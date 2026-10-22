@@ -2263,19 +2263,33 @@ def sec_nan_diagnostics():
         return ''
     lines = ['## Non-finite (NaN/Inf) diagnostics', '',
              '> Triage order: data NaN/Inf -> forward/loss and log(0)/div0/softmax -> fp16 gradient-scaler overflow -> gradient explosion or LR. A check that this record cannot answer is reported as unverifiable, not as clean.', '',
-             '| panel | cell | status | first suspect | first bad step | loss / grad steps | fp16 overflows | guarded attention values | action |', '|---|---|---|---|---|---|---|---|---|']
+             '| panel | cell | status | first suspect | first bad step | loss / grad steps | fp16 overflows | guarded attention values | data audit | action |', '|---|---|---|---|---|---|---|---|---|---|']
     for name, key, rec, d, o in rows[:200]:
         guard = o.get('nan_guard') if isinstance(o.get('nan_guard'), dict) else {}
+        _da = rec.get('data_audit') if isinstance(rec.get('data_audit'), dict) else {}
+        _ds = _da.get('sections') if isinstance(_da.get('sections'), dict) else {}
+        _dt = _ds.get('train') if isinstance(_ds.get('train'), dict) else {}
+        _dv = _ds.get('validation') if isinstance(_ds.get('validation'), dict) else {}
+        _data_txt = 'n/a'
+        if _da:
+            _data_txt = ('%s; train %s tok (%s), val %s tok; label-shift %s'
+                         % (_da.get('status'),
+                            fm(_dt.get('n_checked'), 0),
+                            ('sampled' if _dt.get('sampled') else 'full'),
+                            fm(_dv.get('n_checked'), 0),
+                            (str((_da.get('label_shift') or {}).get('ok'))
+                             if isinstance(_da.get('label_shift'), dict) else 'unknown')))
         action = ''
         for c in (d.get('checks') or []):
             if isinstance(c, dict) and c.get('check') == d.get('primary_suspect'):
                 action = c.get('action') or ''
                 break
-        lines.append('| %s | `%s` | %s | %s | %s | %s / %s | %s | %s | %s |' % (
+        lines.append('| %s | `%s` | %s | %s | %s | %s / %s | %s | %s | %s | %s |' % (
             name, key, d.get('status'), d.get('primary_suspect'),
             fm(o.get('first_bad_step'), 0), fm(o.get('nonfinite_loss_steps'), 0),
             fm(o.get('nonfinite_grad_steps'), 0), fm(o.get('amp_scaler_overflows'), 0),
-            fm(guard.get('elements_cleaned'), 0), str(action).replace('|', '\\|')))
+            fm(guard.get('elements_cleaned'), 0), _data_txt.replace('|', '\\|'),
+            str(action).replace('|', '\\|')))
     lines += ['', '> This section is diagnostic only. A skipped optimizer update is not a fix: inspect the first bad step in `opt_diag.events`, reproduce with `CSA_STRICT_NAN=1` when the attention/pooling guard fired, and record the action in the decision log before comparing the run with others.', '']
     return '\n'.join(lines) + '\n'
 

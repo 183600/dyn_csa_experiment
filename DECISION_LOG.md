@@ -948,3 +948,45 @@ Verification: `python test_review_fixes.py` passes 372/372 (retrieval F1
 identity/aggregate forgery and floor direction checks added);
 `python test_open_block.py` passes 15/15; `python audit_gates.py hypotheses`
 reports `status=ok` for all five hypothesis families.
+
+
+## 2026-10-22 — result-analysis loop: curve checks, evidence-based NaN triage, printed bad cases, cost disclosure (no new runs)
+
+Zero-GPU diagnostics/analysis hardening. No frozen manifest, test split, README
+or CI configuration was touched; `CODE_SEMANTICS` is unchanged because the
+changes only add evidence fields and diagnostic output.
+
+(1) **Curve monitoring is now backed by an explicit data contract.** The
+trainer already recorded `losses`/`ppl_history`/`curve_health`; the NaN triage's
+first branch still trusted a free-text "data checked" string. `audit_token_data`
+now checks dtype, range and NaN/Inf (training stream deterministically sampled
+for scale, validation scanned in full), the first real batch verifies the
+one-token causal target shift, and `diagnose_training_instability` consumes the
+recorded `data_audit` instead of assuming the data were clean. A failed audit,
+or a failed label-shift check, is an observed cause; a missing one is
+`unknown`, never `not_observed`. `v7_supp.train_warmup` records the same audit.
+Overfitting actions now name early stopping explicitly.
+
+(2) **Bad cases are printed, not only written to disk.** `error_analysis.py`
+prints the worst tokens (context, target, prediction, top-5, causes, prefix
+ambiguity) and worst sequences by default (`--print-samples` /
+`--print-sequences` control the budget). Per-token records and the Markdown
+artifact now include the target's measured training frequency, so
+"annotation/rare target" can be checked against a number.
+
+(3) **Scale analysis reports cost alongside the final PPL.** `m0_supp` panels
+now carry `result_diagnostics`: curve-health counts, non-finite/overfitting/
+stalled/early-stopped/`final>best` records, and per-arm medians for PPL, params,
+training throughput, prefill latency and peak memory, with `≥2x` cost flags.
+S1/S2 train records opt into the two-length efficiency sweep
+(`measure_efficiency_sweep`); the single-shape measurement remains.
+
+(4) **Report/audit surfaces.** The NaN diagnostics table shows the data-audit
+result next to the forward/fp16/gradient suspects, and
+`audit_gates.training_health` fails closed on a present-and-failed data audit or
+label-shift check (legacy records without the field keep their old warning
+path).
+
+Verification: `python test_review_fixes.py` passes 374/374 (data-audit/triage
+and scale result-diagnostics tests added); `python v12_supp.py plan` still
+admits 72/72 synthetic records with the same six comparisons.

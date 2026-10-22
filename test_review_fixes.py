@@ -482,7 +482,8 @@ def t_nan_diagnosis_path():
                                          'ce': 4.2, 'comp_reg': float('nan'),
                                          'boundary_pg': 0.0, 'lr': 3e-4}]}})
     assert loss['primary_suspect'] == 'forward_loss_numerics', loss
-    assert 'compression regularizer' in loss['checks'][1]['evidence'], loss
+    _fl = [c for c in loss['checks'] if c['check'] == 'forward_loss_numerics'][0]
+    assert 'compression regularizer' in _fl['evidence'], loss
     # A guarded attention value is evidence even when the loss never went bad.
     guard = L.diagnose_training_instability({
         'amp_dtype': None,
@@ -582,6 +583,58 @@ def t_nan_diagnosis_path():
                              'grad_norm_max': 'not-a-number', 'events': []}})
     assert bad_grad_max['status'] == 'unverifiable', bad_grad_max
     assert bad_grad_max['primary_suspect'] == 'record_integrity', bad_grad_max
+
+
+def t_data_audit_contract():
+    # The NaN triage's first step is the data.  The trainer must record an
+    # actual check, not a free-text "data validated" claim.
+    tr = (np.arange(10000, dtype=np.int64) % 97)
+    va = (np.arange(40, dtype=np.int64) % 97).reshape(4, 10)
+    a = L.audit_token_data(tr, va, 97)
+    assert a['status'] == 'ok', a
+    assert a['sections']['train']['n_checked'] == tr.size, a
+    assert a['sections']['validation']['n_checked'] == va.size, a
+    assert a['sections']['train']['n_nonfinite'] == 0, a
+    assert a['sections']['train']['n_out_of_range'] == 0, a
+    assert a['checks']['integer_ids'] and a['checks']['finite_ok'], a
+    big = (np.arange(5_000_000, dtype=np.int64) % 97)
+    b = L.audit_token_data(big, va, 97, max_sample_tokens=10000)
+    assert b['sections']['train']['sampled'] is True, b
+    assert b['sections']['train']['n_checked'] <= 10000, b
+    for bad in (np.array([1.0, float('nan')]), np.array([1.0, 2.0]),
+                np.array([1, -1]), np.array([1, 97]), np.array([True, False])):
+        try:
+            L.audit_token_data(bad, va, 97)
+        except (TypeError, ValueError):
+            pass
+        else:
+            raise AssertionError(f'audit_token_data accepted {bad!r}')
+    # A valid audit feeds the triage as NOT_OBSERVED evidence; a failed audit
+    # is an observed data cause, not a clean run.
+    clean = L.diagnose_training_instability({
+        'data_audit': a,
+        'opt_diag_summary': {'nonfinite_loss_steps': 0, 'nonfinite_grad_steps': 0,
+                             'events': []}})
+    checks = {c['check']: c for c in clean['checks']}
+    assert checks['data_nan_inf']['status'] == 'not_observed', clean
+    assert checks['data_label_shift']['status'] == 'unknown', clean
+    bad_audit = {**a, 'status': 'failed',
+                 'sections': {**a['sections'],
+                              'train': {**a['sections']['train'], 'n_nonfinite': 1}}}
+    bad = L.diagnose_training_instability({
+        'data_audit': bad_audit,
+        'opt_diag_summary': {'nonfinite_loss_steps': 0, 'nonfinite_grad_steps': 0,
+                             'events': []}})
+    assert bad['status'] == 'instability_observed', bad
+    assert bad['primary_suspect'] == 'data_nan_inf', bad
+    shift = {**a, 'label_shift': {'checked': True, 'ok': False, 'n_rows': 2,
+                                 'n_tokens': 20}}
+    sh = L.diagnose_training_instability({
+        'data_audit': shift,
+        'opt_diag_summary': {'nonfinite_loss_steps': 0, 'nonfinite_grad_steps': 0,
+                             'events': []}})
+    assert sh['status'] == 'instability_observed', sh
+    assert sh['primary_suspect'] == 'data_label_shift', sh
 
 
 def t_paired_errors_use_common_finite_support():
@@ -776,6 +829,8 @@ def t_error_analysis_rare_basis_is_measured():
     assert ok['rare_target_basis'] == 'train_frequency', ok
     assert ok['rare_target_problem'] is None, ok
     assert ok['cause_counts_all']['annotation_or_rare_target']['n'] > 0, ok
+    if ok['worst_tokens']:
+        assert all('target_train_count' in t for t in ok['worst_tokens']), ok['worst_tokens']
 
     # Out-of-range / non-integer samples disable the flag instead of being
     # silently truncated into a different vocabulary's frequencies.
@@ -928,6 +983,8 @@ def t_final_loss_smoothed_uses_last_steps():
     assert r['final_loss_smoothed_n'] == len(tail) == 50, r.get('final_loss_smoothed_n')
     assert abs(r['final_loss_smoothed'] - sum(tail) / len(tail)) < 1e-12, r['final_loss_smoothed']
     assert r['final_loss_smoothed_window'] == 50, r
+    assert r['data_audit']['status'] == 'ok', r.get('data_audit')
+    assert r['data_audit']['label_shift']['ok'] is True, r.get('data_audit')
 
 
 def t_train_variant_early_stop_record():
@@ -2048,6 +2105,39 @@ def t_m0_scale_analysis_descriptive():
         assert os.path.exists(os.path.join(tmp, 'scale_analysis.json'))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def t_m0_result_diagnostics():
+    summary = {
+        'a::seed0': {'variant': 'a', 'seed': 0, 'ppl': 10.0, 'params': 100,
+                     'curve_health': {'status': 'healthy', 'final_minus_best': 0.0},
+                     'efficiency': {'status': 'ok', 'prefill_ms_p50': 2.0,
+                                    'peak_mem_allocated_mb': 10.0},
+                     'train_tokens_per_s': 1000.0,
+                     'peak_memory': {'max_memory_allocated_mb': 12.0}},
+        'a::seed1': {'variant': 'a', 'seed': 1, 'ppl': 10.2, 'params': 100,
+                     'curve_health': {'status': 'overfitting', 'final_minus_best': 0.3},
+                     'efficiency': {'status': 'ok', 'prefill_ms_p50': 2.2,
+                                    'peak_mem_allocated_mb': 11.0},
+                     'train_tokens_per_s': 990.0},
+        'b::seed0': {'variant': 'b', 'seed': 0, 'ppl': 10.1, 'params': 250,
+                     'curve_health': {'status': 'nonfinite'},
+                     'efficiency': {'status': 'ok', 'prefill_ms_p50': 8.0,
+                                    'peak_mem_allocated_mb': 30.0},
+                     'train_tokens_per_s': 300.0,
+                     'early_stop': {'stopped': True}},
+    }
+    d = M0._panel_result_diagnostics(summary)
+    assert d['n_records'] == 3, d
+    assert d['curve_health_counts']['healthy'] == 1, d
+    assert d['records']['nonfinite'] == ['b::seed0'], d
+    assert d['records']['overfitting'] == ['a::seed1'], d
+    assert d['records']['final_above_best'] == ['a::seed1'], d
+    assert d['records']['early_stopped'] == ['b::seed0'], d
+    assert d['best_ppl_arm'] == 'a', d
+    assert 'latency_2x_or_more' in d['cost']['b']['flags'], d
+    assert 'params_2x_or_more' in d['cost']['b']['flags'], d
+    assert 'memory_2x_or_more' in d['cost']['b']['flags'], d
 
 
 def t_seed_plan():
@@ -14723,6 +14813,7 @@ def main():
     _check('A4e training-health classifier: measured vs unmonitored vs nonfinite', t_training_health_classifier)
     _check('A4f training-health threshold is slope-noise aware (2*SE)', t_training_health_noise_aware_threshold)
     _check('A4g training-health actions + widening gap', t_training_health_actions_and_gap)
+    _check('A4h data audit feeds the NaN triage path', t_data_audit_contract)
     _check('A4h early-stop decision policy', t_early_stop_decision)
     _check('A4i NaN triage path', t_nan_diagnosis_path)
     _check('A4j bad-case cause taxonomy', t_token_error_cause_taxonomy)
@@ -14757,6 +14848,7 @@ def main():
     _check('C11 controlled-variable gate: mixed train_knobs', t_pair_reason_train_knobs_mixed)
     _check('C11b corpus/validation-slice fingerprint gate', t_pair_reason_fingerprint_gate)
     _check('C21 M0 scale analysis stays descriptive at n=4', t_m0_scale_analysis_descriptive)
+    _check('C21b M0 result diagnostics expose curve/NaN/cost', t_m0_result_diagnostics)
     _check('C21a M0 records exclude synthesized reconstructions', t_m0_records_exclude_synthesized_reconstructions)
     _check('C12 seed plan', t_seed_plan)
     _check('C13 family Holm + verified baseline + param control', t_audit_family_holm_and_verified)

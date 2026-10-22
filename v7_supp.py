@@ -828,6 +828,7 @@ PARAM_MATCHED_V7 = {'full_rope', 'full_sw128_matched_rope', 'full_rope_sink'}
 def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=512, batch_size=12, steps=20000, warm_steps=0, lr=0.0003, weight_decay=0.1, warmup=200, comp_lambda=0.05, delta_lr_mult=10.0, eval_every=1000, eval_subset=128, val_bnd=None, device=DEVICE, log_every=1000, mlp_ratio=4, deadline_ts=None, save_ckpt=None, ckpt_dir=None, measure_eff=True, diag_every=None):
     L.set_seed(seed)
     L.nan_guard_state(reset=True)
+    _data_audit = L.audit_token_data(train_ids, val_batch, vocab)
     _rng_fp = L.rng_fingerprint()
     L._attb_bump_epoch()
     if variant in set(L.PARAM_MATCHED) | set(PARAM_MATCHED_V7) and float(mlp_ratio) == 4.0:
@@ -940,6 +941,19 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
                     L._check_token_batch(x, y, vocab, step=step + 1)
                 except (TypeError, ValueError, OverflowError) as _be:
                     raise RuntimeError(f'[data] bad training batch at step {step + 1}: {_be}') from _be
+                if step == 0:
+                    try:
+                        _shift_ok = bool(x.shape == y.shape and x.shape[1] > 0
+                                         and torch.equal(y[:, :-1], x[:, 1:]))
+                    except Exception:
+                        _shift_ok = False
+                    _data_audit['label_shift'] = {
+                        'checked': True, 'ok': _shift_ok,
+                        'n_rows': int(x.shape[0]), 'n_tokens': int(x.numel())}
+                    if not _shift_ok:
+                        raise RuntimeError(
+                            '[data] training inputs/targets are not a one-token causal shift; '
+                            'investigate the loader before training further')
             logits = None
             ce = model.ce_loss(x, y, vocab)
             _blp = getattr(model, 'boundary_logp', None)
@@ -1088,8 +1102,8 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
     _instability = L.diagnose_training_instability(
         {'opt_diag_summary': _opt_summary, 'amp_dtype': None,
          'train_knobs': _v7_knobs(device, batch_size),
-         'curve_health': _health, 'health_history': _health_history},
-        data_checked='sampled: token batches validated at startup and every ~1% of steps')
+         'curve_health': _health, 'health_history': _health_history,
+         'data_audit': _data_audit})
     _checkpoints = {}
     if _save_mode and ckpt_dir:
         try:
@@ -1124,7 +1138,7 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
         except Exception as _ee:
             print(f'[efficiency] WARNING: measurement failed ({type(_ee).__name__}: {_ee})')
             _efficiency = {'status': 'error', 'error': f'{type(_ee).__name__}: {_ee}'}
-    res = {'variant': variant, 'seed': seed, 'ppl': ppl, 'params': n_param, 'losses': losses, 'stats': stats, 'steps': steps, 'tokens_seen': steps * batch_size * seq_len, 'train_time_s': wall, 'warm_steps': warm_steps, 'ppl_at_switch': switch_ppl, 'final_loss_smoothed': float(torch.stack(list(_tail)).mean()) if _tail else float('nan'), 'ppl_history': ppl_hist, 'ppl_history_dense_prefix': warm_hist, 'delta_trace': {}, 'train_knobs': _v7_knobs(device, batch_size), 'rng_fp': _rng_fp, 'data_fp': L._ids_fp(train_ids),
+    res = {'variant': variant, 'seed': seed, 'ppl': ppl, 'params': n_param, 'losses': losses, 'stats': stats, 'steps': steps, 'tokens_seen': steps * batch_size * seq_len, 'train_time_s': wall, 'warm_steps': warm_steps, 'ppl_at_switch': switch_ppl, 'final_loss_smoothed': float(torch.stack(list(_tail)).mean()) if _tail else float('nan'), 'ppl_history': ppl_hist, 'ppl_history_dense_prefix': warm_hist, 'delta_trace': {}, 'train_knobs': _v7_knobs(device, batch_size), 'rng_fp': _rng_fp, 'data_fp': L._ids_fp(train_ids), 'data_audit': _data_audit,
            'nll_sum': _eval_stats.get('nll_sum'), 'n_tokens': _eval_stats.get('n_tokens'),
            'nll_per_row': _eval_stats.get('nll_per_row'), 'n_tokens_per_row': _eval_stats.get('n_tokens_per_row'),
            'eval_rows': _eval_stats.get('eval_rows'), 'eval_seed': _eval_stats.get('eval_seed'),

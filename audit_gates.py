@@ -2248,6 +2248,32 @@ def audit_training_health(outdirs=None):
             n_grad = _count_field(diag, 'nonfinite_grad_steps')
             n_guard = _count_field(guard, 'elements_cleaned')
             has_events = bool(n_loss or n_grad or n_guard)
+            # A recorded data audit is the first branch of the NaN triage.
+            # Only validate it when present: legacy records without one stay
+            # on their existing warning path (missing evidence is not evidence
+            # of corruption), but a present-and-failed audit must fail closed.
+            _data_audit = r.get('data_audit')
+            if _data_audit is not None:
+                if not isinstance(_data_audit, dict):
+                    e.append(f'data_audit is not an object ({type(_data_audit).__name__})')
+                else:
+                    if str(_data_audit.get('status') or '') != 'ok':
+                        e.append(f'data_audit status={_data_audit.get("status")!r}; '
+                                 'the data contract did not pass')
+                    _secs = _data_audit.get('sections') if isinstance(_data_audit.get('sections'), dict) else {}
+                    for _name in ('train', 'validation'):
+                        _sec = _secs.get(_name) if isinstance(_secs.get(_name), dict) else {}
+                        if not _sec:
+                            continue
+                        _nf = _count_field(_sec, 'n_nonfinite')
+                        _oor = _count_field(_sec, 'n_out_of_range')
+                        if _nf or _oor:
+                            e.append(f'data_audit.{_name}: {_nf} non-finite and '
+                                     f'{_oor} out-of-range token value(s)')
+                    _ls = _data_audit.get('label_shift')
+                    if isinstance(_ls, dict) and _ls.get('checked') and not _ls.get('ok'):
+                        e.append('data_audit.label_shift failed: inputs/targets are '
+                                 'not a one-token causal shift')
             # Event counters and their event log must not contradict each
             # other: an event log with loss/grad entries while the matching
             # counter is zero is a partially written record, not a clean run.

@@ -496,7 +496,7 @@ def classify_training_health(history, *, tail_k=4, slope_tol=None, gap_tol=None)
     actions = []
     if status == 'overfitting':
         actions.append('add or strengthen a wired regularizer (weight decay; the model has no dropout layer) and/or increase unique training data')
-        actions.append('use the best-validation checkpoint or stop at best_step instead of reporting only the final step')
+        actions.append('use the best-validation checkpoint or enable early stopping (early_stop_patience) at best_step instead of reporting only the final step')
     elif status == 'underfitting_or_stalled':
         actions.append('verify the data pipeline (target shift, tokenizer/vocab mapping) before changing the model')
         actions.append('check the learning-rate schedule and warmup; try a different LR before increasing capacity')
@@ -747,13 +747,69 @@ def diagnose_training_instability(record, *, data_checked=None):
     def add(name, status, evidence, action):
         checks.append({'check': name, 'status': status, 'evidence': evidence, 'action': action})
 
-    if data_checked:
+    _audit_raw = rec.get('data_audit')
+    if _audit_raw is not None and not isinstance(_audit_raw, dict):
+        malformed.append(f'data_audit={_audit_raw!r}')
+        _audit_raw = None
+    _data_bad = False
+    _label_shift_bad = False
+    if isinstance(_audit_raw, dict):
+        _sections = _audit_raw.get('sections') if isinstance(_audit_raw.get('sections'), dict) else {}
+        _tr = _sections.get('train') if isinstance(_sections.get('train'), dict) else {}
+        _va = _sections.get('validation') if isinstance(_sections.get('validation'), dict) else {}
+
+        def _audit_count(sec, key):
+            try:
+                return int(sec.get(key) or 0)
+            except (TypeError, ValueError, OverflowError):
+                return 0
+        _audit_status = str(_audit_raw.get('status') or '')
+        _audit_bad = (_audit_status != 'ok'
+                      or _audit_count(_tr, 'n_nonfinite') or _audit_count(_tr, 'n_out_of_range')
+                      or _audit_count(_va, 'n_nonfinite') or _audit_count(_va, 'n_out_of_range'))
+        _audit_bad = bool(_audit_bad)
+        if _audit_bad:
+            _data_bad = True
+            add('data_nan_inf', 'observed',
+                f'data_audit status={_audit_status!r}; train nonfinite/out-of-range='
+                f'{_audit_count(_tr, "n_nonfinite")}/{_audit_count(_tr, "n_out_of_range")}, '
+                f'validation={_audit_count(_va, "n_nonfinite")}/{_audit_count(_va, "n_out_of_range")}',
+                'fix/replace the token cache or feature matrix before interpreting any training number')
+        else:
+            add('data_nan_inf', 'not_observed',
+                f'data_audit checked {_audit_count(_tr, "n_checked"):,} training token(s) '
+                f'({"sampled" if _tr.get("sampled") else "full"}) and '
+                f'{_audit_count(_va, "n_checked"):,} validation token(s) (full); '
+                'dtype/range/finiteness OK',
+                'if a future run fails here, validate the token cache dtype/range and the label shift before touching the model')
+        _ls = _audit_raw.get('label_shift')
+        if isinstance(_ls, dict) and _ls.get('checked') is not None:
+            if bool(_ls.get('checked')) and not bool(_ls.get('ok')):
+                _label_shift_bad = True
+                add('data_label_shift', 'observed',
+                    f'label-shift check failed on {_ls.get("n_tokens")} token(s)',
+                    'the loader is not producing (x, x_shifted) pairs; fix the target construction before training')
+            else:
+                add('data_label_shift', 'not_observed',
+                    f'causal one-token target shift verified on {_ls.get("n_tokens")} token(s)',
+                    'no action')
+        else:
+            add('data_label_shift', 'unknown',
+                'no label-shift evidence in this record',
+                'check the loader/target shift before treating a stalled curve as an optimisation problem')
+    elif data_checked:
         add('data_nan_inf', 'not_observed',
             f'token batches validated at the configured cadence ({data_checked})',
             'if a future run fails here, validate the token cache dtype/range and the label shift before touching the model')
+        add('data_label_shift', 'unknown',
+            'legacy record has no explicit label-shift check',
+            'check the loader/target shift before treating a stalled curve as an optimisation problem')
     else:
         add('data_nan_inf', 'unknown', 'no data-check evidence in this record',
             'validate token ids/float cache for NaN/Inf and the target shift')
+        add('data_label_shift', 'unknown',
+            'no label-shift evidence in this record',
+            'check the loader/target shift before treating a stalled curve as an optimisation problem')
 
     bad_loss = [e for e in events if e.get('kind') == 'loss']
     bad_grad = [e for e in events if e.get('kind') == 'grad']
@@ -824,7 +880,8 @@ def diagnose_training_instability(record, *, data_checked=None):
     # `observed` — exactly the contradictory record the triage exists to
     # prevent.
     _has_event = bool(n_loss or n_grad or guard_cleaned or bad_loss or bad_grad
-                      or huge_grad or health_nonfinite)
+                      or huge_grad or health_nonfinite or _data_bad
+                      or _label_shift_bad)
     if not _has_event and not malformed:
         status = 'clean'
         primary = None
@@ -844,7 +901,8 @@ def diagnose_training_instability(record, *, data_checked=None):
     return {'status': status, 'summary': summary, 'primary_suspect': primary,
             'first_bad_step': first_bad, 'curve_health_source': _health_source,
             'checks': checks,
-            'recommended_order': ['data_nan_inf', 'forward_loss_numerics',
+            'recommended_order': ['data_nan_inf', 'data_label_shift',
+                                  'forward_loss_numerics',
                                   'attention_pool_nan_to_num', 'validation_curve_numerics',
                                   'fp16_overflow', 'gradient_explosion_lr']}
 
@@ -1171,7 +1229,7 @@ SCALE_TRANSFER_POLICY = {
     'note': 'S1-S4 hold lr/wd/warmup fraction fixed across widths. No muP or LR-transfer calibration has been run; scale contrasts therefore carry an optimisation-transfer confound and the ladder is descriptive until a transfer check exists.',
 }
 B_ARMS = ['full_matched', 'full_sw128_matched', 'csa_fixed', 'csa_dynamic', 'hybrid_dynamic']
-RUN_S1 = dict(RUN, dataset='fineweb', vocab_size=B_VOCAB, d=768, n_layers=12, n_heads=12, d_head=64, seq_len=8192, batch_size=8, n_train_tokens=5000000000, steps=76294, warmup=2000, eval_every=4000, eval_subset=32, val_seqs=512, seeds=[0, 1, 2, 3], outdir='results_b_s1', variants=B_ARMS)
+RUN_S1 = dict(RUN, dataset='fineweb', vocab_size=B_VOCAB, d=768, n_layers=12, n_heads=12, d_head=64, seq_len=8192, batch_size=8, n_train_tokens=5000000000, steps=76294, warmup=2000, eval_every=4000, eval_subset=32, val_seqs=512, seeds=[0, 1, 2, 3], outdir='results_b_s1', variants=B_ARMS, measure_efficiency_sweep=True)
 M0_CAP = dict(total_hours=700.0, margin=0.93, already_hours=0.0, state_path='run_time_state_m0.json')
 RUN_S2 = dict(RUN_S1, d=1024, n_layers=16, n_heads=16, n_train_tokens=12000000000, steps=183105, warmup=4000, eval_every=8000, seeds=[0, 1, 2], outdir='results_b_s2')
 M2_CAP = dict(total_hours=500.0, margin=0.93, already_hours=0.0, state_path='run_time_state_m2.json')
@@ -24658,6 +24716,93 @@ def _fixed_train_eval_batch(train_ids, seq_len, batch_size, device, seed):
             pass
 
 
+def _audit_sample_flat(arr, max_tokens):
+    """Deterministic, bounded sample of a flat token stream for data audits.
+
+    A scale-up corpus can hold billions of ids; scanning all of it on every
+    training cell would make the guard itself a cost centre.  When the array is
+    larger than ``max_tokens`` we read equally spaced windows (the same strategy
+    as ``audit_corpus_split``) and report that the check was sampled.
+    """
+    flat = np.asarray(arr).reshape(-1)
+    n = int(flat.size)
+    if n <= int(max_tokens):
+        return flat, False
+    n_windows = 16
+    width = max(1, int(max_tokens) // n_windows)
+    starts = np.linspace(0, max(0, n - width), num=n_windows, dtype=np.int64)
+    parts = [flat[int(s):int(s) + width] for s in starts]
+    return np.concatenate(parts) if parts else flat[:0], True
+
+
+def audit_token_data(train_ids, val_batch, vocab, *, max_sample_tokens=2_000_000):
+    """Pre-training data contract for the NaN/Inf triage path.
+
+    The prompt's first NaN suspect is the data, so the trainer records an
+    explicit, machine-checkable answer instead of a free-text "data checked"
+    claim.  Integer token caches cannot contain NaN/Inf, but a float feature
+    cache can; both are checked here.  Out-of-vocabulary or negative ids and
+    non-finite float values abort the run before a model is built.  The
+    training stream is sampled deterministically when it is large; the
+    validation split is scanned in full because it is bounded by ``val_seqs``.
+    """
+    _max = _exact_count(max_sample_tokens, minimum=1)
+    if _max is None:
+        raise ValueError(f'audit_token_data needs a positive integer max_sample_tokens, got {max_sample_tokens!r}')
+    max_sample_tokens = int(_max)
+    vocab = int(vocab)
+    out = {'kind': 'token_data_audit', 'status': 'ok', 'vocab': vocab,
+           'max_sample_tokens': max_sample_tokens, 'sections': {}}
+
+    def _check(arr, name, *, sample):
+        arr = np.asarray(arr)
+        if arr.size == 0:
+            raise ValueError(f'{name}: token array is empty')
+        flat = arr.reshape(-1)
+        values, sampled = _audit_sample_flat(flat, max_sample_tokens) if sample else (flat, False)
+        is_bool = (np.dtype(arr.dtype).kind == 'b')
+        is_float = np.dtype(arr.dtype).kind in 'fc'
+        n_nonfinite = 0
+        if is_float:
+            try:
+                n_nonfinite = int(values.size - np.isfinite(values).sum())
+            except (TypeError, ValueError, OverflowError):
+                n_nonfinite = int(values.size)
+        if n_nonfinite:
+            raise ValueError(f'{name}: {n_nonfinite} non-finite (NaN/Inf) value(s) in the checked '
+                             f'{values.size:,} token(s); fix the data before training')
+        if is_float or is_bool or not np.issubdtype(arr.dtype, np.integer):
+            raise TypeError(f'{name}: expected integer token ids, got dtype {arr.dtype}'
+                            + (' (all finite, but token ids must be integral)' if is_float and not n_nonfinite else ''))
+        try:
+            lo = int(values.min())
+            hi = int(values.max())
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(f'{name}: could not read the token-id range') from None
+        n_out = int(np.count_nonzero((values < 0) | (values >= vocab)))
+        if n_out:
+            raise ValueError(f'{name}: {n_out} token id(s) outside vocab [0, {vocab}) '
+                             f'(checked range [{lo}, {hi}])')
+        return {'dtype': np.dtype(arr.dtype).str, 'n_tokens': int(flat.size),
+                'n_checked': int(values.size), 'sampled': bool(sampled),
+                'n_nonfinite': int(n_nonfinite), 'n_out_of_range': int(n_out),
+                'min_id': lo, 'max_id': hi}
+
+    out['sections']['train'] = _check(train_ids, 'training ids', sample=True)
+    if val_batch is not None:
+        out['sections']['validation'] = _check(val_batch, 'validation ids', sample=False)
+    else:
+        out['sections']['validation'] = None
+    out['checks'] = {
+        'integer_ids': True,
+        'range_ok': True,
+        'finite_ok': True,
+        'train_sampled': bool(out['sections']['train']['sampled']),
+        'validation_scanned_in_full': val_batch is not None,
+    }
+    return out
+
+
 def _check_token_batch(x, y, vocab, *, step=None):
     """Fail fast on a corrupted batch before it reaches the model."""
     for name, t in (('inputs', x), ('targets', y)):
@@ -24966,7 +25111,7 @@ def measure_efficiency_sweep(model, ids, device, *, lengths=(512, 2048), batches
     return out
 
 
-def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=512, batch_size=12, steps=1500, lr=0.0003, weight_decay=0.1, warmup=50, comp_lambda=0.05, delta_lr_mult=10.0, eval_every=0, eval_subset=128, val_bnd=None, device=DEVICE, log_every=100, mlp_ratio=4, deadline_ts=None, return_model=False, distributed=False, save_ckpt=None, ckpt_dir=None, diag_every=None, measure_eff=False, amp_dtype='auto', eager_batch='auto', early_stop_patience=None, early_stop_min_delta=0.0):
+def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=512, batch_size=12, steps=1500, lr=0.0003, weight_decay=0.1, warmup=50, comp_lambda=0.05, delta_lr_mult=10.0, eval_every=0, eval_subset=128, val_bnd=None, device=DEVICE, log_every=100, mlp_ratio=4, deadline_ts=None, return_model=False, distributed=False, save_ckpt=None, ckpt_dir=None, diag_every=None, measure_eff=False, measure_eff_sweep=False, amp_dtype='auto', eager_batch='auto', early_stop_patience=None, early_stop_min_delta=0.0):
     if steps < 1:
         raise ValueError(f'train_variant needs steps >= 1, got steps={steps}')
     if early_stop_patience is None:
@@ -24989,6 +25134,9 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
             raise ValueError('early_stop_patience needs eval_every > 0 so the validation curve is measured')
         _es_patience = int(early_stop_patience)
     seed = set_seed(seed)
+    # Data is the first suspect on the NaN/Inf triage path.  Record an actual
+    # contract check (range/dtype/finiteness) rather than a free-text claim.
+    _data_audit = audit_token_data(train_ids, val_batch, vocab)
     _rng_fp = rng_fingerprint()
     _exec_fp = execution_fingerprint()
     _attb_bump_epoch()
@@ -25192,6 +25340,22 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
                     _check_token_batch(x, y, vocab, step=step + 1)
                 except (TypeError, ValueError, OverflowError) as _be:
                     raise RuntimeError(f'[data] bad training batch at step {step + 1}: {_be}') from _be
+                if step == 0:
+                    # A wrong input/target shift leaves every token in range but
+                    # trains the model to predict its own input.  It is a data
+                    # pipeline fault, not an optimisation problem.
+                    try:
+                        _shift_ok = bool(x.shape == y.shape and x.shape[1] > 0
+                                         and torch.equal(y[:, :-1], x[:, 1:]))
+                    except Exception:
+                        _shift_ok = False
+                    _data_audit['label_shift'] = {
+                        'checked': True, 'ok': _shift_ok,
+                        'n_rows': int(x.shape[0]), 'n_tokens': int(x.numel())}
+                    if not _shift_ok:
+                        raise RuntimeError(
+                            '[data] training inputs/targets are not a one-token causal shift; '
+                            'investigate the loader before training further')
             _comp_item = float('nan')
             _pg_item = 0.0
             _loss_item = float('nan')
@@ -25530,8 +25694,8 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
     _instability = diagnose_training_instability(
         {'opt_diag_summary': _opt_summary, 'amp_dtype': _amp,
          'train_knobs': training_knobs(amp_dtype=_amp, eager_batch=_eager_batch_used),
-         'curve_health': _health, 'health_history': _health_history},
-        data_checked='sampled: token batches validated at startup and every ~1% of steps')
+         'curve_health': _health, 'health_history': _health_history,
+         'data_audit': _data_audit})
     _peak = {}
     if device.type == 'cuda':
         try:
@@ -25545,6 +25709,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
     if _save_mode and ckpt_dir:
         _do_save('final', int(_steps_completed), float(ppl) if _is_finite_number(ppl) else None, _last_train_ce)
     _efficiency = None
+    _efficiency_sweep = None
     if measure_eff:
         try:
             if _eval_batch is not None:
@@ -25555,9 +25720,21 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
                 _eff_ids = None
             if _eff_ids is not None and len(_eff_ids):
                 _efficiency = measure_efficiency(_inner_model, _eff_ids, device, warmup=1, iters=5, decode_tokens=4)
+                if measure_eff_sweep:
+                    # A single (batch, length) point cannot support an
+                    # efficiency claim at a new scale.  Two lengths at batch 1
+                    # keep the extra cost small while exposing the shape
+                    # dependence (the full sweep API supports larger grids).
+                    _sweep_lens = sorted({min(512, int(_eff_ids.shape[1])), int(_eff_ids.shape[1])})
+                    _sweep_lens = [n for n in _sweep_lens if 0 < n <= int(_eff_ids.shape[1])]
+                    _efficiency_sweep = measure_efficiency_sweep(
+                        _inner_model, _eff_ids, device,
+                        lengths=tuple(_sweep_lens or [int(_eff_ids.shape[1])]),
+                        batches=(1,), warmup=1, iters=3)
         except Exception as _ee:
             print(f'[efficiency] WARNING: measurement failed ({type(_ee).__name__}: {_ee})')
             _efficiency = {'status': 'error', 'error': f'{type(_ee).__name__}: {_ee}'}
+            _efficiency_sweep = {'status': 'error', 'error': f'{type(_ee).__name__}: {_ee}'}
     # `tokens_seen` counts DRAWS, not unique tokens: training windows are
     # sampled with replacement and overlap heavily, so a 3000-step run over an
     # 8M-token cache does not consume 18.4M distinct tokens.  Record an
@@ -25576,6 +25753,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
               'tokens_seen_unique_estimate': (int(round(_n_train * _uniq_frac)) if _uniq_frac is not None else None),
               'tokens_seen_unique_frac_estimate': _uniq_frac,
               'token_accounting_note': 'tokens_seen counts window draws; unique-token coverage is an estimate under independent uniform window draws, not a measurement',
+              'data_audit': _data_audit,
               'train_time_s': wall, 'train_tokens_per_s': ((_steps_completed * batch_size * seq_len * _world) / wall if wall and wall > 0 else None), 'distributed_rank': _rank, 'distributed_world_size': _world, 'final_loss_smoothed': _final_loss_smoothed, 'final_loss_smoothed_window': 50, 'final_loss_smoothed_n': len(_tail_losses), 'ppl_history': ppl_hist, 'delta_trace': delta_trace, 'train_knobs': training_knobs(amp_dtype=_amp, eager_batch=_eager_batch_used), 'amp_dtype': _amp, 'amp_grad_scaler': bool(_scaler is not None), 'eager_batch': _eager_batch_used, 'ckpt_mode': _ckpt_effective, 'ckpt_estimated_bytes': _auto_need, 'rng_fp': _rng_fp, 'init_core_fp': _init_core_fp, 'data_fp': _ids_fp(train_ids),
               # The token-level evidence behind the reported PPL.
               # `nll_sum / n_tokens` is the pooled-NLL estimator; the per-row
@@ -25604,6 +25782,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
               'opt_diag': _diag, 'opt_diag_summary': _opt_summary,
               'instability_diagnosis': _instability,
               'peak_memory': _peak, 'efficiency': _efficiency,
+              'efficiency_sweep': _efficiency_sweep,
               'checkpoints': _checkpoints}
     if return_model:
         result['_model'] = _inner_model
@@ -26040,11 +26219,18 @@ def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
                 _ctx_support = int(sum(_cd.values()))
         if _ctx_variants is not None and _ctx_variants > 1:
             n_ctx_ambiguous += 1
+        _tr_count = None
+        _tr_frac = None
+        if freq is not None and 0 <= ctgt < int(len(freq)):
+            _tr_count = int(freq[ctgt])
+            _tr_frac = float(_tr_count / max(1, int(freq.sum())))
         worst_tokens.append({
             'row': int(row), 'position': int(pos), 'ce': c, 'target_id': tgt,
             'pred_id': pred, 'entropy': ent, 'margin': margin,
             'topk_ids': tids, 'topk_text': [_decode([x]) for x in tids],
             'rare_target': bool(rare),
+            'target_train_count': _tr_count,
+            'target_train_fraction': _tr_frac,
             'target_text': _decode([ctgt]),
             'pred_text': _decode([pred]),
             'context_text': _decode(ctx_ids),
@@ -29036,7 +29222,7 @@ def _run_cell(cfg, v, seed, *, guard=None, ratios=None, fp=None, train_ids=None,
         try:
             _save_mode = cfg.get('save_ckpt', os.environ.get('CSA_SAVE_CKPT', 'both'))
             _ckpt_dir = cfg.get('ckpt_dir') or os.path.join(outdir, 'checkpoints')
-            rec = train_variant(v, train_ids, val_batch, vocab, seed=seed, d=d, n_layers=n_layers, n_heads=n_heads, d_head=d_head, seq_len=cfg['seq_len'], batch_size=cfg['batch_size'], steps=cfg['steps'], lr=cfg['lr'], weight_decay=cfg['weight_decay'], warmup=cfg['warmup'], comp_lambda=cfg['comp_lambda'], delta_lr_mult=cfg.get('delta_lr_mult', 10.0), eval_every=cfg.get('eval_every', 0), eval_subset=cfg.get('eval_subset', 128), val_bnd=val_bnd, mlp_ratio=ratios[v], deadline_ts=deadline_ts, save_ckpt=_save_mode, ckpt_dir=_ckpt_dir, diag_every=cfg.get('diag_every'), measure_eff=cfg.get('measure_efficiency', True), amp_dtype=cfg.get('amp_dtype', 'auto'), eager_batch=cfg.get('eager_batch', 'auto'), early_stop_patience=cfg.get('early_stop_patience'), early_stop_min_delta=cfg.get('early_stop_min_delta', 0.0))
+            rec = train_variant(v, train_ids, val_batch, vocab, seed=seed, d=d, n_layers=n_layers, n_heads=n_heads, d_head=d_head, seq_len=cfg['seq_len'], batch_size=cfg['batch_size'], steps=cfg['steps'], lr=cfg['lr'], weight_decay=cfg['weight_decay'], warmup=cfg['warmup'], comp_lambda=cfg['comp_lambda'], delta_lr_mult=cfg.get('delta_lr_mult', 10.0), eval_every=cfg.get('eval_every', 0), eval_subset=cfg.get('eval_subset', 128), val_bnd=val_bnd, mlp_ratio=ratios[v], deadline_ts=deadline_ts, save_ckpt=_save_mode, ckpt_dir=_ckpt_dir, diag_every=cfg.get('diag_every'), measure_eff=cfg.get('measure_efficiency', True), measure_eff_sweep=cfg.get('measure_efficiency_sweep', False), amp_dtype=cfg.get('amp_dtype', 'auto'), eager_batch=cfg.get('eager_batch', 'auto'), early_stop_patience=cfg.get('early_stop_patience'), early_stop_min_delta=cfg.get('early_stop_min_delta', 0.0))
             _prov = prov if prov is not None else experiment_provenance(cfg, train_ids=train_ids, val_batch=val_batch, vocab=vocab)
             _hp = run_hyperparameters(cfg, seed=seed, d=d, n_layers=n_layers, n_heads=n_heads, d_head=d_head, vocab=vocab, mlp_ratio=ratios[v], data_version=_prov.get('data', {}).get('data_version'), amp_dtype=rec.get('amp_dtype', 'auto'), eager_batch=rec.get('eager_batch', 'auto'))
             _curve_ref = None

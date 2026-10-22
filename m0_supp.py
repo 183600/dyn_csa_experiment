@@ -792,6 +792,129 @@ def _declared_seed_list(cfg):
             vals.append(_n)
     return sorted(vals)
 
+def _panel_result_diagnostics(summary):
+    """Curve, NaN-triage and cost diagnostics for one scale panel.
+
+    A scale run is not a single PPL number: the same final value can hide a
+    diverged curve, a NaN-triaged run, or a tiny accuracy gain bought with a
+    10x latency/parameter increase.  This block is descriptive and reuses the
+    trainer's recorded fields; it never changes a PPL or a statistical test.
+    """
+    def _num(v):
+        return L._finite_scalar(v)
+
+    def _median(vals):
+        return float(np.median(vals)) if vals else None
+
+    counts = {}
+    nonfinite, overfitting, stalled, early, above_best, unmonitored = [], [], [], [], [], []
+    costs = {}
+    n_records = 0
+    for key, rec in (summary or {}).items():
+        if not isinstance(rec, dict) or rec.get('synthesized') or rec.get('error'):
+            continue
+        n_records += 1
+        h = rec.get('curve_health') if isinstance(rec.get('curve_health'), dict) else {}
+        status = str(h.get('status') or 'missing')
+        counts[status] = int(counts.get(status, 0)) + 1
+        if status == 'nonfinite':
+            nonfinite.append(str(key))
+        elif status == 'overfitting':
+            overfitting.append(str(key))
+        elif status == 'underfitting_or_stalled':
+            stalled.append(str(key))
+        elif status in ('unmonitored', 'insufficient_data'):
+            unmonitored.append(str(key))
+        _fmb = _num(h.get('final_minus_best'))
+        if _fmb is not None and _fmb > 0.0:
+            above_best.append(str(key))
+        es = rec.get('early_stop')
+        if isinstance(es, dict) and es.get('stopped'):
+            early.append(str(key))
+        v = rec.get('variant') or str(key).split('::')[0]
+        c = costs.setdefault(str(v), {'ppl': [], 'params': [], 'train_tps': [],
+                                      'train_time_s': [], 'peak_mem_mb': [],
+                                      'prefill_ms': [], 'tokens': []})
+        _ppl = L._record_primary_ppl(rec)
+        if L.ppl_is_usable(_ppl):
+            c['ppl'].append(float(_ppl))
+        for _key, _dst in (('params', 'params'),
+                           ('train_tokens_per_s', 'train_tps'),
+                           ('train_time_s', 'train_time_s'),
+                           ('tokens_seen', 'tokens')):
+            _x = _num(rec.get(_key))
+            if _x is not None and _x >= 0.0:
+                c[_dst].append(_x)
+        _pm = rec.get('peak_memory') if isinstance(rec.get('peak_memory'), dict) else {}
+        _pmv = _num(_pm.get('max_memory_allocated_mb'))
+        if _pmv is not None and _pmv >= 0.0:
+            c['peak_mem_mb'].append(_pmv)
+        eff = rec.get('efficiency') if isinstance(rec.get('efficiency'), dict) else {}
+        if eff.get('status') == 'ok':
+            _lat = _num(eff.get('prefill_ms_p50'))
+            if _lat is not None and _lat > 0.0:
+                c['prefill_ms'].append(_lat)
+            _mem = _num(eff.get('peak_mem_allocated_mb'))
+            if _mem is not None and _mem >= 0.0:
+                c['peak_mem_mb'].append(_mem)
+            _tps = _num(eff.get('tokens_per_s_prefill'))
+            if _tps is not None and _tps > 0.0:
+                c['eff_tokens_per_s'] = c.get('eff_tokens_per_s', []) + [_tps]
+    arms = {}
+    for v, c in costs.items():
+        arms[v] = {
+            'n': int(max(len(c['ppl']), len(c['params']), len(c['train_tps']))),
+            'ppl_median': _median(c['ppl']),
+            'params_median': _median(c['params']),
+            'train_tokens_per_s_median': _median(c['train_tps']),
+            'train_time_s_median': _median(c['train_time_s']),
+            'peak_mem_mb_max': (max(c['peak_mem_mb']) if c['peak_mem_mb'] else None),
+            'prefill_ms_median': _median(c['prefill_ms']),
+            'prefill_tokens_per_s_median': _median(c.get('eff_tokens_per_s', [])),
+            'tokens_seen_median': _median(c['tokens']),
+            'flags': [],
+        }
+    best = None
+    _rank = [(r['ppl_median'], v) for v, r in arms.items() if r['ppl_median'] is not None]
+    if _rank:
+        best = min(_rank)[1]
+    if best is not None:
+        ref = arms[best]
+        for v, r in arms.items():
+            if v == best or r['ppl_median'] is None:
+                continue
+            _d = (r['ppl_median'] - ref['ppl_median']) / ref['ppl_median'] * 100.0
+            r['ppl_delta_pct_vs_best'] = _d
+            r['latency_ratio_vs_best'] = (r['prefill_ms_median'] / ref['prefill_ms_median']
+                                          if (r['prefill_ms_median'] and ref['prefill_ms_median']) else None)
+            r['params_ratio_vs_best'] = (r['params_median'] / ref['params_median']
+                                         if (r['params_median'] and ref['params_median']) else None)
+            r['memory_ratio_vs_best'] = (r['peak_mem_mb_max'] / ref['peak_mem_mb_max']
+                                         if (r['peak_mem_mb_max'] and ref['peak_mem_mb_max']) else None)
+            if abs(_d) < 0.5:
+                r['flags'].append('ppl_gain_below_0.5pct')
+            if r['latency_ratio_vs_best'] is not None and r['latency_ratio_vs_best'] >= 2.0:
+                r['flags'].append('latency_2x_or_more')
+            if r['params_ratio_vs_best'] is not None and r['params_ratio_vs_best'] >= 2.0:
+                r['flags'].append('params_2x_or_more')
+            if r['memory_ratio_vs_best'] is not None and r['memory_ratio_vs_best'] >= 2.0:
+                r['flags'].append('memory_2x_or_more')
+    return {'n_records': int(n_records), 'curve_health_counts': counts,
+            'best_ppl_arm': best,
+            'records': {
+                'nonfinite': nonfinite[:50],
+                'overfitting': overfitting[:50],
+                'underfitting_or_stalled': stalled[:50],
+                'unmonitored_or_insufficient': unmonitored[:50],
+                'final_above_best': above_best[:50],
+                'early_stopped': early[:50],
+            },
+            'cost': arms,
+            'note': ('curve health is diagnostic, not a model-selection rule; '
+                     'cost ratios compare medians within this panel only and are '
+                     'not a speed claim when device/shape provenance differs')}
+
+
 def scale_analysis(summaries=None, outdir='analysis_m0'):
     """Zero-GPU descriptive analysis for the B-tier S1/S2 panels.
 
@@ -855,9 +978,18 @@ def scale_analysis(summaries=None, outdir='analysis_m0'):
                            'min_seeds_for_family_significance',
                            'sufficient_for_family_rejection')},
             'warnings': audit.get('warnings'),
+            'result_diagnostics': _panel_result_diagnostics(summary),
         }
+        _diag = report['panels'][label]['result_diagnostics']
         print(f'[m0-analysis] {label}: {len(measured)} contrast(s), '
               f'n={n_seeds}, descriptive_only={report["panels"][label]["descriptive_only"]}')
+        print(f'[m0-analysis] {label}: curve_health={_diag["curve_health_counts"]} '
+              f'nonfinite={len(_diag["records"]["nonfinite"])} '
+              f'final>best={len(_diag["records"]["final_above_best"])} '
+              f'best_ppl_arm={_diag.get("best_ppl_arm")}')
+        for _v, _c in sorted((_diag.get('cost') or {}).items()):
+            if _c.get('flags'):
+                print(f'[m0-analysis] {label}/{_v}: cost flags {_c["flags"]}')
         report['notes'].append(
             '%s: n=%d seed(s), descriptive_only=%s; the raw exact sign-flip '
             'floor and the declared-family floor are both reported in its '

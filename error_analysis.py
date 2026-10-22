@@ -108,6 +108,62 @@ def _roundtrip(d):
     return json.loads(json.dumps(d, default=str))
 
 
+def _one_line(value, limit=160):
+    text = '' if value is None else str(value)
+    return text.replace('\r', '\\r').replace('\n', '\\n')[:limit]
+
+
+def _print_bad_cases(res, *, n_tokens=10, n_sequences=3):
+    """Print the worst samples so the reviewer does not have to open JSONL first.
+
+    The console view deliberately repeats the manual-review caveat: the cause
+    label is a triage prompt, not an annotation verdict.
+    """
+    if n_tokens <= 0 and n_sequences <= 0:
+        return
+    print('\n[errors] worst-token samples (context -> target | predicted; cause is a heuristic):')
+    tokens = res.get('worst_tokens') if isinstance(res.get('worst_tokens'), list) else []
+    for i, t in enumerate(tokens[:max(0, int(n_tokens))]):
+        if not isinstance(t, dict):
+            continue
+        topk = t.get('topk_text')
+        if not (isinstance(topk, list) and any(x is not None for x in topk)):
+            topk = t.get('topk_ids') or []
+        if isinstance(topk, list):
+            topk_txt = ', '.join(_one_line(x, 24) for x in topk[:5])
+        else:
+            topk_txt = _one_line(topk, 80)
+        flags = []
+        if t.get('same_context_ambiguous'):
+            flags.append('prefix has multiple targets')
+        if t.get('rare_target'):
+            flags.append('rare target')
+        print(f"  #{i + 1} row={t.get('row')} pos={t.get('position')} CE={t.get('ce')}  "
+              f"target={t.get('target_id')}:{_one_line(t.get('target_text'), 48)!r}  "
+              f"pred={t.get('pred_id')}:{_one_line(t.get('pred_text'), 48)!r}")
+        print(f"      context={_one_line(t.get('context_text'), 180)!r}")
+        print(f"      top-5=[{topk_txt}]  cause={t.get('cause_primary')} "
+              f"causes={t.get('causes')}" + (f"  flags={flags}" if flags else ''))
+    seqs = res.get('worst_sequences') if isinstance(res.get('worst_sequences'), list) else []
+    if n_sequences > 0 and seqs:
+        print('[errors] worst sequences:')
+        for i, sq in enumerate(seqs[:int(n_sequences)]):
+            if not isinstance(sq, dict):
+                continue
+            print(f"  seq #{i + 1} row={sq.get('row')} mean_CE={sq.get('mean_ce')} "
+                  f"n_tokens={sq.get('n_tokens')} context={_one_line(sq.get('context'), 240)!r}")
+    counts = res.get('cause_counts') if isinstance(res.get('cause_counts'), dict) else {}
+    if counts:
+        tally = ', '.join(f'{k}={v}' for k, v in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
+        print(f'[errors] worst-token cause tally: {tally}')
+    ca = res.get('context_ambiguity')
+    if isinstance(ca, dict):
+        print(f"[errors] prefix ambiguity: {ca.get('n_ambiguous_worst')}/{ca.get('n_worst_reviewed')} "
+              f'reviewed worst tokens share a prefix with another target; '
+              f"{ca.get('n_contexts_with_multiple_targets')} ambiguous context(s) in the evaluated rows")
+    print('[errors] Read the context and label before acting: annotation error, genuine ambiguity and a model blind spot need different fixes.\n')
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--ckpt', required=True)
@@ -120,6 +176,8 @@ def main(argv=None):
     ap.add_argument('--max-rows', type=int, default=64)
     ap.add_argument('--top-tokens', type=int, default=80)
     ap.add_argument('--top-sequences', type=int, default=30)
+    ap.add_argument('--print-samples', type=int, default=10, help='worst-token samples to print (0 disables)')
+    ap.add_argument('--print-sequences', type=int, default=3, help='worst sequences to print (0 disables)')
     ap.add_argument('--chunk', type=int, default=8)
     ap.add_argument('--device', default=None)
     args = ap.parse_args(argv)
@@ -136,6 +194,8 @@ def main(argv=None):
     n_rows = int(args.max_rows)
     if n_rows < 1:
         raise SystemExit(f'--max-rows must be a positive integer, got {n_rows}')
+    if args.print_samples < 0 or args.print_sequences < 0:
+        raise SystemExit('--print-samples/--print-sequences must be non-negative integers')
     n_rows = min(n_rows, int(val_batch.shape[0]))
     val_batch = np.ascontiguousarray(val_batch[:n_rows, :seq_len])
     if val_bnd is not None:
@@ -222,13 +282,18 @@ def main(argv=None):
             lines.append(f'| {c} | {v.get("n")} | {(v.get("share") or 0) * 100:.1f}% | {v.get("mean_ce"):.3f} |')
     lines += ['', '## Worst tokens', '',
               '> Read the context before changing the model: a rare-but-correct target, a genuinely ambiguous continuation and a confident blind spot need different fixes.', '',
-              '| # | row | pos | CE | context (truncated) | target | predicted | entropy | rare | ctx variants | cause | boundary |', '|---|---|---|---|---|---|---|---|---|---|---|---|']
+              '| # | row | pos | CE | context (truncated) | target | predicted | top-5 | train count | entropy | rare | ctx variants | cause | boundary |', '|---|---|---|---|---|---|---|---|---|---|---|---|---|---|']
     _tokens = res.get('worst_tokens') if isinstance(res.get('worst_tokens'), list) else []
     for i, t in enumerate(_tokens):
         tgt = (t.get('target_text') or '').replace('|', '\\|').replace('\n', '\\n')[:80]
         prd = (t.get('pred_text') or '').replace('|', '\\|').replace('\n', '\\n')[:80]
         ctx = (t.get('context_text') or '').replace('|', '\\|').replace('\n', '\\n')[:180]
-        lines.append(f'| {i + 1} | {t["row"]} | {t["position"]} | {t["ce"]:.3f} | {ctx} | `{t.get("target_id")}` {tgt} | `{t.get("pred_id")}` {prd} | {t["entropy"]:.3f} | {t.get("rare_target")} | {t.get("same_context_target_variants")} | {t.get("cause_primary")} | {t.get("is_boundary_token")} |')
+        _top = t.get('topk_text')
+        if not (isinstance(_top, list) and any(x is not None for x in _top)):
+            _top = t.get('topk_ids') or []
+        _top_txt = ', '.join(str(x).replace('|', '\\|').replace('\n', '\\n')[:24]
+                             for x in (_top[:5] if isinstance(_top, list) else []))
+        lines.append(f'| {i + 1} | {t["row"]} | {t["position"]} | {t["ce"]:.3f} | {ctx} | `{t.get("target_id")}` {tgt} | `{t.get("pred_id")}` {prd} | {_top_txt} | {t.get("target_train_count")} | {t["entropy"]:.3f} | {t.get("rare_target")} | {t.get("same_context_target_variants")} | {t.get("cause_primary")} | {t.get("is_boundary_token")} |')
     lines += ['', '## Worst sequences', '',
               '| # | row | mean CE | NLL | context (truncated) |', '|---|---|---|---|---|']
     for i, s in enumerate(res.get('worst_sequences') or []):
@@ -253,6 +318,7 @@ def main(argv=None):
             lines.append(f'| {i + 1} | {t["row"]} | {t["position"]} | `{t["target_id"]}` {tg} | {t["ce_a"]:.3f} | {t["ce_b"]:.3f} | {t["delta_b_minus_a"]:+.3f} |')
     lines += ['', '> This file is a diagnostic starting point, not a result table. Inspect the labelled target and context before declaring a model failure: annotation errors, near-duplicates, genuinely ambiguous text and rare tokens all look like "high CE". The automatic cause label is a triage heuristic; only a manual read of the context and label can separate an annotation error from an ambiguous example from a model blind spot.', '']
     L.atomic_write_text(os.path.join(args.outdir, 'bad_cases.md'), '\n'.join(lines) + '\n')
+    _print_bad_cases(res, n_tokens=args.print_samples, n_sequences=args.print_sequences)
     print(f'[errors] wrote {jsonl}, {os.path.join(args.outdir, "bad_cases.md")}, {os.path.join(args.outdir, "summary.json")}' + (' + paired comparison' if paired else ''))
     return res
 
