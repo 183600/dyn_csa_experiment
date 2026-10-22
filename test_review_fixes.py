@@ -16453,6 +16453,208 @@ def t_evidence_and_dynamic_audits_reject_malformed_thresholds():
         assert r['status'] == 'fail', (key, val, r)
 
 
+def t_dynamic_design_requires_explicit_mapping_and_orientation():
+    import copy
+    with open(os.path.join(REPO, 'confirmation_frozen_dynamic.json'), encoding='utf-8') as f:
+        dyn = json.load(f)
+    # A new comparison must state its evidence level; inheriting the manifest
+    # level silently is exactly how an exploratory contrast becomes "frozen".
+    bad = copy.deepcopy(dyn)
+    bad['primary_comparisons'][0].pop('evidence_level')
+    r = L.dynamic_design_audit(bad)
+    assert r['status'] == 'fail', r
+    assert any('no explicit evidence_level' in v for v in r['violations']), r['violations']
+    # Endpoint drift is a post-hoc outcome change, not a confirmation.
+    bad = copy.deepcopy(dyn)
+    bad['primary_comparisons'][0]['endpoint'] = 'by_len.ppl@2048'
+    r = L.dynamic_design_audit(bad)
+    assert r['status'] == 'fail' and any(
+        'does not equal the hypothesis endpoint' in v for v in r['violations']), r['violations']
+    # A reversed contrast must carry the reversed expected sign.
+    bad = copy.deepcopy(dyn)
+    bad['primary_comparisons'][0]['expected_sign'] = 1
+    r = L.dynamic_design_audit(bad)
+    assert r['status'] == 'fail' and any(
+        'expected_sign=1 is inconsistent' in v for v in r['violations']), r['violations']
+    # A declared hypothesis without any scheduled comparison is not a design.
+    bad = copy.deepcopy(dyn)
+    bad['primary_comparisons'] = [
+        c for c in bad['primary_comparisons']
+        if c.get('hypothesis_id') != 'H2_retrieval_precision']
+    r = L.dynamic_design_audit(bad)
+    assert r['status'] == 'fail' and any(
+        'H2_retrieval_precision has no primary comparison' in v
+        for v in r['violations']), r['violations']
+    # An extra hypothesis object is validated, not silently ignored.
+    bad = copy.deepcopy(dyn)
+    bad['hypotheses']['HX_extra'] = 'not-an-object'
+    r = L.dynamic_design_audit(bad)
+    assert r['status'] == 'fail' and any(
+        'malformed extra claim' in v for v in r['violations']), r['violations']
+    # System-level H3/H5 cannot carry the mechanism flag even if all budgets
+    # happened to match.
+    bad = copy.deepcopy(dyn)
+    h3 = next(c for c in bad['primary_comparisons']
+              if c.get('hypothesis_id') == 'H3_long_range_coverage')
+    h3['mechanism_claim_allowed'] = True
+    r = L.dynamic_design_audit(bad)
+    assert r['status'] == 'fail' and any(
+        'not declared mechanism_claim_eligible' in v for v in r['violations']), r['violations']
+
+
+def t_dynamic_power_and_read_calibration_are_machine_checked():
+    import copy
+    with open(os.path.join(REPO, 'confirmation_frozen_dynamic.json'), encoding='utf-8') as f:
+        dyn = json.load(f)
+    # The exact p floor and Holm floor are arithmetic, not prose.
+    for key, val in (('p_floor', 1e-3),
+                     ('min_attainable_p_holm', 0.01),
+                     ('n_seeds', 15),
+                     ('min_power_for_test', 0.99),
+                     ('power_q_for_test', 0.90)):
+        bad = copy.deepcopy(dyn)
+        bad['statistics'][key] = val
+        r = L.dynamic_design_audit(bad)
+        assert r['status'] == 'fail', (key, val, r['violations'])
+    # A power-gate "passed" label without a numeric power is not a gate.
+    bad = copy.deepcopy(dyn)
+    bad['precondition']['power_gate'] = {'status': 'passed'}
+    r = L.dynamic_design_audit(bad)
+    assert r['status'] == 'fail' and any(
+        'power is missing' in v for v in r['violations']), r['violations']
+    # Measured calibration must contain the realized mean and the concrete arm
+    # derived from it; a target_block_tokens guess is not a measurement.
+    bad = copy.deepcopy(dyn)
+    cal = bad['precondition']['read_budget_calibration']
+    cal['status'] = 'measured'
+    r = L.dynamic_design_audit(bad)
+    assert r['status'] == 'fail' and any(
+        'positive mean_dynamic_block_tokens' in v for v in r['violations']), r['violations']
+    # Formula inconsistency is refused.
+    bad = copy.deepcopy(dyn)
+    cal = bad['precondition']['read_budget_calibration']
+    cal.update(status='measured', mean_dynamic_block_tokens=4.5,
+               matched_fixed_topk=32, arm='csa_fixed_rope_topk32')
+    r = L.dynamic_design_audit(bad)
+    assert r['status'] == 'fail' and any(
+        'does not equal the calibration formula result 36' in v
+        for v in r['violations']), r['violations']
+    # A formula-consistent k with no trained/declared arm is still a guess.
+    bad = copy.deepcopy(dyn)
+    cal = bad['precondition']['read_budget_calibration']
+    cal.update(status='measured', mean_dynamic_block_tokens=4.5,
+               matched_fixed_topk=36, arm='csa_fixed_rope_topk36')
+    r = L.dynamic_design_audit(bad)
+    assert r['status'] == 'fail' and any(
+        'is not in manifest.arms' in v for v in r['violations']), r['violations']
+    # With the measured arm present the draft is calibration-consistent again
+    # (it is still a non-runnable draft, not a confirmation).
+    good = copy.deepcopy(bad)
+    good['arms'].append('csa_fixed_rope_topk36')
+    good['binding']['per_arm_recipe_signature']['csa_fixed_rope_topk36'] = {'mr': 4.0}
+    r = L.dynamic_design_audit(good)
+    assert r['status'] == 'ok', r['violations']
+    assert r['calibration']['status'] == 'ok' and r['calibration']['expected_topk'] == 36, r['calibration']
+    assert r['promotion_ready'] is False, r
+
+
+def t_budget_ledger_mechanism_claim_needs_confirmation_and_calibration():
+    import copy
+    with open(os.path.join(REPO, 'confirmation_frozen_dynamic.json'), encoding='utf-8') as f:
+        dyn = json.load(f)
+    # A draft cannot turn a matched budget into a mechanism claim.
+    bad = copy.deepcopy(dyn)
+    bad['primary_comparisons'][0]['mechanism_claim_allowed'] = True
+    r = L.comparison_budget_ledger(bad)
+    assert r['status'] == 'fail' and any(
+        'evidence_level=' in v and 'mechanism claim' in v for v in r['violations']), r['violations']
+    # Promote the same design: the claim is now allowed only because the
+    # manifest is confirmatory AND the dynamic-vs-fixed calibration is measured.
+    good = copy.deepcopy(dyn)
+    good['status'] = 'frozen'
+    good['frozen_at'] = '2026-10-23'
+    good['evidence_level'] = 'confirmatory'
+    good['precondition']['runnable'] = True
+    good['precondition']['read_budget_calibration'].update(
+        status='measured', mean_dynamic_block_tokens=4.0,
+        matched_fixed_topk=32, arm='csa_fixed_rope_topk32')
+    good['precondition']['power_gate'] = {
+        'status': 'passed', 'power': 0.957, 'q': 0.95, 'min_power': 0.8}
+    good['primary_comparisons'][0]['evidence_level'] = 'confirmatory'
+    good['primary_comparisons'][0]['mechanism_claim_allowed'] = True
+    r = L.comparison_budget_ledger(good)
+    assert r['status'] == 'ok', r['violations']
+    entry = r['comparisons'][good['primary_comparisons'][0]['name']]
+    assert entry['mechanism_claim_allowed'] is True, entry
+    assert entry['read_budget_calibration_ok'] is True, entry
+    assert entry['compute_proxy_matched'] is True, entry
+    # A pending calibration breaks the mechanism claim even with the same
+    # confirmatory label: a status must be measured, not merely present.
+    pend = copy.deepcopy(good)
+    pend['precondition']['read_budget_calibration']['status'] = 'pending'
+    rp = L.comparison_budget_ledger(pend)
+    assert rp['status'] == 'fail' and any(
+        'MEASURED read-budget calibration' in v for v in rp['violations']), rp['violations']
+    # Dropping the confirmatory level drops the claim.
+    exp = copy.deepcopy(good)
+    exp['evidence_level'] = 'exploratory'
+    re = L.comparison_budget_ledger(exp)
+    assert re['status'] == 'fail' and any(
+        'evidence_level=' in v and 'mechanism claim' in v for v in re['violations']), re['violations']
+    # A different served cache is a data treatment, not a nuisance.
+    with open(os.path.join(REPO, 'confirmation_frozen.json'), encoding='utf-8') as f:
+        main = json.load(f)
+    tok = copy.deepcopy(main)
+    tok['binding']['per_arm_recipe_signature']['full_rope']['nt'] = 4000000
+    rt = L.comparison_budget_ledger(tok)
+    assert rt['status'] == 'fail' and any(
+        'served train-cache budget' in p for p in rt['problems']), rt['problems']
+    # Boolean counts must not silently become 1.
+    bool_step = copy.deepcopy(main)
+    bool_step['binding']['training_recipe_signature']['steps'] = True
+    rb = L.comparison_budget_ledger(bool_step)
+    assert rb['status'] == 'fail' and any(
+        'positive steps/bs/sl' in p for p in rb['problems']), rb['problems']
+
+
+def t_evidence_audit_checks_power_floor_and_family_identity():
+    import copy
+    with open(os.path.join(REPO, 'confirmation_frozen.json'), encoding='utf-8') as f:
+        main = json.load(f)
+    for key, val in (('p_floor', 1e-4),
+                     ('min_attainable_p_holm', 0.01),
+                     ('n_seeds', 11),
+                     ('alpha', float('nan'))):
+        bad = copy.deepcopy(main)
+        bad['statistics'][key] = val
+        r = L.evidence_level_audit(bad, manifest_path=os.path.join(REPO, 'confirmation_frozen.json'))
+        assert r['status'] == 'fail', (key, val, r['violations'])
+    # A stale per-q power table is a design record defect, not a rounding nit.
+    stale = copy.deepcopy(main)
+    stale['statistics']['power_first_holm_gate']['q=0.95'] = 0.50
+    r = L.evidence_level_audit(stale, manifest_path=os.path.join(REPO, 'confirmation_frozen.json'))
+    assert r['status'] == 'fail' and any(
+        'power_first_holm_gate' in v for v in r['violations']), r['violations']
+    # Duplicate comparison names would silently merge two family slots.
+    dup = copy.deepcopy(main)
+    dup['primary_comparisons'].append(copy.deepcopy(dup['primary_comparisons'][0]))
+    r = L.evidence_level_audit(dup, manifest_path=os.path.join(REPO, 'confirmation_frozen.json'))
+    assert r['status'] == 'fail' and any(
+        'duplicate primary comparison name' in v for v in r['violations']), r['violations']
+    # Duplicate frozen seeds are not extra replication.
+    dseed = copy.deepcopy(main)
+    dseed['seeds'][1] = dseed['seeds'][0]
+    r = L.evidence_level_audit(dseed, manifest_path=os.path.join(REPO, 'confirmation_frozen.json'))
+    assert r['status'] == 'fail' and any(
+        'seeds contain duplicates' in v for v in r['violations']), r['violations']
+    # A malformed direction word is not a direction.
+    badsig = copy.deepcopy(main)
+    badsig['primary_comparisons'][0]['expected_sign'] = 'maybe'
+    r = L.evidence_level_audit(badsig, manifest_path=os.path.join(REPO, 'confirmation_frozen.json'))
+    assert r['status'] == 'fail' and any(
+        'expected_sign' in v for v in r['violations']), r['violations']
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -16883,6 +17085,10 @@ def main():
     _check('L91 audit artifacts resolve from REPO independent of CWD', t_audit_artifacts_resolve_from_repo_not_cwd)
     _check('L92 row identity is numeric-dtype safe + 128-bit', t_row_identity_is_numeric_dtype_and_width_safe)
     _check('L93 evidence/dynamic audits reject malformed thresholds', t_evidence_and_dynamic_audits_reject_malformed_thresholds)
+    _check('L94 dynamic design requires explicit mapping + orientation', t_dynamic_design_requires_explicit_mapping_and_orientation)
+    _check('L95 dynamic power/read calibration are machine-checked', t_dynamic_power_and_read_calibration_are_machine_checked)
+    _check('L96 mechanism claim needs confirmation + measured calibration', t_budget_ledger_mechanism_claim_needs_confirmation_and_calibration)
+    _check('L97 evidence audit checks power floor + family identity', t_evidence_audit_checks_power_floor_and_family_identity)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

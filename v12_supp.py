@@ -3027,6 +3027,9 @@ def dynamic_plan_check(manifest_path=DYNAMIC_MANIFEST):
               'evidence_level': ev.get('manifest_level'),
               'runnable': d.get('runnable'),
               'promotion_ready': d.get('promotion_ready'),
+              'power': d.get('power'),
+              'calibration': d.get('calibration'),
+              'design_cost': led.get('design_cost'),
               'design': d, 'budget_ledger': led, 'evidence_level_audit': ev,
               'errors': errs}
     if errs:
@@ -3039,6 +3042,19 @@ def dynamic_plan_check(manifest_path=DYNAMIC_MANIFEST):
     print(f"[v12 dynamic-plan] OK: design coherent; evidence_level={ev.get('manifest_level')}; "
           f"hypotheses={sorted(d.get('hypotheses') or {})}; "
           f"runnable={d.get('runnable')}; promotion_ready={d.get('promotion_ready')}")
+    _pw = d.get('power') or {}
+    _cal = d.get('calibration') or {}
+    _cost = led.get('design_cost') or {}
+    if _pw:
+        print(f"  [dynamic-plan] power: n={_pw.get('n_seeds')} m={_pw.get('family_m')} "
+              f"projected@{_pw.get('power_q_for_test')}={_pw.get('projected_power')} "
+              f"min={_pw.get('min_power_for_test')}")
+    if _cal:
+        print(f"  [dynamic-plan] read calibration: status={_cal.get('status')} "
+              f"expected_topk={_cal.get('expected_topk')} arm={_cal.get('arm')}")
+    if _cost:
+        print(f"  [dynamic-plan] design cost: {_cost.get('n_runs')} runs, "
+              f"{_cost.get('consumed_tokens_total')} consumed tokens (scheduling aid)")
     for _w in (d.get('warnings') or []) + (led.get('warnings') or []) + (ev.get('warnings') or []):
         print(f'  [dynamic-plan][note] {_w}')
     if not d.get('promotion_ready'):

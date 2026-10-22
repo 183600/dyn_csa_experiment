@@ -114,6 +114,17 @@
       "interpretation_caveat": "Read budget is an analytic proxy until the realized dynamic block length is measured; do not call this read-matched yet. Also confounds boundary policy with learned selection unless paired with the random-vs-random segmentation control."
     },
     {
+      "name": "H3 read-matched fixed vs dynamic (PPL) @ L4096 (draft)",
+      "a": "csa_dynamic_rope",
+      "b": "csa_fixed_rope_topk32",
+      "endpoint": "by_len.ppl@4096",
+      "hypothesis_id": "H3_long_range_coverage",
+      "expected_sign": -1,
+      "evidence_level": "draft",
+      "mechanism_claim_allowed": false,
+      "interpretation_caveat": "This is the H3 long-range-coverage contrast: dynamic reads vs a concrete FIXED arm whose top-k is calibrated from the measured realized dynamic block length. topk32 is only the current candidate; after calibration replace the arm name with the calibrated csa_fixed_rope_topk{k}. The analytic target_block_tokens proxy is not a read-budget match."
+    },
+    {
       "name": "H1 segmentation-only (random selection) @ L4096 (draft)",
       "a": "csa_dynamic_rope_randidx_seeded",
       "b": "csa_fixed_rope_randidx_seeded",
@@ -185,11 +196,11 @@
     "n_seeds": 16,
     "p_floor": 3.0517578125e-05,
     "alpha": 0.05,
-    "family": "primary_comparisons only (m=7)",
+    "family": "primary_comparisons only (m=8)",
     "correction": "holm step-down",
-    "min_attainable_p_holm": 0.000213623046875,
+    "min_attainable_p_holm": 0.000244140625,
     "min_seeds_for_confirmation": 12,
-    "min_seeds_note": "with 16 frozen seeds and a 7-comparison Holm family, 12 complete pairs already give a minimum attainable Holm p of 0.0034 < 0.05; the shipped confirmation must still require all 16 seeds (complete coverage, no top-up)",
+    "min_seeds_note": "with 16 frozen seeds and an 8-comparison Holm family, 12 complete pairs already give a minimum attainable Holm p of 0.00390625 < 0.05; the shipped confirmation must still require all 16 seeds (complete coverage, no top-up)",
     "require_complete_coverage": true,
     "require_power_gate": true,
     "min_power_for_test": 0.8,
@@ -197,7 +208,17 @@
     "power_simulation_required": true,
     "power_note": "Before any disjoint test read, simulate the exact sign-flip over the calibration per-seed delta vector; if power at q=0.95 is below 0.8, add seeds and record the revision BEFORE the read. The symbol-test projection is only a rough design aid.",
     "decision_rule": "DRAFT: not active. Once frozen, CONFIRMED requires status=frozen, a disjoint test source never used for selection, a passed pre-test power gate, complete 16-seed coverage, p_holm<0.05, direction matching the pre-registered sign, matched token/parameter/read budgets (measured calibration for dynamic-vs-fixed), and mechanism_claim_allowed=true only for a single-factor contrast.",
-    "seed_policy": "seeds 0-15 are frozen for this draft; no seeds may be added after the first disjoint test read (selection bias by construction). Missing seeds are reported as unincluded, never topped up."
+    "seed_policy": "seeds 0-15 are frozen for this draft; no seeds may be added after the first disjoint test read (selection bias by construction). Missing seeds are reported as unincluded, never topped up.",
+    "power_projection": {
+      "q": 0.95,
+      "n_seeds": 16,
+      "family_m": 8,
+      "alpha": 0.05,
+      "power": 0.9570621465142272,
+      "minimum_same_sign_seeds": 14,
+      "method": "equal-magnitude symbol-test projection via exp_lib.signflip_power; not the exact sign-flip power for unequal deltas",
+      "source": "design projection at the frozen n/m/q; before freeze replace it with the exact sign-flip simulation on the calibration per-seed delta vector"
+    }
   },
   "eval": {
     "n_seqs_clean": 48,
@@ -254,7 +275,14 @@
       "status": "pending",
       "source": "validation measurement of the realized mean dynamic block length",
       "rule": "freeze the concrete csa_fixed_rope_topk{k_fixed} arm after measurement",
-      "must_not_guess": true
+      "must_not_guess": true,
+      "fixed_block_size": 4,
+      "topk_dynamic": 32,
+      "mean_dynamic_block_tokens": null,
+      "matched_fixed_topk": null,
+      "arm": null,
+      "formula": "k_fixed = round(topk_dynamic * mean_dynamic_block_tokens / fixed_block_size)",
+      "require_concrete_arm": true
     },
     "power_gate": {
       "status": "pending",
@@ -285,10 +313,21 @@
       "predicted_sign": 1,
       "primary_metric": "f1",
       "metric_policy": "boundary_alignment",
-      "endpoint": "boundary_f1.tol1@L4096",
+      "endpoint": "boundary_f1.tol1@4096",
       "requires_param_match": true,
       "falsifier": "Dynamic cuts do not beat fixed cuts on matched-length boundary F1 after Holm correction, or the gain disappears in the random-vs-random segmentation-only contrast.",
-      "evidence_level": "draft"
+      "evidence_level": "draft",
+      "contrast_arms": [
+        [
+          "csa_dynamic_rope_randidx_seeded",
+          "csa_fixed_rope_randidx_seeded"
+        ],
+        [
+          "csa_dynamic_rope",
+          "csa_fixed_rope_topk32"
+        ]
+      ],
+      "mechanism_claim_eligible": true
     },
     "H2_retrieval_precision": {
       "statement": "At the same top-k read budget, learned selection over dynamic blocks retrieves the answer-bearing block more often than a seeded random selector over the same dynamic blocks, and its retrieval advantage is not explained by extra parameters or read slots.",
@@ -299,7 +338,14 @@
       "endpoint": "niah.top1_accuracy@L4096",
       "requires_param_match": true,
       "falsifier": "The seeded random selector matches or beats learned selection on the NIAH/selection endpoint after Holm correction, or the contrast is within seed noise.",
-      "evidence_level": "draft"
+      "evidence_level": "draft",
+      "contrast_arms": [
+        [
+          "csa_dynamic_rope",
+          "csa_dynamic_rope_randidx_seeded"
+        ]
+      ],
+      "mechanism_claim_eligible": true
     },
     "H3_long_range_coverage": {
       "statement": "Dynamic blocking improves long-range coverage: at matched token, parameter and read budgets it lowers L4096 PPL versus a read-matched fixed blocking arm, not merely versus dense attention.",
@@ -310,7 +356,22 @@
       "endpoint": "by_len.ppl@4096",
       "requires_param_match": true,
       "falsifier": "The read-matched fixed arm matches or beats the dynamic arm after Holm correction, or the L4096 gain reverses at L512.",
-      "evidence_level": "draft"
+      "evidence_level": "draft",
+      "contrast_arms": [
+        [
+          "csa_dynamic_rope",
+          "csa_fixed_rope"
+        ],
+        [
+          "csa_dynamic_rope",
+          "full_rope"
+        ],
+        [
+          "csa_dynamic_rope",
+          "csa_fixed_rope_topk32"
+        ]
+      ],
+      "mechanism_claim_eligible": false
     },
     "H4_task_policy": {
       "statement": "The LM-trained boundary policy lowers L4096 PPL versus the cosine threshold + compression-regularizer-only policy at the same read budget.",
@@ -321,7 +382,14 @@
       "endpoint": "by_len.ppl@4096",
       "requires_param_match": true,
       "falsifier": "The task-trained policy matches or loses to the cosine policy after Holm correction, or its seed variance makes the panel unusable.",
-      "evidence_level": "draft"
+      "evidence_level": "draft",
+      "contrast_arms": [
+        [
+          "csa_dynamic_rope_task",
+          "csa_dynamic_rope"
+        ]
+      ],
+      "mechanism_claim_eligible": true
     },
     "H5_hca_hierarchy": {
       "statement": "Alternating dynamic CSA and HCA layers lowers L4096 PPL versus dynamic CSA only at matched training tokens and parameters.",
@@ -332,7 +400,14 @@
       "endpoint": "by_len.ppl@4096",
       "requires_param_match": true,
       "falsifier": "The hybrid matches or loses to CSA-only after Holm correction, or the contrast is confounded by HCA reading every closed block.",
-      "evidence_level": "draft"
+      "evidence_level": "draft",
+      "contrast_arms": [
+        [
+          "hybrid_dynamic_rope",
+          "csa_dynamic_rope"
+        ]
+      ],
+      "mechanism_claim_eligible": false
     }
   },
   "budget_controls": {
@@ -359,6 +434,14 @@
       "arm": "csa_fixed_rope",
       "rule": "the fixed reference consumes the same 18.4M tokens as every dynamic arm",
       "check": "token budget equality is verified by comparison_budget_ledger before any run"
+    },
+    "dense_token_matched": {
+      "arms": [
+        "full_rope",
+        "full_rope_sink"
+      ],
+      "rule": "the parameter-proxy dense arms consume exactly the same steps*bs*seq_len tokens from the same 8M-token cache and data order as every CSA/HCA arm; parameter matching is a separate, explicit reallocation of MLP width",
+      "not_read_matched": "parameter/token matching does NOT match FLOPs or attention reads; use the read_budget control for a mechanism claim"
     },
     "read_budget": {
       "fixed_learned": {

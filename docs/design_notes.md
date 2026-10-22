@@ -1958,7 +1958,7 @@ disjoint test + 完整覆盖 + test 前功效门槛。
 可证伪假设：
 
 - **H1 切分质量**：`metric_policy=boundary_alignment`，主端点
-  `boundary_f1.tol1@L4096`；关键是 **random-vs-random** 对照——两臂都用
+  `boundary_f1.tol1@4096`；关键是 **random-vs-random** 对照——两臂都用
   seeded random selector，只有 fixed/dynamic 边界不同，才能把「边界」从
   「学习式选择」里分离出来。
 - **H2 检索精度**：`niah_retrieval`，主端点 `niah.top1_accuracy@L4096`；
@@ -1969,21 +1969,41 @@ disjoint test + 完整覆盖 + test 前功效门槛。
   数据相关的，所以 draft 要求先在 validation 上测出 realized mean block
   length，再按 `k_fixed = round(topk_dynamic * mean_dynamic_block_tokens /
   fixed_block_size)` 训练具体的 `csa_fixed_rope_topk{k_fixed}`；在测量前
-  `topk32` 只是候选，不能写成 read-matched。
+  `topk32` 只是候选，不能写成 read-matched。H3 现在有**专门的
+  `by_len.ppl` 动态 vs read-matched fixed 对照**，不再只靠「动态 vs 固定」
+  或「动态 vs dense」；审计要求这条 PPL 对照存在。
 - H4 task-learned boundary 与 H5 HCA hierarchy 作为独立假设记录；HCA 读
   每个 closed block，因此被明确标成 system-level，不得当作等读取机制对照。
 
-`dynamic_design_audit` 要求上述假设、专用臂、预算控制块、disjoint test
-source、measured read-budget calibration 与 passed power gate 都存在，才允许
-`promotion_ready=true`。draft 通过审计只说明「设计自洽」，不说明任何结果。
+每条 comparison 还必须显式声明 `evidence_level`，并通过
+`hypothesis_id` 绑定到假设的 `endpoint`、`predicted_sign` 与
+`contrast_arms`（谁减谁、方向是否反转）。H3/H5 标为
+`mechanism_claim_eligible=false`：即使预算恰好匹配，也不能被引用为边界/
+选择机制证据。新增一条对照却没有声明等级、端点漂移、方向反转写错或假设
+没有对应比较，都会在设计阶段被拒绝。
 
-### 39.5 入口
+### 39.5 功效与读取校准是冻结前的同一道门
+
+`statistics.p_floor`、`min_attainable_p_holm`、`min_seeds_for_confirmation`
+与 `power_first_holm_gate` 不再只是散文：`planned_power_audit` 用 exact
+sign-flip / Holm 公式重算并逐项对账。`min_power_for_test=0.8` 还必须真的
+被 `signflip_power(n, m, q, alpha)` 达到；只写 `power_gate.status=passed`
+而没有数值 power，或把 q 降到 0.90 使投影功效 0.789 < 0.8，都会 fail。
+
+动态读取校准由 `dynamic_read_budget_calibration` 验证：`status=measured`
+必须带 realized mean block length、`fixed_block_size`、`topk_dynamic` 和
+公式算出的 `matched_fixed_topk`，且 manifest 必须真的包含
+`csa_fixed_rope_topk{k_fixed}`。pending 状态只能存在于 draft；非 draft
+清单的 `promotion_ready` 需要 measured 校准 + passed power gate + 完整
+scope 声明同时成立。
+
+### 39.6 入口
 
 ```bash
 python audit_gates.py design          # 主清单 + 动态 draft 的预算/证据/假设审计
 python v12_supp.py plan               # 冻结清单 preflight（现在也包含预算台账与证据等级）
 python v12_supp.py dynamic-plan       # 动态 draft 的设计 preflight（不读 test）
-python test_review_fixes.py           # L82-L86 覆盖上述合约
+python test_review_fixes.py           # L82-L97 覆盖上述合约
 ```
 
 新增对照前先过 `design`：它会指出该对照属于 token/parameter/read 哪一维

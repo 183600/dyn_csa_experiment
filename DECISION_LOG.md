@@ -1351,3 +1351,42 @@ overlap scans with the sample size recorded, and a document-overlap scan below
 Verification: new CPU tests L87–L93 plus the existing suite.
 `python test_review_fixes.py` passes 426/429 with the same 3 DataLoader
 environment skips; `python test_open_block.py` passes 15/15.
+
+## 2026-10-22 — hypothesis/evidence/budget preflight hardening (no new runs)
+
+**Problem.** The design preflight from the previous pass still allowed four
+methodological loopholes. (1) A new dynamic comparison could omit
+`evidence_level` and silently inherit the manifest level; its endpoint or
+signed contrast was not tied to the declared hypothesis. (2) The declared
+p-floor/Holm floor and the projected power were prose, not recomputed from the
+frozen n/m/alpha. (3) A dynamic-vs-fixed mechanism claim only checked that a
+`read_budget_calibration` object existed, so `status=pending` was enough.
+(4) The H3 long-range-coverage claim had no PPL contrast against the concrete
+read-matched fixed arm — it still relied on the fixed/dense references — and
+`csa_fixed_rope_topk32` was not yet recognized as a single-factor
+segmentation family.
+
+**Changes.** (1) `exp_lib.planned_power_audit` recomputes the exact two-sided
+floor, the Holm floor, the minimum-seed floor, the per-q `power_first_holm_gate`
+table and the projected power; a plan whose projection is below
+`min_power_for_test`, or a `power_gate.status=passed` label without numeric
+power, fails. (2) `dynamic_read_budget_calibration` verifies the measured mean
+dynamic block length, the `k_fixed = round(topk*mean/fixed_block_size)` formula
+and the existence of the concrete `csa_fixed_rope_topk{k}` arm; pending
+calibration is draft-only. (3) `dynamic_design_audit` now requires an explicit
+`evidence_level` per comparison, an endpoint and signed orientation matching
+the hypothesis (`contrast_arms`), a scheduled comparison for every required
+hypothesis, a `by_len.ppl` dynamic-vs-read-matched-fixed contrast, and
+`mechanism_claim_eligible=true` before any mechanism flag. H3/H5 are explicitly
+system-level. (4) `comparison_budget_ledger` checks the served cache budget
+globally, rejects boolean token counts, records the 6ND/local-window deltas and
+design cost, and only permits a mechanism claim on a confirmatory manifest with
+a measured calibration. (5) The dynamic draft records those fields and its
+8-comparison power projection; it remains `status=draft`, `runnable=false`,
+`promotion_ready=false`. No frozen v12 arm/seed/endpoint/statistic changed.
+
+Verification: new CPU tests L94-L97 (explicit mapping/orientation, power and
+calibration formula, mechanism-claim confirmation, evidence-family identity).
+`python test_review_fixes.py` passes 430/433 with the same 3 DataLoader
+environment skips; `python v12_supp.py dynamic-plan` reports the draft as
+coherent but non-runnable.
