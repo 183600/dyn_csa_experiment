@@ -2558,6 +2558,17 @@ class LeakageSafeTargetEncoder:
         else:
             folds = self._row_folds(n, keys=_row_keys(Xarr))
             policy = 'row_oof'
+            if np.unique(folds).size < 2:
+                # Every row shares one feature key, so the duplicate-safe fold
+                # assignment puts all rows in a single fold.  That fold has no
+                # out-of-fold reference rows; silently emitting the 0.0 prior
+                # for every row would fabricate an encoding, exactly like the
+                # single-row case refused above.  Refuse instead (fit() still
+                # supports this data for a full-table holdout encoding).
+                raise ValueError(
+                    'LeakageSafeTargetEncoder.fit_transform needs at least 2 '
+                    'distinct feature rows so a held duplicate group has '
+                    'out-of-fold reference labels')
         out = np.zeros((n, Xarr.shape[1]), dtype=np.float64)
         for k in range(int(folds.max()) + 1):
             held = np.nonzero(folds == k)[0]

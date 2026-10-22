@@ -1036,14 +1036,15 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
                         except Exception as _te:
                             print(f'[health] WARNING: fixed train-CE evaluation failed ({type(_te).__name__}: {_te}); train CE stays unmonitored at this point')
                             _train_ce = None
-                    if L._is_finite_number(_train_ce):
-                        _last_train_ce = _train_ce
+                    # The `*_final` fields describe the last measurement,
+                    # including a non-finite one; keeping the previous finite
+                    # value would misreport a diverged final eval as healthy.
+                    _last_train_ce = _train_ce
                     _val_ce = math.log(_pv) if L._is_finite_number(_pv) and _pv > 0 else float('nan')
                     _health_history.append({'step': step + 1, 'val_ppl': _pv, 'val_ce': _val_ce,
                                             'train_ce': _train_ce,
                                             'gap': (_val_ce - _train_ce) if (math.isfinite(_val_ce) and L._is_finite_number(_train_ce)) else None})
-                    if L._is_finite_number(_pv) and _pv > 0:
-                        _last_subset_ppl = _pv
+                    _last_subset_ppl = _pv
                     if L._is_finite_number(_pv) and _pv > 0 and (_best_val_ppl is None or _pv < _best_val_ppl):
                         _best_val_ppl = _pv
                         _best_step = step + 1

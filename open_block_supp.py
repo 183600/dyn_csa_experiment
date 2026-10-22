@@ -789,9 +789,16 @@ def _primary_effective_n(results, names):
     for name in (names or []):
         r = (results or {}).get(name)
         if not isinstance(r, dict):
+            # A declared primary contrast with no measured record contributes
+            # zero resolution to the family; skipping it would let the other
+            # contrasts alone certify seed sufficiency for an incomplete panel.
+            used.append(0)
             continue
         n = _as_positive_int(r.get('n'))
         if n is None:
+            # n == 0 is a real (empty) contrast, not a missing one.  It can
+            # never supply sign resolution, so it pins the family floor at 0.
+            used.append(0)
             continue
         nn = L._as_seed_int(r.get('n_nonzero'))
         if nn is not None and 0 <= nn <= n:

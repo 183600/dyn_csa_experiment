@@ -1163,9 +1163,17 @@ def run_finaltest(cfg=None, guard=None):
     _dfp = L._ids_fp(np.ascontiguousarray(test_ids).reshape(-1))
     if int(test_ids.shape[0]) != _nseq_clean or int(test_ids.shape[1]) != need:
         raise SystemExit(f'[v12] REFUSE: loaded test slice shape {tuple(test_ids.shape)} != the frozen ({_nseq_clean}, {need}) — the row count and sequence length are part of the pre-registration; re-freeze explicitly instead of shrinking the panel')
+    # Bind the slice fingerprint IMMEDIATELY after the test read and shape
+    # check, before any audit/evaluation.  If an audit then fails or the
+    # process dies, the lock must still name the slice that was read; leaving
+    # a null preaccess lock would let a later run bind a different slice.
+    _check_or_write_freeze_lock(outdir, manifest, _dfp, stage='accessed',
+                                train_fp=_want_train_fp)
     if not _smoke:
-        # Run the leakage gate BEFORE the `accessed` lock is written
-        # and before any evaluation.  A gate that can never fire (a
+        # Run the leakage gate AFTER the slice is bound but BEFORE any
+        # evaluation.  The binding must survive a failed audit (that is what
+        # keeps the one-shot slice immutable); the audit still gates whether
+        # any measurement is produced.  A gate that can never fire (a
         # Jaccard<=0.05 on a 4M-vs-65k shingle pair) is not a gate, and a
         # `not_verifiable_locally` result must not pass silently.  Both are
         # hard refusals; only a verifiable, clean audit unlocks the panel.
@@ -1206,10 +1214,6 @@ def run_finaltest(cfg=None, guard=None):
         if _sd.get('status') == 'fail':
             _why = list(_sd.get('warnings') or [])
             raise SystemExit(f'[v12] REFUSE: the split-discipline audit reports a hard failure ({"; ".join(_why[:4]) if _why else "see audit_gates.py split"}) — the held-out test split is not clean enough for a frozen confirmation')
-    # first-test-access lock — the plan may not change after
-    # the test split has been read, and the slice itself is part of the freeze.
-    _check_or_write_freeze_lock(outdir, manifest, _dfp, stage='accessed',
-                                train_fp=_want_train_fp)
     print(f'[p5t] manifest {cfg["manifest"]} frozen_at={manifest.get("frozen_at", "?")} sha256={manifest.get("manifest_sha256", "?")[:12]}… arms={manifest["arms"]} seeds={manifest["seeds"]}')
     print(f'[p5t] TEST split rows {test_ids.shape} (held out; no other phase reads this split; ids_fp={_dfp[:12]}…)')
     if _nseq_clean < 64:
@@ -2017,6 +2021,7 @@ def run_power(manifest_path=FREEZE_MANIFEST, summary='results_v10_mech/summary.j
               'summary': summary, 'alpha': alpha, 'm_family': m_family,
               'power_q_for_test': power_q, 'min_power_for_test': min_power,
               'require_power_gate': require, 'comparisons': {}}
+    _seed_whitelist = {int(s) for s in manifest['seeds']}
     all_pass = True
     for comp in comps:
         name = comp.get('name')
@@ -2040,7 +2045,18 @@ def run_power(manifest_path=FREEZE_MANIFEST, summary='results_v10_mech/summary.j
             except (TypeError, ValueError):
                 skipped += 1
                 continue
-            (recs_a if v == a else recs_b)[seed] = rec
+            if seed not in _seed_whitelist:
+                # The frozen sample size/seed set is part of the
+                # pre-registration; an extra legacy seed must not enlarge the
+                # power panel (and a duplicate key spelling must not silently
+                # replace an existing record).
+                skipped += 1
+                continue
+            _dst = recs_a if v == a else recs_b
+            if seed in _dst:
+                skipped += 1
+                continue
+            _dst[seed] = rec
         common = sorted(set(recs_a) & set(recs_b))
         dl, used = _paired_len_deltas(recs_a, recs_b, common, Ln)
         cell = {'endpoint': f'by_len.ppl@{Ln}', 'n': len(dl), 'seeds': used,

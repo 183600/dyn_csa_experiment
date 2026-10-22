@@ -2615,6 +2615,25 @@ def first_occurrence_mask(idx):
     keep.scatter_(1, order, first)
     return keep
 
+
+def _first_occurrence_of_valid(idx, valid):
+    """Keep the first occurrence of each block among the *valid* lanes.
+
+    `first_occurrence_mask` runs before `sel_valid` is applied, so when the
+    first copy of a block id is invalid and a later copy is valid, the plain
+    conjunction removes the later (valid) lane too and the block is never
+    read.  Give every invalid lane a unique negative key first: block ids are
+    non-negative, so these keys cannot collide with a readable block, and the
+    final `& valid` drops them anyway.  The valid lanes then compete only
+    with each other, which is the intended dedup contract.
+    """
+    if valid is None:
+        return first_occurrence_mask(idx)
+    lanes = torch.arange(idx.shape[1], device=idx.device, dtype=torch.long)
+    key = torch.where(valid, idx.to(torch.long), -(lanes + 1))
+    return first_occurrence_mask(key)
+
+
 def _block_order(block_ids, n):
     if block_ids.numel() <= 1:
         return (_arange_cache(block_ids.numel(), block_ids.device), True)
@@ -4422,7 +4441,7 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         valid_all[:, :_nb] = (pos_all[:, None] > last_tok[None, :]) if _arange_sel else (pos_all[:, None] > last_tok[topk_l])
         keep_all = sel_valid
         if _dedup:
-            _ddk_all = first_occurrence_mask(topk_l)
+            _ddk_all = _first_occurrence_of_valid(topk_l, sel_valid)
             keep_all = _ddk_all if keep_all is None else keep_all & _ddk_all
         if keep_all is not None:
             valid_all[:, :_nb] &= keep_all
@@ -4490,7 +4509,8 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
             if _has_sv:
                 keep = sel_valid[s:e]
             if _dedup:
-                _ddk = first_occurrence_mask(topk_l[s:e])
+                _ddk = _first_occurrence_of_valid(
+                    topk_l[s:e], sel_valid[s:e] if _has_sv else None)
                 keep = _ddk if keep is None else keep & _ddk
             if keep is not None:
                 sel_blk = sel_blk & keep
@@ -8970,7 +8990,12 @@ def batch_iter(train_ids, seq_len, batch_size, device, seed=0):
             and cached[1].shape[0] == train_ids.shape[0]
             and cached[2] == _devkey):
         host = cached[1]
-    elif device.type == 'cuda' and _gpu_corpus_cache_fits(_narrow.nbytes, device):
+    elif device.type == 'cuda' and _gpu_corpus_cache_fits(train_ids.nbytes, device):
+        # The residency budget is defined on the ORIGINAL token array (design
+        # notes §6.1).  The narrowed view is a transport form; using its
+        # smaller size would admit up to 4x more corpus than the contract for
+        # a uint16/uint8 cache, so the execution path would silently change
+        # with the storage width at scale.
         try:
             host = torch.from_numpy(_narrow).to(device)
             _PINNED_HOST_CACHE['entry'] = (train_ids, host, _devkey)
@@ -14194,7 +14219,12 @@ def ngram_lm_score(train_ids, eval_ids, vocab_size, order=1, alpha=0.1, interpol
     respected: the first token of every evaluation row is scored by the
     unigram model, never by the previous row's last token.  The effect size is
     token-weighted, matching the LM metric policy."""
-    ids = np.asarray(_ngram_token_ids(train_ids, 'train'), dtype=np.int64)
+    # When the caller hands in precomputed count tables, `train_ids` is not
+    # needed.  Converting the whole fit prefix to int64 on every call made a
+    # per-evaluation-row loop O(n_rows * n_fit_tokens) at scale (the FineWeb
+    # cache is uint16/int32), even though the tables were already built once.
+    ids = (np.asarray(_ngram_token_ids(train_ids, 'train'), dtype=np.int64)
+           if _counts is None else None)
     vocab_size = _ngram_vocab_size(vocab_size)
     if isinstance(alpha, (bool, np.bool_)):
         raise ValueError('alpha must be a positive finite number, got a boolean')
@@ -16810,15 +16840,18 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None, posit
                 'ROC-AUC is below chance; check that the score column is the '
                 'positive-class probability and that positive_label is correct')
         if out['pr_auc'] is not None and out['roc_auc'] is not None:
-            rare = min(prevalence, 1.0 - prevalence)
+            # The policy switch is about the POSITIVE endpoint's prevalence.
+            # When the positive class is common and the negative class is
+            # rare, positive-class PR-AUC has a ~0.999 chance floor and is
+            # not the rare-event endpoint; min(prev, 1-prev) would demand it.
             out['imbalance_warning'] = ('positives at or beyond 1:1000 — PR-AUC is the primary ranking metric; ROC-AUC can look optimistic'
-                                        if _extreme_imbalance(rare) else None)
+                                        if _extreme_imbalance(prevalence) else None)
         if threshold_sweep:
             out['threshold_selection'] = select_binary_threshold(
                 y_true, _bin_score, positive_label=pos)
     elif labels.size == 2 and out.get('positive_label') is not None:
         prev = out['prevalence'].get(_pos_name, 0.0)
-        if _extreme_imbalance(min(prev, 1.0 - prev)):
+        if _extreme_imbalance(prev):
             out['imbalance_warning'] = ('positives at or beyond 1:1000 — report PR-AUC with scores; F1 must name its averaging rule and recall should be reported per class')
     if labels.size > 2 and y_score is not None:
         _score = np.asarray(y_score, dtype=float)
@@ -16850,8 +16883,11 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None, posit
     _thr = 1e-3
     if pos is not None:
         _prev = float(np.mean(np.asarray(y_true) == pos))
-        _rare_val = min(_prev, 1.0 - _prev)
-        _rare = bool(_extreme_imbalance(_rare_val, _thr))
+        # The conditional binary endpoint is keyed to the named positive
+        # class (METRIC_POLICY), not to whichever class happens to be rarer.
+        # A common positive with a rare negative must keep F1; positive-class
+        # PR-AUC would be read against a ~1 - prevalence chance floor.
+        _rare = bool(_extreme_imbalance(_prev, _thr))
         if _rare:
             out['recommended_primary_metric'] = 'pr_auc'
             out['recommended_primary_average'] = 'binary_positive_class'
@@ -17820,6 +17856,11 @@ def metric_policy_audit(summary=None, policy=None):
                 _pr_floor = _finite_scalar(r.get('pr_auc_prevalence'))
                 if _pr_floor is not None and 0.0 <= _pr_floor <= 1.0:
                     prevalence = min(_pr_floor, 1.0 - _pr_floor)
+            # Conditional-endpoint checks for a binary task follow the POSITIVE
+            # class prevalence (the policy's wording and PR-AUC's floor), not
+            # the minority rate.  Legacy records without a positive label keep
+            # the minority fallback.
+            _cond_prev = prevalence
             if task == 'binary_classification' and prevalence is not None:
                 # PR-AUC's chance floor is the POSITIVE-class prevalence, which
                 # need not be the minority class.  When the positive endpoint
@@ -17848,6 +17889,8 @@ def metric_policy_audit(summary=None, policy=None):
                                 if _sup_pos is not None and _n_pos_rec:
                                     _pos_prev = float(_sup_pos) / float(_n_pos_rec)
                 _floor = _pos_prev if _pos_prev is not None else prevalence
+                if _pos_prev is not None:
+                    _cond_prev = _pos_prev
                 _pr_p = _finite_scalar(r.get('pr_auc_prevalence'))
                 if _pr_p is not None and abs(_pr_p - _floor) > 1e-6:
                     # Legacy records may omit positive_label; in that case the
@@ -17908,7 +17951,7 @@ def metric_policy_audit(summary=None, policy=None):
                     _class_issues.append(
                         f'{_label}: recommended_primary_metric={_rec_metric!r} is not '
                         f'defined for task {task!r} (allowed {sorted(_rec_allowed)})')
-                if prevalence is not None:
+                if _cond_prev is not None:
                     # A malformed policy threshold is a contract fault, not a
                     # reason to abort the whole record audit; fall back to the
                     # documented default and surface the invalidity.
@@ -17921,7 +17964,7 @@ def metric_policy_audit(summary=None, policy=None):
                             '1e-3 default')
                         _thr_rec = 1e-3
                     _conditional = _pol_rec.get('primary_when_extreme_imbalance')
-                    if _extreme_imbalance(prevalence, _thr_rec) and _conditional:
+                    if _extreme_imbalance(_cond_prev, _thr_rec) and _conditional:
                         _want_rec = _conditional
                     else:
                         _want_rec = _pol_rec.get('primary')
@@ -17929,7 +17972,7 @@ def metric_policy_audit(summary=None, policy=None):
                         _class_issues.append(
                             f'{_label}: recommended_primary_metric={_rec_metric!r} does '
                             f'not match the policy endpoint {_want_rec!r} at prevalence '
-                            f'{prevalence:.3e}')
+                            f'{_cond_prev:.3e}')
             # `recommended_primary_available` is a claim that the recommended
             # endpoint was actually measured.  A record can otherwise name the
             # right metric and still omit its value (e.g. F1 without PR-AUC at
@@ -17961,7 +18004,7 @@ def metric_policy_audit(summary=None, policy=None):
                         _class_issues.append(
                             f'{_label}: recommended_primary_available=False but the '
                             f'recommended endpoint {_rec_metric!r} is recorded')
-            if (_extreme_imbalance(prevalence)):
+            if (_extreme_imbalance(_cond_prev)):
                 _cond = _policy_entry(task).get(
                     'primary_when_extreme_imbalance',
                     'pr_auc_macro' if task == 'multiclass_classification' else 'pr_auc')
@@ -25983,6 +26026,12 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
                                     'boundary_pg': _pg_item, 'lr': base})
                 print(f'  [nan] non-finite loss at step {step + 1} (ce={_ce_item}, comp={_comp_item}, pg={_pg_item}); skipping the optimizer update')
                 opt.zero_grad(set_to_none=True)
+                if _scaler is not None:
+                    # GradScaler.update() consumes/reset the found-inf state.
+                    # Leaving it pending makes the next unscale_/step keep
+                    # skipping and blocks the scale reduction (they are
+                    # paired even when backward was skipped for a bad loss).
+                    _scaler.update()
             elif _scaler is not None:
                 _scale_before = float(_scaler.get_scale())
                 _scaler.scale(loss).backward()
@@ -26006,6 +26055,10 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
                                         'lr': base})
                     print(f'  [nan] non-finite gradient norm at step {step + 1}; zeroing grads and skipping the update')
                     opt.zero_grad(set_to_none=True)
+                    # unscale_() has marked found_inf; update() is what
+                    # consumes that state and lowers the scale.  Skipping it
+                    # leaves the scale too high and the overflow state set.
+                    _scaler.update()
                 else:
                     _gn_post = min(_gn_pre, float(GRAD_CLIP_NORM))
                     _clip_steps += int(_gn_pre > GRAD_CLIP_NORM)
@@ -26109,9 +26162,11 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
                         _train_ce = None
                 # None = not measured (infra missing/failed); NaN = measured
                 # and non-finite.  classify_training_health counts only the
-                # latter as a non-finite curve point.
-                if _is_finite_number(_train_ce):
-                    _last_train_ce = _train_ce
+                # latter as a non-finite curve point.  `*_final` fields must
+                # describe the LAST measurement, not the last finite one: a
+                # run whose final eval is non-finite must not report an
+                # earlier step's PPL as its final value.
+                _last_train_ce = _train_ce
                 _val_ce = math.log(sub_ppl) if (_is_finite_number(sub_ppl) and sub_ppl > 0) else float('nan')
                 _entry = {'step': step + 1, 'val_ppl': sub_ppl, 'val_ce': _val_ce,
                           'train_ce': _train_ce,
@@ -26121,8 +26176,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
                           'val_doc_ce_sem': _ci.get('doc_ce_sem'),
                           'val_n_docs': _ci.get('n_docs')}
                 _health_history.append(_entry)
-                if _is_finite_number(sub_ppl) and sub_ppl > 0:
-                    _last_subset_ppl = sub_ppl
+                _last_subset_ppl = sub_ppl
                 if _is_finite_number(sub_ppl) and sub_ppl > 0 and (_best_val_ppl is None or sub_ppl < _best_val_ppl):
                     _best_val_ppl = sub_ppl
                     _best_step = step + 1

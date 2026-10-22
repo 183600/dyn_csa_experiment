@@ -47,6 +47,8 @@ for _stream in (sys.stdout, sys.stderr):
 
 REPO = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_DIRS = ['results_lm_test', 'analysis_v12']
+_CKPT_SUFFIXES = ('.pt', '.ckpt', '.pth', '.safetensors')
+
 ENV_FILES = ['confirmation_frozen.json', 'DECISION_LOG.md', 'RELEASES.md', 'requirements.txt',
             'requirements.lock', 'pyproject.toml',
             # data/cache provenance: a tokenizer or cache that changes the ids
@@ -209,7 +211,7 @@ def _collect(dirs, include_ckpt=False):
         for root, _dirs, names in os.walk(base):
             for n in names:
                 p = os.path.join(root, n)
-                if not include_ckpt and (n.endswith('.pt') or n.endswith('.ckpt') or n.endswith('.pth') or n.endswith('.safetensors')):
+                if not include_ckpt and n.endswith(_CKPT_SUFFIXES):
                     continue
                 files.append(p)
     for f in ENV_FILES:
@@ -230,6 +232,10 @@ def _collect(dirs, include_ckpt=False):
                 files.append(os.path.join(REPO, n))
     except OSError:
         pass
+    # TimeGuard ledger / run-state files are part of the evidence the release
+    # claims to preserve (module docstring), but they are gitignored and live
+    # only on the experiment machine.
+    files.extend(sorted(glob.glob(os.path.join(REPO, 'run_time_state*.json'))))
     # The freeze lock can already be reached by the directory walk above;
     # duplicate tar members with the same name are ambiguous on extraction,
     # so keep the first occurrence only.
@@ -273,7 +279,7 @@ def _ckpt_hash_table(dirs):
             continue
         for root, _dirs, names in os.walk(base):
             for n in names:
-                if n.endswith('.pt'):
+                if n.endswith(_CKPT_SUFFIXES):
                     p = os.path.join(root, n)
                     rows[os.path.relpath(p, REPO)] = _sha256(p)
     return rows
@@ -290,7 +296,7 @@ def cmd_plan(tag, dirs, include_ckpt=False):
         print(f'  {sz:>12,d} B  {os.path.relpath(p, REPO)}')
     ck = _ckpt_hash_table(dirs)
     if ck:
-        print(f'[archive] checkpoints found: {len(ck)} (.pt) — hashed into the manifest' + (' and packed' if include_ckpt else ' (bodies NOT packed; use --include-ckpt to embed them)'))
+        print(f'[archive] checkpoints found: {len(ck)} — hashed into the manifest' + (' and packed' if include_ckpt else ' (bodies NOT packed; use --include-ckpt to embed them)'))
     print(f'[archive] total: {total:,d} B (~{total / (1 << 20):.1f} MiB)')
     return files
 
@@ -301,6 +307,14 @@ def cmd_make(tag, dirs, include_ckpt=False, outdir='archive'):
     _missing = [f for f in _required if not os.path.exists(os.path.join(REPO, f))]
     if _missing:
         print(f'[archive] REFUSE: formal release is missing required provenance file(s): {_missing}')
+        return 1
+    _present = [d for d in dirs
+                if os.path.isdir(os.path.join(REPO, d))]
+    if not _present:
+        print('[archive] REFUSE: none of the named result directories exist '
+              f'here ({list(dirs)}); a release of provenance files alone would '
+              'contain no evidence — run this on the machine holding the '
+              'artifacts')
         return 1
     files = _collect(dirs, include_ckpt)
     if not files:
@@ -458,11 +472,14 @@ def cmd_verify(tar_path):
                     break
                 h.update(b)
             got = h.hexdigest()
-            want = (man['files'].get(member.name) or {}).get('sha256')
+            _meta = man['files'].get(member.name) or {}
+            want = _meta.get('sha256')
             if want is None:
                 bad.append(f'{member.name}: in tar but NOT in manifest')
             elif got != want:
                 bad.append(f'{member.name}: hash mismatch (manifest {want[:12]}…, actual {got[:12]}…)')
+            elif _meta.get('bytes') is not None and int(_meta['bytes']) != int(member.size):
+                bad.append(f"{member.name}: byte count mismatch (manifest {_meta['bytes']}, actual {member.size})")
         missing = [n for n in man['files'] if n not in names]
         for n in missing:
             bad.append(f'{n}: in manifest but NOT in tar')

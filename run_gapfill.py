@@ -148,10 +148,15 @@ def _fold_backup_into_aggregate(adir):
         # It is not safe to keep those values next to a larger `seeds` list, so
         # invalidate them explicitly instead of mixing a 1-seed mean with a
         # 2-seed ppl_mean.
-        _derived = ('ppl_primary', 'nll_sum', 'n_tokens', 'ppl_curve',
+        _derived = ('ppl_primary', 'ppl_primary_estimand', 'ppl_primary_missing',
+                    'ppl_aggregation', 'nll_sum', 'n_tokens', 'ppl_curve',
                     'ppl_ci95', 'ppl_ci95_low', 'ppl_ci95_high',
-                    'ppl_median', 'ppl_iqr', 'dPPL_vs_full',
-                    'dPPL_vs_csa_fixed', 'avg_dyn_block_len', 'avg_block_len',
+                    'ppl_ci95_seed_t', 'ppl_ci95_doc_bootstrap',
+                    'ppl_ci_seed_doc_combined', 'ppl_median', 'ppl_iqr',
+                    'ppl_mean_arithmetic', 'dPPL_vs_full', 'dPPL_vs_csa_fixed',
+                    'dPPL_vs_full_mean', 'dPPL_vs_full_std', 'n_paired',
+                    'dPPL_vs_sw128m_mean', 'dPPL_vs_sw128m_std',
+                    'n_paired_sw128m', 'avg_dyn_block_len', 'avg_block_len',
                     'boundary_f1_dyn', 'boundary_excess_dyn',
                     'delta_logit_mean', 'tokens_per_step', 'nll_pooled',
                     'ppl_pooled', 'ppl_pooled_std')
@@ -187,6 +192,11 @@ def synthesize_long_summary():
         except Exception as _e:
             print(f'[synth] FATAL: {spath} exists but cannot be parsed ({type(_e).__name__}: {_e}).  Refusing to overwrite it with an empty summary — move it aside to start fresh.')
             raise
+        if not isinstance(summary, dict):
+            print(f'[synth] SKIP: {spath} is valid JSON but not an object '
+                  f'({type(summary).__name__}) — refusing to treat it as a '
+                  'summary mapping.')
+            return ({'skipped_non_object_summary': spath}, None)
     n_synth = n_kept = n_replaced = n_backfill = 0
     _unaligned = []
     _split = []
@@ -374,6 +384,21 @@ def merge_long_aggregate(adir, snapshot_agg):
         sentry['n_seeds'] = len(vals)
         sentry['ppl_mean'] = sum(vals) / len(vals)
         sentry['ppl_std'] = statistics.stdev(vals) if len(vals) > 1 else 0.0
+        # Every field below was computed over the snapshot's seed subset.
+        # Keeping it next to the enlarged seeds/ppls/ppl_mean would mix a
+        # 1-seed primary/CI/pooled value with a 3-seed mean.  The curve,
+        # secondary means and paired deltas are recomputed below; the rest
+        # stay explicitly null until the panel is re-aggregated.
+        for _f in ('ppl_primary', 'ppl_primary_estimand', 'ppl_primary_missing',
+                   'ppl_aggregation', 'ppl_pooled', 'nll_sum', 'n_tokens',
+                   'ppl_median', 'ppl_iqr', 'ppl_mean_arithmetic',
+                   'ppl_ci95', 'ppl_ci95_low', 'ppl_ci95_high',
+                   'ppl_ci95_seed_t', 'ppl_ci95_doc_bootstrap',
+                   'ppl_ci_seed_doc_combined', 'dPPL_vs_full_mean',
+                   'dPPL_vs_full_std', 'n_paired', 'dPPL_vs_sw128m_mean',
+                   'dPPL_vs_sw128m_std', 'n_paired_sw128m'):
+            if _f in sentry:
+                sentry[_f] = None
         n_folded += 1
         _folded_keys.add(key)
         if n_fresh:

@@ -1103,7 +1103,10 @@ def _attn_fwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
     if valid is None:
         valid = torch.ones_like(topk_idx, dtype=torch.bool)
     win_raw = (t_idx - (w - 1) + torch.arange(w, device=dev)[None, None, :]).expand(R, T, w)
-    sink_v = torch.nan_to_num(sink).to(dtype) if sink is not None else None
+    # q/K/V are deliberately computed in float32 above; the sink logits
+    # must use the same work dtype or torch.cat promotes to the input dtype
+    # and the softmax/einsum then mixes (for fp16/bf16/fp64 input) dtypes.
+    sink_v = torch.nan_to_num(sink).to(torch.float32) if sink is not None else None
     tc = _attn_t_chunk(R, M, nh, hd)
     # t-chunk 在外、头在内：各 (t,h) 的前向计算相互独立，循环顺序交换
     # 不改变任何元素值。chunk 内的 lt_sel/sel_ok/src_win/win_ok/anyrow
@@ -1176,7 +1179,10 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
     if valid is None:
         valid = torch.ones_like(topk_idx, dtype=torch.bool)
     win_raw = (t_idx - (w - 1) + torch.arange(w, device=dev)[None, None, :]).expand(R, T, w)
-    sink_v = torch.nan_to_num(sink).to(dtype) if sink is not None else None
+    # q/K/V are deliberately computed in float32 above; the sink logits
+    # must use the same work dtype or torch.cat promotes to the input dtype
+    # and the softmax/einsum then mixes (for fp16/bf16/fp64 input) dtypes.
+    sink_v = torch.nan_to_num(sink).to(torch.float32) if sink is not None else None
     dq = torch.zeros_like(q) if need_dq else None
     dsoft = torch.zeros_like(soft) if (need_dsoft and soft is not None) else None
     dsink = torch.zeros_like(sink) if (need_dsink and sink is not None) else None

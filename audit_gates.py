@@ -2012,8 +2012,25 @@ def audit_single_factor(manifest_path=None):
                 _arms = [str(a) for a in (man.get('arms') or [])]
                 _cmp = {}
                 _bad = []
-                for comp in (man.get('primary_comparisons') or []):
+                _comps = man.get('primary_comparisons')
+                if not isinstance(_comps, list) or not _comps:
+                    # An empty/malformed family audits zero comparisons; an
+                    # 'ok' verdict would claim the gate passed when nothing was
+                    # checked.  Fail closed.
+                    out['frozen_manifest'] = {
+                        'status': 'fail', 'manifest': _mp,
+                        'note': ('primary_comparisons must be a non-empty list, '
+                                 f'got {type(_comps).__name__}'
+                                 if not isinstance(_comps, list) else
+                                 'primary_comparisons is empty; no declared '
+                                 'comparison was audited')}
+                    out['status'] = 'fail'
+                    comps_for_audit = []
+                else:
+                    comps_for_audit = _comps
+                for comp in comps_for_audit:
                     if not isinstance(comp, dict):
+                        _bad.append(f'non-object primary comparison entry {comp!r}')
                         continue
                     _name = str(comp.get('name'))
                     _a, _b = str(comp.get('a')), str(comp.get('b'))
@@ -2038,10 +2055,11 @@ def audit_single_factor(manifest_path=None):
                                    'claim_flag_cfg_consistent': _consistent,
                                    'note': ('full verdict (objectives + parameter totals) is '
                                             'enforced by `v12_supp.py plan` at preflight')}
-                out['frozen_manifest'] = {'status': ('fail' if _bad else 'ok'),
-                                          'manifest': _mp, 'comparisons': _cmp,
-                                          'violations': _bad,
-                                          'arms_checked': _arms}
+                if comps_for_audit or out['frozen_manifest'].get('status') != 'fail':
+                    out['frozen_manifest'] = {'status': ('fail' if _bad else 'ok'),
+                                              'manifest': _mp, 'comparisons': _cmp,
+                                              'violations': _bad,
+                                              'arms_checked': _arms}
                 if _bad:
                     out['status'] = 'fail'
             else:
@@ -2613,10 +2631,20 @@ def audit_efficiency_pairs(outdirs=None, pairs=None, *, tolerance=0.05):
                         if r.get('batch') is not None}
             _batch_b = {_batch_of(r.get('batch')) for r in eff[b]
                         if r.get('batch') is not None}
+            # A partly recorded arm is not a legacy all-unrecorded arm: one
+            # run with batch=8 and another without the field could be a
+            # different execution shape, so the pair is unverifiable.
+            _batch_a_complete = all(
+                r.get('batch') is not None and _batch_of(r.get('batch')) is not None
+                for r in eff[a])
+            _batch_b_complete = all(
+                r.get('batch') is not None and _batch_of(r.get('batch')) is not None
+                for r in eff[b])
             if not (_batch_a or _batch_b):
                 same_batch = True
                 batch_status = 'unrecorded'
-            elif (None in _batch_a or None in _batch_b
+            elif (not _batch_a_complete or not _batch_b_complete
+                  or None in _batch_a or None in _batch_b
                   or len(_batch_a) != 1 or len(_batch_b) != 1
                   or _batch_a != _batch_b):
                 same_batch = False
