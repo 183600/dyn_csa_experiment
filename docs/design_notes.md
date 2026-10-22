@@ -1988,3 +1988,74 @@ python test_review_fixes.py           # L82-L86 覆盖上述合约
 
 新增对照前先过 `design`：它会指出该对照属于 token/parameter/read 哪一维
 不匹配、缺哪个专用臂、以及是否被错误地标成 confirmatory。
+
+## 40. 值身份、传输对拍、聚合隔离与运行态对账（本轮硬化）
+
+### 40.1 纯函数记忆化必须绑定当前值
+
+`_ids_fp` 的 memo 键是 `(数据指针, shape, strides, dtype)`，它标识的是
+**数组对象**而不是内容。对一个可写数组做原地清理后，旧实现仍返回写入前
+的摘要；该摘要会进入 `run_cfg`、manifest 与 resume 判定，等于把两份不同
+语料当成同一身份。现在只有 `flags.writeable=False` 的数组才允许命中
+memo 或 `.idsfp.json` sidecar；可写数组每次重新哈希。生产语料是只读
+memmap，因此快速路径不变。测试同时核对：原地改值必变、只读/可写副本与
+不同整数宽度（uint16/int32/int64）在值相同时摘要相同。
+
+### 40.2 传输层批量化要有独立对拍
+
+`batch_contract_check` 过去只检查 shape、标签右移、同种子重复与词表范围；
+一个错误的 gather 仍可能“右移且可重复”。现在它从**同一组 seeded starts**
+另建一条最朴素的 int64 NumPy 因果窗口（不 pin、不 prefetch、不窄化索引），
+逐 token 比较真实 `batch_iter` 的输出，并在批次记录中保存
+`transport_matches_int64_reference`。这样 int32 索引 / pinned host /
+预取线程的“只改传输、不改值”声明是被测出来的，而不是注释里的假设。
+
+### 40.3 聚合的容错边界必须显式
+
+`aggregate` 仍然 fail-closed（重复 seed、混语料/混评测切片直接拒绝）。
+但一个已经训练完的面板不能因为一条损坏记录而完全没有聚合输出。
+`aggregate_with_exclusions` 逐条校验，命名并计数所有隔离项：
+
+- 非对象、无有效 PPL、合成重建、非整数 seed 的记录剔除；
+- 同一 `(variant, protocol, seed)` 只保留首个可测记录，后者作为歧义重复
+  剔除（不覆盖、不静默合并）；
+- 同一组内语料/评测指纹不同时，**按指纹类别拆分**输出键，绝不跨切片平均；
+- 仍然触发跨协议配对错误时，按臂分别聚合（保留边际读数，不生成 dPPL）。
+
+`_dump_aggregate` 总会写 `aggregation_exclusions.json`，有隔离项时另写
+`summary.aggregatable.json`。报告的 `n_input` / `n_admitted` /
+`n_excluded` / `reason_counts` / `excluded` 就是容错边界；没有记录被当成
+0 或凭空补一个 seed。
+
+### 40.4 run-state 对账
+
+`_record_failed_panel` 现在会把同一 `run_cfg` 下停留在 `running`（进程被
+杀/后续 preflight 拒绝）的条目改为 `failed`，同时保留已测 cell；已经是
+`complete` 的面板不会被后来的失败 preflight 改写，失败尝试只进
+`experiments.jsonl`。这样“进程退出”与“面板完成”不再是同一个状态。
+
+### 40.5 准入绑定唯一权重与真实清单路径
+
+确认准入在记录携带 `ckpt_sha256`（或清单声明
+`binding.require_ckpt_sha256`）时要求合法 SHA-256，并拒绝同一权重摘要被
+另一个 `(variant, seed)` 复用：一套权重不是两次独立测量。`_load_manifest`
+把 `_path` 带到加载后的清单上，冻结锁因此记录实际使用的清单文件，而不是
+默认文件名。
+
+### 40.6 面向放大：几何参数化
+
+`apply_scale_geometry_overrides` 接受 `B_SEQ_LEN` / `B_BATCH_SIZE` /
+`B_N_TRAIN_TOKENS` / `B_STEPS` / `B_VAL_SEQS`，非法值直接报错；只改几何
+而未显式给步数时按原采样窗口预算重算 steps（ceiling），改 token 预算时
+从预算重算，显式 `B_STEPS` 永远优先。覆盖值写入 cfg，因此进入 `run_cfg`
+与 manifest。M0 驱动改为发现 `RUN_S<n>`，新增 S3/S4 不需要再改
+`_panel_chain_from_env`；没有声明 cap 的未来档位使用自己的
+`run_time_state_s<n>.json`，不会与 S1 共用预算。
+
+### 40.7 最终评估也带机器环境
+
+P5T 的 by-length 记录以前只有代码戳/配方/数据/权重哈希，没有执行环境。
+现在每条评估记录与 `experiments.jsonl` 事件都带 `exec_fp` 与紧凑的
+`environment` 快照；resume 的 stale 判定把「已记录但不同的执行类别」
+视为过期。这样“同一份权重在不同机器/精度栈上评出来的数”不会被当作本轮
+当前机器的测量静默复用，训练与评估的 provenance 口径一致。

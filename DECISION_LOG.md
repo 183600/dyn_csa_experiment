@@ -1244,3 +1244,68 @@ the large-n `0.01/1e-9/0.99` regression, the small-n one-row preservation case,
 and the unchanged exact `0.8/0.1/0.1` result at `2**53+1`.  Both CPU suites
 pass unchanged: `python test_review_fixes.py` 411 passed / 3 environment skips,
 `python test_open_block.py` 15/15.
+
+## 2026-10-22 — memo value identity + transport reference + aggregation quarantine + run-state reconciliation (no new runs)
+
+Zero-GPU reproducibility/engineering hardening; no panel result, frozen
+manifest, README or CI configuration was touched.
+
+**Problem.** (1) `_ids_fp` memoised on `(data pointer, layout)` alone.  An
+in-place write to a writable array left the old digest in the memo (and the
+on-disk `.idsfp.json` sidecar path was also trusted), so the same array could
+be fingerprinted as the pre-edit corpus.  That stale digest then enters
+`run_cfg`, the manifest and the resume check — a pure function that was not
+actually a function of the current values.  (2) `batch_contract_check` checked
+shape/shift/repeatability but not the central transport claim: that narrowing
+gather indices to int32, pinning/uploading the corpus and prefetching do not
+change a token.  A wrong gather could still pass as “shifted and repeatable”.
+(3) `_dump_aggregate` had a fallback that dropped some unusable records, but a
+mixed evaluation-slice error (or a cross-protocol pairing error) could still
+raise after training and leave the panel with no aggregate.  Nothing counted
+the quarantine or stated the tolerance boundary.  (4) A failed pre-flight on an
+existing panel only appended a ledger event; a panel killed in `running` state
+stayed `running` forever, so run-state was not complete.  (5) Admission did
+not bind a record to unique weights: the same checkpoint digest could be
+re-labelled as another arm/seed.
+
+**Changes.** (1) `_ids_fp` only trusts the memo/sidecar for read-only arrays
+(`flags.writeable=False`); writable arrays are hashed fresh every call, so an
+in-place mutation necessarily changes the digest.  Production memmaps keep the
+fast path.  (2) `batch_contract_check` now builds an independent plain-int64
+NumPy causal batch from the SAME seeded starts (no pin, no prefetch, no int32
+narrowing) and compares every token and target; the report records the
+transport dtype and per-batch equivalence.  A loader that changes one token
+now fails the contract.  (3) `aggregate_with_exclusions` validates each record,
+keeps the first measured record for a duplicated `(arm, protocol, seed)`,
+splits groups that disagree on a corpus/evaluation fingerprint instead of
+pooling them, retries a cross-protocol pairing group per arm, and returns a
+JSON report (`n_input`, `n_admitted`, `n_excluded`, reason counts and named
+keys).  `_dump_aggregate` always writes `aggregation_exclusions.json` (and
+`summary.aggregatable.json` when anything was quarantined); no corrupt record is
+silently averaged, and a bad record no longer crashes aggregation.  (4)
+`_record_failed_panel` reconciles a `running`/`incomplete` entry to `failed`
+while preserving its measured cells; an already `complete` panel is never
+rewritten, and the failed attempt remains in the ledger.  (5) Confirmation
+admission validates `ckpt_sha256` when present (or when
+`binding.require_ckpt_sha256` is declared), excludes missing/malformed
+digests, and refuses one digest reused by another `(variant, seed)`.  The
+loaded manifest now carries `_path`, so the freeze lock records the actual
+manifest file rather than the default filename.  (6) Final-test records now
+carry `exec_fp` plus the compact environment snapshot, and resume treats a
+present-but-different execution class as stale; evaluation provenance is no
+longer weaker than training provenance.  (7) Scale geometry is
+parameterised: `apply_scale_geometry_overrides` accepts validated
+`B_SEQ_LEN`/`B_BATCH_SIZE`/`B_N_TRAIN_TOKENS`/`B_STEPS`/`B_VAL_SEQS`
+overrides, preserves the sampled-window budget when only geometry changes,
+records the override in the cfg, and the M0 driver discovers `RUN_S<n>`
+panels instead of hard-coding S1/S2 (future tiers with no cap get their own
+state file).
+
+Verification: new CPU tests `L59b` (in-place mutation changes the id digest;
+storage width/read-only status do not), `E2c3` (int64/uint16 reference
+equivalence and a one-token-corrupting loader fails), `L59c` (corrupt,
+unmeasured, duplicate and mixed-slice records are counted/split, not pooled),
+`E4b2` (running → failed reconciliation; complete stays complete), `L53b`
+(reused/missing checkpoint digests), and `L72b` (geometry override validation
+plus future-panel discovery).  `python test_review_fixes.py` passes with the
+same 3 environment skips; `python test_open_block.py` 15/15.

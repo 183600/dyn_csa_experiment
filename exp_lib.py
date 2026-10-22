@@ -1481,6 +1481,97 @@ def apply_data_protocol(cfg, *, dataset=None, require=(), defaults=None,
     return out
 
 
+# Environment knobs for re-sizing a scale panel WITHOUT editing a driver.  The
+# values are copied into the cfg (and therefore into run_cfg/provenance), so a
+# resumed panel can never mix two geometries silently.
+SCALE_GEOMETRY_ENV = {
+    'B_SEQ_LEN': 'seq_len',
+    'B_BATCH_SIZE': 'batch_size',
+    'B_N_TRAIN_TOKENS': 'n_train_tokens',
+    'B_STEPS': 'steps',
+    'B_VAL_SEQS': 'val_seqs',
+}
+
+
+def apply_scale_geometry_overrides(cfg, env=None, *,
+                                   preserve_draw_budget=True):
+    """Return a copy of a scale-panel cfg with validated geometry overrides.
+
+    The B-tier drivers used to read only the module-level ``RUN_S1``/``RUN_S2``
+    dicts, so adapting a run to a different sequence length or to a GPU with
+    less free memory meant editing code.  These knobs are deliberately
+    explicit and are recorded in the returned cfg:
+
+    * ``B_SEQ_LEN`` / ``B_BATCH_SIZE`` re-size the per-step geometry.  When
+      ``B_STEPS`` is not supplied, the step count is recomputed (ceiling) so
+      the number of sampled windows is preserved; a geometry change cannot
+      quietly shorten the training budget.
+    * ``B_N_TRAIN_TOKENS`` changes the declared token budget and, unless
+      ``B_STEPS`` is explicit, recomputes steps from the new budget.
+    * ``B_STEPS`` is an explicit override and is never recomputed.
+    * ``B_VAL_SEQS`` changes the held-out row count (recorded in the data
+      protocol).
+
+    A malformed value is an error, not a silent fallback.  The function is
+    pure with respect to ``cfg``; it only reads ``env`` (default os.environ).
+    """
+    if not isinstance(cfg, dict):
+        raise TypeError('apply_scale_geometry_overrides expects a config dict')
+    env = os.environ if env is None else env
+    out = dict(cfg)
+
+    def _read(env_key, field):
+        raw = env.get(env_key)
+        if raw is None or (isinstance(raw, str) and not raw.strip()):
+            return None
+        if isinstance(raw, (bool, np.bool_)):
+            raise ValueError(f'{env_key}={raw!r} is not a positive integer')
+        try:
+            val = int(str(raw).strip())
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(f'{env_key}={raw!r} is not a positive integer') from None
+        if val < 1:
+            raise ValueError(f'{env_key}={raw!r} must be >= 1')
+        return int(val)
+
+    overrides = {}
+    for env_key, field in SCALE_GEOMETRY_ENV.items():
+        val = _read(env_key, field)
+        if val is not None:
+            overrides[field] = val
+    if not overrides:
+        return out
+    _old = {k: int(out[k]) for k in ('seq_len', 'batch_size', 'steps')
+            if out.get(k) is not None}
+    out.update(overrides)
+    _steps_from_env = 'steps' in overrides
+    _geometry_changed = ('seq_len' in overrides or 'batch_size' in overrides)
+    _tokens_changed = 'n_train_tokens' in overrides
+    _steps_source = 'explicit_env' if _steps_from_env else 'unchanged'
+    if preserve_draw_budget and not _steps_from_env and (_geometry_changed or _tokens_changed):
+        try:
+            _seq = int(out['seq_len'])
+            _bs = int(out['batch_size'])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            _seq = _bs = 0
+        if _seq > 0 and _bs > 0:
+            if _tokens_changed:
+                _per_step = _bs * _seq
+                out['steps'] = max(1, (int(out['n_train_tokens']) + _per_step - 1) // _per_step)
+                _steps_source = 'from_declared_token_budget'
+            elif _geometry_changed and all(k in _old for k in ('steps', 'seq_len', 'batch_size')):
+                _old_draws = _old['steps'] * _old['batch_size'] * _old['seq_len']
+                _per_step = _bs * _seq
+                out['steps'] = max(1, (_old_draws + _per_step - 1) // _per_step)
+                _steps_source = 'preserve_sampled_windows'
+    out['geometry_overrides'] = {
+        'env': dict(sorted(overrides.items())),
+        'old': _old,
+        'steps_source': _steps_source,
+    }
+    return out
+
+
 _CPU_DEV = torch.device('cpu')
 _DEV_STR = {}
 
@@ -6633,12 +6724,23 @@ def _ids_fp(train_ids):
     # 64 bit other than uint64 is hashed through its canonical int64 form, so
     # a corpus keeps the same fingerprint regardless of storage width (the
     # uint16 FineWeb cache, int32 views and int64 arrays all agree).
+    #
+    # The pointer+layout key identifies an ARRAY OBJECT, not its current
+    # contents.  An in-place write (e.g. a cleaning pass over a validation
+    # array) would otherwise leave the memo returning the pre-write digest,
+    # and that stale digest then becomes a resume/data identity.  OWNDATA does
+    # not help: a writable view of the same buffer is just as mutable.  So a
+    # writable array is never trusted from the memo or from the on-disk
+    # sidecar; it is hashed fresh every call.  The production corpora are
+    # read-only memmaps (writeable=False), which keep the fast path.
     import weakref as _weakref
+    _flags = getattr(train_ids, 'flags', None)
+    _immutable = bool(_flags is not None and not _flags.writeable)
     try:
         _key = (train_ids.__array_interface__['data'][0], train_ids.shape, train_ids.strides, train_ids.dtype.str)
     except (AttributeError, TypeError):
         _key = None
-    if _key is not None:
+    if _key is not None and _immutable:
         _hit = _IDS_FP_MEMO.get(_key)
         if _hit is not None:
             _arr = _hit[0]() if _hit[0] is not None else None
@@ -6648,7 +6750,7 @@ def _ids_fp(train_ids):
     _path = _array_file_path(train_ids)
     _stat = None
     _side = None
-    if _path is not None:
+    if _path is not None and _immutable:
         try:
             _st = os.stat(_path)
             _stat = (int(getattr(_st, 'st_size', 0)),
@@ -6671,7 +6773,7 @@ def _ids_fp(train_ids):
                     and _rec.get('dtype') == _tdtype
                     and tuple(_rec.get('shape') or ()) == _tshape):
                 _fp = _rec['fp']
-                if _key is not None:
+                if _key is not None and _immutable:
                     try:
                         _ref = _weakref.ref(train_ids)
                     except TypeError:
@@ -6698,7 +6800,7 @@ def _ids_fp(train_ids):
             _part = np.ascontiguousarray(_part)
         _h.update(memoryview(_part).cast('B'))
     _fp = _h.hexdigest()[:16]
-    if _key is not None:
+    if _key is not None and _immutable:
         try:
             _ref = _weakref.ref(train_ids)
         except TypeError:
@@ -6706,7 +6808,7 @@ def _ids_fp(train_ids):
         if len(_IDS_FP_MEMO) >= _IDS_FP_MEMO_CAP and _key not in _IDS_FP_MEMO:
             _IDS_FP_MEMO.pop(next(iter(_IDS_FP_MEMO)))
         _IDS_FP_MEMO[_key] = (_ref, _fp)
-    if _side is not None and _stat is not None:
+    if _side is not None and _stat is not None and _immutable:
         try:
             _rec_out = {'size': _stat[0], 'mtime_ns': _stat[1],
                         'ctime_ns': _stat[2], 'inode': _stat[3], 'fp': _fp,
@@ -9834,7 +9936,25 @@ def batch_contract_check(train_ids, seq_len, batch_size, device, seed=0, vocab=N
         'labels_are_next_token_shift': True,
         'ids_within_vocab': True,
         'same_seed_repeats_stream': True,
+        'transport_matches_int64_reference': True,
         'nonempty': True,
+    }
+    # Transport-equivalence reference.  `batch_iter` may narrow its gather
+    # indices to int32, pin/upload the corpus, or run a prefetch thread.  All
+    # of those are transport-only claims; this second stream is built from the
+    # SAME seeded starts with plain int64 NumPy indexing and no prefetch, so
+    # comparing it element by element checks the claim instead of restating it.
+    _n_windows = len(train_ids) - seq_len - 1
+    _idx_dtype = 'int32' if (_n_windows + seq_len + 1 < 2 ** 31) else 'int64'
+    _ref_rng = np.random.default_rng(int(seed))
+    _ref_cols = np.arange(seq_len + 1, dtype=np.int64)
+    _ref_arr = np.asarray(train_ids)
+    report['transport'] = {
+        'index_dtype': _idx_dtype,
+        'reference': 'plain int64 numpy gather from the same seeded starts, no pin/prefetch/narrowing',
+        'corpus_dtype': np.dtype(_ref_arr.dtype).str,
+        'corpus_writeable': bool(getattr(_ref_arr, 'flags', None) is not None
+                                 and _ref_arr.flags.writeable),
     }
     try:
         it_a = batch_iter(train_ids, seq_len, batch_size, device, seed=seed)
@@ -9842,6 +9962,11 @@ def batch_contract_check(train_ids, seq_len, batch_size, device, seed=0, vocab=N
         for index in range(n_batches):
             xa, ya = next(it_a)
             xb, yb = next(it_b)
+            _starts = _ref_rng.integers(0, _n_windows + 1, size=batch_size,
+                                        dtype=np.int64)
+            _ref_idx = _starts[:, None] + _ref_cols[None, :]
+            _ref_ids = torch.from_numpy(np.asarray(_ref_arr[_ref_idx])).long()
+            _ref_x, _ref_y = _ref_ids[:, :-1], _ref_ids[:, 1:]
             checks['nonempty'] = bool(checks['nonempty'] and xa.numel() and ya.numel())
             checks['shapes_ok'] = bool(
                 checks['shapes_ok']
@@ -9860,6 +9985,10 @@ def batch_contract_check(train_ids, seq_len, batch_size, device, seed=0, vocab=N
             checks['same_seed_repeats_stream'] = bool(
                 checks['same_seed_repeats_stream']
                 and torch.equal(xa, xb) and torch.equal(ya, yb))
+            checks['transport_matches_int64_reference'] = bool(
+                checks['transport_matches_int64_reference']
+                and torch.equal(xa.cpu(), _ref_x)
+                and torch.equal(ya.cpu(), _ref_y))
             if _vocab is not None and xa.numel() and ya.numel():
                 _v = int(_vocab)
                 checks['ids_within_vocab'] = bool(
@@ -9874,6 +10003,8 @@ def batch_contract_check(train_ids, seq_len, batch_size, device, seed=0, vocab=N
                 'input_max': int(xa.max()) if xa.numel() else None,
                 'target_min': int(ya.min()) if ya.numel() else None,
                 'target_max': int(ya.max()) if ya.numel() else None,
+                'transport_matches_int64_reference': torch.equal(
+                    xa.cpu(), _ref_x) and torch.equal(ya.cpu(), _ref_y),
             })
         del it_a, it_b
     except Exception as e:
@@ -32228,6 +32359,196 @@ def aggregate(summary):
     if _base_amb:
         raise ValueError('aggregate: unsafe/cross-protocol baseline pairing for ' + '; '.join(sorted(_base_amb)) + '. Pair only a baseline in the SAME (variant, protocol) group; remove or re-tag the mismatched baseline before aggregating.')
     return agg
+
+
+# Fingerprint fields that define the sample a PPL describes.  Records in one
+# aggregate group must agree on all of them; otherwise the group is split (not
+# silently averaged) and the split is reported.
+_AGG_FINGERPRINT_FIELDS = ('data_fp', 'val_fp', 'eval_fp', 'eval_subset_fp',
+                           'holdout_row_fp')
+
+
+def _aggregation_fp_class(rec):
+    return tuple((k, str(rec.get(k))) for k in _AGG_FINGERPRINT_FIELDS
+                 if rec.get(k) is not None and str(rec.get(k)) != '')
+
+
+def aggregate_with_exclusions(summary):
+    """Aggregate a panel while quarantining records that cannot be pooled.
+
+    ``aggregate`` deliberately fails closed: a malformed record, an ambiguous
+    same-seed duplicate, or two different evaluation slices in one group are
+    data-identity faults, and silently averaging them would manufacture n.
+    A finished training panel, however, must still produce the aggregate for
+    its valid records and report exactly what was set aside.  This wrapper:
+
+    * validates each record (object / measured PPL / integer seed / arm name),
+      names every excluded key and the reason;
+    * keeps the FIRST measured record for a duplicated (arm, protocol, seed)
+      and excludes later ones as ambiguous duplicates;
+    * splits a group whose records carry different corpus/evaluation
+      fingerprints into separate output keys instead of averaging them;
+    * retries a group that still trips the strict cross-protocol pairing gate
+      per arm (so the valid marginal readings survive without a dPPL).
+
+    Returns ``(agg, report, admitted_records)``.  ``report`` is JSON-safe and
+    states the tolerance boundary: excluded records are never folded into a
+    number, and no "missing" record is invented.
+    """
+    report = {
+        'kind': 'aggregation_exclusions',
+        'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+        'code': code_stamp(),
+        'n_input': 0, 'n_admitted': 0, 'n_excluded': 0,
+        'reason_counts': {}, 'excluded': [], 'excluded_truncated': 0,
+        'fingerprint_split_groups': [], 'pairing_split_groups': [],
+        'n_aggregate_keys': 0,
+        'tolerance': ('only malformed/unmeasured records and ambiguous '
+                      'same-seed duplicates are dropped; groups that disagree '
+                      'on a corpus/evaluation fingerprint are SPLIT, not '
+                      'averaged; every exclusion is named and counted here'),
+    }
+    if not isinstance(summary, dict):
+        report['n_input'] = 1
+        report['reason_counts'] = {'summary is not an object': 1}
+        report['n_excluded'] = 1
+        return {}, report, {}
+    report['n_input'] = len(summary)
+    legacy_ok = legacy_warm_tags(summary)
+    excluded = []
+    reasons = collections.Counter()
+
+    def _drop(key, why):
+        excluded.append({'key': str(key), 'reason': str(why)})
+        reasons[str(why)] += 1
+
+    candidates = {}
+    for key, rec in summary.items():
+        if not isinstance(rec, dict):
+            _drop(key, 'record is not a JSON object')
+            continue
+        if rec.get('synthesized'):
+            _drop(key, 'synthesized reconstruction (not an independent run)')
+            continue
+        if not ppl_is_usable(rec.get('ppl')):
+            _drop(key, 'missing/non-finite final PPL (failed or unmeasured run)')
+            continue
+        seed = _as_seed_int(rec.get('seed'))
+        if seed is None:
+            _drop(key, f'non-integer seed {rec.get("seed")!r}')
+            continue
+        v = rec.get('variant')
+        if v is None:
+            v = str(key).split('::', 1)[0]
+        if not isinstance(v, str) or not v:
+            _drop(key, f'non-string/empty variant {v!r}')
+            continue
+        # Canonicalise the fields aggregate/readers key on.  The original
+        # record is kept untouched for the per-seed readers.
+        canon = dict(rec, seed=seed, variant=v)
+        tag = record_tag(canon, key, legacy_ok)
+        ident = (v, tag, seed)
+        if ident in candidates:
+            _drop(key, f'duplicate (variant={v!r}, protocol={tag!r}, '
+                       f'seed={seed}) — kept {candidates[ident][0]!r}')
+            continue
+        candidates[ident] = (str(key), canon)
+
+    groups = {}
+    for (v, tag, _seed), (key, rec) in candidates.items():
+        groups.setdefault((v, tag), {})[key] = rec
+
+    agg = {}
+    used = set()
+    for (v, tag), by_key in sorted(groups.items(),
+                                   key=lambda kv: (kv[0][0], kv[0][1] or '')):
+        classes = {}
+        for key, rec in by_key.items():
+            classes.setdefault(_aggregation_fp_class(rec), {})[key] = rec
+        if len(classes) > 1:
+            report['fingerprint_split_groups'].append({
+                'variant': v, 'protocol': tag,
+                'n_fingerprint_classes': len(classes),
+                'n_records': len(by_key),
+                'note': ('records from different corpora/evaluation slices '
+                         'were reported separately, never pooled'),
+            })
+        for ci, (_fp_class, sub) in enumerate(sorted(classes.items(),
+                                                      key=lambda kv: repr(kv[0]))):
+            suffix = ''
+            if len(classes) > 1:
+                _digest = hashlib.sha1(
+                    repr(_fp_class).encode('utf-8')).hexdigest()[:8]
+                suffix = f'@fp{_digest}'
+            try:
+                sub_agg = aggregate(sub)
+                used.update(sub.keys())
+            except Exception as exc:
+                # Most likely the strict cross-protocol baseline-pairing gate.
+                # Re-run each arm separately so its marginal aggregate (and
+                # its measured records) survive; no dPPL is then claimed.
+                sub_agg = {}
+                _pairing_split = False
+                for vv in sorted({str(r.get('variant')) for r in sub.values()}):
+                    _sub_v = {k: r for k, r in sub.items()
+                              if str(r.get('variant')) == vv}
+                    if not _sub_v:
+                        continue
+                    try:
+                        _one = aggregate(_sub_v)
+                    except Exception as exc2:
+                        for k in _sub_v:
+                            _drop(k, f'aggregate failed for arm {vv!r}: '
+                                      f'{type(exc2).__name__}: {exc2}')
+                        continue
+                    _pairing_split = True
+                    used.update(_sub_v.keys())
+                    for k, entry in _one.items():
+                        _key = f'{k}@arm{vv}'
+                        while _key in sub_agg:
+                            _key += "'"
+                        sub_agg[_key] = entry
+                if _pairing_split:
+                    report['pairing_split_groups'].append({
+                        'variant': v, 'protocol': tag,
+                        'error': f'{type(exc).__name__}: {exc}',
+                        'note': ('reported per arm; a cross-protocol dPPL is '
+                                 'not defined and was not produced'),
+                    })
+                if not sub_agg:
+                    continue
+            for key, entry in sub_agg.items():
+                out_key = key + suffix
+                while out_key in agg:
+                    out_key += "'"
+                agg[out_key] = entry
+
+    _unused = set(k for k, _r in candidates.values()) - used
+    _excluded_keys = {e['key'] for e in excluded}
+    for key in sorted(_unused):
+        if str(key) not in _excluded_keys:
+            _drop(key, 'no aggregate entry could be produced for this record')
+
+    report['n_admitted'] = len(used)
+    report['n_excluded'] = max(0, len(summary) - len(used))
+    report['reason_counts'] = dict(sorted(reasons.items()))
+    report['excluded'] = excluded[:200]
+    report['excluded_truncated'] = max(0, len(excluded) - 200)
+    report['n_aggregate_keys'] = len(agg)
+    admitted_records = {key: r for (key, r) in candidates.values()
+                        if key in used}
+    if report['n_excluded']:
+        print(f'[aggregate] {report["n_excluded"]}/{report["n_input"]} '
+              f'record(s) quarantined: '
+              + ', '.join(f'{k}={v}' for k, v in
+                          report['reason_counts'].items()))
+    for _g in report['fingerprint_split_groups']:
+        print(f'[aggregate] {_g["variant"]}/{_g["protocol"] or "-"}: '
+              f'{_g["n_fingerprint_classes"]} fingerprint classes reported '
+              'separately (different data/evaluation slices were not pooled)')
+    return agg, report, admitted_records
+
+
 _TW = {'variant': 18, 'ppl': 16, 'd': 15, 'd2': 15, 'params': 10, 'seeds': 6, 'blklen': 7, 'bnd': 13}
 
 def _fmt_cell(value, width, fmt, absent='—'):
@@ -32829,35 +33150,60 @@ def _record_failed_panel(outdir, cfg, run_cfg, prov, *, stage, error, planned_ce
     Evidence files (`overfit_sanity.json`, `seed_contract.json`, ...) and the
     JSONL ledger are already written before a hard stop, but without a
     manifest a failed attempt had no single file carrying the code version,
-    config, seed plan and failure stage.  Create that manifest entry only when
-    this run_cfg has none yet: a later failed pre-flight must never erase a
-    previously completed panel's cells.
+    config, seed plan and failure stage.
+
+    An existing entry for the SAME run_cfg is never erased: a completed or
+    already-incomplete panel keeps its cells, and the failure is appended to
+    the ledger.  A panel that was left in ``running`` state (the process was
+    killed, or a later pre-flight refused) is flipped to ``failed`` so a run
+    that never finished cannot keep looking live forever.  This is the
+    run-state reconciliation, not a retry: no cell measurement is changed.
     """
     try:
         mpath = os.path.join(outdir, 'run_manifest.json')
+        _existing_entry = None
         if os.path.exists(mpath):
             try:
                 with open(mpath, encoding='utf-8') as _mf:
                     _existing = json.load(_mf)
-                if isinstance(_existing, dict) and run_cfg in (_existing.get('panels') or {}):
-                    log_experiment_event(outdir, {
-                        'kind': 'panel_finish', 'tracking_schema': 2,
-                        'status': 'failed', 'stage': str(stage), 'run_cfg': run_cfg,
-                        'code': code_stamp(), 'provenance': prov, 'error': f'{error}',
-                        'planned_cells': list(planned_cells or []),
-                        'note': 'existing run_manifest entry preserved',
-                    })
-                    return mpath
+                if isinstance(_existing, dict):
+                    _existing_entry = (_existing.get('panels') or {}).get(run_cfg)
             except Exception:
-                pass
-        write_run_manifest(outdir, cfg, run_cfg, prov, {}, status='failed',
+                _existing_entry = None
+        _prev_status = str((_existing_entry or {}).get('status') or '').lower()
+        if _prev_status == 'complete':
+            # A completed panel is evidence; a later failed pre-flight with
+            # the same config must not rewrite it into a failed run.
+            log_experiment_event(outdir, {
+                'kind': 'panel_finish', 'tracking_schema': 2,
+                'status': 'failed', 'stage': str(stage), 'run_cfg': run_cfg,
+                'code': code_stamp(), 'provenance': prov, 'error': f'{error}',
+                'planned_cells': list(planned_cells or []),
+                'note': 'existing COMPLETE run_manifest entry preserved; '
+                        'this failed attempt is recorded only in the ledger',
+            })
+            return mpath
+        # Re-read the measured cells (if any) so the failed entry still carries
+        # everything that DID complete.  A corrupt summary is not a reason to
+        # overwrite it; in that case the previous cells are preserved through
+        # write_run_manifest's merge and the failure is still recorded.
+        try:
+            _summary = _read_summary_json(os.path.join(outdir, 'summary.json'))
+        except Exception:
+            _summary = {}
+        write_run_manifest(outdir, cfg, run_cfg, prov, _summary, status='failed',
                            planned_cells=planned_cells,
-                           started_at=time.strftime('%Y-%m-%dT%H:%M:%S'))
+                           started_at=((_existing_entry or {}).get('created_at')
+                                       or time.strftime('%Y-%m-%dT%H:%M:%S')))
         log_experiment_event(outdir, {
             'kind': 'panel_finish', 'tracking_schema': 2,
             'status': 'failed', 'stage': str(stage), 'run_cfg': run_cfg,
             'code': code_stamp(), 'provenance': prov, 'error': f'{error}',
             'planned_cells': list(planned_cells or []),
+            'previous_status': (_prev_status or None),
+            'note': ('running/incomplete panel reconciled to failed; measured '
+                     'cells were preserved' if _existing_entry else
+                     'first failed attempt for this run_cfg'),
         })
         return mpath
     except Exception as _mfe:
@@ -33292,6 +33638,12 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
         _final_status = 'incomplete'
     write_run_manifest(outdir, cfg, fp, prov, summary, sanity=_sanity_doc, reproducibility=_repro_doc, data_contract=_data_contract, seed_contract=_seed_contract, status=_final_status, planned_cells=_planned_keys, started_at=_panel_started, tracking_verification=_tracking)
     _agg = _finish_panel(outdir, summary)
+    try:
+        with open(os.path.join(outdir, 'aggregation_exclusions.json'),
+                  encoding='utf-8') as _xf:
+            _excl_doc = json.load(_xf)
+    except Exception:
+        _excl_doc = {}
     log_experiment_event(outdir, {
         'kind': 'panel_finish', 'tracking_schema': 2, 'label': label or outdir,
         'status': _final_status,
@@ -33308,39 +33660,35 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
         'n_truncated': len(dropped_truncations), 'n_stale_dropped': len(stale_dropped),
         'tracking_verification': {'passed': bool(_tracking.get('passed')), 'ref': 'tracking_verification.json', 'n_problems': len(_tracking.get('problems') or [])},
         'aggregate_ref': 'aggregate.json', 'summary_ref': 'summary.json',
+        'aggregation_exclusions_ref': 'aggregation_exclusions.json',
+        'n_records_quarantined': int(_excl_doc.get('n_excluded') or 0),
+        'aggregation_exclusion_reasons': _excl_doc.get('reason_counts') or {},
         'aggregate': {str(v): {kk: e.get(kk) for kk in ('n', 'n_seeds', 'ppl_mean', 'ppl_std', 'params') if kk in e} for v, e in (_agg or {}).items() if isinstance(e, dict)},
     })
     return (summary, None)
 
 def _dump_aggregate(outdir, summary):
-    agg = {}
     try:
-        agg = aggregate(summary)
+        agg, _excl, records_for_readers = aggregate_with_exclusions(summary)
     except Exception as e:
+        # The wrapper itself must not make a finished panel unreadable.  Keep
+        # the failure visible (and counted) instead of crashing after training.
         print(f'[aggregate] aggregate({outdir}) failed: {type(e).__name__}: {e}')
-        print('[aggregate] retrying with the unusable records (no measured `ppl`, `synthesized`, or an ambiguous same-seed duplicate) removed — the untouched records keep their exact values')
-        _REQUIRED = ()
-        clean = {k: r for k, r in summary.items() if isinstance(r, dict) and r.get('seed') is not None and ppl_is_usable(r.get('ppl')) and (not r.get('synthesized')) and all((r.get(f) is not None for f in _REQUIRED))}
-        _legacy_ok = legacy_warm_tags(clean)
-        _seen, _dups = ({}, [])
-        for k, r in clean.items():
-            rk = _record_identity(r, k, _legacy_ok)
-            if rk is None:
-                continue
-            if rk in _seen:
-                _dups.append((k, _seen[rk]))
-                continue
-            _seen[rk] = k
-        for k, _keep in _dups:
-            clean.pop(k, None)
-        if _dups:
-            print(f'[aggregate] {len(_dups)} ambiguous record(s) dropped (first key wins): ' + ', '.join((f'kept {keep!r}, dropped {k!r}' for k, keep in _dups)))
-        print(f'[aggregate] {len(summary) - len(clean)} record(s) dropped in total: ' + (', '.join(sorted(set(summary) - set(clean))) or '(none)'))
-        agg = aggregate(clean)
-        atomic_write_json(os.path.join(outdir, 'summary.aggregatable.json'), clean)
-        records_for_readers = clean
-    else:
-        records_for_readers = summary
+        agg, records_for_readers = {}, {}
+        _excl = {'kind': 'aggregation_exclusions', 'n_input': len(summary),
+                 'n_admitted': 0, 'n_excluded': len(summary),
+                 'reason_counts': {f'aggregate wrapper failed: {type(e).__name__}: {e}': len(summary)},
+                 'excluded': [{'key': str(k), 'reason': f'aggregate wrapper failed: {type(e).__name__}: {e}'}
+                              for k in summary][:200],
+                 'excluded_truncated': max(0, len(summary) - 200),
+                 'tolerance': 'aggregation failed catastrophically; no number was written as a silent zero'}
+    atomic_write_json(os.path.join(outdir, 'aggregation_exclusions.json'), _excl)
+    if _excl.get('n_excluded'):
+        atomic_write_json(os.path.join(outdir, 'summary.aggregatable.json'),
+                          records_for_readers)
+        print(f'[aggregate] {_excl["n_excluded"]} record(s) were NOT aggregated '
+              f'(of {_excl["n_input"]}); see aggregation_exclusions.json — '
+              'the remaining records keep their exact values')
     _pub = {k: {kk: vv for kk, vv in e.items() if kk != '_group_records'} if isinstance(e, dict) and '_group_records' in e else e for k, e in agg.items()}
     atomic_write_json(os.path.join(outdir, 'aggregate.json'), _pub)
     _save_csv(_pub, outdir)

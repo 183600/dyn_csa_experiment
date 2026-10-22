@@ -461,6 +461,11 @@ def _load_manifest(path):
                     if not math.isfinite(_mr) or _mr <= 1.0:
                         raise SystemExit(f'[v12] REFUSE: per-arm mr for {_arm!r} must be finite and > 1 ({_mr!r})')
     m['manifest_sha256'] = _file_sha256(path)
+    # Keep the resolved source path on the loaded object.  The freeze lock
+    # records which manifest actually granted the first test access; without
+    # this it fell back to the default filename even when the caller loaded a
+    # different (e.g. archived/renamed) manifest.
+    m['_path'] = os.path.abspath(path)
     return m
 
 
@@ -971,14 +976,16 @@ def _training_health_gate(cfg, v, seed, ckpt_meta, train_rec):
 
 @torch.inference_mode()
 def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test',
-                          train_fp=None, frozen_vocab=None):
+                          train_fp=None, frozen_vocab=None, env=None):
     """One (arm, seed) clean by-length evaluation on the TEST split.
 
     记录现在额外携带 manifest_sha256 与
     ckpt_sha256（绑定「哪份冻结计划、哪份权重」）；recipe 必须通过冻结
     清单的结构化配方签名（不再是自然语言说明）；resume 的 stale 判定
     把 manifest 哈希纳入——清单修订后，同一 outdir 的旧结果自动作废，
-    不会被静默复用。"""
+    不会被静默复用。评估记录同时带执行环境指纹（`exec_fp`）与紧凑的
+    environment 快照：代码戳/配置/种子之外，机器与精度栈也被落盘，
+    而不是只在训练记录里有。"""
     outdir = cfg['outdir']
     os.makedirs(outdir, exist_ok=True)
     spath = cfg['bylen_summary']
@@ -988,6 +995,8 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test',
     _ft_run_id = L.new_experiment_id('p5t')
     _ft_started = time.strftime('%Y-%m-%dT%H:%M:%S')
     _ft_t0 = time.time()
+    _ft_env = env if isinstance(env, dict) else L.environment_snapshot()
+    _ft_exec_fp = L.execution_fingerprint(_ft_env)
     ck = os.path.join(cfg['ckpt_dir'], f'{v}_seed{seed}.pt')
     if not os.path.exists(ck):
         print(f'[p5t] SKIP {v} s{seed}: no checkpoint {ck} (run P3MT/P4MT/P5C first)')
@@ -1094,6 +1103,12 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test',
         if rec.get('split') != split:
             return True
         if rec.get('train_fp') != _tr_train_fp:
+            return True
+        # Same weights/data are not enough if the hardware/software/determinism
+        # class changed: this record was measured on a different execution
+        # environment.  Legacy records without exec_fp keep the old permissive
+        # path; a present digest must match the current one.
+        if rec.get('exec_fp') not in (None, _ft_exec_fp):
             return True
         # A record measured on a different row count is a different estimand.
         # n_seq is stored explicitly and a mismatch is treated as stale.  An
@@ -1222,13 +1237,15 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test',
                                     'train_objective': _tr.get('train_objective') or _ck_prov.get('train_objective'),
                                     'param_breakdown': _tr.get('param_breakdown') or _ck_prov.get('param_breakdown'),
                                     'rng_fp': _tr.get('rng_fp') or _ck_prov.get('rng_fp'),
+                                    'exec_fp': _ft_exec_fp,
+                                    'environment': _ft_env,
                                     'amp_dtype': (_tk or {}).get('amp_dtype') if isinstance(_tk, dict) else None,
                                     'amp_grad_scaler': (_tk or {}).get('amp_grad_scaler') if isinstance(_tk, dict) else None,
                                     'eager_batch': (_tk or {}).get('eager_batch') if isinstance(_tk, dict) else None}
         print(f'  [p5t] {v:32s} s{seed} ' + '  '.join((f'L{k}={vv.get("ppl", float("nan")):.2f}' for k, vv in sorted(r.items()))))
         return summary
     L.locked_json_update(spath, _merge)
-    L.log_experiment_event(outdir, {'kind': 'eval', 'tracking_schema': 2, 'run_id': _ft_run_id, 'status': 'ok', 'started_at': _ft_started, 'finished_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'elapsed_s': time.time() - _ft_t0, 'key': f'{v}::s{seed}', 'variant': v, 'seed': int(seed), 'split': split, 'code': V.CKPT_CODE, 'manifest_sha256': _msha, 'recipe': _ck_recipe, 'ckpt_sha256': _ck_sha, 'data_fp': _dfp, 'train_fp': _tr_train_fp, 'params': _tr.get('params'), 'metrics': {'by_len': {str(k): (v2 or {}).get('ppl') for k, v2 in r.items()}}})
+    L.log_experiment_event(outdir, {'kind': 'eval', 'tracking_schema': 2, 'run_id': _ft_run_id, 'status': 'ok', 'started_at': _ft_started, 'finished_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'elapsed_s': time.time() - _ft_t0, 'key': f'{v}::s{seed}', 'variant': v, 'seed': int(seed), 'split': split, 'code': V.CKPT_CODE, 'manifest_sha256': _msha, 'recipe': _ck_recipe, 'ckpt_sha256': _ck_sha, 'data_fp': _dfp, 'train_fp': _tr_train_fp, 'params': _tr.get('params'), 'exec_fp': _ft_exec_fp, 'environment': _ft_env, 'metrics': {'by_len': {str(k): (v2 or {}).get('ppl') for k, v2 in r.items()}}})
     del d
     return out
 
@@ -1418,11 +1435,13 @@ def run_finaltest(cfg=None, guard=None):
         print(f'[p5t] NOTE: n_seqs_clean={_nseq_clean} — document-sampling uncertainty is NOT well covered at this row count; population-level claims need a larger row panel (per-doc losses are recorded in bylen.json for stratified analysis; see design_notes §20)')
     # 1) clean by-length per (arm, seed)
     _split_label = 'smoke' if _smoke else 'test'
+    _ft_env_once = L.environment_snapshot()
     for v in manifest['arms']:
         for seed in manifest['seeds']:
             _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids,
                                   split=_split_label, train_fp=_want_train_fp,
-                                  frozen_vocab=_frozen_vocab)
+                                  frozen_vocab=_frozen_vocab,
+                                  env=_ft_env_once)
     # 2) frozen uniform-corruption probe on the SAME test rows (secondary,
     #    descriptive-only per the manifest)
     _probe_eval = manifest.get('eval', {}).get('distractor_probe') or {}
@@ -1514,6 +1533,11 @@ def _record_int(value):
     return int(f)
 
 
+def _valid_sha256(value):
+    return (isinstance(value, str)
+            and re.fullmatch(r'[0-9a-fA-F]{64}', value or '') is not None)
+
+
 def _admit_confirmation_records(raw, manifest):
     """Strict admission gate for confirmation records.
 
@@ -1523,7 +1547,9 @@ def _admit_confirmation_records(raw, manifest):
     data_fp 非空、recipe 通过冻结配方签名、by_len 非空。
     不满足者被**点名剔除**（不入统计，也不静默消失）；同一 (variant, seed)
     出现两条可采纳记录 = 歧义，**拒绝运行**（而不是后者覆盖前者）；
-    可采纳记录的 data_fp 必须全局唯一（同一冻结 test 切片），否则拒绝。
+    可采纳记录的 data_fp 必须全局唯一（同一冻结 test 切片），否则拒绝；
+    若清单声明/记录携带 ckpt_sha256，则同一权重摘要不得冒充另一个
+    (variant, seed) 的独立测量。
     返回 (admitted[(variant, seed)] -> record, unified data_fp)。"""
     arms = list(manifest['arms'])
     seed_whitelist = {int(s) for s in manifest['seeds']}
@@ -1537,9 +1563,16 @@ def _admit_confirmation_records(raw, manifest):
     duplicates = []
     fps = set()
     train_fps = set()
+    ckpt_owners = {}
     _any_train_fp = any(isinstance(_r, dict) and bool(_r.get('train_fp'))
                         for _r in (raw or {}).values())
     _require_train_fp = _train_fp_required(manifest) or bool(want_train_fp) or _any_train_fp
+    _bind = manifest.get('binding') or {}
+    _any_ckpt = any(isinstance(_r, dict) and bool(_r.get('ckpt_sha256'))
+                    for _r in (raw or {}).values())
+    _require_ckpt = (bool((_bind.get('require_ckpt_sha256')
+                           if isinstance(_bind, dict) else False))
+                     or _any_ckpt)
     for key, r in (raw or {}).items():
         if not isinstance(r, dict):
             continue
@@ -1563,6 +1596,12 @@ def _admit_confirmation_records(raw, manifest):
                 why = f"_code {r.get('_code')!r} does not match the frozen code semantics {exp_code!r}"
             elif msha is not None and r.get('manifest_sha256') != msha:
                 why = f"manifest_sha256 {str(r.get('manifest_sha256'))[:12]}… does not match the current manifest {msha[:12]}… (record from a different freeze revision)"
+            elif _require_ckpt and not _valid_sha256(r.get('ckpt_sha256')):
+                why = ('missing/malformed checkpoint fingerprint (ckpt_sha256) — '
+                       'the weights cannot be tied to this measurement')
+            elif r.get('ckpt_sha256') is not None and not _valid_sha256(r.get('ckpt_sha256')):
+                why = (f"ckpt_sha256 {str(r.get('ckpt_sha256'))[:12]}… is not a "
+                       'SHA-256 digest')
             elif not isinstance(r.get('data_fp'), str) or not r.get('data_fp'):
                 why = 'missing test-slice fingerprint (data_fp) — None==None pairing is not admissible'
             elif _require_train_fp and (not isinstance(r.get('train_fp'), str) or not r.get('train_fp')):
@@ -1584,6 +1623,18 @@ def _admit_confirmation_records(raw, manifest):
                 if (v, s_i) in admitted:
                     duplicates.append(f'{v}::s{s_i} appears twice ({admitted[(v, s_i)].get("key", "?")} and {key})')
                 else:
+                    _ck = r.get('ckpt_sha256')
+                    if _ck:
+                        _ck_key = str(_ck).lower()
+                        _owner = ckpt_owners.get(_ck_key)
+                        if _owner is not None and _owner != (v, s_i):
+                            duplicates.append(
+                                f'checkpoint digest {_ck[:12]}… is reused by '
+                                f'{_owner[0]}::s{_owner[1]} and {v}::s{s_i} — '
+                                'one set of weights is not two independent '
+                                'measurements')
+                        else:
+                            ckpt_owners[_ck_key] = (v, s_i)
                     # Canonicalise the seed in the admitted record: string
                     # '0' and integer 0 passed the whitelist, but downstream
                     # pairing must not treat them as two different seeds.

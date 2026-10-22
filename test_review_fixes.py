@@ -2125,8 +2125,11 @@ def t_v12_malformed_manifest_and_lock_fail_closed():
                 raise AssertionError(f'freeze lock payload {_payload!r} was accepted')
 
 
-def _rec(variant, seed, fp, by_len=None, code=None, recipe='steps3000_sl512_bs12_nt8000000_lr0.0003_wd0.1_d256_L6_H8_Dh32_v8192_wu50_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee250_es128_detcpu-eager_dfdeadbeef_cscURRENT', msha='CURRENT'):
-    return {'variant': variant, 'seed': seed, 'split': 'test', 'data_fp': fp, 'by_len': by_len or {'4096': {'ppl': 30.0, 'n_tok': 16 * 4095, 'truncated': False}}, '_code': code or L.code_stamp(), 'recipe': recipe, 'manifest_sha256': msha, 'key': f'{variant}::s{seed}'}
+def _rec(variant, seed, fp, by_len=None, code=None, recipe='steps3000_sl512_bs12_nt8000000_lr0.0003_wd0.1_d256_L6_H8_Dh32_v8192_wu50_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee250_es128_detcpu-eager_dfdeadbeef_cscURRENT', msha='CURRENT', ckpt=None):
+    _r = {'variant': variant, 'seed': seed, 'split': 'test', 'data_fp': fp, 'by_len': by_len or {'4096': {'ppl': 30.0, 'n_tok': 16 * 4095, 'truncated': False}}, '_code': code or L.code_stamp(), 'recipe': recipe, 'manifest_sha256': msha, 'key': f'{variant}::s{seed}'}
+    if ckpt is not None:
+        _r['ckpt_sha256'] = ckpt
+    return _r
 
 
 def _manifest_for_admission(seeds=(0, 1, 2), sig=None):
@@ -2175,6 +2178,35 @@ def t_admission_refuses():
         raise AssertionError('records spanning two test slices must be refused (pairwise-equal fps are not enough)')
     except SystemExit as e:
         assert 'slice' in str(e).lower()
+
+
+def t_admission_refuses_reused_checkpoint_digest():
+    m = _manifest_for_admission()
+    _A, _B = 'a' * 64, 'b' * 64
+    raw = {'a::s0': _rec('a_arm', 0, 'FP', ckpt=_A),
+           'b::s0': _rec('b_arm', 0, 'FP', ckpt=_B)}
+    adm, _ = V12._admit_confirmation_records(raw, m)
+    assert len(adm) == 2, adm
+    # One set of weights cannot be re-labelled as another arm/seed: that is a
+    # duplicate measurement, not an independent repeat.
+    raw = {'a::s0': _rec('a_arm', 0, 'FP', ckpt=_A),
+           'b::s0': _rec('b_arm', 0, 'FP', ckpt=_A)}
+    try:
+        V12._admit_confirmation_records(raw, m)
+        raise AssertionError('a reused checkpoint digest must be refused')
+    except SystemExit as e:
+        assert 'checkpoint' in str(e).lower() and 'reused' in str(e).lower(), e
+    # Once the manifest (or any record) declares checkpoint binding, a record
+    # without a valid digest is excluded instead of silently bypassing it.
+    m2 = _manifest_for_admission()
+    m2['binding'] = {'require_ckpt_sha256': True}
+    raw = {'a::s0': _rec('a_arm', 0, 'FP'),
+           'b::s0': _rec('b_arm', 0, 'FP', ckpt=_B)}
+    adm, _ = V12._admit_confirmation_records(raw, m2)
+    assert ('a_arm', 0) not in adm and ('b_arm', 0) in adm, adm
+    raw = {'a::s0': _rec('a_arm', 0, 'FP', ckpt='not-a-digest')}
+    adm, _ = V12._admit_confirmation_records(raw, m2)
+    assert ('a_arm', 0) not in adm, adm
 
 
 def t_recipe_signature():
@@ -2228,6 +2260,16 @@ def t_freeze_lock():
             raise AssertionError('a missing train_fp after it was locked must be refused')
         except SystemExit:
             pass
+
+
+def t_freeze_lock_records_manifest_source_path():
+    with tempfile.TemporaryDirectory() as td:
+        p = os.path.join(td, 'renamed_freeze.json')
+        _write_manifest(p, [0, 1], extra_stat={'descriptive_only': True})
+        m = V12._load_manifest(p)
+        assert m['_path'] == os.path.abspath(p), m.get('_path')
+        lock = V12._check_or_write_freeze_lock(td, m, None, stage='preaccess')
+        assert lock['manifest_path'] == os.path.abspath(p), lock
 
 
 def t_p1l_recipe_signature():
@@ -2773,6 +2815,208 @@ def t_ids_fp_ignores_malformed_sidecar():
         arr2 = np.memmap(path, dtype=np.int64, mode='r', shape=(8,))
         assert L._ids_fp(arr2) == expected
         del arr2
+
+
+def t_ids_fp_memo_is_value_bound():
+    # The memo key is an array identity, not the bytes.  A writable array
+    # mutated in place must produce a NEW digest; otherwise a cleaning pass
+    # would leave a stale fingerprint behind and resume/admission could bind
+    # a different corpus under the old identity.
+    arr = np.array([3, 1, 4, 1, 5], dtype=np.int64)
+    before = L._ids_fp(arr)
+    assert L._ids_fp(arr) == before
+    arr[2] = 9
+    after = L._ids_fp(arr)
+    assert after != before, (before, after)
+    # A read-only copy is the same pure function of the values (and may take
+    # the memo/sidecar fast path); writable vs read-only is not an identity.
+    ro = arr.copy()
+    ro.setflags(write=False)
+    assert L._ids_fp(ro) == after
+    assert L._ids_fp(ro) == after
+    # Storage width is transport, not content.
+    assert L._ids_fp(arr.astype(np.int32)) == after
+    assert L._ids_fp(arr.astype(np.uint16)) == after
+
+
+def t_batch_transport_matches_plain_reference():
+    ids = (np.arange(70000, dtype=np.int64) * 7 % 997)
+    for dt in (np.int64, np.int32, np.uint16, np.uint8):
+        rep = L.batch_contract_check(ids.astype(dt), 64, 8,
+                                     torch.device('cpu'), seed=11,
+                                     vocab=997, n_batches=3)
+        assert rep['passed'] is True, (dt, rep)
+        assert rep['checks']['transport_matches_int64_reference'] is True, (dt, rep)
+        assert all(b.get('transport_matches_int64_reference') is True
+                   for b in rep['batches']), (dt, rep['batches'])
+        assert rep['transport']['index_dtype'] == 'int32', rep['transport']
+    # A loader that silently changes one token must fail the transport check,
+    # not merely the shift/vocabulary checks.
+    _orig = L.batch_iter
+    try:
+        def _bad(train_ids, seq_len, batch_size, device, seed=0):
+            for x, y in _orig(train_ids, seq_len, batch_size, device, seed=seed):
+                x = x.clone()
+                x[0, 0] = (int(x[0, 0]) + 1) % 997
+                yield x, y
+        L.batch_iter = _bad
+        rep = L.batch_contract_check(ids, 64, 8, torch.device('cpu'),
+                                     seed=11, vocab=997, n_batches=2)
+        assert rep['passed'] is False, rep
+        assert rep['checks']['transport_matches_int64_reference'] is False, rep
+    finally:
+        L.batch_iter = _orig
+
+
+def t_aggregate_quarantines_bad_records_without_crashing():
+    # One malformed/unmeasured/duplicate record must not make a completed
+    # panel unreadable.  Valid readings survive; every exclusion is named and
+    # counted, and different data/evaluation slices are SPLIT rather than
+    # averaged.
+    summary = {
+        'csa::seed0': {'variant': 'csa', 'seed': 0, 'ppl': 10.0,
+                       'run_cfg': 'cfg', 'data_fp': 'A'},
+        'csa::seed1': {'variant': 'csa', 'seed': 1, 'ppl': 11.0,
+                       'run_cfg': 'cfg', 'data_fp': 'A'},
+        'csa::seed1_dup': {'variant': 'csa', 'seed': 1, 'ppl': 99.0,
+                           'run_cfg': 'cfg', 'data_fp': 'A'},
+        'csa::seed2': {'variant': 'csa', 'seed': 2, 'ppl': 12.0,
+                       'run_cfg': 'cfg', 'data_fp': 'B'},
+        'csa::error': {'variant': 'csa', 'seed': 3,
+                       'error': 'training failed'},
+        'csa::synth': {'variant': 'csa', 'seed': 4, 'ppl': 8.0,
+                       'synthesized': True},
+        'csa::badseed': {'variant': 'csa', 'seed': 1.5, 'ppl': 9.0},
+    }
+    agg, rep, admitted = L.aggregate_with_exclusions(summary)
+    assert rep['n_input'] == len(summary), rep
+    assert rep['n_excluded'] == 4, rep
+    assert rep['n_admitted'] == 3, rep
+    assert any('duplicate' in e['reason'] for e in rep['excluded']), rep
+    assert any('non-finite' in e['reason'] or 'unmeasured' in e['reason']
+               for e in rep['excluded']), rep
+    assert any('non-integer seed' in e['reason'] for e in rep['excluded']), rep
+    assert rep['fingerprint_split_groups'], rep
+    # A != B are separate slices: two output keys, each with n=2 / n=1, never
+    # one averaged n=3 group.
+    assert len(agg) == 2, agg
+    assert sorted(e['n_seeds'] for e in agg.values()) == [1, 2], agg
+    assert set(admitted) == {'csa::seed0', 'csa::seed1',
+                             'csa::seed2'}, admitted
+
+
+def t_scale_geometry_overrides_are_validated():
+    base = dict(L.RUN_S1)
+    base_draws = base['steps'] * base['batch_size'] * base['seq_len']
+    out = L.apply_scale_geometry_overrides(
+        base, {'B_SEQ_LEN': '4096', 'B_BATCH_SIZE': '4'})
+    assert out['seq_len'] == 4096 and out['batch_size'] == 4, out
+    assert base['seq_len'] == L.RUN_S1['seq_len'], 'override must not mutate the module config'
+    assert out['steps'] * out['batch_size'] * out['seq_len'] >= base_draws, out
+    assert out['geometry_overrides']['steps_source'] == 'preserve_sampled_windows', out
+    # An explicit step count always wins; a token-budget change derives steps
+    # from the budget (ceiling), never silently keeps the old count.
+    fixed = L.apply_scale_geometry_overrides(
+        base, {'B_SEQ_LEN': '2048', 'B_STEPS': '17'})
+    assert fixed['steps'] == 17 and fixed['geometry_overrides']['steps_source'] == 'explicit_env', fixed
+    budget = L.apply_scale_geometry_overrides(
+        base, {'B_SEQ_LEN': '256', 'B_BATCH_SIZE': '1',
+               'B_N_TRAIN_TOKENS': '1000000'})
+    assert budget['steps'] == (1000000 + 255) // 256, budget
+    assert budget['geometry_overrides']['steps_source'] == 'from_declared_token_budget', budget
+    for bad in ({'B_SEQ_LEN': '0'}, {'B_BATCH_SIZE': '-1'},
+                {'B_STEPS': '1.5'}, {'B_VAL_SEQS': 'x'},
+                {'B_SEQ_LEN': True}):
+        try:
+            L.apply_scale_geometry_overrides(base, bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'scale geometry override accepted {bad!r}')
+    # Future tiers are discovered from RUN_S<n>, not hard-coded S1/S2.
+    import m0_supp as M0
+    old = os.environ.get('M0_PANEL')
+    try:
+        os.environ['M0_PANEL'] = 'S1,S2'
+        assert M0._panel_chain_from_env() == ['S1', 'S2']
+        os.environ['M0_PANEL'] = 'S9'
+        try:
+            M0._panel_chain_from_env()
+            raise AssertionError('an undeclared scale panel must be refused')
+        except SystemExit:
+            pass
+    finally:
+        if old is None:
+            os.environ.pop('M0_PANEL', None)
+        else:
+            os.environ['M0_PANEL'] = old
+
+
+def t_dump_aggregate_writes_quarantine_report():
+    # Integration: a completed panel with one bad record still writes
+    # aggregate.json plus an explicit quarantine report, and the reader is
+    # handed only the admitted records.
+    summary = {
+        'csa::seed0': {'variant': 'csa', 'seed': 0, 'ppl': 10.0,
+                       'run_cfg': 'cfg', 'data_fp': 'A'},
+        'csa::error': {'variant': 'csa', 'seed': 1, 'error': 'boom'},
+        'csa::synth': {'variant': 'csa', 'seed': 2, 'ppl': 9.0,
+                       'synthesized': True},
+    }
+    with tempfile.TemporaryDirectory() as td:
+        _saved = (L._plot, L._print_table, L._print_pairs, L.methodology_audit)
+        try:
+            L._plot = lambda *a, **k: None
+            L._print_table = lambda *a, **k: None
+            L._print_pairs = lambda *a, **k: None
+            L.methodology_audit = lambda *a, **k: {}
+            L._dump_aggregate(td, summary)
+        finally:
+            (L._plot, L._print_table, L._print_pairs,
+             L.methodology_audit) = _saved
+        rep = json.load(open(os.path.join(td, 'aggregation_exclusions.json'),
+                             encoding='utf-8'))
+        assert rep['n_input'] == 3 and rep['n_admitted'] == 1, rep
+        assert rep['n_excluded'] == 2, rep
+        assert rep['reason_counts'], rep
+        agg = json.load(open(os.path.join(td, 'aggregate.json'),
+                             encoding='utf-8'))
+        assert list(agg) == ['csa'], agg
+        assert os.path.exists(os.path.join(td, 'summary.aggregatable.json'))
+
+
+def t_failed_panel_reconciles_running_state():
+    with tempfile.TemporaryDirectory() as td:
+        cfg = {'seeds': [0], 'variants': ['full'], 'outdir': td,
+               'n_train_tokens': 64, 'seq_len': 8}
+        tr = np.arange(64, dtype=np.int64) % 97
+        va = np.arange(16, dtype=np.int64).reshape(2, 8) % 97
+        prov = L.experiment_provenance(cfg, train_ids=tr, val_batch=va,
+                                       vocab=97)
+        L.write_run_manifest(td, cfg, 'FP', prov, {}, status='running',
+                             planned_cells=['full::seed0'],
+                             started_at='2026-01-01T00:00:00')
+        L._record_failed_panel(td, cfg, 'FP', prov, stage='preflight',
+                               error='synthetic failure',
+                               planned_cells=['full::seed0'])
+        m = json.load(open(os.path.join(td, 'run_manifest.json'),
+                           encoding='utf-8'))['panels']['FP']
+        assert m['status'] == 'failed', m['status']
+        assert m['completion']['status'] == 'failed', m['completion']
+        assert m['planned_cells'] == ['full::seed0'], m['planned_cells']
+        # A later failed pre-flight must not rewrite a COMPLETE panel.
+        m['status'] = 'complete'
+        m['completion']['status'] = 'complete'
+        m['sentinel'] = 'keep-me'
+        with open(os.path.join(td, 'run_manifest.json'), 'w',
+                  encoding='utf-8') as f:
+            json.dump({'manifest_version': 1, 'panels': {'FP': m}}, f)
+        L._record_failed_panel(td, cfg, 'FP', prov, stage='preflight2',
+                               error='another failure',
+                               planned_cells=['full::seed0'])
+        m2 = json.load(open(os.path.join(td, 'run_manifest.json'),
+                            encoding='utf-8'))['panels']['FP']
+        assert m2['status'] == 'complete' and m2['sentinel'] == 'keep-me', m2
 
 
 def t_seed_coverage_warning():
@@ -16124,6 +16368,7 @@ def main():
     _check('C4 recipe signature', t_recipe_signature)
     _check('C4b P1L checkpoint recipe signature', t_p1l_recipe_signature)
     _check('C5 freeze lock', t_freeze_lock)
+    _check('C5a freeze lock records the actual manifest path', t_freeze_lock_records_manifest_source_path)
     _check('C5b by-length per-document row count', t_by_len_requires_one_ppl_per_row)
     _check('C5c plan endpoint and P5T preflight gate', t_plan_check_rejects_bad_endpoint_and_finaltest_is_gated)
     _check('C5b probe stats reject malformed arm identities', t_probe_stats_rejects_malformed_arm_identities)
@@ -16189,6 +16434,7 @@ def main():
     _check('E2b batch_iter uint16 transport', t_batch_iter_uint16)
     _check('E2c real batch-iterator contract check', t_batch_contract_check)
     _check('E2c2 batch contract validates its own seed/counts', t_batch_contract_check_validation)
+    _check('E2c3 batch transport matches a plain int64 reference', t_batch_transport_matches_plain_reference)
     _check('E2d failed loader contract blocks the panel', t_panel_blocks_on_loader_contract_failure)
     _check('E2e parallel child gets the seed hash', t_parallel_child_env_seed)
     _check('E3 small-batch overfit sanity', t_overfit_sanity)
@@ -16201,6 +16447,7 @@ def main():
     _check('E4 provenance + run manifest', t_provenance_and_manifest)
     _check('E4a manifest requires referenced curve artifacts', t_manifest_missing_curve_ref_is_incomplete)
     _check('E4b manifest rejects mismatched run_cfg/data_version', t_manifest_rejects_mismatched_cell_identity)
+    _check('E4b2 failed pre-flight reconciles a running panel', t_failed_panel_reconciles_running_state)
     _check('E4c runtime host/process identity', t_environment_snapshot_runtime_identity)
     _check('E4b panel tracking events', t_panel_tracking_events)
     _check('E5 DataLoader/worker seeding', t_dataloader_seeding_helpers)
@@ -16447,12 +16694,16 @@ def main():
     _check('L51c recommended endpoint availability + exact floor support', t_metric_audit_recommended_availability_and_exact_floor_support)
     _check('L52 simple-baseline floor identity/rows bind their evidence', t_simple_baseline_bound_floor_identity_and_rows)
     _check('L53 v12 malformed manifest/lock fail closed', t_v12_malformed_manifest_and_lock_fail_closed)
+    _check('L53b admission refuses reused checkpoint digests', t_admission_refuses_reused_checkpoint_digest)
     _check('L54 build report excludes malformed panel objects', t_build_report_malformed_panel_is_excluded)
     _check('L55 controlled recipe requires a complete train_knobs descriptor', t_training_knobs_must_be_complete)
     _check('L56 underpowered contrast is never significant; std definability', t_underpowered_contrast_is_never_significant)
     _check('L57 report pairs cover the declared ablation design', t_report_pairs_cover_the_declared_ablation_design)
     _check('L58 a partial ablation cannot verify the whole component', t_partial_ablation_cannot_verify_a_component)
     _check('L59 id fingerprint ignores malformed sidecar', t_ids_fp_ignores_malformed_sidecar)
+    _check('L59b id fingerprint memo is bound to the current values', t_ids_fp_memo_is_value_bound)
+    _check('L59c aggregate quarantines corrupt records and counts them', t_aggregate_quarantines_bad_records_without_crashing)
+    _check('L59d aggregate writes the quarantine report', t_dump_aggregate_writes_quarantine_report)
     _check('L60 single-factor design gate verifies the shipped design and fails closed on drift', t_single_factor_design_gate_passes_and_fails_closed)
     _check('L61 frozen-manifest mechanism flags are machine-verified single-factor verdicts', t_frozen_manifest_mechanism_flags_are_verified_single_factor)
     _check('L62 seq2k sweep contrasts carry explicit factor declarations', t_seq2k_contrasts_carry_factor_declarations)
@@ -16466,6 +16717,7 @@ def main():
     _check('L70 baseline claim gate requires every baseline rung', t_baseline_claim_gate_requires_every_rung)
     _check('L71 tuned-baseline hypothesis is attached to the panel', t_tuned_baseline_hypothesis_is_attached_to_the_panel)
     _check('L72 data protocol is field-driven and scale-safe', t_data_protocol_is_field_driven_and_scale_safe)
+    _check('L72b scale geometry overrides preserve the draw budget', t_scale_geometry_overrides_are_validated)
     _check('L73 split_and_prepare emits per-split content fingerprints', t_split_and_prepare_emits_per_split_fingerprints)
     _check('L74 chunking similarity source + segmenter prefix invariance', t_chunking_protocol_and_prefix_invariance)
     _check('L75 bnd_rand definitions are tagged and never pooled', t_bnd_rand_definitions_are_tagged_and_never_pooled)

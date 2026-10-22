@@ -1136,6 +1136,22 @@ def scale_analysis(summaries=None, outdir='analysis_m0'):
     return report
 
 
+def _scale_panel_names():
+    """Every declared ``RUN_S<n>`` panel, discovered instead of hard-coded.
+
+    Adding S3/S4 (or an S10) means adding the config in exp_lib; this driver
+    then accepts it without another edit.  The previous S1/S2 tuple silently
+    refused any later tier and made the scale-up path look complete when it
+    was not.
+    """
+    names = []
+    for _n in dir(L):
+        _m = re.fullmatch(r'RUN_S(\d+)', _n)
+        if _m and isinstance(getattr(L, _n, None), dict):
+            names.append('S' + _m.group(1))
+    return sorted(names, key=lambda s: int(s[1:]))
+
+
 def _panel_chain_from_env():
     """Resolve the panel chain: M0_AUTO_CHAIN (comma list) > M0_PANEL > S1.
 
@@ -1145,9 +1161,11 @@ def _panel_chain_from_env():
     """
     raw = (os.environ.get('M0_AUTO_CHAIN') or os.environ.get('M0_PANEL') or 'S1').strip()
     panels = [p.strip().upper() for p in raw.split(',') if p.strip()]
-    bad = [p for p in panels if p not in ('S1', 'S2')]
+    _valid = _scale_panel_names()
+    bad = [p for p in panels if p not in _valid]
     if bad or not panels:
-        print(f"[m0] unknown panel(s) {bad or raw!r} in M0_AUTO_CHAIN/M0_PANEL={raw!r}; expected 'S1' or 'S2'.  Nothing was started.")
+        print(f"[m0] unknown panel(s) {bad or raw!r} in M0_AUTO_CHAIN/M0_PANEL={raw!r}; "
+              f"declared scale panels are {_valid or '(none)'}.  Nothing was started.")
         raise SystemExit(2)
     if len(panels) > 1:
         print(f'[m0] panel chain: {" -> ".join(panels)} (sequential; each panel keeps its own cap/state file; no shutdown between panels)')
@@ -1161,7 +1179,28 @@ def _run_panel(panel):
     end-of-run shutdown so a multi-panel chain never powers off mid-way.
     Returns the final push status.
     """
-    run_cfg, cap, cap_env = (L.RUN_S1, L.M0_CAP, 'M0_CAP_HOURS') if panel == 'S1' else (L.RUN_S2, L.M2_CAP, 'M2_CAP_HOURS')
+    run_cfg = getattr(L, f'RUN_{panel}', None)
+    if not isinstance(run_cfg, dict):
+        print(f'[m0] panel {panel!r} has no RUN_{panel} config; declared panels: '
+              f'{_scale_panel_names()}.  Nothing was started.')
+        raise SystemExit(2)
+    # Geometry is parameterised for future scale: a longer sequence or a card
+    # with less free memory can be handled by explicit env overrides, and the
+    # override is copied into the panel cfg (hence run_cfg/manifest).
+    run_cfg = L.apply_scale_geometry_overrides(run_cfg)
+    if run_cfg.get('geometry_overrides'):
+        print(f'[m0] geometry overrides: {run_cfg["geometry_overrides"]}')
+    _caps = {'S1': (getattr(L, 'M0_CAP', None), 'M0_CAP_HOURS'),
+             'S2': (getattr(L, 'M2_CAP', None), 'M2_CAP_HOURS')}
+    cap, cap_env = _caps.get(panel, (None, f'{panel}_CAP_HOURS'))
+    if not isinstance(cap, dict):
+        cap = getattr(L, f'{panel}_CAP', None)
+        if not isinstance(cap, dict):
+            cap = getattr(L, f'M{panel[1:]}_CAP', None)
+    if not isinstance(cap, dict):
+        # A future tier without a declared cap still gets its own accounting
+        # file instead of silently sharing (and corrupting) S1's budget.
+        cap = dict(L.M0_CAP, state_path=f'run_time_state_{panel.lower()}.json')
     # The compute plan makes G0 a hard precondition for the scale panels, so
     # check it before the pre-flight work starts.
     L.require_g0(f'M0/{panel} 主面板')
