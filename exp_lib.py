@@ -2396,7 +2396,17 @@ def _device_segment_geometry(n, cuts, min_block, max_block, device):
     nxt[:, -1] = n
     # Orbit of f(0) under f(p)=nxt[p], generated in doubling batches.  Invalid
     # slots stay at the sentinel n; the array is padded to a power of two.
-    k_max = (n + max(_mb, 1) - 1) // max(_mb, 1) + 1
+    #
+    # Bound the orbit by the SMALLEST possible successor stride, not by
+    # min_block alone.  f(p) is min(p+max_block, max(p+min_block, cut+1)),
+    # so when max_block < min_block the first branch wins at every step and
+    # the effective stride is max_block.  Bounding by min_block alone then
+    # under-allocates `starts` and silently truncates the block table (the
+    # remaining tokens all collapse into one oversized final block); the
+    # host `_segment`, which this function must replicate exactly, applies
+    # the min/max formula without assuming max_block >= min_block.
+    _stride_min = max(1, min(max(_mb, 1), max(_xb, 1)))
+    k_max = (n + _stride_min - 1) // _stride_min + 1
     target = 1
     while target < k_max:
         target <<= 1

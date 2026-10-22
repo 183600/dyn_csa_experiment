@@ -2334,3 +2334,45 @@ python v12_supp.py plan         # 冻结预检不受影响
 python test_review_fixes.py     # L113 准入、L115 cluster CI、L116 集成、L117 报告口径
 python v12_supp.py plan         # 冻结预检不受影响
 ```
+
+## 45. 设备端分块轨道上界与 pooled-CI 来源守卫
+
+两个零 GPU 的潜在缺陷，规模扩大后都会变成静默错误，因此一并修正。
+
+### 45.1 设备端后继轨道必须按「最小有效步长」定上界
+
+`_device_segment_geometry` 用倍增法在设备上预分配后继轨道，原先按
+`ceil(n / min_block) + 1` 估算块数上界。该上界默认
+`max_block >= min_block`（`AttnCfg` 的正常约束），但本函数承诺是
+`_segment` 的逐整数复刻，而宿主分段器接受任意整数上下界。当
+`max_block < min_block` 时，后继
+`f(p) = min(p+max_block, max(p+min_block, cut+1))` 恒取第一支，实际步长
+是 `max_block`；长序列下真实块数约为 `n/max_block`，预分配轨道只覆盖
+`n/min_block` 个起点，剩余块被截断，所有后续 token 被并进一个超长末块。
+设备端与宿主端的块表因此不同，且没有任何报错。
+
+修正：按最小可能步长定上界
+`max(1, min(max(min_block, 1), max(max_block, 1)))`。`max_block` 为
+`None` 时已在函数入口转换为 `n`；上下界为 0 或负数时宿主每一步也至少
+前进 1，该公式同样成立。修正不改变 `AttnCfg` 已有的
+`max_block >= min_block` 校验，只让内部复刻在宿主可接受的任意边界下
+保持逐整数一致。
+
+### 45.2 没有主终点 `ppl` 时不得发布 pooled cluster 区间
+
+`_doc_level_analysis` 只用文档 NLL 向量计算 cluster 区间，然后把它与
+单元记录的逐种子池化 `ppl` 差核对，确保点估计与冻结主比较同口径。
+原实现中，若 `ppl` 缺失或非有限，`_pt` 为空，`else` 分支会直接接受
+`_pc`，跳过这层核对，发布一个无法与主终点绑定的区间。缺失的主终点值
+不是「文档向量已核对」的证据。
+
+修正：`_pt` 为空时写出 `pooled_ci_unavailable_reason` 并拒绝该区间；
+只有在逐种子 `ppl` 有限且与文档向量复现的池化 Δ 一致时才发布。
+
+入口与验证：
+
+```bash
+python test_review_fixes.py     # L116 缺失 ppl 拒绝、L118 设备/宿主分块一致（n=10003）
+python test_open_block.py       # 分块与开块回归
+python v12_supp.py plan         # 冻结预检不变：72/72、6 个主比较
+```

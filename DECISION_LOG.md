@@ -1718,3 +1718,49 @@ Extended L113 covers the new admission checks.
 `python test_review_fixes.py` passes 451/454 with the same 3 DataLoader
 environment skips; `python v12_supp.py plan` still admits 72/72 synthetic
 frozen records with the same six comparisons.
+
+## 2026-10-22 — device block orbit bound and pooled-CI provenance guard
+
+Zero-GPU correctness review; no training run, frozen manifest, test split,
+`CODE_SEMANTICS`, README or CI configuration was touched. Two latent bugs were
+found and fixed.
+
+**Bug 1 (scale).** `_device_segment_geometry` preallocates the successor orbit
+as a power-of-two table sized from
+`k_max = ceil(n / min_block) + 1`. That bound assumes `max_block >= min_block`
+(the validated `AttnCfg` invariant), but the function is an exact replica of
+`_segment`, which accepts any integer bounds. When `max_block < min_block`, the
+successor `f(p) = min(p+max_block, max(p+min_block, cut+1))` takes the first
+branch at every step, so the effective stride is `max_block`. For a long
+sequence the preallocated orbit then covers only `~n/min_block` starts while
+the true block count is `~n/max_block`; the device result silently truncates
+and collapses every remaining token into one oversized final block. The fix
+bounds the orbit by the smallest possible stride,
+`max(1, min(max(min_block, 1), max(max_block, 1)))`, which is exact for
+negative/zero bounds too (both segmenters floor the step at one).
+
+**Bug 2 (provenance).** `_doc_level_analysis` published the token-pooled
+cluster interval even when it could not reproduce the primary endpoint: if a
+cell's recorded per-seed `ppl` was missing or non-finite, `_pt` became empty
+and the `else` branch accepted `_pc` without the point-estimate identity
+check. A missing primary value is not evidence that the document vectors match
+it. The branch now emits `pooled_ci_unavailable_reason` and withholds the
+interval, matching the existing refusal for mismatched vectors.
+
+**Boundary.** Both fixes are descriptive/geometry corrections: the primary
+pooled PPL, the frozen decision rule, the seed-level exact sign-flip and the
+Holm family are unchanged, and no measurement value changes. `AttnCfg` already
+rejects `max_block < min_block` for normal model configurations; the fix makes
+the internal device replica honour its documented contract for any bounds the
+host segmenter accepts, including future scale experiments that call the
+segmenter directly.
+
+**Verification.** Extended L116 (missing/non-finite primary `ppl` now refuses
+the cluster interval) and new L118 (device vs host segmenter at `n=10003` for
+`max_block < min_block`, dense/sparse cuts, honoured masks, and the valid
+`max_block >= min_block` regression). A property test over 3,000 random
+`(n, min_block, max_block, cut-table)` cases, including `n=10003` and
+`max_block < min_block`, found no further device/host mismatch.
+`python test_review_fixes.py` passes 452/455 with the same 3 DataLoader
+environment skips; `python v12_supp.py plan` still admits 72/72 synthetic
+frozen records with the same six comparisons.

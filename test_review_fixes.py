@@ -16777,6 +16777,42 @@ def t_pool_geometry_widens_instead_of_wrapping():
     assert g2.starts.dtype == torch.int32, g2.starts.dtype
 
 
+def t_device_segment_geometry_matches_host_at_scale():
+    # `_device_segment_geometry` preallocates the successor orbit from a
+    # block-count bound.  The bound must use the SMALLEST possible successor
+    # stride: f(p) = min(p+max_block, max(p+min_block, cut+1)), so when
+    # max_block < min_block the first branch wins and the effective stride is
+    # max_block.  Bounding by min_block alone under-allocates `starts` on a
+    # long sequence and silently truncates the block table (the remaining
+    # tokens collapse into one oversized final block), even though the host
+    # `_segment` it must replicate has no such assumption.
+    n = 10003
+    cuts = np.zeros((2, n - 1), dtype=bool)
+    cuts[0, ::7] = True
+    cuts[1, ::113] = True
+    for mb, xb in ((64, 16), (128, 1), (2, 1), (16, 16), (2, 128), (2, None)):
+        bid, counts, hon = L._device_segment_geometry(
+            n, torch.from_numpy(cuts), mb, xb, 'cpu')
+        for b in range(cuts.shape[0]):
+            _hb, _hh, hc = L._segment(n, cuts[b].tolist(), mb, xb)
+            exp_bid = np.repeat(np.arange(len(hc), dtype=np.int64), hc)
+            got_c = counts[b].tolist()
+            while got_c and got_c[-1] == 0:  # drop the power-of-two padding
+                got_c.pop()
+            assert got_c == [int(c) for c in hc], (mb, xb, b, got_c[:8], list(hc)[:8])
+            assert np.array_equal(bid[b].numpy(), exp_bid), (mb, xb, b)
+            # A truncated table cannot reach the last host block id.
+            assert int(bid[b].max()) == len(hc) - 1, (mb, xb, b, int(bid[b].max()), len(hc))
+            exp_h = np.zeros(max(n - 1, 0), dtype=np.int64)
+            for _slot in _hh:
+                exp_h[int(_slot)] = 1
+            got_h = np.zeros(max(n - 1, 0), dtype=np.int64)
+            _hs = hon[b].numpy()[:n - 1]
+            _ok = _hs >= 0
+            got_h[_hs[_ok]] = 1
+            assert np.array_equal(got_h, exp_h), (mb, xb, b)
+
+
 def t_aggregate_wrapper_preserves_pairs_and_splits_code():
     # `aggregate_with_exclusions` is what every panel dump uses.  Its old
     # per-variant grouping removed the baseline before `aggregate` could pair,
@@ -17508,6 +17544,18 @@ def t_doc_level_analysis_uses_the_pooled_estimand_ci():
     refused2 = V12._doc_level_analysis(bad_ppl, recs_b, [0, 1], 512)
     assert 'pooled_delta_ppl_ci95' not in refused2, refused2
     assert 'inconsistent' in refused2.get('pooled_ci_unavailable_reason', ''), refused2
+    # The cluster interval must also be refused when the cell has no finite
+    # per-seed pooled PPL to tie its point estimate to: a missing primary
+    # value is not evidence that the document vectors reproduce it.
+    _no_ppl_a = _document_cell(nll_a, toks, docs)
+    _no_ppl_b = _document_cell(nll_b, toks, docs)
+    _no_ppl_a.pop('ppl')
+    _no_ppl_b.pop('ppl')
+    no_ppl = ({s: {'by_len': {512: dict(_no_ppl_a)}} for s in (0, 1)},
+              {s: {'by_len': {512: dict(_no_ppl_b)}} for s in (0, 1)})
+    refused3 = V12._doc_level_analysis(no_ppl[0], no_ppl[1], [0, 1], 512)
+    assert 'pooled_delta_ppl_ci95' not in refused3, refused3
+    assert 'pooled PPL' in refused3.get('pooled_ci_unavailable_reason', ''), refused3
     # Row-level cells keep the labelled row bootstrap and never claim a
     # token-pooled document interval.
     rows_a = {s: {'by_len': {512: {'ppl_per_seq': [1.0, 2.0, 4.0]}}}
@@ -17997,6 +18045,7 @@ def main():
     _check('L115 paired token-pooled document cluster CI', t_paired_token_pooled_document_ci)
     _check('L116 doc-level analysis CI targets the pooled estimand', t_doc_level_analysis_uses_the_pooled_estimand_ci)
     _check('L117 document CI rendering never mixes estimands', t_doc_ci_markdown_cell_prefers_pooled_cluster)
+    _check('L118 device block geometry matches host at scale (max_block < min_block)', t_device_segment_geometry_matches_host_at_scale)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

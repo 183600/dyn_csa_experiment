@@ -2070,7 +2070,15 @@ def _doc_level_analysis(recs_a, recs_b, common, Ln):
                     else:
                         _pooled_ci = _pc
                 else:
-                    _pooled_ci = _pc
+                    # The frozen comparison has no finite per-seed pooled PPL
+                    # for this cell, so the document vectors cannot be tied to
+                    # the primary estimand.  Do not publish an interval whose
+                    # point estimate could not be checked: `_pt` is empty for
+                    # a missing/NaN `ppl`, not because the vectors are trusted.
+                    _pooled_ci_reason = (
+                        'token-pooled cluster CI refused: the recorded per-seed '
+                        'pooled PPL is missing or non-finite, so the document '
+                        'vectors cannot be tied to the primary comparison')
     arr = np.asarray(doc_deltas, dtype=float)
     lr = np.asarray(doc_log_ratios, dtype=float)
     # Seed-level sign-flip remains the confirmatory test.  These intervals
