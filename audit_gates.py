@@ -429,6 +429,70 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
         _unverifiable.append(
             'test document-id sidecar is missing; train/val/test document-group '
             'isolation cannot be verified')
+    # c3) per-token document mapping.  The document-level analysis (document
+    # bootstrap, per-document PPL) is only honest when every scored token has
+    # a document id; a fixed row is not a document.  The sidecar is optional
+    # for legacy caches, but if the metadata declares it, its absence or
+    # mismatch is a hard failure rather than a silent fallback to row-level
+    # uncertainty.
+    _ttd_p = os.path.join(cache_dir, f'test_token_doc_ids_{test_tag}.npy')
+    _tm_doc2 = (test_meta or {}).get('doc_ids') or {}
+    _ttd_declared = bool(isinstance(_tm_doc2, dict) and (
+        _tm_doc2.get('test_token_count') is not None
+        or _tm_doc2.get('test_token_fp') is not None))
+    if os.path.exists(_ttd_p):
+        try:
+            _Lfp_doc = _import_exp_lib()
+            _ttd = np.load(_ttd_p)
+            _te_for_size = os.path.join(cache_dir, f'test_ids_{test_tag}.npy')
+            _te_n = int(np.load(_te_for_size, mmap_mode='r').size) if os.path.exists(_te_for_size) else None
+            _ttd_problems = []
+            if _ttd.dtype.kind not in 'iu':
+                _ttd_problems.append(f'per-token doc ids have dtype {_ttd.dtype}, not an integer type')
+            if _ttd.size and int(_ttd.min()) < 0:
+                _ttd_problems.append('per-token doc ids contain negative values')
+            if _te_n is not None and int(_ttd.size) != _te_n:
+                _ttd_problems.append(
+                    f'per-token doc ids cover {_ttd.size} tokens but the test ids have {_te_n}')
+            if _tm_doc2.get('test_token_count') is not None:
+                try:
+                    if int(_tm_doc2['test_token_count']) != int(_ttd.size):
+                        _ttd_problems.append('test_token_count disagrees with the sidecar length')
+                except (TypeError, ValueError, OverflowError):
+                    _ttd_problems.append('test_token_count is not an integer')
+            if _tm_doc2.get('test_token_fp') is not None:
+                if str(_tm_doc2['test_token_fp']) != str(_Lfp_doc._ids_fp(_ttd)):
+                    _ttd_problems.append('per-token doc-id fingerprint disagrees with the metadata')
+            out['checks']['document_level_eval'] = {
+                'status': 'ok' if not _ttd_problems else 'fail',
+                'tokens': int(_ttd.size),
+                'documents': int(np.unique(_ttd).size),
+                'problems': _ttd_problems,
+            }
+            if _ttd_problems:
+                out['status'] = 'fail'
+                out['note'] = ('per-token document mapping is not verifiable: '
+                               + '; '.join(_ttd_problems))
+        except Exception as _tte:
+            out['checks']['document_level_eval'] = f'failed ({type(_tte).__name__}: {_tte})'
+            out['status'] = 'fail'
+            out['note'] = (f'per-token document mapping unreadable ({_tte}); '
+                           'document-level uncertainty cannot be claimed')
+    elif _ttd_declared:
+        out['checks']['document_level_eval'] = {
+            'status': 'fail',
+            'note': 'metadata declares a per-token document-id sidecar that is missing',
+        }
+        out['status'] = 'fail'
+        out['note'] = ('per-token document mapping is declared but missing; '
+                       'rebuild the test cache rather than reporting row-level '
+                       'uncertainty as document-level')
+    else:
+        out['checks']['document_level_eval'] = {
+            'status': 'legacy_row_level',
+            'note': ('no per-token document-id sidecar; the by-length readout is '
+                     'row-level, not document-level (the pooled PPL is unaffected)'),
+        }
     # d) document overlap via deterministic SLIDING shingles on the cached id
     # matrices.  A fixed polynomial rolling hash over every window, uniform
     # segments across the full train stream, and an explicit scanned fraction

@@ -2248,3 +2248,48 @@ Holm/6 时返回 None），以及
 `family_names` 不缩小 m；L108 覆盖 v12 集成只追加 `robustness`、不修改
 `confirmed`/`holm`、覆盖门不被重放，以及 Markdown 渲染；L109 覆盖文档层
 广度读数与行长不一致时的拒绝。
+
+
+## 43. 文档级评测必须按真实文档边界聚合（本轮数据口径硬化）
+
+固定长度的评测行是**流上的窗口**，不是文档。一行可能只覆盖某个文档的
+一部分（同一文档被两行各计一次），也可能同时包含前一个文档的尾部和后
+一个文档的头部。把它当作「文档」做 bootstrap，会系统性地把独立性假设
+写错：点估计仍是 token 池化 PPL（不受影响），但区间和 `n_docs` 描述的是
+行抽样，而不是文档抽样。
+
+因此：
+
+- `load_wikitest` 除文档级 sidecar 外，另落**逐 token** 文档 id
+  `test_token_doc_ids_*.npy`（一个 served token 一个 id）。它由产生 token
+  流的同一组 `len(ids)+1` 长度展开，EOS 归属发出它的文档；写入前校验
+  长度恰等于 served slice、逐 token 与逐文档两个 sidecar 的文档集合一致；
+  meta 记录 count + fingerprint，缓存命中时重新核验。把声明了该 sidecar
+  却缺失/错位的缓存视为损坏（fail closed），而不是静默退回行级。
+- `eval_length_gen(doc_ids=...)` 用 `document_index` + 确定性分段求和把
+  **同一个** per-token NLL 表按文档聚合，输出 `nll_per_doc` /
+  `n_tokens_per_doc` / `ppl_per_doc` / `doc_ids` / `n_docs`。池化 `ppl`、
+  `n_tok`、`nll_sum`、`nll_per_seq`、`ppl_per_seq` 不变；新字段只是同一
+  批预测的另一种分组。
+- `v12_supp._doc_level_analysis` 优先使用 `ppl_per_doc`；若记录混合了
+  文档级与行级、或逐文档 token 数/文档顺序不一致，则拒绝配对，而不是
+  按位置硬配。`granularity` 明确写出 `document` 或 `row`；报告中的
+  「文档/行 Δ 95% CI」和「% Δ<0」使用对应的单位。
+- 准入要求：声明 `doc_granularity=document` 的单元，逐文档 token 数之和
+  必须恰等于 `n_tok`，`n_docs` 必须等于逐文档向量长度。审计端独立重算
+  per-token sidecar 的长度、dtype、负值与指纹。
+- 旧缓存可**不重建**恢复映射：构造契约保证每篇完整文档恰好一个 EOS，被
+  token cap 截断的最后一篇没有 EOS；`_token_doc_ids_from_eos` 按 EOS 位置
+  和文档级 sidecar 顺序展开。只有 EOS 计数/顺序与文档集合都通过校验时才
+  采用；否则仍显式降级为行级并打印原因。这样冻结后的 test cache 不必为了
+  文档级不确定度而重读/重建。
+- 边界：旧缓存没有逐 token sidecar、且 EOS 重建也无法通过校验时，文档级
+  读数明确降级为**行级**并打印说明；池化 PPL 与冻结判定不变，
+  `CODE_SEMANTICS` 不因本改动而升版。
+
+入口与验证：
+
+```bash
+python test_review_fixes.py     # L111 逐 token 对齐、L112 跨行/混合文档聚合、L113 粒度拒绝
+python v12_supp.py plan         # 冻结预检不受影响
+```

@@ -2314,7 +2314,18 @@ def run_niah_phase(payload, guard=None, label=''):
     return summary
 
 @torch.inference_mode()
-def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=16, max_pos=None):
+def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=16, max_pos=None,
+                    doc_ids=None):
+    """By-length evaluation with an optional document-boundary mapping.
+
+    ``doc_ids`` is an optional per-token array with the SAME shape as
+    ``val_ids``.  Fixed evaluation rows are arbitrary windows: a document can
+    span two rows and a row can merge two documents, so ``ppl_per_seq`` is a
+    per-ROW statistic.  When the document mapping is supplied, each cell also
+    carries per-DOCUMENT NLL/token counts/PPL, which is the unit a document
+    bootstrap must resample.  The pooled ``ppl`` and ``ppl_per_seq`` values are
+    unchanged (the new fields are a separate, deterministic aggregation).
+    """
     was = model.training
     model.eval()
     out = {}
@@ -2346,6 +2357,20 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=16, max_pos=
         raise ValueError(
             f'eval_length_gen: val_ids must be a 2-D [n_seq, tokens] panel, '
             f'got shape {_varr.shape}')
+    _doc2d = None
+    if doc_ids is not None:
+        _darr = np.asarray(doc_ids)
+        if tuple(_darr.shape) != tuple(_varr.shape):
+            raise ValueError(
+                f'eval_length_gen: doc_ids must have the same shape as '
+                f'val_ids {tuple(_varr.shape)}, got {tuple(_darr.shape)}')
+        if _darr.dtype.kind not in 'iu':
+            raise ValueError(
+                'eval_length_gen: doc_ids must be integer document ids, got '
+                f'dtype {_darr.dtype}')
+        if _darr.size and int(_darr.min()) < 0:
+            raise ValueError('eval_length_gen: doc_ids must be non-negative')
+        _doc2d = _darr
     if max_pos is not None:
         _mp = L._exact_count(max_pos, minimum=2)
         if _mp is None:
@@ -2434,6 +2459,11 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=16, max_pos=
                 del _h
                 _r += _chunk
             _cum = nll_cols.cumsum(dim=1)
+            _doc_targets = None
+            _doc_map = None
+            if _doc2d is not None:
+                _doc_targets = _doc2d[:int(ids.shape[0]), 1:_Lmax]
+                _doc_map = L.document_index(_doc_targets)
             for Ln in _within:
                 _t = float(_cum[:, Ln - 2].sum()) if Ln >= 2 else 0.0
                 _ntok = int(ids.shape[0]) * (Ln - 1)
@@ -2450,6 +2480,15 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=16, max_pos=
                 if Ln >= 2:
                     out[Ln]['ppl_per_seq'] = [float(L._safe_exp_ppl(float(v) / (Ln - 1))) for v in _cum[:, Ln - 2].tolist()]
                     out[Ln]['n_seq'] = int(ids.shape[0])
+                if _doc_targets is not None:
+                    # Same predicted tokens, grouped by their real document
+                    # identity instead of by the arbitrary row window.
+                    out[Ln].update(L.aggregate_nll_by_document(
+                        nll_cols[:, :Ln - 1], _doc_targets[:, :Ln - 1],
+                        document_index_map=(_doc_map[0],
+                                            _doc_map[1][:, :Ln - 1])))
+                else:
+                    out[Ln]['doc_granularity'] = 'row'
             del x, nll_cols, _cum
         _trunc_cache = {}
         _val_width = int(np.asarray(val_ids).shape[1])
@@ -2483,6 +2522,7 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=16, max_pos=
                 x = L._h2d_async(ids, torch.int64, device)
                 nll, ntok = (torch.zeros((), dtype=torch.float64, device=device), 0)
                 _row_nll = []
+                _tok_nll = []
                 _r, _chunk = (0, int(ids.shape[0]))
                 while _r < int(ids.shape[0]):
                     _sub = x[_r:_r + _chunk]
@@ -2502,6 +2542,7 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=16, max_pos=
                     nll += _nll_rows.sum().double()
                     ntok += int(_sub[:, 1:].numel())
                     _row_nll.append(_nll_rows.sum(dim=1, dtype=torch.float64))
+                    _tok_nll.append(_nll_rows.detach())
                     del _h, _nll_rows
                     _r += _chunk
                 ppl = L._safe_exp_ppl(float(nll) / max(ntok, 1))
@@ -2518,8 +2559,18 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=16, max_pos=
                            'eval_span': _ev_span, 'nll_sum': float(nll),
                            'nll_per_seq': _seq_nll, 'ppl_per_seq': _seq_ppl,
                            'n_seq': int(x.shape[0])}
+                if _doc2d is not None:
+                    # The slice is [start:end] of the original panel; targets
+                    # are its positions 1..end-start-1.
+                    _doc_targets = _doc2d[:int(x.shape[0]), _start + 1:_end]
+                    _nll_all = torch.cat(_tok_nll).reshape(
+                        int(x.shape[0]), _ev_span)
+                    out[Ln].update(L.aggregate_nll_by_document(
+                        _nll_all, _doc_targets))
+                else:
+                    out[Ln]['doc_granularity'] = 'row'
                 _trunc_cache[_key] = dict(out[Ln])
-                del x, _row_nll
+                del x, _row_nll, _tok_nll
             except Exception as e:
                 _err = f'{type(e).__name__}: {e}'
                 out[Ln] = {'error': _err}

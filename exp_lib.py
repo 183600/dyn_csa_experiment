@@ -7675,11 +7675,94 @@ def _doc_ids_for_capped_rows(rows, lengths, cap_tokens):
     return (np.frombuffer(acc, dtype=np.uint64).copy()
             if acc else np.empty(0, dtype=np.uint64))
 
+
+def _token_doc_ids_for_capped_rows(rows, lengths, cap_tokens):
+    """Per-TOKEN document ids of a capped token stream.
+
+    The document-level sidecar answers "which documents contributed", but not
+    "which token belongs to which document" — fixed evaluation rows are
+    arbitrary windows that may split or merge documents.  Without the latter
+    mapping a "per-document" statistic is really a per-row statistic and its
+    document bootstrap is pseudoreplicated (a document split over two rows is
+    counted twice, while one row can mix two documents).
+
+    ``lengths`` is the per-row ``len(ids) + 1`` list produced by
+    :func:`_tokenise_row_chunks` (aligned with the non-empty rows).  The
+    returned array is exactly as long as the served token slice; the EOS of a
+    document carries that document's id, so the boundary token is attributed
+    to the document that emitted it.
+    """
+    acc = array.array('Q')
+    cursor = 0
+    cap_tokens = max(0, int(cap_tokens))
+    for row, length in zip(rows, lengths):
+        if cursor >= cap_tokens:
+            break
+        take = min(int(length), cap_tokens - cursor)
+        if take <= 0:
+            break
+        _doc_u = int(_doc_id_u64(_doc_exact_fp(row)))
+        acc.extend([_doc_u] * take)
+        cursor += take
+    return (np.frombuffer(acc, dtype=np.uint64).copy()
+            if acc else np.empty(0, dtype=np.uint64))
+
+
+def _token_doc_ids_from_eos(token_ids, doc_ids, eos_id):
+    """Recover per-token document ids for a cache built by the EOS discipline.
+
+    ``_tokenise_row_chunks`` appends exactly one EOS to every encoded row, so
+    the served stream contains one EOS per COMPLETE document (the last document
+    may be cut by the token cap and have no EOS).  The document-level sidecar
+    lists the contributing documents in stream order, so the boundaries can be
+    reconstructed without re-reading the raw test split — which matters after
+    the one-shot test access, when rebuilding the frozen cache is forbidden.
+
+    Returns ``(ids, None)`` or ``(None, reason)``.  The caller must still check
+    that the reconstructed document set equals the sidecar's; this function
+    only enforces the EOS-count/order invariants.
+    """
+    arr = np.asarray(token_ids).reshape(-1)
+    docs = np.asarray(doc_ids).reshape(-1)
+    if arr.size == 0 or docs.size == 0:
+        return None, 'empty token or document sidecar'
+    if eos_id is None or isinstance(eos_id, (bool, np.bool_)):
+        return None, 'no integer EOS id available'
+    try:
+        _eos = int(eos_id)
+    except (TypeError, ValueError, OverflowError):
+        return None, 'EOS id is not an integer'
+    if _eos < 0:
+        return None, 'EOS id is negative'
+    eos_pos = np.flatnonzero(arr == _eos)
+    if int(eos_pos.size) not in (int(docs.size), int(docs.size) - 1):
+        return None, (f'{eos_pos.size} EOS tokens for {docs.size} documents; '
+                       'the stream does not follow the one-EOS-per-document '
+                       'construction')
+    out = np.empty(arr.size, dtype=docs.dtype)
+    start = 0
+    di = 0
+    for p in eos_pos.tolist():
+        if di >= int(docs.size):
+            return None, 'more EOS-delimited documents than sidecar ids'
+        out[start:int(p) + 1] = docs[di]
+        di += 1
+        start = int(p) + 1
+    if di < int(docs.size):
+        # The final document was truncated by the token cap; it has no EOS.
+        out[start:] = docs[di]
+        di += 1
+    elif start != int(arr.size):
+        return None, 'trailing tokens after the last EOS but no document id left'
+    if di != int(docs.size):
+        return None, 'document sidecar has unused ids'
+    return out, None
+
 TEST_READ_PURPOSES = ('final_evaluation',)
 
 
 def load_wikitest(seq_len, n_seqs=256, vocab_size=None, cache_dir=None,
-                  purpose='final_evaluation'):
+                  purpose='final_evaluation', return_doc_ids=False):
     """Load the WikiText-103 **test** split as (n_seqs, seq_len) int64 rows.
 
     只读 wiki.test.raw（本地 dump 或 HF test split）作为最终评估数据
@@ -7700,6 +7783,9 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=None, cache_dir=None,
     of falling back to the historical 8192.  ``purpose`` is an allow-list:
     only the frozen final evaluation may read this split, so a diagnostic or
     tuning caller cannot silently turn test into an implicit validation set.
+    ``return_doc_ids=True`` returns a fifth element: the per-token document-id
+    map shaped like the test rows (or ``None`` when neither the sidecar nor
+    EOS reconstruction can verify it).  The default four-tuple is unchanged.
     """
     if purpose not in TEST_READ_PURPOSES:
         raise ValueError(
@@ -7719,12 +7805,15 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=None, cache_dir=None,
     te_path = os.path.join(cache_dir, f'test_ids_{tag}.npy')
     tb_path = os.path.join(cache_dir, f'test_bnd_{tag}.npy')
     td_path = os.path.join(cache_dir, f'test_doc_ids_{tag}.npy')
+    ttd_path = os.path.join(cache_dir, f'test_token_doc_ids_{tag}.npy')
     me_path = os.path.join(cache_dir, f'test_meta_{tag}.json')
     tk_path = os.path.join(cache_dir, f'test_tok_{tag}.json')
     if all((os.path.exists(p) for p in (te_path, tb_path, me_path))):
         _sig_paths = {'test': te_path, 'bnd': tb_path, 'meta': me_path}
         if os.path.exists(td_path):
             _sig_paths['test_doc_ids'] = td_path
+        if os.path.exists(ttd_path):
+            _sig_paths['test_token_doc_ids'] = ttd_path
         if os.path.exists(tk_path):
             _sig_paths['tokenizer'] = tk_path
         _sig = _memo_file_sig(_sig_paths)
@@ -7732,7 +7821,7 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=None, cache_dir=None,
         _hit = _WT103_TEST_MEMO.get(_mkey)
         if _hit is not None:
             print('[data] serving TEST token ids from the in-process memo (same cache files, already verified) ...')
-            return _hit
+            return _hit if return_doc_ids else _hit[:4]
         print('[data] loading cached TEST token ids ...')
         test_ids = np.load(te_path)
         meta = _read_cache_meta(me_path, 'WikiText TEST')
@@ -7755,9 +7844,25 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=None, cache_dir=None,
                 _problems_td = None
         else:
             _problems_td = None
+        # Per-token document ids are the mapping the document-level bootstrap
+        # needs; a legacy cache without them keeps the row-level fallback, but
+        # a cache whose metadata DECLARES them and whose sidecar is missing is
+        # corrupt and must not silently degrade the analysis granularity.
+        test_token_doc_ids = None
+        _problems_ttd = None
+        if os.path.exists(ttd_path):
+            try:
+                test_token_doc_ids = np.load(ttd_path)
+            except Exception as _te:
+                _problems_ttd = f'test token document-id sidecar unreadable ({type(_te).__name__}: {_te})'
+        elif 'test_token_doc_ids' in (meta.get('file_sigs') or {}):
+            _problems_ttd = ('test metadata binds a per-token document-id sidecar '
+                            'that is missing')
         _problems = []
         if _problems_td:
             _problems.append(_problems_td)
+        if _problems_ttd:
+            _problems.append(_problems_ttd)
         _sigs = _cache_file_sigs(_sig_paths)
         _fast = _cache_file_sigs_match(meta, _sigs)
         try:
@@ -7887,6 +7992,58 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=None, cache_dir=None,
                     _problems.append(
                         f'{_shared["train"]} train / {_shared["validation"]} validation '
                         'document ids also occur in the test split (group leakage)')
+        # Per-token document ids, when present, are part of the cache identity.
+        # They must cover every served token exactly; a short/long sidecar
+        # would silently shift document boundaries in the evaluation.
+        _ttd_declared = bool(_mdoc and (
+            _mdoc.get('test_token_count') is not None
+            or _mdoc.get('test_token_fp') is not None))
+        if test_token_doc_ids is not None:
+            _ttd = np.asarray(test_token_doc_ids)
+            if _ttd.ndim != 1:
+                _problems.append(
+                    f'test token document-id sidecar must be 1-D, got shape {_ttd.shape}')
+            if _ttd.dtype.kind not in 'iu':
+                _problems.append(
+                    'test token document-id sidecar must contain integers, got '
+                    f'dtype {_ttd.dtype}')
+            elif _ttd.size and int(_ttd.min()) < 0:
+                _problems.append(
+                    'test token document-id sidecar contains negative ids')
+            if _ttd.size != int(np.asarray(test_ids).size):
+                _problems.append(
+                    f'test token document-id sidecar has {_ttd.size} ids but the '
+                    f'served slice has {int(np.asarray(test_ids).size)} tokens')
+            if _mdoc.get('test_token_count') is not None:
+                try:
+                    _want_ttd_n = int(_mdoc['test_token_count'])
+                except (TypeError, ValueError, OverflowError):
+                    _problems.append(
+                        'test cache metadata has a non-integer test_token_count')
+                else:
+                    if _want_ttd_n != int(_ttd.size):
+                        _problems.append(
+                            'test token document-id sidecar count does not match '
+                            'the cache metadata')
+            if _mdoc.get('test_token_fp') is not None:
+                if str(_mdoc['test_token_fp']) != str(_ids_fp(_ttd)):
+                    _problems.append(
+                        'test token document-id sidecar does not match the '
+                        'fingerprint in the cache metadata')
+            _sf_all_ttd = meta.get('split_fingerprints')
+            _sf_test_ttd = (_sf_all_ttd.get('test')
+                            if isinstance(_sf_all_ttd, dict) else None)
+            if (isinstance(_sf_test_ttd, dict)
+                    and _sf_test_ttd.get('token_documents_fp') is not None
+                    and str(_sf_test_ttd['token_documents_fp']) != str(_ids_fp(_ttd))):
+                _problems.append(
+                    'split_fingerprints.test.token_documents_fp does not match '
+                    'the per-token document-id sidecar')
+        elif _ttd_declared:
+            _problems.append(
+                'test cache metadata records per-token document ids but the '
+                'sidecar is missing; document-level evaluation would silently '
+                'fall back to row granularity')
         # A cached test set is only pairable if its tokenizer was fitted on the
         # SAME train prefix as the train/validation cache.  Verifying this on
         # the cold path is not enough: a swapped test cache could otherwise
@@ -7985,9 +8142,40 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=None, cache_dir=None,
                 'and cannot be silently redefined')
         if not _fast:
             _validate_token_ids(test_ids, meta['vocab'], 'cached test_ids')
-        out = (test_ids, meta['vocab'], None, test_bnd)
+        _out_docs = None
+        if test_token_doc_ids is not None:
+            _out_docs = np.asarray(test_token_doc_ids).reshape(
+                int(n_seqs), int(seq_len))
+        elif test_doc_ids is not None:
+            # Legacy cache: recover the token→document mapping from the
+            # construction contract (one EOS per complete document) instead of
+            # forcing a rebuild of a frozen test cache.  If the invariant does
+            # not hold, the caller gets the explicit row-level fallback.
+            _eos_hit = meta.get('eos_id')
+            if _eos_hit is None and os.path.exists(tk_path):
+                try:
+                    from tokenizers import Tokenizer as _TokE
+                    _eos_hit = _TokE.from_file(tk_path).token_to_id('<eos>')
+                except Exception:
+                    _eos_hit = None
+            if _eos_hit is not None:
+                _recon, _why = _token_doc_ids_from_eos(
+                    np.asarray(test_ids).reshape(-1), test_doc_ids, _eos_hit)
+                if (_recon is not None
+                        and np.array_equal(np.unique(_recon),
+                                           np.unique(test_doc_ids))):
+                    _out_docs = _recon.reshape(int(n_seqs), int(seq_len))
+                    print('[data] reconstructed the per-token document mapping '
+                          'from the EOS boundaries and the document sidecar '
+                          '(legacy cache; no rebuild needed)')
+                elif return_doc_ids:
+                    print(f'[data] NOTE: the legacy test cache has no per-token '
+                          f'document sidecar and EOS reconstruction was not '
+                          f'possible ({_why}); the by-length readout stays '
+                          'row-level')
+        out = (test_ids, meta['vocab'], None, test_bnd, _out_docs)
         _memo_put(_WT103_TEST_MEMO, _mkey, out, _WT103_TEST_MEMO_CAP)
-        return out
+        return out if return_doc_ids else out[:4]
     # cold build: resolve the train tokenizer FIRST, then touch the test rows.
     # Resolve the tokenizer before touching the test rows, so a tokenizer/fit
     # mismatch fails before the held-out split is read.  `test_rows` is
@@ -8253,8 +8441,26 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=None, cache_dir=None,
     # is what makes test/train and test/val group disjointness independently
     # checkable on a later cache hit.
     _served_cap = int(n_have) * int(seq_len)
+    _served_rows = [r for r in _trows if r.strip()]
     test_doc_ids = _doc_ids_for_capped_rows(
-        [r for r in _trows if r.strip()], _test_lengths, _served_cap)
+        _served_rows, _test_lengths, _served_cap)
+    # The per-token mapping is what makes a document-level statistic honest:
+    # a fixed row can split a document or merge two, so aggregating losses by
+    # ROW is pseudoreplication.  This sidecar is tiny (one id per served
+    # token) relative to the id cache.
+    test_token_doc_ids = _token_doc_ids_for_capped_rows(
+        _served_rows, _test_lengths, _served_cap)
+    if int(test_token_doc_ids.size) != int(_served_cap):
+        raise RuntimeError(
+            f'load_wikitest: per-token document-id sidecar covers '
+            f'{int(test_token_doc_ids.size)} tokens but the served test slice '
+            f'has {int(_served_cap)}; refusing to write a misaligned mapping')
+    if not np.array_equal(np.unique(test_token_doc_ids),
+                          np.unique(test_doc_ids)):
+        raise RuntimeError(
+            'load_wikitest: per-token and per-document test sidecars name '
+            'different document sets; the document-level evaluation mapping '
+            'would be inconsistent')
     # Prove group isolation against every train/val cache sidecar present.  The
     # build-time dedup should already guarantee zero; this turns any silent
     # dedup/index mismatch into a hard refusal before the cache is written.
@@ -8282,7 +8488,7 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=None, cache_dir=None,
             'validation document ids occur in the held-out test slice after '
             'deduplication — refusing to write a group-leaking test cache')
     for _p, _a in ((te_path, test_batch), (tb_path, test_bnd),
-                   (td_path, test_doc_ids)):
+                   (td_path, test_doc_ids), (ttd_path, test_token_doc_ids)):
         _fd, _tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(_p)), prefix=os.path.basename(_p) + '.', suffix='.tmp')
         try:
             with os.fdopen(_fd, 'wb') as _fh:
@@ -8295,7 +8501,8 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=None, cache_dir=None,
                 pass
             raise
     _file_sigs = _cache_file_sigs({'test': te_path, 'bnd': tb_path,
-                                   'test_doc_ids': td_path})
+                                   'test_doc_ids': td_path,
+                                   'test_token_doc_ids': ttd_path})
     # Persist the test tokenizer BEFORE writing the meta, so the meta can bind
     # its exact bytes.  The cache identity therefore includes the full-file
     # sha256 (not only a hash of the fit TEXT, which two different BPE merge
@@ -8327,6 +8534,7 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=None, cache_dir=None,
                      'ids_fp': _ids_fp(test_batch),
                      'boundary_fp': _ids_fp(np.ascontiguousarray(test_bnd).reshape(-1)),
                      'documents_fp': _ids_fp(test_doc_ids),
+                     'token_documents_fp': _ids_fp(test_token_doc_ids),
                      'sequences': int(test_batch.shape[0]),
                      'seq_len': int(seq_len)},
             'paired_train': {
@@ -8370,6 +8578,9 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=None, cache_dir=None,
         'doc_ids': {
             'test_count': int(test_doc_ids.size),
             'test_fp': _ids_fp(test_doc_ids),
+            'test_token_count': int(test_token_doc_ids.size),
+            'test_token_fp': _ids_fp(test_token_doc_ids),
+            'token_policy': 'per_token_document_ids_for_document_level_evaluation',
             'train_overlap': int(_shared_train_docs),
             'validation_overlap': int(_shared_val_docs),
             'disjoint': True,
@@ -8385,9 +8596,12 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=None, cache_dir=None,
         },
         'test_sequences': int(test_batch.shape[0]),
         'seq_len': int(seq_len),
+        'eos_id': int(eos_id),
     }, indent=0)
     print('[data] cached TEST token ids to disk (held-out split; final evaluation only)')
-    return (test_batch, vocab, tok, test_bnd)
+    _out = (test_batch, vocab, tok, test_bnd,
+            test_token_doc_ids.reshape(int(n_have), int(seq_len)))
+    return _out if return_doc_ids else _out[:4]
 
 _FWEB_MEMO = {}
 _FWEB_MEMO_CAP = 2
@@ -27490,6 +27704,90 @@ def _det_segment_sum(n_rows, indices, values, dtype=None, sorted_indices=False):
     out.index_copy_(0, seg_id, seg_sum.to(out_dtype))
     return out
 
+
+def document_index(doc_ids):
+    """Compact, deterministic index for an arbitrary per-token document-id array.
+
+    Returns ``(keys, inverse)`` where ``keys`` is the sorted unique document
+    id array and ``inverse`` maps every element back to its position in
+    ``keys``.  The same ``(keys, inverse)`` pair can be sliced for several
+    evaluation lengths/chunks, so document order cannot change between them.
+
+    Document ids are uint64 hashes; converting them to a dense index avoids
+    materialising a huge [n_docs] tensor indexed by the raw hash value.  The
+    function is intentionally NumPy-only and rejects non-integer / negative
+    ids, because a float id such as ``1.5`` would silently become document 1.
+    """
+    arr = np.asarray(doc_ids)
+    if arr.size == 0:
+        raise ValueError('document_index: document ids are empty')
+    if arr.dtype.kind not in 'iu':
+        raise ValueError(
+            f'document_index: document ids must be integers, got dtype {arr.dtype}')
+    if arr.dtype.kind == 'i' and int(arr.min()) < 0:
+        raise ValueError('document_index: document ids must be non-negative')
+    keys, inv = np.unique(arr.reshape(-1), return_inverse=True)
+    return keys, inv.reshape(arr.shape)
+
+
+def aggregate_nll_by_document(nll, doc_ids, *, document_index_map=None):
+    """Aggregate a per-target NLL matrix into per-DOCUMENT NLL / PPL.
+
+    ``nll`` is a ``[n_rows, span]`` (or flat) tensor/array of next-token NLLs;
+    ``doc_ids`` has exactly the same shape and gives the document identity of
+    each predicted target token.  Fixed evaluation rows are arbitrary windows,
+    so a document can span several rows and a row can mix several documents;
+    summing by row and calling each row a document double-counts documents in
+    the bootstrap.  This function groups tokens by document identity instead.
+
+    ``document_index_map`` is the ``(keys, inverse)`` returned by
+    :func:`document_index` for the FULL target slice.  Supplying it makes
+    chunked evaluation use one global document order; when omitted it is
+    computed here.
+    """
+    if not torch.is_tensor(nll):
+        nll = torch.as_tensor(nll)
+    arr = np.asarray(doc_ids)
+    if tuple(arr.shape) != tuple(nll.shape):
+        raise ValueError(
+            f'aggregate_nll_by_document: doc_ids shape {arr.shape} != nll shape '
+            f'{tuple(nll.shape)}')
+    if document_index_map is None:
+        keys, inv = document_index(arr)
+    else:
+        keys, inv = document_index_map
+        keys = np.asarray(keys)
+        inv = np.asarray(inv)
+        if inv.size != int(nll.numel()):
+            raise ValueError(
+                f'aggregate_nll_by_document: index covers {inv.size} targets, '
+                f'expected {int(nll.numel())}')
+    n_docs = int(keys.size)
+    idx = torch.as_tensor(inv.reshape(-1).astype(np.int64, copy=False),
+                          dtype=torch.long, device=nll.device)
+    vals = nll.reshape(-1)
+    nll_doc = _det_segment_sum(n_docs, idx, vals,
+                               dtype=torch.float64).detach().cpu().tolist()
+    tok_doc = _det_segment_sum(
+        n_docs, idx, torch.ones_like(idx), dtype=torch.long
+    ).detach().cpu().tolist()
+    n_tokens = [int(x) for x in tok_doc]
+    nll_values = [float(x) for x in nll_doc]
+    ppl = [(float(_safe_exp_ppl(nll_values[i] / n_tokens[i]))
+            if n_tokens[i] > 0 else float('nan'))
+           for i in range(n_docs)]
+    return {
+        'doc_granularity': 'document',
+        'n_docs': n_docs,
+        'nll_per_doc': nll_values,
+        'n_tokens_per_doc': n_tokens,
+        'ppl_per_doc': ppl,
+        'doc_ids': [format(int(k), '016x') for k in np.asarray(keys).tolist()],
+        'doc_ids_fp': _ids_fp(np.asarray(keys)),
+        'nll_per_doc_total': float(sum(nll_values)),
+        'n_tokens_total': int(sum(n_tokens)),
+    }
+
 @torch.inference_mode()
 def eval_ppl(model, val_batch, device, chunk=8, eval_rows=None, eval_seed=0, return_stats=False,
              collect_block_stats=False, val_bnd=None, bnd_tol=1):
@@ -27504,10 +27802,12 @@ def eval_ppl(model, val_batch, device, chunk=8, eval_rows=None, eval_seed=0, ret
     need_reg_layers = [blk.attn for blk in model.blocks if hasattr(blk.attn, 'need_reg')]
     need_reg_prior = [_a.need_reg for _a in need_reg_layers]
     nll = torch.zeros((), dtype=torch.float64, device=device)
-    # Per-document NLL (eval-subset uncertainty must be visible, not
-    # only the seed-to-seed spread).  Rows are the fixed evaluation documents;
-    # with eval_rows sampling, a row with no sampled target gets 0 tokens and
-    # is excluded by the bootstrap consumer.
+    # Per-ROW NLL (eval-subset uncertainty must be visible, not only the
+    # seed-to-seed spread).  A row is a fixed evaluation WINDOW, not
+    # necessarily one document: use `eval_length_gen` with a per-token
+    # document mapping when a document-level bootstrap is required.  With
+    # eval_rows sampling, a row with no sampled target gets 0 tokens and is
+    # excluded by the bootstrap consumer.
     _row_nll = torch.zeros(int(val_batch.shape[0]), dtype=torch.float64, device=device) if return_stats else None
     _row_ntok = torch.zeros(int(val_batch.shape[0]), dtype=torch.long, device=device) if return_stats else None
     for _a in need_reg_layers:
@@ -32957,12 +33257,16 @@ def _primary_row_arrays(rec):
 
 
 def _doc_bootstrap_ppl_ci(recs, *, n_boot=2000, seed=20261018):
-    """Document-level bootstrap CI for the pooled PPL.
+    """Row-level bootstrap CI for the pooled PPL (legacy name kept).
 
-    Rows are the fixed evaluation documents shared by every seed; resampling
-    ROWS (not tokens) preserves the within-document correlation.  If any
-    record lacks per-row NLL, no CI is invented — the caller must see the
-    missing-evidence state rather than a narrow interval computed from the
+    The historical name says "document", but the records it consumes expose
+    only per-ROW NLL.  A fixed eval row is a window that can split or merge
+    documents, so resampling rows preserves within-row correlation but is not
+    a document bootstrap.  Use ``eval_length_gen(doc_ids=...)`` (which records
+    `nll_per_doc` / `n_tokens_per_doc`) when the document-level estimand is
+    required.  If any record lacks per-row NLL, no CI is invented — the caller
+    must see the missing-evidence state rather than a narrow interval computed
+    from the
     wrong unit.
     """
     recs = list(recs)

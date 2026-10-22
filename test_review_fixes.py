@@ -7625,6 +7625,22 @@ def t_audit_leakage_handles_flat_train_cache():
         fp = good['checks']['id_cache_fingerprints']
         assert fp['train']['status'] == 'ok' and fp['test']['status'] == 'ok', fp
         assert good['checks']['fit_fp_agree'] is True, good['checks']
+        # Per-token document mapping: an undeclared legacy sidecar is
+        # row-level, a declared+valid one is verified, and a declared but
+        # mis-sized one fails closed (never silently shifts boundaries).
+        ttd = np.repeat(np.asarray([10, 20], dtype=np.uint64), 30)
+        np.save(os.path.join(cache, 'test_token_doc_ids_x.npy'), ttd)
+        with open(os.path.join(cache, 'test_meta_x.json'), 'w', encoding='utf-8') as f:
+            json.dump({'vocab': 1000, 'src_fp': L._ids_fp(test), 'fit_fp': 'FITX',
+                       'doc_ids': {'test_token_count': int(ttd.size),
+                                   'test_token_fp': L._ids_fp(ttd)}}, f)
+        good_doc = A.audit_leakage(cache_dir=cache, shingle=4, max_rows_shingled=10)
+        assert good_doc['checks']['document_level_eval']['status'] == 'ok', good_doc
+        np.save(os.path.join(cache, 'test_token_doc_ids_x.npy'), ttd[:-1])
+        broken = A.audit_leakage(cache_dir=cache, shingle=4, max_rows_shingled=10)
+        assert broken['status'] == 'fail', broken
+        assert broken['checks']['document_level_eval']['status'] == 'fail', broken
+        np.save(os.path.join(cache, 'test_token_doc_ids_x.npy'), ttd)
         with open(os.path.join(cache, 'test_meta_x.json'), 'w', encoding='utf-8') as f:
             json.dump({'vocab': 1000, 'src_fp': L._ids_fp(test), 'fit_fp': 'OTHER'}, f)
         mism = A.audit_leakage(cache_dir=cache, shingle=4, max_rows_shingled=10)
@@ -17174,6 +17190,153 @@ def t_causal_quantile_positions_are_exact():
     assert not bool(use_hi2.any()), use_hi2
 
 
+def t_per_token_document_sidecar():
+    rows = ['alpha document', 'beta document', 'gamma document']
+    lengths = [5, 3, 7]
+    cap = 10
+    tok = L._token_doc_ids_for_capped_rows(rows, lengths, cap)
+    doc = L._doc_ids_for_capped_rows(rows, lengths, cap)
+    assert tok.dtype == np.uint64 and tok.size == cap, (tok.dtype, tok.size)
+    assert doc.tolist() == [int(L._doc_id_u64(L._doc_exact_fp(r))) for r in rows]
+    ids = [int(L._doc_id_u64(L._doc_exact_fp(r))) for r in rows]
+    assert tok.tolist() == [ids[0]] * 5 + [ids[1]] * 3 + [ids[2]] * 2
+    # The two sidecars must name the same document set even when the cap
+    # truncates the final document.
+    assert np.array_equal(np.unique(tok), np.unique(doc))
+    # A cap that ends exactly at a document boundary keeps the EOS with the
+    # document that emitted it (length includes the EOS).
+    assert L._token_doc_ids_for_capped_rows(rows, lengths, 5).tolist() == [ids[0]] * 5
+    # Legacy-cache reconstruction from EOS boundaries: one EOS per complete
+    # document, and the final (cap-truncated) document has no EOS.
+    eos = 99
+    toks = np.asarray([1, 2, eos, 3, eos, 4, 5], dtype=np.int64)
+    docs = np.asarray([10, 20, 30], dtype=np.uint64)
+    rec, why = L._token_doc_ids_from_eos(toks, docs, eos)
+    assert why is None and rec.tolist() == [10] * 3 + [20] * 2 + [30] * 2, (why, rec)
+    complete = np.asarray([1, eos, 2, eos, 3, eos], dtype=np.int64)
+    rec2, why2 = L._token_doc_ids_from_eos(complete, docs, eos)
+    assert why2 is None and rec2.tolist() == [10] * 2 + [20] * 2 + [30] * 2, (why2, rec2)
+    # The invariant must fail closed when the EOS count/order cannot describe
+    # the sidecar (rather than shifting every document boundary silently).
+    bad1, _ = L._token_doc_ids_from_eos(toks[:1], docs, eos)
+    assert bad1 is None
+    bad2, _ = L._token_doc_ids_from_eos(
+        np.asarray([1, eos, 2, eos, 3], dtype=np.int64), docs[:2], eos)
+    assert bad2 is None
+    bad3, _ = L._token_doc_ids_from_eos(toks, docs, None)
+    assert bad3 is None
+
+
+def t_document_level_eval_uses_real_boundaries():
+    import copy as _copy
+    torch.manual_seed(0)
+    dev = torch.device('cpu')
+    cfgs = L.make_layer_cfgs(2, 'full_rope')
+    model = L.SmallGPT(256, 64, 2, 4, 16, 64, _copy.deepcopy(cfgs)).to(dev)
+    model.eval()
+    ids = np.asarray(np.random.default_rng(11).integers(0, 256, size=(3, 65)),
+                     dtype=np.int64)
+    # Deliberately make documents span row boundaries and rows mix documents.
+    doc = np.empty_like(ids, dtype=np.uint64)
+    doc[0, :33] = 11
+    doc[0, 33:] = 22
+    doc[1, :21] = 22
+    doc[1, 21:] = 33
+    doc[2, :11] = 33
+    doc[2, 11:] = 44
+    for Ln in (32, 64):
+        cell = V7.eval_length_gen(model, ids, [Ln], dev, max_pos=None,
+                                  doc_ids=doc)[Ln]
+        assert cell['doc_granularity'] == 'document', cell
+        assert cell['n_docs'] == int(np.unique(doc[:3, 1:Ln]).size), cell
+        assert sum(cell['n_tokens_per_doc']) == cell['n_tok'], cell
+        assert len(cell['ppl_per_doc']) == cell['n_docs'], cell
+        # The per-document NLLs partition the same totals as the row-level
+        # accounting; only the grouping changes.  The tiny difference is
+        # float32 per-token values summed in a different order, so compare
+        # relatively rather than to the last bit.
+        assert abs(sum(cell['nll_per_doc']) - cell['nll_sum']) <= 1e-5 * max(1.0, abs(cell['nll_sum'])), cell
+        assert sum(cell['n_tokens_per_doc']) == cell['n_tok'], cell
+        # Token-weighted pooled PPL identity: exp(sum n_d*log ppl_d / sum n_d).
+        _logs = [n * math.log(p) for n, p in
+                 zip(cell['n_tokens_per_doc'], cell['ppl_per_doc'])]
+        _pooled = math.exp(sum(_logs) / sum(cell['n_tokens_per_doc']))
+        assert abs(_pooled - cell['ppl']) / cell['ppl'] < 1e-6, (Ln, _pooled, cell['ppl'])
+    # One document per row: the document and row readouts must coincide.
+    doc2 = np.repeat(np.asarray([[101], [202], [303]], dtype=np.uint64), 65, axis=1)
+    one = V7.eval_length_gen(model, ids, [64], dev, max_pos=None, doc_ids=doc2)[64]
+    assert one['doc_granularity'] == 'document' and one['n_docs'] == 3, one
+    for a, b in zip(one['ppl_per_doc'], one['ppl_per_seq']):
+        assert abs(a - b) < 1e-9 * max(1.0, abs(b)), (a, b)
+    # The truncated branch must aggregate the SAME (start, end) token slice.
+    trunc = V7.eval_length_gen(model, ids, [48, 64], dev, max_pos=32,
+                               doc_ids=doc)
+    for Ln in (48, 64):
+        cell = trunc[Ln]
+        assert cell['truncated'] is True and cell['doc_granularity'] == 'document', cell
+        assert cell['n_tok'] == 3 * 31 and sum(cell['n_tokens_per_doc']) == 3 * 31, cell
+        assert abs(sum(cell['nll_per_doc']) - cell['nll_sum']) <= 1e-5 * max(1.0, abs(cell['nll_sum'])), cell
+    # A misaligned, float or negative mapping is refused before scoring.
+    for bad in (doc[:, :-1], doc.astype(np.float64), -(doc.astype(np.int64))):
+        try:
+            V7.eval_length_gen(model, ids, [32], dev, max_pos=None, doc_ids=bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('eval_length_gen accepted a bad document mapping')
+
+
+def t_doc_level_analysis_prefers_document_cells():
+    na = [1.0, 2.0, 3.0, 100.0]
+    nb = [2.0, 2.0, 2.0, 2.0]
+    docs = ['0000000000000001', '0000000000000002',
+            '0000000000000003', '0000000000000004']
+    toks = [10, 10, 10, 10]
+    recs_a = {s: {'by_len': {512: {'ppl_per_seq': list(na),
+                                    'ppl_per_doc': list(na),
+                                    'n_tokens_per_doc': list(toks),
+                                    'doc_ids': list(docs)}}} for s in (0, 1)}
+    recs_b = {s: {'by_len': {512: {'ppl_per_seq': list(nb),
+                                    'ppl_per_doc': list(nb),
+                                    'n_tokens_per_doc': list(toks),
+                                    'doc_ids': list(docs)}}} for s in (0, 1)}
+    got = V12._doc_level_analysis(recs_a, recs_b, [0, 1], 512)
+    assert got is not None and got['granularity'] == 'document', got
+    assert got['n_docs'] == 4, got
+    assert got['doc_delta_negative'] == 1 and got['doc_delta_positive'] == 2, got
+    assert got['doc_delta_zero'] == 1, got
+    # Mixing document-level and row-level cells would silently change the
+    # estimand; the analysis must refuse rather than fall back per record.
+    mixed = {s: {'by_len': {512: {'ppl_per_seq': list(na)}}} for s in (0,)}
+    mixed.update({s: recs_a[s] for s in (1,)})
+    bad = V12._doc_level_analysis(mixed, recs_b, [0, 1], 512)
+    assert bad is not None and bad['comparable'] is False, bad
+    # Different documents (token counts) on the two sides are not paired.
+    recs_b_bad = {s: {'by_len': {512: {'ppl_per_doc': list(nb),
+                                        'n_tokens_per_doc': [99, 10, 10, 10],
+                                        'doc_ids': list(docs)}}} for s in (0, 1)}
+    bad2 = V12._doc_level_analysis(recs_a, recs_b_bad, [0, 1], 512)
+    assert bad2 is not None and bad2['comparable'] is False, bad2
+    # A document-level by_len cell is admissible only when its per-document
+    # token counts partition the scored targets exactly; a partial cell is
+    # rejected by the same gate that protects the row-level endpoint.
+    good_cell = {'n_tok': 4 * 7, 'truncated': False, 'ppl_per_seq': [1.0] * 4,
+                 'n_seq': 4, 'doc_granularity': 'document',
+                 'nll_per_doc': [1.0, 2.0], 'n_tokens_per_doc': [20, 8],
+                 'ppl_per_doc': [1.0, 2.0],
+                 'doc_ids': ['0000000000000001', '0000000000000002'],
+                 'n_docs': 2}
+    assert V12._by_len_shape_reason({'by_len': {8: dict(good_cell)}}, 4) is None
+    broken = dict(good_cell)
+    broken['n_tokens_per_doc'] = [20, 7]
+    assert 'n_tokens_per_doc sums' in str(
+        V12._by_len_shape_reason({'by_len': {8: broken}}, 4))
+    missing = dict(good_cell)
+    del missing['nll_per_doc']
+    assert 'missing' in str(
+        V12._by_len_shape_reason({'by_len': {8: missing}}, 4))
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -17622,6 +17785,9 @@ def main():
     _check('L108 confirmation robustness never edits the verdict', t_confirmation_robustness_never_edits_the_verdict)
     _check('L109 document-level breadth diagnostics', t_doc_level_breadth_diagnostics)
     _check('L110 causal quantile positions are exact at scale', t_causal_quantile_positions_are_exact)
+    _check('L111 per-token document sidecar matches the capped stream', t_per_token_document_sidecar)
+    _check('L112 eval aggregates by real document boundaries', t_document_level_eval_uses_real_boundaries)
+    _check('L113 doc-level analysis prefers documents and refuses mixed granularity', t_doc_level_analysis_prefers_document_cells)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

@@ -1583,3 +1583,74 @@ selects exact ranks at columns 41/82 (the old float32 path returned
 99.99999/199.99998 instead of 100/200), and the integer positions remain exact
 at columns above `2**24` and `2**53`.  `python test_review_fixes.py` passes
 444/447 with the same 3 DataLoader environment skips.
+
+## 2026-10-22 — document-level evaluation from real document boundaries (no new runs)
+
+Zero-GPU measurement/analysis hardening; no panel, frozen manifest byte
+(`confirmation_frozen.json`), training path, `CODE_SEMANTICS`, test split,
+README or CI configuration was touched. The pooled PPL is unchanged; this
+entry fixes the UNIT used by the "per-document" uncertainty readout.
+
+**Problem.** `eval_length_gen` returned `ppl_per_seq` and `_doc_level_analysis`
+called each entry a "document", but the entries are fixed evaluation ROWS.
+A row is an arbitrary window over the token stream: one WikiText document can
+span two rows (so its loss is counted twice by a row bootstrap), while one row
+can contain the tail of one document and the head of another. The test loader
+persisted only a document-level sidecar (which documents contributed), so the
+analysis had no way to map a scored token to its document. The result was
+pseudoreplicated "document" CIs: the point estimate was right, but the
+uncertainty was computed on the wrong sampling unit and the `n_docs` count
+could differ from the number of documents actually evaluated.
+
+**Changes.** (1) `load_wikitest` now records a per-TOKEN document-id sidecar
+(`test_token_doc_ids_*.npy`, one id per served token; 48 x 4096 ids is ~1.6 MB)
+alongside the existing document-level sidecar, binds it by count + fingerprint
+in `test_meta.doc_ids`, and verifies both on every cache hit. The builder
+checks that the per-token and per-document sidecars name the same document set
+and that the per-token length equals the served slice exactly. Legacy caches
+without it remain usable and explicitly fall back to row-level uncertainty;
+a cache whose metadata DECLARES the sidecar but whose file is missing or
+misaligned fails closed. (2) `exp_lib._token_doc_ids_for_capped_rows` builds
+the mapping from the same per-row `len(ids)+1` lengths that produced the
+token stream, so the EOS token is attributed to the document that emitted it.
+(3) `exp_lib.document_index` gives a compact, deterministic document index for
+arbitrary uint64 ids; `exp_lib.aggregate_nll_by_document` groups per-token NLL
+by document and returns `nll_per_doc`, `n_tokens_per_doc`, `ppl_per_doc`,
+`doc_ids`, `n_docs` and a fingerprint. It uses the shared deterministic
+segmented-sum helper, so the grouping does not depend on chunk order.
+(4) `v7_supp.eval_length_gen(..., doc_ids=...)` attaches those fields to every
+by-length cell (including the truncated-`max_pos` branch) while leaving the
+pooled `ppl`, `n_tok`, `nll_sum`, `nll_per_seq` and `ppl_per_seq` values
+untouched. (5) `v12_supp.P5T` requests the mapping from `load_wikitest` and
+passes it through; `_doc_level_analysis` now prefers `ppl_per_doc` and refuses
+mixed document/row granularity or mismatched per-document token counts/id
+order instead of pairing by position. The public `doc_sampling` dict records
+`granularity`, and the P5T table/notes say "row" when the cache is legacy.
+(6) `exp_lib._token_doc_ids_from_eos` reconstructs the same mapping on a
+legacy cache from the construction contract (one EOS per complete document,
+the cap-truncated last document having none) and the document sidecar; it is
+used only when the EOS count/order and the document set both verify, so an
+existing frozen cache does not need a rebuild just to get document-level
+uncertainty. A failure to verify remains the explicit row-level fallback.
+(7) Admission (`_by_len_shape_reason`) checks that a claimed document-level
+cell's per-document token counts partition exactly `n_tok`; the audit gate
+re-verifies the per-token sidecar's length/dtype/fingerprint. `eval_ppl`'s
+per-ROW statistics keep their old name/behaviour but their docstring now says
+"row", not "document".
+
+**Boundary.** This is a data-processing correction to the uncertainty unit,
+not a new endpoint: the primary pooled PPL and the frozen decision rule are
+byte-for-byte unchanged, and no `CODE_SEMANTICS` bump is needed (no training
+or measurement value changed). A legacy test cache without the sidecar is
+mapped through the verified EOS construction contract when possible and
+otherwise labelled row-level; it is never silently upgraded, and a fresh
+cache always gets the document-level statistic.
+
+**Verification.** New CPU tests L111 (per-token sidecar alignment/cap/EOS),
+L112 (documents spanning rows and rows mixing documents; token-weighted pooled
+PPL identity; truncated branch; one-doc-per-row equivalence with
+`ppl_per_seq`; invalid mapping refusal) and L113 (analysis prefers document
+cells, refuses mixed granularity and mismatched document units). The unchanged
+L109 still covers the row-level fallback.
+`python test_review_fixes.py` passes 447/450 with the same 3 DataLoader
+environment skips.
