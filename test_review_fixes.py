@@ -12467,6 +12467,63 @@ def t_baseline_seed_plan_rejects_duplicate_draws():
     assert search == [1, 2, 3] and final == [4, 5] and overlap == [], (search, final, overlap)
 
 
+def t_baseline_plan_preflight_and_tuned_hypothesis():
+    # The shipped design must be launchable AND powerful enough for its
+    # declared Holm family (four tuned contrasts need n>=8 final seeds).
+    plan = L.baseline_plan()
+    assert plan['status'] == 'ok' and plan['may_launch'], plan
+    assert plan['confirmatory_capable'] is True, plan
+    tuned = plan['tuned']
+    assert tuned['family_size'] == 4 and len(tuned['declared_contrasts']) == 4, tuned
+    assert tuned['search_final_seed_disjoint'] is True, tuned
+    assert tuned['final_seeds_sufficient'] is True, tuned
+    assert tuned['min_final_seeds_for_family_significance'] == 8, tuned
+    simple = plan['simple']
+    assert simple['status'] == 'ok' and simple['expected_cells'] == {
+        'unigram': 6, 'bigram': 36}, simple
+    # Equal-search tuning is not itself the claim: the tuned-baseline
+    # comparison is now a pre-registered, metric-bound hypothesis too.
+    ha = L.hypothesis_audit(L.TUNED_BASELINE_HYPOTHESIS_DESIGN, 'tuned_baseline')
+    assert ha['status'] == 'ok' and not ha['invalid'], ha
+    for table in (L.HYPOTHESIS_DESIGN, L.BASELINE_HYPOTHESIS_DESIGN,
+                  L.OPEN_BLOCK_HYPOTHESIS_DESIGN, L.FLOOR_HYPOTHESIS_DESIGN):
+        for name, spec in table.items():
+            assert spec.get('metric_policy') == 'lm_perplexity', (name, spec)
+    # Structural defects fail before any GPU spend.
+    overlap = dict(L.BASELINE_TUNING_PROTOCOL, search_seeds=[0],
+                   final_seeds=[0, 1, 2, 3, 4, 5, 6, 7])
+    po = L.baseline_tuning_plan(overlap)
+    assert po['status'] == 'fail' and po['search_final_seed_disjoint'] is False, po
+    dup = dict(L.BASELINE_TUNING_PROTOCOL, search_seeds=[100, 100])
+    pd = L.baseline_tuning_plan(dup)
+    assert pd['status'] == 'fail' and any('duplicate seed' in p for p in pd['problems']), pd
+    same_fold = dict(L.BASELINE_TUNING_PROTOCOL,
+                     selection_row_split={'enabled': True, 'seed': 1, 'n_folds': 2,
+                                          'selection_fold': 1, 'evaluation_fold': 1})
+    pf = L.baseline_tuning_plan(same_fold)
+    assert pf['status'] == 'fail' and any('identical' in p for p in pf['problems']), pf
+    no_group = dict(L.BASELINE_TUNING_PROTOCOL,
+                    arm_groups=[{'arms': ['csa_dynamic'], 'method_arm': 'csa_dynamic'}])
+    pg = L.baseline_tuning_plan(no_group)
+    assert pg['status'] == 'fail' and any('not covered' in p for p in pg['problems']), pg
+    # A resolvable-but-underpowered plan is descriptive, not structurally
+    # invalid: it must be visible as such rather than silently launched as
+    # confirmatory evidence.
+    weak = dict(L.BASELINE_TUNING_PROTOCOL, search_seeds=[100, 101, 102],
+                final_seeds=[0, 1, 2])
+    pw = L.baseline_tuning_plan(weak)
+    assert pw['status'] == 'warn' and pw['may_launch'] is True, pw
+    assert pw['final_seeds_sufficient'] is False and pw['confirmatory_capable'] is False, pw
+    # The count-model grid must be complete rather than a cherry-picked cell.
+    bad_simple = dict(L.SIMPLE_BASELINE_POLICY,
+                      grids={'unigram': {'alpha': [0.1]},
+                             'bigram': {'alpha': [0.1]}})
+    ps = L.simple_baseline_plan(bad_simple)
+    assert ps['status'] == 'fail', ps
+    assert any('missing' in p for p in ps['problems']), ps
+    assert any('fewer than 2 levels' in w for w in ps['warnings']), ps
+
+
 def t_bootstrap_and_zero_ce_scaling_contract():
     # Chunking must bound the per-chunk working set when the unit count grows;
     # ordinary panels keep the historical 256-draw chunk exactly.
@@ -15213,6 +15270,7 @@ def main():
     _check('L22b build report exact seed/parameter contracts', t_build_report_exact_seed_and_params)
     _check('L23 methodology/scale gates fail closed on malformed inputs', t_methodology_gate_fail_closed_edges)
     _check('L25 baseline seed plans reject duplicate draws', t_baseline_seed_plan_rejects_duplicate_draws)
+    _check('L25c baseline design preflight + tuned-baseline hypothesis', t_baseline_plan_preflight_and_tuned_hypothesis)
     _check('L25b baseline tuning audit checks search-to-final horizon transfer', t_baseline_horizon_transfer_audit)
     _check('L26 bootstrap chunk scaling + zero-CE measurements', t_bootstrap_and_zero_ce_scaling_contract)
     _check('L27 error analysis excludes non-finite targets', t_error_analysis_excludes_nonfinite_targets)

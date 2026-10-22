@@ -1831,6 +1831,18 @@ def audit_simple_baseline(path=None):
     return out
 
 
+def audit_baseline_design():
+    """基线设计预检（零 GPU）：调参臂组、搜索网格、种子分区与族功效。
+
+    这是 `baseline_tune.py plan` 的审计入口：在花 GPU 之前检查声明的
+    调参设计是否可启动、最终种子数是否足以对声明的 Holm 族做校正，
+    以及计数地板的全因子网格是否完整。"""
+    L = _import_exp_lib()
+    out = L.baseline_plan()
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return out
+
+
 def audit_hypotheses():
     """预注册假设完整性 / 指标对齐审计（零 GPU）。
 
@@ -1841,10 +1853,11 @@ def audit_hypotheses():
     out = {'status': 'ok',
            'component': L.hypothesis_audit(L.HYPOTHESIS_DESIGN, 'component'),
            'baseline': L.hypothesis_audit(L.BASELINE_HYPOTHESIS_DESIGN, 'baseline'),
+           'tuned_baseline': L.hypothesis_audit(L.TUNED_BASELINE_HYPOTHESIS_DESIGN, 'tuned_baseline'),
            'floor': L.hypothesis_audit(L.FLOOR_HYPOTHESIS_DESIGN, 'floor'),
            'open_block': L.hypothesis_audit(L.OPEN_BLOCK_HYPOTHESIS_DESIGN, 'open_block'),
            'niah': L.hypothesis_audit(L.NIAH_HYPOTHESIS_DESIGN, 'niah')}
-    if any(out[k]['status'] != 'ok' for k in ('component', 'baseline', 'floor', 'open_block', 'niah')):
+    if any(out[k]['status'] != 'ok' for k in ('component', 'baseline', 'tuned_baseline', 'floor', 'open_block', 'niah')):
         out['status'] = 'warn'
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return out
@@ -2895,7 +2908,7 @@ def run_report(out='audit_report.json'):
 
 
 if __name__ == '__main__':
-    _cmds = {'leakage': audit_leakage, 'split': audit_split_discipline, 'split_discipline': audit_split_discipline, 'causality': audit_causality, 'attribution': audit_attribution, 'boundary': audit_boundary, 'length': audit_length, 'fairness': audit_fairness, 'metrics': audit_metrics, 'tuning': audit_tuning, 'simple': audit_simple_baseline, 'baseline_floor': audit_simple_baseline, 'hypotheses': audit_hypotheses, 'methodology': audit_methodology, 'single_factor': audit_single_factor, 'failures': audit_failures, 'budget': audit_budget, 'efficiency': audit_efficiency_demo, 'efficiency_pairs': audit_efficiency_pairs, 'training_health': audit_training_health, 'selection': audit_selection, 'release': audit_release_readiness, 'report': run_report}
+    _cmds = {'leakage': audit_leakage, 'split': audit_split_discipline, 'split_discipline': audit_split_discipline, 'causality': audit_causality, 'attribution': audit_attribution, 'boundary': audit_boundary, 'length': audit_length, 'fairness': audit_fairness, 'metrics': audit_metrics, 'tuning': audit_tuning, 'simple': audit_simple_baseline, 'baseline_floor': audit_simple_baseline, 'baseline_plan': audit_baseline_design, 'hypotheses': audit_hypotheses, 'methodology': audit_methodology, 'single_factor': audit_single_factor, 'failures': audit_failures, 'budget': audit_budget, 'efficiency': audit_efficiency_demo, 'efficiency_pairs': audit_efficiency_pairs, 'training_health': audit_training_health, 'selection': audit_selection, 'release': audit_release_readiness, 'report': run_report}
     _arg = sys.argv[1] if len(sys.argv) > 1 else 'report'
     if _arg in ('-h', '--help'):
         print(__doc__)

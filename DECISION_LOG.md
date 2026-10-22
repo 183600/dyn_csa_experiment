@@ -990,3 +990,39 @@ path).
 Verification: `python test_review_fixes.py` passes 374/374 (data-audit/triage
 and scale result-diagnostics tests added); `python v12_supp.py plan` still
 admits 72/72 synthetic records with the same six comparisons.
+
+## 2026-10-22 — baseline design preflight + tuned-baseline hypothesis (no new runs)
+
+Zero-GPU experiment-design hardening; no panel result, frozen manifest, test
+split, README or CI configuration was touched.
+
+**Problem.** Equal-search tuning was audited only *after* the GPU panel had
+run, and the tuned comparison itself had no pre-registered hypothesis.  The
+protocol's 8-seed final partition was justified in prose, but nothing checked
+the declaration before launch: a duplicated seed, an overlapping search/final
+draw, an arm missing from a parameter-matching group, a non-chronological row
+fold or a final partition too small for the declared Holm family could all be
+discovered only from the finished artifact.  That wastes GPU time and makes an
+underpowered contrast easy to launch as if it were confirmatory.
+
+**Changes.** (1) `exp_lib.baseline_tuning_plan` / `simple_baseline_plan` /
+`baseline_plan` now validate the *declared design* before any run: arm-group
+coverage, unique trial cells, metric/split/direction (`ppl`, validation,
+lower-is-better), disjoint search/final seed partitions, the chronological
+nested row fold, and the exact seed count needed for the protocol's declared
+Holm family.  Structural defects fail the plan; a resolvable but underpowered
+final partition is labelled `descriptive_only` (`confirmatory_capable=False`)
+rather than silently promoted.  The count-floor plan checks that the policy's
+claimed full-factorial grid is actually complete and that the fit cap/policy
+are explicit.  (2) `baseline_tune.py plan` runs the preflight and writes
+`baseline_plan.json`; `simple`/`full` now refuse a structurally invalid design
+before training.  (3) `TUNED_BASELINE_HYPOTHESIS_DESIGN` pre-registers the
+tuned-baseline claim (equal search, parameter matching, disjoint held-out rows,
+directional PPL endpoint, falsifier), and every PPL hypothesis now names
+`metric_policy='lm_perplexity'` instead of relying on an implicit global
+mapping.  `audit_gates.py hypotheses` audits the new family.
+
+Verification: new CPU test L25c covers the shipped plan, overlap/duplicate/fold/
+group defects, the underpowered-but-launchable case and the incomplete
+count-model grid. `python baseline_tune.py plan` reports `status=ok`,
+family m=4, final seeds 0-7 sufficient for n>=8.

@@ -10,6 +10,10 @@ arm, selects on validation PPL, and writes the trial/selection record that
 ``exp_lib.baseline_tuning_audit`` verifies.
 
 Subcommands:
+  plan    zero-GPU preflight of the declared tuning/floor design: arm groups,
+          trial grid, disjoint search/final seeds, nested row split and the
+          family power floor; writes baseline_plan.json and refuses a
+          structurally invalid design before any GPU time is spent
   simple  fit and tune the trivial count-model floor (unigram / bigram) on the
           training split, select on validation, write simple_baseline.json
   smoke   tiny end-to-end run of the tuning + selection + audit round-trip
@@ -1147,20 +1151,61 @@ def run_report():
     return {'baseline_tuning': report, 'simple_baseline': simple}
 
 
+def _preflight(outdir='results_baseline_tuning', *, write=True):
+    """Validate the baseline design BEFORE any training starts.
+
+    The audit can only reject an artifact after GPU time has been spent.  This
+    preflight checks the same design properties up front: declared groups and
+    contrasts, equal trial grid, disjoint search/final seeds, a nested row
+    split, and whether the declared final partition can reach a Holm-corrected
+    p for its family.
+    """
+    plan = L.baseline_plan()
+    if write:
+        L.atomic_write_json(os.path.join(outdir, 'baseline_plan.json'), plan)
+    print('[plan] baseline design preflight: %s' % plan.get('status'))
+    _t = plan.get('tuned') or {}
+    print('[plan] tuned: %d arm(s), %d declared contrast(s), family m=%s; '
+          'search seeds=%s final seeds=%s; min n for Holm=%s; sufficient=%s'
+          % (len(_t.get('arms') or []), len(_t.get('declared_contrasts') or []),
+             _t.get('family_size'), _t.get('search_seeds'), _t.get('final_seeds'),
+             _t.get('min_final_seeds_for_family_significance'),
+             _t.get('final_seeds_sufficient')))
+    _s = plan.get('simple') or {}
+    print('[plan] count floor: arms=%s expected cells=%s'
+          % (sorted((_s.get('arms') or {}).keys()), _s.get('expected_cells')))
+    for _p in plan.get('problems') or []:
+        print('[plan] PROBLEM: %s' % _p)
+    for _w in plan.get('warnings') or []:
+        print('[plan] warning: %s' % _w)
+    if not plan.get('may_launch'):
+        print('[plan] REFUSE: the declared design has structural defects; fix them '
+              'before spending GPU time (BASELINE_TUNING_PROTOCOL / SIMPLE_BASELINE_POLICY).')
+        raise SystemExit(1)
+    if not plan.get('confirmatory_capable'):
+        print('[plan] the declared final seed partition is DESCRIPTIVE ONLY for its '
+              'Holm family; the run may proceed but cannot confirm the tuned contrast.')
+    return plan
+
+
 if __name__ == '__main__':
     _cmd = sys.argv[1] if len(sys.argv) > 1 else 'report'
     if _cmd == 'smoke':
         run_smoke()
+    elif _cmd == 'plan':
+        _preflight(os.environ.get('BT_OUTDIR', 'results_baseline_tuning'))
     elif _cmd == 'simple':
         base = dict(L.RUN)
         if os.environ.get('BT_BASE_OUTDIR'):
             base['outdir'] = os.environ['BT_BASE_OUTDIR']
+        _preflight(os.environ.get('BT_OUTDIR', 'results_baseline_tuning'))
         run_simple(base, outdir=os.environ.get('BT_OUTDIR', 'results_baseline_tuning'))
     elif _cmd == 'full':
         base = dict(L.RUN)
         if os.environ.get('BT_BASE_OUTDIR'):
             base['outdir'] = os.environ['BT_BASE_OUTDIR']
         _od = os.environ.get('BT_OUTDIR', 'results_baseline_tuning')
+        _preflight(_od)
         if os.environ.get('BT_SKIP_SIMPLE', '').strip().lower() not in ('1', 'true', 'yes'):
             run_simple(base, outdir=_od)
         run_tuning(base, outdir=_od,
