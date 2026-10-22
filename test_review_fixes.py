@@ -14367,6 +14367,69 @@ def t_kernel_attention_grad_matches_eager_at_boundaries():
           sink=torch.tensor([float('nan'), 0.3]))
 
 
+def t_kernel_attention_block_only_window_contract():
+    # The public eager entry documents w=0 as block-only attention with
+    # k_sw=v_sw=None.  The kernel/ref twin must accept the same form, and a
+    # caller-supplied zero-width window tensor must receive a zero gradient
+    # of its own shape (not the hard-coded [R, T, nh, hd] table the backward
+    # used before).  A non-zero window without its K/V tables is a clear
+    # caller error, not an opaque NoneType failure.
+    import csa_kernels as C
+    T, nh, hd, B, nb = 6, 1, 3, 3, 2
+    torch.manual_seed(0)
+    q0, kb0, vb0 = (torch.randn(T, nh, hd), torch.randn(B, nh, hd),
+                    torch.randn(B, nh, hd))
+    topk = torch.stack([torch.randperm(B)[:nb] for _ in range(T)]).to(torch.int32)
+    last = torch.tensor([0, 1, 2])
+    dO = torch.randn(T, nh, hd)
+
+    def _eager(empty_window):
+        q, kb, vb = (x.clone().requires_grad_(True) for x in (q0, kb0, vb0))
+        if empty_window:
+            ks = torch.zeros(0, nh, hd, requires_grad=True)
+            vs = torch.zeros(0, nh, hd, requires_grad=True)
+        else:
+            ks = vs = None
+        out = L.gathered_attention(q, kb, vb, topk, last, None, None, 0, 0.7)
+        (out * dO).sum().backward()
+        return out, q.grad, kb.grad, ks, vs
+
+    def _kernel(empty_window):
+        q, kb, vb = (x.clone().requires_grad_(True) for x in (q0, kb0, vb0))
+        if empty_window:
+            ks = torch.zeros(1, 0, nh, hd, requires_grad=True)
+            vs = torch.zeros(1, 0, nh, hd, requires_grad=True)
+        else:
+            ks = vs = None
+        out = C.gathered_attention_kernel(
+            q[None], kb[None], vb[None], topk[None], last[None], ks, vs, 0, 0.7,
+            impl='ref')
+        (out * dO[None]).sum().backward()
+        return out[0], q.grad, kb.grad, ks, vs
+
+    for empty_window in (False, True):
+        e_out, e_gq, e_gkb, e_ks, e_vs = _eager(empty_window)
+        k_out, k_gq, k_gkb, k_ks, k_vs = _kernel(empty_window)
+        assert torch.allclose(k_out, e_out, atol=1e-6, rtol=1e-6), empty_window
+        assert torch.allclose(k_gq, e_gq, atol=1e-6, rtol=1e-6), empty_window
+        assert torch.allclose(k_gkb, e_gkb, atol=1e-6, rtol=1e-6), empty_window
+        if empty_window:
+            for k_t, e_t in ((k_ks, e_ks), (k_vs, e_vs)):
+                assert tuple(k_t.grad.shape) == tuple(k_t.shape) == (1, 0, nh, hd)
+                assert torch.count_nonzero(k_t.grad).item() == 0
+
+    # A non-zero window still requires its K/V tables: refuse it explicitly.
+    try:
+        C.gathered_attention_kernel(
+            torch.randn(1, 4, 1, 2), torch.randn(1, 2, 1, 2),
+            torch.randn(1, 2, 1, 2), torch.zeros(1, 4, 1, dtype=torch.int32),
+            torch.zeros(1, 2, dtype=torch.long), None, None, 2, 1.0, impl='ref')
+    except ValueError as exc:
+        assert 'requires k_sw/v_sw' in str(exc)
+    else:
+        raise AssertionError('a non-zero window without K/V must be refused')
+
+
 def t_kernel_ref_length_one_dynamic_arm_matches_eager():
     # At T=1 there is no consecutive-pair similarity, so the eager gate hoist
     # returns no row and the segmenter supplies the single one-token block.
@@ -19271,6 +19334,7 @@ def main():
     _check('L42b no-overlap pool accepts overlap=None', t_pool_variable_blocks_accepts_no_overlap)
     _check('L42d pool geometry accepts the no-cap configuration', t_pool_geometry_accepts_no_cap)
     _check('L42e kernel attention gradients match eager at clamp/sink boundaries', t_kernel_attention_grad_matches_eager_at_boundaries)
+    _check('L42e2 kernel attention accepts the eager block-only window contract', t_kernel_attention_block_only_window_contract)
     _check('L42f greedy match batch is subset-order independent', t_greedy_match_batch_is_order_independent)
     _check('L42g kernel/ref REINFORCE boundary logp survives batching', t_kernel_reinforce_boundary_logp_survives_batching)
     _check('L42g2 kernel/ref accepts the length-one dynamic arm', t_kernel_ref_length_one_dynamic_arm_matches_eager)

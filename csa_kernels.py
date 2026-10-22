@@ -1128,6 +1128,55 @@ def _attn_t_chunk(R, M, nh, hd):
     return max(1, min(int(_ATTN_REF_BUDGET) // per_t, 256))
 
 
+def _attn_window_pair(k_sw, v_sw, q, w):
+    """Normalise the sliding-window K/V pair to the kernel's shape contract.
+
+    The public eager entry point documents ``w=0`` as "block-only attention"
+    with ``k_sw=v_sw=None``.  The kernel twin used to subscript ``None`` while
+    building its per-head views, and its backward allocated the window
+    gradients with a hard-coded ``[R, T, nh, hd]`` shape even when the caller
+    supplied a legitimately zero-width tensor.  Both are transport/shape bugs,
+    not algorithm changes: values for a zero-width window are never read, so
+    an empty tensor is the exact representation of "no window lanes".  A
+    non-zero window without its K/V tables is a caller error and is refused
+    here instead of failing later with an opaque ``NoneType`` error.
+    """
+    R, T, nh, hd = q.shape
+    try:
+        w = int(w)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f'attention window width must be an integer, got {w!r}') from None
+    if w < 0:
+        raise ValueError(f'attention window width must be >= 0, got {w}')
+    if (k_sw is None) != (v_sw is None):
+        raise ValueError('attention needs BOTH k_sw and v_sw (or neither)')
+    if k_sw is None:
+        if w != 0:
+            raise ValueError(f'attention window w={w} requires k_sw/v_sw tensors')
+        # Any zero-length row dimension is unused when w == 0; use the
+        # canonical empty form so gathers, broadcasts and dgrad shapes all
+        # agree with the caller's zero-width window.
+        z = q.new_zeros((int(R), 0, int(nh), int(hd)))
+        return z, z
+    if (len(tuple(k_sw.shape)) != 4
+            or int(k_sw.shape[0]) != int(R)
+            or int(k_sw.shape[2]) != int(nh)
+            or int(k_sw.shape[3]) != int(hd)):
+        raise ValueError(
+            'attention k_sw/v_sw must have shape [R, T_window, nh, hd]; got '
+            f'{tuple(k_sw.shape)} vs q={tuple(q.shape)}')
+    if tuple(v_sw.shape) != tuple(k_sw.shape):
+        raise ValueError(
+            'attention k_sw and v_sw must have the same shape; got '
+            f'{tuple(k_sw.shape)} vs {tuple(v_sw.shape)}')
+    if int(w) > 0 and int(k_sw.shape[1]) != int(T):
+        raise ValueError(
+            f'attention window w={w} indexes positions 0..{int(T) - 1}, but '
+            f'k_sw has {int(k_sw.shape[1])} row(s); supply one K/V row per '
+            'sequence position')
+    return k_sw, v_sw
+
+
 def _attn_fwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, sink, w, scale):
     """torch 参考实现（按 t 分块 × 逐头）。
 
@@ -1140,6 +1189,8 @@ def _attn_fwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
     以 anyrow 乘法清零——本实现以同样的 anyrow 语义清零。
     """
     R, T, nh, hd = q.shape
+    w = int(w)
+    k_sw, v_sw = _attn_window_pair(k_sw, v_sw, q, w)
     nb = topk_idx.shape[-1]
     M = nb + w
     dev = q.device
@@ -1219,6 +1270,8 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
       dsink_h     = −Σ_{r,t} (P_sink^A·GA + P_sink^S·GS)
     """
     R, T, nh, hd = q.shape
+    w = int(w)
+    k_sw, v_sw = _attn_window_pair(k_sw, v_sw, q, w)
     nb = topk_idx.shape[-1]
     Bm = k_blk.shape[1]
     dev = q.device
@@ -1251,20 +1304,31 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
     except (TypeError, ValueError):
         _slab_budget = 64 << 20
     _acc_bytes = int(torch.empty((), dtype=acc).element_size())
+    _has_win = int(w) > 0
     _per_head_bytes = _acc_bytes * hd * (
         R * Bm * (int(bool(need_dkb)) + int(bool(need_dvb)))
-        + R * T * (int(bool(need_dksw)) + int(bool(need_dvsw))))
+        + (R * T * (int(bool(need_dksw)) + int(bool(need_dvsw)))
+           if _has_win else 0))
     group = max(1, min(int(nh), int(_slab_budget) // max(1, int(_per_head_bytes))))
     dk_blk = torch.empty((R, Bm, nh, hd), device=dev, dtype=dtype) if need_dkb else None
     dv_blk = torch.empty((R, Bm, nh, hd), device=dev, dtype=dtype) if need_dvb else None
-    dk_sw = torch.empty((R, T, nh, hd), device=dev, dtype=dtype) if need_dksw else None
-    dv_sw = torch.empty((R, T, nh, hd), device=dev, dtype=dtype) if need_dvsw else None
+    # A zero-width window contributes no lanes and no gradient, but autograd
+    # still requires the returned gradient to match the input tensor's shape.
+    # `zeros_like` is therefore the exact dgrad for w == 0 (and is also the
+    # correct empty gradient for a caller-supplied [R, 0, nh, hd] table).
+    # For a real window every row is written by the head loop below, so an
+    # uninitialised buffer avoids zero-filling an [R, T, nh, hd] tensor at
+    # long-context scale.
+    dk_sw = ((torch.empty_like(k_sw) if _has_win else torch.zeros_like(k_sw))
+             if need_dksw else None)
+    dv_sw = ((torch.empty_like(v_sw) if _has_win else torch.zeros_like(v_sw))
+             if need_dvsw else None)
     dk_slab = torch.zeros((group, R * Bm, hd), device=dev, dtype=acc) if need_dkb else None
     dv_slab = torch.zeros((group, R * Bm, hd), device=dev, dtype=acc) if need_dvb else None
-    dksw_slab = torch.zeros((group, R * T, hd), device=dev, dtype=acc) if need_dksw else None
-    dvsw_slab = torch.zeros((group, R * T, hd), device=dev, dtype=acc) if need_dvsw else None
+    dksw_slab = torch.zeros((group, R * T, hd), device=dev, dtype=acc) if (_has_win and need_dksw) else None
+    dvsw_slab = torch.zeros((group, R * T, hd), device=dev, dtype=acc) if (_has_win and need_dvsw) else None
     dk_scratch = torch.zeros((R * Bm, hd), device=dev, dtype=acc) if (need_dkb or need_dvb) else None
-    dksw_scratch = torch.zeros((R * T, hd), device=dev, dtype=acc) if (need_dksw or need_dvsw) else None
+    dksw_scratch = torch.zeros((R * T, hd), device=dev, dtype=acc) if (_has_win and (need_dksw or need_dvsw)) else None
 
     for h0 in range(0, nh, group):
         h1 = min(h0 + group, nh)
@@ -1291,7 +1355,7 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
                 seg_b_c = _seg_structure(kb_keys.reshape(-1), R * Bm)
                 del kb_keys
             seg_w_c = None
-            if need_dksw or need_dvsw:
+            if _has_win and (need_dksw or need_dvsw):
                 kw_keys = r_idx.expand(R, t1 - t0, w) * T + src_win
                 seg_w_c = _seg_structure(kw_keys.reshape(-1), R * T)
                 del kw_keys
@@ -1372,7 +1436,7 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
                     # the clamp boundary, so the strict interior is the correct
                     # support (>= would emit dl/1e-12 at exactly 1e-12).
                     dsoft[:, t0:t1, :] += torch.where(sf > 1e-12, dl / sf.clamp_min(1e-12), torch.zeros_like(dl)).to(dtype)
-                if need_dkb or need_dksw:
+                if need_dkb or (need_dksw and _has_win):
                     dkl = torch.einsum('rtm,rtd->rtmd', dz, qh)
                     if scale != 1.0:
                         dkl.mul_(scale)
@@ -1380,18 +1444,18 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
                         dk_scratch.zero_()
                         _seg_apply(seg_b_c, dkl[:, :, :nb].reshape(-1, hd), dk_scratch)
                         dk_slab[hi].add_(dk_scratch)
-                    if need_dksw:
+                    if need_dksw and _has_win:
                         dksw_scratch.zero_()
                         _seg_apply(seg_w_c, dkl[:, :, nb:].reshape(-1, hd), dksw_scratch)
                         dksw_slab[hi].add_(dksw_scratch)
                     del dkl
-                if need_dvb or need_dvsw:
+                if need_dvb or (need_dvsw and _has_win):
                     dvl = torch.einsum('rtm,rtd->rtmd', P_A_f, dOh)
                     if need_dvb:
                         dk_scratch.zero_()
                         _seg_apply(seg_b_c, dvl[:, :, :nb].reshape(-1, hd), dk_scratch)
                         dv_slab[hi].add_(dk_scratch)
-                    if need_dvsw:
+                    if need_dvsw and _has_win:
                         dksw_scratch.zero_()
                         _seg_apply(seg_w_c, dvl[:, :, nb:].reshape(-1, hd), dksw_scratch)
                         dvsw_slab[hi].add_(dksw_scratch)
@@ -1404,9 +1468,9 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
             dk_blk[:, :, h0:h1, :] = dk_slab[:_g].view(_g, R, Bm, hd).permute(1, 2, 0, 3).to(dtype)
         if dv_blk is not None:
             dv_blk[:, :, h0:h1, :] = dv_slab[:_g].view(_g, R, Bm, hd).permute(1, 2, 0, 3).to(dtype)
-        if dk_sw is not None:
+        if dk_sw is not None and _has_win:
             dk_sw[:, :, h0:h1, :] = dksw_slab[:_g].view(_g, R, T, hd).permute(1, 2, 0, 3).to(dtype)
-        if dv_sw is not None:
+        if dv_sw is not None and _has_win:
             dv_sw[:, :, h0:h1, :] = dvsw_slab[:_g].view(_g, R, T, hd).permute(1, 2, 0, 3).to(dtype)
     if dsink is not None:
         # eager sanitises the sink before its softmax; nan_to_num's backward
@@ -1438,6 +1502,11 @@ class FusedSparseAttention(torch.autograd.Function):
     @staticmethod
     def forward(ctx, impl, q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, sink, w, scale):
         impl = _attn_impl_for_shape(impl, q, w)
+        # Accept the eager API's block-only form (w=0, k_sw=v_sw=None) and
+        # refuse a non-zero window without its K/V tables.  Normalising once
+        # here also makes the saved tensors and the returned dgrad shapes
+        # agree with the caller's zero-width window.
+        k_sw, v_sw = _attn_window_pair(k_sw, v_sw, q, w)
         # HCA's read-everything arm passes the cached stride-0 arange table:
         # every row is exactly arange(nb), so the triton kernels derive the
         # block id from the lane index.
