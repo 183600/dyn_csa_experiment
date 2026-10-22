@@ -18471,6 +18471,125 @@ def t_requirements_lock_is_a_complete_environment():
         'it must be a full transitive closure')
 
 
+
+def _fake_source_tree(tag):
+    """A small source manifest for freeze-lock tests (no real tree hashing)."""
+    return {
+        'schema': 1,
+        'algorithm': 'sha256(sorted relpath NUL bytes NUL sha256 LF)',
+        'sha256': (tag * 64)[:64],
+        'n_files': 2,
+        'bytes': 10,
+        'files': {
+            'exp_lib.py': {'sha256': (tag * 64)[:64], 'bytes': 7},
+            'v12_supp.py': {'sha256': (tag * 64)[:64], 'bytes': 3},
+        },
+        'scope': 'test fixture',
+    }
+
+
+def t_freeze_lock_binds_the_measurement_source():
+    with tempfile.TemporaryDirectory() as td:
+        man = {'manifest_sha256': 'AAA', 'frozen_at': '2026-10-17'}
+        src_a = _fake_source_tree('a')
+        src_b = _fake_source_tree('b')
+        lock = V12._check_or_write_freeze_lock(
+            td, man, None, stage='preaccess', source_tree=src_a)
+        assert lock['source_tree_sha256'] == src_a['sha256'], lock
+        assert lock['source_tree']['files']['exp_lib.py']['sha256'] == src_a['sha256']
+        lock = V12._check_or_write_freeze_lock(
+            td, man, 'FP', stage='accessed', source_tree=src_a)
+        assert lock['source_tree_sha256'] == src_a['sha256'], lock
+        # A test evaluation from a different measurement tree is refused even
+        # though the manifest hash and CODE_SEMANTICS stamp still match.
+        try:
+            V12._check_or_write_freeze_lock(
+                td, man, lock.get('test_ids_fp'), stage='accessed', source_tree=src_b)
+            raise AssertionError('a test evaluation under changed source must be refused')
+        except SystemExit as e:
+            assert 'measurement source changed' in str(e), str(e)
+            assert 'exp_lib.py' in str(e), str(e)
+        # An analysis-only run may disclose the drift explicitly; the lock
+        # keeps the ORIGINAL attestation so the source gate still fails.
+        os.environ['V12_ALLOW_SOURCE_DRIFT'] = '1'
+        try:
+            lock = V12._check_or_write_freeze_lock(
+                td, man, 'FP', stage='analysis', source_tree=src_b)
+        finally:
+            del os.environ['V12_ALLOW_SOURCE_DRIFT']
+        assert lock['source_tree_sha256'] == src_a['sha256'], lock
+        assert lock['source_tree_drift'][-1]['current_sha256'] == src_b['sha256'], lock
+        # Even after a disclosed analysis drift, a test evaluation still
+        # requires the frozen tree (or a conscious re-freeze).
+        try:
+            V12._check_or_write_freeze_lock(
+                td, man, 'FP', stage='accessed', source_tree=src_b)
+            raise AssertionError('a disclosed analysis drift must not unlock P5T')
+        except SystemExit as e:
+            assert 'measurement source changed' in str(e), str(e)
+        # A conscious re-freeze rebinds the source and keeps the old digest.
+        os.environ['V12_REFREEZE'] = '1'
+        try:
+            lock = V12._check_or_write_freeze_lock(
+                td, man, 'FP', stage='analysis', source_tree=src_b)
+        finally:
+            del os.environ['V12_REFREEZE']
+        assert lock['source_tree_sha256'] == src_b['sha256'], lock
+        assert lock['superseded'][-1]['source_tree_sha256'] == src_a['sha256'], lock
+        assert any(h.get('stage') == 'refreeze-source-tree'
+                   for h in lock.get('history') or []), lock
+        # A malformed/incomplete injected manifest is never accepted as an
+        # attestation.
+        try:
+            V12._check_or_write_freeze_lock(
+                td, man, 'FP', stage='analysis', source_tree={'sha256': ''})
+            raise AssertionError('a source tree without a digest must be refused')
+        except SystemExit:
+            pass
+
+
+def t_freeze_lock_source_audit_and_legacy_boundary():
+    with tempfile.TemporaryDirectory() as td:
+        man = {'manifest_sha256': 'AAA', 'frozen_at': '2026-10-17'}
+        cur = L.source_tree_manifest()
+        V12._check_or_write_freeze_lock(
+            td, man, None, stage='preaccess', source_tree=cur)
+        V12._check_or_write_freeze_lock(
+            td, man, 'FP', stage='accessed', source_tree=cur)
+        lp = os.path.join(td, '.freeze_lock.json')
+        r = A.audit_source_integrity(
+            snapshot_path=os.path.join(td, 'missing_plan.json'), lock_path=lp)
+        assert r['status'] == 'ok' and r['expected_sha256'] == cur['sha256'], r
+        # The audit compares the lock's frozen bytes with the current tree.
+        with open(lp, encoding='utf-8') as f:
+            lock = json.load(f)
+        lock['source_tree']['sha256'] = '0' * 64
+        with open(lp, 'w', encoding='utf-8') as f:
+            json.dump(lock, f)
+        r = A.audit_source_integrity(
+            snapshot_path=os.path.join(td, 'missing_plan.json'), lock_path=lp)
+        assert r['status'] == 'fail' and r['problems'], r
+        # A pre-source-binding lock is unverifiable, never "source is fine".
+        lock.pop('source_tree', None)
+        lock.pop('source_tree_sha256', None)
+        with open(lp, 'w', encoding='utf-8') as f:
+            json.dump(lock, f)
+        r = A.audit_source_integrity(
+            snapshot_path=os.path.join(td, 'missing_plan.json'), lock_path=lp)
+        assert r['status'] == 'not_verifiable_locally', r
+        assert 'predates source-tree binding' in r['note'], r
+        # An analysis run that declared source drift is a visible failure even
+        # when the current tree happens to hash to the recorded digest again.
+        lock['source_tree'] = cur
+        lock['source_tree_sha256'] = cur['sha256']
+        lock['source_tree_drift'] = [{'stage': 'analysis', 'current_sha256': '1' * 64}]
+        with open(lp, 'w', encoding='utf-8') as f:
+            json.dump(lock, f)
+        r = A.audit_source_integrity(
+            snapshot_path=os.path.join(td, 'missing_plan.json'), lock_path=lp)
+        assert r['status'] == 'fail', r
+        assert r['declared_source_drift'], r
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -18951,6 +19070,8 @@ def main():
     _check('L138 dependency lock contract detects stale/missing pins', t_dependency_contract_parses_lock_and_detects_mismatch)
     _check('L139 source/dependency gates fail closed and bind evidence', t_audit_source_and_dependency_gates)
     _check('L140 requirements.lock is a full transitive closure', t_requirements_lock_is_a_complete_environment)
+    _check('L141 freeze lock binds the measurement source and refuses drift', t_freeze_lock_binds_the_measurement_source)
+    _check('L142 source audit verifies the freeze-lock digest and legacy boundary', t_freeze_lock_source_audit_and_legacy_boundary)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

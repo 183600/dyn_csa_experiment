@@ -3403,22 +3403,35 @@ def _display_repo_path(path):
     return ap if rel.startswith('..') else rel
 
 
+def _iter_freeze_locks(results_dirs=None):
+    """Freeze-lock artifacts, explicit dirs first then every results_* tree."""
+    dirs = list(results_dirs) if results_dirs is not None else list(_iter_result_dirs())
+    for d in dirs:
+        p = _audit_artifact(os.path.join(d, '.freeze_lock.json'))
+        if os.path.exists(p):
+            yield p
+
+
 def audit_source_integrity(snapshot_path='analysis_v12/plan_snapshot.json',
-                           results_dirs=None):
-    """Compare the current source bytes with the source bound by a snapshot.
+                           results_dirs=None, lock_path=None):
+    """Compare the current source bytes with the source bound by an artifact.
 
     The git commit + CODE_SEMANTICS stamp cannot detect a dirty edit that
     leaves the stamp unchanged (the exact hazard documented at the top of the
     continuous-loop workflow), and a source tarball has no commit at all.  The
-    plan snapshot / panel provenance now carries a content digest; this gate
-    recomputes it and reports which files changed when the full manifest was
-    recorded.  No recorded digest is ``not_verifiable_locally`` — never
-    "source is fine".
+    plan snapshot, the first-test-access freeze lock and panel provenance now
+    carry a content digest; this gate recomputes it and reports which files
+    changed when the full manifest was recorded.  Preference order is
+    snapshot -> explicit freeze lock -> any discovered freeze lock -> panel
+    provenance, because the freeze lock is the artifact written immediately
+    before the one-shot test access.  No recorded digest is
+    ``not_verifiable_locally`` — never "source is fine".
     """
     L = _import_exp_lib()
     cur = L.source_tree_manifest()
     expected = None
     source = None
+    legacy_lock = None
     snap_file = _audit_artifact(snapshot_path)
     snap = _load(snap_file)
     if isinstance(snap, dict):
@@ -3426,6 +3439,22 @@ def audit_source_integrity(snapshot_path='analysis_v12/plan_snapshot.json',
         if expected:
             source = _display_repo_path(snap_file)
     if expected is None:
+        locks = ([_audit_artifact(lock_path)] if lock_path
+                 else list(_iter_freeze_locks(results_dirs)))
+        for lp in locks:
+            if not os.path.exists(lp):
+                continue
+            lock = _load(lp)
+            got = _extract_source_tree(lock)
+            if got:
+                expected = got
+                source = _display_repo_path(lp)
+                break
+            if isinstance(lock, dict) and 'manifest_sha256' in lock:
+                # A lock from the pre-source-binding driver is honest evidence
+                # of the plan/slice, but it cannot attest the code bytes.
+                legacy_lock = _display_repo_path(lp)
+    if expected is None and legacy_lock is None:
         dirs = list(results_dirs) if results_dirs is not None else list(_iter_result_dirs())
         for d in dirs:
             p = _audit_artifact(os.path.join(d, 'summary.json'))
@@ -3434,6 +3463,26 @@ def audit_source_integrity(snapshot_path='analysis_v12/plan_snapshot.json',
             if expected:
                 source = _display_repo_path(p)
                 break
+    if expected is None and legacy_lock is not None:
+        out = {
+            'kind': 'source_tree_audit',
+            'status': 'not_verifiable_locally',
+            'snapshot': (_display_repo_path(snap_file)
+                         if os.path.exists(snap_file) else None),
+            'source': legacy_lock,
+            'expected_sha256': None,
+            'current_sha256': cur.get('sha256'),
+            'n_expected_files': None,
+            'n_current_files': cur.get('n_files'),
+            'added': [], 'removed': [], 'changed': [],
+            'problems': [],
+            'note': ('the discovered freeze lock predates source-tree '
+                     'binding and has no source digest; the lock attests the '
+                     'plan/test slice but not the measurement code bytes'),
+        }
+        print(json.dumps({k: v for k, v in out.items() if k != 'files'},
+                         ensure_ascii=False, indent=2)[:4000])
+        return out
     out = {
         'kind': 'source_tree_audit',
         'status': 'not_verifiable_locally',
@@ -3505,6 +3554,20 @@ def audit_source_integrity(snapshot_path='analysis_v12/plan_snapshot.json',
         out['note'] = ('the current source tree differs from the tree bound to '
                        'the snapshot/provenance; a git commit + CODE_SEMANTICS '
                        'stamp alone cannot establish source identity')
+    if source and source.endswith('.freeze_lock.json'):
+        _lock = _load(_audit_artifact(source))
+        _drift = _lock.get('source_tree_drift') if isinstance(_lock, dict) else None
+        if _drift:
+            out['declared_source_drift'] = _drift
+            out['problems'].append(
+                f'{len(_drift)} declared analysis-time source-drift event(s) '
+                'are recorded in the freeze lock; the analysis was not run '
+                'from byte-identical code')
+            out['note'] = ('the analysis declared source drift via '
+                           'V12_ALLOW_SOURCE_DRIFT=1; even if the bytes now '
+                           'match the original attestation, this round is not '
+                           'a byte-identical replay')
+            out['status'] = 'fail'
     print(json.dumps({k: v for k, v in out.items() if k != 'files'},
                      ensure_ascii=False, indent=2)[:4000])
     return out

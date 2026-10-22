@@ -2633,7 +2633,8 @@ python v12_supp.py plan           # 冻结预检不变：72/72、6 个主比较
 2. **分析代码本身没有被冻结锁哈希。** 清单钉住 test/correction/endpoint/
    alpha/decision rule，P5T 也检查这些声明字符串；但测试访问后的分析实现
    改动不会改变 `manifest_sha256` 或 `CODE_SEMANTICS`。下一次冻结可在首次
-   test 读取前写入分析函数的规范化摘要。
+   test 读取前写入分析函数的规范化摘要。（§51 已在首次写入时绑定完整
+   测量源码树摘要，并在之后的评估/分析调用中拒绝未经声明的漂移。）
 3. **探索性面板的 look history 不是机器可读的。** 补种子记录在
    decision log、registry 也保证探索性面板不能升级为确认性，但没有逐面板
    的 `max_seeds` / look count。前瞻性的 panel analysis plan 能让「看了
@@ -2703,9 +2704,10 @@ python v12_supp.py plan           # 冻结预检不变：72/72、6 个主比较
 源码树摘要是**内容证据**，不替代 `CODE_SEMANTICS`、冻结 manifest 或
 `run_cfg`：它不参与训练/评测数值、seed、resume、pairing 或 P5T 的
 admission 判定。它也不把测试文件、README、docs 或 CI 配置纳入测量身份；
-这些文件的改动不会让一个已冻结面板看起来「代码变了」。P5T 仍未把该摘要
-写入 freeze lock（§49.2 的剩余边界保留），但 plan snapshot 与每个 cell 的
-provenance 已让「计划批准时的源码」和「产出证据时的源码」可比对。
+这些文件的改动不会让一个已冻结面板看起来「代码变了」。§51 起 P5T 在
+**首次写入 freeze lock 时**绑定完整源码树摘要，并在后续评估/分析调用中
+核验；plan snapshot 与每个 cell 的 provenance 仍保留同一摘要，便于定位
+漂移文件。
 
 ### 50.4 复核
 
@@ -2719,3 +2721,60 @@ python -m pip install --dry-run --no-deps -r requirements.lock  # 验证每条 p
 
 零 GPU、不读 test split；不改变 `confirmation_frozen*.json`、冻结臂/种子/
 终点/alpha/Holm family，也不需要 bump `CODE_SEMANTICS`。
+
+## 51. 冻结锁绑定测量源码树：计划相同不再等于代码相同
+
+### 51.1 问题：manifest 哈希与语义戳都钉不住代码字节
+
+冻结清单的 `manifest_sha256` 钉住的是**计划**（臂、种子、终点、检验、
+决策规则），`CODE_SEMANTICS` 钉住的是一个手工维护的语义常量。两者都不是
+源码哈希。CI 的 continuous-loop header 已明确记录这一危险：一次编辑可以
+改变测量语义而戳仍匹配，P5T 会静默接纳。§49.2 因此把「分析代码没有被
+冻结锁哈希」列为剩余边界，§50 只把源码树摘要写进 plan snapshot 和逐 cell
+provenance，仍未让它参与 freeze lock 的判定。
+
+### 51.2 改动：首次访问时绑定，之后按阶段拒绝/披露
+
+`v12_supp._check_or_write_freeze_lock*` 现在：
+
+- 在**第一次写入**（`preaccess`，即任何 test 读取之前）把
+  `exp_lib.source_tree_manifest()` 的完整清单写入锁的 `source_tree`，
+  并写 `source_tree_sha256` / `source_tree_bound_at`。清单沿用 §50 的范围：
+  非测试/非生成的 `*.py`、`pyproject.toml`、`requirements.txt`、两份冻结
+  清单；README/docs/tests/CI/lock 不在测量身份内。
+- 后续 `preaccess` / `accessed`（真实 test 评估）在源码摘要不同时**硬拒绝**，
+  错误信息列出 changed/added/removed 文件（有界），并提示两条合法路径：
+  恢复冻结时的源码，或 `V12_REFREEZE=1` 有意识地重冻结（前一轮降级为
+  探索性，旧摘要进入 `superseded` 与 `history`）。
+- `finaltest_stats` 的分析调用使用 `stage='analysis'`。默认同样硬拒绝；
+  只有显式 `V12_ALLOW_SOURCE_DRIFT=1` 才允许**披露式**分析重跑：锁保留
+  **原始** `source_tree`（不追溯改写认证），另写 `source_tree_drift`
+  事件（旧/新摘要、变化文件、代码戳）。因此该轮不是 byte-identical
+  replay，`audit_gates.py source` 会判 fail 而不是静默通过。
+- 旧版本写下的锁没有 `source_tree`：若仍是 `preaccess`（尚未读 test），
+  安全地补绑当前树；已 `accessed` 的旧锁保持**未绑定**，审计报
+  `not_verifiable_locally`，绝不把「没有哈希」写成「源码没问题」。
+- 注入的 `source_tree` 也要通过同一契约（必须有非空 sha256、不能有
+  unreadable 文件）；畸形清单不能被当作认证。
+
+`audit_gates.audit_source_integrity()` 的取证顺序变为
+`plan_snapshot` → 显式 freeze lock → 发现的 `.freeze_lock.json` →
+panel provenance。它比较完整逐文件清单，报告 added/removed/changed，
+并把锁里的 `source_tree_drift` 作为 fail 证据。没有源码摘要时仍是
+`not_verifiable_locally`。
+
+### 51.3 边界
+
+这是**证据/门禁**改动：不改变任何 PPL、种子、训练/评测数值路径、冻结臂、
+终点、α、Holm 族或决策规则；不修改 `confirmation_frozen*.json`；也不需要
+bump `CODE_SEMANTICS`。源码树摘要不进入 `run_cfg`、resume fingerprint 或
+`exec_fp`，因此旧 cell 的 resume/pairing 不变。它只让「同一 manifest +
+同一语义戳」不再被误当作「同一份测量代码」。
+
+### 51.4 复核
+
+```bash
+python test_review_fixes.py       # L141 锁绑定/漂移拒绝/披露/重冻结；L142 审计与旧锁边界
+python audit_gates.py source      # 有锁时按锁内源码树核验；无摘要则 not_verifiable
+python v12_supp.py plan           # 预检不变：72/72、6 个主比较
+```

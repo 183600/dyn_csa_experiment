@@ -2101,3 +2101,63 @@ omitted-record attachment and the mechanism-eligible/HCA mismatch.
 `python test_review_fixes.py` passes 476/479 with the same 3 DataLoader
 environment skips; `python test_open_block.py` passes 15/15; the
 `audit_gates.py single_factor` subcommand reports `ok`.
+
+## 2026-10-22 — the freeze lock now binds the measurement source tree (no new runs)
+
+Zero-GPU reproducibility/evidence hardening; no training run, frozen manifest
+byte, test split, `CODE_SEMANTICS`, README or CI configuration was touched.
+
+**Problem.** The freeze lock (`results_lm_test/.freeze_lock.json`) bound the
+manifest SHA-256 and the test-slice/training-corpus fingerprints, but not the
+bytes of the code that produced the test measurements.  `manifest_sha256` pins
+the **plan**, and `CODE_SEMANTICS` is a hand-maintained constant; the warning
+at the top of `.github/workflows/continuous-loop.yml` records the exact
+failure mode: an edit can change measurement semantics while the stamp still
+matches, so P5T would admit it silently.  `source_tree_manifest()` already
+gave the tree a content digest for the plan snapshot and per-cell provenance
+(§50), but §49.2's boundary — "the analysis code itself is not hashed by the
+freeze lock" — remained open.
+
+**Changes.** `v12_supp._check_or_write_freeze_lock*` computes
+`exp_lib.source_tree_manifest()` and writes the full manifest plus
+`source_tree_sha256` / `source_tree_bound_at` when the lock is first created
+(`preaccess`, before any test read).  Later calls compare the digest:
+
+- `preaccess` / `accessed` (a real test evaluation) **refuse** a changed tree,
+  naming the changed/added/removed files (bounded) and the two legitimate
+  paths: restore the frozen tree, or `V12_REFREEZE=1` (the old digest is kept
+  in `superseded` and `history`, and the earlier round is downgraded).
+- `finaltest_stats` now calls the lock with `stage='analysis'`.  A changed
+  analysis tree is refused by default; `V12_ALLOW_SOURCE_DRIFT=1` permits a
+  **disclosed** re-analysis that keeps the ORIGINAL attestation and appends a
+  `source_tree_drift` event (old/new digest, changed files, code stamp).  The
+  run is then not a byte-identical replay and `audit_gates.py source` fails.
+- A pre-source-binding lock that is still `preaccess` (no test read yet) is
+  safely back-filled with the current tree; an already `accessed` legacy lock
+  stays visibly unbound and the audit reports `not_verifiable_locally`, never
+  "source is fine".  Injected manifests are validated with the same contract
+  (non-empty SHA-256, no unreadable files).
+- `audit_gates.audit_source_integrity()` now takes an explicit `lock_path`,
+  discovers `.freeze_lock.json` under `results_*`, and prefers
+  snapshot → freeze lock → panel provenance.  It reports file-level
+  added/removed/changed and treats a recorded `source_tree_drift` as a fail.
+
+`docs/design_notes.md` §49.2/§50.3 now cross-reference the resolved boundary
+and §51 documents the full contract.
+
+**Boundary.** Evidence/gate change only.  No PPL, seed, recipe, endpoint,
+alpha, Holm family, frozen arm, decision rule, test split or checkpoint is
+changed; `confirmation_frozen*.json` is untouched and `CODE_SEMANTICS` is not
+bumped.  The digest does not enter `run_cfg`, resume fingerprints or
+`exec_fp`, so existing cells' resume/pairing is unchanged.
+
+**Verification.** New CPU tests L141 (first-write binding, drift refusal with
+file names, disclosed analysis override, re-freeze rebinding and superseded
+history, malformed injected manifest) and L142 (audit ok/fail against the lock,
+legacy-lock unverifiable boundary, declared drift is a fail).
+`python test_review_fixes.py` passes 478/481 with the same 3 DataLoader
+environment skips; `python test_open_block.py` passes 15/15;
+`python v12_supp.py plan` still admits 72/72 synthetic frozen records with the
+same six comparisons; `python audit_gates.py source` reports `ok` against the
+regenerated plan snapshot; `python audit_gates.py dependencies` reports `ok`
+with 48/48 pinned and 0 unpinned installed distributions.

@@ -27,8 +27,10 @@
      机器校验、manifest 哈希绑定」的记录；歧义重复与混切片直接拒绝。
   3. 冻结绑定（意见三）：每条结果记录携带 manifest_sha256 与
      ckpt_sha256；首次 test 访问写入 `.freeze_lock.json`（清单哈希 +
-     test 指纹），此后清单/test 变更即拒绝（V12_REFREEZE=1 显式改冻结，
-     前轮降级为探索性）；清单修订后同 outdir 的旧结果自动作废。
+     test 指纹 + 测量源码树摘要），此后清单/test/源码变更即拒绝
+     （V12_REFREEZE=1 显式改冻结，前轮降级为探索性；分析阶段可用
+     V12_ALLOW_SOURCE_DRIFT=1 披露式重跑，审计仍判 fail）；清单修订后
+     同 outdir 的旧结果自动作废。
   4. 范围声明（意见四）：确认性主张只覆盖固定分块 CSA 机制
      （清单 scope 块）；动态分块/HCA 的优劣需要各自的预注册。
 
@@ -805,8 +807,39 @@ def _freeze_lock_path(outdir):
     return os.path.join(outdir, _LOCK_NAME)
 
 
+def _source_tree_for_lock(source_tree=None):
+    """Return the measurement-source manifest bound by the freeze lock.
+
+    ``source_tree`` is injectable so a test can exercise the drift guard
+    without editing the working tree.  A caller-supplied manifest is validated
+    with the same contract as a freshly computed one: a lock without a usable
+    digest would attest nothing.
+    """
+    st = source_tree if source_tree is not None else L.source_tree_manifest()
+    if not isinstance(st, dict) or not isinstance(st.get('sha256'), str) or not st['sha256']:
+        raise SystemExit('[v12] REFUSE: cannot compute a source-tree digest for the freeze lock — the code that produced the test measurement would be unattested')
+    if st.get('unreadable'):
+        raise SystemExit(f'[v12] REFUSE: the source tree contains unreadable files ({st["unreadable"][:3]}) — fix the permissions or exclude the path explicitly before freezing; an incomplete source digest cannot attest the measurement code')
+    return st
+
+
+def _source_tree_delta(locked, current, limit=8):
+    """Human-readable added/removed/changed source files (bounded)."""
+    lf = locked.get('files') if isinstance(locked, dict) else None
+    cf = current.get('files') if isinstance(current, dict) else None
+    if not isinstance(lf, dict) or not isinstance(cf, dict):
+        return {'added': [], 'removed': [], 'changed': []}
+    def _h(entry):
+        return entry.get('sha256') if isinstance(entry, dict) else None
+    added = sorted(set(cf) - set(lf))
+    removed = sorted(set(lf) - set(cf))
+    changed = sorted(k for k in set(cf) & set(lf) if _h(cf[k]) != _h(lf[k]))
+    return {'added': added[:limit], 'removed': removed[:limit],
+            'changed': changed[:limit]}
+
+
 def _check_or_write_freeze_lock(outdir, manifest, test_ids_fp, stage='access',
-                                train_fp=None):
+                                train_fp=None, source_tree=None):
     """Serialize the freeze-lock check-and-write across processes.
 
     The check (read the existing lock) and the write must be one critical
@@ -826,14 +859,15 @@ def _check_or_write_freeze_lock(outdir, manifest, test_ids_fp, stage='access',
             if fcntl is not None:
                 fcntl.flock(_gf.fileno(), fcntl.LOCK_EX)
             return _check_or_write_freeze_lock_locked(
-                outdir, manifest, test_ids_fp, stage=stage, train_fp=train_fp)
+                outdir, manifest, test_ids_fp, stage=stage, train_fp=train_fp,
+                source_tree=source_tree)
         finally:
             if fcntl is not None:
                 fcntl.flock(_gf.fileno(), fcntl.LOCK_UN)
 
 
 def _check_or_write_freeze_lock_locked(outdir, manifest, test_ids_fp, stage='access',
-                                       train_fp=None):
+                                       train_fp=None, source_tree=None):
     """Persistent first-test-access lock.
 
     首次测试访问后禁止修改计划：P5T 一旦在 outdir 落下首条记录（或本函数
@@ -847,6 +881,8 @@ def _check_or_write_freeze_lock_locked(outdir, manifest, test_ids_fp, stage='acc
     ``test_reads`` 与 history。"""
     lp = _freeze_lock_path(outdir)
     _sha = manifest.get('manifest_sha256')
+    _src = _source_tree_for_lock(source_tree)
+    _src_sha = _src['sha256']
     if os.path.exists(lp):
         try:
             lock = json.load(open(lp, encoding='utf-8'))
@@ -869,7 +905,19 @@ def _check_or_write_freeze_lock_locked(outdir, manifest, test_ids_fp, stage='acc
         # condition made the mismatch disappear exactly when train_fp=None.
         _train_changed = (lock.get('train_fp') is not None
                           and train_fp != lock.get('train_fp'))
+        # The manifest hash pins the plan, but not the bytes of the code that
+        # turns it into measurements.  Bind the measurement-source digest on
+        # first write and refuse a later test evaluation under a different
+        # tree (the exact hazard the continuous-loop header warns about: an
+        # edit can change semantics while CODE_SEMANTICS still matches).
+        _locked_src = lock.get('source_tree')
+        _locked_src_sha = (_locked_src.get('sha256')
+                           if isinstance(_locked_src, dict) else None)
+        _source_legacy = _locked_src_sha is None
+        _source_changed = bool(_locked_src_sha and _locked_src_sha != _src_sha)
         _refreeze = os.environ.get('V12_REFREEZE', '').strip().lower() in ('1', 'true', 'yes', 'on')
+        _source_override = (os.environ.get('V12_ALLOW_SOURCE_DRIFT', '').strip().lower()
+                            in ('1', 'true', 'yes', 'on'))
         _allow_reread = os.environ.get('V12_ALLOW_TEST_REREAD', '').strip().lower() in ('1', 'true', 'yes', 'on')
         _already_accessed = (str(lock.get('stage') or '') == 'accessed'
                              or lock.get('test_ids_fp') is not None)
@@ -892,6 +940,39 @@ def _check_or_write_freeze_lock_locked(outdir, manifest, test_ids_fp, stage='acc
                     'V12_REFREEZE=1 and V12_ALLOW_TEST_REREAD=1 for a consciously '
                     'declared new round (the prior round is then exploratory).')
             _forced_reread = True
+        if _source_changed and not _refreeze:
+            if _source_override and stage == 'analysis':
+                _delta = _source_tree_delta(_locked_src, _src)
+                print(f'[v12] WARNING: V12_ALLOW_SOURCE_DRIFT=1 — the analysis '
+                      f'source differs from the tree bound at first test access '
+                      f'({str(_locked_src_sha)[:12]}… -> {_src_sha[:12]}…; '
+                      f'changed={_delta["changed"]} added={_delta["added"]} '
+                      f'removed={_delta["removed"]}).  The lock keeps the '
+                      'original attestation; this run is DISCLOSED DRIFT, not '
+                      'a byte-identical replay, and the source gate will fail.')
+                lock['source_tree_drift'] = list(lock.get('source_tree_drift') or []) + [{
+                    'at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+                    'stage': stage,
+                    'locked_sha256': _locked_src_sha,
+                    'current_sha256': _src_sha,
+                    'delta': _delta,
+                    'code_semantics': L.code_stamp(),
+                }]
+                _dirty = True
+            else:
+                _delta = _source_tree_delta(_locked_src, _src)
+                _hint = ('set V12_ALLOW_SOURCE_DRIFT=1 only to re-run the '
+                         'ANALYSIS with a disclosed code difference' if stage == 'analysis'
+                         else 'restore the tree that was frozen, or consciously set V12_REFREEZE=1 (which downgrades the earlier round)')
+                raise SystemExit(
+                    f'[v12] REFUSE: the measurement source changed after the '
+                    f'first test access (lock {lp}: {str(_locked_src_sha)[:12]}… '
+                    f'!= current {_src_sha[:12]}…; changed='
+                    f'{_delta["changed"]} added={_delta["added"]} removed='
+                    f'{_delta["removed"]}).  The frozen manifest binds the plan '
+                    'and CODE_SEMANTICS stamps the semantics constant, but '
+                    'neither hashes the code bytes; a dirty edit can therefore '
+                    'change a measurement while both still match.  ' + _hint)
         if (_manifest_changed or _test_changed or _train_changed) and not _refreeze:
             if _manifest_changed:
                 raise SystemExit(f'[v12] REFUSE: the test split was already accessed under a DIFFERENT frozen manifest (lock {lp}: {lock.get("manifest_sha256")} != current {_sha}, locked_at={lock.get("locked_at")}). Changing the plan after seeing test data is selection bias by construction. To consciously re-freeze, set V12_REFREEZE=1 — the earlier round must then be reported as exploratory in the plan history.')
@@ -912,19 +993,29 @@ def _check_or_write_freeze_lock_locked(outdir, manifest, test_ids_fp, stage='acc
                 'code_semantics': L.code_stamp(),
             }]
             _dirty = True
-        if _manifest_changed or _test_changed or _train_changed:
-            print(f'[v12] WARNING: V12_REFREEZE=1 — the locked plan/test/train identity changed (manifest {lock.get("manifest_sha256")} -> {_sha}, test_ids_fp {lock.get("test_ids_fp")} -> {test_ids_fp}, train_fp {lock.get("train_fp")} -> {train_fp}); the earlier round is DOWNGRADED to exploratory and this must be recorded in the plan history')
+        if (_manifest_changed or _test_changed or _train_changed or _source_changed) and _refreeze:
+            print(f'[v12] WARNING: V12_REFREEZE=1 — the locked plan/test/train/source identity changed (manifest {lock.get("manifest_sha256")} -> {_sha}, test_ids_fp {lock.get("test_ids_fp")} -> {test_ids_fp}, train_fp {lock.get("train_fp")} -> {train_fp}, source {str(_locked_src_sha)[:12]}… -> {_src_sha[:12]}…); the earlier round is DOWNGRADED to exploratory and this must be recorded in the plan history')
             # Persist the conscious re-freeze: under the new plan the lock must
             # carry the new identity so later runs do not refuse, and the
             # superseded plan is retained for the exploratory record.  The lock
             # is written ONCE below, after every check has passed, so a failure
             # can never leave a half-updated (new plan + stale fingerprints) file.
             prev = {_k: lock.get(_k) for _k in ('manifest_sha256', 'test_ids_fp', 'train_fp', 'locked_at', 'frozen_at')}
+            prev['source_tree_sha256'] = _locked_src_sha
             lock['superseded'] = list(lock.get('superseded') or []) + [prev]
+            if _source_changed:
+                lock['history'] = list(lock.get('history') or []) + [{
+                    'stage': 'refreeze-source-tree', 'at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+                    'source_tree_sha256': _src_sha,
+                    'superseded_source_tree_sha256': _locked_src_sha,
+                    'delta': _source_tree_delta(_locked_src, _src)}]
             lock.update({'manifest_sha256': _sha,
                          'manifest_path': os.path.abspath(manifest.get('_path') or FREEZE_MANIFEST),
                          'frozen_at': manifest.get('frozen_at'),
                          'locked_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+                         'source_tree': _src,
+                         'source_tree_sha256': _src_sha,
+                         'source_tree_bound_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
                          'code_semantics': L.CODE_SEMANTICS,
                          'note': 're-frozen under V12_REFREEZE=1: the previous plan is downgraded to exploratory (record it in the plan history)'})
             if _test_changed:
@@ -947,14 +1038,27 @@ def _check_or_write_freeze_lock_locked(outdir, manifest, test_ids_fp, stage='acc
             lock['train_fp'] = train_fp
             lock['history'] = list(lock.get('history') or []) + [{'stage': 'train-fp', 'at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'train_fp': train_fp}]
             _dirty = True
+        if _source_legacy and str(lock.get('stage') or '') == 'preaccess' and test_ids_fp is None:
+            # A pre-access lock written by an older driver has no source
+            # binding.  No test read has happened yet, so binding the current
+            # tree here is not a retrospective attestation.  An already
+            # accessed legacy lock stays visibly unbound (source_tree absent),
+            # and the source audit reports not_verifiable instead of "clean".
+            lock['source_tree'] = _src
+            lock['source_tree_sha256'] = _src_sha
+            lock['source_tree_bound_at'] = time.strftime('%Y-%m-%dT%H:%M:%S')
+            lock['history'] = list(lock.get('history') or []) + [{
+                'stage': 'source-tree-bind', 'at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+                'source_tree_sha256': _src_sha}]
+            _dirty = True
         if _dirty:
             L.atomic_write_json(lp, lock, indent=2)
-            if _manifest_changed or _test_changed or _train_changed:
+            if _manifest_changed or _test_changed or _train_changed or _source_changed:
                 print(f'[v12] freeze lock UPDATED: {lp} (manifest {str(_sha)[:12]}…; {len(lock["superseded"])} superseded plan(s) kept)')
             else:
                 print(f'[v12] freeze lock updated with the first-access slice/train fingerprint: {lp}')
         return lock
-    lock = {'manifest_sha256': _sha, 'manifest_path': os.path.abspath(manifest.get('_path') or FREEZE_MANIFEST), 'frozen_at': manifest.get('frozen_at'), 'locked_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'test_ids_fp': test_ids_fp, 'train_fp': train_fp, 'stage': stage, 'test_reads': (0 if test_ids_fp is None else 1), 'code_semantics': L.code_stamp(), 'history': [{'stage': stage, 'at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'test_ids_fp': test_ids_fp, 'train_fp': train_fp}], 'note': 'first test-split access: the plan may not change after this point (V12_REFREEZE=1 overrides consciously, downgrading the earlier round to exploratory)'}
+    lock = {'manifest_sha256': _sha, 'manifest_path': os.path.abspath(manifest.get('_path') or FREEZE_MANIFEST), 'frozen_at': manifest.get('frozen_at'), 'locked_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'test_ids_fp': test_ids_fp, 'train_fp': train_fp, 'stage': stage, 'test_reads': (0 if test_ids_fp is None else 1), 'source_tree': _src, 'source_tree_sha256': _src_sha, 'source_tree_bound_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'code_semantics': L.code_stamp(), 'history': [{'stage': stage, 'at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'test_ids_fp': test_ids_fp, 'train_fp': train_fp, 'source_tree_sha256': _src_sha}], 'note': 'first test-split access: the plan, test slice and measurement source may not change after this point (V12_REFREEZE=1 overrides consciously, downgrading the earlier round to exploratory)'}
     L.atomic_write_json(lp, lock, indent=2)
     print(f'[v12] freeze lock written: {lp} (manifest {_sha[:12]}…, stage {stage}, test_ids_fp {str(test_ids_fp)[:12]}…)')
     return lock
@@ -2628,7 +2732,7 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
         if not os.path.exists(_freeze_lock_path(_lock_dir)):
             raise SystemExit(f'[v12] REFUSE: {bylen_path} has admissible confirmation records but no freeze lock in {_lock_dir} — refuse to analyse a copied result that cannot be tied to the first test-split access')
         _adm_train_fps = {r.get('train_fp') for r in admitted.values() if isinstance(r.get('train_fp'), str) and r.get('train_fp')}
-        _check_or_write_freeze_lock(_lock_dir, manifest, unified_fp, stage='accessed',
+        _check_or_write_freeze_lock(_lock_dir, manifest, unified_fp, stage='analysis',
                                     train_fp=(next(iter(_adm_train_fps)) if len(_adm_train_fps) == 1 else None))
     _stat = manifest.get('statistics') or {}
     _alpha = float(_stat.get('alpha', 0.05))
