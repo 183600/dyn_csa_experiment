@@ -214,7 +214,11 @@ def v11_analysis(out='analysis_v11/stats.json'):
     comparisons = {}
 
     def add(name, panel_d, a, b, outdir):
-        V9.add_paired(comparisons, name, panel_d, a, b, who='v11 ', outdir=outdir)
+        # Method-vs-dense baseline claims: require matched capacity.  The
+        # matched arm stays a fair comparison; the raw `- full` arm is marked
+        # capacity-confounded instead of being read as a method advantage.
+        V9.add_paired(comparisons, name, panel_d, a, b, who='v11 ', outdir=outdir,
+                      require_param_match=True)
     add('scale384: csa_fixed - full', scale384, 'csa_fixed', 'full', 'results_lm_v5_scale')
     add('scale384: csa_fixed - full_sw128_matched', scale384, 'csa_fixed', 'full_sw128_matched', 'results_lm_v5_scale')
     out_d = {'probe': probe, 'crossover_panels': xo, 'crossover_fit': fit, 'scale384_panel': panel(scale384), 'comparisons': comparisons, 'holm': L.attach_holm(comparisons, family='v11 scale384 + seq2k comparisons')}
@@ -593,7 +597,8 @@ def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
             if 'omitted' in v:
                 A(f'| {k} | 0 | —（{v['omitted']}） | — |')
                 continue
-            A(f'| {k} | {v['n']} | {v['mean']:+.2f} ± {v.get('std', 0):.2f} | {v['p_exact_signflip']:.3f} |')
+            _cap = (' **容量未受控（raw only）**' if v.get('capacity_confounded') else '')
+            A(f'| {k} | {v['n']} | {v['mean']:+.2f} ± {v.get('std', 0):.2f} | {v['p_exact_signflip']:.3f}{_cap} |')
         A('')
     A('---')
     A('')

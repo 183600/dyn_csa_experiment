@@ -3285,6 +3285,27 @@ def t_key_exploratory_phases_declare_at_least_three_seeds():
     for _name in ('P5S2_CFG', 'P5S3_CFG'):
         _seeds = getattr(V12, _name).get('seeds')
         assert _seeds is not None and len(set(_seeds)) >= 3, (_name, _seeds)
+    # The supplementary drivers must not rely on a LATER driver to lift a key
+    # panel above the 3-seed floor: v8 alone used to schedule the 20k RoPE
+    # contrast at n=2 and v9 alone the top-k sweep at n=2.
+    import v8_supp as V8
+    import v9_supp as V9
+    import v11_supp as V11
+    v8_phases = {p[0]: p for p in V8.PHASES}
+    for _name in ('P1S', 'P2R'):
+        _seeds = v8_phases[_name][2]
+        assert _seeds is not None and len(set(_seeds)) >= 3, (_name, _seeds)
+    v9_phases = {p[0]: p for p in V9.PHASES}
+    for _name in ('P2T', 'P2S3'):
+        _seeds = v9_phases[_name][2]
+        assert _seeds is not None and len(set(_seeds)) >= 3, (_name, _seeds)
+    v11_phases = {p[0]: p for p in V11.PHASES}
+    for _name in ('P4SS', 'P4F', 'P4SL'):
+        _seeds = v11_phases[_name][3]
+        assert _seeds is not None and len(set(_seeds)) >= 3, (_name, _seeds)
+    for _fn in (V11.P4MT_CFG, V11.P4MP_CFG):
+        _seeds = _fn().get('seeds')
+        assert _seeds is not None and len(set(_seeds)) >= 3, (_fn.__name__, _seeds)
 
 
 def t_v10_holm_family_keeps_unmeasured_slots():
@@ -14343,6 +14364,47 @@ def t_seq2k_contrasts_carry_factor_declarations():
     assert 'omitted' in rec and rec.get('single_factor') is True and rec.get('factors') == ['index_topk'], rec
 
 
+def t_driver_pair_capacity_controls():
+    # A driver-level method-vs-dense contrast must not quote a p-value as a
+    # method advantage when the dense arm has a different parameter count.
+    # `add_paired` in both v8 and v9 now reuses the methodology-audit capacity
+    # definitions and marks the contrast instead of letting capacity masquerade
+    # as the module.
+    import v8_supp as V8
+    import v9_supp as V9
+    fp = 'steps1_sl8_bs1_nt10_lr0.0003_wd0.1_d8_L1_H1_Dh8_v16_wu1_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee1_es1_detcpu-eager_dfabc_csX'
+    knobs = L.training_knobs()
+
+    def _rec(seed, ppl, params):
+        return {'variant': 'x', 'seed': seed, 'run_cfg': fp, 'steps': 1,
+                'tokens_seen': 1, 'ppl': ppl, 'params': params,
+                'train_knobs': knobs}
+
+    panel = {}
+    for seed in (0, 1, 2):
+        panel.setdefault('method', {})[seed] = _rec(seed, 49.0, 1200)
+        panel.setdefault('tiny', {})[seed] = _rec(seed, 50.0, 1000)
+        panel.setdefault('match', {})[seed] = _rec(seed, 50.0, 1200)
+    for fn in (V9.add_paired, V8._add_paired):
+        comp = {}
+        fn(comp, 'cap', panel, 'method', 'tiny', require_param_match=True)
+        st = comp['cap']
+        assert st['param_controlled'] is False, st
+        assert st['capacity_confounded'] is True, st
+        assert st['method_claim_allowed'] is False, st
+        assert abs(st['param_relative_diff'] - 200.0 / 1200.0) < 1e-12, st
+        fn(comp, 'ok', panel, 'method', 'match', require_param_match=True)
+        st = comp['ok']
+        assert st['param_controlled'] is True, st
+        assert st['capacity_confounded'] is False, st
+        assert st['method_claim_allowed'] is True, st
+        # Without the opt-in the numbers remain available as a raw
+        # comparison; the capacity readout is still attached.
+        fn(comp, 'raw', panel, 'method', 'tiny')
+        st = comp['raw']
+        assert st['param_controlled'] is False and 'method_claim_allowed' not in st, st
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -14706,6 +14768,7 @@ def main():
     _check('L60 single-factor design gate verifies the shipped design and fails closed on drift', t_single_factor_design_gate_passes_and_fails_closed)
     _check('L61 frozen-manifest mechanism flags are machine-verified single-factor verdicts', t_frozen_manifest_mechanism_flags_are_verified_single_factor)
     _check('L62 seq2k sweep contrasts carry explicit factor declarations', t_seq2k_contrasts_carry_factor_declarations)
+    _check('L63 driver method-vs-dense pairs carry a capacity-control verdict', t_driver_pair_capacity_controls)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

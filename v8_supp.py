@@ -35,7 +35,11 @@ def make_guard():
     return g
 P1S_CFG = dict(L.RUN_SCALE, outdir='results_lm_v5_scale', variants=['full', 'full_matched', 'hybrid_dynamic'])
 P2R_CFG = dict(L.RUN_LONG, outdir='results_lm_v8_rope20k', variants=['csa_fixed_rope', 'full_rope'], matched=set(V.PARAM_MATCHED_V7), mlp_match_ref='csa_fixed_rope')
-PHASES = [('P1S', P1S_CFG, [0, 1, 2, 3]), ('P2R', P2R_CFG, [0, 1])]
+# Both panels start at the 3-seed reporting floor.  P2R used to schedule only
+# seeds 0/1 and relied on v9 to add seed 2; a v8-only run therefore reported a
+# key long-context contrast at n=2 (p floor 0.5).  v9's top-up remains
+# resume-safe and simply skips these cells.
+PHASES = [('P1S', P1S_CFG, [0, 1, 2, 3]), ('P2R', P2R_CFG, [0, 1, 2])]
 
 def run_phase(name, guard, par=None):
     import par as _par
@@ -55,7 +59,24 @@ def _ppl_by_seed(outdir, full=False):
 def _paired_records(outdir):
     return L.ppl_by_seed(outdir, full=True)
 
-def _add_paired(comparisons, name, panel, a, b, who='', outdir=None):
+def _arm_param_control(panel, a, b):
+    """Capacity readout for a driver-level paired contrast (same definitions
+    as the methodology audit; driver stats must not quote a missing-capacity
+    comparison as a method advantage)."""
+    _recs = {(v, '', s): r for v, by_seed in (panel or {}).items()
+             for s, r in (by_seed or {}).items() if isinstance(r, dict)}
+    _pa, _pb = L._params_of_arm(_recs, a), L._params_of_arm(_recs, b)
+    _rel, _ok = L._param_control(_recs, a, b)
+    _detail = L._param_control_detail(_recs, a, b)
+    _cap = L._param_capacity_controlled(_detail)
+    return {'params_a': _pa, 'params_b': _pb,
+            'param_relative_diff': _rel,
+            'param_controlled': (None if _ok is None else bool(_ok and _cap is not False)),
+            'param_capacity_controlled': _cap,
+            'param_breakdown': _detail}
+
+def _add_paired(comparisons, name, panel, a, b, who='', outdir=None,
+                require_param_match=False):
 
     def _omit(reason):
         print(f'[stats] {who}{name}: comparison OMITTED — {reason}')
@@ -91,6 +112,18 @@ def _add_paired(comparisons, name, panel, a, b, who='', outdir=None):
     if not dl:
         return _omit(f'no seed survived the run_cfg/steps checks ({len(common)} shared, {len(skipped)} rejected: {sorted(why)})')
     res = V.exact_sign_permutation(dl)
+    res.update(_arm_param_control(panel, a, b))
+    if require_param_match:
+        res['require_param_match'] = True
+        if res.get('param_controlled') is not True:
+            res['capacity_confounded'] = True
+            res['method_claim_allowed'] = False
+            print(f'[stats] {who}{name}: CAPACITY-CONFOUNDED — `{a}` and `{b}` are not '
+                  f'parameter-matched ({res.get("params_a")} vs {res.get("params_b")}); '
+                  'the delta/p may be quoted as a raw comparison, never as the method advantage')
+        else:
+            res['capacity_confounded'] = False
+            res['method_claim_allowed'] = True
     res['seeds'] = [s for s in common if s not in set(skipped)]
     res['n_skipped_config_mismatch'] = len(skipped)
     res['n_unstamped'] = unstamped
@@ -138,7 +171,11 @@ def v8_analysis(out='analysis_v8/stats.json'):
     comparisons = {}
 
     def add(name, panel, a, b, outdir):
-        _add_paired(comparisons, name, panel, a, b, who='v8 ', outdir=outdir)
+        # Every one of these is a method-vs-dense baseline claim: require the
+        # capacity guard so a raw `- full` delta cannot masquerade as a method
+        # advantage when the dense arm has ~13% fewer parameters.
+        _add_paired(comparisons, name, panel, a, b, who='v8 ', outdir=outdir,
+                    require_param_match=True)
     for a, b in [('csa_fixed', 'full'), ('csa_fixed', 'full_matched'), ('csa_fixed', 'full_sw128_matched'), ('csa_dynamic', 'full'), ('hybrid_dynamic', 'full')]:
         add(f'scale: {a} - {b}', scale, a, b, 'results_lm_v5_scale')
     add('rope20k: csa_fixed_rope - full_rope', rope20k, 'csa_fixed_rope', 'full_rope', 'results_lm_v8_rope20k')
@@ -150,7 +187,9 @@ def v8_analysis(out='analysis_v8/stats.json'):
         if 'omitted' in v:
             print(f'  {k:38s} omitted — {v['omitted']}')
             continue
-        print(f'  {k:38s} Δ={v['mean']:+7.2f} ± {v.get('std', 0):5.2f}  p(sign-flip)={v['p_exact_signflip']:.3f}  n={v['n']}')
+        _cap = ('  [CAPACITY-CONFOUNDED: raw comparison only]'
+                if v.get('capacity_confounded') else '')
+        print(f'  {k:38s} Δ={v['mean']:+7.2f} ± {v.get('std', 0):5.2f}  p(sign-flip)={v['p_exact_signflip']:.3f}  n={v['n']}{_cap}')
     return out_d
 
 def git_push(msg):

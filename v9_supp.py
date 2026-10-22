@@ -76,7 +76,11 @@ def make_guard():
     return g
 P2T_CFG = dict(L.RUN, outdir='results_lm_v9_seq2k', seq_len=2048, batch_size=1, steps=1500, variants=['csa_fixed_topk8', 'csa_fixed_topk32', 'csa_fixed_topk128', 'csa_fixed_topk512', 'csa_fix_m1'])
 P2S3_CFG = dict(V8.P2R_CFG)
-PHASES = [('P2T', P2T_CFG, [0, 1]), ('P2S3', P2S3_CFG, [2])]
+# Key panels start at the 3-seed reporting floor.  Later drivers add seeds
+# (v10 P3T adds 2/3 to the topk sweep); scheduling only 2 seeds here made a
+# standalone v9 report resolution-limited at p_floor=0.5.  Re-running these
+# phases is resume-safe, so listing the already-measured seeds costs nothing.
+PHASES = [('P2T', P2T_CFG, [0, 1, 2]), ('P2S3', P2S3_CFG, [0, 1, 2])]
 
 # P2T/P3T 扫描对照的因素声明（单因素契约的扫描版）。端点对照 topk8 - topk512
 # 只差 `index_topk`（单因素剂量响应）；两条 m1 对照同时改 block_size(4→1)、
@@ -140,7 +144,31 @@ def _seed_counts(panel, a, b, missing=()):
         return f'`{v}`: not in panel'
     return _one(a) + ' vs ' + _one(b)
 
-def add_paired(comparisons, name, panel, a, b, *, who='', outdir=None, factors=None):
+def _arm_param_control(panel, a, b):
+    """Capacity readout for a driver-level paired contrast.
+
+    `pair_reason` pins the optimizer / LR schedule / step and token budget, but
+    it deliberately says nothing about CAPACITY.  An ad-hoc comparison such as
+    `csa_fixed - full` (13% fewer parameters in `full`) therefore used to look
+    as controlled as the parameter-matched baseline while quoting a p-value.
+    Reuse the methodology-audit implementation so the driver and the audit
+    cannot drift: every seed record of an arm must expose the same total, and
+    the recorded breakdown must not disagree.
+    """
+    _recs = {(v, '', s): r for v, by_seed in (panel or {}).items()
+             for s, r in (by_seed or {}).items() if isinstance(r, dict)}
+    _pa, _pb = L._params_of_arm(_recs, a), L._params_of_arm(_recs, b)
+    _rel, _ok = L._param_control(_recs, a, b)
+    _detail = L._param_control_detail(_recs, a, b)
+    _cap = L._param_capacity_controlled(_detail)
+    return {'params_a': _pa, 'params_b': _pb,
+            'param_relative_diff': _rel,
+            'param_controlled': (None if _ok is None else bool(_ok and _cap is not False)),
+            'param_capacity_controlled': _cap,
+            'param_breakdown': _detail}
+
+def add_paired(comparisons, name, panel, a, b, *, who='', outdir=None, factors=None,
+               require_param_match=False):
 
     def _omit(reason):
         print(f'[stats] {who}{name}: comparison OMITTED — {reason}')
@@ -189,6 +217,21 @@ def add_paired(comparisons, name, panel, a, b, *, who='', outdir=None, factors=N
     if not dl:
         return _omit(f'no seed survived the run_cfg/steps checks ({len(common)} shared, {len(skipped)} rejected: {sorted(why)})')
     res = V.exact_sign_permutation(dl)
+    res.update(_arm_param_control(panel, a, b))
+    if require_param_match:
+        # A method-vs-baseline contrast is only controlled when capacity is
+        # matched.  Keep the measured delta visible but refuse to let it back a
+        # method claim; the caller/report must read `capacity_confounded`.
+        res['require_param_match'] = True
+        if res.get('param_controlled') is not True:
+            res['capacity_confounded'] = True
+            res['method_claim_allowed'] = False
+            print(f'[stats] {who}{name}: CAPACITY-CONFOUNDED — `{a}` and `{b}` are not '
+                  f'parameter-matched ({res.get("params_a")} vs {res.get("params_b")}); '
+                  'the delta/p may be quoted as a raw comparison, never as the method advantage')
+        else:
+            res['capacity_confounded'] = False
+            res['method_claim_allowed'] = True
     if factors:
         res.update(factors)
     res['seeds'] = [s for s in common if s not in set(skipped)]
@@ -205,14 +248,21 @@ def v9_analysis(out='analysis_v9/stats.json'):
     abs_long_f = _paired_records('results_lm_v3_long')
     comparisons = {}
 
-    def add(name, panel, a, b, outdir):
+    def add(name, panel, a, b, outdir, *, require_param_match=False):
         add_paired(comparisons, name, panel, a, b, who='v9 ', outdir=outdir,
-                   factors=SEQ2K_CONTRAST_FACTORS.get(name))
+                   factors=SEQ2K_CONTRAST_FACTORS.get(name),
+                   require_param_match=require_param_match)
     add('seq2k(bs1): topk8 - m1', seq2k, 'csa_fixed_topk8', 'csa_fix_m1', 'results_lm_v9_seq2k')
     add('seq2k(bs1): topk512 - m1', seq2k, 'csa_fixed_topk512', 'csa_fix_m1', 'results_lm_v9_seq2k')
     add('seq2k(bs1): topk8 - topk512', seq2k, 'csa_fixed_topk8', 'csa_fixed_topk512', 'results_lm_v9_seq2k')
-    add('rope20k: csa_fixed_rope - full_rope', rope20k, 'csa_fixed_rope', 'full_rope', 'results_lm_v8_rope20k')
-    add('long20k(abs): csa_fixed - full', abs_long_f, 'csa_fixed', 'full', 'results_lm_v3_long')
+    # Method-vs-dense comparisons are baseline claims: they must be
+    # parameter-matched, otherwise the delta mixes the architecture with a
+    # capacity difference (the dense rope twin is matched; the abs-PE `full`
+    # long-run arm is not, so it is marked capacity-confounded).
+    add('rope20k: csa_fixed_rope - full_rope', rope20k, 'csa_fixed_rope', 'full_rope',
+        'results_lm_v8_rope20k', require_param_match=True)
+    add('long20k(abs): csa_fixed - full', abs_long_f, 'csa_fixed', 'full',
+        'results_lm_v3_long', require_param_match=True)
     panel = V8._panel_block
     out_d = {'seq2k_bs1_panel': panel(seq2k), 'seq2k_bs3_panel_historical': panel(seq2k_v7), 'rope20k_panel': panel(rope20k), 'comparisons': comparisons, 'holm': L.attach_holm(comparisons, family='v9 seq2k + rope20k + long20k')}
     out_d = L.stamped_analysis('v9_analysis', out_d, outdir=(os.path.dirname(out) or '.'), name=os.path.basename(out))
@@ -221,7 +271,9 @@ def v9_analysis(out='analysis_v9/stats.json'):
         if 'omitted' in v:
             print(f'  {k:38s} omitted — {v['omitted']}')
             continue
-        print(f'  {k:38s} Δ={v['mean']:+7.2f} ± {v.get('std', 0):5.2f}  p(sign-flip)={v['p_exact_signflip']:.3f}  n={v['n']}')
+        _cap = ('  [CAPACITY-CONFOUNDED: raw comparison only]'
+                if v.get('capacity_confounded') else '')
+        print(f'  {k:38s} Δ={v['mean']:+7.2f} ± {v.get('std', 0):5.2f}  p(sign-flip)={v['p_exact_signflip']:.3f}  n={v['n']}{_cap}')
     return out_d
 
 def _fmt_pm(cell, std=None):

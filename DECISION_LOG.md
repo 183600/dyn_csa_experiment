@@ -832,3 +832,35 @@ one conservative note (allblocks); mutating the manifest to flag the main
 kind-swap comparison as mechanism evidence makes the preflight REFUSE. New
 CPU tests cover the pass case, both fail-closed drifts, the flag-consistency
 refusal and the sweep labeling.
+
+## 2026-10-22 — driver-level capacity control + standalone seed floor (no new runs)
+
+Zero-GPU driver/statistics hardening; no panel result, frozen manifest, test
+split, README or CI configuration was touched.
+
+(1) **Capacity control on ad-hoc driver contrasts.** `pair_reason` pins the
+optimizer / LR schedule / step and token budget, but the v8/v9/v11 statistical
+drivers built method-vs-dense comparisons with their own `add_paired` helpers
+and quoted a p-value for `csa_fixed - full` even though plain `full` has about
+13% fewer parameters than `csa_fixed` (measured on the d=384 panel). The helpers
+now attach `params_a` / `params_b` / `param_relative_diff` /
+`param_controlled` / `param_capacity_controlled` using the same
+`_param_control` + `_param_control_detail` definitions as the methodology
+audit, and method-vs-baseline calls opt into `require_param_match=True`. An
+unmatched (or unverifiable) pair keeps its raw delta/p but is marked
+`capacity_confounded=True`, `method_claim_allowed=False`, and is labelled
+"raw comparison only" in the console/v11 report. The parameter-matched dense
+arm remains a fair baseline; `full_matched` / `full_sw128_matched` are checked
+by the same gate rather than assumed.
+
+(2) **Standalone seed floor.** v8 P2R scheduled only seeds 0/1 and v9 P2T only
+0/1, relying on a later driver to lift the key long-context / top-k panels to
+n=3. A v8-only or v9-only run therefore reported those comparisons at n=2
+(exact sign-flip p floor 0.5), below the project's own 3-seed reporting floor.
+Both phases now schedule seeds 0-2, and v9 P2S3 lists the full 0-2 set (resume
+skips already-measured cells), so each driver can stand alone at the floor.
+Later seed top-ups remain resume-safe.
+
+Verification: new CPU test L63 checks both driver implementations for the
+matched/unmatched/unverifiable capacity verdicts; the extended seed-plan test
+covers v8/v9/v11 phases. `python test_review_fixes.py` passes 363/363.
