@@ -2503,3 +2503,112 @@ python test_review_fixes.py     # L121 大行分块 + MemoryError 回退；L122 
 python test_open_block.py       # 分块与开块回归
 python v12_supp.py plan         # 冻结预检不变：72/72、6 个主比较
 ```
+
+## 48. 运行顺序也是实验设计变量：按种子分块并随机化
+
+### 48.1 问题：配对检验假设了「同一时间块」而驱动没有保证它
+
+精确符号翻转检验的交换性前提（§20）要求同一种子下两臂除臂本身外一切
+随机因素相同。代码把数据顺序、初始化 RNG、评测行与腐坏网格都按种子对齐
+了，但**日历时间**从未进入设计的机器检查：`v7_supp.run_lenphase`
+（v12 P5C 的训练入口）原来的单元格顺序是
+`[(v, seed) for v in variants for seed in seeds]`，即「臂 A 的全部种子跑完，
+再跑臂 B 的全部种子」。同一 pair 的两臂因此落在相隔数小时甚至数天的两个
+机器时间块里；驱动更新、GPU 温度/降频、邻居负载、集群镜像变化都可能制造
+一个与臂完全共线的差异，而逐种子配对检验无法把这种差异与臂效应分开。
+这不是「p 值不够小」的问题，是设计层面的混杂。
+
+通用 `exp_lib.run()` 的 `_plan_run` 恰好是 seed-major（同一种子的各臂相邻），
+说明两个驱动早已不一致；但即使是 seed-major，固定不变的臂顺序仍可能把
+「每个 block 的第一个位置」与某个臂绑定（例如基线总是先跑），把预热/缓存
+效应读成臂效应。因此需要的不只是「改成 seed-major」，而是**完整区组 +
+位置随机化**。
+
+### 48.2 设计：随机化完整区组（一个种子一个 block）
+
+`exp_lib.blocked_run_order(cells, block_key=..., seed=...)` 实现：
+
+1. 每个 block（默认 `seed`）内的单元格连续执行，使同一 pair 的两臂尽量
+   处在同一机器时间块；
+2. block 内顺序由一个**稳定的 SHA-256 置换**决定，不依赖 Python 的
+   `hash()`（后者每个进程随机化，会让 resume 得到不同计划）；
+3. 当每个 block 含同一组 treatment 时，使用「随机基排列 + 逐 block 循环
+   旋转」：`offset = (design_seed + block_index) % n_treatments`。这样在
+   block 数 ≥ 臂数时，每个臂在每个位置出现次数之差不超过 1；不是每个
+   block 独立洗牌（独立洗牌可能恰好让某臂总在第一，仍是系统性顺序效应）。
+4. block 顺序按键排序（不是随机），保证并行/续跑看到同一计划；设计种子
+   固定为面板第一个种子，因此同一 `(variants, seeds)` 的 `run_order.json`
+   可复现。
+
+`exp_lib.build_run_order_plan` 把计划写成 `run_order.json`（在
+`results_*/` 内，已被 `.gitignore` 覆盖），字段包括 `design`
+（name/block/design_seed/position_balance）、`variants`、`blocks`（每个
+block 的臂顺序）、`planned_cells`、`cell_blocks` 与 `cell_variants`。
+计划对**全部声明单元格**生成，而不是只对 resume 后待跑的单元格生成，
+否则续跑会重新洗牌、让实际顺序与最初计划不一致。
+
+入口接线：
+
+- `v7_supp.run_lenphase`（v12 P5C 使用）先写计划，再按 `planned_cells`
+  的顺序执行；`_write_phase_manifest(planned_cells=...)` 也使用同一顺序。
+- `exp_lib.run()`（v6/v8/v9/v10/m0 等通用面板）在 `_plan_run` 之后写同一
+  计划，并把待跑单元格按计划顺序排序；训练数值、resume 键和 `run_cfg`
+  均不变。
+
+### 48.3 审计：计划完整区组 + 实际顺序 + arm-major 硬失败
+
+`audit_gates.py run_order`（零 GPU）对每个 `results_*` 目录：
+
+- 读 `run_order.json`，检查每个 block 是否含全部臂各一次（完整区组）、
+  每个臂的位置计数是否平衡、`design.name` 是否是声明的随机化设计；
+- 读 `experiments.jsonl` 的 `kind='cell'` / `status='ok'` 事件，按
+  `started_at` 重建实际顺序；同一单元格重训时取最后一次开始时间（resume
+  合法，不应被误报为重复）；
+- **arm-major 硬失败**：若完整实际序列的臂游程数等于臂数（A 的全部种子
+  连续，再 B 的全部种子连续……），即使 `run_order.json` 声称是区组设计，
+  也判 fail——这说明驱动没有执行计划；
+- 无 `run_order.json` 时从事件推断顺序：能证明是 arm-major 则 fail，
+  否则报 `not_verifiable_locally`，绝不把「没有计划」写成「顺序没问题」；
+- 实际顺序偏离计划排列只给 warning（并行调度可以合法地改变开始顺序），
+  完整区组与 arm-major 判定不受并行影响。
+
+该审计不改变任何 PPL、种子、终点、α、Holm 族或冻结清单；它只把
+「时间是否是替代解释」变成可复核的设计读数。对已经用旧顺序跑完的面板，
+审计会如实报 arm-major / not_verifiable，而不会追溯性改写其结果；新面板
+从下一次运行起使用区组计划。
+
+### 48.4 入口与验证
+
+```bash
+python test_review_fixes.py       # L123 计划/位置平衡/畸形输入；L124 审计的区组、
+                                  #     重训去重、arm-major、无计划不可核验
+python audit_gates.py run_order   # 零 GPU：计划 + 实际顺序审计
+python v12_supp.py plan           # 冻结预检不变：72/72、6 个主比较
+```
+
+边界：48 是运行顺序的设计与审计，不触碰训练/评测数值路径、
+`CODE_SEMANTICS`、`confirmation_frozen.json` 或任何冻结臂/种子/终点；
+`run_order.json` 只存在于被忽略的结果目录，证据归档时随 `results_*/`
+一起打包。
+
+## 49. 实验设计审查的剩余边界（不在本轮改动）
+
+§48 修复的是运行时间混杂；下列设计/准备问题仍是显式边界，不应被
+「已有大量统计门槛」掩盖：
+
+1. **测试切片是前缀而不是概率样本。** 冻结的 48 篇文档是
+   `wiki.test.raw` 中前若干条非重复行；清单已拒绝总体推断（<64 文档）并把
+   估计量限定为该冻结切片，所以这是外部有效性边界，不是隐藏缺陷。未来若
+   要做总体推断，应在冻结前用记录种子的、按长度分层的文档抽样，并把当前
+   前缀切片保留为可复现锚点。
+2. **分析代码本身没有被冻结锁哈希。** 清单钉住 test/correction/endpoint/
+   alpha/decision rule，P5T 也检查这些声明字符串；但测试访问后的分析实现
+   改动不会改变 `manifest_sha256` 或 `CODE_SEMANTICS`。下一次冻结可在首次
+   test 读取前写入分析函数的规范化摘要。
+3. **探索性面板的 look history 不是机器可读的。** 补种子记录在
+   decision log、registry 也保证探索性面板不能升级为确认性，但没有逐面板
+   的 `max_seeds` / look count。前瞻性的 panel analysis plan 能让「看了
+   几次再决定继续」可见，即使仍只作探索性证据。
+4. **实际显著性仍依赖判断。** 报告拒绝 `|mean| <= std` 并给出相对效应/
+   噪声，但没有预先注册的最小实际效应量；若决策是关于实际而非仅统计
+   优势，未来冻结应写明 SESOI（smallest effect size of interest）。

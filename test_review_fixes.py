@@ -17784,6 +17784,145 @@ def t_ladder_tier_discovery_is_numeric_and_complete():
     assert {'S1', 'S2', 'S3', 'S4'}.issubset(set(M0._ladder_tier_names()))
 
 
+def t_run_order_is_blocked_randomized_and_position_balanced():
+    # The frozen P5C lenphase used to run every seed of arm A before arm B,
+    # which makes arm and calendar time perfectly confounded.  The design
+    # helper must be deterministic, complete, seed-blocked and position
+    # balanced without changing the (arm, seed) set.
+    variants = ['csa_fixed_rope', 'full_rope', 'full_rope_sink', 'csa_fixed_rope_nosink']
+    seeds = [0, 1, 2, 3]
+    cells = [(v, s) for s in seeds for v in variants]
+    order = L.blocked_run_order(cells, block_key=lambda c: c[1], seed=11)
+    assert len(order) == len(cells) and set(order) == set(cells)
+    assert order == L.blocked_run_order(cells, block_key=lambda c: c[1], seed=11), 'order must be deterministic'
+    # Every seed block is contiguous and contains every arm exactly once.
+    blocks = []
+    for cell in order:
+        if not blocks or blocks[-1][0] != cell[1]:
+            blocks.append((cell[1], []))
+        blocks[-1][1].append(cell[0])
+    assert [b for b, _ in blocks] == seeds
+    for _b, vs in blocks:
+        assert sorted(vs) == sorted(variants), vs
+    # Position balance: across the four blocks every arm occupies each slot once.
+    for v in variants:
+        slots = [vs.index(v) for _b, vs in blocks]
+        assert sorted(slots) == list(range(len(blocks))), (v, slots)
+    assert L.blocked_run_order(cells, block_key=lambda c: c[1], seed=12) != order, 'design seed must matter'
+    # Malformed cells fail closed instead of silently training a duplicate.
+    for bad in ([('a', 0), ('a', 0)], [{'variant': 'a', 'seed': 0}]):
+        try:
+            L.blocked_run_order(bad, block_key=lambda c: c[1] if isinstance(c, tuple) else 0)
+        except (TypeError, ValueError):
+            pass
+        else:
+            raise AssertionError(f'bad run-order cells accepted: {bad!r}')
+    try:
+        L.blocked_run_order([('a', 0)], block_key=lambda c: c[1], seed='0')
+    except TypeError:
+        pass
+    else:
+        raise AssertionError('a string run-order seed must be rejected')
+    plan = L.build_run_order_plan(cells, block_key=lambda c: c[1], seed=11)
+    assert plan['kind'] == 'run_order' and plan['schema'] == L.RUN_ORDER_SCHEMA
+    assert plan['design']['randomized'] is True
+    assert len(plan['planned_cells']) == len(cells)
+    with tempfile.TemporaryDirectory() as d:
+        path = L.write_run_order(d, plan)
+        with open(path, encoding='utf-8') as f:
+            assert json.load(f)['planned_cells'] == plan['planned_cells']
+    rep = L.run_order_balance(plan)
+    assert rep['status'] == 'ok' and rep['design_ok'] is True, rep
+    assert rep['complete_blocks'] == len(seeds) and rep['arm_major'] is False
+    assert rep['position_balanced'] is True
+    # A complete actual execution in the planned order is accepted.
+    rep = L.run_order_balance(plan, plan['planned_cells'])
+    assert rep['status'] == 'ok', rep
+    # An incomplete/resumed panel is still describable.
+    rep = L.run_order_balance(plan, plan['planned_cells'][:6])
+    assert rep['status'] == 'ok' and rep['actual']['complete'] is False, rep
+    # Arm-major design (one arm per block) must be a hard failure.
+    arm_major = {
+        'kind': 'run_order', 'schema': 1,
+        'design': {'name': 'randomized_complete_block_balanced', 'randomized': True},
+        'variants': variants,
+        'blocks': {str(i): [v] for i, v in enumerate(variants)},
+        'planned_cells': [], 'cell_blocks': {}, 'cell_variants': {},
+    }
+    rep = L.run_order_balance(arm_major)
+    assert rep['status'] == 'fail' and rep['arm_major'] is True, rep
+    # A missing variant in one block breaks the complete-block contract.
+    broken = dict(plan)
+    broken['blocks'] = dict(plan['blocks'])
+    first = next(iter(broken['blocks']))
+    broken['blocks'][first] = broken['blocks'][first][:-1]
+    assert L.run_order_balance(broken)['status'] == 'fail'
+
+
+def t_run_order_audit_detects_temporal_confounding():
+    # The zero-GPU audit must (a) accept a blocked plan executed in blocks,
+    # (b) fail a completed arm-major legacy run, and (c) say
+    # not_verifiable_locally when no design artifact exists.
+    variants = ['a', 'b', 'c', 'd']
+    seeds = [0, 1, 2, 3]
+    cells = [(v, s) for s in seeds for v in variants]
+    plan = L.build_run_order_plan(cells, block_key=lambda c: c[1], seed=3)
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, 'run_order.json'), 'w', encoding='utf-8') as f:
+            json.dump(plan, f)
+        # Execute exactly the plan (serial start order).
+        with open(os.path.join(d, 'experiments.jsonl'), 'w', encoding='utf-8') as f:
+            for i, lab in enumerate(plan['planned_cells']):
+                v, s = lab.rsplit('::seed', 1)
+                f.write(json.dumps({'kind': 'cell', 'status': 'ok', 'variant': v,
+                                    'seed': int(s),
+                                    'started_at': f'2026-01-01T00:{i:02d}:00'}) + '\n')
+        rep = A.audit_run_order([d])
+        rec = rep['panels'][os.path.basename(d)]
+        assert rep['status'] == 'ok' and rec['status'] == 'ok', rec
+        assert rec['actual']['complete'] is True
+        # A resumed/retrained cell appears twice; the latest execution wins
+        # instead of being reported as a duplicate order.
+        with open(os.path.join(d, 'experiments.jsonl'), 'a', encoding='utf-8') as f:
+            lab = plan['planned_cells'][0]
+            v, s = lab.rsplit('::seed', 1)
+            f.write(json.dumps({'kind': 'cell', 'status': 'ok', 'variant': v,
+                                'seed': int(s),
+                                'started_at': '2026-01-01T00:59:00'}) + '\n')
+        rep = A.audit_run_order([d])
+        assert rep['panels'][os.path.basename(d)]['status'] == 'ok'
+        # Legacy arm-major: all seeds of arm A, then all seeds of arm B.
+        with open(os.path.join(d, 'experiments.jsonl'), 'w', encoding='utf-8') as f:
+            i = 0
+            for v in variants:
+                for s in seeds:
+                    f.write(json.dumps({'kind': 'cell', 'status': 'ok', 'variant': v,
+                                        'seed': s,
+                                        'started_at': f'2026-01-02T00:{i:02d}:00'}) + '\n')
+                    i += 1
+        rep = A.audit_run_order([d])
+        rec = rep['panels'][os.path.basename(d)]
+        assert rep['status'] == 'fail' and rec['status'] == 'fail', rec
+        assert rec['arm_major'] is True
+        assert any('arm-major' in p for p in rec['problems'])
+        # No plan: the legacy order is classified but the design is not claimed.
+        os.remove(os.path.join(d, 'run_order.json'))
+        rep = A.audit_run_order([d])
+        rec = rep['panels'][os.path.basename(d)]
+        assert rec['status'] == 'fail' and rec['arm_major'] is True, rec
+        # No plan and no events: explicitly unverifiable, never "ok".
+        os.remove(os.path.join(d, 'experiments.jsonl'))
+        rep = A.audit_run_order([d])
+        assert rep['status'] == 'not_verifiable_locally'
+        assert rep['panels'][os.path.basename(d)]['status'] == 'not_verifiable_locally'
+        # A file that exists but is not a plan object fails closed.
+        with open(os.path.join(d, 'run_order.json'), 'w', encoding='utf-8') as f:
+            f.write('[]')
+        rep = A.audit_run_order([d])
+        assert rep['status'] == 'fail'
+        assert rep['panels'][os.path.basename(d)]['status'] == 'fail'
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -18244,6 +18383,8 @@ def main():
     _check('L120 confirmation drops init-mismatched pairs and never vacuous-passes', t_v12_init_core_fp_pairing)
     _check('L121 uniform segmentation stays NumPy at scale and OOM falls back', t_scale_uniform_segment_and_oom_fallback)
     _check('L122 ladder parameter tiers are discovered in numeric order', t_ladder_tier_discovery_is_numeric_and_complete)
+    _check('L123 run order is blocked randomized and position balanced', t_run_order_is_blocked_randomized_and_position_balanced)
+    _check('L124 run-order audit detects arm-major temporal confounding', t_run_order_audit_detects_temporal_confounding)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

@@ -1889,3 +1889,59 @@ geometry builders return `None` on a simulated `MemoryError`) and L122
 environment skips; `python test_open_block.py` passes; `python v12_supp.py
 plan` still admits 72/72 synthetic frozen records with the same six
 comparisons.
+
+## 2026-10-22 — run order as a design variable (blocked randomization; no new runs)
+
+Zero-GPU design hardening; no training run, frozen manifest byte, test split,
+`CODE_SEMANTICS`, README or CI configuration was touched.
+
+**Problem.** The exact paired sign-flip test assumes within-seed exchangeability,
+but calendar time was never a controlled design variable. `v7_supp.run_lenphase`
+(the training entry point used by v12 P5C) scheduled
+`[(v, seed) for v in variants for seed in seeds]`: every seed of arm A, then
+every seed of arm B. The two arms of each pair were therefore trained in
+different machine/time blocks, so a driver update, thermal throttling, a noisy
+neighbour or a changed image could be perfectly confounded with arm. The
+generic `exp_lib.run()` already happened to be seed-major, but a fixed arm
+order still binds "first slot" to one arm and can turn a warm-up/cache effect
+into an arm effect. This is a design defect, not a p-value problem.
+
+**Change.** New pure helpers `exp_lib.blocked_run_order` /
+`build_run_order_plan` / `run_order_balance` / `write_run_order`:
+
+- one block per seed, cells inside a block contiguous;
+- a stable SHA-256 base permutation (not Python's per-process `hash`) and a
+  per-block cyclic rotation, so each arm occupies each slot roughly equally
+  when blocks >= arms;
+- the plan is built over ALL declared cells, so a resume cannot reshuffle it;
+  `run_order.json` records the design, `blocks`, `planned_cells`,
+  `cell_blocks` and `cell_variants` (inside the gitignored results dir);
+- `v7_supp.run_lenphase` and `exp_lib.run()` now execute in plan order; resume
+  keys, seeds, training values and `run_cfg` are unchanged.
+
+New `audit_gates.py run_order` (also included in `run_report`) checks complete
+blocks, position balance and the actual order from `experiments.jsonl`. A
+complete arm-major execution is a hard FAIL even when the plan claims a blocked
+design; a missing plan is `not_verifiable_locally`, never "order is fine". A
+retrained cell is deduplicated to its last start, and parallel start-order
+deviations are warnings only, because grouping (not wall-clock ranking) is what
+the design guarantees.
+
+**Boundary.** This changes only the order in which the same `(variant, seed)`
+cells run and adds design metadata. It does not change a PPL, seed, recipe,
+endpoint, alpha, Holm family, frozen arm or decision rule, and no
+`CODE_SEMANTICS` bump is needed. Legacy panels keep their results; the audit
+reports arm-major / unverifiable rather than retroactively rewriting them.
+`run_order.json` is an artifact under `results_*/`, so it travels with the
+evidence archive.
+
+**Verification.** New CPU tests L123 (deterministic complete blocks, position
+balance, differing design seeds, duplicate/unhashable/string-seed rejection,
+plan-level audit and malformed/arm-major plans) and L124 (audit accepts a
+planned execution, deduplicates a retrained cell, fails a completed arm-major
+run, and returns not_verifiable when no plan/events exist).
+`python test_review_fixes.py` passes 458/461 with the same 3 DataLoader
+environment skips; `python audit_gates.py run_order` reports
+`not_verifiable_locally` on this source-only tree (no `results_*/` artifacts);
+`python v12_supp.py plan` still admits 72/72 synthetic frozen records with the
+same six comparisons.

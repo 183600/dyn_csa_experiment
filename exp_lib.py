@@ -34940,6 +34940,413 @@ def _run_fp(cfg, d, n_layers, n_heads, d_head, vocab, train_ids, val_batch, devi
     return f'steps{cfg['steps']}_sl{cfg['seq_len']}_bs{cfg['batch_size']}_nt{cfg['n_train_tokens']}_lr{cfg['lr']}_wd{cfg['weight_decay']}_d{d}_L{n_layers}_H{n_heads}_Dh{d_head}_v{vocab}_wu{cfg['warmup']}_cl{cfg['comp_lambda']}_dlm{cfg.get('delta_lr_mult', 10.0)}_mt{_mkey}_mr{cfg.get('mlp_match_ref', 'csa_dynamic')}_ee{cfg.get('eval_every', 0)}_es{cfg.get('eval_subset', 128)}_det{determinism_label()}_df{_ids_fp(train_ids)}-{_ids_fp(np.ascontiguousarray(val_batch).reshape(-1))}{_de_tok}{_es_tok}_tk{_tk}_amp{_amp}_eb{int(_eb)}_ae{_ae}{_am_tok}_cs{code_stamp()}'
 
 
+# ---------------------------------------------------------------------------
+# Run-order design: calendar time is a nuisance factor, not a treatment
+# ---------------------------------------------------------------------------
+# A panel that runs every seed of arm A and only then every seed of arm B has
+# arm perfectly confounded with time: driver updates, thermal state, a noisy
+# neighbour or a changed cluster image can all produce a between-arm gap that
+# the paired seed test will read as an arm effect.  The design below makes the
+# run order explicit: a deterministic randomized complete-block order with one
+# block per seed (so both arms of every pair are trained close together), plus
+# a position rotation that prevents one arm from always occupying the same
+# slot inside a block.  It is a design choice, not a measurement change; the
+# seed-level RNG and every recorded value are untouched.
+
+RUN_ORDER_SCHEMA = 1
+RUN_ORDER_DESIGNS = ('randomized_complete_block_balanced', 'inferred_no_plan')
+
+
+def _run_order_u64(*parts):
+    """Stable 64-bit draw: Python's hash() is randomized per process."""
+    raw = '\x1f'.join(str(p) for p in parts).encode('utf-8')
+    return int.from_bytes(hashlib.sha256(raw).digest()[:8], 'big')
+
+
+def _run_order_default_label(cell, block_key):
+    if isinstance(cell, (tuple, list)) and len(cell) >= 2:
+        return f'{cell[0]}::seed{block_key(cell)}'
+    return f'{cell}::seed{block_key(cell)}'
+
+
+def blocked_run_order(cells, *, block_key, seed=0, balance_positions=True,
+                      balance_key=None):
+    """Return a deterministic randomized complete-block run order.
+
+    ``block_key(cell)`` names the block (normally the seed).  Cells inside a
+    block are run contiguously; the block order itself is sorted by key so a
+    resumed or parallel pass sees the same plan.  ``balance_key(cell)`` names
+    the within-block treatment (normally the arm), which is what position
+    balance rotates.  It defaults to the first element of a ``(variant, seed)``
+    tuple.
+
+    When every block contains the same set of treatment keys,
+    ``balance_positions`` uses a seeded base permutation plus a per-block
+    rotation, so no arm always occupies the first slot (a fixed "first arm is
+    always the baseline" order would leave a warm-up order effect confounded
+    with arm).  Otherwise each block is shuffled independently with the same
+    stable hash.
+
+    The function is pure and deterministic: the same cells, block key and
+    design seed always give the same order, independent of ``PYTHONHASHSEED``.
+    It never changes a training value; each cell still seeds its own RNG.
+    """
+    if not callable(block_key):
+        raise TypeError('block_key must be callable')
+    if isinstance(seed, bool) or not isinstance(seed, numbers.Integral):
+        raise TypeError(f'run-order seed must be an integer, got {seed!r}')
+    seed = int(seed)
+    try:
+        raw = [tuple(c) if isinstance(c, list) else c for c in cells]
+    except TypeError as e:
+        raise TypeError(f'cells must be an iterable of hashable cells: {e}') from e
+    if not raw:
+        return []
+    groups = collections.OrderedDict()
+    seen = set()
+    for cell in raw:
+        try:
+            hash(cell)
+        except TypeError as e:
+            raise TypeError(
+                f'run-order cells must be hashable tuples (got '
+                f'{type(cell).__name__}); a dict/list cell cannot be a resume '
+                f'identity') from e
+        if cell in seen:
+            raise ValueError(f'duplicate run-order cell {cell!r}; training it '
+                             'twice would corrupt the (arm, seed) identity')
+        seen.add(cell)
+        key = block_key(cell)
+        try:
+            hash(key)
+        except TypeError as e:
+            raise TypeError(f'block key for {cell!r} must be hashable') from e
+        groups.setdefault(key, []).append(cell)
+    keys = list(groups)
+    try:
+        keys.sort()
+    except TypeError:
+        keys.sort(key=repr)
+
+    def _treatment(cell):
+        if balance_key is not None:
+            return balance_key(cell)
+        if isinstance(cell, (tuple, list)) and cell:
+            return cell[0]
+        return cell
+
+    ref = max(groups.values(), key=len)
+    ref_treatments = [_treatment(c) for c in ref]
+    try:
+        hash(tuple(ref_treatments))
+    except TypeError as e:
+        raise TypeError('balance_key values must be hashable') from e
+    if len(set(ref_treatments)) != len(ref_treatments):
+        raise ValueError(
+            'balance_key is not unique inside a block; the position-rotation '
+            'design cannot identify the cell to place')
+    treatment_set = set(ref_treatments)
+    same_sets = all(
+        len(g) == len(ref)
+        and {_treatment(c) for c in g} == treatment_set
+        for g in groups.values())
+    base = list(ref_treatments)
+    for i in range(len(base) - 1, 0, -1):
+        j = _run_order_u64(seed, 'base', i) % (i + 1)
+        base[i], base[j] = base[j], base[i]
+    out = []
+    for bi, key in enumerate(keys):
+        group = list(groups[key])
+        if balance_positions and same_sets and len(base) > 1:
+            by_treatment = {_treatment(c): c for c in group}
+            if len(by_treatment) != len(group):
+                raise ValueError(f'block {key!r} has duplicate treatment keys')
+            offset = (seed + bi) % len(base)
+            rotated = base[offset:] + base[:offset]
+            group = [by_treatment[t] for t in rotated]
+        elif len(group) > 1:
+            for i in range(len(group) - 1, 0, -1):
+                j = _run_order_u64(seed, repr(key), i) % (i + 1)
+                group[i], group[j] = group[j], group[i]
+        out.extend(group)
+    return out
+
+
+def build_run_order_plan(cells, *, block_key, seed=0, block_name='seed',
+                         variant_key=None, label=None,
+                         balance_positions=True, balance_key=None,
+                         design_name='randomized_complete_block_balanced',
+                         created_at=None):
+    """Build the JSON-safe plan written next to a panel's summary.
+
+    Only the plan is new metadata; the caller still trains the same cells with
+    the same seeds and hyperparameters.  ``blocks`` records the within-block
+    order and ``planned_cells`` the flat order, so a later audit can check both
+    the design and the actual event order without re-deriving them.
+    """
+    if design_name not in RUN_ORDER_DESIGNS:
+        raise ValueError(f'unknown run-order design {design_name!r}')
+    raw = [tuple(c) if isinstance(c, list) else c for c in cells]
+    if not raw:
+        raise ValueError('a run-order plan needs at least one cell')
+    ordered = blocked_run_order(raw, block_key=block_key, seed=seed,
+                                balance_positions=balance_positions,
+                                balance_key=balance_key)
+
+    def _variant(cell):
+        if variant_key is not None:
+            return str(variant_key(cell))
+        if isinstance(cell, (tuple, list)) and cell:
+            return str(cell[0])
+        return str(cell)
+
+    def _label(cell):
+        return _run_order_default_label(cell, block_key) if label is None else str(label(cell))
+
+    labels = [_label(c) for c in ordered]
+    if len(set(labels)) != len(labels):
+        raise ValueError('run-order labels are not unique; a label is the '
+                         'cell identity used by the audit')
+    variants = []
+    blocks = collections.OrderedDict()
+    cell_blocks = {}
+    cell_variants = {}
+    for cell in ordered:
+        v = _variant(cell)
+        b = str(block_key(cell))
+        if v not in variants:
+            variants.append(v)
+        blocks.setdefault(b, []).append(v)
+        cell_blocks[_label(cell)] = b
+        cell_variants[_label(cell)] = v
+    _same_blocks = all(
+        len(vs) == len(variants) and set(vs) == set(variants)
+        for vs in blocks.values())
+    _pos_policy = ('cyclic_base_rotation'
+                   if balance_positions and _same_blocks
+                   else 'independent_block_shuffle')
+    return {
+        'kind': 'run_order',
+        'schema': RUN_ORDER_SCHEMA,
+        'created_at': created_at or time.strftime('%Y-%m-%dT%H:%M:%S'),
+        'design': {
+            'name': design_name,
+            'block': block_name,
+            'design_seed': int(seed),
+            'randomized': design_name != 'inferred_no_plan',
+            'position_balance': _pos_policy,
+            'execution': 'cells_inside_a_block_are_contiguous',
+        },
+        'variants': variants,
+        'seeds': list(blocks),
+        'blocks': {b: list(vs) for b, vs in blocks.items()},
+        'planned_cells': labels,
+        'cell_blocks': cell_blocks,
+        'cell_variants': cell_variants,
+    }
+
+
+def run_order_balance(plan, actual_order=None):
+    """Audit a run-order plan and, optionally, the order actually observed.
+
+    The plan-level contract is deliberately stronger than "the cells were
+    shuffled": every block must contain every declared arm exactly once
+    (complete blocks), and each arm's slot counts across blocks must differ by
+    at most one (position balance).  An arm-major execution — every seed of
+    one arm, then every seed of the next — is a FAIL, because arm and calendar
+    time are then perfectly confounded and no seed-level p-value can repair it.
+
+    ``actual_order`` is a list of cell labels in execution (start-time) order.
+    Missing cells are allowed on a partial/resumed panel; a complete actual
+    order that is arm-major is a failure, while a complete order that merely
+    deviates from the planned permutation is a warning (parallel dispatch can
+    legitimately reorder starts).  This audit is descriptive of the design and
+    never changes a PPL, seed or decision rule.
+    """
+    out = {'kind': 'run_order_balance', 'status': 'ok', 'problems': [],
+           'warnings': [], 'n_blocks': 0, 'n_cells': 0, 'n_variants': 0,
+           'complete_blocks': 0, 'arm_major': False,
+           'position_balanced': None, 'design_ok': False}
+    if not isinstance(plan, dict):
+        out['status'] = 'fail'
+        out['problems'].append(f'run-order plan must be an object, got {type(plan).__name__}')
+        return out
+    design = plan.get('design') if isinstance(plan.get('design'), dict) else {}
+    name = design.get('name')
+    if name not in RUN_ORDER_DESIGNS:
+        out['problems'].append(
+            f'design.name={name!r} is not one of {list(RUN_ORDER_DESIGNS)}')
+    elif name != 'inferred_no_plan':
+        if design.get('randomized') is not True:
+            out['problems'].append('a randomized run-order design must set randomized=true')
+        _ds = design.get('design_seed')
+        if isinstance(_ds, (bool, np.bool_)) or not isinstance(_ds, numbers.Integral):
+            out['problems'].append(
+                f'design.design_seed={_ds!r} must be an integer; a random '
+                'sequence without a recorded seed cannot be reproduced')
+    blocks = plan.get('blocks')
+    variants = plan.get('variants')
+    if not isinstance(blocks, dict) or not blocks:
+        out['problems'].append('plan.blocks must be a non-empty object')
+        blocks = {}
+    if not isinstance(variants, list) or not variants:
+        variants = list(dict.fromkeys(
+            v for vs in blocks.values() if isinstance(vs, list) for v in vs))
+        if variants:
+            out['warnings'].append('plan.variants was missing; recovered it from blocks')
+    variants = [str(v) for v in variants]
+    if len(set(variants)) != len(variants):
+        out['problems'].append('plan.variants contains duplicates')
+    out['n_variants'] = len(variants)
+    variant_set = set(variants)
+    position_counts = {v: [0] * max(1, len(variants)) for v in variants}
+    # When the design was inferred from events, an incomplete block is just a
+    # partial observation, not proof of a bad plan; only arm-major is a hard
+    # failure there.  A recorded plan is held to the full complete-block
+    # contract.
+    _issue = out['warnings'] if name == 'inferred_no_plan' else out['problems']
+    complete = 0
+    for b, vs in blocks.items():
+        if not isinstance(vs, list) or not vs:
+            _issue.append(f'block {b!r} must be a non-empty list')
+            continue
+        vs = [str(v) for v in vs]
+        if len(vs) != len(set(vs)):
+            _issue.append(f'block {b!r} contains a duplicate arm')
+        if set(vs) == variant_set and len(vs) == len(variants):
+            complete += 1
+        else:
+            _issue.append(
+                f'block {b!r} is not a complete block: got {vs!r}, '
+                f'expected each of {variants!r} exactly once')
+        for i, v in enumerate(vs):
+            if v in position_counts and i < len(position_counts[v]):
+                position_counts[v][i] += 1
+    out['n_blocks'] = len(blocks)
+    out['complete_blocks'] = complete
+    out['n_cells'] = sum(len(vs) for vs in blocks.values() if isinstance(vs, list))
+    if not variants:
+        out['problems'].append('plan declares no arms')
+    if blocks and variants and complete != len(blocks):
+        out['warnings'].append(
+            f'{len(blocks) - complete} block(s) are incomplete; a partial '
+            'panel can still be described, but it is not a complete-block design')
+    balances = []
+    for v, counts in position_counts.items():
+        if counts:
+            balances.append(max(counts) - min(counts))
+    out['position_balanced'] = (max(balances) <= 1) if balances else None
+    _pos_policy = design.get('position_balance')
+    if out['position_balanced'] is False and _pos_policy != 'independent_block_shuffle':
+        _issue.append(
+            'arm positions are not balanced across blocks (an arm always '
+            'occupies the same slot): within-block order is confounded with arm')
+    out['arm_major'] = bool(
+        len(variants) > 1 and len(blocks) > 1
+        and all(isinstance(vs, list) and len(vs) == 1
+                for vs in blocks.values()))
+    if out['arm_major']:
+        out['problems'].append(
+            'every block contains only one arm: the panel is arm-major, so arm '
+            'and calendar time are perfectly confounded')
+    out['design_ok'] = bool(
+        not out['problems'] and complete == len(blocks)
+        and (out['position_balanced'] is not False
+             or _pos_policy == 'independent_block_shuffle'))
+    if name == 'inferred_no_plan':
+        out['warnings'].append(
+            'the run order was inferred from event timestamps because no '
+            'run_order.json plan exists; the design itself cannot be verified')
+        out['status'] = 'fail' if out['arm_major'] else 'not_verifiable_locally'
+    elif out['problems']:
+        out['status'] = 'fail'
+    if actual_order is not None and not isinstance(actual_order, (list, tuple)):
+        out['problems'].append('actual_order must be a list of cell labels')
+    elif actual_order is not None:
+        planned = plan.get('planned_cells')
+        planned = [str(x) for x in planned] if isinstance(planned, list) else []
+        label_block = plan.get('cell_blocks') if isinstance(plan.get('cell_blocks'), dict) else {}
+        label_variant = plan.get('cell_variants') if isinstance(plan.get('cell_variants'), dict) else {}
+        seen = set()
+        actual_blocks = collections.OrderedDict()
+        for lab in actual_order:
+            lab = str(lab)
+            if lab in seen:
+                out['problems'].append(f'actual order repeats cell {lab!r}')
+                continue
+            seen.add(lab)
+            b = label_block.get(lab)
+            if b is None:
+                out['problems'].append(
+                    f'actual order names {lab!r}, which is not in the plan')
+                continue
+            actual_blocks.setdefault(str(b), []).append(lab)
+        if planned:
+            missing = [x for x in planned if x not in seen]
+            extra = [x for x in seen if x not in set(planned)]
+            if extra:
+                out['problems'].append(f'actual order contains unplanned cells: {extra[:5]}')
+            out['actual'] = {
+                'n_observed': len(seen),
+                'n_planned': len(planned),
+                'complete': not missing and not extra,
+                'missing_cells': missing[:20],
+            }
+            if not missing and not extra:
+                # `actual_blocks` groups by seed, so even an arm-major run has
+                # every arm present in each seed group; it is the GLOBAL
+                # sequence that reveals the confound.  Count maximal runs of
+                # the same arm: a legacy arm-major run has one run per arm
+                # (arm A seeds 0..n, then arm B seeds 0..n, ...), while a
+                # seed-blocked run switches arm inside every block.
+                seq_variants = []
+                for lab in actual_order:
+                    lab = str(lab)
+                    v = label_variant.get(lab)
+                    if v is None:
+                        try:
+                            v = lab.rsplit('::seed', 1)[0]
+                        except ValueError:
+                            v = lab
+                    seq_variants.append(str(v))
+                runs = 0
+                for i, v in enumerate(seq_variants):
+                    if i == 0 or v != seq_variants[i - 1]:
+                        runs += 1
+                out['actual']['variant_runs'] = runs
+                out['actual']['n_arms'] = len(set(seq_variants))
+                actual_arm_major = bool(
+                    len(actual_blocks) > 1
+                    and len(set(seq_variants)) > 1
+                    and runs == len(set(seq_variants))
+                    and all(seq_variants.count(v) == len(actual_blocks)
+                            for v in set(seq_variants)))
+                if actual_arm_major:
+                    out['arm_major'] = True
+                    out['problems'].append(
+                        'the completed run is arm-major even though the plan was '
+                        'blocked; the driver did not honour the run-order plan')
+        for b, seq in actual_blocks.items():
+            plan_seq = [x for x in planned if label_block.get(x) == str(b)]
+            it = iter(plan_seq)
+            if not all(any(x == y for y in it) for x in seq):
+                out['warnings'].append(
+                    f'block {b!r}: actual start order {seq!r} is not a '
+                    f'subsequence of the planned order {plan_seq!r}')
+    if out['problems'] and out['status'] != 'fail':
+        out['status'] = 'fail'
+    return out
+
+
+def write_run_order(outdir, plan):
+    """Persist the run-order plan beside the panel's other provenance."""
+    if not isinstance(plan, dict) or plan.get('kind') != 'run_order':
+        raise ValueError('write_run_order expects a plan from build_run_order_plan')
+    path = os.path.join(outdir, 'run_order.json')
+    atomic_write_json(path, plan)
+    return path
+
+
 def _plan_run(cfg, summary_path, fp):
     """Resume-check every (seed x variant) cell up front and return the cells
     that still need to run.
@@ -35611,6 +36018,16 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
         }
         atomic_write_json(os.path.join(outdir, 'reproducibility.json'), _repro_doc)
     cells, stale_dropped = _plan_run(cfg, summary_path, fp)
+    # Plan the order over ALL declared cells, not only the pending ones, so a
+    # resume cannot reshuffle a partially finished panel.  The same cells are
+    # trained with the same seeds; only the calendar order changes.
+    _all_order_cells = [(v, seed) for seed in cfg['seeds'] for v in cfg['variants']]
+    _run_order_plan = build_run_order_plan(
+        _all_order_cells, block_key=lambda c: int(c[1]), seed=_first_seed,
+        block_name='seed')
+    write_run_order(outdir, _run_order_plan)
+    _run_rank = {lab: i for i, lab in enumerate(_run_order_plan['planned_cells'])}
+    cells.sort(key=lambda c: _run_rank.get(f'{c[0]}::seed{c[1]}', len(_run_rank)))
     _panel_started = time.strftime('%Y-%m-%dT%H:%M:%S')
     # Crash-safe tracking: publish the panel's identity (code/data versions,
     # hyperparameters, planned cells) BEFORE the first cell can be

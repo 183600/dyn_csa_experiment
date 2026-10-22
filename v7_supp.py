@@ -2878,7 +2878,7 @@ def run_lenphase(payload, guard=None, label='', par=None):
     os.makedirs(outdir, exist_ok=True)
     ckpt_dir = os.path.join(outdir, 'ckpt')
     os.makedirs(ckpt_dir, exist_ok=True)
-    variants = payload['variants']
+    variants = list(payload['variants'])
     eval_lens = payload['eval_lens']
     seeds = list(payload.get('seeds', [0, 1, 2]))
     steps = payload.get('steps', 3000)
@@ -2912,12 +2912,24 @@ def run_lenphase(payload, guard=None, label='', par=None):
         'provenance': _panel_prov,
     })
     _len_panel_cfg = L.preflight_fingerprint({'payload': payload}, stage='lenphase_panel', vocab=int(vocab))
-    _planned_len = [f'{v}::seed{seed}' for v in variants for seed in seeds]
+    # Block by seed, randomize the arm order inside each seed, and rotate the
+    # starting position across seeds.  The old arm-major order (all seeds of
+    # arm A, then all seeds of arm B) made arm and calendar time perfectly
+    # confounded; this plan trains both arms of a pair close together and
+    # records the design for the zero-GPU audit.
+    _all_len_cells = [(v, seed) for v in variants for seed in seeds]
+    _run_order_plan = L.build_run_order_plan(
+        _all_len_cells, block_key=lambda c: int(c[1]),
+        seed=int((seeds or [0])[0]), block_name='seed')
+    L.write_run_order(outdir, _run_order_plan)
+    _planned_len = list(_run_order_plan['planned_cells'])
+    _order_rank = {lab: i for i, lab in enumerate(_planned_len)}
+    cells = sorted(_all_len_cells,
+                   key=lambda c: _order_rank.get(f'{c[0]}::seed{c[1]}', len(_order_rank)))
     _write_phase_manifest(outdir, {'seeds': seeds, 'variants': list(variants), 'seq_len': train_len},
                           _len_panel_cfg, _panel_prov, phase='lenphase',
                           planned_cells=_planned_len, status='running', started_at=_panel_started)
     _ran_parallel = False
-    cells = [(v, seed) for v in variants for seed in seeds]
     if len(cells) > 1:
         import par as _par
         _par_ctx = par if isinstance(par, dict) else _par.resolve_ctx(par, label=label or outdir)

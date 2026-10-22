@@ -38,6 +38,9 @@
   design_preflight  design 的别名
   failures     失败与缺失：error 记录按臂集中度（选择偏差读数，零 GPU）
   training_health  训练曲线健康与 NaN 排查记录的自洽性（零 GPU）
+  run_order    运行顺序 / 时间混杂：检查 run_order.json 的完整区组与位置
+               平衡，并从 experiments.jsonl 复核实际执行顺序；arm-major
+               顺序（一个臂全部种子跑完再跑下一个臂）判 fail（零 GPU）
   budget       规模核算：6ND 估算 + TimeGuard 记录对账（零 GPU）
   efficiency   prefill/decode/容量读数工具（需要模型；给出可复用函数
                与 CPU 微型演示——不是实验，是测量代码自检）
@@ -3346,8 +3349,182 @@ def audit_selection(path='analysis_mechanism/selection_attribution.json'):
     return out
 
 
+def _read_experiment_events(outdir):
+    path = os.path.join(outdir, 'experiments.jsonl')
+    events = []
+    if not os.path.exists(path):
+        return events
+    try:
+        with open(path, encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    e = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(e, dict):
+                    events.append(e)
+    except OSError:
+        return []
+    return events
+
+
+def _actual_run_order(events):
+    """Cell start order from the append-only event log (completed cells only)."""
+    cells = []
+    for e in events:
+        if (e.get('kind') != 'cell' or e.get('status') != 'ok'
+                or e.get('variant') is None or e.get('seed') is None):
+            continue
+        try:
+            label = f"{e['variant']}::seed{int(e['seed'])}"
+        except (TypeError, ValueError, OverflowError):
+            continue
+        cells.append((str(e.get('started_at') or ''), label))
+    # A retrained/resumed cell legitimately appears more than once; its LAST
+    # start is the execution that produced the current measurement.
+    latest = {}
+    for started, lab in cells:
+        if lab not in latest or started >= latest[lab]:
+            latest[lab] = started
+    return [lab for lab, _started in sorted(latest.items(), key=lambda kv: kv[1])]
+
+
+def audit_run_order(paths=None):
+    """Run-order / temporal-confounding audit (zero GPU).
+
+    A paired seed test only compares arms within a seed.  If the driver runs
+    all seeds of arm A and only then all seeds of arm B, the two arms of every
+    pair were trained in different machine/time blocks; a driver update, a
+    thermal change or a noisy neighbour can then masquerade as an arm effect.
+    This audit checks the recorded design (`run_order.json`) and, when present,
+    the executed order from `experiments.jsonl`:
+
+      * complete blocks: every block (default: seed) contains every declared
+        arm exactly once;
+      * position balance: an arm does not always occupy the same slot;
+      * actual order: a completed arm-major run is a FAIL even when the plan
+        was blocked (the driver did not honour it), while a missing plan is
+        reported as not verifiable rather than silently assumed.
+
+    It is descriptive: it never changes a PPL, seed or decision rule.
+    """
+    L = _import_exp_lib()
+    if paths is None:
+        paths = [os.path.join(REPO, d) for d in _iter_result_dirs()]
+    elif isinstance(paths, (str, os.PathLike)):
+        paths = [paths]
+    out = {'kind': 'run_order_audit', 'status': 'ok', 'panels': {},
+           'n_ok': 0, 'n_fail': 0, 'n_not_verifiable': 0,
+           'problems': [], 'warnings': [],
+           'note': ('blocked randomized run order controls calendar-time / '
+                    'machine-drift confounding; arm-major execution is a '
+                    'design failure, not a null result')}
+    for d in paths:
+        d = os.fspath(d)
+        if not os.path.isdir(d):
+            continue
+        name = os.path.basename(os.path.normpath(d))
+        plan_path = os.path.join(d, 'run_order.json')
+        _plan_exists = os.path.exists(plan_path)
+        plan = _load(plan_path) if _plan_exists else None
+        if _plan_exists and plan is None:
+            # A file that exists but cannot be parsed is not the same as a
+            # pre-planning legacy panel: fail closed instead of inferring.
+            rec = {'status': 'fail', 'plan_present': True,
+                   'problems': ['run_order.json exists but is not a JSON object; '
+                                'the recorded design cannot be verified']}
+            out['n_fail'] += 1
+            out['problems'].extend(f'{name}: {p}' for p in rec['problems'])
+            out['panels'][name] = rec
+            continue
+        events = _read_experiment_events(d)
+        actual = _actual_run_order(events)
+        if plan is None:
+            if not actual:
+                rec = {'status': 'not_verifiable_locally',
+                       'reason': 'no run_order.json and no completed cell events'}
+                out['n_not_verifiable'] += 1
+                out['panels'][name] = rec
+                continue
+            # Legacy/inferred order: classify it, but never claim the design
+            # was randomized when no plan exists.
+            blocks = {}
+            for lab in actual:
+                try:
+                    v, s = lab.rsplit('::seed', 1)
+                except ValueError:
+                    continue
+                blocks.setdefault(s, []).append(v)
+            cell_blocks = {}
+            cell_variants = {}
+            for lab in actual:
+                try:
+                    v, s = lab.rsplit('::seed', 1)
+                except ValueError:
+                    continue
+                cell_blocks[lab] = str(s)
+                cell_variants[lab] = v
+            inferred = {'design': {'name': 'inferred_no_plan', 'randomized': False,
+                                   'block': 'seed', 'design_seed': None},
+                        'variants': sorted({v for vs in blocks.values() for v in vs}),
+                        'blocks': {b: vs for b, vs in blocks.items()},
+                        'planned_cells': list(actual),
+                        'cell_blocks': cell_blocks,
+                        'cell_variants': cell_variants}
+            # Passing the actual order lets the same arm-major detector run on
+            # a legacy panel; the inferred design itself stays unverifiable.
+            rec = L.run_order_balance(inferred, actual)
+            rec['actual']['inferred_from_events'] = True
+            rec['plan_present'] = False
+        else:
+            _cb = plan.get('cell_blocks')
+            if isinstance(_cb, dict):
+                labels_in_plan = set(_cb.keys())
+                filtered = [x for x in actual if x in labels_in_plan]
+                rec = L.run_order_balance(plan, filtered)
+                if not filtered and rec.get('status') == 'ok':
+                    rec['status'] = 'not_verifiable_locally'
+                    rec.setdefault('warnings', []).append(
+                        'the plan exists but no completed cell event matches it; '
+                        'the recorded design is verified, the execution is not')
+            else:
+                # A plan without its cell->block mapping cannot be tied to the
+                # event log; audit the plan itself and say the actual order was
+                # not checkable rather than crashing or silently skipping it.
+                rec = L.run_order_balance(plan)
+                rec.setdefault('warnings', []).append(
+                    'plan has no cell_blocks mapping; the actual execution '
+                    'order could not be checked')
+            rec['plan_present'] = True
+            rec['actual'] = rec.get('actual') or {'n_observed': len(actual)}
+        st = rec.get('status')
+        out['n_ok'] += int(st == 'ok')
+        out['n_fail'] += int(st == 'fail')
+        out['n_not_verifiable'] += int(st == 'not_verifiable_locally')
+        if st == 'fail':
+            out['problems'].extend(f'{name}: {p}' for p in rec.get('problems') or [])
+        for w in rec.get('warnings') or []:
+            out['warnings'].append(f'{name}: {w}')
+        out['panels'][name] = rec
+    if out['n_fail']:
+        out['status'] = 'fail'
+    elif out['n_ok'] == 0:
+        out['status'] = 'not_verifiable_locally'
+    print(json.dumps({k: v for k, v in out.items() if k != 'panels'},
+                     ensure_ascii=False, indent=2)[:4000])
+    if out['panels']:
+        for _n, _r in out['panels'].items():
+            print(f"  [run-order] {_n}: {_r.get('status')} "
+                  f"(blocks={_r.get('n_blocks')}, complete={_r.get('complete_blocks')}, "
+                  f"arm_major={_r.get('arm_major')})")
+    return out
+
+
 def run_report(out='audit_report.json'):
-    res = {'generated_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'leakage': audit_leakage(), 'split_discipline': audit_split_discipline(), 'attribution': audit_attribution(), 'boundary': audit_boundary(), 'length': audit_length(), 'fairness': audit_fairness(), 'metrics': audit_metrics(), 'tuning': audit_tuning(), 'simple_baseline': audit_simple_baseline(), 'hypotheses': audit_hypotheses(), 'methodology': audit_methodology(), 'single_factor': audit_single_factor(), 'design_preflight': audit_design_preflight(), 'failures': audit_failures(), 'budget': audit_budget(), 'training_health': audit_training_health(), 'efficiency_pairs': audit_efficiency_pairs(), 'release': audit_release_readiness(), 'selection': audit_selection()}
+    res = {'generated_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'leakage': audit_leakage(), 'split_discipline': audit_split_discipline(), 'attribution': audit_attribution(), 'boundary': audit_boundary(), 'length': audit_length(), 'fairness': audit_fairness(), 'metrics': audit_metrics(), 'tuning': audit_tuning(), 'simple_baseline': audit_simple_baseline(), 'hypotheses': audit_hypotheses(), 'methodology': audit_methodology(), 'single_factor': audit_single_factor(), 'design_preflight': audit_design_preflight(), 'failures': audit_failures(), 'budget': audit_budget(), 'training_health': audit_training_health(), 'efficiency_pairs': audit_efficiency_pairs(), 'release': audit_release_readiness(), 'selection': audit_selection(), 'run_order': audit_run_order()}
     L_atomic = None
     try:
         L = _import_exp_lib()
@@ -3367,7 +3544,7 @@ def run_report(out='audit_report.json'):
 
 
 if __name__ == '__main__':
-    _cmds = {'leakage': audit_leakage, 'split': audit_split_discipline, 'split_discipline': audit_split_discipline, 'causality': audit_causality, 'attribution': audit_attribution, 'boundary': audit_boundary, 'length': audit_length, 'fairness': audit_fairness, 'metrics': audit_metrics, 'tuning': audit_tuning, 'simple': audit_simple_baseline, 'baseline_floor': audit_simple_baseline, 'baseline_plan': audit_baseline_design, 'hypothesis_coverage': audit_hypothesis_coverage, 'hypotheses': audit_hypotheses, 'methodology': audit_methodology, 'single_factor': audit_single_factor, 'design': audit_design_preflight, 'design_preflight': audit_design_preflight, 'failures': audit_failures, 'budget': audit_budget, 'efficiency': audit_efficiency_demo, 'efficiency_pairs': audit_efficiency_pairs, 'training_health': audit_training_health, 'selection': audit_selection, 'release': audit_release_readiness, 'report': run_report}
+    _cmds = {'leakage': audit_leakage, 'split': audit_split_discipline, 'split_discipline': audit_split_discipline, 'causality': audit_causality, 'attribution': audit_attribution, 'boundary': audit_boundary, 'length': audit_length, 'fairness': audit_fairness, 'metrics': audit_metrics, 'tuning': audit_tuning, 'simple': audit_simple_baseline, 'baseline_floor': audit_simple_baseline, 'baseline_plan': audit_baseline_design, 'hypothesis_coverage': audit_hypothesis_coverage, 'hypotheses': audit_hypotheses, 'methodology': audit_methodology, 'single_factor': audit_single_factor, 'design': audit_design_preflight, 'design_preflight': audit_design_preflight, 'failures': audit_failures, 'budget': audit_budget, 'efficiency': audit_efficiency_demo, 'efficiency_pairs': audit_efficiency_pairs, 'training_health': audit_training_health, 'selection': audit_selection, 'release': audit_release_readiness, 'run_order': audit_run_order, 'report': run_report}
     _arg = sys.argv[1] if len(sys.argv) > 1 else 'report'
     if _arg in ('-h', '--help'):
         print(__doc__)
