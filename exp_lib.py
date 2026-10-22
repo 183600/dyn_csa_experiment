@@ -14451,6 +14451,133 @@ def ngram_lm_score(train_ids, eval_ids, vocab_size, order=1, alpha=0.1, interpol
     return {'order': 2, 'alpha': alpha, 'interpolation': lam,
             'n_tokens': n_tokens, 'nll': nll, 'ppl': float(_safe_exp_ppl(nll)) if math.isfinite(nll) else float('nan')}
 
+def ngram_reference_score(train_ids, eval_ids, vocab_size, *, order=2,
+                          alpha=0.1, interpolation=0.5,
+                          max_fit_tokens=None, _counts=None):
+    """Per-target reference NLL and exact top-1 for a count-model floor.
+
+    This is the per-token counterpart of :func:`ngram_lm_score`, used by the
+    bad-case analysis to separate a model miss from an intrinsically hard or
+    mislabelled token.  The returned arrays align with ``eval_ids[:, 1:]``
+    (the next-token targets scored by ``analyze_errors``); the first token of
+    every row is never a target, so no cross-row transition is introduced.
+
+    The top-1 prediction is the exact argmax of the interpolated model, not a
+    backoff guess: for a seen context the maximum is either the best observed
+    successor or the global unigram argmax (the best zero-count token).  That
+    keeps the reference honest and cheap even when the vocabulary scales.
+    """
+    raw_order = order
+    if isinstance(raw_order, (bool, np.bool_)):
+        raise ValueError(f'reference order must be 1 or 2, got {raw_order!r}')
+    order = _as_seed_int(raw_order)
+    if order not in (1, 2):
+        raise ValueError(f'reference order must be 1 (unigram) or 2 (bigram), got {raw_order!r}')
+    if isinstance(alpha, (bool, np.bool_)):
+        raise ValueError('reference alpha must be a positive finite number, got a boolean')
+    try:
+        alpha = float(alpha)
+        interpolation = float(interpolation)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError('reference alpha/interpolation must be finite numbers') from None
+    if not math.isfinite(alpha) or alpha <= 0.0:
+        raise ValueError('reference alpha must be a positive finite number')
+    if not (math.isfinite(interpolation) and 0.0 <= interpolation <= 1.0):
+        raise ValueError('reference interpolation must be in [0, 1]')
+    if order == 1:
+        interpolation = 0.0
+    vocab_size = _ngram_vocab_size(vocab_size)
+    arr = np.asarray(eval_ids)
+    if arr.ndim == 1:
+        arr = arr.reshape(1, -1)
+    if arr.ndim != 2:
+        raise ValueError('reference eval ids must be 1-D or 2-D (rows x length)')
+    if arr.dtype == np.bool_ or arr.dtype == object or not np.issubdtype(arr.dtype, np.integer):
+        raise TypeError(f'reference eval ids must be integers, got dtype {arr.dtype}')
+    arr = np.asarray(arr, dtype=np.int64)
+    if arr.size and (int(arr.min()) < 0 or int(arr.max()) >= vocab_size):
+        raise ValueError('reference eval ids outside [0, vocab_size)')
+    fit_meta = {'max_fit_tokens': max_fit_tokens, 'n_fit_tokens': None,
+                'n_source_tokens': None, 'fit_truncated': None,
+                'fit_token_policy': 'deterministic_prefix' if max_fit_tokens is not None else 'full'}
+    if _counts is None:
+        ids = np.asarray(_ngram_token_ids(train_ids, 'train'), dtype=np.int64).reshape(-1)
+        fit_meta['n_source_tokens'] = int(ids.size)
+        if max_fit_tokens is not None:
+            cap = _exact_count(max_fit_tokens, minimum=1)
+            if cap is None:
+                raise ValueError(f'max_fit_tokens must be a positive integer or None, got {max_fit_tokens!r}')
+            if cap < ids.size:
+                ids = ids[:cap]
+                fit_meta['fit_truncated'] = True
+            else:
+                fit_meta['fit_truncated'] = False
+            fit_meta['max_fit_tokens'] = int(cap)
+        counts = _ngram_train_counts(ids, vocab_size)
+        fit_meta['n_fit_tokens'] = int(ids.size)
+    else:
+        counts = _counts
+    out = {'kind': 'ngram_reference_scores', 'order': int(order),
+           'alpha': float(alpha), 'interpolation': float(interpolation),
+           'vocab_size': int(vocab_size), 'n_rows': int(arr.shape[0]),
+           'n_targets': int(max(0, arr.shape[1] - 1)),
+           'fit': fit_meta,
+           'nll': np.empty((arr.shape[0], 0), dtype=np.float64),
+           'top1_ids': np.empty((arr.shape[0], 0), dtype=np.int64)}
+    if arr.shape[1] < 2:
+        out['nll'] = np.empty((arr.shape[0], 0), dtype=np.float64)
+        out['top1_ids'] = np.empty((arr.shape[0], 0), dtype=np.int64)
+        out['mean_nll'] = None
+        return out
+    targets = arr[:, 1:]
+    prev = arr[:, :-1]
+    uni_counts = counts[0]
+    denom = float(uni_counts.sum()) + alpha * vocab_size
+    uni_prob = (uni_counts + alpha) / denom
+    log_uni = np.log(np.maximum(uni_prob, np.finfo(float).tiny))
+    uni_top = int(np.argmax(uni_prob))
+    if order == 1:
+        nll = -log_uni[targets]
+        top1 = np.full(targets.shape, uni_top, dtype=np.int64)
+    else:
+        _uni, uniq, ctx, pair_counts = counts
+        keys = (prev.reshape(-1) * vocab_size + targets.reshape(-1)).astype(np.int64)
+        if uniq.size:
+            idx = np.searchsorted(uniq, keys)
+            idx_clip = np.minimum(idx, uniq.size - 1)
+            hit = (idx < uniq.size) & (uniq[idx_clip] == keys)
+            c_pair = np.where(hit, pair_counts[idx_clip], 0).astype(np.float64)
+        else:
+            c_pair = np.zeros(keys.shape, dtype=np.float64)
+        c_ctx = ctx[prev.reshape(-1)].astype(np.float64)
+        p_bg = (c_pair + alpha) / (c_ctx + alpha * vocab_size)
+        p = interpolation * p_bg + (1.0 - interpolation) * uni_prob[targets.reshape(-1)]
+        nll = -np.log(np.maximum(p, np.finfo(float).tiny)).reshape(targets.shape)
+        uniq_ctx, inv = np.unique(prev, return_inverse=True)
+        tops = np.empty(uniq_ctx.size, dtype=np.int64)
+        for j, c in enumerate(uniq_ctx):
+            c = int(c)
+            if ctx[c] <= 0:
+                tops[j] = uni_top
+                continue
+            lo = int(np.searchsorted(uniq, c * vocab_size))
+            hi = int(np.searchsorted(uniq, (c + 1) * vocab_size))
+            succ = uniq[lo:hi] - c * vocab_size
+            cnts = pair_counts[lo:hi].astype(np.float64)
+            den = float(ctx[c]) + alpha * vocab_size
+            seen_scores = interpolation * ((cnts + alpha) / den) + (1.0 - interpolation) * uni_prob[succ]
+            best_seen = int(np.argmax(seen_scores))
+            unseen_score = (interpolation * (alpha / den)
+                            + (1.0 - interpolation) * uni_prob[uni_top])
+            tops[j] = (uni_top if unseen_score > float(seen_scores[best_seen])
+                       else int(succ[best_seen]))
+        top1 = tops[inv].reshape(targets.shape)
+    out['nll'] = nll
+    out['top1_ids'] = top1
+    out['mean_nll'] = float(nll.mean()) if nll.size else None
+    return out
+
+
 def _ngram_row_stats(train_ids, eval_ids, vocab_size, *, order=1, alpha=0.1,
                      interpolation=1.0, _counts=None):
     """Per-row NLL/token accounting for the selected count model.
@@ -26735,7 +26862,10 @@ def _context_target_counts(vb, ctx_len, *, max_positions=None):
 @torch.inference_mode()
 def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
                    top_tokens=100, chunk=8, val_bnd=None, train_ids=None,
-                   context_tokens=16, topk=5, context_scan_max_positions=None):
+                   context_tokens=16, topk=5, context_scan_max_positions=None,
+                   reference='bigram', reference_alpha=0.1,
+                   reference_interpolation=0.5,
+                   reference_max_fit_tokens=20_000_000):
     """Per-token / per-sequence error analysis for one checkpoint.
 
     Returns the worst sequences, worst tokens (with decoded context when a
@@ -26826,6 +26956,68 @@ def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
                   'targets will not be labelled rare/annotation candidates')
     else:
         freq_problem = None
+    # ------------------------------------------------------------------
+    # Empirical reference floor for the bad-case review.
+    #
+    # A high CE alone cannot distinguish "the model missed a predictable
+    # continuation" from "the label is intrinsically hard/noisy".  A smoothed
+    # count model fitted on the TRAINING stream is a cheap control: when the
+    # reference gets a token right and the neural model does not, that is
+    # direct evidence of a model blind spot rather than annotation noise;
+    # when both miss, the target needs a manual label check before it is
+    # blamed on the model.  The reference is fixed (not tuned on validation)
+    # so it cannot flatter itself on the reported rows.
+    _ref_mode = 'none' if reference is None else str(reference).lower()
+    if _ref_mode not in ('none', 'unigram', 'bigram'):
+        raise ValueError(f'reference must be one of none/unigram/bigram, got {reference!r}')
+    _ref_order = 1 if _ref_mode == 'unigram' else 2
+    _ref_counts = None
+    _ref_problem = None
+    _ref_meta = None
+    if _ref_mode != 'none':
+        _ref_cap = None if reference_max_fit_tokens is None else _exact_count(reference_max_fit_tokens, minimum=1)
+        if reference_max_fit_tokens is not None and _ref_cap is None:
+            raise ValueError(f'reference_max_fit_tokens must be a positive integer or None, got {reference_max_fit_tokens!r}')
+        if train_ids is None:
+            _ref_problem = 'no train_ids: the reference floor cannot be fitted'
+        else:
+            try:
+                _tr_raw = np.asarray(train_ids)
+                if _tr_raw.size == 0:
+                    raise ValueError('empty train_ids')
+                if (_tr_raw.dtype == np.bool_ or _tr_raw.dtype == object
+                        or not np.issubdtype(_tr_raw.dtype, np.integer)):
+                    raise TypeError(f'train_ids dtype {_tr_raw.dtype} is not an integer token type')
+                _tr_flat = _tr_raw.reshape(-1)
+                _lo, _hi = int(_tr_flat.min()), int(_tr_flat.max())
+                if _lo < 0 or _hi >= V:
+                    raise ValueError(f'train_ids out of range [{_lo}, {_hi}] for vocab {V}')
+                _n_source = int(_tr_flat.size)
+                _fit_ids = _tr_flat if _ref_cap is None else _tr_flat[:_ref_cap]
+                if _ref_order == 1:
+                    _uni = np.bincount(np.asarray(_fit_ids, dtype=np.int64),
+                                       minlength=V).astype(np.float64)
+                    _ref_counts = (_uni, np.empty(0, dtype=np.int64),
+                                   np.zeros(V, dtype=np.int64),
+                                   np.empty(0, dtype=np.int64))
+                else:
+                    _ref_counts = _ngram_train_counts(np.asarray(_fit_ids, dtype=np.int64), V)
+                _ref_meta = {
+                    'mode': _ref_mode, 'order': _ref_order,
+                    'alpha': float(reference_alpha),
+                    'interpolation': (0.0 if _ref_order == 1 else float(reference_interpolation)),
+                    'fit_token_policy': ('full' if _ref_cap is None else 'deterministic_prefix'),
+                    'max_fit_tokens': _ref_cap,
+                    'n_fit_tokens': int(_fit_ids.size),
+                    'n_source_tokens': _n_source,
+                    'fit_truncated': bool(_fit_ids.size < _n_source),
+                }
+            except Exception as _re:
+                _ref_problem = f'{type(_re).__name__}: {_re}'
+                _ref_counts = None
+        if _ref_counts is None:
+            print(f'[analyze_errors] WARNING: reference floor disabled: {_ref_problem}; '
+                  'bad cases will not report model-vs-reference evidence')
     bnd_np = np.asarray(val_bnd) if val_bnd is not None else None
     if bnd_np is not None and bnd_np.shape != vb.shape:
         print(f'[analyze_errors] WARNING: boundary mask shape {bnd_np.shape} != val_batch shape {vb.shape} — boundary-token statistics are OMITTED rather than computed from a misaligned/truncated mask')
@@ -26850,6 +27042,18 @@ def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
     buckets = collections.defaultdict(lambda: {'n': 0, 'ce_sum': 0.0})
     n_targets = 0
     n_nonfinite = 0
+    # Whole-split reference-floor accumulators.  They are only reported when
+    # a fitted reference exists; an unavailable reference stays `None`, never
+    # a fabricated zero.
+    _ref_stats = {
+        'n_paired': 0, 'model_ce_sum': 0.0, 'reference_ce_sum': 0.0,
+        'n_model_correct': 0, 'n_reference_correct': 0,
+        'n_both_correct': 0, 'n_both_wrong': 0,
+        'n_model_only_correct': 0, 'n_reference_only_correct': 0,
+        'n_both_wrong_unexplained': 0,
+    }
+    _ref_row_delta_sum = np.zeros(n_rows, dtype=np.float64)
+    _ref_row_n = np.zeros(n_rows, dtype=np.int64)
 
     def _bucket(pos, tgt):
         frac = pos / max(1, span)
@@ -26886,6 +27090,22 @@ def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
         r1 = min(n_rows, r0 + max(1, int(chunk)))
         ids = torch.as_tensor(np.ascontiguousarray(vb[r0:r1]), dtype=torch.long, device=device)
         h = model.trunk(ids)
+        # Per-chunk reference scores keep the memory profile bounded: a full
+        # (rows x length) NLL/top-1 pair for a large validation split would be
+        # a hidden multi-hundred-MB allocation.  The count tables are built
+        # once (capped), only the scoring is streamed.
+        _ref_chunk = None
+        if _ref_counts is not None:
+            try:
+                _ref_chunk = ngram_reference_score(
+                    None, np.ascontiguousarray(vb[r0:r1, :seq]), V,
+                    order=_ref_order, alpha=reference_alpha,
+                    interpolation=reference_interpolation,
+                    _counts=_ref_counts)
+            except Exception as _rce:
+                _ref_counts = None
+                _ref_problem = f'reference scoring failed: {type(_rce).__name__}: {_rce}'
+                print(f'[analyze_errors] WARNING: reference floor disabled: {_ref_problem}')
         row_nll = np.zeros(r1 - r0, dtype=np.float64)
         row_n = np.zeros(r1 - r0, dtype=np.int64)
         for s0 in range(0, span, 64):
@@ -26960,6 +27180,43 @@ def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
             _m_blind = (~_flat_rare) & (~_amb) & _blind
             _m_out = (~_flat_rare) & (~_amb) & (~_blind) & (~_flat_in_topk) & _flat_fin
             _m_mixed = (~_flat_rare) & (~_amb) & (~_blind) & _flat_in_topk & _flat_fin
+            _ref_nll = _ref_top = None
+            if _ref_chunk is not None:
+                _ref_nll = torch.as_tensor(
+                    np.ascontiguousarray(_ref_chunk['nll'][:, s0:s1].reshape(-1)),
+                    dtype=torch.float64, device=device)
+                _ref_top = torch.as_tensor(
+                    np.ascontiguousarray(_ref_chunk['top1_ids'][:, s0:s1].reshape(-1)),
+                    dtype=torch.long, device=device)
+                _ref_pair = torch.isfinite(_ref_nll) & _flat_fin
+                _n_ref_pair = int(_ref_pair.sum())
+                if _n_ref_pair:
+                    _model_ok = (pred.reshape(-1) == _flat_tg) & _ref_pair
+                    _ref_ok = (_ref_top == _flat_tg) & _ref_pair
+                    _both_ok = _model_ok & _ref_ok
+                    _both_bad = (~_model_ok) & (~_ref_ok) & _ref_pair
+                    _model_only = _model_ok & (~_ref_ok)
+                    _ref_only = (~_model_ok) & _ref_ok
+                    _unexplained = _both_bad & (~_m_rare) & (~_m_amb)
+                    _ref_stats['n_paired'] += _n_ref_pair
+                    _ref_stats['model_ce_sum'] += float(_flat_ce[_ref_pair].sum())
+                    _ref_stats['reference_ce_sum'] += float(_ref_nll[_ref_pair].sum())
+                    _ref_stats['n_model_correct'] += int(_model_ok.sum())
+                    _ref_stats['n_reference_correct'] += int(_ref_ok.sum())
+                    _ref_stats['n_both_correct'] += int(_both_ok.sum())
+                    _ref_stats['n_both_wrong'] += int(_both_bad.sum())
+                    _ref_stats['n_model_only_correct'] += int(_model_only.sum())
+                    _ref_stats['n_reference_only_correct'] += int(_ref_only.sum())
+                    _ref_stats['n_both_wrong_unexplained'] += int(_unexplained.sum())
+                    _delta = _flat_ce - _ref_nll
+                    _row_delta = torch.where(_ref_pair.reshape(_b, _s),
+                                             _delta.reshape(_b, _s),
+                                             torch.zeros((_b, _s), dtype=torch.float64,
+                                                         device=device))
+                    _ref_row_delta_sum[r0:r1] += _row_delta.sum(dim=1).cpu().numpy()
+                    _ref_row_n[r0:r1] += _ref_pair.reshape(_b, _s).sum(dim=1).cpu().numpy()
+                    del _model_ok, _ref_ok, _both_ok, _both_bad, _model_only, _ref_only
+                    del _unexplained, _delta, _row_delta, _ref_pair
             for _ci, _mask in enumerate((_m_rare, _m_amb, _m_blind, _m_out, _m_mixed)):
                 _all_sum[_ci] += _flat_ce[_mask].sum()
                 _all_cnt[_ci] += int(_mask.sum())
@@ -26983,12 +27240,18 @@ def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
                 _pt = (tg.reshape(-1).index_select(0, _pick_idx)).cpu().numpy()
                 _prr = (rare.reshape(-1).index_select(0, _pick_idx)).cpu().numpy()
                 _ptop = (topi.reshape(-1, _kk).index_select(0, _pick_idx)).cpu().numpy()
+                _pref_ce = (_ref_nll.index_select(0, _pick_idx).cpu().numpy()
+                            if _ref_nll is not None else None)
+                _pref_pred = (_ref_top.index_select(0, _pick_idx).cpu().numpy()
+                              if _ref_top is not None else None)
                 for _k in range(len(_pi)):
                     _lin = int(_pi[_k])
                     _pos = s0 + (_lin % _s)
                     rec = (float(_pv[_k]), r0 + (_lin // _s), _pos, int(_pt[_k]),
                            int(_pr[_k]), float(_pe[_k]), float(_pm[_k]),
-                           [int(x) for x in _ptop[_k]], bool(_prr[_k]))
+                           [int(x) for x in _ptop[_k]], bool(_prr[_k]),
+                           (float(_pref_ce[_k]) if _pref_ce is not None else None),
+                           (int(_pref_pred[_k]) if _pref_pred is not None else None))
                     if len(tok_heap) < int(top_tokens):
                         _heapq.heappush(tok_heap, rec)
                     elif rec[0] > tok_heap[0][0]:
@@ -27020,7 +27283,7 @@ def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
     cause_counts = collections.Counter()
     n_ctx_ambiguous = 0
     for rec in sorted(tok_heap, key=lambda t: t[0], reverse=True)[:max(1, int(top_tokens))]:
-        c, row, pos, tgt, pred, ent, margin, tids, rare = rec
+        c, row, pos, tgt, pred, ent, margin, tids, rare, ref_ce, ref_pred = rec
         lo = max(0, pos - int(context_tokens))
         hi = min(span, pos + int(context_tokens) + 1)
         ctx_ids = [int(x) for x in vb[row, lo:hi + 1].tolist()]
@@ -27028,6 +27291,22 @@ def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
         _triage = classify_token_error(ce=c, entropy=ent, margin=margin,
                                        rare_target=rare, target_id=tgt,
                                        topk_ids=tids, vocab=V)
+        _ref_verdict = None
+        _ref_correct = None
+        _model_correct = None
+        if ref_ce is not None and ref_pred is not None:
+            _model_correct = bool(int(pred) == int(tgt))
+            _ref_correct = bool(int(ref_pred) == int(tgt))
+            if _model_correct and _ref_correct:
+                _ref_verdict = 'both_correct'
+            elif _model_correct:
+                _ref_verdict = 'model_surpasses_reference'
+            elif _ref_correct:
+                _ref_verdict = 'reference_catches_model_miss'
+                _triage['causes'].append('reference_catches_model_miss')
+            else:
+                _ref_verdict = 'both_miss_check_label'
+                _triage['causes'].append('reference_also_miss')
         cause_counts[_triage['primary']] += 1
         _ctx_variants = None
         _ctx_support = None
@@ -27058,6 +27337,15 @@ def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
             'target_in_topk': _triage['target_in_topk'],
             'cause_primary': _triage['primary'],
             'causes': _triage['causes'],
+            'reference_order': (_ref_order if ref_ce is not None else None),
+            'reference_pred_id': ref_pred,
+            'reference_pred_text': (_decode([ref_pred]) if ref_pred is not None else None),
+            'reference_ce': ref_ce,
+            'reference_correct': _ref_correct,
+            'model_correct_vs_reference': _model_correct,
+            'reference_verdict': _ref_verdict,
+            'model_minus_reference_ce': ((c - ref_ce)
+                                         if (ref_ce is not None and math.isfinite(ref_ce)) else None),
             'same_context_target_variants': _ctx_variants,
             'same_context_support': _ctx_support,
             'same_context_ambiguous': (bool(_ctx_variants > 1) if _ctx_variants is not None else None),
@@ -27079,6 +27367,63 @@ def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
     ent_vals = [t[5] for t in tok_heap if math.isfinite(t[5])]
     model.train(was_training)
     _pooled_ce = (sum(x[2] for x in seq_rows) / n_targets) if n_targets else None
+    _ref_comparison = None
+    if _ref_mode != 'none':
+        _n_paired = int(_ref_stats['n_paired'])
+        if _n_paired <= 0:
+            _ref_comparison = {
+                'available': False,
+                'reason': _ref_problem or 'no finite paired target positions',
+                'fit': _ref_meta,
+                'complete': False,
+            }
+        else:
+            _model_ce = _ref_stats['model_ce_sum'] / _n_paired
+            _ref_ce = _ref_stats['reference_ce_sum'] / _n_paired
+            _row_ok = _ref_row_n > 0
+            _row_means = (_ref_row_delta_sum[_row_ok] / _ref_row_n[_row_ok]
+                          if bool(_row_ok.any()) else np.asarray([], dtype=np.float64))
+            _row_se = None
+            _row_ci = None
+            if _row_means.size >= 2:
+                _row_se = float(np.std(_row_means, ddof=1) / math.sqrt(_row_means.size))
+                _row_ci = [float(np.mean(_row_means) - 1.96 * _row_se),
+                           float(np.mean(_row_means) + 1.96 * _row_se)]
+            _n_model_only = int(_ref_stats['n_model_only_correct'])
+            _n_ref_only = int(_ref_stats['n_reference_only_correct'])
+            _n_both_wrong = int(_ref_stats['n_both_wrong'])
+            _n_unexplained = int(_ref_stats['n_both_wrong_unexplained'])
+            _ref_comparison = {
+                'available': True,
+                'complete': bool(_ref_problem is None),
+                'reason': _ref_problem,
+                'fit': _ref_meta,
+                'n_paired_targets': _n_paired,
+                'model_ce': float(_model_ce),
+                'reference_ce': float(_ref_ce),
+                'excess_ce_model_minus_reference': float(_model_ce - _ref_ce),
+                'n_model_correct': int(_ref_stats['n_model_correct']),
+                'n_reference_correct': int(_ref_stats['n_reference_correct']),
+                'n_both_correct': int(_ref_stats['n_both_correct']),
+                'n_both_wrong': _n_both_wrong,
+                'n_model_only_correct': _n_model_only,
+                'n_reference_only_correct': _n_ref_only,
+                'n_both_wrong_unexplained': _n_unexplained,
+                'share_model_only_correct': (float(_n_model_only) / _n_paired),
+                'share_reference_only_correct': (float(_n_ref_only) / _n_paired),
+                'share_both_wrong': (float(_n_both_wrong) / _n_paired),
+                'share_both_wrong_unexplained': (float(_n_unexplained) / _n_paired),
+                'row_mean_excess_ce': (float(np.mean(_row_means)) if _row_means.size else None),
+                'row_excess_ce_se': _row_se,
+                'row_excess_ce_ci95': _row_ci,
+                'n_rows_with_paired_targets': int(_row_means.size),
+                'note': ('The reference is a fixed smoothed count model fitted on the '
+                         'training stream (not tuned on these validation rows). A token that '
+                         'the reference gets right and the model misses is a model blind-spot '
+                         'candidate; one that BOTH miss needs a manual label check before it '
+                         'is called annotation noise. The row-level CI groups by document and '
+                         'is the uncertainty to quote, not the token-level count.'),
+            }
     return {'kind': 'token_error_analysis', 'rows': n_rows, 'seq_len': seq,
             'n_targets': int(n_targets), 'n_nonfinite_tokens': int(n_nonfinite),
             'mean_ce': _pooled_ce,
@@ -27089,12 +27434,17 @@ def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
             'cause_counts': dict(cause_counts),
             'cause_counts_all': cause_counts_all,
             'cause_counts_all_note': 'whole-split heuristic tally over finite targets; cause thresholds are triage heuristics, not labels',
+            'reference_comparison': _ref_comparison,
+            'reference_basis': (_ref_meta.get('mode') if _ref_meta else None),
+            'reference_problem': _ref_problem,
             'cause_guide': {
                 'annotation_or_rare_target': 'check the target annotation and the training frequency; a rare token can be correct but under-trained',
                 'ambiguous_context': 'the distribution is near-uniform or the top-2 margin is tiny; inspect the context and decide whether the task is genuinely ambiguous',
                 'confident_model_blind_spot': 'the model is confidently wrong; look for a systematic context feature it has not learned',
                 'target_outside_topk': 'the target is outside the sampled top-k; check whether this is a tokenization/label-shift issue or a real model miss',
                 'mixed_unclear': 'no single heuristic explains this case; read the full context before changing the model',
+                'reference_catches_model_miss': 'a training-count reference predicts this target correctly while the model does not; treat it as a model blind spot (feature/context coverage), not annotation noise',
+                'reference_also_miss': 'the model and the training-count reference both miss this target; check the label/prefix before blaming the model — this is the annotation-error or intrinsically hard population',
             },
             'entropy': {'max': (max(ent_vals) if ent_vals else None),
                         'mean': (sum(ent_vals) / len(ent_vals) if ent_vals else None)},

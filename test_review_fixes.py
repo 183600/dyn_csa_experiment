@@ -939,6 +939,185 @@ def t_error_analysis_flags_prefix_ambiguity():
     assert r0['context_ambiguity']['context_len'] is None, r0
 
 
+def t_reference_count_model_is_exact_and_bounded():
+    # The reference used to separate model misses from hard labels must be the
+    # actual argmax of the interpolated count model, not a backoff guess, and
+    # a large corpus fit must be a disclosed deterministic prefix.
+    rng = np.random.default_rng(7)
+    V = 7
+    train = rng.integers(0, V, size=250, dtype=np.int64)
+    ev = np.array([[0, 1, 2, 3, 4, 5], [6, 0, 0, 1, 1, 2]], dtype=np.int64)
+    counts = L._ngram_train_counts(train, V)
+    uni, pair_keys, ctx, pair_counts = counts
+    alpha = 0.1
+    uni_prob = (uni + alpha) / (uni.sum() + alpha * V)
+    for order in (1, 2):
+        lams = [0.0] if order == 1 else [0.0, 0.25, 0.5, 0.75, 1.0]
+        for lam in lams:
+            r = L.ngram_reference_score(train, ev, V, order=order,
+                                        alpha=alpha, interpolation=lam)
+            assert r['nll'].shape == (2, 5) and r['top1_ids'].shape == (2, 5), r
+            for row in range(ev.shape[0]):
+                for j in range(1, ev.shape[1]):
+                    prev, tgt = int(ev[row, j - 1]), int(ev[row, j])
+                    if order == 1:
+                        probs = uni_prob
+                        p = uni_prob[tgt]
+                    else:
+                        key = prev * V + tgt
+                        idx = int(np.searchsorted(pair_keys, key))
+                        cp = (float(pair_counts[idx])
+                              if idx < pair_keys.size and int(pair_keys[idx]) == key else 0.0)
+                        c = float(ctx[prev])
+                        p = lam * ((cp + alpha) / (c + alpha * V)) + (1 - lam) * uni_prob[tgt]
+                        cp_all = np.array([
+                            (float(pair_counts[int(np.searchsorted(pair_keys, prev * V + v))])
+                             if (int(np.searchsorted(pair_keys, prev * V + v)) < pair_keys.size
+                                 and int(pair_keys[int(np.searchsorted(pair_keys, prev * V + v))]) == prev * V + v)
+                             else 0.0)
+                            for v in range(V)], dtype=float)
+                        probs = lam * ((cp_all + alpha) / (c + alpha * V)) + (1 - lam) * uni_prob
+                    assert abs(float(r['nll'][row, j - 1]) + math.log(p)) < 1e-9, (order, lam, row, j)
+                    assert int(r['top1_ids'][row, j - 1]) == int(np.argmax(probs)), (order, lam, row, j)
+    # A capped fit reports the truncation instead of pretending it saw the
+    # whole stream.
+    cap = L.ngram_reference_score(train, ev, V, order=2, max_fit_tokens=40)
+    assert cap['fit']['n_fit_tokens'] == 40 and cap['fit']['fit_truncated'] is True, cap['fit']
+    assert cap['fit']['n_source_tokens'] == int(train.size), cap['fit']
+    # Invalid smoothing/order is refused rather than silently replaced.
+    for bad in ({'order': 3}, {'order': True}, {'alpha': 0.0}, {'alpha': float('nan')},
+                {'interpolation': -0.1}, {'interpolation': 1.1}):
+        try:
+            L.ngram_reference_score(train, ev, V, **bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'ngram_reference_score accepted {bad!r}')
+    try:
+        L.ngram_reference_score(train, ev.astype(float), V)
+    except TypeError:
+        pass
+    else:
+        raise AssertionError('reference scoring must refuse float token ids')
+
+
+def t_error_analysis_reference_separates_model_miss():
+    # With a deterministic 5->7 transition in the training stream and a
+    # uniform model, the reference must catch positions the model misses.
+    # Those positions are model blind-spot evidence; both-miss positions are
+    # the population that needs a manual label check.
+    V = 8
+
+    class _Stub:
+        training = True
+
+        def eval(self):
+            self.training = False
+            return self
+
+        def train(self, mode=True):
+            self.training = bool(mode)
+            return self
+
+        def trunk(self, ids):
+            return torch.zeros((ids.shape[0], ids.shape[1], 2))
+
+        def head(self, h):
+            return torch.zeros((h.shape[0], h.shape[1], V))
+
+    train = np.array([5, 7] * 100 + [1] * 100, dtype=np.int64)
+    vb = np.array([[5, 7, 5, 7], [5, 7, 1, 7]], dtype=np.int64)
+    r = L.analyze_errors(_Stub(), vb, V, torch.device('cpu'), top_n=2,
+                         top_tokens=8, train_ids=train, reference='bigram')
+    rc = r['reference_comparison']
+    assert rc['available'] is True and rc['complete'] is True, rc
+    assert rc['n_paired_targets'] == 6, rc
+    assert rc['n_reference_only_correct'] > 0, rc
+    assert rc['n_both_correct'] == 0 and rc['n_model_correct'] == 0, rc
+    assert rc['reference_ce'] < rc['model_ce'], rc
+    assert rc['excess_ce_model_minus_reference'] > 0, rc
+    assert rc['row_excess_ce_ci95'] is not None, rc
+    assert r['reference_basis'] == 'bigram', r
+    assert 'reference_catches_model_miss' in r['cause_guide'], r['cause_guide']
+    assert 'reference_also_miss' in r['cause_guide'], r['cause_guide']
+    hit = [t for t in r['worst_tokens'] if t['reference_verdict'] == 'reference_catches_model_miss']
+    assert hit, r['worst_tokens']
+    for t in hit:
+        assert t['reference_correct'] is True and t['model_correct_vs_reference'] is False, t
+        assert t['reference_pred_id'] == t['target_id'], t
+        assert 'reference_catches_model_miss' in t['causes'], t
+    # Disabling the reference is explicit, and a malformed/empty training
+    # sample disables it with a reason instead of fabricating counts.
+    off = L.analyze_errors(_Stub(), vb, V, torch.device('cpu'), top_n=1,
+                           top_tokens=4, train_ids=train, reference='none')
+    assert off['reference_comparison'] is None and off['reference_basis'] is None, off
+    for bad in (np.array([], dtype=np.int64), np.array([-1, 2]), np.array([1.5, 2.0])):
+        rr = L.analyze_errors(_Stub(), vb, V, torch.device('cpu'), top_n=1,
+                              top_tokens=4, train_ids=bad, reference='bigram')
+        assert rr['reference_comparison']['available'] is False, (bad, rr['reference_comparison'])
+        assert rr['reference_problem'], (bad, rr)
+    try:
+        L.analyze_errors(_Stub(), vb, V, torch.device('cpu'), reference='bogus')
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('analyze_errors must refuse an unknown reference mode')
+
+
+def t_error_analysis_cli_surfaces_reference_floor():
+    # The console and Markdown artifact (not only the JSON) must show the
+    # reference comparison and its row-level uncertainty.
+    class _M:
+        def to(self, device):
+            return self
+
+    class _Cfg:
+        pass
+
+    td = tempfile.mkdtemp(prefix='err_ref_', dir=REPO)
+    saved = (EA._load_model, EA._sha256, L.load_run_corpus, L.analyze_errors)
+    fake = {
+        'mean_ce': 3.0, 'pooled_ppl': 20.1, 'buckets': {},
+        'worst_tokens': [], 'worst_sequences': [],
+        'cause_counts': {}, 'cause_counts_all': {}, 'cause_guide': {},
+        'reference_comparison': {
+            'available': True, 'complete': True, 'reason': None,
+            'fit': {'mode': 'bigram', 'alpha': 0.1, 'interpolation': 0.5,
+                    'n_fit_tokens': 100, 'n_source_tokens': 100,
+                    'fit_truncated': False},
+            'n_paired_targets': 10, 'model_ce': 3.0, 'reference_ce': 2.5,
+            'excess_ce_model_minus_reference': 0.5,
+            'n_model_only_correct': 1, 'n_reference_only_correct': 3,
+            'n_both_wrong': 2, 'n_both_wrong_unexplained': 1,
+            'share_model_only_correct': 0.1, 'share_reference_only_correct': 0.3,
+            'share_both_wrong': 0.2, 'share_both_wrong_unexplained': 0.1,
+            'row_mean_excess_ce': 0.5, 'row_excess_ce_se': 0.1,
+            'row_excess_ce_ci95': [0.304, 0.696], 'n_rows_with_paired_targets': 2},
+        'reference_basis': 'bigram', 'reference_problem': None,
+    }
+    try:
+        EA._load_model = lambda path: (_M(), {'vocab': 32, 'd': 16, 'n_layers': 1,
+                                              'n_heads': 2, 'd_head': 8, 'train_len': 8,
+                                              'cfg': [_Cfg()]})
+        EA._sha256 = lambda path: 'deadbeef'
+        vb = np.arange(32, dtype=np.int64).reshape(4, 8) % 32
+        L.load_run_corpus = lambda cfg: (np.arange(64, dtype=np.int64), vb, 32, None, None)
+        L.analyze_errors = lambda *a, **k: dict(fake)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            EA.main(['--ckpt', 'a.pt', '--outdir', td, '--max-rows', '4'])
+        out = buf.getvalue()
+        assert 'reference floor' in out and 'row-level excess-CE 95% CI' in out, out
+        md = open(os.path.join(td, 'bad_cases.md'), encoding='utf-8').read()
+        assert 'Reference floor' in md and 'reference only correct' in md.lower(), md
+        summ = json.load(open(os.path.join(td, 'summary.json'), encoding='utf-8'))
+        assert summ['reference_comparison']['available'] is True, summ
+        assert summ['analysis_cost']['n_scored_tokens'] == 28, summ['analysis_cost']
+    finally:
+        (EA._load_model, EA._sha256, L.load_run_corpus, L.analyze_errors) = saved
+        shutil.rmtree(td, ignore_errors=True)
+
+
 def t_train_only_curve_health():
     desc = [10.0 - 0.05 * i for i in range(200)]
     h = L.classify_train_loss_curve(desc)
@@ -15543,6 +15722,9 @@ def main():
     _check('L27c error-analysis budgets are explicit, not clamped', t_error_analysis_zero_and_invalid_budgets)
     _check('L27d paired error analysis requires one vocabulary', t_error_analysis_paired_vocab_guard)
     _check('L27e bad cases expose prefix/label ambiguity', t_error_analysis_flags_prefix_ambiguity)
+    _check('L27f reference count model is exact and bounded', t_reference_count_model_is_exact_and_bounded)
+    _check('L27g reference floor separates model misses from hard labels', t_error_analysis_reference_separates_model_miss)
+    _check('L27h CLI/Markdown surface the reference floor and cost', t_error_analysis_cli_surfaces_reference_floor)
     _check('L28 gapfill numeric reader rejects booleans', t_gapfill_numeric_reader_rejects_booleans)
     _check('L28b gapfill announces the family-corrected seed plan', t_gapfill_announces_family_seed_plan)
     _check('L29 release tags cannot escape the archive directory', t_release_tag_cannot_escape_output_dir)

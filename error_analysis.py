@@ -156,6 +156,31 @@ def _print_bad_cases(res, *, n_tokens=10, n_sequences=3):
     if counts:
         tally = ', '.join(f'{k}={v}' for k, v in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
         print(f'[errors] worst-token cause tally: {tally}')
+    rc = res.get('reference_comparison') if isinstance(res.get('reference_comparison'), dict) else {}
+    if rc.get('available'):
+        _fit = rc.get('fit') or {}
+        _fit_txt = (f"{_fit.get('mode')} alpha={_fit.get('alpha')} "
+                    f"interp={_fit.get('interpolation')}; fit={_fit.get('n_fit_tokens')} tokens"
+                    + (' (truncated prefix)' if _fit.get('fit_truncated') else ''))
+        print(f"[errors] reference floor ({_fit_txt}): model CE={rc.get('model_ce'):.4f} vs "
+              f"reference CE={rc.get('reference_ce'):.4f} "
+              f"(excess={rc.get('excess_ce_model_minus_reference'):+.4f}); "
+              f"reference catches model miss={rc.get('n_reference_only_correct')}, "
+              f"both miss={rc.get('n_both_wrong')} "
+              f"({100.0 * (rc.get('share_both_wrong') or 0):.1f}%), "
+              f"both-miss-unexplained={rc.get('n_both_wrong_unexplained')}")
+        if rc.get('row_excess_ce_ci95') is not None:
+            _ci = rc['row_excess_ce_ci95']
+            print(f"[errors] row-level excess-CE 95% CI: [{_ci[0]:+.4f}, {_ci[1]:+.4f}] "
+                  f"over {rc.get('n_rows_with_paired_targets')} row(s)")
+        if not rc.get('complete'):
+            print(f"[errors] WARNING: reference comparison incomplete: {rc.get('reason')}")
+    elif res.get('reference_problem'):
+        print(f"[errors] reference floor unavailable: {res.get('reference_problem')}")
+    cost = res.get('analysis_cost') if isinstance(res.get('analysis_cost'), dict) else {}
+    if cost:
+        print(f"[errors] analysis cost: {cost.get('elapsed_s')}s for "
+              f"{cost.get('n_scored_tokens')} scored token(s)")
     ca = res.get('context_ambiguity')
     if isinstance(ca, dict):
         _scan = ca.get('scan') if isinstance(ca.get('scan'), dict) else {}
@@ -185,6 +210,14 @@ def main(argv=None):
     ap.add_argument('--chunk', type=int, default=8)
     ap.add_argument('--context-scan-positions', type=int, default=2000000,
                     help='bound the prefix-ambiguity scan (0 = scan the whole evaluated split)')
+    ap.add_argument('--reference', default='bigram', choices=['none', 'unigram', 'bigram'],
+                    help='training-count reference floor used to separate model misses from hard/noisy labels')
+    ap.add_argument('--reference-alpha', type=float, default=0.1,
+                    help='fixed add-alpha smoothing for the reference count model (not tuned on validation)')
+    ap.add_argument('--reference-interpolation', type=float, default=0.5,
+                    help='bigram/unigram interpolation for the reference model (0 = unigram, 1 = bigram)')
+    ap.add_argument('--reference-max-fit-tokens', type=int, default=20000000,
+                    help='cap the training prefix used to fit the reference (0 = no cap)')
     ap.add_argument('--device', default=None)
     args = ap.parse_args(argv)
     device = torch.device(args.device) if args.device else L.DEVICE
@@ -204,6 +237,13 @@ def main(argv=None):
         raise SystemExit('--print-samples/--print-sequences must be non-negative integers')
     if args.context_scan_positions < 0:
         raise SystemExit('--context-scan-positions must be a non-negative integer (0 means unbounded)')
+    if args.reference_alpha <= 0 or not math.isfinite(args.reference_alpha):
+        raise SystemExit('--reference-alpha must be a positive finite number')
+    if not (0.0 <= args.reference_interpolation <= 1.0) or not math.isfinite(args.reference_interpolation):
+        raise SystemExit('--reference-interpolation must be in [0, 1]')
+    if args.reference_max_fit_tokens < 0:
+        raise SystemExit('--reference-max-fit-tokens must be non-negative (0 means no cap)')
+    _reference_cap = (args.reference_max_fit_tokens or None)
     n_rows = min(n_rows, int(val_batch.shape[0]))
     val_batch = np.ascontiguousarray(val_batch[:n_rows, :seq_len])
     if val_bnd is not None:
@@ -214,10 +254,19 @@ def main(argv=None):
         else:
             val_bnd = np.ascontiguousarray(_vb[:n_rows, :seq_len])
     print(f'[errors] scoring {n_rows} validation rows x {seq_len} tokens with {os.path.basename(args.ckpt)}')
+    _t0 = time.time()
     res = L.analyze_errors(model, val_batch, vocab, device, tokenizer=tok,
                            top_n=args.top_sequences, top_tokens=args.top_tokens,
                            chunk=args.chunk, val_bnd=val_bnd, train_ids=train_ids,
-                           context_scan_max_positions=(args.context_scan_positions or None))
+                           context_scan_max_positions=(args.context_scan_positions or None),
+                           reference=args.reference, reference_alpha=args.reference_alpha,
+                           reference_interpolation=args.reference_interpolation,
+                           reference_max_fit_tokens=_reference_cap)
+    res['analysis_cost'] = {'elapsed_s': round(time.time() - _t0, 3),
+                            'n_rows': int(n_rows), 'seq_len': int(seq_len),
+                            'n_scored_tokens': int(n_rows * max(0, seq_len - 1)),
+                            'reference_max_fit_tokens': _reference_cap,
+                            'note': ('offline analysis cost only; the reference fit is capped and scored per chunk')}
     res['checkpoint'] = os.path.abspath(args.ckpt)
     res['checkpoint_sha256'] = _sha256(args.ckpt)
     res['checkpoint_meta'] = {k: _roundtrip(meta.get(k)) for k in
@@ -260,6 +309,29 @@ def main(argv=None):
         _rb = str(res.get('rare_target_basis'))
         _rp = res.get('rare_target_problem')
         lines += [f'- rare-target basis: `{_rb}`' + (f' — {_rp}' if _rp else ''), '']
+    _rc = res.get('reference_comparison') if isinstance(res.get('reference_comparison'), dict) else {}
+    if _rc.get('available'):
+        _fit = _rc.get('fit') or {}
+        lines += ['## Reference floor: model miss vs hard/noisy label', '',
+                  '> A fixed smoothed count model fitted on the **training** stream (not tuned on these validation rows) predicts the same targets. '
+                  'A token the reference gets right and the model misses is a model blind-spot candidate; a token both miss is an annotation/irreducible-error candidate until the label is checked.', '',
+                  '| quantity | value |', '|---|---|',
+                  f"| reference | `{_fit.get('mode')}`, alpha={_fit.get('alpha')}, interpolation={_fit.get('interpolation')} |",
+                  f"| fitted on | {_fit.get('n_fit_tokens')} of {_fit.get('n_source_tokens')} training token(s)" + (' (deterministic prefix)' if _fit.get('fit_truncated') else '') + ' |',
+                  f"| paired finite targets | {_rc.get('n_paired_targets')} |",
+                  f"| model CE / reference CE | {_rc.get('model_ce'):.4f} / {_rc.get('reference_ce'):.4f} |",
+                  f"| excess CE (model − reference) | {_rc.get('excess_ce_model_minus_reference'):+.4f} |",
+                  f"| model only correct | {_rc.get('n_model_only_correct')} ({100.0 * (_rc.get('share_model_only_correct') or 0):.1f}%) |",
+                  f"| reference only correct (model miss) | {_rc.get('n_reference_only_correct')} ({100.0 * (_rc.get('share_reference_only_correct') or 0):.1f}%) |",
+                  f"| both wrong (label/annotation candidate) | {_rc.get('n_both_wrong')} ({100.0 * (_rc.get('share_both_wrong') or 0):.1f}%) |",
+                  f"| both wrong and not rare/ambiguous | {_rc.get('n_both_wrong_unexplained')} ({100.0 * (_rc.get('share_both_wrong_unexplained') or 0):.1f}%) |", '']
+        if _rc.get('row_excess_ce_ci95') is not None:
+            _ci = _rc['row_excess_ce_ci95']
+            lines += [f"- Row-level (document-grouped) excess-CE 95% CI: [{_ci[0]:+.4f}, {_ci[1]:+.4f}] over {_rc.get('n_rows_with_paired_targets')} row(s).", '']
+        if not _rc.get('complete'):
+            lines += [f"- **WARNING: incomplete reference comparison** — {_rc.get('reason')}", '']
+    elif res.get('reference_problem'):
+        lines += ['', f'- reference floor unavailable: {res.get("reference_problem")}', '']
     lines += ['## Position / target buckets', '',
               '| bucket | n | mean CE | PPL |', '|---|---|---|---|']
     for k, v in sorted((res.get('buckets') or {}).items()):
@@ -298,7 +370,7 @@ def main(argv=None):
             lines.append(f'| {c} | {v.get("n")} | {(v.get("share") or 0) * 100:.1f}% | {v.get("mean_ce"):.3f} |')
     lines += ['', '## Worst tokens', '',
               '> Read the context before changing the model: a rare-but-correct target, a genuinely ambiguous continuation and a confident blind spot need different fixes.', '',
-              '| # | row | pos | CE | context (truncated) | target | predicted | top-5 | train count | entropy | rare | ctx variants | cause | boundary |', '|---|---|---|---|---|---|---|---|---|---|---|---|---|---|']
+              '| # | row | pos | CE | context (truncated) | target | predicted | top-5 | train count | entropy | rare | ctx variants | cause | ref pred | ref CE | ref verdict | boundary |', '|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|']
     _tokens = res.get('worst_tokens') if isinstance(res.get('worst_tokens'), list) else []
     for i, t in enumerate(_tokens):
         tgt = (t.get('target_text') or '').replace('|', '\\|').replace('\n', '\\n')[:80]
@@ -309,7 +381,10 @@ def main(argv=None):
             _top = t.get('topk_ids') or []
         _top_txt = ', '.join(str(x).replace('|', '\\|').replace('\n', '\\n')[:24]
                              for x in (_top[:5] if isinstance(_top, list) else []))
-        lines.append(f'| {i + 1} | {t["row"]} | {t["position"]} | {t["ce"]:.3f} | {ctx} | `{t.get("target_id")}` {tgt} | `{t.get("pred_id")}` {prd} | {_top_txt} | {t.get("target_train_count")} | {t["entropy"]:.3f} | {t.get("rare_target")} | {t.get("same_context_target_variants")} | {t.get("cause_primary")} | {t.get("is_boundary_token")} |')
+        _refp = (t.get('reference_pred_text') or '').replace('|', '\\|').replace('\n', '\\n')[:60]
+        _rce = t.get('reference_ce')
+        _rce_txt = (f'{_rce:.3f}' if isinstance(_rce, (int, float)) and math.isfinite(_rce) else 'n/a')
+        lines.append(f'| {i + 1} | {t["row"]} | {t["position"]} | {t["ce"]:.3f} | {ctx} | `{t.get("target_id")}` {tgt} | `{t.get("pred_id")}` {prd} | {_top_txt} | {t.get("target_train_count")} | {t["entropy"]:.3f} | {t.get("rare_target")} | {t.get("same_context_target_variants")} | {t.get("cause_primary")} | `{t.get("reference_pred_id")}` {_refp} | {_rce_txt} | {t.get("reference_verdict")} | {t.get("is_boundary_token")} |')
     lines += ['', '## Worst sequences', '',
               '| # | row | mean CE | NLL | context (truncated) |', '|---|---|---|---|---|']
     for i, s in enumerate(res.get('worst_sequences') or []):
