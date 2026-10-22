@@ -14540,6 +14540,25 @@ def t_split_targets_use_exact_fraction_arithmetic():
     assert DG._fraction_value(1e-16) != 0
     assert DG._floor_fraction_product(10 ** 18, 1e-16) > 0
     assert DG._floor_fraction_product(10 ** 18, 1e-15) == 1000
+    # The tolerated 1e-6 fraction slack is not idle at scale: 0.01 + 1e-9 +
+    # 0.99 is over 1 by 1e-9, and at n > 1e9 the exact floors add up to n+741.
+    # A valid split must still reconcile to n (removing the excess from the
+    # split where one row moves it least), not raise "inconsistent sizes".
+    n_over = 742878783538
+    sizes_over = DG._resolve_sizes(n_over, 0.01, 1e-9, 0.99)
+    assert sum(sizes_over) == n_over, sizes_over
+    assert all(v >= 0 for v in sizes_over), sizes_over
+    assert sizes_over[1] > 0, sizes_over
+    # The reconciliation must be O(1) in the excess, not one row at a time:
+    # the tolerated 1e-6 slack allows ~1e12 excess rows at n=1e18.
+    sizes_scale = DG._resolve_sizes(10 ** 18, 0.01, 1e-9, 0.99)
+    assert sum(sizes_scale) == 10 ** 18, sizes_scale
+    assert all(v >= 0 for v in sizes_scale), sizes_scale
+    # The same reconciliation must preserve the requested one-row-per-split
+    # floor and the exact 80/10/10 result when the fractions sum to one.
+    assert DG._resolve_sizes(3, 0.01, 1e-9, 0.99) == (1, 1, 1)
+    assert DG._resolve_sizes(n, 0.8, 0.1, 0.1) == (
+        7205759403792795, 900719925474099, 900719925474099)
     try:
         DG._resolve_sizes(10, 0.8, 0.1, 0.1, train_size=11)
     except ValueError:

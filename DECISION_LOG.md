@@ -1220,3 +1220,27 @@ endpoints/statistics, or any measured result.  The dynamic manifest remains
 as a confirmation.  Verification: new CPU tests L82-L86; the frozen plan still
 admits 72/72 synthetic records and the dynamic-design audit passes as a
 non-runnable draft.
+
+## 2026-10-22 — split-size reconciliation at scale (no new runs)
+
+**Problem.** `data_guard._resolve_sizes` accepts split fractions whose sum is
+within `1e-6` of 1.  That tolerance is harmless at small row counts, but at
+large `n` a tiny overshoot changes integer floors: `0.01 + 1e-9 + 0.99` is
+over 1 by `1e-9`, and at `n=742878783538` the exact floors sum to `n+741`.
+The old code raised `inconsistent split sizes [...]` instead of returning a
+valid chronological split, even though the requested fractions were accepted.
+This would make a scaled-up corpus fail only after its row count grew.
+
+**Changes.** `_resolve_sizes` now reconciles an over-allocated floor sum in
+bulk, proportional to each split's slack above its one-row floor, rather than
+raising.  Bulk matters: the accepted 1e-6 fraction slack can be ~1e12 rows on
+a 1e18-row corpus, so a one-row-at-a-time loop would hang.  Empty/zero-fraction
+splits are never touched, requested splits keep their one-row guarantee, and
+the normal under-allocated path is unchanged.  Exact target sizes are computed
+once as `Fraction`s, so no float product is re-evaluated during reconciliation.
+
+Verification: extended `t_split_targets_use_exact_fraction_arithmetic` with
+the large-n `0.01/1e-9/0.99` regression, the small-n one-row preservation case,
+and the unchanged exact `0.8/0.1/0.1` result at `2**53+1`.  Both CPU suites
+pass unchanged: `python test_review_fixes.py` 411 passed / 3 environment skips,
+`python test_open_block.py` 15/15.

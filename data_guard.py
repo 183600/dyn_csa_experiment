@@ -278,17 +278,55 @@ def _resolve_sizes(n, train_frac=0.8, val_frac=0.1, test_frac=0.1,
     # remainder as well.  Ties go to the later split (preserving the historical
     # zero-fraction contract), while a genuinely under-filled earlier split
     # still wins.  Splits the caller declared empty stay empty.
+    _targets = (train_frac, val_frac, test_frac)
+    _exact_targets = [_fraction_value(f) * int(n) for f in _targets]
     _remainder = n - sum(sizes)
     if _remainder < 0:
-        raise ValueError(f'inconsistent split sizes {sizes} for n={n}')
+        # The fraction sum is allowed to be within 1e-6 of 1.  At large n
+        # even a 1e-9 overshoot can make the three floored targets add up to
+        # more than n (0.01 + 1e-9 + 0.99 does exactly that at n > 1e9).  A
+        # valid split must still sum to n: return the excess while keeping
+        # every requested split non-empty.  A zero-fraction split has zero
+        # slack and is never touched.
+        _excess = -_remainder
+        # Remove the excess in BULK: the tolerated 1e-6 slack can be ~1e12
+        # rows at a 1e18-row corpus, so a one-row-at-a-time loop would hang.
+        # Every removed row adds exactly one to the L1 distance from the exact
+        # target (the floors already sit below their targets), so the split of
+        # the removal does not change that objective.  Distribute it in
+        # proportion to each split's slack above its one-row floor, which
+        # keeps every requested split non-empty and never touches an empty
+        # split.  The leftover from integer division is at most 2 rows.
+        _mins = [1 if requested[i] and n >= sum(requested) else 0
+                 for i in range(3)]
+        _slack = [max(0, int(sizes[i]) - _mins[i]) for i in range(3)]
+        _total_slack = sum(_slack)
+        if _excess > _total_slack or _total_slack <= 0:
+            raise ValueError(
+                f'could not reconcile split sizes {sizes} with n={n}')
+        _remove = [(_excess * _slack[i]) // _total_slack
+                   for i in range(3)]
+        _left = _excess - sum(_remove)
+        if _left:
+            # Largest proportional remainder first; ties go to the later
+            # split, matching the positive-remainder rule below.
+            _order = sorted(range(3),
+                            key=lambda i: ((_excess * _slack[i]) % _total_slack, i),
+                            reverse=True)
+            for i in _order:
+                if not _left:
+                    break
+                _take = min(_slack[i] - _remove[i], _left)
+                _remove[i] += _take
+                _left -= _take
+        sizes = [int(sizes[i]) - _remove[i] for i in range(3)]
+        _remainder = 0
     if _remainder:
-        _targets = (train_frac, val_frac, test_frac)
         # Rank by the exact fractional shortfall, not a rounded float
         # product: at large n a 1-ulp difference can decide which split
         # receives the remainder row.
         _best = max((i for i, flag in enumerate(requested) if flag),
-                    key=lambda i: (_fraction_value(_targets[i]) * int(n)
-                                   - int(sizes[i]), i))
+                    key=lambda i: (_exact_targets[i] - int(sizes[i]), i))
         sizes[_best] += _remainder
     if sum(sizes) != n or any(v < 0 for v in sizes):
         raise ValueError(f'inconsistent split sizes {sizes} for n={n}')
