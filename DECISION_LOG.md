@@ -2204,3 +2204,67 @@ seed drop, single-length refusal, Markdown caveats).
 environment skips; `python v12_supp.py plan` still admits 72/72 synthetic
 frozen records with the same six comparisons; `python audit_gates.py source`
 reports `ok` (23/23 files byte-identical to the regenerated plan snapshot).
+
+## 2026-10-23 — the analysis unit is a raw line, not an article (no new runs)
+
+Zero-GPU data-processing hardening; no training run, no test read, no frozen
+manifest byte, seed, recipe, endpoint, alpha, Holm family or decision rule is
+touched.
+
+**Problem.** The HF `wikitext-103-raw-v1` builder yields one row per raw
+**line** (a title heading, a paragraph, or a ` = = Section = = ` heading), not
+per article.  The loaders' "document ids" and the per-token document map are
+therefore line ids: the 60 articles of a WikiText validation split are ~2.5k
+rows.  Three consequences were not gated. (1) Exact/SimHash deduplication ran
+at line granularity, so an article whose lines were reworded or reordered
+could cross a split. (2) The "per-document" bootstrap resampled paragraph
+lines; the frozen 48×4097 prefix can contain hundreds of lines for a few dozen
+articles, so the repo's 64-document population floor could be satisfied by
+pseudoreplicates. (3) `build_tokenizer` set the ByteLevel pre-tokenizer but
+not its inverse decoder: `decode` returned BPE surface text (`Ġthe`), and
+`boundary_token_ids` therefore missed every space-prefixed punctuation token
+(`Ġ.` `Ġ,` `Ġ:` …), undercounting the boundary mask on real BPE-8k.
+
+**Changes. (1) Reversible tokenizer.** `exp_lib.build_tokenizer` now attaches
+`decoders.ByteLevel()`. Encode/token ids are unchanged; decode is lossless, so
+`boundary_token_ids` recognises space-prefixed punctuation. New caches persist
+the decoder; legacy `tok_*.json` files (decoder null) are repaired **in
+memory** by `ensure_bytelevel_decoder()` for audit purposes only, never
+rewritten. (2) Unit primitives. `wikitext_article_groups` segments raw rows by
+top-level ` = Title = ` headings (blank lines and section headings do not
+split); `wikitext_article_text` / `wikitext_article_ids` give stable
+article-level text and ids; `line_spans_from_token_doc_ids` and
+`decode_token_runs` recover served units from a cache without re-reading the
+raw test split. (3) `audit_gates.audit_document_unit` decodes the test/val
+per-token map, classifies the served unit as line/article/unknown, reports
+`n_lines` / `n_articles` / pseudoreplication and the true article count in the
+frozen prefix, and sets `document_level_claims_allowed=False` for line units.
+When raw train/valid dumps exist it additionally tests article-level leakage
+the line index cannot see: a title whose lines are served in both splits is a
+hard failure; near-duplicate articles missed by line-level cleanup are
+warnings with examples. It never reads `wiki.test.raw`. (4) New caches record
+`document_unit: "line"`, `document_unit_is_article: false` and a definition;
+`_cached_split_problems` rejects an unknown unit or an article claim without
+article-level sidecars. (5) The audit is wired into
+`audit_gates.py document_unit` and `audit_report.json`.
+
+**Boundary.** Token ids, split membership, training/evaluation slices, PPL,
+`CODE_SEMANTICS`, `confirmation_frozen*.json` and CI are unchanged.  The
+corrected boundary mask only affects newly built caches' `val_bnd`/`test_bnd`
+diagnostics, not the LM loss.  Article-level sidecars are **not** written yet:
+existing per-document vectors remain line-level, and the audit says so rather
+than silently relabelling them.  A future freeze should persist
+article/token-article sidecars before the one-shot test read and pass them to
+`eval_length_gen`; this round only reports the true article breadth and
+refuses unqualified document-level/population claims.  Missing raw dumps are
+reported as `not_verifiable_locally`, never as clean.
+
+**Verification.** New CPU tests L151 (heading segmentation, blank/section
+non-splitting, preamble/no-heading refusal, stable article ids, token runs,
+round-trip decode and space-punctuation boundary tokens) and L152 (line-unit
+warning + claim gate, frozen-prefix article count, missing-raw
+non-verification, line/article classification, and a title whose lines straddle
+train/validation failing the audit).  `python test_review_fixes.py` passes
+489/492 with the same 3 DataLoader environment skips;
+`python audit_gates.py document_unit` reports `not_verifiable_locally` with no
+cache; `python v12_supp.py plan` still admits 72/72 synthetic frozen records.

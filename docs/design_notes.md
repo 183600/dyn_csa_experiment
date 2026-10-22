@@ -2287,6 +2287,11 @@ Holm/6 时返回 None），以及
 写错：点估计仍是 token 池化 PPL（不受影响），但区间和 `n_docs` 描述的是
 行抽样，而不是文档抽样。
 
+> **单元补注（§53）。** WikiText 的 row 本身是原始**行**（标题/段落），一篇
+> 文章跨多个 row；本节所说的「文档边界」是 cache 中的 row 边界，不是文章
+> 边界。§53 给出按顶层 ` = Title = ` 标题的文章级重分组与审计入口；本节
+> 已冻结的逐 token 行分组不变（点估计也不变）。
+
 因此：
 
 - `load_wikitest` 除文档级 sidecar 外，另落**逐 token** 文档 id
@@ -2847,3 +2852,110 @@ L149 覆盖：恒定效应的零交互、线性增长效应、Holm 族、逐种�
 L150 覆盖：`log(PPL_a/PPL_b)` 口径、512 参考与回退、截断单元导致整颗
 种子剔除、负/单长度拒绝，以及 Markdown 必须保留「不显著 ≠ 相同」和
 「不改变冻结判定」的边界。
+
+## 53. 分析单元：WikiText 的「文档」是原始行，不是文章（本轮数据口径硬化）
+
+§43 把「固定行 → 逐 token 文档映射」做对了，但映射里的 `document` 仍是
+**原始数据行**。上游 `wikitext-103-raw-v1` builder 的 `_generate_examples`
+逐行 yield：一行标题、若干行段落、若干行 ` = = Section = = ` 小节标题都各是
+一个 row；空行只是文章内部的分节空行，不是文章边界。实测 WikiText-2
+validation 的 60 篇文章对应 2 461 个非空 row、60 个顶层 ` = Title = ` 标题。
+因此旧口径下的：
+
+- **去重**是行级去重：一篇被改写/重排的文章，只要每行都不同，就绕过了
+  精确 + SimHash 行索引；
+- **per-document bootstrap** 重采样的是段落行而不是独立文章；冻结前缀里
+  48 条 4097-token 行可能覆盖几十篇文章、上千行，「<64 文档」的总体门槛
+  被行数虚构地满足；
+- 冻结清单 §49.1 所说的「48 篇文档是前若干条非重复行」本身就把 row 与
+  article 混用了。
+
+本轮把单元变成可执行概念，而不是再换一个未经验证的标签。
+
+### 53.1 分词器必须可逆：ByteLevel decoder 缺失
+
+`build_tokenizer` 只设置了 `ByteLevel(add_prefix_space=True)` 预分词器，没有
+设置其逆 `ByteLevel` decoder。后果是：
+
+- `Tokenizer.decode` 返回 BPE 表面形式（`Ġthe`），不是原文；任何把 token
+  id 映射回原始行/文章的数据审计都无法工作；
+- `boundary_token_ids` 对每个 id 调用 `decode` 后检查是否全为标点。
+  带前导空格的标点 token（`Ġ.` `Ġ,` `Ġ:` `Ġ;` …）解码带 `Ġ`，被 `strip()`
+  后仍不是纯标点，于是**边界 token 掩码漏掉这些 token**。在真实
+  BPE-8k 上这是系统性少计，不是显示问题。
+
+修正：`build_tokenizer` 在训练前挂上 `decoders.ByteLevel()`；`encode` 与
+token id 完全不变，但 `decode` 变成字节级可逆，`boundary_token_ids` 能识别
+空格前缀标点。旧缓存的分词器 JSON 里 `decoder: null`，由
+`ensure_bytelevel_decoder()` 在审计的**内存**中补齐，不重写旧文件；新缓存的
+`tok_*.json` 自带 decoder。**token id、训练流、PPL 均不变**；只有新缓存
+的 `val_bnd` / `test_bnd` 掩码会包含此前漏掉的标点 token（边界诊断口径
+修正，属于数据属性，不是主终点）。
+
+### 53.2 单元原语与审计
+
+- `exp_lib.wikitext_article_groups(rows)`：空行忽略，每个顶层
+  ` = Title = ` 标题开启一篇新文章；` = = Section = = ` 不切分。返回
+  `row_group`（空行为 -1）、`n_articles`、`group_sizes`、`preamble_groups`、
+  `valid` 与问题列表。没有顶层标题时返回单个 group 且 `valid=False`，不
+  静默把每行当成文章。
+- `wikitext_article_text()` / `wikitext_article_ids()`：文章正文按行保序
+  拼接后取内容哈希；任何一行改动都会改变文章 id。
+- `line_spans_from_token_doc_ids()` / `decode_token_runs()`：把 per-token
+  id 映射还原成「一段连续同 id = 一个服务单元」并解码；这是在不重读
+  `wiki.test.raw` 的前提下把已冻结切片重新分组的唯一路径。
+- `audit_gates.audit_document_unit(cache_dir=..., seq_len=..., raw_dir=...)`：
+  1. 解码 test / validation 的 per-token 映射，按「每段是否以顶层标题
+     开头」判定服务单元是 `line` 还是 `article`，并用解码文本的内容哈希
+     复核 id 与字节自洽；切片末尾被 cap 截断的最后一行为允许的 cap 伪影；
+  2. line 单元按顶层标题重分组，报告 `n_lines / n_articles`、
+     pseudoreplication 倍数，以及冻结前缀（`n_seqs × seq_len`）里真正独立
+     的文章数，并用它判定仓库的 64-document 总体门槛；
+  3. 输出 `document_level_claims_allowed`：只有文章级单元才允许未加限定的
+     「per-document」区间/总体主张；line 单元返回 `warnings` 并给出明确
+     理由；
+  4. 当本地有 `wiki.train.raw` / `wiki.valid.raw` 时，把 raw 行哈希映射回
+     缓存中实际服务的行，检查**行级精确去重看不见的文章级泄漏**：同一篇文章
+     的行跨越 train/validation（标题相同但行不同）判 `fail`；再用与 loader
+     相同的 SimHash LSH 检查整篇被改写的近重复文章，命中给 warning 并列出
+     样例；
+  5. `wiki.test.raw` **永不读取**（那会消耗一次性 test 访问）；test 的文章
+     分组只从已落盘的 id + per-token 映射 + 分词器恢复。缺缓存/缺 raw 时
+     明确返回 `not_verifiable_locally`，不会当成 clean。
+
+### 53.3 元数据与边界
+
+新构建的 WikiText train/validation 与 test cache 在 meta 里写
+`document_unit: "line"`、`document_unit_is_article: false` 和
+`document_unit_definition`；`_cached_split_problems` 拒绝未知单元，以及
+「声明 article 却没有 article 级侧车」的自相矛盾缓存。旧 cache 没有该字段，
+读取路径不受影响，审计会从解码结果推断。
+
+边界：
+
+- **不改变任何 token id、split 成员、训练/评测切片或 PPL**；不修改
+  `confirmation_frozen*.json`、`CODE_SEMANTICS`、fixture 或 CI 配置。
+- 文章级侧车（`*_article_ids` / `*_token_article_ids`）**尚未**写入缓存：
+  本轮的 per-document 向量仍然是行级。要把评测不确定度真正改成文章级，
+  应在**下一次冻结前**写入文章级侧车并让 `eval_length_gen(doc_ids=...)`
+  使用它；冻结后的旧 cache 只报告真实文章数与「不允许文档级主张」，
+  不静默改冻结分析。
+- 文章级泄漏检查依赖 raw train/valid；没有 raw 时只报告单元，不声称
+  已排除文章级泄漏。test 侧不读 raw，因此 test 内部的分组是完整的，
+  但 test 与 train 的**部分文章**交叉（若存在）只能由未来缓存中的文章 id
+  侧车证明。
+
+入口与验证：
+
+```bash
+python test_review_fixes.py          # L151 单元原语 + 可逆分词器；L152 单元审计/文章泄漏
+python audit_gates.py document_unit  # 单命令审计（缺缓存 -> not_verifiable_locally）
+python audit_gates.py report         # 汇总新增 document_unit 段
+```
+
+L151 覆盖：顶层标题切分、空行不切分、section 标题不切分、preamble、
+无标题回退、非字符串拒绝、文章 id 稳定性、per-token run、ByteLevel 解码
+往返与空格前缀标点进入边界集。L152 覆盖：line 单元 → `warnings` 且
+`document_level_claims_allowed=False`、冻结前缀文章数、缺 raw 的
+`not_verifiable_locally`、line/article 结构分类，以及「同一文章标题的行
+跨 train/validation」被判 `fail` 的文章级泄漏。

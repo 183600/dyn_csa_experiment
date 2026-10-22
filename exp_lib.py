@@ -6977,8 +6977,17 @@ def build_tokenizer(texts, vocab_size=8192):
     from tokenizers.models import BPE
     from tokenizers.trainers import BpeTrainer
     from tokenizers.pre_tokenizers import ByteLevel
+    from tokenizers import decoders as _decoders
     tok = Tokenizer(BPE(unk_token='<unk>'))
     tok.pre_tokenizer = ByteLevel(add_prefix_space=True)
+    # The BPE is byte-level, so its inverse must be the byte-level decoder.
+    # Without this, `decode` returns the raw BPE surface ("Ġthe") instead of
+    # the original text: the persisted tokenizer is then not round-trippable,
+    # `boundary_token_ids` misses every space-prefixed punctuation token
+    # (Ġ. Ġ, Ġ: …), and no audit can map a token id back to the raw line it
+    # came from.  The decoder is the exact inverse of the pre-tokenizer and
+    # does not change `encode`/token ids by construction.
+    tok.decoder = _decoders.ByteLevel()
     trainer = BpeTrainer(vocab_size=vocab_size, special_tokens=['<pad>', '<unk>', '<bos>', '<eos>'])
     tok.train_from_iterator(texts, trainer=trainer)
     return tok
@@ -7342,6 +7351,25 @@ def _cached_split_problems(meta, train_ids, val_batch, val_bnd, vocab, seq_len=N
         problems.append('metadata records a shuffled split; time/group order cannot be trusted')
     if meta.get('tokenizer_fit_split') not in (None, 'train'):
         problems.append(f"tokenizer was fitted on {meta.get('tokenizer_fit_split')!r}, not train")
+    # The unit of the persisted ids is part of the cache's meaning.  A cache
+    # may declare "line" (current WikiText rows) or "article" (a future
+    # regrouping); an article claim without article-level sidecars would make
+    # every per-document statistic silently line-level, so it is refused here.
+    _du = meta.get('document_unit')
+    if _du is not None and _du not in ('line', 'article'):
+        problems.append(
+            f'document_unit={_du!r} is not one of "line"/"article"')
+    if _du == 'article' and meta.get('document_unit_is_article') is not True:
+        problems.append(
+            'cache declares document_unit=article but does not attest that '
+            'the persisted ids are article-level')
+    if _du == 'article' and meta.get('article_sidecars') is not True:
+        problems.append(
+            'cache declares document_unit=article but records no article-level '
+            'sidecar attestation (article_sidecars=true)')
+    if _du == 'line' and meta.get('document_unit_is_article') is True:
+        problems.append(
+            'cache declares line document_unit but document_unit_is_article=true')
     if not problems and not ranges_trusted:
         for _arr, _label in ((train_ids, 'cached train_ids'), (vb, 'cached val_batch')):
             try:
@@ -7851,6 +7879,17 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=None, val_seqs=512,
         'file_sigs': _file_sigs,
         'id_range': {'train': _array_id_range(train_ids), 'val': _array_id_range(val_batch)},
         'split_strategy': 'official_train_validation_test_deduplicated',
+        # A WikiText row is one raw line (a heading or a paragraph), not one
+        # article.  The ids below group by that row; downstream "per-document"
+        # statistics must either name this unit or regroup by top-level
+        # headings (audit_gates.audit_document_unit).  Recorded explicitly so a
+        # later reader cannot mistake the unit for an article by convention.
+        'document_unit': 'line',
+        'document_unit_is_article': False,
+        'document_unit_definition': (
+            'one non-empty raw WikiText row (heading/paragraph line); an '
+            'article spans multiple rows and is delimited by top-level '
+            '" = Title = " headings'),
         'split_fingerprints': {
             'fingerprint_algorithm': _IDS_FP_ALGO,
             'train': {'file': os.path.basename(tr_path), 'ids_fp': _ids_fp(train_ids),
@@ -8864,6 +8903,14 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=None, cache_dir=None,
         'file_sigs': _file_sigs,
         'id_range': {'test': _array_id_range(test_batch)},
         'split_strategy': 'official_dataset_test_split_near_duplicate_filtered',
+        # See load_wikitext: the per-token map groups by raw LINE, not by
+        # article.  The document-level readout must name/regroup that unit.
+        'document_unit': 'line',
+        'document_unit_is_article': False,
+        'document_unit_definition': (
+            'one non-empty raw WikiText row (heading/paragraph line); an '
+            'article spans multiple rows and is delimited by top-level '
+            '" = Title = " headings'),
         'split_fingerprints': {
             'fingerprint_algorithm': _IDS_FP_ALGO,
             'test': {'file': os.path.basename(te_path),
@@ -9135,6 +9182,234 @@ def _hamming64(a, b):
 def _doc_id_u64(doc_id):
     h = hashlib.blake2b(str(doc_id).encode('utf-8', errors='replace'), digest_size=8)
     return np.uint64(int.from_bytes(h.digest(), 'little'))
+
+
+# ---------------------------------------------------------------------------
+# WikiText row units: line vs article
+# ---------------------------------------------------------------------------
+# The HF `wikitext-103-raw-v1` builder yields ONE ROW PER RAW LINE, including
+# section headings and blank lines (see the upstream builder's
+# `_generate_examples`).  A WikiText *article* therefore spans many rows: its
+# title is a top-level heading (` = Title = `), its sections are inner headings
+# (` = = Section = = `), and blank lines occur *inside* an article between
+# sections.  The loaders have historically called a row a "document", which is
+# a unit-of-analysis error: line-level dedup cannot see an article whose lines
+# were reworded/reordered, and a line-level bootstrap resamples paragraphs,
+# not independent articles.  These helpers make the unit explicit and let the
+# audits (re)group served lines back into articles without touching token ids.
+_WIKITEXT_TOP_HEADING_RE = re.compile(
+    r'^\s*=\s*([^=\s](?:[^=]*[^=\s])?)\s*=\s*$')
+# The same heading at the START of a decoded run.  A whole-article run
+# decodes to " = Title =  body ..." (the per-line EOS tokens are skipped by
+# decode, so there need not be a newline after the title); the full-line form
+# above would reject it.  This prefix form deliberately excludes section
+# headings (the character after the first "=" is another "=").
+_WIKITEXT_TOP_HEADING_PREFIX_RE = re.compile(
+    r'^\s*=\s*[^=\s](?:[^=]*?[^=\s])?\s*=')
+
+
+def wikitext_article_groups(rows):
+    """Group raw WikiText rows into articles by top-level headings.
+
+    ``rows`` are the raw strings a loader sees (HF rows or a local
+    ``wiki.*.raw`` dump).  Blank rows are ignored; every non-blank row that
+    matches a top-level `` = Title = `` heading starts a new article, and all
+    following non-heading rows (including `` = = Section = = `` headings)
+    belong to it until the next top-level heading.  This is the actual
+    WikiText segmentation: blank lines separate *sections/paragraph groups*
+    inside an article, not articles (verified by the 60 top-level headings in
+    the 60-article WikiText-2 validation split).
+
+    Returns a dict with ``row_group`` (-1 for blank rows), ``groups`` (row
+    index lists), ``n_articles``, and diagnostics.  A corpus without any
+    top-level heading is not silently cut into one-line "articles": it is
+    returned as a single group with ``valid=False`` so the caller can refuse
+    or fall back explicitly.
+    """
+    try:
+        _rows = list(rows)
+    except TypeError:
+        raise TypeError(
+            f'wikitext_article_groups: rows must be iterable, got {type(rows).__name__}') from None
+    n_rows = len(_rows)
+    group_of = np.full(n_rows, -1, dtype=np.int64)
+    groups = []
+    heading_rows = []
+    cur = []
+    for _i, _raw in enumerate(_rows):
+        if not isinstance(_raw, str):
+            raise TypeError(
+                'wikitext_article_groups: every row must be a string, got '
+                f'{type(_raw).__name__} at row {_i}')
+        _s = _raw.rstrip('\r\n')
+        if not _s.strip():
+            continue
+        if _WIKITEXT_TOP_HEADING_RE.match(_s):
+            if cur:
+                groups.append(cur)
+            heading_rows.append(_i)
+            cur = [_i]
+        else:
+            if not cur:
+                # A preamble before the first title (rare) is its own article
+                # but carries no heading, which the diagnostics expose.
+                cur = [_i]
+            else:
+                cur.append(_i)
+    if cur:
+        groups.append(cur)
+    for _g, _idxs in enumerate(groups):
+        group_of[np.asarray(_idxs, dtype=np.int64)] = _g
+    group_sizes = [int(len(_g)) for _g in groups]
+    group_has_heading = [
+        bool(_WIKITEXT_TOP_HEADING_RE.match(_rows[int(_g[0])].rstrip('\r\n')))
+        for _g in groups
+    ]
+    preamble_groups = int(sum(1 for _h in group_has_heading if not _h))
+    has_headings = bool(heading_rows)
+    problems = []
+    if n_rows and not has_headings:
+        problems.append(
+            'no top-level " = Title = " heading was found; the corpus cannot '
+            'be segmented into articles and is returned as one group')
+    if preamble_groups and has_headings:
+        # Rows before the first title are not part of any article; report them
+        # instead of folding them into the first article silently.
+        problems.append(
+            f'{preamble_groups} headerless group(s) precede the first title')
+    valid = bool(has_headings and not problems)
+    return {
+        'unit': 'article',
+        'boundary_rule': 'top_level_heading',
+        'row_group': group_of,
+        'groups': groups,
+        'heading_rows': heading_rows,
+        'n_rows': int(n_rows),
+        'n_nonempty_rows': int(sum(group_sizes)),
+        'n_articles': int(len(groups)),
+        'group_sizes': group_sizes,
+        'group_has_heading': group_has_heading,
+        'preamble_groups': int(preamble_groups),
+        'has_headings': bool(has_headings),
+        'max_group_rows': int(max(group_sizes)) if group_sizes else 0,
+        'mean_group_rows': (float(np.mean(group_sizes)) if group_sizes else 0.0),
+        'valid': bool(valid),
+        'problems': problems,
+    }
+
+
+def wikitext_article_text(rows, group):
+    """Canonical text of one article group (used for article-level dedup)."""
+    _parts = []
+    for _i in group:
+        _s = rows[int(_i)]
+        if not isinstance(_s, str):
+            raise TypeError(
+                f'wikitext_article_text: row {int(_i)} is not a string')
+        _s = _s.rstrip('\r\n')
+        if _s.strip():
+            _parts.append(_s)
+    return '\n'.join(_parts)
+
+
+def wikitext_article_ids(rows, groups):
+    """Stable article ids: content hash of the concatenated article text.
+
+    The loader's existing document id is a hash of ONE row; an article id is a
+    hash of the article's rows joined in order, so it is stable across caches
+    built from the same raw source and it changes if any line changes.
+    """
+    return [int(_doc_id_u64(_doc_exact_fp(wikitext_article_text(rows, _g))))
+            for _g in groups]
+
+
+def line_spans_from_token_doc_ids(token_doc_ids):
+    """Runs of equal ids in a per-token document map -> ``(start, stop, id)``.
+
+    The per-token sidecar written by the loader repeats one line/document id
+    for every token of that row (EOS included).  A run is therefore one served
+    raw row; decoding the run recovers the line text without re-reading the
+    corpus.  Used by the document-unit audit to regroup a frozen slice.
+    """
+    _arr = np.asarray(token_doc_ids)
+    if _arr.ndim != 1:
+        raise ValueError(
+            f'line_spans_from_token_doc_ids: expected a 1-D map, got shape {_arr.shape}')
+    if _arr.dtype.kind not in 'iu':
+        raise ValueError(
+            'line_spans_from_token_doc_ids: token document ids must be '
+            f'integers, got dtype {_arr.dtype}')
+    if _arr.size and int(_arr.min()) < 0:
+        raise ValueError(
+            'line_spans_from_token_doc_ids: token document ids must be non-negative')
+    if _arr.size == 0:
+        return []
+    _change = np.flatnonzero(_arr[1:] != _arr[:-1]) + 1
+    _starts = np.concatenate((np.asarray([0], dtype=np.int64), _change))
+    _stops = np.concatenate((_change, np.asarray([_arr.size], dtype=np.int64)))
+    return [(int(_s), int(_e), int(_arr[int(_s)]))
+            for _s, _e in zip(_starts, _stops)]
+
+
+def ensure_bytelevel_decoder(tok):
+    """Attach the inverse of the byte-level pre-tokenizer, if it is missing.
+
+    Legacy caches were persisted before `build_tokenizer` set the decoder, so
+    their JSON has `decoder: null`.  Encode/ids are unaffected; this repairs
+    only the in-memory decode path used by audits.  Returns True when a decoder
+    was attached by this call.
+    """
+    try:
+        if getattr(tok, 'decoder', None) is not None:
+            return False
+    except Exception:
+        return False
+    try:
+        from tokenizers import decoders as _decoders
+        tok.decoder = _decoders.ByteLevel()
+        return True
+    except Exception:
+        return False
+
+
+def decode_token_runs(token_ids, spans, tok, *, chunk=4096):
+    """Decode each ``(start, stop, id)`` run of a token stream to text.
+
+    Returns ``(texts, problems)``.  Decoding is only used for diagnostics and
+    grouping; it does not rewrite any token or cache byte.  A run that fails to
+    decode becomes ``None`` and is counted in ``problems`` instead of aborting
+    the whole audit.  A legacy tokenizer with no decoder gets the byte-level
+    inverse attached in memory first, so old caches remain auditable without a
+    rebuild.
+    """
+    ensure_bytelevel_decoder(tok)
+    _ids = np.asarray(token_ids).reshape(-1)
+    texts = []
+    problems = []
+    try:
+        _spans = list(spans)
+    except TypeError:
+        raise TypeError(
+            f'decode_token_runs: spans must be iterable, got {type(spans).__name__}') from None
+    _step = max(1, int(chunk))
+    for _off in range(0, len(_spans), _step):
+        _batch = _spans[_off:_off + _step]
+        _encoded = []
+        for _s, _e, _doc in _batch:
+            if (not isinstance(_s, int) or not isinstance(_e, int)
+                    or _s < 0 or _e < _s or _e > int(_ids.size)):
+                raise ValueError(
+                    f'decode_token_runs: invalid span ({_s!r}, {_e!r}) for a '
+                    f'{int(_ids.size)}-token stream')
+            _encoded.append([int(_x) for _x in _ids[_s:_e]])
+        try:
+            _decoded = tok.decode_batch(_encoded)
+        except (AttributeError, TypeError, ValueError) as _e:
+            problems.append(f'decode_batch failed: {type(_e).__name__}: {_e}')
+            texts.extend([None] * len(_batch))
+            continue
+        texts.extend(_decoded)
+    return texts, problems
 
 
 class _DocDeduplicator:

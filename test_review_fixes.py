@@ -18967,6 +18967,213 @@ def t_length_interaction_analysis_and_markdown():
     assert V12._length_interaction_markdown('cmp', {}) == []
 
 
+def t_wikitext_article_unit_primitives():
+    """L151 — the raw-row unit is a line; articles are heading-delimited."""
+    rows = ['\r', ' = Alpha = \r', ' = = Section = = \r', ' A paragraph. \r',
+            ' = Beta = ', ' Another paragraph. ']
+    g = L.wikitext_article_groups(rows)
+    assert g['n_articles'] == 2, g
+    assert g['n_nonempty_rows'] == 5, g
+    assert g['group_sizes'] == [3, 2], g
+    assert g['group_has_heading'] == [True, True], g
+    assert g['valid'] is True and g['boundary_rule'] == 'top_level_heading', g
+    assert g['row_group'][0] == -1 and g['row_group'][1] == 0, g
+    assert g['row_group'][4] == 1, g
+    # A blank line inside an article (between sections) must not split it.
+    assert ' = = Section = = ' in L.wikitext_article_text(rows, g['groups'][0]), g
+    # Preamble rows are reported, not silently folded into the first article.
+    g2 = L.wikitext_article_groups([' intro ', ' = Alpha = ', ' body '])
+    assert g2['n_articles'] == 2 and g2['preamble_groups'] == 1, g2
+    assert g2['valid'] is False, g2
+    # No top-level heading: the corpus is one group and explicitly invalid.
+    g3 = L.wikitext_article_groups([' a ', ' b ', ' c '])
+    assert g3['n_articles'] == 1 and g3['valid'] is False, g3
+    assert g3['has_headings'] is False, g3
+    # Non-string rows are refused instead of coerced (a bytes row would hash
+    # differently from the loader's str row).
+    try:
+        L.wikitext_article_groups([' a ', b' b '])
+    except TypeError:
+        pass
+    else:
+        raise AssertionError('article grouping must refuse non-string rows')
+    # Stable article ids: same rows -> same id; any edited line -> new id.
+    a1 = L.wikitext_article_ids(rows, g['groups'])
+    a2 = L.wikitext_article_ids(rows, g['groups'])
+    assert a1 == a2 and len(a1) == 2 and a1[0] != a1[1], (a1, a2)
+    edited = list(rows)
+    edited[3] = ' A changed paragraph. '
+    assert L.wikitext_article_ids(edited, g['groups'])[0] != a1[0]
+    # A cache may not claim a unit it does not persist: article claims without
+    # article sidecars are refused, as is a contradictory line/article pair.
+    _tr = np.arange(16, dtype=np.int32)
+    _vb = np.zeros((2, 8), dtype=np.int64)
+    _bnd = np.zeros_like(_vb, dtype=bool)
+    for _meta, _needle in (
+            ({'document_unit': 'paragraph'}, 'document_unit'),
+            ({'document_unit': 'article'}, 'article-level sidecar'),
+            ({'document_unit': 'line', 'document_unit_is_article': True},
+             'document_unit_is_article')):
+        _p = L._cached_split_problems(_meta, _tr, _vb, _bnd, 512,
+                                      fingerprints_trusted=True,
+                                      ranges_trusted=True)
+        assert any(_needle in x for x in _p), (_meta, _p)
+    # Per-token run recovery: only equal-id runs are merged.
+    spans = L.line_spans_from_token_doc_ids(np.asarray([7, 7, 7, 9, 9, 1]))
+    assert spans == [(0, 3, 7), (3, 5, 9), (5, 6, 1)], spans
+    for bad in (np.asarray([[1, 2]]), np.asarray([1.0, 2.0]), np.asarray([-1, 2])):
+        try:
+            L.line_spans_from_token_doc_ids(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'line spans accepted {bad!r}')
+
+    # The tokenizer must be round-trippable: a byte-level BPE without its
+    # inverse silently decodes to the BPE surface and loses space-prefixed
+    # punctuation from boundary_token_ids.
+    corpus = ([' hello . hello . hello . '] * 50
+              + ['abcdefghijklmnopqrstuvwxyz ABCDEFGHIJKLMNOPQRSTUVWXYZ 0123456789 .,:;!?'] * 8)
+    tok = L.build_tokenizer(corpus, 512)
+    assert tok.decoder is not None, 'build_tokenizer must attach the ByteLevel decoder'
+    text = ' hello . '
+    assert tok.decode(tok.encode(text).ids) == text, (tok.decode(tok.encode(text).ids), text)
+    bnd = L.boundary_token_ids(tok, tok.token_to_id('<eos>'))
+    enc = tok.encode(text)
+    surf = [tok.id_to_token(i) for i in enc.ids]
+    spaced_punct = [i for i, s in zip(enc.ids, surf)
+                    if s.startswith('Ġ') and s[1:].strip()
+                    and all(c in L.PUNCT_CHARS for c in s[1:].strip())]
+    assert spaced_punct, surf
+    assert all(i in bnd for i in spaced_punct), (spaced_punct, surf, sorted(bnd))
+    # A legacy tokenizer JSON (decoder null) is still auditable in memory.
+    tok.decoder = None
+    assert L.ensure_bytelevel_decoder(tok) is True
+    assert tok.decode(tok.encode(text).ids) == text
+
+
+def _write_document_unit_fixture(td):
+    """Minimal line-unit WikiText cache + raw dumps for the L152 audit."""
+    train = [' = Alpha = ', ' Alpha is a test article. ', ' It has two lines. ',
+             ' = Beta = ', ' Beta is another article. ']
+    val = [' = Gamma = ', ' Gamma is a validation article. ']
+    test = [' = Alpha = ', ' Alpha is a test article. ', ' It has two lines. ',
+            ' = Beta = ', ' Beta is another article. ', ' Another line here. ']
+    sl, vocab = 8, 512
+    fit = [r for r in train if r.strip()] + [
+        'abcdefghijklmnopqrstuvwxyz ABCDEFGHIJKLMNOPQRSTUVWXYZ 0123456789 .,:;!?']
+    tok = L.build_tokenizer(fit, vocab)
+    eos = tok.token_to_id('<eos>')
+    tr_len = []
+    tr = L._tokenise_row_chunks([train], 10 ** 9, 'train', tok, eos, lengths_out=tr_len)
+    tr_rows = [r for r in train if r.strip()]
+    tr_doc = L._doc_ids_for_capped_rows(tr_rows, tr_len, len(tr))
+    va_len = []
+    va = L._tokenise_row_chunks([val], 10 ** 9, 'val', tok, eos, lengths_out=va_len)
+    va_rows = [r for r in val if r.strip()]
+    nv = len(va) // sl
+    va_batch = va[:nv * sl].reshape(nv, sl)
+    va_doc = L._doc_ids_for_capped_rows(va_rows, va_len, nv * sl)
+    va_tok = L._token_doc_ids_for_capped_rows(va_rows, va_len, nv * sl)
+    te_len = []
+    te = L._tokenise_row_chunks([test], 10 ** 9, 'test', tok, eos, lengths_out=te_len)
+    te_rows = [r for r in test if r.strip()]
+    nt = len(te) // sl
+    te_batch = te[:nt * sl].reshape(nt, sl)
+    te_doc = L._doc_ids_for_capped_rows(te_rows, te_len, nt * sl)
+    te_tok = L._token_doc_ids_for_capped_rows(te_rows, te_len, nt * sl)
+    tag = f'v5_sl{sl}_capX_v{vocab}_vsX'
+    np.save(os.path.join(td, f'train_ids_{tag}.npy'), tr.astype(np.int32))
+    np.save(os.path.join(td, f'val_batch_{tag}.npy'), va_batch.astype(np.int64))
+    np.save(os.path.join(td, f'val_bnd_{tag}.npy'), np.zeros_like(va_batch, dtype=bool))
+    np.save(os.path.join(td, f'train_doc_ids_{tag}.npy'), tr_doc)
+    np.save(os.path.join(td, f'val_doc_ids_{tag}.npy'), va_doc)
+    np.save(os.path.join(td, f'val_token_doc_ids_{tag}.npy'), va_tok)
+    tok.save(os.path.join(td, f'tok_{tag}.json'))
+    meta = {'vocab': vocab, 'seq_len': sl, 'fit_fp': 'FIT', 'src_fp': 'x',
+            'val_fp': 'y', 'document_unit': 'line',
+            'document_unit_is_article': False}
+    with open(os.path.join(td, f'meta_{tag}.json'), 'w', encoding='utf-8') as f:
+        json.dump(meta, f)
+    ttag = f'v2_sl{sl}_v{vocab}_ns{nt}'
+    np.save(os.path.join(td, f'test_ids_{ttag}.npy'), te_batch.astype(np.int64))
+    np.save(os.path.join(td, f'test_bnd_{ttag}.npy'), np.zeros_like(te_batch, dtype=bool))
+    np.save(os.path.join(td, f'test_doc_ids_{ttag}.npy'), te_doc)
+    np.save(os.path.join(td, f'test_token_doc_ids_{ttag}.npy'), te_tok)
+    tok.save(os.path.join(td, f'test_tok_{ttag}.json'))
+    with open(os.path.join(td, f'test_meta_{ttag}.json'), 'w', encoding='utf-8') as f:
+        json.dump({'vocab': vocab, 'seq_len': sl, 'fit_fp': 'FIT', 'src_fp': 'x',
+                   'bnd_fp': 'z', 'document_unit': 'line',
+                   'document_unit_is_article': False,
+                   'split_fingerprints': {'test': {'sequences': int(nt),
+                                                   'seq_len': int(sl)}}}, f)
+    raw = os.path.join(td, 'raw')
+    os.makedirs(raw, exist_ok=True)
+    with open(os.path.join(raw, 'wiki.train.raw'), 'w', encoding='utf-8') as f:
+        f.write('\n'.join(train) + '\n')
+    with open(os.path.join(raw, 'wiki.valid.raw'), 'w', encoding='utf-8') as f:
+        f.write('\n'.join(val) + '\n')
+    return {'tag': tag, 'ttag': ttag, 'raw': raw,
+            'val_doc_path': os.path.join(td, f'val_doc_ids_{tag}.npy')}
+
+
+def t_document_unit_audit_detects_line_vs_article():
+    """L152 — the audit names the served unit and refuses document claims."""
+    td = tempfile.mkdtemp(prefix='docunit_')
+    try:
+        info = _write_document_unit_fixture(td)
+        with contextlib.redirect_stdout(io.StringIO()):
+            rep = A.audit_document_unit(td, raw_dir=info['raw'])
+        rec = rep['caches'][os.path.abspath(td)]
+        assert rep['status'] == 'warnings', rep
+        assert rec['unit'] == 'line' and rec['document_level_claims_allowed'] is False
+        assert rec['test']['n_lines'] == 6 and rec['test']['n_articles'] == 2, rec['test']
+        assert rec['test']['frozen_prefix']['distinct_articles'] == 2, rec['test']
+        assert rec['test']['claims']['document_level_claims_allowed'] is False
+        assert rec['test']['claims']['population_claim_allowed'] is False
+        assert rec['test']['claims']['n_independent_articles_in_slice'] == 2
+        assert rec['article_leakage']['raw_train_articles'] == 2
+        assert rec['article_leakage']['raw_validation_articles'] == 1
+        assert rec['article_leakage']['articles_with_served_lines_in_both_splits'] == 0
+        # Missing raw data is a disclosed non-verification, not "clean".
+        with contextlib.redirect_stdout(io.StringIO()):
+            rep_noraw = A.audit_document_unit(td, raw_dir=os.path.join(td, 'absent'))
+        rec_noraw = rep_noraw['caches'][os.path.abspath(td)]
+        assert rec_noraw['article_leakage']['status'] == 'not_verifiable_locally'
+        assert rec_noraw['document_level_claims_allowed'] is False
+
+        # Article-unit classification: each run is a whole article and starts
+        # with a heading; a line unit has non-heading runs.
+        art_texts = [' = Alpha = \n Alpha body. ', ' = Beta = \n Beta body. ']
+        art_runs = [((i * 10, i * 10 + 5,
+                      int(L._doc_id_u64(L._doc_exact_fp(t)))), t)
+                    for i, t in enumerate(art_texts)]
+        assert A._unit_classify_runs(art_runs, L)['unit'] == 'article'
+        line_texts = [' = Alpha = ', ' Alpha body. ', ' = Beta = ', ' Beta body. ']
+        line_runs = [((i * 5, i * 5 + 5,
+                       int(L._doc_id_u64(L._doc_exact_fp(t)))), t)
+                     for i, t in enumerate(line_texts)]
+        assert A._unit_classify_runs(line_runs, L)['unit'] == 'line'
+
+        # An article whose served lines straddle train and validation is
+        # invisible to the exact line index; the raw article title makes it
+        # visible and fails the gate.
+        arr = np.load(info['val_doc_path'])
+        extra = L._doc_id_u64(L._doc_exact_fp(' Alpha has another line. '))
+        np.save(info['val_doc_path'], np.append(arr, np.asarray([extra], dtype=np.uint64)))
+        with open(os.path.join(info['raw'], 'wiki.valid.raw'), 'a', encoding='utf-8') as f:
+            f.write(' = Alpha = \n Alpha has another line. \n')
+        with contextlib.redirect_stdout(io.StringIO()):
+            rep2 = A.audit_document_unit(td, raw_dir=info['raw'])
+        rec2 = rep2['caches'][os.path.abspath(td)]
+        assert rep2['status'] == 'fail', rep2
+        assert rec2['article_leakage']['articles_with_served_lines_in_both_splits'] >= 1
+        assert rec2['document_level_claims_allowed'] is False
+        assert any('article leakage' in p for p in rep2['problems']), rep2['problems']
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -19458,6 +19665,8 @@ def main():
     _check('L148 logit thresholds + terminal manifest status + NaN calibration', t_metric_threshold_and_manifest_status_guards)
     _check('L149 paired effect modification across conditions', t_effect_modification_across_conditions)
     _check('L150 length interaction uses within-seed log effects', t_length_interaction_analysis_and_markdown)
+    _check('L151 WikiText row/line/article unit primitives + round-trip tokenizer', t_wikitext_article_unit_primitives)
+    _check('L152 document-unit audit refuses line pseudodocuments and catches article leakage', t_document_unit_audit_detects_line_vs_article)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')
