@@ -65,6 +65,7 @@ __all__ = [
     'grouped_chronological_split_indices',
     'prepare_features',
     'split_and_prepare',
+    'split_content_fingerprints',
     'split_indices',
     'train_val_test_split',
 ]
@@ -3616,6 +3617,51 @@ def clean_training_rows(X, y=None, *, train_idx, drop_duplicates=True,
     }
 
 
+def _split_index_fingerprint(idx):
+    a = np.asarray(idx, dtype=np.int64).reshape(-1)
+    h = hashlib.sha256()
+    h.update(np.asarray(a.shape, dtype=np.int64).tobytes())
+    if a.size:
+        h.update(np.ascontiguousarray(a).tobytes())
+    return h.hexdigest()
+
+
+def split_content_fingerprints(X, y, indices):
+    """Per-split content fingerprints of exactly the rows that will be used.
+
+    A single aggregate digest cannot prove that train, validation and test
+    each kept the identity the analysis assumes.  These are order-sensitive
+    content digests (row order is part of the served data), plus the index
+    digest so a reordering/split-boundary change is visible even when the
+    multiset of rows is unchanged.  Preprocessing must be fitted after this
+    point; the fingerprints describe the raw split content.
+    """
+    X = np.asarray(X)
+    yarr = None if y is None else np.asarray(y)
+    out = {}
+    for name in SPLIT_NAMES:
+        idx = np.asarray(indices.get(name, []), dtype=np.int64).reshape(-1)
+        Xs = _take(X, idx)
+        rec = {'n_rows': int(idx.size),
+               'index_fp': _split_index_fingerprint(idx),
+               'content_fp': None}
+        try:
+            rec['content_fp'] = _matrix_fingerprint(Xs)
+        except (TypeError, ValueError, OverflowError) as e:
+            rec['content_fp_error'] = f'{type(e).__name__}: {e}'
+        if yarr is not None:
+            ys = _take(yarr, idx)
+            try:
+                rec['target_fp'] = _matrix_fingerprint(np.asarray(ys).reshape(-1, 1))
+            except (TypeError, ValueError, OverflowError):
+                h = hashlib.sha256()
+                h.update(json.dumps([repr(v) for v in np.asarray(ys).reshape(-1).tolist()],
+                                    ensure_ascii=True, sort_keys=True).encode('utf-8'))
+                rec['target_fp'] = h.hexdigest()
+        out[name] = rec
+    return out
+
+
 def split_and_prepare(X, y=None, *, time=None, groups=None,
                       train_frac=0.8, val_frac=0.1, test_frac=0.1,
                       train_size=None, val_size=None, test_size=None,
@@ -3765,6 +3811,13 @@ def split_and_prepare(X, y=None, *, time=None, groups=None,
                 'explicitly reported sensitivity run')
     raw_X = {name: _take(Xarr, idx[name]) for name in SPLIT_NAMES}
     out = {'indices': idx, 'X': dict(raw_X)}
+    # Bind each returned split to its raw content before any preprocessing
+    # statistic is fitted; a downstream pairing can then prove it received the
+    # same train/validation/test bytes rather than just the same row count.
+    out['split_fingerprints'] = split_content_fingerprints(Xarr, yarr, idx)
+    out['fingerprint_policy'] = ('per-split order-sensitive content + index digests '
+                                 'computed BEFORE preprocessing; test is never used '
+                                 'to fit any statistic')
     if _dup_check is not None:
         out['cross_split_duplicates'] = _dup_check
     else:

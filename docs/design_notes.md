@@ -276,6 +276,14 @@ RNG 流、不改返回内容，因此不触碰 §3.1 的可比性（`CODE_SEMANT
 随机切割基线有两种口径（固定块数 / 每序列独立切），统计含义不同，
 任何聚合、配对、绘图都必须分开处理。
 
+代码落点：`boundary_alignment(..., rand_kind=...)` 接受
+`matched_cut_count`（固定块数/匹配切割数）与
+`per_sequence_independent`（每序列独立切），每个 cell 记录
+`bnd_rand_kind` 与 `bnd_rand_definition`；独立切口径的闭式值是覆盖率近似，
+因此同时记 `bnd_rand_exact: False`，不参与精确口径的池化。`aggregate` 遇到
+同一臂混用两种口径时只报 `boundary_rand_kind_conflict`，不产出
+`boundary_excess_dyn`；`fuse_analysis` 同样把混口径的层序列整体屏蔽。
+
 ## 11. 窗口掩码的带宽包含对角线
 
 窗口掩码的 live 区间是 `(i - w, i]`——对角线（token 读自己）包含在内，

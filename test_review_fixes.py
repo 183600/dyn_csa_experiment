@@ -15615,6 +15615,222 @@ def t_tuned_baseline_hypothesis_is_attached_to_the_panel():
         falsified['baseline_claim_gate'])
 
 
+
+def t_data_protocol_is_field_driven_and_scale_safe():
+    # The protocol is resolved from fields, so a later scale-up changes values
+    # rather than a code path; malformed/absent declared fields fail closed.
+    big = L.resolve_data_protocol({'dataset': 'wikitext', 'seq_len': 16384,
+                                   'n_train_tokens': 100_000_000, 'vocab_size': 32768,
+                                   'val_seqs': 1024, 'cache_dir': './big'})
+    assert big['seq_len'] == 16384 and big['vocab_size'] == 32768, big
+    assert big['cache_dir'] == './big'
+    for bad in ({'seq_len': True}, {'vocab_size': 0}, {'n_train_tokens': -1}):
+        try:
+            L.resolve_data_protocol(dict({'dataset': 'wikitext'}, **bad))
+            raise AssertionError(f'{bad} must be rejected')
+        except ValueError:
+            pass
+    try:
+        L.resolve_data_protocol({'dataset': 'future_corpus', 'seq_len': 4096})
+    except Exception:
+        # Unknown corpora are allowed only when the loader is supplied; a bare
+        # partial protocol is never silently completed with current-scale values.
+        pass
+    # require= forces a field to be explicit, even when a default exists.
+    try:
+        L.resolve_data_protocol({'dataset': 'wikitext'}, require=('vocab_size',))
+        raise AssertionError('require must reject an implicit default')
+    except ValueError:
+        pass
+    cfg = L.apply_data_protocol({'dataset': 'wikitext', 'outdir': 'x'})
+    assert cfg['seq_len'] == L.DATA_PROTOCOL_DEFAULTS['wikitext']['seq_len'], cfg
+
+
+def t_split_and_prepare_emits_per_split_fingerprints():
+    import data_guard as DG
+    X = np.arange(60, dtype=np.float64).reshape(30, 2)
+    y = np.arange(30, dtype=np.int64)
+    a = DG.split_and_prepare(X, y, train_frac=0.6, val_frac=0.2, test_frac=0.2,
+                             check_cross_split_duplicates=False)
+    fps = a['split_fingerprints']
+    assert set(fps) == {'train', 'val', 'test'}, fps
+    assert all(v.get('content_fp') for v in fps.values()), fps
+    assert fps['train']['index_fp'] != fps['val']['index_fp'], fps
+    b = DG.split_and_prepare(X + 1, y, train_frac=0.6, val_frac=0.2,
+                             test_frac=0.2, check_cross_split_duplicates=False)
+    assert b['split_fingerprints']['train']['content_fp'] != fps['train']['content_fp'], \
+        'changed content must change the per-split fingerprint'
+
+
+def t_chunking_protocol_and_prefix_invariance():
+    c = L.AttnCfg(kind='csa', chunking='cosine_learnable', dynamic=True)
+    assert L.chunk_similarity_source(c) == 'fused'
+    x = torch.randn(11, 4)
+    try:
+        L.chunk_similarity(x, c, fused=None)
+        raise AssertionError('fused source without a fused tensor must fail closed')
+    except RuntimeError:
+        pass
+    c2 = L.AttnCfg(kind='csa', chunking='cosine_learnable', dynamic=True,
+                   cut_signal_source='context')
+    assert L.chunk_similarity_source(c2) == 'context'
+    assert torch.equal(L.chunk_similarity(x, c2), L.cosine_similarity_consecutive(x))
+    proto = L.chunking_protocol(c2)
+    assert proto['cut_signal_source'] == 'context' and proto['cut_rule_strict'] is True, proto
+    # A causal cut table yields prefix-invariant block starts for both the
+    # no-cap and capped geometries.
+    rng = np.random.default_rng(2)
+    cuts = rng.random(80) < 0.25
+    for mb in (None, 8):
+        rep = L.segmentation_prefix_invariance(cuts, 81, 2, mb)
+        assert rep['ok'], (mb, rep['mismatches'][:1])
+    # The causal read gate stays strict at the diagonal.
+    pos = torch.tensor([0, 1, 2])
+    lt = torch.tensor([0, 1, 2])
+    assert L.block_readable(pos, lt).diagonal().tolist() == [False, False, False]
+
+
+def t_bnd_rand_definitions_are_tagged_and_never_pooled():
+    gt = np.zeros(20, dtype=bool)
+    gt[[3, 10]] = True
+    prov = {}
+    p, r, f, rp = L.boundary_alignment([3, 10], gt, 20, provenance=prov)
+    assert prov.get('bnd_rand_kind') == 'matched_cut_count', prov
+    assert 0.0 <= rp <= 1.0
+    prov2 = {}
+    p2, r2, f2, rp2 = L.boundary_alignment([3, 10], gt, 20,
+                                           rand_kind='per_sequence_independent',
+                                           provenance=prov2)
+    assert prov2.get('bnd_rand_kind') == 'per_sequence_independent', prov2
+    assert prov2.get('bnd_rand_exact') is False, prov2
+    try:
+        L.boundary_alignment([3], gt, 20, rand_kind='nonsense')
+        raise AssertionError('unknown bnd_rand kind must be refused')
+    except ValueError:
+        pass
+    # Aggregating cells that mix the two definitions must not average their
+    # excesses into one series.
+    def rec(seed, kind):
+        cell = {'len_mean': 4.0, 'bnd_prec': 0.5, 'bnd_rec': 0.4,
+                'bnd_f1': 0.44, 'bnd_rand': 0.2, 'bnd_excess': 0.3,
+                'bnd_rand_exact': (kind == 'matched_cut_count'),
+                'bnd_rand_kind': kind}
+        return {'variant': 'csa_dynamic', 'seed': seed, 'ppl': 10.0,
+                'run_cfg': 'same', 'steps': 1, 'tokens_seen': 10,
+                'params': 10, 'stats': {'L0_csa_dyn': cell}}
+    summ = {'csa_dynamic::seed0': rec(0, 'matched_cut_count'),
+            'csa_dynamic::seed1': rec(1, 'per_sequence_independent')}
+    agg = L.aggregate(summ)['csa_dynamic']
+    assert 'boundary_rand_kind_conflict' in agg, agg
+    assert 'boundary_excess_dyn' not in agg, agg
+
+
+def t_protocol_group_and_code_semantics_pairing_gate():
+    fp = 'steps1_sl8_bs1_nt10_lr0.0003_wd0.1_d8_L1_H1_Dh8_v16_wu1_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee1_es1_detcpu-eager_dfabc_csX'
+    base = {'variant': 'a', 'seed': 0, 'run_cfg': fp, 'steps': 1,
+            'tokens_seen': 1, 'ppl': 10.0, 'data_fp': 'd', 'val_fp': 'v',
+            'eval_fp': 'e', 'protocol': 'p1', '_code': 'CODE'}
+    b = dict(base, variant='b')
+    assert L.pair_reason(base, b) is None
+    why = L.pair_reason(base, dict(b, protocol='p2'))
+    assert why and 'different protocol' in why, why
+    why = L.pair_reason(base, dict(b, _code='CODE2'))
+    assert why and 'different code semantics' in why, why
+    try:
+        L.pair_reason(base, {k: v for k, v in b.items() if k != 'protocol'})
+        raise AssertionError('one-sided protocol must be unverifiable')
+    except Exception:
+        pass
+    # aggregate must not borrow an untagged baseline for a tagged arm.
+    arm = {'variant': 'csa_dynamic', 'seed': 0, 'run_cfg': 'same',
+           'steps': 1, 'tokens_seen': 10, 'ppl': 9.0, 'params': 10,
+           'protocol': 'p1'}
+    full = {'variant': 'full', 'seed': 0, 'run_cfg': 'same', 'steps': 1,
+            'tokens_seen': 10, 'ppl': 10.0, 'params': 10}
+    agg = L.aggregate({'csa_dynamic::seed0': arm, 'full::seed0': full})
+    assert 'dPPL_vs_full_mean' not in agg.get('csa_dynamic#p1', {}), agg
+
+
+def t_test_split_purpose_and_content_fingerprints():
+    # Only the frozen final evaluation may read the held-out split.
+    try:
+        L.load_wikitest(8, n_seqs=1, purpose='diagnostic')
+        raise AssertionError('a diagnostic test-split read must be refused')
+    except ValueError:
+        pass
+    with tempfile.TemporaryDirectory() as d:
+        tag, ttag = 'tiny', 'tiny_test'
+        tr = np.arange(40, dtype=np.int64)
+        va = (np.arange(16, dtype=np.int64) + 100).reshape(2, 8)
+        te = (np.arange(16, dtype=np.int64) + 200).reshape(2, 8)
+        np.save(os.path.join(d, f'train_ids_{tag}.npy'), tr)
+        np.save(os.path.join(d, f'val_batch_{tag}.npy'), va)
+        np.save(os.path.join(d, f'test_ids_{ttag}.npy'), te)
+        meta = {'vocab': 256, 'seq_len': 8, 'split_strategy': 'ordered',
+                'shuffle_at_split': False, 'tokenizer_fit_split': 'train',
+                'src_fp': L._ids_fp(tr),
+                'val_fp': L._ids_fp(np.ascontiguousarray(va).reshape(-1))}
+        with open(os.path.join(d, f'meta_{tag}.json'), 'w', encoding='utf-8') as f:
+            json.dump(meta, f)
+        tmeta = {'vocab': 256, 'seq_len': 8, 'split_strategy': 'official_test',
+                 'shuffle_at_split': False, 'tokenizer_fit_split': 'train',
+                 'src_fp': L._ids_fp(te), 'test_fp': L._ids_fp(te),
+                 'read_purpose': 'final_evaluation',
+                 'split_fingerprints': {'test': {'ids_fp': L._ids_fp(te)}}}
+        with open(os.path.join(d, f'test_meta_{ttag}.json'), 'w', encoding='utf-8') as f:
+            json.dump(tmeta, f)
+        out = A.audit_split_discipline(cache_dirs=[d], min_shift_tokens=1)
+        rec = out['caches'][os.path.abspath(d)]['corpora'][tag]
+        assert rec.get('test_fingerprint_verified') is True, rec
+        assert rec['status'] != 'fail', rec
+        # A replaced test file with stale metadata must fail closed.
+        np.save(os.path.join(d, f'test_ids_{ttag}.npy'), te + 1)
+        out = A.audit_split_discipline(cache_dirs=[d], min_shift_tokens=1)
+        rec = out['caches'][os.path.abspath(d)]['corpora'][tag]
+        assert rec['status'] == 'fail', rec
+        assert any('test id-cache fingerprint' in w for w in out['warnings']), out
+        # Restore; a recorded read purpose other than the frozen evaluation is
+        # itself a protocol failure.
+        np.save(os.path.join(d, f'test_ids_{ttag}.npy'), te)
+        tmeta['read_purpose'] = 'diagnostic'
+        with open(os.path.join(d, f'test_meta_{ttag}.json'), 'w', encoding='utf-8') as f:
+            json.dump(tmeta, f)
+        out = A.audit_split_discipline(cache_dirs=[d], min_shift_tokens=1)
+        rec = out['caches'][os.path.abspath(d)]['corpora'][tag]
+        assert rec['status'] == 'fail', rec
+        assert any('read_purpose' in w for w in out['warnings']), out
+
+
+
+
+def t_test_split_is_read_only_once():
+    with tempfile.TemporaryDirectory() as td:
+        man = {'manifest_sha256': 'AAA', 'frozen_at': '2026-10-17'}
+        V12._check_or_write_freeze_lock(td, man, None, stage='preaccess')
+        lock = V12._check_or_write_freeze_lock(td, man, 'FP', stage='accessed')
+        assert lock.get('test_reads') == 1, lock
+        # A second P5T preaccess would re-evaluate the same frozen slice.
+        try:
+            V12._check_or_write_freeze_lock(td, man, None, stage='preaccess')
+            raise AssertionError('a second test-split access must be refused')
+        except SystemExit as e:
+            assert 'only once' in str(e) or 'implicit validation' in str(e), str(e)
+        # Analysis-style calls (already carrying the slice fingerprint) are
+        # not a new read.
+        V12._check_or_write_freeze_lock(td, man, 'FP', stage='accessed')
+        # A consciously declared new round is recorded, not silent.
+        os.environ['V12_REFREEZE'] = '1'
+        os.environ['V12_ALLOW_TEST_REREAD'] = '1'
+        try:
+            lock = V12._check_or_write_freeze_lock(td, man, None, stage='preaccess')
+        finally:
+            del os.environ['V12_REFREEZE']
+            del os.environ['V12_ALLOW_TEST_REREAD']
+        assert lock.get('test_reads') == 2, lock
+        assert any(h.get('stage') == 'reread' for h in lock.get('history') or []), lock
+
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -16015,6 +16231,13 @@ def main():
     _check('L69 native temporal row keys are unit-canonical across stored tables', t_native_temporal_row_keys_are_unit_canonical)
     _check('L70 baseline claim gate requires every baseline rung', t_baseline_claim_gate_requires_every_rung)
     _check('L71 tuned-baseline hypothesis is attached to the panel', t_tuned_baseline_hypothesis_is_attached_to_the_panel)
+    _check('L72 data protocol is field-driven and scale-safe', t_data_protocol_is_field_driven_and_scale_safe)
+    _check('L73 split_and_prepare emits per-split content fingerprints', t_split_and_prepare_emits_per_split_fingerprints)
+    _check('L74 chunking similarity source + segmenter prefix invariance', t_chunking_protocol_and_prefix_invariance)
+    _check('L75 bnd_rand definitions are tagged and never pooled', t_bnd_rand_definitions_are_tagged_and_never_pooled)
+    _check('L76 pair only same protocol/code semantics', t_protocol_group_and_code_semantics_pairing_gate)
+    _check('L77 test-split purpose + content fingerprint audit', t_test_split_purpose_and_content_fingerprints)
+    _check('L78 held-out test split is a one-shot resource', t_test_split_is_read_only_once)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

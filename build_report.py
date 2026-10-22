@@ -685,6 +685,20 @@ def _pair_reason(ra, rb):
         return 'unverifiable run_cfg'
     if fa != fb:
         return 'different run_cfg'
+    # Mirror exp_lib.pair_reason's code-semantics and protocol grouping gates.
+    _ca, _cb = ra.get('_code'), rb.get('_code')
+    _ha = _ca is not None and str(_ca) != ''
+    _hb = _cb is not None and str(_cb) != ''
+    if _ha != _hb:
+        return 'unverifiable _code (only one record carries the code-semantics stamp)'
+    if _ha and str(_ca) != str(_cb):
+        return f'different code semantics ({str(_ca)[:24]}… vs {str(_cb)[:24]}…)'
+    _pa = ('protocol' in ra and ra.get('protocol') is not None) or ra.get('warm_steps') is not None
+    _pb = ('protocol' in rb and rb.get('protocol') is not None) or rb.get('warm_steps') is not None
+    if _pa != _pb:
+        return 'unverifiable protocol (only one record carries a protocol tag)'
+    if _pa and str(_tag_of(ra)) != str(_tag_of(rb)):
+        return f'different protocol ({_tag_of(ra)!r} vs {_tag_of(rb)!r})'
     _env_reason = _execution_environment_reason(ra, rb)
     if _env_reason is not None:
         return _env_reason

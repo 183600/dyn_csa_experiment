@@ -235,7 +235,7 @@ class HybridAttentionRoPE(L.HybridAttention):
                 gate, gl = gate_sig
             else:
                 fused = pre['fused'] if pre is not None and 'fused' in pre else self._fuse(x.detach())
-                sim = L.cosine_similarity_consecutive(fused)
+                sim = L.chunk_similarity(x, cfg, fused=fused)
                 if sim.numel() == 0:
                     gate = None
                 else:
@@ -275,7 +275,8 @@ class HybridAttentionRoPE(L.HybridAttention):
                 # identical to the per-row form below (design notes §6.1).
                 bid, nblk, _hon = pre_blocks
             else:
-                sim = L.cosine_similarity_consecutive(x.detach())
+                _fused = self._fuse(x.detach()) if L.chunk_similarity_source(cfg) == 'fused' else None
+                sim = L.chunk_similarity(x.detach(), cfg, fused=_fused)
                 tau = L.causal_adaptive_threshold(sim, cfg.target_block_tokens) if cfg.chunking == 'cosine_adaptive' or cfg.adaptive else cfg.cos_threshold
                 bid, nblk = L.blocks_from_cosine(x, tau, cfg.min_block, cfg.max_block, sim=sim, return_count=True)
         else:

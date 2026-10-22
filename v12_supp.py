@@ -567,6 +567,35 @@ def _frozen_train_fp(manifest):
     return None
 
 
+def _frozen_vocab_size(manifest, cfg=None):
+    """Vocabulary width declared by the frozen plan, or None if unspecified.
+
+    The test cache tag contains the vocab width, so falling back to a
+    repository constant (the historical 8192) would look up the wrong held-out
+    slice after a scale-up.  The declared training recipe is authoritative;
+    every per-arm signature must agree.
+    """
+    _bind = manifest.get('binding') or {}
+    _sig = _bind.get('training_recipe_signature') if isinstance(_bind, dict) else None
+    _vals = set()
+    if isinstance(_sig, dict) and _sig.get('v') is not None:
+        _vals.add(int(_sig['v']))
+    _per = (_bind.get('per_arm_recipe_signature')
+            if isinstance(_bind, dict) else None)
+    if isinstance(_per, dict):
+        for _arm_sig in _per.values():
+            if isinstance(_arm_sig, dict) and _arm_sig.get('v') is not None:
+                _vals.add(int(_arm_sig['v']))
+    if isinstance(cfg, dict) and cfg.get('vocab_size') is not None:
+        _vals.add(int(cfg['vocab_size']))
+    if len(_vals) > 1:
+        raise SystemExit(
+            f'[v12] REFUSE: the frozen plan declares conflicting vocabulary '
+            f'widths {sorted(_vals)}; the held-out cache tag cannot be chosen '
+            'without guessing')
+    return next(iter(_vals)) if _vals else None
+
+
 def _current_train_cache_fps(cache_dir=None):
     """Training-stream fingerprints declared by the LOCAL train caches.
 
@@ -747,7 +776,10 @@ def _check_or_write_freeze_lock(outdir, manifest, test_ids_fp, stage='access',
     与 test 切片指纹。之后的 P5T/analysis 若带着**不同的** manifest 哈希
     或不同 test 指纹运行，将被拒绝——除非显式 V12_REFREEZE=1（并大声
     打印该轮降级为探索性的警告）。``train_fp`` 一旦记录，后续训练集
-    指纹不一致同样拒绝。"""
+    指纹不一致同样拒绝。已经 accessed 的锁不再接受第二次 ``preaccess``：
+    held-out split 是一次性评估资源，重读会把它变成隐式验证集；显式重跑
+    必须同时设置 V12_REFREEZE=1 与 V12_ALLOW_TEST_REREAD=1，锁会记录
+    ``test_reads`` 与 history。"""
     lp = _freeze_lock_path(outdir)
     _sha = manifest.get('manifest_sha256')
     if os.path.exists(lp):
@@ -773,6 +805,28 @@ def _check_or_write_freeze_lock(outdir, manifest, test_ids_fp, stage='access',
         _train_changed = (lock.get('train_fp') is not None
                           and train_fp != lock.get('train_fp'))
         _refreeze = os.environ.get('V12_REFREEZE', '').strip().lower() in ('1', 'true', 'yes', 'on')
+        _allow_reread = os.environ.get('V12_ALLOW_TEST_REREAD', '').strip().lower() in ('1', 'true', 'yes', 'on')
+        _already_accessed = (str(lock.get('stage') or '') == 'accessed'
+                             or lock.get('test_ids_fp') is not None)
+        _forced_reread = False
+        if stage == 'preaccess' and _already_accessed:
+            # The held-out split is a one-shot evaluation resource.  A second
+            # P5T run would re-score the same frozen slice, turning it into an
+            # implicit validation set (new checkpoints/configs can be selected
+            # by inspecting the change).  Resume a completed panel from its
+            # records; a genuinely new round must state V12_REFREEZE=1 AND
+            # V12_ALLOW_TEST_REREAD=1 explicitly.
+            if not (_refreeze and _allow_reread):
+                raise SystemExit(
+                    f'[v12] REFUSE: this results directory already has a '
+                    f'test-split access lock ({lp}, stage=accessed, '
+                    f'test_ids_fp={str(lock.get("test_ids_fp"))[:12]}…). '
+                    'The frozen held-out split may be read/evaluated only once; '
+                    'a second evaluation makes it an implicit validation set. '
+                    'Re-run the analysis from the recorded artifacts, or set '
+                    'V12_REFREEZE=1 and V12_ALLOW_TEST_REREAD=1 for a consciously '
+                    'declared new round (the prior round is then exploratory).')
+            _forced_reread = True
         if (_manifest_changed or _test_changed or _train_changed) and not _refreeze:
             if _manifest_changed:
                 raise SystemExit(f'[v12] REFUSE: the test split was already accessed under a DIFFERENT frozen manifest (lock {lp}: {lock.get("manifest_sha256")} != current {_sha}, locked_at={lock.get("locked_at")}). Changing the plan after seeing test data is selection bias by construction. To consciously re-freeze, set V12_REFREEZE=1 — the earlier round must then be reported as exploratory in the plan history.')
@@ -780,6 +834,19 @@ def _check_or_write_freeze_lock(outdir, manifest, test_ids_fp, stage='access',
                 raise SystemExit(f'[v12] REFUSE: the held-out test slice changed after the first access (lock has ids_fp {lock.get("test_ids_fp")}, current {test_ids_fp}) — the test data itself is part of the freeze; investigate before proceeding (V12_REFREEZE=1 consciously re-freezes to a new slice)')
             raise SystemExit(f'[v12] REFUSE: the training corpus changed after the first test access (lock has train_fp {lock.get("train_fp")}, current {train_fp}) — a different training set cannot enter the frozen confirmation (V12_REFREEZE=1 consciously re-freezes to a new corpus)')
         _dirty = False
+        if _forced_reread:
+            print(f'[v12] WARNING: V12_ALLOW_TEST_REREAD=1 — this is an '
+                  f'ADDITIONAL read of the frozen held-out split (previous '
+                  f'reads: {lock.get("test_reads", 1)}).  Re-evaluation can '
+                  'turn test into an implicit validation set; record why the '
+                  'new round is necessary and whether the decision rule changed.')
+            lock['test_reads'] = int(lock.get('test_reads', 1)) + 1
+            lock['history'] = list(lock.get('history') or []) + [{
+                'stage': 'reread', 'at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+                'test_reads': lock['test_reads'],
+                'code_semantics': L.code_stamp(),
+            }]
+            _dirty = True
         if _manifest_changed or _test_changed or _train_changed:
             print(f'[v12] WARNING: V12_REFREEZE=1 — the locked plan/test/train identity changed (manifest {lock.get("manifest_sha256")} -> {_sha}, test_ids_fp {lock.get("test_ids_fp")} -> {test_ids_fp}, train_fp {lock.get("train_fp")} -> {train_fp}); the earlier round is DOWNGRADED to exploratory and this must be recorded in the plan history')
             # Persist the conscious re-freeze: under the new plan the lock must
@@ -808,6 +875,7 @@ def _check_or_write_freeze_lock(outdir, manifest, test_ids_fp, stage='access',
             # first read; bind the exact slice immediately after it.
             lock['test_ids_fp'] = test_ids_fp
             lock['stage'] = 'accessed'
+            lock['test_reads'] = max(1, int(lock.get('test_reads', 0)))
             lock['history'] = list(lock.get('history') or []) + [{'stage': 'accessed', 'at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'test_ids_fp': test_ids_fp}]
             _dirty = True
         if train_fp is not None and lock.get('train_fp') is None:
@@ -821,7 +889,7 @@ def _check_or_write_freeze_lock(outdir, manifest, test_ids_fp, stage='access',
             else:
                 print(f'[v12] freeze lock updated with the first-access slice/train fingerprint: {lp}')
         return lock
-    lock = {'manifest_sha256': _sha, 'manifest_path': os.path.abspath(manifest.get('_path') or FREEZE_MANIFEST), 'frozen_at': manifest.get('frozen_at'), 'locked_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'test_ids_fp': test_ids_fp, 'train_fp': train_fp, 'stage': stage, 'code_semantics': L.code_stamp(), 'history': [{'stage': stage, 'at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'test_ids_fp': test_ids_fp, 'train_fp': train_fp}], 'note': 'first test-split access: the plan may not change after this point (V12_REFREEZE=1 overrides consciously, downgrading the earlier round to exploratory)'}
+    lock = {'manifest_sha256': _sha, 'manifest_path': os.path.abspath(manifest.get('_path') or FREEZE_MANIFEST), 'frozen_at': manifest.get('frozen_at'), 'locked_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'test_ids_fp': test_ids_fp, 'train_fp': train_fp, 'stage': stage, 'test_reads': (0 if test_ids_fp is None else 1), 'code_semantics': L.code_stamp(), 'history': [{'stage': stage, 'at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'test_ids_fp': test_ids_fp, 'train_fp': train_fp}], 'note': 'first test-split access: the plan may not change after this point (V12_REFREEZE=1 overrides consciously, downgrading the earlier round to exploratory)'}
     L.atomic_write_json(lp, lock, indent=2)
     print(f'[v12] freeze lock written: {lp} (manifest {_sha[:12]}…, stage {stage}, test_ids_fp {str(test_ids_fp)[:12]}…)')
     return lock
@@ -869,7 +937,8 @@ def _training_health_gate(cfg, v, seed, ckpt_meta, train_rec):
 
 
 @torch.inference_mode()
-def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test', train_fp=None):
+def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test',
+                          train_fp=None, frozen_vocab=None):
     """One (arm, seed) clean by-length evaluation on the TEST split.
 
     记录现在额外携带 manifest_sha256 与
@@ -1026,8 +1095,35 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test', train_
         del d
         out['status'] = 'skipped_resume'
         return out
-    _arch = (int(d.get('d', 256)), int(d.get('n_layers', 6)), int(d.get('n_heads', 8)), int(d.get('d_head', 32)))
-    model = L.SmallGPT(int(d.get('vocab', 8192)), *_arch, d.get('train_len', 512), [copy.deepcopy(c) for c in d['cfg']], mlp_ratio=d['mlp_ratio']).to(DEVICE)
+    _arch_missing = [k for k in ('d', 'n_layers', 'n_heads', 'd_head')
+                     if d.get(k) is None]
+    if _arch_missing:
+        print(f'[p5t] REFUSE {v} s{seed}: checkpoint omits model geometry '
+              f'{_arch_missing} — refusing to substitute a current-scale default')
+        del d
+        out['status'] = 'skipped_missing_geometry'
+        return out
+    _arch = (int(d['d']), int(d['n_layers']), int(d['n_heads']), int(d['d_head']))
+    _ck_vocab = d.get('vocab', frozen_vocab)
+    if _ck_vocab is None:
+        print(f'[p5t] REFUSE {v} s{seed}: checkpoint and frozen plan declare no vocabulary width — the embedding shape cannot be reconstructed without a current-scale guess')
+        del d
+        out['status'] = 'skipped_missing_vocab'
+        return out
+    _ck_train_len = d.get('train_len')
+    if _ck_train_len is None:
+        _bind_m = manifest.get('binding') or {}
+        _sig_m = (_bind_m.get('training_recipe_signature')
+                  if isinstance(_bind_m, dict) else None)
+        _ck_train_len = (int(_sig_m.get('sl'))
+                         if isinstance(_sig_m, dict) and _sig_m.get('sl') is not None
+                         else None)
+    if not _ck_train_len:
+        print(f'[p5t] REFUSE {v} s{seed}: checkpoint and frozen plan declare no training context length — refusing to substitute a current-scale default')
+        del d
+        out['status'] = 'skipped_missing_train_len'
+        return out
+    model = L.SmallGPT(int(_ck_vocab), *_arch, int(_ck_train_len), [copy.deepcopy(c) for c in d['cfg']], mlp_ratio=d['mlp_ratio']).to(DEVICE)
     model.load_state_dict(d.pop('sd'))
     model.eval()
     # Keep the checkpoint's provenance fields on a separate binding so the
@@ -1139,6 +1235,27 @@ def run_finaltest(cfg=None, guard=None):
     # tokenizer; this proves current train==frozen training corpus.
     if not _smoke and _want_train_fp is not None:
         _require_current_train_cache_fp(_want_train_fp)
+    if not _smoke:
+        # The held-out read is one-shot, so a missing checkpoint must be found
+        # BEFORE it, not by silently skipping cells after the access has
+        # already been consumed.  A genuinely partial round must say so
+        # explicitly and is reported as incomplete, never as a confirmation.
+        _missing_ck = [f'{_v}::s{_s}' for _v in manifest['arms']
+                       for _s in manifest['seeds']
+                       if not os.path.exists(os.path.join(cfg['ckpt_dir'],
+                                                          f'{_v}_seed{_s}.pt'))]
+        _allow_partial = os.environ.get('V12_ALLOW_PARTIAL_TEST', '').strip().lower() in ('1', 'true', 'yes', 'on')
+        if _missing_ck and not _allow_partial:
+            raise SystemExit(
+                f'[v12] REFUSE: {len(_missing_ck)} frozen checkpoint(s) are '
+                f'missing ({_missing_ck[:6]}…) — refusing to read the one-shot '
+                'test split for a panel that cannot produce its declared '
+                'cells.  Train the missing cells first, or set '
+                'V12_ALLOW_PARTIAL_TEST=1 for an explicitly incomplete round.')
+        if _missing_ck:
+            print(f'[v12] WARNING: V12_ALLOW_PARTIAL_TEST=1 — {len(_missing_ck)} '
+                  'declared checkpoint(s) are missing; this round is INCOMPLETE '
+                  'and must not be reported as a confirmation')
     _lock_path = _freeze_lock_path(outdir)
     if os.path.exists(os.path.join(outdir, 'bylen.json')) and not os.path.exists(_lock_path):
         raise SystemExit(f'[v12] REFUSE: {outdir}/bylen.json exists but there is no pre-access freeze lock — the only honest interpretation is that a test-split measurement predates the lock; investigate before reusing it')
@@ -1153,11 +1270,19 @@ def run_finaltest(cfg=None, guard=None):
     # manifest mismatch is discovered before the one-shot access is used.
     _check_or_write_freeze_lock(outdir, manifest, None, stage='preaccess',
                                 train_fp=_want_train_fp)
+    _frozen_vocab = _frozen_vocab_size(manifest, cfg)
     if test_ids is None:
         _t0 = time.time()
-        test_ids, vocab_t, _, _ = L.load_wikitest(need, n_seqs=_nseq_clean)
+        test_ids, vocab_t, _, _ = L.load_wikitest(
+            need, n_seqs=_nseq_clean, vocab_size=_frozen_vocab,
+            purpose='final_evaluation')
         if guard is not None:
             guard.record_run(time.time() - _t0, 0, 0, 0, 0, 0)
+        if _frozen_vocab is not None and int(vocab_t) != int(_frozen_vocab):
+            raise SystemExit(
+                f'[v12] REFUSE: loaded test vocabulary {vocab_t} != the frozen '
+                f'{_frozen_vocab} — the held-out cache belongs to another '
+                'tokenizer/scale protocol')
     else:
         print('[p5t] SMOKE: test_ids supplied by the caller; records are stamped split="smoke" and are inadmissible to the confirmation statistics')
     _dfp = L._ids_fp(np.ascontiguousarray(test_ids).reshape(-1))
@@ -1223,7 +1348,8 @@ def run_finaltest(cfg=None, guard=None):
     for v in manifest['arms']:
         for seed in manifest['seeds']:
             _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids,
-                                  split=_split_label, train_fp=_want_train_fp)
+                                  split=_split_label, train_fp=_want_train_fp,
+                                  frozen_vocab=_frozen_vocab)
     # 2) frozen uniform-corruption probe on the SAME test rows (secondary,
     #    descriptive-only per the manifest)
     _probe_eval = manifest.get('eval', {}).get('distractor_probe') or {}

@@ -110,6 +110,7 @@ def per_seed_layer(variant, key, seeds):
     layers = layers_of(variant, seeds)
     M = np.full((len(seeds), len(layers)), np.nan)
     n_sampled = 0
+    _kinds = set()
     for i, s in enumerate(seeds):
         st = rec(variant, s).get('stats')
         if not isinstance(st, dict):
@@ -120,13 +121,18 @@ def per_seed_layer(variant, key, seeds):
                 v = _cell.get(key, np.nan)
                 if not isinstance(v, (int, float)) or isinstance(v, bool):
                     v = np.nan
-                if key in ('bnd_rand', 'bnd_excess') and _cell.get('bnd_rand_exact') is False:
-                    if isinstance(v, (int, float)) and np.isfinite(v):
-                        n_sampled += 1
-                    v = np.nan
+                if key in ('bnd_rand', 'bnd_excess'):
+                    _kinds.add(str(_cell.get('bnd_rand_kind') or 'unspecified_legacy'))
+                    if _cell.get('bnd_rand_exact') is False:
+                        if isinstance(v, (int, float)) and np.isfinite(v):
+                            n_sampled += 1
+                        v = np.nan
                 M[i, j] = v
     if n_sampled:
         print(f'[fuse_analysis] NOTE: `{variant}` {key}: {n_sampled} cell(s) carry `bnd_rand_exact: False` (Monte-Carlo estimate, not the exact baseline) and are masked out rather than pooled with the exact readings')
+    if len(_kinds) > 1:
+        print(f'[fuse_analysis] WARNING: `{variant}` {key}: cells mix bnd_rand definitions {sorted(_kinds)} — the two estimands must not be pooled; the whole series is masked')
+        M[:] = np.nan
     return (layers, M)
 
 def _axis_steps(histories):

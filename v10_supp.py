@@ -727,7 +727,12 @@ def run_probe_cell(cfg, v, seed, guard=None, val_ids=None, mech_summ=None):
     def _cell_stale(_key, _fp_x, _summary=None, _mode='uniform'):
         _rec = (_summary if _summary is not None else L.locked_json_read(spath)).get(_key)
         return not (L.result_is_current(_rec, V.CKPT_CODE, 'ppl_mean') and L.ppl_is_usable((_rec or {}).get('ppl_mean')) and _probe_params_current(_rec, _fp_x, _mode) and (_rec or {}).get('recipe') == _ck_recipe and ((_rec or {}).get('val_fp') is None or (_rec or {}).get('val_fp') == _val_fp))
-    _vocab_ck = int(d.get('vocab', 8192))
+    if d.get('vocab') is None:
+        print(f'[p3mp] REFUSE {v} s{seed}: checkpoint declares no vocabulary width — refusing to substitute a current-scale default')
+        del d
+        out['status'] = 'skipped_missing_vocab'
+        return out
+    _vocab_ck = int(d['vocab'])
     if cfg.get('vocab') is not None and int(cfg['vocab']) != _vocab_ck:
         print(f"[p3mp] {v} s{seed}: probe cfg vocab={int(cfg['vocab'])} differs from the checkpoint's vocab={_vocab_ck} — using the checkpoint's (the model is what is being scored)")
     _pcfg = dict(cfg, vocab=_vocab_ck)
@@ -794,12 +799,24 @@ def run_probe_cell(cfg, v, seed, guard=None, val_ids=None, mech_summ=None):
         if not cells and not _niah_cells:
             continue
         if model is None:
-            _arch = (int(d.get('d', 256)), int(d.get('n_layers', 6)), int(d.get('n_heads', 8)), int(d.get('d_head', 32)))
-            if _arch != (256, 6, 8, 32):
-                print(f"[p3mp] REFUSE {v} s{seed}: checkpoint architecture {_arch} differs from the recipe this probe was validated against (256, 6, 8, 32) — not running the probe on unverified weights")
+            _arch_missing = [k for k in ('d', 'n_layers', 'n_heads', 'd_head')
+                             if d.get(k) is None]
+            if _arch_missing:
+                print(f'[p3mp] REFUSE {v} s{seed}: checkpoint omits model geometry {_arch_missing} — refusing to substitute a current-scale default')
+                out['status'] = 'skipped_missing_geometry'
+                return out
+            _arch = (int(d['d']), int(d['n_layers']), int(d['n_heads']), int(d['d_head']))
+            _probe_arch = tuple(int(x) for x in (cfg.get('probe_arch') or (256, 6, 8, 32)))
+            if _arch != _probe_arch:
+                print(f"[p3mp] REFUSE {v} s{seed}: checkpoint architecture {_arch} differs from the probe's declared architecture {_probe_arch} — not running the probe on unverified weights")
                 out['status'] = 'skipped_arch'
                 return out
-            model = L.SmallGPT(_vocab_ck, *_arch, d.get('train_len', 512), [copy.deepcopy(c) for c in d['cfg']], mlp_ratio=d['mlp_ratio']).to(DEVICE)
+            _train_len_ck = d.get('train_len')
+            if _train_len_ck is None:
+                print(f'[p3mp] REFUSE {v} s{seed}: checkpoint declares no training context length — refusing to substitute a current-scale default')
+                out['status'] = 'skipped_missing_train_len'
+                return out
+            model = L.SmallGPT(_vocab_ck, *_arch, int(_train_len_ck), [copy.deepcopy(c) for c in d['cfg']], mlp_ratio=d['mlp_ratio']).to(DEVICE)
             model.load_state_dict(d.pop('sd'))
             model.eval()
         for blk, c0 in zip(model.blocks, d['cfg']):

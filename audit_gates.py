@@ -239,6 +239,13 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
             'tokenizer fit provenance is missing on the train and/or test meta; '
             'the test tokenizer cannot be bound to the train rows')
     out['checks']['fit_fp_agree'] = _fit_agree
+    _train_sem = train_meta.get('code_semantics')
+    _test_sem = test_meta.get('code_semantics')
+    out['checks']['code_semantics'] = {'train': _train_sem, 'test': _test_sem}
+    if _train_sem is not None and _test_sem is not None and str(_train_sem) != str(_test_sem):
+        _tok_problems.append(
+            'train/test caches were built under different data code semantics '
+            f'({_train_sem!r} vs {_test_sem!r})')
     # b) persisted tokenizers, if both exist.  Use the tag-paired files, never
     # the first filename in the directory.
     import hashlib
@@ -359,6 +366,14 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
             if _tm_doc:
                 if int(_tm_doc.get('test_count', -1)) != int(_ted.size):
                     _doc_leak.append('test document-id sidecar count disagrees with the test metadata')
+                _tf_rec = _tm_doc.get('test_fp')
+                if _tf_rec is not None:
+                    try:
+                        _Lfp2 = _import_exp_lib()
+                        if str(_Lfp2._ids_fp(_ted)) != str(_tf_rec):
+                            _doc_leak.append('test document-id sidecar fingerprint disagrees with the test metadata')
+                    except Exception:
+                        _doc_leak.append('test document-id sidecar fingerprint could not be recomputed')
             else:
                 _doc_checks['metadata'] = 'test meta has no doc_ids attestation'
             if os.path.exists(_trd_p):
@@ -956,6 +971,12 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                     _fail(f'{cd}/{tag}: test tokenizer was fitted on {_tmeta.get("tokenizer_fit_split")!r}, not train')
                 if _tmeta.get('split_strategy') is None:
                     _warn(f'{cd}/{tag}: legacy test cache has no split_strategy/tokenizer provenance metadata')
+                _rp = _tmeta.get('read_purpose')
+                if _rp is not None and _rp != 'final_evaluation':
+                    rec['status'] = 'fail'
+                    _fail(f'{cd}/{tag}: test cache records read_purpose={_rp!r}, '
+                          'not the frozen final evaluation; a diagnostic/tuning '
+                          'read would turn test into an implicit validation set')
                 _tndc = _tmeta.get('near_duplicate_cleanup')
                 if isinstance(_tndc, dict):
                     if _tndc.get('policy') != 'test_documents_deduplicated_against_train_and_validation':
@@ -975,6 +996,138 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                 rec['test_pairing'] = 'not_found'
             if te is not None:
                 rec['test_shape'] = list(te.shape)
+                # Per-split content fingerprints are recomputed from the
+                # actual bytes, not trusted from the JSON.  The audit already
+                # did this for train/validation; without the same check on
+                # test, a replaced/stale test file could be certified by a
+                # metadata-only reader and then become an implicit validation
+                # set through repeated evaluation.
+                try:
+                    _Lf = _import_exp_lib()
+                    _t_actual = _Lf._ids_fp(np.asarray(te))
+                    _t_recorded = _tmeta.get('src_fp')
+                    _t_explicit = _tmeta.get('test_fp')
+                    _sf_all = _tmeta.get('split_fingerprints')
+                    _t_split = _sf_all.get('test') if isinstance(_sf_all, dict) else None
+                    if _t_split is not None and not isinstance(_t_split, dict):
+                        rec['status'] = 'fail'
+                        _fail(f'{cd}/{tag}: test split_fingerprints is malformed')
+                        _t_split = {}
+                    _t_split = _t_split or {}
+                    rec['test_fingerprint_recorded'] = bool(_t_recorded)
+                    _fp_ok = (_t_recorded is not None
+                              and str(_t_actual) == str(_t_recorded))
+                    if _t_explicit is not None and str(_t_explicit) != str(_t_actual):
+                        _fp_ok = False
+                    if _t_split.get('ids_fp') is not None and str(_t_split['ids_fp']) != str(_t_actual):
+                        _fp_ok = False
+                    rec['test_fingerprint_verified'] = bool(_fp_ok)
+                    if _t_recorded is None and _t_explicit is None and not _t_split:
+                        # Legacy test cache: there is no recorded fingerprint to
+                        # disagree with.  Report the missing evidence (like the
+                        # train/validation reader does) instead of inventing a
+                        # hard failure; a cache that RECORDS a value must match.
+                        _warn(f'{cd}/{tag}: legacy test cache records no content '
+                              'fingerprint; the held-out id bytes cannot be '
+                              'bound to the audited stream')
+                    elif _t_recorded is not None and str(_t_actual) != str(_t_recorded):
+                        rec['status'] = 'fail'
+                        _fail(f'{cd}/{tag}: test id-cache fingerprint does not '
+                              'match metadata src_fp (the held-out cache was '
+                              'edited or replaced)')
+                    if _t_explicit is not None and str(_t_explicit) != str(_t_actual):
+                        rec['status'] = 'fail'
+                        _fail(f'{cd}/{tag}: test_fp does not match the actual '
+                              'held-out ids')
+                    if _t_split.get('ids_fp') is not None and str(_t_split['ids_fp']) != str(_t_actual):
+                        rec['status'] = 'fail'
+                        _fail(f'{cd}/{tag}: split_fingerprints.test.ids_fp does '
+                              'not match the actual held-out ids')
+                except Exception as _tfe:
+                    rec['status'] = 'fail'
+                    _fail(f'{cd}/{tag}: test id-cache fingerprint audit failed '
+                          f'({type(_tfe).__name__}: {_tfe})')
+                # Split-construction semantics and tokenizer identity must be
+                # the SAME across the train/test pair.  A cache pair built by
+                # different code semantics or different tokenizers is not one
+                # frozen split, even if every individual file is intact.
+                _train_sem = meta.get('code_semantics')
+                _test_sem = _tmeta.get('code_semantics')
+                rec['code_semantics'] = {'train': _train_sem, 'test': _test_sem}
+                if _train_sem is not None and _test_sem is not None and str(_train_sem) != str(_test_sem):
+                    rec['status'] = 'fail'
+                    _fail(f'{cd}/{tag}: train/test data code semantics differ '
+                          f'({_train_sem!r} vs {_test_sem!r}); the split '
+                          'construction is not one frozen pair')
+                import hashlib as _hl
+                _train_tok_sha = meta.get('tokenizer_file_sha256')
+                _test_tok_sha = _tmeta.get('tokenizer_file_sha256')
+                # The BINDING identity is the full id->token map.  File bytes
+                # can differ for equivalent serialisations, so use the vocab
+                # hash for equality and the file hash only to prove each
+                # persisted artefact is the one its own metadata names.
+                _train_vsha = meta.get('tokenizer_vocab_sha256')
+                _test_vsha = _tmeta.get('tokenizer_vocab_sha256')
+                if _train_vsha and _test_vsha and str(_train_vsha) != str(_test_vsha):
+                    rec['status'] = 'fail'
+                    _fail(f'{cd}/{tag}: train/test tokenizer id-space hashes '
+                          'differ; the id spaces are not one paired tokenizer')
+                if _train_tok_sha and _test_tok_sha and str(_train_tok_sha) != str(_test_tok_sha):
+                    if _train_vsha and _test_vsha and str(_train_vsha) == str(_test_vsha):
+                        _warn(f'{cd}/{tag}: train/test tokenizer files are not '
+                              'byte-identical, but their full vocab identity is; '
+                              'the binding equality holds')
+                    else:
+                        rec['status'] = 'fail'
+                        _fail(f'{cd}/{tag}: train/test tokenizer file identities '
+                              'differ without a matching vocab hash; the id '
+                              'spaces cannot be shown to be one paired tokenizer')
+                _train_tok_path = os.path.join(cd, f'tok_{tag}.json')
+                if _train_tok_sha:
+                    if not os.path.exists(_train_tok_path):
+                        rec['status'] = 'fail'
+                        _fail(f'{cd}/{tag}: train metadata binds a tokenizer file '
+                              'that is missing')
+                    else:
+                        try:
+                            with open(_train_tok_path, 'rb') as _tfh2:
+                                _actual_train_tok_sha = _hl.sha256(_tfh2.read()).hexdigest()
+                        except Exception as _tke2:
+                            rec['status'] = 'fail'
+                            _fail(f'{cd}/{tag}: train tokenizer file unreadable '
+                                  f'({type(_tke2).__name__}: {_tke2})')
+                        else:
+                            if str(_actual_train_tok_sha) != str(_train_tok_sha):
+                                rec['status'] = 'fail'
+                                _fail(f'{cd}/{tag}: train tokenizer file sha256 '
+                                      'does not match its metadata (tokenizer '
+                                      'was replaced)')
+                _test_tok_path = os.path.join(cd, f"test_tok_{_ttag}.json")
+                if _test_tok_sha:
+                    if not os.path.exists(_test_tok_path):
+                        rec['status'] = 'fail'
+                        _fail(f'{cd}/{tag}: test metadata binds a tokenizer file '
+                              'that is missing')
+                    else:
+                        try:
+                            with open(_test_tok_path, 'rb') as _tfh:
+                                _actual_tok_sha = _hl.sha256(_tfh.read()).hexdigest()
+                        except Exception as _tke:
+                            rec['status'] = 'fail'
+                            _fail(f'{cd}/{tag}: test tokenizer file unreadable '
+                                  f'({type(_tke).__name__}: {_tke})')
+                        else:
+                            if str(_actual_tok_sha) != str(_test_tok_sha):
+                                rec['status'] = 'fail'
+                                _fail(f'{cd}/{tag}: test tokenizer file sha256 '
+                                      'does not match its metadata (tokenizer '
+                                      'was replaced)')
+                _test_fit = _tmeta.get('fit_fp')
+                _train_fit = meta.get('fit_fp')
+                if _train_fit and _test_fit and str(_train_fit) != str(_test_fit):
+                    rec['status'] = 'fail'
+                    _fail(f'{cd}/{tag}: test fit_fp differs from the train '
+                          'cache fit_fp (different tokenizer-fit corpus)')
                 if np.issubdtype(np.asarray(te).dtype, np.integer):
                     rec['nonfinite_test'] = 0
                 else:
@@ -1018,6 +1171,14 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                         rec['test_documents'] = int(_ted.size)
                         rec['test_train_document_overlap'] = _dtrain
                         rec['test_validation_document_overlap'] = _dval
+                        _md_t = _tmeta.get('doc_ids') or {}
+                        if _md_t.get('test_fp') is not None:
+                            _Lfp3 = _import_exp_lib()
+                            if str(_Lfp3._ids_fp(_ted)) != str(_md_t['test_fp']):
+                                rec['status'] = 'fail'
+                                _fail(f'{cd}/{tag}: test document-id sidecar does '
+                                      'not match the fingerprint in its metadata (a '
+                                      'stale/mixed sidecar cannot certify isolation)')
                         if _dtrain:
                             rec['status'] = 'fail'
                             _fail(f'{cd}/{tag}: {_dtrain} test document ids also occur in train (group leakage)')
@@ -1159,6 +1320,16 @@ def audit_causality():
         fails.append('block_readable violates the strict inequality pos > last_tok (future leakage into the tail block)')
     if bool(_m[0, 0]) or bool(_m[1, 1]):
         fails.append('block_readable must be strict: pos == last_tok must NOT be readable')
+    # c2) the segmentation table itself must be prefix invariant for both the
+    # no-cap and capped dynamic geometries.  A model-level prefix test can miss
+    # this when the differing tail block happens to be unreadable.
+    _rng = np.random.default_rng(0)
+    for _mb in (None, 8, 32):
+        _cuts = _rng.random(96) < 0.22
+        _rep = L.segmentation_prefix_invariance(_cuts, 97, 2, _mb)
+        if not _rep.get('ok'):
+            fails.append(f'segmenter cut table is not prefix invariant (max_block={_mb}): '
+                         f"{_rep.get('mismatches', [])[:1]}")
     if fails:
         print('[audit causality] FAIL:\n  - ' + '\n  - '.join(fails))
         out = {'status': 'fail', 'failures': fails}

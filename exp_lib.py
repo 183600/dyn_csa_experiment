@@ -67,7 +67,8 @@ from data_guard import (
     _hashable_label,
     chronological_split, chronological_split_indices,
     grouped_chronological_split, grouped_chronological_split_indices,
-    split_indices, split_and_prepare, train_val_test_split,
+    split_indices, split_and_prepare, split_content_fingerprints,
+    train_val_test_split,
     assert_no_split_leakage, LeakageSafePreprocessor, SafeScaler,
     LeakageSafeCategoricalEncoder, LeakageSafeFrequencyEncoder,
     LeakageSafeTargetEncoder, clean_training_rows, prepare_features,
@@ -1396,6 +1397,90 @@ M0_CAP = dict(total_hours=700.0, margin=0.93, already_hours=0.0, state_path='run
 RUN_S2 = dict(RUN_S1, d=1024, n_layers=16, n_heads=16, n_train_tokens=12000000000, steps=183105, warmup=4000, eval_every=8000, seeds=[0, 1, 2], outdir='results_b_s2')
 M2_CAP = dict(total_hours=500.0, margin=0.93, already_hours=0.0, state_path='run_time_state_m2.json')
 
+# ---- Declared data protocol (scale-safe) -----------------------------------
+# Every corpus/evaluation size a run may use is a FIELD of its config.  The
+# defaults below are only defaults: once a run is prepared they are copied into
+# its cfg (and therefore into run_cfg / provenance), so scaling up changes a
+# value rather than a code path.  Loaders must never silently fall back to the
+# historical 8192-token vocabulary or 512-token context.
+DATA_PROTOCOL_FIELDS = ('dataset', 'seq_len', 'n_train_tokens', 'vocab_size',
+                        'val_seqs', 'cache_dir')
+DATA_PROTOCOL_DEFAULTS = {
+    'wikitext': dict(dataset='wikitext', seq_len=512,
+                     n_train_tokens=int(RUN['n_train_tokens']),
+                     vocab_size=8192, val_seqs=int(RUN.get('val_seqs', 512)),
+                     cache_dir='./wt103_cache'),
+    'fineweb': dict(dataset='fineweb', seq_len=8192,
+                    n_train_tokens=int(RUN_S1['n_train_tokens']),
+                    vocab_size=int(B_VOCAB), val_seqs=int(RUN_S1.get('val_seqs', 512)),
+                    cache_dir='./fineweb_cache'),
+}
+
+
+def _protocol_pos_int(name, value):
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, numbers.Integral):
+        raise ValueError(f'data protocol field {name} must be an integer, got {value!r}')
+    value = int(value)
+    if value < 1:
+        raise ValueError(f'data protocol field {name} must be >= 1, got {value!r}')
+    return value
+
+
+def resolve_data_protocol(cfg, *, dataset=None, require=(), defaults=None,
+                          allow_unknown=False):
+    """Resolve the scale protocol from fields, never from a hard-coded shape.
+
+    Returns a plain dict with ``dataset``, ``seq_len``, ``n_train_tokens``,
+    ``vocab_size``, ``val_seqs`` and ``cache_dir``.  Required fields
+    (``require``) must come from the caller's cfg, not from a default, so a
+    confirmation plan can refuse an implicit current-scale fallback.  The
+    input cfg is not mutated; :func:`run` copies the resolved values back
+    before fingerprinting.
+    """
+    if not isinstance(cfg, dict):
+        raise TypeError(f'resolve_data_protocol expects a config mapping, got {type(cfg).__name__}')
+    name = str(dataset if dataset is not None else (cfg.get('dataset') or 'wikitext'))
+    _known = (defaults or DATA_PROTOCOL_DEFAULTS)
+    _has_defaults = name in _known
+    if not _has_defaults and not allow_unknown:
+        raise ValueError(
+            f'unknown dataset {name!r}: declare its data protocol defaults or '
+            'pass allow_unknown=True only when a caller supplies its own loader')
+    base = dict(_known.get(name) or {})
+    # The cfg is authoritative; a field that is present but malformed is an
+    # error, not an invitation to use the default (that would let a typo in a
+    # scale knob silently train the old size).  Unknown datasets (unit-test
+    # loaders, future corpora) have no defaults: their fields must come from
+    # the cfg, and absent optional fields are simply not injected.
+    out = {'dataset': name}
+    for key in DATA_PROTOCOL_FIELDS[1:]:
+        raw = cfg.get(key, base.get(key))
+        if raw is None or (isinstance(raw, str) and not raw.strip()):
+            if _has_defaults:
+                raise ValueError(f'data protocol field {key!r} is missing for dataset {name!r}; pass it explicitly (scale must not be implicit)')
+            continue
+        if key == 'cache_dir':
+            out[key] = str(raw)
+        else:
+            out[key] = _protocol_pos_int(key, raw)
+    for key in require:
+        if key not in cfg or cfg.get(key) is None:
+            raise ValueError(f'data protocol field {key!r} must be declared explicitly for this panel (defaults are not allowed)')
+    return out
+
+
+def apply_data_protocol(cfg, *, dataset=None, require=(), defaults=None,
+                        allow_unknown=False):
+    """Return a copy of ``cfg`` with the resolved protocol fields filled in."""
+    if not isinstance(cfg, dict):
+        raise TypeError(f'apply_data_protocol expects a config mapping, got {type(cfg).__name__}')
+    out = dict(cfg)
+    out.update(resolve_data_protocol(out, dataset=dataset, require=require,
+                                     defaults=defaults,
+                                     allow_unknown=allow_unknown))
+    return out
+
+
 _CPU_DEV = torch.device('cpu')
 _DEV_STR = {}
 
@@ -1445,6 +1530,63 @@ def cosine_similarity_consecutive(H, eps=1e-08):
         h = F.normalize(H[_lead_sl + (slice(s, e), slice(None))], dim=-1, eps=eps)
         out[_lead_sl + (slice(s, e - 1),)] = (h[..., 1:, :] * h[..., :-1, :]).sum(dim=-1)
     return out
+
+
+def chunk_similarity_source(cfg):
+    """Effective similarity signal for a chunking configuration."""
+    declared = getattr(cfg, 'cut_signal_source', 'auto')
+    if declared not in CHUNK_SIGNAL_SOURCES:
+        raise ValueError(f'unknown cut_signal_source {declared!r}')
+    if declared != 'auto':
+        return declared
+    return 'fused' if getattr(cfg, 'chunking', 'fixed') == 'cosine_learnable' else 'context'
+
+
+def chunk_similarity(H, cfg, *, fused=None, eps=1e-8):
+    """One entry point for every dynamic-chunking similarity signal.
+
+    All arms that claim to differ only in *chunking policy* must feed the same
+    representation here.  `cut_signal_source='auto'` preserves the historical
+    learned/fused vs context split; a panel that wants signal parity declares
+    the source explicitly (e.g. all arms 'context') and the protocol descriptor
+    records the effective choice.
+    """
+    source = chunk_similarity_source(cfg)
+    if source == 'fused':
+        if fused is None:
+            raise RuntimeError(
+                "chunk_similarity_source='fused' requires the fused projection; "
+                'the caller would otherwise silently fall back to a different '
+                'similarity signal')
+        return cosine_similarity_consecutive(fused, eps=eps)
+    return cosine_similarity_consecutive(H, eps=eps)
+
+
+def chunking_protocol(cfg):
+    """Machine-readable descriptor of the chunking DATA path.
+
+    Recorded next to block statistics so a report can verify that arms being
+    compared used the same similarity signal, the same strict-cut direction and
+    the same geometry bounds before attributing a difference to the policy.
+    """
+    source = chunk_similarity_source(cfg)
+    return {
+        'chunking': str(getattr(cfg, 'chunking', 'fixed')),
+        'dynamic': bool(getattr(cfg, 'dynamic', False)),
+        'cut_signal_source': source,
+        'cut_signal_declared': str(getattr(cfg, 'cut_signal_source', 'auto')),
+        'cut_rule': 'sim < tau',
+        'cut_rule_strict': True,
+        'similarity_eps': 1e-08,
+        'min_block': int(getattr(cfg, 'min_block', 1) or 1),
+        'max_block': (None if getattr(cfg, 'max_block', None) is None
+                      else int(getattr(cfg, 'max_block'))),
+        'target_block_tokens': int(getattr(cfg, 'target_block_tokens', 1) or 1),
+        'cos_threshold': (float(getattr(cfg, 'cos_threshold'))
+                          if getattr(cfg, 'chunking', '') in ('cosine_abs', 'cosine_adaptive')
+                          else None),
+    }
+
 
 # LRU memo of exact segmenter outputs (OrderedDict).
 # — a pure cache: hits return the identical (bids, honoured, counts) triple
@@ -1857,6 +1999,58 @@ def blocks_from_cuts(n, want_cut_list, min_block, max_block, device, return_coun
     if return_honoured:
         out.append(hon)
     return tuple(out)
+
+
+def segmentation_prefix_invariance(cut_table, n, min_block, max_block,
+                                   prefixes=None, max_checks=64):
+    """Check that the cut table induces a prefix-invariant segmentation.
+
+    For every prefix ``T' <= n`` the block starts of ``x[:T']`` must be a
+    prefix of the full block starts; otherwise a token belongs to different
+    blocks at different evaluation lengths and cross-length panels are not
+    comparable.  Returns a report (``ok`` plus the first mismatches) rather
+    than raising, so it can be used as an audit/diagnostic on candidate cut
+    tables.  Only the last (tail) block may legitimately be extended by the
+    withheld suffix; its START is still checked.
+    """
+    cuts = np.asarray(cut_table, dtype=bool).reshape(-1)
+    n = int(n)
+    if n < 1:
+        return {'ok': True, 'n': n, 'checked_prefixes': 0, 'mismatches': []}
+    if cuts.size < n - 1:
+        cuts = np.concatenate([cuts, np.zeros(n - 1 - cuts.size, dtype=bool)])
+    cuts = cuts[:n - 1]
+
+    def _starts_for(m):
+        _, _, counts = _segment(m, cuts[:m - 1], min_block, max_block)
+        return np.cumsum(np.asarray([0] + list(counts), dtype=np.int64))[:-1]
+
+    full = _starts_for(n)
+    if prefixes is None:
+        if n <= max_checks:
+            prefixes = range(1, n + 1)
+        else:
+            # Deterministic coverage of short prefixes (where geometry is
+            # densest) plus evenly spaced longer ones.
+            short = list(range(1, min(n, 32) + 1))
+            rest = np.linspace(33, n, num=min(max_checks - len(short), n - 32),
+                               dtype=np.int64).tolist() if n > 32 else []
+            prefixes = sorted(set(short + [int(x) for x in rest]))
+    mismatches = []
+    checked = 0
+    for t in sorted({int(x) for x in prefixes if 1 <= int(x) <= n}):
+        checked += 1
+        got = _starts_for(t)
+        if got.size > full.size or not np.array_equal(got, full[:got.size]):
+            mismatches.append({'prefix': int(t),
+                               'prefix_starts': got.tolist()[:16],
+                               'full_starts': full[:max(got.size, 1)].tolist()[:16]})
+            if len(mismatches) >= 8:
+                break
+    return {'ok': not mismatches, 'n': n, 'checked_prefixes': checked,
+            'mismatches': mismatches,
+            'policy': 'prefix block starts must be a prefix of the full starts '
+                      '(strictly causal cuts; the tail may only extend)'}
 
 def _hoist_blocks_from_cuts(T, gate_lists, min_block, max_block, device, want_honoured, hon_dtype):
     # Batched form of the per-row `blocks_from_cuts` + honoured-mask uploads in
@@ -4948,6 +5142,7 @@ OPEN_BLOCK_MODES = ('closed', 'prefix_summary', 'prefix_singletons')
 OPEN_BLOCK_SCOPES = ('full_prefix', 'outside_window')
 SELECTION_BUDGETS = ('shared_topk', 'all_closed_plus_prefix')
 POOL_POSITION_POLICIES = ('truncate',)
+CHUNK_SIGNAL_SOURCES = ('auto', 'context', 'fused')
 
 @dataclass
 class AttnCfg:
@@ -5004,8 +5199,19 @@ class AttnCfg:
     # the paired sign-flip sees a random variable rather than one fixed
     # arbitrary pattern shared by every seed.
     random_salt: int = 0
+    # Which representation feeds the chunk-boundary similarity signal.
+    # 'auto' keeps the historical mapping (learned boundaries use the fused
+    # local projection, fixed/adaptive cosine uses the layer input).  Setting
+    # it explicitly lets a panel FORCE the same signal for every arm, so a
+    # preprocessing/fusion difference cannot masquerade as a chunking-policy
+    # difference.  The effective source is recorded by chunking_protocol().
+    cut_signal_source: str = 'auto'
 
     def __post_init__(self):
+        if self.cut_signal_source not in CHUNK_SIGNAL_SOURCES:
+            raise ValueError(
+                f'unknown cut_signal_source {self.cut_signal_source!r}; expected '
+                f'one of {CHUNK_SIGNAL_SOURCES}')
         if self.open_block_mode not in OPEN_BLOCK_MODES:
             raise ValueError(f'unknown open_block_mode {self.open_block_mode!r}; expected one of {OPEN_BLOCK_MODES}')
         if self.open_block_scope not in OPEN_BLOCK_SCOPES:
@@ -5366,7 +5572,7 @@ class HybridAttention(nn.Module):
         # value downstream (the gate tensor itself and the per-row cut lists) is
         # identical to the per-row inline form.
         fused = pre['fused'] if pre is not None and 'fused' in pre else self._fuse(x.detach())
-        sim = cosine_similarity_consecutive(fused)
+        sim = chunk_similarity(x, self.cfg, fused=fused)
         if sim.numel() == 0:
             return None
         cfg = self.cfg
@@ -5398,6 +5604,7 @@ class HybridAttention(nn.Module):
         # gate_bool_stacked): rows[b] is None or (gate_row, bool_row) exactly
         # as `_gate_signal` would have returned for row b.
         B, T, _d = x.shape
+        cfg = self.cfg
         fused = pre_all.get('fused') if pre_all is not None else None
         if fused is None:
             if self.fuse_conv is not None:
@@ -5405,10 +5612,9 @@ class HybridAttention(nn.Module):
                 # itself, exactly like _gate_signal's inline form)
                 return ([self._gate_signal(x[b], None) for b in range(B)], None)
             fused = x.detach()
-        sim = cosine_similarity_consecutive(fused, eps=1e-08)
+        sim = chunk_similarity(x, cfg, fused=fused, eps=1e-08)
         if sim.shape[-1] == 0:
             return ([None] * B, None)
-        cfg = self.cfg
         # rowwise batched cumsum — same per-row values as the unbind/stack loop.
         # The fresh cumsum output carries the divide/add/subtract/divide tails
         # in place.
@@ -5438,7 +5644,8 @@ class HybridAttention(nn.Module):
         B, T, _d = x.shape
         if T <= 1:
             return None
-        sim = cosine_similarity_consecutive(x.detach(), eps=1e-08)
+        _fused = self._fuse(x.detach()) if chunk_similarity_source(cfg) == 'fused' else None
+        sim = chunk_similarity(x.detach(), cfg, fused=_fused, eps=1e-08)
         if cfg.chunking == 'cosine_adaptive' or cfg.adaptive:
             tau = causal_adaptive_threshold(sim, cfg.target_block_tokens)
         else:
@@ -5473,7 +5680,7 @@ class HybridAttention(nn.Module):
                     self.last_boundary_decisions = int(gate.numel())
             else:
                 fused = pre['fused'] if pre is not None and 'fused' in pre else self._fuse(x.detach())
-                sim = cosine_similarity_consecutive(fused)
+                sim = chunk_similarity(x, cfg, fused=fused)
                 if sim.numel() == 0:
                     gate = torch.tensor([], device=x.device)
                 else:
@@ -5532,7 +5739,8 @@ class HybridAttention(nn.Module):
                 # per-row form below (design notes §6.1).
                 bid, nblk, _hon_dev = pre_blocks
             else:
-                sim = cosine_similarity_consecutive(x.detach())
+                _fused = self._fuse(x.detach()) if chunk_similarity_source(cfg) == 'fused' else None
+                sim = chunk_similarity(x.detach(), cfg, fused=_fused)
                 tau = causal_adaptive_threshold(sim, cfg.target_block_tokens) if cfg.chunking == 'cosine_adaptive' or cfg.adaptive else cfg.cos_threshold
                 bid, nblk = blocks_from_cosine(x, tau, cfg.min_block, cfg.max_block, sim=sim, return_count=True)
         else:
@@ -6550,6 +6758,18 @@ def _cached_split_problems(meta, train_ids, val_batch, val_bnd, vocab, seq_len=N
     if (not fingerprints_trusted and 'val_fp' in meta
             and meta.get('val_fp') != _ids_fp(vb.reshape(-1))):
         problems.append('validation id fingerprint does not match the meta file')
+    _sf_all = meta.get('split_fingerprints')
+    _sfp = _sf_all.get('validation') if isinstance(_sf_all, dict) else None
+    if _sfp is not None and not isinstance(_sfp, dict):
+        problems.append('split_fingerprints.validation is not an object')
+        _sfp = {}
+    _sfp = _sfp or {}
+    if (not fingerprints_trusted and _sfp.get('ids_fp') is not None
+            and str(_sfp['ids_fp']) != str(_ids_fp(vb.reshape(-1)))):
+        problems.append('split_fingerprints.validation.ids_fp does not match the validation ids')
+    if (not fingerprints_trusted and _sfp.get('boundary_fp') is not None
+            and str(_sfp['boundary_fp']) != str(_ids_fp(np.ascontiguousarray(val_bnd).reshape(-1)))):
+        problems.append('split_fingerprints.validation.boundary_fp does not match the validation boundary mask')
     if meta.get('shuffle_at_split') is True:
         problems.append('metadata records a shuffled split; time/group order cannot be trusted')
     if meta.get('tokenizer_fit_split') not in (None, 'train'):
@@ -6620,7 +6840,107 @@ def _wt_cache_dir(cache_dir=None):
     return os.environ.get('WT103_CACHE_DIR') or './wt103_cache'
 
 
-def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_dir=None):
+def _unique_cached_vocab(cache_dir, *, label='loader'):
+    """The one vocabulary width declared by the train caches, or an error.
+
+    Used to replace the historical ``vocab_size=8192`` default: a held-out
+    test cache must be looked up at the vocabulary the training cache actually
+    used, not at the scale this repository happened to run first.  Multiple
+    train metas are accepted only when they agree on the width (the normal
+    case: several sequence-length variants of one tokenizer).
+    """
+    import glob as _glob
+    widths = set()
+    for mp in _glob.glob(os.path.join(cache_dir, 'meta_v5_*.json')):
+        try:
+            with open(mp, encoding='utf-8') as fh:
+                m = json.load(fh)
+        except Exception:
+            continue
+        if not isinstance(m, dict) or m.get('vocab') is None:
+            continue
+        try:
+            widths.add(int(m['vocab']))
+        except (TypeError, ValueError, OverflowError):
+            continue
+    if len(widths) == 1:
+        return next(iter(widths))
+    if not widths:
+        raise RuntimeError(
+            f'{label}: no train/validation cache declares its vocabulary width; '
+            'pass vocab_size explicitly rather than falling back to a '
+            'repository default (build the frozen train cache first)')
+    raise RuntimeError(
+        f'{label}: train caches disagree on vocabulary width {sorted(widths)}; '
+        'pass the intended vocab_size explicitly so the held-out cache cannot '
+        'be silently paired with the wrong tokenizer')
+
+
+def _tokenizer_vocab_sha256(tok):
+    """Identity of the full id->token map (size alone is not identity)."""
+    try:
+        vocab = dict(tok.get_vocab())
+    except Exception:
+        return None
+    blob = json.dumps(vocab, sort_keys=True, separators=(',', ':'),
+                      ensure_ascii=True)
+    return hashlib.sha256(blob.encode('utf-8')).hexdigest()
+
+
+def tokenizer_identity(tok, path=None):
+    """Serialisable tokenizer identity for cache metadata and pairing.
+
+    ``vocab_sha256`` binds the id space; ``file_sha256`` (when the tokenizer is
+    persisted) additionally binds the concrete merge/byte serialisation.  Both
+    are content identities, so two arms that agree on them cannot be using
+    tokenizers that only happen to share a vocabulary size.
+    """
+    out = {'vocab_size': int(tok.get_vocab_size()) if tok is not None else None,
+           'vocab_sha256': _tokenizer_vocab_sha256(tok) if tok is not None else None,
+           'file_sha256': None}
+    if path is not None and os.path.exists(path):
+        try:
+            out['file_sha256'] = file_sha256(path)
+        except Exception:
+            out['file_sha256'] = None
+    return out
+
+
+def _tokenizer_file_problems(meta, tok_path, label, *, require=False):
+    """Reasons a persisted tokenizer file does not match its cache metadata.
+
+    A cache that records no tokenizer identity is legacy (``require=False``:
+    warning only), but a RECORDED identity that no longer matches is a hard
+    problem: the id space or merge set was swapped after the cache was built.
+    """
+    problems = []
+    if not isinstance(meta, dict):
+        return [f'{label}: metadata is not an object']
+    recorded = meta.get('tokenizer_file_sha256')
+    if recorded is None:
+        if require:
+            problems.append(f'{label}: cache does not record the tokenizer file identity')
+        return problems
+    if not os.path.exists(tok_path):
+        problems.append(f'{label}: tokenizer file {os.path.basename(tok_path)} is missing')
+        return problems
+    try:
+        actual = file_sha256(tok_path)
+    except Exception as e:
+        problems.append(f'{label}: tokenizer file unreadable ({type(e).__name__}: {e})')
+        return problems
+    if str(actual) != str(recorded):
+        problems.append(
+            f'{label}: tokenizer file sha256 {actual[:16]}… does not match the '
+            f'cache metadata {str(recorded)[:16]}… (the tokenizer was replaced)')
+    return problems
+
+
+def load_wikitext(seq_len, n_train_tokens, vocab_size=None, val_seqs=512,
+                  cache_dir=None):
+    if vocab_size is None:
+        vocab_size = int(DATA_PROTOCOL_DEFAULTS['wikitext']['vocab_size'])
+    vocab_size = _protocol_pos_int('vocab_size', vocab_size)
     from datasets import load_dataset
     cache_dir = _wt_cache_dir(cache_dir)
     os.makedirs(cache_dir, exist_ok=True)
@@ -6637,7 +6957,8 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
     vad_tok_path = os.path.join(cache_dir, f'val_token_doc_ids_{tag}.npy')
     if all((os.path.exists(p) for p in (tr_path, va_path, vp_path, me_path))):
         _sig = _memo_file_sig({'train': tr_path, 'val': va_path,
-                               'bnd': vp_path, 'meta': me_path})
+                               'bnd': vp_path, 'meta': me_path,
+                               'tokenizer': os.path.join(cache_dir, f'tok_{tag}.json')})
         _mkey = (os.path.abspath(cache_dir), tag, _sig)
         _hit = _WT103_MEMO.get(_mkey)
         if _hit is not None:
@@ -6661,6 +6982,13 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
                                            meta.get('vocab'), seq_len=seq_len,
                                            fingerprints_trusted=False,
                                            ranges_trusted=_fast)
+        # The persisted tokenizer is part of the split identity: the test
+        # loader compares its id space to this file on every hit, so a swapped
+        # train tokenizer must invalidate this cache rather than silently
+        # defining a different id space for the train/validation ids.
+        _problems.extend(_tokenizer_file_problems(
+            meta, os.path.join(cache_dir, f'tok_{tag}.json'),
+            'WikiText train/validation tokenizer'))
         if meta.get('tokenizer_fit_protocol') != 'train_prefix_token_budget':
             _problems.append('cache does not attest the frozen train-prefix tokenizer fit')
         if not meta.get('fit_fp'):
@@ -6919,14 +7247,43 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
                 pass
             raise
     _file_sigs = _cache_file_sigs({'train': tr_path, 'val': va_path, 'bnd': vp_path})
+    # Persist the exact tokenizer BEFORE the metadata so the metadata can bind
+    # its bytes.  The held-out test loader compares full vocab identity and the
+    # file sha256 against this cache; a tokenizer swapped afterwards must not
+    # keep certifying a different id space.
+    _tok_path = os.path.join(cache_dir, f'tok_{tag}.json')
+    try:
+        tok.save(_tok_path)
+    except Exception as _te:
+        print(f'[data] NOTE: could not persist the train tokenizer ({type(_te).__name__}: {_te})')
+    _tok_ident = tokenizer_identity(tok, _tok_path if os.path.exists(_tok_path) else None)
     atomic_write_json(me_path, {
         'vocab': vocab,
+        'tokenizer_file': os.path.basename(_tok_path),
+        'tokenizer_file_sha256': _tok_ident.get('file_sha256'),
+        'tokenizer_vocab_sha256': _tok_ident.get('vocab_sha256'),
+        # Data-construction semantics (not the kernel variant): the held-out
+        # test cache must be built under the SAME split/cleanup semantics.
+        'code_semantics': CODE_SEMANTICS,
         'src_fp': _ids_fp(train_ids),
         'val_fp': _ids_fp(np.ascontiguousarray(val_batch).reshape(-1)),
         'fit_fp': fit_fp,
         'file_sigs': _file_sigs,
         'id_range': {'train': _array_id_range(train_ids), 'val': _array_id_range(val_batch)},
         'split_strategy': 'official_train_validation_test_deduplicated',
+        'split_fingerprints': {
+            'fingerprint_algorithm': _IDS_FP_ALGO,
+            'train': {'file': os.path.basename(tr_path), 'ids_fp': _ids_fp(train_ids),
+                      'documents_fp': _ids_fp(train_doc_ids),
+                      'tokens': int(len(train_ids))},
+            'validation': {'file': os.path.basename(va_path),
+                           'ids_fp': _ids_fp(np.ascontiguousarray(val_batch).reshape(-1)),
+                           'boundary_fp': _ids_fp(np.ascontiguousarray(val_bnd).reshape(-1)),
+                           'documents_fp': _ids_fp(val_doc_ids),
+                           'token_documents_fp': _ids_fp(val_token_doc_ids),
+                           'sequences': int(val_batch.shape[0]),
+                           'seq_len': int(seq_len)},
+        },
         'shuffle_at_split': False,
         'tokenizer_fit_split': 'train',
         'tokenizer_fit_protocol': 'train_prefix_token_budget',
@@ -6962,13 +7319,6 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
         'val_sequences': int(val_batch.shape[0]),
         'seq_len': int(seq_len),
     }, indent=0)
-    try:
-        # persist the exact tokenizer that produced this cache so the held-out
-        # test split can be verified against it by full vocab identity (size
-        # alone is not identity: different merges can share a vocab size).
-        tok.save(os.path.join(cache_dir, f'tok_{tag}.json'))
-    except Exception as _te:
-        print(f'[data] NOTE: could not persist the train tokenizer ({type(_te).__name__}: {_te})')
     print('[data] cached token ids to disk (resume-safe)')
     del ds
     gc.collect()
@@ -7050,7 +7400,11 @@ def _doc_ids_for_capped_rows(rows, lengths, cap_tokens):
     return (np.frombuffer(acc, dtype=np.uint64).copy()
             if acc else np.empty(0, dtype=np.uint64))
 
-def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
+TEST_READ_PURPOSES = ('final_evaluation',)
+
+
+def load_wikitest(seq_len, n_seqs=256, vocab_size=None, cache_dir=None,
+                  purpose='final_evaluation'):
     """Load the WikiText-103 **test** split as (n_seqs, seq_len) int64 rows.
 
     只读 wiki.test.raw（本地 dump 或 HF test split）作为最终评估数据
@@ -7065,10 +7419,27 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
     val/test 的文档交集。这样既防止 test 文档穿越到训练集，也防止它穿越到
     用于调参/早停的验证集。缓存命中会校验内容指纹、tokenizer 拟合来源和
     去重元数据；train 语料被更换时应删除整个 wt103_cache/，否则 test 缓存
-    不会跟随重建——这是显式记录的边界，不是静默的失效路径。"""
+    不会跟随重建——这是显式记录的边界，不是静默的失效路径。
+
+    ``vocab_size=None`` resolves the width from the paired train cache instead
+    of falling back to the historical 8192.  ``purpose`` is an allow-list:
+    only the frozen final evaluation may read this split, so a diagnostic or
+    tuning caller cannot silently turn test into an implicit validation set.
+    """
+    if purpose not in TEST_READ_PURPOSES:
+        raise ValueError(
+            f'load_wikitest: purpose={purpose!r} is not an allowed test-split '
+            f'read ({TEST_READ_PURPOSES}).  Tuning, model selection, diagnostics '
+            'and aggregation must use the validation split; only the frozen '
+            'final evaluation may read test.')
     from datasets import load_dataset
     cache_dir = _wt_cache_dir(cache_dir)
     os.makedirs(cache_dir, exist_ok=True)
+    if vocab_size is None:
+        vocab_size = _unique_cached_vocab(cache_dir, label='load_wikitest')
+    vocab_size = _protocol_pos_int('vocab_size', vocab_size)
+    seq_len = _protocol_pos_int('seq_len', seq_len)
+    n_seqs = _protocol_pos_int('n_seqs', n_seqs)
     tag = f'v2_sl{seq_len}_v{vocab_size}_ns{n_seqs}'
     te_path = os.path.join(cache_dir, f'test_ids_{tag}.npy')
     tb_path = os.path.join(cache_dir, f'test_bnd_{tag}.npy')
@@ -7079,6 +7450,8 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
         _sig_paths = {'test': te_path, 'bnd': tb_path, 'meta': me_path}
         if os.path.exists(td_path):
             _sig_paths['test_doc_ids'] = td_path
+        if os.path.exists(tk_path):
+            _sig_paths['tokenizer'] = tk_path
         _sig = _memo_file_sig(_sig_paths)
         _mkey = (os.path.abspath(cache_dir), tag, _sig)
         _hit = _WT103_TEST_MEMO.get(_mkey)
@@ -7112,12 +7485,41 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
             _problems.append(_problems_td)
         _sigs = _cache_file_sigs(_sig_paths)
         _fast = _cache_file_sigs_match(meta, _sigs)
+        try:
+            _meta_vocab = int(meta.get('vocab'))
+        except (TypeError, ValueError, OverflowError):
+            _meta_vocab = None
+        if _meta_vocab is None or _meta_vocab != int(vocab_size):
+            _problems.append(
+                f'test metadata vocab {meta.get("vocab")!r} != requested '
+                f'{int(vocab_size)} — the cache tag and its content disagree')
         if meta.get('src_fp') != _ids_fp(test_ids):
             _problems.append('test id fingerprint does not match the test meta file')
+        if meta.get('bnd_fp') is not None and meta['bnd_fp'] != _ids_fp(
+                np.ascontiguousarray(test_bnd).reshape(-1)):
+            _problems.append('test boundary-mask fingerprint does not match the test meta file')
+        # Redundant explicit per-split field (new caches): a reader that looks
+        # for `test_fp` must see the same content digest as `src_fp`.
+        if meta.get('test_fp') is not None and meta['test_fp'] != _ids_fp(test_ids):
+            _problems.append('test_fp does not match the cached test ids')
+        _sf = meta.get('split_fingerprints')
+        if isinstance(_sf, dict) and isinstance(_sf.get('test'), dict):
+            _declared_test_fp = _sf['test'].get('ids_fp')
+            if _declared_test_fp is not None and _declared_test_fp != _ids_fp(test_ids):
+                _problems.append('test split_fingerprints.ids_fp does not match the cached test ids')
+            _declared_bnd_fp = _sf['test'].get('boundary_fp')
+            if _declared_bnd_fp is not None and _declared_bnd_fp != _ids_fp(
+                    np.ascontiguousarray(test_bnd).reshape(-1)):
+                _problems.append('test split_fingerprints.boundary_fp does not match the cached boundary mask')
         if np.asarray(test_bnd).shape != np.asarray(test_ids).shape:
             _problems.append(f'test boundary mask shape {np.asarray(test_bnd).shape} != {np.asarray(test_ids).shape}')
         if meta.get('shuffle_at_split') is True:
             _problems.append('metadata records a shuffled split')
+        _rp_meta = meta.get('read_purpose')
+        if _rp_meta is not None and _rp_meta != 'final_evaluation':
+            _problems.append(
+                f'test cache was built for read_purpose={_rp_meta!r}, not the '
+                'frozen final evaluation')
         if meta.get('tokenizer_fit_split') not in (None, 'train'):
             _problems.append(f"tokenizer was fitted on {meta.get('tokenizer_fit_split')!r}, not train")
         if meta.get('tokenizer_fit_protocol') != 'train_prefix_token_budget':
@@ -7215,13 +7617,21 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
         # the cold path is not enough: a swapped test cache could otherwise
         # serve a tokenizer that saw test text.
         _train_fit_fps = set()
+        _train_semantics = set()
+        _train_vocab_shas = set()
         for _mp in _glob2.glob(os.path.join(cache_dir, 'meta_v5_*.json')):
             try:
                 _mt = json.load(open(_mp, encoding='utf-8'))
             except Exception:
                 continue
-            if isinstance(_mt, dict) and _mt.get('fit_fp'):
+            if not isinstance(_mt, dict):
+                continue
+            if _mt.get('fit_fp'):
                 _train_fit_fps.add(_mt['fit_fp'])
+            if _mt.get('code_semantics') is not None:
+                _train_semantics.add(str(_mt['code_semantics']))
+            if _mt.get('tokenizer_vocab_sha256'):
+                _train_vocab_shas.add(str(_mt['tokenizer_vocab_sha256']))
         if _train_fit_fps and meta.get('fit_fp') not in _train_fit_fps:
             raise RuntimeError(
                 'load_wikitest: the cached test split was tokenised with a fit '
@@ -7231,6 +7641,31 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
                 'rebuild it from the same train tokenizer')
         if meta.get('fit_fp') and not _train_fit_fps:
             print('[data] NOTE: no train-cache meta found; the cached TEST fit provenance cannot be cross-checked locally')
+        # Code-semantics binding across the pair.  The data-construction stamp
+        # is deliberately separate from the kernel variant: it says how the
+        # split/dedup/tokenisation were produced.  Two caches built by
+        # different semantics are not a matched train/test pair.
+        _sem_meta = meta.get('code_semantics')
+        if _sem_meta is not None and _train_semantics and str(_sem_meta) not in _train_semantics:
+            raise RuntimeError(
+                f'load_wikitest: the test cache was built under code semantics '
+                f'{_sem_meta!r}, but the paired train cache(s) declare '
+                f'{sorted(_train_semantics)} — the train/test split construction '
+                'semantics differ, so the split cannot be treated as one frozen '
+                'pair')
+        if not _train_semantics:
+            print('[data] NOTE: train cache meta has no data code-semantics stamp; the train/test construction binding is unverified (rebuild both caches with the current loader to bind it)')
+        # Full id-space identity across the pair (in addition to the tokenizer
+        # file bytes below).  A cache that records no vocab hash is legacy.
+        _vsha_meta = meta.get('tokenizer_vocab_sha256')
+        if _vsha_meta is not None and _train_vocab_shas and str(_vsha_meta) not in _train_vocab_shas:
+            raise RuntimeError(
+                'load_wikitest: the test tokenizer id-space hash does not match '
+                f'the train cache tokenizer hash ({str(_vsha_meta)[:16]}… vs '
+                f'{sorted(str(x)[:16] for x in _train_vocab_shas)}) — the two '
+                'splits do not share one tokenizer')
+        if _vsha_meta is None:
+            print('[data] NOTE: test cache has no tokenizer_vocab_sha256; only the tokenizer file bytes can be compared')
         # Bind the actual test tokenizer bytes on EVERY cache hit.
         # `fit_fp` hashes the fit TEXT, which two different BPE merge sets can
         # share; it is not a tokenizer identity.  A missing identity in a
@@ -7263,13 +7698,21 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
         if np.asarray(test_ids).shape != (int(n_seqs), int(seq_len)):
             raise RuntimeError(f'load_wikitest: cached test slice shape {np.asarray(test_ids).shape} != the frozen ({int(n_seqs)}, {int(seq_len)}); the frozen slice is part of the pre-registration, so a different row count must be re-frozen explicitly')
         if _problems:
-            _cache_warning('WikiText test split', _problems)
-        else:
-            if not _fast:
-                _validate_token_ids(test_ids, meta['vocab'], 'cached test_ids')
-            out = (test_ids, meta['vocab'], None, test_bnd)
-            _memo_put(_WT103_TEST_MEMO, _mkey, out, _WT103_TEST_MEMO_CAP)
-            return out
+            # Unlike the train/validation cache (which can be rebuilt), the
+            # held-out test split is frozen: serving it while any content,
+            # tokenizer or provenance check is unverified would silently make
+            # an un-auditable panel look like a confirmation.  Fail closed.
+            raise RuntimeError(
+                'load_wikitest: the cached TEST split cannot be verified ('
+                + '; '.join(_problems)
+                + ') — refusing to serve it.  Repair the cache pair explicitly '
+                '(never by relaxing the check); a frozen test slice is read once '
+                'and cannot be silently redefined')
+        if not _fast:
+            _validate_token_ids(test_ids, meta['vocab'], 'cached test_ids')
+        out = (test_ids, meta['vocab'], None, test_bnd)
+        _memo_put(_WT103_TEST_MEMO, _mkey, out, _WT103_TEST_MEMO_CAP)
+        return out
     # cold build: resolve the train tokenizer FIRST, then touch the test rows.
     # Resolve the tokenizer before touching the test rows, so a tokenizer/fit
     # mismatch fails before the held-out split is read.  `test_rows` is
@@ -7592,13 +8035,36 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
     atomic_write_json(me_path, {
         'vocab': vocab,
         'src_fp': _ids_fp(test_batch),
+        'test_fp': _ids_fp(test_batch),
+        'bnd_fp': _ids_fp(np.ascontiguousarray(test_bnd).reshape(-1)),
         'fit_fp': _text_fp(train_fit_rows),
+        'code_semantics': CODE_SEMANTICS,
+        'read_purpose': purpose,
         'tokenizer_file': os.path.basename(tk_path),
         'tokenizer_file_sha256': _tok_sha,
-        'tokenizer_vocab_sha256': hashlib.sha256(json.dumps(dict(tok.get_vocab()), sort_keys=True, separators=(',', ':')).encode('utf-8')).hexdigest(),
+        'tokenizer_vocab_sha256': _tokenizer_vocab_sha256(tok),
         'file_sigs': _file_sigs,
         'id_range': {'test': _array_id_range(test_batch)},
         'split_strategy': 'official_dataset_test_split_near_duplicate_filtered',
+        'split_fingerprints': {
+            'fingerprint_algorithm': _IDS_FP_ALGO,
+            'test': {'file': os.path.basename(te_path),
+                     'ids_fp': _ids_fp(test_batch),
+                     'boundary_fp': _ids_fp(np.ascontiguousarray(test_bnd).reshape(-1)),
+                     'documents_fp': _ids_fp(test_doc_ids),
+                     'sequences': int(test_batch.shape[0]),
+                     'seq_len': int(seq_len)},
+            'paired_train': {
+                'fit_fps': sorted({str(_m.get('fit_fp')) for _m in _train_meta_objs
+                                   if _m.get('fit_fp')}),
+                'code_semantics': sorted({str(_m.get('code_semantics'))
+                                          for _m in _train_meta_objs
+                                          if _m.get('code_semantics') is not None}),
+                'tokenizer_vocab_sha256': sorted(
+                    {str(_m.get('tokenizer_vocab_sha256'))
+                     for _m in _train_meta_objs if _m.get('tokenizer_vocab_sha256')}),
+            },
+        },
         'shuffle_at_split': False,
         'tokenizer_fit_split': 'train',
         'tokenizer_fit_protocol': 'train_prefix_token_budget',
@@ -8107,7 +8573,12 @@ def _fineweb_docs(source):
         txt = str(text)
         yield _doc_exact_fp(txt), txt
 
-def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, cache_dir='./fineweb_cache', source='sample-10BT', fit_docs=20000):
+def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=None, val_seqs=512,
+                     cache_dir='./fineweb_cache', source='sample-10BT',
+                     fit_docs=20000):
+    if vocab_size is None:
+        vocab_size = int(DATA_PROTOCOL_DEFAULTS['fineweb']['vocab_size'])
+    vocab_size = _protocol_pos_int('vocab_size', vocab_size)
     """B-tier corpus: FineWeb-Edu, self-trained BPE.
 
     Discipline mirrors load_wikitext exactly: npy cache keyed by the full
@@ -8145,6 +8616,7 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
     me_path = os.path.join(cache_dir, f'meta_{tag}.json')
     trd_path = os.path.join(cache_dir, f'train_doc_ids_{tag}.npy')
     vad_path = os.path.join(cache_dir, f'val_doc_ids_{tag}.npy')
+    tk_path = os.path.join(cache_dir, f'tok_{tag}.json')
     # Only validation needs token-level groups; a 5B-token TRAIN sidecar
     # would be tens of GB and has no consumer.  Keep train document ids at the
     # document level.
@@ -8153,7 +8625,7 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
                                         trd_path, vad_path))):
         _sig = _memo_file_sig({'train': tr_path, 'val': va_path, 'bnd': vp_path,
                                'meta': me_path, 'train_doc_ids': trd_path,
-                               'val_doc_ids': vad_path})
+                               'val_doc_ids': vad_path, 'tokenizer': tk_path})
         _mkey = (os.path.abspath(cache_dir), tag, _sig, _local_sig)
         _hit = _FWEB_MEMO.get(_mkey)
         if _hit is not None:
@@ -8181,6 +8653,8 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
                                                meta.get('vocab'), seq_len=seq_len,
                                                fingerprints_trusted=False,
                                                ranges_trusted=_fast)
+            _problems.extend(_tokenizer_file_problems(
+                meta, tk_path, 'FineWeb train/validation tokenizer'))
             try:
                 _trd = np.load(trd_path)
                 _vad = np.load(vad_path)
@@ -8443,10 +8917,32 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
         _validate_token_ids(train_ids, vocab, 'fineweb train_ids')
         _file_sigs = _cache_file_sigs({'train': tr_path, 'val': va_path, 'bnd': vp_path,
                                        'train_doc_ids': trd_path, 'val_doc_ids': vad_path})
+        try:
+            tok.save(tk_path)
+        except Exception as _te:
+            print(f'[data] NOTE: could not persist the FineWeb tokenizer ({type(_te).__name__}: {_te})')
+        _tok_ident = tokenizer_identity(tok, tk_path if os.path.exists(tk_path) else None)
         atomic_write_json(me_path, {
             'vocab': vocab,
+            'tokenizer_file': os.path.basename(tk_path),
+            'tokenizer_file_sha256': _tok_ident.get('file_sha256'),
+            'tokenizer_vocab_sha256': _tok_ident.get('vocab_sha256'),
+            'code_semantics': CODE_SEMANTICS,
             'src_fp': _ids_fp(train_ids),
             'val_fp': _ids_fp(np.ascontiguousarray(val_batch).reshape(-1)),
+            'split_fingerprints': {
+                'fingerprint_algorithm': _IDS_FP_ALGO,
+                'train': {'file': os.path.basename(tr_path),
+                          'ids_fp': _ids_fp(train_ids),
+                          'documents_fp': _ids_fp(_train_doc_arr),
+                          'tokens': int(train_ids.size)},
+                'validation': {'file': os.path.basename(va_path),
+                               'ids_fp': _ids_fp(np.ascontiguousarray(val_batch).reshape(-1)),
+                               'boundary_fp': _ids_fp(np.ascontiguousarray(val_bnd).reshape(-1)),
+                               'documents_fp': _ids_fp(_val_doc_arr),
+                               'sequences': int(val_batch.shape[0]),
+                               'seq_len': int(seq_len)},
+            },
             'file_sigs': _file_sigs,
             'id_range': {'train': _array_id_range(train_ids), 'val': _array_id_range(val_batch)},
             'doc_ids': {
@@ -8500,7 +8996,7 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
         audit_corpus_split(train_ids, val_batch, vocab, dataset='fineweb',
                            meta=json.load(open(me_path, encoding='utf-8')))
         _out = (train_ids, val_batch, vocab, tok, val_bnd)
-        _memo_put(_FWEB_MEMO, (os.path.abspath(cache_dir), tag, _memo_file_sig({'train': tr_path, 'val': va_path, 'bnd': vp_path, 'meta': me_path, 'train_doc_ids': trd_path, 'val_doc_ids': vad_path}), _local_sig), _out, _FWEB_MEMO_CAP)
+        _memo_put(_FWEB_MEMO, (os.path.abspath(cache_dir), tag, _memo_file_sig({'train': tr_path, 'val': va_path, 'bnd': vp_path, 'meta': me_path, 'train_doc_ids': trd_path, 'val_doc_ids': vad_path, 'tokenizer': tk_path}), _local_sig), _out, _FWEB_MEMO_CAP)
         return _out
     finally:
         for _raw in (raw_train, raw_val):
@@ -8729,10 +9225,23 @@ def load_run_corpus(cfg):
     with its own cache directory, tokenizer width,
     source name and fit protocol."""
     name = cfg.get('dataset') or 'wikitext'
+    # Resolve every scale knob from declared fields.  The loader receives the
+    # resolved values, so a missing/typoed seq_len or vocab fails here instead
+    # of silently training the historical current-scale shape.
+    proto = resolve_data_protocol(cfg, dataset=name)
     if name == 'wikitext':
-        return load_wikitext(cfg['seq_len'], cfg['n_train_tokens'], vocab_size=cfg.get('vocab_size', 8192), val_seqs=cfg.get('val_seqs', 512), cache_dir=cfg.get('cache_dir', './wt103_cache'))
+        return load_wikitext(proto['seq_len'], proto['n_train_tokens'],
+                             vocab_size=proto['vocab_size'],
+                             val_seqs=proto['val_seqs'],
+                             cache_dir=proto['cache_dir'])
     if name == 'fineweb':
-        return load_fineweb_edu(cfg['seq_len'], cfg['n_train_tokens'], vocab_size=cfg.get('vocab_size', B_VOCAB), val_seqs=cfg.get('val_seqs', 512), cache_dir=cfg.get('cache_dir', './fineweb_cache'), source=cfg.get('fw_source', 'sample-10BT'), fit_docs=cfg.get('fw_fit_docs', 20000))
+        return load_fineweb_edu(proto['seq_len'], proto['n_train_tokens'],
+                                vocab_size=proto['vocab_size'],
+                                val_seqs=proto['val_seqs'],
+                                cache_dir=proto['cache_dir'],
+                                source=cfg.get('fw_source', 'sample-10BT'),
+                                fit_docs=_protocol_pos_int(
+                                    'fw_fit_docs', cfg.get('fw_fit_docs', 20000)))
     raise ValueError(f"load_run_corpus: unknown dataset {name!r} (expected 'wikitext' or 'fineweb')")
 
 def _json_clean(obj):
@@ -9480,6 +9989,26 @@ def open_block_config(m):
                                       for r in rows),
             'fingerprint': hashlib.sha256(blob.encode('utf-8')).hexdigest()[:16]}
 
+
+def model_chunking_protocols(m):
+    """Per-layer chunking DATA-path descriptor + one combined fingerprint.
+
+    This is evidence about how each layer derived its cuts (similarity source,
+    strict cut direction, geometry bounds), not a claim that every arm must
+    have the same descriptor: dynamic-vs-fixed is itself a declared
+    intervention.  It lets an audit compare arms that are supposed to differ
+    only in policy and detect a preprocessing/signal confound.
+    """
+    rows = []
+    for li, blk in enumerate(getattr(m, 'blocks', [])):
+        cfg = getattr(getattr(blk, 'attn', None), 'cfg', None)
+        if cfg is None or getattr(cfg, 'kind', 'full') == 'full':
+            continue
+        rows.append(dict({'layer': int(li)}, **chunking_protocol(cfg)))
+    blob = json.dumps(rows, sort_keys=True, separators=(',', ':'))
+    return {'layers': rows,
+            'fingerprint': hashlib.sha256(blob.encode('utf-8')).hexdigest()[:16]}
+
 def train_objective(m, *, comp_lambda=0.0, delta_lr_mult=1.0):
     """Describe the ACTUAL optimisation objective of an arm.
 
@@ -9633,6 +10162,25 @@ def pair_reason(ra, rb):
         return 'unverifiable run_cfg'
     if ra.get('run_cfg') != rb.get('run_cfg'):
         return 'different run_cfg'
+    # Code semantics are a configuration component even when a legacy run_cfg
+    # predates the `_cs` suffix.  A contrast across two semantic stamps would
+    # silently mix preprocessing/kernel behaviour, so refuse it explicitly.
+    _ca, _cb = ra.get('_code'), rb.get('_code')
+    _ha = _ca is not None and str(_ca) != ''
+    _hb = _cb is not None and str(_cb) != ''
+    if _ha != _hb:
+        return 'unverifiable _code (only one record carries the code-semantics stamp)'
+    if _ha and str(_ca) != str(_cb):
+        return f'different code semantics ({str(_ca)[:24]}… vs {str(_cb)[:24]}…)'
+    # Protocol grouping: a warmup/early-stop/eval variant is its own protocol
+    # and must never be paired with another one, even if its run_cfg happens
+    # to match.  Both-absent is the untagged legacy path.
+    _pa = ('protocol' in ra and ra.get('protocol') is not None) or ra.get('warm_steps') is not None
+    _pb = ('protocol' in rb and rb.get('protocol') is not None) or rb.get('warm_steps') is not None
+    if _pa != _pb:
+        return 'unverifiable protocol (only one record carries a protocol tag)'
+    if _pa and str(_tag_of(ra)) != str(_tag_of(rb)):
+        return f'different protocol ({_tag_of(ra)!r} vs {_tag_of(rb)!r})'
     _env_reason = execution_environment_reason(ra, rb)
     if _env_reason is not None:
         return _env_reason
@@ -17449,6 +17997,12 @@ def metric_policy_audit(summary=None, policy=None):
                 _rb = _finite_scalar(_b.get('bnd_rand'))
                 if _rb is None or not (0.0 <= _rb <= 1.0):
                     _bad_bnd.append('random-out-of-range')
+                _rk = _b.get('bnd_rand_kind')
+                if _rk is not None:
+                    try:
+                        normalize_bnd_rand_kind(_rk)
+                    except (TypeError, ValueError):
+                        _bad_bnd.append('unknown-bnd-rand-kind')
             out['checks'].append({'metric': 'boundary_alignment', 'policy': 'boundary_alignment',
                                   'records': len(bnd), 'ok': not missing and not _bad_bnd,
                                   'missing': missing, 'invalid': sorted(set(_bad_bnd)),
@@ -24944,13 +25498,46 @@ def _restore_block_stats(snap):
             attn._prefix_stats.__dict__.clear()
             attn._prefix_stats.__dict__.update(pstate)
 
-def boundary_alignment(pred_cuts, gt_mask_row, n, tol=1, provenance=None, detail=None):
+# Random-cut baseline has two distinct sampling definitions.  They have
+# different estimands (a fixed number of cuts per sequence vs a per-position
+# independent cut process with a varying count), so their precisions must
+# never be averaged, paired or plotted as one series.
+BND_RAND_KINDS = ('matched_cut_count', 'per_sequence_independent')
+_BND_RAND_ALIASES = {
+    'matched_cut_count': 'matched_cut_count',
+    'fixed_k': 'matched_cut_count',
+    'fixed_block_count': 'matched_cut_count',
+    'per_sequence_independent': 'per_sequence_independent',
+    'independent': 'per_sequence_independent',
+    'independent_cuts': 'per_sequence_independent',
+}
+
+
+def normalize_bnd_rand_kind(kind):
+    if kind is None:
+        return 'matched_cut_count'
+    key = str(kind).strip().lower()
+    if key not in _BND_RAND_ALIASES:
+        raise ValueError(
+            f'unknown bnd_rand kind {kind!r}; expected one of '
+            f'{BND_RAND_KINDS} (aliases: fixed_k / independent).  The two '
+            'definitions have different estimands and must not be mixed.')
+    return _BND_RAND_ALIASES[key]
+
+
+def boundary_alignment(pred_cuts, gt_mask_row, n, tol=1, provenance=None,
+                       detail=None, rand_kind='matched_cut_count'):
+    rand_kind = normalize_bnd_rand_kind(rand_kind)
     gt = np.nonzero(np.asarray(gt_mask_row)[:n - 1])[0] + 1
     pred = np.asarray(pred_cuts)
     P, G = (len(pred), len(gt))
     if P == 0 or G == 0:
         if provenance is not None:
             provenance.setdefault('bnd_rand_exact', True)
+            provenance.setdefault('bnd_rand_kind', rand_kind)
+            provenance.setdefault('bnd_rand_definition',
+                                  'fixed_block_count' if rand_kind == 'matched_cut_count'
+                                  else 'per_sequence_independent')
         if detail is not None:
             detail.update({'tp': 0, 'fp': P, 'fn': G, 'n_pred': P, 'n_gt': G})
         return (0.0, 0.0, 0.0, 0.0)
@@ -24962,9 +25549,14 @@ def boundary_alignment(pred_cuts, gt_mask_row, n, tol=1, provenance=None, detail
     f1 = 2 * prec * rec / max(prec + rec, 1e-09)
     n_pos = max(n - 1, 1)
     _approx = []
-    rand_prec = _random_cut_precision(P, None, n_pos, tol, G, gt, approx_flag=_approx)
+    rand_prec = _random_cut_precision(P, None, n_pos, tol, G, gt,
+                                      approx_flag=_approx, kind=rand_kind)
     if provenance is not None:
         provenance['bnd_rand_exact'] = provenance.get('bnd_rand_exact', True) and (not _approx)
+        provenance.setdefault('bnd_rand_kind', rand_kind)
+        provenance.setdefault('bnd_rand_definition',
+                              'fixed_block_count' if rand_kind == 'matched_cut_count'
+                              else 'per_sequence_independent')
     return (prec, rec, f1, rand_prec)
 
 def _mask_runs(near, n_pos, tol):
@@ -25028,12 +25620,15 @@ def _mask_runs(near, n_pos, tol):
         return np.asarray(sorted(set(out)), dtype=int) + 1
     return None
 
-def _random_cut_precision(P, near, n_pos, tol, G, gt_bounds=None, approx_flag=None):
+def _random_cut_precision(P, near, n_pos, tol, G, gt_bounds=None, approx_flag=None,
+                          kind='matched_cut_count'):
+    kind = normalize_bnd_rand_kind(kind)
     if P <= 0 or G <= 0 or n_pos <= 0:
         return 0.0
     if gt_bounds is None:
         if near is None:
             print('[stats] WARNING: `_random_cut_precision` got neither a `near` mask nor `gt_bounds`; the baseline is UNCOMPUTABLE for this call (returning 0.0) rather than being scored against an inflated reference set.  Pass `gt_bounds`.')
+            print(f'[stats] bnd_rand kind for this call: {kind!r}; this value must not be pooled with the other definition.')
             return 0.0
         _runs = _mask_runs(near, n_pos, tol)
         if _runs is None:
@@ -25057,6 +25652,24 @@ def _random_cut_precision(P, near, n_pos, tol, G, gt_bounds=None, approx_flag=No
             clusters.append(cur)
             cur = [g]
     clusters.append(cur)
+    if kind == 'per_sequence_independent':
+        # Each eligible slot is cut independently with p so that the EXPECTED
+        # number of cuts is P.  The count is therefore random and the estimand
+        # differs from the matched-count baseline above; callers must keep the
+        # two kinds separate.  The closed form is the expected number of GT
+        # boundaries whose neighbourhood contains at least one cut, divided by
+        # the expected number of cuts.  It is a coverage probability, not the
+        # exact greedy-match expectation, so mark it as sampled/non-exact for
+        # pooling purposes.
+        if approx_flag is not None:
+            approx_flag.append(('per_sequence_independent', BND_RAND_KINDS[0]))
+        p = min(1.0, float(P) / float(n_pos))
+        expected = 0.0
+        for cl in clusters:
+            lo, hi = (max(min(cl) - tol, 1), min(max(cl) + tol, n_pos))
+            w = max(1, hi - lo + 1)
+            expected += len(cl) * (1.0 - (1.0 - p) ** w)
+        return float(min(expected / float(P), 1.0))
     expect_frac = 0.0
     for cl in clusters:
         lo, hi = (max(min(cl) - tol, 1), min(max(cl) + tol, n_pos))
@@ -25375,7 +25988,9 @@ def _greedy_match_count_batch(subsets, gt_sorted, order, tol):
             counts[prev_sid] = len(used_p)
     return counts.tolist()
 
-def compression_report(model, val_batch, device, n_sample=64, val_bnd=None, bnd_tol=1):
+def compression_report(model, val_batch, device, n_sample=64, val_bnd=None,
+                       bnd_tol=1, bnd_rand_kind='matched_cut_count'):
+    bnd_rand_kind = normalize_bnd_rand_kind(bnd_rand_kind)
     was_training = model.training
     model.eval()
     enable_block_stats(model, True)
@@ -25384,14 +25999,18 @@ def compression_report(model, val_batch, device, n_sample=64, val_bnd=None, bnd_
     for _a in need_reg_layers:
         _a.need_reg = False
     try:
-        return _compression_report_impl(model, val_batch, device, n_sample, val_bnd, bnd_tol)
+        return _compression_report_impl(model, val_batch, device, n_sample,
+                                        val_bnd, bnd_tol,
+                                        bnd_rand_kind=bnd_rand_kind)
     finally:
         for _a, _prev in zip(need_reg_layers, need_reg_prior):
             _a.need_reg = _prev
         enable_block_stats(model, False)
         model.train(was_training)
 
-def _compression_report_summary(model, seq_len, val_bnd=None, bnd_tol=1):
+def _compression_report_summary(model, seq_len, val_bnd=None, bnd_tol=1,
+                                bnd_rand_kind='matched_cut_count'):
+    bnd_rand_kind = normalize_bnd_rand_kind(bnd_rand_kind)
     report = {}
     # every dynamic layer's delta_logit (same scalars, same floats).
     _dl_layers = [(li, blk.attn.delta_logit) for li, blk in enumerate(model.blocks)
@@ -25419,6 +26038,11 @@ def _compression_report_summary(model, seq_len, val_bnd=None, bnd_tol=1):
             entry = {'blocks': n_blocks, 'avg_len': seq_len / max(n_blocks, 1.0), 'len_mean': _vals[0], 'len_std': _vals[1], 'len_min': int(_vals[2]), 'len_max': int(_vals[3]), 'frac_at_min': _vals[4], 'frac_at_max': _vals[5]}
             del _sc, _vals
         _ps = prefix_stats_summary(attn, seq_len)
+        if getattr(attn.cfg, 'dynamic', False) or getattr(attn.cfg, 'chunking', 'fixed') != 'fixed':
+            # The chunking DATA path (similarity signal / strict cut rule /
+            # geometry bounds) must be comparable across the arms in a
+            # dynamic-vs-fixed or ablation contrast; record it per layer.
+            entry['chunking_protocol'] = chunking_protocol(attn.cfg)
         _ob_cfg = {
             'open_block_mode': getattr(attn.cfg, 'open_block_mode', 'closed'),
             'open_block_scope': getattr(attn.cfg, 'open_block_scope', 'full_prefix'),
@@ -25458,8 +26082,10 @@ def _compression_report_summary(model, seq_len, val_bnd=None, bnd_tol=1):
             for si in range(n_seq_ref):
                 c = _tcut_host.get(si) if si in _tcut_host else _cuts[si]
                 _d = {}
-                p, r_, f_, rp = boundary_alignment(c, val_bnd[si], seq_len, tol=bnd_tol,
-                                                   provenance=_prov, detail=_d)
+                p, r_, f_, rp = boundary_alignment(
+                    c, val_bnd[si], seq_len, tol=bnd_tol,
+                    provenance=_prov, detail=_d,
+                    rand_kind=bnd_rand_kind)
                 ps.append(p)
                 rs.append(r_)
                 fs.append(f_)
@@ -25485,6 +26111,11 @@ def _compression_report_summary(model, seq_len, val_bnd=None, bnd_tol=1):
                 entry['bnd_rand'] = float(np.mean(np.asarray(rps)))
                 entry['bnd_excess'] = entry['bnd_prec'] - entry['bnd_rand']
                 entry['bnd_rand_exact'] = bool(_prov.get('bnd_rand_exact', True))
+                entry['bnd_rand_kind'] = str(_prov.get('bnd_rand_kind') or bnd_rand_kind)
+                entry['bnd_rand_definition'] = str(
+                    _prov.get('bnd_rand_definition')
+                    or ('fixed_block_count' if entry['bnd_rand_kind'] == 'matched_cut_count'
+                        else 'per_sequence_independent'))
                 if not entry['bnd_rand_exact']:
                     print(f'[compression_report] WARNING: `bnd_rand` for L{li}_{kind} is a SAMPLED estimate, not the exact expectation, so `bnd_excess` carries Monte-Carlo error — recorded as `bnd_rand_exact: False` and it must not be pooled with the exact panels.')
             else:
@@ -25496,7 +26127,8 @@ def _compression_report_summary(model, seq_len, val_bnd=None, bnd_tol=1):
 
 
 @torch.inference_mode()
-def _compression_report_impl(model, val_batch, device, n_sample, val_bnd, bnd_tol):
+def _compression_report_impl(model, val_batch, device, n_sample, val_bnd, bnd_tol,
+                             *, bnd_rand_kind='matched_cut_count'):
     report = {}
     seq_len = val_batch.shape[1]
     if int(n_sample) < 1:
@@ -25533,7 +26165,8 @@ def _compression_report_impl(model, val_batch, device, n_sample, val_bnd, bnd_to
             raise
         del ids
         _r0 += _cur
-    return _compression_report_summary(model, int(seq_len), val_bnd, bnd_tol)
+    return _compression_report_summary(model, int(seq_len), val_bnd, bnd_tol,
+                                        bnd_rand_kind=bnd_rand_kind)
 
 def is_no_decay(name):
     if any((k in name for k in ('delta_logit', 'B_pos', 'W_aZ', 'W_bZ', 'sink', 'tok.weight', 'pos.weight', 'fuse_conv', 'q_norm', 'kv_norm'))):
@@ -27249,6 +27882,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
               'param_breakdown': param_breakdown(_inner_model),
               'kv_cache_elements_per_token': kv_cache_elements_per_token(_inner_model),
               'train_objective': train_objective(_inner_model, comp_lambda=comp_lambda, delta_lr_mult=delta_lr_mult),
+              'chunking_protocol': model_chunking_protocols(_inner_model),
               'open_block_config': open_block_config(_inner_model),
               'curve_summary': _curve_summary,
               'curve_health': _health, 'health_history': _health_history,
@@ -30375,6 +31009,9 @@ def aggregate(summary):
             entry['run_cfg'] = recs[0].get('run_cfg')
         dyn_lens, all_lens, deltas = ([], [], [])
         bf1, bex = ([], [])
+        # `bnd_rand` has two sampling definitions; their excesses are different
+        # estimands and must not be averaged into one series.
+        _bnd_rand_kinds = set()
 
         def _cell(layer, k):
             return _finite_scalar(layer.get(k))
@@ -30397,8 +31034,13 @@ def aggregate(summary):
                         _ex = _cell(lv, 'bnd_excess') if lv.get('bnd_rand_exact') is not False else None
                         if _f1 is not None:
                             r_f1.append(_f1)
-                        if _ex is not None:
-                            r_ex.append(_ex)
+                        if _ex is not None or lv.get('bnd_rand') is not None:
+                            _kind = lv.get('bnd_rand_kind')
+                            _kind = (normalize_bnd_rand_kind(_kind)
+                                     if _kind is not None else 'unspecified_legacy')
+                            _bnd_rand_kinds.add(_kind)
+                            if _ex is not None:
+                                r_ex.append(_ex)
                 dl = _cell(lv, 'delta')
                 if dl is not None:
                     r_dl.append(dl)
@@ -30410,6 +31052,14 @@ def aggregate(summary):
                 # Average per record FIRST (as bf1/bex do), so records with more
                 # dynamic layers do not get extra weight in the cross-seed mean.
                 deltas.append(float(np.mean(r_dl)))
+        if len(_bnd_rand_kinds) > 1:
+            entry['boundary_rand_kind_conflict'] = sorted(_bnd_rand_kinds)
+            print(f'[aggregate] WARNING: {key}: `bnd_rand` cells mix the '
+                  f'{sorted(_bnd_rand_kinds)} definitions — their bnd_excess '
+                  'values are different estimands and are NOT averaged; '
+                  'report each kind separately')
+        elif _bnd_rand_kinds:
+            entry['boundary_rand_kind'] = next(iter(_bnd_rand_kinds))
         if dyn_lens:
             entry['avg_dyn_block_len'] = float(np.mean(dyn_lens))
         elif all_lens:
@@ -30419,7 +31069,7 @@ def aggregate(summary):
         if bf1:
             entry['boundary_f1_dyn'] = float(np.mean(bf1))
             entry['boundary_f1_dyn_std'] = float(np.std(bf1, ddof=1)) if len(bf1) > 1 else 0.0
-        if bex:
+        if bex and 'boundary_rand_kind_conflict' not in entry:
             entry['boundary_excess_dyn'] = float(np.mean(bex))
         hists = [r['ppl_history'] for r in recs
                  if isinstance(r.get('ppl_history'), (list, tuple)) and r.get('ppl_history')]
@@ -30497,13 +31147,20 @@ def aggregate(summary):
         return json.dumps([rec.get('run_cfg'), [rec.get(k) for k in PAIR_STEP_KEYS]], sort_keys=True, default=str)
 
     def _baseline_for(tag, fp_idx, base_groups, recs):
+        # Pairing is only legal inside one (variant, protocol) group.  A
+        # tagged arm must never borrow an untagged (or differently tagged)
+        # baseline: that changes the warmup/eval protocol while pretending the
+        # contrast is controlled.  Legacy panel readers may still report the
+        # arm's own marginal aggregate; they simply get no dPPL.
         _want = _cfg_fp_noparam(recs[0]) if recs else None
         if _want is not None:
             _cands = sorted(base_groups.items(), key=lambda kv: (kv[0][0] != tag, kv[0][1] is None))
             for (_t_c, _i_c), _grp in _cands:
+                if _t_c != tag:
+                    continue
                 if any((_cfg_fp_noparam(_r) == _want for _r in _grp)):
                     return (_grp, _t_c)
-        for _cand in ((tag, fp_idx), (tag, None), ('', None)):
+        for _cand in ((tag, fp_idx), (tag, None)):
             if _cand in base_groups:
                 return (base_groups[_cand], _cand[0])
         _want_cfg = recs[0].get('run_cfg') if recs else None
@@ -30522,9 +31179,9 @@ def aggregate(summary):
             print(f'[aggregate] {key}: NO `full` baseline in this panel — dPPL_vs_full not computed')
             continue
         if base_tag != tag:
-            print(f'[aggregate] {key}: pairing against the `full#{base_tag or '(untagged)'}` baseline (no `full` run exists for protocol {tag or '(untagged)'})')
-        elif tag and any((_t == '' for _t, _i in _full_groups)):
-            _base_amb.append(f'{key}: `full#{tag}` and `full` both present')
+            # _baseline_for is strict, so this is a programming error rather
+            # than a fallback: refuse instead of silently changing protocol.
+            _base_amb.append(f'{key}: baseline protocol {base_tag!r} != arm protocol {tag!r}')
             continue
         ds, skipped = _paired(recs, base_recs)
         if skipped:
@@ -30546,9 +31203,7 @@ def aggregate(summary):
         if base_recs is None:
             continue
         if base_tag != tag:
-            print(f'[aggregate] {key}: pairing against the UNTAGGED `full_sw128_matched` baseline')
-        elif tag and any((_t == '' for _t, _i in _sw_groups)):
-            _base_amb.append(f'{key}: `full_sw128_matched#{tag}` and the untagged one both present')
+            _base_amb.append(f'{key}: `full_sw128_matched` baseline protocol {base_tag!r} != arm protocol {tag!r}')
             continue
         ds, skipped = _paired(recs, base_recs)
         if skipped:
@@ -30561,7 +31216,7 @@ def aggregate(summary):
             agg[key]['n_paired_sw128m'] = len(d)
             agg[key]['n_paired_sw128m_skipped'] = len(skipped)
     if _base_amb:
-        raise ValueError('aggregate: ambiguous dense baseline for ' + '; '.join(sorted(_base_amb)) + '. A same-tagged and an untagged baseline are both present, so the reported delta would depend on which one was picked. Remove or re-tag one of them before aggregating.')
+        raise ValueError('aggregate: unsafe/cross-protocol baseline pairing for ' + '; '.join(sorted(_base_amb)) + '. Pair only a baseline in the SAME (variant, protocol) group; remove or re-tag the mismatched baseline before aggregating.')
     return agg
 _TW = {'variant': 18, 'ppl': 16, 'd': 15, 'd2': 15, 'params': 10, 'seeds': 6, 'blklen': 7, 'bnd': 13}
 
@@ -30641,22 +31296,18 @@ def _print_pairs(summary):
         ra, rb = (_sel(a), _sel(b))
         _a_t = {t for t, _s in ra}
         _b_t = {t for t, _s in rb}
-        _a_pure_base = _a_t == {''}
-        _b_pure_base = _b_t == {''}
+        # Same (variant, protocol) group only.  Pairing a tagged arm with an
+        # untagged baseline changes the protocol (warmup/eval condition) and
+        # would otherwise manufacture a controlled-looking delta.
         common = []
-        for tag in sorted(_a_t | _b_t):
-            if tag in _a_t and tag in _b_t and tag:
-                seeds = sorted({s for t, s in ra if t == tag} & {s for t, s in rb if t == tag})
-                common += [(tag, tag, s) for s in seeds]
-            if tag and tag in _a_t and _b_pure_base:
-                seeds = sorted({s for t, s in ra if t == tag} & {s for t, s in rb if t == ''})
-                common += [(tag, '', s) for s in seeds]
-            if tag and tag in _b_t and _a_pure_base:
-                seeds = sorted({s for t, s in ra if t == ''} & {s for t, s in rb if t == tag})
-                common += [('', tag, s) for s in seeds]
-            if tag == '' and '' in _a_t and ('' in _b_t):
-                seeds = sorted({s for t, s in ra if t == ''} & {s for t, s in rb if t == ''})
-                common += [('', '', s) for s in seeds]
+        for tag in sorted(_a_t & _b_t):
+            seeds = sorted({s for t, s in ra if t == tag} & {s for t, s in rb if t == tag})
+            common += [(tag, tag, s) for s in seeds]
+        _only_a = sorted(_a_t - _b_t)
+        _only_b = sorted(_b_t - _a_t)
+        if _only_a or _only_b:
+            print(f'  [skip] {a} vs {b}: protocol group(s) only on one side '
+                  f'(a-only={_only_a}, b-only={_only_b}) — no cross-protocol pairing')
         _by_cond = {}
         _est_by_cond = {}
         _sk = []
@@ -31206,6 +31857,11 @@ def _record_failed_panel(outdir, cfg, run_cfg, prov, *, stage, error, planned_ce
 
 def run(cfg=None, seeds=None, guard=None, label='', par=None):
     cfg = dict(RUN) if cfg is None else dict(cfg)
+    # Freeze the scale protocol into the cfg before any probe/fingerprint so
+    # every downstream consumer (loader, run_cfg, data_version, resume check)
+    # reads the SAME declared sizes instead of falling back to current code
+    # defaults independently.
+    cfg = apply_data_protocol(cfg, allow_unknown=True)
     if seeds is not None:
         cfg['seeds'] = list(seeds)
     d = cfg.get('d', 256)
