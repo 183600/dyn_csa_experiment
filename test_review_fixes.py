@@ -5013,9 +5013,15 @@ def t_environment_snapshot_identity():
     env = L.environment_snapshot()
     for k in ('gpu_identity', 'cuda_visible_devices', 'float32_matmul_precision',
               'cublas_workspace_config', 'dependencies',
+              'dependency_contract', 'env_flags',
               'fp16_reduced_precision_reduction', 'bf16_reduced_precision_reduction'):
         assert k in env, f'environment snapshot missing {k}'
     assert isinstance(env['gpu_identity'], list)
+    assert isinstance(env['env_flags'], dict)
+    contract = env['dependency_contract']
+    assert contract.get('kind') == 'dependency_contract', contract
+    assert contract.get('status') in ('ok', 'partial', 'mismatch',
+                                      'invalid', 'missing_lock'), contract
     dep = env['dependencies']
     assert 'requirements.txt' in dep['files'] and 'requirements.lock' in dep['files'], dep
     assert dep['files']['requirements.txt'] is None or dep['files']['requirements.txt']['sha256'], dep
@@ -18263,6 +18269,120 @@ def t_archive_manifest_covers_bytes_actually_written():
             os.path.join(td, 'archive', 'release_race_test.tar.gz'))
 
 
+def t_source_tree_manifest_tracks_exact_bytes():
+    with tempfile.TemporaryDirectory() as td:
+        os.makedirs(os.path.join(td, 'docs'))
+        os.makedirs(os.path.join(td, 'results_should_be_skipped'))
+        with open(os.path.join(td, 'exp_lib.py'), 'w', encoding='utf-8') as f:
+            f.write('A = 1\n')
+        with open(os.path.join(td, 'pyproject.toml'), 'w', encoding='utf-8') as f:
+            f.write('[project]\n')
+        with open(os.path.join(td, 'docs', 'design_notes.md'), 'w', encoding='utf-8') as f:
+            f.write('note\n')
+        with open(os.path.join(td, 'test_should_be_skipped.py'), 'w', encoding='utf-8') as f:
+            f.write('NOT_MEASUREMENT = True\n')
+        with open(os.path.join(td, 'results_should_be_skipped', 'x.py'), 'w', encoding='utf-8') as f:
+            f.write('NOT_SOURCE = True\n')
+        m1 = L.source_tree_manifest(root=td)
+        m2 = L.source_tree_manifest(root=td)
+        assert m1['sha256'] == m2['sha256'], 'two identical scans must agree'
+        assert set(m1['files']) == {'exp_lib.py', 'pyproject.toml'}, m1['files']
+        assert m1['n_files'] == 2 and 'files' not in L.source_tree_summary(root=td)
+        # A content change must change both the per-file digest and the aggregate.
+        with open(os.path.join(td, 'exp_lib.py'), 'a', encoding='utf-8') as f:
+            f.write('B = 2\n')
+        m3 = L.source_tree_manifest(root=td)
+        assert m3['sha256'] != m1['sha256']
+        assert (m3['files']['exp_lib.py']['sha256']
+                != m1['files']['exp_lib.py']['sha256'])
+        # A removal must be visible, not silently treated as an unchanged tree.
+        os.unlink(os.path.join(td, 'pyproject.toml'))
+        m4 = L.source_tree_manifest(root=td)
+        assert 'pyproject.toml' not in m4['files']
+        assert m4['sha256'] != m3['sha256']
+        # An explicit include list is restricted to the requested files.
+        one = L.source_tree_manifest(root=td, include=['exp_lib.py'])
+        assert set(one['files']) == {'exp_lib.py'}, one
+        try:
+            L.source_tree_manifest(root=td, include=['../escape.py'])
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('include path escaping the root must be rejected')
+
+
+def t_dependency_contract_parses_lock_and_detects_mismatch():
+    from importlib import metadata as _md
+    with tempfile.TemporaryDirectory() as td:
+        lock = os.path.join(td, 'requirements.lock')
+        with open(lock, 'w', encoding='utf-8') as f:
+            f.write('# comment\n--extra-index-url https://example.invalid/simple\n')
+            f.write(f'numpy=={_md.version("numpy")}\n')
+            f.write(f'torch=={_md.version("torch")}\n')
+            f.write('PyYAML==' + _md.version('pyyaml') + '\n')
+        c = L.dependency_contract(lock)
+        assert c['status'] in ('ok', 'partial'), c
+        assert c['n_pinned'] == 3 and not c['mismatches'] and not c['missing'], c
+        assert c['options'] == ['--extra-index-url https://example.invalid/simple'], c
+        with open(lock, 'w', encoding='utf-8') as f:
+            f.write('numpy==0.0.0\n')
+        c = L.dependency_contract(lock)
+        assert c['status'] == 'mismatch' and c['mismatches'], c
+        with open(lock, 'w', encoding='utf-8') as f:
+            f.write('definitely-not-installed-xyz==1.0\n')
+        c = L.dependency_contract(lock)
+        assert c['status'] == 'mismatch' and c['missing'], c
+        with open(lock, 'w', encoding='utf-8') as f:
+            f.write('numpy>=2\n')
+        c = L.dependency_contract(lock)
+        assert c['status'] == 'invalid' and c['invalid'], c
+        c = L.dependency_contract(os.path.join(td, 'absent.lock'))
+        assert c['status'] == 'missing_lock', c
+
+
+def t_audit_source_and_dependency_gates():
+    cur = L.source_tree_manifest()
+    with tempfile.TemporaryDirectory() as td:
+        snap = os.path.join(td, 'plan_snapshot.json')
+        with open(snap, 'w', encoding='utf-8') as f:
+            json.dump({'source_tree': cur}, f)
+        r = A.audit_source_integrity(snapshot_path=snap)
+        assert r['status'] == 'ok', r
+        bad = json.loads(json.dumps(cur))
+        bad['sha256'] = '0' * 64
+        with open(snap, 'w', encoding='utf-8') as f:
+            json.dump({'source_tree': bad}, f)
+        r = A.audit_source_integrity(snapshot_path=snap)
+        assert r['status'] == 'fail' and r['problems'], r
+        r = A.audit_source_integrity(
+            snapshot_path=os.path.join(td, 'missing_plan.json'))
+        assert r['status'] == 'not_verifiable_locally', r
+        lock = os.path.join(td, 'requirements.lock')
+        from importlib import metadata as _md
+        with open(lock, 'w', encoding='utf-8') as f:
+            f.write(f'numpy=={_md.version("numpy")}\n')
+        r = A.audit_dependencies(lock_path=lock)
+        assert r['status'] == 'ok' and r['contract_status'] in ('ok', 'partial'), r
+        with open(lock, 'w', encoding='utf-8') as f:
+            f.write('numpy==0.0.0\n')
+        r = A.audit_dependencies(lock_path=lock)
+        assert r['status'] == 'fail' and r['mismatches'], r
+
+
+def t_requirements_lock_is_a_complete_environment():
+    parsed = L.parse_requirements_lock(os.path.join(REPO, 'requirements.lock'))
+    assert parsed['exists'] and not parsed['invalid'], parsed
+    assert parsed['pins'], parsed
+    # The five direct runtime deps must all be pinned, and the lock must carry
+    # the transitive closure rather than regressing to a five-line top-level
+    # list (the exact failure mode this hardening fixes).
+    for name in ('torch', 'numpy', 'tokenizers', 'datasets', 'matplotlib'):
+        assert name in parsed['pins'], (name, sorted(parsed['pins']))
+    assert len(parsed['pins']) >= 20, (
+        f'requirements.lock pins only {len(parsed["pins"])} distributions; '
+        'it must be a full transitive closure')
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -18739,6 +18859,10 @@ def main():
     _check('L134 kernel geometry caches are training-safe after eval', t_kernel_geometry_caches_are_not_inference_tensors)
     _check('L135 kernel reference fp64 attention stays finite', t_kernel_reference_fp64_stays_finite)
     _check('L136 open-block training receives the panel deadline', t_open_block_cell_receives_the_panel_deadline)
+    _check('L137 source-tree digest tracks exact source bytes', t_source_tree_manifest_tracks_exact_bytes)
+    _check('L138 dependency lock contract detects stale/missing pins', t_dependency_contract_parses_lock_and_detects_mismatch)
+    _check('L139 source/dependency gates fail closed and bind evidence', t_audit_source_and_dependency_gates)
+    _check('L140 requirements.lock is a full transitive closure', t_requirements_lock_is_a_complete_environment)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

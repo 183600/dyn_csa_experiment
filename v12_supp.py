@@ -3582,6 +3582,13 @@ def _archive_plan_snapshot(report, manifest, manifest_path=FREEZE_MANIFEST, outd
                         'before P5C training and the one-shot P5T test access'),
             'git_head': _head,
             'code_semantics': L.CODE_SEMANTICS,
+            # The git commit alone cannot identify a dirty work tree, a source
+            # tarball, or an edit that leaves CODE_SEMANTICS unchanged.  Bind
+            # the exact source bytes and the dependency-lock contract that the
+            # plan gate approved, so a later P5T/analysis artifact can be
+            # compared against this record instead of trusting the stamp.
+            'source_tree': L.source_tree_manifest(),
+            'dependency_contract': L.dependency_contract(),
             'manifest': manifest_path,
             'manifest_sha256': report.get('manifest_sha256'),
             'human_review': {

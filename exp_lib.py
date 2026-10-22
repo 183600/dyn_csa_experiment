@@ -27137,7 +27137,8 @@ def _dependency_fingerprint():
     block without changing the content-based resume fingerprint."""
     root = os.path.dirname(os.path.abspath(__file__))
     files = {}
-    for name in ('requirements.txt', 'requirements.lock', 'pyproject.toml'):
+    for name in ('requirements.txt', 'requirements.lock', 'requirements-ci.txt',
+                 'pyproject.toml'):
         path = os.path.join(root, name)
         try:
             with open(path, 'rb') as fh:
@@ -27156,6 +27157,283 @@ def _dependency_fingerprint():
     except Exception as e:
         files['_error'] = f'{type(e).__name__}: {e}'
     return {'files': files, 'packages': packages}
+
+# ---------------------------------------------------------------------------
+# Source-tree identity
+#
+# A git commit identifies the source only while the work tree is clean AND the
+# reader still has .git.  The frozen-manifest contract deliberately binds
+# CODE_SEMANTICS, not the bytes of exp_lib.py (see the continuous-loop header),
+# and a source tarball / dirty work tree has no commit identity at all.  The
+# source-tree digest is the content-level complement: it hashes exactly the
+# files that can change a measurement or its analysis, so an artifact can be
+# tied to the code that produced it without trusting git.  It is evidence, not
+# a semantic stamp; it never enters run_cfg / the resume fingerprint.
+# ---------------------------------------------------------------------------
+_SOURCE_TREE_HASH_CACHE = {}
+_SOURCE_TREE_CACHE_CAP = 512
+_SOURCE_TREE_CONFIG_FILES = (
+    # requirements.lock is deliberately NOT here: it is a machine-specific
+    # environment record (README tells every machine to regenerate it), so
+    # folding it into the source digest would make the same source look
+    # different on a CPU test box and a CUDA experiment box.  The lock's hash
+    # and contract live in environment_snapshot() instead.
+    'pyproject.toml', 'setup.py', 'setup.cfg', 'requirements.txt',
+    'confirmation_frozen.json', 'confirmation_frozen_dynamic.json',
+)
+_SOURCE_TREE_SKIP_FILES = ('conftest.py',)
+_SOURCE_TREE_SKIP_DIRS = {
+    '.git', '.github', '.venv', 'venv', 'env', 'ENV', '__pycache__',
+    '.ruff_cache', '.pytest_cache', '.mypy_cache', '.cache', 'node_modules',
+    'build', 'dist', 'site-packages', 'archive', 'par_jobs',
+    'wt103_cache', 'fineweb_cache', 'wt103_raw', 'datasets', 'data', 't',
+}
+_SOURCE_TREE_SKIP_PREFIXES = ('results_', 'analysis_')
+
+
+def _source_tree_rel(path, root):
+    return os.path.relpath(path, root).replace(os.sep, '/')
+
+
+def _source_file_sha256(path, st=None):
+    """sha256 of one source file, memoised on the full stat identity."""
+    global _SOURCE_TREE_HASH_CACHE
+    if st is None:
+        st = os.stat(path)
+    key = (os.path.abspath(path), st.st_dev, st.st_ino, st.st_size,
+           st.st_mtime_ns, st.st_ctime_ns)
+    ent = _SOURCE_TREE_HASH_CACHE.get(key)
+    if ent is not None:
+        return ent
+    digest = file_sha256(path)
+    if len(_SOURCE_TREE_HASH_CACHE) >= _SOURCE_TREE_CACHE_CAP:
+        _SOURCE_TREE_HASH_CACHE.clear()
+    _SOURCE_TREE_HASH_CACHE[key] = digest
+    return digest
+
+
+def _source_tree_paths(root):
+    """Deterministic list of source/config files under ``root``.
+
+    Generated artifact directories are pruned, not walked: a 1M-file results
+    tree must not turn a provenance call into an I/O sweep.  README files are
+    intentionally outside the scope (they document the project but cannot
+    change a measurement; the operational tree is what this digest binds).
+    """
+    root = os.path.abspath(root)
+    out = []
+    seen = set()
+    for rel in _SOURCE_TREE_CONFIG_FILES:
+        p = os.path.join(root, rel)
+        if os.path.isfile(p):
+            out.append(p)
+            seen.add(os.path.abspath(p))
+    for cur, dirs, names in os.walk(root, followlinks=False):
+        dirs[:] = sorted(
+            d for d in dirs
+            if d not in _SOURCE_TREE_SKIP_DIRS
+            and not any(d.startswith(pref) for pref in _SOURCE_TREE_SKIP_PREFIXES)
+        )
+        for n in sorted(names):
+            if not n.endswith('.py'):
+                continue
+            if n.startswith('test_') or n in _SOURCE_TREE_SKIP_FILES:
+                # Tests exercise the measurement code; they do not define it.
+                # Keeping them out of the digest means a new CPU test cannot
+                # masquerade as a semantic change to a frozen panel.
+                continue
+            p = os.path.join(cur, n)
+            ap = os.path.abspath(p)
+            if ap in seen or not os.path.isfile(p):
+                continue
+            seen.add(ap)
+            out.append(p)
+    return sorted(out, key=lambda p: _source_tree_rel(p, root))
+
+
+def source_tree_manifest(root=None, include=None):
+    """Content manifest of the measurement-relevant source tree.
+
+    ``include`` lets a test/audit restrict the manifest to explicit relative
+    paths.  The full manifest is the durable form written into a plan snapshot;
+    per-record provenance uses ``source_tree_summary`` so it stays small.
+    """
+    root = os.path.abspath(root or os.path.dirname(os.path.abspath(__file__)))
+    if include is None:
+        paths = _source_tree_paths(root)
+    else:
+        paths = []
+        for rel in include:
+            rel = str(rel).replace('\\', '/')
+            p = os.path.join(root, rel)
+            ap = os.path.abspath(p)
+            if os.path.commonpath([root, ap]) != root:
+                raise ValueError(f'source_tree_manifest: {rel!r} escapes {root!r}')
+            if os.path.isfile(ap):
+                paths.append(ap)
+        paths = sorted(paths, key=lambda p: _source_tree_rel(p, root))
+    files = {}
+    unreadable = []
+    total = 0
+    for p in paths:
+        rel = _source_tree_rel(p, root)
+        try:
+            st = os.stat(p)
+            digest = _source_file_sha256(p, st)
+        except OSError as e:
+            unreadable.append({'path': rel, 'error': f'{type(e).__name__}: {e}'})
+            continue
+        files[rel] = {'sha256': digest, 'bytes': int(st.st_size)}
+        total += int(st.st_size)
+    # Hash paths, sizes and per-file digests in sorted order.  Including the
+    # path makes a rename visible even when the bytes are unchanged; including
+    # the size makes truncation visible even before a digest is compared.
+    blob = ''.join(f'{rel}\0{files[rel]["bytes"]}\0{files[rel]["sha256"]}\n'
+                   for rel in sorted(files))
+    digest = hashlib.sha256(blob.encode('utf-8')).hexdigest()
+    return {
+        'schema': 1,
+        'algorithm': 'sha256(sorted relpath NUL bytes NUL sha256 LF)',
+        'sha256': digest,
+        'n_files': len(files),
+        'bytes': int(total),
+        'files': files,
+        'unreadable': unreadable,
+        'scope': ('all non-generated, non-test *.py under the repo root plus '
+                  'pyproject/setup/requirements.txt and both frozen manifests; '
+                  'requirements.lock (machine-specific environment), README*.md, '
+                  'docs, tests and CI configuration are excluded'),
+    }
+
+
+def source_tree_summary(root=None):
+    """Compact source-tree identity for per-record provenance."""
+    m = source_tree_manifest(root=root)
+    out = {k: m[k] for k in ('schema', 'algorithm', 'sha256', 'n_files',
+                            'bytes', 'scope')}
+    if m.get('unreadable'):
+        out['unreadable'] = m['unreadable']
+    return out
+
+
+def parse_requirements_lock(path=None):
+    """Parse a ``name==version`` lock without importing packaging.
+
+    Options (e.g. ``--extra-index-url``) and comments are recorded but ignored
+    for the version comparison; ambiguous/duplicate pins are an error rather
+    than "last line wins", because that would silently change the environment
+    a release was verified against.
+    """
+    path = os.path.abspath(path or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), 'requirements.lock'))
+    out = {'path': path, 'exists': os.path.isfile(path), 'pins': {},
+           'options': [], 'invalid': [], 'sha256': None}
+    if not out['exists']:
+        return out
+    with open(path, 'rb') as fh:
+        raw = fh.read()
+    out['sha256'] = hashlib.sha256(raw).hexdigest()
+    text = raw.decode('utf-8', 'replace')
+    _pin_re = re.compile(
+        r'^([A-Za-z0-9][A-Za-z0-9._-]*)(?:\[[^\]]*\])?\s*==\s*([^\s;]+)$')
+    for line in text.splitlines():
+        s = line.split('#', 1)[0].strip()
+        if not s:
+            continue
+        if s.startswith('-'):
+            out['options'].append(s)
+            continue
+        # `pip-compile --generate-hashes` puts the hashes on continuation
+        # lines (which start with `--hash`, handled above) and may leave a
+        # trailing backslash on the pin itself.  Accept both forms so a
+        # hash-pinned lock is compared, not silently rejected as malformed.
+        s = s.rstrip('\\').strip().split(' --hash', 1)[0].strip()
+        m = _pin_re.match(s.split(';', 1)[0].strip())
+        if not m:
+            out['invalid'].append(s)
+            continue
+        name = re.sub(r'[-_.]+', '-', m.group(1)).lower()
+        ver = m.group(2).strip()
+        if name in out['pins'] and out['pins'][name]['version'] != ver:
+            out['invalid'].append(f'duplicate/conflicting pin: {s}')
+            continue
+        out['pins'][name] = {'name': m.group(1), 'version': ver}
+    return out
+
+
+def dependency_contract(lock_path=None):
+    """Compare the declared lock with the versions actually installed.
+
+    A lock that is present but incomplete or stale is the reproducibility
+    failure mode a release must expose: the same git commit then runs on a
+    different numerical stack.  ``partial`` means every pinned entry matches
+    but extra installed distributions are not pinned (the lock is not a full
+    environment record).  Tooling (pip/setuptools/wheel) is not a runtime
+    dependency and is excluded from the coverage check.
+    """
+    try:
+        parsed = parse_requirements_lock(lock_path)
+    except OSError as e:
+        # Provenance must never crash a training run because a lock file is
+        # unreadable; report it as an explicit contract failure instead.
+        return {'kind': 'dependency_contract',
+                'lock_path': os.path.abspath(str(lock_path or 'requirements.lock')),
+                'lock_sha256': None, 'n_pinned': 0, 'options': [],
+                'mismatches': [], 'missing': [], 'unpinned_installed': [],
+                'invalid': [f'could not read the lock: {type(e).__name__}: {e}'],
+                'status': 'invalid',
+                'note': 'the lock file exists but could not be read'}
+    out = {'kind': 'dependency_contract', 'lock_path': parsed['path'],
+           'lock_sha256': parsed['sha256'], 'n_pinned': len(parsed['pins']),
+           'options': parsed['options'], 'mismatches': [], 'missing': [],
+           'invalid': list(parsed['invalid']), 'unpinned_installed': [],
+           'status': 'ok', 'note': ''}
+    if not parsed['exists']:
+        out['status'] = 'missing_lock'
+        out['note'] = 'requirements.lock is absent; the environment is not pinned'
+        return out
+    if parsed['invalid']:
+        out['status'] = 'invalid'
+        out['note'] = 'the lock has unparseable/ambiguous entries'
+        return out
+    installed = {}
+    try:
+        from importlib import metadata as _md
+        for dist in _md.distributions():
+            try:
+                name = dist.metadata['Name']
+                if name:
+                    installed[re.sub(r'[-_.]+', '-', str(name)).lower()] = str(dist.version)
+            except Exception:
+                continue
+    except Exception as e:
+        out['status'] = 'invalid'
+        out['invalid'].append(f'importlib.metadata unavailable: {type(e).__name__}: {e}')
+        return out
+    for name, ent in sorted(parsed['pins'].items()):
+        got = installed.get(name)
+        if got is None:
+            out['missing'].append({'name': ent['name'], 'expected': ent['version']})
+        elif str(got) != str(ent['version']):
+            out['mismatches'].append({'name': ent['name'], 'expected': ent['version'],
+                                      'installed': str(got)})
+    _tooling = {'pip', 'setuptools', 'wheel', 'pkg-resources', 'distribute'}
+    out['unpinned_installed'] = sorted(
+        n for n in installed if n not in parsed['pins'] and n not in _tooling)
+    out['n_installed'] = len(installed)
+    out['n_unpinned_installed'] = len(out['unpinned_installed'])
+    if out['mismatches'] or out['missing']:
+        out['status'] = 'mismatch'
+        out['note'] = 'installed versions do not match the lock'
+    elif out['unpinned_installed']:
+        out['status'] = 'partial'
+        out['note'] = ('every pinned entry matches, but the lock does not pin '
+                       'all installed runtime distributions')
+    else:
+        out['note'] = ('every installed runtime distribution is pinned and '
+                       'matches (pip/setuptools/wheel excluded as tooling)')
+    return out
+
 
 def environment_snapshot():
     """Compact software/hardware snapshot for experiment tracking."""
@@ -27204,7 +27482,14 @@ def environment_snapshot():
         'hashseed_contract': hashseed_contract(),
         'tensorflow': getattr(sys.modules.get('tensorflow'), '__version__', None),
         'dependencies': _dependency_fingerprint(),
+        'dependency_contract': dependency_contract(),
         'flags': {k: os.environ.get(k) for k in ('CSA_KERNEL', 'CSA_CKPT', 'CSA_DETERMINISTIC', 'CSA_CPU_THREADS', 'CSA_SKIP_OVERFIT', 'CSA_REQUIRE_REPRO', 'CSA_SKIP_REPRO', 'CUBLAS_WORKSPACE_CONFIG')},
+        # Every run-control variable, not just the historically documented
+        # subset: an unrecorded CSA_*/WT103_*/V12_* flag is an unexplained
+        # difference between two otherwise identical runs.  Secrets (tokens,
+        # passwords) do not use these prefixes and are never collected.
+        'env_flags': {k: os.environ.get(k) for k in sorted(os.environ)
+                      if k.startswith(('CSA_', 'WT103_', 'FWEDU_', 'M0_', 'V12_'))},
     }
     for _mod, _key in (('tokenizers', 'tokenizers'), ('datasets', 'datasets')):
         try:
@@ -27345,7 +27630,13 @@ def code_provenance():
     data fingerprints) and by `stamped_analysis` (derived/audit artifacts,
     which have no data of their own — their inputs are other stamped records
     or on-disk panels, so a `data` block here would be misleading)."""
-    return {'code': {'code_semantics': CODE_SEMANTICS, 'code_stamp': code_stamp(), 'kernel_stamp': _kernel_stamp(), **_git_provenance()}, 'environment': environment_snapshot()}
+    code = {'code_semantics': CODE_SEMANTICS, 'code_stamp': code_stamp(),
+            'kernel_stamp': _kernel_stamp(), **_git_provenance()}
+    # Content identity that survives a source tarball / dirty work tree.  It is
+    # recorded after the git fields so a reader can compare both: the commit
+    # answers "which revision", the tree digest answers "exactly which bytes".
+    code['source_tree'] = source_tree_summary()
+    return {'code': code, 'environment': environment_snapshot()}
 
 def experiment_provenance(cfg, *, train_ids=None, val_batch=None, vocab=None):
     """Everything needed to identify a panel: code version (semantic stamp

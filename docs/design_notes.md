@@ -2612,3 +2612,81 @@ python v12_supp.py plan           # 冻结预检不变：72/72、6 个主比较
 4. **实际显著性仍依赖判断。** 报告拒绝 `|mean| <= std` 并给出相对效应/
    噪声，但没有预先注册的最小实际效应量；若决策是关于实际而非仅统计
    优势，未来冻结应写明 SESOI（smallest effect size of interest）。
+
+## 50. 源码树身份与依赖锁契约（本轮可复现性硬化）
+
+§49.2 指出「分析代码本身没有被冻结锁哈希」是剩余边界；本轮不改变 P5T
+的冻结判定，而是把**源码字节**和**依赖环境**变成可记录、可重算、可审计的
+证据，使「同一 commit / 同一 CODE_SEMANTICS」不再被误当作「同一份代码 /
+同一套数值栈」。
+
+### 50.1 问题
+
+1. `git_commit` 只描述仓库历史：工作区有未提交改动时，两个 run 可以共享
+   同一个 commit；从源码 tar 包运行时甚至没有 commit。`git_diff_sha256`
+   只覆盖 tracked diff，未跟踪的新源码文件不在内容摘要里。
+2. `CODE_SEMANTICS` 是测量语义戳，不是文件哈希（CI header 已明确警告：
+   agent 可以在不 bump 戳的情况下改测量语义）。P5T 的 admission 绑定
+   manifest sha，但不绑定 `exp_lib.py` 的字节。
+3. `requirements.lock` 原先只钉住 5 个直接依赖，transitive 依赖仍随
+   PyPI 最新版本漂移；同一个 lock 不能重建同一条数值路径。
+4. 环境快照只采集了少数 `CSA_*` 开关；未记录的 run-control 变量会让两次
+   「相同配置」的运行产生无法解释的差异。
+
+### 50.2 改动（只增加证据，不改测量语义）
+
+- `exp_lib.source_tree_manifest()` / `source_tree_summary()`：对
+  **非生成、非测试**的 `*.py`（`test_*.py` / `conftest.py` 除外）以及
+  `pyproject.toml`、`setup.py/cfg`、`requirements.txt`、两份冻结清单
+  做确定性 SHA-256。`requirements.lock` 是**机器特定**的环境记录（README
+  要求每台机器重新生成），不进入源码树摘要，否则 CPU 测试机与 CUDA 实验
+  机上的同一份源码会被误判为不同；lock 的哈希与契约由
+  `environment_snapshot()` 单独记录。摘要算法包含相对路径、字节数和逐文件哈希，因此重命名、
+  截断、增删文件都可区分；生成目录（`results_*` / `analysis_*` /
+  `__pycache__` / cache 等）被剪枝，不会把大结果树变成 provenance I/O
+  扫描。
+- `code_provenance()` 的 `code.source_tree` 记录 `sha256` / `n_files` /
+  `bytes` / `scope`。它只进入 provenance，不进入 `run_cfg`、resume
+  fingerprint 或 `exec_fp`，所以既有 cell 的 resume/pairing 完全不变。
+- `v12_supp.py plan` 的 `analysis_v12/plan_snapshot.json` 额外落盘完整
+  `source_tree` 和 `dependency_contract`，让「机器在批准计划时看到的是
+  哪份源码/哪个环境」可异步复核。
+- `exp_lib.parse_requirements_lock()` / `dependency_contract()`：解析
+  `name==version` lock（忽略注释与 `--extra-index-url` 等选项），逐条与
+  `importlib.metadata` 的已安装版本比对，并报告未 pin 的已安装分布。
+  `mismatch` / `missing` / `invalid` 是失败；`partial` 表示所有 pin 都匹配
+  但 lock 不是完整环境记录。
+- `requirements.lock` 改为当前 CPU 测试环境的**完整 `pip freeze`**
+  （48 个分布，含 `torch==2.14.1+cpu`，并在文件头声明 CPU wheel index），
+  不再只有 5 个直接依赖。
+- `audit_gates.py source`：把当前源码树与 `plan_snapshot.json`（或
+  `results_*/summary.json` 的 provenance）记录的 `source_tree` 比对；
+  有完整 manifest 时给出 added/removed/changed 文件；无记录时明确
+  `not_verifiable_locally`，绝不把 git commit 当作源码哈希。
+- `audit_gates.py dependencies`：执行 lock 契约；`partial` 作为 warning，
+  `mismatch`/`missing`/`invalid` 为 fail。两者都并入 `audit_gates.py report`。
+- `environment_snapshot()` 增加 `dependency_contract` 与
+  `env_flags`（所有 `CSA_*` / `WT103_*` / `FWEDU_*` / `M0_*` / `V12_*`），
+  补齐「未记录开关」这一类不可解释差异。
+
+### 50.3 边界
+
+源码树摘要是**内容证据**，不替代 `CODE_SEMANTICS`、冻结 manifest 或
+`run_cfg`：它不参与训练/评测数值、seed、resume、pairing 或 P5T 的
+admission 判定。它也不把测试文件、README、docs 或 CI 配置纳入测量身份；
+这些文件的改动不会让一个已冻结面板看起来「代码变了」。P5T 仍未把该摘要
+写入 freeze lock（§49.2 的剩余边界保留），但 plan snapshot 与每个 cell 的
+provenance 已让「计划批准时的源码」和「产出证据时的源码」可比对。
+
+### 50.4 复核
+
+```bash
+python audit_gates.py source        # 与 plan_snapshot 的源码树比对
+python audit_gates.py dependencies  # lock 与已安装版本比对
+python v12_supp.py plan             # 预检不变：72/72、6 个主比较；快照含源码树/依赖契约
+python test_review_fixes.py         # L137–L140 覆盖摘要、lock 解析、门禁与完整 lock
+python -m pip install --dry-run --no-deps -r requirements.lock  # 验证每条 pin 可解析
+```
+
+零 GPU、不读 test split；不改变 `confirmation_frozen*.json`、冻结臂/种子/
+终点/alpha/Holm family，也不需要 bump `CODE_SEMANTICS`。

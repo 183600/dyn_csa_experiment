@@ -1,10 +1,56 @@
-# Verified CPU environment for the test suite (Python 3.12.15).
-# This is NOT the CUDA reference environment used for the paper-scale runs:
-# those must regenerate their own lock with `python -m pip freeze` and archive
-# it (archive_release.py records `pip freeze` and the GPU identity).  Pinning
-# the CPU versions here makes the zero-GPU test/audit path reproducible.
-numpy==2.5.4
-torch==2.14.1
-tokenizers==0.23.3
+# Fully pinned CPU environment for the test / reproduction path.
+# Python 3.12.15, Linux x86_64.  Generated with `python -m pip freeze`;
+# this is a complete transitive closure, not only the five direct deps.
+# This is NOT the CUDA reference environment used for paper-scale runs:
+# those must regenerate their own lock with `python -m pip freeze` and
+# archive it (archive_release.py records the GPU identity).
+# The CPU wheel index is declared so the +cpu torch build resolves.
+--extra-index-url https://download.pytorch.org/whl/cpu
+aiohappyeyeballs==2.7.1
+aiohttp==3.14.5
+aiosignal==1.4.0
+anyio==4.15.1
+attrs==26.1.0
+click==8.5.0
+contourpy==1.4.0
+cycler==0.12.1
 datasets==5.1.0
+dill==0.4.1
+filelock==4.2.4
+fonttools==4.67.0
+frozenlist==1.8.0
+fsspec==2026.7.0
+h11==0.16.0
+hf-xet==1.7.0
+httpcore2==2.16.0
+httpx2==2.16.0
+huggingface_hub==2.2.0
+idna==3.20
+Jinja2==3.1.6
+kiwisolver==1.5.1
+MarkupSafe==3.0.4
 matplotlib==3.11.2
+mpmath==1.3.0
+multidict==7.1.0
+multiprocess==0.70.19
+networkx==3.7
+numpy==2.5.4
+packaging==26.3
+pandas==3.1.0
+pillow==13.0.0
+propcache==0.5.4
+pyarrow==26.0.0
+pyparsing==3.3.3
+python-dateutil==3.0.0
+PyYAML==6.0.3
+setuptools==84.2.1
+six==1.17.0
+sympy==1.14.0
+tokenizers==0.23.3
+torch==2.14.1+cpu
+tqdm==4.70.1
+truststore==0.10.5
+typing_extensions==4.16.0
+tzdata==2026.5
+xxhash==4.0.2
+yarl==1.25.1

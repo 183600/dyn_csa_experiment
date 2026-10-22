@@ -42,6 +42,11 @@
                平衡，并从 experiments.jsonl 复核实际执行顺序；arm-major
                顺序（一个臂全部种子跑完再跑下一个臂）判 fail（零 GPU）
   budget       规模核算：6ND 估算 + TimeGuard 记录对账（零 GPU）
+  source       源码树身份：把当前源码字节与 plan_snapshot / summary 记录的
+               source_tree 比对（逐文件 added/removed/changed；无记录时明确
+               报 not_verifiable_locally，不把 git commit 当成源码哈希）
+  dependencies 依赖锁契约：requirements.lock 的每条 pin 与已安装版本比对；
+               mismatch/missing/invalid 判 fail，partial 给出覆盖率警告
   efficiency   prefill/decode/容量读数工具（需要模型；给出可复用函数
                与 CPU 微型演示——不是实验，是测量代码自检）
   report       汇总运行本地可执行的全部审计，输出 audit_report.json
@@ -3355,6 +3360,150 @@ def audit_selection(path='analysis_mechanism/selection_attribution.json'):
     return out
 
 
+def _extract_source_tree(obj):
+    """Find a recorded source-tree manifest in a snapshot/summary object."""
+    if not isinstance(obj, dict):
+        return None
+    for key in ('source_tree',):
+        val = obj.get(key)
+        if isinstance(val, dict) and (val.get('sha256') or val.get('files')):
+            return val
+    for key in ('code', 'provenance'):
+        val = obj.get(key)
+        if isinstance(val, dict):
+            got = _extract_source_tree(val)
+            if got:
+                return got
+    return None
+
+
+def _display_repo_path(path):
+    """Relative when inside the repo, absolute when the caller passed a temp path."""
+    ap = os.path.abspath(path)
+    rel = os.path.relpath(ap, REPO)
+    return ap if rel.startswith('..') else rel
+
+
+def audit_source_integrity(snapshot_path='analysis_v12/plan_snapshot.json',
+                           results_dirs=None):
+    """Compare the current source bytes with the source bound by a snapshot.
+
+    The git commit + CODE_SEMANTICS stamp cannot detect a dirty edit that
+    leaves the stamp unchanged (the exact hazard documented at the top of the
+    continuous-loop workflow), and a source tarball has no commit at all.  The
+    plan snapshot / panel provenance now carries a content digest; this gate
+    recomputes it and reports which files changed when the full manifest was
+    recorded.  No recorded digest is ``not_verifiable_locally`` — never
+    "source is fine".
+    """
+    L = _import_exp_lib()
+    cur = L.source_tree_manifest()
+    expected = None
+    source = None
+    snap_file = _audit_artifact(snapshot_path)
+    snap = _load(snap_file)
+    if isinstance(snap, dict):
+        expected = _extract_source_tree(snap)
+        if expected:
+            source = _display_repo_path(snap_file)
+    if expected is None:
+        dirs = list(results_dirs) if results_dirs is not None else list(_iter_result_dirs())
+        for d in dirs:
+            p = _audit_artifact(os.path.join(d, 'summary.json'))
+            summ = _load(p)
+            expected = _extract_source_tree(summ)
+            if expected:
+                source = _display_repo_path(p)
+                break
+    out = {
+        'kind': 'source_tree_audit',
+        'status': 'not_verifiable_locally',
+        'snapshot': (_display_repo_path(snap_file)
+                     if os.path.exists(snap_file) else None),
+        'source': source,
+        'expected_sha256': None,
+        'current_sha256': cur.get('sha256'),
+        'n_expected_files': None,
+        'n_current_files': cur.get('n_files'),
+        'added': [], 'removed': [], 'changed': [],
+        'problems': [],
+        'note': ('no source-tree digest is present in a plan snapshot or panel '
+                 'provenance; a git commit/CODE_SEMANTICS alone cannot prove '
+                 'which source bytes produced an artifact'),
+    }
+    if not isinstance(expected, dict):
+        print(json.dumps({k: v for k, v in out.items() if k != 'files'},
+                         ensure_ascii=False, indent=2)[:4000])
+        return out
+    want_sha = expected.get('sha256')
+    out['expected_sha256'] = want_sha
+    if not isinstance(want_sha, str) or not want_sha:
+        out['status'] = 'fail'
+        out['problems'].append('the recorded source-tree entry has no sha256')
+        print(json.dumps({k: v for k, v in out.items() if k != 'files'},
+                         ensure_ascii=False, indent=2)[:4000])
+        return out
+    exp_files = expected.get('files') if isinstance(expected.get('files'), dict) else {}
+    cur_files = cur.get('files') or {}
+    out['n_expected_files'] = len(exp_files) if exp_files else None
+    if exp_files:
+        _added = sorted(set(cur_files) - set(exp_files))
+        _removed = sorted(set(exp_files) - set(cur_files))
+        _changed = sorted(
+            rel for rel in set(cur_files) & set(exp_files)
+            if (cur_files.get(rel) or {}).get('sha256')
+            != (exp_files.get(rel) or {}).get('sha256'))
+        out['added'], out['removed'], out['changed'] = _added, _removed, _changed
+        if _added:
+            out['problems'].append(f'{len(_added)} source file(s) added since the snapshot')
+        if _removed:
+            out['problems'].append(f'{len(_removed)} source file(s) removed since the snapshot')
+        if _changed:
+            out['problems'].append(f'{len(_changed)} source file(s) changed since the snapshot')
+    if want_sha != cur.get('sha256'):
+        out['problems'].append(
+            f'source tree sha256 {str(cur.get("sha256"))[:12]}… does not match '
+            f'the recorded {str(want_sha)[:12]}…')
+    out['status'] = 'fail' if out['problems'] else 'ok'
+    if out['status'] == 'ok':
+        out['note'] = 'the current source tree is byte-identical to the recorded tree'
+    else:
+        out['note'] = ('the current source tree differs from the tree bound to '
+                       'the snapshot/provenance; a git commit + CODE_SEMANTICS '
+                       'stamp alone cannot establish source identity')
+    print(json.dumps({k: v for k, v in out.items() if k != 'files'},
+                     ensure_ascii=False, indent=2)[:4000])
+    return out
+
+
+def audit_dependencies(lock_path=None):
+    """Verify the installed environment against requirements.lock."""
+    L = _import_exp_lib()
+    c = L.dependency_contract(lock_path)
+    out = {
+        'kind': 'dependency_audit',
+        'status': ('ok' if c.get('status') in ('ok', 'partial') else 'fail'),
+        'contract_status': c.get('status'),
+        'lock_path': c.get('lock_path'),
+        'lock_sha256': c.get('lock_sha256'),
+        'n_pinned': c.get('n_pinned'),
+        'n_installed': c.get('n_installed'),
+        'n_unpinned_installed': c.get('n_unpinned_installed'),
+        'mismatches': c.get('mismatches') or [],
+        'missing': c.get('missing') or [],
+        'invalid': c.get('invalid') or [],
+        'unpinned_installed': (c.get('unpinned_installed') or [])[:50],
+        'problems': [],
+        'warnings': [],
+    }
+    if c.get('status') not in ('ok', 'partial'):
+        out['problems'].append(c.get('note') or f'dependency contract is {c.get("status")}')
+    elif c.get('status') == 'partial':
+        out['warnings'].append(c.get('note') or 'the lock does not pin every installed distribution')
+    print(json.dumps(out, ensure_ascii=False, indent=2)[:4000])
+    return out
+
+
 def _read_experiment_events(outdir):
     path = os.path.join(outdir, 'experiments.jsonl')
     events = []
@@ -3530,7 +3679,7 @@ def audit_run_order(paths=None):
 
 
 def run_report(out='audit_report.json'):
-    res = {'generated_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'leakage': audit_leakage(), 'split_discipline': audit_split_discipline(), 'attribution': audit_attribution(), 'boundary': audit_boundary(), 'length': audit_length(), 'fairness': audit_fairness(), 'metrics': audit_metrics(), 'tuning': audit_tuning(), 'simple_baseline': audit_simple_baseline(), 'hypotheses': audit_hypotheses(), 'methodology': audit_methodology(), 'single_factor': audit_single_factor(), 'design_preflight': audit_design_preflight(), 'failures': audit_failures(), 'budget': audit_budget(), 'training_health': audit_training_health(), 'efficiency_pairs': audit_efficiency_pairs(), 'release': audit_release_readiness(), 'selection': audit_selection(), 'run_order': audit_run_order()}
+    res = {'generated_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'source_tree': audit_source_integrity(), 'dependencies': audit_dependencies(), 'leakage': audit_leakage(), 'split_discipline': audit_split_discipline(), 'attribution': audit_attribution(), 'boundary': audit_boundary(), 'length': audit_length(), 'fairness': audit_fairness(), 'metrics': audit_metrics(), 'tuning': audit_tuning(), 'simple_baseline': audit_simple_baseline(), 'hypotheses': audit_hypotheses(), 'methodology': audit_methodology(), 'single_factor': audit_single_factor(), 'design_preflight': audit_design_preflight(), 'failures': audit_failures(), 'budget': audit_budget(), 'training_health': audit_training_health(), 'efficiency_pairs': audit_efficiency_pairs(), 'release': audit_release_readiness(), 'selection': audit_selection(), 'run_order': audit_run_order()}
     L_atomic = None
     try:
         L = _import_exp_lib()
@@ -3550,7 +3699,7 @@ def run_report(out='audit_report.json'):
 
 
 if __name__ == '__main__':
-    _cmds = {'leakage': audit_leakage, 'split': audit_split_discipline, 'split_discipline': audit_split_discipline, 'causality': audit_causality, 'attribution': audit_attribution, 'boundary': audit_boundary, 'length': audit_length, 'fairness': audit_fairness, 'metrics': audit_metrics, 'tuning': audit_tuning, 'simple': audit_simple_baseline, 'baseline_floor': audit_simple_baseline, 'baseline_plan': audit_baseline_design, 'hypothesis_coverage': audit_hypothesis_coverage, 'hypotheses': audit_hypotheses, 'methodology': audit_methodology, 'single_factor': audit_single_factor, 'design': audit_design_preflight, 'design_preflight': audit_design_preflight, 'failures': audit_failures, 'budget': audit_budget, 'efficiency': audit_efficiency_demo, 'efficiency_pairs': audit_efficiency_pairs, 'training_health': audit_training_health, 'selection': audit_selection, 'release': audit_release_readiness, 'run_order': audit_run_order, 'report': run_report}
+    _cmds = {'leakage': audit_leakage, 'split': audit_split_discipline, 'split_discipline': audit_split_discipline, 'causality': audit_causality, 'attribution': audit_attribution, 'boundary': audit_boundary, 'length': audit_length, 'fairness': audit_fairness, 'metrics': audit_metrics, 'tuning': audit_tuning, 'simple': audit_simple_baseline, 'baseline_floor': audit_simple_baseline, 'baseline_plan': audit_baseline_design, 'hypothesis_coverage': audit_hypothesis_coverage, 'hypotheses': audit_hypotheses, 'methodology': audit_methodology, 'single_factor': audit_single_factor, 'design': audit_design_preflight, 'design_preflight': audit_design_preflight, 'failures': audit_failures, 'budget': audit_budget, 'efficiency': audit_efficiency_demo, 'efficiency_pairs': audit_efficiency_pairs, 'training_health': audit_training_health, 'selection': audit_selection, 'release': audit_release_readiness, 'run_order': audit_run_order, 'source': audit_source_integrity, 'source_tree': audit_source_integrity, 'dependencies': audit_dependencies, 'dependency': audit_dependencies, 'report': run_report}
     _arg = sys.argv[1] if len(sys.argv) > 1 else 'report'
     if _arg in ('-h', '--help'):
         print(__doc__)

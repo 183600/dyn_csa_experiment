@@ -1988,3 +1988,74 @@ environment skips; `python test_open_block.py` passes 15/15;
 `python audit_gates.py run_order` still reports `not_verifiable_locally` on
 this source-only tree; `python v12_supp.py plan` still admits 72/72 synthetic
 frozen records with the same six comparisons.
+
+## 2026-10-22 — source-tree identity and a complete dependency lock
+
+Zero-GPU reproducibility/engineering hardening; no training run, frozen
+manifest byte, test split, `CODE_SEMANTICS`, README or CI configuration was
+touched.
+
+**Problem.** The provenance block recorded `git_commit` plus a tracked-diff
+hash, but those do not identify the bytes that actually ran: a dirty work tree
+shares its commit, an untracked source file is only named in `git status`, and
+a source tarball has no `.git` at all.  `CODE_SEMANTICS` is a measurement
+semantics stamp, not a file hash (the continuous-loop header explicitly warns
+that an edit can change semantics while the stamp still matches).  Separately,
+`requirements.lock` pinned only the five direct dependencies, so the transitive
+numerical stack could drift while the lock still looked "verified"; the
+environment snapshot also recorded only a hand-picked subset of `CSA_*` flags.
+
+**Changes.** `exp_lib.source_tree_manifest()` / `source_tree_summary()` hash a
+deterministic, pruned set of measurement-relevant source files (non-test
+`*.py`, `pyproject.toml`, `setup.py/cfg`, `requirements.txt`, both frozen
+manifests) by relative path, byte count and per-file SHA-256.  The
+machine-specific `requirements.lock` is deliberately excluded from the source
+digest (the same source must not look different on a CPU test box and a CUDA
+experiment box); its hash and contract are recorded separately in
+`environment_snapshot()`.  Generated result/analysis/cache directories and
+tests/docs/CI are excluded so a test edit cannot masquerade as a semantic
+change.  `code_provenance()` records the summary under `code.source_tree`; it
+is provenance only and does not enter `run_cfg`, resume fingerprints or
+`exec_fp`.  `v12_supp.py plan` now writes the
+full manifest plus `dependency_contract()` into
+`analysis_v12/plan_snapshot.json`, binding the bytes and environment the plan
+gate approved.
+
+`exp_lib.parse_requirements_lock()` / `dependency_contract()` parse
+`name==version` locks (options/comments ignored, hash-pinned continuation lines
+accepted) and compare every pin with `importlib.metadata`; mismatched, missing
+or malformed pins fail, `partial` records a lock that does not cover every
+installed distribution.  `requirements.lock` is replaced by the complete
+48-distribution `pip freeze` of the verified CPU environment (including
+`torch==2.14.1+cpu` and the declared CPU wheel index), and
+`environment_snapshot()` records the contract plus all `CSA_*` / `WT103_*` /
+`FWEDU_*` / `M0_*` / `V12_*` run-control variables.
+
+`audit_gates.py source` compares the current tree with a recorded
+`source_tree` from the plan snapshot or panel provenance and reports
+added/removed/changed files; no record is `not_verifiable_locally`, never a
+silent pass.  `audit_gates.py dependencies` exposes the lock contract
+(`partial` is a warning, mismatch/missing/invalid is a fail).  Both are part of
+`audit_gates.py report`.
+
+**Boundary.** These are evidence and environment-description changes only.
+They do not alter a PPL, seed, recipe, endpoint, alpha, Holm family, frozen arm,
+decision rule or P5T admission; no `CODE_SEMANTICS` bump is needed.  P5T does
+not yet bind the tree digest in the freeze lock (the §49.2 boundary remains),
+but the plan snapshot and every cell's provenance make the approved source and
+the evidence-producing source comparable.
+
+**Verification.** New CPU tests L137 (deterministic per-file/aggregate digest,
+content change/removal, explicit include, escape rejection), L138 (options
+ignored, match/mismatch/missing/malformed lock, absent lock), L139 (source
+audit ok/fail/not_verifiable and dependency audit ok/fail) and L140 (the
+tracked lock pins the five direct deps and ≥20 transitive distributions).
+`python test_review_fixes.py` passes 476/479 with the same 3 DataLoader
+environment skips; `python test_open_block.py` passes 15/15;
+`python audit_gates.py source` reports `ok` against the fresh plan snapshot;
+`python audit_gates.py dependencies` reports `ok` with 48/48 pinned and 0
+unpinned installed distributions; `pip install --dry-run --no-deps
+--ignore-installed -r requirements.lock` resolves every pin, and `pip check`
+reports no broken requirements; `python v12_supp.py plan` still admits 72/72
+synthetic frozen records with the same six comparisons.
+
