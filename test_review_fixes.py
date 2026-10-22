@@ -17128,6 +17128,52 @@ def t_window_geometry_is_built_per_chunk():
     assert torch.equal(ref, got), (ref - got).abs().max().item()
 
 
+def t_causal_quantile_positions_are_exact():
+    # The causal quantile rank is q * c with q = 1/target (0.001 above 1000
+    # target tokens).  A float32 product can round an exact integer rank DOWN
+    # (1/41 * 41 -> 0.99999994) and loses the column itself above 2**24.  The
+    # rank/remainder must be computed with the integer division instead.
+    torch = __import__('torch')
+    n = 100
+    x = (torch.arange(n, dtype=torch.float32) * 100.0).reshape(1, n)
+    cols = torch.arange(n, dtype=torch.long)
+    for full in (False, True):
+        out = L._causal_quantile_exact(x, cols, 41, _full_range=full)
+        assert out.dtype == x.dtype, (full, out.dtype)
+        # c=41 has exact position 1.0, so the second-smallest value (100) is
+        # selected exactly; the old float32 product interpolated from rank 0
+        # with frac=0.99999994 and returned 99.99999.
+        assert out[0, 41].item() == 100.0, (full, out[0, 41].item())
+        assert out[0, 82].item() == 200.0, (full, out[0, 82].item())
+        assert out[0, 0].item() == float('-inf'), (full, out[0, 0].item())
+    # Same exact ranks through the public segmenter entry point (the caller
+    # passes the 1-D similarity row, not the private [1, n] batch).
+    tau = L.causal_adaptive_threshold(x.reshape(-1), 41)
+    assert tau[41].item() == 100.0, tau[41].item()
+    assert tau[82].item() == 200.0, tau[82].item()
+    assert tau[0].item() == float('-inf'), tau[0].item()
+
+    # Positions stay exact beyond float32's 2**24 integer range and beyond
+    # 2**53 (the float64 integer range), because no float is used for lo/rem.
+    c = torch.tensor([2 ** 24 + 1, 2 ** 24 + 2, 2 ** 53 + 1, 1234567890123],
+                     dtype=torch.long)
+    for target, den in ((3, 3), (41, 41), (1001, 1000)):
+        _q, lo, frac, _lc, _hc, use_hi, _fr = L._causal_quantile_positions(
+            c, target, 2 ** 63, torch.float64)
+        assert torch.equal(lo, torch.div(c, den, rounding_mode='floor')), (target, lo)
+        rem = c - lo * den
+        assert torch.equal(use_hi, (rem > 0) & (lo + 1 <= c)), (target, use_hi)
+        assert torch.equal(frac, rem.to(torch.float64) / float(den)), (target, frac)
+    # A column whose position is an exact integer (rem == 0) must use the
+    # lower order statistic directly, not a phantom interpolation.
+    c2 = torch.tensor([41, 82, 123], dtype=torch.long)
+    _q, lo2, frac2, _lc, _hc, use_hi2, _fr = L._causal_quantile_positions(
+        c2, 41, 1000, torch.float32)
+    assert lo2.tolist() == [1, 2, 3], lo2
+    assert frac2.tolist() == [0.0, 0.0, 0.0], frac2
+    assert not bool(use_hi2.any()), use_hi2
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -17575,6 +17621,7 @@ def main():
     _check('L107 paired fragility + seed-drop family jackknife', t_paired_fragility_and_seed_drop_jackknife)
     _check('L108 confirmation robustness never edits the verdict', t_confirmation_robustness_never_edits_the_verdict)
     _check('L109 document-level breadth diagnostics', t_doc_level_breadth_diagnostics)
+    _check('L110 causal quantile positions are exact at scale', t_causal_quantile_positions_are_exact)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

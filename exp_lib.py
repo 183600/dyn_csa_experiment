@@ -2423,6 +2423,36 @@ def _causal_quantile_rank(x, lo, frac, use_hi, first_row, q, n):
     return torch.where(first_row, torch.full_like(oc, float('-inf')), oc)
 
 
+def _causal_quantile_positions(cols, target_block_tokens, n, dtype):
+    """Exact order-statistic position for the causal quantile.
+
+    The quantile position is ``q * c`` with ``q = 1 / target`` (or
+    ``0.001`` when ``target > 1000``), i.e. the rank ``lo = c // den`` plus an
+    exact remainder ``rem = c % den``.  Computing this through a float32
+    product loses the index itself once ``c`` approaches 2**24 and can also
+    round an exact integer rank down by one at much smaller columns (e.g.
+    ``target=41, c=41``: ``1/41 * 41`` in float32 is ``0.99999994``).  The
+    integer form below has no such boundary: ``lo``/``rem`` are exact for
+    every int64 column, and only the interpolation fraction is rounded to the
+    work dtype.
+
+    Returns ``(q, lo, frac, lo_c, hi_c, use_hi, first_row)``.
+    """
+    cols = cols.to(torch.long)
+    # q = max(1 / max(target, 1), 0.001); the branch is exactly the point
+    # where 1/target falls below 0.001, so no float comparison is needed.
+    den = min(max(int(target_block_tokens), 1), 1000)
+    q = 1.0 / den
+    lo = torch.div(cols, den, rounding_mode='floor')
+    rem = cols - lo * den
+    frac = (rem.to(dtype) / float(den)) if dtype is not None else (rem / float(den))
+    lo_c = lo.clamp(max=n - 1)
+    hi_c = (lo + 1).clamp(max=n - 1)
+    use_hi = (rem > 0) & (lo + 1 <= cols)
+    first_row = cols == 0
+    return q, lo, frac, lo_c, hi_c, use_hi, first_row
+
+
 def _causal_quantile_exact(x, cols, target_block_tokens, _full_range=False):
     """Closed-form causal quantile at the requested columns.
 
@@ -2432,7 +2462,6 @@ def _causal_quantile_exact(x, cols, target_block_tokens, _full_range=False):
     """
     n = int(x.shape[-1])
     dev = x.device
-    q = max(1.0 / max(int(target_block_tokens), 1), 0.001)
     idx = _arange_cache(n, dev)
     cols = cols.to(torch.long)
     if cols.numel() == 0:
@@ -2440,13 +2469,9 @@ def _causal_quantile_exact(x, cols, target_block_tokens, _full_range=False):
         # loop below cannot write any column, and its `nc = max(1, ...)` guard
         # would otherwise leave a [rows, 1] buffer of uninitialised values.
         return x.new_empty((x.shape[0], 0))
-    pos = q * cols.to(torch.float32)
-    lo = pos.floor().long()
-    frac = pos - lo
-    lo_c = lo.clamp(max=n - 1)
-    hi_c = (lo + 1).clamp(max=n - 1)
-    use_hi = (frac > 0.0) & (lo + 1 <= cols)
-    first_row = cols == 0
+    (q, lo, frac, lo_c, hi_c,
+     use_hi, first_row) = _causal_quantile_positions(
+        cols, target_block_tokens, n, x.dtype)
     nc = max(1, int(cols.numel()))
     if (_full_range and n > 0 and cols.numel() == n
             and bool(torch.isfinite(x).all())):

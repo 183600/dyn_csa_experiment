@@ -1555,3 +1555,31 @@ coverage gate not replayed; Markdown rendering; empty inputs) and L109
 `python test_review_fixes.py` passes 443/446 with the same 3 DataLoader
 environment skips; `python v12_supp.py plan` still admits 72/72 synthetic frozen
 records with the same six comparisons.
+
+## 2026-10-22 — exact causal-quantile rank positions at scale (no new runs)
+
+**Problem.** `_causal_quantile_exact` converted the integer column index to
+float32 before computing the quantile rank (`pos = q * cols.float()`).  That
+looks harmless at the default target of 16 (a power of two), but it is not a
+valid index computation: for `target_block_tokens=41`, `1/41 * 41` rounds to
+`0.99999994`, so the exact rank `1` became `0` with `frac≈1` and the quantile
+interpolated from the wrong pair of order statistics.  The same cast also
+loses the column itself once `c >= 2**24` (adjacent columns collapse to one
+float32 value), which silently changes the dynamic-chunk boundary policy on a
+long-context scale-up.
+
+**Changes.** `exp_lib._causal_quantile_positions` now computes
+`den = min(max(int(target_block_tokens), 1), 1000)` — exactly the branch where
+`q = max(1/target, 0.001)` — and obtains `lo = c // den`, `rem = c % den` with
+integer arithmetic (no float index).  `frac = rem / den` is cast to the work
+dtype for interpolation.  `_causal_quantile_exact` uses this helper for both
+the rank and the sort path, so an exact integer rank has `frac == 0` and uses
+the lower order statistic directly.  The default target=16 path is value
+identical (its float32 product was already exact); no frozen manifest, arm,
+seed, endpoint, statistic or `CODE_SEMANTICS` changed.
+
+**Verification.** New CPU test L110: an end-to-end quantile with target 41
+selects exact ranks at columns 41/82 (the old float32 path returned
+99.99999/199.99998 instead of 100/200), and the integer positions remain exact
+at columns above `2**24` and `2**53`.  `python test_review_fixes.py` passes
+444/447 with the same 3 DataLoader environment skips.
