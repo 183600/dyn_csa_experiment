@@ -807,6 +807,33 @@ def _freeze_lock_path(outdir):
 
 def _check_or_write_freeze_lock(outdir, manifest, test_ids_fp, stage='access',
                                 train_fp=None):
+    """Serialize the freeze-lock check-and-write across processes.
+
+    The check (read the existing lock) and the write must be one critical
+    section: two concurrent P5T/analysis processes could otherwise both see
+    ``no lock`` and replace each other's manifest/test binding.  The guard is a
+    separate stable file so the lock artifact itself is never the target of the
+    read-modify-write.
+    """
+    os.makedirs(outdir, exist_ok=True)
+    guard = _freeze_lock_path(outdir) + '.guard'
+    with open(guard, 'a+', encoding='utf-8') as _gf:
+        try:
+            import fcntl
+        except ImportError:  # pragma: no cover - non-POSIX fallback
+            fcntl = None
+        try:
+            if fcntl is not None:
+                fcntl.flock(_gf.fileno(), fcntl.LOCK_EX)
+            return _check_or_write_freeze_lock_locked(
+                outdir, manifest, test_ids_fp, stage=stage, train_fp=train_fp)
+        finally:
+            if fcntl is not None:
+                fcntl.flock(_gf.fileno(), fcntl.LOCK_UN)
+
+
+def _check_or_write_freeze_lock_locked(outdir, manifest, test_ids_fp, stage='access',
+                                       train_fp=None):
     """Persistent first-test-access lock.
 
     首次测试访问后禁止修改计划：P5T 一旦在 outdir 落下首条记录（或本函数
@@ -972,6 +999,42 @@ def _training_health_gate(cfg, v, seed, ckpt_meta, train_rec):
         print(f'[p5t] WARNING: {msg}; V12_ALLOW_UNHEALTHY=1 permits the test evaluation')
         return None
     return msg + ' — refusing to use the one-shot test access'
+
+
+def _finaltest_admission_problem(stats, manifest, *, smoke=False,
+                                  allow_partial=False):
+    """Return why a P5T pass cannot be reported as completed, or None.
+
+    Running every evaluation call is not evidence: a stale/unreadable
+    checkpoint, a missing training provenance record or the health gate can
+    make every cell return ``skipped_*`` while the phase still exits normally.
+    The one-shot test split has then been consumed with zero admitted cells,
+    so the driver must not append P5T to its completed-phase list.
+    """
+    if smoke:
+        return None
+    admission = stats.get('admission') if isinstance(stats, dict) else None
+    if not isinstance(admission, dict):
+        return 'P5T produced no admission report'
+    _raw_admitted = admission.get('n_admitted')
+    if isinstance(_raw_admitted, (bool, np.bool_)):
+        return f'P5T admission count is malformed: {_raw_admitted!r}'
+    try:
+        n_admitted = int(_raw_admitted)
+    except (TypeError, ValueError, OverflowError):
+        return f'P5T admission count is malformed: {_raw_admitted!r}'
+    if n_admitted < 0:
+        return f'P5T admission count is negative: {n_admitted!r}'
+    n_expected = (len(manifest.get('arms') or [])
+                  * len(manifest.get('seeds') or []))
+    if n_admitted <= 0:
+        return (f'P5T admitted 0/{n_expected} frozen (arm, seed) cells — the '
+                'one-shot test split produced no confirmatory evidence')
+    if n_admitted < n_expected and not allow_partial:
+        return (f'P5T admitted only {n_admitted}/{n_expected} frozen '
+                '(arm, seed) cells; set V12_ALLOW_PARTIAL_TEST=1 only for an '
+                'explicitly incomplete round')
+    return None
 
 
 @torch.inference_mode()
@@ -1473,13 +1536,16 @@ def run_finaltest(cfg=None, guard=None):
     # 1) clean by-length per (arm, seed)
     _split_label = 'smoke' if _smoke else 'test'
     _ft_env_once = L.environment_snapshot()
+    _cell_status = {}
     for v in manifest['arms']:
         for seed in manifest['seeds']:
-            _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids,
-                                  split=_split_label, train_fp=_want_train_fp,
-                                  frozen_vocab=_frozen_vocab,
-                                  env=_ft_env_once,
-                                  test_doc_ids=test_doc_ids)
+            _cell = _finaltest_bylen_cell(
+                cfg, manifest, v, seed, test_ids,
+                split=_split_label, train_fp=_want_train_fp,
+                frozen_vocab=_frozen_vocab,
+                env=_ft_env_once,
+                test_doc_ids=test_doc_ids)
+            _cell_status[f'{v}::s{seed}'] = (_cell or {}).get('status')
     # 2) frozen uniform-corruption probe on the SAME test rows (secondary,
     #    descriptive-only per the manifest)
     _probe_eval = manifest.get('eval', {}).get('distractor_probe') or {}
@@ -1491,7 +1557,23 @@ def run_finaltest(cfg=None, guard=None):
         for seed in pcfg['seeds']:
             V10.run_probe_cell(pcfg, v, seed, guard=guard, val_ids=test_ids, mech_summ=mech_summ)
     # 3) confirmation statistics (zero GPU, from disk)
-    return finaltest_stats(manifest=manifest, bylen_path=cfg['bylen_summary'], probe_path=cfg['probe_summary'], out=cfg.get('stats_out', 'analysis_v12/test_stats.json'))
+    _stats = finaltest_stats(manifest=manifest, bylen_path=cfg['bylen_summary'],
+                             probe_path=cfg['probe_summary'],
+                             out=cfg.get('stats_out',
+                                         'analysis_v12/test_stats.json'))
+    # A normal return from every per-cell call is NOT completion: skipped
+    # checkpoints/provenance/health leave the one-shot split already consumed
+    # but bylen admission empty.  Raise so run_phase/run_full records P5T as
+    # incomplete instead of printing ALL PHASES DONE.
+    _allow_partial = os.environ.get('V12_ALLOW_PARTIAL_TEST', '').strip().lower() in ('1', 'true', 'yes', 'on')
+    _admission_problem = _finaltest_admission_problem(
+        _stats, manifest, smoke=_smoke, allow_partial=_allow_partial)
+    if _admission_problem:
+        _non_ok = {k: s for k, s in _cell_status.items() if s != 'ok'}
+        raise RuntimeError(
+            f'[v12] P5T INCOMPLETE: {_admission_problem}. '
+            f'Non-ok cell statuses: {_non_ok if _non_ok else "none"}')
+    return _stats
 
 def _by_len_shape_reason(rec, n_seq):
     """Why a record's by_len cells do not match the frozen (n_seq, seq_len) grid.

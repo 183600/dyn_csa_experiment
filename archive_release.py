@@ -139,6 +139,25 @@ def _sha256(path, chunk=1 << 20):
     return h.hexdigest()
 
 
+class _HashingReader:
+    """File wrapper that hashes exactly the bytes tarfile consumes."""
+
+    def __init__(self, stream):
+        self._stream = stream
+        self._hash = hashlib.sha256()
+        self.nbytes = 0
+
+    def read(self, size=-1):
+        data = self._stream.read(size)
+        if data:
+            self._hash.update(data)
+            self.nbytes += len(data)
+        return data
+
+    def hexdigest(self):
+        return self._hash.hexdigest()
+
+
 def _atomic_write_bytes(path, data):
     """Write a complete file and only then replace the previous artifact."""
     tmp = path + f'.tmp{os.getpid()}'
@@ -333,8 +352,42 @@ def cmd_make(tag, dirs, include_ckpt=False, outdir='archive'):
         with tarfile.open(tmp_tar, 'w:gz') as tf:
             for p in files:
                 rel = os.path.relpath(p, REPO)
-                man['files'][rel] = {'sha256': _sha256(p), 'bytes': os.path.getsize(p)}
-                tf.add(p, arcname=rel)
+                # Hash the bytes that are actually written into the archive,
+                # not a separate earlier read of the source path.  A live log
+                # or run-state file can change between those two reads, which
+                # produced a release whose own manifest could never verify.
+                st_before = os.stat(p)
+                ti = tf.gettarinfo(p, arcname=rel)
+                ti.size = int(st_before.st_size)
+                with open(p, 'rb') as src:
+                    fst = os.fstat(src.fileno())
+                    if ((fst.st_dev, fst.st_ino, fst.st_size, fst.st_mtime_ns)
+                            != (st_before.st_dev, st_before.st_ino,
+                                st_before.st_size, st_before.st_mtime_ns)):
+                        raise RuntimeError(
+                            f'archive input {p!r} changed between stat and '
+                            'open; retry when the artifact is quiescent')
+                    reader = _HashingReader(src)
+                    tf.addfile(ti, reader)
+                    fst_after = os.fstat(src.fileno())
+                    st_after = os.stat(p)
+                if ((fst_after.st_dev, fst_after.st_ino,
+                     fst_after.st_size, fst_after.st_mtime_ns)
+                        != (st_before.st_dev, st_before.st_ino,
+                            st_before.st_size, st_before.st_mtime_ns)
+                        or (st_after.st_dev, st_after.st_ino,
+                            st_after.st_size, st_after.st_mtime_ns)
+                        != (st_before.st_dev, st_before.st_ino,
+                            st_before.st_size, st_before.st_mtime_ns)):
+                    raise RuntimeError(
+                        f'archive input {p!r} changed while it was being '
+                        'packed; retry when the artifact is quiescent')
+                if int(reader.nbytes) != int(ti.size):
+                    raise RuntimeError(
+                        f'archive input {p!r} produced {reader.nbytes} bytes '
+                        f'but tar expected {ti.size}; nothing was published')
+                man['files'][rel] = {'sha256': reader.hexdigest(),
+                                     'bytes': int(reader.nbytes)}
             man_path_rel = f'{base_name}.MANIFEST.sha256'
             man_bytes = json.dumps(man, ensure_ascii=False, indent=2).encode('utf-8')
             import io

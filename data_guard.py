@@ -1505,6 +1505,7 @@ class LeakageSafePreprocessor:
             # same impute/clip operation that transform() will apply.  They are
             # never recomputed from validation/test data.
             center, factor = 0.0, 1.0
+            unit_scale = None
             if self.scale == 'standard':
                 center = _safe_mean(imputed)
                 sd = _safe_std(imputed)
@@ -1531,8 +1532,14 @@ class LeakageSafePreprocessor:
                     # overflow.
                     scaled, m = _scaled_maxabs(imputed)
                     if scaled is not None:
-                        center = float(np.min(scaled)) * m
-                        factor = m
+                        _smin, _smax = float(np.min(scaled)), float(np.max(scaled))
+                        if _smax > _smin:
+                            center = _smin * m
+                            factor = m
+                            # The original span is not representable; after
+                            # x/m - min/m the range is (_smax-_smin), so a
+                            # finite post-scale restores the documented [0,1].
+                            unit_scale = 1.0 / (_smax - _smin)
                 factor = span if math.isfinite(span) and span > self.eps else factor
             if not np.isfinite(center):
                 center = 0.0
@@ -1548,6 +1555,7 @@ class LeakageSafePreprocessor:
                 'clip_hi': float(q_hi) if np.isfinite(q_hi) else None,
                 'center': center,
                 'factor': factor,
+                'unit_scale': unit_scale,
                 'mean': _safe_mean(imputed),
                 'std': _safe_std(imputed),
                 'median': _safe_median(imputed),
@@ -1586,6 +1594,8 @@ class LeakageSafePreprocessor:
                 # x/factor - center/factor is mathematically identical and
                 # stays finite whenever the scaled value is representable.
                 col = col / st['factor'] - st['center'] / st['factor']
+                if st.get('unit_scale') is not None:
+                    col = col * st['unit_scale']
             if self.clip_z is not None and self.scale != 'none':
                 col = np.clip(col, -self.clip_z, self.clip_z)
             out[:, j] = col
@@ -1628,6 +1638,12 @@ class LeakageSafePreprocessor:
                 raise ValueError(
                     f'{what}.from_stats: feature {j} has a non-positive '
                     'scale factor')
+            if st.get('unit_scale') is not None:
+                _us = _stat_float(st, 'unit_scale', what=what, index=j)
+                if _us is None or _us <= 0.0:
+                    raise ValueError(
+                        f'{what}.from_stats: feature {j} has an invalid '
+                        'minmax unit_scale')
             lo = _stat_float(st, 'clip_lo', what=what, index=j,
                              allow_none=True)
             hi = _stat_float(st, 'clip_hi', what=what, index=j,
@@ -2089,8 +2105,30 @@ def _target_key(value):
         if c.imag == 0.0:
             return _target_key(c.real)
         return 'c:' + repr(c)
-    if isinstance(value, (float, np.floating)):
+    if isinstance(value, np.floating) and value.dtype.itemsize > 8:
+        # Python float() rounds longdouble to 53 bits.  Distinct extended
+        # values must not become one category; keep the float path only when
+        # the value is exactly representable (so 1L == 1 still shares 'i:1').
+        try:
+            _f = float(value)
+            _vfinite = bool(np.isfinite(value))
+            if not _vfinite:
+                # True inf/NaN keeps the shared non-finite identity.
+                f = _f
+            elif math.isfinite(_f) and np.longdouble(_f) == value:
+                f = _f
+            else:
+                # Finite but beyond float64 range (or with extra mantissa
+                # bits): keep the exact extended value, never collapse it to
+                # the infinity key.
+                return 'w:' + _wide_float_key(value).hex()
+        except (TypeError, ValueError, OverflowError):
+            return 'w:' + _wide_float_key(value).hex()
+    elif isinstance(value, (float, np.floating)):
         f = float(value)
+    else:
+        f = None
+    if f is not None:
         if math.isnan(f):
             return '__missing__'
         if math.isinf(f):
@@ -2280,6 +2318,73 @@ class LeakageSafeTargetEncoder:
         fold_of = {key: i % self.n_folds for i, key in enumerate(items)}
         for i, key in enumerate(keys):
             folds[i] = fold_of[key]
+        return folds
+
+    def _coalesce_folds(self, folds, group_keys, row_keys):
+        """Force every group/duplicate-row component into one fold.
+
+        Group folds alone cannot see that the same feature row appears in two
+        different groups; the duplicate's label would then encode its twin.
+        Union rows sharing a group *or* an exact feature key and move each
+        whole component to the smallest fold it already occupies (a pure fold
+        merge, so no held row starts using a later/time label).
+        """
+        n = int(len(folds))
+        parent = list(range(n))
+
+        def find(i):
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+
+        def union(a, b):
+            ra, rb = find(int(a)), find(int(b))
+            if ra != rb:
+                parent[rb] = ra
+
+        if group_keys is not None:
+            first = {}
+            for i, key in enumerate(group_keys):
+                j = first.setdefault(key, i)
+                if j != i:
+                    union(j, i)
+        if row_keys is not None:
+            first = {}
+            for i, key in enumerate(row_keys):
+                j = first.setdefault(key, i)
+                if j != i:
+                    union(j, i)
+        comps = {}
+        for i in range(n):
+            comps.setdefault(find(i), []).append(i)
+        members_list = list(comps.values())
+        conflict = any(len({int(folds[i]) for i in members}) > 1
+                       for members in members_list if len(members) > 1)
+        if not conflict:
+            # No group/duplicate merge spans folds: keep the historical
+            # assignment untouched (only duplicates already in one fold).
+            for members in members_list:
+                target = min(int(folds[i]) for i in members)
+                for i in members:
+                    folds[i] = target
+            return folds
+        # Merging components can make every merged component carry the same
+        # minimum fold (e.g. two duplicate pairs originally in folds 0/1).
+        # Re-assign whole components in first-row/first-fold order so the
+        # merged design still has distinct out-of-fold references.
+        _original = folds.copy()
+        members_list.sort(key=lambda m: (min(int(folds[i]) for i in m), m[0]))
+        for rank, members in enumerate(members_list):
+            target = rank % self.n_folds
+            for i in members:
+                folds[i] = target
+        if np.unique(folds).size < 2:
+            # Every group is connected through duplicate rows.  Collapsing to
+            # one fold would remove all out-of-fold references; keep the
+            # original group/time folds and let fit_transform exclude the
+            # duplicate labels from every reference set instead.
+            return _original
         return folds
 
     def _row_folds(self, n, keys=None):
@@ -2616,6 +2721,14 @@ class LeakageSafeTargetEncoder:
                 f'labels, got {n}')
         self.fit(X, y, groups=groups, time=time)
         yarr = self._target_array(y, n)
+        # Exact duplicate feature rows are one observation.  This must hold on
+        # every fold policy, including grouped/time folds: a duplicate in
+        # another group would otherwise train its twin's encoding.
+        _row_keys_n = _row_keys(Xarr)
+        _group_keys_n = None
+        if groups is not None:
+            _g = _as_1d(groups, 'groups', n)
+            _group_keys_n = [_group_key(v) for v in _g.tolist()]
         if time is not None and groups is not None:
             folds = self._group_time_folds(groups, time, n)
             policy = 'grouped_chronological_expanding_oof'
@@ -2626,20 +2739,29 @@ class LeakageSafeTargetEncoder:
             folds = self._group_folds(groups, n)
             policy = 'grouped_oof'
         else:
-            folds = self._row_folds(n, keys=_row_keys(Xarr))
+            folds = self._row_folds(n, keys=_row_keys_n)
             policy = 'row_oof'
-            if np.unique(folds).size < 2:
-                # Every row shares one feature key, so the duplicate-safe fold
-                # assignment puts all rows in a single fold.  That fold has no
-                # out-of-fold reference rows; silently emitting the 0.0 prior
-                # for every row would fabricate an encoding, exactly like the
-                # single-row case refused above.  Refuse instead (fit() still
-                # supports this data for a full-table holdout encoding).
-                raise ValueError(
-                    'LeakageSafeTargetEncoder.fit_transform needs at least 2 '
-                    'distinct feature rows so a held duplicate group has '
-                    'out-of-fold reference labels')
+        if policy == 'grouped_oof':
+            # Group-only folds are free to merge connected groups.  Time folds
+            # must stay chronological, so they keep their blocks and remove
+            # duplicate labels from the reference set below instead.
+            folds = self._coalesce_folds(folds, _group_keys_n, _row_keys_n)
+        if np.unique(folds).size < 2:
+            # Every row is one duplicate/group component: that fold has no
+            # out-of-fold reference rows.  Silently emitting the prior would
+            # fabricate an encoding, exactly like the single-row case.
+            raise ValueError(
+                'LeakageSafeTargetEncoder.fit_transform needs at least 2 '
+                'distinct feature/group components so a held component has '
+                'out-of-fold reference labels')
         out = np.zeros((n, Xarr.shape[1]), dtype=np.float64)
+        # Duplicate feature rows are one observation even when the chosen
+        # group/time folds could not be merged (e.g. every group is connected
+        # by duplicates).  Never let such a twin contribute to a held row's
+        # reference mean.
+        _dup_key_counts = {}
+        for _rk in _row_keys_n:
+            _dup_key_counts[_rk] = _dup_key_counts.get(_rk, 0) + 1
         for k in range(int(folds.max()) + 1):
             held = np.nonzero(folds == k)[0]
             if held.size == 0:
@@ -2650,6 +2772,13 @@ class LeakageSafeTargetEncoder:
                 ref = np.nonzero(folds < k)[0]
             else:
                 ref = np.nonzero(folds != k)[0]
+            _held_keys = {_row_keys_n[i] for i in held}
+            _exclude = np.fromiter(
+                (_dup_key_counts[_row_keys_n[i]] > 1
+                 and _row_keys_n[i] in _held_keys for i in ref),
+                dtype=bool, count=int(ref.size))
+            if _exclude.any():
+                ref = ref[~_exclude]
             stats = self._fit_fold(Xarr, yarr, ref)
             out[held] = self._apply(stats, Xarr, held)
         self.oof_policy_ = policy
@@ -2770,6 +2899,15 @@ class LeakageSafeTargetEncoder:
         if _row_set_fp is not None and not isinstance(_row_set_fp, str):
             raise ValueError(
                 f'{what}.from_stats: train_row_set_fp must be a string or None')
+        if obj.n_train_ > 0 and (not isinstance(_row_set_fp, str)
+                                 or not _row_set_fp.strip()):
+            # Without the order-insensitive row-set digest, transform() can no
+            # longer recognise the same training rows in a different order and
+            # would serve each row's own label back as its feature.
+            raise ValueError(
+                f'{what}.from_stats: n_train={obj.n_train_} requires a '
+                'non-empty train_row_set_fp so a reordered training matrix is '
+                'still refused')
         obj.train_fp_ = _train_fp
         obj.train_row_set_fp_ = _row_set_fp
         obj.oof_policy_ = stats.get('oof_policy')

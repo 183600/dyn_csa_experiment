@@ -3329,11 +3329,13 @@ def audit_selection(path='analysis_mechanism/selection_attribution.json'):
         if _bad_seed:
             out['problems'].append(f'cell {i} ({c.get("arm")}): per_seed rows have an invalid/duplicate seed key or lack mass_covered/random_baseline: {_bad_seed[:5]}')
         _n_valid = len(_d)
+        _mean_delta = (float(np.mean(_d)) if _n_valid else None)
         if _n_valid >= 2:
             try:
                 L = _import_exp_lib()
                 _r = L.exact_signflip_p(_d)
-                _st = {'p_exact_signflip': float(_r.get('p')), 'n': int(_r.get('n', _n_valid)), 'method': _r.get('method')}
+                _st = {'p_exact_signflip': float(_r.get('p')), 'n': int(_r.get('n', _n_valid)), 'method': _r.get('method'),
+                       'mean_delta': _mean_delta}
             except Exception as e:
                 out['problems'].append(f'cell {i}: could not run the seed test ({type(e).__name__}: {e})')
         out['cells'].append({'arm': c.get('arm'), 'eval_len': el, 'k': k, 'n_blocks': B,
@@ -3341,7 +3343,11 @@ def audit_selection(path='analysis_mechanism/selection_attribution.json'):
                              'mass_excess': mass - base, 'recall_excess': rec - base,
                              'n_queries': nq, 'n_seeds': _n_seeds, 'n_seeds_valid': _n_valid,
                              'seed_test': _st,
-                             'claim_allowed': bool(mass > base and rec > base and nq > 0 and _st is not None and _st.get('p_exact_signflip', 1.0) < 0.05 and int(_st.get('n', 0)) >= 6)})
+                             'claim_allowed': bool(mass > base and rec > base and nq > 0 and _st is not None
+                                                   and _st.get('mean_delta') is not None
+                                                   and float(_st['mean_delta']) > 0.0
+                                                   and _st.get('p_exact_signflip', 1.0) < 0.05
+                                                   and int(_st.get('n', 0)) >= 6)})
     out['status'] = 'fail' if out['problems'] else 'ok'
     out['note'] = ('cells pass the structural contract; `claim_allowed` additionally requires mass/recall above the '
                    'random baseline and a seed-level exact sign-flip p<0.05 with n>=6')

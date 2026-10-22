@@ -102,6 +102,26 @@ def _paired_vocab_guard(meta_a, meta_b):
     vb = _v(meta_b, 'comparison')
     if va != vb:
         raise SystemExit(f'[errors] REFUSE: paired checkpoints use different vocabularies ({va} vs {vb}); per-token labels are not comparable')
+    # Equal vocab SIZE does not imply equal tokens: two independent BPE fits
+    # can share 8192 ids with different merges, and the same id then denotes a
+    # different token.  Compare every recorded corpus/tokenizer identity.  A
+    # one-sided or absent legacy field stays permitted (old checkpoints), but
+    # a present mismatch is a hard refusal.
+    for _field in ('tokenizer_vocab_sha256', 'tokenizer_file_sha256',
+                   'train_fp', 'eval_fp', 'val_fp'):
+        _ia = (meta_a or {}).get(_field)
+        _ib = (meta_b or {}).get(_field)
+        _ia = str(_ia) if _ia not in (None, '') else None
+        _ib = str(_ib) if _ib not in (None, '') else None
+        if _ia is None and _ib is None:
+            continue
+        if _ia is None or _ib is None:
+            continue  # legacy checkpoint without this identity; vocab remains checked
+        if _ia != _ib:
+            raise SystemExit(
+                f'[errors] REFUSE: paired checkpoints record different '
+                f'{_field} identities ({_ia[:16]}… vs {_ib[:16]}…); per-token '
+                'labels are not comparable even at equal vocabulary size')
 
 
 def _roundtrip(d):

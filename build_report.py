@@ -97,7 +97,8 @@ def _ppl_value(entry):
     for k in ('ppl_primary', 'ppl_pooled', 'ppl_mean'):
         v = entry.get(k)
         _f = _as_finite(v)
-        if _f is not None:
+        # PPL = exp(CE) is >= 1; a sub-1 value is a corrupt measurement.
+        if _f is not None and _f >= 1.0:
             return _f
     return None
 
@@ -323,7 +324,7 @@ def _measurable(r):
 
 def _ppl_ok(v):
     f = _as_finite(v)
-    return f is not None and f > 0.0
+    return f is not None and f >= 1.0
 
 def _nested_estimand(rec):
     return (isinstance(rec, dict)
@@ -343,7 +344,7 @@ def _primary_ppl(rec):
         return None
     if rec.get('ppl_estimation_rows') == 'nested_validation_holdout':
         v = _as_finite(rec.get('ppl_holdout'))
-        if v is not None and v > 0.0:
+        if v is not None and v >= 1.0:
             return v
         nll = _as_finite(rec.get('nll_sum_holdout'))
         ntok = _int_or(rec.get('n_tokens_holdout'), None)
@@ -352,7 +353,7 @@ def _primary_ppl(rec):
                 _v = math.exp(nll / ntok)
             except OverflowError:
                 return None
-            return _v if math.isfinite(_v) and _v > 0.0 else None
+            return _v if math.isfinite(_v) and _v >= 1.0 else None
         _nll = rec.get('nll_per_row_holdout')
         _ntok = rec.get('n_tokens_per_row_holdout')
         if isinstance(_nll, list) and isinstance(_ntok, list) and _nll and len(_nll) == len(_ntok):
@@ -365,10 +366,10 @@ def _primary_ppl(rec):
                         _v2 = math.exp(sum(_v) / _tot)
                     except OverflowError:
                         return None
-                    return _v2 if math.isfinite(_v2) and _v2 > 0.0 else None
+                    return _v2 if math.isfinite(_v2) and _v2 >= 1.0 else None
         return None
     v = _as_finite(rec.get('ppl'))
-    return v if v is not None and v > 0.0 else None
+    return v if v is not None and v >= 1.0 else None
 
 def _finite_or_none(v):
     return _as_finite(v)
@@ -427,7 +428,7 @@ def _finite_ppls(r):
     ppls = r.get('ppls') or r.get('ppl_list') or []
     if not isinstance(ppls, (list, tuple)):
         return []
-    return [f for f in (_as_finite(x) for x in ppls) if f is not None and f > 0.0]
+    return [f for f in (_as_finite(x) for x in ppls) if f is not None and f >= 1.0]
 
 _WARM_KEY_RE = re.compile('.*::w(\\d+)::seed\\d+$')
 

@@ -5095,12 +5095,14 @@ _FO_FULL_CAP_BYTES = 64 << 20
 _FO_MINL = {}
 
 def _attn_full_width_ok(n, k, w, need_dedup):
-    # Element count of the hoisted selection tables: the block read mask
-    # [n, k], the [selected|window] valid mask [n, k + w], the per-row
-    # any-reduction [n], and — only when first-occurrence dedup is needed —
-    # its keep mask [n, k].  The per-chunk form is value-identical.
-    elems = int(n) * (int(k) + int(w) + 1 + (int(k) if need_dedup else 0))
-    return elems <= _FO_FULL_CAP_BYTES
+    # Bytes of the hoisted tables: the [n, k+w] valid mask, its negated twin
+    # nvalid_all, the per-row any-reduction, the optional dedup/keep masks, and
+    # the int64 [n, k+w] rows table built by the same branch.  Counting only
+    # one boolean table admitted 2-4x the intended cap at the threshold.
+    _m = int(k) + int(w)
+    _bytes = int(n) * (2 * _m * 1 + 8 + (2 * int(k) if need_dedup else 0)
+                       + 8 * _m)
+    return _bytes <= _FO_FULL_CAP_BYTES
 
 def _finfo_min(dtype):
     # torch.finfo(dtype).min is a pure function of the dtype — the same
@@ -6292,7 +6294,7 @@ class HybridAttention(nn.Module):
                 # fixed top-k budget.
                 _P = 1 if _prefix_kind == 'summary' else int(_prefix_geo['token_idx'].shape[1])
                 _tot = int(Bn) + int(_P)
-                topk_idx = _arange_cache(_tot, x.device)[None, :].expand(T, _tot).to(torch.int32)
+                topk_idx = _arange_exp_cache(T, _tot, x.device)
                 # The closed half still follows the strict closed-block gate
                 # (`pos > last_tok`): HCA reads every *finished* block, not
                 # the still-open current block whose pooled K/V contains
@@ -6708,7 +6710,16 @@ class SmallGPT(nn.Module):
         # the valid targets only (F.cross_entropy's own reduction), exactly as
         # the unchunked form did.  The default None means every target is valid.
         _ign = -100 if ignore_index is None else int(ignore_index)
-        n_tok = int((targets != _ign).sum().item())
+        # The trunk must see the full input (block geometry depends on T), but
+        # only the first `n_cols` target columns are scored.  Counting the
+        # denominator over ALL target columns made a wider target table shrink
+        # the loss (and its gradient) by n_cols/targets.shape[1].
+        n_cols = min(int(ids.shape[1]), int(targets.shape[1]))
+        if n_cols <= 0:
+            raise ValueError(
+                'ce_loss needs at least one input position with a target; '
+                f'got ids{tuple(ids.shape)} targets{tuple(targets.shape)}')
+        n_tok = int((targets[:, :n_cols] != _ign).sum().item())
         n_tok = max(n_tok, 1)
         ce = None
         _ck = torch.is_grad_enabled() and h.requires_grad
@@ -6717,10 +6728,9 @@ class SmallGPT(nn.Module):
             # the limit covers the whole sequence, not just one chunk.
             _saved = 3 * int(ids.shape[0]) * int(ids.shape[1]) * int(vocab) * 4
             _ck = not _cpu_saved_ok(_saved, _CPU_CE_CKPT_BYTES)
-        # The trunk must see the full input (block geometry depends on T), but
-        # a next-token target table is one column shorter; score only the rows
-        # that have a target, exactly like the original logits[:, :-1] form.
-        n_cols = min(int(ids.shape[1]), int(targets.shape[1]))
+        # A next-token target table is one column shorter; score only the
+        # rows that have a target, exactly like the original logits[:, :-1]
+        # form.  `n_cols` (and its denominator) is fixed above.
         for s in range(0, n_cols, chunk):
             e = min(s + chunk, n_cols)
             if _ck:
@@ -11092,8 +11102,12 @@ def objective_reason(ra, rb):
     return _objective_diff(ra, rb)[0]
 
 def ppl_is_usable(v):
+    # PPL = exp(mean CE) with CE >= 0, so a valid value is >= 1.  A sub-1 value
+    # is not a surprisingly strong model; it is an impossible/corrupt
+    # measurement (negative CE, a raw CE accidentally stored as PPL, or a
+    # rounded float underflow) and must not enter aggregates.
     f = _finite_scalar(v)
-    return f is not None and f > 0.0
+    return f is not None and f >= 1.0
 
 def by_len_cells(rows, Ln, variant=None):
     keys = (Ln, int(Ln), str(int(Ln)))
@@ -28191,7 +28205,22 @@ def eval_ppl(model, val_batch, device, chunk=8, eval_rows=None, eval_seed=0, ret
             _k = min(int(eval_rows), _flat)
             if _k < _flat:
                 _g = torch.Generator().manual_seed(int(eval_seed))
-                _sel = torch.randperm(_flat, generator=_g)[:_k]
+                # A full randperm costs O(n_rows*T) memory even for a tiny
+                # eval_rows sample (e.g. 1 GB at 4096x32768).  Sampling with
+                # replacement and de-duplicating gives the same uniform
+                # k-subset distribution with O(k) memory; only near-full
+                # samples fall back to the historical permutation.
+                if _k * 4 >= _flat:
+                    _sel = torch.randperm(_flat, generator=_g)[:_k]
+                else:
+                    _sel = torch.empty(0, dtype=torch.long)
+                    while int(_sel.numel()) < _k:
+                        _draw = torch.randint(0, _flat,
+                                              (max(16, 2 * int(_k - _sel.numel())),),
+                                              generator=_g)
+                        _sel = torch.unique(torch.cat([_sel, _draw]), sorted=True)
+                    if int(_sel.numel()) > _k:
+                        _sel = _sel[torch.randperm(int(_sel.numel()), generator=_g)[:_k]]
                 # keep the sorted host copy: per-chunk membership bounds are
                 # integer range queries on a sorted table — searchsorted on the
                 # host gives the same slice the boolean-mask form selected
@@ -33532,7 +33561,10 @@ def _pooled_ppl_from_records(recs, *, estimand=None):
     total_n, total_t = float(sum(nlls)), float(sum(nts))
     if total_t <= 0:
         return None, None, None
-    return _safe_exp_ppl(total_n / total_t), total_n, int(total_t)
+    _pooled = _safe_exp_ppl(total_n / total_t)
+    if _pooled is None or not math.isfinite(_pooled) or _pooled < 1.0:
+        return None, None, None
+    return _pooled, total_n, int(total_t)
 
 def _record_primary_ppl(rec):
     """The per-seed PPL on the same rows as the record's primary aggregate.
@@ -33553,11 +33585,12 @@ def _record_primary_ppl(rec):
     if rec.get('ppl_estimation_rows') == 'nested_validation_holdout':
         _h = _finite_scalar(rec.get('ppl_holdout'))
         if _h is not None:
-            return _h
+            return _h if ppl_is_usable(_h) else None
         _nll = _finite_scalar(rec.get('nll_sum_holdout'))
         _nt = _exact_count(rec.get('n_tokens_holdout'), minimum=1)
         if _nll is not None and _nt is not None:
-            return _safe_exp_ppl(_nll / _nt)
+            _v = _safe_exp_ppl(_nll / _nt)
+            return _v if ppl_is_usable(_v) else None
         _rn = rec.get('nll_per_row_holdout')
         _rt = rec.get('n_tokens_per_row_holdout')
         if (isinstance(_rn, list) and isinstance(_rt, list)
@@ -33568,9 +33601,11 @@ def _record_primary_ppl(rec):
                     and all(v is not None for v in _toks)):
                 _tot_t = int(sum(_toks))
                 if _tot_t > 0:
-                    return _safe_exp_ppl(float(sum(_vals)) / _tot_t)
+                    _v = _safe_exp_ppl(float(sum(_vals)) / _tot_t)
+                    return _v if ppl_is_usable(_v) else None
         return None
-    return _finite_scalar(rec.get('ppl'))
+    _v = _finite_scalar(rec.get('ppl'))
+    return _v if ppl_is_usable(_v) else None
 
 
 def _paired_primary_delta(rec_a, rec_b):

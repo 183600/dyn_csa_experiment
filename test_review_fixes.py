@@ -17987,6 +17987,282 @@ def t_run_order_audit_detects_temporal_confounding():
         assert rep['panels'][os.path.basename(d)]['status'] == 'fail'
 
 
+def t_target_encoder_groups_keep_duplicate_rows_together():
+    # Same feature row in two different groups must not be split into
+    # different folds: the twin's label would encode this row's target.
+    import data_guard as DG
+    X = np.array([['a'], ['a'], ['b'], ['b']], dtype=object)
+    y = np.array([0.0, 100.0, 0.0, 0.0])
+    groups = np.array(['g0', 'g1', 'g2', 'g3'])
+    enc = DG.LeakageSafeTargetEncoder(smoothing=0.0, n_folds=2, seed=0)
+    oof = enc.fit_transform(X, y, groups=groups)
+    assert np.allclose(oof[0], oof[1]), oof
+    assert np.allclose(oof[2], oof[3]), oof
+    assert not np.allclose(oof[0], 100.0), oof
+    # A persisted encoder without the order-insensitive row-set digest would
+    # silently lose the reordered-training refusal.
+    stats = enc.get_stats()
+    stats.pop('train_row_set_fp', None)
+    try:
+        DG.LeakageSafeTargetEncoder.from_stats(stats)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('from_stats accepted a missing train_row_set_fp')
+
+
+def t_minmax_overflow_stays_unit_interval():
+    import data_guard as DG
+    X = np.array([[-1.0e308], [0.0], [1.0e308]])
+    enc = DG.LeakageSafePreprocessor(scale='minmax', clip_quantiles=None)
+    out = enc.fit_transform(X)
+    assert np.all(np.isfinite(out)), out
+    assert np.allclose(out.ravel(), [0.0, 0.5, 1.0]), out
+    restored = DG.LeakageSafePreprocessor.from_stats(enc.get_stats())
+    assert np.allclose(restored.transform(X), out), (restored.transform(X), out)
+    # Extended precision categories must not collapse through float64.
+    a = DG._target_key(np.longdouble('1.0000000000000000001'))
+    b = DG._target_key(np.longdouble('1.0000000000000000002'))
+    assert a != b, (a, b)
+    assert DG._target_key(np.longdouble(1.0)) == DG._target_key(1)
+    # A finite value beyond float64's range is not the infinity category.
+    _huge = np.longdouble('1e4000')
+    if np.isfinite(_huge):
+        assert DG._target_key(_huge) != DG._target_key(np.longdouble('inf'))
+
+
+def t_selection_audit_requires_positive_seed_effect():
+    A = __import__('audit_gates')
+    td = tempfile.mkdtemp(prefix='selection_neg_', dir=REPO)
+    try:
+        path = os.path.join(td, 'selection.json')
+        cell = {'arm': 'a', 'eval_len': 1024, 'k': 32, 'n_blocks': 256,
+                'n_queries': 100, 'recall_at_k': 0.5, 'mass_covered': 0.9,
+                'random_baseline': 0.1,
+                'per_seed': {str(s): {'mass_covered': 0.1,
+                                      'random_baseline': 0.9}
+                             for s in range(6)}}
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump({'cells': [cell]}, f)
+        r = A.audit_selection(path=path)
+        c = r['cells'][0]
+        # Two-sided p can be significant in the negative direction; a positive
+        # cell aggregate cannot certify it.
+        assert c['seed_test']['p_exact_signflip'] < 0.05, c
+        assert c['seed_test']['mean_delta'] < 0.0, c
+        assert c['claim_allowed'] is False, c
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+
+def t_ppl_below_one_is_not_a_measurement():
+    assert L.ppl_is_usable(1.0) is True
+    assert L.ppl_is_usable(0.5) is False
+    assert L.ppl_is_usable(-1.0) is False
+    nested = {'ppl': 100.0, 'ppl_estimation_rows': 'nested_validation_holdout',
+              'ppl_holdout': -5.0}
+    assert L._record_primary_ppl(nested) is None, nested
+    nested['ppl_holdout'] = 0.5
+    assert L._record_primary_ppl(nested) is None, nested
+    nested['ppl_holdout'] = 10.0
+    assert L._record_primary_ppl(nested) == 10.0
+    assert L._pooled_ppl_from_records(
+        [{'nll_sum': -100.0, 'n_tokens': 10}]) == (None, None, None)
+    import build_report as BR
+    assert BR._ppl_ok(0.5) is False and BR._ppl_ok(1.0) is True
+    assert BR._primary_ppl(nested) == 10.0
+    nested['ppl_holdout'] = 0.5
+    assert BR._primary_ppl(nested) is None
+    import fuse_analysis as FA
+    assert math.isnan(FA.sample_std([])) and math.isnan(FA.sample_std([1.0]))
+    assert np.isnan(FA.sample_std(np.ones((1, 2)), axis=0)).all()
+
+
+def t_paired_error_guard_checks_identity_not_only_vocab_size():
+    import error_analysis as EA
+    EA._paired_vocab_guard({'vocab': 8192}, {'vocab': 8192})
+    for field in ('train_fp', 'eval_fp', 'val_fp', 'tokenizer_vocab_sha256'):
+        try:
+            EA._paired_vocab_guard({'vocab': 8192, field: 'A'},
+                                   {'vocab': 8192, field: 'B'})
+        except SystemExit as e:
+            assert field in str(e), str(e)
+        else:
+            raise AssertionError(f'differing {field} was accepted at equal vocab size')
+        # One-sided legacy identity stays accepted; the guard only refuses a
+        # definite mismatch.
+        EA._paired_vocab_guard({'vocab': 8192, field: 'A'}, {'vocab': 8192})
+
+
+def t_ce_loss_denominator_matches_scored_columns():
+    torch.manual_seed(0)
+    ids = torch.randint(0, 16, (2, 2))
+    wide = torch.randint(0, 16, (2, 4))
+    model = L.SmallGPT(16, 16, 1, 2, 8, 8, L.make_layer_cfgs(1, 'full'),
+                       mlp_ratio=2)
+    got = float(model.ce_loss(ids, wide, 16).detach())
+    with torch.no_grad():
+        lg = model.head(model.trunk(ids))
+        want = float(torch.nn.functional.cross_entropy(
+            lg.reshape(-1, 16), wide[:, :2].reshape(-1),
+            reduction='mean'))
+    assert math.isclose(got, want, rel_tol=1e-5, abs_tol=1e-6), (got, want)
+    # The forward(targets=...) path must use the same denominator.
+    got2 = float(model(ids, targets=wide, vocab=16).detach())
+    assert math.isclose(got2, want, rel_tol=1e-5, abs_tol=1e-6), (got2, want)
+
+
+def t_kernel_geometry_caches_are_not_inference_tensors():
+    import csa_kernels as C
+    with torch.inference_mode():
+        geom = C._pool_geometry_cached([[2, 3]], 2, 5,
+                                       torch.device('cpu'), 128)
+        ar = C._full_arange_cached(1, 4, 3, torch.device('cpu'),
+                                   contiguous=False)
+    assert geom.last_tok.is_inference() is False
+    assert ar.is_inference() is False
+    # The lazy gather/byte caches must also survive an eval-first access.
+    with torch.inference_mode():
+        g_a, av = geom.gather_geom()
+        b_off = geom.b_off(8)
+    assert g_a.is_inference() is False and av.is_inference() is False
+    assert b_off.is_inference() is False
+
+
+def t_kernel_reference_fp64_stays_finite():
+    import csa_kernels as C
+    T, w = 2, 1
+    q = torch.full((1, T, 1, 1), 1e20, dtype=torch.float64)
+    kb = torch.empty((1, 0, 1, 1), dtype=torch.float64)
+    vb = torch.empty((1, 0, 1, 1), dtype=torch.float64)
+    ks = torch.full((1, T, 1, 1), 1e20, dtype=torch.float64)
+    vs = torch.ones((1, T, 1, 1), dtype=torch.float64)
+    idx = torch.empty((1, T, 0), dtype=torch.long)
+    lt = torch.full((1, 0), -1, dtype=torch.long)
+    out = C._attn_fwd_ref(q, kb, vb, ks, vs, idx, None, lt, None, None, w, 1.0)
+    assert torch.isfinite(out).all(), out
+    sink = torch.tensor([1e300], dtype=torch.float64)
+    out2 = C._attn_fwd_ref(q, kb, vb, ks, vs, idx, None, lt, None, sink, w, 1.0)
+    assert torch.isfinite(out2).all(), out2
+
+
+def t_open_block_cell_receives_the_panel_deadline():
+    # --max-hours was only checked before each cell; train_variant then ran
+    # without a deadline and one cell could overrun the whole budget.
+    import open_block_supp as OB
+    with tempfile.TemporaryDirectory() as td:
+        cfg = dict(OB.BASE_CFG)
+        cfg.update(outdir=td, steps=1)
+        seen = {}
+
+        class _Stop(Exception):
+            pass
+
+        def _fake(*args, **kwargs):
+            seen.update(kwargs)
+            raise _Stop
+
+        _orig = L.train_variant
+        L.train_variant = _fake
+        try:
+            try:
+                OB._run_one(
+                    cfg, variant='v', seed=0,
+                    train_ids=np.arange(8, dtype=np.int64),
+                    val_batch=np.zeros((2, 4), dtype=np.int64),
+                    vocab=97, val_bnd=None, outdir=td, fp='fp',
+                    device=torch.device('cpu'), max_hours=1.0,
+                    deadline_ts=123.0)
+            except _Stop:
+                pass
+            else:
+                raise AssertionError('the fake trainer should have stopped')
+        finally:
+            L.train_variant = _orig
+        assert seen.get('deadline_ts') == 123.0, seen
+
+
+def t_finaltest_zero_admission_is_not_a_completed_phase():
+    # A P5T pass whose every cell returned skipped_* used to write a stats
+    # file with admission.n_admitted=0 and still return normally, so run_full
+    # appended P5T to `completed` after the one-shot test read was consumed.
+    man = {'arms': ['a', 'b'], 'seeds': [0, 1]}
+    assert 'admitted 0/' in (V12._finaltest_admission_problem(
+        {'admission': {'n_admitted': 0}}, man) or '')
+    assert V12._finaltest_admission_problem(
+        {'admission': {'n_admitted': 4}}, man) is None
+    assert V12._finaltest_admission_problem(
+        {'admission': {'n_admitted': 1}}, man) is not None
+    assert V12._finaltest_admission_problem(
+        {'admission': {'n_admitted': 1}}, man, allow_partial=True) is None
+    # Smoke fixtures are intentionally allowed to be smaller than the frozen
+    # grid; the explicit smoke flag is the only exemption.
+    assert V12._finaltest_admission_problem(
+        {'admission': {'n_admitted': 0}}, man, smoke=True) is None
+    # A malformed/missing admission report is not evidence of success.
+    assert V12._finaltest_admission_problem({}, man) is not None
+    assert V12._finaltest_admission_problem(
+        {'admission': {'n_admitted': 'x'}}, man) is not None
+
+
+def t_open_block_corrupt_summary_fails_closed():
+    # Starting from {} after a JSON parse error silently replaced the whole
+    # completed panel with the next single record.
+    import open_block_supp as OB
+    with tempfile.TemporaryDirectory() as td:
+        assert OB._load_summary(td) == {}
+        for payload in ('{"a": ', '[]', 'null'):
+            with open(os.path.join(td, 'summary.json'), 'w', encoding='utf-8') as f:
+                f.write(payload)
+            try:
+                OB._load_summary(td)
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError(f'corrupt summary {payload!r} was accepted')
+
+
+def t_archive_manifest_covers_bytes_actually_written():
+    # A file changing between the manifest hash and tf.add used to produce a
+    # release that failed its own `verify`.  The reader hashes the bytes fed
+    # to tar and the make path refuses a source that changed while packing.
+    import archive_release as AR
+    with tempfile.TemporaryDirectory(dir=REPO) as td:
+        rel = os.path.basename(td)
+        live = os.path.join(td, 'live.log')
+        with open(live, 'wb') as f:
+            f.write(b'x' * 4096)
+        _orig = AR._HashingReader
+
+        class _Mutating(_orig):
+            def __init__(self, stream):
+                super().__init__(stream)
+                self._once = True
+
+            def read(self, size=-1):
+                data = super().read(size)
+                if data and self._once:
+                    self._once = False
+                    with open(live, 'ab') as f:
+                        f.write(b'changed')
+                return data
+
+        AR._HashingReader = _Mutating
+        try:
+            try:
+                AR.cmd_make('race_test', [rel],
+                            outdir=os.path.join(rel, 'archive'))
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError(
+                    'archiving a file that changed while packed succeeded')
+        finally:
+            AR._HashingReader = _orig
+        assert not os.path.exists(
+            os.path.join(td, 'archive', 'release_race_test.tar.gz'))
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -18451,6 +18727,18 @@ def main():
     _check('L122 ladder parameter tiers are discovered in numeric order', t_ladder_tier_discovery_is_numeric_and_complete)
     _check('L123 run order is blocked randomized and position balanced', t_run_order_is_blocked_randomized_and_position_balanced)
     _check('L124 run-order audit detects arm-major temporal confounding', t_run_order_audit_detects_temporal_confounding)
+    _check('L125 zero-admission P5T is not a completed phase', t_finaltest_zero_admission_is_not_a_completed_phase)
+    _check('L126 corrupt open-block summary is not silently reset', t_open_block_corrupt_summary_fails_closed)
+    _check('L127 archive manifest covers bytes actually written', t_archive_manifest_covers_bytes_actually_written)
+    _check('L128 grouped target encoding keeps duplicate rows together', t_target_encoder_groups_keep_duplicate_rows_together)
+    _check('L129 minmax overflow + longdouble category identity', t_minmax_overflow_stays_unit_interval)
+    _check('L130 selection audit needs a positive seed effect', t_selection_audit_requires_positive_seed_effect)
+    _check('L131 sub-1 PPL is not a measurement', t_ppl_below_one_is_not_a_measurement)
+    _check('L132 paired errors check corpus/tokenizer identity', t_paired_error_guard_checks_identity_not_only_vocab_size)
+    _check('L133 CE denominator counts only scored target columns', t_ce_loss_denominator_matches_scored_columns)
+    _check('L134 kernel geometry caches are training-safe after eval', t_kernel_geometry_caches_are_not_inference_tensors)
+    _check('L135 kernel reference fp64 attention stays finite', t_kernel_reference_fp64_stays_finite)
+    _check('L136 open-block training receives the panel deadline', t_open_block_cell_receives_the_panel_deadline)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

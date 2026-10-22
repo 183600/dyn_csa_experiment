@@ -45,6 +45,7 @@ Artifacts
 <analysis_open_block>/stats.json + OPEN_BLOCK_REPORT.md
 """
 import argparse
+import contextlib
 import json
 import math
 import os
@@ -132,15 +133,49 @@ def _atomic_json(path, obj):
     os.replace(tmp, path)
 
 
+@contextlib.contextmanager
+def _summary_lock(outdir):
+    """Serialize summary.json read-modify-write across driver processes."""
+    os.makedirs(outdir, exist_ok=True)
+    lock_path = os.path.join(outdir, 'summary.json.lock')
+    lock_f = open(lock_path, 'a+', encoding='utf-8')
+    try:
+        try:
+            import fcntl
+        except ImportError:  # pragma: no cover - non-POSIX fallback
+            fcntl = None
+        if fcntl is not None:
+            fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            if fcntl is not None:  # noqa: F821 - assigned above
+                fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
+        finally:
+            lock_f.close()
+
+
 def _load_summary(outdir):
     p = os.path.join(outdir, 'summary.json')
     if os.path.exists(p):
         try:
             with open(p, encoding='utf-8') as f:
                 d = json.load(f)
-            return d if isinstance(d, dict) else {}
+            if not isinstance(d, dict):
+                raise RuntimeError(
+                    f'[open-block] REFUSE: summary {p} is a '
+                    f'{type(d).__name__}, not an object; the completed-cell '
+                    'records cannot be verified — repair or delete it '
+                    'explicitly')
+            return d
         except Exception as e:
-            print(f'[open-block] WARNING: unreadable summary {p} ({type(e).__name__}: {e}); starting a fresh one')
+            # Starting from {} would overwrite every completed cell in the
+            # file with the next single record.  A partial write is evidence
+            # of a damaged panel; require an explicit repair/delete.
+            raise RuntimeError(
+                f'[open-block] REFUSE: unreadable summary {p} '
+                f'({type(e).__name__}: {e}); repair or delete it explicitly '
+                'instead of silently replacing the completed cells') from e
     return {}
 
 
@@ -200,7 +235,7 @@ def _wikitext_data(cfg):
 
 
 def _run_one(cfg, *, variant, seed, train_ids, val_batch, vocab, val_bnd,
-             outdir, fp, device, max_hours=None, prov=None):
+             outdir, fp, device, max_hours=None, deadline_ts=None, prov=None):
     key = f'{variant}::seed{int(seed)}'
     summary = _load_summary(outdir)
     _data_fp = L._ids_fp(train_ids) if train_ids is not None else None
@@ -226,7 +261,8 @@ def _run_one(cfg, *, variant, seed, train_ids, val_batch, vocab, val_bnd,
         eval_subset=int(cfg.get('eval_subset', 128)),
         val_bnd=val_bnd, device=device, mlp_ratio=4.0,
         measure_eff=True, eager_batch=False,
-        amp_dtype=cfg.get('amp_dtype', 'auto'))
+        amp_dtype=cfg.get('amp_dtype', 'auto'),
+        deadline_ts=deadline_ts)
     rec = dict(rec)
     rec.pop('_model', None)
     rec['key'] = key
@@ -249,8 +285,13 @@ def _run_one(cfg, *, variant, seed, train_ids, val_batch, vocab, val_bnd,
         eager_batch=rec.get('eager_batch', False),
         data_version=rec.get('data_version'))
     rec['hyperparams']['open_block_config'] = rec.get('open_block_config')
-    summary[key] = rec
-    _save_summary(outdir, summary)
+    # Training can take hours; another driver may have completed other cells
+    # meanwhile.  Re-read under the lock and merge this one record, rather
+    # than replacing the whole file from the pre-training snapshot.
+    with _summary_lock(outdir):
+        summary = _load_summary(outdir)
+        summary[key] = rec
+        _save_summary(outdir, summary)
     _nll_tok = _nll_per_token(rec)
     _losses = rec.get('losses') if isinstance(rec.get('losses'), list) else []
     L.log_experiment_event(outdir, {
@@ -393,7 +434,7 @@ def run_panel(cfg, matrix, *, device, synthetic=False, max_hours=None, label='ma
             rec = _run_one(cfg, variant=variant, seed=seed, train_ids=train,
                            val_batch=val, vocab=vocab, val_bnd=val_bnd,
                            outdir=outdir, fp=fp, device=device, max_hours=remain,
-                           prov=prov)
+                           deadline_ts=deadline, prov=prov)
             if rec is not None:
                 done += 1
     summary = _load_summary(outdir)

@@ -303,12 +303,17 @@ class PoolGeometry:
         flat[7 * R * Bm:] = nblk_np
         import exp_lib as L
         _tdtype = torch.int64 if _need_i64 else torch.int32
-        staged, commit = L._h2d_stage((int(flat.size),), _tdtype, device)
-        if staged is not None:
-            staged.numpy()[:] = flat
-            _buf = commit()
-        else:
-            _buf = torch.from_numpy(flat).to(device)
+        # Build outside inference mode: the same geometry object is cached and
+        # later saved for autograd by the indexer/attention wrappers.  An
+        # inference tensor created by an eval pass cannot be saved for a
+        # subsequent training backward.
+        with torch.inference_mode(False):
+            staged, commit = L._h2d_stage((int(flat.size),), _tdtype, device)
+            if staged is not None:
+                staged.numpy()[:] = flat
+                _buf = commit()
+            else:
+                _buf = torch.from_numpy(flat).to(device)
         _v = _buf[:7 * R * Bm].view(7, R, Bm)
         self.R, self.Bm, self.T = R, Bm, T
         self.counts = _v[0]
@@ -339,10 +344,13 @@ class PoolGeometry:
         bool)——内容是 geom 的纯整型函数，只读消费；缓存论证与 b_off /
         _GEOM_CACHE 同。"""
         if self._ga_cache is None:
-            jA = torch.arange(self.max_len, device=self.starts.device)
-            g_a = (self.starts.to(torch.int64)[:, :, None] + jA[None, None, :]).clamp(max=int(self.T) - 1)
-            av_all = jA[None, None, :, None] < self.counts.to(torch.int64)[:, :, None, None]
-            self._ga_cache = (g_a, av_all)
+            # The lazy caches can first be filled by an inference-mode eval;
+            # keep them normal tensors so a later training pass can save them.
+            with torch.inference_mode(False):
+                jA = torch.arange(self.max_len, device=self.starts.device)
+                g_a = (self.starts.to(torch.int64)[:, :, None] + jA[None, None, :]).clamp(max=int(self.T) - 1)
+                av_all = jA[None, None, :, None] < self.counts.to(torch.int64)[:, :, None, None]
+                self._ga_cache = (g_a, av_all)
         return self._ga_cache
 
     def gather_geom_b(self):
@@ -350,29 +358,32 @@ class PoolGeometry:
         if int(self.W_b) <= 0:
             return None
         if self._g_b is None:
-            jB = torch.arange(self.W_b, device=self.starts.device)
-            self._g_b = (self.ov_start.to(torch.int64)[:, :, None] + jB[None, None, :]).clamp(max=int(self.T) - 1)
+            with torch.inference_mode(False):
+                jB = torch.arange(self.W_b, device=self.starts.device)
+                self._g_b = (self.ov_start.to(torch.int64)[:, :, None] + jB[None, None, :]).clamp(max=int(self.T) - 1)
         return self._g_b
 
     def i64_views(self):
         """geom 标量表的 int64 形式（int64 原型的 .to 是 no-op，非原型的
         cast 结果在此缓存）。"""
         if self._i64 is None:
-            self._i64 = dict(starts=self.starts.to(torch.int64),
-                             counts=self.counts.to(torch.int64),
-                             ov_start=self.ov_start.to(torch.int64),
-                             ov_len=self.ov_len.to(torch.int64),
-                             n_blocks=self.n_blocks.to(torch.int64))
+            with torch.inference_mode(False):
+                self._i64 = dict(starts=self.starts.to(torch.int64),
+                                 counts=self.counts.to(torch.int64),
+                                 ov_start=self.ov_start.to(torch.int64),
+                                 ov_len=self.ov_len.to(torch.int64),
+                                 n_blocks=self.n_blocks.to(torch.int64))
         return self._i64
 
     def b_off(self, bposb_rows):
         """[R, Bm, W_b] 的 B 泳道位置嵌入行号（带 eager 同款截断）。"""
         if self._b_off is not None and self._bposb_rows == int(bposb_rows):
             return self._b_off
-        j = torch.arange(self.W_b, device=self.starts.device, dtype=torch.int32)
-        raw = self.ov_start[:, :, None] - self.starts_prev[:, :, None] + j[None, None, :]
-        self._b_off = raw.clamp(max=int(bposb_rows) - 1).long()
-        self._bposb_rows = int(bposb_rows)
+        with torch.inference_mode(False):
+            j = torch.arange(self.W_b, device=self.starts.device, dtype=torch.int32)
+            raw = self.ov_start[:, :, None] - self.starts_prev[:, :, None] + j[None, None, :]
+            self._b_off = raw.clamp(max=int(bposb_rows) - 1).long()
+            self._bposb_rows = int(bposb_rows)
         return self._b_off
 
 
@@ -479,8 +490,11 @@ def _full_arange_cached(B, T, Bm, device, contiguous=True):
     key = (int(B), int(T), int(Bm), str(device), bool(contiguous))
     out = _ARANGE_CACHE.get(key)
     if out is None:
-        base = torch.arange(Bm, device=device, dtype=torch.int32)[None, None, :].expand(B, T, Bm)
-        out = base.contiguous() if contiguous else base
+        # Cache-normal tensor even when first filled from eval inference mode;
+        # FusedSparseAttention saves this table for a later training backward.
+        with torch.inference_mode(False):
+            base = torch.arange(Bm, device=device, dtype=torch.int32)[None, None, :].expand(B, T, Bm)
+            out = base.contiguous() if contiguous else base
         if not contiguous:
             # Shape (B,T,Bm) with stride (0,0,1) is the row-constant arange
             # table; mark it so the attention launcher can recognise it.
@@ -618,15 +632,18 @@ def _pool_bwd_ref(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b, bid, dcomp,
     ov_start_l = _i64['ov_start']
     nblk_l = _i64['n_blocks'][:, None]
     _bpb_rows = int(B_pos_b.shape[0]) if need_bpb else 0
-    gBpb32 = torch.zeros((_bpb_rows, c), device=dev, dtype=torch.float32) if need_bpb else None
-    gBpb_tmp = torch.zeros((_bpb_rows, c), device=dev, dtype=torch.float32) if need_bpb else None
+    # Work in at least fp32; fp64 inputs must not be silently downcast (finite
+    # products can overflow fp32 and turn inf-inf into NaN gradients).
+    _acc = torch.promote_types(dtype, torch.float32)
+    gBpb32 = torch.zeros((_bpb_rows, c), device=dev, dtype=_acc) if need_bpb else None
+    gBpb_tmp = torch.zeros((_bpb_rows, c), device=dev, dtype=_acc) if need_bpb else None
     ch = _pool_chunk_b(R, L + (W if has_b else 0), c, temps=8)
     # 单 chunk（ch >= Bm）时 in_ch / b2 的 chunk 范围条件恒真（geom 与 bid
     # 同源——Bm 由同一分段表的 counts 给出，bid 值恒 < Bm）：where(全真,
     # x, 0) 逐位返回 x（含 ±0/NaN）。
     single_chunk = ch >= Bm
     # 广播用的零标量只读，循环外建立。
-    zero32 = torch.zeros((), device=dev, dtype=torch.float32)
+    zero_acc = torch.zeros((), device=dev, dtype=_acc)
     for b0 in range(0, Bm, ch):
         b1 = min(b0 + ch, Bm)
         av = av_all[:, b0:b1]
@@ -642,12 +659,12 @@ def _pool_bwd_ref(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b, bid, dcomp,
             WinZ = torch.cat([logit_a, logit_b], dim=2)
         else:
             WinZ = logit_a
-        sc = torch.nan_to_num(torch.softmax(WinZ, dim=2)).to(torch.float32)
+        sc = torch.nan_to_num(torch.softmax(WinZ, dim=2)).to(_acc)
         sc_a, sc_b = sc[:, :, :L], (sc[:, :, L:] if has_b else None)
-        dc = dcomp[:, b0:b1].to(torch.float32)
-        gsc_a = dc[:, :, None] * _gather_rows(Xa, g_a[:, b0:b1]).to(torch.float32)
+        dc = dcomp[:, b0:b1].to(_acc)
+        gsc_a = dc[:, :, None] * _gather_rows(Xa, g_a[:, b0:b1]).to(_acc)
         if has_b:
-            gsc_b = dc[:, :, None] * _gather_rows(Xb, g_b[:, b0:b1]).to(torch.float32)
+            gsc_b = dc[:, :, None] * _gather_rows(Xb, g_b[:, b0:b1]).to(_acc)
             Srow = (gsc_a * sc_a).sum(dim=2) + (gsc_b * sc_b).sum(dim=2)
             glogit_b = sc_b * (gsc_b - Srow[:, :, None])
         else:
@@ -658,16 +675,16 @@ def _pool_bwd_ref(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b, bid, dcomp,
             in_ch = None if single_chunk else (bid_l >= b0) & (bid_l < b1)
             sel = bid_l.clamp(b0, b1 - 1)
             jA_t = (t_idx - starts_l.gather(1, sel)).clamp(0, L - 1)
-            dc_sel = dcomp.gather(1, sel[:, :, None].expand(R, T, c)).to(torch.float32)
+            dc_sel = dcomp.gather(1, sel[:, :, None].expand(R, T, c)).to(_acc)
             if need_xa:
                 # sc_a/glogit_a are chunk-local ([R, b1-b0, L, c]); rebase the
                 # global clamped block id into chunk coordinates before the
                 # lane gather (starts_l/dcomp stay global-indexed above).
                 sc_a_sel = _take_lane(sc_a, r_idx, sel - b0, jA_t)
-                gXa += (sc_a_sel * dc_sel).to(dtype) if single_chunk else torch.where(in_ch[:, :, None], sc_a_sel * dc_sel, zero32).to(dtype)
+                gXa += (sc_a_sel * dc_sel).to(dtype) if single_chunk else torch.where(in_ch[:, :, None], sc_a_sel * dc_sel, zero_acc).to(dtype)
             if need_za:
                 gl_a_sel = _take_lane(glogit_a, r_idx, sel - b0, jA_t)
-                gZa += gl_a_sel.to(dtype) if single_chunk else torch.where(in_ch[:, :, None], gl_a_sel, zero32).to(dtype)
+                gZa += gl_a_sel.to(dtype) if single_chunk else torch.where(in_ch[:, :, None], gl_a_sel, zero_acc).to(dtype)
         if has_b and (need_xb or need_zb):
             b2 = (bid_l + 1).clamp(0, Bm - 1)
             j2 = t_idx - ov_start_l.gather(1, b2)
@@ -676,12 +693,12 @@ def _pool_bwd_ref(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b, bid, dcomp,
                 ok2 = ok2 & (b2 >= b0) & (b2 < b1)
             b2c = b2.clamp(b0, b1 - 1)
             j2c = j2.clamp(0, W - 1)
-            dc2 = dcomp.gather(1, b2c[:, :, None].expand(R, T, c)).to(torch.float32)
+            dc2 = dcomp.gather(1, b2c[:, :, None].expand(R, T, c)).to(_acc)
             if need_xb:
                 sc_b_sel = _take_lane(sc_b, r_idx, b2c - b0, j2c)
-                gXb += torch.where(ok2[:, :, None], sc_b_sel * dc2, zero32).to(dtype)
+                gXb += torch.where(ok2[:, :, None], sc_b_sel * dc2, zero_acc).to(dtype)
             if need_zb:
-                gZb += torch.where(ok2[:, :, None], _take_lane(glogit_b, r_idx, b2c - b0, j2c), zero32).to(dtype)
+                gZb += torch.where(ok2[:, :, None], _take_lane(glogit_b, r_idx, b2c - b0, j2c), zero_acc).to(dtype)
         if need_bpa:
             gsum = glogit_a.sum(dim=(0, 1))
             # 前向把 pos_a 钳到 B_pos_a 末行（见上方 clamp）：超程泳道的
@@ -1127,7 +1144,10 @@ def _attn_fwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
     M = nb + w
     dev = q.device
     dtype = q.dtype
-    MINL = _finfo_min(torch.float32)
+    # fp64 attention must stay fp64; downcasting to fp32 silently overflows
+    # finite inputs.  fp16/bf16 still work in fp32, matching eager's work dtype.
+    acc = torch.promote_types(dtype, torch.float32)
+    MINL = _finfo_min(acc)
     out = torch.empty_like(q)
     t_idx = torch.arange(T, device=dev)[None, :, None]
     if valid is None:
@@ -1136,7 +1156,7 @@ def _attn_fwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
     # q/K/V are deliberately computed in float32 above; the sink logits
     # must use the same work dtype or torch.cat promotes to the input dtype
     # and the softmax/einsum then mixes (for fp16/bf16/fp64 input) dtypes.
-    sink_v = torch.nan_to_num(sink).to(torch.float32) if sink is not None else None
+    sink_v = torch.nan_to_num(sink).to(acc) if sink is not None else None
     tc = _attn_t_chunk(R, M, nh, hd)
     # t-chunk 在外、头在内：各 (t,h) 的前向计算相互独立，循环顺序交换
     # 不改变任何元素值。chunk 内的 lt_sel/sel_ok/src_win/win_ok/anyrow
@@ -1158,11 +1178,11 @@ def _attn_fwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
         anyrow = (sel_ok.any(dim=-1) | win_ok.any(dim=-1)) if sink_v is None else None
         src_sel = src32.to(torch.int64)
         for h in range(nh):
-            qh = q_heads[h][:, t0:t1].to(torch.float32)
-            Kb = _gather_rows(kb_heads[h], src_sel).to(torch.float32)
-            Kw = _gather_rows(kw_heads[h], src_win).to(torch.float32)
-            Vb = _gather_rows(vb_heads[h], src_sel).to(torch.float32)
-            Vw = _gather_rows(vw_heads[h], src_win).to(torch.float32)
+            qh = q_heads[h][:, t0:t1].to(acc)
+            Kb = _gather_rows(kb_heads[h], src_sel).to(acc)
+            Kw = _gather_rows(kw_heads[h], src_win).to(acc)
+            Vb = _gather_rows(vb_heads[h], src_sel).to(acc)
+            Vw = _gather_rows(vw_heads[h], src_win).to(acc)
             zA = torch.cat([torch.einsum('rtd,rtmd->rtm', qh, Kb), torch.einsum('rtd,rtmd->rtm', qh, Kw)], dim=-1)
             if scale != 1.0:
                 # x·1.0 is the IEEE identity; the fresh cat output is safe to
@@ -1203,7 +1223,8 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
     Bm = k_blk.shape[1]
     dev = q.device
     dtype = q.dtype
-    MINL = _finfo_min(torch.float32)
+    acc = torch.promote_types(dtype, torch.float32)
+    MINL = _finfo_min(acc)
     M = nb + w
     t_idx = torch.arange(T, device=dev)[None, :, None]
     if valid is None:
@@ -1212,7 +1233,7 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
     # q/K/V are deliberately computed in float32 above; the sink logits
     # must use the same work dtype or torch.cat promotes to the input dtype
     # and the softmax/einsum then mixes (for fp16/bf16/fp64 input) dtypes.
-    sink_v = torch.nan_to_num(sink).to(torch.float32) if sink is not None else None
+    sink_v = torch.nan_to_num(sink).to(acc) if sink is not None else None
     dq = torch.zeros_like(q) if need_dq else None
     dsoft = torch.zeros_like(soft) if (need_dsoft and soft is not None) else None
     dsink = torch.zeros_like(sink) if (need_dsink and sink is not None) else None
@@ -1229,7 +1250,8 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
         _slab_budget = max(1, int(os.environ.get('CSA_ATTN_GRAD_SLAB_MB', '64'))) << 20
     except (TypeError, ValueError):
         _slab_budget = 64 << 20
-    _per_head_bytes = 4 * hd * (
+    _acc_bytes = int(torch.empty((), dtype=acc).element_size())
+    _per_head_bytes = _acc_bytes * hd * (
         R * Bm * (int(bool(need_dkb)) + int(bool(need_dvb)))
         + R * T * (int(bool(need_dksw)) + int(bool(need_dvsw))))
     group = max(1, min(int(nh), int(_slab_budget) // max(1, int(_per_head_bytes))))
@@ -1237,12 +1259,12 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
     dv_blk = torch.empty((R, Bm, nh, hd), device=dev, dtype=dtype) if need_dvb else None
     dk_sw = torch.empty((R, T, nh, hd), device=dev, dtype=dtype) if need_dksw else None
     dv_sw = torch.empty((R, T, nh, hd), device=dev, dtype=dtype) if need_dvsw else None
-    dk_slab = torch.zeros((group, R * Bm, hd), device=dev, dtype=torch.float32) if need_dkb else None
-    dv_slab = torch.zeros((group, R * Bm, hd), device=dev, dtype=torch.float32) if need_dvb else None
-    dksw_slab = torch.zeros((group, R * T, hd), device=dev, dtype=torch.float32) if need_dksw else None
-    dvsw_slab = torch.zeros((group, R * T, hd), device=dev, dtype=torch.float32) if need_dvsw else None
-    dk_scratch = torch.zeros((R * Bm, hd), device=dev, dtype=torch.float32) if (need_dkb or need_dvb) else None
-    dksw_scratch = torch.zeros((R * T, hd), device=dev, dtype=torch.float32) if (need_dksw or need_dvsw) else None
+    dk_slab = torch.zeros((group, R * Bm, hd), device=dev, dtype=acc) if need_dkb else None
+    dv_slab = torch.zeros((group, R * Bm, hd), device=dev, dtype=acc) if need_dvb else None
+    dksw_slab = torch.zeros((group, R * T, hd), device=dev, dtype=acc) if need_dksw else None
+    dvsw_slab = torch.zeros((group, R * T, hd), device=dev, dtype=acc) if need_dvsw else None
+    dk_scratch = torch.zeros((R * Bm, hd), device=dev, dtype=acc) if (need_dkb or need_dvb) else None
+    dksw_scratch = torch.zeros((R * T, hd), device=dev, dtype=acc) if (need_dksw or need_dvsw) else None
 
     for h0 in range(0, nh, group):
         h1 = min(h0 + group, nh)
@@ -1262,7 +1284,7 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
             win_ok = win_raw[:, t0:t1, :] >= 0
             lane_ok = torch.cat([sel_ok, win_ok], dim=-1)
             anyrow = (sel_ok.any(dim=-1) | win_ok.any(dim=-1)) if sink_v is None else None
-            soft_c = soft[:, t0:t1, :].to(torch.float32) if soft is not None else None
+            soft_c = soft[:, t0:t1, :].to(acc) if soft is not None else None
             seg_b_c = None
             if need_dkb or need_dvb:
                 kb_keys = r_idx.expand(R, t1 - t0, nb) * Bm + src64
@@ -1275,12 +1297,12 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
                 del kw_keys
             for h in range(h0, h1):
                 hi = h - h0
-                qh = q_heads[h][:, t0:t1].to(torch.float32)
-                dOh = dO_heads[h][:, t0:t1].to(torch.float32)
-                Kb = _gather_rows(kb_heads[h], src64).to(torch.float32)
-                Kw = _gather_rows(kw_heads[h], src_win).to(torch.float32)
-                Vb = _gather_rows(vb_heads[h], src64).to(torch.float32)
-                Vw = _gather_rows(vw_heads[h], src_win).to(torch.float32)
+                qh = q_heads[h][:, t0:t1].to(acc)
+                dOh = dO_heads[h][:, t0:t1].to(acc)
+                Kb = _gather_rows(kb_heads[h], src64).to(acc)
+                Kw = _gather_rows(kw_heads[h], src_win).to(acc)
+                Vb = _gather_rows(vb_heads[h], src64).to(acc)
+                Vw = _gather_rows(vw_heads[h], src_win).to(acc)
                 Kl = torch.cat([Kb, Kw], dim=-2)
                 Vl = torch.cat([Vb, Vw], dim=-2)
                 zA = torch.cat([torch.einsum('rtd,rtmd->rtm', qh, Kb), torch.einsum('rtd,rtmd->rtm', qh, Kw)], dim=-1)

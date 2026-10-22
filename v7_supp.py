@@ -1541,13 +1541,15 @@ def run_warmup(cfg, seeds, guard=None, label='', warm_grid=(0, 5000, 10000), var
             _cell_recs[_k]['warm_steps'] = int(_w.replace('w', ''))
         except Exception:
             continue
-    _write_phase_manifest(outdir, cfg, _fp, _panel_prov, phase='warmup', planned_cells=_planned, cell_records=_cell_recs, status='complete', started_at=_panel_started, data_contract=_data_contract)
+    _missing_warm = [k for k in _planned if k not in _cell_recs]
+    _warm_status = 'complete' if not _missing_warm else 'incomplete'
+    _write_phase_manifest(outdir, cfg, _fp, _panel_prov, phase='warmup', planned_cells=_planned, cell_records=_cell_recs, status=_warm_status, started_at=_panel_started, data_contract=_data_contract)
     L.log_experiment_event(outdir, {
         'kind': 'panel_finish', 'tracking_schema': 2, 'label': label or outdir,
         'phase': 'warmup', 'started_at': _panel_started,
         'finished_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
-        'n_cells_planned': len(cells), 'n_cells_measured': _measured,
-        'n_cells_missing': max(0, len(cells) - _measured),
+        'n_cells_planned': len(cells), 'n_cells_measured': len(_cell_recs),
+        'n_cells_missing': len(_missing_warm),
         'n_stale_dropped': len(stale_dropped),
         'n_truncated': len(dropped_truncations),
         'summary_ref': os.path.basename(spath), 'code': CKPT_CODE,
@@ -2963,16 +2965,18 @@ def run_lenphase(payload, guard=None, label='', par=None):
             _len_cells[_k]['eval_lens'] = list(eval_lens)
         except Exception:
             continue
+    _missing_len = [k for k in _planned_len if k not in _len_cells]
+    _len_status = 'complete' if not _missing_len else 'incomplete'
     _write_phase_manifest(outdir, {'seeds': seeds, 'variants': list(variants), 'seq_len': train_len},
                           _len_panel_cfg, _panel_prov, phase='lenphase',
                           planned_cells=_planned_len, cell_records=_len_cells,
-                          status='complete', started_at=_panel_started)
+                          status=_len_status, started_at=_panel_started)
     L.log_experiment_event(outdir, {
         'kind': 'panel_finish', 'tracking_schema': 2, 'label': label or outdir,
         'phase': 'lenphase', 'started_at': _panel_started,
         'finished_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
-        'n_cells_planned': len(cells), 'n_cells_measured': _measured,
-        'n_cells_missing': max(0, len(cells) - _measured),
+        'n_cells_planned': len(cells), 'n_cells_measured': len(_len_cells),
+        'n_cells_missing': len(_missing_len),
         'summary_ref': os.path.basename(spath),
         'provenance': _panel_prov, 'code': CKPT_CODE,
     })

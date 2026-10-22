@@ -163,7 +163,9 @@ def sample_std(deltas, axis=None):
         # bitwise-identical.
         if not np.isfinite(d).all():
             d = d[np.isfinite(d)]
-        return float(np.std(d, ddof=1)) if d.size > 1 else 0.0
+        # ddof=1 is undefined for fewer than two finite values; a zero here
+        # would falsely report "no spread measured" as a measured zero.
+        return float(np.std(d, ddof=1)) if d.size > 1 else float('nan')
     if not isinstance(axis, (int, np.integer)):
         raise TypeError(f'axis must be an integer, got {axis!r}')
     axis = int(axis)
@@ -173,12 +175,12 @@ def sample_std(deltas, axis=None):
         raise ValueError(f'axis {axis} is out of bounds for an array with {d.ndim} dimension(s)')
     out_shape = d.shape[:axis] + d.shape[axis + 1:]
     if d.shape[axis] < 2:
-        return np.zeros(out_shape)
+        return np.full(out_shape, np.nan)
     srt = np.moveaxis(d, axis, 0).reshape(d.shape[axis], -1)
-    out = np.zeros(srt.shape[1])
+    out = np.full(srt.shape[1], np.nan)
     for j in range(srt.shape[1]):
         col = srt[:, j][np.isfinite(srt[:, j])]
-        out[j] = float(np.std(col, ddof=1)) if col.size > 1 else 0.0
+        out[j] = float(np.std(col, ddof=1)) if col.size > 1 else float('nan')
     return out.reshape(out_shape)
 
 def _row_nanmean(M):
