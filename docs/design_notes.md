@@ -2156,3 +2156,95 @@ python test_open_block.py            # 15/15
 
 L104 覆盖「包装器恢复配对 dPPL + 混代码戳拆分 + nested 标签」；L105 覆盖
 代码语义进入 arm/control 身份；L106 覆盖确认准入的参数绑定与逐种子一致性。
+
+## 42. 确认结论的稳健性：脆弱性指数与逐种子 Holm 重算（本轮结果分析硬化）
+
+本轮只改结果分析层，不新增 GPU 面板，不改冻结清单的臂/种子/终点/α/族，
+也不改训练或测量数值（`CODE_SEMANTICS` 不变）。目标是把「显著」之外的第二个
+问题写进报告：**这个判定有多依赖个别种子？**
+
+### 42.1 为什么需要它
+
+`finaltest_stats` 已经报告逐种子 Δ、均值、精确符号翻转 p、Holm p 与逐文档
+区间，但没有任何读数回答「删掉一个种子后，Holm 拒绝集合是否还成立」。
+`paired_effect_stats.seed_driven` 只检查**均值符号**是否被单个种子翻转，
+既没有进入冻结确认分析，也看不到「均值不翻、但 p 因一个种子越过 α」的情形。
+一个 12 种子的冻结 panel 若由 11 个微小同向差 + 1 个极大同向差支撑，均值与
+p 都可能很好看，但结论对那一个种子高度敏感。报告若不写这件事，读者会把
+「确认」误读成「稳健」。
+
+### 42.2 两个核心脆弱性读数（外加逐种子 LOO 与区间）
+
+`exp_lib.paired_fragility(deltas, seeds=...)` 复用同一个精确符号翻转检验，
+对每个子集重算 p（确定性、无 Monte-Carlo），给出：
+
+- `drop_fragility`：反复删除当前 |Δ| 最小的种子、p 仍 < α 的最大次数。
+  `0` 表示删掉最弱的一个种子就已经不显著；数值越大，判定越不依赖单点。
+- `flip_fragility`：按 |Δ| 从小到大翻转**同向**种子的符号，直到 p ≥ α 或
+  均值方向反转所需的翻转次数。它是贪心影响上界，**不是**精确最小翻转集；
+  `definition` 字段随数值一起落盘，避免被读成精确最小值。
+- `loo`：逐种子删除后的 mean/p、`p_increase`、`p_shift=|Δp|`、
+  `removes_significance`、`flips_direction`；`most_influential_seed` 按
+  **绝对 p 位移**取最大（不是只看 p 增大：删除一个反向种子让 null panel
+  变显著，同样是单点依赖）；等幅数据下所有种子并列，`most_influential_tied_count`
+  明确写出并列数，报告不把任意一个种子写成唯一驱动。
+- 回归到均值的 t 区间 `ci95_low/high` 与 `ci_excludes_zero`，用来看
+  「精确检验显著」与「区间排除 0」是否一致；报告的稳健性表同时打印
+  `Δ mean [95% CI]`，不让读者只拿到一个 p 值。
+
+数值本身不进入任何判定：函数只返回诊断字典。
+
+### 42.3 族级：删一个种子后重算整个 Holm
+
+`exp_lib.holm_decision_jackknife(named_paired, family_names=...)` 对种子并集
+的每个种子做一次 fold：包含该种子的比较删掉该对后重算精确 p，不包含的
+比较保留全 panel p；随后对整个族重算 Holm，并用与冻结决策一致的严格
+`p_holm < alpha` 回放拒绝集合。输出 `rejected_full`、每个 fold 的
+`rejected/lost/gained`、`always_rejected`、`sometimes_rejected`、
+`unstable_folds` 与逐比较的 `p_holm_min/max`。
+
+`family_names` 是**声明族**：没有可算 Δ 的比较仍以 p=1 占位。若省略这一点，
+一个缺失臂会让 jackknife 的 m 从 6 缩到 5，Holm 校正反而变松——这正是
+`holm_adjust` / `attach_holm` 一直在防的「少报比较缩小族」。
+
+### 42.4 与冻结决策的边界
+
+- `v12_supp.finaltest_stats` 只在原有 `confirmed` 算完之后追加
+  `stats['robustness']`；`confirmed`、`p`、`p_holm`、Holm 族、α 与
+  `min_seeds_for_confirmation` 全部不改写。报告中的新表明确标注
+  「post-hoc 诊断；不改变上面的冻结判定」。当
+  `all_rejections_stable=false` 时另打印「解读提示」：判定仍按预注册规则
+  成立，但**不得**被描述为「对种子稳健」，引用时必须同时报告敏感度。
+- `require_complete_coverage` **不在** jackknife 内重放：删任何一个种子都会
+  使覆盖失败，若重放则该门按构造必然失败，等于没有信息。因此另设
+  `confirmed_without_coverage_full` /
+  `confirmed_without_coverage_by_fold` /
+  `confirmed_without_coverage_stable`，只重放方向 + 参数 + 最小 n 的判定，
+  并在 `coverage_gate_note` 说明覆盖门仍属于冻结决策。
+- `confirmation_robustness` 的 `family_size` 取冻结清单声明的 m；若传入值
+  小于实际比较数则**拒绝**，不靠缩小族来放松 Holm。逐比较另给
+  `min_same_sign_for_family_gate`（等幅投影下界，仅作规划参照；
+  `same_sign_margin` 不替代精确检验）。
+
+### 42.5 文档层广度：均值是否被单个文档支撑
+
+`v12_supp._doc_level_analysis` 新增 `doc_delta_negative/positive/zero`、
+`doc_a_better_fraction`、`per_doc_delta_median` 与
+`top_doc_abs_share = max|Δ_doc| / Σ|Δ_doc|`。这些是描述性读数（文档不是臂的
+随机化单位），但能暴露「一个文档贡献了几乎全部均值差」的赢法；逐文档
+bootstrap 区间仍然以已训练种子为条件。p5t 主表的「文档 Δ 95% CI」单元格
+同时显示 `Δ<0` 的文档占比，避免只看均值与区间。
+
+### 42.6 入口与验证
+
+```bash
+python test_review_fixes.py     # L107-L109
+python v12_supp.py plan         # 冻结预检不变：72/72 合成记录、6 个主比较
+```
+
+L107 覆盖 drop/flip/LOO、种子对齐、非法输入、族门投影（n=6 无法通过
+Holm/6 时返回 None），以及
+「删除 n=6 比较的一个种子后 Holm 拒绝丢失、n=12 比较保持」和
+`family_names` 不缩小 m；L108 覆盖 v12 集成只追加 `robustness`、不修改
+`confirmed`/`holm`、覆盖门不被重放，以及 Markdown 渲染；L109 覆盖文档层
+广度读数与行长不一致时的拒绝。

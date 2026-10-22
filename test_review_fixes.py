@@ -16874,6 +16874,215 @@ def t_confirmation_parameter_binding():
     assert d4['param_match_complete'] is True and d4['param_matched'] is False, d4
 
 
+def t_paired_fragility_and_seed_drop_jackknife():
+    # 12 equal same-sign deltas: the exact test is at its floor; the verdict
+    # survives dropping six least-influential seeds and needs three flips
+    # before p >= alpha.
+    d12 = [0.5] * 12
+    r = L.paired_fragility(d12, seeds=list(range(12)))
+    assert r['n'] == 12 and r['n_nonzero'] == 12, r
+    assert abs(r['p'] - L.signflip_p_floor(12)) < 1e-15, r
+    assert r['same_sign_count'] == 12 and r['same_sign_fraction'] == 1.0, r
+    assert r['drop_fragility'] == 6, r['drop_fragility']
+    assert r['flip_fragility'] == 3 and r['flip_stop_reason'] == 'p>=alpha', r
+    assert r['ci_excludes_zero'] is True, r
+    assert r['most_influential_tied_count'] == 12, r
+    assert len(r['loo']) == 12 and r['loo_p_min'] == r['loo_p_max'], r
+    assert all(not v['removes_significance'] for v in r['loo']), r['loo']
+    # A borderline n=6 panel: one seed removal already overturns the raw test.
+    r6 = L.paired_fragility([0.5] * 6, seeds=list(range(6)))
+    assert r6['drop_fragility'] == 0, r6['drop_fragility']
+    assert all(v['removes_significance'] for v in r6['loo']), r6['loo']
+    assert r6['flip_fragility'] == 1, r6
+    # A contrary outlier is the most influential seed and kills the panel.
+    r_out = L.paired_fragility([0.5] * 11 + [-10.0], seeds=list(range(12)))
+    assert r_out['p'] >= 0.05 and r_out['flip_fragility'] == 0, r_out
+    # Influence is the ABSOLUTE p change: removing the contrary seed makes the
+    # panel significant, which the signed p-increase alone would hide.
+    assert r_out['most_influential_seed'] == 11, r_out['most_influential_seed']
+    assert r_out['most_influential_p_shift'] > 0.9, r_out['most_influential_p_shift']
+    assert r_out['most_influential_tied_count'] == 1, r_out
+    # Dropped non-finite values keep their seed label out of the LOO pass.
+    r_nan = L.paired_fragility([0.5, float('nan'), 0.5, 0.5, 0.5],
+                               seeds=[0, 1, 2, 3, 4])
+    assert r_nan['n'] == 4 and r_nan['n_dropped'] == 1, r_nan
+    assert [v['seed'] for v in r_nan['loo']] == [0, 2, 3, 4], r_nan['loo']
+    # Degenerate inputs are reported, not crashed.
+    r1 = L.paired_fragility([0.5], seeds=[7])
+    assert r1['n'] == 1 and r1['flip_fragility'] == 0, r1
+    r0 = L.paired_fragility([], seeds=[])
+    assert r0['n'] == 0 and r0['drop_fragility'] is None, r0
+    # Seed identity contract: length/duplicate/type errors are explicit.
+    for _bad in (lambda: L.paired_fragility([0.1, 0.2], seeds=[0]),
+                 lambda: L.paired_fragility([0.1, 0.2], seeds=[0, 0]),
+                 lambda: L.paired_fragility([0.1, 0.2], seeds=[0, 1.5]),
+                 lambda: L.paired_fragility([0.1, 0.2], seeds=[0, True]),
+                 lambda: L.paired_fragility('ab'),
+                 lambda: L.paired_fragility([0.1, 0.2], seeds='01'),
+                 lambda: L.paired_fragility(3)):
+        try:
+            _bad()
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('malformed fragility input must raise ValueError')
+    for _bad_alpha in (True, 0, 1.0, 1.5, 'x'):
+        try:
+            L.paired_fragility([0.1, 0.2], alpha=_bad_alpha)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('invalid fragility alpha must raise ValueError')
+    # Family jackknife: dropping a seed from the n=6 comparison loses it,
+    # while the n=12 comparison keeps its Holm rejection in every fold.
+    fam = L.holm_decision_jackknife({
+        'fragile': {'deltas': [0.5] * 6, 'seeds': list(range(6))},
+        'stable': {'deltas': [0.5] * 12, 'seeds': list(range(12))},
+    }, alpha=0.05)
+    assert fam['rejected_full'] == ['fragile', 'stable'], fam['rejected_full']
+    assert fam['unstable_folds'] == list(range(6)), fam['unstable_folds']
+    assert fam['always_rejected'] == ['stable'], fam['always_rejected']
+    assert fam['sometimes_rejected'] == ['fragile'], fam['sometimes_rejected']
+    assert fam['all_rejections_stable'] is False, fam
+    _lost = next(f for f in fam['folds'] if f['seed'] == 0)
+    assert _lost['lost'] == ['fragile'], _lost
+    assert _lost['n_pairs']['fragile'] == 5, _lost['n_pairs']
+    # A seed absent from a comparison leaves that comparison's full p intact.
+    _absent = next(f for f in fam['folds'] if f['seed'] == 6)
+    assert _absent['n_pairs']['fragile'] == 6, _absent['n_pairs']
+    assert _absent['raw_p']['fragile'] == L.exact_signflip_p([0.5] * 6)['p'], _absent
+    # A declared-but-omitted comparison keeps its p=1 family slot: with m=3 the
+    # n=6 comparison (raw p=0.03125) is no longer Holm-rejected, which is the
+    # correct correction and the opposite of silently shrinking m to 2.
+    fam_decl = L.holm_decision_jackknife({
+        'fragile': {'deltas': [0.5] * 6, 'seeds': list(range(6))},
+        'stable': {'deltas': [0.5] * 12, 'seeds': list(range(12))},
+    }, alpha=0.05, family_names=['omitted'])
+    assert fam_decl['n_comparisons'] == 3, fam_decl
+    assert fam_decl['rejected_full'] == ['stable'], fam_decl['rejected_full']
+    assert 'omitted' in fam_decl['never_rejected'], fam_decl['never_rejected']
+    assert fam_decl['per_comparison']['omitted']['p_holm_min'] == 1.0, fam_decl
+    for _bad_family in ('ab', b'ab', 3):
+        try:
+            L.holm_decision_jackknife({'x': [0.5, 0.5]}, family_names=_bad_family)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('a non-iterable/string family_names must raise ValueError')
+    # The composed helper keeps the declared family size and never edits p.
+    rob = L.confirmation_robustness(
+        {'fragile': {'deltas': [0.5] * 6, 'seeds': list(range(6))}},
+        alpha=0.05, family_size=6, confirmed=['fragile'])
+    assert rob['family_size'] == 6, rob
+    # n=6 cannot clear a Holm/6 gate even with 6/6 same-sign pairs, so the
+    # planning margin is explicitly None (not a fabricated 6).
+    assert rob['per_comparison']['fragile']['min_same_sign_for_family_gate'] is None, rob
+    assert rob['per_comparison']['fragile']['same_sign_margin'] is None, rob
+    assert rob['confirmed_full'] == ['fragile'], rob
+    assert rob['summary']['all_holm_rejections_stable_under_one_seed_drop'] is False, rob
+    assert 'does not change the reported p' in rob['per_comparison']['fragile']['note']
+    # A declared family smaller than the supplied comparisons must fail closed
+    # instead of silently relaxing the Holm correction.
+    try:
+        L.confirmation_robustness(
+            {'a': {'deltas': [0.5] * 6, 'seeds': list(range(6))},
+             'b': {'deltas': [0.5] * 6, 'seeds': list(range(6))}},
+            alpha=0.05, family_size=1)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('family_size smaller than the comparison set must be refused')
+
+
+def t_confirmation_robustness_never_edits_the_verdict():
+    pairs = {'cmp': {'deltas': [0.5] * 6, 'seeds': list(range(6))}}
+    stats = {'comparisons': {'cmp': {
+                 'direction_ok': True, 'param_matched': True,
+                 'param_match_complete': True, 'n_effective': 6,
+                 'min_seeds_for_confirmation': 3, 'seeds': list(range(6))}},
+             'holm': {'cmp': {'p_holm': 0.01}},
+             'confirmed': ['cmp']}
+    before = dict(stats)
+    rob = V12._confirmation_robustness_block(
+        stats, pairs, alpha=0.05, family_size=6, param_required=True)
+    assert rob is not None and stats['robustness'] is rob, stats
+    # The frozen verdict itself is untouched: the helper only adds a block.
+    assert stats['confirmed'] == ['cmp'] and stats['holm'] == before['holm'], stats
+    assert rob['confirmed_without_coverage_full'] == ['cmp'], rob
+    assert rob['confirmed_without_coverage_by_fold'] == {
+        '0': [], '1': [], '2': [], '3': [], '4': [], '5': []}, rob
+    assert rob['confirmed_without_coverage_stable'] is False, rob
+    assert 'complete-coverage rule is not replayed' in rob['coverage_gate_note']
+    # The rendered section carries the boundary verbatim and names the row.
+    md = V12._robustness_markdown(rob)
+    assert md and '结论稳健性' in md[0], md
+    assert any('post-hoc' in line for line in md), md
+    assert any('| cmp |' in line for line in md), md
+    assert any('不能被描述为' in line for line in md), md
+    assert any('并列 6 个' in line for line in md), md
+    _cmp_row = next(line for line in md if line.startswith('| cmp |'))
+    assert '[' in _cmp_row and ']' in _cmp_row, _cmp_row
+    assert V12._robustness_markdown({}) == []
+    assert V12._robustness_markdown(None) == []
+    # A declared-but-omitted comparison stays in the family jackknife at p=1.
+    stats_omit = {'comparisons': {'cmp': dict(stats['comparisons']['cmp'])},
+                  'holm': dict(stats['holm']), 'confirmed': ['cmp']}
+    rob_omit = V12._confirmation_robustness_block(
+        stats_omit, {'cmp': pairs['cmp']}, alpha=0.05, family_size=6,
+        param_required=True, family_names=['cmp', 'omitted'])
+    assert rob_omit['family_jackknife']['n_comparisons'] == 2, rob_omit['family_jackknife']
+    assert 'omitted' in rob_omit['family_jackknife']['never_rejected'], rob_omit
+    # A stable n=12 comparison keeps the direction/parameter verdict in every
+    # fold, so the same block reports stability rather than a false alarm.
+    pairs12 = {'cmp': {'deltas': [0.5] * 12, 'seeds': list(range(12))}}
+    stats12 = {'comparisons': {'cmp': {
+                   'direction_ok': True, 'param_matched': True,
+                   'param_match_complete': True, 'n_effective': 12,
+                   'min_seeds_for_confirmation': 3, 'seeds': list(range(12))}},
+               'holm': {'cmp': {'p_holm': 0.01}}, 'confirmed': ['cmp']}
+    rob12 = V12._confirmation_robustness_block(
+        stats12, pairs12, alpha=0.05, family_size=6, param_required=True)
+    assert rob12['confirmed_without_coverage_stable'] is True, rob12
+    # A panel sitting exactly on the declared seed floor cannot survive a drop:
+    # the n-gate is replayed alongside direction/parameters (only complete
+    # coverage is not).
+    stats_floor = {'comparisons': {'cmp': dict(
+                       stats12['comparisons']['cmp'], min_seeds_for_confirmation=12)},
+                   'holm': {'cmp': {'p_holm': 0.01}}, 'confirmed': ['cmp']}
+    rob_floor = V12._confirmation_robustness_block(
+        stats_floor, pairs12, alpha=0.05, family_size=6, param_required=True)
+    assert rob_floor['confirmed_without_coverage_full'] == ['cmp'], rob_floor
+    assert rob_floor['confirmed_without_coverage_by_fold'] == {
+        str(s): [] for s in range(12)}, rob_floor
+    assert rob_floor['confirmed_without_coverage_stable'] is False, rob_floor
+    # No pairs -> no block (an omitted comparison cannot fabricate robustness).
+    stats3 = {'comparisons': {}, 'holm': {}, 'confirmed': []}
+    assert V12._confirmation_robustness_block(
+        stats3, {}, alpha=0.05, family_size=6, param_required=False) is None
+    assert 'robustness' not in stats3, stats3
+
+
+def t_doc_level_breadth_diagnostics():
+    na = [1.0, 2.0, 3.0, 100.0]
+    nb = [2.0, 2.0, 2.0, 2.0]
+    recs_a = {s: {'by_len': {512: {'ppl_per_seq': list(na)}}} for s in (0, 1)}
+    recs_b = {s: {'by_len': {512: {'ppl_per_seq': list(nb)}}} for s in (0, 1)}
+    got = V12._doc_level_analysis(recs_a, recs_b, [0, 1], 512)
+    assert got is not None, got
+    # Δ = a-b per document: [-1, 0, +1, +98].
+    assert got['doc_delta_negative'] == 1, got
+    assert got['doc_delta_positive'] == 2, got
+    assert got['doc_delta_zero'] == 1, got
+    assert abs(got['doc_a_better_fraction'] - 0.25) < 1e-12, got
+    assert abs(got['per_doc_delta_median'] - 0.5) < 1e-12, got
+    assert abs(got['top_doc_abs_share'] - 98.0 / 100.0) < 1e-12, got
+    assert 'outlier-sensitive' in got['breadth_note'], got
+    # Mismatched per-document row counts are refused, not silently truncated.
+    bad_a = {s: {'by_len': {512: {'ppl_per_seq': [1.0, 2.0]}}} for s in (0, 1)}
+    refused = V12._doc_level_analysis(bad_a, recs_b, [0, 1], 512)
+    assert refused is not None and refused['comparable'] is False, refused
+
+
 def t_window_geometry_is_built_per_chunk():
     # The full [n, w] window table is O(n*w) and is only consumed by the
     # full-width mask hoist.  The row-chunked attention path must build the
@@ -17363,6 +17572,9 @@ def main():
     _check('L104 aggregate wrapper preserves paired dPPL and splits code stamps', t_aggregate_wrapper_preserves_pairs_and_splits_code)
     _check('L105 code semantics enter arm/control identity', t_code_semantics_enters_arm_and_control_identity)
     _check('L106 confirmation binds parameter counts per seed', t_confirmation_parameter_binding)
+    _check('L107 paired fragility + seed-drop family jackknife', t_paired_fragility_and_seed_drop_jackknife)
+    _check('L108 confirmation robustness never edits the verdict', t_confirmation_robustness_never_edits_the_verdict)
+    _check('L109 document-level breadth diagnostics', t_doc_level_breadth_diagnostics)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

@@ -11552,6 +11552,429 @@ def paired_effect_stats(deltas, alpha=0.05, min_n=3, with_values=None, without_v
             'ci95_paired_bootstrap': _paired_ci, 'ci95_unpaired_bootstrap': _unpaired_ci,
             **_pair_fields}
 
+# ---- 结果稳健性：脆弱性指数与「丢掉一个种子」的族级判定重算 ------------------
+# 统计显著不等于结论稳健：n 个种子里如果有一个特别大或方向相反，删掉它
+# 可能就翻转方向或让 Holm 门失守。下面的函数**只做 post-hoc 诊断**，不
+# 重算、也不改写冻结判定；它们回答的是「这个判定有多依赖个别种子」。
+# 与 `paired_effect_stats.seed_driven`（只看均值符号）相比，这里重算的是
+# 检验本身与整个 Holm 族，因此能发现「均值不翻、但校正后不再显著」的情形。
+
+def _paired_payload(deltas, seeds=None, *, where='paired analysis'):
+    """Normalise a paired-delta payload to ``(d, seed_labels, kept_positions,
+    n_input)``.  Non-finite deltas are dropped, and their seed labels are
+    dropped with them, so a later leave-one-seed-out pass cannot silently
+    pair a value with the wrong seed."""
+    if isinstance(deltas, (str, bytes)):
+        raise ValueError(f'{where}: deltas must be an iterable of numbers, not a string')
+    try:
+        raw = list(deltas if deltas is not None else [])
+    except TypeError:
+        raise ValueError(f'{where}: deltas must be an iterable') from None
+    if seeds is not None:
+        if isinstance(seeds, (str, bytes)):
+            raise ValueError(f'{where}: seeds must be an iterable of integers, not a string')
+        try:
+            sl = list(seeds)
+        except TypeError:
+            raise ValueError(f'{where}: seeds must be an iterable') from None
+        if len(sl) != len(raw):
+            raise ValueError(f'{where}: seeds length {len(sl)} does not match deltas length {len(raw)}')
+        norm = [_as_seed_int(s) for s in sl]
+        if any(s is None for s in norm):
+            raise ValueError(f'{where}: seeds must be integers ({sl!r})')
+        if len(set(norm)) != len(norm):
+            raise ValueError(f'{where}: duplicate seeds {norm!r}')
+    else:
+        norm = list(range(len(raw)))
+    d, labels, keep = [], [], []
+    for i, x in enumerate(raw):
+        f = _finite_scalar(x)
+        if f is None:
+            continue
+        d.append(f)
+        labels.append(norm[i])
+        keep.append(i)
+    return np.asarray(d, dtype=float), labels, keep, len(raw)
+
+
+def paired_fragility(deltas, *, alpha=0.05, seeds=None):
+    """Post-hoc fragility readout for one paired sign-flip contrast.
+
+    Reports how much of the significance rests on individual seeds:
+
+    ``drop_fragility``
+        The largest k such that repeatedly removing the *least influential*
+        remaining seed (smallest |delta|) still leaves the exact sign-flip
+        p < alpha.  ``0`` means removing even the smallest seed already
+        overturns the raw test; a large k means the verdict does not need any
+        single seed.
+    ``flip_fragility``
+        The number of same-direction seeds (smallest |delta| first) whose sign
+        must be flipped before the test stops rejecting OR the mean changes
+        direction.  This is a greedy influence bound, not a claim that no
+        smaller set of flips could do it; the definition is reported with the
+        number so the readout cannot be mistaken for an exact minimum.
+    ``loo``
+        Per-seed leave-one-out mean/p.  ``removes_significance`` marks the
+        seeds whose removal alone lifts p to/above alpha; ``flips_direction``
+        marks those whose removal reverses the mean sign.
+
+    None of these changes the p-value, the Holm family or a frozen decision.
+    The exact sign-flip test is reused on every subset, so the readout is
+    deterministic and carries the same ``method``/``p_floor`` contract.
+    """
+    alpha = _validated_alpha(alpha, context='paired_fragility alpha')
+    d, labels, _keep, n_input = _paired_payload(deltas, seeds, where='paired_fragility')
+    n = int(d.size)
+    n_dropped = n_input - n
+    out = {'kind': 'paired_fragility', 'unit': 'seed', 'alpha': alpha,
+           'n': n, 'n_input': n_input, 'n_dropped': n_dropped,
+           'seeds': labels, 'per_seed': [float(x) for x in d.tolist()],
+           'mean': float('nan'), 'std': float('nan'), 'sem': float('nan'),
+           'ci95_low': float('nan'), 'ci95_high': float('nan'),
+           'ci_excludes_zero': None,
+           'p': float('nan'), 'p_floor': float('nan'), 'p_signal': False,
+           'n_nonzero': 0, 'sign_counts': {'positive': 0, 'negative': 0, 'zero': 0},
+           'direction': None, 'same_sign_count': 0, 'same_sign_fraction': None,
+           'drop_fragility': None, 'flip_fragility': None,
+           'flip_stop_reason': None,
+           'loo': [], 'most_influential_seed': None,
+           'most_influential_p_increase': None, 'most_influential_p_shift': None,
+           'most_influential_tied_count': None,
+           'loo_p_min': None, 'loo_p_max': None,
+           'method': 'none',
+           'definition': ('drop_fragility = least-influential seeds removable while the exact '
+                          'sign-flip p stays < alpha; flip_fragility = smallest-|delta| '
+                          'same-direction signs that must flip before p >= alpha or the mean '
+                          'direction reverses (greedy, not an exact minimum).'),
+           'note': ('post-hoc influence diagnostic only; it does not change the reported p, '
+                    'the Holm family, or any frozen decision')}
+    if n == 0:
+        return out
+    mean = float(d.mean())
+    std = float(d.std(ddof=1)) if n > 1 else float('nan')
+    sem = float(std / math.sqrt(n)) if (n > 1 and math.isfinite(std)) else float('nan')
+    ci_lo = ci_hi = float('nan')
+    if n > 1 and math.isfinite(sem):
+        tc = _t_critical(0.95, n - 1)
+        if math.isfinite(tc):
+            ci_lo, ci_hi = mean - tc * sem, mean + tc * sem
+    sf = exact_signflip_p(d)
+    p = float(sf['p'])
+    n_nonzero = int(sf.get('n_nonzero') or 0)
+    pos = int((d > 0).sum())
+    neg = int((d < 0).sum())
+    zero = int((d == 0).sum())
+    if mean > 0:
+        direction = 'positive'
+    elif mean < 0:
+        direction = 'negative'
+    else:
+        direction = None
+    same = pos if direction == 'positive' else (neg if direction == 'negative' else max(pos, neg))
+    out.update({'mean': mean, 'std': std, 'sem': sem,
+                'ci95_low': float(ci_lo), 'ci95_high': float(ci_hi),
+                'ci_excludes_zero': (None if not (math.isfinite(ci_lo) and math.isfinite(ci_hi))
+                                     else bool(ci_lo > 0.0 or ci_hi < 0.0)),
+                'p': p, 'p_floor': sf.get('p_floor'), 'p_signal': bool(p < alpha),
+                'n_nonzero': n_nonzero,
+                'sign_counts': {'positive': pos, 'negative': neg, 'zero': zero},
+                'direction': direction, 'same_sign_count': int(same),
+                'same_sign_fraction': (float(same / n) if n else None),
+                'method': sf.get('method')})
+    # ---- least-influential-seed deletion -----------------------------------
+    if n >= 3:
+        if not (p < alpha):
+            out['drop_fragility'] = 0
+        else:
+            kept = np.ones(n, dtype=bool)
+            k = 0
+            while int(kept.sum()) > 2:
+                _abs = np.where(kept, np.abs(d), np.inf)
+                idx = int(np.argmin(_abs))
+                trial = kept.copy()
+                trial[idx] = False
+                if float(exact_signflip_p(d[trial])['p']) < alpha:
+                    kept = trial
+                    k += 1
+                else:
+                    break
+            out['drop_fragility'] = int(k)
+    # ---- greedy sign-flip influence ----------------------------------------
+    if n >= 1:
+        if (not (p < alpha)) or direction is None:
+            out['flip_fragility'] = 0
+            out['flip_stop_reason'] = ('not significant at the full panel'
+                                       if not (p < alpha) else 'no mean direction')
+        else:
+            _sign = 1.0 if direction == 'positive' else -1.0
+            same_idx = [i for i in range(n) if d[i] * _sign > 0]
+            same_idx.sort(key=lambda i: (abs(float(d[i])), i))
+            cur = d.copy()
+            k = 0
+            reason = 'direction reversed'
+            while k < len(same_idx):
+                i = same_idx[k]
+                cur[i] = -cur[i]
+                k += 1
+                p_new = float(exact_signflip_p(cur)['p'])
+                m_new = float(cur.mean())
+                if p_new >= alpha:
+                    reason = 'p>=alpha'
+                    break
+                if (m_new > 0) != (direction == 'positive') or m_new == 0.0:
+                    reason = 'direction reversed'
+                    break
+            out['flip_fragility'] = int(k)
+            out['flip_stop_reason'] = reason
+    # ---- per-seed leave-one-out -------------------------------------------
+    if n >= 2:
+        loo = []
+        for i in range(n):
+            sub = np.delete(d, i)
+            sf_i = exact_signflip_p(sub)
+            p_i = float(sf_i['p'])
+            m_i = float(sub.mean())
+            loo.append({'seed': labels[i], 'n': int(sub.size), 'mean': m_i,
+                        'p': p_i,
+                        'mean_shift': float(m_i - mean),
+                        'p_increase': float(p_i - p) if math.isfinite(p_i) else None,
+                        'p_shift': (abs(float(p_i) - p) if math.isfinite(p_i) else None),
+                        'removes_significance': bool(math.isfinite(p_i) and p < alpha and p_i >= alpha),
+                        'flips_direction': bool(mean != 0.0 and (m_i == 0.0 or (m_i > 0) != (mean > 0)))})
+        out['loo'] = loo
+        # Influence is the ABSOLUTE change in the test, not only an increase:
+        # removing a contrary seed can turn a null panel significant, which is
+        # just as much a single-seed dependence as dropping a supportive one.
+        _rank = [(v.get('p_shift') if isinstance(v.get('p_shift'), float) else float('-inf'),
+                  abs(v.get('mean_shift') or 0.0), -i, v) for i, v in enumerate(loo)]
+        _best = max(_rank, key=lambda t: (t[0], t[1], t[2]))[3]
+        out['most_influential_seed'] = _best['seed']
+        out['most_influential_p_increase'] = _best['p_increase']
+        out['most_influential_p_shift'] = _best['p_shift']
+        # With equal-magnitude deltas every seed ties; naming one of them as
+        # "the" driver would be an artefact of the tie-break, so count the tie.
+        _top_key = (out['most_influential_p_shift'], abs(_best['mean_shift']))
+        out['most_influential_tied_count'] = int(sum(
+            1 for v in loo
+            if v.get('p_shift') == _top_key[0]
+            and abs(float(v.get('mean_shift') or 0.0)) == _top_key[1]))
+        _ps = [v['p'] for v in loo if math.isfinite(v['p'])]
+        out['loo_p_min'] = float(min(_ps)) if _ps else None
+        out['loo_p_max'] = float(max(_ps)) if _ps else None
+    return out
+
+
+def holm_decision_jackknife(named_paired, *, alpha=0.05, family_names=None):
+    """Recompute the whole Holm family after dropping one seed at a time.
+
+    ``named_paired`` maps a comparison name to either a delta iterable or a
+    ``{'deltas'/'per_seed': [...], 'seeds': [...]}`` mapping.  For every seed
+    in the union, the affected comparisons are re-tested on the remaining
+    pairs (comparisons that do not contain that seed keep their full-panel p),
+    and the family is re-corrected.  This answers the question a single
+    comparison's p cannot: does one seed's presence/absence change *which*
+    comparisons survive Holm?
+
+    The returned ``rejected`` sets use the same strict ``p_holm < alpha``
+    predicate as the frozen decision rule (``holm_adjust.reject`` uses
+    ``<=``; the caller's verdict is what is replayed here).  This is a
+    post-hoc stability readout, not a second primary analysis: it never
+    replaces the full-panel p or the frozen decision.
+    """
+    alpha = _validated_alpha(alpha, context='holm_decision_jackknife alpha')
+    if not isinstance(named_paired, dict):
+        raise ValueError('holm_decision_jackknife: named_paired must be a mapping of name -> deltas')
+    payload = {}
+    for name, val in named_paired.items():
+        nm = str(name)
+        if not nm:
+            raise ValueError('holm_decision_jackknife: comparison names must be non-empty strings')
+        if isinstance(val, dict):
+            deltas = val.get('deltas', val.get('per_seed'))
+            seeds = val.get('seeds')
+        else:
+            deltas = val
+            seeds = None
+        d, labels, _keep, _n_in = _paired_payload(deltas, seeds, where=f'holm_decision_jackknife[{nm}]')
+        payload[nm] = (d, labels)
+    # A declared comparison with no computable delta still occupies a family
+    # slot (p=1).  Without this, an omitted arm would silently shrink m and
+    # make the remaining Holm corrections anti-conservative in the jackknife.
+    if family_names is not None:
+        if isinstance(family_names, (str, bytes)):
+            raise ValueError('holm_decision_jackknife: family_names must be an iterable of names, not a string')
+        try:
+            fam_in = list(family_names)
+        except TypeError:
+            raise ValueError('holm_decision_jackknife: family_names must be an iterable') from None
+        for nm in fam_in:
+            snm = str(nm)
+            if not snm:
+                raise ValueError('holm_decision_jackknife: family_names must be non-empty')
+            payload.setdefault(snm, (np.asarray([], dtype=float), []))
+    if not payload:
+        return {'kind': 'holm_decision_jackknife', 'alpha': alpha,
+                'n_comparisons': 0, 'n_folds': 0, 'rejected_full': [],
+                'folds': [], 'always_rejected': [], 'sometimes_rejected': [],
+                'never_rejected': [], 'all_rejections_stable': None,
+                'unstable_folds': [], 'per_comparison': {},
+                'note': 'no comparisons supplied'}
+    names = sorted(payload)
+    full_p = {nm: (1.0 if payload[nm][0].size == 0
+                   else float(exact_signflip_p(payload[nm][0])['p'])) for nm in names}
+    fam_full = holm_adjust([(nm, full_p[nm]) for nm in names], alpha=alpha)
+    rejected_full = sorted(nm for nm in names
+                           if fam_full.get(nm, {}).get('p_holm') is not None
+                           and float(fam_full[nm]['p_holm']) < alpha)
+    all_seeds = sorted({s for _d, labs in payload.values() for s in labs})
+    folds = []
+    for s in all_seeds:
+        raw = {}
+        n_pairs = {}
+        for nm in names:
+            d, labs = payload[nm]
+            if d.size == 0:
+                n_pairs[nm] = 0
+                raw[nm] = 1.0
+            elif s in labs:
+                mask = np.asarray([lab != s for lab in labs], dtype=bool)
+                sub = d[mask]
+                n_pairs[nm] = int(sub.size)
+                raw[nm] = (float(exact_signflip_p(sub)['p']) if sub.size else 1.0)
+            else:
+                n_pairs[nm] = int(d.size)
+                raw[nm] = full_p[nm]
+        fam = holm_adjust([(nm, raw[nm]) for nm in names], alpha=alpha)
+        p_holm = {nm: (None if fam.get(nm, {}).get('p_holm') is None
+                       else float(fam[nm]['p_holm'])) for nm in names}
+        rejected = sorted(nm for nm in names
+                          if p_holm.get(nm) is not None and p_holm[nm] < alpha)
+        folds.append({'seed': int(s), 'n_pairs': n_pairs,
+                      'raw_p': {nm: float(raw[nm]) for nm in names},
+                      'p_holm': p_holm, 'rejected': rejected,
+                      'lost': sorted(set(rejected_full) - set(rejected)),
+                      'gained': sorted(set(rejected) - set(rejected_full))})
+    _sets = [set(f['rejected']) for f in folds]
+    always = sorted(set.intersection(*_sets)) if _sets else []
+    sometimes = sorted(set.union(*_sets) - set(always)) if _sets else []
+    never = sorted(set(names) - set.union(*_sets)) if _sets else list(names)
+    per_comparison = {}
+    for nm in names:
+        vals = [f['p_holm'][nm] for f in folds
+                if f['p_holm'].get(nm) is not None]
+        per_comparison[nm] = {
+            'n_folds': len(folds),
+            'n_folds_present': (sum(1 for f in folds
+                                    if f['n_pairs'].get(nm) == len(payload[nm][1]) - 1)
+                                if len(payload[nm][1]) > 0 else 0),
+            'reject_folds': [f['seed'] for f in folds if nm in f['rejected']],
+            'lost_folds': [f['seed'] for f in folds if nm in f['lost']],
+            'gained_folds': [f['seed'] for f in folds if nm in f['gained']],
+            'p_holm_min': (float(min(vals)) if vals else None),
+            'p_holm_max': (float(max(vals)) if vals else None)}
+    unstable = [f['seed'] for f in folds if f['rejected'] != rejected_full]
+    return {'kind': 'holm_decision_jackknife', 'alpha': alpha,
+            'n_comparisons': len(names), 'n_folds': len(folds),
+            'rejected_full': rejected_full,
+            'folds': folds,
+            'always_rejected': always, 'sometimes_rejected': sometimes,
+            'never_rejected': never,
+            'all_rejections_stable': (None if not folds else (not unstable)),
+            'unstable_folds': unstable,
+            'per_comparison': per_comparison,
+            'definition': ('each fold drops one seed from every comparison that contains it, '
+                           're-runs the exact sign-flip test and the full Holm correction; '
+                           '`rejected` replays the frozen strict p_holm < alpha rule'),
+            'note': ('post-hoc sensitivity readout, not a second primary analysis; the '
+                     'full-panel p/Holm/decision remain the reported result')}
+
+
+def confirmation_robustness(named_paired, *, alpha=0.05, family_size=None, confirmed=None,
+                            family_names=None):
+    """Compose per-contrast fragility and a family-level seed-drop jackknife.
+
+    This is the results-analysis companion of a frozen confirmation: it takes
+    the SAME per-seed deltas that produced the primary p-values and reports
+    how many seeds the verdict can lose before it changes.  It deliberately
+    does not re-derive, re-select or re-label the decision.
+
+    ``family_size`` must be the DECLARED family size when the caller knows it
+    (e.g. the frozen manifest's primary-comparison count), so a comparison
+    that became uncomputable cannot shrink the multiplicity correction.
+    """
+    alpha = _validated_alpha(alpha, context='confirmation_robustness alpha')
+    if not isinstance(named_paired, dict):
+        raise ValueError('confirmation_robustness: named_paired must be a mapping name -> deltas')
+    per = {}
+    for name, val in named_paired.items():
+        if isinstance(val, dict):
+            deltas = val.get('deltas', val.get('per_seed'))
+            seeds = val.get('seeds')
+        else:
+            deltas = val
+            seeds = None
+        per[str(name)] = paired_fragility(deltas, alpha=alpha, seeds=seeds)
+    fam = holm_decision_jackknife(named_paired, alpha=alpha,
+                                  family_names=family_names)
+    _m = _as_seed_int(family_size)
+    _declared = set(per)
+    if family_names is not None:
+        if isinstance(family_names, (str, bytes)):
+            raise ValueError('confirmation_robustness: family_names must be an iterable of names, not a string')
+        try:
+            _declared |= {str(x) for x in family_names}
+        except TypeError:
+            raise ValueError('confirmation_robustness: family_names must be an iterable') from None
+    m = _m if (_m is not None and _m > 0) else len(_declared)
+    if m < len(_declared):
+        raise ValueError(
+            'confirmation_robustness: family_size=%r is smaller than the %d '
+            'supplied/declared comparisons; shrinking the correction family '
+            'would make the Holm margin anti-conservative'
+            % (family_size, len(_declared)))
+    for nm, rec in per.items():
+        _nn = rec.get('n_nonzero')
+        _n_use = _nn if (isinstance(_nn, int) and _nn > 0) else (0 if _nn == 0 else rec.get('n'))
+        req = signflip_min_consistency(_n_use, m, alpha)
+        rec['family_size'] = m
+        rec['min_same_sign_for_family_gate'] = req
+        rec['same_sign_margin'] = (None if req is None or rec.get('same_sign_count') is None
+                                   else int(rec['same_sign_count'] - req))
+        rec['raw_significant'] = bool(isinstance(rec.get('p'), float)
+                                      and math.isfinite(rec['p'])
+                                      and rec['p'] < alpha)
+        rec['holm_rejected_full'] = nm in set(fam.get('rejected_full') or [])
+    _sig = [nm for nm, rec in per.items() if rec.get('raw_significant')]
+    _flips = [rec['flip_fragility'] for rec in per.values()
+              if isinstance(rec.get('flip_fragility'), int)]
+    _drops = [rec['drop_fragility'] for rec in per.values()
+              if isinstance(rec.get('drop_fragility'), int)]
+    out = {'kind': 'confirmation_robustness', 'alpha': alpha,
+           'family_size': m,
+           'per_comparison': per,
+           'family_jackknife': fam,
+           'confirmed_full': (sorted(str(x) for x in confirmed)
+                              if confirmed is not None else None),
+           'summary': {
+               'n_comparisons': len(per),
+               'n_declared_family_names': len(_declared),
+               'n_raw_significant': len(_sig),
+               'raw_significant': sorted(_sig),
+               'n_holm_rejected_full': len(fam.get('rejected_full') or []),
+               'n_always_rejected_across_folds': len(fam.get('always_rejected') or []),
+               'all_holm_rejections_stable_under_one_seed_drop': fam.get('all_rejections_stable'),
+               'unstable_seeds': list(fam.get('unstable_folds') or []),
+               'min_drop_fragility': (int(min(_drops)) if _drops else None),
+               'min_flip_fragility': (int(min(_flips)) if _flips else None)},
+           'role': ('post-hoc robustness diagnostic for the frozen result; it never changes '
+                    'the full-panel p, the Holm family or the confirmation verdict'),
+           'note': ('a frozen decision can still be reported when it is fragile, but the '
+                    'fragility must be reported with it: the diagnosis names the seeds whose '
+                    'single removal would change the verdict instead of hiding them behind '
+                    'an aggregate p-value')}
+    return out
+
 # ---- 预注册功效 / 分辨率工具 --------------------------------------------------
 # 动机：一个冻结方案如果「无论数据多强都不可能达到 p_holm < α」，它落在
 # 分辨率上限而不是「保守」。下面的函数把这件事变成加载清单时就能机器判定

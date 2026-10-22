@@ -1484,3 +1484,74 @@ identity) and L106 (confirmation parameter binding + per-seed consistency).
 environment skips; `python test_open_block.py` passes 15/15;
 `python v12_supp.py plan` admits 72/72 synthetic frozen cells and
 `python v12_supp.py dynamic-plan` still reports the draft as non-runnable.
+
+## 2026-10-22 — confirmation-verdict robustness: fragility + seed-drop Holm jackknife (no new runs)
+
+Zero-GPU results-analysis hardening; no panel, frozen-manifest byte
+(`confirmation_frozen.json`), test split, training path, `CODE_SEMANTICS`,
+README or CI configuration was touched. The frozen `confirmed` verdict is not
+recomputed; the new block is written beside it as a post-hoc diagnostic.
+
+**Problem.** `finaltest_stats` reported a per-seed delta vector, a mean, an
+exact sign-flip p, Holm p and a document bootstrap, but nothing quantified how
+much the frozen verdict depended on one seed. `paired_effect_stats.seed_driven`
+only flips the sign of the MEAN and was never wired into the frozen confirmation;
+it also cannot see the case where the mean keeps its sign but the exact p (or
+the whole Holm rejection set) crosses alpha because of one seed. A 12-seed panel
+supported by 11 tiny same-direction deltas plus one very large one can therefore
+look far more robust than it is. Separately, the per-document readout gave a
+between-document interval but not whether a single document carried the mean.
+
+**Changes.** (1) `exp_lib.paired_fragility` reuses the exact sign-flip test on
+every subset and reports: `drop_fragility` (largest number of least-influential
+|Δ| seeds removable while p<alpha), `flip_fragility` (smallest-|Δ| same-direction
+signs that must flip before p>=alpha or the mean reverses; explicitly labelled a
+greedy influence bound, not an exact minimum), per-seed LOO `p_shift=|Δp|` /
+`removes_significance` / `flips_direction`, the t interval and its zero
+exclusion, and `most_influential_seed` ranked by ABSOLUTE p shift (removing a
+contrary seed that turns a null panel significant is single-seed dependence too,
+which the signed p-increase alone hid), with `most_influential_tied_count` so an
+equal-magnitude tie is not reported as one uniquely guilty seed. Non-finite
+deltas drop their seed label with them; non-integer/duplicate/mismatched seeds
+and invalid alpha fail closed.
+(2) `exp_lib.holm_decision_jackknife` drops one seed at a time from every
+comparison containing it, re-runs the exact test and the FULL Holm family, and
+records `rejected_full`, per-fold `lost/gained`, `always/sometimes_rejected`,
+`unstable_folds` and per-comparison `p_holm_min/max`. It replays the frozen
+strict `p_holm < alpha` rule. `family_names` keeps a declared-but-omitted
+comparison in the family at p=1, so a missing arm cannot shrink m and loosen the
+correction. (3) `exp_lib.confirmation_robustness` composes both, keeps the
+declared `family_size` (and refuses one smaller than the supplied comparison
+set), and adds the equal-magnitude projection margin
+(`min_same_sign_for_family_gate`, `same_sign_margin`) only as a planning
+reference. (4) `v12_supp.finaltest_stats` attaches `stats['robustness']` AFTER
+`confirmed` is computed; `confirmed`, raw p, Holm p, alpha and the family are
+untouched. The complete-coverage gate is deliberately not replayed (dropping any
+seed makes coverage false by construction); instead the block reports
+`confirmed_without_coverage_full/by_fold/stable` and a `coverage_gate_note`. (5)
+The v12 report renders a labelled post-hoc table (Δ mean [95% CI],
+same-direction count, drop/flip fragility, LOO Holm range, most influential
+seed, unstable seeds) via
+the testable `_robustness_markdown` helper; when a Holm rejection is not
+stable it additionally prints that the verdict may not be described as
+"seed-robust" (while the pre-registered decision itself still stands). (6)
+`_doc_level_analysis` adds
+`doc_delta_negative/positive/zero`, `doc_a_better_fraction`,
+`per_doc_delta_median` and `top_doc_abs_share` so a mean carried by one document
+is visible; the main p5t table's document-CI cell also shows the share of
+documents with Δ<0.
+
+**Boundary.** These are descriptive sensitivity readouts, not a second primary
+analysis: no new claim can be confirmed by them, and a fragile frozen verdict is
+still reported as the pre-registered result — but the fragility must be printed
+next to it. `flip_fragility` is greedy (definition shipped with the number);
+`drop_fragility` is a deletion count, not an "add k events" fragility index.
+
+**Verification.** New CPU tests L107 (fragility, seed alignment, invalid inputs,
+LOO, n=6-vs-n=12 family jackknife, omitted comparison keeps its family slot),
+L108 (v12 integration appends only `robustness`; `confirmed`/`holm` unchanged;
+coverage gate not replayed; Markdown rendering; empty inputs) and L109
+(document-level breadth + mismatched-row refusal).
+`python test_review_fixes.py` passes 443/446 with the same 3 DataLoader
+environment skips; `python v12_supp.py plan` still admits 72/72 synthetic frozen
+records with the same six comparisons.

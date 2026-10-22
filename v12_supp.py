@@ -1816,9 +1816,23 @@ def _doc_level_analysis(recs_a, recs_b, common, Ln):
     # within-document correlation.
     _ci_ppl = L.bootstrap_mean_ci(arr, seed=20261018)
     _ci_log = L.bootstrap_mean_ci(lr, seed=20261018)
+    # Breadth diagnostics: a mean gain can be broad-based or carried by one
+    # document.  Counts/fractions are descriptive (documents are not an
+    # independent randomisation of the arm), but they expose an outlier-driven
+    # "win" that a mean and a bootstrap CI can hide.
+    _neg = int((arr < 0).sum())
+    _pos = int((arr > 0).sum())
+    _zero = int((arr == 0).sum())
+    _abs_sum = float(np.abs(arr).sum())
+    _top_share = (float(np.abs(arr).max() / _abs_sum) if _abs_sum > 0.0 else None)
     return {'n_docs': int(len(doc_deltas)), 'n_seeds': len(common),
             'per_doc_delta_mean': float(arr.mean()),
+            'per_doc_delta_median': float(np.median(arr)),
             'per_doc_log_ratio_mean': float(lr.mean()),
+            'doc_delta_negative': _neg, 'doc_delta_positive': _pos,
+            'doc_delta_zero': _zero,
+            'doc_a_better_fraction': (float(_neg / arr.size) if arr.size else None),
+            'top_doc_abs_share': _top_share,
             'between_doc_sd': float(arr.std(ddof=1)) if len(doc_deltas) > 1 else 0.0,
             'between_doc_log_ratio_sd': float(lr.std(ddof=1)) if len(doc_log_ratios) > 1 else 0.0,
             'mean_within_doc_seed_sd': float(np.mean(within)),
@@ -1826,6 +1840,9 @@ def _doc_level_analysis(recs_a, recs_b, common, Ln):
             'per_doc_log_ratio_ci95': ([_ci_log['ci_low'], _ci_log['ci_high']] if _ci_log else None),
             'incomplete_doc_seed_cells': int(incomplete),
             'ci_method': 'percentile bootstrap over documents (chunked, deterministic); conditions on the trained seeds',
+            'breadth_note': ('doc_a_better_fraction counts documents whose seed-mean Δ (a-b) is negative, i.e. lower PPL for arm a; '
+                             'top_doc_abs_share is max|Δ_doc| / sum|Δ_doc| (a single document carrying a large share means the '
+                             'mean is outlier-sensitive).  Both are descriptive: documents are not an arm randomisation.'),
             'note': 'document-sampling uncertainty only; seed-level exact sign-flip remains the confirmatory test, and n_seqs<64 does not cover the language-population distribution — enlarge the row panel for population-level claims (design_notes section 20)'}
 
 
@@ -1990,6 +2007,156 @@ def _test_probe_stats(probe_path, manifest, slice_fp):
         print('[p5t probe] EXCLUDED test-probe records (named, never silent):\n  - ' + '\n  - '.join(excluded[:20]) + ('' if len(excluded) <= 20 else f'\n  … {len(excluded) - 20} more'))
     if _contrast_exclusions:
         print('[p5t probe] EXCLUDED descriptive contrasts (named, never silent):\n  - ' + '\n  - '.join(_contrast_exclusions[:20]))
+    return out
+
+
+def _confirmation_robustness_block(stats, pairs, *, alpha, family_size, param_required,
+                                   family_names=None):
+    """Attach the post-hoc fragility/seed-drop readout to a stats dict.
+
+    ``pairs`` maps each comparison name to ``{'deltas': [...], 'seeds': [...]}``
+    — the same per-seed deltas that produced the primary p-values.  The
+    frozen decision in ``stats['confirmed']`` is never recomputed or changed;
+    this only adds a diagnosis of how much that decision depends on one seed.
+
+    ``family_names`` is the DECLARED comparison list.  An omitted comparison
+    has no deltas but still occupies a family slot, so the seed-drop jackknife
+    must keep it at p=1 instead of shrinking m.
+    """
+    if not pairs:
+        return None
+    rob = L.confirmation_robustness(pairs, alpha=alpha,
+                                    family_size=family_size,
+                                    confirmed=stats.get('confirmed'),
+                                    family_names=family_names)
+    comps = stats.get('comparisons') or {}
+    holm = stats.get('holm') or {}
+    _rej = sorted(k for k, v in holm.items()
+                  if v.get('p_holm') is not None
+                  and float(v['p_holm']) < alpha)
+
+    def _param_gate(k):
+        if not param_required:
+            return True
+        return comps.get(k, {}).get('param_match_complete') is True
+
+    # Replay the direction/parameter/minimum-n part of the frozen rule on each
+    # seed-drop fold.  The complete-coverage gate is deliberately NOT
+    # replayed: dropping a seed necessarily makes coverage false, so
+    # including it would fail every fold by construction and say nothing
+    # about sampling stability.
+    full_nocov = sorted(
+        k for k in _rej
+        if comps.get(k, {}).get('direction_ok') is True
+        and comps.get(k, {}).get('param_matched') is not False
+        and _param_gate(k)
+        and int(comps.get(k, {}).get('n_effective') or 0)
+        >= int(comps.get(k, {}).get('min_seeds_for_confirmation')
+               or len(comps.get(k, {}).get('seeds') or [])))
+    fold_nocov = []
+    for f in rob['family_jackknife']['folds']:
+        keep = set(f['rejected'])
+        row = []
+        for k in full_nocov:
+            if k not in keep:
+                continue
+            _comp = comps.get(k, {})
+            _floor = int(_comp.get('min_seeds_for_confirmation')
+                         or len(_comp.get('seeds') or []))
+            if int(f.get('n_pairs', {}).get(k) or 0) < _floor:
+                continue
+            row.append(k)
+        fold_nocov.append(sorted(row))
+    rob['confirmed_without_coverage_full'] = full_nocov
+    rob['confirmed_without_coverage_by_fold'] = {
+        str(f['seed']): s for f, s in
+        zip(rob['family_jackknife']['folds'], fold_nocov)}
+    rob['confirmed_without_coverage_stable'] = bool(
+        all(s == full_nocov for s in fold_nocov))
+    rob['coverage_gate_note'] = (
+        'the complete-coverage rule is not replayed inside the jackknife: '
+        'dropping one seed always makes coverage_ok false, which would fail '
+        'every fold by construction.  The jackknife asks only whether the '
+        'statistical/direction/minimum-n verdict survives; the frozen decision still '
+        'additionally requires complete coverage.')
+    stats['robustness'] = rob
+    return rob
+
+
+def _robustness_markdown(rob):
+    """Render the post-hoc fragility/seed-drop table for the v12 report.
+
+    Kept as a pure function of the JSON block so the wording and the
+    "does not change the frozen decision" boundary can be unit-tested without
+    a GPU panel or a full report build.
+    """
+    out = []
+    if not (isinstance(rob, dict) and rob.get('per_comparison')):
+        return out
+    A = out.append
+    A('### 结论稳健性（post-hoc 诊断；不改变上面的冻结判定）')
+    A('')
+    A('| 比较 | Δ mean [95% CI]（seed） | 同向种子 | 丢弃最弱种子仍显著 k | 翻转最小同向种子后失效 k | 逐种子删除的 Holm p 范围 | 最敏感种子 |')
+    A('|---|---|---|---|---|---|---|')
+    fjk = rob.get('family_jackknife') or {}
+    fjc = fjk.get('per_comparison') or {}
+    for rk, rr in rob['per_comparison'].items():
+        n = rr.get('n')
+        same = rr.get('same_sign_count')
+        req = rr.get('min_same_sign_for_family_gate')
+        sames = f'{same}/{n}' if same is not None and n else '—'
+        if req is not None:
+            sames += f'（族门等幅投影 ≥{req}）'
+        _lo, _hi = rr.get('ci95_low'), rr.get('ci95_high')
+        if (isinstance(rr.get('mean'), (int, float))
+                and isinstance(_lo, (int, float)) and isinstance(_hi, (int, float))):
+            citxt = f'{rr["mean"]:+.3f} [{_lo:+.3f}, {_hi:+.3f}]'
+        else:
+            citxt = '—'
+        drop = rr.get('drop_fragility')
+        flip = rr.get('flip_fragility')
+        reason = {'p>=alpha': 'p≥α', 'direction reversed': '方向反转',
+                  'not significant at the full panel': '整组已不显著',
+                  'no mean direction': '无方向'}.get(
+                      rr.get('flip_stop_reason'), rr.get('flip_stop_reason') or '—')
+        fliptxt = f'{flip}（{reason}）' if isinstance(flip, int) else '—'
+        fj = fjc.get(rk) or {}
+        lo, hi = fj.get('p_holm_min'), fj.get('p_holm_max')
+        rng = (f'{lo:.3g}–{hi:.3g}'
+               if isinstance(lo, (int, float)) and isinstance(hi, (int, float)) else '—')
+        ms = rr.get('most_influential_seed')
+        mp = rr.get('most_influential_p_shift')
+        mstxt = ((f'种子 {ms}' + (f'（|Δp|={mp:.3g}）' if isinstance(mp, (int, float)) else ''))
+                 if ms is not None else '—')
+        _tied = rr.get('most_influential_tied_count')
+        if isinstance(_tied, int) and _tied > 1 and mstxt != '—':
+            mstxt += f'；并列 {_tied} 个'
+        A(f'| {rk} | {citxt} | {sames} | {drop if isinstance(drop, int) else "—"} | '
+          f'{fliptxt} | {rng} | {mstxt} |')
+    A('')
+    rejf = fjk.get('rejected_full') or []
+    always = fjk.get('always_rejected') or []
+    unstable = fjk.get('unstable_folds') or []
+    A(f"- 整组 Holm 拒绝（全 panel）：{sorted(rejf) if rejf else '无'}。")
+    if fjk.get('all_rejections_stable'):
+        A('- 逐种子删除检验：**每一个**单种子删除后，Holm 拒绝集合都保持不变。')
+    else:
+        A(f"- 逐种子删除检验：**不稳定**。删除这些种子会改变 Holm 拒绝集合：{sorted(unstable)}；"
+          f"始终被拒绝的比较：{sorted(always) if always else '无'}。")
+    nocov_stable = rob.get('confirmed_without_coverage_stable')
+    nocov_full = rob.get('confirmed_without_coverage_full') or []
+    A(f"- 方向/参数/最小 n 判定（不含完整覆盖门）：全 panel = {sorted(nocov_full) if nocov_full else '无'}；"
+      f"逐种子删除后保持不变 = {nocov_stable}。")
+    A('')
+    A('> 定义：`丢弃最弱种子仍显著 k` = 反复删除当前 |Δ| 最小的种子、精确符号翻转 p 仍 < α 的最大次数；'
+      '`翻转最小同向种子后失效 k` = 按 |Δ| 从小到大翻转同向种子，直到 p ≥ α 或均值方向反转的次数（贪心，不是精确最小集）。'
+      '两者都是**对已发生数据的 post-hoc 敏感度读数**，不进入冻结决策，也不改变上面的 p/Holm/confirmed。'
+      '完整覆盖门不在 jackknife 内重放（删任何一个种子都会使覆盖失败），因此上一条只重放方向/参数/最小 n 判定。')
+    A('')
+    if fjk.get('all_rejections_stable') is False:
+        A('**解读提示**：至少一个冻结判定在删除单个种子后不再成立。这不改变预注册的确认结论，'
+          '但该结论**不能被描述为「对种子稳健」**；引用时必须同时报告这一敏感度。')
+        A('')
     return out
 
 
@@ -2239,6 +2406,25 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
                  'legacy manifest: a complete-case subset with n_effective >= the declared floor may be confirmed'),
     }
     stats['confirmed'] = _conf
+    # ---- post-hoc robustness: never part of the frozen decision -----------
+    # A frozen verdict can be statistically valid and still hinge on one seed.
+    # The diagnostic takes the SAME per-seed deltas that produced the primary
+    # p-values and asks how many seeds the verdict can lose before the raw
+    # test / the whole Holm family changes.  It is written next to the
+    # decision, not into it: `confirmed` above is untouched.
+    _rob_pairs = {}
+    for _k, _v in stats['comparisons'].items():
+        _dl = _v.get('per_seed')
+        _sd = _v.get('seeds')
+        if (isinstance(_dl, list) and isinstance(_sd, list)
+                and len(_dl) == len(_sd) and len(_dl) >= 1
+                and 'omitted' not in _v):
+            _rob_pairs[_k] = {'deltas': _dl, 'seeds': _sd}
+    _confirmation_robustness_block(
+        stats, _rob_pairs, alpha=_alpha,
+        family_size=len(manifest['primary_comparisons']),
+        param_required=_param_required,
+        family_names=[str(c.get('name')) for c in manifest['primary_comparisons']])
     stats['significant_nondirectional'] = [k for k in _rej if stats['comparisons'].get(k, {}).get('direction_ok') is None]
     stats['not_confirmed_reasons'] = {k: {'param_matched': stats['comparisons'].get(k, {}).get('param_matched'),
                                           'param_match_complete': stats['comparisons'].get(k, {}).get('param_match_complete'),
@@ -2274,6 +2460,15 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
                                               f'n_docs<{L.MIN_DOCS_FOR_POPULATION_CLAIM} does not cover the language-population distribution, so population-level claims are refused; '
                                               'the confirmed claims are about the frozen evaluation slice (design_notes section 20)')
     print(f'[p5t stats] admitted {len(admitted)}/{len(manifest["arms"]) * _n} frozen (arm, seed) cells on slice {str(unified_fp)[:12]}…; {len(_fam)} frozen primary comparison(s); {len(_rej)} survive Holm; {len(_conf)} also match the pre-registered direction')
+    _rob_s = ((stats.get('robustness') or {}).get('summary') or {})
+    if _rob_s:
+        print(f'[p5t stats] robustness (post-hoc, does NOT change the verdict): '
+              f'raw-significant={_rob_s.get("n_raw_significant")}/{_rob_s.get("n_comparisons")}; '
+              f'Holm rejections stable under every one-seed drop='
+              f'{_rob_s.get("all_holm_rejections_stable_under_one_seed_drop")}; '
+              f'min drop/flip fragility={_rob_s.get("min_drop_fragility")}/'
+              f'{_rob_s.get("min_flip_fragility")}; unstable seeds='
+              f'{_rob_s.get("unstable_seeds")}')
     os.makedirs(os.path.dirname(out) or '.', exist_ok=True)
     stats = L.stamped_analysis('finaltest_stats', stats, outdir=(os.path.dirname(out) or '.'), name=os.path.basename(out))
     print(f'[p5t stats] wrote {out}')
@@ -2614,6 +2809,9 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
             _dsm = v.get('doc_sampling') or {}
             _dci = _dsm.get('per_doc_delta_ppl_ci95')
             _dcitxt = f'[{_dci[0]:+.2f}, {_dci[1]:+.2f}]' if isinstance(_dci, (list, tuple)) and len(_dci) == 2 else '—'
+            _dwin = _dsm.get('doc_a_better_fraction')
+            if isinstance(_dwin, (int, float)) and _dcitxt != '—':
+                _dcitxt += f'；{100.0 * _dwin:.0f}% 文档 Δ<0'
             A(f'| {k} | {v["n"]} | {v.get("coverage_ok")} | {v.get("param_matched")} | {v["mean"]:+.2f} ± {v.get("std", 0):.2f} | {_dcitxt} | {v.get("cohens_dz", float("nan")):+.2f} | {v["p_exact_signflip"]:.3f} | {v.get("p_floor", float("nan")):.3f} | {_hp} | {_hr} | {_ds} |')
         A('')
         _conf = ft.get('confirmed')
@@ -2634,6 +2832,9 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
                   '不确认；该面板只能按实际 n 报告为 descriptive/unconfirmed。')
             else:
                 A(f'**确认结果**：没有冻结主比较同时满足「Holm 校正后 p < {_report_alpha:g}」与「方向符合预注册」。按预注册的决策规则，相应主张**不获确认**；探索性面板的正向读数保持「探索性」标签，不得写成结论。')
+        _rob_lines = _robustness_markdown(ft.get('robustness') or {})
+        if _rob_lines:
+            lines.extend(_rob_lines)
         _nd = ft.get('significant_nondirectional') or []
         if _nd:
             A('')
