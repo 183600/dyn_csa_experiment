@@ -910,3 +910,41 @@ seed domain/collisions), E1a5 (environment pair gate), E3a1 (single optimizer
 grouping shared by trainer and probes) and E3a2 (the real `train_variant`
 loop overfits one fixed batch, and lr=0 fails it). `python
 test_review_fixes.py` passes 372/372.
+
+## 2026-10-22 — multiclass F1 for NIAH + pre-registered floor hypothesis (no new runs)
+
+Zero-GPU metric/hypothesis hardening; no panel result, frozen manifest, test
+split, README or CI configuration was touched.
+
+**Problem.** Two experimental-design gaps remained. (1) NIAH-natural is a
+single-label multiclass retrieval endpoint, but its record only carried top-1
+accuracy and macro recall; it did not state a macro/micro/weighted F1, so a
+multiclass F1 headline could not be audited. (2) "Beats the tuned count-model
+floor" was enforced arithmetically but was not itself a pre-registered
+directional hypothesis with a mechanism, endpoint and falsifier, unlike the
+component and matched-dense families.
+
+**Changes.** (1) `retrieval_metrics` now records per-class
+`predicted`/`precision`/`f1` and named `f1_macro`, `f1_micro`, `f1_weighted`
+(plus `f1_averaging`), all computed from the same top-1 labels. Micro F1 is
+the pooled TP/FP/FN score and therefore equals accuracy on this single-label
+endpoint; macro weights every observed answer class equally; weighted follows
+answer support. `METRIC_POLICY.niah_retrieval` lists all three as secondary
+endpoints and states why PR-AUC/ROC-AUC are not invented without per-class
+scores. `metric_policy_audit` requires all three together, rejects a micro F1
+that differs from accuracy, and recomputes the three aggregates from
+per-class counts (legacy records without F1 are unverifiable, not a pass).
+`v10_supp.py` persists the new fields and prints macro/weighted F1 with the
+top-1/macro-recall/floors table. (2) `FLOOR_HYPOTHESIS_DESIGN` registers the
+floor comparison as a directional hypothesis (Δ = method − floor,
+`predicted_sign=-1`, primary `ppl`, falsifier covering non-comparability and
+Holm failure). `methodology_audit` attaches the observed verdict/sign/direction
+consistency to `simple_baseline.floor_hypothesis`; `audit_gates.hypotheses`
+audits the new family. This does not relax any existing gate: a supported
+hypothesis still requires the comparable rows, matching token denominator and
+Holm-cleared method-arm contrast.
+
+Verification: `python test_review_fixes.py` passes 372/372 (retrieval F1
+identity/aggregate forgery and floor direction checks added);
+`python test_open_block.py` passes 15/15; `python audit_gates.py hypotheses`
+reports `status=ok` for all five hypothesis families.

@@ -13347,6 +13347,32 @@ BASELINE_HYPOTHESIS_DESIGN = {
     },
 }
 
+# The first, weakest gate: every declared method arm must beat the tuned
+# count-model floor before any mechanism claim is interpretable.  This is a
+# separate pre-registered hypothesis because a comparison can satisfy the
+# matched-dense gate while failing the trivial floor (or vice versa), and the
+# direction convention differs: delta = method - floor, so predicted_sign=-1
+# means the method has the lower PPL.  The floor contrast is Holm-corrected
+# across declared method arms by `methodology_audit`.
+FLOOR_HYPOTHESIS_DESIGN = {
+    'method_beats_tuned_count_floor': {
+        'statement': ('Every declared method arm has a lower token-pooled validation '
+                      'PPL/NLL than the tuned unigram/bigram count floor on the same '
+                      'held-out rows and token denominator.'),
+        'mechanism': ('A neural language model can exploit multi-token context and '
+                      'learned representations that a context-free/bigram count model '
+                      'cannot; without this basic gain the mechanism claim has no '
+                      'demonstrated language-modelling advantage at all.'),
+        'predicted_sign': -1,
+        'primary_metric': 'ppl',
+        'metric_policy': 'lm_perplexity',
+        'requires_param_match': False,
+        'falsifier': ('Any declared method arm has a mean PPL at or above the tuned '
+                      'floor, fails the Holm-corrected seed-level contrast, or is not '
+                      'comparable on validation rows/token denominators.'),
+    },
+}
+
 # Open-block panel hypotheses (driver: open_block_supp.py).  These are the
 # declared primary contrasts; the remaining maximum-block x reading-rule cells
 # are descriptive.  Delta convention is a - b on token NLL, so predicted_sign
@@ -15292,6 +15318,7 @@ METRIC_POLICY = {
         'extreme_imbalance_threshold': 1e-3,
         'direction': 'higher_is_better',
         'secondary': ['answer_nll', 'balanced_accuracy', 'macro_recall',
+                      'f1_macro', 'f1_micro', 'f1_weighted',
                       'chance_accuracy', 'majority_accuracy',
                       'acc_lift_over_chance', 'acc_lift_over_majority',
                       'minority_prevalence', 'imbalance_ratio'],
@@ -15301,9 +15328,13 @@ METRIC_POLICY = {
                       'When a class is rarer than 1:1000 the primary endpoint switches '
                       'to macro recall (balanced accuracy).'),
         'aggregation': 'query_unweighted',
-        'note': ('Top-1 accuracy is reported with answer NLL, macro recall (balanced accuracy) '
-                 'and the trivial uniform/majority floors. PR-AUC/ROC-AUC are not substitutes '
-                 'for a many-way retrieval endpoint and must not be invented from top-1 labels. '
+        'note': ('Top-1 accuracy is reported with answer NLL, macro recall (balanced accuracy), '
+                 'the trivial uniform/majority floors and explicitly named macro/micro/weighted '
+                 'F1. Micro F1 equals top-1 accuracy for a single-label endpoint; macro treats '
+                 'every observed answer class equally and weighted follows support, so the '
+                 'averaging rule must accompany every F1 number. PR-AUC/ROC-AUC are not '
+                 'substitutes for a many-way retrieval endpoint and must not be invented from '
+                 'top-1 labels; a record without per-class scores leaves them unverifiable. '
                  'Under extreme answer-class imbalance, macro recall is the conditional primary.'),
     },
     'binary_classification': {
@@ -15766,6 +15797,11 @@ def retrieval_metrics(y_true, y_pred, labels=None, label_names=None):
     * ``n_correct``/``acc`` — the raw top-1 count and rate;
     * ``balanced_accuracy`` (macro recall) — every answer class counts equally,
       so a rare-answer failure cannot hide behind frequent classes;
+    * named ``f1_macro``/``f1_micro``/``f1_weighted`` — a single-label top-1
+      endpoint has per-class TP/FP/FN, so all three averages are computable;
+      micro F1 equals accuracy, macro weighs observed answers equally and
+      weighted follows support.  PR-AUC/ROC-AUC remain unavailable because a
+      top-1 record carries no per-class scores;
     * ``chance_accuracy`` — uniform guessing over the OBSERVED answer classes
       (``1/K``), which is the correct chance floor for this label space (not
       ``1/vocab`` when only K classes actually occur);
@@ -15812,8 +15848,10 @@ def retrieval_metrics(y_true, y_pred, labels=None, label_names=None):
             f'{labs.tolist()}; include them or pass labels=None')
     support = {}
     correct = {}
+    predicted = {}
     for _t, _p in zip(true_keys, pred_keys):
         support[_t] = support.get(_t, 0) + 1
+        predicted[_p] = predicted.get(_p, 0) + 1
         if _t == _p:
             correct[_t] = correct.get(_t, 0) + 1
     n = int(y.size)
@@ -15824,21 +15862,52 @@ def retrieval_metrics(y_true, y_pred, labels=None, label_names=None):
     recall_sum = 0.0
     majority_support = 0
     majority_name = None
+    _f1_defined = []
+    _f1_supports = []
     for _lab, _name in zip(labs.tolist(), label_names):
         _key = _hashable_label(_lab)
         _sup = int(support.get(_key, 0))
-        _rec = (correct.get(_key, 0) / _sup) if _sup else None
-        per_class[_name] = {'support': _sup, 'recall': _rec,
-                            'correct': int(correct.get(_key, 0))}
+        _pred = int(predicted.get(_key, 0))
+        _cor = int(correct.get(_key, 0))
+        _rec = (_cor / _sup) if _sup else None
+        # Precision is defined only when the class was predicted.  A single-
+        # label multiclass endpoint has per-class TP/FP/FN, so macro/micro/
+        # weighted F1 are computable from top-1 labels alone; they expose
+        # false-positive behaviour that recall cannot.
+        _prec = (_cor / _pred) if _pred else 0.0
+        _f1 = ((2.0 * _prec * _rec / (_prec + _rec))
+               if (_rec is not None and (_prec + _rec) > 0) else 0.0)
+        if not _sup:
+            _prec = _prec if _pred else None
+            _f1 = _f1 if _pred else None
+        per_class[_name] = {'support': _sup, 'predicted': _pred,
+                            'recall': _rec, 'correct': _cor,
+                            'precision': _prec, 'f1': _f1}
         if _sup:
             defined += 1
             recall_sum += float(_rec)
+            _f1_defined.append(float(_f1))
+            _f1_supports.append(_sup)
         if _sup > majority_support:
             majority_support = _sup
             majority_name = _name
     chance = (1.0 / defined) if defined else None
     majority = (majority_support / n) if n else None
     balanced = (recall_sum / defined) if defined else None
+    # F1 aggregation is stated explicitly because the three averages answer
+    # different questions under answer-class imbalance.  For a single-label
+    # top-1 endpoint micro F1 equals accuracy by construction; macro weights
+    # every observed answer class equally; weighted follows its support.
+    _f1_macro = (float(np.mean(_f1_defined)) if _f1_defined else None)
+    _f1_weighted = (float(np.average(_f1_defined, weights=_f1_supports))
+                    if _f1_defined else None)
+    _tp_micro = int(n_correct)
+    _fp_micro = int(n - n_correct)
+    _fn_micro = int(n - n_correct)
+    _f1_micro = (2.0 * _tp_micro / (2 * _tp_micro + _fp_micro + _fn_micro)
+                 if n else None)
+    _n_undeclared_pred = int(sum(v for k, v in predicted.items()
+                                 if k not in set(_lab_keys)))
     # Extreme answer-class imbalance: top-1 micro accuracy can be high while a
     # rare answer class is never retrieved.  Macro recall is the recall-aligned
     # conditional endpoint, not an invented PR-AUC from top-1 labels.
@@ -15869,6 +15938,16 @@ def retrieval_metrics(y_true, y_pred, labels=None, label_names=None):
         'acc': acc, 'top1_accuracy': acc,
         'balanced_accuracy': balanced, 'macro_recall': balanced,
         'n_classes': defined,
+        # Three named multiclass F1 averages.  Micro F1 equals accuracy for a
+        # single-label endpoint; macro treats each observed answer equally;
+        # weighted follows answer support.  They can rank models differently.
+        'f1_macro': _f1_macro,
+        'f1_micro': _f1_micro,
+        'f1_weighted': _f1_weighted,
+        'f1_averaging': ('macro = observed-answer-unweighted; micro = pooled '
+                         'TP/FP/FN (equals top-1 accuracy on this single-label '
+                         'endpoint); weighted = support-weighted'),
+        'n_undeclared_predictions': _n_undeclared_pred,
         'answer_support': {name: row['support'] for name, row in per_class.items()},
         'per_class_recall': {name: row['recall'] for name, row in per_class.items()},
         'per_class': per_class,
@@ -15877,10 +15956,13 @@ def retrieval_metrics(y_true, y_pred, labels=None, label_names=None):
         'majority_label': majority_name,
         'acc_lift_over_chance': (acc - chance if acc is not None and chance is not None else None),
         'acc_lift_over_majority': (acc - majority if acc is not None and majority is not None else None),
-        'averaging': 'macro_recall_over_observed_answer_classes; top1 is micro over queries',
+        'averaging': ('macro_recall_over_observed_answer_classes; top1 is micro over queries; '
+                      'F1 is reported separately as macro/micro/weighted'),
         'note': ('chance_accuracy is uniform guessing over the observed answer classes; '
                  'majority_accuracy is the always-most-frequent-answer floor. A top-1 '
-                 'score without these floors is not evidence of retrieval skill.'),
+                 'score without these floors is not evidence of retrieval skill. '
+                 'PR-AUC/ROC-AUC are not reported because a top-1 record carries no '
+                 'per-class scores; inventing them from hard labels would be invalid.'),
     }
 
 
@@ -16822,6 +16904,8 @@ def metric_policy_audit(summary=None, policy=None):
             missing = [k for k in ('acc', 'nll') if not all(k in b for b in niah)]
             _bad_niah = []
             _legacy_niah = []
+            _legacy_f1 = []
+            _f1_unverifiable = []
             for _b in niah:
                 _a = _finite_scalar(_b.get('acc'))
                 _nl = _finite_scalar(_b.get('nll'))
@@ -16962,6 +17046,91 @@ def metric_policy_audit(summary=None, policy=None):
                                 elif (_nc is not None
                                       and int(round(_correct_sum)) != int(_nc)):
                                     _bad_niah.append('per-class-correct-sum-mismatch')
+                    # Multiclass F1 must name its averaging rule.  A top-1
+                    # retrieval record is single-label, so micro F1 is exactly
+                    # accuracy; macro and weighted F1 are recomputed from the
+                    # per-class TP/FP/FN counts when those are present.
+                    _f1_keys = ('f1_macro', 'f1_micro', 'f1_weighted')
+                    _f1_present = [k for k in _f1_keys if k in _b]
+                    if not _f1_present:
+                        _legacy_f1.append(_b.get('variant') or _b.get('name') or '?')
+                    elif len(_f1_present) != len(_f1_keys):
+                        _bad_niah.append('f1-aggregate-missing')
+                    else:
+                        _f1_vals = [_finite_scalar(_b.get(k)) for k in _f1_keys]
+                        if any(v is None or not (0.0 <= v <= 1.0) for v in _f1_vals):
+                            _bad_niah.append('f1-aggregate-invalid')
+                        elif _a is not None and abs(_f1_vals[1] - _a) > 1e-9:
+                            _bad_niah.append('f1-micro-not-accuracy')
+                        else:
+                            _pc_f1 = _b.get('per_class')
+                            _f1_rows = {}
+                            _f1_recalc = isinstance(_pc_f1, dict) and bool(_pc_f1)
+                            if _f1_recalc:
+                                for _name, _row in _pc_f1.items():
+                                    if not isinstance(_row, dict):
+                                        _f1_recalc = False
+                                        break
+                                    _sp = _exact_count(_row.get('support'), minimum=0)
+                                    _pr = _exact_count(_row.get('predicted'), minimum=0)
+                                    _co = _exact_count(_row.get('correct'), minimum=0)
+                                    if None in (_sp, _pr, _co):
+                                        _f1_recalc = False
+                                        break
+                                    _f1_rows[str(_name)] = (_sp, _pr, _co)
+                            if not _f1_recalc:
+                                _f1_unverifiable.append(
+                                    _b.get('variant') or _b.get('name') or '?')
+                            else:
+                                _sup_tot = int(sum(v[0] for v in _f1_rows.values()))
+                                _pred_tot = int(sum(v[1] for v in _f1_rows.values()))
+                                # Predictions of classes that never occur in the
+                                # answer support are legitimate (a top-1 model
+                                # may emit any token), so per-class predicted
+                                # counts need not sum to n_queries.  When the
+                                # record exposes that count, reconcile it;
+                                # otherwise only require no over-count.
+                                _n_und = _exact_count(
+                                    _b.get('n_undeclared_predictions'), minimum=0)
+                                _den_bad = False
+                                if _nq is not None and _sup_tot != int(_nq):
+                                    _den_bad = True
+                                elif _pred_tot > (_sup_tot if _nq is None else int(_nq)):
+                                    _den_bad = True
+                                elif (_n_und is not None and _nq is not None
+                                      and _pred_tot + _n_und != int(_nq)):
+                                    _den_bad = True
+                                if _den_bad:
+                                    _bad_niah.append('f1-count-denominator-mismatch')
+                                else:
+                                    _f1_macro_pc = []
+                                    _f1_sup_pc = []
+                                    for _sp, _pr, _co in _f1_rows.values():
+                                        if not _sp:
+                                            continue
+                                        _prec = (_co / _pr) if _pr else 0.0
+                                        _rec = _co / _sp
+                                        _fv = (2.0 * _prec * _rec / (_prec + _rec)
+                                               if (_prec + _rec) > 0 else 0.0)
+                                        _f1_macro_pc.append(_fv)
+                                        _f1_sup_pc.append(_sp)
+                                    _want_macro = (float(np.mean(_f1_macro_pc))
+                                                   if _f1_macro_pc else 0.0)
+                                    _want_weighted = (
+                                        float(np.average(_f1_macro_pc,
+                                                         weights=_f1_sup_pc))
+                                        if _f1_macro_pc else 0.0)
+                                    # Micro is over the full single-label
+                                    # endpoint, including predictions of
+                                    # unobserved classes, so it equals accuracy.
+                                    _tp = int(sum(v[2] for v in _f1_rows.values()))
+                                    _den = int(_sup_tot)
+                                    _want_micro = 2.0 * _tp / max(
+                                        2 * _tp + (_den - _tp) + (_den - _tp), 1)
+                                    if (abs(_f1_vals[0] - _want_macro) > 1e-9
+                                            or abs(_f1_vals[1] - _want_micro) > 1e-9
+                                            or abs(_f1_vals[2] - _want_weighted) > 1e-9):
+                                        _bad_niah.append('f1-aggregate-inconsistent')
                     _lch = _finite_scalar(_b.get('acc_lift_over_chance'))
                     if _lch is not None and _ch is not None and _a is not None:
                         if abs(_lch - (_a - _ch)) > 1e-9:
@@ -17041,7 +17210,9 @@ def metric_policy_audit(summary=None, policy=None):
             out['checks'].append({'metric': 'niah_retrieval', 'policy': 'niah_retrieval',
                                   'records': len(niah), 'ok': not missing and not _bad_niah,
                                   'missing': missing, 'invalid': sorted(set(_bad_niah)),
-                                  'legacy_without_trivial_floor': len(_legacy_niah)})
+                                  'legacy_without_trivial_floor': len(_legacy_niah),
+                                  'legacy_without_f1': len(_legacy_f1),
+                                  'f1_unverifiable': len(_f1_unverifiable)})
             if missing:
                 out['warnings'].append(f'NIAH reports top-1 without {missing}; answer NLL is required alongside retrieval accuracy')
             if _bad_niah:
@@ -17053,6 +17224,16 @@ def metric_policy_audit(summary=None, policy=None):
                     f'{len(_legacy_niah)}/{len(niah)} NIAH record(s) carry no n_correct/trivial floor; '
                     'their top-1 accuracy cannot be distinguished from uniform/majority guessing '
                     '(legacy records are unverifiable, not a pass)')
+            if _legacy_f1:
+                out['warnings'].append(
+                    f'{len(_legacy_f1)}/{len(niah)} NIAH record(s) carry no explicit '
+                    'macro/micro/weighted F1; a multiclass F1 without a named averaging '
+                    'rule is unverifiable (legacy records, not a pass)')
+            if _f1_unverifiable:
+                out['warnings'].append(
+                    f'{len(_f1_unverifiable)} NIAH record(s) report F1 but expose no '
+                    'per-class support/predicted/correct counts; the macro/micro/weighted '
+                    'aggregates cannot be recomputed')
         classify_tasks = ('classification', 'binary_classification', 'multiclass_classification')
         _class_recs, _class_issues = [], []
         _allowed_f1_averages = ('macro', 'micro', 'weighted', 'binary_positive_class',
@@ -21219,6 +21400,40 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                     report['warnings'].append(
                         'the declared method arm(s) do not yet have a Holm-cleared beats-floor '
                         'contrast — report the floor comparison as unconfirmed, not as a win')
+                # Attach the pre-registered floor hypothesis to the observed
+                # verdict.  Predicted sign is on delta = method PPL - floor
+                # PPL, so -1 means the method is expected to be lower.  A
+                # significant result in the opposite direction is a direction
+                # conflict, not support for the declared mechanism.
+                _floor_deltas = [(_floor_by_arm.get(_v) or {}).get('mean_delta')
+                                 for _v in _method_arm_names
+                                 if _finite_scalar((_floor_by_arm.get(_v) or {}).get('mean_delta')) is not None]
+                _floor_obs = None
+                if _floor_deltas:
+                    if all(float(v) < 0 for v in _floor_deltas):
+                        _floor_obs = -1
+                    elif all(float(v) > 0 for v in _floor_deltas):
+                        _floor_obs = 1
+                    else:
+                        _floor_obs = 0
+                if _method_floor_status == 'all_method_arms_beat_floor':
+                    _floor_h_status = 'supported'
+                elif _method_floor_status == 'method_arm_does_not_beat_floor':
+                    _floor_h_status = 'falsified'
+                elif _method_floor_status == 'method_floor_contrast_unresolved':
+                    _floor_h_status = 'unresolved'
+                else:
+                    _floor_h_status = 'unverified'
+                _floor_h = hypothesis_audit(FLOOR_HYPOTHESIS_DESIGN, 'floor')
+                _floor_spec = dict(FLOOR_HYPOTHESIS_DESIGN['method_beats_tuned_count_floor'])
+                _floor_spec.update({
+                    'observed_status': _floor_h_status,
+                    'observed_sign': _floor_obs,
+                    'direction_consistent': (None if _floor_obs is None
+                                             else bool(_floor_obs == -1)),
+                    'method_arm_status': _method_floor_status,
+                    'audit_status': _floor_h.get('status'),
+                })
                 report['simple_baseline'].update({
                     'method_arm_floor_contrasts': _floor_by_arm,
                     'method_arm_floor_status': _method_floor_status,
@@ -21240,6 +21455,7 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                     'panel_beats_simple_floor': (bool(_panel_ppl < _floor_ppl)
                                                  if _comparable is True and _floor_ppl is not None
                                                  else None),
+                    'floor_hypothesis': _floor_spec,
                 })
                 if _comparable is False:
                     report['warnings'].append(

@@ -1851,3 +1851,38 @@ allblocks 读严格更多信息、等读预算不成立——保守方向永远�
 
 本节全部改动为零 GPU 的定义点/清单门与标注：不改任何臂的测量语义
 （`CODE_SEMANTICS` 不变）、不改冻结清单字节、不动任何 results_*。
+
+## 38. 多分类 F1 口径与地板假设（本轮设计硬化）
+
+本轮不新增 GPU 面板，只补齐两处「指标必须对齐研究目标、比较必须有
+预注册假设」的缺口。`CODE_SEMANTICS` 与冻结清单均未改动。
+
+### 38.1 NIAH 的 macro/micro/weighted F1
+
+NIAH-natural 是单标签多分类检索端点。此前它报告 top-1 accuracy、
+macro recall（balanced accuracy）、均匀/多数类地板和 answer NLL，但
+没有 F1；一个多分类指标不注明 macro/micro/weighted 无法复核。现在
+`retrieval_metrics` 从同一批 top-1 标签计算每类 TP/FP/FN，并同时返回：
+
+- `f1_macro`：只在观测到的答案类上等权平均；
+- `f1_micro`：池化 TP/FP/FN，单标签任务下恒等于 top-1 accuracy；
+- `f1_weighted`：按答案支持度加权。
+
+`per_class` 增加 `predicted`/`precision`/`f1`，`metric_policy_audit`
+对 NIAH 记录重算三个聚合（有 per-class 计数时），并强制
+`f1_micro == acc`。缺少 F1 的旧记录标为 legacy（不是通过）；声称 F1
+却没有 per-class 计数的记录标为不可复核。PR-AUC/ROC-AUC 仍不伪造：
+top-1 记录没有每类分数，硬造 one-vs-rest 分数会改变被测对象。
+`v10_supp.py` 的 NIAH 记录与报表同步持久化并展示 macro/weighted F1。
+
+### 38.2 「战胜调参过的计数地板」是独立预注册假设
+
+`FLOOR_HYPOTHESIS_DESIGN.method_beats_tuned_count_floor` 把最基本的
+比较写成可审计假设：Δ = 方法臂 PPL − 地板 PPL，`predicted_sign=-1`，
+主指标 `ppl`（`lm_perplexity`），falsifier 是任一声明方法臂不低、未过
+Holm、或行/token 分母不可比。`methodology_audit` 把该假设与
+`method_arm_floor_status` 绑定，输出 `observed_status`
+（supported/falsified/unresolved/unverified）、`observed_sign` 与
+`direction_consistent`；正向显著不再能被自动读成支持声明机制。
+`audit_gates.hypotheses` 也覆盖该假设族。比较仍需先通过
+§26/§27 的可比性、token 分母与 Holm 门槛。

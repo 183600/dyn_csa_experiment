@@ -1771,8 +1771,9 @@ def audit_metrics(outdirs=None):
     micro/weighted；极度不平衡优先 PR-AUC；指标必须对齐任务目标。本审计
     先检查 `exp_lib.METRIC_POLICY` 是否完整声明，再对本地面板检查边界
     指标是否同时给出 precision/recall/随机基线、NIAH 是否同时给出 answer
-    NLL、二分类是否声明决策阈值与来源、校准字段是否在合法范围，以及
-    macro/micro/weighted F1 是否能由 per-class 计数复现。缺失只标
+    NLL 与明确命名的 macro/micro/weighted F1、二分类是否声明决策阈值与
+    来源、校准字段是否在合法范围，以及 F1 是否能由 per-class 计数复现。
+    缺失只标
     warn/不可核验，不伪造一个「通过」。"""
     L = _import_exp_lib()
     out = {'status': 'ok', 'policy': L.metric_policy_audit(), 'panels': {}}
@@ -1840,9 +1841,10 @@ def audit_hypotheses():
     out = {'status': 'ok',
            'component': L.hypothesis_audit(L.HYPOTHESIS_DESIGN, 'component'),
            'baseline': L.hypothesis_audit(L.BASELINE_HYPOTHESIS_DESIGN, 'baseline'),
+           'floor': L.hypothesis_audit(L.FLOOR_HYPOTHESIS_DESIGN, 'floor'),
            'open_block': L.hypothesis_audit(L.OPEN_BLOCK_HYPOTHESIS_DESIGN, 'open_block'),
            'niah': L.hypothesis_audit(L.NIAH_HYPOTHESIS_DESIGN, 'niah')}
-    if any(out[k]['status'] != 'ok' for k in ('component', 'baseline', 'open_block', 'niah')):
+    if any(out[k]['status'] != 'ok' for k in ('component', 'baseline', 'floor', 'open_block', 'niah')):
         out['status'] = 'warn'
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return out

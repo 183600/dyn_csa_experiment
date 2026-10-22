@@ -4835,6 +4835,24 @@ def t_retrieval_metrics_and_niah_trivial_floor():
     assert abs(rm['majority_accuracy'] - 0.75) < 1e-12, rm
     assert abs(rm['acc_lift_over_chance'] - 0.25) < 1e-12, rm
     assert abs(rm['acc_lift_over_majority']) < 1e-12, rm
+    # A multiclass endpoint must name macro/micro/weighted F1.  Micro equals
+    # top-1 accuracy for single-label predictions; macro treats the two
+    # observed answers equally; weighted follows support (3:1 here).
+    assert abs(rm['f1_micro'] - rm['acc']) < 1e-12, rm
+    assert abs(rm['f1_macro'] - (6.0 / 7.0) / 2.0) < 1e-12, rm['f1_macro']
+    assert abs(rm['f1_weighted'] - (3.0 * (6.0 / 7.0) / 4.0)) < 1e-12, rm['f1_weighted']
+    assert rm['per_class']['0']['predicted'] == 4, rm['per_class']
+    assert abs(rm['per_class']['0']['precision'] - 0.75) < 1e-12, rm['per_class']
+    assert rm['n_undeclared_predictions'] == 0, rm
+    # A prediction of a class absent from the answer support is legitimate
+    # (top-1 can emit any token): it counts as an undeclared prediction and
+    # must not make the per-class predicted counts fail to sum to n_queries.
+    rm_u = L.retrieval_metrics([0, 0, 1], [0, 2, 1])
+    assert rm_u['n_undeclared_predictions'] == 1, rm_u
+    assert abs(rm_u['f1_micro'] - rm_u['acc']) < 1e-12, rm_u
+    _rec_u = dict(rm_u, task='niah_natural', nll=1.0, n_queries=rm_u['n'])
+    assert L.metric_policy_audit({'u::seed0': _rec_u})['status'] == 'ok', \
+        L.metric_policy_audit({'u::seed0': _rec_u})
     # The NIAH copy rule is a deterministic lexical floor: it must recover a
     # planted key->value pair by copying after the nearest earlier key, and
     # count a query with no earlier key as missing context (not as a hit).
@@ -4878,6 +4896,21 @@ def t_retrieval_metrics_and_niah_trivial_floor():
     rec = dict(rm, task='niah_natural', nll=1.25, n_queries=rm['n'])
     good = {'n::seed0': rec}
     assert L.metric_policy_audit(good)['status'] == 'ok', L.metric_policy_audit(good)
+    # F1 averages must be complete, reproducible from per-class counts, and
+    # micro F1 must equal accuracy on a single-label endpoint.
+    for _mut, _why in (({'f1_weighted': None}, 'f1-aggregate-invalid'),
+                       ({'f1_micro': 0.1}, 'f1-micro-not-accuracy'),
+                       ({'f1_macro': 0.99}, 'f1-aggregate-inconsistent')):
+        _bad_f1 = json.loads(json.dumps(good))
+        _bad_f1['n::seed0'].update(_mut)
+        _fa = L.metric_policy_audit(_bad_f1)
+        assert _fa['status'] == 'warn', (_mut, _fa)
+        assert any(_why in str(c.get('invalid')) for c in _fa['checks']), (_mut, _fa)
+    _miss_f1 = json.loads(json.dumps(good))
+    del _miss_f1['n::seed0']['f1_weighted']
+    _mfa = L.metric_policy_audit(_miss_f1)
+    assert _mfa['status'] == 'warn' and any(
+        'f1-aggregate-missing' in str(c.get('invalid')) for c in _mfa['checks']), _mfa
     # A persisted lexical copy-rule floor must be reproducible from its exact
     # counts, and a model that does not beat it is called out (the rule is the
     # simplest baseline that can solve this copy task).
@@ -6688,12 +6721,23 @@ def t_simple_floor_contrast_is_significance_aware():
         assert r2['simple_baseline']['panel_beats_simple_floor'] is False, r2['simple_baseline']
         assert r2['simple_baseline']['floor_contrast']['verdict'] == 'does_not_beat_floor', r2['simple_baseline']
         assert any('does not beat the tuned count-model floor' in w for w in r2['warnings']), r2['warnings']
+        _fh2 = r2['simple_baseline'].get('floor_hypothesis') or {}
+        assert _fh2.get('observed_status') == 'falsified', _fh2
+        assert _fh2.get('observed_sign') == 1 and _fh2.get('direction_consistent') is False, _fh2
         # The pre-declared method arm must clear the floor ITSELF.  Selecting
         # the best panel arm post hoc could let a dense baseline rescue the
         # gate while the proposed method is worse than the count model.
         assert fl['method_arms_beat_floor'] is True, fl.get('method_arm_floor_status')
         assert fl['method_arm_floor_status'] == 'all_method_arms_beat_floor', fl.get('method_arm_floor_status')
         assert fl['method_arm_floor_contrasts']['csa_dynamic']['method_status'] == 'beats_floor_holm', fl['method_arm_floor_contrasts']
+        # The floor comparison is a pre-registered directional hypothesis, not
+        # just an arithmetic gate: delta = method - floor, so observed sign -1
+        # supports the claim and a positive mean is a direction conflict.
+        _fh = fl.get('floor_hypothesis') or {}
+        assert _fh.get('observed_status') == 'supported', _fh
+        assert _fh.get('observed_sign') == -1 and _fh.get('direction_consistent') is True, _fh
+        assert _fh.get('audit_status') == 'ok', _fh
+        assert L.hypothesis_audit(L.FLOOR_HYPOTHESIS_DESIGN, 'floor')['status'] == 'ok'
         # The floor is an estimate on the same rows, so the contrast also
         # carries a paired row bootstrap instead of treating it as a constant.
         _fb = fl['method_arm_floor_contrasts']['csa_dynamic'].get('paired_row_bootstrap_delta') or {}
@@ -7171,6 +7215,14 @@ def t_hypothesis_audit_completeness_and_metric_alignment():
     # ablation and the matched-dense baseline both do.
     assert L.HYPOTHESIS_DESIGN['compression_regularizer']['requires_param_match'] is True
     assert L.BASELINE_HYPOTHESIS_DESIGN['compression_vs_matched_dense']['requires_param_match'] is True
+    # Beating the tuned count-model floor is itself a pre-registered
+    # directional hypothesis with its own endpoint and falsifier.
+    _floor_ha = L.hypothesis_audit(L.FLOOR_HYPOTHESIS_DESIGN, 'floor')
+    assert _floor_ha['status'] == 'ok' and not _floor_ha['invalid'], _floor_ha
+    _floor_spec = L.FLOOR_HYPOTHESIS_DESIGN['method_beats_tuned_count_floor']
+    assert _floor_spec['primary_metric'] == 'ppl'
+    assert _floor_spec['metric_policy'] == 'lm_perplexity'
+    assert _floor_spec['predicted_sign'] == -1
     # The NIAH accuracy contrasts now have an explicit pre-registered
     # hypothesis family too, including the reported sign convention.
     _niah_ha = L.hypothesis_audit(L.NIAH_HYPOTHESIS_DESIGN, 'niah')

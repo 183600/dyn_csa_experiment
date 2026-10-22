@@ -826,7 +826,7 @@ def run_probe_cell(cfg, v, seed, guard=None, val_ids=None, mech_summ=None):
         for Ln, cond in _niah_cells:
             res = _niah_ppls(model, val_ids, Ln, _pcfg['n_seq'], _pcfg, cond, row_cache=_row_cache, chunk_mem=_chunk_mem)
             key = _niah_cell_key(v, seed, arm, Ln, cond)
-            rec = {'variant': v, 'seed': seed, 'arm': arm, 'eval_len': int(Ln), 'task': 'niah_natural', 'condition': cond, 'acc': float(res['acc']), 'nll': float(res['nll']), 'n_queries': int(res['n']), 'n_correct': int(res['n_correct']), 'balanced_accuracy': res.get('balanced_accuracy'), 'macro_recall': res.get('macro_recall'), 'n_classes': int(res.get('n_classes') or 0), 'answer_support': res.get('answer_support'), 'per_class_recall': res.get('per_class_recall'), 'per_class': res.get('per_class'), 'chance_accuracy': res.get('chance_accuracy'), 'majority_accuracy': res.get('majority_accuracy'), 'majority_label': res.get('majority_label'), 'acc_lift_over_chance': res.get('acc_lift_over_chance'), 'acc_lift_over_majority': res.get('acc_lift_over_majority'), 'minority_prevalence': res.get('minority_prevalence'), 'imbalance_ratio': res.get('imbalance_ratio'), 'imbalance_warning': res.get('imbalance_warning'), 'recommended_primary_metric': res.get('recommended_primary_metric'), 'recommended_primary_reason': res.get('recommended_primary_reason'), 'recommended_primary_available': res.get('recommended_primary_available'), 'copy_rule_baseline': res.get('copy_rule_baseline'), 'n_pairs': int(res.get('n_pairs', (_niah_cfg or {}).get('n_pairs', 8))), 'dist_mean': float(res.get('dist_mean', float('nan'))), 'dist_min': int(res.get('dist_min', -1)), 'dist_max': int(res.get('dist_max', -1)), 'rho': float(res.get('rho', 0.0)), 'val_fp': _val_fp, '_code': V.CKPT_CODE, 'probe_params': _niah_fp_of(cond), 'recipe': _ck_recipe}
+            rec = {'variant': v, 'seed': seed, 'arm': arm, 'eval_len': int(Ln), 'task': 'niah_natural', 'condition': cond, 'acc': float(res['acc']), 'nll': float(res['nll']), 'n_queries': int(res['n']), 'n_correct': int(res['n_correct']), 'balanced_accuracy': res.get('balanced_accuracy'), 'macro_recall': res.get('macro_recall'), 'f1_macro': res.get('f1_macro'), 'f1_micro': res.get('f1_micro'), 'f1_weighted': res.get('f1_weighted'), 'f1_averaging': res.get('f1_averaging'), 'n_undeclared_predictions': res.get('n_undeclared_predictions'), 'n_classes': int(res.get('n_classes') or 0), 'answer_support': res.get('answer_support'), 'per_class_recall': res.get('per_class_recall'), 'per_class': res.get('per_class'), 'chance_accuracy': res.get('chance_accuracy'), 'majority_accuracy': res.get('majority_accuracy'), 'majority_label': res.get('majority_label'), 'acc_lift_over_chance': res.get('acc_lift_over_chance'), 'acc_lift_over_majority': res.get('acc_lift_over_majority'), 'minority_prevalence': res.get('minority_prevalence'), 'imbalance_ratio': res.get('imbalance_ratio'), 'imbalance_warning': res.get('imbalance_warning'), 'recommended_primary_metric': res.get('recommended_primary_metric'), 'recommended_primary_reason': res.get('recommended_primary_reason'), 'recommended_primary_available': res.get('recommended_primary_available'), 'copy_rule_baseline': res.get('copy_rule_baseline'), 'n_pairs': int(res.get('n_pairs', (_niah_cfg or {}).get('n_pairs', 8))), 'dist_mean': float(res.get('dist_mean', float('nan'))), 'dist_min': int(res.get('dist_min', -1)), 'dist_max': int(res.get('dist_max', -1)), 'rho': float(res.get('rho', 0.0)), 'val_fp': _val_fp, '_code': V.CKPT_CODE, 'probe_params': _niah_fp_of(cond), 'recipe': _ck_recipe}
             L.locked_json_update(_nspath, (lambda s, _p=dict({key: rec}): (s.update(_p), s)[1]), indent=1)
             _log_metrics[key] = {'acc': float(rec['acc']), 'nll': float(rec['nll']), 'n_queries': int(rec['n_queries'])}
             print(f"  [niah] {key:48s} acc={rec['acc']:.3f} nll={rec['nll']:.3f}", flush=True)
@@ -1675,11 +1675,19 @@ def v10_analysis(out='analysis_v10/stats.json'):
                 accs = {s: r['acc'] for s, r in by_seed.items()}
                 nlls = {s: r['nll'] for s, r in by_seed.items()}
                 bals = {s: r.get('balanced_accuracy') for s, r in by_seed.items()}
+                _f1m = {s: r.get('f1_macro') for s, r in by_seed.items()}
+                _f1w = {s: r.get('f1_weighted') for s, r in by_seed.items()}
                 _first = next(iter(by_seed.values()))
                 _bal_vals = [float(x) for x in bals.values()
                              if isinstance(x, (int, float)) and not isinstance(x, bool)
                              and math.isfinite(float(x))]
-                niah_cells.append({'variant': v, 'arm': arm, 'eval_len': Ln, 'condition': cond, 'seeds': sorted(accs), 'acc_by_seed': accs, 'nll_by_seed': nlls, 'balanced_by_seed': bals, 'acc_mean': float(np.mean(list(accs.values()))), 'balanced_mean': (float(np.mean(_bal_vals)) if _bal_vals else None), 'nll_mean': float(np.mean(list(nlls.values()))), 'recommended_primary_metric': _first.get('recommended_primary_metric'), 'copy_rule_acc': (_first.get('copy_rule_baseline') or {}).get('acc'), 'copy_rule_n_missing_context': (_first.get('copy_rule_baseline') or {}).get('n_missing_context'), 'minority_prevalence': _first.get('minority_prevalence'), 'chance_accuracy': _first.get('chance_accuracy'), 'majority_accuracy': _first.get('majority_accuracy'), 'n_classes': _first.get('n_classes'), 'n': len(accs), 'n_pairs': _first.get('n_pairs'), 'dist_mean': _first.get('dist_mean'), 'val_fp': _vfp, 'probe_params': _first.get('probe_params'), '_code': _cd, 'recipe': _recipe})
+                _f1m_vals = [float(x) for x in _f1m.values()
+                             if isinstance(x, (int, float)) and not isinstance(x, bool)
+                             and math.isfinite(float(x))]
+                _f1w_vals = [float(x) for x in _f1w.values()
+                             if isinstance(x, (int, float)) and not isinstance(x, bool)
+                             and math.isfinite(float(x))]
+                niah_cells.append({'variant': v, 'arm': arm, 'eval_len': Ln, 'condition': cond, 'seeds': sorted(accs), 'acc_by_seed': accs, 'nll_by_seed': nlls, 'balanced_by_seed': bals, 'f1_macro_by_seed': _f1m, 'f1_weighted_by_seed': _f1w, 'acc_mean': float(np.mean(list(accs.values()))), 'balanced_mean': (float(np.mean(_bal_vals)) if _bal_vals else None), 'f1_macro_mean': (float(np.mean(_f1m_vals)) if _f1m_vals else None), 'f1_weighted_mean': (float(np.mean(_f1w_vals)) if _f1w_vals else None), 'nll_mean': float(np.mean(list(nlls.values()))), 'recommended_primary_metric': _first.get('recommended_primary_metric'), 'copy_rule_acc': (_first.get('copy_rule_baseline') or {}).get('acc'), 'copy_rule_n_missing_context': (_first.get('copy_rule_baseline') or {}).get('n_missing_context'), 'minority_prevalence': _first.get('minority_prevalence'), 'chance_accuracy': _first.get('chance_accuracy'), 'majority_accuracy': _first.get('majority_accuracy'), 'n_classes': _first.get('n_classes'), 'n': len(accs), 'n_pairs': _first.get('n_pairs'), 'dist_mean': _first.get('dist_mean'), 'val_fp': _vfp, 'probe_params': _first.get('probe_params'), '_code': _cd, 'recipe': _recipe})
             niah_contrasts = {}
             niah_acc_contrasts = {}
             _nidx = {}
@@ -2057,13 +2065,15 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
         A('')
         A('**设计**：序列 = 远端自然文本（内嵌 8 个 key→value 耦合）+ 目标区（自然文本收尾 + 8 个查询 key）。查询 key 的下一个 token 的正确答案只在远端出现——正确预测**必须**利用远距信息；`distract` 条件把 ρ=0.5 的远端草料换成其他真实序列的 token（realistic-token 替换；不是主题/语义干扰），但**绝不腐坏耦合位置**。报告 answer top-1 准确率与 answer NLL（已按各臂 clean/distract 成对）。')
         A('')
-        A('| 臂 | L | 条件 | acc (微) | macro-recall | 均匀 chance | 多数类 floor | answer NLL | n |')
-        A('|---|---|---|---|---|---|---|---|---|')
+        A('| 臂 | L | 条件 | acc (微) | macro-recall | F1 macro | F1 weighted | 均匀 chance | 多数类 floor | answer NLL | n |')
+        A('|---|---|---|---|---|---|---|---|---|---|---|')
         for c in sorted(niah['cells'], key=lambda c: (c['eval_len'], c['condition'], c['variant'], c['arm'])):
             _bal = (f"{c['balanced_mean']:.3f}" if c.get('balanced_mean') is not None else 'n/a')
+            _f1m = (f"{c['f1_macro_mean']:.3f}" if c.get('f1_macro_mean') is not None else 'n/a')
+            _f1w = (f"{c['f1_weighted_mean']:.3f}" if c.get('f1_weighted_mean') is not None else 'n/a')
             _ch = (f"{c['chance_accuracy']:.3f}" if isinstance(c.get('chance_accuracy'), (int, float)) else 'n/a')
             _mj = (f"{c['majority_accuracy']:.3f}" if isinstance(c.get('majority_accuracy'), (int, float)) else 'n/a')
-            A(f"| `{c['variant']}::{c['arm']}` | {c['eval_len']} | {c['condition']} | {c['acc_mean']:.3f} | {_bal} | {_ch} | {_mj} | {c['nll_mean']:.3f} | {c['n']} |")
+            A(f"| `{c['variant']}::{c['arm']}` | {c['eval_len']} | {c['condition']} | {c['acc_mean']:.3f} | {_bal} | {_f1m} | {_f1w} | {_ch} | {_mj} | {c['nll_mean']:.3f} | {c['n']} |")
         A('')
         if niah.get('contrasts'):
             A('| NIAH 配对比较（Δ = 对照臂 − 学习选择，answer NLL，>0 = 学习选择更好） | n | Δ mean±std | p (exact) | p (Holm) |')
@@ -2083,7 +2093,7 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
             A('')
         A('> 该任务直接检验「长距离信息**利用**能力」，与上面的干扰鲁棒性互补：鲁棒性高 + 检索利用不差，才支持「稀疏选择在滤噪的同时保留了有用远距信息」；若只有鲁棒性而检索差，则更符合「本来就少用远端」的替代解释。')
         A('')
-        A('> **平凡基线**：`均匀 chance` = 1 / 实际出现的答案类别数；`多数类 floor` = 总是预测出现最多的答案 token。`acc (微)` 会被高频答案主导，`macro-recall` 对每个答案类别等权；读检索收益时必须三列一起看。')
+        A('> **平凡基线**：`均匀 chance` = 1 / 实际出现的答案类别数；`多数类 floor` = 总是预测出现最多的答案 token。`acc (微)` 会被高频答案主导，`macro-recall` 对每个答案类别等权；`F1 macro` 对每个出现过的答案类别等权，`F1 weighted` 按答案支持度加权（单标签 top-1 任务的 `F1 micro` 恒等于 acc，已写在记录里）。读检索收益时必须把这些列一起看；PR-AUC/ROC-AUC 需要每类分数，top-1 记录不伪造。')
         A('')
     A('### 统计口径')
     A('')
