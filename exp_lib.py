@@ -14464,8 +14464,12 @@ def ngram_reference_score(train_ids, eval_ids, vocab_size, *, order=2,
 
     The top-1 prediction is the exact argmax of the interpolated model, not a
     backoff guess: for a seen context the maximum is either the best observed
-    successor or the global unigram argmax (the best zero-count token).  That
-    keeps the reference honest and cheap even when the vocabulary scales.
+    successor or the best *unseen* token (which can differ from the global
+    unigram argmax when that token is already a successor).  Ties are broken
+    by the lowest token id, matching ``np.argmax``.  The unigram ranking is
+    sorted once per call and each context only scans successors plus the
+    first unseen candidate, so a large vocabulary does not turn this into an
+    ``O(contexts * vocab)`` scan.
     """
     raw_order = order
     if isinstance(raw_order, (bool, np.bool_)):
@@ -14553,24 +14557,64 @@ def ngram_reference_score(train_ids, eval_ids, vocab_size, *, order=2,
         p_bg = (c_pair + alpha) / (c_ctx + alpha * vocab_size)
         p = interpolation * p_bg + (1.0 - interpolation) * uni_prob[targets.reshape(-1)]
         nll = -np.log(np.maximum(p, np.finfo(float).tiny)).reshape(targets.shape)
+        # Rank the unigram distribution once: unseen tokens are ordered by
+        # unigram probability (ties by token id), and a context only needs
+        # the first ranked token it did not observe as a successor.  When
+        # interpolation=1 the conditional term is identical for every unseen
+        # token, so the winner is simply the smallest unseen id.
+        if interpolation >= 1.0:
+            uni_order = None
+        else:
+            uni_order = np.lexsort((np.arange(vocab_size, dtype=np.int64),
+                                    -uni_prob))
         uniq_ctx, inv = np.unique(prev, return_inverse=True)
         tops = np.empty(uniq_ctx.size, dtype=np.int64)
         for j, c in enumerate(uniq_ctx):
             c = int(c)
-            if ctx[c] <= 0:
-                tops[j] = uni_top
-                continue
             lo = int(np.searchsorted(uniq, c * vocab_size))
             hi = int(np.searchsorted(uniq, (c + 1) * vocab_size))
             succ = uniq[lo:hi] - c * vocab_size
             cnts = pair_counts[lo:hi].astype(np.float64)
             den = float(ctx[c]) + alpha * vocab_size
-            seen_scores = interpolation * ((cnts + alpha) / den) + (1.0 - interpolation) * uni_prob[succ]
-            best_seen = int(np.argmax(seen_scores))
-            unseen_score = (interpolation * (alpha / den)
-                            + (1.0 - interpolation) * uni_prob[uni_top])
-            tops[j] = (uni_top if unseen_score > float(seen_scores[best_seen])
-                       else int(succ[best_seen]))
+            best_id = None
+            best_score = -np.inf
+            if succ.size:
+                seen_scores = (interpolation * ((cnts + alpha) / den)
+                               + (1.0 - interpolation) * uni_prob[succ])
+                best_seen = int(np.argmax(seen_scores))
+                best_id = int(succ[best_seen])
+                best_score = float(seen_scores[best_seen])
+            if succ.size < vocab_size:
+                if interpolation >= 1.0:
+                    # Smallest token id that is not a successor.
+                    cand = 0
+                    for s in succ.tolist():
+                        if s == cand:
+                            cand += 1
+                        elif s > cand:
+                            break
+                    unseen_id = cand
+                else:
+                    assert uni_order is not None
+                    pos = 0
+                    while pos < uni_order.size:
+                        cand = int(uni_order[pos])
+                        k = int(np.searchsorted(succ, cand))
+                        if k >= succ.size or int(succ[k]) != cand:
+                            break
+                        pos += 1
+                    unseen_id = int(uni_order[pos])
+                unseen_score = (interpolation * (alpha / den)
+                                + (1.0 - interpolation) * uni_prob[unseen_id])
+                if (unseen_score > best_score
+                        or (unseen_score == best_score
+                            and (best_id is None or unseen_id < best_id))):
+                    best_id, best_score = unseen_id, unseen_score
+            if best_id is None:
+                # Every token is observed after this context; the seen argmax
+                # above always exists in that case.
+                best_id = uni_top
+            tops[j] = best_id
         top1 = tops[inv].reshape(targets.shape)
     out['nll'] = nll
     out['top1_ids'] = top1

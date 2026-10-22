@@ -984,6 +984,32 @@ def t_reference_count_model_is_exact_and_bounded():
     cap = L.ngram_reference_score(train, ev, V, order=2, max_fit_tokens=40)
     assert cap['fit']['n_fit_tokens'] == 40 and cap['fit']['fit_truncated'] is True, cap['fit']
     assert cap['fit']['n_source_tokens'] == int(train.size), cap['fit']
+    # Sparse/tied contexts: the best unseen token is not always the global
+    # unigram argmax (it may already be a successor), and an exact argmax
+    # breaks a score tie by the lowest token id.  A backoff guess used to
+    # disagree with np.argmax here.
+    rng2 = np.random.default_rng(11)
+    for _ in range(40):
+        _V = int(rng2.integers(2, 13))
+        _train = rng2.integers(0, _V, size=int(rng2.integers(0, 40)), dtype=np.int64)
+        _ev = rng2.integers(0, _V, size=(2, 6), dtype=np.int64)
+        _uni, _pk, _ctx, _pc = L._ngram_train_counts(_train, _V)
+        _up = (_uni + alpha) / (_uni.sum() + alpha * _V)
+        for _lam in (0.0, 0.25, 0.5, 0.75, 1.0):
+            _r = L.ngram_reference_score(_train, _ev, _V, order=2,
+                                          alpha=alpha, interpolation=_lam)
+            for _row in range(_ev.shape[0]):
+                for _j in range(1, _ev.shape[1]):
+                    _p = int(_ev[_row, _j - 1])
+                    _probs = np.array([
+                        (float(_pc[int(np.searchsorted(_pk, _p * _V + _v))])
+                         if (int(np.searchsorted(_pk, _p * _V + _v)) < _pk.size
+                             and int(_pk[int(np.searchsorted(_pk, _p * _V + _v))]) == _p * _V + _v)
+                         else 0.0)
+                        for _v in range(_V)], dtype=float)
+                    _probs = _lam * ((_probs + alpha) / (_ctx[_p] + alpha * _V)) + (1 - _lam) * _up
+                    assert int(_r['top1_ids'][_row, _j - 1]) == int(np.argmax(_probs)), (
+                        _V, _lam, _row, _j, _r['top1_ids'][_row, _j - 1], int(np.argmax(_probs)))
     # Invalid smoothing/order is refused rather than silently replaced.
     for bad in ({'order': 3}, {'order': True}, {'alpha': 0.0}, {'alpha': float('nan')},
                 {'interpolation': -0.1}, {'interpolation': 1.1}):
