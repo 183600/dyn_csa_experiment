@@ -1542,13 +1542,93 @@ def _valid_sha256(value):
             and re.fullmatch(r'[0-9a-fA-F]{64}', value or '') is not None)
 
 
+def _manifest_requires_params(manifest):
+    """Whether the frozen plan's own disclosure makes `params` mandatory.
+
+    Parameter matching is part of the frozen comparison contract: the main
+    dense reference is widened to match the CSA parameter total.  A plan that
+    discloses `compute_budget_disclosure.parameter_matching` therefore cannot
+    accept a confirmation record with no parameter count — the decision rule's
+    `param_matched is not false` would otherwise be satisfied by *unknown*.
+    Descriptive-only smoke plans and legacy manifests without the disclosure
+    keep the permissive path (and still report `param_matched=None`).
+    """
+    if not isinstance(manifest, dict):
+        return False
+    if (manifest.get('statistics') or {}).get('descriptive_only') is True:
+        return False
+    _cbd = manifest.get('compute_budget_disclosure')
+    return (isinstance(_cbd, dict)
+            and bool(str(_cbd.get('parameter_matching') or '').strip()))
+
+
+def _param_match_detail(recs_a, recs_b, seeds, a='a', b='b'):
+    """Per-seed parameter identity for one confirmatory comparison.
+
+    A single seed carrying `params` cannot certify an arm's capacity: the
+    frozen decision rule uses the arm totals, and `_params_of_arm` in
+    `exp_lib` already refuses a partial/mixed arm.  This helper reports the
+    per-seed counts, requires every usable seed on BOTH sides, and requires
+    each arm's own counts to be internally identical before returning a
+    True/False verdict.  Anything missing/inconsistent is `None`
+    (unverifiable), never silently treated as a match.
+    """
+    out = {'params_a': None, 'params_b': None, 'param_rel_diff': None,
+           'param_matched': None, 'param_match_complete': False,
+           'param_match_reason': None,
+           'params_by_seed': {'a': {}, 'b': {}},
+           'param_consistent': {'a': None, 'b': None}}
+    seeds = list(seeds or [])
+    side = {'a': recs_a, 'b': recs_b}
+    missing = {'a': [], 'b': []}
+    for label, recs in side.items():
+        vals = {}
+        for s in seeds:
+            rec = recs.get(s)
+            v = _record_int(rec.get('params')) if isinstance(rec, dict) else None
+            if v is None or v <= 0:
+                missing[label].append(int(s))
+            else:
+                vals[int(s)] = int(v)
+        out['params_by_seed'][label] = {str(k): int(v) for k, v in sorted(vals.items())}
+        out['param_consistent'][label] = (len(set(vals.values())) <= 1) if vals else None
+    if not seeds:
+        out['param_match_reason'] = 'no usable seed pairs'
+        return out
+    _bad = []
+    _names = {'a': a, 'b': b}
+    for label in ('a', 'b'):
+        if missing[label]:
+            _bad.append(f'{_names[label]} missing/invalid params for seed(s) '
+                        f'{sorted(missing[label])}')
+        elif out['param_consistent'][label] is False:
+            _bad.append(f'{_names[label]} has different params across its own '
+                        f"seeds ({sorted(set(out['params_by_seed'][label].values()))})")
+    if _bad:
+        out['param_match_reason'] = '; '.join(_bad)
+        return out
+    _pa = list(out['params_by_seed']['a'].values())
+    _pb = list(out['params_by_seed']['b'].values())
+    out['params_a'] = float(np.mean(_pa))
+    out['params_b'] = float(np.mean(_pb))
+    out['param_match_complete'] = True
+    _am, _bm = out['params_a'], out['params_b']
+    _rel = abs(_am - _bm) / max(_am, _bm, 1.0)
+    out['param_rel_diff'] = float(_rel)
+    out['param_matched'] = bool(_rel <= 0.01)
+    return out
+
+
 def _admit_confirmation_records(raw, manifest):
     """Strict admission gate for confirmation records.
 
     一条 bylen 记录要进入确认统计，必须同时满足：
       split==test、variant 在冻结臂内、seed 在冻结白名单内、_code 等于冻结
     清单声明的代码语义、manifest_sha256 等于当前清单哈希（同修订轮）、
-    data_fp 非空、recipe 通过冻结配方签名、by_len 非空。
+    data_fp 非空、recipe 通过冻结配方签名、by_len 非空。清单披露了
+    `compute_budget_disclosure.parameter_matching` 时，参数计数（params）
+    也必须有有效正值——否则决策规则的「param_matched is not false」会把
+    「未知」当成通过。
     不满足者被**点名剔除**（不入统计，也不静默消失）；同一 (variant, seed)
     出现两条可采纳记录 = 歧义，**拒绝运行**（而不是后者覆盖前者）；
     可采纳记录的 data_fp 必须全局唯一（同一冻结 test 切片），否则拒绝；
@@ -1581,6 +1661,11 @@ def _admit_confirmation_records(raw, manifest):
     _any_train_fp = any(isinstance(_r, dict) and bool(_r.get('train_fp'))
                         for _r in (raw or {}).values())
     _require_train_fp = _train_fp_required(manifest) or bool(want_train_fp) or _any_train_fp
+    # A disclosed parameter-matching contract makes the parameter count part of
+    # the measurement identity.  Missing counts are named exclusions, so the
+    # decision rule cannot read an unverifiable `param_matched=None` as "not
+    # false" and confirm a comparison that was never capacity-checked.
+    _require_params = _manifest_requires_params(manifest)
     _bind = manifest.get('binding') or {}
     _any_ckpt = any(isinstance(_r, dict) and bool(_r.get('ckpt_sha256'))
                     for _r in (raw or {}).values())
@@ -1630,6 +1715,10 @@ def _admit_confirmation_records(raw, manifest):
                 why = 'recipe does not match the frozen training_recipe signature (including the per-arm mr)'
             elif _implementation_reason(r, impl) is not None:
                 why = _implementation_reason(r, impl)
+            elif _require_params and ((_record_int(r.get('params')) or 0) <= 0):
+                why = ('missing/invalid parameter count (params) — the frozen '
+                       'plan discloses parameter matching, so capacity is part '
+                       'of the measurement identity and cannot be left unknown')
             elif not isinstance(r.get('by_len'), dict) or not r.get('by_len'):
                 why = 'no by_len measurement'
             else:
@@ -1961,6 +2050,17 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
         if _missing:
             raise SystemExit(f'[p5t stats] REFUSE: the frozen plan lacks compute-budget disclosure {_missing}. Parameter matching is not compute matching; the report must state the FLOPs/read-budget mismatch next to every primary comparison .')
     stats['compute_budget_disclosure'] = _cbd
+    stats['parameter_binding'] = {
+        'required_by_manifest': bool(_manifest_requires_params(manifest)),
+        'confirmation_requires_complete': bool(_manifest_requires_params(manifest)),
+        'n_admitted_records': len(admitted),
+        'n_admitted_without_params': sum(
+            1 for r in admitted.values()
+            if (_record_int(r.get('params')) or 0) <= 0),
+        'note': ('a disclosed parameter-matching contract makes params part of '
+                 'the admission identity; a missing count is excluded rather '
+                 'than read as param_matched=None'),
+    }
     for v in manifest['arms']:
         rows = [r for (rv, s), r in admitted.items() if rv == v]
         _lens = sorted({n for n in (_record_int(k) for r in rows for k in (r.get('by_len') or {}))
@@ -2047,18 +2147,8 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
             res['p_floor_effective'] = _fl_eff
             res['min_attainable_p_holm_effective'] = L.holm_min_attainable_p(_floor_n, len(manifest['primary_comparisons']), _alpha)
             res['power_first_holm_gate_effective'] = {f'q={q:.2f}': L.signflip_power(_floor_n, len(manifest['primary_comparisons']), q, _alpha) for q in (0.8, 0.85, 0.9, 0.95)}
-        _pa = [p for p in (L._finite_scalar(recs_a[s].get('params')) for s in usable) if p is not None]
-        _pb = [p for p in (L._finite_scalar(recs_b[s].get('params')) for s in usable) if p is not None]
-        if _pa and _pb:
-            _am, _bm = float(np.mean(_pa)), float(np.mean(_pb))
-            _rel = abs(_am - _bm) / max(_am, _bm, 1.0)
-            res['param_matched'] = bool(_rel <= 0.01)
-            res['param_rel_diff'] = float(_rel)
-            res['params_a'] = _am
-            res['params_b'] = _bm
-        else:
-            res['param_matched'] = None
-            res['param_rel_diff'] = None
+        _param = _param_match_detail(recs_a, recs_b, usable, a, b)
+        res.update(_param)
         _iv = sorted({str(recs_a[s].get('init_core_fp')) for s in usable if recs_a[s].get('init_core_fp')} |
                      {str(recs_b[s].get('init_core_fp')) for s in usable if recs_b[s].get('init_core_fp')})
         res['same_init_core_fp'] = (len(_iv) <= 1)
@@ -2124,8 +2214,21 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
     # checkpoints or the health gate; those are not random attrition, so the
     # shipped plan refuses to call such a subset "confirmed".  The 8-pair floor
     # remains the mathematical resolution floor and is still reported.
+    # A disclosed parameter-matching contract is only satisfied by a COMPLETE
+    # per-seed parameter record.  `param_matched is not false` alone would also
+    # accept None (missing/inconsistent evidence), which is exactly the
+    # unknown-as-pass path the admission gate was added to close.  Legacy
+    # manifests without the disclosure keep the historical wording.
+    _param_required = bool(_manifest_requires_params(manifest))
+
+    def _param_gate(k):
+        if not _param_required:
+            return True
+        return stats['comparisons'].get(k, {}).get('param_match_complete') is True
+
     _conf = [k for k in _rej if stats['comparisons'].get(k, {}).get('direction_ok') is True
              and stats['comparisons'].get(k, {}).get('param_matched') is not False
+             and _param_gate(k)
              and int(stats['comparisons'].get(k, {}).get('n_effective') or 0) >= int(stats['comparisons'].get(k, {}).get('min_seeds_for_confirmation') or len(manifest['seeds']))
              and (not _require_cov or stats['comparisons'].get(k, {}).get('coverage_ok') is True)]
     stats['coverage_requirement'] = {
@@ -2138,6 +2241,8 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
     stats['confirmed'] = _conf
     stats['significant_nondirectional'] = [k for k in _rej if stats['comparisons'].get(k, {}).get('direction_ok') is None]
     stats['not_confirmed_reasons'] = {k: {'param_matched': stats['comparisons'].get(k, {}).get('param_matched'),
+                                          'param_match_complete': stats['comparisons'].get(k, {}).get('param_match_complete'),
+                                          'param_match_reason': stats['comparisons'].get(k, {}).get('param_match_reason'),
                                           'coverage_ok': stats['comparisons'].get(k, {}).get('coverage_ok'),
                                           'coverage_required': bool(_require_cov),
                                           'n_effective': stats['comparisons'].get(k, {}).get('n_effective'),

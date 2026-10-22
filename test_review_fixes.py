@@ -16761,6 +16761,119 @@ def t_pool_geometry_widens_instead_of_wrapping():
     assert g2.starts.dtype == torch.int32, g2.starts.dtype
 
 
+def t_aggregate_wrapper_preserves_pairs_and_splits_code():
+    # `aggregate_with_exclusions` is what every panel dump uses.  Its old
+    # per-variant grouping removed the baseline before `aggregate` could pair,
+    # so every shipped aggregate silently lost dPPL_vs_full / n_paired.
+    base = {'run_cfg': 'cfg1', 'steps': 10, 'tokens_seen': 1000,
+            'params': 100, '_code': 'v1'}
+    summary = {}
+    for variant, ppl in (('csa_dynamic', 10.0), ('full', 13.0)):
+        for seed in (0, 1):
+            summary[f'{variant}::s{seed}'] = dict(
+                base, variant=variant, seed=seed, ppl=ppl + seed,
+                nll_sum=(ppl + seed) * 1000, n_tokens=1000)
+    agg, rep, admitted = L.aggregate_with_exclusions(summary)
+    assert len(admitted) == 4, admitted
+    arm = agg['csa_dynamic']
+    assert arm.get('dPPL_vs_full_mean') == -3.0, arm
+    assert arm.get('n_paired') == 2, arm
+    # A non-nested record must be labelled full_validation; a set {False} is
+    # truthy and used to mislabel every ordinary panel as nested-holdout.
+    assert arm.get('ppl_primary_estimand') == 'full_validation', arm
+    assert agg['full'].get('ppl_primary_estimand') == 'full_validation'
+    # Two code stamps are two measurements, not two seeds: split, never pool.
+    mixed = {k: dict(v, _code=('v1' if v['seed'] == 0 else 'v2'))
+             for k, v in summary.items()}
+    agg2, rep2, _ = L.aggregate_with_exclusions(mixed)
+    assert len(agg2) == 4 and any('@fp' in k for k in agg2), list(agg2)
+    assert all(v['n_seeds'] == 1 for v in agg2.values()), agg2
+    assert all(v.get('dPPL_vs_full_mean') is not None for k, v in agg2.items()
+               if k.startswith('csa_dynamic@')), agg2
+    assert len(rep2['fingerprint_split_groups']) == 2, rep2
+    # A nested-holdout record keeps its declared estimand label.
+    nested = dict(summary['csa_dynamic::s0'], seed=0,
+                  ppl_estimation_rows='nested_validation_holdout',
+                  ppl_holdout=9.0)
+    a1, _r1, _ad1 = L.aggregate_with_exclusions(
+        {f'csa_dynamic::s0': nested,
+         'full::s0': dict(summary['full::s0'])})
+    assert a1['csa_dynamic']['ppl_primary_estimand'] == 'nested_validation_holdout', a1
+    assert a1['csa_dynamic']['ppl_primary'] == 9.0, a1
+
+
+def t_code_semantics_enters_arm_and_control_identity():
+    def rec(v, seed, code, ppl):
+        return {'variant': v, 'seed': seed, '_code': code, 'run_cfg': 'cfg',
+                'steps': 10, 'tokens_seen': 1000, 'params': 100, 'ppl': ppl,
+                'nll_sum': ppl * 1000, 'n_tokens': 1000}
+    recs = {('a', '', 0): rec('a', 0, 'v1', 10.0),
+            ('a', '', 1): rec('a', 1, 'v1', 11.0),
+            ('b', '', 0): rec('b', 0, 'v2', 12.0),
+            ('b', '', 1): rec('b', 1, 'v2', 13.0)}
+    cv = L.controlled_variables_report(recs, ['a', 'b'])
+    assert cv['code_equal'] is False and cv['controlled'] is False, cv
+    assert '_code' in cv['differences'], cv
+    recs['a', '', 1] = dict(recs['a', '', 1], _code='v2')
+    cv2 = L.controlled_variables_report(recs, ['a', 'b'])
+    assert 'a' in cv2['within_arm_mixed'], cv2
+    assert cv2['controlled'] is False, cv2
+    # Arm summaries split by code stamp and use the correct estimand label.
+    summary = {f'a::s{s}': rec('a', s, ('v1' if s == 0 else 'v2'), 10.0 + s)
+               for s in (0, 1)}
+    rep = L.methodology_audit(summary, design={}, baselines={}, write=False,
+                              verbose=False)
+    keys = [k for k in rep['arm_summary'] if k.startswith('a')]
+    assert len(keys) == 2, rep['arm_summary']
+    assert all(rep['arm_summary'][k]['n_seeds'] == 1 for k in keys)
+    assert all(rep['arm_summary'][k]['ppl_estimand'] == 'full_validation'
+               for k in keys), rep['arm_summary']
+
+
+def t_confirmation_parameter_binding():
+    m = _manifest_for_admission(seeds=(0, 1))
+    m['compute_budget_disclosure'] = {'parameter_matching': 'matched by mr'}
+    m['statistics']['descriptive_only'] = False
+    good = {}
+    for v in ('a_arm', 'b_arm'):
+        for s in (0, 1):
+            good[f'{v}::s{s}'] = dict(_rec(v, s, 'FP'), params=100)
+    adm, _fp = V12._admit_confirmation_records(good, m)
+    assert len(adm) == 4, adm
+    bad = {k: dict(r) for k, r in good.items()}
+    del bad['a_arm::s1']['params']
+    adm2, _fp2 = V12._admit_confirmation_records(bad, m)
+    assert ('a_arm', 1) not in adm2 and len(adm2) == 3, adm2
+    # Descriptive-only smoke plans keep the legacy permissive path.
+    m_desc = dict(m, statistics=dict(m['statistics'], descriptive_only=True))
+    adm3, _fp3 = V12._admit_confirmation_records(bad, m_desc)
+    assert len(adm3) == 4, adm3
+    # Per-seed parameter identity: partial/inconsistent evidence is not a pass.
+    ra = {0: {'params': 100}, 1: {'params': 100}}
+    rb = {0: {'params': 100}, 1: {'params': 100}}
+    d = V12._param_match_detail(ra, rb, [0, 1], 'a', 'b')
+    assert d['param_match_complete'] is True and d['param_matched'] is True, d
+    # A small total difference is still within the 1% tolerance.
+    rb_ok = {0: {'params': 100}, 1: {'params': 100}}
+    d_ok = V12._param_match_detail(ra, rb_ok, [0, 1], 'a', 'b')
+    assert d_ok['param_matched'] is True, d_ok
+    d2 = V12._param_match_detail(ra, {0: {'params': 100}}, [0, 1], 'a', 'b')
+    assert d2['param_match_complete'] is False and d2['param_matched'] is None, d2
+    d3 = V12._param_match_detail({0: {'params': 100}, 1: {'params': 200}},
+                                 rb, [0, 1], 'a', 'b')
+    assert d3['param_match_complete'] is False and d3['param_matched'] is None, d3
+    assert d3['param_match_reason'], d3
+    # The manifest disclosure is what makes params mandatory; descriptive-only
+    # smoke plans keep the legacy path.
+    assert V12._manifest_requires_params(m) is True
+    assert V12._manifest_requires_params(m_desc) is False
+    assert V12._manifest_requires_params({'statistics': {}}) is False
+    # Two internally consistent arms beyond 1% are a real mismatch, not None.
+    d4 = V12._param_match_detail(ra, {0: {'params': 200}, 1: {'params': 200}},
+                                 [0, 1], 'a', 'b')
+    assert d4['param_match_complete'] is True and d4['param_matched'] is False, d4
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -17201,6 +17314,9 @@ def main():
     _check('L101 float index boundary casts are range-guarded', t_index_float_boundary_casts_are_guarded)
     _check('L102 confirmation admission rejects non-object payloads', t_confirmation_admission_rejects_nonobject_payload)
     _check('L103 segment sums accumulate in wide precision', t_segment_sum_accumulates_precisely)
+    _check('L104 aggregate wrapper preserves paired dPPL and splits code stamps', t_aggregate_wrapper_preserves_pairs_and_splits_code)
+    _check('L105 code semantics enter arm/control identity', t_code_semantics_enters_arm_and_control_identity)
+    _check('L106 confirmation binds parameter counts per seed', t_confirmation_parameter_binding)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

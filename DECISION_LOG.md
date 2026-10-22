@@ -1431,3 +1431,56 @@ fingerprint boundaries, int32→int64 pool geometry, float index boundaries,
 non-object confirmation payload, wide segment-sum accumulation).  `python
 test_review_fixes.py` passes 436/439 with the same 3 DataLoader environment
 skips; `python test_open_block.py` passes 15/15.
+
+## 2026-10-22 — measurement identity, paired aggregation and confirmation parameter binding (no new runs)
+
+**Problem.** Three analysis-layer paths let "paired" or "confirmed" mean less
+than the frozen protocol says. (1) `_dump_aggregate` uses
+`aggregate_with_exclusions`, whose old grouping split each variant first and
+then called `aggregate` on one arm at a time. Every subgroup therefore lacked
+the `full` baseline, so the shipped panel dumps silently lost
+`dPPL_vs_full` / `n_paired` even though a direct `aggregate` computed them.
+(2) Two records with different `_code` stamps were pooled as extra seeds by
+`aggregate`, the arm summaries and `controlled_variables_report` when their
+`run_cfg` happened to match; legacy records without the suffix were treated as
+mergeable with current measurements. (3) `aggregate` and `methodology_audit`
+tested the set `{False}` for truthiness, labelling every ordinary
+full-validation arm as `nested_validation_holdout`. (4) Confirmation admission
+did not require `params` even when the frozen plan discloses parameter
+matching, so the decision rule's `param_matched is not false` could be
+satisfied by `param_matched=None`; one seed's parameter count could also
+certify an entire arm.
+
+**Changes.** (1) `aggregate_with_exclusions` now groups by
+`(protocol, fingerprint class)` ACROSS variants, so all arms of one controlled
+class enter the same `aggregate` and paired dPPL survives; different classes
+are still split with a shared `@fp<digest>` suffix and named in
+`fingerprint_split_groups`, and the per-arm fallback still refuses a dPPL when
+pairing is undefined. (2) `measurement_semantics_key` makes the `_code` stamp
+part of `_cfg_fp` / `_cfg_fp_noparam`, the aggregation fingerprint class and
+the arm-summary identity; `controlled_variables_report` exposes
+`code_equal` / `code_values` and marks differing, within-arm-mixed or
+one-sided stamps as uncontrolled (both absent stays the legacy `None` path).
+(3) The nested flag is compared to `{True}` rather than tested for truthiness.
+(4) When a non-descriptive manifest declares
+`compute_budget_disclosure.parameter_matching`, admission requires a positive
+`params` on every record (missing counts are named exclusions; descriptive
+smoke plans and legacy plans without the disclosure keep the permissive path).
+`finaltest_stats` computes `param_matched` only when every usable seed on both
+sides carries a parameter count and each arm is internally consistent; it
+records `params_by_seed`, `param_consistent`, `param_match_complete` and
+`param_match_reason`, and the top-level `parameter_binding` states whether the
+manifest requires the binding.  For a manifest that discloses parameter
+matching, a confirmed verdict additionally requires
+`param_match_complete is True`: `param_matched is not false` alone still
+accepts `None`, which is the unknown-as-pass path being closed. The frozen decision text, manifest bytes, arms,
+seeds, endpoints, alpha and Holm family are unchanged; `CODE_SEMANTICS` is not
+bumped because no training/measurement value changes.
+
+**Verification.** New CPU tests L104 (wrapper restores paired dPPL, mixed code
+stamps split, nested estimand label), L105 (code semantics in arm/control
+identity) and L106 (confirmation parameter binding + per-seed consistency).
+`python test_review_fixes.py` passes 439/442 with the same 3 DataLoader
+environment skips; `python test_open_block.py` passes 15/15;
+`python v12_supp.py plan` admits 72/72 synthetic frozen cells and
+`python v12_supp.py dynamic-plan` still reports the draft as non-runnable.

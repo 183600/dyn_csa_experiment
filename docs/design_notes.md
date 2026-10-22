@@ -2079,3 +2079,80 @@ P5T 的 by-length 记录以前只有代码戳/配方/数据/权重哈希，没�
 `environment` 快照；resume 的 stale 判定把「已记录但不同的执行类别」
 视为过期。这样“同一份权重在不同机器/精度栈上评出来的数”不会被当作本轮
 当前机器的测量静默复用，训练与评估的 provenance 口径一致。
+
+## 41. 测量语义身份、配对聚合与确认参数绑定（本轮硬化）
+
+本轮不新增 GPU 面板，不改冻结清单的臂/种子/终点/α/族，也不改训练数值路径
+（`CODE_SEMANTICS` 不变）。修正的是分析层三处会让「配对」和「确认」名不副实
+的数据流。
+
+### 41.1 聚合包装器不得在配对前拆散臂
+
+`_dump_aggregate` 走的是 `aggregate_with_exclusions`。旧实现先按 `variant`
+分组、再按指纹类拆，`aggregate(sub)` 的每个 `sub` 只剩一个臂，于是
+`dPPL_vs_full` / `dPPL_vs_sw128m` 永远不会生成——所有面板 dump 只有边际
+均值，没有配对差（直接调用 `aggregate` 才有）。现在先按
+`(protocol, sample/measurement class)` **跨臂**分组：同一 class 内的 csa 与
+`full` 一起进入 `aggregate`，配对差恢复；class 不同才拆，输出键追加
+`@fp<digest>`，且同一 class 的各臂共享同一后缀。跨协议/配对失败时仍逐臂
+回退并记 `pairing_split_groups`，此时明确不产生 dPPL，而不是伪造一个。
+
+### 41.2 `_code` 是测量身份，不是装饰
+
+`run_cfg` 通常内嵌代码语义戳，但历史记录可能没有后缀。两条不同 `_code`
+的记录不是同一实验的两个种子：预处理、归约顺序或内核路径可能不同。现在：
+
+- `aggregate` 的 `_cfg_fp` / `_cfg_fp_noparam` 含
+  `measurement_semantics_key(rec)`；
+- `aggregate_with_exclusions` 的指纹类含 `_code`；缺失戳是独立的
+  `<unverified>` 类，不是会与已验证记录合并的通配符；
+- `methodology_audit` 的 arm summary 分组身份含 `_code`（与 val/eval/
+  holdout 指纹并列）；
+- `controlled_variables_report` 新增 `code_equal` / `code_values`：
+  跨臂不同、臂内不同种子不同、或部分记录缺戳都使
+  `controlled=False`；两边都缺仍是 legacy `None`，而不是失败或通过。
+
+这些改动不改变任何数值，只让不可比的记录被分组或点名，而不是静默平均。
+
+### 41.3 estimand 标签的集合真值 bug
+
+`{False}` 在 Python 中为真。`aggregate` 与 `methodology_audit` 的 arm summary
+曾因此把普通全验证记录标成 `nested_validation_holdout`。估计量本身是正确的
+（`_pooled_ppl_from_records` 用单个布尔推断），错的只是标签；但标签会进入
+报告与下游消费，仍属统计口径缺陷。现在只有 `_nested_flags == {True}` 才标
+nested，其余一律 `full_validation`（missing/mixed 的显式 fallback 不变）。
+
+### 41.4 确认性参数绑定
+
+冻结决策规则写的是 `param_matched is not false`；若记录没有 `params`，
+`param_matched=None` 会被读成「不是 false」而通过。冻结清单已经披露
+`compute_budget_disclosure.parameter_matching`，因此参数计数是测量身份的
+一部分，而不是可选的展示字段：
+
+- `_admit_confirmation_records` 对这类清单要求每条记录携带正的 `params`；
+  缺失/非法即**点名剔除**。`statistics.descriptive_only=true` 的 smoke 清单
+  与没有该披露的历史清单保留原 permissive path。
+- `finaltest_stats` 的 `param_matched` 只在**每个可用种子、两侧**都有参数、
+  且同一臂自身各 seed 的参数完全一致时才计算；否则
+  `param_match_complete=False` 并给出 `param_match_reason`，不再让一个种子的
+  `params` 认证整臂，也不把「未知」当匹配。
+- 每条比较落盘 `params_by_seed` / `param_consistent` /
+  `param_match_complete`；顶层 `parameter_binding` 记录该清单是否要求绑定、
+  以及有多少可采纳记录缺参数。对披露参数匹配的清单，确认判定还要求
+  `param_match_complete is True`——`param_matched is not false` 单独成立时
+  仍会接受 `None`，那正是「未知当通过」的路径。
+
+冻结决策文字与 `confirmation_frozen.json` 字节均未改动：本改动只是让「未知」
+不能走进那条规则；shipped plan 的 72/72 合成记录仍全部通过预检。
+
+### 41.5 入口与验证
+
+```bash
+python v12_supp.py plan              # 冻结预检（参数绑定 + 原有功效/预算门）
+python v12_supp.py dynamic-plan      # 动态 draft 仍不可运行
+python test_review_fixes.py          # L104-L106 覆盖上述合约
+python test_open_block.py            # 15/15
+```
+
+L104 覆盖「包装器恢复配对 dPPL + 混代码戳拆分 + nested 标签」；L105 覆盖
+代码语义进入 arm/control 身份；L106 覆盖确认准入的参数绑定与逐种子一致性。

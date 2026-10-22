@@ -23109,6 +23109,17 @@ def controlled_variables_report(recs, arms):
 
     run_cfg = _control(lambda r: _canon_setting(r.get('run_cfg')))
     train_knobs = _control(lambda r: _canon_setting(r.get('train_knobs')))
+    # The code-semantics stamp is a measurement identity, not decoration.  A
+    # run_cfg normally embeds it, but legacy records may omit the suffix; an
+    # arm whose seeds were measured under different stamps is a mixed protocol,
+    # even when the compact run_cfg strings happen to agree.  Presence is not
+    # required for old panels (both-absent stays the legacy path), but a
+    # present-one-sided or differing stamp fails the control.
+    def _code_setting(r):
+        _c = r.get('_code') if isinstance(r, dict) else None
+        return None if _c is None or str(_c) == '' else _canon_setting(str(_c))
+
+    code = _control(_code_setting)
     # Equality of two partial descriptors is not controlled-recipe evidence.
     # Collect every present-but-incomplete descriptor per arm so the panel
     # report can fail closed instead of treating it as a legacy omission.
@@ -23144,13 +23155,15 @@ def controlled_variables_report(recs, arms):
         hp_equal = True
     mixed = sorted(set(run_cfg['within_arm_mixed']) | set(train_knobs['within_arm_mixed'])
                    | set(objective['within_arm_mixed'])
+                   | set(code['within_arm_mixed'])
                    | {a for k in hp_checked for a in hyper[k]['within_arm_mixed']})
     partial = sorted(set(run_cfg['partially_recorded']) | set(train_knobs['partially_recorded'])
                      | set(objective['partially_recorded'])
+                     | set(code['partially_recorded'])
                      | {a for k in hp_checked for a in hyper[k]['partially_recorded']})
     diff_values = {}
     for key, ctl in (('run_cfg', run_cfg), ('train_knobs', train_knobs),
-                     ('train_objective', objective)):
+                     ('train_objective', objective), ('_code', code)):
         if ctl['equal'] is False:
             diff_values[key] = ctl['values']
     for key in hp_diffs:
@@ -23190,6 +23203,12 @@ def controlled_variables_report(recs, arms):
     if (objective['equal'] is False
             and (objective['within_arm_mixed'] or objective['partially_recorded'])):
         controlled = False
+    # Same rule for the code-semantics stamp: a differing or partially
+    # recorded stamp means the arm's seeds were not all measured by one
+    # implementation.  All-absent remains the legacy path (None, not a pass).
+    if (code['equal'] is False
+            or code['within_arm_mixed'] or code['partially_recorded']):
+        controlled = False
     # A present-but-partial descriptor cannot attest any single recipe, even
     # when every record carries the same incomplete dictionary.
     if _knob_defects:
@@ -23202,6 +23221,8 @@ def controlled_variables_report(recs, arms):
         'train_knobs_defects': _knob_defects,
         'objective_equal': objective['equal'],
         'objective_values': objective['values'],
+        'code_equal': code['equal'],
+        'code_values': code['values'],
         'hyperparams_equal': hp_equal,
         'controlled': controlled,
         'within_arm_mixed': mixed,
@@ -23210,6 +23231,7 @@ def controlled_variables_report(recs, arms):
             'run_cfg': {'n_records': run_cfg['n_records'], 'n_missing': run_cfg['n_missing']},
             'train_knobs': {'n_records': train_knobs['n_records'], 'n_missing': train_knobs['n_missing']},
             'objective': {'n_records': objective['n_records'], 'n_missing': objective['n_missing']},
+            '_code': {'n_records': code['n_records'], 'n_missing': code['n_missing']},
             'hyperparams': {k: {'n_records': hyper[k]['n_records'], 'n_missing': hyper[k]['n_missing']}
                             for k in hp_checked},
         },
@@ -24285,9 +24307,13 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
     # evaluation/warmup conditions never get pooled into a fake larger n.
     def _slice_fp(r):
         # Pooling two validation slices into one arm mean is the same units
-        # error aggregate() refuses; keep the slice in the identity.
+        # error aggregate() refuses; keep the slice in the identity.  The code
+        # semantics stamp is part of that identity too: a per-seed mean that
+        # mixes two `_code` values averages measurements produced by different
+        # implementations, not two seeds of one.
         return tuple(str(r.get(k) or '') for k in
-                     ('val_fp', 'eval_fp', 'holdout_row_fp'))
+                     ('val_fp', 'eval_fp', 'holdout_row_fp')) + (
+                         measurement_semantics_key(r),)
 
     _arm_groups = {}
     for (v, t, s), r in recs.items():
@@ -24326,7 +24352,7 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
         else:
             _vals = [float(x) for x in _primary]
             _estimand = ('nested_validation_holdout'
-                         if _nested_flags
+                         if _nested_flags == {True}
                          else 'full_validation')
             _pooled, _nll_tot, _ntok_tot = _pooled_ppl_from_records(_recs_sorted)
         _key = v if not t else '%s::%s' % (v, t)
@@ -24335,8 +24361,9 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
             _base_seen[(v, t)] = _idx + 1
             _key = '%s::slice%d' % (_key, _idx)
             report['warnings'].append(
-                '%s: records span different validation slices; arm summary is '
-                'split by slice instead of pooling different documents' % _key)
+                '%s: records span different validation slices or code-semantics '
+                'stamps; arm summary is split instead of pooling different '
+                'documents/implementations' % _key)
         report['arm_summary'][_key] = {
             'variant': v, 'protocol': t, 'n_seeds': len(_vals),
             'seeds': sorted(_by_seed),
@@ -24408,6 +24435,12 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
             })
             if _cv.get('objective_differences'):
                 report['warnings'].append('%s: arms share run_cfg but not the actual training objective (%s) — the contrast is a system-level comparison, not an isolated mechanism claim' % (comp, '; '.join(_cv['objective_differences'])))
+            if _cv.get('code_equal') is False:
+                report['warnings'].append(
+                    '%s: arms were measured under different code-semantics '
+                    'stamps (%s) — the two numbers were produced by different '
+                    'implementations, so this is not a controlled pair'
+                    % (comp, _cv.get('code_values')))
             report['controlled_variables'][comp] = _cv
             if _cv.get('within_arm_mixed'):
                 report['warnings'].append('%s: arm(s) %s mix DIFFERENT protocols within one arm across seeds — a seed-averaged claim would pool incompatible runs'
@@ -32800,6 +32833,25 @@ def paired_row_bootstrap_delta(pairs, *, n_boot=1000, seed=20261018, conf=0.95):
                    'substitute for the seed-level exact sign-flip p-value.')
     return out
 
+def measurement_semantics_key(rec):
+    """Identity of the code semantics that produced a measurement.
+
+    `run_cfg` normally carries the code-stamp suffix, but legacy records may
+    omit it (or predate the suffix).  Two records measured under different
+    `_code` stamps are not two seeds of one experiment: preprocessing, the
+    collectives' reduction order or a kernel path may differ.  Aggregation and
+    arm summaries therefore key on this explicit value *in addition to*
+    `run_cfg`; a missing stamp is its own `<unverified>` class rather than a
+    wildcard that merges with a verified one.
+    """
+    if not isinstance(rec, dict):
+        return '<unverified>'
+    c = rec.get('_code')
+    if c is None or str(c) == '':
+        return '<unverified>'
+    return str(c)
+
+
 def aggregate(summary):
 
     def _protocol_tag(rec, key=None):
@@ -32879,7 +32931,10 @@ def aggregate(summary):
         _p = _as_seed_int(rec.get('params'))
         if _p is not None and _p <= 0:
             _p = None
-        return json.dumps([rec.get('run_cfg'), _p, [rec.get(k) for k in PAIR_STEP_KEYS]], sort_keys=True, default=str)
+        return json.dumps([rec.get('run_cfg'), _p,
+                           [rec.get(k) for k in PAIR_STEP_KEYS],
+                           measurement_semantics_key(rec)],
+                          sort_keys=True, default=str)
 
     def _steps_ok(recs):
         if len(recs) < 2:
@@ -32932,7 +32987,7 @@ def aggregate(summary):
         # the `@cfg` suffix is a digest of the config fingerprint itself, so a
         # resume pass cannot reshuffle which group a published key refers to
         _ordered = sorted(_subs.items(), key=lambda kv: kv[0])
-        print(f'[aggregate] WARNING: `{_agg_key(v, tag)}` holds records from {len(_ordered)} different run_cfg/load/parameter-count configurations — pooling them would average incompatible runs (or two different MODEL WIDTHS, which are not two seeds of one model) and fake extra seeds.  Reported per configuration instead.')
+        print(f'[aggregate] WARNING: `{_agg_key(v, tag)}` holds records from {len(_ordered)} different run_cfg/load/parameter-count/code-semantics configurations — pooling them would average incompatible runs (or two different MODEL WIDTHS or CODE STAMPS, which are not two seeds of one model) and fake extra seeds.  Reported per configuration instead.')
         for _fp, _rs in _ordered:
             _i = hashlib.sha1(_fp.encode('utf-8')).hexdigest()[:8]
             _split_groups.append(((v, tag, _i), _rs))
@@ -32973,7 +33028,7 @@ def aggregate(summary):
             ppls = np.array(_primary_vals, dtype=float)
             _primary_estimand = (
                 'nested_validation_holdout'
-                if _nested_flags
+                if _nested_flags == {True}
                 else 'full_validation')
             _pooled, _nll_total, _ntok_total = _pooled_ppl_from_records(recs)
         _sorted = np.sort(ppls)
@@ -33146,8 +33201,12 @@ def aggregate(summary):
         # Baseline-matching fingerprint WITHOUT params: a `full` baseline
         # legitimately differs from the sparse arm in parameter count, so a
         # params-including fingerprint could never match it (dead branch).
-        # run_cfg + steps/tokens is exactly the gate `pair_reason` applies.
-        return json.dumps([rec.get('run_cfg'), [rec.get(k) for k in PAIR_STEP_KEYS]], sort_keys=True, default=str)
+        # run_cfg + steps/tokens + code semantics is exactly the gate
+        # `pair_reason` applies (the code stamp must not be mixed either).
+        return json.dumps([rec.get('run_cfg'),
+                           [rec.get(k) for k in PAIR_STEP_KEYS],
+                           measurement_semantics_key(rec)],
+                          sort_keys=True, default=str)
 
     def _baseline_for(tag, fp_idx, base_groups, recs):
         # Pairing is only legal inside one (variant, protocol) group.  A
@@ -33223,11 +33282,13 @@ def aggregate(summary):
     return agg
 
 
-# Fingerprint fields that define the sample a PPL describes.  Records in one
-# aggregate group must agree on all of them; otherwise the group is split (not
-# silently averaged) and the split is reported.
+# Fingerprint fields that define the sample/measurement a PPL describes.
+# Records in one aggregate group must agree on all of them; otherwise the group
+# is split (not silently averaged) and the split is reported.  `_code` is the
+# implementation-semantics stamp: it is not a data fingerprint, but a PPL
+# produced by different code semantics is still not one measurement.
 _AGG_FINGERPRINT_FIELDS = ('data_fp', 'val_fp', 'eval_fp', 'eval_subset_fp',
-                           'holdout_row_fp')
+                           'holdout_row_fp', '_code')
 
 
 def _aggregation_fp_class(rec):
@@ -33249,7 +33310,8 @@ def aggregate_with_exclusions(summary):
     * keeps the FIRST measured record for a duplicated (arm, protocol, seed)
       and excludes later ones as ambiguous duplicates;
     * splits a group whose records carry different corpus/evaluation
-      fingerprints into separate output keys instead of averaging them;
+      fingerprints or different code-semantics stamps into separate output
+      keys instead of averaging them;
     * retries a group that still trips the strict cross-protocol pairing gate
       per arm (so the valid marginal readings survive without a dPPL).
 
@@ -33267,8 +33329,9 @@ def aggregate_with_exclusions(summary):
         'n_aggregate_keys': 0,
         'tolerance': ('only malformed/unmeasured records and ambiguous '
                       'same-seed duplicates are dropped; groups that disagree '
-                      'on a corpus/evaluation fingerprint are SPLIT, not '
-                      'averaged; every exclusion is named and counted here'),
+                      'on a corpus/evaluation fingerprint or code-semantics '
+                      'stamp are SPLIT, not averaged; every exclusion is named '
+                      'and counted here'),
     }
     if not isinstance(summary, dict):
         report['n_input'] = 1
@@ -33316,74 +33379,85 @@ def aggregate_with_exclusions(summary):
             continue
         candidates[ident] = (str(key), canon)
 
+    # Group by (protocol, sample/measurement class) ACROSS variants.  Splitting
+    # inside each variant first (the previous shape) silently removed the
+    # baseline from every subgroup, so `aggregate` could never form a paired
+    # dPPL: the wrapper that every panel dump uses produced marginal means but
+    # no paired contrast.  A class is the tuple of data/evaluation/code
+    # fingerprints; all arms of one controlled comparison must share it, and
+    # only the shared class is paired.
     groups = {}
+    by_variant_tag = {}
+    tag_classes = {}
     for (v, tag, _seed), (key, rec) in candidates.items():
-        groups.setdefault((v, tag), {})[key] = rec
-
-    agg = {}
-    used = set()
-    for (v, tag), by_key in sorted(groups.items(),
-                                   key=lambda kv: (kv[0][0], kv[0][1] or '')):
-        classes = {}
-        for key, rec in by_key.items():
-            classes.setdefault(_aggregation_fp_class(rec), {})[key] = rec
-        if len(classes) > 1:
+        _cls = _aggregation_fp_class(rec)
+        groups.setdefault((tag, _cls), {})[key] = rec
+        by_variant_tag.setdefault((v, tag), []).append(rec)
+        tag_classes.setdefault(tag, set()).add(_cls)
+    for (v, tag), recs in sorted(by_variant_tag.items(),
+                                 key=lambda kv: (kv[0][0], kv[0][1] or '')):
+        _classes = {_aggregation_fp_class(r) for r in recs}
+        if len(_classes) > 1:
             report['fingerprint_split_groups'].append({
                 'variant': v, 'protocol': tag,
-                'n_fingerprint_classes': len(classes),
-                'n_records': len(by_key),
-                'note': ('records from different corpora/evaluation slices '
-                         'were reported separately, never pooled'),
+                'n_fingerprint_classes': len(_classes),
+                'n_records': len(recs),
+                'note': ('records from different corpora/evaluation slices or '
+                         'code-semantics stamps were reported separately, never '
+                         'pooled'),
             })
-        for ci, (_fp_class, sub) in enumerate(sorted(classes.items(),
-                                                      key=lambda kv: repr(kv[0]))):
-            suffix = ''
-            if len(classes) > 1:
-                _digest = hashlib.sha1(
-                    repr(_fp_class).encode('utf-8')).hexdigest()[:8]
-                suffix = f'@fp{_digest}'
-            try:
-                sub_agg = aggregate(sub)
-                used.update(sub.keys())
-            except Exception as exc:
-                # Most likely the strict cross-protocol baseline-pairing gate.
-                # Re-run each arm separately so its marginal aggregate (and
-                # its measured records) survive; no dPPL is then claimed.
-                sub_agg = {}
-                _pairing_split = False
-                for vv in sorted({str(r.get('variant')) for r in sub.values()}):
-                    _sub_v = {k: r for k, r in sub.items()
-                              if str(r.get('variant')) == vv}
-                    if not _sub_v:
-                        continue
-                    try:
-                        _one = aggregate(_sub_v)
-                    except Exception as exc2:
-                        for k in _sub_v:
-                            _drop(k, f'aggregate failed for arm {vv!r}: '
-                                      f'{type(exc2).__name__}: {exc2}')
-                        continue
-                    _pairing_split = True
-                    used.update(_sub_v.keys())
-                    for k, entry in _one.items():
-                        _key = f'{k}@arm{vv}'
-                        while _key in sub_agg:
-                            _key += "'"
-                        sub_agg[_key] = entry
-                if _pairing_split:
-                    report['pairing_split_groups'].append({
-                        'variant': v, 'protocol': tag,
-                        'error': f'{type(exc).__name__}: {exc}',
-                        'note': ('reported per arm; a cross-protocol dPPL is '
-                                 'not defined and was not produced'),
-                    })
-                if not sub_agg:
+    agg = {}
+    used = set()
+    for (tag, _fp_class), sub in sorted(
+            groups.items(), key=lambda kv: ((kv[0][0] or ''), repr(kv[0][1]))):
+        suffix = ''
+        if len(tag_classes.get(tag) or ()) > 1:
+            _digest = hashlib.sha1(
+                repr(_fp_class).encode('utf-8')).hexdigest()[:8]
+            suffix = f'@fp{_digest}'
+        try:
+            sub_agg = aggregate(sub)
+            used.update(sub.keys())
+        except Exception as exc:
+            # Most likely the strict cross-protocol baseline-pairing gate.
+            # Re-run each arm separately so its marginal aggregate (and
+            # its measured records) survive; no dPPL is then claimed.
+            sub_agg = {}
+            _pairing_split = False
+            for vv in sorted({str(r.get('variant')) for r in sub.values()}):
+                _sub_v = {k: r for k, r in sub.items()
+                          if str(r.get('variant')) == vv}
+                if not _sub_v:
                     continue
-            for key, entry in sub_agg.items():
-                out_key = key + suffix
-                while out_key in agg:
-                    out_key += "'"
-                agg[out_key] = entry
+                try:
+                    _one = aggregate(_sub_v)
+                except Exception as exc2:
+                    for k in _sub_v:
+                        _drop(k, f'aggregate failed for arm {vv!r}: '
+                                  f'{type(exc2).__name__}: {exc2}')
+                    continue
+                _pairing_split = True
+                used.update(_sub_v.keys())
+                for k, entry in _one.items():
+                    _key = f'{k}@arm{vv}'
+                    while _key in sub_agg:
+                        _key += "'"
+                    sub_agg[_key] = entry
+            if _pairing_split:
+                report['pairing_split_groups'].append({
+                    'protocol': tag,
+                    'variants': sorted({str(r.get('variant')) for r in sub.values()}),
+                    'error': f'{type(exc).__name__}: {exc}',
+                    'note': ('reported per arm; a cross-protocol dPPL is '
+                             'not defined and was not produced'),
+                })
+            if not sub_agg:
+                continue
+        for key, entry in sub_agg.items():
+            out_key = key + suffix
+            while out_key in agg:
+                out_key += "'"
+            agg[out_key] = entry
 
     _unused = set(k for k, _r in candidates.values()) - used
     _excluded_keys = {e['key'] for e in excluded}
