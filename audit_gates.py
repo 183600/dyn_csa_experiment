@@ -3412,6 +3412,54 @@ def _iter_freeze_locks(results_dirs=None):
             yield p
 
 
+def _declared_source_drift(lock_files):
+    """All declared analysis-time source-drift events among ``lock_files``.
+
+    A drift event is evidence that the analysis was NOT run from the bytes
+    bound at first test access.  It must be read from the freeze lock even
+    when the plan snapshot supplies the *expected* source tree: the snapshot
+    records the approved plan, while the lock records what actually ran.
+    """
+    out, seen, sources = [], set(), []
+    for lp in lock_files:
+        if not lp:
+            continue
+        p = os.path.abspath(lp)
+        if p in seen or not os.path.exists(p):
+            continue
+        seen.add(p)
+        lock = _load(p)
+        ev = lock.get('source_tree_drift') if isinstance(lock, dict) else None
+        if not ev:
+            continue
+        if not isinstance(ev, list):
+            # Malformed evidence still means "a drift was declared"; never
+            # silently treat a non-list value as a clean lock.
+            ev = [ev]
+        sources.append(_display_repo_path(p))
+        out.extend(dict(item) if isinstance(item, dict) else {'event': item}
+                   for item in ev)
+    return out, sources
+
+
+def _apply_declared_source_drift(out, lock_files):
+    """Fail an audit result when a relevant freeze lock declares drift."""
+    drift, sources = _declared_source_drift(lock_files)
+    if drift:
+        out['declared_source_drift'] = drift
+        out['declared_source_drift_locks'] = sources
+        out['problems'].append(
+            f'{len(drift)} declared analysis-time source-drift event(s) '
+            'are recorded in the freeze lock; the analysis was not run '
+            'from byte-identical code')
+        out['note'] = ('the analysis declared source drift via '
+                       'V12_ALLOW_SOURCE_DRIFT=1; even if the bytes now '
+                       'match the original attestation, this round is not '
+                       'a byte-identical replay')
+        out['status'] = 'fail'
+    return out
+
+
 def audit_source_integrity(snapshot_path='analysis_v12/plan_snapshot.json',
                            results_dirs=None, lock_path=None):
     """Compare the current source bytes with the source bound by an artifact.
@@ -3432,6 +3480,23 @@ def audit_source_integrity(snapshot_path='analysis_v12/plan_snapshot.json',
     expected = None
     source = None
     legacy_lock = None
+
+    def _drift_locks():
+        # Explicit lock first; otherwise every discovered freeze lock.  The
+        # lock that supplied `source` is included even when a plan snapshot
+        # was preferred for the expected tree, because a drift event is
+        # evidence about what actually ran, not about the approved plan.
+        locks = ([_audit_artifact(lock_path)] if lock_path
+                 else list(_iter_freeze_locks(results_dirs)))
+        if isinstance(source, str) and source.endswith('.freeze_lock.json'):
+            locks.append(_audit_artifact(source))
+        return locks
+
+    def _emit(out):
+        _apply_declared_source_drift(out, _drift_locks())
+        print(json.dumps({k: v for k, v in out.items() if k != 'files'},
+                         ensure_ascii=False, indent=2)[:4000])
+        return out
     snap_file = _audit_artifact(snapshot_path)
     snap = _load(snap_file)
     if isinstance(snap, dict):
@@ -3480,9 +3545,7 @@ def audit_source_integrity(snapshot_path='analysis_v12/plan_snapshot.json',
                      'binding and has no source digest; the lock attests the '
                      'plan/test slice but not the measurement code bytes'),
         }
-        print(json.dumps({k: v for k, v in out.items() if k != 'files'},
-                         ensure_ascii=False, indent=2)[:4000])
-        return out
+        return _emit(out)
     out = {
         'kind': 'source_tree_audit',
         'status': 'not_verifiable_locally',
@@ -3500,17 +3563,13 @@ def audit_source_integrity(snapshot_path='analysis_v12/plan_snapshot.json',
                  'which source bytes produced an artifact'),
     }
     if not isinstance(expected, dict):
-        print(json.dumps({k: v for k, v in out.items() if k != 'files'},
-                         ensure_ascii=False, indent=2)[:4000])
-        return out
+        return _emit(out)
     want_sha = expected.get('sha256')
     out['expected_sha256'] = want_sha
     if not isinstance(want_sha, str) or not want_sha:
         out['status'] = 'fail'
         out['problems'].append('the recorded source-tree entry has no sha256')
-        print(json.dumps({k: v for k, v in out.items() if k != 'files'},
-                         ensure_ascii=False, indent=2)[:4000])
-        return out
+        return _emit(out)
     _raw_exp_files = expected.get('files')
     if _raw_exp_files is not None and not isinstance(_raw_exp_files, dict):
         out['problems'].append('the recorded source-tree files entry is not an object')
@@ -3554,23 +3613,9 @@ def audit_source_integrity(snapshot_path='analysis_v12/plan_snapshot.json',
         out['note'] = ('the current source tree differs from the tree bound to '
                        'the snapshot/provenance; a git commit + CODE_SEMANTICS '
                        'stamp alone cannot establish source identity')
-    if source and source.endswith('.freeze_lock.json'):
-        _lock = _load(_audit_artifact(source))
-        _drift = _lock.get('source_tree_drift') if isinstance(_lock, dict) else None
-        if _drift:
-            out['declared_source_drift'] = _drift
-            out['problems'].append(
-                f'{len(_drift)} declared analysis-time source-drift event(s) '
-                'are recorded in the freeze lock; the analysis was not run '
-                'from byte-identical code')
-            out['note'] = ('the analysis declared source drift via '
-                           'V12_ALLOW_SOURCE_DRIFT=1; even if the bytes now '
-                           'match the original attestation, this round is not '
-                           'a byte-identical replay')
-            out['status'] = 'fail'
-    print(json.dumps({k: v for k, v in out.items() if k != 'files'},
-                     ensure_ascii=False, indent=2)[:4000])
-    return out
+    # `_emit` also inspects declared analysis-time drift in the relevant
+    # freeze lock(s), even when the expected tree came from the plan snapshot.
+    return _emit(out)
 
 
 def audit_dependencies(lock_path=None):

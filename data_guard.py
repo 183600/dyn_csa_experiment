@@ -4738,29 +4738,34 @@ def _row_keys(X):
             if _canonical_int:
                 block = block.astype(np.int64, copy=False)
             # An integer has a float64 twin exactly when the round-trip is
-            # lossless.  Hash those rows through the SAME float64 bytes the
+            # lossless.  Hash those ROWS through the SAME float64 bytes the
             # float branch uses, so an int64 row and an equal float64 row get
             # one key (the old int-byte key made train/test duplicates stored
             # at different numeric dtypes invisible to the leakage gate).
             # Values that are not exactly representable stay on the integer
             # bytes; no equal float64 exists for them, so precision is kept.
-            _f = np.asarray(block, dtype=np.float64)
-            _finite = np.isfinite(_f)
-            _in_range = _finite & (_f >= -(2.0 ** 63)) & (_f < (2.0 ** 63))
-            if bool(_in_range.all()) and np.array_equal(
-                    _f.astype(np.int64), np.asarray(block, dtype=np.int64)):
-                arr = np.ascontiguousarray(_f)
-                for row_view in arr.view(np.uint8):
-                    h = hashlib.blake2b(digest_size=16)
-                    h.update(memoryview(row_view))
+            #
+            # The decision MUST be per row.  A block-wide `all()` made the key
+            # of every row in a hash block depend on whether some unrelated
+            # row in the same block was float64-exact; once a table exceeded
+            # one hash block, the same duplicate could hash differently on
+            # either side of the boundary and the leakage/duplicate gates
+            # silently missed it.
+            _i = np.ascontiguousarray(block, dtype=np.int64)
+            _f = np.ascontiguousarray(block, dtype=np.float64)
+            _safe = np.isfinite(_f) & (_f >= -(2.0 ** 63)) & (_f < (2.0 ** 63))
+            _exact = np.zeros(_f.shape, dtype=bool)
+            if _safe.any():
+                _exact[_safe] = (_f[_safe].astype(np.int64) == _i[_safe])
+            _exact_row = _exact.all(axis=1)
+            for _r in range(int(_i.shape[0])):
+                h = hashlib.blake2b(digest_size=16)
+                if bool(_exact_row[_r]):
+                    h.update(memoryview(_f[_r]))
                     h.update(b'|')
                     h.update(_tail)
-                    keys.append(h.digest())
-                continue
-            arr = np.ascontiguousarray(block)
-            for row_view in arr.view(np.uint8).reshape(arr.shape[0], -1):
-                h = hashlib.blake2b(digest_size=16)
-                h.update(memoryview(row_view))
+                else:
+                    h.update(memoryview(_i[_r]))
                 keys.append(h.digest())
         return keys
     keys = []

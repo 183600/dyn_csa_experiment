@@ -615,9 +615,19 @@ def _frozen_vocab_size(manifest, cfg=None):
 
     _bind = manifest.get('binding') or {}
     _sig = _bind.get('training_recipe_signature') if isinstance(_bind, dict) else None
+    # `_recipe_signature` accepts the pre-v2 spelling `training_recipe` as an
+    # alias of `training_recipe_signature`.  Vocabulary binding must use the
+    # same accepted shapes; reading only the new key made a legacy manifest
+    # fall through to the local cache's width (and then burn the one-shot test
+    # access before every checkpoint was refused as a vocab mismatch).
+    _legacy_sig = (_bind.get('training_recipe')
+                   if isinstance(_bind, dict) else None)
     _vals = set()
-    if isinstance(_sig, dict) and _sig.get('v') is not None:
-        _vals.add(_width(_sig['v'], 'binding.training_recipe_signature.v'))
+    for _label, _recipe in (
+            ('binding.training_recipe_signature.v', _sig),
+            ('binding.training_recipe.v', _legacy_sig)):
+        if isinstance(_recipe, dict) and _recipe.get('v') is not None:
+            _vals.add(_width(_recipe['v'], _label))
     _per = (_bind.get('per_arm_recipe_signature')
             if isinstance(_bind, dict) else None)
     if isinstance(_per, dict):
@@ -915,6 +925,11 @@ def _check_or_write_freeze_lock_locked(outdir, manifest, test_ids_fp, stage='acc
                            if isinstance(_locked_src, dict) else None)
         _source_legacy = _locked_src_sha is None
         _source_changed = bool(_locked_src_sha and _locked_src_sha != _src_sha)
+        # Initialize the write flag here, BEFORE the disclosed-drift branch
+        # can set it.  It used to be reset unconditionally after that branch,
+        # which discarded the event just recorded and left the on-disk lock
+        # looking byte-identical to a clean run.
+        _dirty = False
         _refreeze = os.environ.get('V12_REFREEZE', '').strip().lower() in ('1', 'true', 'yes', 'on')
         _source_override = (os.environ.get('V12_ALLOW_SOURCE_DRIFT', '').strip().lower()
                             in ('1', 'true', 'yes', 'on'))
@@ -979,7 +994,6 @@ def _check_or_write_freeze_lock_locked(outdir, manifest, test_ids_fp, stage='acc
             if _test_changed:
                 raise SystemExit(f'[v12] REFUSE: the held-out test slice changed after the first access (lock has ids_fp {lock.get("test_ids_fp")}, current {test_ids_fp}) — the test data itself is part of the freeze; investigate before proceeding (V12_REFREEZE=1 consciously re-freezes to a new slice)')
             raise SystemExit(f'[v12] REFUSE: the training corpus changed after the first test access (lock has train_fp {lock.get("train_fp")}, current {train_fp}) — a different training set cannot enter the frozen confirmation (V12_REFREEZE=1 consciously re-freezes to a new corpus)')
-        _dirty = False
         if _forced_reread:
             print(f'[v12] WARNING: V12_ALLOW_TEST_REREAD=1 — this is an '
                   f'ADDITIONAL read of the frozen held-out split (previous '
@@ -1054,7 +1068,15 @@ def _check_or_write_freeze_lock_locked(outdir, manifest, test_ids_fp, stage='acc
         if _dirty:
             L.atomic_write_json(lp, lock, indent=2)
             if _manifest_changed or _test_changed or _train_changed or _source_changed:
-                print(f'[v12] freeze lock UPDATED: {lp} (manifest {str(_sha)[:12]}…; {len(lock["superseded"])} superseded plan(s) kept)')
+                # A disclosed analysis-only drift is persisted without a
+                # re-freeze, so `superseded` need not exist (it is created only
+                # by V12_REFREEZE).  Indexing it unconditionally crashed after
+                # the event had already been written.
+                _n_sup = len(lock.get('superseded') or [])
+                print(f'[v12] freeze lock UPDATED: {lp} (manifest '
+                      f'{str(_sha)[:12]}…'
+                      + (f'; {_n_sup} superseded plan(s) kept' if _n_sup else '')
+                      + ')')
             else:
                 print(f'[v12] freeze lock updated with the first-access slice/train fingerprint: {lp}')
         return lock
@@ -1245,7 +1267,7 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test',
         del d
         out['status'] = 'skipped_train_fp_mismatch'
         return out
-    eval_lens = [int(x) for x in manifest.get('eval', {}).get('by_length_ppl', cfg['eval_lens'])]
+    eval_lens = [int(x) for x in (manifest.get('eval') or {}).get('by_length_ppl', cfg['eval_lens'])]
     _dfp = L._ids_fp(np.ascontiguousarray(test_ids).reshape(-1))
     # The matched-initialization digest is the evidence that "same seed"
     # really means "same shared trunk".  Resolve it once (training summary
@@ -1466,7 +1488,7 @@ def run_finaltest(cfg=None, guard=None):
     manifest = _load_manifest(cfg['manifest'])
     outdir = cfg['outdir']
     os.makedirs(outdir, exist_ok=True)
-    need = max([int(x) for x in manifest.get('eval', {}).get('by_length_ppl', cfg['eval_lens'])]) + 1
+    need = max([int(x) for x in (manifest.get('eval') or {}).get('by_length_ppl', cfg['eval_lens'])]) + 1
     _nseq_clean = int((manifest.get('eval') or {}).get('n_seqs_clean') or cfg.get('n_seq', 48))
     test_ids = cfg.get('test_ids')
     _smoke = bool(cfg.get('smoke'))
@@ -1656,7 +1678,7 @@ def run_finaltest(cfg=None, guard=None):
             _cell_status[f'{v}::s{seed}'] = (_cell or {}).get('status')
     # 2) frozen uniform-corruption probe on the SAME test rows (secondary,
     #    descriptive-only per the manifest)
-    _probe_eval = manifest.get('eval', {}).get('distractor_probe') or {}
+    _probe_eval = (manifest.get('eval') or {}).get('distractor_probe') or {}
     pcfg = dict(V10.PROBE, outdir=outdir, ckpt_dir=cfg['ckpt_dir'], summary=cfg['probe_summary'], variants=list(manifest['arms']), seeds=[int(s) for s in manifest['seeds']], eval_lens=[int(x) for x in (_probe_eval.get('eval_lens') or [2048, 4096])], rhos=[float(x) for x in (_probe_eval.get('rhos') or [0.0, 0.125, 0.25, 0.5])], modes={'uniform': [float(x) for x in (_probe_eval.get('rhos') or [0.0, 0.125, 0.25, 0.5])]}, niah=None, arm_overrides={v: ['learned'] for v in ('csa_fixed_rope_randidx_seeded', 'csa_fixed_rope_allblocks')}, target=int(_probe_eval.get('target', cfg.get('target', 512))), n_seq=int(_probe_eval.get('n_seq', cfg.get('n_seq', 48))), chunk=int(cfg.get('chunk', 4)))
     mech_summ = {}
     if os.path.exists(cfg['mech_summary']):

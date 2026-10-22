@@ -748,7 +748,14 @@ def early_stop_decision(history, *, patience, min_delta=0.0):
     best_step = None
     stale = 0
     for step, ppl in pts:
-        if best is None or ppl < best - min_delta:
+        # `min_delta=0` keeps the historical strict-improvement contract
+        # (equal PPL is a stale point).  For a positive margin the docstring's
+        # "at least min_delta below" is inclusive: a point exactly on the
+        # boundary is an improvement, not a stale evaluation.
+        _threshold = None if best is None else best - min_delta
+        _improved = (best is None or ppl < _threshold
+                     or (min_delta > 0.0 and ppl == _threshold))
+        if _improved:
             best = ppl
             best_step = step
             stale = 0
@@ -3989,13 +3996,19 @@ def _prefetch_pool_geometry(attn, pre_blocks, n, dev):
 def _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, Fd, dev, B, order, order_is_identity=False):
     counts, ends, starts, last_idx, end_prev, starts_prev, ov_start, ov_len = _pool_parts(block_ids, B, overlap, n)
     ov = overlap
+    _identity = bool(order_is_identity)
     _cpu = getattr(block_ids, '_pool_cpu', None)
     if _cpu is not None and len(_cpu[0]) == B:
         max_len = _cpu[1]
         _ov_hi = min(ov, _cpu[2]) if B > 1 else -1
         _gkey = ('vo', int(B), int(ov), int(n), int(B_pos_a.shape[0]), int(B_pos_b.shape[0]))
         _geom = getattr(block_ids, '_pool_geom', None)
-        _geom = None if _geom is None else _geom.get(_gkey)
+        # The cached geometry stores bias rows as within-sorted-block ranks,
+        # which is only the token's within-block offset when the block ids are
+        # in their original (monotone) order.  A sorted non-monotone layout
+        # needs the per-block bias table built below.
+        _geom = (None if (_geom is None or not _identity)
+                 else _geom.get(_gkey))
     elif ov_len.numel():
         # Only the two maxima are consumed below; fold them into one stacked
         # read and discard the minima.
@@ -4013,7 +4026,7 @@ def _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, F
         # identical to the on-device build below.  None means fall back to the
         # on-device form, whose values are identical.
         _host = None
-        if _POOL_PARTS_HOST and _cpu is not None and len(_cpu[0]) == B:
+        if _identity and _POOL_PARTS_HOST and _cpu is not None and len(_cpu[0]) == B:
             _host = _pool_geom_host_var(_cpu[0], B, ov, n, max_len, _ov_hi, B_pos_a.shape[0], B_pos_b.shape[0], dev)
         if _host is not None:
             g_a, mask_a, g_b, mask_b, b_off, _pos_a = _host
@@ -4038,7 +4051,7 @@ def _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, F
                 b_off = (ov_start[:, None] - starts_prev[:, None] + op[None, :]).clamp_(max=B_pos_b.shape[0] - 1)
                 _lim = B_pos_a.shape[0] - 1
                 _pos_a = pos if max_len <= B_pos_a.shape[0] else pos.clamp(max=_lim)
-            if _cpu is not None and len(_cpu[0]) == B:
+            if _identity and _cpu is not None and len(_cpu[0]) == B:
                 _pool_geom_put(block_ids, _gkey, (g_a, mask_a, g_b, mask_b, b_off, _pos_a))
     # Every block's pooled vector is a function of its own block lanes and
     # overlap lanes only (the softmax normalization and the weighted sum are
@@ -4051,7 +4064,25 @@ def _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, F
     # (float lanes) plus the two boolean masks.
     _per_elems = (4 * int(max_len) + 4 * _Wb) * _Fd + 8 * (int(max_len) + _Wb)
     _chunk = _pool_block_chunk(B, _per_elems, Xas.element_size())
-    # Within the embedding table the gather index is exactly arange(max_len).
+    # Within the embedding table the gather index is exactly arange(max_len)
+    # only when the row order is the original token order.  With a sorted
+    # non-monotone layout every block's bias index must be recomputed from the
+    # block's ORIGINAL token positions: the sorted lane rank is not
+    # `token_position - block_start` when a block's tokens are non-contiguous.
+    _bias_a = _bias_b = None
+    if not _identity:
+        _orig = order
+        _ja = _range_cache(0, int(g_a.shape[1]), dev)
+        _rank_a = (starts[:, None] + _ja[None, :]).clamp(max=n - 1)
+        _start_a = _orig[starts.clamp(max=n - 1)][:, None]
+        _bias_a = (_orig[_rank_a] - _start_a).clamp(
+            min=0, max=B_pos_a.shape[0] - 1)
+        if _Wb > 0:
+            _jb = _range_cache(0, _Wb, dev)
+            _rank_b = (ov_start[:, None] + _jb[None, :]).clamp(max=n - 1)
+            _start_b = _orig[starts_prev.clamp(max=n - 1)][:, None]
+            _bias_b = (_orig[_rank_b] - _start_b).clamp(
+                min=0, max=B_pos_b.shape[0] - 1)
     _bpa = B_pos_a[:max_len] if max_len <= B_pos_a.shape[0] else B_pos_a[_pos_a]
     # Every real block carries at least one token (the segmenters only emit
     # positive counts), so the A lanes always contain a finite logit and the
@@ -4076,8 +4107,14 @@ def _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, F
         # same values as the out-of-place add (AddBackward saves no tensor, and
         # the only downstream consumer chain — masked_fill_/cat/softmax — keeps
         # no pre-add version).
-        Zam += _bpa[None]
-        Zbm += B_pos_b[b_off[_b0:_b1]]
+        if _bias_a is None:
+            Zam += _bpa[None]
+        else:
+            Zam += B_pos_a[_bias_a[_b0:_b1]]
+        if _bias_b is None:
+            Zbm += B_pos_b[b_off[_b0:_b1]]
+        else:
+            Zbm += B_pos_b[_bias_b[_b0:_b1]]
         # the fill mask broadcasts: masked_fill_ accepts a broadcastable mask,
         # so the same booleans reach every lane (broadcast reads are exact).
         Zam.masked_fill_(~_ma[:, :, None], float('-inf'))
@@ -4124,7 +4161,10 @@ def pool_blocks_single(X, Z, B_pos, block_ids, n_blocks=None, monotonic=False):
         max_len = _cpu[1]
         _gkey = ('so', int(B), int(n), int(B_pos.shape[0]))
         _gc = getattr(block_ids, '_pool_geom', None)
-        _geom = None if _gc is None else _gc.get(_gkey)
+        # The cached bias rows are within-sorted-block ranks; only an identity
+        # row order makes them the token's within-block offsets.
+        _geom = (None if (_gc is None or not _ident)
+                 else _gc.get(_gkey))
     else:
         max_len = int(counts.max())
     if _geom is not None:
@@ -4134,7 +4174,7 @@ def pool_blocks_single(X, Z, B_pos, block_ids, n_blocks=None, monotonic=False):
         # values are identical to the device build; only the location of the
         # integer math and the transport change, §6.1/§6.2).
         _host = None
-        if _POOL_PARTS_HOST and _cpu is not None and len(_cpu[0]) == B:
+        if _ident and _POOL_PARTS_HOST and _cpu is not None and len(_cpu[0]) == B:
             _host = _pool_geom_host_single(_cpu[0], B, n, max_len, B_pos.shape[0], dev)
         if _host is not None:
             g, mask, _pos_a = _host
@@ -4150,7 +4190,7 @@ def pool_blocks_single(X, Z, B_pos, block_ids, n_blocks=None, monotonic=False):
                 # built first and the clamp runs in place (same kernel, same integers).
                 g = _gp.clamp_(max=n - 1)
                 _pos_a = pos if max_len <= B_pos.shape[0] else pos.clamp(max=B_pos.shape[0] - 1)
-            if _cpu is not None and len(_cpu[0]) == B:
+            if _ident and _cpu is not None and len(_cpu[0]) == B:
                 _pool_geom_put(block_ids, _gkey, (g, mask, _pos_a))
     # Block-chunked exactly as _pool_ordered: each block's pooled vector is a
     # function of its own lanes only, so the grouping never changes a value.
@@ -4158,7 +4198,17 @@ def pool_blocks_single(X, Z, B_pos, block_ids, n_blocks=None, monotonic=False):
     # Conservative per-block element count: Xb + Zb(WinZ) + sc plus the mask.
     _per_elems = 3 * int(max_len) * _Fd + 4 * int(max_len)
     _chunk = _pool_block_chunk(B, _per_elems, Xs.element_size())
-    # Same slice-view form as _pool_ordered (index == arange(max_len)).
+    # Same slice-view form as _pool_ordered (index == arange(max_len)) only for
+    # an identity row order.  A sorted non-monotone layout needs each block's
+    # bias index recomputed from the ORIGINAL token positions.
+    _bias = None
+    if not _ident:
+        _orig = order
+        _j = _range_cache(0, int(g.shape[1]), dev)
+        _rank = (starts[:, None] + _j[None, :]).clamp(max=n - 1)
+        _start = _orig[starts.clamp(max=n - 1)][:, None]
+        _bias = (_orig[_rank] - _start).clamp(
+            min=0, max=B_pos.shape[0] - 1)
     _bpos = B_pos[:max_len] if max_len <= B_pos.shape[0] else B_pos[_pos_a]
     _clean = _pool_counts_clean(block_ids, B)
     comp = torch.empty(B, _Fd, device=dev, dtype=Xs.dtype)
@@ -4174,7 +4224,10 @@ def pool_blocks_single(X, Z, B_pos, block_ids, n_blocks=None, monotonic=False):
         # masked-multiply and boolean-index forms.
         # += on the fresh _take_2d output (same elementwise kernel and values as
         # the out-of-place add; see _pool_ordered).
-        WinZ += _bpos[None]
+        if _bias is None:
+            WinZ += _bpos[None]
+        else:
+            WinZ += B_pos[_bias[_b0:_b1]]
         # broadcast fill mask (same argument as _pool_ordered): identical booleans
         # per lane.
         WinZ.masked_fill_(~mask[_b0:_b1, :, None], float('-inf'))
@@ -7744,6 +7797,12 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=None, val_seqs=512,
     _validate_token_ids(train_ids, vocab, 'wikitext train_ids')
     _validate_token_ids(val_batch, vocab, 'wikitext val_batch')
     print(f'[data] val sequences = {n_val} (seq_len={seq_len})')
+    if n_val < int(val_seqs):
+        print(f'[data] WARNING: the validation split filled only {n_val} of '
+              f'{int(val_seqs)} requested sequence(s) ({len(val_ids)} tokens '
+              f'for seq_len={seq_len}); downstream panels configured for '
+              'val_seqs rows will see a smaller holdout — enlarge the '
+              'validation source or lower val_seqs and record the change')
     _shared_docs = int(np.intersect1d(train_doc_ids, val_doc_ids).size)
     if _shared_docs:
         raise RuntimeError(
@@ -9622,6 +9681,13 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=None, val_seqs=512,
         # 与 load_wikitext 同口径：块缓冲区含 +1 条序列的余量，钳到 val_seqs。
         n_val = min(n_val_tokens // seq_len, int(val_seqs))
         print(f'[data] val sequences = {n_val} (seq_len={seq_len}, contiguous holdout after the train region)')
+        if n_val < int(val_seqs):
+            print(f'[data] WARNING: the FineWeb validation holdout filled only '
+                  f'{n_val} of {int(val_seqs)} requested sequence(s) '
+                  f'({n_val_tokens} tokens for seq_len={seq_len}); downstream '
+                  'panels configured for val_seqs rows will see a smaller '
+                  'holdout — enlarge the holdout or lower val_seqs and record '
+                  'the change')
         if n_val == 0:
             raise RuntimeError('load_fineweb_edu: the corpus ran dry before a single validation sequence was filled — raise n_train_tokens or provide a larger source')
         if n_train < seq_len + 1:
@@ -20514,9 +20580,10 @@ def _binary_calibration(y_bin, score, n_bins=10):
     _bins = _as_seed_int(n_bins)
     if _bins is None or _bins < 1:
         raise ValueError(f'n_bins must be a positive integer, got {n_bins!r}')
-    if score.size and (np.any(score < 0.0) or np.any(score > 1.0)):
+    if score.size and (not np.all(np.isfinite(score))
+                       or np.any(score < 0.0) or np.any(score > 1.0)):
         return {'status': 'unavailable',
-                'reason': 'scores are outside [0, 1]; Brier/ECE require probabilities'}
+                'reason': 'scores are not finite probabilities in [0, 1]; Brier/ECE require probabilities'}
     if score.size == 0:
         return {'status': 'unavailable', 'reason': 'no scores'}
     idx = np.clip((score * _bins).astype(np.int64), 0, _bins - 1)
@@ -21905,9 +21972,14 @@ def metric_policy_audit(summary=None, policy=None):
                     _class_issues.append(
                         f'{_label}: decision_threshold_source={_thr_src!r} is set but '
                         'decision_threshold is missing')
-                elif _thr is not None and (_t is None or not (0.0 <= _t <= 1.0)):
+                elif _thr is not None and _t is None:
+                    # The score is not necessarily a probability: logits and
+                    # arbitrary ranking scores are supported, so only
+                    # finiteness is a contract here.  A cut outside the
+                    # observed [score_min, score_max] is caught by
+                    # `threshold_within_score_range` below.
                     _class_issues.append(
-                        f'{_label}: decision_threshold={_thr!r} is not a finite value in [0, 1]')
+                        f'{_label}: decision_threshold={_thr!r} is not a finite number')
                 if _thr_src is None:
                     _class_issues.append(
                         f'{_label}: decision_threshold is reported without decision_threshold_source')
@@ -28322,13 +28394,17 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reprodu
                                   and not _seed_mismatch and not _missing_curve_refs
                                   and not _run_cfg_mismatch and not _data_version_mismatch)
     _declared_status = status or 'complete'
-    if _declared_status in ('running', 'failed', 'error'):
+    if _declared_status in ('running', 'failed', 'error', 'incomplete'):
         _completion_status = _declared_status
     else:
         _completion_status = 'complete' if _integrity['complete'] else 'incomplete'
     _completion = {
         'status': _completion_status,
-        'complete': bool(_integrity['complete']),
+        # A panel explicitly declared incomplete/failed/running is not complete
+        # just because its recorded cells happen to be trace-complete.  The
+        # boolean is a conjunction of the declared terminal state and the
+        # per-cell integrity verdict.
+        'complete': bool(_integrity['complete'] and _completion_status == 'complete'),
         'n_planned': len(planned_cells),
         'n_measured': len(cells),
         'n_missing': len(_missing_cells),
@@ -32244,7 +32320,14 @@ def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
             del logp
             topv, topi = torch.topk(lg_work, _kk, dim=-1)
             pred = topi[..., 0]
-            margin = (topv[..., 0] - topv[..., 1]) if _kk > 1 else torch.zeros_like(topv[..., 0])
+            # With topk=1 there is no second logit, so the top-1/top-2 margin
+            # is unmeasured.  A zero here is not a measured margin: the
+            # `margin <= 0.5` / `>= 2.0` rules would then label every token
+            # ambiguous (and make the blind-spot cause unreachable).  A NaN
+            # is the explicit "not measured" value; the classifier already
+            # skips non-finite margins and keeps the entropy rules.
+            margin = ((topv[..., 0] - topv[..., 1]) if _kk > 1
+                      else torch.full_like(topv[..., 0], float('nan')))
             del lg_work, topv
             # Bucket ids for every token at once.
             pos = torch.arange(s0, s1, device=device, dtype=torch.float64)[None, :]

@@ -436,6 +436,12 @@ def t_early_stop_decision():
     assert L.early_stop_decision(hist2, patience=2)['should_stop'] is False
     tight = L.early_stop_decision(hist2[:3], patience=2, min_delta=2.0)
     assert tight['should_stop'] is True, tight
+    # "at least min_delta below" is inclusive: exactly 0.5 below the best is
+    # an improvement, not a stale point.
+    edge = L.early_stop_decision(
+        [{'step': 0, 'val_ppl': 10.0}, {'step': 1, 'val_ppl': 9.5}],
+        patience=1, min_delta=0.5)
+    assert edge['should_stop'] is False and edge['best_step'] == 1, edge
     assert L.early_stop_decision([], patience=1)['should_stop'] is False
     for bad_p in (0, -1, True, 1.5, '2'):
         try:
@@ -18590,6 +18596,173 @@ def t_freeze_lock_source_audit_and_legacy_boundary():
         assert r['status'] == 'fail', r
         assert r['declared_source_drift'], r
 
+def t_freeze_lock_persists_declared_drift():
+    # The disclosed-drift branch used to set _dirty and then have it
+    # unconditionally reset, so the event lived only in the returned dict.
+    # The on-disk lock — the artifact the source audit reads — stayed clean.
+    with tempfile.TemporaryDirectory() as td:
+        man = {'manifest_sha256': 'AAA', 'frozen_at': '2026-10-17'}
+        src_a = _fake_source_tree('a')
+        src_b = _fake_source_tree('b')
+        V12._check_or_write_freeze_lock(
+            td, man, None, stage='preaccess', source_tree=src_a)
+        V12._check_or_write_freeze_lock(
+            td, man, 'FP', stage='accessed', source_tree=src_a)
+        lp = os.path.join(td, '.freeze_lock.json')
+        os.environ['V12_ALLOW_SOURCE_DRIFT'] = '1'
+        try:
+            V12._check_or_write_freeze_lock(
+                td, man, 'FP', stage='analysis', source_tree=src_b)
+        finally:
+            del os.environ['V12_ALLOW_SOURCE_DRIFT']
+        with open(lp, encoding='utf-8') as f:
+            disk = json.load(f)
+        assert disk.get('source_tree_drift'), disk
+        assert disk['source_tree_drift'][-1]['current_sha256'] == src_b['sha256']
+        # The original attestation is retained (the round is disclosed, not
+        # re-frozen).
+        assert disk['source_tree_sha256'] == src_a['sha256'], disk
+        # The audit must read the drift from the lock even when the expected
+        # tree came from the plan snapshot (which is a different artifact).
+        snap = os.path.join(td, 'plan_snapshot.json')
+        with open(snap, 'w', encoding='utf-8') as f:
+            json.dump({'source_tree': src_a}, f)
+        r = A.audit_source_integrity(snapshot_path=snap, lock_path=lp)
+        assert r['status'] == 'fail', r
+        assert r.get('declared_source_drift'), r
+        # Discovery through results_dirs must give the same verdict.
+        r2 = A.audit_source_integrity(snapshot_path=snap, results_dirs=[td])
+        assert r2['status'] == 'fail' and r2.get('declared_source_drift'), r2
+
+
+def t_frozen_vocab_accepts_legacy_recipe_key():
+    # _recipe_signature accepts the pre-v2 `training_recipe` alias; the
+    # vocabulary binding must use the same accepted shape or P5T resolves the
+    # test cache from the local width instead of the frozen one.
+    assert V12._frozen_vocab_size(
+        {'binding': {'training_recipe': {'v': 16384}}}) == 16384
+    assert V12._frozen_vocab_size(
+        {'binding': {'training_recipe_signature': {'v': 16384}}}) == 16384
+    # Conflicting spellings are corrupt evidence, not "pick the new one".
+    try:
+        V12._frozen_vocab_size({'binding': {
+            'training_recipe': {'v': 16384},
+            'training_recipe_signature': {'v': 8192}}})
+        raise AssertionError('conflicting frozen vocabulary widths must be refused')
+    except SystemExit as e:
+        assert 'conflicting vocabulary' in str(e), str(e)
+
+
+def t_row_keys_are_per_row_not_per_block():
+    # Duplicate identity must be a pure function of the row.  The old integer
+    # branch chose float-vs-int hashing for a whole 64 MiB block, so one
+    # float64-inexact row poisoned every row in that block and an equal row in
+    # the next block got a different key (missed duplicate/leak).
+    import data_guard as DG
+    old_block = DG._HASH_BLOCK_BYTES
+    DG._HASH_BLOCK_BYTES = 16  # 2 rows per block for a 1-column int64 table
+    try:
+        X = np.array([[5], [2 ** 60 + 1], [5], [3]], dtype=np.int64)
+        got = DG.duplicate_mask(X)
+        assert list(got) == [False, False, True, False], got
+        # Exact and object spellings of the same rows share one key; a large
+        # integer stays distinct from its rounded float image.
+        native = DG._row_keys(np.array([[5], [2 ** 60 + 1]], dtype=np.int64))
+        obj = DG._row_keys(np.array([[5], [2 ** 60 + 1]], dtype=object))
+        assert native == obj, (native, obj)
+        assert (DG._row_keys(np.array([[5]], dtype=np.int64))
+                == DG._row_keys(np.array([[5.0]], dtype=np.float64)))
+    finally:
+        DG._HASH_BLOCK_BYTES = old_block
+
+
+def t_nonmonotone_pooling_uses_original_positions():
+    # When block ids are not monotone the rows are sorted by block, but the
+    # position bias is a function of the ORIGINAL token position within its
+    # block, not of the sorted lane rank.
+    X = torch.tensor([[0.], [1.], [0.], [1.]])
+    Z = torch.zeros_like(X)
+    B = torch.tensor([[0.], [0.5], [1.0], [1.5]])
+    bid = torch.tensor([0, 1, 1, 0])
+    comp = L.pool_blocks_single(X, Z, B, bid, n_blocks=2,
+                                monotonic=False)[0].ravel()
+    # block 0 = original tokens {0, 2} -> bias rows {0, 1}; block 1 =
+    # original tokens {1, 3} -> bias rows {0, 1}.
+    assert torch.allclose(comp, torch.tensor([0.81757444, 0.37754068]),
+                          atol=1e-6), comp
+    # A merely reversed block order is still contiguous: sorting must recover
+    # the same per-block offsets as the already-monotone path.
+    mono = L.pool_blocks_single(X, Z, B, torch.tensor([0, 0, 1, 1]),
+                                n_blocks=2, monotonic=True)[0]
+    rev = L.pool_blocks_single(X, Z, B, torch.tensor([1, 1, 0, 0]),
+                               n_blocks=2, monotonic=False)[0]
+    assert torch.allclose(mono, rev, atol=1e-6), (mono, rev)
+
+
+def t_analyze_errors_topk_one_has_no_margin():
+    # With one logit the top1/top2 margin is unmeasured; a synthetic 0 margin
+    # made every non-rare token "ambiguous_context" and made the blind-spot
+    # cause unreachable.
+    V = 8
+
+    class _Stub:
+        training = True
+
+        def eval(self):
+            self.training = False
+            return self
+
+        def train(self, mode=True):
+            self.training = bool(mode)
+            return self
+
+        def trunk(self, ids):
+            return torch.zeros((ids.shape[0], ids.shape[1], 2))
+
+        def head(self, h):
+            x = torch.zeros((h.shape[0], h.shape[1], V))
+            x[..., 0] = 10.0
+            return x
+
+    vb = np.full((2, 4), 3, dtype=np.int64)  # model always predicts 0
+    r = L.analyze_errors(_Stub(), vb, V, torch.device('cpu'), topk=1,
+                         top_n=0, top_tokens=0)
+    cc = r['cause_counts_all']
+    assert cc['ambiguous_context']['n'] == 0, cc
+    assert cc['target_outside_topk']['n'] == r['n_targets'], cc
+
+
+def t_metric_threshold_and_manifest_status_guards():
+    # Logit scores are a supported 1-D score type; a finite cut of 2.0 is a
+    # legal operating point and must not be rejected as "not in [0, 1]".
+    y = np.array([0, 1, 0, 1, 1, 0])
+    logits = np.array([-2.0, 3.0, -1.0, 2.0, 1.0, -0.5])
+    m = L.classification_metrics(y, y_score=logits, labels=[0, 1],
+                                 threshold=2.0)
+    rec = dict(m, variant='r', task='binary_classification')
+    aud = L.metric_policy_audit({'r': rec})
+    assert aud['status'] == 'ok', aud
+    # Non-finite probability scores are unavailable, not an "ok" calibration
+    # with NaN Brier/ECE.
+    cal = L._binary_calibration(np.array([0, 1]),
+                                np.array([0.5, float('nan')]))
+    assert cal['status'] == 'unavailable', cal
+
+    # A declared terminal status must not be contradicted by
+    # completion.complete=True.
+    with tempfile.TemporaryDirectory() as td:
+        cfg = {'seeds': [], 'variants': [], 'outdir': td,
+               'n_train_tokens': 1, 'seq_len': 1}
+        for status in ('incomplete', 'failed'):
+            L.write_run_manifest(td, cfg, 'FP', {'data': {}}, {},
+                                 status=status, planned_cells=[])
+            e = json.load(open(os.path.join(td, 'run_manifest.json'),
+                               encoding='utf-8'))['panels']['FP']
+            assert e['status'] == status, e
+            assert e['completion']['status'] == status, e['completion']
+            assert e['completion']['complete'] is False, e['completion']
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -19072,6 +19245,12 @@ def main():
     _check('L140 requirements.lock is a full transitive closure', t_requirements_lock_is_a_complete_environment)
     _check('L141 freeze lock binds the measurement source and refuses drift', t_freeze_lock_binds_the_measurement_source)
     _check('L142 source audit verifies the freeze-lock digest and legacy boundary', t_freeze_lock_source_audit_and_legacy_boundary)
+    _check('L143 disclosed source drift is persisted and audited with a snapshot', t_freeze_lock_persists_declared_drift)
+    _check('L144 frozen vocabulary accepts the legacy recipe spelling', t_frozen_vocab_accepts_legacy_recipe_key)
+    _check('L145 duplicate keys are per row, not per hash block', t_row_keys_are_per_row_not_per_block)
+    _check('L146 non-monotone pooling uses original block positions', t_nonmonotone_pooling_uses_original_positions)
+    _check('L147 topk=1 margin is unmeasured, not zero', t_analyze_errors_topk_one_has_no_margin)
+    _check('L148 logit thresholds + terminal manifest status + NaN calibration', t_metric_threshold_and_manifest_status_guards)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')
