@@ -200,6 +200,29 @@ def _finite_mean(v):
     v = v[np.isfinite(v)]
     return float(v.mean()) if v.size else float('nan')
 
+def _context_reason(ra, rb):
+    # `_variant_records` keeps one protocol group PER VARIANT, so the two arms
+    # can still come from different groups (e.g. clean vs warm).  `pair_reason`
+    # compares run_cfg/knobs/data, but protocol and warmup are not part of that
+    # fingerprint; require them here.
+    for _k in ('protocol', 'warm_steps'):
+        _va, _vb = ra.get(_k), rb.get(_k)
+        if (_va is None) != (_vb is None):
+            return f'{_k} is unverifiable (only one arm carries it)'
+        if _va is not None and _va != _vb:
+            return f'{_k} differs ({_va!r} != {_vb!r})'
+    return None
+
+def _pair_reason_with_context(ra, rb):
+    """The complete pairability gate used by every section of this report.
+
+    Keeping one helper (instead of calling `L.pair_reason` directly in some
+    sections) prevents the block-length table, the trajectories and the
+    boundary plots from pairing seeds across different protocols/warmups after
+    the main table has already rejected them.
+    """
+    return L.pair_reason(ra, rb) or _context_reason(ra, rb)
+
 def main(argv=None):
     if argv is None:
         argv = sys.argv[1:]
@@ -258,21 +281,8 @@ def main(argv=None):
             continue
         layers = layers_of(a, SEEDS)
 
-        def _context_reason(ra, rb):
-            # `_variant_records` keeps one protocol group PER VARIANT, so the
-            # two arms can still come from different groups (e.g. clean vs
-            # warm).  `pair_reason` compares run_cfg/knobs/data, but protocol
-            # and warmup are not part of that fingerprint; require them here.
-            for _k in ('protocol', 'warm_steps'):
-                _va, _vb = ra.get(_k), rb.get(_k)
-                if (_va is None) != (_vb is None):
-                    return f'{_k} is unverifiable (only one arm carries it)'
-                if _va is not None and _va != _vb:
-                    return f'{_k} differs ({_va!r} != {_vb!r})'
-            return None
-
-        _reasons = {s: (L.pair_reason(rec(a, s), rec(b, s))
-                        or _context_reason(rec(a, s), rec(b, s))) for s in SEEDS}
+        _reasons = {s: _pair_reason_with_context(rec(a, s), rec(b, s))
+                    for s in SEEDS}
         _why = sorted({r for r in _reasons.values() if r})
         _ok_seeds = [s for s in SEEDS if _reasons[s] is None]
         _gate_ok = not _why
@@ -379,7 +389,7 @@ def main(argv=None):
     _blk, _pgate_drop = ({}, [])
     _pair_missing = False
     try:
-        _pair_ok_seeds = [s for s in _hyb_common if L.pair_reason(rec('hybrid_csa_dyn', s), rec('hybrid_csa_dyn_fuse', s)) is None]
+        _pair_ok_seeds = [s for s in _hyb_common if _pair_reason_with_context(rec('hybrid_csa_dyn', s), rec('hybrid_csa_dyn_fuse', s)) is None]
     except (KeyError, IndexError, ValueError, TypeError):
         _pair_ok_seeds = []
         _pair_missing = True
@@ -445,12 +455,12 @@ def main(argv=None):
     lines.append('')
     _hyb_keep = None
     try:
-        _hyb_keep = np.array([L.pair_reason(rec('hybrid_csa_dyn', s), rec('hybrid_csa_dyn_fuse', s)) is None for s in _hyb_common], dtype=bool)
+        _hyb_keep = np.array([_pair_reason_with_context(rec('hybrid_csa_dyn', s), rec('hybrid_csa_dyn_fuse', s)) is None for s in _hyb_common], dtype=bool)
     except (KeyError, ValueError, TypeError):
         _hyb_keep = np.zeros(len(_hyb_common), dtype=bool)
     _hyb_seeds = [s for s, k in zip(_hyb_common, _hyb_keep) if k]
     try:
-        _csa_keep = np.array([L.pair_reason(rec('csa_dynamic', s), rec('csa_dyn_fuse', s)) is None for s in _csa_common], dtype=bool)
+        _csa_keep = np.array([_pair_reason_with_context(rec('csa_dynamic', s), rec('csa_dyn_fuse', s)) is None for s in _csa_common], dtype=bool)
     except (KeyError, ValueError, TypeError):
         _csa_keep = np.zeros(len(_csa_common), dtype=bool)
     _csa_seeds = [s for s, k in zip(_csa_common, _csa_keep) if k]

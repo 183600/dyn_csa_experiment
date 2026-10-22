@@ -631,6 +631,13 @@ def _relaxed_pair_reason(a, b, tuned_arms):
             return f'unverifiable {k} (at least one record omits it)'
         if _va != _vb:
             return f'{k} differs ({_va!r} vs {_vb!r})'
+    # Same-seed replication is only controlled on the same hardware/software/
+    # precision class.  The strict `pair_reason` carries this gate; the relaxed
+    # tuned rule must not bypass it.  Legacy records without the digest keep
+    # the historical permissive path.
+    _env_reason = L.execution_environment_reason(a, b)
+    if _env_reason is not None:
+        return _env_reason
     # The final tuned metric may be a held-out row fold; the strict
     # `pair_reason` already refuses a mixed evaluation slice, and the relaxed
     # tuned rule must not become a back door around it.  Legacy records with

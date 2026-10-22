@@ -655,6 +655,28 @@ def _training_knobs_reason(ka, kb):
                 'augmentation / precision)')
     return None
 
+def _execution_environment_reason(ra, rb):
+    """Mirror exp_lib.execution_environment_reason for the zero-GPU report.
+
+    Same-seed replication is only controlled on the same hardware/software/
+    precision class.  The statistics layer refuses a pair whose execution
+    fingerprint disagrees; the report must not pair it either.  Legacy records
+    without the digest keep the historical permissive path.
+    """
+    def _fp(rec):
+        v = rec.get('exec_fp')
+        if v is None and isinstance(rec.get('hyperparams'), dict):
+            v = rec['hyperparams'].get('exec_fp')
+        return v
+    a, b = _fp(ra), _fp(rb)
+    ha = a is not None and str(a) != ''
+    hb = b is not None and str(b) != ''
+    if ha and hb and str(a) != str(b):
+        return (f'different execution environment ({str(a)[:12]}… vs '
+                f'{str(b)[:12]}…): same-seed replication is not controlled '
+                'across hardware/driver/precision classes')
+    return None
+
 def _pair_reason(ra, rb):
     if not isinstance(ra, dict) or not isinstance(rb, dict):
         return 'a record is not a dict'
@@ -663,6 +685,9 @@ def _pair_reason(ra, rb):
         return 'unverifiable run_cfg'
     if fa != fb:
         return 'different run_cfg'
+    _env_reason = _execution_environment_reason(ra, rb)
+    if _env_reason is not None:
+        return _env_reason
     # The run_cfg string does not carry the optimizer identity / schedule
     # shape / clipping / augmentation or the AMP/eager implementation mode.
     # Mirror exp_lib.pair_reason so a zero-GPU report cannot pair cells that
