@@ -575,19 +575,50 @@ def _frozen_vocab_size(manifest, cfg=None):
     slice after a scale-up.  The declared training recipe is authoritative;
     every per-arm signature must agree.
     """
+    def _width(value, label):
+        # A manifest is machine-checkable evidence: a boolean, a fractional
+        # float or a non-finite value is not a vocabulary width.  Silently
+        # truncating it would select a different test-cache tag than the one
+        # the pre-registration names.
+        if isinstance(value, (bool, np.bool_)):
+            raise SystemExit(
+                f'[v12] REFUSE: {label}={value!r} is not a positive integer '
+                'vocabulary width')
+        if isinstance(value, numbers.Integral):
+            width = int(value)
+        else:
+            try:
+                f = float(value)
+            except (TypeError, ValueError, OverflowError):
+                raise SystemExit(
+                    f'[v12] REFUSE: {label}={value!r} is not an integer '
+                    'vocabulary width')
+            if not math.isfinite(f) or f != math.floor(f):
+                raise SystemExit(
+                    f'[v12] REFUSE: {label}={value!r} is not an integer '
+                    'vocabulary width')
+            width = int(f)
+        if width < 1:
+            raise SystemExit(
+                f'[v12] REFUSE: {label}={value!r} must be a positive '
+                'vocabulary width')
+        return width
+
     _bind = manifest.get('binding') or {}
     _sig = _bind.get('training_recipe_signature') if isinstance(_bind, dict) else None
     _vals = set()
     if isinstance(_sig, dict) and _sig.get('v') is not None:
-        _vals.add(int(_sig['v']))
+        _vals.add(_width(_sig['v'], 'binding.training_recipe_signature.v'))
     _per = (_bind.get('per_arm_recipe_signature')
             if isinstance(_bind, dict) else None)
     if isinstance(_per, dict):
-        for _arm_sig in _per.values():
+        for _arm, _arm_sig in _per.items():
             if isinstance(_arm_sig, dict) and _arm_sig.get('v') is not None:
-                _vals.add(int(_arm_sig['v']))
+                _vals.add(_width(
+                    _arm_sig['v'],
+                    f'binding.per_arm_recipe_signature[{_arm!r}].v'))
     if isinstance(cfg, dict) and cfg.get('vocab_size') is not None:
-        _vals.add(int(cfg['vocab_size']))
+        _vals.add(_width(cfg['vocab_size'], 'cfg.vocab_size'))
     if len(_vals) > 1:
         raise SystemExit(
             f'[v12] REFUSE: the frozen plan declares conflicting vocabulary '
@@ -1104,11 +1135,46 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test',
         out['status'] = 'skipped_missing_geometry'
         return out
     _arch = (int(d['d']), int(d['n_layers']), int(d['n_heads']), int(d['d_head']))
-    _ck_vocab = d.get('vocab', frozen_vocab)
-    if _ck_vocab is None:
+    _ck_vocab_raw = d.get('vocab', frozen_vocab)
+    if _ck_vocab_raw is None:
         print(f'[p5t] REFUSE {v} s{seed}: checkpoint and frozen plan declare no vocabulary width — the embedding shape cannot be reconstructed without a current-scale guess')
         del d
         out['status'] = 'skipped_missing_vocab'
+        return out
+    if isinstance(_ck_vocab_raw, (bool, np.bool_)):
+        print(f'[p5t] REFUSE {v} s{seed}: checkpoint vocabulary width '
+              f'{_ck_vocab_raw!r} is a boolean, not a positive integer')
+        del d
+        out['status'] = 'skipped_missing_vocab'
+        return out
+    try:
+        _ck_vocab = int(_ck_vocab_raw)
+    except (TypeError, ValueError, OverflowError):
+        print(f'[p5t] REFUSE {v} s{seed}: checkpoint vocabulary width '
+              f'{_ck_vocab_raw!r} is not an integer')
+        del d
+        out['status'] = 'skipped_missing_vocab'
+        return out
+    if _ck_vocab < 1 or (
+            isinstance(_ck_vocab_raw, numbers.Real)
+            and not isinstance(_ck_vocab_raw, numbers.Integral)
+            and float(_ck_vocab_raw) != _ck_vocab):
+        print(f'[p5t] REFUSE {v} s{seed}: checkpoint vocabulary width '
+              f'{_ck_vocab_raw!r} is not a positive integer')
+        del d
+        out['status'] = 'skipped_missing_vocab'
+        return out
+    # The checkpoint must be the one the frozen recipe/test tokenizer names.
+    # Using the checkpoint's width when it disagrees with the frozen plan
+    # would evaluate that arm against a different id space (and could index
+    # past the embedding) after the one-shot test access was already spent.
+    if frozen_vocab is not None and _ck_vocab != int(frozen_vocab):
+        print(f'[p5t] REFUSE {v} s{seed}: checkpoint vocabulary width '
+              f'{_ck_vocab} != the frozen plan/test tokenizer width '
+              f'{int(frozen_vocab)} — this arm cannot be evaluated on the '
+              'frozen held-out slice')
+        del d
+        out['status'] = 'skipped_vocab_mismatch'
         return out
     _ck_train_len = d.get('train_len')
     if _ck_train_len is None:
@@ -1283,6 +1349,11 @@ def run_finaltest(cfg=None, guard=None):
                 f'[v12] REFUSE: loaded test vocabulary {vocab_t} != the frozen '
                 f'{_frozen_vocab} — the held-out cache belongs to another '
                 'tokenizer/scale protocol')
+        if _frozen_vocab is None:
+            # No binding declared the width, but the served test cache did:
+            # use it as the binding so every checkpoint is still checked
+            # against the tokenizer that actually produced the slice.
+            _frozen_vocab = int(vocab_t)
     else:
         print('[p5t] SMOKE: test_ids supplied by the caller; records are stamped split="smoke" and are inadmissible to the confirmation statistics')
     _dfp = L._ids_fp(np.ascontiguousarray(test_ids).reshape(-1))

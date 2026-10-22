@@ -2027,15 +2027,24 @@ def segmentation_prefix_invariance(cut_table, n, min_block, max_block,
 
     full = _starts_for(n)
     if prefixes is None:
+        # Keep a small `max_checks` usable: the short-prefix block must never
+        # exceed the caller's budget (a negative np.linspace count used to
+        # raise instead of returning a partial report).
+        max_checks = max(0, int(max_checks))
         if n <= max_checks:
             prefixes = range(1, n + 1)
         else:
             # Deterministic coverage of short prefixes (where geometry is
             # densest) plus evenly spaced longer ones.
-            short = list(range(1, min(n, 32) + 1))
-            rest = np.linspace(33, n, num=min(max_checks - len(short), n - 32),
-                               dtype=np.int64).tolist() if n > 32 else []
+            short = list(range(1, min(n, 32, max_checks) + 1))
+            rest_n = min(max_checks - len(short), max(0, n - len(short)))
+            rest = (np.linspace(len(short) + 1, n, num=rest_n,
+                                dtype=np.int64).tolist() if rest_n > 0 else [])
             prefixes = sorted(set(short + [int(x) for x in rest]))
+    elif isinstance(prefixes, numbers.Integral):
+        # A single prefix is a legitimate convenience input; iterating an int
+        # would otherwise raise an unrelated TypeError.
+        prefixes = [int(prefixes)]
     mismatches = []
     checked = 0
     for t in sorted({int(x) for x in prefixes if 1 <= int(x) <= n}):
@@ -8576,9 +8585,6 @@ def _fineweb_docs(source):
 def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=None, val_seqs=512,
                      cache_dir='./fineweb_cache', source='sample-10BT',
                      fit_docs=20000):
-    if vocab_size is None:
-        vocab_size = int(DATA_PROTOCOL_DEFAULTS['fineweb']['vocab_size'])
-    vocab_size = _protocol_pos_int('vocab_size', vocab_size)
     """B-tier corpus: FineWeb-Edu, self-trained BPE.
 
     Discipline mirrors load_wikitext exactly: npy cache keyed by the full
@@ -8600,6 +8606,9 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=None, val_seqs=512,
         caps); the partial final train batch is discarded between regions;
       - val_batch is int64 (eval paths feed targets straight to cross entropy).
     """
+    if vocab_size is None:
+        vocab_size = int(DATA_PROTOCOL_DEFAULTS['fineweb']['vocab_size'])
+    vocab_size = _protocol_pos_int('vocab_size', vocab_size)
     os.makedirs(cache_dir, exist_ok=True)
     # A local stand-in corpus must never share a cache tag with the hub source:
     # otherwise a cache built from FWEDU_LOCAL_JSONL would be served on a later
@@ -21525,10 +21534,6 @@ def _sign_of(x):
     return 0
 
 def _classify_group_status(entries, *, min_n, alpha, m_family, require_param_match=False):
-    _min_n = _as_seed_int(min_n)
-    if _min_n is None or _min_n < 0:
-        raise ValueError(f'min_n must be a non-negative integer, got {min_n!r}')
-    min_n = _min_n
     """One status per declared innovation / baseline claim.
 
     verified            — a controlled, capacity-controlled (total plus the
@@ -21561,6 +21566,11 @@ def _classify_group_status(entries, *, min_n, alpha, m_family, require_param_mat
                           seed noise (|mean| <= std);
     unverified          — no controlled contrast (missing arm / config mismatch).
     """
+    _min_n = _as_seed_int(min_n)
+    if _min_n is None or _min_n < 0:
+        raise ValueError(f'min_n must be a non-negative integer, got {min_n!r}')
+    min_n = _min_n
+
     def _capacity_ok(e):
         pc = e.get('param_capacity_controlled')
         return pc if pc is not None else e.get('param_controlled')
@@ -25641,8 +25651,6 @@ def _random_cut_precision(P, near, n_pos, tol, G, gt_bounds=None, approx_flag=No
     if gt.size == 0:
         return 0.0
     gt = np.unique(gt)
-    if P >= n_pos:
-        return float(min(gt.size, P) / P)
     clusters, cur = ([], [int(gt[0])])
     for g in gt[1:]:
         g = int(g)
@@ -25669,7 +25677,15 @@ def _random_cut_precision(P, near, n_pos, tol, G, gt_bounds=None, approx_flag=No
             lo, hi = (max(min(cl) - tol, 1), min(max(cl) + tol, n_pos))
             w = max(1, hi - lo + 1)
             expected += len(cl) * (1.0 - (1.0 - p) ** w)
-        return float(min(expected / float(P), 1.0))
+        # p is clamped at 1 when P > n_pos; the expected number of cuts is
+        # then n_pos, not P.  Dividing by P would understate the coverage
+        # probability of the definition the caller asked for.  For the normal
+        # P <= n_pos case keep the historical denominator (bit-identical to
+        # the pre-existing formula rather than merely mathematically equal).
+        expected_cuts = float(P) if P <= n_pos else float(n_pos)
+        return float(min(expected / max(expected_cuts, 1e-12), 1.0))
+    if P >= n_pos:
+        return float(min(gt.size, P) / P)
     expect_frac = 0.0
     for cl in clusters:
         lo, hi = (max(min(cl) - tol, 1), min(max(cl) + tol, n_pos))

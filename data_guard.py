@@ -3622,7 +3622,11 @@ def _split_index_fingerprint(idx):
     h = hashlib.sha256()
     h.update(np.asarray(a.shape, dtype=np.int64).tobytes())
     if a.size:
-        h.update(np.ascontiguousarray(a).tobytes())
+        # Hash the contiguous buffer through a zero-copy view.  `.tobytes()`
+        # materialised a second full copy of the index array, which is
+        # needless host memory (and a peak allocation) when a large split is
+        # fingerprinted.
+        h.update(memoryview(np.ascontiguousarray(a)).cast('B'))
     return h.hexdigest()
 
 

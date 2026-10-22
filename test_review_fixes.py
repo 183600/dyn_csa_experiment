@@ -15703,6 +15703,12 @@ def t_bnd_rand_definitions_are_tagged_and_never_pooled():
                                            provenance=prov2)
     assert prov2.get('bnd_rand_kind') == 'per_sequence_independent', prov2
     assert prov2.get('bnd_rand_exact') is False, prov2
+    # At P >= n_pos the independent process has p=1, so every eligible slot is
+    # cut: expected precision is matched/n_pos, NOT matched/P.
+    _rp_cap = L._random_cut_precision(
+        30, None, 19, 1, 2, gt_bounds=[3, 10],
+        kind='per_sequence_independent')
+    assert abs(_rp_cap - 2.0 / 19.0) < 1e-12, _rp_cap
     try:
         L.boundary_alignment([3], gt, 20, rand_kind='nonsense')
         raise AssertionError('unknown bnd_rand kind must be refused')
@@ -15829,6 +15835,50 @@ def t_test_split_is_read_only_once():
         assert lock.get('test_reads') == 2, lock
         assert any(h.get('stage') == 'reread' for h in lock.get('history') or []), lock
 
+
+def t_segmentation_prefix_check_honours_small_budget_and_scalar_prefix():
+    # The diagnostic must remain usable when a caller asks for fewer checks
+    # than the 32 short prefixes: the old np.linspace count went negative and
+    # raised instead of returning a partial report.
+    rng = np.random.default_rng(7)
+    cuts = rng.random(200) < 0.2
+    for mc in (0, 1, 5, 10, 31, 32, 33, 64):
+        rep = L.segmentation_prefix_invariance(cuts, 201, 2, None,
+                                               max_checks=mc)
+        assert rep['ok'], (mc, rep)
+        assert rep['checked_prefixes'] <= max(0, mc), (mc, rep)
+    rep = L.segmentation_prefix_invariance(cuts, 201, 2, None, prefixes=17)
+    assert rep['ok'] and rep['checked_prefixes'] == 1, rep
+
+
+def t_loader_docstrings_survive_parameter_validation():
+    # Executable statements before the first string literal silently turn a
+    # function docstring into a dead expression; the scale loaders must keep
+    # their documented contract introspectable.
+    assert L.load_fineweb_edu.__doc__ and 'FineWeb-Edu' in L.load_fineweb_edu.__doc__
+    assert L._classify_group_status.__doc__ and 'verified' in L._classify_group_status.__doc__
+
+
+def t_frozen_vocab_width_is_a_validated_positive_integer():
+    m = {'binding': {'training_recipe_signature': {'v': 8192},
+                     'per_arm_recipe_signature': {'a': {'v': 8192}}}}
+    assert V12._frozen_vocab_size(m) == 8192, m
+    assert V12._frozen_vocab_size(m, {'vocab_size': 8192}) == 8192
+    assert V12._frozen_vocab_size({}) is None
+    for bad in (True, False, 0, -1, 8192.5, float('inf'), float('nan'), 'x'):
+        try:
+            V12._frozen_vocab_size({'binding': {'training_recipe_signature':
+                                               {'v': bad}}})
+            raise AssertionError(f'frozen vocab width {bad!r} was accepted')
+        except SystemExit:
+            pass
+    try:
+        V12._frozen_vocab_size(
+            {'binding': {'training_recipe_signature': {'v': 8192},
+                         'per_arm_recipe_signature': {'a': {'v': 16384}}}})
+        raise AssertionError('conflicting frozen vocabulary widths were accepted')
+    except SystemExit:
+        pass
 
 
 def main():
@@ -16238,6 +16288,9 @@ def main():
     _check('L76 pair only same protocol/code semantics', t_protocol_group_and_code_semantics_pairing_gate)
     _check('L77 test-split purpose + content fingerprint audit', t_test_split_purpose_and_content_fingerprints)
     _check('L78 held-out test split is a one-shot resource', t_test_split_is_read_only_once)
+    _check('L79 prefix-invariance check honours small budgets/scalar prefixes', t_segmentation_prefix_check_honours_small_budget_and_scalar_prefix)
+    _check('L80 loader/audit docstrings survive parameter validation', t_loader_docstrings_survive_parameter_validation)
+    _check('L81 frozen vocab width is a validated positive integer', t_frozen_vocab_width_is_a_validated_positive_integer)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')
