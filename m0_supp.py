@@ -119,7 +119,16 @@ def _ladder_params(name):
     层数）；tok/pos/head 词表与位置嵌入及最终 RMSNorm 单独计入。外推
     恒等式在 run_params 里用 S1 的全量实例化对拍验证。"""
     sc = L.SCALE_LADDER[name]
-    seq = L.RUN_S1['seq_len']
+    # A future tier may declare its own context length.  Position embeddings
+    # are a seq_len-sized table, so reusing S1's seq_len here made the
+    # analytic parameter count wrong as soon as a tier changed geometry
+    # (including a B_SEQ_LEN-style override recorded in its RUN_* config).
+    # Legacy tiers without their own run config keep the historical S1 span.
+    _run = getattr(L, f'RUN_{name}', None)
+    if isinstance(_run, dict) and _run.get('seq_len') is not None:
+        seq = int(_run['seq_len'])
+    else:
+        seq = int(L.RUN_S1['seq_len'])
     with torch.random.fork_rng():
         cfgs = L.make_layer_cfgs(1, 'csa_dynamic')
         m1 = L.SmallGPT(L.B_VOCAB, sc['d'], 1, sc['n_heads'], sc['d_head'], seq, cfgs)
@@ -160,7 +169,10 @@ def run_params(outdir='results_m0_params'):
         print(f"{name:<4}{cfg_txt:<28}{n:>16,}{_PLAN_PARAMS[name] / 1e9:>12.2f}B{n / _PLAN_PARAMS[name]:>8.2f}")
         tiers.append({'tier': name, 'config': {'d': sc['d'], 'n_layers': sc['n_layers'], 'n_heads': sc['n_heads'], 'd_head': sc['d_head']}, 'params': int(n), 'plan_params': _PLAN_PARAMS[name], 'ratio_to_plan': n / _PLAN_PARAMS[name]})
     _budget_tiers = []
-    for _name, _run in (('S1', L.RUN_S1), ('S2', L.RUN_S2)):
+    # Discover every declared RUN_<tier> instead of freezing S1/S2: a future
+    # S3/S4 added to SCALE_LADDER must enter the transfer audit without a
+    # second edit here.
+    for _name, _run in sorted(_tier_run_cfgs().items()):
         _p = next((t['params'] for t in tiers if t['tier'] == _name), None)
         _budget_tiers.append({'name': _name, 'cfg': dict(_run, vocab=_run.get('vocab_size')), 'params': _p})
     _budget = L.scale_ladder_audit(_budget_tiers)

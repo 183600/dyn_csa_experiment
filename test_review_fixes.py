@@ -2933,6 +2933,15 @@ def t_scale_geometry_overrides_are_validated():
             pass
         else:
             raise AssertionError(f'scale geometry override accepted {bad!r}')
+    # A budget override without the geometry needed to derive steps must fail
+    # closed instead of silently keeping the old step count.
+    try:
+        L.apply_scale_geometry_overrides(
+            {'n_train_tokens': 1000, 'steps': 10},
+            {'B_N_TRAIN_TOKENS': '2000'})
+        raise AssertionError('unrecomputable step override was silently accepted')
+    except ValueError:
+        pass
     # Future tiers are discovered from RUN_S<n>, not hard-coded S1/S2.
     import m0_supp as M0
     old = os.environ.get('M0_PANEL')
@@ -16309,6 +16318,141 @@ def t_v12_plan_emits_design_preflight():
     assert dr['ok'] and dr['runnable'] is False and dr['promotion_ready'] is False, dr
 
 
+def t_kernel_det_scatter_precision_and_nonfinite_topk():
+    import csa_kernels as CK
+    # The deterministic scatter must honour the requested dtype and must not
+    # erase a later segment behind a large global prefix.
+    vals = torch.tensor([1e8, 1.0, 1.0], dtype=torch.float64)
+    idx = torch.tensor([0, 1, 1])
+    out = CK._det_scatter_add_multi(2, idx, [vals], 'cpu', torch.float64)[0]
+    assert out.dtype == torch.float64, out.dtype
+    assert torch.equal(out, torch.tensor([1e8, 2.0], dtype=torch.float64)), out
+    idx = torch.cat([torch.zeros(64, dtype=torch.int64),
+                     torch.ones(1000, dtype=torch.int64)])
+    vals = torch.cat([torch.full((64,), 1e12), torch.ones(1000)])
+    out = CK._det_scatter_add_multi(2, idx, [vals], 'cpu', torch.float32)[0]
+    assert abs(float(out[1]) - 1000.0) < 1.0, out
+    # NaN input must delegate to torch.sort instead of leaving buf[..., 0]
+    # uninitialised (which crashed at k=1 and returned [5,5] at k=2).
+    x = torch.tensor([[float('nan'), 1., 2., 3., 4., 5.]])
+    for k in (1, 2, 3):
+        got_v, got_i = CK._stable_topk_desc(x, k)
+        exp_v, exp_i = torch.sort(x, dim=-1, descending=True, stable=True)
+        assert torch.equal(got_i, exp_i[..., :k]), (k, got_i, exp_i)
+        assert torch.equal(got_v.nan_to_num(0), exp_v[..., :k].nan_to_num(0)), (k, got_v, exp_v)
+
+def t_provenance_extra_ids_alias_narrow_and_sample_bound():
+    ids = np.arange(100, dtype=np.int64)
+    a = L.experiment_provenance(
+        {'dataset': 'wikitext', 'n_train_tokens': 100, 'seq_len': 10,
+         'data_extra': {'task': 'niah', 'seed': 1}}, train_ids=ids, vocab=100)
+    b = L.experiment_provenance(
+        {'dataset': 'wikitext', 'n_train_tokens': 100, 'seq_len': 10,
+         'data_extra': {'task': 'corrupt', 'seed': 2}}, train_ids=ids, vocab=100)
+    assert a['data']['corpus_fp'] != b['data']['corpus_fp'], (a['data'], b['data'])
+    # A read-only view over writable storage is still mutable.
+    base = np.arange(10, dtype=np.int64)
+    view = base[:]
+    view.flags.writeable = False
+    f1 = L._ids_fp(view)
+    base[0] = 99
+    assert L._ids_fp(view) != f1, 'memo returned the pre-mutation digest for a mutable base'
+    # Narrowing is transport-only and must not wrap a negative id.
+    try:
+        L._ids_narrow(np.array([-2 ** 31 - 1, 0, 5], dtype=np.int64))
+        raise AssertionError('negative out-of-range ids were silently narrowed')
+    except ValueError:
+        pass
+    for _m in (1, 4, 15, 16):
+        _s, _sampled = L._audit_sample_flat(np.arange(100), _m)
+        assert _sampled and _s.size <= _m, (_m, _s.size)
+
+def t_v7_eval_length_reports_short_panel():
+    cfg = V7.make_layer_cfgs_v7(1, 'csa_fixed_rope')[0]
+    model = V7.SmallGPTRoPE(64, 32, 1, 2, 16, 16, [cfg])
+    ids = (np.arange(40).reshape(2, 20) % 64).astype(np.int64)
+    out = V7.eval_length_gen(model, ids, [32], 'cpu', n_seq=2, max_pos=None)
+    assert 32 in out and out[32].get('error'), out
+    assert out[32].get('truncated') is False, out
+    try:
+        V7.eval_length_gen(model, ids.reshape(-1), [32], 'cpu', n_seq=2, max_pos=None)
+        raise AssertionError('a 1-D eval panel must be refused')
+    except ValueError:
+        pass
+
+def t_ladder_params_use_the_tier_geometry():
+    import m0_supp as M0
+    name = 'S9'
+    L.SCALE_LADDER[name] = {'d': 16, 'n_layers': 1, 'n_heads': 1, 'd_head': 16}
+    L.RUN_S9 = {'seq_len': 64, 'outdir': 'unused', 'seeds': [0], 'steps': 1,
+                'batch_size': 1, 'n_train_tokens': 64, 'lr': 0.1, 'warmup': 0,
+                'vocab_size': L.B_VOCAB}
+    try:
+        got, _per_layer = M0._ladder_params(name)
+        cfgs = L.make_layer_cfgs(1, 'csa_dynamic')
+        want = L.count_params(L.SmallGPT(L.B_VOCAB, 16, 1, 1, 16, 64, cfgs))
+        assert got == want, (got, want)
+    finally:
+        L.SCALE_LADDER.pop(name, None)
+        if hasattr(L, 'RUN_S9'):
+            delattr(L, 'RUN_S9')
+
+def t_audit_artifacts_resolve_from_repo_not_cwd():
+    panel = tempfile.mkdtemp(prefix='results_zz_audit_', dir=REPO)
+    old = os.getcwd()
+    try:
+        with open(os.path.join(panel, 'summary.json'), 'w', encoding='utf-8') as f:
+            json.dump({'csa::seed0': {'variant': 'csa', 'seed': 0, 'ppl': 1.0,
+                                      'params': 10, 'stats': {}}}, f)
+        os.chdir(tempfile.gettempdir())
+        out = A.audit_attribution(outdirs=[os.path.basename(panel)])
+        assert os.path.basename(panel) in out['panels'], out
+    finally:
+        os.chdir(old)
+        shutil.rmtree(panel, ignore_errors=True)
+
+def t_row_identity_is_numeric_dtype_and_width_safe():
+    import data_guard as DG
+    i = np.array([[1, 2]], dtype=np.int64)
+    f = np.array([[1.0, 2.0]])
+    assert DG._row_keys(i) == DG._row_keys(f), 'equal int/float rows must share a key'
+    assert len(DG._row_keys(i)[0]) == 16, 'row digests must not be only 64-bit'
+    # A large int that float64 cannot represent must not collide with its
+    # rounded float image.
+    assert DG._row_keys(np.array([[2 ** 53 + 1]], dtype=np.int64)) != \
+        DG._row_keys(np.array([[float(2 ** 53)]]))
+    assert A._row_overlap_count(np.array([[1., 2.], [3., 4.]]),
+                                np.array([[1, 2]])) == 1
+    assert DG._matrix_fingerprint(np.array([1., 2.])) == \
+        DG._matrix_fingerprint(np.array([[1.], [2.]]))
+    # A complex table cannot use the canonical fingerprint, but a null
+    # content_fp must not become an accidental identity match.
+    fp = DG.split_content_fingerprints(
+        np.array([[1 + 2j], [3 + 4j]]), None,
+        {'train': np.array([0, 1]), 'val': np.array([], dtype=np.int64),
+         'test': np.array([], dtype=np.int64)})
+    assert all(v.get('content_fp') for v in fp.values()), fp
+    assert fp['train']['content_fp'] != fp['val']['content_fp'], fp
+
+def t_evidence_and_dynamic_audits_reject_malformed_thresholds():
+    import copy
+    with open(os.path.join(REPO, 'confirmation_frozen.json'), encoding='utf-8') as f:
+        main = json.load(f)
+    bad = copy.deepcopy(main)
+    bad['scope']['confirmatory_claims'] = ['not', 'text']
+    ev = L.evidence_level_audit(bad, manifest_path='confirmation_frozen.json')
+    assert ev['status'] == 'fail', ev
+    with open(os.path.join(REPO, 'confirmation_frozen_dynamic.json'), encoding='utf-8') as f:
+        dyn = json.load(f)
+    for key, val in (('alpha', float('nan')),
+                     ('min_power_for_test', float('inf')),
+                     ('min_power_for_test', float('nan'))):
+        m = copy.deepcopy(dyn)
+        m['statistics'][key] = val
+        r = L.dynamic_design_audit(m, manifest_path='confirmation_frozen_dynamic.json')
+        assert r['status'] == 'fail', (key, val, r)
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -16732,6 +16876,13 @@ def main():
     _check('L84 dynamic design requires hypotheses + dedicated controls', t_dynamic_design_audit_requires_hypotheses_and_controls)
     _check('L85 dynamic control arms isolate boundary/selection factors', t_dynamic_control_arms_construct_and_isolate_factors)
     _check('L86 v12 plan emits the budget/evidence design preflight', t_v12_plan_emits_design_preflight)
+    _check('L87 deterministic scatter precision + non-finite stable top-k', t_kernel_det_scatter_precision_and_nonfinite_topk)
+    _check('L88 provenance data_extra + mutable-view id memo + narrow/sample bounds', t_provenance_extra_ids_alias_narrow_and_sample_bound)
+    _check('L89 short eval panel is reported, not shape-crashed', t_v7_eval_length_reports_short_panel)
+    _check('L90 ladder parameter count uses each tier geometry', t_ladder_params_use_the_tier_geometry)
+    _check('L91 audit artifacts resolve from REPO independent of CWD', t_audit_artifacts_resolve_from_repo_not_cwd)
+    _check('L92 row identity is numeric-dtype safe + 128-bit', t_row_identity_is_numeric_dtype_and_width_safe)
+    _check('L93 evidence/dynamic audits reject malformed thresholds', t_evidence_and_dynamic_audits_reject_malformed_thresholds)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

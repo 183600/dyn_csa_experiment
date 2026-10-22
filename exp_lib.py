@@ -1553,17 +1553,38 @@ def apply_scale_geometry_overrides(cfg, env=None, *,
             _seq = int(out['seq_len'])
             _bs = int(out['batch_size'])
         except (KeyError, TypeError, ValueError, OverflowError):
-            _seq = _bs = 0
-        if _seq > 0 and _bs > 0:
-            if _tokens_changed:
-                _per_step = _bs * _seq
-                out['steps'] = max(1, (int(out['n_train_tokens']) + _per_step - 1) // _per_step)
-                _steps_source = 'from_declared_token_budget'
-            elif _geometry_changed and all(k in _old for k in ('steps', 'seq_len', 'batch_size')):
-                _old_draws = _old['steps'] * _old['batch_size'] * _old['seq_len']
-                _per_step = _bs * _seq
-                out['steps'] = max(1, (_old_draws + _per_step - 1) // _per_step)
-                _steps_source = 'preserve_sampled_windows'
+            raise ValueError(
+                'scale geometry override changed seq_len/batch_size/token '
+                'budget but the cfg lacks a usable seq_len/batch_size; the '
+                'step count cannot be recomputed (pass B_STEPS explicitly)') from None
+        if _seq <= 0 or _bs <= 0:
+            raise ValueError(
+                f'scale geometry override needs positive seq_len/batch_size, '
+                f'got {_seq}/{_bs}')
+        if _tokens_changed:
+            _per_step = _bs * _seq
+            try:
+                _budget = int(out['n_train_tokens'])
+            except (KeyError, TypeError, ValueError, OverflowError):
+                raise ValueError(
+                    'scale geometry override changed n_train_tokens but the '
+                    'value is not an integer') from None
+            if _budget < 1:
+                raise ValueError(
+                    f'scale geometry override needs a positive token budget, '
+                    f'got {_budget}')
+            out['steps'] = max(1, (_budget + _per_step - 1) // _per_step)
+            _steps_source = 'from_declared_token_budget'
+        elif _geometry_changed:
+            if not all(k in _old for k in ('steps', 'seq_len', 'batch_size')):
+                raise ValueError(
+                    'scale geometry override changed seq_len/batch_size but '
+                    'the cfg has no existing steps/seq_len/batch_size to '
+                    'preserve the sampled-window budget (pass B_STEPS explicitly)')
+            _old_draws = _old['steps'] * _old['batch_size'] * _old['seq_len']
+            _per_step = _bs * _seq
+            out['steps'] = max(1, (_old_draws + _per_step - 1) // _per_step)
+            _steps_source = 'preserve_sampled_windows'
     out['geometry_overrides'] = {
         'env': dict(sorted(overrides.items())),
         'old': _old,
@@ -6735,7 +6756,29 @@ def _ids_fp(train_ids):
     # read-only memmaps (writeable=False), which keep the fast path.
     import weakref as _weakref
     _flags = getattr(train_ids, 'flags', None)
-    _immutable = bool(_flags is not None and not _flags.writeable)
+
+    def _readonly_chain(arr):
+        # A read-only view can still alias writable storage (``base[:]`` with
+        # ``writeable=False``), so trusting only the view's own flag left a
+        # stale memo/sidecar digest after the base was mutated.  Walk the base
+        # chain; memmaps expose an mmap (non-ndarray) base and stay on the
+        # fast path.
+        seen = 0
+        cur = arr
+        while isinstance(cur, np.ndarray):
+            if cur.flags.writeable:
+                return False
+            seen += 1
+            if seen > 64:  # defensive: a cycle is not immutable evidence
+                return False
+            nxt = getattr(cur, 'base', None)
+            if nxt is cur:
+                break
+            cur = nxt
+        return True
+
+    _immutable = bool(_flags is not None and not _flags.writeable
+                      and _readonly_chain(train_ids))
     try:
         _key = (train_ids.__array_interface__['data'][0], train_ids.shape, train_ids.strides, train_ids.dtype.str)
     except (AttributeError, TypeError):
@@ -9695,6 +9738,32 @@ def _ids_narrow(train_ids):
     _hit = _NARROW_MEMO.get(_key)
     if _hit is not None and _hit[0]() is train_ids:
         return _hit[1]
+
+    class _TransportRangeError(ValueError):
+        pass
+
+    def _copy_i32_checked(src, dst):
+        """Copy in chunks, refusing any value outside the int32 transport range.
+
+        The metadata/`max()` fast path only proves an UPPER bound; a large
+        negative sentinel would otherwise wrap to a positive id on assignment
+        to int32 (`-2**31 - 1 -> 2**31 - 1`) and the model would train on a
+        different token than the cache contains."""
+        _s_flat = np.asarray(src).reshape(-1)
+        _d_flat = np.asarray(dst).reshape(-1)
+        _step = 1 << 24
+        for _s in range(0, int(_s_flat.size), _step):
+            _e = min(_s + _step, int(_s_flat.size))
+            _chunk = _s_flat[_s:_e]
+            if _chunk.size:
+                _mn, _mx = int(_chunk.min()), int(_chunk.max())
+                if _mn < -(2 ** 31) or _mx > 2 ** 31 - 1:
+                    raise _TransportRangeError(
+                        f'token ids span [{_mn}, {_mx}] outside the int32 '
+                        'transport range; refusing a lossy narrowing')
+            _d_flat[_s:_e] = _chunk
+        return dst
+
     _path = getattr(train_ids, 'filename', None)
     if _path and train_ids.size:
         # A disk-backed corpus is mapped read-only.  Workers share one int32
@@ -9721,14 +9790,9 @@ def _ids_narrow(train_ids):
                 os.close(_fd)
                 try:
                     _mm = np.lib.format.open_memmap(_tmp, mode='w+', dtype=np.int32, shape=tuple(train_ids.shape))
-                    _flat_mm = _mm.reshape(-1)
-                    _flat_src = np.asarray(train_ids).reshape(-1)
-                    _step = 1 << 24
-                    for _s in range(0, int(train_ids.size), _step):
-                        _e = min(_s + _step, int(train_ids.size))
-                        _flat_mm[_s:_e] = _flat_src[_s:_e]
+                    _copy_i32_checked(train_ids, _mm)
                     _mm.flush()
-                    del _flat_mm, _mm
+                    del _mm
                     os.replace(_tmp, _side)
                 except BaseException:
                     try:
@@ -9739,13 +9803,19 @@ def _ids_narrow(train_ids):
                 _n = np.load(_side, mmap_mode='r')
                 _narrow_memo_put(_key, _weakref.ref(train_ids), _n)
                 return _n
-        except (OSError, ValueError, TypeError):
+        except (OSError, ValueError, TypeError) as _e:
+            # A range failure is a data error, not a reason to fall through to
+            # a second lossy conversion; other sidecar/filesystem failures keep
+            # the historical in-memory fallback.
+            if isinstance(_e, _TransportRangeError):
+                raise
             pass
     _mx = _cache_id_upper_bound(getattr(train_ids, 'filename', None))
     if _mx is None:
         _mx = int(train_ids.max()) if train_ids.size else -1
     if train_ids.size and _mx < 2 ** 31:
-        _n = train_ids.astype(np.int32)
+        _n = np.empty(train_ids.shape, dtype=np.int32)
+        _copy_i32_checked(train_ids, _n)
         _narrow_memo_put(_key, _weakref.ref(train_ids), _n)
         return _n
     return train_ids
@@ -14347,9 +14417,15 @@ def evidence_level_audit(manifest, *, manifest_path=None, panel_paths=None):
         if _stat.get('require_complete_coverage') is not True:
             _confirm_ready = False
             _why.append('statistics.require_complete_coverage is not true')
-        if not (_scope.get('confirmatory_claims') or '').strip():
+        # A claims statement is text, not an arbitrary truthy object.  Calling
+        # ``.strip()`` on a list/dict/number raised an unrelated AttributeError
+        # from the middle of the audit, so a malformed manifest could crash
+        # instead of failing closed; merely stringifying it would also let a
+        # non-empty container masquerade as a declared claim.
+        _claims = _scope.get('confirmatory_claims')
+        if not isinstance(_claims, str) or not _claims.strip():
             _confirm_ready = False
-            _why.append('scope.confirmatory_claims is empty')
+            _why.append('scope.confirmatory_claims is empty or not text')
         if not str(manifest.get('frozen_at') or '').strip():
             _confirm_ready = False
             _why.append('frozen_at is empty')
@@ -15115,10 +15191,22 @@ def dynamic_design_audit(manifest, *, manifest_path=None):
             f'statistics.n_seeds={nseeds} does not equal len(seeds)={len(seeds)}')
     mfam = len(comps)
     alpha = stat.get('alpha', 0.05)
+    _alpha_bad = False
     try:
         alpha = float(alpha)
     except (TypeError, ValueError, OverflowError):
+        _alpha_bad = True
         alpha = 0.05
+    else:
+        if isinstance(stat.get('alpha'), (bool, np.bool_)):
+            _alpha_bad = True
+        if not (math.isfinite(alpha) and 0.0 < alpha < 1.0):
+            _alpha_bad = True
+            alpha = 0.05
+    if _alpha_bad:
+        out['violations'].append(
+            f'statistics.alpha={stat.get("alpha")!r} is not a finite number in '
+            '(0,1); the planned family-resolution threshold is unverifiable')
     min_n = stat.get('min_seeds_for_confirmation')
     try:
         min_n = int(min_n or 0)
@@ -15139,13 +15227,21 @@ def dynamic_design_audit(manifest, *, manifest_path=None):
         out['violations'].append(
             'statistics.require_power_gate must be true; a dynamic panel cannot '
             'be confirmed without a pre-test power simulation')
+    _mp_bad = False
     try:
         mp = float(stat.get('min_power_for_test'))
     except (TypeError, ValueError, OverflowError):
         mp = 0.0
-    if mp < 0.8:
+        _mp_bad = True
+    else:
+        if isinstance(stat.get('min_power_for_test'), (bool, np.bool_)):
+            _mp_bad = True
+        if not (math.isfinite(mp) and 0.0 <= mp <= 1.0):
+            _mp_bad = True
+    if _mp_bad or mp < 0.8:
         out['violations'].append(
-            f'statistics.min_power_for_test={mp} < 0.8; an underpowered dynamic '
+            f'statistics.min_power_for_test={stat.get("min_power_for_test")!r} is '
+            'not a finite power in [0,1] >= 0.8; an underpowered dynamic '
             'contrast cannot confirm a mechanism claim')
     if stat.get('power_simulation_required') is not True:
         out['violations'].append(
@@ -25440,14 +25536,18 @@ def experiment_provenance(cfg, *, train_ids=None, val_batch=None, vocab=None):
         data['val_fp'] = _ids_fp(_vb)
     if vocab is not None:
         data['vocab_size'] = int(vocab)
-    _cfp = _corpus_fp_from_data(data)
-    if _cfp is not None:
-        data['corpus_fp'] = _cfp
     _extra = cfg.get('data_extra')
     if isinstance(_extra, dict):
         # Synthetic/task-specific generators (NIAH recipe, corruption modes)
         # must be part of the data identity, not only the human note.
         data['data_extra'] = _jsonable(_extra)
+    # Compute the composite fingerprint AFTER data_extra is present:
+    # `_corpus_fp_from_data` deliberately includes that key, so computing it
+    # first made two distinct task/corruption corpora carry the same corpus_fp
+    # (the field used by cross-scale corpus binding).
+    _cfp = _corpus_fp_from_data(data)
+    if _cfp is not None:
+        data['corpus_fp'] = _cfp
     data['data_version'] = _data_version(data)
     prov = code_provenance()
     prov['data'] = data
@@ -27952,10 +28052,19 @@ def _audit_sample_flat(arr, max_tokens):
     """
     flat = np.asarray(arr).reshape(-1)
     n = int(flat.size)
-    if n <= int(max_tokens):
+    _max = _exact_count(max_tokens, minimum=1)
+    if _max is None:
+        raise ValueError(
+            f'_audit_sample_flat needs a positive integer max_tokens, got {max_tokens!r}')
+    max_tokens = int(_max)
+    if n <= max_tokens:
         return flat, False
-    n_windows = 16
-    width = max(1, int(max_tokens) // n_windows)
+    # The budget can be smaller than the historical 16 windows.  Shrinking the
+    # window count (and keeping width >= 1) makes the bound hold even for
+    # max_tokens=1; the old fixed 16 windows returned 16 elements for a
+    # one-token budget, so the audit's stated cost was exceeded 16x.
+    n_windows = min(16, max_tokens)
+    width = max(1, max_tokens // n_windows)
     starts = np.linspace(0, max(0, n - width), num=n_windows, dtype=np.int64)
     parts = [flat[int(s):int(s) + width] for s in starts]
     return np.concatenate(parts) if parts else flat[:0], True

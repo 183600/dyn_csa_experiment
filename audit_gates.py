@@ -89,6 +89,21 @@ def _iter_result_dirs():
             yield name
 
 
+def _audit_artifact(path):
+    """Resolve a repository artifact independently of the caller's CWD.
+
+    ``_iter_result_dirs`` enumerates ``REPO`` but yields bare names; joining
+    them directly against the process CWD silently dropped every panel when
+    the CLI was invoked from another directory.  An absolute path is used
+    as-is, an existing CWD-relative path keeps its historical meaning for
+    explicit caller arguments, and otherwise the path is rooted at REPO.
+    """
+    p = os.fspath(path)
+    if os.path.isabs(p) or os.path.exists(p):
+        return p
+    return os.path.join(REPO, p)
+
+
 def _import_exp_lib():
     sys.path.insert(0, REPO)
     import exp_lib as L
@@ -509,6 +524,15 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
                     max_row_overlap = float(max(row_overlaps))
             _viol = bool((test_overlap > _max_shingle_ov)
                          or (max_row_overlap is not None and max_row_overlap > _max_row_ov))
+            # The overlap statistics are computed on the sampled shingles
+            # only.  With a 1-D train stream capped at ~4M tokens, a 1e9-token
+            # cache scans 0.4%; a test row copied from an unsampled region
+            # then looks clean.  Report the coverage and refuse to certify a
+            # split whose overlap evidence covers less than a quarter of
+            # either side.
+            _min_cov = 0.25
+            _coverage_ok = (float(tr_frac) >= _min_cov
+                            and float(te_frac) >= _min_cov)
             out['checks']['doc_overlap'] = {
                 'shingle_k': int(shingle),
                 'hash': 'uint64 polynomial rolling hash (fixed base 1000003), sliding windows',
@@ -516,6 +540,8 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
                 'test_rows_scanned': int(te_rows),
                 'train_tokens_scanned_fraction': round(float(tr_frac), 6),
                 'test_rows_scanned_fraction': round(float(te_frac), 6),
+                'min_scan_fraction_for_certification': _min_cov,
+                'scan_coverage_sufficient': bool(_coverage_ok),
                 'test_shingles': int(te_s.size),
                 'train_shingles': int(tr_s.size),
                 'shared_shingles': inter,
@@ -529,7 +555,7 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
                 'policy_max_row_overlap': _max_row_ov,
                 'policy_max_jaccard_diagnostic_only': 0.05,
                 'policy_violation': _viol,
-                'status': 'fail' if _viol else 'ok',
+                'status': 'fail' if _viol else ('ok' if _coverage_ok else 'not_verifiable'),
                 'note': ('nonzero overlap reflects WikiText-103 near-duplicate '
                          'documents. The gate uses reachable statistics '
                          '(shared/test shingles and the worst test row), not the '
@@ -549,6 +575,14 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
                                'near-duplicate evaluation documents are excluded '
                                '(or an explicit overlap-excluded sensitivity '
                                'analysis is reported).')
+            elif not _coverage_ok:
+                out['status'] = 'not_verifiable_locally'
+                out['note'] = (
+                    'the document-overlap scan covers only '
+                    f'{float(tr_frac):.2%} of train and {float(te_frac):.2%} of '
+                    f'test (minimum {_min_cov:.0%}); a clean sample is not '
+                    'evidence that the unsampled remainder is clean. Increase '
+                    'the shingle scan budget or treat the split as unverified.')
         else:
             out['checks']['doc_overlap'] = 'npy caches absent'
     except Exception as e:
@@ -790,6 +824,22 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
         if out['status'] == 'ok':
             out['status'] = 'warnings'
 
+    def _audit_row_sample(arr, label, rec):
+        """Deterministically cap a 2-D panel at ``max_rows`` for duplicate scans.
+
+        ``max_rows`` was validated but unused, so a 1e8-row cache still built
+        giant row-key tables.  The cap is recorded; it is an audit sample, not
+        a proof about the unsampled rows.
+        """
+        a = np.asarray(arr)
+        if a.ndim == 2 and a.shape[0] > max_rows:
+            _ix = np.unique(np.linspace(0, a.shape[0] - 1, num=max_rows,
+                                        dtype=np.int64))
+            rec[f'{label}_rows_total'] = int(a.shape[0])
+            rec[f'{label}_rows_audited'] = int(_ix.size)
+            return a[_ix]
+        return a
+
     for cd in cache_dirs:
         if not os.path.isdir(cd):
             continue
@@ -826,6 +876,7 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                 continue
             rec['train_shape'] = list(tr.shape)
             rec['val_shape'] = list(va.shape)
+            _va_scan = _audit_row_sample(va, 'validation', rec)
             rec['declared_split_strategy'] = meta.get('split_strategy') or 'legacy_unrecorded'
             rec['shuffle_at_split'] = meta.get('shuffle_at_split')
             rec['tokenizer_fit_split'] = meta.get('tokenizer_fit_split')
@@ -936,7 +987,7 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
 
             # Exact duplicate rows across train/val/test.  This is row-level
             # leakage regardless of how the split was generated.
-            shared_val = _row_overlap_count(tr, va)
+            shared_val = _row_overlap_count(tr, _va_scan)
             rec['exact_row_overlap_train_val'] = int(shared_val)
             if shared_val:
                 rec['status'] = 'fail'
@@ -1000,6 +1051,7 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                 rec['test_pairing'] = 'not_found'
             if te is not None:
                 rec['test_shape'] = list(te.shape)
+                _te_scan = _audit_row_sample(te, 'test', rec)
                 # Per-split content fingerprints are recomputed from the
                 # actual bytes, not trusted from the JSON.  The audit already
                 # did this for train/validation; without the same check on
@@ -1141,12 +1193,12 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                         rec['status'] = 'fail'
                         _fail(f'{cd}/{tag}: {_bad_te} NaN/Inf values in the test split')
                 if np.asarray(te).ndim == 2:
-                    _dup_te = int(DG.duplicate_mask(np.asarray(te)).sum())
+                    _dup_te = int(DG.duplicate_mask(np.asarray(_te_scan)).sum())
                     rec['duplicate_rows_within_test'] = _dup_te
                     if _dup_te:
                         _warn(f'{cd}/{tag}: {_dup_te} duplicate test rows')
-                shared_test = _row_overlap_count(tr, te)
-                shared_val_test = _row_overlap_count(va, te)
+                shared_test = _row_overlap_count(tr, _te_scan)
+                shared_val_test = _row_overlap_count(_va_scan, _te_scan)
                 rec['exact_row_overlap_train_test'] = int(shared_test)
                 rec['exact_row_overlap_val_test'] = int(shared_val_test)
                 if shared_test:
@@ -1360,7 +1412,7 @@ def audit_attribution(outdirs=None):
     import numpy as np
     dirs = outdirs or list(_iter_result_dirs())
     for d in dirs:
-        summ = _load(os.path.join(d, 'summary.json'))
+        summ = _load(_audit_artifact(os.path.join(d, 'summary.json')))
         if not summ:
             continue
         panel = {}
@@ -1447,7 +1499,7 @@ def audit_boundary(outdirs=None):
         return f if math.isfinite(f) else None
 
     for d in dirs:
-        summ = _load(os.path.join(d, 'summary.json'))
+        summ = _load(_audit_artifact(os.path.join(d, 'summary.json')))
         if not summ:
             continue
         found = {}
@@ -1499,7 +1551,7 @@ def audit_length(bylen_path='results_lm_test/bylen.json'):
     核验点：同一 L 下全部记录的 n_tok 与 eval_span 必须一致（n_tok =
     n_seq × (L−1)，即同一组前缀目标 token 被评分）；truncated 必须为假；
     逐文档行数 n_seq 跨臂一致。若某臂对不同目标集评分，跨臂比较无效。"""
-    raw = _load(bylen_path)
+    raw = _load(_audit_artifact(bylen_path))
     if raw is None:
         out = {'status': 'not_verifiable_locally', 'note': f'{bylen_path} absent — P5T has not run; the same checks apply to results_v10_mech/summary.json by_len panels'}
         print(json.dumps(out, ensure_ascii=False))
@@ -1687,7 +1739,7 @@ def audit_fairness(summary_path='results_v10_mech/summary.json', arms=None):
     （exp_lib.pair_reason 口径）；train_knobs（优化器/betas/eps/裁剪/调度）
     一致；mlp_ratio 只在「参数量匹配」臂上有差异且被显式记录。任何臂间
     单独调参会在此被点名，而不是混进「方法效果」里。"""
-    summ = _load(summary_path)
+    summ = _load(_audit_artifact(summary_path))
     if summ is None:
         out = {'status': 'not_verifiable_locally', 'note': f'{summary_path} absent — needs the training records of the frozen arms'}
         print(json.dumps(out, ensure_ascii=False))
@@ -1891,7 +1943,7 @@ def audit_failures(outdirs=None):
     out = {'status': 'ok', 'panels': {}}
     dirs = outdirs or list(_iter_result_dirs())
     for d in dirs:
-        summ = _load(os.path.join(d, 'summary.json'))
+        summ = _load(_audit_artifact(os.path.join(d, 'summary.json')))
         if not summ:
             continue
         by_arm = {}
@@ -1954,7 +2006,7 @@ def audit_metrics(outdirs=None):
     out = {'status': 'ok', 'policy': L.metric_policy_audit(), 'panels': {}}
     dirs = outdirs or list(_iter_result_dirs())
     for d in dirs:
-        summ = _load(os.path.join(d, 'summary.json'))
+        summ = _load(_audit_artifact(os.path.join(d, 'summary.json')))
         if not summ:
             continue
         rep = L.metric_policy_audit(summ)
@@ -2402,7 +2454,7 @@ def audit_budget(state_files=('run_time_state_v10.json', 'run_time_state_v12.jso
     """规模核算（零 GPU）：每面板 6ND 估算 + 已记账实测秒数。"""
     out = {'status': 'ok', 'panels': {}}
     for d, v, steps in panels:
-        summ = _load(os.path.join(d, 'summary.json'))
+        summ = _load(_audit_artifact(os.path.join(d, 'summary.json')))
         if summ is None:
             out['panels'][d] = 'not present locally'
             continue
@@ -2445,7 +2497,7 @@ def audit_budget(state_files=('run_time_state_v10.json', 'run_time_state_v12.jso
         out['panels'][d] = {'params': r0.get('params'), 'steps': _steps,
                             'tokens': tok, 'estimate': est}
     for sf in state_files:
-        st = _load(sf)
+        st = _load(_audit_artifact(sf))
         if st is not None:
             # TimeGuard stores `runs` as an integer counter; older/foreign
             # state files may store a list.  len(integer) would crash the whole
@@ -2525,7 +2577,7 @@ def audit_training_health(outdirs=None):
            'note': 'diagnostic only: a healthy record is not thereby a valid treatment claim, and an unhealthy record is not silently deleted'}
     _Lmod = None
     for d in dirs:
-        summ = _load(os.path.join(d, 'summary.json'))
+        summ = _load(_audit_artifact(os.path.join(d, 'summary.json')))
         if not isinstance(summ, dict) or not summ:
             continue
         cells = {}
@@ -2839,7 +2891,7 @@ def audit_efficiency_pairs(outdirs=None, pairs=None, *, tolerance=0.05):
            'tolerance': tolerance,
            'note': 'measured prefill only; no KV cache in this model; analytic FLOPs are never substituted for timing'}
     for d in dirs:
-        summ = _load(os.path.join(d, 'summary.json'))
+        summ = _load(_audit_artifact(os.path.join(d, 'summary.json')))
         if not summ:
             continue
         eff = {}

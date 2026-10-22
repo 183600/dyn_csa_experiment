@@ -822,12 +822,17 @@ def grouped_chronological_split_indices(n, groups, train_frac=0.8, val_frac=0.1,
             raise ValueError(
                 f'grouped split had inconsistent boundaries {c1}/{c2} for '
                 f'{n_groups} groups')
-    out = {name: [] for name in SPLIT_NAMES}
     bounds = (0, c1, c2, n_groups)
+    # Build int64 arrays directly instead of materialising N Python integers
+    # and then sorting a second Python list.  `members[g]` is already in
+    # ascending row order (stable argsort), so only the concatenation across
+    # groups needs sorting; `np.sort` keeps the same final value order.
+    res = {}
     for k, name in enumerate(SPLIT_NAMES):
-        for g in order_groups[bounds[k]:bounds[k + 1]]:
-            out[name].extend(int(i) for i in members[g])
-    res = {name: np.asarray(sorted(v), dtype=np.int64) for name, v in out.items()}
+        _parts = [np.asarray(members[g], dtype=np.int64)
+                  for g in order_groups[bounds[k]:bounds[k + 1]]]
+        res[name] = (np.sort(np.concatenate(_parts))
+                     if _parts else np.empty(0, dtype=np.int64))
     # A requested non-empty split must not silently be empty.  An empty
     # validation set is not a harmless corner case: selection/early stopping
     # then has no legal data and callers are tempted to fall back to test.
@@ -1738,7 +1743,7 @@ def _categorical_fingerprint(X):
             h.update(key.encode('utf-8', errors='replace'))
             h.update(b'|')
         h.update(b'\x1f')
-    return h.hexdigest()[:16]
+    return h.hexdigest()
 
 
 def _categorical_row_set_fingerprint(X):
@@ -1778,7 +1783,7 @@ def _categorical_row_set_fingerprint(X):
     h.update(str(total).encode('ascii'))
     h.update(b'|')
     h.update(str(xored).encode('ascii'))
-    return h.hexdigest()[:16]
+    return h.hexdigest()
 
 
 def _json_safe_category(value):
@@ -3579,12 +3584,15 @@ def clean_training_rows(X, y=None, *, train_idx, drop_duplicates=True,
                 if value < lo or value > hi:
                     drop[pos] = True
                     n_target_outlier_rows += 1
-    keys = _row_keys(_raw_X)
+    # Only the TRAIN rows need duplicate clusters here.  Hashing the whole
+    # table materialised one bytes object per row (a multi-GB list on a
+    # scale-up corpus) even when clean_train was applied to a small subset.
+    keys = _row_keys(_take(_raw_X, train_rows))
     clusters = {}
     for pos, row in enumerate(train_rows.tolist()):
         if drop[pos]:
             continue
-        clusters.setdefault(keys[row], []).append(pos)
+        clusters.setdefault(keys[pos], []).append(pos)
     n_duplicate_rows = 0
     n_conflict_rows = 0
     n_conflict_clusters = 0
@@ -3690,6 +3698,19 @@ def split_content_fingerprints(X, y, indices):
         try:
             rec['content_fp'] = _matrix_fingerprint(Xs)
         except (TypeError, ValueError, OverflowError) as e:
+            # A null fingerprint is not a neutral value: two unrelated
+            # datasets both compare as None == None.  Keep an exact
+            # dtype/shape/raw-byte digest instead, and mark it as a fallback
+            # so the primary canonical fingerprint is never silently
+            # replaced by "unknown".
+            h = hashlib.sha256()
+            _xs = np.asarray(Xs)
+            h.update(np.dtype(_xs.dtype).str.encode('ascii'))
+            h.update(str(tuple(_xs.shape)).encode('ascii'))
+            if _xs.size:
+                h.update(memoryview(np.ascontiguousarray(_xs)).cast('B'))
+            rec['content_fp'] = h.hexdigest()
+            rec['content_fp_fallback'] = 'raw_bytes'
             rec['content_fp_error'] = f'{type(e).__name__}: {e}'
         if yarr is not None:
             ys = _take(yarr, idx)
@@ -3935,6 +3956,11 @@ def _matrix_fingerprint(X):
     arr = np.asarray(X)
     if arr.ndim == 0:
         arr = arr.reshape(1, 1)
+    elif arr.ndim == 1:
+        # A 1-D table is one column.  Hashing the original (n,) shape while
+        # the object path reshaped to (n,1) made the same single-column table
+        # fingerprint differently depending on its storage rank.
+        arr = arr.reshape(-1, 1)
     h = hashlib.sha256()
     h.update(str(arr.shape).encode('ascii'))
     if np.iscomplexobj(arr):
@@ -4061,7 +4087,7 @@ def _matrix_fingerprint(X):
                     _tail.update(key)
         h.update(b'|T')
         h.update(_tail.digest())
-        return h.hexdigest()[:16]
+        return h.hexdigest()
     _w = int(arr.shape[1]) if arr.ndim > 1 else 1
     _step = _hash_row_block(_w, 1 << 20)
     _is_int = (np.issubdtype(arr.dtype, np.integer) or arr.dtype == np.bool_
@@ -4149,7 +4175,7 @@ def _matrix_fingerprint(X):
                 _tail.update(key)
     h.update(b'|T')
     h.update(_tail.digest())
-    return h.hexdigest()[:16]
+    return h.hexdigest()
 
 def _wide_float_key(v):
     """Exact canonical key for a float wider than float64 (longdouble)."""
@@ -4333,7 +4359,7 @@ def _row_keys(X):
         keys = []
         for start in range(0, src.shape[0], _step):
             for row in src[start:start + _step].tolist():
-                h = hashlib.blake2b(digest_size=8)
+                h = hashlib.blake2b(digest_size=16)
                 for v in row:
                     h.update(_wide_float_key(v))
                     h.update(b'|')
@@ -4446,7 +4472,80 @@ def _row_keys(X):
         keys = []
         for start in range(0, src.shape[0], _step):
             for row in src[start:start + _step].tolist():
-                h = hashlib.blake2b(digest_size=8)
+                # An all-numeric row (None counts as the missing-like NaN)
+                # uses the SAME row bytes as the native int/float branch, so
+                # an object column and a numeric column holding equal values
+                # share one duplicate identity instead of two.  This includes
+                # the non-finite mask/code encoding, not only finite rows.
+                _vals = []
+                _numeric = True
+                for v in row:
+                    if v is None:
+                        _vals.append(float('nan'))
+                        continue
+                    if (not isinstance(v, (numbers.Number, _decimal.Decimal))
+                            or isinstance(v, (complex, np.complexfloating))):
+                        _numeric = False
+                        break
+                    # A longdouble has more than float64's 53-bit mantissa;
+                    # the native >8-byte branch hashes its exact wide key, so
+                    # do not round it into the common float64 path here.
+                    if (isinstance(v, np.floating)
+                            and v.dtype.itemsize > 8):
+                        _numeric = False
+                        break
+                    # Decimal('sNaN') raises in float(); it is still one
+                    # missing-like NaN identity, not a categorical value.
+                    if _numeric_is_nan(v):
+                        _vals.append(float('nan'))
+                        continue
+                    try:
+                        _vals.append(float(v))
+                    except (TypeError, ValueError, OverflowError):
+                        _numeric = False
+                        break
+                if _numeric:
+                    _frow = np.asarray(_vals, dtype=np.float64).reshape(-1)
+                    _exact = True
+                    for v, fv in zip(row, _frow.tolist()):
+                        if math.isfinite(fv):
+                            if v is None or not (v == fv):
+                                _exact = False
+                                break
+                        # Non-finite object values map to their float image;
+                        # NaN/Inf identity is carried by the code table below.
+                    if _exact:
+                        if np.any(_frow == 0.0):
+                            _frow = _frow.copy()
+                            _frow[_frow == 0.0] = 0.0
+                        _finite = np.isfinite(_frow)
+                        h = hashlib.blake2b(digest_size=16)
+                        h.update(np.ascontiguousarray(_frow[_finite]).tobytes())
+                        h.update(b'|')
+                        h.update(np.packbits(~_finite).tobytes())
+                        if not _finite.all():
+                            _code = np.zeros(_frow.shape, dtype=np.uint8)
+                            _code[np.isnan(_frow)] = 1
+                            _code[np.isposinf(_frow)] = 2
+                            _code[np.isneginf(_frow)] = 3
+                            h.update(_code.tobytes())
+                        keys.append(h.digest())
+                        continue
+                    # All-int rows that float64 cannot represent use the same
+                    # raw int64 bytes as the native integer fallback.
+                    if all(isinstance(v, numbers.Integral) for v in row):
+                        try:
+                            _irow = np.asarray(row, dtype=np.int64)
+                        except (TypeError, ValueError, OverflowError):
+                            _irow = None
+                        if (_irow is not None and _irow.size == len(row)
+                                and all(int(v) == int(i)
+                                        for v, i in zip(row, _irow.tolist()))):
+                            h = hashlib.blake2b(digest_size=16)
+                            h.update(memoryview(np.ascontiguousarray(_irow)).cast('B'))
+                            keys.append(h.digest())
+                            continue
+                h = hashlib.blake2b(digest_size=16)
                 for v in row:
                     h.update(_real_key(v))
                     h.update(b'|')
@@ -4465,7 +4564,7 @@ def _row_keys(X):
         keys = []
         for start in range(0, src.shape[0], _step):
             for row in src[start:start + _step]:
-                h = hashlib.blake2b(digest_size=8)
+                h = hashlib.blake2b(digest_size=16)
                 for v in row:
                     h.update(_temporal_key(v))
                     h.update(b'|')
@@ -4477,13 +4576,34 @@ def _row_keys(X):
     if np.issubdtype(src.dtype, np.integer) or src.dtype == np.bool_:
         _step = _hash_row_block(int(src.shape[1]), 1 << 16)
         keys = []
+        _tail = np.packbits(np.zeros(int(src.shape[1]), dtype=bool)).tobytes()
         for start in range(0, src.shape[0], _step):
             block = src[start:start + _step]
             if _canonical_int:
                 block = block.astype(np.int64, copy=False)
+            # An integer has a float64 twin exactly when the round-trip is
+            # lossless.  Hash those rows through the SAME float64 bytes the
+            # float branch uses, so an int64 row and an equal float64 row get
+            # one key (the old int-byte key made train/test duplicates stored
+            # at different numeric dtypes invisible to the leakage gate).
+            # Values that are not exactly representable stay on the integer
+            # bytes; no equal float64 exists for them, so precision is kept.
+            _f = np.asarray(block, dtype=np.float64)
+            _finite = np.isfinite(_f)
+            _in_range = _finite & (_f >= -(2.0 ** 63)) & (_f < (2.0 ** 63))
+            if bool(_in_range.all()) and np.array_equal(
+                    _f.astype(np.int64), np.asarray(block, dtype=np.int64)):
+                arr = np.ascontiguousarray(_f)
+                for row_view in arr.view(np.uint8):
+                    h = hashlib.blake2b(digest_size=16)
+                    h.update(memoryview(row_view))
+                    h.update(b'|')
+                    h.update(_tail)
+                    keys.append(h.digest())
+                continue
             arr = np.ascontiguousarray(block)
             for row_view in arr.view(np.uint8).reshape(arr.shape[0], -1):
-                h = hashlib.blake2b(digest_size=8)
+                h = hashlib.blake2b(digest_size=16)
                 h.update(memoryview(row_view))
                 keys.append(h.digest())
         return keys
@@ -4509,7 +4629,7 @@ def _row_keys(X):
             # per-row boolean-index copy and packbits call.
             _tail = np.packbits(np.zeros(int(src.shape[1]), dtype=bool)).tobytes()
             for row_view in arr.view(np.uint8):
-                h = hashlib.blake2b(digest_size=8)
+                h = hashlib.blake2b(digest_size=16)
                 h.update(memoryview(row_view))
                 h.update(b'|')
                 h.update(_tail)
@@ -4523,7 +4643,7 @@ def _row_keys(X):
             # other, and treating them as such manufactures cross-split
             # leakage (and false label conflicts) from corrupted values.  The
             # byte code keeps NaN/NaN equal while separating the infinities.
-            h = hashlib.blake2b(digest_size=8)
+            h = hashlib.blake2b(digest_size=16)
             h.update(np.ascontiguousarray(row[ok]).tobytes())
             h.update(b'|')
             h.update(np.packbits(~ok).tobytes())
@@ -4940,10 +5060,23 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
                 hard_failures.append(_msg)
             else:
                 warnings.append(_msg)
+        # Only duplicate keys can carry conflicting labels.  Building one
+        # set() per row (as the old code did) costs hundreds of bytes per
+        # distinct row even when the table has no duplicates at all; find the
+        # duplicated keys first and collect labels only for those.
+        _seen_keys = set()
+        _dup_keys = set()
+        for k in keys:
+            if k in _seen_keys:
+                _dup_keys.add(k)
+            else:
+                _seen_keys.add(k)
+        del _seen_keys
         by_row = {}
-        for i, (k, lab) in enumerate(zip(keys, labels)):
-            if lab is not None:
-                by_row.setdefault(k, set()).add(_hashable_label(lab))
+        if _dup_keys:
+            for i, (k, lab) in enumerate(zip(keys, labels)):
+                if lab is not None and k in _dup_keys:
+                    by_row.setdefault(k, set()).add(_hashable_label(lab))
         conflicts = [k for k, labs in by_row.items() if len(labs) > 1]
         checks['label_conflicts_on_duplicate_rows'] = len(conflicts)
         if conflicts:

@@ -153,11 +153,20 @@ def _det_scatter_add_multi(n_rows, indices, values_list, device, dtype):
     keep = (seg_id >= 0) & (seg_id < n_rows)
     seg_id_k = seg_id[keep]
     lo_idx = seg_end[:-1]
+    # The prefix-sum difference below subtracts two GLOBAL prefixes.  In the
+    # response dtype (often fp32) a large earlier segment rounds away the
+    # small values of every later segment (e.g. 64 * 1e12 followed by 1000 *
+    # 1.0 gives 0 instead of 1000), and the downcast to fp32 also discarded
+    # the caller's requested precision.  Accumulate in float64 and cast only
+    # the final segment sums: the stable sort still fixes the addition order,
+    # so the reduction stays deterministic, while long-context dk/dv sums no
+    # longer lose short segments as the number of blocks grows.
+    _acc = torch.complex128 if dtype.is_complex else torch.float64
     for values, out in zip(values_list, outs):
         if values is None:
             continue
-        val_s = values.index_select(0, order).to(torch.float32)
-        csum = val_s.cumsum_(dim=0)
+        val_s = values.index_select(0, order).to(_acc)
+        csum = val_s.cumsum(dim=0)
         hi = csum.index_select(0, seg_end)
         lo = torch.zeros_like(hi)
         if seg_end.numel() > 1:
@@ -200,19 +209,23 @@ def _seg_structure(keys, n_rows):
 
 
 def _seg_apply(seg, values, out_flat):
-    """按共享段结构把一个头的值表归约进逐头 fp32 扁平行：值经同一排列
+    """按共享段结构把一个头的值表归约进逐头扁平行：值经同一排列
     gather 后 cumsum，段和写入 seg_id 行（调用方保证 out_flat 已清零；
     未被任何键覆盖的行保持零，与「零初始化全头缓冲后按 seg_id·nh+h
-    写入、末尾一次 cast」逐头 cast 的参考形式逐位一致）。"""
+    写入、末尾一次 cast」逐头 cast 的参考形式一致）。段和用 float64
+    累加后再写回 out_flat 的 dtype：共享的前缀和会被大段稀释，fp32 下
+    后续小段会变成 0；累加顺序仍由同一稳定排序固定，所以结果确定。"""
     order, seg_end, seg_id_k, keep = seg
-    val_s = values.index_select(0, order).to(torch.float32)
-    csum = val_s.cumsum_(dim=0)
+    _acc = (torch.complex128 if out_flat.dtype.is_complex
+            else torch.float64)
+    val_s = values.index_select(0, order).to(_acc)
+    csum = val_s.cumsum(dim=0)
     hi = csum.index_select(0, seg_end)
     lo = torch.zeros_like(hi)
     if seg_end.numel() > 1:
         lo[1:] = csum.index_select(0, seg_end[:-1])
     seg_sum = hi - lo
-    out_flat.index_copy_(0, seg_id_k, seg_sum[keep])
+    out_flat.index_copy_(0, seg_id_k, seg_sum[keep].to(out_flat.dtype))
 
 
 class PoolGeometry:
@@ -772,6 +785,15 @@ def _stable_topk_desc(x, k):
     if kk >= B:
         val, idx = torch.sort(x, dim=-1, descending=True, stable=True)
         return val, idx
+    # The rank/scatter construction below needs a finite k-th value: with NaN
+    # in a row, comparisons against kth are all false, rank slot 0 is never
+    # written and `buf` keeps uninitialised indices (a crash or garbage
+    # selection depending on allocator contents).  Delegate the non-finite
+    # case to sort, whose stable NaN ordering is the contract this helper
+    # documents ("exactly the first k columns of torch.sort").
+    if not bool(torch.isfinite(x).all()):
+        val, idx = torch.sort(x, dim=-1, descending=True, stable=True)
+        return val[..., :kk], idx[..., :kk]
     lead = x.shape[:-1]
     m = 1
     for _s in lead:

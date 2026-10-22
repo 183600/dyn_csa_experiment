@@ -2334,6 +2334,11 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=16, max_pos=
         raise ValueError(
             f'eval_length_gen: n_seq must be a positive integer, got {n_seq!r}')
     n_seq = int(_n_seq)
+    _varr = np.asarray(val_ids)
+    if _varr.ndim != 2:
+        raise ValueError(
+            f'eval_length_gen: val_ids must be a 2-D [n_seq, tokens] panel, '
+            f'got shape {_varr.shape}')
     if max_pos is not None:
         _mp = L._exact_count(max_pos, minimum=2)
         if _mp is None:
@@ -2386,6 +2391,20 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=16, max_pos=
                 _nll[:, _s:_e] = _ce
                 del _lg, _ce
             return _nll
+        # A requested length is only measurable if the cached panel actually
+        # holds that many tokens.  The old code sliced `val_ids` to the
+        # available width and then allocated `nll_cols` for `_Lmax` targets,
+        # so a RoPE arm evaluated at a longer length than the cache crashed
+        # with a target/logit width mismatch (or silently scored a shorter
+        # span on some backends).  Report the unavailable cells explicitly.
+        _val_width_now = int(np.asarray(val_ids).shape[1]) if np.asarray(val_ids).ndim == 2 else 0
+        _too_short = [int(Ln) for Ln in _within if int(Ln) > _val_width_now]
+        for Ln in _too_short:
+            out[Ln] = {'error': (f'val_ids has {_val_width_now} tokens; cannot '
+                                 f'evaluate L={Ln} without a shorter, undeclared span'),
+                       'truncated': False, 'eval_span': None}
+        if _too_short:
+            _within = [int(Ln) for Ln in _within if int(Ln) not in set(_too_short)]
         if _within:
             _Lmax = max(_within)
             ids = np.asarray(val_ids[:n_seq, :_Lmax], dtype=np.int64)

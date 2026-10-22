@@ -1309,3 +1309,45 @@ unmeasured, duplicate and mixed-slice records are counted/split, not pooled),
 (reused/missing checkpoint digests), and `L72b` (geometry override validation
 plus future-panel discovery).  `python test_review_fixes.py` passes with the
 same 3 environment skips; `python test_open_block.py` 15/15.
+
+## 2026-10-22 — scale-safety review: deterministic reductions, row identity, artifact paths (no new runs)
+
+**Problem.** Several helpers were correct at the small current scale but lost
+information as counts/context grew. (1) `csa_kernels._det_scatter_add_multi`
+and `_seg_apply` always accumulated in fp32 and cast to fp32 regardless of the
+requested dtype; a global prefix from an early segment erased later small
+segments, and float64 requests were silently downcast. (2) `_stable_topk_desc`
+left its scatter buffer uninitialised for NaN scores. (3) Row identity in
+`data_guard._row_keys` depended on numeric storage dtype (equal int64/float
+rows had different keys), used only 64-bit digests (birthday collisions become
+material at 1e9 rows), and `split_content_fingerprints` returned `None` after
+a canonical-fingerprint failure. (4) `experiment_provenance` computed
+`corpus_fp` before adding `data_extra`; a read-only view of writable storage
+could keep a stale `_ids_fp` memo; `_ids_narrow` trusted only an upper bound
+and wrapped large negative ids; `_audit_sample_flat` exceeded tiny budgets.
+(5) `v7_supp.eval_length_gen` sliced a short panel but still allocated for the
+requested length. (6) `m0_supp._ladder_params` used S1's `seq_len` for every
+tier. (7) Result-dir audits resolved `_iter_result_dirs()` names against the
+process CWD, and the document-overlap gate certified a split after scanning a
+tiny fraction of a large train stream.
+
+**Changes.** Deterministic scatter helpers now honour the requested output
+dtype and accumulate floating sums in float64 (same stable order, then one
+cast); non-finite `_stable_topk_desc` inputs delegate to `torch.sort`.
+`_row_keys` hashes exactly representable integer rows through the same float64
+bytes as float rows, keeps large-int precision, uses 128-bit row digests, and
+provides a raw dtype/shape/byte fallback for failed content fingerprints;
+native and object numeric rows share one identity. `experiment_provenance`
+inserts `data_extra` before the composite fingerprint; `_ids_fp` walks the
+base chain before trusting a read-only memo/sidecar; `_ids_narrow` checks both
+int32 bounds while copying; `_audit_sample_flat` never exceeds its budget.
+`eval_length_gen` reports an explicit cell error when the cache is shorter
+than the requested span. `_ladder_params` uses `RUN_<tier>`'s sequence length
+when present. Audit artifact loads resolve relative names against `REPO` (an
+existing CWD path keeps its explicit meaning), `max_rows` caps validation/test
+overlap scans with the sample size recorded, and a document-overlap scan below
+25% coverage is `not_verifiable_locally` rather than clean.
+
+Verification: new CPU tests L87–L93 plus the existing suite.
+`python test_review_fixes.py` passes 426/429 with the same 3 DataLoader
+environment skips; `python test_open_block.py` passes 15/15.
