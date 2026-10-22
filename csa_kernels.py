@@ -1162,7 +1162,7 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
       dq          = Σ_l dz_l · K_l · scale
       dk_l        = dz_l · q · scale
       dV_l        = (P_A_l · anyrow) · dO   （前向值只经 A，见上）
-      dλ_l        = dzS_l（块泳道）；dsoft_l = dλ_l · [soft ≥ 1e-12] / soft
+      dλ_l        = dzS_l（块泳道）；dsoft_l = dλ_l · [soft > 1e-12] / soft
       dsink_h     = −Σ_{r,t} (P_sink^A·GA + P_sink^S·GS)
     """
     R, T, nh, hd = q.shape
@@ -1256,13 +1256,20 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
                 g = torch.einsum('rtd,rtmd->rtm', dOh, Vl)
                 gh = g * (anyrow[:, :, None] if anyrow is not None else 1.0)
                 P_S = GS = dzS = P_sinkS = P_sinkA = None
+                s_ok = None
                 if soft_c is not None:
                     # S 路径（soft 先验）与 sink 无关——eager 的直通估计器在
                     # use_sink=False 时同样有 S 路梯度。
                     lam = torch.log(soft_c.clamp_min(1e-12))
                     lam = lam.masked_fill(soft_c <= 0, MINL)
-                    zS = zA.clone()
-                    zS[:, :, :nb] = (zA[:, :, :nb] + lam).clamp_min(MINL)
+                    # Keep the pre-clamp value: eager's clamp_min(_MINL) has a
+                    # zero derivative on saturated lanes (including the invalid
+                    # lanes that masked_fill placed exactly at _MINL).  Applying
+                    # dzS there would add a uniform-softmax term eager never has.
+                    zS_pre = zA.clone()
+                    zS_pre[:, :, :nb] = zA[:, :, :nb] + lam
+                    s_ok = lane_ok & (zS_pre > MINL)
+                    zS = zS_pre.clamp_min(MINL)
                 if sink_v is None:
                     P_A = torch.softmax(zA, dim=-1)
                     P_A_f = P_A * (anyrow[:, :, None] if anyrow is not None else 1.0)
@@ -1292,6 +1299,8 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
                         if GS is not None:
                             acc = acc + (-(P_sinkS * GS)).sum(dim=(0, 1))
                         dsink[h] += acc.to(dtype)
+                if dzS is not None:
+                    dzS = torch.where(s_ok, dzS, torch.zeros_like(dzS))
                 dz = dzA if dzS is None else dzA + dzS
                 if dq is not None:
                     _dq = torch.einsum('rtm,rtmd->rtd', dz, Kl)
@@ -1301,7 +1310,10 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
                 if dsoft is not None and dzS is not None:
                     dl = dzS[:, :, :nb]
                     sf = soft_c
-                    dsoft[:, t0:t1, :] += torch.where(sf >= 1e-12, dl / sf.clamp_min(1e-12), torch.zeros_like(dl)).to(dtype)
+                    # log(clamp_min(soft, 1e-12)) has a zero derivative at
+                    # the clamp boundary, so the strict interior is the correct
+                    # support (>= would emit dl/1e-12 at exactly 1e-12).
+                    dsoft[:, t0:t1, :] += torch.where(sf > 1e-12, dl / sf.clamp_min(1e-12), torch.zeros_like(dl)).to(dtype)
                 if need_dkb or need_dksw:
                     dkl = torch.einsum('rtm,rtd->rtmd', dz, qh)
                     if scale != 1.0:
@@ -1338,6 +1350,11 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
             dk_sw[:, :, h0:h1, :] = dksw_slab[:_g].view(_g, R, T, hd).permute(1, 2, 0, 3).to(dtype)
         if dv_sw is not None:
             dv_sw[:, :, h0:h1, :] = dvsw_slab[:_g].view(_g, R, T, hd).permute(1, 2, 0, 3).to(dtype)
+    if dsink is not None:
+        # eager sanitises the sink before its softmax; nan_to_num's backward
+        # is zero at the replaced elements, so the kernel must not route a
+        # gradient back into a non-finite sink entry.
+        dsink = torch.where(torch.isfinite(sink), dsink, torch.zeros_like(dsink))
     return (dq, dk_blk, dv_blk, dk_sw, dv_sw, dsoft, dsink)
 
 
@@ -1791,7 +1808,8 @@ def _attn_bwd_triton(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, sof
             ZSs = torch.where(ZS == 0, torch.ones_like(ZS), ZS)
             p_sink_s = torch.exp(sk - mS) / ZSs
             acc = acc - (p_sink_s * GS).sum(dim=(0, 1))
-        dsink = acc.to(dtype)
+        finite = torch.isfinite(sink)
+        dsink = torch.where(finite, acc.to(dtype), torch.zeros_like(acc, dtype=dtype))
     return (dq, dk_blk, dv_blk, dk_sw, dv_sw, dsoft, dsink)
 
 
@@ -2051,10 +2069,15 @@ def _attach_attn_kernels(ns):
             if HAS_SOFT:
                 sf = tl.load(soft_ptr + ((r * T + ti) * NB + j), mask=tm, other=0.0).to(tl.float32)
                 lam = tl.where(sf > 0.0, tl.log(tl.maximum(sf, 1e-12)), -3.402823466e38)
-                zS = tl.maximum(zj + lam, -3.402823466e38)
+                zS_pre = zj + lam
+                zS = tl.maximum(zS_pre, -3.402823466e38)
                 zS = tl.where(ok, zS, float('-inf'))
                 eS = tl.exp(zS - mS)
-                dz += eS / ZSs * (g - GS)
+                # clamp_min has a zero derivative on saturated lanes; drop the
+                # S-path term there (matches the eager autograd graph).
+                dzS = tl.where(ok & (zS_pre > -3.402823466e38),
+                               eS / ZSs * (g - GS), 0.0)
+                dz += dzS
             dqacc += dz[:, None] * kj * SCALE
         tl.store(dq_ptr + ((r * T + ti[:, None]) * NH + h) * HD + d[None, :], dqacc.to(dq_ptr.dtype.element_ty), mask=tm[:, None])
 
@@ -2124,9 +2147,11 @@ def _attach_attn_kernels(ns):
                     ZSs = tl.where(ZS == 0.0, 1.0, ZS)
                     sf = tl.load(soft_ptr + (r * T + tt) * NB + jj).to(tl.float32)
                     lam = tl.where(sf > 0.0, tl.log(tl.maximum(sf, 1e-12)), -3.402823466e38)
-                    zS = tl.maximum(z + lam, -3.402823466e38)
+                    zS_pre = z + lam
+                    zS = tl.maximum(zS_pre, -3.402823466e38)
                     PS = tl.exp(zS - mS) / ZSs
                     dzS = PS * (g - GS)
+                    dzS = tl.where(zS_pre > -3.402823466e38, dzS, 0.0)
                     dz += dzS
                 if NEED_DK:
                     dk_acc += dz * q_v * SCALE
@@ -2187,12 +2212,17 @@ def _attach_attn_kernels(ns):
                 GS = tl.load(GS_ptr + st, mask=tm, other=0.0)
                 ZSs = tl.where(ZS == 0.0, 1.0, ZS)
                 z = tl.sum(q_v * k_v, 1) * SCALE
-                zS = tl.maximum(z + lam, -3.402823466e38)
+                zS_pre = z + lam
+                zS = tl.maximum(zS_pre, -3.402823466e38)
                 zS = tl.where(ok, zS, float('-inf'))
                 PS = tl.exp(zS - mS) / ZSs
                 g = tl.sum(dO_v * v_v, 1)
                 dzS = PS * (g - GS)
-                ds_h = tl.where(sf >= 1e-12, dzS / tl.maximum(sf, 1e-12), 0.0)
+                # Strict interior for log(clamp_min(soft, 1e-12)); its
+                # derivative is zero at the boundary, and the outer
+                # clamp_min(_MINL) also kills saturated lanes.
+                ds_h = tl.where(ok & (zS_pre > -3.402823466e38) & (sf > 1e-12),
+                                dzS / tl.maximum(sf, 1e-12), 0.0)
                 acc += ds_h.to(dsoft_ptr.dtype.element_ty).to(tl.float32)
             tl.store(dsoft_ptr + ((r * T + ti) * NB + j), acc.to(dsoft_ptr.dtype.element_ty), mask=tm)
 
@@ -2486,6 +2516,11 @@ def sparse_layer_forward(attn, x, pre_all, gate_sigs, pre_blocks, impl=None):
         # 没有它内核模式的记录会丢掉全部块长/边界诊断。
         for _b in range(B):
             attn._stats.append(torch.bincount(bid_full[_b]))
+            # Eager `_single` also feeds the forced/natural cut counters from
+            # the same boolean cut row; the kernel path used to omit them.
+            if gate_sigs is not None:
+                attn._stats.add_segmentation(
+                    bid_full[_b], gate_sigs[_b][1], cfg.max_block)
         if attn._cuts is not None:
             for _b in range(B):
                 attn._cuts.append((bid_full[_b, 1:] != bid_full[_b, :-1]).nonzero(as_tuple=True)[0] + 1)
@@ -2540,6 +2575,17 @@ def sparse_layer_forward(attn, x, pre_all, gate_sigs, pre_blocks, impl=None):
                                     soft=soft, sink_logits=sink, sel_valid=valid, impl=impl_attn)
     outs = attn.W_o(out.reshape(B, T, attn.nh * attn.hd))
     attn.last_gate_mean = _gate_mean_batched(attn, cfg, T, B, gate_sigs, hons, nblks)
+    # REINFORCE boundary policy: the batched/kernel path used to leave the
+    # score-function log-probability unset, silently dropping the ONLY
+    # boundary-training term for csa_dynamic_task.  Sum the per-row values
+    # (the row loop overwrites them, which is why B=1 hid the loss).
+    if gate_sigs is not None and gate_sigs and len(gate_sigs[0]) > 2:
+        attn.last_boundary_logp = torch.stack([_gs[2] for _gs in gate_sigs]).sum()
+        attn.last_boundary_decisions = int(
+            sum(int(_gs[1].numel()) for _gs in gate_sigs))
+    else:
+        attn.last_boundary_logp = None
+        attn.last_boundary_decisions = 0
     return outs
 
 

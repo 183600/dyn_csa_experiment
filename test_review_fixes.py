@@ -13136,6 +13136,137 @@ def t_pool_geometry_accepts_no_cap():
     assert g3.max_block == 128
 
 
+def t_kernel_attention_grad_matches_eager_at_boundaries():
+    # The torch-reference twin of the fused attention must match autograd on
+    # the two boundary cases eager's graph defines: clamp_min(soft, 1e-12)
+    # has zero derivative at/outside the boundary (so soft=0 must not emit a
+    # uniform-softmax S-path gradient), and nan_to_num(sink) blocks the
+    # gradient at a non-finite sink entry.
+    import csa_kernels as C
+    dev = torch.device('cpu')
+
+    def _grads(mode, q, kb, vb, topk, last, soft=None, sink=None, w=0):
+        qq, kk, vv = (t.clone().requires_grad_(True) for t in (q, kb, vb))
+        sf = soft.clone().requires_grad_(True) if soft is not None else None
+        ss = sink.clone().requires_grad_(True) if sink is not None else None
+        ksw = torch.zeros(q.shape[0], w, q.shape[2], q.shape[3], device=dev)
+        vsw = torch.zeros_like(ksw)
+        if mode == 'eager':
+            out = L.gathered_attention(qq[0], kk[0], vv[0], topk[0], last[0],
+                                       ksw[0] if w else None, vsw[0] if w else None,
+                                       w, 1.0, soft=None if sf is None else sf[0],
+                                       sink_logits=ss)
+        else:
+            out = C.gathered_attention_kernel(qq, kk, vv, topk, last, ksw, vsw,
+                                              w, 1.0, soft=sf, sink_logits=ss,
+                                              impl='ref')
+        out.sum().backward()
+        return (out.detach(), qq.grad, kk.grad, vv.grad,
+                None if sf is None else sf.grad,
+                None if ss is None else ss.grad)
+
+    def _same(case, **kw):
+        ref = _grads('ref', **kw)
+        eager = _grads('eager', **kw)
+        for name, a, b in zip(('out', 'gq', 'gk', 'gv', 'gsoft', 'gsink'), ref, eager):
+            if a is None:
+                assert b is None, (case, name)
+                continue
+            assert torch.allclose(a, b, atol=2e-5, rtol=2e-5), (case, name, a, b)
+
+    q = torch.tensor([[[[1., 0.]], [[1., 0.]]]])
+    kb = torch.tensor([[[[1., 0.]], [[0., 1.]]]])
+    vb = torch.tensor([[[[1., 2.]], [[3., 4.]]]])
+    topk = torch.tensor([[[0, 1], [0, 1]]])
+    last = torch.tensor([[-1, 0]])
+    _same('soft=0', q=q, kb=kb, vb=vb, topk=topk, last=last,
+          soft=torch.zeros(1, 2, 2))
+    _same('soft=1e-12', q=q, kb=kb, vb=vb, topk=topk, last=last,
+          soft=torch.full((1, 2, 2), 1e-12))
+
+    torch.manual_seed(0)
+    q = torch.randn(1, 4, 2, 4)
+    kb = torch.randn(1, 3, 2, 4)
+    vb = torch.randn(1, 3, 2, 4)
+    topk = torch.tensor([[[0], [1], [0], [2]]])
+    last = torch.tensor([[0, 1, 0, 2]])
+    _same('nan sink', q=q, kb=kb, vb=vb, topk=topk, last=last,
+          sink=torch.tensor([float('nan'), 0.3]))
+
+
+def t_kernel_reinforce_boundary_logp_survives_batching():
+    # `csa_dynamic_task` trains its cut policy through REINFORCE.  The batched
+    # kernel/ref path used to return None (dropping the only boundary-loss
+    # term), and the eager row loop used to keep only the LAST row's logp.
+    # Both must now expose the summed log-probability and decision count.
+    import csa_kernels as C
+    got = {}
+    for mode in (None, 'ref'):
+        with C.kernel_env(mode):
+            torch.manual_seed(0)
+            cfgs = L.make_layer_cfgs(1, 'csa_dynamic_task')
+            model = L.SmallGPT(128, 64, 1, 4, 16, 32, cfgs).to('cpu')
+            ids = torch.randint(0, 128, (2, 32),
+                                generator=torch.Generator().manual_seed(1))
+            model(ids)
+            assert model.boundary_logp is not None, (mode, 'logp missing')
+            got[mode] = (float(model.boundary_logp.detach()),
+                         int(model.boundary_decisions))
+    assert got[None][1] == got['ref'][1], got
+    assert abs(got[None][0] - got['ref'][0]) <= 1e-4, got
+
+
+def t_probe_contrasts_require_same_validation_slice():
+    # The distractor-probe cell index drops val_fp from its lookup key; two
+    # arms measured on different validation slices each look unambiguous, so
+    # the pairing gate itself must compare the slice fingerprints.  Same for
+    # the derived delta-NLL entries.
+    import v10_supp as V10
+    import v11_supp as V11
+    code = L.code_stamp()
+    pp = {'n_seq': 4, 'seq_len': 8, 'target': 2, 'chunk': 2}
+
+    def _rec(v, arm, seed, vfp, ppl, rho=0.5, mode='uniform'):
+        return {'variant': v, 'arm': arm, 'seed': seed, 'eval_len': 8,
+                'rho': rho, 'mode': mode, 'ppl_mean': ppl,
+                'probe_params': dict(pp), '_code': code, 'recipe': 'r',
+                'val_fp': vfp}
+
+    raw = {}
+    for s in (0, 1, 2):
+        raw[f'l{s}'] = _rec('csa_fixed_rope', 'learned', s, 'A', 10.0 + s)
+        raw[f'd{s}'] = _rec('full_rope', 'dense', s, 'B', 11.0 + s)
+    td = tempfile.mkdtemp(prefix='probe_', dir=REPO)
+    old = dict(V10.PROBE)
+    try:
+        sp = os.path.join(td, 'distractor.json')
+        with open(sp, 'w', encoding='utf-8') as f:
+            json.dump(raw, f)
+        V10.PROBE.update(summary=sp, eval_lens=[8], rhos=[0.0, 0.5],
+                         modes={'uniform': [0.5]}, niah={})
+        r10 = V10.v10_analysis(os.path.join(td, 'v10.json'))
+        assert not [k for k in r10['probe']['contrasts'] if k.startswith('L8 r0.5')], \
+            r10['probe']['contrasts']
+        r11 = V11.v11_analysis(os.path.join(td, 'v11.json'))
+        assert not [k for k in r11['probe']['contrasts'] if k.startswith('L8 r0.5')], \
+            r11['probe']['contrasts']
+    finally:
+        V10.PROBE.clear()
+        V10.PROBE.update(old)
+        shutil.rmtree(td, ignore_errors=True)
+
+
+def t_greedy_match_batch_is_order_independent():
+    # `_greedy_match_counts` sorts its predicate before the rank tie-break.
+    # The batched helper must canonicalise each subset the same way, otherwise
+    # its match count depends on the caller's tuple order.
+    gt = np.array([3, 7, 10, 14, 15, 16, 19, 22])
+    sub = (9, 8, 6)
+    gs, order = np.sort(gt), np.argsort(gt, kind='stable')
+    got = L._greedy_match_count_batch([sub], gs, order, tol=3)
+    assert got == [L._greedy_match_counts(np.array(sub), gt, tol=3)[0]], got
+
+
 def t_pool_variable_blocks_accepts_no_overlap():
     # `overlap=None` is the no-overlap/HCA contract.  `_pool_parts` then
     # returns a four-tuple while `_pool_ordered` unpacks eight, so this public
@@ -14403,6 +14534,25 @@ def t_driver_pair_capacity_controls():
         fn(comp, 'raw', panel, 'method', 'tiny')
         st = comp['raw']
         assert st['param_controlled'] is False and 'method_claim_allowed' not in st, st
+        # A one-sided param_breakdown is UNVERIFIABLE, not a pass: the total
+        # count matches, but the capacity detail cannot be attested for both
+        # arms.  Treating None as "not False" (the old `and _cap is not False`
+        # shortcut) silently promoted it to controlled.
+        one_sided = {}
+        for seed in (0, 1, 2):
+            one_sided.setdefault('method', {})[seed] = dict(
+                _rec(seed, 49.0, 1200),
+                param_breakdown={'non_embedding': 800, 'active': 700})
+            one_sided.setdefault('match_nb', {})[seed] = _rec(seed, 50.0, 1200)
+        for fn in (V9.add_paired, V8._add_paired):
+            comp = {}
+            fn(comp, 'unverifiable', one_sided, 'method', 'match_nb',
+               require_param_match=True)
+            st = comp['unverifiable']
+            assert st['param_capacity_controlled'] is None, st
+            assert st['param_controlled'] is None, st
+            assert st['capacity_confounded'] is True, st
+            assert st['method_claim_allowed'] is False, st
 
 
 def main():
@@ -14745,6 +14895,10 @@ def main():
     _check('L42 empty-sequence pool kernel matches eager', t_pool_kernel_empty_sequence_matches_eager)
     _check('L42b no-overlap pool accepts overlap=None', t_pool_variable_blocks_accepts_no_overlap)
     _check('L42d pool geometry accepts the no-cap configuration', t_pool_geometry_accepts_no_cap)
+    _check('L42e kernel attention gradients match eager at clamp/sink boundaries', t_kernel_attention_grad_matches_eager_at_boundaries)
+    _check('L42f greedy match batch is subset-order independent', t_greedy_match_batch_is_order_independent)
+    _check('L42g kernel/ref REINFORCE boundary logp survives batching', t_kernel_reinforce_boundary_logp_survives_batching)
+    _check('L42h probe contrasts require the same validation slice', t_probe_contrasts_require_same_validation_slice)
     _check('L42c efficiency medians average both middle seeds', t_efficiency_median_uses_both_middle_seeds)
     _check('L43 eager_batch rejects typos/non-finite values', t_eager_batch_rejects_typos_and_nonfinite)
     _check('L44 gapfill merge refreshes/invalidates seed-derived fields', t_gapfill_merge_keeps_secondary_and_invalidates_stale_fields)

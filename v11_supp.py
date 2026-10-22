@@ -159,6 +159,9 @@ def v11_analysis(out='analysis_v11/stats.json'):
                     other = cell_mean('full_rope', 'dense', Ln, rho) if arm == 'dense' else cell_mean('csa_fixed_rope', arm, Ln, rho)
                     if not learned or not other:
                         continue
+                    if learned.get('val_fp') != other.get('val_fp'):
+                        print(f"[v11 stats] L{Ln} r{rho} {tag}: the two arms were measured on DIFFERENT validation slices ({learned.get('val_fp')} vs {other.get('val_fp')}) — pairing them would difference two different measurements, so the contrast is omitted")
+                        continue
                     if V10._fp_norm(learned.get('probe_params')) != V10._fp_norm(other.get('probe_params')):
                         print(f'[v11 stats] L{Ln} r{rho} {tag}: the two arms were probed under DIFFERENT probe_params — pairing them would difference two different measurements, so the contrast is omitted')
                         continue

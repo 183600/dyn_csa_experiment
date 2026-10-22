@@ -158,12 +158,12 @@ def _arm_param_control(panel, a, b):
     _recs = {(v, '', s): r for v, by_seed in (panel or {}).items()
              for s, r in (by_seed or {}).items() if isinstance(r, dict)}
     _pa, _pb = L._params_of_arm(_recs, a), L._params_of_arm(_recs, b)
-    _rel, _ok = L._param_control(_recs, a, b)
+    _rel = L._param_control(_recs, a, b)[0]
     _detail = L._param_control_detail(_recs, a, b)
     _cap = L._param_capacity_controlled(_detail)
     return {'params_a': _pa, 'params_b': _pb,
             'param_relative_diff': _rel,
-            'param_controlled': (None if _ok is None else bool(_ok and _cap is not False)),
+            'param_controlled': _cap,
             'param_capacity_controlled': _cap,
             'param_breakdown': _detail}
 
@@ -226,9 +226,12 @@ def add_paired(comparisons, name, panel, a, b, *, who='', outdir=None, factors=N
         if res.get('param_controlled') is not True:
             res['capacity_confounded'] = True
             res['method_claim_allowed'] = False
-            print(f'[stats] {who}{name}: CAPACITY-CONFOUNDED — `{a}` and `{b}` are not '
-                  f'parameter-matched ({res.get("params_a")} vs {res.get("params_b")}); '
-                  'the delta/p may be quoted as a raw comparison, never as the method advantage')
+            _why = ('capacity is unverifiable (missing/one-sided param_breakdown)'
+                    if res.get('param_controlled') is None else
+                    f'not parameter-matched ({res.get("params_a")} vs {res.get("params_b")})')
+            print(f'[stats] {who}{name}: CAPACITY-CONFOUNDED — `{a}` and `{b}`: '
+                  f'{_why}; the delta/p may be quoted as a raw comparison, '
+                  'never as the method advantage')
         else:
             res['capacity_confounded'] = False
             res['method_claim_allowed'] = True

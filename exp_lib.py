@@ -4280,6 +4280,12 @@ def _finfo_min(dtype):
     return v
 
 def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale, q_chunk=128, soft=None, sink_logits=None, mem_budget_bytes=None, sel_valid=None, topk_distinct=False, soft_form=False, v_stacked=None, k_stacked=None):
+    if (k_sw is None) != (v_sw is None):
+        raise ValueError('gathered_attention needs BOTH k_sw and v_sw (or neither)')
+    if k_sw is None and int(w) != 0:
+        # Without window tensors the mask/row tables would be built for `w`
+        # lanes that have no K/V source, surfacing later as a shape error.
+        raise ValueError(f'gathered_attention: w={w} requires k_sw/v_sw; pass w=0 for block-only attention')
     n = q.shape[0]
     dev = q.device
     if mem_budget_bytes is None:
@@ -5612,6 +5618,8 @@ class HybridAttention(nn.Module):
         gates = []
         _prev_batch = _CPU_ACTIVE_BATCH[0]
         _CPU_ACTIVE_BATCH[0] = int(B)
+        _blp = None
+        _bdec = 0
         try:
             for b in range(B):
                 pre = pres[b]
@@ -5619,8 +5627,18 @@ class HybridAttention(nn.Module):
                 outs[b] = o
                 if g is not None:
                     gates.append(g)
+                # `_single` resets these per row; the row loop used to leave
+                # only the LAST row's REINFORCE log-probability, so a batch
+                # trained on a fraction of its boundary decisions.  Accumulate
+                # all rows (the batched/kernel path sums them too).
+                _lp = getattr(self, 'last_boundary_logp', None)
+                if _lp is not None:
+                    _blp = _lp if _blp is None else _blp + _lp
+                    _bdec += int(getattr(self, 'last_boundary_decisions', 0) or 0)
         finally:
             _CPU_ACTIVE_BATCH[0] = _prev_batch
+        self.last_boundary_logp = _blp
+        self.last_boundary_decisions = int(_bdec)
         if not gates:
             self.last_gate_mean = None
         else:
@@ -23525,7 +23543,11 @@ def _greedy_match_counts(pred, gt, tol, _pre=None):
     return (len(used_p), len(used_g))
 
 def _greedy_match_count_batch(subsets, gt_sorted, order, tol):
-    subs = [tuple(s) for s in subsets]
+    # `_greedy_match_counts` sorts the predicate before its rank tie-break, so
+    # the batched form must canonicalise every subset the same way.  Using the
+    # caller's order made the match count depend on how a subset happened to
+    # be constructed (its rank, not its value, broke distance ties).
+    subs = [tuple(sorted(s)) for s in subsets]
     n_sub = len(subs)
     if n_sub == 0:
         return []

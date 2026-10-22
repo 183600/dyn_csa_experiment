@@ -1500,6 +1500,9 @@ def v10_analysis(out='analysis_v10/stats.json'):
             return hits[0] if hits else {}
 
         def _pairable(a, b, Ln, rho, tag, mode='uniform'):
+            if a.get('val_fp') != b.get('val_fp'):
+                print(f"[v10 stats] L{Ln} r{rho} {mode} {tag}: the two arms were measured on DIFFERENT validation slices ({a.get('val_fp')} vs {b.get('val_fp')}) — pairing them would difference two different measurements, so the contrast is omitted")
+                return False
             if _fp_norm(a.get('probe_params')) != _fp_norm(b.get('probe_params')):
                 print(f'[v10 stats] L{Ln} r{rho} {mode} {tag}: the two arms were probed under DIFFERENT probe_params — pairing them would difference two different measurements, so the contrast is omitted')
                 return False
@@ -1605,7 +1608,7 @@ def v10_analysis(out='analysis_v10/stats.json'):
             if len(per_seed) >= 1:
                 means = {s: per_seed[s] for s in sorted(per_seed)}
                 _dl = list(means.values())
-                entry = {'variant': v, 'arm': arm, 'eval_len': Ln, 'rho': rho, 'mode': mode, 'n': len(_dl), 'mean': float(np.mean(_dl)), 'std': float(np.std(_dl, ddof=1)) if len(_dl) > 1 else 0.0, 'per_seed': means, 'clean_nll_by_seed': {s: _nll_tok(r) for s, r in clean_grp.items() if math.isfinite(_nll_tok(r))}, 'note': 'delta = NLL_corrupted - NLL_clean, nats per target token'}
+                entry = {'variant': v, 'arm': arm, 'eval_len': Ln, 'rho': rho, 'mode': mode, 'val_fp': _vfp, 'probe_params': json.loads(_pp) if isinstance(_pp, str) else _pp, '_code': _cd, 'recipe': _recipe, 'n': len(_dl), 'mean': float(np.mean(_dl)), 'std': float(np.std(_dl, ddof=1)) if len(_dl) > 1 else 0.0, 'per_seed': means, 'clean_nll_by_seed': {s: _nll_tok(r) for s, r in clean_grp.items() if math.isfinite(_nll_tok(r))}, 'note': 'delta = NLL_corrupted - NLL_clean, nats per target token'}
                 delta_nll[f'{v}::{arm}::L{Ln}::{mode}::r{rho}'] = entry
         # paired delta-NLL contrasts between arms at the same (L, mode, rho)
         for Ln in PROBE['eval_lens']:
@@ -1617,6 +1620,17 @@ def v10_analysis(out='analysis_v10/stats.json'):
                     for arm, tag in (('dense', 'full_rope::dense'), ('randidx', 'csa_fixed_rope::randidx'), ('allblocks', 'csa_fixed_rope::allblocks')):
                         other = delta_nll.get(f'{tag}::L{Ln}::{mode}::r{rho}')
                         if not learned or not other:
+                            continue
+                        # The delta entries also have to come from the same
+                        # validation slice / probe / code, not merely share a
+                        # (variant, arm, L, mode, rho) key.
+                        if learned.get('val_fp') != other.get('val_fp'):
+                            print(f"[v10 stats] ΔNLL L{Ln} {mode} r{rho} {arm}: the two arms were measured on DIFFERENT validation slices ({learned.get('val_fp')} vs {other.get('val_fp')}) — contrast omitted")
+                            continue
+                        if (_fp_norm(learned.get('probe_params')) != _fp_norm(other.get('probe_params'))
+                                or learned.get('_code') != other.get('_code')
+                                or _recipe_norm(learned.get('recipe')) != _recipe_norm(other.get('recipe'))):
+                            print(f'[v10 stats] ΔNLL L{Ln} {mode} r{rho} {arm}: probe/code/recipe identity differs — contrast omitted')
                             continue
                         common = sorted(set(learned['per_seed']) & set(other['per_seed']))
                         if len(common) >= 2:
@@ -1665,7 +1679,7 @@ def v10_analysis(out='analysis_v10/stats.json'):
                 _bal_vals = [float(x) for x in bals.values()
                              if isinstance(x, (int, float)) and not isinstance(x, bool)
                              and math.isfinite(float(x))]
-                niah_cells.append({'variant': v, 'arm': arm, 'eval_len': Ln, 'condition': cond, 'seeds': sorted(accs), 'acc_by_seed': accs, 'nll_by_seed': nlls, 'balanced_by_seed': bals, 'acc_mean': float(np.mean(list(accs.values()))), 'balanced_mean': (float(np.mean(_bal_vals)) if _bal_vals else None), 'nll_mean': float(np.mean(list(nlls.values()))), 'recommended_primary_metric': _first.get('recommended_primary_metric'), 'copy_rule_acc': (_first.get('copy_rule_baseline') or {}).get('acc'), 'copy_rule_n_missing_context': (_first.get('copy_rule_baseline') or {}).get('n_missing_context'), 'minority_prevalence': _first.get('minority_prevalence'), 'chance_accuracy': _first.get('chance_accuracy'), 'majority_accuracy': _first.get('majority_accuracy'), 'n_classes': _first.get('n_classes'), 'n': len(accs), 'n_pairs': _first.get('n_pairs'), 'dist_mean': _first.get('dist_mean'), 'val_fp': _vfp})
+                niah_cells.append({'variant': v, 'arm': arm, 'eval_len': Ln, 'condition': cond, 'seeds': sorted(accs), 'acc_by_seed': accs, 'nll_by_seed': nlls, 'balanced_by_seed': bals, 'acc_mean': float(np.mean(list(accs.values()))), 'balanced_mean': (float(np.mean(_bal_vals)) if _bal_vals else None), 'nll_mean': float(np.mean(list(nlls.values()))), 'recommended_primary_metric': _first.get('recommended_primary_metric'), 'copy_rule_acc': (_first.get('copy_rule_baseline') or {}).get('acc'), 'copy_rule_n_missing_context': (_first.get('copy_rule_baseline') or {}).get('n_missing_context'), 'minority_prevalence': _first.get('minority_prevalence'), 'chance_accuracy': _first.get('chance_accuracy'), 'majority_accuracy': _first.get('majority_accuracy'), 'n_classes': _first.get('n_classes'), 'n': len(accs), 'n_pairs': _first.get('n_pairs'), 'dist_mean': _first.get('dist_mean'), 'val_fp': _vfp, 'probe_params': _first.get('probe_params'), '_code': _cd, 'recipe': _recipe})
             niah_contrasts = {}
             niah_acc_contrasts = {}
             _nidx = {}
@@ -1675,12 +1689,25 @@ def v10_analysis(out='analysis_v10/stats.json'):
             def _ncell(v, arm, Ln, cond):
                 hits = _nidx.get((v, arm, Ln, cond), [])
                 return hits[0] if len(hits) == 1 else {}
+
+            def _n_pairable(a, b, Ln, cond, tag):
+                if a.get('val_fp') != b.get('val_fp'):
+                    print(f"[v10 stats] NIAH-nat L{Ln} {cond} {tag}: the two arms were measured on DIFFERENT validation slices ({a.get('val_fp')} vs {b.get('val_fp')}) — contrast omitted")
+                    return False
+                if (_fp_norm(a.get('probe_params')) != _fp_norm(b.get('probe_params'))
+                        or a.get('_code') != b.get('_code')
+                        or _recipe_norm(a.get('recipe')) != _recipe_norm(b.get('recipe'))):
+                    print(f'[v10 stats] NIAH-nat L{Ln} {cond} {tag}: probe/code/recipe identity differs — contrast omitted')
+                    return False
+                return True
             for Ln in PROBE['eval_lens']:
                 for cond in (PROBE.get('niah') or {}).get('conditions', ['clean', 'distract']):
                     learned = _ncell('csa_fixed_rope', 'learned', Ln, cond)
                     for arm, tag in (('dense', 'full_rope'), ('randidx', 'csa_fixed_rope'), ('allblocks', 'csa_fixed_rope')):
                         other = _ncell('full_rope', 'dense', Ln, cond) if arm == 'dense' else _ncell(tag, arm, Ln, cond)
                         if not learned or not other:
+                            continue
+                        if not _n_pairable(learned, other, Ln, cond, arm):
                             continue
                         common = sorted(set(learned['acc_by_seed']) & set(other['acc_by_seed']))
                         if len(common) >= 2:
@@ -1698,6 +1725,8 @@ def v10_analysis(out='analysis_v10/stats.json'):
                     for tag, ov in (('csa_randtrain', 'csa_fixed_rope_randidx'), ('csa_alltrain', 'csa_fixed_rope_allblocks')):
                         other = _ncell(ov, 'learned', Ln, cond)
                         if not learned or not other:
+                            continue
+                        if not _n_pairable(learned, other, Ln, cond, tag):
                             continue
                         common = sorted(set(learned['nll_by_seed']) & set(other['nll_by_seed']))
                         if len(common) >= 2:
