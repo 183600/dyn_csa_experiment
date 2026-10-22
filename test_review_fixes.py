@@ -15881,6 +15881,171 @@ def t_frozen_vocab_width_is_a_validated_positive_integer():
         pass
 
 
+def t_budget_ledger_enforces_token_parameter_read_controls():
+    import copy
+    with open(os.path.join(REPO, 'confirmation_frozen.json'), encoding='utf-8') as f:
+        m = json.load(f)
+    r = L.comparison_budget_ledger(m)
+    assert r['status'] == 'ok', r['violations']
+    # n_train_tokens is the served-cache size, NOT steps*bs*sl.  The ledger
+    # must compare the CONSUMED token budget across arms and record both.
+    tb = r['token_budget']
+    assert tb['train_cache_tokens'] == 8000000, tb
+    assert tb['consumed_tokens'] == 3000 * 12 * 512 == 18432000, tb
+    assert tb['shared_by_all_arms'] is True, tb
+    assert abs(tb['definitions']['epochs_over_cache'] - 2.304) < 1e-9, tb
+    cmps = r['comparisons']
+    main = cmps['main: csa_fixed_rope - full_rope @ L4096 (test)']
+    assert main['token_matched'] is True and main['param_matched'] is True, main
+    assert main['read_matched'] is False, main           # sparse vs full read
+    assert main['mechanism_claim_allowed'] is False, main
+    seeded = next(v for k, v in cmps.items() if 'randidx_seeded' in k)
+    assert seeded['token_matched'] and seeded['param_matched'], seeded
+    assert seeded['read_matched'] is True, seeded        # equal top-k
+    assert seeded['dedicated_control'] == 'selection_control', seeded
+    allb = next(v for k, v in cmps.items() if 'allblocks' in k)
+    assert allb['read_matched'] is False, allb
+    assert allb['mechanism_claim_allowed'] is False, allb
+
+    # A mechanism claim on the main sparse-vs-dense comparison must be refused:
+    # it is parameter-matched but not read/compute matched, and the cfg diff is
+    # an architecture swap, not a single factor.
+    bad = copy.deepcopy(m)
+    for c in bad['primary_comparisons']:
+        if c.get('name', '').startswith('main:'):
+            c['mechanism_claim_allowed'] = True
+    rb = L.comparison_budget_ledger(bad)
+    assert rb['status'] == 'fail', rb
+    assert any('read budget is not matched' in v or 'single-factor' in v
+               for v in rb['violations']), rb['violations']
+
+    # A per-arm token override silently changes the treatment budget and must
+    # break the shared-token premise.
+    tok = copy.deepcopy(m)
+    tok['binding']['per_arm_recipe_signature']['full_rope']['steps'] = 1500
+    rt = L.comparison_budget_ledger(tok)
+    assert rt['status'] == 'fail', rt
+    assert any('do not share one consumed token budget' in p
+               for p in rt['problems']), rt['problems']
+
+
+def t_evidence_level_audit_keeps_exploratory_exploratory():
+    import copy
+    with open(os.path.join(REPO, 'confirmation_frozen.json'), encoding='utf-8') as f:
+        main = json.load(f)
+    ev = L.evidence_level_audit(main, manifest_path=os.path.join(REPO, 'confirmation_frozen.json'))
+    assert ev['status'] == 'ok', ev['violations']
+    assert ev['manifest_level'] == 'confirmatory', ev
+    with open(os.path.join(REPO, 'confirmation_frozen_dynamic.json'), encoding='utf-8') as f:
+        dyn = json.load(f)
+    de = L.evidence_level_audit(dyn, manifest_path=os.path.join(REPO, 'confirmation_frozen_dynamic.json'))
+    assert de['status'] == 'ok', de['violations']
+    assert de['manifest_level'] == 'draft', de
+    # A draft comparison cannot be promoted by label.
+    bad = copy.deepcopy(dyn)
+    bad['primary_comparisons'][0]['evidence_level'] = 'confirmatory'
+    be = L.evidence_level_audit(bad, manifest_path='confirmation_frozen_dynamic.json')
+    assert be['status'] == 'fail', be
+    # A v6-v11 panel that claims confirmatory is a hard contradiction: those
+    # panels were selected on the same validation split they report.
+    with tempfile.TemporaryDirectory() as td:
+        panel = os.path.join(td, 'results_lm_v7_rope')
+        os.makedirs(panel)
+        with open(os.path.join(panel, 'summary.json'), 'w', encoding='utf-8') as f:
+            json.dump({'evidence_level': 'confirmatory', 'arm': {'ppl': 1.0}}, f)
+        pe = L.evidence_level_audit(main, manifest_path='confirmation_frozen.json',
+                                    panel_paths=[panel])
+        assert pe['status'] == 'fail', pe
+        assert any('same validation split' in v for v in pe['violations']), pe['violations']
+        # A registry panel with no summary is still exploratory, not a pass for
+        # confirmatory wording.
+        empty = os.path.join(td, 'results_v10_mech')
+        os.makedirs(empty)
+        ee = L.evidence_level_audit(main, manifest_path='confirmation_frozen.json',
+                                    panel_paths=[empty])
+        assert ee['status'] == 'ok', ee
+        assert ee['panels']['results_v10_mech']['declared_level'].startswith('exploratory'), ee
+
+
+def t_dynamic_design_audit_requires_hypotheses_and_controls():
+    import copy
+    with open(os.path.join(REPO, 'confirmation_frozen_dynamic.json'), encoding='utf-8') as f:
+        dyn = json.load(f)
+    d = L.dynamic_design_audit(dyn, manifest_path=os.path.join(REPO, 'confirmation_frozen_dynamic.json'))
+    assert d['status'] == 'ok', d['violations']
+    assert d['runnable'] is False and d['promotion_ready'] is False, d
+    assert {'H1_segmentation_quality', 'H2_retrieval_precision',
+            'H3_long_range_coverage'} <= set(d['hypotheses']), d['hypotheses']
+    # Every required dedicated control is present.
+    for role in ('token_budget', 'parameter_proxy', 'read_budget',
+                 'selection_control', 'segmentation_control', 'hca_control'):
+        assert isinstance(d['controls'].get(role), dict), (role, d['controls'])
+    # Missing hypothesis / missing control arm / a draft mechanism claim all
+    # fail closed before any GPU spend.
+    bad = copy.deepcopy(dyn)
+    bad['hypotheses'].pop('H1_segmentation_quality')
+    assert L.dynamic_design_audit(bad)['status'] == 'fail'
+    bad = copy.deepcopy(dyn)
+    bad['arms'].remove('csa_dynamic_rope_randidx_seeded')
+    assert L.dynamic_design_audit(bad)['status'] == 'fail'
+    bad = copy.deepcopy(dyn)
+    bad['primary_comparisons'][0]['mechanism_claim_allowed'] = True
+    assert L.dynamic_design_audit(bad)['status'] == 'fail'
+    # A frozen/runnable claim without the measured calibration + passed power
+    # gate must not be promoted.
+    bad = copy.deepcopy(dyn)
+    bad['status'] = 'frozen'
+    bad['frozen_at'] = '2026-10-22'
+    bad['precondition']['runnable'] = True
+    assert L.dynamic_design_audit(bad)['status'] == 'fail'
+    # The ledger must agree that the dynamic design's token budgets are shared
+    # and that the read-rich/dense arms are not the mechanism controls.
+    led = L.comparison_budget_ledger(dyn)
+    assert led['status'] == 'ok', led['violations']
+    assert led['token_budget']['shared_by_all_arms'] is True, led['token_budget']
+    hca = next(v for k, v in led['comparisons'].items() if 'HCA' in k)
+    assert hca['read_matched'] is False and hca['mechanism_claim_allowed'] is False, hca
+
+
+def t_dynamic_control_arms_construct_and_isolate_factors():
+    # The dynamic design is rope-only; these are the arms the draft names.
+    for arm in ('csa_dynamic_rope', 'csa_dynamic_rope_randidx_seeded',
+                'csa_dynamic_rope_task', 'hybrid_dynamic_rope',
+                'csa_fixed_rope_topk32'):
+        cfgs = V7.make_layer_cfgs_v7(6, arm)
+        assert len(cfgs) == 6 and all(getattr(c, 'rope', False) for c in cfgs), (arm, cfgs)
+    keys, _ = L._design_pair_cfg_keys('csa_dynamic_rope',
+                                      'csa_dynamic_rope_randidx_seeded',
+                                      V7.make_layer_cfgs_v7, 6)
+    assert set(keys) == {'indexer_mode', 'random_salt'}, keys
+    keys, _ = L._design_pair_cfg_keys('csa_dynamic_rope',
+                                      'csa_dynamic_rope_task',
+                                      V7.make_layer_cfgs_v7, 6)
+    assert set(keys) == {'boundary_policy'}, keys
+    keys, _ = L._design_pair_cfg_keys('csa_fixed_rope_randidx_seeded',
+                                      'csa_dynamic_rope_randidx_seeded',
+                                      V7.make_layer_cfgs_v7, 6)
+    assert set(keys) == {'dynamic', 'chunking', 'target_block_tokens'}, keys
+    # HCA is a kind swap: architecture-level, never a single-factor mechanism.
+    keys, _ = L._design_pair_cfg_keys('csa_dynamic_rope', 'hybrid_dynamic_rope',
+                                      V7.make_layer_cfgs_v7, 6)
+    assert 'kind' in set(keys), keys
+
+
+def t_v12_plan_emits_design_preflight():
+    rep = V12.plan_check(os.path.join(REPO, 'confirmation_frozen.json'))
+    assert rep['ok'], rep['errors']
+    dp = rep.get('design_preflight') or {}
+    led = dp.get('budget_ledger') or {}
+    ev = dp.get('evidence_level') or {}
+    assert led.get('status') == 'ok', led.get('violations')
+    assert led['token_budget']['shared_by_all_arms'] is True, led['token_budget']
+    assert ev.get('status') == 'ok' and ev.get('manifest_level') == 'confirmatory', ev
+    # The dynamic draft must be auditable but explicitly non-runnable.
+    dr = V12.dynamic_plan_check(os.path.join(REPO, 'confirmation_frozen_dynamic.json'))
+    assert dr['ok'] and dr['runnable'] is False and dr['promotion_ready'] is False, dr
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -16291,6 +16456,11 @@ def main():
     _check('L79 prefix-invariance check honours small budgets/scalar prefixes', t_segmentation_prefix_check_honours_small_budget_and_scalar_prefix)
     _check('L80 loader/audit docstrings survive parameter validation', t_loader_docstrings_survive_parameter_validation)
     _check('L81 frozen vocab width is a validated positive integer', t_frozen_vocab_width_is_a_validated_positive_integer)
+    _check('L82 token/parameter/read budget ledger enforces dedicated controls', t_budget_ledger_enforces_token_parameter_read_controls)
+    _check('L83 exploratory panels cannot be relabelled confirmatory', t_evidence_level_audit_keeps_exploratory_exploratory)
+    _check('L84 dynamic design requires hypotheses + dedicated controls', t_dynamic_design_audit_requires_hypotheses_and_controls)
+    _check('L85 dynamic control arms isolate boundary/selection factors', t_dynamic_control_arms_construct_and_isolate_factors)
+    _check('L86 v12 plan emits the budget/evidence design preflight', t_v12_plan_emits_design_preflight)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

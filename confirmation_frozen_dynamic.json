@@ -1,12 +1,16 @@
 {
   "status": "draft",
-  "manifest_version": 3,
+  "manifest_version": 4,
   "frozen_at": null,
-  "purpose": "Separate pre-registration for DYNAMIC chunking and HCA. This is a design record, not a runnable confirmation: the fixed-chunk v5 study will consume the WikiText-103 test slice; a second study on the same rows is not independent. Freeze this plan only after a disjoint test corpus (or a disjoint, never-read document split) is reserved.",
+  "purpose": "Separate pre-registration DRAFT for DYNAMIC chunking and HCA. This is a hypothesis-driven design record, not a runnable confirmation: the fixed-chunk v5 study will consume the WikiText-103 test slice, so a second study on the same rows is not independent. The draft names (H1) segmentation quality, (H2) retrieval precision and (H3) long-range coverage as separate claims, and schedules the dedicated controls needed to attribute a gain to the boundary mechanism rather than to dense-vs-sparse budget differences. Freeze only after a disjoint test corpus (or never-read document split) is reserved, the realized dynamic block length is measured to calibrate the matched fixed top-k, and the pre-test power gate passes. v6-v11 results are exploratory and may not be quoted as evidence for this draft.",
   "arms": [
     "csa_fixed_rope",
+    "csa_fixed_rope_randidx_seeded",
+    "csa_fixed_rope_allblocks",
+    "csa_fixed_rope_topk32",
     "csa_dynamic_rope",
-    "csa_dynamic_task",
+    "csa_dynamic_rope_randidx_seeded",
+    "csa_dynamic_rope_task",
     "hybrid_dynamic_rope",
     "full_rope",
     "full_rope_sink"
@@ -29,7 +33,7 @@
     14,
     15
   ],
-  "training_recipe": "Same 3000-step/512/12 recipe as v5, but the dynamic arms add the boundary policy knobs (target_block_tokens, temperature, comp_lambda, boundary_policy). Every arm must be tuned on validation with the same declared grid before the test read; the cosine threshold arm is not LM-trained (only comp_reg trains the scalar offset), so csa_dynamic_task is the task-learned policy arm and must be reported separately.",
+  "training_recipe": "Same 3000-step / seq 512 / batch 12 recipe as v5: 18.4M consumed tokens per run over the same 8M-token train cache, identical data order per seed. EVERY arm uses RoPE (rope=True, rope_dim=16, qk_norm=True); mixing the non-rope csa_dynamic_task with rope arms is forbidden because positional encoding would be a second factor. No arm may early-stop: a shortened run changes the token budget and cannot enter a budget-controlled contrast. The dynamic arms add the boundary policy knobs (target_block_tokens, temperature, comp_lambda, boundary_policy); all knobs are tuned on validation with the same declared grid before any disjoint test read.",
   "binding": {
     "training_recipe_signature": {
       "steps": 3000,
@@ -59,10 +63,22 @@
       "csa_fixed_rope": {
         "mr": 4.0
       },
+      "csa_fixed_rope_randidx_seeded": {
+        "mr": 4.0
+      },
+      "csa_fixed_rope_allblocks": {
+        "mr": 4.0
+      },
+      "csa_fixed_rope_topk32": {
+        "mr": 4.0
+      },
       "csa_dynamic_rope": {
         "mr": 4.0
       },
-      "csa_dynamic_task": {
+      "csa_dynamic_rope_randidx_seeded": {
+        "mr": 4.0
+      },
+      "csa_dynamic_rope_task": {
         "mr": 4.0
       },
       "hybrid_dynamic_rope": {
@@ -74,44 +90,94 @@
       "full_rope_sink": {
         "mr": 6.763427734375
       }
+    },
+    "per_arm_recipe_signature_note": "All sparse/dynamic arms stay at mr=4.0 so the boundary/selection contrast does not also change MLP width. full_rope is widened to the v5 parameter proxy; full_rope_sink subtracts the 48 sink parameters. The ledger verifies the totals before any test access.",
+    "read_budget_binding": {
+      "train_len": 512,
+      "eval_len": 4096,
+      "fixed_block_size": 4,
+      "dynamic_target_block_tokens": 4,
+      "topk": 32,
+      "note": "Analytic read budget only. The realized mean dynamic block length must be measured on validation before the matched fixed top-k is frozen."
     }
   },
   "primary_comparisons": [
     {
-      "name": "dynamic-vs-fixed: csa_dynamic_rope - csa_fixed_rope @ L4096",
+      "name": "H3 dynamic-vs-fixed (learned selection) @ L4096 (draft)",
       "a": "csa_dynamic_rope",
       "b": "csa_fixed_rope",
       "endpoint": "by_len.ppl@4096",
-      "expected_sign": null,
-      "hypothesis_direction": "non-directional: does the cosine-boundary dynamic arm beat the fixed 4-token block arm at the same read budget?",
-      "mechanism_claim_allowed": false
+      "hypothesis_id": "H3_long_range_coverage",
+      "expected_sign": -1,
+      "evidence_level": "draft",
+      "mechanism_claim_allowed": false,
+      "interpretation_caveat": "Read budget is an analytic proxy until the realized dynamic block length is measured; do not call this read-matched yet. Also confounds boundary policy with learned selection unless paired with the random-vs-random segmentation control."
     },
     {
-      "name": "task-vs-cosine: csa_dynamic_task - csa_dynamic_rope @ L4096",
-      "a": "csa_dynamic_task",
+      "name": "H1 segmentation-only (random selection) @ L4096 (draft)",
+      "a": "csa_dynamic_rope_randidx_seeded",
+      "b": "csa_fixed_rope_randidx_seeded",
+      "endpoint": "boundary_f1.tol1@4096",
+      "hypothesis_id": "H1_segmentation_quality",
+      "expected_sign": 1,
+      "evidence_level": "draft",
+      "mechanism_claim_allowed": false,
+      "interpretation_caveat": "Both arms use a seeded random selector, so this isolates the boundary mechanism; promotion still requires the measured read-budget calibration and a matched fixed top-k."
+    },
+    {
+      "name": "H2 selection-only (dynamic blocking) @ L4096 (draft)",
+      "a": "csa_dynamic_rope",
+      "b": "csa_dynamic_rope_randidx_seeded",
+      "endpoint": "niah.top1_accuracy@L4096",
+      "hypothesis_id": "H2_retrieval_precision",
+      "expected_sign": 1,
+      "evidence_level": "draft",
+      "mechanism_claim_allowed": false,
+      "interpretation_caveat": "Both arms use the same dynamic cuts and top-k, so only the selector differs; the NIAH endpoint and the top-1/random floors are reported together."
+    },
+    {
+      "name": "H4 task-learned boundary vs cosine @ L4096 (draft)",
+      "a": "csa_dynamic_rope_task",
       "b": "csa_dynamic_rope",
       "endpoint": "by_len.ppl@4096",
-      "expected_sign": "negative",
-      "hypothesis_direction": "negative would show the LM-trained boundary policy beats the cosine heuristic",
-      "mechanism_claim_allowed": false
+      "hypothesis_id": "H4_task_policy",
+      "expected_sign": -1,
+      "evidence_level": "draft",
+      "mechanism_claim_allowed": false,
+      "interpretation_caveat": "The task-learned policy trains the cut sampler with the LM loss; the cosine arm trains only the compression-regularizer offset. This is a boundary-policy contrast, not a boundary-geometry or read-budget contrast."
     },
     {
-      "name": "hca-vs-csa: hybrid_dynamic_rope - csa_dynamic_rope @ L4096",
+      "name": "H1 boundary quality at matched read budget @ L4096 (draft)",
+      "a": "csa_dynamic_rope",
+      "b": "csa_fixed_rope_topk32",
+      "endpoint": "boundary_f1.tol1@4096",
+      "hypothesis_id": "H1_segmentation_quality",
+      "expected_sign": 1,
+      "evidence_level": "draft",
+      "mechanism_claim_allowed": false,
+      "interpretation_caveat": "The concrete fixed top-k must be re-derived from the measured dynamic block length before freezing; topk32 is only the initial candidate, not a frozen matched budget."
+    },
+    {
+      "name": "H5 system-level HCA-dynamic vs CSA-dynamic @ L4096 (draft)",
       "a": "hybrid_dynamic_rope",
       "b": "csa_dynamic_rope",
       "endpoint": "by_len.ppl@4096",
-      "expected_sign": null,
-      "hypothesis_direction": "non-directional HCA readout; HCA reads every closed block, so this is not read-budget matched",
-      "mechanism_claim_allowed": false
+      "hypothesis_id": "H5_hca_hierarchy",
+      "expected_sign": -1,
+      "evidence_level": "draft",
+      "mechanism_claim_allowed": false,
+      "interpretation_caveat": "HCA reads every closed block and is NOT read-budget matched; this is a system-level hierarchy readout, never a boundary/selection mechanism claim."
     },
     {
-      "name": "sink-matched dense vs dynamic: full_rope_sink - csa_dynamic_rope @ L4096",
-      "a": "full_rope_sink",
+      "name": "H3 parameter proxy: dense vs dynamic @ L4096 (draft)",
+      "a": "full_rope",
       "b": "csa_dynamic_rope",
       "endpoint": "by_len.ppl@4096",
-      "expected_sign": null,
-      "hypothesis_direction": "system-level dynamic-vs-dense readout with the sink matched",
-      "mechanism_claim_allowed": false
+      "hypothesis_id": "H3_long_range_coverage",
+      "expected_sign": 1,
+      "evidence_level": "draft",
+      "mechanism_claim_allowed": false,
+      "interpretation_caveat": "The dense arm is parameter-matched by MLP widening, not compute/read matched; it is a system-level reference, not the mechanism control."
     }
   ],
   "statistics": {
@@ -119,11 +185,19 @@
     "n_seeds": 16,
     "p_floor": 3.0517578125e-05,
     "alpha": 0.05,
-    "family": "primary_comparisons only (m=4)",
+    "family": "primary_comparisons only (m=7)",
     "correction": "holm step-down",
-    "min_attainable_p_holm": 0.0001220703125,
-    "min_seeds_for_confirmation": 10,
-    "decision_rule": "DRAFT: not active. Once frozen, CONFIRMED requires p_holm<0.05, direction match, parameter match, full coverage and the pre-test power gate on a disjoint test source."
+    "min_attainable_p_holm": 0.000213623046875,
+    "min_seeds_for_confirmation": 12,
+    "min_seeds_note": "with 16 frozen seeds and a 7-comparison Holm family, 12 complete pairs already give a minimum attainable Holm p of 0.0034 < 0.05; the shipped confirmation must still require all 16 seeds (complete coverage, no top-up)",
+    "require_complete_coverage": true,
+    "require_power_gate": true,
+    "min_power_for_test": 0.8,
+    "power_q_for_test": 0.95,
+    "power_simulation_required": true,
+    "power_note": "Before any disjoint test read, simulate the exact sign-flip over the calibration per-seed delta vector; if power at q=0.95 is below 0.8, add seeds and record the revision BEFORE the read. The symbol-test projection is only a rough design aid.",
+    "decision_rule": "DRAFT: not active. Once frozen, CONFIRMED requires status=frozen, a disjoint test source never used for selection, a passed pre-test power gate, complete 16-seed coverage, p_holm<0.05, direction matching the pre-registered sign, matched token/parameter/read budgets (measured calibration for dynamic-vs-fixed), and mechanism_claim_allowed=true only for a single-factor contrast.",
+    "seed_policy": "seeds 0-15 are frozen for this draft; no seeds may be added after the first disjoint test read (selection bias by construction). Missing seeds are reported as unincluded, never topped up."
   },
   "eval": {
     "n_seqs_clean": 48,
@@ -136,19 +210,226 @@
     "per_document": true,
     "boundary_f1": {
       "enabled": true,
-      "note": "secondary segmentation endpoint; needs the same boundary labels and tolerance as v10's boundary_alignment; never folded into the PPL Holm family"
+      "tolerance": 1,
+      "note": "H1 primary endpoint; macro over sequences, matched-length random baseline reported alongside"
+    },
+    "niah": {
+      "enabled": true,
+      "primary": "top1_accuracy",
+      "floors": [
+        "uniform",
+        "majority"
+      ],
+      "note": "H2 primary endpoint with trivial floors; not folded into the PPL Holm family"
+    },
+    "distractor_probe": {
+      "mode": "uniform",
+      "rhos": [
+        0.0,
+        0.125,
+        0.25,
+        0.5
+      ],
+      "eval_lens": [
+        2048,
+        4096
+      ],
+      "target": 512,
+      "n_seq": 16
     }
   },
   "scope": {
-    "confirmatory_claims": "DYNAMIC chunking and HCA only",
-    "not_covered": "fixed-chunk selection/sink claims are covered by confirmation_frozen.json, not here",
-    "required_for": "a disjoint test source, a new freeze, a pre-test power simulation and the same strict admission/freeze-lock machinery"
+    "confirmatory_claims": "DYNAMIC chunking and HCA only, after this draft is frozen and the disjoint-source preconditions are met",
+    "not_covered": "fixed-chunk selection/sink claims are covered by confirmation_frozen.json, not here; dense-vs-sparse compute claims are not covered here either",
+    "required_for": "a disjoint test source, a new freeze, a measured dynamic-block-length read-budget calibration, a pre-test power simulation and the same strict admission/freeze-lock machinery as v12",
+    "mechanism_claim_policy": "Only H1 segmentation-only (random-vs-random), H2 selection-only (dynamic blocking) and H4 task-policy contrasts are eligible for a mechanism claim, and only after the read-budget calibration; H3/H5/dense comparisons are system-level."
   },
   "precondition": {
     "runnable": false,
     "test_source": "FineWeb-Edu (preferred) or a disjoint WikiText-103 document split",
-    "must_not_reuse": "results_lm_test rows 0-47 already reserved for the fixed v5 study",
-    "why": "a second confirmation on the same test rows is not independent; the first read fixes the slice and the freeze lock only protects that manifest"
+    "disjoint_test_source": "FineWeb-Edu (preferred) or a disjoint WikiText-103 document split",
+    "must_not_reuse": "results_lm_test rows 0-47 reserved for the fixed v5 study; no v6-v11 validation row/arm selection may be reused as evidence",
+    "why": "a second confirmation on the same test rows is not independent; the first read fixes the slice and the freeze lock only protects that manifest",
+    "read_budget_calibration": {
+      "status": "pending",
+      "source": "validation measurement of the realized mean dynamic block length",
+      "rule": "freeze the concrete csa_fixed_rope_topk{k_fixed} arm after measurement",
+      "must_not_guess": true
+    },
+    "power_gate": {
+      "status": "pending",
+      "method": "exact sign-flip simulation on the calibration per-seed delta vector",
+      "min_power": 0.8,
+      "q": 0.95,
+      "must_precede_test_read": true
+    },
+    "selection_provenance": {
+      "v6_v11": "exploratory; selected on the same validation split; never evidence for this draft",
+      "dynamic_arms": "design hypotheses fixed BEFORE any dynamic run",
+      "new_comparisons": "must declare hypothesis_id/evidence_level/control before running"
+    }
   },
-  "status_note": "DRAFT ONLY. `v12_supp.py` refuses status=draft unless V12_ALLOW_DRAFT=1, and even then this file is not a confirmation."
+  "status_note": "DRAFT ONLY. `v12_supp.py dynamic-plan` audits this file and refuses structural defects. Even with V12_ALLOW_DRAFT=1 this file is not a confirmation; the fixed v5 test rows must never be reused, and no dynamic/HCA result may be written as confirmatory until every precondition above is met.",
+  "evidence_level": "draft",
+  "evidence_policy": {
+    "level": "draft",
+    "explicit_rule": "A draft/exploratory result can never be promoted by a smaller p-value, a new endpoint, or a post-hoc arm. Promotion requires a new frozen manifest, a disjoint test source, complete seed coverage and the pre-test power gate.",
+    "v6_v11_status": "exploratory (selected on the same validation split used for analysis)",
+    "v12_fixed_chunk_status": "confirmatory only for confirmation_frozen.json, not this file",
+    "new_comparison_rule": "Every new comparison must name hypothesis_id, endpoint, evidence_level, expected_sign and its dedicated control before any GPU run."
+  },
+  "hypotheses": {
+    "H1_segmentation_quality": {
+      "statement": "Dynamic boundaries improve segmentation quality: at matched token, parameter and read budgets, dynamic cuts align with reference boundaries more often than fixed cuts, and the gain survives when both arms use the same (random) block selector.",
+      "mechanism": "Cosine low-similarity transitions place cuts between units that should not be compressed together, reducing cross-boundary compression error.",
+      "predicted_sign": 1,
+      "primary_metric": "f1",
+      "metric_policy": "boundary_alignment",
+      "endpoint": "boundary_f1.tol1@L4096",
+      "requires_param_match": true,
+      "falsifier": "Dynamic cuts do not beat fixed cuts on matched-length boundary F1 after Holm correction, or the gain disappears in the random-vs-random segmentation-only contrast.",
+      "evidence_level": "draft"
+    },
+    "H2_retrieval_precision": {
+      "statement": "At the same top-k read budget, learned selection over dynamic blocks retrieves the answer-bearing block more often than a seeded random selector over the same dynamic blocks, and its retrieval advantage is not explained by extra parameters or read slots.",
+      "mechanism": "Query-conditioned indexer scores identify the dynamic block that contains the far key/value instead of spending the budget on arbitrary blocks.",
+      "predicted_sign": 1,
+      "primary_metric": "top1_accuracy",
+      "metric_policy": "niah_retrieval",
+      "endpoint": "niah.top1_accuracy@L4096",
+      "requires_param_match": true,
+      "falsifier": "The seeded random selector matches or beats learned selection on the NIAH/selection endpoint after Holm correction, or the contrast is within seed noise.",
+      "evidence_level": "draft"
+    },
+    "H3_long_range_coverage": {
+      "statement": "Dynamic blocking improves long-range coverage: at matched token, parameter and read budgets it lowers L4096 PPL versus a read-matched fixed blocking arm, not merely versus dense attention.",
+      "mechanism": "Adaptive cuts avoid diluting a fixed read budget over irrelevant fixed-length blocks, so more of the selected budget carries content needed at long range.",
+      "predicted_sign": -1,
+      "primary_metric": "ppl",
+      "metric_policy": "lm_perplexity",
+      "endpoint": "by_len.ppl@4096",
+      "requires_param_match": true,
+      "falsifier": "The read-matched fixed arm matches or beats the dynamic arm after Holm correction, or the L4096 gain reverses at L512.",
+      "evidence_level": "draft"
+    },
+    "H4_task_policy": {
+      "statement": "The LM-trained boundary policy lowers L4096 PPL versus the cosine threshold + compression-regularizer-only policy at the same read budget.",
+      "mechanism": "The LM objective can trade compression against language-modelling loss directly, whereas the cosine threshold optimizes a segmentation surrogate.",
+      "predicted_sign": -1,
+      "primary_metric": "ppl",
+      "metric_policy": "lm_perplexity",
+      "endpoint": "by_len.ppl@4096",
+      "requires_param_match": true,
+      "falsifier": "The task-trained policy matches or loses to the cosine policy after Holm correction, or its seed variance makes the panel unusable.",
+      "evidence_level": "draft"
+    },
+    "H5_hca_hierarchy": {
+      "statement": "Alternating dynamic CSA and HCA layers lowers L4096 PPL versus dynamic CSA only at matched training tokens and parameters.",
+      "mechanism": "Local HCA layers and sparse dynamic CSA layers cover complementary short- and long-range structure.",
+      "predicted_sign": -1,
+      "primary_metric": "ppl",
+      "metric_policy": "lm_perplexity",
+      "endpoint": "by_len.ppl@4096",
+      "requires_param_match": true,
+      "falsifier": "The hybrid matches or loses to CSA-only after Holm correction, or the contrast is confounded by HCA reading every closed block.",
+      "evidence_level": "draft"
+    }
+  },
+  "budget_controls": {
+    "token_budget": {
+      "rule": "all arms consume steps*bs*seq_len = 3000*12*512 = 18,432,000 tokens from the same 8M-token cache and data order",
+      "consumed_tokens": 18432000,
+      "train_cache_tokens": 8000000,
+      "same_recipe": true,
+      "early_stop_forbidden": true
+    },
+    "parameter_proxy": {
+      "arms": [
+        "full_rope",
+        "full_rope_sink"
+      ],
+      "rule": "full_rope matches csa_fixed_rope total parameters; full_rope_sink subtracts only the 48 sink parameters",
+      "mr": {
+        "full_rope": 6.76348876953125,
+        "full_rope_sink": 6.763427734375
+      },
+      "not_compute_matched": "parameter matching reallocates MLP width; it does NOT match FLOPs or attention reads"
+    },
+    "token_matched_arm": {
+      "arm": "csa_fixed_rope",
+      "rule": "the fixed reference consumes the same 18.4M tokens as every dynamic arm",
+      "check": "token budget equality is verified by comparison_budget_ledger before any run"
+    },
+    "read_budget": {
+      "fixed_learned": {
+        "arm": "csa_fixed_rope",
+        "block_size": 4,
+        "topk": 32
+      },
+      "fixed_random": {
+        "arm": "csa_fixed_rope_randidx_seeded",
+        "block_size": 4,
+        "topk": 32
+      },
+      "fixed_read_matched_candidate": {
+        "arm": "csa_fixed_rope_topk32",
+        "block_size": 4,
+        "topk": 32
+      },
+      "dynamic_learned": {
+        "arm": "csa_dynamic_rope",
+        "target_block_tokens": 4,
+        "topk": 32
+      },
+      "dynamic_random": {
+        "arm": "csa_dynamic_rope_randidx_seeded",
+        "target_block_tokens": 4,
+        "topk": 32
+      },
+      "read_rich_allblocks": {
+        "arm": "csa_fixed_rope_allblocks",
+        "topk": 1000000,
+        "not_matched": true
+      },
+      "require_read_matched_for_claim": true,
+      "calibration": {
+        "status": "required_before_freeze",
+        "source": "measured realized mean dynamic block length on the validation split",
+        "rule": "k_fixed = round(topk_dynamic * mean_dynamic_block_tokens / fixed_block_size); train the concrete csa_fixed_rope_topk{k_fixed} arm and record the measurement in this manifest before freezing",
+        "must_not_guess": true,
+        "analytic_proxy_only_until_measured": true
+      }
+    },
+    "selection_control": {
+      "pairs": [
+        [
+          "csa_fixed_rope",
+          "csa_fixed_rope_randidx_seeded"
+        ],
+        [
+          "csa_dynamic_rope",
+          "csa_dynamic_rope_randidx_seeded"
+        ]
+      ],
+      "purpose": "separate learned selection from boundary policy inside each blocking mode; both arms use the same number of read blocks"
+    },
+    "segmentation_control": {
+      "pair": [
+        "csa_fixed_rope_randidx_seeded",
+        "csa_dynamic_rope_randidx_seeded"
+      ],
+      "purpose": "hold the selector random in BOTH arms so fixed-vs-dynamic isolates the boundary mechanism instead of boundary + learned selection",
+      "same_selection_mode": true
+    },
+    "hca_control": {
+      "pair": [
+        "csa_dynamic_rope",
+        "hybrid_dynamic_rope"
+      ],
+      "read_budget_matched": false,
+      "purpose": "HCA reads every closed block, so this is a system-level hierarchy readout, not an equal-read mechanism control",
+      "claim_scope": "system-level only; never a boundary/selection mechanism claim"
+    },
+    "dedicated_control_rule": "a mechanism claim is allowed only with matched tokens, matched parameters and a matched/read-calibrated budget plus one of the dedicated controls above; \"vs dense\" alone is never sufficient"
+  }
 }

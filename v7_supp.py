@@ -747,6 +747,36 @@ def make_layer_cfgs_v7(n_layers, variant):
         return [AttnCfgRope(kind='csa', dynamic=False, block_size=4, overlap=OVERLAP, index_topk=1000000, rope=True, rope_dim=16, qk_norm=True) for _ in range(n_layers)]
     if variant == 'csa_dynamic_rope':
         return [AttnCfgRope(kind='csa', dynamic=True, chunking='cosine_learnable', target_block_tokens=4, overlap=OVERLAP, index_topk=32, temperature=0.1, rope=True, rope_dim=16, qk_norm=True) for _ in range(n_layers)]
+    if variant == 'csa_dynamic_rope_randidx_seeded':
+        # Dynamic-blocking selection control: the cut policy and the read
+        # budget are identical to `csa_dynamic_rope`; only the top-k block
+        # selection is a per-(seed, layer) pseudo-random draw.  Fixed-vs-
+        # dynamic under BOTH random selectors therefore isolates the boundary
+        # (segmentation) mechanism from learned selection.
+        return [AttnCfgRope(kind='csa', dynamic=True, chunking='cosine_learnable', target_block_tokens=4, overlap=OVERLAP, index_topk=32, temperature=0.1, indexer_mode='random', random_salt=_indexer_salt(i), rope=True, rope_dim=16, qk_norm=True) for i in range(n_layers)]
+    if variant == 'csa_dynamic_rope_task':
+        # Task-learned boundary policy, rope-consistent with the other dynamic
+        # arms.  The non-rope `csa_dynamic_task` must never be compared with
+        # rope arms: positional encoding would be a second factor.
+        return [AttnCfgRope(kind='csa', dynamic=True, chunking='cosine_learnable', target_block_tokens=4, overlap=OVERLAP, index_topk=32, temperature=0.1, boundary_policy='reinforce', rope=True, rope_dim=16, qk_norm=True) for _ in range(n_layers)]
+    if variant == 'hybrid_dynamic_rope':
+        # HCA reads every closed block, so this arm is an information-rich
+        # system-level comparison, not an equal-read-budget control.
+        out = []
+        for i in range(n_layers):
+            if i % 2 == 0:
+                out.append(AttnCfgRope(kind='csa', dynamic=True, chunking='cosine_learnable', target_block_tokens=4, overlap=OVERLAP, index_topk=32, temperature=0.1, rope=True, rope_dim=16, qk_norm=True))
+            else:
+                out.append(AttnCfgRope(kind='hca', dynamic=True, chunking='cosine_learnable', target_block_tokens=64, block_size=64, temperature=0.1, comp_lambda_mult=4.0, rope=True, rope_dim=16, qk_norm=True))
+        return out
+    if variant.startswith('csa_fixed_rope_topk'):
+        # Read-budget-matched fixed control for the dynamic study.  The
+        # concrete k is frozen only after the realized mean dynamic block
+        # length is measured on validation (see confirmation_frozen_dynamic).
+        _k = int(variant.replace('csa_fixed_rope_topk', ''))
+        if _k < 1:
+            raise ValueError(f'{variant}: top-k must be >= 1, got {_k}')
+        return [AttnCfgRope(kind='csa', dynamic=False, block_size=4, overlap=OVERLAP, index_topk=_k, rope=True, rope_dim=16, qk_norm=True) for _ in range(n_layers)]
     if variant == 'hybrid_fixed_rope':
         out = []
         for i in range(n_layers):

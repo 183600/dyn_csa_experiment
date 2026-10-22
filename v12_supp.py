@@ -34,8 +34,10 @@
 
 模式：
   python v12_supp.py smoke            # 端到端自检（微型 ckpt + 冻结清单副本）
-  python v12_supp.py plan             # 零 GPU 预检：戳/实现绑定/准入/功效，不读 test；
+  python v12_supp.py plan             # 零 GPU 预检：戳/实现绑定/准入/功效/预算台账/证据等级，不读 test；
                                       # 通过后自动把快照留档到 analysis_v12/plan_snapshot.json
+  python v12_supp.py dynamic-plan     # 零 GPU 预检动态/HCA 草稿：假设、专用对照、token/参数/读取预算、
+                                      # disjoint-source/校准/功效前置；通过也只说明设计自洽，不是确认
   python v12_supp.py power            # 零 GPU：用 P5C validation 差值做精确条件功效（同样不读 test）
   python v12_supp.py full             # P5C -> P5H -> P5PW -> P5T -> P5MP -> P5S2/P5S3 -> report
   python v12_supp.py auto             # 无人值守：与 full 同链，但把「plan 预检通过」的
@@ -2893,10 +2895,33 @@ def plan_check(manifest_path=FREEZE_MANIFEST):
                                          'single_factor': _sf,
                                          'mechanism_claim_allowed': _flag,
                                          'claim_flag_consistent': (_flag is not True) or _sf}
+    # ---- design preflight: budgets + evidence level (zero GPU) ----------
+    # Single-factor / parameter / objective checks above answer "is the
+    # attention cfg the only declared factor?".  They do NOT answer "do the
+    # arms share a token and read/compute budget?" or "is this manifest allowed
+    # to call the result confirmatory?".  Both are design questions and must
+    # refuse the plan before any GPU spend or test access.
+    _design = {}
+    try:
+        _ledger = L.comparison_budget_ledger(m)
+        _ev = L.evidence_level_audit(m, manifest_path=manifest_path, panel_paths=[])
+        _design = {'budget_ledger': _ledger, 'evidence_level': _ev}
+        if _ledger.get('status') == 'fail':
+            errs.extend(f'budget ledger: {v}' for v in (_ledger.get('violations') or []))
+        if _ev.get('status') == 'fail':
+            errs.extend(f'evidence level: {v}' for v in (_ev.get('violations') or []))
+        notes.extend(f'budget ledger: {w}' for w in (_ledger.get('warnings') or []))
+        notes.extend(f'evidence level: {w}' for w in (_ev.get('warnings') or []))
+    except Exception as _e:
+        errs.append(
+            f'the design preflight could not run ({type(_e).__name__}: {_e}); a '
+            'confirmation needs a verifiable token/parameter/read-budget ledger '
+            'and evidence-level declaration')
     report = {'ok': not errs, 'manifest': manifest_path, 'manifest_sha256': m.get('manifest_sha256'),
               'code_semantics': L.CODE_SEMANTICS, 'n_arms': len(arms), 'n_seeds': len(seeds),
               'n_min_for_confirmation': _n_min, 'min_attainable_p_holm': _min_holm,
               'predicted': _pred, 'admitted': len(admitted), 'comparisons': _comp_report,
+              'design_preflight': _design,
               'errors': errs, 'notes': notes}
     if errs:
         print('[v12 plan] REFUSED — the frozen plan is not runnable end-to-end:')
@@ -2915,6 +2940,62 @@ def plan_check(manifest_path=FREEZE_MANIFEST):
 
 def run_plan(manifest_path=FREEZE_MANIFEST):
     return plan_check(manifest_path)
+
+
+DYNAMIC_MANIFEST = 'confirmation_frozen_dynamic.json'
+
+def dynamic_plan_check(manifest_path=DYNAMIC_MANIFEST):
+    """Zero-GPU design preflight for the DYNAMIC/HCA draft.
+
+    Deliberately does NOT call `_load_manifest`: that loader refuses
+    `status=draft`, which is exactly the state a design record must be in
+    before its disjoint test source and power gate exist.  This check audits
+    the draft as a DESIGN (hypotheses + dedicated controls + budget ledger +
+    evidence level) and prints why it is not runnable yet.  Passing it never
+    upgrades the draft to a confirmation.
+    """
+    if not os.path.exists(manifest_path):
+        raise SystemExit(
+            f'[v12 dynamic-plan] REFUSE: no dynamic design record at '
+            f'{manifest_path!r}; write the hypotheses and dedicated controls '
+            'before adding dynamic/HCA arms')
+    try:
+        with open(manifest_path, encoding='utf-8') as _f:
+            m = json.load(_f)
+    except Exception as _e:
+        raise SystemExit(
+            f'[v12 dynamic-plan] REFUSE: {manifest_path} is not readable JSON '
+            f'({type(_e).__name__}: {_e})') from None
+    d = L.dynamic_design_audit(m, manifest_path=manifest_path)
+    led = L.comparison_budget_ledger(m)
+    ev = L.evidence_level_audit(m, manifest_path=manifest_path, panel_paths=[])
+    errs = list(d.get('violations') or []) + list(led.get('violations') or []) \
+        + list(ev.get('violations') or [])
+    report = {'ok': not errs, 'manifest': manifest_path,
+              'declared_status': m.get('status'),
+              'evidence_level': ev.get('manifest_level'),
+              'runnable': d.get('runnable'),
+              'promotion_ready': d.get('promotion_ready'),
+              'design': d, 'budget_ledger': led, 'evidence_level_audit': ev,
+              'errors': errs}
+    if errs:
+        print('[v12 dynamic-plan] REFUSED — the dynamic design is not coherent:')
+        for _e in errs:
+            print(f'  - {_e}')
+        raise SystemExit(
+            '[v12 dynamic-plan] FAILED: fix the dynamic design BEFORE any '
+            'dynamic/HCA training or any disjoint-test access')
+    print(f"[v12 dynamic-plan] OK: design coherent; evidence_level={ev.get('manifest_level')}; "
+          f"hypotheses={sorted(d.get('hypotheses') or {})}; "
+          f"runnable={d.get('runnable')}; promotion_ready={d.get('promotion_ready')}")
+    for _w in (d.get('warnings') or []) + (led.get('warnings') or []) + (ev.get('warnings') or []):
+        print(f'  [dynamic-plan][note] {_w}')
+    if not d.get('promotion_ready'):
+        print('  [dynamic-plan] DRAFT: this is a design record, NOT a confirmation. '
+              'Reserve a disjoint test source, measure the realized dynamic block '
+              'length to calibrate the read-matched fixed top-k, and pass the '
+              'pre-test power gate before freezing.')
+    return report
 
 
 def run_smoke():
@@ -2964,7 +3045,7 @@ if __name__ == '__main__':
         sys.stdout.reconfigure(line_buffering=True)
     except Exception:
         pass
-    _MODES = ('full', 'smoke', 'plan', 'analysis', 'report', 'phase', 'finaltest', 'power', 'auto')
+    _MODES = ('full', 'smoke', 'plan', 'dynamic-plan', 'analysis', 'report', 'phase', 'finaltest', 'power', 'auto')
     if mode in ('-h', '--help', 'help'):
         print(__doc__)
         raise SystemExit(0)
@@ -2980,6 +3061,8 @@ if __name__ == '__main__':
             run_smoke()
         elif mode == 'plan':
             run_plan(sys.argv[2] if len(sys.argv) > 2 else FREEZE_MANIFEST)
+        elif mode == 'dynamic-plan':
+            dynamic_plan_check(sys.argv[2] if len(sys.argv) > 2 else DYNAMIC_MANIFEST)
         elif mode == 'analysis':
             v12_analysis()
         elif mode == 'report':

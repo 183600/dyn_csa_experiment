@@ -14076,6 +14076,1000 @@ def open_block_matrix_audit(factory=None, *, n_layers=6, verbose=True):
             print(f"[open-block-matrix] OK: {len(report['pairs'])} intra-matrix contrast(s) vary only on the declared axes")
     return report
 
+# ---------------------------------------------------------------------------
+# 设计前馈（design preflight）：预算台账 / 证据等级 / 动态分块假设
+# ---------------------------------------------------------------------------
+# 这一层只做**零 GPU 的设计核验**，不读任何 test 数据：
+#   * `comparison_budget_ledger` 把「同 token、同参数、同读取预算」从散文
+#     声明变成逐臂可复算的台账；它回答的是「这条对照到底控制了哪些预算」，
+#     而不是「结果显著吗」。
+#   * `evidence_level_audit` 把探索/确认等级写进机器可检查的字段：v6-v11
+#     这些在同一 validation split 上选择/比较出来的结果永远是 exploratory；
+#     draft 清单永远不能产出 confirmatory 主张。
+#   * `dynamic_design_audit` 要求动态分块研究先写清假设（切分质量、检索
+#     精度、长程覆盖）和专用对照（随机选择臂、参数代理臂、读取预算匹配
+#     臂），再允许冻结。
+# 这些函数在 exp_lib 内定义，供 audit_gates/v12_supp 共同复用；不依赖任何
+# 结果目录，因而可以在训练前、test 访问前运行。
+EVIDENCE_LEVELS = {
+    'confirmatory': {
+        'definition': ('frozen pre-registered comparison evaluated once on a held-out '
+                       'endpoint never used for selection'),
+        'requirements': ('frozen manifest', 'pre-test power gate passed',
+                         'complete frozen seed coverage', 'frozen endpoint',
+                         'no post-hoc arm/seed/endpoint change'),
+        'may_use_words': ('confirmed', 'confirmatory', '确认性'),
+    },
+    'exploratory': {
+        'definition': ('comparison selected, tuned or observed on the same validation '
+                       'split used for analysis; not licensed for confirmation'),
+        'requirements': ('declared hypothesis', 'effect size and uncertainty reported',
+                         'explicit exploratory label next to every quote'),
+        'may_use_words': ('exploratory', 'candidate', '探索性'),
+    },
+    'descriptive': {
+        'definition': ('secondary/diagnostic readout that does not enter any '
+                       'inferential claim family'),
+        'requirements': ('named as descriptive', 'never folded into Holm family'),
+        'may_use_words': ('descriptive', 'diagnostic', '描述性'),
+    },
+    'draft': {
+        'definition': ('design record; not runnable and not a pre-registration'),
+        'requirements': ('hypotheses and dedicated controls declared',
+                         'disjoint test source reserved', 'power gate defined'),
+        'may_use_words': ('draft', '设计稿', '未冻结'),
+    },
+}
+# Explicit registry of panels whose selection/reporting happened on the same
+# validation split.  A result directory here can never be re-labelled
+# confirmatory by editing a summary: the registry is code, and the audit fails
+# when a panel declares `confirmatory` while sitting in this set.
+EXPLORATORY_PANEL_REGISTRY = {
+    'results_lm_v3_1500': 'v6 core table (9 variants, 1500 steps)',
+    'results_lm_v3_long': 'v6 long-run table',
+    'results_lm_v4_abl': 'v6 leave-one-out ablation table',
+    'results_lm_v5_scale': 'v6 d=384/8L scale probe',
+    'results_lm_v7_rope': 'v7 RoPE+QK-norm panel',
+    'results_lm_v7_seq2k': 'v7 seq-2048 panel',
+    'results_lm_v7_warmup': 'v7 dense-warmup panel',
+    'results_lm_v7_long40': 'v7 40k-step long panel',
+    'results_lm_v8_rope20k': 'v8 RoPE 20k panel',
+    'results_lm_v9_seq2k': 'v9 seq-2048 topk panel',
+    'results_v10_mech': 'v10 mechanism/probe panel',
+    'results_lm_v10_scale_s': 'v10 scale small arm',
+    'results_lm_v10_scale_l': 'v10 scale large arm',
+    'results_lm_v10_scale_l8k': 'v10 token-matched large arm',
+    'results_lm_v10_scale_lflop': 'v10 compute-proxy large arm',
+    'results_open_block': 'open-block panel',
+    'results_open_block_aux': 'open-block auxiliary panel',
+    'results_open_block_extended': 'open-block extended panel',
+}
+
+
+def _evidence_manifest_path(manifest_path):
+    if manifest_path is None:
+        return None
+    return os.path.abspath(str(manifest_path))
+
+
+def evidence_level_audit(manifest, *, manifest_path=None, panel_paths=None):
+    """Zero-GPU evidence-level discipline audit.
+
+    The project's claim ladder is: `confirmatory` > `exploratory` >
+    `descriptive`/`draft`.  A result that was selected on the same validation
+    split as its reported comparison is exploratory by construction, no matter
+    how small its p-value is.  This audit checks:
+
+      * a manifest/comparison declares a known evidence level;
+      * `status=draft` (or `frozen_at=null`) can never carry a `confirmatory`
+        comparison;
+      * a confirmatory manifest must actually declare its protection:
+        pre-test power gate, complete coverage, frozen scope and endpoint;
+      * a summary inside `EXPLORATORY_PANEL_REGISTRY` cannot claim
+        confirmatory status;
+      * every comparison carries a level or inherits a defensible one.
+
+    Returns a report with `status` ('ok'/'fail'/'not_verifiable_locally'),
+    `violations`, `warnings`, per-comparison levels and the effective manifest
+    level.  It never mutates the manifest.
+    """
+    out = {'status': 'ok', 'manifest': _evidence_manifest_path(manifest_path),
+           'manifest_level': None, 'comparisons': {}, 'panels': {},
+           'violations': [], 'warnings': [], 'levels': dict(EVIDENCE_LEVELS)}
+    if not isinstance(manifest, dict):
+        out['status'] = 'fail'
+        out['violations'].append(
+            f'manifest must be an object, got {type(manifest).__name__}')
+        return out
+    _status = str(manifest.get('status') or '').strip().lower()
+    _frozen_at = manifest.get('frozen_at')
+    _declared = str(manifest.get('evidence_level') or '').strip().lower()
+    if _declared and _declared not in EVIDENCE_LEVELS:
+        out['violations'].append(
+            f'manifest evidence_level={_declared!r} is not one of {sorted(EVIDENCE_LEVELS)}')
+        _declared = ''
+    if not _declared:
+        if _status == 'draft' or _frozen_at in (None, ''):
+            _declared = 'draft'
+        elif os.path.basename(out['manifest'] or '') == 'confirmation_frozen_dynamic.json':
+            _declared = 'draft'
+        elif os.path.basename(out['manifest'] or '') == 'confirmation_frozen.json':
+            _declared = 'confirmatory'
+        else:
+            _declared = 'exploratory'
+    # A draft manifest is a design record, not a pre-registration.
+    if (_status == 'draft' or _frozen_at in (None, '')) and _declared == 'confirmatory':
+        out['violations'].append(
+            'a manifest with status=draft / frozen_at=null cannot declare '
+            'evidence_level=confirmatory; a draft is a design record, not a '
+            'pre-registration')
+        _declared = 'draft'
+    out['manifest_level'] = _declared
+    _stat = manifest.get('statistics') if isinstance(manifest.get('statistics'), dict) else {}
+    _scope = manifest.get('scope') if isinstance(manifest.get('scope'), dict) else {}
+    _confirm_ready = True
+    _why = []
+    if _declared == 'confirmatory':
+        if _stat.get('require_power_gate') is not True:
+            _confirm_ready = False
+            _why.append('statistics.require_power_gate is not true')
+        if _stat.get('require_complete_coverage') is not True:
+            _confirm_ready = False
+            _why.append('statistics.require_complete_coverage is not true')
+        if not (_scope.get('confirmatory_claims') or '').strip():
+            _confirm_ready = False
+            _why.append('scope.confirmatory_claims is empty')
+        if not str(manifest.get('frozen_at') or '').strip():
+            _confirm_ready = False
+            _why.append('frozen_at is empty')
+        if _confirm_ready is False:
+            out['violations'].append(
+                'manifest declares confirmatory but lacks the protection fields: '
+                + '; '.join(_why))
+    # Comparison-level declarations.
+    comps = manifest.get('primary_comparisons')
+    if not isinstance(comps, list) or not comps:
+        out['violations'].append('primary_comparisons must be a non-empty list')
+        comps = []
+    for i, comp in enumerate(comps):
+        if not isinstance(comp, dict):
+            out['violations'].append(f'primary comparison #{i} is not an object')
+            continue
+        _name = str(comp.get('name') or f'#{i}')
+        _lvl = str(comp.get('evidence_level') or _declared).strip().lower()
+        if _lvl not in EVIDENCE_LEVELS:
+            out['violations'].append(
+                f'{_name}: evidence_level={_lvl!r} is not one of {sorted(EVIDENCE_LEVELS)}')
+            _lvl = _declared
+        if _lvl == 'confirmatory' and _declared != 'confirmatory':
+            out['violations'].append(
+                f'{_name}: comparison is labelled confirmatory but the manifest '
+                f'level is {_declared!r}; confirmation cannot be established by a '
+                'single comparison label')
+        if _lvl == 'confirmatory' and _status == 'draft':
+            out['violations'].append(
+                f'{_name}: draft manifest cannot contain a confirmatory comparison')
+        _mech = comp.get('mechanism_claim_allowed')
+        if _mech is True and _lvl in ('draft', 'exploratory', 'descriptive'):
+            out['warnings'].append(
+                f'{_name}: mechanism_claim_allowed=true is a DESIGN target at '
+                f'evidence_level={_lvl}; it may not be quoted as established '
+                'evidence until the level is promoted by a frozen confirmation')
+        out['comparisons'][_name] = {
+            'a': comp.get('a'), 'b': comp.get('b'),
+            'endpoint': comp.get('endpoint'), 'evidence_level': _lvl,
+            'mechanism_claim_allowed': _mech,
+        }
+    # Existing result panels: registry membership is decisive.
+    _panels = list(panel_paths) if panel_paths is not None else list(EXPLORATORY_PANEL_REGISTRY)
+    for _p in _panels:
+        _p = str(_p)
+        _base = os.path.basename(os.path.normpath(_p))
+        _full = _p if os.path.isabs(_p) else os.path.join(os.path.dirname(os.path.abspath(__file__)), _p)
+        _summ = os.path.join(_full, 'summary.json')
+        _rec = {'registry_label': EXPLORATORY_PANEL_REGISTRY.get(_base),
+                'exists': os.path.isdir(_full), 'summary': _summ,
+                'declared_level': None, 'ok': None, 'reason': None}
+        if os.path.exists(_summ):
+            try:
+                with open(_summ, encoding='utf-8') as _f:
+                    _s = json.load(_f)
+            except Exception as _e:
+                _s = None
+                _rec['reason'] = f'summary is not readable JSON ({type(_e).__name__})'
+            if isinstance(_s, dict):
+                _lvl_raw = _s.get('evidence_level', _s.get('claim_level'))
+                if _lvl_raw is None:
+                    # `level` is a generic field in some artifacts; only use it
+                    # when its value is actually an evidence-level word, never
+                    # when it is a numeric training level or an unrelated label.
+                    _cand = _s.get('level')
+                    if isinstance(_cand, str) and _cand.strip().lower() in (
+                            set(EVIDENCE_LEVELS) | {'confirmed', 'confirmation'}):
+                        _lvl_raw = _cand
+                _rec['declared_level'] = _lvl_raw
+                _lvl = str(_rec['declared_level'] or '').strip().lower()
+                if _lvl in ('confirmatory', 'confirmed', 'confirmation'):
+                    _rec['ok'] = False
+                    _rec['reason'] = ('a panel selected on the same validation '
+                                      'split cannot declare confirmatory evidence')
+                    out['violations'].append(f'{_base}: {_rec["reason"]}')
+                elif _lvl and _lvl not in EVIDENCE_LEVELS:
+                    _rec['ok'] = False
+                    _rec['reason'] = f'unknown evidence level {_lvl!r}'
+                    out['violations'].append(f'{_base}: {_rec["reason"]}')
+                else:
+                    _rec['ok'] = True
+                    _rec['declared_level'] = _lvl or 'exploratory (registry default)'
+            elif _rec['reason'] is None:
+                _rec['ok'] = True
+                _rec['declared_level'] = 'exploratory (registry default)'
+        elif EXPLORATORY_PANEL_REGISTRY.get(_base):
+            _rec['ok'] = True
+            _rec['declared_level'] = 'exploratory (registry; no local summary)'
+        out['panels'][_base or _p] = _rec
+    if out['violations']:
+        out['status'] = 'fail'
+    return out
+
+
+def _ledger_factory():
+    """Arm factory for the ledger: v7's rope factory when available.
+
+    The dynamic study is rope-only (mixing rope and non-rope arms would add an
+    undeclared positional-encoding factor).  Importing v7 also installs the
+    matching SmallGPT factory, so the parameter counts below are the ones the
+    trainer actually builds.
+    """
+    try:
+        import v7_supp as _V7
+        return _V7.make_layer_cfgs_v7, 'v7_rope'
+    except Exception:
+        return make_layer_cfgs, 'base'
+
+
+def _ledger_read_budget(cfgs, seq_len):
+    """Analytic read-budget proxy for one arm at one sequence length.
+
+    The unit is a token read by a query.  For full attention every query reads
+    T tokens; HCA reads every closed block (T tokens up to the current
+    position); CSA reads `min(index_topk, n_blocks)` blocks.  Dynamic block
+    lengths are data-dependent, so a dynamic arm's token read is an ESTIMATE
+    from `target_block_tokens` and is flagged as such.
+    """
+    T = max(int(seq_len), 1)
+    layers = []
+    for cfg in cfgs:
+        kind = str(getattr(cfg, 'kind', 'full') or 'full')
+        dyn = bool(getattr(cfg, 'dynamic', False))
+        if kind == 'full':
+            unit = T
+            n_blocks = 1
+            k = 1
+            # A windowed dense arm (`full_sw128_matched`) reads only its
+            # window; treating it as full attention would overstate its read
+            # budget in a future scale/baseline ledger.
+            _win = int(getattr(cfg, 'window', 0) or 0)
+            selected = min(T, _win) if _win > 0 else T
+            overlap = 0
+            estimate = False
+        elif kind == 'hca':
+            unit = max(int(getattr(cfg, 'block_size', 64) or 64), 1)
+            n_blocks = int(math.ceil(T / float(unit)))
+            k = n_blocks
+            selected = min(T, n_blocks * unit)
+            overlap = int(getattr(cfg, 'overlap', 0) or 0)
+            estimate = dyn
+        else:
+            unit = (max(int(getattr(cfg, 'target_block_tokens', 1) or 1), 1)
+                    if dyn else max(int(getattr(cfg, 'block_size', 4) or 4), 1))
+            n_blocks = int(math.ceil(T / float(unit)))
+            _topk = int(getattr(cfg, 'index_topk', 0) or 0)
+            k = min(_topk, n_blocks) if _topk > 0 else n_blocks
+            selected = k * unit
+            # The local window is additive, not part of the selected blocks.
+            overlap = int(getattr(cfg, 'sliding_window', 0) or getattr(cfg, 'overlap', 0) or 0)
+            estimate = dyn
+        layers.append({
+            'kind': kind, 'dynamic': dyn, 'block_unit_tokens': unit,
+            'n_blocks_available': n_blocks, 'blocks_read': k,
+            'selected_block_tokens': selected,
+            'local_window_tokens': overlap,
+            'tokens_read_per_query': min(T, selected + (0 if kind == 'full' else overlap)),
+            'read_fraction': min(1.0, (selected + (0 if kind == 'full' else overlap)) / float(T)),
+            'read_budget_is_estimate': estimate,
+        })
+    n = max(len(layers), 1)
+    mean_selected = sum(x['selected_block_tokens'] for x in layers) / float(n)
+    mean_tokens = sum(x['tokens_read_per_query'] for x in layers) / float(n)
+    mean_fraction = sum(x['read_fraction'] for x in layers) / float(n)
+    return {
+        'seq_len': T,
+        'n_layers': len(layers),
+        'blocks_read_per_query_mean': sum(x['blocks_read'] for x in layers) / float(n),
+        'selected_block_tokens_per_query_mean': mean_selected,
+        'selected_read_fraction_mean': mean_selected / float(T),
+        'tokens_read_per_query_mean': mean_tokens,
+        'read_fraction_mean': mean_fraction,
+        'read_budget_is_estimate': any(x['read_budget_is_estimate'] for x in layers),
+        'layers': layers,
+        'note': ('analytic proxy; dynamic block lengths are data-dependent, so '
+                 'a dynamic read budget must be calibrated on the realized '
+                 'segmentation before it can match a fixed arm'),
+    }
+
+
+def _ledger_arm_mr(manifest, arm, sig):
+    """Per-arm MLP ratio: explicit pin first, then the project matcher.
+
+    A missing pin is reported as unverifiable rather than silently assumed,
+    because a dense parameter-proxy arm that silently reverted to mr=4 would
+    stop being a parameter proxy.
+    """
+    binding = manifest.get('binding') if isinstance(manifest.get('binding'), dict) else {}
+    per_arm = binding.get('per_arm_recipe_signature') if isinstance(
+        binding.get('per_arm_recipe_signature'), dict) else {}
+    ent = per_arm.get(arm)
+    if isinstance(ent, dict) and ent.get('mr') is not None:
+        try:
+            return float(ent['mr']), 'frozen per-arm pin'
+        except (TypeError, ValueError, OverflowError):
+            return None, 'malformed per-arm mr'
+    ref = 'csa_fixed_rope' if 'csa_fixed_rope' in (manifest.get('arms') or []) else 'csa_dynamic'
+    try:
+        mr = variant_mlp_ratio(
+            arm, int(sig.get('v', 8192)), d=int(sig.get('d', 256)),
+            n_layers=int(sig.get('L', 6)), n_heads=int(sig.get('H', 8)),
+            d_head=int(sig.get('Dh', 32)), seq_len=int(sig.get('sl', 512)),
+            matched={arm}, ref_variant=ref)
+        return float(mr), 'computed by variant_mlp_ratio'
+    except Exception as _e:
+        return None, f'not computable ({type(_e).__name__}: {_e})'
+
+
+def comparison_budget_ledger(manifest, *, factory=None, seq_lens=(512, 4096),
+                             read_tolerance=0.10, param_tolerance=0.01,
+                             build_params=True):
+    """Zero-GPU token/parameter/read/compute budget ledger per comparison.
+
+    This is the design-time answer to "is the dense baseline and each CSA/HCA
+    arm controlled on the same token and compute/read budget?".  For every arm
+    it records the training-token budget, parameter total and analytic read
+    budget; for every declared comparison it reports which budgets match and
+    which dedicated control it actually is.  A `mechanism_claim_allowed=true`
+    comparison fails the audit when any of the following is not matched:
+
+      * training tokens (same steps x batch x sequence, same declared corpus
+        exposure);
+      * parameters (total within `param_tolerance`, plus no explicit
+        per-arm mismatch);
+      * read budget (analytic token reads within `read_tolerance`, or a
+        calibration artifact for a dynamic-vs-fixed pair);
+      * an identifiable dedicated control family (selection, segmentation,
+        task-policy, sink, or parameter-proxy) instead of only "vs dense".
+
+    The audit does not decide significance and never reads a result file.
+    """
+    for _name, _val in (('read_tolerance', read_tolerance),
+                        ('param_tolerance', param_tolerance)):
+        if isinstance(_val, (bool, np.bool_)):
+            raise ValueError(f'{_name} must be a finite non-negative number, got {_val!r}')
+        try:
+            _f = float(_val)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(f'{_name} must be a finite non-negative number, got {_val!r}') from None
+        if not math.isfinite(_f) or _f < 0.0:
+            raise ValueError(f'{_name} must be a finite non-negative number, got {_val!r}')
+    try:
+        _seq_lens = [int(x) for x in seq_lens]
+    except (TypeError, ValueError, OverflowError):
+        _seq_lens = []
+    out = {'status': 'ok', 'manifest': None, 'factory': None,
+           'seq_lens': (_seq_lens or [512]), 'arms': {}, 'comparisons': {},
+           'dedicated_controls': {'parameter_proxy_arms': [],
+                                  'read_matched_arms': [],
+                                  'selection_control_pairs': [],
+                                  'segmentation_control_pairs': [],
+                                  'task_policy_pairs': [],
+                                  'sink_control_pairs': [],
+                                  'information_rich_allblocks': []},
+           'violations': [], 'warnings': [], 'problems': [],
+           'policy': {'read_tolerance': float(read_tolerance),
+                      'param_tolerance': float(param_tolerance),
+                      'token_budget_rule': ('steps*bs*seq_len must equal the '
+                                            'declared n_train_tokens for every '
+                                            'arm; all arms must share it'),
+                      'claim_rule': ('a mechanism claim requires matched tokens, '
+                                     'matched parameters and a matched read '
+                                     'budget plus a dedicated control family'),
+                      'compute_rule': ('compute_6nd_matched uses params x consumed '
+                                       'tokens only; compute_proxy_matched also '
+                                       'requires the selected-read budget to match. '
+                                       'Neither is a measured FLOPs number'),
+                      'scale_note': ('every budget is parsed from the manifest '
+                                     'signature and normalized per token/query; '
+                                     'rerun the ledger for a new d/L/seq scale '
+                                     'instead of assuming the small-scale result '
+                                     'transfers')}}
+    if not isinstance(manifest, dict):
+        out['status'] = 'fail'
+        out['problems'].append(f'manifest must be an object, got {type(manifest).__name__}')
+        return out
+    arms = manifest.get('arms')
+    if not isinstance(arms, list) or not arms:
+        out['status'] = 'fail'
+        out['problems'].append('manifest.arms must be a non-empty list')
+        return out
+    arms = [str(a) for a in arms]
+    binding = manifest.get('binding') if isinstance(manifest.get('binding'), dict) else {}
+    sig = binding.get('training_recipe_signature')
+    if not isinstance(sig, dict):
+        sig = binding.get('training_recipe')
+    if not isinstance(sig, dict):
+        out['problems'].append('no training_recipe_signature in binding; the token budget is unverifiable')
+        sig = {}
+    try:
+        steps = int(sig.get('steps', 0) or 0)
+        bs = int(sig.get('bs', 0) or 0)
+        sl = int(sig.get('sl', 0) or 0)
+        nt = int(sig.get('nt', 0) or 0)
+    except (TypeError, ValueError, OverflowError):
+        steps = bs = sl = nt = 0
+    effective_tokens = steps * bs * sl
+    if steps <= 0 or bs <= 0 or sl <= 0:
+        out['problems'].append(
+            f'training recipe lacks a positive steps/bs/sl ({steps}, {bs}, {sl}); '
+            'the consumed token budget is unverifiable')
+    if nt <= 0:
+        out['problems'].append('training recipe lacks a positive n_train_tokens')
+    # `nt` in the frozen signature is the TRAIN-CACHE size (how many tokens
+    # the loader serves), not the number of tokens consumed by training.  The
+    # run consumes steps*bs*sl tokens over that cache (possibly several
+    # epochs).  Conflating the two would falsely reject the frozen plan, so the
+    # ledger records both and matches the CONSUMED budget across arms.
+    out['token_budget'] = {
+        'steps': steps, 'batch_size': bs, 'seq_len': sl,
+        'train_cache_tokens': nt,
+        'consumed_tokens': effective_tokens,
+        'shared_by_all_arms': bool(effective_tokens > 0),
+        'definitions': {
+            'train_cache_tokens': 'n_train_tokens in the recipe signature: the served train cache size',
+            'consumed_tokens': 'steps * batch_size * seq_len: tokens actually consumed by the run',
+            'epochs_over_cache': (effective_tokens / float(nt) if nt > 0 else None),
+        },
+    }
+
+    def _arm_token_budget(arm):
+        per_arm = (binding.get('per_arm_recipe_signature')
+                   if isinstance(binding.get('per_arm_recipe_signature'), dict) else {})
+        merged = dict(sig)
+        ent = per_arm.get(arm)
+        if isinstance(ent, dict):
+            for _k in ('steps', 'bs', 'sl', 'nt'):
+                if _k in ent:
+                    merged[_k] = ent[_k]
+        try:
+            return (int(merged.get('steps', 0) or 0) * int(merged.get('bs', 0) or 0)
+                    * int(merged.get('sl', 0) or 0), int(merged.get('nt', 0) or 0))
+        except (TypeError, ValueError, OverflowError):
+            return (0, 0)
+    _fac, _fac_name = (factory, getattr(factory, '__name__', repr(factory))) if factory is not None else _ledger_factory()
+    out['factory'] = _fac_name
+    cfgs_by_arm = {}
+    for arm in arms:
+        _consumed, _cache = _arm_token_budget(arm)
+        rec = {'variant': arm, 'mr': None, 'mr_source': None, 'params': None,
+               'token_budget': _consumed, 'train_cache_tokens': _cache,
+               'params_per_token': None, 'read_budget': {}, 'errors': []}
+        try:
+            cfgs = _fac(int(sig.get('L', 6)), arm)
+            cfgs_by_arm[arm] = cfgs
+        except Exception as _e:
+            rec['errors'].append(f'arm construction failed ({type(_e).__name__}: {_e})')
+            out['arms'][arm] = rec
+            continue
+        mr, mr_src = _ledger_arm_mr(manifest, arm, sig)
+        rec['mr'], rec['mr_source'] = mr, mr_src
+        if build_params:
+            if mr is None:
+                rec['errors'].append('MLP ratio is unpinned/uncomputable; parameter matching is unverifiable')
+            else:
+                try:
+                    _m = SmallGPT(int(sig.get('v', 8192)), int(sig.get('d', 256)),
+                                  int(sig.get('L', 6)), int(sig.get('H', 8)),
+                                  int(sig.get('Dh', 32)), int(sig.get('sl', 512)),
+                                  cfgs, mlp_ratio=mr)
+                    rec['params'] = int(count_params(_m))
+                    del _m
+                except Exception as _e:
+                    rec['errors'].append(
+                        f'parameter count failed ({type(_e).__name__}: {_e})')
+        if rec['params'] and rec['token_budget']:
+            rec['params_per_token'] = rec['params'] / float(rec['token_budget'])
+        for Ln in out['seq_lens']:
+            rec['read_budget'][str(Ln)] = _ledger_read_budget(cfgs, Ln)
+        out['arms'][arm] = rec
+        if rec['errors']:
+            out['warnings'].extend(f'{arm}: {e}' for e in rec['errors'])
+    _consumed = {rec.get('token_budget') for rec in out['arms'].values()
+                 if rec.get('token_budget')}
+    out['token_budget']['arm_consumed_tokens'] = {
+        a: rec.get('token_budget') for a, rec in out['arms'].items()}
+    out['token_budget']['shared_by_all_arms'] = bool(
+        len(_consumed) == 1 and next(iter(_consumed), 0) > 0)
+    if out['token_budget']['shared_by_all_arms'] is False:
+        out['problems'].append(
+            'arms do not share one consumed token budget '
+            f'({sorted(_consumed)}); token counts are a treatment, not a nuisance')
+    if out['token_budget']['shared_by_all_arms']:
+        out['token_budget']['consumed_tokens'] = next(iter(_consumed))
+    # Dedicated-control inventory from the arm names/configs themselves.
+    for arm, cfgs in cfgs_by_arm.items():
+        if any(int(getattr(c, 'index_topk', 0) or 0) >= 1000000 for c in cfgs):
+            out['dedicated_controls']['information_rich_allblocks'].append(arm)
+        if any(str(getattr(c, 'kind', '')) == 'full' for c in cfgs):
+            out['dedicated_controls']['parameter_proxy_arms'].append(arm)
+        if any(bool(getattr(c, 'dynamic', False)) for c in cfgs) and all(
+                str(getattr(c, 'indexer_mode', 'learned')) == 'random' for c in cfgs):
+            out['dedicated_controls']['read_matched_arms'].append(arm)
+    comps = manifest.get('primary_comparisons')
+    if not isinstance(comps, list) or not comps:
+        out['problems'].append('primary_comparisons must be a non-empty list')
+        comps = []
+    _ptol = float(param_tolerance)
+    _rtol = float(read_tolerance)
+    for i, comp in enumerate(comps):
+        if not isinstance(comp, dict):
+            out['problems'].append(f'primary comparison #{i} is not an object')
+            continue
+        name = str(comp.get('name') or f'#{i}')
+        a, b = str(comp.get('a') or ''), str(comp.get('b') or '')
+        entry = {'name': name, 'a': a, 'b': b, 'endpoint': comp.get('endpoint'),
+                 'mechanism_claim_allowed': comp.get('mechanism_claim_allowed'),
+                 'token_matched': None, 'param_matched': None,
+                 'param_rel_diff': None, 'read_matched': None,
+                 'read_ratio_max_min': None, 'compute_proxy_matched': None,
+                 'cfg_diff_keys': None, 'single_factor_cfg': None,
+                 'dedicated_control': None, 'dynamic_vs_fixed': False,
+                 'read_budget_calibration_required': False,
+                 'read_budget_calibration_present': bool(
+                     isinstance(comp.get('read_budget_calibration'), dict)
+                     and comp['read_budget_calibration']),
+                 'problems': [], 'warnings': []}
+        if a not in arms or b not in arms:
+            entry['problems'].append('comparison names arms outside manifest.arms')
+            out['comparisons'][name] = entry
+            continue
+        if a not in cfgs_by_arm or b not in cfgs_by_arm:
+            entry['problems'].append('at least one arm has no constructible config')
+            out['comparisons'][name] = entry
+            continue
+        # Token budget: compare the CONSUMED tokens of the two arms (and the
+        # served cache they draw from), not the cache size against the product.
+        _ta = out['arms'][a].get('token_budget') or 0
+        _tb = out['arms'][b].get('token_budget') or 0
+        _ca = out['arms'][a].get('train_cache_tokens') or 0
+        _cb = out['arms'][b].get('train_cache_tokens') or 0
+        entry['token_matched'] = bool(_ta > 0 and _ta == _tb and _ca == _cb)
+        entry['consumed_tokens'] = {a: _ta, b: _tb}
+        entry['train_cache_tokens'] = {a: _ca, b: _cb}
+        pa, pb = out['arms'][a].get('params'), out['arms'][b].get('params')
+        if pa and pb:
+            rel = abs(pa - pb) / float(max(pa, pb, 1))
+            entry['param_rel_diff'] = float(rel)
+            entry['param_matched'] = bool(rel <= _ptol)
+        else:
+            entry['param_matched'] = None
+            entry['problems'].append('parameter totals are unverifiable for this pair')
+        # Read budget at the evaluation length (default 4096): the length at
+        # which sparse-vs-dense read fractions diverge most.
+        _L = 4096 if 4096 in out['seq_lens'] else out['seq_lens'][-1]
+        ra = out['arms'][a]['read_budget'].get(str(_L)) or {}
+        rb = out['arms'][b]['read_budget'].get(str(_L)) or {}
+        # The SELECTED block-token budget is the variable read budget (the
+        # manifest's 32/1024 statement).  The local window is a separate,
+        # additive term present in the CSA arms; report it but do not let it
+        # hide the selected-budget mismatch (or manufacture a match).
+        ta = float(ra.get('selected_block_tokens_per_query_mean') or 0.0)
+        tb = float(rb.get('selected_block_tokens_per_query_mean') or 0.0)
+        if ta > 0 and tb > 0:
+            ratio = max(ta, tb) / min(ta, tb)
+            entry['read_ratio_max_min'] = float(ratio)
+            entry['read_matched'] = bool(abs(ratio - 1.0) <= _rtol)
+        else:
+            entry['read_matched'] = None
+        entry['selected_read_tokens_per_query'] = {a: ta, b: tb}
+        entry['read_tokens_including_local_window'] = {
+            a: float(ra.get('tokens_read_per_query_mean') or 0.0),
+            b: float(rb.get('tokens_read_per_query_mean') or 0.0)}
+        entry['local_window_tokens'] = {
+            a: [x.get('local_window_tokens') for x in (ra.get('layers') or [])],
+            b: [x.get('local_window_tokens') for x in (rb.get('layers') or [])]}
+        # 6ND (params x tokens) and the attention read budget are separate
+        # axes: two arms can match parameters and still read 32x differently.
+        entry['compute_6nd_matched'] = entry['param_matched']
+        entry['compute_proxy_matched'] = bool(
+            entry['param_matched'] is True and entry['read_matched'] is True)
+        # Config diff and the dedicated-control family.
+        try:
+            keys, _per_layer = _design_pair_cfg_keys(a, b, _fac, int(sig.get('L', 6)))
+        except Exception as _e:
+            keys = _e
+        if isinstance(keys, Exception):
+            entry['problems'].append(f'cfg diff failed ({type(keys).__name__}: {keys})')
+        else:
+            keys = set(keys)
+            entry['cfg_diff_keys'] = sorted(keys)
+            entry['single_factor_cfg'] = bool(cfg_keys_single_factor(keys))
+            _ca = cfgs_by_arm[a]
+            _cb = cfgs_by_arm[b]
+            _da = any(bool(getattr(c, 'dynamic', False)) for c in _ca)
+            _db = any(bool(getattr(c, 'dynamic', False)) for c in _cb)
+            entry['dynamic_vs_fixed'] = bool(_da != _db)
+            _mode_a = {str(getattr(c, 'indexer_mode', 'learned')) for c in _ca}
+            _mode_b = {str(getattr(c, 'indexer_mode', 'learned')) for c in _cb}
+            _same_mode = _mode_a == _mode_b
+            _allblocks = (a in out['dedicated_controls']['information_rich_allblocks']
+                          or b in out['dedicated_controls']['information_rich_allblocks'])
+            if _allblocks:
+                entry['dedicated_control'] = 'information_rich_allblocks_control'
+            elif keys <= {'indexer_mode', 'random_salt'}:
+                entry['dedicated_control'] = 'selection_control'
+                out['dedicated_controls']['selection_control_pairs'].append(name)
+            elif keys <= {'boundary_policy'}:
+                entry['dedicated_control'] = 'task_policy_control'
+                out['dedicated_controls']['task_policy_pairs'].append(name)
+            elif keys <= {'use_sink', 'full_sink'}:
+                entry['dedicated_control'] = 'sink_control'
+                out['dedicated_controls']['sink_control_pairs'].append(name)
+            elif (keys <= {'dynamic', 'chunking', 'target_block_tokens'}
+                  and _same_mode):
+                entry['dedicated_control'] = 'segmentation_control'
+                out['dedicated_controls']['segmentation_control_pairs'].append(name)
+            elif keys <= {'index_topk'}:
+                entry['dedicated_control'] = 'read_dose_control'
+            elif 'kind' in keys:
+                entry['dedicated_control'] = 'architecture_level_parameter_proxy'
+            else:
+                entry['dedicated_control'] = 'multi_factor/other'
+            if entry['dynamic_vs_fixed']:
+                # A dynamic-vs-fixed read budget depends on the realized mean
+                # block length.  A confirmatory mechanism claim needs that
+                # calibration, not an assumed target.
+                entry['read_budget_calibration_required'] = True
+                if (entry['mechanism_claim_allowed'] is True
+                        and not entry['read_budget_calibration_present']):
+                    entry['problems'].append(
+                        'dynamic-vs-fixed mechanism claim requires a '
+                        'read_budget_calibration artifact (measured realized '
+                        'mean block length -> matched fixed top-k/block size); '
+                        'the analytic target_block_tokens proxy is not enough')
+        claim = entry['mechanism_claim_allowed']
+        if claim is True:
+            if entry['token_matched'] is not True:
+                entry['problems'].append('mechanism claim but token budget is not matched')
+            if entry['param_matched'] is not True:
+                entry['problems'].append('mechanism claim but parameters are not matched (or unverifiable)')
+            if entry['read_matched'] is not True:
+                entry['problems'].append('mechanism claim but read budget is not matched within tolerance')
+            if entry['single_factor_cfg'] is not True:
+                entry['problems'].append('mechanism claim but the cfg diff is not a declared single-factor family')
+            if entry['dedicated_control'] in (None, 'multi_factor/other'):
+                entry['problems'].append('mechanism claim without an identifiable dedicated control family (selection/segmentation/task-policy/sink/parameter-proxy)')
+        if entry['problems']:
+            out['status'] = 'fail'
+            out['violations'].extend(f'{name}: {p}' for p in entry['problems'])
+        if entry['read_budget_calibration_required'] and not entry['read_budget_calibration_present']:
+            entry['warnings'].append(
+                'dynamic-vs-fixed read budget is an analytic proxy until '
+                'calibrated on realized block lengths; do not describe it as '
+                'read-budget matched')
+        out['comparisons'][name] = entry
+    if out['problems']:
+        out['status'] = 'fail'
+        out['violations'].extend(out['problems'])
+    return out
+
+
+def dynamic_design_audit(manifest, *, manifest_path=None):
+    """Zero-GPU hypothesis/control contract for the DYNAMIC chunking study.
+
+    A dynamic-vs-fixed PPL contrast alone cannot tell us *which* claim is true:
+    better boundaries (segmentation quality), better retrieval (selection
+    precision at a fixed read budget), or better long-range coverage (less
+    dilution at L4096).  This audit refuses a dynamic design that has not
+    declared those hypotheses separately and has not scheduled the dedicated
+    controls needed to attribute a gain:
+
+      * fixed vs dynamic at the SAME selection mode (random-vs-random isolates
+        segmentation from learned selection);
+      * a read-budget-matched fixed arm (calibrated top-k), not only vs dense;
+      * a parameter-proxy dense arm and a sink-matched dense arm;
+      * a selection control inside the dynamic arm;
+      * a task-learned-boundary arm, reported separately from the cosine
+        heuristic;
+      * a HCA comparison explicitly marked as system-level/unmatched-read.
+
+    It also enforces the evidence level: a draft can never be confirmatory;
+    promotion requires a disjoint test source, a measured read-budget
+    calibration and a pre-test power gate.
+    """
+    out = {'status': 'ok', 'manifest': _evidence_manifest_path(manifest_path),
+           'evidence_level': None, 'hypotheses': {}, 'controls': {},
+           'comparisons': {}, 'violations': [], 'warnings': [],
+           'runnable': False, 'promotion_ready': False}
+    if not isinstance(manifest, dict):
+        out['status'] = 'fail'
+        out['violations'].append(
+            f'manifest must be an object, got {type(manifest).__name__}')
+        return out
+    status = str(manifest.get('status') or '').strip().lower()
+    frozen_at = manifest.get('frozen_at')
+    level = str(manifest.get('evidence_level') or '').strip().lower()
+    if not level:
+        level = 'draft' if (status == 'draft' or frozen_at in (None, '')) else 'confirmatory'
+    out['evidence_level'] = level
+    if level == 'confirmatory' and (status == 'draft' or frozen_at in (None, '')):
+        out['violations'].append(
+            'dynamic design is draft/unfrozen but declares confirmatory; a '
+            'draft is not a pre-registration')
+    if level not in EVIDENCE_LEVELS:
+        out['violations'].append(f'unknown evidence_level {level!r}')
+    if status != 'draft' and level != 'confirmatory':
+        out['violations'].append(
+            f'a non-draft dynamic plan must declare evidence_level=confirmatory '
+            f'(got {level!r}); a frozen plan labelled exploratory cannot be used '
+            'to promote a claim')
+    arms = [str(a) for a in (manifest.get('arms') or []) if isinstance(a, str)]
+    if len(set(arms)) != len(arms):
+        out['violations'].append('arms contain duplicates')
+    arm_set = set(arms)
+    # ---- hypotheses -----------------------------------------------------
+    hyps = manifest.get('hypotheses')
+    if not isinstance(hyps, dict) or not hyps:
+        out['violations'].append(
+            'hypotheses must be a non-empty object: name the dynamic-vs-fixed '
+            'claims (segmentation quality / retrieval precision / long-range '
+            'coverage) before adding arms')
+        hyps = {}
+    required_hyp = ('H1_segmentation_quality', 'H2_retrieval_precision',
+                    'H3_long_range_coverage')
+    _all_hyp = list(required_hyp) + [h for h in hyps if h not in required_hyp]
+    for hid in _all_hyp:
+        h = hyps.get(hid)
+        if not isinstance(h, dict):
+            if hid in required_hyp:
+                out['violations'].append(
+                    f'missing required dynamic hypothesis {hid!r}; a dynamic arm '
+                    'must state which mechanism it is meant to test')
+            continue
+        _bad = []
+        for fld in ('statement', 'mechanism', 'falsifier', 'primary_metric',
+                    'metric_policy', 'endpoint'):
+            if not str(h.get(fld) or '').strip():
+                _bad.append(fld)
+        if h.get('predicted_sign') not in (-1, 1):
+            _bad.append('predicted_sign must be -1 or +1')
+        if h.get('metric_policy') not in METRIC_POLICY:
+            _bad.append(f'metric_policy {h.get("metric_policy")!r} is not in METRIC_POLICY')
+        if h.get('requires_param_match') is not True:
+            _bad.append('requires_param_match must be true for a budget-controlled claim')
+        if _bad:
+            out['violations'].append(f'{hid}: {", ".join(_bad)}')
+        out['hypotheses'][hid] = {k: h.get(k) for k in
+                                  ('statement', 'mechanism', 'predicted_sign',
+                                   'primary_metric', 'metric_policy', 'endpoint',
+                                   'requires_param_match', 'falsifier')}
+    # ---- dedicated control inventory -----------------------------------
+    controls = manifest.get('budget_controls')
+    if not isinstance(controls, dict) or not controls:
+        out['violations'].append(
+            'budget_controls must declare token/parameter/read/selection/'
+            'segmentation controls; "vs dense" alone cannot attribute a gain')
+        controls = {}
+    out['controls'] = controls
+    _need = {
+        'token_budget': ('token_budget',),
+        'parameter_proxy': ('parameter_proxy',),
+        'read_budget': ('read_budget',),
+        'selection_control': ('selection_control',),
+        'segmentation_control': ('segmentation_control',),
+        'hca_control': ('hca_control',),
+    }
+    for label, keys in _need.items():
+        if not any(isinstance(controls.get(k), dict) and controls.get(k) for k in keys):
+            out['violations'].append(
+                f'budget_controls.{label} is missing; every mechanism claim '
+                'needs a declared dedicated control, not only a dense baseline')
+    # Required arm roles (names are part of the design record).
+    _required_roles = {
+        'fixed reference (learned selection)': 'csa_fixed_rope',
+        'dynamic reference (learned selection)': 'csa_dynamic_rope',
+        'fixed random-selection control': 'csa_fixed_rope_randidx_seeded',
+        'dynamic random-selection control': 'csa_dynamic_rope_randidx_seeded',
+        'parameter-proxy dense reference': 'full_rope',
+        'sink-matched dense reference': 'full_rope_sink',
+        'read-rich all-block control': 'csa_fixed_rope_allblocks',
+        'read-budget-matched fixed candidate': 'csa_fixed_rope_topk32',
+        'task-learned boundary arm': 'csa_dynamic_rope_task',
+        'HCA dynamic arm': 'hybrid_dynamic_rope',
+    }
+    _topk_prefix = 'csa_fixed_rope_topk'
+    _has_topk_arm = any(a.startswith(_topk_prefix)
+                        and a[len(_topk_prefix):].isdigit()
+                        for a in arm_set)
+    for role, arm in _required_roles.items():
+        if role == 'read-budget-matched fixed candidate':
+            # Any concrete calibrated top-k is acceptable; freezing 32 before
+            # measuring the realized dynamic block length is exactly what the
+            # calibration precondition forbids.
+            if not _has_topk_arm:
+                out['violations'].append(
+                    f'missing {role} arm {_topk_prefix}{{k}}; a fixed arm whose '
+                    'top-k is calibrated from the measured dynamic block length '
+                    'is required, not only a dense baseline')
+            continue
+        if arm not in arm_set:
+            out['violations'].append(
+                f'missing {role} arm {arm!r}; the dynamic study needs this arm '
+                'to separate the claimed mechanism from budget/capacity effects')
+    # ---- comparisons ----------------------------------------------------
+    comps = manifest.get('primary_comparisons')
+    if not isinstance(comps, list) or not comps:
+        out['violations'].append('primary_comparisons must be a non-empty list')
+        comps = []
+    seen_pairs = set()
+    for i, comp in enumerate(comps):
+        if not isinstance(comp, dict):
+            out['violations'].append(f'primary comparison #{i} is not an object')
+            continue
+        name = str(comp.get('name') or f'#{i}')
+        a, b = comp.get('a'), comp.get('b')
+        ent = {'a': a, 'b': b, 'endpoint': comp.get('endpoint'),
+               'hypothesis_id': comp.get('hypothesis_id'),
+               'evidence_level': str(comp.get('evidence_level') or level).lower(),
+               'mechanism_claim_allowed': comp.get('mechanism_claim_allowed'),
+               'problems': []}
+        if a not in arm_set or b not in arm_set:
+            ent['problems'].append('names an arm outside manifest.arms')
+        if comp.get('hypothesis_id') not in out['hypotheses']:
+            ent['problems'].append(
+                'no declared hypothesis_id; every new comparison must map to a '
+                'pre-registered claim (H1/H2/H3) or be labelled descriptive')
+        if ent['evidence_level'] not in EVIDENCE_LEVELS:
+            ent['problems'].append(f'unknown evidence_level {ent["evidence_level"]!r}')
+        if ent['evidence_level'] == 'confirmatory' and level != 'confirmatory':
+            ent['problems'].append(
+                'comparison is confirmatory but the manifest is not; a draft '
+                'cannot promote a single comparison by label')
+        if not str(comp.get('endpoint') or '').strip():
+            ent['problems'].append('no endpoint')
+        # A mechanism claim must not ride on an all-block/dense arm only.
+        if comp.get('mechanism_claim_allowed') is True:
+            if str(a).endswith('allblocks') or str(b).endswith('allblocks'):
+                ent['problems'].append(
+                    'all-block arm is not read-budget matched; it cannot serve '
+                    'as the mechanism control')
+            if ent['evidence_level'] == 'draft':
+                ent['problems'].append(
+                    'draft cannot carry an enabled mechanism claim; mark it as '
+                    'a design target and clear it after calibration/freeze')
+        if ent['problems']:
+            out['violations'].extend(f'{name}: {p}' for p in ent['problems'])
+        seen_pairs.add(frozenset((a, b)))
+        out['comparisons'][name] = ent
+    # Required paired contrasts: segmentation-only and selection-only.
+    required_pairs = {
+        'segmentation-only (both random selection)':
+            frozenset(('csa_fixed_rope_randidx_seeded', 'csa_dynamic_rope_randidx_seeded')),
+        'selection-only inside dynamic blocking':
+            frozenset(('csa_dynamic_rope', 'csa_dynamic_rope_randidx_seeded')),
+        'parameter proxy vs dynamic':
+            frozenset(('full_rope', 'csa_dynamic_rope')),
+    }
+    for label, pair in required_pairs.items():
+        if pair not in seen_pairs:
+            out['violations'].append(
+                f'missing required contrast {label} ({sorted(pair)}); without '
+                'it the dynamic gain cannot be attributed to the declared mechanism')
+    # ---- statistics / power -------------------------------------------
+    stat = manifest.get('statistics') if isinstance(manifest.get('statistics'), dict) else {}
+    seeds = manifest.get('seeds') if isinstance(manifest.get('seeds'), list) else []
+    try:
+        nseeds = int(stat.get('n_seeds') or len(seeds))
+    except (TypeError, ValueError, OverflowError):
+        nseeds = 0
+    if nseeds != len(seeds):
+        out['violations'].append(
+            f'statistics.n_seeds={nseeds} does not equal len(seeds)={len(seeds)}')
+    mfam = len(comps)
+    alpha = stat.get('alpha', 0.05)
+    try:
+        alpha = float(alpha)
+    except (TypeError, ValueError, OverflowError):
+        alpha = 0.05
+    min_n = stat.get('min_seeds_for_confirmation')
+    try:
+        min_n = int(min_n or 0)
+    except (TypeError, ValueError, OverflowError):
+        min_n = 0
+    if min_n < 2 or (nseeds and min_n > nseeds):
+        out['violations'].append(
+            f'statistics.min_seeds_for_confirmation={min_n} is outside [2, {nseeds}]')
+    if nseeds and mfam:
+        floor = holm_min_attainable_p(min_n or nseeds, mfam, alpha)
+        out['min_attainable_p_holm'] = floor
+        if floor is None or not math.isfinite(floor) or floor > alpha:
+            out['violations'].append(
+                f'with n={min_n or nseeds} and a Holm family of m={mfam}, the '
+                f'minimum attainable Holm p is {floor} > alpha={alpha}; the '
+                'plan cannot confirm even with a perfect effect')
+    if stat.get('require_power_gate') is not True:
+        out['violations'].append(
+            'statistics.require_power_gate must be true; a dynamic panel cannot '
+            'be confirmed without a pre-test power simulation')
+    try:
+        mp = float(stat.get('min_power_for_test'))
+    except (TypeError, ValueError, OverflowError):
+        mp = 0.0
+    if mp < 0.8:
+        out['violations'].append(
+            f'statistics.min_power_for_test={mp} < 0.8; an underpowered dynamic '
+            'contrast cannot confirm a mechanism claim')
+    if stat.get('power_simulation_required') is not True:
+        out['violations'].append(
+            'statistics.power_simulation_required must be true (simulate the '
+            'per-seed delta vector before touching the disjoint test source)')
+    # ---- preconditions / promotion ------------------------------------
+    pre = manifest.get('precondition') if isinstance(manifest.get('precondition'), dict) else {}
+    out['runnable'] = bool(pre.get('runnable') is True)
+    if status == 'draft' and out['runnable']:
+        out['violations'].append(
+            'status=draft is inconsistent with precondition.runnable=true')
+    _cal = pre.get('read_budget_calibration') if isinstance(pre.get('read_budget_calibration'), dict) else {}
+    _pwr = pre.get('power_gate') if isinstance(pre.get('power_gate'), dict) else {}
+    _disjoint = bool(str(pre.get('disjoint_test_source') or pre.get('test_source') or '').strip())
+    if not _disjoint:
+        out['violations'].append(
+            'precondition must name a disjoint test source; reusing the v5 '
+            'test rows would make a second study non-independent')
+    if not str(pre.get('must_not_reuse') or '').strip():
+        out['violations'].append(
+            'precondition.must_not_reuse must name the reserved v5 rows/slice')
+    # Freezing is not a label change: a non-draft, runnable design must carry
+    # the measured read-budget calibration and the passed power gate.  A
+    # frozen plan that is not runnable is either a stale draft or a plan that
+    # cannot actually be executed; neither may enter confirmation.
+    if status != 'draft':
+        if not out['runnable']:
+            out['violations'].append(
+                'a non-draft dynamic plan must be runnable (precondition.runnable=true)')
+        if _cal.get('status') != 'measured':
+            out['violations'].append(
+                'a non-draft dynamic plan must carry a MEASURED read-budget '
+                f'calibration (got {_cal.get("status")!r}); topk32 is only a candidate')
+        if _pwr.get('status') != 'passed':
+            out['violations'].append(
+                'a non-draft dynamic plan must pass the pre-test power gate '
+                f'(got {_pwr.get("status")!r}); freezing before the gate is a '
+                'design defect, not a scheduling choice')
+    out['promotion_ready'] = bool(
+        _cal.get('status') == 'measured'
+        and _pwr.get('status') == 'passed'
+        and out['runnable']
+        and not out['violations'])
+    if status == 'draft' and not out['promotion_ready']:
+        out['warnings'].append(
+            'DRAFT ONLY: this design is not runnable and cannot produce a '
+            'confirmatory claim. Promote it only after (1) a disjoint test '
+            'source is reserved, (2) the realized dynamic block length is '
+            'measured and the matched fixed top-k is trained, and (3) the '
+            'pre-test power gate passes on the frozen delta vector.')
+    if out['violations']:
+        out['status'] = 'fail'
+    return out
+
+
 HYPOTHESIS_DESIGN = {
     'dynamic_blocking': {
         'statement': 'Content-adaptive dynamic blocking lowers validation PPL versus fixed blocking at the same parameter count, data order and training length.',

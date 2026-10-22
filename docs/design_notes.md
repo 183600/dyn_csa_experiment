@@ -1894,3 +1894,97 @@ Holm、或行/token 分母不可比。`methodology_audit` 把该假设与
 `direction_consistent`；正向显著不再能被自动读成支持声明机制。
 `audit_gates.hypotheses` 也覆盖该假设族。比较仍需先通过
 §26/§27 的可比性、token 分母与 Holm 门槛。
+
+## 39. 设计前馈：预算台账、证据等级与动态分块假设（本轮方法硬化）
+
+本轮不读 test、不新增 GPU 结果；只把「实验开始前就必须回答的设计问题」
+变成零 GPU、可拒绝运行的机器合约。`CODE_SEMANTICS` 与
+`confirmation_frozen.json` 均未改动；动态/HCA 仍只是 draft，不能据此
+产生确认性主张。
+
+### 39.1 token 预算不等于 train-cache 大小
+
+`confirmation_frozen.json` 的 `binding.training_recipe_signature.nt` 是
+**训练缓存被服务的 token 数**（8M），而一次 run 实际消耗的是
+`steps*bs*seq_len = 3000*12*512 = 18.432M`（约 2.3 个 epoch）。把二者
+当成同一个「token 预算」会把冻结清单误判成超预算。新的
+`exp_lib.comparison_budget_ledger` 同时记录
+`train_cache_tokens`、`consumed_tokens`、`epochs_over_cache` 与逐臂
+`consumed_tokens`，并要求同一对照的两臂**消耗 token 完全相同、缓存相同**。
+任何 per-arm 的 steps/bs/seq 覆盖都会让共享预算失效并拒绝。
+
+### 39.2 预算控制是三维的：token、参数、读取/计算
+
+仅说「parameter-matched dense」不够：dense 可能通过加宽 MLP 匹配总量，
+但训练 FLOPs、注意力读取比例和 kernel 仍不同；反过来，稀疏臂读的
+block 少也不等于参数少。台账对每条对照分别输出：
+
+- `token_matched`：`consumed_tokens` 与 `train_cache_tokens` 相同；
+- `param_matched`：真实建出的 `SmallGPT` 参数总量在 1% 内；
+- `read_matched`：按 `kind`/`block_size`/`target_block_tokens`/`index_topk`
+  解析出的每 query 读取 token 数在 10% 内（动态臂标记为 estimate）；
+- `compute_proxy_matched`：当前以参数×token 的 6ND 代理为准（显式声明
+  它不是实测 FLOPs）；
+- `dedicated_control`：selection / segmentation / task-policy / sink /
+  parameter-proxy / allblocks / multi-factor。
+
+只有 `mechanism_claim_allowed=true` 同时满足 token、参数、读取预算匹配，
+且 cfg diff 属于一个已声明单因素族、并存在专用对照时，台账才放行。
+`csa_fixed_rope_randidx_seeded` 因此可以支撑「学习式选择 vs 同读取预算
+的随机选择」；主对比（vs `full_rope`）仍是 system-level：参数匹配但读取/
+FLOPs/kernel 不匹配，`mechanism_claim_allowed` 必须保持 false。
+`csa_fixed_rope_allblocks` 被明确标为 information-rich all-block control，
+不是等预算对照。
+
+### 39.3 证据等级是代码属性，不是报告措辞
+
+`exp_lib.EVIDENCE_LEVELS` 定义 confirmatory / exploratory / descriptive /
+draft 四级；`EXPLORATORY_PANEL_REGISTRY` 把 v6-v11（以及 open-block、
+scale 等在同一 validation split 上选择/比较出来的面板）登记为
+exploratory。`evidence_level_audit` 的硬规则：
+
+- `status=draft` 或 `frozen_at=null` 的清单永远不能声明 confirmatory；
+- 单条 comparison 不能靠改 label 越过 manifest 等级；
+- confirmatory manifest 必须同时有 `require_power_gate`、
+  `require_complete_coverage`、非空 `scope.confirmatory_claims` 与冻结时间；
+- registry 里的结果目录若在 summary 里写 `confirmatory/confirmed`，直接 fail。
+
+因此「v6-v11 的 p 值更小」不是升级理由；升级只能来自新的冻结清单 +
+disjoint test + 完整覆盖 + test 前功效门槛。
+
+### 39.4 动态分块必须按假设拆开，而不是只跟 dense 比
+
+动态分块相对固定分块的增益至少有三种互斥解释，draft 现在把它们写成三条
+可证伪假设：
+
+- **H1 切分质量**：`metric_policy=boundary_alignment`，主端点
+  `boundary_f1.tol1@L4096`；关键是 **random-vs-random** 对照——两臂都用
+  seeded random selector，只有 fixed/dynamic 边界不同，才能把「边界」从
+  「学习式选择」里分离出来。
+- **H2 检索精度**：`niah_retrieval`，主端点 `niah.top1_accuracy@L4096`；
+  对照是同一动态分块下的 learned top-k vs seeded random top-k，读取预算
+  相同，并同时报告 uniform/majority 平凡地板。
+- **H3 长程覆盖**：`lm_perplexity`，主端点 `by_len.ppl@4096`；必须与
+  **读取预算匹配的固定臂**比，而不是只跟 dense/参数代理比。动态块长度是
+  数据相关的，所以 draft 要求先在 validation 上测出 realized mean block
+  length，再按 `k_fixed = round(topk_dynamic * mean_dynamic_block_tokens /
+  fixed_block_size)` 训练具体的 `csa_fixed_rope_topk{k_fixed}`；在测量前
+  `topk32` 只是候选，不能写成 read-matched。
+- H4 task-learned boundary 与 H5 HCA hierarchy 作为独立假设记录；HCA 读
+  每个 closed block，因此被明确标成 system-level，不得当作等读取机制对照。
+
+`dynamic_design_audit` 要求上述假设、专用臂、预算控制块、disjoint test
+source、measured read-budget calibration 与 passed power gate 都存在，才允许
+`promotion_ready=true`。draft 通过审计只说明「设计自洽」，不说明任何结果。
+
+### 39.5 入口
+
+```bash
+python audit_gates.py design          # 主清单 + 动态 draft 的预算/证据/假设审计
+python v12_supp.py plan               # 冻结清单 preflight（现在也包含预算台账与证据等级）
+python v12_supp.py dynamic-plan       # 动态 draft 的设计 preflight（不读 test）
+python test_review_fixes.py           # L82-L86 覆盖上述合约
+```
+
+新增对照前先过 `design`：它会指出该对照属于 token/parameter/read 哪一维
+不匹配、缺哪个专用臂、以及是否被错误地标成 confirmatory。

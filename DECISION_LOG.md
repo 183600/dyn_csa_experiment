@@ -1178,3 +1178,45 @@ Verification: new CPU tests E5b (real worker-process contract), E5c (hashseed +
 worker checks in the seed contract), E5d (overfit cache binds the execution
 target) and extended E4b (curve digest and post-hoc tamper detection).
 `python test_review_fixes.py` passes 397/397.
+
+## 2026-10-22 — design preflight: token/parameter/read budgets, evidence levels, dynamic hypotheses (no new runs)
+
+**Problem.** The frozen plan already disclosed that the dense reference is
+parameter-matched but NOT compute/read matched, and the dynamic/HCA file was
+only a draft with non-directional comparisons.  Three design defects remained
+before any new GPU spend: (1) the token budget was easy to misread as
+`n_train_tokens=8M` although a run consumes `3000*12*512=18.432M` over that
+cache; (2) there was no single machine ledger proving which budget each arm
+matched, so a mechanism claim could still be attached to a dense-only
+comparison; (3) the dynamic draft had no explicit segmentation-quality /
+retrieval-precision / long-range-coverage hypotheses and no dedicated
+random-vs-random or read-matched controls.  There was also no code-level
+registry preventing v6-v11 (selected on the same validation split) from being
+re-labelled confirmatory.
+
+**Changes.** (1) `exp_lib.comparison_budget_ledger` records per-arm
+`train_cache_tokens`, `consumed_tokens`, real parameter totals and an analytic
+read budget, classifies each comparison as selection/segmentation/task-policy/
+sink/parameter-proxy/allblocks, and refuses `mechanism_claim_allowed=true`
+unless token, parameter and read budgets match and a dedicated control exists.
+(2) `exp_lib.evidence_level_audit` + `EVIDENCE_LEVELS` +
+`EXPLORATORY_PANEL_REGISTRY` make v6-v11 exploratory by code; a draft manifest
+or a draft comparison can never be confirmatory, and a registry panel summary
+that says `confirmatory` fails the audit. (3) `exp_lib.dynamic_design_audit`
+requires H1 segmentation quality (boundary F1), H2 retrieval precision (NIAH),
+H3 long-range coverage (PPL vs a read-matched fixed arm), plus H4/H5, the
+dedicated control arms and a disjoint-source/measured-calibration/passed-power
+precondition. (4) `v12_supp.plan` now runs the budget/evidence preflight before
+training; new `v12_supp dynamic-plan` audits the draft without treating it as a
+confirmation; `audit_gates design` is the unified zero-GPU entry point.
+(5) `v7_supp` gains rope-consistent dynamic control arms
+(`csa_dynamic_rope_randidx_seeded`, `csa_dynamic_rope_task`,
+`hybrid_dynamic_rope`, `csa_fixed_rope_topk{k}`) so the dynamic draft never
+mixes rope and non-rope arms.
+
+**No change to** `CODE_SEMANTICS`, `confirmation_frozen.json` arms/seeds/
+endpoints/statistics, or any measured result.  The dynamic manifest remains
+`status=draft`, `evidence_level=draft`, `runnable=false`; it must not be quoted
+as a confirmation.  Verification: new CPU tests L82-L86; the frozen plan still
+admits 72/72 synthetic records and the dynamic-design audit passes as a
+non-runnable draft.

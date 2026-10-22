@@ -32,6 +32,10 @@
                干预键集（定义点审计，不读 results_*）；open-block 矩阵只沿
                两根声明轴变化；冻结清单的 mechanism_claim_allowed 标志与实际
                臂配置 diff 一致（零 GPU）
+  design       设计前馈：token/参数/读取预算台账、专用对照臂、证据等级
+                （v6-v11 永远 exploratory；draft 不能 confirmatory）与动态
+                分块 H1-H5 假设/对照（零 GPU，不读 test）
+  design_preflight  design 的别名
   failures     失败与缺失：error 记录按臂集中度（选择偏差读数，零 GPU）
   training_health  训练曲线健康与 NaN 排查记录的自洽性（零 GPU）
   budget       规模核算：6ND 估算 + TimeGuard 记录对账（零 GPU）
@@ -2252,6 +2256,116 @@ def audit_single_factor(manifest_path=None):
 
 
 # ---------------------------------------------------------------------------
+# 7f) design preflight：预算台账 / 证据等级 / 动态分块假设与对照
+# ---------------------------------------------------------------------------
+
+def _load_manifest_file(path):
+    try:
+        with open(path, encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def audit_design_preflight(manifest_path=None, dynamic_path=None):
+    """零 GPU 设计前馈审计：在训练/test 访问前核对实验设计。
+
+    这是本轮科研方法改进的统一入口，回答四个在跑 GPU 之前就必须回答的问题：
+
+      1. **预算控制**：主清单与动态草稿里每条对照的 token 预算、参数总量、
+         读取预算是否真的匹配？机制主张是否只挂在专用对照臂上，而不是只跟
+         dense 基线比？（`exp_lib.comparison_budget_ledger`）
+      2. **证据等级**：v6-v11（同一 validation split 上选择/比较）是否仍被
+         标成 exploratory？draft 清单是否被当成确认性计划？
+         （`exp_lib.evidence_level_audit`）
+      3. **假设驱动**：动态分块是否把「切分质量 / 检索精度 / 长程覆盖」写成
+         可证伪的独立假设，并安排了 random-vs-random、read-matched、参数
+         代理、sink 匹配等对照？（`exp_lib.dynamic_design_audit`）
+      4. **功效与冻结**：种子数/族大小是否至少数学上可达 Holm 显著，是否声明
+         了 test 前功效门槛？（两个 manifest 的统计块）
+
+    返回结构化报告；任一硬性设计缺陷 => `status=fail`。它不读任何
+    results_*/ 数值，也不调用 test loader。
+    """
+    L = _import_exp_lib()
+    mp = manifest_path or os.path.join(REPO, 'confirmation_frozen.json')
+    dp = dynamic_path or os.path.join(REPO, 'confirmation_frozen_dynamic.json')
+    out = {'status': 'ok', 'frozen_manifest': mp, 'dynamic_manifest': dp,
+           'frozen': {}, 'dynamic': {}, 'violations': [], 'warnings': []}
+    main = _load_manifest_file(mp)
+    if not isinstance(main, dict):
+        out['violations'].append(f'frozen manifest is missing/unreadable: {mp}')
+        out['frozen'] = {'status': 'not_verifiable_locally'}
+    else:
+        ledger = L.comparison_budget_ledger(main)
+        ev = L.evidence_level_audit(main, manifest_path=mp,
+                                    panel_paths=list(L.EXPLORATORY_PANEL_REGISTRY))
+        out['frozen'] = {
+            'status': ('fail' if (ledger.get('status') == 'fail'
+                                  or ev.get('status') == 'fail') else 'ok'),
+            'evidence_level': ev.get('manifest_level'),
+            'token_budget': ledger.get('token_budget'),
+            'comparisons': ledger.get('comparisons'),
+            'dedicated_controls': ledger.get('dedicated_controls'),
+            'ledger_violations': ledger.get('violations'),
+            'evidence_violations': ev.get('violations'),
+            'evidence_warnings': ev.get('warnings'),
+        }
+        out['violations'].extend(f'frozen: {v}' for v in
+                                 (ledger.get('violations') or []) +
+                                 (ev.get('violations') or []))
+        out['warnings'].extend(f'frozen: {w}' for w in
+                               (ledger.get('warnings') or []) +
+                               (ev.get('warnings') or []))
+        if out['frozen']['status'] == 'fail':
+            out['status'] = 'fail'
+    dyn = _load_manifest_file(dp)
+    if not isinstance(dyn, dict):
+        out['warnings'].append(
+            f'no readable dynamic draft at {dp}; the dynamic/HCA study has no '
+            'design record yet')
+        out['dynamic'] = {'status': 'not_verifiable_locally'}
+    else:
+        dd = L.dynamic_design_audit(dyn, manifest_path=dp)
+        dl = L.comparison_budget_ledger(dyn)
+        de = L.evidence_level_audit(dyn, manifest_path=dp, panel_paths=[])
+        out['dynamic'] = {
+            'status': ('fail' if (dd.get('status') == 'fail'
+                                  or dl.get('status') == 'fail'
+                                  or de.get('status') == 'fail') else 'ok'),
+            'declared_status': dyn.get('status'),
+            'evidence_level': de.get('manifest_level'),
+            'runnable': dd.get('runnable'),
+            'promotion_ready': dd.get('promotion_ready'),
+            'hypotheses': sorted(dd.get('hypotheses') or {}),
+            'dedicated_controls': dl.get('dedicated_controls'),
+            'comparisons': dl.get('comparisons'),
+            'design_violations': dd.get('violations'),
+            'ledger_violations': dl.get('violations'),
+            'evidence_violations': de.get('violations'),
+            'warnings': (dd.get('warnings') or []) + (dl.get('warnings') or [])
+                        + (de.get('warnings') or []),
+        }
+        out['violations'].extend(f'dynamic: {v}' for v in
+                                 (dd.get('violations') or []) +
+                                 (dl.get('violations') or []) +
+                                 (de.get('violations') or []))
+        out['warnings'].extend(f'dynamic: {w}' for w in out['dynamic']['warnings'])
+        if out['dynamic']['status'] == 'fail':
+            out['status'] = 'fail'
+        # A draft being non-runnable is expected, not a violation; make the
+        # distinction explicit so a green design audit is not mistaken for a
+        # green confirmation.
+        if str(dyn.get('status') or '').lower() == 'draft':
+            out['warnings'].append(
+                'dynamic draft is intentionally non-runnable: `promotion_ready` '
+                'must become true (disjoint source + measured read-budget '
+                'calibration + passed power gate) before any dynamic confirmation')
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return out
+
+
+# ---------------------------------------------------------------------------
 # 8) 规模核算：6ND 估算 + TimeGuard 记录对账
 # ---------------------------------------------------------------------------
 
@@ -3096,7 +3210,7 @@ def audit_selection(path='analysis_mechanism/selection_attribution.json'):
 
 
 def run_report(out='audit_report.json'):
-    res = {'generated_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'leakage': audit_leakage(), 'split_discipline': audit_split_discipline(), 'attribution': audit_attribution(), 'boundary': audit_boundary(), 'length': audit_length(), 'fairness': audit_fairness(), 'metrics': audit_metrics(), 'tuning': audit_tuning(), 'simple_baseline': audit_simple_baseline(), 'hypotheses': audit_hypotheses(), 'methodology': audit_methodology(), 'single_factor': audit_single_factor(), 'failures': audit_failures(), 'budget': audit_budget(), 'training_health': audit_training_health(), 'efficiency_pairs': audit_efficiency_pairs(), 'release': audit_release_readiness(), 'selection': audit_selection()}
+    res = {'generated_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'leakage': audit_leakage(), 'split_discipline': audit_split_discipline(), 'attribution': audit_attribution(), 'boundary': audit_boundary(), 'length': audit_length(), 'fairness': audit_fairness(), 'metrics': audit_metrics(), 'tuning': audit_tuning(), 'simple_baseline': audit_simple_baseline(), 'hypotheses': audit_hypotheses(), 'methodology': audit_methodology(), 'single_factor': audit_single_factor(), 'design_preflight': audit_design_preflight(), 'failures': audit_failures(), 'budget': audit_budget(), 'training_health': audit_training_health(), 'efficiency_pairs': audit_efficiency_pairs(), 'release': audit_release_readiness(), 'selection': audit_selection()}
     L_atomic = None
     try:
         L = _import_exp_lib()
@@ -3116,7 +3230,7 @@ def run_report(out='audit_report.json'):
 
 
 if __name__ == '__main__':
-    _cmds = {'leakage': audit_leakage, 'split': audit_split_discipline, 'split_discipline': audit_split_discipline, 'causality': audit_causality, 'attribution': audit_attribution, 'boundary': audit_boundary, 'length': audit_length, 'fairness': audit_fairness, 'metrics': audit_metrics, 'tuning': audit_tuning, 'simple': audit_simple_baseline, 'baseline_floor': audit_simple_baseline, 'baseline_plan': audit_baseline_design, 'hypothesis_coverage': audit_hypothesis_coverage, 'hypotheses': audit_hypotheses, 'methodology': audit_methodology, 'single_factor': audit_single_factor, 'failures': audit_failures, 'budget': audit_budget, 'efficiency': audit_efficiency_demo, 'efficiency_pairs': audit_efficiency_pairs, 'training_health': audit_training_health, 'selection': audit_selection, 'release': audit_release_readiness, 'report': run_report}
+    _cmds = {'leakage': audit_leakage, 'split': audit_split_discipline, 'split_discipline': audit_split_discipline, 'causality': audit_causality, 'attribution': audit_attribution, 'boundary': audit_boundary, 'length': audit_length, 'fairness': audit_fairness, 'metrics': audit_metrics, 'tuning': audit_tuning, 'simple': audit_simple_baseline, 'baseline_floor': audit_simple_baseline, 'baseline_plan': audit_baseline_design, 'hypothesis_coverage': audit_hypothesis_coverage, 'hypotheses': audit_hypotheses, 'methodology': audit_methodology, 'single_factor': audit_single_factor, 'design': audit_design_preflight, 'design_preflight': audit_design_preflight, 'failures': audit_failures, 'budget': audit_budget, 'efficiency': audit_efficiency_demo, 'efficiency_pairs': audit_efficiency_pairs, 'training_health': audit_training_health, 'selection': audit_selection, 'release': audit_release_readiness, 'report': run_report}
     _arg = sys.argv[1] if len(sys.argv) > 1 else 'report'
     if _arg in ('-h', '--help'):
         print(__doc__)
