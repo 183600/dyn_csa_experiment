@@ -4331,6 +4331,49 @@ def t_dataloader_seeding_helpers():
     assert _w4a != _w5, 'a different DataLoader seed must change the worker draws'
 
 
+def t_dataloader_contract_check():
+    try:
+        r = L.dataloader_contract_check(seed=11, num_workers=2, batch_size=4, batches=2)
+    except (PermissionError, OSError) as e:
+        raise _SkipTest(f'DataLoader worker processes need POSIX semaphores, which this sandbox forbids ({type(e).__name__}: {e})') from e
+    assert r['passed'] is True, r
+    for k in ('stream_nonempty', 'same_seed_reproducible',
+              'different_seed_changes_stream', 'rng_state_preserved'):
+        assert r['checks'].get(k) is True, (k, r['checks'])
+    assert r['num_workers'] == 2 and r['same_seed_stream'] and r['other_seed_stream']
+    # The probe must not consume the caller's RNG streams.
+    L.set_seed(99)
+    fp = L.rng_fingerprint()
+    L.dataloader_contract_check(seed=3, num_workers=0, batch_size=2, batches=1)
+    assert L.rng_fingerprint() == fp
+
+
+def t_seed_contract_reports_hashseed_and_workers():
+    r = L.seed_contract_check(seed=3, check_dataloader_workers=False)
+    assert isinstance(r.get('hashseed'), dict), r
+    for k in ('pinned_at_startup', 'child_seed', 'effective_current_process', 'note'):
+        assert k in r['hashseed'], r['hashseed']
+    assert r['hashseed']['child_seed'] is not None
+    try:
+        r2 = L.seed_contract_check(seed=3, check_dataloader_workers=True, dataloader_workers=2)
+    except (PermissionError, OSError) as e:
+        raise _SkipTest(f'DataLoader worker processes need POSIX semaphores ({type(e).__name__}: {e})') from e
+    assert r2['passed'] is True, r2
+    assert r2['checks']['dataloader_worker_processes'] is True, r2['checks']
+    assert r2['dataloader_contract']['passed'] is True, r2['dataloader_contract']
+
+
+def t_overfit_probe_cache_binds_device():
+    kw = dict(seed=0, steps=10, seq_len=16, batch_size=2, vocab=64,
+              target_loss=0.05, target_acc=0.99, source='synthetic')
+    a = L._overfit_probe_config(device=torch.device('cpu'), **kw)
+    b = L._overfit_probe_config(device=torch.device('cuda:0'), **kw)
+    assert a['device'] == 'cpu' and b['device'] == 'cuda:0'
+    assert a['exec_fp'] and a['determinism']
+    assert L._overfit_probe_digest(a) != L._overfit_probe_digest(b), \
+        'a cached overfit pass must not cross execution targets'
+
+
 def t_train_variant_reproducible():
     ids = np.arange(8192, dtype=np.int64) % 997
     val = (np.arange(64, dtype=np.int64) % 997).reshape(2, 32)
@@ -4395,6 +4438,19 @@ def t_experiment_ledger():
         integ = entry.get('tracking_integrity') or {}
         assert integ.get('n_cells') == 1 and integ.get('with_curve') == 1 and integ.get('with_rng_fp') == 1 and integ.get('with_data_contract') == 1, integ
         assert integ.get('with_seed_metadata') == 1 and integ.get('seed_metadata_mismatch') == [], integ
+        assert integ.get('with_curve_hash') == 1, integ
+        assert cell.get('curve_sha256') and cell.get('hyperparams', {}).get('rng'), cell
+        tv = L.verify_run_tracking(d, fp)
+        assert tv['passed'] is True, tv
+        # A curve edited after the fact must no longer verify against the
+        # digest stored with the record.  This is what makes the training
+        # curve an auditable artifact rather than an unverified path.
+        _cp = os.path.join(d, cell['curve_ref'])
+        _curve = json.load(open(_cp, encoding='utf-8'))
+        _curve['losses'][0] = float(_curve['losses'][0]) + 1.0
+        json.dump(_curve, open(_cp, 'w', encoding='utf-8'))
+        tv2 = L.verify_run_tracking(d, fp)
+        assert tv2['passed'] is False and any('digest' in p for p in tv2['problems']), tv2
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
@@ -15637,6 +15693,9 @@ def main():
     _check('E4c runtime host/process identity', t_environment_snapshot_runtime_identity)
     _check('E4b panel tracking events', t_panel_tracking_events)
     _check('E5 DataLoader/worker seeding', t_dataloader_seeding_helpers)
+    _check('E5b real DataLoader worker-process contract', t_dataloader_contract_check)
+    _check('E5c seed contract records hashseed + worker processes', t_seed_contract_reports_hashseed_and_workers)
+    _check('E5d overfit cache binds the execution target', t_overfit_probe_cache_binds_device)
     _check('E5b repro probe cache binds device and LR', t_repro_probe_config_binds_device_and_lr)
     _check('E6 end-to-end training reproducibility', t_train_variant_reproducible)
     _check('E7 overfit check detects broken optimizer', t_overfit_detects_broken_optimizer)

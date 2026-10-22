@@ -9,6 +9,14 @@ if os.environ.get('CSA_HF_MIRROR', '').strip().lower() in ('1', 'true', 'yes'):
 # (par.py workers, resumed runs).  The experiment itself never depends on
 # set/dict iteration order, but pinning it closes the last Python-level
 # nondeterminism source on repeat runs of the same machine.
+#
+# Capture whether the caller actually launched the interpreter with a pinned
+# hash seed.  `os.environ.setdefault` below cannot change the CURRENT
+# interpreter's hash randomisation, so a run that started without
+# PYTHONHASHSEED is still hash-randomised even though every child process we
+# spawn sees '0'.  Recording the startup value makes that residual gap visible
+# in the provenance block instead of silently assuming it away.
+_PYTHONHASHSEED_AT_STARTUP = os.environ.get('PYTHONHASHSEED')
 os.environ.setdefault('PYTHONHASHSEED', '0')
 _cpu_thr = os.environ.get('CSA_CPU_THREADS', '').strip() or '1'
 os.environ.setdefault('OMP_NUM_THREADS', _cpu_thr)
@@ -23030,7 +23038,112 @@ def deterministic_dataloader(dataset, *, seed=0, **kwargs):
         kwargs['worker_init_fn'] = seed_worker
     return DataLoader(dataset, **kwargs)
 
-def seed_contract_check(seed=0, *, device=None, check_subprocess=False):
+def dataloader_contract_check(seed=0, *, num_workers=2, batch_size=4, batches=2, device=None):
+    """Exercise a REAL seeded DataLoader, including worker processes.
+
+    `seed_contract_check` draws the Python/NumPy/Torch streams directly and
+    simulates the worker hook.  That cannot catch a wiring mistake such as a
+    DataLoader built without `generator=`/`worker_init_fn=`, or a worker
+    dataset that draws from the OS entropy pool.  This check therefore builds
+    the actual `deterministic_dataloader` with `num_workers>0`, iterates the
+    same seed twice and a different seed once, and compares the full batch
+    stream (sampler order + every per-item Python/NumPy/Torch draw).
+
+    The probe is side-effect free on the process RNG streams and is safe to
+    call before a panel; it is skipped into the report rather than raised so a
+    caller can decide whether worker processes are required on its platform.
+    """
+    seed = _seed_value(seed)
+    _nw = _exact_count(num_workers, minimum=0)
+    _bs = _exact_count(batch_size, minimum=1)
+    _nb = _exact_count(batches, minimum=1)
+    if _nw is None:
+        raise ValueError(f'dataloader_contract_check: num_workers must be a non-negative integer, got {num_workers!r}')
+    if _bs is None:
+        raise ValueError(f'dataloader_contract_check: batch_size must be a positive integer, got {batch_size!r}')
+    if _nb is None:
+        raise ValueError(f'dataloader_contract_check: batches must be a positive integer, got {batches!r}')
+    num_workers, batch_size, batches = int(_nw), int(_bs), int(_nb)
+    try:
+        from torch.utils.data import Dataset
+    except Exception as e:  # pragma: no cover - torch is a hard dependency
+        return {'kind': 'dataloader_contract', 'seed': int(seed),
+                'num_workers': num_workers, 'passed': False,
+                'diagnosis': f'could not import torch DataLoader: {type(e).__name__}: {e}'}
+
+    class _RNGDataset(Dataset):
+        def __init__(self, n):
+            self.n = int(n)
+
+        def __len__(self):
+            return self.n
+
+        def __getitem__(self, i):
+            return torch.tensor([int(i),
+                                 int(random.random() * 1e9),
+                                 int(np.random.random() * 1e9),
+                                 int(torch.randint(0, 2 ** 31 - 1, (1,)).item())],
+                                dtype=torch.int64)
+
+    _n_items = max(batch_size * batches * max(1, num_workers), 16)
+
+    def _stream(s):
+        if num_workers == 0:
+            # Without worker processes the dataset's own Python/NumPy/Torch
+            # draws run in the parent; seed them explicitly so the same-seed
+            # comparison still tests the loader wiring rather than leftover
+            # process-state drift.
+            set_seed(s)
+        dl = deterministic_dataloader(_RNGDataset(_n_items), batch_size=batch_size,
+                                      shuffle=True, seed=s, num_workers=num_workers)
+        out = []
+        for _b in dl:
+            out.append(_b.tolist())
+            if len(out) >= batches:
+                break
+        del dl
+        return out
+
+    _fp_before = rng_fingerprint()
+    try:
+        with _preserve_rng_state():
+            a = _stream(seed)
+            b = _stream(seed)
+            c = _stream(_other_seed(seed))
+        error = None
+    except Exception as e:
+        a = b = c = []
+        error = f'{type(e).__name__}: {e}'
+    _fp_after = rng_fingerprint()
+    checks = {
+        'stream_nonempty': bool(a and all(a)),
+        'same_seed_reproducible': bool(a and a == b),
+        'different_seed_changes_stream': bool(a and a != c),
+        'rng_state_preserved': bool(_fp_before == _fp_after),
+    }
+    failed = [k for k, ok in checks.items() if not ok]
+    report = {
+        'kind': 'dataloader_contract',
+        'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+        'code': code_stamp(),
+        'seed': int(seed),
+        'num_workers': num_workers,
+        'batch_size': batch_size,
+        'batches': batches,
+        'device': str(DEVICE if device is None else device),
+        'checks': checks,
+        'same_seed_stream': a,
+        'other_seed_stream': c,
+        'rng_fp_before': _fp_before,
+        'rng_fp_after': _fp_after,
+        'error': error,
+        'passed': bool(not failed and error is None),
+        'diagnosis': ('ok' if (not failed and error is None)
+                      else ('error: ' + error if error else 'failed checks: ' + ', '.join(failed))),
+    }
+    return report
+
+def seed_contract_check(seed=0, *, device=None, check_subprocess=False, check_dataloader_workers=False, dataloader_workers=2):
     """Explicit audit of every RNG source a reproducible run depends on.
 
     `reproducibility_check` proves that a short TRAINING stream repeats; this
@@ -23146,9 +23259,25 @@ def seed_contract_check(seed=0, *, device=None, check_subprocess=False):
             except Exception as e:
                 errors['subprocess_seed'] = f'{type(e).__name__}: {e}'
                 checks['subprocess_seed_reproducible'] = False
+        dl_contract = None
+        if check_dataloader_workers:
+            # Actual worker PROCESSES, not just the hook's draws: this catches
+            # a DataLoader created without the seeded generator/worker_init_fn.
+            dl_contract = dataloader_contract_check(
+                seed, num_workers=dataloader_workers)
+            checks['dataloader_worker_processes'] = bool(dl_contract.get('passed'))
+            if not dl_contract.get('passed'):
+                errors['dataloader_worker_processes'] = str(dl_contract.get('diagnosis'))
     _fp_after = rng_fingerprint()
     _rng_preserved = bool(_fp_before == _fp_after)
     checks['rng_state_preserved'] = _rng_preserved
+    _hash_contract = hashseed_contract()
+    # Not a pass/fail check: a plain `python driver.py` launch is
+    # hash-randomised before exp_lib can import.  Record the residual gap so a
+    # reviewer can see whether this run was launched reproducibly.
+    warnings = []
+    if not _hash_contract['pinned_at_startup']:
+        warnings.append(_hash_contract['note'])
     failed = [k for k, ok in checks.items() if ok is False]
     passed = not failed and not errors
     report = {
@@ -23167,6 +23296,9 @@ def seed_contract_check(seed=0, *, device=None, check_subprocess=False):
         'worker_draws_b': w2,
         'worker_draws_other_seed': w3,
         'subprocess': sub,
+        'dataloader_contract': dl_contract,
+        'hashseed': _hash_contract,
+        'warnings': warnings,
         'rng_fp_before': _fp_before,
         'rng_fp_after': _fp_after,
         'rng_state_preserved': _rng_preserved,
@@ -23244,6 +23376,43 @@ def determinism_label():
     if not torch.cuda.is_available():
         return 'cpu'
     return 'cudnn' if torch.backends.cudnn.deterministic else 'off'
+
+def hashseed_contract():
+    """Report whether the CURRENT interpreter was started hash-seeded.
+
+    ``PYTHONHASHSEED`` is consumed by CPython before any repository module is
+    imported, so ``set_seed`` cannot repair an interpreter that was launched
+    without it.  The experiment code is written to avoid set/dict iteration
+    order, but a future data path must not silently rely on that promise.
+    This report separates:
+
+    * ``pinned_at_startup`` — the environment variable existed before
+      ``exp_lib`` imported (a re-launched/CI/par.py child has this true);
+    * ``child_seed`` — what every child process we spawn will inherit;
+    * ``effective_current_process`` — ``fixed`` only when the startup pin was
+      present, else ``randomised``.
+
+    It is evidence, not a hard gate: a normal ``python driver.py`` invocation
+    has always been hash-randomised, and failing the whole panel on that would
+    be a false alarm.  ``seed_contract_check`` records it alongside the other
+    RNG streams and a confirmation driver can require it explicitly.
+    """
+    env_at_startup = _PYTHONHASHSEED_AT_STARTUP
+    pinned = env_at_startup is not None and str(env_at_startup).strip() != ''
+    return {
+        'pinned_at_startup': bool(pinned),
+        'value_at_startup': env_at_startup,
+        'child_seed': os.environ.get('PYTHONHASHSEED'),
+        'sys_hash_randomization': bool(getattr(sys.flags, 'hash_randomization', 0)),
+        'effective_current_process': ('fixed' if pinned else 'randomised'),
+        'note': ('the current interpreter was launched with a fixed PYTHONHASHSEED'
+                 if pinned else
+                 'the current interpreter was launched WITHOUT PYTHONHASHSEED; '
+                 'CPython hash randomisation cannot be changed after startup. '
+                 'Child processes are pinned, and this experiment does not depend '
+                 'on hash iteration order, but launch with PYTHONHASHSEED=0 for '
+                 'bit-identical Python-level set/dict ordering across runs.'),
+    }
 
 def _jsonable(v):
     """Recursively convert a config/provenance value to JSON-safe data.
@@ -23387,6 +23556,9 @@ def environment_snapshot():
         'cpu_threads': int(torch.get_num_threads()),
         'cpu_interop_threads': int(torch.get_num_interop_threads()) if hasattr(torch, 'get_num_interop_threads') else None,
         'pythonhashseed': os.environ.get('PYTHONHASHSEED'),
+        'pythonhashseed_at_startup': _PYTHONHASHSEED_AT_STARTUP,
+        'pythonhashseed_pinned_at_startup': bool(_PYTHONHASHSEED_AT_STARTUP not in (None, '')),
+        'hashseed_contract': hashseed_contract(),
         'tensorflow': getattr(sys.modules.get('tensorflow'), '__version__', None),
         'dependencies': _dependency_fingerprint(),
         'flags': {k: os.environ.get(k) for k in ('CSA_KERNEL', 'CSA_CKPT', 'CSA_DETERMINISTIC', 'CSA_CPU_THREADS', 'CSA_SKIP_OVERFIT', 'CSA_REQUIRE_REPRO', 'CSA_SKIP_REPRO', 'CUBLAS_WORKSPACE_CONFIG')},
@@ -23614,7 +23786,7 @@ def run_hyperparameters(cfg, *, seed, d, n_layers, n_heads, d_head, vocab, mlp_r
         hp['data_version'] = str(data_version)
     return hp
 
-def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reproducibility=None, *, data_contract=None, seed_contract=None, status=None, planned_cells=None, started_at=None, cell_records=None):
+def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reproducibility=None, *, data_contract=None, seed_contract=None, status=None, planned_cells=None, started_at=None, cell_records=None, tracking_verification=None):
     """Merge one panel's provenance/config/outcome summary into
     `outdir/run_manifest.json` under the same flock used by summary.json.
 
@@ -23740,7 +23912,9 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reprodu
                                       'best': min(_loss_nums) if _loss_nums else rec.get('curve_best'),
                                       'ppl_history_points': (len(_ph) if _ph else int(rec.get('ppl_history_n_points') or 0))},
                     'curve_ref': rec.get('curve_ref') or f'summary.json#{key}.losses',
+                    'curve_sha256': rec.get('curve_sha256'),
                     'ppl_history_ref': rec.get('ppl_history_ref') or f'summary.json#{key}.ppl_history',
+                    'ppl_history_sha256': rec.get('ppl_history_sha256'),
                     'sanity_ref': rec.get('sanity_ref') or ('overfit_sanity.json' if sanity else None),
                 }
     if planned_cells is None:
@@ -23810,6 +23984,7 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reprodu
         'with_exec_fp': sum(1 for c in cells.values() if c.get('exec_fp')),
         'with_data_version': sum(1 for c in cells.values() if c.get('data_version')),
         'with_curve': sum(1 for c in cells.values() if (c.get('curve_summary') or {}).get('n_points')),
+        'with_curve_hash': sum(1 for c in cells.values() if c.get('curve_sha256')),
         'with_sanity_ref': sum(1 for c in cells.values() if c.get('sanity_ref')),
         'with_data_contract': int(bool(isinstance(data_contract, dict) and data_contract.get('passed'))),
         'with_seed_contract': int(bool(isinstance(seed_contract, dict) and seed_contract.get('passed'))),
@@ -23885,6 +24060,7 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reprodu
         'reproducibility': reproducibility,
         'seed_contract': seed_contract,
         'data_contract': data_contract,
+        'tracking_verification': tracking_verification,
         'evidence': _evidence,
         'experiment_log': 'experiments.jsonl',
         'tracking_schema': 2,
@@ -23909,6 +24085,167 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reprodu
         return m
     locked_json_update(path, _merge)
     return path
+
+def verify_run_tracking(outdir, run_cfg=None, *, require_ppl=True):
+    """Independently verify one panel's on-disk trace.
+
+    `write_run_manifest` builds the trace; this function reads it back from
+    disk and re-derives the checks a reader would otherwise have to trust:
+    every planned cell has a record, a code stamp, hyperparameters including
+    the full RNG map, a data version, a final result, and a curve whose
+    recorded digest still matches the file.  It is read-only and never touches
+    the test split, so it can run at the end of every panel (and by hand on an
+    archived outdir).
+
+    Returns a JSON-safe verdict.  Missing legacy fields are reported as
+    problems for a current panel; `warnings` carries non-fatal notes.
+    """
+    problems = []
+    warnings = []
+    outdir = os.path.abspath(outdir)
+    manifest_path = os.path.join(outdir, 'run_manifest.json')
+    summary_path = os.path.join(outdir, 'summary.json')
+    if not os.path.exists(manifest_path):
+        return {'kind': 'run_tracking_verification', 'outdir': outdir,
+                'run_cfg': run_cfg, 'passed': False,
+                'problems': ['run_manifest.json is missing'],
+                'warnings': [], 'n_checked': 0}
+    try:
+        with open(manifest_path, encoding='utf-8') as f:
+            manifest = json.load(f)
+    except Exception as e:
+        return {'kind': 'run_tracking_verification', 'outdir': outdir,
+                'run_cfg': run_cfg, 'passed': False,
+                'problems': [f'run_manifest.json cannot be parsed: {type(e).__name__}: {e}'],
+                'warnings': [], 'n_checked': 0}
+    panels = manifest.get('panels') if isinstance(manifest, dict) else None
+    if not isinstance(panels, dict) or not panels:
+        return {'kind': 'run_tracking_verification', 'outdir': outdir,
+                'run_cfg': run_cfg, 'passed': False,
+                'problems': ['run_manifest.json has no panels'], 'warnings': [],
+                'n_checked': 0}
+    if run_cfg is None:
+        # Newest panel by created_at / updated_at; insertion order is the
+        # fallback for legacy manifests without timestamps.
+        def _stamp(entry):
+            return str((entry or {}).get('updated_at') or (entry or {}).get('created_at') or '')
+        run_cfg = max(panels, key=lambda k: _stamp(panels.get(k)))
+    entry = panels.get(run_cfg)
+    if not isinstance(entry, dict):
+        return {'kind': 'run_tracking_verification', 'outdir': outdir,
+                'run_cfg': run_cfg, 'passed': False,
+                'problems': [f'panel {run_cfg!r} is absent from run_manifest.json'],
+                'warnings': [], 'n_checked': 0}
+    try:
+        with open(summary_path, encoding='utf-8') as f:
+            summary = json.load(f)
+    except Exception as e:
+        summary = {}
+        problems.append(f'summary.json cannot be parsed: {type(e).__name__}: {e}')
+    if not isinstance(summary, dict):
+        problems.append('summary.json is not a JSON object')
+        summary = {}
+    planned = [str(k) for k in (entry.get('planned_cells') or [])]
+    if not planned:
+        problems.append('panel records no planned_cells')
+    cells = entry.get('cells') if isinstance(entry.get('cells'), dict) else {}
+    prov_dv = ((entry.get('provenance') or {}).get('data') or {}).get('data_version')
+    checked = 0
+    for key in planned:
+        checked += 1
+        rec = summary.get(key)
+        cell = cells.get(key)
+        if not isinstance(rec, dict):
+            problems.append(f'{key}: no summary record')
+            continue
+        if not isinstance(cell, dict):
+            problems.append(f'{key}: no manifest cell entry')
+            cell = {}
+        if not rec.get('_code'):
+            problems.append(f'{key}: record has no code stamp')
+        if cell.get('code_stamp') and rec.get('_code') and cell['code_stamp'] != rec.get('_code'):
+            problems.append(f'{key}: manifest code_stamp disagrees with the record')
+        hp = rec.get('hyperparams') if isinstance(rec.get('hyperparams'), dict) else {}
+        if not hp:
+            problems.append(f'{key}: record has no hyperparameters')
+        if not cell.get('hyperparams'):
+            problems.append(f'{key}: manifest cell has no hyperparameters')
+        rng = hp.get('rng') if isinstance(hp.get('rng'), dict) else {}
+        if not rng:
+            problems.append(f'{key}: hyperparameters have no RNG map')
+        try:
+            _expected = int(str(key).rsplit('::seed', 1)[1])
+        except (ValueError, IndexError):
+            _expected = None
+        if _expected is None:
+            problems.append(f'{key}: key does not name a seed')
+        else:
+            _seed_vals = [hp.get('seed'), hp.get('data_seed')]
+            _seed_vals += [rng.get(k) for k in ('python', 'numpy', 'torch', 'cuda', 'tensorflow', 'data', 'dataloader_generator')]
+            if any(v is None for v in _seed_vals):
+                problems.append(f'{key}: RNG map is incomplete')
+            elif any(int(v) != _expected for v in _seed_vals):
+                problems.append(f'{key}: seed metadata disagrees with the key')
+        dv = rec.get('data_version') or cell.get('data_version')
+        if not dv:
+            problems.append(f'{key}: record has no data_version')
+        elif prov_dv and str(dv) != str(prov_dv):
+            problems.append(f'{key}: data_version disagrees with the panel provenance')
+        if not rec.get('rng_fp'):
+            problems.append(f'{key}: record has no rng_fp')
+        if not rec.get('exec_fp'):
+            warnings.append(f'{key}: record has no exec_fp (legacy record)')
+        if require_ppl and not ppl_is_usable(rec.get('ppl')):
+            problems.append(f'{key}: no usable final PPL/result')
+        ref = rec.get('curve_ref')
+        losses = rec.get('losses') if isinstance(rec.get('losses'), list) else []
+        if ref and '#' not in str(ref):
+            path = os.path.join(outdir, str(ref))
+            if not os.path.exists(path):
+                problems.append(f'{key}: curve sidecar {ref!r} is missing')
+            else:
+                want = rec.get('curve_sha256') or cell.get('curve_sha256')
+                got = _file_sha256(path)
+                if want and got != want:
+                    problems.append(f'{key}: curve sidecar digest no longer matches the record')
+                elif not want:
+                    warnings.append(f'{key}: curve sidecar has no recorded digest')
+                try:
+                    with open(path, encoding='utf-8') as f:
+                        payload = json.load(f)
+                    if not isinstance(payload, dict):
+                        problems.append(f'{key}: curve sidecar is not a JSON object')
+                    elif not (payload.get('losses') or payload.get('ppl_history')):
+                        problems.append(f'{key}: curve sidecar contains no curve data')
+                except Exception as e:
+                    problems.append(f'{key}: curve sidecar cannot be parsed ({type(e).__name__}: {e})')
+        elif not losses and not rec.get('curve_n_points'):
+            problems.append(f'{key}: no training curve (inline or sidecar)')
+        ph_ref = rec.get('ppl_history_ref')
+        if ph_ref and '#' not in str(ph_ref):
+            ph_path = os.path.join(outdir, str(ph_ref))
+            if not os.path.exists(ph_path):
+                problems.append(f'{key}: ppl_history sidecar {ph_ref!r} is missing')
+            else:
+                want = rec.get('ppl_history_sha256') or cell.get('ppl_history_sha256')
+                if want and _file_sha256(ph_path) != want:
+                    problems.append(f'{key}: ppl_history sidecar digest no longer matches the record')
+    verdict = {
+        'kind': 'run_tracking_verification',
+        'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+        'outdir': outdir,
+        'run_cfg': run_cfg,
+        'panel_status': entry.get('status'),
+        'panel_completion': entry.get('completion'),
+        'n_planned': len(planned),
+        'n_checked': checked,
+        'problems': problems,
+        'warnings': warnings,
+        'passed': bool(not problems),
+    }
+    verdict['diagnosis'] = ('ok' if not problems else
+                            f'{len(problems)} tracking problem(s); first: {problems[0]}')
+    return verdict
 
 _EVAL_TOKENS_PER_CHUNK = 1 << 20
 
@@ -25341,6 +25678,27 @@ def _auto_ckpt_mode(device, n_param, n_layers, d, mlp_ratio, batch_size, seq_len
 
 _CURVE_MAX_POINTS = 200000
 _CURVE_SIDECAR_INLINE_PPL = 4096
+
+
+def _file_sha256(path, *, chunk=1 << 20):
+    """SHA-256 of an artifact file, or None when it cannot be read.
+
+    Tracking currently records a *path* for a curve sidecar.  A path alone
+    cannot distinguish the curve written by this cell from a later edit or a
+    file copied in from another run.  Storing the digest turns the reference
+    into an auditable pointer; the verifier can then recompute it.
+    """
+    try:
+        h = hashlib.sha256()
+        with open(path, 'rb') as f:
+            while True:
+                b = f.read(int(chunk))
+                if not b:
+                    break
+                h.update(b)
+        return h.hexdigest()
+    except (OSError, TypeError, ValueError):
+        return None
 
 
 def _curve_sidecar_rel(key):
@@ -28202,7 +28560,7 @@ def _probe_arch(arch=None):
                 _arch[_k] = int(arch[_k])
     return _arch
 
-def _overfit_probe_config(*, seed, steps, seq_len, batch_size, vocab, target_loss, target_acc, arch=None, mlp_ratio=None, ignore_index=None, source='synthetic', data_fp=None):
+def _overfit_probe_config(*, seed, steps, seq_len, batch_size, vocab, target_loss, target_acc, arch=None, mlp_ratio=None, ignore_index=None, source='synthetic', data_fp=None, device=None):
     """Exact probe configuration that a cached PASS is allowed to certify.
 
     A pass only proves that THIS tiny run can overfit (same step count, batch
@@ -28230,6 +28588,13 @@ def _overfit_probe_config(*, seed, steps, seq_len, batch_size, vocab, target_los
         'ignore_index': (None if ignore_index is None else int(ignore_index)),
         'source': str(source),
         'data_fp': (None if data_fp is None else str(data_fp)),
+        # The probe certifies THIS execution target.  A CPU pass cannot attest
+        # that the CUDA kernel path applies gradients; including the device and
+        # the environment class in the cache key prevents a cached pass from
+        # crossing hardware/software boundaries.
+        'device': str(DEVICE if device is None else device),
+        'determinism': determinism_label(),
+        'exec_fp': execution_fingerprint(),
         'code': code_stamp(),
     }
     return cfg
@@ -28464,7 +28829,7 @@ def production_loop_sanity_check(variant='full', *, seed=0, **kwargs):
         report['diagnosis'] = 'the production-loop probe did not restore the process RNG state'
     return report
 
-def overfit_guard(variants, *, seed=0, steps=200, seq_len=64, batch_size=2, vocab=1024, train_ids=None, batch=None, ignore_index=None, mlp_ratio=None, force=False, target_loss=0.05, target_acc=0.99, arch=None):
+def overfit_guard(variants, *, seed=0, steps=200, seq_len=64, batch_size=2, vocab=1024, train_ids=None, batch=None, ignore_index=None, mlp_ratio=None, force=False, target_loss=0.05, target_acc=0.99, arch=None, device=None):
     """Run `overfit_sanity_check` once per variant per process and hard-stop
     on failure.  Called automatically by `run()` before the first panel and by
     the length/checkpoint phases, so every training driver inherits the check.
@@ -28513,7 +28878,7 @@ def overfit_guard(variants, *, seed=0, steps=200, seq_len=64, batch_size=2, voca
     _cfg_keys = {}
     _semantics = {}
     for v in variants:
-        _pc = _overfit_probe_config(seed=seed, steps=steps, seq_len=seq_len, batch_size=batch_size, vocab=vocab, target_loss=target_loss, target_acc=target_acc, arch=_arch, mlp_ratio=_overfit_ratio_for(mlp_ratio, v), ignore_index=_ign, source=src, data_fp=_data_fp)
+        _pc = _overfit_probe_config(seed=seed, steps=steps, seq_len=seq_len, batch_size=batch_size, vocab=vocab, target_loss=target_loss, target_acc=target_acc, arch=_arch, mlp_ratio=_overfit_ratio_for(mlp_ratio, v), ignore_index=_ign, source=src, data_fp=_data_fp, device=device)
         _probe_cfgs[v] = _pc
         _cfg_keys[v] = _overfit_probe_digest(_pc)
         _semantics[v] = _overfit_probe_semantics(_pc)
@@ -28545,7 +28910,7 @@ def overfit_guard(variants, *, seed=0, steps=200, seq_len=64, batch_size=2, voca
         return []
     reports = []
     for v in todo:
-        r = overfit_sanity_check(v, seed=seed, steps=steps, d=_arch['d'], n_layers=_arch['n_layers'], n_heads=_arch['n_heads'], d_head=_arch['d_head'], seq_len=seq_len, batch_size=batch_size, vocab=vocab, train_ids=(train_ids if src == 'data' else None), batch=(batch if src == 'batch' else None), ignore_index=_ign, mlp_ratio=_overfit_ratio_for(mlp_ratio, v), target_loss=target_loss, target_acc=target_acc)
+        r = overfit_sanity_check(v, seed=seed, steps=steps, d=_arch['d'], n_layers=_arch['n_layers'], n_heads=_arch['n_heads'], d_head=_arch['d_head'], seq_len=seq_len, batch_size=batch_size, vocab=vocab, train_ids=(train_ids if src == 'data' else None), batch=(batch if src == 'batch' else None), ignore_index=_ign, mlp_ratio=_overfit_ratio_for(mlp_ratio, v), target_loss=target_loss, target_acc=target_acc, device=device)
         r['guard_probe_config'] = _probe_cfgs[v]
         r['guard_probe_key'] = _cfg_keys[v]
         r['guard_probe_semantics'] = _semantics[v]
@@ -30596,6 +30961,8 @@ def _run_cell(cfg, v, seed, *, guard=None, ratios=None, fp=None, train_ids=None,
             _curve_move_ph = False
             if not rec.get('cap_truncated'):
                 _curve_ref, _curve_losses, _curve_ph, _curve_move_ph = _write_cell_curve(outdir, key, rec)
+            _curve_sha = (_file_sha256(os.path.join(outdir, _curve_ref))
+                          if _curve_ref else None)
 
             def _apply(summary):
                 if rec.get('cap_truncated'):
@@ -30631,6 +30998,7 @@ def _run_cell(cfg, v, seed, *, guard=None, ratios=None, fp=None, train_ids=None,
                     if _curve_ref:
                         _cs = _finite_curve(_curve_losses)
                         _rec_out['curve_ref'] = _curve_ref
+                        _rec_out['curve_sha256'] = _curve_sha
                         _rec_out['curve_n_points'] = _cs['n_points']
                         _rec_out['curve_first'] = _curve_losses[0] if _curve_losses else None
                         _rec_out['curve_last'] = _cs['last']
@@ -30641,6 +31009,7 @@ def _run_cell(cfg, v, seed, *, guard=None, ratios=None, fp=None, train_ids=None,
                         _rec_out['curve_n_points'] = len(_curve_losses)
                     if _curve_move_ph:
                         _rec_out['ppl_history_ref'] = _curve_ref
+                        _rec_out['ppl_history_sha256'] = _curve_sha
                         _rec_out['ppl_history_n_points'] = len(_curve_ph)
                     elif _curve_ph:
                         _rec_out['ppl_history_n_points'] = len(_curve_ph)
@@ -30870,7 +31239,7 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
     except RuntimeError as _fe:
         _prov0 = experiment_provenance(cfg)
         _reports0 = [dict(r) for _k, r in _OVERFIT_REPORTS.items() if _k[0] in set(_variants)]
-        _cfg0 = _overfit_probe_config(seed=_first_seed, steps=_probe_steps, seq_len=_probe_seq, batch_size=_probe_batch, vocab=_pre_vocab, target_loss=0.05, target_acc=0.99, arch=_arch, source='synthetic')
+        _cfg0 = _overfit_probe_config(seed=_first_seed, steps=_probe_steps, seq_len=_probe_seq, batch_size=_probe_batch, vocab=_pre_vocab, target_loss=0.05, target_acc=0.99, arch=_arch, source='synthetic', device=DEVICE)
         _doc0 = {
             'kind': 'small_batch_overfit_sanity_panel', 'stage': 'synthetic_preflight',
             'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
@@ -30938,8 +31307,14 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
     # and worker hook) and a different seed actually changes each one.  This
     # is cheaper than the 3-step training check and pinpoints WHICH stream is
     # unseeded when a reproduction fails.
-    _seed_contract = seed_contract_check(seed=_first_seed)
+    _dl_workers = int(cfg.get('dataloader_workers') or 0)
+    _seed_contract = seed_contract_check(
+        seed=_first_seed,
+        check_dataloader_workers=_dl_workers > 0,
+        dataloader_workers=max(1, _dl_workers))
     _seed_contract.update({'run_cfg': fp, 'label': label or outdir, 'provenance': prov})
+    for _w in _seed_contract.get('warnings') or []:
+        print(f'[determinism] WARNING: {_w}')
     atomic_write_json(os.path.join(outdir, 'seed_contract.json'), _seed_contract)
     log_experiment_event(outdir, {
         'kind': 'preflight', 'tracking_schema': 2,
@@ -30980,7 +31355,7 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
             'repeatable batches. See data_contract.json.')
 
     def _data_probe_cfg(v):
-        return _overfit_probe_config(seed=_first_seed, steps=_probe_steps, seq_len=_probe_seq, batch_size=_probe_batch, vocab=vocab, target_loss=0.05, target_acc=0.99, arch=_arch, mlp_ratio=ratios.get(v), ignore_index=None, source='data', data_fp=_data_fp)
+        return _overfit_probe_config(seed=_first_seed, steps=_probe_steps, seq_len=_probe_seq, batch_size=_probe_batch, vocab=vocab, target_loss=0.05, target_acc=0.99, arch=_arch, mlp_ratio=ratios.get(v), ignore_index=None, source='data', data_fp=_data_fp, device=DEVICE)
 
     # The real data-path check: the synthetic pass above cannot catch a broken
     # real token stream / vocabulary mapping.  It is a superset of the model
@@ -31211,6 +31586,16 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
     # existed.
     _final_status = 'complete' if (not _missing and not _trace_bad) else 'incomplete'
     write_run_manifest(outdir, cfg, fp, prov, summary, sanity=_sanity_doc, reproducibility=_repro_doc, data_contract=_data_contract, seed_contract=_seed_contract, status=_final_status, planned_cells=_planned_keys, started_at=_panel_started)
+    # Independent read-back of the trace that was just written.  A run whose
+    # manifest/cells/curve digests do not agree is not "complete" even if the
+    # process exited normally: that is how a partially traced panel would
+    # otherwise be quoted as if every planned cell carried evidence.
+    _tracking = verify_run_tracking(outdir, fp)
+    atomic_write_json(os.path.join(outdir, 'tracking_verification.json'), _tracking)
+    if not _tracking.get('passed'):
+        print(f'[track] tracking verification FAILED: {_tracking.get("diagnosis")} — marking the panel incomplete')
+        _final_status = 'incomplete'
+    write_run_manifest(outdir, cfg, fp, prov, summary, sanity=_sanity_doc, reproducibility=_repro_doc, data_contract=_data_contract, seed_contract=_seed_contract, status=_final_status, planned_cells=_planned_keys, started_at=_panel_started, tracking_verification=_tracking)
     _agg = _finish_panel(outdir, summary)
     log_experiment_event(outdir, {
         'kind': 'panel_finish', 'tracking_schema': 2, 'label': label or outdir,
@@ -31226,6 +31611,7 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
         'n_cells_missing': len(_missing), 'missing_cells': _missing[:20],
         'n_trace_bad': len(_trace_bad), 'trace_bad_cells': _trace_bad[:20],
         'n_truncated': len(dropped_truncations), 'n_stale_dropped': len(stale_dropped),
+        'tracking_verification': {'passed': bool(_tracking.get('passed')), 'ref': 'tracking_verification.json', 'n_problems': len(_tracking.get('problems') or [])},
         'aggregate_ref': 'aggregate.json', 'summary_ref': 'summary.json',
         'aggregate': {str(v): {kk: e.get(kk) for kk in ('n', 'n_seeds', 'ppl_mean', 'ppl_std', 'params') if kk in e} for v, e in (_agg or {}).items() if isinstance(e, dict)},
     })

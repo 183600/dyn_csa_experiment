@@ -1141,3 +1141,40 @@ direction conflict fail closed; untuned/verified stays unconfirmed) and L71
 (tuned hypothesis is supported on a controlled 7-seed panel, falsified when the
 dense baseline wins, and the full claim stays closed while the count floor is
 unverified). `python test_review_fixes.py` passes 394/394.
+
+## 2026-10-22 — seed audit, overfit-cache binding and trace verification (no new runs)
+
+Zero-GPU reproducibility/tracking hardening; no panel result, frozen manifest,
+test split, README or CI configuration was touched.
+
+**Problem.** (1) The seed contract recorded child-process `PYTHONHASHSEED` but
+not whether the *current* interpreter was launched with one; CPython consumes
+that variable before `exp_lib` imports, so a normal `python driver.py` launch
+remains hash-randomised even though every spawned child is pinned.  The
+DataLoader check drew the worker hook in-process and never exercised real
+worker processes.  (2) The small-batch overfit cache key covered code, data,
+architecture and MLP width but not the execution target, so a CPU pass could
+certify a CUDA run in the same process.  (3) A curve sidecar was referenced by
+path only: a later edit or copied file could silently replace the curve behind
+an otherwise complete manifest.
+
+**Changes.** (1) `exp_lib.hashseed_contract` records the startup value and the
+residual current-process gap in provenance/seed_contract (as a warning, not a
+false hard failure).  New `dataloader_contract_check` iterates a real
+`deterministic_dataloader` with worker processes twice at the same seed and
+once at a different seed, checking sampler order plus per-item
+Python/NumPy/Torch draws; `seed_contract_check(...,
+check_dataloader_workers=True)` embeds it and `run()` enables it when
+`dataloader_workers > 0`.  (2) `_overfit_probe_config` now includes the device,
+determinism level and `exec_fp`, so a cached PASS cannot cross hardware or
+software classes.  (3) `_run_cell` stores `curve_sha256` for sidecars;
+`verify_run_tracking(outdir, run_cfg)` independently reads the manifest and
+summary back and checks planned cells, code stamp, hyperparameters/RNG map,
+data_version, final result and curve digest.  `run()` writes
+`tracking_verification.json`, downgrades a panel to `incomplete` if the
+read-back fails, and embeds the verdict in the manifest/ledger.
+
+Verification: new CPU tests E5b (real worker-process contract), E5c (hashseed +
+worker checks in the seed contract), E5d (overfit cache binds the execution
+target) and extended E4b (curve digest and post-hoc tamper detection).
+`python test_review_fixes.py` passes 397/397.
