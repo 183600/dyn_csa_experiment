@@ -21499,7 +21499,7 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
               'component_seed_requirements': {}, 'baseline_seed_requirements': {},
               'hypotheses': {}, 'hypotheses_incomplete': [], 'hypothesis_audit': {},
               'metric_audit': {}, 'baseline_tuning': {}, 'simple_baseline': {},
-              'family': {}, 'warnings': []}
+              'baseline_claim_gate': {}, 'family': {}, 'warnings': []}
     if _summary_type is not None:
         report['warnings'].append(
             f'summary is a {_summary_type}, not an object; no record-level '
@@ -22023,6 +22023,49 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
         _verified = list(report.get('verified_baselines') or [])
         report['tuned_verified_baselines'] = [c for c in _verified if c in _tuned_comps]
         report['untuned_verified_baselines'] = [c for c in _verified if c not in _tuned_comps]
+        _dir_conf = sorted(c for c in (report.get('direction_conflict_baselines') or [])
+                           if c in set(_scoped_baselines))
+        _tuned_v = list(report['tuned_verified_baselines'])
+        _untuned_v = list(report['untuned_verified_baselines'])
+        if _dir_conf:
+            _tuned_status = 'falsified'
+        elif not _bt.get('tuning_verified'):
+            _tuned_status = 'unverified'
+        elif (_tuned_v and not _untuned_v and not _uncovered and not _mismatched):
+            _tuned_status = 'supported'
+        elif _tuned_v:
+            _tuned_status = 'partial'
+        else:
+            _tuned_status = 'unresolved'
+        _tuned_obs = (-1 if _tuned_status == 'supported'
+                      else (1 if _tuned_status == 'falsified' else None))
+        report['baseline_tuning']['tuned_hypothesis'] = dict(
+            TUNED_BASELINE_HYPOTHESIS_DESIGN['method_beats_tuned_baseline'],
+            observed_status=_tuned_status,
+            observed_sign=_tuned_obs,
+            direction_consistent=(None if _tuned_obs is None else bool(_tuned_obs == -1)),
+            tuned_verified_baselines=_tuned_v,
+            untuned_verified_baselines=_untuned_v,
+            direction_conflict_baselines=_dir_conf,
+            panel_uncovered_arms=_uncovered,
+            panel_arm_hyperparams_mismatch=_mismatched,
+        )
+        if _tuned_status == 'falsified':
+            report['warnings'].append(
+                'the tuned-baseline hypothesis is FALSIFIED: a matched dense baseline '
+                'is significantly better than the declared method arm (%s), so the '
+                'method cannot be quoted as beating a tuned baseline'
+                % ', '.join(_dir_conf))
+        elif _tuned_status == 'partial':
+            report['warnings'].append(
+                'the tuned-baseline hypothesis is only PARTIAL: some verified baseline '
+                'contrasts were not run at the selected tuned configuration (%s)'
+                % ', '.join(_untuned_v))
+        elif _tuned_status == 'unresolved':
+            report['warnings'].append(
+                'the tuned-baseline hypothesis is UNRESOLVED: no declared '
+                'method-vs-baseline contrast is verified after family correction '
+                'at the current seed count')
         if _bt.get('tuning_verified') and not _bt.get('tuned_claim_allowed') and _verified:
             report['warnings'].append(
                 'baseline tuning is verified as an equal-search grid but does not '
@@ -22447,6 +22490,11 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                            _sb.get('best_baseline') or 'count-model'))
     if report['hypotheses_missing']:
         report['warnings'].append('no pre-registered hypothesis for: ' + ', '.join(sorted(set(report['hypotheses_missing']))) + ' — direction cannot be checked, so a significant result is at most measured')
+    report['baseline_claim_gate'] = baseline_claim_gate(report)
+    _bcg = report['baseline_claim_gate']
+    if _bcg.get('status') == 'fail':
+        report['warnings'].append(
+            'baseline claim gate FAILED: ' + '; '.join(_bcg.get('reasons') or []))
 
     if write and outdir:
         try:
@@ -22457,6 +22505,98 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
     if verbose:
         _print_methodology_audit(report)
     return report
+
+def baseline_claim_gate(report):
+    """Unified ladder for the claim "the method beats a well-tuned baseline".
+
+    A significant matched-dense contrast is only interpretable after two weaker
+    rungs have been cleared on the SAME panel: the declared method arm must
+    beat the tuned count-model floor, and the dense baseline must have been
+    selected by the declared equal-search tuning grid and actually trained at
+    that selected configuration.  Keeping the three rungs explicit prevents the
+    common overclaim in which a method beats an untuned baseline (or one arm of
+    a multi-baseline family) and is reported as beating "the baseline".
+
+    ``claim_allowed`` is True only when every applicable rung passes.  Missing
+    evidence is ``unverified`` (warn), not a pass; explicit counter-evidence
+    (method below the floor, or a matched baseline significantly better than
+    the method) is ``failed``.  The gate never reads the test split and adds no
+    measurement: it only combines artifacts the panel audit already computed.
+    """
+    out = {'kind': 'baseline_claim_gate', 'status': 'not_applicable',
+           'applicable': False, 'claim_allowed': None, 'rungs': {},
+           'reasons': [], 'warnings': [],
+           'note': ('rungs: tuned count-model floor -> equal-search tuning -> '
+                    'tuned matched-dense contrast; all must pass on the same '
+                    'panel and rows')}
+    if not isinstance(report, dict):
+        out.update(status='fail', reasons=['methodology audit is not an object'])
+        return out
+    baselines = report.get('baselines')
+    if not isinstance(baselines, dict) or not baselines:
+        out['reasons'].append('this panel declares no matched-dense baseline contrast')
+        return out
+    out['applicable'] = True
+    simple = report.get('simple_baseline') if isinstance(
+        report.get('simple_baseline'), dict) else {}
+    tuning = report.get('baseline_tuning') if isinstance(
+        report.get('baseline_tuning'), dict) else {}
+    floor_status = simple.get('method_arm_floor_status')
+    floor_ok = (simple.get('tuned_floor_claim_allowed') is True
+                and simple.get('comparable_to_panel') is True
+                and simple.get('method_arms_beat_floor') is True)
+    if floor_ok:
+        _fs, _fd = 'passed', 'declared method arm(s) beat the tuned count floor'
+    elif (floor_status == 'method_arm_does_not_beat_floor'
+          or simple.get('panel_beats_simple_floor') is False
+          or (floor_status == 'method_floor_contrast_unresolved'
+              and simple.get('method_arms_beat_floor') is False)):
+        _fs, _fd = 'failed', 'a declared method arm does not beat the tuned count floor'
+    else:
+        _fs, _fd = 'unverified', (simple.get('status') or 'missing')
+    out['rungs']['tuned_count_floor'] = {'passed': _fs == 'passed',
+                                         'status': _fs, 'detail': _fd}
+    if tuning.get('tuned_claim_allowed') is True:
+        _ts, _td = 'passed', 'equal-search tuning artifact is verified'
+    elif tuning.get('tuning_verified') is True:
+        _ts, _td = 'unverified', ('tuning artifact is verified but not adequate: '
+                                  + '; '.join(tuning.get('tuned_claim_reasons') or []))
+    else:
+        _ts, _td = 'unverified', (tuning.get('status') or 'missing')
+    out['rungs']['equal_search_tuning'] = {'passed': _ts == 'passed',
+                                           'status': _ts, 'detail': _td}
+    _tuned_v = list(report.get('tuned_verified_baselines') or [])
+    _untuned_v = list(report.get('untuned_verified_baselines') or [])
+    _conflict = list(report.get('direction_conflict_baselines') or [])
+    if _conflict:
+        _ms = 'failed'
+        _md = ('matched baseline(s) significantly better than the method: '
+               + ', '.join(map(str, _conflict)))
+    elif _tuned_v and not _untuned_v:
+        _ms, _md = 'passed', 'tuned matched-dense contrast is verified'
+    elif _untuned_v:
+        _ms = 'unverified'
+        _md = ('verified only against an untuned baseline: '
+               + ', '.join(map(str, _untuned_v)))
+    else:
+        _ms, _md = 'unverified', 'no verified method-vs-baseline contrast'
+    out['rungs']['tuned_matched_dense'] = {'passed': _ms == 'passed',
+                                           'status': _ms, 'detail': _md}
+    out['claim_allowed'] = all(r['passed'] for r in out['rungs'].values())
+    for _name, _rung in out['rungs'].items():
+        if not _rung['passed']:
+            out['reasons'].append(f"{_name}: {_rung['status']} ({_rung['detail']})")
+    if out['claim_allowed']:
+        out['status'] = 'ok'
+    elif any(r['status'] == 'failed' for r in out['rungs'].values()):
+        out['status'] = 'fail'
+    else:
+        out['status'] = 'warn'
+    if out['status'] != 'ok':
+        out['warnings'].append(
+            'do not quote a "beats a tuned baseline" claim until every rung passes')
+    return out
+
 
 def _print_methodology_audit(report):
     print('\n========== methodology audit: controlled comparison / ablation / statistics ==========')
@@ -22594,6 +22734,12 @@ def _print_methodology_audit(report):
             print('  resolution-limited baseline claims: ' + ', '.join(report['resolution_limited_baselines']))
         if report.get('unverified_baselines'):
             print('  unverified baseline claims (missing/incomplete/param-mismatched): ' + ', '.join(report['unverified_baselines']))
+        _bcg = report.get('baseline_claim_gate') or {}
+        if _bcg.get('applicable'):
+            print('  baseline claim gate: allowed=%s status=%s' % (
+                _bcg.get('claim_allowed'), _bcg.get('status')))
+            for _name, _rung in (_bcg.get('rungs') or {}).items():
+                print('    %-24s %-10s %s' % (_name, _rung.get('status'), _rung.get('detail')))
     for w in report['warnings']:
         print('  [warn] ' + w)
     print('======================================================================================')

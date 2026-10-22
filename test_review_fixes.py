@@ -15417,6 +15417,88 @@ def t_classification_threshold_metadata_matches_predictions():
     assert 'roc_auc' not in pred_only and 'pr_auc' not in pred_only, pred_only
 
 
+def t_baseline_claim_gate_requires_every_rung():
+    report = {'baselines': {'compression_vs_matched_dense': [
+        {'with': 'csa_dynamic', 'without': 'full_sw128_matched'}]}}
+    empty = L.baseline_claim_gate(report)
+    assert empty['applicable'] is True and empty['claim_allowed'] is False, empty
+    assert empty['rungs']['tuned_count_floor']['status'] == 'unverified', empty
+    full = dict(
+        report,
+        simple_baseline={'tuned_floor_claim_allowed': True,
+                         'comparable_to_panel': True,
+                         'method_arms_beat_floor': True,
+                         'method_arm_floor_status': 'all_method_arms_beat_floor'},
+        baseline_tuning={'tuning_verified': True, 'tuned_claim_allowed': True},
+        tuned_verified_baselines=['compression_vs_matched_dense'],
+        untuned_verified_baselines=[], direction_conflict_baselines=[])
+    gate = L.baseline_claim_gate(full)
+    assert gate['claim_allowed'] is True and gate['status'] == 'ok', gate
+    below_floor = dict(full, simple_baseline=dict(
+        full['simple_baseline'],
+        method_arms_beat_floor=False,
+        method_arm_floor_status='method_arm_does_not_beat_floor'))
+    g2 = L.baseline_claim_gate(below_floor)
+    assert g2['claim_allowed'] is False and g2['status'] == 'fail', g2
+    untuned = dict(full, tuned_verified_baselines=[],
+                   untuned_verified_baselines=['compression_vs_matched_dense'])
+    g3 = L.baseline_claim_gate(untuned)
+    assert g3['claim_allowed'] is False and g3['status'] == 'warn', g3
+    conflict = dict(full, tuned_verified_baselines=[],
+                    untuned_verified_baselines=[],
+                    direction_conflict_baselines=['compression_vs_matched_dense'])
+    g4 = L.baseline_claim_gate(conflict)
+    assert g4['claim_allowed'] is False and g4['status'] == 'fail', g4
+    no_baseline = L.baseline_claim_gate({'baselines': {}})
+    assert no_baseline['status'] == 'not_applicable' and no_baseline['claim_allowed'] is None, no_baseline
+
+
+def t_tuned_baseline_hypothesis_is_attached_to_the_panel():
+    fp = 'steps1_sl8_bs1_nt10_lr0.0003_wd0.1_d8_L1_H1_Dh8_v16_wu1_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee1_es1_detcpu-eager_dfabc_csX'
+    knobs = L.training_knobs()
+    hp = {'lr': 0.0001, 'weight_decay': 0.1, 'warmup': 50}
+
+    def _summary(effect):
+        s = {}
+        for i in range(7):
+            s[f'csa_dynamic::seed{i}'] = dict(
+                variant='csa_dynamic', seed=i, run_cfg=fp, steps=1, tokens_seen=1,
+                ppl=50.0 + effect, params=1000, train_knobs=knobs, hyperparams=dict(hp))
+            s[f'full_sw128_matched::seed{i}'] = dict(
+                variant='full_sw128_matched', seed=i, run_cfg=fp, steps=1,
+                tokens_seen=1, ppl=50.0, params=1000, train_knobs=knobs,
+                hyperparams=dict(hp))
+            s[f'full_matched::seed{i}'] = dict(
+                variant='full_matched', seed=i, run_cfg=fp, steps=1,
+                tokens_seen=1, ppl=50.0, params=1000, train_knobs=knobs,
+                hyperparams=dict(hp))
+        return s
+
+    old_bt, old_sb = L.baseline_tuning_audit, L.simple_baseline_audit
+    cov = {a: a for a in ('csa_dynamic', 'full_sw128_matched', 'full_matched')}
+    L.baseline_tuning_audit = lambda **kw: {
+        'status': 'ok', 'tuning_verified': True, 'tuned_claim_allowed': True,
+        'tuned_claim_reasons': [], 'coverage': cov,
+        'selected_configs': {a: dict(hp) for a in cov}, 'warnings': []}
+    L.simple_baseline_audit = lambda **kw: {
+        'status': 'not_verifiable_locally', 'baseline_verified': False,
+        'warnings': []}
+    try:
+        supported = L.methodology_audit(_summary(-1.0), verbose=False)
+        falsified = L.methodology_audit(_summary(+1.0), verbose=False)
+    finally:
+        L.baseline_tuning_audit, L.simple_baseline_audit = old_bt, old_sb
+    th = supported['baseline_tuning']['tuned_hypothesis']
+    assert th['observed_status'] == 'supported' and th['direction_consistent'] is True, th
+    assert supported['baseline_claim_gate']['rungs']['tuned_matched_dense']['passed'] is True
+    assert supported['baseline_claim_gate']['claim_allowed'] is False, (
+        'the count floor is still unverified, so the full claim must stay closed')
+    fh = falsified['baseline_tuning']['tuned_hypothesis']
+    assert fh['observed_status'] == 'falsified' and fh['direction_consistent'] is False, fh
+    assert falsified['baseline_claim_gate']['status'] == 'fail', (
+        falsified['baseline_claim_gate'])
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -15810,6 +15892,8 @@ def main():
     _check('L67 single-factor audit fails closed on a non-object manifest', t_single_factor_audit_rejects_nonobject_manifest)
     _check('L68 classification threshold metadata matches the actual predictions', t_classification_threshold_metadata_matches_predictions)
     _check('L69 native temporal row keys are unit-canonical across stored tables', t_native_temporal_row_keys_are_unit_canonical)
+    _check('L70 baseline claim gate requires every baseline rung', t_baseline_claim_gate_requires_every_rung)
+    _check('L71 tuned-baseline hypothesis is attached to the panel', t_tuned_baseline_hypothesis_is_attached_to_the_panel)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

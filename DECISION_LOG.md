@@ -1103,3 +1103,41 @@ Verification: new CPU tests A4m/A4m1 (train-only classifier and trainer
 recording), A4m2 (bounded prefix scan and scan metadata), A4m3 (cost-gain flag)
 and extended C21b.  `python test_review_fixes.py` passes 387/387;
 `python test_open_block.py` passes 15/15.
+
+## 2026-10-22 — unified baseline-claim ladder + observed tuned-baseline hypothesis (no new runs)
+
+Zero-GPU methodology hardening; no panel result, frozen manifest, test split,
+README or CI configuration was touched.
+
+**Problem.** The audit computed every component of the "beats a tuned
+baseline" claim — the tuned count-model floor, the equal-search tuning
+artifact, and the parameter-matched dense contrast — but left them in separate
+fields with no single machine-readable verdict. A reader (or a downstream
+report) could quote the significant matched-dense row while ignoring that the
+method had not beaten the count floor, or that the baseline was verified only
+at its untuned default. In addition, the tuned-baseline hypothesis was
+pre-registered in the launch plan but never attached to the observed panel
+verdict, unlike the floor hypothesis.
+
+**Changes.** (1) `exp_lib.baseline_claim_gate(report)` combines the panel audit
+into an explicit three-rung ladder: tuned count-model floor → verified
+equal-search tuning → tuned parameter-matched dense contrast. `claim_allowed`
+is True only when every applicable rung passes on the same panel/rows; missing
+evidence is `unverified` (warn) and counter-evidence (method below the floor,
+or a baseline significantly better than the method) is `failed`. The gate is a
+pure combination of existing artifacts — it adds no measurement and never reads
+the test split. `methodology_audit` now records it as `baseline_claim_gate`,
+prints each rung, and emits a failure warning. (2) `methodology_audit` attaches
+the pre-registered `TUNED_BASELINE_HYPOTHESIS_DESIGN` entry to the observed
+panel as `baseline_tuning.tuned_hypothesis`, with
+`supported`/`partial`/`unresolved`/`falsified` status and sign consistency;
+`falsified` is reported when a matched dense baseline is significantly better
+than the method. This does not relax any existing gate: the previous
+`tuned_verified_baselines` / `untuned_verified_baselines` split still drives
+the verdict.
+
+Verification: new CPU tests L70 (every rung required; floor failure and
+direction conflict fail closed; untuned/verified stays unconfirmed) and L71
+(tuned hypothesis is supported on a controlled 7-seed panel, falsified when the
+dense baseline wins, and the full claim stays closed while the count floor is
+unverified). `python test_review_fixes.py` passes 394/394.
