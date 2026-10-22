@@ -939,6 +939,107 @@ def t_error_analysis_flags_prefix_ambiguity():
     assert r0['context_ambiguity']['context_len'] is None, r0
 
 
+def t_train_only_curve_health():
+    desc = [10.0 - 0.05 * i for i in range(200)]
+    h = L.classify_train_loss_curve(desc)
+    assert h['status'] == 'descending', h
+    assert h['mode'] == 'train_only' and h['n_points'] == 200, h
+    stall = L.classify_train_loss_curve([5.0] * 200)
+    assert stall['status'] == 'stalled', stall
+    diverge = [5.0 - 0.01 * i for i in range(100)] + [4.0 + 0.05 * i for i in range(100)]
+    dh = L.classify_train_loss_curve(diverge)
+    assert dh['status'] == 'diverging', dh
+    spiky = [5.0 - 0.01 * i for i in range(200)]
+    spiky[185] = 30.0
+    sh = L.classify_train_loss_curve(spiky)
+    assert sh['status'] == 'unstable_spikes', sh
+    assert sh['first_spike_index'] == 185, sh
+    nh = L.classify_train_loss_curve([1.0, float('nan'), 0.9] + [0.8] * 20)
+    assert nh['status'] == 'nonfinite' and nh['first_nonfinite_index'] == 1, nh
+    ih = L.classify_train_loss_curve([1.0, 0.9])
+    assert ih['status'] == 'insufficient_data', ih
+    for _bad in (True, 1.5, 0, -1):
+        try:
+            L.classify_train_loss_curve(desc, min_points=_bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'min_points={_bad!r} must be refused')
+
+
+def t_train_variant_records_train_curve_without_validation():
+    ids = np.arange(2048, dtype=np.int64) % 997
+    val = (np.arange(64, dtype=np.int64) % 997).reshape(4, 16)
+    r = L.train_variant('full', ids, val, 997, seed=0, d=32, n_layers=1,
+                        n_heads=2, d_head=16, seq_len=16, batch_size=2, steps=60,
+                        lr=1e-3, weight_decay=0.0, warmup=1, comp_lambda=0.0,
+                        eval_every=0, mlp_ratio=4.0, device=torch.device('cpu'),
+                        log_every=0)
+    th = r.get('train_curve_health') or {}
+    assert th.get('mode') == 'train_only' and th.get('status') not in (None, 'insufficient_data'), th
+    assert th.get('n_points') == 60, th
+    assert (r.get('curve_health') or {}).get('status') in ('unmonitored', 'nonfinite'), r.get('curve_health')
+    checks = {c['check']: c['status'] for c in
+              (r.get('instability_diagnosis') or {}).get('checks', [])}
+    assert checks.get('train_loss_curve') == 'not_observed', checks
+
+
+def t_error_analysis_context_scan_is_bounded():
+    vocab = 8
+
+    class _Stub:
+        training = True
+
+        def eval(self):
+            self.training = False
+            return self
+
+        def train(self, mode=True):
+            self.training = bool(mode)
+            return self
+
+        def trunk(self, ids):
+            return torch.zeros((ids.shape[0], ids.shape[1], 2))
+
+        def head(self, h):
+            return torch.zeros((h.shape[0], h.shape[1], vocab))
+
+    vb = np.array([[1, 2, 3, 4, 5], [1, 2, 3, 4, 6]], dtype=np.int64)
+    full = L.analyze_errors(_Stub(), vb, vocab, torch.device('cpu'),
+                            top_n=2, top_tokens=8)
+    assert full['context_ambiguity']['scan_complete'] is True, full['context_ambiguity']
+    bounded = L.analyze_errors(_Stub(), vb, vocab, torch.device('cpu'),
+                               top_n=2, top_tokens=8,
+                               context_scan_max_positions=4)
+    ca = bounded['context_ambiguity']
+    assert ca['scan_complete'] is False, ca
+    assert ca['scan']['n_rows_scanned'] == 1 and ca['scan']['n_rows_total'] == 2, ca
+    assert ca['scan']['n_positions_scanned'] == 4, ca
+    assert ca.get('scan_note'), ca
+    for _bad in (True, 0, -1, 1.5):
+        try:
+            L.analyze_errors(_Stub(), vb, vocab, torch.device('cpu'),
+                             top_n=1, top_tokens=1,
+                             context_scan_max_positions=_bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'context_scan_max_positions={_bad!r} must be refused')
+
+
+def t_cost_increase_flags_sub_noise_gain():
+    rows = [{'variant': 'best', 'ppl': p, 'prefill_ms_p50': 10.0,
+             'params': 100, 'peak_mem_allocated_mb': 10.0, 'tokens_seen': 100}
+            for p in (48.0, 48.2, 47.8)]
+    rows += [{'variant': 'pricey', 'ppl': p, 'prefill_ms_p50': 25.0,
+              'params': 100, 'peak_mem_allocated_mb': 10.0, 'tokens_seen': 100}
+             for p in (48.05, 48.15, 47.95)]
+    s = BR.efficiency_accuracy_summary(rows)
+    pricey = [r for r in s if r['variant'] == 'pricey'][0]
+    assert 'cost_increase_without_clear_gain' in pricey['flags'], pricey
+    assert 'latency_2x_or_more' in pricey['flags'], pricey
+
+
 def t_loss_curve_downsample_keeps_spikes_and_nan():
     # Long runs are downsampled before the curve is written.  A one-step
     # explosion/NaN must survive that reduction, or a diverged run looks clean.
@@ -2138,6 +2239,8 @@ def t_m0_result_diagnostics():
     assert 'latency_2x_or_more' in d['cost']['b']['flags'], d
     assert 'params_2x_or_more' in d['cost']['b']['flags'], d
     assert 'memory_2x_or_more' in d['cost']['b']['flags'], d
+    assert 'cost_increase_without_clear_gain' in d['cost']['b']['flags'], d
+    assert d['train_curve_health_counts'].get('missing') == 3, d
 
 
 def t_seed_plan():
@@ -15127,6 +15230,10 @@ def main():
     _check('A4k early stop is recorded and token accounting follows completed steps', t_train_variant_early_stop_record)
     _check('A4k1 final loss smoothing uses the last 50 steps', t_final_loss_smoothed_uses_last_steps)
     _check('A4k2 long loss-curve downsampling keeps spikes and NaN', t_loss_curve_downsample_keeps_spikes_and_nan)
+    _check('A4m train-only loss-curve health', t_train_only_curve_health)
+    _check('A4m1 train_variant records the train-only curve', t_train_variant_records_train_curve_without_validation)
+    _check('A4m2 bad-case prefix scan is bounded', t_error_analysis_context_scan_is_bounded)
+    _check('A4m3 cost increase without a clear PPL gain is flagged', t_cost_increase_flags_sub_noise_gain)
     _check('A4l v12 health gate refuses a recorded non-finite event', t_v12_health_gate_refuses_unstable_training)
     _check('A4g rope arms never claim the batched eager twin', t_rope_arms_are_not_batched)
     _check('A4g2 apply_rope preserves width (over-long/odd rope_dim)', t_apply_rope_preserves_width)

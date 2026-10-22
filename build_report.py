@@ -2012,6 +2012,40 @@ def sec_training_health():
     return '\n'.join(lines) + '\n'
 
 
+def sec_train_curve_health():
+    rows = []
+    for name, s in _result_summaries().items():
+        for key, rec in s.items():
+            if not isinstance(rec, dict):
+                continue
+            th = rec.get('train_curve_health')
+            if isinstance(th, dict):
+                rows.append((name, key, th))
+    if not rows:
+        return ''
+    lines = ['## Per-step training-loss curve (not only the final value)', '',
+             '> This is the training-side fallback for panels without a validation grid. It detects non-finite steps, a rising tail, finite spikes and a plateau; it cannot diagnose overfitting, which needs held-out points.', '',
+             '| panel | cell | status | points | last | min | first spike | tail slope | relative change | action |', '|---|---|---|---|---|---|---|---|---|---|']
+    for name, key, th in rows[:200]:
+        _acts_raw = th.get('actions')
+        if isinstance(_acts_raw, str):
+            _acts = [_acts_raw]
+        elif isinstance(_acts_raw, (list, tuple)):
+            _acts = list(_acts_raw)
+        else:
+            _acts = []
+        _act = '; '.join(str(a) for a in _acts) or '—'
+        lines.append('| %s | `%s` | %s | %s | %s | %s | %s | %s | %s | %s |' % (
+            name, key, th.get('status'), fm(th.get('n_points'), 0),
+            fm(th.get('last'), 4), fm(th.get('min'), 4),
+            fm(th.get('first_spike_index'), 0),
+            fm(th.get('tail_slope_per_step'), 6),
+            fm(th.get('tail_relative_change'), 4),
+            _act.replace('|', '\\|')))
+    lines += ['', '> `diverging` = the tail is rising; `unstable_spikes` = isolated finite jumps; `stalled` = no measurable decline in the tail; `nonfinite` = a NaN/Inf step was recorded. A spike or divergence that never reaches NaN is still an optimization failure and must not be hidden by quoting the final loss.', '']
+    return '\n'.join(lines) + '\n'
+
+
 def efficiency_group_key(eff):
     """Comparability key for a measured efficiency record.
 
@@ -2186,6 +2220,13 @@ def efficiency_accuracy_summary(items):
                 flags.append('params_2x_or_more')
             if r['memory_ratio_vs_best'] is not None and r['memory_ratio_vs_best'] >= 2.0:
                 flags.append('memory_2x_or_more')
+            _cost_2x = any(x is not None and x >= 2.0
+                           for x in (r['latency_ratio_vs_best'],
+                                     r['params_ratio_vs_best'],
+                                     r['memory_ratio_vs_best']))
+            if _cost_2x and (abs(r['ppl_delta_pct_vs_best']) < 0.5
+                             or r['distinguishable'] is False):
+                flags.append('cost_increase_without_clear_gain')
             r['flags'] = flags
         if _budget_status == 'differs':
             r['flags'] = list(r.get('flags') or []) + ['train_budget_differs']
@@ -2543,7 +2584,7 @@ def main(argv=None):
     parts = [sec_header(), '---\n']
     failed = []
     _reset_claim_registry()
-    for sec in (sec_p0r, sec_p0w, sec_p0e, sec_p1t, sec_p1l, sec_p2s, sec_flops, sec_training_health, sec_early_stop, sec_nan_diagnostics, sec_error_analysis, sec_efficiency, sec_stats, sec_global_multiplicity):
+    for sec in (sec_p0r, sec_p0w, sec_p0e, sec_p1t, sec_p1l, sec_p2s, sec_flops, sec_training_health, sec_train_curve_health, sec_early_stop, sec_nan_diagnostics, sec_error_analysis, sec_efficiency, sec_stats, sec_global_multiplicity):
         try:
             parts.append(sec())
         except Exception as e:

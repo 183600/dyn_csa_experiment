@@ -561,6 +561,128 @@ def classify_training_health(history, *, tail_k=4, slope_tol=None, gap_tol=None)
     }
 
 
+def classify_train_loss_curve(losses, *, min_points=8, tail_k=32,
+                              spike_sigma=6.0, min_rel_change=0.01):
+    """Classify the per-step training-loss curve without a validation grid.
+
+    This is the fallback used when a panel has ``eval_every=0`` (or the
+    validation batch is unavailable): it cannot diagnose overfitting, which
+    needs held-out points, but it can still expose the failures a single final
+    loss hides — a non-finite step, a rising tail (divergence / too-high LR),
+    isolated finite spikes, and a plateau.  ``status`` is one of
+    ``nonfinite``, ``insufficient_data``, ``diverging``,
+    ``unstable_spikes``, ``stalled`` or ``descending``.
+    """
+    try:
+        vals = list(losses) if losses is not None else []
+    except TypeError:
+        vals = []
+    n_bad = 0
+    first_bad = None
+    finite = []
+    for i, v in enumerate(vals):
+        try:
+            fv = float(v)
+        except (TypeError, ValueError, OverflowError):
+            fv = None
+        if fv is not None and math.isfinite(fv):
+            finite.append((i, fv))
+        else:
+            n_bad += 1
+            if first_bad is None:
+                first_bad = i
+    _min = _exact_count(min_points, minimum=2)
+    _tail = _exact_count(tail_k, minimum=2)
+    _sig = _finite_scalar(spike_sigma)
+    _rel = _finite_scalar(min_rel_change)
+    if _min is None or _tail is None:
+        raise ValueError('classify_train_loss_curve needs integer min_points>=2 and tail_k>=2')
+    if _sig is None or _sig <= 0.0 or _rel is None or _rel < 0.0:
+        raise ValueError('classify_train_loss_curve needs spike_sigma>0 and min_rel_change>=0')
+    min_points, tail_k, spike_sigma, min_rel_change = int(_min), int(_tail), _sig, _rel
+    n = len(vals)
+    out = {
+        'kind': 'train_loss_curve_health', 'mode': 'train_only',
+        'n_points': n, 'n_nonfinite': int(n_bad),
+        'first_nonfinite_index': first_bad,
+        'n_finite': len(finite),
+        'min': (min(v for _, v in finite) if finite else None),
+        'max': (max(v for _, v in finite) if finite else None),
+        'last': (finite[-1][1] if finite else None),
+        'n_spikes': 0, 'first_spike_index': None,
+        'tail_start_index': None, 'tail_slope_per_step': None,
+        'tail_slope_se': None, 'tail_relative_change': None,
+        'status': None, 'reason': None, 'actions': [],
+        'note': ('training-side health only; overfitting requires held-out validation points'),
+    }
+    if n_bad:
+        out['status'] = 'nonfinite'
+        out['reason'] = f'{n_bad} non-finite training-loss point(s); first at step index {first_bad}'
+        out['actions'].append('follow the NaN triage path: data NaN/Inf -> log(0)/div0/softmax -> fp16 overflow -> gradient explosion/LR')
+    if len(finite) < min_points:
+        if out['status'] is None:
+            out['status'] = 'insufficient_data'
+            out['reason'] = f'only {len(finite)} finite training-loss point(s); at least {min_points} are needed'
+            out['actions'].append('record more training-loss points (lower log_every or raise the step budget) before reading the trend')
+        return out
+    window = max(tail_k, int(math.ceil(n * 0.1)))
+    start = max(0, n - window)
+    tail = [(i, v) for i, v in finite if i >= start]
+    if len(tail) < min_points:
+        tail = finite[-min_points:]
+        start = tail[0][0]
+    xs = [float(i) for i, _ in tail]
+    ys = [v for _, v in tail]
+    k = len(tail)
+    mx = sum(xs) / k
+    my = sum(ys) / k
+    den = sum((x - mx) ** 2 for x in xs)
+    slope = (sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / den) if den > 0 else None
+    se = None
+    if slope is not None and k > 2:
+        rss = sum((y - (my + slope * (x - mx))) ** 2 for x, y in zip(xs, ys))
+        se = math.sqrt((rss / (k - 2)) / den) if den > 0 else None
+    span = xs[-1] - xs[0]
+    med = float(np.median(ys))
+    rel = ((slope * span) / max(abs(med), 1e-12)) if slope is not None else None
+    tol = max(1e-12, 2.0 * se) if se is not None else 1e-12
+    deviations = [abs(v - med) for v in ys]
+    mad = float(np.median(deviations))
+    sigma = 1.4826 * mad
+    spike_cut = max(spike_sigma * sigma, 0.5 * abs(med), 1e-12)
+    spikes = [i for i, v in tail if v > med + spike_cut]
+    out.update({
+        'tail_start_index': int(start), 'tail_n': k,
+        'tail_slope_per_step': slope, 'tail_slope_se': se,
+        'tail_slope_tol': tol, 'tail_relative_change': rel,
+        'tail_median': med, 'tail_robust_sigma': sigma,
+        'n_spikes': len(spikes),
+        'first_spike_index': (int(spikes[0]) if spikes else None),
+    })
+    if out['status'] is not None:
+        return out
+    if slope is not None and slope > tol and rel is not None and rel > min_rel_change:
+        out['status'] = 'diverging'
+        out['reason'] = (f'training loss is rising in the tail (slope={slope:.4g}/step, '
+                         f'relative change={rel:+.3%})')
+        out['actions'].append('lower the LR, extend warmup and inspect gradient/AMP diagnostics before adding capacity')
+    elif spikes:
+        out['status'] = 'unstable_spikes'
+        out['reason'] = (f'{len(spikes)} finite training-loss spike(s) in the tail; '
+                         f'first at step index {spikes[0]}')
+        out['actions'].append('inspect the spike step for a corrupted batch, gradient clipping and the LR schedule')
+    elif slope is not None and slope < -tol and rel is not None and rel < -min_rel_change:
+        out['status'] = 'descending'
+        out['reason'] = (f'training loss is still falling in the tail (slope={slope:.4g}/step, '
+                         f'relative change={rel:+.3%})')
+    else:
+        out['status'] = 'stalled'
+        out['reason'] = (f'training loss is flat in the tail (slope={slope!r}/step, '
+                         f'relative change={rel!r})')
+        out['actions'].append('verify the data pipeline and learning-rate schedule; if the loss plateau is high, train longer or change capacity')
+    return out
+
+
 def early_stop_decision(history, *, patience, min_delta=0.0):
     """Return whether a validation curve has stopped improving.
 
@@ -707,6 +829,21 @@ def diagnose_training_instability(record, *, data_checked=None):
             health = {}
     if _hist_raw is not None and not isinstance(_hist_raw, list):
         malformed.append(f'health_history is not a list ({type(_hist_raw).__name__})')
+    _train_raw = rec.get('train_curve_health')
+    if _train_raw is not None and not isinstance(_train_raw, dict):
+        malformed.append(f'train_curve_health={_train_raw!r}')
+    train_health = _train_raw if isinstance(_train_raw, dict) else {}
+    _train_source = 'record' if isinstance(_train_raw, dict) else 'missing'
+    if not train_health:
+        _losses_raw = rec.get('losses')
+        if isinstance(_losses_raw, list) and _losses_raw:
+            try:
+                train_health = classify_train_loss_curve(_losses_raw)
+                _train_source = 'derived_from_losses'
+            except Exception as _tce:
+                malformed.append(f'losses could not be classified ({type(_tce).__name__}: {_tce})')
+        elif _losses_raw is not None and not isinstance(_losses_raw, list):
+            malformed.append(f'losses is not a list ({type(_losses_raw).__name__})')
     health_nonfinite = str(health.get('status') or '') == 'nonfinite'
     # If both representations exist, the curve wins on a numerical failure:
     # a cached `healthy` summary must not hide a non-finite point in its own
@@ -855,6 +992,22 @@ def diagnose_training_instability(record, *, data_checked=None):
         add('gradient_explosion_lr', 'not_observed',
             f'non-finite grad steps={n_grad}, max pre-clip grad={grad_max}', 'no action')
 
+    _train_status = str(train_health.get('status') or '')
+    _train_bad = _train_status in ('nonfinite', 'diverging', 'unstable_spikes')
+    if _train_bad:
+        add('train_loss_curve', 'observed',
+            f'train curve status={_train_status} ({train_health.get("reason") or "no reason recorded"}; '
+            f'source={_train_source})',
+            'inspect the first bad training step: a corrupted batch, an LR/warmup fault or a gradient/AMP overflow precedes most divergences')
+    elif _train_source == 'missing':
+        add('train_loss_curve', 'unknown',
+            'no per-step training-loss curve or train_curve_health was recorded',
+            'record the training-loss curve (losses) even when eval_every=0; the final loss alone hides divergence and spikes')
+    else:
+        add('train_loss_curve', 'not_observed',
+            f'train curve status={_train_status or "unknown"} (source={_train_source})',
+            'no action')
+
     if health_nonfinite:
         add('validation_curve_numerics', 'observed',
             f'curve_health is nonfinite ({health.get("reason") or "no reason recorded"}; source={_health_source})',
@@ -881,7 +1034,7 @@ def diagnose_training_instability(record, *, data_checked=None):
     # prevent.
     _has_event = bool(n_loss or n_grad or guard_cleaned or bad_loss or bad_grad
                       or huge_grad or health_nonfinite or _data_bad
-                      or _label_shift_bad)
+                      or _label_shift_bad or _train_bad)
     if not _has_event and not malformed:
         status = 'clean'
         primary = None
@@ -904,7 +1057,8 @@ def diagnose_training_instability(record, *, data_checked=None):
             'recommended_order': ['data_nan_inf', 'data_label_shift',
                                   'forward_loss_numerics',
                                   'attention_pool_nan_to_num', 'validation_curve_numerics',
-                                  'fp16_overflow', 'gradient_explosion_lr']}
+                                  'fp16_overflow', 'gradient_explosion_lr',
+                                  'train_loss_curve']}
 
 
 def _safe_exp_ppl(x):
@@ -26280,12 +26434,17 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
     # an average of points spread over a large fraction of the run.
     _tail_losses = [v for v in losses[-50:] if math.isfinite(v)]
     _final_loss_smoothed = (sum(_tail_losses) / len(_tail_losses)) if _tail_losses else None
+    _train_health = classify_train_loss_curve(losses)
     if _health_history:
         _health = classify_training_health(_health_history)
     else:
-        _health = {'status': 'unmonitored', 'reason': 'no validation eval points (eval_every=0 or no val_batch); only the training batch CE curve is available',
+        _train_status = _train_health.get('status')
+        _health = {'status': ('nonfinite' if _train_status == 'nonfinite' else 'unmonitored'),
+                   'reason': ('no validation eval points (eval_every=0 or no val_batch); '
+                              f'training-loss curve status={_train_status} ({_train_health.get("reason")})'),
                    'n_points': 0, 'best_step': None, 'best_val_ppl': None,
-                   'final_val_ppl': None, 'final_minus_best': None}
+                   'final_val_ppl': None, 'final_minus_best': None,
+                   'train_curve_status': _train_status}
     _grad_vals = [float(v) for v in _diag.get('grad_norm_pre_clip', []) if _is_finite_number(v)]
     _upd_vals = [float(v) for v in _diag.get('update_norm', []) if _is_finite_number(v)]
     _opt_summary = {
@@ -26311,6 +26470,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
         {'opt_diag_summary': _opt_summary, 'amp_dtype': _amp,
          'train_knobs': training_knobs(amp_dtype=_amp, eager_batch=_eager_batch_used),
          'curve_health': _health, 'health_history': _health_history,
+         'train_curve_health': _train_health, 'losses': losses,
          'data_audit': _data_audit})
     _peak = {}
     if device.type == 'cuda':
@@ -26387,6 +26547,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
               'open_block_config': open_block_config(_inner_model),
               'curve_summary': _curve_summary,
               'curve_health': _health, 'health_history': _health_history,
+              'train_curve_health': _train_health,
               'train_ce_fixed_final': _last_train_ce,
               'train_val_gap_final': _health.get('gap_last'),
               'best_step': _best_step, 'best_val_ppl': _best_val_ppl,
@@ -26502,21 +26663,41 @@ def classify_token_error(*, ce, entropy, margin, rare_target, target_id, topk_id
     return {'primary': primary, 'causes': causes, 'target_in_topk': in_topk}
 
 
-def _context_target_counts(vb, ctx_len):
+def _context_target_counts(vb, ctx_len, *, max_positions=None):
     """Map each observed prefix to the next-token counts seen in this split.
 
     Used ONLY to flag that an apparently wrong target is not uniquely
     determined by its prefix: the same prefix occurs with a different next
     token elsewhere in the evaluated rows (label inconsistency or genuine
     ambiguity).  It does not decide which label is correct.
+
+    ``max_positions`` bounds the scan for scale-up runs.  When the evaluated
+    split is larger, equally spaced rows are scanned and the returned metadata
+    says the scan was incomplete; an unbounded prefix dictionary over a
+    multi-million-token validation split is not an acceptable hidden cost.
     """
     n_rows, seq = int(vb.shape[0]), int(vb.shape[1])
     span = seq - 1
     if span < 1:
-        return {}, 0
+        return {}, 0, {'n_rows_total': n_rows, 'n_rows_scanned': 0,
+                       'n_positions_scanned': 0, 'max_positions': max_positions,
+                       'complete': True, 'rows': []}
     ctx_len = max(1, min(int(ctx_len), span))
+    scan_rows = list(range(n_rows))
+    complete = True
+    if max_positions is not None:
+        _max = _exact_count(max_positions, minimum=1)
+        if _max is None:
+            raise ValueError(f'_context_target_counts needs a positive integer max_positions, got {max_positions!r}')
+        total = n_rows * span
+        if total > int(_max):
+            n_scan = max(1, min(n_rows, int(_max) // max(1, span)))
+            if n_scan < n_rows:
+                scan_rows = [int(r) for r in
+                             np.unique(np.linspace(0, n_rows - 1, num=n_scan, dtype=np.int64))]
+                complete = False
     out = {}
-    for r in range(n_rows):
+    for r in scan_rows:
         row = vb[r]
         for pos in range(span):
             start = max(0, pos + 1 - ctx_len)
@@ -26527,13 +26708,18 @@ def _context_target_counts(vb, ctx_len):
                 out[key] = {tgt: 1}
             else:
                 d[tgt] = d.get(tgt, 0) + 1
-    return out, ctx_len
+    meta = {'n_rows_total': n_rows, 'n_rows_scanned': len(scan_rows),
+            'n_positions_scanned': len(scan_rows) * span,
+            'max_positions': max_positions, 'complete': complete}
+    if not complete:
+        meta['rows'] = scan_rows
+    return out, ctx_len, meta
 
 
 @torch.inference_mode()
 def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
                    top_tokens=100, chunk=8, val_bnd=None, train_ids=None,
-                   context_tokens=16, topk=5):
+                   context_tokens=16, topk=5, context_scan_max_positions=None):
     """Per-token / per-sequence error analysis for one checkpoint.
 
     Returns the worst sequences, worst tokens (with decoded context when a
@@ -26585,8 +26771,10 @@ def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
     # an inventory was requested, so a zero-budget call stays cheap.
     _ctx_counts = None
     _ctx_len_used = None
+    _ctx_scan = None
     if top_tokens > 0:
-        _ctx_counts, _ctx_len_used = _context_target_counts(vb, min(16, max(1, span)))
+        _ctx_counts, _ctx_len_used, _ctx_scan = _context_target_counts(
+            vb, min(16, max(1, span)), max_positions=context_scan_max_positions)
     # "Rare target" is a claim about the TRAINING frequency.  An empty or
     # malformed training sample is not a frequency table of all-zero counts:
     # reading it that way would label every token `annotation_or_rare_target`
@@ -26902,8 +27090,13 @@ def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
                                                      if _ctx_counts is not None else None),
                 'n_positions_with_ambiguous_context': (sum(sum(_d.values()) for _d in _ctx_counts.values() if len(_d) > 1)
                                                        if _ctx_counts is not None else None),
+                'scan': _ctx_scan,
+                'scan_complete': (None if _ctx_scan is None else bool(_ctx_scan.get('complete'))),
                 'note': ('same prefix in the evaluated validation rows has more than one observed next token; '
-                         'this is label inconsistency or genuine ambiguity, not proof of an annotation error')},
+                         'this is label inconsistency or genuine ambiguity, not proof of an annotation error'),
+                'scan_note': (None if (_ctx_scan is None or _ctx_scan.get('complete'))
+                              else 'prefix-ambiguity counts are from a bounded, evenly spaced row sample; '
+                                   'they are not whole-split totals (see scan metadata)')},
             'tokenizer_available': tok is not None,
             'rare_target_basis': rare_basis,
             'rare_target_problem': freq_problem,

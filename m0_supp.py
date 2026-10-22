@@ -807,7 +807,9 @@ def _panel_result_diagnostics(summary):
         return float(np.median(vals)) if vals else None
 
     counts = {}
+    train_counts = {}
     nonfinite, overfitting, stalled, early, above_best, unmonitored = [], [], [], [], [], []
+    train_bad = []
     costs = {}
     n_records = 0
     for key, rec in (summary or {}).items():
@@ -817,6 +819,11 @@ def _panel_result_diagnostics(summary):
         h = rec.get('curve_health') if isinstance(rec.get('curve_health'), dict) else {}
         status = str(h.get('status') or 'missing')
         counts[status] = int(counts.get(status, 0)) + 1
+        th = rec.get('train_curve_health') if isinstance(rec.get('train_curve_health'), dict) else {}
+        tstatus = str(th.get('status') or 'missing')
+        train_counts[tstatus] = int(train_counts.get(tstatus, 0)) + 1
+        if tstatus in ('nonfinite', 'diverging', 'unstable_spikes'):
+            train_bad.append(str(key))
         if status == 'nonfinite':
             nonfinite.append(str(key))
         elif status == 'overfitting':
@@ -862,9 +869,17 @@ def _panel_result_diagnostics(summary):
                 c['eff_tokens_per_s'] = c.get('eff_tokens_per_s', []) + [_tps]
     arms = {}
     for v, c in costs.items():
+        _ppl_mean = (sum(c['ppl']) / len(c['ppl'])) if c['ppl'] else None
+        _ppl_std = (float(np.std(c['ppl'], ddof=1)) if len(c['ppl']) > 1 else None)
+        _ppl_sem = (_ppl_std / math.sqrt(len(c['ppl']))
+                    if (_ppl_std is not None and c['ppl']) else None)
         arms[v] = {
             'n': int(max(len(c['ppl']), len(c['params']), len(c['train_tps']))),
+            'n_ppl': len(c['ppl']),
             'ppl_median': _median(c['ppl']),
+            'ppl_mean': _ppl_mean,
+            'ppl_std': _ppl_std,
+            'ppl_sem': _ppl_sem,
             'params_median': _median(c['params']),
             'train_tokens_per_s_median': _median(c['train_tps']),
             'train_time_s_median': _median(c['train_time_s']),
@@ -891,8 +906,25 @@ def _panel_result_diagnostics(summary):
                                          if (r['params_median'] and ref['params_median']) else None)
             r['memory_ratio_vs_best'] = (r['peak_mem_mb_max'] / ref['peak_mem_mb_max']
                                          if (r['peak_mem_mb_max'] and ref['peak_mem_mb_max']) else None)
+            if (r['ppl_mean'] is not None and ref['ppl_mean'] is not None
+                    and r['ppl_sem'] is not None and ref['ppl_sem'] is not None):
+                r['noise_2se'] = 2.0 * math.sqrt(r['ppl_sem'] ** 2 + ref['ppl_sem'] ** 2)
+                r['distinguishable'] = (None if r['noise_2se'] == 0.0
+                                        else abs(r['ppl_mean'] - ref['ppl_mean']) > r['noise_2se'])
+            else:
+                r['noise_2se'] = None
+                r['distinguishable'] = None
+            _cost_ratios = [x for x in (r['latency_ratio_vs_best'], r['params_ratio_vs_best'],
+                                        r['memory_ratio_vs_best']) if x is not None]
+            _cost_2x = any(x >= 2.0 for x in _cost_ratios)
             if abs(_d) < 0.5:
                 r['flags'].append('ppl_gain_below_0.5pct')
+            if r['distinguishable'] is False:
+                r['flags'].append('ppl_gain_within_seed_noise')
+            elif r['distinguishable'] is None:
+                r['flags'].append('ppl_uncertainty_unverifiable')
+            if _cost_2x and (abs(_d) < 0.5 or r['distinguishable'] is False):
+                r['flags'].append('cost_increase_without_clear_gain')
             if r['latency_ratio_vs_best'] is not None and r['latency_ratio_vs_best'] >= 2.0:
                 r['flags'].append('latency_2x_or_more')
             if r['params_ratio_vs_best'] is not None and r['params_ratio_vs_best'] >= 2.0:
@@ -900,6 +932,7 @@ def _panel_result_diagnostics(summary):
             if r['memory_ratio_vs_best'] is not None and r['memory_ratio_vs_best'] >= 2.0:
                 r['flags'].append('memory_2x_or_more')
     return {'n_records': int(n_records), 'curve_health_counts': counts,
+            'train_curve_health_counts': train_counts,
             'best_ppl_arm': best,
             'records': {
                 'nonfinite': nonfinite[:50],
@@ -908,6 +941,7 @@ def _panel_result_diagnostics(summary):
                 'unmonitored_or_insufficient': unmonitored[:50],
                 'final_above_best': above_best[:50],
                 'early_stopped': early[:50],
+                'train_curve_bad': train_bad[:50],
             },
             'cost': arms,
             'note': ('curve health is diagnostic, not a model-selection rule; '

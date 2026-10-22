@@ -1063,3 +1063,43 @@ recall and is rejected as an F1 hypothesis), and extended L25c (per-group
 baseline ladder, method-only group refused, matched arm outside group refused).
 `python test_review_fixes.py` passes 383/383; `python baseline_tune.py plan`
 still reports `status=ok` with family m=4 and final seeds 0-7 sufficient.
+
+## 2026-10-22 — train-only curve monitor + bounded bad-case scan + explicit cost/gain gate (no new runs)
+
+Zero-GPU diagnostics/analysis hardening. No panel result, frozen manifest,
+test split, README or CI configuration was touched; `CODE_SEMANTICS` is
+unchanged because the additions only record evidence and bound an offline
+diagnostic scan.
+
+**Problem.** (1) Curve monitoring still depended on a validation grid.  A
+panel with `eval_every=0` recorded per-step `losses` but reported only
+`curve_health=unmonitored`, so a finite divergence or a spike that never
+reached NaN stayed invisible; the NaN triage also had no train-curve suspect.
+(2) The prefix-ambiguity scan in `analyze_errors` built a Python dictionary for
+every evaluated position, so the offline bad-case pass could silently become a
+multi-hundred-MB cost on a longer validation split.  (3) The efficiency summary
+listed a small PPL delta and 2x latency/params/memory as separate tags, leaving
+the reader to notice the combination that the methodology prompt explicitly
+rules out.
+
+**Changes.** (1) `exp_lib.classify_train_loss_curve` is the train-only fallback:
+it reports `nonfinite`, `diverging`, `unstable_spikes`, `stalled`, `descending`
+or `insufficient_data` from `losses`, with a noise-aware tail slope.  The
+trainer records it as `train_curve_health` on every run and uses it to make
+`curve_health` non-finite when only the training curve failed; the NaN triage
+consumes it (deriving it from legacy `losses` when the field is absent) and adds
+a `train_loss_curve` suspect/action.  `build_report.py` renders the new curve
+next to the validation-health table.  (2) `analyze_errors` takes
+`context_scan_max_positions` (CLI `--context-scan-positions`, default 2M; 0 =
+unbounded) and records `scan_complete`, scanned row/position counts and a
+sampling note, so a bounded ambiguity count can never be quoted as a whole-split
+total.  (3) Both `m0_supp._panel_result_diagnostics` and
+`build_report.efficiency_accuracy_summary` now emit
+`cost_increase_without_clear_gain` when a sub-0.5%-or-within-noise PPL change
+comes with a >=2x latency, parameter or memory increase; M0 also reports
+per-arm seed SEM and `ppl_gain_within_seed_noise`.
+
+Verification: new CPU tests A4m/A4m1 (train-only classifier and trainer
+recording), A4m2 (bounded prefix scan and scan metadata), A4m3 (cost-gain flag)
+and extended C21b.  `python test_review_fixes.py` passes 387/387;
+`python test_open_block.py` passes 15/15.

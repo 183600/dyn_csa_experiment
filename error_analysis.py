@@ -158,9 +158,13 @@ def _print_bad_cases(res, *, n_tokens=10, n_sequences=3):
         print(f'[errors] worst-token cause tally: {tally}')
     ca = res.get('context_ambiguity')
     if isinstance(ca, dict):
+        _scan = ca.get('scan') if isinstance(ca.get('scan'), dict) else {}
+        _scan_txt = ('whole split' if ca.get('scan_complete')
+                     else f"sampled {_scan.get('n_rows_scanned')}/{_scan.get('n_rows_total')} rows")
         print(f"[errors] prefix ambiguity: {ca.get('n_ambiguous_worst')}/{ca.get('n_worst_reviewed')} "
               f'reviewed worst tokens share a prefix with another target; '
-              f"{ca.get('n_contexts_with_multiple_targets')} ambiguous context(s) in the evaluated rows")
+              f"{ca.get('n_contexts_with_multiple_targets')} ambiguous context(s) in the evaluated rows "
+              f'({_scan_txt})')
     print('[errors] Read the context and label before acting: annotation error, genuine ambiguity and a model blind spot need different fixes.\n')
 
 
@@ -179,6 +183,8 @@ def main(argv=None):
     ap.add_argument('--print-samples', type=int, default=10, help='worst-token samples to print (0 disables)')
     ap.add_argument('--print-sequences', type=int, default=3, help='worst sequences to print (0 disables)')
     ap.add_argument('--chunk', type=int, default=8)
+    ap.add_argument('--context-scan-positions', type=int, default=2000000,
+                    help='bound the prefix-ambiguity scan (0 = scan the whole evaluated split)')
     ap.add_argument('--device', default=None)
     args = ap.parse_args(argv)
     device = torch.device(args.device) if args.device else L.DEVICE
@@ -196,6 +202,8 @@ def main(argv=None):
         raise SystemExit(f'--max-rows must be a positive integer, got {n_rows}')
     if args.print_samples < 0 or args.print_sequences < 0:
         raise SystemExit('--print-samples/--print-sequences must be non-negative integers')
+    if args.context_scan_positions < 0:
+        raise SystemExit('--context-scan-positions must be a non-negative integer (0 means unbounded)')
     n_rows = min(n_rows, int(val_batch.shape[0]))
     val_batch = np.ascontiguousarray(val_batch[:n_rows, :seq_len])
     if val_bnd is not None:
@@ -208,7 +216,8 @@ def main(argv=None):
     print(f'[errors] scoring {n_rows} validation rows x {seq_len} tokens with {os.path.basename(args.ckpt)}')
     res = L.analyze_errors(model, val_batch, vocab, device, tokenizer=tok,
                            top_n=args.top_sequences, top_tokens=args.top_tokens,
-                           chunk=args.chunk, val_bnd=val_bnd, train_ids=train_ids)
+                           chunk=args.chunk, val_bnd=val_bnd, train_ids=train_ids,
+                           context_scan_max_positions=(args.context_scan_positions or None))
     res['checkpoint'] = os.path.abspath(args.ckpt)
     res['checkpoint_sha256'] = _sha256(args.ckpt)
     res['checkpoint_meta'] = {k: _roundtrip(meta.get(k)) for k in
@@ -267,12 +276,19 @@ def main(argv=None):
             lines.append(f'| {c} | {n} | {(_guide.get(c) or "").replace("|", "\\|")} |')
     _ca = res.get('context_ambiguity') if isinstance(res.get('context_ambiguity'), dict) else {}
     if _ca:
+        _scan = _ca.get('scan') if isinstance(_ca.get('scan'), dict) else {}
+        _scan_txt = ('whole evaluated split' if _ca.get('scan_complete')
+                     else f'{_scan.get("n_rows_scanned")}/{_scan.get("n_rows_total")} row(s), '
+                          f'{_scan.get("n_positions_scanned")} position(s)')
         lines += ['', '**Prefix ambiguity (label inconsistency vs genuine ambiguity):**', '',
                   f'- contexts with more than one observed next token: {_ca.get("n_contexts_with_multiple_targets")} '
-                  f'covering {_ca.get("n_positions_with_ambiguous_context")} scored position(s)',
+                  f'covering {_ca.get("n_positions_with_ambiguous_context")} scored position(s) '
+                  f'(scan: {_scan_txt})',
                   f'- reviewed worst tokens: {_ca.get("n_ambiguous_worst")} / {_ca.get("n_worst_reviewed")} '
                   f'share their prefix with a different target',
                   f'- {_ca.get("note")}']
+        if _ca.get('scan_note'):
+            lines.append(f'- {_ca.get("scan_note")}')
     _all = res.get('cause_counts_all') if isinstance(res.get('cause_counts_all'), dict) else {}
     if _all:
         lines += ['', '**Whole-split cause tally (finite targets, heuristic):**', '',
