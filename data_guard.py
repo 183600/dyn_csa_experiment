@@ -4323,12 +4323,29 @@ def _row_keys(X):
                     h.update(b'|')
                 keys.append(h.digest())
         return keys
-    # Integer/bool/datetime/timedelta rows are hashed in their own dtype.
-    # Converting them to float64 first collapses distinct int64 values above
-    # 2**53 (and nanosecond timestamps) into false duplicates.
-    if (np.issubdtype(src.dtype, np.integer) or src.dtype == np.bool_
-            or np.issubdtype(src.dtype, np.datetime64)
+    if (np.issubdtype(src.dtype, np.datetime64)
             or np.issubdtype(src.dtype, np.timedelta64)):
+        # A native temporal row must follow its instant, not the storage unit.
+        # Hashing the raw dtype bytes made the same instant keyed differently
+        # by unit (``datetime64[D]`` 2020-01-01 != the same value in ``[s]`` or
+        # ``[ns]``), so an exact duplicate stored at a different resolution was
+        # reported as zero overlap.  Build the same canonical per-cell keys as
+        # the object path (which also keeps native and object temporal rows
+        # comparable) and include NaT as one missing-like identity.
+        _step = _hash_row_block(int(src.shape[1]), 1 << 16)
+        keys = []
+        for start in range(0, src.shape[0], _step):
+            for row in src[start:start + _step]:
+                h = hashlib.blake2b(digest_size=8)
+                for v in row:
+                    h.update(_temporal_key(v))
+                    h.update(b'|')
+                keys.append(h.digest())
+        return keys
+    # Integer/bool rows are hashed in a canonical int64 form.  Converting them
+    # to float64 first collapses distinct int64 values above 2**53 into false
+    # duplicates.
+    if np.issubdtype(src.dtype, np.integer) or src.dtype == np.bool_:
         _step = _hash_row_block(int(src.shape[1]), 1 << 16)
         keys = []
         for start in range(0, src.shape[0], _step):

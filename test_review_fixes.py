@@ -11538,6 +11538,47 @@ def t_data_guard_nat_and_label_identity():
     assert _shift['js_divergence'] > 0.5, _rep2
 
 
+def t_native_temporal_row_keys_are_unit_canonical():
+    # A native datetime/timedelta column stores an instant in a declared unit.
+    # Hashing the raw dtype bytes keyed the SAME instant differently by unit,
+    # so an exact duplicate held at a different resolution (e.g. a day-stamped
+    # train cache and a second-stamped holdout) was reported as zero overlap.
+    import data_guard as DG
+    days = np.array([[np.datetime64('2020-01-01', 'D')],
+                     [np.datetime64('2020-01-02', 'D')]])
+    seconds = np.array([[np.datetime64('2020-01-01', 's')],
+                        [np.datetime64('2020-01-03', 's')]])
+    nanos = np.array([[np.datetime64('2020-01-01', 'ns')]])
+    assert DG._row_keys(days)[0] == DG._row_keys(seconds)[0]
+    assert DG._row_keys(days)[0] == DG._row_keys(nanos)[0]
+    assert DG._row_keys(days)[0] != DG._row_keys(days)[1]
+    # Native and object spellings of the same instant share one row key, just
+    # as the object column path already canonicalised them.
+    obj = np.array([[np.datetime64('2020-01-01', 's')]], dtype=object)
+    assert DG._row_keys(days[:1])[0] == DG._row_keys(obj)[0]
+    # Outside the int64-nanosecond range the exact unit scaling must still
+    # collapse equal instants instead of falling back to dtype bytes.
+    far_d = np.array([[np.datetime64('2500-01-01', 'D')]])
+    far_s = np.array([[np.datetime64('2500-01-01', 's')]])
+    assert DG._row_keys(far_d)[0] == DG._row_keys(far_s)[0]
+    # Timedeltas use their own identity and never collide with datetimes.
+    td_d = np.array([[np.timedelta64(1, 'D')]])
+    td_s = np.array([[np.timedelta64(86400, 's')]])
+    assert DG._row_keys(td_d)[0] == DG._row_keys(td_s)[0]
+    assert DG._row_keys(td_d)[0] != DG._row_keys(days[:1])[0]
+    # NaT is one missing-like identity per temporal kind, across units.
+    nat_d = np.array([[np.datetime64('NaT', 'D')]])
+    nat_s = np.array([[np.datetime64('NaT', 's')]])
+    assert DG._row_keys(nat_d)[0] == DG._row_keys(nat_s)[0]
+    assert DG._row_keys(nat_d)[0] != DG._row_keys(
+        np.array([[np.timedelta64('NaT', 's')]]))[0]
+    # The cross-array overlap audit is the caller that compares separately
+    # stored tables, so exercise it end to end.
+    import audit_gates as A
+    assert A._row_overlap_count(days, seconds) == 1
+    assert A._row_overlap_count(days, seconds[1:]) == 0
+
+
 def t_object_temporal_duplicate_identity():
     # Adjacent nanosecond timestamps have the same float64 image.  An object
     # column must not collapse them into false duplicates (which would drop
@@ -15336,6 +15377,7 @@ def main():
     _check('L66 preprocessor audit rejects truncated feature stats', t_preprocessor_audit_rejects_truncated_stats)
     _check('L67 single-factor audit fails closed on a non-object manifest', t_single_factor_audit_rejects_nonobject_manifest)
     _check('L68 classification threshold metadata matches the actual predictions', t_classification_threshold_metadata_matches_predictions)
+    _check('L69 native temporal row keys are unit-canonical across stored tables', t_native_temporal_row_keys_are_unit_canonical)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')
