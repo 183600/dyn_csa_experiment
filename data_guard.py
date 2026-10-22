@@ -1237,6 +1237,29 @@ def _safe_quantiles(values, qs):
     return (-math.inf, math.inf)
 
 
+def _ks_statistic(reference, holdout):
+    """Exact two-sample Kolmogorov-Smirnov distance between finite samples.
+
+    The empirical-CDF difference can change value only at an observation of
+    either sample, so evaluating it at both sorted samples is exact and avoids
+    materialising the pooled union.  Returns ``None`` for an empty side (the
+    statistic is undefined, not zero).
+    """
+    a = np.sort(np.asarray(reference, dtype=np.float64).reshape(-1))
+    b = np.sort(np.asarray(holdout, dtype=np.float64).reshape(-1))
+    if a.size == 0 or b.size == 0:
+        return None
+    # At each reference value the reference CDF is its right rank; the holdout
+    # CDF is the count <= that value.  The symmetric evaluation at holdout
+    # values covers every possible extremum of the two step functions.
+    fa_at_a = np.searchsorted(a, a, side='right') / float(a.size)
+    fb_at_a = np.searchsorted(b, a, side='right') / float(b.size)
+    fa_at_b = np.searchsorted(a, b, side='right') / float(a.size)
+    fb_at_b = np.searchsorted(b, b, side='right') / float(b.size)
+    return float(max(np.max(np.abs(fa_at_a - fb_at_a)),
+                     np.max(np.abs(fa_at_b - fb_at_b))))
+
+
 def _persisted_features(stats, *, what):
     """Validate a persisted ``features`` table against ``n_features_in``.
 
