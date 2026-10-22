@@ -2450,3 +2450,56 @@ python test_review_fixes.py     # L119 三值审计、L120 确认层剔除/未�
 python v12_supp.py plan         # 冻结预检不变
 python v12_supp.py smoke        # P5T 往返仍覆盖，smoke 记录不可入确认
 ```
+
+## 47. 面向放大的分块/侧车/宿主几何：不要按 token 或 block 建 Python 列表
+
+本节不改变任何冻结配置或测量值；四处在长序列/长文档下会随规模放大的
+表示或失败路径被修正。
+
+### 47.1 均匀步长分块也必须遵守大行 NumPy 契约
+
+`_segment` 的通用后继表路径已在 `n > 64` 时返回 NumPy `counts` 行，避免
+为每个 block 建 Python 对象；但均匀步长闭式捷径仍无条件执行
+`[_stride] * (n // _stride)`。m=1 / `block_size=1` 臂的步长恰为 1，长序列
+因此先产生一个每 block 一个指针的 Python 列表，随后消费端
+`np.asarray(counts)` 还会再复制一次。现在捷径先用 `int64` NumPy 行构造
+同一组整数，仅 `n <= 64` 时转回历史 list 形式；`bids`、`honoured`、
+`counts` 与 `sum(counts)` 的值逐项不变。
+
+### 47.2 逐 token 文档 sidecar 不得为每篇文档建临时列表
+
+缓存构建的验证流原先用 `array.extend([doc_id] * take)` 写逐 token id。
+长文档会临时分配「每个 token 一个指针」的 Python 列表，尽管独立的
+capped-row helper 已改用 `np.repeat`。现在改用
+`array.extend(itertools.repeat(doc_id, take))`：临时对象 O(1)，写出的
+uint64 id 序列完全相同。
+
+### 47.3 宿主几何的 OOM 必须走既有回退，而不是让整层崩溃
+
+池化几何的宿主构建器承诺「宿主形式不能服务时返回 `None`，调用方回退到
+设备端形式」。原 `except` 覆盖 RuntimeError/TypeError/ValueError/
+AttributeError，但 `MemoryError`（以及 `OverflowError`）不在此列：规模
+放大后宿主侧一次大分配失败会直接终止，而不是使用值完全相同的设备端
+几何。六个宿主构建器现把分配失败也视为「不能服务」；pinned staging 池在
+`pin_memory` 因显存/锁页内存不足抛 `MemoryError` 时同样回退。成功路径的
+整数与布尔值不变。
+
+### 47.4 参数审计的档位必须从阶梯发现（S10 也按数值排序）
+
+`m0_supp.run_params` 过去遍历字面量 `('S1', 'S2', 'S3', 'S4')`。新增
+`SCALE_LADDER` 档位时，面板解析器和 `scale_ladder_audit` 已能发现，但
+planned-vs-observed 参数量表会静默漏掉该档。现在档位列表由
+`SCALE_LADDER` 生成并按数值排序（`S2` 在 `S10` 前）；没有记录规划值的
+档位仍然测量并写出，只是 `ratio_to_plan=None`，不删除也不 KeyError。
+
+边界：47.1–47.3 是表示/传输层修正（整数、缓存字节、前向值均不变），
+47.4 是审计覆盖面修正；冻结清单、臂/种子/终点/α/Holm 族、训练数值路径与
+`CODE_SEMANTICS` 均不变。
+
+入口与验证：
+
+```bash
+python test_review_fixes.py     # L121 大行分块 + MemoryError 回退；L122 阶梯发现/排序
+python test_open_block.py       # 分块与开块回归
+python v12_supp.py plan         # 冻结预检不变：72/72、6 个主比较
+```

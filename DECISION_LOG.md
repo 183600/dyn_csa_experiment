@@ -1832,3 +1832,60 @@ absent/one-sided evidence is `None`, never True).
 `python test_review_fixes.py` passes 454/457 with the same 3 DataLoader
 environment skips; `python v12_supp.py plan` still admits 72/72 synthetic
 frozen records with the same six comparisons.
+
+## 2026-10-22 — scale-safe segmentation / sidecar construction / host fallbacks
+
+Zero-GPU correctness review aimed at future scale; no training run, frozen
+manifest byte, test split, `CODE_SEMANTICS`, README or CI configuration was
+touched. The integer values and every measured PPL are unchanged; the fixes
+remove per-block/per-token Python-object materialisation and one crash path
+when the optional host geometry cannot be allocated.
+
+**Bug 1 (uniform-stride segmentation).** `_segment` has a closed-form
+uniform-stride shortcut. Its general successor-walk path already returns a
+NumPy `counts` row for `n > 64`, but the shortcut always built
+`[_stride] * (n // _stride)` as a Python list. For the m=1 / `block_size=1`
+arm the stride is one, so a long sequence created one Python list element per
+block before any consumer ran, and downstream `np.asarray(counts)` copied it
+again. The shortcut now builds the same integers directly in an `int64`
+NumPy row for large `n` and converts to the historical list only for `n <= 64`.
+`bids`, `honoured`, counts and sum(n) are byte-for-byte the same values.
+
+**Bug 2 (per-token document sidecar).** The cache builder's inline validation
+path used `array.extend([doc_id] * take)` for every document. A long document
+therefore allocated a temporary Python list with one pointer per token even
+though the standalone capped-row helper had already been changed to
+`np.repeat`. It now extends the `array('Q')` from `itertools.repeat`, so the
+temporary object is O(1) and the stored uint64 ids are identical.
+
+**Bug 3 (host-geometry fallback contract).** The host pooling-geometry
+builders document "None when the host form cannot serve; the caller then
+falls back to the on-device form". Their `except` lists caught runtime/type/
+value/attribute errors but not `MemoryError` (or `OverflowError`), so a
+large-but-valid geometry that exceeded host memory crashed the layer instead
+of falling back. The six builders now treat allocation failure as "cannot
+serve" and return `None`; the pinned-staging pools likewise fall back when
+`pin_memory` raises `MemoryError`. No integer/value changes on the successful
+path.
+
+**Bug 4 (ladder parameter audit).** `m0_supp.run_params` iterated a literal
+`('S1', 'S2', 'S3', 'S4')`, so a newly declared `SCALE_LADDER` tier was
+silently absent from the planned-vs-observed parameter table even though the
+panel resolver and `scale_ladder_audit` had discovered it. The tier list is
+now derived from the ladder and sorted numerically (`S2` before `S10`), and a
+tier without a recorded planning value is still measured and reported with an
+explicit `None` ratio rather than dropped or raising `KeyError`.
+
+**Boundary.** Bugs 1-3 are representation/transport corrections (same
+integers, same cache bytes, same forward values) and bug 4 is an audit-only
+coverage fix. No frozen arm/seed/endpoint/alpha/Holm family or decision rule
+changes; `CODE_SEMANTICS` is not bumped.
+
+**Verification.** New CPU tests L121 (uniform-stride counts are a large NumPy
+row with exact values, the ≤64 list contract is preserved, and the host
+geometry builders return `None` on a simulated `MemoryError`) and L122
+(numeric ladder discovery, incl. S10 ordering and an unknown tier).
+`python test_review_fixes.py` passes 456/459 with the same 3 DataLoader
+environment skips; `python test_open_block.py` passes; `python v12_supp.py
+plan` still admits 72/72 synthetic frozen records with the same six
+comparisons.

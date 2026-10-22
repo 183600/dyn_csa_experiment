@@ -141,14 +141,38 @@ def _ladder_params(name):
 
 _PLAN_PARAMS = {'S1': 0.14e9, 'S2': 0.26e9, 'S3': 0.62e9, 'S4': 1.3e9}
 
+
+def _ladder_tier_names(ladder=None):
+    """Every declared ladder tier in numeric order (S2 before S10).
+
+    The parameter audit used to iterate a literal ``('S1', 'S2', 'S3', 'S4')``.
+    A new ``SCALE_LADDER['S5']`` (or S10) then silently dropped out of the
+    planned-vs-observed table even though the driver, the panel resolver and
+    ``scale_ladder_audit`` had already discovered it.  Keep this list derived
+    from the ladder itself; unknown/non-``S<n>`` names sort after numeric tiers
+    by their label instead of raising.
+    """
+    names = [str(n) for n in ((L.SCALE_LADDER if ladder is None else ladder) or {})]
+
+    def _key(name):
+        _m = re.fullmatch(r'S(\d+)', name)
+        return (0, int(_m.group(1)), '') if _m else (1, 0, name)
+
+    return sorted(names, key=_key)
+
 def run_params(outdir='results_m0_params'):
-    """S1–S4 参数量审计：SmallGPT 实例化统计（S1 全量对拍，S2–S4 均匀层组合，
-    S4 即规划的解析外推口径），对照规划值。
+    """Scale-ladder parameter audit: SmallGPT instantiation counts.
+
+    Every tier declared in ``SCALE_LADDER`` is measured (the list is discovered,
+    not a literal S1-S4 tuple); S1 is cross-checked against a full
+    instantiation and the other tiers use the same uniform-layer composition.
+    A tier without a recorded planning value is still reported, with its ratio
+    explicitly marked unavailable.
 
     结果连同代码/环境/git 溯源戳写入 `outdir/params_audit.json` 并登记
     experiments.jsonl——参数量是可引用的数字，只打印不留痕
     就无法追溯是哪一版代码算出的。"""
-    print(f'[params] SmallGPT(csa_dynamic) @ vocab={L.B_VOCAB} seq={L.RUN_S1["seq_len"]} — 实例化统计（S1 全量对拍，S2–S4 均匀层组合，S4 即规划的解析外推口径）\n')
+    print(f'[params] SmallGPT(csa_dynamic) @ vocab={L.B_VOCAB} seq={L.RUN_S1["seq_len"]} — 实例化统计（S1 全量对拍，其余档位均匀层组合；档位从 SCALE_LADDER 发现）\n')
     sc1 = L.SCALE_LADDER['S1']
     with torch.random.fork_rng():
         cfgs = L.make_layer_cfgs(sc1['n_layers'], 'csa_dynamic')
@@ -162,12 +186,18 @@ def run_params(outdir='results_m0_params'):
     print(f'[params] self-check: S1 full instantiation = {n_full:,} == uniform-layer composition  OK\n')
     print(f"{'档':<4}{'配置':<28}{'参数量':>16}{'规划值':>14}{'比值':>8}")
     tiers = []
-    for name in ('S1', 'S2', 'S3', 'S4'):
+    for name in _ladder_tier_names():
         sc = L.SCALE_LADDER[name]
         n, _pl = _ladder_params(name)
         cfg_txt = f"d={sc['d']}/{sc['n_layers']}L/{sc['n_heads']}H/dh={sc['d_head']}"
-        print(f"{name:<4}{cfg_txt:<28}{n:>16,}{_PLAN_PARAMS[name] / 1e9:>12.2f}B{n / _PLAN_PARAMS[name]:>8.2f}")
-        tiers.append({'tier': name, 'config': {'d': sc['d'], 'n_layers': sc['n_layers'], 'n_heads': sc['n_heads'], 'd_head': sc['d_head']}, 'params': int(n), 'plan_params': _PLAN_PARAMS[name], 'ratio_to_plan': n / _PLAN_PARAMS[name]})
+        _plan = _PLAN_PARAMS.get(name)
+        if _plan is not None:
+            print(f"{name:<4}{cfg_txt:<28}{n:>16,}{_plan / 1e9:>12.2f}B{n / _plan:>8.2f}")
+        else:
+            # A tier added after these planning values were recorded is still
+            # measured and reported; only its planning ratio is unavailable.
+            print(f"{name:<4}{cfg_txt:<28}{n:>16,}{'—':>13}{'—':>8}")
+        tiers.append({'tier': name, 'config': {'d': sc['d'], 'n_layers': sc['n_layers'], 'n_heads': sc['n_heads'], 'd_head': sc['d_head']}, 'params': int(n), 'plan_params': _plan, 'ratio_to_plan': (n / _plan if _plan is not None else None)})
     _budget_tiers = []
     # Discover every declared RUN_<tier> instead of freezing S1/S2: a future
     # S3/S4 added to SCALE_LADDER must enter the transfer audit without a
@@ -181,11 +211,11 @@ def run_params(outdir='results_m0_params'):
           f"tokens/param ratio={_budget.get('tokens_per_param_ratio')}")
     for _w in _budget.get('warnings') or []:
         print(f'[params] WARNING: {_w}')
-    print('\n[params] 规划值约 0.14B / 0.26B / 0.62B / 1.3B；差异超过两成即需要回改阶梯配置或修订规划。')
+    print('\n[params] S1–S4 的参考规划值约为 0.14B / 0.26B / 0.62B / 1.3B；有规划值的档位差异超过两成即需要回改阶梯配置或修订规划。')
     os.makedirs(outdir, exist_ok=True)
     L.stamped_analysis('m0_params_audit', {
         'vocab': int(L.B_VOCAB), 'seq_len': int(L.RUN_S1['seq_len']),
-        'method': 'SmallGPT instantiation count; S1 verified against a full instantiation, S2-S4 by uniform-layer composition (S4 = the planned analytic extrapolation)',
+        'method': 'SmallGPT instantiation count; S1 verified against a full instantiation, every other declared tier by the same uniform-layer composition',
         'self_check': {'s1_full_instantiation': int(n_full), 's1_uniform_layer_composition': int(n_s1), 'passed': bool(n_s1 == n_full)},
         'plan_source': 'SCALE_LADDER planning values', 'tiers': tiers,
         'scale_ladder_audit': _budget,

@@ -17741,6 +17741,49 @@ def t_v12_init_core_fp_pairing():
         assert c4['same_init_core_fp'] is None, c4
 
 
+def t_scale_uniform_segment_and_oom_fallback():
+    # The uniform-stride shortcut used to build one Python list entry per
+    # block even on a long sequence.  The m=1 / block_size=1 arm makes stride
+    # one, so that is exactly the scale path that must stay on the large-row
+    # NumPy contract (the general walk already does).
+    n = 10000
+    bids, hon, counts = L._segment(n, np.zeros(n - 1, dtype=bool), 1, 1)
+    assert isinstance(counts, np.ndarray) and counts.dtype == np.int64, type(counts)
+    assert counts.size == n and int(counts.min()) == 1 and int(counts.max()) == 1
+    assert np.array_equal(bids, np.arange(n, dtype=np.int64)), bids[:8]
+    assert hon == {}
+    # The all-cuts shortcut also ends with the partial tail block; its values
+    # and total must be identical to the repeated-count form.
+    n2 = 10001
+    bids2, hon2, counts2 = L._segment(n2, np.ones(n2 - 1, dtype=bool), 2, 2)
+    assert isinstance(counts2, np.ndarray) and counts2.dtype == np.int64
+    exp = np.full((n2 + 1) // 2, 2, dtype=np.int64)
+    exp[-1] = 1
+    assert np.array_equal(counts2, exp), (counts2[-3:], exp[-3:])
+    assert np.array_equal(bids2, np.arange(n2, dtype=np.int64) // 2)
+    # Small rows keep the historical list contract (and the segment cache).
+    assert L._segment(3, [True, True], 1, 2)[2] == [1, 1, 1]
+
+    # Host pooling geometry is an optimization with a documented fallback:
+    # "None when the host form cannot serve; the caller then falls back to the
+    # on-device form".  An allocation failure is a MemoryError, which the
+    # builders must translate to None instead of crashing a long-context run.
+    import unittest.mock as mock
+    with mock.patch.object(L.np, 'empty', side_effect=MemoryError):
+        assert L._pool_parts_flat([17, 4, 9], 3, 3, 30) is None
+        assert L._pool_geom_flat_var([17, 4, 9], 3, 3, 30, 4, 2, 5, 3) is None
+        assert L._pool_geom_flat_single([17, 4, 9], 3, 30, 4, 5) is None
+
+
+def t_ladder_tier_discovery_is_numeric_and_complete():
+    # The parameter audit used to iterate a literal S1-S4 tuple.  A newly
+    # declared SCALE_LADDER tier must be discovered (and numeric order must
+    # not turn S10 into the second tier).
+    assert M0._ladder_tier_names({'S10': {}, 'S2': {}, 'X': {}}) == ['S2', 'S10', 'X']
+    assert M0._ladder_tier_names({}) == []
+    assert {'S1', 'S2', 'S3', 'S4'}.issubset(set(M0._ladder_tier_names()))
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -18199,6 +18242,8 @@ def main():
     _check('L118 device block geometry matches host at scale (max_block < min_block)', t_device_segment_geometry_matches_host_at_scale)
     _check('L119 per-seed matched-initialization audit is tri-state', t_paired_init_core_audit)
     _check('L120 confirmation drops init-mismatched pairs and never vacuous-passes', t_v12_init_core_fp_pairing)
+    _check('L121 uniform segmentation stays NumPy at scale and OOM falls back', t_scale_uniform_segment_and_oom_fallback)
+    _check('L122 ladder parameter tiers are discovered in numeric order', t_ladder_tier_discovery_is_numeric_and_complete)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

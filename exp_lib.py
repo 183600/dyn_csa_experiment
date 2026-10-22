@@ -1924,10 +1924,18 @@ def _segment(n, want_cut_list, min_block, max_block):
         # the cut (count 2), not to the short stride.
         _stride = max(1, min(_mb, _xb))
     if _stride is not None:
-        counts = [_stride] * (n // _stride)
-        _rem = n % _stride
+        # The uniform shortcut must obey the same large-table contract as the
+        # general walk below: small rows keep the historical Python-list form,
+        # but a long sequence (e.g. the m=1 / block_size=1 arm, where stride is
+        # one) must not materialise one Python object per block.  Build the
+        # repeated row in NumPy first and convert only the <=64-token case.
+        _nfull, _rem = divmod(n, _stride)
+        _k = _nfull + (1 if _rem else 0)
+        counts = np.full(_k, _stride, dtype=np.int64)
         if _rem:
-            counts.append(_rem)
+            counts[-1] = _rem
+        if n <= 64:
+            counts = counts.tolist()
         # Floor division is the same exact integer block id the repeated-count
         # form builds (uniform stride over the whole sequence).
         bids = _np_range(n) // _stride
@@ -2058,7 +2066,7 @@ def _h2d_stage(shape, dtype, device):
             try:
                 with torch.inference_mode(False):
                     slots = [[torch.empty(shape, dtype=dtype).pin_memory(), None] for _ in range(n_slots)]
-            except (RuntimeError, TypeError):
+            except (RuntimeError, TypeError, MemoryError):
                 return (None, None)
             _H2D_POOL_BYTES[0] += est
             ent = {'slots': slots, 'rr': 0, 'bytes': est}
@@ -2106,7 +2114,7 @@ def _h2d_async(host_src, dtype, device):
             return t.to(device)
         try:
             t = t.pin_memory()
-        except RuntimeError:
+        except (RuntimeError, MemoryError):
             pass
         return t.to(device, non_blocking=t.is_pinned())
 
@@ -2172,7 +2180,7 @@ def _d2h_stage(shape, dtype, device):
             try:
                 with torch.inference_mode(False):
                     slots = [[torch.empty(shape, dtype=dtype).pin_memory(), None] for _ in range(n_slots)]
-            except (RuntimeError, TypeError):
+            except (RuntimeError, TypeError, MemoryError):
                 return (None, None)
             _D2H_POOL_BYTES[0] += est
             ent = {'slots': slots, 'rr': 0, 'bytes': est}
@@ -3536,7 +3544,7 @@ def _pool_parts_flat(counts_l, B, ov, n, pad_to=1):
         if pad:
             flat[total:] = 0
         return _pool_geom_content_put(_ck, (flat, total))
-    except (RuntimeError, TypeError, ValueError, AttributeError):
+    except (RuntimeError, TypeError, ValueError, OverflowError, MemoryError, AttributeError):
         return None
 
 def _pool_parts_host(block_ids, B, ov, n, counts_l):
@@ -3558,7 +3566,7 @@ def _pool_parts_host(block_ids, B, ov, n, counts_l):
         # the bucket pad is sliced off first; the unbound segment views are
         # read-only views into buf.
         return buf[:total].view(8 if ov is not None else 4, int(B)).unbind(0)
-    except (RuntimeError, TypeError, ValueError, AttributeError):
+    except (RuntimeError, TypeError, ValueError, OverflowError, MemoryError, AttributeError):
         return None
 
 def _pool_geom_flat_var(counts_l, B, ov, n, max_len, ov_hi, pa_rows, pb_rows, pad_to=1):
@@ -3627,7 +3635,7 @@ def _pool_geom_flat_var(counts_l, B, ov, n, max_len, ov_hi, pa_rows, pb_rows, pa
         else:
             np.minimum(pos, pa_rows - 1, out=pos_a)
         return _pool_geom_content_put(_ck, (flat_i, flat_b, n_a, n_b, W_b, max_len))
-    except (RuntimeError, TypeError, ValueError, AttributeError):
+    except (RuntimeError, TypeError, ValueError, OverflowError, MemoryError, AttributeError):
         return None
 
 def _pool_geom_host_var(counts_l, B, ov, n, max_len, ov_hi, pa_rows, pb_rows, dev):
@@ -3647,7 +3655,7 @@ def _pool_geom_host_var(counts_l, B, ov, n, max_len, ov_hi, pa_rows, pb_rows, de
         mbuf = _h2d_async(flat_b, torch.bool, dev)
         # the bucket pad tail is never read: every view has an explicit end.
         return (g_a, mbuf[0:n_a].view(B, max_len), g_b, mbuf[n_a:n_a + n_b].view(B, W_b), b_off, pos_a)
-    except (RuntimeError, TypeError, ValueError, AttributeError):
+    except (RuntimeError, TypeError, ValueError, OverflowError, MemoryError, AttributeError):
         return None
 
 def _pool_geom_flat_single(counts_l, B, n, max_len, p_rows, pad_to=1):
@@ -3687,7 +3695,7 @@ def _pool_geom_flat_single(counts_l, B, n, max_len, p_rows, pad_to=1):
         else:
             np.minimum(pos, p_rows - 1, out=pos_a)
         return _pool_geom_content_put(_ck, (flat_i, mask_np, n_g, max_len))
-    except (RuntimeError, TypeError, ValueError, AttributeError):
+    except (RuntimeError, TypeError, ValueError, OverflowError, MemoryError, AttributeError):
         return None
 
 def _pool_geom_host_single(counts_l, B, n, max_len, p_rows, dev):
@@ -3706,7 +3714,7 @@ def _pool_geom_host_single(counts_l, B, n, max_len, p_rows, dev):
         buf = _h2d_async(flat_i, _idt, dev)
         mask = _h2d_async(mask_np, torch.bool, dev)[:n_g].view(B, max_len)
         return (buf[0:n_g].view(B, max_len), mask, buf[n_g:n_g + max_len])
-    except (RuntimeError, TypeError, ValueError, AttributeError):
+    except (RuntimeError, TypeError, ValueError, OverflowError, MemoryError, AttributeError):
         return None
 
 def _pool_parts(block_ids, B, ov, n):
@@ -7582,7 +7590,13 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=None, val_seqs=512,
                     if take > 0:
                         arr[cursor:cursor + take] = ids[:take]
                         if _token_doc_ids is not None:
-                            _token_doc_ids.extend([_doc_u] * int(take))
+                            # `array.extend` consumes an iterator in place, so
+                            # a long document does not allocate a temporary
+                            # Python list with one pointer per token (the same
+                            # O(tokens) hazard the standalone capped-row helper
+                            # avoids with np.repeat).
+                            _token_doc_ids.extend(
+                                itertools.repeat(_doc_u, int(take)))
                         cursor += take
                     if cursor >= cap_tokens:
                         _stop = True
