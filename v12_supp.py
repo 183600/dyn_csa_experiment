@@ -1076,6 +1076,21 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test',
         return out
     eval_lens = [int(x) for x in manifest.get('eval', {}).get('by_length_ppl', cfg['eval_lens'])]
     _dfp = L._ids_fp(np.ascontiguousarray(test_ids).reshape(-1))
+    # The matched-initialization digest is the evidence that "same seed"
+    # really means "same shared trunk".  Resolve it once (training summary
+    # first, checkpoint metadata as a fallback) and require a resumed record
+    # to carry the SAME value: a record whose provenance predates the field
+    # is re-evaluated rather than silently reused as "unverified".
+    _ck_init = d.get('init_core_fp')
+    _tr_init = _tr.get('init_core_fp')
+    if _ck_init and _tr_init and str(_ck_init) != str(_tr_init):
+        print(f'[p5t] REFUSE {v} s{seed}: checkpoint init_core_fp {str(_ck_init)[:12]}… != training-record init_core_fp {str(_tr_init)[:12]}… — the weights and the training record describe different shared-trunk initializations')
+        del d
+        out['status'] = 'skipped_init_mismatch'
+        return out
+    _expect_init = _tr_init or _ck_init
+    if not _expect_init:
+        print(f'[p5t] WARNING: {v} s{seed}: no init_core_fp in the training record or checkpoint — the pair will be reported as initialization-UNVERIFIED and cannot be certified as matched')
     _cur = L.locked_json_read(spath).get(f'{v}::s{seed}')
     _ck_sha = None
     try:
@@ -1104,6 +1119,12 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test',
         if rec.get('split') != split:
             return True
         if rec.get('train_fp') != _tr_train_fp:
+            return True
+        # A record written before the matched-initialization field existed is
+        # not a reusable confirmation measurement when the training/checkpoint
+        # provenance DOES carry the digest: re-evaluate it so the pair can be
+        # verified instead of resuming on unverified metadata.
+        if _expect_init and rec.get('init_core_fp') != _expect_init:
             return True
         # Same weights/data are not enough if the hardware/software/determinism
         # class changed: this record was measured on a different execution
@@ -1213,7 +1234,7 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test',
     # Keep the checkpoint's provenance fields on a separate binding so the
     # record writer never depends on a variable that this function deletes.
     _ck_prov = {k: d.get(k) for k in ('train_knobs', 'params', 'train_objective',
-                                      'param_breakdown', 'rng_fp')}
+                                      'param_breakdown', 'rng_fp', 'init_core_fp')}
     # score EVERY loaded row: test_ids is the frozen slice already sliced to
     # the manifest's n_seqs_clean, and data_fp is computed over all of them.
     # eval_length_gen's default (n_seq=8) would measure only the
@@ -1237,12 +1258,15 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test',
         # records (admitted=0) after the one-shot test access had already been
         # burned.
         _tk = _tr.get('train_knobs') or _ck_prov.get('train_knobs')
+        # _expect_init was resolved before the resume check; reuse the SAME
+        # value here so the record and the staleness test cannot disagree.
         summary[f'{v}::s{seed}'] = {'variant': v, 'seed': seed, 'params': _tr.get('params') or _ck_prov.get('params'), 'by_len': r, 'split': split, 'data_fp': _dfp, 'train_fp': _tr_train_fp, '_code': V.CKPT_CODE, 'recipe': _ck_recipe, 'manifest_sha256': _msha, 'ckpt_sha256': _ensure_ck_sha(), 'ckpt_sig': (list(_ck_sig) if _ck_sig is not None else None),
                                     'n_seq': int(test_ids.shape[0]),
                                     'train_knobs': _tk,
                                     'train_objective': _tr.get('train_objective') or _ck_prov.get('train_objective'),
                                     'param_breakdown': _tr.get('param_breakdown') or _ck_prov.get('param_breakdown'),
                                     'rng_fp': _tr.get('rng_fp') or _ck_prov.get('rng_fp'),
+                                    'init_core_fp': _expect_init,
                                     'exec_fp': _ft_exec_fp,
                                     'environment': _ft_env,
                                     'amp_dtype': (_tk or {}).get('amp_dtype') if isinstance(_tk, dict) else None,
@@ -1251,7 +1275,7 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test',
         print(f'  [p5t] {v:32s} s{seed} ' + '  '.join((f'L{k}={vv.get("ppl", float("nan")):.2f}' for k, vv in sorted(r.items()))))
         return summary
     L.locked_json_update(spath, _merge)
-    L.log_experiment_event(outdir, {'kind': 'eval', 'tracking_schema': 2, 'run_id': _ft_run_id, 'status': 'ok', 'started_at': _ft_started, 'finished_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'elapsed_s': time.time() - _ft_t0, 'key': f'{v}::s{seed}', 'variant': v, 'seed': int(seed), 'split': split, 'code': V.CKPT_CODE, 'manifest_sha256': _msha, 'recipe': _ck_recipe, 'ckpt_sha256': _ck_sha, 'data_fp': _dfp, 'train_fp': _tr_train_fp, 'params': _tr.get('params'), 'exec_fp': _ft_exec_fp, 'environment': _ft_env, 'metrics': {'by_len': {str(k): (v2 or {}).get('ppl') for k, v2 in r.items()}}})
+    L.log_experiment_event(outdir, {'kind': 'eval', 'tracking_schema': 2, 'run_id': _ft_run_id, 'status': 'ok', 'started_at': _ft_started, 'finished_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'elapsed_s': time.time() - _ft_t0, 'key': f'{v}::s{seed}', 'variant': v, 'seed': int(seed), 'split': split, 'code': V.CKPT_CODE, 'manifest_sha256': _msha, 'recipe': _ck_recipe, 'ckpt_sha256': _ck_sha, 'data_fp': _dfp, 'train_fp': _tr_train_fp, 'params': _tr.get('params'), 'init_core_fp': _expect_init, 'exec_fp': _ft_exec_fp, 'environment': _ft_env, 'metrics': {'by_len': {str(k): (v2 or {}).get('ppl') for k, v2 in r.items()}}})
     del d
     return out
 
@@ -2529,15 +2553,48 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
     # and batch order are not independently re-derivable from a record; report
     # them instead of silently assuming them.
     _rngs = sorted({str(r.get('rng_fp')) for r in admitted.values() if r.get('rng_fp')})
-    _inits = sorted({str(r.get('init_core_fp')) for r in admitted.values() if r.get('init_core_fp')})
+    # init_core_fp is a function of the SEED: a healthy panel has a different
+    # digest for every seed and the SAME digest for the two arms within a
+    # seed.  The old global "all values equal" test was both conceptually
+    # wrong (it would fail a healthy panel) and vacuously true when no record
+    # carried the field.  Summarise the per-seed two-arm contract instead.
+    _init_by_seed = {}
+    for (_v, _s), _r in admitted.items():
+        _iv = _r.get('init_core_fp')
+        # Same rule as the per-comparison audit: a malformed non-string value
+        # is unverified, never stringified into a match.
+        if isinstance(_iv, str) and _iv.strip():
+            _init_by_seed.setdefault(int(_s), {}).setdefault(str(_v), set()).add(_iv.strip())
+    _init_mismatch, _init_complete = [], True
+    if set(_init_by_seed) != {int(s) for s in manifest['seeds']}:
+        # A panel-level "matched initialization" statement needs evidence for
+        # every declared seed, not only the ones that happened to be admitted.
+        _init_complete = False
+    for _s, _byarm in _init_by_seed.items():
+        _vals = set().union(*_byarm.values())
+        # More than one digest for the same seed is a definite inconsistency
+        # whether it appears across arms or (via a duplicate record) within
+        # one arm.  Admission refuses duplicate (arm, seed) records, so the
+        # second case is defensive.
+        if len(_vals) > 1 or any(len(_x) > 1 for _x in _byarm.values()):
+            _init_mismatch.append(int(_s))
+        if set(_byarm) != set(manifest['arms']):
+            _init_complete = False
+    _inits = sorted({x for _byarm in _init_by_seed.values() for _v in _byarm.values() for x in _v})
+    _same_init = (None if not _init_by_seed
+                  else (False if _init_mismatch
+                        else (True if _init_complete else None)))
     stats['validity'] = {
         'rng_fp_values': _rngs,
         'same_rng_fp': len(_rngs) <= 1,
         'init_core_fp_values': _inits,
-        'same_init_core_fp': len(_inits) <= 1,
-        'init_core_fp_recorded': bool(_inits),
+        'init_core_fp_recorded': bool(_init_by_seed),
+        'init_core_fp_seeds': sorted(_init_by_seed),
+        'init_core_fp_complete': bool(_init_complete),
+        'init_core_fp_mismatch_seeds': _init_mismatch,
+        'same_init_core_fp': _same_init,
         'n_seq_values': sorted({n for n in (_record_int(r.get('n_seq')) for r in admitted.values()) if n is not None}),
-        'note': 'exact sign-flip requires within-seed exchangeability (same data order / eval rows / corruption grid). data_fp, train_fp, n_seq and recipe are machine-checked; the shared-trunk initialization digest (init_core_fp) is reported and compared (`same_init_core_fp`); rng_fp is reported but NOT enforced (architecture-induced RNG consumption is part of the arm), so the exchangeability claim remains a declared, machine-instrumented assumption.',
+        'note': ('exact sign-flip requires within-seed exchangeability (same data order / eval rows / corruption grid). data_fp, train_fp, n_seq and recipe are machine-checked; the shared-trunk initialization digest (init_core_fp) is checked PER SEED between the two arms (a definite mismatch drops that pair; a one-sided/absent digest is UNVERIFIED, never read as a match), and rng_fp is reported but NOT enforced (architecture-induced RNG consumption is part of the arm). The exchangeability claim therefore remains a declared assumption, but the matched-initialization part of it is now measured and enforced rather than vacuously true.'),
     }
     # The frozen comparison is parameter-matched, not compute-matched.
     # Refuse a non-descriptive plan that does not disclose
@@ -2613,10 +2670,19 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
             bl = rec.get('by_len') or {}
             c = bl.get(Ln, bl.get(str(Ln)))
             return float(c['ppl']) if isinstance(c, dict) and L.ppl_is_usable(c.get('ppl')) and isinstance(c.get('truncated'), (bool, np.bool_)) and not bool(c.get('truncated')) else None
+        # A paired sign-flip test is only valid on pairs that started from the
+        # same shared trunk.  Check it PER SEED (the digest is seed-dependent):
+        # a definite mismatch is not a pair and is dropped by name; a legacy
+        # one-sided/absent digest is reported as unverified, never as a match.
+        _init_aud = L.paired_init_core_audit(recs_a, recs_b, common)
+        _init_status = {e['seed']: e['status'] for e in _init_aud['per_seed']}
         dl = []
         usable = []
         dropped = []
         for s in common:
+            if _init_status.get(int(s)) == 'mismatch':
+                dropped.append({'seed': int(s), 'reason': 'init_core_fp mismatch: the two arms did not start from the same shared trunk, so the seed is not a matched pair'})
+                continue
             pa, pb = (_cell_ppl(recs_a[s]), _cell_ppl(recs_b[s]))
             if pa is None or pb is None:
                 dropped.append({'seed': int(s), 'reason': f'missing usable untruncated cell at L{Ln}'})
@@ -2624,7 +2690,7 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
             dl.append(pa - pb)
             usable.append(s)
         if len(usable) < 2:
-            stats['comparisons'][name] = {'omitted': f'<2 complete seed pairs at the frozen endpoint (common records: {common}; usable pairs: {usable}; whitelist {manifest["seeds"]})', 'n': 0, 'expected_sign': exp_sign, 'dropped_pairs': dropped}
+            stats['comparisons'][name] = {'omitted': f'<2 complete seed pairs at the frozen endpoint (common records: {common}; usable pairs: {usable}; whitelist {manifest["seeds"]})', 'n': 0, 'expected_sign': exp_sign, 'dropped_pairs': dropped, 'init_core_fp': _init_aud}
             continue
         res = V.exact_sign_permutation(dl)
         _n_eff = len(usable)
@@ -2634,6 +2700,10 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
         res['coverage_ok'] = bool(_n_eff == len(manifest['seeds']))
         res['missing_seeds'] = sorted(set(int(s) for s in manifest['seeds']) - set(int(s) for s in usable))
         res['dropped_pairs'] = dropped
+        res['init_core_fp'] = _init_aud
+        res['same_init_core_fp'] = _init_aud['pairing_ok']
+        res['init_core_fp_recorded'] = any(('a' in e) or ('b' in e)
+                                          for e in _init_aud['per_seed'])
         res['min_seeds_for_confirmation'] = _n_min
         # Diagnostics must use the n that actually entered THIS comparison,
         # so p_floor / min_attainable_p_holm / power describe the test that
@@ -2649,10 +2719,6 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
             res['power_first_holm_gate_effective'] = {f'q={q:.2f}': L.signflip_power(_floor_n, len(manifest['primary_comparisons']), q, _alpha) for q in (0.8, 0.85, 0.9, 0.95)}
         _param = _param_match_detail(recs_a, recs_b, usable, a, b)
         res.update(_param)
-        _iv = sorted({str(recs_a[s].get('init_core_fp')) for s in usable if recs_a[s].get('init_core_fp')} |
-                     {str(recs_b[s].get('init_core_fp')) for s in usable if recs_b[s].get('init_core_fp')})
-        res['same_init_core_fp'] = (len(_iv) <= 1)
-        res['init_core_fp_recorded'] = bool(_iv)
         _act = []
         for _recs in (recs_a, recs_b):
             for s in usable:
@@ -2721,6 +2787,16 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
     # manifests without the disclosure keep the historical wording.
     _param_required = bool(_manifest_requires_params(manifest))
 
+    # Matched initialization is a VALIDITY precondition of the paired test,
+    # not an extra effect-size threshold: a pair whose two arms carry
+    # different shared-trunk digests is dropped above, and a comparison that
+    # still shows a definite mismatch (e.g. a legacy manifest without
+    # complete coverage) cannot be called confirmed.  `None` (unverified
+    # legacy evidence) keeps the historical permissive path, but it is never
+    # printed as equality.
+    def _init_gate(k):
+        return stats['comparisons'].get(k, {}).get('same_init_core_fp') is not False
+
     def _param_gate(k):
         if not _param_required:
             return True
@@ -2729,6 +2805,7 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
     _conf = [k for k in _rej if stats['comparisons'].get(k, {}).get('direction_ok') is True
              and stats['comparisons'].get(k, {}).get('param_matched') is not False
              and _param_gate(k)
+             and _init_gate(k)
              and int(stats['comparisons'].get(k, {}).get('n_effective') or 0) >= int(stats['comparisons'].get(k, {}).get('min_seeds_for_confirmation') or len(manifest['seeds']))
              and (not _require_cov or stats['comparisons'].get(k, {}).get('coverage_ok') is True)]
     stats['coverage_requirement'] = {
@@ -2766,6 +2843,8 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
                                           'coverage_required': bool(_require_cov),
                                           'n_effective': stats['comparisons'].get(k, {}).get('n_effective'),
                                           'min_seeds_for_confirmation': stats['comparisons'].get(k, {}).get('min_seeds_for_confirmation'),
+                                          'same_init_core_fp': stats['comparisons'].get(k, {}).get('same_init_core_fp'),
+                                          'init_core_fp_mismatch_seeds': (stats['comparisons'].get(k, {}).get('init_core_fp') or {}).get('mismatch_seeds'),
                                           'direction_ok': stats['comparisons'].get(k, {}).get('direction_ok')}
                                       for k in _rej if k not in _conf}
     _m = len(manifest['primary_comparisons'])
@@ -3150,26 +3229,39 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
         A('')
     comps = ft.get('comparisons') or {}
     if comps:
-        A('| 冻结主比较（test split，配对） | n | 覆盖完整 | 参数匹配 | Δ mean±std | Δ 95% CI（文档 token 池化 cluster / 行 bootstrap） | d_z | p (exact) | p 下限 | Holm p | Holm 拒绝 | 方向符合 |')
-        A('|---|---|---|---|---|---|---|---|---|---|---|---|')
+        A('| 冻结主比较（test split，配对） | n | 覆盖完整 | 参数匹配 | 初始化配对 | Δ mean±std | Δ 95% CI（文档 token 池化 cluster / 行 bootstrap） | d_z | p (exact) | p 下限 | Holm p | Holm 拒绝 | 方向符合 |')
+        A('|---|---|---|---|---|---|---|---|---|---|---|---|---|')
         holm = ft.get('holm') or {}
         for k, v in comps.items():
             if 'omitted' in v:
-                A(f'| {k} | 0 | — | — | —（{v["omitted"]}） | — | — | — | — | — | — | — |')
+                A(f'| {k} | 0 | — | — | — | —（{v["omitted"]}） | — | — | — | — | — | — | — |')
                 continue
             _h = holm.get(k) or {}
             _hp = f'{_h.get("p_holm", float("nan")):.3f}' if _h.get('p_holm') is not None else '—'
             _hr = '✔' if (_h.get('p_holm') is not None and float(_h['p_holm']) < _report_alpha) else '✘'
             _dir = v.get('direction_ok')
             _ds = '—（非方向性）' if _dir is None else ('✔' if _dir else '✘')
+            _ipa = v.get('same_init_core_fp')
+            _ipa_txt = '—（未验证）' if _ipa is None else ('✔' if _ipa else '✘')
             _dsm = v.get('doc_sampling') or {}
             _dcitxt = _doc_ci_markdown_cell(_dsm)
             _dwin = _dsm.get('doc_a_better_fraction')
             _dunit = ('文档' if _dsm.get('granularity') == 'document' else '行')
             if isinstance(_dwin, (int, float)) and _dcitxt != '—':
                 _dcitxt += f'；{100.0 * _dwin:.0f}% {_dunit} Δ<0'
-            A(f'| {k} | {v["n"]} | {v.get("coverage_ok")} | {v.get("param_matched")} | {v["mean"]:+.2f} ± {v.get("std", 0):.2f} | {_dcitxt} | {v.get("cohens_dz", float("nan")):+.2f} | {v["p_exact_signflip"]:.3f} | {v.get("p_floor", float("nan")):.3f} | {_hp} | {_hr} | {_ds} |')
+            A(f'| {k} | {v["n"]} | {v.get("coverage_ok")} | {v.get("param_matched")} | {_ipa_txt} | {v["mean"]:+.2f} ± {v.get("std", 0):.2f} | {_dcitxt} | {v.get("cohens_dz", float("nan")):+.2f} | {v["p_exact_signflip"]:.3f} | {v.get("p_floor", float("nan")):.3f} | {_hp} | {_hr} | {_ds} |')
         A('')
+        _init_dropped = {k: [d for d in (v.get('dropped_pairs') or [])
+                             if 'init_core_fp' in str(d.get('reason', ''))]
+                         for k, v in comps.items()}
+        _init_dropped = {k: ds for k, ds in _init_dropped.items() if ds}
+        if _init_dropped:
+            A('（初始化配对：' + '；'.join(
+                f'{k} 丢弃种子 {[d["seed"] for d in ds]}'
+                for k, ds in sorted(_init_dropped.items()))
+              + '。这些种子的两臂 shared-trunk 初始化摘要不同，已按「不是配对」剔除，'
+                '不进入精确符号翻转检验；覆盖门因此会拒绝把它们当作完整面板。）')
+            A('')
         if any(isinstance((_v.get('doc_sampling') or {}).get('pooled_delta_ppl_ci95'),
                           (list, tuple))
                for _v in comps.values()):
@@ -3180,7 +3272,7 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
             A('')
         _conf = ft.get('confirmed')
         if _conf is None:
-            _conf = [k for k, v in holm.items() if v.get('reject') and (comps.get(k, {}).get('direction_ok') is True) and (comps.get(k, {}).get('param_matched') is not False) and (comps.get(k, {}).get('coverage_ok') is True)]
+            _conf = [k for k, v in holm.items() if v.get('reject') and (comps.get(k, {}).get('direction_ok') is True) and (comps.get(k, {}).get('param_matched') is not False) and (comps.get(k, {}).get('same_init_core_fp') is not False) and (comps.get(k, {}).get('coverage_ok') is True)]
         if _conf:
             A(f'**确认结果**：{len(_conf)}/{len(comps)} 个冻结主比较在 Holm 校正后成立**且方向符合预注册**（{sorted(_conf)}）——这是预注册规则下的确认性证据。')
         else:
@@ -3188,7 +3280,8 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
             _sig = [k for k, _h in holm.items()
                     if _h.get('p_holm') is not None and float(_h['p_holm']) < _report_alpha
                     and comps.get(k, {}).get('direction_ok') is True
-                    and comps.get(k, {}).get('param_matched') is not False]
+                    and comps.get(k, {}).get('param_matched') is not False
+                    and comps.get(k, {}).get('same_init_core_fp') is not False]
             _cov_blocked = [k for k in _sig if comps.get(k, {}).get('coverage_ok') is False]
             if _cov_req and _cov_blocked:
                 A(f'**确认结果**：{sorted(_cov_blocked)} 达到「Holm p < {_report_alpha:g}」且方向符合，'

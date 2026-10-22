@@ -17590,6 +17590,157 @@ def t_doc_ci_markdown_cell_prefers_pooled_cluster():
     assert 'bootstrap' in cell4, cell4
 
 
+def t_paired_init_core_audit():
+    # The digest is seed-dependent, so a healthy panel has DIFFERENT values
+    # across seeds and EQUAL values across the two arms within a seed.
+    a = {0: {'init_core_fp': 'aa'}, 1: {'init_core_fp': 'bb'},
+         2: {'init_core_fp': 'cc'}}
+    b = {0: {'init_core_fp': 'aa'}, 1: {'init_core_fp': 'XX'}, 2: {}}
+    r = L.paired_init_core_audit(a, b, [0, 1, 2])
+    assert r['n_pairs'] == 3 and r['n_verified'] == 1, r
+    assert r['n_mismatch'] == 1 and r['n_unverified'] == 1, r
+    assert r['mismatch_seeds'] == [1] and r['unverified_seeds'] == [2], r
+    assert r['keep_seeds'] == [0, 2], r
+    assert r['pairing_ok'] is False, r
+    # All pairs verified: the across-seed values still differ, which must NOT
+    # be misread as a mismatch.
+    ok = L.paired_init_core_audit(a, {0: {'init_core_fp': 'aa'},
+                                      1: {'init_core_fp': 'bb'},
+                                      2: {'init_core_fp': 'cc'}}, [0, 1, 2])
+    assert ok['pairing_ok'] is True and ok['n_mismatch'] == 0, ok
+    # No digest anywhere is UNVERIFIED (None), never the vacuous True that made
+    # the old global `len(values) <= 1` test look like a pass.
+    empty = L.paired_init_core_audit({0: {}, 1: {}}, {0: {}, 1: {}}, [0, 1])
+    assert empty['pairing_ok'] is None and empty['n_unverified'] == 2, empty
+    # A one-sided digest is unverifiable, not equality.
+    one = L.paired_init_core_audit({0: {'init_core_fp': 'a'}}, {0: {}}, [0])
+    assert one['n_unverified'] == 1 and one['pairing_ok'] is None, one
+    # A malformed non-string value must not stringify into a match.
+    mal = L.paired_init_core_audit({0: {'init_core_fp': 123}},
+                                   {0: {'init_core_fp': '123'}}, [0])
+    assert mal['n_unverified'] == 1 and mal['pairing_ok'] is None, mal
+    # A missing record is not a pair either.
+    miss = L.paired_init_core_audit({0: {'init_core_fp': 'a'}}, {}, [0])
+    assert miss['n_missing'] == 1 and miss['pairing_ok'] is None, miss
+    assert L.paired_init_core_audit({}, {}, [])['pairing_ok'] is None
+    # Seed identity is validated exactly like the other fragility helpers.
+    for _bad in ('0', 0.0, True, 3):
+        try:
+            L.paired_init_core_audit({}, {}, _bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'seed collection {_bad!r} was accepted')
+    for _call in (lambda: L.paired_init_core_audit([], {}, [0]),
+                  lambda: L.paired_init_core_audit({}, {}, [0, 0]),
+                  lambda: L.paired_init_core_audit({}, {}, [0, [0]]),
+                  lambda: L.paired_init_core_audit({}, {}, [0, True])):
+        try:
+            _call()
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('malformed audit input must raise ValueError')
+
+
+def t_v12_init_core_fp_pairing():
+    class _EmptyModel:
+        def state_dict(self):
+            return {}
+
+    # The metadata must actually travel with the weights, not only with the
+    # training summary; the P5T writer reads it from this payload.
+    _pl = L._checkpoint_payload(_EmptyModel(), variant='v', seed=0, step=1,
+                                val_ppl=1.0, train_ce=1.0, health={},
+                                extra={'init_core_fp': 'DEADBEEF'})
+    assert _pl.get('init_core_fp') == 'DEADBEEF', _pl
+
+    def _mk_manifest(td, seeds):
+        m = {'frozen_at': '2026-10-22', 'code_semantics_expected': L.CODE_SEMANTICS,
+             'arms': ['a_arm', 'b_arm'], 'seeds': list(seeds),
+             'primary_comparisons': [{'name': 'c1', 'a': 'a_arm', 'b': 'b_arm',
+                                      'endpoint': 'by_len.ppl@4096',
+                                      'expected_sign': 'negative'}],
+             'statistics': {'test': 'exact two-sided sign-flip',
+                            'correction': 'holm step-down',
+                            'descriptive_only': True,
+                            'require_complete_coverage': True,
+                            'min_seeds_for_confirmation': 2}}
+        p = os.path.join(td, 'm.json')
+        with open(p, 'w', encoding='utf-8') as f:
+            json.dump(m, f)
+        return V12._load_manifest(p)
+
+    def _rec(v, s, init, ppl, msha):
+        r = {'variant': v, 'seed': s, 'split': 'test', 'data_fp': 'FP',
+             'by_len': {'4096': {'ppl': ppl, 'n_tok': 1000,
+                                 'truncated': False}},
+             '_code': L.code_stamp(), 'manifest_sha256': msha}
+        if init is not None:
+            r['init_core_fp'] = init
+        return r
+
+    with tempfile.TemporaryDirectory() as td:
+        m = _mk_manifest(td, [0, 1])
+        outdir = os.path.join(td, 'res')
+        os.makedirs(outdir)
+        V12._check_or_write_freeze_lock(outdir, m, 'FP', stage='accessed')
+        bp = os.path.join(outdir, 'bylen.json')
+
+        def _run(raw, tag):
+            with open(bp, 'w', encoding='utf-8') as f:
+                json.dump(raw, f)
+            return V12.finaltest_stats(
+                manifest=m, bylen_path=bp,
+                probe_path=os.path.join(td, 'no_probe.json'),
+                out=os.path.join(td, f'stats_{tag}.json'))
+
+        # Healthy: each seed has its own init, both arms agree per seed.
+        raw = {'a_arm::s0': _rec('a_arm', 0, 'I0', 10.0, m['manifest_sha256']),
+               'b_arm::s0': _rec('b_arm', 0, 'I0', 12.0, m['manifest_sha256']),
+               'a_arm::s1': _rec('a_arm', 1, 'I1', 10.0, m['manifest_sha256']),
+               'b_arm::s1': _rec('b_arm', 1, 'I1', 13.0, m['manifest_sha256'])}
+        st = _run(raw, 'ok')
+        c = st['comparisons']['c1']
+        assert c['n_effective'] == 2 and c['coverage_ok'] is True, c
+        assert c['same_init_core_fp'] is True, c
+        assert c['init_core_fp']['pairing_ok'] is True, c['init_core_fp']
+        assert c['init_core_fp_recorded'] is True, c
+        assert st['validity']['same_init_core_fp'] is True, st['validity']
+        assert st['validity']['init_core_fp_complete'] is True, st['validity']
+
+        # One arm's seed-1 digest differs: that seed is not a matched pair and
+        # must be dropped by name, so a 2-seed complete-coverage plan cannot
+        # confirm from the remnants.
+        bad = {k: dict(v) for k, v in raw.items()}
+        bad['b_arm::s1']['init_core_fp'] = 'OTHER'
+        st2 = _run(bad, 'mismatch')
+        c2 = st2['comparisons']['c1']
+        assert 'omitted' in c2, c2
+        assert c2['init_core_fp']['mismatch_seeds'] == [1], c2['init_core_fp']
+        assert c2['dropped_pairs'][0]['seed'] == 1, c2['dropped_pairs']
+        assert 'init_core_fp' in c2['dropped_pairs'][0]['reason'], c2
+        assert st2['validity']['same_init_core_fp'] is False, st2['validity']
+        assert st2['validity']['init_core_fp_mismatch_seeds'] == [1], st2
+
+        # No digest recorded: unverified (None), never True, and no pair is
+        # silently certified as matched.
+        unv = {k: {kk: vv for kk, vv in v.items() if kk != 'init_core_fp'}
+               for k, v in raw.items()}
+        st3 = _run(unv, 'unverified')
+        c3 = st3['comparisons']['c1']
+        assert c3['same_init_core_fp'] is None and c3['init_core_fp_recorded'] is False, c3
+        assert st3['validity']['same_init_core_fp'] is None, st3['validity']
+        assert st3['validity']['init_core_fp_recorded'] is False, st3['validity']
+        # One-sided evidence is also unverified, not equality.
+        one = {k: dict(v) for k, v in unv.items()}
+        one['a_arm::s1']['init_core_fp'] = 'ONLY_A'
+        st4 = _run(one, 'one_sided')
+        c4 = st4['comparisons']['c1']
+        assert c4['init_core_fp']['unverified_seeds'] == [0, 1], c4['init_core_fp']
+        assert c4['same_init_core_fp'] is None, c4
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -18046,6 +18197,8 @@ def main():
     _check('L116 doc-level analysis CI targets the pooled estimand', t_doc_level_analysis_uses_the_pooled_estimand_ci)
     _check('L117 document CI rendering never mixes estimands', t_doc_ci_markdown_cell_prefers_pooled_cluster)
     _check('L118 device block geometry matches host at scale (max_block < min_block)', t_device_segment_geometry_matches_host_at_scale)
+    _check('L119 per-seed matched-initialization audit is tri-state', t_paired_init_core_audit)
+    _check('L120 confirmation drops init-mismatched pairs and never vacuous-passes', t_v12_init_core_fp_pairing)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

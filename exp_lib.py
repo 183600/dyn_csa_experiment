@@ -26374,6 +26374,105 @@ def init_core_fingerprint(model):
         h.update(arr.tobytes())
     return h.hexdigest()[:16]
 
+def paired_init_core_audit(records_a, records_b, seeds):
+    """Audit the matched-initialization contract for PAIRED seeds.
+
+    ``init_core_fp`` hashes the shared trunk initialization.  It depends on
+    the seed, so the valid test is equality between the TWO ARMS at the SAME
+    seed; equality across different seeds is neither expected nor required.
+    Treating the whole panel as one value set would mark a healthy panel as
+    mismatched (every seed has a different init) or, when the field is
+    absent, vacuously pass.  This helper performs the per-seed check once so
+    the confirmation analysis and its tests share one definition.
+
+    A pair is ``verified`` only when both records carry a non-empty digest
+    and the digests are equal.  ``mismatch`` is definite evidence that the
+    two arms did not start from the same shared trunk, so the caller must
+    drop that pair.  A one-sided or absent digest is ``unverified`` (legacy
+    records predate the field): it is reported, never read as equality, and
+    does not by itself drop the pair.
+
+    ``pairing_ok`` is ``True`` only when every requested seed is verified,
+    ``False`` when at least one pair mismatches, and ``None`` when the
+    evidence is merely incomplete.  It is deliberately tri-state: absence of
+    evidence is not a pass.
+    """
+    if not isinstance(records_a, dict) or not isinstance(records_b, dict):
+        raise ValueError('paired_init_core_audit: records_a/records_b must be mappings')
+    if isinstance(seeds, (str, bytes)):
+        raise ValueError('paired_init_core_audit: seeds must be an iterable of integers')
+    try:
+        seed_list = list(seeds)
+    except TypeError:
+        raise ValueError('paired_init_core_audit: seeds must be an iterable') from None
+    _seen = set()
+    norm = []
+    for s in seed_list:
+        si = _as_seed_int(s)
+        if si is None:
+            raise ValueError(f'paired_init_core_audit: seed {s!r} is not an integer')
+        if si in _seen:
+            raise ValueError(f'paired_init_core_audit: duplicate seed {si}')
+        _seen.add(si)
+        norm.append(si)
+
+    def _val(rec):
+        if not isinstance(rec, dict):
+            return None
+        v = rec.get('init_core_fp')
+        # Malformed evidence is unverified, not a value: str(123) == '123'
+        # must not let a non-digest become a "match".
+        if not isinstance(v, str):
+            return None
+        s = v.strip()
+        return s if s else None
+
+    per_seed = []
+    counts = {'verified': 0, 'mismatch': 0, 'unverified': 0, 'missing': 0}
+    for s in norm:
+        ra, rb = records_a.get(s), records_b.get(s)
+        va, vb = _val(ra), _val(rb)
+        if ra is None or rb is None:
+            status = 'missing'
+        elif va is not None and vb is not None:
+            status = 'verified' if va == vb else 'mismatch'
+        else:
+            status = 'unverified'
+        counts[status] += 1
+        entry = {'seed': int(s), 'status': status}
+        if va is not None:
+            entry['a'] = va
+        if vb is not None:
+            entry['b'] = vb
+        per_seed.append(entry)
+    n_pairs = len(norm)
+    mismatch = [e['seed'] for e in per_seed if e['status'] == 'mismatch']
+    unverified = [e['seed'] for e in per_seed if e['status'] == 'unverified']
+    missing = [e['seed'] for e in per_seed if e['status'] == 'missing']
+    if mismatch:
+        pairing_ok = False
+    elif n_pairs and counts['verified'] == n_pairs:
+        pairing_ok = True
+    else:
+        pairing_ok = None
+    return {'n_pairs': int(n_pairs), 'n_verified': int(counts['verified']),
+            'n_mismatch': int(counts['mismatch']),
+            'n_unverified': int(counts['unverified']),
+            'n_missing': int(counts['missing']),
+            'verified_seeds': [e['seed'] for e in per_seed if e['status'] == 'verified'],
+            'mismatch_seeds': mismatch, 'unverified_seeds': unverified,
+            'missing_seeds': missing,
+            'pairing_ok': pairing_ok,
+            'keep_seeds': [e['seed'] for e in per_seed if e['status'] != 'mismatch'],
+            'per_seed': per_seed,
+            'definition': ('verified = both arms at the same seed carry an equal non-empty '
+                           'init_core_fp; mismatch = both present but different (drop the pair); '
+                           'unverified = one-sided/absent digest (legacy, not a match); '
+                           'pairing_ok is True only if every requested pair is verified, '
+                           'False if any mismatches, None if evidence is incomplete.'),
+            'note': ('matched initialization is a pairing validity precondition, not a '
+                     'measured outcome; no training or evaluation value is changed')}
+
 def capture_rng_state():
     """Snapshot every RNG stream a short diagnostic may consume.
 
@@ -30453,6 +30552,12 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
                 'extra': {'train_fp': _ids_fp(train_ids),
                           'eval_fp': _ids_fp(np.ascontiguousarray(np.asarray(val_batch)).reshape(-1)) if val_batch is not None else None,
                           'rng_fp': _rng_fp, 'params': int(n_param),
+                          # The matched-initialization digest travels with the
+                          # weights, not only with the training summary: the
+                          # confirmation evaluator must be able to verify the
+                          # pair without trusting a separately persisted
+                          # summary file.
+                          'init_core_fp': _init_core_fp,
                           'open_block_config': open_block_config(_inner_model),
                           # Enough geometry to rebuild the model for
                           # post-hoc error analysis without guessing defaults.

@@ -1764,3 +1764,71 @@ the cluster interval) and new L118 (device vs host segmenter at `n=10003` for
 `python test_review_fixes.py` passes 452/455 with the same 3 DataLoader
 environment skips; `python v12_supp.py plan` still admits 72/72 synthetic
 frozen records with the same six comparisons.
+
+## 2026-10-22 — matched-initialization evidence reaches the confirmation test (no new runs)
+
+Zero-GPU validity/provenance hardening; no panel, frozen manifest byte
+(`confirmation_frozen.json`), training or evaluation numeric path,
+`CODE_SEMANTICS`, test split, README or CI configuration was touched.
+
+**Problem.** The exact sign-flip confirmation is a paired-seed test: within a
+seed the two arms must share the same shared-trunk initialization. Training
+already records `init_core_fp` (a digest of the `tok`/`pos`/`head`/`norm`
+initial tensors), and the generic `pair_reason` refuses a pair whose digests
+differ or are one-sided. The confirmation path did not carry that evidence:
+`_finaltest_bylen_cell` copied only `train_knobs/params/train_objective/
+param_breakdown/rng_fp` from the training record, so `bylen.json` never had
+`init_core_fp`. Three consequences followed. (1) `finaltest_stats` could not
+check the pairing it claimed to check. (2) Its global
+`same_init_core_fp = len(set(values)) <= 1` was both conceptually wrong —
+the digest is a function of the seed, so a healthy panel HAS different values
+across seeds — and vacuously true when no value existed, printing "same" for
+"no evidence". (3) `_admit_confirmation_records` never ran the init check, so
+a definitely mismatched pair could enter the test; with a legacy
+`require_complete_coverage=false` manifest it could even confirm from the
+remaining pairs.
+
+**Changes.** (1) The checkpoint `extra` now stores `init_core_fp`, and
+`_finaltest_bylen_cell` copies it from the training record (falling back to
+the weight metadata) into every bylen record and the experiment event.  If
+the checkpoint and the training record both carry the field but disagree, the
+cell is REFUSED (the weights and the record describe different
+initializations).  A missing digest emits an explicit WARNING and is never
+invented.  A resumed bylen record whose digest differs from the expected one
+— including a legacy record that has no field — is stale and is re-evaluated
+rather than reused as an "unverified" confirmation measurement. (2) New
+`exp_lib.paired_init_core_audit(records_a, records_b, seeds)` performs the
+per-SEED two-arm check and returns four states (`verified`, `mismatch`,
+`unverified`, `missing`) plus a tri-state `pairing_ok`: True only when every
+requested pair is verified, False on any definite mismatch, None when the
+evidence is merely incomplete. A one-sided/absent digest is unverified, not
+equality. (3) Each primary comparison runs that audit; mismatched seeds are
+named in `dropped_pairs` and excluded from the exact sign-flip test. If fewer
+than two pairs remain the comparison is `omitted`, not invented. Per-
+comparison `init_core_fp`, `same_init_core_fp` and `init_core_fp_recorded`
+are written, and the top-level `validity` block now summarises the per-seed
+two-arm digest sets (`init_core_fp_complete`, mismatch seeds) instead of a
+cross-seed global set. (4) `confirmed` additionally requires
+`same_init_core_fp is not False`. `None` (legacy records without the field)
+keeps the permissive historical path but is rendered as "unverified", never
+as "same". Under the shipped `require_complete_coverage=true` plan, dropping
+any seed already fails coverage, so this gate only states the same fact; it
+adds no effect-size threshold. (5) The P5T table gains an initialization-
+pairing column and prints dropped seeds/reasons when a mismatch occurs.
+
+**Boundary.** This is a pairing-validity correction, not a new endpoint or a
+changed decision rule: the frozen arms/seeds/endpoints/alpha/Holm family,
+the training numeric path and the test split are byte-for-byte unchanged.
+The checkpoint gains one metadata field; existing checkpoints still resolve
+the digest from their training record. A definite mismatch is no longer
+treated as a pair; unverified legacy evidence is not relabelled as a match.
+No `CODE_SEMANTICS` bump is needed because no loss or PPL value changes.
+
+**Verification.** New CPU tests L119 (per-seed audit: healthy across-seed
+digests, mismatch, one-sided, missing, vacuous-empty, seed validation) and
+L120 (end-to-end `finaltest_stats`: matched panel is verified; a mismatched
+seed is dropped by name and a complete-coverage plan becomes `omitted`;
+absent/one-sided evidence is `None`, never True).
+`python test_review_fixes.py` passes 454/457 with the same 3 DataLoader
+environment skips; `python v12_supp.py plan` still admits 72/72 synthetic
+frozen records with the same six comparisons.

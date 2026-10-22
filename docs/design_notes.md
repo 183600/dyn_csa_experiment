@@ -2376,3 +2376,77 @@ python test_review_fixes.py     # L116 缺失 ppl 拒绝、L118 设备/宿主分
 python test_open_block.py       # 分块与开块回归
 python v12_supp.py plan         # 冻结预检不变：72/72、6 个主比较
 ```
+
+## 46. 配对初始化的证据必须随权重走，并按种子核验
+
+确认性检验的单位是「同种子、两臂」的配对差。精确符号翻转检验要求配对内
+交换性，其中「两臂从同一个 shared-trunk 初始化出发」是可核验的必要条件。
+本轮不新增实验、不改冻结清单的臂/种子/终点/α/族，也不改训练或评测数值；
+修正的是这条证据从训练记录到确认分析之间的断链，以及一个会「真空通过」
+的读法。
+
+### 46.1 三个具体缺陷
+
+1. **证据没有进入 test 记录。** `train_variant` 已经把
+   `init_core_fp`（`tok`/`pos`/`head`/`norm` 的初始化摘要）写入训练记录，
+   但 `_finaltest_bylen_cell` 的 `_ck_prov` 只搬运
+   `train_knobs/params/train_objective/param_breakdown/rng_fp`，bylen 记录
+   从未携带该字段。确认统计从 `bylen.json` 现算，因此根本看不到初始化
+   证据；P5T 的 checkpoint 也没有保存它。
+2. **全局「所有值相等」是错的。** `init_core_fp` 是种子的函数：健康面板
+   里不同种子的摘要本来就不同，同一种子两臂才应相同。`finaltest_stats`
+   原先用「admitted 记录的全部值只有一种」作为 `same_init_core_fp`，健康
+   面板会被判为 False；更糟的是字段缺失时集合为空，
+   `len(values) <= 1` 为 True，于是「没有证据」被打印成「匹配」。
+3. **确认准入没有执行配对检查。** 通用的 `pair_reason` 会拒绝
+   `init_core_fp` 不一致或单边的配对，但 `_admit_confirmation_records`
+   只检查了数据/语料/行数/配方/代码/参数，没有调用它。于是初始化不一致的
+   种子仍可能进入确认比较；在 `require_complete_coverage=false` 的历史
+   清单下，甚至可以用剩余配对继续确认。
+
+### 46.2 修正
+
+- **随权重走。** checkpoint 的 `extra` 增加 `init_core_fp`；
+  `_finaltest_bylen_cell` 从训练记录（旧 checkpoint 则从权重元数据）取出
+  该值写入 bylen 记录与 experiment event。若 checkpoint 与训练记录都带该
+  字段但不相等，说明权重与训练记录不是同一次初始化，直接 REFUSE 该 cell；
+  缺失时打印 WARNING，明确该配对将显示为「未验证」，而不是伪造一个摘要。
+  续跑时，已有 bylen 记录的 `init_core_fp` 与当前期望值不一致（包括旧记录
+  根本没有该字段）会被判为 stale 并重新评测，而不是把一个「未验证」的
+  旧测量直接复用进确认面板。
+- **纯函数审计。** `exp_lib.paired_init_core_audit(records_a, records_b,
+  seeds)` 按种子给出 `verified` / `mismatch` / `unverified` / `missing`
+  四态，返回 `pairing_ok` 三值：全部核验为 True，存在确定不一致为 False，
+  证据不完整为 None。单边或缺失的摘要不参与相等判断。
+- **确认层执行。** 每个主比较先跑该审计；`mismatch` 的种子被**点名剔除**
+  （写入 `dropped_pairs`），不进入精确符号翻转检验。若剔除后不足两对，
+  比较按 `omitted` 记录而不是伪造结果。逐比较落盘
+  `init_core_fp`/`same_init_core_fp`/`init_core_fp_recorded`；顶层
+  `validity` 改为按种子的两臂摘要集合汇总，`init_core_fp_complete`
+  明确面板是否每个种子、每个臂都有证据。
+- **判定边界。** `confirmed` 增加
+  `same_init_core_fp is not False`：确定不一致的配对不能确认。`None`
+  （历史记录未携带该字段）保持原有 permissive 路径，但报告只写
+  「未验证」，不再写「相同」。在 shipped plan 的
+  `require_complete_coverage=true` 下，剔除任何一个种子本来就会让覆盖门
+  失败，因此该 gate 只是把同一事实写进判定，不引入新的效应量阈值。
+- **报告。** P5T 主表新增「初始化配对」列（✔ / ✘ / —未验证），并在有
+  剔除时列出种子与原因。`validity.note` 明确 `rng_fp` 仍然只报告不强制
+  （架构对 RNG 的消耗属于臂本身），而初始化这一部分现在是「测量并执行」，
+  不再是「真空为真」。
+
+### 46.3 边界
+
+这是测量/分析层的有效性修正，不是新终点：`confirmation_frozen.json`
+字节、冻结臂/种子/终点/α/Holm 族、训练数值路径、test split 与
+`CODE_SEMANTICS` 均未改变。checkpoint 只多一个元数据字段，已有 checkpoint
+仍可从训练记录回退读取。新 gate 不会把「未验证」判成失败，只阻止「确定
+不一致」被当成配对。
+
+### 46.4 入口与验证
+
+```bash
+python test_review_fixes.py     # L119 三值审计、L120 确认层剔除/未验证语义
+python v12_supp.py plan         # 冻结预检不变
+python v12_supp.py smoke        # P5T 往返仍覆盖，smoke 记录不可入确认
+```
