@@ -302,7 +302,11 @@ class PoolGeometry:
         self.max_len = int(max_len)
         self.W_b = int(W_b)
         self.overlap = overlap
-        self.max_block = int(max_block)
+        # `max_block=None` is the no-cap configuration: the counts table already
+        # encodes every forced cut, so the geometry is well defined.  Keep the
+        # declaration as None instead of crashing on int(None) (the no-cap
+        # open-block arms are a supported scale configuration).
+        self.max_block = None if max_block is None else int(max_block)
         self._b_off = None
         self._bposb_rows = None
         self._ga_cache = None
@@ -422,7 +426,7 @@ def _geom_evict(need=0):
 def _pool_geometry_cached(counts_rows, overlap, T, device, max_block):
     key = (tuple(id(c) for c in counts_rows),
            None if overlap is None else int(overlap), int(T),
-           str(device), int(max_block))
+           str(device), None if max_block is None else int(max_block))
     ent = _GEOM_CACHE.get(key)
     if ent is not None:
         refs, geom, charged = ent

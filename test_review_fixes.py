@@ -13100,6 +13100,21 @@ def t_pool_kernel_empty_sequence_matches_eager():
     assert y2.shape == (1, 0, 3) and last2.shape == (1, 0) and Bm2 == 0, (y2.shape, last2.shape, Bm2)
 
 
+def t_pool_geometry_accepts_no_cap():
+    # `max_block=None` (dynamic boundaries only) is a supported scale
+    # configuration.  The pool geometry is fully determined by the counts
+    # table, so it must not crash on int(None) — neither when built directly
+    # nor through the cache used by the fused-kernel path.
+    import csa_kernels as C
+    dev = torch.device('cpu')
+    g = C.PoolGeometry([[2, 1, 3]], overlap=2, T=6, device=dev, max_block=None)
+    assert g.max_block is None and g.R == 1 and g.Bm == 3, g.__dict__
+    g2 = C._pool_geometry_cached([[2, 1, 3]], 2, 6, dev, None)
+    assert g2.max_block is None and g2.R == 1 and g2.Bm == 3
+    g3 = C._pool_geometry_cached([[2, 1, 3]], 2, 6, dev, 128)
+    assert g3.max_block == 128
+
+
 def t_pool_variable_blocks_accepts_no_overlap():
     # `overlap=None` is the no-overlap/HCA contract.  `_pool_parts` then
     # returns a four-tuple while `_pool_ordered` unpacks eight, so this public
@@ -14667,6 +14682,7 @@ def main():
     _check('L41 warmup table uses the primary estimand', t_build_report_warmup_uses_primary_estimand)
     _check('L42 empty-sequence pool kernel matches eager', t_pool_kernel_empty_sequence_matches_eager)
     _check('L42b no-overlap pool accepts overlap=None', t_pool_variable_blocks_accepts_no_overlap)
+    _check('L42d pool geometry accepts the no-cap configuration', t_pool_geometry_accepts_no_cap)
     _check('L42c efficiency medians average both middle seeds', t_efficiency_median_uses_both_middle_seeds)
     _check('L43 eager_batch rejects typos/non-finite values', t_eager_batch_rejects_typos_and_nonfinite)
     _check('L44 gapfill merge refreshes/invalidates seed-derived fields', t_gapfill_merge_keeps_secondary_and_invalidates_stale_fields)
