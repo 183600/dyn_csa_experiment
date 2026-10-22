@@ -7379,6 +7379,76 @@ def t_hypothesis_audit_completeness_and_metric_alignment():
         names=['h'], policy={'x': None})
     assert _bad_bind['status'] == 'warn' and _bad_bind['invalid'] == ['h'], _bad_bind
 
+def t_hypothesis_coverage_audit():
+    # The shipped design must have a pre-registered hypothesis for every
+    # declared contrast family, and no stale/orphan hypothesis entries.
+    cov = L.hypothesis_coverage_audit()
+    assert cov['status'] == 'ok', cov
+    assert cov['component']['complete'] is True, cov
+    assert cov['baseline']['complete'] is True, cov
+    # A new experiment family added to the design without a hypothesis is
+    # exactly the failure this audit exists to catch.
+    design = dict(L.ABLATION_DESIGN)
+    design['unregistered_change'] = [('csa_dynamic', 'csa_fixed', 'new idea')]
+    missing = L.hypothesis_coverage_audit(design=design)
+    assert missing['status'] == 'warn', missing
+    assert 'unregistered_change' in missing['component']['missing'], missing
+    # An orphan hypothesis describes a contrast the design no longer contains.
+    table = dict(L.HYPOTHESIS_DESIGN)
+    table['ghost_component'] = dict(table['dynamic_blocking'])
+    orphan = L.hypothesis_coverage_audit(component_table=table)
+    assert orphan['status'] == 'warn', orphan
+    assert 'ghost_component' in orphan['component']['orphan'], orphan
+    # An empty family has nothing to test, even if a hypothesis exists.
+    empty_design = dict(L.ABLATION_DESIGN)
+    empty_design['empty_family'] = []
+    empty = L.hypothesis_coverage_audit(design=empty_design)
+    assert 'empty_family' in empty['component']['empty_contrast'], empty
+    # Baseline hypotheses are covered by the same contract.
+    no_base = L.hypothesis_coverage_audit(baseline_table={})
+    assert no_base['status'] == 'warn', no_base
+    assert no_base['baseline']['missing'] == sorted(L.BASELINE_DESIGN), no_base
+    # Malformed design/table inputs fail closed rather than crashing.
+    assert L.hypothesis_coverage_audit(design=[])['status'] == 'fail'
+    assert L.hypothesis_coverage_audit(component_table=[])['status'] == 'fail'
+
+
+def t_extreme_imbalance_boundary_is_inclusive():
+    # "1:1000 or more imbalanced" means prevalence <= 1e-3.  A strict `<`
+    # would leave an endpoint exactly at 1:1000 on the usual F1/accuracy
+    # headline, contradicting the declared policy.
+    assert L._extreme_imbalance(1e-3) is True
+    assert L._extreme_imbalance(1.0001e-3) is False
+    assert L._extreme_imbalance(0.0) is True
+    assert L._extreme_imbalance(None) is None
+    assert L._extreme_imbalance('bad') is None
+    # A binary endpoint with exactly one positive in 1000 must recommend the
+    # conditional PR-AUC primary, not F1/ROC.
+    y = np.array([0] * 999 + [1])
+    score = np.r_[np.linspace(0.0, 0.4, 999), 0.9]
+    m = L.classification_metrics(y, y_score=score, labels=[0, 1],
+                                 positive_label=1)
+    assert abs(m['pr_auc_prevalence'] - 1e-3) < 1e-15, m['pr_auc_prevalence']
+    assert m['recommended_primary_metric'] == 'pr_auc', m
+    assert m['imbalance_warning'] is not None, m
+    # The same boundary applies to many-way retrieval: one answer in 1000 is
+    # extreme and switches the primary to macro recall.
+    yt = np.array([0] * 999 + [1])
+    yp = np.zeros(1000, dtype=np.int64)
+    rt = L.retrieval_metrics(yt, yp, labels=[0, 1])
+    assert abs(rt['minority_prevalence'] - 1e-3) < 1e-15, rt
+    assert rt['recommended_primary_metric'] == 'macro_recall', rt
+    # And to the pre-registered hypothesis audit: an F1 hypothesis at exactly
+    # 1:1000 is misaligned with the conditional policy primary (PR-AUC).
+    spec = {'statement': 'x', 'mechanism': 'y', 'predicted_sign': -1,
+            'primary_metric': 'f1', 'metric_policy': 'binary_classification',
+            'requires_param_match': False, 'falsifier': 'z',
+            'prevalence': 1e-3}
+    ha = L.hypothesis_audit({'at_boundary': spec}, 'component')
+    assert ha['status'] == 'warn', ha
+    assert 'at_boundary' in ha['metric_misaligned'], ha
+
+
 def t_leakage_safe_split_contract():
     idx = L.chronological_split_indices(100, 0.7, 0.2, 0.1)
     assert [len(idx[k]) for k in ('train', 'val', 'test')] == [70, 20, 10], idx
@@ -12519,6 +12589,29 @@ def t_baseline_plan_preflight_and_tuned_hypothesis():
     assert tuned['search_final_seed_disjoint'] is True, tuned
     assert tuned['final_seeds_sufficient'] is True, tuned
     assert tuned['min_final_seeds_for_family_significance'] == 8, tuned
+    # The design records an explicit baseline ladder per tuning group: each
+    # method arm must have a comparison partner, and the matched subset must
+    # actually sit inside the group.
+    assert len(tuned['tuning_groups']) == 2, tuned
+    for _g in tuned['tuning_groups']:
+        assert _g['has_baseline'] is True, _g
+        assert _g['has_matched_baseline'] is True, _g
+        assert _g['method_arm'] not in _g['matched'], _g
+        for _b in _g['matched']:
+            assert _b in _g['arms'], _g
+    no_partner = dict(L.BASELINE_TUNING_PROTOCOL, arms=['method'],
+                      arm_groups=[{'arms': ['method'], 'method_arm': 'method',
+                                   'matched': []}])
+    pn = L.baseline_tuning_plan(no_partner)
+    assert pn['status'] == 'fail' and any(
+        'no baseline/control arm' in p for p in pn['problems']), pn
+    outside = dict(L.BASELINE_TUNING_PROTOCOL,
+                   arm_groups=[{'arms': list(L.BASELINE_TUNING_PROTOCOL['arms']),
+                                'method_arm': 'csa_dynamic',
+                                'matched': ['not_in_group']}])
+    pout = L.baseline_tuning_plan(outside)
+    assert pout['status'] == 'fail' and any(
+        'not in this group' in p for p in pout['problems']), pout
     simple = plan['simple']
     assert simple['status'] == 'ok' and simple['expected_cells'] == {
         'unigram': 6, 'bigram': 36}, simple
@@ -15181,6 +15274,8 @@ def main():
     _check('H5a binary threshold selection + calibration + threshold audit', t_binary_threshold_and_calibration_contract)
     _check('H5b boundary macro/micro F1 averaging contract', t_boundary_macro_micro_f1_contract)
     _check('H6 hypothesis completeness + metric alignment + direction=0', t_hypothesis_audit_completeness_and_metric_alignment)
+    _check('H6a hypothesis coverage: every declared family has one, no orphans', t_hypothesis_coverage_audit)
+    _check('H6b extreme-imbalance boundary is inclusive at 1:1000', t_extreme_imbalance_boundary_is_inclusive)
     _check('H7 simple-baseline driver uses the panel corpus', t_simple_baseline_driver_serves_the_panel_corpus)
     _check('H7a floor contrast is seed-level and significance-aware', t_simple_floor_contrast_is_significance_aware)
     _check('H8 leakage audit handles a flat 1-D train cache', t_audit_leakage_handles_flat_train_cache)

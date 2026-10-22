@@ -1026,3 +1026,40 @@ Verification: new CPU test L25c covers the shipped plan, overlap/duplicate/fold/
 group defects, the underpowered-but-launchable case and the incomplete
 count-model grid. `python baseline_tune.py plan` reports `status=ok`,
 family m=4, final seeds 0-7 sufficient for n>=8.
+
+## 2026-10-22 — hypothesis coverage + inclusive imbalance boundary + baseline ladder (no new runs)
+
+Zero-GPU experiment-design hardening; no panel result, frozen manifest,
+test-split access, README or CI configuration was touched.
+
+**Problem.** (1) `hypothesis_audit` could verify that an existing hypothesis
+was complete, but nothing checked that every declared contrast family actually
+had one: a new ablation component or baseline family could be added to the
+design with no pre-registered mechanism/direction, and the audit would still
+report `ok`.  (2) The metric policy says the conditional endpoint switches at
+"1:1000 or more imbalanced", which is prevalence `<= 1e-3`, but every code path
+used a strict `< 1e-3`.  A panel with exactly one positive in 1000 therefore
+kept the F1/accuracy headline instead of switching to PR-AUC / macro recall.
+(3) The tuning preflight checked arm groups and seed partitions but not that a
+group actually contains a baseline partner for its method arm.
+
+**Changes.** (1) `exp_lib.hypothesis_coverage_audit` checks both directions
+for the component and baseline designs: every declared family has a hypothesis
+(missing), every hypothesis maps to a declared family (orphan), and no family
+is empty.  `audit_gates.py hypotheses` now includes the coverage block (and a
+direct `hypothesis_coverage` command).  (2) `_extreme_imbalance` is the single
+inclusive boundary predicate (prevalence `<= threshold`), used by
+`hypothesis_audit`, `retrieval_metrics`, `classification_metrics` and
+`metric_policy_audit`; the policy text now states the inclusive boundary
+explicitly.  (3) `_plan_arm_groups` now validates each group's `matched`
+subset (inside the group, never the method arm) and refuses a method arm with
+no baseline/control partner.  `baseline_tuning_plan` records the resulting
+`tuning_groups` ladder so the preflight shows the actual method-vs-baseline
+pairs before GPU time is spent.
+
+Verification: new CPU tests H6a (coverage missing/orphan/empty, baseline
+coverage, fail-closed inputs), H6b (exactly 1:1000 switches to PR-AUC / macro
+recall and is rejected as an F1 hypothesis), and extended L25c (per-group
+baseline ladder, method-only group refused, matched arm outside group refused).
+`python test_review_fixes.py` passes 383/383; `python baseline_tune.py plan`
+still reports `status=ok` with family m=4 and final seeds 0-7 sufficient.

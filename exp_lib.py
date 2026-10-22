@@ -15405,8 +15405,8 @@ METRIC_POLICY = {
     'niah_retrieval': {
         'task': 'multi_class_retrieval',
         'primary': 'top1_accuracy',
-        # When one answer class is rarer than 1:1000, top-1 accuracy is
-        # dominated by the frequent answers.  Macro recall (balanced accuracy)
+        # When one answer class is at or beyond 1:1000 (prevalence <= 1e-3),
+        # top-1 accuracy is dominated by the frequent answers.  Macro recall (balanced accuracy)
         # is the recall-aligned conditional endpoint; PR-AUC is deliberately
         # NOT used because a many-way retrieval record may carry only top-1
         # labels, and inventing one-vs-rest scores from them is not valid.
@@ -15421,7 +15421,7 @@ METRIC_POLICY = {
         'chance': '1/n_observed_answer_classes (uniform); majority-answer floor also required',
         'imbalance': ('top-1 micro accuracy is dominated by frequent answer classes; '
                       'report macro recall and the uniform/majority floors alongside it. '
-                      'When a class is rarer than 1:1000 the primary endpoint switches '
+                      'When a class is at or beyond 1:1000 (prevalence <= 1e-3) the primary endpoint switches '
                       'to macro recall (balanced accuracy).'),
         'aggregation': 'query_unweighted',
         'note': ('Top-1 accuracy is reported with answer NLL, macro recall (balanced accuracy), '
@@ -15446,7 +15446,7 @@ METRIC_POLICY = {
         'direction': 'higher_is_better',
         'secondary': ['precision', 'recall', 'pr_auc', 'roc_auc', 'balanced_accuracy',
                       'brier_score', 'ece'],
-        'imbalance': 'report prevalence; when positives are rarer than 1:1000 the primary endpoint is PR-AUC, not F1 or ROC-AUC',
+        'imbalance': 'report prevalence; when positives are at or beyond 1:1000 (prevalence <= 1e-3) the primary endpoint is PR-AUC, not F1 or ROC-AUC',
         'aggregation': 'binary',
         'decision_threshold': 0.5,
         'decision_threshold_policy': ('Report the cut with every F1/precision/recall/balanced '
@@ -15455,7 +15455,7 @@ METRIC_POLICY = {
                                       'rows disjoint from evaluation and recorded as '
                                       'decision_threshold_source="validation_selection" with its '
                                       'split and metric. PR-AUC/ROC-AUC/Brier/ECE are threshold-free.'),
-        'note': 'F1 must state the averaging rule; for binary tasks it is the positive-class F1. For prevalence < 1e-3, PR-AUC is the primary ranking endpoint. Calibration (Brier/ECE) is secondary: a good ranking must not be mistaken for usable probabilities.',
+        'note': 'F1 must state the averaging rule; for binary tasks it is the positive-class F1. For prevalence <= 1e-3 (1:1000 or more imbalanced), PR-AUC is the primary ranking endpoint. Calibration (Brier/ECE) is secondary: a good ranking must not be mistaken for usable probabilities.',
     },
     'multiclass_classification': {
         'task': 'multiclass_classification',
@@ -15471,7 +15471,7 @@ METRIC_POLICY = {
                       'pr_auc_micro_lift_over_chance', 'roc_auc_macro',
                       'roc_auc_micro', 'roc_auc_weighted', 'brier_score', 'ece'],
         'imbalance': ('macro averaging is required when class frequencies differ; micro equals '
-                      'accuracy for single-label tasks; when a class is rarer than 1:1000 the '
+                      'accuracy for single-label tasks; when a class is at or beyond 1:1000 (prevalence <= 1e-3) the '
                       'primary ranking endpoint switches to one-vs-rest macro PR-AUC'),
         'aggregation': 'macro',
         'ranking': 'one-vs-rest macro/micro/weighted PR-AUC and ROC-AUC; the caller must name the averaging rule',
@@ -15487,6 +15487,91 @@ METRIC_POLICY = {
 
 _HYPOTHESIS_REQUIRED = ('statement', 'mechanism', 'predicted_sign', 'primary_metric',
                         'requires_param_match', 'falsifier')
+
+
+def _extreme_imbalance(prevalence, threshold=1e-3):
+    """Is the minority-class prevalence AT OR BEYOND the declared boundary?
+
+    The project policy says the conditional endpoint switches at "1:1000 or
+    more imbalanced".  In prevalence terms a 1:1000 endpoint is exactly 1e-3,
+    so the comparison must be inclusive: a strict ``<`` silently keeps the
+    usual F1/accuracy headline for a panel that is already at the documented
+    extreme.  Returns ``True``/``False``, or ``None`` when either argument is
+    not a usable probability/threshold.
+    """
+    prev = _finite_scalar(prevalence)
+    thr = _finite_scalar(threshold)
+    if prev is None or thr is None:
+        return None
+    if not (0.0 <= prev <= 1.0) or not (0.0 < thr <= 1.0):
+        return None
+    return bool(prev <= thr)
+
+
+def hypothesis_coverage_audit(design=None, baselines=None,
+                              component_table=None, baseline_table=None):
+    """Design-point coverage of the pre-registered hypothesis tables.
+
+    `hypothesis_audit` checks that a hypothesis which EXISTS is complete and
+    metric-aligned.  It cannot notice an experiment that was added without a
+    hypothesis, because the table and the design are separate declarations.
+    This audit closes that gap: every declared contrast family must have an
+    entry, and every entry must correspond to a declared family (an orphan
+    hypothesis describes an experiment the design no longer contains).
+
+    Both directions are reported.  A missing hypothesis is a pre-registration
+    defect; an orphan is a stale declaration.  Neither is silently defaulted.
+    """
+    design = ABLATION_DESIGN if design is None else design
+    baselines = BASELINE_DESIGN if baselines is None else baselines
+    component_table = (HYPOTHESIS_DESIGN if component_table is None
+                       else component_table)
+    baseline_table = (BASELINE_HYPOTHESIS_DESIGN if baseline_table is None
+                      else baseline_table)
+    if not isinstance(design, dict) or not isinstance(baselines, dict):
+        return {'kind': 'hypothesis_coverage', 'status': 'fail',
+                'problems': ['design and baselines must be mappings'],
+                'warnings': []}
+    if not isinstance(component_table, dict) or not isinstance(baseline_table, dict):
+        return {'kind': 'hypothesis_coverage', 'status': 'fail',
+                'problems': ['hypothesis tables must be mappings'],
+                'warnings': []}
+    out = {'kind': 'hypothesis_coverage', 'status': 'ok',
+           'component': {}, 'baseline': {}, 'warnings': []}
+
+    def _cover(label, declared, table):
+        declared_keys = sorted(declared)
+        table_keys = sorted(table)
+        missing = [k for k in declared_keys if k not in table]
+        orphan = [k for k in table_keys if k not in declared]
+        empty = [k for k in declared_keys
+                 if not isinstance(declared.get(k), (list, tuple))
+                 or not declared.get(k)]
+        out[label] = {'declared': declared_keys,
+                      'with_hypothesis': table_keys,
+                      'missing': missing, 'orphan': orphan,
+                      'empty_contrast': empty,
+                      'complete': not (missing or orphan or empty)}
+        if missing:
+            out['warnings'].append(
+                f'{label}: declared contrast family/families {missing} have no '
+                'pre-registered hypothesis — a result from them cannot be '
+                'interpreted against an expected mechanism or direction')
+        if orphan:
+            out['warnings'].append(
+                f'{label}: hypothesis entry/entries {orphan} do not correspond '
+                'to a declared contrast family — the declaration has drifted '
+                'from the experiment design')
+        if empty:
+            out['warnings'].append(
+                f'{label}: declared family/families {empty} are empty — there '
+                'is nothing for the hypothesis to be tested on')
+
+    _cover('component', design, component_table)
+    _cover('baseline', baselines, baseline_table)
+    if out['warnings']:
+        out['status'] = 'warn'
+    return out
 
 
 def _metric_policy_roles(metric, policy):
@@ -15648,10 +15733,11 @@ def hypothesis_audit(table=None, kind='component', names=None, policy=None):
                         continue
                     _cond = _pol.get('primary_when_extreme_imbalance')
                     _thr = _finite_scalar(_pol.get('extreme_imbalance_threshold'))
-                    if (_cond and _thr is not None and _prev_value < _thr
+                    if (_cond and _thr is not None
+                            and _extreme_imbalance(_prev_value, _thr)
                             and metric_role == 'primary' and pm != _cond):
                         _prev_issue = (
-                            f'prevalence={_prev_value:.3e} is below the '
+                            f'prevalence={_prev_value:.3e} is at or beyond the '
                             f'{_pn} extreme-imbalance threshold {_thr:g}; the '
                             f'policy primary switches to {_cond!r}, not {pm!r} '
                             '(or declare metric_role="secondary" with a justification)')
@@ -16012,20 +16098,20 @@ def retrieval_metrics(y_true, y_pred, labels=None, label_names=None):
     _minority_prev = min(_observed_prev) if _observed_prev else None
     _imbalance_ratio = ((1.0 - _minority_prev) / _minority_prev
                         if _minority_prev is not None and _minority_prev > 0 else None)
-    _rare = (_minority_prev is not None and _minority_prev < 1e-3)
+    _rare = bool(_extreme_imbalance(_minority_prev))
     _recommended = 'macro_recall' if _rare else 'top1_accuracy'
     return {
         'n': n, 'n_correct': n_correct,
         'minority_prevalence': _minority_prev,
         'imbalance_ratio': _imbalance_ratio,
         'imbalance_warning': (
-            'an answer class is rarer than 1:1000 — report macro recall '
+            'an answer class is at or beyond 1:1000 — report macro recall '
             '(balanced accuracy) as the conditional primary; top-1 accuracy '
             'is dominated by frequent answers' if _rare else None),
         'recommended_primary_metric': _recommended,
         'recommended_primary_reason': (
-            ('minority answer prevalence %.3e is below 1:1000; macro recall '
-             'counts every answer class equally' % _minority_prev) if _rare else
+            ('minority answer prevalence %.3e is at or below 1e-3 (1:1000); '
+             'macro recall counts every answer class equally' % _minority_prev) if _rare else
             ('minority answer prevalence %s is not extreme; top-1 accuracy is '
              'the policy primary' % ('n/a' if _minority_prev is None
                                      else '%.3e' % _minority_prev))),
@@ -16656,9 +16742,9 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None, posit
         out['minority_prevalence'] = min(_prev) if _prev else None
         out['imbalance_ratio'] = (float((1.0 - min(_prev)) / min(_prev))
                                   if _prev and min(_prev) > 0 else None)
-        if _prev and min(_prev) < 1e-3:
+        if _prev and _extreme_imbalance(min(_prev)):
             out['imbalance_warning'] = (
-                'a class is rarer than 1:1000 — report one-vs-rest macro PR-AUC '
+                'a class is at or beyond 1:1000 — report one-vs-rest macro PR-AUC '
                 '(pr_auc_macro) as the ranking endpoint; macro/micro/weighted F1 '
                 'answer different questions and ROC-AUC can look optimistic')
     if labels.size == 2:
@@ -16725,15 +16811,15 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None, posit
                 'positive-class probability and that positive_label is correct')
         if out['pr_auc'] is not None and out['roc_auc'] is not None:
             rare = min(prevalence, 1.0 - prevalence)
-            out['imbalance_warning'] = ('positives rarer than 1:1000 — PR-AUC is the primary ranking metric; ROC-AUC can look optimistic'
-                                        if rare < 1e-3 else None)
+            out['imbalance_warning'] = ('positives at or beyond 1:1000 — PR-AUC is the primary ranking metric; ROC-AUC can look optimistic'
+                                        if _extreme_imbalance(rare) else None)
         if threshold_sweep:
             out['threshold_selection'] = select_binary_threshold(
                 y_true, _bin_score, positive_label=pos)
     elif labels.size == 2 and out.get('positive_label') is not None:
         prev = out['prevalence'].get(_pos_name, 0.0)
-        if min(prev, 1.0 - prev) < 1e-3:
-            out['imbalance_warning'] = ('positives rarer than 1:1000 — report PR-AUC with scores; F1 must name its averaging rule and recall should be reported per class')
+        if _extreme_imbalance(min(prev, 1.0 - prev)):
+            out['imbalance_warning'] = ('positives at or beyond 1:1000 — report PR-AUC with scores; F1 must name its averaging rule and recall should be reported per class')
     if labels.size > 2 and y_score is not None:
         _score = np.asarray(y_score, dtype=float)
         if _score.ndim == 2:
@@ -16764,12 +16850,13 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None, posit
     _thr = 1e-3
     if pos is not None:
         _prev = float(np.mean(np.asarray(y_true) == pos))
-        _rare = min(_prev, 1.0 - _prev)
-        if _rare < _thr:
+        _rare_val = min(_prev, 1.0 - _prev)
+        _rare = bool(_extreme_imbalance(_rare_val, _thr))
+        if _rare:
             out['recommended_primary_metric'] = 'pr_auc'
             out['recommended_primary_average'] = 'binary_positive_class'
             out['recommended_primary_reason'] = (
-                f'positive prevalence {_prev:.3e} is below 1:1000; '
+                f'positive prevalence {_prev:.3e} is at or beyond 1:1000; '
                 'PR-AUC is the policy primary under extreme imbalance')
         else:
             out['recommended_primary_metric'] = 'f1'
@@ -16778,25 +16865,26 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None, posit
                 f'positive prevalence {_prev:.3e} is not extreme; '
                 'positive-class F1 is the policy primary')
         out['recommended_primary_available'] = bool(
-            out.get('pr_auc') is not None if _rare < _thr else True)
+            out.get('pr_auc') is not None if _rare else True)
     elif labels.size > 2:
         _prev_all = [float(v) for v in out.get('prevalence', {}).values()]
         if _prev_all:
-            _rare = min(_prev_all)
-            if _rare < _thr:
+            _rare_val = min(_prev_all)
+            _rare = bool(_extreme_imbalance(_rare_val, _thr))
+            if _rare:
                 out['recommended_primary_metric'] = 'pr_auc_macro'
                 out['recommended_primary_average'] = 'one_vs_rest_macro'
                 out['recommended_primary_reason'] = (
-                    f'minority prevalence {_rare:.3e} is below 1:1000; '
+                    f'minority prevalence {_rare_val:.3e} is at or beyond 1:1000; '
                     'one-vs-rest macro PR-AUC is the policy primary')
             else:
                 out['recommended_primary_metric'] = 'f1_macro'
                 out['recommended_primary_average'] = 'macro'
                 out['recommended_primary_reason'] = (
-                    f'minority prevalence {_rare:.3e} is not extreme; '
+                    f'minority prevalence {_rare_val:.3e} is not extreme; '
                     'macro F1 is the policy primary')
             out['recommended_primary_available'] = bool(
-                out.get('pr_auc_macro') is not None if _rare < _thr else True)
+                out.get('pr_auc_macro') is not None if _rare else True)
     return out
 
 def metric_policy_audit(summary=None, policy=None):
@@ -17260,7 +17348,7 @@ def metric_policy_audit(summary=None, policy=None):
                             # prevalence; the conditional endpoint stays
                             # unverifiable instead of aborting the audit.
                             _minority = None
-                        _extreme = (_minority is not None and _minority < 1e-3)
+                        _extreme = bool(_extreme_imbalance(_minority))
                         _want_primary = ('macro_recall' if _extreme
                                          else 'top1_accuracy')
                         _declared_primary = _b.get('recommended_primary_metric')
@@ -17833,7 +17921,7 @@ def metric_policy_audit(summary=None, policy=None):
                             '1e-3 default')
                         _thr_rec = 1e-3
                     _conditional = _pol_rec.get('primary_when_extreme_imbalance')
-                    if prevalence < _thr_rec and _conditional:
+                    if _extreme_imbalance(prevalence, _thr_rec) and _conditional:
                         _want_rec = _conditional
                     else:
                         _want_rec = _pol_rec.get('primary')
@@ -17873,7 +17961,7 @@ def metric_policy_audit(summary=None, policy=None):
                         _class_issues.append(
                             f'{_label}: recommended_primary_available=False but the '
                             f'recommended endpoint {_rec_metric!r} is recorded')
-            if prevalence is not None and prevalence < 1e-3:
+            if (_extreme_imbalance(prevalence)):
                 _cond = _policy_entry(task).get(
                     'primary_when_extreme_imbalance',
                     'pr_auc_macro' if task == 'multiclass_classification' else 'pr_auc')
@@ -17883,23 +17971,23 @@ def metric_policy_audit(summary=None, policy=None):
                 if r.get(_roc_key) is not None and r.get(_pr_key) is None:
                     out['warnings'].append(
                         f"{_label} reports {_roc_key} but no {_pr_key} at prevalence "
-                        f"{prevalence:.2e} (<1:1000); PR-AUC ({_pr_key}) is the primary "
-                        'ranking metric here')
+                        f"{prevalence:.2e} (at or beyond 1:1000); PR-AUC ({_pr_key}) is "
+                        'the primary ranking metric here')
                 if (not _is_mc and r.get('pr_auc') is not None
                         and r.get('pr_auc_prevalence') is None):
                     out['warnings'].append(f"{_label} reports a rare-positive PR-AUC without its prevalence floor; PR-AUC must be read against chance prevalence")
                 if _declared_primary is not None and _declared_primary != _cond:
                     _class_issues.append(
                         f'{_label}: declares primary_metric={_declared_primary!r} at '
-                        f'prevalence {prevalence:.2e} (<1:1000); the conditional '
-                        f'policy primary is {_cond!r}')
+                        f'prevalence {prevalence:.2e} (at or beyond 1:1000); the '
+                        f'conditional policy primary is {_cond!r}')
                 if r.get(_pr_key) is None and (r.get('f1_primary') is not None
                                                or r.get('f1') is not None
                                                or r.get('f1_macro') is not None):
                     _class_issues.append(
                         f'{_label}: reports F1 without {_pr_key} at prevalence '
-                        f'{prevalence:.2e} (<1:1000); F1 is threshold-dependent and '
-                        'cannot be the primary endpoint here')
+                        f'{prevalence:.2e} (at or beyond 1:1000); F1 is '
+                        'threshold-dependent and cannot be the primary endpoint here')
         if _class_recs:
             out['checks'].append({'metric': 'classification', 'records': len(_class_recs),
                                   'ok': not _class_issues,
@@ -18285,15 +18373,23 @@ def _plan_trial_grid(trials, problems, warnings):
 
 
 def _plan_arm_groups(protocol, arms, problems, warnings):
-    """Every declared arm must belong to exactly one parameter-matching group."""
+    """Every declared arm must belong to exactly one parameter-matching group.
+
+    A tuning group also has to contain an actual comparison partner for its
+    method arm.  Without that check a "baseline tuning" design can declare a
+    method arm alone in its group, launch the expensive equal search, and only
+    discover from the finished artifact that there was never a tuned baseline
+    to beat.  Returns a machine-readable ladder summary for the plan record.
+    """
     raw_groups = protocol.get('arm_groups')
+    groups_out = []
     if raw_groups is None:
         warnings.append('no arm_groups declared; the legacy all-arms contrast rule '
                         'will be used and parameter-matching groups are implicit')
-        return
+        return groups_out
     if not isinstance(raw_groups, (list, tuple)):
         problems.append(f'arm_groups must be a list, got {type(raw_groups).__name__}')
-        return
+        return groups_out
     declared = set(arms)
     seen = set()
     for idx, group in enumerate(raw_groups):
@@ -18304,17 +18400,59 @@ def _plan_arm_groups(protocol, arms, problems, warnings):
         if not isinstance(group_arms, (list, tuple, set)):
             problems.append(f'arm_groups[{idx}].arms must be a list')
             continue
+        group_arms = list(group_arms)
+        if len(set(group_arms)) != len(group_arms):
+            problems.append(f'arm_groups[{idx}].arms contains duplicates')
         method = group.get('method_arm')
         if method not in declared:
             problems.append(f'arm_groups[{idx}].method_arm={method!r} is not a declared arm')
         if method not in group_arms:
             problems.append(f'arm_groups[{idx}] method_arm={method!r} is not in its own arm list')
+        partners = [a for a in group_arms if a != method]
+        if not partners:
+            problems.append(
+                f'arm_groups[{idx}] declares method_arm={method!r} with no '
+                'baseline/control arm in the same group; there is no tuned '
+                'contrast to estimate')
+        matched_raw = group.get('matched')
+        matched = []
+        if matched_raw is not None:
+            if not isinstance(matched_raw, (list, tuple, set)):
+                problems.append(f'arm_groups[{idx}].matched must be a list')
+            else:
+                matched = list(matched_raw)
+                if method in matched:
+                    problems.append(
+                        f'arm_groups[{idx}] lists its own method_arm={method!r} '
+                        'in the parameter-matched baseline set')
+                for arm in matched:
+                    if arm not in group_arms:
+                        problems.append(
+                            f'arm_groups[{idx}].matched contains {arm!r}, which '
+                            'is not in this group')
+                if not matched:
+                    warnings.append(
+                        f'arm_groups[{idx}] declares an empty matched set; the '
+                        'method has no explicitly parameter-matched baseline')
+        elif partners:
+            warnings.append(
+                f'arm_groups[{idx}] does not declare its parameter-matched '
+                'baseline subset; matching is implicit')
         for arm in group_arms:
             if arm not in declared:
                 problems.append(f'arm_groups[{idx}] contains undeclared arm {arm!r}')
             if arm in seen:
                 problems.append(f'arm {arm!r} appears in more than one tuning group')
             seen.add(arm)
+        groups_out.append({
+            'method_arm': method,
+            'arms': group_arms,
+            'baseline_arms': partners,
+            'matched': matched,
+            'has_baseline': bool(partners),
+            'has_matched_baseline': bool(matched),
+            'declared_contrasts': [[method, a] for a in partners if a in declared],
+        })
     missing = sorted(declared - seen)
     if missing:
         problems.append(f'declared arm(s) {missing} are not covered by any tuning group')
@@ -18328,6 +18466,7 @@ def _plan_arm_groups(protocol, arms, problems, warnings):
                     problems.append(f'inherits_tuning[{arm!r}]={ref!r} is not a declared arm')
                 if arm == ref:
                     problems.append(f'inherits_tuning[{arm!r}] points at itself')
+    return groups_out
 
 
 def baseline_tuning_plan(protocol=None, *, alpha=0.05):
@@ -18350,7 +18489,7 @@ def baseline_tuning_plan(protocol=None, *, alpha=0.05):
            'search_final_seed_disjoint': None,
            'min_final_seeds_for_family_significance': None,
            'final_seeds_sufficient': None, 'trial_count': 0,
-           'grid_levels': {}, 'selection_row_split': None,
+           'grid_levels': {}, 'tuning_groups': [], 'selection_row_split': None,
            'hypothesis_audit': {}, 'problems': problems, 'warnings': warnings}
     if not isinstance(protocol, dict):
         problems.append(f'protocol must be an object, got {type(protocol).__name__}')
@@ -18388,7 +18527,7 @@ def baseline_tuning_plan(protocol=None, *, alpha=0.05):
     _note = protocol.get('search_design_note')
     if _note is not None and (not isinstance(_note, str) or not _note.strip()):
         problems.append('search_design_note must be non-empty when present')
-    _plan_arm_groups(protocol, arms, problems, warnings)
+    out['tuning_groups'] = _plan_arm_groups(protocol, arms, problems, warnings)
     # Seed partitions: search and final draws must be disjoint, and the final
     # partition must be large enough for the declared Holm family.
     search = _plan_seed_list(protocol.get('search_seeds'), 'search_seeds', problems)
