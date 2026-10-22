@@ -447,6 +447,8 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
             _te_for_size = os.path.join(cache_dir, f'test_ids_{test_tag}.npy')
             _te_n = int(np.load(_te_for_size, mmap_mode='r').size) if os.path.exists(_te_for_size) else None
             _ttd_problems = []
+            if _ttd.ndim != 1:
+                _ttd_problems.append(f'per-token doc ids have shape {_ttd.shape}, not 1-D')
             if _ttd.dtype.kind not in 'iu':
                 _ttd_problems.append(f'per-token doc ids have dtype {_ttd.dtype}, not an integer type')
             if _ttd.size and int(_ttd.min()) < 0:
@@ -454,6 +456,20 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
             if _te_n is not None and int(_ttd.size) != _te_n:
                 _ttd_problems.append(
                     f'per-token doc ids cover {_ttd.size} tokens but the test ids have {_te_n}')
+            _ted_for_ttd = os.path.join(cache_dir, f'test_doc_ids_{test_tag}.npy')
+            if (os.path.exists(_ted_for_ttd) and _ttd.ndim == 1
+                    and _ttd.dtype.kind in 'iu'):
+                try:
+                    if not np.array_equal(
+                            np.unique(_ttd),
+                            np.unique(np.load(_ted_for_ttd))):
+                        _ttd_problems.append(
+                            'per-token and per-document sidecars name different '
+                            'document sets; the document-level statistic would '
+                            'not use the verified groups')
+                except Exception as _tde:
+                    _ttd_problems.append(
+                        f'per-document sidecar cannot be compared ({type(_tde).__name__}: {_tde})')
             if _tm_doc2.get('test_token_count') is not None:
                 try:
                     if int(_tm_doc2['test_token_count']) != int(_ttd.size):

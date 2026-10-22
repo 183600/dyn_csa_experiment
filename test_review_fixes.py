@@ -17286,6 +17286,59 @@ def t_document_level_eval_uses_real_boundaries():
             raise AssertionError('eval_length_gen accepted a bad document mapping')
 
 
+def t_document_aggregation_omits_documents_absent_from_the_slice():
+    # A global document map is built on the LONGEST evaluated prefix.  For a
+    # shorter by-length cell, documents that have not started yet must not be
+    # emitted with 0 tokens and NaN PPL: n_docs would be inflated and the
+    # per-document vectors would contain non-units.
+    full = np.asarray([[1, 1, 2, 2, 3],
+                       [1, 2, 2, 2, 3]], dtype=np.uint64)
+    full_nll = torch.arange(10, dtype=torch.float32).reshape(2, 5)
+    keys, inv = L.document_index(full)
+    short = L.aggregate_nll_by_document(
+        full_nll[:, :4], full[:, :4],
+        document_index_map=(keys, inv[:, :4]))
+    assert short['n_docs'] == 2, short
+    assert short['doc_ids'] == ['0000000000000001', '0000000000000002'], short
+    assert short['n_tokens_per_doc'] == [3, 5], short
+    assert all(math.isfinite(p) and p > 0 for p in short['ppl_per_doc']), short
+    assert short['n_tokens_total'] == 8 and short['n_docs'] == len(short['nll_per_doc']), short
+    # The explicit map must be a valid (keys, inverse) for THIS slice; a
+    # stale/out-of-range/float map is refused instead of silently dropping
+    # tokens in the scatter.
+    for bad in ((keys, inv[:, :4] + 100),
+                (keys.astype(np.float64), inv[:, :4]),
+                (keys, inv[:, :4].astype(np.float64)),
+                (np.asarray([10, 20, 30]), inv[:, :4])):
+        try:
+            L.aggregate_nll_by_document(
+                full_nll[:, :4], full[:, :4], document_index_map=bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'aggregate_nll_by_document accepted {bad!r}')
+    # End-to-end: when two lengths are evaluated together, the shorter cell
+    # must contain only the documents present in that prefix.
+    import copy as _copy
+    torch.manual_seed(0)
+    dev = torch.device('cpu')
+    cfgs = L.make_layer_cfgs(2, 'full_rope')
+    model = L.SmallGPT(256, 64, 2, 4, 16, 64, _copy.deepcopy(cfgs)).to(dev)
+    model.eval()
+    ids = np.asarray(np.random.default_rng(12).integers(0, 256, size=(2, 33)),
+                     dtype=np.int64)
+    doc = np.empty_like(ids, dtype=np.uint64)
+    doc[:, :20] = 7
+    doc[:, 20:] = 9
+    cells = V7.eval_length_gen(model, ids, [8, 32], dev, max_pos=None,
+                               doc_ids=doc)
+    assert cells[8]['n_docs'] == 1, cells[8]
+    assert cells[8]['n_tokens_per_doc'] == [14], cells[8]
+    assert cells[32]['n_docs'] == 2, cells[32]
+    assert cells[32]['n_tokens_per_doc'] == [38, 24], cells[32]
+    assert all(math.isfinite(p) for p in cells[8]['ppl_per_doc']), cells[8]
+
+
 def t_doc_level_analysis_prefers_document_cells():
     na = [1.0, 2.0, 3.0, 100.0]
     nb = [2.0, 2.0, 2.0, 2.0]
@@ -17788,6 +17841,7 @@ def main():
     _check('L111 per-token document sidecar matches the capped stream', t_per_token_document_sidecar)
     _check('L112 eval aggregates by real document boundaries', t_document_level_eval_uses_real_boundaries)
     _check('L113 doc-level analysis prefers documents and refuses mixed granularity', t_doc_level_analysis_prefers_document_cells)
+    _check('L114 document aggregation omits documents absent from a shorter slice', t_document_aggregation_omits_documents_absent_from_the_slice)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

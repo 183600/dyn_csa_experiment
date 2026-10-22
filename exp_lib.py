@@ -7692,7 +7692,8 @@ def _token_doc_ids_for_capped_rows(rows, lengths, cap_tokens):
     document carries that document's id, so the boundary token is attributed
     to the document that emitted it.
     """
-    acc = array.array('Q')
+    doc_ids = []
+    takes = []
     cursor = 0
     cap_tokens = max(0, int(cap_tokens))
     for row, length in zip(rows, lengths):
@@ -7701,11 +7702,16 @@ def _token_doc_ids_for_capped_rows(rows, lengths, cap_tokens):
         take = min(int(length), cap_tokens - cursor)
         if take <= 0:
             break
-        _doc_u = int(_doc_id_u64(_doc_exact_fp(row)))
-        acc.extend([_doc_u] * take)
+        doc_ids.append(int(_doc_id_u64(_doc_exact_fp(row))))
+        takes.append(take)
         cursor += take
-    return (np.frombuffer(acc, dtype=np.uint64).copy()
-            if acc else np.empty(0, dtype=np.uint64))
+    if not takes:
+        return np.empty(0, dtype=np.uint64)
+    # One repeat rather than a Python list of `take` ids: the per-token
+    # sidecar is O(tokens), so a single long document must not materialise an
+    # equally long intermediate list.
+    return np.repeat(np.asarray(doc_ids, dtype=np.uint64),
+                     np.asarray(takes, dtype=np.int64))
 
 
 def _token_doc_ids_from_eos(token_ids, doc_ids, eos_id):
@@ -7735,27 +7741,32 @@ def _token_doc_ids_from_eos(token_ids, doc_ids, eos_id):
     if _eos < 0:
         return None, 'EOS id is negative'
     eos_pos = np.flatnonzero(arr == _eos)
-    if int(eos_pos.size) not in (int(docs.size), int(docs.size) - 1):
-        return None, (f'{eos_pos.size} EOS tokens for {docs.size} documents; '
+    n_docs = int(docs.size)
+    n_eos = int(eos_pos.size)
+    if n_eos not in (n_docs, n_docs - 1):
+        return None, (f'{n_eos} EOS tokens for {n_docs} documents; '
                        'the stream does not follow the one-EOS-per-document '
                        'construction')
-    out = np.empty(arr.size, dtype=docs.dtype)
-    start = 0
-    di = 0
-    for p in eos_pos.tolist():
-        if di >= int(docs.size):
-            return None, 'more EOS-delimited documents than sidecar ids'
-        out[start:int(p) + 1] = docs[di]
-        di += 1
-        start = int(p) + 1
-    if di < int(docs.size):
+    # Every document but (possibly) the capped final one ends at its EOS.
+    # Build the token counts per document and repeat the ids; the old loop
+    # assigned one Python slice per document, which is O(documents) Python
+    # calls and is needlessly slow on a long-context test cache.
+    ends = np.empty(n_docs, dtype=np.int64)
+    ends[:n_eos] = eos_pos + 1
+    if n_eos < n_docs:
         # The final document was truncated by the token cap; it has no EOS.
-        out[start:] = docs[di]
-        di += 1
-    elif start != int(arr.size):
-        return None, 'trailing tokens after the last EOS but no document id left'
-    if di != int(docs.size):
-        return None, 'document sidecar has unused ids'
+        ends[-1] = int(arr.size)
+    starts = np.empty(n_docs, dtype=np.int64)
+    starts[0] = 0
+    starts[1:] = ends[:-1]
+    lengths = ends - starts
+    if bool((lengths < 0).any()) or int(lengths.sum(dtype=np.int64)) != int(arr.size):
+        # This includes the n_docs == n_eos case with trailing tokens after
+        # the last EOS, which has no document id left to carry them.
+        return None, 'EOS boundaries do not partition the token stream'
+    out = np.repeat(docs, lengths)
+    if int(out.size) != int(arr.size):
+        return None, 'document sidecar does not cover the token stream'
     return out, None
 
 TEST_READ_PURPOSES = ('final_evaluation',)
@@ -8039,6 +8050,26 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=None, cache_dir=None,
                 _problems.append(
                     'split_fingerprints.test.token_documents_fp does not match '
                     'the per-token document-id sidecar')
+            # The per-token map is what the document-level evaluation actually
+            # groups by; the per-document sidecar is what the train/val/test
+            # group-isolation check intersects.  If they name different
+            # document sets, isolation can be verified for one sidecar while
+            # the scored statistic uses an unverified document.  The cold
+            # build enforces this; a cache hit must not silently relax it.
+            if (test_doc_ids is not None and _ttd.ndim == 1
+                    and _ttd.dtype.kind in 'iu'):
+                try:
+                    if not np.array_equal(
+                            np.unique(_ttd),
+                            np.unique(np.asarray(test_doc_ids).reshape(-1))):
+                        _problems.append(
+                            'per-token and per-document test sidecars name '
+                            'different document sets; the document-level '
+                            'evaluation would not match the verified groups')
+                except (TypeError, ValueError):
+                    _problems.append(
+                        'per-token and per-document test sidecars cannot be '
+                        'compared for document identity')
         elif _ttd_declared:
             _problems.append(
                 'test cache metadata records per-token document ids but the '
@@ -27743,7 +27774,10 @@ def aggregate_nll_by_document(nll, doc_ids, *, document_index_map=None):
     ``document_index_map`` is the ``(keys, inverse)`` returned by
     :func:`document_index` for the FULL target slice.  Supplying it makes
     chunked evaluation use one global document order; when omitted it is
-    computed here.
+    computed here.  Documents with no target in this slice (the map came from a
+    longer prefix) are omitted from the returned vectors rather than reported
+    with a zero token count and a NaN PPL: a document that has not started yet
+    is not an evaluation unit of this cell.
     """
     if not torch.is_tensor(nll):
         nll = torch.as_tensor(nll)
@@ -27755,13 +27789,50 @@ def aggregate_nll_by_document(nll, doc_ids, *, document_index_map=None):
     if document_index_map is None:
         keys, inv = document_index(arr)
     else:
-        keys, inv = document_index_map
+        try:
+            keys, inv = document_index_map
+        except (TypeError, ValueError):
+            raise ValueError(
+                'aggregate_nll_by_document: document_index_map must be a '
+                '(keys, inverse) pair') from None
         keys = np.asarray(keys)
         inv = np.asarray(inv)
+        if keys.ndim != 1 or keys.size == 0:
+            raise ValueError(
+                'aggregate_nll_by_document: document_index_map keys must be a '
+                f'non-empty 1-D array, got shape {keys.shape}')
+        if keys.dtype.kind not in 'iu':
+            raise ValueError(
+                'aggregate_nll_by_document: document_index_map keys must be '
+                f'integers, got dtype {keys.dtype}')
+        if keys.dtype.kind == 'i' and int(keys.min()) < 0:
+            raise ValueError(
+                'aggregate_nll_by_document: document_index_map keys must be '
+                'non-negative')
+        if inv.dtype.kind not in 'iu':
+            raise ValueError(
+                'aggregate_nll_by_document: document_index_map inverse must be '
+                f'integers, got dtype {inv.dtype}')
         if inv.size != int(nll.numel()):
             raise ValueError(
                 f'aggregate_nll_by_document: index covers {inv.size} targets, '
                 f'expected {int(nll.numel())}')
+        if inv.size:
+            _inv_min = int(inv.min())
+            _inv_max = int(inv.max())
+            if _inv_min < 0 or _inv_max >= int(keys.size):
+                raise ValueError(
+                    'aggregate_nll_by_document: document_index_map inverse '
+                    f'spans [{_inv_min}, {_inv_max}] but there are only '
+                    f'{int(keys.size)} documents')
+        inv = inv.reshape(arr.shape)
+        # A map for a longer prefix is valid here, but it must still describe
+        # THIS slice's identities.  Without this check a stale/mismatched map
+        # would silently regroup the same tokens into different documents.
+        if not np.array_equal(keys[inv.reshape(-1)], arr.reshape(-1)):
+            raise ValueError(
+                'aggregate_nll_by_document: document_index_map does not match '
+                'doc_ids; refusing to regroup tokens under a different map')
     n_docs = int(keys.size)
     idx = torch.as_tensor(inv.reshape(-1).astype(np.int64, copy=False),
                           dtype=torch.long, device=nll.device)
@@ -27773,17 +27844,24 @@ def aggregate_nll_by_document(nll, doc_ids, *, document_index_map=None):
     ).detach().cpu().tolist()
     n_tokens = [int(x) for x in tok_doc]
     nll_values = [float(x) for x in nll_doc]
-    ppl = [(float(_safe_exp_ppl(nll_values[i] / n_tokens[i]))
-            if n_tokens[i] > 0 else float('nan'))
-           for i in range(n_docs)]
+    # Drop documents that have no target in this slice.  A global map (built
+    # on the longest requested prefix) otherwise carries documents that start
+    # later, giving them 0 tokens and NaN PPL; that inflates n_docs and makes
+    # the per-document vectors length-inconsistent for no measurement reason.
+    _present = [i for i, n in enumerate(n_tokens) if n > 0]
+    keys_present = np.asarray(keys)[_present]
+    nll_values = [nll_values[i] for i in _present]
+    n_tokens = [n_tokens[i] for i in _present]
+    ppl = [float(_safe_exp_ppl(nll_values[i] / n_tokens[i]))
+           for i in range(len(_present))]
     return {
         'doc_granularity': 'document',
-        'n_docs': n_docs,
+        'n_docs': len(_present),
         'nll_per_doc': nll_values,
         'n_tokens_per_doc': n_tokens,
         'ppl_per_doc': ppl,
-        'doc_ids': [format(int(k), '016x') for k in np.asarray(keys).tolist()],
-        'doc_ids_fp': _ids_fp(np.asarray(keys)),
+        'doc_ids': [format(int(k), '016x') for k in keys_present.tolist()],
+        'doc_ids_fp': _ids_fp(keys_present),
         'nll_per_doc_total': float(sum(nll_values)),
         'n_tokens_total': int(sum(n_tokens)),
     }
