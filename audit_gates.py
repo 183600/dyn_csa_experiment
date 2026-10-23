@@ -35,8 +35,9 @@
                每个创新点的留一对照是否完整、n 与 mean±std（零 GPU）
   single_factor  单因素设计契约：每条声明对照的臂配置 diff 恰好等于声明的
                干预键集（定义点审计，不读 results_*）；open-block 矩阵只沿
-               两根声明轴变化；冻结清单的 mechanism_claim_allowed 标志与实际
-               臂配置 diff 一致（零 GPU）
+               两根声明轴变化；v7/v9 扫描的 factors 与真实 arm diff 对账；
+               冻结清单的 mechanism_claim_allowed 标志与实际臂配置 diff 一致
+               （零 GPU）
   design       设计前馈：token/参数/读取预算台账、专用对照臂、证据等级
                 （v6-v11 永远 exploratory；draft 不能 confirmatory）与动态
                 分块 H1-H5 假设/对照（零 GPU，不读 test）
@@ -3331,6 +3332,9 @@ def audit_single_factor(manifest_path=None):
       * v9/v10 seq2k 扫描声明（`v9.SEQ2K_CONTRAST_FACTORS`）：把元数据里的
         `single_factor`/`factors` 与真实臂配置 diff 对账，单因素标签不能只
         靠手写；
+      * v7 RoPE / 选择器 / sink 对照声明（`v7.ROPE_CONTRAST_FACTORS`）：把
+        位置编码、选择器、全块读取与 sink 对照的 factors 与 v7 工厂的真实
+        arm diff 对账；
       * 冻结清单（confirmation_frozen.json）：每条 primary comparison 的
         attention-cfg diff 是否单因素（`cfg_keys_single_factor` 的一族判据），
         与 `mechanism_claim_allowed` 标志的一致性。`True` 标志但 cfg 非单因素
@@ -3339,7 +3343,7 @@ def audit_single_factor(manifest_path=None):
     """
     L = _import_exp_lib()
     out = {'status': 'ok', 'design': {}, 'open_block_matrix': {},
-           'sweep_contrasts': {}, 'frozen_manifest': {}}
+           'sweep_contrasts': {}, 'v7_contrasts': {}, 'frozen_manifest': {}}
     design_rep = L.single_factor_design_audit(verbose=False)
     out['design'] = design_rep
     ob_rep = L.open_block_matrix_audit(verbose=False)
@@ -3369,6 +3373,12 @@ def audit_single_factor(manifest_path=None):
         out['frozen_manifest'] = {'status': 'not_verifiable_locally',
                                    'note': f'cannot import the v7 arm factory ({type(_e).__name__}: {_e})'}
         _factory = None
+    if _factory is not None:
+        _v7_rep = L.sweep_contrast_factor_audit(
+            V7.ROPE_CONTRAST_FACTORS, factory=_factory, verbose=False)
+        out['v7_contrasts'] = _v7_rep
+        if _v7_rep.get('status') == 'fail':
+            out['status'] = 'fail'
     _mp = manifest_path or os.path.join(REPO, 'confirmation_frozen.json')
     if _factory is not None:
         if not os.path.exists(_mp):

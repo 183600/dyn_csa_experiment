@@ -16805,6 +16805,7 @@ CONTRAST_SYSTEM_LEVEL_DECLARATIONS = {
 SINGLE_FACTOR_CFG_FAMILIES = (
     frozenset(),  # identical attention cfgs — the factor lives outside (e.g. mlp_ratio)
     frozenset({'indexer_mode', 'random_salt'}),
+    frozenset({'qk_norm', 'rope', 'rope_dim'}),
     # content-adaptive segmentation is one mechanism family: the boundary
     # policy/geometry moves together and the selector stays fixed.
     frozenset({'dynamic', 'chunking', 'target_block_tokens'}),

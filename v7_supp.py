@@ -862,6 +862,52 @@ def _v7_knobs_fp(device=None, batch_size=None):
 
 ROPE_VARIANTS = ['full_rope', 'csa_fixed_rope', 'hybrid_fixed_rope', 'csa_dynamic_rope', 'csa_fixed']
 PARAM_MATCHED_V7 = {'full_rope', 'full_sw128_matched_rope', 'full_rope_sink'}
+ROPE_CONTRAST_FACTORS = {
+    'CSA+RoPE vs CSA absPE': {
+        'a': 'csa_fixed_rope', 'b': 'csa_fixed',
+        'single_factor': True,
+        'factors': ['qk_norm', 'rope', 'rope_dim'],
+        'factors_note': ('one positional-encoding family: RoPE on/off, its dimension, '
+                         'and the QK normalization used by the RoPE arms'),
+    },
+    'CSA+RoPE vs dense+RoPE': {
+        'a': 'csa_fixed_rope', 'b': 'full_rope',
+        'single_factor': False,
+        'factors': ['kind'],
+        'factors_note': 'attention-operator swap: architecture-level, not a single knob',
+    },
+    'hybrid+RoPE vs dense+RoPE': {
+        'a': 'hybrid_fixed_rope', 'b': 'full_rope',
+        'single_factor': False,
+        'factors': ['block_size', 'kind'],
+        'factors_note': ('attention-operator swap plus the HCA block geometry: '
+                         'architecture-level, not a single knob'),
+    },
+    'v7 scratch: seeded-random selection vs learned': {
+        'a': 'csa_fixed_rope_randidx_seeded', 'b': 'csa_fixed_rope',
+        'single_factor': True,
+        'factors': ['indexer_mode', 'random_salt'],
+        'factors_note': 'single-factor selection control at the same top-k; the salt defines the per-seed/layer draw',
+    },
+    'v7 scratch: all-block reading vs learned': {
+        'a': 'csa_fixed_rope_allblocks', 'b': 'csa_fixed_rope',
+        'single_factor': True,
+        'factors': ['index_topk'],
+        'factors_note': 'single-factor read-budget intervention (top-k -> all blocks)',
+    },
+    'v7 scratch: no-sink vs learned': {
+        'a': 'csa_fixed_rope_nosink', 'b': 'csa_fixed_rope',
+        'single_factor': True,
+        'factors': ['use_sink'],
+        'factors_note': 'single-factor attention-sink ablation',
+    },
+    'v7 scratch: sink-matched dense vs dense': {
+        'a': 'full_rope_sink', 'b': 'full_rope',
+        'single_factor': True,
+        'factors': ['full_sink'],
+        'factors_note': 'single-factor dense attention-sink ablation',
+    },
+}
 
 def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=512, batch_size=12, steps=20000, warm_steps=0, lr=0.0003, weight_decay=0.1, warmup=200, comp_lambda=0.05, delta_lr_mult=10.0, eval_every=1000, eval_subset=128, val_bnd=None, device=DEVICE, log_every=1000, mlp_ratio=4, deadline_ts=None, save_ckpt=None, ckpt_dir=None, measure_eff=True, diag_every=None):
     L.set_seed(seed)
@@ -1895,6 +1941,15 @@ def bootstrap_report(outdirs, out='analysis_v7/stats.json'):
         res['n_skipped_config_mismatch'] = len(skipped)
         res['n_unstamped'] = unstamped
         out_d['comparisons'][name] = res
+    _factor_rep = L.sweep_contrast_factor_audit(
+        ROPE_CONTRAST_FACTORS, factory=make_layer_cfgs_v7, verbose=False)
+    for _name, _rec in out_d['comparisons'].items():
+        _decl = ROPE_CONTRAST_FACTORS.get(_name)
+        if not isinstance(_decl, dict) or not isinstance(_rec, dict):
+            continue
+        _rec.update(_decl)
+        _rec['factor_declaration_verified'] = bool(
+            (_factor_rep.get('pairs', {}).get(_name) or {}).get('verified'))
     # Family-wise correction over the report's five pre-listed comparisons
     # This is a guard against multiple-comparison
     # over-reading; the panel remains EXPLORATORY because its comparisons and

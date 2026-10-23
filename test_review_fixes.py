@@ -15840,6 +15840,47 @@ def t_seq2k_contrasts_carry_factor_declarations():
     assert _out['factor_declaration_verified'] is False, _out
 
 
+def t_v7_rope_contrasts_carry_factor_declarations():
+    # The v7 rope/sink/selection contrasts must declare their factor structure
+    # and the audit must recompute it from the real v7 arm configs.  In
+    # particular the CSA+RoPE vs CSA-absPE contrast moves one positional-
+    # encoding family, not an undeclared second knob.
+    decl = V7.ROPE_CONTRAST_FACTORS
+    for name in ('CSA+RoPE vs CSA absPE', 'CSA+RoPE vs dense+RoPE',
+                 'hybrid+RoPE vs dense+RoPE',
+                 'v7 scratch: seeded-random selection vs learned',
+                 'v7 scratch: all-block reading vs learned',
+                 'v7 scratch: no-sink vs learned',
+                 'v7 scratch: sink-matched dense vs dense'):
+        assert name in decl, name
+    pos = decl['CSA+RoPE vs CSA absPE']
+    assert pos['single_factor'] is True, pos
+    assert set(pos['factors']) == {'qk_norm', 'rope', 'rope_dim'}, pos
+    assert L.cfg_keys_single_factor(set(pos['factors'])), pos
+    assert not L.cfg_keys_single_factor({'qk_norm', 'rope', 'rope_dim', 'index_topk'})
+    _rep = L.sweep_contrast_factor_audit(
+        decl, factory=V7.make_layer_cfgs_v7, verbose=False)
+    assert _rep['status'] == 'ok', _rep['violations']
+    assert all(e['verified'] for e in _rep['pairs'].values()), _rep['pairs']
+    assert _rep['pairs']['CSA+RoPE vs CSA absPE']['actual_single_factor'] is True
+    assert _rep['pairs']['CSA+RoPE vs dense+RoPE']['actual_single_factor'] is False
+
+    _drift = {k: dict(v) for k, v in decl.items()}
+    _drift['CSA+RoPE vs CSA absPE'] = dict(
+        _drift['CSA+RoPE vs CSA absPE'], factors=['rope', 'rope_dim'])
+    _bad = L.sweep_contrast_factor_audit(
+        _drift, factory=V7.make_layer_cfgs_v7, verbose=False)
+    assert _bad['status'] == 'fail', _bad
+    assert not _bad['pairs']['CSA+RoPE vs CSA absPE']['verified'], _bad['pairs']
+    _mislabel = {k: dict(v) for k, v in decl.items()}
+    _mislabel['CSA+RoPE vs dense+RoPE'] = dict(
+        _mislabel['CSA+RoPE vs dense+RoPE'], single_factor=True)
+    _bad2 = L.sweep_contrast_factor_audit(
+        _mislabel, factory=V7.make_layer_cfgs_v7, verbose=False)
+    assert _bad2['status'] == 'fail', _bad2
+    assert not _bad2['pairs']['CSA+RoPE vs dense+RoPE']['verified'], _bad2['pairs']
+
+
 def t_driver_pair_capacity_controls():
     # A driver-level method-vs-dense contrast must not quote a p-value as a
     # method advantage when the dense arm has a different parameter count.
@@ -20298,6 +20339,7 @@ def main():
     _check('L60 single-factor design gate verifies the shipped design and fails closed on drift', t_single_factor_design_gate_passes_and_fails_closed)
     _check('L61 frozen-manifest mechanism flags are machine-verified single-factor verdicts', t_frozen_manifest_mechanism_flags_are_verified_single_factor)
     _check('L62 seq2k sweep contrasts carry explicit factor declarations', t_seq2k_contrasts_carry_factor_declarations)
+    _check('L62b v7 rope/sink/selection contrasts carry verified factor declarations', t_v7_rope_contrasts_carry_factor_declarations)
     _check('L63 driver method-vs-dense pairs carry a capacity-control verdict', t_driver_pair_capacity_controls)
     _check('L64 indexer chunked partial tile preserves the compact row stride', t_indexer_chunked_partial_tile_preserves_row_stride)
     _check('L64b window geometry is built per chunk, not as a full O(n*w) table', t_window_geometry_is_built_per_chunk)
