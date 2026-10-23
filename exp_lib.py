@@ -5713,9 +5713,18 @@ def _attn_full_width_ok(n, k, w, need_dedup):
     # nvalid_all, the per-row any-reduction, the optional dedup/keep masks, and
     # the int64 [n, k+w] rows table built by the same branch.  Counting only
     # one boolean table admitted 2-4x the intended cap at the threshold.
+    #
+    # The window branch additionally materialises the cached full geometry
+    # [n, w] (int32 indices + bool validity, 5 bytes/lane) and, when the row
+    # table is hoisted, its int32 block-offset twin (4 bytes/lane).  Leaving
+    # those out let a shape pass this 64 MiB gate while the window tables alone
+    # added up to ~2x the cap at long context.  Keep the accounting complete so
+    # the chunked fallback (value-identical) is chosen before the allocation.
     _m = int(k) + int(w)
     _bytes = int(n) * (2 * _m * 1 + 8 + (2 * int(k) if need_dedup else 0)
                        + 8 * _m)
+    if int(w) > 0:
+        _bytes += int(n) * int(w) * (4 + 1 + 4)
     return _bytes <= _FO_FULL_CAP_BYTES
 
 def _finfo_min(dtype):
@@ -13787,10 +13796,17 @@ def _normalise_look_series(looks, *, where='sequential_signflip_p'):
     if isinstance(looks, (str, bytes, dict)):
         raise ValueError(f'{where}: looks must be an iterable of '
                          '(seeds, deltas) pairs or {seeds, deltas} mappings')
-    try:
-        items = list(looks or [])
-    except TypeError:
-        raise ValueError(f'{where}: looks must be an iterable') from None
+    # Never use ``x or []`` on a caller-supplied sequence: a multi-element
+    # NumPy array / torch tensor raises "truth value ... is ambiguous", so a
+    # perfectly valid array input would crash before the contract check.  Only
+    # None means "empty" here.
+    if looks is None:
+        items = []
+    else:
+        try:
+            items = list(looks)
+        except TypeError:
+            raise ValueError(f'{where}: looks must be an iterable') from None
     out = []
     for k, item in enumerate(items):
         if isinstance(item, dict):
@@ -13804,8 +13820,11 @@ def _normalise_look_series(looks, *, where='sequential_signflip_p'):
             raise ValueError(f'{where}: look {k} seeds/deltas must be '
                              'iterables of numbers, not strings')
         try:
-            s_in = list(seeds or [])
-            d_in = list(deltas or [])
+            # Same array-truthiness guard as `looks` above.  A 0-d array is
+            # not a sequence either, but `list()` raises TypeError for it and
+            # the existing explicit error below is the right contract.
+            s_in = [] if seeds is None else list(seeds)
+            d_in = [] if deltas is None else list(deltas)
         except TypeError:
             raise ValueError(f'{where}: look {k} seeds/deltas must be iterables') from None
         if len(s_in) != len(d_in):
@@ -28748,15 +28767,48 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
         appended, so a manually edited summary still gets a two-look check
         when history exists.
         """
-        if not final_seeds or not final_deltas:
+        if final_seeds is None or final_deltas is None:
             return None
-        cur = {int(s): float(d) for s, d in zip(final_seeds, final_deltas)}
+        _final_seeds = list(final_seeds)
+        _final_deltas = list(final_deltas)
+        if not _final_seeds or not _final_deltas:
+            return None
+
+        def _look_rows(rec):
+            # Do not use ``x or []`` on a recorded sequence: a NumPy/tensor
+            # value raises on multi-element truth testing.  The strict seed
+            # reader also refuses a fractional value instead of silently
+            # truncating it into a different (but valid-looking) seed, and a
+            # non-finite/boolean delta is not a measurement.
+            raw_seeds = rec.get('seeds')
+            raw_deltas = rec.get('deltas')
+            if raw_seeds is None or raw_deltas is None:
+                return None
+            if (isinstance(raw_seeds, (str, bytes, bytearray))
+                    or isinstance(raw_deltas, (str, bytes, bytearray))):
+                return None
+            seeds = [_as_seed_int(s) for s in raw_seeds]
+            if any(s is None for s in seeds):
+                return None
+            deltas = [_finite_scalar(d) for d in raw_deltas]
+            if any(d is None for d in deltas):
+                return None
+            return seeds, [float(d) for d in deltas]
+
+        cur = {}
+        for s, d in zip(_final_seeds, _final_deltas):
+            si = _as_seed_int(s)
+            if si is None:
+                raise ValueError('final look seeds must be integers')
+            cur[si] = float(d)
         series, stale = [], []
         seen = set()
         for lk in _look_series.get(key) or []:
             try:
-                seeds = [int(s) for s in lk.get('seeds') or []]
-                deltas = [float(d) for d in lk.get('deltas') or []]
+                parsed = _look_rows(lk)
+                if parsed is None:
+                    raise ValueError('non-numeric seed/delta')
+                seeds, deltas = parsed
             except (TypeError, ValueError):
                 stale.append({'look': lk.get('look'), 'reason': 'non-numeric seed/delta'})
                 continue
@@ -28778,12 +28830,13 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                 continue
             seen.add(sig)
             series.append({'look': lk.get('look'), 'seeds': seeds, 'deltas': deltas})
-        sig = (tuple(int(s) for s in final_seeds),
-               tuple(round(float(d), 12) for d in final_deltas))
+        _final_order = sorted(cur)
+        sig = (tuple(_final_order),
+               tuple(round(cur[s], 12) for s in _final_order))
         if sig not in seen:
             series.append({'look': series[-1].get('look', 0) + 1 if series else 1,
-                           'seeds': [int(s) for s in final_seeds],
-                           'deltas': [float(d) for d in final_deltas],
+                           'seeds': _final_order,
+                           'deltas': [cur[s] for s in _final_order],
                            'current': True})
         if not series:
             return None

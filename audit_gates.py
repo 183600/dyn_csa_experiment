@@ -5468,10 +5468,22 @@ def audit_look_history(paths=None):
                         rec['problems'].append(
                             f'look {lid} {key}: {len(seeds)} seeds vs {len(deltas)} deltas')
                         continue
+                    if not seeds or not deltas:
+                        rec['problems'].append(
+                            f'look {lid} {key}: empty seeds/deltas is not a look')
+                        continue
                     try:
-                        _ss = [int(s) for s in seeds]
-                    except (TypeError, ValueError):
-                        rec['problems'].append(f'look {lid} {key}: non-integer seed')
+                        # Use the library's exact seed reader: plain int()
+                        # would silently truncate 1.5 to seed 1 (and accept
+                        # True as 1), turning a corrupt record into a valid
+                        # looking one.  Booleans/fractional values are not
+                        # seed identities.
+                        _ss = [L._as_seed_int(s) for s in seeds]
+                    except (TypeError, ValueError, OverflowError):
+                        _ss = None
+                    if _ss is None or any(s is None for s in _ss):
+                        rec['problems'].append(
+                            f'look {lid} {key}: non-integer seed')
                         continue
                     if len(set(_ss)) != len(_ss):
                         rec['problems'].append(f'look {lid} {key}: duplicate seeds')

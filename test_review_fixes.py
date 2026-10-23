@@ -20942,6 +20942,62 @@ def t_look_history_audit_flags_downgrade():
         assert any('does not match the recomputed' in p for p in aud_bad['problems']), aud_bad
 
 
+def t_look_series_array_inputs_and_strict_audit_seeds():
+    """L179 — array look inputs work; the audit refuses truncated seeds."""
+    d = [-1.0, -1.0, -1.0]
+    # A NumPy array is a legitimate sequence; `x or []` used to raise
+    # "truth value ... is ambiguous" before the function could read it.
+    arr = L.sequential_signflip_p([(np.asarray([0, 1, 2]),
+                                    np.asarray(d))])
+    plain = L.sequential_signflip_p([([0, 1, 2], d)])
+    assert arr['p_sequential'] == plain['p_sequential'], (arr, plain)
+    mapping = L.sequential_signflip_p([{'seeds': np.asarray([0, 1, 2]),
+                                        'deltas': np.asarray(d)}])
+    assert mapping['p_sequential'] == plain['p_sequential'], mapping
+    # Non-integer/boolean recorded seeds are not silently truncated (1.5 and
+    # True would both become seed 1 under plain int()).
+    key = 'component::dynamic_blocking::csa_dynamic|csa_fixed||'
+    d1, d2 = [-1.0, -2.0], [-1.0, -2.0, -3.0]
+    for bad in ([0, 1.5], [0, True], [0, 'x']):
+        hist = {'schema': 1, 'looks': [
+            {'look': 1, 'contrasts': {key: {
+                'seeds': bad, 'deltas': d1,
+                'p_exact_signflip': L.exact_signflip_p(d1)['p']}}},
+            {'look': 2, 'contrasts': {key: {
+                'seeds': [0, 1, 2], 'deltas': d2,
+                'p_exact_signflip': L.exact_signflip_p(d2)['p']}}}]}
+        with tempfile.TemporaryDirectory() as td:
+            with open(os.path.join(td, 'look_history.json'), 'w',
+                      encoding='utf-8') as f:
+                json.dump(hist, f)
+            with contextlib.redirect_stdout(io.StringIO()):
+                aud = A.audit_look_history(paths=[td])
+        assert aud['status'] == 'fail', (bad, aud)
+        assert any('non-integer seed' in p for p in aud['problems']), aud
+    # A genuinely empty look is a malformed record, not an empty evidence set.
+    hist['looks'][0]['contrasts'][key].update({'seeds': [], 'deltas': []})
+    with tempfile.TemporaryDirectory() as td:
+        with open(os.path.join(td, 'look_history.json'), 'w',
+                  encoding='utf-8') as f:
+            json.dump(hist, f)
+        with contextlib.redirect_stdout(io.StringIO()):
+            aud = A.audit_look_history(paths=[td])
+    assert aud['status'] == 'fail' and any('empty seeds/deltas' in p
+                                           for p in aud['problems']), aud
+
+
+def t_full_width_cap_accounts_for_window_tables():
+    """L180 — the full-width gate counts the O(n*w) window tables it allocates."""
+    # At k=32, w=128 the hoisted masks/rows alone fit 64 MiB at n=39000, but
+    # the cached window index/validity and block-offset tables push the real
+    # footprint above it.  The chunked path is value-identical and must be
+    # selected instead.
+    assert L._attn_full_width_ok(39000, 32, 128, False) is False
+    # Normal short-context cells still take the faster hoisted path.
+    assert L._attn_full_width_ok(2048, 32, 128, False) is True
+    assert L._attn_full_width_ok(128, 8, 16, False) is True
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -21464,6 +21520,8 @@ def main():
     _check('L176 sequential max-over-looks sign-flip is exact and directional', t_sequential_look_signflip_primitives)
     _check('L177 look history is deduped, stale-aware and audit-corrected', t_look_history_recorded_and_audited)
     _check('L178 look-history gate flags naive/sequential downgrades', t_look_history_audit_flags_downgrade)
+    _check('L179 look inputs accept arrays; audit rejects non-integer seeds', t_look_series_array_inputs_and_strict_audit_seeds)
+    _check('L180 full-width attention cap includes O(n*w) window tables', t_full_width_cap_accounts_for_window_tables)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')
