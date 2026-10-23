@@ -2329,13 +2329,23 @@ def audit_sample_design(cache_dir=None, *, raw_dir=None, max_raw_articles=None):
                     if _claim is True and not _all_repr:
                         _srec['problems'].append(
                             'claim=true but not every stratum is represented')
+                    if _pop_claim is True and _claim is not True:
+                        # A population claim is strictly stronger than a
+                        # representativeness claim; accepting it while the
+                        # weaker claim is false would let one contradictory
+                        # metadata block authorise an extrapolation the
+                        # sampling design does not support.
+                        _srec['problems'].append(
+                            'population claim requires '
+                            'representativeness_claim_allowed=true; the '
+                            'metadata contradicts itself')
                     if _pop_claim is True and _n_sel < 64:
                         _srec['problems'].append(
                             f'population claim with only {_n_sel} independent '
                             f'units (<64-unit floor)')
                     _srec['population_claim_allowed'] = bool(
-                        _pop_claim is True and _n_sel >= 64 and _all_repr
-                        and not _pp)
+                        _pop_claim is True and _claim is True
+                        and _n_sel >= 64 and _all_repr and not _pp)
                     if _claim is not True:
                         _srec['warnings'].append(
                             'plan is a probability sample but the metadata does '
@@ -2366,7 +2376,18 @@ def audit_sample_design(cache_dir=None, *, raw_dir=None, max_raw_articles=None):
             try:
                 _sr = int(_blk.get('source_rows'))
                 _rs = int(_blk.get('rows_served'))
-                if _sr > 0 and _rs >= 0:
+                if _sr < 0 or _rs < 0:
+                    _srec['problems'].append(
+                        'source_rows/rows_served must be non-negative')
+                    _srec['row_coverage_fraction'] = None
+                elif _rs > _sr:
+                    # metadata that reports more served rows than the source
+                    # contains is contradictory; a coverage > 1 must not be
+                    # quoted as evidence of breadth.
+                    _srec['problems'].append(
+                        f'rows_served={_rs} exceeds source_rows={_sr}')
+                    _srec['row_coverage_fraction'] = None
+                elif _sr > 0:
                     _srec['row_coverage_fraction'] = float(_rs) / float(_sr)
                     _srec['row_coverage_incomplete'] = bool(_rs < _sr)
             except (TypeError, ValueError):

@@ -19700,6 +19700,15 @@ def t_document_stratified_plan_is_reproducible_and_auditable():
     _bad_problems = L.sampling_plan_problems(bad)
     assert any('plan_fp' in x or 'stratum n_selected' in x or 'selected has' in x
                for x in _bad_problems), _bad_problems
+    # A plan cannot claim more strata than units (which would imply an empty
+    # stratum); the fingerprint is recomputed so only the structure fails.
+    fake = json.loads(json.dumps(p1))
+    fake['n_strata'] = fake['n_units'] + 1
+    fake['strata'].append({'index': len(fake['strata']), 'n_units': 0,
+                           'n_selected': 0})
+    fake['plan_fp'] = L._sampling_plan_fp(fake)
+    _fake_problems = L.sampling_plan_problems(fake)
+    assert any('n_strata' in x or 'no units' in x for x in _fake_problems), _fake_problems
     # Public error paths are explicit, not silent coercions.
     for kwargs in ({'n_select': 0}, {'n_select': 121}, {'seed': True},
                    {'n_strata': 0}, {'allocation': 'nope'}):
@@ -19719,6 +19728,26 @@ def t_document_stratified_plan_is_reproducible_and_auditable():
         raise AssertionError('NaN size accepted')
     picked = L.select_sampled_items(list(range(120)), p1)
     assert picked == p1['selected'], picked
+    # Indexable containers are indexed directly (no full copy); generators
+    # still work through the list fallback.
+    assert L.select_sampled_items(range(120), p1) == p1['selected']
+    assert L.select_sampled_items(iter(range(120)), p1) == p1['selected']
+    # A capped size-weighted allocation stays exact and fast; the remainder
+    # is distributed in bulk instead of one unit per pass.
+    alloc = L._sampling_allocation(
+        400, 400, [100, 100, 100, 100], 'size_weighted', 1,
+        stratum_size_sums=[10 ** 9, 1, 1, 1])
+    assert int(alloc.sum()) == 400, alloc
+    assert int(alloc[0]) == 100 and (alloc >= 1).all(), alloc
+    assert (alloc <= 100).all(), alloc
+    # An infeasible per-stratum floor is an explicit error, never silently
+    # lowered to the stratum's population.
+    try:
+        L._sampling_allocation(12, 12, [1, 5, 6], 'equal', 2)
+    except ValueError as e:
+        assert 'floor' in str(e), e
+    else:
+        raise AssertionError('infeasible min_per_stratum silently accepted')
 
 
 def t_wikitext_article_sampling_selects_whole_articles():
@@ -19823,6 +19852,36 @@ def t_sample_design_audit_reports_prefix_and_probability_plans():
         train = rep_ok['caches'][os.path.abspath(cache)]['train']
         assert train['status'] == 'ok', train
         assert train['representativeness_claim_allowed'] is True, train
+        # A population claim is stronger than representativeness: metadata
+        # that forbids the latter cannot authorise the former.
+        _pop_plan = L.document_stratified_plan(
+            [2] * 80, 80, seed=5, n_strata=4, source_fp='fixture80')
+        _pop_block = {
+            'train': {'design': 'stratified_document', 'plan': _pop_plan,
+                      'source_fp': 'fixture80', 'source_rows': 80,
+                      'rows_served': 80, 'tokens_served': 100,
+                      'token_cap': 100, 'cap_reached': True,
+                      'representativeness_claim_allowed': False,
+                      'population_claim_allowed': True},
+            'validation': prefix['validation'],
+        }
+        with open(meta_path, 'w', encoding='utf-8') as fh:
+            json.dump({'vocab': 80, 'seq_len': 8, 'sampling': _pop_block}, fh)
+        rep_pop = A.audit_sample_design(cache, raw_dir=raw)
+        assert rep_pop['status'] == 'fail', rep_pop
+        assert any('requires representativeness_claim_allowed=true' in p
+                   for p in rep_pop['problems']), rep_pop
+        _pop_block['train']['representativeness_claim_allowed'] = True
+        _pop_block['train']['population_claim_allowed'] = False
+        _pop_block['train']['rows_served'] = 81
+        with open(meta_path, 'w', encoding='utf-8') as fh:
+            json.dump({'vocab': 80, 'seq_len': 8, 'sampling': _pop_block}, fh)
+        rep_rows = A.audit_sample_design(cache, raw_dir=raw)
+        assert rep_rows['status'] == 'fail', rep_rows
+        assert any('exceeds source_rows' in p for p in rep_rows['problems']), rep_rows
+        # Restore a valid train block before the test-only read check.
+        with open(meta_path, 'w', encoding='utf-8') as fh:
+            json.dump({'vocab': 80, 'seq_len': 8, 'sampling': strat}, fh)
         # Test metadata is audited without ever opening wiki.test.raw.
         test_meta = {'vocab': 80, 'seq_len': 8, 'sampling': {
             'test': {'design': 'source_order_prefix', 'source_rows': 64,

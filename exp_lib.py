@@ -9889,9 +9889,15 @@ def _sampling_allocation(n_units, n_select, stratum_sizes, allocation,
     ``proportional`` allocates in proportion to each stratum's unit count,
     ``equal`` gives every stratum the same quota, and ``size_weighted`` uses
     the sum of the per-unit sizes.  Floors are followed by a deterministic
-    largest-remainder pass; a final capped pass moves units out of strata that
-    cannot supply their quota.  The result is exact, non-negative and never
-    exceeds a stratum's population.
+    largest-remainder pass; a final capped pass moves units between strata
+    that cannot supply or absorb their quota.  The result is exact,
+    non-negative, never exceeds a stratum's population and honours
+    ``min_per_stratum`` (an infeasible floor is an error, not silently
+    lowered).
+
+    The remainder is distributed in bulk rather than one unit at a time:
+    when such a capped allocation is asked for millions of units, a
+    per-unit loop turns into millions of full-array argmax passes.
     """
     S = len(stratum_sizes)
     counts = np.asarray(stratum_sizes, dtype=np.int64)
@@ -9908,33 +9914,75 @@ def _sampling_allocation(n_units, n_select, stratum_sizes, allocation,
             f'allocation must be one of proportional/equal/size_weighted, got {allocation!r}')
     if not np.isfinite(weights).all() or weights.sum() <= 0:
         weights = counts.astype(np.float64)
-    if n_select < S * int(min_per_stratum):
+    min_per_stratum = int(min_per_stratum)
+    if min_per_stratum < 0:
         raise ValueError(
-            f'n_select={n_select} cannot give {int(min_per_stratum)} unit(s) '
+            f'min_per_stratum must be non-negative, got {min_per_stratum}')
+    if S and int(counts.min()) < min_per_stratum:
+        raise ValueError(
+            f'min_per_stratum={min_per_stratum} exceeds the smallest stratum '
+            f'({int(counts.min())} unit(s)); the per-stratum floor cannot be met')
+    if n_select < S * min_per_stratum:
+        raise ValueError(
+            f'n_select={n_select} cannot give {min_per_stratum} unit(s) '
             f'to each of {S} non-empty strata; lower min_per_stratum or select more')
     ideal = weights / weights.sum() * float(n_select)
     alloc = np.floor(ideal).astype(np.int64)
     alloc = np.minimum(alloc, counts)
     # Guarantee the per-stratum minimum before spending the remainder.
-    alloc = np.maximum(alloc, int(min_per_stratum))
+    alloc = np.maximum(alloc, min_per_stratum)
     alloc = np.minimum(alloc, counts)
-    while int(alloc.sum()) < int(n_select):
-        room = np.where(alloc < counts, ideal - alloc, -np.inf)
-        j = int(np.argmax(room))
-        if not np.isfinite(room[j]):
+    total = int(alloc.sum())
+    target = int(n_select)
+    while total < target:
+        # Prefer strata still below their ideal quota, then any stratum with
+        # room.  Each pass adds an equal share to the eligible set and caps at
+        # the stratum's population; a capped stratum drops out next pass, so
+        # the number of passes is bounded by the number of strata, not by the
+        # number of remaining units.
+        eligible = np.flatnonzero(alloc < counts)
+        if not eligible.size:
             break
-        alloc[j] += 1
-    while int(alloc.sum()) > int(n_select):
-        # Remove from strata furthest above their ideal quota, never below min.
-        removable = np.where(alloc > int(min_per_stratum), alloc - ideal, -np.inf)
-        j = int(np.argmax(removable))
-        if not np.isfinite(removable[j]):
+        positive = eligible[ideal[eligible] - alloc[eligible] > 0]
+        if positive.size:
+            eligible = positive
+        missing = target - total
+        share, extra = divmod(missing, int(eligible.size))
+        if share:
+            add = np.minimum(counts[eligible] - alloc[eligible], share)
+            alloc[eligible] += add
+            total += int(add.sum())
+        else:
+            deficit = ideal[eligible] - alloc[eligible]
+            order = np.lexsort((eligible, -deficit))
+            chosen = eligible[order[:extra]]
+            alloc[chosen] += 1
+            total += int(extra)
+    while total > target:
+        # Remove from strata furthest above their ideal quota, never below the
+        # declared floor; bulk-remove like the addition pass above.
+        eligible = np.flatnonzero(alloc > min_per_stratum)
+        if not eligible.size:
             break
-        alloc[j] -= 1
-    if int(alloc.sum()) != int(n_select):
+        positive = eligible[alloc[eligible] - ideal[eligible] > 0]
+        if positive.size:
+            eligible = positive
+        surplus = total - target
+        share, extra = divmod(surplus, int(eligible.size))
+        if share:
+            sub = np.minimum(alloc[eligible] - min_per_stratum, share)
+            alloc[eligible] -= sub
+            total -= int(sub.sum())
+        else:
+            excess = alloc[eligible] - ideal[eligible]
+            order = np.lexsort((eligible, -excess))
+            chosen = eligible[order[:extra]]
+            alloc[chosen] -= 1
+            total -= int(extra)
+    if total != target:
         raise ValueError(
             f'could not allocate n_select={n_select} over strata sizes '
-            f'{counts.tolist()} with min_per_stratum={int(min_per_stratum)}')
+            f'{counts.tolist()} with min_per_stratum={min_per_stratum}')
     return alloc
 
 
@@ -10028,6 +10076,14 @@ def document_stratified_plan(sizes, n_select, *, seed=0, n_strata=4,
     all_represented = all(s['n_selected'] > 0 for s in strata)
     total_size = float(sizes_f.sum())
     selected_size = float(sizes_f[np.asarray(selected, dtype=np.int64)].sum())
+    # Hash the size vector incrementally: the same digest as
+    # ','.join(format(float(x), '.17g') ...), without materialising a string
+    # with one entry per corpus unit (which is large for a scale-up corpus).
+    _sizes_hash = hashlib.sha256()
+    for _i, _x in enumerate(sizes_f):
+        if _i:
+            _sizes_hash.update(b',')
+        _sizes_hash.update(format(float(_x), '.17g').encode('ascii'))
     plan = {
         'schema': 'document_stratified_sample_v1',
         'design': 'stratified_document',
@@ -10038,9 +10094,7 @@ def document_stratified_plan(sizes, n_select, *, seed=0, n_strata=4,
         'allocation': str(allocation),
         'min_per_stratum': int(min_per_stratum),
         'source_fp': source_fp,
-        'sizes_fp': hashlib.sha256(
-            ','.join(format(float(x), '.17g') for x in sizes_f).encode('ascii')
-        ).hexdigest(),
+        'sizes_fp': _sizes_hash.hexdigest(),
         'selected': selected,
         'selection_without_replacement': True,
         'all_strata_represented': bool(all_represented),
@@ -10075,6 +10129,9 @@ def sampling_plan_problems(plan):
         seed = _sampling_int('seed', plan.get('seed'), minimum=0)
         if n_select > n_units:
             problems.append(f'n_select={n_select} > n_units={n_units}')
+        if n_strata > n_units:
+            problems.append(f'n_strata={n_strata} > n_units={n_units}; '
+                            'a stratum cannot be empty')
         selected = plan.get('selected')
         if not isinstance(selected, list):
             problems.append('selected is not a list')
@@ -10112,6 +10169,8 @@ def sampling_plan_problems(plan):
             except (TypeError, ValueError) as e:
                 problems.append(str(e))
                 continue
+            if _nu <= 0:
+                problems.append(f'strata[{i}] has no units; strata must be non-empty')
             if _ns > _nu:
                 problems.append(f'strata[{i}] selects {_ns} of {_nu} units')
             _sum_units += _nu
@@ -10203,15 +10262,31 @@ def wikitext_article_sampling_plan(rows, n_articles, *, seed=0, n_strata=4,
 
 
 def select_sampled_items(items, plan):
-    """Materialise the units named by a validated ``document_stratified_plan``."""
+    """Materialise the units named by a validated ``document_stratified_plan``.
+
+    Indexable containers (lists, arrays, ``range``) are never copied in full:
+    only the selected units are materialised, so a plan over a scale-up corpus
+    does not allocate a second copy of the whole corpus just to pick a subset.
+    """
     problems = sampling_plan_problems(plan)
     if problems:
         raise ValueError('select_sampled_items: invalid plan: ' + '; '.join(problems))
+    n_units = int(plan['n_units'])
+    # Only containers whose ``__getitem__`` is positional may use the fast
+    # path.  A dict, for example, would interpret the integer indices as keys,
+    # so it must go through the generic sequence fallback instead.
+    if isinstance(items, (list, tuple, range, np.ndarray)):
+        n_items = len(items)
+        if n_items != n_units:
+            raise ValueError(
+                f'select_sampled_items: {n_items} items but the plan describes '
+                f'{n_units} units')
+        return [items[int(i)] for i in plan['selected']]
     seq = list(items)
-    if len(seq) != int(plan['n_units']):
+    if len(seq) != n_units:
         raise ValueError(
             f'select_sampled_items: {len(seq)} items but the plan describes '
-            f"{int(plan['n_units'])} units")
+            f'{n_units} units')
     return [seq[int(i)] for i in plan['selected']]
 
 
