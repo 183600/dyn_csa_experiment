@@ -1366,11 +1366,11 @@ def _g0_mismatch(cert):
         return 'certificate is not a JSON object'
     if cert.get('status') != 'pass':
         return f"certificate status is {cert.get('status')!r}, not 'pass'"
-    if not cert.get('numeric_pass'):
+    if cert.get('numeric_pass') is not True:
         return 'operator/model numeric equivalence did not pass'
-    if not cert.get('benchmark_pass'):
+    if cert.get('benchmark_pass') is not True:
         return 'G0 kernel/eager certificate did not pass (CUDA+triton required)'
-    if not cert.get('training_tost_pass'):
+    if cert.get('training_tost_pass') is not True:
         return 'training-level TOST equivalence did not pass'
     if str(cert.get('code_semantics')) != str(CODE_SEMANTICS):
         return f"code semantics {cert.get('code_semantics')!r} != current {CODE_SEMANTICS!r}"

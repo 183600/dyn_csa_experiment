@@ -19939,6 +19939,27 @@ def t_sample_design_audit_reports_prefix_and_probability_plans():
         assert 'wiki.test.raw' in trec['raw_coverage']['reason'], trec
 
 
+def t_g0_certificate_requires_real_booleans():
+    # The G0 gate must fail closed on malformed certificates: a non-empty
+    # string such as "false" is truthy, so a plain truthiness test would let
+    # a corrupted/hand-edited certificate authorize every scale panel.
+    base = {
+        'status': 'pass',
+        'numeric_pass': True,
+        'benchmark_pass': True,
+        'training_tost_pass': True,
+        'code_semantics': L.CODE_SEMANTICS,
+        'kernel_stamp': L._kernel_stamp(),
+    }
+    assert L._g0_mismatch(dict(base)) is None, L._g0_mismatch(dict(base))
+    for key in ('numeric_pass', 'benchmark_pass', 'training_tost_pass'):
+        for bogus in ('false', 'true', 1, 0, [], {}):
+            cert = dict(base)
+            cert[key] = bogus
+            why = L._g0_mismatch(cert)
+            assert why is not None, (key, bogus)
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -20443,6 +20464,7 @@ def main():
     _check('L158 stratified sampling plan is deterministic and tamper-evident', t_document_stratified_plan_is_reproducible_and_auditable)
     _check('L159 wiki article sampler selects whole articles only', t_wikitext_article_sampling_selects_whole_articles)
     _check('L160 sampling audit distinguishes prefix from probability sample', t_sample_design_audit_reports_prefix_and_probability_plans)
+    _check('L161 G0 certificate requires real boolean pass flags', t_g0_certificate_requires_real_booleans)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')
