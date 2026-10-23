@@ -2482,3 +2482,65 @@ plan` 仍 72/72 合成记录、6 个比较；`python audit_gates.py source` 在�
 plan snapshot 后 `ok`（23/23 文件逐字节一致）；`python audit_gates.py
 sesoi` 仍通过；`python audit_gates.py looks` 在无结果树时明确
 `not_verifiable_locally`（不是 pass）。
+
+## 2026-10-23 — ordered dose-response design gate + exact paired trend (no new runs)
+
+Zero-GPU design/analysis hardening. No training run, no test-split read, no
+frozen manifest byte/seed/recipe/endpoint/α/Holm rule, and no
+`CODE_SEMANTICS` change.
+
+**Problem.** The mechanism panels contain ordered levels (top-k, block size,
+retrieval/distractor ratio), but the reporting path only supports pairwise
+contrasts. Testing the two endpoints (or the best adjacent pair) and calling
+the result a dose-response loses the ordering, invites post-hoc endpoint and
+direction selection, and makes a two-point line look like a mechanism result.
+A significant pairwise difference is not evidence that the outcome varies
+monotonically with the dose.
+
+**Fix.** `exp_lib.py` now has two companion primitives:
+
+- `dose_response_design_audit()` — a definition-point gate requiring ≥3
+  distinct finite doses, distinct arms, an AttnCfg diff of exactly the declared
+  `dose_key` versus the baseline, monotonic numeric dose-key values (inverse
+  coding allowed), the same declared seed set at every level (default
+  `min_seeds=3`), and one shared protocol identity. A partial protocol
+  declaration or a bundled second factor fails closed. Optional
+  `require_protocol`/`require_seeds` flags support legacy descriptive audits.
+- `dose_response_trend()` — a within-seed OLS slope per seed over the declared
+  doses, followed by ONE exact sign-flip test on those slopes (the existing
+  `paired_effect_stats` contract: n, CI, p floor, underpowered,
+  within-seed-noise). `direction='increasing'|'decreasing'` must be declared;
+  a significant opposite-direction slope is `direction_conflict`, never
+  relabelled. `shape='monotone'` additionally requires every adjacent mean
+  step to move in the declared direction; a linear trend remains reportable
+  without the stronger monotone claim (`shape_conflict`). Missing/non-finite
+  readings are named complete-case exclusions, not zeros or silent subset
+  means. Multiple ordered families must be corrected together via the existing
+  Holm/global-multiplicity machinery; adjacent pairs are not separate
+  hypotheses.
+
+`audit_gates.py dose_response` reads an optional manifest
+`dose_response_design` block (or an explicit in-process design) and reports
+`not_applicable` when no ordered declaration exists. It was added to
+`audit_gates.py report`. The frozen manifests are unchanged: the new section
+is opt-in for future/ordered panels, not a retrofit of v12.
+
+**Boundary.** Ordered doses are not randomized: a single-axis cfg diff rules
+out a declared second factor, but not co-varying training time, memory or
+implementation paths. A significant trend is association under the declared
+ladder, not proof of mechanism; non-monotone or opposite-direction results
+must be reported as such. The direction/shape declaration is machine-checked
+for consistency but cannot prove it was written before the first look.
+
+**Verification.** `python test_review_fixes.py` passes 529/529 (0 skipped in
+this sandbox), including new L181 (ordered single-axis ladder, bundled second
+factor, duplicate dose, seed mismatch, missing seed declaration, two points,
+protocol mismatch, scrambled dose-key order, post-hoc `direction='auto'`,
+invalid shape) and L182 (exact p=2/64, direction conflict, linear-vs-monotone
+shape gate,
+missing/non-finite complete-case exclusions, two-point refusal, protocol
+conflict, invalid direction/shape). `python v12_supp.py plan` still admits
+72/72 synthetic frozen records with the same six comparisons;
+`python audit_gates.py source` is `ok` (23/23 source files byte-identical);
+`python audit_gates.py dose_response` returns `not_applicable` because the
+frozen plan has no ordered-dose declaration (explicitly not a pass).

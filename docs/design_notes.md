@@ -3752,3 +3752,88 @@ python test_review_fixes.py            # L60a/L60b
 L60a 覆盖： shipped 三组设计通过、缺 cell / 重用臂 / 非并行轴 / 未排程臂
 fail-closed。L60b 覆盖：常值正/负交互的精确 p、独立族大小、缺 cell 保留
 槽位、run_cfg 不一致丢弃全部种子、容量混淆时禁止机制声明。
+
+## 60. 有序剂量设计：dose-response 不是「挑两个端点比一下」
+
+### 60.1 为什么需要
+
+top-k、块大小、retrieval ratio、distractor 比例这类机制面板天然是**有序水平**。
+只挑两个端点做一次配对检验，会同时丢掉两件事：
+
+1. **顺序信息**：如果机制真的随剂量单调变化，三点以上的趋势比端点差更有
+   说服力；反过来，端点显著但中间不动，也不支持「剂量响应」的措辞。
+2. **选择自由度**：端点、方向和水平数量如果都是看完结果再定，那么
+   「显著」可以被事后搜索出来。方向与形状必须先于读数写入设计。
+
+两个点永远可以连成一条线，所以两点对比只能叫 endpoint contrast，不能叫
+dose-response。
+
+### 60.2 设计点契约
+
+`exp_lib.dose_response_design_audit(levels, direction=..., dose_key=...)` 在
+训练/读数之前核验：
+
+- 至少 3 个有限、互异、按剂量排序的水平；两点直接 fail（并提示改用端点
+  对比）；
+- 每个水平声明 `label`、`dose`、`arm`；所有 arm 互异；
+- 基线 arm 到每个剂量 arm 的 AttnCfg diff **恰好等于** `{dose_key}`：多一个
+  键 = 混入第二因素，少一个键 = 干预消失；
+- `dose_key` 在每个水平上是有限标量，且其值随声明剂量单调（允许反向编码，
+  不允许乱序）；重复值说明两个「剂量」实际是同一操纵；
+- 每个水平声明**同一批种子**（默认 `min_seeds=3`），因为趋势是种子内配对；
+- 若声明测量协议（eval 长度、checkpoint、recipe 等身份），每个水平必须
+  声明同一个协议；否则趋势会把不同测量混在一起。
+
+这是**设计声明门**，不读结果，也不能证明方向确实是在第一次看数之前写的；
+它只保证一旦写下 declaration，机器能发现「不是单轴 / 不是同一批种子 /
+不是同一测量协议 / 不是有序剂量」的声明。
+
+### 60.3 估计量与检验
+
+记录级 `dose_response_trend(levels, direction=..., shape='linear'|'monotone')`
+对每个在**所有水平**都有有限读数的种子计算 OLS 斜率：
+
+```
+b_s = Σ_i (x_i - x̄)(y_{s,i} - ȳ_s) / Σ_i (x_i - x̄)^2
+```
+
+主检验是对 `{b_s}` 的**一次双侧精确符号翻转**，与主审计使用同一
+`paired_effect_stats` 口径（n、mean、std、CI、p floor、underpowered、
+within-seed-noise 都保留）。不是把每个相邻水平都做一次检验再取最小 p：
+那样既没有校正，也会把「中间某个相邻差最大」误当成整体剂量响应。
+
+- `direction` 必须是预注册的 `increasing`/`decreasing`；显著但方向相反时
+  判 `direction_conflict`，不能改写成「反向剂量响应」来救回显著。
+- `shape='linear'` 只要求方向；`shape='monotone'` 额外要求每个相邻水平的
+  **平均**步进都在声明方向上。形状不满足时判 `shape_conflict`，但仍可
+  报告线性趋势，且 `claim_allowed=False`。
+- 缺失/非有限读数按完整案例剔除并逐个点名；不补零、不静默取子集平均。
+- 协议身份不一致（例如不同 eval 长度）判 `protocol_conflict`，即使 p 很小
+  也不允许因果/机制措辞。
+- 多个有序族应把各自的 p 作为**一个声明的族**交给
+  `global_multiplicity_audit`/Holm；本函数只产生一条 p。
+
+### 60.4 边界
+
+- 有序剂量不是随机分配：`dose` 与训练时长、显存、实现路径等仍可能共变；
+  单轴 cfg diff 只排除**声明层面**的第二因素，不证明剂量本身外生。
+- 显著趋势只说明「操纵与结果同向」，不证明机制；反向/非单调结果同样
+  有信息，必须按预注册方向报告，而不是事后改假设。
+- 该层不改变 `confirmation_frozen*.json`、P5T 的 p/α/Holm/终点、种子白名单
+  或 `CODE_SEMANTICS`；它只约束新的有序面板/未来冻结清单中的可选
+  `dose_response_design` 声明。
+- 清单没有 `dose_response_design` 时，`audit_gates.py dose_response` 返回
+  `not_applicable`，不是 pass；没有声明就没有可审计的剂量假设。
+
+### 60.5 入口与验证
+
+```bash
+python audit_gates.py dose_response   # 零 GPU：读清单可选声明；无声明 not_applicable
+python test_review_fixes.py           # L181 设计门；L182 精确趋势
+```
+
+L181 覆盖：三点单轴通过、额外 cfg 键、重复剂量、种子集不一致、缺种子声明、
+两点、协议变化、剂量轴乱序、`direction='auto'`、非法 shape 全部
+fail-closed。L182 覆盖：6 种子精确 p=2/64、方向冲突、linear vs monotone
+形状门、缺失/非有限读数点名剔除、两点拒绝、协议冲突、非法
+direction/shape 的调用错误。

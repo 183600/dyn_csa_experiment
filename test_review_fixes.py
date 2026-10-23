@@ -21183,6 +21183,173 @@ def t_full_width_cap_accounts_for_window_tables():
     assert L._attn_full_width_ok(128, 8, 16, False) is True
 
 
+def _dose_factory(n, arm):
+    table = {
+        'k8': {'index_topk': 8},
+        'k32': {'index_topk': 32},
+        'k128': {'index_topk': 128},
+        'k32_plus_block': {'index_topk': 32, 'block_size': 8},
+    }
+    if arm not in table:
+        raise KeyError(arm)
+    return [dict({'kind': 'csa', 'block_size': 4}, **table[arm])
+            for _ in range(int(n))]
+
+
+def t_dose_response_design_requires_ordered_single_axis_ladder():
+    """L181 — a dose ladder is not a pair of endpoints with a label."""
+    base = [
+        {'label': 'k8', 'dose': 8, 'arm': 'k8', 'seeds': [0, 1, 2],
+         'protocol': 'uniform/4097'},
+        {'label': 'k32', 'dose': 32, 'arm': 'k32', 'seeds': [0, 1, 2],
+         'protocol': 'uniform/4097'},
+        {'label': 'k128', 'dose': 128, 'arm': 'k128', 'seeds': [0, 1, 2],
+         'protocol': 'uniform/4097'},
+    ]
+    r = L.dose_response_design_audit(
+        base, direction='increasing', dose_key='index_topk',
+        factory=_dose_factory, n_layers=2)
+    assert r['status'] == 'ok', r
+    assert r['n_levels'] == 3 and r['n_seeds'] == 3, r
+    assert r['dose_key_values'] == {'k8': 8.0, 'k32': 32.0, 'k128': 128.0}, r
+    assert r['levels']['k32']['cfg_diff_keys'] == ['index_topk'], r
+    # The wrapper accepts the explicit design object too.
+    with contextlib.redirect_stdout(io.StringIO()):
+        wrapped = A.audit_dose_response(
+            design={'levels': base, 'direction': 'increasing',
+                    'dose_key': 'index_topk'},
+            factory=_dose_factory)
+    assert wrapped['status'] == 'ok', wrapped
+    # An extra moved key is a second factor, not a dose axis.
+    extra = base[:2] + [{'label': 'mixed', 'dose': 128,
+                         'arm': 'k32_plus_block', 'seeds': [0, 1, 2],
+                         'protocol': 'uniform/4097'}]
+    bad = L.dose_response_design_audit(
+        extra, direction='increasing', dose_key='index_topk',
+        factory=_dose_factory, n_layers=2)
+    assert bad['status'] == 'fail', bad
+    assert any('not isolated' in v and 'block_size' in v
+               for v in bad['violations']), bad
+    # Duplicate doses, mismatched seeds, a missing seed declaration, and a
+    # two-point "ladder" are all design failures.
+    dup = base[:2] + [{'label': 'dup', 'dose': 32, 'arm': 'k128',
+                       'seeds': [0, 1, 2], 'protocol': 'uniform/4097'}]
+    for levels, why in [
+        (dup, 'duplicate dose'),
+        (base[:2] + [{'label': 'k128', 'dose': 128, 'arm': 'k128',
+                      'seeds': [0, 1], 'protocol': 'uniform/4097'}],
+         'seed set'),
+        ([{k: v for k, v in rec.items() if k != 'seeds'} for rec in base],
+         'seed set'),
+        (base[:2], 'at least 3'),
+    ]:
+        rep = L.dose_response_design_audit(
+            levels, direction='increasing', dose_key='index_topk',
+            factory=_dose_factory, n_layers=2)
+        assert rep['status'] == 'fail', (why, rep)
+        assert any(why in v for v in rep['violations']), (why, rep)
+    # A protocol change between doses confounds the trend.
+    proto = [dict(rec, protocol='uniform/4097' if rec['label'] != 'k32'
+                  else 'uniform/2049') for rec in base]
+    rep = L.dose_response_design_audit(
+        proto, direction='increasing', dose_key='index_topk',
+        factory=_dose_factory, n_layers=2)
+    assert rep['status'] == 'fail' and any('protocol' in v
+                                           for v in rep['violations']), rep
+    # The declared dose order must agree with the actual key values (inverse
+    # coding is fine; a scrambled ladder is not).
+    scrambled = [
+        {'label': 'a', 'dose': 8, 'arm': 'k8', 'seeds': [0], 'protocol': 'p'},
+        {'label': 'b', 'dose': 32, 'arm': 'k128', 'seeds': [0], 'protocol': 'p'},
+        {'label': 'c', 'dose': 128, 'arm': 'k32', 'seeds': [0], 'protocol': 'p'},
+    ]
+    rep = L.dose_response_design_audit(
+        scrambled, direction='increasing', dose_key='index_topk',
+        factory=_dose_factory, n_layers=2, min_seeds=1)
+    assert rep['status'] == 'fail' and any('not monotonic' in v
+                                           for v in rep['violations']), rep
+    # An auto/post-hoc direction is not representable.
+    rep = L.dose_response_design_audit(
+        base, direction='auto', dose_key='index_topk',
+        factory=_dose_factory, n_layers=2)
+    assert rep['status'] == 'fail' and any('direction' in v
+                                           for v in rep['violations']), rep
+    # The shape is a pre-registered design choice, not an analysis-time option.
+    rep = L.dose_response_design_audit(
+        base, direction='increasing', dose_key='index_topk',
+        factory=_dose_factory, n_layers=2, shape='u-shape')
+    assert rep['status'] == 'fail' and any('shape' in v
+                                           for v in rep['violations']), rep
+
+
+def t_dose_response_trend_is_exact_directional_and_shape_gated():
+    """L182 — one pre-registered ordered test, not endpoint cherry-picking."""
+    def levels(fn, n=6, doses=(0, 1, 2)):
+        return [{'label': str(d), 'dose': float(d),
+                 'values': {s: fn(s, d) for s in range(n)}}
+                for d in doses]
+
+    pos = L.dose_response_trend(
+        levels(lambda s, d: 10.0 + (0.5 + 0.2 * s) * d),
+        direction='increasing')
+    assert pos['status'] == 'ok' and pos['verdict'] == 'monotone_trend_supported', pos
+    assert pos['claim_allowed'] is True, pos
+    assert pos['p_exact_signflip'] == 2.0 / 2 ** 6, pos
+    assert pos['monotonicity']['all_mean_steps_in_direction'] is True, pos
+    assert pos['monotonicity']['strict_monotone_seeds'] == 6, pos
+    assert pos['slope_stats']['n'] == 6, pos
+    # The same data support the opposite pre-registered direction only as a
+    # conflict, never as a positive claim.
+    neg = L.dose_response_trend(
+        levels(lambda s, d: 10.0 - (0.5 + 0.2 * s) * d),
+        direction='increasing')
+    assert neg['verdict'] == 'direction_conflict', neg
+    assert neg['claim_allowed'] is False, neg
+    # A monotone shape requires every adjacent mean step, while a linear
+    # trend can still be reported without upgrading it to monotone.
+    bent = levels(lambda s, d: (0.0, 10.0, 9.0)[d])
+    lin = L.dose_response_trend(bent, direction='increasing', shape='linear')
+    mono = L.dose_response_trend(bent, direction='increasing', shape='monotone')
+    assert lin['verdict'] == 'linear_trend_supported' and lin['claim_allowed'], lin
+    assert mono['verdict'] == 'shape_conflict' and not mono['claim_allowed'], mono
+    # Incomplete cases are named, not silently averaged; five seeds cannot
+    # clear the exact-test resolution floor at alpha=.05.
+    missing = L.dose_response_trend(
+        levels(lambda s, d: None if (s == 0 and d == 1)
+               else 10.0 + (0.5 + 0.2 * s) * d),
+        direction='increasing')
+    assert missing['n_complete_seeds'] == 5, missing
+    assert missing['excluded_seeds'][0]['seed'] == 0, missing
+    assert missing['verdict'] == 'resolution_limited', missing
+    # Non-finite values are excluded with a warning rather than becoming a
+    # fake zero.
+    nonfinite = levels(lambda s, d: float('nan') if (s == 1 and d == 2)
+                       else 10.0 + (0.5 + 0.2 * s) * d)
+    nf = L.dose_response_trend(nonfinite, direction='increasing')
+    assert nf['n_complete_seeds'] == 5 and any('non-finite' in w
+                                               for w in nf['warnings']), nf
+    # A two-point contrast is a named endpoint comparison, not a trend.
+    two = L.dose_response_trend(
+        levels(lambda s, d: 10.0 + s * d, n=6, doses=(0, 1)),
+        direction='increasing')
+    assert two['status'] == 'insufficient_levels' and not two['claim_allowed'], two
+    # Protocol mismatch blocks the causal reading even if p is small.
+    proto = levels(lambda s, d: 10.0 + (0.5 + 0.2 * s) * d)
+    proto[0]['protocol'] = 'eval/2049'
+    proto[1]['protocol'] = 'eval/4097'
+    proto[2]['protocol'] = 'eval/4097'
+    pc = L.dose_response_trend(proto, direction='increasing')
+    assert pc['verdict'] == 'protocol_conflict' and not pc['claim_allowed'], pc
+    # An unknown direction/shape is a caller error, not an automatic choice.
+    for kw in ({'direction': 'up'}, {'direction': 'increasing', 'shape': 'u-shape'}):
+        try:
+            L.dose_response_trend(levels(lambda s, d: 10.0 + s * d), **kw)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'invalid trend parameter accepted: {kw}')
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -21711,6 +21878,8 @@ def main():
     _check('L178 look-history gate flags naive/sequential downgrades', t_look_history_audit_flags_downgrade)
     _check('L179 look inputs accept arrays; audit rejects non-integer seeds', t_look_series_array_inputs_and_strict_audit_seeds)
     _check('L180 full-width attention cap includes O(n*w) window tables', t_full_width_cap_accounts_for_window_tables)
+    _check('L181 dose-response design requires an ordered single-axis ladder', t_dose_response_design_requires_ordered_single_axis_ladder)
+    _check('L182 dose-response trend is exact, directional and shape-gated', t_dose_response_trend_is_exact_directional_and_shape_gated)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

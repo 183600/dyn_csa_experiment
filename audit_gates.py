@@ -51,6 +51,9 @@
                 （v6-v11 永远 exploratory；draft 不能 confirmatory）与动态
                 分块 H1-H5 假设/对照（零 GPU，不读 test）
   design_preflight  design 的别名
+  dose_response  有序剂量设计：方向/形状预注册、>=3 个单调剂量、只动一个
+                声明键、同一种子集与测量协议（零 GPU；清单无该声明时
+                not_applicable）
   failures     失败与缺失：error 记录按臂集中度（选择偏差读数，零 GPU）
   training_health  训练曲线健康与 NaN 排查记录的自洽性（零 GPU）
   run_order    运行顺序 / 时间混杂：检查 run_order.json 的完整区组与位置
@@ -3612,6 +3615,74 @@ def audit_factorial_design(manifest_path=None):
 
 
 # ---------------------------------------------------------------------------
+# 7e-3) dose_response：有序剂量/机制梯度的定义点审计（零 GPU）
+# ---------------------------------------------------------------------------
+
+def audit_dose_response(manifest_path=None, design=None, *, direction=None,
+                        dose_key=None, factory=None, verbose=True):
+    """有序剂量设计的定义点审计（零 GPU）。
+
+    从冻结清单的可选 ``dose_response_design`` 字段读取声明，或由调用方直接
+    传入 ``design``（``{levels, direction, dose_key, ...}`` 或 levels 本身）。
+    核验“至少三个水平、剂量排序、只改变一个声明键、同一种子集、同一测量
+    协议、方向/形状预注册”；清单没有该字段时明确返回 ``not_applicable``，
+    不把“没有声明”误报成通过。记录级趋势检验在
+    ``exp_lib.dose_response_trend``，本入口只核验设计。
+    """
+    L = _import_exp_lib()
+    mp = manifest_path or os.path.join(REPO, 'confirmation_frozen.json')
+    spec = design
+    source = 'argument'
+    if spec is None:
+        man = _load_manifest_file(mp)
+        if not isinstance(man, dict):
+            out = {'status': 'not_verifiable_locally',
+                   'manifest': mp,
+                   'note': 'no readable frozen manifest; no ordered-dose '
+                           'declaration can be audited'}
+            if verbose:
+                print(json.dumps(out, ensure_ascii=False, indent=2))
+            return out
+        spec = man.get('dose_response_design') or man.get('dose_response')
+        source = mp
+        if spec is None:
+            out = {'status': 'not_applicable',
+                   'manifest': mp,
+                   'note': ('the manifest declares no dose_response_design; '
+                            'an ordered ladder is not used by this plan')}
+            if verbose:
+                print(json.dumps(out, ensure_ascii=False, indent=2))
+            return out
+    if isinstance(spec, dict) and isinstance(spec.get('levels'), (dict, list, tuple)):
+        levels = spec.get('levels')
+        direction = spec.get('direction') if direction is None else direction
+        dose_key = spec.get('dose_key') if dose_key is None else dose_key
+        kwargs = {
+            'n_layers': spec.get('n_layers', 6),
+            'min_levels': spec.get('min_levels', 3),
+            'min_seeds': spec.get('min_seeds', 3),
+            'require_seeds': spec.get('require_seeds', True),
+            'require_protocol': spec.get('require_protocol', False),
+            'shape': spec.get('shape', 'linear'),
+        }
+    else:
+        levels = spec
+        kwargs = {}
+    try:
+        rep = L.dose_response_design_audit(
+            levels, direction=direction, dose_key=dose_key,
+            factory=factory, **kwargs)
+    except Exception as e:
+        rep = {'kind': 'dose_response_design', 'status': 'fail',
+               'violations': [f'{type(e).__name__}: {e}'],
+               'note': 'dose-response design audit could not be completed'}
+    rep['source'] = source
+    if verbose:
+        print(json.dumps(rep, ensure_ascii=False, indent=2))
+    return rep
+
+
+# ---------------------------------------------------------------------------
 # 7f) design preflight：预算台账 / 证据等级 / 动态分块假设与对照
 # ---------------------------------------------------------------------------
 
@@ -5646,7 +5717,7 @@ def audit_look_history(paths=None):
 
 
 def run_report(out='audit_report.json'):
-    res = {'generated_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'source_tree': audit_source_integrity(), 'dependencies': audit_dependencies(), 'data_source': audit_data_source(), 'leakage': audit_leakage(), 'split_discipline': audit_split_discipline(), 'document_unit': audit_document_unit(), 'sample_design': audit_sample_design(), 'attribution': audit_attribution(), 'boundary': audit_boundary(), 'length': audit_length(), 'fairness': audit_fairness(), 'metrics': audit_metrics(), 'tuning': audit_tuning(), 'simple_baseline': audit_simple_baseline(), 'hypotheses': audit_hypotheses(), 'sesoi': audit_sesoi_declaration(), 'unit_influence': audit_unit_influence(), 'looks': audit_look_history(), 'methodology': audit_methodology(), 'single_factor': audit_single_factor(), 'factorial': audit_factorial_design(), 'design_preflight': audit_design_preflight(), 'failures': audit_failures(), 'budget': audit_budget(), 'training_health': audit_training_health(), 'efficiency_pairs': audit_efficiency_pairs(), 'release': audit_release_readiness(), 'selection': audit_selection(), 'run_order': audit_run_order()}
+    res = {'generated_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'source_tree': audit_source_integrity(), 'dependencies': audit_dependencies(), 'data_source': audit_data_source(), 'leakage': audit_leakage(), 'split_discipline': audit_split_discipline(), 'document_unit': audit_document_unit(), 'sample_design': audit_sample_design(), 'attribution': audit_attribution(), 'boundary': audit_boundary(), 'length': audit_length(), 'fairness': audit_fairness(), 'metrics': audit_metrics(), 'tuning': audit_tuning(), 'simple_baseline': audit_simple_baseline(), 'hypotheses': audit_hypotheses(), 'sesoi': audit_sesoi_declaration(), 'unit_influence': audit_unit_influence(), 'looks': audit_look_history(), 'methodology': audit_methodology(), 'single_factor': audit_single_factor(), 'factorial': audit_factorial_design(), 'design_preflight': audit_design_preflight(), 'dose_response': audit_dose_response(verbose=False), 'failures': audit_failures(), 'budget': audit_budget(), 'training_health': audit_training_health(), 'efficiency_pairs': audit_efficiency_pairs(), 'release': audit_release_readiness(), 'selection': audit_selection(), 'run_order': audit_run_order()}
     L_atomic = None
     try:
         L = _import_exp_lib()
@@ -5666,7 +5737,7 @@ def run_report(out='audit_report.json'):
 
 
 if __name__ == '__main__':
-    _cmds = {'leakage': audit_leakage, 'split': audit_split_discipline, 'split_discipline': audit_split_discipline, 'document_unit': audit_document_unit, 'unit': audit_document_unit, 'sample_design': audit_sample_design, 'sampling': audit_sample_design, 'sample': audit_sample_design, 'causality': audit_causality, 'attribution': audit_attribution, 'boundary': audit_boundary, 'length': audit_length, 'fairness': audit_fairness, 'metrics': audit_metrics, 'tuning': audit_tuning, 'simple': audit_simple_baseline, 'baseline_floor': audit_simple_baseline, 'baseline_plan': audit_baseline_design, 'hypothesis_coverage': audit_hypothesis_coverage, 'hypotheses': audit_hypotheses, 'sesoi': audit_sesoi_declaration, 'unit_influence': audit_unit_influence, 'influence': audit_unit_influence, 'looks': audit_look_history, 'look_history': audit_look_history, 'methodology': audit_methodology, 'single_factor': audit_single_factor, 'factorial': audit_factorial_design, 'factorial_design': audit_factorial_design, 'design': audit_design_preflight, 'design_preflight': audit_design_preflight, 'failures': audit_failures, 'budget': audit_budget, 'efficiency': audit_efficiency_demo, 'efficiency_pairs': audit_efficiency_pairs, 'training_health': audit_training_health, 'selection': audit_selection, 'release': audit_release_readiness, 'run_order': audit_run_order, 'source': audit_source_integrity, 'source_tree': audit_source_integrity, 'dependencies': audit_dependencies, 'dependency': audit_dependencies, 'data_source': audit_data_source, 'dataset_source': audit_data_source, 'report': run_report}
+    _cmds = {'leakage': audit_leakage, 'split': audit_split_discipline, 'split_discipline': audit_split_discipline, 'document_unit': audit_document_unit, 'unit': audit_document_unit, 'sample_design': audit_sample_design, 'sampling': audit_sample_design, 'sample': audit_sample_design, 'causality': audit_causality, 'attribution': audit_attribution, 'boundary': audit_boundary, 'length': audit_length, 'fairness': audit_fairness, 'metrics': audit_metrics, 'tuning': audit_tuning, 'simple': audit_simple_baseline, 'baseline_floor': audit_simple_baseline, 'baseline_plan': audit_baseline_design, 'hypothesis_coverage': audit_hypothesis_coverage, 'hypotheses': audit_hypotheses, 'sesoi': audit_sesoi_declaration, 'unit_influence': audit_unit_influence, 'influence': audit_unit_influence, 'looks': audit_look_history, 'look_history': audit_look_history, 'methodology': audit_methodology, 'single_factor': audit_single_factor, 'factorial': audit_factorial_design, 'factorial_design': audit_factorial_design, 'design': audit_design_preflight, 'design_preflight': audit_design_preflight, 'dose_response': audit_dose_response, 'dose_response_design': audit_dose_response, 'failures': audit_failures, 'budget': audit_budget, 'efficiency': audit_efficiency_demo, 'efficiency_pairs': audit_efficiency_pairs, 'training_health': audit_training_health, 'selection': audit_selection, 'release': audit_release_readiness, 'run_order': audit_run_order, 'source': audit_source_integrity, 'source_tree': audit_source_integrity, 'dependencies': audit_dependencies, 'dependency': audit_dependencies, 'data_source': audit_data_source, 'dataset_source': audit_data_source, 'report': run_report}
     _arg = sys.argv[1] if len(sys.argv) > 1 else 'report'
     if _arg in ('-h', '--help'):
         print(__doc__)
