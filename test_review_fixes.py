@@ -20732,6 +20732,216 @@ def t_unit_influence_audit_gate():
         assert aud_missing['status'] == 'not_verifiable_locally', aud_missing
 
 
+def t_sequential_look_signflip_primitives():
+    """L176 — max-over-looks sequential p is exact, directional and monotone."""
+    d1 = [-1.0, -1.0, -1.0]
+    one = L.sequential_signflip_p([(list(range(3)), d1)])
+    assert one['n_looks'] == 1 and one['method'] == 'single-look', one
+    assert abs(one['p_sequential'] - L.exact_signflip_p(d1)['p']) < 1e-12, one
+    # Nested looks: the sequential p can never be smaller than the final-look
+    # two-sided p (the final look is inside the max).
+    d2 = [-1.0] * 8
+    s2 = L.sequential_signflip_p([(list(range(3)), d2[:3]),
+                                  (list(range(6)), d2[:6]),
+                                  (list(range(8)), d2)])
+    assert s2['p_sequential'] >= s2['looks'][-1]['p'] - 1e-12, s2
+    assert s2['method'] == 'exact-max-over-looks-final-direction', s2
+    # A concrete vector where the final-n p is < alpha but the sequential p is
+    # larger: the same data at an extra look is not the same evidence.
+    d3 = [-1.34, -1.18, -1.46, -1.21, -0.7, -1.1, 0.42, -0.48, 0.18, -0.04]
+    s3 = L.sequential_signflip_p([(list(range(6)), d3[:6]),
+                                  (list(range(10)), d3)])
+    assert s3['looks'][-1]['p'] < s3['p_sequential'] - 1e-12, s3
+    # An early look in the OPPOSITE direction must not create a sequential
+    # claim for the final (near-null) direction.
+    s4 = L.sequential_signflip_p([
+        (list(range(6)), [-10.0, -10.0, -10.0, -10.0, -10.0, -10.0]),
+        ([0, 1, 2, 3, 4, 5, 6, 7], [-10.0, -10.0, -10.0, -10.0, -10.0, -10.0,
+                                   31.0, 31.0])])
+    assert s4['p_sequential'] == 1.0, s4
+    # Inconsistent seed deltas across looks (a re-run) fall back to the
+    # conservative Bonferroni bound and name the seed; never silently combine.
+    s5 = L.sequential_signflip_p([([0, 1, 2], [-1.0, -1.0, -1.0]),
+                                  ([0, 1, 2, 3], [-1.0, -1.0, -2.0, -1.0])])
+    assert 'inconsistent' in s5['method'] and s5['inconsistent_seeds'] == [2], s5
+    assert abs(s5['p_sequential'] - min(1.0, 2 * s5['p_final_look'])) < 1e-12, s5
+    # Too many seeds for joint enumeration -> valid Bonferroni over the final p.
+    s6 = L.sequential_signflip_p([
+        (list(range(17)), [-1.0] * 17),
+        (list(range(18)), [-1.0] * 17 + [-0.5])])
+    assert s6['method'] == 'bonferroni-over-looks', s6
+    assert abs(s6['p_sequential'] - min(1.0, 2 * s6['p_final_look'])) < 1e-12, s6
+    # Determinism: the enumeration must not depend on hash ordering.
+    assert L.sequential_signflip_p([(list(range(6)), d3[:6]),
+                                    (list(range(10)), d3)])['p_sequential'] == s3['p_sequential']
+    # Input contract failures are explicit, not silent drops.
+    for bad in ([([0, 0], [1.0, 2.0])],
+                [([0, 1], [1.0])],
+                [([], [])],
+                [([0.5], [1.0])]):
+        try:
+            L.sequential_signflip_p(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'malformed look series must be rejected: {bad!r}')
+    # A non-finite delta is dropped and counted, matching exact_signflip_p's
+    # contract instead of silently treating NaN as a measurement.
+    drop = L.sequential_signflip_p([([0, 1], [1.0, float('nan')])])
+    assert drop['looks'][0]['n'] == 1 and drop['looks'][0]['n_dropped'] == 1, drop
+
+
+def t_look_history_recorded_and_audited():
+    """L177 — look history is deduped, stale-aware, and drives the audit p."""
+    fp = ('steps1_sl8_bs1_nt10_lr0.0003_wd0.1_d8_L1_H1_Dh8_v16_wu1_cl0.05_'
+          'dlm10.0_mtdefault_mrcsa_dynamic_ee1_es1_detcpu-eager_dfabc_csX')
+    knobs = L.training_knobs()
+    deltas = [-1.34, -1.18, -1.46, -1.21, -0.7, -1.1, 0.42, -0.48, 0.18, -0.04]
+    design = {'dynamic_blocking': [('csa_dynamic', 'csa_fixed', 'x')]}
+    key = 'component::dynamic_blocking::csa_dynamic|csa_fixed||'
+
+    def _summary(n):
+        s = {}
+        for i in range(n):
+            s[f'csa_dynamic::seed{i}'] = dict(
+                variant='csa_dynamic', seed=i, run_cfg=fp, steps=1, tokens_seen=1,
+                ppl=50.0 + deltas[i], params=100, train_knobs=knobs)
+            s[f'csa_fixed::seed{i}'] = dict(
+                variant='csa_fixed', seed=i, run_cfg=fp, steps=1, tokens_seen=1,
+                ppl=50.0, params=100, train_knobs=knobs)
+        return s
+
+    with tempfile.TemporaryDirectory() as td:
+        recs6, _ = L._variant_seed_map(_summary(6))
+        h1 = L.record_panel_look(td, recs6)
+        assert h1['n_looks'] == 1, h1
+        recs10, _ = L._variant_seed_map(_summary(10))
+        h2 = L.record_panel_look(td, recs10)
+        assert h2['n_looks'] == 2, h2
+        # Re-aggregating unchanged data is not a new look.
+        assert L.record_panel_look(td, recs10)['n_looks'] == 2
+        hist = L.load_look_history(td)
+        assert len(hist['looks']) == 2 and key in hist['looks'][-1]['contrasts'], hist
+        by_key = L.looks_by_contrast(hist)
+        assert len(by_key[key]) == 2 and by_key[key][-1]['seeds'] == list(range(10))
+
+        rep = L.methodology_audit(_summary(10), design=design, baselines={},
+                                  outdir=td, verbose=False)
+        e = rep['components']['dynamic_blocking'][0]
+        la = e['look_analysis']
+        assert la['n_looks'] == 2 and e['look_adjusted'] is True, e
+        assert abs(e['p_look_adjusted'] - la['p_sequential']) < 1e-12, e
+        assert abs(e['p_holm_global'] - la['p_sequential']) < 1e-12, e
+        assert abs(e['p_holm_global_naive'] - e['p_exact_signflip']) < 1e-12, e
+        assert e['p_holm_global'] >= e['p_holm_global_naive'] - 1e-12, e
+        assert rep['look_history']['panel_looks'] == 2, rep['look_history']
+        assert rep['look_history']['n_contrasts_look_adjusted'] == 1, rep['look_history']
+        # TOST equivalence is also corrected for the spent looks.
+        _se = e.get('sesoi') or {}
+        assert _se.get('n_looks') == 2 and _se.get('p_tost_look_adjusted') is not None, _se
+        assert abs(float(_se['p_tost_look_adjusted'])
+                   - min(1.0, 2.0 * float(_se['tost_p_tost']))) < 1e-12, _se
+
+        # The independent gate recomputes the same sequential p and passes.
+        with contextlib.redirect_stdout(io.StringIO()):
+            aud = A.audit_look_history(paths=[td])
+        assert aud['status'] == 'ok', aud
+        assert aud['n_panels'] == 1 and aud['n_looks'] == 2, aud
+        assert aud['n_contrasts_adjusted'] == 1, aud
+
+        # A re-run that changes an early seed's delta is STALE: the old look is
+        # excluded and named, not combined into the joint null.
+        stale_hist = json.loads(json.dumps(hist))
+        stale_hist['looks'][0]['contrasts'][key]['deltas'][0] = -9.0
+        with contextlib.redirect_stdout(io.StringIO()):
+            rep_stale = L.methodology_audit(_summary(10), design=design,
+                                            baselines={}, look_history=stale_hist,
+                                            verbose=False)
+        e_stale = rep_stale['components']['dynamic_blocking'][0]
+        assert e_stale['look_analysis']['n_stale_looks'] >= 1, e_stale
+        assert any('STALE' in w for w in rep_stale['warnings']), rep_stale['warnings']
+        # The independent gate mirrors the stale exclusion: it warns about the
+        # changed seed but still reproduces the audit's (remaining) sequential p.
+        with open(os.path.join(td, 'look_history.json'), 'w', encoding='utf-8') as f:
+            json.dump(stale_hist, f)
+        L.methodology_audit(_summary(10), design=design, baselines={},
+                            outdir=td, verbose=False)
+        with contextlib.redirect_stdout(io.StringIO()):
+            aud_stale = A.audit_look_history(paths=[td])
+        assert aud_stale['status'] == 'warnings', aud_stale
+        assert any('stale look' in w for w in aud_stale['warnings']), aud_stale
+
+        # A tampered recorded per-look p is a hard audit failure.
+        bad = json.loads(json.dumps(hist))
+        bad['looks'][0]['contrasts'][key]['p_exact_signflip'] = 0.999
+        with open(os.path.join(td, 'look_history.json'), 'w', encoding='utf-8') as f:
+            json.dump(bad, f)
+        with contextlib.redirect_stdout(io.StringIO()):
+            aud_bad = A.audit_look_history(paths=[td])
+        assert aud_bad['status'] == 'fail', aud_bad
+        assert any('does not recompute' in p for p in aud_bad['problems']), aud_bad
+
+        # Missing audit block: recorded looks cannot be cross-checked -> warn.
+        with open(os.path.join(td, 'look_history.json'), 'w', encoding='utf-8') as f:
+            json.dump(hist, f)
+        os.remove(os.path.join(td, 'methodology_audit.json'))
+        with contextlib.redirect_stdout(io.StringIO()):
+            aud_missing = A.audit_look_history(paths=[td])
+        assert aud_missing['status'] == 'warnings', aud_missing
+        assert any('no look_analysis block' in w for w in aud_missing['warnings']), aud_missing
+    # No look files at all is not a pass.
+    with tempfile.TemporaryDirectory() as td:
+        with contextlib.redirect_stdout(io.StringIO()):
+            aud_empty = A.audit_look_history(paths=[td])
+        assert aud_empty['status'] == 'not_verifiable_locally', aud_empty
+
+
+def t_look_history_audit_flags_downgrade():
+    """L178 — the audit surfaces a naive-significant / sequential-null claim."""
+    deltas = [-1.0, -1.0, -1.0, -1.0, -1.0, -1.0, 0.5, 0.5]
+    key = 'component::dynamic_blocking::csa_dynamic|csa_fixed||'
+    hist = {'schema': 1, 'looks': [
+        {'look': 1, 'contrasts': {key: {
+            'seeds': [0, 1, 2, 3, 4, 5], 'deltas': deltas[:6],
+            'p_exact_signflip': L.exact_signflip_p(deltas[:6])['p']}}},
+        {'look': 2, 'contrasts': {key: {
+            'seeds': list(range(8)), 'deltas': deltas,
+            'p_exact_signflip': L.exact_signflip_p(deltas)['p']}}},
+    ]}
+    seq = L.sequential_signflip_p(
+        [{'seeds': hist['looks'][0]['contrasts'][key]['seeds'],
+          'deltas': deltas[:6]},
+         {'seeds': hist['looks'][1]['contrasts'][key]['seeds'],
+          'deltas': deltas}])
+    # A synthetic audit block whose naive verdict is significant but whose
+    # sequential verdict is not; the gate must reproduce the p and flag it.
+    audit = {'components': {'dynamic_blocking': [{
+        'look_analysis': {'contrast': key, 'n_looks': 2,
+                          'p_sequential': seq['p_sequential']},
+        'significant_global_naive': True, 'significant_global': False,
+        'p_holm_global_naive': 0.01, 'p_holm_global': seq['p_sequential'],
+    }]}, 'baselines': {}}
+    with tempfile.TemporaryDirectory() as td:
+        with open(os.path.join(td, 'look_history.json'), 'w', encoding='utf-8') as f:
+            json.dump(hist, f)
+        with open(os.path.join(td, 'methodology_audit.json'), 'w', encoding='utf-8') as f:
+            json.dump(audit, f)
+        with contextlib.redirect_stdout(io.StringIO()):
+            aud = A.audit_look_history(paths=[td])
+        assert aud['status'] == 'ok', aud
+        assert len(aud['downgraded_claims']) == 1, aud
+        assert aud['downgraded_claims'][0]['contrast'] == key, aud
+        # A stale audit p (not what the recorded deltas imply) is a hard fail.
+        audit['components']['dynamic_blocking'][0]['look_analysis'][
+            'p_sequential'] = 0.001
+        with open(os.path.join(td, 'methodology_audit.json'), 'w', encoding='utf-8') as f:
+            json.dump(audit, f)
+        with contextlib.redirect_stdout(io.StringIO()):
+            aud_bad = A.audit_look_history(paths=[td])
+        assert aud_bad['status'] == 'fail', aud_bad
+        assert any('does not match the recomputed' in p for p in aud_bad['problems']), aud_bad
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -21251,6 +21461,9 @@ def main():
     _check('L173 leave-one-unit-out influence targets the pooled estimand', t_doc_unit_influence_primitives)
     _check('L174 unit influence reaches v12 analysis + report caveat', t_doc_influence_analysis_and_markdown)
     _check('L175 unit-influence audit flags fragile and stale artifacts', t_unit_influence_audit_gate)
+    _check('L176 sequential max-over-looks sign-flip is exact and directional', t_sequential_look_signflip_primitives)
+    _check('L177 look history is deduped, stale-aware and audit-corrected', t_look_history_recorded_and_audited)
+    _check('L178 look-history gate flags naive/sequential downgrades', t_look_history_audit_flags_downgrade)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

@@ -13765,6 +13765,211 @@ def exact_signflip_p(deltas):
     return {'n': n, 'p': float(p), 'n_dropped': n_dropped,
             'n_nonzero': n_nonzero, 'p_floor': p_floor, 'method': method}
 
+# ---- 序列观测（look）修正：补种子不是免费的 --------------------------------
+# 实验面板在补种子（n=3 -> 4 -> 6 ...）时会多次聚合/查看同一终点。按最终 n
+# 只做一次检验会把「看了几次再决定加种子」的选择效应漏掉，这是典型的
+# optional stopping。`sequential_signflip_p` 在**同一组逐种子配对差**上，
+# 对每个 look 取「最终效应方向」的证据并取 max，再在零假设（每个种子的符号
+# 独立等概率）下联合枚举所有 look 的符号指派，给出族级（跨 look）精确 p。
+# 只做 post-hoc 稳健性修正，不改冻结确认清单里的 p/α/决策。
+LOOK_SEQUENTIAL_ENUM_MAX_N = 16
+
+
+def _normalise_look_series(looks, *, where='sequential_signflip_p'):
+    """Normalise ``[{seeds, deltas}, ...]`` or ``[(seeds, deltas), ...]``.
+
+    Each look is sorted by seed so the joint enumeration below has a stable,
+    auditable column order.  Non-finite deltas are dropped (and counted), a
+    duplicate seed inside one look is a hard error (it would make the sign
+    assignment ambiguous), and an empty look is refused rather than silently
+    skipped.
+    """
+    if isinstance(looks, (str, bytes, dict)):
+        raise ValueError(f'{where}: looks must be an iterable of '
+                         '(seeds, deltas) pairs or {seeds, deltas} mappings')
+    try:
+        items = list(looks or [])
+    except TypeError:
+        raise ValueError(f'{where}: looks must be an iterable') from None
+    out = []
+    for k, item in enumerate(items):
+        if isinstance(item, dict):
+            seeds, deltas = item.get('seeds'), item.get('deltas')
+        elif isinstance(item, (tuple, list)) and len(item) == 2:
+            seeds, deltas = item
+        else:
+            raise ValueError(f'{where}: look {k} must be a (seeds, deltas) '
+                             f'pair or a mapping, got {type(item).__name__}')
+        if isinstance(seeds, (str, bytes)) or isinstance(deltas, (str, bytes)):
+            raise ValueError(f'{where}: look {k} seeds/deltas must be '
+                             'iterables of numbers, not strings')
+        try:
+            s_in = list(seeds or [])
+            d_in = list(deltas or [])
+        except TypeError:
+            raise ValueError(f'{where}: look {k} seeds/deltas must be iterables') from None
+        if len(s_in) != len(d_in):
+            raise ValueError(f'{where}: look {k} has {len(s_in)} seeds but '
+                             f'{len(d_in)} deltas')
+        if not s_in:
+            raise ValueError(f'{where}: look {k} is empty')
+        rows, n_dropped = [], 0
+        for s, d in zip(s_in, d_in):
+            si = _as_seed_int(s)
+            if si is None:
+                raise ValueError(f'{where}: look {k} seed {s!r} is not an integer')
+            di = _finite_scalar(d)
+            if di is None:
+                n_dropped += 1
+                continue
+            rows.append((si, di))
+        rows.sort(key=lambda t: t[0])
+        _ss = [s for s, _d in rows]
+        if len(set(_ss)) != len(_ss):
+            raise ValueError(f'{where}: look {k} contains duplicate seeds {_ss!r}')
+        if not rows:
+            raise ValueError(f'{where}: look {k} has no finite delta')
+        out.append({'seeds': _ss, 'deltas': [float(d) for _s, d in rows],
+                    'n_dropped': int(n_dropped)})
+    return out
+
+
+def sequential_signflip_p(looks, *, alpha=0.05):
+    """Family-wise sign-flip p over multiple looks at a growing seed set.
+
+    ``looks`` is an ordered list of ``(seeds, deltas)`` / ``{seeds, deltas}``
+    snapshots of the SAME paired contrast, earliest first.  The LAST look is
+    the decisive one: its observed sign defines the direction of the claim.
+    For a union of at most :data:`LOOK_SEQUENTIAL_ENUM_MAX_N` seeds the null is
+    enumerated exactly:
+
+      every seed gets an independent random sign; the same sign vector is
+      projected onto each look's seed set; for every look the evidence in the
+      FINAL direction is ``T_k = sign_final * sum_{i in look_k} sign_i d_i``.
+      The sequential statistic is ``max_k T_k``, compared with the final
+      observed ``T_final = |sum_{i in final} d_i|``.  ``p_seq`` is the exact
+      two-sided p, ``min(1, 2 * P(max_k T_k >= T_final))``.
+
+    This is deliberately NOT a min-p over the raw look p-values: an early look
+    that happened to be more extreme (possibly in the opposite direction) must
+    not turn a final null into a "significant" claim.  Including the final look
+    in the maximum guarantees ``p_seq >= p_final``; the two-sided doubling over
+    the max makes it a valid family-wise p for "the final effect, allowing for
+    the analyses already spent".
+
+    Larger unions use the valid but conservative Bonferroni bound over looks
+    (``min(1, K * p_final)``).  Conflicting deltas for the same seed across
+    looks (a re-run/edited record) also fall back to that bound and are named
+    in ``inconsistent_seeds`` — a stale look is never silently combined.  A
+    panel whose final significance is a product of topping up seeds is thus
+    downgraded rather than reported at its final-n p.
+    """
+    alpha = _validated_alpha(alpha)
+    series = _normalise_look_series(looks)
+    k_looks = len(series)
+    look_stats = []
+    for i, lk in enumerate(series, 1):
+        sf = exact_signflip_p(lk['deltas'])
+        look_stats.append({
+            'look': int(i), 'n': int(sf.get('n') or 0),
+            'seeds': list(lk['seeds']), 'p': float(sf.get('p', float('nan'))),
+            'mean': float(np.mean(lk['deltas'])),
+            'sum': float(np.sum(lk['deltas'])),
+            'p_floor': sf.get('p_floor'), 'method': sf.get('method'),
+            'n_dropped': int(lk.get('n_dropped') or 0),
+        })
+    if k_looks == 0:
+        return {'n_looks': 0, 'p_sequential': float('nan'),
+                'p_min_look': float('nan'), 'p_final_look': float('nan'),
+                'looks': [], 'method': 'none', 'alpha': float(alpha),
+                'n_union_seeds': 0, 'inconsistent_seeds': [],
+                'note': 'no looks supplied'}
+    _ps = [s['p'] for s in look_stats if math.isfinite(s['p'])]
+    p_min = float(min(_ps)) if _ps else float('nan')
+    p_final = look_stats[-1]['p']
+    if k_looks == 1:
+        return {'n_looks': 1, 'p_sequential': p_final, 'p_min_look': p_min,
+                'p_final_look': p_final, 'looks': look_stats,
+                'method': 'single-look', 'alpha': float(alpha),
+                'n_union_seeds': len(series[0]['seeds']),
+                'inconsistent_seeds': [],
+                'note': ('one analysis look: no optional-stopping correction '
+                         'is needed')}
+    # Build the union of seed effects.  A seed must carry one delta across
+    # looks; a changed value means the record was re-run and the old look is
+    # not a look at the same estimand.
+    seed_delta, inconsistent = {}, set()
+    for lk in series:
+        for s, d in zip(lk['seeds'], lk['deltas']):
+            if s in seed_delta:
+                if abs(seed_delta[s] - d) > 1e-9:
+                    inconsistent.add(s)
+            else:
+                seed_delta[s] = d
+    union_seeds = sorted(seed_delta)
+    base = {'n_looks': k_looks, 'p_min_look': p_min,
+            'p_final_look': p_final, 'looks': look_stats,
+            'alpha': float(alpha), 'n_union_seeds': len(union_seeds),
+            'inconsistent_seeds': sorted(inconsistent)}
+    _final_sum = float(look_stats[-1]['sum'])
+    if abs(_final_sum) <= 1e-300:
+        base.update({'p_sequential': 1.0,
+                     'method': 'degenerate-final-zero',
+                     'note': ('the final look has exactly zero total effect; '
+                              'no directional sequential claim is possible')})
+        return base
+    direction = 1.0 if _final_sum > 0 else -1.0
+    t_obs = abs(_final_sum)
+    if inconsistent or len(union_seeds) > LOOK_SEQUENTIAL_ENUM_MAX_N:
+        p_seq = (min(1.0, float(k_looks) * p_final)
+                 if math.isfinite(p_final) else float('nan'))
+        base.update({
+            'p_sequential': p_seq,
+            'method': ('bonferroni-over-looks' if not inconsistent
+                       else 'bonferroni-over-looks-inconsistent-seeds'),
+            'note': ('union too large for exact joint enumeration or seed '
+                     'deltas changed across looks; Bonferroni over the FINAL '
+                     'look p is valid but conservative')})
+        return base
+    # Exact joint enumeration of max_k T_k in the final direction.  Only the
+    # column projection of each look is needed; the per-look null distribution
+    # is implicit in the union sign enumeration.
+    cols = []
+    union_index = {s: i for i, s in enumerate(union_seeds)}
+    for lk in series:
+        cols.append(np.asarray([union_index[s] for s in lk['seeds']],
+                               dtype=np.int64))
+    d_union = np.asarray([seed_delta[s] for s in union_seeds], dtype=float)
+    total = 1 << len(union_seeds)
+    bitpos = np.arange(len(union_seeds), dtype=np.int64)[None, :]
+    step = max(1, min(total, (1 << 18) // max(len(union_seeds), 1)))
+    count = 0
+    for off in range(0, total, step):
+        bs = min(step, total - off)
+        masks = np.arange(off, off + bs, dtype=np.int64)[:, None]
+        signs = np.where((masks & (1 << bitpos)) != 0, 1.0, -1.0)
+        t_max = None
+        for cc in cols:
+            # The same union sign vector restricted to this look's columns;
+            # seeds outside the look contribute nothing.
+            sub = direction * (signs[:, cc] @ d_union[cc])
+            t_max = sub if t_max is None else np.maximum(t_max, sub)
+        count += int((t_max >= t_obs - 1e-12).sum())
+    p_one = count / float(total)
+    p_seq = min(1.0, 2.0 * p_one)
+    # The final look is inside the maximum, so p_seq >= p_final up to floating
+    # rounding; clamp explicitly rather than report a numerically "better"
+    # sequential p than the ordinary final test.
+    if math.isfinite(p_final):
+        p_seq = max(p_seq, float(p_final))
+    base.update({'p_sequential': float(p_seq),
+                 'method': 'exact-max-over-looks-final-direction',
+                 'note': ('exact joint sign-flip null over all seeds used by '
+                          'any look, maximised in the final effect direction; '
+                          'p >= the final-look p')})
+    return base
+
+
 def _percentile_ci(vals, lo=2.5, hi=97.5):
     v = [f for f in (_finite_scalar(x) for x in vals) if f is not None]
     if len(v) < 2:
@@ -26887,6 +27092,175 @@ def _paired_seed_deltas(recs, a, b, *, strict_hyper=False):
         out[(ts, bs)] = (deltas, seeds, skipped)
     return out
 
+# ---- 面板 look history：把「第几次分析」变成可复核的落盘记录 --------------
+# 补种子 pass 会对同一个 outdir 再次聚合；每次 seed 集合变化就是一次新的
+# look。这里把**当时**参与检验的逐种子配对差与种子集合落盘，使
+# `sequential_signflip_p` 可以在事后复核「最终显著是不是靠不断加种子得到的」。
+# 该文件只记录分析事件，不进入 resume/pairing/冻结判定。
+LOOK_HISTORY_SCHEMA = 1
+LOOK_HISTORY_MAX_LOOKS = 500
+
+
+def _contrast_look_key(kind, comp, with_arm, without_arm, tag_with, tag_without):
+    return '%s::%s::%s|%s|%s|%s' % (kind, comp, with_arm, without_arm,
+                                    tag_with or '', tag_without or '')
+
+
+def panel_look_snapshot(recs, *, design=None, baselines=None):
+    """Measured declared contrasts with their exact per-seed deltas.
+
+    This is the evidence a look needs: the seed set that was actually paired
+    at aggregation time and the signed ``with - without`` primary-endpoint
+    delta for each seed.  Only contrasts with at least one controlled pair are
+    emitted; missing arms are the job of the completeness audit, not of the
+    look history.
+    """
+    design = ABLATION_DESIGN if design is None else design
+    baselines = BASELINE_DESIGN if baselines is None else baselines
+    out = {}
+    groups = (('component', design), ('baseline', baselines))
+    for kind, group in groups:
+        if not isinstance(group, dict):
+            continue
+        for comp, contrasts in group.items():
+            if isinstance(contrasts, (str, bytes)):
+                continue
+            try:
+                items = list(contrasts or ())
+            except TypeError:
+                continue
+            for item in items:
+                if not isinstance(item, (tuple, list)) or len(item) < 2:
+                    continue
+                a, b = item[0], item[1]
+                if not (isinstance(a, str) and isinstance(b, str)
+                        and a.strip() and b.strip()):
+                    continue
+                conds = _paired_seed_deltas(
+                    recs, a, b, strict_hyper=(kind == 'component'))
+                for (ts, bs), (deltas, shared, skipped) in sorted(conds.items()):
+                    _skipped = {s for s, _why in skipped}
+                    seeds = [s for s in shared if s not in _skipped]
+                    if not deltas or not seeds:
+                        continue
+                    key = _contrast_look_key(kind, comp, a, b, ts, bs)
+                    sf = exact_signflip_p(deltas)
+                    out[key] = {
+                        'kind': kind, 'component': comp,
+                        'with': a, 'without': b,
+                        'tag_with': ts or '', 'tag_without': bs or '',
+                        'seeds': [int(s) for s in seeds],
+                        'deltas': [float(d) for d in deltas],
+                        'n': int(len(deltas)),
+                        'mean': float(np.mean(deltas)),
+                        'p_exact_signflip': float(sf.get('p', float('nan'))),
+                        'n_skipped_pairs': int(len(skipped)),
+                    }
+    return out
+
+
+def load_look_history(outdir):
+    """Read ``<outdir>/look_history.json``; a missing file is an empty history.
+
+    A malformed file is returned as ``{'schema': ..., 'looks': [],
+    'invalid': reason}`` instead of being silently treated as "no looks": a
+    corrupted look record must not erase the correction it implies.
+    """
+    path = os.path.join(os.fspath(outdir), 'look_history.json')
+    if not os.path.exists(path):
+        return {'schema': LOOK_HISTORY_SCHEMA, 'looks': []}
+    try:
+        with open(path, encoding='utf-8') as f:
+            obj = json.load(f)
+    except Exception as e:
+        return {'schema': LOOK_HISTORY_SCHEMA, 'looks': [],
+                'invalid': f'{type(e).__name__}: {e}'}
+    if not isinstance(obj, dict):
+        return {'schema': LOOK_HISTORY_SCHEMA, 'looks': [],
+                'invalid': f'look_history.json is a {type(obj).__name__}, not an object'}
+    obj.setdefault('schema', LOOK_HISTORY_SCHEMA)
+    if not isinstance(obj.get('looks'), list):
+        obj['looks'] = []
+        obj['invalid'] = 'looks is not a list'
+    return obj
+
+
+def record_panel_look(outdir, recs, *, design=None, baselines=None, now=None):
+    """Append a look snapshot when the measured contrast set changed.
+
+    Re-aggregating an unchanged panel does NOT add a look (the same seed set
+    is the same analysis).  A new seed, a newly measured arm or a re-run delta
+    does add one.  The file is bounded by :data:`LOOK_HISTORY_MAX_LOOKS`; the
+    oldest looks are dropped with an explicit ``truncated`` flag so the record
+    never silently becomes a different kind of evidence.
+    """
+    snapshot = panel_look_snapshot(recs, design=design, baselines=baselines)
+    hist = load_look_history(outdir)
+    if not snapshot:
+        # No declared contrast is measured in this panel (e.g. a pure
+        # confirmation or kernel run): do not create an empty look file.
+        return hist
+    if hist.get('invalid'):
+        # Keep the reason visible; a fresh record cannot prove what was lost.
+        hist.setdefault('recovered_after_invalid', hist['invalid'])
+    looks = hist.get('looks') if isinstance(hist.get('looks'), list) else []
+    marker = json.dumps(snapshot, sort_keys=True, separators=(',', ':'),
+                        ensure_ascii=True, default=str)
+    last = looks[-1] if looks and isinstance(looks[-1], dict) else {}
+    if last:
+        last_marker = json.dumps(last.get('contrasts'), sort_keys=True,
+                                 separators=(',', ':'), ensure_ascii=True,
+                                 default=str)
+        if last_marker == marker:
+            return hist
+    look_no = int(last.get('look') or len(looks)) + 1 if looks else 1
+    entry = {'look': look_no,
+             'recorded_at': now or time.strftime('%Y-%m-%dT%H:%M:%S'),
+             'n_contrasts': len(snapshot),
+             'contrasts': snapshot}
+    looks.append(entry)
+    truncated = 0
+    if len(looks) > LOOK_HISTORY_MAX_LOOKS:
+        truncated = len(looks) - LOOK_HISTORY_MAX_LOOKS
+        looks = looks[-LOOK_HISTORY_MAX_LOOKS:]
+    hist.update({'schema': LOOK_HISTORY_SCHEMA, 'panel': os.fspath(outdir),
+                 'looks': looks, 'n_looks': len(looks)})
+    if truncated:
+        hist['truncated_oldest_looks'] = int(
+            hist.get('truncated_oldest_looks') or 0) + int(truncated)
+    atomic_write_json(os.path.join(os.fspath(outdir), 'look_history.json'), hist)
+    return hist
+
+
+def looks_by_contrast(history):
+    """Flatten a look history into ``{contrast_key: [look, ...]}``."""
+    out = {}
+    if not isinstance(history, dict):
+        return out
+    for look in history.get('looks') or []:
+        if not isinstance(look, dict):
+            continue
+        contrasts = look.get('contrasts')
+        if not isinstance(contrasts, dict):
+            continue
+        for key, c in contrasts.items():
+            if not (isinstance(c, dict) and isinstance(c.get('seeds'), list)
+                    and isinstance(c.get('deltas'), list)):
+                continue
+            # An empty look is not a look at this contrast; it must not make the
+            # whole sequential call fail (the caller would lose the panel's
+            # correction entirely).  The public primitive still rejects an
+            # empty input contract.
+            if not c['seeds'] or not c['deltas']:
+                continue
+            out.setdefault(str(key), []).append({
+                'look': look.get('look'), 'recorded_at': look.get('recorded_at'),
+                'seeds': list(c['seeds']), 'deltas': list(c['deltas']),
+                'p_exact_signflip': c.get('p_exact_signflip'),
+            })
+    return out
+
+
 def _knobs_equal_across_arms(recs, arms, key):
     """Compare a per-record descriptor (`run_cfg`, `train_knobs`, ...) across
     the arms of one component.  Returns True/False/None: True when at least two
@@ -27427,15 +27801,20 @@ def _family_size_with_missing(design_group, entries_by_comp):
     return int(total_entries + missing)
 
 
-def _holm_assign(entries, m_family, alpha, out_key):
+def _holm_assign(entries, m_family, alpha, out_key, *, p_key='p_exact_signflip'):
     """Attach a Holm step-down adjusted p to each entry over the declared
     family.  `m_family` is the DECLARED number of contrasts, not just the ones
     with data: a missing arm must not shrink the correction family (that would
     make an incomplete ablation look better-powered than it is).  Dummy p=1
-    entries fill the difference."""
+    entries fill the difference.
+
+    ``p_key`` selects the per-contrast p fed into the family correction.  The
+    default keeps the historical naive final-look p; the look-adjusted pass
+    passes ``p_look_adjusted`` so optional stopping cannot be corrected away
+    by a family that never saw the extra looks."""
     named = []
     for i, e in enumerate(entries):
-        p = e.get('p_exact_signflip')
+        p = e.get(p_key)
         if isinstance(p, (int, float)) and math.isfinite(float(p)):
             named.append((str(i), float(p)))
     m_eff = max(int(m_family), len(entries), len(named))
@@ -27642,7 +28021,18 @@ def _apply_sesoi_holm(component_entries, component_design, baseline_entries,
                 if s.get('margin_ppl') is None:
                     continue
                 name = f'{kind}::{comp}::{j}'
-                named.append((name, s.get('tost_p_tost')))
+                _p_tost = s.get('tost_p_tost')
+                _k_looks = int((e.get('look_analysis') or {}).get('n_looks') or 1)
+                if (isinstance(_p_tost, (int, float)) and math.isfinite(float(_p_tost))
+                        and _k_looks > 1):
+                    # Equivalence is a positive claim and is equally exposed
+                    # to optional stopping: a TOST run after each seed top-up
+                    # can be "equivalent" at the look that happened to be
+                    # tight.  Bonferroni over looks is valid and conservative.
+                    _p_tost = min(1.0, float(_p_tost) * _k_looks)
+                    s['p_tost_look_adjusted'] = _p_tost
+                    s['n_looks'] = _k_looks
+                named.append((name, _p_tost))
                 by_name[name] = e
                 _measured_pairs.add((e.get('with'), e.get('without')))
             # Every declared contrast that produced no TOST gets a dummy p=1
@@ -27701,7 +28091,8 @@ def _apply_sesoi_holm(component_entries, component_design, baseline_entries,
         new['source'] = s.get('source')
         # Preserve the descriptive fields from the per-contrast decision; the
         # refreshed dict is the same object's replacement, not a lossy cast.
-        for _k in ('label', 'baseline_ppl', 'relative_margin_pct'):
+        for _k in ('label', 'baseline_ppl', 'relative_margin_pct',
+                   'p_tost_look_adjusted', 'n_looks'):
             if _k in s:
                 new[_k] = s[_k]
         new['p_floor'] = s.get('p_floor')
@@ -28209,7 +28600,7 @@ def methodology_seed_plan(n_seeds, design=None, baselines=None, alpha=0.05, vari
             'ablation_complete': _ablation.get('complete'),
             'note': 'a panel below the minimum is DESCRIPTIVE ONLY: the exact-test resolution floor, not the observed effect, bounds its p value'}
 
-def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n=3, outdir=None, write=True, verbose=True, sesoi=None):
+def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n=3, outdir=None, write=True, verbose=True, sesoi=None, look_history=None):
     """Zero-GPU audit of controlled comparison, ablation completeness and
     statistical reliability for one panel's `summary` dict.
 
@@ -28240,7 +28631,16 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
     not counted as practically useful.
 
     Returns the report dict and, when `outdir` is given, writes
-    `methodology_audit.json`."""
+    `methodology_audit.json`.
+
+    ``look_history`` (default: read ``<outdir>/look_history.json`` when it
+    exists) records every aggregation look of the panel.  When a contrast was
+    measured at more than one growing seed set, its significance is ALSO
+    required to pass the exact sequential sign-flip p from
+    :func:`sequential_signflip_p`; the naive final-n p is kept as
+    ``p_exact_signflip`` / ``p_holm_global_naive`` for transparency.  This is
+    the optional-stopping correction: topping up seeds after seeing a
+    non-significant result cannot buy the final-n p for free."""
     alpha = _validated_alpha(alpha, context='methodology_audit alpha')
     _min_n = _as_seed_int(min_n)
     if _min_n is None or _min_n < 0:
@@ -28271,6 +28671,17 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
         # family and mislabel an untested comparison as "unverified".
         _base_arms = {x for _cs in BASELINE_DESIGN.values() for _a, _b, _n in _cs for x in (_a, _b)}
         baselines = BASELINE_DESIGN if (default_design and (_base_arms & set(present))) else {}
+    # Optional-stopping evidence: only the looks actually recorded for THIS
+    # panel are used.  An explicit `look_history` argument wins over the file
+    # so a caller can audit an exported copy without trusting a sibling file.
+    if look_history is None and outdir is not None:
+        look_history = load_look_history(outdir)
+    if look_history is not None and not isinstance(look_history, dict):
+        report_look_invalid = f'look_history is a {type(look_history).__name__}, not an object'
+        look_history = {'looks': []}
+    else:
+        report_look_invalid = (look_history or {}).get('invalid') if isinstance(look_history, dict) else None
+    _look_series = looks_by_contrast(look_history or {})
     # Both passes below (collection and scoping) must see the same one-pass
     # iterable, so materialise declarations exactly once up front.
     design = _materialise_contrast_design(design)
@@ -28293,6 +28704,7 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
               'practically_harmful_components': [],
               'practically_inconclusive_components': [],
               'sesoi': {},
+              'look_history': {}, 'look_adjusted_contrasts': [],
               'direction_conflict_components': [], 'hypotheses_missing': [],
               'verified_baselines': [], 'measured_baselines': [],
               'significant_baselines': [], 'nominally_significant_baselines': [],
@@ -28321,6 +28733,85 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
         report['warnings'].append(
             f'baselines is a {_baseline_type_problem}, not a mapping; no '
             'baseline contrast can be audited')
+    if report_look_invalid:
+        report['warnings'].append(
+            f'look history is unreadable or malformed ({report_look_invalid}); '
+            'the optional-stopping/sequential correction cannot be verified for '
+            'this panel — do not read its naive p as look-adjusted')
+
+    def _attach_look_analysis(st, key, final_seeds, final_deltas):
+        """Attach the sequential p for this contrast from the recorded looks.
+
+        A history look whose shared-seed deltas disagree with the current
+        record is STALE (the seed was re-run): it is excluded and named, never
+        silently averaged into the joint null.  The final look is always
+        appended, so a manually edited summary still gets a two-look check
+        when history exists.
+        """
+        if not final_seeds or not final_deltas:
+            return None
+        cur = {int(s): float(d) for s, d in zip(final_seeds, final_deltas)}
+        series, stale = [], []
+        seen = set()
+        for lk in _look_series.get(key) or []:
+            try:
+                seeds = [int(s) for s in lk.get('seeds') or []]
+                deltas = [float(d) for d in lk.get('deltas') or []]
+            except (TypeError, ValueError):
+                stale.append({'look': lk.get('look'), 'reason': 'non-numeric seed/delta'})
+                continue
+            if len(seeds) != len(deltas) or not seeds:
+                stale.append({'look': lk.get('look'), 'reason': 'seed/delta length mismatch or empty'})
+                continue
+            _rows = sorted(zip(seeds, deltas), key=lambda t: t[0])
+            seeds = [s for s, _d in _rows]
+            deltas = [d for _s, d in _rows]
+            dm = dict(zip(seeds, deltas))
+            bad = [s for s in seeds if s in cur and abs(dm[s] - cur[s]) > 1e-9]
+            if bad:
+                stale.append({'look': lk.get('look'),
+                              'reason': 'seed delta changed across looks',
+                              'seeds': sorted(bad)})
+                continue
+            sig = (tuple(seeds), tuple(round(v, 12) for v in deltas))
+            if sig in seen:
+                continue
+            seen.add(sig)
+            series.append({'look': lk.get('look'), 'seeds': seeds, 'deltas': deltas})
+        sig = (tuple(int(s) for s in final_seeds),
+               tuple(round(float(d), 12) for d in final_deltas))
+        if sig not in seen:
+            series.append({'look': series[-1].get('look', 0) + 1 if series else 1,
+                           'seeds': [int(s) for s in final_seeds],
+                           'deltas': [float(d) for d in final_deltas],
+                           'current': True})
+        if not series:
+            return None
+        seq = sequential_signflip_p(series, alpha=alpha)
+        seq['contrast'] = key
+        seq['n_stale_looks'] = len(stale)
+        seq['stale_looks'] = stale
+        seq['look_adjusted'] = bool(len(series) > 1)
+        if stale:
+            report['warnings'].append(
+                '%s: %d recorded look(s) are STALE (a seed delta changed after '
+                're-running); they were excluded from the sequential test, so '
+                'the correction covers only the remaining %d look(s)'
+                % (key, len(stale), len(series)))
+        if len(series) > 1:
+            report['look_adjusted_contrasts'].append(key)
+            if seq.get('p_sequential') is not None and math.isfinite(float(seq['p_sequential'])):
+                _naive = st.get('p_exact_signflip')
+                if (isinstance(_naive, (int, float)) and math.isfinite(float(_naive))
+                        and float(_naive) < alpha and float(seq['p_sequential']) >= alpha):
+                    report['warnings'].append(
+                        '%s: the naive final-look p=%.4g would be significant, but '
+                        'the sequential p over %d looks is %.4g (>= alpha=%.3g) — '
+                        'topping up seeds does not make the effect confirmable; '
+                        'report it as exploratory/unresolved'
+                        % (key, float(_naive), len(series),
+                           float(seq['p_sequential']), alpha))
+        return seq
 
     def _collect(design_group, kind):
         out = {}
@@ -28488,6 +28979,20 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                                'predicted_sign': _pred, 'observed_sign': _obs,
                                'direction_consistent': (None if (_pred is None or _obs is None)
                                                         else (_pred == 0 or _pred == _obs))})
+                    # Every aggregation with a new seed set is a look.  If this
+                    # contrast has more than one recorded look, the naive
+                    # final-n p is NOT the evidence a sequential experiment
+                    # provides; attach the exact max-over-looks p here and use
+                    # it for the family correction below.
+                    st['deltas'] = [float(x) for x in deltas]
+                    _look_key = _contrast_look_key(kind, comp, a, b, ts, bs)
+                    _seq = _attach_look_analysis(st, _look_key, _passed, deltas)
+                    if _seq is not None:
+                        st['look_analysis'] = _seq
+                        st['p_look_adjusted'] = _seq.get('p_sequential')
+                    else:
+                        st['p_look_adjusted'] = st.get('p_exact_signflip')
+                    st['look_adjusted'] = bool((_seq or {}).get('look_adjusted'))
                     if st['requires_param_match'] and _param_capacity_ok is not True:
                         st['param_match_unmet'] = True
                         st['mechanism_claim_allowed'] = False
@@ -28703,8 +29208,18 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
         _family_size_with_missing(_scoped_design, comp_entries)
         + _family_size_with_missing(_scoped_baselines, base_entries))
     m_family = max(declared_m, len(all_entries), _family_with_missing)
-    _holm_assign(all_entries, m_family, alpha, 'p_holm_global')
-    _holm_assign(all_entries, m_family, alpha, 'p_holm_family')
+    _holm_assign(all_entries, m_family, alpha, 'p_holm_global_naive')
+    _holm_assign(all_entries, m_family, alpha, 'p_holm_global',
+                 p_key='p_look_adjusted')
+    _holm_assign(all_entries, m_family, alpha, 'p_holm_family',
+                 p_key='p_look_adjusted')
+    for e in all_entries:
+        # Keep the naive family verdict visible: the difference between the
+        # two columns IS the optional-stopping correction, not a bug.
+        _phn = e.get('p_holm_global_naive')
+        e['significant_global_naive'] = bool(
+            _phn is not None and float(_phn) < alpha
+            and (not e.get('within_seed_noise')) and e.get('controlled'))
     for e in all_entries:
         _ph = e.get('p_holm_global')
         e['significant_global'] = bool(_ph is not None and float(_ph) < alpha and (not e.get('within_seed_noise')) and e.get('controlled'))
@@ -29552,6 +30067,43 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
         report['warnings'].append(
             'baseline claim gate FAILED: ' + '; '.join(_bcg.get('reasons') or []))
 
+    # ---- look / optional-stopping summary --------------------------------
+    # One contrast can have several protocol entries; the summary is keyed by
+    # the same stable key the look file uses.  `n_looks` is the maximum number
+    # of looks among adjusted contrasts (a panel-level count of analysis
+    # rounds, not of statistical tests).
+    _look_entries = [e for e in all_entries if isinstance(e.get('look_analysis'), dict)]
+    report['look_adjusted_contrasts'] = sorted(set(report['look_adjusted_contrasts']))
+    _look_keys = sorted({e['look_analysis'].get('contrast') for e in _look_entries
+                         if e['look_analysis'].get('contrast')})
+    _multi = [e for e in _look_entries
+              if int(e['look_analysis'].get('n_looks') or 0) > 1]
+    _multi_keys = sorted({e['look_analysis'].get('contrast') for e in _multi
+                          if e['look_analysis'].get('contrast')})
+    _downgraded = sorted({
+        e['look_analysis'].get('contrast') for e in _look_entries
+        if e.get('significant_global_naive') and not e.get('significant_global')})
+    report['look_history'] = {
+        'schema': LOOK_HISTORY_SCHEMA,
+        'panel_looks': int(max([int(e['look_analysis'].get('n_looks') or 0)
+                                for e in _look_entries] or [0])),
+        'n_contrasts_with_looks': len(_look_keys),
+        'n_contrasts_look_adjusted': len(_multi_keys),
+        'look_adjusted_contrasts': _multi_keys,
+        'downgraded_naive_significant': _downgraded,
+        'invalid': report_look_invalid,
+        'policy': ('each new seed set aggregated for this panel is one look; '
+                   'significance uses the exact max-over-looks sign-flip p, '
+                   'and the naive final-n p is kept only as a diagnostic'),
+    }
+    if _downgraded:
+        report['warnings'].append(
+            'optional-stopping correction DOWNGRADED %d contrast(s): %s — '
+            'the naive final-look family p was < alpha, but the exact '
+            'max-over-looks p was not. Adding seeds after seeing a '
+            'non-significant result is one of the looks, not a free rerun.'
+            % (len(_downgraded), ', '.join(_downgraded[:5])))
+
     if write and outdir:
         try:
             os.makedirs(outdir, exist_ok=True)
@@ -29662,6 +30214,13 @@ def _print_methodology_audit(report):
     print('  family: %d declared contrasts, m_eff=%s; Holm p is the family-corrected p.' % (int(_fam.get('declared_contrasts') or 0), _fam.get('effective_m')))
     if _fam.get('min_seeds_for_family_significance'):
         print('  minimum seeds for a family-corrected rejection at alpha=%g: n>=%d (below this every p is resolution-limited).' % (float(report.get('alpha', 0.05)), int(_fam['min_seeds_for_family_significance'])))
+    _lh = report.get('look_history') or {}
+    if int(_lh.get('panel_looks') or 0) > 1:
+        print('  analysis looks: %d (seed top-ups); %d contrast(s) use the exact '
+              'max-over-looks p%s'
+              % (int(_lh['panel_looks']), int(_lh.get('n_contrasts_look_adjusted') or 0),
+                 (': DOWNGRADED ' + ', '.join(_lh['downgraded_naive_significant'][:3]))
+                 if _lh.get('downgraded_naive_significant') else ''))
     _abl = report.get('ablation_completeness') or {}
     if _abl:
         _missing = '; '.join('%s=%s' % (c, ','.join(a))
@@ -40279,6 +40838,17 @@ def _dump_aggregate(outdir, summary):
     _save_csv(_pub, outdir)
     _print_table(_pub)
     _print_pairs(records_for_readers)
+    # Record this aggregation as a look BEFORE the audit reads the history, so
+    # the audit's sequential correction sees the same seed set it is auditing.
+    try:
+        _looks = record_panel_look(outdir, records_for_readers)
+        if int(_looks.get('n_looks') or 0) > 1:
+            print(f'[look] this panel has {_looks["n_looks"]} analysis look(s) '
+                  '(seed top-ups); significance is additionally checked against '
+                  'the sequential sign-flip p in methodology_audit.json')
+    except Exception as e:
+        print(f'[look] could not record the look history ({type(e).__name__}: '
+              f'{e}); the sequential correction will be unavailable')
     try:
         methodology_audit(records_for_readers, outdir=outdir, verbose=True)
     except Exception as e:

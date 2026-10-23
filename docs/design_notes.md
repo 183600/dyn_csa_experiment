@@ -2689,6 +2689,8 @@ python v12_supp.py plan           # 冻结预检不变：72/72、6 个主比较
    decision log、registry 也保证探索性面板不能升级为确认性，但没有逐面板
    的 `max_seeds` / look count。前瞻性的 panel analysis plan 能让「看了
    几次再决定继续」可见，即使仍只作探索性证据。
+   （**§58 已处理**：每次新种子集合的聚合写入 `look_history.json`，并用
+   精确 max-over-looks 序列 p 收紧探索性面板的 `verified`。）
 4. **实际显著性仍依赖判断。** 报告拒绝 `|mean| <= std` 并给出相对效应/
    噪声，但没有预先注册的最小实际效应量；若决策是关于实际而非仅统计
    优势，未来冻结应写明 SESOI（smallest effect size of interest）。
@@ -3547,3 +3549,126 @@ L174 覆盖：v12 分析在文档与文章单元上写入正确 id、影响块�
 边界、均匀效应不被误标、无影响块时不伪造表格。L175 覆盖：fragile 块
 → `warnings`、一致块 → `ok`、篡改点估计 → `fail`、pooled CI 存在但
 无影响块 → `warnings`、缺产物 → `not_verifiable_locally`。
+
+## 58. 补种子不是免费重跑：把 look history 变成可复算的序列检验（本轮对比实验方法硬化）
+
+### 58.1 问题：同一个面板被分析了不止一次
+
+§19 的族校正解决的是「一个面板内同时比较 m 条声明」的多重性；§42/§57
+解决的是「结论是否由某一个训练种子或评测单位主导」。它们都默认**最终
+种子集合只被检验了一次**。但本仓库的补种子流程不是这样工作的：
+
+- `run_gapfill.py full` 先以 seeds 0-2 聚合、写 `summary.json` /
+  `methodology_audit.json`；
+- 看到结果后，`topup`（`ABL_SEED_TARGET` / `CORE_SEED_TARGET`）再把同一
+  面板补到 n=4、6、12，每补一次就再聚合、再看一次。
+
+这正是 optional stopping / 多次 look：如果每次都在「这次还不显著」之后
+继续加种子，直到某一次 p<α，那么最终 n 下的朴素 p 不再是实验真正花费的
+错误率。§49.3 已经把「探索性面板的 look history 不是机器可读的」列为
+剩余边界；本轮把它变成落盘、可复算、会真正收紧判定的证据，而不是再加
+一句「补种子要小心」。
+
+### 58.2 定义：一次 look 是一个新的种子集合
+
+`exp_lib.record_panel_look(outdir, recs)` 在 `_dump_aggregate` 每次聚合时
+运行，对每个**已测声明对照**记录：
+
+- 当前参与配对的种子集合与逐种子配对差 `d_i = with − without`（主终点、
+  与 `_paired_seed_deltas` 同一受控配对门）；
+- 该 look 的精确符号翻转 p、均值、run 配置键与删除的配对数。
+
+写进 `<outdir>/look_history.json`。同一份数据重复聚合**不会**新增 look；
+新种子、新臂或某个种子的配对差被重跑改变才会新增。文件有上限
+（`LOOK_HISTORY_MAX_LOOKS=500`），截断时显式记录
+`truncated_oldest_looks`，不静默丢掉证据。
+
+这是**分析事件**记录，不进入 `run_cfg`、resume 键、配对身份、`src_fp`
+或冻结清单；它不改变任何训练/评测数值。
+
+### 58.3 方法：最终方向上的 max-over-looks 精确符号翻转
+
+`exp_lib.sequential_signflip_p(looks)` 的输入是同一对照按时间排序的
+look 序列，最后一个 look 是当前最终种子集合。设最终总效应
+`T_final = |Σ_i d_i|`，方向 `s = sign(Σ_i d_i)`。零假设下每个种子的符号
+独立等概率翻转，同一条符号向量投影到每个 look 的种子上：
+
+```
+T_k(ε) = s · Σ_{i ∈ look_k} ε_i d_i
+p_one  = P( max_k T_k(ε) ≥ T_final )
+p_seq  = min(1, 2 · p_one)
+```
+
+- 这是**联合**零分布，不是把各 look 的 p 当独立检验再做一次校正；look
+  之间的相关性（共享种子）被精确复现。
+- 取 max 且用**最终方向**，而不是「所有 look 里最小的双侧 p」：一个早期
+  look 即使更极端、方向相反，也不能替最终的相反方向「买」显著。最终
+  look 一定在 max 内，所以 `p_seq ≥ p_final`；这保证修正只会变保守。
+- 双侧用 `2·p_one`：对任意符号路径，
+  `P(max_k |S_k| ≥ T) ≤ 2·P(max_k S_k ≥ T)`，是有效的保守上界。
+- 种子并集 ≤ `LOOK_SEQUENTIAL_ENUM_MAX_N=16` 时按上式精确枚举；更大时
+  退回 `min(1, K · p_final)` 的 Bonferroni-over-looks（有效但保守），并
+  在 `method` 里标明。K=1 时直接等于普通精确 p（没有额外损失）。
+- 同一种子在两个 look 的 `d_i` 不一致（记录被重跑/编辑）时，旧 look 视为
+  **stale**，在 `methodology_audit` 中剔除并点名；公开原语则退回
+  Bonferroni 并把冲突种子写进 `inconsistent_seeds`。绝不把两个估计量的
+  配对差混进同一个联合零分布。
+
+### 58.4 接入 `methodology_audit`：verified 用序列 p
+
+- `methodology_audit(..., look_history=None)`：默认从
+  `<outdir>/look_history.json` 读取；也可显式传入（审计导出的副本）。
+  每个对照条目新增 `look_analysis`（逐 look 的 n/seeds/p、`p_sequential`、
+  `method`、`n_stale_looks`）与 `p_look_adjusted`。
+- 族校正改为两列：`p_holm_global_naive` 用最终 n 的朴素 p（保留，供
+  对照/诊断），`p_holm_global` / `p_holm_family` 用 `p_look_adjusted`。
+  `significant_global` 因此要求**序列 p** 也过 Holm；`verified` /
+  `system_level_only` / SESOI 的统计前提全部沿用这条更保守的判定。
+- TOST 等价同样受多次 look 影响：对 K>1 的对照，`_apply_sesoi_holm` 把
+  原始 TOST p 先做 `min(1, K·p)` 再进 Holm，写入
+  `sesoi.p_tost_look_adjusted` / `n_looks`。`equivalent` 不能再靠某一次
+  恰好很紧的补种子 look 取得。
+- 报告顶层新增 `look_history` 块（`panel_looks`、被修正的对照数、被
+  降级的朴素显著项、`invalid`）并把降级写进 warnings；控制台打印
+  `analysis looks: K`。`REPORT_v12` 若读取该审计块会得到同一口径。
+- `audit_gates.audit_look_history`（`python audit_gates.py looks`）独立
+  复核：look 编号严格递增、seed/delta 长度与唯一性、逐 look p 可重算、
+  `methodology_audit.json` 的 `p_sequential` 与重算一致、补种子是否嵌套、
+  以及「朴素显著但序列不显著」的降级清单。结构不一致判 `fail`，缺少
+  audit 块判 `warnings`，没有任何 look 文件判 `not_verifiable_locally`。
+
+### 58.5 边界
+
+- **不改**冻结确认清单：`confirmation_frozen*.json`、P5T 的 p/α/Holm/
+  决策规则、种子白名单、终点与 `CODE_SEMANTICS` 全部不动。该层只约束
+  探索性面板的**重新阅读与措辞**；v12 确认性判定仍按冻结规则。
+- 只对**有 look history 的新聚合**生效。历史 v6-v11 面板没有该文件，
+  `methodology_audit` 保持原行为（并在缺文件时不做任何猜测），不重跑、
+  不回填，也不把旧结论标成已做序列修正。
+- 「聚合过」不必然等于「人看过」：若中间 look 从未被查看，序列修正是
+  保守的而非错误的；若确实按 p 决定继续补种子，它就是必须的修正。该
+  文件把「有没有多次分析」变成可复核事实，但无法证明分析者的意图。
+- 序列 p 的条件是「look 序列是同一对照、同一主终点、同一评测切片」；
+  stale look 被剔除，但**没有**自动检测「换了一个验证切片后仍复用同一
+  outdir」——这仍由 `pair_reason` 的 `val_fp`/`eval_fp` 门和 §19 负责。
+- 并集 >16 个种子用 Bonferroni 回退：仍有效，但比精确 max 保守；报告
+  必须读 `method`，不能把两种 p 当成同一精度。
+- 这是族级「最终方向是否有过证据」的 p，不替代效应量、SESOI、种子
+  稳健性（§42）或单单元影响（§57）；它只回答「多次补种子后，最终 n 的
+  p 还能不能按原样引用」。
+
+### 58.6 入口与验证
+
+```bash
+python test_review_fixes.py          # L176 原语；L177 落盘/去重/stale/审计；L178 降级门
+python audit_gates.py looks          # 零 GPU：逐面板 look history 与序列 p
+python audit_gates.py report         # 汇总里新增 looks
+```
+
+L176 覆盖：单 look 等于普通精确 p、嵌套 look 的 `p_seq ≥ p_final`、
+具体降级向量、早期反向 look 不能替最终方向取得显著、stale 种子回退
+Bonferroni、>16 种子回退、确定性与 malformed 输入 fail-closed。L177
+覆盖：6→10 补种子产生 2 个 look、重复聚合不新增、stale delta 被剔除
+并 warn、篡改逐 look p 判 fail、缺 audit 块判 warnings、无产物判
+`not_verifiable_locally`。L178 覆盖：朴素显著/序列不显著的降级被审计
+点名，audit 的序列 p 与重算不一致判 fail。

@@ -289,6 +289,7 @@ python audit_gates.py leakage     # 分词器来源 / 词表一致性 / train-te
 python audit_gates.py single_factor  # 定义点单因素门：每条声明对照的臂配置 diff 恰等于声明的干预键集；开放块矩阵只沿声明轴变化；冻结清单的 mechanism_claim_allowed 标志与实际 cfg diff 对账
 python audit_gates.py sesoi       # 设计期门：每个消融组件都有合法已声明 SESOI，且声明对照完整排程
 python audit_gates.py unit_influence  # 结果分析门：逐单元影响块必须复现主终点 pooled Δ；标记单单元主导/陈旧产物
+python audit_gates.py looks       # look-history 门：复核逐 look p 与精确 max-over-looks 序列 p；标记「补种子后才显著」的对照
 python audit_gates.py report      # 运行本地可核验的全部审计 -> audit_report.json
 python archive_release.py plan v13 --dirs results_lm_test analysis_v12   # 证据归档 dry-run
 ```
@@ -385,3 +386,14 @@ python build_report.py        # 从产物重建 REPORT_v7.md（零 GPU）
   与报告 pooled Δ 一致，并对 fragile/陈旧产物给 warning。该层是 post-hoc
   描述，**不改变**冻结 p/Holm/`confirmed` 判定（详见 docs/design_notes.md
   §57）。
+- **补种子 / optional stopping**：每次聚合出现新种子集合时，驱动把每个
+  已测的声明式留一/基线对照的种子集合与逐种子配对差写入
+  `<outdir>/look_history.json`。同一对照有多个 look 时，`methodology_audit`
+  改用**最终效应方向上的精确
+  max-over-looks** 符号翻转 p（对种子并集做联合符号枚举），族校正后的
+  `verified` 门使用该序列 p；最终 n 的朴素 p 只保留为
+  `p_holm_global_naive` 供对照。TOST 等价判定也做 Bonferroni-over-looks
+  修正；被重跑改变配对差的 stale look 会被剔除并点名。
+  `audit_gates.py looks` 独立重算逐 look p 与序列 p，并点名「朴素显著
+  但序列不显著」的对照。该层只约束探索性面板，**不改**冻结清单
+  （详见 docs/design_notes.md §58）。

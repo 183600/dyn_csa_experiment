@@ -2444,3 +2444,41 @@ section correctly reports the current legacy `wt103_cache` as
 `not_verifiable_locally`); a cold local-raw build was exercised and its meta
 records `provider='local'`, and the subsequent cache hit serves the same bytes.
 
+
+## 2026-10-23 — 补种子要按 look 序列检验（no new runs）
+
+零 GPU 的对比实验方法硬化；不新增训练、不读 test split、不改冻结清单的
+任何字节/种子/终点/α/Holm 决策规则，也不改 `CODE_SEMANTICS`。
+
+**Problem.** §49.3 已把「探索性面板的 look history 不是机器可读的」列为
+剩余边界。补种子流程（`topup` / `ABL_SEED_TARGET` / `CORE_SEED_TARGET`）
+会让同一对照在 n=3→4→6→12 时被多次聚合、多次查看；最终 n 的朴素符号
+翻转 p 没有计入「看了几次再决定继续加种子」的选择效应，属于 optional
+stopping。仅在单面板内做 Holm 不能修正这一点。
+
+**Fix.** `_dump_aggregate` 现在把每个新种子集合作为一次 look 写入
+`<outdir>/look_history.json`（同一数据重复聚合去重；文件有界并在截断时
+显式记录）。新增 `exp_lib.sequential_signflip_p`：在种子并集上联合枚举
+符号翻转，对每个 look 取**最终效应方向**上的证据并取 max，再双侧化；
+p 不小于最终 look 的普通精确 p。≤16 个种子精确枚举，更多时退回
+Bonferroni-over-looks；同一种子跨 look 配对差不一致时旧 look 视为
+stale 并剔除。`methodology_audit` 的 `p_holm_global` /
+`p_holm_family` / `significant_global` / `verified` 改用序列 p，朴素
+最终 p 保留为 `p_holm_global_naive`；TOST 等价也乘 look 数后再进 Holm。
+新增 `audit_gates.py looks` 独立重算并核对每个 panel 的 look history 与
+`methodology_audit.json`，把「朴素显著、序列不显著」列为降级清单。
+
+**Boundary.** 只影响有 look history 的新聚合；历史 v6-v11 面板没有该
+文件，审计保持原行为，不回填、不重跑、不把旧结果升级为已做序列修正。
+该文件是分析事件记录，不进入 resume/pairing/run_cfg/冻结判定；「从未
+查看中间 look」时该修正是保守的而非错误的。没有自动检测「换验证切片
+复用 outdir」——那仍由 `pair_fp` / `_paired_seed_deltas` 的指纹门负责。
+
+**Verification.** `python test_review_fixes.py` 通过 518/521，3 个
+DataLoader 环境跳过；新增 L176（原语：单 look 等价、单调、方向性、
+stale/大规模回退、malformed 拒绝）、L177（落盘/去重/stale 剔除/篡改 p
+fail-closed/缺 audit 块 warning）、L178（降级门）。`python v12_supp.py
+plan` 仍 72/72 合成记录、6 个比较；`python audit_gates.py source` 在刷新
+plan snapshot 后 `ok`（23/23 文件逐字节一致）；`python audit_gates.py
+sesoi` 仍通过；`python audit_gates.py looks` 在无结果树时明确
+`not_verifiable_locally`（不是 pass）。

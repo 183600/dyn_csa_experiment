@@ -39,6 +39,9 @@
   unit_influence  结果分析：逐评测单位删除（leave-one-out）影响读数是否
                与主终点同口径、是否由单个文章/文档主导（读 analysis_v12/，
                零 GPU；warning 级，不改变冻结判定）
+  looks        序列观测 / optional stopping：逐面板 look history 的种子集合、
+               逐种子配对差、逐 look p 与 max-over-looks 序列 p 是否自洽；
+               朴素最终 p 显著但序列 p 不显著的对照会被点名（零 GPU）
   single_factor  单因素设计契约：每条声明对照的臂配置 diff 恰好等于声明的
                干预键集（定义点审计，不读 results_*）；open-block 矩阵只沿
                两根声明轴变化；v7/v9 扫描的 factors 与真实 arm diff 对账；
@@ -5351,8 +5354,234 @@ def audit_unit_influence(path=None):
     return out
 
 
+def _find_look_histories(paths=None, max_depth=3):
+    """Yield ``look_history.json`` paths from explicit paths or results_* trees."""
+    seen = set()
+
+    def _walk(base):
+        base = os.path.abspath(base)
+        for root, dirs, files in os.walk(base):
+            depth = root[len(base):].count(os.sep)
+            # Result trees can contain caches/checkpoints; the look file only
+            # ever sits next to a panel summary, so prune deep/generated trees.
+            dirs[:] = [d for d in dirs
+                       if d not in ('__pycache__', 'wt103_cache', 'checkpoints')
+                       and depth < max_depth]
+            if 'look_history.json' in files:
+                yield os.path.join(root, 'look_history.json')
+
+    if paths is not None:
+        for p in paths:
+            p = os.fspath(p)
+            if os.path.isdir(p):
+                for f in _walk(p):
+                    if f not in seen:
+                        seen.add(f)
+                        yield f
+            elif os.path.isfile(p) and p.endswith('.json'):
+                ap = os.path.abspath(p)
+                if ap not in seen:
+                    seen.add(ap)
+                    yield ap
+        return
+    for name in _iter_result_dirs():
+        for f in _walk(os.path.join(REPO, name)):
+            if f not in seen:
+                seen.add(f)
+                yield f
+
+
+def audit_look_history(paths=None):
+    """Audit recorded analysis looks and the sequential (optional-stopping) p.
+
+    Every seed top-up pass re-aggregates a panel; if the analyst then decides
+    to add more seeds, the final-n p is not the p the experiment spent.  The
+    driver records each distinct seed set as a look in ``look_history.json``.
+    This gate independently:
+
+      * validates the look file (schema, per-look seed/delta lengths, unique
+        seeds, finite deltas, recomputed per-look exact p);
+      * recomputes the exact max-over-looks sequential p with the same
+        ``exp_lib.sequential_signflip_p`` the audit used and compares it with
+        ``methodology_audit.json``;
+      * flags seed regressions, stale/missing audit blocks and any contrast
+        whose naive final-look family p would be significant but whose
+        sequential p is not.
+
+    A malformed or internally inconsistent look file is a ``fail``: an
+    untraceable correction cannot be quoted.  No look files at all is
+    ``not_verifiable_locally``, not a pass.
+    """
+    L = _import_exp_lib()
+    out = {'kind': 'look_history_audit', 'status': 'ok', 'panels': {},
+           'n_panels': 0, 'n_looks': 0, 'n_contrasts_adjusted': 0,
+           'downgraded_claims': [], 'problems': [], 'warnings': [],
+           'note': ('optional-stopping correction: a panel aggregated at several '
+                    'growing seed sets is judged by the exact max-over-looks '
+                    'sign-flip p, not only by the final-n p')}
+    files = sorted(_find_look_histories(paths))
+
+    def _finite(x):
+        if isinstance(x, (bool, np.bool_)):
+            return None
+        try:
+            y = float(x)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return y if math.isfinite(y) else None
+
+    for f in files:
+        panel_dir = os.path.dirname(f)
+        rec = {'path': f, 'looks': 0, 'contrasts': {},
+               'downgraded': [], 'warnings': [], 'problems': []}
+        hist = _load(f)
+        if hist is None:
+            rec['problems'].append('look_history.json is missing or not a JSON object')
+        elif not isinstance(hist.get('looks'), list):
+            rec['problems'].append('looks is not a list')
+        else:
+            series = {}
+            prev_look = 0
+            for look in hist['looks']:
+                if not isinstance(look, dict):
+                    rec['problems'].append(f'look entry is a {type(look).__name__}, not an object')
+                    continue
+                lid = look.get('look')
+                if not isinstance(lid, int) or isinstance(lid, bool) or lid <= prev_look:
+                    rec['problems'].append(f'look number {lid!r} is not a strictly increasing integer')
+                else:
+                    prev_look = lid
+                contrasts = look.get('contrasts')
+                if not isinstance(contrasts, dict):
+                    rec['problems'].append(f'look {lid}: contrasts is not an object')
+                    continue
+                rec['looks'] += 1
+                for key, c in contrasts.items():
+                    if not isinstance(c, dict):
+                        rec['problems'].append(f'look {lid} {key}: contrast is not an object')
+                        continue
+                    seeds, deltas = c.get('seeds'), c.get('deltas')
+                    if (not isinstance(seeds, list) or not isinstance(deltas, list)):
+                        rec['problems'].append(f'look {lid} {key}: seeds/deltas are not lists')
+                        continue
+                    if len(seeds) != len(deltas):
+                        rec['problems'].append(
+                            f'look {lid} {key}: {len(seeds)} seeds vs {len(deltas)} deltas')
+                        continue
+                    try:
+                        _ss = [int(s) for s in seeds]
+                    except (TypeError, ValueError):
+                        rec['problems'].append(f'look {lid} {key}: non-integer seed')
+                        continue
+                    if len(set(_ss)) != len(_ss):
+                        rec['problems'].append(f'look {lid} {key}: duplicate seeds')
+                        continue
+                    _dd = [_finite(x) for x in deltas]
+                    if any(x is None for x in _dd):
+                        rec['problems'].append(f'look {lid} {key}: non-finite delta')
+                        continue
+                    sf = L.exact_signflip_p(_dd)
+                    recorded_p = _finite(c.get('p_exact_signflip'))
+                    if recorded_p is not None and abs(recorded_p - float(sf['p'])) > 1e-9:
+                        rec['problems'].append(
+                            f'look {lid} {key}: recorded p={recorded_p:.6g} does not '
+                            f'recompute ({sf["p"]:.6g})')
+                    series.setdefault(key, []).append(
+                        {'look': lid, 'seeds': _ss, 'deltas': _dd})
+            # Recompute the sequential p and compare with the audit artifact.
+            audit_path = os.path.join(panel_dir, 'methodology_audit.json')
+            audit = _load(audit_path) if os.path.exists(audit_path) else None
+            audit_entries = {}
+            if isinstance(audit, dict):
+                for group in ('components', 'baselines'):
+                    for _comp, es in (audit.get(group) or {}).items():
+                        for e in es or []:
+                            la = e.get('look_analysis') if isinstance(e, dict) else None
+                            if isinstance(la, dict) and la.get('contrast'):
+                                audit_entries[str(la['contrast'])] = (e, la)
+            for key, looks in sorted(series.items()):
+                if len(looks) < 2:
+                    continue
+                # Mirror `_attach_look_analysis`: a re-run can change one
+                # seed's paired delta.  An earlier look that disagrees with the
+                # current (last) record on a shared seed is stale and must not
+                # be mixed into the joint null; name it rather than fail the
+                # whole panel by recomputing a p the audit never used.
+                cur = dict(zip(looks[-1]['seeds'], looks[-1]['deltas']))
+                valid, stale = [], []
+                for lk in looks:
+                    _bad = [s for s, d in zip(lk['seeds'], lk['deltas'])
+                            if s in cur and abs(d - cur[s]) > 1e-9]
+                    if _bad:
+                        stale.append({'look': lk['look'], 'seeds': sorted(_bad)})
+                    else:
+                        valid.append(lk)
+                if stale:
+                    rec['warnings'].append(
+                        f'{key}: {len(stale)} stale look(s) excluded (seed delta '
+                        f'changed across looks: {stale})')
+                if len(valid) < 2:
+                    continue
+                rec['contrasts'][key] = {'n_looks': len(valid),
+                                         'looks': [x['look'] for x in valid]}
+                out['n_contrasts_adjusted'] += 1
+                # Top-ups should be nested; a seed disappearing is suspicious
+                # (a re-run that removed a pair) and is named, not hidden.
+                for a, b in zip(valid, valid[1:]):
+                    if not set(a['seeds']).issubset(set(b['seeds'])):
+                        rec['warnings'].append(
+                            f'{key}: look {b["look"]} does not contain every seed of '
+                            f'look {a["look"]} (seed regression)')
+                try:
+                    seq = L.sequential_signflip_p(
+                        [{'seeds': x['seeds'], 'deltas': x['deltas']} for x in valid])
+                except Exception as e:
+                    rec['problems'].append(
+                        f'{key}: sequential test failed ({type(e).__name__}: {e})')
+                    continue
+                rec['contrasts'][key]['p_sequential'] = seq.get('p_sequential')
+                rec['contrasts'][key]['method'] = seq.get('method')
+                ent = audit_entries.get(key)
+                if ent is None:
+                    rec['warnings'].append(
+                        f'{key}: {len(looks)} looks are recorded but the audit has no '
+                        'look_analysis block; rerun methodology_audit on this panel')
+                    continue
+                e, la = ent
+                ap = _finite(la.get('p_sequential'))
+                if ap is None or abs(ap - float(seq['p_sequential'])) > 1e-9:
+                    rec['problems'].append(
+                        f'{key}: audit sequential p={la.get("p_sequential")!r} does not '
+                        f'match the recomputed {seq.get("p_sequential")!r}')
+                if (e.get('significant_global_naive')
+                        and not e.get('significant_global')):
+                    rec['downgraded'].append(key)
+                    out['downgraded_claims'].append(
+                        {'panel': panel_dir, 'contrast': key,
+                         'p_naive': e.get('p_holm_global_naive'),
+                         'p_sequential': la.get('p_sequential')})
+        out['n_panels'] += 1
+        out['n_looks'] += int(rec['looks'])
+        if rec['problems']:
+            out['problems'].extend(f'{panel_dir}: {x}' for x in rec['problems'])
+        if rec['warnings']:
+            out['warnings'].extend(f'{panel_dir}: {x}' for x in rec['warnings'])
+        out['panels'][panel_dir] = rec
+    if not files:
+        out['status'] = 'not_verifiable_locally'
+        out['reason'] = ('no results_*/look_history.json found — no panel has been '
+                         'aggregated since look tracking was added')
+    elif out['problems']:
+        out['status'] = 'fail'
+    elif out['warnings']:
+        out['status'] = 'warnings'
+    print(json.dumps({k: v for k, v in out.items() if k != 'panels'},
+                     ensure_ascii=False, indent=2))
+    return out
+
+
 def run_report(out='audit_report.json'):
-    res = {'generated_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'source_tree': audit_source_integrity(), 'dependencies': audit_dependencies(), 'data_source': audit_data_source(), 'leakage': audit_leakage(), 'split_discipline': audit_split_discipline(), 'document_unit': audit_document_unit(), 'sample_design': audit_sample_design(), 'attribution': audit_attribution(), 'boundary': audit_boundary(), 'length': audit_length(), 'fairness': audit_fairness(), 'metrics': audit_metrics(), 'tuning': audit_tuning(), 'simple_baseline': audit_simple_baseline(), 'hypotheses': audit_hypotheses(), 'sesoi': audit_sesoi_declaration(), 'unit_influence': audit_unit_influence(), 'methodology': audit_methodology(), 'single_factor': audit_single_factor(), 'design_preflight': audit_design_preflight(), 'failures': audit_failures(), 'budget': audit_budget(), 'training_health': audit_training_health(), 'efficiency_pairs': audit_efficiency_pairs(), 'release': audit_release_readiness(), 'selection': audit_selection(), 'run_order': audit_run_order()}
+    res = {'generated_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'source_tree': audit_source_integrity(), 'dependencies': audit_dependencies(), 'data_source': audit_data_source(), 'leakage': audit_leakage(), 'split_discipline': audit_split_discipline(), 'document_unit': audit_document_unit(), 'sample_design': audit_sample_design(), 'attribution': audit_attribution(), 'boundary': audit_boundary(), 'length': audit_length(), 'fairness': audit_fairness(), 'metrics': audit_metrics(), 'tuning': audit_tuning(), 'simple_baseline': audit_simple_baseline(), 'hypotheses': audit_hypotheses(), 'sesoi': audit_sesoi_declaration(), 'unit_influence': audit_unit_influence(), 'looks': audit_look_history(), 'methodology': audit_methodology(), 'single_factor': audit_single_factor(), 'design_preflight': audit_design_preflight(), 'failures': audit_failures(), 'budget': audit_budget(), 'training_health': audit_training_health(), 'efficiency_pairs': audit_efficiency_pairs(), 'release': audit_release_readiness(), 'selection': audit_selection(), 'run_order': audit_run_order()}
     L_atomic = None
     try:
         L = _import_exp_lib()
@@ -5372,7 +5601,7 @@ def run_report(out='audit_report.json'):
 
 
 if __name__ == '__main__':
-    _cmds = {'leakage': audit_leakage, 'split': audit_split_discipline, 'split_discipline': audit_split_discipline, 'document_unit': audit_document_unit, 'unit': audit_document_unit, 'sample_design': audit_sample_design, 'sampling': audit_sample_design, 'sample': audit_sample_design, 'causality': audit_causality, 'attribution': audit_attribution, 'boundary': audit_boundary, 'length': audit_length, 'fairness': audit_fairness, 'metrics': audit_metrics, 'tuning': audit_tuning, 'simple': audit_simple_baseline, 'baseline_floor': audit_simple_baseline, 'baseline_plan': audit_baseline_design, 'hypothesis_coverage': audit_hypothesis_coverage, 'hypotheses': audit_hypotheses, 'sesoi': audit_sesoi_declaration, 'unit_influence': audit_unit_influence, 'influence': audit_unit_influence, 'methodology': audit_methodology, 'single_factor': audit_single_factor, 'design': audit_design_preflight, 'design_preflight': audit_design_preflight, 'failures': audit_failures, 'budget': audit_budget, 'efficiency': audit_efficiency_demo, 'efficiency_pairs': audit_efficiency_pairs, 'training_health': audit_training_health, 'selection': audit_selection, 'release': audit_release_readiness, 'run_order': audit_run_order, 'source': audit_source_integrity, 'source_tree': audit_source_integrity, 'dependencies': audit_dependencies, 'dependency': audit_dependencies, 'data_source': audit_data_source, 'dataset_source': audit_data_source, 'report': run_report}
+    _cmds = {'leakage': audit_leakage, 'split': audit_split_discipline, 'split_discipline': audit_split_discipline, 'document_unit': audit_document_unit, 'unit': audit_document_unit, 'sample_design': audit_sample_design, 'sampling': audit_sample_design, 'sample': audit_sample_design, 'causality': audit_causality, 'attribution': audit_attribution, 'boundary': audit_boundary, 'length': audit_length, 'fairness': audit_fairness, 'metrics': audit_metrics, 'tuning': audit_tuning, 'simple': audit_simple_baseline, 'baseline_floor': audit_simple_baseline, 'baseline_plan': audit_baseline_design, 'hypothesis_coverage': audit_hypothesis_coverage, 'hypotheses': audit_hypotheses, 'sesoi': audit_sesoi_declaration, 'unit_influence': audit_unit_influence, 'influence': audit_unit_influence, 'looks': audit_look_history, 'look_history': audit_look_history, 'methodology': audit_methodology, 'single_factor': audit_single_factor, 'design': audit_design_preflight, 'design_preflight': audit_design_preflight, 'failures': audit_failures, 'budget': audit_budget, 'efficiency': audit_efficiency_demo, 'efficiency_pairs': audit_efficiency_pairs, 'training_health': audit_training_health, 'selection': audit_selection, 'release': audit_release_readiness, 'run_order': audit_run_order, 'source': audit_source_integrity, 'source_tree': audit_source_integrity, 'dependencies': audit_dependencies, 'dependency': audit_dependencies, 'data_source': audit_data_source, 'dataset_source': audit_data_source, 'report': run_report}
     _arg = sys.argv[1] if len(sys.argv) > 1 else 'report'
     if _arg in ('-h', '--help'):
         print(__doc__)

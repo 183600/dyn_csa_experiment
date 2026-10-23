@@ -355,6 +355,7 @@ python audit_gates.py leakage     # tokenizer provenance, vocab identity, train/
 python audit_gates.py single_factor  # design-time gate: every declared contrast's arm-cfg diff equals its declared intervention key set; open-block matrix axes; frozen-manifest mechanism_claim_allowed flags vs the actual cfg diff
 python audit_gates.py sesoi       # design-time gate: every ablation component has a valid declared SESOI and is fully scheduled
 python audit_gates.py unit_influence  # result-analysis gate: unit-influence block reproduces pooled Δ; flags one-unit-driven comparisons
+python audit_gates.py looks       # look-history gate: recompute per-look and exact max-over-looks sequential p; flags seed top-ups that only look significant at the final n
 python audit_gates.py report      # run every locally-verifiable audit -> audit_report.json
 python audit_gates.py selection   # selection-recall contract (refuses unsupported mechanism claims when absent)
 python audit_gates.py efficiency_pairs  # measured latency claims: same shape/device/KV required
@@ -463,6 +464,18 @@ machine gates rather than new prose:
   unit_influence` independently checks the block against the reported pooled
   estimate and warns on fragile/stale artifacts.  It is post-hoc and never
   changes the frozen p/Holm/`confirmed` verdict (design_notes §57).
+- **Optional stopping / seed top-ups**: every aggregation with a new seed set
+  records each measured declared ablation/baseline contrast in
+  `<outdir>/look_history.json`.  When a contrast has more than
+  one look, `methodology_audit` judges it by the exact **max-over-looks**
+  sign-flip p in the final effect direction (joint sign enumeration over the
+  seed union), and the family-Holm `verified` gate uses that sequential p; the
+  naive final-n p is retained only as `p_holm_global_naive`.  TOST equivalence
+  gets a Bonferroni-over-looks correction as well.  Stale looks (a re-run seed
+  whose delta changed) are excluded and named.  `audit_gates.py looks`
+  independently recomputes the per-look and sequential p and flags
+  naive-significant / sequential-null claims.  This is exploratory only and
+  never changes the frozen manifest (design_notes §58).
 - **Evidence**: `audit_gates.release` parses `RELEASES.md`; with no complete
   row the repository is declared source-only/not auditable.  `archive_release.py`
   now also packs `pyproject.toml`, cache/tokenizer metadata and `run_*.log`.
