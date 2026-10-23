@@ -19595,6 +19595,19 @@ def t_dataset_source_pinning_and_audit():
         out = A.audit_data_source(td)
         assert out['status'] == 'ok', out
         assert out['n_pinned'] == 2 and out['n_legacy'] == 0, out
+        # A cache directory may hold several corpora.  A FineWeb train cache
+        # must not be paired with the WikiText test slice, and its different
+        # upstream commit is not a mixed-snapshot warning.
+        _write('meta_v2_sl512_fwsample-10BT.json',
+               {'vocab': 8192, 'source': 'sample-10BT',
+                'dataset_source': L.fineweb_edu_dataset_source()})
+        out = A.audit_data_source(td)
+        assert out['status'] == 'ok', out
+        assert out['n_pinned'] == 3, out
+        assert not any('more than one upstream revision' in w
+                       for w in out['warnings']), out
+        assert not any('paired train revision' in x
+                       for x in out['problems']), out
         _write('test_meta_v2_sl4097.json', dict(
             base, dataset_source=dict(L.wikitext_dataset_source(),
                                       revision='c' * 40)))

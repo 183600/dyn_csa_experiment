@@ -4323,6 +4323,7 @@ def audit_data_source(cache_dir=None):
         return out
     train_metas = []
     test_metas = []
+    dataset_revisions = {}
     for path in metas:
         name = os.path.basename(path)
         meta = _load(path)
@@ -4349,6 +4350,9 @@ def audit_data_source(cache_dir=None):
                 rev = str(src.get('revision') or '').lower()
                 if rev:
                     out['revisions'].setdefault(rev, []).append(name)
+                    dataset_revisions.setdefault(
+                        'fineweb' if meta.get('source') else 'wikitext',
+                        set()).add(rev)
             elif src.get('provider') == 'local':
                 out['n_local'] += 1
         else:
@@ -4365,25 +4369,53 @@ def audit_data_source(cache_dir=None):
         out['problems'].extend(probs)
         out['warnings'].extend(warns)
         if name.startswith('test_meta_'):
-            test_metas.append(meta)
+            test_metas.append((name, meta))
         else:
             train_metas.append(meta)
     # Cross-cache consistency: every test cache must name the same upstream
-    # commit as its paired train caches.
+    # commit as its paired train caches.  A directory may legitimately hold
+    # several corpora (e.g. WikiText and FineWeb), so pair only train caches
+    # from the same upstream repository/config.  Match the loaders' tokenizer-
+    # fit rule too: a cache built for a different fit corpus is a different
+    # protocol, not a reference snapshot for this test slice.
     if test_metas:
-        for tm in test_metas:
-            probs, warns = L.dataset_source_pair_problems(tm, train_metas,
+        for test_name, tm in test_metas:
+            ts = (tm.get('dataset_source')
+                  if isinstance(tm, dict) else None)
+            ts = ts if isinstance(ts, dict) else {}
+            tfit = tm.get('fit_fp') if isinstance(tm, dict) else None
+            paired = []
+            for _m in train_metas:
+                s = _m.get('dataset_source') if isinstance(_m, dict) else None
+                s = s if isinstance(s, dict) else {}
+                if (ts.get('provider') == 'huggingface'
+                        and s.get('provider') == 'huggingface'
+                        and (ts.get('repo') != s.get('repo')
+                             or ts.get('config') != s.get('config'))):
+                    continue
+                mfit = _m.get('fit_fp') if isinstance(_m, dict) else None
+                if tfit and mfit and tfit != mfit:
+                    continue
+                paired.append(_m)
+            if ts and not paired:
+                out['warnings'].append(
+                    f'{test_name}: no train cache matches the test corpus and '
+                    'tokenizer-fit provenance; the upstream revision cannot '
+                    'be compared')
+            probs, warns = L.dataset_source_pair_problems(tm, paired,
                                                           label='test/train')
             out['problems'].extend(probs)
             out['warnings'].extend(warns)
-    # Two different pinned head revisions in one cache directory means the
-    # directory itself mixes corpus snapshots.  Per-cache records may still be
+    # Two different pinned revisions *within one corpus* mean that corpus's
+    # caches mix upstream snapshots.  Per-cache records may still be
     # internally consistent, so this is a warning at directory level; the
     # train/test pair check above turns the dangerous case into a failure.
-    if len(out['revisions']) > 1:
-        out['warnings'].append(
-            'the cache directory contains more than one upstream revision: '
-            + ', '.join(sorted(out['revisions'])))
+    # Different corpora naturally have different commits and must not warn.
+    for _dataset, _revs in sorted(dataset_revisions.items()):
+        if len(_revs) > 1:
+            out['warnings'].append(
+                f'the {_dataset} caches contain more than one upstream '
+                'revision: ' + ', '.join(sorted(_revs)))
     if out['problems']:
         out['status'] = 'fail'
     elif out['n_legacy'] or out['n_local'] or out['warnings']:
