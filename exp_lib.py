@@ -1117,6 +1117,64 @@ def _finite_scalar(v):
     return f if math.isfinite(f) else None
 
 
+def _contains_bool_value(x):
+    """True when a scalar/sequence/array carries a boolean element.
+
+    Booleans are flags, not measurements.  A mixed list such as
+    ``[True, 2.0, 3.0]`` is coerced by ``np.asarray`` to a float array, so a
+    dtype-only check would miss it; this recursive scan catches it before the
+    numeric conversion on the small per-seed/per-document inputs these
+    statistics helpers receive.
+    """
+    if isinstance(x, (bool, np.bool_)):
+        return True
+    if isinstance(x, np.ndarray):
+        if x.dtype.kind == 'b':
+            return True
+        if x.dtype.kind == 'O':
+            return any(isinstance(v, (bool, np.bool_))
+                       for v in x.reshape(-1))
+        return False
+    if isinstance(x, (list, tuple)):
+        return any(_contains_bool_value(v) for v in x)
+    return False
+
+
+def _scaled_sum_of_squares(values, multiplier):
+    """``multiplier * sum(v**2)`` without overflowing representable results.
+
+    Cluster-robust/jackknife variances square per-unit influences.  A finite
+    influence can still be large enough that the naive square overflows to
+    inf even though the final variance (and SE) is representable.  Scale by
+    the largest deviation, compute the unitless sum, then combine in log
+    space.  Returns None when the true result does not fit a float, so callers
+    can mark the interval unavailable instead of emitting inf.
+    """
+    vals = [float(v) for v in values]
+    if not vals:
+        return 0.0
+    scale = max((abs(v) for v in vals), default=0.0)
+    if not math.isfinite(scale):
+        return None
+    if scale == 0.0:
+        return 0.0
+    try:
+        ss = math.fsum((v / scale) ** 2 for v in vals)
+    except (OverflowError, ValueError):
+        return None
+    if not (math.isfinite(ss) and ss > 0.0):
+        return None
+    try:
+        logval = (math.log(float(multiplier)) + 2.0 * math.log(scale)
+                  + math.log(ss))
+    except (ValueError, OverflowError):
+        return None
+    if not math.isfinite(logval) or logval > math.log(sys.float_info.max):
+        return None
+    val = math.exp(logval)
+    return val if math.isfinite(val) else None
+
+
 def _nll_doc_ci(nll_per_row, n_tokens_per_row):
     """Approximate 95% CI for PPL from per-DOCUMENT NLL (not per-token).
 
@@ -1194,8 +1252,10 @@ def _nll_doc_ci(nll_per_row, n_tokens_per_row):
                 'doc_ce_mean': None, 'doc_ce_sem': None,
                 'ppl_ci95_low': None, 'ppl_ci95_high': None, 'n_docs': len(doc_ce)}
     mean = sum(doc_ce) / len(doc_ce)
-    var = sum((x - mean) ** 2 for x in doc_ce) / (len(doc_ce) - 1)
-    sem = math.sqrt(max(var, 0.0) / len(doc_ce))
+    _doc_var = _scaled_sum_of_squares(
+        [x - mean for x in doc_ce], 1.0 / (len(doc_ce) - 1))
+    sem = (math.sqrt(max(_doc_var, 0.0) / len(doc_ce))
+           if _doc_var is not None else None)
     ce = total_nll / total_tok
     # The point estimate is token-pooled, so the interval must be for that
     # same estimand.  Resampling/weighting per-document CEs as if the pooled
@@ -1213,11 +1273,21 @@ def _nll_doc_ci(nll_per_row, n_tokens_per_row):
         nll, ntok = pair
         _resid.append(nll - ce * ntok)
     n_docs = len(_resid)
-    _var = (n_docs / (n_docs - 1.0)) * sum(r * r for r in _resid) / (total_tok * total_tok)
-    _sem_ce = math.sqrt(max(_var, 0.0))
+    # Scale each residual by the total before squaring: r**2 and
+    # total_tok**2 can each overflow while their ratio is representable.
+    _var = _scaled_sum_of_squares(
+        [r / total_tok for r in _resid], n_docs / (n_docs - 1.0))
+    _sem_ce = (math.sqrt(max(_var, 0.0)) if _var is not None else None)
     _tc = _t_critical(0.95, n_docs - 1)
     if not math.isfinite(_tc):
         _tc = 1.959963984540054
+    if _sem_ce is None:
+        return {'ppl': _safe_exp_ppl(ce), 'doc_ce_mean': mean,
+                'doc_ce_sem': sem, 'ce_sem_cluster_robust': None,
+                'ci_method': ('point estimate only: the cluster-robust '
+                              'variance exceeds the representable float range'),
+                'ppl_ci95_low': None, 'ppl_ci95_high': None,
+                'n_docs': n_docs}
     # Cross-entropy cannot be negative, so the corresponding PPL cannot be
     # below 1.  The symmetric t interval on CE can cross zero for a small,
     # high-variance document sample; exponentiating that raw lower endpoint
@@ -1262,7 +1332,16 @@ def _paired_nll_doc_ci(nll_a, nll_b, n_tokens, *, conf=0.95):
     """
     def _matrix(x, name):
         try:
-            arr = np.asarray(x, dtype=float)
+            raw = np.asarray(x)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(f'{name}: values must be numeric') from None
+        if _contains_bool_value(x) or raw.dtype.kind == 'b':
+            # A boolean is a flag, not an NLL measurement (same scalar
+            # contract as _finite_scalar/_nll_doc_ci).  Without this check
+            # True/False would silently become 1.0/0.0.
+            raise ValueError(f'{name}: booleans are not NLL measurements')
+        try:
+            arr = np.asarray(raw, dtype=float)
         except (TypeError, ValueError, OverflowError):
             raise ValueError(f'{name}: values must be numeric') from None
         if arr.ndim == 1:
@@ -1279,14 +1358,23 @@ def _paired_nll_doc_ci(nll_a, nll_b, n_tokens, *, conf=0.95):
             f'_paired_nll_doc_ci: arm shapes differ ({A.shape} vs {B.shape}); '
             'a paired interval needs the same seeds and documents')
     try:
-        T = np.asarray(n_tokens, dtype=float).reshape(-1)
+        _raw_t = np.asarray(n_tokens).reshape(-1)
     except (TypeError, ValueError, OverflowError):
         raise ValueError('_paired_nll_doc_ci: n_tokens must be numeric') from None
+    if _contains_bool_value(n_tokens) or _raw_t.dtype.kind == 'b':
+        # A mixed [True, 1.0] list coerces to a float array before
+        # `_exact_count` sees it; reject the flag at the source.
+        raise ValueError('_paired_nll_doc_ci: token counts must be integers, not booleans')
+    # Token counts are exact integers: a fractional or boolean count must not
+    # be silently truncated/coerced into a different pooled denominator (the
+    # same contract _nll_doc_ci already enforces).
+    _counts = [_exact_count(v, minimum=1) for v in _raw_t.tolist()]
+    if any(c is None for c in _counts):
+        raise ValueError('_paired_nll_doc_ci: every document needs a finite positive integer token count')
+    T = np.asarray(_counts, dtype=float)
     if T.size != A.shape[1]:
         raise ValueError(
             f'_paired_nll_doc_ci: {T.size} token counts for {A.shape[1]} documents')
-    if not np.all(np.isfinite(T)) or np.any(T <= 0.0):
-        raise ValueError('_paired_nll_doc_ci: every document needs a finite positive token count')
     if isinstance(conf, (bool, np.bool_)):
         raise ValueError('_paired_nll_doc_ci: conf must be a probability in (0, 1)')
     try:
@@ -1325,23 +1413,34 @@ def _paired_nll_doc_ci(nll_a, nll_b, n_tokens, *, conf=0.95):
     psi = (ea[:, None] * (A - ce_a[:, None] * T[None, :]) / total_tok
            - eb[:, None] * (B - ce_b[:, None] * T[None, :]) / total_tok)
     bar = psi.mean(axis=0)
-    var = (D / (D - 1.0)) * float(np.sum(bar * bar))
-    se = math.sqrt(max(var, 0.0))
+    var = _scaled_sum_of_squares(bar, D / (D - 1.0))
+    se = (math.sqrt(max(var, 0.0)) if var is not None else None)
     psi_lr = ((A - ce_a[:, None] * T[None, :])
               - (B - ce_b[:, None] * T[None, :])) / total_tok
     bar_lr = psi_lr.mean(axis=0)
-    var_lr = (D / (D - 1.0)) * float(np.sum(bar_lr * bar_lr))
-    se_lr = math.sqrt(max(var_lr, 0.0))
+    var_lr = _scaled_sum_of_squares(bar_lr, D / (D - 1.0))
+    se_lr = (math.sqrt(max(var_lr, 0.0)) if var_lr is not None else None)
+    if se is None or se_lr is None:
+        out['method'] = ('point estimate only: the cluster-robust variance '
+                         'exceeds the representable float range')
+        return out
     tc = _t_critical(conf, D - 1)
     if not math.isfinite(tc):
         return out
+    _lo, _hi = delta_ppl - tc * se, delta_ppl + tc * se
+    _lrl, _lrh = lr - tc * se_lr, lr + tc * se_lr
     out.update({
         'se_ppl': float(se),
         'se_log_ratio': float(se_lr),
-        'delta_ppl_ci95': [delta_ppl - tc * se, delta_ppl + tc * se],
-        'delta_log_ratio_ci95': [lr - tc * se_lr, lr + tc * se_lr],
-        'ratio_ci95': [_safe_exp_ppl(lr - tc * se_lr),
-                       _safe_exp_ppl(lr + tc * se_lr)],
+        'delta_ppl_ci95': ([_lo, _hi]
+                           if math.isfinite(_lo) and math.isfinite(_hi)
+                           else None),
+        'delta_log_ratio_ci95': ([_lrl, _lrh]
+                                 if math.isfinite(_lrl) and math.isfinite(_lrh)
+                                 else None),
+        'ratio_ci95': ([_safe_exp_ppl(_lrl), _safe_exp_ppl(_lrh)]
+                       if math.isfinite(_lrl) and math.isfinite(_lrh)
+                       else None),
     })
     return out
 
@@ -1395,7 +1494,16 @@ def paired_nll_unit_influence(nll_a, nll_b, n_tokens, *, unit_ids=None,
 
     def _matrix(x, name):
         try:
-            arr = np.asarray(x, dtype=float)
+            raw = np.asarray(x)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(f'{name}: values must be numeric') from None
+        if _contains_bool_value(x) or raw.dtype.kind == 'b':
+            # A boolean is a flag, not an NLL measurement (same scalar
+            # contract as _finite_scalar/_nll_doc_ci).  Without this check
+            # True/False would silently become 1.0/0.0.
+            raise ValueError(f'{name}: booleans are not NLL measurements')
+        try:
+            arr = np.asarray(raw, dtype=float)
         except (TypeError, ValueError, OverflowError):
             raise ValueError(f'{name}: values must be numeric') from None
         if arr.ndim == 1:
@@ -1413,14 +1521,22 @@ def paired_nll_unit_influence(nll_a, nll_b, n_tokens, *, unit_ids=None,
             f'paired_nll_unit_influence: arm shapes differ ({A.shape} vs {B.shape}); '
             'a paired readout needs the same seeds and units')
     try:
-        T = np.asarray(n_tokens, dtype=float).reshape(-1)
+        _raw_t = np.asarray(n_tokens).reshape(-1)
     except (TypeError, ValueError, OverflowError):
         raise ValueError('paired_nll_unit_influence: n_tokens must be numeric') from None
+    if _contains_bool_value(n_tokens) or _raw_t.dtype.kind == 'b':
+        # A mixed [True, 1.0] list coerces to a float array before
+        # `_exact_count` sees it; reject the flag at the source.
+        raise ValueError('paired_nll_unit_influence: token counts must be integers, not booleans')
+    # Token counts are exact integers; a fractional or boolean count would
+    # otherwise change the pooled denominator without any measurement meaning.
+    _counts = [_exact_count(v, minimum=1) for v in _raw_t.tolist()]
+    if any(c is None for c in _counts):
+        raise ValueError('paired_nll_unit_influence: every unit needs a finite positive integer token count')
+    T = np.asarray(_counts, dtype=float)
     if T.size != A.shape[1]:
         raise ValueError(
             f'paired_nll_unit_influence: {T.size} token counts for {A.shape[1]} units')
-    if not np.all(np.isfinite(T)) or np.any(T <= 0.0):
-        raise ValueError('paired_nll_unit_influence: every unit needs a finite positive token count')
 
     S, D = A.shape
     if D < 3:
@@ -1506,7 +1622,10 @@ def paired_nll_unit_influence(nll_a, nll_b, n_tokens, *, unit_ids=None,
     def _max_or_none(arr, mask):
         if not np.any(mask):
             return None
-        return float(np.max(arr[mask]))
+        v = float(np.max(arr[mask]))
+        # A subtraction of two finite but opposite-sign large values can
+        # overflow to inf; that is not a measured "maximum change".
+        return v if math.isfinite(v) else None
 
     max_change_ppl = _max_or_none(abs_change_ppl, use_ppl)
     max_change_lr = _max_or_none(abs_change_lr, use_lr)
@@ -1520,7 +1639,8 @@ def paired_nll_unit_influence(nll_a, nll_b, n_tokens, *, unit_ids=None,
             return None
         if not math.isfinite(full_value) or abs(full_value) <= 1e-300:
             return None
-        return float(change / abs(full_value))
+        v = float(change / abs(full_value))
+        return v if math.isfinite(v) else None
 
     rel_change_ppl = _relative(max_change_ppl, full_delta)
     rel_change_lr = _relative(max_change_lr, full_lr)
@@ -1539,7 +1659,12 @@ def paired_nll_unit_influence(nll_a, nll_b, n_tokens, *, unit_ids=None,
 
     sign_stable_ppl = _sign_stable(loo_delta, full_delta, use_ppl)
     sign_stable_lr = _sign_stable(loo_lr, full_lr, use_lr)
-    single_unit_dominates = bool(rel_change_lr is not None and rel_change_lr >= 1.0)
+    # A change that overflowed during subtraction still proves the fold is
+    # influential even though its percentage cannot be represented.
+    _change_overflow = bool(np.any(np.isinf(abs_change_lr[use_lr])))
+    single_unit_dominates = bool(
+        _change_overflow
+        or (rel_change_lr is not None and rel_change_lr >= 1.0))
     if sign_stable_lr is None:
         fragile_to_one_unit = None
     else:
@@ -1551,32 +1676,88 @@ def paired_nll_unit_influence(nll_a, nll_b, n_tokens, *, unit_ids=None,
                   if sign_stable_lr is not None else None)
 
     # Exact jackknife variance of the pooled estimate over the unit folds.
-    jackknife_ok = bool(np.all(finite))
+    # The LOO points themselves can be enormous while still finite (a unit
+    # that carries almost all tokens leaves a tiny remaining pooled PPL); a
+    # naive squaring of such deviations overflows to inf even when the final
+    # SE would be representable.  Compute in a scaled/log space and explicitly
+    # mark the jackknife unavailable when the variance does not fit a float.
+    def _jackknife_se(values):
+        n = int(len(values))
+        if n < 2:
+            return None, False
+        try:
+            center = math.fsum(float(v) for v in values) / n
+        except (OverflowError, ValueError):
+            return None, False
+        if not math.isfinite(center):
+            return None, False
+        try:
+            dev = [float(v) - center for v in values]
+        except (TypeError, ValueError, OverflowError):
+            return None, False
+        scale = max((abs(d) for d in dev), default=0.0)
+        if not math.isfinite(scale):
+            return None, False
+        if scale == 0.0:
+            return 0.0, True
+        try:
+            ss = math.fsum((d / scale) ** 2 for d in dev)
+        except (OverflowError, ValueError):
+            return None, False
+        factor = (n - 1.0) / n
+        if not (math.isfinite(ss) and ss > 0.0):
+            return None, False
+        try:
+            logvar = math.log(factor) + 2.0 * math.log(scale) + math.log(ss)
+        except (ValueError, OverflowError):
+            return None, False
+        if logvar > math.log(sys.float_info.max):
+            # The variance is mathematically beyond float, so neither the SE
+            # nor a symmetric CI can be represented.  Do not emit inf as if
+            # it were a measured interval.
+            return None, False
+        var = math.exp(logvar)
+        if not math.isfinite(var):
+            return None, False
+        return math.sqrt(max(var, 0.0)), True
+    _all_finite = bool(np.all(finite))
+    jackknife_ok = False
     jack_se_ppl = jack_se_lr = None
     jack_ci_ppl = jack_ci_lr = None
-    if jackknife_ok:
-        dbar = float(np.mean(loo_delta))
-        jack_var = ((D - 1.0) / D) * float(np.sum((loo_delta - dbar) ** 2))
-        jack_se_ppl = math.sqrt(max(jack_var, 0.0))
-        lbar = float(np.mean(loo_lr))
-        jack_var_lr = ((D - 1.0) / D) * float(np.sum((loo_lr - lbar) ** 2))
-        jack_se_lr = math.sqrt(max(jack_var_lr, 0.0))
-        tc = _t_critical(conf, D - 1)
-        if math.isfinite(tc):
-            jack_ci_ppl = [full_delta - tc * jack_se_ppl,
-                           full_delta + tc * jack_se_ppl]
-            jack_ci_lr = [full_lr - tc * jack_se_lr,
-                          full_lr + tc * jack_se_lr]
+    _jack_reason = None
+    if _all_finite:
+        jack_se_ppl, _jk_ppl_ok = _jackknife_se(loo_delta)
+        jack_se_lr, _jk_lr_ok = _jackknife_se(loo_lr)
+        jackknife_ok = bool(_jk_ppl_ok and _jk_lr_ok)
+        if not jackknife_ok:
+            _jack_reason = ('the delete-one-unit variance exceeds the '
+                            'representable float range')
+    else:
+        _jack_reason = 'one or more leave-one-unit-out folds is unavailable'
+    tc = _t_critical(conf, D - 1) if jackknife_ok else float('nan')
+    if jackknife_ok and math.isfinite(tc):
+        _lo, _hi = (full_delta - tc * jack_se_ppl,
+                    full_delta + tc * jack_se_ppl)
+        if math.isfinite(_lo) and math.isfinite(_hi):
+            jack_ci_ppl = [_lo, _hi]
+        _lo, _hi = (full_lr - tc * jack_se_lr,
+                    full_lr + tc * jack_se_lr)
+        if math.isfinite(_lo) and math.isfinite(_hi):
+            jack_ci_lr = [_lo, _hi]
     cluster_se_ppl = full.get('se_ppl')
     cluster_se_lr = full.get('se_log_ratio')
     se_ratio_ppl = (float(jack_se_ppl / cluster_se_ppl)
                     if (jack_se_ppl is not None and cluster_se_ppl
                         and math.isfinite(cluster_se_ppl) and cluster_se_ppl > 0.0)
                     else None)
+    if se_ratio_ppl is not None and not math.isfinite(se_ratio_ppl):
+        se_ratio_ppl = None
     se_ratio_lr = (float(jack_se_lr / cluster_se_lr)
                    if (jack_se_lr is not None and cluster_se_lr
                        and math.isfinite(cluster_se_lr) and cluster_se_lr > 0.0)
                    else None)
+    if se_ratio_lr is not None and not math.isfinite(se_ratio_lr):
+        se_ratio_lr = None
 
     order = [int(i) for i in np.argsort(-np.nan_to_num(abs_change_lr, nan=-1.0),
                                         kind='stable')[:top_k] if abs_change_lr[i] > -np.inf]
@@ -1585,9 +1766,13 @@ def paired_nll_unit_influence(nll_a, nll_b, n_tokens, *, unit_ids=None,
         top_units.append({
             'unit_id': labels[i],
             'loo_delta_ppl': (None if not finite[i] else float(loo_delta[i])),
-            'loo_change_ppl': (None if not finite[i] else float(change_ppl[i])),
+            'loo_change_ppl': (None if (not finite[i]
+                                        or not math.isfinite(float(change_ppl[i])))
+                               else float(change_ppl[i])),
             'loo_delta_log_ratio': (None if not finite[i] else float(loo_lr[i])),
-            'loo_change_log_ratio': (None if not finite[i] else float(change_lr[i])),
+            'loo_change_log_ratio': (None if (not finite[i]
+                                              or not math.isfinite(float(change_lr[i])))
+                                     else float(change_lr[i])),
         })
     best_idx = None
     tied = None
@@ -1596,6 +1781,36 @@ def paired_nll_unit_influence(nll_a, nll_b, n_tokens, *, unit_ids=None,
         best_idx = int(np.argmax(_cand))
         best_val = float(_cand[best_idx])
         tied = int(np.sum(np.isclose(_cand, best_val, rtol=0.0, atol=1e-12)))
+
+    def _vector_with_unavailable_as_none(values):
+        # An unavailable fold is marked by `loo_available`; emitting inf/NaN
+        # in the per-fold vectors would make the object non-JSON-compliant
+        # until _json_clean rewrites it, and a consumer that reads the
+        # in-memory result (or a strict writer) would see a fake point.  Use
+        # JSON null for exactly the folds the flag marks unavailable, and for
+        # a derived change that overflowed even though the fold itself is
+        # finite.
+        out = []
+        for i in range(D):
+            try:
+                v = float(values[i])
+            except (TypeError, ValueError, OverflowError):
+                out.append(None)
+                continue
+            out.append(None if (not finite[i] or not math.isfinite(v)) else v)
+        return out
+
+    def _finite_vector(values):
+        out = []
+        for v in values:
+            try:
+                v = float(v)
+            except (TypeError, ValueError, OverflowError):
+                out.append(None)
+                continue
+            out.append(v if math.isfinite(v) else None)
+        return out
+
     return {
         'kind': 'paired_unit_influence', 'available': True,
         'n_units': int(D), 'n_units_loo_available': int(np.sum(finite)),
@@ -1603,18 +1818,19 @@ def paired_nll_unit_influence(nll_a, nll_b, n_tokens, *, unit_ids=None,
         'unit_ids': labels,
         'label_source': ('provided' if unit_ids is not None else 'index_fallback'),
         'full_delta_ppl': full_delta, 'full_delta_log_ratio': full_lr,
-        'delta_method_influence_ppl': psi.tolist(),
-        'delta_method_influence_log_ratio': psi_lr.tolist(),
-        'loo_delta_ppl': loo_delta.tolist(),
-        'loo_delta_log_ratio': loo_lr.tolist(),
-        'loo_change_ppl': change_ppl.tolist(),
-        'loo_change_log_ratio': change_lr.tolist(),
+        'delta_method_influence_ppl': _finite_vector(psi),
+        'delta_method_influence_log_ratio': _finite_vector(psi_lr),
+        'loo_delta_ppl': _vector_with_unavailable_as_none(loo_delta),
+        'loo_delta_log_ratio': _vector_with_unavailable_as_none(loo_lr),
+        'loo_change_ppl': _vector_with_unavailable_as_none(change_ppl),
+        'loo_change_log_ratio': _vector_with_unavailable_as_none(change_lr),
         'loo_available': finite.tolist(),
         'max_abs_change_ppl': max_change_ppl,
         'max_abs_change_log_ratio': max_change_lr,
         'max_abs_relative_change_ppl': rel_change_ppl,
         'max_abs_relative_change_log_ratio': rel_change_lr,
         'jackknife_available': jackknife_ok,
+        'jackknife_unavailable_reason': _jack_reason,
         'jackknife_se_ppl': jack_se_ppl,
         'jackknife_se_log_ratio': jack_se_lr,
         'jackknife_ci95_ppl': jack_ci_ppl,
@@ -27172,13 +27388,41 @@ def _family_size_with_missing(design_group, entries_by_comp):
     """
     total_entries = 0
     missing = 0
-    for comp, contrasts in (design_group or {}).items():
-        entries = (entries_by_comp or {}).get(comp) or []
+    _design = design_group if isinstance(design_group, dict) else {}
+    _entries = entries_by_comp if isinstance(entries_by_comp, dict) else {}
+    for comp, contrasts in _design.items():
+        entries = _entries.get(comp) or []
         total_entries += len(entries)
-        measured_pairs = {(e.get('with'), e.get('without')) for e in entries}
-        for c in (contrasts or ()):
-            if (not isinstance(c, (tuple, list)) or len(c) < 2
-                    or (c[0], c[1]) not in measured_pairs):
+        measured_pairs = set()
+        for e in entries:
+            if not isinstance(e, dict):
+                continue
+            a, b = e.get('with'), e.get('without')
+            try:
+                measured_pairs.add((a, b))
+            except TypeError:
+                # An unhashable arm id cannot identify a measured pair; it
+                # must not crash the family accounting.
+                continue
+        if isinstance(contrasts, (str, bytes, bytearray)):
+            _contrast_items = [contrasts]
+        else:
+            try:
+                _contrast_items = list(contrasts or ())
+            except TypeError:
+                _contrast_items = [contrasts]
+        for c in _contrast_items:
+            if not isinstance(c, (tuple, list)) or len(c) < 2:
+                missing += 1
+                continue
+            try:
+                _pair = (c[0], c[1])
+                _measured = _pair in measured_pairs
+            except TypeError:
+                # A malformed (unhashable) declaration still occupies a
+                # declared family slot.
+                _measured = False
+            if not _measured:
                 missing += 1
     return int(total_entries + missing)
 
@@ -27376,10 +27620,13 @@ def _apply_sesoi_holm(component_entries, component_design, baseline_entries,
         for comp, contrasts in (design_group or {}).items():
             if comp not in specs:
                 continue
-            try:
-                _contrast_list = list(contrasts or ())
-            except TypeError:
-                _contrast_list = []
+            if isinstance(contrasts, (str, bytes, bytearray)):
+                _contrast_list = [contrasts]
+            else:
+                try:
+                    _contrast_list = list(contrasts or ())
+                except TypeError:
+                    _contrast_list = []
             declared += len(_contrast_list)
             _declared_pairs = []
             for _c in _contrast_list:
@@ -27478,16 +27725,96 @@ def _apply_sesoi_holm(component_entries, component_design, baseline_entries,
                    'equivalence has no exact-sign-flip resolution floor'),
     }
 
+def _materialise_contrast_design(design):
+    """Return a design whose per-component contrast iterables are re-iterable.
+
+    A caller may pass a one-pass generator of contrasts.  The audit currently
+    walks each declaration twice (collection, then family scoping), and an
+    exhausted iterator would silently drop every contrast on the second pass
+    (or crash `len`).  Materialising once is value-preserving and makes both
+    passes see the same declarations.  Non-iterable/malformed entries are
+    kept as-is so the caller can report them rather than silently replacing
+    them with an empty declaration.
+    """
+    if not isinstance(design, dict):
+        return design
+    out = {}
+    for comp, contrasts in design.items():
+        if isinstance(contrasts, (list, tuple, str, bytes, bytearray)):
+            # Strings are a single malformed declaration, not an iterable of
+            # per-character contrasts; preserving them lets the validators
+            # count one bad slot instead of len(text) fake ones.
+            out[comp] = contrasts
+            continue
+        try:
+            out[comp] = list(contrasts)
+        except TypeError:
+            out[comp] = contrasts
+    return out
+
+
+def _declared_contrast_count(design):
+    """Number of declared contrast slots, tolerating malformed declarations.
+
+    A malformed/non-iterable declaration is still one declared slot (fail
+    closed): dropping it would understate the correction family and make the
+    plan look easier to confirm than it is.
+    """
+    if not isinstance(design, dict):
+        return 0
+    total = 0
+    for contrasts in design.values():
+        if isinstance(contrasts, (str, bytes, bytearray)):
+            total += 1
+            continue
+        if isinstance(contrasts, (list, tuple)):
+            total += len(contrasts)
+            continue
+        try:
+            total += len(list(contrasts))
+        except TypeError:
+            total += 1
+    return int(total)
+
+
 def _scope_design(design, present):
     """Keep only claims this panel actually tests: a component enters the
     family when at least one of its declared contrasts has BOTH arms measured.
     Once in, all of its declared contrasts keep their slots (missing arms are
-    dummies), so an incomplete ablation cannot shrink its own correction."""
+    dummies), so an incomplete ablation cannot shrink its own correction.
+
+    A malformed design (non-mapping, non-list contrasts, short/unhashable
+    entries) is tolerated here: callers report it separately, while this
+    scoping pass must never crash the whole audit or fabricate a pair.
+    """
     out = {}
     present = set(present or ())
+    if not isinstance(design, dict):
+        return out
     for comp, contrasts in design.items():
-        if any(a in present and b in present for a, b, _n in contrasts):
-            out[comp] = contrasts
+        if isinstance(contrasts, (str, bytes, bytearray)):
+            continue
+        try:
+            _items = list(contrasts or ())
+        except TypeError:
+            continue
+        _tested = False
+        for item in _items:
+            if not isinstance(item, (tuple, list)) or len(item) < 2:
+                continue
+            try:
+                if item[0] in present and item[1] in present:
+                    _tested = True
+                    break
+            except TypeError:
+                # Unhashable arm id: not a testable contrast, but the
+                # completeness/family audits still see the declaration.
+                continue
+        if _tested:
+            # Store the materialised list: a one-pass iterable would already
+            # be exhausted by the membership scan above, and downstream
+            # readers need a re-iterable declaration.
+            out[comp] = _items
     return out
 
 def ablation_completeness_audit(design=None, present=None, *, arms_by_combo=None,
@@ -27848,6 +28175,16 @@ def methodology_seed_plan(n_seeds, design=None, baselines=None, alpha=0.05, vari
         if baselines is None:
             baselines = BASELINE_DESIGN
     baselines = {} if baselines is None else baselines
+    # A non-mapping design cannot declare any contrast; normalise it instead
+    # of crashing on `.values()` / iterating a string below.  Malformed
+    # per-component declarations are counted conservatively by
+    # `_declared_contrast_count`.
+    design = _materialise_contrast_design(design)
+    baselines = _materialise_contrast_design(baselines)
+    if not isinstance(design, dict):
+        design = {}
+    if not isinstance(baselines, dict):
+        baselines = {}
     _present = None
     if variants is not None:
         _present = set(variants or ())
@@ -27857,7 +28194,8 @@ def methodology_seed_plan(n_seeds, design=None, baselines=None, alpha=0.05, vari
                  {'mode': 'leave-one-out', 'complete': None, 'components': {},
                   'complete_components': [], 'incomplete_components': [],
                   'missing_arms': {}})
-    m = sum(len(v) for v in design.values()) + sum(len(v) for v in baselines.values())
+    m = (_declared_contrast_count(design)
+         + _declared_contrast_count(baselines))
     req = signflip_min_n_for_holm(m, alpha)
     # A fractional/bool seed count is not a plan size; truncating 6.9 to 6
     # could label an invalid plan sufficient.  Treat it as zero (fail closed)
@@ -27911,6 +28249,14 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
     _sesoi_specs = _normalise_sesoi_design(ABLATION_SESOI if sesoi is None else sesoi)
     default_design = design is None
     design = ABLATION_DESIGN if design is None else design
+    _design_type_problem = None
+    if not isinstance(design, dict):
+        _design_type_problem = type(design).__name__
+        design = {}
+    _baseline_type_problem = None
+    if baselines is not None and not isinstance(baselines, dict):
+        _baseline_type_problem = type(baselines).__name__
+        baselines = {}
     _summary_type = None
     if summary is not None and not isinstance(summary, dict):
         _summary_type = type(summary).__name__
@@ -27925,6 +28271,10 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
         # family and mislabel an untested comparison as "unverified".
         _base_arms = {x for _cs in BASELINE_DESIGN.values() for _a, _b, _n in _cs for x in (_a, _b)}
         baselines = BASELINE_DESIGN if (default_design and (_base_arms & set(present))) else {}
+    # Both passes below (collection and scoping) must see the same one-pass
+    # iterable, so materialise declarations exactly once up front.
+    design = _materialise_contrast_design(design)
+    baselines = _materialise_contrast_design(baselines)
     try:
         _min_sig_n = signflip_min_n_for_holm(1, alpha) or 0
     except (ValueError, ZeroDivisionError):
@@ -27963,14 +28313,54 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
         report['warnings'].append(
             f'summary is a {_summary_type}, not an object; no record-level '
             'contrast can be audited')
+    if _design_type_problem is not None:
+        report['warnings'].append(
+            f'design is a {_design_type_problem}, not a mapping; no component '
+            'contrast can be audited')
+    if _baseline_type_problem is not None:
+        report['warnings'].append(
+            f'baselines is a {_baseline_type_problem}, not a mapping; no '
+            'baseline contrast can be audited')
 
     def _collect(design_group, kind):
         out = {}
         meta = {}
+        if not isinstance(design_group, dict):
+            report['warnings'].append(
+                f'{kind} design is not a mapping; no contrast can be audited')
+            return out, meta
         for comp, contrasts in design_group.items():
             entries = []
             arms = set()
-            for a, b, note in contrasts:
+            if isinstance(contrasts, (str, bytes, bytearray)):
+                report['warnings'].append(
+                    f'{comp}: {kind} contrasts are a string, not a list of '
+                    '(with, without, note) tuples; the declaration is '
+                    'malformed and was not audited')
+                _contrast_items = []
+            else:
+                try:
+                    _contrast_items = list(contrasts or ())
+                except TypeError:
+                    report['warnings'].append(
+                        f'{comp}: {kind} contrasts are not an iterable; the '
+                        'declaration is malformed and was not audited')
+                    _contrast_items = []
+            for _item in _contrast_items:
+                if (not isinstance(_item, (tuple, list))
+                        or len(_item) < 2):
+                    report['warnings'].append(
+                        f'{comp}: malformed {kind} contrast {_item!r} (expected '
+                        '(with, without, note)); it was not audited')
+                    continue
+                a, b = _item[0], _item[1]
+                if (not isinstance(a, str) or not isinstance(b, str)
+                        or not a.strip() or not b.strip()):
+                    report['warnings'].append(
+                        f'{comp}: malformed {kind} contrast {_item!r} (arm ids '
+                        'must be non-empty strings); it was not audited')
+                    continue
+                note = _item[2] if len(_item) > 2 else ''
                 arms.update((a, b))
                 a_present, b_present = (a in present, b in present)
                 conds = _paired_seed_deltas(recs, a, b, strict_hyper=(kind == 'component'))
@@ -28343,10 +28733,15 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
         lists = {s: [] for s in status_names}
         for comp, contrasts in design_group.items():
             entries = entries_by_comp.get(comp, [])
+            _c_items = (contrasts if isinstance(contrasts, (list, tuple))
+                        else [])
             # Per-component Holm: the family is this innovation's own declared
-            # contrasts ("is THIS module useful?").
+            # contrasts ("is THIS module useful?").  A malformed declaration
+            # still occupies a slot via `_declared_contrast_count`; it must
+            # not crash or shrink the per-component correction.
+            _n_comp = _declared_contrast_count({comp: contrasts})
             m_comp = max(
-                len(contrasts),
+                _n_comp,
                 _family_size_with_missing({comp: contrasts}, {comp: entries}))
             _holm_assign(entries, m_comp, alpha, 'p_holm_component')
             for e in entries:
@@ -28355,8 +28750,12 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
             status = _classify_group_status(
                 entries, min_n=min_n, alpha=alpha, m_family=m_family,
                 require_param_match=require_param_match,
-                n_declared=len(contrasts),
-                declared_pairs=[(a, b) for a, b, _n in contrasts])
+                n_declared=_n_comp,
+                declared_pairs=[
+                    (c[0], c[1]) for c in _c_items
+                    if (isinstance(c, (tuple, list)) and len(c) >= 2
+                        and isinstance(c[0], str) and isinstance(c[1], str)
+                        and c[0].strip() and c[1].strip())])
             lists[status].append(comp)
             if status == 'verified':
                 # `verified` is the corrected-significance tier; keep the
@@ -28413,8 +28812,8 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                                           % (comp, _cov))
             _req_key = 'component_seed_requirements' if kind == 'component' else 'baseline_seed_requirements'
             report[_req_key][comp] = {
-                'declared_contrasts': int(len(contrasts)),
-                'min_seeds_for_component_significance': signflip_min_n_for_holm(len(contrasts), alpha),
+                'declared_contrasts': int(_n_comp),
+                'min_seeds_for_component_significance': signflip_min_n_for_holm(_n_comp, alpha),
                 'min_seeds_for_family_significance': signflip_min_n_for_holm(m_family, alpha),
             }
         for status in status_names:

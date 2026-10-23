@@ -20399,6 +20399,31 @@ def t_sesoi_partial_panel_and_input_guards():
             spec={'dynamic_blocking': {'relative_pct': 1.0}},
             design={'dynamic_blocking': None})
     assert bad['status'] == 'fail', bad
+    # The full methodology audit must also fail closed on a malformed design
+    # instead of crashing on len()/unpacking.  Each shape below is a
+    # declaration defect, not a reason to abort the whole panel audit.
+    for _bad_design in ({'c': [('a', 'b')]}, {'c': None}, {'c': ['ab']},
+                        {'c': [None]}, {'c': []}, {'c': 'not-a-list'},
+                        ['not', 'a', 'mapping']):
+        with contextlib.redirect_stdout(io.StringIO()):
+            _rep = L.methodology_audit({}, design=_bad_design,
+                                       baselines={}, verbose=False)
+        assert _rep['warnings'], (_bad_design, _rep['warnings'])
+    # A one-pass generator is walked by two audit passes (collection and
+    # family scoping); it must be materialised once, not exhausted.
+    _gen = {'c': (item for item in [('a', 'b', 'x')])}
+    with contextlib.redirect_stdout(io.StringIO()):
+        _gen_rep = L.methodology_audit({}, design=_gen, baselines={},
+                                       verbose=False)
+    assert 'c' in _gen_rep['components'], _gen_rep['components']
+    # The prospective seed plan has the same contract (and counts a malformed
+    # declaration as one slot rather than dropping it).
+    assert L.methodology_seed_plan(6, design={'c': [('a', 'b')]},
+                                   baselines={})['declared_contrasts'] == 1
+    assert L.methodology_seed_plan(6, design={'c': None},
+                                   baselines={})['declared_contrasts'] == 1
+    assert L.methodology_seed_plan(6, design=['not', 'a', 'mapping'],
+                                   baselines={})['declared_contrasts'] == 0
 
 
 def t_doc_unit_influence_primitives():
@@ -20486,6 +20511,37 @@ def t_doc_unit_influence_primitives():
     assert holder['available'] is True and holder['jackknife_available'] is False, holder
     assert holder['loo_available'][0] is False, holder
     assert holder['loo_available'][1] is True, holder
+    # An unavailable fold is JSON-safe null in every per-fold vector, never
+    # inf/NaN that a strict writer would reject or a reader could mistake for
+    # a point estimate.
+    assert holder['loo_delta_ppl'][0] is None, holder
+    assert holder['loo_change_ppl'][0] is None, holder
+    assert holder['loo_delta_log_ratio'][0] is None, holder
+    assert holder['loo_change_log_ratio'][0] is None, holder
+    assert holder['loo_delta_ppl'][1] is not None, holder
+    json.dumps(holder, allow_nan=False)
+
+    # All LOO folds can be finite while their squared deviations exceed the
+    # float range.  The jackknife must then be explicitly unavailable (no
+    # inf SE/CI masquerading as a measured interval), and the object stays
+    # JSON-compliant.
+    extreme = L.paired_nll_unit_influence([[0.0, 500.0, 500.0]],
+                                          [[0.0, 0.0, 0.0]],
+                                          [10, 1, 1])
+    assert extreme['available'] is True, extreme
+    assert extreme['loo_available'] == [True, True, True], extreme
+    assert extreme['jackknife_available'] is False, extreme
+    assert extreme['jackknife_se_ppl'] is None, extreme
+    assert extreme['jackknife_ci95_ppl'] is None, extreme
+    assert extreme['jackknife_unavailable_reason'], extreme
+    json.dumps(extreme, allow_nan=False)
+    # The cluster-robust variance has the same overflow contract: a finite
+    # point estimate with an unrepresentable variance is a point-only result,
+    # never an inf interval.
+    _pc = L._paired_nll_doc_ci([[700.0, 701.0, 699.0, 700.0]],
+                               [[0.0, 0.0, 0.0, 0.0]], [1, 1, 1, 1])
+    assert math.isfinite(_pc['delta_ppl']), _pc
+    assert _pc['se_ppl'] is None and _pc['delta_ppl_ci95'] is None, _pc
 
     # Shape/token/id/option guards: a malformed id vector or fold must not
     # silently index the wrong unit.
@@ -20494,6 +20550,9 @@ def t_doc_unit_influence_primitives():
         ([[1.0, 2.0, 3.0]], [[1.0, 2.0, 3.0]], [1.0, 1.0]),
         ([[1.0, 2.0, 3.0]], [[1.0, 2.0, 3.0]], [1.0, 0.0, 1.0]),
         ([[1.0, 2.0, 3.0]], [[1.0, 2.0, 3.0]], [1.0, float('nan'), 1.0]),
+        ([[1.0, 2.0, 3.0]], [[1.0, 2.0, 3.0]], [1.5, 1.0, 1.0]),
+        ([[1.0, 2.0, 3.0]], [[1.0, 2.0, 3.0]], [True, 1.0, 1.0]),
+        ([[True, 2.0, 3.0]], [[1.0, 2.0, 3.0]], [1.0, 1.0, 1.0]),
         ([[1.0, 2.0, 3.0]], [[1.0, 2.0, float('inf')]], [1.0, 1.0, 1.0]),
     ]
     for _a, _b, _t in bad_inputs:
