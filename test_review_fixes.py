@@ -4168,6 +4168,38 @@ def t_data_seed_for_rank_is_domain_safe():
             raise AssertionError(f'data_seed_for_rank accepted seed {bad!r}')
 
 
+def t_all_ranks_agree_branches_on_reduced_value():
+    # A rank-local finiteness flag must be AND-reduced before DDP chooses
+    # backward vs skip.  The old loss branch reduced the flag but still
+    # branched on the local value, so a finite rank could enter backward while
+    # a peer skipped it and deadlock.
+    if not torch.distributed.is_available():
+        return
+    _orig = torch.distributed.all_reduce
+    _peer = [1]
+    _seen = []
+
+    def _fake_all_reduce(flag, op=None):
+        _seen.append((int(flag.item()), op))
+        flag.fill_(min(int(flag.item()), _peer[0]))
+
+    torch.distributed.all_reduce = _fake_all_reduce
+    try:
+        dev = torch.device('cpu')
+        assert L._all_ranks_agree(True, False, dev) is True
+        assert L._all_ranks_agree(False, False, dev) is False
+        assert not _seen, 'single-process calls must not enter a collective'
+        assert L._all_ranks_agree(True, True, dev) is True
+        _peer[0] = 0
+        assert L._all_ranks_agree(True, True, dev) is False, (
+            'a locally finite rank must skip when a peer reports non-finite')
+        _peer[0] = 1
+        assert L._all_ranks_agree(False, True, dev) is False
+        assert all(op == torch.distributed.ReduceOp.MIN for _, op in _seen), _seen
+    finally:
+        torch.distributed.all_reduce = _orig
+
+
 def t_execution_environment_pair_gate():
     fp = 'steps1_sl8_bs1_nt10_lr0.0003_wd0.1_d8_L1_H1_Dh8_v16_wu1_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee1_es1_detcpu-eager_dfabc_csX'
     base = dict(variant='a', seed=0, run_cfg=fp, steps=1, tokens_seen=1, ppl=10.0,
@@ -18795,6 +18827,40 @@ def t_analyze_errors_topk_one_has_no_margin():
     assert cc['target_outside_topk']['n'] == r['n_targets'], cc
 
 
+def t_token_frequency_table_chunks_exactly():
+    # The rare-target table must not need an int64 copy of the whole corpus.
+    # Chunked integer additions have to return the exact bincount vector, also
+    # across several chunk boundaries, for every integer storage width the
+    # scale corpora use.
+    V = 11
+    ids = np.array([0, 1, 1, 2, 5, 5, 5, 10, 3, 4, 4, 0, 7, 8, 9, 2, 2, 6,
+                    1, 10], dtype=np.int64)
+    expected = np.bincount(ids, minlength=V)
+    for dt in (np.uint8, np.uint16, np.int32, np.int64):
+        got = L._token_frequency_table(ids.astype(dt), V, chunk=3)
+        assert got.dtype == np.int64, got.dtype
+        assert np.array_equal(got, expected), (dt, got, expected)
+    # Empty corpora and a chunk larger than the data are exact too.
+    assert np.array_equal(L._token_frequency_table(np.empty(0, np.int32), V),
+                          np.zeros(V, dtype=np.int64))
+    assert np.array_equal(L._token_frequency_table(ids, V, chunk=1 << 20),
+                          expected)
+    for bad in (np.zeros(2, dtype=np.float32), np.zeros(2, dtype=np.bool_)):
+        try:
+            L._token_frequency_table(bad, V)
+        except TypeError:
+            pass
+        else:
+            raise AssertionError(f'non-integer ids {bad.dtype} must be refused')
+    for bad_v, bad_chunk in ((0, 3), (V, 0)):
+        try:
+            L._token_frequency_table(ids, bad_v, chunk=bad_chunk)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('invalid vocab/chunk must be refused')
+
+
 def t_metric_threshold_and_manifest_status_guards():
     # Logit scores are a supported 1-D score type; a finite cut of 2.0 is a
     # legal operating point and must not be rejected as "not in [0, 1]".
@@ -19293,6 +19359,7 @@ def main():
     _check('E1a2 seed scalars never truncate silently', t_seed_scalar_rejects_silent_truncation)
     _check('E1a3 seed domain validation', t_seed_domain_guard)
     _check('E1a4 DDP rank data seeds stay in-domain and collision-free', t_data_seed_for_rank_is_domain_safe)
+    _check('E1a4b DDP branches on the rank-agreed finiteness flag', t_all_ranks_agree_branches_on_reduced_value)
     _check('E1a5 paired records must share the execution environment', t_execution_environment_pair_gate)
     _check('E1b explicit RNG seed contract', t_seed_contract_check)
     _check('E2 batch_iter reproducibility', t_batch_iter_reproducible)
@@ -19662,6 +19729,7 @@ def main():
     _check('L145 duplicate keys are per row, not per hash block', t_row_keys_are_per_row_not_per_block)
     _check('L146 non-monotone pooling uses original block positions', t_nonmonotone_pooling_uses_original_positions)
     _check('L147 topk=1 margin is unmeasured, not zero', t_analyze_errors_topk_one_has_no_margin)
+    _check('L147b token-frequency table accumulates in exact bounded chunks', t_token_frequency_table_chunks_exactly)
     _check('L148 logit thresholds + terminal manifest status + NaN calibration', t_metric_threshold_and_manifest_status_guards)
     _check('L149 paired effect modification across conditions', t_effect_modification_across_conditions)
     _check('L150 length interaction uses within-seed log effects', t_length_interaction_analysis_and_markdown)

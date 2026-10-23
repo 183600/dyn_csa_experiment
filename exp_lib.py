@@ -31165,6 +31165,22 @@ def is_main_process():
     return distributed_info()[0] == 0
 
 
+def _all_ranks_agree(local_ok, distributed, device):
+    """Rank-agreed boolean for a branch that runs DDP collectives.
+
+    A per-rank condition (finite loss, finite gradient norm) must be reduced
+    before choosing whether to enter backward/step: if one rank skips and a
+    peer enters the DDP gradient collective, the job deadlocks.  Outside a
+    multi-process launch this is exactly the caller's local boolean.
+    """
+    if not distributed:
+        return bool(local_ok)
+    flag = torch.tensor([1 if bool(local_ok) else 0], dtype=torch.int32,
+                        device=device)
+    torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MIN)
+    return bool(int(flag.item()))
+
+
 def _amp_requested():
     """Mixed-precision mode for the training path.
 
@@ -32028,23 +32044,26 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
                 else:
                     _ce_item = float('nan')
                     _comp_item = 0.0
-            if _dist and _world > 1:
-                # Every rank must take the same branch: skipping backward on
-                # one rank while another enters DDP's gradient collective
-                # deadlocks the job.
-                _ok_t = torch.tensor([1 if math.isfinite(_loss_item) else 0], dtype=torch.int32, device=device)
-                torch.distributed.all_reduce(_ok_t, op=torch.distributed.ReduceOp.MIN)
-                _step_ok = bool(int(_ok_t.item()))
-            if not math.isfinite(_loss_item):
-                _step_ok = False
+            _loss_finite_local = bool(math.isfinite(_loss_item))
+            # Branch on the rank-agreed value, not on this rank's local loss:
+            # a rank whose own shard happened to be finite used to enter
+            # backward while a peer skipped it, deadlocking DDP.
+            _loss_ok = _all_ranks_agree(_loss_finite_local,
+                                        _dist and _world > 1, device)
+            _step_ok = _loss_ok
+            if not _loss_ok:
                 _skipped_steps += 1
                 _nonfinite_loss_steps += 1
                 if _first_bad_step is None:
                     _first_bad_step = step + 1
                 _nan_events.append({'step': step + 1, 'kind': 'loss', 'loss': _loss_item,
                                     'ce': _ce_item, 'comp_reg': _comp_item,
-                                    'boundary_pg': _pg_item, 'lr': base})
-                print(f'  [nan] non-finite loss at step {step + 1} (ce={_ce_item}, comp={_comp_item}, pg={_pg_item}); skipping the optimizer update')
+                                    'boundary_pg': _pg_item, 'lr': base,
+                                    'rank_local_finite': _loss_finite_local,
+                                    'rank': int(_rank)})
+                _where = ('this rank' if not _loss_finite_local
+                          else f'another rank (rank {int(_rank)} loss is finite)')
+                print(f'  [nan] non-finite loss at step {step + 1} ({_where}; ce={_ce_item}, comp={_comp_item}, pg={_pg_item}); skipping the optimizer update on every rank')
                 opt.zero_grad(set_to_none=True)
                 if _scaler is not None:
                     # GradScaler.update() consumes/reset the found-inf state.
@@ -32058,12 +32077,8 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
                 _scaler.unscale_(opt)
                 _gn = torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
                 _gn_pre = float(_gn.detach().item()) if torch.is_tensor(_gn) else float(_gn)
-                if _dist and _world > 1:
-                    _gok = torch.tensor([1 if math.isfinite(_gn_pre) else 0], dtype=torch.int32, device=device)
-                    torch.distributed.all_reduce(_gok, op=torch.distributed.ReduceOp.MIN)
-                    _grad_ok = bool(int(_gok.item()))
-                else:
-                    _grad_ok = math.isfinite(_gn_pre)
+                _grad_ok = _all_ranks_agree(math.isfinite(_gn_pre),
+                                            _dist and _world > 1, device)
                 if not _grad_ok:
                     _step_ok = False
                     _skipped_steps += 1
@@ -32098,12 +32113,8 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
                 loss.backward()
                 _gn = torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
                 _gn_pre = float(_gn.detach().item()) if torch.is_tensor(_gn) else float(_gn)
-                if _dist and _world > 1:
-                    _gok = torch.tensor([1 if math.isfinite(_gn_pre) else 0], dtype=torch.int32, device=device)
-                    torch.distributed.all_reduce(_gok, op=torch.distributed.ReduceOp.MIN)
-                    _grad_ok = bool(int(_gok.item()))
-                else:
-                    _grad_ok = math.isfinite(_gn_pre)
+                _grad_ok = _all_ranks_agree(math.isfinite(_gn_pre),
+                                            _dist and _world > 1, device)
                 if not _grad_ok:
                     _step_ok = False
                     _skipped_steps += 1
@@ -32598,6 +32609,34 @@ def _context_target_counts(vb, ctx_len, *, max_positions=None):
     return out, ctx_len, meta
 
 
+def _token_frequency_table(flat_ids, vocab, *, chunk=1 << 24):
+    """Exact token counts accumulated in bounded chunks.
+
+    ``np.bincount(np.asarray(ids, dtype=np.int64))`` materialises an 8-byte
+    copy of the ENTIRE corpus first: 40 GB on a 5B-token scale-up before the
+    count table itself is allocated.  Integer chunk additions return the
+    identical counts while keeping the temporary at O(chunk), so the rare-
+    target diagnostic remains usable at the corpus sizes this project targets.
+    """
+    arr = np.asarray(flat_ids).reshape(-1)
+    V = int(vocab)
+    if V < 1:
+        raise ValueError(f'_token_frequency_table needs vocab >= 1, got {vocab!r}')
+    step = _exact_count(chunk, minimum=1)
+    if step is None:
+        raise ValueError(f'_token_frequency_table needs a positive chunk, got {chunk!r}')
+    if arr.dtype == np.bool_ or not np.issubdtype(arr.dtype, np.integer):
+        raise TypeError(f'_token_frequency_table needs integer ids, got dtype {arr.dtype}')
+    out = np.zeros(V, dtype=np.int64)
+    for s in range(0, int(arr.size), int(step)):
+        _part = arr[s:s + int(step)]
+        if _part.size:
+            # bincount accepts every integer width here; only the small chunk
+            # is converted internally, never the whole corpus.
+            out += np.bincount(_part, minlength=V)
+    return out
+
+
 @torch.inference_mode()
 def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
                    top_tokens=100, chunk=8, val_bnd=None, train_ids=None,
@@ -32684,8 +32723,15 @@ def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
                 if _lo < 0 or _hi >= V:
                     freq_problem = f'train_ids out of range [{_lo}, {_hi}] for vocab {V}'
                 else:
-                    freq = np.bincount(_flat_tr.astype(np.int64), minlength=V)
-                    if freq.shape[0] != V:
+                    # Chunked integer accumulation: no whole-corpus int64
+                    # copy at scale (see _token_frequency_table).
+                    try:
+                        freq = _token_frequency_table(_flat_tr, V)
+                    except (MemoryError, ValueError, TypeError, OverflowError) as _fe:
+                        freq = None
+                        freq_problem = (f'train-frequency table could not be '
+                                        f'accumulated ({type(_fe).__name__}: {_fe})')
+                    if freq is not None and freq.shape[0] != V:
                         freq_problem = f'frequency table has {freq.shape[0]} rows, expected {V}'
                         freq = None
         if freq is not None:
