@@ -2362,3 +2362,34 @@ passes 493/496 with the same 3 DataLoader environment skips;
 `python v12_supp.py plan` still admits 72/72 synthetic frozen records with the
 same six comparisons; `python audit_gates.py source` reports `ok` (23/23 files byte-identical)
 after regenerating the plan snapshot with `python v12_supp.py plan`.
+
+## 2026-10-23 — validation article audit must trim the unserved sidecar tail (no new runs)
+
+Zero-GPU audit correctness; no training run, no test read, no frozen
+manifest byte, seed, recipe, endpoint or `CODE_SEMANTICS` is touched.
+
+**Problem.** `exp_lib.load_wikitext` caps the validation token stream at
+`val_seqs * seq_len + seq_len`, writes the per-token document map for that
+whole cap (`val_token_doc_ids_*`), and serves only the first
+`n_val * seq_len` tokens as `val_batch`.  `audit_gates._unit_decode_runs`
+demanded exact equality between the map length and the served array, so on a
+normally built cache the validation half of `document_unit` always failed
+before decoding (e.g. 262656 sidecar ids vs 262144 served tokens in the local
+512x512 cache).  The article-leakage/unit section then reported only the length
+error instead of analysing the selection split, which defeats the audit that
+motivated the article unit in the first place.
+
+**Fix.** A longer sidecar is trimmed to the served prefix and the number of
+unserved ids is recorded as `trimmed_unserved_tokens`; the map is written in
+stream order, so the served tokens are its prefix.  A *shorter* sidecar is
+still a hard error — that means some served token has no document identity.
+No token, id, fingerprint or article boundary changes for the served slice.
+
+**Verification.** Extended L152 with the real loader layout (one extra
+sequence of sidecar ids): the audit decodes validation, records the trim and
+still classifies the line unit; a one-id-short map remains refused.
+`python test_review_fixes.py` passes 493/496 with the same 3 DataLoader
+environment skips; `python v12_supp.py plan` still admits 72/72 synthetic
+frozen records; `python audit_gates.py source` is `ok` after regenerating the
+plan snapshot.
+

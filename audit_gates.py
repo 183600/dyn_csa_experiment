@@ -1427,11 +1427,21 @@ def _unit_decode_runs(ids, ttd, tok, L, label, rec):
     import numpy as np
     flat = np.asarray(ids).reshape(-1)
     doc = np.asarray(ttd).reshape(-1)
-    if doc.size != flat.size:
+    if doc.size < flat.size:
         rec['problems'].append(
             f'{label}: per-token document map covers {doc.size} tokens but the '
-            f'id array has {flat.size}')
+            f'id array has {flat.size}; the served slice is not fully mapped')
         return None
+    if doc.size > flat.size:
+        # The loaders cap the validation stream at val_seqs*seq_len + seq_len
+        # but serve only the first n_val*seq_len tokens.  The sidecar therefore
+        # carries one extra (unserved) sequence of ids by construction.  The
+        # map is written in stream order, so the served rows are its prefix;
+        # trim the unserved tail and say so instead of rejecting a normal cache.
+        # A shorter map stays a hard error (above): that would mean some served
+        # token has no document identity at all.
+        rec['trimmed_unserved_tokens'] = int(doc.size - flat.size)
+        doc = doc[:flat.size]
     try:
         spans = L.line_spans_from_token_doc_ids(doc)
     except (TypeError, ValueError, OverflowError) as e:

@@ -19180,7 +19180,8 @@ def _write_document_unit_fixture(td):
     with open(os.path.join(raw, 'wiki.valid.raw'), 'w', encoding='utf-8') as f:
         f.write('\n'.join(val) + '\n')
     return {'tag': tag, 'ttag': ttag, 'raw': raw,
-            'val_doc_path': os.path.join(td, f'val_doc_ids_{tag}.npy')}
+            'val_doc_path': os.path.join(td, f'val_doc_ids_{tag}.npy'),
+            'val_token_doc_path': os.path.join(td, f'val_token_doc_ids_{tag}.npy')}
 
 
 def t_document_unit_audit_detects_line_vs_article():
@@ -19201,6 +19202,29 @@ def t_document_unit_audit_detects_line_vs_article():
         assert rec['article_leakage']['raw_train_articles'] == 2
         assert rec['article_leakage']['raw_validation_articles'] == 1
         assert rec['article_leakage']['articles_with_served_lines_in_both_splits'] == 0
+        # The loader caps the validation stream at val_seqs*seq_len + seq_len
+        # but serves only the first n_val*seq_len tokens, so a normal cache's
+        # per-token sidecar is ONE extra sequence longer than val_batch.  The
+        # audit must trim that unserved tail instead of refusing to decode.
+        _tok_map = np.load(info['val_token_doc_path'])
+        np.save(info['val_token_doc_path'],
+                np.concatenate([_tok_map, _tok_map[-8:]]))
+        with contextlib.redirect_stdout(io.StringIO()):
+            rep_tail = A.audit_document_unit(td, raw_dir=info['raw'])
+        _vrec = rep_tail['caches'][os.path.abspath(td)]['validation']
+        assert _vrec['status'] == 'ok', _vrec
+        assert _vrec['trimmed_unserved_tokens'] == 8, _vrec
+        assert _vrec['unit'] == 'line', _vrec
+        # A shorter map is still a hard error: some served token would have no
+        # document identity.
+        from tokenizers import Tokenizer as _Tok
+        _tok_obj = _Tok.from_file(os.path.join(td, f"tok_{info['tag']}.json"))
+        _short = {'problems': []}
+        _va = np.load(os.path.join(td, f"val_batch_{info['tag']}.npy"))
+        assert A._unit_decode_runs(
+            _va, _tok_map[:-1], _tok_obj, L, 'validation', _short) is None, _short
+        assert any('not fully mapped' in p for p in _short['problems']), _short
+        np.save(info['val_token_doc_path'], _tok_map)
         # Missing raw data is a disclosed non-verification, not "clean".
         with contextlib.redirect_stdout(io.StringIO()):
             rep_noraw = A.audit_document_unit(td, raw_dir=os.path.join(td, 'absent'))
