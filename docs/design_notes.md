@@ -257,6 +257,51 @@ RNG 流、不改返回内容，因此不触碰 §3.1 的可比性（`CODE_SEMANT
 - 模块导入必须零副作用：不读写状态文件、不下载、不改随机种子。依赖产物的
   检查在产物缺席时必须可跳过而不是失败。
 
+### 7.1 上游语料版本是内容指纹之外的另一层身份
+
+`src_fp` / `train_fp` 证明两次运行**看到了同一批 token**；它不能证明一次
+**全新构建**来自同一个上游快照。WikiText-103 与 FineWeb-Edu 都是可变的
+Hub 仓库，同一配置在分支移动后重建会得到不同语料，而旧记录的内容指纹
+对「新语料」只会表现为另一组数字，不会指出上游已经变了。
+
+因此两类语料都固定一个**完整 40 位 commit**：
+
+- WikiText-103：`WIKITEXT_HF_REVISION`（`Salesforce/wikitext`，
+  `wikitext-103-raw-v1`；镜像别名 `wikitext` 指向同一 commit）；
+- FineWeb-Edu：`FINEWEB_EDU_HF_REVISION`（`HuggingFaceFW/fineweb-edu`）。
+
+`load_dataset(..., revision=<commit>)` 直接请求该 commit。需要镜像/离线副本
+时用 `WT103_DATASET_REVISION` / `FWEDU_DATASET_REVISION` 覆盖，但只接受
+完整 40 位十六进制 commit——分支名、tag、短前缀都会移动，不能作为数据身份。
+非法值在加载前硬报错。commit 固定的是 Hub 树；若某个 builder 另行抓取外部
+归档，最终到达训练循环的字节仍以 `src_fp` / `fit_fp` 内容指纹为准。两层
+身份互补：commit 让**上游变化可见**，内容指纹让**实际字节可对账**，不能用
+前者替代后者。
+
+每个 cache meta 新增 `dataset_source`（test meta 另记
+`train_dataset_source` / `validation_dataset_source`）：
+
+```
+{'provider': 'huggingface', 'repo': ..., 'config': ...,
+ 'revision': '<40-hex>', 'revision_pinned': true}
+```
+
+- 缓存命中时，若 meta 记录的 revision 与当前固定值不同，train/validation
+  缓存按既有纪律**重建**（并在日志里点名），test 缓存则**硬拒绝**（冻结
+  切片不能静默换上游）；
+- test meta 的 train/validation/test 三个来源必须属于同一 commit，冷构建
+  在写盘前检查，混快照直接拒绝；
+- 没有该字段的旧缓存按 legacy 处理：打印一次 NOTE，继续可读（旧结果必须
+  仍可复现），但审计明确写「上游 commit 不可本地验证」，绝不算作已证明；
+- 本地 `wiki.*.raw` / `WT103_RAW_TXT` / `FWEDU_LOCAL_JSONL` 记为
+  `provider='local'`：内容仍由 token 指纹绑定，但上游 commit 不被声称，
+  审计给 warning。
+
+`python audit_gates.py data_source`（也进入 `report`）独立于 loader 重算这
+一层：逐 cache 校验 schema/commit，配对 train/test，汇总目录内出现的
+revision。它与 §8 的证据分级一致：**不可验证就说不可验证**，不用「文件
+存在」代替「来源已核验」。
+
 ## 8. 仓库边界
 
 仓库只承载**源码、驱动脚本与设计文档**：实验结果目录、分析目录、逐版

@@ -2393,3 +2393,54 @@ environment skips; `python v12_supp.py plan` still admits 72/72 synthetic
 frozen records; `python audit_gates.py source` is `ok` after regenerating the
 plan snapshot.
 
+## 2026-10-23 — installable source tree + pinned upstream corpus revision (no new runs)
+
+Zero-GPU reproducibility/engineering hardening. No training run, no test-split
+read, no frozen manifest byte/seed/recipe/endpoint, no `CODE_SEMANTICS` change,
+and no README/CI edit.
+
+**Problem 1 (engineering).** `pyproject.toml` declared a setuptools build but
+had no explicit module list. Setuptools' flat-layout auto-discovery found the
+generated `wt103_cache/`, `analysis_*` and `results_*` directories and refused
+with "Multiple top-level packages discovered"; `pip install .`/`python -m
+build` failed. A repository whose only supported workflow is "run files in
+place" cannot produce a reproducible wheel/sdist or a clean-environment smoke.
+**Fix.** `[tool.setuptools] py-modules` now lists every measurement/driver
+module explicitly (test entry points stay source-only), and the metadata
+declares `readme`, license, keywords and classifiers. `MANIFEST.in` defines the
+sdist contents (code, tests, frozen manifests, docs; no caches/results/CI),
+`Makefile` groups the zero-GPU checks, and `.build/` is ignored. The new CPU
+test L155 parses the metadata, fails if a new top-level module is not listed,
+and performs a real `pip install --no-deps --no-build-isolation --target ...`
+of a minimal source copy.
+
+**Problem 2 (reproducibility).** `src_fp`/`train_fp` prove two runs saw the same
+tokens, but not that a **fresh build** came from the same upstream snapshot.
+`load_dataset('Salesforce/wikitext', ...)` and the FineWeb-Edu stream were called
+without a revision, so a moved Hub branch would silently define a different
+corpus for the same config (the cache metadata did not record the upstream
+commit either). **Fix.** WikiText-103 (`b08601e0…`, aliased `wikitext` repo) and
+FineWeb-Edu (`87f09149…`) now pin a full 40-hex Hub commit and pass
+`revision=`; `WT103_DATASET_REVISION` / `FWEDU_DATASET_REVISION` accept only a
+full commit (branch/tag/short prefix is refused). Every cache meta records
+`dataset_source` (`provider`/`repo`/`config`/`revision`/`revision_pinned`), test
+metas also record the train/validation source, and train/validation/test must
+agree on one commit at build time. On cache hit a mismatched Hub revision
+rebuilds train/validation and hard-refuses the frozen test cache; legacy caches
+without the field remain readable but are reported as unverifiable, never as
+clean. Local dumps are explicit `provider='local'` records (content still bound
+by token fingerprints, upstream commit not claimed). Run/checkpoint provenance
+also carries `configured_dataset_source`. The new
+`python audit_gates.py data_source` subcommand (also in `report`) re-checks the
+schema, commit pins and train/test pairing independently of the loader; L156
+covers moving-reference refusal, env override, mismatched/legacy/local caches
+and the audit verdicts, and L157 exercises the cold local-raw build/write path.
+
+**Verification.** `python test_review_fixes.py` passes 496/499 with the same 3
+DataLoader environment skips; `python v12_supp.py plan` still admits 72/72
+synthetic frozen records; `python audit_gates.py source` is `ok` after the plan
+snapshot refresh; `python audit_gates.py report` completes (its `data_source`
+section correctly reports the current legacy `wt103_cache` as
+`not_verifiable_locally`); a cold local-raw build was exercised and its meta
+records `provider='local'`, and the subsequent cache hit serves the same bytes.
+

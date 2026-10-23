@@ -52,6 +52,9 @@
                报 not_verifiable_locally，不把 git commit 当成源码哈希）
   dependencies 依赖锁契约：requirements.lock 的每条 pin 与已安装版本比对；
                mismatch/missing/invalid 判 fail，partial 给出覆盖率警告
+  data_source  上游语料版本：每个 cache meta 是否记录并匹配固定的 Hub commit
+               （WikiText-103 / FineWeb-Edu）；train/validation/test 必须同一
+               快照；legacy/local 缓存明确报不可验证而非算作干净
   efficiency   prefill/decode/容量读数工具（需要模型；给出可复用函数
                与 CPU 微型演示——不是实验，是测量代码自检）
   report       汇总运行本地可执行的全部审计，输出 audit_report.json
@@ -4267,6 +4270,143 @@ def audit_dependencies(lock_path=None):
     return out
 
 
+def audit_data_source(cache_dir=None):
+    """Verify the upstream corpus revision recorded in each cache metadata file.
+
+    A token-content fingerprint proves that two runs used the same tokens; it
+    does not prove that a *new* cache was built from the same upstream snapshot.
+    WikiText-103 and FineWeb-Edu are mutable Hub repositories, so the loaders
+    pin a full commit and record it in `dataset_source`.  This audit recomputes
+    that contract independently of the loader:
+
+      - every non-legacy cache must carry a schema-valid `dataset_source`;
+      - a Hub source must name a full 40-hex commit and attest the pin;
+      - all paired train/validation/test caches must name the same commit;
+      - a legacy cache (no field) is reported as unverifiable, never as clean.
+
+    Local raw/jsonl corpora are legitimate; their content is bound by the token
+    fingerprints and the audit records that the upstream commit is not
+    attested.
+    """
+    import glob as _glob
+    L = _import_exp_lib()
+    if cache_dir in (None, ''):
+        cache_dir = os.environ.get('WT103_CACHE_DIR') or './wt103_cache'
+    cache_dir = _audit_artifact(cache_dir)
+    out = {
+        'kind': 'dataset_source_audit',
+        'status': 'ok',
+        'cache_dir': cache_dir,
+        'n_caches': 0,
+        'n_pinned': 0,
+        'n_legacy': 0,
+        'n_local': 0,
+        'revisions': {},
+        'caches': {},
+        'problems': [],
+        'warnings': [],
+    }
+    if not os.path.isdir(cache_dir):
+        out['status'] = 'not_verifiable_locally'
+        out['note'] = f'{cache_dir} does not exist; build or copy the corpus cache to audit its upstream revision'
+        print(json.dumps(out, ensure_ascii=False, indent=2)[:4000])
+        return out
+    metas = sorted(_glob.glob(os.path.join(cache_dir, 'meta_*.json')))
+    metas += sorted(_glob.glob(os.path.join(cache_dir, 'test_meta_*.json')))
+    # `meta_*.json` also matches test_meta_*.json on case-sensitive globs only
+    # when the pattern is literal, but de-duplicate defensively.
+    metas = sorted(set(metas))
+    if not metas:
+        out['status'] = 'not_verifiable_locally'
+        out['note'] = f'{cache_dir} has no meta_*.json/test_meta_*.json; cannot audit the corpus revision'
+        print(json.dumps(out, ensure_ascii=False, indent=2)[:4000])
+        return out
+    train_metas = []
+    test_metas = []
+    for path in metas:
+        name = os.path.basename(path)
+        meta = _load(path)
+        if not isinstance(meta, dict):
+            out['problems'].append(f'{name}: unreadable metadata')
+            continue
+        out['n_caches'] += 1
+        # FineWeb metadata records `source`; WikiText metadata does not.
+        try:
+            if meta.get('source'):
+                expected = L.fineweb_edu_dataset_source(str(meta.get('source')))
+            else:
+                expected = L.wikitext_dataset_source()
+        except Exception as e:
+            out['problems'].append(
+                f'{name}: the pinned source cannot be resolved '
+                f'({type(e).__name__}: {e})')
+            expected = None
+        probs, warns = L._dataset_source_problems(meta, expected, name)
+        src = meta.get('dataset_source')
+        if isinstance(src, dict):
+            if src.get('provider') == 'huggingface':
+                out['n_pinned'] += 1
+                rev = str(src.get('revision') or '').lower()
+                if rev:
+                    out['revisions'].setdefault(rev, []).append(name)
+            elif src.get('provider') == 'local':
+                out['n_local'] += 1
+        else:
+            out['n_legacy'] += 1
+        out['caches'][name] = {
+            'dataset': 'fineweb' if meta.get('source') else 'wikitext',
+            'provider': (src or {}).get('provider') if isinstance(src, dict) else None,
+            'repo': (src or {}).get('repo') if isinstance(src, dict) else None,
+            'revision': (src or {}).get('revision') if isinstance(src, dict) else None,
+            'revision_pinned': (src or {}).get('revision_pinned') if isinstance(src, dict) else None,
+            'problems': probs,
+            'warnings': warns,
+        }
+        out['problems'].extend(probs)
+        out['warnings'].extend(warns)
+        if name.startswith('test_meta_'):
+            test_metas.append(meta)
+        else:
+            train_metas.append(meta)
+    # Cross-cache consistency: every test cache must name the same upstream
+    # commit as its paired train caches.
+    if test_metas:
+        for tm in test_metas:
+            probs, warns = L.dataset_source_pair_problems(tm, train_metas,
+                                                          label='test/train')
+            out['problems'].extend(probs)
+            out['warnings'].extend(warns)
+    # Two different pinned head revisions in one cache directory means the
+    # directory itself mixes corpus snapshots.  Per-cache records may still be
+    # internally consistent, so this is a warning at directory level; the
+    # train/test pair check above turns the dangerous case into a failure.
+    if len(out['revisions']) > 1:
+        out['warnings'].append(
+            'the cache directory contains more than one upstream revision: '
+            + ', '.join(sorted(out['revisions'])))
+    if out['problems']:
+        out['status'] = 'fail'
+    elif out['n_legacy'] or out['n_local'] or out['warnings']:
+        if out['n_legacy']:
+            # Any cache without the field means the directory as a whole is
+            # not fully attested.  Say exactly that instead of letting the
+            # verified subset stand in for the missing one.
+            out['status'] = 'not_verifiable_locally'
+            out['note'] = (
+                f'{out["n_legacy"]} of {out["n_caches"]} cache metadata file(s) '
+                'predate dataset_source; the upstream commit cannot be attested '
+                'for those caches without rebuilding (they remain readable, but '
+                'are not clean)')
+        else:
+            out['status'] = 'ok'
+            out['note'] = ('present dataset-source records verify; local '
+                           'caches and directory-level caveats are listed under '
+                           'warnings and are not claimed as attestations')
+    print(json.dumps({k: v for k, v in out.items() if k != 'caches'},
+                     ensure_ascii=False, indent=2)[:4000])
+    return out
+
+
 def _read_experiment_events(outdir):
     path = os.path.join(outdir, 'experiments.jsonl')
     events = []
@@ -4442,7 +4582,7 @@ def audit_run_order(paths=None):
 
 
 def run_report(out='audit_report.json'):
-    res = {'generated_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'source_tree': audit_source_integrity(), 'dependencies': audit_dependencies(), 'leakage': audit_leakage(), 'split_discipline': audit_split_discipline(), 'document_unit': audit_document_unit(), 'attribution': audit_attribution(), 'boundary': audit_boundary(), 'length': audit_length(), 'fairness': audit_fairness(), 'metrics': audit_metrics(), 'tuning': audit_tuning(), 'simple_baseline': audit_simple_baseline(), 'hypotheses': audit_hypotheses(), 'methodology': audit_methodology(), 'single_factor': audit_single_factor(), 'design_preflight': audit_design_preflight(), 'failures': audit_failures(), 'budget': audit_budget(), 'training_health': audit_training_health(), 'efficiency_pairs': audit_efficiency_pairs(), 'release': audit_release_readiness(), 'selection': audit_selection(), 'run_order': audit_run_order()}
+    res = {'generated_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'source_tree': audit_source_integrity(), 'dependencies': audit_dependencies(), 'data_source': audit_data_source(), 'leakage': audit_leakage(), 'split_discipline': audit_split_discipline(), 'document_unit': audit_document_unit(), 'attribution': audit_attribution(), 'boundary': audit_boundary(), 'length': audit_length(), 'fairness': audit_fairness(), 'metrics': audit_metrics(), 'tuning': audit_tuning(), 'simple_baseline': audit_simple_baseline(), 'hypotheses': audit_hypotheses(), 'methodology': audit_methodology(), 'single_factor': audit_single_factor(), 'design_preflight': audit_design_preflight(), 'failures': audit_failures(), 'budget': audit_budget(), 'training_health': audit_training_health(), 'efficiency_pairs': audit_efficiency_pairs(), 'release': audit_release_readiness(), 'selection': audit_selection(), 'run_order': audit_run_order()}
     L_atomic = None
     try:
         L = _import_exp_lib()
@@ -4462,7 +4602,7 @@ def run_report(out='audit_report.json'):
 
 
 if __name__ == '__main__':
-    _cmds = {'leakage': audit_leakage, 'split': audit_split_discipline, 'split_discipline': audit_split_discipline, 'document_unit': audit_document_unit, 'unit': audit_document_unit, 'causality': audit_causality, 'attribution': audit_attribution, 'boundary': audit_boundary, 'length': audit_length, 'fairness': audit_fairness, 'metrics': audit_metrics, 'tuning': audit_tuning, 'simple': audit_simple_baseline, 'baseline_floor': audit_simple_baseline, 'baseline_plan': audit_baseline_design, 'hypothesis_coverage': audit_hypothesis_coverage, 'hypotheses': audit_hypotheses, 'methodology': audit_methodology, 'single_factor': audit_single_factor, 'design': audit_design_preflight, 'design_preflight': audit_design_preflight, 'failures': audit_failures, 'budget': audit_budget, 'efficiency': audit_efficiency_demo, 'efficiency_pairs': audit_efficiency_pairs, 'training_health': audit_training_health, 'selection': audit_selection, 'release': audit_release_readiness, 'run_order': audit_run_order, 'source': audit_source_integrity, 'source_tree': audit_source_integrity, 'dependencies': audit_dependencies, 'dependency': audit_dependencies, 'report': run_report}
+    _cmds = {'leakage': audit_leakage, 'split': audit_split_discipline, 'split_discipline': audit_split_discipline, 'document_unit': audit_document_unit, 'unit': audit_document_unit, 'causality': audit_causality, 'attribution': audit_attribution, 'boundary': audit_boundary, 'length': audit_length, 'fairness': audit_fairness, 'metrics': audit_metrics, 'tuning': audit_tuning, 'simple': audit_simple_baseline, 'baseline_floor': audit_simple_baseline, 'baseline_plan': audit_baseline_design, 'hypothesis_coverage': audit_hypothesis_coverage, 'hypotheses': audit_hypotheses, 'methodology': audit_methodology, 'single_factor': audit_single_factor, 'design': audit_design_preflight, 'design_preflight': audit_design_preflight, 'failures': audit_failures, 'budget': audit_budget, 'efficiency': audit_efficiency_demo, 'efficiency_pairs': audit_efficiency_pairs, 'training_health': audit_training_health, 'selection': audit_selection, 'release': audit_release_readiness, 'run_order': audit_run_order, 'source': audit_source_integrity, 'source_tree': audit_source_integrity, 'dependencies': audit_dependencies, 'dependency': audit_dependencies, 'data_source': audit_data_source, 'dataset_source': audit_data_source, 'report': run_report}
     _arg = sys.argv[1] if len(sys.argv) > 1 else 'report'
     if _arg in ('-h', '--help'):
         print(__doc__)

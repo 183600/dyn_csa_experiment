@@ -1,0 +1,40 @@
+# Source distribution contents for the source-only evidence model.
+#
+# The Git tree carries code, drivers, design documents and the frozen manifests;
+# caches/results/analysis directories are reproducible local artifacts and are
+# therefore excluded.  Keeping the tests in the sdist makes the package
+# self-checking: `tar xf ... && python test_review_fixes.py` on the unpacked
+# source is a complete CPU verification without a Git checkout.
+include LICENSE
+include README.md
+include README_zh.md
+include DECISION_LOG.md
+include RELEASES.md
+include pyproject.toml
+include requirements.txt
+include requirements-ci.txt
+include requirements.lock
+include confirmation_frozen.json
+include confirmation_frozen_dynamic.json
+include test_review_fixes.py
+include test_open_block.py
+recursive-include docs *.md
+
+# Never ship regenerable corpora, checkpoints, result/analysis trees, caches or
+# CI configuration.  The repository's evidence model publishes those through
+# archive_release.py, not through the package.
+prune .github
+prune .git
+prune wt103_cache
+prune fineweb_cache
+prune wt103_raw
+prune __pycache__
+prune results_smoke
+prune results_smoke_bench
+prune analysis_audit
+prune analysis_v12
+prune archive
+prune .build
+prune dist
+prune build
+global-exclude *.py[cod] *.npy *.npz *.arrow *.pt *.pth *.ckpt *.log *.tmp

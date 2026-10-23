@@ -19485,6 +19485,168 @@ def t_article_level_eval_and_analysis():
     assert mixed_ids is not None and mixed_ids['comparable'] is False, mixed_ids
 
 
+def t_project_packaging_is_complete():
+    """The source tree must be installable, not just importable in-place."""
+    import tomllib
+    import subprocess
+    import glob as _glob
+    cfg_path = os.path.join(REPO, 'pyproject.toml')
+    with open(cfg_path, 'rb') as fh:
+        cfg = tomllib.load(fh)
+    mods = cfg.get('tool', {}).get('setuptools', {}).get('py-modules')
+    assert isinstance(mods, list) and mods, 'pyproject.toml must declare py-modules explicitly'
+    expected = sorted(
+        os.path.splitext(os.path.basename(p))[0]
+        for p in _glob.glob(os.path.join(REPO, '*.py'))
+        if not os.path.basename(p).startswith('test_'))
+    assert sorted(mods) == expected, (
+        'pyproject [tool.setuptools] py-modules is out of date: '
+        f'missing={sorted(set(expected) - set(mods))} '
+        f'extra={sorted(set(mods) - set(expected))}')
+    assert not any(m.startswith('test_') for m in mods), 'test scripts are not runtime modules'
+    assert cfg['project'].get('readme') == 'README.md'
+    assert cfg['project'].get('license'), 'the package must declare its license'
+    assert os.path.exists(os.path.join(REPO, 'MANIFEST.in'))
+    # Actually build/install a minimal source copy: setuptools discovery used to
+    # fail with "Multiple top-level packages discovered" and no unit test saw
+    # it because in-place imports never invoke the build backend.
+    try:
+        import setuptools  # noqa: F401
+    except Exception as e:  # pragma: no cover
+        raise _SkipTest(f'setuptools is unavailable ({type(e).__name__}: {e})')
+    with tempfile.TemporaryDirectory() as td:
+        src = os.path.join(td, 'src')
+        os.makedirs(src)
+        names = ['pyproject.toml', 'README.md', 'LICENSE', 'MANIFEST.in',
+                 'requirements.txt', 'requirements.lock'] + [m + '.py' for m in mods]
+        for name in names:
+            p = os.path.join(REPO, name)
+            if os.path.exists(p):
+                shutil.copy2(p, os.path.join(src, name))
+        target = os.path.join(td, 'installed')
+        proc = subprocess.run(
+            [sys.executable, '-m', 'pip', 'install', '--no-deps',
+             '--no-build-isolation', '--target', target, src],
+            capture_output=True, text=True)
+        assert proc.returncode == 0, (
+            'pip install . failed:\n' + (proc.stdout or '')[-2000:]
+            + (proc.stderr or '')[-4000:])
+        for m in mods:
+            assert os.path.exists(os.path.join(target, m + '.py')), (
+                f'{m}.py missing from the installed package')
+        assert not os.path.exists(os.path.join(target, 'test_review_fixes.py')), (
+            'test scripts must stay source-only')
+
+
+def t_dataset_source_pinning_and_audit():
+    """The upstream corpus commit is pinned, recorded, and independently audited."""
+    assert L.WIKITEXT_HF_REVISION == 'b08601e04326c79dfdd32d625aee71d232d685c3'
+    assert L.FINEWEB_EDU_HF_REVISION == '87f09149ef4734204d70ed1d046ddc9ca3f2b8f9'
+    assert L.wikitext_dataset_source()['revision_pinned'] is True
+    assert L.wikitext_dataset_source()['config'] == 'wikitext-103-raw-v1'
+    # Moving references are refused; only a full commit is a data identity.
+    old = os.environ.get('WT103_DATASET_REVISION')
+    try:
+        for bad in ('main', 'abc123', 'z' * 40, 'A' * 39):
+            os.environ['WT103_DATASET_REVISION'] = bad
+            try:
+                L.wikitext_dataset_source()
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f'WT103_DATASET_REVISION={bad!r} must be refused')
+        os.environ['WT103_DATASET_REVISION'] = 'a' * 40
+        assert L.wikitext_dataset_source()['revision'] == 'a' * 40
+    finally:
+        if old is None:
+            os.environ.pop('WT103_DATASET_REVISION', None)
+        else:
+            os.environ['WT103_DATASET_REVISION'] = old
+    good = {'dataset_source': L.wikitext_dataset_source()}
+    p, w = L._dataset_source_problems(good, L.wikitext_dataset_source(), 'x')
+    assert p == [] and w == [], (p, w)
+    legacy_p, legacy_w = L._dataset_source_problems({}, L.wikitext_dataset_source(), 'x')
+    assert legacy_p == [] and legacy_w, (legacy_p, legacy_w)
+    bad = {'dataset_source': dict(L.wikitext_dataset_source(), revision='b' * 40)}
+    p, _w = L._dataset_source_problems(bad, L.wikitext_dataset_source(), 'x')
+    assert p and 'differs from the pinned' in p[0], p
+    local = {'dataset_source': L.local_dataset_source('raw')}
+    p, w = L._dataset_source_problems(local, L.wikitext_dataset_source(), 'x')
+    assert p == [] and w, (p, w)
+    malformed = {'dataset_source': {'provider': 'hub', 'revision': 'main'}}
+    p, _w = L._dataset_source_problems(malformed, L.wikitext_dataset_source(), 'x')
+    assert p, p
+    pair = L.dataset_source_pair_problems(
+        {'dataset_source': dict(L.wikitext_dataset_source(), revision='a' * 40)},
+        [{'dataset_source': dict(L.wikitext_dataset_source(), revision='b' * 40)}])
+    assert pair[0], pair
+    # The audit is independent of the loader: a matching cache pair is ok, a
+    # mismatched frozen test cache is a hard failure, and a legacy cache is
+    # explicitly unverifiable rather than silently clean.
+    with tempfile.TemporaryDirectory() as td:
+        def _write(name, meta):
+            with open(os.path.join(td, name), 'w', encoding='utf-8') as fh:
+                json.dump(meta, fh)
+        base = {'vocab': 8192, 'fit_fp': 'f' * 16,
+                'dataset_source': L.wikitext_dataset_source()}
+        _write('meta_v5_sl512.json', base)
+        _write('test_meta_v2_sl4097.json',
+               dict(base, dataset_source=L.wikitext_dataset_source()))
+        out = A.audit_data_source(td)
+        assert out['status'] == 'ok', out
+        assert out['n_pinned'] == 2 and out['n_legacy'] == 0, out
+        _write('test_meta_v2_sl4097.json', dict(
+            base, dataset_source=dict(L.wikitext_dataset_source(),
+                                      revision='c' * 40)))
+        out = A.audit_data_source(td)
+        assert out['status'] == 'fail', out
+        assert any('does not match' in x for x in out['problems']), out
+        _write('test_meta_v2_sl4097.json', {'vocab': 8192})
+        out = A.audit_data_source(td)
+        assert out['status'] == 'not_verifiable_locally', out
+        assert out['n_legacy'] == 1, out
+        assert any('predates the pinned' in x for x in out['warnings']), out
+
+
+def t_local_raw_cache_records_dataset_source():
+    """A cold local-raw build must record an explicit, non-pinned source."""
+    old = os.environ.get('WT103_RAW_TXT')
+    with tempfile.TemporaryDirectory() as td:
+        raw = os.path.join(td, 'raw')
+        os.makedirs(raw)
+        for split, n in (('train', 400), ('valid', 200)):
+            with open(os.path.join(raw, f'wiki.{split}.raw'), 'w',
+                      encoding='utf-8') as fh:
+                for i in range(n):
+                    fh.write(f'= {split} {i} =\n\nThis is a {split} sentence '
+                             f'number {i} with some words.\n\n')
+        cache = os.path.join(td, 'cache')
+        os.makedirs(cache)
+        os.environ['WT103_RAW_TXT'] = raw
+        try:
+            a = L.load_wikitext(16, 128, 64, val_seqs=4, cache_dir=cache)
+            meta_path = os.path.join(cache, 'meta_v5_sl16_cap128_v64_vs4.json')
+            assert os.path.exists(meta_path), os.listdir(cache)
+            with open(meta_path, encoding='utf-8') as fh:
+                meta = json.load(fh)
+            src = meta.get('dataset_source')
+            assert isinstance(src, dict), src
+            assert src.get('provider') == 'local' and src.get('revision') is None, src
+            assert src.get('revision_pinned') is False, src
+            # A cache hit must serve exactly the same bytes and not fabricate a
+            # Hub revision for a local dump.
+            b = L.load_wikitext(16, 128, 64, val_seqs=4, cache_dir=cache)
+            assert np.array_equal(a[0], b[0]) and np.array_equal(a[1], b[1])
+            _p, _w = L._dataset_source_problems(
+                meta, L.wikitext_dataset_source(), 'local')
+            assert _p == [] and _w, (_p, _w)
+        finally:
+            if old is None:
+                os.environ.pop('WT103_RAW_TXT', None)
+            else:
+                os.environ['WT103_RAW_TXT'] = old
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -19982,6 +20144,9 @@ def main():
     _check('L152 document-unit audit refuses line pseudodocuments and catches article leakage', t_document_unit_audit_detects_line_vs_article)
     _check('L153 article unit primitives recover clusters from the frozen line map', t_article_unit_primitive_and_reconstruction)
     _check('L154 article clustering is additive and preferred over line clusters', t_article_level_eval_and_analysis)
+    _check('L155 project packaging is explicit and installable', t_project_packaging_is_complete)
+    _check('L156 upstream dataset revision is pinned, recorded and audited', t_dataset_source_pinning_and_audit)
+    _check('L157 cold local-raw cache records an explicit source', t_local_raw_cache_records_dataset_source)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

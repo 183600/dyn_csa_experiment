@@ -7693,6 +7693,10 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=None, val_seqs=512,
             _problems.append(
                 'cache has no document-id sidecars; whole-document group '
                 'isolation cannot be verified — rebuild the corpus cache')
+        _src_problems, _src_warnings = _dataset_source_problems(
+            meta, wikitext_dataset_source(), 'WikiText train/validation')
+        _problems.extend(_src_problems)
+        _warn_dataset_source('WikiText train/validation', _src_warnings)
         if _problems:
             _cache_warning('WikiText train/validation split', _problems)
         else:
@@ -7704,17 +7708,23 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=None, val_seqs=512,
             _memo_put(_WT103_MEMO, _mkey, _out, _WT103_MEMO_CAP)
             return _out
     ds = local_wikitext_if_available(cache_dir)
+    _dataset_source = local_dataset_source('wikitext_raw')
     if ds is None:
+        _wt_source = wikitext_dataset_source()
         last_err = None
-        for repo in ('Salesforce/wikitext', 'wikitext'):
+        for repo in (WIKITEXT_HF_REPO, WIKITEXT_HF_REPO_ALIAS):
             try:
                 # Request train/validation EXPLICITLY.  Calling without
                 # `split=` materialises all three splits, including
                 # wiki.test.raw; test is only ever requested by load_wikitest.
+                # `revision=` pins the immutable Hub commit (see
+                # wikitext_dataset_source): a moving branch would silently
+                # change a fresh build's corpus.
                 ds = {
-                    'train': load_dataset(repo, 'wikitext-103-raw-v1', split='train', cache_dir=cache_dir),
-                    'validation': load_dataset(repo, 'wikitext-103-raw-v1', split='validation', cache_dir=cache_dir),
+                    'train': load_dataset(repo, WIKITEXT_HF_CONFIG, split='train', cache_dir=cache_dir, revision=_wt_source['revision']),
+                    'validation': load_dataset(repo, WIKITEXT_HF_CONFIG, split='validation', cache_dir=cache_dir, revision=_wt_source['revision']),
                 }
+                _dataset_source = wikitext_dataset_source(repo=repo)
                 break
             except Exception as e:
                 last_err = e
@@ -7906,6 +7916,11 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=None, val_seqs=512,
         # Data-construction semantics (not the kernel variant): the held-out
         # test cache must be built under the SAME split/cleanup semantics.
         'code_semantics': CODE_SEMANTICS,
+        # Immutable upstream identity (Hub commit) or an explicit local-dump
+        # record.  A token fingerprint alone cannot tell a fresh build on a
+        # changed upstream revision from the original corpus; the audit checks
+        # this field and the loaders refuse a mismatched rebuild.
+        'dataset_source': _dataset_source,
         'src_fp': _ids_fp(train_ids),
         'val_fp': _ids_fp(np.ascontiguousarray(val_batch).reshape(-1)),
         'fit_fp': fit_fp,
@@ -8251,6 +8266,41 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=None, cache_dir=None,
             _problems.append(_problems_td)
         if _problems_ttd:
             _problems.append(_problems_ttd)
+        # Upstream identity: a frozen test slice is only a snapshot if the
+        # corpus commit is the pinned one (a local raw dump is content-bound by
+        # the fingerprints and gets a warning, not a hard failure).  Compare it
+        # with every paired train cache whose metadata records a revision.
+        _src_problems, _src_warnings = _dataset_source_problems(
+            meta, wikitext_dataset_source(), 'WikiText TEST')
+        _problems.extend(_src_problems)
+        _warn_dataset_source('WikiText TEST', _src_warnings)
+        for _skey in ('train_dataset_source', 'validation_dataset_source'):
+            _sub = meta.get(_skey)
+            if isinstance(_sub, dict):
+                _sub_p, _sub_w = _dataset_source_problems(
+                    {'dataset_source': _sub}, wikitext_dataset_source(),
+                    f'WikiText TEST {_skey}')
+                _problems.extend(_sub_p)
+                _warn_dataset_source(f'WikiText TEST {_skey}', _sub_w)
+        import glob as _glob_src
+        _paired_train_metas = []
+        for _mpath in sorted(_glob_src.glob(os.path.join(cache_dir, 'meta_v5_*.json'))):
+            try:
+                _mobj = json.load(open(_mpath, encoding='utf-8'))
+            except Exception:
+                continue
+            if isinstance(_mobj, dict):
+                # Pair only train caches that describe the same tokenizer-fit
+                # corpus; an unrelated protocol in the same directory is not a
+                # reference snapshot for this test slice.
+                if (meta.get('fit_fp') and _mobj.get('fit_fp')
+                        and meta.get('fit_fp') != _mobj.get('fit_fp')):
+                    continue
+                _paired_train_metas.append(_mobj)
+        _pair_problems, _pair_warnings = dataset_source_pair_problems(
+            meta, _paired_train_metas, label='test/train')
+        _problems.extend(_pair_problems)
+        _warn_dataset_source('test/train pair', _pair_warnings)
         _sigs = _cache_file_sigs(_sig_paths)
         _fast = _cache_file_sigs_match(meta, _sigs)
         try:
@@ -8590,6 +8640,7 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=None, cache_dir=None,
     # populated after the validation block below, immediately before
     # tokenisation.
     test_rows = None
+    _test_source = local_dataset_source('wikitext_test_raw')
     ds_test = None
     ds_train = None
     raw_txt = os.environ.get('WT103_RAW_TXT')
@@ -8630,18 +8681,22 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=None, cache_dir=None,
     if len(_maxrows) == 1:
         _fit_max_rows = _maxrows.pop()
     train_rows_source = None
+    _train_source = local_dataset_source('wikitext_train_raw')
     for cand in _cands:
         _f = os.path.join(cand, 'wiki.train.raw')
         if os.path.exists(_f):
             train_rows_source = _read_raw_rows(_f)
             break
     if train_rows_source is None:
-        for repo in ('Salesforce/wikitext', 'wikitext'):
+        _wt_source = wikitext_dataset_source()
+        for repo in (WIKITEXT_HF_REPO, WIKITEXT_HF_REPO_ALIAS):
             try:
                 # TRAIN split only, for the frozen tokenizer fit.  Never reuse
                 # the test dataset here: fitting the tokenizer on test text
-                # would be leakage.
-                ds_train = load_dataset(repo, 'wikitext-103-raw-v1', split='train', cache_dir=cache_dir)
+                # would be leakage.  The revision pin is the same immutable
+                # Hub commit used by the train/validation cache.
+                ds_train = load_dataset(repo, WIKITEXT_HF_CONFIG, split='train', cache_dir=cache_dir, revision=_wt_source['revision'])
+                _train_source = wikitext_dataset_source(repo=repo)
                 break
             except Exception as e:
                 last_err = e
@@ -8713,6 +8768,7 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=None, cache_dir=None,
     # train.  Read validation (already consumed by earlier phases, never test)
     # before the held-out rows, so the dedup index is complete first.
     val_rows_source = None
+    _val_source = local_dataset_source('wikitext_validation_raw')
     for cand in _cands:
         _f = os.path.join(cand, 'wiki.valid.raw')
         if os.path.exists(_f):
@@ -8720,10 +8776,12 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=None, cache_dir=None,
             print(f'[data] local wikitext-103 VALIDATION split at {_f} ({len(val_rows_source)} rows)')
             break
     if val_rows_source is None:
-        for repo in ('Salesforce/wikitext', 'wikitext'):
+        _wt_source = wikitext_dataset_source()
+        for repo in (WIKITEXT_HF_REPO, WIKITEXT_HF_REPO_ALIAS):
             try:
-                ds_val = load_dataset(repo, 'wikitext-103-raw-v1', split='validation', cache_dir=cache_dir)
+                ds_val = load_dataset(repo, WIKITEXT_HF_CONFIG, split='validation', cache_dir=cache_dir, revision=_wt_source['revision'])
                 val_rows_source = list(ds_val['text'])
+                _val_source = wikitext_dataset_source(repo=repo)
                 break
             except Exception as e:
                 last_err = e
@@ -8801,11 +8859,13 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=None, cache_dir=None,
             print(f'[data] local wikitext-103 TEST split at {_f} ({len(test_rows)} rows)')
             break
     if test_rows is None:
+        _wt_source = wikitext_dataset_source()
         last_err = None
-        for repo in ('Salesforce/wikitext', 'wikitext'):
+        for repo in (WIKITEXT_HF_REPO, WIKITEXT_HF_REPO_ALIAS):
             try:
                 # Only the TEST split: never materialise train/validation here.
-                ds_test = load_dataset(repo, 'wikitext-103-raw-v1', split='test', cache_dir=cache_dir)
+                ds_test = load_dataset(repo, WIKITEXT_HF_CONFIG, split='test', cache_dir=cache_dir, revision=_wt_source['revision'])
+                _test_source = wikitext_dataset_source(repo=repo)
                 break
             except Exception as e:
                 last_err = e
@@ -8922,6 +8982,26 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=None, cache_dir=None,
         _tok_sha = file_sha256(tk_path)
     except Exception as _e:
         print(f'[data] NOTE: could not persist the test tokenizer ({type(_e).__name__}: {_e}) — a rebuild will re-fit it deterministically')
+    # The test rows were read only after every earlier check; before writing the
+    # frozen slice, refuse a mixed-upstream build (two different Hub commits
+    # cannot define one held-out snapshot).
+    _cold_revs = {str(s.get('revision')).lower()
+                  for s in (_train_source, _val_source, _test_source)
+                  if isinstance(s, dict) and s.get('provider') == 'huggingface'
+                  and s.get('revision')}
+    if len(_cold_revs) > 1:
+        raise RuntimeError(
+            'load_wikitest: train/validation/test were loaded from different '
+            f'upstream revisions {sorted(_cold_revs)} — refusing to write a '
+            'test cache that spans more than one corpus snapshot')
+    _cold_pair_problems, _cold_pair_warnings = dataset_source_pair_problems(
+        {'dataset_source': _test_source},
+        [m for m in _train_meta_objs
+         if not (m.get('fit_fp') and m.get('fit_fp') != _fit_fp_build)],
+        label='test')
+    _warn_dataset_source('test/train pair', _cold_pair_warnings)
+    if _cold_pair_problems:
+        raise RuntimeError('load_wikitest: ' + '; '.join(_cold_pair_problems))
     atomic_write_json(me_path, {
         'vocab': vocab,
         'src_fp': _ids_fp(test_batch),
@@ -8930,6 +9010,12 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=None, cache_dir=None,
         'fit_fp': _text_fp(train_fit_rows),
         'code_semantics': CODE_SEMANTICS,
         'read_purpose': purpose,
+        # Which immutable upstream snapshot (or local raw dump) produced each
+        # split.  The audit recomputes pair consistency instead of trusting the
+        # build-time check.
+        'dataset_source': _test_source,
+        'train_dataset_source': _train_source,
+        'validation_dataset_source': _val_source,
         'tokenizer_file': os.path.basename(tk_path),
         'tokenizer_file_sha256': _tok_sha,
         'tokenizer_vocab_sha256': _tokenizer_vocab_sha256(tok),
@@ -9839,6 +9925,178 @@ def _filter_test_documents(train_rows, val_index, test_rows, *, label='test'):
 TOKENIZER_FIT_TOKENS = 8_000_000
 
 
+# ---- Pinned upstream corpus revisions --------------------------------------
+# A token-content fingerprint binds a run to the bytes it actually saw, but it
+# cannot tell a *fresh build* that the upstream Hub dataset changed under the
+# same configuration.  Two builds of "WikiText-103-raw" from different Hub
+# revisions would then be compared as if they were the same corpus.  Pin the
+# upstream commit (the exact value already backing the frozen wt103_cache) and
+# record it in every cache metadata file; a mismatch is a hard refusal, not a
+# silent rebuild.
+#
+# The environment overrides exist for mirrors/offline copies of the same
+# immutable commit.  They accept a full 40-hex commit only: a branch name or a
+# short prefix can move and is not a reproducible data identity.
+WIKITEXT_HF_REPO = 'Salesforce/wikitext'
+WIKITEXT_HF_REPO_ALIAS = 'wikitext'  # mirror alias of the same repository
+WIKITEXT_HF_CONFIG = 'wikitext-103-raw-v1'
+WIKITEXT_HF_REVISION = 'b08601e04326c79dfdd32d625aee71d232d685c3'
+FINEWEB_EDU_HF_REPO = 'HuggingFaceFW/fineweb-edu'
+FINEWEB_EDU_HF_REVISION = '87f09149ef4734204d70ed1d046ddc9ca3f2b8f9'
+_HF_REVISION_RE = re.compile(r'^[0-9a-f]{40}$')
+
+
+def _pinned_hf_revision(env_name, default, label):
+    """Resolve a full-commit data revision, refusing moving references."""
+    raw = os.environ.get(env_name)
+    rev = (raw if raw not in (None, '') else default)
+    rev = str(rev).strip().lower()
+    if not _HF_REVISION_RE.match(rev):
+        raise ValueError(
+            f'{env_name} must be a full 40-hex commit SHA (got {rev!r}); a '
+            f'branch/tag/short prefix can move and cannot pin the {label} '
+            'corpus for reproducible builds')
+    return rev
+
+
+def wikitext_dataset_source(repo=None):
+    """Machine-readable identity of the WikiText-103 upstream source."""
+    return {
+        'provider': 'huggingface',
+        'repo': str(repo or WIKITEXT_HF_REPO),
+        'config': WIKITEXT_HF_CONFIG,
+        'revision': _pinned_hf_revision(
+            'WT103_DATASET_REVISION', WIKITEXT_HF_REVISION, 'WikiText-103'),
+        'revision_pinned': True,
+    }
+
+
+def fineweb_edu_dataset_source(source='sample-10BT'):
+    """Machine-readable identity of the FineWeb-Edu upstream source."""
+    return {
+        'provider': 'huggingface',
+        'repo': FINEWEB_EDU_HF_REPO,
+        'config': str(source),
+        'revision': _pinned_hf_revision(
+            'FWEDU_DATASET_REVISION', FINEWEB_EDU_HF_REVISION, 'FineWeb-Edu'),
+        'revision_pinned': True,
+    }
+
+
+def local_dataset_source(label, paths=None):
+    """Identity of a local raw/jsonl stand-in (no movable upstream revision)."""
+    rec = {
+        'provider': 'local',
+        'label': str(label),
+        'revision': None,
+        'revision_pinned': False,
+    }
+    if paths:
+        rec['paths'] = sorted({os.path.abspath(os.fspath(p)) for p in paths})
+    return rec
+
+
+def fineweb_cache_source(source='sample-10BT'):
+    """Source record actually used by the FineWeb-Edu loader."""
+    env_value = os.environ.get('FWEDU_LOCAL_JSONL', '')
+    if env_value.strip():
+        return local_dataset_source('fineweb_local_jsonl',
+                                    _fineweb_local_files(env_value))
+    return fineweb_edu_dataset_source(source)
+
+
+def _dataset_source_problems(meta, expected, label):
+    """Return ``(problems, warnings)`` for a cache's dataset provenance.
+
+    A missing record is a legacy-cache warning (old caches must stay readable),
+    while a present-but-wrong record is a hard problem.  A genuine local raw
+    dump is not an error: its content is bound by the token fingerprints, and
+    the warning says the upstream revision could not be attested.
+    """
+    problems, warnings = [], []
+    if not isinstance(meta, dict):
+        return [f'{label}: cache metadata is not an object'], []
+    src = meta.get('dataset_source')
+    if src is None:
+        warnings.append(
+            f'{label}: cache predates the pinned dataset-source record; the '
+            'upstream commit cannot be attested locally (rebuild to record it)')
+        return problems, warnings
+    if not isinstance(src, dict):
+        return [f'{label}: dataset_source is a {type(src).__name__}, not an object'], []
+    provider = src.get('provider')
+    if provider not in ('huggingface', 'local'):
+        problems.append(
+            f'{label}: dataset_source.provider={provider!r} is not one of '
+            '"huggingface"/"local"')
+        return problems, warnings
+    if provider == 'huggingface':
+        rev = src.get('revision')
+        if not isinstance(rev, str) or not _HF_REVISION_RE.match(rev.strip().lower()):
+            problems.append(
+                f'{label}: dataset_source.revision={rev!r} is not a full 40-hex '
+                'commit; the corpus cannot be pinned')
+        if src.get('revision_pinned') is not True:
+            problems.append(
+                f'{label}: dataset_source claims the Hub but does not attest '
+                'revision_pinned=true')
+        if expected is not None and expected.get('provider') == 'huggingface':
+            want = expected.get('revision')
+            if isinstance(rev, str) and want and rev.strip().lower() != want:
+                problems.append(
+                    f'{label}: cached corpus revision {rev[:12]}… differs from '
+                    f'the pinned {want[:12]}… — rebuild the cache from the '
+                    'pinned commit (or set the documented WT103_DATASET_REVISION/'
+                    'FWEDU_DATASET_REVISION override deliberately)')
+    else:
+        warnings.append(
+            f'{label}: cache was built from a local raw dump; content is bound '
+            'by the token fingerprints, but the upstream commit is not attested')
+    return problems, warnings
+
+
+def dataset_source_pair_problems(test_meta, train_metas, label='test'):
+    """Check that a test cache and its paired train caches share one upstream source."""
+    problems, warnings = [], []
+    ts = test_meta.get('dataset_source') if isinstance(test_meta, dict) else None
+    if not isinstance(ts, dict):
+        warnings.append(
+            f'{label}: test cache has no dataset_source record; the upstream '
+            'revision cannot be compared with the train caches')
+        return problems, warnings
+    trev = ts.get('revision') if ts.get('provider') == 'huggingface' else None
+    seen = set()
+    for _m in train_metas or []:
+        if not isinstance(_m, dict):
+            continue
+        s = _m.get('dataset_source')
+        if not isinstance(s, dict):
+            warnings.append(
+                f'{label}: a paired train cache has no dataset_source record; '
+                'the upstream revision cannot be compared')
+            continue
+        if s.get('provider') == 'huggingface' and s.get('revision'):
+            seen.add(str(s['revision']).strip().lower())
+    if trev and seen and seen != {str(trev).strip().lower()}:
+        problems.append(
+            f'{label}: test corpus revision {str(trev)[:12]}… does not match the '
+            f'paired train revision(s) {sorted(r[:12] for r in seen)} — the '
+            'split cannot be described as one upstream snapshot')
+    return problems, warnings
+
+
+_DATA_SOURCE_WARNED = set()
+
+
+def _warn_dataset_source(label, warnings):
+    for w in warnings or []:
+        if w in _DATA_SOURCE_WARNED:
+            continue
+        _DATA_SOURCE_WARNED.add(w)
+        print(f'[data] NOTE: {w}')
+
+
+
 def _wikitext_fit_rows(rows, vocab_size, token_cap, max_rows=50000):
     """Select a deterministic train-prefix fit corpus within ``token_cap``.
 
@@ -9913,15 +10171,19 @@ def _fineweb_local_rows(env_value):
 def _fineweb_rows(source):
     """Ordered, non-empty FineWeb-Edu documents (streaming; deterministic row
     order per dataset revision).  The token cache plus its content fingerprint
-    is what actually binds a panel to its corpus, so a hub-side revision change
-    rebuilds a different, non-confusable corpus (different src_fp -> different
-    run_cfg -> stale records are dropped, never silently reused)."""
+    binds a panel to the corpus.  The Hub commit is also pinned
+    (`fineweb_edu_dataset_source`) and passed to `load_dataset`, so a fresh
+    build cannot silently stream a newer snapshot than the one recorded in the
+    cache metadata.  A src_fp mismatch would still drop stale records, but the
+    pin makes the change visible *before* the cache is rebuilt."""
     env_value = os.environ.get('FWEDU_LOCAL_JSONL', '')
     if env_value.strip():
         yield from _fineweb_local_rows(env_value)
         return
     from datasets import load_dataset
-    ds = load_dataset('HuggingFaceFW/fineweb-edu', name=source, split='train', streaming=True)
+    _rev = fineweb_edu_dataset_source(source)['revision']
+    ds = load_dataset(FINEWEB_EDU_HF_REPO, name=source, split='train',
+                      streaming=True, revision=_rev)
     n_docs = 0
     for rec in ds:
         text = rec.get('text') if isinstance(rec, dict) else None
@@ -9980,6 +10242,7 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=None, val_seqs=512,
     _local_env = os.environ.get('FWEDU_LOCAL_JSONL', '').strip()
     _local_tag = f'_loc{hashlib.sha1(_local_env.encode("utf-8")).hexdigest()[:8]}' if _local_env else ''
     _local_sig = _fineweb_local_source_fingerprint(_local_env) if _local_env else None
+    _fw_source = fineweb_cache_source(source)
     tag = f'v2_sl{seq_len}_cap{n_train_tokens}_v{vocab_size}_vs{val_seqs}_fw{source}_fd{fit_docs}{_local_tag}'
     tr_path = os.path.join(cache_dir, f'train_ids_{tag}.npy')
     va_path = os.path.join(cache_dir, f'val_batch_{tag}.npy')
@@ -10026,6 +10289,10 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=None, val_seqs=512,
                                                ranges_trusted=_fast)
             _problems.extend(_tokenizer_file_problems(
                 meta, tk_path, 'FineWeb train/validation tokenizer'))
+            _src_problems, _src_warnings = _dataset_source_problems(
+                meta, _fw_source, 'FineWeb train/validation')
+            _problems.extend(_src_problems)
+            _warn_dataset_source('FineWeb train/validation', _src_warnings)
             try:
                 _trd = np.load(trd_path)
                 _vad = np.load(vad_path)
@@ -10344,6 +10611,7 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=None, val_seqs=512,
                 **{'simhash_'+k: v for k, v in _dedup.stats().items() if k.startswith('near_') or k == 'policy'},
             },
             'local_source_sig': _local_sig,
+            'dataset_source': _fw_source,
             'source': source,
             'fit_docs': fit_docs,
             'disk_dtype': np.dtype(disk_dt).str,
@@ -28920,6 +29188,24 @@ def experiment_provenance(cfg, *, train_ids=None, val_batch=None, vocab=None):
         # Synthetic/task-specific generators (NIAH recipe, corruption modes)
         # must be part of the data identity, not only the human note.
         data['data_extra'] = _jsonable(_extra)
+    # Record the source the loader is PINNED to.  The cache metadata records
+    # what the bytes were actually built from; this field makes the intent
+    # visible in every run/checkpoint record, and `audit_gates data_source`
+    # checks the two against each other.  It is deliberately not added to
+    # `_data_version` (the content fingerprints already bind the bytes).
+    try:
+        if data['dataset'] == 'wikitext':
+            data['configured_dataset_source'] = wikitext_dataset_source()
+        elif data['dataset'] == 'fineweb':
+            data['configured_dataset_source'] = fineweb_cache_source(
+                data.get('source') or 'sample-10BT')
+    except ValueError:
+        raise
+    except Exception as _dse:
+        data['configured_dataset_source'] = {
+            'status': 'unresolved',
+            'error': f'{type(_dse).__name__}: {_dse}',
+        }
     # Compute the composite fingerprint AFTER data_extra is present:
     # `_corpus_fp_from_data` deliberately includes that key, so computing it
     # first made two distinct task/corruption corpora carry the same corpus_fp

@@ -17,6 +17,7 @@ htmlcov/
 *.egg-info/
 dist/
 build/
+.build/
 
 # Jupyter
 .ipynb_checkpoints/

@@ -6,7 +6,16 @@ build-backend = "setuptools.build_meta"
 name = "dyn-csa-experiment"
 version = "0.0.0"
 description = "Controlled WikiText-103 study of compressed-block sparse attention"
+readme = "README.md"
+license = { text = "MIT" }
 requires-python = ">=3.12"
+keywords = ["sparse-attention", "reproducibility", "language-modeling", "wikitext-103"]
+classifiers = [
+  "Programming Language :: Python :: 3.12",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
   "torch>=2.8,<3",
   "numpy>=2.0,<3",
@@ -14,6 +23,42 @@ dependencies = [
   "datasets>=3.0,<6",
   "matplotlib>=3.8,<4",
 ]
+
+[project.optional-dependencies]
+# Packaging/check tooling only; the runtime closure is requirements.lock.
+dev = ["build>=1.2,<2"]
+
+# This is a flat, script-oriented research repository (modules are executed as
+# `python v12_supp.py ...`, not imported from a package).  Setuptools'
+# automatic discovery walks result/cache directories and fails with "Multiple
+# top-level packages discovered"; declare the measurement modules explicitly so
+# `pip install .` / `python -m build` remain a supported reproducibility check.
+# test_review_fixes.py and test_open_block.py stay source-only test entry
+# points.  The unit test `t_project_packaging_is_complete` fails if a new
+# top-level module is added without being listed here.
+[tool.setuptools]
+py-modules = [
+  "archive_release",
+  "audit_gates",
+  "baseline_tune",
+  "build_report",
+  "csa_kernels",
+  "data_guard",
+  "error_analysis",
+  "exp_lib",
+  "fuse_analysis",
+  "m0_supp",
+  "open_block_supp",
+  "par",
+  "run_gapfill",
+  "v7_supp",
+  "v8_supp",
+  "v9_supp",
+  "v10_supp",
+  "v11_supp",
+  "v12_supp",
+]
+include-package-data = false
 
 [tool.pytest.ini_options]
 testpaths = ["."]
