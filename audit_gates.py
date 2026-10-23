@@ -3240,6 +3240,23 @@ def audit_sesoi_declaration(spec=None, design=None):
         print(json.dumps(out, ensure_ascii=False, indent=2))
         return out
     for comp, contrasts in design.items():
+        if not isinstance(comp, str) or not comp.strip():
+            out['problems'].append(
+                f'ablation component name {comp!r} is not a non-empty string')
+            continue
+        if not isinstance(contrasts, (list, tuple)):
+            out['problems'].append(
+                f'{comp}: declared contrasts must be a list/tuple, got '
+                f'{type(contrasts).__name__}')
+            continue
+        bad_contrasts = [i for i, c in enumerate(contrasts)
+                         if not (isinstance(c, (tuple, list)) and len(c) == 3
+                                 and all(isinstance(x, str) and x.strip()
+                                         for x in c[:2]))]
+        if bad_contrasts:
+            out['problems'].append(
+                f'{comp}: malformed contrast declaration(s) at index '
+                f'{bad_contrasts[:5]} (expected (with_arm, without_arm, note))')
         rec = {'declared': comp in norm, 'n_contrasts': len(contrasts)}
         if comp not in norm:
             out['problems'].append(f'{comp}: no pre-registered SESOI margin; '
@@ -3250,10 +3267,10 @@ def audit_sesoi_declaration(spec=None, design=None):
             rec['probe_margin_ppl_at_baseline_50'] = margin
             if margin is None:
                 out['problems'].append(f'{comp}: margin cannot be translated to PPL ({why})')
-            if not norm[comp].get('rationale'):
+            if not str(norm[comp].get('rationale') or '').strip():
                 out['warnings'].append(f'{comp}: margin has no recorded rationale')
         out['components'][comp] = rec
-    extras = sorted(set(norm) - set(design))
+    extras = sorted(set(norm) - set(design), key=str)
     if extras:
         out['warnings'].append('SESOI declares component(s) not present in the '
                                'ablation design: ' + ', '.join(extras))

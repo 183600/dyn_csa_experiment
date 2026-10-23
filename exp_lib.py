@@ -14491,6 +14491,36 @@ def _practical_decision_from_stats(stats, tost, *, margin, direction, alpha, min
     alpha.  A significant effect smaller than the margin is explicitly
     ``sub_sesoi`` — detectable, but too small to support a practical claim.
     """
+    if not isinstance(stats, dict):
+        raise ValueError(
+            f'stats must be a mapping, got {type(stats).__name__}')
+    alpha = _validated_alpha(alpha, context='_practical_decision_from_stats alpha')
+    _min_n = _as_seed_int(min_n)
+    if _min_n is None or _min_n < 0:
+        raise ValueError(
+            f'min_n must be a non-negative integer, got {min_n!r}')
+    min_n = _min_n
+    _direction = _as_seed_int(direction)
+    if _direction is None or _direction not in (-1, 0, 1):
+        raise ValueError(
+            f'direction must be -1, 0 or +1, got {direction!r}')
+    direction = _direction
+    if isinstance(margin, (bool, np.bool_)):
+        raise ValueError(f'margin must be a positive real number, got {margin!r}')
+    try:
+        margin = float(margin)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(
+            f'margin must be a positive real number, got {margin!r}') from None
+    if not math.isfinite(margin) or margin <= 0.0:
+        raise ValueError(f'margin must be finite and >0, got {margin!r}')
+    _tost = tost if isinstance(tost, dict) else {}
+    _sig_raw = stats.get('significant')
+    sig = (bool(_sig_raw) if isinstance(_sig_raw, (bool, np.bool_))
+           else False)
+    _tost_eq_raw = _tost.get('equivalent')
+    _tost_equiv = (bool(_tost_eq_raw)
+                   if isinstance(_tost_eq_raw, (bool, np.bool_)) else False)
     n = _as_seed_int(stats.get('n'))
     n = 0 if n is None or n < 0 else n
     mean = _finite_scalar(stats.get('mean'))
@@ -14500,12 +14530,12 @@ def _practical_decision_from_stats(stats, tost, *, margin, direction, alpha, min
         'p_floor': stats.get('p_floor'), 'n_nonzero': stats.get('n_nonzero'),
         'p_floor_scope': 'exact sign-flip superiority test (not TOST)',
         'alpha': float(alpha), 'min_n': int(min_n), 'direction': int(direction),
-        'tost_p_tost': (tost or {}).get('p_tost'),
+        'tost_p_tost': _tost.get('p_tost'),
         'tost_p_holm': p_holm_tost,
-        'tost_ci': (tost or {}).get('ci'),
-        'tost_equivalent': bool((tost or {}).get('equivalent')),
+        'tost_ci': _tost.get('ci'),
+        'tost_equivalent': _tost_equiv,
         'decision': 'indeterminate', 'claim': 'inconclusive', 'reason': '',
-        'statistically_significant': bool(stats.get('significant')),
+        'statistically_significant': sig,
         'seed_driven': stats.get('seed_driven'),
         'practical_significant': False,
     }
@@ -14519,7 +14549,6 @@ def _practical_decision_from_stats(stats, tost, *, margin, direction, alpha, min
         out['claim'] = 'underpowered'
         out['reason'] = f'n={n} < min_n={int(min_n)}; neither a difference nor equivalence is decidable'
         return out
-    sig = bool(stats.get('significant'))
     abs_mean = abs(float(mean))
     if sig:
         if abs_mean <= float(margin):
@@ -14570,7 +14599,7 @@ def _practical_decision_from_stats(stats, tost, *, margin, direction, alpha, min
                              'equivalence cannot be certified')
             return out
     _holm_ok = (_ph is None) or (_ph < float(alpha))
-    if bool((tost or {}).get('equivalent')) and _holm_ok:
+    if _tost_equiv and _holm_ok:
         out['decision'] = 'equivalent'
         out['claim'] = 'module_removable_within_sesoi'
         out['reason'] = ('the TOST interval lies inside ±SESOI and the (Holm-adjusted) '
@@ -14614,17 +14643,23 @@ def ablation_practical_decision(deltas, *, margin=None, sesoi=None, baseline_ppl
     if _min_n is None or _min_n < 0:
         raise ValueError(f'min_n must be a non-negative integer, got {min_n!r}')
     min_n = _min_n
-    if isinstance(direction, (bool, np.bool_)):
+    # Materialise a one-pass iterable exactly once: the same sample feeds the
+    # superiority test and the TOST.  Passing a generator straight through
+    # would leave the second call with an exhausted iterator (n=0), silently
+    # turning a real equivalence result into `not_declared`.
+    if deltas is None:
+        deltas = []
+    elif not isinstance(deltas, (list, tuple, np.ndarray)):
+        deltas = list(deltas)
+    # Direction is a categorical sign, not a count: int(1.5) == 1 would
+    # silently accept a malformed declaration as a one-sided claim.
+    _direction = _as_seed_int(direction)
+    if _direction is None or _direction not in (-1, 0, 1):
         raise ValueError(f'direction must be -1, 0 or +1, got {direction!r}')
-    try:
-        direction = int(direction)
-    except (TypeError, ValueError, OverflowError):
-        raise ValueError(f'direction must be -1, 0 or +1, got {direction!r}') from None
-    if direction not in (-1, 0, 1):
-        raise ValueError(f'direction must be -1, 0 or +1, got {direction!r}')
+    direction = _direction
     stats = paired_effect_stats(deltas, alpha=alpha, min_n=min_n)
     if margin is None:
-        if sesoi is None:
+        if sesoi is None or (isinstance(sesoi, dict) and not sesoi):
             return {'n': int(stats.get('n') or 0), 'mean': stats.get('mean'),
                     'margin': None, 'margin_ppl': None, 'decision': 'not_declared',
                     'claim': 'not_declared',
@@ -26829,6 +26864,28 @@ def _compute_control_detail(recs, a, b, *, tolerance=0.25):
                        f'({out["compute_matched_source"]}); this is NOT an equal-compute comparison')
     return out
 
+def _family_size_with_missing(design_group, entries_by_comp):
+    """Declared family size, counting unmeasured contrasts as p=1 slots.
+
+    ``len(entries) + missing declarations`` is not ``max(n_declared, n_entries)``
+    when one contrast is measured under several protocol tags and a *different*
+    declared contrast is missing: the extra tags would otherwise fill the
+    missing contrast's slot and shrink the correction family.  This helper is
+    the single place that accounting is defined.
+    """
+    total_entries = 0
+    missing = 0
+    for comp, contrasts in (design_group or {}).items():
+        entries = (entries_by_comp or {}).get(comp) or []
+        total_entries += len(entries)
+        measured_pairs = {(e.get('with'), e.get('without')) for e in entries}
+        for c in (contrasts or ()):
+            if (not isinstance(c, (tuple, list)) or len(c) < 2
+                    or (c[0], c[1]) not in measured_pairs):
+                missing += 1
+    return int(total_entries + missing)
+
+
 def _holm_assign(entries, m_family, alpha, out_key):
     """Attach a Holm step-down adjusted p to each entry over the declared
     family.  `m_family` is the DECLARED number of contrasts, not just the ones
@@ -26863,7 +26920,7 @@ def _sign_of(x):
     return 0
 
 def _classify_group_status(entries, *, min_n, alpha, m_family, require_param_match=False,
-                           n_declared=None):
+                           n_declared=None, declared_pairs=None):
     """One status per declared innovation / baseline claim.
 
     verified            — a controlled, capacity-controlled (total plus the
@@ -26940,13 +26997,21 @@ def _classify_group_status(entries, *, min_n, alpha, m_family, require_param_mat
         # pre-registered SESOI, or be dominated by one seed.  `verified`
         # requires the *practical* verdict `superior` whenever a SESOI was
         # declared; without a declared margin the historical behaviour is kept.
+        #
+        # Include declared-but-untranslatable margins (`margin_ppl is None`,
+        # decision `not_declared`) in this gate.  Treating them as "no SESOI"
+        # would let a malformed/zero-baseline margin silently restore the
+        # statistical-only `verified` verdict, which is exactly the fail-open
+        # path the declaration gate is meant to prevent.
         _prac = [e for e in sig
-                 if (e.get('sesoi') or {}).get('margin_ppl') is not None]
-        # Only tighten when EVERY significant contrast has a declared margin;
+                 if (e.get('sesoi') or {}).get('declared')]
+        # Only tighten when EVERY significant contrast has a SESOI declaration;
         # a mixed custom design keeps the historical statistical-only verdict
         # rather than gating on an arbitrary subset.
         if _prac and len(_prac) == len(sig):
             _dec = [e.get('practical_decision') for e in _prac]
+            if any(d in (None, 'not_declared') for d in _dec):
+                return 'practically_indeterminate'
             if _dec and all(d == 'sub_sesoi' for d in _dec):
                 return 'sub_sesoi'
             if any(d == 'inferior' for d in _dec):
@@ -26959,9 +27024,23 @@ def _classify_group_status(entries, *, min_n, alpha, m_family, require_param_mat
     # "The component is removable" is a component-level claim: it needs the
     # whole declared ablation, not one convenient contrast.  Equivalence on a
     # partial panel stays descriptive instead of becoming `equivalent`.
-    _all_declared_measured = (n_declared is None or len(usable) >= int(n_declared))
+    #
+    # Count DISTINCT (with, without) pairs, not entries: a contrast measured
+    # under two protocol tags has two entries, and an entry-count check could
+    # then hide a missing second contrast.  Underpowered pairs are excluded
+    # from `powered`, so a component with one n=8 equivalent contrast and one
+    # n=2 contrast can no longer certify the whole component as removable.
+    _powered_pairs = {(e.get('with'), e.get('without')) for e in powered}
+    if declared_pairs is not None:
+        _declared_pairs = set(declared_pairs)
+        _all_declared_powered = bool(_declared_pairs) and _declared_pairs.issubset(
+            _powered_pairs)
+    elif n_declared is None:
+        _all_declared_powered = True
+    else:
+        _all_declared_powered = len(_powered_pairs) >= int(n_declared)
     if (_sesoi_powered and len(_sesoi_powered) == len(powered)
-            and _all_declared_measured
+            and _all_declared_powered
             and all(e.get('practical_decision') == 'equivalent'
                     for e in _sesoi_powered)):
         return 'equivalent'
@@ -26995,11 +27074,25 @@ def _apply_sesoi_holm(component_entries, component_design, baseline_entries,
               ('baseline', baseline_entries, baseline_design))
     named, by_name = [], {}
     declared = 0
+    missing_declared = 0
     for kind, entries_by_comp, design_group in groups:
         for comp, contrasts in (design_group or {}).items():
             if comp not in specs:
                 continue
-            declared += len(contrasts)
+            try:
+                _contrast_list = list(contrasts or ())
+            except TypeError:
+                _contrast_list = []
+            declared += len(_contrast_list)
+            _declared_pairs = []
+            for _c in _contrast_list:
+                if isinstance(_c, (tuple, list)) and len(_c) >= 2:
+                    _declared_pairs.append((_c[0], _c[1]))
+                else:
+                    # A structural defect must still occupy a family slot
+                    # (fail closed); it can never be silently dropped.
+                    _declared_pairs.append(None)
+            _measured_pairs = set()
             for j, e in enumerate((entries_by_comp or {}).get(comp) or []):
                 s = e.get('sesoi') or {}
                 if s.get('margin_ppl') is None:
@@ -27007,11 +27100,24 @@ def _apply_sesoi_holm(component_entries, component_design, baseline_entries,
                 name = f'{kind}::{comp}::{j}'
                 named.append((name, s.get('tost_p_tost')))
                 by_name[name] = e
+                _measured_pairs.add((e.get('with'), e.get('without')))
+            # Every declared contrast that produced no TOST gets a dummy p=1
+            # slot.  The count is per DECLARATION, not per entry: one
+            # contrast measured under two protocol tags must not consume the
+            # slot of a different, entirely unmeasured contrast.
+            missing_declared += sum(
+                1 for _p in _declared_pairs
+                if _p is None or _p not in _measured_pairs)
     if not named:
-        return {'m': 0, 'declared_contrasts': int(declared), 'n_measured': 0,
+        # No TOST is available, but the declared family size is still real:
+        # reporting m=0 would falsely suggest that a partial panel has no
+        # correction burden.
+        m = max(int(declared), int(missing_declared))
+        return {'m': int(m), 'declared_contrasts': int(declared), 'n_measured': 0,
                 'min_attainable_p_holm': None,
-                'note': 'no measured contrast carries a pre-registered SESOI'}
-    m = max(int(declared), len(named))
+                'note': ('no measured contrast carries a pre-registered SESOI; '
+                         'declared contrasts keep their p=1 family slots')}
+    m = int(len(named) + missing_declared)
     padded = list(named)
     padded.extend((f'__sesoi_declared_missing_{i}', 1.0)
                   for i in range(m - len(named)))
@@ -27037,12 +27143,23 @@ def _apply_sesoi_holm(component_entries, component_design, baseline_entries,
             'equivalent': s.get('tost_equivalent'),
             'ci': s.get('tost_ci'),
         }
+        _min_for_pd = _as_seed_int(s.get('min_n'))
+        if _min_for_pd is None:
+            _min_for_pd = min_n
+        _dir_for_pd = _as_seed_int(s.get('direction', -1))
+        if _dir_for_pd not in (-1, 0, 1):
+            _dir_for_pd = -1
         new = _practical_decision_from_stats(
-            stats2, tost2, margin=float(s['margin']),
-            direction=int(s.get('direction', -1)), alpha=alpha,
-            min_n=int(s.get('min_n', min_n)), p_holm_tost=ph)
+            stats2, tost2, margin=s['margin'],
+            direction=_dir_for_pd, alpha=alpha,
+            min_n=_min_for_pd, p_holm_tost=ph)
         new['declared'] = True
         new['source'] = s.get('source')
+        # Preserve the descriptive fields from the per-contrast decision; the
+        # refreshed dict is the same object's replacement, not a lossy cast.
+        for _k in ('label', 'baseline_ppl', 'relative_margin_pct'):
+            if _k in s:
+                new[_k] = s[_k]
         new['p_floor'] = s.get('p_floor')
         new['p_floor_scope'] = s.get('p_floor_scope')
         new['n_nonzero'] = s.get('n_nonzero')
@@ -27891,7 +28008,14 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
             report['arms_below_min_seeds'].append(_key)
     declared_m = sum(len(v) for v in _scoped_design.values()) + sum(len(v) for v in _scoped_baselines.values())
     all_entries = [e for group in (comp_entries, base_entries) for entries in group.values() for e in entries]
-    m_family = max(declared_m, len(all_entries))
+    # Count each measured entry as one family member AND add a dummy slot for
+    # every declared contrast that has no entry at all.  `max(declared, entries)`
+    # undercounts when one contrast has several protocol entries while another
+    # declared contrast is missing; extra tags must not fill the missing slot.
+    _family_with_missing = (
+        _family_size_with_missing(_scoped_design, comp_entries)
+        + _family_size_with_missing(_scoped_baselines, base_entries))
+    m_family = max(declared_m, len(all_entries), _family_with_missing)
     _holm_assign(all_entries, m_family, alpha, 'p_holm_global')
     _holm_assign(all_entries, m_family, alpha, 'p_holm_family')
     for e in all_entries:
@@ -27924,14 +28048,18 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
             entries = entries_by_comp.get(comp, [])
             # Per-component Holm: the family is this innovation's own declared
             # contrasts ("is THIS module useful?").
-            m_comp = max(len(contrasts), len(entries))
+            m_comp = max(
+                len(contrasts),
+                _family_size_with_missing({comp: contrasts}, {comp: entries}))
             _holm_assign(entries, m_comp, alpha, 'p_holm_component')
             for e in entries:
                 _phc = e.get('p_holm_component')
                 e['significant_component'] = bool(_phc is not None and float(_phc) < alpha and (not e.get('within_seed_noise')) and e.get('controlled'))
-            status = _classify_group_status(entries, min_n=min_n, alpha=alpha, m_family=m_family,
-                                            require_param_match=require_param_match,
-                                            n_declared=len(contrasts))
+            status = _classify_group_status(
+                entries, min_n=min_n, alpha=alpha, m_family=m_family,
+                require_param_match=require_param_match,
+                n_declared=len(contrasts),
+                declared_pairs=[(a, b) for a, b, _n in contrasts])
             lists[status].append(comp)
             if status == 'verified':
                 # `verified` is the corrected-significance tier; keep the
@@ -28008,24 +28136,40 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
     _sesoi_lists = {'useful': [], 'equivalent': [], 'sub_sesoi': [],
                     'harmful': [], 'inconclusive': [], 'not_measured': [],
                     'not_declared': []}
+    _present_arms = set(present)
     for _group in ('components', 'baselines'):
         for _comp, _entries in (report.get(_group) or {}).items():
             if _comp not in _sesoi_specs:
                 continue
-            _measured = [e for e in _entries
-                         if (e.get('sesoi') or {}).get('margin_ppl') is not None]
-            _dec = [e.get('practical_decision') for e in _measured]
+            # Include entries whose declared margin could not be translated
+            # (`not_declared`): they are a design defect, not "not measured".
+            _declared_entries = [e for e in _entries
+                                 if (e.get('sesoi') or {}).get('declared')]
+            _dec = [e.get('practical_decision') for e in _declared_entries]
+            _design_contrasts = ((design if _group == 'components' else baselines)
+                                 or {}).get(_comp) or []
+            _declared_pairs = []
+            for _c in _design_contrasts:
+                if isinstance(_c, (tuple, list)) and len(_c) >= 2:
+                    _declared_pairs.append((_c[0], _c[1]))
+            _powered_pairs = {
+                (e.get('with'), e.get('without')) for e in _entries
+                if e.get('controlled')
+                and (_as_seed_int(e.get('n')) or 0) >= int(min_n)}
+            _all_declared_powered = (bool(_declared_pairs)
+                                     and set(_declared_pairs).issubset(_powered_pairs))
             if _group == 'components':
                 _comp_complete = bool(
                     (((report.get('ablation_completeness') or {}).get('components')
                       or {}).get(_comp) or {}).get('complete'))
             else:
                 # The completeness audit is component-oriented; for a declared
-                # baseline contrast require every declared baseline pair to be
-                # measured before calling it removable.
-                _n_decl = len((baselines or {}).get(_comp) or [])
-                _comp_complete = bool(_n_decl and len(_measured) >= _n_decl)
-            if not _measured:
+                # baseline contrast require every declared baseline pair's arms
+                # to be present before calling it removable.
+                _comp_complete = bool(_declared_pairs) and all(
+                    _a in _present_arms and _b in _present_arms
+                    for _a, _b in _declared_pairs)
+            if not _declared_entries:
                 _status = 'not_measured'
             elif any(d == 'not_declared' for d in _dec):
                 _status = 'not_declared'
@@ -28034,7 +28178,7 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
             elif any(d == 'superior' for d in _dec):
                 _status = 'useful'
             elif (_dec and all(d == 'equivalent' for d in _dec)
-                  and _comp_complete):
+                  and _comp_complete and _all_declared_powered):
                 _status = 'equivalent'
             elif _dec and all(d in ('sub_sesoi', 'equivalent') for d in _dec) \
                     and any(d == 'sub_sesoi' for d in _dec):
@@ -28047,6 +28191,7 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                 'margin_spec': _sesoi_specs[_comp],
                 'status': _status,
                 'ablation_complete': _comp_complete,
+                'all_declared_contrasts_powered': bool(_all_declared_powered),
                 'decisions': [{
                     'with': e.get('with'), 'without': e.get('without'),
                     'n': (e.get('sesoi') or {}).get('n'),
@@ -28058,34 +28203,39 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                     'p_tost_holm': (e.get('sesoi') or {}).get('tost_p_holm'),
                     'ci_tost': (e.get('sesoi') or {}).get('tost_ci'),
                     'reason': (e.get('sesoi') or {}).get('reason'),
-                } for e in _measured],
+                } for e in _declared_entries],
             }
             if (_dec and all(d == 'equivalent' for d in _dec)
-                    and not _comp_complete):
+                    and not (_comp_complete and _all_declared_powered)):
                 report['warnings'].append(
                     '%s: the measured contrast(es) are TOST-equivalent, but the '
-                    'declared ablation is INCOMPLETE — equivalence on a partial '
-                    'panel is descriptive only and cannot support "remove the '
+                    'declared ablation is INCOMPLETE or has a missing/'
+                    'underpowered contrast — equivalence on that partial panel '
+                    'is descriptive only and cannot support "remove the '
                     'component"' % _comp)
-            if _status == 'useful' and not _comp_complete:
+            if _status == 'useful' and not (_comp_complete and _all_declared_powered):
                 report['warnings'].append(
                     '%s: at least one contrast is practically useful, but the '
-                    'declared ablation is INCOMPLETE — report this as a '
-                    'contrast-level result, not as "the component is useful" '
-                    'for the whole innovation' % _comp)
+                    'declared ablation is INCOMPLETE or has a missing/'
+                    'underpowered contrast — report this as a contrast-level '
+                    'result, not as "the component is useful" for the whole '
+                    'innovation' % _comp)
+            _spec = _sesoi_specs[_comp]
+            _margin_desc = (
+                '%.2f%% of the without-arm PPL' % float(_spec['relative_pct'])
+                if _spec.get('relative_pct') is not None
+                else '%.4g PPL (absolute)' % float(_spec['absolute_ppl']))
             if _status == 'sub_sesoi':
                 report['warnings'].append(
                     '%s: the effect is statistically detectable but smaller than the '
-                    'pre-registered SESOI (%.2f%% of the without-arm PPL); do not '
-                    'quote it as a practically useful module contribution'
-                    % (_comp, float(_sesoi_specs[_comp].get('relative_pct') or 0.0)))
+                    'pre-registered SESOI (%s); do not quote it as a practically '
+                    'useful module contribution' % (_comp, _margin_desc))
             elif _status == 'equivalent':
                 report['warnings'].append(
                     '%s: TOST places the ablation effect inside the pre-registered '
-                    'SESOI (%.2f%% of the without-arm PPL) after family adjustment — '
-                    'this is positive evidence of practical removability, not a '
-                    'non-significant null'
-                    % (_comp, float(_sesoi_specs[_comp].get('relative_pct') or 0.0)))
+                    'SESOI (%s) after family adjustment — this is positive evidence '
+                    'of practical removability, not a non-significant null'
+                    % (_comp, _margin_desc))
             elif _status == 'harmful':
                 report['warnings'].append(
                     '%s: the module-removal contrast is significant and practically '
@@ -28882,9 +29032,14 @@ def _print_methodology_audit(report):
             print('        %s | %s' % (_c, e['effect_vs_noise']))
             _pe = e.get('sesoi') or {}
             if _pe.get('margin_ppl') is not None:
-                print('        practical: %s (|Δ|=%.4f, margin=%.4f PPL; TOST p=%.4g, Holm p=%s) — %s'
+                # `0.0 or nan` would turn an exact zero TOST p into "nan";
+                # test for None instead of truthiness.
+                _tost_p = _pe.get('tost_p_tost')
+                _tost_s = ('%.4g' % float(_tost_p)
+                           if _tost_p is not None else 'n/a')
+                print('        practical: %s (|Δ|=%.4f, margin=%.4f PPL; TOST p=%s, Holm p=%s) — %s'
                       % (e.get('practical_decision'), abs(float(_pe.get('mean') or 0.0)),
-                         float(_pe['margin_ppl']), float(_pe.get('tost_p_tost') or float('nan')),
+                         float(_pe['margin_ppl']), _tost_s,
                          ('%.4g' % float(_pe['tost_p_holm']))
                          if _pe.get('tost_p_holm') is not None else 'n/a',
                          _pe.get('reason') or ''))

@@ -20305,6 +20305,102 @@ def t_sesoi_declaration_gate():
     assert any('not present in the ablation design' in w for w in out['warnings']), out
 
 
+def t_sesoi_partial_panel_and_input_guards():
+    # Component-level equivalence needs EVERY declared contrast to be powered.
+    # One n=8 equivalent contrast must not certify a component whose second
+    # declared contrast is only n=2 (underpowered).
+    eq = {'with': 'a', 'without': 'b', 'controlled': True, 'n': 8,
+          'significant_global': False, 'within_seed_noise': False,
+          'sesoi': {'margin_ppl': 0.5, 'declared': True},
+          'practical_decision': 'equivalent'}
+    weak = {'with': 'a', 'without': 'c', 'controlled': True, 'n': 2,
+            'significant_global': False, 'within_seed_noise': False,
+            'sesoi': {'margin_ppl': 0.5, 'declared': True},
+            'practical_decision': 'underpowered'}
+    assert L._classify_group_status([eq, weak], min_n=3, alpha=0.05,
+                                    m_family=2, n_declared=2) != 'equivalent'
+    # Two protocol entries for ONE pair cannot stand in for a missing second
+    # declared contrast; distinct pairs, not entry count, define coverage.
+    dup = dict(eq)
+    assert L._classify_group_status([eq, dup], min_n=3, alpha=0.05,
+                                    m_family=2, n_declared=2) != 'equivalent'
+    # The explicit declaration path is strict even if one pair has two entries.
+    assert L._classify_group_status(
+        [eq, dup], min_n=3, alpha=0.05, m_family=2, n_declared=2,
+        declared_pairs=[('a', 'b'), ('a', 'c')]) != 'equivalent'
+    # No measured contrast still leaves the declared family slots visible.
+    fam = L._apply_sesoi_holm(
+        {'c': []}, {'c': [('a', 'b', 'x')]}, {}, {},
+        {'c': {'relative_pct': 1.0}}, alpha=0.05, min_n=3)
+    assert fam['m'] == 1 and fam['declared_contrasts'] == 1, fam
+    # At scale a contrast can carry several protocol tags.  Those extra
+    # measured entries must not fill the p=1 slot of a DIFFERENT, missing
+    # declared contrast: m = 2 measured tags + 1 missing declaration = 3.
+    fp = ('steps1_sl8_bs1_nt10_lr0.0003_wd0.1_d8_L1_H1_Dh8_v16_wu1_'
+          'cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee1_es1_'
+          'detcpu-eager_dfabc_csX')
+    knobs = L.training_knobs()
+    multi = {}
+    for i in range(3):
+        for tag in ('p1', 'p2'):
+            multi[f'csa_dynamic::{tag}::seed{i}'] = dict(
+                variant='csa_dynamic', seed=i, protocol=tag, run_cfg=fp,
+                steps=1, tokens_seen=1, ppl=50.0, params=100,
+                train_knobs=knobs)
+            multi[f'csa_fixed::{tag}::seed{i}'] = dict(
+                variant='csa_fixed', seed=i, protocol=tag, run_cfg=fp,
+                steps=1, tokens_seen=1, ppl=50.0, params=100,
+                train_knobs=knobs)
+    design = {'dynamic_blocking': [
+        ('csa_dynamic', 'csa_fixed', 'x'),
+        ('csa_dynamic', 'csa_fixed_missing', 'y')]}
+    mr = L.methodology_audit(multi, design=design, baselines={}, verbose=False)
+    assert mr['family']['effective_m'] == 3, mr['family']
+    assert mr['sesoi']['family']['m'] == 3, mr['sesoi']['family']
+    assert 'dynamic_blocking' not in mr['equivalent_components'], mr
+    # A one-pass iterable must feed both the superiority and TOST tests.
+    r = L.ablation_practical_decision(
+        iter([0.01, -0.01, 0.0, 0.01, -0.01, 0.0]), margin=0.5)
+    assert r['decision'] == 'equivalent' and r['n'] == 6, r
+    # Direction is a sign, not a number to truncate.
+    for bad in (1.5, -0.5, float('nan'), True):
+        try:
+            L.ablation_practical_decision([0.1, 0.2, 0.3], margin=0.1,
+                                          direction=bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'fractional/bool direction accepted: {bad!r}')
+    # An empty SESOI mapping means "declaration disabled", not a malformed
+    # single-component spec.
+    off = L.ablation_practical_decision([0.01, -0.01, 0.0], sesoi={})
+    assert off['decision'] == 'not_declared' and off['margin'] is None, off
+    # Truthy/non-boolean flags must not authorize a superiority or TOST claim.
+    malformed = L._practical_decision_from_stats(
+        {'n': 8, 'mean': 1.0, 'significant': 'false'},
+        {'equivalent': 'false', 'p_tost': 0.0, 'ci': [0.0, 0.0]},
+        margin=0.1, direction=-1, alpha=0.05, min_n=3)
+    assert malformed['decision'] != 'superior', malformed
+    assert malformed['decision'] != 'equivalent', malformed
+    # Refreshing the family p must not drop the descriptive per-contrast fields.
+    pd = L.ablation_practical_decision(
+        [0.01, -0.01, 0.0, 0.01, -0.01, 0.0],
+        sesoi={'relative_pct': 1.0}, baseline_ppl=50.0, label='x')
+    entry = {'with': 'a', 'without': 'b', 'sesoi': pd,
+             'significant_global': False, 'p_holm_global': 0.9}
+    L._apply_sesoi_holm({'c': [entry]}, {'c': [('a', 'b', 'x')]}, {}, {},
+                        {'c': {'relative_pct': 1.0}}, alpha=0.05, min_n=3)
+    assert entry['sesoi']['label'] == 'x', entry['sesoi']
+    assert entry['sesoi']['baseline_ppl'] == 50.0, entry['sesoi']
+    assert abs(entry['sesoi']['relative_margin_pct'] - 1.0) < 1e-12, entry['sesoi']
+    # A malformed design is a gate failure, never an exception from len().
+    with contextlib.redirect_stdout(io.StringIO()):
+        bad = A.audit_sesoi_declaration(
+            spec={'dynamic_blocking': {'relative_pct': 1.0}},
+            design={'dynamic_blocking': None})
+    assert bad['status'] == 'fail', bad
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -20820,6 +20916,7 @@ def main():
     _check('L169 SESOI practical decision primitives', t_sesoi_practical_decision_primitives)
     _check('L170 SESOI gates verified / equivalent / harmful ablation verdicts', t_sesoi_audit_gates_verified_and_equivalence)
     _check('L171 SESOI declaration gate fails closed', t_sesoi_declaration_gate)
+    _check('L172 SESOI partial-panel coverage + input guards', t_sesoi_partial_panel_and_input_guards)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')
