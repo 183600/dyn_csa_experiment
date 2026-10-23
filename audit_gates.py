@@ -3575,6 +3575,12 @@ def audit_design_preflight(manifest_path=None, dynamic_path=None):
                 'dynamic draft is intentionally non-runnable: `promotion_ready` '
                 'must become true (disjoint source + measured read-budget '
                 'calibration + passed power gate) before any dynamic confirmation')
+    # A recorded violation is a hard design defect, including the case where
+    # the frozen manifest is missing/unreadable.  Previously that branch only
+    # appended to `violations` while `status` stayed 'ok', so the CLI exited 0
+    # on a checkout with no frozen plan.
+    if out['violations']:
+        out['status'] = 'fail'
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return out
 
@@ -4531,7 +4537,7 @@ def audit_source_integrity(snapshot_path='analysis_v12/plan_snapshot.json',
     source = None
     legacy_lock = None
 
-    def _drift_locks():
+    def _relevant_locks():
         # Explicit lock first; otherwise every discovered freeze lock.  The
         # lock that supplied `source` is included even when a plan snapshot
         # was preferred for the expected tree, because a drift event is
@@ -4540,10 +4546,82 @@ def audit_source_integrity(snapshot_path='analysis_v12/plan_snapshot.json',
                  else list(_iter_freeze_locks(results_dirs)))
         if isinstance(source, str) and source.endswith('.freeze_lock.json'):
             locks.append(_audit_artifact(source))
-        return locks
+        out, seen = [], set()
+        for lp in locks:
+            if not lp:
+                continue
+            p = os.path.abspath(lp)
+            if p in seen or not os.path.exists(p):
+                continue
+            seen.add(p)
+            out.append(p)
+        return out
+
+    def _check_source_locks(out):
+        """Require every source-bound freeze lock to agree with `expected`.
+
+        A plan snapshot records the approved tree, while a freeze lock records
+        the tree actually used at first test access.  The audit used to prefer
+        the snapshot and ignore a conflicting lock unless that lock happened to
+        declare a drift event; a stale/mis-copied snapshot could therefore
+        report "byte-identical" while the lock attested a different
+        measurement tree.  Compare the digests whenever both sides exist.
+        """
+        if not isinstance(expected, dict):
+            return out
+        want = expected.get('sha256')
+        if not isinstance(want, str) or not want:
+            return out
+        checked, mismatches, malformed = [], [], []
+        for lp in _relevant_locks():
+            lock = _load(lp)
+            if not isinstance(lock, dict):
+                continue
+            tree = _extract_source_tree(lock)
+            tree_sha = tree.get('sha256') if isinstance(tree, dict) else None
+            top_sha = lock.get('source_tree_sha256')
+            # A lock from the pre-source-binding driver has neither field: it
+            # is honest evidence of the plan/slice, not of the code bytes.
+            if tree_sha is None and top_sha is None:
+                continue
+            rec = {'lock': _display_repo_path(lp)}
+            if (isinstance(tree_sha, str) and tree_sha
+                    and isinstance(top_sha, str) and top_sha
+                    and tree_sha != top_sha):
+                rec['error'] = ('source_tree.sha256 disagrees with '
+                                'source_tree_sha256')
+                malformed.append(rec)
+            sha = (tree_sha if isinstance(tree_sha, str) and tree_sha
+                   else top_sha if isinstance(top_sha, str) and top_sha
+                   else None)
+            if sha is None:
+                rec['error'] = 'source tree has no usable sha256'
+                malformed.append(rec)
+                continue
+            rec['source_sha256'] = sha
+            checked.append(rec)
+            if sha != want:
+                mismatches.append(rec)
+        if checked:
+            out['source_locks'] = checked
+        if malformed:
+            out['malformed_source_locks'] = malformed
+            out['problems'].append(
+                f'{len(malformed)} freeze lock(s) carry an incomplete or '
+                'contradictory source-tree binding')
+        if mismatches:
+            out['source_lock_mismatches'] = mismatches
+            out['problems'].append(
+                f'{len(mismatches)} freeze lock(s) bind a different source '
+                'tree than the snapshot/provenance; the measurement code '
+                'bytes are not established by the preferred artifact')
+        if malformed or mismatches:
+            out['status'] = 'fail'
+        return out
 
     def _emit(out):
-        _apply_declared_source_drift(out, _drift_locks())
+        _check_source_locks(out)
+        _apply_declared_source_drift(out, _relevant_locks())
         print(json.dumps({k: v for k, v in out.items() if k != 'files'},
                          ensure_ascii=False, indent=2)[:4000])
         return out

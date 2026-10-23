@@ -2509,13 +2509,24 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=16, max_pos=
         # with a target/logit width mismatch (or silently scored a shorter
         # span on some backends).  Report the unavailable cells explicitly.
         _val_width_now = int(np.asarray(val_ids).shape[1]) if np.asarray(val_ids).ndim == 2 else 0
-        _too_short = [int(Ln) for Ln in _within if int(Ln) > _val_width_now]
+        # A truncated length also needs the full `Ln`-prefix, not merely
+        # `_eff_max` tokens: the intended "last _eff_max tokens of the Ln
+        # prefix" does not exist when the panel itself is shorter than Ln.
+        # Checking only `_within` let two over-long lengths collapse onto the
+        # same clamped (start,end) slice and report a different causal context
+        # under the requested L labels.
+        _too_short = [int(Ln) for Ln in (_within + _trunc_lens)
+                      if int(Ln) > _val_width_now]
         for Ln in _too_short:
             out[Ln] = {'error': (f'val_ids has {_val_width_now} tokens; cannot '
                                  f'evaluate L={Ln} without a shorter, undeclared span'),
                        'truncated': False, 'eval_span': None}
         if _too_short:
-            _within = [int(Ln) for Ln in _within if int(Ln) not in set(_too_short)]
+            _too_short_set = set(_too_short)
+            _within = [int(Ln) for Ln in _within
+                       if int(Ln) not in _too_short_set]
+            _trunc_lens = [int(Ln) for Ln in _trunc_lens
+                           if int(Ln) not in _too_short_set]
         if _within:
             _Lmax = max(_within)
             ids = np.asarray(val_ids[:n_seq, :_Lmax], dtype=np.int64)
@@ -2854,7 +2865,14 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
             torch.cuda.empty_cache()
             return out
         model = _tr.pop('_model')
-        _atomic_torch_save({'cfg': cfgs, 'mlp_ratio': mr, 'vocab': vocab, 'd': 256, 'n_layers': 6, 'n_heads': 8, 'd_head': 32, 'train_len': train_len, 'max_seq': train_len, 'code': CKPT_CODE, 'recipe': _recipe, 'run_cfg': _run_cfg, 'sd': model.state_dict(), 'final_ppl': _tr.get('ppl'), 'params': L.count_params(model), 'rng_fp': _tr.get('rng_fp'), 'train_fp': _tr.get('data_fp'), 'val_fp': _tr.get('eval_fp'), 'losses': _tr.get('losses'), 'ppl_history': _tr.get('ppl_history'), 'curve_health': _tr.get('curve_health'), 'health_history': _tr.get('health_history'), 'opt_diag_summary': _tr.get('opt_diag_summary'), 'best_step': _tr.get('best_step'), 'best_val_ppl': _tr.get('best_val_ppl'), 'train_ce_fixed_final': _tr.get('train_ce_fixed_final'), 'train_knobs': _tr.get('train_knobs'), 'train_objective': _tr.get('train_objective'), 'param_breakdown': _tr.get('param_breakdown'), 'n_seq': n_seq, 'steps': steps}, ck)
+        # Bind the file to the arm/seed and to the exact weights it contains.
+        # The recipe deliberately omits the arm name (two frozen controls can
+        # share the same recipe and parameter count), so without these fields a
+        # copied checkpoint from another arm/seed passed every P5T identity
+        # check and could enter the confirmation panel as the wrong weights.
+        _sd = model.state_dict()
+        _sd_sha = L.state_dict_sha256(_sd)
+        _atomic_torch_save({'cfg': cfgs, 'mlp_ratio': mr, 'vocab': vocab, 'd': 256, 'n_layers': 6, 'n_heads': 8, 'd_head': 32, 'train_len': train_len, 'max_seq': train_len, 'code': CKPT_CODE, 'variant': v, 'seed': int(seed), 'state_dict_sha256': _sd_sha, 'recipe': _recipe, 'run_cfg': _run_cfg, 'sd': _sd, 'final_ppl': _tr.get('ppl'), 'params': L.count_params(model), 'rng_fp': _tr.get('rng_fp'), 'train_fp': _tr.get('data_fp'), 'val_fp': _tr.get('eval_fp'), 'losses': _tr.get('losses'), 'ppl_history': _tr.get('ppl_history'), 'curve_health': _tr.get('curve_health'), 'health_history': _tr.get('health_history'), 'opt_diag_summary': _tr.get('opt_diag_summary'), 'best_step': _tr.get('best_step'), 'best_val_ppl': _tr.get('best_val_ppl'), 'train_ce_fixed_final': _tr.get('train_ce_fixed_final'), 'train_knobs': _tr.get('train_knobs'), 'train_objective': _tr.get('train_objective'), 'param_breakdown': _tr.get('param_breakdown'), 'n_seq': n_seq, 'steps': steps}, ck)
         if guard is not None:
             guard.record_run(time.time() - t0, steps, 256, 6, train_len, batch_size, calib_seconds=_tr.get('train_time_s'))
             if booked:
@@ -2903,6 +2921,11 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
         _merged.update(r)
         _rec = {'variant': v, 'seed': seed, 'params': _ckp_params, 'max_pos': mp, 'by_len': _merged, '_code': CKPT_CODE, 'recipe': _recipe, 'run_cfg': _run_cfg, 'eval_n_seq': n_seq, 'n_seq': n_seq}
         _prev_resume = _cur_now if isinstance(_cur_now, dict) else {}
+        # The training record carries the same weight identity as the
+        # checkpoint it produced, so P5T can detect a record swapped between
+        # arms/seeds even when both share a recipe and parameter count.
+        _rec['state_dict_sha256'] = (_ckp.get('state_dict_sha256')
+                                     or _prev_resume.get('state_dict_sha256'))
         # `pair_reason` requires steps/tokens_seen to be present and equal;
         # both are recorded here so a frozen pair is not "unverifiable
         # steps/tokens_seen".

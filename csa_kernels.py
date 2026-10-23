@@ -887,7 +887,7 @@ def _indexer_fwd_ref(qI, kI, w_idx, last_tok, topk, need_soft=True):
     qIf = qI if qI.dtype == acc else qI.to(acc)
     kIf = kI if kI.dtype == acc else kI.to(acc)
     wf = w_idx if w_idx.dtype == acc else w_idx.to(acc)
-    k_out = min(int(topk), Bm)
+    k_out = max(0, min(int(topk), Bm))
     idx = torch.empty((R, T, k_out), device=dev, dtype=torch.int32)
     valid = torch.empty((R, T, k_out), device=dev, dtype=torch.bool)
     # Soft is a training-only prior (the straight-through S path is dead
@@ -1068,6 +1068,15 @@ def _indexer_impl_for_shape(impl, kI):
     # the runner-up path below streams the top-k over block chunks.  Long-context
     # shapes (Bm can be tens of thousands) therefore stay on the Triton
     # scorer instead of silently degrading to the torch reference twin.
+    if impl == 'triton' and kI.dtype == torch.float64:
+        # The Triton scorer loads q/k/w into fp32 lanes, while the reference
+        # twin promotes to fp64.  A finite fp64 value can overflow fp32 and an
+        # fp64 near-tie can change the selected block, so fail closed to the
+        # reference implementation instead of silently changing the function.
+        _warn_shape_fallback(
+            'indexer', 'fp64 inputs require the torch-reference backend '
+                       '(the Triton scorer computes in fp32)')
+        return 'ref'
     return impl
 
 
@@ -1083,7 +1092,14 @@ class FusedIndexer(torch.autograd.Function):
         # is False inside a custom autograd Function's forward, so it cannot
         # detect that a backward will be built.
         need_soft = bool(need_soft) or any(ctx.needs_input_grad[1:4])
-        impl = _indexer_impl_for_shape(impl, kI)
+        if impl == 'triton' and any(
+                t.dtype == torch.float64 for t in (qI, kI, w_idx)):
+            _warn_shape_fallback(
+                'indexer', 'fp64 inputs require the torch-reference backend '
+                           '(the Triton scorer computes in fp32)')
+            impl = 'ref'
+        else:
+            impl = _indexer_impl_for_shape(impl, kI)
         if impl == 'triton':
             idx, valid, soft = _indexer_fwd_triton(qI, kI, w_idx, last_tok, topk, need_soft=need_soft)
         else:
@@ -1487,6 +1503,14 @@ def _attn_bwd_ref(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, 
 def _attn_impl_for_shape(impl, q, w):
     if impl != 'triton':
         return impl
+    if q.dtype == torch.float64:
+        # The Triton attention kernels cast q/k/v to fp32; the reference twin
+        # keeps fp64.  Route fp64 to the reference instead of narrowing it
+        # (which can overflow a finite value or change a near-tie result).
+        _warn_shape_fallback(
+            'attention', 'fp64 inputs require the torch-reference backend '
+                         '(the Triton kernels compute in fp32)')
+        return 'ref'
     hd = int(q.shape[-1])
     if int(w) < 1 or hd < 16 or (hd & (hd - 1)) != 0:
         _warn_shape_fallback('attention', f'w={int(w)}, hd={hd} require w >= 1 and a power-of-two hd >= 16')
@@ -1501,7 +1525,15 @@ class FusedSparseAttention(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, impl, q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, soft, sink, w, scale):
-        impl = _attn_impl_for_shape(impl, q, w)
+        if impl == 'triton' and any(
+                isinstance(t, torch.Tensor) and t.dtype == torch.float64
+                for t in (q, k_blk, v_blk, k_sw, v_sw)):
+            _warn_shape_fallback(
+                'attention', 'fp64 inputs require the torch-reference backend '
+                             '(the Triton kernels compute in fp32)')
+            impl = 'ref'
+        else:
+            impl = _attn_impl_for_shape(impl, q, w)
         # Accept the eager API's block-only form (w=0, k_sw=v_sw=None) and
         # refuse a non-zero window without its K/V tables.  Normalising once
         # here also makes the saved tensors and the returned dgrad shapes
@@ -2418,6 +2450,15 @@ def _attach_attn_kernels(ns):
 # ============================================================================
 
 def _pool_fwd_triton(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b):
+    if any(t is not None and t.dtype == torch.float64
+           for t in (Xa, Xb, Za, Zb)):
+        # The Triton pool loads every lane in fp32, while the shared backward
+        # is written in fp64 for fp64 inputs.  Returning the fp64 reference
+        # keeps forward/backward the same function and avoids fp32 overflow.
+        _warn_shape_fallback(
+            'pool', 'fp64 inputs require the torch-reference backend '
+                    '(the Triton kernel computes in fp32)')
+        return _pool_fwd_ref(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b)
     K = _kernels()
     triton = K.triton
     R, T, C = Xa.shape
@@ -2532,7 +2573,7 @@ def _indexer_fwd_triton(qI, kI, w_idx, last_tok, topk, need_soft=True):
     # 打分泳道宽补到 >= 16 的 2 幂（零填充泳道对点积恰好贡献 +0.0，分数
     # 逐位不变）；hd 无需是 2 的幂或 >= 16。
     HDP = max(_next_pow2(hd), 16)
-    k_out = min(int(topk), Bm)
+    k_out = max(0, min(int(topk), Bm))
     BB2 = _next_pow2(Bm)
     idx = torch.empty((R, T, k_out), device=qI.device, dtype=torch.int32)
     valid_i8 = torch.empty((R, T, k_out), device=qI.device, dtype=torch.int8)

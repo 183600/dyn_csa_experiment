@@ -157,9 +157,15 @@ _HEALTH_NONBLOCKING = frozenset({
 
 
 def _health_blocks(status):
-    """True only for statuses that make the confirmation evaluation unsafe."""
+    """True unless the status is explicitly known to be safe.
+
+    This is a one-shot test-access gate, so the check is a whitelist, not a
+    blacklist: a future/renamed/typo'd status must fail closed instead of
+    silently becoming "non-blocking" merely because it is absent from
+    ``_HEALTH_BLOCKING``.
+    """
     s = str(status if status is not None else 'unknown')
-    return s != 'healthy' and s in _HEALTH_BLOCKING
+    return s != 'healthy' and s not in _HEALTH_NONBLOCKING
 
 def run_training_health(cfg=None):
     """Pre-test health gate over the frozen arms/seeds.
@@ -1258,6 +1264,14 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test',
         print(f'[p5t] SKIP {v} s{seed}: checkpoint unreadable ({type(_cle).__name__}: {_cle})')
         out['status'] = 'skipped_bad_ckpt'
         return out
+    _ck_identity = _checkpoint_identity_problem(d, v, seed)
+    if _ck_identity:
+        print(f'[p5t] REFUSE {v} s{seed}: {_ck_identity} — a checkpoint from '
+              'another arm/seed (or with different weights) cannot enter the '
+              'confirmation panel')
+        del d
+        out['status'] = 'skipped_ckpt_identity'
+        return out
     if d.get('code') != V.CKPT_CODE:
         print(f'[p5t] REFUSE {v} s{seed}: checkpoint predates the current code stamp (code={d.get("code")!r})')
         del d
@@ -1271,6 +1285,32 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test',
         print(f'[p5t] REFUSE {v} s{seed}: no current training record backs the checkpoint — the weights have no traceable provenance')
         del d
         out['status'] = 'skipped_no_provenance'
+        return out
+    # The summary key is not evidence: the record itself must name the same
+    # arm/seed, otherwise a mis-keyed/swap-edited summary.json can pair the
+    # checkpoint with another run's metadata.
+    if _tr.get('variant') != v or _record_int(_tr.get('seed')) != int(seed):
+        print(f'[p5t] REFUSE {v} s{seed}: training record identity is '
+              f'variant={_tr.get("variant")!r}, seed={_tr.get("seed")!r} — '
+              'the record does not describe the requested cell')
+        del d
+        out['status'] = 'skipped_record_identity'
+        return out
+    _tr_sd_sha = _tr.get('state_dict_sha256')
+    if not _valid_sha256(_tr_sd_sha):
+        print(f'[p5t] REFUSE {v} s{seed}: training record carries no valid '
+              'state_dict_sha256; the record cannot be tied to the evaluated '
+              'weights (regenerate the cell with the current writer)')
+        del d
+        out['status'] = 'skipped_record_digest'
+        return out
+    if _tr_sd_sha != d.get('state_dict_sha256'):
+        print(f'[p5t] REFUSE {v} s{seed}: training-record weight digest '
+              f'{str(_tr_sd_sha)[:12]}… != checkpoint weight digest '
+              f'{str(d.get("state_dict_sha256"))[:12]}… — the record and the '
+              'weights describe different runs')
+        del d
+        out['status'] = 'skipped_ckpt_digest'
         return out
     _health_refusal = _training_health_gate(cfg, v, seed, d, _tr)
     if _health_refusal:
@@ -2049,6 +2089,46 @@ def _record_int(value):
 def _valid_sha256(value):
     return (isinstance(value, str)
             and re.fullmatch(r'[0-9a-fA-F]{64}', value or '') is not None)
+
+
+def _checkpoint_identity_problem(ckpt, variant, seed):
+    """Return why a P5T checkpoint is not the requested arm/seed, or None.
+
+    The lenphase recipe is deliberately arm-independent for several frozen
+    controls (they share the same parameter count and hyper-parameters), and
+    ``init_core_fp`` is a function of the seed, not the arm.  A copied file
+    therefore passed every recipe/train-fp/init check.  Bind the payload to
+    its (variant, seed) and verify that the declared weight digest is the one
+    actually stored inside the file.
+    """
+    if not isinstance(ckpt, dict):
+        return 'checkpoint payload is not an object'
+    got_variant = ckpt.get('variant')
+    if got_variant is None:
+        return 'checkpoint carries no variant identity (legacy/pre-identity writer)'
+    if str(got_variant) != str(variant):
+        return f'checkpoint variant {got_variant!r} != requested {variant!r}'
+    got_seed = _record_int(ckpt.get('seed'))
+    if got_seed is None:
+        return 'checkpoint carries no exact integer seed identity'
+    if got_seed != int(seed):
+        return f'checkpoint seed {got_seed!r} != requested {int(seed)!r}'
+    declared = ckpt.get('state_dict_sha256')
+    if not _valid_sha256(declared):
+        return ('checkpoint carries no valid state_dict_sha256 (legacy/pre-'
+                'identity writer); the stored weights cannot be tied to this '
+                'arm/seed')
+    sd = ckpt.get('sd')
+    if not isinstance(sd, dict) or not sd:
+        return 'checkpoint carries no state-dict mapping'
+    try:
+        actual = L.state_dict_sha256(sd)
+    except Exception as e:
+        return f'checkpoint state dict could not be hashed ({type(e).__name__}: {e})'
+    if actual != declared:
+        return ('checkpoint state-dict digest does not match its declared '
+                'state_dict_sha256; the weights were edited or mis-copied')
+    return None
 
 
 def _manifest_requires_params(manifest):

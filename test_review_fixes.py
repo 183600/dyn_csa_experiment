@@ -19960,6 +19960,188 @@ def t_g0_certificate_requires_real_booleans():
             assert why is not None, (key, bogus)
 
 
+def t_design_preflight_missing_manifest_fails_closed():
+    # A missing/truncated frozen manifest is a hard design failure, not a
+    # "not_verifiable" warning that still exits 0: the CLI treats only
+    # status=fail as a red gate, so the violations list alone is not enough.
+    with tempfile.TemporaryDirectory() as td:
+        missing = os.path.join(td, 'missing_manifest.json')
+        with contextlib.redirect_stdout(io.StringIO()):
+            rep = A.audit_design_preflight(manifest_path=missing)
+        assert rep['status'] == 'fail', rep.get('status')
+        assert any('missing/unreadable' in v for v in rep['violations']), rep
+        bad = os.path.join(td, 'truncated_manifest.json')
+        with open(bad, 'w', encoding='utf-8') as f:
+            f.write('{not json')
+        with contextlib.redirect_stdout(io.StringIO()):
+            rep_bad = A.audit_design_preflight(manifest_path=bad)
+        assert rep_bad['status'] == 'fail' and rep_bad['violations'], rep_bad
+
+
+def t_p5t_health_gate_uses_a_status_whitelist():
+    # The one-shot test gate may only proceed for statuses the policy names.
+    # An unrecognized/renamed/uppercase status must fail closed; the old
+    # blacklist let any string outside _HEALTH_BLOCKING pass as non-blocking.
+    assert V12._health_blocks('healthy') is False
+    for status in sorted(V12._HEALTH_NONBLOCKING):
+        assert V12._health_blocks(status) is False, status
+    for status in ('unknown', 'fine', 'HEALTHY', 'degraded', 'nonfinite',
+                   'overfitting', 'validation_degrading', 'insufficient_data',
+                   'unmonitored', None):
+        assert V12._health_blocks(status) is True, status
+    why = V12._training_health_gate(
+        {}, 'arm', 0, {'curve_health': {'status': 'fine'}}, {})
+    assert why and 'refusing' in why, why
+
+
+def t_source_audit_rejects_lock_snapshot_disagreement():
+    # The snapshot records the approved plan; a freeze lock records the tree
+    # actually used at first test access.  A stale/mis-copied snapshot must
+    # not make the audit green while the lock attests a different tree.
+    cur = L.source_tree_manifest()
+    with tempfile.TemporaryDirectory() as td:
+        snap = os.path.join(td, 'plan_snapshot.json')
+        with open(snap, 'w', encoding='utf-8') as f:
+            json.dump({'source_tree': cur}, f)
+        lock_b = _fake_source_tree('b')
+        lp = os.path.join(td, '.freeze_lock.json')
+        with open(lp, 'w', encoding='utf-8') as f:
+            json.dump({'manifest_sha256': 'AAA',
+                       'source_tree': lock_b,
+                       'source_tree_sha256': lock_b['sha256']}, f)
+        with contextlib.redirect_stdout(io.StringIO()):
+            bad = A.audit_source_integrity(snapshot_path=snap, lock_path=lp)
+        assert bad['status'] == 'fail', bad
+        assert bad.get('source_lock_mismatches'), bad
+        assert any('different source tree' in p for p in bad['problems']), bad
+        # The same disagreement is found through result-dir discovery.
+        with contextlib.redirect_stdout(io.StringIO()):
+            bad2 = A.audit_source_integrity(snapshot_path=snap, results_dirs=[td])
+        assert bad2['status'] == 'fail' and bad2.get('source_lock_mismatches'), bad2
+        # A matching lock keeps the normal byte-identical verdict.
+        with open(lp, 'w', encoding='utf-8') as f:
+            json.dump({'manifest_sha256': 'AAA',
+                       'source_tree': cur,
+                       'source_tree_sha256': cur['sha256']}, f)
+        with contextlib.redirect_stdout(io.StringIO()):
+            good = A.audit_source_integrity(snapshot_path=snap, lock_path=lp)
+        assert good['status'] == 'ok' and not good['problems'], good
+        # Two discovered locks bound to different trees cannot both describe
+        # the same measurement source.
+        td_b = os.path.join(td, 'results_b')
+        os.mkdir(td_b)
+        lp_b = os.path.join(td_b, '.freeze_lock.json')
+        with open(lp_b, 'w', encoding='utf-8') as f:
+            json.dump({'manifest_sha256': 'BBB',
+                       'source_tree': lock_b,
+                       'source_tree_sha256': lock_b['sha256']}, f)
+        td_a = os.path.join(td, 'results_a')
+        os.mkdir(td_a)
+        lp_a = os.path.join(td_a, '.freeze_lock.json')
+        with open(lp_a, 'w', encoding='utf-8') as f:
+            json.dump({'manifest_sha256': 'AAA',
+                       'source_tree': cur,
+                       'source_tree_sha256': cur['sha256']}, f)
+        with contextlib.redirect_stdout(io.StringIO()):
+            mixed = A.audit_source_integrity(snapshot_path=snap,
+                                             results_dirs=[td_a, td_b])
+        assert mixed['status'] == 'fail' and mixed.get('source_lock_mismatches'), mixed
+
+
+def t_eval_length_truncated_beyond_panel_is_refused():
+    # A truncated request still needs the full Ln prefix.  When the panel is
+    # shorter than Ln, clamping to the panel width silently changes the causal
+    # context instead of reporting the unavailable length.
+    torch.manual_seed(0)
+    cfgs = L.make_layer_cfgs(1, 'full_rope')
+    model = V7.SmallGPTRoPE(32, 16, 1, 2, 8, 20, cfgs).eval()
+    ids = np.asarray(np.random.default_rng(3).integers(
+        0, 32, size=(2, 20)), dtype=np.int64)
+    dev = torch.device('cpu')
+    out = V7.eval_length_gen(model, ids, [24, 32], dev, max_pos=16)
+    for Ln in (24, 32):
+        assert 'error' in out[Ln], (Ln, out[Ln])
+        assert out[Ln].get('truncated') is False, out[Ln]
+    # A length that really fits keeps the intended last-_eff_max slice.
+    valid = V7.eval_length_gen(model, ids, [16, 20], dev, max_pos=8)
+    for Ln in (16, 20):
+        cell = valid[Ln]
+        assert 'ppl' in cell and cell['truncated'] is True, (Ln, cell)
+        assert cell['eval_span'] == 7, (Ln, cell)
+
+
+def t_article_cluster_map_survives_a_capped_heading():
+    # The loader's token cap can cut a raw row.  The cold-build helper and the
+    # decode-from-cache helper must produce the SAME article cluster map; a
+    # truncated heading must not be folded into the previous article.
+    rows = [' = Art 0 = ', ' = Art 1 = ']
+    tok = L.build_tokenizer(rows, 128)
+    eos = tok.token_to_id('<eos>')
+    lengths = []
+    ids = L._tokenise_row_chunks([rows], 10 ** 9, 'test', tok, eos,
+                                 lengths_out=lengths)
+    line_map = np.repeat(
+        [L._doc_id_u64(L._doc_exact_fp(r)) for r in rows],
+        np.asarray(lengths, dtype=np.int64))
+    first_len = int(lengths[0])
+    for cap in range(first_len + 1, int(ids.size)):
+        cold = L.wikitext_token_article_ids_for_rows(rows, lengths, cap)
+        cached = L.wikitext_token_article_ids_from_line_map(
+            ids[:cap], line_map[:cap], tok)
+        assert cold['status'] == cached['status'] == 'ok', (cap, cold, cached)
+        assert np.array_equal(cold['token_article_ids'],
+                              cached['token_article_ids']), cap
+        assert cached['last_run_partial'] is True, cap
+        # The partial heading is its own line-level unit, not article 0.
+        assert len(np.unique(cached['token_article_ids'])) == 2, (cap, cached)
+    # Blank rows have identical stripped content; each still needs its own
+    # cluster id, otherwise unrelated blank lines are one pseudo-document.
+    rid = L.wikitext_article_row_ids(['', ' = A = ', '', ''])
+    blanks = rid['row_article_id'][[0, 2, 3]]
+    assert len(set(int(x) for x in blanks)) == 3, rid['row_article_id']
+
+
+def t_p5t_checkpoint_identity_binds_arm_seed_and_weights():
+    sd = {'w': torch.tensor([1.0, 2.0])}
+    sha = L.state_dict_sha256(sd)
+    base = {'variant': 'arm_a', 'seed': 0,
+            'state_dict_sha256': sha, 'sd': sd}
+    assert V12._checkpoint_identity_problem(base, 'arm_a', 0) is None
+    cases = [
+        (dict(base, variant='arm_b'), 'arm_b'),
+        (dict(base, seed=1), 'seed'),
+        (dict(base, state_dict_sha256='0' * 64), 'digest'),
+        ({k: v for k, v in base.items() if k != 'state_dict_sha256'},
+         'state_dict_sha256'),
+        (dict(base, sd={'w': torch.tensor([9.0, 9.0])}), 'edited'),
+    ]
+    for ckpt, needle in cases:
+        why = V12._checkpoint_identity_problem(ckpt, 'arm_a', 0)
+        assert why, (needle, ckpt)
+    # The requested identity itself is checked, not just the stored one.
+    assert V12._checkpoint_identity_problem(base, 'arm_a', 1), 'seed mismatch'
+
+
+def t_kernel_fp64_and_negative_topk_guards():
+    import csa_kernels as C
+    q64 = torch.zeros((1, 2, 1, 16), dtype=torch.float64)
+    assert C._attn_impl_for_shape('triton', q64, 8) == 'ref'
+    k64 = torch.zeros((1, 2, 4), dtype=torch.float64)
+    assert C._indexer_impl_for_shape('triton', k64) == 'ref'
+    # A negative topk is clamped to zero like the eager helper, rather than
+    # requesting a tensor with a negative dimension.
+    R, T, Bm, nIH, hd = 1, 2, 2, 1, 4
+    qI = torch.randn(R, T, nIH, hd)
+    kI = torch.randn(R, Bm, nIH, hd)
+    w_idx = torch.randn(R, T, nIH)
+    last_tok = torch.tensor([[1, 2]], dtype=torch.int64)
+    idx, valid, soft = C._indexer_fwd_ref(
+        qI, kI, w_idx, last_tok, -1, need_soft=False)
+    assert tuple(idx.shape) == (R, T, 0), idx.shape
+    assert tuple(valid.shape) == (R, T, 0), valid.shape
+    assert soft is None
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -20465,6 +20647,13 @@ def main():
     _check('L159 wiki article sampler selects whole articles only', t_wikitext_article_sampling_selects_whole_articles)
     _check('L160 sampling audit distinguishes prefix from probability sample', t_sample_design_audit_reports_prefix_and_probability_plans)
     _check('L161 G0 certificate requires real boolean pass flags', t_g0_certificate_requires_real_booleans)
+    _check('L162 design preflight fails closed without a frozen manifest', t_design_preflight_missing_manifest_fails_closed)
+    _check('L163 P5T health gate is a status whitelist', t_p5t_health_gate_uses_a_status_whitelist)
+    _check('L164 source audit checks freeze-lock/snapshot agreement', t_source_audit_rejects_lock_snapshot_disagreement)
+    _check('L165 eval length refuses truncation beyond the panel', t_eval_length_truncated_beyond_panel_is_refused)
+    _check('L166 article clusters are stable when the cap splits a heading', t_article_cluster_map_survives_a_capped_heading)
+    _check('L167 P5T checkpoint identity binds arm/seed/weights', t_p5t_checkpoint_identity_binds_arm_seed_and_weights)
+    _check('L168 kernel fp64/negative-topk guards', t_kernel_fp64_and_negative_topk_guards)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

@@ -9705,10 +9705,16 @@ def wikitext_article_row_ids(rows):
         }
     article_ids = _article_cluster_ids(_rows, group['groups'])
     row_aid = np.empty(n_rows, dtype=np.uint64)
-    # Start with a unique line-level id for every row (blank/uncovered rows
-    # included), then overwrite the rows that belong to an evidenced article.
+    # Start with a line-level id for every row, then overwrite the rows that
+    # belong to an evidenced article.  Blank rows all have the same stripped
+    # content, so a plain content hash made every blank row one cluster; add
+    # the row position to keep the documented "each blank row is its own
+    # cluster" contract.  Non-blank rows keep the loader's content line id.
     for _i, _row in enumerate(_rows):
-        row_aid[_i] = _doc_id_u64(_doc_exact_fp(_row))
+        if isinstance(_row, str) and _row.strip():
+            row_aid[_i] = _doc_id_u64(_doc_exact_fp(_row))
+        else:
+            row_aid[_i] = _doc_id_u64(_doc_exact_fp(f'blank\x00{_i}\x00{_row}'))
     for _gid, _idxs in enumerate(group['groups']):
         row_aid[np.asarray(_idxs, dtype=np.int64)] = np.uint64(article_ids[_gid])
     return {
@@ -9755,9 +9761,22 @@ def wikitext_token_article_ids_from_line_map(token_ids, token_doc_ids, tok,
     if line_ids.size == 0:
         return {'status': 'empty', 'reason': 'empty token/line map'}
     flat_line = line_ids.reshape(-1)
+    flat_ids = ids.reshape(-1)
     spans = line_spans_from_token_doc_ids(flat_line)
-    texts, problems = decode_token_runs(ids.reshape(-1), spans, tok,
-                                        chunk=chunk)
+    # The loader cuts the served per-token map at a fixed token cap, so the
+    # final run can be a PREFIX of a raw row.  A partial BODY line still
+    # belongs to the preceding article and can be decoded/grouped normally.
+    # A partial HEADING, however, does not match the whole-heading regex and
+    # would be folded into the previous article, disagreeing with the
+    # cold-build helper that sees the full heading.  Keep a partial
+    # heading-like run at line identity (in both paths) instead of guessing an
+    # article from incomplete text.
+    try:
+        _eos = tok.token_to_id('<eos>')
+    except Exception:
+        _eos = None
+    _last_partial = bool(spans) and _eos is not None and int(flat_ids[-1]) != int(_eos)
+    texts, problems = decode_token_runs(flat_ids, spans, tok, chunk=chunk)
     if problems:
         return {'status': 'decode_failed',
                 'reason': '; '.join(problems[:3]),
@@ -9765,29 +9784,51 @@ def wikitext_token_article_ids_from_line_map(token_ids, token_doc_ids, tok,
     if any(t is None for t in texts):
         return {'status': 'decode_failed',
                 'reason': 'one or more line runs could not be decoded'}
-    group = wikitext_article_groups(texts)
-    if not group.get('groups'):
+    _partial_heading = bool(
+        _last_partial
+        and re.match(r'^\s*=\s*(?!=)', str(texts[-1] or '')))
+    _group_texts = texts[:-1] if _partial_heading else texts
+    group = wikitext_article_groups(_group_texts)
+    if not group.get('groups') and not (_last_partial and _partial_heading):
         return {'status': 'empty_after_grouping',
                 'reason': 'decoded line runs grouped to zero articles'}
-    article_ids = _article_cluster_ids(texts, group['groups'])
-    # One article id per decoded line, using the line's own id for rows the
-    # grouper did not place (e.g. blank lines) so no two rows are merged by
-    # accident.
-    line_aid = np.empty(len(texts), dtype=np.uint64)
-    for _i, ((_, _, _lid), _text) in enumerate(zip(spans, texts)):
+    article_ids = (_article_cluster_ids(_group_texts, group['groups'])
+                   if group.get('groups') else [])
+    # One line-level id for every served run; a partial heading keeps that
+    # identity instead of being merged into the previous article.
+    line_aid = np.empty(len(spans), dtype=np.uint64)
+    for _i, (_s, _e, _lid) in enumerate(spans):
         line_aid[_i] = np.uint64(_lid)
     for _gid, _idxs in enumerate(group['groups']):
         line_aid[np.asarray(_idxs, dtype=np.int64)] = np.uint64(article_ids[_gid])
     out = np.empty(flat_line.size, dtype=np.uint64)
     for (_s, _e, _lid), _aid in zip(spans, line_aid):
         out[int(_s):int(_e)] = _aid
+    # Report the same served-cluster accounting as the cold-build helper:
+    # the partial final run contributes one line-level cluster, not an
+    # unmeasured article.
+    _n_served_articles = int(np.unique(line_aid).size)
+    _served_counts = (np.unique(line_aid, return_counts=True)[1]
+                      if _n_served_articles else np.empty(0, dtype=np.int64))
+    _summary = _article_group_summary(group, n_lines=len(spans))
+    _summary.update(
+        n_lines=int(len(spans)),
+        n_articles=_n_served_articles,
+        mean_lines_per_article=(float(len(spans)) / _n_served_articles
+                                if _n_served_articles else None),
+        pseudoreplication_factor=(float(len(spans)) / _n_served_articles
+                                  if _n_served_articles else None),
+        max_lines_per_article=(int(_served_counts.max())
+                               if _served_counts.size else 0),
+    )
     return {
         'status': 'ok',
         'token_article_ids': out.reshape(ids.shape),
         'line_article_ids': line_aid,
         'line_ids': [int(s[2]) for s in spans],
+        'last_run_partial': bool(_last_partial),
         'valid_for_clustering': bool(group.get('has_headings')),
-        **_article_group_summary(group, n_lines=len(spans)),
+        **_summary,
     }
 
 
@@ -9806,14 +9847,8 @@ def wikitext_token_article_ids_for_rows(rows, lengths, cap_tokens):
         raise ValueError(
             f'wikitext_token_article_ids_for_rows: {len(rows)} rows but '
             f'{len(lengths)} lengths')
-    rid = wikitext_article_row_ids(rows)
-    if rid['status'] != 'ok':
-        return {'status': rid['status'],
-                'token_article_ids': np.empty(0, dtype=np.uint64),
-                **{k: v for k, v in rid.items()
-                   if k not in ('status', 'row_article_id', 'article_ids')}}
-    row_aid = np.asarray(rid['row_article_id'], dtype=np.uint64)
     takes = []
+    lens_used = []
     cursor = 0
     cap_tokens = max(0, int(cap_tokens))
     for _i, (_row, _length) in enumerate(zip(rows, lengths)):
@@ -9828,12 +9863,39 @@ def wikitext_token_article_ids_for_rows(rows, lengths, cap_tokens):
         if take <= 0:
             break
         takes.append(take)
+        lens_used.append(int(_len_i))
         cursor += take
+    # The cap can cut the final row.  A partial BODY line stays in the
+    # preceding article (its full text does not change the grouping).  A
+    # partial top-level HEADING must instead keep line identity: the decoded
+    # prefix does not match the whole-heading rule, and grouping the full
+    # heading would create an article the cache-hit path cannot reconstruct.
+    _last_truncated = bool(takes) and int(takes[-1]) < int(lens_used[-1])
+    _partial_heading = bool(
+        _last_truncated
+        and _WIKITEXT_TOP_HEADING_RE.match(str(rows[len(takes) - 1])))
+    _n_complete = len(takes) - (1 if _partial_heading else 0)
+    _group_rows = rows[:_n_complete] if _partial_heading else rows
+    rid = wikitext_article_row_ids(_group_rows)
+    if rid['status'] != 'ok' and _n_complete:
+        return {'status': rid['status'],
+                'token_article_ids': np.empty(0, dtype=np.uint64),
+                **{k: v for k, v in rid.items()
+                   if k not in ('status', 'row_article_id', 'article_ids')}}
+    row_aid = np.asarray(rid['row_article_id'], dtype=np.uint64)
     if not takes:
         out = np.empty(0, dtype=np.uint64)
         served_aid = np.empty(0, dtype=np.uint64)
     else:
-        served_aid = row_aid[:len(takes)]
+        served_aid = np.empty(len(takes), dtype=np.uint64)
+        _copy_n = min(len(takes), int(row_aid.size))
+        if _copy_n:
+            served_aid[:_copy_n] = row_aid[:_copy_n]
+        if _partial_heading:
+            # Use the same content line id the loader wrote into the sidecar;
+            # the partial heading is not assigned to a neighbouring article.
+            served_aid[-1] = _doc_id_u64(
+                _doc_exact_fp(rows[len(takes) - 1]))
         out = np.repeat(served_aid, np.asarray(takes, dtype=np.int64))
     _n_served_articles = int(np.unique(served_aid).size)
     _served_counts = (np.unique(served_aid, return_counts=True)[1]
@@ -9858,6 +9920,7 @@ def wikitext_token_article_ids_for_rows(rows, lengths, cap_tokens):
         'token_article_ids': out,
         'line_article_ids': served_aid,
         'n_tokens': int(out.size),
+        'last_run_partial': bool(_last_truncated),
         'valid_for_clustering': bool(rid['valid_for_clustering']),
         **_served,
     }
