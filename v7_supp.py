@@ -2317,8 +2317,8 @@ def run_niah_phase(payload, guard=None, label=''):
 
 @torch.inference_mode()
 def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=16, max_pos=None,
-                    doc_ids=None):
-    """By-length evaluation with an optional document-boundary mapping.
+                    doc_ids=None, article_ids=None):
+    """By-length evaluation with optional document/article cluster mappings.
 
     ``doc_ids`` is an optional per-token array with the SAME shape as
     ``val_ids``.  Fixed evaluation rows are arbitrary windows: a document can
@@ -2327,6 +2327,14 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=16, max_pos=
     carries per-DOCUMENT NLL/token counts/PPL, which is the unit a document
     bootstrap must resample.  The pooled ``ppl`` and ``ppl_per_seq`` values are
     unchanged (the new fields are a separate, deterministic aggregation).
+
+    ``article_ids`` is an optional per-token ARTICLE mapping (same shape).
+    WikiText's "document" sidecar is really one raw LINE; a line-level
+    bootstrap resamples several paragraphs of the same article and is
+    pseudoreplicated.  When supplied, each cell carries additional
+    per-ARTICLE NLL/token counts/PPL alongside — never instead of — the
+    line-level fields, so the frozen document contract is untouched and the
+    article-level interval is additive evidence.
     """
     was = model.training
     model.eval()
@@ -2373,6 +2381,20 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=16, max_pos=
         if _darr.size and int(_darr.min()) < 0:
             raise ValueError('eval_length_gen: doc_ids must be non-negative')
         _doc2d = _darr
+    _art2d = None
+    if article_ids is not None:
+        _aarr = np.asarray(article_ids)
+        if tuple(_aarr.shape) != tuple(_varr.shape):
+            raise ValueError(
+                f'eval_length_gen: article_ids must have the same shape as '
+                f'val_ids {tuple(_varr.shape)}, got {tuple(_aarr.shape)}')
+        if _aarr.dtype.kind not in 'iu':
+            raise ValueError(
+                'eval_length_gen: article_ids must be integer article ids, '
+                f'got dtype {_aarr.dtype}')
+        if _aarr.size and int(_aarr.min()) < 0:
+            raise ValueError('eval_length_gen: article_ids must be non-negative')
+        _art2d = _aarr
     if max_pos is not None:
         _mp = L._exact_count(max_pos, minimum=2)
         if _mp is None:
@@ -2466,6 +2488,11 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=16, max_pos=
             if _doc2d is not None:
                 _doc_targets = _doc2d[:int(ids.shape[0]), 1:_Lmax]
                 _doc_map = L.document_index(_doc_targets)
+            _art_targets = None
+            _art_map = None
+            if _art2d is not None:
+                _art_targets = _art2d[:int(ids.shape[0]), 1:_Lmax]
+                _art_map = L.document_index(_art_targets)
             for Ln in _within:
                 _t = float(_cum[:, Ln - 2].sum()) if Ln >= 2 else 0.0
                 _ntok = int(ids.shape[0]) * (Ln - 1)
@@ -2491,6 +2518,14 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=16, max_pos=
                                             _doc_map[1][:, :Ln - 1])))
                 else:
                     out[Ln]['doc_granularity'] = 'row'
+                if _art_targets is not None:
+                    # WikiText rows are lines; only the article is an
+                    # independent sampling unit for the evaluation corpus.
+                    # Additive: line-level fields above stay unchanged.
+                    out[Ln].update(L.aggregate_nll_by_article(
+                        nll_cols[:, :Ln - 1], _art_targets[:, :Ln - 1],
+                        document_index_map=(_art_map[0],
+                                            _art_map[1][:, :Ln - 1])))
             del x, nll_cols, _cum
         _trunc_cache = {}
         _val_width = int(np.asarray(val_ids).shape[1])
@@ -2571,6 +2606,12 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=16, max_pos=
                         _nll_all, _doc_targets))
                 else:
                     out[Ln]['doc_granularity'] = 'row'
+                if _art2d is not None:
+                    _art_targets = _art2d[:int(x.shape[0]), _start + 1:_end]
+                    _nll_all = torch.cat(_tok_nll).reshape(
+                        int(x.shape[0]), _ev_span)
+                    out[Ln].update(L.aggregate_nll_by_article(
+                        _nll_all, _art_targets))
                 _trunc_cache[_key] = dict(out[Ln])
                 del x, _row_nll, _tok_nll
             except Exception as e:

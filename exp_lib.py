@@ -7502,6 +7502,39 @@ def tokenizer_identity(tok, path=None):
     return out
 
 
+def load_wikitext_test_tokenizer(cache_dir=None, *, n_seqs, seq_len, vocab_size):
+    """Load the persisted TEST tokenizer WITHOUT reading the test split.
+
+    The article-unit reconstruction needs the exact byte-level decoder that
+    produced the frozen slice.  ``load_wikitest`` writes
+    ``test_tok_v2_sl{seq_len}_v{vocab_size}_ns{n_seqs}.json`` at build time;
+    reading that file is not a test access.  Returns ``None`` when the cache
+    has no persisted tokenizer (a legacy cache), so the caller can fall back
+    explicitly instead of guessing an id space.
+    """
+    n_seqs = _protocol_pos_int('n_seqs', n_seqs)
+    seq_len = _protocol_pos_int('seq_len', seq_len)
+    vocab_size = _protocol_pos_int('vocab_size', vocab_size)
+    cache_dir = _wt_cache_dir(cache_dir)
+    tag = f'v2_sl{seq_len}_v{vocab_size}_ns{n_seqs}'
+    path = os.path.join(cache_dir, f'test_tok_{tag}.json')
+    if not os.path.exists(path):
+        return None
+    try:
+        from tokenizers import Tokenizer
+        tok = Tokenizer.from_file(path)
+    except Exception as e:
+        raise RuntimeError(
+            f'load_wikitext_test_tokenizer: cached test tokenizer {path} is '
+            f'unreadable ({type(e).__name__}: {e}); cannot verify the article '
+            'unit without the exact id space') from e
+    if int(tok.get_vocab_size()) != int(vocab_size):
+        raise RuntimeError(
+            f'load_wikitext_test_tokenizer: tokenizer width '
+            f'{int(tok.get_vocab_size())} != requested {int(vocab_size)}')
+    return tok
+
+
 def _tokenizer_file_problems(meta, tok_path, label, *, require=False):
     """Reasons a persisted tokenizer file does not match its cache metadata.
 
@@ -9410,6 +9443,244 @@ def decode_token_runs(token_ids, spans, tok, *, chunk=4096):
             continue
         texts.extend(_decoded)
     return texts, problems
+
+
+def _article_group_summary(group, *, n_lines):
+    """Serialisable diagnostics shared by the article-unit builders."""
+    n_articles = int(group.get('n_articles') or 0)
+    n_lines = int(n_lines)
+    return {
+        'unit': 'article',
+        'boundary_rule': 'top_level_heading',
+        'n_lines': n_lines,
+        'n_articles': n_articles,
+        'mean_lines_per_article': (float(n_lines) / n_articles
+                                   if n_articles else None),
+        'max_lines_per_article': int(group.get('max_group_rows') or 0),
+        'pseudoreplication_factor': (float(n_lines) / n_articles
+                                     if n_articles else None),
+        'preamble_groups': int(group.get('preamble_groups') or 0),
+        'has_headings': bool(group.get('has_headings')),
+        'grouping_valid': bool(group.get('valid')),
+        'problems': list(group.get('problems') or []),
+    }
+
+
+def _normalise_article_unit_text(text):
+    return re.sub(r'\s+', ' ', str(text or '')).strip()
+
+
+def _article_cluster_ids(rows, groups):
+    """Stable CLUSTER ids for article grouping.
+
+    Unlike :func:`wikitext_article_ids` (a content hash used for leakage
+    audits), a cluster label must be identical when the same article is
+    recovered from raw rows or from decoded token runs.  The raw line and its
+    decoded form can differ in insignificant whitespace, so the key is the
+    top-level title (normalised) plus the group's ordinal position.  A
+    headerless preamble uses its whitespace-normalised text instead.  The
+    ordinal keeps two same-titled articles distinct within one slice.
+    """
+    out = []
+    for _gid, _idxs in enumerate(groups):
+        _first = str(rows[int(_idxs[0])]).rstrip('\r\n')
+        _m = _WIKITEXT_TOP_HEADING_RE.match(_first)
+        if _m:
+            _key = f'title:{_m.group(1).strip()}'
+        else:
+            _key = ('text:' + _normalise_article_unit_text(
+                wikitext_article_text(rows, _idxs)))
+        out.append(int(_doc_id_u64(_doc_exact_fp(f'{_gid}\0{_key}'))))
+    return out
+
+
+def wikitext_article_row_ids(rows):
+    """Map raw WikiText rows to stable ARTICLE ids.
+
+    The loader's ``doc_id`` is a hash of one raw row (a title, a paragraph or
+    a section heading).  An article spans several rows and is delimited by a
+    top-level `` = Title = `` heading.  This helper returns one article id per
+    row, so a cache can persist the unit a document-level claim actually needs.
+
+    Rows that are blank (or any row outside every group) get their own
+    line-level id rather than being merged into a neighbouring article: a
+    blank line must never make two articles one cluster.
+
+    Returns a dict with ``status`` in {'ok', 'empty'}, ``row_article_id``
+    (uint64, one entry per row), the article ids in group order, and the
+    grouping diagnostics.  A corpus with no top-level heading is still
+    returned (one group) but ``valid_for_clustering`` is False, because the
+    article boundary is not evidenced; callers fall back explicitly.
+    """
+    _rows = list(rows)
+    group = wikitext_article_groups(_rows)
+    n_rows = int(group.get('n_rows') or 0)
+    if not group.get('groups'):
+        return {
+            'status': 'empty',
+            'row_article_id': np.empty(0, dtype=np.uint64),
+            'article_ids': [],
+            'valid_for_clustering': False,
+            **_article_group_summary(group, n_lines=0),
+        }
+    article_ids = _article_cluster_ids(_rows, group['groups'])
+    row_aid = np.empty(n_rows, dtype=np.uint64)
+    # Start with a unique line-level id for every row (blank/uncovered rows
+    # included), then overwrite the rows that belong to an evidenced article.
+    for _i, _row in enumerate(_rows):
+        row_aid[_i] = _doc_id_u64(_doc_exact_fp(_row))
+    for _gid, _idxs in enumerate(group['groups']):
+        row_aid[np.asarray(_idxs, dtype=np.int64)] = np.uint64(article_ids[_gid])
+    return {
+        'status': 'ok',
+        'row_article_id': row_aid,
+        'article_ids': [int(x) for x in article_ids],
+        'valid_for_clustering': bool(group.get('has_headings')),
+        **_article_group_summary(
+            group, n_lines=int(group.get('n_nonempty_rows') or n_rows)),
+    }
+
+
+def wikitext_token_article_ids_from_line_map(token_ids, token_doc_ids, tok,
+                                             *, chunk=4096):
+    """Recover per-token ARTICLE ids from a frozen cache without reading raw.
+
+    ``token_doc_ids`` is the per-token line mapping persisted by the loader.
+    Each maximal run of equal ids is one served raw row; decoding the run
+    recovers its text (the tokenizer's ByteLevel decoder is attached in memory
+    for legacy caches).  Rows are then regrouped by top-level headings.
+
+    This is the path a frozen test cache uses on a cache hit: the held-out raw
+    file is not re-read and no token/cache byte is rewritten.  The recovered
+    ids are used only to choose the resampling CLUSTER, so the pooled PPL and
+    every line-level field stay bit-identical.
+
+    Returns a dict.  ``status`` is 'ok' only when every run decoded and at
+    least one group exists; ``valid_for_clustering`` additionally requires an
+    evidenced top-level heading.  On a decode failure the caller must fall
+    back to line-level uncertainty, never guess the article.
+    """
+    ids = np.asarray(token_ids)
+    line_ids = np.asarray(token_doc_ids)
+    if tuple(ids.shape) != tuple(line_ids.shape):
+        # A cache stores the per-token map flat while the served panel is 2-D.
+        # Accept the unambiguous total-size match, but never a different
+        # length (that would shift every line boundary silently).
+        if int(ids.size) == int(line_ids.size):
+            line_ids = line_ids.reshape(ids.shape)
+        else:
+            return {'status': 'shape_mismatch',
+                    'reason': (f'token_ids shape {tuple(ids.shape)} != line map '
+                               f'shape {tuple(line_ids.shape)}')}
+    if line_ids.size == 0:
+        return {'status': 'empty', 'reason': 'empty token/line map'}
+    flat_line = line_ids.reshape(-1)
+    spans = line_spans_from_token_doc_ids(flat_line)
+    texts, problems = decode_token_runs(ids.reshape(-1), spans, tok,
+                                        chunk=chunk)
+    if problems:
+        return {'status': 'decode_failed',
+                'reason': '; '.join(problems[:3]),
+                'problems': problems}
+    if any(t is None for t in texts):
+        return {'status': 'decode_failed',
+                'reason': 'one or more line runs could not be decoded'}
+    group = wikitext_article_groups(texts)
+    if not group.get('groups'):
+        return {'status': 'empty_after_grouping',
+                'reason': 'decoded line runs grouped to zero articles'}
+    article_ids = _article_cluster_ids(texts, group['groups'])
+    # One article id per decoded line, using the line's own id for rows the
+    # grouper did not place (e.g. blank lines) so no two rows are merged by
+    # accident.
+    line_aid = np.empty(len(texts), dtype=np.uint64)
+    for _i, ((_, _, _lid), _text) in enumerate(zip(spans, texts)):
+        line_aid[_i] = np.uint64(_lid)
+    for _gid, _idxs in enumerate(group['groups']):
+        line_aid[np.asarray(_idxs, dtype=np.int64)] = np.uint64(article_ids[_gid])
+    out = np.empty(flat_line.size, dtype=np.uint64)
+    for (_s, _e, _lid), _aid in zip(spans, line_aid):
+        out[int(_s):int(_e)] = _aid
+    return {
+        'status': 'ok',
+        'token_article_ids': out.reshape(ids.shape),
+        'line_article_ids': line_aid,
+        'line_ids': [int(s[2]) for s in spans],
+        'valid_for_clustering': bool(group.get('has_headings')),
+        **_article_group_summary(group, n_lines=len(spans)),
+    }
+
+
+def wikitext_token_article_ids_for_rows(rows, lengths, cap_tokens):
+    """Build per-token ARTICLE ids for a capped token stream from raw rows.
+
+    ``rows`` are the non-empty raw rows aligned with ``lengths`` (each
+    ``len(encoded_ids) + 1``, the EOS included), exactly as produced by
+    ``_tokenise_row_chunks``.  This is the cache-build counterpart of
+    :func:`wikitext_token_article_ids_from_line_map`; it writes the same
+    grouping without ever needing to decode the token stream.
+    """
+    rows = list(rows)
+    lengths = list(lengths)
+    if len(rows) != len(lengths):
+        raise ValueError(
+            f'wikitext_token_article_ids_for_rows: {len(rows)} rows but '
+            f'{len(lengths)} lengths')
+    rid = wikitext_article_row_ids(rows)
+    if rid['status'] != 'ok':
+        return {'status': rid['status'],
+                'token_article_ids': np.empty(0, dtype=np.uint64),
+                **{k: v for k, v in rid.items()
+                   if k not in ('status', 'row_article_id', 'article_ids')}}
+    row_aid = np.asarray(rid['row_article_id'], dtype=np.uint64)
+    takes = []
+    cursor = 0
+    cap_tokens = max(0, int(cap_tokens))
+    for _i, (_row, _length) in enumerate(zip(rows, lengths)):
+        _len_i = _exact_count(_length, minimum=1)
+        if _len_i is None:
+            raise ValueError(
+                'wikitext_token_article_ids_for_rows: lengths['
+                f'{_i}]={_length!r} is not a positive integer token count')
+        if cursor >= cap_tokens:
+            break
+        take = min(int(_len_i), cap_tokens - cursor)
+        if take <= 0:
+            break
+        takes.append(take)
+        cursor += take
+    if not takes:
+        out = np.empty(0, dtype=np.uint64)
+        served_aid = np.empty(0, dtype=np.uint64)
+    else:
+        served_aid = row_aid[:len(takes)]
+        out = np.repeat(served_aid, np.asarray(takes, dtype=np.int64))
+    _n_served_articles = int(np.unique(served_aid).size)
+    _served_counts = (np.unique(served_aid, return_counts=True)[1]
+                      if _n_served_articles else np.empty(0, dtype=np.int64))
+    _served = {k: v for k, v in rid.items()
+               if k not in ('status', 'row_article_id', 'article_ids')}
+    # The diagnostics describe the SERVED (capped) stream, not every raw row
+    # that happened to be passed in: an article beyond the cap is not an
+    # evaluation unit of this cell.
+    _served.update(
+        n_lines=int(len(takes)),
+        n_articles=_n_served_articles,
+        mean_lines_per_article=(float(len(takes)) / _n_served_articles
+                                if _n_served_articles else None),
+        pseudoreplication_factor=(float(len(takes)) / _n_served_articles
+                                  if _n_served_articles else None),
+        max_lines_per_article=(int(_served_counts.max())
+                               if _served_counts.size else 0),
+    )
+    return {
+        'status': 'ok',
+        'token_article_ids': out,
+        'line_article_ids': served_aid,
+        'n_tokens': int(out.size),
+        'valid_for_clustering': bool(rid['valid_for_clustering']),
+        **_served,
+    }
 
 
 class _DocDeduplicator:
@@ -29449,6 +29720,40 @@ def aggregate_nll_by_document(nll, doc_ids, *, document_index_map=None):
         'nll_per_doc_total': float(sum(nll_values)),
         'n_tokens_total': int(sum(n_tokens)),
     }
+
+
+def aggregate_nll_by_article(nll, article_ids, *, document_index_map=None):
+    """Aggregate per-target NLL into per-ARTICLE NLL / PPL.
+
+    WikiText rows are lines, not articles; a line-level bootstrap resamples
+    paragraphs of the same article and therefore understates the sampling
+    uncertainty of an article-level claim.  This is the same deterministic
+    segment sum as :func:`aggregate_nll_by_document`, with article-named
+    fields so a consumer cannot mistake one unit for the other.
+
+    The pooled totals are identical to the document aggregation for the SAME
+    targets (only the grouping differs); the caller keeps both vectors so the
+    frozen line-level contract is untouched and the article-level readout is
+    additive evidence.
+    """
+    doc = aggregate_nll_by_document(
+        nll, article_ids, document_index_map=document_index_map)
+    n_articles = int(doc['n_docs'])
+    return {
+        'article_granularity': 'article',
+        'unit_definition': ('top-level " = Title = " article; rows are lines '
+                            'and are not independent of their article'),
+        'n_articles': n_articles,
+        'nll_per_article': list(doc['nll_per_doc']),
+        'n_tokens_per_article': list(doc['n_tokens_per_doc']),
+        'ppl_per_article': list(doc['ppl_per_doc']),
+        'article_ids': list(doc['doc_ids']),
+        'article_ids_fp': doc['doc_ids_fp'],
+        'nll_per_article_total': float(doc['nll_per_doc_total']),
+        'n_tokens_article_total': int(doc['n_tokens_total']),
+        'article_source': 'per_token_article_map',
+    }
+
 
 @torch.inference_mode()
 def eval_ppl(model, val_batch, device, chunk=8, eval_rows=None, eval_seed=0, return_stats=False,

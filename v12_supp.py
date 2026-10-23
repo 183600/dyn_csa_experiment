@@ -1167,10 +1167,66 @@ def _finaltest_admission_problem(stats, manifest, *, smoke=False,
     return None
 
 
+def _resolve_test_article_ids(test_ids, test_doc_ids, *, n_seqs, seq_len,
+                              vocab_size):
+    """Recover article clusters for the frozen test slice, or explain why not.
+
+    The test cache's per-token map groups raw WikiText LINES.  A line-level
+    bootstrap resamples paragraphs of one article and understates uncertainty;
+    the article is the independent unit.  Reconstruction decodes the already
+    loaded line runs with the persisted test tokenizer, so it does NOT read
+    ``wiki.test.raw`` again and does not rewrite a cache byte.
+
+    Returns ``(article_ids_or_None, diagnostics)``.  Any failure is an
+    explicit fallback reason, never a guessed article boundary.
+    """
+    diag = {'status': 'not_attempted', 'unit': 'article',
+            'source': 'decoded_line_runs'}
+    if test_doc_ids is None:
+        diag.update(status='no_line_mapping',
+                    reason='the test cache has no per-token line map')
+        return None, diag
+    if vocab_size is None:
+        diag.update(status='no_vocab_binding',
+                    reason='the frozen test vocabulary width is unknown')
+        return None, diag
+    try:
+        tok = L.load_wikitext_test_tokenizer(
+            n_seqs=int(n_seqs), seq_len=int(seq_len),
+            vocab_size=int(vocab_size))
+    except Exception as e:
+        diag.update(status='tokenizer_unreadable',
+                    reason=f'{type(e).__name__}: {e}')
+        return None, diag
+    if tok is None:
+        diag.update(status='tokenizer_missing',
+                    reason=('the test cache has no persisted tokenizer; '
+                            'legacy caches need a rebuild for the article '
+                            'unit'))
+        return None, diag
+    rep = L.wikitext_token_article_ids_from_line_map(
+        test_ids, test_doc_ids, tok)
+    for _k, _v in rep.items():
+        if _k not in ('token_article_ids', 'line_article_ids', 'line_ids'):
+            diag[_k] = _v
+    if rep.get('status') != 'ok':
+        diag.setdefault('reason', 'article grouping did not complete')
+        return None, diag
+    if not rep.get('valid_for_clustering'):
+        diag.update(status='no_top_level_heading',
+                    reason=('the decoded slice has no evidenced top-level '
+                            '" = Title = " heading; article boundaries are '
+                            'not identifiable'))
+        return None, diag
+    diag['status'] = 'ok'
+    return rep['token_article_ids'], diag
+
+
 @torch.inference_mode()
 def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test',
                           train_fp=None, frozen_vocab=None, env=None,
-                          test_doc_ids=None):
+                          test_doc_ids=None, test_article_ids=None,
+                          article_diag=None):
     """One (arm, seed) clean by-length evaluation on the TEST split.
 
     记录现在额外携带 manifest_sha256 与
@@ -1437,7 +1493,8 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test',
     # statistic instead of treating arbitrary fixed rows as documents.
     r = V.eval_length_gen(model, test_ids, eval_lens, DEVICE, max_pos=None,
                           n_seq=int(test_ids.shape[0]),
-                          doc_ids=test_doc_ids)
+                          doc_ids=test_doc_ids,
+                          article_ids=test_article_ids)
     del model
     gc.collect()
 
@@ -1455,6 +1512,9 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test',
         # value here so the record and the staleness test cannot disagree.
         summary[f'{v}::s{seed}'] = {'variant': v, 'seed': seed, 'params': _tr.get('params') or _ck_prov.get('params'), 'by_len': r, 'split': split, 'data_fp': _dfp, 'train_fp': _tr_train_fp, '_code': V.CKPT_CODE, 'recipe': _ck_recipe, 'manifest_sha256': _msha, 'ckpt_sha256': _ensure_ck_sha(), 'ckpt_sig': (list(_ck_sig) if _ck_sig is not None else None),
                                     'n_seq': int(test_ids.shape[0]),
+                                    'article_grouping': (dict(article_diag)
+                                                         if isinstance(article_diag, dict)
+                                                         else None),
                                     'train_knobs': _tk,
                                     'train_objective': _tr.get('train_objective') or _ck_prov.get('train_objective'),
                                     'param_breakdown': _tr.get('param_breakdown') or _ck_prov.get('param_breakdown'),
@@ -1580,6 +1640,8 @@ def run_finaltest(cfg=None, guard=None):
                                 train_fp=_want_train_fp)
     _frozen_vocab = _frozen_vocab_size(manifest, cfg)
     test_doc_ids = None
+    test_article_ids = None
+    article_diag = None
     if test_ids is None:
         _t0 = time.time()
         test_ids, vocab_t, _, _, test_doc_ids = L.load_wikitest(
@@ -1614,6 +1676,26 @@ def run_finaltest(cfg=None, guard=None):
     # a null preaccess lock would let a later run bind a different slice.
     _check_or_write_freeze_lock(outdir, manifest, _dfp, stage='accessed',
                                 train_fp=_want_train_fp)
+    # The slice is now bound.  Recover the article clusters from the SAME
+    # served runs so the evaluation corpus has the independent unit; a failure
+    # is disclosed and falls back to the line map, never guessed.  Doing this
+    # AFTER the lock keeps the one-shot fingerprint write as early as possible.
+    if test_doc_ids is not None and _frozen_vocab is not None:
+        test_article_ids, article_diag = _resolve_test_article_ids(
+            test_ids, test_doc_ids, n_seqs=_nseq_clean, seq_len=need,
+            vocab_size=int(_frozen_vocab))
+        if test_article_ids is not None:
+            print(f'[p5t] article unit: {article_diag.get("n_articles")} '
+                  f'articles from {article_diag.get("n_lines")} served lines '
+                  f'(pseudoreplication factor '
+                  f'{article_diag.get("pseudoreplication_factor"):.2f}); '
+                  'line-level fields are unchanged')
+        else:
+            print('[p5t] NOTE: article-level clustering is unavailable '
+                  f'({article_diag.get("status")}: '
+                  f'{article_diag.get("reason")}); the document readout stays '
+                  'line-level and population-level uncertainty remains '
+                  'pseudoreplicated')
     if not _smoke:
         # Run the leakage gate AFTER the slice is bound but BEFORE any
         # evaluation.  The binding must survive a failed audit (that is what
@@ -1674,7 +1756,9 @@ def run_finaltest(cfg=None, guard=None):
                 split=_split_label, train_fp=_want_train_fp,
                 frozen_vocab=_frozen_vocab,
                 env=_ft_env_once,
-                test_doc_ids=test_doc_ids)
+                test_doc_ids=test_doc_ids,
+                test_article_ids=test_article_ids,
+                article_diag=article_diag)
             _cell_status[f'{v}::s{seed}'] = (_cell or {}).get('status')
     # 2) frozen uniform-corruption probe on the SAME test rows (secondary,
     #    descriptive-only per the manifest)
@@ -1836,6 +1920,102 @@ def _by_len_shape_reason(rec, n_seq):
             for _k in ('nll_per_doc', 'n_tokens_per_doc', 'ppl_per_doc', 'doc_ids'):
                 if not isinstance(_c.get(_k), list) or not _c.get(_k):
                     return (f'by_len[{_ln_i}] carries partial document fields '
+                            f'({_k} missing)')
+        # Article-level cells are the independent-unit readout.  They are
+        # additive (the line-level document fields above must stay present),
+        # but a declared article cell must partition the SAME scored targets
+        # and reconstruct the SAME totals; otherwise the article bootstrap
+        # would resample a different grouping than the reported PPL.
+        _agran = _c.get('article_granularity')
+        _art_keys = ('nll_per_article', 'n_tokens_per_article',
+                     'ppl_per_article', 'article_ids')
+        _has_art_cell = any(k in _c for k in _art_keys)
+        if _agran not in (None, 'article'):
+            return (f'by_len[{_ln_i}].article_granularity={_agran!r} is not '
+                    '"article"')
+        if _agran == 'article':
+            for _k in _art_keys:
+                if not isinstance(_c.get(_k), list) or not _c.get(_k):
+                    return (f'by_len[{_ln_i}].{_k} is missing while '
+                            'article_granularity=article — the article-level '
+                            'claim is unverifiable')
+            _alen = {len(_c[_k]) for _k in _art_keys}
+            if len(_alen) != 1:
+                return (f'by_len[{_ln_i}] article vectors disagree in length '
+                        f'{sorted(_alen)}')
+            _ant = _c.get('n_tokens_per_article')
+            _asum = 0
+            for _x in _ant:
+                if (isinstance(_x, (bool, np.bool_))
+                        or not isinstance(_x, (int, float, np.integer, np.floating))):
+                    return f'by_len[{_ln_i}].n_tokens_per_article contains {_x!r}'
+                _xf = float(_x)
+                if not math.isfinite(_xf) or _xf != math.floor(_xf) or _xf <= 0:
+                    return (f'by_len[{_ln_i}].n_tokens_per_article contains '
+                            f'{_x!r}; every retained article needs at least '
+                            'one scored target')
+                _asum += int(_xf)
+            if _asum != int(_ntok_f):
+                return (f'by_len[{_ln_i}].n_tokens_per_article sums to '
+                        f'{_asum}, not the scored n_tok={int(_ntok_f)}')
+            if _c.get('n_articles') is not None:
+                _na = _c.get('n_articles')
+                if (isinstance(_na, (bool, np.bool_))
+                        or not isinstance(_na, (int, float, np.integer, np.floating))):
+                    return f'by_len[{_ln_i}].n_articles={_na!r} is not an integer'
+                try:
+                    _naf = float(_na)
+                except (TypeError, ValueError, OverflowError):
+                    _naf = float('nan')
+                if (not math.isfinite(_naf) or _naf != math.floor(_naf)
+                        or int(_naf) != len(_ant)):
+                    return (f'by_len[{_ln_i}].n_articles={_na!r} != the '
+                            f'{len(_ant)} per-article entries')
+            _aids = _c.get('article_ids')
+            try:
+                _aset = set(_aids)
+            except TypeError:
+                return (f'by_len[{_ln_i}].article_ids contains an unhashable '
+                        'entry; the article list is malformed')
+            if len(_aset) != len(_aids):
+                return (f'by_len[{_ln_i}].article_ids contains duplicate ids; '
+                        'an article cannot be counted twice')
+            if _c.get('n_docs') is not None:
+                _nd_cmp = _record_int(_c.get('n_docs'))
+                if _nd_cmp is not None and len(_ant) > _nd_cmp:
+                    return (f'by_len[{_ln_i}] has {len(_ant)} articles but only '
+                            f'{_nd_cmp} line-level documents; article clusters '
+                            'cannot be more numerous than their lines')
+            _anll = _c.get('nll_per_article')
+            for _x in _anll:
+                if (isinstance(_x, (bool, np.bool_))
+                        or not isinstance(_x, (int, float, np.integer, np.floating))):
+                    return f'by_len[{_ln_i}].nll_per_article contains {_x!r}'
+                if not math.isfinite(float(_x)):
+                    return f'by_len[{_ln_i}].nll_per_article contains {_x!r}'
+            if _c.get('nll_sum') is not None:
+                _ns = _c.get('nll_sum')
+                if (isinstance(_ns, (bool, np.bool_))
+                        or not isinstance(_ns, (int, float, np.integer, np.floating))):
+                    return f'by_len[{_ln_i}].nll_sum={_ns!r} is not numeric'
+                _nsf = float(_ns)
+                if (not math.isfinite(_nsf)
+                        or abs(math.fsum(float(x) for x in _anll) - _nsf)
+                        > 1e-5 * max(1.0, abs(_nsf))):
+                    return (f'by_len[{_ln_i}].nll_per_article sums to '
+                            f'{math.fsum(float(x) for x in _anll)!r}, not the '
+                            f'recorded nll_sum={_nsf!r}')
+            for _tot_key, _want in (('n_tokens_article_total', _asum),
+                                    ('n_articles', len(_ant))):
+                if _c.get(_tot_key) is not None:
+                    _tv = _record_int(_c.get(_tot_key))
+                    if _tv is None or _tv != _want:
+                        return (f'by_len[{_ln_i}].{_tot_key}='
+                                f'{_c.get(_tot_key)!r} does not match {_want}')
+        elif _has_art_cell:
+            for _k in _art_keys:
+                if not isinstance(_c.get(_k), list) or not _c.get(_k):
+                    return (f'by_len[{_ln_i}] carries partial article fields '
                             f'({_k} missing)')
         if _c.get('n_seq') is not None:
             _ns = _c.get('n_seq')
@@ -2087,43 +2267,50 @@ def _admit_confirmation_records(raw, manifest):
     return admitted, (sorted(fps)[0] if fps else None)
 
 
-def _doc_nll_matrix(rows, n_docs, tokens):
-    """Validate and stack per-document NLL vectors for the pooled-Δ CI.
+def _doc_nll_matrix(rows, n_docs, tokens, *, unit='document'):
+    """Validate and stack per-unit NLL vectors for the pooled-Δ CI.
 
-    Returns ``(matrix, None)`` or ``(None, reason)``.  Admission checks the
-    same totals, but these checks are repeated at the analysis boundary: the
-    CI must be refused when the document vectors do not reconstruct the cell's
-    own totals, because a wrong interval is worse than an explicitly
-    unavailable one.
+    ``unit`` is 'document' (the frozen line-level contract) or 'article'
+    (the independent corpus unit).  Returns ``(matrix, None)`` or
+    ``(None, reason)``.  Admission checks the same totals, but these checks
+    are repeated at the analysis boundary: the CI must be refused when the
+    unit vectors do not reconstruct the cell's own totals, because a wrong
+    interval is worse than an explicitly unavailable one.
     """
+    if unit not in ('document', 'article'):
+        return None, f'unknown unit {unit!r}'
+    _suffix = 'article' if unit == 'article' else 'doc'
+    _nll_key = f'nll_per_{_suffix}'
+    _tok_key = f'n_tokens_per_{_suffix}'
+    _ppl_key = f'ppl_per_{_suffix}'
     if not isinstance(tokens, (list, tuple)) or len(tokens) != n_docs:
-        return None, 'n_tokens_per_doc is missing or misaligned'
+        return None, f'{_tok_key} is missing or misaligned'
     _tok_f = []
     for t in tokens:
         if isinstance(t, (bool, np.bool_)):
-            return None, 'n_tokens_per_doc contains a boolean'
+            return None, f'{_tok_key} contains a boolean'
         try:
             tf = float(t)
         except (TypeError, ValueError, OverflowError):
-            return None, 'n_tokens_per_doc contains a non-numeric value'
+            return None, f'{_tok_key} contains a non-numeric value'
         if not math.isfinite(tf) or tf <= 0.0:
-            return None, 'n_tokens_per_doc contains a non-positive entry'
+            return None, f'{_tok_key} contains a non-positive entry'
         _tok_f.append(tf)
     out = []
     for r in rows:
-        nll = r.get('nll_per_doc')
+        nll = r.get(_nll_key)
         if not isinstance(nll, list) or len(nll) != n_docs:
-            return None, 'nll_per_doc missing or misaligned with the document vector'
+            return None, f'{_nll_key} missing or misaligned with the {unit} vector'
         vals = []
         for x in nll:
             if isinstance(x, (bool, np.bool_)):
-                return None, 'nll_per_doc contains a boolean'
+                return None, f'{_nll_key} contains a boolean'
             try:
                 v = float(x)
             except (TypeError, ValueError, OverflowError):
-                return None, 'nll_per_doc contains a non-numeric value'
+                return None, f'{_nll_key} contains a non-numeric value'
             if not math.isfinite(v):
-                return None, 'nll_per_doc contains a non-finite value'
+                return None, f'{_nll_key} contains a non-finite value'
             vals.append(v)
         _nll_sum = r.get('nll_sum')
         if _nll_sum is not None:
@@ -2134,22 +2321,22 @@ def _doc_nll_matrix(rows, n_docs, tokens):
             except (TypeError, ValueError, OverflowError):
                 return None, 'nll_sum is not numeric'
             if not math.isfinite(_ns) or abs(math.fsum(vals) - _ns) > 1e-5 * max(1.0, abs(_ns)):
-                return None, 'nll_per_doc does not partition the recorded nll_sum'
-        _ppl = r.get('ppl_per_doc')
+                return None, f'{_nll_key} does not partition the recorded nll_sum'
+        _ppl = r.get(_ppl_key)
         if isinstance(_ppl, list) and len(_ppl) == n_docs:
             for v, t, p in zip(vals, _tok_f, _ppl):
                 if isinstance(p, (bool, np.bool_)):
-                    return None, 'ppl_per_doc contains a boolean'
+                    return None, f'{_ppl_key} contains a boolean'
                 try:
                     pf = float(p)
                 except (TypeError, ValueError, OverflowError):
-                    return None, 'ppl_per_doc contains a non-numeric value'
+                    return None, f'{_ppl_key} contains a non-numeric value'
                 expected = L._safe_exp_ppl(v / t)
                 if (expected is None or not math.isfinite(expected)
                         or not math.isfinite(pf) or pf <= 0.0
                         or abs(pf - expected) > 1e-6 * max(1.0, abs(expected))):
-                    return None, ('ppl_per_doc is inconsistent with '
-                                  'nll_per_doc / n_tokens_per_doc')
+                    return None, (f'{_ppl_key} is inconsistent with '
+                                  f'{_nll_key} / {_tok_key}')
         out.append(vals)
     return out, None
 
@@ -2172,57 +2359,89 @@ def _doc_level_analysis(recs_a, recs_b, common, Ln):
     rows_b = [recs_b[s]['by_len'].get(Ln, recs_b[s]['by_len'].get(str(Ln))) or {} for s in common]
     # A fixed eval ROW is an arbitrary window, not a document: it can split
     # one document over two rows (double-counting it) or merge two documents
-    # into one row.  Prefer the per-TOKEN document aggregation when the cache
-    # supplied it; the row fallback is kept, but labelled as row-level so a
-    # "document bootstrap" is never claimed for a row bootstrap.
+    # into one row.  A WikiText "document" is itself one raw LINE, so even the
+    # document bootstrap resamples paragraphs of the same article.  Prefer the
+    # per-TOKEN ARTICLE aggregation when every record carries it (the
+    # independent corpus unit); otherwise fall back to the line-level document
+    # map, and only then to fixed rows.  Every fallback is named in the output.
+    _art_a = [r.get('ppl_per_article') for r in rows_a]
+    _art_b = [r.get('ppl_per_article') for r in rows_b]
+    _has_art = [isinstance(x, list) and bool(x) for x in _art_a + _art_b]
     _doc_a = [r.get('ppl_per_doc') for r in rows_a]
     _doc_b = [r.get('ppl_per_doc') for r in rows_b]
     _has_doc = [isinstance(x, list) and bool(x) for x in _doc_a + _doc_b]
-    if any(_has_doc):
-        if not all(_has_doc):
+    _article_fallback = None
+    if any(_has_art) and all(_has_art):
+        _granularity = 'article'
+        _ppl_a, _ppl_b = _art_a, _art_b
+        _tok_key, _ids_key = 'n_tokens_per_article', 'article_ids'
+    elif any(_has_art):
+        if not (all(_has_doc) and any(_has_doc)):
+            return {'n_docs': 0, 'n_seeds': len(common), 'comparable': False,
+                    'reason': ('some records carry article-level cells and '
+                               'others do not; the article and line units '
+                               'cannot be pooled'),
+                    'note': 'refused rather than mixing two estimands'}
+        _article_fallback = ('article cells are missing for some arm/seed '
+                             'records; reported at the line-level document '
+                             'unit')
+        _granularity = 'document'
+        _ppl_a, _ppl_b = _doc_a, _doc_b
+        _tok_key, _ids_key = 'n_tokens_per_doc', 'doc_ids'
+    elif all(_has_doc) and any(_has_doc):
+        _granularity = 'document'
+        _ppl_a, _ppl_b = _doc_a, _doc_b
+        _tok_key, _ids_key = 'n_tokens_per_doc', 'doc_ids'
+    else:
+        if any(_has_doc):
             return {'n_docs': 0, 'n_seeds': len(common), 'comparable': False,
                     'reason': ('some records carry document-level cells and '
                                'others do not; document- and row-level '
                                'uncertainty cannot be pooled'),
                     'note': 'refused rather than mixing two estimands'}
-        _tok_a = [r.get('n_tokens_per_doc') for r in rows_a]
-        _tok_b = [r.get('n_tokens_per_doc') for r in rows_b]
+        _granularity = 'row'
+        _ppl_a = [r.get('ppl_per_seq') for r in rows_a]
+        _ppl_b = [r.get('ppl_per_seq') for r in rows_b]
+        if not all(isinstance(x, list) and x for x in _ppl_a + _ppl_b):
+            return None
+    if _granularity in ('document', 'article'):
+        _tok_a = [r.get(_tok_key) for r in rows_a]
+        _tok_b = [r.get(_tok_key) for r in rows_b]
         if not all(isinstance(x, list) and x for x in _tok_a + _tok_b):
             return {'n_docs': 0, 'n_seeds': len(common), 'comparable': False,
-                    'reason': 'document-level cells lack per-document token counts',
-                    'note': 'refused rather than treating unequal documents as equal'}
-        _lens = {len(x) for x in _doc_a + _doc_b + _tok_a + _tok_b}
+                    'reason': (f'{_granularity}-level cells lack per-unit '
+                               'token counts'),
+                    'note': 'refused rather than treating unequal units as equal'}
+        _lens = {len(x) for x in _ppl_a + _ppl_b + _tok_a + _tok_b}
         if len(_lens) != 1:
             return {'n_docs': int(min(_lens)), 'n_seeds': len(common),
                     'comparable': False,
-                    'reason': 'document counts differ across arm/seed records',
+                    'granularity': _granularity,
+                    'reason': (f'{_granularity} counts differ across arm/seed '
+                               'records'),
                     'row_counts': sorted(_lens),
                     'note': 'refused rather than silently truncating'}
         _ref_tok = list(_tok_a[0])
         if any(list(x) != _ref_tok for x in _tok_a + _tok_b):
             return {'n_docs': int(min(_lens)), 'n_seeds': len(common),
                     'comparable': False,
-                    'reason': ('per-document token counts differ across '
-                               'arm/seed records; the documents are not the '
-                               'same evaluation units'),
-                    'note': 'refused rather than pairing different documents'}
-        _ref_ids = rows_a[0].get('doc_ids')
+                    'granularity': _granularity,
+                    'reason': (f'per-{_granularity} token counts differ across '
+                               'arm/seed records; the units are not the same'),
+                    'note': 'refused rather than pairing different units'}
+        _ref_ids = rows_a[0].get(_ids_key)
         if _ref_ids is not None:
-            if any(r.get('doc_ids') != _ref_ids for r in rows_a + rows_b):
+            if any(r.get(_ids_key) != _ref_ids for r in rows_a + rows_b):
                 return {'n_docs': int(min(_lens)), 'n_seeds': len(common),
                         'comparable': False,
-                        'reason': ('document id order differs across arm/seed '
-                                   'records; document-paired deltas would pair '
-                                   'different documents'),
+                        'granularity': _granularity,
+                        'reason': (f'{_granularity} id order differs across '
+                                   'arm/seed records; paired deltas would pair '
+                                   'different units'),
                         'note': 'refused rather than pairing by position'}
-        per_doc_a, per_doc_b = _doc_a, _doc_b
-        _granularity = 'document'
+        per_doc_a, per_doc_b = _ppl_a, _ppl_b
     else:
-        per_doc_a = [r.get('ppl_per_seq') for r in rows_a]
-        per_doc_b = [r.get('ppl_per_seq') for r in rows_b]
-        if not all(isinstance(x, list) and x for x in per_doc_a + per_doc_b):
-            return None
-        _granularity = 'row'
+        per_doc_a, per_doc_b = _ppl_a, _ppl_b
     # Pair unit i across arms only when every record evaluated the SAME number
     # of units.  Silently taking the minimum would pair a truncated panel
     # with a full one and claim a larger sample than either scored.
@@ -2267,13 +2486,16 @@ def _doc_level_analysis(recs_a, recs_b, common, Ln):
     # with their token counts, not give every document equal weight.
     _pooled_ci = None
     _pooled_ci_reason = None
-    if _granularity == 'document':
-        _nll_a, _why_a = _doc_nll_matrix(rows_a, n_docs, _ref_tok)
-        _nll_b, _why_b = _doc_nll_matrix(rows_b, n_docs, _ref_tok)
+    if _granularity in ('document', 'article'):
+        _nll_a, _why_a = _doc_nll_matrix(rows_a, n_docs, _ref_tok,
+                                         unit=_granularity)
+        _nll_b, _why_b = _doc_nll_matrix(rows_b, n_docs, _ref_tok,
+                                         unit=_granularity)
         if _nll_a is None or _nll_b is None:
             _pooled_ci_reason = (
                 'token-pooled cluster CI not available: '
-                + (_why_a or _why_b or 'document NLL vectors are unusable'))
+                + (_why_a or _why_b
+                   or f'{_granularity} NLL vectors are unusable'))
         else:
             _pc = L._paired_nll_doc_ci(_nll_a, _nll_b, _ref_tok)
             if _pc is None:
@@ -2300,9 +2522,9 @@ def _doc_level_analysis(recs_a, recs_b, common, Ln):
                     _want = float(np.mean(_pt))
                     if abs(_pc['delta_ppl'] - _want) > 1e-5 * max(1.0, abs(_want)):
                         _pooled_ci_reason = (
-                            'token-pooled cluster CI refused: the document '
-                            'vectors do not reproduce the recorded per-seed '
-                            'pooled PPL difference')
+                            f'token-pooled cluster CI refused: the '
+                            f'{_granularity} vectors do not reproduce the '
+                            'recorded per-seed pooled PPL difference')
                     else:
                         _pooled_ci = _pc
                 else:
@@ -2313,8 +2535,9 @@ def _doc_level_analysis(recs_a, recs_b, common, Ln):
                     # a missing/NaN `ppl`, not because the vectors are trusted.
                     _pooled_ci_reason = (
                         'token-pooled cluster CI refused: the recorded per-seed '
-                        'pooled PPL is missing or non-finite, so the document '
-                        'vectors cannot be tied to the primary comparison')
+                        'pooled PPL is missing or non-finite, so the '
+                        f'{_granularity} vectors cannot be tied to the primary '
+                        'comparison')
     arr = np.asarray(doc_deltas, dtype=float)
     lr = np.asarray(doc_log_ratios, dtype=float)
     # Seed-level sign-flip remains the confirmatory test.  These intervals
@@ -2333,8 +2556,37 @@ def _doc_level_analysis(recs_a, recs_b, common, Ln):
     _zero = int((arr == 0).sum())
     _abs_sum = float(np.abs(arr).sum())
     _top_share = (float(np.abs(arr).max() / _abs_sum) if _abs_sum > 0.0 else None)
-    out = {'n_docs': int(len(doc_deltas)), 'n_seeds': len(common),
+    _unit_notes = {
+        'article': ('article-sampling uncertainty only; seed-level exact '
+                    'sign-flip remains the confirmatory test.  WikiText rows '
+                    'are lines, so the article (top-level heading group) is '
+                    'the independent corpus unit; article count is typically '
+                    'far below the 64-unit population floor, so '
+                    'population-level claims stay refused'),
+        'document': ('line-level sampling uncertainty only; seed-level exact '
+                     'sign-flip remains the confirmatory test.  A WikiText '
+                     '"document" is one raw line, so an article spanning '
+                     'several lines is pseudoreplicated here; report the '
+                     'article unit when the cache/tokenizer can supply it '
+                     '(design_notes section 54)'),
+        'row': ('ROW-level uncertainty only: fixed eval rows can split or '
+                'merge lines/articles, so this bootstrap is not a document '
+                'bootstrap; rebuild/copy the test cache with per-token line '
+                'ids and a byte-level tokenizer for the article-level readout'),
+    }
+    _ci_method = {
+        'article': ('percentile bootstrap over ARTICLES (chunked, '
+                    'deterministic); conditions on the trained seeds'),
+        'document': ('percentile bootstrap over LINES (the cache calls them '
+                     'documents; chunked, deterministic); conditions on the '
+                     'trained seeds'),
+        'row': ('percentile bootstrap over fixed eval ROWS (chunked, '
+                'deterministic); rows are not documents'),
+    }[_granularity]
+    out = {'n_docs': int(len(doc_deltas)), 'n_units': int(len(doc_deltas)),
+           'n_seeds': len(common),
            'granularity': _granularity,
+           'unit': _granularity,
            'per_doc_delta_mean': float(arr.mean()),
            'per_doc_delta_median': float(np.median(arr)),
            'per_doc_log_ratio_mean': float(lr.mean()),
@@ -2348,18 +2600,26 @@ def _doc_level_analysis(recs_a, recs_b, common, Ln):
            'per_doc_delta_ppl_ci95': ([_ci_ppl['ci_low'], _ci_ppl['ci_high']] if _ci_ppl else None),
            'per_doc_log_ratio_ci95': ([_ci_log['ci_low'], _ci_log['ci_high']] if _ci_log else None),
            'incomplete_doc_seed_cells': int(incomplete),
-           'ci_method': (('percentile bootstrap over DOCUMENTS (chunked, deterministic); '
-                          'conditions on the trained seeds')
-                         if _granularity == 'document' else
-                         ('percentile bootstrap over fixed eval ROWS (chunked, '
-                          'deterministic); rows are not documents, so this is '
-                          'a row-level interval, not a document-sampling one')),
+           'ci_method': _ci_method,
            'breadth_note': ('doc_a_better_fraction counts units whose seed-mean Δ (a-b) is negative, i.e. lower PPL for arm a; '
                             'top_doc_abs_share is max|Δ_unit| / sum|Δ_unit| (a single unit carrying a large share means the '
                             'mean is outlier-sensitive).  Both are descriptive: units are not an arm randomisation.'),
-           'note': (('document-sampling uncertainty only; seed-level exact sign-flip remains the confirmatory test, and n_seqs<64 does not cover the language-population distribution — enlarge the row panel for population-level claims (design_notes section 20)')
-                    if _granularity == 'document' else
-                    ('ROW-level uncertainty only: fixed eval rows can split or merge documents, so this bootstrap is not a document bootstrap; rebuild/copy the test cache with per-token document ids for the document-level readout (design_notes section 43)'))}
+           'article_fallback_reason': _article_fallback,
+           'note': _unit_notes[_granularity]}
+    if _granularity == 'article':
+        out['n_articles'] = int(len(doc_deltas))
+        _line_units = rows_a[0].get('ppl_per_doc') if rows_a else None
+        out['n_line_docs'] = (len(_line_units)
+                              if isinstance(_line_units, list) and _line_units
+                              else None)
+        if out['n_line_docs']:
+            out['pseudoreplication_factor'] = (
+                float(out['n_line_docs']) / float(out['n_articles']))
+        if out['n_articles'] < 20:
+            out['small_cluster_warning'] = (
+                'fewer than 20 article clusters: the percentile interval is '
+                'coarse and must be reported with its n; it is not a '
+                'population interval')
     if _pooled_ci is not None:
         out.update({
             'pooled_delta_ppl': _pooled_ci['delta_ppl'],
@@ -2368,17 +2628,19 @@ def _doc_level_analysis(recs_a, recs_b, common, Ln):
             'pooled_delta_log_ratio_ci95': _pooled_ci['delta_log_ratio_ci95'],
             'pooled_ratio_ci95': _pooled_ci['ratio_ci95'],
             'pooled_ci_n_docs': _pooled_ci['n_docs'],
+            'pooled_ci_n_units': _pooled_ci['n_docs'],
+            'pooled_ci_unit': _granularity,
             'pooled_ci_df': _pooled_ci['df'],
             'pooled_ci_method': _pooled_ci['method'],
             'pooled_ci_note': ('interval for the token-pooled Δ, the same '
-                               'estimand as the primary comparison; documents '
-                               'are clusters and the trained seeds are '
-                               'conditioned on.  `pooled_delta_log_ratio` is '
-                               'the seed-averaged log PPL ratio, not the log '
-                               'of the ΔPPL.  This is not a seed-level '
-                               'significance test.'),
+                               'estimand as the primary comparison; the '
+                               f'{_granularity} units are clusters and the '
+                               'trained seeds are conditioned on.  '
+                               '`pooled_delta_log_ratio` is the seed-averaged '
+                               'log PPL ratio, not the log of the ΔPPL.  This '
+                               'is not a seed-level significance test.'),
         })
-    elif _granularity == 'document':
+    elif _granularity in ('document', 'article'):
         out['pooled_ci_unavailable_reason'] = (
             _pooled_ci_reason or
             'token-pooled cluster CI not available for this cell')
@@ -2687,7 +2949,8 @@ def _doc_ci_markdown_cell(dsm):
     is testable without a panel.
     """
     dsm = dsm if isinstance(dsm, dict) else {}
-    unit = '文档' if dsm.get('granularity') == 'document' else '行'
+    _u = dsm.get('unit') or dsm.get('granularity')
+    unit = {'article': '文章', 'document': '文档'}.get(_u, '行')
 
     def _fmt(ci):
         if isinstance(ci, (list, tuple)) and len(ci) == 2:
@@ -3210,39 +3473,84 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
     if unified_fp is not None and admitted:
         # Read the recorded evaluation units from whichever frozen endpoint
         # carries them; smoking/alternate manifests need not contain L=4096.
-        # A real document count is used when the per-token mapping exists;
-        # otherwise the row count is reported as row granularity, not as
-        # "documents".
-        _n_doc, _gran, _doc_len = 0, 'row', None
+        # A real article count is preferred when every admissible cell carries
+        # it (the independent corpus unit); otherwise the line-level document
+        # count; otherwise the row count.  Mixed article coverage fails closed
+        # for a population claim rather than borrowing the larger line count.
+        _n_art, _n_doc, _n_row = 0, 0, 0
+        _art_cells = _doc_cells = _row_cells = 0
+        _doc_len = None
         for _r in admitted.values():
             for _k, _c in (_r.get('by_len') or {}).items():
                 if not isinstance(_c, dict):
                     continue
-                if isinstance(_c.get('ppl_per_doc'), list) and _c['ppl_per_doc']:
-                    # Use the most complete document panel: n_docs can grow
-                    # with the evaluation length (a longer prefix contains
-                    # more whole documents), and taking whichever cell happens
-                    # to be first would make the population gate arbitrary.
-                    if _gran != 'document' or len(_c['ppl_per_doc']) > _n_doc:
-                        _n_doc = len(_c['ppl_per_doc'])
-                        _gran = 'document'
+                _has_a = (isinstance(_c.get('ppl_per_article'), list)
+                          and bool(_c['ppl_per_article']))
+                _has_d = (isinstance(_c.get('ppl_per_doc'), list)
+                          and bool(_c['ppl_per_doc']))
+                if _has_a:
+                    _art_cells += 1
+                    if len(_c['ppl_per_article']) > _n_art:
+                        _n_art = len(_c['ppl_per_article'])
                         _doc_len = _k
-                elif (_gran != 'document'
-                      and isinstance(_c.get('ppl_per_seq'), list)
-                      and len(_c['ppl_per_seq']) > _n_doc):
-                    _n_doc, _gran = len(_c['ppl_per_seq']), 'row'
-                    _doc_len = _k
-        if _n_doc:
+                if _has_d:
+                    _doc_cells += 1
+                    if len(_c['ppl_per_doc']) > _n_doc:
+                        _n_doc = len(_c['ppl_per_doc'])
+                        if not _has_a:
+                            _doc_len = _k
+                elif (isinstance(_c.get('ppl_per_seq'), list)
+                      and _c['ppl_per_seq']):
+                    _row_cells += 1
+                    _n_row = max(_n_row, len(_c['ppl_per_seq']))
+                    if not _has_a and not _has_d:
+                        _doc_len = _k
+        _mixed_article = bool(_art_cells and _doc_cells
+                              and _art_cells != _doc_cells)
+        if _art_cells:
+            _gran = 'article'
+            _n_units = _n_art
+        elif _doc_cells:
+            _gran = 'document'
+            _n_units = _n_doc
+        elif _row_cells:
+            _gran = 'row'
+            _n_units = _n_row
+        else:
+            _n_units = 0
+            _gran = 'row'
+        if _n_units:
             stats['doc_sampling_granularity'] = _gran
+            stats['doc_sampling_unit'] = _gran
             stats['doc_sampling_endpoint'] = _doc_len
-            stats['population_claim_allowed'] = bool(_n_doc >= L.MIN_DOCS_FOR_POPULATION_CLAIM)
-            if _n_doc < L.MIN_DOCS_FOR_POPULATION_CLAIM:
-                _unit = 'documents' if _gran == 'document' else 'fixed eval rows'
-                stats['doc_sampling_note'] = (f'{_unit} recorded (n={_n_doc}); between-unit variance is reported per comparison in doc_sampling — '
-                                              f'n<{L.MIN_DOCS_FOR_POPULATION_CLAIM} does not cover the language-population distribution, so population-level claims are refused; '
-                                              'the confirmed claims are about the frozen evaluation slice (design_notes sections 20/43)'
-                                              + ('' if _gran == 'document' else
-                                                 '; ROW granularity: rebuild the test cache with per-token document ids for a document-level readout'))
+            stats['doc_sampling_n_units'] = int(_n_units)
+            stats['doc_sampling_mixed_article_coverage'] = bool(_mixed_article)
+            stats['population_claim_allowed'] = bool(
+                _n_units >= L.MIN_DOCS_FOR_POPULATION_CLAIM
+                and not _mixed_article)
+            if (not stats['population_claim_allowed']):
+                _unit = {'article': 'articles',
+                         'document': 'lines (the cache calls them documents)',
+                         'row': 'fixed eval rows'}[_gran]
+                if _mixed_article:
+                    stats['doc_sampling_note'] = (
+                        'population-level claims are refused because article '
+                        'coverage is mixed across admissible cells; the '
+                        'larger line-level count is not substituted for the '
+                        'independent unit (design_notes sections 20/43/54)')
+                else:
+                    stats['doc_sampling_note'] = (
+                        f'{_unit} recorded (n={_n_units}); between-unit '
+                        'variance is reported per comparison in '
+                        f'doc_sampling — n<{L.MIN_DOCS_FOR_POPULATION_CLAIM} '
+                        'does not cover the language-population distribution, '
+                        'so population-level claims are refused; the '
+                        'confirmed claims are about the frozen evaluation '
+                        'slice (design_notes sections 20/43/54)'
+                        + ('' if _gran == 'article' else
+                           '; the article unit is the independent corpus '
+                           'unit — report it when the cache/tokenizer can '
+                           'supply it'))
     print(f'[p5t stats] admitted {len(admitted)}/{len(manifest["arms"]) * _n} frozen (arm, seed) cells on slice {str(unified_fp)[:12]}…; {len(_fam)} frozen primary comparison(s); {len(_rej)} survive Holm; {len(_conf)} also match the pre-registered direction')
     _rob_s = ((stats.get('robustness') or {}).get('summary') or {})
     if _rob_s:
@@ -3578,7 +3886,7 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
         A('')
     comps = ft.get('comparisons') or {}
     if comps:
-        A('| 冻结主比较（test split，配对） | n | 覆盖完整 | 参数匹配 | 初始化配对 | Δ mean±std | Δ 95% CI（文档 token 池化 cluster / 行 bootstrap） | d_z | p (exact) | p 下限 | Holm p | Holm 拒绝 | 方向符合 |')
+        A('| 冻结主比较（test split，配对） | n | 覆盖完整 | 参数匹配 | 初始化配对 | Δ mean±std | Δ 95% CI（文章/文档 token 池化 cluster / 行 bootstrap） | d_z | p (exact) | p 下限 | Holm p | Holm 拒绝 | 方向符合 |')
         A('|---|---|---|---|---|---|---|---|---|---|---|---|---|')
         holm = ft.get('holm') or {}
         for k, v in comps.items():
@@ -3595,7 +3903,8 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
             _dsm = v.get('doc_sampling') or {}
             _dcitxt = _doc_ci_markdown_cell(_dsm)
             _dwin = _dsm.get('doc_a_better_fraction')
-            _dunit = ('文档' if _dsm.get('granularity') == 'document' else '行')
+            _du = _dsm.get('unit') or _dsm.get('granularity')
+            _dunit = {'article': '文章', 'document': '文档'}.get(_du, '行')
             if isinstance(_dwin, (int, float)) and _dcitxt != '—':
                 _dcitxt += f'；{100.0 * _dwin:.0f}% {_dunit} Δ<0'
             A(f'| {k} | {v["n"]} | {v.get("coverage_ok")} | {v.get("param_matched")} | {_ipa_txt} | {v["mean"]:+.2f} ± {v.get("std", 0):.2f} | {_dcitxt} | {v.get("cohens_dz", float("nan")):+.2f} | {v["p_exact_signflip"]:.3f} | {v.get("p_floor", float("nan")):.3f} | {_hp} | {_hr} | {_ds} |')
@@ -3614,10 +3923,14 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
         if any(isinstance((_v.get('doc_sampling') or {}).get('pooled_delta_ppl_ci95'),
                           (list, tuple))
                for _v in comps.values()):
-            A('（CI 口径：文档级记录使用按文档聚类的 token 池化 Δ 的 cluster-robust 区间，'
-              '点估计与冻结比较的 token 池化 Δ 相同；同表 `Δ mean±std` 的离散度是种子间训练随机性，'
-              '两者不确定性来源不同。等权逐文档 bootstrap 仍保存在 `analysis_v12/test_stats.json` 的 '
-              '`per_doc_delta_ppl_ci95`，只作「平均文档」描述，不再占据主表 CI 列。）')
+            A('（CI 口径：优先按**文章**（顶层 ` = Title = ` 分组）聚类的 token 池化 Δ '
+              'cluster-robust 区间；没有文章映射时退回按行级「文档」聚类。WikiText 的 '
+              'raw row 是一行，不是一篇文章，行级 bootstrap 会把同一文章的段落当作独立样本'
+              '（伪重复），因此文章级区间是主口径，行列字段仅作冻结契约的兼容证据。'
+              '点估计与冻结比较的 token 池化 Δ 相同；同表 `Δ mean±std` 的离散度是种子间'
+              '训练随机性，两者不确定性来源不同。等权逐单元 bootstrap 仍保存在 '
+              '`analysis_v12/test_stats.json` 的 `per_doc_delta_ppl_ci95`，只作描述，'
+              '不再占据主表 CI 列。）')
             A('')
         _conf = ft.get('confirmed')
         if _conf is None:

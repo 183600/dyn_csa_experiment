@@ -19240,6 +19240,227 @@ def t_document_unit_audit_detects_line_vs_article():
         shutil.rmtree(td, ignore_errors=True)
 
 
+def t_article_unit_primitive_and_reconstruction():
+    """L153 — article ids are recovered from a frozen line map, without raw."""
+    rows = ['', ' = Alpha = ', ' Alpha body. ', ' = = Section = = ',
+            ' More alpha. ', '', ' = Beta = ', ' Beta body. ']
+    rid = L.wikitext_article_row_ids(rows)
+    assert rid['status'] == 'ok' and rid['n_articles'] == 2, rid
+    assert rid['valid_for_clustering'] is True, rid
+    assert rid['n_lines'] == 6, rid
+    aid = rid['row_article_id']
+    assert aid[1] == aid[2] == aid[3] == aid[4], rid
+    assert aid[6] == aid[7] and aid[1] != aid[6], rid
+    # A blank/uncovered row is its own cluster, never folded into an article.
+    assert aid[0] not in (aid[1], aid[6]), rid
+    assert aid[5] not in (aid[1], aid[6]), rid
+    # Cluster identity is the article, not its body bytes: editing a paragraph
+    # keeps the cluster, editing/removing the top-level title does not.
+    edited = list(rows)
+    edited[2] = ' A changed line. '
+    assert L.wikitext_article_row_ids(edited)['row_article_id'][1] == aid[1]
+    retitled = list(rows)
+    retitled[1] = ' = Gamma = '
+    assert L.wikitext_article_row_ids(retitled)['row_article_id'][1] != aid[1]
+    # A corpus with no top-level heading is returned but not claimed valid.
+    nohead = L.wikitext_article_row_ids([' a ', ' b ', ' c '])
+    assert nohead['status'] == 'ok' and nohead['valid_for_clustering'] is False
+
+    td = tempfile.mkdtemp(prefix='articleunit_')
+    old_env = os.environ.get('WT103_CACHE_DIR')
+    try:
+        info = _write_document_unit_fixture(td)
+        ttag = info['ttag']
+        sl = 8
+        test = [' = Alpha = ', ' Alpha is a test article. ',
+                ' It has two lines. ', ' = Beta = ',
+                ' Beta is another article. ', ' Another line here. ']
+        ids = np.load(os.path.join(td, f'test_ids_{ttag}.npy'))
+        line = np.load(os.path.join(td, f'test_token_doc_ids_{ttag}.npy'))
+        from tokenizers import Tokenizer
+        tok = Tokenizer.from_file(os.path.join(td, f'test_tok_{ttag}.json'))
+        rep = L.wikitext_token_article_ids_from_line_map(ids, line, tok)
+        assert rep['status'] == 'ok', rep
+        assert rep['n_lines'] == 6 and rep['n_articles'] == 2, rep
+        assert rep['pseudoreplication_factor'] == 3.0, rep
+        assert len(set(rep['line_article_ids'].tolist())) == 2, rep
+        assert np.unique(rep['token_article_ids']).size == 2, rep
+        # The article id is the article, not one of its line ids.
+        assert set(rep['line_article_ids'].tolist()) != set(rep['line_ids']), rep
+        # Cache-build path (raw rows + lengths) must agree with the decode path.
+        lengths = []
+        full = L._tokenise_row_chunks([test], 10 ** 9, 'test', tok,
+                                      tok.token_to_id('<eos>'),
+                                      lengths_out=lengths)
+        te_rows = [r for r in test if r.strip()]
+        ta = L.wikitext_token_article_ids_for_rows(
+            te_rows, lengths, int(ids.size))
+        assert ta['status'] == 'ok', ta
+        assert np.array_equal(ta['token_article_ids'],
+                              rep['token_article_ids'].reshape(-1)), ta
+        assert int(full.size) >= int(ids.size)
+        # A legacy tokenizer (decoder null) is repaired in memory, not trusted
+        # as BPE surface text.
+        tok.decoder = None
+        rep_legacy = L.wikitext_token_article_ids_from_line_map(ids, line, tok)
+        assert rep_legacy['status'] == 'ok', rep_legacy
+        assert np.array_equal(rep_legacy['token_article_ids'],
+                              rep['token_article_ids']), rep_legacy
+        # A flat map with a wrong total size is refused, never reshaped by
+        # guessing where a line boundary moved.
+        bad = L.wikitext_token_article_ids_from_line_map(
+            ids, line[:-1], tok)
+        assert bad['status'] == 'shape_mismatch', bad
+        # The persisted test tokenizer is loadable without a test read.  The
+        # fixture's tiny BPE fit stops below its requested width, so use the
+        # actual serialized width and mirror the file under that tag.
+        vw = int(tok.get_vocab_size())
+        shutil.copy(os.path.join(td, f'test_tok_{ttag}.json'),
+                    os.path.join(td, f'test_tok_v2_sl{sl}_v{vw}_ns{ids.shape[0]}.json'))
+        tk = L.load_wikitext_test_tokenizer(td, n_seqs=ids.shape[0],
+                                            seq_len=sl, vocab_size=vw)
+        assert tk is not None and tk.get_vocab_size() == vw
+        shutil.copy(os.path.join(td, f'test_tok_{ttag}.json'),
+                    os.path.join(td, f'test_tok_v2_sl{sl}_v{vw + 1}_ns{ids.shape[0]}.json'))
+        try:
+            L.load_wikitext_test_tokenizer(td, n_seqs=ids.shape[0],
+                                           seq_len=sl, vocab_size=vw + 1)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError('a tokenizer width mismatch must be refused')
+        # The driver helper resolves the same article map through the cache.
+        os.environ['WT103_CACHE_DIR'] = td
+        art, diag = V12._resolve_test_article_ids(
+            ids, line.reshape(ids.shape), n_seqs=ids.shape[0], seq_len=sl,
+            vocab_size=vw)
+        assert art is not None and diag['status'] == 'ok', diag
+        assert np.array_equal(art, rep['token_article_ids']), diag
+        assert diag['n_articles'] == 2 and diag['n_lines'] == 6, diag
+    finally:
+        if old_env is None:
+            os.environ.pop('WT103_CACHE_DIR', None)
+        else:
+            os.environ['WT103_CACHE_DIR'] = old_env
+        shutil.rmtree(td, ignore_errors=True)
+
+
+def _article_cell(nll_doc, tok_doc, ids_doc, nll_art, tok_art, ids_art,
+                  n_seq=2):
+    """A self-consistent by_len cell carrying BOTH line and article units."""
+    n_tok = sum(tok_doc)
+    assert sum(tok_art) == n_tok and sum(nll_art) == sum(nll_doc)
+    return {
+        'n_tok': n_tok, 'truncated': False, 'n_seq': n_seq,
+        'nll_sum': math.fsum(nll_art),
+        'ppl': math.exp(math.fsum(nll_art) / n_tok),
+        'nll_per_seq': [math.fsum(nll_art)] * n_seq,
+        'ppl_per_seq': [math.exp(math.fsum(nll_art) / n_tok)] * n_seq,
+        'doc_granularity': 'document',
+        'nll_per_doc': list(nll_doc), 'n_tokens_per_doc': list(tok_doc),
+        'ppl_per_doc': [math.exp(n / t) for n, t in zip(nll_doc, tok_doc)],
+        'doc_ids': list(ids_doc), 'n_docs': len(tok_doc),
+        'article_granularity': 'article',
+        'nll_per_article': list(nll_art),
+        'n_tokens_per_article': list(tok_art),
+        'ppl_per_article': [math.exp(n / t) for n, t in zip(nll_art, tok_art)],
+        'article_ids': list(ids_art), 'n_articles': len(tok_art),
+    }
+
+
+def t_article_level_eval_and_analysis():
+    """L154 — article clustering is additive and preferred by the analysis."""
+    import copy as _copy
+    torch.manual_seed(0)
+    dev = torch.device('cpu')
+    cfgs = L.make_layer_cfgs(2, 'full_rope')
+    model = L.SmallGPT(256, 64, 2, 4, 16, 64,
+                       _copy.deepcopy(cfgs)).to(dev)
+    model.eval()
+    ids = np.asarray(np.random.default_rng(11).integers(0, 256, size=(3, 65)),
+                     dtype=np.int64)
+    # Four line-level documents inside two articles.
+    doc = np.empty_like(ids, dtype=np.uint64)
+    doc[:, :20] = 11
+    doc[:, 20:40] = 22
+    doc[:, 40:] = 33
+    art = np.empty_like(ids, dtype=np.uint64)
+    art[:, :20] = 101
+    art[:, 20:] = 202
+    base = V7.eval_length_gen(model, ids, [32], dev, max_pos=None,
+                              doc_ids=doc)[32]
+    both = V7.eval_length_gen(model, ids, [32], dev, max_pos=None,
+                              doc_ids=doc, article_ids=art)[32]
+    # The frozen line-level fields are bit-identical; article fields are
+    # additive evidence, not a replacement.
+    assert both['ppl'] == base['ppl'], (both['ppl'], base['ppl'])
+    assert both['nll_per_doc'] == base['nll_per_doc'], both
+    assert both['ppl_per_doc'] == base['ppl_per_doc'], both
+    assert both['n_docs'] == base['n_docs'] and both['doc_granularity'] == 'document'
+    assert both['article_granularity'] == 'article' and both['n_articles'] == 2, both
+    assert sum(both['n_tokens_per_article']) == both['n_tok'], both
+    assert abs(math.fsum(both['nll_per_article']) - both['nll_sum']) <= \
+        1e-5 * max(1.0, abs(both['nll_sum'])), both
+    assert len(set(both['article_ids'])) == 2, both
+    # Admission accepts the additive cell and rejects inconsistent article
+    # vectors instead of letting them reach the bootstrap.
+    assert V12._by_len_shape_reason({'by_len': {32: both}}, 3) is None
+    for _mut, _needle in (
+            (lambda c: c.update(n_tokens_per_article=[46, 46]), 'sums to'),
+            (lambda c: c.update(article_ids=['a', 'a']), 'duplicate'),
+            (lambda c: c.update(article_ids=[['a'], ['b']]), 'unhashable'),
+            (lambda c: c.pop('nll_per_article'), 'missing'),
+            (lambda c: c.update(article_granularity='line'), 'article_granularity'),
+            (lambda c: c.update(n_articles=1), 'n_articles')):
+        bad = _copy.deepcopy(both)
+        _mut(bad)
+        why = V12._by_len_shape_reason({'by_len': {32: bad}}, 3)
+        assert why is not None and _needle in why, (why, _needle, bad)
+    for bad_map in (art[:, :-1], art.astype(np.float64), -(art.astype(np.int64))):
+        try:
+            V7.eval_length_gen(model, ids, [32], dev, max_pos=None,
+                               article_ids=bad_map)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('eval_length_gen accepted a bad article map')
+
+    # Analysis prefers the article unit when every record carries it.
+    cells_a = _article_cell([2.0, 6.0], [4, 10], ['l1', 'l2'],
+                            [2.0, 6.0], [7, 7], ['a1', 'a2'])
+    cells_b = _article_cell([2.5, 6.5], [4, 10], ['l1', 'l2'],
+                            [2.5, 6.5], [7, 7], ['a1', 'a2'])
+    recs_a = {s: {'by_len': {512: _copy.deepcopy(cells_a)}} for s in (0, 1)}
+    recs_b = {s: {'by_len': {512: _copy.deepcopy(cells_b)}} for s in (0, 1)}
+    out = V12._doc_level_analysis(recs_a, recs_b, [0, 1], 512)
+    assert out is not None and out['granularity'] == 'article', out
+    assert out['unit'] == 'article' and out['n_units'] == 2, out
+    assert out['n_articles'] == 2 and out['n_docs'] == 2, out
+    assert out['pooled_ci_n_units'] == 2, out
+    assert out['n_line_docs'] == 2 and out['pseudoreplication_factor'] == 1.0, out
+    assert 'small_cluster_warning' in out, out
+    want = math.exp(8.0 / 14.0) - math.exp(9.0 / 14.0)
+    assert abs(out['pooled_delta_ppl'] - want) < 1e-12, (out, want)
+    assert '文章' in V12._doc_ci_markdown_cell(out), out
+    # If only some records carry article cells, do not mix units: fall back
+    # to the line-level document map and say so.
+    recs_doc_b = _copy.deepcopy(recs_b)
+    for s in (0, 1):
+        for _k in ('nll_per_article', 'n_tokens_per_article',
+                   'ppl_per_article', 'article_ids', 'article_granularity',
+                   'n_articles'):
+            recs_doc_b[s]['by_len'][512].pop(_k, None)
+    fallback = V12._doc_level_analysis(recs_a, recs_doc_b, [0, 1], 512)
+    assert fallback is not None and fallback['granularity'] == 'document', fallback
+    assert fallback['article_fallback_reason'], fallback
+    # Article ids that differ across seeds are not the same units.
+    recs_b_ids = _copy.deepcopy(recs_b)
+    for s in (0, 1):
+        recs_b_ids[s]['by_len'][512]['article_ids'] = ['a1', f'a{s + 3}']
+    mixed_ids = V12._doc_level_analysis(recs_a, recs_b_ids, [0, 1], 512)
+    assert mixed_ids is not None and mixed_ids['comparable'] is False, mixed_ids
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -19735,6 +19956,8 @@ def main():
     _check('L150 length interaction uses within-seed log effects', t_length_interaction_analysis_and_markdown)
     _check('L151 WikiText row/line/article unit primitives + round-trip tokenizer', t_wikitext_article_unit_primitives)
     _check('L152 document-unit audit refuses line pseudodocuments and catches article leakage', t_document_unit_audit_detects_line_vs_article)
+    _check('L153 article unit primitives recover clusters from the frozen line map', t_article_unit_primitive_and_reconstruction)
+    _check('L154 article clustering is additive and preferred over line clusters', t_article_level_eval_and_analysis)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

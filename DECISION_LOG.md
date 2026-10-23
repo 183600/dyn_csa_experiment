@@ -2268,3 +2268,97 @@ train/validation failing the audit).  `python test_review_fixes.py` passes
 489/492 with the same 3 DataLoader environment skips;
 `python audit_gates.py document_unit` reports `not_verifiable_locally` with no
 cache; `python v12_supp.py plan` still admits 72/72 synthetic frozen records.
+
+## 2026-10-23 — evaluation uncertainty is clustered by article, not by raw line (no new runs)
+
+Zero-GPU results-analysis hardening; no training run, no test read, no frozen
+manifest byte, seed, recipe, endpoint, alpha, Holm family, decision rule or
+`CODE_SEMANTICS` is touched.
+
+**Problem.** §53 of the design notes made the analysis unit explicit: the
+HF `wikitext-103-raw-v1` builder yields one row per raw **line**, so the
+loader's "document" sidecar is a line, and an article spans many rows.  The
+audit (`audit_gates.document_unit`) could report the true article count and
+refused unqualified document-level claims, but the per-comparison
+`doc_sampling` readout still resampled the line-level `nll_per_doc` vectors.
+That is pseudoreplication: several paragraphs of one article are treated as
+independent sampling units, so the document bootstrap interval is too narrow
+and `n_docs` overstates the independent corpus breadth.  The frozen `n=48`
+"documents" are 48 fixed evaluation rows, not 48 articles.  As a concrete
+check, the local 512x512 validation cache decodes to 2022 line runs inside 56
+top-level articles (36.1 lines per article): the line bootstrap would treat
+roughly 36 paragraphs as independent draws from a single article.
+
+**Changes. (1) Article cluster primitives.** `exp_lib` now has
+`wikitext_article_row_ids(rows)`, `wikitext_token_article_ids_from_line_map(
+token_ids, line_ids, tok)`, `wikitext_token_article_ids_for_rows(rows,
+lengths, cap_tokens)` and `aggregate_nll_by_article(nll, article_ids)`.
+Cluster ids are keyed by `(group ordinal, normalised top-level " = Title = "
+heading)`, not by the article body hash: the same frozen slice recovered from
+raw rows or from decoded token runs must yield the same clusters, while a body
+edit does not split one article and an ordinal disambiguates same-titled
+articles.  Blank/uncovered rows get their own id and are never merged into a
+neighbouring article.  `wikitext_article_ids()` (the content hash used by the
+leakage audit) is unchanged; cluster label and content identity are now
+separate concepts.  `load_wikitext_test_tokenizer()` reads the persisted test
+tokenizer JSON (width-checked) without touching `wiki.test.raw`.
+
+**(2) Additive evaluation fields.** `v7_supp.eval_length_gen` accepts an
+optional `article_ids` mapping and appends `article_granularity='article'`,
+`n_articles`, `nll_per_article`, `n_tokens_per_article`, `ppl_per_article`,
+`article_ids`, `article_ids_fp` and article totals.  The line-level
+`nll_per_doc` / `n_tokens_per_doc` / `ppl_per_doc` / `doc_ids` fields and every
+pooled `ppl` / `nll_sum` / `n_tok` value stay bit-identical: the article
+aggregation is a second grouping of the same per-token NLLs.  The frozen
+line-level contract therefore remains auditable.
+
+**(3) P5T reconstruction without a second test read.** The driver resolves the
+article map from the already-loaded per-token line map and the persisted
+ByteLevel decoder (`_resolve_test_article_ids`).  A legacy cache with no
+persisted tokenizer or no top-level heading falls back to the line unit with
+an explicit status/reason recorded in every P5T record's `article_grouping`;
+it never guesses an article boundary and never re-reads the held-out split.
+The decoder is repaired in memory for legacy caches, not written back.
+
+**(4) Admission and analysis.** `_by_len_shape_reason` validates article
+vectors with the same rigor as line vectors (equal lengths, positive integer
+token counts that partition `n_tok`, finite NLLs that reconstruct `nll_sum`,
+matching `n_articles`, unique ids, article count <= line-document count), and
+refuses partially-written article fields.  `_doc_level_analysis` prefers
+articles when every admitted record carries them, falls back to line-level
+documents (with `article_fallback_reason`) when coverage is mixed, and refuses
+to pool mixed units.  `_doc_nll_matrix` takes `unit='document'|'article'`.
+The analysis also reports `n_line_docs`, the observed
+`pseudoreplication_factor` (line units per article) and a
+`small_cluster_warning` below 20 article clusters.  The population-claim gate
+now uses the article count and refuses a population claim when article
+coverage is mixed rather than substituting the larger line count.  Report
+rendering names the unit ("文章"/"文档"/"行").
+
+**Boundary.** This changes the evaluation *unit of uncertainty*, not the
+point estimate or the frozen decision: the exact sign-flip over seeds remains
+the confirmatory test, and no article field enters `run_cfg`, resume keys,
+pairing identity or the manifested endpoint.  The article count over a
+48×4097 prefix is expected to be well below the 64-unit population floor, so
+population claims remain refused; the gain is that the refusal and any
+reported interval now use the independent unit.  A cap-truncated final
+article is one in-slice cluster whose label is reproducible within the frozen
+slice; it is not claimed to equal the full-article content id.  No
+article sidecar is persisted yet — a future freeze should write
+`test_token_article_ids_*` before the one-shot read.  Historical v6-v11
+panels are not backfilled: their records carry no article fields and remain
+line-level; only new `eval_length_gen(article_ids=...)` callers get the
+article readout.
+
+**Verification.** New CPU tests L153 (blank rows not merged, title vs body
+edits, raw-vs-decode identical clusters, legacy decoder repair, wrong-size
+flat map refused, tokenizer width mismatch refused, driver helper reconstructs
+the same map from the cache) and L154 (line fields bit-identical after the
+additive article aggregation, article totals partition `n_tok`/`nll_sum`,
+admission rejects partial/duplicate/inconsistent article cells, analysis
+prefers articles, mixed coverage falls back with a recorded reason,
+cross-seed article-id mismatch is refused).  `python test_review_fixes.py`
+passes 493/496 with the same 3 DataLoader environment skips;
+`python v12_supp.py plan` still admits 72/72 synthetic frozen records with the
+same six comparisons; `python audit_gates.py source` reports `ok` (23/23 files byte-identical)
+after regenerating the plan snapshot with `python v12_supp.py plan`.

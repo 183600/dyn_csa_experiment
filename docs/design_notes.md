@@ -2959,3 +2959,165 @@ L151 覆盖：顶层标题切分、空行不切分、section 标题不切分、p
 `document_level_claims_allowed=False`、冻结前缀文章数、缺 raw 的
 `not_verifiable_locally`、line/article 结构分类，以及「同一文章标题的行
 跨 train/validation」被判 `fail` 的文章级泄漏。
+
+> **后续（§54）。** 本节只把「行 vs 文章」做成审计与拒绝主张；§54 进一步
+> 把文章聚类接进评测记录与结果分析：`nll_per_article` 等字段与行级字段
+> 并存，`doc_sampling` 在可用时按文章 cluster 重采样。§53.3 所说的
+> 「per-document 向量仍是行级」指**冻结的行级契约未改**；新增的文章向量
+> 是追加证据，不替换旧字段。
+
+## 54. 评测不确定性必须按文章聚类，而不是按原始行（本轮统计口径硬化）
+
+§53 把「分析单元是原始行，不是文章」变成可审计的诊断，但**主分析仍然
+按行级 per-document 向量做 bootstrap**。这不只是标签问题：一行是文章内的
+一个段落/标题行，同一篇文章的多行被当作独立样本重采样，等于把段落当成了
+独立的语料抽样单位。区间会因此偏窄，`n_docs` 也会被行数虚构地抬高。§53
+把这个边界写清楚了，本轮把文章级聚类真正接进评测记录与结果分析，同时
+**不改冻结清单、不改训练、不改主终点 PPL、不改任何 line 字段**。
+
+### 54.1 问题：行级 bootstrap 的伪重复
+
+冻结评测的 48 条固定窗口按逐 token 行映射聚合后，得到的是该切片覆盖的
+raw lines（通常多于 48 条）的「per-document」向量；每条向量其实是一个
+raw row（标题、段落或 section 标题），一篇 WikiText 文章通常跨多行。
+于是：
+
+- 同一篇文章的若干段落被当成独立抽样单位，文章内相关被忽略；
+- 文章数远小于行数，真正的独立单位数被高估；
+- `doc_sampling` 的区间、`doc_a_better_fraction`、top-share 等描述量
+  都作用在错误的单位上；
+- 冻结清单把 48 条评测行写成「48 篇文档」；行级 `n_docs` 计的是行数，
+  二者都不是文章数。
+
+本地 512×512 验证缓存（2026-10-23 的当前工作区）解码后是 2022 条行级
+run、56 篇顶层文章，平均 36.1 行/篇。也就是说，行级 bootstrap 会把同一篇
+文章里约 36 个段落当成独立抽样单位；这正是伪重复的量级。
+
+§53 的审计已经能报告真实文章数与 `document_level_claims_allowed=False`，
+但那只阻止了主张，并没有让区间本身变对。本轮补上后者。
+
+### 54.2 文章聚类的构造：标题 + 组序号
+
+新增 `exp_lib.wikitext_article_row_ids(rows)`：按顶层 ` = Title = ` 标题
+把 raw rows 分组成文章，再为每篇文章生成一个**聚类 id**。id 的键是
+
+```
+(组序号, 归一化后的顶层标题)
+```
+
+而不是文章正文的内容哈希。原因：
+
+- 同一个冻结切片既可以从 raw rows 构造，也可以从已落盘的逐 token 行映射
+  解码后重建；两者的正文可能有无害的空白差异，但标题一致。用标题做键，
+  两条路径得到同一组聚类 id。
+- 正文编辑不应把同一篇文章拆成两个 cluster；标题/组序号才是文章身份。
+- 组序号保证同一标题的两篇文章（罕见）不会合并。
+
+无标题的 preamble 用「空白归一化后的正文」做键，并报告
+`preamble_groups`；它被当作一个独立 cluster（保守：不与其在切片外的
+续文合并）。`wikitext_article_ids()`（内容哈希，用于泄漏审计）保持不变，
+两个 id 的用途不同：前者是**聚类标签**，后者是**内容身份**。
+
+### 54.3 不需要重读 test split 的重建
+
+`exp_lib.wikitext_token_article_ids_from_line_map(token_ids, line_ids, tok)`：
+
+1. `line_spans_from_token_doc_ids` 把逐 token 行映射切成连续 run；
+2. `decode_token_runs` 用持久化的 ByteLevel decoder 解出每一行的文本
+   （legacy `decoder: null` 只在内存中补，不重写缓存）；
+3. `wikitext_article_groups` 按顶层标题分组；
+4. 把每个 run 的 token 写成其文章的聚类 id。
+
+因此 P5T 在**已经读过** test slice 之后，只需读 `test_tok_*.json` 就能
+重建文章映射，不会第二次访问 `wiki.test.raw`，也不修改任何缓存字节。
+`load_wikitext_test_tokenizer()` 只读 tokenizer JSON，并核对宽度；缺
+tokenizer 的 legacy cache 明确回退到行级，不猜 id 空间。
+
+`wikitext_token_article_ids_for_rows(rows, lengths, cap_tokens)` 是
+cache-build 对偶：直接从 raw rows + 每行 token 长度构造同样的映射，供未来
+在首次 test 读取前落文章侧车。
+
+### 54.4 评测记录：文章字段是**追加**的
+
+`v7_supp.eval_length_gen(..., article_ids=...)` 在原有
+`nll_per_doc` / `n_tokens_per_doc` / `ppl_per_doc` / `doc_ids` **之外**
+追加：
+
+```
+article_granularity = 'article'
+n_articles
+nll_per_article
+n_tokens_per_article
+ppl_per_article
+article_ids
+article_ids_fp
+nll_per_article_total
+n_tokens_article_total
+```
+
+行级字段逐位不变（同一 `nll_cols`，只是多一次分组求和）。池化 `ppl`、
+`nll_sum`、`n_tok`、`ppl_per_seq` 完全不变；冻结的 line 契约仍可复核。
+`article_ids` 是聚类标签的十六进制形式，使用与 line 相同的定长格式。
+
+`_by_len_shape_reason` 对文章字段做与行级字段同等的准入检查：向量等长、
+token 计数为正整数且精确分割 `n_tok`、NLL 有限且重构 `nll_sum`、
+`n_articles` 一致、`article_ids` 无重复、文章数不得超过行级文档数。
+部分写入或自相矛盾的文章字段被拒绝，而不是被当作「没有文章字段」。
+
+### 54.5 结果分析：文章优先、回退显式
+
+`_doc_level_analysis` 的单位选择顺序：
+
+1. 每条记录的每个 cell 都有完整文章向量 → `granularity='article'`；
+2. 只有部分记录有 → 若全部有行级向量，回退到 `'document'` 并在
+   `article_fallback_reason` 里说明；否则拒绝混合估计量；
+3. 没有文章/行级向量 → 退回 `'row'`。
+
+文章模式下，`_doc_nll_matrix(..., unit='article')` 读取
+`nll_per_article` / `n_tokens_per_article` / `ppl_per_article`，逐文章
+配对、按 token 池化、对文章做 cluster bootstrap。`n_docs` 字段保留为
+「单位数」的历史名字，同时给出 `unit` / `n_units` / `n_articles` /
+`pooled_ci_unit`，避免下游把文章数误读成行数。`_doc_ci_markdown_cell`
+对文章显示「文章」，对行级显示「文档/行」。文章 cluster 少于 20 时，
+`small_cluster_warning` 明确说明百分位区间很粗、必须连同 n 报告，不能当作
+总体区间。
+
+种群门槛（`population_claim_allowed`）优先使用文章数：只要任一 cell 有
+文章向量就用文章单位；若文章覆盖在不同 cell 间不一致，则**不**用更大的
+行数替代，直接拒绝种群主张。这与「文章是独立单位」的统计含义一致。由于
+48 条 4097-token 行通常只覆盖几十篇文章，门槛几乎必然仍是 `n<64`；
+本轮的贡献是让拒绝理由和区间都建立在正确单位上，而不是放宽门槛。
+
+### 54.6 边界
+
+- **不改任何 token、split、训练、checkpoint、PPL 点估计、种子、alpha、
+  Holm family、决策规则或 `confirmation_frozen*.json`**；不需要 bump
+  `CODE_SEMANTICS`。
+- 文章聚类是**分析单位**，不是新数据；文章 id 不进入 `run_cfg`、resume
+  指纹或 pairing 键。
+- 切片末尾被 cap 截断的文章仍是一个 cluster，但其 id 只基于切片内可见的
+  标题/组序号；这是可复现的切片内身份，不声称与全文文章 id 相同。
+- 切片从文章中间开始且没有顶层标题时，`valid_for_clustering=False`，明确
+  回退行级；不把「无标题」误判成「一篇文章」。
+- 文章级侧车尚未写入缓存；本轮在 P5T 分析时从行映射重建。未来应在首次
+  test 读取前写 `test_token_article_ids_*`，让缓存自身携带该单位。
+- 历史探索性面板（v6–v11）的落盘记录没有文章字段，仍按行级分析；本轮
+  不重跑、不回填，也不把旧记录重新标记成文章级。`eval_length_gen` 的
+  `article_ids=` 是给新面板/新分析的入口。
+- 文章级区间仍只描述冻结切片的文章抽样，不是语言总体；`n<64` 时种群
+  主张继续拒绝。
+
+### 54.7 复核
+
+```bash
+python test_review_fixes.py     # L153 文章原语/重建；L154 评测字段 + 分析偏好
+python v12_supp.py plan         # 零 GPU、不读 test，冻结计划不变
+python audit_gates.py report     # 其余审计不变
+```
+
+L153 覆盖：空白行不并入文章、标题变更改变聚类、正文变更不改变聚类、
+raw/lengths 与 decode 两条路径得到同一映射、legacy decoder 内存修复、
+错误总长度的扁平映射被拒绝、tokenizer 宽度不匹配被拒绝、驱动 helper
+从缓存重建同一文章映射。L154 覆盖：文章字段追加后行级字段逐位不变、
+文章 token/NLL 精确重构池化总量、准入拒绝部分/重复/不一致字段、分析
+优先文章单位、混合覆盖回退行级并留痕、跨种子文章 id 不一致被拒绝。
