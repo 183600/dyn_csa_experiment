@@ -16064,6 +16064,24 @@ def t_factorial_design_gate_verifies_parallel_cells():
         present=set(L.RUN_ABL['variants']) - {'csa_dyn_randidx'})
     assert rmiss['status'] == 'fail', rmiss
     assert any('not scheduled' in v for v in rmiss['violations']), rmiss['violations']
+    # A scaled model must be audited at its actual depth, not a hard-coded 6.
+    rdeep = L.factorial_design_audit(n_layers=2)
+    assert rdeep['status'] == 'ok', rdeep['violations']
+    assert rdeep['n_layers'] == 2, rdeep
+    # Two distinct dict keys that normalise to the same (row, column) cell
+    # must not let one silently overwrite the other.
+    class _AliasKey(tuple):
+        __hash__ = object.__hash__
+        __eq__ = object.__eq__
+
+    alias = copy.deepcopy(L.FACTORIAL_DESIGN['dynamic_blocking_x_attention_sink'])
+    alias['cells'][_AliasKey(('control', 'control'))] = \
+        alias['cells'][('control', 'control')]
+    ralias = L.factorial_design_audit(
+        {'alias': alias}, present=set(L.RUN_ABL['variants']))
+    assert ralias['status'] == 'fail', ralias
+    assert any('duplicates normalized cell' in v
+               for v in ralias['violations']), ralias['violations']
 
 
 def _factorial_records(interaction, n=7, params=None):
@@ -16215,6 +16233,43 @@ def t_factorial_design_gate_rejects_value_drift_and_absent_interventions():
     # TypeError escaping the audit.
     err, per = L._design_pair_cfg_keys('a', 'b', lambda _n, _v: None, 2)
     assert isinstance(err, Exception) and per == {}, (err, per)
+
+
+def t_factorial_interaction_matches_stripped_arms_and_disjoint_designs():
+    import copy
+    recs = _factorial_records(0.05)
+    base = copy.deepcopy(
+        L.FACTORIAL_DESIGN['dynamic_blocking_x_learned_selection'])
+    # A single declared factorial is fully identified by its own four arms;
+    # it must not be skipped just because those arms are also the global
+    # intersection of a one-element design list.
+    rone = L.factorial_interaction_audit(design={'only': base}, recs=recs)
+    assert rone['status'] == 'ok', rone
+    one = rone['factorials']['only']
+    assert one['n_complete'] == 7 and one['interaction']['available'] is True, one
+    assert rone['family']['m'] == 1, rone['family']
+    # Arm ids are stripped by the design gate; the record-level audit must
+    # resolve the same records rather than silently reporting no_data.
+    ws = copy.deepcopy(base)
+    ws['cells'] = {k: '  %s  ' % v for k, v in ws['cells'].items()}
+    rws = L.factorial_interaction_audit(design={'padded': ws}, recs=recs)
+    assert rws['status'] == 'ok', rws
+    wfac = rws['factorials']['padded']
+    assert wfac['n_complete'] == 7 and wfac['interaction']['available'] is True, wfac
+    assert wfac['cells']['control|control'] == 'csa_fix_randidx', wfac['cells']
+    # Adding a future factorial with disjoint arms must not hide the measured
+    # design (the old global-intersection test returned not_applicable).
+    future = {
+        'factors': ('future_a', 'future_b'),
+        'cells': {k: 'future_arm_%d' % i
+                  for i, k in enumerate(L._FACTORIAL_CELL_KEYS)},
+    }
+    rdis = L.factorial_interaction_audit(
+        design={'present': base, 'future': future}, recs=recs)
+    assert rdis['status'] == 'ok', rdis
+    assert set(rdis['factorials']) == {'present'}, rdis['factorials']
+    assert rdis['factorials']['present']['n_complete'] == 7, rdis['factorials']
+    assert rdis['family']['m'] == 1, rdis['family']
 
 
 def t_classification_threshold_metadata_matches_predictions():
@@ -21280,6 +21335,18 @@ def t_dose_response_design_requires_ordered_single_axis_ladder():
         factory=_dose_factory, n_layers=2, shape='u-shape')
     assert rep['status'] == 'fail' and any('shape' in v
                                            for v in rep['violations']), rep
+    # Vector-valued config fields beside the scalar dose axis must not make
+    # the diff comparison raise (a multi-element tensor is not truth-testable).
+    def _tensor_factory(n, arm):
+        return [{'kind': 'csa', 'block_size': 4,
+                 'index_topk': {'k8': 8, 'k32': 32, 'k128': 128}[arm],
+                 'mask': torch.tensor([1.0, 2.0])}
+                for _ in range(int(n))]
+
+    tr = L.dose_response_design_audit(
+        base, direction='increasing', dose_key='index_topk',
+        factory=_tensor_factory, n_layers=2)
+    assert tr['status'] == 'ok', tr
 
 
 def t_dose_response_trend_is_exact_directional_and_shape_gated():
@@ -21752,6 +21819,7 @@ def main():
     _check('L60b factorial interaction is a paired difference-of-differences with an isolated Holm family', t_factorial_interaction_test_is_paired_and_isolated)
     _check('L60c factorial interaction names missing seeds and rejects malformed cells', t_factorial_interaction_fails_closed_on_malformed_records_and_names_missing_seeds)
     _check('L60d factorial design gate rejects value drift and absent interventions', t_factorial_design_gate_rejects_value_drift_and_absent_interventions)
+    _check('L60e factorial interaction strips arms and isolates disjoint designs', t_factorial_interaction_matches_stripped_arms_and_disjoint_designs)
     _check('L61 frozen-manifest mechanism flags are machine-verified single-factor verdicts', t_frozen_manifest_mechanism_flags_are_verified_single_factor)
     _check('L62 seq2k sweep contrasts carry explicit factor declarations', t_seq2k_contrasts_carry_factor_declarations)
     _check('L62b v7 rope/sink/selection contrasts carry verified factor declarations', t_v7_rope_contrasts_carry_factor_declarations)

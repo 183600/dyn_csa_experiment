@@ -28745,7 +28745,7 @@ def methodology_seed_plan(n_seeds, design=None, baselines=None, alpha=0.05, vari
             'ablation_complete': _ablation.get('complete'),
             'note': 'a panel below the minimum is DESCRIPTIVE ONLY: the exact-test resolution floor, not the observed effect, bounds its p value'}
 
-def factorial_design_audit(design=None, present=None, factory=None):
+def factorial_design_audit(design=None, present=None, factory=None, n_layers=6):
     """Zero-GPU gate for the declared 2x2 ablation interactions.
 
     A factorial is only interpretable when the two factors are manipulated in
@@ -28768,8 +28768,13 @@ def factorial_design_audit(design=None, present=None, factory=None):
     """
     design = FACTORIAL_DESIGN if design is None else design
     factory = make_layer_cfgs if factory is None else factory
+    _nl = _as_seed_int(n_layers)
+    if _nl is None or _nl < 1:
+        raise ValueError(
+            f'factorial_design_audit: n_layers must be a positive integer, got {n_layers!r}')
+    n_layers = int(_nl)
     present_set = set(RUN_ABL['variants']) if present is None else set(present)
-    report = {'kind': 'factorial_design', 'status': 'ok', 'n_layers': 6,
+    report = {'kind': 'factorial_design', 'status': 'ok', 'n_layers': n_layers,
               'factorials': {}, 'violations': [], 'warnings': []}
     if not isinstance(design, dict) or not design:
         report['violations'].append(
@@ -28814,7 +28819,12 @@ def factorial_design_audit(design=None, present=None, factory=None):
             if not isinstance(arm, str) or not arm.strip():
                 _bad(f'cell {tuple(key)!r} has an invalid arm id {arm!r}')
                 continue
-            norm_cells[tuple(key)] = arm.strip()
+            _nkey = tuple(key)
+            if _nkey in norm_cells:
+                _bad(f'cell key {key!r} duplicates normalized cell {_nkey!r}; '
+                     'the declaration is ambiguous')
+                continue
+            norm_cells[_nkey] = arm.strip()
         rec['cells'] = {f'{k[0]}|{k[1]}': v for k, v in norm_cells.items()}
         missing = [list(k) for k in _FACTORIAL_CELL_KEYS if k not in norm_cells]
         extra = [list(k) for k in norm_cells if k not in _FACTORIAL_CELL_KEYS]
@@ -28940,7 +28950,7 @@ def _factorial_condition_rows(recs, cells, *, strict_hyper=True):
     all four records, and the interaction is formed on log PPL.  Missing or
     uncontrolled seeds are named, never silently averaged over a subset.
     """
-    arms = [cells[k] for k in _FACTORIAL_CELL_KEYS]
+    arms = [cells[k].strip() for k in _FACTORIAL_CELL_KEYS]
     by_arm = {a: {} for a in arms}
     for key, r in recs.items():
         if not (isinstance(key, tuple) and len(key) == 3):
@@ -29101,15 +29111,16 @@ def factorial_interaction_audit(summary=None, design=None, *, alpha=0.05,
         _arms = [a.strip() for a in _raw]
         if len(set(_arms)) == 4:
             arm_sets.append(set(_arms))
+    all_arms = set().union(*arm_sets) if arm_sets else set()
     shared = set.intersection(*arm_sets) if arm_sets else set()
-    if arm_sets and not (present - shared):
+    if arm_sets and not (present & all_arms):
         return {'kind': 'factorial_interaction', 'status': 'not_applicable',
                 'factorials': {}, 'family': {},
                 'significant_interactions': [],
                 'direction_conflict_interactions': [],
                 'warnings': startup_warnings,
-                'note': ('this panel contains none of the factorial-specific '
-                         'arms; no 2x2 interaction is measured here')}
+                'note': ('this panel contains none of the arms declared by a '
+                         '2x2 factorial; no interaction is measured here')}
     out = {'kind': 'factorial_interaction', 'status': 'ok',
            'alpha': float(alpha), 'min_n': min_n, 'factorials': {},
            'family': {}, 'significant_interactions': [],
@@ -29146,10 +29157,20 @@ def factorial_interaction_audit(summary=None, design=None, *, alpha=0.05,
             out['warnings'].append(f'{name}: the four cells are not distinct arms')
             continue
         present_arms = set(arms) & present
-        if not (present_arms - shared):
+        if not present_arms:
             continue
+        # A partial panel that only contains arms shared by every declared
+        # factorial does not identify THIS factorial.  A complete four-arm
+        # panel does, and a panel with a design-specific arm is reported as
+        # incomplete.  Comparing against the global intersection (rather than
+        # skipping whenever all present arms are shared) keeps a single-design
+        # audit measurable instead of falsely returning not_applicable.
+        if len(present_arms) < 4 and present_arms <= shared:
+            continue
+        norm_cells = {k: arms[i] for i, k in enumerate(_FACTORIAL_CELL_KEYS)}
         rec = {'factors': list(factors) if isinstance(factors, (list, tuple)) else None,
-               'cells': {f'{k[0]}|{k[1]}': cells[k] for k in _FACTORIAL_CELL_KEYS},
+               'cells': {f'{k[0]}|{k[1]}': norm_cells[k]
+                         for k in _FACTORIAL_CELL_KEYS},
                'n_present_cells': len(present_arms), 'status': 'incomplete',
                'interaction': {'available': False}}
         out['factorials'][str(name)] = rec
@@ -29162,7 +29183,7 @@ def factorial_interaction_audit(summary=None, design=None, *, alpha=0.05,
                 + ', '.join(missing) + '); its family slot is kept at p=1')
             family.append((str(name), 1.0))
             continue
-        rows, skipped, param = _factorial_condition_rows(recs, cells)
+        rows, skipped, param = _factorial_condition_rows(recs, norm_cells)
         rec['n_complete'] = len(rows)
         rec['seeds'] = [r['seed'] for r in rows]
         rec['dropped'] = skipped
@@ -29442,6 +29463,36 @@ def _dose_arm_value(arm, factory, n_layers, dose_key):
 
 
 
+def _cfg_values_differ(value_a, value_b):
+    """Whether two config-field values differ, with safe NumPy/torch truth.
+
+    ``value_a != value_b`` returns an elementwise array/tensor for vector
+    fields, so using it directly in ``if`` raises for any field with more than
+    one element.  A config declaration may legitimately carry such a field
+    (e.g. a mask) beside the scalar dose axis; an ambiguous comparison is
+    treated as different so the gate fails closed instead of crashing or
+    silently dropping a possible second factor.
+    """
+    try:
+        differs = (value_a != value_b)
+    except Exception:
+        return True
+    if isinstance(differs, np.ndarray):
+        try:
+            return bool(differs.any())
+        except Exception:
+            return True
+    if torch.is_tensor(differs):
+        try:
+            return bool(differs.any().item())
+        except Exception:
+            return True
+    try:
+        return bool(differs)
+    except Exception:
+        return True
+
+
 def _dose_pair_cfg_keys(variant_a, variant_b, factory, n_layers):
     """Config diff for the ordered-ladder audit, including plain dict configs.
 
@@ -29468,14 +29519,7 @@ def _dose_pair_cfg_keys(variant_a, variant_b, factory, n_layers):
                 for k in set(x) | set(y):
                     if k not in x or k not in y:
                         d[k] = (x.get(k), y.get(k))
-                        continue
-                    try:
-                        differs = (x[k] != y[k])
-                        if isinstance(differs, np.ndarray):
-                            differs = bool(differs.any())
-                    except (TypeError, ValueError):
-                        differs = True
-                    if differs:
+                    elif _cfg_values_differ(x[k], y[k]):
                         d[k] = (x[k], y[k])
             else:
                 d = layer_cfg_diff(x, y)

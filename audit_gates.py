@@ -3576,7 +3576,7 @@ def audit_single_factor(manifest_path=None):
 # 7e-2) factorial：2x2 交互设计的定义点审计（零 GPU）
 # ---------------------------------------------------------------------------
 
-def audit_factorial_design(manifest_path=None):
+def audit_factorial_design(manifest_path=None, *, n_layers=6):
     """2x2 因子交互设计审计（零 GPU、零落盘依赖）。
 
     复用 `exp_lib.factorial_design_audit`，在定义点核验三组交互：
@@ -3589,7 +3589,7 @@ def audit_factorial_design(manifest_path=None):
     这是 `single_factor` 的补集：单因素审计回答「每个臂只动了一个组件吗」，
     factorial 审计回答「两个组件的 2x2 是否可识别、交互是否可解释」。"""
     L = _import_exp_lib()
-    out = L.factorial_design_audit()
+    out = L.factorial_design_audit(n_layers=n_layers)
     if manifest_path:
         try:
             with open(manifest_path, encoding='utf-8') as _f:
