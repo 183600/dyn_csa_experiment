@@ -14016,8 +14016,65 @@ def _bootstrap_draw_chunk(n_units):
     return max(1, min(_BOOTSTRAP_CHUNK_DRAWS, _BOOTSTRAP_CHUNK_ELEMS // n))
 
 
+def _bootstrap_t_interval(values, *, n_boot, seed, conf):
+    """Studentized (bootstrap-t) interval for a mean, with a safe fallback.
+
+    The percentile bootstrap is first-order accurate and, at the 3-12 unit
+    counts this repository reports, measurably under-covers a nominal 95%
+    interval.  The bootstrap-t construction studentizes every resample with
+    its own standard error and is second-order accurate, so its coverage is
+    close to nominal at the same unit count.  Draws are generated in fixed
+    chunks (the working set is O(n_boot), not O(n_boot * n_units)) and the RNG
+    stream is local and seeded.
+
+    A resample whose standard error is zero carries no scale information; if
+    too few studentized draws are usable (e.g. a constant vector or a panel
+    with only a handful of distinct values) the function falls back to the
+    percentile interval and says so in ``method``.  The fallback is explicit,
+    never a silent switch to a different estimand.
+    """
+    v = np.asarray(values, dtype=float)
+    n = int(v.size)
+    mean = float(v.mean())
+    sd = float(v.std(ddof=1)) if n > 1 else float('nan')
+    se = sd / math.sqrt(n) if n > 1 and math.isfinite(sd) else float('nan')
+    rng = np.random.default_rng(int(seed))
+    means = np.empty(int(n_boot), dtype=float)
+    tstats = np.empty(int(n_boot), dtype=float)
+    chunk = _bootstrap_draw_chunk(n)
+    for off in range(0, int(n_boot), chunk):
+        m = min(chunk, int(n_boot) - off)
+        idx = rng.integers(0, n, size=(m, n))
+        X = v[idx]
+        bm = X.mean(axis=1)
+        bs = X.std(axis=1, ddof=1)
+        means[off:off + m] = bm
+        with np.errstate(divide='ignore', invalid='ignore'):
+            tstats[off:off + m] = np.where(
+                bs > 0, (bm - mean) / (bs / math.sqrt(n)), np.nan)
+    lo_q = 100.0 * (1.0 - float(conf)) / 2.0
+    hi_q = 100.0 - lo_q
+    valid_t = np.isfinite(tstats)
+    n_valid = int(valid_t.sum())
+    if (n >= 3 and se > 0 and math.isfinite(se)
+            and n_valid >= max(20, int(0.5 * int(n_boot)))):
+        q_lo, q_hi = np.percentile(tstats[valid_t], [lo_q, hi_q])
+        lo = mean - float(q_hi) * se
+        hi = mean - float(q_lo) * se
+        method = ('studentized bootstrap-t over independent units '
+                  '(chunked, deterministic)')
+        used = int(n_valid)
+    else:
+        lo, hi = np.percentile(means, [lo_q, hi_q])
+        method = ('percentile bootstrap fallback (too few positive-variance '
+                  'resamples for a studentized interval)')
+        used = 0
+    return {'ci_low': float(lo), 'ci_high': float(hi), 'method': method,
+            'n_boot_studentized': used}
+
+
 def bootstrap_mean_ci(values, *, n_boot=4000, seed=20261018, conf=0.95):
-    """Percentile bootstrap CI for the mean of i.i.d. units (e.g. documents).
+    """Studentized bootstrap CI for the mean of i.i.d. units (e.g. documents).
 
     Units must be the independent sampling unit.  For LM evaluation a document
     row is the unit (tokens within a document are correlated), and this helper
@@ -14025,6 +14082,13 @@ def bootstrap_mean_ci(values, *, n_boot=4000, seed=20261018, conf=0.95):
     training uncertainty.  Resampling is chunked, so the working set does not
     grow with n_boot.  The RNG is seeded, so repeated report builds return the
     same interval.
+
+    The interval is a bootstrap-t (studentized) interval rather than the raw
+    percentile interval: the percentile construction under-covers at the small
+    unit counts this repository uses (its coverage is calibrated and reported
+    by ``statistical_calibration_suite``).  A constant or degenerate input
+    falls back to the percentile interval, and the returned ``method`` names
+    the fallback instead of hiding it.
     """
     v = np.asarray([f for f in (_finite_scalar(x) for x in (values if values is not None else []))
                     if f is not None], dtype=float)
@@ -14041,22 +14105,21 @@ def bootstrap_mean_ci(values, *, n_boot=4000, seed=20261018, conf=0.95):
         return None
     if nb < 20 or not (0.0 < c < 1.0):
         return None
-    rng = np.random.default_rng(sd)
-    means = np.empty(nb, dtype=float)
-    _chunk = _bootstrap_draw_chunk(n)
-    for _off in range(0, nb, _chunk):
-        _nb = min(_chunk, nb - _off)
-        _idx = rng.integers(0, n, size=(_nb, n))
-        means[_off:_off + _nb] = v[_idx].mean(axis=1)
-    lo_q = 100.0 * (1.0 - c) / 2.0
-    hi_q = 100.0 - lo_q
-    lo, hi = np.percentile(means, [lo_q, hi_q])
+    _ci = _bootstrap_t_interval(v, n_boot=nb, seed=sd, conf=c)
     return {'n': n, 'n_boot': nb, 'seed': int(seed), 'mean': float(v.mean()),
-            'ci_low': float(lo), 'ci_high': float(hi), 'conf': c,
-            'method': 'percentile bootstrap over independent units (chunked, deterministic)'}
+            'ci_low': _ci['ci_low'], 'ci_high': _ci['ci_high'], 'conf': c,
+            'method': _ci['method'],
+            'n_boot_studentized': _ci['n_boot_studentized']}
 
 
 def paired_bootstrap_ci(deltas, *, n_boot=4000, seed=20261018):
+    """Paired studentized bootstrap CI for the mean paired difference.
+
+    The paired bootstrap uses the same seeded local RNG and chunked draws as
+    :func:`bootstrap_mean_ci`.  It is a sensitivity/uncertainty readout; the
+    exact sign-flip p-value remains the primary test and is not affected by
+    the interval construction.
+    """
     d = np.asarray([f for f in (_finite_scalar(x) for x in (deltas if deltas is not None else []))
                     if f is not None], dtype=float)
     if d.size < 2:
@@ -14069,14 +14132,8 @@ def paired_bootstrap_ci(deltas, *, n_boot=4000, seed=20261018):
     sd = _as_seed_int(seed)
     if nb is None or sd is None or nb < 2:
         return None
-    rng = np.random.default_rng(sd)
-    means = np.empty(nb, dtype=float)
-    chunk = _bootstrap_draw_chunk(d.size)
-    for off in range(0, nb, chunk):
-        m = min(chunk, nb - off)
-        idx = rng.integers(0, d.size, size=(m, d.size))
-        means[off:off + m] = d[idx].mean(axis=1)
-    return _percentile_ci(means.tolist())
+    _ci = _bootstrap_t_interval(d, n_boot=nb, seed=sd, conf=0.95)
+    return [_ci['ci_low'], _ci['ci_high']]
 
 def unpaired_bootstrap_ci(with_values, without_values, *, n_boot=4000, seed=20261018):
     a = np.asarray([f for f in (_finite_scalar(x) for x in (with_values if with_values is not None else []))
@@ -42407,6 +42464,28 @@ STATISTICAL_CALIBRATION_POLICY = {
     'tost_conf': 0.90,
     'holm_m': 6,
     'holm_alt_p': 1e-06,
+    # Interval calibration: the reported seed-t, paired-bootstrap and
+    # document/unit-bootstrap intervals are distinct estimators from the
+    # hypothesis tests above, so their nominal coverage and non-vacuity are
+    # checked separately.  The caps are design limits on the mean interval
+    # width in the same units as the simulated data; they reject a trivially
+    # wide interval that would pass a coverage-only check.
+    'interval_conf': 0.95,
+    'interval_n': 12,
+    'interval_n_boot': 400,
+    'interval_doc_units': 24,
+    'interval_doc_between_sd': 1.0,
+    'interval_seed_count': 6,
+    'interval_seed_effect_sd': 0.2,
+    'interval_doc_effect_sd': 0.5,
+    'interval_within_sd': 0.1,
+    'interval_doc_tokens': 8,
+    'interval_combined_mu': 1.0,
+    'interval_combined_n_boot': 300,
+    'interval_max_width_t': 2.0,
+    'interval_max_width_paired_boot': 2.0,
+    'interval_max_width_doc_boot': 2.0,
+    'interval_max_log_width_combined': 1.2,
     'note': ('deterministic synthetic calibration of the analysis machinery; '
              'it is not evidence about WikiText, the model, or any substantive '
              'hypothesis, and it cannot repair a confounded design'),
@@ -42530,6 +42609,91 @@ def calibration_power_gate(n_reject, n_sim, *, power_floor=0.60,
             'control_level': c, 'status': status}
 
 
+def calibration_interval_coverage_gate(n_covered, n_sim, *, nominal=0.95,
+                                       control_level=0.001,
+                                       warning_level=0.01):
+    """One-sided calibration gate for a confidence interval's coverage.
+
+    Under a correctly calibrated two-sided interval the number of simulations
+    whose interval covers the true target is ``Binomial(n_sim, nominal)``.
+    The gate fails only when the lower-tail probability
+    ``P(X <= n_covered | nominal)`` is below ``control_level`` — i.e. when the
+    observed coverage is significantly *below* nominal beyond Monte-Carlo
+    noise.  Over-coverage is conservative and passes; a shortfall that is
+    compatible with simulation noise is a warning, not a failure.  The
+    thresholds are fixed before looking at the count, exactly as for the
+    hypothesis-test calibration gates.
+    """
+    k, n = _calibration_counts(n_covered, n_sim)
+    target = _calibration_fraction(nominal, 'nominal')
+    c = _calibration_fraction(control_level, 'control_level')
+    w = _calibration_fraction(warning_level, 'warning_level')
+    if w < c:
+        raise ValueError('warning_level must be >= control_level')
+    rate = k / n
+    p_under = _binomial_cdf(k, n, target)
+    if p_under < c:
+        status = 'fail'
+    elif rate < target and p_under < w:
+        status = 'warnings'
+    else:
+        status = 'ok'
+    return {'n_sim': n, 'n_covered': k, 'rate': float(rate),
+            'nominal': target, 'shortfall': float(rate - target),
+            'p_under_coverage': float(p_under),
+            'control_level': c, 'warning_level': w, 'status': status}
+
+
+def calibration_interval_width_gate(mean_width, max_width):
+    """Reject a vacuous interval (zero, non-finite, or wider than declared).
+
+    Coverage alone cannot distinguish a calibrated interval from an
+    arbitrarily wide one: [−inf, +inf] covers the truth with probability one
+    and conveys nothing.  Each calibration path therefore declares a maximum
+    acceptable mean width in the simulated data's units.  The cap is a design
+    limit fixed before the simulation, not a post-hoc description of the
+    observed interval.
+    """
+    try:
+        w = float(mean_width)
+        cap = float(max_width)
+    except (TypeError, ValueError, OverflowError):
+        return {'mean_width': None, 'max_width': None, 'status': 'fail',
+                'problem': 'non-numeric interval width'}
+    if isinstance(mean_width, (bool, np.bool_)) or isinstance(max_width, (bool, np.bool_)):
+        return {'mean_width': None, 'max_width': None, 'status': 'fail',
+                'problem': 'boolean interval width'}
+    if not math.isfinite(w) or not math.isfinite(cap) or w <= 0 or cap <= 0:
+        return {'mean_width': w if math.isfinite(w) else None,
+                'max_width': cap if math.isfinite(cap) else None,
+                'status': 'fail',
+                'problem': 'interval width must be finite and > 0'}
+    status = 'ok' if w <= cap else 'fail'
+    return {'mean_width': w, 'max_width': cap, 'status': status,
+            'problem': None if status == 'ok' else
+            f'mean interval width {w:.6g} exceeds the declared cap {cap:.6g}'}
+
+
+def _calibration_add_interval(out, name, coverage_control, width_control, **extra):
+    rec = {'coverage_control': coverage_control,
+           'width_control': width_control}
+    rec.update(extra)
+    out['tests'][name] = rec
+    for part in ('coverage_control', 'width_control'):
+        _st = rec[part].get('status')
+        if _st == 'fail':
+            out['status'] = 'fail'
+            out['violations'].append(
+                f'{name}.{part}: interval calibration failed '
+                f'({rec[part].get("rate", rec[part].get("mean_width"))!r})')
+        elif _st == 'warnings':
+            if out['status'] == 'ok':
+                out['status'] = 'warnings'
+            out['warnings'].append(
+                f'{name}.{part}: coverage shortfall compatible with '
+                f'Monte-Carlo noise (rate={rec[part].get("rate")!r})')
+
+
 def _calibration_path_gate(out, name, predicate, expected):
     rec = out['tests'][name]
     methods = rec.get('methods') or []
@@ -42574,7 +42738,10 @@ def statistical_calibration_suite(*, seed=None, n_sim=None, alpha=None,
     sign-flip enumeration, the 21-40 seed meet-in-the-middle path, the n>40
     saddlepoint tail (plus a direct saddlepoint-vs-exact agreement check at
     n=21), the max-over-looks sequential p, paired TOST at the margin, and the
-    Holm step-down family.
+    Holm step-down family.  A second group calibrates the interval estimators
+    the reports quote (seed-level paired t, paired bootstrap-t, unit/document
+    bootstrap-t and the combined seed x document interval) for both coverage
+    of the true target and non-vacuity of the reported width.
 
     All randomness comes from local ``numpy.random.default_rng`` streams
     spawned from ``seed`` through a ``SeedSequence``; no global NumPy/Torch RNG
@@ -42619,7 +42786,7 @@ def statistical_calibration_suite(*, seed=None, n_sim=None, alpha=None,
     policy['power_floor'] = power_floor
     policy['control_level'] = control_level
     policy['warning_level'] = warning_level
-    children = np.random.SeedSequence(int(_seed)).spawn(7)
+    children = np.random.SeedSequence(int(_seed)).spawn(11)
     out = {'kind': 'statistical_calibration', 'status': 'ok',
            'seed': int(_seed), 'n_sim': n_sim, 'alpha': alpha,
            'power_floor': power_floor, 'control_level': control_level,
@@ -42822,5 +42989,134 @@ def statistical_calibration_suite(*, seed=None, n_sim=None, alpha=None,
         calibration_power_gate(k_alt, n_sim, power_floor=power_floor,
                                control_level=control_level),
         family_m=m_holm, alternative_p=alt_p)
+
+    # ---- interval calibration: coverage AND non-vacuity -------------------
+    # A test that is correctly calibrated can still quote an interval that
+    # under-covers or is so wide that it says nothing.  These paths exercise
+    # the exact interval constructors the reports use.  The target is the
+    # population mean (0 for the centred seed contrasts, 1.0 on the log-PPL
+    # scale for the combined interval); the width caps are declared in the
+    # policy before the draws.
+    conf = float(policy['interval_conf'])
+    n_int = int(policy['interval_n'])
+    nb_int = int(policy['interval_n_boot'])
+
+    # (1) seed-level paired t interval from paired_effect_stats.ci95_*
+    rng = np.random.default_rng(children[7])
+    k_cov = 0
+    widths = []
+    for _ in range(n_sim):
+        d = rng.normal(size=n_int)
+        st = paired_effect_stats(d.tolist(), min_n=3)
+        lo, hi = st.get('ci95_low'), st.get('ci95_high')
+        if (lo is not None and hi is not None
+                and math.isfinite(float(lo)) and math.isfinite(float(hi))):
+            k_cov += bool(float(lo) <= 0.0 <= float(hi))
+            widths.append(float(hi) - float(lo))
+    _calibration_add_interval(
+        out, 'interval_seed_t',
+        calibration_interval_coverage_gate(
+            k_cov, n_sim, nominal=conf, control_level=control_level,
+            warning_level=warning_level),
+        calibration_interval_width_gate(
+            float(np.mean(widths)) if widths else float('nan'),
+            policy['interval_max_width_t']),
+        path='paired t interval (paired_effect_stats.ci95)',
+        n_units=n_int, target_mean=0.0, conf=conf)
+
+    # (2) paired bootstrap-t interval used by paired_effect_stats
+    rng = np.random.default_rng(children[8])
+    k_cov = 0
+    widths = []
+    for _ in range(n_sim):
+        d = rng.normal(size=n_int)
+        bseed = int(rng.integers(0, 2**31 - 1))
+        ci = paired_bootstrap_ci(d.tolist(), n_boot=nb_int, seed=bseed)
+        if ci is not None and all(math.isfinite(float(x)) for x in ci):
+            k_cov += bool(float(ci[0]) <= 0.0 <= float(ci[1]))
+            widths.append(float(ci[1]) - float(ci[0]))
+    _calibration_add_interval(
+        out, 'interval_paired_bootstrap',
+        calibration_interval_coverage_gate(
+            k_cov, n_sim, nominal=conf, control_level=control_level,
+            warning_level=warning_level),
+        calibration_interval_width_gate(
+            float(np.mean(widths)) if widths else float('nan'),
+            policy['interval_max_width_paired_boot']),
+        path='paired bootstrap-t (chunked, deterministic)',
+        n_units=n_int, target_mean=0.0, conf=conf, n_boot=nb_int)
+
+    # (3) unit/document bootstrap-t interval
+    rng = np.random.default_rng(children[9])
+    n_docs = int(policy['interval_doc_units'])
+    between = float(policy['interval_doc_between_sd'])
+    k_cov = 0
+    widths = []
+    for _ in range(n_sim):
+        vals = rng.normal(0.0, between, size=n_docs)
+        bseed = int(rng.integers(0, 2**31 - 1))
+        ci = bootstrap_mean_ci(vals.tolist(), n_boot=nb_int,
+                               seed=bseed, conf=conf)
+        if ci is not None and all(math.isfinite(float(ci[k])) for k in ('ci_low', 'ci_high')):
+            k_cov += bool(float(ci['ci_low']) <= 0.0 <= float(ci['ci_high']))
+            widths.append(float(ci['ci_high']) - float(ci['ci_low']))
+    _calibration_add_interval(
+        out, 'interval_unit_bootstrap',
+        calibration_interval_coverage_gate(
+            k_cov, n_sim, nominal=conf, control_level=control_level,
+            warning_level=warning_level),
+        calibration_interval_width_gate(
+            float(np.mean(widths)) if widths else float('nan'),
+            policy['interval_max_width_doc_boot']),
+        path='studentized unit/document bootstrap (chunked, deterministic)',
+        n_units=n_docs, target_mean=0.0, conf=conf, n_boot=nb_int)
+
+    # (4) combined seed x document interval used for the pooled PPL.  The
+    #     synthetic panel has known seed, document and token noise; the
+    #     population target is exp(mu), and the interval is checked on the
+    #     log-PPL scale so the multiplicative geometry does not hide a
+    #     vacuous interval.
+    rng = np.random.default_rng(children[10])
+    n_seeds_int = int(policy['interval_seed_count'])
+    n_tok_int = int(policy['interval_doc_tokens'])
+    seed_sd = float(policy['interval_seed_effect_sd'])
+    doc_sd = float(policy['interval_doc_effect_sd'])
+    within_sd = float(policy['interval_within_sd'])
+    mu_int = float(policy['interval_combined_mu'])
+    nb_comb = int(policy['interval_combined_n_boot'])
+    target_ppl = math.exp(mu_int)
+    k_cov = 0
+    log_widths = []
+    for _ in range(n_sim):
+        se_eff = rng.normal(0.0, seed_sd, size=n_seeds_int)
+        de_eff = rng.normal(0.0, doc_sd, size=n_docs)
+        noise = rng.normal(0.0, within_sd, size=(n_seeds_int, n_docs))
+        ce = mu_int + se_eff[:, None] + de_eff[None, :] + noise
+        nll = (ce * n_tok_int).tolist()
+        ntok = [n_tok_int] * n_docs
+        recs = [{'nll_per_row': nll[s], 'n_tokens_per_row': ntok}
+                for s in range(n_seeds_int)]
+        bseed = int(rng.integers(0, 2**31 - 1))
+        ci = _combined_seed_doc_ci(recs, n_boot=nb_comb, seed=bseed, conf=conf)
+        if ci.get('status') == 'ok' and ci.get('ci95_ppl'):
+            lo, hi = ci['ci95_ppl']
+            try:
+                k_cov += bool(float(lo) <= target_ppl <= float(hi))
+                lw = math.log(float(hi)) - math.log(float(lo))
+                if math.isfinite(lw):
+                    log_widths.append(lw)
+            except (TypeError, ValueError, OverflowError):
+                pass
+    _calibration_add_interval(
+        out, 'interval_combined_seed_doc',
+        calibration_interval_coverage_gate(
+            k_cov, n_sim, nominal=conf, control_level=control_level,
+            warning_level=warning_level),
+        calibration_interval_width_gate(
+            float(np.mean(log_widths)) if log_widths else float('nan'),
+            policy['interval_max_log_width_combined']),
+        path='combined seed x document interval (log-PPL scale)',
+        n_seeds=n_seeds_int, n_units=n_docs, target_ppl=target_ppl,
+        conf=conf, n_boot=nb_comb)
 
     return out

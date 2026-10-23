@@ -21503,13 +21503,21 @@ def t_statistical_calibration_gates_and_suite():
     assert L._calibration_policy_fp(L.statistical_calibration_suite(n_sim=40)['policy']) != r1['policy_fp']
     expected = {'exact_signflip_enumeration', 'exact_signflip_mitm',
                 'saddlepoint_vs_exact', 'saddlepoint_tail',
-                'sequential_looks', 'tost_paired', 'holm_family'}
+                'sequential_looks', 'tost_paired', 'holm_family',
+                'interval_seed_t', 'interval_paired_bootstrap',
+                'interval_unit_bootstrap', 'interval_combined_seed_doc'}
     assert set(r1['tests']) == expected, sorted(r1['tests'])
     for name, rec in r1['tests'].items():
         if name == 'saddlepoint_vs_exact':
             assert rec['status'] == 'ok', rec
             assert rec['max_abs_error'] <= rec['max_abs_tolerance'], rec
             assert rec['mean_abs_error'] <= rec['mean_abs_tolerance'], rec
+        elif 'coverage_control' in rec:
+            cov, wid = rec['coverage_control'], rec['width_control']
+            assert cov['status'] in ('ok', 'warnings'), (name, rec)
+            assert wid['status'] == 'ok', (name, rec)
+            assert 0.0 <= cov['rate'] <= 1.0, rec
+            assert 0.0 < wid['mean_width'] <= wid['max_width'], rec
         else:
             for part in ('null_control', 'positive_control'):
                 assert rec[part]['status'] in ('ok', 'warnings'), (name, rec)
@@ -21542,6 +21550,11 @@ def t_statistical_calibration_is_wired_into_the_audit():
                  'holm_family'):
         assert rep['tests'][name]['null_control']['rate'] <= 0.10, (name, rep)
         assert rep['tests'][name]['positive_control']['rate'] >= 0.60, (name, rep)
+    for name in ('interval_seed_t', 'interval_paired_bootstrap',
+                 'interval_unit_bootstrap', 'interval_combined_seed_doc'):
+        _rec = rep['tests'][name]
+        assert _rec['coverage_control']['status'] in ('ok', 'warnings'), (name, rep)
+        assert _rec['width_control']['status'] == 'ok', (name, rep)
     import inspect
     src = inspect.getsource(A.run_report)
     assert "'calibration': audit_statistical_calibration()" in src, src
@@ -21553,6 +21566,62 @@ def t_statistical_calibration_is_wired_into_the_audit():
         pass
     else:
         raise AssertionError('audit accepted an under-sized calibration simulation')
+
+
+def t_interval_calibration_gates_and_bootstrap():
+    """L186 — interval coverage is calibrated and vacuous widths are rejected."""
+    # Coverage gates: nominal passes; a gross shortfall fails; over-coverage
+    # is conservative and passes; malformed counts/levels fail closed.
+    ok = L.calibration_interval_coverage_gate(950, 1000, nominal=0.95)
+    assert ok['status'] == 'ok' and abs(ok['rate'] - 0.95) < 1e-12, ok
+    bad = L.calibration_interval_coverage_gate(700, 1000, nominal=0.95)
+    assert bad['status'] == 'fail' and bad['p_under_coverage'] < 0.001, bad
+    conservative = L.calibration_interval_coverage_gate(990, 1000, nominal=0.95)
+    assert conservative['status'] == 'ok', conservative
+    for bad_args in ((-1, 10), (11, 10), (1.5, 10), (True, 10), (1, 10.5)):
+        try:
+            L.calibration_interval_coverage_gate(*bad_args)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'invalid coverage counts accepted: {bad_args!r}')
+    for bad_kw in ({'nominal': True}, {'nominal': 0.0}, {'nominal': 1.0},
+                   {'control_level': 0.0}, {'warning_level': 0.0001},
+                   {'control_level': 0.02, 'warning_level': 0.01}):
+        try:
+            L.calibration_interval_coverage_gate(95, 100, **bad_kw)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'invalid coverage gate parameter accepted: {bad_kw!r}')
+    # Width gate: a finite positive width under the cap passes; zero, negative,
+    # NaN/inf and over-cap widths fail.  Coverage alone would accept them.
+    assert L.calibration_interval_width_gate(1.0, 2.0)['status'] == 'ok'
+    for bad_w in (0.0, -1.0, float('nan'), float('inf'), 2.0001):
+        assert L.calibration_interval_width_gate(bad_w, 2.0)['status'] == 'fail', bad_w
+    assert L.calibration_interval_width_gate(True, 2.0)['status'] == 'fail'
+    # The suite now calibrates interval constructors on both properties.
+    r = L.statistical_calibration_suite(n_sim=80)
+    assert r['status'] == 'ok', r
+    for name in ('interval_seed_t', 'interval_paired_bootstrap',
+                 'interval_unit_bootstrap', 'interval_combined_seed_doc'):
+        rec = r['tests'][name]
+        assert rec['coverage_control']['status'] in ('ok', 'warnings'), rec
+        assert rec['width_control']['status'] == 'ok', rec
+        assert 0.0 < rec['width_control']['mean_width'] <= rec['width_control']['max_width'], rec
+    # The paired and unit bootstrap intervals are studentized, deterministic,
+    # and fall back explicitly on a degenerate (zero-variance) input.
+    d = [0.1, -0.2, 0.3, 0.05, 0.15, -0.05]
+    p1 = L.paired_bootstrap_ci(d, n_boot=200, seed=11)
+    p2 = L.paired_bootstrap_ci(d, n_boot=200, seed=11)
+    assert p1 == p2 and p1[0] < p1[1], (p1, p2)
+    unit = L.bootstrap_mean_ci([0.1, -0.2, 0.3, 0.05, 0.15, -0.05],
+                               n_boot=200, seed=11)
+    assert 'studentized' in unit['method'], unit
+    assert unit['n_boot_studentized'] > 0, unit
+    const = L.bootstrap_mean_ci([2.0] * 8, n_boot=100, seed=11)
+    assert const['ci_low'] == const['ci_high'] == 2.0, const
+    assert 'fallback' in const['method'], const
 
 
 def main():
@@ -22089,6 +22158,7 @@ def main():
     _check('L183 statistical calibration gates null and positive controls', t_statistical_calibration_gates_and_suite)
     _check('L184 statistical calibration is wired into the audit report', t_statistical_calibration_is_wired_into_the_audit)
     _check('L185 dataclass config diff handles vector fields', t_layer_cfg_diff_handles_vector_fields)
+    _check('L186 interval calibration covers coverage and non-vacuity', t_interval_calibration_gates_and_bootstrap)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

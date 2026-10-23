@@ -74,7 +74,9 @@
                永不读取 wiki.test.raw
   calibration  统计机器的零假设校准：精确符号翻转 / MITM / n>40 鞍点 /
                max-over-looks 序列 p / 配对 TOST / Holm 的负控制（超发率）
-               与正控制（灵敏度），固定种子、局部 RNG、纯合成数据；
+               与正控制（灵敏度），以及 seed-t / paired bootstrap-t /
+               unit bootstrap-t / combined seed×doc 区间的覆盖率与
+               非空洞宽度门；固定种子、局部 RNG、纯合成数据；
                不读结果、不训练、不改任何测量语义
   efficiency   prefill/decode/容量读数工具（需要模型；给出可复用函数
                与 CPU 微型演示——不是实验，是测量代码自检）
@@ -5728,14 +5730,19 @@ def audit_statistical_calibration(*, n_sim=None, seed=None):
     paired TOST and Holm.  This gate runs negative controls (data generated
     under the null: the false-positive rate may not exceed alpha beyond
     Monte-Carlo noise) and positive controls (data with a known effect: the
-    same procedure must retain sensitivity) for each path.  It uses only local
-    RNG streams and synthetic data, reads no result artifact and starts no
-    training; it therefore cannot change a measurement or a frozen verdict.
+    same procedure must retain sensitivity) for each path.  It also calibrates
+    the reported interval estimators (seed-level paired t, paired bootstrap-t,
+    unit/document bootstrap-t and the combined seed x document interval):
+    coverage may not fall below nominal beyond Monte-Carlo noise, and the
+    mean width may not exceed a declared cap (a trivially wide interval is not
+    uncertainty quantification).  It uses only local RNG streams and synthetic
+    data, reads no result artifact and starts no training; it therefore cannot
+    change a measurement or a frozen verdict.
 
-    A pass says the statistical machinery has the advertised error rates on
-    idealized independent pairs.  It does not certify exchangeability,
-    randomisation or measurement identity in a real panel, and it is not
-    evidence for or against any substantive mechanism claim.
+    A pass says the statistical machinery has the advertised error rates and
+    interval coverage on idealized independent pairs.  It does not certify
+    exchangeability, randomisation or measurement identity in a real panel,
+    and it is not evidence for or against any substantive mechanism claim.
     """
     L = _import_exp_lib()
     rep = L.statistical_calibration_suite(n_sim=n_sim, seed=seed)
@@ -5743,7 +5750,14 @@ def audit_statistical_calibration(*, n_sim=None, seed=None):
                       if k not in ('policy', 'tests')},
                      ensure_ascii=False, indent=2))
     for name, rec in (rep.get('tests') or {}).items():
-        if 'null_control' in rec:
+        if 'coverage_control' in rec:
+            _cc = rec['coverage_control']
+            _wc = rec['width_control']
+            print(f"[calibration] {name}: coverage={_cc.get('rate')!r} "
+                  f"(nominal={_cc.get('nominal')!r}, {_cc.get('status')}), "
+                  f"mean_width={_wc.get('mean_width')!r} "
+                  f"(cap={_wc.get('max_width')!r}, {_wc.get('status')})")
+        elif 'null_control' in rec:
             print(f"[calibration] {name}: null={rec['null_control'].get('rate')!r} "
                   f"({rec['null_control'].get('status')}), "
                   f"positive={rec['positive_control'].get('rate')!r} "

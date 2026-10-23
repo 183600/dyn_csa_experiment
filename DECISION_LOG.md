@@ -2592,3 +2592,62 @@ seed/n_sim/α/阈值，带覆盖参数运行不会复用默认策略的指纹。
 下 status=`ok`：null 拒绝率 0.038–0.061，正控制 0.78–1.0，鞍点对精确
 max |Δp|=0.0229、mean=0.00084。`python v12_supp.py plan` 仍 72/72 合成
 冻结记录、6 个比较。
+
+## 2026-10-23 — 区间估计器也要先校准（no new runs）
+
+零 GPU 的方法论硬化；不新增训练、不读 test split、不改冻结清单的
+任何字节/种子/终点/α/Holm 决策规则，也不改 `CODE_SEMANTICS`。这是
+§61「统计机器先校准再使用」的区间估计器补全。
+
+**Problem.** §61 只校准了 p 值路径，但报告还直接引用逐种子配对 t 区间、
+配对 bootstrap 区间、按评测单位重采样的区间，以及合并 seed×document 两个
+方差源的 `_combined_seed_doc_ci`。p 值校准不能推出区间校准：同一份数据上
+5% 超发的检验可以伴随只有 90% 覆盖率的 95% 区间。实测旧
+`paired_bootstrap_ci` 在 n=12 的百分位构造下覆盖率约 0.907，名义却是
+95%；这会让报告中「95% bootstrap 区间」的标签失真。
+
+**Fix.** 新增 `_bootstrap_t_interval()`，把 `bootstrap_mean_ci` 与
+`paired_bootstrap_ci` 从百分位法改为 **bootstrap-t（studentized）**：
+每次重采样用自身标准误标准化，再取 t 分位数反变换；RNG 仍是局部、固定
+种子、分块生成。n<3、重采样方差为 0、或可用 studentized 抽样太少时显式
+回退百分位法，并在 `method` 中写明 fallback。`bootstrap_mean_ci` 保持
+`n_boot>=20` 的原有输入契约；`paired_bootstrap_ci` 保持 `n_boot>=2` 的
+原有契约（小样本走 fallback），不静默改变估计量。
+
+`STATISTICAL_CALIBRATION_POLICY` 新增区间名义覆盖率、模拟规模、bootstrap
+抽取数、已知 DGP 参数和四条宽度上限。新增两条门：
+
+- `calibration_interval_coverage_gate`：正确校准下覆盖数
+  `K ~ Binomial(n_sim, nominal)`；只拒绝显著低于名义覆盖率的欠覆盖，
+  保守的过覆盖通过；阈值在模拟前固定。
+- `calibration_interval_width_gate`：平均宽度必须有限、为正且不超过预先
+  声明的上限，拒绝「覆盖率 1 但宽度爆炸」的空洞区间。
+
+`statistical_calibration_suite()` 新增四条路径：
+`interval_seed_t`（逐种子配对 t）、`interval_paired_bootstrap`（配对
+bootstrap-t）、`interval_unit_bootstrap`（24 单位 bootstrap-t）、
+`interval_combined_seed_doc`（6 seeds × 24 docs，已知 seed/doc/token
+方差，目标为 `exp(mu)`，在 log-PPL 尺度检查宽度）。每个模拟重复的
+bootstrap 种子由局部 RNG 流派生，避免所有重复共享同一组重采样索引。
+覆盖率与宽度分别进入 `coverage_control` / `width_control`，任一 fail 即
+suite fail。
+
+**Boundary.** 校准只覆盖上述四条被报告直接引用的路径；
+`unpaired_bootstrap_ci`、`paired_row_bootstrap_delta`、
+`_doc_bootstrap_ppl_ci` 仍是百分位近似，未进入覆盖率门，引用时必须保留
+「近似/仅该抽样源」的限定。合成数据仍是理想独立正态单位，不验证真实
+面板的相关结构、重尾或 seed×document 交互设定；通过门不等于区间在真实
+面板上一定准确。宽度上限是防止退化解的工程门，不是最优精度声明。
+这些改动只影响区间读数，不改变精确符号翻转 p、Holm 规则或冻结判定。
+
+**Verification.** `python test_review_fixes.py` 通过 534/534（0 skipped，
+新增 L186；L183 期望集合与 L184 断言扩展为 11 条路径）。
+`python audit_gates.py calibration` 在默认策略（seed=20261023, n_sim=2000）
+下 status=`ok`，policy_fp=`1a5b3de5…`：检验路径保持 §61 的结果；区间路径
+覆盖率/平均宽度分别为 `interval_seed_t` 0.9525/1.2369、
+`interval_paired_bootstrap` 0.9440/1.2848、`interval_unit_bootstrap`
+0.9520/0.8354、`interval_combined_seed_doc` 0.9775/0.6568（log 尺度），
+均通过且宽度低于上限。`python v12_supp.py plan` 仍 72/72 合成冻结记录、
+6 个比较；`python audit_gates.py source` 在刷新快照后 status=`ok`
+（23/23 文件字节一致），`audit_gates.py report` 的 `calibration` 键为
+`ok`。

@@ -848,13 +848,14 @@ statement / mechanism / `predicted_sign` / `primary_metric` / falsifier；
 - 文档级区间必须针对**同一个估计量**：token-pooled PPL 的区间不能用
   「逐文档 CE 的未加权标准误」近似（文档长度不同时两者不是同一个量）。
   `_nll_doc_ci` 因此改用 documents-as-clusters 的稳健方差与 t 临界值；
-  v12 的逐文档配对分析另给 `bootstrap_mean_ci` 的文档重采样区间（对逐
-  文档 PPL 差与 log 比分别报告）。这些区间**以已训练的种子为条件**，
+  v12 的逐文档配对分析另给 `bootstrap_mean_ci` 的文档重采样
+  studentized 区间（对逐文档 PPL 差与 log 比分别报告）。这些区间**以
+  已训练的种子为条件**，
   只量化文档抽样不确定性，不能替代 seed-level 精确符号翻转检验。
 
 ### 22.2 符号翻转检验的假设与敏感性
 
-- `paired_effect_stats` 现同时给出符号计数、paired bootstrap 区间、
+- `paired_effect_stats` 现同时给出符号计数、paired bootstrap-t 区间、
   Wilcoxon signed-rank 敏感性 p（n≤16 精确）、以及调用方提供两臂数值时的
   **unpaired** bootstrap 区间。
 - 这些都只是敏感性读数；主检验仍是 seed-level 精确符号翻转。相同 seed
@@ -3969,3 +3970,104 @@ python test_review_fixes.py           # L183 策略/门/确定性；L184 审计�
 fail-closed、两次运行逐字节一致、全局 RNG 状态不变、全部六条路径存在且
 控制门通过。L184 覆盖：审计入口的种子/规模/状态、报告字典接线、CLI 文档
 与过小模拟的拒绝。
+
+## 62. 区间也要校准：覆盖率不等于「检验通过」，宽度不能靠放宽（本轮结果分析硬化）
+
+### 62.1 问题：检验校准了，区间还没校准
+
+§61 只校准了 p 值路径。报告同时大量引用区间估计：逐种子配对 t 区间
+（`paired_effect_stats.ci95_*`）、配对 bootstrap 区间、按评测单位
+（document/unit）重采样的区间，以及把训练种子与评测文档两个方差源合并的
+`_combined_seed_doc_ci`。p 值校准不能推出区间校准：
+
+- 一个 p 检验可以在零假设下保持 5% 超发，而同一份数据上的 95% 区间却只有
+  90% 覆盖率——两者是不同的估计量；
+- 反过来，一个无限宽的区间 `[-inf, +inf]` 覆盖率恒为 1，能通过任何只检查
+  覆盖率的门，却不传递任何不确定性信息；
+- 小样本百分位 bootstrap 的欠覆盖是已知的有限样本现象，不是实现崩溃：
+  在 n=12、名义 95% 下，本仓库旧的 `paired_bootstrap_ci` 实测覆盖率约
+  0.907（固定种子模拟），而配对 t 区间约 0.952。这个差距足以让报告里的
+  「95% bootstrap 区间」名不副实。
+
+因此需要把区间当成与检验并列的统计机器：既检查覆盖率，也检查区间不是
+空洞的，并把不合格的构造替换掉，而不是把名义水平改小。
+
+### 62.2 方法：两个门 + studentized bootstrap
+
+`STATISTICAL_CALIBRATION_POLICY` 新增区间校准参数（名义覆盖率 0.95、
+每个路径的重复次数沿用 `n_sim`、bootstrap 抽取数、已知数据生成过程与
+宽度上限）。新增两条门：
+
+- `calibration_interval_coverage_gate(K, n_sim, nominal=0.95, ...)`：
+  正确校准下 `K ~ Binomial(n_sim, nominal)`。用单侧下尾
+  `P(X <= K | nominal)` 判 fail/warning；**高于**名义覆盖率的保守行为通过。
+  阈值在模拟前固定。
+- `calibration_interval_width_gate(mean_width, max_width)`：
+  平均宽度必须是有限正数且不超过声明的上限。上限是 DGP 单位下的设计值，
+  不是看完结果再写的描述；它专门拒绝「覆盖率为 1 但宽度爆炸」的退化解。
+
+每个模拟重复的 bootstrap 种子由同一个局部 RNG 流派生，而不是所有重复共用
+一个固定种子；否则覆盖率会条件在单一一组重采样索引上，蒙特卡洛独立性不足。
+
+配对与单位 bootstrap 从百分位法改为 **bootstrap-t（studentized）**：
+每个重采样用自身的标准误标准化 `(mean* - mean)/se*`，再取 t 分布的分位数
+反变换回原尺度。它在 n=12 附近的覆盖率显著优于百分位法，且不改变主检验
+（精确符号翻转 p）或冻结判定。若重采样的标准差为 0 或可用 t 统计量太少
+（常量输入、极少数不同取值），函数显式回退到百分位区间，并在返回的
+`method` 里写明 fallback，不静默改变估计量。
+
+四条路径：
+
+| 路径 | 构造 | 目标 | 宽度上限 |
+|---|---|---|---|
+| `interval_seed_t` | `paired_effect_stats` 的逐种子配对 t 区间 | 总体均值 0 | 2.0 |
+| `interval_paired_bootstrap` | 配对 bootstrap-t（`paired_bootstrap_ci`） | 总体均值 0 | 2.0 |
+| `interval_unit_bootstrap` | 单位/bootstrap-t（`bootstrap_mean_ci`，24 个单位） | 总体均值 0 | 2.0 |
+| `interval_combined_seed_doc` | `_combined_seed_doc_ci`（6 seeds × 24 docs，已知 seed/doc/token 方差） | `exp(mu)`，在 log-PPL 尺度检查宽度 | 1.2（log 宽度） |
+
+### 62.3 默认策略下的实际校准
+
+`seed=20261023, n_sim=2000, n_boot=400` 的结果（仅用于回归定位，不是
+科学证据）：
+
+```
+interval_seed_t             coverage 0.9525  mean_width 1.2369
+interval_paired_bootstrap   coverage 0.9440  mean_width 1.2848
+interval_unit_bootstrap     coverage 0.9520  mean_width 0.8354
+interval_combined_seed_doc  coverage 0.9775  mean_width 0.6568 (log)
+```
+
+四条路径的覆盖率都在名义水平附近（最低 0.944，差异在蒙特卡洛噪声内），
+宽度都低于声明上限。combined 区间偏保守（0.9775 > 0.95），这是合并两个
+方差源时用
+`S-1` 自由度 t 分位数的已知保守性；它通过覆盖率门，但报告仍应把它读作
+保守区间，而不是「精确 95%」。
+
+### 62.4 边界
+
+- 校准数据仍是理想正态/独立单位；它不验证真实面板的相关结构、重尾、
+  文档内相关或 seed×document 交互的设定是否正确。真实面板的覆盖率仍依赖
+  这些假设。
+- 这里只校准四条被报告直接引用的路径。`unpaired_bootstrap_ci`、逐行
+  `paired_row_bootstrap_delta`、`_doc_bootstrap_ppl_ci` 等百分位区间仍是
+  近似读数，未进入本轮覆盖率门；引用它们时必须保留「近似/仅该抽样源」
+  的限定。
+- 通过覆盖率门不等于区间在真实面板上一定准确；欠覆盖只在固定 `n_sim`
+  下可检出的量级上被判 fail，不能证明误差率恰好等于 5%。
+- 宽度上限是防止退化解的工程门，不是「最优精度」声明；加宽区间以换取
+  覆盖率仍可能是合理的保守选择。
+- 这些改动只影响报告中的区间读数，不改变精确符号翻转 p、Holm 决策规则、
+  冻结清单、`CODE_SEMANTICS` 或 P5T 的确认判定；也不新增训练或读取
+  test split。
+
+### 62.5 入口与验证
+
+```bash
+python audit_gates.py calibration     # 零 GPU；同时打印检验与区间校准
+python test_review_fixes.py           # L183/L184 扩展 + L186
+```
+
+L186 覆盖：覆盖率门的已知值（0.95 通过、0.70 fail、保守通过）、非法计数/
+名义水平/阈值 fail-closed、宽度门拒绝 0/负/NaN/inf/超上限/布尔值、四条
+区间路径存在且宽度非空洞、bootstrap-t 的确定性与常量输入显式回退。
+完整 CPU 套件 534/534 通过（0 skipped）。
