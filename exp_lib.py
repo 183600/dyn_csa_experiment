@@ -1346,6 +1346,303 @@ def _paired_nll_doc_ci(nll_a, nll_b, n_tokens, *, conf=0.95):
     return out
 
 
+def paired_nll_unit_influence(nll_a, nll_b, n_tokens, *, unit_ids=None,
+                              conf=0.95, top_k=5):
+    """Leave-one-unit-out influence on the paired token-pooled PPL difference.
+
+    ``_paired_nll_doc_ci`` answers "how wide is the document-sampling
+    interval?" with a delta-method variance.  It does not answer the equally
+    important result-analysis question: **is the reported effect carried by a
+    single evaluation unit?**  A mean and an interval can both look stable
+    while one article supplies most of the difference; removing that article
+    would then reverse (or erase) the conclusion.  This function makes the
+    influence explicit and deterministic:
+
+      * exact leave-one-unit-out (LOO) recomputation of the SAME estimand
+        (mean over seeds of the token-pooled PPL difference), not a
+        re-weighting of equal per-unit means;
+      * the delta-method influence vector already used by the cluster-robust
+        variance, exposed for inspection;
+      * a delete-one-unit jackknife SE/CI and its ratio to the cluster-robust
+        SE (a large ratio is a high-leverage-unit warning);
+      * direction stability over all LOO folds and a ``single_unit_dominates``
+        flag when dropping one unit changes the log effect by at least 100%;
+      * the ``top_k`` most influential units by absolute LOO change.
+
+    ``unit_ids`` labels the columns (an article/document id); it is required to
+    be the same length as the units and unique after string coercion.  When it
+    is ``None`` deterministic ``unit_<i>`` labels are used.
+
+    This is a **post-hoc descriptive** diagnostic.  It conditions on the
+    trained seeds (seed uncertainty remains the exact sign-flip test), it does
+    not turn units into a randomisation, and it never changes a p-value, Holm
+    family or frozen decision.  Dropping a unit also changes the target slice
+    to "the frozen slice minus that unit"; that is the point of the readout,
+    not a claim about the population.
+    """
+    if isinstance(conf, (bool, np.bool_)):
+        raise ValueError('paired_nll_unit_influence: conf must be a probability in (0, 1)')
+    try:
+        conf = float(conf)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError('paired_nll_unit_influence: conf must be a probability in (0, 1)') from None
+    if not (0.0 < conf < 1.0):
+        raise ValueError('paired_nll_unit_influence: conf must be a probability in (0, 1)')
+    _top_k = _as_seed_int(top_k)
+    if _top_k is None or _top_k < 1:
+        raise ValueError('paired_nll_unit_influence: top_k must be a positive integer')
+    top_k = _top_k
+
+    def _matrix(x, name):
+        try:
+            arr = np.asarray(x, dtype=float)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(f'{name}: values must be numeric') from None
+        if arr.ndim == 1:
+            arr = arr[None, :]
+        if arr.ndim != 2 or arr.shape[0] < 1 or arr.shape[1] < 1:
+            raise ValueError(f'{name}: expected [n_seeds, n_units], got shape {arr.shape}')
+        if not np.all(np.isfinite(arr)):
+            raise ValueError(f'{name}: all per-unit NLLs must be finite')
+        return arr
+
+    A = _matrix(nll_a, 'paired_nll_unit_influence(nll_a)')
+    B = _matrix(nll_b, 'paired_nll_unit_influence(nll_b)')
+    if A.shape != B.shape:
+        raise ValueError(
+            f'paired_nll_unit_influence: arm shapes differ ({A.shape} vs {B.shape}); '
+            'a paired readout needs the same seeds and units')
+    try:
+        T = np.asarray(n_tokens, dtype=float).reshape(-1)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError('paired_nll_unit_influence: n_tokens must be numeric') from None
+    if T.size != A.shape[1]:
+        raise ValueError(
+            f'paired_nll_unit_influence: {T.size} token counts for {A.shape[1]} units')
+    if not np.all(np.isfinite(T)) or np.any(T <= 0.0):
+        raise ValueError('paired_nll_unit_influence: every unit needs a finite positive token count')
+
+    S, D = A.shape
+    if D < 3:
+        return {'kind': 'paired_unit_influence', 'available': False,
+                'n_units': int(D), 'n_seeds': int(S),
+                'reason': ('a delete-one-unit jackknife/influence readout '
+                           'needs at least three units')}
+    if isinstance(unit_ids, (str, bytes, bytearray)):
+        raise ValueError('paired_nll_unit_influence: unit_ids must be an iterable, not a string')
+    if unit_ids is None:
+        labels = [f'unit_{i}' for i in range(D)]
+    else:
+        try:
+            labels = [str(x) for x in unit_ids]
+        except TypeError:
+            raise ValueError('paired_nll_unit_influence: unit_ids must be an iterable') from None
+        if len(labels) != D:
+            raise ValueError(
+                f'paired_nll_unit_influence: {len(labels)} unit ids for {D} units')
+        if len(set(labels)) != D:
+            raise ValueError('paired_nll_unit_influence: unit ids must be unique')
+
+    total_tok = float(T.sum())
+    if not math.isfinite(total_tok) or total_tok <= 0.0:
+        raise ValueError('paired_nll_unit_influence: the total token count must be positive')
+    full = _paired_nll_doc_ci(A, B, T, conf=conf)
+    if full is None:
+        return {'kind': 'paired_unit_influence', 'available': False,
+                'n_units': int(D), 'n_seeds': int(S),
+                'reason': 'the full pooled PPL difference overflowed'}
+    full_delta = float(full['delta_ppl'])
+    full_lr = float(full['delta_log_ratio'])
+
+    sum_a = A.sum(axis=1)
+    sum_b = B.sum(axis=1)
+    ce_a = sum_a / total_tok
+    ce_b = sum_b / total_tok
+    ea = np.asarray([_safe_exp_ppl(x) for x in ce_a], dtype=float)
+    eb = np.asarray([_safe_exp_ppl(x) for x in ce_b], dtype=float)
+    if not (np.all(np.isfinite(ea)) and np.all(np.isfinite(eb))):
+        return {'kind': 'paired_unit_influence', 'available': False,
+                'n_units': int(D), 'n_seeds': int(S),
+                'reason': 'the per-seed pooled PPL overflowed'}
+
+    # Exact delete-one-unit recomputation.  The full-fold point must be the
+    # same estimand as the caller's pooled CI; otherwise the influence belongs
+    # to a different comparison and is refused rather than silently reported.
+    denom = total_tok - T
+    usable_denom = denom > 0.0
+    ce_a_loo = np.full((S, D), np.nan, dtype=float)
+    ce_b_loo = np.full((S, D), np.nan, dtype=float)
+    np.divide(sum_a[:, None] - A, denom[None, :], out=ce_a_loo,
+              where=usable_denom[None, :])
+    np.divide(sum_b[:, None] - B, denom[None, :], out=ce_b_loo,
+              where=usable_denom[None, :])
+    with np.errstate(over='ignore', invalid='ignore'):
+        ea_loo = np.exp(ce_a_loo)
+        eb_loo = np.exp(ce_b_loo)
+    loo_delta = np.mean(ea_loo - eb_loo, axis=0)
+    loo_lr = np.mean(ce_a_loo - ce_b_loo, axis=0)
+    finite = np.isfinite(loo_delta) & np.isfinite(loo_lr)
+    if not np.any(finite):
+        return {'kind': 'paired_unit_influence', 'available': False,
+                'n_units': int(D), 'n_seeds': int(S),
+                'reason': ('no usable leave-one-unit-out fold (a unit may hold '
+                           'all tokens, or the remaining pooled PPL overflowed)')}
+
+    # Delta-method influence, exactly the ``bar`` term that the cluster-robust
+    # variance squares.  Kept separate from the exact LOO fold so the report
+    # can show local influence even when a fold overflows.
+    psi = (ea[:, None] * (A - ce_a[:, None] * T[None, :]) / total_tok
+           - eb[:, None] * (B - ce_b[:, None] * T[None, :]) / total_tok).mean(axis=0)
+    psi_lr = ((A - ce_a[:, None] * T[None, :])
+              - (B - ce_b[:, None] * T[None, :])).mean(axis=0) / total_tok
+
+    change_ppl = loo_delta - full_delta
+    change_lr = loo_lr - full_lr
+    abs_change_ppl = np.where(finite, np.abs(change_ppl), -np.inf)
+    abs_change_lr = np.where(finite, np.abs(change_lr), -np.inf)
+    use_ppl = abs_change_ppl > -np.inf
+    use_lr = abs_change_lr > -np.inf
+
+    def _max_or_none(arr, mask):
+        if not np.any(mask):
+            return None
+        return float(np.max(arr[mask]))
+
+    max_change_ppl = _max_or_none(abs_change_ppl, use_ppl)
+    max_change_lr = _max_or_none(abs_change_lr, use_lr)
+
+    def _relative(change, full_value):
+        if change is None or full_value is None:
+            return None
+        try:
+            full_value = float(full_value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(full_value) or abs(full_value) <= 1e-300:
+            return None
+        return float(change / abs(full_value))
+
+    rel_change_ppl = _relative(max_change_ppl, full_delta)
+    rel_change_lr = _relative(max_change_lr, full_lr)
+
+    def _sign_stable(values, ref, mask):
+        if not np.any(mask):
+            return None
+        try:
+            ref = float(ref)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(ref) or ref == 0.0:
+            return None
+        vals = values[mask]
+        return bool(np.all((vals > 0.0) if ref > 0.0 else (vals < 0.0)))
+
+    sign_stable_ppl = _sign_stable(loo_delta, full_delta, use_ppl)
+    sign_stable_lr = _sign_stable(loo_lr, full_lr, use_lr)
+    single_unit_dominates = bool(rel_change_lr is not None and rel_change_lr >= 1.0)
+    if sign_stable_lr is None:
+        fragile_to_one_unit = None
+    else:
+        fragile_to_one_unit = bool((not sign_stable_lr) or single_unit_dominates)
+
+    n_flips_ppl = (int(np.sum((loo_delta[use_ppl] > 0.0) != (full_delta > 0.0)))
+                   if sign_stable_ppl is not None else None)
+    n_flips_lr = (int(np.sum((loo_lr[use_lr] > 0.0) != (full_lr > 0.0)))
+                  if sign_stable_lr is not None else None)
+
+    # Exact jackknife variance of the pooled estimate over the unit folds.
+    jackknife_ok = bool(np.all(finite))
+    jack_se_ppl = jack_se_lr = None
+    jack_ci_ppl = jack_ci_lr = None
+    if jackknife_ok:
+        dbar = float(np.mean(loo_delta))
+        jack_var = ((D - 1.0) / D) * float(np.sum((loo_delta - dbar) ** 2))
+        jack_se_ppl = math.sqrt(max(jack_var, 0.0))
+        lbar = float(np.mean(loo_lr))
+        jack_var_lr = ((D - 1.0) / D) * float(np.sum((loo_lr - lbar) ** 2))
+        jack_se_lr = math.sqrt(max(jack_var_lr, 0.0))
+        tc = _t_critical(conf, D - 1)
+        if math.isfinite(tc):
+            jack_ci_ppl = [full_delta - tc * jack_se_ppl,
+                           full_delta + tc * jack_se_ppl]
+            jack_ci_lr = [full_lr - tc * jack_se_lr,
+                          full_lr + tc * jack_se_lr]
+    cluster_se_ppl = full.get('se_ppl')
+    cluster_se_lr = full.get('se_log_ratio')
+    se_ratio_ppl = (float(jack_se_ppl / cluster_se_ppl)
+                    if (jack_se_ppl is not None and cluster_se_ppl
+                        and math.isfinite(cluster_se_ppl) and cluster_se_ppl > 0.0)
+                    else None)
+    se_ratio_lr = (float(jack_se_lr / cluster_se_lr)
+                   if (jack_se_lr is not None and cluster_se_lr
+                       and math.isfinite(cluster_se_lr) and cluster_se_lr > 0.0)
+                   else None)
+
+    order = [int(i) for i in np.argsort(-np.nan_to_num(abs_change_lr, nan=-1.0),
+                                        kind='stable')[:top_k] if abs_change_lr[i] > -np.inf]
+    top_units = []
+    for i in order:
+        top_units.append({
+            'unit_id': labels[i],
+            'loo_delta_ppl': (None if not finite[i] else float(loo_delta[i])),
+            'loo_change_ppl': (None if not finite[i] else float(change_ppl[i])),
+            'loo_delta_log_ratio': (None if not finite[i] else float(loo_lr[i])),
+            'loo_change_log_ratio': (None if not finite[i] else float(change_lr[i])),
+        })
+    best_idx = None
+    tied = None
+    if np.any(use_lr) and abs(full_lr) > 1e-300:
+        _cand = np.where(use_lr, abs_change_lr, -np.inf)
+        best_idx = int(np.argmax(_cand))
+        best_val = float(_cand[best_idx])
+        tied = int(np.sum(np.isclose(_cand, best_val, rtol=0.0, atol=1e-12)))
+    return {
+        'kind': 'paired_unit_influence', 'available': True,
+        'n_units': int(D), 'n_units_loo_available': int(np.sum(finite)),
+        'n_seeds': int(S), 'conf': float(conf),
+        'unit_ids': labels,
+        'label_source': ('provided' if unit_ids is not None else 'index_fallback'),
+        'full_delta_ppl': full_delta, 'full_delta_log_ratio': full_lr,
+        'delta_method_influence_ppl': psi.tolist(),
+        'delta_method_influence_log_ratio': psi_lr.tolist(),
+        'loo_delta_ppl': loo_delta.tolist(),
+        'loo_delta_log_ratio': loo_lr.tolist(),
+        'loo_change_ppl': change_ppl.tolist(),
+        'loo_change_log_ratio': change_lr.tolist(),
+        'loo_available': finite.tolist(),
+        'max_abs_change_ppl': max_change_ppl,
+        'max_abs_change_log_ratio': max_change_lr,
+        'max_abs_relative_change_ppl': rel_change_ppl,
+        'max_abs_relative_change_log_ratio': rel_change_lr,
+        'jackknife_available': jackknife_ok,
+        'jackknife_se_ppl': jack_se_ppl,
+        'jackknife_se_log_ratio': jack_se_lr,
+        'jackknife_ci95_ppl': jack_ci_ppl,
+        'jackknife_ci95_log_ratio': jack_ci_lr,
+        'cluster_robust_se_ppl': cluster_se_ppl,
+        'cluster_robust_se_log_ratio': cluster_se_lr,
+        'se_ratio_jackknife_to_cluster_ppl': se_ratio_ppl,
+        'se_ratio_jackknife_to_cluster_log_ratio': se_ratio_lr,
+        'sign_stable_ppl': sign_stable_ppl,
+        'sign_stable_log_ratio': sign_stable_lr,
+        'single_unit_dominates': single_unit_dominates,
+        'fragile_to_one_unit': fragile_to_one_unit,
+        'n_sign_flips_ppl': n_flips_ppl,
+        'n_sign_flips_log_ratio': n_flips_lr,
+        'most_influential_unit': (labels[best_idx] if best_idx is not None else None),
+        'most_influential_index': best_idx,
+        'most_influential_tied_count': tied,
+        'top_units': top_units,
+        'method': ('exact leave-one-unit-out on the token-pooled per-seed PPL '
+                   'difference, averaged over seeds; delete-one-unit jackknife; '
+                   'delta-method influence exposed alongside it'),
+        'note': ('post-hoc descriptive robustness only: conditions on the trained '
+                 'seeds, does not randomise units, does not change any p/Holm/'
+                 'frozen decision, and describes the frozen slice minus one unit '
+                 'rather than the language population'),
+    }
+
+
 # ---- G0 gate ---------------------------------------------------------------
 # The scale panels are only allowed to start after the kernel/eager
 # equivalence certificate exists and matches this code/env.  `m0_supp.py

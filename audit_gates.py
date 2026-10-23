@@ -36,6 +36,9 @@
                下的 TOST 等价/亚 SESOI/有害判定（零 GPU）
   sesoi        消融 SESOI 声明：每个声明组件都有唯一、有限、>0 的相对或
                绝对 margin，且留一对照在 RUN_ABL 中完整排程（设计期，零 GPU）
+  unit_influence  结果分析：逐评测单位删除（leave-one-out）影响读数是否
+               与主终点同口径、是否由单个文章/文档主导（读 analysis_v12/，
+               零 GPU；warning 级，不改变冻结判定）
   single_factor  单因素设计契约：每条声明对照的臂配置 diff 恰好等于声明的
                干预键集（定义点审计，不读 results_*）；open-block 矩阵只沿
                两根声明轴变化；v7/v9 扫描的 factors 与真实 arm diff 对账；
@@ -5205,8 +5208,151 @@ def audit_run_order(paths=None):
     return out
 
 
+def audit_unit_influence(path=None):
+    """Result-analysis audit: leave-one-unit-out influence is present and sound.
+
+    A pooled ΔPPL can be statistically significant and still be carried by one
+    evaluation article.  ``v12_supp._doc_level_analysis`` now records a
+    ``doc_sampling.unit_influence`` block; this audit independently checks that
+    the block is internally consistent with the reported pooled estimate and
+    flags comparisons whose direction or magnitude depends on one unit.
+
+    It is a **warning-level** audit by design: the frozen decision rule does
+    not include a unit-drop threshold, so a fragile comparison must carry the
+    caveat in the report but must not be silently turned into "not confirmed".
+    A malformed block (point estimate disagrees with the pooled Δ, missing
+    units, wrong vector lengths) is a ``fail`` because it cannot support any
+    influence statement.
+    """
+    p = path or os.path.join(REPO, 'analysis_v12', 'test_stats.json')
+    out = {'kind': 'unit_influence_audit', 'status': 'ok', 'path': p,
+           'comparisons': {}, 'n_ok': 0, 'n_fragile': 0, 'n_missing': 0,
+           'problems': [], 'warnings': [],
+           'note': ('post-hoc descriptive robustness; a fragile comparison must '
+                    'carry the single-unit caveat, but this audit never changes '
+                    'a frozen p/Holm/confirmed verdict')}
+    if not os.path.exists(p):
+        out['status'] = 'not_verifiable_locally'
+        out['reason'] = 'no final-test stats artifact on disk'
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return out
+    data = _load(p)
+    if data is None:
+        out['status'] = 'fail'
+        out['problems'].append(f'{p} exists but is not a readable JSON object')
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return out
+    ft = data.get('finaltest') if isinstance(data.get('finaltest'), dict) else data
+    comps = ft.get('comparisons') if isinstance(ft, dict) else None
+    if not isinstance(comps, dict) or not comps:
+        out['status'] = 'not_verifiable_locally'
+        out['reason'] = 'the stats artifact carries no comparisons'
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return out
+
+    def _finite(x):
+        if isinstance(x, (bool, np.bool_)):
+            return None
+        try:
+            y = float(x)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return y if math.isfinite(y) else None
+
+    for name, comp in comps.items():
+        if not isinstance(comp, dict):
+            continue
+        ds = comp.get('doc_sampling')
+        inf = ds.get('unit_influence') if isinstance(ds, dict) else None
+        rec = {'present': isinstance(inf, dict)}
+        if not isinstance(inf, dict):
+            if isinstance(ds, dict) and ds.get('pooled_delta_ppl_ci95') is not None:
+                out['n_missing'] += 1
+                out['warnings'].append(
+                    f'{name}: pooled CI exists but no unit_influence block '
+                    '(stale/legacy analysis artifact); the single-unit '
+                    'sensitivity is unverified')
+            out['comparisons'][name] = rec
+            continue
+        rec['available'] = inf.get('available')
+        if not inf.get('available'):
+            out['warnings'].append(
+                f'{name}: unit influence unavailable ({inf.get("reason")})')
+            out['comparisons'][name] = rec
+            continue
+        n_units = inf.get('n_units')
+        ids = inf.get('unit_ids')
+        pooled = _finite(ds.get('pooled_delta_ppl'))
+        full = _finite(inf.get('full_delta_ppl'))
+        rec.update({'n_units': n_units, 'fragile_to_one_unit': inf.get('fragile_to_one_unit'),
+                    'most_influential_unit': inf.get('most_influential_unit'),
+                    'max_abs_relative_change_log_ratio':
+                        inf.get('max_abs_relative_change_log_ratio')})
+        if not isinstance(n_units, int) or n_units < 3:
+            out['problems'].append(f'{name}: invalid n_units={n_units!r}')
+        if not isinstance(ids, list) or len(ids) != n_units:
+            out['problems'].append(
+                f'{name}: unit_ids length does not match n_units={n_units!r}')
+        elif len(set(map(str, ids))) != n_units:
+            out['problems'].append(
+                f'{name}: unit_ids are not unique; the folds cannot identify units')
+        for _vec_key in ('loo_delta_ppl', 'loo_delta_log_ratio',
+                         'loo_change_ppl', 'loo_change_log_ratio'):
+            _vec = inf.get(_vec_key)
+            if not isinstance(_vec, list) or len(_vec) != n_units:
+                out['problems'].append(
+                    f'{name}: {_vec_key} length does not match n_units={n_units!r}')
+                continue
+            if any(v is not None and _finite(v) is None for v in _vec):
+                out['problems'].append(
+                    f'{name}: {_vec_key} contains a non-finite, non-null value')
+        _idx = inf.get('most_influential_index')
+        if (_idx is not None
+                and (not isinstance(_idx, int) or isinstance(_idx, bool)
+                     or not (0 <= _idx < (n_units if isinstance(n_units, int) else 0)))):
+            out['problems'].append(
+                f'{name}: most_influential_index {_idx!r} is outside the unit vector')
+        if (isinstance(_idx, int) and isinstance(ids, list)
+                and 0 <= _idx < len(ids)
+                and inf.get('most_influential_unit') is not None
+                and str(ids[_idx]) != str(inf.get('most_influential_unit'))):
+            out['problems'].append(
+                f'{name}: most_influential_unit does not match unit_ids[index]')
+        if pooled is None or full is None:
+            out['problems'].append(
+                f'{name}: pooled or full influence point estimate is missing/non-finite')
+        elif abs(full - pooled) > 1e-6 * max(1.0, abs(pooled)):
+            out['problems'].append(
+                f'{name}: unit-influence full point {full!r} does not reproduce '
+                f'the reported pooled Δ {pooled!r}')
+        _mi = inf.get('most_influential_unit')
+        if (_mi is not None and isinstance(ids, list) and _mi not in ids):
+            out['problems'].append(
+                f'{name}: most_influential_unit {_mi!r} is not one of unit_ids')
+        _frag = inf.get('fragile_to_one_unit')
+        if _frag is not None and not isinstance(_frag, bool):
+            out['problems'].append(
+                f'{name}: fragile_to_one_unit is not a boolean or null')
+        elif _frag is True:
+            out['n_fragile'] += 1
+            out['warnings'].append(
+                f'{name}: direction/magnitude depends on one '
+                f'{inf.get("most_influential_unit")!r}; the report must carry '
+                'the single-unit caveat')
+        elif _frag is False:
+            out['n_ok'] += 1
+        out['comparisons'][name] = rec
+    if out['problems']:
+        out['status'] = 'fail'
+    elif out['n_fragile'] or out['n_missing']:
+        out['status'] = 'warnings'
+    print(json.dumps({k: v for k, v in out.items() if k != 'comparisons'},
+                     ensure_ascii=False, indent=2))
+    return out
+
+
 def run_report(out='audit_report.json'):
-    res = {'generated_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'source_tree': audit_source_integrity(), 'dependencies': audit_dependencies(), 'data_source': audit_data_source(), 'leakage': audit_leakage(), 'split_discipline': audit_split_discipline(), 'document_unit': audit_document_unit(), 'sample_design': audit_sample_design(), 'attribution': audit_attribution(), 'boundary': audit_boundary(), 'length': audit_length(), 'fairness': audit_fairness(), 'metrics': audit_metrics(), 'tuning': audit_tuning(), 'simple_baseline': audit_simple_baseline(), 'hypotheses': audit_hypotheses(), 'sesoi': audit_sesoi_declaration(), 'methodology': audit_methodology(), 'single_factor': audit_single_factor(), 'design_preflight': audit_design_preflight(), 'failures': audit_failures(), 'budget': audit_budget(), 'training_health': audit_training_health(), 'efficiency_pairs': audit_efficiency_pairs(), 'release': audit_release_readiness(), 'selection': audit_selection(), 'run_order': audit_run_order()}
+    res = {'generated_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'source_tree': audit_source_integrity(), 'dependencies': audit_dependencies(), 'data_source': audit_data_source(), 'leakage': audit_leakage(), 'split_discipline': audit_split_discipline(), 'document_unit': audit_document_unit(), 'sample_design': audit_sample_design(), 'attribution': audit_attribution(), 'boundary': audit_boundary(), 'length': audit_length(), 'fairness': audit_fairness(), 'metrics': audit_metrics(), 'tuning': audit_tuning(), 'simple_baseline': audit_simple_baseline(), 'hypotheses': audit_hypotheses(), 'sesoi': audit_sesoi_declaration(), 'unit_influence': audit_unit_influence(), 'methodology': audit_methodology(), 'single_factor': audit_single_factor(), 'design_preflight': audit_design_preflight(), 'failures': audit_failures(), 'budget': audit_budget(), 'training_health': audit_training_health(), 'efficiency_pairs': audit_efficiency_pairs(), 'release': audit_release_readiness(), 'selection': audit_selection(), 'run_order': audit_run_order()}
     L_atomic = None
     try:
         L = _import_exp_lib()
@@ -5226,7 +5372,7 @@ def run_report(out='audit_report.json'):
 
 
 if __name__ == '__main__':
-    _cmds = {'leakage': audit_leakage, 'split': audit_split_discipline, 'split_discipline': audit_split_discipline, 'document_unit': audit_document_unit, 'unit': audit_document_unit, 'sample_design': audit_sample_design, 'sampling': audit_sample_design, 'sample': audit_sample_design, 'causality': audit_causality, 'attribution': audit_attribution, 'boundary': audit_boundary, 'length': audit_length, 'fairness': audit_fairness, 'metrics': audit_metrics, 'tuning': audit_tuning, 'simple': audit_simple_baseline, 'baseline_floor': audit_simple_baseline, 'baseline_plan': audit_baseline_design, 'hypothesis_coverage': audit_hypothesis_coverage, 'hypotheses': audit_hypotheses, 'sesoi': audit_sesoi_declaration, 'methodology': audit_methodology, 'single_factor': audit_single_factor, 'design': audit_design_preflight, 'design_preflight': audit_design_preflight, 'failures': audit_failures, 'budget': audit_budget, 'efficiency': audit_efficiency_demo, 'efficiency_pairs': audit_efficiency_pairs, 'training_health': audit_training_health, 'selection': audit_selection, 'release': audit_release_readiness, 'run_order': audit_run_order, 'source': audit_source_integrity, 'source_tree': audit_source_integrity, 'dependencies': audit_dependencies, 'dependency': audit_dependencies, 'data_source': audit_data_source, 'dataset_source': audit_data_source, 'report': run_report}
+    _cmds = {'leakage': audit_leakage, 'split': audit_split_discipline, 'split_discipline': audit_split_discipline, 'document_unit': audit_document_unit, 'unit': audit_document_unit, 'sample_design': audit_sample_design, 'sampling': audit_sample_design, 'sample': audit_sample_design, 'causality': audit_causality, 'attribution': audit_attribution, 'boundary': audit_boundary, 'length': audit_length, 'fairness': audit_fairness, 'metrics': audit_metrics, 'tuning': audit_tuning, 'simple': audit_simple_baseline, 'baseline_floor': audit_simple_baseline, 'baseline_plan': audit_baseline_design, 'hypothesis_coverage': audit_hypothesis_coverage, 'hypotheses': audit_hypotheses, 'sesoi': audit_sesoi_declaration, 'unit_influence': audit_unit_influence, 'influence': audit_unit_influence, 'methodology': audit_methodology, 'single_factor': audit_single_factor, 'design': audit_design_preflight, 'design_preflight': audit_design_preflight, 'failures': audit_failures, 'budget': audit_budget, 'efficiency': audit_efficiency_demo, 'efficiency_pairs': audit_efficiency_pairs, 'training_health': audit_training_health, 'selection': audit_selection, 'release': audit_release_readiness, 'run_order': audit_run_order, 'source': audit_source_integrity, 'source_tree': audit_source_integrity, 'dependencies': audit_dependencies, 'dependency': audit_dependencies, 'data_source': audit_data_source, 'dataset_source': audit_data_source, 'report': run_report}
     _arg = sys.argv[1] if len(sys.argv) > 1 else 'report'
     if _arg in ('-h', '--help'):
         print(__doc__)

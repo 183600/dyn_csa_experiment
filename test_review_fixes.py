@@ -20401,6 +20401,278 @@ def t_sesoi_partial_panel_and_input_guards():
     assert bad['status'] == 'fail', bad
 
 
+def t_doc_unit_influence_primitives():
+    """L173 — leave-one-unit-out influence targets the pooled estimand."""
+    A = [[2.0, 3.0, 5.0, 7.0], [3.0, 4.0, 6.0, 8.0]]
+    B = [[3.0, 3.0, 4.0, 6.0], [4.0, 4.0, 5.0, 7.0]]
+    T = [10.0, 20.0, 30.0, 40.0]
+    full = L._paired_nll_doc_ci(A, B, T)
+    got = L.paired_nll_unit_influence(A, B, T,
+                                     unit_ids=['u0', 'u1', 'u2', 'u3'])
+    assert got['available'] is True and got['n_units'] == 4, got
+    assert got['n_seeds'] == 2 and got['unit_ids'] == ['u0', 'u1', 'u2', 'u3'], got
+    assert abs(got['full_delta_ppl'] - full['delta_ppl']) < 1e-12, got
+    assert abs(got['full_delta_log_ratio'] - full['delta_log_ratio']) < 1e-12, got
+    assert len(got['loo_delta_ppl']) == 4 and len(got['loo_change_ppl']) == 4, got
+    Aa, Bb, Tt = np.asarray(A), np.asarray(B), np.asarray(T)
+    for i in range(4):
+        keep = [j for j in range(4) if j != i]
+        one = L._paired_nll_doc_ci(Aa[:, keep], Bb[:, keep], Tt[keep])
+        assert abs(got['loo_delta_ppl'][i] - one['delta_ppl']) < 1e-12, (i, got, one)
+        assert abs(got['loo_delta_log_ratio'][i] - one['delta_log_ratio']) < 1e-12, (i, got)
+    # The jackknife SE is the delete-one-unit variance of those exact folds.
+    d = np.asarray(got['loo_delta_ppl'])
+    want_se = math.sqrt(((len(d) - 1.0) / len(d)) * float(np.sum((d - d.mean()) ** 2)))
+    assert abs(got['jackknife_se_ppl'] - want_se) < 1e-12, got
+    # The exposed delta-method influence is exactly the term whose squares
+    # give the existing cluster-robust SE; it is not a second, inconsistent
+    # influence definition.
+    _psi = np.asarray(got['delta_method_influence_ppl'])
+    _se_from_psi = math.sqrt((len(_psi) / (len(_psi) - 1.0))
+                             * float(np.sum(_psi ** 2)))
+    assert abs(_se_from_psi - full['se_ppl']) < 1e-12, (got, full, _se_from_psi)
+    lo, hi = got['jackknife_ci95_ppl']
+    assert lo <= got['full_delta_ppl'] <= hi, got
+    assert got['se_ratio_jackknife_to_cluster_ppl'] is not None, got
+    # The most influential unit is the largest absolute LOO change on the
+    # scale-free log effect, not necessarily the largest raw PPL difference.
+    _lr = np.asarray(got['loo_delta_log_ratio'])
+    assert got['most_influential_index'] == int(np.argmax(np.abs(_lr - got['full_delta_log_ratio']))), got
+    assert got['top_units'][0]['unit_id'] == got['most_influential_unit'], got
+
+    # One unit carries the whole effect: deleting it reverses the direction.
+    A2 = [[1.0, 1.0, 1.0, 200.0]]
+    B2 = [[2.0, 2.0, 2.0, 2.0]]
+    T2 = [10.0, 10.0, 10.0, 10.0]
+    out = L.paired_nll_unit_influence(A2, B2, T2,
+                                      unit_ids=['a', 'b', 'c', 'd'])
+    assert out['most_influential_unit'] == 'd', out
+    assert out['fragile_to_one_unit'] is True, out
+    assert out['single_unit_dominates'] is True, out
+    assert out['sign_stable_log_ratio'] is False, out
+    assert out['n_sign_flips_log_ratio'] >= 1, out
+    assert any(u['unit_id'] == 'd' for u in out['top_units']), out
+
+    # A uniform relative effect has zero LOO change: no single unit dominates.
+    A3 = [[2.0, 2.0, 2.0, 2.0]]
+    B3 = [[3.0, 3.0, 3.0, 3.0]]
+    T3 = [10.0, 10.0, 10.0, 10.0]
+    flat = L.paired_nll_unit_influence(A3, B3, T3)
+    assert flat['max_abs_change_ppl'] == 0.0, flat
+    assert flat['max_abs_change_log_ratio'] == 0.0, flat
+    assert flat['fragile_to_one_unit'] is False, flat
+    assert flat['sign_stable_log_ratio'] is True, flat
+    assert flat['most_influential_tied_count'] == 4, flat
+    assert flat['unit_ids'] == ['unit_0', 'unit_1', 'unit_2', 'unit_3'], flat
+    assert flat['label_source'] == 'index_fallback', flat
+    assert got['label_source'] == 'provided', got
+
+    # An exactly null contrast has no direction to be fragile in: report
+    # "undefined", never a fabricated stable/fragile boolean.
+    null = L.paired_nll_unit_influence(A3, A3, T3)
+    assert null['full_delta_log_ratio'] == 0.0, null
+    assert null['sign_stable_log_ratio'] is None, null
+    assert null['fragile_to_one_unit'] is None, null
+    assert null['most_influential_unit'] is None, null
+
+    # Fewer than three units cannot support a delete-one jackknife.
+    short = L.paired_nll_unit_influence([[2.0, 3.0]], [[3.0, 4.0]], [10.0, 10.0])
+    assert short['available'] is False and short['n_units'] == 2, short
+    # A small unit can be so important that deleting it overflows the pooled
+    # PPL: that fold must be named unavailable, not silently become inf/nan.
+    holder = L.paired_nll_unit_influence([[0.0, 1000.0, 1000.0]],
+                                         [[0.0, 0.0, 0.0]],
+                                         [1000.0, 1.0, 1.0])
+    assert holder['available'] is True and holder['jackknife_available'] is False, holder
+    assert holder['loo_available'][0] is False, holder
+    assert holder['loo_available'][1] is True, holder
+
+    # Shape/token/id/option guards: a malformed id vector or fold must not
+    # silently index the wrong unit.
+    bad_inputs = [
+        ([[1.0, 2.0, 3.0]], [[1.0, 2.0]], [1.0, 1.0, 1.0]),
+        ([[1.0, 2.0, 3.0]], [[1.0, 2.0, 3.0]], [1.0, 1.0]),
+        ([[1.0, 2.0, 3.0]], [[1.0, 2.0, 3.0]], [1.0, 0.0, 1.0]),
+        ([[1.0, 2.0, 3.0]], [[1.0, 2.0, 3.0]], [1.0, float('nan'), 1.0]),
+        ([[1.0, 2.0, 3.0]], [[1.0, 2.0, float('inf')]], [1.0, 1.0, 1.0]),
+    ]
+    for _a, _b, _t in bad_inputs:
+        try:
+            L.paired_nll_unit_influence(_a, _b, _t)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'accepted malformed influence input {(_a, _b, _t)!r}')
+    for _ids in (['a', 'b'], ['a', 'a', 'c'], 'abc'):
+        try:
+            L.paired_nll_unit_influence([[1.0, 2.0, 3.0]], [[2.0, 2.0, 2.0]],
+                                        [1.0, 1.0, 1.0], unit_ids=_ids)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'accepted bad unit_ids={_ids!r}')
+    for _kw in ({'top_k': 0}, {'top_k': 1.5}, {'top_k': True},
+                {'conf': 0.0}, {'conf': True}):
+        try:
+            L.paired_nll_unit_influence([[1.0, 2.0, 3.0]], [[2.0, 2.0, 2.0]],
+                                        [1.0, 1.0, 1.0], **_kw)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'accepted bad influence option {_kw!r}')
+
+
+def t_doc_influence_analysis_and_markdown():
+    """L174 — the v12 analysis records unit influence and the report caveats it."""
+    docs = ['d0', 'd1', 'd2', 'd3']
+    toks = [10, 10, 10, 10]
+    nll_a = [1.0, 1.0, 1.0, 200.0]
+    nll_b = [2.0, 2.0, 2.0, 2.0]
+    recs_a = {s: {'by_len': {512: _document_cell(nll_a, toks, docs)}}
+              for s in (0, 1)}
+    recs_b = {s: {'by_len': {512: _document_cell(nll_b, toks, docs)}}
+              for s in (0, 1)}
+    got = V12._doc_level_analysis(recs_a, recs_b, [0, 1], 512)
+    inf = got.get('unit_influence')
+    assert isinstance(inf, dict) and inf.get('available') is True, got
+    assert inf['unit_ids'] == docs, inf
+    assert abs(inf['full_delta_ppl'] - got['pooled_delta_ppl']) < 1e-12, (inf, got)
+    assert inf['most_influential_unit'] == 'd3', inf
+    assert inf['fragile_to_one_unit'] is True, inf
+    md = V12._doc_influence_markdown(
+        {'comparisons': {'csa_vs_full': {'doc_sampling': got}}})
+    text = '\n'.join(md)
+    assert '单元影响诊断' in text and 'd3' in text, text
+    assert '单单元主导' in text and '不改变上面的冻结判定' in text, text
+    assert '不能把结论描述为' in text, text
+    # A uniform effect is not flagged, and the table says so without turning
+    # the absence of a single-unit flip into a population claim.
+    flat_a = [2.0, 2.0, 2.0, 2.0]
+    flat_b = [3.0, 3.0, 3.0, 3.0]
+    fa = {s: {'by_len': {512: _document_cell(flat_a, toks, docs)}}
+          for s in (0, 1)}
+    fb = {s: {'by_len': {512: _document_cell(flat_b, toks, docs)}}
+          for s in (0, 1)}
+    flat = V12._doc_level_analysis(fa, fb, [0, 1], 512)
+    ftext = '\n'.join(V12._doc_influence_markdown(
+        {'comparisons': {'csa_vs_full': {'doc_sampling': flat}}}))
+    assert '未见单单元翻转' in ftext and '⚠ 单单元主导' not in ftext, ftext
+    # The article unit is preferred and its ids, not the line ids, label folds.
+    cell_a = _article_cell([1.0, 1.0, 1.0, 200.0], toks,
+                           ['l0', 'l1', 'l2', 'l3'],
+                           [1.0, 1.0, 1.0, 200.0], toks,
+                           ['a0', 'a1', 'a2', 'a3'])
+    cell_b = _article_cell([2.0, 2.0, 2.0, 2.0], toks,
+                           ['l0', 'l1', 'l2', 'l3'],
+                           [2.0, 2.0, 2.0, 2.0], toks,
+                           ['a0', 'a1', 'a2', 'a3'])
+    art_a = {s: {'by_len': {512: dict(cell_a)}} for s in (0, 1)}
+    art_b = {s: {'by_len': {512: dict(cell_b)}} for s in (0, 1)}
+    art = V12._doc_level_analysis(art_a, art_b, [0, 1], 512)
+    assert art['granularity'] == 'article', art
+    assert art['unit_influence']['unit_ids'] == ['a0', 'a1', 'a2', 'a3'], art
+    assert art['unit_influence']['most_influential_unit'] == 'a3', art
+    # No influence block means no table (never a fabricated "stable" line);
+    # a pooled CI without the block is named as unverified, not omitted.
+    assert V12._doc_influence_markdown({}) == []
+    assert V12._doc_influence_markdown(
+        {'comparisons': {'x': {'doc_sampling': {'unit': 'document'}}}}) == []
+    miss = V12._doc_influence_markdown({'comparisons': {'x': {'doc_sampling': {
+        'unit': 'document', 'pooled_delta_ppl_ci95': [-1.0, 1.0],
+        'unit_influence_unavailable_reason': 'unit ids are not unique'}}}})
+    mtext = '\n'.join(miss)
+    assert '单单元敏感性**未验证**' in mtext and 'unit ids are not unique' in mtext, mtext
+
+
+def t_unit_influence_audit_gate():
+    """L175 — the audit checks the influence block and warns on fragility."""
+    nll_a = [[1.0, 1.0, 1.0, 200.0]]
+    nll_b = [[2.0, 2.0, 2.0, 2.0]]
+    toks = [10.0, 10.0, 10.0, 10.0]
+    inf = L.paired_nll_unit_influence(nll_a, nll_b, toks,
+                                      unit_ids=['a', 'b', 'c', 'd'])
+    comp = {'doc_sampling': {
+        'unit': 'document',
+        'pooled_delta_ppl': inf['full_delta_ppl'],
+        'pooled_delta_ppl_ci95': [-1.0, 1.0],
+        'unit_influence': inf,
+    }}
+    stats = {'comparisons': {'x': comp}}
+    with tempfile.TemporaryDirectory() as td:
+        p = os.path.join(td, 'test_stats.json')
+        with open(p, 'w', encoding='utf-8') as f:
+            json.dump(stats, f)
+        with contextlib.redirect_stdout(io.StringIO()):
+            aud = A.audit_unit_influence(path=p)
+        assert aud['status'] == 'warnings', aud
+        assert aud['n_fragile'] == 1 and aud['n_ok'] == 0, aud
+        assert any('x' in w and 'single-unit' in w for w in aud['warnings']), aud
+        assert aud['comparisons']['x']['most_influential_unit'] == 'd', aud
+
+        # The same block with a uniform effect passes the consistency gate.
+        inf_ok = L.paired_nll_unit_influence(
+            [[2.0, 2.0, 2.0, 2.0]], [[3.0, 3.0, 3.0, 3.0]],
+            [10.0, 10.0, 10.0, 10.0], unit_ids=['a', 'b', 'c', 'd'])
+        stats_ok = {'comparisons': {'x': {
+            'doc_sampling': {'unit': 'document',
+                             'pooled_delta_ppl': inf_ok['full_delta_ppl'],
+                             'pooled_delta_ppl_ci95': [-1.0, 1.0],
+                             'unit_influence': inf_ok}}}}
+        with open(p, 'w', encoding='utf-8') as f:
+            json.dump(stats_ok, f)
+        with contextlib.redirect_stdout(io.StringIO()):
+            aud_ok = A.audit_unit_influence(path=p)
+        assert aud_ok['status'] == 'ok' and aud_ok['n_ok'] == 1, aud_ok
+
+        # A point estimate that no longer matches the pooled Δ is a hard fail.
+        bad = json.loads(json.dumps(stats))
+        bad['comparisons']['x']['doc_sampling']['unit_influence'][
+            'full_delta_ppl'] += 1.0
+        with open(p, 'w', encoding='utf-8') as f:
+            json.dump(bad, f)
+        with contextlib.redirect_stdout(io.StringIO()):
+            aud_bad = A.audit_unit_influence(path=p)
+        assert aud_bad['status'] == 'fail', aud_bad
+        assert any('does not reproduce' in x for x in aud_bad['problems']), aud_bad
+
+        # Duplicate ids and non-finite fold values are also hard failures.
+        bad_ids = json.loads(json.dumps(stats))
+        bad_ids['comparisons']['x']['doc_sampling']['unit_influence'][
+            'unit_ids'][1] = bad_ids['comparisons']['x']['doc_sampling'][
+                'unit_influence']['unit_ids'][0]
+        with open(p, 'w', encoding='utf-8') as f:
+            json.dump(bad_ids, f)
+        with contextlib.redirect_stdout(io.StringIO()):
+            aud_ids = A.audit_unit_influence(path=p)
+        assert aud_ids['status'] == 'fail', aud_ids
+        assert any('not unique' in x for x in aud_ids['problems']), aud_ids
+        bad_vec = json.loads(json.dumps(stats))
+        bad_vec['comparisons']['x']['doc_sampling']['unit_influence'][
+            'loo_delta_ppl'][0] = float('nan')
+        with open(p, 'w', encoding='utf-8') as f:
+            json.dump(bad_vec, f)
+        with contextlib.redirect_stdout(io.StringIO()):
+            aud_vec = A.audit_unit_influence(path=p)
+        assert aud_vec['status'] == 'fail', aud_vec
+        assert any('non-finite' in x for x in aud_vec['problems']), aud_vec
+
+        # A stale pooled-CI artifact without the block is unverified, not clean.
+        stale = {'comparisons': {'x': {
+            'doc_sampling': {'unit': 'document',
+                             'pooled_delta_ppl': 1.0,
+                             'pooled_delta_ppl_ci95': [-1.0, 1.0]}}}}
+        with open(p, 'w', encoding='utf-8') as f:
+            json.dump(stale, f)
+        with contextlib.redirect_stdout(io.StringIO()):
+            aud_stale = A.audit_unit_influence(path=p)
+        assert aud_stale['status'] == 'warnings', aud_stale
+        assert aud_stale['n_missing'] == 1, aud_stale
+        # A missing artifact is explicitly not verifiable, not a pass.
+        with contextlib.redirect_stdout(io.StringIO()):
+            aud_missing = A.audit_unit_influence(path=os.path.join(td, 'none.json'))
+        assert aud_missing['status'] == 'not_verifiable_locally', aud_missing
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -20917,6 +21189,9 @@ def main():
     _check('L170 SESOI gates verified / equivalent / harmful ablation verdicts', t_sesoi_audit_gates_verified_and_equivalence)
     _check('L171 SESOI declaration gate fails closed', t_sesoi_declaration_gate)
     _check('L172 SESOI partial-panel coverage + input guards', t_sesoi_partial_panel_and_input_guards)
+    _check('L173 leave-one-unit-out influence targets the pooled estimand', t_doc_unit_influence_primitives)
+    _check('L174 unit influence reaches v12 analysis + report caveat', t_doc_influence_analysis_and_markdown)
+    _check('L175 unit-influence audit flags fragile and stale artifacts', t_unit_influence_audit_gate)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

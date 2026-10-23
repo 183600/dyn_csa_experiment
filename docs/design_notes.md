@@ -3434,3 +3434,116 @@ baseline、畸形声明 fail-closed。L170 覆盖：2% 效应仍 `verified`；0.
 `equivalent`（不是 null）；反向 1.6% 成为 `harmful`；`sesoi={}` 恢复旧
 行为；未测声明对照仍占 Holm 槽位。L171 覆盖：缺组件、零/NaN margin、
 拼错组件名都在设计期被发现。
+
+## 57. 结果稳健性要问到「单个评测单位」：leave-one-unit-out 影响与 jackknife（本轮结果分析硬化）
+
+### 57.1 问题：种子稳健不等于评测单位稳健
+
+§42 的脆弱性/逐种子删除回答的是「结论是否依赖某一个训练种子」；§54 的
+cluster-robust 区间回答的是「按文章聚类后评测抽样的不确定性有多宽」。
+两者都不能回答一个更直接的结果分析问题：
+
+> 报告的 pooled ΔPPL 是否主要由**一个评测文章/文档**贡献？删掉它，方向
+> 或幅度还成立吗？
+
+旧报告只有 `top_doc_abs_share = max|Δ_unit| / Σ|Δ_unit|` 这一描述量。
+它能提示某个单位的逐文档 PPL 差很大，但（a）逐文档 PPL 的等权差与主终点
+的 token 池化 Δ 不是同一估计量；（b）它没有做「删除该单位后重算」；
+（c）cluster-robust 区间可能在一个高杠杆单位存在时仍然很窄。把
+`top_doc_abs_share` 当作「单文档影响」会同时犯 §54 已经指出的估计量混用
+错误。
+
+### 57.2 方法：在同一个 pooled 估计量上做精确 delete-one-unit
+
+新增 `exp_lib.paired_nll_unit_influence(nll_a, nll_b, n_tokens, *,
+unit_ids=..., conf=0.95, top_k=5)`：
+
+- 输入仍是 `[n_seeds, n_units]` 的逐单位 NLL 与共享 token 数；单位可以是
+  文章、行级文档或固定行。主终点保持
+
+  ```
+  Δ = mean_s [ exp(Σ_i a_si / T) − exp(Σ_i b_si / T) ]
+  ```
+
+  不做逐文档等权平均。
+- 对每个单位 i 精确重算 `Δ_{-i}`（去掉 i 后的 token 池化 PPL 差，再对
+  种子取均值），得到 `loo_delta_ppl` / `loo_delta_log_ratio` 与
+  `loo_change_*`。这与「把逐单位 PPL 差做一次 bootstrap」回答的问题不同：
+  后者重采样等权单位，前者保持主终点的 token 权重。
+- 同时暴露 `_paired_nll_doc_ci` 已经在用、但此前只用于方差求和的
+  delta-method influence `psi_i` / `psi_lr_i`，便于检查局部影响。
+- 用全部 LOO 折计算 delete-one-unit jackknife：
+
+  ```
+  se_jack = sqrt((D−1)/D · Σ_i (Δ_{-i} − mean(Δ_{-i}))²)
+  ```
+
+  并给出 t(df=D−1) 区间；同时报告它与 cluster-robust SE 的比值。比值远大于
+  1 是「高杠杆单位」警告，而不是新的显著性检验。
+- 方向稳定性按**尺度无关的 log 效应**判断：`sign_stable_log_ratio` 要求
+  所有有限 LOO 折与全 panel 的 `Δlog PPL` 同号；`single_unit_dominates`
+  表示删除一个单位使 log 效应变化 ≥100%。`fragile_to_one_unit` 是二者的
+  并集；全 panel 效应恰为 0 时返回 `None`（没有方向可翻转，不能伪造
+  stable/fragile）。
+- `top_k` 按 |Δlog PPL 变化| 排序；`unit_ids` 必须与单位数等长且唯一。
+  某个 LOO 折因剩余 token 池化的 PPL 溢出而不可用时，该折标为不可用，
+  jackknife 明确关闭，而不是把 inf/nan 当成一个点。
+
+### 57.3 接入 v12 分析、报告与审计
+
+- `v12_supp._doc_level_analysis` 只在 pooled cluster CI 已经与记录的主
+  终点逐值对齐时计算影响块（否则影响属于另一个估计量）；单位 id 取
+  `article_ids`（优先）或 `doc_ids`，要求唯一且顺序已跨臂/种子核对。
+  行级（`row`）单元没有 token 池化主终点，不生成该块。
+- 结果写入 `comparisons[*].doc_sampling.unit_influence`：
+  `full_delta_*`、`delta_method_influence_*`、`loo_*`、`jackknife_*`、
+  `se_ratio_*`、`most_influential_unit`、`top_units` 与
+  `fragile_to_one_unit`；`label_source` 区分 `provided` 与
+  `index_fallback`。不可用时写 `unit_influence_unavailable_reason`，
+  不静默省略。
+- `v12_supp._doc_influence_markdown` 在 REPORT_v12 的结论稳健性表之后
+  渲染「单元影响诊断」：最敏感单位、删除后 Δ、最大单单位变化、删除后
+  是否同向、jackknife 区间与标记。`单单元主导` 行会额外给出「引用时必须
+  同时报告该敏感度，不能描述为对评测文档稳健」的提示。
+- `audit_gates.audit_unit_influence`（`python audit_gates.py unit_influence`）
+  独立检查每个影响块：`full_delta_ppl` 必须复现报告 pooled Δ、单位 id/
+  LOO 向量长度必须闭合、`fragile_to_one_unit` 必须是 bool/null。块自相
+  矛盾判 `fail`；单单元主导或 pooled CI 存在但没有影响块的陈旧产物判
+  `warnings`；没有产物判 `not_verifiable_locally`。该审计**不**把 fragile
+  改写成「未确认」——冻结决策规则没有这条阈值。
+
+### 57.4 边界
+
+- **不改**任何 token、split、训练、checkpoint、PPL 点估计、种子、alpha、
+  Holm 族、决策规则或 `confirmation_frozen*.json`；不需要 bump
+  `CODE_SEMANTICS`。`confirmed` 仍只由 §41/§42 的冻结规则产生。
+- 这是 **post-hoc 描述**：条件在已训练种子上；单位不是随机化分配；删除
+  一个单位后描述的是「冻结切片减一个单位」，不是语言总体，也不支持
+  `population_claim_allowed`。
+- `fragile_to_one_unit=False` 只表示「没有单个单位的删除会翻转方向或
+  使 log 效应变化 ≥100%」，不是「对所有文章稳健」的证书；仍然必须与
+  cluster 区间、n、文章数和 §54 的小 cluster 警告一起读。
+- 100% 阈值是预先写明的描述性 convention（不是从这批结果反推的检验阈
+  值）；若删除一个单位只造成 20% 变化，报告应显示数值而不是把它藏进
+  「稳定」标签。
+- 行级单元没有 token 池化 NLL 矩阵，故不生成影响块；历史 v6–v11 记录
+  没有该字段，不重跑、不回填，也不把旧记录标成已做单单元敏感性。
+- `unit_ids` 缺失/重复时分析层回退到索引标签并明确记录，而不是猜是哪
+  篇文章；这会降低可读性，但不改变数值。
+
+### 57.5 入口与验证
+
+```bash
+python test_review_fixes.py             # L173 原语；L174 v12 接入/渲染；L175 审计
+python audit_gates.py unit_influence    # 零 GPU：核对已落盘影响块
+python audit_gates.py report            # 汇总里新增 unit_influence
+```
+
+L173 覆盖：精确 LOO 与逐折 `_paired_nll_doc_ci` 逐位一致、jackknife SE
+手算一致、单单位主导/方向翻转、均匀效应零变化、全零效应返回 undefined、
+<3 单位拒绝、LOO 溢出折标为不可用、形状/token/id/选项 fail-closed。
+L174 覆盖：v12 分析在文档与文章单元上写入正确 id、影响块点估计与
+`pooled_delta_ppl` 一致、报告表含「单单元主导」与「不改变冻结判定」
+边界、均匀效应不被误标、无影响块时不伪造表格。L175 覆盖：fragile 块
+→ `warnings`、一致块 → `ok`、篡改点估计 → `fail`、pooled CI 存在但
+无影响块 → `warnings`、缺产物 → `not_verifiable_locally`。

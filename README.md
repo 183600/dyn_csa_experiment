@@ -354,6 +354,7 @@ python audit_gates.py causality   # CPU unit audit: prefix invariance / label sh
 python audit_gates.py leakage     # tokenizer provenance, vocab identity, train/test overlap
 python audit_gates.py single_factor  # design-time gate: every declared contrast's arm-cfg diff equals its declared intervention key set; open-block matrix axes; frozen-manifest mechanism_claim_allowed flags vs the actual cfg diff
 python audit_gates.py sesoi       # design-time gate: every ablation component has a valid declared SESOI and is fully scheduled
+python audit_gates.py unit_influence  # result-analysis gate: unit-influence block reproduces pooled Δ; flags one-unit-driven comparisons
 python audit_gates.py report      # run every locally-verifiable audit -> audit_report.json
 python audit_gates.py selection   # selection-recall contract (refuses unsupported mechanism claims when absent)
 python audit_gates.py efficiency_pairs  # measured latency claims: same shape/device/KV required
@@ -453,6 +454,15 @@ machine gates rather than new prose:
   is `equivalent` (positive evidence of removability).  `audit_gates.py sesoi` fails closed if a component has no
   declared margin or the ablation is not fully scheduled.  This is exploratory
   and does not modify the frozen confirmatory manifest.
+- **Single-unit influence**: the pooled ΔPPL now carries an exact
+  leave-one-unit-out readout (`doc_sampling.unit_influence`): the most
+  influential article/line, the Δ without it, direction stability across all
+  folds, a delete-one-unit jackknife interval/SE and its ratio to the
+  cluster-robust SE.  A comparison whose direction or magnitude depends on one
+  evaluation unit is flagged in `REPORT_v12.md`; `audit_gates.py
+  unit_influence` independently checks the block against the reported pooled
+  estimate and warns on fragile/stale artifacts.  It is post-hoc and never
+  changes the frozen p/Holm/`confirmed` verdict (design_notes §57).
 - **Evidence**: `audit_gates.release` parses `RELEASES.md`; with no complete
   row the repository is declared source-only/not auditable.  `archive_release.py`
   now also packs `pyproject.toml`, cache/tokenizer metadata and `run_*.log`.

@@ -288,6 +288,7 @@ python audit_gates.py causality   # 纯 CPU 单元审计：前缀不变性 / 标
 python audit_gates.py leakage     # 分词器来源 / 词表一致性 / train-test 文档重叠
 python audit_gates.py single_factor  # 定义点单因素门：每条声明对照的臂配置 diff 恰等于声明的干预键集；开放块矩阵只沿声明轴变化；冻结清单的 mechanism_claim_allowed 标志与实际 cfg diff 对账
 python audit_gates.py sesoi       # 设计期门：每个消融组件都有合法已声明 SESOI，且声明对照完整排程
+python audit_gates.py unit_influence  # 结果分析门：逐单元影响块必须复现主终点 pooled Δ；标记单单元主导/陈旧产物
 python audit_gates.py report      # 运行本地可核验的全部审计 -> audit_report.json
 python archive_release.py plan v13 --dirs results_lm_test analysis_v12   # 证据归档 dry-run
 ```
@@ -376,3 +377,11 @@ python build_report.py        # 从产物重建 REPORT_v7.md（零 GPU）
   （可删的正证据）；部分消融只作描述性读数。`audit_gates.py
   sesoi` 对「缺 margin / 未完整排程」fail-closed。该层只约束探索性消融，
   不改冻结确认清单（详见 docs/design_notes.md §56）。
+- **单单元影响**：pooled ΔPPL 新增精确的 leave-one-unit-out 读数
+  （`doc_sampling.unit_influence`）：最敏感文章/行、删除它后的 Δ、全部
+  LOO 折的方向稳定性、delete-one-unit jackknife 区间/SE 及其与
+  cluster-robust SE 的比值。方向或幅度依赖单个评测单位的比较会在
+  `REPORT_v12.md` 中标记；`audit_gates.py unit_influence` 独立核对影响块
+  与报告 pooled Δ 一致，并对 fragile/陈旧产物给 warning。该层是 post-hoc
+  描述，**不改变**冻结 p/Holm/`confirmed` 判定（详见 docs/design_notes.md
+  §57）。

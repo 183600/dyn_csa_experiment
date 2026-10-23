@@ -2451,6 +2451,7 @@ def _doc_level_analysis(recs_a, recs_b, common, Ln):
     _doc_b = [r.get('ppl_per_doc') for r in rows_b]
     _has_doc = [isinstance(x, list) and bool(x) for x in _doc_a + _doc_b]
     _article_fallback = None
+    _ref_ids = None
     if any(_has_art) and all(_has_art):
         _granularity = 'article'
         _ppl_a, _ppl_b = _art_a, _art_b
@@ -2534,6 +2535,18 @@ def _doc_level_analysis(recs_a, recs_b, common, Ln):
     n_docs = min(_lens)
     if n_docs < 2:
         return None
+    # Unit labels for the leave-one-unit-out influence readout.  The order was
+    # already checked across arm/seed records above; only a unique, complete id
+    # vector may label the folds, otherwise the readout falls back to indices
+    # (and the report says so) rather than guessing which unit was dropped.
+    _unit_ids = None
+    if isinstance(_ref_ids, (list, tuple)) and len(_ref_ids) == n_docs:
+        try:
+            _ids_cand = [str(x) for x in _ref_ids]
+            if len(set(_ids_cand)) == n_docs:
+                _unit_ids = _ids_cand
+        except (TypeError, ValueError):
+            _unit_ids = None
     doc_deltas = []
     doc_log_ratios = []
     within = []
@@ -2566,6 +2579,8 @@ def _doc_level_analysis(recs_a, recs_b, common, Ln):
     # with their token counts, not give every document equal weight.
     _pooled_ci = None
     _pooled_ci_reason = None
+    _unit_influence = None
+    _unit_influence_reason = None
     if _granularity in ('document', 'article'):
         _nll_a, _why_a = _doc_nll_matrix(rows_a, n_docs, _ref_tok,
                                          unit=_granularity)
@@ -2607,6 +2622,14 @@ def _doc_level_analysis(recs_a, recs_b, common, Ln):
                             'recorded per-seed pooled PPL difference')
                     else:
                         _pooled_ci = _pc
+                        try:
+                            _unit_influence = L.paired_nll_unit_influence(
+                                _nll_a, _nll_b, _ref_tok, unit_ids=_unit_ids)
+                        except (ValueError, TypeError, FloatingPointError,
+                                OverflowError) as _ie:
+                            _unit_influence = None
+                            _unit_influence_reason = (
+                                f'{type(_ie).__name__}: {_ie}')
                 else:
                     # The frozen comparison has no finite per-seed pooled PPL
                     # for this cell, so the document vectors cannot be tied to
@@ -2720,6 +2743,12 @@ def _doc_level_analysis(recs_a, recs_b, common, Ln):
                                'log PPL ratio, not the log of the ΔPPL.  This '
                                'is not a seed-level significance test.'),
         })
+        if _unit_influence is not None:
+            out['unit_influence'] = _unit_influence
+        else:
+            out['unit_influence_unavailable_reason'] = (
+                _unit_influence_reason or
+                'leave-one-unit-out influence not available for this cell')
     elif _granularity in ('document', 'article'):
         out['pooled_ci_unavailable_reason'] = (
             _pooled_ci_reason or
@@ -3049,6 +3078,104 @@ def _doc_ci_markdown_cell(dsm):
     if unit_ci is not None:
         return f'{unit_ci}（{unit} bootstrap，等权单元）'
     return '—'
+
+
+def _doc_influence_markdown(ft):
+    """Render the post-hoc leave-one-unit-out influence table.
+
+    Pure function of the final-test stats dict, so the wording and the
+    "does not change the frozen decision" boundary are testable without a
+    panel.  It deliberately uses the scale-free log-ratio influence for the
+    fragility flag: a PPL difference is expressed on the baseline's scale,
+    while the log ratio is the multiplicative effect the arms are compared on.
+    """
+    comps = (ft or {}).get('comparisons') if isinstance(ft, dict) else None
+    if not isinstance(comps, dict):
+        return []
+    rows = []
+    missing = []
+    for name, comp in comps.items():
+        if not isinstance(comp, dict):
+            continue
+        dsm = comp.get('doc_sampling') or {}
+        inf = dsm.get('unit_influence') if isinstance(dsm, dict) else None
+        if not isinstance(inf, dict) or not inf.get('available'):
+            if (isinstance(dsm, dict)
+                    and dsm.get('pooled_delta_ppl_ci95') is not None):
+                missing.append(
+                    f'{name}（{dsm.get("unit_influence_unavailable_reason") or "缺少影响块"}）')
+            continue
+        unit = {'article': '文章', 'document': '文档'}.get(
+            dsm.get('unit') or dsm.get('granularity'), '单元')
+        full = inf.get('full_delta_ppl')
+        idx = inf.get('most_influential_index')
+        loo = inf.get('loo_delta_ppl') or []
+        loo_delta = (loo[idx] if isinstance(idx, int) and 0 <= idx < len(loo)
+                     else None)
+        rel_lr = inf.get('max_abs_relative_change_log_ratio')
+        rel_ppl = inf.get('max_abs_relative_change_ppl')
+        rel_txt = '—'
+        if isinstance(rel_lr, (int, float)) and math.isfinite(rel_lr):
+            rel_txt = f'log {100.0 * rel_lr:.0f}%'
+        if isinstance(rel_ppl, (int, float)) and math.isfinite(rel_ppl):
+            rel_txt += (f' / PPL {100.0 * rel_ppl:.0f}%'
+                        if rel_txt != '—' else f'PPL {100.0 * rel_ppl:.0f}%')
+        same = inf.get('sign_stable_log_ratio')
+        same_txt = ('—' if same is None else ('是' if same else '否（翻转）'))
+        ci = inf.get('jackknife_ci95_ppl')
+        ci_txt = '—'
+        if isinstance(ci, (list, tuple)) and len(ci) == 2:
+            try:
+                lo, hi = float(ci[0]), float(ci[1])
+                if math.isfinite(lo) and math.isfinite(hi):
+                    ci_txt = f'[{lo:+.2f}, {hi:+.2f}]'
+            except (TypeError, ValueError, OverflowError):
+                pass
+        _frag = inf.get('fragile_to_one_unit')
+        if _frag is None:
+            flag = '—（无方向）'
+        elif _frag:
+            flag = '⚠ 单单元主导'
+        else:
+            flag = '未见单单元翻转'
+        uid = inf.get('most_influential_unit')
+        uid_txt = (str(uid)[:16] if uid is not None else '—')
+        if inf.get('label_source') == 'index_fallback':
+            uid_txt += '（索引）'
+        tied = inf.get('most_influential_tied_count')
+        if isinstance(tied, int) and tied > 1:
+            uid_txt += f'（并列 {tied}）'
+        full_txt = f'{full:+.3f}' if isinstance(full, (int, float)) and math.isfinite(full) else '—'
+        loo_txt = (f'{loo_delta:+.3f}'
+                   if isinstance(loo_delta, (int, float)) and math.isfinite(loo_delta)
+                   else '—')
+        rows.append('| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |'
+                    % (name, unit, inf.get('n_units', '—'), full_txt, uid_txt,
+                       loo_txt, rel_txt, same_txt, ci_txt, flag))
+    if not rows and not missing:
+        return []
+    out = ['### 单元影响诊断（post-hoc；不改变上面的冻结判定）', '']
+    if rows:
+        out += ['| 比较 | 单位 | n | 全 panel ΔPPL | 最敏感单元 | 删除后 ΔPPL | 最大单单元变化 | 删除后同向 | jackknife 95% CI | 标记 |',
+                '|---|---|---|---|---|---|---|---|---|---|']
+        out.extend(rows)
+        out += ['',
+                '> 定义：对每个评测单位 i 删除它，再用**同一 token 池化估计量**重算 ΔPPL；'
+                '`最敏感单元` 是使 log 效应变化最大的单位，`jackknife 95% CI` 是 delete-one-unit '
+                'jackknife 区间（条件在已训练种子上）。`单单元主导` 指删除一个单位使 log 效应变化 ≥100%；'
+                '方向翻转单独标记。该表是**对已发生数据的 post-hoc 描述**：不进入冻结 p/Holm/confirmed，'
+                '不把评测单位当成随机化，也不能据此做总体推断；删除单位后描述的是「冻结切片减一个单位」。'
+                '逐单元完整 LOO 向量与 delta-method influence 见 `analysis_v12/test_stats.json` 的 '
+                '`doc_sampling.unit_influence`。', '']
+    if missing:
+        out += ['> 以下比较有 pooled CI 但没有可用的单元影响块，'
+                '单单元敏感性**未验证**：' + '；'.join(missing) + '。', '']
+    frag = [r.split('|')[1].strip() for r in rows if '单单元主导' in r]
+    if frag:
+        out += ['**解读提示**：' + '、'.join(frag) +
+                ' 的方向/幅度依赖单个评测单位；引用时必须同时报告该敏感度，'
+                '不能把结论描述为「对评测文档稳健」。', '']
+    return out
 
 
 def _robustness_markdown(rob):
@@ -4017,6 +4144,19 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
             _conf = [k for k, v in holm.items() if v.get('reject') and (comps.get(k, {}).get('direction_ok') is True) and (comps.get(k, {}).get('param_matched') is not False) and (comps.get(k, {}).get('same_init_core_fp') is not False) and (comps.get(k, {}).get('coverage_ok') is True)]
         if _conf:
             A(f'**确认结果**：{len(_conf)}/{len(comps)} 个冻结主比较在 Holm 校正后成立**且方向符合预注册**（{sorted(_conf)}）——这是预注册规则下的确认性证据。')
+            _frag_conf = []
+            for _k in _conf:
+                _dsm = comps.get(_k, {}).get('doc_sampling') or {}
+                _ui = _dsm.get('unit_influence') or {}
+                if _ui.get('fragile_to_one_unit') is True:
+                    _u = {'article': '文章', 'document': '文档'}.get(
+                        _dsm.get('unit') or _dsm.get('granularity'), '单元')
+                    _frag_conf.append(f'{_k}（最敏感{_u} `{_ui.get("most_influential_unit")}`）')
+            if _frag_conf:
+                A('')
+                A('**单单元敏感度提示**：' + '；'.join(_frag_conf) +
+                  ' 的确认方向依赖删除单个评测单位；确认判定不变，但引用时必须同时报告'
+                  '下方「单元影响诊断」，不能把结论描述为对评测文档稳健。')
         else:
             _cov_req = bool((ft.get('coverage_requirement') or {}).get('require_complete_coverage'))
             _sig = [k for k, _h in holm.items()
@@ -4034,6 +4174,9 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
         _rob_lines = _robustness_markdown(ft.get('robustness') or {})
         if _rob_lines:
             lines.extend(_rob_lines)
+        _doc_inf_lines = _doc_influence_markdown(ft)
+        if _doc_inf_lines:
+            lines.extend(_doc_inf_lines)
         _nd = ft.get('significant_nondirectional') or []
         if _nd:
             A('')
