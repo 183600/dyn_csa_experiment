@@ -19644,6 +19644,13 @@ def t_local_raw_cache_records_dataset_source():
                 meta = json.load(fh)
             src = meta.get('dataset_source')
             assert isinstance(src, dict), src
+            _samp = meta.get('sampling')
+            assert isinstance(_samp, dict), meta
+            assert _samp['train']['design'] == 'source_order_prefix', _samp
+            assert _samp['train']['representativeness_claim_allowed'] is False, _samp
+            assert _samp['train']['source_rows'] == 1600, _samp
+            assert _samp['train']['rows_served'] > 0, _samp
+            assert _samp['validation']['source_rows'] == 800, _samp
             assert src.get('provider') == 'local' and src.get('revision') is None, src
             assert src.get('revision_pinned') is False, src
             # A cache hit must serve exactly the same bytes and not fabricate a
@@ -19658,6 +19665,178 @@ def t_local_raw_cache_records_dataset_source():
                 os.environ.pop('WT103_RAW_TXT', None)
             else:
                 os.environ['WT103_RAW_TXT'] = old
+
+
+def t_document_stratified_plan_is_reproducible_and_auditable():
+    sizes = [1 + (i * 7) % 23 for i in range(120)]
+    p1 = L.document_stratified_plan(sizes, 24, seed=11, n_strata=6)
+    p2 = L.document_stratified_plan(sizes, 24, seed=11, n_strata=6)
+    assert p1 == p2, (p1.get('plan_fp'), p2.get('plan_fp'))
+    assert p1['n_units'] == 120 and p1['n_select'] == 24, p1
+    assert p1['selected'] == sorted(p1['selected']), p1['selected']
+    assert len(set(p1['selected'])) == 24, p1['selected']
+    assert all(0 <= i < 120 for i in p1['selected']), p1['selected']
+    assert p1['selection_without_replacement'] is True, p1
+    assert p1['all_strata_represented'] is True, p1['strata']
+    assert sum(s['n_units'] for s in p1['strata']) == 120, p1['strata']
+    assert sum(s['n_selected'] for s in p1['strata']) == 24, p1['strata']
+    assert all(s['n_selected'] >= 1 for s in p1['strata']), p1['strata']
+    assert abs(p1['unit_coverage_fraction'] - 24 / 120) < 1e-12, p1
+    assert L.sampling_plan_problems(p1) == [], L.sampling_plan_problems(p1)
+    # A different source snapshot must not reuse the same selected units.
+    p3 = L.document_stratified_plan(sizes, 24, seed=11, n_strata=6,
+                                    source_fp='snapshot-b')
+    assert p3['selected'] != p1['selected'], ('source_fp ignored', p1['selected'])
+    assert L.sampling_plan_problems(p3) == [], L.sampling_plan_problems(p3)
+    # Tampering with the persisted selection invalidates the fingerprint.
+    bad = json.loads(json.dumps(p1))
+    bad['selected'][0] = (bad['selected'][0] + 1) % 120
+    if bad['selected'] != sorted(set(bad['selected'])):
+        bad['selected'] = sorted(set(bad['selected']))
+    bad['selected'] = sorted(set(bad['selected']))
+    if len(bad['selected']) != bad['n_select']:
+        bad['selected'] = bad['selected'][:-1] + [i for i in range(120)
+                                                 if i not in bad['selected']][:1]
+    _bad_problems = L.sampling_plan_problems(bad)
+    assert any('plan_fp' in x or 'stratum n_selected' in x or 'selected has' in x
+               for x in _bad_problems), _bad_problems
+    # Public error paths are explicit, not silent coercions.
+    for kwargs in ({'n_select': 0}, {'n_select': 121}, {'seed': True},
+                   {'n_strata': 0}, {'allocation': 'nope'}):
+        try:
+            _kw = {'n_select': 24}
+            _kw.update(kwargs)
+            L.document_stratified_plan(sizes, **_kw)
+        except (TypeError, ValueError):
+            pass
+        else:
+            raise AssertionError(f'bad plan input accepted: {kwargs}')
+    try:
+        L.document_stratified_plan([1.0, float('nan')], 1)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('NaN size accepted')
+    picked = L.select_sampled_items(list(range(120)), p1)
+    assert picked == p1['selected'], picked
+
+
+def t_wikitext_article_sampling_selects_whole_articles():
+    rows = []
+    for a in range(8):
+        rows.append(f' = Article {a} = ')
+        rows.extend([f'body {a}.{j}' for j in range(a % 4)])
+        rows.append('')
+    rep = L.wikitext_article_sampling_plan(rows, 4, seed=3, n_strata=2)
+    assert rep['status'] == 'ok' and rep['n_articles_available'] == 8, rep
+    groups = L.wikitext_article_groups(rows)['groups']
+    selected_articles = set(rep['selected_article_indices'])
+    expected_rows = sorted(i for a in selected_articles for i in groups[a])
+    assert rep['selected_row_indices'] == expected_rows, rep
+    assert len(rep['selected_article_ids']) == 4, rep
+    assert L.sampling_plan_problems(rep['plan']) == [], rep['plan']
+    # No headings means no article unit; the sampler refuses instead of
+    # treating each line as a pseudo-article.
+    try:
+        L.wikitext_article_sampling_plan(['a', 'b', 'c'], 2)
+    except ValueError as e:
+        assert 'top-level headings' in str(e), e
+    else:
+        raise AssertionError('line-only rows accepted as articles')
+
+
+def t_sample_design_audit_reports_prefix_and_probability_plans():
+    with tempfile.TemporaryDirectory() as td:
+        raw = os.path.join(td, 'raw')
+        cache = os.path.join(td, 'cache')
+        os.makedirs(raw)
+        os.makedirs(cache)
+        train_rows = []
+        for a in range(16):
+            train_rows.extend([f' = Train {a} = ', f'body {a}', f'more {a}'])
+        val_rows = [' = Val 0 = ', 'v0', ' = Val 1 = ', 'v1']
+        with open(os.path.join(raw, 'wiki.train.raw'), 'w', encoding='utf-8') as fh:
+            fh.write('\n'.join(train_rows) + '\n')
+        with open(os.path.join(raw, 'wiki.valid.raw'), 'w', encoding='utf-8') as fh:
+            fh.write('\n'.join(val_rows) + '\n')
+        tag = 'v5_sl8_cap100_v80_vs4'
+        _id = lambda r: int(L._doc_id_u64(L._doc_exact_fp(r)))
+        np.save(os.path.join(cache, f'train_doc_ids_{tag}.npy'),
+                np.asarray([_id(r) for r in train_rows[:24]], dtype=np.uint64))
+        np.save(os.path.join(cache, f'val_doc_ids_{tag}.npy'),
+                np.asarray([_id(r) for r in val_rows], dtype=np.uint64))
+        prefix = {
+            'train': {'design': 'source_order_prefix', 'source_rows': len(train_rows),
+                      'rows_served': 24, 'tokens_served': 100, 'token_cap': 100,
+                      'cap_reached': True, 'representativeness_claim_allowed': False,
+                      'population_claim_allowed': False},
+            'validation': {'design': 'source_order_prefix',
+                           'source_rows': len(val_rows), 'rows_served': len(val_rows),
+                           'tokens_served': 100, 'token_cap': 100,
+                           'cap_reached': True,
+                           'representativeness_claim_allowed': False,
+                           'population_claim_allowed': False},
+        }
+        meta_path = os.path.join(cache, f'meta_{tag}.json')
+        with open(meta_path, 'w', encoding='utf-8') as fh:
+            json.dump({'vocab': 80, 'seq_len': 8, 'sampling': prefix}, fh)
+        rep = A.audit_sample_design(cache, raw_dir=raw)
+        assert rep['status'] == 'warnings', rep
+        train = rep['caches'][os.path.abspath(cache)]['train']
+        assert train['sampling_class'] == 'non_probability_prefix', train
+        assert train['representativeness_claim_allowed'] is False, train
+        assert train['row_coverage_fraction'] == 24 / len(train_rows), train
+        rc = train['raw_coverage']
+        assert rc['status'] == 'ok' and rc['raw_articles'] == 16, rc
+        assert rc['article_coverage_fraction'] == 0.5, rc
+        assert 'wiki.test.raw' in rep['note'], rep
+        # An optimistic claim on a prefix is a hard failure, not a footnote.
+        bad = json.loads(json.dumps(prefix))
+        bad['train']['representativeness_claim_allowed'] = True
+        with open(meta_path, 'w', encoding='utf-8') as fh:
+            json.dump({'vocab': 80, 'seq_len': 8, 'sampling': bad}, fh)
+        rep_bad = A.audit_sample_design(cache, raw_dir=raw)
+        assert rep_bad['status'] == 'fail', rep_bad
+        assert any('optimistic claim' in p for p in rep_bad['problems']), rep_bad
+        # A valid stratified plan is accepted; a population claim below the
+        # 64-unit floor is refused even when representativeness is claimed.
+        plan = L.document_stratified_plan([2] * 16, 8, seed=5, n_strata=4,
+                                          source_fp='fixture')
+        strat = {
+            'train': {'design': 'stratified_document', 'plan': plan,
+                      'source_fp': 'fixture', 'source_rows': 16,
+                      'rows_served': 8, 'tokens_served': 100,
+                      'token_cap': 100, 'cap_reached': True,
+                      'representativeness_claim_allowed': True,
+                      'population_claim_allowed': True},
+            'validation': prefix['validation'],
+        }
+        with open(meta_path, 'w', encoding='utf-8') as fh:
+            json.dump({'vocab': 80, 'seq_len': 8, 'sampling': strat}, fh)
+        rep_strat = A.audit_sample_design(cache, raw_dir=raw)
+        assert rep_strat['status'] == 'fail', rep_strat
+        assert any('64-unit floor' in p for p in rep_strat['problems']), rep_strat
+        strat['train']['population_claim_allowed'] = False
+        with open(meta_path, 'w', encoding='utf-8') as fh:
+            json.dump({'vocab': 80, 'seq_len': 8, 'sampling': strat}, fh)
+        rep_ok = A.audit_sample_design(cache, raw_dir=raw)
+        train = rep_ok['caches'][os.path.abspath(cache)]['train']
+        assert train['status'] == 'ok', train
+        assert train['representativeness_claim_allowed'] is True, train
+        # Test metadata is audited without ever opening wiki.test.raw.
+        test_meta = {'vocab': 80, 'seq_len': 8, 'sampling': {
+            'test': {'design': 'source_order_prefix', 'source_rows': 64,
+                     'rows_served': 24, 'tokens_served': 192,
+                     'token_cap': 192, 'cap_reached': True,
+                     'representativeness_claim_allowed': False,
+                     'population_claim_allowed': False}}}
+        with open(os.path.join(cache, 'test_meta_v5_sl8_v80_ns24.json'), 'w',
+                  encoding='utf-8') as fh:
+            json.dump(test_meta, fh)
+        rep_test = A.audit_sample_design(cache, raw_dir=raw)
+        trec = rep_test['caches'][os.path.abspath(cache)]['test']
+        assert trec['raw_coverage']['status'] == 'not_applicable', trec
+        assert 'wiki.test.raw' in trec['raw_coverage']['reason'], trec
 
 
 def main():
@@ -20160,6 +20339,9 @@ def main():
     _check('L155 project packaging is explicit and installable', t_project_packaging_is_complete)
     _check('L156 upstream dataset revision is pinned, recorded and audited', t_dataset_source_pinning_and_audit)
     _check('L157 cold local-raw cache records an explicit source', t_local_raw_cache_records_dataset_source)
+    _check('L158 stratified sampling plan is deterministic and tamper-evident', t_document_stratified_plan_is_reproducible_and_auditable)
+    _check('L159 wiki article sampler selects whole articles only', t_wikitext_article_sampling_selects_whole_articles)
+    _check('L160 sampling audit distinguishes prefix from probability sample', t_sample_design_audit_reports_prefix_and_probability_plans)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

@@ -3166,3 +3166,158 @@ raw/lengths 与 decode 两条路径得到同一映射、legacy decoder 内存修
 从缓存重建同一文章映射。L154 覆盖：文章字段追加后行级字段逐位不变、
 文章 token/NLL 精确重构池化总量、准入拒绝部分/重复/不一致字段、分析
 优先文章单位、混合覆盖回退行级并留痕、跨种子文章 id 不一致被拒绝。
+
+## 55. 抽样设计：source-order prefix 不是概率样本（本轮数据方法硬化）
+
+### 55.1 问题
+
+§49.1 已经承认：冻结的 test slice 是 test split 按源顺序切出的**前若干
+行**，不是对 test 文章总体的概率抽样；train/validation 同样如此。
+`load_wikitext` / `load_wikitest` 的构造规则是确定的、可复现的、泄漏安全
+的，但它回答的是「源顺序下最先出现的足量 token 是什么」，而不是「从文章
+总体中随机抽到的样本是什么」。因此：
+
+- 数据覆盖只到源文件前部；后部文章、长尾长度层可能完全没有进入切片；
+- 固定行数/ token 数不是 inclusion probability，不能把切片均值直接外推到
+  WikiText 文章总体；
+- 现有缓存只在 `split_strategy` 里描述「官方 split + 去重」，没有字段让
+  读者区分「确定性前缀」与「可复核的概率样本」；
+- §54 的文章聚类修正了**分析单位**，但没有修正**单位如何进入切片**。
+
+本轮补上的是抽样层：不改 token、split、cap、去重、训练或冻结计划，只
+增加可复核的抽样计划原语、缓存侧抽样元数据和一个独立审计。
+
+### 55.2 通用分层计划：`document_stratified_plan`
+
+```python
+plan = document_stratified_plan(
+    sizes, n_select, seed=0, n_strata=4,
+    allocation='proportional', min_per_stratum=1,
+    source_fp='<corpus snapshot fingerprint>')
+```
+
+- 单位按 `(size, index)` 排序后切成 `n_strata` 个**等数量**层；
+- 每层用由 `seed + stratum + source_fp + n_units + n_select` 哈希出的
+  独立 RNG 做**无放回**抽样；
+- `allocation` 支持 `proportional`（按层内单位数）、`equal`、以及显式的
+  `size_weighted`（按层内 size 总和；只有在分析权重也按 size 调整时才
+  应使用）；
+- 当 `n_select >= n_strata * min_per_stratum` 时保证每层至少一个单位；
+- 计划记录 selected indices、每层 n_units/n_selected、`sizes_fp`、
+  `source_fp` 和 `plan_fp`（去掉 `plan_fp` 后的 canonical JSON SHA-256）。
+
+`sampling_plan_problems(plan)` 独立复核：index 范围/重复/排序、层计数
+之和、`all_strata_represented`、`selected_without_replacement`、
+`plan_fp` 是否与内容一致。任何冻结后被改写或层计数不再闭合的计划都会被
+拒绝。`select_sampled_items(items, plan)` 只按已校验的 indices 取数，
+不重新抽样。
+
+### 55.3 文章级抽样：`wikitext_article_sampling_plan`
+
+```python
+rep = wikitext_article_sampling_plan(
+    rows, n_articles, seed=0, n_strata=4,
+    size_unit='rows',           # 或 'chars'
+    allocation='proportional', source_fp=None)
+```
+
+- 先用 `wikitext_article_groups` 按顶层 ` = Title = ` 标题切成完整文章；
+  没有标题的语料直接 `ValueError`，绝不把每行当成伪文章；
+- 以文章行数（或字符数）分层，抽中的是**整篇文章**；
+- 返回 `selected_article_indices`、`selected_article_ids`、
+  `selected_article_sizes` 和排序后的 `selected_row_indices`，调用方可以
+  只物化这些行，不会把一篇文章拆到 selected/unselected 两侧；
+- `plan` 字段就是 55.2 的计划，`plan_fp` 与之绑定。
+
+这是给**下一次 freeze** 的入口：目前冻结的 v12 缓存不重采样，新计划也
+不会自动替换现有 prefix 切片。
+
+### 55.4 缓存侧抽样元数据
+
+新构建的 train/validation/test meta 增加 `sampling`（追加字段，不改
+`src_fp`/`val_fp`/`test_fp`/`file_sigs`/token ids）：
+
+```text
+sampling.train.design                 = 'source_order_prefix'
+sampling.train.selection_rule         = 'first_nonempty_rows_..._until_token_cap'
+sampling.train.source_rows            = 上游 split 行数
+sampling.train.nonempty_rows_scanned  = 实际扫到的非空行数
+sampling.train.rows_served            = 实际进入 token 流的行数
+sampling.train.tokens_served          = 实际 token 数
+sampling.train.token_cap              = 请求的 cap
+sampling.train.cap_reached            = 是否因 cap 停止
+sampling.train.duplicate_documents_skipped = {exact, near}
+sampling.train.representativeness_claim_allowed = false
+sampling.train.population_claim_allowed         = false
+```
+
+validation 额外记录 `sequences_served/sequences_requested`；test 额外记录
+`rows_after_dedup`、`tokens_tokenised`。legacy 缓存没有该字段时，审计将其
+标为 `prefix_inferred_legacy`，不补写、不改字节。
+
+### 55.5 审计：`audit_gates.audit_sample_design`
+
+```bash
+python audit_gates.py sample_design
+python audit_gates.py report        # 汇总里新增 sample_design
+```
+
+审计逻辑：
+
+1. 读取每个 meta 的 `sampling` 块；缺失则明确标记
+   `prefix_inferred_legacy`；
+2. 对 `source_order_prefix`：`representativeness_claim_allowed` 和
+   `population_claim_allowed` 必须为 false；若元数据反而声称可外推，直接
+   `fail`。这是**硬门**，不是脚注；
+3. 对 `stratified_document`：调用
+   `sampling_plan_problems(plan)`；计划无效、`source_fp` 与 block 不一致、
+   层未覆盖、或 `population_claim_allowed=true` 但独立单位少于 64，均
+   `fail`；
+4. 若 `tokens_served < token_cap` 且 `cap_reached != true`，报告「源提前
+   耗尽」，防止把实际更短的训练/评测流当成声明的长度；
+5. 若本地存在 `wiki.train.raw` / `wiki.valid.raw`，用 doc-id sidecar 把
+   served 行映射回文章：
+   - 行覆盖率 = served raw lines / raw nonempty lines；
+   - 文章覆盖率 = 至少一行被 serve 的文章数 / raw 文章数；
+   - served 与 source 的文章长度分布 KS 统计量，阈值取双样本 5% 临界值
+     `1.36 * sqrt((n1+n2)/(n1*n2))`（上限 1.0）；
+   - 按 source 文章长度四分位报告覆盖率；某层完全没有 served 文章时给出
+     warning；
+6. **永不读取 `wiki.test.raw`**。test 的 raw coverage 固定
+   `not_applicable`，只用 build-time metadata 报告 source/served 行数。
+   这是 §17 一次性 held-out 访问纪律的延续。
+
+状态语义：`ok` 只表示声明与可复核的证据一致；`warnings` 包含
+「prefix 不可外推」「源提前耗尽」「长度分布偏移」「某长度层未覆盖」；
+`not_verifiable_locally` 用于缺缓存/缺 raw；`fail` 只给自相矛盾或过度
+声称的元数据。
+
+### 55.6 边界
+
+- **不改** token、split、cap、去重、训练、checkpoint、PPL 点估计、种子、
+  alpha、Holm family、决策规则或 `confirmation_frozen*.json`；不 bump
+  `CODE_SEMANTICS`。
+- 现有 v12 冻结切片仍是 prefix；本轮**不重采样、不回填、不重跑**。§49.1
+  的外部效度限制继续成立，只是现在有机器可读的审计证据。
+- `source_order_prefix` 是有效的研究设计（预注册的固定切片），只是不能
+  冒充概率样本；它的重复实验随机性来自训练种子，不来自文章抽样。
+- 分层计划只处理「哪些单位进入切片」；进入切片后的 token 截断、文章被
+  cap 从中间切断、近重复删除仍按原规则执行，并在审计中分开报告。
+- 概率抽样的 `representativeness_claim_allowed=true` 只表示抽样机制可
+  复核，不等于 48 行/几十篇文章足以支持总体区间；`population_claim_allowed`
+  继续要求至少 64 个独立单位（§45/§54 的门槛）。
+
+### 55.7 复核
+
+```bash
+python test_review_fixes.py   # L158 计划确定性/防篡改；L159 整文章抽样；L160 审计
+python audit_gates.py sample_design
+python audit_gates.py report
+```
+
+L158 覆盖：同参数逐位复现、无放回/排序/层计数闭合、`source_fp` 改变选择、
+计划被篡改后 `plan_fp`/层计数检查拒绝、非法 n/seed/NaN/allocation 被拒。
+L159 覆盖：只选整篇文章、返回行索引与文章组完全一致、无标题语料拒绝。
+L160 覆盖：prefix 块标 warning 且 claims 为 false、prefix 上过度声称判
+fail、合法 stratified 计划通过、少于 64 单位时 population claim 判 fail、
+test 块只读 metadata 且 `raw_coverage=not_applicable`。

@@ -7772,10 +7772,11 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=None, val_seqs=512,
     _dedup_by_split = {}
 
     def stream_tokenise(split, cap_tokens, label, _ds=ds, _tok=tok, _eos=eos_id,
-                        _dtype=np.int32, want_token_doc_ids=False):
+                        _dtype=np.int32, want_token_doc_ids=False, stats=None):
         cap_tokens = max(0, int(cap_tokens))
         arr = np.empty(cap_tokens, dtype=_dtype)
         cursor = 0
+        _rows_considered = 0
         _doc_ids = array.array('Q')
         # Per-token document ids are the only representation that can map a
         # fixed validation ROW back to the documents it overlaps.  The legacy
@@ -7794,6 +7795,7 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=None, val_seqs=512,
             rows = [r for r in rows if r.strip()]
             kept = []
             for _j, r in enumerate(rows):
+                _rows_considered += 1
                 # The tokenizer-fit documents are the frozen TRAIN prefix and
                 # are part of the model's training stream; do not filter them
                 # out as duplicates of themselves on the first pass.
@@ -7848,21 +7850,37 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=None, val_seqs=512,
                     if _doc_ids else np.empty(0, dtype=np.uint64))
         _tok_doc_arr = (np.frombuffer(_token_doc_ids, dtype=np.uint64).copy()
                         if _token_doc_ids else np.empty(0, dtype=np.uint64))
+        if stats is not None:
+            stats.update({
+                'source_rows_total': int(len(_ds[split])),
+                'nonempty_rows_scanned': int(_rows_considered),
+                'rows_served': int(_doc_arr.size),
+                'tokens_served': int(cursor),
+                'token_cap': int(cap_tokens),
+                'cap_reached': bool(cursor >= cap_tokens),
+                'duplicate_documents_skipped': {
+                    'exact': int(_skipped.get('exact', 0)),
+                    'near': int(_skipped.get('near', 0)),
+                },
+            })
         if cursor < arr.size:
             exact = arr[:cursor].copy()
             del arr
             return exact, _doc_arr, _tok_doc_arr
         return arr, _doc_arr, _tok_doc_arr
     print(f'[data] tokenising train (cap {n_train_tokens} tokens) ...')
+    _train_stream_stats = {}
     train_ids, train_doc_ids, train_token_doc_ids = stream_tokenise(
-        'train', n_train_tokens + seq_len, 'train', _dtype=np.int32)
+        'train', n_train_tokens + seq_len, 'train', _dtype=np.int32,
+        stats=_train_stream_stats)
     print(f'[data] train tokens = {len(train_ids)}  vocab = {vocab}')
     if len(train_ids) < n_train_tokens + seq_len:
         print(f'[data] WARNING: the train split ran dry at {len(train_ids)} tokens (< requested {n_train_tokens + seq_len}); runs configured for the advertised token target will train on fewer tokens than advertised')
     print('[data] tokenising validation ...')
+    _val_stream_stats = {}
     val_ids, val_doc_ids, val_token_doc_ids = stream_tokenise(
         'validation', val_seqs * seq_len + seq_len, 'val', _dtype=np.int64,
-        want_token_doc_ids=True)
+        want_token_doc_ids=True, stats=_val_stream_stats)
     n_val = min(len(val_ids) // seq_len, val_seqs)
     val_batch = val_ids[:n_val * seq_len].reshape(n_val, seq_len)
     _validate_token_ids(train_ids, vocab, 'wikitext train_ids')
@@ -7927,6 +7945,54 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=None, val_seqs=512,
         'file_sigs': _file_sigs,
         'id_range': {'train': _array_id_range(train_ids), 'val': _array_id_range(val_batch)},
         'split_strategy': 'official_train_validation_test_deduplicated',
+        # Sampling design is recorded separately from token content.  The
+        # current loader takes a source-order prefix, so the served slice is
+        # NOT a probability sample of its upstream split; downstream claims
+        # must not be generalised to unseen articles without this caveat.
+        # A future freeze can build the same cache from a documented
+        # document_stratified_plan and record design='stratified_document'.
+        'sampling': {
+            'schema': 'wikitext_slice_sampling_v1',
+            'train': {
+                'design': 'source_order_prefix',
+                'selection_rule': 'first_nonempty_rows_in_source_order_until_token_cap',
+                'random_seed': None,
+                'representativeness_claim_allowed': False,
+                'population_claim_allowed': False,
+                'source_rows': int(_train_stream_stats.get('source_rows_total', len(ds['train']))),
+                'nonempty_rows_scanned': int(_train_stream_stats.get('nonempty_rows_scanned', 0)),
+                'rows_served': int(_train_stream_stats.get('rows_served', train_doc_ids.size)),
+                'tokens_served': int(_train_stream_stats.get('tokens_served', len(train_ids))),
+                'token_cap': int(_train_stream_stats.get('token_cap', n_train_tokens + seq_len)),
+                'cap_reached': bool(_train_stream_stats.get('cap_reached', False)),
+                'duplicate_documents_skipped': _train_stream_stats.get(
+                    'duplicate_documents_skipped', {}),
+                'claim_reason': (
+                    'the served rows are the first non-empty source rows, not a '
+                    'random sample; coverage of later articles is unverified'),
+            },
+            'validation': {
+                'design': 'source_order_prefix',
+                'selection_rule': 'first_nonempty_rows_in_source_order_until_token_cap',
+                'random_seed': None,
+                'representativeness_claim_allowed': False,
+                'population_claim_allowed': False,
+                'source_rows': int(_val_stream_stats.get('source_rows_total', len(ds['validation']))),
+                'nonempty_rows_scanned': int(_val_stream_stats.get('nonempty_rows_scanned', 0)),
+                'rows_served': int(_val_stream_stats.get('rows_served', val_doc_ids.size)),
+                'tokens_served': int(_val_stream_stats.get('tokens_served', len(val_ids))),
+                'token_cap': int(_val_stream_stats.get('token_cap', val_seqs * seq_len + seq_len)),
+                'cap_reached': bool(_val_stream_stats.get('cap_reached', False)),
+                'sequences_served': int(val_batch.shape[0]),
+                'sequences_requested': int(val_seqs),
+                'duplicate_documents_skipped': _val_stream_stats.get(
+                    'duplicate_documents_skipped', {}),
+                'claim_reason': (
+                    'the selection split is a prefix of the source order, not a '
+                    'random sample; it is valid for selection under the frozen '
+                    'protocol but not for population inference'),
+            },
+        },
         # A WikiText row is one raw line (a heading or a paragraph), not one
         # article.  The ids below group by that row; downstream "per-document"
         # statistics must either name this unit or regroup by top-level
@@ -9022,6 +9088,34 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=None, cache_dir=None,
         'file_sigs': _file_sigs,
         'id_range': {'test': _array_id_range(test_batch)},
         'split_strategy': 'official_dataset_test_split_near_duplicate_filtered',
+        # The held-out panel is a source-order prefix of the
+        # near-duplicate-cleaned test split.  It is a frozen evaluation
+        # snapshot, not a probability sample of WikiText test articles; the
+        # sampling audit reports its coverage without ever re-reading raw test.
+        'sampling': {
+            'schema': 'wikitext_slice_sampling_v1',
+            'test': {
+                'design': 'source_order_prefix',
+                'selection_rule': 'first_nonempty_rows_of_deduplicated_test_split_until_token_cap',
+                'random_seed': None,
+                'representativeness_claim_allowed': False,
+                'population_claim_allowed': False,
+                'source_rows': int(len(test_rows)),
+                'rows_after_dedup': int(len(_trows)),
+                'rows_served': int(test_doc_ids.size),
+                'tokens_served': int(n_have) * int(seq_len),
+                'tokens_tokenised': int(len(ids)),
+                'token_cap': int(_cap_test),
+                'cap_reached': bool(len(ids) >= int(_cap_test)),
+                'sequences_served': int(test_batch.shape[0]),
+                'sequences_requested': int(n_seqs),
+                'claim_reason': (
+                    'the frozen panel is the first evaluated rows of the test '
+                    'split in source order, not a random sample of test '
+                    'articles; it supports the frozen comparison, not an '
+                    'unconditional population claim'),
+            },
+        },
         # See load_wikitext: the per-token map groups by raw LINE, not by
         # article.  The document-level readout must name/regroup that unit.
         'document_unit': 'line',
@@ -9767,6 +9861,358 @@ def wikitext_token_article_ids_for_rows(rows, lengths, cap_tokens):
         'valid_for_clustering': bool(rid['valid_for_clustering']),
         **_served,
     }
+
+
+def _sampling_int(name, value, *, minimum=0, maximum=None):
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, numbers.Integral):
+        raise TypeError(f'{name} must be an integer, got {type(value).__name__}')
+    out = int(value)
+    if out < int(minimum):
+        raise ValueError(f'{name} must be >= {int(minimum)}, got {out}')
+    if maximum is not None and out > int(maximum):
+        raise ValueError(f'{name} must be <= {int(maximum)}, got {out}')
+    return out
+
+
+def _sampling_plan_fp(plan):
+    """Canonical fingerprint of a sampling plan (excluding ``plan_fp``)."""
+    body = {k: v for k, v in plan.items() if k != 'plan_fp'}
+    blob = json.dumps(body, sort_keys=True, separators=(',', ':'),
+                      ensure_ascii=False)
+    return hashlib.sha256(blob.encode('utf-8')).hexdigest()
+
+
+def _sampling_allocation(n_units, n_select, stratum_sizes, allocation,
+                         min_per_stratum, stratum_size_sums=None):
+    """Integer allocation of ``n_select`` units over non-empty strata.
+
+    ``proportional`` allocates in proportion to each stratum's unit count,
+    ``equal`` gives every stratum the same quota, and ``size_weighted`` uses
+    the sum of the per-unit sizes.  Floors are followed by a deterministic
+    largest-remainder pass; a final capped pass moves units out of strata that
+    cannot supply their quota.  The result is exact, non-negative and never
+    exceeds a stratum's population.
+    """
+    S = len(stratum_sizes)
+    counts = np.asarray(stratum_sizes, dtype=np.int64)
+    if allocation == 'proportional':
+        weights = counts.astype(np.float64)
+    elif allocation == 'equal':
+        weights = np.ones(S, dtype=np.float64)
+    elif allocation == 'size_weighted':
+        weights = np.asarray(
+            stratum_size_sums if stratum_size_sums is not None else stratum_sizes,
+            dtype=np.float64)
+    else:
+        raise ValueError(
+            f'allocation must be one of proportional/equal/size_weighted, got {allocation!r}')
+    if not np.isfinite(weights).all() or weights.sum() <= 0:
+        weights = counts.astype(np.float64)
+    if n_select < S * int(min_per_stratum):
+        raise ValueError(
+            f'n_select={n_select} cannot give {int(min_per_stratum)} unit(s) '
+            f'to each of {S} non-empty strata; lower min_per_stratum or select more')
+    ideal = weights / weights.sum() * float(n_select)
+    alloc = np.floor(ideal).astype(np.int64)
+    alloc = np.minimum(alloc, counts)
+    # Guarantee the per-stratum minimum before spending the remainder.
+    alloc = np.maximum(alloc, int(min_per_stratum))
+    alloc = np.minimum(alloc, counts)
+    while int(alloc.sum()) < int(n_select):
+        room = np.where(alloc < counts, ideal - alloc, -np.inf)
+        j = int(np.argmax(room))
+        if not np.isfinite(room[j]):
+            break
+        alloc[j] += 1
+    while int(alloc.sum()) > int(n_select):
+        # Remove from strata furthest above their ideal quota, never below min.
+        removable = np.where(alloc > int(min_per_stratum), alloc - ideal, -np.inf)
+        j = int(np.argmax(removable))
+        if not np.isfinite(removable[j]):
+            break
+        alloc[j] -= 1
+    if int(alloc.sum()) != int(n_select):
+        raise ValueError(
+            f'could not allocate n_select={n_select} over strata sizes '
+            f'{counts.tolist()} with min_per_stratum={int(min_per_stratum)}')
+    return alloc
+
+
+def document_stratified_plan(sizes, n_select, *, seed=0, n_strata=4,
+                             allocation='proportional', min_per_stratum=1,
+                             source_fp=None):
+    """Deterministic stratified sample of independent units by size.
+
+    The units are sorted by ``(size, index)`` and cut into ``n_strata``
+    equal-count blocks.  A seeded, without-replacement sample is drawn inside
+    each block.  Because the strata are equal-count, proportional allocation
+    is also equal allocation across strata: every selected unit has the same
+    inclusion probability *conditional on its stratum*, and every stratum is
+    represented when ``n_select >= n_strata * min_per_stratum``.
+
+    This is a *sampling-design* helper, not a loader default: it enables a
+    future freeze to draw a probability sample instead of taking the first
+    rows in source order.  ``source_fp`` binds the plan to a corpus snapshot;
+    changing it changes the selected units even when the sizes and seed are
+    unchanged.
+    """
+    try:
+        arr = np.asarray(sizes)
+    except Exception as e:
+        raise TypeError(f'sizes must be a 1-D numeric sequence ({type(e).__name__}: {e})') from None
+    if arr.ndim != 1:
+        raise ValueError(f'sizes must be 1-D, got shape {arr.shape}')
+    if arr.size == 0:
+        raise ValueError('sizes must contain at least one unit')
+    if not (np.issubdtype(arr.dtype, np.number) and not np.iscomplexobj(arr)):
+        raise TypeError(f'sizes must be numeric, got dtype {arr.dtype}')
+    sizes_f = arr.astype(np.float64, copy=False)
+    if not np.isfinite(sizes_f).all():
+        raise ValueError('sizes must be finite (no NaN/inf)')
+    if (sizes_f < 0).any():
+        raise ValueError('sizes must be non-negative')
+    if float(sizes_f.sum()) <= 0:
+        raise ValueError('sizes must have a positive total')
+    seed = _sampling_int('seed', seed, minimum=0)
+    n_strata = _sampling_int('n_strata', n_strata, minimum=1)
+    n_select = _sampling_int('n_select', n_select, minimum=1)
+    min_per_stratum = _sampling_int('min_per_stratum', min_per_stratum, minimum=0)
+    n_units = int(sizes_f.size)
+    if n_select > n_units:
+        raise ValueError(f'n_select={n_select} exceeds the {n_units} available units')
+    if source_fp is not None and not isinstance(source_fp, str):
+        raise TypeError(f'source_fp must be a string or None, got {type(source_fp).__name__}')
+    n_strata = min(int(n_strata), n_units)
+    order = np.lexsort((np.arange(n_units, dtype=np.int64), sizes_f))
+    stratum_members = [np.asarray(x, dtype=np.int64)
+                       for x in np.array_split(order, n_strata)]
+    stratum_sizes = [int(m.size) for m in stratum_members]
+    _size_sums = [float(sizes_f[m].sum()) for m in stratum_members]
+    alloc = _sampling_allocation(n_units, n_select, stratum_sizes,
+                                 allocation, min_per_stratum,
+                                 stratum_size_sums=_size_sums)
+    selected = []
+    strata = []
+    for _i, (_members, _k) in enumerate(zip(stratum_members, alloc)):
+        _k = int(_k)
+        if _k:
+            # Hash the plan parameters into a per-stratum seed so the draw is
+            # independent of NumPy's global random state and of the order in
+            # which callers request plans.
+            _key = json.dumps({'schema': 'document_stratified_sample_v1',
+                               'seed': seed, 'stratum': _i,
+                               'source_fp': source_fp, 'n_units': n_units,
+                               'n_select': n_select, 'n_strata': n_strata},
+                              sort_keys=True, separators=(',', ':'))
+            _digest = hashlib.sha256(_key.encode('utf-8')).digest()
+            _rng = np.random.default_rng(int.from_bytes(_digest[:16], 'little'))
+            _take = np.sort(_rng.choice(_members, size=_k, replace=False))
+            selected.extend(int(x) for x in _take.tolist())
+        else:
+            _take = np.empty(0, dtype=np.int64)
+        _sizes = sizes_f[_members]
+        strata.append({
+            'index': int(_i),
+            'n_units': int(_members.size),
+            'n_selected': _k,
+            'size_sum': float(_sizes.sum()),
+            'min_size': float(_sizes.min()) if _members.size else None,
+            'max_size': float(_sizes.max()) if _members.size else None,
+            'selected_fraction': (float(_k) / float(_members.size)
+                                  if _members.size else 0.0),
+        })
+    selected = sorted(selected)
+    if len(selected) != n_select or len(set(selected)) != n_select:
+        raise RuntimeError('internal error: stratified sample is not a '
+                           f'without-replacement sample of size {n_select}')
+    all_represented = all(s['n_selected'] > 0 for s in strata)
+    total_size = float(sizes_f.sum())
+    selected_size = float(sizes_f[np.asarray(selected, dtype=np.int64)].sum())
+    plan = {
+        'schema': 'document_stratified_sample_v1',
+        'design': 'stratified_document',
+        'seed': int(seed),
+        'n_units': n_units,
+        'n_select': int(n_select),
+        'n_strata': int(n_strata),
+        'allocation': str(allocation),
+        'min_per_stratum': int(min_per_stratum),
+        'source_fp': source_fp,
+        'sizes_fp': hashlib.sha256(
+            ','.join(format(float(x), '.17g') for x in sizes_f).encode('ascii')
+        ).hexdigest(),
+        'selected': selected,
+        'selection_without_replacement': True,
+        'all_strata_represented': bool(all_represented),
+        'unit_coverage_fraction': float(n_select) / float(n_units),
+        'size_coverage_fraction': (selected_size / total_size
+                                   if total_size > 0 else 0.0),
+        'strata': strata,
+    }
+    plan['plan_fp'] = _sampling_plan_fp(plan)
+    return plan
+
+
+def sampling_plan_problems(plan):
+    """Structural/consistency problems with a persisted sampling plan.
+
+    This deliberately re-derives the fingerprint and the stratum totals from
+    the plan itself: a plan edited after the freeze (or one whose selected
+    units no longer sum to ``n_select``) is rejected instead of being quoted
+    as a probability sample.
+    """
+    if not isinstance(plan, dict):
+        return [f'plan is not an object (got {type(plan).__name__})']
+    problems = []
+    try:
+        if plan.get('schema') != 'document_stratified_sample_v1':
+            problems.append(f"schema={plan.get('schema')!r}")
+        if plan.get('design') != 'stratified_document':
+            problems.append(f"design={plan.get('design')!r}")
+        n_units = _sampling_int('n_units', plan.get('n_units'), minimum=1)
+        n_select = _sampling_int('n_select', plan.get('n_select'), minimum=1)
+        n_strata = _sampling_int('n_strata', plan.get('n_strata'), minimum=1)
+        seed = _sampling_int('seed', plan.get('seed'), minimum=0)
+        if n_select > n_units:
+            problems.append(f'n_select={n_select} > n_units={n_units}')
+        selected = plan.get('selected')
+        if not isinstance(selected, list):
+            problems.append('selected is not a list')
+            selected = []
+        if len(selected) != n_select:
+            problems.append(f'selected has {len(selected)} entries, expected {n_select}')
+        _sel = []
+        for i, x in enumerate(selected):
+            try:
+                _xi = _sampling_int(f'selected[{i}]', x, minimum=0, maximum=n_units - 1)
+            except (TypeError, ValueError) as e:
+                problems.append(str(e))
+                continue
+            _sel.append(_xi)
+        if len(set(_sel)) != len(_sel):
+            problems.append('selected contains duplicate unit indices')
+        if _sel != sorted(_sel):
+            problems.append('selected is not sorted by source index')
+        if plan.get('selection_without_replacement') is not True:
+            problems.append('selection_without_replacement is not true')
+        strata = plan.get('strata')
+        if not isinstance(strata, list) or len(strata) != n_strata:
+            problems.append('strata is not a list of length n_strata')
+            strata = []
+        _sum_units = 0
+        _sum_selected = 0
+        _all_repr = True
+        for i, s in enumerate(strata):
+            if not isinstance(s, dict):
+                problems.append(f'strata[{i}] is not an object')
+                continue
+            try:
+                _nu = _sampling_int(f'strata[{i}].n_units', s.get('n_units'), minimum=0)
+                _ns = _sampling_int(f'strata[{i}].n_selected', s.get('n_selected'), minimum=0)
+            except (TypeError, ValueError) as e:
+                problems.append(str(e))
+                continue
+            if _ns > _nu:
+                problems.append(f'strata[{i}] selects {_ns} of {_nu} units')
+            _sum_units += _nu
+            _sum_selected += _ns
+            _all_repr = _all_repr and _ns > 0
+        if strata and _sum_units != n_units:
+            problems.append(f'stratum n_units sum {_sum_units} != n_units {n_units}')
+        if strata and _sum_selected != n_select:
+            problems.append(f'stratum n_selected sum {_sum_selected} != n_select {n_select}')
+        if bool(plan.get('all_strata_represented')) != bool(_all_repr):
+            problems.append('all_strata_represented disagrees with the stratum counts')
+        if seed < 0:
+            problems.append('seed must be non-negative')
+        _fp = plan.get('plan_fp')
+        if not isinstance(_fp, str) or _fp != _sampling_plan_fp(plan):
+            problems.append('plan_fp does not match the plan contents')
+        if plan.get('source_fp') is not None and not isinstance(plan.get('source_fp'), str):
+            problems.append('source_fp is not a string or null')
+    except (TypeError, ValueError, KeyError) as e:
+        problems.append(f'invalid plan ({type(e).__name__}: {e})')
+    return problems
+
+
+def wikitext_article_sampling_plan(rows, n_articles, *, seed=0, n_strata=4,
+                                   allocation='proportional', size_unit='rows',
+                                   min_per_stratum=1, source_fp=None):
+    """Stratified article sample for a raw WikiText split.
+
+    Unlike the loaders' source-order prefix, this returns whole articles drawn
+    without replacement from equal-count size strata.  ``size_unit='rows'``
+    stratifies by article length in raw rows; ``size_unit='chars'`` by the
+    concatenated article character count.  Whole articles are selected, so a
+    caller can materialise their rows without splitting an article across
+    selected and unselected units.
+
+    The returned ``selected_row_indices`` are sorted and every row of a
+    selected article is included.  ``valid_for_article_sampling`` is false
+    for corpora without top-level headings; the function refuses instead of
+    silently treating lines as articles.
+    """
+    _rows = list(rows)
+    groups = wikitext_article_groups(_rows)
+    if not groups.get('valid'):
+        raise ValueError(
+            'wikitext_article_sampling_plan: the rows cannot be segmented into '
+            'articles by top-level headings (' + '; '.join(groups.get('problems') or []) + ')')
+    _groups = groups['groups']
+    if size_unit == 'rows':
+        sizes = [int(len(g)) for g in _groups]
+    elif size_unit == 'chars':
+        sizes = [int(len(wikitext_article_text(_rows, g))) for g in _groups]
+    else:
+        raise ValueError(f"size_unit must be 'rows' or 'chars', got {size_unit!r}")
+    if source_fp is None:
+        _src_hash = hashlib.sha256()
+        for _r in _rows:
+            _src_hash.update(_r.encode('utf-8', errors='replace'))
+            _src_hash.update(b'\n')
+        source_fp = _src_hash.hexdigest()
+    plan = document_stratified_plan(
+        sizes, n_articles, seed=seed, n_strata=n_strata,
+        allocation=allocation, min_per_stratum=min_per_stratum,
+        source_fp=source_fp)
+    selected_article_indices = list(plan['selected'])
+    selected_row_indices = sorted(
+        int(i) for _a in selected_article_indices for i in _groups[_a])
+    article_ids = wikitext_article_ids(_rows, _groups)
+    return {
+        'status': 'ok',
+        'schema': 'wikitext_article_sample_v1',
+        'design': 'stratified_article',
+        'size_unit': size_unit,
+        'n_articles_available': int(len(_groups)),
+        'n_articles_selected': int(len(selected_article_indices)),
+        'selected_article_indices': selected_article_indices,
+        'selected_article_ids': [int(article_ids[i]) for i in selected_article_indices],
+        'selected_article_sizes': [int(sizes[i]) for i in selected_article_indices],
+        'selected_row_indices': selected_row_indices,
+        'article_grouping': {
+            'boundary_rule': groups.get('boundary_rule'),
+            'n_nonempty_rows': int(groups.get('n_nonempty_rows', 0)),
+            'n_articles': int(groups.get('n_articles', 0)),
+            'max_rows_per_article': int(groups.get('max_group_rows', 0)),
+            'mean_rows_per_article': float(groups.get('mean_group_rows', 0.0)),
+        },
+        'plan': plan,
+        'plan_fp': plan['plan_fp'],
+    }
+
+
+def select_sampled_items(items, plan):
+    """Materialise the units named by a validated ``document_stratified_plan``."""
+    problems = sampling_plan_problems(plan)
+    if problems:
+        raise ValueError('select_sampled_items: invalid plan: ' + '; '.join(problems))
+    seq = list(items)
+    if len(seq) != int(plan['n_units']):
+        raise ValueError(
+            f'select_sampled_items: {len(seq)} items but the plan describes '
+            f"{int(plan['n_units'])} units")
+    return [seq[int(i)] for i in plan['selected']]
 
 
 class _DocDeduplicator:

@@ -55,6 +55,10 @@
   data_source  上游语料版本：每个 cache meta 是否记录并匹配固定的 Hub commit
                （WikiText-103 / FineWeb-Edu）；train/validation/test 必须同一
                快照；legacy/local 缓存明确报不可验证而非算作干净
+  sample_design  抽样设计：缓存声明的是 source-order prefix 还是可复核的
+               document-stratified 概率样本；prefix 明确标记为不可外推，
+               raw train/valid 可用时量化文章覆盖率、文章长度 KS 与分层覆盖；
+               永不读取 wiki.test.raw
   efficiency   prefill/decode/容量读数工具（需要模型；给出可复用函数
                与 CPU 微型演示——不是实验，是测量代码自检）
   report       汇总运行本地可执行的全部审计，输出 audit_report.json
@@ -2019,6 +2023,397 @@ def audit_document_unit(cache_dir=None, *, seq_len=None, raw_dir=None,
             r.get('status') == 'not_verifiable_locally'
             for r in (trec, vrec, trrec, rawrec)):
         out['status'] = 'not_verifiable_locally'
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 1b) sampling：前缀切片 vs 概率样本 / 文章覆盖 / 可外推性
+# ---------------------------------------------------------------------------
+
+def _sample_ks(a, b):
+    """Two-sample Kolmogorov-Smirnov statistic without SciPy."""
+    a = np.sort(np.asarray(a, dtype=np.float64))
+    b = np.sort(np.asarray(b, dtype=np.float64))
+    if a.size == 0 or b.size == 0:
+        return None
+    grid = np.unique(np.concatenate([a, b]))
+    ca = np.searchsorted(a, grid, side='right') / float(a.size)
+    cb = np.searchsorted(b, grid, side='right') / float(b.size)
+    return float(np.max(np.abs(ca - cb)))
+
+
+def audit_sample_design(cache_dir=None, *, raw_dir=None, max_raw_articles=None):
+    """Audit whether the cached WikiText slices are probability samples.
+
+    The loaders have always selected a **source-order prefix** and capped it by
+    tokens.  That is reproducible and leakage-safe, but it is not a random
+    sample: later articles can be systematically absent, and a prefix of raw
+    lines is not a prefix of the article population in any probabilistic
+    sense.  This zero-GPU audit makes the distinction explicit:
+
+      * it records the declared ``sampling`` block (new caches) or labels the
+        slice ``prefix_inferred_legacy`` when the field is missing;
+      * it refuses any block that claims representativeness/population validity
+        without a validated ``document_stratified_plan`` (seed, without-
+        replacement selection, stratum coverage);
+      * when raw train/validation dumps are available, it regroups served line
+        ids into whole articles, reports row/article coverage, the
+        served-vs-source article-length KS distance and coverage by source
+        size quartile; missing raw data is ``not_verifiable_locally``, never
+        "clean";
+      * it never reads ``wiki.test.raw``.  A test slice's coverage is reported
+        from its build-time metadata only, because re-reading the held-out
+        split would consume the one-shot confirmation access.
+
+    Prefix slices are reported as ``warnings`` with
+    ``representativeness_claim_allowed=False``; they are not silently relabelled
+    as probability samples.  An invalid optimistic claim is a hard failure.
+    """
+    L = _import_exp_lib()
+    import glob
+    if cache_dir in (None, ''):
+        cache_dir = os.environ.get('WT103_CACHE_DIR') or './wt103_cache'
+    if max_raw_articles is not None:
+        max_raw_articles = _audit_positive_int('max_raw_articles', max_raw_articles)
+    if raw_dir in (None, ''):
+        raw_dir = os.environ.get('WT103_RAW_TXT') or './wt103_raw'
+    out = {'kind': 'sample_design_audit', 'status': 'ok', 'caches': {},
+           'warnings': [], 'problems': [],
+           'note': ('A source-order prefix is reproducible but not a '
+                    'probability sample.  This audit never reads '
+                    'wiki.test.raw; test coverage is metadata-only.')}
+    if not os.path.isdir(cache_dir):
+        out['status'] = 'not_verifiable_locally'
+        out['note'] = f'{cache_dir!r} does not exist — no cache to audit'
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return out
+    _metas = sorted(glob.glob(os.path.join(cache_dir, 'meta_*.json')))
+    _metas += sorted(glob.glob(os.path.join(cache_dir, 'test_meta_*.json')))
+    if not _metas:
+        out['status'] = 'not_verifiable_locally'
+        out['note'] = f'{cache_dir!r} contains no cache metadata'
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return out
+
+    def _warn(msg):
+        out['warnings'].append(msg)
+        if out['status'] == 'ok':
+            out['status'] = 'warnings'
+
+    _raw_rows_cache = {}
+
+    def _raw_rows(split):
+        if split in _raw_rows_cache:
+            return _raw_rows_cache[split]
+        fname = {'train': 'wiki.train.raw', 'validation': 'wiki.valid.raw'}.get(split)
+        if fname is None:
+            return None
+        path = os.path.join(raw_dir, fname)
+        if not os.path.exists(path):
+            _raw_rows_cache[split] = None
+            return None
+        try:
+            rows = L._read_raw_rows(path)
+        except Exception as e:
+            _raw_rows_cache[split] = None
+            _raw_rows_cache[split + '_error'] = f'{type(e).__name__}: {e}'
+            return None
+        _raw_rows_cache[split] = rows
+        return rows
+
+    def _raw_coverage(split, served_ids, sidecar):
+        rec = {'status': 'ok'}
+        if split == 'test':
+            rec.update({
+                'status': 'not_applicable',
+                'reason': ('wiki.test.raw is never read: re-reading the frozen '
+                           'held-out split would consume the one-shot access; '
+                           'test coverage is reported from build metadata'),
+            })
+            return rec
+        rows = _raw_rows(split)
+        if rows is None:
+            _err = _raw_rows_cache.get(split + '_error')
+            rec.update({
+                'status': 'not_verifiable_locally',
+                'reason': (f'raw {split} dump is unavailable under {raw_dir!r}'
+                           + (f' ({_err})' if _err else '')
+                           + '; served-vs-source article coverage cannot be measured'),
+            })
+            return rec
+        if served_ids is None:
+            rec.update({
+                'status': 'not_verifiable_locally',
+                'reason': f'{sidecar} is missing; served line ids cannot be mapped to raw articles',
+            })
+            return rec
+        try:
+            groups = L.wikitext_article_groups(rows)
+        except Exception as e:
+            rec.update({
+                'status': 'not_verifiable_locally',
+                'reason': f'raw {split} dump cannot be segmented ({type(e).__name__}: {e})',
+            })
+            return rec
+        if not groups.get('valid'):
+            rec.update({
+                'status': 'not_verifiable_locally',
+                'reason': ('raw rows are not segmented by top-level headings; '
+                           'article coverage is undefined (' + '; '.join(groups.get('problems') or []) + ')'),
+            })
+            return rec
+        _groups = groups['groups']
+        if max_raw_articles is not None:
+            _groups = _groups[:int(max_raw_articles)]
+        _sizes_all = []
+        _served_flags = []
+        _served_line_hits = 0
+        for g in _groups:
+            _hit = False
+            for i in g:
+                _row = rows[int(i)]
+                _h = int(L._doc_id_u64(L._doc_exact_fp(_row)))
+                if _h in served_ids:
+                    _hit = True
+                    _served_line_hits += 1
+            _sizes_all.append(int(len(g)))
+            _served_flags.append(bool(_hit))
+        _raw_nonempty = int(sum(len(g) for g in _groups))
+        _a = np.asarray(_sizes_all, dtype=np.int64)
+        _flags = np.asarray(_served_flags, dtype=bool)
+        _b = _a[_flags]
+        _n_all = int(_a.size)
+        _n_served = int(_b.size)
+        _ks = _sample_ks(_a, _b)
+        _ks_limit = (min(1.0, 1.36 * math.sqrt(
+                        (float(_n_all) + float(_n_served))
+                        / (float(_n_all) * float(_n_served))))
+                     if _n_served and _n_all else None)
+        rec.update({
+            'raw_nonempty_rows': int(groups.get('n_nonempty_rows', 0)),
+            'raw_articles': _n_all,
+            'served_article_size_units': _n_served,
+            'article_coverage_fraction': (float(_n_served) / float(_n_all)
+                                          if _n_all else 0.0),
+            'served_line_hits': int(_served_line_hits),
+            'line_coverage_fraction': (float(_served_line_hits)
+                                       / float(_raw_nonempty)
+                                       if _raw_nonempty else 0.0),
+            'article_size_ks': _ks,
+            'article_size_ks_limit': _ks_limit,
+            'article_size_shift_flag': bool(
+                _ks is not None and _ks_limit is not None and _ks > _ks_limit),
+        })
+        if max_raw_articles is not None:
+            rec['article_subset'] = f'first {int(max_raw_articles)} raw articles'
+        # Coverage across source-size quartiles: a probability sample should
+        # reach every stratum; a source prefix can miss the tail.
+        try:
+            _edges = np.quantile(_a, [0.25, 0.5, 0.75])
+            _bin = np.digitize(_a, _edges, right=False)
+            _qs = []
+            for q in range(4):
+                _mask = _bin == q
+                _tot = int(_mask.sum())
+                _srv = int((_mask & _flags).sum())
+                _qs.append({'quartile': q + 1, 'articles': _tot,
+                            'served_articles': _srv,
+                            'coverage_fraction': (float(_srv) / float(_tot)
+                                                  if _tot else None)})
+            rec['by_source_size_quartile'] = _qs
+            _uncovered = [q['quartile'] for q in _qs
+                          if q['articles'] and q['served_articles'] == 0]
+            rec['uncovered_quartiles'] = _uncovered
+            _rw = []
+            if _uncovered:
+                rec['status'] = 'warnings'
+                _rw.append(f'source-size quartile(s) {_uncovered} have no '
+                           'served articles (prefix coverage is not whole-population)')
+            if rec.get('article_size_shift_flag'):
+                rec['status'] = 'warnings'
+                _rw.append(f'served/articles article-length KS={_ks:.3f} '
+                           f'exceeds the finite-sample limit {_ks_limit:.3f}; the '
+                           'served length distribution is not representative')
+            if _rw:
+                rec['warnings'] = _rw
+        except Exception as e:
+            rec['quartile_error'] = f'{type(e).__name__}: {e}'
+        return rec
+
+    _n_blocks = 0
+    for _mp in _metas:
+        _meta = _load(_mp)
+        if not isinstance(_meta, dict):
+            _warn(f'{os.path.basename(_mp)} is not a readable metadata object')
+            continue
+        _is_test = os.path.basename(_mp).startswith('test_meta_')
+        _tag = (os.path.basename(_mp)[len('test_meta_'):-len('.json')]
+                if _is_test else
+                os.path.basename(_mp)[len('meta_'):-len('.json')])
+        _cachedir = os.path.abspath(cache_dir)
+        _crec = out['caches'].setdefault(_cachedir, {'meta_files': []})
+        _crec['meta_files'].append(os.path.basename(_mp))
+        _sampling = _meta.get('sampling')
+        if isinstance(_sampling, dict) and any(
+                k in _sampling for k in ('train', 'validation', 'test')):
+            _blocks = [(k, v) for k, v in _sampling.items()
+                       if k in ('train', 'validation', 'test') and isinstance(v, dict)]
+        elif isinstance(_sampling, dict):
+            _blocks = [('test' if _is_test else 'train', _sampling)]
+        elif _is_test:
+            _blocks = [('test', {})]
+        else:
+            _blocks = [('train', {}), ('validation', {})]
+        if not _is_test and not any(k == 'validation' for k, _ in _blocks):
+            _blocks.append(('validation', {}))
+        for _split, _blk in _blocks:
+            _n_blocks += 1
+            _srec = _crec.setdefault(_split, {'problems': [], 'warnings': []})
+            _design = _blk.get('design') or 'prefix_inferred_legacy'
+            _srec['design'] = _design
+            _srec['declared_sampling_fields'] = bool(_blk)
+            _srec.update({
+                'source_rows': _blk.get('source_rows'),
+                'rows_after_dedup': _blk.get('rows_after_dedup'),
+                'rows_served': _blk.get('rows_served'),
+                'tokens_served': _blk.get('tokens_served'),
+                'token_cap': _blk.get('token_cap'),
+                'cap_reached': _blk.get('cap_reached'),
+            })
+            _claim = _blk.get('representativeness_claim_allowed')
+            _pop_claim = _blk.get('population_claim_allowed')
+            _srec['declared_claims'] = {
+                'representativeness_claim_allowed': _claim,
+                'population_claim_allowed': _pop_claim,
+            }
+            _prefix = _design in ('source_order_prefix', 'prefix',
+                                  'ordered_prefix', 'prefix_inferred_legacy')
+            if _prefix:
+                _srec['sampling_class'] = 'non_probability_prefix'
+                _srec['representativeness_claim_allowed'] = False
+                _srec['population_claim_allowed'] = False
+                if _claim is True or _pop_claim is True:
+                    _srec['problems'].append(
+                        'optimistic claim: metadata claims representativeness/'
+                        'population validity for a source-order prefix; that '
+                        'claim is not supported')
+                try:
+                    _sr0 = int(_blk.get('source_rows'))
+                    _rs0 = int(_blk.get('rows_served'))
+                except (TypeError, ValueError):
+                    _sr0 = _rs0 = None
+                if _sr0 is not None and _rs0 is not None and _rs0 >= _sr0:
+                    _srec['warnings'].append(
+                        'source-order selection covers the full cached source '
+                        'rows but is still not a probability sample; it is a '
+                        'census of this source snapshot')
+                else:
+                    _srec['warnings'].append(
+                        'source-order prefix, not a probability sample; later '
+                        'articles are unserved by construction')
+            elif _design == 'stratified_document':
+                _plan = _blk.get('plan')
+                _pp = L.sampling_plan_problems(_plan) if _plan is not None else [
+                    'metadata declares a stratified design but records no plan']
+                _srec['plan_fp'] = (_plan.get('plan_fp')
+                                    if isinstance(_plan, dict) else None)
+                if _pp:
+                    _srec['problems'].extend(_pp)
+                else:
+                    _srec['sampling_class'] = 'probability_stratified_document'
+                    _n_sel = int(_plan.get('n_select') or 0)
+                    _all_repr = bool(_plan.get('all_strata_represented'))
+                    _srec['representativeness_claim_allowed'] = bool(
+                        _claim is True and _all_repr)
+                    if _claim is True and not _all_repr:
+                        _srec['problems'].append(
+                            'claim=true but not every stratum is represented')
+                    if _pop_claim is True and _n_sel < 64:
+                        _srec['problems'].append(
+                            f'population claim with only {_n_sel} independent '
+                            f'units (<64-unit floor)')
+                    _srec['population_claim_allowed'] = bool(
+                        _pop_claim is True and _n_sel >= 64 and _all_repr
+                        and not _pp)
+                    if _claim is not True:
+                        _srec['warnings'].append(
+                            'plan is a probability sample but the metadata does '
+                            'not claim representativeness; claim stays false')
+                if isinstance(_plan, dict) and _blk.get('source_fp') not in (None, _plan.get('source_fp')):
+                    _srec['problems'].append(
+                        'sampling source_fp disagrees with the plan source_fp')
+            else:
+                _srec['sampling_class'] = 'unknown'
+                _srec['representativeness_claim_allowed'] = False
+                _srec['population_claim_allowed'] = False
+                _srec['problems'].append(f'unknown sampling design {_design!r}')
+            # Token-budget honesty: a cap that was not reached means the source
+            # ran dry and the advertised training/evaluation length is not the
+            # length actually served.
+            try:
+                _ts = _blk.get('tokens_served')
+                _tc = _blk.get('token_cap')
+                if (_ts is not None and _tc is not None
+                        and int(_ts) < int(_tc)
+                        and _blk.get('cap_reached') is not True):
+                    _srec['warnings'].append(
+                        f'served {int(_ts)} tokens < cap {int(_tc)} and '
+                        'cap_reached is not true: the source ran dry')
+            except (TypeError, ValueError):
+                _srec['problems'].append('tokens_served/token_cap are not integers')
+            # Row coverage from metadata (cheap, works without raw dumps).
+            try:
+                _sr = int(_blk.get('source_rows'))
+                _rs = int(_blk.get('rows_served'))
+                if _sr > 0 and _rs >= 0:
+                    _srec['row_coverage_fraction'] = float(_rs) / float(_sr)
+                    _srec['row_coverage_incomplete'] = bool(_rs < _sr)
+            except (TypeError, ValueError):
+                _srec['row_coverage_fraction'] = None
+            # Article-level coverage needs the raw source; test raw is never read.
+            _sidecar = None
+            if _split == 'train':
+                _sidecar = os.path.join(cache_dir, f'train_doc_ids_{_tag}.npy')
+            elif _split == 'validation':
+                _sidecar = os.path.join(cache_dir, f'val_doc_ids_{_tag}.npy')
+            elif _split == 'test':
+                _sidecar = os.path.join(cache_dir, f'test_doc_ids_{_tag}.npy')
+            _served_ids = None
+            if _sidecar and os.path.exists(_sidecar):
+                try:
+                    _served_ids = set(int(x) for x in np.load(_sidecar).tolist())
+                except Exception as e:
+                    _srec['warnings'].append(
+                        f'{os.path.basename(_sidecar)} unreadable ({type(e).__name__}: {e})')
+            _raw = _raw_coverage(_split, _served_ids, _sidecar)
+            _srec['raw_coverage'] = _raw
+            if _raw.get('status') == 'not_verifiable_locally':
+                _srec['warnings'].append(
+                    _raw.get('reason') or 'raw coverage is not verifiable')
+            for _rw in _raw.get('warnings') or []:
+                _srec['warnings'].append(_rw)
+            if _srec['problems']:
+                _srec['status'] = 'fail'
+            elif _srec['warnings']:
+                _srec['status'] = 'warnings'
+            else:
+                _srec['status'] = 'ok'
+            for _w in _srec['warnings']:
+                _tagged_w = f'{_split}: {_w}'
+                if _tagged_w not in out['warnings']:
+                    out['warnings'].append(_tagged_w)
+            for _p in _srec['problems']:
+                _tagged_p = f'{_split}: {_p}'
+                if _tagged_p not in out['problems']:
+                    out['problems'].append(_tagged_p)
+    if _n_blocks == 0:
+        out['status'] = 'not_verifiable_locally'
+        out['note'] = 'cache metadata contains no train/validation/test sampling blocks'
+    elif out['problems']:
+        out['status'] = 'fail'
+    elif out['warnings']:
+        out['status'] = 'warnings'
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return out
 
@@ -4614,7 +5009,7 @@ def audit_run_order(paths=None):
 
 
 def run_report(out='audit_report.json'):
-    res = {'generated_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'source_tree': audit_source_integrity(), 'dependencies': audit_dependencies(), 'data_source': audit_data_source(), 'leakage': audit_leakage(), 'split_discipline': audit_split_discipline(), 'document_unit': audit_document_unit(), 'attribution': audit_attribution(), 'boundary': audit_boundary(), 'length': audit_length(), 'fairness': audit_fairness(), 'metrics': audit_metrics(), 'tuning': audit_tuning(), 'simple_baseline': audit_simple_baseline(), 'hypotheses': audit_hypotheses(), 'methodology': audit_methodology(), 'single_factor': audit_single_factor(), 'design_preflight': audit_design_preflight(), 'failures': audit_failures(), 'budget': audit_budget(), 'training_health': audit_training_health(), 'efficiency_pairs': audit_efficiency_pairs(), 'release': audit_release_readiness(), 'selection': audit_selection(), 'run_order': audit_run_order()}
+    res = {'generated_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'source_tree': audit_source_integrity(), 'dependencies': audit_dependencies(), 'data_source': audit_data_source(), 'leakage': audit_leakage(), 'split_discipline': audit_split_discipline(), 'document_unit': audit_document_unit(), 'sample_design': audit_sample_design(), 'attribution': audit_attribution(), 'boundary': audit_boundary(), 'length': audit_length(), 'fairness': audit_fairness(), 'metrics': audit_metrics(), 'tuning': audit_tuning(), 'simple_baseline': audit_simple_baseline(), 'hypotheses': audit_hypotheses(), 'methodology': audit_methodology(), 'single_factor': audit_single_factor(), 'design_preflight': audit_design_preflight(), 'failures': audit_failures(), 'budget': audit_budget(), 'training_health': audit_training_health(), 'efficiency_pairs': audit_efficiency_pairs(), 'release': audit_release_readiness(), 'selection': audit_selection(), 'run_order': audit_run_order()}
     L_atomic = None
     try:
         L = _import_exp_lib()
@@ -4634,7 +5029,7 @@ def run_report(out='audit_report.json'):
 
 
 if __name__ == '__main__':
-    _cmds = {'leakage': audit_leakage, 'split': audit_split_discipline, 'split_discipline': audit_split_discipline, 'document_unit': audit_document_unit, 'unit': audit_document_unit, 'causality': audit_causality, 'attribution': audit_attribution, 'boundary': audit_boundary, 'length': audit_length, 'fairness': audit_fairness, 'metrics': audit_metrics, 'tuning': audit_tuning, 'simple': audit_simple_baseline, 'baseline_floor': audit_simple_baseline, 'baseline_plan': audit_baseline_design, 'hypothesis_coverage': audit_hypothesis_coverage, 'hypotheses': audit_hypotheses, 'methodology': audit_methodology, 'single_factor': audit_single_factor, 'design': audit_design_preflight, 'design_preflight': audit_design_preflight, 'failures': audit_failures, 'budget': audit_budget, 'efficiency': audit_efficiency_demo, 'efficiency_pairs': audit_efficiency_pairs, 'training_health': audit_training_health, 'selection': audit_selection, 'release': audit_release_readiness, 'run_order': audit_run_order, 'source': audit_source_integrity, 'source_tree': audit_source_integrity, 'dependencies': audit_dependencies, 'dependency': audit_dependencies, 'data_source': audit_data_source, 'dataset_source': audit_data_source, 'report': run_report}
+    _cmds = {'leakage': audit_leakage, 'split': audit_split_discipline, 'split_discipline': audit_split_discipline, 'document_unit': audit_document_unit, 'unit': audit_document_unit, 'sample_design': audit_sample_design, 'sampling': audit_sample_design, 'sample': audit_sample_design, 'causality': audit_causality, 'attribution': audit_attribution, 'boundary': audit_boundary, 'length': audit_length, 'fairness': audit_fairness, 'metrics': audit_metrics, 'tuning': audit_tuning, 'simple': audit_simple_baseline, 'baseline_floor': audit_simple_baseline, 'baseline_plan': audit_baseline_design, 'hypothesis_coverage': audit_hypothesis_coverage, 'hypotheses': audit_hypotheses, 'methodology': audit_methodology, 'single_factor': audit_single_factor, 'design': audit_design_preflight, 'design_preflight': audit_design_preflight, 'failures': audit_failures, 'budget': audit_budget, 'efficiency': audit_efficiency_demo, 'efficiency_pairs': audit_efficiency_pairs, 'training_health': audit_training_health, 'selection': audit_selection, 'release': audit_release_readiness, 'run_order': audit_run_order, 'source': audit_source_integrity, 'source_tree': audit_source_integrity, 'dependencies': audit_dependencies, 'dependency': audit_dependencies, 'data_source': audit_data_source, 'dataset_source': audit_data_source, 'report': run_report}
     _arg = sys.argv[1] if len(sys.argv) > 1 else 'report'
     if _arg in ('-h', '--help'):
         print(__doc__)
