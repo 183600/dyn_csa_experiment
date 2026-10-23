@@ -21417,6 +21417,39 @@ def t_dose_response_trend_is_exact_directional_and_shape_gated():
             raise AssertionError(f'invalid trend parameter accepted: {kw}')
 
 
+def t_layer_cfg_diff_handles_vector_fields():
+    """L185 — dataclass config diffs must not truth-test elementwise vectors."""
+    import dataclasses as _dc
+
+    @_dc.dataclass
+    class _VectorCfg:
+        kind: str = 'csa'
+        index_topk: int = 32
+        mask: object = None
+
+    a = _VectorCfg(mask=np.array([1.0, 2.0]))
+    same = _VectorCfg(mask=np.array([1.0, 2.0]))
+    assert L.layer_cfg_diff(a, same) == {}
+    assert L.layer_cfg_diff(
+        _VectorCfg(mask=torch.tensor([1.0, 2.0])),
+        _VectorCfg(mask=torch.tensor([1.0, 2.0]))) == {}
+    assert set(L.layer_cfg_diff(
+        a, _VectorCfg(mask=torch.tensor([1.0, 3.0])))) == {'mask'}
+    # Broadcast-incompatible shapes are still a difference, not a crash.
+    assert set(L.layer_cfg_diff(
+        a, _VectorCfg(mask=np.array([1.0, 2.0, 3.0])))) == {'mask'}
+
+    def _factory(n_layers, arm):
+        return [_VectorCfg(index_topk=8 if arm == 'k8' else 128,
+                           mask=torch.tensor([1.0, 2.0]))
+                for _ in range(int(n_layers))]
+
+    keys, per_layer = L._design_pair_cfg_keys('k8', 'k128', _factory, 2)
+    assert keys == ['index_topk'], (keys, per_layer)
+    assert set(per_layer) == {0, 1}, per_layer
+    assert all(set(d) == {'index_topk'} for d in per_layer.values()), per_layer
+
+
 def t_statistical_calibration_gates_and_suite():
     """L183 — the statistical machinery is calibrated before its output counts."""
     assert abs(L._binomial_sf(1, 10, 0.5) - (1.0 - 0.5 ** 10)) < 1e-15
@@ -22055,6 +22088,7 @@ def main():
     _check('L182 dose-response trend is exact, directional and shape-gated', t_dose_response_trend_is_exact_directional_and_shape_gated)
     _check('L183 statistical calibration gates null and positive controls', t_statistical_calibration_gates_and_suite)
     _check('L184 statistical calibration is wired into the audit report', t_statistical_calibration_is_wired_into_the_audit)
+    _check('L185 dataclass config diff handles vector fields', t_layer_cfg_diff_handles_vector_fields)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

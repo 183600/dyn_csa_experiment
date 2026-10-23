@@ -18050,6 +18050,36 @@ def cfg_keys_single_factor(keys):
     ks = frozenset(str(k) for k in keys)
     return 'kind' not in ks and any(ks <= fam for fam in SINGLE_FACTOR_CFG_FAMILIES)
 
+def _cfg_values_differ(value_a, value_b):
+    """Whether two config-field values differ, with safe NumPy/torch truth.
+
+    ``value_a != value_b`` returns an elementwise array/tensor for vector
+    fields, so using it directly in ``if`` raises for any field with more than
+    one element.  A config declaration may legitimately carry such a field
+    (e.g. a mask) beside the scalar dose axis; an ambiguous comparison is
+    treated as different so the gate fails closed instead of crashing or
+    silently dropping a possible second factor.
+    """
+    try:
+        differs = (value_a != value_b)
+    except Exception:
+        return True
+    if isinstance(differs, np.ndarray):
+        try:
+            return bool(differs.any())
+        except Exception:
+            return True
+    if torch.is_tensor(differs):
+        try:
+            return bool(differs.any().item())
+        except Exception:
+            return True
+    try:
+        return bool(differs)
+    except Exception:
+        return True
+
+
 def layer_cfg_diff(ca, cb):
     """Field-by-field diff between two per-layer attention configs.
 
@@ -18069,11 +18099,7 @@ def layer_cfg_diff(ca, cb):
     out = {}
     for name in keys:
         va, vb = getattr(ca, name, None), getattr(cb, name, None)
-        try:
-            differs = (va != vb)
-        except (TypeError, ValueError):
-            differs = True
-        if differs:
+        if _cfg_values_differ(va, vb):
             out[name] = (va, vb)
     return out
 
@@ -29461,36 +29487,6 @@ def _dose_arm_value(arm, factory, n_layers, dose_key):
         return None, f'{dose_key!r} varies across layers ({vals!r})'
     return vals[0], None
 
-
-
-def _cfg_values_differ(value_a, value_b):
-    """Whether two config-field values differ, with safe NumPy/torch truth.
-
-    ``value_a != value_b`` returns an elementwise array/tensor for vector
-    fields, so using it directly in ``if`` raises for any field with more than
-    one element.  A config declaration may legitimately carry such a field
-    (e.g. a mask) beside the scalar dose axis; an ambiguous comparison is
-    treated as different so the gate fails closed instead of crashing or
-    silently dropping a possible second factor.
-    """
-    try:
-        differs = (value_a != value_b)
-    except Exception:
-        return True
-    if isinstance(differs, np.ndarray):
-        try:
-            return bool(differs.any())
-        except Exception:
-            return True
-    if torch.is_tensor(differs):
-        try:
-            return bool(differs.any().item())
-        except Exception:
-            return True
-    try:
-        return bool(differs)
-    except Exception:
-        return True
 
 
 def _dose_pair_cfg_keys(variant_a, variant_b, factory, n_layers):
