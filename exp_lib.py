@@ -18081,24 +18081,30 @@ def _design_pair_cfg_keys(variant_a, variant_b, factory, n_layers):
     """Union (over layers) of the config keys in which two arms differ.
 
     Returns `(keys, per_layer)` where `per_layer` maps layer index -> diff
-    dict (layers with no diff are omitted).  A construction failure in either
-    arm is returned as the exception object so the caller can report it as a
-    violation instead of crashing the audit.
+    dict (layers with no diff are omitted).  Any construction failure in either
+    arm -- including a factory that returns a non-sequence or a non-config
+    object -- is returned as the exception object so the caller can report it
+    as a violation instead of crashing the audit.
     """
+    per_layer = {}
+    keys = set()
     try:
         cfgs_a = factory(n_layers, variant_a)
         cfgs_b = factory(n_layers, variant_b)
+        if isinstance(cfgs_a, (str, bytes, bytearray)) or isinstance(
+                cfgs_b, (str, bytes, bytearray)):
+            raise TypeError('factory returned a string, not a sequence of layer configs')
+        cfgs_a, cfgs_b = list(cfgs_a), list(cfgs_b)
+        if len(cfgs_a) != len(cfgs_b):
+            raise ValueError(
+                f'arms have different layer counts ({len(cfgs_a)} vs {len(cfgs_b)})')
+        for i, (x, y) in enumerate(zip(cfgs_a, cfgs_b)):
+            d = layer_cfg_diff(x, y)
+            if d:
+                per_layer[i] = d
+                keys.update(d)
     except Exception as e:  # fail closed: an unbuildable arm is a design defect
-        return e, {}
-    if len(cfgs_a) != len(cfgs_b):
-        return ValueError(f'arms have different layer counts ({len(cfgs_a)} vs {len(cfgs_b)})'), {}
-    per_layer = {}
-    keys = set()
-    for i, (x, y) in enumerate(zip(cfgs_a, cfgs_b)):
-        d = layer_cfg_diff(x, y)
-        if d:
-            per_layer[i] = d
-            keys.update(d)
+        return e, per_layer
     return sorted(keys), per_layer
 
 def single_factor_design_audit(design=None, *, baseline_design=None, factory=None,
@@ -28773,7 +28779,8 @@ def factorial_design_audit(design=None, present=None, factory=None):
     for name, spec in design.items():
         rec = {'factors': None, 'cells': {}, 'complete': False,
                'missing_cells': [], 'extra_cells': [], 'missing_arms': [],
-               'factor_diffs': {}, 'hypothesis': None, 'hypothesis_audit': None,
+               'factor_diffs': {}, 'factor_diff_signatures': {},
+               'hypothesis': None, 'hypothesis_audit': None,
                'full_factorial': None}
         report['factorials'][str(name)] = rec
         _ok = True
@@ -28859,22 +28866,38 @@ def factorial_design_audit(design=None, present=None, factory=None):
                          (norm_cells[('active', 'active')],
                           norm_cells[('active', 'control')]))
             keys = []
+            signatures = []
             for a, b in pairs:
                 _k, _per = _design_pair_cfg_keys(a, b, factory, report['n_layers'])
                 if isinstance(_k, Exception):
                     _bad(f'{factor}: cannot construct the {a} vs {b} contrast '
                          f'({type(_k).__name__}: {_k})')
-                    _k = []
+                    keys.append(())
+                    signatures.append(None)
+                    continue
                 keys.append(tuple(_k))
+                signatures.append(_canon_setting(_per))
             rec['factor_diffs'][factor] = {
                 'at_other_control': list(keys[0]),
                 'at_other_active': list(keys[1]),
+            }
+            rec['factor_diff_signatures'][factor] = {
+                'at_other_control': signatures[0],
+                'at_other_active': signatures[1],
             }
             if keys[0] != keys[1]:
                 _bad(f'{factor}: the intervention is not parallel across the '
                      f'other factor\'s levels ({list(keys[0])} vs {list(keys[1])}); '
                      'the interaction would compare two different manipulations')
+            elif (signatures[0] is not None and signatures[1] is not None
+                  and signatures[0] != signatures[1]):
+                _bad(f'{factor}: the intervention changes the same key names but '
+                     'with different values across the other factor\'s levels; '
+                     'the interaction would compare two different manipulations')
             union = set(keys[0]) | set(keys[1])
+            if not union:
+                _bad(f'{factor}: no AttnCfg key differs between the declared '
+                     'control and active cells; the intervention is absent')
             if 'kind' in union:
                 _bad(f'{factor}: changing the attention-kind field makes this '
                      'an architecture swap, not a 2x2 factor')
@@ -28919,13 +28942,23 @@ def _factorial_condition_rows(recs, cells, *, strict_hyper=True):
     """
     arms = [cells[k] for k in _FACTORIAL_CELL_KEYS]
     by_arm = {a: {} for a in arms}
-    for (v, t, s), r in recs.items():
+    for key, r in recs.items():
+        if not (isinstance(key, tuple) and len(key) == 3):
+            continue
+        v, t, s = key
         if v in by_arm:
             by_arm[v].setdefault(s, {})[str(t or '')] = r
     if not all(by_arm.values()):
         return [], [], None
+    all_seeds = set().union(*[set(d) for d in by_arm.values()])
     common = set.intersection(*[set(d) for d in by_arm.values()])
     rows, skipped = [], []
+    for s in sorted(all_seeds - common):
+        missing = [a for a in arms if s not in by_arm[a]]
+        skipped.append({
+            'seed': s,
+            'reason': 'missing cell record(s) for arm(s): ' + ', '.join(missing),
+        })
     for s in sorted(common):
         tagsets = [set(by_arm[a][s]) for a in arms]
         nonempty = set().union(*[ts - {''} for ts in tagsets])
@@ -29036,21 +29069,52 @@ def factorial_interaction_audit(summary=None, design=None, *, alpha=0.05,
                 'note': 'no factorial design is declared'}
     if recs is None:
         recs, _amb = _variant_seed_map(summary or {})
-    present = {v for (v, _t, _s) in recs}
-    arm_sets = [set(spec.get('cells', {}).values())
-                for spec in design.values() if isinstance(spec, dict)]
-    shared = set.intersection(*arm_sets) if arm_sets else set()
-    if not (present - shared):
+    startup_warnings = []
+    if not isinstance(recs, dict):
         return {'kind': 'factorial_interaction', 'status': 'not_applicable',
                 'factorials': {}, 'family': {},
                 'significant_interactions': [],
-                'direction_conflict_interactions': [], 'warnings': [],
+                'direction_conflict_interactions': [],
+                'warnings': [f'records must be a mapping, got {type(recs).__name__}'],
+                'note': 'no usable factorial records were supplied'}
+    present = set()
+    for _key in recs:
+        if not (isinstance(_key, tuple) and len(_key) == 3):
+            startup_warnings.append(
+                f'record key {_key!r} is not a (variant, protocol, seed) triple; ignored')
+            continue
+        try:
+            present.add(_key[0])
+        except TypeError:
+            startup_warnings.append(
+                f'record key {_key!r} has an unhashable arm id; ignored')
+    arm_sets = []
+    for _name, _spec in design.items():
+        if not isinstance(_spec, dict):
+            continue
+        _cells = _spec.get('cells')
+        if not isinstance(_cells, dict):
+            continue
+        _raw = [_cells.get(k) for k in _FACTORIAL_CELL_KEYS]
+        if any(not isinstance(_a, str) or not _a.strip() for _a in _raw):
+            continue
+        _arms = [a.strip() for a in _raw]
+        if len(set(_arms)) == 4:
+            arm_sets.append(set(_arms))
+    shared = set.intersection(*arm_sets) if arm_sets else set()
+    if arm_sets and not (present - shared):
+        return {'kind': 'factorial_interaction', 'status': 'not_applicable',
+                'factorials': {}, 'family': {},
+                'significant_interactions': [],
+                'direction_conflict_interactions': [],
+                'warnings': startup_warnings,
                 'note': ('this panel contains none of the factorial-specific '
                          'arms; no 2x2 interaction is measured here')}
     out = {'kind': 'factorial_interaction', 'status': 'ok',
            'alpha': float(alpha), 'min_n': min_n, 'factorials': {},
            'family': {}, 'significant_interactions': [],
-           'direction_conflict_interactions': [], 'warnings': [],
+           'direction_conflict_interactions': [],
+           'warnings': list(startup_warnings),
            'claim_level': ('exploratory interaction family; never part of the '
                            'leave-one-out or frozen confirmatory correction'),
            'note': ('positive interaction = the second factor adds less when the '
@@ -29067,11 +29131,17 @@ def factorial_interaction_audit(summary=None, design=None, *, alpha=0.05,
         if not isinstance(cells, dict):
             out['warnings'].append(f'{name}: cells must be a mapping')
             continue
-        try:
-            arms = [cells[k] for k in _FACTORIAL_CELL_KEYS]
-        except (KeyError, TypeError):
-            out['warnings'].append(f'{name}: incomplete 2x2 cell declaration')
+        raw_arms = [cells.get(k) for k in _FACTORIAL_CELL_KEYS]
+        if any(not isinstance(a, str) or not a.strip() for a in raw_arms):
+            out['warnings'].append(
+                f'{name}: the four cells must map to non-empty, hashable arm ids')
             continue
+        arms = [a.strip() for a in raw_arms]
+        extra_cells = sorted(str(k) for k in cells if k not in _FACTORIAL_CELL_KEYS)
+        if extra_cells:
+            out['warnings'].append(
+                f'{name}: cell declaration has extra key(s): '
+                + ', '.join(extra_cells))
         if len(set(arms)) != 4:
             out['warnings'].append(f'{name}: the four cells are not distinct arms')
             continue
@@ -29166,7 +29236,10 @@ def factorial_interaction_audit(summary=None, design=None, *, alpha=0.05,
                            and math.isfinite(float(st['p_exact_signflip'])))
                        else 1.0))
     if not out['factorials']:
-        out['status'] = 'not_applicable'
+        out['status'] = 'incomplete' if out['warnings'] else 'not_applicable'
+        if not out['warnings']:
+            out['note'] = ('no complete factorial declaration could be measured '
+                           'from the supplied records')
         return out
     if family:
         h = holm_adjust(family, alpha=alpha)

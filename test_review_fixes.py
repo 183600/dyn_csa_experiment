@@ -16137,6 +16137,86 @@ def t_factorial_interaction_test_is_paired_and_isolated():
     assert any('capacity control' in w for w in cap['warnings']), cap['warnings']
 
 
+def t_factorial_interaction_fails_closed_on_malformed_records_and_names_missing_seeds():
+    import copy
+    # A cells declaration that is not a mapping must produce a warning, not an
+    # AttributeError from `.values()`.
+    bad = {'bad': {'factors': ('dynamic_blocking', 'attention_sink'),
+                   'cells': ['not', 'a', 'mapping']}}
+    r = L.factorial_interaction_audit(design=bad, recs=_factorial_records(0.05))
+    assert r['status'] == 'incomplete', r
+    assert any('cells must be a mapping' in w for w in r['warnings']), r['warnings']
+    # A non-string (and therefore unhashable) arm id must not reach set().
+    unl = copy.deepcopy(L.FACTORIAL_DESIGN['dynamic_blocking_x_attention_sink'])
+    unl['cells'][('active', 'active')] = ['csa_dyn_zerocont']
+    ru = L.factorial_interaction_audit(
+        design={'bad': unl}, recs=_factorial_records(0.05))
+    assert ru['status'] == 'incomplete', ru
+    assert any('non-empty, hashable arm ids' in w for w in ru['warnings']), ru['warnings']
+    # A seed present in only some cells is named in dropped, not silently
+    # excluded from the denominator.
+    recs = _factorial_records(0.05)
+    del recs[('csa_fix_randidx', '', 3)]
+    rm = L.factorial_interaction_audit(recs=recs)
+    fac = rm['factorials']['dynamic_blocking_x_learned_selection']
+    assert fac['n_complete'] == 6, fac
+    assert any(int(d.get('seed')) == 3 and 'csa_fix_randidx' in d.get('reason', '')
+               for d in fac['dropped']), fac['dropped']
+
+
+def t_factorial_design_gate_rejects_value_drift_and_absent_interventions():
+    import dataclasses
+    base = L.AttnCfg(kind='csa', dynamic=False, block_size=4,
+                     overlap=L.OVERLAP, index_topk=32)
+
+    def _dyn(block):
+        return dataclasses.replace(base, dynamic=True,
+                                    chunking='cosine_learnable',
+                                    target_block_tokens=block)
+
+    def _design(factory):
+        return {'drift': {
+            'factors': ('dynamic_blocking', 'attention_sink'),
+            'cells': {('control', 'control'): 'a0',
+                      ('active', 'control'): 'a1',
+                      ('control', 'active'): 'b0',
+                      ('active', 'active'): 'b1'},
+            'hypothesis': 'dynamic_blocking_x_attention_sink',
+        }}
+
+    def value_drift(_n, variant):
+        if variant == 'a0':
+            return [base]
+        if variant == 'a1':
+            return [_dyn(4)]
+        if variant == 'b0':
+            return [dataclasses.replace(base, use_sink=False)]
+        return [dataclasses.replace(_dyn(8), use_sink=False)]
+
+    rv = L.factorial_design_audit(
+        _design(value_drift), factory=value_drift,
+        present={'a0', 'a1', 'b0', 'b1'})
+    assert rv['status'] == 'fail', rv
+    assert any('same key names' in v and 'different values' in v
+               for v in rv['violations']), rv['violations']
+
+    def absent_dynamic(_n, variant):
+        if variant in ('a0', 'a1'):
+            return [base]
+        return [dataclasses.replace(base, use_sink=False)]
+
+    ra = L.factorial_design_audit(
+        _design(absent_dynamic), factory=absent_dynamic,
+        present={'a0', 'a1', 'b0', 'b1'})
+    assert ra['status'] == 'fail', ra
+    assert any('intervention is absent' in v for v in ra['violations']), ra['violations']
+
+    # A factory that returns None is a reported construction failure, not a
+    # TypeError escaping the audit.
+    err, per = L._design_pair_cfg_keys('a', 'b', lambda _n, _v: None, 2)
+    assert isinstance(err, Exception) and per == {}, (err, per)
+
+
 def t_classification_threshold_metadata_matches_predictions():
     y = np.array([0, 1, 0, 1])
     score = np.array([[0.9, 0.1], [0.2, 0.8], [0.7, 0.3], [0.4, 0.6]])
@@ -21503,6 +21583,8 @@ def main():
     _check('L60 single-factor design gate verifies the shipped design and fails closed on drift', t_single_factor_design_gate_passes_and_fails_closed)
     _check('L60a 2x2 factorial design gate verifies parallel cells and fails closed', t_factorial_design_gate_verifies_parallel_cells)
     _check('L60b factorial interaction is a paired difference-of-differences with an isolated Holm family', t_factorial_interaction_test_is_paired_and_isolated)
+    _check('L60c factorial interaction names missing seeds and rejects malformed cells', t_factorial_interaction_fails_closed_on_malformed_records_and_names_missing_seeds)
+    _check('L60d factorial design gate rejects value drift and absent interventions', t_factorial_design_gate_rejects_value_drift_and_absent_interventions)
     _check('L61 frozen-manifest mechanism flags are machine-verified single-factor verdicts', t_frozen_manifest_mechanism_flags_are_verified_single_factor)
     _check('L62 seq2k sweep contrasts carry explicit factor declarations', t_seq2k_contrasts_carry_factor_declarations)
     _check('L62b v7 rope/sink/selection contrasts carry verified factor declarations', t_v7_rope_contrasts_carry_factor_declarations)
