@@ -20142,6 +20142,169 @@ def t_kernel_fp64_and_negative_topk_guards():
     assert soft is None
 
 
+def t_sesoi_practical_decision_primitives():
+    # Equivalence is a positive claim: a small, precise effect inside the
+    # pre-registered margin is 'equivalent', not 'not significant'.
+    r = L.ablation_practical_decision(
+        [0.02, -0.01, 0.0, 0.01, -0.02, 0.0], margin=0.5,
+        alpha=0.05, min_n=3, direction=-1)
+    assert r['decision'] == 'equivalent' and r['claim'] == 'module_removable_within_sesoi', r
+    assert r['tost_equivalent'] is True and r['tost_p_tost'] < 0.05, r
+    # A detectable effect smaller than the margin is sub-SESOI, never
+    # deliberately 'useful', even though the sign-flip p is tiny.
+    r2 = L.ablation_practical_decision(
+        [0.05, 0.051, 0.052, 0.053, 0.054, 0.055], margin=0.1,
+        alpha=0.05, min_n=3, direction=-1)
+    assert r2['decision'] == 'sub_sesoi' and r2['practical_significant'] is False, r2
+    # Same magnitude in the declared-benefit direction is only 'superior' when
+    # it exceeds the margin; this one does not, so it stays sub-SESOI too.
+    r3 = L.ablation_practical_decision(
+        [-0.05, -0.051, -0.052, -0.053, -0.054, -0.055], margin=0.1,
+        alpha=0.05, min_n=3, direction=-1)
+    assert r3['decision'] == 'sub_sesoi', r3
+    # Opposite-direction, above-margin effect is harmful.
+    r4 = L.ablation_practical_decision(
+        [0.8, 0.81, 0.79, 0.82, 0.8, 0.81], margin=0.1,
+        alpha=0.05, min_n=3, direction=-1)
+    assert r4['decision'] == 'inferior' and r4['claim'] == 'module_harmful', r4
+    # No pre-registered margin: no equivalence verdict at all.
+    r5 = L.ablation_practical_decision([0.0, 0.0, 0.0, 0.0, 0.0], sesoi=None)
+    assert r5['decision'] == 'not_declared' and r5['margin'] is None, r5
+    # n=2 cannot support equivalence even if the point estimate is tiny.
+    r6 = L.ablation_practical_decision([0.0, 0.0], margin=0.5, min_n=3)
+    assert r6['decision'] == 'underpowered', r6
+    # Relative margins translate against the without-arm PPL.
+    spec = L._normalise_sesoi_design({'x': {'relative_pct': 2.0}})['x']
+    margin, why = L._sesoi_margin_ppl(spec, 50.0)
+    assert why == '' and abs(margin - 1.0) < 1e-12, (margin, why)
+    # A normalised spec (both unit keys present, one None) can be normalised
+    # again; the public helper accepts its own output.
+    again = L._normalise_sesoi_design({'x': spec})['x']
+    assert again['relative_pct'] == 2.0 and again['absolute_ppl'] is None, again
+    assert L._sesoi_margin_ppl(spec, 0.0)[0] is None, 'a zero baseline cannot define a relative margin'
+    # The public helper can derive the absolute margin from a relative spec.
+    r7 = L.ablation_practical_decision([0.01, -0.01, 0.0, 0.02, -0.02, 0.0],
+                                       sesoi={'relative_pct': 1.0},
+                                       baseline_ppl=50.0, min_n=3)
+    assert r7['decision'] == 'equivalent' and abs(r7['margin'] - 0.5) < 1e-12, r7
+    # Malformed declarations fail closed instead of silently dropping a margin.
+    for bad in ({'x': {'relative_pct': 0.0}},
+                {'x': {'relative_pct': -1.0}},
+                {'x': {'relative_pct': float('nan')}},
+                {'x': {'relative_pct': True}},
+                {'x': {'relative_pct': 1.0, 'absolute_ppl': 1.0}},
+                {'x': {'absolute_ppl': None}}):
+        try:
+            L._normalise_sesoi_design(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'malformed SESOI must be rejected: {bad!r}')
+
+
+def t_sesoi_audit_gates_verified_and_equivalence():
+    fp = 'steps1_sl8_bs1_nt10_lr0.0003_wd0.1_d8_L1_H1_Dh8_v16_wu1_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee1_es1_detcpu-eager_dfabc_csX'
+    knobs = L.training_knobs()
+    design = {'dynamic_blocking': [('csa_dynamic', 'csa_fixed', 'x')]}
+
+    def _summary(effect, noise=0.0, n=8):
+        s = {}
+        for i in range(n):
+            s[f'csa_dynamic::seed{i}'] = dict(
+                variant='csa_dynamic', seed=i, run_cfg=fp, steps=1,
+                tokens_seen=1, ppl=50.0 + effect + (noise if i % 2 else -noise),
+                params=100, train_knobs=knobs)
+            s[f'csa_fixed::seed{i}'] = dict(
+                variant='csa_fixed', seed=i, run_cfg=fp, steps=1,
+                tokens_seen=1, ppl=50.0, params=100, train_knobs=knobs)
+        return s
+
+    # 2% improvement: above the 1% SESOI -> useful and verified.
+    r = L.methodology_audit(_summary(-1.0, 0.001), design=design,
+                            baselines={}, verbose=False)
+    e = r['components']['dynamic_blocking'][0]
+    assert e['practical_decision'] == 'superior', e
+    assert 'dynamic_blocking' in r['verified_components'], r['verified_components']
+    assert 'dynamic_blocking' in r['practically_useful_components'], r
+    assert r['sesoi']['components']['dynamic_blocking']['status'] == 'useful', r['sesoi']
+    # 0.2% improvement: statistically detectable but below the SESOI.  It must
+    # not be counted as verified or practically useful.
+    r2 = L.methodology_audit(_summary(-0.1, 0.001), design=design,
+                             baselines={}, verbose=False)
+    e2 = r2['components']['dynamic_blocking'][0]
+    assert e2['practical_decision'] == 'sub_sesoi', e2
+    assert 'dynamic_blocking' not in r2['verified_components'], r2['verified_components']
+    assert 'dynamic_blocking' in r2['sub_sesoi_components'], r2['sub_sesoi_components']
+    # A precise zero effect: TOST inside the 1% margin -> removable, NOT a
+    # failed significance test and NOT verified.
+    r3 = L.methodology_audit(_summary(0.0, 0.005), design=design,
+                             baselines={}, verbose=False)
+    e3 = r3['components']['dynamic_blocking'][0]
+    assert e3['practical_decision'] == 'equivalent', e3
+    assert 'dynamic_blocking' in r3['equivalent_components'], r3['equivalent_components']
+    assert 'dynamic_blocking' not in r3['verified_components'], r3['verified_components']
+    assert r3['sesoi']['components']['dynamic_blocking']['status'] == 'equivalent', r3['sesoi']
+    # The equivalence p is family-adjusted and reported.
+    assert math.isfinite(float(e3['sesoi']['tost_p_holm'])), e3['sesoi']
+    # 1.6% in the wrong direction: harmful, above the SESOI.
+    r4 = L.methodology_audit(_summary(0.8, 0.001), design=design,
+                             baselines={}, verbose=False)
+    assert r4['sesoi']['components']['dynamic_blocking']['status'] == 'harmful', r4['sesoi']
+    # Passing an empty SESOI mapping restores the statistical-only behaviour:
+    # the 0.2% effect is then verified (legacy), proving the gate is explicit.
+    r5 = L.methodology_audit(_summary(-0.1, 0.001), design=design,
+                             baselines={}, sesoi={}, verbose=False)
+    assert 'dynamic_blocking' in r5['verified_components'], r5['verified_components']
+    assert r5['sesoi']['declared_components'] == [], r5['sesoi']
+    # An unmeasured declared contrast keeps its SESOI family slot (dummy p=1);
+    # a partial ablation cannot shrink the equivalence correction burden.
+    partial_design = {'dynamic_blocking': [
+        ('csa_dynamic', 'csa_fixed', 'x'),
+        ('csa_dynamic', 'csa_fixed_missing', 'y')]}
+    r6 = L.methodology_audit(_summary(0.0, 0.005), design=partial_design,
+                             baselines={}, verbose=False)
+    assert r6['sesoi']['family']['m'] == 2, r6['sesoi']['family']
+    # Equivalence on a partial ablation cannot certify "the component is
+    # removable" (the second declared contrast is missing).
+    assert 'dynamic_blocking' not in r6['equivalent_components'], r6['equivalent_components']
+    assert r6['sesoi']['components']['dynamic_blocking']['status'] != 'equivalent', r6['sesoi']
+    # Practical superiority follows the FAMILY-corrected significance, not the
+    # raw sign-flip p.  Here n=6 gives raw p=0.031 but 5 declared contrasts
+    # leave Holm p=0.156, so the contrast must not be called useful.
+    wide_design = {'dynamic_blocking': [
+        ('csa_dynamic', 'csa_fixed', 'x')] + [
+        ('csa_dynamic', f'csa_fixed_missing{i}', 'y') for i in range(1, 5)]}
+    r7 = L.methodology_audit(_summary(-1.0, 0.001, n=6), design=wide_design,
+                             baselines={}, verbose=False)
+    e7 = r7['components']['dynamic_blocking'][0]
+    assert e7['significant_global'] is False, e7
+    assert e7['practical_decision'] != 'superior', e7['sesoi']
+    assert 'dynamic_blocking' not in r7['verified_components'], r7['verified_components']
+
+
+def t_sesoi_declaration_gate():
+    def _audit(**kw):
+        with contextlib.redirect_stdout(io.StringIO()):
+            return A.audit_sesoi_declaration(**kw)
+
+    ok = _audit()
+    assert ok['status'] == 'ok' and ok['ablation_complete'] is True, ok
+    # Every declared ablation component must have a pre-registered margin.
+    partial = {'dynamic_blocking': {'relative_pct': 1.0}}
+    bad = _audit(spec=partial)
+    assert bad['status'] == 'fail' and any('no pre-registered SESOI' in p
+                                           for p in bad['problems']), bad
+    # A malformed declaration is a design defect, not a silently missing margin.
+    bad2 = _audit(spec={'dynamic_blocking': {'relative_pct': 0.0}})
+    assert bad2['status'] == 'fail', bad2
+    # Extra/misspelled component names are surfaced (a typo would otherwise
+    # leave the real component without a margin).
+    extra = dict(L.ABLATION_SESOI)
+    extra['dynamic_blockin'] = {'relative_pct': 1.0}
+    out = _audit(spec=extra)
+    assert any('not present in the ablation design' in w for w in out['warnings']), out
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -20654,6 +20817,9 @@ def main():
     _check('L166 article clusters are stable when the cap splits a heading', t_article_cluster_map_survives_a_capped_heading)
     _check('L167 P5T checkpoint identity binds arm/seed/weights', t_p5t_checkpoint_identity_binds_arm_seed_and_weights)
     _check('L168 kernel fp64/negative-topk guards', t_kernel_fp64_and_negative_topk_guards)
+    _check('L169 SESOI practical decision primitives', t_sesoi_practical_decision_primitives)
+    _check('L170 SESOI gates verified / equivalent / harmful ablation verdicts', t_sesoi_audit_gates_verified_and_equivalence)
+    _check('L171 SESOI declaration gate fails closed', t_sesoi_declaration_gate)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

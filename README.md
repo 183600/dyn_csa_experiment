@@ -353,6 +353,7 @@ freeze and need their own pre-registration.
 python audit_gates.py causality   # CPU unit audit: prefix invariance / label shift / decode consistency
 python audit_gates.py leakage     # tokenizer provenance, vocab identity, train/test overlap
 python audit_gates.py single_factor  # design-time gate: every declared contrast's arm-cfg diff equals its declared intervention key set; open-block matrix axes; frozen-manifest mechanism_claim_allowed flags vs the actual cfg diff
+python audit_gates.py sesoi       # design-time gate: every ablation component has a valid declared SESOI and is fully scheduled
 python audit_gates.py report      # run every locally-verifiable audit -> audit_report.json
 python audit_gates.py selection   # selection-recall contract (refuses unsupported mechanism claims when absent)
 python audit_gates.py efficiency_pairs  # measured latency claims: same shape/device/KV required
@@ -442,6 +443,16 @@ machine gates rather than new prose:
   contract and reports `not_verifiable_locally` (with an explicit "unsupported
   mechanism claim" note) until that artifact exists.  Boundary alignment,
   block/read diagnostics and NIAH remain the available direct readouts.
+- **Ablation practical significance**: every declared ablation component now
+  carries a declared SESOI (relative PPL margin, default 1%; exploratory
+  panels only) and is adjudicated with paired TOST plus family-adjusted
+  equivalence p.  A
+  non-significant contrast is never relabelled "removable" without TOST; a
+  statistically significant but sub-SESOI effect is `sub_sesoi`, not
+  `verified`; a TOST-inside-margin result on a COMPLETE declared ablation
+  is `equivalent` (positive evidence of removability).  `audit_gates.py sesoi` fails closed if a component has no
+  declared margin or the ablation is not fully scheduled.  This is exploratory
+  and does not modify the frozen confirmatory manifest.
 - **Evidence**: `audit_gates.release` parses `RELEASES.md`; with no complete
   row the repository is declared source-only/not auditable.  `archive_release.py`
   now also packs `pyproject.toml`, cache/tokenizer metadata and `run_*.log`.

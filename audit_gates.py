@@ -32,7 +32,10 @@
   tuning       基线调参：主方法与简单基线是否获得同一搜索网格与范围
                （读 results_baseline_tuning/baseline_tuning.json）
   methodology  受控对比 / 消融完整性 / 统计可靠性：逐臂全种子设置一致性、
-               每个创新点的留一对照是否完整、n 与 mean±std（零 GPU）
+               每个创新点的留一对照是否完整、n 与 mean±std、预注册 SESOI
+               下的 TOST 等价/亚 SESOI/有害判定（零 GPU）
+  sesoi        消融 SESOI 声明：每个声明组件都有唯一、有限、>0 的相对或
+               绝对 margin，且留一对照在 RUN_ABL 中完整排程（设计期，零 GPU）
   single_factor  单因素设计契约：每条声明对照的臂配置 diff 恰好等于声明的
                干预键集（定义点审计，不读 results_*）；open-block 矩阵只沿
                两根声明轴变化；v7/v9 扫描的 factors 与真实 arm diff 对账；
@@ -3207,6 +3210,67 @@ def audit_hypothesis_coverage():
     return out
 
 
+def audit_sesoi_declaration(spec=None, design=None):
+    """消融 SESOI 声明审计（零 GPU，设计期，不读结果）。
+
+    `methodology_audit` 只在**每条对照都带预注册 margin** 时才能区分
+    「模块可删（TOST 等价）」与「数据不足（不确定）」。这个入口在跑 GPU 前
+    检查：
+      * 每个 `ABLATION_DESIGN` 组件都有 margin，且单位唯一、有限、>0；
+      * margin 能在一个正常 PPL 基线上换算成正的绝对 PPL 边界；
+      * 没有为未声明组件写 margin（拼写错误会让整条对照静默失去 SESOI）；
+      * 声明的留一对照本身在 `RUN_ABL` 里完整排程。
+    缺 margin 或声明畸形是 fail-closed 的设计缺陷，不是事后调整理由。
+    """
+    L = _import_exp_lib()
+    spec = L.ABLATION_SESOI if spec is None else spec
+    design = L.ABLATION_DESIGN if design is None else design
+    out = {'status': 'ok', 'problems': [], 'warnings': [],
+           'components': {}, 'ablation_complete': None}
+    try:
+        norm = L._normalise_sesoi_design(spec)
+    except Exception as e:
+        out['status'] = 'fail'
+        out['problems'].append(f'SESOI declaration is malformed: {type(e).__name__}: {e}')
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return out
+    if not isinstance(design, dict):
+        out['status'] = 'fail'
+        out['problems'].append('ABLATION_DESIGN is not a mapping')
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return out
+    for comp, contrasts in design.items():
+        rec = {'declared': comp in norm, 'n_contrasts': len(contrasts)}
+        if comp not in norm:
+            out['problems'].append(f'{comp}: no pre-registered SESOI margin; '
+                                   'a non-significant ablation cannot be called removable')
+        else:
+            rec['margin_spec'] = norm[comp]
+            margin, why = L._sesoi_margin_ppl(norm[comp], 50.0)
+            rec['probe_margin_ppl_at_baseline_50'] = margin
+            if margin is None:
+                out['problems'].append(f'{comp}: margin cannot be translated to PPL ({why})')
+            if not norm[comp].get('rationale'):
+                out['warnings'].append(f'{comp}: margin has no recorded rationale')
+        out['components'][comp] = rec
+    extras = sorted(set(norm) - set(design))
+    if extras:
+        out['warnings'].append('SESOI declares component(s) not present in the '
+                               'ablation design: ' + ', '.join(extras))
+    try:
+        abl = L.ablation_completeness_audit(design, L.RUN_ABL['variants'])
+        out['ablation_complete'] = bool(abl.get('complete'))
+        if not out['ablation_complete']:
+            out['problems'].append('declared ablation is not complete under RUN_ABL: '
+                                   + json.dumps(abl.get('missing_arms') or {}, ensure_ascii=False))
+    except Exception as e:
+        out['problems'].append(f'ablation completeness check failed: {type(e).__name__}: {e}')
+    if out['problems']:
+        out['status'] = 'fail'
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return out
+
+
 def audit_hypotheses():
     """预注册假设完整性 / 指标对齐审计（零 GPU）。
 
@@ -3274,6 +3338,13 @@ def audit_methodology(outdirs=None, design=None, alpha=0.05, min_n=3, write=True
             'arm_summary': rep.get('arm_summary'),
             'arms_below_min_seeds': rep.get('arms_below_min_seeds'),
             'verified_components': rep.get('verified_components'),
+            'practically_useful_components': rep.get('practically_useful_components'),
+            'practical_equivalent_components': (
+                (rep.get('sesoi') or {}).get('equivalent_components')),
+            'sub_sesoi_components': rep.get('sub_sesoi_components'),
+            'practically_harmful_components': rep.get('practically_harmful_components'),
+            'practically_inconclusive_components': rep.get('practically_inconclusive_components'),
+            'sesoi_family': (rep.get('sesoi') or {}).get('family'),
             'unverified_components': rep.get('unverified_components'),
             'system_level_only_components': rep.get('system_level_only_components'),
             'incomplete_components': rep.get('incomplete_components'),
@@ -5118,7 +5189,7 @@ def audit_run_order(paths=None):
 
 
 def run_report(out='audit_report.json'):
-    res = {'generated_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'source_tree': audit_source_integrity(), 'dependencies': audit_dependencies(), 'data_source': audit_data_source(), 'leakage': audit_leakage(), 'split_discipline': audit_split_discipline(), 'document_unit': audit_document_unit(), 'sample_design': audit_sample_design(), 'attribution': audit_attribution(), 'boundary': audit_boundary(), 'length': audit_length(), 'fairness': audit_fairness(), 'metrics': audit_metrics(), 'tuning': audit_tuning(), 'simple_baseline': audit_simple_baseline(), 'hypotheses': audit_hypotheses(), 'methodology': audit_methodology(), 'single_factor': audit_single_factor(), 'design_preflight': audit_design_preflight(), 'failures': audit_failures(), 'budget': audit_budget(), 'training_health': audit_training_health(), 'efficiency_pairs': audit_efficiency_pairs(), 'release': audit_release_readiness(), 'selection': audit_selection(), 'run_order': audit_run_order()}
+    res = {'generated_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'source_tree': audit_source_integrity(), 'dependencies': audit_dependencies(), 'data_source': audit_data_source(), 'leakage': audit_leakage(), 'split_discipline': audit_split_discipline(), 'document_unit': audit_document_unit(), 'sample_design': audit_sample_design(), 'attribution': audit_attribution(), 'boundary': audit_boundary(), 'length': audit_length(), 'fairness': audit_fairness(), 'metrics': audit_metrics(), 'tuning': audit_tuning(), 'simple_baseline': audit_simple_baseline(), 'hypotheses': audit_hypotheses(), 'sesoi': audit_sesoi_declaration(), 'methodology': audit_methodology(), 'single_factor': audit_single_factor(), 'design_preflight': audit_design_preflight(), 'failures': audit_failures(), 'budget': audit_budget(), 'training_health': audit_training_health(), 'efficiency_pairs': audit_efficiency_pairs(), 'release': audit_release_readiness(), 'selection': audit_selection(), 'run_order': audit_run_order()}
     L_atomic = None
     try:
         L = _import_exp_lib()
@@ -5138,7 +5209,7 @@ def run_report(out='audit_report.json'):
 
 
 if __name__ == '__main__':
-    _cmds = {'leakage': audit_leakage, 'split': audit_split_discipline, 'split_discipline': audit_split_discipline, 'document_unit': audit_document_unit, 'unit': audit_document_unit, 'sample_design': audit_sample_design, 'sampling': audit_sample_design, 'sample': audit_sample_design, 'causality': audit_causality, 'attribution': audit_attribution, 'boundary': audit_boundary, 'length': audit_length, 'fairness': audit_fairness, 'metrics': audit_metrics, 'tuning': audit_tuning, 'simple': audit_simple_baseline, 'baseline_floor': audit_simple_baseline, 'baseline_plan': audit_baseline_design, 'hypothesis_coverage': audit_hypothesis_coverage, 'hypotheses': audit_hypotheses, 'methodology': audit_methodology, 'single_factor': audit_single_factor, 'design': audit_design_preflight, 'design_preflight': audit_design_preflight, 'failures': audit_failures, 'budget': audit_budget, 'efficiency': audit_efficiency_demo, 'efficiency_pairs': audit_efficiency_pairs, 'training_health': audit_training_health, 'selection': audit_selection, 'release': audit_release_readiness, 'run_order': audit_run_order, 'source': audit_source_integrity, 'source_tree': audit_source_integrity, 'dependencies': audit_dependencies, 'dependency': audit_dependencies, 'data_source': audit_data_source, 'dataset_source': audit_data_source, 'report': run_report}
+    _cmds = {'leakage': audit_leakage, 'split': audit_split_discipline, 'split_discipline': audit_split_discipline, 'document_unit': audit_document_unit, 'unit': audit_document_unit, 'sample_design': audit_sample_design, 'sampling': audit_sample_design, 'sample': audit_sample_design, 'causality': audit_causality, 'attribution': audit_attribution, 'boundary': audit_boundary, 'length': audit_length, 'fairness': audit_fairness, 'metrics': audit_metrics, 'tuning': audit_tuning, 'simple': audit_simple_baseline, 'baseline_floor': audit_simple_baseline, 'baseline_plan': audit_baseline_design, 'hypothesis_coverage': audit_hypothesis_coverage, 'hypotheses': audit_hypotheses, 'sesoi': audit_sesoi_declaration, 'methodology': audit_methodology, 'single_factor': audit_single_factor, 'design': audit_design_preflight, 'design_preflight': audit_design_preflight, 'failures': audit_failures, 'budget': audit_budget, 'efficiency': audit_efficiency_demo, 'efficiency_pairs': audit_efficiency_pairs, 'training_health': audit_training_health, 'selection': audit_selection, 'release': audit_release_readiness, 'run_order': audit_run_order, 'source': audit_source_integrity, 'source_tree': audit_source_integrity, 'dependencies': audit_dependencies, 'dependency': audit_dependencies, 'data_source': audit_data_source, 'dataset_source': audit_data_source, 'report': run_report}
     _arg = sys.argv[1] if len(sys.argv) > 1 else 'report'
     if _arg in ('-h', '--help'):
         print(__doc__)

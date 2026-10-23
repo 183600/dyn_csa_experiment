@@ -3321,3 +3321,116 @@ L159 覆盖：只选整篇文章、返回行索引与文章组完全一致、无
 L160 覆盖：prefix 块标 warning 且 claims 为 false、prefix 上过度声称判
 fail、合法 stratified 计划通过、少于 64 单位时 population claim 判 fail、
 test 块只读 metadata 且 `raw_coverage=not_applicable`。
+
+## 56. 消融要判「实际等价/可删」，不能把不显著当成零（本轮方法硬化）
+
+### 56.1 问题：显著性检验不能回答「模块能不能删」
+
+§19/§25 的门槛解决的是「有没有可检出的差异」：`verified` 要求受控、
+Holm 校正后 p<α 且效应大于种子噪声。它没有、也不能回答消融真正要问的
+第二个问题：
+
+> 去掉这个模块后，PPL 的变化是否小到可以认为它**实际**不重要？
+
+旧审计把没有校正显著性的对照放进 `measured` / `noise_level` /
+`resolution_limited`，这三个标签都不是「等价」。审稿人或下游读者很容易
+把 `noise_level` 读成「模块无用」，但 n=3–6 的符号翻转检验本来就没有
+足够分辨率排除一个中等效应；这正是 §49.4 点名的剩余边界。反过来，大 n
+下一个 0.05% 的 PPL 差异也可能显著，把它算成「模块有用」同样是把统计
+显著性误当成实际重要性。**两种错误方向都需要一个预先固定的最小实际
+效应量（SESOI）和等价性检验，而不是继续加一句「不显著不代表无差异」。**
+
+### 56.2 设计：预注册 relative SESOI + 配对 TOST + 族校正
+
+`ABLATION_SESOI` 为 `ABLATION_DESIGN` 的每个组件声明一个相对 margin
+（默认 1% of the without-arm PPL）和 rationale。对**尚未看结果的新面板**，
+这是预注册；对已经跑完的探索性面板，这是本轮分析开始前固定的 convention
+（不是事后从结果反推），并且仍不升级为确认性证据。margin 是**相对
+without 臂主终点 PPL 的百分比**，不是从观察到的种子方差反推的——后者会让
+噪声大的面板更容易「等价」，正好把不确定性变成结论。相对 margin 在每条
+对照上换算为绝对 PPL 边界：
+
+```
+margin_ppl = without_arm_ppl * relative_pct / 100
+```
+
+对逐种子配对差 Δ = with − without（PPL，负 = 模块有用）同时做两件事：
+
+1. **优越性**：沿用 §19 的受控配对、精确符号翻转与 Holm；只有
+   `significant_global` 且 `|Δ| > margin_ppl` 才算 `superior`；
+2. **等价性**：`tost_paired(deltas, margin_ppl, conf=1-2α)` 的两个单边
+   检验都通过，且 TOST p 经同一 Holm 族校正后仍 < α，才算 `equivalent`。
+   TOST 的 p 取两个单边 p 的最大值，再对声明族做 Holm——交集-并集检验
+   下这是保守且可复核的做法。
+
+判定优先级（`ablation_practical_decision`）：
+
+| decision | 含义 |
+|---|---|
+| `superior` | 校正后显著、方向符合声明、幅度 > SESOI，且不由单个种子翻转 |
+| `inferior` | 校正后显著、方向相反、幅度 > SESOI（真正的有害/反向证据） |
+| `sub_sesoi` | 统计上可检出，但 abs(Δ) ≤ SESOI（大 n 的微小差异；不算实际有用） |
+| `equivalent` | 没有显著差异 **且** TOST 区间整体落在 ±SESOI 内、族校正后 p<α |
+| `seed_driven_improvement` | 显著且 >SESOI，但去掉一个种子会翻转均值方向；不升级为实际结论 |
+| `detectable_difference` | 方向未声明（`direction=0`）时的显著差异，只报区间 |
+| `indeterminate` / `underpowered` / `no_data` / `not_declared` | 数据或设计不足以判「有用」或「可删」，不得写成 null |
+
+`equivalent` 与「不显著」的区别是硬门：没有 TOST 通过，绝不产生
+`equivalent`；没有预注册 margin，连判定入口都不开（`not_declared`）。
+
+### 56.3 接入 `methodology_audit`
+
+- 新增 `methodology_audit(..., sesoi=None)`：`None` 用 `ABLATION_SESOI`，
+  传 `{}` 显式关闭，传 mapping 则覆盖（仍受同一校验）。
+- 每条受控对照的 `entry['sesoi']` 记录 margin、TOST p/CI、族校正 p、
+  `decision`/`claim`/`reason`；`entry['practical_decision']` 供分类器使用。
+- `_classify_group_status` 只在**声明了 margin** 时收紧：
+  - 显著但全部 `sub_sesoi` → `sub_sesoi`，不进 `verified`；
+  - 显著但存在非 `superior` 的实际判定 → `practically_indeterminate`；
+  - 全部 `equivalent` → `equivalent`，不再落入 `noise_level`；
+  - 未声明 SESOI 的自定义设计保持旧行为，避免破坏历史面板。
+- 报告新增顶层 `sesoi` 块与
+  `practically_useful_components` / `equivalent_components` /
+  `sub_sesoi_components` / `practically_harmful_components` /
+  `practically_inconclusive_components`，并把 `equivalent`、`sub_sesoi`
+  与 `verified` 分开打印。
+- `audit_gates.py sesoi` 在设计期检查：每个 `ABLATION_DESIGN` 组件都有
+  margin、单位唯一、有限且 >0、能换算成正 PPL 边界、没有拼错组件名、且
+  声明的留一对照在 `RUN_ABL` 中完整排程。缺声明直接 `fail`。
+
+### 56.4 边界
+
+- 只作用于探索性消融面板；**不改** `confirmation_frozen*.json`、冻结臂/
+  种子/终点/α/Holm 族或决策规则，也不改任何训练/评测数值路径。
+- 对历史面板，1% 是现在固定下来、用于重新阅读旧结果的 convention，**不是**
+  当年第一次 test 访问前写下的预注册；因此它不能把探索性证据升级为
+  确认性。真正的确认性 SESOI 必须在首次 test 读取前进入冻结清单。
+- 1% 是本研究对架构级消融预先采用的 convention；具体面板可在**看结果前**
+  用 `sesoi=` 传入更小/更大的 margin，但必须记录 rationale。它不是从数据
+  估计的，也不能在看到 `p` 后调整。
+- TOST 用配对 t 区间（与 `tost_paired` 的既有假设一致），不是精确符号
+  翻转的等价版本；它在小 n 下偏保守/依赖近似，因此 `n<min_n` 一律
+  `underpowered`，且 `equivalent` 仍要求族校正后 p<α。
+- `equivalent` 的结论是「在该 SESOI 下实际可删」，不是「总体严格零」；
+  报告必须同时给出 margin、TOST CI、Holm p 与 n，不能只写「无显著差异」。
+- **组件级「可删」要求完整消融**：如果某组件只测了声明对照的一部分，即使
+  已测的那条 TOST 等价，也只标为描述性/不确定，不能把部分消融升级为
+  「整个模块可删」。`_classify_group_status` 的 `equivalent` 分支因此额外
+  要求所有声明对照都在场。
+- `sub_sesoi` 不是「模块无用」：它只说明效应小于预先声明的实际重要性
+  阈值；若研究问题关心更小效应，应换一个**预先注册**的更小 margin。
+
+### 56.5 入口与验证
+
+```bash
+python test_review_fixes.py          # L169 判定原语；L170 审计分级；L171 声明门
+python audit_gates.py sesoi          # 零 GPU：SESOI 声明 + 排程完整性
+python audit_gates.py report         # 汇总里新增 sesoi
+```
+
+L169 覆盖：等价/亚 SESOI/反向有害/未声明/欠功效、相对 margin 换算、零
+baseline、畸形声明 fail-closed。L170 覆盖：2% 效应仍 `verified`；0.2%
+可检出效应被降为 `sub_sesoi` 且不进 `verified`；精确零效应成为
+`equivalent`（不是 null）；反向 1.6% 成为 `harmful`；`sesoi={}` 恢复旧
+行为；未测声明对照仍占 Holm 槽位。L171 覆盖：缺组件、零/NaN margin、
+拼错组件名都在设计期被发现。

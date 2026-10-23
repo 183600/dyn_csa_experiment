@@ -287,6 +287,7 @@ phase 只读 train/valid。首次 test split 评估之后禁止追加冻结比�
 python audit_gates.py causality   # 纯 CPU 单元审计：前缀不变性 / 标签移位 / 解码一致性
 python audit_gates.py leakage     # 分词器来源 / 词表一致性 / train-test 文档重叠
 python audit_gates.py single_factor  # 定义点单因素门：每条声明对照的臂配置 diff 恰等于声明的干预键集；开放块矩阵只沿声明轴变化；冻结清单的 mechanism_claim_allowed 标志与实际 cfg diff 对账
+python audit_gates.py sesoi       # 设计期门：每个消融组件都有合法已声明 SESOI，且声明对照完整排程
 python audit_gates.py report      # 运行本地可核验的全部审计 -> audit_report.json
 python archive_release.py plan v13 --dirs results_lm_test analysis_v12   # 证据归档 dry-run
 ```
@@ -366,3 +367,12 @@ python build_report.py        # 从产物重建 REPORT_v7.md（零 GPU）
   对齐同时成立才判单因素；True 标志挂上非单因素比较直接 refuse。HCA 动态
   臂的 comp_lambda_mult=4 与 block_size（inert）差异首次写进对照声明
   （详见 docs/design_notes.md §37）。
+- **消融的实际显著性**：每个声明组件新增 SESOI（默认相对 PPL 1%；只用于
+  探索性面板；历史面板是分析前固定的 convention，不是当年预注册），
+  用配对 TOST + 族校正等价 p 判定「实际有用 / 实际可删 / 亚 SESOI /
+  有害 / 不确定」。**不显著**绝不会在没有 TOST 的情况下被改写成「可删」；
+  显著但小于 SESOI 的结果是 `sub_sesoi`，不再进入 `verified`；TOST 区间
+  整体落在 margin 内、且该组件的声明对照全部在场，才是 `equivalent`
+  （可删的正证据）；部分消融只作描述性读数。`audit_gates.py
+  sesoi` 对「缺 margin / 未完整排程」fail-closed。该层只约束探索性消融，
+  不改冻结确认清单（详见 docs/design_notes.md §56）。

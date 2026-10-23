@@ -14400,6 +14400,273 @@ def tost_paired(deltas, margin, conf=0.90):
     return out
 
 
+# ---- 消融的实际显著性：预注册 SESOI + 配对 TOST ---------------------------
+# 显著性检验回答「能否排除零」，等价性检验回答「能否把效应限定在一个实际
+# 可忽略的区间内」。消融的「模块可删/模块无用」主张属于后者，不能由
+# p>=alpha 推出。下面的函数只看已经算好的逐种子配对差，不替调用方选 margin：
+# margin 必须来自预注册（面板级或 ABLATION_SESOI），单位与 Δ 相同（PPL）。
+
+def _normalise_sesoi_design(spec):
+    """Validate a {component: margin spec} mapping; fail closed on ambiguity.
+
+    A spec is either a positive number (interpreted as relative percent of the
+    without-module PPL) or a mapping with exactly one of ``relative_pct`` /
+    ``absolute_ppl``.  Booleans, zero, negative, NaN/inf and a spec carrying
+    both units are rejected instead of being coerced: a malformed SESOI would
+    silently change which ablation claims are allowed.
+    """
+    if spec is None:
+        return {}
+    if not isinstance(spec, dict):
+        raise ValueError(f'SESOI must be a mapping component -> margin spec, got {type(spec).__name__}')
+    out = {}
+    for comp, raw in spec.items():
+        if not isinstance(comp, str) or not comp.strip():
+            raise ValueError(f'SESOI component names must be non-empty strings, got {comp!r}')
+        if isinstance(raw, dict):
+            # A normalised spec carries both keys with one of them None; only
+            # actual values count as declared units.
+            units = [k for k in ('relative_pct', 'absolute_ppl', 'absolute')
+                     if k in raw and raw[k] is not None]
+            if len(units) != 1:
+                raise ValueError(
+                    f'SESOI[{comp!r}] must declare exactly one of relative_pct / '
+                    f'absolute_ppl, got {sorted(units)}')
+            unit = units[0]
+            value = raw[unit]
+        elif isinstance(raw, (int, float, np.integer, np.floating)) and not isinstance(raw, (bool, np.bool_)):
+            unit, value = 'relative_pct', raw
+        else:
+            raise ValueError(
+                f'SESOI[{comp!r}] must be a positive number or a mapping, got {raw!r}')
+        if isinstance(value, (bool, np.bool_)):
+            raise ValueError(f'SESOI[{comp!r}] must not be a boolean, got {value!r}')
+        try:
+            value = float(value)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(f'SESOI[{comp!r}] margin is not a real number: {raw!r}') from None
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError(f'SESOI[{comp!r}] margin must be finite and >0, got {value!r}')
+        out[comp] = {
+            'relative_pct': (value if unit == 'relative_pct' else None),
+            'absolute_ppl': (value if unit != 'relative_pct' else None),
+            'rationale': (str(raw.get('rationale') or '') if isinstance(raw, dict) else ''),
+        }
+    return out
+
+
+def _sesoi_margin_ppl(spec, baseline_ppl):
+    """Translate one normalised SESOI spec into an absolute PPL margin.
+
+    Returns ``(margin, reason)``.  A relative margin needs a finite positive
+    baseline PPL; without it the margin is unavailable, not silently zero.
+    """
+    if not isinstance(spec, dict):
+        return None, 'no SESOI declared'
+    rel = spec.get('relative_pct')
+    absolute = spec.get('absolute_ppl')
+    if rel is not None:
+        base = _finite_scalar(baseline_ppl)
+        if base is None or base <= 0.0:
+            return None, 'relative SESOI needs a finite positive without-arm PPL'
+        margin = float(base) * float(rel) / 100.0
+    elif absolute is not None:
+        margin = float(absolute)
+    else:
+        return None, 'SESOI spec carries no margin'
+    if not math.isfinite(margin) or margin <= 0.0:
+        return None, f'computed margin is not finite/positive ({margin!r})'
+    return float(margin), ''
+
+
+def _practical_decision_from_stats(stats, tost, *, margin, direction, alpha, min_n,
+                                   p_holm_tost=None):
+    """Combine superiority + equivalence into one practical ablation verdict.
+
+    ``direction`` is the sign of the improvement on the Δ scale: -1 for PPL
+    (with-module minus without-module, lower is better), +1 if higher is
+    better, 0 when the claim has no direction.  Superiority needs a
+    family-corrected significant effect above the margin; equivalence needs
+    the TOST interval inside the margin AND the Holm-adjusted TOST p below
+    alpha.  A significant effect smaller than the margin is explicitly
+    ``sub_sesoi`` — detectable, but too small to support a practical claim.
+    """
+    n = _as_seed_int(stats.get('n'))
+    n = 0 if n is None or n < 0 else n
+    mean = _finite_scalar(stats.get('mean'))
+    out = {
+        'n': n, 'mean': mean, 'margin': float(margin),
+        'margin_ppl': float(margin),
+        'p_floor': stats.get('p_floor'), 'n_nonzero': stats.get('n_nonzero'),
+        'p_floor_scope': 'exact sign-flip superiority test (not TOST)',
+        'alpha': float(alpha), 'min_n': int(min_n), 'direction': int(direction),
+        'tost_p_tost': (tost or {}).get('p_tost'),
+        'tost_p_holm': p_holm_tost,
+        'tost_ci': (tost or {}).get('ci'),
+        'tost_equivalent': bool((tost or {}).get('equivalent')),
+        'decision': 'indeterminate', 'claim': 'inconclusive', 'reason': '',
+        'statistically_significant': bool(stats.get('significant')),
+        'seed_driven': stats.get('seed_driven'),
+        'practical_significant': False,
+    }
+    if n == 0 or mean is None:
+        out['decision'] = 'no_data'
+        out['claim'] = 'no_data'
+        out['reason'] = 'no finite paired difference'
+        return out
+    if n < int(min_n):
+        out['decision'] = 'underpowered'
+        out['claim'] = 'underpowered'
+        out['reason'] = f'n={n} < min_n={int(min_n)}; neither a difference nor equivalence is decidable'
+        return out
+    sig = bool(stats.get('significant'))
+    abs_mean = abs(float(mean))
+    if sig:
+        if abs_mean <= float(margin):
+            out['decision'] = 'sub_sesoi'
+            out['claim'] = 'detectable_but_below_sesoi'
+            out['reason'] = ('statistically detectable but |Δ| <= pre-registered SESOI; '
+                             'not a practically meaningful module contribution')
+            out['practical_significant'] = False
+        elif int(direction) == 0:
+            out['decision'] = 'detectable_difference'
+            out['claim'] = 'detectable_difference'
+            out['reason'] = 'no directional claim was declared; report the interval only'
+            out['practical_significant'] = False
+        elif float(mean) * float(direction) > 0.0:
+            if stats.get('seed_driven') is True:
+                out['decision'] = 'seed_driven_improvement'
+                out['claim'] = 'inconclusive_seed_driven'
+                out['reason'] = ('the significant improvement is above the SESOI but '
+                                 'dropping one seed flips the mean sign; not stable enough '
+                                 'for a practical claim')
+            else:
+                out['decision'] = 'superior'
+                out['claim'] = 'module_useful'
+                out['reason'] = ('family-corrected significant improvement larger than the '
+                                 'pre-registered SESOI')
+                out['practical_significant'] = True
+        else:
+            out['decision'] = 'inferior'
+            out['claim'] = 'module_harmful'
+            out['reason'] = ('family-corrected significant effect opposite to the declared '
+                             'improvement direction and larger than the SESOI')
+            out['practical_significant'] = True
+        return out
+    # No superiority.  Equivalence is the only route to "removable"; a
+    # non-significant result alone is NOT enough.  A malformed family p is
+    # fail-closed (cannot certify equivalence) instead of crashing the audit.
+    _ph = None
+    if p_holm_tost is not None:
+        try:
+            _ph = (None if isinstance(p_holm_tost, (bool, np.bool_))
+                   else float(p_holm_tost))
+        except (TypeError, ValueError, OverflowError):
+            _ph = None
+        if _ph is not None and not (math.isfinite(_ph) and 0.0 <= _ph <= 1.0):
+            _ph = None
+        if _ph is None:
+            out['reason'] = ('the supplied family-adjusted TOST p is malformed; '
+                             'equivalence cannot be certified')
+            return out
+    _holm_ok = (_ph is None) or (_ph < float(alpha))
+    if bool((tost or {}).get('equivalent')) and _holm_ok:
+        out['decision'] = 'equivalent'
+        out['claim'] = 'module_removable_within_sesoi'
+        out['reason'] = ('the TOST interval lies inside ±SESOI and the (Holm-adjusted) '
+                         'equivalence p is below alpha; this is evidence of practical '
+                         'removability, not a failed significance test')
+        return out
+    if _ph is not None and _ph >= float(alpha):
+        out['reason'] = ('the raw TOST may be inside the margin, but the family-adjusted '
+                         'equivalence p does not clear alpha')
+    else:
+        out['reason'] = ('neither a significant improvement nor an equivalence interval '
+                         'inside the SESOI; the data are inconclusive')
+    return out
+
+
+def ablation_practical_decision(deltas, *, margin=None, sesoi=None, baseline_ppl=None,
+                                alpha=0.05, min_n=3, direction=-1,
+                                p_holm_tost=None, label='contrast'):
+    """Adjudicate one ablation contrast as useful / removable / harmful / unclear.
+
+    Parameters
+    ----------
+    deltas : per-seed paired ``with - without`` effects on the primary metric
+        (for PPL, negative means the module helps).
+    margin : absolute SESOI in the same units as ``deltas``.  Preferred when
+        the caller already fixed the margin.
+    sesoi : alternatively a normalised/raw SESOI spec used with
+        ``baseline_ppl`` to derive the margin (see ``_normalise_sesoi_design``).
+    direction : sign of a practically better effect (-1 for PPL, +1 for
+        accuracy, 0 for a non-directional claim).
+    p_holm_tost : optional family-adjusted TOST p; when supplied, equivalence
+        requires it to be below ``alpha``.
+
+    Returns a machine-readable dict.  ``decision`` is one of
+    ``superior`` / ``inferior`` / ``sub_sesoi`` / ``detectable_difference`` /
+    ``seed_driven_improvement`` / ``equivalent`` / ``indeterminate`` /
+    ``underpowered`` / ``no_data`` / ``not_declared``.
+    """
+    alpha = _validated_alpha(alpha, context='ablation_practical_decision alpha')
+    _min_n = _as_seed_int(min_n)
+    if _min_n is None or _min_n < 0:
+        raise ValueError(f'min_n must be a non-negative integer, got {min_n!r}')
+    min_n = _min_n
+    if isinstance(direction, (bool, np.bool_)):
+        raise ValueError(f'direction must be -1, 0 or +1, got {direction!r}')
+    try:
+        direction = int(direction)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f'direction must be -1, 0 or +1, got {direction!r}') from None
+    if direction not in (-1, 0, 1):
+        raise ValueError(f'direction must be -1, 0 or +1, got {direction!r}')
+    stats = paired_effect_stats(deltas, alpha=alpha, min_n=min_n)
+    if margin is None:
+        if sesoi is None:
+            return {'n': int(stats.get('n') or 0), 'mean': stats.get('mean'),
+                    'margin': None, 'margin_ppl': None, 'decision': 'not_declared',
+                    'claim': 'not_declared',
+                    'reason': 'no pre-registered SESOI was supplied',
+                    'p_floor': stats.get('p_floor'),
+                    'tost_p_tost': None, 'tost_p_holm': p_holm_tost,
+                    'tost_ci': None, 'tost_equivalent': None,
+                    'statistically_significant': bool(stats.get('significant')),
+                    'seed_driven': stats.get('seed_driven'),
+                    'practical_significant': False, 'label': str(label)}
+        spec = _normalise_sesoi_design({'__one__': sesoi}).get('__one__')
+        margin, why = _sesoi_margin_ppl(spec, baseline_ppl)
+        if margin is None:
+            return {'n': int(stats.get('n') or 0), 'mean': stats.get('mean'),
+                    'margin': None, 'margin_ppl': None, 'decision': 'not_declared',
+                    'claim': 'not_declared', 'reason': why,
+                    'p_floor': stats.get('p_floor'),
+                    'tost_p_tost': None, 'tost_p_holm': p_holm_tost,
+                    'tost_ci': None, 'tost_equivalent': None,
+                    'statistically_significant': bool(stats.get('significant')),
+                    'seed_driven': stats.get('seed_driven'),
+                    'practical_significant': False, 'label': str(label)}
+    if isinstance(margin, (bool, np.bool_)):
+        raise ValueError(f'margin must be a positive real number, got {margin!r}')
+    try:
+        margin = float(margin)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f'margin must be a positive real number, got {margin!r}') from None
+    if not math.isfinite(margin) or margin <= 0.0:
+        raise ValueError(f'margin must be finite and >0, got {margin!r}')
+    # Use the same alpha for superiority and the two one-sided TOST tests.
+    tost = tost_paired(deltas, margin, conf=1.0 - 2.0 * alpha)
+    out = _practical_decision_from_stats(
+        stats, tost, margin=margin, direction=direction, alpha=alpha,
+        min_n=min_n, p_holm_tost=p_holm_tost)
+    out.update({'label': str(label), 'baseline_ppl': baseline_ppl,
+                'relative_margin_pct': (100.0 * margin / float(baseline_ppl)
+                                        if _finite_scalar(baseline_ppl) not in (None, 0.0)
+                                        else None)})
+    return out
+
+
 # ---- 跨规模推断（scale ladder）：相对效应、异质性、趋势 ---------------------
 # 动机：把 d=128 与 d=512 的「绝对 PPL 差」直接相减，会把基线 PPL 本身的
 # 规模差异混进效应里（PPL 不是跨规模可加的）。跨规模的比较必须先转成
@@ -16718,6 +16985,55 @@ ABLATION_DESIGN = {
     'hybrid_hierarchy': [
         ('hybrid_csa_dyn', 'csa_dynamic', 'CSA+HCA hybrid vs CSA-only (dynamic blocking)'),
     ],
+}
+
+# ---- 预先注册的最小实际效应量（SESOI）------------------------------------
+# 「不显著」不是「等价」：精确符号翻转检验不能证明模块可以删掉，只能说明
+# 当前种子数下没有检出差异。反过来，大 n 下一个 0.05% 的 PPL 差异也可以
+# 「显著」，却不构成「模块有用」的实际证据。消融要回答的是**实际**问题，
+# 因此每条声明对照都需要一个在看结果之前就固定的最小实际效应量（SESOI），
+# 用配对 TOST 把「等价/可删」与「不确定」分开。
+#
+# 这里的 margin 是**相对于 without 臂主终点 PPL 的百分比**，不是用观察到的
+# 种子方差反推的（后者会让噪声大的面板更容易「等价」）。1% 是本研究对
+# 架构级消融预先采用的实际显著性阈值：PPL 改善小于 1% 时，相对训练配方、
+# 评测切片和实现细节的差异不足以支撑「该模块有用/无用」的强主张。它不是
+# 冻结确认清单的一部分（confirmatory manifest 不动），只约束探索性消融的
+# **措辞与决策**；具体面板可以传入更小/更大的已声明 margin，但不能在看到
+# 结果后改。`audit_gates.py sesoi` 把「每个声明组件都有 margin」变成门。
+ABLATION_SESOI = {
+    'dynamic_blocking': {
+        'relative_pct': 1.0,
+        'rationale': 'A boundary-policy change must move PPL by >=1% to be treated as practically useful; smaller shifts are within the study\'s recipe/evaluation variation.',
+    },
+    'learned_selection': {
+        'relative_pct': 1.0,
+        'rationale': 'Learned top-k selection is only practically useful if it beats the equal-budget random control by >=1% PPL.',
+    },
+    'content_pooling': {
+        'relative_pct': 1.0,
+        'rationale': 'Pooled block content must change PPL by >=1% versus zero-content blocks to support a content-pooling claim.',
+    },
+    'attention_sink': {
+        'relative_pct': 1.0,
+        'rationale': 'A sink contribution below 1% PPL is treated as practically removable at this study scale.',
+    },
+    'compression_regularizer': {
+        'relative_pct': 1.0,
+        'rationale': 'The compression loss term must deliver >=1% PPL to justify its extra tuning surface.',
+    },
+    'task_learned_boundary': {
+        'relative_pct': 1.0,
+        'rationale': 'The task-learned cut policy must beat the threshold gate by >=1% PPL to justify the score-function machinery.',
+    },
+    'local_fusion': {
+        'relative_pct': 1.0,
+        'rationale': 'The learned fusion convolution must move PPL by >=1% versus identity fusion to be practically relevant.',
+    },
+    'hybrid_hierarchy': {
+        'relative_pct': 1.0,
+        'rationale': 'The CSA+HCA hierarchy must beat CSA-only by >=1% PPL to support a complementary-layer claim.',
+    },
 }
 
 # 主方法 vs 参数对齐基线的对比也属于「受控对比」：它回答的是方法本身是否
@@ -26546,7 +26862,8 @@ def _sign_of(x):
         return -1
     return 0
 
-def _classify_group_status(entries, *, min_n, alpha, m_family, require_param_match=False):
+def _classify_group_status(entries, *, min_n, alpha, m_family, require_param_match=False,
+                           n_declared=None):
     """One status per declared innovation / baseline claim.
 
     verified            — a controlled, capacity-controlled (total plus the
@@ -26571,6 +26888,17 @@ def _classify_group_status(entries, *, min_n, alpha, m_family, require_param_mat
                           isolated mechanism;
     measured            — a controlled contrast exists with n >= min_n, but no
                           corrected significance;
+    equivalent          — no corrected significance, BUT every SESOI-declared
+                          powered contrast is TOST-equivalent inside its
+                          pre-registered margin after family adjustment.  This
+                          is positive evidence of practical removability, not a
+                          failed significance test;
+    sub_sesoi           — corrected significance exists, but the effect is
+                          smaller than the pre-registered SESOI: detectable,
+                          not practically meaningful;
+    practically_indeterminate — significant (or seed-driven) effect whose
+                          practical verdict is neither clearly above the SESOI
+                          nor equivalent; do not call it verified;
     resolution_limited  — a controlled, non-noise contrast exists whose
                           family-corrected exact-test p floor is still above
                           alpha at this n (add seeds; never read as a null);
@@ -26608,7 +26936,35 @@ def _classify_group_status(entries, *, min_n, alpha, m_family, require_param_mat
         # audit already computes finally has a consumer.
         if all(e.get('mechanism_claim_allowed') is False for e in sig):
             return 'system_level_only'
+        # A statistically significant effect can still be smaller than the
+        # pre-registered SESOI, or be dominated by one seed.  `verified`
+        # requires the *practical* verdict `superior` whenever a SESOI was
+        # declared; without a declared margin the historical behaviour is kept.
+        _prac = [e for e in sig
+                 if (e.get('sesoi') or {}).get('margin_ppl') is not None]
+        # Only tighten when EVERY significant contrast has a declared margin;
+        # a mixed custom design keeps the historical statistical-only verdict
+        # rather than gating on an arbitrary subset.
+        if _prac and len(_prac) == len(sig):
+            _dec = [e.get('practical_decision') for e in _prac]
+            if _dec and all(d == 'sub_sesoi' for d in _dec):
+                return 'sub_sesoi'
+            if any(d == 'inferior' for d in _dec):
+                return 'direction_conflict'
+            if any(d != 'superior' for d in _dec):
+                return 'practically_indeterminate'
         return 'verified'
+    _sesoi_powered = [e for e in powered
+                      if (e.get('sesoi') or {}).get('margin_ppl') is not None]
+    # "The component is removable" is a component-level claim: it needs the
+    # whole declared ablation, not one convenient contrast.  Equivalence on a
+    # partial panel stays descriptive instead of becoming `equivalent`.
+    _all_declared_measured = (n_declared is None or len(usable) >= int(n_declared))
+    if (_sesoi_powered and len(_sesoi_powered) == len(powered)
+            and _all_declared_measured
+            and all(e.get('practical_decision') == 'equivalent'
+                    for e in _sesoi_powered)):
+        return 'equivalent'
     noise_free = [e for e in powered if not e.get('within_seed_noise')]
     if not noise_free:
         return 'noise_level'
@@ -26623,6 +26979,90 @@ def _classify_group_status(entries, *, min_n, alpha, m_family, require_param_mat
         if math.isfinite(fl) and fl > alpha:
             return 'resolution_limited'
     return 'noise_level'
+
+def _apply_sesoi_holm(component_entries, component_design, baseline_entries,
+                      baseline_design, specs, *, alpha, min_n):
+    """Family-adjust TOST p-values and refresh every practical decision.
+
+    The SESOI family is the set of *declared* contrasts belonging to components
+    with a pre-registered margin.  Missing/unmeasured contrasts occupy a dummy
+    p=1 slot, exactly like the superiority family, so an incomplete panel
+    cannot buy a smaller correction burden.  The two one-sided TOST p-values
+    are summarised by their max, and Holm is applied to that conservative
+    p-value — adequate for intersection-union equivalence tests.
+    """
+    groups = (('component', component_entries, component_design),
+              ('baseline', baseline_entries, baseline_design))
+    named, by_name = [], {}
+    declared = 0
+    for kind, entries_by_comp, design_group in groups:
+        for comp, contrasts in (design_group or {}).items():
+            if comp not in specs:
+                continue
+            declared += len(contrasts)
+            for j, e in enumerate((entries_by_comp or {}).get(comp) or []):
+                s = e.get('sesoi') or {}
+                if s.get('margin_ppl') is None:
+                    continue
+                name = f'{kind}::{comp}::{j}'
+                named.append((name, s.get('tost_p_tost')))
+                by_name[name] = e
+    if not named:
+        return {'m': 0, 'declared_contrasts': int(declared), 'n_measured': 0,
+                'min_attainable_p_holm': None,
+                'note': 'no measured contrast carries a pre-registered SESOI'}
+    m = max(int(declared), len(named))
+    padded = list(named)
+    padded.extend((f'__sesoi_declared_missing_{i}', 1.0)
+                  for i in range(m - len(named)))
+    holm = holm_adjust(padded, alpha=alpha)
+    for name, e in by_name.items():
+        s = e['sesoi']
+        ph = (holm.get(name) or {}).get('p_holm')
+        if ph is None:
+            # An invalid/unavailable TOST p cannot certify equivalence; keep
+            # the family slot at p=1 (fail closed) rather than skipping the
+            # correction and letting a raw TOST pass.
+            ph = 1.0
+        stats2 = {
+            'n': s.get('n'), 'mean': s.get('mean'),
+            # Prefer the family-corrected verdict attached by the caller.
+            'significant': (e.get('significant_global')
+                            if e.get('significant_global') is not None
+                            else s.get('statistically_significant')),
+            'seed_driven': s.get('seed_driven'),
+        }
+        tost2 = {
+            'p_tost': s.get('tost_p_tost'),
+            'equivalent': s.get('tost_equivalent'),
+            'ci': s.get('tost_ci'),
+        }
+        new = _practical_decision_from_stats(
+            stats2, tost2, margin=float(s['margin']),
+            direction=int(s.get('direction', -1)), alpha=alpha,
+            min_n=int(s.get('min_n', min_n)), p_holm_tost=ph)
+        new['declared'] = True
+        new['source'] = s.get('source')
+        new['p_floor'] = s.get('p_floor')
+        new['p_floor_scope'] = s.get('p_floor_scope')
+        new['n_nonzero'] = s.get('n_nonzero')
+        new['statistically_significant_raw'] = s.get('statistically_significant')
+        new['p_holm_global'] = e.get('p_holm_global')
+        e['sesoi'] = new
+        e['practical_decision'] = new['decision']
+    return {
+        'm': int(m),
+        'declared_contrasts': int(declared),
+        'n_measured': len(named),
+        # TOST is a t-approximation: unlike the exact sign-flip test it has no
+        # 2/2**n resolution floor, so reporting a sign-flip floor here would
+        # wrongly suggest that equivalence is impossible at small n.  The
+        # superiority floor remains in `report['family']`.
+        'min_attainable_p_holm': None,
+        'method': ('Holm step-down over the declared SESOI contrasts; TOST p is '
+                   'max(one-sided p), missing declared contrasts keep p=1; '
+                   'equivalence has no exact-sign-flip resolution floor'),
+    }
 
 def _scope_design(design, present):
     """Keep only claims this panel actually tests: a component enters the
@@ -27017,7 +27457,7 @@ def methodology_seed_plan(n_seeds, design=None, baselines=None, alpha=0.05, vari
             'ablation_complete': _ablation.get('complete'),
             'note': 'a panel below the minimum is DESCRIPTIVE ONLY: the exact-test resolution floor, not the observed effect, bounds its p value'}
 
-def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n=3, outdir=None, write=True, verbose=True):
+def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n=3, outdir=None, write=True, verbose=True, sesoi=None):
     """Zero-GPU audit of controlled comparison, ablation completeness and
     statistical reliability for one panel's `summary` dict.
 
@@ -27032,11 +27472,20 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
     family.  A missing arm does NOT shrink the family (dummy p=1 entries keep
     the declared m), so an incomplete ablation cannot buy a lower p.  A
     component is `verified` only when a controlled contrast is significant
-    AFTER that correction and its effect exceeds seed noise; merely having
+    AFTER that correction and its effect exceeds seed noise (and, when a SESOI
+    is declared for it, the practical decision is `superior`); merely having
     n>=min_n is reported as `measured` (descriptive), never as verification.
     Per-component Holm results are also exported, because the report-facing
     claim is usually per innovation, while the global correction is the
     conservative cross-component reading.
+
+    ``sesoi`` is the pre-registered smallest effect size of interest mapping
+    (default: :data:`ABLATION_SESOI`; pass ``{}`` to disable).  For every
+    component with a declared margin, a paired TOST classifies the contrast as
+    ``superior`` / ``inferior`` / ``sub_sesoi`` / ``equivalent`` /
+    indeterminate.  A non-significant result is never re-labelled equivalent
+    without TOST, and a statistically significant effect below the margin is
+    not counted as practically useful.
 
     Returns the report dict and, when `outdir` is given, writes
     `methodology_audit.json`."""
@@ -27045,6 +27494,7 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
     if _min_n is None or _min_n < 0:
         raise ValueError(f'min_n must be a non-negative integer, got {min_n!r}')
     min_n = _min_n
+    _sesoi_specs = _normalise_sesoi_design(ABLATION_SESOI if sesoi is None else sesoi)
     default_design = design is None
     design = ABLATION_DESIGN if design is None else design
     _summary_type = None
@@ -27073,6 +27523,12 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
               'resolution_limited_components': [], 'underpowered_components': [],
               'noise_level_components': [], 'unverified_components': [],
               'system_level_only_components': [],
+              'equivalent_components': [], 'sub_sesoi_components': [],
+              'practically_indeterminate_components': [],
+              'practically_useful_components': [],
+              'practically_harmful_components': [],
+              'practically_inconclusive_components': [],
+              'sesoi': {},
               'direction_conflict_components': [], 'hypotheses_missing': [],
               'verified_baselines': [], 'measured_baselines': [],
               'significant_baselines': [], 'nominally_significant_baselines': [],
@@ -27237,6 +27693,30 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                                 % (comp, a, b, 'unverifiable' if _param_capacity_ok is None else 'capacity differs'))
                     st['paired_row_bootstrap_delta'] = paired_row_bootstrap_delta(
                         [(recs[(a, ts, s)], recs[(b, bs, s)]) for s in _passed])
+                    # Practical significance: a non-significant contrast is not
+                    # evidence of equivalence, and a significant contrast
+                    # smaller than the pre-registered SESOI is not a practical
+                    # module contribution.  Only measured pairs with a declared
+                    # margin enter this layer.
+                    if deltas and comp in _sesoi_specs:
+                        _margin, _why = _sesoi_margin_ppl(_sesoi_specs[comp], _b_mean)
+                        if _margin is None:
+                            st['sesoi'] = {
+                                'declared': True, 'margin_ppl': None,
+                                'decision': 'not_declared', 'claim': 'not_declared',
+                                'reason': _why, 'source': _sesoi_specs[comp],
+                            }
+                            st['practical_decision'] = 'not_declared'
+                        else:
+                            _dir = _pred if _pred in (-1, 0, 1) else -1
+                            _pd = ablation_practical_decision(
+                                deltas, margin=_margin, alpha=alpha, min_n=min_n,
+                                direction=_dir,
+                                label=f'{comp}: {a} - {b}')
+                            _pd['declared'] = True
+                            _pd['source'] = _sesoi_specs[comp]
+                            st['sesoi'] = _pd
+                            st['practical_decision'] = _pd['decision']
                     entries.append(st)
                     if deltas:
                         _contrast_measured = True
@@ -27418,6 +27898,13 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
         _ph = e.get('p_holm_global')
         e['significant_global'] = bool(_ph is not None and float(_ph) < alpha and (not e.get('within_seed_noise')) and e.get('controlled'))
         e['significant_family'] = e['significant_global']
+    # Practical decisions must use the SAME family-corrected superiority
+    # verdict as the rest of the audit, not the raw sign-flip p.  Run this
+    # after `significant_global` is attached so a nominally significant but
+    # Holm-non-significant contrast cannot be called practically useful.
+    _sesoi_family = _apply_sesoi_holm(
+        comp_entries, _scoped_design, base_entries, _scoped_baselines,
+        _sesoi_specs, alpha=alpha, min_n=min_n)
     report['family'] = {
         'name': ('ABLATION_DESIGN+BASELINE_DESIGN' if _scoped_baselines else 'ABLATION_DESIGN') + ' (exploratory; not pre-registered)',
         'declared_contrasts': int(declared_m),
@@ -27428,7 +27915,8 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
     }
 
     def _publish(group_name, design_group, entries_by_comp, meta, kind, require_param_match):
-        status_names = ('verified', 'system_level_only', 'direction_conflict', 'direction_unspecified', 'measured',
+        status_names = ('verified', 'system_level_only', 'direction_conflict', 'direction_unspecified',
+                        'equivalent', 'sub_sesoi', 'practically_indeterminate', 'measured',
                         'significant', 'nominally_significant', 'resolution_limited',
                         'underpowered', 'noise_level', 'unverified')
         lists = {s: [] for s in status_names}
@@ -27442,7 +27930,8 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                 _phc = e.get('p_holm_component')
                 e['significant_component'] = bool(_phc is not None and float(_phc) < alpha and (not e.get('within_seed_noise')) and e.get('controlled'))
             status = _classify_group_status(entries, min_n=min_n, alpha=alpha, m_family=m_family,
-                                            require_param_match=require_param_match)
+                                            require_param_match=require_param_match,
+                                            n_declared=len(contrasts))
             lists[status].append(comp)
             if status == 'verified':
                 # `verified` is the corrected-significance tier; keep the
@@ -27509,6 +27998,127 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
 
     _publish('components', design, comp_entries, comp_meta, 'component', require_param_match=False)
     _publish('baselines', baselines, base_entries, base_meta, 'baseline', require_param_match=True)
+
+    # ---- SESOI / practical-equivalence summary ---------------------------
+    # Per component this is the decision the ablation actually needs:
+    # useful (above SESOI), removable (TOST inside SESOI), harmful, or
+    # inconclusive.  A `measured`/`noise_level` superiority status is NOT
+    # silently upgraded to equivalence here.
+    _sesoi_components = {}
+    _sesoi_lists = {'useful': [], 'equivalent': [], 'sub_sesoi': [],
+                    'harmful': [], 'inconclusive': [], 'not_measured': [],
+                    'not_declared': []}
+    for _group in ('components', 'baselines'):
+        for _comp, _entries in (report.get(_group) or {}).items():
+            if _comp not in _sesoi_specs:
+                continue
+            _measured = [e for e in _entries
+                         if (e.get('sesoi') or {}).get('margin_ppl') is not None]
+            _dec = [e.get('practical_decision') for e in _measured]
+            if _group == 'components':
+                _comp_complete = bool(
+                    (((report.get('ablation_completeness') or {}).get('components')
+                      or {}).get(_comp) or {}).get('complete'))
+            else:
+                # The completeness audit is component-oriented; for a declared
+                # baseline contrast require every declared baseline pair to be
+                # measured before calling it removable.
+                _n_decl = len((baselines or {}).get(_comp) or [])
+                _comp_complete = bool(_n_decl and len(_measured) >= _n_decl)
+            if not _measured:
+                _status = 'not_measured'
+            elif any(d == 'not_declared' for d in _dec):
+                _status = 'not_declared'
+            elif any(d == 'inferior' for d in _dec):
+                _status = 'harmful'
+            elif any(d == 'superior' for d in _dec):
+                _status = 'useful'
+            elif (_dec and all(d == 'equivalent' for d in _dec)
+                  and _comp_complete):
+                _status = 'equivalent'
+            elif _dec and all(d in ('sub_sesoi', 'equivalent') for d in _dec) \
+                    and any(d == 'sub_sesoi' for d in _dec):
+                _status = 'sub_sesoi'
+            else:
+                _status = 'inconclusive'
+            _sesoi_lists[_status].append(_comp)
+            _sesoi_components[_comp] = {
+                'group': _group,
+                'margin_spec': _sesoi_specs[_comp],
+                'status': _status,
+                'ablation_complete': _comp_complete,
+                'decisions': [{
+                    'with': e.get('with'), 'without': e.get('without'),
+                    'n': (e.get('sesoi') or {}).get('n'),
+                    'mean': (e.get('sesoi') or {}).get('mean'),
+                    'margin_ppl': (e.get('sesoi') or {}).get('margin_ppl'),
+                    'decision': e.get('practical_decision'),
+                    'claim': (e.get('sesoi') or {}).get('claim'),
+                    'p_tost': (e.get('sesoi') or {}).get('tost_p_tost'),
+                    'p_tost_holm': (e.get('sesoi') or {}).get('tost_p_holm'),
+                    'ci_tost': (e.get('sesoi') or {}).get('tost_ci'),
+                    'reason': (e.get('sesoi') or {}).get('reason'),
+                } for e in _measured],
+            }
+            if (_dec and all(d == 'equivalent' for d in _dec)
+                    and not _comp_complete):
+                report['warnings'].append(
+                    '%s: the measured contrast(es) are TOST-equivalent, but the '
+                    'declared ablation is INCOMPLETE — equivalence on a partial '
+                    'panel is descriptive only and cannot support "remove the '
+                    'component"' % _comp)
+            if _status == 'useful' and not _comp_complete:
+                report['warnings'].append(
+                    '%s: at least one contrast is practically useful, but the '
+                    'declared ablation is INCOMPLETE — report this as a '
+                    'contrast-level result, not as "the component is useful" '
+                    'for the whole innovation' % _comp)
+            if _status == 'sub_sesoi':
+                report['warnings'].append(
+                    '%s: the effect is statistically detectable but smaller than the '
+                    'pre-registered SESOI (%.2f%% of the without-arm PPL); do not '
+                    'quote it as a practically useful module contribution'
+                    % (_comp, float(_sesoi_specs[_comp].get('relative_pct') or 0.0)))
+            elif _status == 'equivalent':
+                report['warnings'].append(
+                    '%s: TOST places the ablation effect inside the pre-registered '
+                    'SESOI (%.2f%% of the without-arm PPL) after family adjustment — '
+                    'this is positive evidence of practical removability, not a '
+                    'non-significant null'
+                    % (_comp, float(_sesoi_specs[_comp].get('relative_pct') or 0.0)))
+            elif _status == 'harmful':
+                report['warnings'].append(
+                    '%s: the module-removal contrast is significant and practically '
+                    'HARMFUL in the declared direction (effect larger than the SESOI); '
+                    'the mechanism claim is contradicted, not merely unsupported'
+                    % _comp)
+            elif _status == 'inconclusive':
+                report['warnings'].append(
+                    '%s: neither a practically useful effect (>SESOI) nor TOST '
+                    'equivalence inside the SESOI is established; report it as '
+                    'inconclusive rather than as a null or a win'
+                    % _comp)
+    report['sesoi'] = {
+        'policy': ('pre-registered relative SESOI with paired TOST; exploratory '
+                   'panels only (the frozen confirmatory manifest is unchanged)'),
+        'alpha': float(alpha), 'min_n': int(min_n),
+        'declared_components': sorted(_sesoi_specs),
+        'family': _sesoi_family,
+        'components': _sesoi_components,
+        'useful_components': sorted(_sesoi_lists['useful']),
+        'equivalent_components': sorted(_sesoi_lists['equivalent']),
+        'sub_sesoi_components': sorted(_sesoi_lists['sub_sesoi']),
+        'harmful_components': sorted(_sesoi_lists['harmful']),
+        'inconclusive_components': sorted(_sesoi_lists['inconclusive']),
+        'not_measured_components': sorted(_sesoi_lists['not_measured']),
+        'not_declared_components': sorted(_sesoi_lists['not_declared']),
+    }
+    report['practically_useful_components'] = list(report['sesoi']['useful_components'])
+    report['practically_harmful_components'] = list(report['sesoi']['harmful_components'])
+    report['practically_inconclusive_components'] = sorted(
+        set(report['sesoi']['inconclusive_components'])
+        | set(report['sesoi']['sub_sesoi_components'])
+        | set(report['sesoi']['not_declared_components']))
 
     # A panel is a *complete ablation* only if every declared innovation has
     # its full leave-one-out set AND no declared innovation is entirely
@@ -28270,8 +28880,40 @@ def _print_methodology_audit(report):
                     100.0 * float(e.get('param_rel_diff') or 0.0),
                     ('; ' + ', '.join(_extra)) if _extra else ''))
             print('        %s | %s' % (_c, e['effect_vs_noise']))
+            _pe = e.get('sesoi') or {}
+            if _pe.get('margin_ppl') is not None:
+                print('        practical: %s (|Δ|=%.4f, margin=%.4f PPL; TOST p=%.4g, Holm p=%s) — %s'
+                      % (e.get('practical_decision'), abs(float(_pe.get('mean') or 0.0)),
+                         float(_pe['margin_ppl']), float(_pe.get('tost_p_tost') or float('nan')),
+                         ('%.4g' % float(_pe['tost_p_holm']))
+                         if _pe.get('tost_p_holm') is not None else 'n/a',
+                         _pe.get('reason') or ''))
+    _sesoi = report.get('sesoi') or {}
+    if _sesoi.get('declared_components'):
+        _fam = _sesoi.get('family') or {}
+        print('  SESOI / practical equivalence (pre-registered; m=%s, TOST+Holm, alpha=%g):'
+              % (_fam.get('m'), float(report.get('alpha', 0.05))))
+        if _sesoi.get('useful_components'):
+            print('    practically useful (>SESOI): ' + ', '.join(_sesoi['useful_components']))
+        if _sesoi.get('equivalent_components'):
+            print('    practically removable (TOST inside SESOI; NOT a failed significance test): '
+                  + ', '.join(_sesoi['equivalent_components']))
+        if _sesoi.get('sub_sesoi_components'):
+            print('    detectable but below SESOI: ' + ', '.join(_sesoi['sub_sesoi_components']))
+        if _sesoi.get('harmful_components'):
+            print('    practically HARMFUL (opposite direction, >SESOI): '
+                  + ', '.join(_sesoi['harmful_components']))
+        if _sesoi.get('inconclusive_components'):
+            print('    inconclusive (neither >SESOI nor equivalent): '
+                  + ', '.join(_sesoi['inconclusive_components']))
     if report['verified_components']:
-        print('  verified innovations (controlled AND family-Holm p<alpha AND |Δ|>seed noise): ' + ', '.join(report['verified_components']))
+        print('  verified innovations (controlled AND family-Holm p<alpha AND |Δ|>seed noise AND, when declared, >SESOI): ' + ', '.join(report['verified_components']))
+    if report.get('equivalent_components'):
+        print('  equivalent innovations (TOST inside the pre-registered SESOI after family adjustment): ' + ', '.join(report['equivalent_components']))
+    if report.get('sub_sesoi_components'):
+        print('  sub-SESOI innovations (significant but too small to be practically useful): ' + ', '.join(report['sub_sesoi_components']))
+    if report.get('practically_indeterminate_components'):
+        print('  practically indeterminate (significant/seed-driven but not clearly >SESOI): ' + ', '.join(report['practically_indeterminate_components']))
     if report.get('measured_components'):
         print('  measured innovations (controlled contrast with n>=%d; descriptive unless also verified): ' % int(report.get('min_n', 3)) + ', '.join(report['measured_components']))
     if report.get('nominally_significant_components'):
