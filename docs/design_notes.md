@@ -3672,3 +3672,83 @@ Bonferroni、>16 种子回退、确定性与 malformed 输入 fail-closed。L177
 并 warn、篡改逐 look p 判 fail、缺 audit 块判 warnings、无产物判
 `not_verifiable_locally`。L178 覆盖：朴素显著/序列不显著的降级被审计
 点名，audit 的序列 p 与重算不一致判 fail。
+
+## 59. 2×2 因子交互：相加性不是默认假设
+
+### 59.1 为什么需要
+
+留一（leave-one-out）族回答的是「单独拿掉这个模块会怎样」，不能回答
+「两个模块的收益是否重叠」。完全可能出现：两个模块各自显著有用，但同时
+打开时第二个几乎不再增加收益。把两个单因素结论直接相加，会高估组合收益。
+交互检验把「第二个模块在第一个已开启时是否仍然有用」变成预注册问题。
+
+### 59.2 设计与估计量
+
+只使用 `RUN_ABL` 已经排程的臂，不新增训练预算：
+
+| 交互 | control/control | active/control | control/active | active/active |
+|---|---|---|---|---|
+| dynamic_blocking × learned_selection | `csa_fix_randidx` | `csa_dyn_randidx` | `csa_fixed` | `csa_dynamic` |
+| dynamic_blocking × content_pooling | `csa_fix_zerocont` | `csa_dyn_zerocont` | `csa_fixed` | `csa_dynamic` |
+| dynamic_blocking × attention_sink | `csa_fix_nosink` | `csa_dyn_nosink` | `csa_fixed` | `csa_dynamic` |
+
+每个种子上的估计量是 log PPL 尺度的差之差：
+
+```
+I_s = (logPPL_11 - logPPL_10) - (logPPL_01 - logPPL_00)
+```
+
+正 `I` = 次可加/冗余（第二因子在第一个开启后帮助变小）；负 `I` = 协同。
+log 尺度避免「基线 PPL 更高所以绝对效应更大」的机械放大。三个交互都
+预注册 `predicted_sign=+1`：两个机制被假设为在争夺同一部分块相关性/上下文
+外质量信息，而不是纯粹互补。
+
+### 59.3 为什么只有这三组
+
+`hybrid × dynamic` 被排除：固定层加 HCA 只改 `kind/block_size`，动态层加
+HCA 同时改 `chunking/dynamic/target_block_tokens/comp_lambda_mult`；两条轴
+不是同一组 cfg 改动，交互会把「HCA」与「动态配方」混在一起。只有
+`dynamic_blocking` 对另外三个因子在 fixed/dynamic 两水平的 cfg diff 完全
+相同，2×2 才可识别。
+
+### 59.4 设计点门与记录级门
+
+`factorial_design_audit()`（定义点、零 GPU）检查：
+
+1. 四个 cell 完整、映射到四个不同的臂，且全部在 `RUN_ABL['variants']`；
+2. 每个因子的 control→active AttnCfg diff 在另一因子的 control/active 两个
+   水平上**完全相同**；否则该轴不是并行操纵；
+3. diff 不含 `kind`，且每个键属于 `ABLATION_INTERVENTION_KEYS` 的声明族；
+4. 每个 factorial 都有完整、metric-aligned 的 `INTERACTION_HYPOTHESIS_DESIGN`
+   条目；
+5. 复用 `ablation_completeness_audit(arms_by_combo=...)` 的全因子模式，
+   缺 cell / 重用臂会被精确点名。
+
+`factorial_interaction_audit()`（记录级）对每个种子要求四臂共享 protocol
+tag、通过 `pair_reason` 与 `_hyperparam_reason`、使用同一 primary estimand、
+PPL 有限，然后才计算 `I_s`；被拒的种子逐条列出，不静默取子集平均。
+参数容量不通过时交互仍可报告，但标 `mechanism_claim_allowed=False`。
+
+### 59.5 统计与族隔离
+
+- 对 `I_s` 使用与主审计相同的精确符号翻转检验和种子级 CI；报告
+  `ratio_of_ratios=exp(mean(I))`，而不是把「两次显著性」相互比较。
+- 交互有**独立**的 Holm 族：不进入留一族，不改变 `family.effective_m`，
+  也不改变冻结确认规则。缺失/不可控的 factorial 保留 dummy p=1 槽位，
+  所以缺臂不能缩小校正族来「买」显著。
+- 非显著交互只说明「当前种子数下没检出偏离相加」，不是「效应严格可加」；
+  与主审计一样受精确检验分辨率下限约束。
+
+### 59.6 入口与验证
+
+```bash
+python audit_gates.py factorial        # 定义点：并行操纵/完整性/假设
+python audit_gates.py single_factor    # 同时包含 factorial_design 视图
+python audit_gates.py methodology      # 面板 summary 中的交互族
+python audit_gates.py report           # 汇总新增 factorial / interactions
+python test_review_fixes.py            # L60a/L60b
+```
+
+L60a 覆盖： shipped 三组设计通过、缺 cell / 重用臂 / 非并行轴 / 未排程臂
+fail-closed。L60b 覆盖：常值正/负交互的精确 p、独立族大小、缺 cell 保留
+槽位、run_cfg 不一致丢弃全部种子、容量混淆时禁止机制声明。

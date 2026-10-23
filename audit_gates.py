@@ -3308,8 +3308,9 @@ def audit_hypotheses():
            'tuned_baseline': L.hypothesis_audit(L.TUNED_BASELINE_HYPOTHESIS_DESIGN, 'tuned_baseline'),
            'floor': L.hypothesis_audit(L.FLOOR_HYPOTHESIS_DESIGN, 'floor'),
            'open_block': L.hypothesis_audit(L.OPEN_BLOCK_HYPOTHESIS_DESIGN, 'open_block'),
-           'niah': L.hypothesis_audit(L.NIAH_HYPOTHESIS_DESIGN, 'niah')}
-    if any(out[k]['status'] != 'ok' for k in ('coverage', 'component', 'baseline', 'tuned_baseline', 'floor', 'open_block', 'niah')):
+           'niah': L.hypothesis_audit(L.NIAH_HYPOTHESIS_DESIGN, 'niah'),
+           'interaction': L.hypothesis_audit(L.INTERACTION_HYPOTHESIS_DESIGN, 'interaction')}
+    if any(out[k]['status'] != 'ok' for k in ('coverage', 'component', 'baseline', 'tuned_baseline', 'floor', 'open_block', 'niah', 'interaction')):
         out['status'] = 'warn'
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return out
@@ -3380,6 +3381,12 @@ def audit_methodology(outdirs=None, design=None, alpha=0.05, min_n=3, write=True
             'capacity_confounded_components': sorted(
                 c for c, es in (rep.get('components') or {}).items()
                 if any(e.get('capacity_confounded') for e in es)),
+            'interaction_family': (rep.get('interactions') or {}).get('family'),
+            'interaction_factorials': (rep.get('interactions') or {}).get('factorials'),
+            'significant_interactions': (
+                (rep.get('interactions') or {}).get('significant_interactions')),
+            'interaction_direction_conflicts': (
+                (rep.get('interactions') or {}).get('direction_conflict_interactions')),
             'warnings': rep.get('warnings'),
         }
         out['panels'][d] = _panel
@@ -3437,12 +3444,16 @@ def audit_single_factor(manifest_path=None):
     """
     L = _import_exp_lib()
     out = {'status': 'ok', 'design': {}, 'open_block_matrix': {},
-           'sweep_contrasts': {}, 'v7_contrasts': {}, 'frozen_manifest': {}}
+           'sweep_contrasts': {}, 'v7_contrasts': {}, 'frozen_manifest': {},
+           'factorial_design': {}}
     design_rep = L.single_factor_design_audit(verbose=False)
     out['design'] = design_rep
     ob_rep = L.open_block_matrix_audit(verbose=False)
     out['open_block_matrix'] = ob_rep
-    if design_rep.get('status') != 'ok' or ob_rep.get('status') != 'ok':
+    fact_rep = L.factorial_design_audit()
+    out['factorial_design'] = fact_rep
+    if (design_rep.get('status') != 'ok' or ob_rep.get('status') != 'ok'
+            or fact_rep.get('status') != 'ok'):
         out['status'] = 'fail'
     # v9/v10 attach a `single_factor`/`factors` label to each seq2k paired
     # record.  Verify that label against the actual arm construction instead of
@@ -3554,6 +3565,48 @@ def audit_single_factor(manifest_path=None):
             if (isinstance(out.get('frozen_manifest'), dict)
                     and out['frozen_manifest'].get('status') == 'fail'):
                 out['status'] = 'fail'
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 7e-2) factorial：2x2 交互设计的定义点审计（零 GPU）
+# ---------------------------------------------------------------------------
+
+def audit_factorial_design(manifest_path=None):
+    """2x2 因子交互设计审计（零 GPU、零落盘依赖）。
+
+    复用 `exp_lib.factorial_design_audit`，在定义点核验三组交互：
+      * 四个 cell 完整、臂唯一且已排程；
+      * 每个因子在另一因子的两个水平上做**同一组** AttnCfg 改动
+        （并行操纵；否则交互比较的是两种不同干预）；
+      * 改动键属于该组件的声明干预集，且不交换 `kind`；
+      * 每组交互都有完整、指标对齐的预注册假设。
+
+    这是 `single_factor` 的补集：单因素审计回答「每个臂只动了一个组件吗」，
+    factorial 审计回答「两个组件的 2x2 是否可识别、交互是否可解释」。"""
+    L = _import_exp_lib()
+    out = L.factorial_design_audit()
+    if manifest_path:
+        try:
+            with open(manifest_path, encoding='utf-8') as _f:
+                _man = json.load(_f)
+            out['manifest_arms'] = list(_man.get('arms') or [])
+            _missing = sorted(set(
+                a for rec in (out.get('factorials') or {}).values()
+                for a in (rec.get('cells') or {}).values()
+                if a not in set(out['manifest_arms'])))
+            out['manifest_missing_arms'] = _missing
+            if _missing:
+                out['status'] = 'fail'
+                out['violations'].append(
+                    'factorial arm(s) absent from the frozen manifest: '
+                    + ', '.join(_missing))
+        except Exception as _e:
+            out['status'] = 'fail'
+            out['violations'].append(
+                f'cannot read manifest {manifest_path}: '
+                f'{type(_e).__name__}: {_e}')
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return out
 
@@ -5593,7 +5646,7 @@ def audit_look_history(paths=None):
 
 
 def run_report(out='audit_report.json'):
-    res = {'generated_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'source_tree': audit_source_integrity(), 'dependencies': audit_dependencies(), 'data_source': audit_data_source(), 'leakage': audit_leakage(), 'split_discipline': audit_split_discipline(), 'document_unit': audit_document_unit(), 'sample_design': audit_sample_design(), 'attribution': audit_attribution(), 'boundary': audit_boundary(), 'length': audit_length(), 'fairness': audit_fairness(), 'metrics': audit_metrics(), 'tuning': audit_tuning(), 'simple_baseline': audit_simple_baseline(), 'hypotheses': audit_hypotheses(), 'sesoi': audit_sesoi_declaration(), 'unit_influence': audit_unit_influence(), 'looks': audit_look_history(), 'methodology': audit_methodology(), 'single_factor': audit_single_factor(), 'design_preflight': audit_design_preflight(), 'failures': audit_failures(), 'budget': audit_budget(), 'training_health': audit_training_health(), 'efficiency_pairs': audit_efficiency_pairs(), 'release': audit_release_readiness(), 'selection': audit_selection(), 'run_order': audit_run_order()}
+    res = {'generated_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'source_tree': audit_source_integrity(), 'dependencies': audit_dependencies(), 'data_source': audit_data_source(), 'leakage': audit_leakage(), 'split_discipline': audit_split_discipline(), 'document_unit': audit_document_unit(), 'sample_design': audit_sample_design(), 'attribution': audit_attribution(), 'boundary': audit_boundary(), 'length': audit_length(), 'fairness': audit_fairness(), 'metrics': audit_metrics(), 'tuning': audit_tuning(), 'simple_baseline': audit_simple_baseline(), 'hypotheses': audit_hypotheses(), 'sesoi': audit_sesoi_declaration(), 'unit_influence': audit_unit_influence(), 'looks': audit_look_history(), 'methodology': audit_methodology(), 'single_factor': audit_single_factor(), 'factorial': audit_factorial_design(), 'design_preflight': audit_design_preflight(), 'failures': audit_failures(), 'budget': audit_budget(), 'training_health': audit_training_health(), 'efficiency_pairs': audit_efficiency_pairs(), 'release': audit_release_readiness(), 'selection': audit_selection(), 'run_order': audit_run_order()}
     L_atomic = None
     try:
         L = _import_exp_lib()
@@ -5613,7 +5666,7 @@ def run_report(out='audit_report.json'):
 
 
 if __name__ == '__main__':
-    _cmds = {'leakage': audit_leakage, 'split': audit_split_discipline, 'split_discipline': audit_split_discipline, 'document_unit': audit_document_unit, 'unit': audit_document_unit, 'sample_design': audit_sample_design, 'sampling': audit_sample_design, 'sample': audit_sample_design, 'causality': audit_causality, 'attribution': audit_attribution, 'boundary': audit_boundary, 'length': audit_length, 'fairness': audit_fairness, 'metrics': audit_metrics, 'tuning': audit_tuning, 'simple': audit_simple_baseline, 'baseline_floor': audit_simple_baseline, 'baseline_plan': audit_baseline_design, 'hypothesis_coverage': audit_hypothesis_coverage, 'hypotheses': audit_hypotheses, 'sesoi': audit_sesoi_declaration, 'unit_influence': audit_unit_influence, 'influence': audit_unit_influence, 'looks': audit_look_history, 'look_history': audit_look_history, 'methodology': audit_methodology, 'single_factor': audit_single_factor, 'design': audit_design_preflight, 'design_preflight': audit_design_preflight, 'failures': audit_failures, 'budget': audit_budget, 'efficiency': audit_efficiency_demo, 'efficiency_pairs': audit_efficiency_pairs, 'training_health': audit_training_health, 'selection': audit_selection, 'release': audit_release_readiness, 'run_order': audit_run_order, 'source': audit_source_integrity, 'source_tree': audit_source_integrity, 'dependencies': audit_dependencies, 'dependency': audit_dependencies, 'data_source': audit_data_source, 'dataset_source': audit_data_source, 'report': run_report}
+    _cmds = {'leakage': audit_leakage, 'split': audit_split_discipline, 'split_discipline': audit_split_discipline, 'document_unit': audit_document_unit, 'unit': audit_document_unit, 'sample_design': audit_sample_design, 'sampling': audit_sample_design, 'sample': audit_sample_design, 'causality': audit_causality, 'attribution': audit_attribution, 'boundary': audit_boundary, 'length': audit_length, 'fairness': audit_fairness, 'metrics': audit_metrics, 'tuning': audit_tuning, 'simple': audit_simple_baseline, 'baseline_floor': audit_simple_baseline, 'baseline_plan': audit_baseline_design, 'hypothesis_coverage': audit_hypothesis_coverage, 'hypotheses': audit_hypotheses, 'sesoi': audit_sesoi_declaration, 'unit_influence': audit_unit_influence, 'influence': audit_unit_influence, 'looks': audit_look_history, 'look_history': audit_look_history, 'methodology': audit_methodology, 'single_factor': audit_single_factor, 'factorial': audit_factorial_design, 'factorial_design': audit_factorial_design, 'design': audit_design_preflight, 'design_preflight': audit_design_preflight, 'failures': audit_failures, 'budget': audit_budget, 'efficiency': audit_efficiency_demo, 'efficiency_pairs': audit_efficiency_pairs, 'training_health': audit_training_health, 'selection': audit_selection, 'release': audit_release_readiness, 'run_order': audit_run_order, 'source': audit_source_integrity, 'source_tree': audit_source_integrity, 'dependencies': audit_dependencies, 'dependency': audit_dependencies, 'data_source': audit_data_source, 'dataset_source': audit_data_source, 'report': run_report}
     _arg = sys.argv[1] if len(sys.argv) > 1 else 'report'
     if _arg in ('-h', '--help'):
         print(__doc__)

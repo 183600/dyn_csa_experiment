@@ -17759,6 +17759,75 @@ ABLATION_DESIGN = {
     ],
 }
 
+# ---- 2x2 factorial interaction design (comparative / ablation science) ----
+# A leave-one-out family answers "does the module help on its own".  It cannot
+# answer whether two modules overlap: a second module can help alone while
+# adding little once the first is already present.  These 2x2 factorials use
+# arms that RUN_ABL already schedules, so the interaction is measured on the
+# same seeds/data/recipe without a new training run.  Cell keys are
+# (factor1 level, factor2 level), both oriented control -> active:
+#
+#   interaction = (log PPL_11 - log PPL_10)
+#               - (log PPL_01 - log PPL_00)
+#
+# i.e. the effect of factor2 when factor1 is active minus its effect when
+# factor1 is at the control level.  Both simple effects are expected to be
+# negative (the active level lowers PPL), so a POSITIVE interaction means the
+# two interventions are sub-additive / redundant and a NEGATIVE one means
+# synergy.  The log scale makes the contrast a ratio of ratios and prevents a
+# higher baseline PPL from mechanically producing a larger absolute effect.
+#
+# Interactions are exploratory: they get their own declared Holm family and
+# never enter the frozen confirmatory or the leave-one-out correction family.
+_FACTORIAL_CELL_KEYS = (('control', 'control'), ('active', 'control'),
+                        ('control', 'active'), ('active', 'active'))
+FACTORIAL_DESIGN = {
+    'dynamic_blocking_x_learned_selection': {
+        'factors': ('dynamic_blocking', 'learned_selection'),
+        'levels': {'dynamic_blocking': ('fixed', 'dynamic'),
+                   'learned_selection': ('random', 'learned')},
+        'cells': {
+            ('control', 'control'): 'csa_fix_randidx',
+            ('active', 'control'): 'csa_dyn_randidx',
+            ('control', 'active'): 'csa_fixed',
+            ('active', 'active'): 'csa_dynamic',
+        },
+        'hypothesis': 'dynamic_blocking_x_learned_selection',
+        'note': ('Does learned selection still help once adaptive boundaries are '
+                 'present, or do both mechanisms chase the same block-relevance '
+                 'signal?'),
+    },
+    'dynamic_blocking_x_content_pooling': {
+        'factors': ('dynamic_blocking', 'content_pooling'),
+        'levels': {'dynamic_blocking': ('fixed', 'dynamic'),
+                   'content_pooling': ('zero_content', 'pooled_content')},
+        'cells': {
+            ('control', 'control'): 'csa_fix_zerocont',
+            ('active', 'control'): 'csa_dyn_zerocont',
+            ('control', 'active'): 'csa_fixed',
+            ('active', 'active'): 'csa_dynamic',
+        },
+        'hypothesis': 'dynamic_blocking_x_content_pooling',
+        'note': ('Adaptive boundaries produce more homogeneous blocks; does '
+                 'pooled block content still add as much as it does under fixed '
+                 'blocks?'),
+    },
+    'dynamic_blocking_x_attention_sink': {
+        'factors': ('dynamic_blocking', 'attention_sink'),
+        'levels': {'dynamic_blocking': ('fixed', 'dynamic'),
+                   'attention_sink': ('no_sink', 'sink')},
+        'cells': {
+            ('control', 'control'): 'csa_fix_nosink',
+            ('active', 'control'): 'csa_dyn_nosink',
+            ('control', 'active'): 'csa_fixed',
+            ('active', 'active'): 'csa_dynamic',
+        },
+        'hypothesis': 'dynamic_blocking_x_attention_sink',
+        'note': ('Both a sink and adaptive blocks can absorb off-context mass; '
+                 'the interaction asks whether their benefits overlap.'),
+    },
+}
+
 # ---- 预先注册的最小实际效应量（SESOI）------------------------------------
 # 「不显著」不是「等价」：精确符号翻转检验不能证明模块可以删掉，只能说明
 # 当前种子数下没有检出差异。反过来，大 n 下一个 0.05% 的 PPL 差异也可以
@@ -20221,6 +20290,57 @@ HYPOTHESIS_DESIGN = {
         'metric_policy': 'lm_perplexity',
         'requires_param_match': True,
         'falsifier': 'The hybrid matches or loses to CSA-only after Holm correction.',
+    },
+}
+
+INTERACTION_HYPOTHESIS_DESIGN = {
+    'dynamic_blocking_x_learned_selection': {
+        'statement': ('The log-PPL benefit of learned top-k selection is smaller '
+                      'when dynamic blocking is active than when blocking is '
+                      'fixed (positive sub-additive interaction).'),
+        'mechanism': ('Adaptive boundaries and learned selection both determine '
+                      'which blocks are informative; improving one reduces the '
+                      'marginal value of the other.'),
+        'predicted_sign': 1,
+        'primary_metric': 'ppl',
+        'metric_policy': 'lm_perplexity',
+        'requires_param_match': True,
+        'falsifier': ('The interaction is not distinguishable from zero after the '
+                      'declared interaction-family Holm correction, its sign is '
+                      'negative (synergy), or the four cells fail the capacity/'
+                      'recipe controls.'),
+    },
+    'dynamic_blocking_x_content_pooling': {
+        'statement': ('The log-PPL benefit of pooled block content is smaller '
+                      'under dynamic blocking than under fixed blocking '
+                      '(positive sub-additive interaction).'),
+        'mechanism': ('Adaptive cuts make blocks more internally homogeneous, '
+                      'so the information lost by collapsing a block into one '
+                      'summary is smaller than under fixed blocks.'),
+        'predicted_sign': 1,
+        'primary_metric': 'ppl',
+        'metric_policy': 'lm_perplexity',
+        'requires_param_match': True,
+        'falsifier': ('The interaction is not distinguishable from zero after the '
+                      'declared interaction-family Holm correction, its sign is '
+                      'negative (synergy), or the four cells fail the capacity/'
+                      'recipe controls.'),
+    },
+    'dynamic_blocking_x_attention_sink': {
+        'statement': ('The log-PPL benefit of the attention sink is smaller under '
+                      'dynamic blocking than under fixed blocking (positive '
+                      'sub-additive interaction).'),
+        'mechanism': ('A sink and adaptive block reads both provide an outlet '
+                      'for off-context probability mass; once one is present the '
+                      'other has less unattributed mass to absorb.'),
+        'predicted_sign': 1,
+        'primary_metric': 'ppl',
+        'metric_policy': 'lm_perplexity',
+        'requires_param_match': True,
+        'falsifier': ('The interaction is not distinguishable from zero after the '
+                      'declared interaction-family Holm correction, its sign is '
+                      'negative (synergy), or the four cells fail the capacity/'
+                      'recipe controls.'),
     },
 }
 
@@ -28619,6 +28739,471 @@ def methodology_seed_plan(n_seeds, design=None, baselines=None, alpha=0.05, vari
             'ablation_complete': _ablation.get('complete'),
             'note': 'a panel below the minimum is DESCRIPTIVE ONLY: the exact-test resolution floor, not the observed effect, bounds its p value'}
 
+def factorial_design_audit(design=None, present=None, factory=None):
+    """Zero-GPU gate for the declared 2x2 ablation interactions.
+
+    A factorial is only interpretable when the two factors are manipulated in
+    a *parallel* way at both levels of the other factor.  This audit constructs
+    every cell through the real arm factory and verifies:
+
+      * all four (control/control, active/control, control/active,
+        active/active) cells exist, use distinct arms, and are scheduled;
+      * the ``control -> active`` AttnCfg diff of each factor is IDENTICAL at
+        the other factor's control and active levels (otherwise the two cells
+        compare different interventions and the interaction is not identified);
+      * the factor diff stays inside the declared intervention family for that
+        component and never swaps ``kind`` (an architecture change);
+      * every factorial has a complete pre-registered interaction hypothesis.
+
+    The full-factorial completeness mode of
+    :func:`ablation_completeness_audit` is reused, so a missing or reused cell
+    is reported with its exact combination.  Returns a report dict; ``status``
+    is ``'ok'`` only when no violation was found.
+    """
+    design = FACTORIAL_DESIGN if design is None else design
+    factory = make_layer_cfgs if factory is None else factory
+    present_set = set(RUN_ABL['variants']) if present is None else set(present)
+    report = {'kind': 'factorial_design', 'status': 'ok', 'n_layers': 6,
+              'factorials': {}, 'violations': [], 'warnings': []}
+    if not isinstance(design, dict) or not design:
+        report['violations'].append(
+            f'factorial design must be a non-empty mapping, got {type(design).__name__}')
+        report['status'] = 'fail'
+        return report
+    for name, spec in design.items():
+        rec = {'factors': None, 'cells': {}, 'complete': False,
+               'missing_cells': [], 'extra_cells': [], 'missing_arms': [],
+               'factor_diffs': {}, 'hypothesis': None, 'hypothesis_audit': None,
+               'full_factorial': None}
+        report['factorials'][str(name)] = rec
+        _ok = True
+
+        def _bad(msg):
+            nonlocal _ok
+            _ok = False
+            report['violations'].append(f'{name}: {msg}')
+
+        if not isinstance(spec, dict):
+            _bad(f'declaration must be a mapping, got {type(spec).__name__}')
+            continue
+        factors = spec.get('factors')
+        cells = spec.get('cells')
+        if (not isinstance(factors, (list, tuple)) or len(factors) != 2
+                or not all(isinstance(f, str) and f.strip() for f in factors)
+                or factors[0].strip() == factors[1].strip()):
+            _bad('factors must be two distinct non-empty component names')
+            continue
+        factors = tuple(f.strip() for f in factors)
+        rec['factors'] = list(factors)
+        if not isinstance(cells, dict):
+            _bad(f'cells must be a mapping, got {type(cells).__name__}')
+            continue
+        norm_cells = {}
+        for key, arm in cells.items():
+            if (not isinstance(key, (tuple, list)) or len(key) != 2
+                    or any(k not in ('control', 'active') for k in key)):
+                _bad(f'cell key {key!r} must be (control|active, control|active)')
+                continue
+            if not isinstance(arm, str) or not arm.strip():
+                _bad(f'cell {tuple(key)!r} has an invalid arm id {arm!r}')
+                continue
+            norm_cells[tuple(key)] = arm.strip()
+        rec['cells'] = {f'{k[0]}|{k[1]}': v for k, v in norm_cells.items()}
+        missing = [list(k) for k in _FACTORIAL_CELL_KEYS if k not in norm_cells]
+        extra = [list(k) for k in norm_cells if k not in _FACTORIAL_CELL_KEYS]
+        rec['missing_cells'] = missing
+        rec['extra_cells'] = extra
+        if missing:
+            _bad('missing 2x2 cell(s): ' + json.dumps(missing))
+        if extra:
+            _bad('undeclared cell(s) outside the 2x2 design: ' + json.dumps(extra))
+        if set(norm_cells) != set(_FACTORIAL_CELL_KEYS):
+            continue
+        arms = [norm_cells[k] for k in _FACTORIAL_CELL_KEYS]
+        if len(set(arms)) != len(arms):
+            _bad('the four cells must map to four distinct arm ids')
+        missing_arms = sorted(set(arms) - present_set)
+        rec['missing_arms'] = missing_arms
+        if missing_arms:
+            _bad('arm(s) not scheduled in the canonical ablation panel: '
+                 + ', '.join(missing_arms))
+
+        combos = {
+            (): norm_cells[('control', 'control')],
+            (factors[0],): norm_cells[('active', 'control')],
+            (factors[1],): norm_cells[('control', 'active')],
+            tuple(sorted(factors)): norm_cells[('active', 'active')],
+        }
+        abl = ablation_completeness_audit(arms_by_combo=combos, present=present_set)
+        rec['full_factorial'] = {
+            'complete': bool(abl.get('complete')),
+            'n_mapped': int(abl.get('n_mapped') or 0),
+            'missing_combos': abl.get('missing_combos') or [],
+            'reused_arms': abl.get('reused_arms') or {},
+        }
+        if not abl.get('complete'):
+            _bad('full-factorial completeness failed: '
+                 + json.dumps({k: rec['full_factorial'][k] for k in
+                               ('missing_combos', 'reused_arms')},
+                              ensure_ascii=False))
+
+        for fi, factor in enumerate(factors):
+            if fi == 0:
+                pairs = ((norm_cells[('active', 'control')],
+                          norm_cells[('control', 'control')]),
+                         (norm_cells[('active', 'active')],
+                          norm_cells[('control', 'active')]))
+            else:
+                pairs = ((norm_cells[('control', 'active')],
+                          norm_cells[('control', 'control')]),
+                         (norm_cells[('active', 'active')],
+                          norm_cells[('active', 'control')]))
+            keys = []
+            for a, b in pairs:
+                _k, _per = _design_pair_cfg_keys(a, b, factory, report['n_layers'])
+                if isinstance(_k, Exception):
+                    _bad(f'{factor}: cannot construct the {a} vs {b} contrast '
+                         f'({type(_k).__name__}: {_k})')
+                    _k = []
+                keys.append(tuple(_k))
+            rec['factor_diffs'][factor] = {
+                'at_other_control': list(keys[0]),
+                'at_other_active': list(keys[1]),
+            }
+            if keys[0] != keys[1]:
+                _bad(f'{factor}: the intervention is not parallel across the '
+                     f'other factor\'s levels ({list(keys[0])} vs {list(keys[1])}); '
+                     'the interaction would compare two different manipulations')
+            union = set(keys[0]) | set(keys[1])
+            if 'kind' in union:
+                _bad(f'{factor}: changing the attention-kind field makes this '
+                     'an architecture swap, not a 2x2 factor')
+            allowed = set()
+            _decl = ABLATION_INTERVENTION_KEYS.get(factor, {})
+            if isinstance(_decl, dict):
+                for _kset in _decl.values():
+                    allowed.update(_kset)
+            extra_keys = sorted(union - allowed)
+            if extra_keys:
+                _bad(f'{factor}: undeclared AttnCfg key(s) move with the factor: '
+                     + ', '.join(extra_keys))
+
+        hname = str(spec.get('hypothesis') or name)
+        rec['hypothesis'] = hname
+        hyp = INTERACTION_HYPOTHESIS_DESIGN.get(hname)
+        if not isinstance(hyp, dict):
+            _bad(f'no pre-registered interaction hypothesis named {hname!r}')
+        else:
+            ha = hypothesis_audit({hname: hyp}, 'interaction', names=[hname])
+            rec['hypothesis_audit'] = ha
+            bad_h = (ha.get('invalid') or []) + (ha.get('metric_unknown') or []) + \
+                    (ha.get('metric_misaligned') or [])
+            if bad_h:
+                _bad('interaction hypothesis is malformed or metric-misaligned: '
+                     + ', '.join(str(x) for x in bad_h))
+        rec['complete'] = bool(_ok and not missing and not extra
+                               and not missing_arms)
+    if report['violations']:
+        report['status'] = 'fail'
+    return report
+
+
+def _factorial_condition_rows(recs, cells, *, strict_hyper=True):
+    """Per-seed 2x2 cells with the same controlled-pair gate as the LOO audit.
+
+    All four cells must be present at one protocol tag and one seed; every cell
+    is checked against the (control, control) cell with ``pair_reason`` (and
+    the structured MLP-width gate), the primary estimand must be the same in
+    all four records, and the interaction is formed on log PPL.  Missing or
+    uncontrolled seeds are named, never silently averaged over a subset.
+    """
+    arms = [cells[k] for k in _FACTORIAL_CELL_KEYS]
+    by_arm = {a: {} for a in arms}
+    for (v, t, s), r in recs.items():
+        if v in by_arm:
+            by_arm[v].setdefault(s, {})[str(t or '')] = r
+    if not all(by_arm.values()):
+        return [], [], None
+    common = set.intersection(*[set(d) for d in by_arm.values()])
+    rows, skipped = [], []
+    for s in sorted(common):
+        tagsets = [set(by_arm[a][s]) for a in arms]
+        nonempty = set().union(*[ts - {''} for ts in tagsets])
+        if len(nonempty) > 1:
+            skipped.append({'seed': s, 'reason':
+                            'ambiguous protocol tags across the four cells: '
+                            + ', '.join(sorted(nonempty))})
+            continue
+        tag = next(iter(nonempty)) if nonempty else ''
+        chosen, bad = {}, None
+        for a, ts in zip(arms, tagsets):
+            if tag and tag in ts:
+                chosen[a] = by_arm[a][s][tag]
+            elif '' in ts:
+                chosen[a] = by_arm[a][s]['']
+            else:
+                bad = f'arm {a} has no record for protocol tag {tag!r}'
+                break
+        if bad is not None:
+            skipped.append({'seed': s, 'reason': bad})
+            continue
+        ref = arms[0]
+        reasons = []
+        for a in arms[1:]:
+            reason = pair_reason(chosen[ref], chosen[a])
+            if reason is None and strict_hyper:
+                reason = _hyperparam_reason(chosen[ref], chosen[a])
+            if reason is not None:
+                reasons.append(f'{a}: {reason}')
+        if reasons:
+            skipped.append({'seed': s, 'reason':
+                            'uncontrolled cell(s): ' + '; '.join(reasons)})
+            continue
+        estimands = {chosen[a].get('ppl_estimation_rows') ==
+                     'nested_validation_holdout' for a in arms}
+        if len(estimands) > 1:
+            skipped.append({'seed': s, 'reason':
+                            'the four cells mix nested-holdout and '
+                            'full-validation estimands'})
+            continue
+        ppls, bad = {}, None
+        for a in arms:
+            p = _record_primary_ppl(chosen[a])
+            if p is None:
+                bad = f'arm {a} has no usable primary PPL'
+                break
+            ppls[a] = float(p)
+        if bad is not None:
+            skipped.append({'seed': s, 'reason': bad})
+            continue
+        lp = {a: math.log(ppls[a]) for a in arms}
+        interaction = ((lp[arms[3]] - lp[arms[2]])
+                       - (lp[arms[1]] - lp[arms[0]]))
+        simple = {
+            'factor1_at_factor2_control': lp[arms[1]] - lp[arms[0]],
+            'factor1_at_factor2_active': lp[arms[3]] - lp[arms[2]],
+            'factor2_at_factor1_control': lp[arms[2]] - lp[arms[0]],
+            'factor2_at_factor1_active': lp[arms[3]] - lp[arms[1]],
+        }
+        rows.append({'seed': s, 'tag': tag, 'ppl': ppls,
+                     'log_ppl': lp, 'interaction_log_ppl': interaction,
+                     'simple_log_effects': simple})
+    ref = arms[0]
+    param = {a: _param_control_detail(recs, a, ref) for a in arms[1:]}
+    capacity = [_param_capacity_controlled(d) for d in param.values()]
+    if any(v is False for v in capacity):
+        capacity_controlled = False
+    elif all(v is True for v in capacity):
+        capacity_controlled = True
+    else:
+        capacity_controlled = None
+    return rows, skipped, {'reference': ref,
+                           'by_cell': param,
+                           'capacity_controlled': capacity_controlled}
+
+
+def factorial_interaction_audit(summary=None, design=None, *, alpha=0.05,
+                                min_n=3, recs=None, hypotheses=None):
+    """Paired 2x2 interaction tests for the declared ablation factorials.
+
+    The estimand is the *change* in a paired effect: for each seed,
+    ``(log PPL_11 - log PPL_10) - (log PPL_01 - log PPL_00)``.  A positive
+    value means the second factor adds less when the first is active
+    (sub-additive), a negative value means synergy.  The exact sign-flip test
+    and the seed-level confidence interval therefore operate on the
+    interaction itself, not on a comparison of two separate significance
+    verdicts.
+
+    The interaction family is declared separately and is EXPLORATORY: it never
+    changes the leave-one-out or frozen confirmatory Holm families.  Missing
+    or uncontrolled factorials keep a dummy p=1 slot, so an incomplete 2x2
+    panel cannot shrink the correction and buy significance.
+    """
+    alpha = _validated_alpha(alpha, context='factorial_interaction_audit alpha')
+    _min_n = _as_seed_int(min_n)
+    if _min_n is None or _min_n < 0:
+        raise ValueError(
+            f'factorial_interaction_audit: min_n must be a non-negative integer, got {min_n!r}')
+    min_n = int(_min_n)
+    design = FACTORIAL_DESIGN if design is None else design
+    hypotheses = (INTERACTION_HYPOTHESIS_DESIGN
+                  if hypotheses is None else hypotheses)
+    if not isinstance(design, dict) or not design:
+        return {'kind': 'factorial_interaction', 'status': 'not_applicable',
+                'factorials': {}, 'family': {},
+                'significant_interactions': [],
+                'direction_conflict_interactions': [], 'warnings': [],
+                'note': 'no factorial design is declared'}
+    if recs is None:
+        recs, _amb = _variant_seed_map(summary or {})
+    present = {v for (v, _t, _s) in recs}
+    arm_sets = [set(spec.get('cells', {}).values())
+                for spec in design.values() if isinstance(spec, dict)]
+    shared = set.intersection(*arm_sets) if arm_sets else set()
+    if not (present - shared):
+        return {'kind': 'factorial_interaction', 'status': 'not_applicable',
+                'factorials': {}, 'family': {},
+                'significant_interactions': [],
+                'direction_conflict_interactions': [], 'warnings': [],
+                'note': ('this panel contains none of the factorial-specific '
+                         'arms; no 2x2 interaction is measured here')}
+    out = {'kind': 'factorial_interaction', 'status': 'ok',
+           'alpha': float(alpha), 'min_n': min_n, 'factorials': {},
+           'family': {}, 'significant_interactions': [],
+           'direction_conflict_interactions': [], 'warnings': [],
+           'claim_level': ('exploratory interaction family; never part of the '
+                           'leave-one-out or frozen confirmatory correction'),
+           'note': ('positive interaction = the second factor adds less when the '
+                    'first is active (sub-additive); negative = synergy. A '
+                    'non-significant interaction is not evidence that the '
+                    'effects are additive.')}
+    family = []
+    for name, spec in design.items():
+        if not isinstance(spec, dict):
+            out['warnings'].append(f'{name}: factorial declaration is not a mapping')
+            continue
+        cells = spec.get('cells')
+        factors = spec.get('factors')
+        if not isinstance(cells, dict):
+            out['warnings'].append(f'{name}: cells must be a mapping')
+            continue
+        try:
+            arms = [cells[k] for k in _FACTORIAL_CELL_KEYS]
+        except (KeyError, TypeError):
+            out['warnings'].append(f'{name}: incomplete 2x2 cell declaration')
+            continue
+        if len(set(arms)) != 4:
+            out['warnings'].append(f'{name}: the four cells are not distinct arms')
+            continue
+        present_arms = set(arms) & present
+        if not (present_arms - shared):
+            continue
+        rec = {'factors': list(factors) if isinstance(factors, (list, tuple)) else None,
+               'cells': {f'{k[0]}|{k[1]}': cells[k] for k in _FACTORIAL_CELL_KEYS},
+               'n_present_cells': len(present_arms), 'status': 'incomplete',
+               'interaction': {'available': False}}
+        out['factorials'][str(name)] = rec
+        if len(present_arms) < 4:
+            missing = sorted(set(arms) - present_arms)
+            rec['missing_arms'] = missing
+            rec['interaction']['reason'] = 'missing arm(s): ' + ', '.join(missing)
+            out['warnings'].append(
+                f'{name}: 2x2 interaction is incomplete (missing '
+                + ', '.join(missing) + '); its family slot is kept at p=1')
+            family.append((str(name), 1.0))
+            continue
+        rows, skipped, param = _factorial_condition_rows(recs, cells)
+        rec['n_complete'] = len(rows)
+        rec['seeds'] = [r['seed'] for r in rows]
+        rec['dropped'] = skipped
+        rec['param_control'] = param
+        if not rows:
+            rec['status'] = 'no_data'
+            rec['interaction']['reason'] = (
+                'no seed has four controlled cells with a usable primary PPL')
+            out['warnings'].append(f'{name}: no complete 2x2 seed remains; '
+                                   'its family slot is kept at p=1')
+            family.append((str(name), 1.0))
+            continue
+        st = paired_effect_stats([r['interaction_log_ppl'] for r in rows],
+                                 alpha=alpha, min_n=min_n,
+                                 seeds=[r['seed'] for r in rows])
+        cell = {k: st.get(k) for k in
+                ('n', 'n_input', 'n_dropped', 'dropped_seeds', 'complete_pairs',
+                 'seeds', 'mean', 'std', 'std_defined', 'sem', 'cohens_dz',
+                 'ci95_low', 'ci95_high', 'p_exact_signflip', 'p_floor',
+                 'underpowered', 'resolution_limited', 'within_seed_noise',
+                 'significant', 'effect_vs_noise', 'seed_driven', 'seed_robust')}
+        m = cell.get('mean')
+        if isinstance(m, (int, float)) and math.isfinite(float(m)) and -700.0 < float(m) < 700.0:
+            cell['ratio_of_ratios'] = float(math.exp(float(m)))
+            cell['percent_change'] = float(100.0 * (math.exp(float(m)) - 1.0))
+        else:
+            cell['ratio_of_ratios'] = None
+            cell['percent_change'] = None
+        simple = {}
+        for key in rows[0]['simple_log_effects']:
+            vals = [float(r['simple_log_effects'][key]) for r in rows]
+            mean = float(np.mean(vals))
+            simple[key] = {'mean_log_effect': mean,
+                           'ratio': float(math.exp(mean)) if -700.0 < mean < 700.0 else None,
+                           'n': len(vals),
+                           'role': 'descriptive simple effect (not tested here)'}
+        rec['simple_effects'] = simple
+        hyp = hypotheses.get(str(name)) if isinstance(hypotheses, dict) else None
+        pred = hyp.get('predicted_sign') if isinstance(hyp, dict) else None
+        obs = _sign_of(st.get('mean')) if st.get('n') else None
+        cell.update({
+            'available': True,
+            'definition': ('(log PPL_11 - log PPL_10) - '
+                           '(log PPL_01 - log PPL_00); positive = the second '
+                           'factor adds less when the first is active'),
+            'hypothesis': hyp.get('statement') if isinstance(hyp, dict) else None,
+            'predicted_sign': pred,
+            'observed_sign': obs,
+            'direction_consistent': (None if pred not in (-1, 0, 1) or obs is None
+                                     else (pred == 0 or pred == obs)),
+            'p_holm': None,
+            'significant_family': False,
+            'role': 'exploratory interaction (separate Holm family)',
+        })
+        if param.get('capacity_controlled') is not True:
+            cell['mechanism_claim_allowed'] = False
+            cell['capacity_confound'] = (
+                'unverifiable' if param.get('capacity_controlled') is None
+                else 'parameter/breakdown mismatch')
+            out['warnings'].append(
+                f'{name}: the four cells do not clear the capacity control '
+                f'({cell["capacity_confound"]}); the interaction is reported but '
+                'cannot back a mechanism claim')
+        else:
+            cell['mechanism_claim_allowed'] = True
+        rec['interaction'] = cell
+        rec['status'] = 'ok'
+        family.append((str(name),
+                       float(st['p_exact_signflip'])
+                       if (isinstance(st.get('p_exact_signflip'), (int, float))
+                           and math.isfinite(float(st['p_exact_signflip'])))
+                       else 1.0))
+    if not out['factorials']:
+        out['status'] = 'not_applicable'
+        return out
+    if family:
+        h = holm_adjust(family, alpha=alpha)
+        floors = []
+        for name, _p in family:
+            rec = out['factorials'].get(name) or {}
+            cell = rec.get('interaction') or {}
+            floors.append(cell.get('p_floor') if cell.get('available') else 1.0)
+        out['family'] = {
+            'name': 'declared 2x2 factorial interactions (exploratory; not pre-registered as confirmatory)',
+            'm': len(family),
+            'alpha': float(alpha),
+            'min_seeds_for_family_significance': signflip_min_n_for_holm(len(family), alpha),
+            'min_attainable_p_holm': holm_min_attainable_p_floors(floors, alpha=alpha),
+            'note': ('missing/uncontrolled factorials keep a dummy p=1 slot; '
+                     'this family never changes the leave-one-out or frozen '
+                     'confirmatory correction'),
+        }
+        for name, _p in family:
+            rec = out['factorials'].get(name) or {}
+            cell = rec.get('interaction') or {}
+            if not cell.get('available'):
+                continue
+            cell['p_holm'] = (h.get(name) or {}).get('p_holm')
+            cell['significant_family'] = bool(
+                cell.get('significant')
+                and isinstance(cell.get('p_holm'), (int, float))
+                and float(cell['p_holm']) < alpha)
+            if cell['significant_family']:
+                out['significant_interactions'].append(name)
+                if cell.get('direction_consistent') is False:
+                    out['direction_conflict_interactions'].append(name)
+    if any(rec.get('status') != 'ok' for rec in out['factorials'].values()):
+        out['status'] = 'incomplete'
+    return out
+
+
 def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n=3, outdir=None, write=True, verbose=True, sesoi=None, look_history=None):
     """Zero-GPU audit of controlled comparison, ablation completeness and
     statistical reliability for one panel's `summary` dict.
@@ -29284,6 +29869,13 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
     _sesoi_family = _apply_sesoi_holm(
         comp_entries, _scoped_design, base_entries, _scoped_baselines,
         _sesoi_specs, alpha=alpha, min_n=min_n)
+    # 2x2 interactions are a separate, explicitly exploratory family.  They are
+    # computed from the same controlled-pair records but never enter `m_family`
+    # above, and never alter the frozen/confirmatory verdict.
+    report['interactions'] = factorial_interaction_audit(
+        recs=recs, alpha=alpha, min_n=min_n)
+    for _iw in report['interactions'].get('warnings') or []:
+        report['warnings'].append('interaction: ' + str(_iw))
     report['family'] = {
         'name': ('ABLATION_DESIGN+BASELINE_DESIGN' if _scoped_baselines else 'ABLATION_DESIGN') + ' (exploratory; not pre-registered)',
         'declared_contrasts': int(declared_m),
@@ -30290,6 +30882,33 @@ def _print_methodology_audit(report):
             _state, _tail = 'INCOMPLETE', ' — missing ' + _detail
         print('  ablation completeness (%s): %s%s'
               % (_abl.get('mode'), _state, _tail))
+    _ix = report.get('interactions') or {}
+    if _ix.get('factorials'):
+        _ixf = _ix.get('family') or {}
+        print('  --- 2x2 factorial interactions (log-PPL; exploratory, separate Holm family) ---')
+        print('  interaction family: m=%s, alpha=%g, min attainable p_Holm=%s'
+              % (_ixf.get('m'), float(_ix.get('alpha', 0.05)),
+                 _ixf.get('min_attainable_p_holm')))
+        for _name, _irec in _ix['factorials'].items():
+            _ic = _irec.get('interaction') or {}
+            if not _ic.get('available'):
+                print('    %-42s %s (%s)'
+                      % (_name, _irec.get('status'),
+                         _ic.get('reason') or 'no complete 2x2 panel'))
+                continue
+            _ph = _ic.get('p_holm')
+            print('    %-42s n=%-2d  interaction=%+.4f  ratio=%.4f  p=%s  p_Holm=%s%s'
+                  % (_name, int(_ic.get('n') or 0), float(_ic.get('mean') or 0.0),
+                     float(_ic.get('ratio_of_ratios') or float('nan')),
+                     ('%.4f' % float(_ic['p_exact_signflip']))
+                     if isinstance(_ic.get('p_exact_signflip'), (int, float)) else 'n/a',
+                     ('%.4f' % float(_ph)) if isinstance(_ph, (int, float)) else 'n/a',
+                     '  [SIGN CONFLICT vs pre-registered direction]'
+                     if _name in (_ix.get('direction_conflict_interactions') or []) else ''))
+            print('        predicted sign=%s, observed=%s; %s; mechanism claim allowed=%s'
+                  % (_ic.get('predicted_sign'), _ic.get('observed_sign'),
+                     _ic.get('effect_vs_noise') or 'n<min_n',
+                     _ic.get('mechanism_claim_allowed')))
     if report.get('arm_summary'):
         print('  arm means (mean ± sample std over seeds):')
         for _k, _e in report['arm_summary'].items():

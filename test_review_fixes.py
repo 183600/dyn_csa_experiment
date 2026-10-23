@@ -16032,6 +16032,111 @@ def t_single_factor_audit_rejects_nonobject_manifest():
     assert rep['frozen_manifest']['status'] == 'fail', rep
 
 
+def t_factorial_design_gate_verifies_parallel_cells():
+    import copy
+    rep = L.factorial_design_audit()
+    assert rep['status'] == 'ok', rep['violations']
+    assert set(rep['factorials']) == set(L.FACTORIAL_DESIGN), rep['factorials']
+    for name, rec in rep['factorials'].items():
+        assert rec['complete'] is True, (name, rec)
+        assert rec['full_factorial']['complete'] is True, (name, rec)
+        assert len(rec['cells']) == 4, (name, rec)
+        for factor, diffs in rec['factor_diffs'].items():
+            assert diffs['at_other_control'] == diffs['at_other_active'], (name, factor, diffs)
+            assert 'kind' not in diffs['at_other_control'], (name, factor, diffs)
+    # A cell that changes TWO factors makes one axis non-parallel; the
+    # interaction would then compare different interventions.
+    bad = copy.deepcopy(L.FACTORIAL_DESIGN['dynamic_blocking_x_attention_sink'])
+    bad['cells'][('active', 'active')] = 'csa_dyn_zerocont'
+    rbad = L.factorial_design_audit(
+        {'bad': bad}, present=set(L.RUN_ABL['variants']))
+    assert rbad['status'] == 'fail', rbad
+    assert any('not parallel' in v for v in rbad['violations']), rbad['violations']
+    # Reusing one arm in two cells is not a factorial either.
+    dup = copy.deepcopy(L.FACTORIAL_DESIGN['dynamic_blocking_x_learned_selection'])
+    dup['cells'][('active', 'active')] = dup['cells'][('control', 'control')]
+    rdup = L.factorial_design_audit(
+        {'dup': dup}, present=set(L.RUN_ABL['variants']))
+    assert rdup['status'] == 'fail', rdup
+    assert any('distinct' in v or 'full-factorial' in v for v in rdup['violations']), rdup['violations']
+    # An arm absent from the canonical panel cannot be read as a cell.
+    rmiss = L.factorial_design_audit(
+        present=set(L.RUN_ABL['variants']) - {'csa_dyn_randidx'})
+    assert rmiss['status'] == 'fail', rmiss
+    assert any('not scheduled' in v for v in rmiss['violations']), rmiss['violations']
+
+
+def _factorial_records(interaction, n=7, params=None):
+    arms = [L.FACTORIAL_DESIGN['dynamic_blocking_x_learned_selection']['cells'][k]
+            for k in L._FACTORIAL_CELL_KEYS]
+    knobs = L.training_knobs()
+    params = params or {}
+    recs = {}
+    for s in range(n):
+        base = math.log(50.0) + 0.1 * s
+        levels = {arms[0]: base, arms[1]: base - 0.2, arms[2]: base - 0.1,
+                  arms[3]: base - 0.3 + interaction}
+        for arm in arms:
+            recs[(arm, '', s)] = {
+                'variant': arm, 'protocol': '', 'seed': s,
+                'run_cfg': 'same_cfg', 'ppl': math.exp(levels[arm]),
+                'steps': 100, 'tokens_seen': 1000,
+                'params': int(params.get(arm, 1000)),
+                'train_knobs': knobs,
+            }
+    return recs
+
+
+def t_factorial_interaction_test_is_paired_and_isolated():
+    # The interaction is the seed-level difference of differences; a constant
+    # +0.05 must be detected with the exact sign-flip test, not by comparing
+    # two independent significance verdicts.
+    recs = _factorial_records(0.05)
+    r = L.factorial_interaction_audit(recs=recs)
+    assert r['status'] == 'ok', r
+    fac = r['factorials']['dynamic_blocking_x_learned_selection']
+    it = fac['interaction']
+    assert it['available'] is True and it['n'] == 7, it
+    assert abs(float(it['mean']) - 0.05) < 1e-9, it
+    assert abs(float(it['ratio_of_ratios']) - math.exp(0.05)) < 1e-9, it
+    assert it['significant'] is True, it
+    assert it['p_holm'] == it['p_exact_signflip'], it
+    assert it['direction_consistent'] is True, it
+    assert r['significant_interactions'] == ['dynamic_blocking_x_learned_selection'], r
+    # The interaction family is its own declared family: only the factorial
+    # with arms present is counted; the other two are untouched.
+    assert r['family']['m'] == 1, r['family']
+    # A negative interaction is a real result but contradicts the
+    # pre-registered sub-additive direction; it must not be read as support.
+    neg = L.factorial_interaction_audit(recs=_factorial_records(-0.05))
+    nit = neg['factorials']['dynamic_blocking_x_learned_selection']['interaction']
+    assert nit['significant_family'] is True and nit['direction_consistent'] is False, nit
+    assert neg['direction_conflict_interactions'] == ['dynamic_blocking_x_learned_selection'], neg
+    # Missing one cell keeps the family slot (m=1) but reports no interaction.
+    incomplete = {k: v for k, v in recs.items() if k[0] != 'csa_fix_randidx'}
+    ri = L.factorial_interaction_audit(recs=incomplete)
+    ifac = ri['factorials']['dynamic_blocking_x_learned_selection']
+    assert ifac['status'] == 'incomplete' and ifac['interaction']['available'] is False, ifac
+    assert ri['family']['m'] == 1, ri['family']
+    assert any('family slot is kept at p=1' in w for w in ri['warnings']), ri['warnings']
+    # A run_cfg mismatch drops every seed rather than mixing two recipes.
+    mixed = dict(recs)
+    for s in range(7):
+        mixed[('csa_dyn_randidx', '', s)] = dict(
+            mixed[('csa_dyn_randidx', '', s)], run_cfg='different_cfg')
+    rm = L.factorial_interaction_audit(recs=mixed)
+    mfac = rm['factorials']['dynamic_blocking_x_learned_selection']
+    assert mfac['status'] == 'no_data', mfac
+    assert any('no complete 2x2 seed' in w for w in rm['warnings']), rm['warnings']
+    # A capacity difference is not silently treated as a mechanism effect.
+    cap = L.factorial_interaction_audit(
+        recs=_factorial_records(0.05, params={'csa_dynamic': 5000}))
+    cit = cap['factorials']['dynamic_blocking_x_learned_selection']['interaction']
+    assert cit['mechanism_claim_allowed'] is False, cit
+    assert cit['significant_family'] is True, cit
+    assert any('capacity control' in w for w in cap['warnings']), cap['warnings']
+
+
 def t_classification_threshold_metadata_matches_predictions():
     y = np.array([0, 1, 0, 1])
     score = np.array([[0.9, 0.1], [0.2, 0.8], [0.7, 0.3], [0.4, 0.6]])
@@ -21396,6 +21501,8 @@ def main():
     _check('L59c aggregate quarantines corrupt records and counts them', t_aggregate_quarantines_bad_records_without_crashing)
     _check('L59d aggregate writes the quarantine report', t_dump_aggregate_writes_quarantine_report)
     _check('L60 single-factor design gate verifies the shipped design and fails closed on drift', t_single_factor_design_gate_passes_and_fails_closed)
+    _check('L60a 2x2 factorial design gate verifies parallel cells and fails closed', t_factorial_design_gate_verifies_parallel_cells)
+    _check('L60b factorial interaction is a paired difference-of-differences with an isolated Holm family', t_factorial_interaction_test_is_paired_and_isolated)
     _check('L61 frozen-manifest mechanism flags are machine-verified single-factor verdicts', t_frozen_manifest_mechanism_flags_are_verified_single_factor)
     _check('L62 seq2k sweep contrasts carry explicit factor declarations', t_seq2k_contrasts_carry_factor_declarations)
     _check('L62b v7 rope/sink/selection contrasts carry verified factor declarations', t_v7_rope_contrasts_carry_factor_declarations)
