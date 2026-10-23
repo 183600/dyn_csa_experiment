@@ -3837,3 +3837,135 @@ L181 覆盖：三点单轴通过、额外 cfg 键、重复剂量、种子集不�
 fail-closed。L182 覆盖：6 种子精确 p=2/64、方向冲突、linear vs monotone
 形状门、缺失/非有限读数点名剔除、两点拒绝、协议冲突、非法
 direction/shape 的调用错误。
+
+## 61. 统计机器校准：先证明检验本身不超发，再谈显著
+
+### 61.1 为什么需要
+
+本仓库的结论最终落在一串统计程序上：精确符号翻转、n=21–40 的
+meet-in-the-middle（MITM）、n>40 的 Lugannani–Rice 鞍点尾、max-over-looks
+的序列 p、配对 TOST 与 Holm。单元测试能证明这些函数在**给定输入**上返回
+预期形状，但不能证明它们的**频率学错误率**在重复抽样下符合名义水平。
+一个实现错误（枚举漏项、鞍点公式符号、序列 max 的方向、TOST 边界用了单侧
+而不是双侧）完全可能让所有 fixture 测试通过，却让零假设下的 p 系统性偏小。
+一旦如此，后面所有「p<0.05」「Holm 后仍显著」都失去意义。
+
+所以统计机器本身必须像训练/评测代码一样被校准：先用**已知答案**的合成
+数据检验它，再允许它去检验真实面板。校准不是又一层结果审计，而是分析
+工具的计量学。
+
+### 61.2 对象与策略
+
+`exp_lib.STATISTICAL_CALIBRATION_POLICY` 固定以下先验参数（改动会改变
+`policy_fp`，必须在看结果前写入；指纹绑定实际生效的 seed/n_sim/α/阈值，
+带覆盖参数运行不会复用默认策略的指纹）：
+
+| 参数 | 默认 | 含义 |
+|---|---|---|
+| `simulation_seed` | `20261023` | 模拟种子的根；派生子流 |
+| `n_sim` | 2000 | 每个路径的重复次数 |
+| `alpha` | 0.05 | 与主审计相同的名义水平 |
+| `power_floor` | 0.60 | 正控制要求的最低灵敏度 |
+| `control_level` | 0.001 | 单侧校准门的失败阈值 |
+| `warning_level` | 0.01 | 仅告警、不判失败的阈值 |
+| `saddlepoint_max_abs_error` | 0.03 | 鞍点 p 与精确 p 的最大允许偏差 |
+| `saddlepoint_mean_abs_error` | 0.005 | 平均允许偏差 |
+
+所有随机性来自 `numpy.random.SeedSequence(seed).spawn(k)` 派生的**局部**
+`default_rng` 流；校准不读、不写全局 NumPy/Torch RNG，因此不会扰动训练或
+其他面板的可复现性。输出只依赖策略与输入（模拟出的 p 值），不依赖时钟，
+同一版本下逐字节可复现。
+
+### 61.3 负控制与正控制
+
+只做零假设校准是不够的：一个永远不拒绝的检验会完美通过所有 type-I 检查。
+每个路径因此必须同时通过两个门。
+
+**负控制（type-I）**：数据由 `N(0,1)` 生成，真实效应为零。若检验校准，
+拒绝次数 `K ~ Binomial(n_sim, alpha)`。单侧上尾
+
+```
+p_anti = P(K >= k_obs | alpha)
+```
+
+在 `p_anti < control_level` 时判 fail（观测超发率显著高于名义水平），
+在 `p_anti < warning_level` 时只告警；低于 alpha 的保守行为通过。阈值
+在模拟前固定，不能看完 `k_obs` 再挑一个刚好不判失败的 `control_level`。
+
+**正控制（灵敏度）**：数据由已知均值移动的 `N(delta,1)` 生成。若检验有
+至少 `power_floor` 的功效，拒绝次数 `K ~ Binomial(n_sim, power_floor)`。
+单侧下尾
+
+```
+p_below = P(K <= k_obs | power_floor)
+```
+
+在 `p_below < control_level` 时判 fail（灵敏度显著低于声明下限）；观测率
+低于下限但仍在蒙特卡洛噪声内时告警。正控制的 delta 是设计选择，不是从
+实验里估计出来的效应量。
+
+两个门都是**单侧筛查**：通过只表示在 `n_sim` 次重复下没有检出足以判失败的
+系统性偏差，不能读成「错误率精确等于 α 已被证明」；1 个百分点量级的偏差
+需要更大的 `n_sim` 或专门的等价性检验。这里选择固定预算的筛查，是为了让
+校准能在零 GPU 审计里常规运行，而不是把「未检出」包装成「已证明」。
+
+### 61.4 被校准的检验路径与鞍点精度
+
+| 路径 | 种子数 | 负控制 | 正控制 | 额外检查 |
+|---|---|---|---|---|
+| 精确符号翻转枚举 | 12 | `N(0,1)` | `N(1.0,1)` | 方法确为 enumeration |
+| MITM 精确路径 | 21 | `N(0,1)` | `N(0.8,1)` | 方法确为 MITM |
+| 鞍点尾（n>40 分派） | 48 | `N(0,1)` | `N(0.5,1)` | 方法确为 saddlepoint |
+| 鞍点近似精度 | 21 | — | — | 与精确 MITM p 的逐点最大/平均绝对误差 |
+| max-over-looks 序列 p | 12，looks 6/9/12 | `N(0,1)` | `N(0.9,1)` | 同一批种子嵌套 look |
+| 配对 TOST | 12 | `mean=1.0`（恰在 margin=1.0） | `mean=0` | `conf=0.90` |
+| Holm 族 | m=6 | `Uniform(0,1)` p 值 | 一个 `1e-6` + 五个 null | 全局 FWER / 至少一次拒绝 |
+
+鞍点精度是**近似正确性**门，不是显著性门：它逐点比较
+`_signflip_saddlepoint_p` 与 `exact_signflip_p`（n=21 时后者是 MITM 精确值），
+限制最大绝对误差与平均绝对误差；仅当所有 draw 都通过才记为 ok。
+
+默认策略在 `seed=20261023, n_sim=2000` 下的一个实际运行结果（用于回归
+定位，不作为科学证据）：
+
+```
+exact enumeration   null 0.061   positive 0.8825
+MITM                null 0.0495  positive 0.942
+saddlepoint n=48    null 0.038   positive 0.9165
+sequential          null 0.042   positive 0.7845
+TOST boundary       null 0.0485  positive 0.888
+Holm FWER           null 0.051   positive 1.0
+saddlepoint vs exact max |Δp| 0.0229, mean |Δp| 0.00084
+```
+
+这些数字随固定种子确定；它们说明当前实现没有可检出的系统性超发，也
+保留了可用功效。它们**不**说明任何真实面板的效应存在。
+
+### 61.5 边界
+
+- 校准只验证统计机器在**理想独立配对、正态、同方差**数据上的频率学行为。
+  它不验证真实面板的 exchangeability、随机化、配对完整性或测量同一性；
+  那些仍由 `pair_fp`、`src_fp`、run-order、leakage 与 protocol 门负责。
+- 通过校准不能把有混淆的设计变成因果证据，也不能修复选择偏差、泄漏或
+  optional stopping；它只排除「分析函数本身算错」这一小类问题。
+- 一个显著结果仍可能来自真实但非因果的共变；校准不是机制证据。
+- 失败表示该统计路径的声明不可信，不表示旧结果一定错；但基于该路径的
+  新结论必须先修复实现，不能靠换种子/换阈值绕过。
+- 策略参数、种子与模拟数据都是分析工具的一部分；它们与
+  `CODE_SEMANTICS`、冻结清单、P5T 的 α/Holm 规则和实验种子无关。校准不
+  读取结果树，不新增训练，不写 `results_*`。
+
+### 61.6 入口与验证
+
+```bash
+python audit_gates.py calibration     # 零 GPU、纯合成数据；fail 时退出码 1
+python audit_gates.py stats_calibration
+python test_review_fixes.py           # L183 策略/门/确定性；L184 审计接线
+```
+
+`audit_gates.py calibration` 也作为 `calibration` 键进入
+`audit_gates.py report` 的 `audit_report.json`。L183 覆盖：二项尾已知值、
+保守检验通过、200/200 拒绝判 fail、零功效判 fail、非法计数/α/阈值
+fail-closed、两次运行逐字节一致、全局 RNG 状态不变、全部六条路径存在且
+控制门通过。L184 覆盖：审计入口的种子/规模/状态、报告字典接线、CLI 文档
+与过小模拟的拒绝。

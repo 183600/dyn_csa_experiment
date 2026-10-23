@@ -72,6 +72,10 @@
                document-stratified 概率样本；prefix 明确标记为不可外推，
                raw train/valid 可用时量化文章覆盖率、文章长度 KS 与分层覆盖；
                永不读取 wiki.test.raw
+  calibration  统计机器的零假设校准：精确符号翻转 / MITM / n>40 鞍点 /
+               max-over-looks 序列 p / 配对 TOST / Holm 的负控制（超发率）
+               与正控制（灵敏度），固定种子、局部 RNG、纯合成数据；
+               不读结果、不训练、不改任何测量语义
   efficiency   prefill/decode/容量读数工具（需要模型；给出可复用函数
                与 CPU 微型演示——不是实验，是测量代码自检）
   report       汇总运行本地可执行的全部审计，输出 audit_report.json
@@ -5716,8 +5720,42 @@ def audit_look_history(paths=None):
     return out
 
 
+def audit_statistical_calibration(*, n_sim=None, seed=None):
+    """Deterministic synthetic calibration of the analysis machinery.
+
+    The evidence pipeline quotes exact sign-flip p-values, a meet-in-the-middle
+    exact path, a saddlepoint tail for n>40, a max-over-looks sequential p,
+    paired TOST and Holm.  This gate runs negative controls (data generated
+    under the null: the false-positive rate may not exceed alpha beyond
+    Monte-Carlo noise) and positive controls (data with a known effect: the
+    same procedure must retain sensitivity) for each path.  It uses only local
+    RNG streams and synthetic data, reads no result artifact and starts no
+    training; it therefore cannot change a measurement or a frozen verdict.
+
+    A pass says the statistical machinery has the advertised error rates on
+    idealized independent pairs.  It does not certify exchangeability,
+    randomisation or measurement identity in a real panel, and it is not
+    evidence for or against any substantive mechanism claim.
+    """
+    L = _import_exp_lib()
+    rep = L.statistical_calibration_suite(n_sim=n_sim, seed=seed)
+    print(json.dumps({k: v for k, v in rep.items()
+                      if k not in ('policy', 'tests')},
+                     ensure_ascii=False, indent=2))
+    for name, rec in (rep.get('tests') or {}).items():
+        if 'null_control' in rec:
+            print(f"[calibration] {name}: null={rec['null_control'].get('rate')!r} "
+                  f"({rec['null_control'].get('status')}), "
+                  f"positive={rec['positive_control'].get('rate')!r} "
+                  f"({rec['positive_control'].get('status')})")
+        else:
+            print(f"[calibration] {name}: {rec.get('status')} "
+                  f"(max_abs_error={rec.get('max_abs_error')!r})")
+    return rep
+
+
 def run_report(out='audit_report.json'):
-    res = {'generated_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'source_tree': audit_source_integrity(), 'dependencies': audit_dependencies(), 'data_source': audit_data_source(), 'leakage': audit_leakage(), 'split_discipline': audit_split_discipline(), 'document_unit': audit_document_unit(), 'sample_design': audit_sample_design(), 'attribution': audit_attribution(), 'boundary': audit_boundary(), 'length': audit_length(), 'fairness': audit_fairness(), 'metrics': audit_metrics(), 'tuning': audit_tuning(), 'simple_baseline': audit_simple_baseline(), 'hypotheses': audit_hypotheses(), 'sesoi': audit_sesoi_declaration(), 'unit_influence': audit_unit_influence(), 'looks': audit_look_history(), 'methodology': audit_methodology(), 'single_factor': audit_single_factor(), 'factorial': audit_factorial_design(), 'design_preflight': audit_design_preflight(), 'dose_response': audit_dose_response(verbose=False), 'failures': audit_failures(), 'budget': audit_budget(), 'training_health': audit_training_health(), 'efficiency_pairs': audit_efficiency_pairs(), 'release': audit_release_readiness(), 'selection': audit_selection(), 'run_order': audit_run_order()}
+    res = {'generated_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'source_tree': audit_source_integrity(), 'dependencies': audit_dependencies(), 'data_source': audit_data_source(), 'leakage': audit_leakage(), 'split_discipline': audit_split_discipline(), 'document_unit': audit_document_unit(), 'sample_design': audit_sample_design(), 'attribution': audit_attribution(), 'boundary': audit_boundary(), 'length': audit_length(), 'fairness': audit_fairness(), 'metrics': audit_metrics(), 'tuning': audit_tuning(), 'simple_baseline': audit_simple_baseline(), 'hypotheses': audit_hypotheses(), 'sesoi': audit_sesoi_declaration(), 'unit_influence': audit_unit_influence(), 'looks': audit_look_history(), 'methodology': audit_methodology(), 'single_factor': audit_single_factor(), 'factorial': audit_factorial_design(), 'design_preflight': audit_design_preflight(), 'dose_response': audit_dose_response(verbose=False), 'failures': audit_failures(), 'budget': audit_budget(), 'training_health': audit_training_health(), 'efficiency_pairs': audit_efficiency_pairs(), 'release': audit_release_readiness(), 'selection': audit_selection(), 'run_order': audit_run_order(), 'calibration': audit_statistical_calibration()}
     L_atomic = None
     try:
         L = _import_exp_lib()
@@ -5737,7 +5775,7 @@ def run_report(out='audit_report.json'):
 
 
 if __name__ == '__main__':
-    _cmds = {'leakage': audit_leakage, 'split': audit_split_discipline, 'split_discipline': audit_split_discipline, 'document_unit': audit_document_unit, 'unit': audit_document_unit, 'sample_design': audit_sample_design, 'sampling': audit_sample_design, 'sample': audit_sample_design, 'causality': audit_causality, 'attribution': audit_attribution, 'boundary': audit_boundary, 'length': audit_length, 'fairness': audit_fairness, 'metrics': audit_metrics, 'tuning': audit_tuning, 'simple': audit_simple_baseline, 'baseline_floor': audit_simple_baseline, 'baseline_plan': audit_baseline_design, 'hypothesis_coverage': audit_hypothesis_coverage, 'hypotheses': audit_hypotheses, 'sesoi': audit_sesoi_declaration, 'unit_influence': audit_unit_influence, 'influence': audit_unit_influence, 'looks': audit_look_history, 'look_history': audit_look_history, 'methodology': audit_methodology, 'single_factor': audit_single_factor, 'factorial': audit_factorial_design, 'factorial_design': audit_factorial_design, 'design': audit_design_preflight, 'design_preflight': audit_design_preflight, 'dose_response': audit_dose_response, 'dose_response_design': audit_dose_response, 'failures': audit_failures, 'budget': audit_budget, 'efficiency': audit_efficiency_demo, 'efficiency_pairs': audit_efficiency_pairs, 'training_health': audit_training_health, 'selection': audit_selection, 'release': audit_release_readiness, 'run_order': audit_run_order, 'source': audit_source_integrity, 'source_tree': audit_source_integrity, 'dependencies': audit_dependencies, 'dependency': audit_dependencies, 'data_source': audit_data_source, 'dataset_source': audit_data_source, 'report': run_report}
+    _cmds = {'leakage': audit_leakage, 'split': audit_split_discipline, 'split_discipline': audit_split_discipline, 'document_unit': audit_document_unit, 'unit': audit_document_unit, 'sample_design': audit_sample_design, 'sampling': audit_sample_design, 'sample': audit_sample_design, 'causality': audit_causality, 'attribution': audit_attribution, 'boundary': audit_boundary, 'length': audit_length, 'fairness': audit_fairness, 'metrics': audit_metrics, 'tuning': audit_tuning, 'simple': audit_simple_baseline, 'baseline_floor': audit_simple_baseline, 'baseline_plan': audit_baseline_design, 'hypothesis_coverage': audit_hypothesis_coverage, 'hypotheses': audit_hypotheses, 'sesoi': audit_sesoi_declaration, 'unit_influence': audit_unit_influence, 'influence': audit_unit_influence, 'looks': audit_look_history, 'look_history': audit_look_history, 'methodology': audit_methodology, 'single_factor': audit_single_factor, 'factorial': audit_factorial_design, 'factorial_design': audit_factorial_design, 'design': audit_design_preflight, 'design_preflight': audit_design_preflight, 'dose_response': audit_dose_response, 'dose_response_design': audit_dose_response, 'failures': audit_failures, 'budget': audit_budget, 'efficiency': audit_efficiency_demo, 'efficiency_pairs': audit_efficiency_pairs, 'training_health': audit_training_health, 'selection': audit_selection, 'release': audit_release_readiness, 'run_order': audit_run_order, 'calibration': audit_statistical_calibration, 'stats_calibration': audit_statistical_calibration, 'type_i': audit_statistical_calibration, 'source': audit_source_integrity, 'source_tree': audit_source_integrity, 'dependencies': audit_dependencies, 'dependency': audit_dependencies, 'data_source': audit_data_source, 'dataset_source': audit_data_source, 'report': run_report}
     _arg = sys.argv[1] if len(sys.argv) > 1 else 'report'
     if _arg in ('-h', '--help'):
         print(__doc__)

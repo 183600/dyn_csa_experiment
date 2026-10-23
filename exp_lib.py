@@ -42374,3 +42374,457 @@ def _dump_aggregate(outdir, summary):
 
 def _finish_panel(outdir, summary):
     return _dump_aggregate(outdir, summary)
+
+
+# ---- 统计机器的校准：先证明检验本身在零假设下不超发，再谈结果 -------------
+# 本仓库的结论依赖一串统计程序：精确符号翻转、meet-in-the-middle、n>40 的
+# Lugannani-Rice 鞍点尾、max-over-looks 序列 p、配对 TOST 与 Holm。它们被
+# 单元测试覆盖，并不等于它们的**频率学错误率**已被校准。下面的模拟只用
+# 局部 RNG、固定种子与合成数据，不触碰训练/评测 RNG、不读取任何结果目录，
+# 也不改变任何测量语义；它验证的是「统计机器」，不是「实验假说」。
+
+STATISTICAL_CALIBRATION_POLICY = {
+    'version': 'statcal-1',
+    'simulation_seed': 20261023,
+    'n_sim': 2000,
+    'alpha': 0.05,
+    'power_floor': 0.60,
+    'control_level': 0.001,
+    'warning_level': 0.01,
+    'exact_n': 12,
+    'exact_power_delta': 1.0,
+    'mitm_n': 21,
+    'mitm_power_delta': 0.8,
+    'saddlepoint_exact_n': 21,
+    'saddlepoint_exact_draws': 300,
+    'saddlepoint_max_abs_error': 0.03,
+    'saddlepoint_mean_abs_error': 0.005,
+    'saddlepoint_n': 48,
+    'saddlepoint_power_delta': 0.5,
+    'sequential_union_n': 12,
+    'sequential_look_sizes': (6, 9, 12),
+    'sequential_power_delta': 0.9,
+    'tost_n': 12,
+    'tost_margin': 1.0,
+    'tost_null_mean': 1.0,
+    'tost_alt_mean': 0.0,
+    'tost_conf': 0.90,
+    'holm_m': 6,
+    'holm_alt_p': 1e-06,
+    'note': ('deterministic synthetic calibration of the analysis machinery; '
+             'it is not evidence about WikiText, the model, or any substantive '
+             'hypothesis, and it cannot repair a confounded design'),
+}
+
+
+def _calibration_policy_fp(policy=None):
+    payload = dict(STATISTICAL_CALIBRATION_POLICY if policy is None else policy)
+    blob = json.dumps(payload, sort_keys=True, separators=(',', ':'),
+                      ensure_ascii=True)
+    return hashlib.sha256(blob.encode('utf-8')).hexdigest()
+
+
+def _calibration_fraction(value, name):
+    if isinstance(value, (bool, np.bool_)):
+        raise ValueError(f'{name} must be a real number in (0,1), got {value!r}')
+    try:
+        v = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f'{name} must be a real number in (0,1), got {value!r}') from None
+    if not (0.0 < v < 1.0):
+        raise ValueError(f'{name} must be in (0,1), got {value!r}')
+    return v
+
+
+def _calibration_counts(n_reject, n_sim):
+    k = _as_seed_int(n_reject)
+    n = _as_seed_int(n_sim)
+    if k is None or n is None or n < 1 or k < 0 or k > n:
+        raise ValueError(
+            'calibration counts require integers 0 <= n_reject <= n_sim and '
+            f'n_sim >= 1, got n_reject={n_reject!r}, n_sim={n_sim!r}')
+    return int(k), int(n)
+
+
+def _binomial_sf(k, n, p):
+    """P(Bin(n,p) >= k) for an arbitrary p, using the regularized beta."""
+    k, n = _calibration_counts(k, n)
+    p = _calibration_fraction(p, 'binomial p')
+    if k <= 0:
+        return 1.0
+    if k > n:
+        return 0.0
+    v = _betai(float(k), float(n - k + 1), p)
+    if not math.isfinite(v):
+        raise ValueError('binomial upper tail is not finite')
+    return float(min(1.0, max(0.0, v)))
+
+
+def _binomial_cdf(k, n, p):
+    """P(Bin(n,p) <= k) for an arbitrary p, using the regularized beta."""
+    k, n = _calibration_counts(k, n)
+    p = _calibration_fraction(p, 'binomial p')
+    if k < 0:
+        return 0.0
+    if k >= n:
+        return 1.0
+    v = _betai(float(n - k), float(k + 1), 1.0 - p)
+    if not math.isfinite(v):
+        raise ValueError('binomial lower tail is not finite')
+    return float(min(1.0, max(0.0, v)))
+
+
+def calibration_type_i_gate(n_reject, n_sim, *, alpha=0.05,
+                            control_level=0.001, warning_level=0.01):
+    """One-sided calibration gate for a nominal type-I error rate.
+
+    Under a correctly calibrated procedure the rejection count is Binomial
+    (n_sim, alpha).  The gate fails only when the upper-tail probability
+    ``P(X >= n_reject | alpha)`` is below ``control_level`` — i.e. when the
+    observed false-positive rate is itself significantly above nominal.  A
+    rate that is merely above alpha but compatible with Monte-Carlo noise is a
+    warning, never a failure, and a conservative procedure (rate below alpha)
+    passes.  ``control_level`` is fixed before the simulation; changing it
+    after seeing the count would be the same optional-stopping problem the
+    pipeline refuses elsewhere.
+    """
+    k, n = _calibration_counts(n_reject, n_sim)
+    a = _validated_alpha(alpha, context='calibration_type_i_gate alpha')
+    c = _calibration_fraction(control_level, 'control_level')
+    w = _calibration_fraction(warning_level, 'warning_level')
+    if w < c:
+        raise ValueError('warning_level must be >= control_level')
+    rate = k / n
+    p_anti = _binomial_sf(k, n, a)
+    if p_anti < c:
+        status = 'fail'
+    elif p_anti < w:
+        status = 'warnings'
+    else:
+        status = 'ok'
+    return {'n_sim': n, 'n_reject': k, 'rate': float(rate), 'alpha': a,
+            'excess': float(rate - a), 'p_anti_conservative': float(p_anti),
+            'control_level': c, 'warning_level': w, 'status': status}
+
+
+def calibration_power_gate(n_reject, n_sim, *, power_floor=0.60,
+                           control_level=0.001):
+    """One-sided calibration gate for a sensitivity / positive-control rate.
+
+    A test that never rejects would pass every type-I calibration, so a valid
+    statistical assay also needs a positive control.  Under a procedure with
+    power at least ``power_floor`` the count is Binomial(n_sim, floor).  The
+    gate fails when the lower-tail probability is below ``control_level``
+    (observed sensitivity significantly below the declared floor).  The floor
+    is a design convention, not an estimate from the experiment.
+    """
+    k, n = _calibration_counts(n_reject, n_sim)
+    f = _calibration_fraction(power_floor, 'power_floor')
+    c = _calibration_fraction(control_level, 'control_level')
+    rate = k / n
+    p_below = _binomial_cdf(k, n, f)
+    if p_below < c:
+        status = 'fail'
+    elif rate < f:
+        status = 'warnings'
+    else:
+        status = 'ok'
+    return {'n_sim': n, 'n_reject': k, 'rate': float(rate),
+            'power_floor': f, 'p_below_floor': float(p_below),
+            'control_level': c, 'status': status}
+
+
+def _calibration_path_gate(out, name, predicate, expected):
+    rec = out['tests'][name]
+    methods = rec.get('methods') or []
+    ok = any(predicate(m) for m in methods)
+    rec['path_ok'] = bool(ok)
+    if not ok:
+        out['status'] = 'fail'
+        out['violations'].append(
+            f'{name}: expected {expected} dispatch, observed methods={methods!r}')
+
+
+def _calibration_add(out, name, null_control, positive_control, **extra):
+    rec = {'null_control': null_control, 'positive_control': positive_control}
+    rec.update(extra)
+    out['tests'][name] = rec
+    for part in ('null_control', 'positive_control'):
+        _st = rec[part].get('status')
+        if _st == 'fail':
+            out['status'] = 'fail'
+            out['violations'].append(
+                f'{name}.{part}: calibration gate failed '
+                f'(rate={rec[part].get("rate")!r}, '
+                f'n={rec[part].get("n_reject")!r}/{rec[part].get("n_sim")!r})')
+        elif _st == 'warnings':
+            if out['status'] == 'ok':
+                out['status'] = 'warnings'
+            out['warnings'].append(
+                f'{name}.{part}: rate outside the nominal target but compatible '
+                f'with Monte-Carlo noise (rate={rec[part].get("rate")!r})')
+
+
+def statistical_calibration_suite(*, seed=None, n_sim=None, alpha=None,
+                                  power_floor=None, control_level=None,
+                                  warning_level=None):
+    """Deterministic synthetic calibration of every statistical procedure the
+    evidence pipeline relies on.
+
+    The suite exercises a **negative control** (data generated under the null:
+    the false-positive rate must not exceed alpha beyond Monte-Carlo noise)
+    and a **positive control** (data generated with a known effect: the same
+    procedure must retain sensitivity above a declared floor) for the exact
+    sign-flip enumeration, the 21-40 seed meet-in-the-middle path, the n>40
+    saddlepoint tail (plus a direct saddlepoint-vs-exact agreement check at
+    n=21), the max-over-looks sequential p, paired TOST at the margin, and the
+    Holm step-down family.
+
+    All randomness comes from local ``numpy.random.default_rng`` streams
+    spawned from ``seed`` through a ``SeedSequence``; no global NumPy/Torch RNG
+    is read or written, so the suite cannot perturb a training run or another
+    panel's reproducibility.  The output is a pure function of the policy and
+    inputs (the simulated p-values, not a clock).  A pass certifies that the
+    analysis machinery has the advertised frequentist behaviour on idealized
+    independent pairs; it does not certify the exchangeability, independence or
+    unconfoundedness of any real panel, and it is not evidence for or against a
+    substantive mechanism claim.  Passing is a screen for gross miscalibration,
+    not an equivalence test proving the error rate equals alpha exactly.
+    """
+    policy = dict(STATISTICAL_CALIBRATION_POLICY)
+    seed = policy['simulation_seed'] if seed is None else seed
+    n_sim = policy['n_sim'] if n_sim is None else n_sim
+    alpha = policy['alpha'] if alpha is None else alpha
+    power_floor = policy['power_floor'] if power_floor is None else power_floor
+    control_level = (policy['control_level'] if control_level is None
+                     else control_level)
+    warning_level = (policy['warning_level'] if warning_level is None
+                     else warning_level)
+    _seed = _as_seed_int(seed)
+    if _seed is None or _seed < 0:
+        raise ValueError(
+            f'statistical_calibration_suite: seed must be a non-negative '
+            f'integer, got {seed!r}')
+    _n_sim = _as_seed_int(n_sim)
+    if _n_sim is None or _n_sim < 20:
+        raise ValueError(
+            f'statistical_calibration_suite: n_sim must be an integer >= 20, '
+            f'got {n_sim!r}')
+    n_sim = int(_n_sim)
+    alpha = _validated_alpha(alpha, context='statistical_calibration alpha')
+    power_floor = _calibration_fraction(power_floor, 'power_floor')
+    control_level = _calibration_fraction(control_level, 'control_level')
+    warning_level = _calibration_fraction(warning_level, 'warning_level')
+    if warning_level < control_level:
+        raise ValueError('warning_level must be >= control_level')
+    policy['simulation_seed'] = int(_seed)
+    policy['n_sim'] = n_sim
+    policy['alpha'] = alpha
+    policy['power_floor'] = power_floor
+    policy['control_level'] = control_level
+    policy['warning_level'] = warning_level
+    children = np.random.SeedSequence(int(_seed)).spawn(7)
+    out = {'kind': 'statistical_calibration', 'status': 'ok',
+           'seed': int(_seed), 'n_sim': n_sim, 'alpha': alpha,
+           'power_floor': power_floor, 'control_level': control_level,
+           'warning_level': warning_level, 'tests': {},
+           'violations': [], 'warnings': [],
+           'policy': policy, 'policy_fp': _calibration_policy_fp(policy),
+           'deterministic': True,
+           'note': policy['note'],
+           'interpretation_boundary': (
+               'a pass validates the statistical machinery on synthetic '
+               'independent pairs; it does not validate the exchangeability, '
+               'randomisation or measurement identity of a real panel, and it '
+               'is not evidence for a substantive hypothesis')}
+
+    rng = np.random.default_rng(children[0])
+    n_exact = int(policy['exact_n'])
+    delta_exact = float(policy['exact_power_delta'])
+    k_null = k_alt = 0
+    methods = set()
+    for _ in range(n_sim):
+        d = rng.normal(size=n_exact)
+        r = exact_signflip_p(d.tolist())
+        methods.add(r.get('method'))
+        k_null += bool(r['p'] <= alpha)
+    for _ in range(n_sim):
+        d = rng.normal(loc=delta_exact, scale=1.0, size=n_exact)
+        k_alt += bool(exact_signflip_p(d.tolist())['p'] <= alpha)
+    _calibration_add(
+        out, 'exact_signflip_enumeration',
+        calibration_type_i_gate(k_null, n_sim, alpha=alpha,
+                                control_level=control_level,
+                                warning_level=warning_level),
+        calibration_power_gate(k_alt, n_sim, power_floor=power_floor,
+                               control_level=control_level),
+        path='exact enumeration', n_seeds=n_exact,
+        alternative_mean=delta_exact,
+        methods=sorted(m for m in methods if m))
+    _calibration_path_gate(out, 'exact_signflip_enumeration',
+                           lambda m: m == 'exact', 'exact enumeration')
+
+    rng = np.random.default_rng(children[1])
+    n_mitm = int(policy['mitm_n'])
+    delta_mitm = float(policy['mitm_power_delta'])
+    k_null = k_alt = 0
+    methods = set()
+    for _ in range(n_sim):
+        d = rng.normal(size=n_mitm)
+        r = exact_signflip_p(d.tolist())
+        methods.add(r.get('method'))
+        k_null += bool(r['p'] <= alpha)
+    for _ in range(n_sim):
+        d = rng.normal(loc=delta_mitm, scale=1.0, size=n_mitm)
+        k_alt += bool(exact_signflip_p(d.tolist())['p'] <= alpha)
+    _calibration_add(
+        out, 'exact_signflip_mitm',
+        calibration_type_i_gate(k_null, n_sim, alpha=alpha,
+                                control_level=control_level,
+                                warning_level=warning_level),
+        calibration_power_gate(k_alt, n_sim, power_floor=power_floor,
+                               control_level=control_level),
+        path='meet-in-the-middle', n_seeds=n_mitm,
+        alternative_mean=delta_mitm, methods=sorted(m for m in methods if m))
+    _calibration_path_gate(out, 'exact_signflip_mitm',
+                           lambda m: m == 'exact-mitm', 'MITM')
+
+    rng = np.random.default_rng(children[2])
+    n_sp_exact = int(policy['saddlepoint_exact_n'])
+    n_draws = min(int(policy['saddlepoint_exact_draws']), n_sim)
+    errors = []
+    n_disagree = 0
+    for _ in range(n_draws):
+        d = rng.normal(size=n_sp_exact)
+        exact = exact_signflip_p(d.tolist())
+        approx, _method = _signflip_saddlepoint_p(d.tolist())
+        errors.append(abs(float(approx) - float(exact['p'])))
+        n_disagree += bool((approx <= alpha) != (exact['p'] <= alpha))
+    max_err = max(errors) if errors else float('nan')
+    mean_err = float(np.mean(errors)) if errors else float('nan')
+    tol_max = float(policy['saddlepoint_max_abs_error'])
+    tol_mean = float(policy['saddlepoint_mean_abs_error'])
+    acc_status = ('fail' if (not math.isfinite(max_err)
+                             or max_err > tol_max
+                             or not math.isfinite(mean_err)
+                             or mean_err > tol_mean) else 'ok')
+    out['tests']['saddlepoint_vs_exact'] = {
+        'n_seeds': n_sp_exact, 'n_draws': n_draws,
+        'max_abs_error': float(max_err), 'mean_abs_error': float(mean_err),
+        'max_abs_tolerance': tol_max, 'mean_abs_tolerance': tol_mean,
+        'rejection_disagreements': int(n_disagree), 'status': acc_status}
+    if acc_status == 'fail':
+        out['status'] = 'fail'
+        out['violations'].append(
+            'saddlepoint_vs_exact: approximation error '
+            f'(max={max_err!r} > {tol_max!r} or mean={mean_err!r} > '
+            f'{tol_mean!r})')
+
+    rng = np.random.default_rng(children[3])
+    n_sp = int(policy['saddlepoint_n'])
+    delta_sp = float(policy['saddlepoint_power_delta'])
+    k_null = k_alt = 0
+    sp_methods = set()
+    for _ in range(n_sim):
+        d = rng.normal(size=n_sp)
+        r = exact_signflip_p(d.tolist())
+        sp_methods.add(r.get('method'))
+        k_null += bool(r['p'] <= alpha)
+    for _ in range(n_sim):
+        d = rng.normal(loc=delta_sp, scale=1.0, size=n_sp)
+        k_alt += bool(exact_signflip_p(d.tolist())['p'] <= alpha)
+    _calibration_add(
+        out, 'saddlepoint_tail',
+        calibration_type_i_gate(k_null, n_sim, alpha=alpha,
+                                control_level=control_level,
+                                warning_level=warning_level),
+        calibration_power_gate(k_alt, n_sim, power_floor=power_floor,
+                               control_level=control_level),
+        path='saddlepoint (n>40 dispatch)', n_seeds=n_sp,
+        alternative_mean=delta_sp,
+        methods=sorted(m for m in sp_methods if m))
+    _calibration_path_gate(out, 'saddlepoint_tail',
+                           lambda m: m == 'saddlepoint', 'saddlepoint')
+
+    rng = np.random.default_rng(children[4])
+    n_union = int(policy['sequential_union_n'])
+    look_sizes = [int(x) for x in policy['sequential_look_sizes']]
+    if (not look_sizes or look_sizes[-1] != n_union
+            or any(x <= 0 or x > n_union for x in look_sizes)
+            or any(b <= a for a, b in zip(look_sizes, look_sizes[1:]))):
+        raise ValueError('sequential look sizes must be strictly increasing '
+                         'and end at sequential_union_n')
+    look_defs = [list(range(size)) for size in look_sizes]
+    delta_seq = float(policy['sequential_power_delta'])
+    k_null = k_alt = 0
+    seq_methods = set()
+    for _ in range(n_sim):
+        d = rng.normal(size=n_union)
+        looks = [(s, [float(d[i]) for i in s]) for s in look_defs]
+        r = sequential_signflip_p(looks)
+        seq_methods.add(r.get('method'))
+        k_null += bool(r['p_sequential'] <= alpha)
+    for _ in range(n_sim):
+        d = rng.normal(loc=delta_seq, scale=1.0, size=n_union)
+        looks = [(s, [float(d[i]) for i in s]) for s in look_defs]
+        r = sequential_signflip_p(looks)
+        k_alt += bool(r['p_sequential'] <= alpha)
+    _calibration_add(
+        out, 'sequential_looks',
+        calibration_type_i_gate(k_null, n_sim, alpha=alpha,
+                                control_level=control_level,
+                                warning_level=warning_level),
+        calibration_power_gate(k_alt, n_sim, power_floor=power_floor,
+                               control_level=control_level),
+        path='max-over-looks sign-flip', union_seeds=n_union,
+        look_sizes=look_sizes, alternative_mean=delta_seq,
+        methods=sorted(m for m in seq_methods if m))
+    _calibration_path_gate(out, 'sequential_looks',
+                           lambda m: 'max-over-looks' in str(m),
+                           'max-over-looks sequential')
+
+    rng = np.random.default_rng(children[5])
+    n_tost = int(policy['tost_n'])
+    margin = float(policy['tost_margin'])
+    conf = float(policy['tost_conf'])
+    null_mean = float(policy['tost_null_mean'])
+    alt_mean = float(policy['tost_alt_mean'])
+    k_null = k_alt = 0
+    for _ in range(n_sim):
+        d = rng.normal(loc=null_mean, scale=1.0, size=n_tost)
+        k_null += bool(tost_paired(d.tolist(), margin, conf=conf)['equivalent'])
+    for _ in range(n_sim):
+        d = rng.normal(loc=alt_mean, scale=1.0, size=n_tost)
+        k_alt += bool(tost_paired(d.tolist(), margin, conf=conf)['equivalent'])
+    _calibration_add(
+        out, 'tost_paired',
+        calibration_type_i_gate(k_null, n_sim, alpha=alpha,
+                                control_level=control_level,
+                                warning_level=warning_level),
+        calibration_power_gate(k_alt, n_sim, power_floor=power_floor,
+                               control_level=control_level),
+        n_seeds=n_tost, margin=margin, conf=conf,
+        null_mean=null_mean, alternative_mean=alt_mean)
+
+    rng = np.random.default_rng(children[6])
+    m_holm = int(policy['holm_m'])
+    alt_p = float(policy['holm_alt_p'])
+    k_null = k_alt = 0
+    for _ in range(n_sim):
+        ps = rng.random(m_holm)
+        h = holm_adjust([(f'c{i}', float(p)) for i, p in enumerate(ps)], alpha=alpha)
+        k_null += bool(any(v.get('reject') for v in h.values()))
+    for _ in range(n_sim):
+        ps = np.concatenate(([alt_p], rng.random(m_holm - 1)))
+        h = holm_adjust([(f'c{i}', float(p)) for i, p in enumerate(ps)], alpha=alpha)
+        k_alt += bool(any(v.get('reject') for v in h.values()))
+    _calibration_add(
+        out, 'holm_family',
+        calibration_type_i_gate(k_null, n_sim, alpha=alpha,
+                                control_level=control_level,
+                                warning_level=warning_level),
+        calibration_power_gate(k_alt, n_sim, power_floor=power_floor,
+                               control_level=control_level),
+        family_m=m_holm, alternative_p=alt_p)
+
+    return out

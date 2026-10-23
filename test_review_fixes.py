@@ -21417,6 +21417,111 @@ def t_dose_response_trend_is_exact_directional_and_shape_gated():
             raise AssertionError(f'invalid trend parameter accepted: {kw}')
 
 
+def t_statistical_calibration_gates_and_suite():
+    """L183 — the statistical machinery is calibrated before its output counts."""
+    assert abs(L._binomial_sf(1, 10, 0.5) - (1.0 - 0.5 ** 10)) < 1e-15
+    assert abs(L._binomial_cdf(0, 10, 0.5) - 0.5 ** 10) < 1e-15
+    assert L._binomial_sf(0, 10, 0.5) == 1.0
+    assert L._binomial_cdf(10, 10, 0.5) == 1.0
+    try:
+        L._binomial_sf(11, 10, 0.5)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('out-of-range binomial count accepted')
+    # A conservative procedure passes; a grossly anti-conservative procedure
+    # fails the one-sided control in the predicted direction.
+    assert L.calibration_type_i_gate(0, 200, alpha=0.05)['status'] == 'ok'
+    bad = L.calibration_type_i_gate(200, 200, alpha=0.05)
+    assert bad['status'] == 'fail' and bad['p_anti_conservative'] < 1e-6, bad
+    # A test with no power cannot be rescued by passing the null control.
+    zero = L.calibration_power_gate(0, 100, power_floor=0.60)
+    assert zero['status'] == 'fail', zero
+    assert L.calibration_power_gate(100, 100, power_floor=0.60)['status'] == 'ok'
+    assert L.calibration_power_gate(60, 100, power_floor=0.60)['status'] == 'ok'
+    for bad_args in ((-1, 10), (11, 10), (1.5, 10), (True, 10), (1, 10.5), (1, 0)):
+        try:
+            L.calibration_type_i_gate(*bad_args)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'invalid calibration counts accepted: {bad_args!r}')
+    for bad_kw in ({'alpha': True}, {'alpha': 0.0}, {'alpha': 1.0},
+                   {'control_level': 0.0}, {'warning_level': 0.0001},
+                   {'control_level': 0.02, 'warning_level': 0.01}):
+        try:
+            L.calibration_type_i_gate(5, 100, **bad_kw)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'invalid calibration gate parameter accepted: {bad_kw!r}')
+    # The suite is deterministic and must not consume or reseed the global RNG.
+    before = np.random.get_state()
+    r1 = L.statistical_calibration_suite(n_sim=120)
+    after = np.random.get_state()
+    assert before[0] == after[0], 'calibration changed the global RNG algorithm'
+    assert np.array_equal(before[1], after[1]), 'calibration consumed the global RNG state'
+    assert before[2:] == after[2:], 'calibration changed the global RNG position'
+    r2 = L.statistical_calibration_suite(n_sim=120)
+    assert r1['status'] == 'ok', r1
+    assert r1['tests'] == r2['tests'], 'calibration is not deterministic'
+    assert r1['policy_fp'] == r2['policy_fp'] == L._calibration_policy_fp(r1['policy']), r1
+    assert r1['policy']['n_sim'] == 120 and r1['policy']['simulation_seed'] == 20261023, r1
+    assert L._calibration_policy_fp(L.statistical_calibration_suite(n_sim=40)['policy']) != r1['policy_fp']
+    expected = {'exact_signflip_enumeration', 'exact_signflip_mitm',
+                'saddlepoint_vs_exact', 'saddlepoint_tail',
+                'sequential_looks', 'tost_paired', 'holm_family'}
+    assert set(r1['tests']) == expected, sorted(r1['tests'])
+    for name, rec in r1['tests'].items():
+        if name == 'saddlepoint_vs_exact':
+            assert rec['status'] == 'ok', rec
+            assert rec['max_abs_error'] <= rec['max_abs_tolerance'], rec
+            assert rec['mean_abs_error'] <= rec['mean_abs_tolerance'], rec
+        else:
+            for part in ('null_control', 'positive_control'):
+                assert rec[part]['status'] in ('ok', 'warnings'), (name, rec)
+                assert 0.0 <= rec[part]['rate'] <= 1.0, rec
+            if 'methods' in rec:
+                assert rec.get('path_ok') is True, (name, rec)
+    for bad in ({'n_sim': 19}, {'n_sim': 1.5}, {'seed': -1},
+                {'seed': True}, {'power_floor': 1.0},
+                {'control_level': 0.0}, {'warning_level': 0.0001}):
+        kw = {'n_sim': 40}
+        kw.update(bad)
+        try:
+            L.statistical_calibration_suite(**kw)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'invalid suite parameter accepted: {bad!r}')
+
+
+def t_statistical_calibration_is_wired_into_the_audit():
+    """L184 — the calibration is reachable from the audit and the report."""
+    with contextlib.redirect_stdout(io.StringIO()):
+        rep = A.audit_statistical_calibration(n_sim=100, seed=7)
+    assert rep['status'] == 'ok', rep
+    assert rep['kind'] == 'statistical_calibration' and rep['deterministic'] is True
+    assert rep['seed'] == 7 and rep['n_sim'] == 100
+    assert set(rep['violations']) == set(), rep
+    for name in ('exact_signflip_enumeration', 'exact_signflip_mitm',
+                 'saddlepoint_tail', 'sequential_looks', 'tost_paired',
+                 'holm_family'):
+        assert rep['tests'][name]['null_control']['rate'] <= 0.10, (name, rep)
+        assert rep['tests'][name]['positive_control']['rate'] >= 0.60, (name, rep)
+    import inspect
+    src = inspect.getsource(A.run_report)
+    assert "'calibration': audit_statistical_calibration()" in src, src
+    assert 'calibration' in (A.__doc__ or ''), 'calibration is not documented in the audit CLI'
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            A.audit_statistical_calibration(n_sim=19)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('audit accepted an under-sized calibration simulation')
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -21948,6 +22053,8 @@ def main():
     _check('L180 full-width attention cap includes O(n*w) window tables', t_full_width_cap_accounts_for_window_tables)
     _check('L181 dose-response design requires an ordered single-axis ladder', t_dose_response_design_requires_ordered_single_axis_ladder)
     _check('L182 dose-response trend is exact, directional and shape-gated', t_dose_response_trend_is_exact_directional_and_shape_gated)
+    _check('L183 statistical calibration gates null and positive controls', t_statistical_calibration_gates_and_suite)
+    _check('L184 statistical calibration is wired into the audit report', t_statistical_calibration_is_wired_into_the_audit)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

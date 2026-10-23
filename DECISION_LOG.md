@@ -2544,3 +2544,51 @@ conflict, invalid direction/shape). `python v12_supp.py plan` still admits
 `python audit_gates.py source` is `ok` (23/23 source files byte-identical);
 `python audit_gates.py dose_response` returns `not_applicable` because the
 frozen plan has no ordered-dose declaration (explicitly not a pass).
+
+## 2026-10-23 — 统计机器先校准再使用（no new runs）
+
+零 GPU 的方法论硬化；不新增训练、不读 test split、不改冻结清单的
+任何字节/种子/终点/α/Holm 决策规则，也不改 `CODE_SEMANTICS`。
+
+**Problem.** 单元测试只能证明统计函数在给定 fixture 上返回预期形状，不能
+证明它们在重复抽样下的频率学错误率符合名义水平。精确符号翻转的枚举、n=21
+的 MITM、n>40 的鞍点尾、max-over-looks 的序列 p、TOST 的 margin 边界与
+Holm 的 FWER 任何一处实现偏差，都可能让全部 fixture 通过、却让所有真实
+面板的 p 系统性偏小。此前没有任何门直接检查「检验本身是否超发」。
+
+**Fix.** `exp_lib.STATISTICAL_CALIBRATION_POLICY` 固定种子、重复次数、
+α、功效下限与两条单侧校准阈值；新增
+`statistical_calibration_suite()` 用**局部** `SeedSequence`/`default_rng`
+流生成纯合成数据，对六条路径同时跑：
+
+- 精确符号翻转枚举（n=12）、MITM（n=21）、鞍点尾（n=48，验证 n>40 分派）；
+  每条路径还核对实际 `method` 确实是该路径，而不是在别的实现上做校准；
+- 鞍点 p 与 n=21 精确 MITM p 的逐点最大/平均绝对误差；
+- max-over-looks 序列 p（nested looks 6/9/12）；
+- 配对 TOST 在 margin 边界（null mean=1，margin=1）与零均值（正控制）；
+- Holm 六族全局 FWER 与「一个强信号 + 五个 null」的正控制。
+
+每条路径都有**负控制**（`K ~ Binomial(n_sim, alpha)` 的上尾，防止超发）
+和**正控制**（`K ~ Binomial(n_sim, power_floor)` 的下尾，防止「从不拒绝」的
+检验蒙混过关）。校准失败判 fail；仅超出名义水平但仍在蒙特卡洛噪声内判
+warning；保守行为通过。阈值固定于模拟前，不能看结果后再调。
+`audit_gates.py calibration`（别名 `stats_calibration`）把结果写入
+`audit_report.json` 的 `calibration` 键；校准不读结果树、不写
+`results_*`、不触碰全局 RNG。`policy_fp` 绑定实际生效的
+seed/n_sim/α/阈值，带覆盖参数运行不会复用默认策略的指纹。
+
+**Boundary.** 校准只验证统计机器在理想独立配对、正态、同方差数据上的
+行为，不验证真实面板的 exchangeability、随机化、配对完整性或测量同一性；
+通过校准不能修复混淆、泄漏或 optional stopping，也不是机制证据。失败表示
+该统计路径的声明不可信，不自动推翻旧结果，但基于它的新结论必须先修实现，
+不能靠换种子或换阈值绕过。策略只属于分析工具，与冻结清单、P5T 的
+α/Holm 规则和实验种子无关。
+
+**Verification.** `python test_review_fixes.py` 通过 532/532（0 skipped），
+新增 L183（二项尾已知值、保守通过、200/200 拒绝 fail、零功效 fail、
+非法计数/α/阈值 fail-closed、两次运行确定、全局 RNG 不变、六条路径齐全）
+与 L184（审计入口、报告接线、CLI 文档、过小模拟拒绝）。
+`python audit_gates.py calibration` 在默认策略（seed=20261023, n_sim=2000）
+下 status=`ok`：null 拒绝率 0.038–0.061，正控制 0.78–1.0，鞍点对精确
+max |Δp|=0.0229、mean=0.00084。`python v12_supp.py plan` 仍 72/72 合成
+冻结记录、6 个比较。
