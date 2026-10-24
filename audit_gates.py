@@ -5537,6 +5537,27 @@ def audit_analysis_choices(path=None):
             return None
         return y if math.isfinite(y) else None
 
+    def _same_choice_value(a, b):
+        # bool must not compare equal to 1/0, and a numeric string must not
+        # replay as a float (the concordance helper deliberately rejects both).
+        if isinstance(a, (bool, np.bool_)) or isinstance(b, (bool, np.bool_)):
+            return (isinstance(a, (bool, np.bool_))
+                    and isinstance(b, (bool, np.bool_))
+                    and bool(a) == bool(b))
+        if isinstance(a, (list, tuple)) or isinstance(b, (list, tuple)):
+            return (isinstance(a, (list, tuple))
+                    and isinstance(b, (list, tuple))
+                    and len(a) == len(b)
+                    and all(_same_choice_value(x, y) for x, y in zip(a, b)))
+        if isinstance(a, numbers.Number) and isinstance(b, numbers.Number):
+            if (isinstance(a, (complex, np.complexfloating))
+                    or isinstance(b, (complex, np.complexfloating))):
+                return False
+            _fa, _fb = _finite(a), _finite(b)
+            return (_fa is not None and _fb is not None
+                    and abs(_fa - _fb) <= 1e-12 * max(1.0, abs(_fa), abs(_fb)))
+        return a == b
+
     keys = ('status', 'claim', 'n_specs', 'n_available', 'n_unavailable',
             'n_nonzero', 'n_positive', 'n_negative', 'n_zero',
             'n_same_as_primary', 'n_opposite_to_primary', 'direction_stable',
@@ -5548,9 +5569,20 @@ def audit_analysis_choices(path=None):
         if not isinstance(comp, dict):
             continue
         ds = comp.get('doc_sampling')
-        cc = ds.get('analysis_choice_concordance') if isinstance(ds, dict) else None
+        _has_cc = isinstance(ds, dict) and 'analysis_choice_concordance' in ds
+        cc = ds.get('analysis_choice_concordance') if _has_cc else None
         rec = {'present': isinstance(cc, dict)}
-        if not isinstance(cc, dict):
+        if _has_cc and not isinstance(cc, dict):
+            # Present-but-malformed is not the same as absent: a corrupt block
+            # must not silently downgrade to a warning (or, worse, look like a
+            # legacy artifact that simply never recorded the sensitivity).
+            out['problems'].append(
+                f'{name}: analysis_choice_concordance is a '
+                f'{type(cc).__name__}, not a JSON object')
+            rec['error'] = 'not_an_object'
+            out['comparisons'][name] = rec
+            continue
+        if not _has_cc:
             if 'omitted' not in comp:
                 out['n_missing'] += 1
                 if (isinstance(ds, dict)
@@ -5585,10 +5617,12 @@ def audit_analysis_choices(path=None):
                 f'{name}: n_specs={cc.get("n_specs")!r} but {len(specs)} '
                 'specification rows are stored')
         names = [s.get('spec') for s in specs if isinstance(s, dict)]
-        if len(names) != len(specs) or len(set(names)) != len(names):
+        if (len(names) != len(specs)
+                or any(not isinstance(n, str) or not n.strip() for n in names)
+                or len(set(names)) != len(names)):
             out['problems'].append(
-                f'{name}: specification names are missing, duplicated or not '
-                'all dicts')
+                f'{name}: specification names are missing, non-string, '
+                'duplicated or not all dicts')
             out['comparisons'][name] = rec
             continue
         pname = cc.get('primary_spec')
@@ -5613,12 +5647,54 @@ def audit_analysis_choices(path=None):
                 out['problems'].append(
                     f'{name}: stored {k}={cc.get(k)!r} does not reproduce '
                     f'replayed {want.get(k)!r}')
+        # The aggregate keys above do not see every derived field of every
+        # row (``is_primary`` is the clearest example).  Replaying the rows
+        # and comparing them also catches a row whose stored labels/counts
+        # contradict its own point/CI instead of letting the aggregates hide it.
+        _wspecs = want.get('specifications')
+        if not isinstance(_wspecs, list) or len(_wspecs) != len(specs):
+            out['problems'].append(
+                f'{name}: specification rows do not reproduce the replayed '
+                f'row count ({len(specs)} stored vs '
+                f'{len(_wspecs) if isinstance(_wspecs, list) else "non-list"})')
+        else:
+            for _i, (_stored, _replayed) in enumerate(zip(specs, _wspecs)):
+                if not isinstance(_stored, dict) or not isinstance(_replayed, dict):
+                    out['problems'].append(
+                        f'{name}: specification row {_i} is not an object')
+                    continue
+                # Compare the fields actually stored (a hand-written minimal
+                # row may omit derived fields; the replay supplies them), but
+                # reject fields the replayed row never produces.
+                _bad = sorted(k for k in set(_stored) & set(_replayed)
+                              if not _same_choice_value(_stored.get(k),
+                                                        _replayed.get(k)))
+                _extra = sorted(set(_stored) - set(_replayed))
+                if _bad or _extra:
+                    _what = []
+                    if _bad:
+                        _what.append(f'does not reproduce fields {_bad}')
+                    if _extra:
+                        _what.append(f'has unexpected fields {_extra}')
+                    out['problems'].append(
+                        f'{name}: specification row {_i} '
+                        f'({_stored.get("spec")!r}) ' + ' and '.join(_what))
         _er = cc.get('effect_range_ppl')
         _wer = want.get('effect_range_ppl')
         if (_er is None) != (_wer is None):
             out['problems'].append(
                 f'{name}: stored effect_range_ppl presence does not reproduce')
+        elif _wer is not None and not isinstance(_er, dict):
+            out['problems'].append(
+                f'{name}: stored effect_range_ppl is a '
+                f'{type(_er).__name__}, not an object')
         elif isinstance(_er, dict) and isinstance(_wer, dict):
+            _extra = sorted(set(_er) - {'min', 'max', 'span',
+                                        'relative_span', 'n'})
+            if _extra:
+                out['problems'].append(
+                    f'{name}: stored effect_range_ppl has unexpected fields '
+                    f'{_extra}')
             for k in ('min', 'max', 'span', 'relative_span', 'n'):
                 _a, _b = _er.get(k), _wer.get(k)
                 if k == 'n':

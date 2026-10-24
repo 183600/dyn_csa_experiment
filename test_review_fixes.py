@@ -21715,6 +21715,12 @@ def t_analysis_choice_concordance_and_audit():
             (primary, [{'spec': 'x', 'point': True}]),
             (primary, [{'spec': 'x', 'point': -0.1, 'ci95': [1.0, -1.0]}]),
             (primary, [{'spec': 'x', 'point': -0.1, 'ci95': [0.0]}]),
+            (primary, [{'spec': 'x', 'point': '-0.1'}]),
+            (primary, [{'spec': 'x', 'point': -0.1,
+                        'ci95': ['-0.2', '-0.05']}]),
+            (primary, [{'spec': 'x', 'point': -0.1, 'unit': 3}]),
+            (primary, [{'spec': 'x', 'point': -0.1,
+                        'estimand': {'not': 'a label'}}]),
             (primary, [{'available': 'no', 'point': -0.1}]),
             ({'spec': 'p', 'available': False}, []),
             ({'spec': 'p', 'point': float('nan')}, []),
@@ -21777,6 +21783,28 @@ def t_analysis_choice_concordance_and_audit():
         no_ds = _audit({'comparisons': {'x': {'mean': -1.0}}})
         assert no_ds['status'] == 'not_verifiable_locally', no_ds
         assert no_ds['n_missing'] == 1 and no_ds['warnings'], no_ds
+        corrupt = _audit({'comparisons': {'x': {
+            'mean': -1.0,
+            'doc_sampling': {'analysis_choice_concordance': ['bad']}}}})
+        assert corrupt['status'] == 'fail', corrupt
+        assert any('not a JSON object' in x for x in corrupt['problems']), corrupt
+        assert corrupt['n_missing'] == 0, corrupt
+        # Replay from the stored rows cannot re-derive every label, but a
+        # self-inconsistent derived field must still fail rather than be
+        # hidden by the aggregate counts.
+        bad_row = json.loads(json.dumps(_stats(stable)))
+        bad_row['comparisons']['x']['doc_sampling'][
+            'analysis_choice_concordance']['specifications'][1][
+                'is_primary'] = True
+        row_bad = _audit(bad_row)
+        assert row_bad['status'] == 'fail', row_bad
+        assert any('specification row 1' in x for x in row_bad['problems']), row_bad
+        unhashable_name = json.loads(json.dumps(_stats(stable)))
+        unhashable_name['comparisons']['x']['doc_sampling'][
+            'analysis_choice_concordance']['specifications'][1]['spec'] = []
+        name_bad = _audit(unhashable_name)
+        assert name_bad['status'] == 'fail', name_bad
+        assert any('specification names' in x for x in name_bad['problems']), name_bad
         bad_specs = json.loads(json.dumps(_stats(stable)))
         bad_specs['comparisons']['x']['doc_sampling'][
             'analysis_choice_concordance']['specifications'][1]['spec'] = \
@@ -21832,6 +21860,15 @@ def t_analysis_choice_concordance_and_audit():
     miss_md = V12._analysis_choice_markdown(
         {'comparisons': {'x': {'doc_sampling': {'per_doc_delta_mean': -1.0}}}})
     assert any('未验证' in line and 'x' in line for line in miss_md), miss_md
+    # A corrupt external artifact must render as unverified, never crash the
+    # report while trying to describe it.
+    corrupt_md = '\n'.join(V12._analysis_choice_markdown(
+        {'comparisons': {'x': {'doc_sampling': {
+            'analysis_choice_concordance': {
+                'status': 'stable', 'primary_sign': 'not-a-number',
+                'effect_range_ppl': ['not', 'an', 'object'],
+                'specifications': 3}}}}}))
+    assert '未验证' in corrupt_md and 'x' in corrupt_md, corrupt_md
 
 
 def main():

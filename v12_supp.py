@@ -3318,19 +3318,29 @@ def _analysis_choice_markdown(ft):
     details = []
     missing = []
     fragile = []
+    corrupt = []
+
+    def _mark_corrupt(name):
+        if name not in corrupt:
+            corrupt.append(name)
+
     for name, comp in comps.items():
         if not isinstance(comp, dict):
             continue
         dsm = comp.get('doc_sampling') or {}
-        cc = dsm.get('analysis_choice_concordance') if isinstance(dsm, dict) else None
+        _has_cc = isinstance(dsm, dict) and 'analysis_choice_concordance' in dsm
+        cc = dsm.get('analysis_choice_concordance') if _has_cc else None
         if not isinstance(cc, dict):
-            if (isinstance(dsm, dict)
+            if _has_cc:
+                _mark_corrupt(name)
+            elif (isinstance(dsm, dict)
                     and (dsm.get('per_doc_delta_mean') is not None
                          or dsm.get('pooled_delta_ppl') is not None)):
                 missing.append(name)
             continue
         status = cc.get('status')
-        if status not in labels:
+        if not isinstance(status, str) or status not in labels:
+            _mark_corrupt(name)
             continue
         n_specs = cc.get('n_specs')
         n_avail = cc.get('n_available')
@@ -3339,28 +3349,46 @@ def _analysis_choice_markdown(ft):
         n_excl = cc.get('n_excluding_zero')
         n_ci = cc.get('n_with_ci')
         psign = cc.get('primary_sign')
+        if isinstance(psign, (bool, np.bool_)):
+            psign = None
+        else:
+            try:
+                psign = float(psign) if psign is not None else None
+            except (TypeError, ValueError, OverflowError):
+                psign = None
+        if psign is None and cc.get('primary_sign') is not None:
+            _mark_corrupt(name)
         if psign is None or psign == 0:
             sign_txt = '零/无方向'
         else:
-            sign_txt = '负（a 更低）' if float(psign) < 0 else '正（a 更高）'
+            sign_txt = '负（a 更低）' if psign < 0 else '正（a 更高）'
         same_txt = f'{n_same}/{n_opp}' if n_same is not None else '—'
         ci_txt = (f'{n_excl}/{n_ci}' if n_ci is not None else '—')
         if cc.get('precision_concordant') is False:
             ci_txt += '（不一致）'
-        er = cc.get('effect_range_ppl') or {}
-        if all(isinstance(er.get(k), (int, float)) for k in ('min', 'max')):
+        er = cc.get('effect_range_ppl')
+        if isinstance(er, dict) and all(
+                isinstance(er.get(k), (int, float))
+                and not isinstance(er.get(k), (bool, np.bool_))
+                for k in ('min', 'max')):
             rng = f'[{er["min"]:+.3f}, {er["max"]:+.3f}]'
-            if isinstance(er.get('span'), (int, float)):
+            if (isinstance(er.get('span'), (int, float))
+                    and not isinstance(er.get('span'), (bool, np.bool_))):
                 rng += f'（跨度 {er["span"]:.3f}）'
         else:
             rng = '—'
+            if er is not None:
+                _mark_corrupt(name)
         flag = labels[status]
         if cc.get('fragile'):
             fragile.append(name)
         rows.append('| %s | %s/%s | %s | %s | %s | %s | %s |'
                     % (name, n_avail, n_specs, sign_txt, same_txt,
                        ci_txt, rng, flag))
-        specs = cc.get('specifications') or []
+        specs = cc.get('specifications')
+        if not isinstance(specs, list):
+            specs = []
+            _mark_corrupt(name)
         if status == 'direction_unstable':
             opp = [str(s.get('spec')) for s in specs
                    if isinstance(s, dict) and s.get('available')
@@ -3374,7 +3402,7 @@ def _analysis_choice_markdown(ft):
                 details.append(
                     f'{name}: 排除零的规格 {excl or "无"}；跨零的规格 '
                     f'{cross or "无"}')
-    if not rows and not missing:
+    if not rows and not missing and not corrupt:
         return []
     out = ['### 分析口径一致性（post-hoc；不改变上面的冻结判定）', '']
     if rows:
@@ -3396,6 +3424,9 @@ def _analysis_choice_markdown(ft):
         out += ['> 以下比较有 doc_sampling 但缺少分析口径一致性块'
                 '（旧产物或未重新生成分析），该敏感性**未验证**：'
                 + '、'.join(missing) + '。', '']
+    if corrupt:
+        out += ['> 以下比较的分析口径一致性块损坏或状态未知，该敏感性'
+                '**未验证**：' + '、'.join(corrupt) + '。', '']
     if fragile:
         out += ['**解读提示**：' + '、'.join(fragile) +
                 ' 的方向或精度结论依赖分析口径；引用时必须同时报告本表，'
@@ -4385,9 +4416,11 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
                   '下方「单元影响诊断」，不能把结论描述为对评测文档稳健。')
             _choice_conf = []
             for _k in _conf:
-                _cc = ((comps.get(_k, {}).get('doc_sampling') or {})
-                       .get('analysis_choice_concordance') or {})
-                if _cc.get('fragile') is True:
+                _cmp = comps.get(_k)
+                _ds = _cmp.get('doc_sampling') if isinstance(_cmp, dict) else None
+                _cc = (_ds.get('analysis_choice_concordance')
+                       if isinstance(_ds, dict) else None)
+                if isinstance(_cc, dict) and _cc.get('fragile') is True:
                     _choice_conf.append(
                         f'{_k}（{_cc.get("status")}）')
             if _choice_conf:

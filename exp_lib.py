@@ -14391,7 +14391,16 @@ ANALYSIS_CHOICE_POLICY = {
 
 
 def _choice_number(value):
-    if isinstance(value, (bool, np.bool_)):
+    """Finite real scalar for an analysis-choice row.
+
+    A numeric string is not a measurement: accepting ``"1.0"`` here would let
+    a hand-edited/stale artifact replay as if it were a number (and would make
+    the audit's stored/replayed comparison type-blind).  Booleans and complex
+    values are rejected for the same reason as in :func:`_finite_scalar`.
+    """
+    if (isinstance(value, (bool, np.bool_))
+            or isinstance(value, (complex, np.complexfloating))
+            or not isinstance(value, numbers.Number)):
         return None
     try:
         out = float(value)
@@ -14419,6 +14428,10 @@ def _choice_row(raw, *, primary=False, zero_tol=0.0):
     if not isinstance(spec, str) or not spec.strip():
         raise ValueError('specification needs a non-empty string `spec`')
     spec = spec.strip()
+    for _key in ('estimand', 'unit', 'scale'):
+        _val = raw.get(_key)
+        if _val is not None and not isinstance(_val, str):
+            raise ValueError(f'{spec}: {_key} must be a string or None')
     available = raw.get('available', True)
     if not isinstance(available, (bool, np.bool_)):
         raise ValueError(f'{spec}: available must be a boolean')
@@ -14431,6 +14444,8 @@ def _choice_row(raw, *, primary=False, zero_tol=0.0):
         if point is None:
             raise ValueError(f'{spec}: available specification needs a finite point')
         ci = _choice_interval(raw.get('ci95'))
+        if reason is not None and not isinstance(reason, str):
+            raise ValueError(f'{spec}: reason must be a string or None')
     else:
         if not isinstance(reason, str) or not reason.strip():
             reason = 'specification explicitly marked unavailable'
