@@ -14484,7 +14484,9 @@ def analysis_choice_concordance(primary, alternatives, *, zero_tol=0.0):
       zero-exclusion), ``direction_unstable``, ``zero_effect`` or
       ``insufficient_specs``;
     * ``effect_range_ppl`` gives the min/max/span across PPL-delta
-      specifications only (log-ratio/win-rate points are not pooled into it).
+      specifications only (log-ratio/win-rate points are not pooled into it);
+      ``relative_span`` is emitted only when the primary point is itself a
+      PPL-delta, so the ratio never mixes two scales.
 
     The helper deliberately computes **no p-value** and performs no
     multiplicity correction: adding specifications to a significance family
@@ -14546,7 +14548,8 @@ def analysis_choice_concordance(primary, alternatives, *, zero_tol=0.0):
         effect_range = {
             'min': float(_lo), 'max': float(_hi), 'span': _span,
             'relative_span': (float(_span / abs(p['point']))
-                              if abs(p['point']) > 0.0 else None),
+                              if (p['scale'] == 'ppl_delta'
+                                  and abs(p['point']) > 0.0) else None),
             'n': len(ppl_points),
         }
     claim = {

@@ -5529,7 +5529,8 @@ def audit_analysis_choices(path=None):
         return out
 
     def _finite(x):
-        if isinstance(x, (bool, np.bool_)):
+        if (isinstance(x, (bool, np.bool_, str, bytes, bytearray))
+                or x is None):
             return None
         try:
             y = float(x)
@@ -5612,7 +5613,7 @@ def audit_analysis_choices(path=None):
                 f'{name}: specifications must be a list with at least 2 rows')
             out['comparisons'][name] = rec
             continue
-        if cc.get('n_specs') != len(specs):
+        if not _same_choice_value(cc.get('n_specs'), len(specs)):
             out['problems'].append(
                 f'{name}: n_specs={cc.get("n_specs")!r} but {len(specs)} '
                 'specification rows are stored')
@@ -5643,7 +5644,7 @@ def audit_analysis_choices(path=None):
             out['comparisons'][name] = rec
             continue
         for k in keys:
-            if cc.get(k) != want.get(k):
+            if not _same_choice_value(cc.get(k), want.get(k)):
                 out['problems'].append(
                     f'{name}: stored {k}={cc.get(k)!r} does not reproduce '
                     f'replayed {want.get(k)!r}')
@@ -5698,7 +5699,7 @@ def audit_analysis_choices(path=None):
             for k in ('min', 'max', 'span', 'relative_span', 'n'):
                 _a, _b = _er.get(k), _wer.get(k)
                 if k == 'n':
-                    if _a != _b:
+                    if not _same_choice_value(_a, _b):
                         out['problems'].append(
                             f'{name}: effect_range_ppl.{k}={_a!r} does not '
                             f'reproduce {_b!r}')

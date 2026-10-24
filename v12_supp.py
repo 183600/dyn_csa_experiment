@@ -3364,8 +3364,12 @@ def _analysis_choice_markdown(ft):
             sign_txt = '负（a 更低）' if psign < 0 else '正（a 更高）'
         same_txt = f'{n_same}/{n_opp}' if n_same is not None else '—'
         ci_txt = (f'{n_excl}/{n_ci}' if n_ci is not None else '—')
-        if cc.get('precision_concordant') is False:
-            ci_txt += '（不一致）'
+        _pc = cc.get('precision_concordant')
+        if isinstance(_pc, (bool, np.bool_)):
+            if not bool(_pc):
+                ci_txt += '（不一致）'
+        elif _pc is not None:
+            _mark_corrupt(name)
         er = cc.get('effect_range_ppl')
         if isinstance(er, dict) and all(
                 isinstance(er.get(k), (int, float))
@@ -3380,8 +3384,12 @@ def _analysis_choice_markdown(ft):
             if er is not None:
                 _mark_corrupt(name)
         flag = labels[status]
-        if cc.get('fragile'):
-            fragile.append(name)
+        _frag = cc.get('fragile')
+        if isinstance(_frag, (bool, np.bool_)):
+            if bool(_frag):
+                fragile.append(name)
+        elif _frag is not None:
+            _mark_corrupt(name)
         rows.append('| %s | %s/%s | %s | %s | %s | %s | %s |'
                     % (name, n_avail, n_specs, sign_txt, same_txt,
                        ci_txt, rng, flag))

@@ -21668,6 +21668,19 @@ def t_analysis_choice_concordance_and_audit():
     assert stable['n_excluding_zero'] == 3 and stable['n_crossing_zero'] == 0, stable
     er = stable['effect_range_ppl']
     assert er['min'] == -1.0 and er['max'] == -0.5 and er['n'] == 2, stable
+    assert er['relative_span'] == 0.5, stable
+    # A PPL-delta range must not be divided by a primary point on another
+    # scale (log-ratio here): that would publish a meaningless mixed-unit ratio.
+    mixed_scale = L.analysis_choice_concordance(
+        {'spec': 'unit_log_ratio', 'unit': 'article', 'scale': 'log_ratio',
+         'point': -0.2, 'ci95': [-0.4, -0.05]},
+        [{'spec': 'seed_mean', 'unit': 'seed', 'scale': 'ppl_delta',
+          'point': -1.0},
+         {'spec': 'unit_mean', 'unit': 'article', 'scale': 'ppl_delta',
+          'point': -1.5}])
+    _mser = mixed_scale['effect_range_ppl']
+    assert _mser['min'] == -1.5 and _mser['max'] == -1.0, mixed_scale
+    assert _mser['span'] == 0.5 and _mser['relative_span'] is None, mixed_scale
     assert not any(k.startswith('p_') for k in stable), stable
     # A second interval that crosses zero while the direction still agrees is
     # precision sensitivity, not a direction contradiction.
@@ -21776,6 +21789,17 @@ def t_analysis_choice_concordance_and_audit():
         bad_mean = _audit(_stats(stable, mean=-2.0))
         assert bad_mean['status'] == 'fail', bad_mean
         assert any('frozen per-seed mean' in x for x in bad_mean['problems']), bad_mean
+        # Type-blind replay is not a reproduction: an aggregate flag written as
+        # 1 and a numeric string mean must both fail.
+        bool_aggregate = json.loads(json.dumps(_stats(stable)))
+        bool_aggregate['comparisons']['x']['doc_sampling'][
+            'analysis_choice_concordance']['direction_stable'] = 1
+        bool_bad = _audit(bool_aggregate)
+        assert bool_bad['status'] == 'fail', bool_bad
+        assert any('direction_stable' in x for x in bool_bad['problems']), bool_bad
+        string_mean = _audit(_stats(stable, mean='-1.0'))
+        assert string_mean['status'] == 'fail', string_mean
+        assert any('frozen mean is missing' in x for x in string_mean['problems']), string_mean
         stale = _audit({'comparisons': {'x': {
             'mean': -1.0, 'doc_sampling': {'per_doc_delta_mean': -1.0}}}})
         assert stale['status'] == 'not_verifiable_locally', stale
@@ -21869,6 +21893,15 @@ def t_analysis_choice_concordance_and_audit():
                 'effect_range_ppl': ['not', 'an', 'object'],
                 'specifications': 3}}}}}))
     assert '未验证' in corrupt_md and 'x' in corrupt_md, corrupt_md
+    # A string "false" is not a boolean flag: it must not be rendered as a
+    # fragility warning, and the corrupt block must be marked unverified.
+    false_fragile = json.loads(json.dumps(stable))
+    false_fragile['fragile'] = 'false'
+    ff_md = '\n'.join(V12._analysis_choice_markdown(
+        {'comparisons': {'x': {'doc_sampling': {
+            'analysis_choice_concordance': false_fragile}}}}))
+    assert '未验证' in ff_md, ff_md
+    assert '**解读提示**' not in ff_md and '依赖分析口径' not in ff_md, ff_md
 
 
 def main():
