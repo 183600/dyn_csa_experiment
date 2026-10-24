@@ -39,6 +39,10 @@
   unit_influence  结果分析：逐评测单位删除（leave-one-out）影响读数是否
                与主终点同口径、是否由单个文章/文档主导（读 analysis_v12/，
                零 GPU；warning 级，不改变冻结判定）
+  analysis_choices  结果分析：同一主比较的多种分析口径（逐种子 mean/median/
+               trimmed、token 池化、逐单元 mean/median/log-ratio/win-rate）
+               是否方向一致、带区间的口径是否一致地排除零（读 analysis_v12/，
+               零 GPU；warning 级，不改变冻结判定）
   looks        序列观测 / optional stopping：逐面板 look history 的种子集合、
                逐种子配对差、逐 look p 与 max-over-looks 序列 p 是否自洽；
                朴素最终 p 显著但序列 p 不显著的对照会被点名（零 GPU）
@@ -5484,6 +5488,197 @@ def audit_unit_influence(path=None):
     return out
 
 
+def audit_analysis_choices(path=None):
+    """Result-analysis audit: multi-specification concordance is coherent.
+
+    A single panel can be described by per-seed mean/median/trimmed summaries,
+    a token-pooled difference, or equal-weighted evaluation units.  The report
+    records ``doc_sampling.analysis_choice_concordance``; this gate
+    independently replays that summary from the stored specification rows and
+    checks it against the frozen per-seed mean.  Disagreement in direction or
+    in zero-exclusion is a **warning** (a reporting caveat), not a change to
+    the frozen decision.  A stale, internally inconsistent or non-reproducible
+    block is a ``fail`` because it cannot support the claim that the
+    sensitivity was actually checked.
+    """
+    L = _import_exp_lib()
+    p = path or os.path.join(REPO, 'analysis_v12', 'test_stats.json')
+    out = {'kind': 'analysis_choice_audit', 'status': 'ok', 'path': p,
+           'comparisons': {}, 'n_ok': 0, 'n_fragile': 0,
+           'n_missing': 0, 'problems': [], 'warnings': [],
+           'note': ('post-hoc specification concordance; divergent directions or '
+                    'zero-exclusion are reporting caveats, never changes to a '
+                    'frozen p/Holm/confirmed verdict')}
+    if not os.path.exists(p):
+        out['status'] = 'not_verifiable_locally'
+        out['reason'] = 'no final-test stats artifact on disk'
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return out
+    data = _load(p)
+    if data is None:
+        out['status'] = 'fail'
+        out['problems'].append(f'{p} exists but is not a readable JSON object')
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return out
+    ft = data.get('finaltest') if isinstance(data.get('finaltest'), dict) else data
+    comps = ft.get('comparisons') if isinstance(ft, dict) else None
+    if not isinstance(comps, dict) or not comps:
+        out['status'] = 'not_verifiable_locally'
+        out['reason'] = 'the stats artifact carries no comparisons'
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return out
+
+    def _finite(x):
+        if isinstance(x, (bool, np.bool_)):
+            return None
+        try:
+            y = float(x)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return y if math.isfinite(y) else None
+
+    keys = ('status', 'claim', 'n_specs', 'n_available', 'n_unavailable',
+            'n_nonzero', 'n_positive', 'n_negative', 'n_zero',
+            'n_same_as_primary', 'n_opposite_to_primary', 'direction_stable',
+            'n_with_ci', 'n_excluding_zero', 'n_crossing_zero',
+            'precision_concordant', 'excluding_zero_specs',
+            'crossing_zero_specs', 'fragile', 'primary_sign',
+            'primary_excludes_zero')
+    for name, comp in comps.items():
+        if not isinstance(comp, dict):
+            continue
+        ds = comp.get('doc_sampling')
+        cc = ds.get('analysis_choice_concordance') if isinstance(ds, dict) else None
+        rec = {'present': isinstance(cc, dict)}
+        if not isinstance(cc, dict):
+            if 'omitted' not in comp:
+                out['n_missing'] += 1
+                if (isinstance(ds, dict)
+                        and (ds.get('per_doc_delta_mean') is not None
+                             or ds.get('pooled_delta_ppl') is not None)):
+                    _why = ('doc_sampling exists but no analysis-choice block '
+                            '(stale/legacy analysis artifact)')
+                else:
+                    _why = 'no doc_sampling/analysis-choice block'
+                out['warnings'].append(
+                    f'{name}: {_why}; the multi-specification sensitivity is '
+                    'unverified')
+            out['comparisons'][name] = rec
+            continue
+        rec['status'] = cc.get('status')
+        specs = cc.get('specifications')
+        rec['n_specs'] = cc.get('n_specs')
+        if cc.get('kind') != 'analysis_choice_concordance':
+            out['problems'].append(
+                f'{name}: unexpected kind {cc.get("kind")!r}')
+        if cc.get('version') != L.ANALYSIS_CHOICE_POLICY['version']:
+            out['problems'].append(
+                f'{name}: analysis-choice version {cc.get("version")!r} does '
+                f'not match {L.ANALYSIS_CHOICE_POLICY["version"]!r}')
+        if not isinstance(specs, list) or len(specs) < 2:
+            out['problems'].append(
+                f'{name}: specifications must be a list with at least 2 rows')
+            out['comparisons'][name] = rec
+            continue
+        if cc.get('n_specs') != len(specs):
+            out['problems'].append(
+                f'{name}: n_specs={cc.get("n_specs")!r} but {len(specs)} '
+                'specification rows are stored')
+        names = [s.get('spec') for s in specs if isinstance(s, dict)]
+        if len(names) != len(specs) or len(set(names)) != len(names):
+            out['problems'].append(
+                f'{name}: specification names are missing, duplicated or not '
+                'all dicts')
+            out['comparisons'][name] = rec
+            continue
+        pname = cc.get('primary_spec')
+        primaries = [s for s in specs if s.get('spec') == pname]
+        if len(primaries) != 1:
+            out['problems'].append(
+                f'{name}: primary_spec {pname!r} does not identify exactly one '
+                'stored specification')
+            out['comparisons'][name] = rec
+            continue
+        alts = [s for s in specs if s.get('spec') != pname]
+        try:
+            want = L.analysis_choice_concordance(primaries[0], alts)
+        except (ValueError, TypeError, FloatingPointError, OverflowError) as e:
+            out['problems'].append(
+                f'{name}: stored specifications cannot be replayed '
+                f'({type(e).__name__}: {e})')
+            out['comparisons'][name] = rec
+            continue
+        for k in keys:
+            if cc.get(k) != want.get(k):
+                out['problems'].append(
+                    f'{name}: stored {k}={cc.get(k)!r} does not reproduce '
+                    f'replayed {want.get(k)!r}')
+        _er = cc.get('effect_range_ppl')
+        _wer = want.get('effect_range_ppl')
+        if (_er is None) != (_wer is None):
+            out['problems'].append(
+                f'{name}: stored effect_range_ppl presence does not reproduce')
+        elif isinstance(_er, dict) and isinstance(_wer, dict):
+            for k in ('min', 'max', 'span', 'relative_span', 'n'):
+                _a, _b = _er.get(k), _wer.get(k)
+                if k == 'n':
+                    if _a != _b:
+                        out['problems'].append(
+                            f'{name}: effect_range_ppl.{k}={_a!r} does not '
+                            f'reproduce {_b!r}')
+                    continue
+                _fa, _fb = _finite(_a), _finite(_b)
+                if (_fa is None) != (_fb is None):
+                    out['problems'].append(
+                        f'{name}: effect_range_ppl.{k} presence does not '
+                        'reproduce')
+                elif _fa is not None and abs(_fa - _fb) > 1e-9 * max(
+                        1.0, abs(_fb)):
+                    out['problems'].append(
+                        f'{name}: effect_range_ppl.{k}={_fa!r} does not '
+                        f'reproduce {_fb!r}')
+        _pm = _finite(primaries[0].get('point'))
+        _mean = _finite(comp.get('mean'))
+        if _pm is None or _mean is None:
+            out['problems'].append(
+                f'{name}: primary analysis-choice point or frozen mean is '
+                'missing/non-finite')
+        elif abs(_pm - _mean) > 1e-6 * max(1.0, abs(_mean)):
+            out['problems'].append(
+                f'{name}: primary analysis-choice point {_pm!r} does not '
+                f'reproduce the frozen per-seed mean {_mean!r}')
+        if cc.get('status') in ('direction_unstable', 'precision_sensitive'):
+            out['n_fragile'] += 1
+            if cc.get('status') == 'direction_unstable':
+                out['warnings'].append(
+                    f'{name}: analysis specifications disagree on direction; '
+                    'the report must show the specification table and must not '
+                    'quote one aggregation as robust')
+            else:
+                out['warnings'].append(
+                    f'{name}: direction is stable but zero-exclusion depends on '
+                    'the analysis choice; interval claims must name the unit/'
+                    'estimand')
+        elif cc.get('status') in ('insufficient_specs', 'zero_effect'):
+            out['warnings'].append(
+                f'{name}: analysis-choice status is {cc.get("status")!r}; the '
+                'multi-specification check is not informative')
+        else:
+            out['n_ok'] += 1
+        out['comparisons'][name] = rec
+    if out['problems']:
+        out['status'] = 'fail'
+    elif out['n_ok'] == 0 and not out['n_fragile']:
+        out['status'] = 'not_verifiable_locally'
+        out['reason'] = ('no comparison carries a replayable analysis-choice '
+                         'block')
+    elif out['warnings']:
+        out['status'] = 'warnings'
+    print(json.dumps({k: v for k, v in out.items() if k != 'comparisons'},
+                     ensure_ascii=False, indent=2))
+    return out
+
+
 def _find_look_histories(paths=None, max_depth=3):
     """Yield ``look_history.json`` paths from explicit paths or results_* trees."""
     seen = set()
@@ -5769,7 +5964,7 @@ def audit_statistical_calibration(*, n_sim=None, seed=None):
 
 
 def run_report(out='audit_report.json'):
-    res = {'generated_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'source_tree': audit_source_integrity(), 'dependencies': audit_dependencies(), 'data_source': audit_data_source(), 'leakage': audit_leakage(), 'split_discipline': audit_split_discipline(), 'document_unit': audit_document_unit(), 'sample_design': audit_sample_design(), 'attribution': audit_attribution(), 'boundary': audit_boundary(), 'length': audit_length(), 'fairness': audit_fairness(), 'metrics': audit_metrics(), 'tuning': audit_tuning(), 'simple_baseline': audit_simple_baseline(), 'hypotheses': audit_hypotheses(), 'sesoi': audit_sesoi_declaration(), 'unit_influence': audit_unit_influence(), 'looks': audit_look_history(), 'methodology': audit_methodology(), 'single_factor': audit_single_factor(), 'factorial': audit_factorial_design(), 'design_preflight': audit_design_preflight(), 'dose_response': audit_dose_response(verbose=False), 'failures': audit_failures(), 'budget': audit_budget(), 'training_health': audit_training_health(), 'efficiency_pairs': audit_efficiency_pairs(), 'release': audit_release_readiness(), 'selection': audit_selection(), 'run_order': audit_run_order(), 'calibration': audit_statistical_calibration()}
+    res = {'generated_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'source_tree': audit_source_integrity(), 'dependencies': audit_dependencies(), 'data_source': audit_data_source(), 'leakage': audit_leakage(), 'split_discipline': audit_split_discipline(), 'document_unit': audit_document_unit(), 'sample_design': audit_sample_design(), 'attribution': audit_attribution(), 'boundary': audit_boundary(), 'length': audit_length(), 'fairness': audit_fairness(), 'metrics': audit_metrics(), 'tuning': audit_tuning(), 'simple_baseline': audit_simple_baseline(), 'hypotheses': audit_hypotheses(), 'sesoi': audit_sesoi_declaration(), 'unit_influence': audit_unit_influence(), 'analysis_choices': audit_analysis_choices(), 'looks': audit_look_history(), 'methodology': audit_methodology(), 'single_factor': audit_single_factor(), 'factorial': audit_factorial_design(), 'design_preflight': audit_design_preflight(), 'dose_response': audit_dose_response(verbose=False), 'failures': audit_failures(), 'budget': audit_budget(), 'training_health': audit_training_health(), 'efficiency_pairs': audit_efficiency_pairs(), 'release': audit_release_readiness(), 'selection': audit_selection(), 'run_order': audit_run_order(), 'calibration': audit_statistical_calibration()}
     L_atomic = None
     try:
         L = _import_exp_lib()
@@ -5789,7 +5984,7 @@ def run_report(out='audit_report.json'):
 
 
 if __name__ == '__main__':
-    _cmds = {'leakage': audit_leakage, 'split': audit_split_discipline, 'split_discipline': audit_split_discipline, 'document_unit': audit_document_unit, 'unit': audit_document_unit, 'sample_design': audit_sample_design, 'sampling': audit_sample_design, 'sample': audit_sample_design, 'causality': audit_causality, 'attribution': audit_attribution, 'boundary': audit_boundary, 'length': audit_length, 'fairness': audit_fairness, 'metrics': audit_metrics, 'tuning': audit_tuning, 'simple': audit_simple_baseline, 'baseline_floor': audit_simple_baseline, 'baseline_plan': audit_baseline_design, 'hypothesis_coverage': audit_hypothesis_coverage, 'hypotheses': audit_hypotheses, 'sesoi': audit_sesoi_declaration, 'unit_influence': audit_unit_influence, 'influence': audit_unit_influence, 'looks': audit_look_history, 'look_history': audit_look_history, 'methodology': audit_methodology, 'single_factor': audit_single_factor, 'factorial': audit_factorial_design, 'factorial_design': audit_factorial_design, 'design': audit_design_preflight, 'design_preflight': audit_design_preflight, 'dose_response': audit_dose_response, 'dose_response_design': audit_dose_response, 'failures': audit_failures, 'budget': audit_budget, 'efficiency': audit_efficiency_demo, 'efficiency_pairs': audit_efficiency_pairs, 'training_health': audit_training_health, 'selection': audit_selection, 'release': audit_release_readiness, 'run_order': audit_run_order, 'calibration': audit_statistical_calibration, 'stats_calibration': audit_statistical_calibration, 'type_i': audit_statistical_calibration, 'source': audit_source_integrity, 'source_tree': audit_source_integrity, 'dependencies': audit_dependencies, 'dependency': audit_dependencies, 'data_source': audit_data_source, 'dataset_source': audit_data_source, 'report': run_report}
+    _cmds = {'leakage': audit_leakage, 'split': audit_split_discipline, 'split_discipline': audit_split_discipline, 'document_unit': audit_document_unit, 'unit': audit_document_unit, 'sample_design': audit_sample_design, 'sampling': audit_sample_design, 'sample': audit_sample_design, 'causality': audit_causality, 'attribution': audit_attribution, 'boundary': audit_boundary, 'length': audit_length, 'fairness': audit_fairness, 'metrics': audit_metrics, 'tuning': audit_tuning, 'simple': audit_simple_baseline, 'baseline_floor': audit_simple_baseline, 'baseline_plan': audit_baseline_design, 'hypothesis_coverage': audit_hypothesis_coverage, 'hypotheses': audit_hypotheses, 'sesoi': audit_sesoi_declaration, 'unit_influence': audit_unit_influence, 'influence': audit_unit_influence, 'analysis_choices': audit_analysis_choices, 'specification_curve': audit_analysis_choices, 'analysis_choice': audit_analysis_choices, 'looks': audit_look_history, 'look_history': audit_look_history, 'methodology': audit_methodology, 'single_factor': audit_single_factor, 'factorial': audit_factorial_design, 'factorial_design': audit_factorial_design, 'design': audit_design_preflight, 'design_preflight': audit_design_preflight, 'dose_response': audit_dose_response, 'dose_response_design': audit_dose_response, 'failures': audit_failures, 'budget': audit_budget, 'efficiency': audit_efficiency_demo, 'efficiency_pairs': audit_efficiency_pairs, 'training_health': audit_training_health, 'selection': audit_selection, 'release': audit_release_readiness, 'run_order': audit_run_order, 'calibration': audit_statistical_calibration, 'stats_calibration': audit_statistical_calibration, 'type_i': audit_statistical_calibration, 'source': audit_source_integrity, 'source_tree': audit_source_integrity, 'dependencies': audit_dependencies, 'dependency': audit_dependencies, 'data_source': audit_data_source, 'dataset_source': audit_data_source, 'report': run_report}
     _arg = sys.argv[1] if len(sys.argv) > 1 else 'report'
     if _arg in ('-h', '--help'):
         print(__doc__)

@@ -2651,3 +2651,55 @@ suite fail。
 6 个比较；`python audit_gates.py source` 在刷新快照后 status=`ok`
 （23/23 文件字节一致），`audit_gates.py report` 的 `calibration` 键为
 `ok`。
+
+## 2026-10-24 — 分析口径的多重性要显式对账（no new runs）
+
+零 GPU 的方法论硬化；不新增训练、不读 test split、不改冻结清单的
+任何字节/种子/终点/α/Holm 决策规则，也不改 `CODE_SEMANTICS`。
+
+**Problem.** §61/§62 校准了 p 值与区间，但同一份冻结 panel 仍可在多种
+聚合口径之间选择：逐种子 mean/median/trimmed mean、token 池化 ΔPPL、
+逐评测单元 mean/median/log-ratio/win-balance。这些口径回答不同估计量，本可
+不一致；报告只展示其中一个时，读者看不到方向与零排除是否随口径改变，分析
+者也可以挑选最有利的口径并称其「稳健」。一个超大文档可以让 token 池化
+ΔPPL 为正、而等权逐单元中位数为负；此前 `doc_sampling` 虽逐项记录，却没有
+显式的口径间对账块，也没有审计门检查该块是否被省略或篡改。
+
+**Fix.** 新增
+`exp_lib.analysis_choice_concordance(primary, alternatives)`：对主口径与
+声明式口径集合计算 `direction_stable`、`precision_concordant`、
+`effect_range_ppl`、逐口径 `sign`/`excludes_zero`/`available`，并给出
+`stable`、`precision_sensitive`、`direction_unstable`、`zero_effect`、
+`insufficient_specs` 五态。它**不计算 p 值、不做多重校正、不新增检验**，
+只把口径选择显式化，避免把 forking paths 塞进显著性族。
+
+`v12_supp._doc_level_analysis` 现把 8 条口径写入
+`doc_sampling.analysis_choice_concordance`：逐种子 mean（主口径）、
+median、20% trimmed mean，token 池化 ΔPPL，逐单元 mean、median、
+log-ratio、win-balance（`(n_positive - n_negative) / n_units`，负号表示
+a 更常更低；全平局为 0）。种子不足 5 时 trimmed mean 显式不可用，缺失区间显式留空。
+报告新增「分析口径一致性」表，列出可用/总口径、主方向、同向/反向、区间
+排除零计数、PPL 范围，并在方向翻转/精度敏感时点名具体口径、提示不得只报
+单一聚合。`audit_gates.py analysis_choices`（别名 `specification_curve`、
+`analysis_choice`）从 `analysis_v12/test_stats.json` 重放存储的口径行：
+块内状态/计数/方向/零排除不可复现，或主口径点估计与冻结逐种子均值不符，
+判 fail；方向翻转/精度敏感判 warning；旧产物缺少该块判
+`not_verifiable_locally`，不冒充通过。
+
+**Boundary.** 口径同向不是统计独立复现，也不是「换一种聚合仍显著」的
+证明；`precision_sensitive` 在单位/估计量不同时是正常现象，不能读成方向
+失败。该块只枚举当前报告实际使用的口径，不覆盖截尾比例、加权方案、文档
+过滤、长度子集等未枚举的分析选择，因此不能证明「没有其他口径会翻转」。
+逐种子/逐单元/token 池化区间条件在不同抽样源上；本块只比较是否排除零，
+不比较宽度，也不合并两种不确定性。全部读数仍是 post-hoc 描述，不改变
+精确符号翻转 p、Holm 决策、冻结清单或 P5T 的确认判定。
+
+**Verification.** `python test_review_fixes.py` 通过 536/536（0 skipped，
+新增 L188）：五态、零/不可用口径、CI-less 口径、重复名/非法 CI/布尔点/
+非有限主口径/非法 `zero_tol` fail-closed、输入不变；审计稳定→ok、方向
+翻转→warnings、状态篡改/主均值不符/重复名→fail、旧产物→
+`not_verifiable_locally`；合成「token 池化正、逐单元中位数为负」panel 被
+标为 `direction_unstable` 且报告保留 caveat。`python v12_supp.py plan`
+仍 72/72 合成冻结记录、6 个比较；`python audit_gates.py analysis_choices`
+在无 `analysis_v12/test_stats.json` 时返回 `not_verifiable_locally`（不冒充
+通过）。

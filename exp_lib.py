@@ -14378,6 +14378,204 @@ def paired_effect_stats(deltas, alpha=0.05, min_n=3, with_values=None, without_v
             'ci95_paired_bootstrap': _paired_ci, 'ci95_unpaired_bootstrap': _unpaired_ci,
             **_pair_fields}
 
+ANALYSIS_CHOICE_POLICY = {
+    'version': 'analysis-choice-1',
+    'min_specs': 2,
+    'statuses': ('stable', 'precision_sensitive', 'direction_unstable',
+                 'zero_effect', 'insufficient_specs'),
+    'note': ('post-hoc specification concordance only: it re-describes one '
+             'panel under several aggregation/weighting choices and never adds '
+             'a test, a p-value or a Holm member, and never changes a frozen '
+             'decision'),
+}
+
+
+def _choice_number(value):
+    if isinstance(value, (bool, np.bool_)):
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return out if math.isfinite(out) else None
+
+
+def _choice_interval(value):
+    if value is None:
+        return None
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        raise ValueError(f'ci95 must be a two-element sequence, got {value!r}')
+    lo = _choice_number(value[0])
+    hi = _choice_number(value[1])
+    if lo is None or hi is None or lo > hi:
+        raise ValueError(f'ci95 must be finite with lo<=hi, got {value!r}')
+    return [lo, hi]
+
+
+def _choice_row(raw, *, primary=False, zero_tol=0.0):
+    if not isinstance(raw, dict):
+        raise ValueError(f'specification must be a dict, got {type(raw).__name__}')
+    spec = raw.get('spec')
+    if not isinstance(spec, str) or not spec.strip():
+        raise ValueError('specification needs a non-empty string `spec`')
+    spec = spec.strip()
+    available = raw.get('available', True)
+    if not isinstance(available, (bool, np.bool_)):
+        raise ValueError(f'{spec}: available must be a boolean')
+    available = bool(available)
+    point = None
+    ci = None
+    reason = raw.get('reason')
+    if available:
+        point = _choice_number(raw.get('point'))
+        if point is None:
+            raise ValueError(f'{spec}: available specification needs a finite point')
+        ci = _choice_interval(raw.get('ci95'))
+    else:
+        if not isinstance(reason, str) or not reason.strip():
+            reason = 'specification explicitly marked unavailable'
+    sign = None
+    if point is not None:
+        sign = 0 if abs(point) <= zero_tol else (1 if point > 0 else -1)
+    return {
+        'spec': spec,
+        'estimand': raw.get('estimand'),
+        'unit': raw.get('unit'),
+        'scale': raw.get('scale'),
+        'point': point,
+        'ci95': ci,
+        'available': available,
+        'reason': reason,
+        'is_primary': bool(primary),
+        'sign': sign,
+        'excludes_zero': (None if ci is None else bool(ci[0] > 0.0 or ci[1] < 0.0)),
+    }
+
+
+def analysis_choice_concordance(primary, alternatives, *, zero_tol=0.0):
+    """Summarise whether one panel's conclusion survives analysis choices.
+
+    The same panel can be summarised by the per-seed mean, median or trimmed
+    mean, by the token-pooled difference, or by equal-weighted evaluation
+    units.  These are not independent tests and they are not exchangeable
+    estimands; reporting only the most favourable one is a specification
+    choice that the reader cannot see.  This helper makes the set explicit:
+
+    * ``direction_stable``: the primary point is non-zero and every
+      available specification with a non-zero point has the primary sign;
+    * ``precision_concordant``: every available specification that carries a
+      two-sided interval agrees on whether that interval excludes zero;
+    * ``status`` is ``stable``, ``precision_sensitive`` (same sign, different
+      zero-exclusion), ``direction_unstable``, ``zero_effect`` or
+      ``insufficient_specs``;
+    * ``effect_range_ppl`` gives the min/max/span across PPL-delta
+      specifications only (log-ratio/win-rate points are not pooled into it).
+
+    The helper deliberately computes **no p-value** and performs no
+    multiplicity correction: adding specifications to a significance family
+    would create a garden of forking paths rather than control it.  A
+    ``precision_sensitive`` or ``direction_unstable`` readout is a reporting
+    caveat, not a new confirmatory test and not a change to any frozen
+    decision.
+    """
+    _zt = _choice_number(zero_tol)
+    if _zt is None or _zt < 0.0:
+        raise ValueError(f'zero_tol must be a finite non-negative number, got {zero_tol!r}')
+    p = _choice_row(primary, primary=True, zero_tol=_zt)
+    if not p['available']:
+        raise ValueError('primary specification must be available with a finite point')
+    try:
+        alts = list(alternatives if alternatives is not None else [])
+    except TypeError:
+        raise ValueError('alternatives must be an iterable of dicts') from None
+    rows = [p]
+    seen = {p['spec']}
+    for raw in alts:
+        row = _choice_row(raw, zero_tol=_zt)
+        if row['spec'] in seen:
+            raise ValueError(f'duplicate specification name {row["spec"]!r}')
+        seen.add(row['spec'])
+        rows.append(row)
+    avail = [r for r in rows if r['available']]
+    nonzero = [r for r in avail if r['sign'] != 0]
+    pos = int(sum(1 for r in nonzero if r['sign'] > 0))
+    neg = int(sum(1 for r in nonzero if r['sign'] < 0))
+    zero = int(sum(1 for r in avail if r['sign'] == 0))
+    primary_sign = p['sign']
+    direction_stable = bool(primary_sign not in (None, 0) and nonzero
+                            and all(r['sign'] == primary_sign for r in nonzero))
+    same_as_primary = int(sum(1 for r in nonzero if r['sign'] == primary_sign))
+    opposite_to_primary = int(sum(1 for r in nonzero if r['sign'] != primary_sign))
+    ci_rows = [r for r in avail if r['ci95'] is not None]
+    excluding = [r for r in ci_rows if r['excludes_zero']]
+    crossing = [r for r in ci_rows if not r['excludes_zero']]
+    precision_concordant = None
+    if len(ci_rows) >= 2:
+        precision_concordant = bool(len(excluding) == 0 or len(crossing) == 0)
+    if len(avail) < int(ANALYSIS_CHOICE_POLICY['min_specs']):
+        status = 'insufficient_specs'
+    elif not nonzero:
+        status = 'zero_effect'
+    elif not direction_stable:
+        status = 'direction_unstable'
+    elif precision_concordant is False:
+        status = 'precision_sensitive'
+    else:
+        status = 'stable'
+    ppl_points = [r['point'] for r in avail
+                  if r['scale'] == 'ppl_delta' and r['point'] is not None]
+    effect_range = None
+    if ppl_points:
+        _lo, _hi = min(ppl_points), max(ppl_points)
+        _span = float(_hi - _lo)
+        effect_range = {
+            'min': float(_lo), 'max': float(_hi), 'span': _span,
+            'relative_span': (float(_span / abs(p['point']))
+                              if abs(p['point']) > 0.0 else None),
+            'n': len(ppl_points),
+        }
+    claim = {
+        'stable': ('all non-zero specifications agree on the primary direction '
+                   'and, where intervals exist, agree on whether zero is '
+                   'excluded'),
+        'precision_sensitive': ('directions agree but the zero-exclusion '
+                                'conclusion depends on the analysis choice'),
+        'direction_unstable': 'available specifications disagree on the direction',
+        'zero_effect': 'every available specification has a point estimate of zero',
+        'insufficient_specs': ('fewer than two analysis specifications are '
+                               'available'),
+    }[status]
+    return {
+        'kind': 'analysis_choice_concordance',
+        'version': ANALYSIS_CHOICE_POLICY['version'],
+        'status': status,
+        'claim': claim,
+        'primary_spec': p['spec'],
+        'primary_sign': primary_sign,
+        'primary_excludes_zero': p['excludes_zero'],
+        'specifications': rows,
+        'n_specs': len(rows),
+        'n_available': len(avail),
+        'n_unavailable': len(rows) - len(avail),
+        'n_nonzero': len(nonzero),
+        'n_positive': pos,
+        'n_negative': neg,
+        'n_zero': zero,
+        'n_same_as_primary': same_as_primary,
+        'n_opposite_to_primary': opposite_to_primary,
+        'direction_stable': direction_stable,
+        'n_with_ci': len(ci_rows),
+        'n_excluding_zero': len(excluding),
+        'n_crossing_zero': len(crossing),
+        'precision_concordant': precision_concordant,
+        'excluding_zero_specs': [r['spec'] for r in excluding],
+        'crossing_zero_specs': [r['spec'] for r in crossing],
+        'effect_range_ppl': effect_range,
+        'fragile': status in ('precision_sensitive', 'direction_unstable'),
+        'note': ANALYSIS_CHOICE_POLICY['note'],
+    }
+
+
 # ---- 结果稳健性：脆弱性指数与「丢掉一个种子」的族级判定重算 ------------------
 # 统计显著不等于结论稳健：n 个种子里如果有一个特别大或方向相反，删掉它
 # 可能就翻转方向或让 Holm 门失守。下面的函数**只做 post-hoc 诊断**，不

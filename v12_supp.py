@@ -2421,7 +2421,111 @@ def _doc_nll_matrix(rows, n_docs, tokens, *, unit='document'):
     return out, None
 
 
-def _doc_level_analysis(recs_a, recs_b, common, Ln):
+def _analysis_choice_block(out, primary_deltas=None):
+    """Attach an explicit multi-specification readout to one comparison.
+
+    The frozen test is the per-seed exact sign-flip on the token-pooled Δ.  The
+    report also shows unit-weighted and robust summaries; this block records
+    whether those choices agree in sign and in zero-exclusion, so a reader
+    cannot see only the most favourable aggregation.  It adds no p-value and
+    no Holm member.
+    """
+    if not isinstance(out, dict):
+        return None
+    deltas = []
+    for x in (primary_deltas if primary_deltas is not None else []):
+        f = L._finite_scalar(x)
+        if f is not None:
+            deltas.append(f)
+    if not deltas:
+        return None
+    n = len(deltas)
+    mean = float(np.mean(deltas))
+    seed_ci = None
+    if n > 1:
+        _sd = float(np.std(deltas, ddof=1))
+        _sem = _sd / math.sqrt(n)
+        _tc = L._t_critical(0.95, n - 1)
+        if math.isfinite(_tc) and math.isfinite(_sem):
+            seed_ci = [mean - _tc * _sem, mean + _tc * _sem]
+    unit = out.get('unit') or out.get('granularity') or 'unit'
+
+    def _ci_or_none(ci):
+        if isinstance(ci, (list, tuple)) and len(ci) == 2:
+            lo = L._finite_scalar(ci[0])
+            hi = L._finite_scalar(ci[1])
+            if lo is not None and hi is not None:
+                return [lo, hi]
+        return None
+
+    def _finite(key):
+        return L._finite_scalar(out.get(key))
+
+    primary = {
+        'spec': 'seed_mean_ppl_delta',
+        'estimand': 'mean of per-seed token-pooled PPL differences (a-b)',
+        'unit': 'seed', 'scale': 'ppl_delta', 'point': mean, 'ci95': seed_ci,
+    }
+    alts = []
+
+    def _add(spec, estimand, row_unit, scale, point, ci=None, reason=None):
+        row = {'spec': spec, 'estimand': estimand, 'unit': row_unit,
+               'scale': scale, 'point': point, 'ci95': ci}
+        if point is None:
+            row['available'] = False
+            row['reason'] = reason or 'point estimate unavailable'
+        alts.append(row)
+
+    _add('seed_median_ppl_delta',
+         'median of per-seed token-pooled PPL differences (a-b)',
+         'seed', 'ppl_delta', float(np.median(deltas)))
+    if n >= 5:
+        _k = int(math.floor(0.2 * n))
+        _trimmed = sorted(deltas)[_k:n - _k]
+        _add('seed_trimmed_mean_ppl_delta',
+             '20% trimmed mean of per-seed token-pooled PPL differences (a-b)',
+             'seed', 'ppl_delta', float(np.mean(_trimmed)))
+    else:
+        alts.append({'spec': 'seed_trimmed_mean_ppl_delta',
+                     'estimand': '20% trimmed mean of per-seed PPL differences',
+                     'unit': 'seed', 'scale': 'ppl_delta', 'available': False,
+                     'point': None, 'ci95': None,
+                     'reason': 'requires at least 5 seeds'})
+    _add('token_pooled_ppl_delta',
+         'token-pooled PPL difference with unit-cluster interval (a-b)',
+         unit, 'ppl_delta', _finite('pooled_delta_ppl'),
+         _ci_or_none(out.get('pooled_delta_ppl_ci95')),
+         out.get('pooled_ci_unavailable_reason'))
+    _add('equal_unit_mean_ppl_delta',
+         'equal-weighted mean of per-unit PPL differences (a-b)',
+         unit, 'ppl_delta', _finite('per_doc_delta_mean'),
+         _ci_or_none(out.get('per_doc_delta_ppl_ci95')))
+    _add('unit_median_ppl_delta',
+         'median of per-unit PPL differences (a-b)',
+         unit, 'ppl_delta', _finite('per_doc_delta_median'))
+    _add('unit_mean_log_ratio',
+         'mean per-unit log(PPL_a / PPL_b)',
+         unit, 'log_ratio', _finite('per_doc_log_ratio_mean'),
+         _ci_or_none(out.get('per_doc_log_ratio_ci95')))
+    _neg = _finite('doc_delta_negative')
+    _pos = _finite('doc_delta_positive')
+    _n_units = _finite('n_units')
+    if (_neg is not None and _pos is not None and _n_units is not None
+            and _n_units > 0 and _neg + _pos <= _n_units):
+        _add('unit_win_balance_oriented',
+             'fraction of units with a worse PPL minus fraction with a lower '
+             'PPL (negative = arm a wins more often)',
+             unit, 'win_balance', (_pos - _neg) / _n_units)
+    else:
+        alts.append({'spec': 'unit_win_balance_oriented',
+                     'estimand': 'signed fraction of units where arm a has lower PPL',
+                     'unit': unit, 'scale': 'win_balance', 'available': False,
+                     'point': None, 'ci95': None,
+                     'reason': 'win-balance summary unavailable'})
+    return L.analysis_choice_concordance(primary, alts)
+
+
+def _doc_level_analysis(recs_a, recs_b, common, Ln, primary_deltas=None):
     """Document-sampling readout for one comparison.
 
     逐文档配对差（对每个文档取「种子内臂差」的均值）与两层方差分解：
@@ -2753,6 +2857,20 @@ def _doc_level_analysis(recs_a, recs_b, common, Ln):
         out['pooled_ci_unavailable_reason'] = (
             _pooled_ci_reason or
             'token-pooled cluster CI not available for this cell')
+    _seed_deltas = primary_deltas
+    if _seed_deltas is None:
+        _seed_deltas = []
+        for _ra, _rb in zip(rows_a, rows_b):
+            _pa = L._finite_scalar((_ra or {}).get('ppl'))
+            _pb = L._finite_scalar((_rb or {}).get('ppl'))
+            if _pa is not None and _pb is not None:
+                _seed_deltas.append(_pa - _pb)
+    else:
+        _seed_deltas = list(_seed_deltas)
+    if _seed_deltas:
+        _choice = _analysis_choice_block(out, _seed_deltas)
+        if _choice is not None:
+            out['analysis_choice_concordance'] = _choice
     return out
 
 
@@ -3178,6 +3296,113 @@ def _doc_influence_markdown(ft):
     return out
 
 
+def _analysis_choice_markdown(ft):
+    """Render the post-hoc analysis-choice concordance table.
+
+    Pure function of the final-test stats dict so the wording and the
+    "does not change the frozen decision" boundary can be tested without a
+    panel.  The block is descriptive: it neither adds a p-value nor selects a
+    preferred specification.
+    """
+    comps = (ft or {}).get('comparisons') if isinstance(ft, dict) else None
+    if not isinstance(comps, dict):
+        return []
+    labels = {
+        'stable': '稳定',
+        'precision_sensitive': '⚠ 精度口径敏感',
+        'direction_unstable': '⚠ 方向翻转',
+        'zero_effect': '零效应',
+        'insufficient_specs': '口径不足',
+    }
+    rows = []
+    details = []
+    missing = []
+    fragile = []
+    for name, comp in comps.items():
+        if not isinstance(comp, dict):
+            continue
+        dsm = comp.get('doc_sampling') or {}
+        cc = dsm.get('analysis_choice_concordance') if isinstance(dsm, dict) else None
+        if not isinstance(cc, dict):
+            if (isinstance(dsm, dict)
+                    and (dsm.get('per_doc_delta_mean') is not None
+                         or dsm.get('pooled_delta_ppl') is not None)):
+                missing.append(name)
+            continue
+        status = cc.get('status')
+        if status not in labels:
+            continue
+        n_specs = cc.get('n_specs')
+        n_avail = cc.get('n_available')
+        n_same = cc.get('n_same_as_primary')
+        n_opp = cc.get('n_opposite_to_primary')
+        n_excl = cc.get('n_excluding_zero')
+        n_ci = cc.get('n_with_ci')
+        psign = cc.get('primary_sign')
+        if psign is None or psign == 0:
+            sign_txt = '零/无方向'
+        else:
+            sign_txt = '负（a 更低）' if float(psign) < 0 else '正（a 更高）'
+        same_txt = f'{n_same}/{n_opp}' if n_same is not None else '—'
+        ci_txt = (f'{n_excl}/{n_ci}' if n_ci is not None else '—')
+        if cc.get('precision_concordant') is False:
+            ci_txt += '（不一致）'
+        er = cc.get('effect_range_ppl') or {}
+        if all(isinstance(er.get(k), (int, float)) for k in ('min', 'max')):
+            rng = f'[{er["min"]:+.3f}, {er["max"]:+.3f}]'
+            if isinstance(er.get('span'), (int, float)):
+                rng += f'（跨度 {er["span"]:.3f}）'
+        else:
+            rng = '—'
+        flag = labels[status]
+        if cc.get('fragile'):
+            fragile.append(name)
+        rows.append('| %s | %s/%s | %s | %s | %s | %s | %s |'
+                    % (name, n_avail, n_specs, sign_txt, same_txt,
+                       ci_txt, rng, flag))
+        specs = cc.get('specifications') or []
+        if status == 'direction_unstable':
+            opp = [str(s.get('spec')) for s in specs
+                   if isinstance(s, dict) and s.get('available')
+                   and s.get('sign') not in (None, 0, psign)]
+            if opp:
+                details.append(f'{name}: 与主口径反向的规格为 {opp}')
+        elif status == 'precision_sensitive':
+            cross = cc.get('crossing_zero_specs') or []
+            excl = cc.get('excluding_zero_specs') or []
+            if cross or excl:
+                details.append(
+                    f'{name}: 排除零的规格 {excl or "无"}；跨零的规格 '
+                    f'{cross or "无"}')
+    if not rows and not missing:
+        return []
+    out = ['### 分析口径一致性（post-hoc；不改变上面的冻结判定）', '']
+    if rows:
+        out += ['| 比较 | 可用/总口径 | 主方向 | 同向/反向 | 区间排除零 | PPL Δ 范围 | 标记 |',
+                '|---|---|---|---|---|---|---|']
+        out.extend(rows)
+        out += ['',
+                '> 定义：同一 panel 的多种口径（逐种子 mean/median/trimmed mean、'
+                'token 池化、逐评测单元 mean/median/log-ratio/win-balance）在方向与'
+                '「区间是否排除零」上是否一致。`同向/反向` 相对主口径。'
+                '方向一致不等于估计量相同：逐种子、逐单元与 token 池化回答不同问题，'
+                '区间宽度也依赖单位。`精度口径敏感` 只说明带区间口径的零排除结论不一致，'
+                '不是方向矛盾。该表是**对已发生数据的 post-hoc 描述**：不新增检验/多重校正，'
+                '不进入冻结 p/Holm/confirmed，也不能用来挑选最有利口径；'
+                '引用时不得只报单一聚合而隐去本表。', '']
+    if details:
+        out += ['**口径细节**：' + '；'.join(details) + '。', '']
+    if missing:
+        out += ['> 以下比较有 doc_sampling 但缺少分析口径一致性块'
+                '（旧产物或未重新生成分析），该敏感性**未验证**：'
+                + '、'.join(missing) + '。', '']
+    if fragile:
+        out += ['**解读提示**：' + '、'.join(fragile) +
+                ' 的方向或精度结论依赖分析口径；引用时必须同时报告本表，'
+                '不能把结论描述为「换一种聚合仍然稳健」。', '']
+    return out
+
+
 def _robustness_markdown(rob):
     """Render the post-hoc fragility/seed-drop table for the v12 report.
 
@@ -3578,7 +3803,8 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
             res['direction_ok'] = bool((res['mean'] > 0) == (exp_sign == 'positive'))
         else:
             res['direction_ok'] = None
-        _doc = _doc_level_analysis(recs_a, recs_b, usable, Ln)
+        _doc = _doc_level_analysis(recs_a, recs_b, usable, Ln,
+                                   primary_deltas=dl)
         if _doc is not None:
             res['doc_sampling'] = _doc
         stats['comparisons'][name] = res
@@ -4157,6 +4383,18 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
                 A('**单单元敏感度提示**：' + '；'.join(_frag_conf) +
                   ' 的确认方向依赖删除单个评测单位；确认判定不变，但引用时必须同时报告'
                   '下方「单元影响诊断」，不能把结论描述为对评测文档稳健。')
+            _choice_conf = []
+            for _k in _conf:
+                _cc = ((comps.get(_k, {}).get('doc_sampling') or {})
+                       .get('analysis_choice_concordance') or {})
+                if _cc.get('fragile') is True:
+                    _choice_conf.append(
+                        f'{_k}（{_cc.get("status")}）')
+            if _choice_conf:
+                A('')
+                A('**分析口径敏感度提示**：' + '；'.join(_choice_conf) +
+                  ' 的确认方向或精度结论依赖分析口径；确认判定不变，但引用时必须'
+                  '同时报告下方「分析口径一致性」表，不能只报单一聚合。')
         else:
             _cov_req = bool((ft.get('coverage_requirement') or {}).get('require_complete_coverage'))
             _sig = [k for k, _h in holm.items()
@@ -4177,6 +4415,9 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
         _doc_inf_lines = _doc_influence_markdown(ft)
         if _doc_inf_lines:
             lines.extend(_doc_inf_lines)
+        _choice_lines = _analysis_choice_markdown(ft)
+        if _choice_lines:
+            lines.extend(_choice_lines)
         _nd = ft.get('significant_nondirectional') or []
         if _nd:
             A('')

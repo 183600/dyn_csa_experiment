@@ -21649,6 +21649,191 @@ def t_interval_calibration_gates_and_bootstrap():
     assert 'fallback' in const['method'], const
 
 
+def t_analysis_choice_concordance_and_audit():
+    """L188 — multi-specification agreement is explicit, replayed and caveated."""
+    primary = {'spec': 'seed_mean', 'unit': 'seed', 'scale': 'ppl_delta',
+               'estimand': 'mean (a-b)', 'point': -1.0, 'ci95': [-2.0, -0.5]}
+    stable_alts = [
+        {'spec': 'seed_median', 'unit': 'seed', 'scale': 'ppl_delta',
+         'point': -0.5, 'ci95': [-1.5, -0.1]},
+        {'spec': 'unit_log_ratio', 'unit': 'article', 'scale': 'log_ratio',
+         'point': -0.2, 'ci95': [-0.4, -0.05]},
+    ]
+    stable = L.analysis_choice_concordance(primary, stable_alts)
+    assert stable['status'] == 'stable', stable
+    assert stable['direction_stable'] is True and stable['fragile'] is False, stable
+    assert stable['precision_concordant'] is True, stable
+    assert stable['n_specs'] == 3 and stable['n_available'] == 3, stable
+    assert stable['n_same_as_primary'] == 3 and stable['n_opposite_to_primary'] == 0, stable
+    assert stable['n_excluding_zero'] == 3 and stable['n_crossing_zero'] == 0, stable
+    er = stable['effect_range_ppl']
+    assert er['min'] == -1.0 and er['max'] == -0.5 and er['n'] == 2, stable
+    assert not any(k.startswith('p_') for k in stable), stable
+    # A second interval that crosses zero while the direction still agrees is
+    # precision sensitivity, not a direction contradiction.
+    precision = L.analysis_choice_concordance(
+        primary, [{'spec': 'unit_mean', 'point': -0.2, 'ci95': [-1.0, 0.5],
+                   'scale': 'ppl_delta', 'unit': 'article'}])
+    assert precision['status'] == 'precision_sensitive', precision
+    assert precision['direction_stable'] is True and precision['fragile'] is True, precision
+    assert precision['precision_concordant'] is False, precision
+    assert precision['crossing_zero_specs'] == ['unit_mean'], precision
+    # Opposite point estimates are a hard direction contradiction even when
+    # both intervals exclude zero.
+    unstable = L.analysis_choice_concordance(
+        primary, [{'spec': 'unit_mean', 'point': 0.5, 'ci95': [0.1, 1.0],
+                   'scale': 'ppl_delta', 'unit': 'article'}])
+    assert unstable['status'] == 'direction_unstable', unstable
+    assert unstable['n_positive'] == 1 and unstable['n_negative'] == 1, unstable
+    assert unstable['n_opposite_to_primary'] == 1, unstable
+    # Zero and unavailable specifications are named, not silently dropped.
+    zero = L.analysis_choice_concordance(
+        {'spec': 'seed_mean', 'point': 0.0, 'ci95': [-1.0, 1.0]},
+        [{'spec': 'unit_mean', 'point': 0.0},
+         {'spec': 'trimmed', 'available': False, 'reason': 'n<5'}])
+    assert zero['status'] == 'zero_effect', zero
+    assert zero['n_available'] == 2 and zero['n_unavailable'] == 1, zero
+    assert zero['n_zero'] == 2, zero
+    zero_primary = L.analysis_choice_concordance(
+        {'spec': 'seed_mean', 'point': 0.0},
+        [{'spec': 'unit_mean', 'point': 1.0}])
+    assert zero_primary['status'] == 'direction_unstable', zero_primary
+    assert zero_primary['n_opposite_to_primary'] == 1, zero_primary
+    thin = L.analysis_choice_concordance(
+        primary, [{'spec': 'trimmed', 'available': False, 'reason': 'n<5'}])
+    assert thin['status'] == 'insufficient_specs' and thin['n_available'] == 1, thin
+    # A CI-less specification still contributes to direction but not to the
+    # precision concordance; one CI alone is not enough to claim agreement.
+    sign_only = L.analysis_choice_concordance(
+        primary, [{'spec': 'unit_median', 'point': -0.1}])
+    assert sign_only['status'] == 'stable', sign_only
+    assert sign_only['n_with_ci'] == 1 and sign_only['precision_concordant'] is None, sign_only
+    # Fail closed: malformed rows, duplicate names and a non-finite primary
+    # cannot produce a reassuring status.
+    for bad_args in (
+            (primary, [{'spec': 'x', 'point': -0.1}, {'spec': 'x', 'point': -0.2}]),
+            (primary, [{'spec': 'x', 'point': True}]),
+            (primary, [{'spec': 'x', 'point': -0.1, 'ci95': [1.0, -1.0]}]),
+            (primary, [{'spec': 'x', 'point': -0.1, 'ci95': [0.0]}]),
+            (primary, [{'available': 'no', 'point': -0.1}]),
+            ({'spec': 'p', 'available': False}, []),
+            ({'spec': 'p', 'point': float('nan')}, []),
+            ('not-a-dict', []),
+            (primary, 'not-an-iterable')):
+        try:
+            L.analysis_choice_concordance(*bad_args)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'accepted malformed analysis choice {bad_args!r}')
+    for bad_zt in (True, -1.0, float('nan'), float('inf')):
+        try:
+            L.analysis_choice_concordance(primary, [], zero_tol=bad_zt)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'accepted zero_tol={bad_zt!r}')
+    snapshot = json.dumps([primary, stable_alts], sort_keys=True)
+    L.analysis_choice_concordance(primary, stable_alts)
+    assert json.dumps([primary, stable_alts], sort_keys=True) == snapshot, \
+        'concordance mutated its inputs'
+
+    def _stats(cc, mean=-1.0):
+        return {'comparisons': {'x': {
+            'mean': mean,
+            'doc_sampling': {'analysis_choice_concordance': cc}}}}
+
+    with tempfile.TemporaryDirectory() as td:
+        p = os.path.join(td, 'test_stats.json')
+
+        def _audit(obj):
+            with open(p, 'w', encoding='utf-8') as f:
+                json.dump(obj, f)
+            with contextlib.redirect_stdout(io.StringIO()):
+                return A.audit_analysis_choices(path=p)
+
+        ok = _audit(_stats(stable))
+        assert ok['status'] == 'ok' and ok['n_ok'] == 1, ok
+        assert ok['n_fragile'] == 0 and not ok['problems'], ok
+        unstable_cc = L.analysis_choice_concordance(
+            primary, [{'spec': 'unit_mean', 'point': 0.5,
+                       'ci95': [0.1, 1.0]}])
+        warn = _audit(_stats(unstable_cc))
+        assert warn['status'] == 'warnings' and warn['n_fragile'] == 1, warn
+        assert any('disagree on direction' in w for w in warn['warnings']), warn
+        bad_status = json.loads(json.dumps(_stats(stable)))
+        bad_status['comparisons']['x']['doc_sampling'][
+            'analysis_choice_concordance']['status'] = 'precision_sensitive'
+        bad = _audit(bad_status)
+        assert bad['status'] == 'fail', bad
+        assert any('does not reproduce' in x for x in bad['problems']), bad
+        bad_mean = _audit(_stats(stable, mean=-2.0))
+        assert bad_mean['status'] == 'fail', bad_mean
+        assert any('frozen per-seed mean' in x for x in bad_mean['problems']), bad_mean
+        stale = _audit({'comparisons': {'x': {
+            'mean': -1.0, 'doc_sampling': {'per_doc_delta_mean': -1.0}}}})
+        assert stale['status'] == 'not_verifiable_locally', stale
+        assert stale['n_missing'] == 1 and stale['warnings'], stale
+        no_ds = _audit({'comparisons': {'x': {'mean': -1.0}}})
+        assert no_ds['status'] == 'not_verifiable_locally', no_ds
+        assert no_ds['n_missing'] == 1 and no_ds['warnings'], no_ds
+        bad_specs = json.loads(json.dumps(_stats(stable)))
+        bad_specs['comparisons']['x']['doc_sampling'][
+            'analysis_choice_concordance']['specifications'][1]['spec'] = \
+            bad_specs['comparisons']['x']['doc_sampling'][
+                'analysis_choice_concordance']['specifications'][0]['spec']
+        dup = _audit(bad_specs)
+        assert dup['status'] == 'fail', dup
+        gone = os.path.join(td, 'none.json')
+        with contextlib.redirect_stdout(io.StringIO()):
+            absent = A.audit_analysis_choices(path=gone)
+        assert absent['status'] == 'not_verifiable_locally', absent
+    import inspect
+    assert 'analysis_choices' in (A.__doc__ or ''), 'analysis-choice audit is not documented'
+    assert "'analysis_choices': audit_analysis_choices()" in \
+        inspect.getsource(A.run_report), 'analysis-choice audit is not wired into the report'
+    assert 'analysis_choices' in inspect.getsource(A), 'analysis-choice CLI is not registered'
+
+    # Integration: a distribution where the token-pooled mean is positive but
+    # the equal-weighted median is negative must be reported as a direction
+    # contradiction, not hidden behind either summary.
+    docs = ['d0', 'd1', 'd2', 'd3']
+    toks = [10, 10, 10, 10]
+    nll_a = [1.0, 1.0, 1.0, 20.0]
+    nll_b = [2.0, 2.0, 2.0, 2.0]
+    recs_a = {s: {'by_len': {512: _document_cell(nll_a, toks, docs)}}
+              for s in (0, 1)}
+    recs_b = {s: {'by_len': {512: _document_cell(nll_b, toks, docs)}}
+              for s in (0, 1)}
+    got = V12._doc_level_analysis(recs_a, recs_b, [0, 1], 512)
+    cc = got.get('analysis_choice_concordance')
+    assert isinstance(cc, dict), got
+    assert cc['status'] == 'direction_unstable', cc
+    assert cc['n_specs'] == 8 and cc['n_available'] == 7, cc
+    assert cc['primary_sign'] == 1 and cc['n_opposite_to_primary'] >= 1, cc
+    assert any(s['spec'] == 'unit_median_ppl_delta' and s['sign'] == -1
+               for s in cc['specifications']), cc
+    json.dumps(cc, allow_nan=False)
+    md = '\n'.join(V12._analysis_choice_markdown(
+        {'comparisons': {'x': {'doc_sampling': got}}}))
+    assert '分析口径一致性' in md and '方向翻转' in md, md
+    assert '不改变上面的冻结判定' in md and '不能用来挑选最有利口径' in md, md
+    assert '不能把结论描述为' in md, md
+    flat_cell = _document_cell([2.0, 2.0, 2.0, 2.0], toks, docs)
+    flat_a = {s: {'by_len': {512: dict(flat_cell)}} for s in (0, 1)}
+    flat_b = {s: {'by_len': {512: dict(flat_cell)}} for s in (0, 1)}
+    flat = V12._doc_level_analysis(flat_a, flat_b, [0, 1], 512)
+    fcc = flat.get('analysis_choice_concordance')
+    assert fcc['status'] == 'zero_effect', fcc
+    _wb = next(s for s in fcc['specifications']
+               if s['spec'] == 'unit_win_balance_oriented')
+    assert _wb['point'] == 0.0, _wb
+    assert V12._analysis_choice_markdown({}) == []
+    miss_md = V12._analysis_choice_markdown(
+        {'comparisons': {'x': {'doc_sampling': {'per_doc_delta_mean': -1.0}}}})
+    assert any('未验证' in line and 'x' in line for line in miss_md), miss_md
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -22185,6 +22370,7 @@ def main():
     _check('L185 dataclass config diff handles vector fields', t_layer_cfg_diff_handles_vector_fields)
     _check('L186 interval calibration covers coverage and non-vacuity', t_interval_calibration_gates_and_bootstrap)
     _check('L187 look recorder normalizes raw string-keyed summaries', t_look_history_accepts_raw_summary_keys)
+    _check('L188 analysis-choice concordance is explicit and audited', t_analysis_choice_concordance_and_audit)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

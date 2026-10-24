@@ -4071,3 +4071,84 @@ L186 覆盖：覆盖率门的已知值（0.95 通过、0.70 fail、保守通过�
 名义水平/阈值 fail-closed、宽度门拒绝 0/负/NaN/inf/超上限/布尔值、四条
 区间路径存在且宽度非空洞、bootstrap-t 的确定性与常量输入显式回退。
 完整 CPU 套件 534/534 通过（0 skipped）。
+
+## 63. 同一 panel 的多种分析口径要显式对账（本轮结果分析硬化）
+
+### 63.1 问题：口径选择本身是不可见的结果分析自由度
+
+§61/§62 校准了 p 值与区间，但报告仍可在同一份冻结 panel 上选择多种聚合：
+
+- 逐种子 mean / median / 20% trimmed mean；
+- token 池化 ΔPPL（与冻结主终点同口径）；
+- 逐评测单元（article/document/row）等权 mean / median；
+- 逐单元 log-ratio 与 win-balance。
+
+这些口径回答不同问题，本来就不应给出同一个数。但在只报其中一个时，读者
+看不到方向是否一致、区间是否同样排除零；更糟的是，分析者可以在一组口径
+中挑选最有利的一个，把它写成「稳健」。逐种子均值显著、而逐文档中位数
+方向相反的面板是真实可能出现的：一个超长/超大文档可以主导 token 池化
+Δ，却改变不了等权中位数的符号。此前 `doc_sampling` 已分别记录这些读数，
+但没有一个显式的「口径间对账」块，也没有审计门检查它是否被悄悄省略。
+
+### 63.2 方法：只对账，不新增检验
+
+`exp_lib.analysis_choice_concordance(primary, alternatives)` 接收主口径与
+一组声明式口径（`spec`、`estimand`、`unit`、`scale`、`point`、`ci95`），
+返回：
+
+- `direction_stable`：主口径非零，且所有可用且非零的口径点估计与主口径同号；
+- `precision_concordant`：所有带两侧区间的可用口径对「是否排除零」一致；
+- `status`：`stable`、`precision_sensitive`（同向但零排除不一致）、
+  `direction_unstable`（方向矛盾）、`zero_effect`、`insufficient_specs`；
+- `effect_range_ppl`：仅在 PPL-Δ 口径内给出 min/max/span，不把 log-ratio
+  或 win-balance 混进同一尺度；
+- 逐口径的 `sign`、`excludes_zero`、`available/reason`，以及反向/跨零的
+  口径名单。
+
+`v12_supp._doc_level_analysis` 现在把 8 条口径写入
+`doc_sampling.analysis_choice_concordance`：逐种子 mean（主口径）、
+median、trimmed mean，token 池化，逐单元 mean、median、log-ratio、
+win-balance（`(n_positive - n_negative) / n_units`，负号表示 a 更常更低；全平局为 0）。
+种子数不足 5 时 trimmed mean 显式不可用，未计算的区间显式留空，不伪造。
+
+报告新增「分析口径一致性」表，列出可用/总口径、主方向、同向/反向、
+区间排除零计数与 PPL 范围；方向翻转或精度敏感时附具体口径名单和引用提示。
+若被确认的比较在该块中 fragile，确认段落还会单独提示不能只报单一聚合。
+该表**不新增 p 值、不进入 Holm 族、不做多重校正、不改变冻结判定**。把
+更多口径塞进显著性族只会扩大 forking paths，而不是控制它。
+
+`audit_gates.py analysis_choices`（别名 `specification_curve` /
+`analysis_choice`）从 `analysis_v12/test_stats.json` 重放存储的口径行：
+若块内 `status`/计数/方向/零排除无法由 `analysis_choice_concordance`
+复现，或主口径点估计与冻结逐种子均值不一致，判 fail；方向翻转或精度敏感
+只判 warning，并要求报告携带 caveat；旧产物缺少该块时判
+`not_verifiable_locally`，不冒充通过。
+
+### 63.3 边界
+
+- 口径一致不是统计独立复现，也不是「换一种聚合仍显著」的证明。同向只说明
+  这些描述量没有互相矛盾；`precision_sensitive` 在单位/估计量不同时是
+  正常现象，不能读成方向失败。
+- 该块不覆盖所有可能的口径：截尾比例、加权方案、文档过滤、长度子集、
+  模型选择等仍是未枚举的 forking paths；它只把当前报告实际使用的口径
+  显式化，不能证明「没有其他口径会翻转」。
+- 逐种子/逐单元/token 池化的区间条件在不同抽样源上；本块只比较
+  「是否排除零」，不比较区间宽度，也不把两种不确定性合并。
+- 全部读数仍是 post-hoc 描述；不改变精确符号翻转 p、Holm 决策、冻结清单、
+  `CODE_SEMANTICS` 或 P5T 的确认判定，不新增训练，也不读取 test split。
+
+### 63.4 入口与验证
+
+```bash
+python audit_gates.py analysis_choices   # 零 GPU；读 analysis_v12/test_stats.json
+python v12_supp.py report                # 报告新增「分析口径一致性」表
+python test_review_fixes.py              # L188
+```
+
+L188 覆盖：稳定/精度敏感/方向翻转/零效应/口径不足五种状态、零与不可用
+口径的显式记录、CI-less 口径只参与方向、重复名/非法 CI/布尔点/非有限主
+口径/非法 `zero_tol` fail-closed、输入不被修改；审计入口的稳定→ok、
+方向翻转→warnings、状态篡改/主均值不符/重复名→fail、旧产物→
+`not_verifiable_locally`、报告与 CLI 接线；以及「token 池化均值为正但逐
+单元中位数为负」的合成 panel 被标为 `direction_unstable` 且报告保留
+caveat。完整 CPU 套件 536/536 通过（0 skipped）。
