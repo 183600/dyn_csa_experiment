@@ -21182,6 +21182,31 @@ def t_look_history_audit_flags_downgrade():
         assert any('does not match the recomputed' in p for p in aud_bad['problems']), aud_bad
 
 
+def t_look_history_accepts_raw_summary_keys():
+    """L187 — the real aggregation path feeds string-keyed summaries to the
+    look recorder; they must be normalized, not unpacked as (variant, tag, seed)."""
+    fp = ('steps1_sl8_bs1_nt10_lr0.0003_wd0.1_d8_L1_H1_Dh8_v16_wu1_cl0.05_'
+          'dlm10.0_mtdefault_mrcsa_dynamic_ee1_es1_detcpu-eager_dfabc_csX')
+    knobs = L.training_knobs()
+    summary = {}
+    for i in range(6):
+        summary[f'csa_dynamic::seed{i}'] = dict(
+            variant='csa_dynamic', seed=i, run_cfg=fp, steps=1, tokens_seen=1,
+            ppl=50.0 - (i + 1) / 10.0, params=100, train_knobs=knobs)
+        summary[f'csa_fixed::seed{i}'] = dict(
+            variant='csa_fixed', seed=i, run_cfg=fp, steps=1, tokens_seen=1,
+            ppl=50.0, params=100, train_knobs=knobs)
+    design = {'dynamic_blocking': [('csa_dynamic', 'csa_fixed')]}
+    key = 'component::dynamic_blocking::csa_dynamic|csa_fixed||'
+    with tempfile.TemporaryDirectory() as td:
+        hist = L.record_panel_look(td, summary, design=design, baselines={})
+        assert hist['n_looks'] == 1, hist
+        snap = hist['looks'][0]['contrasts']
+        assert key in snap, snap
+        assert snap[key]['seeds'] == list(range(6)), snap[key]
+        assert snap[key]['n'] == 6, snap[key]
+
+
 def t_look_series_array_inputs_and_strict_audit_seeds():
     """L179 — array look inputs work; the audit refuses truncated seeds."""
     d = [-1.0, -1.0, -1.0]
@@ -22159,6 +22184,7 @@ def main():
     _check('L184 statistical calibration is wired into the audit report', t_statistical_calibration_is_wired_into_the_audit)
     _check('L185 dataclass config diff handles vector fields', t_layer_cfg_diff_handles_vector_fields)
     _check('L186 interval calibration covers coverage and non-vacuity', t_interval_calibration_gates_and_bootstrap)
+    _check('L187 look recorder normalizes raw string-keyed summaries', t_look_history_accepts_raw_summary_keys)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

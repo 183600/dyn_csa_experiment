@@ -27345,6 +27345,13 @@ def panel_look_snapshot(recs, *, design=None, baselines=None):
     """
     design = ABLATION_DESIGN if design is None else design
     baselines = BASELINE_DESIGN if baselines is None else baselines
+    # The aggregation path hands this function the raw summary mapping, whose
+    # keys are strings/legacy ids; the unit-test path hands it the normalized
+    # {(variant, protocol, seed): rec} map.  Normalize the former exactly like
+    # methodology_audit does, or the first raw key is unpacked as a triple and
+    # the look is silently lost ("too many values to unpack").
+    if not all(isinstance(k, tuple) and len(k) == 3 for k in recs):
+        recs, _amb = _variant_seed_map(recs)
     out = {}
     groups = (('component', design), ('baseline', baselines))
     for kind, group in groups:
