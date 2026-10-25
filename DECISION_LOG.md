@@ -2744,3 +2744,39 @@ dirty 工作树可被如实绑定。数值、冻结清单、`CODE_SEMANTICS`、�
 `code_semantics` 被身份检查拒绝；tar 内 manifest 的
 `source_tree_sha256` 改为错误值后，即使文件哈希全匹配，`verify` 返回 1。
 `python archive_release.py verify <archive>` 的旧归档路径保持兼容。
+
+## 2026-10-25 — 跨 panel 消融门识别反证并报告复现状态（no new runs）
+
+零 GPU 的方法学硬化；不新增训练、不读取 test split、不修改冻结清单的
+字节/种子/终点/alpha/Holm 决策规则，也不改 `CODE_SEMANTICS`。
+
+**Problem.** `ablation_coverage_across_panels` 只做覆盖计数：组件只要在
+任一 panel 完整且 verified 就进入 `verified_anywhere`，即使另一个完整
+panel 给出族校正后的相反方向或超过 SESOI 的有害移除效果，
+`all_components_useful_allowed` 仍可能为真。这等于按 panel 挑选证据，
+也会把单 panel verified 误读为已复现。
+
+**Fix.** 每个组件的跨 panel 行新增
+`panels_direction_conflict`、`panels_practically_harmful`、
+`panels_opposite_mean`、`panels_measured_unverified`、
+`panels_replicated` 和 `replication_status`；顶层新增
+`replicated_anywhere`、`single_panel_verified`、
+`direction_conflict_anywhere`、`practically_harmful_anywhere`、
+`opposite_mean_anywhere`。`all_components_useful_allowed` 在任意
+反证/实际有害时关闭，并在 reasons 中指名冲突 panel；incomplete 与
+verified-only-incomplete 旧规则不变。`audit_methodology` 将跨 panel
+列表提升到报告顶层。该门不重算 p、不合并效应，只消费已有族校正
+verdict；SESOI/Holm 语义不变。
+
+**Boundary.** `replicated` 只表示 >=2 个完整 panel 均 verified，不是
+独立复现或外部效度：共享种子、切片、训练配方时误差仍相关。该门不做
+meta-analysis，不估计合并效应或异质性；需要合并时仍用显式
+`meta_analyze_effects`。反方向但未达族校正显著的均值只产生警告，不单独
+关闭项目门，避免小样本噪声翻转；未声明方向的对比不算冲突。冲突 panel
+即使 ablation 不完整也保留点名，不能用缺臂抹掉反证。
+
+**Verification.** `python test_review_fixes.py` 通过 539/539（0 skipped，
+新增 L191）：p1 verified、p2 完整但方向冲突时 A 为 `contradicted` 且项目
+门关闭并点名 p2；B 在两个完整 panel verified 时为 `replicated`；
+practically harmful 同样关闭门；非显著相反均值只产生
+`opposite_mean` 警告。未改冻结清单、数值或 `CODE_SEMANTICS`。

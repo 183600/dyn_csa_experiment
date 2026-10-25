@@ -28869,12 +28869,26 @@ def ablation_coverage_across_panels(reports, design=None, *, verbose=False):
 
     This is a reporting gate, not a new statistical test: it never promotes a
     component; it only prevents a panel-by-panel reading from hiding an
-    omitted innovation."""
+    omitted innovation.
+
+    Verification in one panel can still be contradicted elsewhere.  A
+    correction-significant opposite direction (or a practically harmful
+    removal contrast) in ANY reported panel closes the project-level
+    "useful" gate; such panels are named in
+    `direction_conflict_anywhere` / `practically_harmful_anywhere`.
+    `replication_status` distinguishes `replicated` (verified in >=2 complete
+    panels), `single_panel`, `contradicted`, and `not_verified`; it is
+    descriptive unless a contradiction is present.  A powered but
+    non-significant opposite mean is reported as a warning, not counted as a
+    corrected contradiction."""
     design = ABLATION_DESIGN if design is None else design
     out = {'status': 'ok', 'components': {}, 'complete_anywhere': [],
            'usable_anywhere': [], 'verified_anywhere': [], 'measured_anywhere': [],
            'missing_everywhere': [], 'complete_but_unverified': [],
-           'verified_only_incomplete': [], 'warnings': []}
+           'verified_only_incomplete': [], 'replicated_anywhere': [],
+           'single_panel_verified': [], 'direction_conflict_anywhere': [],
+           'practically_harmful_anywhere': [], 'opposite_mean_anywhere': [],
+           'warnings': []}
     if not isinstance(reports, dict):
         out['status'] = 'warn'
         out['warnings'].append('reports must be a {panel: methodology_audit} mapping')
@@ -28883,6 +28897,11 @@ def ablation_coverage_across_panels(reports, design=None, *, verbose=False):
         row = {'panels_complete': [], 'panels_measured': [],
                'panels_verified': [], 'panels_verified_raw': [],
                'panels_verified_incomplete': [], 'panels_unverified': [],
+               'panels_measured_unverified': [],
+               'panels_direction_conflict': [],
+               'panels_practically_harmful': [],
+               'panels_opposite_mean': [], 'panels_replicated': [],
+               'replication_status': 'not_measured',
                'missing_arms': {}, 'declared_in': []}
         for name in sorted(reports):
             rep = reports.get(name)
@@ -28925,11 +28944,48 @@ def ablation_coverage_across_panels(reports, design=None, *, verbose=False):
                     row['panels_verified_incomplete'].append(name)
             if comp in (rep.get('unverified_components') or []):
                 row['panels_unverified'].append(name)
+            # A single-panel result is not automatically replicated.  More
+            # importantly, a panel that significantly points the OTHER way is
+            # contradictory evidence, not an inconvenient panel to omit from
+            # the project-level read.
+            _conflicts = rep.get('direction_conflict_components') or []
+            if isinstance(_conflicts, (list, tuple, set)) and comp in _conflicts:
+                row['panels_direction_conflict'].append(name)
+            _harmful = rep.get('practically_harmful_components') or []
+            if isinstance(_harmful, (list, tuple, set)) and comp in _harmful:
+                row['panels_practically_harmful'].append(name)
+            _comp_map = rep.get('components')
+            _entries = (_comp_map.get(comp)
+                        if isinstance(_comp_map, dict) else None)
+            if isinstance(_entries, (list, tuple)):
+                _nmin = _as_seed_int(rep.get('min_n')) or 0
+                for _e in _entries:
+                    if not isinstance(_e, dict) or not _e.get('controlled'):
+                        continue
+                    _n = _as_seed_int(_e.get('n'))
+                    if _n is None or _n < _nmin:
+                        continue
+                    if (_e.get('direction_consistent') is False
+                            and _e.get('observed_sign') in (-1, 1)):
+                        row['panels_opposite_mean'].append(name)
+                        break
         row['panels_usable'] = sorted(set(row['panels_complete']) & set(row['panels_measured']))
+        row['panels_measured_unverified'] = sorted(
+            set(row['panels_measured']) - set(row['panels_verified_raw']))
+        _verified_complete = sorted(set(row['panels_verified']))
+        row['panels_replicated'] = (_verified_complete
+                                    if len(_verified_complete) >= 2 else [])
         row['complete_anywhere'] = bool(row['panels_complete'])
         row['usable_anywhere'] = bool(row['panels_usable'])
         row['verified_anywhere'] = bool(row['panels_verified'])
         row['measured_anywhere'] = bool(row['panels_measured'])
+        _contradicted = bool(row['panels_direction_conflict']
+                             or row['panels_practically_harmful'])
+        row['replication_status'] = (
+            'contradicted' if _contradicted else
+            'replicated' if row['panels_replicated'] else
+            'single_panel' if row['panels_verified'] else
+            'not_verified' if row['panels_measured'] else 'not_measured')
         out['components'][comp] = row
         if row['complete_anywhere']:
             out['complete_anywhere'].append(comp)
@@ -28957,6 +29013,33 @@ def ablation_coverage_across_panels(reports, design=None, *, verbose=False):
                 'contrast(s), not for the whole innovation; complete the '
                 'missing arm(s) before calling this component verified'
                 % (comp, ', '.join(row['panels_verified_incomplete'])))
+        if row['panels_replicated']:
+            out['replicated_anywhere'].append(comp)
+        elif row['panels_verified']:
+            out['single_panel_verified'].append(comp)
+        if row['panels_direction_conflict']:
+            out['direction_conflict_anywhere'].append(comp)
+            out['warnings'].append(
+                '%s: the declared direction is contradicted by a correction-'
+                'significant result in %s — a result in another panel is not '
+                'a replication, it is evidence against a project-level '
+                '"useful" claim'
+                % (comp, ', '.join(row['panels_direction_conflict'])))
+        if row['panels_practically_harmful']:
+            out['practically_harmful_anywhere'].append(comp)
+            if not row['panels_direction_conflict']:
+                out['warnings'].append(
+                    '%s: removal is practically harmful in %s (effect beyond '
+                    'the pre-registered SESOI); do not average this panel away'
+                    % (comp, ', '.join(row['panels_practically_harmful'])))
+        if (row['panels_opposite_mean'] and not row['panels_direction_conflict']
+                and not row['panels_practically_harmful']):
+            out['opposite_mean_anywhere'].append(comp)
+            out['warnings'].append(
+                '%s: a complete, powered contrast has the opposite mean '
+                'direction in %s; this is not a corrected contradiction, but '
+                'it weakens any single-panel replication claim'
+                % (comp, ', '.join(row['panels_opposite_mean'])))
         if row['usable_anywhere']:
             out['usable_anywhere'].append(comp)
         if row['measured_anywhere']:
@@ -28976,6 +29059,10 @@ def ablation_coverage_across_panels(reports, design=None, *, verbose=False):
     if out['verified_only_incomplete']:
         _reasons.append('verified only through an incomplete ablation: '
                         + ', '.join(sorted(set(out['verified_only_incomplete']))))
+    if out['direction_conflict_anywhere'] or out['practically_harmful_anywhere']:
+        _reasons.append('contradicted by another panel: '
+                        + ', '.join(sorted(set(out['direction_conflict_anywhere'])
+                                           | set(out['practically_harmful_anywhere']))))
     out['all_components_useful_allowed'] = bool(_needed) and not _reasons
     out['all_components_useful_reasons'] = _reasons
     out['unverified_components'] = _unverified
@@ -30369,7 +30456,12 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
     :func:`sequential_signflip_p`; the naive final-n p is kept as
     ``p_exact_signflip`` / ``p_holm_global_naive`` for transparency.  This is
     the optional-stopping correction: topping up seeds after seeing a
-    non-significant result cannot buy the final-n p for free."""
+    non-significant result cannot buy the final-n p for free.
+
+    This report is single-panel evidence.  Project-level replication and
+    cross-panel contradictions are computed by
+    :func:`ablation_coverage_across_panels`; do not read one panel's
+    `verified_components` as an independently replicated result."""
     alpha = _validated_alpha(alpha, context='methodology_audit alpha')
     _min_n = _as_seed_int(min_n)
     if _min_n is None or _min_n < 0:

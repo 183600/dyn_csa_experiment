@@ -3354,6 +3354,12 @@ def audit_methodology(outdirs=None, design=None, alpha=0.05, min_n=3, write=True
       * arm_summary：每条臂的 n、mean±std 与是否达到 min_n（关键实验至少
         3–5 个种子的可复核读数）。
 
+    `ablation_coverage` 进一步汇总跨 panel 的 complete/verified 覆盖、
+    replicated / single_panel 复现状态，以及任意 panel 的显著反方向
+    （direction_conflict）或实际有害（practically_harmful）证据；后者
+    关闭 `all_components_useful_allowed`，不会因为另一个 panel 通过而被
+    平均掉。
+
     没有 `results_*/summary.json` 时返回 not_verifiable_locally，而不是
     伪造一个通过。"""
     L = _import_exp_lib()
@@ -3429,6 +3435,16 @@ def audit_methodology(outdirs=None, design=None, alpha=0.05, min_n=3, write=True
             out['ablation_coverage'].get('unverified_components') or [])
         out['verified_only_incomplete'] = list(
             out['ablation_coverage'].get('verified_only_incomplete') or [])
+        out['replicated_components'] = list(
+            out['ablation_coverage'].get('replicated_anywhere') or [])
+        out['single_panel_verified_components'] = list(
+            out['ablation_coverage'].get('single_panel_verified') or [])
+        out['direction_conflict_across_panels'] = list(
+            out['ablation_coverage'].get('direction_conflict_anywhere') or [])
+        out['practically_harmful_across_panels'] = list(
+            out['ablation_coverage'].get('practically_harmful_anywhere') or [])
+        out['opposite_mean_across_panels'] = list(
+            out['ablation_coverage'].get('opposite_mean_anywhere') or [])
         if out['ablation_coverage'].get('status') != 'ok':
             out['status'] = 'warn'
     print(json.dumps(out, ensure_ascii=False, indent=2))

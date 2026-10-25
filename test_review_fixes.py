@@ -3433,7 +3433,7 @@ def t_ablation_coverage_across_panels():
     design = {'A': [('full', 'full-A', '')], 'B': [('full', 'full-B', '')]}
 
     def _rep(*, complete=(), incomplete=(), missing=None, measured=(), verified=(),
-             unverified=()):
+             unverified=(), conflicts=(), harmful=(), entries=None, min_n=3):
         return {'ablation_completeness': {
                     'components': {c: {} for c in set(complete) | set(incomplete)},
                     'complete_components': list(complete),
@@ -3441,7 +3441,10 @@ def t_ablation_coverage_across_panels():
                     'missing_arms': dict(missing or {})},
                 'measured_components': list(measured),
                 'verified_components': list(verified),
-                'unverified_components': list(unverified)}
+                'unverified_components': list(unverified),
+                'direction_conflict_components': list(conflicts),
+                'practically_harmful_components': list(harmful),
+                'components': dict(entries or {}), 'min_n': min_n}
 
     reports = {
         'p1': _rep(complete=('A',), measured=('A',), verified=('A',)),
@@ -3471,6 +3474,64 @@ def t_ablation_coverage_across_panels():
     assert cov3['components']['A']['usable_anywhere'] is False, cov3
     assert cov3['usable_anywhere'] == [], cov3
     assert cov3['status'] == 'warn' and any('shared seeds' in w for w in cov3['warnings']), cov3
+
+
+def t_ablation_coverage_replication_and_contradiction():
+    design = {'A': [('full', 'full-A', '')], 'B': [('full', 'full-B', '')]}
+
+    def _rep(*, complete=(), incomplete=(), missing=None, measured=(), verified=(),
+             unverified=(), conflicts=(), harmful=(), entries=None, min_n=3):
+        return {'ablation_completeness': {
+                    'components': {c: {} for c in set(complete) | set(incomplete)},
+                    'complete_components': list(complete),
+                    'incomplete_components': list(incomplete),
+                    'missing_arms': dict(missing or {})},
+                'measured_components': list(measured),
+                'verified_components': list(verified),
+                'unverified_components': list(unverified),
+                'direction_conflict_components': list(conflicts),
+                'practically_harmful_components': list(harmful),
+                'components': dict(entries or {}), 'min_n': min_n}
+
+    _full = dict(complete=('A', 'B'), measured=('A', 'B'))
+    p1 = _rep(verified=('A', 'B'), **_full)
+    p2 = _rep(verified=('B',), unverified=('A',), conflicts=('A',), **_full)
+    cov = L.ablation_coverage_across_panels({'p1': p1, 'p2': p2}, design)
+    # One panel verifying A is not enough: the other panel's corrected
+    # opposite direction is contradictory evidence, not a second opinion.
+    assert cov['components']['A']['panels_verified'] == ['p1'], cov
+    assert cov['components']['A']['panels_direction_conflict'] == ['p2'], cov
+    assert cov['components']['A']['replication_status'] == 'contradicted', cov
+    assert cov['components']['B']['panels_replicated'] == ['p1', 'p2'], cov
+    assert cov['components']['B']['replication_status'] == 'replicated', cov
+    assert cov['replicated_anywhere'] == ['B'], cov
+    assert cov['single_panel_verified'] == ['A'], cov
+    assert cov['direction_conflict_anywhere'] == ['A'], cov
+    assert cov['all_components_useful_allowed'] is False, cov
+    assert any('contradicted by another panel' in r
+               for r in cov['all_components_useful_reasons']), cov
+
+    # A practically harmful removal is a contradiction even when the panel
+    # classifier did not also put the component in the direction-conflict list.
+    p2h = _rep(verified=('B',), unverified=('A',), harmful=('A',), **_full)
+    covh = L.ablation_coverage_across_panels({'p1': p1, 'p2': p2h}, design)
+    assert covh['practically_harmful_anywhere'] == ['A'], covh
+    assert covh['components']['A']['replication_status'] == 'contradicted', covh
+    assert covh['all_components_useful_allowed'] is False, covh
+
+    # A powered opposite MEAN without correction-significance is a warning,
+    # not a contradiction: do not let noise alone flip the project gate.
+    p2o = _rep(verified=('B',), unverified=('A',), **_full,
+               entries={'A': [{'controlled': True, 'n': 3,
+                               'direction_consistent': False,
+                               'observed_sign': 1, 'predicted_sign': -1}]})
+    covo = L.ablation_coverage_across_panels({'p1': p1, 'p2': p2o}, design)
+    assert covo['components']['A']['panels_opposite_mean'] == ['p2'], covo
+    assert covo['components']['A']['replication_status'] == 'single_panel', covo
+    assert covo['opposite_mean_anywhere'] == ['A'], covo
+    assert covo['direction_conflict_anywhere'] == [], covo
+    assert covo['all_components_useful_allowed'] is True, covo
+    assert covo['status'] == 'warn', covo
 
 
 def t_panel_ablation_flag_does_not_overclaim():
@@ -22664,6 +22725,8 @@ def main():
     _check('L188 analysis-choice concordance is explicit and audited', t_analysis_choice_concordance_and_audit)
     _check('L189 missing WikiText train source raises RuntimeError', t_wikitest_missing_train_source_fails_with_runtime_error)
     _check('L190 release identity binds the measurement source', t_release_identity_binds_measurement_source)
+    _check('L191 project ablation gate rejects panel contradictions and reports replication',
+           t_ablation_coverage_replication_and_contradiction)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

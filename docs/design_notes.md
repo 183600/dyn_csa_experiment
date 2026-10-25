@@ -4216,3 +4216,77 @@ L190 覆盖：真实 `make` 的 tar 中含 `exp_lib.py`/`archive_release.py` 等
 per-file map 删除源码、篡改顶层源码摘要或清空 `code_semantics` 会被
 身份检查拒绝；把 tar 内 manifest 的 `source_tree_sha256` 改成错误值后，
 即使所有文件哈希仍匹配，`verify` 也返回 1。
+
+## 65. 跨 panel 消融门必须识别反证，并区分单面板与复现
+
+### 65.1 问题：覆盖计数会把反证平均掉
+
+`ablation_coverage_across_panels` 原来的项目级读数是「某组件在任意
+panel 完整且 verified」即计入 `verified_anywhere`；只要所有组件都在
+某处通过，`all_components_useful_allowed` 就为真。若组件 A 在 p1 完整
+且方向一致地通过，却在 p2 完整、方向显著相反（或移除效果超过 SESOI 而
+有害），旧门仍会允许「每个创新都有用」的项目级声明。这不是复现，而是
+按 panel 挑选有利证据：一个反证 panel 不能因为另一个 panel 通过就被
+平均掉。反过来，单 panel verified 也不等于独立复现，报告应明确标成
+`single_panel`，而不是让读者自行假设已经复制。
+
+### 65.2 方法：反证优先，其次才是复现
+
+对每个声明的组件，`ablation_coverage_across_panels` 在原有
+complete / usable / measured / verified / unverified 覆盖读数之外增加：
+
+- `panels_direction_conflict`：该 panel 的
+  `direction_conflict_components` 点名了此组件——族校正后显著、但方向
+  与预注册假设相反；
+- `panels_practically_harmful`：该 panel 的
+  `practically_harmful_components` 点名了此组件——移除效果超过预注册
+  SESOI 且方向为害；
+- `panels_opposite_mean`：至少一个 controlled、n≥min_n 的对比均值为反
+  方向；这是描述性警告，不是校正后的反证；
+- `panels_measured_unverified`：测过但没有任何 verified 对比的面板；
+- `panels_replicated` 与 `replication_status`：至少两个完整 panel 均
+  verified 才是 `replicated`；否则按 `contradicted` / `single_panel` /
+  `not_verified` / `not_measured` 分级。
+
+顶层新增 `replicated_anywhere`、`single_panel_verified`、
+`direction_conflict_anywhere`、`practically_harmful_anywhere` 和
+`opposite_mean_anywhere`。`all_components_useful_allowed` 在任何
+反证/实际有害存在时关闭，并在 `all_components_useful_reasons` 点名
+冲突 panel；旧的 incomplete / verified-only-incomplete 规则保持不变。
+`audit_methodology` 把上述跨 panel 列表提升到报告顶层，便于
+`audit_gates.py report` 直接消费。
+
+该门不重新计算 p 值，不新增统计检验，也不合并 panel 效应；它只重排
+已有 panel 级、族校正后的 verdict。`verified`、SESOI 与 Holm 的语义
+完全不变。
+
+### 65.3 边界
+
+- **不是独立复现，也不是外部效度。** `replicated` 只表示两个完整 panel
+  都通过；若它们共享种子、验证切片、训练配方或调参历史，误差仍相关。
+  该字段不能替代独立数据/独立实验室的 replication。
+- **不做 meta-analysis。** 不估计跨 panel 的合并效应、异质性
+  (`I²`/`tau²`) 或预测区间；需要合并效应时仍应使用显式的
+  `meta_analyze_effects`，并先证明各 panel 的可合并性。
+- **反证优先于复现计数。** 冲突 panel 即使 ablation 不完整也仍然点名，
+  因为显著反方向结果不能被「该 panel 缺一个臂」抹掉；它不能被当作
+  `verified`，也不能被忽略。
+- **只对预注册方向负责。** `direction_unspecified` 不算
+  `direction_conflict`；未声明方向的 panel 不会被强行判为反证。
+  `panels_opposite_mean` 仅为警告，不单独关闭项目门，避免小样本噪声
+  翻转结论。
+- 该改动不改变冻结清单、种子、终点、alpha、Holm 决策或任何数值结果；
+  不新增训练、不读取 test split、不改 `CODE_SEMANTICS`。
+
+### 65.4 入口与验证
+
+```bash
+python audit_gates.py report             # 报告含 replicated/single_panel/...
+python test_review_fixes.py              # L191
+```
+
+L191 覆盖：p1 完整 verified、p2 完整但显著反方向时 A 被标为
+`contradicted`、项目门关闭且在 reasons 中点名 p2；B 在两个完整 panel
+通过时为 `replicated`；`practically_harmful` 同样关闭门；一个 powered
+但非显著的相反均值只产生 `opposite_mean` 警告，不关闭项目门。完整 CPU
+套件 539/539 通过（0 skipped）。
