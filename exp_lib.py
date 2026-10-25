@@ -29471,8 +29471,12 @@ def factorial_interaction_audit(summary=None, design=None, *, alpha=0.05,
         # panel does, and a panel with a design-specific arm is reported as
         # incomplete.  Comparing against the global intersection (rather than
         # skipping whenever all present arms are shared) keeps a single-design
-        # audit measurable instead of falsely returning not_applicable.
-        if len(present_arms) < 4 and present_arms <= shared:
+        # audit measurable instead of falsely returning not_applicable.  With
+        # exactly one declared factorial there is no ambiguity to resolve, so
+        # even a partial panel must be reported as incomplete (and keep its
+        # p=1 family slot) rather than silently vanish.
+        if (len(present_arms) < 4 and present_arms <= shared
+                and len(arm_sets) > 1):
             continue
         norm_cells = {k: arms[i] for i, k in enumerate(_FACTORIAL_CELL_KEYS)}
         rec = {'factors': list(factors) if isinstance(factors, (list, tuple)) else None,
@@ -40115,6 +40119,7 @@ def _combined_seed_doc_ci(recs, *, n_boot=2000, seed=20261018, conf=0.95):
                      for r in recs if isinstance(r, dict)}
     rows = []
     _mixed_estimands = len(_nested_flags) > 1
+    _zero_token_seed = False
     for r in recs:
         _arrays = _primary_row_arrays(r)
         if _arrays is None:
@@ -40142,6 +40147,14 @@ def _combined_seed_doc_ci(recs, *, n_boot=2000, seed=20261018, conf=0.95):
         ntok_mat = ntok_mat[:, keep]
         if not np.isfinite(nll_mat).all() or not np.isfinite(ntok_mat).all() or (ntok_mat < 0).any():
             rows = None
+        elif (ntok_mat.sum(axis=1) <= 0).any():
+            # A record with no scored token anywhere is not a PPL measurement
+            # (0 tokens would otherwise divide by 1e-30 and enter the seed
+            # component as a fake CE=0 seed).  Its NLLs also cannot be pooled
+            # into the document component.  Refuse the interval instead of
+            # inventing a zero-variance seed.
+            rows = None
+            _zero_token_seed = True
     out = {'status': 'unverifiable', 'n_seeds': len(recs), 'n_docs': None,
            'n_docs_dropped_zero_token': None,
            'se_seed_logppl': None, 'se_doc_logppl': None,
@@ -40152,6 +40165,12 @@ def _combined_seed_doc_ci(recs, *, n_boot=2000, seed=20261018, conf=0.95):
         out['reason'] = ('records mix nested-holdout and full-validation row '
                          'samples; the seed and document components would come '
                          'from two different evaluation sets')
+        return out
+    if _zero_token_seed:
+        out['reason'] = ('at least one record has no scored tokens after '
+                         'dropping all-zero documents; its pooled PPL is '
+                         'undefined, so no seed or document interval is '
+                         'invented from it')
         return out
     # Coverage, draw count and RNG seed identify the interval.  Never build a
     # 95% interval while echoing conf=True/1.0, and never let a fractional

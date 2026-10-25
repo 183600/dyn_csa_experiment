@@ -3932,6 +3932,20 @@ def t_combined_seed_doc_uncertainty():
     # Zero-token (never scored) rows are dropped, not pooled as free mass.
     r4 = L._combined_seed_doc_ci(_recs([0.0, 0.2], n_docs=8, ntok=50, zero_docs=2))
     assert r4['status'] == 'ok' and r4['n_docs'] == 6 and r4['n_docs_dropped_zero_token'] == 2, r4
+    # A whole seed with no scored token is not a CE=0 measurement: the seed
+    # component would otherwise divide by 1e-30 and report a fake zero-variance
+    # seed.  Refuse the interval instead.
+    _zero_seed = _recs([0.0, 0.2])
+    _zero_seed[1]['n_tokens_per_row'] = [0] * len(_zero_seed[1]['n_tokens_per_row'])
+    _zero_seed[1]['nll_per_row'] = [0.0] * len(_zero_seed[1]['nll_per_row'])
+    r5 = L._combined_seed_doc_ci(_zero_seed)
+    assert r5['status'] == 'unverifiable', r5
+    assert r5['se_seed_logppl'] is None and r5['se_doc_logppl'] is None, r5
+    assert r5['ci95_ppl'] is None and 'scored tokens' in r5.get('reason', ''), r5
+    # The same refusal applies when every document is unscored (there is no
+    # pooled PPL to bootstrap).
+    r6 = L._combined_seed_doc_ci(_recs([0.0, 0.2], n_docs=4, zero_docs=4))
+    assert r6['status'] == 'unverifiable' and r6['ci95_ppl'] is None, r6
     # The aggregate entry exposes the combined interval next to the two
     # single-level intervals.
     summary = {}
@@ -16290,6 +16304,27 @@ def t_factorial_interaction_matches_stripped_arms_and_disjoint_designs():
     one = rone['factorials']['only']
     assert one['n_complete'] == 7 and one['interaction']['available'] is True, one
     assert rone['family']['m'] == 1, rone['family']
+    # A single declared factorial is identified by its own arms even when the
+    # panel is partial: it must be reported incomplete (keeping its p=1 family
+    # slot), not silently downgraded to not_applicable.
+    partial = {k: v for k, v in recs.items() if k[0] != 'csa_fix_randidx'}
+    rpart = L.factorial_interaction_audit(design={'only': base}, recs=partial)
+    assert rpart['status'] == 'incomplete', rpart
+    pfac = rpart['factorials']['only']
+    assert pfac['status'] == 'incomplete' and pfac['interaction']['available'] is False, pfac
+    assert rpart['family']['m'] == 1, rpart['family']
+    assert any('family slot is kept at p=1' in w for w in rpart['warnings']), rpart['warnings']
+    # With multiple declared designs, a panel containing only their shared arms
+    # is genuinely ambiguous and must still be skipped rather than attributed
+    # to an arbitrary factorial.
+    shared_only = {k: v for k, v in recs.items()
+                   if k[0] in ('csa_fixed', 'csa_dynamic')}
+    amb = L.factorial_interaction_audit(
+        design={'one': base,
+                'two': copy.deepcopy(
+                    L.FACTORIAL_DESIGN['dynamic_blocking_x_content_pooling'])},
+        recs=shared_only)
+    assert amb['status'] == 'not_applicable' and not amb['factorials'], amb
     # Arm ids are stripped by the design gate; the record-level audit must
     # resolve the same records rather than silently reporting no_data.
     ws = copy.deepcopy(base)
