@@ -22000,6 +22000,28 @@ def t_analysis_choice_concordance_and_audit():
     assert '**解读提示**' not in ff_md and '依赖分析口径' not in ff_md, ff_md
 
 
+def t_wikitest_missing_train_source_fails_with_runtime_error():
+    """A dataset loader returning None is a missing source, not UnboundLocal."""
+    import unittest.mock as mock
+    old = os.environ.get('WT103_RAW_TXT')
+    with tempfile.TemporaryDirectory() as td:
+        os.environ['WT103_RAW_TXT'] = os.path.join(td, 'absent_raw')
+        try:
+            with mock.patch('datasets.load_dataset', return_value=None):
+                try:
+                    L.load_wikitest(8, n_seqs=1, vocab_size=64,
+                                    cache_dir=os.path.join(td, 'cache'))
+                except RuntimeError as e:
+                    assert 'no train source' in str(e), e
+                else:  # pragma: no cover
+                    raise AssertionError('a missing HF train split was accepted')
+        finally:
+            if old is None:
+                os.environ.pop('WT103_RAW_TXT', None)
+            else:
+                os.environ['WT103_RAW_TXT'] = old
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -22537,6 +22559,7 @@ def main():
     _check('L186 interval calibration covers coverage and non-vacuity', t_interval_calibration_gates_and_bootstrap)
     _check('L187 look recorder normalizes raw string-keyed summaries', t_look_history_accepts_raw_summary_keys)
     _check('L188 analysis-choice concordance is explicit and audited', t_analysis_choice_concordance_and_audit)
+    _check('L189 missing WikiText train source raises RuntimeError', t_wikitest_missing_train_source_fails_with_runtime_error)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

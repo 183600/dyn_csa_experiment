@@ -9277,6 +9277,7 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=None, cache_dir=None,
             break
     if train_rows_source is None:
         _wt_source = wikitext_dataset_source()
+        last_err = None
         for repo in (WIKITEXT_HF_REPO, WIKITEXT_HF_REPO_ALIAS):
             try:
                 # TRAIN split only, for the frozen tokenizer fit.  Never reuse
