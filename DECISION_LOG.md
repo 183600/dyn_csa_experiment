@@ -2703,3 +2703,44 @@ a 更常更低；全平局为 0）。种子不足 5 时 trimmed mean 显式不�
 仍 72/72 合成冻结记录、6 个比较；`python audit_gates.py analysis_choices`
 在无 `analysis_v12/test_stats.json` 时返回 `not_verifiable_locally`（不冒充
 通过）。
+
+
+## 2026-10-25 — 证据归档自带测量源码并用内容摘要绑定（no new runs）
+
+零 GPU 的发布工程硬化；不新增训练、不读 test split、不改冻结清单的
+任何字节/种子/终点/α/Holm 决策规则，也不改 `CODE_SEMANTICS`。
+
+**Problem.** §50/§51 已让冻结锁和运行清单绑定源码树，但
+`archive_release.py` 的正式 release 仍只记录 `git_head`，tar 内没有测量
+源码。工作树为 dirty、分支移动、提交被变基/删除，或报告在源码编辑后
+才生成时，归档无法从自身字节重建当时的代码；`git_head` 只能证明某个
+提交存在，不能证明归档里的结果与该提交在同一时刻被绑定。验证者被迫
+信任打包者的陈述。
+
+**Fix.** `plan`/`make` 复用 `exp_lib.source_tree_manifest()`（与冻结锁/
+运行清单同一口径），把每个测量源码文件按仓库相对路径加入归档；manifest
+新增 `identity`：`schema`、`code_semantics`、`code_stamp`、`source_tree`
+（逐文件 `sha256`/`bytes`、`n_files`、总字节、聚合摘要）、顶层
+`source_tree_sha256`、`dependency_contract`、`execution_fingerprint` 和
+精简 `environment`。聚合摘要为
+`sha256(sorted relpath NUL bytes NUL sha256 LF)`。`make` 在发布前用
+`_release_identity_problems()` 复核实际写入 tar 的字节，最多只能校验已
+打包源码；不一致（例如打包期间源码被编辑）则删除临时 tar 并拒绝发布。
+`verify` 对归档内 manifest 执行同一检查，不依赖 Git、当前工作树或
+`exp_lib`。旧归档无 `identity` 时仍校验文件哈希，但打印 NOTE，明确源码
+绑定不可验证。
+
+**Boundary.** 不是环境重建：`verify` 不重新安装依赖、不重算
+`dependency_contract`，也不验证 `execution_fingerprint` 记录的主机/CUDA
+栈。依赖与指纹是归档时声明，需配合发布记录和 `audit_gates.py`。源码树
+口径只含测量相关源码/配置，不含测试、README、docs 和结果，绑定的是代码
+身份而非说明文档版本。Git 提交仍保留，但不再是源码身份的唯一依据；
+dirty 工作树可被如实绑定。数值、冻结清单、`CODE_SEMANTICS`、种子、
+终点与 Holm 决策均不变。
+
+**Verification.** `python test_review_fixes.py` 通过 L190：真实 `make`
+的 tar 含 `exp_lib.py`/`archive_release.py` 等源码，`identity` 与 per-file
+哈希一致，`verify` 通过；删除源码映射、篡改顶层源码摘要或清空
+`code_semantics` 被身份检查拒绝；tar 内 manifest 的
+`source_tree_sha256` 改为错误值后，即使文件哈希全匹配，`verify` 返回 1。
+`python archive_release.py verify <archive>` 的旧归档路径保持兼容。

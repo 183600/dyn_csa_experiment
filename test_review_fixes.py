@@ -22022,6 +22022,74 @@ def t_wikitest_missing_train_source_fails_with_runtime_error():
                 os.environ['WT103_RAW_TXT'] = old
 
 
+def t_release_identity_binds_measurement_source():
+    """A release must carry the exact measurement source it was built from.
+
+    The archive used to record the git HEAD only.  A dirty tree, a moved
+    branch, or a source edit made after a run could therefore leave an
+    "auditable" release whose code cannot be reconstructed.  `make` now packs
+    the source-tree manifest's files and `verify` recomputes the digest from
+    those packed bytes, independently of exp_lib and of Git.
+    """
+    import archive_release as AR
+    import tarfile
+    with tempfile.TemporaryDirectory(dir=REPO) as td:
+        rel = os.path.basename(td)
+        results = os.path.join(td, 'results_x')
+        os.makedirs(results)
+        with open(os.path.join(results, 'summary.json'), 'w', encoding='utf-8') as f:
+            json.dump({'csa_fixed::seed0': {'ppl': 10.0}}, f)
+        out = os.path.join(rel, 'archive')
+        assert AR.cmd_make('identity_test', [os.path.join(rel, 'results_x')],
+                           outdir=out) == 0
+        path = os.path.join(out, 'release_identity_test.tar.gz')
+        assert os.path.isfile(path)
+        with tarfile.open(path, 'r:gz') as tf:
+            man_name = next(n for n in tf.getnames()
+                            if n.endswith('.MANIFEST.sha256'))
+            man = json.load(tf.extractfile(man_name))
+        ident = man['identity']
+        assert ident['schema'] == AR._SOURCE_IDENTITY_SCHEMA, ident
+        assert ident['code_semantics'] == L.CODE_SEMANTICS, ident
+        st = ident['source_tree']
+        assert st['sha256'] == ident['source_tree_sha256'], st
+        assert AR._release_identity_problems(man) == [], AR._release_identity_problems(man)
+        for rel_src, meta in st['files'].items():
+            assert rel_src in man['files'], f'source file not packed: {rel_src}'
+            assert man['files'][rel_src]['sha256'] == meta['sha256'], rel_src
+            assert man['files'][rel_src]['bytes'] == meta['bytes'], rel_src
+        assert 'exp_lib.py' in st['files'] and 'archive_release.py' in st['files'], st
+        assert any(k.endswith('results_x/summary.json')
+                   for k in man['files']), man['files'].keys()
+        assert AR.cmd_verify(path) == 0
+        # Identity is a binding, not a label: a source file missing from the
+        # packed map or a wrong aggregate digest must be refused.
+        bad = json.loads(json.dumps(man))
+        bad['files'].pop('exp_lib.py')
+        assert any('not packed' in p for p in AR._release_identity_problems(bad)), bad
+        bad2 = json.loads(json.dumps(man))
+        bad2['identity']['source_tree_sha256'] = '0' * 64
+        assert AR._release_identity_problems(bad2), bad2
+        bad3 = json.loads(json.dumps(man))
+        bad3['identity']['code_semantics'] = ''
+        assert any('code_semantics' in p for p in AR._release_identity_problems(bad3)), bad3
+        # End-to-end: tampering with the identity block makes verify fail even
+        # though every packed file hash still matches.
+        tampered = path + '.tampered.tar.gz'
+        with tarfile.open(path, 'r:gz') as src, tarfile.open(tampered, 'w:gz') as dst:
+            for member in src.getmembers():
+                data = src.extractfile(member)
+                if member.name == man_name:
+                    _m = json.loads(data.read())
+                    _m['identity']['source_tree_sha256'] = '0' * 64
+                    _b = json.dumps(_m).encode('utf-8')
+                    member.size = len(_b)
+                    dst.addfile(member, io.BytesIO(_b))
+                else:
+                    dst.addfile(member, data)
+        assert AR.cmd_verify(tampered) == 1
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -22560,6 +22628,7 @@ def main():
     _check('L187 look recorder normalizes raw string-keyed summaries', t_look_history_accepts_raw_summary_keys)
     _check('L188 analysis-choice concordance is explicit and audited', t_analysis_choice_concordance_and_audit)
     _check('L189 missing WikiText train source raises RuntimeError', t_wikitest_missing_train_source_fails_with_runtime_error)
+    _check('L190 release identity binds the measurement source', t_release_identity_binds_measurement_source)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

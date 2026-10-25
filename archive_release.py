@@ -10,6 +10,10 @@ SHA-256 清单的固定归档**，可发布到任何只读位置（release 附�
 归档内容（对一个 tag/版本）：
   - 各 results_*/summary.json、bylen/distractor/niah 等落盘产物
   - analysis_*/ 全部统计 JSON 与 REPORT*.md
+  - **测量源码**：`exp_lib.source_tree_manifest()` 范围内的全部文件，
+    以仓库相对路径入包；归档因此不依赖 Git 历史仍然自洽
+  - **identity 块**：CODE_SEMANTICS、完整源码树摘要、依赖锁契约、
+    执行环境指纹；`verify` 只凭归档即可重算源码树摘要
   - confirmation_frozen.json（+ 冻结锁 .freeze_lock.json 与 ckpt 哈希表）
   - run_time_state*.json（TimeGuard 账本）
   - 环境：python/pip/torch/CUDA 版本、requirements 快照
@@ -208,8 +212,144 @@ def _env_snapshot():
     return env
 
 
-def _collect(dirs, include_ckpt=False):
-    """Files that would enter the archive, with sizes and hashes (lazily)."""
+_SOURCE_TREE_ALGORITHM = 'sha256(sorted relpath NUL bytes NUL sha256 LF)'
+_SOURCE_IDENTITY_SCHEMA = 1
+
+
+def _measurement_source_manifest(root=None):
+    """The measurement-relevant source tree, via the library's one definition.
+
+    The archiver must not re-implement the scope: `exp_lib.source_tree_manifest`
+    is what the freeze lock, run provenance and the source audit already bind.
+    Importing the library here is deliberate — a release built from bytes that
+    the measurement code cannot identify is not an evidence release.
+    """
+    _root = os.path.abspath(root or REPO)
+    if REPO not in sys.path:
+        sys.path.insert(0, REPO)
+    try:
+        import exp_lib as _L
+    except Exception as e:
+        raise RuntimeError(
+            'cannot compute the measurement source identity '
+            f'({type(e).__name__}: {e}); run the archiver from the repository '
+            'envelope with exp_lib.py available') from e
+    return _L.source_tree_manifest(root=_root)
+
+
+def _release_identity(source_tree):
+    """Compact, self-contained identity for one evidence release."""
+    import exp_lib as _L
+    env = _L.environment_snapshot()
+    _env_keys = ('python', 'platform', 'machine', 'processor', 'torch',
+                 'torch_git_version', 'numpy', 'cuda_available', 'cuda_version',
+                 'cudnn_version', 'gpu_identity', 'determinism',
+                 'cudnn_deterministic', 'cudnn_benchmark',
+                 'deterministic_algorithms', 'tf32_matmul', 'tf32_cudnn',
+                 'cublas_workspace_config', 'cpu_threads', 'pythonhashseed')
+    return {
+        'schema': _SOURCE_IDENTITY_SCHEMA,
+        'code_semantics': _L.CODE_SEMANTICS,
+        'code_stamp': _L.code_stamp(),
+        'source_tree': source_tree,
+        'source_tree_sha256': source_tree.get('sha256'),
+        'dependency_contract': _L.dependency_contract(),
+        'execution_fingerprint': _L.execution_fingerprint(env=env),
+        'environment': {k: env.get(k) for k in _env_keys},
+        'note': ('the measurement source files are packed at repository-relative '
+                 'paths; verify recomputes source_tree.sha256 from the packed '
+                 'bytes, so a release remains auditable without Git history'),
+    }
+
+
+def _bad_file_entry(meta, *, require_bytes=False):
+    """Malformed per-file manifest entry?  Booleans are not byte counts."""
+    if not isinstance(meta, dict):
+        return True
+    sha = meta.get('sha256')
+    if not isinstance(sha, str) or not re.fullmatch(r'[0-9a-fA-F]{64}', sha):
+        return True
+    size = meta.get('bytes')
+    if size is None:
+        return bool(require_bytes)
+    return (isinstance(size, bool) or not isinstance(size, int) or size < 0)
+
+
+def _release_identity_problems(man, *, identity=None):
+    """Why a manifest's identity does not bind its packed bytes.
+
+    Runs on the archived manifest alone: every source-tree entry must be in the
+    per-file map with the same digest/size, the aggregate digest is recomputed
+    with the documented algorithm, and the top-level identity fields must be
+    present.  It does not import exp_lib, so `verify` stays independent of the
+    code it is checking.
+    """
+    problems = []
+    ident = man.get('identity') if identity is None else identity
+    if not isinstance(ident, dict):
+        return ['identity block is missing or not an object']
+    if ident.get('schema') != _SOURCE_IDENTITY_SCHEMA:
+        problems.append(f"identity schema is {ident.get('schema')!r}, "
+                        f'expected {_SOURCE_IDENTITY_SCHEMA}')
+    _cs = ident.get('code_semantics')
+    if not isinstance(_cs, str) or not _cs.strip():
+        problems.append('identity.code_semantics is empty or not a string')
+    if not isinstance(ident.get('dependency_contract'), dict):
+        problems.append('identity.dependency_contract is missing or not an object')
+    st = ident.get('source_tree')
+    if not isinstance(st, dict):
+        return problems + ['identity.source_tree is missing or not an object']
+    if st.get('algorithm') != _SOURCE_TREE_ALGORITHM:
+        problems.append('identity.source_tree.algorithm is not the documented one')
+    files = st.get('files')
+    if not isinstance(files, dict) or not files:
+        return problems + ['identity.source_tree.files is missing or empty']
+    packed = man.get('files') if isinstance(man.get('files'), dict) else {}
+    if not packed:
+        problems.append('manifest files map is missing or empty')
+    total = 0
+    for rel, meta in files.items():
+        if _unsafe_member_name(rel):
+            problems.append(f'unsafe source-tree path: {rel!r}')
+            continue
+        if _bad_file_entry(meta, require_bytes=True):
+            problems.append(f'malformed source-tree entry: {rel!r}')
+            continue
+        total += int(meta['bytes'])
+        got = packed.get(rel)
+        if not isinstance(got, dict):
+            problems.append(f'source file not packed: {rel!r}')
+            continue
+        if str(got.get('sha256', '')).lower() != str(meta['sha256']).lower():
+            problems.append(f'source-file digest disagrees with packed bytes: {rel!r}')
+        if got.get('bytes') is not None and int(got['bytes']) != int(meta['bytes']):
+            problems.append(f'source-file size disagrees with packed bytes: {rel!r}')
+    blob = ''.join(f'{rel}\0{files[rel]["bytes"]}\0{files[rel]["sha256"]}\n'
+                   for rel in sorted(files)
+                   if isinstance(files.get(rel), dict)
+                   and files[rel].get('sha256') is not None
+                   and files[rel].get('bytes') is not None)
+    digest = hashlib.sha256(blob.encode('utf-8')).hexdigest()
+    if str(st.get('sha256', '')).lower() != digest:
+        problems.append('identity.source_tree.sha256 does not recompute from its files')
+    if str(ident.get('source_tree_sha256', '')).lower() != str(st.get('sha256', '')).lower():
+        problems.append('identity.source_tree_sha256 disagrees with identity.source_tree.sha256')
+    if st.get('n_files') != len(files):
+        problems.append('identity.source_tree.n_files disagrees with its file map')
+    if st.get('bytes') != total:
+        problems.append('identity.source_tree.bytes disagrees with its file map')
+    return problems
+
+
+def _collect(dirs, include_ckpt=False, *, include_source=False, source_tree=None):
+    """Files that would enter the archive, with sizes and hashes (lazily).
+
+    `include_source` appends the exact measurement-source files (the same
+    scope the freeze lock and run provenance bind).  The caller can pass a
+    previously computed `source_tree` so the identity and the packed bytes are
+    evaluated against one scan; a later scan would make a concurrent source
+    edit look like a valid release.
+    """
     files = []
     _repo_real = os.path.realpath(REPO)
     for d in dirs:
@@ -256,6 +396,14 @@ def _collect(dirs, include_ckpt=False):
     # claims to preserve (module docstring), but they are gitignored and live
     # only on the experiment machine.
     files.extend(sorted(glob.glob(os.path.join(REPO, 'run_time_state*.json'))))
+    if include_source:
+        st = source_tree if source_tree is not None else _measurement_source_manifest()
+        _src_files = st.get('files') if isinstance(st, dict) else None
+        if not isinstance(_src_files, dict) or not _src_files:
+            raise RuntimeError('the measurement source manifest is empty; refusing '
+                               'to build a release that cannot bind its code')
+        for rel in sorted(_src_files):
+            files.append(os.path.join(REPO, rel))
     # The freeze lock can already be reached by the directory walk above;
     # duplicate tar members with the same name are ambiguous on extraction,
     # so keep the first occurrence only.
@@ -338,13 +486,18 @@ def _ckpt_hash_table(dirs):
 
 def cmd_plan(tag, dirs, include_ckpt=False):
     tag = _release_tag(tag)
-    files = _collect(dirs, include_ckpt)
+    source_tree = _measurement_source_manifest()
+    files = _collect(dirs, include_ckpt, include_source=True,
+                     source_tree=source_tree)
     total = 0
     print(f'[archive] plan for release {tag!r} ({len(files)} files):')
     for p in files:
         sz = os.path.getsize(p)
         total += sz
         print(f'  {sz:>12,d} B  {os.path.relpath(p, REPO)}')
+    print(f'[archive] measurement source: {source_tree.get("n_files")} files, '
+          f'{int(source_tree.get("bytes") or 0):,d} B, '
+          f'sha256 {str(source_tree.get("sha256"))[:16]}…')
     ck = _ckpt_hash_table(dirs)
     if ck:
         print(f'[archive] checkpoints found: {len(ck)} — hashed into the manifest' + (' and packed' if include_ckpt else ' (bodies NOT packed; use --include-ckpt to embed them)'))
@@ -367,15 +520,23 @@ def cmd_make(tag, dirs, include_ckpt=False, outdir='archive'):
               'contain no evidence — run this on the machine holding the '
               'artifacts')
         return 1
-    files = _collect(dirs, include_ckpt)
+    source_tree = _measurement_source_manifest()
+    files = _collect(dirs, include_ckpt, include_source=True,
+                     source_tree=source_tree)
     if not files:
         print('[archive] REFUSE: nothing to archive — the named result dirs do not exist here; run this on the machine holding the artifacts')
         return 1
+    identity = _release_identity(source_tree)
+    _dep_status = (identity.get('dependency_contract') or {}).get('status')
+    if _dep_status not in ('ok', 'partial'):
+        print(f'[archive] WARNING: dependency contract status is {_dep_status!r}; '
+              'the archive records the mismatch but this environment is not a '
+              'verified lock environment')
     _outdir = _safe_outdir(outdir)
     os.makedirs(_outdir, exist_ok=True)
     base_name = f'release_{tag}'
     tar_path = os.path.join(_outdir, f'{base_name}.tar.gz')
-    man = {'release': base_name, 'tag': tag, 'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'created_by': 'archive_release.py', 'git': _git_state(), 'environment': _env_snapshot(), 'dirs': list(dirs), 'include_ckpt_bodies': bool(include_ckpt), 'files': {}, 'checkpoint_hashes': _ckpt_hash_table(dirs)}
+    man = {'schema': 2, 'release': base_name, 'tag': tag, 'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'created_by': 'archive_release.py', 'git': _git_state(), 'environment': _env_snapshot(), 'identity': identity, 'dirs': list(dirs), 'include_ckpt_bodies': bool(include_ckpt), 'files': {}, 'checkpoint_hashes': _ckpt_hash_table(dirs)}
     # Build the archive beside its final name; an interrupted or failed make
     # must not leave a truncated `release_<tag>.tar.gz` (or destroy a previous
     # good release with the same tag).
@@ -420,6 +581,16 @@ def cmd_make(tag, dirs, include_ckpt=False, outdir='archive'):
                         f'but tar expected {ti.size}; nothing was published')
                 man['files'][rel] = {'sha256': reader.hexdigest(),
                                      'bytes': int(reader.nbytes)}
+            # The source manifest was scanned before packing.  A source edit
+            # between that scan and the reads above would produce an archive
+            # whose identity does not describe its own code; refuse to publish
+            # it instead of leaving a release that cannot verify.
+            _ident_problems = _release_identity_problems(man, identity=identity)
+            if _ident_problems:
+                raise RuntimeError(
+                    'release identity does not match the packed measurement '
+                    'source (was a source file edited while archiving?): '
+                    + '; '.join(_ident_problems[:8]))
             man_path_rel = f'{base_name}.MANIFEST.sha256'
             man_bytes = json.dumps(man, ensure_ascii=False, indent=2).encode('utf-8')
             import io
@@ -442,6 +613,10 @@ def cmd_make(tag, dirs, include_ckpt=False, outdir='archive'):
                         f'{tar_sha}  {os.path.basename(tar_path)}\n'.encode('utf-8'))
     print(f'[archive] wrote {os.path.relpath(tar_path, REPO)} ({os.path.getsize(tar_path):,d} B)')
     print(f'[archive] wrote {man_path_rel} ({len(man["files"])} files, {len(man["checkpoint_hashes"])} ckpt hashes)')
+    print(f'[archive] identity: code_semantics={identity.get("code_semantics")} '
+          f'source_tree={str(identity.get("source_tree_sha256"))[:16]}… '
+          f'({int(source_tree.get("n_files") or 0)} source files, '
+          f'dependency={_dep_status})')
     print(f'[archive] archive sha256: {tar_sha}')
     print('[archive] publish the tar.gz + MANIFEST + .sha256 to a read-only location (release attachment / object store); the git repo itself stays source-only (design_notes §8)')
     _atomic_write_bytes(
@@ -449,6 +624,10 @@ def cmd_make(tag, dirs, include_ckpt=False, outdir='archive'):
         json.dumps({'release': base_name, 'tag': tag, 'created_at': man['created_at'],
                     'tar_sha256': tar_sha, 'n_files': len(man['files']),
                     'n_ckpt_hashes': len(man['checkpoint_hashes']),
+                    'code_semantics': identity.get('code_semantics'),
+                    'source_tree_sha256': identity.get('source_tree_sha256'),
+                    'execution_fingerprint': identity.get('execution_fingerprint'),
+                    'dependency_status': _dep_status,
                     'git_head': (man['git'] or {}).get('git_head')},
                    ensure_ascii=False, indent=2).encode('utf-8'))
     return 0
@@ -511,15 +690,6 @@ def cmd_verify(tar_path):
         if not isinstance(man, dict) or not isinstance(man.get('files'), dict):
             print('[archive] REFUSE: the MANIFEST has no files mapping')
             return 1
-        def _bad_file_entry(meta):
-            if not isinstance(meta, dict):
-                return True
-            sha = meta.get('sha256')
-            if not isinstance(sha, str) or not re.fullmatch(r'[0-9a-fA-F]{64}', sha):
-                return True
-            size = meta.get('bytes')
-            return (size is not None
-                    and (isinstance(size, bool) or not isinstance(size, int) or size < 0))
         _bad_entries = [n for n, meta in man['files'].items()
                         if _bad_file_entry(meta)]
         if _bad_entries:
@@ -575,6 +745,15 @@ def cmd_verify(tar_path):
             print('[archive] REFUSE: the MANIFEST has malformed checkpoint hash '
                   f'entr(ies): {_bad_ck[:5]}')
             return 1
+        _ident = man.get('identity')
+        if _ident is None:
+            print('[archive] NOTE: no identity block (legacy release); the '
+                  'measurement source-tree binding cannot be verified from '
+                  'this archive alone')
+        else:
+            _ident_bad = _release_identity_problems(man, identity=_ident)
+            if _ident_bad:
+                bad.extend(f'identity: {p}' for p in _ident_bad[:20])
         print(f'[archive] verified {len(names)} members against the manifest; {len(ck)} checkpoint hashes recorded' + (' (bodies not packed — verify on the experiment machine by hash)' if ck else ''))
         if bad:
             print('[archive] FAIL:\n  - ' + '\n  - '.join(bad[:20]))

@@ -4152,3 +4152,67 @@ L188 覆盖：稳定/精度敏感/方向翻转/零效应/口径不足五种状�
 `not_verifiable_locally`、报告与 CLI 接线；以及「token 池化均值为正但逐
 单元中位数为负」的合成 panel 被标为 `direction_unstable` 且报告保留
 caveat。完整 CPU 套件 536/536 通过（0 skipped）。
+
+## 64. 证据归档必须自带测量源码并用内容摘要绑定
+
+### 64.1 问题：Git HEAD 不能证明归档里的代码
+
+§50/§51 已让冻结锁和运行清单绑定测量源码树，但 `archive_release.py` 的
+正式归档仍只记录 `git_head`。发布物本身不含源码；当工作树是 dirty、
+分支已移动、提交被变基/删除，或报告在最后一次源码编辑之后才生成时，
+一个「可审计」归档无法从自身字节重建当时的测量代码。只写 `git_head`
+还有一个更隐蔽的失败模式：归档里的结果和该提交的源码都真实存在，但二者
+从未在同一时刻被绑定，验证者只能相信打包者的陈述。正式 release 因此需要
+把测量源码入包，并让 `verify` 从包内字节独立重算身份。
+
+### 64.2 方法：一个源码清单、一个内容摘要、一次发布前复核
+
+`archive_release.py` 复用
+`exp_lib.source_tree_manifest()`（与冻结锁/运行清单同一扫描口径，排除
+`test_*.py`、`conftest.py`、`results_*`、`analysis_*` 等），在 `plan`
+和 `make` 时把每个源码文件按仓库相对路径加入归档。manifest 新增
+`identity` 块，记录：
+
+- `schema`、`code_semantics`、`code_stamp`；
+- `source_tree`（文件 → `sha256`/`bytes`、`n_files`、总字节数和聚合
+  `sha256`）与顶层 `source_tree_sha256`；
+- `dependency_contract`（锁文件契约的当前读数）和
+  `execution_fingerprint`；
+- 精简的 `environment` 字段。
+
+聚合摘要使用与源码树清单一致的算法：
+`sha256(sorted relpath NUL bytes NUL sha256 LF)`。`make` 在写 manifest
+前用 `_release_identity_problems()` 对**实际写入 tar 的字节**复核：每个
+源码树条目必须在 per-file map 中且摘要/大小一致，聚合摘要必须能重算；
+不一致（例如打包期间源码被编辑）就删除临时 tar 并拒绝发布。`verify`
+对归档内的 manifest 执行同一检查，因此校验不依赖 Git、当前工作树或
+`exp_lib`。没有 `identity` 的旧归档仍可校验文件哈希，但会打印 NOTE：
+其源码绑定不可从归档本身验证。
+
+### 64.3 边界
+
+- 这不是环境重建：`verify` 校验源码字节和摘要，不重新安装依赖、不重算
+  `dependency_contract`，也不验证 `execution_fingerprint` 所记录的主机/
+  CUDA 栈是否为真。依赖契约和指纹是归档时的声明，需配合发布记录和
+  `audit_gates.py` 使用。
+- 源码树口径是「测量相关源码和配置」，不含测试、README、docs 和结果
+  文件；它绑定的是代码身份，不是论文/说明文档的版本。
+- Git 提交仍保留在 manifest 中，但它不再是源码身份的唯一依据；dirty
+  工作树可以被如实绑定，而不需要先制造一个干净提交。
+- 该改动不改变任何数值、冻结清单、`CODE_SEMANTICS`、种子、终点或
+  Holm 决策；也不新增训练或读取 test split。
+
+### 64.4 入口与验证
+
+```bash
+python archive_release.py plan  <tag> --dirs results_lm_test analysis_v12
+python archive_release.py make  <tag> --dirs results_lm_test analysis_v12
+python archive_release.py verify archive/release_<tag>.tar.gz
+python test_review_fixes.py              # L190
+```
+
+L190 覆盖：真实 `make` 的 tar 中含 `exp_lib.py`/`archive_release.py` 等
+源码，manifest 的 `identity` 与 per-file 哈希一致，`verify` 通过；从
+per-file map 删除源码、篡改顶层源码摘要或清空 `code_semantics` 会被
+身份检查拒绝；把 tar 内 manifest 的 `source_tree_sha256` 改成错误值后，
+即使所有文件哈希仍匹配，`verify` 也返回 1。
