@@ -15919,6 +15919,37 @@ def _betai(a, b, x):
     return float(1.0 - bt * _betacf(b, a, 1.0 - x) / b)
 
 
+def _student_t_sf_large_df(z, df):
+    """Student t 上尾的正态极限展开（z>=0，df 大）。
+
+    `_betai` 在 df 很大时需要在 x=df/(df+t^2) 接近 1 处相减两个巨大的
+    lgamma 值，尾概率会丢失约 1e-5（df=1e12）。这里把 t 密度按 1/df 展开
+    并在高斯尾上积分；三阶项的绝对误差在 df>=1e4 时已低于 1e-15。
+    """
+    if z == 0.0:
+        return 0.5
+    if z > 40.0:
+        return 0.0
+    inv = 1.0 / df
+    inv2 = inv * inv
+    inv3 = inv2 * inv
+    z2 = z * z
+    z3 = z2 * z
+    z5 = z3 * z2
+    z7 = z5 * z2
+    z9 = z7 * z2
+    z11 = z9 * z2
+    q = 0.5 * math.erfc(z / math.sqrt(2.0))
+    phi = math.exp(-0.5 * z2) / math.sqrt(2.0 * math.pi)
+    i1 = phi * (z + z3) / 4.0
+    i2 = (q / 32.0 + phi * (-z / 32.0 - 5.0 * z3 / 96.0
+                            - 7.0 * z5 / 96.0 + z7 / 32.0))
+    i3 = (-q / 384.0 + phi * (-z / 32.0 + z5 / 64.0 + 7.0 * z7 / 192.0
+                              - 11.0 * z9 / 384.0 + z11 / 384.0))
+    mass = 1.0 + inv2 / 32.0 - inv3 / 384.0
+    return float((q + inv * i1 + inv2 * i2 + inv3 * i3) / mass)
+
+
 def _student_t_sf(t, df):
     """Student t 的上尾概率 P(T >= t)。"""
     if not (df > 0.0) or math.isnan(t):
@@ -15929,8 +15960,11 @@ def _student_t_sf(t, df):
         return 1.0
     if not math.isfinite(t):
         return float('nan')
-    x = df / (df + t * t)
-    tail = 0.5 * _betai(df / 2.0, 0.5, x)
+    if df >= 10000.0 and (df >= 1e15 or abs(t) <= 10.0):
+        tail = _student_t_sf_large_df(abs(t), df)
+    else:
+        x = df / (df + t * t)
+        tail = 0.5 * _betai(df / 2.0, 0.5, x)
     return float(tail if t >= 0 else 1.0 - tail)
 
 

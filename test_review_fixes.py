@@ -22338,6 +22338,22 @@ def t_train_val_passage_overlap_gate():
             raise AssertionError(f'audit_split_discipline accepted {kw_bad!r}')
 
 
+def t_student_t_large_df_tail():
+    z = 1.959963984540054
+    assert abs(L._student_t_sf(z, 1e12) - 0.025000000000138661) < 5e-15
+    assert abs(L._student_t_sf(z, 1e9) - 0.025000000138647571) < 5e-14
+    assert abs(L._student_t_sf(1.0, 1e8) - 0.15865525514131067) < 5e-14
+    assert abs(L._student_t_sf(2.0, 1e12) - 0.022750131948314185) < 5e-15
+    assert abs(L._t_critical(0.95, 1e12) - 1.9599639845424261) < 1e-14
+    assert abs(L._t_critical(0.95, 1e9) - 1.9599639869123251) < 1e-13
+    assert L._student_t_sf(0.0, 1e12) == 0.5
+    assert abs(L._student_t_sf(-2.0, 1e12)
+               - (1.0 - L._student_t_sf(2.0, 1e12))) < 1e-15
+    assert abs(L._student_t_sf(20.0, 1e20) - 2.7536241186063325e-89) < 1e-100
+    assert abs(L._student_t_sf(20.0, float('inf'))
+               - L._student_t_sf(20.0, 1e20)) < 1e-100
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -22883,6 +22899,8 @@ def main():
     _check('L192 large-df chi-square tail remains accurate', t_chi2_large_df_tail)
     _check('L193 train/val passage overlap is calibrated and coverage-honest',
            t_train_val_passage_overlap_gate)
+    _check('L194 large-df Student t tail and critical value stay accurate',
+           t_student_t_large_df_tail)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')
