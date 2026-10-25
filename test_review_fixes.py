@@ -134,6 +134,24 @@ def t_min_consistency():
             raise AssertionError(f'signflip_min_n_for_holm accepted alpha={_bad_alpha!r}')
 
 
+def t_binomial_tail_at_scale():
+    n = 10 ** 8
+    mean = n // 2
+    logpmf = (math.lgamma(n + 1.0) - 2.0 * math.lgamma(mean + 1.0)
+              - n * math.log(2.0))
+    exact = 0.5 + 0.5 * math.exp(logpmf)
+    got = L._binom_cdf_half(n, mean)
+    assert abs(got - exact) < 1e-7, f'n=1e8 central binomial CDF: {got!r} vs {exact!r}'
+    k = L.signflip_min_consistency(n, 10, 0.05)
+    assert k is not None and 0 < k < n, k
+    tail = L._binom_cdf_half(n, n - k)
+    prev = L._binom_cdf_half(n, n - k + 1)
+    assert 20.0 * tail <= 0.05 + 1e-15, f'k_min={k} does not clear the gate'
+    assert 20.0 * prev > 0.05 + 1e-15, f'k_min={k} is not minimal'
+    power = L.signflip_power(n, 10, 0.5, 0.05)
+    assert abs(power - tail) < 1e-12, f'q=0.5 power {power!r} != tail {tail!r}'
+
+
 def t_power():
     assert L.signflip_power(6, 4, 0.99) == 0.0, 'an impossible plan has zero power at any q'
     pw = L.signflip_power(12, 4, 0.9, 0.05)
@@ -22202,6 +22220,7 @@ def main():
         return 0
     _check('A1 holm_min_attainable_p', t_holm_min_attainable)
     _check('A2 signflip_min_consistency', t_min_consistency)
+    _check('A2b binomial tail at scale', t_binomial_tail_at_scale)
     _check('A3 signflip_power', t_power)
     _check('A4 tost_paired directions', t_tost)
     _check('A5 exact_signflip baseline', t_exact_signflip_baseline)

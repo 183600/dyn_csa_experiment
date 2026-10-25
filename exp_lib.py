@@ -15284,20 +15284,19 @@ def signflip_min_consistency(n_seeds, m_comparisons, alpha=0.05):
     m = _as_seed_int(m_comparisons)
     if n is None or m is None or n <= 0 or m <= 0:
         return None
-    best = None
-    for k in range(n, -1, -1):
-        p = 2.0 * _binom_cdf_half(n, n - k)
-        # Use the SAME acceptance convention as `holm_adjust` and
-        # `holm_min_attainable_p`: p_holm <= alpha rejects.  A strict `<`
-        # here made an exactly-attainable plan (e.g. n=3, m=1, alpha=0.25,
-        # where the floor is exactly 0.25) look impossible and report zero
-        # power, contradicting the plan-power gate.
-        if m * p <= alpha + 1e-15:
-            best = k  # keep descending: p(k) grows monotonically as k shrinks,
-            # so the last k that still clears the gate is the MINIMUM k
+    def passes(k):
+        return m * 2.0 * _binom_cdf_half(n, n - k) <= alpha + 1e-15
+
+    if not passes(n):
+        return None
+    lo, hi = -1, n
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if passes(mid):
+            hi = mid
         else:
-            break
-    return best
+            lo = mid
+    return hi
 
 
 def signflip_power(n_seeds, m_comparisons, q, alpha=0.05):
@@ -15794,7 +15793,8 @@ def _betacf(a, b, x):
         d = tiny
     d = 1.0 / d
     h = d
-    for m in range(1, 500):
+    max_iter = max(500, int(min(1000000.0, 10.0 * math.sqrt(max(a, b)) + 200.0)))
+    for m in range(1, max_iter):
         m2 = 2 * m
         aa = m * (b - m) * x / ((qam + m2) * (a + m2))
         d = 1.0 + aa * d
@@ -15820,16 +15820,34 @@ def _betacf(a, b, x):
     return h
 
 
+def _betai_log_bt(a, b, x):
+    if min(a, b) < 8.0 or a + b < 1000000.0:
+        return (math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b)
+                + a * math.log(x) + b * math.log1p(-x))
+    d1 = (b * x - a * (1.0 - x)) / a
+    d2 = (a * (1.0 - x) - b * x) / b
+    if d1 <= -1.0 or d2 <= -1.0:
+        return float('-inf')
+    inva, invb, invab = 1.0 / a, 1.0 / b, 1.0 / (a + b)
+    return (a * math.log1p(d1) + b * math.log1p(d2)
+            - 0.5 * (math.log(a + b) - math.log(a) - math.log(b))
+            - 0.5 * math.log(2.0 * math.pi)
+            - (inva + invb - invab) / 12.0
+            + (inva ** 3 + invb ** 3 - invab ** 3) / 360.0
+            - (inva ** 5 + invb ** 5 - invab ** 5) / 1260.0
+            + (inva ** 7 + invb ** 7 - invab ** 7) / 1680.0)
+
+
 def _betai(a, b, x):
     """正则化不完全贝塔 I_x(a,b)。"""
-    if not (a > 0.0 and b > 0.0) or not math.isfinite(x):
+    if (not (a > 0.0 and b > 0.0) or not math.isfinite(a)
+            or not math.isfinite(b) or not math.isfinite(x)):
         return float('nan')
     if x <= 0.0:
         return 0.0
     if x >= 1.0:
         return 1.0
-    bt = math.exp(math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b)
-                  + a * math.log(x) + b * math.log1p(-x))
+    bt = math.exp(_betai_log_bt(a, b, x))
     if x < (a + 1.0) / (a + b + 2.0):
         return float(bt * _betacf(a, b, x) / a)
     return float(1.0 - bt * _betacf(b, a, 1.0 - x) / b)
