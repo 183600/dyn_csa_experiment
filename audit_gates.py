@@ -891,9 +891,218 @@ def _row_overlap_count(train, rows, chunk_tokens=1 << 20):
     return len(matched)
 
 
+def _passage_overlap_from_segments(train_segments, val_rows, *, shingle,
+                                   scanned_tokens, total_train_tokens,
+                                   min_scan_fraction=0.25,
+                                   max_val_shingle_overlap=0.25,
+                                   max_excess_overlap=0.10,
+                                   max_val_row_overlap=0.50):
+    """Near-duplicate *passage* overlap between a scanned train sample and val.
+
+    Exact row overlap is blind to a validation row that reuses a long passage
+    from a training document while differing elsewhere.  This helper hashes
+    every ``shingle``-token window in the scanned train segments and in the
+    validation rows, then measures:
+
+      * the fraction of unique validation shingles that occur in train;
+      * the maximum fraction of a single validation row's shingles in train.
+
+    A train-internal baseline (disjoint halves of the same scanned sample) is
+    reported and subtracted from the set-level fraction, so recurring corpus
+    boilerplate is not mistaken for split contamination.  A row-level baseline
+    is measured on held-out train chunks for the same reason.  Coverage is
+    explicit: a clean scan of a small fraction of train is ``not_verifiable``,
+    never ``ok``.
+    """
+    import numpy as np
+    val = np.asarray(val_rows)
+    if val.ndim == 1:
+        val = val.reshape(1, -1)
+    k = int(shingle)
+    if k < 2 or val.ndim != 2 or val.shape[0] == 0 or val.shape[1] < k:
+        return {'status': 'not_applicable', 'shingle': k,
+                'reason': 'validation rows shorter than the shingle width or empty'}
+    seg_data = []
+    for seg in train_segments:
+        a = np.asarray(seg).reshape(-1)
+        if a.size >= k:
+            h = _window_hashes(a, k)
+            if h.size:
+                seg_data.append((a, h))
+    if not seg_data:
+        return {'status': 'not_applicable', 'shingle': k,
+                'reason': 'training scan shorter than the shingle width'}
+    train_hashes = np.unique(np.concatenate([h for _, h in seg_data]))
+    train_sorted = np.sort(train_hashes)
+    # Split the scanned train sample into two disjoint references.  The
+    # resulting overlap is the corpus's own repeated-passage rate, not
+    # evidence of a train/validation leak.
+    if len(seg_data) >= 2:
+        b_raw = [a for a, _ in seg_data[1::2]]
+        a_h = np.unique(np.concatenate([h for _, h in seg_data[0::2]]))
+        b_h = np.unique(np.concatenate([h for _, h in seg_data[1::2]]))
+    else:
+        raw = seg_data[0][0]
+        mid = raw.size // 2
+        b_raw = [raw[mid:]]
+        a_h = np.unique(_window_hashes(raw[:mid], k))
+        b_h = np.unique(_window_hashes(raw[mid:], k))
+    if a_h.size and b_h.size:
+        baseline = float(np.intersect1d(a_h, b_h, assume_unique=True).size) / float(b_h.size)
+    else:
+        baseline = 0.0
+    a_sorted = np.sort(a_h)
+    baseline_row = 0.0
+    if a_sorted.size:
+        width = int(val.shape[1])
+        _chunks = []
+        for seg in b_raw:
+            n = seg.size // width
+            if n <= 0:
+                continue
+            idx = (np.unique(np.linspace(0, n - 1, num=min(16, n),
+                                         dtype=np.int64)))
+            _chunks.extend(seg[int(i) * width:(int(i) + 1) * width] for i in idx)
+        for chunk in _chunks[:32]:
+            rh = _window_hashes(chunk, k)
+            if not rh.size:
+                continue
+            pos = np.searchsorted(a_sorted, rh)
+            pos = np.clip(pos, 0, a_sorted.size - 1)
+            hit = a_sorted[pos] == rh
+            baseline_row = max(baseline_row, float(hit.mean()))
+    row_hashes = []
+    row_fracs = []
+    for row in val:
+        rh = _window_hashes(row, k)
+        if not rh.size:
+            continue
+        row_hashes.append(rh)
+        pos = np.searchsorted(train_sorted, rh)
+        pos = np.clip(pos, 0, train_sorted.size - 1)
+        hit = train_sorted[pos] == rh
+        row_fracs.append(float(hit.mean()))
+    if not row_hashes:
+        return {'status': 'not_applicable', 'shingle': k,
+                'reason': 'validation rows shorter than the shingle width'}
+    val_hashes = np.unique(np.concatenate(row_hashes))
+    shared = int(np.intersect1d(train_hashes, val_hashes, assume_unique=True).size)
+    val_overlap = float(shared) / float(val_hashes.size)
+    excess = max(0.0, val_overlap - baseline)
+    max_row = max(row_fracs)
+    row_excess = max(0.0, max_row - baseline_row)
+    coverage = (float(scanned_tokens) / float(total_train_tokens)
+                if total_train_tokens else 1.0)
+    val_violation = (val_overlap > float(max_val_shingle_overlap)
+                     and excess > float(max_excess_overlap))
+    row_violation = (max_row > float(max_val_row_overlap)
+                     and row_excess > float(max_excess_overlap))
+    violation = bool(val_violation or row_violation)
+    if violation:
+        status = 'fail'
+        note = (f'train/validation passage overlap {val_overlap:.3f} '
+                f'(train-internal baseline {baseline:.3f}); '
+                f'max validation-row overlap {max_row:.3f} '
+                f'(row baseline {baseline_row:.3f})')
+    elif coverage < float(min_scan_fraction):
+        status = 'not_verifiable'
+        note = (f'passage overlap scan covered only {coverage:.1%} of train; '
+                'a clean sample is not a clean-split proof')
+    else:
+        status = 'ok'
+        note = (f'train/validation passage overlap {val_overlap:.3f} '
+                f'(baseline {baseline:.3f}); max row overlap {max_row:.3f}')
+    return {
+        'status': status,
+        'shingle': k,
+        'train_tokens_scanned': int(scanned_tokens),
+        'train_tokens_scanned_fraction': round(coverage, 6),
+        'val_rows_scanned': int(val.shape[0]),
+        'unique_train_shingles': int(train_hashes.size),
+        'unique_val_shingles': int(val_hashes.size),
+        'shared_shingles': int(shared),
+        'val_shingle_overlap': round(val_overlap, 6),
+        'train_internal_shingle_overlap': round(baseline, 6),
+        'excess_over_val_baseline': round(excess, 6),
+        'max_val_row_overlap': round(max_row, 6),
+        'max_train_row_overlap_baseline': round(baseline_row, 6),
+        'max_val_row_excess': round(row_excess, 6),
+        'val_rows_over_max_overlap': int(sum(
+            f > float(max_val_row_overlap) for f in row_fracs)),
+        'policy': {
+            'min_scan_fraction': float(min_scan_fraction),
+            'max_val_shingle_overlap': float(max_val_shingle_overlap),
+            'max_excess_overlap': float(max_excess_overlap),
+            'max_val_row_overlap': float(max_val_row_overlap),
+        },
+        'note': note,
+    }
+
+
+def _passage_overlap_stats(train, val, *, shingle=32, max_scan_tokens=4_000_000,
+                           min_scan_fraction=0.25,
+                           max_val_shingle_overlap=0.25,
+                           max_excess_overlap=0.10,
+                           max_val_row_overlap=0.50,
+                           max_val_rows=4096):
+    """Sample a train stream the same way as the exact-row audit and compare
+    near-duplicate passage shingles against validation."""
+    import numpy as np
+    tr = np.asarray(train).reshape(-1)
+    va = np.asarray(val)
+    if va.ndim == 1:
+        va = va.reshape(1, -1)
+    k = _audit_positive_int('shingle', shingle)
+    cap = _audit_positive_int('max_scan_tokens', max_scan_tokens)
+    max_val_rows = _audit_positive_int('max_val_rows', max_val_rows)
+    min_scan_fraction = _audit_nonneg_float('min_scan_fraction', min_scan_fraction)
+    max_val_shingle_overlap = _audit_nonneg_float(
+        'max_val_shingle_overlap', max_val_shingle_overlap)
+    max_excess_overlap = _audit_nonneg_float(
+        'max_excess_overlap', max_excess_overlap)
+    max_val_row_overlap = _audit_nonneg_float(
+        'max_val_row_overlap', max_val_row_overlap)
+    for _name, _val in (('min_scan_fraction', min_scan_fraction),
+                        ('max_val_shingle_overlap', max_val_shingle_overlap),
+                        ('max_excess_overlap', max_excess_overlap),
+                        ('max_val_row_overlap', max_val_row_overlap)):
+        if _val > 1.0:
+            raise ValueError(f'{_name} must be a fraction in [0, 1], got {_val!r}')
+    if not tr.size or va.ndim != 2 or va.shape[0] == 0 or va.shape[1] < k:
+        return {'status': 'not_applicable', 'shingle': k,
+                'reason': 'train stream or validation rows too short'}
+    val_total = int(va.shape[0])
+    if val_total > max_val_rows:
+        idx = np.unique(np.linspace(0, val_total - 1, max_val_rows,
+                                    dtype=np.int64))
+        va = va[idx]
+    nseg = 16
+    seg_len = max(int(cap) // nseg, int(va.shape[1]) + 1)
+    if tr.size <= max(int(cap), nseg * seg_len):
+        segments = [tr]
+        scanned = int(tr.size)
+    else:
+        starts = np.linspace(0, tr.size - seg_len, nseg, dtype=np.int64)
+        segments = [tr[int(s):int(s) + seg_len] for s in starts]
+        scanned = int(sum(s.size for s in segments))
+    out = _passage_overlap_from_segments(
+        segments, va, shingle=k, scanned_tokens=scanned,
+        total_train_tokens=int(tr.size), min_scan_fraction=min_scan_fraction,
+        max_val_shingle_overlap=max_val_shingle_overlap,
+        max_excess_overlap=max_excess_overlap,
+        max_val_row_overlap=max_val_row_overlap)
+    out['val_rows_total'] = val_total
+    return out
+
+
 def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                            js_fail=0.25, min_shift_tokens=5000,
-                           preferred_train_seq_len=None):
+                           preferred_train_seq_len=None,
+                           passage_shingle=32, max_passage_scan_tokens=4_000_000,
+                           min_passage_scan_fraction=0.25,
+                           max_val_shingle_overlap=0.25,
+                           max_passage_excess_overlap=0.10,
+                           max_val_row_shingle_overlap=0.50):
     """Audit the *split contract* for every cached corpus on disk.
 
     Unlike ``audit_leakage`` (tokenizer provenance and document overlap), this
@@ -902,6 +1111,8 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
       * the metadata declares an ordered/non-shuffled split and a train-only
         tokenizer fit;
       * validation and test contain no exact row duplicated from train;
+      * validation contains no long near-duplicate passage from train (a
+        shingle-overlap scan calibrated against train-internal repetition);
       * no group/document spans two sides (for FineWeb, document-disjoint
         chronological construction is recorded and the cache metadata keeps
         the validation fingerprint);
@@ -928,6 +1139,23 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
         raise ValueError(f'js_warn ({js_warn}) must not exceed js_fail ({js_fail})')
     min_shift_tokens = _audit_positive_int('min_shift_tokens', min_shift_tokens)
     max_rows = _audit_positive_int('max_rows', max_rows)
+    passage_shingle = _audit_positive_int('passage_shingle', passage_shingle)
+    max_passage_scan_tokens = _audit_positive_int(
+        'max_passage_scan_tokens', max_passage_scan_tokens)
+    min_passage_scan_fraction = _audit_nonneg_float(
+        'min_passage_scan_fraction', min_passage_scan_fraction)
+    max_val_shingle_overlap = _audit_nonneg_float(
+        'max_val_shingle_overlap', max_val_shingle_overlap)
+    max_passage_excess_overlap = _audit_nonneg_float(
+        'max_passage_excess_overlap', max_passage_excess_overlap)
+    max_val_row_shingle_overlap = _audit_nonneg_float(
+        'max_val_row_shingle_overlap', max_val_row_shingle_overlap)
+    for _name, _val in (('min_passage_scan_fraction', min_passage_scan_fraction),
+                        ('max_val_shingle_overlap', max_val_shingle_overlap),
+                        ('max_passage_excess_overlap', max_passage_excess_overlap),
+                        ('max_val_row_shingle_overlap', max_val_row_shingle_overlap)):
+        if _val > 1.0:
+            raise ValueError(f'{_name} must be a fraction in [0, 1], got {_val!r}')
     import glob
     import numpy as np
     sys.path.insert(0, REPO)
@@ -1115,6 +1343,32 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
             if shared_val:
                 rec['status'] = 'fail'
                 _fail(f'{cd}/{tag}: {shared_val} validation rows exactly duplicate a training row')
+            # Near-duplicate passage overlap catches a validation row that
+            # reuses a long training passage while differing elsewhere.  The
+            # scan is sampled, so a clean result on a small train fraction is
+            # recorded as not_verifiable rather than certified.
+            try:
+                _passage = _passage_overlap_stats(
+                    tr, _va_scan, shingle=passage_shingle,
+                    max_scan_tokens=max_passage_scan_tokens,
+                    min_scan_fraction=min_passage_scan_fraction,
+                    max_val_shingle_overlap=max_val_shingle_overlap,
+                    max_excess_overlap=max_passage_excess_overlap,
+                    max_val_row_overlap=max_val_row_shingle_overlap)
+                rec['passage_overlap'] = _passage
+                if _passage.get('status') == 'fail':
+                    rec['status'] = 'fail'
+                    _fail(f'{cd}/{tag}: ' + str(_passage.get(
+                        'note', 'near-duplicate passage overlap')))
+                elif _passage.get('status') == 'not_verifiable':
+                    if rec['status'] == 'ok':
+                        rec['status'] = 'warnings'
+                    _warn(f'{cd}/{tag}: ' + str(_passage.get(
+                        'note', 'passage overlap scan incomplete')))
+            except Exception as _pe:
+                rec['status'] = 'fail'
+                _fail(f'{cd}/{tag}: passage-overlap audit failed '
+                      f'({type(_pe).__name__}: {_pe})')
             # The test cache filename carries its own seq_len/vocab/ns tag.
             # P5T deliberately loads test at a longer sequence length than the
             # training cache, so seq_len is NOT part of the cache identity.

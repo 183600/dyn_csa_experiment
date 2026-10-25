@@ -4290,3 +4290,76 @@ L191 覆盖：p1 完整 verified、p2 完整但显著反方向时 A 被标为
 通过时为 `replicated`；`practically_harmful` 同样关闭门；一个 powered
 但非显著的相反均值只产生 `opposite_mean` 警告，不关闭项目门。完整 CPU
 套件 539/539 通过（0 skipped）。
+
+## 66. train/validation 近重复段落审计：覆盖诚实与语料内基线校准
+
+### 66.1 问题：精确行匹配和「干净样本」都不足以证明切分干净
+
+现有 `audit_corpus_split` 只在一个确定性 train 样本上检查 validation 行是否
+逐 token 完全相同，`audit_split_discipline` 也只做 exact-row overlap。两条
+路径都漏掉两种情况：
+
+1. validation 行复用了训练文档中的一段长段落，但行内其它 token 不同，因此
+   不是 exact row；原始行级 `_DocDeduplicator` 在行粒度工作，也不能保证
+   跨行/半行的段落复用被清除。
+2. train 很大时扫描预算只覆盖一小部分；旧逻辑在扫描干净时仍返回 `ok`，
+   把「未发现」误写成「证明没有」。validation 是所有探索性 panel 的选型
+   切片，这个 fail-open 会直接影响模型选择。
+
+### 66.2 方法：shingle 重叠、语料内基线、显式覆盖
+
+新增 `_passage_overlap_from_segments()`（`audit_gates.py`）：
+
+- 对同一组确定性 train 窗口（默认最多 2M/4M tokens，16 段等距）和
+  validation 行计算 32-token 滑动 shingle 的 uint64 多项式哈希；
+- 统计 validation 唯一 shingle 在 train 中出现的比例，以及单个 validation
+  行的最大重叠比例；
+- 用扫描样本的两个不相交部分（A/B）计算 train 内部的重复段落基线；只有
+  `val_overlap > 0.25` 且 `val_overlap - baseline > 0.10` 才按集合级违规
+  处理。行级同样减去由 train 内部 chunk 估计的 row baseline，避免把
+  WikiText 的模板/重复段落误判为泄漏；
+- 覆盖不足 `min_scan_fraction`（默认 0.25）时返回 `not_verifiable`，绝不
+  返回 `ok`。
+
+`audit_corpus_split` 复用已有的 `_segments`，把 passage 报告写入
+`report['passage_overlap']`；集合级或行级违规进入 `hard_failures`（strict
+时拒绝训练），覆盖不足进入 warnings。旧的 exact-row 扫描也显式记录
+`exact_row_scan_sufficient`：扫描干净但覆盖不足时降为 warnings。
+`audit_split_discipline` 在 exact-row 检查后运行同一 helper，并把结果写入
+`rec['passage_overlap']`；违规 fail，覆盖不足 warning。
+
+参数（`passage_shingle`、`min_scan_fraction`、`max_val_shingle_overlap`、
+`max_passage_excess_overlap`、`max_val_row_shingle_overlap`）全部进入
+`audit_corpus_split` 的 memo key，并做有限值/分数范围校验；NaN、负值、
+`>1` 的「阈值」不会静默关闭门。
+
+### 66.3 边界
+
+- **不是语义/改写检测。** 32-token exact shingle 对逐段复制和轻微编辑
+  敏感，但对同义改写、翻译回译、摘要复用不敏感；它不能替代
+  SimHash/嵌入级近重复或人工审阅。
+- **不是全量证明。** 扫描是确定性的均匀样本；覆盖不足会明确标成
+  `not_verifiable`，但覆盖足够也不证明未扫描区域一定干净。需要更强保证时
+  应增大 `max_scan_tokens` 或做全量扫描。
+- **基线不是万能校准。** train 内部基线高说明语料自身重复多；此时集合级
+  超额阈值仍可能漏掉与常见模板无法区分的泄漏。行级阈值 0.50 只针对
+  「单行大半是训练段落」的强信号。
+- 该改动不改变任何数据构造、分词器、冻结清单、种子、终点、alpha、Holm
+  决策或 `CODE_SEMANTICS`；不新增训练、不读取 test split；只增加零 GPU
+  的审计读数和 fail-closed 行为。
+
+### 66.4 入口与验证
+
+```bash
+python audit_gates.py split              # 每个 cache 含 passage_overlap
+python test_review_fixes.py              # L193
+python v12_supp.py plan
+```
+
+L193 覆盖：干净随机 split 的 passage `ok`；复制一段 train 后只改一个 token
+（exact-row 仍为 0）被行级重叠抓住并 hard fail；精确复制同时触发 exact-row
+和 passage；重复模板语料的 train 内部基线接近 1、超额为 0，不误报；扫描
+覆盖 5% 时 exact-row 与 passage 都降为 warnings/`not_verifiable`；短行返回
+`not_applicable`；`audit_split_discipline` 对同一 cache 的干净/污染版本
+分别 ok/fail；NaN/负值/超范围参数被拒绝。完整 CPU 套件 542/542 通过
+（0 skipped）。

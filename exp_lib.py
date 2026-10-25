@@ -11763,15 +11763,27 @@ _CORPUS_AUDIT_MEMO = {}
 
 def audit_corpus_split(train_ids, val_batch, vocab, *, dataset='wikitext',
                        meta=None, max_scan_tokens=2_000_000, sample_rows=64,
-                       shift_warn=0.25, shift_fail=0.75, strict=True):
+                       shift_warn=0.25, shift_fail=0.75, strict=True,
+                       passage_shingle=32, min_scan_fraction=0.25,
+                       max_val_shingle_overlap=0.25,
+                       max_passage_excess_overlap=0.10,
+                       max_val_row_shingle_overlap=0.50):
     """Hard pre-training gate for a cached/served token split.
 
     Runs before any model fitting and raises on a hard leakage/data-quality
     failure: out-of-vocabulary ids, non-finite or empty holdouts, duplicate
     rows *across* splits (exact match on a deterministic sample of the train
-    stream), non-disjoint document ids when the cache records them, and
-    materially shifted holdout token distributions.  A clean report is cached
-    by the two content fingerprints, so resume phases do not rescan.
+    stream), long near-duplicate passages shared by train and validation,
+    non-disjoint document ids when the cache records them, and materially
+    shifted holdout token distributions.  A clean report is cached by the two
+    content fingerprints, so resume phases do not rescan.
+
+    The exact-row and passage scans cover at most ``max_scan_tokens`` of
+    train.  If that is less than ``min_scan_fraction``, a clean sample is
+    reported as ``warnings`` (not ``ok``): it is not a proof about the
+    unscanned region.  ``max_passage_excess_overlap`` subtracts the corpus's
+    own repeated-passage baseline before the set-level passage threshold is
+    applied, so boilerplate does not masquerade as split leakage.
     """
     import data_guard as _DG
 
@@ -11802,6 +11814,20 @@ def audit_corpus_split(train_ids, val_batch, vocab, *, dataset='wikitext',
             f'shift_warn ({shift_warn}) must not exceed shift_fail ({shift_fail})')
     sample_rows = _gate_int('sample_rows', sample_rows)
     max_scan_tokens = _gate_int('max_scan_tokens', max_scan_tokens)
+    passage_shingle = _gate_int('passage_shingle', passage_shingle)
+    min_scan_fraction = _gate_float('min_scan_fraction', min_scan_fraction)
+    max_val_shingle_overlap = _gate_float(
+        'max_val_shingle_overlap', max_val_shingle_overlap)
+    max_passage_excess_overlap = _gate_float(
+        'max_passage_excess_overlap', max_passage_excess_overlap)
+    max_val_row_shingle_overlap = _gate_float(
+        'max_val_row_shingle_overlap', max_val_row_shingle_overlap)
+    for _name, _val in (('min_scan_fraction', min_scan_fraction),
+                        ('max_val_shingle_overlap', max_val_shingle_overlap),
+                        ('max_passage_excess_overlap', max_passage_excess_overlap),
+                        ('max_val_row_shingle_overlap', max_val_row_shingle_overlap)):
+        if _val > 1.0:
+            raise ValueError(f'{_name} must be a fraction in [0, 1], got {_val!r}')
     tr = np.asarray(train_ids).reshape(-1)
     va = np.asarray(val_batch)
     report = {
@@ -11824,7 +11850,10 @@ def audit_corpus_split(train_ids, val_batch, vocab, *, dataset='wikitext',
     key = (dataset, int(vocab), _ids_fp(tr),
            _ids_fp(np.ascontiguousarray(va).reshape(-1)) if va.size else None,
            _meta_fp, float(shift_warn), float(shift_fail),
-           int(sample_rows), int(max_scan_tokens), bool(strict))
+           int(sample_rows), int(max_scan_tokens), bool(strict),
+           int(passage_shingle), float(min_scan_fraction),
+           float(max_val_shingle_overlap), float(max_passage_excess_overlap),
+           float(max_val_row_shingle_overlap))
     _hit = _CORPUS_AUDIT_MEMO.get(key)
     if _hit is not None:
         return _hit
@@ -11902,9 +11931,46 @@ def audit_corpus_split(train_ids, val_batch, vocab, *, dataset='wikitext',
         report['train_tokens_scanned'] = int(_scanned)
         report['train_tokens_scanned_fraction'] = round(
             float(_scanned) / float(tr.size), 6) if tr.size else 1.0
+        report['exact_row_scan_sufficient'] = bool(
+            report['train_tokens_scanned_fraction'] >= float(min_scan_fraction))
         if _shared:
             report['hard_failures'].append(
                 f'{_shared} sampled validation rows occur verbatim in train')
+        elif not report['exact_row_scan_sufficient']:
+            report['warnings'].append(
+                'exact-row overlap scan covered only '
+                f'{report["train_tokens_scanned_fraction"]:.1%} of train; '
+                'a clean sample is not a clean-split proof')
+        # A validation row can reuse a long training passage without being an
+        # exact row match.  Audit near-duplicate shingles on the same train
+        # windows and on (up to) 4096 validation rows.  The helper subtracts a
+        # train-internal repetition baseline and reports coverage explicitly.
+        _pva = np.asarray(va)
+        if _pva.shape[0] > 4096:
+            _pidx = np.unique(np.linspace(0, _pva.shape[0] - 1, 4096,
+                                          dtype=np.int64))
+            _pva = _pva[_pidx]
+            report['passage_val_rows_total'] = int(va.shape[0])
+            report['passage_val_rows_audited'] = int(_pidx.size)
+        try:
+            _passage = _AG._passage_overlap_from_segments(
+                _segments, _pva, shingle=passage_shingle,
+                scanned_tokens=_scanned, total_train_tokens=int(tr.size),
+                min_scan_fraction=min_scan_fraction,
+                max_val_shingle_overlap=max_val_shingle_overlap,
+                max_excess_overlap=max_passage_excess_overlap,
+                max_val_row_overlap=max_val_row_shingle_overlap)
+            report['passage_overlap'] = _passage
+            if _passage.get('status') == 'fail':
+                report['hard_failures'].append(str(_passage.get(
+                    'note', 'near-duplicate train/validation passage overlap')))
+            elif _passage.get('status') == 'not_verifiable':
+                report['warnings'].append(str(_passage.get(
+                    'note', 'passage overlap scan incomplete')))
+        except Exception as _pe:
+            report['hard_failures'].append(
+                'passage-overlap audit failed '
+                f'({type(_pe).__name__}: {_pe})')
 
     # Document-level proof, when the cache carries it.
     _docs = (meta or {}).get('doc_ids') or {}

@@ -22211,6 +22211,133 @@ def t_release_identity_binds_measurement_source():
         assert AR.cmd_verify(tampered) == 1
 
 
+def t_train_val_passage_overlap_gate():
+    rng = np.random.default_rng(20261025)
+    tr = rng.integers(0, 100, size=200000, dtype=np.int64)
+    va = rng.integers(0, 100, size=(16, 128), dtype=np.int64)
+    kw = dict(dataset='wikitext', max_scan_tokens=100000, sample_rows=16,
+              strict=False)
+    rep = L.audit_corpus_split(tr, va, 100, **kw)
+    po = rep['passage_overlap']
+    assert rep['status'] == 'ok', rep
+    assert po['status'] == 'ok' and po['val_shingle_overlap'] == 0.0, po
+    assert po['train_tokens_scanned_fraction'] >= 0.25, po
+    # The memo key must include the new policy knobs, not only token bytes.
+    rep2 = L.audit_corpus_split(
+        tr, va, 100, dataset='wikitext', max_scan_tokens=100000,
+        sample_rows=16, strict=False, min_scan_fraction=0.01,
+        max_val_shingle_overlap=0.99)
+    assert rep2['passage_overlap']['policy']['max_val_shingle_overlap'] == 0.99, rep2
+    assert rep2['passage_overlap']['policy']['min_scan_fraction'] == 0.01, rep2
+
+    # A contiguous train passage copied into val, with one edit so the exact
+    # row scan stays clean.  The near-duplicate gate must still catch it.
+    near = va.copy()
+    near[4] = tr[1000:1128]
+    near[4, 64] = (near[4, 64] + 1) % 100
+    rep = L.audit_corpus_split(tr, near, 100, **kw)
+    po = rep['passage_overlap']
+    assert rep['exact_row_overlap_in_sample'] == 0, rep
+    assert po['status'] == 'fail', po
+    assert po['max_val_row_overlap'] > 0.5, po
+    assert rep['status'] == 'fail', rep
+    assert any('passage overlap' in h for h in rep['hard_failures']), rep
+
+    # Exact copy: both the row gate and the passage gate fire.
+    exact = va.copy()
+    exact[4] = tr[1000:1128]
+    rep = L.audit_corpus_split(tr, exact, 100, **kw)
+    assert rep['status'] == 'fail', rep
+    assert rep['passage_overlap']['status'] == 'fail', rep
+
+    # Recurring corpus boilerplate is not split contamination: the
+    # train-internal baseline is high and the excess is zero.
+    b0 = np.arange(1000, 1064, dtype=np.int64)
+    b1 = np.arange(2000, 2064, dtype=np.int64)
+    b2 = np.arange(3000, 3064, dtype=np.int64)
+    boiler_train = np.tile(np.concatenate([b0, b1, b2]), 2000)[:200000]
+    boiler_val = np.tile(b0, (16, 2))
+    rep = L.audit_corpus_split(boiler_train, boiler_val, 5000, **kw)
+    po = rep['passage_overlap']
+    assert po['train_internal_shingle_overlap'] > 0.9, po
+    assert po['excess_over_val_baseline'] == 0.0, po
+    assert po['status'] == 'ok', po
+    assert rep['exact_row_overlap_in_sample'] == 0, rep
+
+    # A clean sample over a small train fraction must not be certified.
+    low = L.audit_corpus_split(tr, va, 100, dataset='wikitext',
+                               max_scan_tokens=10000, sample_rows=16,
+                               strict=False)
+    assert low['train_tokens_scanned_fraction'] < 0.25, low
+    assert low['exact_row_scan_sufficient'] is False, low
+    assert low['passage_overlap']['status'] == 'not_verifiable', low
+    assert low['status'] == 'warnings', low
+    assert any('clean sample is not a clean-split proof' in w
+               for w in low['warnings']), low
+
+    # Rows shorter than the shingle width are explicitly not applicable, not
+    # silently clean.
+    short = L.audit_corpus_split(
+        np.arange(1000, dtype=np.int64),
+        np.arange(1000, 1008, dtype=np.int64).reshape(2, 4), 2000,
+        dataset='wikitext', max_scan_tokens=1000, sample_rows=2, strict=False)
+    assert short['passage_overlap']['status'] == 'not_applicable', short
+
+    # The offline split audit must report the same statistic and fail closed.
+    with tempfile.TemporaryDirectory() as d:
+        tag = 'passage'
+        np.save(os.path.join(d, f'train_ids_{tag}.npy'), tr)
+        np.save(os.path.join(d, f'val_batch_{tag}.npy'), va)
+        meta = {'vocab': 100, 'seq_len': 128, 'split_strategy': 'ordered',
+                'shuffle_at_split': False, 'tokenizer_fit_split': 'train'}
+        with open(os.path.join(d, f'meta_{tag}.json'), 'w', encoding='utf-8') as f:
+            json.dump(meta, f)
+        out = A.audit_split_discipline(cache_dirs=[d], min_shift_tokens=1,
+                                       max_passage_scan_tokens=100000)
+        rec = out['caches'][os.path.abspath(d)]['corpora'][tag]
+        assert rec['passage_overlap']['status'] == 'ok', rec
+        assert out['status'] == 'ok', out
+        np.save(os.path.join(d, f'val_batch_{tag}.npy'), exact)
+        out = A.audit_split_discipline(cache_dirs=[d], min_shift_tokens=1,
+                                       max_passage_scan_tokens=100000)
+        rec = out['caches'][os.path.abspath(d)]['corpora'][tag]
+        assert rec['passage_overlap']['status'] == 'fail', rec
+        assert rec['status'] == 'fail', rec
+        assert any('passage overlap' in w for w in out['warnings']), out
+        # A clean scan over a small train fraction is not certified offline
+        # either; the per-cache status must not stay 'ok'.
+        np.save(os.path.join(d, f'val_batch_{tag}.npy'), va)
+        out = A.audit_split_discipline(cache_dirs=[d], min_shift_tokens=1,
+                                       max_passage_scan_tokens=10000)
+        rec = out['caches'][os.path.abspath(d)]['corpora'][tag]
+        assert rec['passage_overlap']['status'] == 'not_verifiable', rec
+        assert rec['status'] == 'warnings', rec
+
+    # NaN/negative policy values must not silently disable the new gate.
+    for kw_bad in ({'passage_shingle': 0}, {'passage_shingle': True},
+                   {'min_scan_fraction': float('nan')},
+                   {'max_val_shingle_overlap': -0.1},
+                   {'max_val_row_shingle_overlap': 1.5},
+                   {'max_passage_excess_overlap': 2.0}):
+        try:
+            L.audit_corpus_split(tr, va, 100, strict=False, **kw_bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'audit_corpus_split accepted {kw_bad!r}')
+    for kw_bad in ({'passage_shingle': 0},
+                   {'min_passage_scan_fraction': float('nan')},
+                   {'max_val_shingle_overlap': -1.0},
+                   {'max_val_row_shingle_overlap': 1.5},
+                   {'max_passage_excess_overlap': 2.0}):
+        try:
+            A.audit_split_discipline(cache_dirs=[], **kw_bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'audit_split_discipline accepted {kw_bad!r}')
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -22754,6 +22881,8 @@ def main():
     _check('L191 project ablation gate rejects panel contradictions and reports replication',
            t_ablation_coverage_replication_and_contradiction)
     _check('L192 large-df chi-square tail remains accurate', t_chi2_large_df_tail)
+    _check('L193 train/val passage overlap is calibrated and coverage-honest',
+           t_train_val_passage_overlap_gate)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

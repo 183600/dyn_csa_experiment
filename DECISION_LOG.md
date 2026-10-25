@@ -2780,3 +2780,41 @@ meta-analysis，不估计合并效应或异质性；需要合并时仍用显式
 门关闭并点名 p2；B 在两个完整 panel verified 时为 `replicated`；
 practically harmful 同样关闭门；非显著相反均值只产生
 `opposite_mean` 警告。未改冻结清单、数值或 `CODE_SEMANTICS`。
+
+## 2026-10-25 — train/validation 近重复段落门与覆盖诚实（no new runs）
+
+零 GPU 的数据处理/方法学硬化；不新增训练、不读取 test split、不修改冻结
+清单的字节/种子/终点/alpha/Holm 决策规则，也不改 `CODE_SEMANTICS`。
+
+**Problem.** `audit_corpus_split` 与 `audit_split_discipline` 只检查
+validation 行是否与 train 逐 token 完全相同。validation 复用训练文档中的
+长段落但改写其余 token 时不会被发现；原始行级 `_DocDeduplicator` 也不能
+保证跨行/半行复用被清除。同时，大 train 上只扫描一小部分，扫描干净仍可能
+返回 `ok`，把「未发现」当成「已证明」。validation 是所有探索性 panel 的
+选型切片，这会使选型与后续确认共享未披露的污染。
+
+**Fix.** 新增 `_passage_overlap_from_segments()`：在既有 16 段确定性 train
+窗口和 validation 行上计算 32-token shingle 哈希；报告 validation shingle
+重叠比例、单行最大重叠、train 内部 A/B 重复基线、行级 train 内部基线、
+覆盖比例和策略字段。集合级仅在 `val_overlap > 0.25` 且超出基线
+`> 0.10` 时 fail；行级仅在 `max_row > 0.50` 且超出 row baseline
+`> 0.10` 时 fail；覆盖低于 `min_scan_fraction` 返回 `not_verifiable`。
+`audit_corpus_split` 复用已有 `_segments` 并新增 `passage_overlap` 块、
+`exact_row_scan_sufficient` 和低覆盖 warning；`audit_split_discipline` 在
+exact-row 检查后运行同一 helper。新参数全部进入 memo key 并做有限值/
+`[0,1]` 校验。
+
+**Boundary.** 32-token exact shingle 不是语义/改写检测：同义改写、翻译
+回译、摘要复用仍可能漏掉，不能替代嵌入级近重复或人工审阅。扫描是样本，
+覆盖足够也不证明未扫描区域干净；覆盖不足只标 `not_verifiable`，不冒充
+通过。train 内部基线高时，与常见模板无法区分的泄漏仍可能漏掉；行级阈值
+只抓「单行大半是训练段落」的强信号。该改动不改变数据构造、分词器、冻结
+清单、种子、终点、alpha、Holm 或 `CODE_SEMANTICS`；不新增训练/测试读取。
+
+**Verification.** `python test_review_fixes.py` 通过 542/542（0 skipped，
+新增 L193）：干净 split ok；复制 train 段落后改一个 token（exact-row=0）
+被 passage 行级门 fail；精确复制同时触发两个门；重复模板语料基线≈1、
+超额 0 不误报；5% 覆盖降为 warnings/`not_verifiable`；短行
+`not_applicable`；`audit_split_discipline` 对干净/污染 cache 分别 ok/fail；
+NaN/负值/超范围参数被拒绝。`python v12_supp.py plan` 仍 72/72 合成冻结
+记录、6 个比较。
