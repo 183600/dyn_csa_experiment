@@ -8543,7 +8543,23 @@ def t_audit_selection_rejects_boolean_measurements():
             json.dump({'cells': [dict(cell, mass_covered=True)]}, f)
         r = A.audit_selection(path=path)
         assert r['status'] == 'fail', r
-        assert any('booleans' in p for p in r['problems']), r
+        assert any('real numbers' in p for p in r['problems']), r
+        # Numeric strings are not recall/mass readings: a hand-edited
+        # artifact must not unlock the claim gate by spelling the same number.
+        for _field in ('recall_at_k', 'mass_covered', 'random_baseline'):
+            _bad = dict(cell, **{_field: str(cell[_field])})
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump({'cells': [_bad]}, f)
+            r = A.audit_selection(path=path)
+            assert r['status'] == 'fail', (_field, r)
+            assert any('real numbers' in p for p in r['problems']), (_field, r)
+        # Geometry counts are exact integers, not numeric strings.
+        _bad_k = dict(cell, k=str(cell['k']))
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump({'cells': [_bad_k]}, f)
+        r = A.audit_selection(path=path)
+        assert r['status'] == 'fail', r
+        assert any('exact integers' in p for p in r['problems']), r
         with open(path, 'w', encoding='utf-8') as f:
             json.dump({'cells': [cell]}, f)
         r = A.audit_selection(path=path)
@@ -10618,6 +10634,14 @@ def t_audit_training_health_records():
         r4 = A.audit_training_health(outdirs=[td])
         assert r4['status'] == 'fail' and any('unverifiable, not zero' in x
                                               for x in r4['errors']), r4
+        # A numeric string is not an event count either, even when it spells 0.
+        string_count = json.loads(json.dumps(clean))
+        string_count['opt_diag_summary']['nonfinite_loss_steps'] = '0'
+        with open(os.path.join(td, 'summary.json'), 'w', encoding='utf-8') as f:
+            json.dump({'sc::s0': string_count}, f)
+        rsc = A.audit_training_health(outdirs=[td])
+        assert rsc['status'] == 'fail' and any(
+            'unverifiable, not zero' in x for x in rsc['errors']), rsc
         # The cached status is not evidence on its own: a record claiming
         # healthy while its own curve is overfitting must be surfaced, and a
         # masked non-finite curve point must fail closed.
@@ -10642,6 +10666,15 @@ def t_audit_training_health_records():
         assert any('best_val_ppl=1' in x for x in r5['warnings']), r5
         assert any('final_minus_best=-5' in x for x in r5['warnings']), r5
         assert any('steps_since_best=777' in x for x in r5['warnings']), r5
+        # Numeric strings are not cached curve readings.
+        string_best = json.loads(json.dumps(fake_clean))
+        string_best['curve_health']['best_val_ppl'] = '1.0'
+        with open(os.path.join(td, 'summary.json'), 'w', encoding='utf-8') as f:
+            json.dump({'sb::s0': string_best}, f)
+        rsb = A.audit_training_health(outdirs=[td])
+        assert rsb['status'] == 'warnings', rsb
+        assert any('best_val_ppl is not a finite' in x
+                   for x in rsb['warnings']), rsb
         nan_hist = [{'step': 0, 'train_ce': 5.0, 'val_ce': 4.0},
                     {'step': 100, 'train_ce': 4.8, 'val_ce': float('nan')}]
         masked_nan = dict(fake_clean, health_history=nan_hist)
@@ -10908,6 +10941,15 @@ def t_audit_length_rejects_unverifiable_counts():
                 'truncated': False, 'n_seq': True}}}}, f)
         r2 = A.audit_length(p)
         assert r2['status'] == 'fail', r2
+        # A numeric string is not an exact token count, even if it equals the
+        # number the audit would otherwise accept.
+        with open(p, 'w', encoding='utf-8') as f:
+            json.dump({'a::s0': {'by_len': {'4096': {
+                'ppl': 30.0, 'n_tok': str(16 * 4095), 'eval_span': 4095,
+                'truncated': False, 'n_seq': 16}}}}, f)
+        r_str = A.audit_length(p)
+        assert r_str['status'] == 'fail', r_str
+        assert any('n_tok' in x for x in r_str['problems']), r_str
         # Non-hashable malformed cells must be a recorded failure, not an
         # uncaught TypeError from inserting them into a comparison set.
         with open(p, 'w', encoding='utf-8') as f:
@@ -18552,6 +18594,10 @@ def t_ppl_below_one_is_not_a_measurement():
     import fuse_analysis as FA
     assert math.isnan(FA.sample_std([])) and math.isnan(FA.sample_std([1.0]))
     assert np.isnan(FA.sample_std(np.ones((1, 2)), axis=0)).all()
+    # A one-seed arm has no measured spread; the report must not print ±0.
+    assert FA._fmt_sd(float('nan')) == '—'
+    assert FA._mean_pm(1.0, float('nan')) == '1.0000±—'
+    assert FA._mean_pm(1.0, 0.0) == '1.0000±0.0000'
 
 
 def t_paired_error_guard_checks_identity_not_only_vocab_size():
@@ -20923,6 +20969,30 @@ def t_unit_influence_audit_gate():
             aud_ok = A.audit_unit_influence(path=p)
         assert aud_ok['status'] == 'ok' and aud_ok['n_ok'] == 1, aud_ok
 
+        # Numeric strings are not measurements: stringified readings must fail
+        # instead of replaying as a valid influence block.
+        stringified = json.loads(json.dumps(stats_ok))
+        _u = stringified['comparisons']['x']['doc_sampling']['unit_influence']
+        _u['full_delta_ppl'] = str(_u['full_delta_ppl'])
+        _u['loo_delta_ppl'][0] = str(_u['loo_delta_ppl'][0])
+        with open(p, 'w', encoding='utf-8') as f:
+            json.dump(stringified, f)
+        with contextlib.redirect_stdout(io.StringIO()):
+            aud_string = A.audit_unit_influence(path=p)
+        assert aud_string['status'] == 'fail', aud_string
+        assert any('non-finite' in x for x in aud_string['problems']), aud_string
+
+        # The availability flag is a boolean, not a truthy string.
+        bad_avail = json.loads(json.dumps(stats_ok))
+        bad_avail['comparisons']['x']['doc_sampling']['unit_influence'][
+            'available'] = 'false'
+        with open(p, 'w', encoding='utf-8') as f:
+            json.dump(bad_avail, f)
+        with contextlib.redirect_stdout(io.StringIO()):
+            aud_avail = A.audit_unit_influence(path=p)
+        assert aud_avail['status'] == 'fail', aud_avail
+        assert any('available' in x for x in aud_avail['problems']), aud_avail
+
         # A point estimate that no longer matches the pooled Δ is a hard fail.
         bad = json.loads(json.dumps(stats))
         bad['comparisons']['x']['doc_sampling']['unit_influence'][
@@ -20954,6 +21024,15 @@ def t_unit_influence_audit_gate():
             aud_vec = A.audit_unit_influence(path=p)
         assert aud_vec['status'] == 'fail', aud_vec
         assert any('non-finite' in x for x in aud_vec['problems']), aud_vec
+        # A non-object comparison is corrupt, not silently absent.
+        bad_comp = json.loads(json.dumps(stats_ok))
+        bad_comp['comparisons']['bad'] = ['not', 'an', 'object']
+        with open(p, 'w', encoding='utf-8') as f:
+            json.dump(bad_comp, f)
+        with contextlib.redirect_stdout(io.StringIO()):
+            aud_comp = A.audit_unit_influence(path=p)
+        assert aud_comp['status'] == 'fail', aud_comp
+        assert any('not an object' in x for x in aud_comp['problems']), aud_comp
 
         # A stale pooled-CI artifact without the block is unverified, not clean.
         stale = {'comparisons': {'x': {
@@ -21120,6 +21199,19 @@ def t_look_history_recorded_and_audited():
             aud_bad = A.audit_look_history(paths=[td])
         assert aud_bad['status'] == 'fail', aud_bad
         assert any('does not recompute' in p for p in aud_bad['problems']), aud_bad
+
+        # A numeric string that happens to equal the recomputed p is still not
+        # a measurement: present-but-unparseable evidence must fail closed.
+        string_p = json.loads(json.dumps(hist))
+        _orig_p = string_p['looks'][0]['contrasts'][key]['p_exact_signflip']
+        string_p['looks'][0]['contrasts'][key]['p_exact_signflip'] = str(_orig_p)
+        with open(os.path.join(td, 'look_history.json'), 'w', encoding='utf-8') as f:
+            json.dump(string_p, f)
+        with contextlib.redirect_stdout(io.StringIO()):
+            aud_string_p = A.audit_look_history(paths=[td])
+        assert aud_string_p['status'] == 'fail', aud_string_p
+        assert any('not a finite number' in p
+                   for p in aud_string_p['problems']), aud_string_p
 
         # Missing audit block: recorded looks cannot be cross-checked -> warn.
         with open(os.path.join(td, 'look_history.json'), 'w', encoding='utf-8') as f:
@@ -21813,6 +21905,10 @@ def t_analysis_choice_concordance_and_audit():
         assert corrupt['status'] == 'fail', corrupt
         assert any('not a JSON object' in x for x in corrupt['problems']), corrupt
         assert corrupt['n_missing'] == 0, corrupt
+        # A non-object comparison is corrupt, not silently absent.
+        nonobj = _audit({'comparisons': {'x': ['not', 'an', 'object']}})
+        assert nonobj['status'] == 'fail', nonobj
+        assert any('not an object' in x for x in nonobj['problems']), nonobj
         # Replay from the stored rows cannot re-derive every label, but a
         # self-inconsistent derived field must still fail rather than be
         # hidden by the aggregate counts.

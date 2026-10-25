@@ -183,6 +183,14 @@ def sample_std(deltas, axis=None):
         out[j] = float(np.std(col, ddof=1)) if col.size > 1 else float('nan')
     return out.reshape(out_shape)
 
+def _fmt_sd(value, fmt='.4f'):
+    # A one-seed arm has no estimable spread.  Printing "±0.0000" would
+    # present an undefined standard deviation as a measured zero.
+    return format(value, fmt) if math.isfinite(value) else '—'
+
+def _mean_pm(mean, sd, fmt='.4f'):
+    return f'{format(mean, fmt)}±{_fmt_sd(sd, fmt)}'
+
 def _row_nanmean(M):
     # With no NaNs, a 2-D mean along the (contiguous) last axis is
     # bitwise-identical to per-row np.mean (verified by differential test).
@@ -315,15 +323,15 @@ def main(argv=None):
             db = _lma - _lmb
             _sb = _row_nanmean(Mb)
             _sa = _row_nanmean(Ma)
-            sd_b = sample_std(_sb) if Mb.shape[0] > 1 else 0.0
-            sd_a = sample_std(_sa) if Ma.shape[0] > 1 else 0.0
+            sd_b = sample_std(_sb)
+            sd_a = sample_std(_sa)
             mean_b = _finite_mean(_sb)
             mean_a = _finite_mean(_sa)
             if not (math.isfinite(mean_b) and math.isfinite(mean_a)):
                 print(f'[fuse_analysis] NOTE: metric {key!r} has no finite per-seed value in at least one arm — the {name} row is omitted from the table rather than printed as nan')
                 continue
-            lines.append(f'| — | **{name}** | {mean_b:.4f}±{sd_b:.4f} | {mean_a:.4f}±{sd_a:.4f} | **{mean_a - mean_b:+.4f}** |')
-            pair_stats[name] = dict(layers=list(Ma_layers), layer_idx=layer_idx(Ma_layers), nofuse_perlayer_mean=np.round(_lmb, 4).tolist(), fuse_perlayer_mean=np.round(_lma, 4).tolist(), delta_perlayer=np.round(db, 4).tolist(), nofuse_seed_std=float(sd_b), fuse_seed_std=float(sd_a))
+            lines.append(f'| — | **{name}** | {_mean_pm(mean_b, sd_b)} | {_mean_pm(mean_a, sd_a)} | **{mean_a - mean_b:+.4f}** |')
+            pair_stats[name] = dict(layers=list(Ma_layers), layer_idx=layer_idx(Ma_layers), nofuse_perlayer_mean=np.round(_lmb, 4).tolist(), fuse_perlayer_mean=np.round(_lma, 4).tolist(), delta_perlayer=np.round(db, 4).tolist(), nofuse_seed_std=(float(sd_b) if math.isfinite(sd_b) else None), fuse_seed_std=(float(sd_a) if math.isfinite(sd_a) else None))
         if _ok_seeds and not _gate_ok:
             lines.append(f'\n> 注：上表的均值与 Δ 与下方检验同口径——只在通过配置/训练量配对门禁的 {_ok_seeds} 上计算，{len(SEEDS) - len(_ok_seeds)} 个未过门禁的 seed（{_why}）不进入任何数字。')
         _, fb = per_seed_layer(b, 'bnd_f1', tuple(SEEDS))
@@ -348,14 +356,14 @@ def main(argv=None):
                 lines.append(f'> 注：{len(SEEDS) - len(_ok_seeds)} 个 seed 未通过配置/训练量配对门禁（{_why}），已按本仓库惯例排除——Δ 与 p 值只在可配对的 {_ok_seeds} 上计算，跨配置的种子差不进入检验。')
             _d_f1m = d_f1.mean()
             _n_same = int(((d_f1 != 0) & ((d_f1 > 0) == (_d_f1m > 0))).sum())
-            lines.append(f'- 层均边界 F1：Δ = {_d_f1m:+.4f} ± {sample_std(d_f1):.4f}，{_n_same}/{_n_f1} 同向，p({_rf1["method"]}) = {p_f1:.3f}')
+            lines.append(f'- 层均边界 F1：Δ = {_d_f1m:+.4f} ± {_fmt_sd(sample_std(d_f1))}，{_n_same}/{_n_f1} 同向，p({_rf1["method"]}) = {p_f1:.3f}')
             _n_ppl = len(d_ppl)
             # Two-sided floor is 2/2**n for exact, MITM and saddlepoint alike.
             _ppl_floor0 = L.signflip_p_floor(_n_ppl)
             _floor_txt = (f'（n={_n_ppl} 时 p 分辨率下限 {_ppl_floor0:.3g}）'
                           if math.isfinite(_ppl_floor0)
                           else f'（n={_n_ppl} 的 p 分辨率不可计算）')
-            lines.append(f'- 最终 PPL：Δ = {d_ppl.mean():+.2f} ± {sample_std(d_ppl):.2f}，p({_rppl["method"]}) = {p_ppl:.3f}{_floor_txt}\n')
+            lines.append(f'- 最终 PPL：Δ = {d_ppl.mean():+.2f} ± {_fmt_sd(sample_std(d_ppl), ".2f")}，p({_rppl["method"]}) = {p_ppl:.3f}{_floor_txt}\n')
         elif not _ok_seeds:
             p_f1 = p_ppl = None
             lines.append(f'\n**配对检验：未执行。** 上述两臂不满足本仓库的可配对条件（{_why}）——它们的训练配置无法证明相同，**不给出 p 值**、不进入任何显著性主张。\n')

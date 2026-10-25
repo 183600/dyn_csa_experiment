@@ -2731,6 +2731,15 @@ def audit_length(bylen_path='results_lm_test/bylen.json'):
             return None
         return int(f) if math.isfinite(f) and f == math.floor(f) else None
 
+    def _exact_value(value):
+        # `_exact_int` stays permissive for by_len *keys* (JSON object keys
+        # are strings); a count stored as a numeric string is not a
+        # measurement and must not certify the target set.
+        if isinstance(value, (bool, np.bool_)) or not isinstance(value, numbers.Real):
+            return None
+        f = float(value)
+        return int(f) if math.isfinite(f) and f == math.floor(f) else None
+
     def _hashable(value):
         # Artifact cells are JSON, but a direct caller can supply a list/dict
         # where a count/flag belongs.  Such a value is unverifiable and must
@@ -2769,18 +2778,18 @@ def audit_length(bylen_path='results_lm_test/bylen.json'):
                 problems.append(f'{key}: L{Ln} cell is not a JSON object')
                 continue
             e = by_len.setdefault(Ln, {'n_tok': set(), 'eval_span': set(), 'truncated': set(), 'n_seq': set()})
-            e['n_tok'].add(_exact_int(c.get('n_tok')))
-            e['eval_span'].add(_exact_int(c.get('eval_span')))
+            e['n_tok'].add(_exact_value(c.get('n_tok')))
+            e['eval_span'].add(_exact_value(c.get('eval_span')))
             e['truncated'].add(_hashable(c.get('truncated')))
             for _field in ('n_tok', 'eval_span'):
-                if _exact_int(c.get(_field)) is None:
+                if _exact_value(c.get(_field)) is None:
                     problems.append(
                         f'{key}: L{Ln} cell has no exact integer `{_field}` '
                         f'({c.get(_field)!r}) — the scored target set is unverifiable')
             _nseq_cell = None
             _seq_explicit = None
             if c.get('n_seq') is not None:
-                _seq_explicit = _exact_int(c.get('n_seq'))
+                _seq_explicit = _exact_value(c.get('n_seq'))
                 if _seq_explicit is None:
                     problems.append(
                         f'{key}: L{Ln} cell has a non-integer `n_seq` '
@@ -2808,8 +2817,8 @@ def audit_length(bylen_path='results_lm_test/bylen.json'):
             # (but equally wrong) counts across arms are not a valid target
             # set, so verify the formula whenever the cell claims to be a
             # full-length measurement.
-            _nt = _exact_int(c.get('n_tok'))
-            _ns = _exact_int(_nseq_cell)
+            _nt = _exact_value(c.get('n_tok'))
+            _ns = _exact_value(_nseq_cell)
             _trunc = c.get('truncated')
             if (isinstance(_trunc, (bool, np.bool_)) and not bool(_trunc)
                     and _ns is not None and _nt is not None):
@@ -4009,12 +4018,10 @@ def audit_training_health(outdirs=None):
                 e.append(f'nan_guard is not an object ({type(_guard_raw).__name__})')
             guard = _guard_raw if isinstance(_guard_raw, dict) else {}
             def _nonneg(v):
-                if isinstance(v, (bool, np.bool_)):
+                if (isinstance(v, (bool, np.bool_))
+                        or not isinstance(v, numbers.Real)):
                     return None
-                try:
-                    f = float(v)
-                except (TypeError, ValueError, OverflowError):
-                    return None
+                f = float(v)
                 if not (math.isfinite(f) and f >= 0.0 and f == math.floor(f)):
                     return None
                 return int(f)
@@ -4138,12 +4145,10 @@ def audit_training_health(outdirs=None):
                         if _bp is not None:
                             # PPL is a positive real, not an integer count.
                             _bpv = None
-                            if not isinstance(_bp, (bool, np.bool_)):
-                                try:
-                                    _f = float(_bp)
-                                    _bpv = _f if (math.isfinite(_f) and _f > 0.0) else None
-                                except (TypeError, ValueError, OverflowError):
-                                    _bpv = None
+                            if (not isinstance(_bp, (bool, np.bool_))
+                                    and isinstance(_bp, numbers.Real)):
+                                _f = float(_bp)
+                                _bpv = _f if (math.isfinite(_f) and _f > 0.0) else None
                             _rbp = _rh.get('best_val_ppl')
                             if _bpv is None:
                                 w.append(f'curve_health.best_val_ppl is not a finite '
@@ -4156,12 +4161,10 @@ def audit_training_health(outdirs=None):
                         _fm = h.get('final_minus_best')
                         if _fm is not None:
                             _fmv = None
-                            if not isinstance(_fm, (bool, np.bool_)):
-                                try:
-                                    _f = float(_fm)
-                                    _fmv = _f if math.isfinite(_f) else None
-                                except (TypeError, ValueError, OverflowError):
-                                    _fmv = None
+                            if (not isinstance(_fm, (bool, np.bool_))
+                                    and isinstance(_fm, numbers.Real)):
+                                _f = float(_fm)
+                                _fmv = _f if math.isfinite(_f) else None
                             _rfm = _rh.get('final_minus_best')
                             if _fmv is None:
                                 w.append(f'curve_health.final_minus_best is not finite ({_fm!r})')
@@ -4562,6 +4565,23 @@ def audit_selection(path='analysis_mechanism/selection_attribution.json'):
             return None
         return int(f) if math.isfinite(f) and f == math.floor(f) else None
 
+    def _exact_count(value):
+        # A numeric string is not an exact count.  `_exact_int` stays
+        # permissive for seed *keys* (JSON object keys are strings), but cell
+        # geometry is a measurement and must arrive as a real number.
+        if isinstance(value, (bool, np.bool_)) or not isinstance(value, numbers.Real):
+            return None
+        f = float(value)
+        return int(f) if math.isfinite(f) and f == math.floor(f) else None
+
+    def _measurement(value):
+        # Numeric strings are not recall/mass readings; float("0.9") would
+        # otherwise let a hand-edited artifact unlock the claim gate.
+        if isinstance(value, (bool, np.bool_)) or not isinstance(value, numbers.Real):
+            return None
+        f = float(value)
+        return f if math.isfinite(f) else None
+
     for i, c in enumerate(cells):
         if not isinstance(c, dict):
             out['problems'].append(f'cell {i}: not an object')
@@ -4573,26 +4593,21 @@ def audit_selection(path='analysis_mechanism/selection_attribution.json'):
         if not isinstance(c.get('per_seed'), dict):
             out['problems'].append(f'cell {i} ({c.get("arm")}): per_seed must be a seed -> measurement object')
             continue
-        # A Boolean is a flag, not a measurement: float(True) == 1.0 would
-        # silently certify a perfect recall/mass cell from a placeholder.
-        if any(isinstance(c.get(_k), (bool, np.bool_))
-               for _k in ('recall_at_k', 'mass_covered', 'random_baseline')):
+        _rec = _measurement(c['recall_at_k'])
+        _mass = _measurement(c['mass_covered'])
+        _base = _measurement(c['random_baseline'])
+        if _rec is None or _mass is None or _base is None:
             out['problems'].append(
-                f'cell {i}: recall/mass/baseline must be numeric measurements, '
-                'not booleans')
+                f'cell {i}: recall/mass/baseline must be finite real numbers '
+                '(not strings, booleans, or non-finite values)')
             continue
-        try:
-            k, B = _exact_int(c['k']), _exact_int(c['n_blocks'])
-            el, nq = _exact_int(c['eval_len']), _exact_int(c['n_queries'])
-            rec, mass, base = (float(c['recall_at_k']), float(c['mass_covered']), float(c['random_baseline']))
-        except (TypeError, ValueError, OverflowError):
-            out['problems'].append(f'cell {i}: non-numeric fields')
-            continue
+        rec, mass, base = _rec, _mass, _base
+        k, B = _exact_count(c['k']), _exact_count(c['n_blocks'])
+        el, nq = _exact_count(c['eval_len']), _exact_count(c['n_queries'])
         if k is None or B is None or el is None or nq is None:
-            out['problems'].append(f'cell {i}: k/n_blocks/eval_len/n_queries must be exact integers')
-            continue
-        if not all(math.isfinite(x) for x in (rec, mass, base)):
-            out['problems'].append(f'cell {i}: recall/mass/baseline must be finite')
+            out['problems'].append(
+                f'cell {i}: k/n_blocks/eval_len/n_queries must be exact '
+                'integers (counts, not strings, booleans, or fractions)')
             continue
         if not (0.0 <= rec <= 1.0 and 0.0 <= mass <= 1.0 and 0.0 <= base <= 1.0):
             out['problems'].append(f'cell {i}: recall/mass/baseline outside [0,1]')
@@ -5388,7 +5403,10 @@ def audit_unit_influence(path=None):
         return out
 
     def _finite(x):
-        if isinstance(x, (bool, np.bool_)):
+        # A numeric string (or bytes) is not a measurement: float("1.0")
+        # would let a hand-edited/stale artifact replay as a finite reading.
+        if (isinstance(x, (bool, np.bool_, str, bytes, bytearray))
+                or x is None):
             return None
         try:
             y = float(x)
@@ -5398,6 +5416,12 @@ def audit_unit_influence(path=None):
 
     for name, comp in comps.items():
         if not isinstance(comp, dict):
+            # A non-object comparison cannot carry a measured influence block;
+            # silently skipping it would hide a corrupt comparison.
+            out['problems'].append(
+                f'{name}: comparison is a {type(comp).__name__}, not an object')
+            out['comparisons'][name] = {'present': False,
+                                        'error': 'not_an_object'}
             continue
         ds = comp.get('doc_sampling')
         inf = ds.get('unit_influence') if isinstance(ds, dict) else None
@@ -5411,8 +5435,19 @@ def audit_unit_influence(path=None):
                     'sensitivity is unverified')
             out['comparisons'][name] = rec
             continue
-        rec['available'] = inf.get('available')
-        if not inf.get('available'):
+        _available = inf.get('available')
+        if not isinstance(_available, (bool, np.bool_)):
+            # The availability flag decides whether the block is a measurement
+            # or an explicit omission; "false"/1 must not be silently treated
+            # as available evidence.
+            out['problems'].append(
+                f'{name}: unit_influence.available is not a boolean '
+                f'({_available!r})')
+            rec['error'] = 'invalid_available'
+            out['comparisons'][name] = rec
+            continue
+        rec['available'] = bool(_available)
+        if not _available:
             out['warnings'].append(
                 f'{name}: unit influence unavailable ({inf.get("reason")})')
             out['comparisons'][name] = rec
@@ -5568,6 +5603,12 @@ def audit_analysis_choices(path=None):
             'primary_excludes_zero')
     for name, comp in comps.items():
         if not isinstance(comp, dict):
+            # A non-object comparison cannot carry a replayable analysis-choice
+            # block; silently skipping it would hide a corrupt comparison.
+            out['problems'].append(
+                f'{name}: comparison is a {type(comp).__name__}, not an object')
+            out['comparisons'][name] = {'present': False,
+                                        'error': 'not_an_object'}
             continue
         ds = comp.get('doc_sampling')
         _has_cc = isinstance(ds, dict) and 'analysis_choice_concordance' in ds
@@ -5824,7 +5865,10 @@ def audit_look_history(paths=None):
     files = sorted(_find_look_histories(paths))
 
     def _finite(x):
-        if isinstance(x, (bool, np.bool_)):
+        # A numeric string (or bytes) is not a measurement: float("1.0")
+        # would let a hand-edited/stale artifact replay as a finite reading.
+        if (isinstance(x, (bool, np.bool_, str, bytes, bytearray))
+                or x is None):
             return None
         try:
             y = float(x)
@@ -5892,14 +5936,26 @@ def audit_look_history(paths=None):
                         continue
                     _dd = [_finite(x) for x in deltas]
                     if any(x is None for x in _dd):
-                        rec['problems'].append(f'look {lid} {key}: non-finite delta')
+                        rec['problems'].append(
+                            f'look {lid} {key}: non-finite/non-numeric delta')
                         continue
                     sf = L.exact_signflip_p(_dd)
-                    recorded_p = _finite(c.get('p_exact_signflip'))
-                    if recorded_p is not None and abs(recorded_p - float(sf['p'])) > 1e-9:
-                        rec['problems'].append(
-                            f'look {lid} {key}: recorded p={recorded_p:.6g} does not '
-                            f'recompute ({sf["p"]:.6g})')
+                    # A present-but-malformed p is corrupt evidence, not an
+                    # absent field: silently skipping the check would let a
+                    # tampered look replay as verified.  Keep the deltas in
+                    # the sequential family (dropping a look would erase the
+                    # optional-stopping correction it represents).
+                    if 'p_exact_signflip' in c:
+                        _raw_p = c.get('p_exact_signflip')
+                        recorded_p = _finite(_raw_p)
+                        if recorded_p is None:
+                            rec['problems'].append(
+                                f'look {lid} {key}: recorded p is not a finite '
+                                f'number ({_raw_p!r})')
+                        elif abs(recorded_p - float(sf['p'])) > 1e-9:
+                            rec['problems'].append(
+                                f'look {lid} {key}: recorded p={recorded_p:.6g} does not '
+                                f'recompute ({sf["p"]:.6g})')
                     series.setdefault(key, []).append(
                         {'look': lid, 'seeds': _ss, 'deltas': _dd})
             # Recompute the sequential p and compare with the audit artifact.
