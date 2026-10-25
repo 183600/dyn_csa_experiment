@@ -181,6 +181,13 @@ def t_tost_student_t_and_boundary():
             _df, _conf, _tc)
 
 
+def t_chi2_large_df_tail():
+    assert abs(L._gammaincc(500000.0, 500000.0) - 0.4998119368033945) < 1e-11
+    assert abs(L.chi2_sf(1_000_000.0, 1_000_000.0) - 0.4998119368033945) < 1e-11
+    assert abs(L.chi2_sf(10_000_000.0, 10_000_000.0) - 0.4999405291960622) < 1e-11
+    assert abs(L.chi2_sf(3.841458820694124, 1.0) - 0.05) < 1e-10
+
+
 def t_safe_exp_and_doc_ci():
     # A finite exponent must stay a finite PPL; only an actual IEEE overflow
     # yields inf.
@@ -22727,6 +22734,7 @@ def main():
     _check('L190 release identity binds the measurement source', t_release_identity_binds_measurement_source)
     _check('L191 project ablation gate rejects panel contradictions and reports replication',
            t_ablation_coverage_replication_and_contradiction)
+    _check('L192 large-df chi-square tail remains accurate', t_chi2_large_df_tail)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

@@ -15724,6 +15724,8 @@ def _gammaincc(a, x):
     """正则化上不完全伽马 Q(a,x)，用于 Cochran Q 的卡方尾概率。"""
     if not (a > 0.0) or math.isnan(x) or x < 0.0:
         return float('nan')
+    if not math.isfinite(a):
+        return float('nan')
     if x == float('inf'):
         return 0.0
     if not math.isfinite(x):
@@ -15735,13 +15737,30 @@ def _gammaincc(a, x):
         ap = float(a)
         s = 1.0 / a
         d = s
-        for _ in range(1000):
+        for _ in range(max(1000, int(50.0 * math.sqrt(a)) + 500)):
             ap += 1.0
             d *= x / ap
             s += d
             if abs(d) < abs(s) * 1e-15:
                 break
-        p = s * math.exp(-x + a * math.log(x) - gln)
+        if a >= 1000.0:
+            r = (x - a) / a
+            if abs(r) < 1e-3:
+                log_r = (-(r * r) / 2.0
+                         + (r ** 3) / 3.0
+                         - (r ** 4) / 4.0
+                         + (r ** 5) / 5.0
+                         - (r ** 6) / 6.0)
+            else:
+                log_r = math.log1p(r) - r
+            inv_a = 1.0 / a
+            delta = inv_a * (1.0 / 12.0
+                             - inv_a * inv_a * (1.0 / 360.0
+                                                - inv_a * inv_a * (1.0 / 1260.0)))
+            log_pref = a * log_r + 0.5 * math.log(a / (2.0 * math.pi)) - delta
+        else:
+            log_pref = -x + a * math.log(x) - gln
+        p = s * math.exp(log_pref)
         return float(min(1.0, max(0.0, 1.0 - p)))
     tiny = 1e-300
     b = x + 1.0 - a
