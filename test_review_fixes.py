@@ -16226,7 +16226,7 @@ def t_factorial_design_gate_verifies_parallel_cells():
                for v in ralias['violations']), ralias['violations']
 
 
-def _factorial_records(interaction, n=7, params=None):
+def _factorial_records(interaction, n=7, params=None, noise=0.0):
     arms = [L.FACTORIAL_DESIGN['dynamic_blocking_x_learned_selection']['cells'][k]
             for k in L._FACTORIAL_CELL_KEYS]
     knobs = L.training_knobs()
@@ -16234,8 +16234,10 @@ def _factorial_records(interaction, n=7, params=None):
     recs = {}
     for s in range(n):
         base = math.log(50.0) + 0.1 * s
+        inter = interaction[s] if isinstance(interaction, (list, tuple)) else interaction
         levels = {arms[0]: base, arms[1]: base - 0.2, arms[2]: base - 0.1,
-                  arms[3]: base - 0.3 + interaction}
+                  arms[3]: base - 0.3 + inter
+                  + (noise if s % 2 else -noise)}
         for arm in arms:
             recs[(arm, '', s)] = {
                 'variant': arm, 'protocol': '', 'seed': s,
@@ -20549,6 +20551,212 @@ def t_kernel_fp64_and_negative_topk_guards():
     assert soft is None
 
 
+def t_interaction_sesoi_design_gate():
+    rep = L.interaction_sesoi_audit()
+    assert rep['status'] == 'ok', rep
+    assert set(rep['factorials']) == set(L.FACTORIAL_DESIGN), rep
+    for name, rec in rep['factorials'].items():
+        assert rec['declared'] is True and rec['predicted_sign'] == 1, (name, rec)
+        assert math.isfinite(rec['margin_log_ratio']), (name, rec)
+        assert abs(rec['margin_log_ratio'] - math.log(1.01)) < 1e-12, (name, rec)
+    # Absolute log-ratio margins are accepted and stay on the log scale.
+    spec = dict(L.INTERACTION_SESOI)
+    spec['dynamic_blocking_x_attention_sink'] = {
+        'absolute_log_ratio': 0.02, 'rationale': 'unit probe'}
+    absrep = L.interaction_sesoi_audit(sesoi=spec)
+    assert absrep['status'] == 'ok', absrep
+    assert abs(absrep['factorials']['dynamic_blocking_x_attention_sink']
+               ['margin_log_ratio'] - 0.02) < 1e-15, absrep
+    # A missing margin cannot silently fall back to "not significant".
+    partial = {k: v for k, v in L.INTERACTION_SESOI.items()
+               if k != 'dynamic_blocking_x_attention_sink'}
+    missing = L.interaction_sesoi_audit(sesoi=partial)
+    assert missing['status'] == 'fail', missing
+    assert any('no pre-registered interaction SESOI' in p
+               for p in missing['problems']), missing
+    # A typo is surfaced instead of leaving the real factorial unmargined.
+    extra = dict(L.INTERACTION_SESOI)
+    extra['dynamic_blocking_x_attention_sin'] = {'relative_pct': 1.0}
+    ex = L.interaction_sesoi_audit(sesoi=extra)
+    assert any('not present in the design' in w for w in ex['warnings']), ex
+    # Malformed/ambiguous margins are design defects.
+    for bad in ({'dynamic_blocking_x_learned_selection': {'relative_pct': 0.0}},
+                {'dynamic_blocking_x_learned_selection': {'relative_pct': -1.0}},
+                {'dynamic_blocking_x_learned_selection': {'relative_pct': float('nan')}},
+                {'dynamic_blocking_x_learned_selection': {'relative_pct': True}},
+                {'dynamic_blocking_x_learned_selection': {
+                    'relative_pct': 1.0, 'absolute_log_ratio': 1.0}},
+                {'dynamic_blocking_x_learned_selection': {
+                    'absolute_log_ratio': None}}):
+        out = L.interaction_sesoi_audit(sesoi=bad)
+        assert out['status'] == 'fail', (bad, out)
+    # No factorial design means the interaction test is simply not applicable.
+    assert L.interaction_sesoi_audit(design={})['status'] == 'not_applicable'
+    # The CLI wrapper returns the same verdict and does not read results.
+    with contextlib.redirect_stdout(io.StringIO()):
+        cli = A.audit_interaction_sesoi()
+    assert cli['status'] == 'ok', cli
+    with contextlib.redirect_stdout(io.StringIO()):
+        cli_bad = A.audit_interaction_sesoi(spec=partial)
+    assert cli_bad['status'] == 'fail', cli_bad
+
+
+def t_factorial_interaction_sesoi_decisions():
+    name = 'dynamic_blocking_x_learned_selection'
+    margin = math.log(1.01)
+
+    def run(vals, **kw):
+        return L.factorial_interaction_audit(
+            recs=_factorial_records(vals), **kw)
+
+    # The predicted positive interaction above the margin is supported only
+    # after the interaction-family correction.
+    r = run([0.05] * 7)
+    f = r['factorials'][name]
+    assert f['practical_decision'] == 'hypothesis_supported', f
+    assert f['interaction']['significant_family'] is True, f['interaction']
+    assert f['interaction']['p_tost_holm'] is not None, f['interaction']
+    assert r['hypothesis_supported_interactions'] == [name], r
+    assert r['equivalent_interactions'] == [], r
+    # Opposite sign, above margin: a real direction conflict, not support.
+    neg = run([-0.05] * 7)
+    nf = neg['factorials'][name]
+    assert nf['practical_decision'] == 'direction_conflict', nf
+    assert neg['direction_conflict_interactions'] == [name], neg
+    assert name not in neg['indeterminate_interactions'], neg
+    # Detectable but inside the margin is sub-SESOI, never "useful" and never
+    # "additive": a tiny p-value cannot turn it into either.
+    sub = run([0.005] * 7)
+    sf = sub['factorials'][name]
+    assert sf['practical_decision'] == 'sub_sesoi', sf
+    assert sf['interaction']['sesoi']['practical_significant'] is False, sf
+    assert sub['sub_sesoi_interactions'] == [name], sub
+    assert sub['equivalent_interactions'] == [], sub
+    # A precise zero interaction inside the margin is positive evidence of
+    # practical additivity, with a family-adjusted TOST p.
+    add = run([0.002 if i % 2 else -0.002 for i in range(7)])
+    af = add['factorials'][name]
+    assert af['practical_decision'] == 'additive', af
+    assert af['interaction']['p_holm'] == 1.0, af['interaction']
+    assert math.isfinite(float(af['interaction']['p_tost_holm'])), af
+    assert add['equivalent_interactions'] == [name], add
+    assert add['sesoi']['family']['m'] == 1, add['sesoi']
+    # A noisy, non-significant interaction is indeterminate, not additive.
+    ind = run([0.025 if i % 2 else -0.015 for i in range(7)])
+    assert ind['factorials'][name]['practical_decision'] == 'indeterminate', ind
+    assert ind['indeterminate_interactions'] == [name], ind
+    assert ind['equivalent_interactions'] == [], ind
+    # n<min_n fails closed even if the point estimate is exactly zero.
+    weak = L.factorial_interaction_audit(
+        recs=_factorial_records([0.0, 0.0], n=2), min_n=3)
+    assert weak['factorials'][name]['practical_decision'] == 'underpowered', weak
+    # Missing a cell cannot be called additive or indeterminate; it is
+    # not_measured and keeps its declared TOST family slot.
+    incomplete = {k: v for k, v in _factorial_records(0.05).items()
+                  if k[0] != 'csa_fix_randidx'}
+    inc = L.factorial_interaction_audit(recs=incomplete)
+    assert inc['factorials'][name]['practical_decision'] == 'not_measured', inc
+    assert inc['not_measured_interactions'] == [name], inc
+    # Empty SESOI mapping disables the practical layer explicitly.
+    off = run([0.05] * 7, sesoi={})
+    assert off['factorials'][name]['practical_decision'] == 'not_declared', off
+    assert off['not_declared_interactions'] == [name], off
+    assert off['equivalent_interactions'] == [], off
+    assert off['sesoi']['family']['m'] == 0, off['sesoi']
+    # A malformed-but-declared partial SESOI still keeps an unbeatable slot
+    # for the undeclared factorial; the TOST family must not shrink and buy
+    # significance for the one factorial that happens to have a margin.
+    import copy
+    base = copy.deepcopy(L.FACTORIAL_DESIGN[name])
+    two = {'a': copy.deepcopy(base), 'b': copy.deepcopy(base)}
+    partial_two = L.factorial_interaction_audit(
+        design=two, recs=_factorial_records(
+            [0.002 if i % 2 else -0.002 for i in range(7)]),
+        sesoi={'a': {'relative_pct': 1.0}})
+    assert partial_two['sesoi']['family']['m'] == 2, partial_two['sesoi']
+    assert partial_two['factorials']['b']['practical_decision'] == 'not_declared', partial_two
+    assert partial_two['not_declared_interactions'] == ['b'], partial_two
+    # The no-complete-2x2-seed branch must not append the same name twice.
+    allbad = {k: (dict(v, run_cfg='other_cfg')
+                  if k[0] == 'csa_fix_randidx' else v)
+              for k, v in _factorial_records(0.05).items()}
+    rbad = L.factorial_interaction_audit(recs=allbad, sesoi={})
+    assert rbad['not_declared_interactions'] == [name], rbad
+    assert rbad['factorials'][name]['status'] == 'no_data', rbad
+    # A malformed SESOI fails the audit instead of silently dropping a margin.
+    bad = run([0.05] * 7, sesoi={name: {'relative_pct': 0.0}})
+    assert bad['status'] == 'fail' and bad['sesoi']['error'], bad
+    # Repeating the same factorial three times exercises the Holm correction
+    # on both the superiority and TOST families; m must be the declared 3,
+    # not the one factorial we happened to inspect.
+    three = {f'copy{i}': copy.deepcopy(base) for i in range(3)}
+    r3 = L.factorial_interaction_audit(
+        design=three, recs=_factorial_records(
+            [0.002 if i % 2 else -0.002 for i in range(7)]),
+        sesoi={k: {'relative_pct': 1.0} for k in three})
+    assert r3['family']['m'] == 3 and r3['sesoi']['family']['m'] == 3, r3
+    for rec in r3['factorials'].values():
+        assert rec['practical_decision'] == 'additive', rec
+        assert rec['interaction']['p_holm'] == 1.0, rec['interaction']
+        assert (rec['interaction']['p_tost_holm']
+                >= rec['interaction']['sesoi']['tost_p_tost']), rec['interaction']
+
+
+def t_interaction_practical_decision_primitives():
+    margin = math.log(1.01)
+    r = L.interaction_practical_decision(
+        [0.002, -0.002, 0.002, -0.002, 0.002, -0.002],
+        margin=margin, direction=1)
+    assert r['decision'] == 'additive' and r['claim'] == 'additive_within_sesoi', r
+    assert r['tost_equivalent'] is True and r['tost_p_tost'] < 0.05, r
+    assert r['margin_ratio'] is not None and abs(r['margin_ratio'] - 1.01) < 1e-12, r
+    # A one-pass iterable feeds both the superiority and TOST tests.
+    again = L.interaction_practical_decision(
+        iter([0.002, -0.002, 0.002, -0.002, 0.002, -0.002]),
+        margin=margin, direction=1)
+    assert again['n'] == 6 and again['decision'] == 'additive', again
+    # No margin means no additivity claim.
+    off = L.interaction_practical_decision([0.002, -0.002, 0.0], sesoi={})
+    assert off['decision'] == 'not_declared' and off['margin'] is None, off
+    # Relative specs are converted on the log-ratio scale.
+    rel = L.interaction_practical_decision(
+        [0.002, -0.002, 0.002, -0.002, 0.002, -0.002],
+        sesoi={'relative_pct': 1.0}, direction=1)
+    assert rel['decision'] == 'additive', rel
+    assert abs(rel['margin'] - margin) < 1e-12, rel
+    # Malformed family p-values fail closed: a raw TOST alone cannot certify
+    # equivalence when the supplied family p is invalid.
+    malformed = L.interaction_practical_decision(
+        [0.002, -0.002, 0.002, -0.002, 0.002, -0.002],
+        margin=margin, direction=1, p_holm_tost='false')
+    assert malformed['decision'] != 'additive', malformed
+    malformed2 = L.interaction_practical_decision(
+        [0.05] * 7, margin=margin, direction=1, p_holm='false')
+    assert malformed2['decision'] != 'hypothesis_supported', malformed2
+    # Direction and margin are validation gates, not coercions.
+    for bad in (1.5, -0.5, float('nan'), True):
+        try:
+            L.interaction_practical_decision([0.1, 0.2, 0.3], margin=margin,
+                                             direction=bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'fractional/bool interaction direction accepted: {bad!r}')
+    for bad_margin in (0.0, -0.1, float('nan'), float('inf'), True):
+        try:
+            L.interaction_practical_decision([0.1, 0.2, 0.3], margin=bad_margin)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'invalid interaction margin accepted: {bad_margin!r}')
+    # The normaliser accepts its own output and rejects ambiguous units.
+    norm = L._normalise_interaction_sesoi_design(
+        {'x': {'relative_pct': 2.0}})['x']
+    again2 = L._normalise_interaction_sesoi_design({'x': norm})['x']
+    assert again2['relative_pct'] == 2.0 and again2['absolute_log_ratio'] is None, again2
+    assert abs(norm['margin_log_ratio'] - math.log1p(0.02)) < 1e-15, norm
+
+
 def t_sesoi_practical_decision_primitives():
     # Equivalence is a positive claim: a small, precise effect inside the
     # pre-registered margin is 'equivalent', not 'not significant'.
@@ -22901,6 +23109,12 @@ def main():
            t_train_val_passage_overlap_gate)
     _check('L194 large-df Student t tail and critical value stay accurate',
            t_student_t_large_df_tail)
+    _check('L195 interaction SESOI declaration gate fails closed',
+           t_interaction_sesoi_design_gate)
+    _check('L196 interaction TOST separates additivity from inconclusive',
+           t_factorial_interaction_sesoi_decisions)
+    _check('L197 interaction practical-decision primitives',
+           t_interaction_practical_decision_primitives)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

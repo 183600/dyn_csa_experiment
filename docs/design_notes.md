@@ -4363,3 +4363,125 @@ L193 覆盖：干净随机 split 的 passage `ok`；复制一段 train 后只改
 `not_applicable`；`audit_split_discipline` 对同一 cache 的干净/污染版本
 分别 ok/fail；NaN/负值/超范围参数被拒绝。完整 CPU 套件 542/542 通过
 （0 skipped）。
+
+## 67. 2x2 交互的「不显著」也不等于「可加」：预注册交互 SESOI + TOST
+
+### 67.1 问题：交互 p≥α 被读成 additivity
+
+§59 的 `factorial_interaction_audit` 只做精确符号翻转 + 交互族 Holm：
+`p_holm≥α` 只说明当前种子数下没有检出交互，不能证明两个模块的实际
+交互为零。另一方面，n 很大时一个 0.1% 的交互也可能「显著」，却不足以
+支撑子可加/协同的机制主张。§56 已给留一消融加了 SESOI + TOST，但交互层
+仍缺少同一区分，于是报告容易把「未检出」写成「可加」，或把亚 SESOI 的
+可检出交互写成机制证据。
+
+### 67.2 方法：log ratio-of-ratios 上的预注册 margin
+
+新增 `INTERACTION_SESOI`（`exp_lib.py`）与
+`_normalise_interaction_sesoi_design()`。交互 estimand 保持 §59 的定义：
+
+```text
+I_s = (log PPL_11 - log PPL_10) - (log PPL_01 - log PPL_00)
+```
+
+margin 也定义在自然对数交互尺度上。`relative_pct=1.0` 换算为
+`log(1.01)`，即比值比落在 `[1/1.01, 1.01]`；也接受
+`absolute_log_ratio`（仍是 log 尺度，不是 PPL）。布尔、0、负值、NaN/inf、
+同时声明两个单位、非字符串名都会 fail closed，不会静默退化成「没有
+margin」。
+
+`interaction_practical_decision()` 对逐种子交互值计算配对 TOST，并给出
+机器可读的 `decision`：
+
+- `hypothesis_supported`：族校正后显著且 `I` 超过 margin，方向与预注册
+  一致（当前三个假设均为正、子可加）；
+- `direction_conflict`：族校正后显著、超过 margin，但方向相反；
+- `sub_sesoi`：族校正后显著，但 `|I|≤margin`——可检出，不构成实际交互；
+- `additive`：TOST 区间落在 margin 内，且（若有）Holm 校正后的 TOST p
+  小于 α——这是「实际可加」的正证据，不是「交互恰好为零」；
+- `indeterminate`：既没有超过 margin 的交互，也没有落入 margin 的等价
+  区间；
+- `underpowered` / `no_data` / `not_measured` / `not_declared`。
+
+`factorial_interaction_audit(..., sesoi=None)` 默认读取
+`INTERACTION_SESOI`；传入 `{}` 可显式关闭实际显著性层。每个可测交互的
+原始 TOST p 先进入**独立的交互等价族**，再做 Holm；缺失/不完整 factorial
+保留 p=1 槽位，不能通过少报一个交互来缩小等价性校正族。超显著性检验族
+（§59）与等价性族互不混用：`p_holm` 仍是「交互是否非零」的族校正 p，
+`p_tost_holm` 才是「能否声称实际可加」的族校正 p。TOST 是 t 近似，没有
+精确符号翻转的 `2/2**n` 分辨率下限，因此 `sesoi.family` 不报告
+`min_attainable_p_holm`。
+
+顶层新增：
+
+- `equivalent_interactions`
+- `hypothesis_supported_interactions`
+- `sub_sesoi_interactions`
+- `indeterminate_interactions`
+- `not_measured_interactions`
+- `not_declared_interactions`
+- `sesoi.family` / `sesoi.policy`
+
+每个 `factorials[*].interaction` 仍保留 §59 的 `p_holm`、
+`significant_family`、`mechanism_claim_allowed`，并新增
+`p_tost_holm`、`practical_decision` 与 `sesoi` 块。容量/配方控制仍是
+`mechanism_claim_allowed` 的独立硬条件：等价性只说明「交互小」，不能绕开
+参数/容量混杂。
+
+### 67.3 设计期门
+
+`interaction_sesoi_audit()`（exp_lib）与
+`python audit_gates.py interaction_sesoi` 在跑 GPU 前检查：
+
+- 每个声明的 factorial 都有 margin；缺一个即 fail；
+- 单位唯一、有限、>0；相对 margin 会换算为 log 尺度；
+- 没有为拼写错误的 factorial 写 margin（warning，防止真 factorial 静默
+  失去 margin）；
+- 对应 `INTERACTION_HYPOTHESIS_DESIGN` 存在且 `predicted_sign∈{-1,0,1}`；
+- 交互声明为空时返回 `not_applicable`，而不是假装通过。
+
+`audit_gates.py report` 现在包含 `interaction_sesoi` 块。
+
+### 67.4 边界
+
+- **不是精确零交互检验。** `additive` 的区间是预注册 margin 内的实际
+  可加性；等价于「小到本研究不关心」，不是「I=0」。
+- **不是交互的机制确认。** 显著交互仍可能来自容量、实现或训练配方差异；
+  只有 `mechanism_claim_allowed=True` 才允许机制措辞。现有
+  `param/breakdown` 控制继续生效。
+- **不改变冻结确认清单。** 交互族仍是 §59 的探索性族，不进入冻结
+  confirmatory 或留一消融 Holm 族；新 margin 只约束交互结果的措辞与
+  决策，不新增训练、不改种子/终点/α，也不改 `CODE_SEMANTICS`。
+- **TOST 依赖 t 近似与配对可交换性。** 种子数很小或差异严重偏态时，
+  区间覆盖率仍受 §62 的校准边界约束；`underpowered` 不会被等价性绕过。
+- **只在 panel 内校正。** 交互超显著性族与交互 TOST 族都是单 panel 的
+  声明族；跨 panel 的交互复制/反证仍应走 §65 的跨 panel 读数和显式
+  meta-analysis，不能把多个 panel 的 `additive` 直接当作全局等价。
+- **一个显著但亚 SESOI 的交互不是零。** `sub_sesoi` 明确保留「可检出」，
+  不能写成「无交互」；`indeterminate` 也不能写成「可加」。
+- **旧 falsifier 的读法。** `INTERACTION_HYPOTHESIS_DESIGN[*]['falsifier']`
+  里的 “not distinguishable from zero” 现在必须经新判定解释：只有
+  `additive`（TOST 区间在 margin 内）才是否定「实际交互」的正证据；
+  `indeterminate` 只是数据不足，不自动算 falsifier。本改动不改写既有
+  hypothesis 文本，避免把新决策伪装成对旧预注册的事后重写。
+- 默认 1% 是本研究对架构级交互预先采用的实际阈值，与 §56 的消融 1%
+  对齐；面板若要更小/更大 margin，必须显式声明并走同一设计门。
+
+### 67.5 入口与验证
+
+```bash
+python audit_gates.py interaction_sesoi   # 设计期：覆盖/单位/方向
+python audit_gates.py report              # 汇总含 interaction_sesoi
+python test_review_fixes.py               # L195-L197
+python v12_supp.py plan                   # 冻结计划预检不受影响
+```
+
+L195 覆盖默认声明全通过、绝对 log margin、缺 margin/歧义单位/NaN/布尔/
+双单位 fail、拼写错误 warning、空设计 `not_applicable` 与 CLI 包装。
+L196 覆盖正向支持/反向冲突/亚 SESOI/精确可加/不确定/n<min_n/缺臂/
+`sesoi={}` 关闭/部分声明保留未声明 factorial 的 p=1 槽位/无完整 seed 时
+列表不重复/畸形声明 fail，以及三个重复 factorial 下超显著性与 TOST
+两个族的 m=3 Holm。L197 覆盖直接判定原语、单次迭代器、相对 margin 换算、
+畸形族 p 的 fail-closed、方向/ margin 输入校验与 normaliser 幂等。
+完整 CPU 套件 546/546 通过（0 skipped）；`python v12_supp.py plan` 仍
+72/72 合成冻结记录、6 个比较。

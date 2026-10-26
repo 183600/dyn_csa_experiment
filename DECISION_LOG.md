@@ -2818,3 +2818,52 @@ exact-row 检查后运行同一 helper。新参数全部进入 memo key 并做�
 `not_applicable`；`audit_split_discipline` 对干净/污染 cache 分别 ok/fail；
 NaN/负值/超范围参数被拒绝。`python v12_supp.py plan` 仍 72/72 合成冻结
 记录、6 个比较。
+
+## 2026-10-26 — 2x2 交互的 SESOI/TOST 等价性与设计门（no new runs）
+
+零 GPU 的对比实验/消融方法学硬化；不新增训练、不读取 test split、不修改
+冻结清单的字节/种子/终点/alpha/Holm 决策规则，也不改 `CODE_SEMANTICS`。
+
+**Problem.** §59 的 `factorial_interaction_audit` 只有交互族 Holm 的
+精确符号翻转：`p_holm>=alpha` 不是「两个模块可加」，n 大时一个亚 SESOI
+的交互也可能显著。留一消融在 §56 已有预注册 margin + TOST，但交互层仍
+把「未检出」与「实际可加」混在一起，也没有把「可检出但实际很小」与
+「超过 SESOI 的子可加/协同」分开。
+
+**Fix.** 新增 `INTERACTION_SESOI`、`_normalise_interaction_sesoi_design()`、
+`interaction_practical_decision()` 和 `interaction_sesoi_audit()`。
+margin 在自然对数 ratio-of-ratios 尺度上定义，`relative_pct=1.0` 换算为
+`log(1.01)`；拒绝布尔/0/负值/NaN/inf/双单位/非字符串名。
+`factorial_interaction_audit(..., sesoi=None)` 默认为每个可测交互计算
+配对 TOST，并把 TOST p 放进独立的交互等价族做 Holm；不完整/缺失
+factorial 保留 p=1 槽位。判定分为 `hypothesis_supported` /
+`direction_conflict` / `sub_sesoi` / `additive` / `indeterminate` /
+`underpowered` / `no_data` / `not_measured` / `not_declared`。
+`additive` 要求 TOST 区间在 margin 内且族校正 TOST p<alpha；非显著且
+未做等价检验一律 `indeterminate`，不能写成 additivity。交互单元新增
+`p_tost_holm`、`practical_decision`、`sesoi`；顶层新增
+`equivalent_interactions`、`hypothesis_supported_interactions`、
+`sub_sesoi_interactions`、`indeterminate_interactions` 等列表。
+设计期门 `audit_gates.py interaction_sesoi` 检查每个 factorial 的 margin
+覆盖、单位、正性、拼写与方向假设；`audit_gates.py report` 纳入该块。
+
+**Boundary.** `additive` 是预注册 margin 内的实际可加性，不是精确零
+交互，也不是机制确认：容量/配方混杂仍由 `mechanism_claim_allowed`
+独立把关。`sub_sesoi` 仍可检出，不能写成「无交互」；`indeterminate`
+不能写成「可加」；`underpowered` 不能被等价性绕过。旧
+`INTERACTION_HYPOTHESIS_DESIGN[*]['falsifier']` 文本不改写：
+"not distinguishable from zero" 现在只是 `indeterminate`，只有
+TOST 区间落在 margin 内的 `additive` 才是对「实际交互」的正反证。
+交互族仍是探索性族，
+不进入冻结 confirmatory 或留一消融 Holm 族；不新增训练、种子、终点或
+α，不合并 panel，也不改变任何已落盘数值。
+
+**Verification.** `python test_review_fixes.py` 通过 546/546（0 skipped，
+新增 L195-L197）：交互 SESOI 设计门全通过/缺 margin/歧义单位/NaN/布尔/
+双单位 fail、拼写 warning、空设计 `not_applicable`；正向支持/反向冲突/
+亚 SESOI/精确可加/不确定/n<min_n/缺臂/`sesoi={}` 关闭/部分声明保留
+p=1 槽位/无完整 seed 列表不重复/畸形声明 fail，以及三个重复 factorial
+下超显著性与 TOST 两族 m=3 的 Holm；直接判定原语、
+单次迭代器、相对 margin 换算、畸形族 p 的 fail-closed 与输入校验。
+`python audit_gates.py interaction_sesoi` 返回 `ok`；`python v12_supp.py
+plan` 仍 72/72 合成冻结记录、6 个比较。

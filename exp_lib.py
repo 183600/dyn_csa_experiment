@@ -15778,6 +15778,346 @@ def ablation_practical_decision(deltas, *, margin=None, sesoi=None, baseline_ppl
     return out
 
 
+# ---- 2x2 交互的等价性（SESOI + TOST）--------------------------------------
+
+def _normalise_interaction_sesoi_design(spec):
+    """Validate a ``{factorial: margin}`` mapping for 2x2 interactions.
+
+    A spec is either a positive number (interpreted as a relative percent of
+    the ratio-of-ratios) or a mapping with exactly one of ``relative_pct`` /
+    ``absolute_log_ratio``.  ``relative_pct`` is converted to
+    ``log1p(pct/100)`` on the natural-log interaction scale; an absolute
+    margin is already on that log scale (never PPL).  Booleans, zero,
+    negative, NaN/inf, both units at once, and non-string names are rejected
+    instead of being coerced: a malformed interaction SESOI would silently
+    change which additivity claims are allowed.
+    """
+    if spec is None:
+        return {}
+    if not isinstance(spec, dict):
+        raise ValueError(
+            f'interaction SESOI must be a mapping factorial -> margin spec, '
+            f'got {type(spec).__name__}')
+    out = {}
+    for name, raw in spec.items():
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(
+                f'interaction SESOI names must be non-empty strings, got {name!r}')
+        if isinstance(raw, dict):
+            units = [k for k in ('relative_pct', 'absolute_log_ratio')
+                     if k in raw and raw[k] is not None]
+            if len(units) != 1:
+                raise ValueError(
+                    f'interaction SESOI[{name!r}] must declare exactly one of '
+                    f'relative_pct / absolute_log_ratio, got {sorted(units)}')
+            unit = units[0]
+            value = raw[unit]
+        elif (isinstance(raw, (int, float, np.integer, np.floating))
+              and not isinstance(raw, (bool, np.bool_))):
+            unit, value = 'relative_pct', raw
+        else:
+            raise ValueError(
+                f'interaction SESOI[{name!r}] must be a positive number or a '
+                f'mapping, got {raw!r}')
+        if isinstance(value, (bool, np.bool_)):
+            raise ValueError(
+                f'interaction SESOI[{name!r}] must not be a boolean, got {value!r}')
+        try:
+            value = float(value)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(
+                f'interaction SESOI[{name!r}] margin is not a real number: '
+                f'{raw!r}') from None
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError(
+                f'interaction SESOI[{name!r}] margin must be finite and >0, '
+                f'got {value!r}')
+        relative = None
+        absolute = None
+        if unit == 'relative_pct':
+            relative = value
+            margin = math.log1p(value / 100.0)
+        else:
+            absolute = value
+            margin = value
+        if not math.isfinite(margin) or margin <= 0.0:
+            raise ValueError(
+                f'interaction SESOI[{name!r}] converts to a non-finite/non-positive '
+                f'log margin ({margin!r})')
+        out[name] = {
+            'relative_pct': relative,
+            'absolute_log_ratio': absolute,
+            'margin_log_ratio': float(margin),
+            'rationale': (str(raw.get('rationale') or '')
+                          if isinstance(raw, dict) else ''),
+        }
+    return out
+
+
+def _interaction_decision_from_stats(stats, tost, *, margin, direction, alpha,
+                                     min_n, p_holm=None, p_holm_tost=None,
+                                     label='interaction'):
+    """Combine superiority + TOST into one practical interaction verdict.
+
+    ``direction`` is the pre-registered sign of the interaction (+1 for the
+    sub-additive hypothesis, -1 for synergy, 0 for a non-directional claim).
+    A family-corrected significant interaction above the margin is
+    ``hypothesis_supported`` or ``direction_conflict``; an interaction
+    detectable but inside the margin is ``sub_sesoi``; only a TOST whose
+    (family-adjusted) interval lies inside the margin is ``additive``.
+    A non-significant interaction with no equivalence test stays
+    ``indeterminate`` — it is not evidence of additivity.
+    """
+    if not isinstance(stats, dict):
+        raise ValueError(
+            f'interaction stats must be a mapping, got {type(stats).__name__}')
+    alpha = _validated_alpha(
+        alpha, context='_interaction_decision_from_stats alpha')
+    _min_n = _as_seed_int(min_n)
+    if _min_n is None or _min_n < 0:
+        raise ValueError(
+            f'interaction min_n must be a non-negative integer, got {min_n!r}')
+    min_n = int(_min_n)
+    _direction = _as_seed_int(direction)
+    if _direction is None or _direction not in (-1, 0, 1):
+        raise ValueError(
+            f'interaction direction must be -1, 0 or +1, got {direction!r}')
+    direction = int(_direction)
+    if isinstance(margin, (bool, np.bool_)):
+        raise ValueError(
+            f'interaction margin must be a positive real number, got {margin!r}')
+    try:
+        margin = float(margin)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(
+            f'interaction margin must be a positive real number, got {margin!r}') from None
+    if not math.isfinite(margin) or margin <= 0.0:
+        raise ValueError(
+            f'interaction margin must be finite and >0, got {margin!r}')
+
+    def _prob(value):
+        if value is None or isinstance(value, (bool, np.bool_)):
+            return None
+        try:
+            v = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(v) or not 0.0 <= v <= 1.0:
+            return None
+        return v
+
+    _tost = tost if isinstance(tost, dict) else {}
+    _sig_raw = stats.get('significant')
+    sig = (bool(_sig_raw) if isinstance(_sig_raw, (bool, np.bool_)) else False)
+    n = _as_seed_int(stats.get('n'))
+    n = 0 if n is None or n < 0 else int(n)
+    mean = _finite_scalar(stats.get('mean'))
+    p_sup = _prob(p_holm)
+    p_tost = _prob(p_holm_tost)
+    superiority_family_ok = True
+    if p_holm is not None:
+        if p_sup is None:
+            superiority_family_ok = False
+            sig = False
+        else:
+            sig = bool(sig and p_sup < alpha)
+    _tost_eq_raw = _tost.get('equivalent')
+    tost_equiv = (bool(_tost_eq_raw)
+                  if isinstance(_tost_eq_raw, (bool, np.bool_)) else False)
+    tost_family_ok = True
+    if p_holm_tost is not None and p_tost is None:
+        tost_family_ok = False
+    equivalence_ok = bool(
+        tost_equiv and tost_family_ok
+        and (p_tost is None or p_tost < alpha))
+    margin_ratio = (float(math.exp(margin)) if margin < 700.0 else None)
+    out = {
+        'n': n, 'mean': mean,
+        'margin': float(margin),
+        'margin_log_ratio': float(margin),
+        'margin_ratio': margin_ratio,
+        'margin_pct_equivalent': (100.0 * (margin_ratio - 1.0)
+                                  if margin_ratio is not None else None),
+        'p_exact_signflip': stats.get('p_exact_signflip'),
+        'p_floor': stats.get('p_floor'), 'n_nonzero': stats.get('n_nonzero'),
+        'p_holm': p_sup,
+        'family_adjusted_superiority': (p_holm is not None),
+        'tost_p_tost': _tost.get('p_tost'),
+        'tost_p_holm': p_tost,
+        'family_adjusted_tost': (p_holm_tost is not None),
+        'tost_ci': _tost.get('ci'),
+        'tost_equivalent': tost_equiv,
+        'tost_interval_inside_margin': _tost.get('ci_within_margin'),
+        'alpha': float(alpha), 'min_n': int(min_n), 'direction': direction,
+        'decision': 'indeterminate', 'claim': 'inconclusive', 'reason': '',
+        'statistically_significant': bool(sig),
+        'practical_significant': False,
+        'seed_driven': stats.get('seed_driven'),
+        'label': str(label),
+    }
+    ci = _tost.get('ci')
+    if (isinstance(ci, (list, tuple)) and len(ci) == 2
+            and all(_finite_scalar(x) is not None for x in ci)
+            and float(ci[1]) < 700.0):
+        out['tost_ci_ratio'] = [float(math.exp(float(ci[0]))),
+                                float(math.exp(float(ci[1])))]
+    if n == 0 or mean is None:
+        out['decision'] = 'no_data'
+        out['claim'] = 'no_data'
+        out['reason'] = 'no finite paired interaction difference'
+        return out
+    if n < min_n:
+        out['decision'] = 'underpowered'
+        out['claim'] = 'underpowered'
+        out['reason'] = (
+            f'n={n} < min_n={min_n}; neither an interaction nor additivity is '
+            'decidable')
+        return out
+    abs_mean = abs(float(mean))
+    if sig:
+        if abs_mean <= float(margin):
+            out['decision'] = 'sub_sesoi'
+            out['claim'] = 'detectable_but_below_sesoi'
+            out['reason'] = (
+                'family-corrected interaction is detectable but |I| <= the '
+                'pre-registered SESOI; this is not a practically relevant '
+                'interaction and not proof of exact additivity')
+            return out
+        if direction == 0:
+            out['decision'] = 'detectable_difference'
+            out['claim'] = 'detectable_difference'
+            out['reason'] = (
+                'no directional interaction claim was declared; report the '
+                'interval only')
+            return out
+        if float(mean) * float(direction) > 0.0:
+            out['decision'] = 'hypothesis_supported'
+            out['claim'] = 'interaction_above_sesoi_in_predicted_direction'
+            out['reason'] = (
+                'family-corrected interaction is larger than the pre-registered '
+                'SESOI in the predicted direction')
+        else:
+            out['decision'] = 'direction_conflict'
+            out['claim'] = 'interaction_above_sesoi_opposite_predicted_direction'
+            out['reason'] = (
+                'family-corrected interaction is larger than the pre-registered '
+                'SESOI and has the opposite sign to the declared hypothesis')
+        out['practical_significant'] = True
+        return out
+    if equivalence_ok:
+        out['decision'] = 'additive'
+        out['claim'] = 'additive_within_sesoi'
+        out['reason'] = (
+            'the TOST interval lies inside the pre-registered SESOI and the '
+            '(Holm-adjusted) equivalence p is below alpha; this is evidence of '
+            'practical additivity, not a failed interaction test')
+        return out
+    if not superiority_family_ok:
+        out['reason'] = (
+            'the supplied family-adjusted superiority p is malformed; a '
+            'practical interaction cannot be certified')
+    elif p_holm_tost is not None and p_tost is None:
+        out['reason'] = (
+            'the supplied family-adjusted TOST p is malformed; additivity '
+            'cannot be certified')
+    elif p_holm_tost is not None and p_tost >= alpha:
+        out['reason'] = (
+            'the raw TOST may be inside the margin, but the family-adjusted '
+            'equivalence p does not clear alpha')
+    else:
+        out['reason'] = (
+            'neither a family-corrected interaction above the SESOI nor an '
+            'equivalence interval inside it; the data are inconclusive')
+    return out
+
+
+def interaction_practical_decision(deltas, *, margin=None, sesoi=None,
+                                   alpha=0.05, min_n=3, direction=1,
+                                   p_holm=None, p_holm_tost=None,
+                                   label='interaction'):
+    """Adjudicate a 2x2 interaction against a pre-registered SESOI.
+
+    Parameters
+    ----------
+    deltas : per-seed interaction values on the natural-log ratio-of-ratios
+        scale (``(log PPL11 - log PPL10) - (log PPL01 - log PPL00)``).
+    margin : absolute SESOI in the same log units (preferred when the caller
+        already fixed it).  A 1% ratio-of-ratios margin is ``log(1.01)``.
+    sesoi : alternatively a raw/normalised interaction SESOI spec
+        (``relative_pct`` or ``absolute_log_ratio``).
+    direction : pre-registered sign (+1 sub-additive, -1 synergy, 0 none).
+    p_holm : optional family-adjusted superiority p.  When supplied, a
+        ``hypothesis_supported``/``direction_conflict`` verdict requires it
+        to be below alpha; when absent the raw sign-flip verdict is used and
+        the result is labelled as not family-adjusted.
+    p_holm_tost : optional family-adjusted TOST p; equivalence requires it
+        below alpha when supplied.
+
+    Returns ``decision`` in ``hypothesis_supported`` / ``direction_conflict``
+    / ``sub_sesoi`` / ``detectable_difference`` / ``additive`` /
+    ``indeterminate`` / ``underpowered`` / ``no_data`` / ``not_declared``.
+    ``additive`` is a positive equivalence claim about practical additivity
+    inside the margin, not a claim that the interaction is exactly zero.
+    """
+    alpha = _validated_alpha(
+        alpha, context='interaction_practical_decision alpha')
+    _min_n = _as_seed_int(min_n)
+    if _min_n is None or _min_n < 0:
+        raise ValueError(
+            f'interaction min_n must be a non-negative integer, got {min_n!r}')
+    min_n = int(_min_n)
+    if deltas is None:
+        deltas = []
+    elif not isinstance(deltas, (list, tuple, np.ndarray)):
+        deltas = list(deltas)
+    _direction = _as_seed_int(direction)
+    if _direction is None or _direction not in (-1, 0, 1):
+        raise ValueError(
+            f'interaction direction must be -1, 0 or +1, got {direction!r}')
+    direction = int(_direction)
+    stats = paired_effect_stats(deltas, alpha=alpha, min_n=min_n)
+    if margin is None:
+        if sesoi is None or (isinstance(sesoi, dict) and not sesoi):
+            return {
+                'n': int(stats.get('n') or 0), 'mean': stats.get('mean'),
+                'margin': None, 'margin_log_ratio': None, 'margin_ratio': None,
+                'margin_pct_equivalent': None,
+                'p_exact_signflip': stats.get('p_exact_signflip'),
+                'p_floor': stats.get('p_floor'),
+                'p_holm': None, 'family_adjusted_superiority': False,
+                'tost_p_tost': None, 'tost_p_holm': p_holm_tost,
+                'family_adjusted_tost': (p_holm_tost is not None),
+                'tost_ci': None, 'tost_equivalent': None,
+                'statistically_significant': bool(stats.get('significant')),
+                'seed_driven': stats.get('seed_driven'),
+                'practical_significant': False, 'decision': 'not_declared',
+                'claim': 'not_declared',
+                'reason': 'no pre-registered interaction SESOI was supplied',
+                'label': str(label), 'direction': direction,
+                'alpha': float(alpha), 'min_n': int(min_n),
+            }
+        spec = _normalise_interaction_sesoi_design(
+            {'__one__': sesoi}).get('__one__')
+        if spec is None:
+            raise ValueError('interaction SESOI spec normalised to nothing')
+        margin = spec['margin_log_ratio']
+    if isinstance(margin, (bool, np.bool_)):
+        raise ValueError(
+            f'interaction margin must be a positive real number, got {margin!r}')
+    try:
+        margin = float(margin)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(
+            f'interaction margin must be a positive real number, got {margin!r}') from None
+    if not math.isfinite(margin) or margin <= 0.0:
+        raise ValueError(
+            f'interaction margin must be finite and >0, got {margin!r}')
+    tost = tost_paired(deltas, margin, conf=1.0 - 2.0 * alpha)
+    return _interaction_decision_from_stats(
+        stats, tost, margin=margin, direction=direction, alpha=alpha,
+        min_n=min_n, p_holm=p_holm, p_holm_tost=p_holm_tost, label=label)
+
+
 # ---- 跨规模推断（scale ladder）：相对效应、异质性、趋势 ---------------------
 # 动机：把 d=128 与 d=512 的「绝对 PPL 差」直接相减，会把基线 PPL 本身的
 # 规模差异混进效应里（PPL 不是跨规模可加的）。跨规模的比较必须先转成
@@ -18285,6 +18625,39 @@ ABLATION_SESOI = {
     'hybrid_hierarchy': {
         'relative_pct': 1.0,
         'rationale': 'The CSA+HCA hierarchy must beat CSA-only by >=1% PPL to support a complementary-layer claim.',
+    },
+}
+
+# ---- 2x2 交互的预注册 SESOI ------------------------------------------------
+# 交互「不显著」同样不是「可加」：精确符号翻转只能说明当前种子数下没有
+# 检出交互，不能证明交互在实际上为零。反过来，一个超过 SESOI 的交互才是
+# 子可加/协同的实际证据。这里把与消融 SESOI 相同的逻辑移到 2x2 交互：
+# 在看结果之前固定一个 log ratio-of-ratios 边界，用配对 TOST 把
+# 「实际可加（等价零交互）」与「不确定」分开。
+#
+# 单位是自然对数交互尺度 I=log((PPL11/PPL10)/(PPL01/PPL00))：
+#   relative_pct=1.0  <=>  margin = log(1.01)  <=>  比值比在 [1/1.01, 1.01]
+# 这比「绝对 log 差」更可解释，也不会让高 PPL 基线机械地获得更大的区间。
+# 每个声明的 factorial 必须有 margin；`audit_gates.py interaction_sesoi`
+# 在定义点检查覆盖、单位和正性。缺 margin 时交互仍报告，但只能标
+# not_declared，不能声称可加或可删。
+INTERACTION_SESOI = {
+    'dynamic_blocking_x_learned_selection': {
+        'relative_pct': 1.0,
+        'rationale': ('A learned-selection benefit that changes by <1% of its '
+                      'ratio-of-ratios when dynamic blocking is active is treated '
+                      'as practically additive at this study scale.'),
+    },
+    'dynamic_blocking_x_content_pooling': {
+        'relative_pct': 1.0,
+        'rationale': ('A content-pooling benefit that changes by <1% of its '
+                      'ratio-of-ratios across blocking regimes is treated as '
+                      'practically additive.'),
+    },
+    'dynamic_blocking_x_attention_sink': {
+        'relative_pct': 1.0,
+        'rationale': ('A sink benefit that changes by <1% of its ratio-of-ratios '
+                      'across blocking regimes is treated as practically additive.'),
     },
 }
 
@@ -29472,6 +29845,99 @@ def factorial_design_audit(design=None, present=None, factory=None, n_layers=6):
     return report
 
 
+def interaction_sesoi_audit(design=None, sesoi=None):
+    """Zero-GPU gate: every declared 2x2 interaction carries a valid SESOI.
+
+    A non-significant interaction is not evidence of additivity; only a
+    pre-registered margin + TOST can produce an ``additive`` verdict.  This
+    gate therefore fails closed when a factorial has no margin, when the
+    margin is malformed/ambiguous, or when the corresponding interaction
+    hypothesis lacks a directional sign.  Extra factorial names are warnings
+    (a typo also leaves the intended factorial unmargined, which fails).  It
+    does not inspect results or choose a margin.
+    """
+    design = FACTORIAL_DESIGN if design is None else design
+    spec = INTERACTION_SESOI if sesoi is None else sesoi
+    out = {
+        'kind': 'interaction_sesoi', 'status': 'ok',
+        'factorials': {}, 'problems': [], 'warnings': [],
+        'policy': {
+            'scale': ('natural-log ratio-of-ratios; relative_pct p is '
+                      'converted to log1p(p/100)'),
+            'equivalence': ('paired TOST at alpha, Holm-adjusted across the '
+                            'declared interaction family'),
+            'non_significant_is_not_additivity': True,
+            'sub_sesoi_is_not_zero': True,
+        },
+    }
+    if not isinstance(design, dict):
+        out['status'] = 'fail'
+        out['problems'].append(
+            f'factorial design must be a mapping, got {type(design).__name__}')
+        return out
+    if not design:
+        out['status'] = 'not_applicable'
+        out['note'] = 'no factorial design is declared'
+        return out
+    try:
+        norm = _normalise_interaction_sesoi_design(spec)
+    except Exception as e:
+        out['status'] = 'fail'
+        out['problems'].append(
+            f'interaction SESOI declaration is malformed: '
+            f'{type(e).__name__}: {e}')
+        return out
+    for name, decl in design.items():
+        sname = str(name)
+        rec = {'declared': sname in norm}
+        out['factorials'][sname] = rec
+        if not isinstance(decl, dict):
+            out['problems'].append(
+                f'{sname}: factorial declaration must be a mapping, got '
+                f'{type(decl).__name__}')
+            continue
+        if sname not in norm:
+            out['problems'].append(
+                f'{sname}: no pre-registered interaction SESOI margin; a '
+                'non-significant interaction cannot be called additive')
+            continue
+        rec['margin_spec'] = dict(norm[sname])
+        rec['margin_log_ratio'] = norm[sname]['margin_log_ratio']
+        rec['margin_ratio'] = (
+            float(math.exp(norm[sname]['margin_log_ratio']))
+            if norm[sname]['margin_log_ratio'] < 700.0 else None)
+        if not str(norm[sname].get('rationale') or '').strip():
+            out['warnings'].append(
+                f'{sname}: interaction margin has no recorded rationale')
+        if (norm[sname].get('relative_pct') is not None
+                and norm[sname]['relative_pct'] > 50.0):
+            out['warnings'].append(
+                f'{sname}: relative interaction SESOI is >50% of the '
+                'ratio-of-ratios; verify this is intentional')
+        hname = str(decl.get('hypothesis') or sname)
+        hyp = INTERACTION_HYPOTHESIS_DESIGN.get(hname)
+        if not isinstance(hyp, dict):
+            out['problems'].append(
+                f'{sname}: no pre-registered interaction hypothesis named '
+                f'{hname!r}')
+            continue
+        pred = hyp.get('predicted_sign')
+        if isinstance(pred, bool) or pred not in (-1, 0, 1):
+            out['problems'].append(
+                f'{sname}: interaction hypothesis {hname!r} has no valid '
+                f'predicted_sign (got {pred!r})')
+        rec['hypothesis'] = hname
+        rec['predicted_sign'] = pred
+    extras = sorted(set(norm) - {str(k) for k in design})
+    if extras:
+        out['warnings'].append(
+            'interaction SESOI declares factorial(s) not present in the '
+            'design: ' + ', '.join(extras))
+    if out['problems']:
+        out['status'] = 'fail'
+    return out
+
+
 def _factorial_condition_rows(recs, cells, *, strict_hyper=True):
     """Per-seed 2x2 cells with the same controlled-pair gate as the LOO audit.
 
@@ -29577,7 +30043,8 @@ def _factorial_condition_rows(recs, cells, *, strict_hyper=True):
 
 
 def factorial_interaction_audit(summary=None, design=None, *, alpha=0.05,
-                                min_n=3, recs=None, hypotheses=None):
+                                min_n=3, recs=None, hypotheses=None,
+                                sesoi=None):
     """Paired 2x2 interaction tests for the declared ablation factorials.
 
     The estimand is the *change* in a paired effect: for each seed,
@@ -29592,6 +30059,13 @@ def factorial_interaction_audit(summary=None, design=None, *, alpha=0.05,
     changes the leave-one-out or frozen confirmatory Holm families.  Missing
     or uncontrolled factorials keep a dummy p=1 slot, so an incomplete 2x2
     panel cannot shrink the correction and buy significance.
+
+    ``sesoi`` maps factorial name -> pre-registered margin (default
+    ``INTERACTION_SESOI``; pass ``{}`` to disable the practical layer).  When
+    a margin exists, a paired TOST on the interaction gets its own Holm family
+    and yields an ``additive`` verdict only if the interval lies inside the
+    margin.  A non-significant interaction without that test stays
+    ``indeterminate``; it is never evidence of additivity.
     """
     alpha = _validated_alpha(alpha, context='factorial_interaction_audit alpha')
     _min_n = _as_seed_int(min_n)
@@ -29602,12 +30076,26 @@ def factorial_interaction_audit(summary=None, design=None, *, alpha=0.05,
     design = FACTORIAL_DESIGN if design is None else design
     hypotheses = (INTERACTION_HYPOTHESIS_DESIGN
                   if hypotheses is None else hypotheses)
+    try:
+        sesoi_specs = _normalise_interaction_sesoi_design(
+            INTERACTION_SESOI if sesoi is None else sesoi)
+        sesoi_error = None
+    except ValueError as e:
+        sesoi_specs = {}
+        sesoi_error = f'{type(e).__name__}: {e}'
+    empty_extra = {'equivalent_interactions': [],
+                   'hypothesis_supported_interactions': [],
+                   'sub_sesoi_interactions': [],
+                   'indeterminate_interactions': [],
+                   'not_measured_interactions': [],
+                   'not_declared_interactions': [],
+                   'sesoi': {'declared': sorted(sesoi_specs), 'error': sesoi_error}}
     if not isinstance(design, dict) or not design:
         return {'kind': 'factorial_interaction', 'status': 'not_applicable',
                 'factorials': {}, 'family': {},
                 'significant_interactions': [],
                 'direction_conflict_interactions': [], 'warnings': [],
-                'note': 'no factorial design is declared'}
+                'note': 'no factorial design is declared', **empty_extra}
     if recs is None:
         recs, _amb = _variant_seed_map(summary or {})
     startup_warnings = []
@@ -29617,7 +30105,7 @@ def factorial_interaction_audit(summary=None, design=None, *, alpha=0.05,
                 'significant_interactions': [],
                 'direction_conflict_interactions': [],
                 'warnings': [f'records must be a mapping, got {type(recs).__name__}'],
-                'note': 'no usable factorial records were supplied'}
+                'note': 'no usable factorial records were supplied', **empty_extra}
     present = set()
     for _key in recs:
         if not (isinstance(_key, tuple) and len(_key) == 3):
@@ -29651,19 +30139,49 @@ def factorial_interaction_audit(summary=None, design=None, *, alpha=0.05,
                 'direction_conflict_interactions': [],
                 'warnings': startup_warnings,
                 'note': ('this panel contains none of the arms declared by a '
-                         '2x2 factorial; no interaction is measured here')}
+                         '2x2 factorial; no interaction is measured here'),
+                **empty_extra}
     out = {'kind': 'factorial_interaction', 'status': 'ok',
            'alpha': float(alpha), 'min_n': min_n, 'factorials': {},
            'family': {}, 'significant_interactions': [],
            'direction_conflict_interactions': [],
+           'equivalent_interactions': [],
+           'hypothesis_supported_interactions': [],
+           'sub_sesoi_interactions': [],
+           'indeterminate_interactions': [],
+           'not_measured_interactions': [],
+           'not_declared_interactions': [],
+           'sesoi': {
+               'declared': sorted(sesoi_specs),
+               'error': sesoi_error,
+               'policy': {
+                   'scale': ('natural-log ratio-of-ratios; relative_pct p is '
+                             'converted to log1p(p/100)'),
+                   'test': ('paired TOST at alpha over the interaction '
+                            'family; Holm-adjusted TOST p required'),
+                   'non_significant_is_not_additivity': True,
+                   'sub_sesoi_is_not_zero': True,
+                   'equivalence_scope': ('practical additivity inside the '
+                                         'declared margin, not exact zero '
+                                         'interaction'),
+               },
+           },
            'warnings': list(startup_warnings),
            'claim_level': ('exploratory interaction family; never part of the '
                            'leave-one-out or frozen confirmatory correction'),
            'note': ('positive interaction = the second factor adds less when the '
                     'first is active (sub-additive); negative = synergy. A '
                     'non-significant interaction is not evidence that the '
-                    'effects are additive.')}
+                    'effects are additive; only a pre-registered SESOI + TOST '
+                    'can support an additive_within_sesoi verdict.')}
+    if sesoi_error is not None:
+        out['status'] = 'fail'
+        out['warnings'].append(
+            f'interaction SESOI is malformed; no practical interaction claim '
+            f'is allowed: {sesoi_error}')
     family = []
+    tost_family = []
+    interaction_values = {}
     for name, spec in design.items():
         if not isinstance(spec, dict):
             out['warnings'].append(f'{name}: factorial declaration is not a mapping')
@@ -29709,6 +30227,9 @@ def factorial_interaction_audit(summary=None, design=None, *, alpha=0.05,
                'n_present_cells': len(present_arms), 'status': 'incomplete',
                'interaction': {'available': False}}
         out['factorials'][str(name)] = rec
+        _sesoi_spec = sesoi_specs.get(str(name))
+        _margin = (_sesoi_spec.get('margin_log_ratio')
+                   if isinstance(_sesoi_spec, dict) else None)
         if len(present_arms) < 4:
             missing = sorted(set(arms) - present_arms)
             rec['missing_arms'] = missing
@@ -29717,6 +30238,24 @@ def factorial_interaction_audit(summary=None, design=None, *, alpha=0.05,
                 f'{name}: 2x2 interaction is incomplete (missing '
                 + ', '.join(missing) + '); its family slot is kept at p=1')
             family.append((str(name), 1.0))
+            if _margin is None:
+                rec['practical_decision'] = 'not_declared'
+                rec['sesoi'] = {
+                    'declared': False, 'margin_log_ratio': None,
+                    'decision': 'not_declared', 'claim': 'not_declared',
+                    'reason': 'no pre-registered interaction SESOI was supplied',
+                }
+                if sesoi_specs:
+                    tost_family.append((str(name), 1.0))
+            else:
+                rec['practical_decision'] = 'not_measured'
+                rec['sesoi'] = {
+                    'declared': True,
+                    'margin_log_ratio': float(_margin),
+                    'decision': 'not_measured', 'claim': 'not_measured',
+                    'reason': 'missing 2x2 cell(s); additivity cannot be certified',
+                }
+                tost_family.append((str(name), 1.0))
             continue
         rows, skipped, param = _factorial_condition_rows(recs, norm_cells)
         rec['n_complete'] = len(rows)
@@ -29730,6 +30269,24 @@ def factorial_interaction_audit(summary=None, design=None, *, alpha=0.05,
             out['warnings'].append(f'{name}: no complete 2x2 seed remains; '
                                    'its family slot is kept at p=1')
             family.append((str(name), 1.0))
+            if _margin is None:
+                rec['practical_decision'] = 'not_declared'
+                rec['sesoi'] = {
+                    'declared': False, 'margin_log_ratio': None,
+                    'decision': 'not_declared', 'claim': 'not_declared',
+                    'reason': 'no pre-registered interaction SESOI was supplied',
+                }
+                if sesoi_specs:
+                    tost_family.append((str(name), 1.0))
+            else:
+                rec['practical_decision'] = 'not_measured'
+                rec['sesoi'] = {
+                    'declared': True,
+                    'margin_log_ratio': float(_margin),
+                    'decision': 'not_measured', 'claim': 'not_measured',
+                    'reason': 'no controlled 2x2 seed; additivity cannot be certified',
+                }
+                tost_family.append((str(name), 1.0))
             continue
         st = paired_effect_stats([r['interaction_log_ppl'] for r in rows],
                                  alpha=alpha, min_n=min_n,
@@ -29770,6 +30327,7 @@ def factorial_interaction_audit(summary=None, design=None, *, alpha=0.05,
             'direction_consistent': (None if pred not in (-1, 0, 1) or obs is None
                                      else (pred == 0 or pred == obs)),
             'p_holm': None,
+            'p_tost_holm': None,
             'significant_family': False,
             'role': 'exploratory interaction (separate Holm family)',
         })
@@ -29791,8 +30349,34 @@ def factorial_interaction_audit(summary=None, design=None, *, alpha=0.05,
                        if (isinstance(st.get('p_exact_signflip'), (int, float))
                            and math.isfinite(float(st['p_exact_signflip'])))
                        else 1.0))
+        _vals = [float(r['interaction_log_ppl']) for r in rows]
+        interaction_values[str(name)] = _vals
+        if _sesoi_spec is None:
+            rec['practical_decision'] = 'not_declared'
+            cell['practical_decision'] = 'not_declared'
+            cell['sesoi'] = {
+                'declared': False, 'margin_log_ratio': None,
+                'decision': 'not_declared', 'claim': 'not_declared',
+                'reason': 'no pre-registered interaction SESOI was supplied',
+            }
+            if sesoi_specs:
+                tost_family.append((str(name), 1.0))
+        else:
+            _dir = pred if pred in (-1, 0, 1) else 0
+            _pd = interaction_practical_decision(
+                _vals, margin=float(_margin), alpha=alpha, min_n=min_n,
+                direction=_dir, label=str(name))
+            rec['practical_decision'] = _pd['decision']
+            cell['sesoi'] = _pd
+            cell['practical_decision'] = _pd['decision']
+            _pt = _pd.get('tost_p_tost')
+            tost_family.append((
+                str(name),
+                float(_pt) if (isinstance(_pt, (int, float))
+                               and math.isfinite(float(_pt))) else 1.0))
     if not out['factorials']:
-        out['status'] = 'incomplete' if out['warnings'] else 'not_applicable'
+        if out['status'] != 'fail':
+            out['status'] = 'incomplete' if out['warnings'] else 'not_applicable'
         if not out['warnings']:
             out['note'] = ('no complete factorial declaration could be measured '
                            'from the supplied records')
@@ -29814,12 +30398,22 @@ def factorial_interaction_audit(summary=None, design=None, *, alpha=0.05,
                      'this family never changes the leave-one-out or frozen '
                      'confirmatory correction'),
         }
+        ht = holm_adjust(tost_family, alpha=alpha) if tost_family else {}
+        out['sesoi']['family'] = {
+            'm': len(tost_family),
+            'alpha': float(alpha),
+            'method': ('Holm step-down over the declared interaction TOSTs; '
+                       'missing interactions keep a p=1 slot'),
+            # TOST is a t-approximation and has no 2/2**n exact floor.
+            'min_attainable_p_holm': None,
+        }
         for name, _p in family:
             rec = out['factorials'].get(name) or {}
             cell = rec.get('interaction') or {}
             if not cell.get('available'):
                 continue
             cell['p_holm'] = (h.get(name) or {}).get('p_holm')
+            cell['p_tost_holm'] = (ht.get(name) or {}).get('p_holm')
             cell['significant_family'] = bool(
                 cell.get('significant')
                 and isinstance(cell.get('p_holm'), (int, float))
@@ -29828,7 +30422,42 @@ def factorial_interaction_audit(summary=None, design=None, *, alpha=0.05,
                 out['significant_interactions'].append(name)
                 if cell.get('direction_consistent') is False:
                     out['direction_conflict_interactions'].append(name)
-    if any(rec.get('status') != 'ok' for rec in out['factorials'].values()):
+            _spec = sesoi_specs.get(name)
+            _vals = interaction_values.get(name)
+            if _spec is not None and _vals:
+                _pred = cell.get('predicted_sign')
+                _dir = _pred if _pred in (-1, 0, 1) else 0
+                _pd = interaction_practical_decision(
+                    _vals, margin=float(_spec['margin_log_ratio']),
+                    alpha=alpha, min_n=min_n, direction=_dir,
+                    p_holm=cell.get('p_holm'),
+                    p_holm_tost=cell.get('p_tost_holm'),
+                    label=name)
+                rec['practical_decision'] = _pd['decision']
+                cell['sesoi'] = _pd
+                cell['practical_decision'] = _pd['decision']
+    # One classification pass over every declared factorial avoids duplicate
+    # list entries across complete, incomplete and no-data branches.
+    for name, rec in out['factorials'].items():
+        _pd = rec.get('practical_decision')
+        if _pd == 'additive':
+            out['equivalent_interactions'].append(name)
+        elif _pd == 'hypothesis_supported':
+            out['hypothesis_supported_interactions'].append(name)
+        elif _pd == 'sub_sesoi':
+            out['sub_sesoi_interactions'].append(name)
+        elif _pd == 'not_measured':
+            out['not_measured_interactions'].append(name)
+        elif _pd == 'not_declared':
+            out['not_declared_interactions'].append(name)
+        elif _pd == 'direction_conflict':
+            # Already listed in direction_conflict_interactions (family-sig).
+            pass
+        else:
+            out['indeterminate_interactions'].append(name)
+    if (out['status'] != 'fail'
+            and any(rec.get('status') != 'ok'
+                    for rec in out['factorials'].values())):
         out['status'] = 'incomplete'
     return out
 
