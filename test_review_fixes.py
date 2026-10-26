@@ -22758,6 +22758,135 @@ def t_paired_design_sensitivity_planning():
                for v in L.paired_design_sensitivity(6, 4)['violations'])
 
 
+
+def t_signflip_power_table_scales_exactly():
+    def _reference(deltas, m_family, alpha, qs, expected_sign):
+        abs_d = np.asarray([abs(float(x)) for x in deltas], dtype=float)
+        n = int(abs_d.size)
+        total = 1 << n
+        masks = np.arange(total, dtype=np.int64)[:, None]
+        bits = (1 << np.arange(n, dtype=np.int64))[None, :]
+        signs = np.where((masks & bits) != 0, 1.0, -1.0)
+        sums = signs @ abs_d
+        abs_sums = np.abs(sums)
+        p = (abs_sums[None, :] >= abs_sums[:, None] - 1e-12).mean(axis=1)
+        p_holm = np.minimum(1.0, p * float(m_family))
+        k_plus = np.asarray([bin(i).count('1') for i in range(total)], dtype=int)
+        if expected_sign == 'negative':
+            sign_ok = sums < 0
+            k_power = n - k_plus
+            k_same = k_power
+        elif expected_sign == 'positive':
+            sign_ok = sums > 0
+            k_power = k_plus
+            k_same = k_power
+        else:
+            sign_ok = np.ones(total, dtype=bool)
+            k_power = k_plus
+            k_same = np.maximum(k_plus, n - k_plus)
+        power = {}
+        for q in qs:
+            prob = (q ** k_power) * ((1.0 - q) ** (n - k_power))
+            power[f'q={q:.2f}'] = float(
+                (prob * ((p_holm < alpha) & sign_ok)).sum())
+        min_same = None
+        for s in range(n + 1):
+            sel = (k_same == s) & sign_ok
+            if sel.any() and float(p_holm[sel].min()) < alpha:
+                min_same = int(s)
+                break
+        return {'power': power, 'min_same_sign_for_alpha': min_same,
+                'min_attainable_p_holm': float(p_holm.min())}
+
+    qs = [0.5, 0.8, 0.95, 1.0]
+    for n in range(2, 10):
+        deltas = [0.2 + 0.11 * i for i in range(n)]
+        for expected_sign in ('positive', 'negative', None):
+            got = V12._signflip_power_table(deltas, 6, 0.05, qs, expected_sign)
+            ref = _reference(deltas, 6, 0.05, qs, expected_sign)
+            assert got['enumerated'] == 1 << n, got
+            for q in qs:
+                key = f'q={q:.2f}'
+                assert abs(got['power'][key] - ref['power'][key]) < 1e-12, (
+                    n, expected_sign, key, got['power'][key], ref['power'][key])
+            assert got['min_same_sign_for_alpha'] == ref['min_same_sign_for_alpha'], got
+            assert abs(got['min_attainable_p_holm']
+                       - ref['min_attainable_p_holm']) < 1e-15, got
+
+    # The old non-directional branch credited both all-positive and
+    # all-negative patterns with k=n at q=1, yielding power=2.  The actual
+    # positive-sign mass at q=1 is one pattern (power=1).
+    ones = V12._signflip_power_table([1.0] * 8, 6, 0.05, [1.0], None)
+    assert abs(ones['power']['q=1.00'] - 1.0) < 1e-12, ones
+    assert ones['min_same_sign_for_alpha'] == 8, ones
+    half = V12._signflip_power_table([1.0] * 8, 6, 0.05, [0.5], None)
+    assert abs(half['power']['q=0.50'] - 2.0 / 256.0) < 1e-12, half
+
+    big = V12._signflip_power_table(
+        [0.2 + 0.11 * i for i in range(16)], 8, 0.05, [0.95], 'negative')
+    assert big['n'] == 16 and big['enumerated'] == 1 << 16, big
+    assert 0.0 <= big['power']['q=0.95'] <= 1.0, big
+    assert big['min_attainable_p_holm'] > 0.0, big
+    try:
+        V12._signflip_power_table([1.0] * 21, 8, 0.05, [0.95], 'negative')
+    except ValueError as exc:
+        assert 'capped at n<=20' in str(exc), exc
+    else:
+        raise AssertionError('expected the n>20 power table to fail closed')
+
+
+def t_sensitivity_audit_validates_seed_and_comparison_identity():
+    with tempfile.TemporaryDirectory() as td:
+        mp = os.path.join(td, 'manifest.json')
+        manifest = {
+            'manifest_version': 3,
+            'seeds': list(range(12)),
+            'statistics': {'alpha': 0.05, 'min_power_for_test': 0.80},
+            'primary_comparisons': [
+                {'name': 'a', 'expected_sign': 'negative', 'sesoi': 0.01},
+            ],
+        }
+
+        def _audit():
+            with open(mp, 'w', encoding='utf-8') as f:
+                json.dump(manifest, f)
+            with contextlib.redirect_stdout(io.StringIO()):
+                return A.audit_design_sensitivity(
+                    manifest_path=mp, pilot_path=os.path.join(td, 'missing.json'))
+
+        manifest['seeds'] = list(range(11)) + [10]
+        rep = _audit()
+        assert rep['status'] == 'fail', rep
+        assert any('manifest.seeds contains duplicates' in v
+                   for v in rep['violations']), rep['violations']
+
+        manifest['seeds'] = list(range(12))
+        manifest['statistics']['n_seeds'] = 13
+        rep = _audit()
+        assert rep['status'] == 'fail', rep
+        assert any('statistics.n_seeds=13 does not equal len(seeds)=12' in v
+                   for v in rep['violations']), rep['violations']
+        manifest['statistics'].pop('n_seeds')
+
+        manifest['primary_comparisons'] = [
+            {'name': 'a', 'expected_sign': 'negative', 'sesoi': 0.01},
+            {'name': 'a', 'expected_sign': 'negative', 'sesoi': 0.01},
+        ]
+        rep = _audit()
+        assert rep['status'] == 'fail', rep
+        assert any('duplicate primary-comparison name' in v
+                   for v in rep['violations']), rep['violations']
+        assert len(rep['comparisons']) == 1, rep
+
+        manifest['primary_comparisons'] = [
+            {'name': 'a', 'expected_sign': 'negative', 'sesoi': 0.01,
+             'require_sesoi_power': 'false'},
+        ]
+        rep = _audit()
+        assert rep['status'] == 'fail', rep
+        assert any('must be a boolean' in v for v in rep['violations']), rep['violations']
+
+
 def t_audit_design_sensitivity_manifest_and_pilot():
     with tempfile.TemporaryDirectory() as td:
         mp = os.path.join(td, 'manifest.json')
@@ -23374,6 +23503,10 @@ def main():
            t_paired_design_sensitivity_planning)
     _check('L199 sensitivity audit joins manifest, pilot artifact, and SESOI gate',
            t_audit_design_sensitivity_manifest_and_pilot)
+    _check('L200 sign-flip power table scales exactly to the 16-seed panel',
+           t_signflip_power_table_scales_exactly)
+    _check('L201 sensitivity audit validates seed and comparison identity',
+           t_sensitivity_audit_validates_seed_and_comparison_identity)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

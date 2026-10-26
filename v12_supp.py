@@ -4067,42 +4067,66 @@ def _signflip_power_table(abs_d, m_family, alpha, qs, expected_sign):
     Holm is screened conservatively as min(1, m*p).  Power at q is the
     q**k (1-q)**(n-k) mass of patterns that reject *and* point in the
     pre-registered direction.  This is the simulation the manifest asks for
-    before the one-shot test; it is exact for n<=13 and refuses larger n.
+    before the one-shot test.
+
+    The rank of every pattern is obtained by sorting the 2**n null sums once
+    (O(2**n log 2**n)) instead of building the all-pairs comparison matrix
+    (O(4**n) time and memory), so the exact table remains usable for the
+    16-seed dynamic panel and remains bounded at n<=20.  Larger panels refuse
+    explicitly rather than silently exhausting memory; the exact sign-flip
+    analysis itself switches to meet-in-the-middle/saddlepoint above that
+    point, but conditional power still needs every sign pattern.
     """
     abs_d = np.asarray([abs(float(x)) for x in abs_d], dtype=float)
     n = int(abs_d.size)
     if n < 2:
         raise ValueError('power needs at least two paired deltas')
-    if n > 13:
-        raise ValueError(f'power enumeration is capped at n<=13 (got {n}); split the panel or add a Monte-Carlo path consciously')
+    if n > 20:
+        raise ValueError(f'power enumeration is capped at n<=20 (got {n}); split the panel or add a Monte-Carlo path consciously')
     total = 1 << n
-    masks = np.arange(total, dtype=np.int64)[:, None]
     bits = (1 << np.arange(n, dtype=np.int64))[None, :]
-    signs = np.where((masks & bits) != 0, 1.0, -1.0)
-    sums = signs @ abs_d
-    abs_sums = np.abs(sums)
-    # p[j] = P_null(|sum| >= |sum_j|), the exact two-sided sign-flip p of the
-    # pattern whose observed signed sum is sums[j].
-    p = (abs_sums[None, :] >= abs_sums[:, None] - 1e-12).mean(axis=1)
+    _idx = np.arange(total, dtype=np.int64)
+    try:
+        k_plus = np.bitwise_count(_idx)
+    except AttributeError:
+        k_plus = np.fromiter((int(i).bit_count() for i in _idx),
+                             dtype=np.int16, count=total)
+    abs_sums = np.empty(total, dtype=float)
+    k_power = np.empty(total, dtype=np.int16)
+    k_same = np.empty(total, dtype=np.int16)
+    sign_ok = np.empty(total, dtype=bool)
+    step = max(1, min(total, (1 << 18) // max(n, 1)))
+    for off in range(0, total, step):
+        bs = min(step, total - off)
+        masks = np.arange(off, off + bs, dtype=np.int64)[:, None]
+        signs = np.where((masks & bits) != 0, 1.0, -1.0)
+        sums = signs @ abs_d
+        abs_sums[off:off + bs] = np.abs(sums)
+        _kp = k_plus[off:off + bs]
+        if expected_sign == 'negative':
+            sign_ok[off:off + bs] = sums < 0
+            k_power[off:off + bs] = n - _kp
+            k_same[off:off + bs] = n - _kp
+        elif expected_sign == 'positive':
+            sign_ok[off:off + bs] = sums > 0
+            k_power[off:off + bs] = _kp
+            k_same[off:off + bs] = _kp
+        else:
+            sign_ok[off:off + bs] = True
+            k_power[off:off + bs] = _kp
+            k_same[off:off + bs] = np.maximum(_kp, n - _kp)
+    sorted_abs = np.sort(abs_sums)
+    p = (total - np.searchsorted(sorted_abs, abs_sums - 1e-12,
+                                 side='left')) / float(total)
     p_holm = np.minimum(1.0, p * float(m_family))
-    k_plus = np.asarray([bin(i).count('1') for i in range(total)], dtype=int)
-    if expected_sign == 'negative':
-        sign_ok = sums < 0
-        k_expected = n - k_plus
-    elif expected_sign == 'positive':
-        sign_ok = sums > 0
-        k_expected = k_plus
-    else:
-        sign_ok = np.ones(total, dtype=bool)
-        k_expected = np.maximum(k_plus, n - k_plus)
     power = {}
     for q in qs:
         q = float(q)
-        prob = (q ** k_expected) * ((1.0 - q) ** (n - k_expected))
+        prob = (q ** k_power) * ((1.0 - q) ** (n - k_power))
         power[f'q={q:.2f}'] = float((prob * ((p_holm < alpha) & sign_ok)).sum())
     min_same = None
     for s in range(n + 1):
-        sel = (k_expected == s) & sign_ok
+        sel = (k_same == s) & sign_ok
         if sel.any() and float(p_holm[sel].min()) < alpha:
             min_same = int(s)
             break
@@ -4192,13 +4216,15 @@ def run_power(manifest_path=FREEZE_MANIFEST, summary='results_v10_mech/summary.j
         _sesoi = comp.get('sesoi')
         if _sesoi is None:
             _sesoi = stat.get('sesoi')
+        _require_sesoi = (comp['require_sesoi_power']
+                          if 'require_sesoi_power' in comp
+                          else stat.get('require_sesoi_power', False))
         _sens = L.paired_design_sensitivity(
             len(manifest['seeds']), m_family, alpha=alpha,
             target_power=min_power,
             pilot_deltas=(dl if len(dl) >= 2 else None),
             expected_sign=exp, sesoi=_sesoi,
-            require_sesoi_power=bool(comp.get('require_sesoi_power')
-                                     or stat.get('require_sesoi_power')))
+            require_sesoi_power=_require_sesoi)
         cell['sensitivity'] = _sens
         if _sens.get('status') == 'fail':
             all_pass = False

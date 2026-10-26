@@ -4159,6 +4159,26 @@ def audit_design_sensitivity(manifest_path=None,
     if n is None or n < 2:
         out['violations'].append(
             f'manifest.seeds must be a list with at least two seeds, got {seeds!r}')
+    elif isinstance(seeds, list):
+        _seed_vals = []
+        for _i, _s in enumerate(seeds):
+            _sv = L._as_seed_int(_s)
+            if _sv is None or _sv < 0:
+                out['violations'].append(
+                    f'manifest.seeds[{_i}]={_s!r} is not a non-negative integer seed')
+            else:
+                _seed_vals.append(_sv)
+        if len(set(_seed_vals)) != len(_seed_vals):
+            out['violations'].append(
+                'manifest.seeds contains duplicates; the power floor would be '
+                'computed from a seed count that the panel cannot realise')
+        _n_stat = L._as_seed_int(stat.get('n_seeds'))
+        if 'n_seeds' in stat and _n_stat is None:
+            out['violations'].append(
+                f'statistics.n_seeds={stat.get("n_seeds")!r} is not an integer')
+        elif _n_stat is not None and _n_stat != n:
+            out['violations'].append(
+                f'statistics.n_seeds={_n_stat} does not equal len(seeds)={n}')
     if m is None or m < 1:
         out['violations'].append(
             f'manifest.primary_comparisons must be a non-empty list, got {comps!r}')
@@ -4176,12 +4196,20 @@ def audit_design_sensitivity(manifest_path=None,
             'or run `python v12_supp.py power` before relying on MDE/SESOI '
             'readouts')
     pilot_cells = 0
+    _seen_names = set()
     for comp in comps:
         if not isinstance(comp, dict):
             out['violations'].append(
                 f'primary comparison is not an object: {comp!r}')
             continue
         name = str(comp.get('name') or f'comparison_{len(out["comparisons"])}')
+        if name in _seen_names:
+            out['violations'].append(
+                f'duplicate primary-comparison name {name!r}; the family size '
+                'counts it twice but a name-keyed report can only hold one, so '
+                'the Holm family and the per-comparison readout would disagree')
+            continue
+        _seen_names.add(name)
         pcell = pilot_comps.get(name) if isinstance(pilot_comps, dict) else None
         deltas = pcell.get('deltas') if isinstance(pcell, dict) else None
         if not isinstance(deltas, list):
@@ -4191,8 +4219,9 @@ def audit_design_sensitivity(manifest_path=None,
         sesoi = comp.get('sesoi')
         if sesoi is None:
             sesoi = stat.get('sesoi')
-        require_sesoi = bool(comp.get('require_sesoi_power')
-                             or stat.get('require_sesoi_power'))
+        require_sesoi = (comp['require_sesoi_power']
+                         if 'require_sesoi_power' in comp
+                         else stat.get('require_sesoi_power', False))
         rep = L.paired_design_sensitivity(
             n, m or 0, alpha=out['alpha'],
             target_power=out['target_power'], pilot_deltas=deltas,
