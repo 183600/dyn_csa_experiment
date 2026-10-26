@@ -204,6 +204,13 @@ def t_chi2_large_df_tail():
     assert abs(L.chi2_sf(1_000_000.0, 1_000_000.0) - 0.4998119368033945) < 1e-11
     assert abs(L.chi2_sf(10_000_000.0, 10_000_000.0) - 0.4999405291960622) < 1e-11
     assert abs(L.chi2_sf(3.841458820694124, 1.0) - 0.05) < 1e-10
+    # Scale-up: the recurrence's `a + 1` used to round back to `a` (b == 0,
+    # ZeroDivisionError), and the direct series needed billions of terms and
+    # lost accuracy before that.  Both huge-shape cases must stay fast and
+    # accurate (reference values from SciPy's gammaincc).
+    assert abs(L._gammaincc(1e15, 1e15) - 0.4999999957947791) < 1e-12
+    assert abs(L._gammaincc(1e16, 1e16) - 0.4999999986701924) < 1e-12
+    assert abs(L.chi2_sf(1e16, 1e16) - 0.49999999811936807) < 1e-12
 
 
 def t_safe_exp_and_doc_ci():
@@ -22578,6 +22585,19 @@ def t_student_t_large_df_tail():
     assert abs(L._student_t_sf(20.0, 1e20) - 2.7536241186063325e-89) < 1e-100
     assert abs(L._student_t_sf(20.0, float('inf'))
                - L._student_t_sf(20.0, 1e20)) < 1e-100
+    # In the 1e7 <= df < 1e15 / |t| > 10 region the incomplete-beta fallback
+    # loses up to ~2e-2 relative accuracy; the 1/df expansion must be used
+    # there too (reference values from high-precision mpmath).
+    assert abs(L._student_t_sf(11.0, 1e10)
+               - 1.9106602853626618e-28) < 1e-40
+    assert abs(L._student_t_sf(20.0, 1e12)
+               - 2.7536242293012506e-89) < 1e-100
+    assert abs(L._student_t_sf(11.0, 1e14)
+               - 1.9106595745697621e-28) < 1e-40
+    assert abs(L._student_t_sf(15.0, 1e8)
+               - 3.6714349561714935e-51) < 1e-60
+    assert abs(L._student_t_sf(20.0, 1e7)
+               - 2.7647156034788507e-89) < 1e-99
 
 
 def main():

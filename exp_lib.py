@@ -16137,6 +16137,21 @@ def _gammaincc(a, x):
         return float('nan')
     if x == 0.0:
         return 1.0
+    # For a large shape parameter the direct series needs O(sqrt(a)) terms
+    # (billions of iterations at a~1e16), loses cancellation accuracy in the
+    # tail, and its recurrence uses `a + 1.0`; once `a >= 2**53` that addition
+    # rounds back to `a`, leaving the continued fraction with b == 0 and a
+    # ZeroDivisionError.  Torch is already a runtime dependency and its
+    # regularized incomplete gamma is stable for float64 across this scale.
+    if a >= 1e7:
+        try:
+            _q = torch.special.gammaincc(
+                torch.tensor(float(a), dtype=torch.float64),
+                torch.tensor(float(x), dtype=torch.float64)).item()
+        except Exception:
+            _q = float('nan')
+        if math.isfinite(_q):
+            return float(min(1.0, max(0.0, _q)))
     gln = math.lgamma(a)
     if x < a + 1.0:
         ap = float(a)
@@ -16168,7 +16183,12 @@ def _gammaincc(a, x):
         p = s * math.exp(log_pref)
         return float(min(1.0, max(0.0, 1.0 - p)))
     tiny = 1e-300
-    b = x + 1.0 - a
+    # Keep the subtraction from cancelling to zero at the float resolution
+    # limit (x == a there); the mathematically equivalent `(x-a) + 1` is
+    # exact for this branch and never feeds a zero denominator.
+    b = (x - a) + 1.0
+    if b <= 0.0:
+        return float('nan')
     c = 1.0 / tiny
     d = 1.0 / b
     h = d
@@ -16300,7 +16320,12 @@ def _student_t_sf(t, df):
         return 1.0
     if not math.isfinite(t):
         return float('nan')
-    if df >= 10000.0 and (df >= 1e15 or abs(t) <= 10.0):
+    # The 1/df expansion is more accurate than the incomplete-beta route for
+    # large df at both moderate and extreme t.  At df=1e10, |t|=11 the latter
+    # has ~1e-5 relative error, and by df=1e14 it is ~2e-2.  Keep the
+    # incomplete-beta path where it is still the accurate choice (df < 1e4,
+    # or |t| > 10 between df=1e4 and 1e7).
+    if df >= 1e7 or (df >= 10000.0 and abs(t) <= 10.0):
         tail = _student_t_sf_large_df(abs(t), df)
     else:
         x = df / (df + t * t)
