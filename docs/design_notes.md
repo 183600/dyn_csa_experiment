@@ -4485,3 +4485,107 @@ L196 覆盖正向支持/反向冲突/亚 SESOI/精确可加/不确定/n<min_n/�
 畸形族 p 的 fail-closed、方向/ margin 输入校验与 normaliser 幂等。
 完整 CPU 套件 546/546 通过（0 skipped）；`python v12_supp.py plan` 仍
 72/72 合成冻结记录、6 个比较。
+
+## 68. 设计期功效必须对实际 margin 负责：MDE、精度与所需种子数
+
+### 68.1 问题：能检出「非零」不等于能检出「值得关心」
+
+已有两层功效检查：
+
+- `planned_power_audit` 检查冻结的 n/m/α、`2/2^n` 与 Holm 下限是否自洽，
+  以及声明的 q 处投影功效是否达到 `min_power_for_test`；
+- `v12_supp.py power` 在 validation 差值上枚举 `2^12` 个符号模式，给出
+  条件功效与最小同向种子数。
+
+两者都回答「这个计划在某个 q 下有多大概率通过第一道 Holm 门」，但没有
+回答实验设计更基本的问题：**n=12、m=6 能分辨多大的实际效应？** 一个很小
+的效应在 n 足够大时也会显著，却可能远低于研究真正关心的最小实际效应
+（SESOI）。§56/§67 已给留一消融和 2×2 交互加了 SESOI + TOST，但确认性
+主对照本身仍没有 MDE、区间半宽或「在 SESOI 处的功效」读数。预注册若只写
+「12 seeds, q=0.95」，读者无法判断这 12 个种子是为哪个效应量准备的。
+
+### 68.2 方法：把 pilot SD、SESOI 与 sign-flip 计划连接起来
+
+新增 `exp_lib.paired_design_sensitivity()`：
+
+```python
+rep = paired_design_sensitivity(
+    12, 6, alpha=0.05, target_power=0.80,
+    pilot_deltas=validation_deltas, expected_sign='negative',
+    sesoi=0.5, target_halfwidth=0.2,
+    require_sesoi_power=False)
+```
+
+输入是设计参数、一个 pilot/validation 配对差值向量（或只给 `pilot_sd`）、
+可选 SESOI 与目标区间半宽。输出包括：
+
+- 精确符号翻转/Holm 下限：`p_floor`、`min_attainable_p_holm`；
+- 功效曲线：`q=0.50 ... q=0.99` 处的 `signflip_power`；
+- `min_q_for_target_power`：达到目标功效所需的最小同向率 q；
+- pilot 同向率 `q_sign_rate`、正态隐含的 `q_normal_implied`、当前 n 下的
+  功效，以及在目标功效下所需的最小 n；
+- **MDE**：在配对正态符号模型下
+  `MDE ≈ sigma * Phi^-1(q_target)`，其中 `q_target` 是达到目标功效所需的
+  最小 q；同时报告 `MDE / SESOI`；
+- **精度**：计划 n 下的配对 t 95% CI 半宽
+  `t_{0.975,n-1} * sigma / sqrt(n)`，以及达到目标半宽所需的 n；
+- **SESOI 处的功效**：`q_sesoi = Phi(|SESOI| / sigma)`，再用同一个
+  `signflip_power(n, m, q_sesoi, alpha)` 计算功效与所需 n。
+
+`require_sesoi_power=True` 时，缺 SESOI、缺 pilot SD、非方向性对照或
+SESOI 处功效不足都判 fail；默认 false 时只给 warning，并把
+`sesoi.status` 标成 `not_declared` / `not_verifiable` / `no_direction` /
+`underpowered`。审计**不会替研究虚构一个 margin**。
+
+### 68.3 接线
+
+- `v12_supp.py power` 的每条对照新增 `sensitivity` 块，用冻结的 n、m 与
+  同一条 validation 差值向量计算上述读数；不改变原有 q=0.95 功效门槛。
+  若 sensitivity 自身 fail（例如声明了 SESOI 但计划在 margin 处欠功效），
+  `all_pass` 会变 false，避免“声明了实际显著性却完全不检查”。
+- `python audit_gates.py sensitivity` 读取冻结清单和（可选的）
+  `analysis_v12/power_validation.json`；每条主对照输出同一结构。没有
+  power 产物时状态是 `not_verifiable`，不是绿色通过。
+- `python audit_gates.py report` 汇总里新增 `sensitivity` 块。
+- 现有冻结清单尚未声明主对照 SESOI，因此当前读数会明确 warning 并停在
+  `not_verifiable`；这是在暴露设计缺口，不是把缺失当成通过。下一次冻结
+  可以在首次 test 访问前显式声明 margin 并打开 `require_sesoi_power`。
+
+### 68.4 边界
+
+- **MDE 与 q_sesoi 是正态符号模型近似。** `signflip_power` 本身是等幅
+  符号检验投影；`|d_i|` 不等时它是真实 sign-flip 功效的上界。MDE 不是精确
+  sign-flip 效应量，只是设计期标尺，不能替代 `v12_supp.py power` 的
+  条件功效或最终数据。
+- **不是事后功效。** 函数只接受 pilot/validation 差值或显式 SD，不读取
+  test 结果；审计入口也不调用 `load_wikitest`。它不改变任何 PPL、种子、
+  终点、α、Holm 族、决策规则或 `CODE_SEMANTICS`。
+- **pilot 不是确认证据。** pilot 同向率高只说明设计前提暂时可行；不能把
+  pilot 的 p 值、MDE 或 SESOI 功效写进确认性结论。
+- **文档级精度不是种子级精度。** 这里的 `sigma` 是逐种子配对差值的 SD；
+  文档/文章层面的聚类区间需要 document-cluster SD，不能把本函数的 t 区间
+  当作 §54/§57 的单位级区间。
+- **没有 SESOI 就没有实际显著性结论。** 当前主对照仍只能报告统计方向与
+  区间；`sensitivity` 的 warning 是把 §49.4 的边界显式化，而不是新增一个
+  任意阈值。
+- **n 是计划种子数，不是 attrition 后的样本量。** 所需 n 搜索假设 pilot
+  q/SD 固定，且不建模记录缺失、seed 崩溃或 `min_complete_pairs` 低于计划
+  seeds 的情形；把这些损失纳入后，真实 MDE 只会更宽。需要保守设计时，应
+  用可完成配对数而不是名义 seed 数重跑本函数。
+- **n_max 是搜索上限。** 若在 `n_max` 内达不到目标功效，所需 n 返回
+  `None`；这表示当前设计参数下不可行，不是“需要更多种子”的自动许可。
+
+### 68.5 入口与验证
+
+```bash
+python audit_gates.py sensitivity   # 设计期：功效曲线/MDE/精度/SESOI
+python audit_gates.py report        # 汇总含 sensitivity
+python test_review_fixes.py         # L198/L199
+python v12_supp.py plan             # 冻结计划预检不变
+```
+
+L198 覆盖：12×6 的精确下限、功效曲线与公开 `signflip_power` 对账、
+pilot 同向率/方向、MDE 与 t 区间半宽、目标半宽所需 n、SESOI 充足/不足/
+仅警告/非方向性、缺 pilot、非法 α/target/SD/margin/±方向/字符串 n_max，
+以及 n=6,m=4 的分辨率失败。L199 覆盖 manifest + pilot artifact + SESOI 门的接线、缺 pilot 或对照名不匹配时的 `not_verifiable`，以及无 SESOI 时的 warning。完整 CPU 套件 550/550 通过（0 skipped）；
+`python v12_supp.py plan` 仍 72/72 合成冻结记录、6 个比较。

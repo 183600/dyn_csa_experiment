@@ -22691,6 +22691,130 @@ def t_student_t_large_df_tail():
                - 2.7647156034788507e-89) < 1e-99
 
 
+def t_paired_design_sensitivity_planning():
+    base = L.paired_design_sensitivity(
+        12, 6, alpha=0.05, target_power=0.80,
+        pilot_deltas=[-1.0] * 10 + [-0.5, -2.0], expected_sign='negative')
+    assert base['status'] == 'ok', base['violations']
+    assert base['n_seeds'] == 12 and base['m_family'] == 6
+    assert abs(base['p_floor'] - L.signflip_p_floor(12)) < 1e-15, base['p_floor']
+    assert abs(base['min_attainable_p_holm']
+               - L.holm_min_attainable_p(12, 6, 0.05)) < 1e-15
+    assert base['pilot']['q_sign_rate'] == 1.0, base['pilot']
+    assert base['pilot']['direction_ok'] is True, base['pilot']
+    assert 0.9 < base['min_q_for_target_power'] < 0.99, base['min_q_for_target_power']
+    assert abs(base['power_curve']['q=0.950']
+               - L.signflip_power(12, 6, 0.95, 0.05)) < 1e-15
+    assert base['mde']['absolute'] > 0.0, base['mde']
+    assert base['precision']['ci95_halfwidth'] > 0.0, base['precision']
+    assert base['pilot']['required_n_for_target_power'] <= 12, base['pilot']
+
+    tight = L.paired_design_sensitivity(
+        12, 6, target_power=0.80, pilot_sd=1.0, target_halfwidth=0.1)
+    assert tight['status'] == 'ok', tight['violations']
+    assert tight['precision']['meets_target'] is False, tight['precision']
+    assert tight['precision']['n_required_for_target_halfwidth'] > 12, tight['precision']
+    loose = L.paired_design_sensitivity(
+        12, 6, target_power=0.80, pilot_sd=1.0, target_halfwidth=1.0)
+    assert loose['precision']['meets_target'] is True, loose['precision']
+    assert loose['precision']['n_required_for_target_halfwidth'] <= 12, loose['precision']
+
+    big = L.paired_design_sensitivity(
+        12, 6, target_power=0.80, pilot_sd=1.0, expected_sign='positive',
+        sesoi=10.0, require_sesoi_power=True)
+    assert big['status'] == 'ok' and big['sesoi']['power_ok'] is True, big
+    small = L.paired_design_sensitivity(
+        12, 6, target_power=0.80, pilot_sd=1.0, expected_sign='positive',
+        sesoi=0.01, require_sesoi_power=True)
+    assert small['status'] == 'fail', small
+    assert small['sesoi']['status'] == 'underpowered', small['sesoi']
+    assert any('underpowered at the pre-registered SESOI' in v
+               for v in small['violations']), small['violations']
+    advisory = L.paired_design_sensitivity(
+        12, 6, target_power=0.80, pilot_sd=1.0, expected_sign='positive',
+        sesoi=0.01)
+    assert advisory['status'] == 'ok' and advisory['sesoi']['status'] == 'underpowered', advisory
+    assert any('SESOI' in w for w in advisory['warnings']), advisory['warnings']
+
+    nd = L.paired_design_sensitivity(
+        12, 6, pilot_deltas=[-1.0, 1.0, -2.0], expected_sign=None, sesoi=1.0)
+    assert nd['status'] == 'ok' and nd['sesoi']['status'] == 'no_direction', nd
+    bare = L.paired_design_sensitivity(12, 6)
+    assert bare['status'] == 'ok' and bare['pilot']['status'] == 'not_provided', bare
+    assert any('no pilot deltas or SD' in w for w in bare['warnings']), bare['warnings']
+    empty = L.paired_design_sensitivity(12, 6, pilot_deltas=[])
+    assert empty['status'] == 'ok' and empty['pilot']['status'] == 'not_provided', empty
+
+    for kwargs in (dict(alpha=float('nan')), dict(target_power=1.0),
+                   dict(pilot_sd=-1.0), dict(sesoi=True),
+                   dict(expected_sign='maybe'), dict(require_sesoi_power='yes'),
+                   dict(n_max=1), dict(pilot_deltas='abc'),
+                   dict(target_halfwidth=0.0)):
+        bad = L.paired_design_sensitivity(12, 6, **kwargs)
+        assert bad['status'] == 'fail', (kwargs, bad)
+    assert L.paired_design_sensitivity(True, 6)['status'] == 'fail'
+    assert L.paired_design_sensitivity(6, 4)['status'] == 'fail'
+    assert any('minimum attainable Holm p' in v
+               for v in L.paired_design_sensitivity(6, 4)['violations'])
+
+
+def t_audit_design_sensitivity_manifest_and_pilot():
+    with tempfile.TemporaryDirectory() as td:
+        mp = os.path.join(td, 'manifest.json')
+        pp = os.path.join(td, 'power_validation.json')
+        manifest = {
+            'manifest_version': 3,
+            'seeds': list(range(12)),
+            'statistics': {'alpha': 0.05, 'min_power_for_test': 0.80,
+                           'sesoi': 0.01, 'require_sesoi_power': True},
+            'primary_comparisons': [
+                {'name': 'a', 'expected_sign': 'negative',
+                 'sesoi': 0.01, 'require_sesoi_power': True},
+            ],
+        }
+        with open(mp, 'w', encoding='utf-8') as f:
+            json.dump(manifest, f)
+        with open(pp, 'w', encoding='utf-8') as f:
+            json.dump({'comparisons': {
+                'a': {'deltas': [-1.0] * 10 + [-0.5, -2.0]}}}, f)
+        with contextlib.redirect_stdout(io.StringIO()):
+            rep = A.audit_design_sensitivity(manifest_path=mp, pilot_path=pp)
+        assert rep['status'] == 'fail', rep
+        assert rep['pilot_status'] == 'available', rep
+        cell = rep['comparisons']['a']
+        assert cell['pilot']['status'] == 'available', cell['pilot']
+        assert cell['pilot']['n'] == 12, cell['pilot']
+        assert cell['sesoi']['status'] == 'underpowered', cell['sesoi']
+        assert any('a: require_sesoi_power=true and the planned n is '
+                   'underpowered' in v for v in rep['violations']), rep['violations']
+
+        manifest['statistics'].pop('sesoi')
+        manifest['statistics'].pop('require_sesoi_power')
+        manifest['primary_comparisons'][0].pop('sesoi')
+        manifest['primary_comparisons'][0].pop('require_sesoi_power')
+        with open(mp, 'w', encoding='utf-8') as f:
+            json.dump(manifest, f)
+        with contextlib.redirect_stdout(io.StringIO()):
+            rep2 = A.audit_design_sensitivity(manifest_path=mp, pilot_path=pp)
+        assert rep2['status'] == 'ok', rep2
+        assert rep2['comparisons']['a']['sesoi']['status'] == 'not_declared', rep2
+        assert any('declares no SESOI' in w for w in rep2['warnings']), rep2['warnings']
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            rep3 = A.audit_design_sensitivity(
+                manifest_path=mp, pilot_path=os.path.join(td, 'missing.json'))
+        assert rep3['status'] == 'not_verifiable', rep3
+        assert rep3['pilot_status'] == 'not_available', rep3
+
+        with open(pp, 'w', encoding='utf-8') as f:
+            json.dump({'comparisons': {'b': {'deltas': [-1.0, -2.0]}}}, f)
+        with contextlib.redirect_stdout(io.StringIO()):
+            rep4 = A.audit_design_sensitivity(manifest_path=mp, pilot_path=pp)
+        assert rep4['status'] == 'not_verifiable', rep4
+        assert rep4['pilot_status'] == 'no_matching_comparisons', rep4
+        assert any('none carry a deltas list' in w for w in rep4['warnings']), rep4['warnings']
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -23246,6 +23370,10 @@ def main():
            t_factorial_interaction_sesoi_decisions)
     _check('L197 interaction practical-decision primitives',
            t_interaction_practical_decision_primitives)
+    _check('L198 paired design sensitivity: power curve, MDE, precision, SESOI',
+           t_paired_design_sensitivity_planning)
+    _check('L199 sensitivity audit joins manifest, pilot artifact, and SESOI gate',
+           t_audit_design_sensitivity_manifest_and_pilot)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

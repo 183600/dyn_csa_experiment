@@ -4189,6 +4189,19 @@ def run_power(manifest_path=FREEZE_MANIFEST, summary='results_v10_mech/summary.j
         dl, used = _paired_len_deltas(recs_a, recs_b, common, Ln)
         cell = {'endpoint': f'by_len.ppl@{Ln}', 'n': len(dl), 'seeds': used,
                 'skipped_stale_records': skipped}
+        _sesoi = comp.get('sesoi')
+        if _sesoi is None:
+            _sesoi = stat.get('sesoi')
+        _sens = L.paired_design_sensitivity(
+            len(manifest['seeds']), m_family, alpha=alpha,
+            target_power=min_power,
+            pilot_deltas=(dl if len(dl) >= 2 else None),
+            expected_sign=exp, sesoi=_sesoi,
+            require_sesoi_power=bool(comp.get('require_sesoi_power')
+                                     or stat.get('require_sesoi_power')))
+        cell['sensitivity'] = _sens
+        if _sens.get('status') == 'fail':
+            all_pass = False
         if len(dl) >= 2 and exp in ('positive', 'negative'):
             obs = L.exact_signflip_p(dl)
             mean = float(np.mean(dl))

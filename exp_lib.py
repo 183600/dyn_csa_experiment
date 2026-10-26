@@ -19787,6 +19787,358 @@ def planned_power_audit(manifest, *, require_projection=False):
     return out
 
 
+def _normal_cdf(x):
+    return 0.5 * (1.0 + math.erf(float(x) / math.sqrt(2.0)))
+
+
+def _normal_quantile(p):
+    p = float(p)
+    if not (0.0 < p < 1.0):
+        return float('nan')
+    lo, hi = -9.0, 9.0
+    for _ in range(100):
+        mid = 0.5 * (lo + hi)
+        if _normal_cdf(mid) < p:
+            lo = mid
+        else:
+            hi = mid
+    return 0.5 * (lo + hi)
+
+
+def _design_direction(value):
+    if value is None:
+        return None, None
+    if isinstance(value, (bool, np.bool_)):
+        return None, f'expected_sign={value!r} must not be a boolean'
+    if isinstance(value, numbers.Real) and not isinstance(value, complex):
+        f = _finite_scalar(value)
+        if f in (-1.0, 1.0):
+            return int(f), None
+        return None, f'expected_sign={value!r} must be -1 or +1'
+    text = str(value).strip().lower()
+    if text in ('positive', '+', '+1', '1'):
+        return 1, None
+    if text in ('negative', '-', '-1'):
+        return -1, None
+    return None, f'expected_sign={value!r} must be positive, negative, -1, +1, or null'
+
+
+def _q_for_target_power(n_seeds, m_comparisons, target_power, alpha):
+    if signflip_power(n_seeds, m_comparisons, 1.0, alpha) + 1e-15 < target_power:
+        return None
+    lo, hi = 0.5, 1.0
+    for _ in range(80):
+        mid = 0.5 * (lo + hi)
+        if signflip_power(n_seeds, m_comparisons, mid, alpha) >= target_power:
+            hi = mid
+        else:
+            lo = mid
+    return float(hi)
+
+
+def _n_for_target_power(n_seeds, m_comparisons, q, target_power, alpha, n_max):
+    if q is None or q <= 0.5:
+        return None
+    for n in range(2, int(n_max) + 1):
+        if signflip_power(n, m_comparisons, q, alpha) + 1e-15 >= target_power:
+            return int(n)
+    return None
+
+
+def paired_design_sensitivity(n_seeds, m_comparisons, *, alpha=0.05,
+                              target_power=0.80, pilot_deltas=None,
+                              pilot_sd=None, sesoi=None, expected_sign=None,
+                              target_halfwidth=None,
+                              require_sesoi_power=False, n_max=512):
+    """Design-stage power, MDE and precision for a paired seed panel.
+
+    This audit answers a question the p-value floor and the declared-q power
+    projection cannot answer: *what effect size can this panel actually
+    resolve, and is that enough for the pre-registered practical margin?*
+
+    It is deliberately separate from ``planned_power_audit``.  That audit
+    checks that the frozen n/m/alpha/floors are internally consistent.  This
+    audit takes a pilot or validation vector of paired deltas (or only their
+    SD), converts a pre-registered SESOI into the sign probability
+    ``q = Phi(|SESOI| / sigma)``, and evaluates the SAME Holm/sign-flip
+    planning projection used by ``signflip_power``.  It also reports the
+    minimum detectable mean under a normal sign model and the expected paired
+    t CI half-width at the planned n.
+
+    The normal sign conversion and the MDE are approximations.  The
+    sign-flip projection is itself a symbol-test upper bound when the |d_i|
+    are unequal, so this output is a planning aid, not a promise about the
+    one-shot test.  No result file or test-split value is read here.
+    """
+    out = {'kind': 'paired_design_sensitivity', 'status': 'ok',
+           'n_seeds': None, 'm_family': None, 'alpha': None,
+           'target_power': None, 'p_floor': None,
+           'min_attainable_p_holm': None, 'power_curve': {},
+           'min_q_for_target_power': None, 'pilot': {}, 'mde': {},
+           'precision': {}, 'sesoi': {}, 'violations': [],
+           'warnings': [],
+           'policy': {
+               'alpha': 'two-sided exact sign-flip planning projection',
+               'q_definition': ('probability that one seed\'s paired delta '
+                                'falls in the pre-registered direction'),
+               'sesoi_rule': ('q_sesoi = Phi(|SESOI|/pilot_sd); underpowered '
+                              'at the margin is a design failure only when '
+                              'require_sesoi_power is true'),
+               'mde_rule': ('normal sign-model approximation: '
+                            'sd * Phi^-1(q_target); not an exact sign-flip '
+                            'effect-size calculation'),
+               'precision_rule': ('paired t 95% CI half-width at the planned n; '
+                                  'document-level precision requires the '
+                                  'document-cluster SD, not the seed SD'),
+               'n_rule': ('n is the planned seed count; required-n searches '
+                          'assume the pilot q and SD stay fixed and do not '
+                          'model attrition or incomplete pairs'),
+           }}
+    n = _design_int(n_seeds)
+    m = _design_int(m_comparisons)
+    n_max_i = _design_int(n_max)
+    out['n_seeds'], out['m_family'] = n, m
+    if n is None or n < 2:
+        out['violations'].append(
+            f'n_seeds={n_seeds!r} must be an integer >= 2')
+        n = None
+    if m is None or m < 1:
+        out['violations'].append(
+            f'm_comparisons={m_comparisons!r} must be a positive integer')
+        m = None
+    if n_max_i is None or n_max_i < 2 or n_max_i > 10000:
+        out['violations'].append(
+            f'n_max={n_max!r} must be an integer in [2, 10000]')
+        n_max_i = 512
+    a = _design_probability(alpha, name='alpha', lo_open=True, hi_open=True)
+    if a is None:
+        out['violations'].append(
+            f'alpha={alpha!r} must be a finite probability in (0,1)')
+    out['alpha'] = a
+    tp = _design_probability(target_power, name='target_power',
+                             lo_open=True, hi_open=True)
+    if tp is None:
+        out['violations'].append(
+            f'target_power={target_power!r} must be a finite probability in (0,1)')
+    out['target_power'] = tp
+    if not isinstance(require_sesoi_power, (bool, np.bool_)):
+        out['violations'].append(
+            f'require_sesoi_power={require_sesoi_power!r} must be a boolean')
+        require_sesoi_power = False
+    require_sesoi_power = bool(require_sesoi_power)
+    out['require_sesoi_power'] = require_sesoi_power
+    target_halfwidth_value = None
+    if target_halfwidth is not None:
+        target_halfwidth_value = _finite_scalar(target_halfwidth)
+        if target_halfwidth_value is None or target_halfwidth_value <= 0.0:
+            out['violations'].append(
+                f'target_halfwidth={target_halfwidth!r} must be a finite positive number')
+            target_halfwidth_value = None
+    out['target_halfwidth'] = target_halfwidth_value
+    direction, direction_error = _design_direction(expected_sign)
+    if direction_error:
+        out['violations'].append(direction_error)
+    out['expected_sign'] = direction
+    raw_deltas = []
+    dropped = 0
+    if isinstance(pilot_deltas, (str, bytes)):
+        out['violations'].append(
+            'pilot_deltas must be a sequence of numbers, not a string')
+        pilot_deltas = None
+    if pilot_deltas is not None:
+        try:
+            for value in pilot_deltas:
+                f = _finite_scalar(value)
+                if f is None:
+                    dropped += 1
+                else:
+                    raw_deltas.append(f)
+        except TypeError:
+            out['violations'].append(
+                f'pilot_deltas must be an iterable of finite numbers, got {type(pilot_deltas).__name__}')
+            raw_deltas = []
+    d = np.asarray(raw_deltas, dtype=float)
+    explicit_sd = None
+    if pilot_sd is not None:
+        explicit_sd = _finite_scalar(pilot_sd)
+        if explicit_sd is None or explicit_sd <= 0.0:
+            out['violations'].append(
+                f'pilot_sd={pilot_sd!r} must be a finite positive number')
+            explicit_sd = None
+    mean = float(d.mean()) if d.size else None
+    sd = None
+    if explicit_sd is not None:
+        sd = float(explicit_sd)
+        if d.size >= 2:
+            calculated = float(d.std(ddof=1))
+            if abs(calculated - sd) > 1e-12 * max(1.0, abs(sd)):
+                out['warnings'].append(
+                    'pilot_sd overrides the SD recomputed from pilot_deltas; '
+                    'report which sample each value came from')
+    elif d.size >= 2:
+        sd = float(d.std(ddof=1))
+        if not (math.isfinite(sd) and sd > 0.0):
+            out['warnings'].append(
+                'pilot deltas have zero/non-finite SD; MDE and SESOI power '
+                'are not computable')
+            sd = None
+    elif d.size == 1:
+        out['warnings'].append(
+            'only one finite pilot delta; a paired SD needs at least two')
+    if dropped:
+        out['warnings'].append(
+            f'{dropped} non-finite/non-numeric pilot delta(s) were dropped')
+    q_sign_rate = None
+    direction_ok = None
+    q_normal = None
+    if d.size and direction is not None:
+        q_sign_rate = float(np.count_nonzero(d * direction > 0.0) / d.size)
+        if mean is not None and mean != 0.0:
+            direction_ok = bool(mean * direction > 0.0)
+        if sd is not None and sd > 0.0:
+            q_normal = float(min(1.0, max(0.0, _normal_cdf(abs(mean) / sd))))
+        if direction_ok is False:
+            out['warnings'].append(
+                'the pilot mean points AGAINST the pre-registered direction; '
+                'the confirmation premise, not just its power, is in question')
+    out['pilot'] = {
+        'status': ('not_provided' if (not d.size and explicit_sd is None)
+                   else 'available'),
+        'n': int(d.size), 'n_dropped': int(dropped),
+        'mean': mean, 'sd': sd, 'expected_sign': direction,
+        'direction_ok': direction_ok, 'q_sign_rate': q_sign_rate,
+        'q_normal_implied': q_normal,
+        'source': ('deltas' if d.size else ('pilot_sd' if sd is not None else None)),
+    }
+    if n is not None and m is not None and a is not None:
+        out['p_floor'] = float(signflip_p_floor(n))
+        out['min_attainable_p_holm'] = float(holm_min_attainable_p(n, m, a))
+        if out['min_attainable_p_holm'] > a + 1e-15:
+            out['violations'].append(
+                f'with n={n} seeds and m={m} comparisons the minimum attainable '
+                f'Holm p is {out["min_attainable_p_holm"]:.6g} > alpha={a}; '
+                'the panel is resolution-limited even if every seed agrees')
+        for q in (0.50, 0.60, 0.70, 0.80, 0.85, 0.90, 0.95, 0.975, 0.99):
+            out['power_curve'][f'q={q:.3f}'] = float(
+                signflip_power(n, m, q, a))
+        if tp is not None:
+            out['min_q_for_target_power'] = _q_for_target_power(n, m, tp, a)
+            if out['min_q_for_target_power'] is None:
+                out['warnings'].append(
+                    f'target_power={tp} is unreachable at n={n}, m={m}, alpha={a}')
+    if sd is not None and tp is not None and n is not None:
+        tc = _t_critical(0.95, float(n - 1))
+        half = (float(tc) * sd / math.sqrt(n)) if math.isfinite(tc) else None
+        out['precision'] = {
+            'confidence': 0.95, 't_critical': float(tc) if math.isfinite(tc) else None,
+            'ci95_halfwidth': half, 'target_halfwidth': None,
+            'n_required_for_target_halfwidth': None, 'meets_target': None,
+        }
+        if target_halfwidth_value is not None:
+            th = target_halfwidth_value
+            out['precision']['target_halfwidth'] = float(th)
+            out['precision']['meets_target'] = bool(half is not None and half <= th)
+            needed = None
+            for n_try in range(2, n_max_i + 1):
+                tc_try = _t_critical(0.95, float(n_try - 1))
+                if math.isfinite(tc_try) and tc_try * sd / math.sqrt(n_try) <= th:
+                    needed = int(n_try)
+                    break
+            out['precision']['n_required_for_target_halfwidth'] = needed
+        if half is not None and out['precision'].get('meets_target') is False:
+            out['warnings'].append(
+                'the expected paired 95% CI half-width at the planned n '
+                f'({half:.6g}) exceeds target_halfwidth={target_halfwidth!r}')
+    if q_sign_rate is not None and tp is not None and n is not None and m is not None and a is not None:
+        needed = _n_for_target_power(n, m, q_sign_rate, tp, a, n_max_i)
+        out['pilot']['required_n_for_target_power'] = needed
+        out['pilot']['n_shortfall'] = (None if needed is None
+                                       else max(0, needed - n))
+        observed_power = float(signflip_power(n, m, q_sign_rate, a))
+        out['pilot']['power_at_q_sign_rate'] = observed_power
+        if observed_power + 1e-15 < tp:
+            out['warnings'].append(
+                f'the observed pilot sign rate q={q_sign_rate:.6g} gives power '
+                f'{observed_power:.6g} < target_power={tp}')
+    if sd is not None and tp is not None and out.get('min_q_for_target_power'):
+        q_target = out['min_q_for_target_power']
+        if q_target > 0.5 + 1e-12:
+            mde = sd * _normal_quantile(q_target)
+            out['mde'] = {
+                'absolute': float(mde), 'q_for_target_power': float(q_target),
+                'relative_to_pilot_sd': (float(mde) / sd if sd else None),
+                'method': ('normal sign-probability approximation '
+                           '(sd * Phi^-1(q_target)); sign-flip power remains '
+                           'a symbol-test planning projection'),
+            }
+            if sesoi is not None:
+                sesoi_value = _finite_scalar(sesoi)
+                if sesoi_value is not None and sesoi_value > 0.0:
+                    out['mde']['multiple_of_sesoi'] = float(mde / sesoi_value)
+    sesoi_value = None
+    if sesoi is not None:
+        sesoi_value = _finite_scalar(sesoi)
+        if sesoi_value is None or sesoi_value <= 0.0:
+            out['violations'].append(
+                f'sesoi={sesoi!r} must be a finite positive margin in the '
+                'same units as the paired deltas')
+            sesoi_value = None
+    out['sesoi'] = {
+        'margin': sesoi_value, 'status': 'not_declared',
+        'q_implied': None, 'power_at_sesoi': None,
+        'required_n_for_target_power': None, 'power_ok': None,
+        'note': ('no pre-registered SESOI supplied; statistical detectability '
+                 'does not establish practical relevance'),
+    }
+    if require_sesoi_power and sesoi is None:
+        out['violations'].append(
+            'require_sesoi_power=true but no SESOI margin was declared')
+    if sesoi_value is not None:
+        if sd is None:
+            out['sesoi'].update({'status': 'not_verifiable',
+                                 'note': 'SESOI declared but no pilot SD is available'})
+            if require_sesoi_power:
+                out['violations'].append(
+                    'require_sesoi_power=true but the pilot SD is missing')
+        elif direction is None:
+            out['sesoi'].update({'status': 'no_direction',
+                                 'note': ('a non-directional comparison has no '
+                                          'sign probability; report the margin '
+                                          'and CI width instead')})
+            if require_sesoi_power:
+                out['violations'].append(
+                    'require_sesoi_power=true but the comparison is non-directional')
+        elif tp is not None and n is not None and m is not None and a is not None:
+            q_sesoi = float(min(1.0, max(0.0, _normal_cdf(abs(sesoi_value) / sd))))
+            power_sesoi = float(signflip_power(n, m, q_sesoi, a))
+            needed = _n_for_target_power(n, m, q_sesoi, tp, a, n_max_i)
+            ok = bool(power_sesoi + 1e-15 >= tp)
+            out['sesoi'].update({
+                'status': 'ok' if ok else 'underpowered',
+                'q_implied': q_sesoi, 'power_at_sesoi': power_sesoi,
+                'required_n_for_target_power': needed, 'power_ok': ok,
+                'note': ('the planned n meets the target power at the '
+                         'pre-registered margin' if ok else
+                         'the planned n cannot reach target power at the '
+                         'pre-registered margin'),
+            })
+            if not ok:
+                out['warnings'].append(
+                    f'the pre-registered SESOI has power {power_sesoi:.6g} < '
+                    f'target_power={tp}')
+                if require_sesoi_power:
+                    out['violations'].append(
+                        'require_sesoi_power=true and the planned n is '
+                        'underpowered at the pre-registered SESOI')
+    if not out['pilot'].get('n') and pilot_sd is None:
+        out['warnings'].append(
+            'no pilot deltas or SD supplied; the power curve is informational '
+            'and MDE/SESOI power cannot be computed')
+    if out['violations']:
+        out['status'] = 'fail'
+    return out
+
+
 def dynamic_read_budget_calibration(manifest):
     """Validate the measured read-budget calibration and its matched fixed arm.
 

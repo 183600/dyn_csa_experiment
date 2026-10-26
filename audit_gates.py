@@ -58,6 +58,9 @@
                 （v6-v11 永远 exploratory；draft 不能 confirmatory）与动态
                 分块 H1-H5 假设/对照（零 GPU，不读 test）
   design_preflight  design 的别名
+  sensitivity  设计前馈：功效曲线、target power 所需 q、近似 MDE、配对
+               95% CI 半宽与（若有）SESOI 处的功效；缺 pilot/SESOI 时明确
+               报不可验证，不虚构效应量（零 GPU，不读 test）
   dose_response  有序剂量设计：方向/形状预注册、>=3 个单调剂量、只动一个
                 声明键、同一种子集与测量协议（零 GPU；清单无该声明时
                 not_applicable）
@@ -4109,6 +4112,118 @@ def audit_design_preflight(manifest_path=None, dynamic_path=None):
     return out
 
 
+def audit_design_sensitivity(manifest_path=None,
+                            pilot_path='analysis_v12/power_validation.json'):
+    """Zero-GPU design sensitivity: can the planned n resolve the SESOI?
+
+    The frozen design preflight verifies that the declared q has enough power.
+    It cannot say whether that q corresponds to an effect the study would
+    care about.  This audit reads the same manifest and, when available, the
+    validation power artifact written by ``v12_supp.py power``.  For every
+    primary comparison it reports the exact Holm floor, the sign-flip power
+    curve, the minimum q needed for target power, the approximate MDE, the
+    expected paired 95% CI half-width, and (if the manifest declares one) the
+    power at the pre-registered SESOI.
+
+    Missing pilot data or a missing SESOI is reported as a warning, not a
+    fabricated pass: the audit never invents an effect size.  A declared SESOI
+    that the planned n cannot resolve fails only when the manifest sets
+    ``require_sesoi_power``; otherwise the underpowered margin is named and
+    kept visible.  This reads no test split and changes no frozen decision.
+    """
+    L = _import_exp_lib()
+    mp = manifest_path or os.path.join(REPO, 'confirmation_frozen.json')
+    pp = pilot_path
+    if pp and not os.path.isabs(str(pp)):
+        pp = os.path.join(REPO, str(pp))
+    out = {'kind': 'design_sensitivity', 'status': 'ok', 'manifest': mp,
+           'pilot': pp, 'pilot_status': 'not_available', 'n_seeds': None,
+           'm_family': None, 'alpha': None, 'target_power': None,
+           'comparisons': {}, 'violations': [], 'warnings': []}
+    manifest = _load_manifest_file(mp)
+    if not isinstance(manifest, dict):
+        out['status'] = 'fail'
+        out['violations'].append(
+            f'frozen manifest is missing/unreadable: {mp}')
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return out
+    stat = manifest.get('statistics') if isinstance(
+        manifest.get('statistics'), dict) else {}
+    seeds = manifest.get('seeds')
+    comps = manifest.get('primary_comparisons')
+    n = len(seeds) if isinstance(seeds, list) else None
+    m = len(comps) if isinstance(comps, list) else None
+    out['n_seeds'], out['m_family'] = n, m
+    out['alpha'] = stat.get('alpha', 0.05)
+    out['target_power'] = stat.get('min_power_for_test', 0.80)
+    if n is None or n < 2:
+        out['violations'].append(
+            f'manifest.seeds must be a list with at least two seeds, got {seeds!r}')
+    if m is None or m < 1:
+        out['violations'].append(
+            f'manifest.primary_comparisons must be a non-empty list, got {comps!r}')
+    if not isinstance(comps, list):
+        comps = []
+    pilot = _load_manifest_file(pp) if pp else None
+    pilot_comps = (pilot.get('comparisons')
+                   if isinstance(pilot, dict) and isinstance(
+                       pilot.get('comparisons'), dict) else {})
+    if pilot_comps:
+        out['pilot_status'] = 'available'
+    else:
+        out['warnings'].append(
+            f'no readable power-validation artifact at {pp}; pass a pilot SD '
+            'or run `python v12_supp.py power` before relying on MDE/SESOI '
+            'readouts')
+    pilot_cells = 0
+    for comp in comps:
+        if not isinstance(comp, dict):
+            out['violations'].append(
+                f'primary comparison is not an object: {comp!r}')
+            continue
+        name = str(comp.get('name') or f'comparison_{len(out["comparisons"])}')
+        pcell = pilot_comps.get(name) if isinstance(pilot_comps, dict) else None
+        deltas = pcell.get('deltas') if isinstance(pcell, dict) else None
+        if not isinstance(deltas, list):
+            deltas = None
+        else:
+            pilot_cells += 1
+        sesoi = comp.get('sesoi')
+        if sesoi is None:
+            sesoi = stat.get('sesoi')
+        require_sesoi = bool(comp.get('require_sesoi_power')
+                             or stat.get('require_sesoi_power'))
+        rep = L.paired_design_sensitivity(
+            n, m or 0, alpha=out['alpha'],
+            target_power=out['target_power'], pilot_deltas=deltas,
+            expected_sign=comp.get('expected_sign'), sesoi=sesoi,
+            require_sesoi_power=require_sesoi)
+        out['comparisons'][name] = rep
+        out['violations'].extend(
+            f'{name}: {v}' for v in (rep.get('violations') or []))
+        out['warnings'].extend(
+            f'{name}: {w}' for w in (rep.get('warnings') or []))
+        if rep.get('status') == 'fail':
+            out['status'] = 'fail'
+    if out['pilot_status'] == 'available' and pilot_cells == 0:
+        out['pilot_status'] = 'no_matching_comparisons'
+        out['warnings'].append(
+            'the power artifact has comparisons but none carry a deltas list '
+            'matching a frozen primary comparison name')
+    if (out['pilot_status'] != 'available' or pilot_cells == 0) and \
+            out['status'] == 'ok':
+        out['status'] = 'not_verifiable'
+    if out['violations']:
+        out['status'] = 'fail'
+    if (not any(isinstance(c, dict) and c.get('sesoi') for c in comps)
+            and not stat.get('sesoi')):
+        out['warnings'].append(
+            'the frozen manifest declares no SESOI for its primary '
+            'comparisons; statistical detectability is not practical relevance')
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return out
+
+
 # ---------------------------------------------------------------------------
 # 8) 规模核算：6ND 估算 + TimeGuard 记录对账
 # ---------------------------------------------------------------------------
@@ -6449,7 +6564,7 @@ def audit_statistical_calibration(*, n_sim=None, seed=None):
 
 
 def run_report(out='audit_report.json'):
-    res = {'generated_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'source_tree': audit_source_integrity(), 'dependencies': audit_dependencies(), 'data_source': audit_data_source(), 'leakage': audit_leakage(), 'split_discipline': audit_split_discipline(), 'document_unit': audit_document_unit(), 'sample_design': audit_sample_design(), 'attribution': audit_attribution(), 'boundary': audit_boundary(), 'length': audit_length(), 'fairness': audit_fairness(), 'metrics': audit_metrics(), 'tuning': audit_tuning(), 'simple_baseline': audit_simple_baseline(), 'hypotheses': audit_hypotheses(), 'sesoi': audit_sesoi_declaration(), 'interaction_sesoi': audit_interaction_sesoi(), 'unit_influence': audit_unit_influence(), 'analysis_choices': audit_analysis_choices(), 'looks': audit_look_history(), 'methodology': audit_methodology(), 'single_factor': audit_single_factor(), 'factorial': audit_factorial_design(), 'design_preflight': audit_design_preflight(), 'dose_response': audit_dose_response(verbose=False), 'failures': audit_failures(), 'budget': audit_budget(), 'training_health': audit_training_health(), 'efficiency_pairs': audit_efficiency_pairs(), 'release': audit_release_readiness(), 'selection': audit_selection(), 'run_order': audit_run_order(), 'calibration': audit_statistical_calibration()}
+    res = {'generated_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'source_tree': audit_source_integrity(), 'dependencies': audit_dependencies(), 'data_source': audit_data_source(), 'leakage': audit_leakage(), 'split_discipline': audit_split_discipline(), 'document_unit': audit_document_unit(), 'sample_design': audit_sample_design(), 'attribution': audit_attribution(), 'boundary': audit_boundary(), 'length': audit_length(), 'fairness': audit_fairness(), 'metrics': audit_metrics(), 'tuning': audit_tuning(), 'simple_baseline': audit_simple_baseline(), 'hypotheses': audit_hypotheses(), 'sesoi': audit_sesoi_declaration(), 'interaction_sesoi': audit_interaction_sesoi(), 'unit_influence': audit_unit_influence(), 'analysis_choices': audit_analysis_choices(), 'looks': audit_look_history(), 'methodology': audit_methodology(), 'single_factor': audit_single_factor(), 'factorial': audit_factorial_design(), 'design_preflight': audit_design_preflight(), 'sensitivity': audit_design_sensitivity(), 'dose_response': audit_dose_response(verbose=False), 'failures': audit_failures(), 'budget': audit_budget(), 'training_health': audit_training_health(), 'efficiency_pairs': audit_efficiency_pairs(), 'release': audit_release_readiness(), 'selection': audit_selection(), 'run_order': audit_run_order(), 'calibration': audit_statistical_calibration()}
     L_atomic = None
     try:
         L = _import_exp_lib()
@@ -6469,7 +6584,7 @@ def run_report(out='audit_report.json'):
 
 
 if __name__ == '__main__':
-    _cmds = {'leakage': audit_leakage, 'split': audit_split_discipline, 'split_discipline': audit_split_discipline, 'document_unit': audit_document_unit, 'unit': audit_document_unit, 'sample_design': audit_sample_design, 'sampling': audit_sample_design, 'sample': audit_sample_design, 'causality': audit_causality, 'attribution': audit_attribution, 'boundary': audit_boundary, 'length': audit_length, 'fairness': audit_fairness, 'metrics': audit_metrics, 'tuning': audit_tuning, 'simple': audit_simple_baseline, 'baseline_floor': audit_simple_baseline, 'baseline_plan': audit_baseline_design, 'hypothesis_coverage': audit_hypothesis_coverage, 'hypotheses': audit_hypotheses, 'sesoi': audit_sesoi_declaration, 'interaction_sesoi': audit_interaction_sesoi, 'interaction': audit_interaction_sesoi, 'unit_influence': audit_unit_influence, 'influence': audit_unit_influence, 'analysis_choices': audit_analysis_choices, 'specification_curve': audit_analysis_choices, 'analysis_choice': audit_analysis_choices, 'looks': audit_look_history, 'look_history': audit_look_history, 'methodology': audit_methodology, 'single_factor': audit_single_factor, 'factorial': audit_factorial_design, 'factorial_design': audit_factorial_design, 'design': audit_design_preflight, 'design_preflight': audit_design_preflight, 'dose_response': audit_dose_response, 'dose_response_design': audit_dose_response, 'failures': audit_failures, 'budget': audit_budget, 'efficiency': audit_efficiency_demo, 'efficiency_pairs': audit_efficiency_pairs, 'training_health': audit_training_health, 'selection': audit_selection, 'release': audit_release_readiness, 'run_order': audit_run_order, 'calibration': audit_statistical_calibration, 'stats_calibration': audit_statistical_calibration, 'type_i': audit_statistical_calibration, 'source': audit_source_integrity, 'source_tree': audit_source_integrity, 'dependencies': audit_dependencies, 'dependency': audit_dependencies, 'data_source': audit_data_source, 'dataset_source': audit_data_source, 'report': run_report}
+    _cmds = {'leakage': audit_leakage, 'split': audit_split_discipline, 'split_discipline': audit_split_discipline, 'document_unit': audit_document_unit, 'unit': audit_document_unit, 'sample_design': audit_sample_design, 'sampling': audit_sample_design, 'sample': audit_sample_design, 'causality': audit_causality, 'attribution': audit_attribution, 'boundary': audit_boundary, 'length': audit_length, 'fairness': audit_fairness, 'metrics': audit_metrics, 'tuning': audit_tuning, 'simple': audit_simple_baseline, 'baseline_floor': audit_simple_baseline, 'baseline_plan': audit_baseline_design, 'hypothesis_coverage': audit_hypothesis_coverage, 'hypotheses': audit_hypotheses, 'sesoi': audit_sesoi_declaration, 'interaction_sesoi': audit_interaction_sesoi, 'interaction': audit_interaction_sesoi, 'unit_influence': audit_unit_influence, 'influence': audit_unit_influence, 'analysis_choices': audit_analysis_choices, 'specification_curve': audit_analysis_choices, 'analysis_choice': audit_analysis_choices, 'looks': audit_look_history, 'look_history': audit_look_history, 'methodology': audit_methodology, 'single_factor': audit_single_factor, 'factorial': audit_factorial_design, 'factorial_design': audit_factorial_design, 'design': audit_design_preflight, 'design_preflight': audit_design_preflight, 'sensitivity': audit_design_sensitivity, 'design_sensitivity': audit_design_sensitivity, 'precision': audit_design_sensitivity, 'dose_response': audit_dose_response, 'dose_response_design': audit_dose_response, 'failures': audit_failures, 'budget': audit_budget, 'efficiency': audit_efficiency_demo, 'efficiency_pairs': audit_efficiency_pairs, 'training_health': audit_training_health, 'selection': audit_selection, 'release': audit_release_readiness, 'run_order': audit_run_order, 'calibration': audit_statistical_calibration, 'stats_calibration': audit_statistical_calibration, 'type_i': audit_statistical_calibration, 'source': audit_source_integrity, 'source_tree': audit_source_integrity, 'dependencies': audit_dependencies, 'dependency': audit_dependencies, 'data_source': audit_data_source, 'dataset_source': audit_data_source, 'report': run_report}
     _arg = sys.argv[1] if len(sys.argv) > 1 else 'report'
     if _arg in ('-h', '--help'):
         print(__doc__)
