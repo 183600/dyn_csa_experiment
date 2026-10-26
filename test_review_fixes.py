@@ -23002,6 +23002,28 @@ def t_unit_precision_design_planning():
     assert bare['status'] == 'not_verifiable', bare
     assert bare['pilot']['status'] == 'not_provided', bare['pilot']
 
+    # A pilot with too few/zero-variance units has no SD, so MDE/SESOI power
+    # cannot be computed; that is not a green "ok" design.
+    one = L.unit_precision_design(48, pilot_unit_deltas=[0.1])
+    assert one['status'] == 'not_verifiable', one
+    zero_sd = L.unit_precision_design(48, pilot_unit_deltas=[0.1, 0.1])
+    assert zero_sd['status'] == 'not_verifiable', zero_sd
+
+    # Regression: the normal-approximation n0 can exceed n_max even though a
+    # smaller feasible n exists.  The old 50-step upward scan returned None
+    # here (n0=112936 > n_max=100000, true minimum=74871).
+    _sd, _alpha = 54.45357975358687, 0.35524694384435124
+    _margin, _target_power = 0.12912223662142594, 0.4492389684641835
+    missed = L.unit_precision_design(
+        48, pilot_unit_sd=_sd, alpha=_alpha, sesoi=_margin,
+        target_power=_target_power)
+    _needed = missed['sesoi']['required_n_for_target_power']
+    assert _needed is not None and 2 < _needed <= 100000, missed['sesoi']
+    assert (L._unit_power_at(_needed, _sd, _margin, _alpha) + 1e-15
+            >= _target_power), missed['sesoi']
+    assert (L._unit_power_at(_needed - 1, _sd, _margin, _alpha) + 1e-15
+            < _target_power), missed['sesoi']
+
     for kwargs in (dict(alpha=float('nan')), dict(target_power=1.0),
                    dict(pilot_unit_sd=-1.0), dict(pilot_unit_deltas='abc'),
                    dict(unit_label='line'), dict(target_halfwidth=0.0),
@@ -23101,6 +23123,33 @@ def t_audit_evaluation_design_and_wiring():
         cell = rep['comparisons']['a']
         assert cell['status'] == 'ok' and cell['precision']['ci_halfwidth'] > 0, cell
 
+        for _bad_pilot in (
+                {'comparisons': {'a': {'unit_deltas': []}}},
+                {'comparisons': {'a': {'unit_deltas': [0.1]}}},
+                {'comparisons': {'a': {'unit_deltas': [0.1, 0.1]}}}):
+            _bad = L.evaluation_design_audit(manifest, _bad_pilot)
+            assert _bad['status'] == 'not_verifiable', (_bad_pilot, _bad)
+
+        du = L.evaluation_design_units(manifest)
+        assert du['raw_n_units'] == 48 and du['n_units'] == 48, du
+        assert du['unit_label'] == 'document' and du['label_declared'] is True, du
+        du = L.evaluation_design_units({'eval': {'n_seqs_clean': 32}})
+        assert du['raw_n_units'] == 32 and du['n_units'] == 32, du
+        assert du['unit_label'] == 'document' and du['label_declared'] is False, du
+        du = L.evaluation_design_units({
+            'evaluation_design': {'n_units': None, 'unit_count': 40},
+            'eval': {'n_seqs_clean': None},
+            'binding': {'test_slice': {'n_seqs': 48}}})
+        assert du['raw_n_units'] == 40 and du['n_units'] == 40, du
+        du = L.evaluation_design_units({
+            'eval': {'n_seqs_clean': None},
+            'binding': {'test_slice': {'n_seqs': 48}}})
+        assert du['raw_n_units'] == 48 and du['n_units'] == 48, du
+        du = L.evaluation_design_units(
+            {'evaluation_design': {'n_units': 64, 'unit': 'Article'}})
+        assert du['raw_n_units'] == 64 and du['unit_label'] == 'article', du
+        assert du['label_declared'] is True, du
+
         with contextlib.redirect_stdout(io.StringIO()):
             rep2 = A.audit_evaluation_design(
                 manifest_path=mp, pilot_path=os.path.join(td, 'missing.json'))
@@ -23154,6 +23203,62 @@ def t_audit_evaluation_design_and_wiring():
     import inspect
     assert "'evaluation': audit_evaluation_design()" in inspect.getsource(A.run_report)
     assert 'evaluation' in (A.__doc__ or ''), 'evaluation is not documented in the audit CLI'
+
+
+def t_power_preflight_uses_frozen_test_units():
+    manifest = {
+        'frozen_at': 'test', 'code_semantics_expected': L.CODE_SEMANTICS,
+        'arms': ['a', 'b'], 'seeds': [0, 1],
+        'primary_comparisons': [{
+            'name': 'a-b', 'a': 'a', 'b': 'b',
+            'endpoint': 'by_len.ppl@512', 'expected_sign': 'positive'}],
+        'statistics': {
+            'test': 'exact two-sided sign-flip',
+            'correction': 'holm step-down', 'alpha': 0.05, 'n_seeds': 2,
+            'descriptive_only': True, 'min_power_for_test': 0.8,
+            'require_power_gate': False},
+        'eval': {'n_seqs_clean': 64},
+        'evaluation_design': {'n_units': 64, 'unit': 'document'},
+    }
+    docs = ['d1', 'd2', 'd3', 'd4']
+
+    def rec(ppl, vals):
+        return {'by_len': {'512': {
+            'ppl': ppl, 'truncated': False,
+            'ppl_per_doc': vals, 'doc_ids': list(docs)}}}
+
+    summary = {
+        'a::seed0': rec(2.0, [3.0, 2.0, 2.0, 1.0]),
+        'b::seed0': rec(1.0, [1.0, 1.0, 1.0, 1.0]),
+        'a::seed1': rec(2.0, [3.0, 2.0, 2.0, 1.0]),
+        'b::seed1': rec(1.0, [1.0, 1.0, 1.0, 1.0]),
+    }
+    with tempfile.TemporaryDirectory() as td:
+        mp = os.path.join(td, 'manifest.json')
+        sp = os.path.join(td, 'summary.json')
+        op = os.path.join(td, 'power.json')
+        with open(mp, 'w', encoding='utf-8') as f:
+            json.dump(manifest, f)
+        with open(sp, 'w', encoding='utf-8') as f:
+            json.dump(summary, f)
+        _old_current = L.result_is_current
+        L.result_is_current = lambda *a, **k: True
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                V12.run_power(manifest_path=mp, summary=sp, out=op)
+        finally:
+            L.result_is_current = _old_current
+        with open(op, encoding='utf-8') as f:
+            rep = json.load(f)
+    cell = rep['comparisons']['a-b']
+    up = cell['unit_precision']
+    assert up['status'] == 'ok', up
+    assert up['n_units'] == 64 and up['pilot_n_units'] == 4, up
+    assert up['unit_label'] == 'document' and up['pilot_unit'] == 'document', up
+    assert cell['evaluation_unit']['n_units'] == 4, cell['evaluation_unit']
+
+    import inspect
+    assert 'evaluation_design_units' in inspect.getsource(V12.run_power)
 
 
 def main():
@@ -23725,6 +23830,8 @@ def main():
            t_paired_unit_deltas_prefers_independent_units)
     _check('L204 evaluation-design audit joins manifest, pilot and sampling gate',
            t_audit_evaluation_design_and_wiring)
+    _check('L205 power preflight sizes precision from the frozen test units',
+           t_power_preflight_uses_frozen_test_units)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

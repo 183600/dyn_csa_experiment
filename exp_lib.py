@@ -20146,6 +20146,13 @@ _UNIT_GRANULARITIES = (
 )
 
 
+def _unit_sequence(value):
+    """Non-empty one-dimensional unit vector (list, tuple or NumPy array)."""
+    if isinstance(value, np.ndarray):
+        return value.ndim == 1 and value.size > 0
+    return isinstance(value, (list, tuple)) and len(value) > 0
+
+
 def paired_unit_deltas(rows_a, rows_b, *, unit='auto'):
     """Per-unit paired PPL differences averaged over paired seeds.
 
@@ -20181,7 +20188,7 @@ def paired_unit_deltas(rows_a, rows_b, *, unit='auto'):
     reasons = {}
     for label, key, id_key in candidates:
         vectors = [r.get(key) for r in rows_a + rows_b]
-        if not all(isinstance(v, (list, tuple)) and v for v in vectors):
+        if not all(_unit_sequence(v) for v in vectors):
             reasons[label] = f'{key} is absent, empty or not a list in every seed cell'
             continue
         lengths = {len(v) for v in vectors}
@@ -20195,9 +20202,11 @@ def paired_unit_deltas(rows_a, rows_b, *, unit='auto'):
         ids = None
         if id_key is not None:
             id_vectors = [r.get(id_key) for r in rows_a + rows_b]
-            if all(isinstance(v, (list, tuple)) and len(v) == n_units
+            if all(_unit_sequence(v) and len(v) == n_units
                    for v in id_vectors):
-                first = list(id_vectors[0])
+                first = (id_vectors[0].tolist()
+                         if isinstance(id_vectors[0], np.ndarray)
+                         else list(id_vectors[0]))
                 if any(list(v) != first for v in id_vectors[1:]):
                     reasons[label] = f'{id_key} order/identities differ across seeds'
                     continue
@@ -20217,11 +20226,18 @@ def paired_unit_deltas(rows_a, rows_b, *, unit='auto'):
                         or not ppl_is_usable(va) or not ppl_is_usable(vb)):
                     usable = False
                     break
-                diffs.append(va - vb)
+                diff = va - vb
+                if not math.isfinite(diff):
+                    usable = False
+                    break
+                diffs.append(diff)
             if not usable:
                 break
             values.append(float(np.mean(diffs)))
-        if not usable or len(values) < 2:
+        mean = float(np.mean(values)) if values else None
+        sd = float(np.std(values, ddof=1)) if len(values) >= 2 else None
+        if (not usable or len(values) < 2 or mean is None or sd is None
+                or not (math.isfinite(mean) and math.isfinite(sd))):
             reasons[label] = f'{key} contains non-finite/sub-1 PPL values'
             continue
         return {
@@ -20229,8 +20245,8 @@ def paired_unit_deltas(rows_a, rows_b, *, unit='auto'):
             'key': key, 'n_units': int(len(values)), 'n_seeds': len(rows_a),
             'deltas': values, 'ids': ids,
             'id_key': id_key,
-            'mean': float(np.mean(values)),
-            'sd': float(np.std(values, ddof=1)),
+            'mean': mean,
+            'sd': sd,
             'source': (f'{key} averaged within unit over {len(rows_a)} paired seeds'),
         }
     return {'status': 'not_available', 'unit': None,
@@ -20240,34 +20256,82 @@ def paired_unit_deltas(rows_a, rows_b, *, unit='auto'):
 
 def _unit_power_at(n, sd, margin, alpha):
     """Two-sided normal-approximation power at a unit-level mean margin."""
-    se = float(sd) / math.sqrt(float(n))
+    try:
+        n = float(n)
+        sd = float(sd)
+        margin = float(margin)
+        alpha = float(alpha)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not (math.isfinite(n) and n > 1.0):
+        return None
+    if not (math.isfinite(sd) and sd > 0.0):
+        return None
+    if not (math.isfinite(margin) and 0.0 < alpha < 1.0):
+        return None
+    se = sd / math.sqrt(n)
     if not (math.isfinite(se) and se > 0.0):
         return None
-    tc = _t_critical(1.0 - float(alpha), float(n) - 1.0)
+    tc = _t_critical(1.0 - alpha, n - 1.0)
     if not math.isfinite(tc):
         return None
-    z = float(margin) / se
+    z = margin / se
     return float(min(1.0, max(0.0, _normal_cdf(z - tc) + _normal_cdf(-z - tc))))
 
 
 def _unit_needed_n(n0, *, sd, alpha, target, kind, n_max,
                    target_power=None):
-    """Refine a normal-approximation n around n0 with the actual t critical."""
-    n0 = max(2, int(n0))
-    if n0 > int(n_max):
+    """Smallest n in ``[2, n_max]`` meeting the t-based criterion.
+
+    ``n0`` is the normal-approximation hint retained for compatibility.  The
+    hint can be above ``n_max`` even when a smaller valid n exists, or below
+    the true minimum; scanning only a short window around it therefore missed
+    feasible designs and could report a non-minimal n.  Both criteria are
+    monotone in n, so a binary search over the whole feasible range returns
+    the minimal integer without ever enumerating up to ``n_max``.
+    """
+    _ = n0
+    try:
+        hi = int(n_max)
+        sd = float(sd)
+        alpha = float(alpha)
+        target = float(target)
+    except (TypeError, ValueError, OverflowError):
         return None
-    for n in range(n0, min(int(n_max), n0 + 50) + 1):
-        if kind == 'power':
+    if hi < 2 or not (math.isfinite(sd) and sd > 0.0):
+        return None
+    if not (math.isfinite(alpha) and 0.0 < alpha < 1.0):
+        return None
+    if not (math.isfinite(target) and target > 0.0):
+        return None
+    if kind == 'power':
+        try:
+            tp = float(target_power)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not (math.isfinite(tp) and 0.0 < tp < 1.0):
+            return None
+
+        def _ok(n):
             power = _unit_power_at(n, sd, target, alpha)
-            if (power is not None and target_power is not None
-                    and power + 1e-15 >= float(target_power)):
-                return int(n)
+            return power is not None and power + 1e-15 >= tp
+    else:
+        def _ok(n):
+            tc = _t_critical(1.0 - alpha, float(n) - 1.0)
+            return (math.isfinite(tc)
+                    and tc * sd / math.sqrt(float(n)) <= target)
+    if _ok(2):
+        return 2
+    if not _ok(hi):
+        return None
+    lo = 2
+    while lo + 1 < hi:
+        mid = (lo + hi) // 2
+        if _ok(mid):
+            hi = mid
         else:
-            tc = _t_critical(1.0 - float(alpha), float(n) - 1.0)
-            if (math.isfinite(tc)
-                    and tc * float(sd) / math.sqrt(float(n)) <= float(target)):
-                return int(n)
-    return None
+            lo = mid
+    return int(hi)
 
 
 def unit_precision_design(n_units, *, pilot_unit_deltas=None,
@@ -20359,6 +20423,9 @@ def unit_precision_design(n_units, *, pilot_unit_deltas=None,
         out['violations'].append(
             f'n_max={n_max!r} must be an integer in [2, 1000000]')
         n_max_i = 100000
+    out['policy']['population_rule'] = (
+        f'population claims require at least {mu} independent units and a '
+        'non-row unit label; otherwise claims are limited to the frozen slice')
     raw = []
     dropped = 0
     if isinstance(pilot_unit_deltas, (str, bytes)):
@@ -20440,10 +20507,8 @@ def unit_precision_design(n_units, *, pilot_unit_deltas=None,
             'method': 'paired t interval at the frozen unit count',
         }
         if target_halfwidth_value is not None:
-            n0 = (float(_normal_quantile(1.0 - a / 2.0))
-                  * sd / target_halfwidth_value) ** 2
             out['precision']['n_required_for_target_halfwidth'] = _unit_needed_n(
-                math.ceil(n0), sd=sd, alpha=a, target=target_halfwidth_value,
+                2, sd=sd, alpha=a, target=target_halfwidth_value,
                 kind='halfwidth', n_max=n_max_i)
             if out['precision']['meets_target'] is False:
                 out['warnings'].append(
@@ -20490,11 +20555,8 @@ def unit_precision_design(n_units, *, pilot_unit_deltas=None,
         elif tp is not None and a is not None and n is not None:
             power = _unit_power_at(n, sd, sesoi_value, a)
             ok = bool(power is not None and power + 1e-15 >= tp)
-            z_alpha = float(_normal_quantile(1.0 - a / 2.0))
-            z_power = float(_normal_quantile(tp))
-            n0 = math.ceil(((z_alpha + z_power) * sd / sesoi_value) ** 2)
             needed = _unit_needed_n(
-                n0, sd=sd, alpha=a, target=sesoi_value, kind='power',
+                2, sd=sd, alpha=a, target=sesoi_value, kind='power',
                 n_max=n_max_i, target_power=tp)
             out['sesoi'].update({
                 'status': 'ok' if ok else 'underpowered',
@@ -20545,8 +20607,52 @@ def unit_precision_design(n_units, *, pilot_unit_deltas=None,
             'be computed')
     if out['violations']:
         out['status'] = 'fail'
-    elif out['pilot'].get('status') == 'not_provided':
+    elif sd is None:
         out['status'] = 'not_verifiable'
+    return out
+
+
+def evaluation_design_units(manifest):
+    """Frozen test-slice unit count and label declared by a manifest.
+
+    ``evaluation_design.n_units`` is authoritative; legacy manifests fall back
+    to ``eval.n_seqs_clean`` and then ``binding.test_slice.n_seqs``.  The raw
+    value is returned alongside the coerced integer so callers can let
+    :func:`unit_precision_design` reject a malformed declaration with the
+    original value in the violation message.
+    """
+    out = {'n_units': None, 'raw_n_units': None, 'unit_label': 'document',
+           'label_declared': False}
+    if not isinstance(manifest, dict):
+        return out
+    design = manifest.get('evaluation_design')
+    if not isinstance(design, dict):
+        design = manifest.get('evaluation')
+    if not isinstance(design, dict):
+        design = {}
+    raw_n = design.get('n_units')
+    if raw_n is None:
+        raw_n = design.get('unit_count')
+    if raw_n is None:
+        binding = manifest.get('binding') if isinstance(
+            manifest.get('binding'), dict) else {}
+        test_slice = binding.get('test_slice') if isinstance(
+            binding.get('test_slice'), dict) else {}
+        eval_blk = manifest.get('eval') if isinstance(
+            manifest.get('eval'), dict) else {}
+        raw_n = eval_blk.get('n_seqs_clean')
+        if raw_n is None:
+            raw_n = test_slice.get('n_seqs')
+    label = design.get('unit')
+    if label is None:
+        label = design.get('unit_label')
+    if label is None:
+        label = 'document'
+    out['unit_label'] = label.strip().lower() if isinstance(
+        label, str) else label
+    out['label_declared'] = ('unit' in design) or ('unit_label' in design)
+    out['raw_n_units'] = raw_n
+    out['n_units'] = _design_int(raw_n)
     return out
 
 
@@ -20576,8 +20682,6 @@ def evaluation_design_audit(manifest, pilot=None):
         manifest.get('binding'), dict) else {}
     test_slice = binding.get('test_slice') if isinstance(
         binding.get('test_slice'), dict) else {}
-    eval_blk = manifest.get('eval') if isinstance(
-        manifest.get('eval'), dict) else {}
     design = manifest.get('evaluation_design')
     if not isinstance(design, dict):
         design = manifest.get('evaluation') if isinstance(
@@ -20586,20 +20690,20 @@ def evaluation_design_audit(manifest, pilot=None):
         design = {}
     stat = manifest.get('statistics') if isinstance(
         manifest.get('statistics'), dict) else {}
-    raw_n = design.get('n_units', design.get('unit_count'))
-    if raw_n is None:
-        raw_n = eval_blk.get('n_seqs_clean', test_slice.get('n_seqs'))
-    unit_label = design.get('unit', design.get('unit_label', 'document'))
-    out['n_units'] = _design_int(raw_n)
-    out['unit_label'] = str(unit_label).strip().lower() if isinstance(
-        unit_label, str) else unit_label
+    _units = evaluation_design_units(manifest)
+    raw_n = _units['raw_n_units']
+    unit_label = _units['unit_label']
+    out['n_units'] = _units['n_units']
+    out['unit_label'] = unit_label
     alpha = stat.get('alpha', 0.05)
     target_power = stat.get('min_power_for_test', 0.80)
-    min_units = design.get(
-        'min_units_for_population', stat.get(
-            'min_units_for_population', MIN_DOCS_FOR_POPULATION_CLAIM))
-    sampling = design.get('test_slice_sampling',
-                          test_slice.get('sampling'))
+    min_units = design.get('min_units_for_population')
+    if min_units is None:
+        min_units = stat.get(
+            'min_units_for_population', MIN_DOCS_FOR_POPULATION_CLAIM)
+    sampling = design.get('test_slice_sampling')
+    if sampling is None:
+        sampling = test_slice.get('sampling')
     method = None
     if isinstance(sampling, dict):
         method = sampling.get('method', sampling.get('design'))
@@ -20624,9 +20728,11 @@ def evaluation_design_audit(manifest, pilot=None):
                     'stratified_document', 'document_stratified',
                     'stratified_article', 'article_stratified'):
         out['sampling']['probability_sample'] = True
-    supports_population = design.get(
-        'supports_population_claim', design.get(
-            'population_claim', stat.get('supports_population_claim', False)))
+    supports_population = design.get('supports_population_claim')
+    if supports_population is None:
+        supports_population = design.get('population_claim')
+    if supports_population is None:
+        supports_population = stat.get('supports_population_claim', False)
     if not isinstance(supports_population, (bool, np.bool_)):
         out['violations'].append(
             'supports_population_claim must be a boolean when declared')
@@ -20636,6 +20742,17 @@ def evaluation_design_audit(manifest, pilot=None):
     comps = comps if isinstance(comps, list) else []
     pilot_comps = pilot.get('comparisons') if isinstance(
         pilot, dict) and isinstance(pilot.get('comparisons'), dict) else {}
+    def _pilot_deltas(vals):
+        if isinstance(vals, np.ndarray):
+            return vals.tolist() if vals.ndim == 1 else None
+        if isinstance(vals, (list, tuple)):
+            return list(vals)
+        return None
+
+    def _has_pilot_delta(vals):
+        return isinstance(vals, list) and any(
+            _finite_scalar(v) is not None for v in vals)
+
     pilot_cells = 0
     if comps:
         for comp in comps:
@@ -20651,10 +20768,8 @@ def evaluation_design_audit(manifest, pilot=None):
             cell = pilot_comps.get(name) if isinstance(pilot_comps, dict) else None
             unit_deltas = None
             if isinstance(cell, dict):
-                unit_deltas = cell.get('unit_deltas')
-                if not isinstance(unit_deltas, list):
-                    unit_deltas = None
-                else:
+                unit_deltas = _pilot_deltas(cell.get('unit_deltas'))
+                if _has_pilot_delta(unit_deltas):
                     pilot_cells += 1
             sesoi = comp.get('sesoi')
             if sesoi is None:
@@ -20674,12 +20789,14 @@ def evaluation_design_audit(manifest, pilot=None):
                 f'{name}: {w}' for w in (rep.get('warnings') or []))
             if rep.get('status') == 'fail':
                 out['status'] = 'fail'
+            elif (rep.get('status') == 'not_verifiable'
+                  and out['status'] == 'ok'):
+                out['status'] = 'not_verifiable'
     else:
-        unit_deltas = design.get('pilot_unit_deltas')
-        if not isinstance(unit_deltas, list):
-            unit_deltas = pilot.get('unit_deltas') if isinstance(
-                pilot, dict) and isinstance(pilot.get('unit_deltas'), list) else None
-        if unit_deltas is not None:
+        unit_deltas = _pilot_deltas(design.get('pilot_unit_deltas'))
+        if unit_deltas is None and isinstance(pilot, dict):
+            unit_deltas = _pilot_deltas(pilot.get('unit_deltas'))
+        if _has_pilot_delta(unit_deltas):
             pilot_cells = 1
         rep = unit_precision_design(
             raw_n, pilot_unit_deltas=unit_deltas, unit_label=unit_label,
@@ -20691,6 +20808,8 @@ def evaluation_design_audit(manifest, pilot=None):
         out['warnings'].extend(rep.get('warnings') or [])
         if rep.get('status') == 'fail':
             out['status'] = 'fail'
+        elif rep.get('status') == 'not_verifiable' and out['status'] == 'ok':
+            out['status'] = 'not_verifiable'
     out['population'] = {
         'n_units': out['n_units'], 'unit_label': out['unit_label'],
         'min_units_for_population': min_units,
@@ -20722,12 +20841,24 @@ def evaluation_design_audit(manifest, pilot=None):
     elif supports_population:
         _n = out['n_units']
         _label = out['unit_label']
-        if (_n is None or _label == 'row'
-                or (isinstance(_n, int) and _n < min_units)):
+        _mu_check = _design_int(min_units)
+        if (_n is None or _label == 'row' or _mu_check is None
+                or _mu_check < 2 or _mu_check > 1000000
+                or _n < _mu_check):
             out['violations'].append(
                 'manifest declares supports_population_claim=true but the '
                 f'frozen design (n_units={_n!r}, unit={_label!r}, floor='
                 f'{min_units}) cannot support it')
+            out['status'] = 'fail'
+        if out['sampling'].get('probability_sample') is False:
+            out['violations'].append(
+                'manifest declares a population claim but the test slice is a '
+                'deterministic prefix/first-n sample')
+            out['status'] = 'fail'
+        elif out['sampling'].get('probability_sample') is None:
+            out['violations'].append(
+                'manifest declares a population claim but no machine-readable '
+                'probability sampling design is declared')
             out['status'] = 'fail'
     if pilot_cells == 0:
         if out['status'] == 'ok':

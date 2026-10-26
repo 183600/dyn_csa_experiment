@@ -4174,6 +4174,15 @@ def run_power(manifest_path=FREEZE_MANIFEST, summary='results_v10_mech/summary.j
         qs.append(power_q)
     min_power = float(stat.get('min_power_for_test', 0.80))
     require = bool(stat.get('require_power_gate'))
+    _eval_design = manifest.get('evaluation_design')
+    if not isinstance(_eval_design, dict):
+        _eval_design = manifest.get('evaluation')
+    if not isinstance(_eval_design, dict):
+        _eval_design = {}
+    _min_units = _eval_design.get('min_units_for_population')
+    if _min_units is None:
+        _min_units = stat.get(
+            'min_units_for_population', L.MIN_DOCS_FOR_POPULATION_CLAIM)
     report = {'kind': 'power_validation', 'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
               'manifest': manifest_path, 'manifest_sha256': manifest.get('manifest_sha256'),
               'summary': summary, 'alpha': alpha, 'm_family': m_family,
@@ -4242,11 +4251,29 @@ def run_power(manifest_path=FREEZE_MANIFEST, summary='results_v10_mech/summary.j
                                      [c_b for _, c_b in _unit_pairs])
         cell['evaluation_unit'] = _unit
         if _unit.get('status') == 'ok':
+            # The pilot units come from validation, but the precision design
+            # must use the FROZEN test-slice unit count.  Passing the pilot
+            # count here silently sized the test panel from the validation
+            # panel (and could allow a population claim the test slice cannot
+            # support).
+            _frozen_units = L.evaluation_design_units(manifest)
+            _planned_n = _frozen_units['raw_n_units']
+            _planned_label = _frozen_units['unit_label']
+            if _planned_n is not None and not _frozen_units['label_declared']:
+                _planned_label = _unit['unit']
             _up = L.unit_precision_design(
-                _unit['n_units'], pilot_unit_deltas=_unit['deltas'],
-                unit_label=_unit['unit'], sesoi=_sesoi,
+                _planned_n, pilot_unit_deltas=_unit['deltas'],
+                unit_label=_planned_label, sesoi=_sesoi,
                 target_power=min_power, alpha=alpha,
-                require_sesoi_power=_require_sesoi)
+                require_sesoi_power=_require_sesoi,
+                min_units_for_population=_min_units)
+            _up['pilot_n_units'] = _unit['n_units']
+            _up['pilot_unit'] = _unit['unit']
+            if _planned_label != _unit['unit']:
+                _up.setdefault('warnings', []).append(
+                    f'frozen evaluation unit {_planned_label!r} differs from '
+                    f'the pilot unit {_unit["unit"]!r}; the pilot SD is not a '
+                    'validated estimate at the frozen granularity')
             cell['unit_deltas'] = list(_unit['deltas'])
             if _unit.get('ids') is not None:
                 cell['unit_ids'] = list(_unit['ids'])
