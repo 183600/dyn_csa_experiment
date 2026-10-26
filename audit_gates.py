@@ -6256,6 +6256,17 @@ def audit_look_history(paths=None):
                             la = e.get('look_analysis') if isinstance(e, dict) else None
                             if isinstance(la, dict) and la.get('contrast'):
                                 audit_entries[str(la['contrast'])] = (e, la)
+                # 2x2 interactions use the same look-history key namespace and
+                # the same sequential primitive; the gate must verify them too,
+                # not only the ablation/baseline contrasts.
+                _ix = audit.get('interactions') or {}
+                for _name, _rec in (_ix.get('factorials') or {}).items():
+                    cell = (_rec.get('interaction')
+                            if isinstance(_rec, dict) else None)
+                    la = (cell.get('look_analysis')
+                          if isinstance(cell, dict) else None)
+                    if isinstance(la, dict) and la.get('contrast'):
+                        audit_entries[str(la['contrast'])] = (cell, la)
             for key, looks in sorted(series.items()):
                 if len(looks) < 2:
                     continue
@@ -6310,12 +6321,21 @@ def audit_look_history(paths=None):
                     rec['problems'].append(
                         f'{key}: audit sequential p={la.get("p_sequential")!r} does not '
                         f'match the recomputed {seq.get("p_sequential")!r}')
-                if (e.get('significant_global_naive')
-                        and not e.get('significant_global')):
+                _naive = e.get('significant_global_naive')
+                _adj = e.get('significant_global')
+                _p_naive = e.get('p_holm_global_naive')
+                if _naive is None and _adj is None:
+                    # Interaction cells use the interaction-family names; the
+                    # sequential p is still the same primitive and the same
+                    # downgrade rule.
+                    _naive = e.get('significant_family_naive')
+                    _adj = e.get('significant_family')
+                    _p_naive = e.get('p_holm_naive')
+                if _naive and not _adj:
                     rec['downgraded'].append(key)
                     out['downgraded_claims'].append(
                         {'panel': panel_dir, 'contrast': key,
-                         'p_naive': e.get('p_holm_global_naive'),
+                         'p_naive': _p_naive,
                          'p_sequential': la.get('p_sequential')})
         out['n_panels'] += 1
         out['n_looks'] += int(rec['looks'])

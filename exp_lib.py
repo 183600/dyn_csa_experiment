@@ -28086,7 +28086,19 @@ def _contrast_look_key(kind, comp, with_arm, without_arm, tag_with, tag_without)
                                     tag_with or '', tag_without or '')
 
 
-def panel_look_snapshot(recs, *, design=None, baselines=None):
+def _interaction_look_key(name):
+    """Stable look-history key for one declared 2x2 factorial.
+
+    The interaction is recomputed from the four cells at each aggregation, so
+    the key is the factorial identity.  If the cell arms or their protocol
+    tags change, the per-seed interaction values change too; the sequential
+    reader then treats the earlier look as stale and excludes it by name
+    rather than silently mixing two estimands.
+    """
+    return 'interaction::%s' % name
+
+
+def panel_look_snapshot(recs, *, design=None, baselines=None, factorials=None):
     """Measured declared contrasts with their exact per-seed deltas.
 
     This is the evidence a look needs: the seed set that was actually paired
@@ -28094,9 +28106,15 @@ def panel_look_snapshot(recs, *, design=None, baselines=None):
     delta for each seed.  Only contrasts with at least one controlled pair are
     emitted; missing arms are the job of the completeness audit, not of the
     look history.
+
+    ``factorials`` additionally records each controlled 2x2 interaction as a
+    per-seed look series (default: ``FACTORIAL_DESIGN``; pass ``{}`` to omit).
+    A declared interaction family is an analysis family too, so a seed top-up
+    must not silently buy an interaction or an additivity claim.
     """
     design = ABLATION_DESIGN if design is None else design
     baselines = BASELINE_DESIGN if baselines is None else baselines
+    factorials = FACTORIAL_DESIGN if factorials is None else factorials
     # The aggregation path hands this function the raw summary mapping, whose
     # keys are strings/legacy ids; the unit-test path hands it the normalized
     # {(variant, protocol, seed): rec} map.  Normalize the former exactly like
@@ -28143,6 +28161,7 @@ def panel_look_snapshot(recs, *, design=None, baselines=None):
                         'p_exact_signflip': float(sf.get('p', float('nan'))),
                         'n_skipped_pairs': int(len(skipped)),
                     }
+    out.update(factorial_look_snapshot(recs, design=factorials))
     return out
 
 
@@ -28172,16 +28191,20 @@ def load_look_history(outdir):
     return obj
 
 
-def record_panel_look(outdir, recs, *, design=None, baselines=None, now=None):
+def record_panel_look(outdir, recs, *, design=None, baselines=None,
+                      factorials=None, now=None):
     """Append a look snapshot when the measured contrast set changed.
 
     Re-aggregating an unchanged panel does NOT add a look (the same seed set
     is the same analysis).  A new seed, a newly measured arm or a re-run delta
     does add one.  The file is bounded by :data:`LOOK_HISTORY_MAX_LOOKS`; the
     oldest looks are dropped with an explicit ``truncated`` flag so the record
-    never silently becomes a different kind of evidence.
+    never silently becomes a different kind of evidence.  ``factorials`` is
+    forwarded to :func:`panel_look_snapshot` so declared 2x2 interactions are
+    covered by the same optional-stopping correction as ablations.
     """
-    snapshot = panel_look_snapshot(recs, design=design, baselines=baselines)
+    snapshot = panel_look_snapshot(recs, design=design, baselines=baselines,
+                                   factorials=factorials)
     hist = load_look_history(outdir)
     if not snapshot:
         # No declared contrast is measured in this panel (e.g. a pure
@@ -30067,9 +30090,140 @@ def _factorial_condition_rows(recs, cells, *, strict_hyper=True):
                            'capacity_controlled': capacity_controlled}
 
 
+def factorial_look_snapshot(recs, *, design=None):
+    """Per-seed 2x2 interaction values for the look history.
+
+    Only seeds whose four cells clear the same controlled-pair gate as
+    :func:`factorial_interaction_audit` are emitted.  The snapshot stores the
+    exact per-seed interaction estimand, not a p-value decision, so the
+    sequential max-over-looks test can be recomputed later without trusting a
+    recorded verdict.  A partial or uncontrolled factorial emits nothing; the
+    completeness audit, not the look file, is responsible for naming it.
+    """
+    design = FACTORIAL_DESIGN if design is None else design
+    out = {}
+    if not isinstance(recs, dict) or not isinstance(design, dict):
+        return out
+    if not all(isinstance(k, tuple) and len(k) == 3 for k in recs):
+        recs, _amb = _variant_seed_map(recs)
+    present = {k[0] for k in recs
+               if isinstance(k, tuple) and len(k) == 3}
+    for name, spec in design.items():
+        if not isinstance(spec, dict):
+            continue
+        cells = spec.get('cells')
+        if not isinstance(cells, dict):
+            continue
+        raw_arms = [cells.get(k) for k in _FACTORIAL_CELL_KEYS]
+        if any(not isinstance(a, str) or not a.strip() for a in raw_arms):
+            continue
+        arms = [a.strip() for a in raw_arms]
+        if len(set(arms)) != 4 or not set(arms).issubset(present):
+            continue
+        norm_cells = {k: arms[i] for i, k in enumerate(_FACTORIAL_CELL_KEYS)}
+        rows, _skipped, _param = _factorial_condition_rows(recs, norm_cells)
+        if not rows:
+            continue
+        seeds = [int(r['seed']) for r in rows]
+        deltas = [float(r['interaction_log_ppl']) for r in rows]
+        sf = exact_signflip_p(deltas)
+        out[_interaction_look_key(str(name))] = {
+            'kind': 'interaction',
+            'factorial': str(name),
+            'cells': {f'{k[0]}|{k[1]}': norm_cells[k]
+                      for k in _FACTORIAL_CELL_KEYS},
+            'tags': {str(r['seed']): str(r.get('tag') or '') for r in rows},
+            'seeds': seeds,
+            'deltas': deltas,
+            'n': int(len(deltas)),
+            'mean': float(np.mean(deltas)),
+            'p_exact_signflip': float(sf.get('p', float('nan'))),
+        }
+    return out
+
+
+def _interaction_look_analysis(look_series, key, final_seeds, final_deltas,
+                               *, alpha=0.05):
+    """Sequential max-over-looks p for one interaction contrast.
+
+    Mirrors the ablation look reader: a recorded look whose shared-seed delta
+    disagrees with the current record is STALE (the seed was re-run), so it is
+    excluded and named instead of being mixed into the joint null.  The
+    current aggregation is appended when the history does not already contain
+    it, so a manually edited summary still gets a two-look check.
+    """
+    if not final_seeds or not final_deltas:
+        return None, [], 0
+    cur = {}
+    for s, d in zip(final_seeds, final_deltas):
+        si = _as_seed_int(s)
+        di = _finite_scalar(d)
+        if si is None or di is None:
+            raise ValueError(
+                'final interaction look seeds/deltas must be finite numbers')
+        cur[si] = float(di)
+
+    def _rows(rec):
+        raw_seeds, raw_deltas = rec.get('seeds'), rec.get('deltas')
+        if raw_seeds is None or raw_deltas is None:
+            return None
+        if (isinstance(raw_seeds, (str, bytes, bytearray))
+                or isinstance(raw_deltas, (str, bytes, bytearray))):
+            return None
+        seeds = [_as_seed_int(s) for s in raw_seeds]
+        deltas = [_finite_scalar(d) for d in raw_deltas]
+        if any(s is None for s in seeds) or any(d is None for d in deltas):
+            return None
+        if len(seeds) != len(deltas) or not seeds:
+            return None
+        pairs = sorted(zip(seeds, deltas), key=lambda t: t[0])
+        return [int(s) for s, _d in pairs], [float(d) for _s, d in pairs]
+
+    series, stale, seen = [], [], set()
+    for lk in (look_series or {}).get(key) or []:
+        try:
+            parsed = _rows(lk)
+        except (TypeError, ValueError):
+            parsed = None
+        if parsed is None:
+            stale.append({'look': lk.get('look'),
+                          'reason': 'non-numeric/invalid seed-delta rows'})
+            continue
+        seeds, deltas = parsed
+        dm = dict(zip(seeds, deltas))
+        bad = [s for s in seeds if s in cur and abs(dm[s] - cur[s]) > 1e-9]
+        if bad:
+            stale.append({'look': lk.get('look'),
+                          'reason': 'seed delta changed across looks',
+                          'seeds': sorted(bad)})
+            continue
+        sig = (tuple(seeds), tuple(round(v, 12) for v in deltas))
+        if sig in seen:
+            continue
+        seen.add(sig)
+        series.append({'look': lk.get('look'), 'seeds': seeds,
+                       'deltas': deltas})
+    _order = sorted(cur)
+    sig = (tuple(_order), tuple(round(cur[s], 12) for s in _order))
+    if sig not in seen:
+        series.append({
+            'look': (series[-1].get('look', 0) + 1 if series else 1),
+            'seeds': _order, 'deltas': [cur[s] for s in _order],
+            'current': True,
+        })
+    if not series:
+        return None, stale, 0
+    seq = sequential_signflip_p(series, alpha=alpha)
+    seq['contrast'] = key
+    seq['n_stale_looks'] = len(stale)
+    seq['stale_looks'] = stale
+    seq['look_adjusted'] = bool(len(series) > 1)
+    return seq, stale, len(series)
+
+
 def factorial_interaction_audit(summary=None, design=None, *, alpha=0.05,
                                 min_n=3, recs=None, hypotheses=None,
-                                sesoi=None):
+                                sesoi=None, look_history=None):
     """Paired 2x2 interaction tests for the declared ablation factorials.
 
     The estimand is the *change* in a paired effect: for each seed,
@@ -30091,6 +30245,12 @@ def factorial_interaction_audit(summary=None, design=None, *, alpha=0.05,
     and yields an ``additive`` verdict only if the interval lies inside the
     margin.  A non-significant interaction without that test stays
     ``indeterminate``; it is never evidence of additivity.
+
+    ``look_history`` (a ``look_history.json`` object) applies the same exact
+    max-over-looks correction to the interaction family: a factorial measured
+    after seed top-ups is judged by the sequential sign-flip p, not only by
+    the final-n p, and the equivalence (TOST) p is Bonferroni-corrected over
+    looks.  Without a history the historical final-look behaviour is kept.
     """
     alpha = _validated_alpha(alpha, context='factorial_interaction_audit alpha')
     _min_n = _as_seed_int(min_n)
@@ -30108,12 +30268,21 @@ def factorial_interaction_audit(summary=None, design=None, *, alpha=0.05,
     except ValueError as e:
         sesoi_specs = {}
         sesoi_error = f'{type(e).__name__}: {e}'
+    _look_series = looks_by_contrast(look_history or {})
+    _look_invalid = ((look_history or {}).get('invalid')
+                     if isinstance(look_history, dict) else
+                     (None if look_history is None else
+                      f'look_history is a {type(look_history).__name__}, not an object'))
     empty_extra = {'equivalent_interactions': [],
                    'hypothesis_supported_interactions': [],
                    'sub_sesoi_interactions': [],
                    'indeterminate_interactions': [],
                    'not_measured_interactions': [],
                    'not_declared_interactions': [],
+                   'look_adjusted_interactions': [],
+                   'downgraded_interactions': [],
+                   'look_history': {'n_look_adjusted': 0,
+                                    'invalid': _look_invalid},
                    'sesoi': {'declared': sorted(sesoi_specs), 'error': sesoi_error}}
     if not isinstance(design, dict) or not design:
         return {'kind': 'factorial_interaction', 'status': 'not_applicable',
@@ -30176,6 +30345,16 @@ def factorial_interaction_audit(summary=None, design=None, *, alpha=0.05,
            'indeterminate_interactions': [],
            'not_measured_interactions': [],
            'not_declared_interactions': [],
+           'look_adjusted_interactions': [],
+           'downgraded_interactions': [],
+           'look_history': {
+               'n_look_adjusted': 0,
+               'invalid': _look_invalid,
+               'policy': ('each new seed set aggregated for this panel is one '
+                          'look; the interaction family uses the exact '
+                          'max-over-looks sign-flip p and the TOST p is '
+                          'Bonferroni-corrected over looks'),
+           },
            'sesoi': {
                'declared': sorted(sesoi_specs),
                'error': sesoi_error,
@@ -30204,7 +30383,14 @@ def factorial_interaction_audit(summary=None, design=None, *, alpha=0.05,
         out['warnings'].append(
             f'interaction SESOI is malformed; no practical interaction claim '
             f'is allowed: {sesoi_error}')
+    if _look_invalid:
+        out['warnings'].append(
+            f'interaction look history is unreadable or malformed '
+            f'({_look_invalid}); the optional-stopping correction cannot be '
+            'verified for the interaction family — do not read its naive p as '
+            'look-adjusted')
     family = []
+    family_naive = []
     tost_family = []
     interaction_values = {}
 
@@ -30217,6 +30403,7 @@ def factorial_interaction_audit(summary=None, design=None, *, alpha=0.05,
         out['warnings'].append(
             f'{name}: {reason}; its family slot is kept at p=1')
         family.append((sname, 1.0))
+        family_naive.append((sname, 1.0))
         _sesoi_spec = sesoi_specs.get(sname)
         _margin = (_sesoi_spec.get('margin_log_ratio')
                    if isinstance(_sesoi_spec, dict) else None)
@@ -30296,6 +30483,7 @@ def factorial_interaction_audit(summary=None, design=None, *, alpha=0.05,
                 f'{name}: 2x2 interaction is incomplete (missing '
                 + ', '.join(missing) + '); its family slot is kept at p=1')
             family.append((str(name), 1.0))
+            family_naive.append((str(name), 1.0))
             if _margin is None:
                 rec['practical_decision'] = 'not_declared'
                 rec['sesoi'] = {
@@ -30327,6 +30515,7 @@ def factorial_interaction_audit(summary=None, design=None, *, alpha=0.05,
             out['warnings'].append(f'{name}: no complete 2x2 seed remains; '
                                    'its family slot is kept at p=1')
             family.append((str(name), 1.0))
+            family_naive.append((str(name), 1.0))
             if _margin is None:
                 rec['practical_decision'] = 'not_declared'
                 rec['sesoi'] = {
@@ -30402,13 +30591,43 @@ def factorial_interaction_audit(summary=None, design=None, *, alpha=0.05,
             cell['mechanism_claim_allowed'] = True
         rec['interaction'] = cell
         rec['status'] = 'ok'
-        family.append((str(name),
-                       float(st['p_exact_signflip'])
-                       if (isinstance(st.get('p_exact_signflip'), (int, float))
-                           and math.isfinite(float(st['p_exact_signflip'])))
-                       else 1.0))
         _vals = [float(r['interaction_log_ppl']) for r in rows]
         interaction_values[str(name)] = _vals
+        _look_key = _interaction_look_key(str(name))
+        _seq, _stale, _n_series = _interaction_look_analysis(
+            _look_series, _look_key, [r['seed'] for r in rows], _vals,
+            alpha=alpha)
+        cell['look_analysis'] = _seq
+        cell['look_adjusted'] = bool((_seq or {}).get('look_adjusted'))
+        cell['n_looks'] = int((_seq or {}).get('n_looks') or 0)
+        _adj_p = ((_seq or {}).get('p_sequential')
+                  if isinstance(_seq, dict) else st.get('p_exact_signflip'))
+        if not (isinstance(_adj_p, (int, float))
+                and math.isfinite(float(_adj_p))):
+            _adj_p = 1.0
+        cell['p_look_adjusted'] = float(_adj_p)
+        _raw_p = (float(st['p_exact_signflip'])
+                  if (isinstance(st.get('p_exact_signflip'), (int, float))
+                      and math.isfinite(float(st['p_exact_signflip'])))
+                  else 1.0)
+        if _stale:
+            out['warnings'].append(
+                f'{name}: {len(_stale)} recorded interaction look(s) are STALE '
+                '(a seed delta changed after re-running); they were excluded '
+                f'from the sequential test, so the correction covers only the '
+                f'remaining {int((_seq or {}).get("n_looks") or 1)} look(s)')
+        family.append((str(name), float(_adj_p)))
+        family_naive.append((str(name), _raw_p))
+        if cell['look_adjusted']:
+            out['look_adjusted_interactions'].append(str(name))
+            if _raw_p < alpha <= float(_adj_p):
+                out['downgraded_interactions'].append(str(name))
+                out['warnings'].append(
+                    f'{name}: the naive final-look interaction p={_raw_p:.4g} '
+                    f'would be significant, but the exact max-over-looks p '
+                    f'over {cell["n_looks"]} looks is {float(_adj_p):.4g} '
+                    f'(>= alpha={alpha:.3g}); a seed top-up does not make the '
+                    'interaction confirmable')
         if _sesoi_spec is None:
             rec['practical_decision'] = 'not_declared'
             cell['practical_decision'] = 'not_declared'
@@ -30424,14 +30643,22 @@ def factorial_interaction_audit(summary=None, design=None, *, alpha=0.05,
             _pd = interaction_practical_decision(
                 _vals, margin=float(_margin), alpha=alpha, min_n=min_n,
                 direction=_dir, label=str(name))
+            _pt = _pd.get('tost_p_tost')
+            _pt_adj = (float(_pt) if (isinstance(_pt, (int, float))
+                                      and math.isfinite(float(_pt)))
+                       else 1.0)
+            _k_looks = int(cell['n_looks'] or 1)
+            if _k_looks > 1:
+                # Equivalence is a positive claim and is equally exposed to
+                # optional stopping; Bonferroni over the spent looks is valid
+                # and conservative.
+                _pt_adj = min(1.0, _pt_adj * _k_looks)
+            _pd['p_tost_look_adjusted'] = _pt_adj
+            _pd['n_looks'] = _k_looks
             rec['practical_decision'] = _pd['decision']
             cell['sesoi'] = _pd
             cell['practical_decision'] = _pd['decision']
-            _pt = _pd.get('tost_p_tost')
-            tost_family.append((
-                str(name),
-                float(_pt) if (isinstance(_pt, (int, float))
-                               and math.isfinite(float(_pt))) else 1.0))
+            tost_family.append((str(name), _pt_adj))
     if not out['factorials']:
         if out['status'] != 'fail':
             out['status'] = 'incomplete' if out['warnings'] else 'not_applicable'
@@ -30441,6 +30668,7 @@ def factorial_interaction_audit(summary=None, design=None, *, alpha=0.05,
         return out
     if family:
         h = holm_adjust(family, alpha=alpha)
+        hn = holm_adjust(family_naive, alpha=alpha) if family_naive else {}
         floors = []
         for name, _p in family:
             rec = out['factorials'].get(name) or {}
@@ -30452,6 +30680,9 @@ def factorial_interaction_audit(summary=None, design=None, *, alpha=0.05,
             'alpha': float(alpha),
             'min_seeds_for_family_significance': signflip_min_n_for_holm(len(family), alpha),
             'min_attainable_p_holm': holm_min_attainable_p_floors(floors, alpha=alpha),
+            'n_look_adjusted': len(out['look_adjusted_interactions']),
+            'p_adjustment': ('exact max-over-looks sign-flip p per interaction; '
+                             'naive final-look p kept as p_holm_naive'),
             'note': ('missing/uncontrolled factorials keep a dummy p=1 slot; '
                      'this family never changes the leave-one-out or frozen '
                      'confirmatory correction'),
@@ -30471,11 +30702,16 @@ def factorial_interaction_audit(summary=None, design=None, *, alpha=0.05,
             if not cell.get('available'):
                 continue
             cell['p_holm'] = (h.get(name) or {}).get('p_holm')
+            cell['p_holm_naive'] = (hn.get(name) or {}).get('p_holm')
             cell['p_tost_holm'] = (ht.get(name) or {}).get('p_holm')
             cell['significant_family'] = bool(
                 cell.get('significant')
                 and isinstance(cell.get('p_holm'), (int, float))
                 and float(cell['p_holm']) < alpha)
+            cell['significant_family_naive'] = bool(
+                cell.get('significant')
+                and isinstance(cell.get('p_holm_naive'), (int, float))
+                and float(cell['p_holm_naive']) < alpha)
             if cell['significant_family']:
                 out['significant_interactions'].append(name)
                 if cell.get('direction_consistent') is False:
@@ -30485,15 +30721,24 @@ def factorial_interaction_audit(summary=None, design=None, *, alpha=0.05,
             if _spec is not None and _vals:
                 _pred = cell.get('predicted_sign')
                 _dir = _pred if _pred in (-1, 0, 1) else 0
+                _prev = cell.get('sesoi') or {}
                 _pd = interaction_practical_decision(
                     _vals, margin=float(_spec['margin_log_ratio']),
                     alpha=alpha, min_n=min_n, direction=_dir,
                     p_holm=cell.get('p_holm'),
                     p_holm_tost=cell.get('p_tost_holm'),
                     label=name)
+                _pd['p_tost_look_adjusted'] = _prev.get('p_tost_look_adjusted')
+                _pd['n_looks'] = _prev.get('n_looks')
                 rec['practical_decision'] = _pd['decision']
                 cell['sesoi'] = _pd
                 cell['practical_decision'] = _pd['decision']
+    out['look_history']['n_look_adjusted'] = len(
+        out['look_adjusted_interactions'])
+    out['look_history']['look_adjusted_contrasts'] = list(
+        out['look_adjusted_interactions'])
+    out['look_history']['downgraded_naive_significant'] = list(
+        out['downgraded_interactions'])
     # One classification pass over every declared factorial avoids duplicate
     # list entries across complete, incomplete and no-data branches.
     for name, rec in out['factorials'].items():
@@ -31914,7 +32159,7 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
     # computed from the same controlled-pair records but never enter `m_family`
     # above, and never alter the frozen/confirmatory verdict.
     report['interactions'] = factorial_interaction_audit(
-        recs=recs, alpha=alpha, min_n=min_n)
+        recs=recs, alpha=alpha, min_n=min_n, look_history=look_history)
     for _iw in report['interactions'].get('warnings') or []:
         report['warnings'].append('interaction: ' + str(_iw))
     report['family'] = {
@@ -32758,17 +33003,37 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
     # the same stable key the look file uses.  `n_looks` is the maximum number
     # of looks among adjusted contrasts (a panel-level count of analysis
     # rounds, not of statistical tests).
-    _look_entries = [e for e in all_entries if isinstance(e.get('look_analysis'), dict)]
-    report['look_adjusted_contrasts'] = sorted(set(report['look_adjusted_contrasts']))
+    _ix_report = report.get('interactions') or {}
+    _ix_cells = [rec.get('interaction')
+                 for rec in (_ix_report.get('factorials') or {}).values()
+                 if isinstance(rec, dict)
+                 and isinstance(rec.get('interaction'), dict)]
+    _look_entries = [e for e in all_entries
+                     if isinstance(e.get('look_analysis'), dict)]
+    _look_entries += [c for c in _ix_cells
+                      if isinstance(c.get('look_analysis'), dict)]
+    _ix_look_keys = {c['look_analysis'].get('contrast')
+                     for c in _ix_cells
+                     if isinstance(c.get('look_analysis'), dict)
+                     and c['look_analysis'].get('contrast')}
+    report['look_adjusted_contrasts'] = sorted(
+        set(report['look_adjusted_contrasts']) | _ix_look_keys)
     _look_keys = sorted({e['look_analysis'].get('contrast') for e in _look_entries
                          if e['look_analysis'].get('contrast')})
     _multi = [e for e in _look_entries
               if int(e['look_analysis'].get('n_looks') or 0) > 1]
     _multi_keys = sorted({e['look_analysis'].get('contrast') for e in _multi
                           if e['look_analysis'].get('contrast')})
-    _downgraded = sorted({
-        e['look_analysis'].get('contrast') for e in _look_entries
-        if e.get('significant_global_naive') and not e.get('significant_global')})
+    _downgraded = set()
+    for e in _look_entries:
+        if 'significant_global_naive' in e:
+            if (e.get('significant_global_naive')
+                    and not e.get('significant_global')):
+                _downgraded.add(e['look_analysis'].get('contrast'))
+        elif (e.get('significant_family_naive')
+              and not e.get('significant_family')):
+            _downgraded.add(e['look_analysis'].get('contrast'))
+    _downgraded = sorted(k for k in _downgraded if k)
     report['look_history'] = {
         'schema': LOOK_HISTORY_SCHEMA,
         'panel_looks': int(max([int(e['look_analysis'].get('n_looks') or 0)
@@ -32930,6 +33195,14 @@ def _print_methodology_audit(report):
         print('  interaction family: m=%s, alpha=%g, min attainable p_Holm=%s'
               % (_ixf.get('m'), float(_ix.get('alpha', 0.05)),
                  _ixf.get('min_attainable_p_holm')))
+        _ixl = _ix.get('look_history') or {}
+        if int(_ixl.get('n_look_adjusted') or 0):
+            print('  interaction looks: %d contrast(s) use the exact '
+                  'max-over-looks p%s'
+                  % (int(_ixl['n_look_adjusted']),
+                     ('; DOWNGRADED ' + ', '.join(
+                         _ixl.get('downgraded_naive_significant') or []))
+                     if _ixl.get('downgraded_naive_significant') else ''))
         for _name, _irec in _ix['factorials'].items():
             _ic = _irec.get('interaction') or {}
             if not _ic.get('available'):
