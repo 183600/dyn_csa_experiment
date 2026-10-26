@@ -20139,6 +20139,607 @@ def paired_design_sensitivity(n_seeds, m_comparisons, *, alpha=0.05,
     return out
 
 
+_UNIT_GRANULARITIES = (
+    ('article', 'ppl_per_article', 'article_ids'),
+    ('document', 'ppl_per_doc', 'doc_ids'),
+    ('row', 'ppl_per_seq', None),
+)
+
+
+def paired_unit_deltas(rows_a, rows_b, *, unit='auto'):
+    """Per-unit paired PPL differences averaged over paired seeds.
+
+    ``rows_a``/``rows_b`` are equal-length lists of by-length cells (for
+    example ``record['by_len'][4096]``) in the same seed order.  Each cell may
+    carry ``ppl_per_article``, ``ppl_per_doc`` or ``ppl_per_seq``.  The
+    function selects the most independent available unit (article before
+    document before row), checks that all seeds share the same unit count and
+    identities, and returns the seed-averaged per-unit difference
+    ``mean_seed(ppl_a[u] - ppl_b[u])``.
+
+    The result is the pilot input for :func:`unit_precision_design`.  It is a
+    paired design quantity, not a test statistic: averaging over seeds removes
+    the seed-level pairing noise and leaves the evaluation-unit sampling
+    distribution that the test-time document bootstrap must confront.
+    """
+    if unit not in ('auto', 'article', 'document', 'row'):
+        raise ValueError(
+            f"unit must be 'auto', 'article', 'document' or 'row', got {unit!r}")
+    try:
+        rows_a = list(rows_a)
+        rows_b = list(rows_b)
+    except TypeError:
+        raise ValueError('rows_a and rows_b must be sequences of by-length cells') from None
+    if len(rows_a) != len(rows_b):
+        return {'status': 'not_available', 'reason': (
+            f'seed panels differ in length: {len(rows_a)} vs {len(rows_b)}')}
+    if len(rows_a) < 1:
+        return {'status': 'not_available', 'reason': 'no paired seed cells'}
+    if not all(isinstance(r, dict) for r in rows_a + rows_b):
+        raise ValueError('rows_a and rows_b must contain by-length cell objects')
+    candidates = [c for c in _UNIT_GRANULARITIES if unit == 'auto' or c[0] == unit]
+    reasons = {}
+    for label, key, id_key in candidates:
+        vectors = [r.get(key) for r in rows_a + rows_b]
+        if not all(isinstance(v, (list, tuple)) and v for v in vectors):
+            reasons[label] = f'{key} is absent, empty or not a list in every seed cell'
+            continue
+        lengths = {len(v) for v in vectors}
+        if len(lengths) != 1:
+            reasons[label] = f'{key} has inconsistent unit counts across seeds: {sorted(lengths)}'
+            continue
+        n_units = lengths.pop()
+        if n_units < 2:
+            reasons[label] = f'{key} has fewer than two units ({n_units})'
+            continue
+        ids = None
+        if id_key is not None:
+            id_vectors = [r.get(id_key) for r in rows_a + rows_b]
+            if all(isinstance(v, (list, tuple)) and len(v) == n_units
+                   for v in id_vectors):
+                first = list(id_vectors[0])
+                if any(list(v) != first for v in id_vectors[1:]):
+                    reasons[label] = f'{id_key} order/identities differ across seeds'
+                    continue
+                ids = first
+            else:
+                reasons[label] = (
+                    f'{id_key} is absent or has the wrong length; unit order '
+                    'cannot be verified across seeds')
+                continue
+        values = []
+        usable = True
+        for u in range(n_units):
+            diffs = []
+            for ra, rb in zip(rows_a, rows_b):
+                va, vb = _finite_scalar(ra[key][u]), _finite_scalar(rb[key][u])
+                if (va is None or vb is None
+                        or not ppl_is_usable(va) or not ppl_is_usable(vb)):
+                    usable = False
+                    break
+                diffs.append(va - vb)
+            if not usable:
+                break
+            values.append(float(np.mean(diffs)))
+        if not usable or len(values) < 2:
+            reasons[label] = f'{key} contains non-finite/sub-1 PPL values'
+            continue
+        return {
+            'status': 'ok', 'unit': label, 'unit_label': label,
+            'key': key, 'n_units': int(len(values)), 'n_seeds': len(rows_a),
+            'deltas': values, 'ids': ids,
+            'id_key': id_key,
+            'mean': float(np.mean(values)),
+            'sd': float(np.std(values, ddof=1)),
+            'source': (f'{key} averaged within unit over {len(rows_a)} paired seeds'),
+        }
+    return {'status': 'not_available', 'unit': None,
+            'reason': '; '.join(f'{k}: {v}' for k, v in reasons.items()),
+            'candidates': reasons}
+
+
+def _unit_power_at(n, sd, margin, alpha):
+    """Two-sided normal-approximation power at a unit-level mean margin."""
+    se = float(sd) / math.sqrt(float(n))
+    if not (math.isfinite(se) and se > 0.0):
+        return None
+    tc = _t_critical(1.0 - float(alpha), float(n) - 1.0)
+    if not math.isfinite(tc):
+        return None
+    z = float(margin) / se
+    return float(min(1.0, max(0.0, _normal_cdf(z - tc) + _normal_cdf(-z - tc))))
+
+
+def _unit_needed_n(n0, *, sd, alpha, target, kind, n_max,
+                   target_power=None):
+    """Refine a normal-approximation n around n0 with the actual t critical."""
+    n0 = max(2, int(n0))
+    if n0 > int(n_max):
+        return None
+    for n in range(n0, min(int(n_max), n0 + 50) + 1):
+        if kind == 'power':
+            power = _unit_power_at(n, sd, target, alpha)
+            if (power is not None and target_power is not None
+                    and power + 1e-15 >= float(target_power)):
+                return int(n)
+        else:
+            tc = _t_critical(1.0 - float(alpha), float(n) - 1.0)
+            if (math.isfinite(tc)
+                    and tc * float(sd) / math.sqrt(float(n)) <= float(target)):
+                return int(n)
+    return None
+
+
+def unit_precision_design(n_units, *, pilot_unit_deltas=None,
+                          pilot_unit_sd=None, unit_label='document',
+                          sesoi=None, target_power=0.80, alpha=0.05,
+                          target_halfwidth=None, require_sesoi_power=False,
+                          min_units_for_population=MIN_DOCS_FOR_POPULATION_CLAIM,
+                          n_max=100000):
+    """Design-stage precision for an evaluation-unit paired contrast.
+
+    ``paired_design_sensitivity`` plans the SEED panel: it asks how often the
+    paired sign pattern would reject.  This function plans the separate
+    evaluation-unit panel at test time: given the frozen number of documents
+    (or articles), what mean PPL difference can the design resolve, and what
+    population claim is justified?
+
+    The pilot vector is one paired difference per evaluation unit, usually
+    the seed-averaged ``ppl_a - ppl_b`` obtained from
+    :func:`paired_unit_deltas`.  The pilot units come from validation; the
+    planned ``n_units`` is the frozen test-unit count, so the two counts need
+    not match.  The output is an approximate two-sided
+    one-sample-t precision statement (normal power approximation with a t
+    critical value), not a substitute for the exact sign-flip test or the
+    document bootstrap.  A population claim additionally requires the frozen
+    unit count to reach ``min_units_for_population`` and a non-row unit.
+    """
+    out = {'kind': 'unit_precision_design', 'status': 'ok',
+           'n_units': None, 'unit_label': None, 'alpha': None,
+           'target_power': None, 'pilot': {}, 'precision': {},
+           'mde': {}, 'sesoi': {}, 'population': {}, 'violations': [],
+           'warnings': [],
+           'policy': {
+               'estimand': ('paired mean PPL difference over independent '
+                            'evaluation units, conditional on the frozen '
+                            'trained seeds'),
+               'unit': ('article is the corpus sampling unit; document is the '
+                        'real document boundary; row is a fixed evaluation '
+                        'window and cannot support population inference'),
+               'power_rule': ('two-sided one-sample-t normal approximation '
+                              'with the actual t critical value; the exact '
+                              'sign-flip test and unit bootstrap remain the '
+                              'analysis-time procedures'),
+               'population_rule': ('population claims require at least '
+                                   f'{MIN_DOCS_FOR_POPULATION_CLAIM} independent '
+                                   'units and a non-row unit label; otherwise '
+                                   'claims are limited to the frozen slice'),
+               'sesoi_rule': ('a declared SESOI is failed only when '
+                              'require_sesoi_power is true, matching the '
+                              'seed-level sensitivity policy'),
+           }}
+    n = _design_int(n_units)
+    out['n_units'] = n
+    if n is None or n < 2:
+        out['violations'].append(
+            f'n_units={n_units!r} must be an integer >= 2')
+        n = None
+    label = str(unit_label).strip().lower() if isinstance(
+        unit_label, str) else unit_label
+    if label not in ('article', 'document', 'row'):
+        out['violations'].append(
+            f"unit_label={unit_label!r} must be 'article', 'document' or 'row'")
+        label = None
+    out['unit_label'] = label
+    a = _design_probability(alpha, name='alpha', lo_open=True, hi_open=True)
+    if a is None:
+        out['violations'].append(
+            f'alpha={alpha!r} must be a finite probability in (0,1)')
+    out['alpha'] = a
+    tp = _design_probability(target_power, name='target_power',
+                             lo_open=True, hi_open=True)
+    if tp is None:
+        out['violations'].append(
+            f'target_power={target_power!r} must be a finite probability in (0,1)')
+    out['target_power'] = tp
+    if not isinstance(require_sesoi_power, (bool, np.bool_)):
+        out['violations'].append(
+            f'require_sesoi_power={require_sesoi_power!r} must be a boolean')
+        require_sesoi_power = False
+    require_sesoi_power = bool(require_sesoi_power)
+    out['require_sesoi_power'] = require_sesoi_power
+    mu = _design_int(min_units_for_population)
+    if mu is None or mu < 2 or mu > 1000000:
+        out['violations'].append(
+            f'min_units_for_population={min_units_for_population!r} must be '
+            'an integer in [2, 1000000]')
+        mu = MIN_DOCS_FOR_POPULATION_CLAIM
+    n_max_i = _design_int(n_max)
+    if n_max_i is None or n_max_i < 2 or n_max_i > 1000000:
+        out['violations'].append(
+            f'n_max={n_max!r} must be an integer in [2, 1000000]')
+        n_max_i = 100000
+    raw = []
+    dropped = 0
+    if isinstance(pilot_unit_deltas, (str, bytes)):
+        out['violations'].append(
+            'pilot_unit_deltas must be a sequence of numbers, not a string')
+        pilot_unit_deltas = None
+    if pilot_unit_deltas is not None:
+        try:
+            for value in pilot_unit_deltas:
+                f = _finite_scalar(value)
+                if f is None:
+                    dropped += 1
+                else:
+                    raw.append(f)
+        except TypeError:
+            out['violations'].append(
+                'pilot_unit_deltas must be an iterable of finite numbers, '
+                f'got {type(pilot_unit_deltas).__name__}')
+            raw = []
+    d = np.asarray(raw, dtype=float)
+    explicit_sd = None
+    if pilot_unit_sd is not None:
+        explicit_sd = _finite_scalar(pilot_unit_sd)
+        if explicit_sd is None or explicit_sd <= 0.0:
+            out['violations'].append(
+                f'pilot_unit_sd={pilot_unit_sd!r} must be a finite positive number')
+            explicit_sd = None
+    sd = None
+    if explicit_sd is not None:
+        sd = float(explicit_sd)
+        if d.size >= 2:
+            calculated = float(d.std(ddof=1))
+            if abs(calculated - sd) > 1e-12 * max(1.0, abs(sd)):
+                out['warnings'].append(
+                    'pilot_unit_sd overrides the SD recomputed from '
+                    'pilot_unit_deltas; report which sample each value came from')
+    elif d.size >= 2:
+        sd = float(d.std(ddof=1))
+        if not (math.isfinite(sd) and sd > 0.0):
+            out['warnings'].append(
+                'pilot unit deltas have zero/non-finite SD; MDE and SESOI '
+                'power are not computable')
+            sd = None
+    elif d.size == 1:
+        out['warnings'].append(
+            'only one finite pilot unit delta; a paired SD needs at least two')
+    if dropped:
+        out['warnings'].append(
+            f'{dropped} non-finite/non-numeric pilot unit delta(s) were dropped')
+    out['pilot'] = {
+        'status': ('not_provided' if (not d.size and explicit_sd is None)
+                   else 'available'),
+        'n': int(d.size), 'n_dropped': int(dropped),
+        'mean': float(d.mean()) if d.size else None, 'sd': sd,
+        'source': ('deltas' if d.size else ('pilot_unit_sd' if sd is not None else None)),
+    }
+    target_halfwidth_value = None
+    if target_halfwidth is not None:
+        target_halfwidth_value = _finite_scalar(target_halfwidth)
+        if target_halfwidth_value is None or target_halfwidth_value <= 0.0:
+            out['violations'].append(
+                f'target_halfwidth={target_halfwidth!r} must be a finite '
+                'positive number')
+            target_halfwidth_value = None
+    out['target_halfwidth'] = target_halfwidth_value
+    half = None
+    if sd is not None and a is not None and n is not None:
+        tc = _t_critical(1.0 - a, float(n) - 1.0)
+        if math.isfinite(tc):
+            half = float(tc * sd / math.sqrt(n))
+        out['precision'] = {
+            'confidence': 1.0 - a,
+            't_critical': float(tc) if math.isfinite(tc) else None,
+            'ci_halfwidth': half, 'ci95_halfwidth': half,
+            'target_halfwidth': target_halfwidth_value,
+            'meets_target': (None if target_halfwidth_value is None or half is None
+                             else bool(half <= target_halfwidth_value)),
+            'n_required_for_target_halfwidth': None,
+            'method': 'paired t interval at the frozen unit count',
+        }
+        if target_halfwidth_value is not None:
+            n0 = (float(_normal_quantile(1.0 - a / 2.0))
+                  * sd / target_halfwidth_value) ** 2
+            out['precision']['n_required_for_target_halfwidth'] = _unit_needed_n(
+                math.ceil(n0), sd=sd, alpha=a, target=target_halfwidth_value,
+                kind='halfwidth', n_max=n_max_i)
+            if out['precision']['meets_target'] is False:
+                out['warnings'].append(
+                    f'the expected paired CI half-width at n={n} '
+                    f'({half:.6g}) exceeds target_halfwidth='
+                    f'{target_halfwidth_value!r}')
+    if sd is not None and tp is not None and a is not None and n is not None:
+        ze = float(_normal_quantile(tp))
+        tc = _t_critical(1.0 - a, float(n) - 1.0)
+        mde = ((tc + ze) * sd / math.sqrt(n)) if math.isfinite(tc) else None
+        out['mde'] = {
+            'absolute': float(mde) if mde is not None else None,
+            'relative_to_pilot_sd': (float(mde) / sd if mde is not None else None),
+            'method': ('normal power approximation with the t critical value: '
+                       '(t_crit + Phi^-1(target_power)) * sd / sqrt(n)'),
+            'multiple_of_sesoi': None,
+        }
+    sesoi_value = None
+    if sesoi is not None:
+        sesoi_value = _finite_scalar(sesoi)
+        if sesoi_value is None or sesoi_value <= 0.0:
+            out['violations'].append(
+                f'sesoi={sesoi!r} must be a finite positive margin in the same '
+                'units as the paired unit deltas')
+            sesoi_value = None
+    out['sesoi'] = {
+        'margin': sesoi_value, 'status': 'not_declared',
+        'power_at_sesoi': None, 'required_n_for_target_power': None,
+        'power_ok': None,
+        'note': ('no pre-registered SESOI supplied; statistical detectability '
+                 'does not establish practical relevance'),
+    }
+    if require_sesoi_power and sesoi is None:
+        out['violations'].append(
+            'require_sesoi_power=true but no SESOI margin was declared')
+    if sesoi_value is not None:
+        if sd is None:
+            out['sesoi'].update({
+                'status': 'not_verifiable',
+                'note': 'SESOI declared but no pilot unit SD is available'})
+            if require_sesoi_power:
+                out['violations'].append(
+                    'require_sesoi_power=true but the pilot unit SD is missing')
+        elif tp is not None and a is not None and n is not None:
+            power = _unit_power_at(n, sd, sesoi_value, a)
+            ok = bool(power is not None and power + 1e-15 >= tp)
+            z_alpha = float(_normal_quantile(1.0 - a / 2.0))
+            z_power = float(_normal_quantile(tp))
+            n0 = math.ceil(((z_alpha + z_power) * sd / sesoi_value) ** 2)
+            needed = _unit_needed_n(
+                n0, sd=sd, alpha=a, target=sesoi_value, kind='power',
+                n_max=n_max_i, target_power=tp)
+            out['sesoi'].update({
+                'status': 'ok' if ok else 'underpowered',
+                'power_at_sesoi': power,
+                'required_n_for_target_power': needed,
+                'power_ok': ok,
+                'note': ('the planned unit count meets the target power at the '
+                         'pre-registered margin' if ok else
+                         'the planned unit count cannot reach target power at '
+                         'the pre-registered margin'),
+            })
+            if not ok:
+                out['warnings'].append(
+                    f'the pre-registered SESOI has approximate unit power '
+                    f'{power if power is not None else "n/a"} < '
+                    f'target_power={tp}')
+                if require_sesoi_power:
+                    out['violations'].append(
+                        'require_sesoi_power=true and the planned unit count is '
+                        'underpowered at the pre-registered SESOI')
+    if out['mde'].get('absolute') is not None and sesoi_value is not None:
+        out['mde']['multiple_of_sesoi'] = float(
+            out['mde']['absolute'] / sesoi_value)
+    claim_allowed = False
+    claim_note = None
+    if n is not None and label is not None:
+        if label == 'row':
+            claim_note = ('row is an evaluation window, not an independent '
+                          'corpus unit; population claims are refused')
+        elif n < mu:
+            claim_note = (f'n_units={n} < min_units_for_population={mu}; '
+                          'claims are limited to the frozen evaluation slice')
+        else:
+            claim_allowed = True
+            claim_note = (f'n_units={n} >= {mu} and unit={label}; a '
+                          'population claim is admissible only with a '
+                          'declared probability sampling design')
+        if not claim_allowed:
+            out['warnings'].append(claim_note)
+    out['population'] = {
+        'n_units': n, 'min_units_for_population': mu,
+        'unit_label': label, 'claim_allowed': claim_allowed,
+        'note': claim_note,
+    }
+    if not out['pilot'].get('n') and pilot_unit_sd is None:
+        out['warnings'].append(
+            'no pilot unit deltas or SD supplied; unit MDE/SESOI power cannot '
+            'be computed')
+    if out['violations']:
+        out['status'] = 'fail'
+    elif out['pilot'].get('status') == 'not_provided':
+        out['status'] = 'not_verifiable'
+    return out
+
+
+def evaluation_design_audit(manifest, pilot=None):
+    """Audit the evaluation-unit panel declared by a frozen manifest.
+
+    Seed-level power answers whether the training replication can reject.
+    This audit asks the orthogonal preparation questions: how many independent
+    test units exist, whether that count can support a population claim, and
+    (when ``v12_supp.py power`` wrote per-unit deltas) what mean PPL difference
+    the frozen slice can resolve.
+
+    ``pilot`` is the parsed ``power_validation.json`` object.  A missing pilot
+    is reported as ``not_verifiable`` with a warning, never as a pass.  No
+    test data is read.
+    """
+    out = {'kind': 'evaluation_design_audit', 'status': 'ok',
+           'n_units': None, 'unit_label': None, 'population': {},
+           'sampling': {}, 'comparisons': {}, 'violations': [],
+           'warnings': []}
+    if not isinstance(manifest, dict):
+        out['status'] = 'fail'
+        out['violations'].append(
+            f'manifest must be an object, got {type(manifest).__name__}')
+        return out
+    binding = manifest.get('binding') if isinstance(
+        manifest.get('binding'), dict) else {}
+    test_slice = binding.get('test_slice') if isinstance(
+        binding.get('test_slice'), dict) else {}
+    eval_blk = manifest.get('eval') if isinstance(
+        manifest.get('eval'), dict) else {}
+    design = manifest.get('evaluation_design')
+    if not isinstance(design, dict):
+        design = manifest.get('evaluation') if isinstance(
+            manifest.get('evaluation'), dict) else {}
+    if not isinstance(design, dict):
+        design = {}
+    stat = manifest.get('statistics') if isinstance(
+        manifest.get('statistics'), dict) else {}
+    raw_n = design.get('n_units', design.get('unit_count'))
+    if raw_n is None:
+        raw_n = eval_blk.get('n_seqs_clean', test_slice.get('n_seqs'))
+    unit_label = design.get('unit', design.get('unit_label', 'document'))
+    out['n_units'] = _design_int(raw_n)
+    out['unit_label'] = str(unit_label).strip().lower() if isinstance(
+        unit_label, str) else unit_label
+    alpha = stat.get('alpha', 0.05)
+    target_power = stat.get('min_power_for_test', 0.80)
+    min_units = design.get(
+        'min_units_for_population', stat.get(
+            'min_units_for_population', MIN_DOCS_FOR_POPULATION_CLAIM))
+    sampling = design.get('test_slice_sampling',
+                          test_slice.get('sampling'))
+    method = None
+    if isinstance(sampling, dict):
+        method = sampling.get('method', sampling.get('design'))
+    elif isinstance(sampling, str):
+        method = sampling
+    method = str(method).strip().lower() if isinstance(method, str) else None
+    out['sampling'] = {
+        'declared': sampling is not None, 'method': method,
+        'probability_sample': None,
+        'note': ('no machine-readable sampling declaration in the manifest; '
+                 'the prefix/first-n loader cannot establish a probability '
+                 'sample for population inference' if sampling is None else
+                 'declared sampling design is not independently replayed here'),
+    }
+    if method in ('prefix', 'first_n', 'first-n', 'source_order'):
+        out['sampling']['probability_sample'] = False
+        out['warnings'].append(
+            f'test-slice sampling method {method!r} is a deterministic '
+            'prefix/first-n rule, not a probability sample; population claims '
+            'are refused')
+    elif method in ('probability', 'simple_random', 'srs', 'random',
+                    'stratified_document', 'document_stratified',
+                    'stratified_article', 'article_stratified'):
+        out['sampling']['probability_sample'] = True
+    supports_population = design.get(
+        'supports_population_claim', design.get(
+            'population_claim', stat.get('supports_population_claim', False)))
+    if not isinstance(supports_population, (bool, np.bool_)):
+        out['violations'].append(
+            'supports_population_claim must be a boolean when declared')
+        supports_population = False
+    supports_population = bool(supports_population)
+    comps = manifest.get('primary_comparisons')
+    comps = comps if isinstance(comps, list) else []
+    pilot_comps = pilot.get('comparisons') if isinstance(
+        pilot, dict) and isinstance(pilot.get('comparisons'), dict) else {}
+    pilot_cells = 0
+    if comps:
+        for comp in comps:
+            if not isinstance(comp, dict):
+                out['violations'].append(
+                    f'primary comparison is not an object: {comp!r}')
+                continue
+            name = str(comp.get('name') or f'comparison_{len(out["comparisons"])}')
+            if name in out['comparisons']:
+                out['violations'].append(
+                    f'duplicate primary-comparison name {name!r}')
+                continue
+            cell = pilot_comps.get(name) if isinstance(pilot_comps, dict) else None
+            unit_deltas = None
+            if isinstance(cell, dict):
+                unit_deltas = cell.get('unit_deltas')
+                if not isinstance(unit_deltas, list):
+                    unit_deltas = None
+                else:
+                    pilot_cells += 1
+            sesoi = comp.get('sesoi')
+            if sesoi is None:
+                sesoi = stat.get('sesoi')
+            require_sesoi = (comp['require_sesoi_power']
+                             if 'require_sesoi_power' in comp
+                             else stat.get('require_sesoi_power', False))
+            rep = unit_precision_design(
+                raw_n, pilot_unit_deltas=unit_deltas, unit_label=unit_label,
+                sesoi=sesoi, target_power=target_power, alpha=alpha,
+                require_sesoi_power=require_sesoi,
+                min_units_for_population=min_units)
+            out['comparisons'][name] = rep
+            out['violations'].extend(
+                f'{name}: {v}' for v in (rep.get('violations') or []))
+            out['warnings'].extend(
+                f'{name}: {w}' for w in (rep.get('warnings') or []))
+            if rep.get('status') == 'fail':
+                out['status'] = 'fail'
+    else:
+        unit_deltas = design.get('pilot_unit_deltas')
+        if not isinstance(unit_deltas, list):
+            unit_deltas = pilot.get('unit_deltas') if isinstance(
+                pilot, dict) and isinstance(pilot.get('unit_deltas'), list) else None
+        if unit_deltas is not None:
+            pilot_cells = 1
+        rep = unit_precision_design(
+            raw_n, pilot_unit_deltas=unit_deltas, unit_label=unit_label,
+            sesoi=stat.get('sesoi'), target_power=target_power, alpha=alpha,
+            require_sesoi_power=stat.get('require_sesoi_power', False),
+            min_units_for_population=min_units)
+        out['comparisons']['all'] = rep
+        out['violations'].extend(rep.get('violations') or [])
+        out['warnings'].extend(rep.get('warnings') or [])
+        if rep.get('status') == 'fail':
+            out['status'] = 'fail'
+    out['population'] = {
+        'n_units': out['n_units'], 'unit_label': out['unit_label'],
+        'min_units_for_population': min_units,
+        'supports_population_claim_declared': supports_population,
+        'claim_allowed': None,
+        'note': None,
+    }
+    reps = [r for r in out['comparisons'].values() if isinstance(r, dict)]
+    if reps:
+        pop = reps[0].get('population') or {}
+        allowed = bool(pop.get('claim_allowed'))
+        out['population']['claim_allowed'] = allowed
+        out['population']['note'] = pop.get('note')
+        if supports_population and not allowed:
+            out['violations'].append(
+                'manifest declares supports_population_claim=true but the '
+                f'frozen design cannot support it ({pop.get("note")})')
+            out['status'] = 'fail'
+        if supports_population and out['sampling'].get('probability_sample') is False:
+            out['violations'].append(
+                'manifest declares a population claim but the test slice is a '
+                'deterministic prefix/first-n sample')
+            out['status'] = 'fail'
+        elif supports_population and out['sampling'].get('probability_sample') is None:
+            out['violations'].append(
+                'manifest declares a population claim but no machine-readable '
+                'probability sampling design is declared')
+            out['status'] = 'fail'
+    elif supports_population:
+        _n = out['n_units']
+        _label = out['unit_label']
+        if (_n is None or _label == 'row'
+                or (isinstance(_n, int) and _n < min_units)):
+            out['violations'].append(
+                'manifest declares supports_population_claim=true but the '
+                f'frozen design (n_units={_n!r}, unit={_label!r}, floor='
+                f'{min_units}) cannot support it')
+            out['status'] = 'fail'
+    if pilot_cells == 0:
+        if out['status'] == 'ok':
+            out['status'] = 'not_verifiable'
+        out['warnings'].append(
+            'no per-unit pilot deltas found in the power artifact; unit MDE and '
+            'SESOI precision are not verifiable (run `python v12_supp.py power`)')
+    if out['violations']:
+        out['status'] = 'fail'
+    return out
+
+
 def dynamic_read_budget_calibration(manifest):
     """Validate the measured read-budget calibration and its matched fixed arm.
 

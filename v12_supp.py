@@ -4038,11 +4038,17 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
     print(f'[p5t stats] wrote {out}')
     return stats
 
-def _ppl_at_len(rec, Ln):
-    """Usable, untruncated PPL for one (record, length), else None."""
+def _by_len_cell(rec, Ln):
+    """The by-length cell for one record/length, else None."""
     bl = (rec or {}).get('by_len') or {}
     c = bl.get(Ln, bl.get(str(Ln)))
-    if (isinstance(c, dict) and c.get('truncated') is False
+    return c if isinstance(c, dict) else None
+
+
+def _ppl_at_len(rec, Ln):
+    """Usable, untruncated PPL for one (record, length), else None."""
+    c = _by_len_cell(rec, Ln)
+    if (c is not None and c.get('truncated') is False
             and L.ppl_is_usable(c.get('ppl'))):
         return float(c['ppl'])
     return None
@@ -4228,6 +4234,25 @@ def run_power(manifest_path=FREEZE_MANIFEST, summary='results_v10_mech/summary.j
         cell['sensitivity'] = _sens
         if _sens.get('status') == 'fail':
             all_pass = False
+        _unit_pairs = [(s, _by_len_cell(recs_a.get(s), Ln),
+                        _by_len_cell(recs_b.get(s), Ln)) for s in used]
+        _unit_pairs = [(c_a, c_b) for _s, c_a, c_b in _unit_pairs
+                       if c_a is not None and c_b is not None]
+        _unit = L.paired_unit_deltas([c_a for c_a, _ in _unit_pairs],
+                                     [c_b for _, c_b in _unit_pairs])
+        cell['evaluation_unit'] = _unit
+        if _unit.get('status') == 'ok':
+            _up = L.unit_precision_design(
+                _unit['n_units'], pilot_unit_deltas=_unit['deltas'],
+                unit_label=_unit['unit'], sesoi=_sesoi,
+                target_power=min_power, alpha=alpha,
+                require_sesoi_power=_require_sesoi)
+            cell['unit_deltas'] = list(_unit['deltas'])
+            if _unit.get('ids') is not None:
+                cell['unit_ids'] = list(_unit['ids'])
+            cell['unit_precision'] = _up
+            if _up.get('status') == 'fail':
+                all_pass = False
         if len(dl) >= 2 and exp in ('positive', 'negative'):
             obs = L.exact_signflip_p(dl)
             mean = float(np.mean(dl))
@@ -4955,11 +4980,16 @@ def plan_check(manifest_path=FREEZE_MANIFEST):
     try:
         _ledger = L.comparison_budget_ledger(m)
         _ev = L.evidence_level_audit(m, manifest_path=manifest_path, panel_paths=[])
-        _design = {'budget_ledger': _ledger, 'evidence_level': _ev}
+        _evd = L.evaluation_design_audit(m)
+        _design = {'budget_ledger': _ledger, 'evidence_level': _ev,
+                   'evaluation_design': _evd}
         if _ledger.get('status') == 'fail':
             errs.extend(f'budget ledger: {v}' for v in (_ledger.get('violations') or []))
         if _ev.get('status') == 'fail':
             errs.extend(f'evidence level: {v}' for v in (_ev.get('violations') or []))
+        if _evd.get('status') == 'fail':
+            errs.extend(f'evaluation design: {v}'
+                        for v in (_evd.get('violations') or []))
         notes.extend(f'budget ledger: {w}' for w in (_ledger.get('warnings') or []))
         notes.extend(f'evidence level: {w}' for w in (_ev.get('warnings') or []))
     except Exception as _e:

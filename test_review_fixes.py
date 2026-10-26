@@ -17049,6 +17049,9 @@ def t_v12_plan_emits_design_preflight():
     assert led.get('status') == 'ok', led.get('violations')
     assert led['token_budget']['shared_by_all_arms'] is True, led['token_budget']
     assert ev.get('status') == 'ok' and ev.get('manifest_level') == 'confirmatory', ev
+    evd = dp.get('evaluation_design') or {}
+    assert evd.get('n_units') == 48, evd
+    assert (evd.get('population') or {}).get('claim_allowed') is False, evd
     # The dynamic draft must be auditable but explicitly non-runnable.
     dr = V12.dynamic_plan_check(os.path.join(REPO, 'confirmation_frozen_dynamic.json'))
     assert dr['ok'] and dr['runnable'] is False and dr['promotion_ready'] is False, dr
@@ -22944,6 +22947,215 @@ def t_audit_design_sensitivity_manifest_and_pilot():
         assert any('none carry a deltas list' in w for w in rep4['warnings']), rep4['warnings']
 
 
+def t_unit_precision_design_planning():
+    deltas = [-0.20] * 8 + [0.05] * 40
+    base = L.unit_precision_design(
+        48, pilot_unit_deltas=deltas, unit_label='document',
+        sesoi=0.05, target_power=0.80)
+    assert base['status'] == 'ok', base['violations']
+    assert base['n_units'] == 48 and base['unit_label'] == 'document'
+    _sd = float(np.std(deltas, ddof=1))
+    _tc = L._t_critical(0.95, 47.0)
+    assert abs(base['precision']['ci_halfwidth']
+               - _tc * _sd / math.sqrt(48.0)) < 1e-12, base['precision']
+    assert base['pilot']['sd'] == _sd, base['pilot']
+    assert base['mde']['absolute'] > 0.0, base['mde']
+    assert base['population']['claim_allowed'] is False, base['population']
+    assert any('min_units_for_population' in w for w in base['warnings']), base['warnings']
+    assert base['sesoi']['status'] in ('ok', 'underpowered'), base['sesoi']
+
+    large = L.unit_precision_design(
+        64, pilot_unit_deltas=deltas, unit_label='document')
+    assert large['status'] == 'ok', large['violations']
+    assert large['population']['claim_allowed'] is True, large['population']
+    row = L.unit_precision_design(
+        640, pilot_unit_deltas=deltas, unit_label='row')
+    assert row['status'] == 'ok', row['violations']
+    assert row['population']['claim_allowed'] is False, row['population']
+    assert any('evaluation window' in w for w in row['warnings']), row['warnings']
+
+    tight = L.unit_precision_design(
+        48, pilot_unit_sd=0.1, target_halfwidth=0.01)
+    assert tight['status'] == 'ok', tight['violations']
+    assert tight['precision']['meets_target'] is False, tight['precision']
+    assert tight['precision']['n_required_for_target_halfwidth'] > 48, tight['precision']
+    loose = L.unit_precision_design(
+        48, pilot_unit_sd=0.1, target_halfwidth=1.0)
+    assert loose['precision']['meets_target'] is True, loose['precision']
+    assert loose['precision']['n_required_for_target_halfwidth'] <= 48, loose['precision']
+
+    under = L.unit_precision_design(
+        48, pilot_unit_sd=0.1, sesoi=0.001, target_power=0.80,
+        require_sesoi_power=True)
+    assert under['status'] == 'fail', under
+    assert under['sesoi']['status'] == 'underpowered', under['sesoi']
+    assert under['sesoi']['required_n_for_target_power'] > 48, under['sesoi']
+    assert any('underpowered at the pre-registered SESOI' in v
+               for v in under['violations']), under['violations']
+    advisory = L.unit_precision_design(
+        48, pilot_unit_sd=0.1, sesoi=0.001, target_power=0.80)
+    assert advisory['status'] == 'ok', advisory
+    assert advisory['sesoi']['status'] == 'underpowered', advisory['sesoi']
+    assert any('SESOI' in w for w in advisory['warnings']), advisory['warnings']
+
+    bare = L.unit_precision_design(48)
+    assert bare['status'] == 'not_verifiable', bare
+    assert bare['pilot']['status'] == 'not_provided', bare['pilot']
+
+    for kwargs in (dict(alpha=float('nan')), dict(target_power=1.0),
+                   dict(pilot_unit_sd=-1.0), dict(pilot_unit_deltas='abc'),
+                   dict(unit_label='line'), dict(target_halfwidth=0.0),
+                   dict(require_sesoi_power='yes'), dict(n_max=1),
+                   dict(min_units_for_population=1)):
+        bad = L.unit_precision_design(48, **kwargs)
+        assert bad['status'] == 'fail', (kwargs, bad)
+    assert L.unit_precision_design(True)['status'] == 'fail'
+
+
+def t_paired_unit_deltas_prefers_independent_units():
+    a = [{'ppl_per_article': [10.0, 12.0, 14.0],
+          'article_ids': ['a', 'b', 'c'],
+          'ppl_per_doc': [10.0, 12.0], 'doc_ids': ['x', 'y'],
+          'ppl_per_seq': [10.0, 12.0]},
+         {'ppl_per_article': [10.5, 12.5, 14.5],
+          'article_ids': ['a', 'b', 'c'],
+          'ppl_per_doc': [10.5, 12.5], 'doc_ids': ['x', 'y'],
+          'ppl_per_seq': [10.5, 12.5]}]
+    b = [{'ppl_per_article': [9.0, 10.0, 11.0],
+          'article_ids': ['a', 'b', 'c'],
+          'ppl_per_doc': [9.5, 10.5], 'doc_ids': ['x', 'y'],
+          'ppl_per_seq': [9.0, 11.0]},
+         {'ppl_per_article': [9.5, 10.5, 11.5],
+          'article_ids': ['a', 'b', 'c'],
+          'ppl_per_doc': [10.0, 11.0], 'doc_ids': ['x', 'y'],
+          'ppl_per_seq': [9.5, 11.5]}]
+    got = L.paired_unit_deltas(a, b)
+    assert got['status'] == 'ok', got
+    assert got['unit'] == 'article' and got['n_units'] == 3, got
+    assert got['n_seeds'] == 2 and got['ids'] == ['a', 'b', 'c'], got
+    assert all(abs(x - y) < 1e-12 for x, y in zip(got['deltas'], [1.0, 2.0, 3.0])), got['deltas']
+
+    no_article = [dict(x) for x in a]
+    no_article_b = [dict(x) for x in b]
+    for rows in (no_article, no_article_b):
+        for cell in rows:
+            cell.pop('ppl_per_article')
+            cell.pop('article_ids')
+    doc = L.paired_unit_deltas(no_article, no_article_b)
+    assert doc['status'] == 'ok' and doc['unit'] == 'document', doc
+    assert abs(doc['deltas'][0] - 0.5) < 1e-12, doc['deltas']
+
+    for rows in (no_article, no_article_b):
+        for cell in rows:
+            cell.pop('ppl_per_doc')
+            cell.pop('doc_ids')
+    row = L.paired_unit_deltas(no_article, no_article_b)
+    assert row['status'] == 'ok' and row['unit'] == 'row', row
+
+    bad_ids = [dict(x) for x in a]
+    bad_ids[1]['article_ids'] = ['c', 'b', 'a']
+    bad = L.paired_unit_deltas(bad_ids, b, unit='article')
+    assert bad['status'] == 'not_available', bad
+    assert any('identities differ' in v for v in bad['candidates'].values()), bad
+
+    short = [dict(x) for x in a]
+    short[1]['ppl_per_article'] = [10.0, 12.0]
+    short[1]['article_ids'] = ['a', 'b']
+    bad = L.paired_unit_deltas(short, b, unit='article')
+    assert bad['status'] == 'not_available', bad
+
+    low = [dict(x) for x in a]
+    low[0] = dict(low[0])
+    low[0]['ppl_per_seq'] = [0.5, 12.0]
+    bad = L.paired_unit_deltas(low, b, unit='row')
+    assert bad['status'] == 'not_available', bad
+    try:
+        L.paired_unit_deltas(a, b, unit='line')
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('invalid unit label was accepted')
+
+
+def t_audit_evaluation_design_and_wiring():
+    with tempfile.TemporaryDirectory() as td:
+        mp = os.path.join(td, 'manifest.json')
+        pp = os.path.join(td, 'power_validation.json')
+        manifest = {
+            'statistics': {'alpha': 0.05, 'min_power_for_test': 0.80},
+            'eval': {'n_seqs_clean': 48},
+            'binding': {'test_slice': {'n_seqs': 48}},
+            'primary_comparisons': [{'name': 'a'}],
+            'evaluation_design': {'n_units': 48, 'unit': 'document'},
+        }
+        with open(mp, 'w', encoding='utf-8') as f:
+            json.dump(manifest, f)
+        with open(pp, 'w', encoding='utf-8') as f:
+            json.dump({'comparisons': {
+                'a': {'unit_deltas': [-0.2] * 8 + [0.05] * 40}}}, f)
+        with contextlib.redirect_stdout(io.StringIO()):
+            rep = A.audit_evaluation_design(manifest_path=mp, pilot_path=pp)
+        assert rep['status'] == 'ok', rep
+        assert rep['n_units'] == 48 and rep['pilot_status'] == 'available', rep
+        assert rep['population']['claim_allowed'] is False, rep['population']
+        cell = rep['comparisons']['a']
+        assert cell['status'] == 'ok' and cell['precision']['ci_halfwidth'] > 0, cell
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            rep2 = A.audit_evaluation_design(
+                manifest_path=mp, pilot_path=os.path.join(td, 'missing.json'))
+        assert rep2['status'] == 'not_verifiable', rep2
+        assert rep2['pilot_status'] == 'not_available', rep2
+        assert any('no per-unit pilot deltas' in w for w in rep2['warnings']), rep2
+
+        manifest['evaluation_design']['supports_population_claim'] = True
+        with open(mp, 'w', encoding='utf-8') as f:
+            json.dump(manifest, f)
+        with contextlib.redirect_stdout(io.StringIO()):
+            rep3 = A.audit_evaluation_design(manifest_path=mp, pilot_path=pp)
+        assert rep3['status'] == 'fail', rep3
+        assert any('supports_population_claim=true' in v for v in rep3['violations']), rep3
+
+        manifest['evaluation_design']['n_units'] = 64
+        manifest['eval']['n_seqs_clean'] = 64
+        with open(mp, 'w', encoding='utf-8') as f:
+            json.dump(manifest, f)
+        with contextlib.redirect_stdout(io.StringIO()):
+            rep3b = A.audit_evaluation_design(manifest_path=mp, pilot_path=pp)
+        assert rep3b['status'] == 'fail', rep3b
+        assert any('no machine-readable probability sampling design' in v
+                   for v in rep3b['violations']), rep3b
+
+        manifest['evaluation_design']['test_slice_sampling'] = {'method': 'prefix'}
+        with open(mp, 'w', encoding='utf-8') as f:
+            json.dump(manifest, f)
+        with contextlib.redirect_stdout(io.StringIO()):
+            rep4 = A.audit_evaluation_design(manifest_path=mp, pilot_path=pp)
+        assert rep4['status'] == 'fail', rep4
+        assert any('deterministic prefix' in v for v in rep4['violations']), rep4
+
+        manifest['evaluation_design']['supports_population_claim'] = 'yes'
+        with open(mp, 'w', encoding='utf-8') as f:
+            json.dump(manifest, f)
+        with contextlib.redirect_stdout(io.StringIO()):
+            rep5 = A.audit_evaluation_design(manifest_path=mp, pilot_path=pp)
+        assert rep5['status'] == 'fail', rep5
+        assert any('supports_population_claim must be a boolean' in v
+                   for v in rep5['violations']), rep5
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        frozen = A.audit_evaluation_design(
+            manifest_path=os.path.join(REPO, 'confirmation_frozen.json'),
+            pilot_path=os.path.join(REPO, 'analysis_v12', 'does_not_exist.json'))
+    assert frozen['n_units'] == 48, frozen
+    assert frozen['population']['claim_allowed'] is False, frozen
+    assert frozen['status'] == 'not_verifiable', frozen
+
+    import inspect
+    assert "'evaluation': audit_evaluation_design()" in inspect.getsource(A.run_report)
+    assert 'evaluation' in (A.__doc__ or ''), 'evaluation is not documented in the audit CLI'
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -23507,6 +23719,12 @@ def main():
            t_signflip_power_table_scales_exactly)
     _check('L201 sensitivity audit validates seed and comparison identity',
            t_sensitivity_audit_validates_seed_and_comparison_identity)
+    _check('L202 evaluation-unit precision: MDE, CI, SESOI and population floor',
+           t_unit_precision_design_planning)
+    _check('L203 paired unit deltas prefer article/doc/row and verify identities',
+           t_paired_unit_deltas_prefers_independent_units)
+    _check('L204 evaluation-design audit joins manifest, pilot and sampling gate',
+           t_audit_evaluation_design_and_wiring)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

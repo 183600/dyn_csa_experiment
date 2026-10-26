@@ -4587,5 +4587,97 @@ python v12_supp.py plan             # 冻结计划预检不变
 L198 覆盖：12×6 的精确下限、功效曲线与公开 `signflip_power` 对账、
 pilot 同向率/方向、MDE 与 t 区间半宽、目标半宽所需 n、SESOI 充足/不足/
 仅警告/非方向性、缺 pilot、非法 α/target/SD/margin/±方向/字符串 n_max，
-以及 n=6,m=4 的分辨率失败。L199 覆盖 manifest + pilot artifact + SESOI 门的接线、缺 pilot 或对照名不匹配时的 `not_verifiable`，以及无 SESOI 时的 warning。完整 CPU 套件 550/550 通过（0 skipped）；
+以及 n=6,m=4 的分辨率失败。L199 覆盖 manifest + pilot artifact + SESOI 门的接线、缺 pilot 或对照名不匹配时的 `not_verifiable`，以及无 SESOI 时的 warning。完整 CPU 套件 555/555 通过（0 skipped）；
 `python v12_supp.py plan` 仍 72/72 合成冻结记录、6 个比较。
+
+## 69. 评测单位级设计：从「种子能拒绝吗」到「切片能估多准」
+
+### 69.1 动机
+
+§68 的 `paired_design_sensitivity` 只规划**种子轴**：它用逐种子配对差值估计
+符号翻转检验的功效、MDE 与种子级 t 区间。但最终 PPL 对比还有第二条抽样轴：
+**评测单位**（WikiText 的 article/document；row 只是固定评测窗口）。即使 12
+个种子全部同向，若冻结切片只有 48 个文档，文档级均值的置信区间和可外推范围
+仍由这 48 个单位决定；而 48 < 代码中的
+`MIN_DOCS_FOR_POPULATION_CLAIM=64`，本来就不允许 population claim。§68.4
+明确把「文档级精度不是种子级精度」列为边界，本节把这个缺口变成可执行的设计
+审计。
+
+新增两个设计期原语（`exp_lib.py`）：
+
+- `paired_unit_deltas(rows_a, rows_b, unit='auto')`：从同一批 validation
+  记录的 `by_len` 单元中，优先取 `ppl_per_article`，其次 `ppl_per_doc`，
+  最后 `ppl_per_seq`；核验所有种子共享相同的单位数与 `article_ids` /
+  `doc_ids` 顺序后，返回**逐单位、跨种子平均**的配对差值
+  `mean_seed(ppl_a[u] - ppl_b[u])`。它不重新定义主终点，只把文档/文章
+  抽样分布暴露出来。
+- `unit_precision_design(n_units, ...)`：以冻结单位数和 pilot 单位差值
+  （或显式单位 SD）计算：
+  - 单位级配对 t 区间半宽 `t_{1-alpha/2,n-1} * sd / sqrt(n_units)`；
+  - 目标功效下的近似 MDE
+    `(t_crit + Phi^-1(target_power)) * sd / sqrt(n_units)`；
+  - 给定 `target_halfwidth` 或 SESOI 时所需单位数；
+  - SESOI 处的双侧正态近似功效；
+  - `population.claim_allowed`：仅当单位标签非 `row` 且
+    `n_units >= min_units_for_population`（默认 64）时为真；否则明确拒绝
+    population claim，把结论限制在冻结切片。
+
+### 69.2 审计入口
+
+`evaluation_design_audit(manifest, pilot=None)` 及
+`python audit_gates.py evaluation` 读取：
+
+- 冻结清单的 `evaluation_design.n_units`（缺省回退到
+  `eval.n_seqs_clean` / `binding.test_slice.n_seqs`）、`unit`、
+  `test_slice_sampling`、`supports_population_claim`；
+- `analysis_v12/power_validation.json` 中每条主对照新增的 `unit_deltas`
+  （由 `v12_supp.py power` 从 validation 记录的逐单位 PPL 生成）。
+
+输出逐对照的 `unit_precision`，并汇总 `population` 与 `sampling`。没有
+`unit_deltas` 时状态是 `not_verifiable`，不是绿色通过。若清单声明
+`supports_population_claim=true`，但单位数低于 floor、单位是 `row`，或
+切片被声明为 deterministic prefix / first-n，则判 fail。
+
+`v12_supp.py power` 新增 `evaluation_unit` 与 `unit_precision` 块；
+`v12_supp.py plan` 的 `design_preflight` 新增 `evaluation_design` 块（清单
+声明矛盾会在首次 test 访问前拒绝）；`audit_gates.py report` 新增
+`evaluation` 块。当前冻结清单没有 `evaluation_design` 块，因此审计会报告
+`n_units=48`、`claim_allowed=false`、`not_verifiable`（缺 unit pilot），
+并显式写出「48 < 64，结论限于冻结切片」。这是暴露设计边界，不是新增失败
+门槛；但一旦清单声明 `supports_population_claim=true`，缺失概率抽样设计或
+单位数不足就会判 fail。
+
+### 69.3 边界
+
+- **单位级 t 区间与 MDE 是正态近似**，使用实际 t 临界值；它不等于
+  §54/§57 的单位 bootstrap 区间，也不替代最终 sign-flip 检验。
+- **跨种子平均的单位差值**只移除种子配对噪声，不移除文档抽样噪声；
+  `sd` 必须是单位间 SD，不是种子间 SD。`paired_unit_deltas` 不从
+  test 读取数据，也不改变任何 PPL 归约。pilot 单位来自 validation，而
+  `n_units` 是冻结 test 切片的单位数；两者不必相等，报告时必须分别注明。
+- **population claim 需要概率抽样设计**，仅单位数 >=64 还不够；清单未声明
+  可复核的 `test_slice_sampling` 时，审计只报告「未声明」，不把 prefix
+  切片当成概率样本。
+- **row 不是独立语料单位**。即使 row 数 >=64，WikiText 的 row 是行/段落，
+  属于同一文章，不能支持 population inference；文章是首选独立单位。
+- **SESOI 政策与 §68 一致**：只有 `require_sesoi_power=true` 时，单位数在
+  SESOI 处欠功效才判 fail；否则保留 warning 与 `underpowered` 状态，不虚构
+  margin。
+- **pilot 不是确认证据**。单位级 MDE/功效只用于设计准备，不能写成 test
+  结果或替代冻结决策规则。
+
+### 69.4 入口与验证
+
+```bash
+python audit_gates.py evaluation   # 单位数/精度/population/抽样设计
+python audit_gates.py report       # 汇总含 evaluation
+python v12_supp.py power           # validation 单位差值 + 单位级精度
+python test_review_fixes.py        # L202-L204
+python v12_supp.py plan            # 冻结计划预检不变
+```
+
+L202 覆盖单位级 CI/MDE/SESOI 充足与不足、目标半宽所需 n、population floor、
+`row` 拒绝与非法参数；L203 覆盖 article/document/row 优先级、跨种子单位
+身份核验与不可用路径；L204 覆盖 manifest + pilot + sampling 门接线、
+缺 pilot 的 `not_verifiable`、population 过度声明失败，以及 `run_report`
+与 CLI 文档接线。
