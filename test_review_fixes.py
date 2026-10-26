@@ -20744,6 +20744,13 @@ def t_interaction_practical_decision_primitives():
     malformed2 = L.interaction_practical_decision(
         [0.05] * 7, margin=margin, direction=1, p_holm='false')
     assert malformed2['decision'] != 'hypothesis_supported', malformed2
+    # A malformed superiority-family p must also block an additive claim: the
+    # same fail-closed rule applies even when the raw TOST interval is tight.
+    malformed3 = L.interaction_practical_decision(
+        [0.002, -0.002, 0.002, -0.002, 0.002, -0.002],
+        margin=margin, direction=1, p_holm='false')
+    assert malformed3['decision'] != 'additive', malformed3
+    assert 'superiority p is malformed' in malformed3['reason'], malformed3
     # Direction and margin are validation gates, not coercions.
     for bad in (1.5, -0.5, float('nan'), True):
         try:

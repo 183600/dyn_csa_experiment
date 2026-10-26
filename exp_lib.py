@@ -15928,7 +15928,7 @@ def _interaction_decision_from_stats(stats, tost, *, margin, direction, alpha,
     if p_holm_tost is not None and p_tost is None:
         tost_family_ok = False
     equivalence_ok = bool(
-        tost_equiv and tost_family_ok
+        tost_equiv and tost_family_ok and superiority_family_ok
         and (p_tost is None or p_tost < alpha))
     margin_ratio = (float(math.exp(margin)) if margin < 700.0 else None)
     out = {
