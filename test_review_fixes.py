@@ -22669,6 +22669,13 @@ def t_student_t_large_df_tail():
     assert abs(L._student_t_sf(20.0, 1e20) - 2.7536241186063325e-89) < 1e-100
     assert abs(L._student_t_sf(20.0, float('inf'))
                - L._student_t_sf(20.0, 1e20)) < 1e-100
+    # The 1/df expansion is only switched on once its neglected term is below
+    # the beta path's error.  At df=1e4, |t|=10 the old dispatch used the
+    # expansion and was ~1e-4 relative low; the beta path is ~1e-11 there.
+    for _df, _ref in ((1e4, 9.8164037143314743e-24),
+                      (1e5, 7.8165076501170029e-24)):
+        _got = L._student_t_sf(10.0, _df)
+        assert abs(_got / _ref - 1.0) < 1e-8, (_df, _got, _ref)
     # In the 1e7 <= df < 1e15 / |t| > 10 region the incomplete-beta fallback
     # loses up to ~2e-2 relative accuracy; the 1/df expansion must be used
     # there too (reference values from high-precision mpmath).

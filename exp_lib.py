@@ -16508,9 +16508,12 @@ def _student_t_sf(t, df):
     # The 1/df expansion is more accurate than the incomplete-beta route for
     # large df at both moderate and extreme t.  At df=1e10, |t|=11 the latter
     # has ~1e-5 relative error, and by df=1e14 it is ~2e-2.  Keep the
-    # incomplete-beta path where it is still the accurate choice (df < 1e4,
-    # or |t| > 10 between df=1e4 and 1e7).
-    if df >= 1e7 or (df >= 10000.0 and abs(t) <= 10.0):
+    # incomplete-beta path where it is still the accurate choice: below
+    # df~3e5 its far-tail error (~1e-10) beats the expansion's neglected
+    # 1/df^4 term (e.g. df=1e4, |t|=10 is ~1e-4 relative), while above that
+    # the expansion wins.  |t|>10 between df=1e4 and 1e7 stays on the beta
+    # path unless df>=1e7, where the beta tail itself is no longer accurate.
+    if df >= 1e7 or (df >= 300000.0 and abs(t) <= 10.0):
         tail = _student_t_sf_large_df(abs(t), df)
     else:
         x = df / (df + t * t)
