@@ -16264,6 +16264,190 @@ def _betai_log_bt(a, b, x):
             + (inva ** 7 + invb ** 7 - invab ** 7) / 1680.0)
 
 
+def _betai_nr(a, b, x):
+    """正则化不完全贝塔 I_x(a,b) 的 Numerical Recipes 路径。"""
+    bt = math.exp(_betai_log_bt(a, b, x))
+    if x < (a + 1.0) / (a + b + 2.0):
+        return float(bt * _betacf(a, b, x) / a)
+    return float(1.0 - bt * _betacf(b, a, 1.0 - x) / b)
+
+
+_BINOMIAL_EXACT_INDEX_MAX = 2000000
+_BINOMIAL_TINY_INDEX_MAX = 100
+_BINOMIAL_OLD_MAX_N = 100000000.0
+
+
+def _binom_log_comb(n, k):
+    """Stable log C(n,k) when min(k,n-k) is small enough to sum directly.
+
+    The lgamma difference loses all useful digits at the scale of the seed
+    planners (n around 1e12-1e16, k around the mean): both lgamma terms are
+    ~1e17 and their cancellation error is O(1) in the log.  Summing the log
+    ratio (n-i)/(i+1) one factor at a time keeps the same absolute accuracy
+    at those scales.  Callers only pass m <= _BINOMIAL_EXACT_INDEX_MAX.
+    """
+    n = int(n)
+    k = int(k)
+    m = min(k, n - k)
+    if m == 0:
+        return 0.0
+    return math.fsum(math.log(n - i) - math.log(i + 1) for i in range(m))
+
+
+def _binom_logpmf(k, n, p):
+    return (_binom_log_comb(n, k) + k * math.log(p)
+            + (n - k) * math.log1p(-p))
+
+
+def _binom_cdf_exact_lower(k, n, p):
+    """P(Bin(n,p) <= k) for k below the mean, summed away from the mode.
+
+    Starting at k and walking down avoids the O(n) sum from zero; every step
+    is a ratio of consecutive pmf values, so no large combinatorial factor is
+    ever formed.
+    """
+    lp = _binom_logpmf(k, n, p)
+    if lp < -745.0:
+        return 0.0
+    q = 1.0 - p
+    term = math.exp(lp)
+    total = term
+    i = int(k)
+    while i > 0:
+        ratio = (i / (n - i + 1.0)) * (q / p)
+        term *= ratio
+        i -= 1
+        total += term
+        if term <= total * 1e-18 or term == 0.0:
+            break
+    return float(min(1.0, total))
+
+
+def _binom_sf_exact_upper(k, n, p):
+    """P(Bin(n,p) >= k) for k above the mean, summed away from the mode."""
+    lp = _binom_logpmf(k, n, p)
+    if lp < -745.0:
+        return 0.0
+    q = 1.0 - p
+    term = math.exp(lp)
+    total = term
+    i = int(k)
+    while i < n:
+        ratio = ((n - i) / (i + 1.0)) * (p / q)
+        term *= ratio
+        i += 1
+        total += term
+        if term <= total * 1e-18 or term == 0.0:
+            break
+    return float(min(1.0, total))
+
+
+def _binom_edgeworth_corr(z, var, p):
+    g1 = (1.0 - 2.0 * p) / math.sqrt(var)
+    g2 = (1.0 - 6.0 * p * (1.0 - p)) / var
+    z2 = z * z
+    z3 = z2 * z
+    z5 = z3 * z2
+    return (g1 * (1.0 - z2) / 6.0
+            + g2 * (3.0 * z - z3) / 24.0
+            + g1 * g1 * (z5 - 10.0 * z3 + 15.0 * z) / 72.0)
+
+
+def _binom_edgeworth_cdf(k, n, p):
+    """Edgeworth CDF for a large binomial count (continuity corrected).
+
+    At this scale the incomplete-beta continued fraction needs O(sqrt(n))
+    iterations and its 1e6 cap silently truncates at n~1e14.  For npq large the
+    skewness/kurtosis corrections are O(1/n) or smaller, while the exact tail
+    sum is still used when min(k,n-k) is small.
+    """
+    mu = n * p
+    var = mu * (1.0 - p)
+    sd = math.sqrt(var)
+    z = math.fsum((float(k), -mu, 0.5)) / sd
+    phi = math.exp(-0.5 * z * z) / math.sqrt(2.0 * math.pi)
+    cdf = 0.5 * math.erfc(-z / math.sqrt(2.0))
+    if abs(z) < 1e6:
+        cdf += phi * _binom_edgeworth_corr(z, var, p)
+    return float(min(1.0, max(0.0, cdf)))
+
+
+def _binom_edgeworth_sf(k, n, p):
+    mu = n * p
+    var = mu * (1.0 - p)
+    sd = math.sqrt(var)
+    z = math.fsum((float(k), -mu, -0.5)) / sd
+    phi = math.exp(-0.5 * z * z) / math.sqrt(2.0 * math.pi)
+    sf = 0.5 * math.erfc(z / math.sqrt(2.0))
+    if abs(z) < 1e6:
+        sf -= phi * _binom_edgeworth_corr(z, var, p)
+    return float(min(1.0, max(0.0, sf)))
+
+
+def _binomial_cdf_stable(k, n, p):
+    k = int(k)
+    n = int(n)
+    if k < 0:
+        return 0.0
+    if k >= n:
+        return 1.0
+    if p <= 0.0:
+        return 1.0
+    if p >= 1.0:
+        return 0.0
+    if p > 0.5:
+        # X ~ Bin(n,p) is n - Y with Y ~ Bin(n,1-p).  Evaluate the smaller-p
+        # side so the legacy beta path never has to take x close to 1.
+        return _binomial_sf_stable(n - k, n, 1.0 - p)
+    mu = n * p
+    if k >= mu:
+        return float(1.0 - _binomial_sf_stable(k + 1, n, p))
+    # A tiny index is the one case the beta path cannot handle at any n: when
+    # min(a,b) is tiny, the lgamma difference in log B(a,b) cancels
+    # catastrophically (e.g. sf(1, 1e8, 1e-8) was off by ~1e-7).  Summing the
+    # few tail terms is both exact and cheap there.
+    if min(k, n - k) <= _BINOMIAL_TINY_INDEX_MAX:
+        return _binom_cdf_exact_lower(k, n, p)
+    # With one small beta index the continued fraction converges quickly and
+    # is more accurate than a long exact sum or the Edgeworth correction.  Use
+    # it even for n > 1e8 when the index is still manageable; the remaining
+    # large-index cases are the ones that hit the old 1e6-iteration cap.
+    if n <= _BINOMIAL_OLD_MAX_N:
+        return float(_betai_nr(float(n - k), float(k + 1), 1.0 - p))
+    if min(k, n - k) <= _BINOMIAL_EXACT_INDEX_MAX:
+        # p <= 0.5 here.  Computing I_{1-p}(n-k,k+1) directly makes the beta
+        # parameters huge and x ~ 1, where the legacy path can lose ~1e-5.
+        # Use the complementary upper tail instead: P(X<=k)=1-P(X>=k+1).
+        return float(1.0 - _betai_nr(float(k + 1), float(n - k), p))
+    return _binom_edgeworth_cdf(k, n, p)
+
+
+def _binomial_sf_stable(k, n, p):
+    k = int(k)
+    n = int(n)
+    if k <= 0:
+        return 1.0
+    if k > n:
+        return 0.0
+    if p <= 0.0:
+        return 0.0
+    if p >= 1.0:
+        return 1.0
+    if p > 0.5:
+        # P_p(X>=k) = P_{1-p}(n-X <= n-k).
+        return _binomial_cdf_stable(n - k, n, 1.0 - p)
+    mu = n * p
+    if k <= mu:
+        return float(1.0 - _binomial_cdf_stable(k - 1, n, p))
+    if min(k, n - k) <= _BINOMIAL_TINY_INDEX_MAX:
+        return _binom_sf_exact_upper(k, n, p)
+    if n <= _BINOMIAL_OLD_MAX_N:
+        return float(_betai_nr(float(k), float(n - k + 1), p))
+    if min(k, n - k) <= _BINOMIAL_EXACT_INDEX_MAX:
+        return float(_betai_nr(float(k), float(n - k + 1), p))
+    return _binom_edgeworth_sf(k, n, p)
+
+
 def _betai(a, b, x):
     """正则化不完全贝塔 I_x(a,b)。"""
     if (not (a > 0.0 and b > 0.0) or not math.isfinite(a)
@@ -16273,10 +16457,11 @@ def _betai(a, b, x):
         return 0.0
     if x >= 1.0:
         return 1.0
-    bt = math.exp(_betai_log_bt(a, b, x))
-    if x < (a + 1.0) / (a + b + 2.0):
-        return float(bt * _betacf(a, b, x) / a)
-    return float(1.0 - bt * _betacf(b, a, 1.0 - x) / b)
+    if (a >= 1.0 and b >= 1.0 and a + b >= 1000000.0
+            and float(a).is_integer() and float(b).is_integer()):
+        n_binom = int(a) + int(b) - 1
+        return _binomial_sf_stable(int(a), n_binom, float(x))
+    return _betai_nr(a, b, x)
 
 
 def _student_t_sf_large_df(z, df):
@@ -28263,11 +28448,20 @@ def looks_by_contrast(history):
             # empty input contract.
             if not c['seeds'] or not c['deltas']:
                 continue
-            out.setdefault(str(key), []).append({
+            entry = {
                 'look': look.get('look'), 'recorded_at': look.get('recorded_at'),
                 'seeds': list(c['seeds']), 'deltas': list(c['deltas']),
                 'p_exact_signflip': c.get('p_exact_signflip'),
-            })
+            }
+            # Interaction looks also bind the cell arms and the protocol tag of
+            # each seed.  Keep those descriptors here so the interaction reader
+            # can reject a look whose estimand changed even when its numeric
+            # deltas happen to be unchanged.  Ablation readers simply ignore
+            # the extra keys.
+            for _meta in ('cells', 'tags'):
+                if isinstance(c.get(_meta), dict):
+                    entry[_meta] = dict(c[_meta])
+            out.setdefault(str(key), []).append(entry)
     return out
 
 
@@ -30143,14 +30337,17 @@ def factorial_look_snapshot(recs, *, design=None):
 
 
 def _interaction_look_analysis(look_series, key, final_seeds, final_deltas,
-                               *, alpha=0.05):
+                               *, alpha=0.05, final_tags=None,
+                               final_cells=None):
     """Sequential max-over-looks p for one interaction contrast.
 
     Mirrors the ablation look reader: a recorded look whose shared-seed delta
     disagrees with the current record is STALE (the seed was re-run), so it is
-    excluded and named instead of being mixed into the joint null.  The
-    current aggregation is appended when the history does not already contain
-    it, so a manually edited summary still gets a two-look check.
+    excluded and named instead of being mixed into the joint null.  A look is
+    also stale when the four cell arms or a shared seed's protocol tag changed,
+    even if the numeric delta happens to be identical.  The current aggregation
+    is appended when the history does not already contain it, so a manually
+    edited summary still gets a two-look check.
     """
     if not final_seeds or not final_deltas:
         return None, [], 0
@@ -30162,6 +30359,15 @@ def _interaction_look_analysis(look_series, key, final_seeds, final_deltas,
             raise ValueError(
                 'final interaction look seeds/deltas must be finite numbers')
         cur[si] = float(di)
+    cur_tags = {}
+    if isinstance(final_tags, dict):
+        for s, t in final_tags.items():
+            si = _as_seed_int(s)
+            if si is not None:
+                cur_tags[si] = str(t or '')
+    cur_cells = None
+    if isinstance(final_cells, dict) and final_cells:
+        cur_cells = {str(k): str(v) for k, v in final_cells.items()}
 
     def _rows(rec):
         raw_seeds, raw_deltas = rec.get('seeds'), rec.get('deltas')
@@ -30176,11 +30382,20 @@ def _interaction_look_analysis(look_series, key, final_seeds, final_deltas,
             return None
         if len(seeds) != len(deltas) or not seeds:
             return None
+        # A duplicate seed makes the sign assignment ambiguous; treat the whole
+        # look as invalid/stale instead of letting sequential_signflip_p raise
+        # and take the interaction audit down with it.
+        if len(set(seeds)) != len(seeds):
+            return None
         pairs = sorted(zip(seeds, deltas), key=lambda t: t[0])
         return [int(s) for s, _d in pairs], [float(d) for _s, d in pairs]
 
     series, stale, seen = [], [], set()
     for lk in (look_series or {}).get(key) or []:
+        if not isinstance(lk, dict):
+            stale.append({'look': None,
+                          'reason': 'look is not a mapping'})
+            continue
         try:
             parsed = _rows(lk)
         except (TypeError, ValueError):
@@ -30190,6 +30405,28 @@ def _interaction_look_analysis(look_series, key, final_seeds, final_deltas,
                           'reason': 'non-numeric/invalid seed-delta rows'})
             continue
         seeds, deltas = parsed
+        look_cells = lk.get('cells')
+        if (cur_cells is not None and isinstance(look_cells, dict)
+                and look_cells):
+            norm_cells = {str(k): str(v) for k, v in look_cells.items()}
+            if norm_cells != cur_cells:
+                stale.append({'look': lk.get('look'),
+                              'reason': 'cell arms changed across looks'})
+                continue
+        look_tags = lk.get('tags')
+        if cur_tags and isinstance(look_tags, dict) and look_tags:
+            tags = {}
+            for s, t in look_tags.items():
+                si = _as_seed_int(s)
+                if si is not None:
+                    tags[si] = str(t or '')
+            bad_tags = [s for s in seeds
+                        if s in cur_tags and tags.get(s) != cur_tags[s]]
+            if bad_tags:
+                stale.append({'look': lk.get('look'),
+                              'reason': 'protocol tag changed across looks',
+                              'seeds': sorted(bad_tags)})
+                continue
         dm = dict(zip(seeds, deltas))
         bad = [s for s in seeds if s in cur and abs(dm[s] - cur[s]) > 1e-9]
         if bad:
@@ -30594,9 +30831,12 @@ def factorial_interaction_audit(summary=None, design=None, *, alpha=0.05,
         _vals = [float(r['interaction_log_ppl']) for r in rows]
         interaction_values[str(name)] = _vals
         _look_key = _interaction_look_key(str(name))
+        _cur_cells = {f'{k[0]}|{k[1]}': norm_cells[k]
+                      for k in _FACTORIAL_CELL_KEYS}
+        _cur_tags = {str(r['seed']): str(r.get('tag') or '') for r in rows}
         _seq, _stale, _n_series = _interaction_look_analysis(
             _look_series, _look_key, [r['seed'] for r in rows], _vals,
-            alpha=alpha)
+            alpha=alpha, final_tags=_cur_tags, final_cells=_cur_cells)
         cell['look_analysis'] = _seq
         cell['look_adjusted'] = bool((_seq or {}).get('look_adjusted'))
         cell['n_looks'] = int((_seq or {}).get('n_looks') or 0)
@@ -30613,9 +30853,10 @@ def factorial_interaction_audit(summary=None, design=None, *, alpha=0.05,
         if _stale:
             out['warnings'].append(
                 f'{name}: {len(_stale)} recorded interaction look(s) are STALE '
-                '(a seed delta changed after re-running); they were excluded '
-                f'from the sequential test, so the correction covers only the '
-                f'remaining {int((_seq or {}).get("n_looks") or 1)} look(s)')
+                '(a seed delta, cell arm, or protocol tag changed after '
+                're-running); they were excluded from the sequential test, so '
+                'the correction covers only the remaining '
+                f'{int((_seq or {}).get("n_looks") or 1)} look(s)')
         family.append((str(name), float(_adj_p)))
         family_naive.append((str(name), _raw_p))
         if cell['look_adjusted']:

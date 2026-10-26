@@ -6243,8 +6243,14 @@ def audit_look_history(paths=None):
                             rec['problems'].append(
                                 f'look {lid} {key}: recorded p={recorded_p:.6g} does not '
                                 f'recompute ({sf["p"]:.6g})')
-                    series.setdefault(key, []).append(
-                        {'look': lid, 'seeds': _ss, 'deltas': _dd})
+                    _entry = {'look': lid, 'seeds': _ss, 'deltas': _dd}
+                    # Interaction records additionally bind the four cell arms
+                    # and per-seed protocol tags; preserve them so a re-declared
+                    # result is not replayed as the same estimand.
+                    for _meta in ('cells', 'tags'):
+                        if isinstance(c.get(_meta), dict):
+                            _entry[_meta] = c[_meta]
+                    series.setdefault(key, []).append(_entry)
             # Recompute the sequential p and compare with the audit artifact.
             audit_path = os.path.join(panel_dir, 'methodology_audit.json')
             audit = _load(audit_path) if os.path.exists(audit_path) else None
@@ -6276,18 +6282,57 @@ def audit_look_history(paths=None):
                 # be mixed into the joint null; name it rather than fail the
                 # whole panel by recomputing a p the audit never used.
                 cur = dict(zip(looks[-1]['seeds'], looks[-1]['deltas']))
+                _last_cells = (looks[-1].get('cells')
+                               if isinstance(looks[-1].get('cells'), dict) else None)
+                _last_tags = (looks[-1].get('tags')
+                              if isinstance(looks[-1].get('tags'), dict) else None)
+                if _last_cells:
+                    _last_cells = {str(k): str(v) for k, v in _last_cells.items()}
+                _last_tags_n = {}
+                if _last_tags:
+                    for _s, _t in _last_tags.items():
+                        try:
+                            _si = L._as_seed_int(_s)
+                        except (TypeError, ValueError, OverflowError):
+                            _si = None
+                        if _si is not None:
+                            _last_tags_n[_si] = str(_t or '')
                 valid, stale = [], []
                 for lk in looks:
                     _bad = [s for s, d in zip(lk['seeds'], lk['deltas'])
                             if s in cur and abs(d - cur[s]) > 1e-9]
+                    _reason = 'seed delta changed across looks'
+                    _look_cells = (lk.get('cells')
+                                   if isinstance(lk.get('cells'), dict) else None)
+                    if (_last_cells and _look_cells
+                            and {str(k): str(v) for k, v in _look_cells.items()}
+                            != _last_cells):
+                        _bad = []
+                        _reason = 'cell arms changed across looks'
+                    if not _bad and _last_tags_n and isinstance(lk.get('tags'), dict) and lk.get('tags'):
+                        _look_tags = {}
+                        for _s, _t in lk['tags'].items():
+                            try:
+                                _si = L._as_seed_int(_s)
+                            except (TypeError, ValueError, OverflowError):
+                                _si = None
+                            if _si is not None:
+                                _look_tags[_si] = str(_t or '')
+                        _bad_tags = [s for s in lk['seeds']
+                                     if s in _last_tags_n
+                                     and _look_tags.get(s) != _last_tags_n[s]]
+                        if _bad_tags:
+                            _bad = _bad_tags
+                            _reason = 'protocol tag changed across looks'
                     if _bad:
-                        stale.append({'look': lk['look'], 'seeds': sorted(_bad)})
+                        stale.append({'look': lk['look'], 'reason': _reason,
+                                      'seeds': sorted(_bad)})
                     else:
                         valid.append(lk)
                 if stale:
                     rec['warnings'].append(
-                        f'{key}: {len(stale)} stale look(s) excluded (seed delta '
-                        f'changed across looks: {stale})')
+                        f'{key}: {len(stale)} stale look(s) excluded '
+                        f'(estimand changed across looks: {stale})')
                 if len(valid) < 2:
                     continue
                 rec['contrasts'][key] = {'n_looks': len(valid),

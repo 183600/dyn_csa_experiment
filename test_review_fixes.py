@@ -152,6 +152,44 @@ def t_binomial_tail_at_scale():
     assert abs(power - tail) < 1e-12, f'q=0.5 power {power!r} != tail {tail!r}'
 
 
+def t_binomial_tail_large_scale():
+    # The incomplete-beta continued fraction hits its 1e6-step cap around
+    # n~1e14; the central CDF then drifted by ~3e-10 (n=1e14) and ~1e-7
+    # (n=1e16).  At these scales the continuity correction is itself only
+    # O(1/sqrt(n)), so a path that drops it is visible even at the mean.
+    for n in (10 ** 10, 10 ** 12, 10 ** 14, 10 ** 16):
+        got = L._binom_cdf_half(n, n // 2)
+        ref = 0.5 + 1.0 / math.sqrt(2.0 * math.pi * n)
+        assert abs(got - ref) < 1e-13, (n, got, ref)
+    # A tiny p with enormous n is the Poisson corner: 1-p rounds to 1 in
+    # float, so lgamma/log(q) cancellation used to return e.g. 6e-17 instead
+    # of 0.632 at n=1e16.  The exact small-tail path avoids log C(n,k).
+    for n, p, tol in ((10 ** 12, 1e-12, 5e-12),
+                      (10 ** 16, 1e-16, 1e-12)):
+        lam = n * p
+        ref1 = 1.0 - math.exp(-lam)
+        ref2 = 1.0 - math.exp(-lam) * (1.0 + lam)
+        got1 = L._binomial_sf(1, n, p)
+        got2 = L._binomial_sf(2, n, p)
+        assert abs(got1 - ref1) < tol, (n, p, got1, ref1)
+        assert abs(got2 - ref2) < tol, (n, p, got2, ref2)
+    # The integer-parameter beta identity I_x(a,b)=P(Bin(a+b-1,x)>=a)
+    # must preserve both symmetry and the large-n central value.
+    a = 10 ** 15
+    assert abs(L._betai(a, a, 0.5) - 0.5) < 1e-15
+    assert abs(L._betai(a, a + 1, 0.5)
+               + L._betai(a + 1, a, 0.5) - 1.0) < 1e-15
+    assert 0.5 < L._betai(a, a + 1, 0.5) < 0.5000001
+    # The planning helpers must stay consistent with the same tail primitive.
+    n = 10 ** 14
+    k = L.signflip_min_consistency(n, 10, 0.05)
+    assert k is not None and 0 < k < n, k
+    tail = L._binom_cdf_half(n, n - k)
+    assert 20.0 * tail <= 0.05 + 1e-12
+    power = L.signflip_power(n, 10, 0.5, 0.05)
+    assert abs(power - tail) < 1e-12, (power, tail)
+
+
 def t_power():
     assert L.signflip_power(6, 4, 0.99) == 0.0, 'an impossible plan has zero power at any q'
     pw = L.signflip_power(12, 4, 0.9, 0.05)
@@ -16444,6 +16482,52 @@ def t_factorial_interaction_matches_stripped_arms_and_disjoint_designs():
     assert rdis['family']['m'] == 1, rdis['family']
 
 
+def t_factorial_interaction_look_history_binds_cells_and_tags():
+    import copy
+    name = 'dynamic_blocking_x_learned_selection'
+    key = L._interaction_look_key(name)
+    recs5 = _factorial_records(0.05, n=5)
+    recs7 = _factorial_records(0.05, n=7)
+    s5 = L.factorial_look_snapshot(recs5)[key]
+    s7 = L.factorial_look_snapshot(recs7)[key]
+    # The snapshot carries the estimand identity, not just numbers.
+    assert s5['cells']['control|control'] == 'csa_fix_randidx', s5
+    assert set(s5['tags']) == {str(i) for i in range(5)}, s5
+
+    def read(*contrasts, final):
+        history = {'looks': [{'look': i, 'contrasts': {key: c}}
+                             for i, c in enumerate(contrasts, 1)]}
+        return L._interaction_look_analysis(
+            L.looks_by_contrast(history), key, final['seeds'], final['deltas'],
+            final_tags=final['tags'], final_cells=final['cells'])
+
+    # Re-reading the same look is deduped, not counted as optional stopping.
+    seq, stale, n = read(s5, final=s5)
+    assert n == 1 and not stale and seq['look_adjusted'] is False, (seq, stale, n)
+    # A protocol-tag change is stale even when the deltas are byte-identical.
+    retagged = copy.deepcopy(s5)
+    retagged['tags'] = {k: 'v2' for k in retagged['tags']}
+    seq, stale, n = read(retagged, final=s5)
+    assert n == 1 and stale, (seq, stale, n)
+    assert stale[0]['reason'] == 'protocol tag changed across looks', stale
+    # So is a change in the four cell arms (the estimand identity).
+    recelled = copy.deepcopy(s5)
+    recelled['cells']['control|control'] = 'other_arm'
+    seq, stale, n = read(recelled, final=s5)
+    assert n == 1 and stale, (seq, stale, n)
+    assert stale[0]['reason'] == 'cell arms changed across looks', stale
+    # A malformed duplicate-seed look is excluded as stale, never crashes the
+    # sequential reader.
+    dup = copy.deepcopy(s5)
+    dup['seeds'] = [s5['seeds'][0], s5['seeds'][0]]
+    dup['deltas'] = [s5['deltas'][0], s5['deltas'][0]]
+    seq, stale, n = read(dup, final=s5)
+    assert n == 1 and stale, (seq, stale, n)
+    # Two genuine top-up looks remain two looks and are look-adjusted.
+    seq, stale, n = read(s5, s7, final=s7)
+    assert n == 2 and not stale and seq['look_adjusted'] is True, (seq, stale, n)
+
+
 def t_classification_threshold_metadata_matches_predictions():
     y = np.array([0, 1, 0, 1])
     score = np.array([[0.9, 0.1], [0.2, 0.8], [0.7, 0.3], [0.4, 0.6]])
@@ -22610,6 +22694,7 @@ def main():
     _check('A1 holm_min_attainable_p', t_holm_min_attainable)
     _check('A2 signflip_min_consistency', t_min_consistency)
     _check('A2b binomial tail at scale', t_binomial_tail_at_scale)
+    _check('A2c binomial tail at large scale', t_binomial_tail_large_scale)
     _check('A3 signflip_power', t_power)
     _check('A4 tost_paired directions', t_tost)
     _check('A5 exact_signflip baseline', t_exact_signflip_baseline)
@@ -23004,6 +23089,7 @@ def main():
     _check('L60c factorial interaction names missing seeds and rejects malformed cells', t_factorial_interaction_fails_closed_on_malformed_records_and_names_missing_seeds)
     _check('L60d factorial design gate rejects value drift and absent interventions', t_factorial_design_gate_rejects_value_drift_and_absent_interventions)
     _check('L60e factorial interaction strips arms and isolates disjoint designs', t_factorial_interaction_matches_stripped_arms_and_disjoint_designs)
+    _check('L60f factorial interaction look history binds cells and protocol tags', t_factorial_interaction_look_history_binds_cells_and_tags)
     _check('L61 frozen-manifest mechanism flags are machine-verified single-factor verdicts', t_frozen_manifest_mechanism_flags_are_verified_single_factor)
     _check('L62 seq2k sweep contrasts carry explicit factor declarations', t_seq2k_contrasts_carry_factor_declarations)
     _check('L62b v7 rope/sink/selection contrasts carry verified factor declarations', t_v7_rope_contrasts_carry_factor_declarations)
