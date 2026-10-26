@@ -20676,6 +20676,17 @@ def t_factorial_interaction_sesoi_decisions():
     assert partial_two['sesoi']['family']['m'] == 2, partial_two['sesoi']
     assert partial_two['factorials']['b']['practical_decision'] == 'not_declared', partial_two
     assert partial_two['not_declared_interactions'] == ['b'], partial_two
+    malformed_cells = {'good': copy.deepcopy(base), 'bad': copy.deepcopy(base)}
+    malformed_cells['bad']['cells'][('active', 'active')] = (
+        malformed_cells['bad']['cells'][('active', 'control')])
+    md = L.factorial_interaction_audit(
+        design=malformed_cells, recs=_factorial_records(
+            [0.002 if i % 2 else -0.002 for i in range(7)]),
+        sesoi={k: {'relative_pct': 1.0} for k in malformed_cells})
+    assert md['status'] == 'incomplete', md
+    assert md['factorials']['bad']['status'] == 'incomplete', md['factorials']
+    assert md['family']['m'] == 2, md['family']
+    assert md['sesoi']['family']['m'] == 2, md['sesoi']
     # The no-complete-2x2-seed branch must not append the same name twice.
     allbad = {k: (dict(v, run_cfg='other_cfg')
                   if k[0] == 'csa_fix_randidx' else v)

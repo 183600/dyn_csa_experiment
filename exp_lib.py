@@ -30182,19 +30182,52 @@ def factorial_interaction_audit(summary=None, design=None, *, alpha=0.05,
     family = []
     tost_family = []
     interaction_values = {}
+
+    def _unusable_factorial(name, reason):
+        sname = str(name)
+        rec = {'factors': None, 'cells': None, 'n_present_cells': 0,
+               'status': 'incomplete',
+               'interaction': {'available': False, 'reason': reason}}
+        out['factorials'][sname] = rec
+        out['warnings'].append(
+            f'{name}: {reason}; its family slot is kept at p=1')
+        family.append((sname, 1.0))
+        _sesoi_spec = sesoi_specs.get(sname)
+        _margin = (_sesoi_spec.get('margin_log_ratio')
+                   if isinstance(_sesoi_spec, dict) else None)
+        if _margin is None:
+            rec['practical_decision'] = 'not_declared'
+            rec['sesoi'] = {
+                'declared': False, 'margin_log_ratio': None,
+                'decision': 'not_declared', 'claim': 'not_declared',
+                'reason': 'no pre-registered interaction SESOI was supplied',
+            }
+            if sesoi_specs:
+                tost_family.append((sname, 1.0))
+        else:
+            rec['practical_decision'] = 'not_measured'
+            rec['sesoi'] = {
+                'declared': True,
+                'margin_log_ratio': float(_margin),
+                'decision': 'not_measured', 'claim': 'not_measured',
+                'reason': ('the factorial declaration is malformed; '
+                           'additivity cannot be certified'),
+            }
+            tost_family.append((sname, 1.0))
+
     for name, spec in design.items():
         if not isinstance(spec, dict):
-            out['warnings'].append(f'{name}: factorial declaration is not a mapping')
+            _unusable_factorial(name, 'factorial declaration is not a mapping')
             continue
         cells = spec.get('cells')
         factors = spec.get('factors')
         if not isinstance(cells, dict):
-            out['warnings'].append(f'{name}: cells must be a mapping')
+            _unusable_factorial(name, 'cells must be a mapping')
             continue
         raw_arms = [cells.get(k) for k in _FACTORIAL_CELL_KEYS]
         if any(not isinstance(a, str) or not a.strip() for a in raw_arms):
-            out['warnings'].append(
-                f'{name}: the four cells must map to non-empty, hashable arm ids')
+            _unusable_factorial(
+                name, 'the four cells must map to non-empty, hashable arm ids')
             continue
         arms = [a.strip() for a in raw_arms]
         extra_cells = sorted(str(k) for k in cells if k not in _FACTORIAL_CELL_KEYS)
@@ -30203,7 +30236,7 @@ def factorial_interaction_audit(summary=None, design=None, *, alpha=0.05,
                 f'{name}: cell declaration has extra key(s): '
                 + ', '.join(extra_cells))
         if len(set(arms)) != 4:
-            out['warnings'].append(f'{name}: the four cells are not distinct arms')
+            _unusable_factorial(name, 'the four cells are not distinct arms')
             continue
         present_arms = set(arms) & present
         if not present_arms:
