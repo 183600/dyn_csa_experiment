@@ -4681,3 +4681,99 @@ L202 覆盖单位级 CI/MDE/SESOI 充足与不足、目标半宽所需 n、popul
 身份核验与不可用路径；L204 覆盖 manifest + pilot + sampling 门接线、
 缺 pilot 的 `not_verifiable`、population 过度声明失败，以及 `run_report`
 与 CLI 文档接线。
+
+## 70. 预注册方向性主张的三向判定：确认、反证与不确定
+
+### 70.1 动机
+
+§41/§42 的冻结确认规则把结果二分为「`confirmed`」与「其余」：只有
+`p_holm < alpha`、方向符合预注册、覆盖/参数/初始化/样本下限全部满足才
+进入 `confirmed`，否则一律按探索性读数处理。这个二分漏掉了一类在科学上
+很不一样的结果：**Holm 校正后显著、方向却与预注册相反**。把它写成
+「未确认」「无效应」或「探索性」会掩盖证据已经与方向性主张冲突这一事实；
+反过来，把它写成「显著更差」「实际等价」或「相反机制成立」又超出了检验
+能支持的范围。
+
+本节在**不新增检验、不新增 alpha、不改变任何 p/Holm/`confirmed`** 的
+前提下，把冻结族的同一个 Holm 拒绝集合划分为三向判定：
+
+- `supported`：Holm 显著 + 方向符合 + 有效性门全过；
+- `refuted`：Holm 显著 + 方向相反 + 有效性门全过；
+- `inconclusive` / `not_testable` / `significant_nondirectional`：其余情形。
+
+### 70.2 方法与接线
+
+`exp_lib.directional_claim_verdicts(comparisons, ...)` 是纯函数。每条记录
+读取 `p_holm`、`expected_sign`、`direction_ok`、`n_effective`、
+`min_seeds_for_confirmation`、`coverage_ok`、`param_matched`、
+`param_match_complete`、`same_init_core_fp`、`omitted` 和
+`mechanism_claim_allowed`，返回逐比较 `verdicts` 与顶层
+`supported` / `refuted` / `inconclusive` / `significant_nondirectional` /
+`not_testable` / `opposite_nonsignificant` /
+`reverse_significant_unverified` 列表及计数。规则边界：
+
+- 反向显著但覆盖、参数、初始化或样本下限至少一项未过 ⇒
+  `inconclusive`，并进入 `reverse_significant_unverified`；不能宣布反证；
+- 反向但不显著 ⇒ `inconclusive`，可进入 `opposite_nonsignificant` 供报告
+  解释，但不是反证；
+- `expected_sign=None` 的显著读数 ⇒ `significant_nondirectional`，永不进入
+  `supported`/`refuted`；
+- 缺失、`omitted` 或无 `p_holm` ⇒ `not_testable`；
+- `param_matched=false` 始终使主张无效；清单声明参数匹配契约时还要求
+  `param_match_complete=true`，缺记录不再按「未知即通过」处理。
+
+`v12_supp.finaltest_stats` 在冻结 `confirmed` 计算完成后调用该函数，写入
+`stats['verdicts']`、`verdict_summary`、`refuted`、`inconclusive`、
+`not_testable`、`opposite_nonsignificant`、
+`reverse_significant_unverified` 和 `verdict_consistency`。冻结
+`confirmed` 保持原规则原值；若 `supported` 与它不一致，只记录 warning 和
+`verdict_consistency.match=false`，不静默改写。`not_confirmed_reasons`
+为每个 Holm 拒绝但未确认的比较补上 `verdict`、`verdict_reason` 与
+`gate_failures`。`build_report` 通过 `_refutation_markdown` 单独渲染反证、
+显著反向但未过门、反向不显著三类，避免它们被「未确认」段吞掉。
+
+结果分析审计 `audit_gates.audit_confirmation_verdicts` 读取
+`analysis_v12/test_stats.json`，用存储的 `holm[*].p_holm`、方向与有效性门
+独立重放三向划分，核对逐比较 verdict、顶层列表、`confirmed == supported`
+以及 supported/refuted 不相交。verdict 被篡改、比较重复归类、列表与重放
+不一致 ⇒ `fail`；没有 verdict 字段的旧 artifact ⇒
+`not_verifiable_locally`（不能追溯升级），不会静默通过。该审计接入
+`audit_gates.py report` 的 `verdicts` 键及 CLI 别名 `verdicts`/`verdict`/
+`three_way`。
+
+### 70.3 边界
+
+- **反证不是新检验。** `refuted` 只是对同一个双侧 Holm 显著结果的预注册
+  方向解释，继承该族的 FWER 控制；没有另算单侧 p，也没有把 alpha 翻倍。
+- **反证不是等价。** 未预注册 SESOI 时，`refuted` 只说明预注册的**方向性
+  优势**不成立，不能写成「显著更差」「实际等价」或「效应小于某阈值」。
+- **反证不证明相反机制。** `mechanism_claim_allowed=false` 的 system-level
+  比较只否定所测系统差异，不否定机制本身；报告必须保留
+  `claim_scope=system_level` 的措辞。
+- **有效性门优先。** 反向显著但覆盖不全、参数不匹配、初始化未核验或
+  `n_effective` 低于下限时，证据不能进入反证，只能记为
+  `inconclusive`；这正是「显著」不等于「可解释」的地方。
+- **旧 artifact 不追溯升级。** 没有三向字段的已落盘统计只能报告
+  `not_verifiable_locally`；要得到反证判定，必须用当前分析重跑并保留新
+  artifact，不能事后手写标签。
+- **不改变冻结决策。** 本节不改 manifest、种子、终点、alpha、Holm 族、
+  `CODE_SEMANTICS` 或任何已落盘数值；`confirmed` 仍是唯一冻结确认集合。
+
+### 70.4 入口与验证
+
+```bash
+python audit_gates.py verdicts   # 重放三向判定并核对 artifact
+python audit_gates.py report     # 汇总含 verdicts
+python v12_supp.py finaltest     # 写出 verdicts/refuted/verdict_consistency
+python v12_supp.py report        # 报告含反证/反向不显著段
+python test_review_fixes.py      # L206-L208
+python v12_supp.py plan          # 冻结计划预检不变
+```
+
+L206 覆盖纯函数的三向划分、反向显著但门未过、无方向/缺失/省略、
+`param_matched` 与参数契约、样本下限、p==alpha、非法输入以及不修改入参；
+L207 覆盖 `finaltest_stats` 的 supported/refuted/inconclusive 三态、
+`not_confirmed_reasons.verdict`、`verdict_consistency` 与
+`_refutation_markdown` 的正反边界文案；L208 覆盖审计对正常 artifact 的
+`warnings`、列表/逐项 verdict 篡改的 `fail`、旧 artifact 与缺文件的
+`not_verifiable_locally`，以及 `run_report`/CLI 接线。

@@ -42,6 +42,9 @@
   unit_influence  结果分析：逐评测单位删除（leave-one-out）影响读数是否
                与主终点同口径、是否由单个文章/文档主导（读 analysis_v12/，
                零 GPU；warning 级，不改变冻结判定）
+  verdicts     三向方向性判定：supported / refuted / inconclusive /
+               not_testable；显著反向不是「未确认」而是反证（读
+               analysis_v12/test_stats.json，零 GPU，不改变 p/Holm）
   analysis_choices  结果分析：同一主比较的多种分析口径（逐种子 mean/median/
                trimmed、token 池化、逐单元 mean/median/log-ratio/win-rate）
                是否方向一致、带区间的口径是否一致地排除零（读 analysis_v12/，
@@ -6262,6 +6265,194 @@ def audit_analysis_choices(path=None):
     return out
 
 
+def audit_confirmation_verdicts(path=None):
+    """Result-analysis audit: the three-way directional verdict is coherent.
+
+    ``v12_supp.finaltest_stats`` records ``supported`` / ``refuted`` /
+    ``inconclusive`` / ``not_testable`` plus a per-comparison ``verdicts``
+    block.  A Holm-significant result in the opposite direction is a
+    refutation of the pre-registered directional claim, not "not confirmed";
+    this gate independently replays the partition from the stored p-values,
+    directions and validity gates.  It never recomputes a p-value and never
+    changes the frozen decision.  A stored verdict that disagrees with the
+    replay, a comparison that appears in two buckets, or a missing verdict is
+    a ``fail``; an artifact produced before the three-way field existed is
+    ``not_verifiable_locally`` rather than silently passing.
+    """
+    L = _import_exp_lib()
+    p = path or os.path.join(REPO, 'analysis_v12', 'test_stats.json')
+    out = {'kind': 'confirmation_verdict_audit', 'status': 'ok', 'path': p,
+           'comparisons': {}, 'n_supported': 0, 'n_refuted': 0,
+           'n_inconclusive': 0, 'n_not_testable': 0,
+           'problems': [], 'warnings': [],
+           'note': ('replays the three-way directional partition on the SAME '
+                    'Holm family; it adds no test and never changes a frozen '
+                    'p/Holm/confirmed verdict')}
+    if not os.path.exists(p):
+        out['status'] = 'not_verifiable_locally'
+        out['reason'] = 'no final-test stats artifact on disk'
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return out
+    data = _load(p)
+    if data is None:
+        out['status'] = 'fail'
+        out['problems'].append(f'{p} exists but is not a readable JSON object')
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return out
+    ft = data.get('finaltest') if isinstance(data.get('finaltest'), dict) else data
+    comps = ft.get('comparisons') if isinstance(ft, dict) else None
+    if not isinstance(comps, dict) or not comps:
+        out['status'] = 'not_verifiable_locally'
+        out['reason'] = 'the stats artifact carries no comparisons'
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return out
+    stored = ft.get('verdicts')
+    if not isinstance(stored, dict) or not stored:
+        out['status'] = 'not_verifiable_locally'
+        out['reason'] = ('the stats artifact predates the three-way verdict '
+                         'block; regenerate it with the current v12 analysis')
+        out['warnings'].append(
+            'legacy artifact: a reverse-significant comparison cannot be '
+            'distinguished from an unconfirmed one until the analysis is rerun')
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return out
+    holm = ft.get('holm') if isinstance(ft.get('holm'), dict) else {}
+    vin = {}
+    for name, rec in comps.items():
+        if not isinstance(rec, dict):
+            out['problems'].append(
+                f'{name}: comparison is a {type(rec).__name__}, not an object')
+            continue
+        cv = dict(rec)
+        _h = holm.get(name) if isinstance(holm.get(name), dict) else {}
+        cv['p_holm'] = _h.get('p_holm', cv.get('p_holm'))
+        vin[str(name)] = cv
+    _cov = ((ft.get('coverage_requirement') or {}).get('require_complete_coverage')
+            if isinstance(ft.get('coverage_requirement'), dict) else False)
+    _par = ((ft.get('parameter_binding') or {}).get('required_by_manifest')
+            if isinstance(ft.get('parameter_binding'), dict) else False)
+    _m = ft.get('manifest') if isinstance(ft.get('manifest'), dict) else {}
+    _seeds = _m.get('seeds') if isinstance(_m.get('seeds'), list) else []
+    _alpha = ft.get('alpha', 0.05)
+    try:
+        replay = L.directional_claim_verdicts(
+            vin, names=list(vin), alpha=_alpha,
+            require_complete_coverage=bool(_cov),
+            require_param_match=bool(_par),
+            default_min_seeds=(len(_seeds) if _seeds else None))
+    except Exception as _e:
+        out['status'] = 'fail'
+        out['problems'].append(
+            f'the stored comparison records cannot be replayed '
+            f'({type(_e).__name__}: {_e})')
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return out
+    expected = replay['verdicts']
+    _allowed = {'supported', 'refuted', 'inconclusive',
+                'significant_nondirectional', 'not_testable'}
+    for name in vin:
+        srec = stored.get(name)
+        if not isinstance(srec, dict):
+            out['problems'].append(
+                f'{name}: stored verdict is missing or not an object')
+            continue
+        _v = srec.get('verdict')
+        if _v not in _allowed:
+            out['problems'].append(
+                f'{name}: stored verdict {_v!r} is not one of {sorted(_allowed)}')
+            continue
+        want = expected[name]['verdict']
+        if _v != want:
+            out['problems'].append(
+                f'{name}: stored verdict {_v!r} does not match the replay '
+                f'{want!r} from p_holm/direction/validity gates')
+        _sp, _wp = srec.get('p_holm'), expected[name].get('p_holm')
+        if (_sp is None) != (_wp is None):
+            out['problems'].append(
+                f'{name}: stored p_holm presence does not match the replay')
+        elif _sp is not None:
+            try:
+                if abs(float(_sp) - float(_wp)) > 1e-12:
+                    out['problems'].append(
+                        f'{name}: stored p_holm={_sp!r} does not match the '
+                        f'replayed {_wp!r}')
+            except (TypeError, ValueError, OverflowError):
+                out['problems'].append(
+                    f'{name}: stored p_holm is not numeric')
+        out['comparisons'][name] = {
+            'verdict': _v, 'expected': want,
+            'expected_sign': expected[name].get('expected_sign'),
+            'direction_ok': expected[name].get('direction_ok'),
+            'claim_scope': expected[name].get('claim_scope'),
+            'gate_failures': expected[name].get('gate_failures')}
+    _extra = sorted(set(map(str, stored)) - set(vin))
+    if _extra:
+        out['problems'].append(
+            f'stored verdicts contain undeclared comparisons: {_extra}')
+    # ``significant_nondirectional`` predates the three-way block: the frozen
+    # field includes every Holm rejection whose direction is unverifiable,
+    # even when a validity gate fails.  Replay that legacy field exactly rather
+    # than comparing it to the helper's stricter non-directional bucket.
+    _legacy_nd = []
+    for _name, _rec in vin.items():
+        try:
+            _p = float(_rec.get('p_holm'))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if math.isfinite(_p) and _p < float(replay['alpha']) and \
+                _rec.get('direction_ok') is None:
+            _legacy_nd.append(_name)
+    _lists = {'confirmed': replay['supported'],
+              'refuted': replay['refuted'],
+              'inconclusive': replay['inconclusive'],
+              'not_testable': replay['not_testable'],
+              'significant_nondirectional': _legacy_nd,
+              'opposite_nonsignificant': replay['opposite_nonsignificant'],
+              'reverse_significant_unverified': replay['reverse_significant_unverified']}
+    for key, want in _lists.items():
+        got = ft.get(key)
+        if got is None:
+            if key in ('confirmed', 'refuted'):
+                out['problems'].append(
+                    f'top-level {key!r} list is missing from the stats artifact')
+            continue
+        if isinstance(got, (str, bytes)) or not isinstance(got, (list, tuple)):
+            out['problems'].append(
+                f'top-level {key!r} is not a list')
+            continue
+        got_s = sorted(str(x) for x in got)
+        want_s = sorted(want)
+        if len(got_s) != len(set(got_s)):
+            out['problems'].append(
+                f'top-level {key!r} contains duplicate names')
+        if got_s != want_s:
+            out['problems'].append(
+                f'top-level {key!r}={got_s} does not match the replay {want_s}')
+    _overlap = (set(replay['supported']) & set(replay['refuted']))
+    if _overlap:
+        out['problems'].append(
+            f'comparisons cannot be both supported and refuted: {sorted(_overlap)}')
+    out['n_supported'] = len(replay['supported'])
+    out['n_refuted'] = len(replay['refuted'])
+    out['n_inconclusive'] = len(replay['inconclusive'])
+    out['n_not_testable'] = len(replay['not_testable'])
+    if replay['refuted']:
+        out['warnings'].append(
+            'refuted comparisons are directional conflicts, not "not '
+            'confirmed" or equivalence; the report must keep that wording')
+    if replay['reverse_significant_unverified']:
+        out['warnings'].append(
+            'some comparisons have a significant reverse point estimate but '
+            'failed a validity gate; they stay inconclusive, not refuted')
+    if out['problems']:
+        out['status'] = 'fail'
+    elif out['warnings']:
+        out['status'] = 'warnings'
+    print(json.dumps({k: v for k, v in out.items() if k != 'comparisons'},
+                     ensure_ascii=False, indent=2))
+    return out
+
+
 def _find_look_histories(paths=None, max_depth=3):
     """Yield ``look_history.json`` paths from explicit paths or results_* trees."""
     seen = set()
@@ -6627,7 +6818,7 @@ def audit_statistical_calibration(*, n_sim=None, seed=None):
 
 
 def run_report(out='audit_report.json'):
-    res = {'generated_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'source_tree': audit_source_integrity(), 'dependencies': audit_dependencies(), 'data_source': audit_data_source(), 'leakage': audit_leakage(), 'split_discipline': audit_split_discipline(), 'document_unit': audit_document_unit(), 'sample_design': audit_sample_design(), 'attribution': audit_attribution(), 'boundary': audit_boundary(), 'length': audit_length(), 'fairness': audit_fairness(), 'metrics': audit_metrics(), 'tuning': audit_tuning(), 'simple_baseline': audit_simple_baseline(), 'hypotheses': audit_hypotheses(), 'sesoi': audit_sesoi_declaration(), 'interaction_sesoi': audit_interaction_sesoi(), 'unit_influence': audit_unit_influence(), 'analysis_choices': audit_analysis_choices(), 'looks': audit_look_history(), 'methodology': audit_methodology(), 'single_factor': audit_single_factor(), 'factorial': audit_factorial_design(), 'design_preflight': audit_design_preflight(), 'sensitivity': audit_design_sensitivity(), 'evaluation': audit_evaluation_design(), 'dose_response': audit_dose_response(verbose=False), 'failures': audit_failures(), 'budget': audit_budget(), 'training_health': audit_training_health(), 'efficiency_pairs': audit_efficiency_pairs(), 'release': audit_release_readiness(), 'selection': audit_selection(), 'run_order': audit_run_order(), 'calibration': audit_statistical_calibration()}
+    res = {'generated_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'source_tree': audit_source_integrity(), 'dependencies': audit_dependencies(), 'data_source': audit_data_source(), 'leakage': audit_leakage(), 'split_discipline': audit_split_discipline(), 'document_unit': audit_document_unit(), 'sample_design': audit_sample_design(), 'attribution': audit_attribution(), 'boundary': audit_boundary(), 'length': audit_length(), 'fairness': audit_fairness(), 'metrics': audit_metrics(), 'tuning': audit_tuning(), 'simple_baseline': audit_simple_baseline(), 'hypotheses': audit_hypotheses(), 'sesoi': audit_sesoi_declaration(), 'interaction_sesoi': audit_interaction_sesoi(), 'unit_influence': audit_unit_influence(), 'analysis_choices': audit_analysis_choices(), 'verdicts': audit_confirmation_verdicts(), 'looks': audit_look_history(), 'methodology': audit_methodology(), 'single_factor': audit_single_factor(), 'factorial': audit_factorial_design(), 'design_preflight': audit_design_preflight(), 'sensitivity': audit_design_sensitivity(), 'evaluation': audit_evaluation_design(), 'dose_response': audit_dose_response(verbose=False), 'failures': audit_failures(), 'budget': audit_budget(), 'training_health': audit_training_health(), 'efficiency_pairs': audit_efficiency_pairs(), 'release': audit_release_readiness(), 'selection': audit_selection(), 'run_order': audit_run_order(), 'calibration': audit_statistical_calibration()}
     L_atomic = None
     try:
         L = _import_exp_lib()
@@ -6647,7 +6838,7 @@ def run_report(out='audit_report.json'):
 
 
 if __name__ == '__main__':
-    _cmds = {'leakage': audit_leakage, 'split': audit_split_discipline, 'split_discipline': audit_split_discipline, 'document_unit': audit_document_unit, 'unit': audit_document_unit, 'sample_design': audit_sample_design, 'sampling': audit_sample_design, 'sample': audit_sample_design, 'causality': audit_causality, 'attribution': audit_attribution, 'boundary': audit_boundary, 'length': audit_length, 'fairness': audit_fairness, 'metrics': audit_metrics, 'tuning': audit_tuning, 'simple': audit_simple_baseline, 'baseline_floor': audit_simple_baseline, 'baseline_plan': audit_baseline_design, 'hypothesis_coverage': audit_hypothesis_coverage, 'hypotheses': audit_hypotheses, 'sesoi': audit_sesoi_declaration, 'interaction_sesoi': audit_interaction_sesoi, 'interaction': audit_interaction_sesoi, 'unit_influence': audit_unit_influence, 'influence': audit_unit_influence, 'analysis_choices': audit_analysis_choices, 'specification_curve': audit_analysis_choices, 'analysis_choice': audit_analysis_choices, 'looks': audit_look_history, 'look_history': audit_look_history, 'methodology': audit_methodology, 'single_factor': audit_single_factor, 'factorial': audit_factorial_design, 'factorial_design': audit_factorial_design, 'design': audit_design_preflight, 'design_preflight': audit_design_preflight, 'sensitivity': audit_design_sensitivity, 'design_sensitivity': audit_design_sensitivity, 'precision': audit_design_sensitivity, 'evaluation': audit_evaluation_design, 'evaluation_design': audit_evaluation_design, 'unit_precision': audit_evaluation_design, 'dose_response': audit_dose_response, 'dose_response_design': audit_dose_response, 'failures': audit_failures, 'budget': audit_budget, 'efficiency': audit_efficiency_demo, 'efficiency_pairs': audit_efficiency_pairs, 'training_health': audit_training_health, 'selection': audit_selection, 'release': audit_release_readiness, 'run_order': audit_run_order, 'calibration': audit_statistical_calibration, 'stats_calibration': audit_statistical_calibration, 'type_i': audit_statistical_calibration, 'source': audit_source_integrity, 'source_tree': audit_source_integrity, 'dependencies': audit_dependencies, 'dependency': audit_dependencies, 'data_source': audit_data_source, 'dataset_source': audit_data_source, 'report': run_report}
+    _cmds = {'leakage': audit_leakage, 'split': audit_split_discipline, 'split_discipline': audit_split_discipline, 'document_unit': audit_document_unit, 'unit': audit_document_unit, 'sample_design': audit_sample_design, 'sampling': audit_sample_design, 'sample': audit_sample_design, 'causality': audit_causality, 'attribution': audit_attribution, 'boundary': audit_boundary, 'length': audit_length, 'fairness': audit_fairness, 'metrics': audit_metrics, 'tuning': audit_tuning, 'simple': audit_simple_baseline, 'baseline_floor': audit_simple_baseline, 'baseline_plan': audit_baseline_design, 'hypothesis_coverage': audit_hypothesis_coverage, 'hypotheses': audit_hypotheses, 'sesoi': audit_sesoi_declaration, 'interaction_sesoi': audit_interaction_sesoi, 'interaction': audit_interaction_sesoi, 'unit_influence': audit_unit_influence, 'influence': audit_unit_influence, 'analysis_choices': audit_analysis_choices, 'specification_curve': audit_analysis_choices, 'verdicts': audit_confirmation_verdicts, 'verdict': audit_confirmation_verdicts, 'three_way': audit_confirmation_verdicts, 'analysis_choice': audit_analysis_choices, 'looks': audit_look_history, 'look_history': audit_look_history, 'methodology': audit_methodology, 'single_factor': audit_single_factor, 'factorial': audit_factorial_design, 'factorial_design': audit_factorial_design, 'design': audit_design_preflight, 'design_preflight': audit_design_preflight, 'sensitivity': audit_design_sensitivity, 'design_sensitivity': audit_design_sensitivity, 'precision': audit_design_sensitivity, 'evaluation': audit_evaluation_design, 'evaluation_design': audit_evaluation_design, 'unit_precision': audit_evaluation_design, 'dose_response': audit_dose_response, 'dose_response_design': audit_dose_response, 'failures': audit_failures, 'budget': audit_budget, 'efficiency': audit_efficiency_demo, 'efficiency_pairs': audit_efficiency_pairs, 'training_health': audit_training_health, 'selection': audit_selection, 'release': audit_release_readiness, 'run_order': audit_run_order, 'calibration': audit_statistical_calibration, 'stats_calibration': audit_statistical_calibration, 'type_i': audit_statistical_calibration, 'source': audit_source_integrity, 'source_tree': audit_source_integrity, 'dependencies': audit_dependencies, 'dependency': audit_dependencies, 'data_source': audit_data_source, 'dataset_source': audit_data_source, 'report': run_report}
     _arg = sys.argv[1] if len(sys.argv) > 1 else 'report'
     if _arg in ('-h', '--help'):
         print(__doc__)

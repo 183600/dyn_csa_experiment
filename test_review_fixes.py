@@ -23286,6 +23286,277 @@ def t_power_preflight_uses_frozen_test_units():
     assert 'evaluation_design_units' in inspect.getsource(V12.run_power)
 
 
+def t_directional_claim_verdicts_three_way():
+    base = {
+        'expected_sign': 'negative', 'p_holm': 0.01, 'direction_ok': True,
+        'n_effective': 12, 'min_seeds_for_confirmation': 8,
+        'coverage_ok': True, 'param_matched': True,
+        'param_match_complete': True, 'same_init_core_fp': True,
+        'mechanism_claim_allowed': False,
+    }
+
+    def _case(**over):
+        c = dict(base)
+        c.update(over)
+        return c
+
+    comps = {
+        'sup': _case(),
+        'ref': _case(direction_ok=False),
+        'inc': _case(p_holm=0.5),
+        'nd': _case(expected_sign=None, direction_ok=None),
+        'omit': {'omitted': 'no complete seed pairs'},
+        'opp_inc': _case(p_holm=0.4, direction_ok=False),
+    }
+    frozen = json.loads(json.dumps(comps))
+    rep = L.directional_claim_verdicts(
+        comps, names=['sup', 'ref', 'inc', 'nd', 'omit', 'opp_inc'],
+        alpha=0.05, require_complete_coverage=True,
+        require_param_match=True, default_min_seeds=8)
+    assert comps == frozen, 'the helper must not mutate its input records'
+    assert rep['supported'] == ['sup'], rep['supported']
+    assert rep['refuted'] == ['ref'], rep['refuted']
+    assert rep['inconclusive'] == ['inc', 'opp_inc'], rep['inconclusive']
+    assert rep['not_testable'] == ['omit'], rep['not_testable']
+    assert rep['significant_nondirectional'] == ['nd'], rep
+    assert rep['opposite_nonsignificant'] == ['opp_inc'], rep
+    assert rep['verdicts']['ref']['reason'] == 'holm_significant_and_direction_opposite', rep
+    assert rep['verdicts']['ref']['claim_scope'] == 'system_level', rep['verdicts']['ref']
+    assert rep['verdicts']['nd']['claim_scope'] == 'nondirectional', rep['verdicts']['nd']
+    assert rep['counts']['refuted'] == 1, rep['counts']
+    assert 'not equivalence' in rep['rule'], rep['rule']
+
+    # A reverse-significant result that fails a validity gate is NOT a
+    # refutation; it stays inconclusive and is surfaced by name so the report
+    # can explain why the evidence was not admitted.
+    weak = L.directional_claim_verdicts(
+        {'ref': _case(direction_ok=False, coverage_ok=False)},
+        names=['ref'], alpha=0.05, require_complete_coverage=True,
+        require_param_match=True, default_min_seeds=8)
+    assert weak['refuted'] == [], weak
+    assert weak['reverse_significant_unverified'] == ['ref'], weak
+    assert weak['verdicts']['ref']['verdict'] == 'inconclusive', weak
+    assert 'coverage_incomplete' in weak['verdicts']['ref']['gate_failures'], weak
+
+    # A definite parameter mismatch always invalidates the claim; a disclosed
+    # matching contract additionally requires a complete record (None is not a
+    # pass), while legacy manifests without the contract keep the old path.
+    _v = L.directional_claim_verdicts(
+        {'m': _case(param_matched=False)},
+        names=['m'], require_param_match=False, default_min_seeds=8)
+    assert _v['supported'] == [] and _v['verdicts']['m']['validity_ok'] is False, _v
+    _v = L.directional_claim_verdicts(
+        {'m': _case(param_match_complete=None)},
+        names=['m'], require_param_match=True, default_min_seeds=8)
+    assert _v['supported'] == [], _v
+    _v = L.directional_claim_verdicts(
+        {'m': _case(param_match_complete=None)},
+        names=['m'], require_param_match=False, default_min_seeds=8)
+    assert _v['supported'] == ['m'], _v
+    _v = L.directional_claim_verdicts(
+        {'m': _case(n_effective=3)},
+        names=['m'], default_min_seeds=8)
+    assert _v['supported'] == [] and any(
+        'min_seeds_for_confirmation' in x
+        for x in _v['verdicts']['m']['gate_failures']), _v
+
+    # p == alpha is not below alpha; two-sided p cannot be a boolean/NaN/out
+    # of range.  The helper adds no test, so the boundary must be exact.
+    _v = L.directional_claim_verdicts({'m': _case(p_holm=0.05)}, names=['m'])
+    assert _v['verdicts']['m']['verdict'] == 'inconclusive', _v
+
+    def _raises(fn):
+        try:
+            fn()
+        except ValueError:
+            return
+        raise AssertionError('expected ValueError')
+
+    _raises(lambda: L.directional_claim_verdicts({'m': _case(expected_sign='up')}, names=['m']))
+    _raises(lambda: L.directional_claim_verdicts({'m': _case(direction_ok=1)}, names=['m']))
+    _raises(lambda: L.directional_claim_verdicts({'m': _case(p_holm=True)}, names=['m']))
+    _raises(lambda: L.directional_claim_verdicts({'m': _case(p_holm=float('nan'))}, names=['m']))
+    _raises(lambda: L.directional_claim_verdicts({'m': _case(p_holm=-0.01)}, names=['m']))
+    _raises(lambda: L.directional_claim_verdicts({'m': _case()}, names='m'))
+    _raises(lambda: L.directional_claim_verdicts({'m': _case()}, names=['m', 'm']))
+    _raises(lambda: L.directional_claim_verdicts({'m': _case()}, names=['m'], alpha=1.0))
+    _raises(lambda: L.directional_claim_verdicts({'m': _case()}, names=['m'],
+                                                  default_min_seeds=-1))
+
+    import inspect
+    src = inspect.getsource(V12.finaltest_stats)
+    assert 'directional_claim_verdicts' in src and 'verdict_consistency' in src, src
+    assert inspect.getsource(V12._refutation_markdown)
+
+
+def t_finaltest_verdicts_and_refutation_markdown():
+    manifest = {
+        'frozen_at': '2026-10-27', 'code_semantics_expected': L.CODE_SEMANTICS,
+        'arms': ['a_arm', 'b_arm'], 'seeds': [0, 1, 2, 3, 4, 5],
+        'primary_comparisons': [{
+            'name': 'c1', 'a': 'a_arm', 'b': 'b_arm',
+            'endpoint': 'by_len.ppl@4096', 'expected_sign': 'negative',
+            'mechanism_claim_allowed': False}],
+        'statistics': {
+            'test': 'exact two-sided sign-flip', 'correction': 'holm step-down',
+            'descriptive_only': True, 'require_complete_coverage': True,
+            'min_seeds_for_confirmation': 2, 'n_seeds': 6},
+    }
+
+    def _rec(arm, seed, ppl, msha):
+        return {'variant': arm, 'seed': seed, 'split': 'test',
+                'data_fp': 'FP', 'by_len': {'4096': {
+                    'ppl': ppl, 'n_tok': 1000, 'truncated': False}},
+                '_code': L.code_stamp(), 'manifest_sha256': msha,
+                'init_core_fp': f'I{seed}',
+                'param_breakdown': {'active': 1000}, 'params': 1000}
+
+    with tempfile.TemporaryDirectory() as td:
+        mp = os.path.join(td, 'm.json')
+        with open(mp, 'w', encoding='utf-8') as f:
+            json.dump(manifest, f)
+        m = V12._load_manifest(mp)
+        outdir = os.path.join(td, 'res')
+        os.makedirs(outdir)
+        V12._check_or_write_freeze_lock(outdir, m, 'FP', stage='accessed')
+        bp = os.path.join(outdir, 'bylen.json')
+
+        def _run(avals, tag):
+            raw = {}
+            for s, a_ppl in enumerate(avals):
+                raw[f'a_arm::s{s}'] = _rec('a_arm', s, a_ppl, m['manifest_sha256'])
+                raw[f'b_arm::s{s}'] = _rec('b_arm', s, 12.0, m['manifest_sha256'])
+            with open(bp, 'w', encoding='utf-8') as f:
+                json.dump(raw, f)
+            with contextlib.redirect_stdout(io.StringIO()):
+                return V12.finaltest_stats(
+                    manifest=m, bylen_path=bp,
+                    probe_path=os.path.join(td, 'no_probe.json'),
+                    out=os.path.join(td, f'stats_{tag}.json'))
+
+        # a - b is negative: the pre-registered direction is supported.
+        st = _run([10.0] * 6, 'sup')
+        assert st['confirmed'] == ['c1'], st['confirmed']
+        assert st['verdicts']['c1']['verdict'] == 'supported', st['verdicts']
+        assert st['verdict_summary']['supported'] == ['c1'], st['verdict_summary']
+        assert st['verdict_consistency']['match'] is True, st
+        assert V12._refutation_markdown(st, 0.05) == []
+
+        # a - b is positive and Holm-significant: a directional conflict, not
+        # "not confirmed" and not an exploratory result.
+        st = _run([14.0] * 6, 'ref')
+        assert st['confirmed'] == [], st['confirmed']
+        assert st['refuted'] == ['c1'], st['refuted']
+        assert st['verdicts']['c1']['verdict'] == 'refuted', st['verdicts']
+        assert st['verdicts']['c1']['reason'] == 'holm_significant_and_direction_opposite', st
+        md = '\n'.join(V12._refutation_markdown(st, 0.05))
+        assert '反证' in md and '不是「未确认」' in md, md
+        assert 'system_level' in md and 'SESOI' in md, md
+        assert st['not_confirmed_reasons']['c1']['verdict'] == 'refuted', st['not_confirmed_reasons']
+
+        # A non-significant reversal is inconclusive and may be called out as
+        # an opposite non-significant readout, never as a refutation.
+        st = _run([13.0, 11.9, 12.1, 12.1, 12.1, 12.1], 'inc')
+        assert st['confirmed'] == [] and st['refuted'] == [], st
+        assert st['inconclusive'] == ['c1'], st['inconclusive']
+        assert st['verdicts']['c1']['verdict'] == 'inconclusive', st['verdicts']
+        assert st['opposite_nonsignificant'] == ['c1'], st
+        md = '\n'.join(V12._refutation_markdown(st, 0.05))
+        assert '方向相反但未达显著' in md and '不是支持也不是反证' in md, md
+
+    import inspect
+    src = inspect.getsource(V12.build_report)
+    assert '_refutation_markdown' in src, src
+
+
+def t_audit_confirmation_verdicts_and_wiring():
+    def _rec(sign, dok, p, **over):
+        c = {'expected_sign': sign, 'direction_ok': dok,
+             'n_effective': 12, 'min_seeds_for_confirmation': 8,
+             'coverage_ok': True, 'param_matched': True,
+             'param_match_complete': True, 'same_init_core_fp': True,
+             'mechanism_claim_allowed': False}
+        c.update(over)
+        return c
+
+    comps = {'c1': _rec('negative', True, 0.01),
+             'c2': _rec('negative', False, 0.02),
+             'c3': _rec('negative', True, 0.5),
+             'c4': {'omitted': 'no complete pairs'},
+             # Legacy ``significant_nondirectional`` keeps a Holm-significant
+             # record whose direction is unverifiable even when a validity
+             # gate failed; the helper classifies it as inconclusive.
+             'c5': _rec('negative', None, 0.03, coverage_ok=False)}
+    holm = {k: {'p_holm': {'c1': 0.01, 'c2': 0.02, 'c3': 0.5,
+                           'c4': 1.0, 'c5': 0.03}[k]}
+            for k in comps}
+    rep = L.directional_claim_verdicts(
+        {k: dict(v, p_holm=holm[k]['p_holm']) for k, v in comps.items()},
+        names=list(comps), require_complete_coverage=True,
+        require_param_match=True, default_min_seeds=12)
+    ft = {'alpha': 0.05, 'comparisons': comps,
+          'holm': holm,
+          'manifest': {'seeds': list(range(12))},
+          'coverage_requirement': {'require_complete_coverage': True},
+          'parameter_binding': {'required_by_manifest': True},
+          'verdicts': rep['verdicts'],
+          'confirmed': rep['supported'], 'refuted': rep['refuted'],
+          'inconclusive': rep['inconclusive'],
+          'not_testable': rep['not_testable'],
+          'significant_nondirectional': ['c5'],
+          'opposite_nonsignificant': rep['opposite_nonsignificant'],
+          'reverse_significant_unverified': rep['reverse_significant_unverified']}
+    # The omitted comparison supplies no p_holm; the explicit holm map keeps
+    # the family slot at p=1.0, exactly as finaltest_stats does.
+    with tempfile.TemporaryDirectory() as td:
+        p = os.path.join(td, 'test_stats.json')
+        with open(p, 'w', encoding='utf-8') as f:
+            json.dump({'finaltest': ft}, f)
+        with contextlib.redirect_stdout(io.StringIO()):
+            got = A.audit_confirmation_verdicts(p)
+        assert got['status'] == 'warnings', got
+        assert got['n_supported'] == 1 and got['n_refuted'] == 1, got
+        assert got['n_inconclusive'] == 2 and got['n_not_testable'] == 1, got
+        assert any('refuted' in w and 'not "not confirmed"' in w
+                   for w in got['warnings']), got['warnings']
+
+        bad = json.loads(json.dumps({'finaltest': ft}))
+        bad['finaltest']['refuted'] = []
+        with open(p, 'w', encoding='utf-8') as f:
+            json.dump(bad, f)
+        with contextlib.redirect_stdout(io.StringIO()):
+            got = A.audit_confirmation_verdicts(p)
+        assert got['status'] == 'fail', got
+        assert any("top-level 'refuted'" in x for x in got['problems']), got
+
+        tampered = json.loads(json.dumps({'finaltest': ft}))
+        tampered['finaltest']['verdicts']['c2']['verdict'] = 'supported'
+        with open(p, 'w', encoding='utf-8') as f:
+            json.dump(tampered, f)
+        with contextlib.redirect_stdout(io.StringIO()):
+            got = A.audit_confirmation_verdicts(p)
+        assert got['status'] == 'fail', got
+        assert any('c2' in x and 'supported' in x for x in got['problems']), got
+
+        legacy = json.loads(json.dumps({'finaltest': ft}))
+        legacy['finaltest'].pop('verdicts')
+        with open(p, 'w', encoding='utf-8') as f:
+            json.dump(legacy, f)
+        with contextlib.redirect_stdout(io.StringIO()):
+            got = A.audit_confirmation_verdicts(p)
+        assert got['status'] == 'not_verifiable_locally', got
+        assert 'predates' in got['reason'], got
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        got = A.audit_confirmation_verdicts(os.path.join(tempfile.gettempdir(),
+                                                        'no_such_stats.json'))
+    assert got['status'] == 'not_verifiable_locally', got
+
+    import inspect
+    assert 'audit_confirmation_verdicts()' in inspect.getsource(A.run_report)
+    assert "'verdicts': audit_confirmation_verdicts" in inspect.getsource(A)
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -23857,6 +24128,12 @@ def main():
            t_audit_evaluation_design_and_wiring)
     _check('L205 power preflight sizes precision from the frozen test units',
            t_power_preflight_uses_frozen_test_units)
+    _check('L206 directional claim verdicts separate support, refutation and inconclusive',
+           t_directional_claim_verdicts_three_way)
+    _check('L207 final-test report keeps a reverse-significant refutation distinct',
+           t_finaltest_verdicts_and_refutation_markdown)
+    _check('L208 confirmation-verdict audit replays and rejects tampering',
+           t_audit_confirmation_verdicts_and_wiring)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

@@ -2867,3 +2867,53 @@ p=1 槽位/无完整 seed 列表不重复/畸形声明 fail，以及三个重复
 单次迭代器、相对 margin 换算、畸形族 p 的 fail-closed 与输入校验。
 `python audit_gates.py interaction_sesoi` 返回 `ok`；`python v12_supp.py
 plan` 仍 72/72 合成冻结记录、6 个比较。
+
+## 2026-10-27 — 预注册方向性主张的三向判定：确认、反证与不确定（no new runs）
+
+零 GPU 的确认性分析方法学硬化；不新增训练、不读取 test split、不修改
+冻结清单的字节/种子/终点/alpha/Holm 决策规则，也不改 `CODE_SEMANTICS`。
+
+**Problem.** §41/§42 的冻结确认规则只有 `confirmed` 与「其余」两态。当一个
+比较在 Holm 校正后显著、但方向与预注册相反时，旧报告只能把它归入「未确认」
+或「探索性」，这会掩盖证据已经与方向性主张冲突；反过来，直接写成「显著
+更差」「实际等价」或「相反机制成立」又超出了 test 与 SESOI 声明能支持的
+范围。
+
+**Fix.** 新增 `exp_lib.directional_claim_verdicts()`：在同一个 Holm 拒绝
+集合上，按预注册方向与既有有效性门做三向划分——`supported` / `refuted` /
+`inconclusive`（另有 `not_testable`、`significant_nondirectional`）。反向
+显著但覆盖/参数/初始化/样本下限未过时只记 `inconclusive` 并进入
+`reverse_significant_unverified`；反向不显著进入
+`opposite_nonsignificant`；无方向的显著读数进入
+`significant_nondirectional`，永不进入 supported/refuted。参数门明确：
+`param_matched=false` 始终失效，清单声明匹配契约时还要求
+`param_match_complete=true`，缺记录不是通过。
+
+`v12_supp.finaltest_stats` 写入 `verdicts`、`verdict_summary`、
+`refuted`、`inconclusive`、`not_testable`、`opposite_nonsignificant`、
+`reverse_significant_unverified`、`verdict_consistency`，并为
+`not_confirmed_reasons` 补 `verdict`/`verdict_reason`/`gate_failures`；
+冻结 `confirmed` 原值保留，不一致只警告并记录。`build_report` 增加
+`_refutation_markdown`，单独渲染反证、显著反向但未过门、反向不显著三类，
+阻止它们被「未确认/探索性」段吞掉。`audit_gates.py` 新增
+`audit_confirmation_verdicts`：读取 `analysis_v12/test_stats.json`，用存储
+的 `holm[*].p_holm`、方向与门独立重放三向划分，核对逐项 verdict、顶层
+列表和 `confirmed == supported`；篡改/重复归类/不一致判 fail，缺三向字段
+的旧 artifact 判 `not_verifiable_locally`，并接入 `report` 的 `verdicts`
+键与 CLI 别名 `verdicts`/`verdict`/`three_way`。
+
+**Boundary.** 反证不是新检验：它继承同一双侧 Holm 族的 FWER 控制，不另算
+单侧 p、不增加 alpha。没有预注册 SESOI 时，`refuted` 只说明预注册的方向性
+优势不成立，不是实际等价，也不能写成「显著更差」；`mechanism_claim_allowed
+=false` 的 system-level 比较只否定所测系统差异，不证明相反机制。反向显著
+但未过有效性门不是反证。旧 artifact 不追溯升级。该改动不改变任何已落盘
+p/Holm/`confirmed` 数值，也不改变冻结清单或实验执行。
+
+**Verification.** `python test_review_fixes.py` 通过 559/559（0 skipped，
+新增 L206-L208）：L206 覆盖三向划分、反向显著但门未过、无方向/缺失/省略、
+参数契约、样本下限、p==alpha、非法输入与入参不变；L207 覆盖
+`finaltest_stats` 的 supported/refuted/inconclusive 三态、
+`not_confirmed_reasons.verdict`、`verdict_consistency` 与反证/反向不显著
+文案；L208 覆盖审计正常 `warnings`、列表/逐项 verdict 篡改 `fail`、旧
+artifact/缺文件 `not_verifiable_locally` 以及 `run_report`/CLI 接线。
+`python v12_supp.py plan` 仍 72/72 合成冻结记录、6 个比较。

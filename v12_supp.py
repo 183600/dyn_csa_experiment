@@ -3899,7 +3899,55 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
                  if _require_cov else
                  'legacy manifest: a complete-case subset with n_effective >= the declared floor may be confirmed'),
     }
+    # A two-sided test with a pre-registered direction has THREE admissible
+    # outcomes, not two: support, refutation (a Holm-significant result in the
+    # opposite direction), and inconclusive.  "Otherwise exploratory" is the
+    # wrong reading of a significant reversal.  The verdict helper partitions
+    # the SAME Holm rejections under the SAME validity gates; it adds no test,
+    # no alpha and no multiplicity correction.  `confirmed` is kept exactly as
+    # the frozen rule computed it; the helper's `supported` set is cross-checked
+    # against it rather than allowed to silently redefine the decision.
+    _verdict_in = {}
+    for _c in manifest['primary_comparisons']:
+        _k = str(_c.get('name'))
+        _cv = dict(stats['comparisons'].get(_k) or {})
+        _cv['p_holm'] = (stats['holm'].get(_k) or {}).get('p_holm')
+        if 'expected_sign' not in _cv:
+            _cv['expected_sign'] = _c.get('expected_sign')
+        if 'mechanism_claim_allowed' not in _cv:
+            _cv['mechanism_claim_allowed'] = _c.get('mechanism_claim_allowed')
+        _verdict_in[_k] = _cv
+    _verdict_block = L.directional_claim_verdicts(
+        _verdict_in,
+        names=[str(_c.get('name')) for _c in manifest['primary_comparisons']],
+        alpha=_alpha, require_complete_coverage=bool(_require_cov),
+        require_param_match=_param_required,
+        default_min_seeds=len(manifest['seeds']))
+    stats['verdicts'] = _verdict_block['verdicts']
+    stats['verdict_summary'] = {
+        k: _verdict_block[k] for k in
+        ('alpha', 'supported', 'refuted', 'inconclusive',
+         'significant_nondirectional', 'not_testable',
+         'opposite_nonsignificant', 'reverse_significant_unverified',
+         'counts', 'rule', 'role')}
     stats['confirmed'] = _conf
+    stats['refuted'] = list(_verdict_block['refuted'])
+    stats['inconclusive'] = list(_verdict_block['inconclusive'])
+    stats['not_testable'] = list(_verdict_block['not_testable'])
+    stats['opposite_nonsignificant'] = list(_verdict_block['opposite_nonsignificant'])
+    stats['reverse_significant_unverified'] = list(_verdict_block['reverse_significant_unverified'])
+    if set(_conf) != set(_verdict_block['supported']):
+        print('[p5t stats] WARNING: the frozen confirmation set and the three-way '
+              f'supported set disagree (confirmed={sorted(_conf)}, '
+              f'supported={sorted(_verdict_block["supported"])}); the frozen '
+              'decision is left untouched and the mismatch is recorded.')
+    stats['verdict_consistency'] = {
+        'frozen_confirmed': sorted(_conf),
+        'supported': sorted(_verdict_block['supported']),
+        'match': set(_conf) == set(_verdict_block['supported']),
+        'note': ('the frozen decision rule remains authoritative; a mismatch is '
+                 'recorded here rather than silently reconciled'),
+    }
     # ---- post-hoc robustness: never part of the frozen decision -----------
     # A frozen verdict can be statistically valid and still hinge on one seed.
     # The diagnostic takes the SAME per-seed deltas that produced the primary
@@ -3929,7 +3977,10 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
                                           'min_seeds_for_confirmation': stats['comparisons'].get(k, {}).get('min_seeds_for_confirmation'),
                                           'same_init_core_fp': stats['comparisons'].get(k, {}).get('same_init_core_fp'),
                                           'init_core_fp_mismatch_seeds': (stats['comparisons'].get(k, {}).get('init_core_fp') or {}).get('mismatch_seeds'),
-                                          'direction_ok': stats['comparisons'].get(k, {}).get('direction_ok')}
+                                          'direction_ok': stats['comparisons'].get(k, {}).get('direction_ok'),
+                                          'verdict': (stats['verdicts'].get(k) or {}).get('verdict'),
+                                          'verdict_reason': (stats['verdicts'].get(k) or {}).get('reason'),
+                                          'gate_failures': (stats['verdicts'].get(k) or {}).get('gate_failures')}
                                       for k in _rej if k not in _conf}
     _m = len(manifest['primary_comparisons'])
     _n = len(manifest['seeds'])
@@ -4361,6 +4412,71 @@ def _fmt_pm(cell):
         return f'{cell["mean"]:.2f} ±{cell.get("std", 0.0):.2f}'
     return f'{cell:.2f}'
 
+def _refutation_markdown(ft, alpha=0.05):
+    """Render the three-way directional verdicts that are NOT support.
+
+    Pure function of the final-test stats dict so the wording and the
+    "refutation is not equivalence / not the opposite mechanism" boundary can
+    be tested without a GPU panel or a full report build.
+    """
+    if not isinstance(ft, dict):
+        return []
+    _alpha = alpha
+    try:
+        _alpha = float(alpha)
+    except (TypeError, ValueError, OverflowError):
+        pass
+
+    def _names(key):
+        raw = ft.get(key)
+        if isinstance(raw, (bool, np.bool_)) or not isinstance(raw, (list, tuple)):
+            return []
+        return [str(x) for x in raw]
+
+    ref = _names('refuted')
+    unverified = _names('reverse_significant_unverified')
+    opposite = _names('opposite_nonsignificant')
+    if not (ref or unverified or opposite):
+        return []
+    verdicts = ft.get('verdicts')
+    if not isinstance(verdicts, dict):
+        verdicts = {}
+
+    def _detail(name):
+        v = verdicts.get(name)
+        if not isinstance(v, dict):
+            return f'`{name}`'
+        p = v.get('p_holm')
+        ptxt = (f'{float(p):.4g}' if isinstance(p, (int, float))
+                and not isinstance(p, (bool, np.bool_))
+                and math.isfinite(float(p)) else '—')
+        scope = v.get('claim_scope') or 'unspecified'
+        return f'`{name}`（p_holm={ptxt}, claim_scope={scope}）'
+
+    out = []
+    A = out.append
+    if ref:
+        A(f'**反证结果（方向冲突）**：{"; ".join(_detail(k) for k in ref)} 在 Holm 校正后 '
+          f'p<{_alpha:g}，但方向与预注册相反。这是对该**方向性主张**的反证/方向冲突，'
+          '不是「未确认」，也不是「无效应」。')
+        A('')
+        A('> 边界：反证仍继承同一 Holm 族的 FWER 控制，但没有预先注册 SESOI 时，'
+          '它只说明该方向性优势不成立，**不证明相反机制**，也不能写成「显著更差/实际等价」；'
+          'system-level 比较（`mechanism_claim_allowed=false`）的反证只否定所测系统差异，'
+          '不否定机制本身。冻结 p/Holm/alpha 与 `confirmed` 均未被本段改变。')
+        A('')
+    if unverified:
+        A(f'**显著反向但有效性门未过**：{"; ".join(_detail(k) for k in unverified)} 的 '
+          'Holm p 低于 alpha 且点估计方向相反，但覆盖/参数/初始化/样本下限至少一项未满足；'
+          '因此只能记为 `inconclusive`，不能据此宣布反证。')
+        A('')
+    if opposite:
+        A(f'**方向相反但未达显著**：{"; ".join(_detail(k) for k in opposite)} 的点估计与预注册方向相反，'
+          '但 Holm 校正后不显著；这只是不确定（inconclusive），既不是支持也不是反证。')
+        A('')
+    return out
+
+
 def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
     v12_analysis(out=stats_p)
     st = json.load(open(stats_p, encoding='utf-8'))
@@ -4540,7 +4656,7 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
                   '但至少一个冻结种子没有进入该比较。按 v4 的 `require_complete_coverage`，缺失种子不是随机缺失，'
                   '不确认；该面板只能按实际 n 报告为 descriptive/unconfirmed。')
             else:
-                A(f'**确认结果**：没有冻结主比较同时满足「Holm 校正后 p < {_report_alpha:g}」与「方向符合预注册」。按预注册的决策规则，相应主张**不获确认**；探索性面板的正向读数保持「探索性」标签，不得写成结论。')
+                A(f'**确认结果**：没有冻结主比较同时满足「Holm 校正后 p < {_report_alpha:g}」与「方向符合预注册」。按预注册的决策规则，相应主张**不获确认**；探索性面板的正向读数保持「探索性」标签，不得写成结论。若某比较的 Holm 显著方向与预注册相反，下面单列为反证/方向冲突，不能改写成「未确认」「无效应」或「探索性」。')
         _rob_lines = _robustness_markdown(ft.get('robustness') or {})
         if _rob_lines:
             lines.extend(_rob_lines)
@@ -4550,6 +4666,9 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
         _choice_lines = _analysis_choice_markdown(ft)
         if _choice_lines:
             lines.extend(_choice_lines)
+        _ref_lines = _refutation_markdown(ft, _report_alpha)
+        if _ref_lines:
+            lines.extend(_ref_lines)
         _nd = ft.get('significant_nondirectional') or []
         if _nd:
             A('')

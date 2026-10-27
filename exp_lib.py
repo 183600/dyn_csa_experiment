@@ -15084,6 +15084,215 @@ def confirmation_robustness(named_paired, *, alpha=0.05, family_size=None, confi
                     'an aggregate p-value')}
     return out
 
+# ---- 预注册方向性主张的三向判定 ---------------------------------------------
+# 一个双侧检验 + 预注册方向不是二值「确认/不确认」：Holm 显著且方向相反的
+# 结果是对该方向性主张的反证，不是「没有证据」。下面的纯函数把冻结判定拆成
+# supported / refuted / inconclusive / significant_nondirectional /
+# not_testable，且反证必须通过与确认相同的有效性门（覆盖、参数、初始化、
+# n 下限），避免拿一个不完整面板去宣布反证。
+
+def directional_claim_verdicts(comparisons, *, names=None, alpha=0.05,
+                               require_complete_coverage=False,
+                               require_param_match=False,
+                               default_min_seeds=None):
+    """Three-way verdicts for pre-registered directional comparisons.
+
+    ``comparisons`` maps a comparison name to its statistics record.  The
+    relevant keys are ``p_holm``, ``expected_sign`` (``'positive'`` /
+    ``'negative'`` / ``None``), ``direction_ok`` (bool or ``None``),
+    ``n_effective``, ``min_seeds_for_confirmation``, ``coverage_ok``,
+    ``param_matched``, ``param_match_complete``, ``same_init_core_fp`` and
+    optionally ``mechanism_claim_allowed``.  A record with a non-empty
+    ``omitted`` key is reported as ``not_testable``.
+
+    A comparison is ``supported`` only when the Holm p is below alpha, the
+    observed direction matches the pre-registered sign, and the same validity
+    gates as the frozen confirmation hold.  It is ``refuted`` when the Holm p
+    is below alpha, the direction is opposite to the pre-registered sign, and
+    those validity gates hold.  A significant reverse result with a missing
+    gate is *not* a refutation: it is ``inconclusive`` with an explicit
+    ``reverse_significant_unverified`` diagnostic.  Missing/omitted results are
+    ``not_testable``.  A significant comparison with ``expected_sign=None`` is
+    ``significant_nondirectional`` and can never enter ``supported`` or
+    ``refuted``.
+
+    This function adds no test and no multiplicity correction: it partitions
+    the SAME Holm rejections into the pre-registered directional outcomes, so
+    refutation inherits the family-wise error control of the two-sided test.
+    It is not an equivalence test: ``refuted`` means the directional
+    superiority claim was contradicted, not that the opposite mechanism was
+    proven or that the effect exceeds a SESOI.
+    """
+    alpha = _validated_alpha(alpha, context='directional_claim_verdicts alpha')
+    if not isinstance(comparisons, dict):
+        raise ValueError('directional_claim_verdicts: comparisons must be a mapping name -> record')
+    if names is None:
+        names = list(comparisons)
+    else:
+        if isinstance(names, (str, bytes)):
+            raise ValueError('directional_claim_verdicts: names must be an iterable of names, not a string')
+        try:
+            names = [str(x) for x in names]
+        except TypeError:
+            raise ValueError('directional_claim_verdicts: names must be iterable') from None
+    if len(set(names)) != len(names):
+        raise ValueError('directional_claim_verdicts: names contain duplicates')
+    _dmin = _as_seed_int(default_min_seeds)
+    if default_min_seeds is not None and (_dmin is None or _dmin < 0):
+        raise ValueError(
+            'directional_claim_verdicts: default_min_seeds must be a '
+            f'non-negative integer or None, got {default_min_seeds!r}')
+    _req_cov = bool(require_complete_coverage)
+    _req_param = bool(require_param_match)
+    verdicts = {}
+    buckets = {'supported': [], 'refuted': [], 'inconclusive': [],
+               'significant_nondirectional': [], 'not_testable': [],
+               'opposite_nonsignificant': [],
+               'reverse_significant_unverified': []}
+    for name in names:
+        rec = comparisons.get(name)
+        out = {'name': name, 'verdict': 'not_testable', 'reason': '',
+               'expected_sign': None, 'direction_ok': None,
+               'p_holm': None, 'holm_significant': False,
+               'validity_ok': False, 'gate_failures': [],
+               'n_effective': None, 'min_seeds': None,
+               'mechanism_claim_allowed': None, 'claim_scope': 'unspecified'}
+        if not isinstance(rec, dict):
+            out['reason'] = 'not_reported'
+            buckets['not_testable'].append(name)
+            verdicts[name] = out
+            continue
+        out['mechanism_claim_allowed'] = rec.get('mechanism_claim_allowed')
+        if rec.get('omitted'):
+            out['reason'] = 'omitted: ' + str(rec.get('omitted'))
+            buckets['not_testable'].append(name)
+            verdicts[name] = out
+            continue
+        sign_raw = rec.get('expected_sign')
+        if sign_raw is None:
+            sign = None
+        elif isinstance(sign_raw, str) and sign_raw.strip().lower() in ('positive', 'negative'):
+            sign = sign_raw.strip().lower()
+        else:
+            raise ValueError(
+                f'directional_claim_verdicts[{name!r}]: expected_sign must be '
+                f"'positive', 'negative' or None, got {sign_raw!r}")
+        out['expected_sign'] = sign
+        dok_raw = rec.get('direction_ok')
+        if dok_raw is None:
+            dok = None
+        elif isinstance(dok_raw, (bool, np.bool_)):
+            dok = bool(dok_raw)
+        else:
+            raise ValueError(
+                f'directional_claim_verdicts[{name!r}]: direction_ok must be '
+                f'a bool or None, got {dok_raw!r}')
+        out['direction_ok'] = dok
+        ph_raw = rec.get('p_holm')
+        if ph_raw is None:
+            out['reason'] = 'no_holm_p'
+            buckets['not_testable'].append(name)
+            verdicts[name] = out
+            continue
+        if isinstance(ph_raw, (bool, np.bool_)):
+            raise ValueError(
+                f'directional_claim_verdicts[{name!r}]: p_holm is a boolean, not a p-value')
+        try:
+            ph = float(ph_raw)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(
+                f'directional_claim_verdicts[{name!r}]: p_holm is not numeric: {ph_raw!r}') from None
+        if not math.isfinite(ph) or not (0.0 <= ph <= 1.0):
+            raise ValueError(
+                f'directional_claim_verdicts[{name!r}]: p_holm must be a finite '
+                f'probability in [0,1], got {ph_raw!r}')
+        out['p_holm'] = ph
+        out['holm_significant'] = bool(ph < alpha)
+        n_eff = _as_seed_int(rec.get('n_effective'))
+        min_n = _as_seed_int(rec.get('min_seeds_for_confirmation'))
+        if min_n is None:
+            min_n = _dmin
+        out['n_effective'] = (n_eff if n_eff is not None else 0)
+        out['min_seeds'] = min_n
+        failures = []
+        if n_eff is None:
+            failures.append('n_effective_unverifiable')
+        if min_n is not None and (n_eff is None or n_eff < min_n):
+            failures.append(
+                f'n_effective={out["n_effective"]} < min_seeds_for_confirmation={min_n}')
+        if _req_cov and rec.get('coverage_ok') is not True:
+            failures.append('coverage_incomplete')
+        # A definite parameter mismatch always invalidates a paired capacity
+        # claim.  A disclosed parameter-matching contract additionally requires
+        # the COMPLETE per-seed record; `None` is still unverified, never a pass.
+        if rec.get('param_matched') is False:
+            failures.append('param_mismatch')
+        elif _req_param and rec.get('param_match_complete') is not True:
+            failures.append('param_match_incomplete')
+        if rec.get('same_init_core_fp') is False:
+            failures.append('init_core_fp_mismatch')
+        out['gate_failures'] = failures
+        out['validity_ok'] = not failures
+        if sign is None:
+            out['claim_scope'] = 'nondirectional'
+        elif rec.get('mechanism_claim_allowed') is True:
+            out['claim_scope'] = 'mechanism'
+        elif rec.get('mechanism_claim_allowed') is False:
+            out['claim_scope'] = 'system_level'
+        if not out['holm_significant']:
+            out['verdict'] = 'inconclusive'
+            out['reason'] = 'not_holm_significant'
+            if dok is False and sign is not None:
+                buckets['opposite_nonsignificant'].append(name)
+        elif sign is None:
+            # Preserve the frozen field's semantics: this is a Holm-significant
+            # non-directional readout.  It can never be confirmatory.
+            buckets['significant_nondirectional'].append(name)
+            if out['validity_ok']:
+                out['verdict'] = 'significant_nondirectional'
+                out['reason'] = 'holm_significant_without_a_directional_hypothesis'
+            else:
+                out['verdict'] = 'inconclusive'
+                out['reason'] = 'holm_significant_but_validity_gates_failed'
+        elif failures:
+            out['verdict'] = 'inconclusive'
+            out['reason'] = 'holm_significant_but_validity_gates_failed'
+            if dok is False:
+                out['direction_conflict'] = True
+                buckets['reverse_significant_unverified'].append(name)
+        elif dok is True:
+            out['verdict'] = 'supported'
+            out['reason'] = 'holm_significant_and_direction_matches'
+            buckets['supported'].append(name)
+        elif dok is False:
+            out['verdict'] = 'refuted'
+            out['reason'] = 'holm_significant_and_direction_opposite'
+            buckets['refuted'].append(name)
+        else:
+            out['verdict'] = 'inconclusive'
+            out['reason'] = 'direction_unverifiable'
+        if out['verdict'] == 'inconclusive' and name not in buckets['inconclusive']:
+            buckets['inconclusive'].append(name)
+        verdicts[name] = out
+    out = {'alpha': alpha, 'names': names, 'verdicts': verdicts,
+           'supported': buckets['supported'], 'refuted': buckets['refuted'],
+           'inconclusive': buckets['inconclusive'],
+           'significant_nondirectional': buckets['significant_nondirectional'],
+           'not_testable': buckets['not_testable'],
+           'opposite_nonsignificant': buckets['opposite_nonsignificant'],
+           'reverse_significant_unverified': buckets['reverse_significant_unverified'],
+           'counts': {k: len(v) for k, v in buckets.items()},
+           'rule': ('Holm-significant + pre-registered direction + validity gates = '
+                    'supported; Holm-significant + opposite direction + validity gates = '
+                    'refuted; everything else is inconclusive or not_testable. '
+                    'Refutation is a directional claim conflict, not equivalence and '
+                    'not proof of the opposite mechanism.'),
+           'role': ('reports the pre-registered three-way decision on the SAME '
+                    'Holm family; it adds no test, no multiplicity correction and '
+                    'does not change any p-value')}
+    return out
+
+
 # ---- 预注册功效 / 分辨率工具 --------------------------------------------------
 # 动机：一个冻结方案如果「无论数据多强都不可能达到 p_holm < α」，它落在
 # 分辨率上限而不是「保守」。下面的函数把这件事变成加载清单时就能机器判定
