@@ -41439,9 +41439,401 @@ def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
                             'n_targets': int(n_targets), 'n_out_of_range': 0}}
 
 
+ERROR_BUCKET_POLICY = {
+    'version': 'error-bucket-1',
+    'split_seed': 20261027,
+    'discovery_frac': 0.5,
+    'min_clusters': 3,
+    'min_tokens': 10,
+    'direction': 'positive',
+    'alpha': 0.05,
+    'note': ('内部稳定性检查，不是外部复现：验证行是固定文本，不是从总体抽取的随机样本；'
+             '全样本桶 p 值只在声明族内做 Holm 校正，仍是事后描述。'
+             '发现/复现两半按文本行（cluster）整块切分，选中桶只在未参与选择的半边上报告效应。'),
+}
+
+
+def _error_bucket_key(value, *, where='bucket_ids'):
+    """Canonical JSON-safe id for a bucket or a cluster (validation row)."""
+    if isinstance(value, (bool, np.bool_)):
+        raise ValueError(f'{where} must not contain boolean labels, got {value!r}')
+    if isinstance(value, (int, np.integer)):
+        return str(int(value))
+    if isinstance(value, (float, np.floating)):
+        _f = float(value)
+        if not math.isfinite(_f) or _f != math.floor(_f):
+            raise ValueError(f'{where} labels must be integer-like or non-empty strings, got {value!r}')
+        return str(int(_f))
+    if isinstance(value, str):
+        _s = value.strip()
+        if not _s:
+            raise ValueError(f'{where} must not contain empty labels')
+        return _s
+    raise ValueError(f'{where} labels must be integer-like or strings, got {type(value).__name__}')
+
+
+def _error_numeric_vector(values, *, where='deltas'):
+    """1-D finite-aware float vector without silently accepting flags/complex."""
+    try:
+        raw = np.asarray(values)
+    except Exception as exc:
+        raise ValueError(f'{where} is not array-like ({type(exc).__name__}: {exc})') from None
+    if raw.ndim != 1:
+        raise ValueError(f'{where} must be 1-D, got shape {raw.shape}')
+    if raw.dtype.kind in ('b', 'c', 'S', 'U', 'V'):
+        raise ValueError(f'{where} must be real numeric measurements, got dtype {raw.dtype}')
+    if raw.dtype.kind == 'O':
+        out = []
+        for i, x in enumerate(raw):
+            if isinstance(x, (bool, np.bool_)):
+                raise ValueError(f'{where}[{i}] is a boolean flag, not a measurement')
+            try:
+                f = float(x)
+            except (TypeError, ValueError, OverflowError):
+                out.append(float('nan'))
+                continue
+            out.append(f)
+        return np.asarray(out, dtype=np.float64)
+    try:
+        return raw.astype(np.float64, copy=False)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f'{where} cannot be converted to float ({type(exc).__name__})') from None
+
+
+def _error_label_vector(values, n, *, where):
+    if isinstance(values, (str, bytes)):
+        raise ValueError(f'{where} must be a sequence of labels, not a single string')
+    try:
+        raw = list(values)
+    except TypeError:
+        raise ValueError(f'{where} must be a sequence of labels') from None
+    if len(raw) != n:
+        raise ValueError(f'{where} length {len(raw)} does not match deltas length {n}')
+    return [_error_bucket_key(x, where=where) for x in raw]
+
+
+def _error_cluster_stats(values, token_counts=None):
+    """Equal-cluster mean with t CI and exact sign-flip p (two-sided)."""
+    vals = np.asarray(values, dtype=np.float64)
+    n = int(vals.size)
+    if n == 0:
+        return {'n_clusters': 0, 'n_tokens': 0, 'mean': None, 'sd': None,
+                'se': None, 'ci95_low': None, 'ci95_high': None,
+                'p_exact_signflip': None, 'p_floor': None,
+                'ci_excludes_zero': False, 'direction': 0}
+    mean = float(vals.mean())
+    if n >= 2:
+        sd = float(vals.std(ddof=1))
+        se = sd / math.sqrt(n)
+        half = float(_t_critical(0.95, n - 1)) * se
+        lo, hi = mean - half, mean + half
+        ci_excludes_zero = bool(lo > 0.0 or hi < 0.0)
+    else:
+        sd = se = lo = hi = None
+        ci_excludes_zero = False
+    sf = exact_signflip_p(vals.tolist())
+    p = sf.get('p')
+    p = float(p) if isinstance(p, (int, float)) and math.isfinite(float(p)) else None
+    n_tokens = (int(np.sum(token_counts)) if token_counts is not None and len(token_counts) else n)
+    return {'n_clusters': n, 'n_tokens': n_tokens, 'mean': mean,
+            'sd': sd, 'se': se, 'ci95_low': lo, 'ci95_high': hi,
+            'p_exact_signflip': p, 'p_floor': sf.get('p_floor'),
+            'ci_excludes_zero': ci_excludes_zero,
+            'direction': (1 if mean > 0 else (-1 if mean < 0 else 0))}
+
+
+def _error_stat_rank(values):
+    """Average ranks for a small vector of bucket means (ties share a rank)."""
+    vals = np.asarray(values, dtype=np.float64)
+    order = np.argsort(vals, kind='mergesort')
+    ranks = np.empty(vals.size, dtype=np.float64)
+    ranks[order] = np.arange(1, vals.size + 1, dtype=np.float64)
+    pos = 0
+    while pos < vals.size:
+        end = pos + 1
+        while end < vals.size and vals[order[end]] == vals[order[pos]]:
+            end += 1
+        if end - pos > 1:
+            ranks[order[pos:end]] = 0.5 * (pos + 1 + end)
+        pos = end
+    return ranks
+
+
+def _error_rank_correlation(a, b):
+    if len(a) < 3 or len(a) != len(b):
+        return None
+    ra = _error_stat_rank(a)
+    rb = _error_stat_rank(b)
+    sa, sb = float(ra.std(ddof=1)), float(rb.std(ddof=1))
+    if not (math.isfinite(sa) and math.isfinite(sb)) or sa <= 0.0 or sb <= 0.0:
+        return None
+    return float(np.corrcoef(ra, rb)[0, 1])
+
+
+def paired_error_bucket_inference(deltas, bucket_ids, cluster_ids, *, alpha=0.05,
+                                  direction='positive', split_seed=None,
+                                  discovery_frac=None, min_clusters=None,
+                                  min_tokens=None, include_units=True):
+    """Split-half, cluster-level inference for paired bad-case buckets.
+
+    ``delta = CE_B - CE_A``.  The function first aggregates tokens to the
+    cluster (validation-row) level, so a long row cannot outvote many short
+    rows merely by contributing more tokens.  Bucket p-values on the full
+    sample are Holm-adjusted within the declared bucket family, but they are
+    post-hoc descriptions: the bucket family was inspected before selection.
+
+    To separate discovery from confirmation, whole clusters are split into
+    two disjoint contiguous blocks in first-occurrence (row) order.  Contiguous
+    blocks keep adjacent rows - which may belong to the same document - on the
+    same side, instead of interleaving a document across the boundary.  The
+    worst bucket is chosen on the discovery block only; its mean, t interval
+    and exact sign-flip p are then reported on the untouched replication block.
+    ``replicated`` requires the same sign and a replication CI excluding zero.
+    This is an internal stability check (fixed validation text, not a random
+    population sample), not independent external replication.
+    """
+    alpha = _validated_alpha(alpha)
+    if direction not in ('positive', 'negative', 'two-sided'):
+        raise ValueError(f"direction must be positive/negative/two-sided, got {direction!r}")
+    split_seed = (ERROR_BUCKET_POLICY['split_seed'] if split_seed is None else split_seed)
+    if isinstance(split_seed, (bool, np.bool_)):
+        raise ValueError(f'split_seed must be an integer, got {split_seed!r}')
+    try:
+        split_seed = int(split_seed)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f'split_seed must be an integer, got {split_seed!r}') from None
+    discovery_frac = (ERROR_BUCKET_POLICY['discovery_frac']
+                      if discovery_frac is None else discovery_frac)
+    if isinstance(discovery_frac, (bool, np.bool_)):
+        raise ValueError(f'discovery_frac must be in (0,1), got {discovery_frac!r}')
+    try:
+        discovery_frac = float(discovery_frac)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f'discovery_frac must be in (0,1), got {discovery_frac!r}') from None
+    if not (0.0 < discovery_frac < 1.0) or not math.isfinite(discovery_frac):
+        raise ValueError(f'discovery_frac must be in (0,1), got {discovery_frac!r}')
+    min_clusters = (ERROR_BUCKET_POLICY['min_clusters'] if min_clusters is None else min_clusters)
+    _mc = _exact_count(min_clusters, minimum=2)
+    if _mc is None:
+        raise ValueError(f'min_clusters must be an integer >= 2, got {min_clusters!r}')
+    min_clusters = int(_mc)
+    min_tokens = (ERROR_BUCKET_POLICY['min_tokens'] if min_tokens is None else min_tokens)
+    _mt = _exact_count(min_tokens, minimum=1)
+    if _mt is None:
+        raise ValueError(f'min_tokens must be a positive integer, got {min_tokens!r}')
+    min_tokens = int(_mt)
+    include_units = bool(include_units)
+
+    d = _error_numeric_vector(deltas, where='deltas')
+    n_input = int(d.size)
+    bucket_labels = _error_label_vector(bucket_ids, n_input, where='bucket_ids')
+    cluster_labels = _error_label_vector(cluster_ids, n_input, where='cluster_ids')
+    finite = np.isfinite(d)
+    n_finite = int(finite.sum())
+    base = {
+        'kind': 'paired_error_bucket_inference',
+        'policy_version': ERROR_BUCKET_POLICY['version'],
+        'alpha': alpha,
+        'direction': direction,
+        'min_clusters': min_clusters,
+        'min_tokens': min_tokens,
+        'discovery_frac': discovery_frac,
+        'split_seed': split_seed,
+        'n_tokens_input': n_input,
+        'n_tokens': n_finite,
+        'n_tokens_nonfinite': int(n_input - n_finite),
+        'status': 'no_data',
+        'reason': 'no finite paired deltas',
+        'policy_note': ERROR_BUCKET_POLICY['note'],
+        'buckets': {},
+        'selected': None,
+        'split': None,
+        'rank_correlation': None,
+    }
+    if n_finite == 0:
+        return base
+    keep = np.flatnonzero(finite)
+    d = d[keep]
+    bucket_labels = [bucket_labels[i] for i in keep]
+    cluster_labels = [cluster_labels[i] for i in keep]
+    clusters_ordered = list(dict.fromkeys(cluster_labels))
+    clusters = sorted(set(cluster_labels))
+    bucket_names = sorted(set(bucket_labels))
+    nc = len(clusters_ordered)
+    cmap = {c: i for i, c in enumerate(clusters)}
+    cidx = np.fromiter((cmap[c] for c in cluster_labels), dtype=np.int64, count=d.size)
+    bucket_reports = {}
+    units_by_bucket = {}
+    for b in bucket_names:
+        mask = np.fromiter((x == b for x in bucket_labels), dtype=bool, count=d.size)
+        n_tok = int(mask.sum())
+        sums = np.bincount(cidx[mask], weights=d[mask], minlength=nc)
+        cnts = np.bincount(cidx[mask], minlength=nc).astype(np.int64)
+        nz = np.flatnonzero(cnts > 0)
+        means = sums[nz] / cnts[nz]
+        units = [{'cluster': clusters[int(i)], 'mean_delta': float(sums[i] / cnts[i]),
+                  'n_tokens': int(cnts[i])} for i in nz]
+        units_by_bucket[b] = units
+        st = _error_cluster_stats(means, cnts[nz])
+        st['n_tokens'] = n_tok
+        st['mean_delta_token_weighted'] = float(d[mask].mean()) if n_tok else None
+        st['underpowered_tokens'] = bool(n_tok < min_tokens)
+        st['cluster_units'] = units if include_units else None
+        bucket_reports[b] = st
+    holm = holm_adjust([(b, bucket_reports[b].get('p_exact_signflip')) for b in bucket_names],
+                       alpha=alpha)
+    for b in bucket_names:
+        rec = holm.get(b) or {}
+        bucket_reports[b]['p_holm'] = rec.get('p_holm')
+        bucket_reports[b]['holm_rank'] = rec.get('rank')
+        bucket_reports[b]['holm_reject'] = bool(rec.get('reject'))
+        bucket_reports[b]['role'] = 'post_hoc_full_sample_descriptive'
+    base['buckets'] = bucket_reports
+    base['family'] = {'m': len(bucket_names), 'method': 'holm',
+                      'declared_buckets': bucket_names,
+                      'note': '全样本桶 p 为事后描述；选择校正来自发现/复现切分。'}
+    base['n_clusters'] = nc
+    if nc < 2 * min_clusters:
+        base['status'] = 'insufficient_clusters'
+        base['reason'] = (f'{nc} cluster(s) cannot be split into two halves of >= '
+                          f'{min_clusters} clusters each')
+        return base
+
+    ordered = clusters_ordered
+    # The seed is kept in the artifact as an audit identifier; the contiguous
+    # split itself is order-based, so changing the seed cannot reshuffle rows.
+    n_disc = int(round(discovery_frac * nc))
+    n_disc = max(min_clusters, min(nc - min_clusters, n_disc))
+    discovery = set(ordered[:n_disc])
+    replication = set(ordered[n_disc:])
+    base['split'] = {
+        'seed': split_seed,
+        'discovery_frac_requested': discovery_frac,
+        'strategy': 'contiguous first-occurrence whole-cluster blocks; discovery then replication',
+        'cluster_order': ordered,
+        'discovery_clusters': [c for c in ordered if c in discovery],
+        'replication_clusters': [c for c in ordered if c in replication],
+        'n_discovery': len(discovery),
+        'n_replication': len(replication),
+        'disjoint': not bool(discovery & replication),
+    }
+
+    for b in bucket_names:
+        units = units_by_bucket[b]
+        for half, keep_c in (('discovery', discovery), ('replication', replication)):
+            sub = [u for u in units if u['cluster'] in keep_c]
+            vals = [u['mean_delta'] for u in sub]
+            ntok = [u['n_tokens'] for u in sub]
+            st = _error_cluster_stats(vals, ntok)
+            if sub:
+                st['mean_delta_token_weighted'] = float(np.average(vals, weights=ntok))
+            else:
+                st['mean_delta_token_weighted'] = None
+            st['underpowered_tokens'] = bool(st['n_tokens'] < min_tokens)
+            bucket_reports[b][half] = st
+
+    both = [b for b in bucket_names
+            if bucket_reports[b]['discovery'].get('n_clusters', 0) >= min_clusters
+            and bucket_reports[b]['replication'].get('n_clusters', 0) >= min_clusters]
+    rank_corr = None
+    if len(both) >= 3:
+        rank_corr = _error_rank_correlation(
+            [bucket_reports[b]['discovery']['mean'] for b in both],
+            [bucket_reports[b]['replication']['mean'] for b in both])
+    base['rank_correlation'] = {'spearman': rank_corr, 'n_buckets': len(both),
+                                'note': '桶均值的两半秩相关；仅来自同一条验证文本。'}
+
+    def _candidate_ok(st):
+        return (st.get('n_clusters', 0) >= min_clusters
+                and st.get('n_tokens', 0) >= min_tokens
+                and st.get('mean') is not None
+                and ((direction == 'positive' and st['mean'] > 0.0)
+                     or (direction == 'negative' and st['mean'] < 0.0)
+                     or (direction == 'two-sided' and st['mean'] != 0.0)))
+
+    def _rank_key(b):
+        st = bucket_reports[b]['discovery']
+        m = float(st['mean'])
+        if direction == 'positive':
+            return (-m, b)
+        if direction == 'negative':
+            return (m, b)
+        return (-abs(m), b)
+
+    cand = [b for b in bucket_names if _candidate_ok(bucket_reports[b]['discovery'])]
+    if not cand:
+        base['status'] = 'no_candidate'
+        base['reason'] = ('no bucket has a discovery-half mean in the requested '
+                          f'direction {direction!r} with >= {min_clusters} clusters '
+                          f'and >= {min_tokens} tokens')
+        return base
+    selected = sorted(cand, key=_rank_key)[0]
+    ds = bucket_reports[selected]['discovery']
+    rs = bucket_reports[selected]['replication']
+    same_sign = bool(ds['mean'] is not None and rs['mean'] is not None
+                     and ds['mean'] * rs['mean'] > 0.0)
+    rep_ok = (rs.get('n_clusters', 0) >= min_clusters
+              and rs.get('n_tokens', 0) >= min_tokens)
+    replicated = bool(rep_ok and same_sign and rs.get('ci_excludes_zero'))
+    if not rep_ok:
+        rep_reason = 'insufficient_replication_clusters_or_tokens'
+    elif not same_sign:
+        rep_reason = 'replication_sign_flip'
+    elif not rs.get('ci_excludes_zero'):
+        rep_reason = 'replication_ci_includes_zero'
+    else:
+        rep_reason = 'same_sign_and_replication_ci_excludes_zero'
+
+    # rank by the replication half, not by the half used for selection
+    def _rank_key_rep(b):
+        st = bucket_reports[b]['replication']
+        m = float(st['mean'])
+        if direction == 'positive':
+            return (-m, b)
+        if direction == 'negative':
+            return (m, b)
+        return (-abs(m), b)
+    ranked_rep = [b for b in bucket_names if _candidate_ok(bucket_reports[b]['replication'])]
+    ranked_rep = sorted(ranked_rep, key=_rank_key_rep)
+    rank_rep = (ranked_rep.index(selected) + 1) if selected in ranked_rep else None
+    ratio = (float(rs['mean']) / float(ds['mean'])
+             if (ds['mean'] not in (None, 0.0) and rs['mean'] is not None) else None)
+
+    base['selected'] = {
+        'bucket': selected,
+        'selection_role': 'discovery_half_only',
+        'discovery_mean': ds['mean'],
+        'discovery_ci95': [ds['ci95_low'], ds['ci95_high']],
+        'discovery_n_clusters': ds['n_clusters'],
+        'discovery_n_tokens': ds['n_tokens'],
+        'replication_mean': rs['mean'],
+        'replication_ci95': [rs['ci95_low'], rs['ci95_high']],
+        'replication_n_clusters': rs['n_clusters'],
+        'replication_n_tokens': rs['n_tokens'],
+        'replication_p_exact_signflip': rs['p_exact_signflip'],
+        'same_sign': same_sign,
+        'replicated': replicated,
+        'replication_reason': rep_reason,
+        'shrinkage_replication_over_discovery': ratio,
+        'rank_in_replication': rank_rep,
+        'n_ranked_replication_buckets': len(ranked_rep),
+        'full_sample_mean': bucket_reports[selected]['mean'],
+        'full_sample_ci95': [bucket_reports[selected]['ci95_low'],
+                             bucket_reports[selected]['ci95_high']],
+        'full_sample_p_holm': bucket_reports[selected].get('p_holm'),
+        'full_sample_role': 'post_hoc_full_sample_descriptive',
+        'claim_boundary': ('桶是在发现半边上选出的；复现半边的区间/符号是选择校正后的读数。'
+                           '两半都来自同一条固定验证文本，因此这是内部稳定性而非外部复现。'),
+    }
+    base['status'] = 'ok'
+    base['reason'] = None
+    return base
+
+
 @torch.inference_mode()
 def compare_token_errors(model_a, model_b, val_batch, vocab, device, *, tokenizer=None,
-                         top_n=50, chunk=8):
+                         top_n=50, chunk=8, val_bnd=None, train_ids=None,
+                         bucket_audit=True):
     """Paired per-token CE comparison between two checkpoints.
 
     Answers "on which positions does arm B lose to arm A" instead of only
@@ -41504,6 +41896,69 @@ def compare_token_errors(model_a, model_b, val_batch, vocab, device, *, tokenize
     mean_a_paired = float(np.mean(ca[paired])) if n_paired else None
     mean_b_paired = float(np.mean(cb[paired])) if n_paired else None
     diff = cb - ca
+    bucket_inference = None
+    bucket_family_reasons = {}
+    if bucket_audit:
+        # One family = one pre-declared set of buckets.  Token rows are the
+        # clustering unit: a long row must not outvote several short rows just
+        # because it contributes more next-token positions.
+        _flat_delta = diff.reshape(-1)
+        _row_ids = np.repeat(np.arange(n_rows, dtype=np.int64), span).tolist()
+        _families = []
+        _frac = np.arange(span, dtype=np.float64) / max(1, span)
+        _pbin = ((_frac >= 0.1).astype(np.int64) + (_frac >= 0.5).astype(np.int64)
+                 + (_frac >= 0.9).astype(np.int64))
+        _pos_names = np.array(['position:first10%', 'position:10-50%',
+                               'position:50-90%', 'position:last10%'], dtype=object)
+        _families.append(('position', _pos_names[_pbin].tolist() * n_rows))
+        if train_ids is None:
+            bucket_family_reasons['target_rarity'] = 'unavailable: no train_ids'
+        else:
+            try:
+                _tr = np.asarray(train_ids)
+                if _tr.size == 0:
+                    raise ValueError('empty train_ids: token frequencies are unmeasured')
+                if _tr.dtype == np.bool_ or not np.issubdtype(_tr.dtype, np.integer):
+                    raise TypeError(f'train_ids dtype {_tr.dtype} is not an integer token type')
+                _tlo, _thi = int(_tr.min()), int(_tr.max())
+                if _tlo < 0 or _thi >= _V:
+                    raise ValueError(f'train_ids out of range [{_tlo}, {_thi}] for vocab {_V}')
+                _freq = _token_frequency_table(_tr.reshape(-1), _V)
+                _targets = vb[:, 1:].reshape(-1)
+                _rare = _freq[_targets] <= 5
+                _families.append(('target_rarity', np.where(
+                    _rare, 'target:rare(<=5 train occurrences)', 'target:common').tolist()))
+            except Exception as _exc:
+                bucket_family_reasons['target_rarity'] = f'{type(_exc).__name__}: {_exc}'
+        if val_bnd is None:
+            bucket_family_reasons['boundary'] = 'unavailable: no val_bnd'
+        else:
+            try:
+                _bnd = np.asarray(val_bnd)
+                if _bnd.shape != vb.shape:
+                    raise ValueError(f'boundary mask shape {_bnd.shape} != val_batch shape {vb.shape}')
+                _bnd_flat = _bnd[:, 1:].reshape(-1).astype(bool)
+                _families.append(('boundary', np.where(
+                    _bnd_flat, 'target:boundary-token', 'target:non-boundary').tolist()))
+            except Exception as _exc:
+                bucket_family_reasons['boundary'] = f'{type(_exc).__name__}: {_exc}'
+        try:
+            bucket_inference = []
+            for _fam, _labels in _families:
+                _rep = paired_error_bucket_inference(
+                    _flat_delta, _labels, _row_ids,
+                    alpha=ERROR_BUCKET_POLICY['alpha'],
+                    direction=ERROR_BUCKET_POLICY['direction'],
+                    split_seed=ERROR_BUCKET_POLICY['split_seed'],
+                    discovery_frac=ERROR_BUCKET_POLICY['discovery_frac'],
+                    min_clusters=ERROR_BUCKET_POLICY['min_clusters'],
+                    min_tokens=ERROR_BUCKET_POLICY['min_tokens'])
+                _rep['family'] = _fam
+                bucket_inference.append(_rep)
+        except Exception as _exc:
+            bucket_inference = None
+            bucket_family_reasons['_all'] = f'{type(_exc).__name__}: {_exc}'
+            print(f'[errors] WARNING: paired bucket inference failed ({type(_exc).__name__}: {_exc})')
     flat = np.where(paired, diff, -np.inf).reshape(-1)
     k = min(top_n, int(flat.size))
     if k <= 0:
@@ -41554,7 +42009,11 @@ def compare_token_errors(model_a, model_b, val_batch, vocab, device, *, tokenize
             'n_nonfinite_b': int(n_total - n_finite_b),
             'b_worse_at_n': int(np.sum(paired & (diff > 0))),
             'a_worse_at_n': int(np.sum(paired & (diff < 0))),
-            'worst_tokens_for_b': out}
+            'worst_tokens_for_b': out,
+            'bucket_inference': bucket_inference,
+            'bucket_family_reasons': bucket_family_reasons,
+            'bucket_inference_note': ('桶级推断以验证行为 cluster；发现/复现切分是内部稳定性检查，'
+                                      '不是外部复现，也不把固定验证文本当作总体样本。')}
 
 
 def _batch_arrays(batch, vocab=None):

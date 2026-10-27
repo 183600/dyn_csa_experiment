@@ -213,6 +213,94 @@ def _print_bad_cases(res, *, n_tokens=10, n_sequences=3):
     print('[errors] Read the context and label before acting: annotation error, genuine ambiguity and a model blind spot need different fixes.\n')
 
 
+def _ci_text(ci, fmt='{:+.3f}'):
+    if (not isinstance(ci, (list, tuple)) or len(ci) != 2
+            or not all(isinstance(x, (int, float)) and not isinstance(x, bool)
+                       and math.isfinite(float(x)) for x in ci)):
+        return 'n/a'
+    return '[' + ', '.join(fmt.format(float(x)) for x in ci) + ']'
+
+
+def _num_text(value, fmt='{:+.3f}'):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 'n/a'
+    if not math.isfinite(float(value)):
+        return 'n/a'
+    return fmt.format(float(value))
+
+
+def _render_paired_bucket_inference(paired):
+    """Markdown for the split-half bucket inference (empty for legacy JSON)."""
+    fams = paired.get('bucket_inference') if isinstance(paired, dict) else None
+    if not isinstance(fams, list) or not fams:
+        return []
+    lines = ['', '## Paired bucket inference (discovery/replication split)', '',
+             '> Token-level counts overstate precision and the worst bucket is selected after looking at the same data. '
+             'Here whole validation **rows** are the independent-ish unit; the bucket is chosen on a deterministic '
+             'discovery half and its effect is read on the disjoint replication half. Full-sample bucket p-values are '
+             'Holm-adjusted inside the declared family but remain **post-hoc descriptions**. Replicated = same sign and '
+             'replication 95% CI excludes zero. The two halves come from the same fixed validation text: this is internal '
+             'stability, not external replication and not a population inference.', '']
+    reasons = paired.get('bucket_family_reasons') if isinstance(paired.get('bucket_family_reasons'), dict) else {}
+    if reasons:
+        lines += ['- omitted families: ' + '; '.join(
+            f'`{k}` ({_one_line(v, 180)})' for k, v in sorted(reasons.items())), '']
+    for fam in fams:
+        if not isinstance(fam, dict):
+            continue
+        name = fam.get('family') or 'unnamed'
+        status = fam.get('status') or 'unknown'
+        lines += [f'### `{name}`', '', f'- status: `{status}`']
+        if fam.get('reason'):
+            lines.append(f'- reason: {_one_line(fam.get("reason"), 240)}')
+        split = fam.get('split') if isinstance(fam.get('split'), dict) else {}
+        if split:
+            lines.append(
+                f'- split: {split.get("n_discovery")} discovery / {split.get("n_replication")} '
+                f'replication row-cluster(s), disjoint={split.get("disjoint")}; '
+                f'seed={split.get("seed")}')
+        rc = fam.get('rank_correlation') if isinstance(fam.get('rank_correlation'), dict) else {}
+        if rc:
+            lines.append(f'- split-half bucket-order Spearman: {_num_text(rc.get("spearman"), "{:+.3f}")} '
+                         f'over {rc.get("n_buckets")} bucket(s)')
+        buckets = fam.get('buckets') if isinstance(fam.get('buckets'), dict) else {}
+        if not buckets:
+            lines += ['', '- no bucket had finite paired tokens.', '']
+            continue
+        sel = fam.get('selected') if isinstance(fam.get('selected'), dict) else {}
+        sel_name = sel.get('bucket')
+        lines += ['', '| bucket | tokens | clusters | full ΔCE (B−A) | full 95% CI | Holm p | discovery Δ | replication Δ | replication 95% CI | replicated |',
+                  '|---|---|---|---|---|---|---|---|---|---|']
+        for b, rec in sorted(buckets.items()):
+            if not isinstance(rec, dict):
+                continue
+            d = rec.get('discovery') if isinstance(rec.get('discovery'), dict) else {}
+            r = rec.get('replication') if isinstance(rec.get('replication'), dict) else {}
+            _b = f'**{b}**' if b == sel_name else str(b)
+            _rep = ('yes' if sel.get('replicated') else 'no') if b == sel_name else ''
+            lines.append(
+                f'| {_b} | {rec.get("n_tokens")} | {rec.get("n_clusters")} | '
+                f'{_num_text(rec.get("mean"))} | {_ci_text([rec.get("ci95_low"), rec.get("ci95_high")])} | '
+                f'{_num_text(rec.get("p_holm"), "{:.4f}")} | {_num_text(d.get("mean"))} | '
+                f'{_num_text(r.get("mean"))} | {_ci_text([r.get("ci95_low"), r.get("ci95_high")])} | {_rep} |')
+        if sel:
+            lines += ['', f'- selected on discovery half: `{sel_name}` '
+                          f'(Δ={_num_text(sel.get("discovery_mean"))}, '
+                          f'95% CI {_ci_text(sel.get("discovery_ci95"))}, '
+                          f'{sel.get("discovery_n_clusters")} clusters)',
+                      f'- replication half: Δ={_num_text(sel.get("replication_mean"))}, '
+                      f'95% CI {_ci_text(sel.get("replication_ci95"))}, exact p='
+                      f'{_num_text(sel.get("replication_p_exact_signflip"), "{:.4f}")}, '
+                      f'same sign={sel.get("same_sign")}, **replicated={sel.get("replicated")}** '
+                      f'({sel.get("replication_reason")})',
+                      f'- shrinkage (replication/discovery): {_num_text(sel.get("shrinkage_replication_over_discovery"), "{:+.3f}")}; '
+                      f'rank in replication: {sel.get("rank_in_replication")}/{sel.get("n_ranked_replication_buckets")}; '
+                      f'full-sample Holm p={_num_text(sel.get("full_sample_p_holm"), "{:.4f}")} (post-hoc)',
+                      f'- claim boundary: {sel.get("claim_boundary")}']
+        lines.append('')
+    return lines
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--ckpt', required=True)
@@ -300,7 +388,8 @@ def main(argv=None):
         _paired_vocab_guard(meta, meta_b)
         model_b.to(device)
         paired = L.compare_token_errors(model, model_b, val_batch, vocab, device,
-                                        tokenizer=tok, top_n=args.top_tokens, chunk=args.chunk)
+                                        tokenizer=tok, top_n=args.top_tokens, chunk=args.chunk,
+                                        val_bnd=val_bnd, train_ids=train_ids)
         paired['checkpoint_a'] = os.path.abspath(args.ckpt)
         paired['checkpoint_b'] = os.path.abspath(args.compare_ckpt)
         paired['checkpoint_a_sha256'] = res['checkpoint_sha256']
@@ -310,6 +399,18 @@ def main(argv=None):
         with open(os.path.join(args.outdir, 'paired_bad_cases.jsonl'), 'w', encoding='utf-8') as f:
             for i, rec in enumerate(paired.get('worst_tokens_for_b') or []):
                 f.write(json.dumps(L._json_clean({'kind': 'paired_token', 'rank': i + 1, **rec}), ensure_ascii=False, allow_nan=False) + '\n')
+        for fam in paired.get('bucket_inference') or []:
+            if not isinstance(fam, dict):
+                continue
+            sel = fam.get('selected') if isinstance(fam.get('selected'), dict) else {}
+            if fam.get('status') == 'ok' and sel:
+                print(f"[errors] bucket inference {fam.get('family')}: selected={sel.get('bucket')} "
+                      f"discovery={_num_text(sel.get('discovery_mean'))} "
+                      f"replication={_num_text(sel.get('replication_mean'))} "
+                      f"replicated={sel.get('replicated')}")
+            else:
+                print(f"[errors] bucket inference {fam.get('family')}: {fam.get('status')} "
+                      f"({_one_line(fam.get('reason'), 180)})")
         del model_b
     # JSONL: one line per bad case, easiest to filter/grep downstream.
     jsonl = os.path.join(args.outdir, 'bad_cases.jsonl')
@@ -427,6 +528,7 @@ def main(argv=None):
         for i, t in enumerate(paired.get('worst_tokens_for_b') or []):
             tg = (t.get('target_text') or '').replace('|', '\\|').replace('\n', '\\n')[:60]
             lines.append(f'| {i + 1} | {t["row"]} | {t["position"]} | `{t["target_id"]}` {tg} | {t["ce_a"]:.3f} | {t["ce_b"]:.3f} | {t["delta_b_minus_a"]:+.3f} |')
+        lines += _render_paired_bucket_inference(paired)
     lines += ['', '> This file is a diagnostic starting point, not a result table. Inspect the labelled target and context before declaring a model failure: annotation errors, near-duplicates, genuinely ambiguous text and rare tokens all look like "high CE". The automatic cause label is a triage heuristic; only a manual read of the context and label can separate an annotation error from an ambiguous example from a model blind spot.', '']
     L.atomic_write_text(os.path.join(args.outdir, 'bad_cases.md'), '\n'.join(lines) + '\n')
     _print_bad_cases(res, n_tokens=args.print_samples, n_sequences=args.print_sequences)

@@ -4966,3 +4966,123 @@ fail 或 warning、0.2% 差异停在 `sub_sesoi` 且不进入
 `verified_baselines`、2% 差异进入 `verified_baselines`，以及显式
 `sesoi={}` 恢复旧统计判定。本轮完整 CPU 套件 `561/561` 通过（0 skipped），
 `v12_supp.py plan` 仍为 72/72 records / 6 comparisons。
+
+## 73. 坏例桶要按行做选择后推断：发现/复现切分、cluster 级区间与 Holm（本轮结果分析硬化）
+
+### 73.1 问题
+
+`compare_token_errors` 已经能回答「B 在哪些 token 上比 A 差」，但它的桶级
+读法仍有两个结果分析上的漏洞：
+
+1. **伪重复。** 桶均值按 token 计算，一行 512 个位置会贡献最多 512 个
+   「样本」；同一段上下文里的相邻 token 高度相关，token 数会把区间宽度
+   压得远小于实际的不确定性。
+2. **选择偏差（winner's curse）。** 报告里「最差的桶」是在看过同一批
+   validation 数据后选出来的；再对同一个桶报 p 值/区间，等于用同一份
+   数据既选假设又做检验。全样本 Holm 只能控制「同时报多个桶」的多重性，
+   不能控制「先看结果再挑桶」的选择效应。
+
+这不是换一个更花哨的检验，而是要让「命名坏例」这一步的可复现性边界
+写清楚：桶是在哪一半上选的、另一半是否还同向、复现半边的不确定性有多
+大。由于仓库的 validation 行是固定文本，不是从总体抽取的概率样本，结论
+只能写成**内部稳定性**，不能写成总体推断或外部复现。
+
+### 73.2 方法：以 validation row 为 cluster 的两半选择
+
+对配对 token 定义 `δ_i = CE_B,i − CE_A,i`（正值 = B 更差）。`exp_lib.
+paired_error_bucket_inference()` 的默认口径：
+
+1. **先聚合到 cluster。** cluster 是 validation row（`val_batch` 的一行，
+   即一段连续 token 窗口）。桶内每个 cluster 先取 token 平均
+   `\barδ_c`，桶统计量是 cluster 均值的等权平均；token 总数只作为
+   coverage/描述量，不再冒充独立样本数。
+2. **全样本描述。** 对每个声明桶报 cluster 数、token 数、均值、样本 SD
+   （ddof=1）、`mean ± t_{0.975,n_c−1} · s/√n_c` 的 95% 区间、双侧
+   exact sign-flip p，并在声明族内做 Holm。这些 p 值明确标记为
+   `post_hoc_full_sample_descriptive`：它们没有为「挑最差桶」校正。
+3. **整行切分。** 用固定 seed 对 cluster 标识做 SHA-256，排序后前
+   `n_d` 个 cluster 进入 discovery，其余进入 replication；`n_d` 夹在
+   `[min_clusters, n_c − min_clusters]`。切分是确定性的、两半不重叠，
+   且同一行的所有 token 只会在同一半。默认 `min_clusters=3`、
+   `min_tokens=10`，桶家族包括 position、target rarity（需要
+   `train_ids`）和 boundary（需要 `val_bnd`）；缺少辅助输入时该家族
+   被省略并记录原因，而不是伪造标签。
+4. **只在 discovery 上选桶。** 在 discovery 半边按预声明方向（默认
+   positive，即 B 更差）选择均值最大的桶；允许的桶必须有
+   `n_clusters ≥ min_clusters`、`n_tokens ≥ min_tokens`，且方向正确。
+5. **在 replication 上读效应。** 对同一个桶报告 replication 半边的
+   cluster 均值、95% t 区间、exact p、符号是否一致、相对 discovery 的
+   shrinkage，以及它在 replication 半边同类桶中的排名。
+   `replicated = same_sign AND replication 95% CI excludes 0`。
+   这里**不要求** replication p ≤ α：每半只有 3 个 cluster 时 exact
+   sign-flip 的 p 分辨率下限就是 2/2³ = 0.25，永远不可能显著；把
+   `replicated` 绑到 p 会把小样本的稳定性检查变成不可能通过的假门。
+6. **全局排序稳定性。** 对两半都达到 `min_clusters` 的桶，报桶均值的
+   Spearman 秩相关，作为「桶的相对排序是否在另一半还成立」的描述量；
+   桶数少于 3 或秩方差为 0 时返回 `None`，不硬造相关系数。
+
+`replicated` 是诊断标签，不是新的确认性判定；它不进入冻结清单的
+p/Holm 族，也不改变 `confirmed`。
+
+### 73.3 为什么不用 token 级 bootstrap 或全样本重采样
+
+- token 级 bootstrap 把同一行的相邻位置当独立抽样，区间会系统性偏窄；
+- 全样本重采样仍然在同一批数据上完成「选桶 + 检验」，不能消除选择偏差；
+- 按 cluster 重采样能修区间宽度，但修不了「先看最差桶再报它」；
+- 因此采用「整行两半 + discovery 选桶 + replication 读效应」，并把
+  全样本 Holm 明确降级为事后描述。
+
+### 73.4 集成与产物
+
+- `exp_lib.paired_error_bucket_inference(deltas, bucket_ids, cluster_ids,
+  ...)`：纯函数；`compare_token_errors(..., train_ids=..., val_bnd=...)`
+  自动构造 position/target_rarity/boundary 三个家族，结果写入
+  `paired_errors.json` 的 `bucket_inference` 与
+  `bucket_family_reasons`。
+- `error_analysis.py` 在 `bad_cases.md` 增加「Paired bucket inference」
+  小节：逐桶表、discovery/replication 读数、`replicated`、shrinkage、
+  replication 排名、两半秩相关，以及固定验证文本/事后 p 值的边界说明。
+- `build_report.py` 从 `paired_errors.json` 读取同一 block 并在主报告
+  渲染；旧 artifact 没有该字段时静默跳过。
+- `audit_gates.audit_error_case_inference()`（CLI：
+  `python audit_gates.py error_case_inference` / `error_buckets`）从存储
+  的 cluster units 重放：全样本均值、exact p、Holm、确定性切分、
+  discovery 选桶、replication 符号/区间与 `replicated`。缺 artifact 或
+  旧 artifact 返回 `not_verifiable`，篡改判 `fail`；并接入
+  `audit_gates.py report` 的 `error_case_inference` 键。
+
+### 73.5 边界
+
+- **内部稳定性，不是外部复现。** 两半来自同一条固定 validation 文本；
+  这不是新数据、不是总体抽样，也不是独立文章复现。WikiText 的 row 是
+  原始行/窗口，不是文章；同一篇文章的不同行仍可能落在两半，因此
+  row-level 切分只消除了「同一行 token 泄漏」，不能消除文章级相关。
+- **不能把 `replicated=True` 写成确认性证据。** 它只说明在未参与选桶的
+  另一半上方向未翻转且区间未跨 0；不证明机制、不证明总体、不进入冻结
+  p/Holm 族。
+- **全样本桶 p 仍是事后描述。** 即使 Holm 后显著，也不能把它当作
+  「选择校正后的显著」；选择校正后的读数是 replication 半边。
+- **小样本两半的 p 有分辨率下限。** `min_clusters=3` 时 exact p 下限
+  0.25；因此 `replicated` 以区间和符号为准，不能反过来说「p>0.05 所以
+  不稳定」。
+- **不新增运行、不读 test split、不改冻结清单。** 该改动只读已存在的
+  validation 分析产物；不改变 `confirmation_frozen*.json` 的字节/种子/
+  终点/α/Holm 规则，也不改 `CODE_SEMANTICS`。
+
+### 73.6 入口与验证
+
+```bash
+python error_analysis.py --ckpt A.pt --compare-ckpt B.pt  # 生成 paired bucket inference
+python audit_gates.py error_case_inference                 # 重放 bucket 决策
+python audit_gates.py error_buckets                        # 同上（别名）
+python audit_gates.py report                               # 汇总含 error_case_inference
+python build_report.py                                     # 主报告渲染该小节
+python test_review_fixes.py                                # L211 + 既有回归
+```
+
+L211 覆盖：整行切分的确定性/不重叠、discovery 选桶、replication 同向
+与复现、token 级伪重复不再作为样本数、`no_candidate` 与 `no_data` 的
+区分、非法输入 fail-closed、artifact 重放通过/篡改 `fail`/缺文件
+`not_verifiable`、辅助家族缺输入时记录原因，以及 EA/BR Markdown 的
+`replicated` 与边界文案。完整 CPU 套件 `563/563` 通过（0 skipped）。
+`v12_supp.py plan` 的冻结计划/比较数不受影响。

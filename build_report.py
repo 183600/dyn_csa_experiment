@@ -2457,6 +2457,64 @@ def _render_error_analysis(d):
     return lines
 
 
+def _render_paired_error_inference(paired):
+    """Compact split-half bucket inference for the main report."""
+    fams = paired.get('bucket_inference') if isinstance(paired, dict) else None
+    if not isinstance(fams, list) or not fams:
+        return []
+    lines = ['']
+    reasons = paired.get('bucket_family_reasons')
+    if isinstance(reasons, dict) and reasons:
+        lines += ['- omitted bucket families: ' + '; '.join(
+            f'`{k}` ({str(v)[:160]})' for k, v in sorted(reasons.items())), '']
+    for fam in fams:
+        if not isinstance(fam, dict):
+            continue
+        name = fam.get('family') or 'unnamed'
+        status = fam.get('status') or 'unknown'
+        split = fam.get('split') if isinstance(fam.get('split'), dict) else {}
+        lines += [f'**Paired bucket inference — `{name}`**: `{status}`', '']
+        if fam.get('reason'):
+            lines += [f'- {fam.get("reason")}', '']
+        if split:
+            lines += [f'- split: {split.get("n_discovery")} discovery / {split.get("n_replication")} '
+                      f'replication validation rows (disjoint, hash-seeded)', '']
+        buckets = fam.get('buckets') if isinstance(fam.get('buckets'), dict) else {}
+        if not buckets:
+            continue
+        sel = fam.get('selected') if isinstance(fam.get('selected'), dict) else {}
+        sel_name = sel.get('bucket')
+        lines += ['| bucket | tokens | clusters | full ΔCE | full 95% CI | Holm p | discovery Δ | replication Δ | replicated |',
+                  '|---|---|---|---|---|---|---|---|---|']
+        for b, rec in sorted(buckets.items()):
+            if not isinstance(rec, dict):
+                continue
+            dd = rec.get('discovery') if isinstance(rec.get('discovery'), dict) else {}
+            rr = rec.get('replication') if isinstance(rec.get('replication'), dict) else {}
+            _lo, _hi = _as_finite(rec.get('ci95_low')), _as_finite(rec.get('ci95_high'))
+            _ci = (f'[{_lo:+.3f}, {_hi:+.3f}]' if _lo is not None and _hi is not None else 'n/a')
+            lines.append('| %s%s | %s | %s | %s | %s | %s | %s | %s | %s |' % (
+                '**' if b == sel_name else '', str(b) + ('**' if b == sel_name else ''),
+                fm(rec.get('n_tokens'), 0), fm(rec.get('n_clusters'), 0), fm(rec.get('mean')),
+                _ci, fm(rec.get('p_holm'), 4), fm(dd.get('mean')), fm(rr.get('mean')),
+                ('yes' if sel.get('replicated') else 'no') if b == sel_name else ''))
+        if sel:
+            _sel_ci = sel.get('replication_ci95')
+            if not (isinstance(_sel_ci, (list, tuple)) and len(_sel_ci) == 2):
+                _sel_ci = [None, None]
+            _rlo, _rhi = _as_finite(_sel_ci[0]), _as_finite(_sel_ci[1])
+            _rci = (f'[{_rlo:+.3f}, {_rhi:+.3f}]' if _rlo is not None and _rhi is not None else 'n/a')
+            lines += ['', f'- selected on discovery half: `{sel_name}`; replication Δ={fm(sel.get("replication_mean"))}, '
+                      f'95% CI {_rci}, **replicated={sel.get("replicated")}** '
+                      f'({sel.get("replication_reason")}); shrinkage='
+                      f'{fm(sel.get("shrinkage_replication_over_discovery"), 3)}; '
+                      f'rank in replication={sel.get("rank_in_replication")}/'
+                      f'{sel.get("n_ranked_replication_buckets")}', '']
+    lines += ['> Bucket p-values on the full sample are Holm-adjusted within the declared family but remain post-hoc descriptions. '
+              'The replication half is an internal split-half stability check on the same fixed validation text, not a population test.', '']
+    return lines
+
+
 def sec_error_analysis():
     docs = []
     seen = set()
@@ -2477,6 +2535,10 @@ def sec_error_analysis():
         if len(docs) > 1:
             lines += [f'### `{os.path.basename(os.path.dirname(path)) or "analysis_errors"}`', '']
         lines += _render_error_analysis(d)
+        _paired_path = os.path.join(os.path.dirname(path), 'paired_errors.json')
+        _paired = load(_paired_path, default=None)
+        if isinstance(_paired, dict):
+            lines += _render_paired_error_inference(_paired)
     return '\n'.join(lines) + '\n'
 
 

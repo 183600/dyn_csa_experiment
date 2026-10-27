@@ -24363,12 +24363,153 @@ def main():
            t_replication_independence_is_not_shared_draws)
     _check('L210 baseline SESOI gates practical superiority and declaration',
            t_baseline_sesoi_and_design_gate)
+    _check('L211 error-bucket inference splits clusters and replays its verdict',
+           t_error_bucket_inference_split_half_and_audit)
+    _check('L211b paired bucket inference is rendered with its claim boundary',
+           t_compare_token_errors_reports_bucket_inference_and_markdown)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')
     if skips:
         print('[test] SKIPPED (environment preconditions): ' + '; '.join(f'{n} — {why}' for n, _s, why in skips))
     return 1 if fails else 0
+
+
+def t_error_bucket_inference_split_half_and_audit():
+    # Synthetic clusters: bucket y is worse in every row, bucket x only at a
+    # few positions.  The discovery/replication split must choose y without
+    # using the replication half for selection, and the replay gate must detect
+    # a tampered verdict.
+    rows, buckets, d = [], [], []
+    for r in range(16):
+        for j in range(8):
+            rows.append(r)
+            buckets.append('y' if j else 'x')
+            d.append(1.0 if j else 0.5)
+    rep = L.paired_error_bucket_inference(d, buckets, rows, min_clusters=3,
+                                          min_tokens=5, split_seed=7)
+    assert rep['status'] == 'ok', rep
+    assert rep['selected']['bucket'] == 'y', rep['selected']
+    assert rep['selected']['same_sign'] is True, rep['selected']
+    assert rep['selected']['replicated'] is True, rep['selected']
+    assert rep['selected']['full_sample_p_holm'] < 0.01, rep['selected']
+    split = rep['split']
+    assert split['disjoint'] is True, split
+    assert not (set(split['discovery_clusters']) & set(split['replication_clusters']))
+    assert len(split['discovery_clusters']) + len(split['replication_clusters']) == 16
+    # The full-sample Holm path is present for every bucket, and the selected
+    # bucket is marked post-hoc rather than promoted to confirmation.
+    for b, rec in rep['buckets'].items():
+        assert rec['p_holm'] is not None, (b, rec)
+        assert rec['role'] == 'post_hoc_full_sample_descriptive', rec
+    again = L.paired_error_bucket_inference(d, buckets, rows, min_clusters=3,
+                                            min_tokens=5, split_seed=7)
+    assert again['split'] == split, 'split must be deterministic'
+    # No positive discovery candidate is a different state from "no data".
+    neg = L.paired_error_bucket_inference([-x for x in d], buckets, rows,
+                                          min_clusters=3, min_tokens=5,
+                                          split_seed=7)
+    assert neg['status'] == 'no_candidate', neg['status']
+    empty = L.paired_error_bucket_inference([], [], [])
+    assert empty['status'] == 'no_data', empty
+    # Fail-closed validation.
+    for args, kw in ((([1.0, 2.0], ['a'], [0, 1]), {}),
+                     (([True], ['a'], [0]), {}),
+                     (([1.0], ['a'], [0]), {'min_clusters': 1}),
+                     (([1.0], ['a'], [0]), {'min_tokens': 0})):
+        try:
+            L.paired_error_bucket_inference(*args, **kw)
+        except (ValueError, TypeError):
+            pass
+        else:
+            raise AssertionError(f'inference accepted invalid input {args!r} {kw!r}')
+
+    # Replay gate accepts the authentic artifact and rejects a flipped verdict.
+    td = tempfile.mkdtemp(prefix='bucket_inf_', dir=REPO)
+    art = os.path.join(td, 'paired_errors.json')
+    try:
+        rep['family'] = 'synthetic'
+        with open(art, 'w', encoding='utf-8') as f:
+            json.dump({'kind': 'paired_token_error_comparison',
+                       'bucket_inference': [rep]}, f)
+        aud = A.audit_error_case_inference(art)
+        assert aud['status'] == 'ok', aud
+        bad = json.loads(json.dumps(rep))
+        bad['selected']['replicated'] = not bad['selected']['replicated']
+        with open(art, 'w', encoding='utf-8') as f:
+            json.dump({'bucket_inference': [bad]}, f)
+        aud2 = A.audit_error_case_inference(art)
+        assert aud2['status'] == 'fail', aud2
+        assert any('replicated' in x for x in aud2['problems']), aud2
+        missing = A.audit_error_case_inference(os.path.join(td, 'absent.json'))
+        assert missing['status'] == 'not_verifiable', missing
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+
+def t_compare_token_errors_reports_bucket_inference_and_markdown():
+    import torch.nn.functional as _F
+
+    class _M:
+        def __init__(self, correct_logit):
+            self.correct_logit = float(correct_logit)
+            self.training = True
+
+        def eval(self):
+            self.training = False
+            return self
+
+        def train(self, mode=True):
+            self.training = bool(mode)
+            return self
+
+        def trunk(self, ids):
+            return ids.unsqueeze(-1).float()
+
+        def head(self, h):
+            ids = h[..., 0].long()
+            lg = torch.zeros((ids.shape[0], ids.shape[1], 32), dtype=torch.float32)
+            tgt = ((ids + 1) % 32).unsqueeze(-1)
+            return lg.scatter(2, tgt, self.correct_logit)
+
+    vb = (np.arange(20 * 8, dtype=np.int64).reshape(20, 8) % 32)
+    a, b = _M(7.0), _M(3.0)
+    train_ids = np.arange(320, dtype=np.int64) % 32
+    bnd = np.zeros_like(vb, dtype=bool)
+    bnd[:, 1::2] = True
+    r = L.compare_token_errors(a, b, vb, 32, torch.device('cpu'), top_n=0,
+                               train_ids=train_ids, val_bnd=bnd)
+    fams = {f['family']: f for f in (r.get('bucket_inference') or [])}
+    assert {'position', 'target_rarity', 'boundary'} <= set(fams), fams
+    for fam in fams.values():
+        assert fam['status'] in ('ok', 'no_candidate', 'insufficient_clusters'), fam
+    pos = fams['position']
+    assert pos['status'] == 'ok', pos
+    assert pos['selected'] is not None and pos['selected']['replicated'] is True, pos['selected']
+    assert pos['selected']['bucket'].startswith('position:'), pos['selected']
+    # The split is row-level and disjoint: no token row leaks across halves.
+    assert pos['split']['disjoint'] is True, pos['split']
+    for bname, rec in pos['buckets'].items():
+        for u in rec.get('cluster_units') or []:
+            assert (u['cluster'] in pos['split']['discovery_clusters']) != (
+                u['cluster'] in pos['split']['replication_clusters']), (bname, u)
+    # Auxiliary families fail soft (recorded reason) rather than aborting the
+    # paired comparison when their inputs are malformed.
+    r2 = L.compare_token_errors(a, b, vb, 32, torch.device('cpu'), top_n=0,
+                                train_ids=[], val_bnd=np.zeros((3, 3), dtype=bool))
+    assert 'target_rarity' in r2['bucket_family_reasons'], r2['bucket_family_reasons']
+    assert 'boundary' in r2['bucket_family_reasons'], r2['bucket_family_reasons']
+    assert r2['bucket_inference'], r2
+    r3 = L.compare_token_errors(a, b, vb, 32, torch.device('cpu'), top_n=0,
+                                bucket_audit=False)
+    assert r3['bucket_inference'] is None, r3
+    # Artifact renderers expose the stability claim and its boundary.
+    paired = {'bucket_inference': [pos],
+              'bucket_family_reasons': {'target_rarity': 'unavailable: no train_ids'}}
+    ea_txt = '\n'.join(EA._render_paired_bucket_inference(paired))
+    assert 'replicated=True' in ea_txt and 'not external replication' in ea_txt, ea_txt
+    br_txt = '\n'.join(BR._render_paired_error_inference(paired))
+    assert 'replicated=True' in br_txt and 'post-hoc' in br_txt, br_txt
 
 
 if __name__ == '__main__':

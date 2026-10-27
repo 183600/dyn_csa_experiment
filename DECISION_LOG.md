@@ -2956,3 +2956,44 @@ fail 或 warning、0.2% 差异停在 `sub_sesoi` 且不进入
 `sesoi={}` 恢复旧判定。`python audit_gates.py baseline_sesoi` 返回
 `ok`；`python audit_gates.py sesoi` 仍 `ok`；`python v12_supp.py plan`
 仍 72/72 合成冻结记录、6 个比较。
+
+## 2026-10-27 — 坏例桶的 row-cluster 发现/复现推断与重放门（no new runs）
+
+零 GPU 的结果分析方法学硬化；不新增训练、不读取 test split、不修改冻结
+清单的字节/种子/终点/alpha/Holm 决策规则，也不改 `CODE_SEMANTICS`。
+
+**Problem.** `compare_token_errors` 的桶级报告按 token 计均值/样本量，长行
+会对短行形成伪重复；而「最差桶」是看过同一批 validation 数据后挑出的，
+再对同一个桶报 p 值/区间会受 winner's curse 影响。现有全样本桶 p 没有
+多重性之外的校正，也没有说明桶是在哪一半上被选中的。
+
+**Fix.** 新增 `exp_lib.paired_error_bucket_inference()`：以 validation row
+为 cluster，先聚合 token，再对 cluster 做确定性 SHA-256 两半切分；只在
+discovery 半边按方向选最差桶，在 disjoint replication 半边报告均值、t
+区间、exact sign-flip p、同向性、shrinkage 和排名。
+`replicated = same_sign AND replication 95% CI excludes 0`（不要求
+replication p≤α，因为 3 个 cluster 的 exact p 下限是 0.25）。全样本桶 p
+保留 Holm，但明确标记为 `post_hoc_full_sample_descriptive`。
+`compare_token_errors(..., train_ids=..., val_bnd=...)` 构造 position /
+target rarity / boundary 三个家族；缺少辅助输入时记录原因并省略。
+`error_analysis.py` 的 `bad_cases.md`、`build_report.py` 的主报告渲染该
+block；新增 `audit_gates.audit_error_case_inference()`（CLI
+`error_case_inference` / `error_buckets`），从 `paired_errors.json` 存储的
+cluster units 重放均值、exact p、Holm、切分、选桶、replication 符号/区间
+与 `replicated`，并接入 `audit_gates.py report`。
+
+**Boundary.** 这是固定 validation 文本上的**内部稳定性**检查，不是总体
+推断、不是新数据、不是独立文章复现。WikiText 的 row 是原始行/窗口，同一
+文章的不同行仍可能跨两半，row-level 切分不能消除文章级相关。
+`replicated=True` 不是确认性证据，不进入冻结 p/Holm 族，不改变
+`confirmed`；全样本 Holm 显著也不能写成「选择校正后的显著」。两半 p 值
+有分辨率下限，小样本应以区间/符号为准。
+
+**Verification.** `python test_review_fixes.py` 通过 `563/563`（0 skipped，
+新增 L211/L211b）：覆盖确定性/不重叠切分、discovery 选桶、replication
+复现、token 级伪重复不作为样本数、`no_data`/`no_candidate` 区分、非法输入
+fail-closed、artifact 重放通过/篡改 `fail`/缺文件 `not_verifiable`、
+辅助家族缺输入时记录原因，以及 EA/BR Markdown 的 `replicated` 与边界
+文案。`python audit_gates.py error_case_inference` 对合成 artifact 返回
+`ok`、篡改后 `fail`；缺文件返回 `not_verifiable`。`python v12_supp.py
+plan` 的冻结计划/比较数不受影响。

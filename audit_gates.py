@@ -54,6 +54,10 @@
   looks        序列观测 / optional stopping：逐面板 look history 的种子集合、
                逐种子配对差、逐 look p 与 max-over-looks 序列 p 是否自洽；
                朴素最终 p 显著但序列 p 不显著的对照会被点名（零 GPU）
+  error_case_inference  坏例桶推断重放：从 paired_errors.json 的 row-cluster
+               聚合重算全样本均值/exact p/Holm、确定性发现/复现切分、
+               discovery 选桶与 replication 符号/区间/复现判定；缺产物报
+               not_verifiable，篡改判 fail（零 GPU，不读 test）
   single_factor  单因素设计契约：每条声明对照的臂配置 diff 恰好等于声明的
                干预键集（定义点审计，不读 results_*）；open-block 矩阵只沿
                两根声明轴变化；v7/v9 扫描的 factors 与真实 arm diff 对账；
@@ -6874,6 +6878,302 @@ def audit_look_history(paths=None):
     return out
 
 
+def audit_error_case_inference(path=None):
+    """Replay the split-half paired error-bucket inference from its artifact.
+
+    The bad-case Markdown is a claim surface: it names a bucket as worse and
+    reports a replication-half interval.  This gate re-derives the bucket
+    means, the discovery-only selection, the replication sign/CI decision and
+    the within-family Holm correction from the stored cluster-level units.  It
+    reads a local artifact only (zero GPU) and starts no experiment.
+    """
+    L = _import_exp_lib()
+    if path is None:
+        path = os.path.join(REPO, 'analysis_errors', 'paired_errors.json')
+    path = os.path.abspath(str(path))
+    out = {'kind': 'error_case_inference', 'status': 'ok', 'path': path,
+           'policy_version_expected': L.ERROR_BUCKET_POLICY['version'],
+           'families': {}, 'problems': [], 'warnings': []}
+    if not os.path.exists(path):
+        out['status'] = 'not_verifiable'
+        out['warnings'].append(f'no paired error artifact at {path}; run error_analysis.py --compare-ckpt first')
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return out
+    try:
+        with open(path, encoding='utf-8') as f:
+            doc = json.load(f)
+    except Exception as exc:
+        out['status'] = 'fail'
+        out['problems'].append(f'artifact is unreadable: {type(exc).__name__}: {exc}')
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return out
+    fams = doc.get('bucket_inference') if isinstance(doc, dict) else None
+    if not isinstance(fams, list) or not fams:
+        out['status'] = 'not_verifiable'
+        out['warnings'].append('artifact has no bucket_inference block (legacy or aborted analysis)')
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return out
+
+    def _finite(x):
+        if isinstance(x, (bool, np.bool_)):
+            return None
+        try:
+            v = float(x)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return v if math.isfinite(v) else None
+
+    def _close(a, b, tol):
+        return (a is not None and b is not None and abs(a - b) <= tol)
+
+    def _mean(vals):
+        return float(np.mean(vals)) if vals else None
+
+    def _subset(units, keep):
+        return [u for u in units if str(u.get('cluster')) in keep]
+
+    for fi, fam in enumerate(fams):
+        tag = f'family[{fi}]'
+        if not isinstance(fam, dict):
+            out['problems'].append(f'{tag}: not an object')
+            continue
+        fname = str(fam.get('family') or tag)
+        tag = f'{fname}'
+        rec = {'status': fam.get('status'), 'problems': []}
+        out['families'][tag] = rec
+        _p = rec['problems']
+        if fam.get('policy_version') != L.ERROR_BUCKET_POLICY['version']:
+            _p.append(f"policy version {fam.get('policy_version')!r} != "
+                      f"{L.ERROR_BUCKET_POLICY['version']!r}")
+        alpha = _finite(fam.get('alpha'))
+        direction = fam.get('direction')
+        min_clusters = _finite(fam.get('min_clusters'))
+        min_tokens = _finite(fam.get('min_tokens'))
+        frac = _finite(fam.get('discovery_frac'))
+        seed = fam.get('split_seed')
+        if alpha is None or not (0.0 < alpha < 1.0):
+            _p.append('alpha missing/invalid')
+        if direction not in ('positive', 'negative', 'two-sided'):
+            _p.append(f'direction {direction!r} invalid')
+        if min_clusters is None or min_clusters < 2 or min_clusters != int(min_clusters):
+            _p.append('min_clusters missing/invalid')
+        if min_tokens is None or min_tokens < 1 or min_tokens != int(min_tokens):
+            _p.append('min_tokens missing/invalid')
+        if frac is None or not (0.0 < frac < 1.0):
+            _p.append('discovery_frac missing/invalid')
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            _p.append('split_seed missing/invalid')
+        if _p:
+            rec['status'] = 'fail'
+            continue
+        min_clusters = int(min_clusters)
+        min_tokens = int(min_tokens)
+        buckets = fam.get('buckets') if isinstance(fam.get('buckets'), dict) else {}
+        if not buckets:
+            _p.append('no buckets recorded')
+            rec['status'] = 'fail'
+            continue
+        units_by_bucket = {}
+        all_clusters = set()
+        ok_units = True
+        for b, brec in sorted(buckets.items()):
+            units = brec.get('cluster_units') if isinstance(brec, dict) else None
+            if not isinstance(units, list):
+                _p.append(f'bucket {b!r}: cluster_units missing (cannot replay)')
+                ok_units = False
+                continue
+            seen = set()
+            cleaned = []
+            for u in units:
+                if not isinstance(u, dict):
+                    _p.append(f'bucket {b!r}: malformed cluster unit')
+                    ok_units = False
+                    continue
+                c = u.get('cluster')
+                m = _finite(u.get('mean_delta'))
+                ntok = _finite(u.get('n_tokens'))
+                if c is None or m is None or ntok is None or ntok < 1:
+                    _p.append(f'bucket {b!r}: malformed cluster unit {u!r}')
+                    ok_units = False
+                    continue
+                c = str(c)
+                if c in seen:
+                    _p.append(f'bucket {b!r}: duplicate cluster {c!r}')
+                    ok_units = False
+                seen.add(c)
+                all_clusters.add(c)
+                cleaned.append({'cluster': c, 'mean_delta': m, 'n_tokens': int(ntok)})
+            units_by_bucket[b] = cleaned
+            vals = [u['mean_delta'] for u in cleaned]
+            ntok = sum(u['n_tokens'] for u in cleaned)
+            if not _close(_mean(vals), _finite(brec.get('mean')), 1e-9):
+                _p.append(f'bucket {b!r}: stored mean != replay')
+            if int(brec.get('n_clusters') or 0) != len(cleaned):
+                _p.append(f'bucket {b!r}: n_clusters != replay')
+            if int(brec.get('n_tokens') or 0) != ntok:
+                _p.append(f'bucket {b!r}: n_tokens != replay')
+            p = L.exact_signflip_p(vals)
+            pv = _finite(p.get('p'))
+            if not _close(pv, _finite(brec.get('p_exact_signflip')), 1e-12):
+                _p.append(f'bucket {b!r}: exact sign-flip p != replay')
+        if not ok_units:
+            rec['status'] = 'fail'
+            continue
+        # Recompute the within-family Holm correction from the replayed p-values.
+        raw_pairs = []
+        for b in sorted(buckets):
+            vals = [u['mean_delta'] for u in units_by_bucket[b]]
+            raw_pairs.append((b, _finite(L.exact_signflip_p(vals).get('p'))))
+        holm = L.holm_adjust(raw_pairs, alpha=alpha)
+        for b in sorted(buckets):
+            stored = _finite(buckets[b].get('p_holm'))
+            replay = _finite((holm.get(b) or {}).get('p_holm'))
+            if stored is not None or replay is not None:
+                if not _close(stored, replay, 1e-12):
+                    _p.append(f'bucket {b!r}: Holm p != replay')
+        split = fam.get('split')
+        if fam.get('status') == 'insufficient_clusters':
+            if split is not None:
+                _p.append('insufficient_clusters status must not carry a split')
+            rec['n_clusters'] = len(all_clusters)
+            rec['status'] = 'fail' if _p else 'ok'
+            continue
+        if not isinstance(split, dict):
+            _p.append('split metadata missing')
+            rec['status'] = 'fail'
+            continue
+        disc = split.get('discovery_clusters')
+        repl = split.get('replication_clusters')
+        order_raw = split.get('cluster_order')
+        if not (isinstance(disc, list) and isinstance(repl, list)):
+            _p.append('split cluster lists missing')
+            rec['status'] = 'fail'
+            continue
+        disc_raw = [str(x) for x in disc]
+        repl_raw = [str(x) for x in repl]
+        disc = set(disc_raw)
+        repl = set(repl_raw)
+        if disc & repl:
+            _p.append('discovery/replication clusters overlap')
+        if disc | repl != all_clusters:
+            _p.append('split does not partition the observed clusters')
+        if len(disc_raw) != len(disc) or len(repl_raw) != len(repl):
+            _p.append('split cluster lists contain duplicates')
+        if not isinstance(order_raw, list):
+            _p.append('split cluster_order missing (cannot verify contiguity)')
+            rec['status'] = 'fail'
+            continue
+        ordered = [str(x) for x in order_raw]
+        if len(ordered) != len(set(ordered)) or set(ordered) != all_clusters:
+            _p.append('cluster_order is not a permutation of the observed clusters')
+        if disc_raw != [c for c in ordered if c in disc]:
+            _p.append('discovery cluster order was not preserved')
+        if repl_raw != [c for c in ordered if c in repl]:
+            _p.append('replication cluster order was not preserved')
+        n_disc = int(round(frac * len(ordered)))
+        n_disc = max(min_clusters, min(len(ordered) - min_clusters, n_disc))
+        expected_disc = set(ordered[:n_disc])
+        if disc != expected_disc:
+            _p.append('discovery half is not the contiguous first-occurrence split')
+        # Replay each half's mean/tokens and the discovery-only selection.
+        cand = []
+        for b in sorted(buckets):
+            for half, keep in (('discovery', disc), ('replication', repl)):
+                sub = _subset(units_by_bucket[b], keep)
+                vals = [u['mean_delta'] for u in sub]
+                ntok = sum(u['n_tokens'] for u in sub)
+                st = buckets[b].get(half) if isinstance(buckets[b].get(half), dict) else {}
+                if not _close(_mean(vals), _finite(st.get('mean')), 1e-9):
+                    _p.append(f'bucket {b!r}: {half} mean != replay')
+                if int(st.get('n_clusters') or 0) != len(sub):
+                    _p.append(f'bucket {b!r}: {half} n_clusters != replay')
+                if int(st.get('n_tokens') or 0) != ntok:
+                    _p.append(f'bucket {b!r}: {half} n_tokens != replay')
+            dsub = _subset(units_by_bucket[b], disc)
+            dvals = [u['mean_delta'] for u in dsub]
+            dm = _mean(dvals)
+            if (len(dsub) >= min_clusters and sum(u['n_tokens'] for u in dsub) >= min_tokens
+                    and dm is not None
+                    and ((direction == 'positive' and dm > 0.0)
+                         or (direction == 'negative' and dm < 0.0)
+                         or (direction == 'two-sided' and dm != 0.0))):
+                cand.append((b, dm))
+        if direction == 'positive':
+            exp_sel = sorted(cand, key=lambda x: (-x[1], x[0]))
+        elif direction == 'negative':
+            exp_sel = sorted(cand, key=lambda x: (x[1], x[0]))
+        else:
+            exp_sel = sorted(cand, key=lambda x: (-abs(x[1]), x[0]))
+        selected = fam.get('selected') if isinstance(fam.get('selected'), dict) else None
+        if fam.get('status') == 'no_candidate':
+            if exp_sel:
+                _p.append(f'status=no_candidate but replay finds candidate {exp_sel[0][0]!r}')
+            if selected is not None:
+                _p.append('status=no_candidate must not carry a selected bucket')
+        elif fam.get('status') == 'ok':
+            if not exp_sel:
+                _p.append('status=ok but replay finds no eligible discovery bucket')
+            elif selected is None:
+                _p.append('status=ok but selected bucket is missing')
+            else:
+                sel_b = selected.get('bucket')
+                if sel_b != exp_sel[0][0]:
+                    _p.append(f'selected bucket {sel_b!r} != replay {exp_sel[0][0]!r}')
+                if sel_b in units_by_bucket:
+                    dsub = _subset(units_by_bucket[sel_b], disc)
+                    dvals = [u['mean_delta'] for u in dsub]
+                    dstat = L._error_cluster_stats(
+                        dvals, [u['n_tokens'] for u in dsub])
+                    rsub = _subset(units_by_bucket[sel_b], repl)
+                    rvals = [u['mean_delta'] for u in rsub]
+                    rntok = [u['n_tokens'] for u in rsub]
+                    rst = L._error_cluster_stats(rvals, rntok)
+                    if not _close(_finite(selected.get('discovery_mean')),
+                                  _finite(dstat.get('mean')), 1e-9):
+                        _p.append('selected discovery mean != replay')
+                    if not _close(_finite(selected.get('replication_mean')),
+                                  _finite(rst.get('mean')), 1e-9):
+                        _p.append('selected replication mean != replay')
+                    _dci = selected.get('discovery_ci95')
+                    if (isinstance(_dci, (list, tuple)) and len(_dci) == 2
+                            and not (_close(_finite(_dci[0]), _finite(dstat.get('ci95_low')), 1e-9)
+                                     and _close(_finite(_dci[1]), _finite(dstat.get('ci95_high')), 1e-9))):
+                        _p.append('selected discovery CI != replay')
+                    _rci = selected.get('replication_ci95')
+                    if (isinstance(_rci, (list, tuple)) and len(_rci) == 2
+                            and not (_close(_finite(_rci[0]), _finite(rst.get('ci95_low')), 1e-9)
+                                     and _close(_finite(_rci[1]), _finite(rst.get('ci95_high')), 1e-9))):
+                        _p.append('selected replication CI != replay')
+                    if not _close(_finite(selected.get('replication_p_exact_signflip')),
+                                  _finite(rst.get('p_exact_signflip')), 1e-12):
+                        _p.append('selected replication exact p != replay')
+                    same = (rst.get('mean') is not None
+                            and _finite(selected.get('discovery_mean')) is not None
+                            and float(selected['discovery_mean']) * float(rst['mean']) > 0.0)
+                    rep_ok = (rst.get('n_clusters', 0) >= min_clusters
+                              and rst.get('n_tokens', 0) >= min_tokens)
+                    replicated = bool(rep_ok and same and rst.get('ci_excludes_zero'))
+                    if bool(selected.get('replicated')) != replicated:
+                        _p.append('replicated verdict != replay')
+                    if bool(selected.get('same_sign')) != same:
+                        _p.append('same_sign != replay')
+                    _ph = _finite((holm.get(sel_b) or {}).get('p_holm'))
+                    if not _close(_finite(selected.get('full_sample_p_holm')), _ph, 1e-12):
+                        _p.append('selected full-sample Holm p != replay')
+        else:
+            _p.append(f'unknown family status {fam.get("status")!r}')
+        rec['n_clusters'] = len(all_clusters)
+        rec['n_candidates_discovery'] = len(cand)
+        rec['status'] = 'fail' if _p else 'ok'
+    if any(isinstance(r, dict) and r.get('status') == 'fail' for r in out['families'].values()):
+        out['status'] = 'fail'
+    for k, r in out['families'].items():
+        if isinstance(r, dict) and r.get('problems'):
+            out['problems'].extend(f"{k}: {x}" for x in r['problems'])
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return out
+
+
 def audit_statistical_calibration(*, n_sim=None, seed=None):
     """Deterministic synthetic calibration of the analysis machinery.
 
@@ -6921,7 +7221,7 @@ def audit_statistical_calibration(*, n_sim=None, seed=None):
 
 
 def run_report(out='audit_report.json'):
-    res = {'generated_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'source_tree': audit_source_integrity(), 'dependencies': audit_dependencies(), 'data_source': audit_data_source(), 'leakage': audit_leakage(), 'split_discipline': audit_split_discipline(), 'document_unit': audit_document_unit(), 'sample_design': audit_sample_design(), 'attribution': audit_attribution(), 'boundary': audit_boundary(), 'length': audit_length(), 'fairness': audit_fairness(), 'metrics': audit_metrics(), 'tuning': audit_tuning(), 'simple_baseline': audit_simple_baseline(), 'hypotheses': audit_hypotheses(), 'sesoi': audit_sesoi_declaration(), 'baseline_sesoi': audit_baseline_sesoi(), 'interaction_sesoi': audit_interaction_sesoi(), 'unit_influence': audit_unit_influence(), 'analysis_choices': audit_analysis_choices(), 'verdicts': audit_confirmation_verdicts(), 'looks': audit_look_history(), 'methodology': audit_methodology(), 'single_factor': audit_single_factor(), 'factorial': audit_factorial_design(), 'design_preflight': audit_design_preflight(), 'sensitivity': audit_design_sensitivity(), 'evaluation': audit_evaluation_design(), 'dose_response': audit_dose_response(verbose=False), 'failures': audit_failures(), 'budget': audit_budget(), 'training_health': audit_training_health(), 'efficiency_pairs': audit_efficiency_pairs(), 'release': audit_release_readiness(), 'selection': audit_selection(), 'run_order': audit_run_order(), 'calibration': audit_statistical_calibration()}
+    res = {'generated_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'source_tree': audit_source_integrity(), 'dependencies': audit_dependencies(), 'data_source': audit_data_source(), 'leakage': audit_leakage(), 'split_discipline': audit_split_discipline(), 'document_unit': audit_document_unit(), 'sample_design': audit_sample_design(), 'attribution': audit_attribution(), 'boundary': audit_boundary(), 'length': audit_length(), 'fairness': audit_fairness(), 'metrics': audit_metrics(), 'tuning': audit_tuning(), 'simple_baseline': audit_simple_baseline(), 'hypotheses': audit_hypotheses(), 'sesoi': audit_sesoi_declaration(), 'baseline_sesoi': audit_baseline_sesoi(), 'interaction_sesoi': audit_interaction_sesoi(), 'unit_influence': audit_unit_influence(), 'analysis_choices': audit_analysis_choices(), 'verdicts': audit_confirmation_verdicts(), 'looks': audit_look_history(), 'methodology': audit_methodology(), 'single_factor': audit_single_factor(), 'factorial': audit_factorial_design(), 'design_preflight': audit_design_preflight(), 'sensitivity': audit_design_sensitivity(), 'evaluation': audit_evaluation_design(), 'dose_response': audit_dose_response(verbose=False), 'failures': audit_failures(), 'budget': audit_budget(), 'training_health': audit_training_health(), 'efficiency_pairs': audit_efficiency_pairs(), 'error_case_inference': audit_error_case_inference(), 'release': audit_release_readiness(), 'selection': audit_selection(), 'run_order': audit_run_order(), 'calibration': audit_statistical_calibration()}
     L_atomic = None
     try:
         L = _import_exp_lib()
@@ -6941,7 +7241,7 @@ def run_report(out='audit_report.json'):
 
 
 if __name__ == '__main__':
-    _cmds = {'leakage': audit_leakage, 'split': audit_split_discipline, 'split_discipline': audit_split_discipline, 'document_unit': audit_document_unit, 'unit': audit_document_unit, 'sample_design': audit_sample_design, 'sampling': audit_sample_design, 'sample': audit_sample_design, 'causality': audit_causality, 'attribution': audit_attribution, 'boundary': audit_boundary, 'length': audit_length, 'fairness': audit_fairness, 'metrics': audit_metrics, 'tuning': audit_tuning, 'simple': audit_simple_baseline, 'baseline_floor': audit_simple_baseline, 'baseline_plan': audit_baseline_design, 'hypothesis_coverage': audit_hypothesis_coverage, 'hypotheses': audit_hypotheses, 'sesoi': audit_sesoi_declaration, 'baseline_sesoi': audit_baseline_sesoi, 'baseline_sesoi_declaration': audit_baseline_sesoi, 'interaction_sesoi': audit_interaction_sesoi, 'interaction': audit_interaction_sesoi, 'unit_influence': audit_unit_influence, 'influence': audit_unit_influence, 'analysis_choices': audit_analysis_choices, 'specification_curve': audit_analysis_choices, 'verdicts': audit_confirmation_verdicts, 'verdict': audit_confirmation_verdicts, 'three_way': audit_confirmation_verdicts, 'analysis_choice': audit_analysis_choices, 'looks': audit_look_history, 'look_history': audit_look_history, 'methodology': audit_methodology, 'single_factor': audit_single_factor, 'factorial': audit_factorial_design, 'factorial_design': audit_factorial_design, 'design': audit_design_preflight, 'design_preflight': audit_design_preflight, 'sensitivity': audit_design_sensitivity, 'design_sensitivity': audit_design_sensitivity, 'precision': audit_design_sensitivity, 'evaluation': audit_evaluation_design, 'evaluation_design': audit_evaluation_design, 'unit_precision': audit_evaluation_design, 'dose_response': audit_dose_response, 'dose_response_design': audit_dose_response, 'failures': audit_failures, 'budget': audit_budget, 'efficiency': audit_efficiency_demo, 'efficiency_pairs': audit_efficiency_pairs, 'training_health': audit_training_health, 'selection': audit_selection, 'release': audit_release_readiness, 'run_order': audit_run_order, 'calibration': audit_statistical_calibration, 'stats_calibration': audit_statistical_calibration, 'type_i': audit_statistical_calibration, 'source': audit_source_integrity, 'source_tree': audit_source_integrity, 'dependencies': audit_dependencies, 'dependency': audit_dependencies, 'data_source': audit_data_source, 'dataset_source': audit_data_source, 'report': run_report}
+    _cmds = {'leakage': audit_leakage, 'split': audit_split_discipline, 'split_discipline': audit_split_discipline, 'document_unit': audit_document_unit, 'unit': audit_document_unit, 'sample_design': audit_sample_design, 'sampling': audit_sample_design, 'sample': audit_sample_design, 'causality': audit_causality, 'attribution': audit_attribution, 'boundary': audit_boundary, 'length': audit_length, 'fairness': audit_fairness, 'metrics': audit_metrics, 'tuning': audit_tuning, 'simple': audit_simple_baseline, 'baseline_floor': audit_simple_baseline, 'baseline_plan': audit_baseline_design, 'hypothesis_coverage': audit_hypothesis_coverage, 'hypotheses': audit_hypotheses, 'sesoi': audit_sesoi_declaration, 'baseline_sesoi': audit_baseline_sesoi, 'baseline_sesoi_declaration': audit_baseline_sesoi, 'interaction_sesoi': audit_interaction_sesoi, 'interaction': audit_interaction_sesoi, 'unit_influence': audit_unit_influence, 'influence': audit_unit_influence, 'analysis_choices': audit_analysis_choices, 'specification_curve': audit_analysis_choices, 'verdicts': audit_confirmation_verdicts, 'verdict': audit_confirmation_verdicts, 'three_way': audit_confirmation_verdicts, 'analysis_choice': audit_analysis_choices, 'looks': audit_look_history, 'look_history': audit_look_history, 'methodology': audit_methodology, 'single_factor': audit_single_factor, 'factorial': audit_factorial_design, 'factorial_design': audit_factorial_design, 'design': audit_design_preflight, 'design_preflight': audit_design_preflight, 'sensitivity': audit_design_sensitivity, 'design_sensitivity': audit_design_sensitivity, 'precision': audit_design_sensitivity, 'evaluation': audit_evaluation_design, 'evaluation_design': audit_evaluation_design, 'unit_precision': audit_evaluation_design, 'dose_response': audit_dose_response, 'dose_response_design': audit_dose_response, 'failures': audit_failures, 'budget': audit_budget, 'efficiency': audit_efficiency_demo, 'efficiency_pairs': audit_efficiency_pairs, 'training_health': audit_training_health, 'selection': audit_selection, 'release': audit_release_readiness, 'run_order': audit_run_order, 'error_case_inference': audit_error_case_inference, 'error_buckets': audit_error_case_inference, 'calibration': audit_statistical_calibration, 'stats_calibration': audit_statistical_calibration, 'type_i': audit_statistical_calibration, 'source': audit_source_integrity, 'source_tree': audit_source_integrity, 'dependencies': audit_dependencies, 'dependency': audit_dependencies, 'data_source': audit_data_source, 'dataset_source': audit_data_source, 'report': run_report}
     _arg = sys.argv[1] if len(sys.argv) > 1 else 'report'
     if _arg in ('-h', '--help'):
         print(__doc__)
