@@ -111,6 +111,16 @@ def t_min_consistency():
     # Scale-up: the planning math must not overflow int->float at large n.
     big = L.signflip_min_consistency(2000, 10, 0.05)
     assert big is not None and 0 < big < 2000, big
+    # The same applies to a huge comparison family: a 401-digit m must not
+    # turn into an OverflowError or an underflowed "p=0" pass.
+    huge_m = 10 ** 400
+    assert L.holm_min_attainable_p(12, huge_m, 0.05) == 1.0
+    assert L.signflip_min_consistency(12, huge_m, 0.05) is None
+    assert L.signflip_power(12, huge_m, 0.95, 0.05) == 0.0
+    assert L.signflip_min_n_for_holm(huge_m, 0.05, n_max=64) is None
+    assert L.signflip_min_n_for_holm(huge_m, 0.05, n_max=2000) == 1335
+    assert 0.0 < L.holm_min_attainable_p(1400, huge_m, 0.05) < 0.05
+    assert L.signflip_min_consistency(1400, huge_m, 0.05) == 1393
     # The planning alpha is a probability threshold, not a coerced float:
     # True->1.0 and a string could otherwise change the required seed count.
     for _bad_alpha in (True, 0, 1.0, 1.5, float('nan'), 'not-a-number'):
@@ -23349,6 +23359,26 @@ def t_attrition_power_audit_and_design_gate():
             'require_attrition_power'] is False, rep
         assert any('require_attrition_power' in v and 'must be a boolean' in v
                    for v in rep['violations']), rep['violations']
+
+        # A non-directional comparison never enters the per-comparison
+        # attrition audit.  The top-level gate must still reject a malformed
+        # pre-registered boolean instead of coercing "yes" to True.
+        manifest['statistics']['attrition'] = {'pair_retention': 1.0}
+        manifest['statistics']['require_complete_coverage'] = 'yes'
+        manifest['primary_comparisons'][0]['expected_sign'] = None
+        with open(mp, 'w', encoding='utf-8') as f:
+            json.dump(manifest, f)
+        with contextlib.redirect_stdout(io.StringIO()):
+            rep = A.audit_design_sensitivity(manifest_path=mp, pilot_path=pp)
+        assert rep['status'] == 'fail', rep
+        assert rep['attrition']['require_complete_coverage'] is False, rep['attrition']
+        assert any('require_complete_coverage' in v and 'must be a boolean' in v
+                   for v in rep['violations']), rep['violations']
+
+    huge = L.attrition_power_audit(
+        12, 10 ** 400, q=0.95, pair_retention=1.0)
+    assert huge['status'] == 'fail', huge
+    assert huge['family_floor'] is None, huge
 
     big = L.attrition_power_audit(
         1000, 6, q=0.95, pair_retention=1.0, n_max=8)

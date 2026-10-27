@@ -4278,13 +4278,20 @@ def audit_design_sensitivity(manifest_path=None,
         out['violations'].append(
             'statistics.attrition.require_attrition_power='
             f'{_attr_require_raw!r} must be a boolean')
+    _req_cov_raw = stat.get('require_complete_coverage', False)
+    if isinstance(_req_cov_raw, (bool, np.bool_)):
+        _req_cov = bool(_req_cov_raw)
+    else:
+        _req_cov = False
+        out['violations'].append(
+            'statistics.require_complete_coverage='
+            f'{_req_cov_raw!r} must be a boolean')
     out['attrition'] = {
         'declared': bool(_attr_cfg),
         'pair_retention': _attr_cfg.get('pair_retention'),
         'require_attrition_power': _attr_require,
         'availability_target': _attr_cfg.get('availability_target'),
-        'require_complete_coverage': bool(
-            stat.get('require_complete_coverage')),
+        'require_complete_coverage': _req_cov,
         'note': ('pair_retention is a planning stress test, not an observed '
                  'attrition rate; missing the declaration is a warning unless '
                  'require_attrition_power is true'),

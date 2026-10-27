@@ -15313,7 +15313,22 @@ def holm_min_attainable_p(n_seeds, m_comparisons, alpha=0.05):
     m = _as_seed_int(m_comparisons)
     if n is None or m is None or n <= 0 or m <= 0:
         return float('nan')
-    return min(1.0, m * signflip_p_floor(n))
+    floor = signflip_p_floor(n)
+    if floor > 0.0:
+        try:
+            return min(1.0, m * floor)
+        except OverflowError:
+            return 1.0
+    # 2**-n underflowed.  A large enough family can still have
+    # m * 2**-n above alpha (or even above 1), so do not report 0.
+    if n.bit_length() > 1024:
+        return 0.0
+    log_p = math.log(m) + math.log(2.0) - n * math.log(2.0)
+    if log_p >= 0.0:
+        return 1.0
+    if log_p < -745.0:
+        return 0.0
+    return math.exp(log_p)
 
 
 def holm_min_attainable_p_floors(p_floors, alpha=0.05):
@@ -15357,12 +15372,18 @@ def signflip_min_n_for_holm(m_comparisons, alpha=0.05, n_max=64):
     m = _as_seed_int(m_comparisons)
     n_max = _as_seed_int(n_max)
     a = _validated_alpha(alpha, context='signflip_min_n_for_holm alpha')
-    if m is None or n_max is None or m <= 0:
+    if m is None or n_max is None or m <= 0 or n_max < 1:
         return None
-    for n in range(1, n_max + 1):
-        if holm_min_attainable_p(n, m, a) <= a + 1e-15:
-            return n
-    return None
+    if holm_min_attainable_p(n_max, m, a) > a + 1e-15:
+        return None
+    lo, hi = 1, n_max
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if holm_min_attainable_p(mid, m, a) <= a + 1e-15:
+            hi = mid
+        else:
+            lo = mid + 1
+    return lo
 
 
 def global_multiplicity_audit(named_pvals, *, alpha=0.05,
@@ -15544,6 +15565,53 @@ def _binom_cdf_half(n, m):
     return float(min(1.0, math.exp(mx) * math.fsum(math.exp(x - mx) for x in logs)))
 
 
+def _log_binom_cdf_half(n, m):
+    """log P(Bin(n, 1/2) <= m), without underflowing to -inf.
+
+    ``_binom_cdf_half`` is float-valued: for a very small lower tail it
+    returns 0.0, which loses the information a large family size needs in
+    order to decide whether ``m * 2 * cdf`` clears alpha.  This helper keeps
+    the log probability for the tail sizes where that distinction matters.
+    """
+    n = _as_seed_int(n)
+    m = _as_seed_int(m)
+    if n is None or m is None or n <= 0:
+        return 0.0 if (m is not None and m >= 0) else float('-inf')
+    if m < 0:
+        return float('-inf')
+    if m >= n:
+        return 0.0
+    if m * 2 >= n:
+        log_upper = _log_binom_cdf_half(n, n - m - 1)
+        if not math.isfinite(log_upper) or log_upper < -745.0:
+            return 0.0
+        return float(math.log1p(-math.exp(log_upper)))
+    # Beyond the float exponent range even log2(n) is not representable, but
+    # the true log-CDF is then far below any family size expressible here.
+    if n.bit_length() > 1024:
+        return float('-inf')
+    log2n = n * math.log(2.0)
+    if m <= 20000:
+        logs = []
+        log_term = -log2n
+        for j in range(m + 1):
+            if j:
+                log_term += math.log(n - j + 1) - math.log(j)
+            logs.append(log_term)
+        mx = max(logs)
+        return float(mx + math.log(math.fsum(math.exp(x - mx) for x in logs)))
+    # The tail is dominated by its largest term; sum the geometric correction
+    # downward instead of iterating over m (which can be huge at scale).
+    log_term = (math.lgamma(n + 1.0) - math.lgamma(m + 1.0)
+                - math.lgamma(n - m + 1.0) - log2n)
+    if not math.isfinite(log_term):
+        return float('-inf')
+    r = m / (n - m + 1.0)
+    if r >= 1.0:
+        return float(log_term)
+    return float(log_term + math.log1p(r / (1.0 - r)))
+
+
 def signflip_min_consistency(n_seeds, m_comparisons, alpha=0.05):
     """规划用：通过 Holm 第一道门所需的最小同向种子数 k_min。
 
@@ -15560,7 +15628,16 @@ def signflip_min_consistency(n_seeds, m_comparisons, alpha=0.05):
     if n is None or m is None or n <= 0 or m <= 0:
         return None
     def passes(k):
-        return m * 2.0 * _binom_cdf_half(n, n - k) <= alpha + 1e-15
+        cdf = _binom_cdf_half(n, n - k)
+        if cdf > 0.0:
+            try:
+                return m * 2.0 * cdf <= alpha + 1e-15
+            except OverflowError:
+                log_lhs = math.log(m) + math.log(2.0) + math.log(cdf)
+        else:
+            log_lhs = (math.log(m) + math.log(2.0)
+                       + _log_binom_cdf_half(n, n - k))
+        return log_lhs <= math.log(alpha) + 1e-15
 
     if not passes(n):
         return None
