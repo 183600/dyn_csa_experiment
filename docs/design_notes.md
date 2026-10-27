@@ -4570,10 +4570,12 @@ SESOI 处功效不足都判 fail；默认 false 时只给 warning，并把
 - **没有 SESOI 就没有实际显著性结论。** 当前主对照仍只能报告统计方向与
   区间；`sensitivity` 的 warning 是把 §49.4 的边界显式化，而不是新增一个
   任意阈值。
-- **n 是计划种子数，不是 attrition 后的样本量。** 所需 n 搜索假设 pilot
-  q/SD 固定，且不建模记录缺失、seed 崩溃或 `min_complete_pairs` 低于计划
-  seeds 的情形；把这些损失纳入后，真实 MDE 只会更宽。需要保守设计时，应
-  用可完成配对数而不是名义 seed 数重跑本函数。
+- **n 是计划种子数，不是 attrition 后的样本量。** 本函数不建模记录缺失、
+  seed 崩溃或 `min_complete_pairs` 低于计划 seeds 的情形；这些损失使真实
+  MDE 更宽，且当 `require_complete_coverage=true` 时还会直接阻止确认。
+  这一边界由 §74 的 `attrition_power_audit` 单独处理：它把独立配对保留率
+  与完整覆盖规则结合，报告「可运行概率」和「可确认拒绝的联合概率」。不要
+  用本函数的名义 n 代替 attrition-adjusted power。
 - **n_max 是搜索上限。** 若在 `n_max` 内达不到目标功效，所需 n 返回
   `None`；这表示当前设计参数下不可行，不是“需要更多种子”的自动许可。
 
@@ -5086,3 +5088,117 @@ L211 覆盖：整行切分的确定性/不重叠、discovery 选桶、replicatio
 `not_verifiable`、辅助家族缺输入时记录原因，以及 EA/BR Markdown 的
 `replicated` 与边界文案。完整 CPU 套件 `563/563` 通过（0 skipped）。
 `v12_supp.py plan` 的冻结计划/比较数不受影响。
+
+
+## 74. 设计期功效必须把「分析能否运行」算进去：attrition-adjusted power
+
+### 74.1 问题：条件功效不是确认成功概率
+
+§68 的 `paired_design_sensitivity`、`v12_supp.py power` 与冻结功效门都
+**条件在完整面板上**：它们假设计划的所有种子都进入比较。当前清单又声明
+`require_complete_coverage=true`，因此只要缺失一个配对，该比较就不能被
+确认，而不是用剩下的 k 个配对做「小 n 确认」。§68.4 已把这一点记为边界，
+但没有给出可执行读数。
+
+假设每个计划配对以概率 p 独立可完成，K ~ Binomial(n, p)。在完整覆盖规则
+下，分析可运行当且仅当 K=n，所以
+
+```
+P(可确认的拒绝) = P(K=n) * signflip_power(n, m, q, alpha)
+```
+
+而不是 `signflip_power(n, m, q, alpha)`。以当前 n=12、m=6、q=0.95 为例，
+条件功效是 0.882；若 p=0.95，`P(K=12)=0.95^12=0.540`，联合概率只有
+0.476。此时即使名义 n 再大，80% 目标也不可达：n 增大提高条件功效，但
+`p^n` 同时衰减；在 p=0.95 的完整覆盖规则下，扫描到 n=512 的最大联合功效
+仍只有 0.476。这是「分析能否运行」的瓶颈，不是「种子是否够多」。
+
+### 74.2 方法：把覆盖率规则和损失模型分开
+
+新增 `exp_lib.attrition_power_audit(n, m, q=..., pair_retention=...)`：
+
+1. **可运行阈值。** 完整覆盖时阈值为 n；否则为
+   `max(Holm 分辨率下限, min_complete_pairs)`。低于 Holm 下限的
+   `min_complete_pairs` 不会降低门槛，只产生 warning。
+2. **条件功效。** 对每个 k，沿用 §68 的
+   `signflip_power(k, m, q, alpha)`。它是等幅符号检验投影；`|d_i|` 不等时
+   只是设计期近似。
+3. **可运行概率。** `P(K >= 阈值)`，用稳定的二项上尾计算。
+4. **联合功效。** `Σ_{k>=阈值} P(K=k) * signflip_power(k,m,q,alpha)`；
+   完整覆盖时只剩 k=n 一项，即 `p^n * power(n)`。
+5. **目标保留率。** 在固定 n 下二分搜索满足目标联合功效（以及可选的
+   `availability_target`）的最小 p；若即使 p=1 也达不到目标，返回
+   `None`，并把原因标为 `power`。
+6. **所需名义 n。** 在 `[2, n_max]` 内扫描满足目标的最小名义种子数；
+   完整覆盖下联合功效可能非单调，所以必须扫描而不是二分。
+7. **保留率压力表。** 默认报告 p=1.00/0.99/0.97/0.95/0.90 下的可运行
+   概率、联合功效和功效损失，避免只报一个点估计。
+
+`pair_retention` 必须由调用方或清单显式声明；函数不会从 test 结果、历史
+失败率或结果好坏反推 p。未声明时状态是 `not_declared`，仍然输出压力表
+和达到目标所需的最低 p，但不会给出通过判定。
+
+### 74.3 接线
+
+- `v12_supp.py power` 的每个方向性对照新增 `attrition` 块：
+  `q` 优先取 validation 的 `pilot.q_sign_rate`，缺失时退回清单声明的
+  `statistics.power_q_for_test`；`pair_retention`/`availability_target`
+  来自可选的 `statistics.attrition`。原有 q=0.95 精确条件功效门不变。
+  只有 `require_attrition_power=true` 或参数非法时，attrition 块才会把
+  `all_pass` 置 false。
+- `audit_gates.py sensitivity` 在每条主对照的 `rep['attrition']` 中加入
+  同一结构，并在顶层汇总 `out['attrition']`；缺失声明是 warning，
+  `require_attrition_power=true` 时才是 violation。
+- `audit_gates.py report` 的 `sensitivity` 块因此自动携带 attrition 读数，
+  不需要新增 CLI；旧清单没有 `statistics.attrition` 时行为保持兼容。
+- 冻结清单当前没有声明 `pair_retention`，所以现阶段只展示压力表并明确
+  warning，不把缺失当成通过。未来若要打开门，应在首次 test 访问前声明：
+
+```json
+"statistics": {
+  "attrition": {
+    "pair_retention": 0.99,
+    "availability_target": 0.95,
+    "require_attrition_power": true
+  }
+}
+```
+
+### 74.4 边界
+
+- **p 是设计假设，不是观测到的 attrition。** 独立同分布是最乐观情形；
+  同一机器/同一周/健康门导致的成组失败、以及和效应相关的丢失（例如某臂
+  崩溃）都会使真实联合功效更低。完整覆盖下的 `p^n` 应读作可运行概率的
+  上界，不是保证。
+- **条件功效仍是符号检验投影。** 这里只把 §68 的条件功效按 K 的分布
+  混合；没有把 `|d_i|` 的不等幅、非正态或种子间相关变成精确 sign-flip
+  计算。`attrition_power_audit` 也不替代 `v12_supp.py power` 的精确条件
+  功效表。
+- **完整覆盖不能靠补种子救回部分面板。** 若规则是
+  `require_complete_coverage=true`，缺失配对对应的比较就是 unconfirmed；
+  提高名义 n 只会改变未来计划的成功率，不会把已发生的缺失变成随机可忽略
+  损失。
+- **最低保留率不是事后挑选的阈值。** `min_pair_retention_for_target` 是
+  设计诊断：它说明在给定覆盖规则和条件功效下需要多高的配对完成率。不能
+  看到 test 结果后再挑一个 p 来解释。
+- **不改冻结决定。** 本函数不读取 test split、不改变 PPL/种子/终点/α/
+  Holm/覆盖规则，也不改 `CODE_SEMANTICS`；它只把「名义 n 的功效」和
+  「实际可运行分析的联合功效」分开报告。
+
+### 74.5 入口与验证
+
+```bash
+python audit_gates.py sensitivity   # 每条对照含 attrition 压力表
+python audit_gates.py report        # sensitivity 块自动携带
+python v12_supp.py power            # 预测试功效产物含 attrition 块
+python test_review_fixes.py         # L212 + 既有回归
+python v12_supp.py plan             # 冻结计划预检不变
+```
+
+L212 覆盖：完整覆盖下 `p^n * power(n)`、5% 损失时条件 0.882 → 联合
+0.476、8 配对下限与完整覆盖的不同失败模式、所需名义 n=13、最低保留率
+约 0.992、低于 Holm 下限的 `min_complete_pairs` warning、未声明 retention
+时的 `not_declared`、`require_attrition_power` 的 fail-closed、非法输入，
+以及 audit 清单声明/缺失/满足三态。完整 CPU 套件 `564/564` 通过
+（0 skipped）；`python v12_supp.py plan` 的 72/72 合成冻结记录、6 个比较
+不受影响。

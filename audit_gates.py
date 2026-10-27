@@ -4242,7 +4242,13 @@ def audit_design_sensitivity(manifest_path=None,
     fabricated pass: the audit never invents an effect size.  A declared SESOI
     that the planned n cannot resolve fails only when the manifest sets
     ``require_sesoi_power``; otherwise the underpowered margin is named and
-    kept visible.  This reads no test split and changes no frozen decision.
+    kept visible.  Each directional cell also carries
+    ``attrition_power_audit``: with ``require_complete_coverage`` a missing
+    pair blocks confirmation, so the conditional power is multiplied by the
+    probability that the full panel actually completes.  A declared
+    ``statistics.attrition.pair_retention`` gates that block only when
+    ``require_attrition_power`` is true; otherwise it is a named warning and
+    stress table.  This reads no test split and changes no frozen decision.
     """
     L = _import_exp_lib()
     mp = manifest_path or os.path.join(REPO, 'confirmation_frozen.json')
@@ -4262,6 +4268,24 @@ def audit_design_sensitivity(manifest_path=None,
         return out
     stat = manifest.get('statistics') if isinstance(
         manifest.get('statistics'), dict) else {}
+    _attr_cfg = (stat.get('attrition')
+                 if isinstance(stat.get('attrition'), dict) else {})
+    out['attrition'] = {
+        'declared': bool(_attr_cfg),
+        'pair_retention': _attr_cfg.get('pair_retention'),
+        'require_attrition_power': bool(
+            _attr_cfg.get('require_attrition_power', False)),
+        'availability_target': _attr_cfg.get('availability_target'),
+        'require_complete_coverage': bool(
+            stat.get('require_complete_coverage')),
+        'note': ('pair_retention is a planning stress test, not an observed '
+                 'attrition rate; missing the declaration is a warning unless '
+                 'require_attrition_power is true'),
+    }
+    if not _attr_cfg:
+        out['warnings'].append(
+            'the frozen manifest declares no statistics.attrition.pair_retention; '
+            'the attrition table below is a stress test, not a pass')
     seeds = manifest.get('seeds')
     comps = manifest.get('primary_comparisons')
     n = len(seeds) if isinstance(seeds, list) else None
@@ -4340,6 +4364,40 @@ def audit_design_sensitivity(manifest_path=None,
             target_power=out['target_power'], pilot_deltas=deltas,
             expected_sign=comp.get('expected_sign'), sesoi=sesoi,
             require_sesoi_power=require_sesoi)
+        _dir = str(comp.get('expected_sign') or '').lower()
+        _q_attr = (rep.get('pilot') or {}).get('q_sign_rate')
+        _q_source = 'pilot_sign_rate'
+        if _q_attr is None:
+            _q_attr = stat.get('power_q_for_test')
+            _q_source = 'statistics.power_q_for_test'
+        if _dir in ('positive', 'negative') and _q_attr is not None:
+            rep['attrition'] = L.attrition_power_audit(
+                n, m or 0, q=_q_attr,
+                pair_retention=_attr_cfg.get('pair_retention'),
+                alpha=out['alpha'], target_power=out['target_power'],
+                require_complete_coverage=stat.get(
+                    'require_complete_coverage', False),
+                min_complete_pairs=stat.get('min_seeds_for_confirmation'),
+                availability_target=_attr_cfg.get('availability_target'),
+                require_attrition_power=_attr_cfg.get(
+                    'require_attrition_power', False))
+            rep['attrition']['q_source'] = _q_source
+            rep['attrition']['require_attrition_power'] = bool(
+                _attr_cfg.get('require_attrition_power', False))
+            out['violations'].extend(
+                f'{name}: {v}'
+                for v in (rep['attrition'].get('violations') or []))
+            out['warnings'].extend(
+                f'{name}: {w}'
+                for w in (rep['attrition'].get('warnings') or []))
+            if rep['attrition'].get('status') == 'fail':
+                out['status'] = 'fail'
+        else:
+            rep['attrition'] = {
+                'status': 'not_applicable',
+                'reason': ('a directional q is required for a sign-flip '
+                           'attrition projection'),
+            }
         out['comparisons'][name] = rep
         out['violations'].extend(
             f'{name}: {v}' for v in (rep.get('violations') or []))

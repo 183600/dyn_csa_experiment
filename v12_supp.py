@@ -4205,8 +4205,11 @@ def run_power(manifest_path=FREEZE_MANIFEST, summary='results_v10_mech/summary.j
     in the reject region at the pre-registered direction probability q?  A
     plan whose power at `statistics.power_q_for_test` is below
     `statistics.min_power_for_test` must add seeds and record a revision
-    *before* P5T (V12_ALLOW_LOW_POWER=1 is the explicit override).  Reads only
-    the validation summary; never calls load_wikitest.
+    *before* P5T (V12_ALLOW_LOW_POWER=1 is the explicit override).  Each
+    directional cell also carries an attrition stress table: under the frozen
+    coverage rule, a missing pair can make the comparison unconfirmed even
+    when the conditional power is adequate.  Reads only the validation
+    summary; never calls load_wikitest.
     """
     manifest = _load_manifest(manifest_path)
     if not os.path.exists(summary):
@@ -4234,6 +4237,8 @@ def run_power(manifest_path=FREEZE_MANIFEST, summary='results_v10_mech/summary.j
     if _min_units is None:
         _min_units = stat.get(
             'min_units_for_population', L.MIN_DOCS_FOR_POPULATION_CLAIM)
+    _attr_cfg = (stat.get('attrition')
+                 if isinstance(stat.get('attrition'), dict) else {})
     report = {'kind': 'power_validation', 'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
               'manifest': manifest_path, 'manifest_sha256': manifest.get('manifest_sha256'),
               'summary': summary, 'alpha': alpha, 'm_family': m_family,
@@ -4294,6 +4299,31 @@ def run_power(manifest_path=FREEZE_MANIFEST, summary='results_v10_mech/summary.j
         cell['sensitivity'] = _sens
         if _sens.get('status') == 'fail':
             all_pass = False
+        if exp in ('positive', 'negative'):
+            _q_attr = (_sens.get('pilot') or {}).get('q_sign_rate')
+            _q_source = 'pilot_sign_rate'
+            if _q_attr is None:
+                _q_attr = power_q
+                _q_source = 'statistics.power_q_for_test'
+            cell['attrition'] = L.attrition_power_audit(
+                len(manifest['seeds']), m_family, q=_q_attr,
+                pair_retention=_attr_cfg.get('pair_retention'),
+                alpha=alpha, target_power=min_power,
+                require_complete_coverage=stat.get(
+                    'require_complete_coverage', False),
+                min_complete_pairs=stat.get('min_seeds_for_confirmation'),
+                availability_target=_attr_cfg.get('availability_target'),
+                require_attrition_power=_attr_cfg.get(
+                    'require_attrition_power', False))
+            cell['attrition']['q_source'] = _q_source
+            if cell['attrition'].get('status') == 'fail':
+                all_pass = False
+        else:
+            cell['attrition'] = {
+                'status': 'not_applicable',
+                'reason': ('a directional q is required for a sign-flip '
+                           'attrition projection'),
+            }
         _unit_pairs = [(s, _by_len_cell(recs_a.get(s), Ln),
                         _by_len_cell(recs_b.get(s), Ln)) for s in used]
         _unit_pairs = [(c_a, c_b) for _s, c_a, c_b in _unit_pairs
@@ -4382,6 +4412,13 @@ def run_power(manifest_path=FREEZE_MANIFEST, summary='results_v10_mech/summary.j
         _pw = ((_v.get('power') or {}).get('power') or {}).get(f'q={power_q:.2f}')
         print(f'  [p5pw] {_k}: n={_v.get("n")} power={_pw if _pw is not None else "n/a"} '
               f'ok={_v.get("power_ok")}')
+        _attr = _v.get('attrition') or {}
+        if _attr.get('status') not in (None, 'not_applicable'):
+            _min_p = _attr.get('min_pair_retention_for_target')
+            print(f'  [p5pw] {_k}: attrition={_attr.get("status")} '
+                  f'runnable={_attr.get("probability_runnable")} '
+                  f'joint={_attr.get("unconditional_power")} '
+                  f'min_pair_retention={_min_p if _min_p is not None else "n/a"}')
     allow = os.environ.get('V12_ALLOW_LOW_POWER', '').strip().lower() in ('1', 'true', 'yes', 'on')
     if require and not all_pass and not allow:
         raise SystemExit(f'[p5pw] REFUSE: the pre-test power calibration is below {min_power:.2f} at q={power_q:.2f}; '

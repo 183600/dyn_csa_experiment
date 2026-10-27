@@ -2997,3 +2997,42 @@ fail-closed、artifact 重放通过/篡改 `fail`/缺文件 `not_verifiable`、
 文案。`python audit_gates.py error_case_inference` 对合成 artifact 返回
 `ok`、篡改后 `fail`；缺文件返回 `not_verifiable`。`python v12_supp.py
 plan` 的冻结计划/比较数不受影响。
+
+## 2026-10-27 — 设计期功效把「分析能否运行」纳入：attrition-adjusted power（no new runs）
+
+零 GPU 的设计期方法学硬化；不新增训练、不读取 test split、不修改冻结清单
+的字节/种子/终点/alpha/Holm/覆盖规则，也不改 `CODE_SEMANTICS`。
+
+**Problem.** §68 的 `paired_design_sensitivity`、`v12_supp.py power` 与冻结
+功效门都条件在完整面板上。当前清单声明 `require_complete_coverage=true`，
+缺失一个配对就使该比较 unconfirmed，而不是用剩下的 k 个配对做小 n 确认；
+但已有读数仍报 `signflip_power(n,m,q,alpha)`，没有报「可运行且拒绝」的联合
+概率。n=12、m=6、q=0.95 的条件功效是 0.882；若配对完成率 p=0.95，完整覆盖
+的可运行概率只有 `0.95^12=0.540`，联合功效降到 0.476，且任何名义 n 都无法
+在 p=0.95 下达到 80%（n 增大提高条件功效，但 `p^n` 同时衰减）。
+
+**Fix.** 新增 `exp_lib.attrition_power_audit()`：K ~ Binomial(n,p)，完整覆盖
+时阈值 τ=n，否则 τ=max(Holm 下限, min_complete_pairs)；报告可运行概率
+`P(K>=τ)`、联合功效 `Σ_{k>=τ} P(K=k)*signflip_power(k,m,q,alpha)`、期望完成
+配对数、达到目标所需最低 p、所需名义 n，以及 p=1.00/0.99/0.97/0.95/0.90 的
+压力表。`pair_retention` 必须显式声明；缺失时为 `not_declared`，不伪造通过；
+`require_attrition_power=true` 时才 fail-closed。`v12_supp.py power` 的每条
+方向性对照新增 `attrition` 块（q 优先取 pilot sign rate，缺失时退回
+`power_q_for_test`）；`audit_gates.audit_design_sensitivity()` 在每条对照和
+顶层汇总中接入，并支持可选的 `statistics.attrition.pair_retention` /
+`availability_target` / `require_attrition_power`。原有 q=0.95 精确条件功效
+门不变。
+
+**Boundary.** p 是设计假设，不是观测 attrition；独立同分布是最乐观情形，
+成组失败或与效应相关的丢失会更差。条件功效仍是等幅符号检验投影，不把
+|d_i| 不等幅或种子间相关变成精确 sign-flip。完整覆盖下的 `p^n` 是可运行
+概率的上界，补名义种子不能把已发生的缺失变成随机可忽略损失；最低保留率
+也必须在看 test 前固定，不能事后挑选。
+
+**Verification.** `python test_review_fixes.py` 通过 `564/564`（0 skipped，
+新增 L212）：完整覆盖联合功效、5% 损失 0.882→0.476、8 配对下限与完整覆盖
+的不同失败模式、所需名义 n=13、最低保留率约 0.992、低于 Holm 下限的 warning、
+未声明/要求声明/满足三态、非法输入，以及 audit 清单三态。`python
+v12_supp.py plan` 仍 72/72 合成冻结记录、6 个比较；`python audit_gates.py
+report` 的 `sensitivity` 块已输出 attrition 压力表，当前清单未声明 retention，
+因此保持 warning 而非绿色通过。

@@ -20435,6 +20435,382 @@ def paired_design_sensitivity(n_seeds, m_comparisons, *, alpha=0.05,
     return out
 
 
+def _attrition_probability_runnable(n_seeds, pair_retention, threshold):
+    """P(K >= threshold) for K ~ Binomial(n_seeds, pair_retention)."""
+    if threshold is None or threshold > n_seeds:
+        return 0.0
+    if pair_retention >= 1.0:
+        return 1.0
+    if pair_retention <= 0.0:
+        return 0.0
+    return float(_binomial_sf_stable(int(threshold), int(n_seeds),
+                                     float(pair_retention)))
+
+
+def _attrition_joint_power(n_seeds, pair_retention, threshold,
+                           power_by_k, log_factorials):
+    """P(reject AND analysis runnable) under independent pair retention.
+
+    ``power_by_k`` is the conditional sign-flip power at k complete pairs.
+    The joint event requires K >= threshold and, conditional on K, a
+    rejection in the pre-registered direction.
+    """
+    if threshold is None or threshold > n_seeds:
+        return 0.0
+    if pair_retention <= 0.0:
+        return 0.0
+    if pair_retention >= 1.0:
+        return float(power_by_k[n_seeds])
+    logp = math.log(pair_retention)
+    log1p = math.log1p(-pair_retention)
+    lf = log_factorials
+    terms = []
+    for k in range(max(0, int(threshold)), n_seeds + 1):
+        if power_by_k[k] <= 0.0:
+            continue
+        log_pmf = (lf[n_seeds] - lf[k] - lf[n_seeds - k]
+                   + k * logp + (n_seeds - k) * log1p)
+        if log_pmf > -745.0:
+            terms.append(math.exp(log_pmf) * power_by_k[k])
+    return float(min(1.0, max(0.0, math.fsum(terms))))
+
+
+def attrition_power_audit(n_seeds, m_comparisons, *, q,
+                          pair_retention=None, alpha=0.05,
+                          target_power=0.80,
+                          require_complete_coverage=True,
+                          min_complete_pairs=None,
+                          availability_target=None,
+                          require_attrition_power=False,
+                          n_max=512,
+                          retention_scenarios=(1.0, 0.99, 0.97, 0.95, 0.90)):
+    """Design-stage power after pair loss, not power on a perfect panel.
+
+    ``paired_design_sensitivity`` and the pre-test power gate condition on
+    every planned pair entering the analysis.  A confirmation rule with
+    ``require_complete_coverage=true`` is all-or-nothing: one missing pair
+    makes the comparison unconfirmed even if the remaining pairs would reject.
+    The probability of a confirmable result is therefore
+
+        P(reject AND runnable) = E[ 1(K >= threshold) * power(K) ],
+
+    where K ~ Binomial(n_seeds, pair_retention).  This audit reports that
+    joint probability, the chance the analysis is runnable at all, the
+    retention needed to reach the target, and a retention stress-test table.
+    It does not infer attrition from the test split and never changes a
+    frozen decision rule.
+
+    ``pair_retention`` is a planning assumption, not a measured quantity.
+    Independent losses are the optimistic case; failures driven by the same
+    machine/week/health gate are correlated, and losses associated with the
+    effect (for example a crashing arm) violate the exchangeability the
+    conditional power projection already assumes.  A complete-coverage plan
+    cannot replace a missing seed with a smaller-n confirmation; treating
+    ``p**n`` as the runnable probability is the best case.
+    """
+    out = {
+        'kind': 'attrition_power_audit', 'status': 'ok',
+        'n_seeds': None, 'm_family': None, 'alpha': None, 'q': None,
+        'target_power': None, 'pair_retention': None,
+        'require_complete_coverage': None, 'min_complete_pairs': None,
+        'runnable_at': None, 'family_floor': None,
+        'expected_complete_pairs': None,
+        'conditional_power': None, 'probability_runnable': None,
+        'probability_at_least_family_floor': None,
+        'unconditional_power': None, 'power_loss': None,
+        'power_loss_relative': None, 'target_met': None,
+        'coverage_bottleneck': None,
+        'required_nominal_seeds': None,
+        'max_unconditional_power': None,
+        'n_at_max_unconditional_power': None,
+        'min_pair_retention_for_target': None,
+        'failure_reason': None, 'scenarios': [],
+        'violations': [], 'warnings': [],
+        'policy': {
+            'loss_model': ('independent Bernoulli pair retention; correlated '
+                           'or effect-related loss is worse than reported'),
+            'conditional_power': ('equal-magnitude symbol-test projection '
+                                  'signflip_power(k, m, q, alpha); a design '
+                                  'aid, not the exact power for unequal |d_i|'),
+            'complete_coverage': ('runnable iff all planned pairs complete; '
+                                  'unconditional power = P(K=n) * power(n)'),
+            'min_complete_pairs': ('when complete coverage is off, runnable '
+                                   'iff K >= max(Holm floor, min_complete_pairs)'),
+            'retention_rule': ('pair_retention must be declared or supplied; '
+                               'the audit does not estimate it from outcome data'),
+        },
+    }
+    n = _design_int(n_seeds)
+    m = _design_int(m_comparisons)
+    n_max_i = _design_int(n_max)
+    if n is None or n < 2:
+        out['violations'].append(f'n_seeds={n_seeds!r} must be an integer >= 2')
+        n = None
+    if m is None or m < 1:
+        out['violations'].append(
+            f'm_comparisons={m_comparisons!r} must be a positive integer')
+        m = None
+    if n_max_i is None or n_max_i < 2 or n_max_i > 10000:
+        out['violations'].append(
+            f'n_max={n_max!r} must be an integer in [2, 10000]')
+        n_max_i = 512
+    a = _design_probability(alpha, name='alpha', lo_open=True, hi_open=True)
+    if a is None:
+        out['violations'].append(
+            f'alpha={alpha!r} must be a finite probability in (0,1)')
+    tp = _design_probability(target_power, name='target_power',
+                             lo_open=True, hi_open=True)
+    if tp is None:
+        out['violations'].append(
+            f'target_power={target_power!r} must be a finite probability in (0,1)')
+    qv = _design_probability(q, name='q')
+    if qv is None:
+        out['violations'].append(
+            f'q={q!r} must be a finite probability in [0,1]')
+    if not isinstance(require_complete_coverage, (bool, np.bool_)):
+        out['violations'].append(
+            f'require_complete_coverage={require_complete_coverage!r} must be a boolean')
+        require_complete_coverage = True
+    require_cov = bool(require_complete_coverage)
+    if not isinstance(require_attrition_power, (bool, np.bool_)):
+        out['violations'].append(
+            f'require_attrition_power={require_attrition_power!r} must be a boolean')
+        require_attrition_power = False
+    require_attr = bool(require_attrition_power)
+    min_pairs = None
+    if min_complete_pairs is not None:
+        min_pairs = _design_int(min_complete_pairs)
+        if min_pairs is None or min_pairs < 0:
+            out['violations'].append(
+                f'min_complete_pairs={min_complete_pairs!r} must be a '
+                'non-negative integer')
+            min_pairs = None
+    p = None
+    if pair_retention is not None:
+        p = _design_probability(pair_retention, name='pair_retention')
+        if p is None:
+            out['violations'].append(
+                f'pair_retention={pair_retention!r} must be a finite '
+                'probability in [0,1]')
+    avail_t = None
+    if availability_target is not None:
+        avail_t = _design_probability(availability_target,
+                                      name='availability_target',
+                                      lo_open=True)
+        if avail_t is None:
+            out['violations'].append(
+                f'availability_target={availability_target!r} must be a '
+                'finite probability in (0,1]')
+    out['n_seeds'], out['m_family'] = n, m
+    out['alpha'], out['target_power'] = a, tp
+    out['q'], out['pair_retention'] = qv, p
+    out['require_complete_coverage'] = require_cov
+    out['min_complete_pairs'] = min_pairs
+    out['availability_target'] = avail_t
+    out['require_attrition_power'] = require_attr
+    search_max = max(n or 2, n_max_i)
+    out['n_max'] = search_max
+    if (not require_cov and min_pairs is not None and n is not None
+            and min_pairs > n):
+        out['warnings'].append(
+            f'min_complete_pairs={min_pairs} exceeds the planned n={n}; '
+            'the current panel cannot satisfy its own floor')
+    if not require_cov and min_pairs is not None and min_pairs > search_max:
+        out['warnings'].append(
+            f'min_complete_pairs={min_pairs} exceeds the search cap '
+            f'n_max={search_max}; runnable is impossible within this scan')
+    if n is None or m is None or a is None or qv is None or tp is None:
+        if out['violations']:
+            out['status'] = 'fail'
+        return out
+    family_floor = signflip_min_n_for_holm(m, a, n_max=search_max)
+    out['family_floor'] = family_floor
+    if family_floor is None:
+        out['violations'].append(
+            f'no n <= {search_max} reaches the Holm floor for m={m} at '
+            f'alpha={a}; the family is resolution-limited')
+
+    def _runnable_threshold(nn):
+        if require_cov:
+            return nn
+        if family_floor is None:
+            return None
+        return max(family_floor, min_pairs or 0)
+
+    runnable_at = _runnable_threshold(n)
+    out['runnable_at'] = runnable_at
+    if (not require_cov and family_floor is not None and min_pairs is not None
+            and min_pairs < family_floor):
+        out['warnings'].append(
+            f'min_complete_pairs={min_pairs} is below the Holm resolution '
+            f'floor {family_floor}; the floor governs runnability')
+    power_by_k = [0.0] * (search_max + 1)
+    for k in range(2, search_max + 1):
+        power_by_k[k] = float(signflip_power(k, m, qv, a))
+    log_factorials = [math.lgamma(i + 1.0) for i in range(search_max + 1)]
+
+    def _joint(nn, pp, threshold):
+        return _attrition_joint_power(
+            int(nn), float(pp), threshold, power_by_k, log_factorials)
+
+    def _avail(nn, pp, threshold):
+        return _attrition_probability_runnable(int(nn), float(pp), threshold)
+
+    conditional = float(power_by_k[n])
+    out['conditional_power'] = conditional
+    if p is not None:
+        out['expected_complete_pairs'] = float(n * p)
+        out['probability_runnable'] = _avail(n, p, runnable_at)
+        if family_floor is not None:
+            out['probability_at_least_family_floor'] = _avail(
+                n, p, family_floor)
+        out['unconditional_power'] = _joint(n, p, runnable_at)
+        out['power_loss'] = float(conditional - out['unconditional_power'])
+        out['power_loss_relative'] = (
+            float(out['power_loss'] / conditional) if conditional > 0.0 else None)
+        out['target_met'] = bool(
+            out['unconditional_power'] + 1e-15 >= tp
+            and (avail_t is None
+                 or out['probability_runnable'] + 1e-15 >= avail_t))
+        out['coverage_bottleneck'] = bool(
+            conditional + 1e-15 >= tp
+            and out['unconditional_power'] + 1e-15 < tp)
+    if conditional + 1e-15 >= tp:
+        def _retention_ok(pp):
+            if _joint(n, pp, runnable_at) + 1e-15 < tp:
+                return False
+            if (avail_t is not None
+                    and _avail(n, pp, runnable_at) + 1e-15 < avail_t):
+                return False
+            return True
+        if _retention_ok(1.0):
+            lo, hi = 0.0, 1.0
+            for _ in range(80):
+                mid = 0.5 * (lo + hi)
+                if _retention_ok(mid):
+                    hi = mid
+                else:
+                    lo = mid
+            out['min_pair_retention_for_target'] = float(hi)
+    scenarios = []
+    if retention_scenarios is not None:
+        if isinstance(retention_scenarios, (str, bytes)):
+            out['violations'].append(
+                'retention_scenarios must be an iterable of probabilities')
+        else:
+            try:
+                scenarios = list(retention_scenarios)
+            except TypeError:
+                out['violations'].append(
+                    'retention_scenarios must be an iterable of probabilities')
+                scenarios = []
+    for idx, sp in enumerate(scenarios):
+        spv = _design_probability(sp, name=f'retention_scenarios[{idx}]')
+        if spv is None:
+            out['violations'].append(
+                f'retention_scenarios[{idx}]={sp!r} must be a probability in [0,1]')
+            continue
+        if any(abs(spv - x) <= 1e-15 for x in
+               [s['pair_retention'] for s in out['scenarios']]):
+            continue
+        joint = _joint(n, spv, runnable_at)
+        avail = _avail(n, spv, runnable_at)
+        out['scenarios'].append({
+            'pair_retention': float(spv),
+            'expected_complete_pairs': float(n * spv),
+            'probability_runnable': avail,
+            'conditional_power': conditional,
+            'unconditional_power': joint,
+            'power_loss': float(conditional - joint),
+            'availability_ok': (None if avail_t is None
+                                else bool(avail + 1e-15 >= avail_t)),
+            'target_met': bool(joint + 1e-15 >= tp
+                               and (avail_t is None
+                                    or avail + 1e-15 >= avail_t)),
+        })
+    if p is not None and not any(
+            abs(p - s['pair_retention']) <= 1e-15 for s in out['scenarios']):
+        joint = _joint(n, p, runnable_at)
+        avail = _avail(n, p, runnable_at)
+        out['scenarios'].append({
+            'pair_retention': float(p),
+            'expected_complete_pairs': float(n * p),
+            'probability_runnable': avail,
+            'conditional_power': conditional,
+            'unconditional_power': joint,
+            'power_loss': float(conditional - joint),
+            'availability_ok': (None if avail_t is None
+                                else bool(avail + 1e-15 >= avail_t)),
+            'target_met': bool(joint + 1e-15 >= tp
+                               and (avail_t is None
+                                    or avail + 1e-15 >= avail_t)),
+        })
+    out['scenarios'].sort(key=lambda s: s['pair_retention'], reverse=True)
+    if p is not None:
+        max_joint = 0.0
+        max_n = None
+        required = None
+        for nn in range(2, search_max + 1):
+            threshold = _runnable_threshold(nn)
+            joint = _joint(nn, p, threshold)
+            if joint > max_joint + 1e-15:
+                max_joint, max_n = joint, nn
+            if required is not None:
+                continue
+            avail = _avail(nn, p, threshold)
+            if (joint + 1e-15 >= tp
+                    and (avail_t is None or avail + 1e-15 >= avail_t)):
+                required = nn
+        out['max_unconditional_power'] = float(max_joint)
+        out['n_at_max_unconditional_power'] = max_n
+        out['required_nominal_seeds'] = required
+        if out['target_met']:
+            out['status'] = 'ok'
+        elif required is not None:
+            out['status'] = 'underpowered'
+            out['warnings'].append(
+                f'the planned n={n} has attrition-adjusted power '
+                f'{out["unconditional_power"]:.6g} < target_power={tp}; '
+                f'the smallest nominal n meeting the target at '
+                f'pair_retention={p} is {required}')
+        elif family_floor is None:
+            out['status'] = 'impossible'
+            out['failure_reason'] = 'resolution_floor'
+        elif max_joint + 1e-15 < tp:
+            out['status'] = 'impossible'
+            out['failure_reason'] = 'power'
+            out['warnings'].append(
+                f'no n <= {search_max} reaches attrition-adjusted power '
+                f'{tp} at pair_retention={p}; the maximum is {max_joint:.6g}')
+        else:
+            out['status'] = 'impossible'
+            out['failure_reason'] = 'availability'
+            out['warnings'].append(
+                f'no n <= {search_max} meets both target power={tp} and '
+                f'availability_target={avail_t} at pair_retention={p}')
+        if require_attr and not out['target_met']:
+            out['violations'].append(
+                'require_attrition_power=true but the planned panel has '
+                f'attrition-adjusted power {out["unconditional_power"]:.6g} '
+                f'< target_power={tp}'
+                + ('' if avail_t is None else
+                   f' or runnable probability {out["probability_runnable"]:.6g} '
+                   f'< availability_target={avail_t}'))
+    else:
+        if require_attr:
+            out['violations'].append(
+                'require_attrition_power=true but no pair_retention was declared')
+        else:
+            out['warnings'].append(
+                'no pair_retention was declared; the retention table is a '
+                'stress test, not a pass, and no attrition-adjusted verdict '
+                'is issued')
+        out['status'] = 'fail' if require_attr else 'not_declared'
+    if out['violations']:
+        out['status'] = 'fail'
+    return out
+
+
 _UNIT_GRANULARITIES = (
     ('article', 'ppl_per_article', 'article_ids'),
     ('document', 'ppl_per_doc', 'doc_ids'),

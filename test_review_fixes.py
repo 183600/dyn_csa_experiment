@@ -23197,6 +23197,140 @@ def t_audit_design_sensitivity_manifest_and_pilot():
         assert any('none carry a deltas list' in w for w in rep4['warnings']), rep4['warnings']
 
 
+def t_attrition_power_audit_and_design_gate():
+    base = L.attrition_power_audit(
+        12, 6, q=0.95, pair_retention=1.0, target_power=0.80,
+        require_complete_coverage=True, min_complete_pairs=8)
+    assert base['status'] == 'ok', base['violations']
+    assert base['runnable_at'] == 12 and base['family_floor'] == 8, base
+    assert abs(base['conditional_power']
+               - L.signflip_power(12, 6, 0.95, 0.05)) < 1e-15, base
+    assert abs(base['unconditional_power'] - base['conditional_power']) < 1e-15
+    assert base['probability_runnable'] == 1.0, base
+    assert base['target_met'] is True and base['coverage_bottleneck'] is False
+    assert base['min_pair_retention_for_target'] is not None, base
+    assert 0.99 < base['min_pair_retention_for_target'] < 1.0, base
+    assert base['required_nominal_seeds'] == 12, base
+    _sc = {s['pair_retention']: s for s in base['scenarios']}
+    assert abs(_sc[0.95]['unconditional_power'] - 0.95 ** 12
+               * base['conditional_power']) < 1e-12, _sc[0.95]
+
+    # With complete coverage, 5% pair loss multiplies power by P(K=12), so
+    # the conditional 0.882 becomes an unconditional 0.476.  No nominal n can
+    # recover 80% here because the all-12 requirement caps availability.
+    loss = L.attrition_power_audit(
+        12, 6, q=0.95, pair_retention=0.95, target_power=0.80,
+        require_complete_coverage=True)
+    assert loss['status'] == 'impossible', loss
+    assert loss['failure_reason'] == 'power', loss
+    assert loss['coverage_bottleneck'] is True, loss
+    assert abs(loss['probability_runnable'] - 0.95 ** 12) < 1e-12, loss
+    assert abs(loss['unconditional_power'] - 0.95 ** 12
+               * loss['conditional_power']) < 1e-12, loss
+    assert loss['power_loss'] > 0.3 and loss['required_nominal_seeds'] is None
+
+    # The same 5% loss with an 8-pair floor is a different design: the panel
+    # is almost certainly runnable, but the smaller effective n drops power to
+    # 0.742, which is still below target.  The audit must separate those two
+    # failure modes instead of reporting one "attrition" number.
+    floor = L.attrition_power_audit(
+        12, 6, q=0.95, pair_retention=0.95, target_power=0.80,
+        require_complete_coverage=False, min_complete_pairs=8,
+        availability_target=0.95)
+    assert floor['runnable_at'] == 8, floor
+    assert floor['probability_runnable'] > 0.999, floor
+    assert floor['unconditional_power'] > loss['unconditional_power'], floor
+    assert floor['status'] == 'underpowered', floor
+    assert floor['required_nominal_seeds'] == 13, floor
+    assert floor['failure_reason'] is None, floor
+
+    # min_complete_pairs below the Holm resolution floor is not a lower bar.
+    below = L.attrition_power_audit(
+        12, 6, q=0.95, pair_retention=0.95,
+        require_complete_coverage=False, min_complete_pairs=3)
+    assert below['runnable_at'] == 8, below
+    assert any('below the Holm resolution floor' in w
+               for w in below['warnings']), below
+
+    # An undeclared retention is visible as not_declared, never as a pass;
+    # requiring it turns the missing declaration into a failure.
+    nd = L.attrition_power_audit(12, 6, q=0.95, target_power=0.80)
+    assert nd['status'] == 'not_declared', nd
+    assert nd['min_pair_retention_for_target'] is not None, nd
+    assert any('no pair_retention' in w for w in nd['warnings']), nd
+    need = L.attrition_power_audit(
+        12, 6, q=0.95, target_power=0.80, require_attrition_power=True)
+    assert need['status'] == 'fail', need
+    assert any('no pair_retention' in v for v in need['violations']), need
+    required = L.attrition_power_audit(
+        12, 6, q=0.95, pair_retention=0.95, target_power=0.80,
+        require_attrition_power=True)
+    assert required['status'] == 'fail', required
+    assert any('attrition-adjusted power' in v
+               for v in required['violations']), required
+
+    assert L.attrition_power_audit(
+        12, 6, q=1.0, pair_retention=1.0,
+        target_power=0.99)['unconditional_power'] == 1.0
+    for kwargs in (dict(n_seeds=1), dict(m_comparisons=0), dict(q=-0.01),
+                   dict(pair_retention=1.5), dict(alpha=0.0),
+                   dict(target_power=1.0), dict(require_complete_coverage='yes'),
+                   dict(min_complete_pairs=-1), dict(availability_target=0.0),
+                   dict(retention_scenarios='x'), dict(n_max=1)):
+        _kw = dict(n_seeds=12, m_comparisons=6, q=0.95)
+        _kw.update(kwargs)
+        bad = L.attrition_power_audit(**_kw)
+        assert bad['status'] == 'fail', (kwargs, bad)
+
+    with tempfile.TemporaryDirectory() as td:
+        mp = os.path.join(td, 'm.json')
+        pp = os.path.join(td, 'p.json')
+        manifest = {
+            'manifest_version': 3, 'seeds': list(range(12)),
+            'statistics': {
+                'alpha': 0.05, 'min_power_for_test': 0.80,
+                'power_q_for_test': 0.95,
+                'require_complete_coverage': True,
+                'min_seeds_for_confirmation': 8,
+                'attrition': {'pair_retention': 0.95,
+                              'require_attrition_power': True}},
+            'primary_comparisons': [
+                {'name': 'a', 'expected_sign': 'negative'}],
+        }
+        with open(mp, 'w', encoding='utf-8') as f:
+            json.dump(manifest, f)
+        with open(pp, 'w', encoding='utf-8') as f:
+            json.dump({'comparisons': {'a': {'deltas': [-1.0] * 12}}}, f)
+        with contextlib.redirect_stdout(io.StringIO()):
+            rep = A.audit_design_sensitivity(manifest_path=mp, pilot_path=pp)
+        assert rep['status'] == 'fail', rep
+        assert rep['attrition']['declared'] is True, rep['attrition']
+        assert rep['comparisons']['a']['attrition']['status'] == 'fail', rep
+        assert any('a: require_attrition_power=true' in v
+                   for v in rep['violations']), rep['violations']
+
+        manifest['statistics']['attrition']['pair_retention'] = 1.0
+        with open(mp, 'w', encoding='utf-8') as f:
+            json.dump(manifest, f)
+        with contextlib.redirect_stdout(io.StringIO()):
+            rep = A.audit_design_sensitivity(manifest_path=mp, pilot_path=pp)
+        assert rep['status'] == 'ok', rep
+        assert rep['comparisons']['a']['attrition']['status'] == 'ok', rep
+
+        manifest['statistics'].pop('attrition')
+        with open(mp, 'w', encoding='utf-8') as f:
+            json.dump(manifest, f)
+        with contextlib.redirect_stdout(io.StringIO()):
+            rep = A.audit_design_sensitivity(manifest_path=mp, pilot_path=pp)
+        assert rep['attrition']['declared'] is False, rep['attrition']
+        assert any('no statistics.attrition.pair_retention' in w
+                   for w in rep['warnings']), rep['warnings']
+
+    import inspect
+    assert 'attrition_power_audit' in inspect.getsource(A.audit_design_sensitivity)
+    assert 'attrition_power_audit' in inspect.getsource(V12.run_power)
+
+
 def t_unit_precision_design_planning():
     deltas = [-0.20] * 8 + [0.05] * 40
     base = L.unit_precision_design(
@@ -24367,6 +24501,8 @@ def main():
            t_error_bucket_inference_split_half_and_audit)
     _check('L211b paired bucket inference is rendered with its claim boundary',
            t_compare_token_errors_reports_bucket_inference_and_markdown)
+    _check('L212 attrition-adjusted power and retention design gate',
+           t_attrition_power_audit_and_design_gate)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')
