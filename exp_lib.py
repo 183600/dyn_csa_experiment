@@ -19845,6 +19845,43 @@ def _n_for_target_power(n_seeds, m_comparisons, q, target_power, alpha, n_max):
     return None
 
 
+def _n_for_target_halfwidth(sd, target, *, conf=0.95, n_max=512):
+    """Smallest n in ``[2, n_max]`` whose paired-t CI half-width meets target.
+
+    ``t_crit(conf, n-1) * sd / sqrt(n)`` is monotone decreasing in n, so a
+    binary search returns the minimal integer without enumerating every n.
+    The previous linear scan cost thousands of incomplete-beta evaluations at
+    the upper end of ``n_max``.
+    """
+    try:
+        sd = float(sd)
+        target = float(target)
+        hi = int(n_max)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if (hi < 2 or not (math.isfinite(sd) and sd > 0.0)
+            or not (math.isfinite(target) and target > 0.0)):
+        return None
+
+    def _ok(n):
+        tc = _t_critical(conf, float(n) - 1.0)
+        return (math.isfinite(tc)
+                and tc * sd / math.sqrt(float(n)) <= target)
+
+    if _ok(2):
+        return 2
+    if not _ok(hi):
+        return None
+    lo = 2
+    while lo + 1 < hi:
+        mid = (lo + hi) // 2
+        if _ok(mid):
+            hi = mid
+        else:
+            lo = mid
+    return int(hi)
+
+
 def paired_design_sensitivity(n_seeds, m_comparisons, *, alpha=0.05,
                               target_power=0.80, pilot_deltas=None,
                               pilot_sd=None, sesoi=None, expected_sign=None,
@@ -20026,7 +20063,7 @@ def paired_design_sensitivity(n_seeds, m_comparisons, *, alpha=0.05,
             if out['min_q_for_target_power'] is None:
                 out['warnings'].append(
                     f'target_power={tp} is unreachable at n={n}, m={m}, alpha={a}')
-    if sd is not None and tp is not None and n is not None:
+    if sd is not None and n is not None:
         tc = _t_critical(0.95, float(n - 1))
         half = (float(tc) * sd / math.sqrt(n)) if math.isfinite(tc) else None
         out['precision'] = {
@@ -20038,13 +20075,8 @@ def paired_design_sensitivity(n_seeds, m_comparisons, *, alpha=0.05,
             th = target_halfwidth_value
             out['precision']['target_halfwidth'] = float(th)
             out['precision']['meets_target'] = bool(half is not None and half <= th)
-            needed = None
-            for n_try in range(2, n_max_i + 1):
-                tc_try = _t_critical(0.95, float(n_try - 1))
-                if math.isfinite(tc_try) and tc_try * sd / math.sqrt(n_try) <= th:
-                    needed = int(n_try)
-                    break
-            out['precision']['n_required_for_target_halfwidth'] = needed
+            out['precision']['n_required_for_target_halfwidth'] = (
+                _n_for_target_halfwidth(sd, th, n_max=n_max_i))
         if half is not None and out['precision'].get('meets_target') is False:
             out['warnings'].append(
                 'the expected paired 95% CI half-width at the planned n '

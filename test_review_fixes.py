@@ -22722,6 +22722,31 @@ def t_paired_design_sensitivity_planning():
     assert loose['precision']['meets_target'] is True, loose['precision']
     assert loose['precision']['n_required_for_target_halfwidth'] <= 12, loose['precision']
 
+    # The CI half-width depends on sd/n only.  A malformed target_power must
+    # not suppress the precision block or its required-n readout.
+    bad_tp = L.paired_design_sensitivity(
+        12, 6, target_power=1.0, pilot_sd=1.0, target_halfwidth=0.5)
+    assert bad_tp['status'] == 'fail', bad_tp
+    assert bad_tp['precision']['ci95_halfwidth'] > 0.0, bad_tp['precision']
+    assert (bad_tp['precision']['n_required_for_target_halfwidth']
+            is not None), bad_tp['precision']
+
+    # The half-width search is binary; verify it returns the true minimum and
+    # handles the n_max boundary without enumerating every n.
+    for _sd, _th, _cap in ((1.0, 0.1, 512), (2.5, 0.05, 1000),
+                           (0.3, 1.0, 64)):
+        _got = L._n_for_target_halfwidth(_sd, _th, n_max=_cap)
+        _want = None
+        for _n in range(2, _cap + 1):
+            _tc = L._t_critical(0.95, float(_n - 1))
+            if _tc * _sd / math.sqrt(_n) <= _th:
+                _want = _n
+                break
+        assert _got == _want, (_sd, _th, _cap, _got, _want)
+    _edge = L._t_critical(0.95, 9999.0) / 100.0
+    assert L._n_for_target_halfwidth(1.0, _edge, n_max=10000) == 10000
+    assert L._n_for_target_halfwidth(1.0, _edge * 0.999, n_max=10000) is None
+
     big = L.paired_design_sensitivity(
         12, 6, target_power=0.80, pilot_sd=1.0, expected_sign='positive',
         sesoi=10.0, require_sesoi_power=True)
