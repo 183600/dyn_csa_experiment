@@ -21304,6 +21304,73 @@ def t_sesoi_partial_panel_and_input_guards():
                                    baselines={})['declared_contrasts'] == 0
 
 
+def t_baseline_sesoi_and_design_gate():
+    # The baseline claim has its own pre-registered margin; a significant but
+    # practically tiny advantage over a matched dense baseline is not enough.
+    assert set(L.BASELINE_SESOI) == set(L.BASELINE_DESIGN), L.BASELINE_SESOI
+    norm = L._normalise_sesoi_design(L.BASELINE_SESOI)
+    assert norm['compression_vs_matched_dense']['relative_pct'] == 1.0, norm
+    with contextlib.redirect_stdout(io.StringIO()):
+        ok = A.audit_baseline_sesoi()
+    assert ok['status'] == 'ok' and ok['all_arms_scheduled'] is True, ok
+    with contextlib.redirect_stdout(io.StringIO()):
+        missing = A.audit_baseline_sesoi(spec={})
+    assert missing['status'] == 'fail', missing
+    assert any('no pre-registered baseline SESOI' in p
+               for p in missing['problems']), missing
+    extra = dict(L.BASELINE_SESOI)
+    extra['compression_vs_matched_dens'] = {'relative_pct': 1.0}
+    with contextlib.redirect_stdout(io.StringIO()):
+        typo = A.audit_baseline_sesoi(spec=extra)
+    assert typo['status'] == 'ok', typo
+    assert any('not present in BASELINE_DESIGN' in w
+               for w in typo['warnings']), typo
+    with contextlib.redirect_stdout(io.StringIO()):
+        malformed = A.audit_baseline_sesoi(
+            spec={'compression_vs_matched_dense': {'relative_pct': 0.0}})
+    assert malformed['status'] == 'fail', malformed
+    with contextlib.redirect_stdout(io.StringIO()):
+        unscheduled = A.audit_baseline_sesoi(
+            spec={'x': {'relative_pct': 1.0}},
+            design={'x': [('a', 'not_scheduled', 'x')]})
+    assert unscheduled['status'] == 'fail', unscheduled
+    assert any('not scheduled' in p for p in unscheduled['problems']), unscheduled
+
+    fp = 'steps1_sl8_bs1_nt10_lr0.0003_wd0.1_d8_L1_H1_Dh8_v16_wu1_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee1_es1_detcpu-eager_dfabc_csX'
+    knobs = L.training_knobs()
+
+    def _summary(effect, noise=0.001, n=8):
+        s = {}
+        for i in range(n):
+            s[f'csa_dynamic::seed{i}'] = dict(
+                variant='csa_dynamic', seed=i, run_cfg=fp, steps=1,
+                tokens_seen=1, ppl=50.0 + effect + (noise if i % 2 else -noise),
+                params=1000, train_knobs=knobs)
+            s[f'full_sw128_matched::seed{i}'] = dict(
+                variant='full_sw128_matched', seed=i, run_cfg=fp, steps=1,
+                tokens_seen=1, ppl=50.0, params=1001, train_knobs=knobs)
+        return s
+
+    # 0.2% below the matched dense baseline: statistically detectable, but
+    # below the 1% baseline SESOI.  It must not become a verified baseline.
+    small = L.methodology_audit(_summary(-0.1), verbose=False)
+    es = small['baselines']['compression_vs_matched_dense'][0]
+    assert es['sesoi']['declared'] is True and es['sesoi']['margin_ppl'] == 0.5, es
+    assert es['practical_decision'] == 'sub_sesoi', es
+    assert 'compression_vs_matched_dense' not in small['verified_baselines'], small
+    assert 'compression_vs_matched_dense' in small['sub_sesoi_baselines'], small
+    assert 'compression_vs_matched_dense' in small['sesoi']['sub_sesoi_components'], small
+    # 2% below the same baseline: above SESOI, so the baseline claim passes.
+    big = L.methodology_audit(_summary(-1.0), verbose=False)
+    eb = big['baselines']['compression_vs_matched_dense'][0]
+    assert eb['practical_decision'] == 'superior', eb
+    assert 'compression_vs_matched_dense' in big['verified_baselines'], big
+    # Explicitly disabling SESOI restores the historical statistical-only
+    # verdict; the default is not silently applied when the caller opts out.
+    legacy = L.methodology_audit(_summary(-0.1), sesoi={}, verbose=False)
+    assert 'compression_vs_matched_dense' in legacy['verified_baselines'], legacy
+
+
 def t_doc_unit_influence_primitives():
     """L173 — leave-one-unit-out influence targets the pooled estimand."""
     A = [[2.0, 3.0, 5.0, 7.0], [3.0, 4.0, 6.0, 8.0]]
@@ -24287,6 +24354,8 @@ def main():
            t_audit_confirmation_verdicts_and_wiring)
     _check('L209 replication independence separates shared draws from new evidence',
            t_replication_independence_is_not_shared_draws)
+    _check('L210 baseline SESOI gates practical superiority and declaration',
+           t_baseline_sesoi_and_design_gate)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

@@ -36,6 +36,8 @@
                下的 TOST 等价/亚 SESOI/有害判定（零 GPU）
   sesoi        消融 SESOI 声明：每个声明组件都有唯一、有限、>0 的相对或
                绝对 margin，且留一对照在 RUN_ABL 中完整排程（设计期，零 GPU）
+  baseline_sesoi  方法 vs 参数匹配基线的 SESOI 声明：每个声明基线都有
+               唯一、有限、>0 的 margin，且基线臂在 RUN 中排程（设计期，零 GPU）
   interaction_sesoi  2x2 交互 SESOI 声明：每个声明的 factorial 都有唯一、
                有限、>0 的 log ratio-of-ratios margin 与方向假设；缺 margin
                时交互仍可报告，但不能声称可加/可删（设计期，零 GPU）
@@ -3582,6 +3584,95 @@ def audit_sesoi_declaration(spec=None, design=None):
     return out
 
 
+def audit_baseline_sesoi(spec=None, design=None):
+    """参数匹配基线的 SESOI 声明审计（零 GPU，设计期，不读结果）。
+
+    `methodology_audit` 对方法 vs 参数匹配稠密基线同样需要预注册 margin，
+    否则一个大 n 下显著、但实际只低 0.1% PPL 的结果会被误读为「方法有实际
+    优势」。这个入口在跑 GPU 前检查：
+      * 每个 `BASELINE_DESIGN` 对比都有唯一、有限、>0 的 margin；
+      * margin 能在正常 PPL 基线上换算成正的绝对 PPL 边界；
+      * 没有为未声明基线写 margin（拼写错误会让对照静默失去 SESOI）；
+      * 声明的基线臂都在 `RUN['variants']` 中排程。
+    """
+    L = _import_exp_lib()
+    spec = L.BASELINE_SESOI if spec is None else spec
+    design = L.BASELINE_DESIGN if design is None else design
+    out = {'kind': 'baseline_sesoi', 'status': 'ok', 'problems': [],
+           'warnings': [], 'components': {}, 'all_arms_scheduled': None}
+    try:
+        norm = L._normalise_sesoi_design(spec)
+    except Exception as e:
+        out['status'] = 'fail'
+        out['problems'].append(
+            f'baseline SESOI declaration is malformed: {type(e).__name__}: {e}')
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return out
+    if not isinstance(design, dict):
+        out['status'] = 'fail'
+        out['problems'].append('BASELINE_DESIGN is not a mapping')
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return out
+    scheduled = set(L.RUN.get('variants') or ())
+    all_scheduled = True
+    for comp, contrasts in design.items():
+        if not isinstance(comp, str) or not comp.strip():
+            out['problems'].append(
+                f'baseline component name {comp!r} is not a non-empty string')
+            all_scheduled = False
+            continue
+        if not isinstance(contrasts, (list, tuple)):
+            out['problems'].append(
+                f'{comp}: declared contrasts must be a list/tuple, got '
+                f'{type(contrasts).__name__}')
+            all_scheduled = False
+            continue
+        bad_contrasts = [i for i, c in enumerate(contrasts)
+                         if not (isinstance(c, (tuple, list)) and len(c) == 3
+                                 and all(isinstance(x, str) and x.strip()
+                                         for x in c[:2]))]
+        if bad_contrasts:
+            out['problems'].append(
+                f'{comp}: malformed contrast declaration(s) at index '
+                f'{bad_contrasts[:5]} (expected (with_arm, without_arm, note))')
+        arms = sorted({str(x) for c in contrasts
+                       if isinstance(c, (tuple, list)) and len(c) >= 2
+                       for x in c[:2]})
+        missing = [a for a in arms if a not in scheduled]
+        if missing:
+            all_scheduled = False
+            out['problems'].append(
+                f'{comp}: baseline arm(s) {missing} are not scheduled in '
+                'RUN["variants"]')
+        rec = {'declared': comp in norm, 'n_contrasts': len(contrasts),
+               'arms': arms, 'arms_scheduled': not missing}
+        if comp not in norm:
+            out['problems'].append(
+                f'{comp}: no pre-registered baseline SESOI margin; a '
+                'non-significant baseline contrast cannot be called equivalent')
+        else:
+            rec['margin_spec'] = norm[comp]
+            margin, why = L._sesoi_margin_ppl(norm[comp], 50.0)
+            rec['probe_margin_ppl_at_baseline_50'] = margin
+            if margin is None:
+                out['problems'].append(
+                    f'{comp}: baseline margin cannot be translated to PPL ({why})')
+            if not str(norm[comp].get('rationale') or '').strip():
+                out['warnings'].append(
+                    f'{comp}: baseline margin has no recorded rationale')
+        out['components'][comp] = rec
+    extras = sorted(set(norm) - set(design), key=str)
+    if extras:
+        out['warnings'].append(
+            'baseline SESOI declares component(s) not present in '
+            'BASELINE_DESIGN: ' + ', '.join(extras))
+    out['all_arms_scheduled'] = bool(all_scheduled)
+    if out['problems']:
+        out['status'] = 'fail'
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return out
+
+
 def audit_interaction_sesoi(spec=None, design=None):
     """2x2 interaction SESOI declaration audit (zero-GPU, design-time).
 
@@ -6830,7 +6921,7 @@ def audit_statistical_calibration(*, n_sim=None, seed=None):
 
 
 def run_report(out='audit_report.json'):
-    res = {'generated_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'source_tree': audit_source_integrity(), 'dependencies': audit_dependencies(), 'data_source': audit_data_source(), 'leakage': audit_leakage(), 'split_discipline': audit_split_discipline(), 'document_unit': audit_document_unit(), 'sample_design': audit_sample_design(), 'attribution': audit_attribution(), 'boundary': audit_boundary(), 'length': audit_length(), 'fairness': audit_fairness(), 'metrics': audit_metrics(), 'tuning': audit_tuning(), 'simple_baseline': audit_simple_baseline(), 'hypotheses': audit_hypotheses(), 'sesoi': audit_sesoi_declaration(), 'interaction_sesoi': audit_interaction_sesoi(), 'unit_influence': audit_unit_influence(), 'analysis_choices': audit_analysis_choices(), 'verdicts': audit_confirmation_verdicts(), 'looks': audit_look_history(), 'methodology': audit_methodology(), 'single_factor': audit_single_factor(), 'factorial': audit_factorial_design(), 'design_preflight': audit_design_preflight(), 'sensitivity': audit_design_sensitivity(), 'evaluation': audit_evaluation_design(), 'dose_response': audit_dose_response(verbose=False), 'failures': audit_failures(), 'budget': audit_budget(), 'training_health': audit_training_health(), 'efficiency_pairs': audit_efficiency_pairs(), 'release': audit_release_readiness(), 'selection': audit_selection(), 'run_order': audit_run_order(), 'calibration': audit_statistical_calibration()}
+    res = {'generated_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'source_tree': audit_source_integrity(), 'dependencies': audit_dependencies(), 'data_source': audit_data_source(), 'leakage': audit_leakage(), 'split_discipline': audit_split_discipline(), 'document_unit': audit_document_unit(), 'sample_design': audit_sample_design(), 'attribution': audit_attribution(), 'boundary': audit_boundary(), 'length': audit_length(), 'fairness': audit_fairness(), 'metrics': audit_metrics(), 'tuning': audit_tuning(), 'simple_baseline': audit_simple_baseline(), 'hypotheses': audit_hypotheses(), 'sesoi': audit_sesoi_declaration(), 'baseline_sesoi': audit_baseline_sesoi(), 'interaction_sesoi': audit_interaction_sesoi(), 'unit_influence': audit_unit_influence(), 'analysis_choices': audit_analysis_choices(), 'verdicts': audit_confirmation_verdicts(), 'looks': audit_look_history(), 'methodology': audit_methodology(), 'single_factor': audit_single_factor(), 'factorial': audit_factorial_design(), 'design_preflight': audit_design_preflight(), 'sensitivity': audit_design_sensitivity(), 'evaluation': audit_evaluation_design(), 'dose_response': audit_dose_response(verbose=False), 'failures': audit_failures(), 'budget': audit_budget(), 'training_health': audit_training_health(), 'efficiency_pairs': audit_efficiency_pairs(), 'release': audit_release_readiness(), 'selection': audit_selection(), 'run_order': audit_run_order(), 'calibration': audit_statistical_calibration()}
     L_atomic = None
     try:
         L = _import_exp_lib()
@@ -6850,7 +6941,7 @@ def run_report(out='audit_report.json'):
 
 
 if __name__ == '__main__':
-    _cmds = {'leakage': audit_leakage, 'split': audit_split_discipline, 'split_discipline': audit_split_discipline, 'document_unit': audit_document_unit, 'unit': audit_document_unit, 'sample_design': audit_sample_design, 'sampling': audit_sample_design, 'sample': audit_sample_design, 'causality': audit_causality, 'attribution': audit_attribution, 'boundary': audit_boundary, 'length': audit_length, 'fairness': audit_fairness, 'metrics': audit_metrics, 'tuning': audit_tuning, 'simple': audit_simple_baseline, 'baseline_floor': audit_simple_baseline, 'baseline_plan': audit_baseline_design, 'hypothesis_coverage': audit_hypothesis_coverage, 'hypotheses': audit_hypotheses, 'sesoi': audit_sesoi_declaration, 'interaction_sesoi': audit_interaction_sesoi, 'interaction': audit_interaction_sesoi, 'unit_influence': audit_unit_influence, 'influence': audit_unit_influence, 'analysis_choices': audit_analysis_choices, 'specification_curve': audit_analysis_choices, 'verdicts': audit_confirmation_verdicts, 'verdict': audit_confirmation_verdicts, 'three_way': audit_confirmation_verdicts, 'analysis_choice': audit_analysis_choices, 'looks': audit_look_history, 'look_history': audit_look_history, 'methodology': audit_methodology, 'single_factor': audit_single_factor, 'factorial': audit_factorial_design, 'factorial_design': audit_factorial_design, 'design': audit_design_preflight, 'design_preflight': audit_design_preflight, 'sensitivity': audit_design_sensitivity, 'design_sensitivity': audit_design_sensitivity, 'precision': audit_design_sensitivity, 'evaluation': audit_evaluation_design, 'evaluation_design': audit_evaluation_design, 'unit_precision': audit_evaluation_design, 'dose_response': audit_dose_response, 'dose_response_design': audit_dose_response, 'failures': audit_failures, 'budget': audit_budget, 'efficiency': audit_efficiency_demo, 'efficiency_pairs': audit_efficiency_pairs, 'training_health': audit_training_health, 'selection': audit_selection, 'release': audit_release_readiness, 'run_order': audit_run_order, 'calibration': audit_statistical_calibration, 'stats_calibration': audit_statistical_calibration, 'type_i': audit_statistical_calibration, 'source': audit_source_integrity, 'source_tree': audit_source_integrity, 'dependencies': audit_dependencies, 'dependency': audit_dependencies, 'data_source': audit_data_source, 'dataset_source': audit_data_source, 'report': run_report}
+    _cmds = {'leakage': audit_leakage, 'split': audit_split_discipline, 'split_discipline': audit_split_discipline, 'document_unit': audit_document_unit, 'unit': audit_document_unit, 'sample_design': audit_sample_design, 'sampling': audit_sample_design, 'sample': audit_sample_design, 'causality': audit_causality, 'attribution': audit_attribution, 'boundary': audit_boundary, 'length': audit_length, 'fairness': audit_fairness, 'metrics': audit_metrics, 'tuning': audit_tuning, 'simple': audit_simple_baseline, 'baseline_floor': audit_simple_baseline, 'baseline_plan': audit_baseline_design, 'hypothesis_coverage': audit_hypothesis_coverage, 'hypotheses': audit_hypotheses, 'sesoi': audit_sesoi_declaration, 'baseline_sesoi': audit_baseline_sesoi, 'baseline_sesoi_declaration': audit_baseline_sesoi, 'interaction_sesoi': audit_interaction_sesoi, 'interaction': audit_interaction_sesoi, 'unit_influence': audit_unit_influence, 'influence': audit_unit_influence, 'analysis_choices': audit_analysis_choices, 'specification_curve': audit_analysis_choices, 'verdicts': audit_confirmation_verdicts, 'verdict': audit_confirmation_verdicts, 'three_way': audit_confirmation_verdicts, 'analysis_choice': audit_analysis_choices, 'looks': audit_look_history, 'look_history': audit_look_history, 'methodology': audit_methodology, 'single_factor': audit_single_factor, 'factorial': audit_factorial_design, 'factorial_design': audit_factorial_design, 'design': audit_design_preflight, 'design_preflight': audit_design_preflight, 'sensitivity': audit_design_sensitivity, 'design_sensitivity': audit_design_sensitivity, 'precision': audit_design_sensitivity, 'evaluation': audit_evaluation_design, 'evaluation_design': audit_evaluation_design, 'unit_precision': audit_evaluation_design, 'dose_response': audit_dose_response, 'dose_response_design': audit_dose_response, 'failures': audit_failures, 'budget': audit_budget, 'efficiency': audit_efficiency_demo, 'efficiency_pairs': audit_efficiency_pairs, 'training_health': audit_training_health, 'selection': audit_selection, 'release': audit_release_readiness, 'run_order': audit_run_order, 'calibration': audit_statistical_calibration, 'stats_calibration': audit_statistical_calibration, 'type_i': audit_statistical_calibration, 'source': audit_source_integrity, 'source_tree': audit_source_integrity, 'dependencies': audit_dependencies, 'dependency': audit_dependencies, 'data_source': audit_data_source, 'dataset_source': audit_data_source, 'report': run_report}
     _arg = sys.argv[1] if len(sys.argv) > 1 else 'report'
     if _arg in ('-h', '--help'):
         print(__doc__)

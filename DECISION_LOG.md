@@ -2918,3 +2918,41 @@ p/Holm/`confirmed` 数值，也不改变冻结清单或实验执行。
 文案；L208 覆盖审计正常 `warnings`、列表/逐项 verdict 篡改 `fail`、旧
 artifact/缺文件 `not_verifiable_locally` 以及 `run_report`/CLI 接线。
 `python v12_supp.py plan` 仍 72/72 合成冻结记录、6 个比较。
+
+## 2026-10-27 — 参数匹配基线的 SESOI/TOST 与设计期声明门（no new runs）
+
+零 GPU 的对比实验方法学硬化；不新增训练、不读取 test split、不修改冻结
+清单的字节/种子/终点/alpha/Holm 决策规则，也不改 `CODE_SEMANTICS`。
+
+**Problem.** 留一消融与 2×2 交互已有预注册 SESOI + TOST，但
+`compression_vs_matched_dense` 仍只按 Holm 显著性判 `verified`。大 n 下
+一个 0.1% 的 PPL 差异可以显著，却不构成方法相对参数匹配稠密基线的实际
+优势；反过来，非显著也没有等价性判定。`methodology_audit` 的默认 margin
+只覆盖 `ABLATION_SESOI`，baseline 条目不会获得 SESOI。
+
+**Fix.** 新增 `exp_lib.BASELINE_SESOI`（当前
+`compression_vs_matched_dense` = 相对 1%）与
+`DEFAULT_METHODOLOGY_SESOI`（消融 + baseline 并集）。`methodology_audit`
+默认对 baseline 做相同的配对 TOST + 声明族 Holm；显著但低于 margin 进入
+`sub_sesoi_baselines`，只有超过 margin 的 `superior` 才进入
+`verified_baselines`，显式 `sesoi={}` 保持旧统计判定。`report['sesoi']`
+新增 `declared_baselines`，不再把基线键混进 `declared_components`。
+新增 `audit_gates.audit_baseline_sesoi()` /
+`python audit_gates.py baseline_sesoi`：在设计期检查每个
+`BASELINE_DESIGN` 对照的 margin 覆盖、单位、正性、拼写和
+`RUN['variants']` 排程；`audit_gates.py report` 汇总新增
+`baseline_sesoi`。
+
+**Boundary.** 这是探索性方法学门，不进入冻结 confirmatory 的 p/Holm 族，
+不改变任何已落盘数值。`sub_sesoi` 是可检出但小于实际边界，不能写成零
+效应；`equivalent` 只说明 margin 内无可区分优势，不是方法更优；部分
+baseline panel 的等价结果不能授权整条主张。margin 仍需在看结果前固定，
+事后调整会使 TOST 失去预注册含义。
+
+**Verification.** `python test_review_fixes.py` 通过 561/561（0 skipped，
+新增 L210）：默认声明覆盖与排程、缺 margin/拼写/畸形/未排程臂的
+fail 或 warning、0.2% 差异停在 `sub_sesoi` 且不进入
+`verified_baselines`、2% 差异进入 `verified_baselines`，以及
+`sesoi={}` 恢复旧判定。`python audit_gates.py baseline_sesoi` 返回
+`ok`；`python audit_gates.py sesoi` 仍 `ok`；`python v12_supp.py plan`
+仍 72/72 合成冻结记录、6 个比较。

@@ -4876,3 +4876,93 @@ disjoint seeds + same evaluation、disjoint seeds + disjoint evaluation、
 `replicated`，以及独立性字段不会把共享 draws 放进
 `independently_replicated_anywhere`。本轮完整 CPU 套件 `560/560` 通过，
 `v12_supp.py plan` 仍为 72/72 records / 6 comparisons。
+
+## 72. 参数匹配基线也需要自己的 SESOI，不能只看「显著」（本轮对比实验方法硬化）
+
+### 72.1 问题：消融有实际显著性门，基线主张仍停留在统计显著性
+
+§56 给留一消融、§67 给 2×2 交互、§68 给确认性计划分别加了 SESOI/TOST
+或设计期 margin，但主方法 vs 参数匹配稠密基线仍只有「Holm 校正后显著」。
+`methodology_audit` 的默认 `ABLATION_SESOI` 只覆盖组件，`_collect` 也只把
+margin 附加到 component 条目；baseline 条目不会得到 SESOI。因此在 n 足够
+大时，一个只比稠密基线低 0.1% PPL 的差异也可以把
+`compression_vs_matched_dense` 标成 `verified`，读者无法区分「统计上可
+检出」与「实际值得关心」。反过来，基线对比不显著时也没有 TOST 路由，
+不能把「未检出」写成「等价」。
+
+### 72.2 方法：独立的 baseline SESOI + 同一套 TOST/Holm 判定
+
+新增 `exp_lib.BASELINE_SESOI`：
+
+```python
+BASELINE_SESOI = {
+    'compression_vs_matched_dense': {
+        'relative_pct': 1.0,
+        'rationale': '...'
+    }
+}
+```
+
+它与 `ABLATION_SESOI` 分开声明，因为 baseline 回答的是方法 vs 强基线，
+不是模块留一消融。`DEFAULT_METHODOLOGY_SESOI` 是两者的并集；
+`methodology_audit(..., sesoi=None)` 使用该并集，显式 `sesoi={}` 仍关闭
+所有 SESOI，显式传入 mapping 则完全按调用方的声明执行。
+
+对 baseline 条目，审计现在和 component 一样：
+
+- 用 without 臂的主终点 PPL 把相对 margin 换算成绝对 PPL；
+- 做配对 TOST，并在声明族上做 Holm 校正；
+- 只有 `significant_global` 且效应超过 margin 的 `superior` 才能进入
+  `verified_baselines`；
+- 显著但小于 margin 进入 `sub_sesoi_baselines` / `sub_sesoi_components`，
+  不能写成「方法有实际优势」；
+- 非显著且 TOST 在 margin 内进入 `equivalent`，但只有全部声明 baseline
+  对照都完整、有功效时才能支撑「实际等价/无可区分优势」；
+- `report['sesoi']` 新增 `declared_baselines`，避免把 baseline 混进
+  `declared_components`。
+
+### 72.3 设计期门与接线
+
+新增 `audit_gates.audit_baseline_sesoi()` / `python audit_gates.py
+baseline_sesoi`，在跑 GPU 前检查：
+
+- 每个 `BASELINE_DESIGN` 对照都有唯一、有限、>0 的 margin；
+- margin 能在正常 PPL 基线上换算成正的绝对边界；
+- 没有拼错或未声明的 baseline 键；
+- 声明的基线臂都在 `RUN['variants']` 中排程。
+
+`python audit_gates.py report` 的汇总新增 `baseline_sesoi` 键，与既有
+`sesoi`、`interaction_sesoi` 并列。该门是设计期审计，不读
+`results_*`、不启动训练、不改变任何已落盘数值。
+
+### 72.4 边界
+
+- **不是新检验，也不是确认性证据。** baseline TOST 仍属于探索性
+  `methodology_audit`，不进入冻结 confirmatory 的 p/Holm 族，不改变
+  `confirmation_frozen.json`、seeds、终点、alpha、`CODE_SEMANTICS` 或
+  `confirmed`。
+- **`sub_sesoi` 不是零效应。** 它表示差异可检出但小于预注册实际边界；
+  不能写成「无差异」或「方法无用」。
+- **`equivalent` 不是「方法更好」。** 它只表示在预注册 margin 内无法
+  区分方法与该基线；宣称实际优势仍需 `superior`。
+- **margin 不能看结果后改。** 1% 是本研究预先采用的实际显著性阈值；
+  特定面板可在看结果前声明更小/更大的 margin，但事后调整会使 TOST
+  失去预注册含义。
+- **基线不完整时不升级。** 只有一个 baseline 对照有数据时，不能被
+  部分 panel 的 TOST 结果授权为整条 baseline 主张的等价/可删。
+
+### 72.5 入口与验证
+
+```bash
+python audit_gates.py baseline_sesoi  # 设计期 baseline margin/排程审计
+python audit_gates.py sesoi           # 消融 SESOI 声明（不变）
+python audit_gates.py report          # 汇总含 baseline_sesoi
+python test_review_fixes.py           # L210 + 既有回归
+python v12_supp.py plan               # 冻结计划预检不变
+```
+
+L210 覆盖默认 baseline SESOI 覆盖/排程、缺 margin/拼写/畸形/未排程臂的
+fail 或 warning、0.2% 差异停在 `sub_sesoi` 且不进入
+`verified_baselines`、2% 差异进入 `verified_baselines`，以及显式
+`sesoi={}` 恢复旧统计判定。本轮完整 CPU 套件 `561/561` 通过（0 skipped），
+`v12_supp.py plan` 仍为 72/72 records / 6 comparisons。

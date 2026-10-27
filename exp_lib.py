@@ -19144,6 +19144,23 @@ BASELINE_DESIGN = {
     ],
 }
 
+# ---- 参数匹配基线的预注册 SESOI -------------------------------------------
+# 方法优于参数匹配稠密基线也需要实际显著性边界。一个在 n 很大时「显著」但
+# 只比稠密基线低 0.1% PPL 的差异，不足以支撑「压缩读取代价换来了实际收益」
+# 的主张；反过来，未检出差异也不能由「非显著」升级为「等价」。这个映射与
+# ABLATION_SESOI 分开声明，因为 baseline 回答的是方法 vs 强基线，而不是
+# 模块留一消融。margin 同样在结果之前固定，单位是 without 臂 PPL 的百分比。
+BASELINE_SESOI = {
+    'compression_vs_matched_dense': {
+        'relative_pct': 1.0,
+        'rationale': ('A dynamic-CSA PPL advantage below 1% over a parameter-'
+                      'matched dense baseline is treated as within the study\'s '
+                      'recipe/evaluation variation and cannot support a practical '
+                      'superiority claim.'),
+    },
+}
+DEFAULT_METHODOLOGY_SESOI = {**ABLATION_SESOI, **BASELINE_SESOI}
+
 # ---- 单因素设计契约（design-time gate）------------------------------------
 # ABLATION_DESIGN / BASELINE_DESIGN 的每条对照都是「应该只有一个因素在变」的
 # 受控对比。run_cfg / train_knobs / hyperparams / objective / params 的配对门
@@ -33422,12 +33439,13 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
     conservative cross-component reading.
 
     ``sesoi`` is the pre-registered smallest effect size of interest mapping
-    (default: :data:`ABLATION_SESOI`; pass ``{}`` to disable).  For every
-    component with a declared margin, a paired TOST classifies the contrast as
-    ``superior`` / ``inferior`` / ``sub_sesoi`` / ``equivalent`` /
-    indeterminate.  A non-significant result is never re-labelled equivalent
-    without TOST, and a statistically significant effect below the margin is
-    not counted as practically useful.
+    (default: :data:`DEFAULT_METHODOLOGY_SESOI`, the union of
+    :data:`ABLATION_SESOI` and :data:`BASELINE_SESOI`; pass ``{}`` to disable).
+    For every component and parameter-matched baseline with a declared margin,
+    a paired TOST classifies the contrast as ``superior`` / ``inferior`` /
+    ``sub_sesoi`` / ``equivalent`` / indeterminate.  A non-significant result
+    is never re-labelled equivalent without TOST, and a statistically
+    significant effect below the margin is not counted as practically useful.
 
     Returns the report dict and, when `outdir` is given, writes
     `methodology_audit.json`.
@@ -33450,7 +33468,8 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
     if _min_n is None or _min_n < 0:
         raise ValueError(f'min_n must be a non-negative integer, got {min_n!r}')
     min_n = _min_n
-    _sesoi_specs = _normalise_sesoi_design(ABLATION_SESOI if sesoi is None else sesoi)
+    _sesoi_specs = _normalise_sesoi_design(
+        DEFAULT_METHODOLOGY_SESOI if sesoi is None else sesoi)
     default_design = design is None
     design = ABLATION_DESIGN if design is None else design
     _design_type_problem = None
@@ -34318,10 +34337,14 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
                     'inconclusive rather than as a null or a win'
                     % _comp)
     report['sesoi'] = {
-        'policy': ('pre-registered relative SESOI with paired TOST; exploratory '
+        'policy': ('pre-registered relative SESOI with paired TOST for ablation '
+                   'components and parameter-matched baselines; exploratory '
                    'panels only (the frozen confirmatory manifest is unchanged)'),
         'alpha': float(alpha), 'min_n': int(min_n),
-        'declared_components': sorted(_sesoi_specs),
+        'declared_components': sorted(
+            set(_sesoi_specs) & set(design)),
+        'declared_baselines': sorted(
+            set(_sesoi_specs) & set(baselines)),
         'family': _sesoi_family,
         'components': _sesoi_components,
         'useful_components': sorted(_sesoi_lists['useful']),
@@ -35212,7 +35235,7 @@ def _print_methodology_audit(report):
                          if _pe.get('tost_p_holm') is not None else 'n/a',
                          _pe.get('reason') or ''))
     _sesoi = report.get('sesoi') or {}
-    if _sesoi.get('declared_components'):
+    if _sesoi.get('declared_components') or _sesoi.get('declared_baselines'):
         _fam = _sesoi.get('family') or {}
         print('  SESOI / practical equivalence (pre-registered; m=%s, TOST+Holm, alpha=%g):'
               % (_fam.get('m'), float(report.get('alpha', 0.05))))
