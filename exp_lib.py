@@ -16562,6 +16562,27 @@ def _binom_edgeworth_corr(z, var, p):
             + g1 * g1 * (z5 - 10.0 * z3 + 15.0 * z) / 72.0)
 
 
+def _binom_continuity_numerator(k, n, p, correction):
+    """Accurate ``k - n*p + correction`` for huge integer counts.
+
+    Once ``k`` exceeds 2**53, converting it to float drops low bits before
+    subtracting ``n*p``; near the mean the continuity correction can then
+    change sign (e.g. the central CDF at n=1e17 came out on the wrong side of
+    0.5).  Split ``p`` into its exact binary rational and subtract the integer
+    part exactly before the float conversion.
+    """
+    k = int(k)
+    n = int(n)
+    try:
+        num, den = float(p).as_integer_ratio()
+    except (OverflowError, ValueError):
+        return math.fsum((float(k), -float(n) * float(p), float(correction)))
+    product = n * num
+    mu_int, remainder = divmod(product, den)
+    return math.fsum((float(k - mu_int), -float(remainder) / float(den),
+                      float(correction)))
+
+
 def _binom_edgeworth_cdf(k, n, p):
     """Edgeworth CDF for a large binomial count (continuity corrected).
 
@@ -16573,7 +16594,7 @@ def _binom_edgeworth_cdf(k, n, p):
     mu = n * p
     var = mu * (1.0 - p)
     sd = math.sqrt(var)
-    z = math.fsum((float(k), -mu, 0.5)) / sd
+    z = _binom_continuity_numerator(k, n, p, 0.5) / sd
     phi = math.exp(-0.5 * z * z) / math.sqrt(2.0 * math.pi)
     cdf = 0.5 * math.erfc(-z / math.sqrt(2.0))
     if abs(z) < 1e6:
@@ -16585,7 +16606,7 @@ def _binom_edgeworth_sf(k, n, p):
     mu = n * p
     var = mu * (1.0 - p)
     sd = math.sqrt(var)
-    z = math.fsum((float(k), -mu, -0.5)) / sd
+    z = _binom_continuity_numerator(k, n, p, -0.5) / sd
     phi = math.exp(-0.5 * z * z) / math.sqrt(2.0 * math.pi)
     sf = 0.5 * math.erfc(z / math.sqrt(2.0))
     if abs(z) < 1e6:
@@ -45530,7 +45551,7 @@ def _binomial_sf(k, n, p):
         return 1.0
     if k > n:
         return 0.0
-    v = _betai(float(k), float(n - k + 1), p)
+    v = _betai(k, n - k + 1, p)
     if not math.isfinite(v):
         raise ValueError('binomial upper tail is not finite')
     return float(min(1.0, max(0.0, v)))
@@ -45544,7 +45565,7 @@ def _binomial_cdf(k, n, p):
         return 0.0
     if k >= n:
         return 1.0
-    v = _betai(float(n - k), float(k + 1), 1.0 - p)
+    v = _betai(n - k, k + 1, 1.0 - p)
     if not math.isfinite(v):
         raise ValueError('binomial lower tail is not finite')
     return float(min(1.0, max(0.0, v)))

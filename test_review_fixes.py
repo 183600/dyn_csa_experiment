@@ -157,10 +157,16 @@ def t_binomial_tail_large_scale():
     # n~1e14; the central CDF then drifted by ~3e-10 (n=1e14) and ~1e-7
     # (n=1e16).  At these scales the continuity correction is itself only
     # O(1/sqrt(n)), so a path that drops it is visible even at the mean.
-    for n in (10 ** 10, 10 ** 12, 10 ** 14, 10 ** 16):
+    for n in (10 ** 10, 10 ** 12, 10 ** 14, 10 ** 16, 10 ** 17, 10 ** 18):
         got = L._binom_cdf_half(n, n // 2)
         ref = 0.5 + 1.0 / math.sqrt(2.0 * math.pi * n)
         assert abs(got - ref) < 1e-13, (n, got, ref)
+    # Above 2**53 a float count loses the +1 that distinguishes the mean from
+    # mean+1; both the public wrappers and the beta identity must keep it.
+    n = 10 ** 17
+    cdf_mean = L._binom_cdf_half(n, n // 2)
+    assert abs(L._binomial_cdf(n // 2, n, 0.5) - cdf_mean) < 1e-15
+    assert abs(L._binomial_sf(n // 2 + 1, n, 0.5) - (1.0 - cdf_mean)) < 1e-15
     # A tiny p with enormous n is the Poisson corner: 1-p rounds to 1 in
     # float, so lgamma/log(q) cancellation used to return e.g. 6e-17 instead
     # of 0.632 at n=1e16.  The exact small-tail path avoids log C(n,k).
@@ -175,19 +181,19 @@ def t_binomial_tail_large_scale():
         assert abs(got2 - ref2) < tol, (n, p, got2, ref2)
     # The integer-parameter beta identity I_x(a,b)=P(Bin(a+b-1,x)>=a)
     # must preserve both symmetry and the large-n central value.
-    a = 10 ** 15
-    assert abs(L._betai(a, a, 0.5) - 0.5) < 1e-15
-    assert abs(L._betai(a, a + 1, 0.5)
-               + L._betai(a + 1, a, 0.5) - 1.0) < 1e-15
-    assert 0.5 < L._betai(a, a + 1, 0.5) < 0.5000001
+    for a in (10 ** 15, 10 ** 18):
+        assert abs(L._betai(a, a, 0.5) - 0.5) < 1e-15
+        assert abs(L._betai(a, a + 1, 0.5)
+                   + L._betai(a + 1, a, 0.5) - 1.0) < 1e-15
+        assert 0.5 < L._betai(a, a + 1, 0.5) < 0.5000001
     # The planning helpers must stay consistent with the same tail primitive.
-    n = 10 ** 14
-    k = L.signflip_min_consistency(n, 10, 0.05)
-    assert k is not None and 0 < k < n, k
-    tail = L._binom_cdf_half(n, n - k)
-    assert 20.0 * tail <= 0.05 + 1e-12
-    power = L.signflip_power(n, 10, 0.5, 0.05)
-    assert abs(power - tail) < 1e-12, (power, tail)
+    for n in (10 ** 14, 10 ** 18):
+        k = L.signflip_min_consistency(n, 10, 0.05)
+        assert k is not None and 0 < k < n, k
+        tail = L._binom_cdf_half(n, n - k)
+        assert 20.0 * tail <= 0.05 + 1e-12
+        power = L.signflip_power(n, 10, 0.5, 0.05)
+        assert abs(power - tail) < 1e-12, (power, tail)
 
 
 def t_power():
