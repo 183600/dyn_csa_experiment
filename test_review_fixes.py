@@ -3610,6 +3610,135 @@ def t_ablation_coverage_replication_and_contradiction():
     assert covo['status'] == 'warn', covo
 
 
+def t_replication_independence_is_not_shared_draws():
+    # A draw identity must bind seeds, evaluation slices and recipe/source
+    # fields, while ignoring malformed records instead of crashing.
+    ident = L.component_draw_identity(None, ['full'])
+    assert ident['n_records'] == 0 and ident['seeds'] == [], ident
+
+    fp = 'steps1_sl8_bs1_nt10_lr0.0003_wd0.1_d8_L1_H1_Dh8_v16_wu1_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee1_es1_detcpu-eager_dfabc_csX'
+    knobs = L.training_knobs()
+    recs = {}
+    for i in range(3):
+        for v, ppl in (('full', 50.0), ('full-A', 51.0)):
+            recs[f'{v}::seed{i}'] = dict(
+                variant=v, seed=i, run_cfg=fp, steps=1, tokens_seen=1,
+                ppl=ppl, params=100, train_knobs=knobs, _code='cs1',
+                val_fp='val1', eval_fp='eval1', data_fp='data1')
+    rep = L.methodology_audit(
+        recs, design={'A': [('full', 'full-A', 'ablate')]}, baselines={},
+        verbose=False)
+    draw = rep['component_draws']['A']
+    assert draw['seeds'] == [0, 1, 2], draw
+    assert draw['eval_fps'] == ['eval1'] and draw['val_fps'] == ['val1'], draw
+    assert draw['code_values'] == ['cs1'], draw
+
+    p1 = {'seeds': [0, 1, 2], 'eval_fps': ['eval1'], 'val_fps': ['val1'],
+          'data_fps': ['data1'], 'code_values': ['cs1'],
+          'train_knobs_values': ['knobs1']}
+    p2 = {'seeds': [0, 1, 2], 'eval_fps': ['eval2'], 'val_fps': ['val2'],
+          'data_fps': ['data1'], 'code_values': ['cs1'],
+          'train_knobs_values': ['knobs1']}
+    shared = L.replication_independence_audit({'p1': p1, 'p2': p2})
+    assert shared['status'] == 'shared_training_draws', shared
+    assert shared['panels_shared_seeds'] == ['p1', 'p2'], shared
+
+    # Disjoint training seeds but a shared evaluation slice are NEW training
+    # draws, not independent evaluation.
+    p3 = dict(p2, seeds=[3, 4, 5], eval_fps=['eval1'], val_fps=['val1'])
+    new_seeds = L.replication_independence_audit({'p1': p1, 'p3': p3})
+    assert new_seeds['status'] == 'new_seeds_only', new_seeds
+    assert new_seeds['panels_new_seeds'] == ['p1', 'p3'], new_seeds
+
+    # Disjoint seeds and disjoint evaluation fingerprints are the only tier
+    # that may be called independent replication.
+    p4 = dict(p2, seeds=[3, 4, 5], eval_fps=['eval9'], val_fps=['val9'])
+    independent = L.replication_independence_audit({'p1': p1, 'p4': p4})
+    assert independent['status'] == 'independent_replication', independent
+    assert independent['panels_independent'] == ['p1', 'p4'], independent
+
+    # Missing seed identity is never treated as disjoint.
+    unattested = L.replication_independence_audit(
+        {'p1': p1, 'p5': {'seeds': [], 'eval_fps': ['eval9']}})
+    assert unattested['status'] == 'unattested', unattested
+    assert unattested['n_pairs'] == 1 and unattested['unattested_pairs'], unattested
+
+    # A scalar identity field is one value, not an iterable of characters;
+    # otherwise "eval1"/"eval2" would falsely share the character "e".
+    scalar = L.replication_independence_audit({
+        'p1': {'seeds': 0, 'eval_fps': 'eval1', 'val_fps': 'val1'},
+        'p2': {'seeds': 1, 'eval_fps': 'eval2', 'val_fps': 'val2'}})
+    assert scalar['status'] == 'independent_replication', scalar
+    assert scalar['pairs']['p1|p2']['seed_overlap'] == [], scalar
+
+    # A validation-only match is not enough to attest an independent outcome
+    # slice; without eval/holdout fingerprints this stays new-seeds/unverified.
+    val_only = L.replication_independence_audit({
+        'p1': {'seeds': [0], 'val_fps': ['val1']},
+        'p2': {'seeds': [1], 'val_fps': ['val2']}})
+    assert val_only['status'] == 'new_seeds_only', val_only
+    assert (val_only['pairs']['p1|p2']['tier']
+            == 'new_seeds_unverified_evaluation'), val_only
+
+    # A partially malformed seed list must not silently drop the bad entry and
+    # become "disjoint"; the pair is unattested, not independent.
+    bad_seed = L.replication_independence_audit({
+        'p1': {'seeds': [0, 'not-a-seed'], 'eval_fps': ['eval1']},
+        'p2': {'seeds': [1], 'eval_fps': ['eval2']}})
+    assert bad_seed['status'] == 'unattested', bad_seed
+
+    # Coverage must not call same-seed panels a replication, and must label
+    # disjoint-seed/same-eval panels as a weaker new-seed repetition.
+    def _rep(*, complete=(), measured=(), verified=(), draws=None):
+        return {'ablation_completeness': {
+                    'components': {c: {} for c in complete},
+                    'complete_components': list(complete),
+                    'incomplete_components': [],
+                    'missing_arms': {}},
+                'measured_components': list(measured),
+                'verified_components': list(verified),
+                'unverified_components': [],
+                'direction_conflict_components': [],
+                'practically_harmful_components': [],
+                'components': {}, 'min_n': 3,
+                'component_draws': dict(draws or {})}
+
+    design = {'A': [('full', 'full-A', '')]}
+    same = L.ablation_coverage_across_panels({
+        'p1': _rep(complete=('A',), measured=('A',), verified=('A',),
+                   draws={'A': p1}),
+        'p2': _rep(complete=('A',), measured=('A',), verified=('A',),
+                   draws={'A': p2})}, design)
+    assert same['components']['A']['replication_status'] == 'replicated_shared_seeds', same
+    assert same['independently_replicated_anywhere'] == [], same
+    assert same['shared_seed_replicated_anywhere'] == ['A'], same
+    assert any('share training seeds' in w for w in same['warnings']), same
+
+    new_cov = L.ablation_coverage_across_panels({
+        'p1': _rep(complete=('A',), measured=('A',), verified=('A',),
+                   draws={'A': p1}),
+        'p3': _rep(complete=('A',), measured=('A',), verified=('A',),
+                   draws={'A': p3})}, design)
+    assert new_cov['components']['A']['replication_status'] == 'replicated_new_seeds', new_cov
+    assert new_cov['new_seed_replicated_anywhere'] == ['A'], new_cov
+
+    ind_cov = L.ablation_coverage_across_panels({
+        'p1': _rep(complete=('A',), measured=('A',), verified=('A',),
+                   draws={'A': p1}),
+        'p4': _rep(complete=('A',), measured=('A',), verified=('A',),
+                   draws={'A': p4})}, design)
+    assert ind_cov['components']['A']['replication_status'] == 'replicated', ind_cov
+    assert ind_cov['independently_replicated_anywhere'] == ['A'], ind_cov
+
+    # Legacy reports without draw metadata keep the old label but never get
+    # promoted into the independent list.
+    legacy = L.ablation_coverage_across_panels({
+        'p1': _rep(complete=('A',), measured=('A',), verified=('A',)),
+        'p2': _rep(complete=('A',), measured=('A',), verified=('A',))}, design)
+    assert legacy['components']['A']['replication_status'] == 'replicated', legacy
+    assert legacy['independently_replicated_anywhere'] == [], legacy
+
+
 def t_panel_ablation_flag_does_not_overclaim():
     fp = 'steps1_sl8_bs1_nt10_lr0.0003_wd0.1_d8_L1_H1_Dh8_v16_wu1_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee1_es1_detcpu-eager_dfabc_csX'
     knobs = L.training_knobs()
@@ -24140,6 +24269,8 @@ def main():
            t_finaltest_verdicts_and_refutation_markdown)
     _check('L208 confirmation-verdict audit replays and rejects tampering',
            t_audit_confirmation_verdicts_and_wiring)
+    _check('L209 replication independence separates shared draws from new evidence',
+           t_replication_independence_is_not_shared_draws)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

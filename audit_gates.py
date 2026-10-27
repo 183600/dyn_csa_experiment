@@ -3638,7 +3638,10 @@ def audit_methodology(outdirs=None, design=None, alpha=0.05, min_n=3, write=True
     replicated / single_panel 复现状态，以及任意 panel 的显著反方向
     （direction_conflict）或实际有害（practically_harmful）证据；后者
     关闭 `all_components_useful_allowed`，不会因为另一个 panel 通过而被
-    平均掉。
+    平均掉。`component_draws` 记录每个 component 的 seeds / evaluation
+    fingerprints / code / knobs 身份，`replication_independence` 把
+    `replicated` 细分为独立 draws、仅新 seeds、共享 seeds 和未核验四档；
+    这些标签只影响复现措辞，不参与 p 值或 Holm 校正。
 
     没有 `results_*/summary.json` 时返回 not_verifiable_locally，而不是
     伪造一个通过。"""
@@ -3666,6 +3669,7 @@ def audit_methodology(outdirs=None, design=None, alpha=0.05, min_n=3, write=True
         _panel = {
             'ablation_complete': rep.get('ablation_complete'),
             'ablation_completeness': rep.get('ablation_completeness'),
+            'component_draws': rep.get('component_draws'),
             'controlled_variables': rep.get('controlled_variables'),
             'arm_summary': rep.get('arm_summary'),
             'arms_below_min_seeds': rep.get('arms_below_min_seeds'),
@@ -3717,6 +3721,14 @@ def audit_methodology(outdirs=None, design=None, alpha=0.05, min_n=3, write=True
             out['ablation_coverage'].get('verified_only_incomplete') or [])
         out['replicated_components'] = list(
             out['ablation_coverage'].get('replicated_anywhere') or [])
+        out['independently_replicated_components'] = list(
+            out['ablation_coverage'].get('independently_replicated_anywhere') or [])
+        out['new_seed_replicated_components'] = list(
+            out['ablation_coverage'].get('new_seed_replicated_anywhere') or [])
+        out['shared_seed_replicated_components'] = list(
+            out['ablation_coverage'].get('shared_seed_replicated_anywhere') or [])
+        out['unattested_replicated_components'] = list(
+            out['ablation_coverage'].get('unattested_replicated_anywhere') or [])
         out['single_panel_verified_components'] = list(
             out['ablation_coverage'].get('single_panel_verified') or [])
         out['direction_conflict_across_panels'] = list(

@@ -4277,6 +4277,8 @@ complete / usable / measured / verified / unverified 覆盖读数之外增加：
   翻转结论。
 - 该改动不改变冻结清单、种子、终点、alpha、Holm 决策或任何数值结果；
   不新增训练、不读取 test split、不改 `CODE_SEMANTICS`。
+- §71 进一步把这里的 `replicated` 细分为独立 draws、新 seeds、共享
+  seeds 与未核验；共享 seeds 的 panel 不再能写成独立复现。
 
 ### 65.4 入口与验证
 
@@ -4777,3 +4779,100 @@ L207 覆盖 `finaltest_stats` 的 supported/refuted/inconclusive 三态、
 `_refutation_markdown` 的正反边界文案；L208 覆盖审计对正常 artifact 的
 `warnings`、列表/逐项 verdict 篡改的 `fail`、旧 artifact 与缺文件的
 `not_verifiable_locally`，以及 `run_report`/CLI 接线。
+
+## 71. 跨 panel 复现要区分「新证据」与「同一批 draws 的重复测量」（本轮方法硬化）
+
+### 71.1 问题：两个 panel 都显著，不等于两次独立复现
+
+`ablation_coverage_across_panels` 原先把「>=2 个 complete/verified panel」
+直接标成 `replicated`。但如果两个 panel 使用同一组训练 seeds、同一份
+validation/evaluation 切片，它们只是同一批随机 draws 的重复读数；把这种
+结果写成「跨 panel 独立复现」会高估证据量。反过来，只有训练 seeds 不同、
+评测切片仍相同，也只能支持「新 seeds 上的重复」，不能支持「独立评测单位
+上的复现」。这是报告措辞与项目级证据标签的问题，不是新的显著性检验。
+
+### 71.2 方法：逐 panel 记录 sampling identity，再做 pair 审计
+
+`exp_lib.component_draw_identity(recs, arms)` 只读取 `methodology_audit`
+已经载入的 summary 记录，按 component 的声明臂收集：
+
+- 训练 seed 集合；
+- validation / evaluation / holdout-row fingerprint 集合；
+- data / corpus fingerprint 集合；
+- `_code` 与规范化后的 `train_knobs` 值。
+
+缺失值保持缺失，非法记录跳过，不做「空字符串等于空字符串」的伪匹配。
+`exp_lib.replication_independence_audit(panels)` 对每对 panel 给出：
+
+- `shared_training_draws`：训练 seeds 有交集——重复测量；
+- `new_seeds_same_evaluation` / `new_seeds_unverified_evaluation`：
+  seeds 不相交，但 evaluation/validation/holdout 指纹重叠或未记录；
+- `independent_replication`：seeds 不相交，已记录的 evaluation /
+  validation / holdout 指纹均不重叠，且 eval 或 holdout 至少有一项被记录
+  为不相交；只有 validation 不同、eval/holdout 未记录时仍是
+  `new_seeds_unverified_evaluation`；
+- `unattested`：seed 或评测身份缺失，不能判断；
+- 只有一个 panel：`insufficient_panels`。
+
+`data_fp` / `corpus_fp` 仍被记录和展示，但不参与当前 tier 判定，避免把
+「同一语料的不同抽样」误当成独立评测单位；语料层面的独立性需要单独的
+抽样设计审计。
+
+`ablation_coverage_across_panels` 只在 >=2 个 complete/verified panel 时
+使用这些 tier，并把旧的 `replicated` 细分为：
+
+- `replicated`：至少一对独立复现；
+- `replicated_new_seeds`：只有新 seeds、评测切片仍共享或未核验；
+- `replicated_shared_seeds`：panel 之间共享训练 seeds；
+- `replicated_unattested`：有部分身份记录但不足以判断；
+- 完全没有任何 `component_draws` 的旧 report 保留 `replicated` 旧标签，
+  且**不会**被加入 `independently_replicated_anywhere`。
+
+逐 component 的 `replication_independence` 保留全部 pair、独立/新 seeds/
+共享/未核验列表。顶层
+`independently_replicated_anywhere`、`new_seed_replicated_anywhere`、
+`shared_seed_replicated_anywhere`、`unattested_replicated_anywhere` 分别
+汇总，供报告和 `audit_gates.audit_methodology` 读取。
+
+### 71.3 接线
+
+`methodology_audit` 在写出 component/baseline 分组后，为每个 component 和
+baseline 生成 `report['component_draws'][name]`。该字段只包含身份元数据，
+不读取结果文件、不改变任何 p 值、效应量、SESOI、Holm 族或
+`all_components_useful_allowed`。`ablation_coverage_across_panels` 用
+`component_draws` 生成 tier；`audit_gates.audit_methodology` 把逐 panel
+`component_draws`、全局 tier 以及
+`independently_replicated_components` / `new_seed_replicated_components` /
+`shared_seed_replicated_components` / `unattested_replicated_components`
+暴露到 report。
+
+### 71.4 边界
+
+- **不是新检验。** tier 只解释已有 verified 结果，不增加比较、不重算 p、
+  不改变 FWER；`all_components_useful_allowed` 仍由 complete、verified、
+  direction conflict 与 practically harmful 决定。
+- **共享 seeds 不是矛盾证据。** `replicated_shared_seeds` 是重复测量，
+  不等于结果错误；它只是不能写成独立复现。
+- **新 seeds 不等于独立评测。** 评测切片相同或未记录时，只能写
+  `replicated_new_seeds`。
+- **未核验不是通过。** 混合身份或缺字段时用 `replicated_unattested`；
+  旧 report 没有身份字段时保留 legacy `replicated`，但不升级为独立复现。
+- **不追溯改写历史。** 已落盘旧 artifact 没有 `component_draws`，不能
+  事后补标签；要得到新 tier，必须用当前分析重跑并保留新 artifact。
+- **不改冻结。** 本节不改 `confirmation_frozen.json`、seeds、终点、alpha、
+  Holm 族、`CODE_SEMANTICS` 或任何确认结果。
+
+### 71.5 入口与验证
+
+```bash
+python test_review_fixes.py      # L209 + 既有 coverage 回归
+python v12_supp.py plan          # 冻结计划预检不变
+python audit_gates.py methodology # 读取 results_*/summary.json 的零 GPU 审计
+```
+
+L209 覆盖：identity 对非 dict/malformed 输入不崩溃、同 seeds 共享、
+disjoint seeds + same evaluation、disjoint seeds + disjoint evaluation、
+缺失 seed 为 unattested、coverage 的四种新标签、legacy 无身份保留旧
+`replicated`，以及独立性字段不会把共享 draws 放进
+`independently_replicated_anywhere`。本轮完整 CPU 套件 `560/560` 通过，
+`v12_supp.py plan` 仍为 72/72 records / 6 comparisons。

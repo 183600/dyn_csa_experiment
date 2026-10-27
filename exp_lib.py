@@ -30978,15 +30978,29 @@ def ablation_coverage_across_panels(reports, design=None, *, verbose=False):
     "useful" gate; such panels are named in
     `direction_conflict_anywhere` / `practically_harmful_anywhere`.
     `replication_status` distinguishes `replicated` (verified in >=2 complete
-    panels), `single_panel`, `contradicted`, and `not_verified`; it is
-    descriptive unless a contradiction is present.  A powered but
-    non-significant opposite mean is reported as a warning, not counted as a
-    corrected contradiction."""
+    panels), `single_panel`, `contradicted`, and `not_verified`.  With the
+    sampling identity written by :func:`methodology_audit`, the replicate
+    label is further split: `replicated` requires at least one pair with
+    disjoint training seeds AND at least one recorded eval/holdout fingerprint
+    that is disjoint (with no recorded evaluation fingerprint overlapping);
+    disjoint seeds on a shared evaluation slice are `replicated_new_seeds`; shared
+    seeds are `replicated_shared_seeds` (repeated measurement, not independent
+    replication); a mix with missing identities and no stronger pair is
+    `replicated_unattested`.  Per-pair detail remains in
+    `replication_independence`.
+    These labels never change the p values or the project-level usefulness
+    gate; they only stop repeated draws from being reported as independent
+    replication.  A powered but non-significant opposite mean is reported as a
+    warning, not counted as a corrected contradiction."""
     design = ABLATION_DESIGN if design is None else design
     out = {'status': 'ok', 'components': {}, 'complete_anywhere': [],
            'usable_anywhere': [], 'verified_anywhere': [], 'measured_anywhere': [],
            'missing_everywhere': [], 'complete_but_unverified': [],
            'verified_only_incomplete': [], 'replicated_anywhere': [],
+           'independently_replicated_anywhere': [],
+           'new_seed_replicated_anywhere': [],
+           'shared_seed_replicated_anywhere': [],
+           'unattested_replicated_anywhere': [],
            'single_panel_verified': [], 'direction_conflict_anywhere': [],
            'practically_harmful_anywhere': [], 'opposite_mean_anywhere': [],
            'warnings': []}
@@ -31002,6 +31016,10 @@ def ablation_coverage_across_panels(reports, design=None, *, verbose=False):
                'panels_direction_conflict': [],
                'panels_practically_harmful': [],
                'panels_opposite_mean': [], 'panels_replicated': [],
+               'panels_independently_replicated': [],
+               'panels_new_seed_replicated': [],
+               'panels_shared_seed_replicated': [],
+               'replication_independence': {},
                'replication_status': 'not_measured',
                'missing_arms': {}, 'declared_in': []}
         for name in sorted(reports):
@@ -31076,15 +31094,56 @@ def ablation_coverage_across_panels(reports, design=None, *, verbose=False):
         _verified_complete = sorted(set(row['panels_verified']))
         row['panels_replicated'] = (_verified_complete
                                     if len(_verified_complete) >= 2 else [])
+        # Sampling identity: only panels that actually verified the component
+        # can be replication evidence.  Missing identities are intentionally
+        # kept in the audit as unattested rather than dropped, so two newly
+        # identified panels cannot hide a third unlabelled duplicate panel.
+        _draws, _draws_present = {}, False
+        for _name in _verified_complete:
+            _rp = reports.get(_name)
+            _cd = ((_rp.get('component_draws') or {})
+                   if isinstance(_rp, dict) else {})
+            _draw = _cd.get(comp) if isinstance(_cd, dict) else None
+            if isinstance(_draw, dict):
+                _draws[_name] = _draw
+                _draws_present = True
+            else:
+                _draws[_name] = {}
+        _ind = replication_independence_audit(_draws)
+        row['replication_independence'] = _ind
+        if _ind.get('status') == 'independent_replication':
+            row['panels_independently_replicated'] = list(
+                _ind.get('panels_independent') or [])
+        elif _ind.get('status') == 'new_seeds_only':
+            row['panels_new_seed_replicated'] = list(
+                _ind.get('panels_new_seeds') or [])
+        elif _ind.get('status') == 'shared_training_draws':
+            row['panels_shared_seed_replicated'] = list(
+                _ind.get('panels_shared_seeds') or [])
         row['complete_anywhere'] = bool(row['panels_complete'])
         row['usable_anywhere'] = bool(row['panels_usable'])
         row['verified_anywhere'] = bool(row['panels_verified'])
         row['measured_anywhere'] = bool(row['panels_measured'])
         _contradicted = bool(row['panels_direction_conflict']
                              or row['panels_practically_harmful'])
+        _repl_status = None
+        if len(row['panels_replicated']) >= 2:
+            _tier = _ind.get('status')
+            if _tier == 'independent_replication':
+                _repl_status = 'replicated'
+            elif _tier == 'new_seeds_only':
+                _repl_status = 'replicated_new_seeds'
+            elif _tier == 'shared_training_draws':
+                _repl_status = 'replicated_shared_seeds'
+            elif _draws_present:
+                _repl_status = 'replicated_unattested'
+            else:
+                # Legacy reports predate component_draws.  Keep the historical
+                # label rather than retroactively calling them independent.
+                _repl_status = 'replicated'
         row['replication_status'] = (
             'contradicted' if _contradicted else
-            'replicated' if row['panels_replicated'] else
+            _repl_status if _repl_status else
             'single_panel' if row['panels_verified'] else
             'not_verified' if row['panels_measured'] else 'not_measured')
         out['components'][comp] = row
@@ -31118,6 +31177,28 @@ def ablation_coverage_across_panels(reports, design=None, *, verbose=False):
             out['replicated_anywhere'].append(comp)
         elif row['panels_verified']:
             out['single_panel_verified'].append(comp)
+        if row['panels_independently_replicated']:
+            out['independently_replicated_anywhere'].append(comp)
+        elif row['panels_new_seed_replicated']:
+            out['new_seed_replicated_anywhere'].append(comp)
+            out['warnings'].append(
+                '%s: verified in %s with disjoint training seeds, but the '
+                'evaluation slice is shared or not attested as disjoint — '
+                'report a new-seed replication, not an independent evaluation'
+                % (comp, ', '.join(row['panels_new_seed_replicated'])))
+        elif row['panels_shared_seed_replicated']:
+            out['shared_seed_replicated_anywhere'].append(comp)
+            out['warnings'].append(
+                '%s: verified in %s but those panels share training seeds; '
+                'this is repeated measurement of the same draws, not '
+                'independent replication'
+                % (comp, ', '.join(row['panels_shared_seed_replicated'])))
+        elif row['replication_status'] == 'replicated_unattested':
+            out['unattested_replicated_anywhere'].append(comp)
+            out['warnings'].append(
+                '%s: verified in >=2 complete panels, but at least one panel '
+                'lacks a usable draw identity; replication independence is '
+                'unattested' % comp)
         if row['panels_direction_conflict']:
             out['direction_conflict_anywhere'].append(comp)
             out['warnings'].append(
@@ -31173,6 +31254,244 @@ def ablation_coverage_across_panels(reports, design=None, *, verbose=False):
               % (', '.join(out['complete_anywhere']) or 'none',
                  ', '.join(out['missing_everywhere']) or 'none'))
     return out
+
+_COMPONENT_DRAW_FP_FIELDS = ('val_fp', 'eval_fp', 'holdout_row_fp',
+                             'data_fp', 'corpus_fp')
+
+
+def _draw_value(v):
+    """Stable string identity for a draw/fingerprint field.
+
+    A string is already an identity and must not be JSON-quoted a second time
+    when an exported report is re-audited; structured values are canonicalised
+    with sorted keys so two equivalent mappings compare equal.
+    """
+    if isinstance(v, str):
+        return v.strip()
+    return _canon_setting(v)
+
+
+def _identity_values(v):
+    """Iterator for an identity field, treating a scalar as one value.
+
+    Exported/older reports may carry a bare string or integer where the
+    current writer emits a list.  Iterating a bare string would compare its
+    characters (so "seed-1" and "seed-2" could share the character "e"),
+    which is exactly the silent false match this gate must avoid.
+    """
+    if v is None:
+        return ()
+    if isinstance(v, (list, tuple, set, frozenset)):
+        return v
+    return (v,)
+
+
+def component_draw_identity(recs, arms):
+    """Describe the sampling draws behind one component's arm records.
+
+    A cross-panel "replicated" label is only meaningful if the panels are not
+    just the same training seeds measured twice.  `methodology_audit` stores
+    this compact identity next to each component so the project-level gate can
+    distinguish independent draws from repeated measurements.  Fingerprints
+    are canonicalised, missing values stay missing (never an empty-string
+    match), and malformed record keys are ignored instead of crashing.
+
+    The identity is descriptive: it does not decide significance, does not
+    compare arms, and does not read any result file.
+    """
+    if not isinstance(recs, dict):
+        recs, arms = {}, []
+    if isinstance(arms, str):
+        arms = [arms]
+    arm_set = {str(a) for a in (arms or ()) if isinstance(a, str) and a.strip()}
+    seeds, fps, codes, knobs = set(), {k: set() for k in _COMPONENT_DRAW_FP_FIELDS}, set(), set()
+    n_records = 0
+    for key, rec in recs.items():
+        if not isinstance(key, (tuple, list)) or len(key) != 3:
+            continue
+        variant = key[0]
+        if variant not in arm_set:
+            continue
+        n_records += 1
+        if not isinstance(rec, dict):
+            continue
+        seed = _as_seed_int(key[2])
+        if seed is not None:
+            seeds.add(seed)
+        for field in _COMPONENT_DRAW_FP_FIELDS:
+            val = rec.get(field)
+            if val is None or (isinstance(val, str) and not val.strip()):
+                continue
+            fps[field].add(_draw_value(val))
+        code = rec.get('_code')
+        if code is not None and not (isinstance(code, str) and not code.strip()):
+            codes.add(_draw_value(code))
+        kn = rec.get('train_knobs')
+        if kn is not None:
+            knobs.add(_draw_value(kn))
+    out = {'arms': sorted(arm_set), 'n_records': int(n_records),
+           'seeds': sorted(seeds), 'code_values': sorted(codes),
+           'train_knobs_values': sorted(knobs)}
+    for field in _COMPONENT_DRAW_FP_FIELDS:
+        out[field + 's'] = sorted(fps[field])
+    return out
+
+
+def _draws_overlap(a, b):
+    """True/False/None for two canonical setting sets.
+
+    None means at least one side has no recorded value, so overlap cannot be
+    attested; it must never be read as "disjoint".
+    """
+    if not a or not b:
+        return None
+    return bool(set(a) & set(b))
+
+
+def replication_independence_audit(panels):
+    """Classify whether verified panels are independent replications.
+
+    ``panels`` maps panel name -> a :func:`component_draw_identity` dict (or a
+    compatible mapping with ``seeds`` and fingerprint lists).  Two panels are
+    only an independent replication when their training seeds are disjoint,
+    no recorded evaluation fingerprint overlaps, and at least one
+    eval/holdout fingerprint is recorded as disjoint.  Disjoint seeds with a
+    shared (or unverifiable) evaluation slice are recorded as new training
+    draws, not as independent evaluation; overlapping seeds are repeated
+    measurements of the same draws, however different the surrounding panel
+    labels are.
+
+    Returns per-pair detail plus one of ``independent_replication``,
+    ``new_seeds_same_evaluation``, ``new_seeds_unverified_evaluation``,
+    ``shared_training_draws``, ``unattested`` or ``insufficient_panels``.
+    This is a labelling/diagnostic gate, not a new hypothesis test.
+    """
+    if not isinstance(panels, dict):
+        return {'status': 'unattested', 'n_panels': 0, 'n_pairs': 0,
+                'pairs': {}, 'independent_pairs': [], 'new_seed_pairs': [],
+                'shared_seed_pairs': [], 'unattested_pairs': [],
+                'panels_independent': [], 'panels_new_seeds': [],
+                'panels_shared_seeds': [],
+                'warnings': ['panels must be a mapping of panel -> draw identity']}
+    norm = {}
+    for name, ident in panels.items():
+        if not isinstance(ident, dict):
+            continue
+        seeds = set()
+        _bad_seed = False
+        for s in _identity_values(ident.get('seeds')):
+            _s = _as_seed_int(s)
+            if _s is None:
+                _bad_seed = True
+            else:
+                seeds.add(_s)
+        fps = {f: {_draw_value(x) for x in _identity_values(ident.get(f + 's'))
+                   if x is not None and not (isinstance(x, str) and not x.strip())}
+               for f in _COMPONENT_DRAW_FP_FIELDS}
+        _codes = {_draw_value(x) for x in _identity_values(ident.get('code_values'))
+                  if x is not None and not (isinstance(x, str) and not x.strip())}
+        _knobs = {_draw_value(x) for x in _identity_values(ident.get('train_knobs_values'))
+                  if x is not None}
+        norm[str(name)] = {'seeds': sorted(seeds) if seeds else None,
+                           'bad_seed': _bad_seed, 'fps': fps,
+                           'code_values': _codes,
+                           'train_knobs_values': _knobs}
+    pairs, independent, new_seed, shared, unattested = {}, [], [], [], []
+    names = sorted(norm)
+    for i, a in enumerate(names):
+        for b in names[i + 1:]:
+            A, B = norm[a], norm[b]
+            sa, sb = A['seeds'], B['seeds']
+            seed_overlap = (sorted(set(sa) & set(sb))
+                            if sa is not None and sb is not None else None)
+            seed_disjoint = (not seed_overlap if seed_overlap is not None else False)
+            ev_overlap = {}
+            for field in ('val_fp', 'eval_fp', 'holdout_row_fp'):
+                ev_overlap[field] = _draws_overlap(A['fps'][field], B['fps'][field])
+            shared_fields = [f for f, v in ev_overlap.items() if v is True]
+            attested = [f for f, v in ev_overlap.items() if v is not None]
+            # Validation-only agreement is not enough to attest an independent
+            # outcome slice: `eval_fp`/`holdout_row_fp` must also be recorded
+            # as disjoint.  Otherwise a panel pair with two unrecorded
+            # evaluation slices would be promoted to independence on the
+            # strength of a validation fingerprint alone.
+            _primary_attested = any(
+                ev_overlap[f] is not None
+                for f in ('eval_fp', 'holdout_row_fp'))
+            evaluation_shared = (True if shared_fields else
+                                 (False if _primary_attested else None))
+            if A['bad_seed'] or B['bad_seed'] or sa is None or sb is None:
+                tier = 'unattested'
+            elif seed_overlap:
+                tier = 'shared_training_draws'
+            elif evaluation_shared is True:
+                tier = 'new_seeds_same_evaluation'
+            elif evaluation_shared is False:
+                tier = 'independent_replication'
+            else:
+                tier = 'new_seeds_unverified_evaluation'
+            pairs[f'{a}|{b}'] = {
+                'panel_a': a, 'panel_b': b, 'tier': tier,
+                'seed_overlap': seed_overlap,
+                'seed_disjoint': bool(seed_disjoint),
+                'evaluation_overlap': ev_overlap,
+                'evaluation_shared': evaluation_shared,
+                'shared_evaluation_fields': shared_fields,
+                'evaluation_attested_fields': attested,
+                'code_shared': _draws_overlap(A['code_values'],
+                                               B['code_values']),
+                'recipe_shared': _draws_overlap(A['train_knobs_values'],
+                                                 B['train_knobs_values']),
+            }
+            if tier == 'independent_replication':
+                independent.append(pairs[f'{a}|{b}'])
+            elif tier in ('new_seeds_same_evaluation',
+                          'new_seeds_unverified_evaluation'):
+                new_seed.append(pairs[f'{a}|{b}'])
+            elif tier == 'shared_training_draws':
+                shared.append(pairs[f'{a}|{b}'])
+            else:
+                unattested.append(pairs[f'{a}|{b}'])
+    if independent:
+        status = 'independent_replication'
+    elif new_seed:
+        status = 'new_seeds_only'
+    elif shared:
+        status = 'shared_training_draws'
+    elif len(norm) < 2:
+        status = 'insufficient_panels'
+    else:
+        status = 'unattested'
+    warnings = []
+    if status == 'shared_training_draws':
+        warnings.append(
+            'verified panels share training seeds (%s); this is repeated '
+            'measurement of the same draws, not independent replication'
+            % ', '.join(map(str, sorted({s for p in shared for s in (p['seed_overlap'] or [])}))))
+    elif status == 'new_seeds_only':
+        warnings.append(
+            'verified panels use disjoint training seeds but share or do not '
+            'attest an independent evaluation slice; report this as a new-seed '
+            'replication, not an independent evaluation')
+    elif status == 'unattested':
+        warnings.append('panel draw identities are missing or incomplete; '
+                        'replication independence is unattested')
+    return {
+        'status': status, 'n_panels': len(norm), 'n_pairs': len(pairs),
+        'pairs': pairs,
+        'independent_pairs': [f'{p["panel_a"]}|{p["panel_b"]}' for p in independent],
+        'new_seed_pairs': [f'{p["panel_a"]}|{p["panel_b"]}' for p in new_seed],
+        'shared_seed_pairs': [f'{p["panel_a"]}|{p["panel_b"]}' for p in shared],
+        'unattested_pairs': [f'{p["panel_a"]}|{p["panel_b"]}' for p in unattested],
+        'panels_independent': sorted({p['panel_a'] for p in independent}
+                                     | {p['panel_b'] for p in independent}),
+        'panels_new_seeds': sorted({p['panel_a'] for p in new_seed}
+                                   | {p['panel_b'] for p in new_seed}),
+        'panels_shared_seeds': sorted({p['panel_a'] for p in shared}
+                                      | {p['panel_b'] for p in shared}),
+        'warnings': warnings,
+    }
+
 
 def _baseline_artifact_path(name, outdir=None):
     """Locate a baseline artifact next to a panel or its parent.
@@ -33195,6 +33514,7 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
               'untuned_verified_baselines': [],
               'direction_unspecified_components': [], 'direction_unspecified_baselines': [],
               'incomplete_components': [], 'controlled_variables': {},
+              'component_draws': {},
               'ablation_completeness': {}, 'ablation_complete': None,
               'arm_summary': {}, 'arms_below_min_seeds': [],
               'component_seed_requirements': {}, 'baseline_seed_requirements': {},
@@ -33858,6 +34178,18 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
 
     _publish('components', design, comp_entries, comp_meta, 'component', require_param_match=False)
     _publish('baselines', baselines, base_entries, base_meta, 'baseline', require_param_match=True)
+
+    # Sampling identity for the project-level replication gate: two panels
+    # that verify the same component with the SAME seeds are repeated
+    # measurements, not independent replications.  This is descriptive
+    # metadata; it does not enter any p value or family correction.
+    report['component_draws'] = {}
+    for _group, _group_design, _group_meta in (
+            ('components', design, comp_meta),
+            ('baselines', baselines, base_meta)):
+        for _comp in _group_design:
+            _arms = ((_group_meta.get(_comp) or {}).get('arms') or [])
+            report['component_draws'][_comp] = component_draw_identity(recs, _arms)
 
     # ---- SESOI / practical-equivalence summary ---------------------------
     # Per component this is the decision the ablation actually needs:
