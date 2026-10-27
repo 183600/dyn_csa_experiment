@@ -41570,6 +41570,26 @@ def _error_rank_correlation(a, b):
     return float(np.corrcoef(ra, rb)[0, 1])
 
 
+def _error_bucket_split_order(clusters, split_seed):
+    """Deterministic whole-cluster order from SHA-256(split_seed, cluster).
+
+    Cluster labels are validation-row ids (or arbitrary canonical strings).
+    Hashing rather than slicing the first-occurrence order prevents a corpus
+    whose rows are grouped by document from systematically putting one part of
+    the document order into discovery and the other into replication.  The
+    seed is part of the digest, so a different declared seed reshuffles the
+    split while the same seed always reproduces it exactly.
+    """
+    seed = int(split_seed)
+    prefix = f'{seed}\x00'.encode('utf-8')
+
+    def _key(cluster):
+        text = str(cluster)
+        return (hashlib.sha256(prefix + text.encode('utf-8')).digest(), text)
+
+    return sorted({str(c) for c in clusters}, key=_key)
+
+
 def paired_error_bucket_inference(deltas, bucket_ids, cluster_ids, *, alpha=0.05,
                                   direction='positive', split_seed=None,
                                   discovery_frac=None, min_clusters=None,
@@ -41583,14 +41603,15 @@ def paired_error_bucket_inference(deltas, bucket_ids, cluster_ids, *, alpha=0.05
     post-hoc descriptions: the bucket family was inspected before selection.
 
     To separate discovery from confirmation, whole clusters are split into
-    two disjoint contiguous blocks in first-occurrence (row) order.  Contiguous
-    blocks keep adjacent rows - which may belong to the same document - on the
-    same side, instead of interleaving a document across the boundary.  The
-    worst bucket is chosen on the discovery block only; its mean, t interval
-    and exact sign-flip p are then reported on the untouched replication block.
-    ``replicated`` requires the same sign and a replication CI excluding zero.
-    This is an internal stability check (fixed validation text, not a random
-    population sample), not independent external replication.
+    two disjoint blocks by a deterministic SHA-256 order keyed by the declared
+    seed.  Hashing avoids turning a corpus whose rows are grouped by document
+    into a systematic "early documents discover, late documents replicate"
+    split.  The worst bucket is chosen on the discovery block only; its mean,
+    t interval and exact sign-flip p are then reported on the untouched
+    replication block.  ``replicated`` requires the same sign and a replication
+    CI excluding zero.  This is an internal stability check (fixed validation
+    text, not a random population sample), not independent external
+    replication.
     """
     alpha = _validated_alpha(alpha)
     if direction not in ('positive', 'negative', 'two-sided'):
@@ -41656,10 +41677,9 @@ def paired_error_bucket_inference(deltas, bucket_ids, cluster_ids, *, alpha=0.05
     d = d[keep]
     bucket_labels = [bucket_labels[i] for i in keep]
     cluster_labels = [cluster_labels[i] for i in keep]
-    clusters_ordered = list(dict.fromkeys(cluster_labels))
     clusters = sorted(set(cluster_labels))
     bucket_names = sorted(set(bucket_labels))
-    nc = len(clusters_ordered)
+    nc = len(clusters)
     cmap = {c: i for i, c in enumerate(clusters)}
     cidx = np.fromiter((cmap[c] for c in cluster_labels), dtype=np.int64, count=d.size)
     bucket_reports = {}
@@ -41699,9 +41719,7 @@ def paired_error_bucket_inference(deltas, bucket_ids, cluster_ids, *, alpha=0.05
                           f'{min_clusters} clusters each')
         return base
 
-    ordered = clusters_ordered
-    # The seed is kept in the artifact as an audit identifier; the contiguous
-    # split itself is order-based, so changing the seed cannot reshuffle rows.
+    ordered = _error_bucket_split_order(clusters, split_seed)
     n_disc = int(round(discovery_frac * nc))
     n_disc = max(min_clusters, min(nc - min_clusters, n_disc))
     discovery = set(ordered[:n_disc])
@@ -41709,7 +41727,7 @@ def paired_error_bucket_inference(deltas, bucket_ids, cluster_ids, *, alpha=0.05
     base['split'] = {
         'seed': split_seed,
         'discovery_frac_requested': discovery_frac,
-        'strategy': 'contiguous first-occurrence whole-cluster blocks; discovery then replication',
+        'strategy': 'sha256(seed, cluster) whole-cluster order; discovery then replication',
         'cluster_order': ordered,
         'discovery_clusters': [c for c in ordered if c in discovery],
         'replication_clusters': [c for c in ordered if c in replication],

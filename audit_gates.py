@@ -6969,6 +6969,18 @@ def audit_error_case_inference(path=None):
         min_clusters = int(min_clusters)
         min_tokens = int(min_tokens)
         buckets = fam.get('buckets') if isinstance(fam.get('buckets'), dict) else {}
+        if fam.get('status') == 'no_data':
+            if buckets:
+                _p.append('status=no_data must not carry buckets')
+            if fam.get('selected') is not None:
+                _p.append('status=no_data must not carry a selected bucket')
+            if fam.get('split') is not None:
+                _p.append('status=no_data must not carry a split')
+            if _finite(fam.get('n_tokens')) != 0.0:
+                _p.append('status=no_data must record zero finite paired tokens')
+            rec['n_clusters'] = 0
+            rec['status'] = 'fail' if _p else 'ok'
+            continue
         if not buckets:
             _p.append('no buckets recorded')
             rec['status'] = 'fail'
@@ -7035,6 +7047,10 @@ def audit_error_case_inference(path=None):
         if fam.get('status') == 'insufficient_clusters':
             if split is not None:
                 _p.append('insufficient_clusters status must not carry a split')
+            if fam.get('selected') is not None:
+                _p.append('insufficient_clusters status must not carry a selected bucket')
+            if len(all_clusters) >= 2 * min_clusters:
+                _p.append('insufficient_clusters but replay finds enough clusters for two halves')
             rec['n_clusters'] = len(all_clusters)
             rec['status'] = 'fail' if _p else 'ok'
             continue
@@ -7059,13 +7075,20 @@ def audit_error_case_inference(path=None):
             _p.append('split does not partition the observed clusters')
         if len(disc_raw) != len(disc) or len(repl_raw) != len(repl):
             _p.append('split cluster lists contain duplicates')
+        if split.get('seed') != seed:
+            _p.append(f"split seed {split.get('seed')!r} != declared split_seed {seed!r}")
+        if split.get('strategy') != 'sha256(seed, cluster) whole-cluster order; discovery then replication':
+            _p.append(f"split strategy {split.get('strategy')!r} is not the audited SHA-256 rule")
         if not isinstance(order_raw, list):
-            _p.append('split cluster_order missing (cannot verify contiguity)')
+            _p.append('split cluster_order missing (cannot verify the SHA-256 split)')
             rec['status'] = 'fail'
             continue
         ordered = [str(x) for x in order_raw]
         if len(ordered) != len(set(ordered)) or set(ordered) != all_clusters:
             _p.append('cluster_order is not a permutation of the observed clusters')
+        expected_order = L._error_bucket_split_order(all_clusters, seed)
+        if ordered != expected_order:
+            _p.append('cluster_order != SHA-256(split_seed, cluster) order')
         if disc_raw != [c for c in ordered if c in disc]:
             _p.append('discovery cluster order was not preserved')
         if repl_raw != [c for c in ordered if c in repl]:
@@ -7074,7 +7097,13 @@ def audit_error_case_inference(path=None):
         n_disc = max(min_clusters, min(len(ordered) - min_clusters, n_disc))
         expected_disc = set(ordered[:n_disc])
         if disc != expected_disc:
-            _p.append('discovery half is not the contiguous first-occurrence split')
+            _p.append('discovery half is not the SHA-256 cluster split')
+        if split.get('disjoint') is not True:
+            _p.append('split metadata does not declare disjoint halves')
+        if split.get('n_discovery') != len(disc_raw):
+            _p.append('split n_discovery != replay')
+        if split.get('n_replication') != len(repl_raw):
+            _p.append('split n_replication != replay')
         # Replay each half's mean/tokens and the discovery-only selection.
         cand = []
         for b in sorted(buckets):

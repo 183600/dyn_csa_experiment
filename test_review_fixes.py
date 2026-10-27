@@ -24405,6 +24405,16 @@ def t_error_bucket_inference_split_half_and_audit():
     again = L.paired_error_bucket_inference(d, buckets, rows, min_clusters=3,
                                             min_tokens=5, split_seed=7)
     assert again['split'] == split, 'split must be deterministic'
+    # The declared seed must drive the SHA-256 cluster order, not just be
+    # echoed in the artifact.  Otherwise a tampered seed would be unauditable.
+    other_orders = {
+        tuple(L.paired_error_bucket_inference(
+            d, buckets, rows, min_clusters=3, min_tokens=5,
+            split_seed=_seed)['split']['cluster_order'])
+        for _seed in (8, 9, 10)
+    }
+    assert tuple(split['cluster_order']) not in other_orders, (
+        'different split seeds must reshuffle the cluster order')
     # No positive discovery candidate is a different state from "no data".
     neg = L.paired_error_bucket_inference([-x for x in d], buckets, rows,
                                           min_clusters=3, min_tokens=5,
@@ -24434,6 +24444,28 @@ def t_error_bucket_inference_split_half_and_audit():
                        'bucket_inference': [rep]}, f)
         aud = A.audit_error_case_inference(art)
         assert aud['status'] == 'ok', aud
+        bad_seed = json.loads(json.dumps(rep))
+        bad_seed['split_seed'] += 1
+        with open(art, 'w', encoding='utf-8') as f:
+            json.dump({'bucket_inference': [bad_seed]}, f)
+        aud_seed = A.audit_error_case_inference(art)
+        assert aud_seed['status'] == 'fail', aud_seed
+        assert any('seed' in x for x in aud_seed['problems']), aud_seed
+        # A no_data family is auditable only when it really is empty; a
+        # fabricated token count must not turn "no data" into a passing claim.
+        empty_fam = json.loads(json.dumps(empty))
+        empty_fam['family'] = 'empty'
+        with open(art, 'w', encoding='utf-8') as f:
+            json.dump({'bucket_inference': [empty_fam]}, f)
+        aud_empty = A.audit_error_case_inference(art)
+        assert aud_empty['status'] == 'ok', aud_empty
+        bad_empty = json.loads(json.dumps(empty_fam))
+        bad_empty['n_tokens'] = 1
+        with open(art, 'w', encoding='utf-8') as f:
+            json.dump({'bucket_inference': [bad_empty]}, f)
+        aud_bad_empty = A.audit_error_case_inference(art)
+        assert aud_bad_empty['status'] == 'fail', aud_bad_empty
+        assert any('zero finite' in x for x in aud_bad_empty['problems']), aud_bad_empty
         bad = json.loads(json.dumps(rep))
         bad['selected']['replicated'] = not bad['selected']['replicated']
         with open(art, 'w', encoding='utf-8') as f:
