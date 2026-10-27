@@ -194,6 +194,22 @@ def t_binomial_tail_large_scale():
         assert 20.0 * tail <= 0.05 + 1e-12
         power = L.signflip_power(n, 10, 0.5, 0.05)
         assert abs(power - tail) < 1e-12, (power, tail)
+    # Public wrappers must take p directly.  Passing 1-p into the beta helper
+    # and folding the complement back in (1-(1-p)) loses ~eps/p relative
+    # accuracy: at n=1e16, p=1e-12 the old lower tail was 0.5035421 instead of
+    # the high-precision 0.5026596 (mpmath, 80 digits).  Keep both tails exact
+    # enough that they still partition the sample space at this scale.
+    _n, _p, _k = 10 ** 16, 1e-12, 10000
+    assert abs(L._binomial_cdf(0, 1000, 0.5) - 0.5 ** 1000) < 1e-300
+    assert abs(L._binomial_cdf(_k, _n, _p) - 0.5026595812190084) < 1e-11
+    assert abs(L._binomial_cdf(_k, _n, _p)
+               + L._binomial_sf(_k + 1, _n, _p) - 1.0) < 1e-12
+    # The planning power uses the same direct upper tail; it must not
+    # subtract 1-(1-q) anywhere on the way back out.
+    _kmin = L.signflip_min_consistency(2000, 10, 0.05)
+    for _q in (0.5, 0.55, 0.9, 0.999999):
+        assert abs(L.signflip_power(2000, 10, _q, 0.05)
+                   - L._binomial_sf_stable(_kmin, 2000, _q)) < 1e-15
 
 
 def t_power():

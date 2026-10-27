@@ -15582,8 +15582,9 @@ def signflip_power(n_seeds, m_comparisons, q, alpha=0.05):
     因此这里的功效是对真实 sign-flip 功效的上界（绝对值不等时实际功效
     更低）。功效对 q 敏感——预注册时必须报告 q 的假设来源（如 validation
     面板的同向率），不得只报「数学上可能」。n<=0 或方案不可能确认时返回
-    0.0。尾部概率用正则化不完全贝塔函数计算（P(X<=k-1)=I_{1-q}(n-k+1,k)），
-    大 n 下不会因 `comb(n,k)*q**k` 的整数/浮点溢出而失败。"""
+    0.0。尾部概率直接调用稳定的上尾分发器计算 P(Bin(n,q)>=k_min)，
+    既避免 `comb(n,k)*q**k` 在 n 很大时溢出，也避免先算下尾 1-q 再
+    相减带来的 `1-(1-q)` 精度损失。"""
     kmin = signflip_min_consistency(n_seeds, m_comparisons, alpha)
     if kmin is None or kmin <= 0:
         return 0.0 if kmin is None else 1.0
@@ -15600,16 +15601,20 @@ def signflip_power(n_seeds, m_comparisons, q, alpha=0.05):
         return 1.0
     if q <= 0.0:
         return 0.0
-    cdf = _betai(n - kmin + 1, kmin, 1.0 - q)
-    if not math.isfinite(cdf):
+    # Evaluate the upper tail directly.  The old form computed the lower
+    # tail at 1-q and subtracted it; for tiny q the beta helper folds the
+    # complement back in (1-(1-q)), so q loses ~eps/q relative accuracy and
+    # the returned power is quantised/cancelled.  The stable upper-tail
+    # dispatcher takes q directly and remains exact down to the tiny-p tail.
+    tail = _binomial_sf_stable(kmin, n, q)
+    if not math.isfinite(tail):
         # Fallback: log-space binomial tail (overflow-free).
         logq, log1q = math.log(q), math.log1p(-q)
         logs = [math.lgamma(n + 1) - math.lgamma(k + 1) - math.lgamma(n - k + 1)
                 + k * logq + (n - k) * log1q for k in range(kmin, n + 1)]
         mx = max(logs)
-        pw = math.exp(mx) * math.fsum(math.exp(x - mx) for x in logs)
-        return float(min(1.0, pw))
-    return float(min(1.0, max(0.0, 1.0 - cdf)))
+        tail = math.exp(mx) * math.fsum(math.exp(x - mx) for x in logs)
+    return float(min(1.0, max(0.0, tail)))
 
 
 def tost_paired(deltas, margin, conf=0.90):
@@ -45883,7 +45888,10 @@ def _binomial_sf(k, n, p):
         return 1.0
     if k > n:
         return 0.0
-    v = _betai(k, n - k + 1, p)
+    # Same direct-p contract as the lower-tail wrapper: the stable dispatcher
+    # picks the exact small-index sum or the matching beta/Edgeworth branch
+    # without ever folding in a complement that could lose precision.
+    v = _binomial_sf_stable(k, n, p)
     if not math.isfinite(v):
         raise ValueError('binomial upper tail is not finite')
     return float(min(1.0, max(0.0, v)))
@@ -45897,7 +45905,11 @@ def _binomial_cdf(k, n, p):
         return 0.0
     if k >= n:
         return 1.0
-    v = _betai(n - k, k + 1, 1.0 - p)
+    # Route through the stable dispatcher instead of forming 1-p and passing
+    # it to _betai: for tiny p that subtraction is exact, but _betai folds the
+    # complement back in and ``1-(1-p)`` loses ~eps/p relative accuracy (a
+    # 0.2% CDF error at n=1e16, p=1e-12).  The dispatcher takes p directly.
+    v = _binomial_cdf_stable(k, n, p)
     if not math.isfinite(v):
         raise ValueError('binomial lower tail is not finite')
     return float(min(1.0, max(0.0, v)))
