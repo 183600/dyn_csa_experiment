@@ -16643,16 +16643,28 @@ def _binomial_cdf_stable(k, n, p):
     # few tail terms is both exact and cheap there.
     if min(k, n - k) <= _BINOMIAL_TINY_INDEX_MAX:
         return _binom_cdf_exact_lower(k, n, p)
-    # With one small beta index the continued fraction converges quickly and
-    # is more accurate than a long exact sum or the Edgeworth correction.  Use
-    # it even for n > 1e8 when the index is still manageable; the remaining
-    # large-index cases are the ones that hit the old 1e6-iteration cap.
     if n <= _BINOMIAL_OLD_MAX_N:
         return float(_betai_nr(float(n - k), float(k + 1), 1.0 - p))
     if min(k, n - k) <= _BINOMIAL_EXACT_INDEX_MAX:
-        # p <= 0.5 here.  Computing I_{1-p}(n-k,k+1) directly makes the beta
-        # parameters huge and x ~ 1, where the legacy path can lose ~1e-5.
-        # Use the complementary upper tail instead: P(X<=k)=1-P(X>=k+1).
+        # p <= 0.5 here.  For tiny p the complement route computes
+        # P(X<=k) as 1-P(X>=k+1) and folds x through 1-x; at n=1e16,
+        # p=1e-12 that loses ~1e-2 near the mean because the CDF
+        # derivative is ~n*pmf.  Close to the mean the direct lower beta
+        # avoids the fold; further out the exact lower sum avoids the
+        # direct path's loss of precision as the lower tail approaches one.
+        if p <= 1e-5:
+            _var = mu * (1.0 - p)
+            if _var > 0.0 and k >= mu - 0.55 * math.sqrt(_var):
+                _a = float(k + 1)
+                _b = float(n - k)
+                try:
+                    _bt = math.exp(_betai_log_bt(_a, _b, p))
+                except OverflowError:
+                    _bt = float('inf')
+                _i = _bt * _betacf(_a, _b, p) / _a
+                if math.isfinite(_i) and 0.0 <= _i <= 0.7:
+                    return float(1.0 - _i)
+            return _binom_cdf_exact_lower(k, n, p)
         return float(1.0 - _betai_nr(float(k + 1), float(n - k), p))
     return _binom_edgeworth_cdf(k, n, p)
 

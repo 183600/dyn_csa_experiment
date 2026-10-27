@@ -204,6 +204,13 @@ def t_binomial_tail_large_scale():
     assert abs(L._binomial_cdf(_k, _n, _p) - 0.5026595812190084) < 1e-11
     assert abs(L._binomial_cdf(_k, _n, _p)
                + L._binomial_sf(_k + 1, _n, _p) - 1.0) < 1e-12
+    # Just below the mean the complement route folded x through 1-x and
+    # returned 0.4792308 instead of 0.4827166 at n=1e16, p=1e-12, k=9995.
+    # A second scale keeps the exact lower-sum fallback covered.
+    assert abs(L._binomial_cdf(9995, 10 ** 16, 1e-12)
+               - 0.4827166222951466) < 1e-9
+    assert abs(L._binomial_cdf(999000, 10 ** 15, 1e-9)
+               - 0.15877629969068482) < 1e-9
     # The planning power uses the same direct upper tail; it must not
     # subtract 1-(1-q) anywhere on the way back out.
     _kmin = L.signflip_min_consistency(2000, 10, 0.05)
