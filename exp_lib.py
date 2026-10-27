@@ -20608,8 +20608,17 @@ def attrition_power_audit(n_seeds, m_comparisons, *, q,
     out['min_complete_pairs'] = min_pairs
     out['availability_target'] = avail_t
     out['require_attrition_power'] = require_attr
-    search_max = max(n or 2, n_max_i)
+    search_max = n_max_i
     out['n_max'] = search_max
+    if not require_cov and n is not None and n > 10000:
+        out['violations'].append(
+            f'planned n_seeds={n} exceeds the partial-coverage scan cap '
+            '10000; the attrition audit cannot verify a joint power for '
+            'this design')
+        out['failure_reason'] = 'scan_cap'
+        out['status'] = 'fail'
+        return out
+    array_max = max(search_max, n) if (not require_cov and n is not None) else search_max
     if (not require_cov and min_pairs is not None and n is not None
             and min_pairs > n):
         out['warnings'].append(
@@ -20623,11 +20632,12 @@ def attrition_power_audit(n_seeds, m_comparisons, *, q,
         if out['violations']:
             out['status'] = 'fail'
         return out
-    family_floor = signflip_min_n_for_holm(m, a, n_max=search_max)
+    floor_max = max(search_max, min(n or 0, 10000))
+    family_floor = signflip_min_n_for_holm(m, a, n_max=floor_max)
     out['family_floor'] = family_floor
     if family_floor is None:
         out['violations'].append(
-            f'no n <= {search_max} reaches the Holm floor for m={m} at '
+            f'no n <= {floor_max} reaches the Holm floor for m={m} at '
             f'alpha={a}; the family is resolution-limited')
 
     def _runnable_threshold(nn):
@@ -20644,19 +20654,47 @@ def attrition_power_audit(n_seeds, m_comparisons, *, q,
         out['warnings'].append(
             f'min_complete_pairs={min_pairs} is below the Holm resolution '
             f'floor {family_floor}; the floor governs runnability')
-    power_by_k = [0.0] * (search_max + 1)
-    for k in range(2, search_max + 1):
+    power_by_k = [0.0] * (array_max + 1)
+    for k in range(2, array_max + 1):
         power_by_k[k] = float(signflip_power(k, m, qv, a))
-    log_factorials = [math.lgamma(i + 1.0) for i in range(search_max + 1)]
+    log_factorials = [math.lgamma(i + 1.0) for i in range(array_max + 1)]
+
+    def _power_at(k):
+        k = int(k)
+        if 0 <= k <= array_max:
+            return float(power_by_k[k])
+        return float(signflip_power(k, m, qv, a))
 
     def _joint(nn, pp, threshold):
-        return _attrition_joint_power(
-            int(nn), float(pp), threshold, power_by_k, log_factorials)
+        nn = int(nn)
+        if nn <= array_max:
+            return _attrition_joint_power(
+                nn, float(pp), threshold, power_by_k, log_factorials)
+        if threshold is None or threshold > nn:
+            return 0.0
+        if pp <= 0.0:
+            return 0.0
+        if pp >= 1.0:
+            return _power_at(nn)
+        logp = math.log(pp)
+        log1p = math.log1p(-pp)
+        lf_n = math.lgamma(nn + 1.0)
+        terms = []
+        for k in range(max(0, int(threshold)), nn + 1):
+            pk = _power_at(k)
+            if pk <= 0.0:
+                continue
+            log_pmf = (lf_n - math.lgamma(k + 1.0)
+                       - math.lgamma(nn - k + 1.0)
+                       + k * logp + (nn - k) * log1p)
+            if log_pmf > -745.0:
+                terms.append(math.exp(log_pmf) * pk)
+        return float(min(1.0, max(0.0, math.fsum(terms))))
 
     def _avail(nn, pp, threshold):
         return _attrition_probability_runnable(int(nn), float(pp), threshold)
 
-    conditional = float(power_by_k[n])
+    conditional = _power_at(n)
     out['conditional_power'] = conditional
     if p is not None:
         out['expected_complete_pairs'] = float(n * p)

@@ -4270,11 +4270,18 @@ def audit_design_sensitivity(manifest_path=None,
         manifest.get('statistics'), dict) else {}
     _attr_cfg = (stat.get('attrition')
                  if isinstance(stat.get('attrition'), dict) else {})
+    _attr_require_raw = _attr_cfg.get('require_attrition_power', False)
+    if isinstance(_attr_require_raw, (bool, np.bool_)):
+        _attr_require = bool(_attr_require_raw)
+    else:
+        _attr_require = False
+        out['violations'].append(
+            'statistics.attrition.require_attrition_power='
+            f'{_attr_require_raw!r} must be a boolean')
     out['attrition'] = {
         'declared': bool(_attr_cfg),
         'pair_retention': _attr_cfg.get('pair_retention'),
-        'require_attrition_power': bool(
-            _attr_cfg.get('require_attrition_power', False)),
+        'require_attrition_power': _attr_require,
         'availability_target': _attr_cfg.get('availability_target'),
         'require_complete_coverage': bool(
             stat.get('require_complete_coverage')),
@@ -4282,7 +4289,7 @@ def audit_design_sensitivity(manifest_path=None,
                  'attrition rate; missing the declaration is a warning unless '
                  'require_attrition_power is true'),
     }
-    if not _attr_cfg:
+    if _attr_cfg.get('pair_retention') is None:
         out['warnings'].append(
             'the frozen manifest declares no statistics.attrition.pair_retention; '
             'the attrition table below is a stress test, not a pass')
@@ -4364,13 +4371,13 @@ def audit_design_sensitivity(manifest_path=None,
             target_power=out['target_power'], pilot_deltas=deltas,
             expected_sign=comp.get('expected_sign'), sesoi=sesoi,
             require_sesoi_power=require_sesoi)
-        _dir = str(comp.get('expected_sign') or '').lower()
+        _dir = rep.get('expected_sign')
         _q_attr = (rep.get('pilot') or {}).get('q_sign_rate')
         _q_source = 'pilot_sign_rate'
         if _q_attr is None:
             _q_attr = stat.get('power_q_for_test')
             _q_source = 'statistics.power_q_for_test'
-        if _dir in ('positive', 'negative') and _q_attr is not None:
+        if _dir in (-1, 1) and _q_attr is not None:
             rep['attrition'] = L.attrition_power_audit(
                 n, m or 0, q=_q_attr,
                 pair_retention=_attr_cfg.get('pair_retention'),
@@ -4382,8 +4389,6 @@ def audit_design_sensitivity(manifest_path=None,
                 require_attrition_power=_attr_cfg.get(
                     'require_attrition_power', False))
             rep['attrition']['q_source'] = _q_source
-            rep['attrition']['require_attrition_power'] = bool(
-                _attr_cfg.get('require_attrition_power', False))
             out['violations'].extend(
                 f'{name}: {v}'
                 for v in (rep['attrition'].get('violations') or []))
@@ -6984,6 +6989,11 @@ def audit_error_case_inference(path=None):
     def _close(a, b, tol):
         return (a is not None and b is not None and abs(a - b) <= tol)
 
+    def _close_optional(a, b, tol):
+        if a is None and b is None:
+            return True
+        return _close(a, b, tol)
+
     def _mean(vals):
         return float(np.mean(vals)) if vals else None
 
@@ -7170,7 +7180,7 @@ def audit_error_case_inference(path=None):
                 vals = [u['mean_delta'] for u in sub]
                 ntok = sum(u['n_tokens'] for u in sub)
                 st = buckets[b].get(half) if isinstance(buckets[b].get(half), dict) else {}
-                if not _close(_mean(vals), _finite(st.get('mean')), 1e-9):
+                if not _close_optional(_mean(vals), _finite(st.get('mean')), 1e-9):
                     _p.append(f'bucket {b!r}: {half} mean != replay')
                 if int(st.get('n_clusters') or 0) != len(sub):
                     _p.append(f'bucket {b!r}: {half} n_clusters != replay')
@@ -7218,21 +7228,21 @@ def audit_error_case_inference(path=None):
                     if not _close(_finite(selected.get('discovery_mean')),
                                   _finite(dstat.get('mean')), 1e-9):
                         _p.append('selected discovery mean != replay')
-                    if not _close(_finite(selected.get('replication_mean')),
-                                  _finite(rst.get('mean')), 1e-9):
+                    if not _close_optional(_finite(selected.get('replication_mean')),
+                                           _finite(rst.get('mean')), 1e-9):
                         _p.append('selected replication mean != replay')
                     _dci = selected.get('discovery_ci95')
                     if (isinstance(_dci, (list, tuple)) and len(_dci) == 2
-                            and not (_close(_finite(_dci[0]), _finite(dstat.get('ci95_low')), 1e-9)
-                                     and _close(_finite(_dci[1]), _finite(dstat.get('ci95_high')), 1e-9))):
+                            and not (_close_optional(_finite(_dci[0]), _finite(dstat.get('ci95_low')), 1e-9)
+                                     and _close_optional(_finite(_dci[1]), _finite(dstat.get('ci95_high')), 1e-9))):
                         _p.append('selected discovery CI != replay')
                     _rci = selected.get('replication_ci95')
                     if (isinstance(_rci, (list, tuple)) and len(_rci) == 2
-                            and not (_close(_finite(_rci[0]), _finite(rst.get('ci95_low')), 1e-9)
-                                     and _close(_finite(_rci[1]), _finite(rst.get('ci95_high')), 1e-9))):
+                            and not (_close_optional(_finite(_rci[0]), _finite(rst.get('ci95_low')), 1e-9)
+                                     and _close_optional(_finite(_rci[1]), _finite(rst.get('ci95_high')), 1e-9))):
                         _p.append('selected replication CI != replay')
-                    if not _close(_finite(selected.get('replication_p_exact_signflip')),
-                                  _finite(rst.get('p_exact_signflip')), 1e-12):
+                    if not _close_optional(_finite(selected.get('replication_p_exact_signflip')),
+                                           _finite(rst.get('p_exact_signflip')), 1e-12):
                         _p.append('selected replication exact p != replay')
                     same = (rst.get('mean') is not None
                             and _finite(selected.get('discovery_mean')) is not None

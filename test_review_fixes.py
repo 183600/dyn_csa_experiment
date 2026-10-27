@@ -23326,6 +23326,37 @@ def t_attrition_power_audit_and_design_gate():
         assert any('no statistics.attrition.pair_retention' in w
                    for w in rep['warnings']), rep['warnings']
 
+        manifest['statistics']['attrition'] = {'pair_retention': 1.0}
+        manifest['primary_comparisons'][0]['expected_sign'] = -1
+        with open(mp, 'w', encoding='utf-8') as f:
+            json.dump(manifest, f)
+        with contextlib.redirect_stdout(io.StringIO()):
+            rep = A.audit_design_sensitivity(manifest_path=mp, pilot_path=pp)
+        assert rep['status'] == 'ok', rep
+        assert rep['comparisons']['a']['expected_sign'] == -1, rep
+        assert rep['comparisons']['a']['attrition']['status'] == 'ok', rep
+
+        manifest['statistics']['attrition'] = {
+            'pair_retention': 1.0, 'require_attrition_power': 'false'}
+        manifest['primary_comparisons'][0]['expected_sign'] = 'negative'
+        with open(mp, 'w', encoding='utf-8') as f:
+            json.dump(manifest, f)
+        with contextlib.redirect_stdout(io.StringIO()):
+            rep = A.audit_design_sensitivity(manifest_path=mp, pilot_path=pp)
+        assert rep['status'] == 'fail', rep
+        assert rep['attrition']['require_attrition_power'] is False, rep['attrition']
+        assert rep['comparisons']['a']['attrition'][
+            'require_attrition_power'] is False, rep
+        assert any('require_attrition_power' in v and 'must be a boolean' in v
+                   for v in rep['violations']), rep['violations']
+
+    big = L.attrition_power_audit(
+        1000, 6, q=0.95, pair_retention=1.0, n_max=8)
+    assert big['status'] == 'ok', big
+    assert big['n_max'] == 8, big
+    assert big['required_nominal_seeds'] is None, big
+    assert big['conditional_power'] == 1.0 and big['unconditional_power'] == 1.0, big
+
     import inspect
     assert 'attrition_power_audit' in inspect.getsource(A.audit_design_sensitivity)
     assert 'attrition_power_audit' in inspect.getsource(V12.run_power)
@@ -24602,6 +24633,28 @@ def t_error_bucket_inference_split_half_and_audit():
         aud_bad_empty = A.audit_error_case_inference(art)
         assert aud_bad_empty['status'] == 'fail', aud_bad_empty
         assert any('zero finite' in x for x in aud_bad_empty['problems']), aud_bad_empty
+        sparse_rows, sparse_buckets, sparse_d = [], [], []
+        for _c in ('c2', 'c5', 'c3', 'c6'):
+            for _ in range(2):
+                sparse_rows.append(_c)
+                sparse_buckets.append('y')
+                sparse_d.append(1.0)
+        for _c in ('c4', 'c7', 'c1', 'c0'):
+            for _ in range(2):
+                sparse_rows.append(_c)
+                sparse_buckets.append('x')
+                sparse_d.append(-0.5)
+        sparse = L.paired_error_bucket_inference(
+            sparse_d, sparse_buckets, sparse_rows, min_clusters=2,
+            min_tokens=1, split_seed=7)
+        assert sparse['status'] == 'ok', sparse
+        assert sparse['selected']['bucket'] == 'y', sparse['selected']
+        assert sparse['buckets']['y']['replication']['mean'] is None, sparse
+        assert sparse['buckets']['x']['discovery']['mean'] is None, sparse
+        with open(art, 'w', encoding='utf-8') as f:
+            json.dump({'bucket_inference': [sparse]}, f)
+        aud_sparse = A.audit_error_case_inference(art)
+        assert aud_sparse['status'] == 'ok', aud_sparse
         bad = json.loads(json.dumps(rep))
         bad['selected']['replicated'] = not bad['selected']['replicated']
         with open(art, 'w', encoding='utf-8') as f:

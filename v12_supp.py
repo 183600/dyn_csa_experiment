@@ -4250,8 +4250,8 @@ def run_power(manifest_path=FREEZE_MANIFEST, summary='results_v10_mech/summary.j
         name = comp.get('name')
         a, b = comp.get('a'), comp.get('b')
         Ln = int(str(comp.get('endpoint', 'by_len.ppl@4096')).rsplit('@', 1)[-1])
-        exp = comp.get('expected_sign')
-        exp = str(exp).lower() if exp is not None else None
+        exp, _exp_err = L._design_direction(comp.get('expected_sign'))
+        exp = {1: 'positive', -1: 'negative', None: None}[exp]
         recs_a, recs_b = {}, {}
         skipped = 0
         for key, rec in raw.items():
