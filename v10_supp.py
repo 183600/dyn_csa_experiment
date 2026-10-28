@@ -512,6 +512,21 @@ def _probe_defs(cfg):
 def _niah_cell_key(v, seed, arm, Ln, cond):
     return f'{v}::s{seed}::{arm}::L{Ln}::niah::{cond}'
 
+def _attach_niah_factor_metadata(record, tag, factor_report):
+    _decl = L.NIAH_CONTRAST_FACTORS.get(tag)
+    if not isinstance(record, dict) or not isinstance(_decl, dict):
+        return record
+    for _key in ('single_factor', 'factors', 'factors_note'):
+        if _key in _decl:
+            record[_key] = _decl[_key]
+    _pair = (factor_report.get('pairs') or {}).get(tag) if isinstance(factor_report, dict) else None
+    _verified = isinstance(_pair, dict) and _pair.get('verified') is True
+    record['factor_declaration_verified'] = _verified
+    if not _verified and record.get('single_factor') is True:
+        record['declared_single_factor'] = True
+        record['single_factor'] = False
+    return record
+
 def _niah_fingerprint(cfg, condition=None):
     _n = cfg.get('niah') or {}
     _need = max((int(_x) for _x in cfg['eval_lens'])) + 1
@@ -820,9 +835,7 @@ def run_probe_cell(cfg, v, seed, guard=None, val_ids=None, mech_summ=None):
             model.load_state_dict(d.pop('sd'))
             model.eval()
         for blk, c0 in zip(model.blocks, d['cfg']):
-            ac = blk.attn.cfg
-            ac.indexer_mode = 'random' if arm == 'randidx' else getattr(c0, 'indexer_mode', 'learned')
-            ac.index_topk = 10 ** 6 if arm == 'allblocks' else getattr(c0, 'index_topk', 32)
+            L.apply_niah_inference_arm(blk.attn.cfg, c0, arm)
         t0 = time.time()
         _pending = {}
         for _ci, (Ln, rho, mode) in enumerate(cells, 1):
@@ -1438,6 +1451,13 @@ def _equal_token_slices():
 
 def v10_analysis(out='analysis_v10/stats.json'):
     os.makedirs(os.path.dirname(out) or '.', exist_ok=True)
+    try:
+        import v7_supp as _V7
+        _niah_factor_rep = L.niah_contrast_factor_audit(
+            factory=_V7.make_layer_cfgs_v7, verbose=False)
+    except Exception as _e:
+        _niah_factor_rep = {'status': 'not_verifiable', 'pairs': {},
+                            'note': f'{type(_e).__name__}: {_e}'}
     probe = {}
     sp = PROBE['summary']
     if os.path.exists(sp):
@@ -1738,6 +1758,7 @@ def v10_analysis(out='analysis_v10/stats.json'):
                         if len(common) >= 2:
                             res = V.exact_sign_permutation([other['nll_by_seed'][s] - learned['nll_by_seed'][s] for s in common])
                             res['seeds'] = common
+                            _attach_niah_factor_metadata(res, arm, _niah_factor_rep)
                             niah_contrasts[f'NIAH-nat L{Ln} {cond}: {arm} - learned (answer NLL)'] = res
                             # Accuracy is the declared primary endpoint for
                             # retrieval.  Testing only the secondary NLL would
@@ -1746,6 +1767,7 @@ def v10_analysis(out='analysis_v10/stats.json'):
                             # accuracy is indistinguishable.
                             _ra = V.exact_sign_permutation([other['acc_by_seed'][s] - learned['acc_by_seed'][s] for s in common])
                             _ra['seeds'] = common
+                            _attach_niah_factor_metadata(_ra, arm, _niah_factor_rep)
                             niah_acc_contrasts[f'NIAH-nat L{Ln} {cond}: {arm} - learned (answer accuracy)'] = _ra
                     for tag, ov in (('csa_randtrain', 'csa_fixed_rope_randidx'), ('csa_alltrain', 'csa_fixed_rope_allblocks')):
                         other = _ncell(ov, 'learned', Ln, cond)
@@ -1757,9 +1779,11 @@ def v10_analysis(out='analysis_v10/stats.json'):
                         if len(common) >= 2:
                             res = V.exact_sign_permutation([other['nll_by_seed'][s] - learned['nll_by_seed'][s] for s in common])
                             res['seeds'] = common
+                            _attach_niah_factor_metadata(res, tag, _niah_factor_rep)
                             niah_contrasts[f'NIAH-nat L{Ln} {cond}: {tag} - learned (answer NLL)'] = res
                             _ra = V.exact_sign_permutation([other['acc_by_seed'][s] - learned['acc_by_seed'][s] for s in common])
                             _ra['seeds'] = common
+                            _attach_niah_factor_metadata(_ra, tag, _niah_factor_rep)
                             niah_acc_contrasts[f'NIAH-nat L{Ln} {cond}: {tag} - learned (answer accuracy)'] = _ra
             probe['niah_natural'] = {'cells': niah_cells, 'contrasts': niah_contrasts,
                                      'accuracy_contrasts': niah_acc_contrasts,

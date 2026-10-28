@@ -16235,6 +16235,87 @@ def t_v7_rope_contrasts_carry_factor_declarations():
     assert _bad2['status'] == 'fail', _bad2
     assert not _bad2['pairs']['CSA+RoPE vs dense+RoPE']['verified'], _bad2['pairs']
 
+    _verified = {'CSA+RoPE vs CSA absPE': {'single_factor': True, 'n': 2}}
+    V7.attach_contrast_factor_metadata(
+        _verified, decl, {'pairs': {'CSA+RoPE vs CSA absPE': {'verified': True}}})
+    assert _verified['CSA+RoPE vs CSA absPE']['single_factor'] is True
+    assert _verified['CSA+RoPE vs CSA absPE']['factor_declaration_verified'] is True
+    _unverified = {'CSA+RoPE vs CSA absPE': {'single_factor': True, 'n': 2}}
+    V7.attach_contrast_factor_metadata(
+        _unverified, decl, {'pairs': {'CSA+RoPE vs CSA absPE': {'verified': False}}})
+    _unverified_rec = _unverified['CSA+RoPE vs CSA absPE']
+    assert _unverified_rec['single_factor'] is False, _unverified_rec
+    assert _unverified_rec['declared_single_factor'] is True, _unverified_rec
+    assert _unverified_rec['factor_declaration_verified'] is False, _unverified_rec
+    assert _unverified_rec['factors'] == pos['factors'], _unverified_rec
+    _missing = {'CSA+RoPE vs CSA absPE': {'single_factor': True, 'n': 2}}
+    V7.attach_contrast_factor_metadata(_missing, decl, {'status': 'fail'})
+    assert _missing['CSA+RoPE vs CSA absPE']['single_factor'] is False, _missing
+    _system = {'CSA+RoPE vs dense+RoPE': {'single_factor': False, 'n': 2}}
+    V7.attach_contrast_factor_metadata(
+        _system, decl, {'pairs': {'CSA+RoPE vs dense+RoPE': {'verified': False}}})
+    assert _system['CSA+RoPE vs dense+RoPE']['single_factor'] is False, _system
+
+
+def t_niah_contrast_factors_are_machine_verified():
+    import copy as _copy
+    rep = L.niah_contrast_factor_audit(
+        factory=V7.make_layer_cfgs_v7, verbose=False)
+    assert rep['status'] == 'ok', rep['violations']
+    for tag in ('randidx', 'allblocks', 'csa_randtrain', 'csa_alltrain'):
+        entry = rep['pairs'][tag]
+        assert entry['verified'] is True, entry
+        assert entry['declared_single_factor'] is True, entry
+        assert entry['actual_single_factor'] is True, entry
+        assert entry['actual_keys'] == sorted(L.NIAH_CONTRAST_FACTORS[tag]['factors']), entry
+    _dense = rep['pairs']['dense']
+    assert _dense['verified'] is True and _dense['actual_single_factor'] is False, _dense
+    assert _dense['actual_keys'] == ['kind'], _dense
+    assert L.NIAH_INFERENCE_ARM_OVERRIDES['randidx'] == {'indexer_mode': 'random'}
+    assert L.NIAH_INFERENCE_ARM_OVERRIDES['allblocks'] == {'index_topk': 10 ** 6}
+
+    _base = V7.AttnCfgRope(kind='csa', dynamic=False, block_size=4, overlap=16,
+                           index_topk=32, rope=True, rope_dim=16, qk_norm=True)
+    _target = _copy.deepcopy(_base)
+
+    def _diff(a, b):
+        return {k for k in a.__dataclass_fields__ if getattr(a, k) != getattr(b, k)}
+
+    L.apply_niah_inference_arm(_target, _base, 'randidx')
+    assert _diff(_target, _base) == {'indexer_mode'}, _diff(_target, _base)
+    L.apply_niah_inference_arm(_target, _base, 'allblocks')
+    assert _diff(_target, _base) == {'index_topk'}, _diff(_target, _base)
+    L.apply_niah_inference_arm(_target, _base, 'learned')
+    assert _diff(_target, _base) == set(), _diff(_target, _base)
+
+    _bad = _copy.deepcopy(L.NIAH_CONTRAST_FACTORS)
+    _bad['randidx'] = dict(_bad['randidx'], factors=['indexer_mode', 'index_topk'])
+    _bad_rep = L.niah_contrast_factor_audit(
+        _bad, factory=V7.make_layer_cfgs_v7, verbose=False)
+    assert _bad_rep['status'] == 'fail' and not _bad_rep['pairs']['randidx']['verified'], _bad_rep
+    _bad2 = _copy.deepcopy(L.NIAH_CONTRAST_FACTORS)
+    _bad2['allblocks'] = dict(_bad2['allblocks'], override='missing_arm')
+    _bad2_rep = L.niah_contrast_factor_audit(
+        _bad2, factory=V7.make_layer_cfgs_v7, verbose=False)
+    assert _bad2_rep['status'] == 'fail', _bad2_rep
+    _bad3 = _copy.deepcopy(L.NIAH_CONTRAST_FACTORS)
+    _bad3['csa_alltrain'] = dict(_bad3['csa_alltrain'], factors=['index_topk', 'use_sink'])
+    _bad3_rep = L.niah_contrast_factor_audit(
+        _bad3, factory=V7.make_layer_cfgs_v7, verbose=False)
+    assert _bad3_rep['status'] == 'fail', _bad3_rep
+
+    _rec = {'single_factor': True}
+    V10._attach_niah_factor_metadata(
+        _rec, 'randidx', {'pairs': {'randidx': {'verified': False}}})
+    assert _rec['single_factor'] is False and _rec['declared_single_factor'] is True, _rec
+    assert _rec['factor_declaration_verified'] is False, _rec
+    assert _rec['factors'] == ['indexer_mode'], _rec
+    _rec_ok = {'single_factor': True}
+    V10._attach_niah_factor_metadata(
+        _rec_ok, 'allblocks', rep)
+    assert _rec_ok['single_factor'] is True, _rec_ok
+    assert _rec_ok['factor_declaration_verified'] is True, _rec_ok
+
 
 def t_driver_pair_capacity_controls():
     # A driver-level method-vs-dense contrast must not quote a p-value as a
@@ -24386,6 +24467,7 @@ def main():
     _check('L61 frozen-manifest mechanism flags are machine-verified single-factor verdicts', t_frozen_manifest_mechanism_flags_are_verified_single_factor)
     _check('L62 seq2k sweep contrasts carry explicit factor declarations', t_seq2k_contrasts_carry_factor_declarations)
     _check('L62b v7 rope/sink/selection contrasts carry verified factor declarations', t_v7_rope_contrasts_carry_factor_declarations)
+    _check('L62c NIAH inference/trained contrasts carry machine-verified factor declarations', t_niah_contrast_factors_are_machine_verified)
     _check('L63 driver method-vs-dense pairs carry a capacity-control verdict', t_driver_pair_capacity_controls)
     _check('L64 indexer chunked partial tile preserves the compact row stride', t_indexer_chunked_partial_tile_preserves_row_stride)
     _check('L64b window geometry is built per chunk, not as a full O(n*w) table', t_window_geometry_is_built_per_chunk)

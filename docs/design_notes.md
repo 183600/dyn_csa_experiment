@@ -5202,3 +5202,87 @@ L212 覆盖：完整覆盖下 `p^n * power(n)`、5% 损失时条件 0.882 → �
 以及 audit 清单声明/缺失/满足三态。完整 CPU 套件 `564/564` 通过
 （0 skipped）；`python v12_supp.py plan` 的 72/72 合成冻结记录、6 个比较
 不受影响。
+
+## 75. NIAH 机制对照也必须声明并核验单因素：共享推理 override + 定义点审计
+
+### 75.1 问题
+
+NIAH-natural 的四类对照此前只在 `v10_supp.py` 的运行路径里硬编码：
+
+- 同一 checkpoint 上把 `indexer_mode` 换成随机选择（`randidx`）；
+- 同一 checkpoint 上把 `index_topk` 放大到全部块（`allblocks`）；
+- 与参数匹配 dense 臂比较（`dense`，架构级）；
+- 与从头训练的 random/all-block 对照比较（`csa_randtrain` /
+  `csa_alltrain`）。
+
+这些对照进入了 `niah_natural.json` 和报告，但没有 `single_factor` /
+`factors` 元数据，也没有任何定义点审计。更严重的是，H3 的假设文本写成
+「same top-k block budget」，而 `allblocks` 实际把 top-k 设为全部块；这
+会把「读取预算干预」误读成「等读取预算的机制对照」。单因素实验不只是
+「只动一个键」，还必须把该键的读数边界写清楚。
+
+### 75.2 方法：共享 override 与同一张声明表
+
+新增 `exp_lib.NIAH_INFERENCE_ARM_OVERRIDES`，把推理期各臂的改动集中为
+一张表：
+
+```python
+{'learned': {},
+ 'randidx': {'indexer_mode': 'random'},
+ 'allblocks': {'index_topk': 10 ** 6}}
+```
+
+`exp_lib.apply_niah_inference_arm()` 在每次切换臂时，先把所有声明键重置
+为 checkpoint 的基线值，再应用当前臂 override。这样模型在同一 seed 内
+跨臂复用时，不会把上一个臂的 `indexer_mode` 或 `index_topk` 残留到下一个
+臂。`v10_supp.py` 的实际 probe 路径改为调用该函数，声明表与执行路径不再
+各写一份。
+
+新增 `exp_lib.NIAH_CONTRAST_FACTORS`，对五类可测对照分别声明：
+
+| 对照 | 实际改动 | 单因素 | 读数边界 |
+|---|---|---|---|
+| `dense` | `kind` | 否 | 架构级 dense 基线 |
+| `randidx` | `indexer_mode` | 是 | 同 checkpoint、同 top-k |
+| `allblocks` | `index_topk` | 是 | 读取预算干预，不是等读取预算 |
+| `csa_randtrain` | `indexer_mode` | 是 | 从头训练、同 top-k |
+| `csa_alltrain` | `index_topk` | 是 | 从头训练的全块读取，预算不等 |
+
+`exp_lib.niah_contrast_factor_audit()` 对推理期条目直接核对共享 override
+表的键集；对 from-scratch/dense 条目通过 v7 arm 工厂重算 AttnCfg diff。
+声明与真实键集必须在两个方向完全一致，`single_factor=True` 还必须落在
+`cfg_keys_single_factor()` 的同一个声明族内。`audit_gates.audit_single_factor()`
+新增 `niah_contrasts` 块；任一对照漂移即整体 `fail`。
+
+### 75.3 记录与报告
+
+`v10_supp.py` 的 NIAH NLL/accuracy contrast 现在都携带
+`single_factor`、`factors`、`factors_note` 与
+`factor_declaration_verified`。若定义点审计未通过，记录保留
+`declared_single_factor=True` 并把 `single_factor` 清零，和 v9 的
+fail-closed 口径一致。H3 的预注册文本改为「read-rich all-block control」，
+明确它是读取预算干预，不是等读取预算比较。
+
+### 75.4 边界
+
+- `randidx` / `allblocks` 是**同一训练 checkpoint 的推理期干预**，不是
+  重新训练的选择器对照；后者由 `csa_randtrain` / `csa_alltrain` 表示。
+- `allblocks` 仍是单因素（只动 `index_topk`），但不能解释为「同预算下
+  选择优于平均分配」；它比较的是固定 top-k 与全块读取。
+- `dense` 是架构级对照，不进入 knob-level 单因素主张。
+- NIAH 的 top-1 accuracy 仍是预注册主端点，NLL 是同时报告的第二端点；
+  单因素声明不改变 Holm 族、种子数、阈值或冻结决定。
+
+### 75.5 入口与验证
+
+```bash
+python audit_gates.py single_factor   # 含 niah_contrasts
+python audit_gates.py report          # 汇总该块
+python test_review_fixes.py           # L62c + 既有回归
+python v12_supp.py plan               # 冻结计划预检不变
+```
+
+L62c 覆盖：五类声明与真实 override/arm diff 一致、dense 不是单因素、
+推理 override 跨臂复用时不残留上一个臂的键、错误的 factors/override 标签
+使审计 `fail`，以及记录层未验证时 fail-closed。完整 CPU 套件预期
+`565/565` 通过（0 skipped）；冻结清单、种子、端点与 `CODE_SEMANTICS` 不变。

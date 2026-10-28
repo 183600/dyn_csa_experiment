@@ -19732,6 +19732,125 @@ def sweep_contrast_factor_audit(declarations, *, factory=None, n_layers=6,
                   f"contrast(s) verified against the actual arm configs")
     return report
 
+def niah_contrast_factor_audit(declarations=None, *, overrides=None,
+                               factory=None, n_layers=6, verbose=True):
+    declarations = (NIAH_CONTRAST_FACTORS if declarations is None
+                    else declarations)
+    overrides = (NIAH_INFERENCE_ARM_OVERRIDES if overrides is None
+                 else overrides)
+    report = {'pairs': {}, 'violations': [], 'status': 'ok'}
+    if not isinstance(declarations, dict) or not declarations:
+        report['status'] = 'fail'
+        report['violations'].append(
+            'NIAH factor declarations must be a non-empty name -> declaration object')
+        return report
+    if not isinstance(overrides, dict):
+        report['status'] = 'fail'
+        report['violations'].append('NIAH inference overrides must be an object')
+        return report
+    missing_factory = False
+    for name, spec in declarations.items():
+        label = str(name)
+        if not isinstance(spec, dict):
+            report['violations'].append(f'{label}: declaration is not an object')
+            continue
+        factors = spec.get('factors')
+        if (not isinstance(factors, (list, tuple, set, frozenset))
+                or not factors
+                or any(not isinstance(k, str) or not k.strip() for k in factors)):
+            report['violations'].append(
+                f'{label}: factors must be a non-empty list of AttnCfg key names')
+            continue
+        declared_sf = spec.get('single_factor')
+        if not isinstance(declared_sf, bool):
+            report['violations'].append(
+                f'{label}: single_factor must be an explicit boolean')
+            continue
+        declared_set = {str(k) for k in factors}
+        override_tag = spec.get('override')
+        a, b = spec.get('a'), spec.get('b')
+        if override_tag is not None and (a is not None or b is not None):
+            report['violations'].append(
+                f'{label}: declaration cannot be both an inference override and an arm pair')
+            continue
+        if override_tag is not None:
+            if not isinstance(override_tag, str) or override_tag not in overrides:
+                report['violations'].append(
+                    f'{label}: override {override_tag!r} is not in the shared NIAH override map')
+                continue
+            _override_spec = overrides.get(override_tag)
+            if not isinstance(_override_spec, dict):
+                report['violations'].append(
+                    f'{label}: override {override_tag!r} must be an object')
+                continue
+            actual_set = {str(k) for k in _override_spec}
+            entry = {'mode': 'inference_override', 'override': override_tag,
+                     'a': 'csa_fixed_rope', 'b': 'csa_fixed_rope'}
+        else:
+            if not (isinstance(a, str) and a.strip()
+                    and isinstance(b, str) and b.strip()):
+                report['violations'].append(
+                    f'{label}: declaration must name an override tag or both arms (a/b)')
+                continue
+            if factory is None:
+                missing_factory = True
+                continue
+            actual, per_layer = _design_pair_cfg_keys(a, b, factory, n_layers)
+            if isinstance(actual, Exception):
+                report['violations'].append(
+                    f'{label}: arm construction failed '
+                    f'({type(actual).__name__}: {actual})')
+                continue
+            actual_set = set(actual)
+            entry = {'mode': 'trained_pair', 'a': a, 'b': b,
+                     'per_layer': {str(i): {k: [v0, v1] for k, (v0, v1) in d.items()}
+                                   for i, d in per_layer.items()}}
+        extra = sorted(actual_set - declared_set)
+        missing = sorted(declared_set - actual_set)
+        actual_sf = bool(cfg_keys_single_factor(actual_set))
+        entry.update({'declared_factors': sorted(declared_set),
+                      'actual_keys': sorted(actual_set),
+                      'extra_keys': extra, 'missing_keys': missing,
+                      'declared_single_factor': declared_sf,
+                      'actual_single_factor': actual_sf})
+        ok = True
+        if extra:
+            ok = False
+            report['violations'].append(
+                f'{label}: arms/overrides also differ in undeclared key(s) '
+                f'{extra}; the declared factors {sorted(declared_set)} do not '
+                'describe the contrast')
+        if missing:
+            ok = False
+            report['violations'].append(
+                f'{label}: declared factor key(s) {missing} do not differ; the '
+                'declared intervention is absent')
+        if declared_sf:
+            if actual_set != declared_set:
+                ok = False
+            if not actual_sf:
+                ok = False
+                report['violations'].append(
+                    f'{label}: declared single-factor but the actual diff '
+                    f'{sorted(actual_set)} is not one declared intervention family')
+        entry['verified'] = bool(ok)
+        report['pairs'][label] = entry
+    if report['violations']:
+        report['status'] = 'fail'
+    elif missing_factory:
+        report['status'] = 'not_verifiable'
+        report['note'] = ('the trained-arm factory is unavailable; inference '
+                          'overrides were checked but trained pairs were not')
+    if verbose:
+        if report['violations']:
+            print('[niah-factor] REFUSED — declarations do not match the arms:')
+            for _v in report['violations']:
+                print(f'  - {_v}')
+        elif report['status'] == 'ok':
+            print(f"[niah-factor] OK: {len(report['pairs'])} NIAH contrast(s) "
+                  'verified against the shared overrides/arm configs')
+    return report
+
 def open_block_matrix_audit(factory=None, *, n_layers=6, verbose=True):
     """Zero-GPU check of the open-block panel's declared 2-factor factorial.
 
@@ -23372,12 +23491,14 @@ NIAH_HYPOTHESIS_DESIGN = {
                       'Holm correction, or the difference is within seed noise.'),
     },
     'niah_learned_vs_allblocks_accuracy': {
-        'statement': ('Under the same top-k block budget, learned selection retrieves '
-                      'planted NIAH answers more often than the trained all-block control. '
+        'statement': ('Against a read-rich trained all-block control, learned selection '
+                      'at a fixed top-k retrieves planted NIAH answers more often. '
                       'The reported contrast is control minus learned accuracy, so a '
-                      'negative sign means learned is better.'),
-        'mechanism': ('Selecting the relevant blocks is better than spreading the same '
-                      'budget over all blocks, which dilutes attention to the far key.'),
+                      'negative sign means learned is better. This is a read-budget '
+                      'intervention, not an equal-read comparison.'),
+        'mechanism': ('Selecting the relevant blocks at a fixed top-k is better than '
+                      'spending the full read budget on all blocks, which can dilute '
+                      'attention to the far key.'),
         'predicted_sign': -1,
         'primary_metric': 'top1_accuracy',
         'metric_policy': 'niah_retrieval',
@@ -23386,6 +23507,65 @@ NIAH_HYPOTHESIS_DESIGN = {
                       'after Holm correction, or the difference is within seed noise.'),
     },
 }
+
+NIAH_INFERENCE_ARM_OVERRIDES = {
+    'learned': {},
+    'randidx': {'indexer_mode': 'random'},
+    'allblocks': {'index_topk': 10 ** 6},
+}
+
+NIAH_CONTRAST_FACTORS = {
+    'dense': {
+        'a': 'csa_fixed_rope', 'b': 'full_rope',
+        'single_factor': False,
+        'factors': ['kind'],
+        'factors_note': ('parameter-matched dense baseline: attention-operator swap, '
+                         'architecture-level rather than a single knob'),
+    },
+    'randidx': {
+        'override': 'randidx',
+        'single_factor': True,
+        'factors': ['indexer_mode'],
+        'factors_note': ('inference-time random block-selection control on the same '
+                         'checkpoint and top-k'),
+    },
+    'allblocks': {
+        'override': 'allblocks',
+        'single_factor': True,
+        'factors': ['index_topk'],
+        'factors_note': ('read-rich all-block intervention on the same checkpoint; '
+                         'single-factor but NOT read-budget matched'),
+    },
+    'csa_randtrain': {
+        'a': 'csa_fixed_rope_randidx', 'b': 'csa_fixed_rope',
+        'single_factor': True,
+        'factors': ['indexer_mode'],
+        'factors_note': 'from-scratch random-selection control at the same top-k',
+    },
+    'csa_alltrain': {
+        'a': 'csa_fixed_rope_allblocks', 'b': 'csa_fixed_rope',
+        'single_factor': True,
+        'factors': ['index_topk'],
+        'factors_note': ('from-scratch read-rich all-block control; single-factor '
+                         'but not read-budget matched'),
+    },
+}
+
+def apply_niah_inference_arm(cfg, base_cfg, arm, overrides=None):
+    overrides = NIAH_INFERENCE_ARM_OVERRIDES if overrides is None else overrides
+    if not isinstance(overrides, dict):
+        raise ValueError('NIAH arm overrides must be a mapping')
+    all_keys = sorted({str(k) for spec in overrides.values()
+                       if isinstance(spec, dict) for k in spec})
+    for key in all_keys:
+        if hasattr(base_cfg, key):
+            setattr(cfg, key, getattr(base_cfg, key))
+    arm_spec = overrides.get(arm) or {}
+    if not isinstance(arm_spec, dict):
+        raise ValueError(f'NIAH arm overrides for {arm!r} must be a mapping')
+    for key, value in arm_spec.items():
+        setattr(cfg, key, value)
+    return cfg
 
 def _splitmix64_u64(x):
     """Deterministic 64-bit mixing (SplitMix64) used for row folds.

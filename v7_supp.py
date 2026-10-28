@@ -909,6 +909,22 @@ ROPE_CONTRAST_FACTORS = {
     },
 }
 
+def attach_contrast_factor_metadata(comparisons, declarations, factor_report):
+    _pairs = factor_report.get('pairs') if isinstance(factor_report, dict) else None
+    _pairs = _pairs if isinstance(_pairs, dict) else {}
+    for _name, _rec in (comparisons or {}).items():
+        _decl = (declarations or {}).get(_name)
+        if not isinstance(_decl, dict) or not isinstance(_rec, dict):
+            continue
+        _rec.update(_decl)
+        _pair = _pairs.get(_name)
+        _verified = isinstance(_pair, dict) and _pair.get('verified') is True
+        _rec['factor_declaration_verified'] = _verified
+        if not _verified and _rec.get('single_factor') is True:
+            _rec['declared_single_factor'] = True
+            _rec['single_factor'] = False
+    return comparisons
+
 def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layers=6, n_heads=8, d_head=32, seq_len=512, batch_size=12, steps=20000, warm_steps=0, lr=0.0003, weight_decay=0.1, warmup=200, comp_lambda=0.05, delta_lr_mult=10.0, eval_every=1000, eval_subset=128, val_bnd=None, device=DEVICE, log_every=1000, mlp_ratio=4, deadline_ts=None, save_ckpt=None, ckpt_dir=None, measure_eff=True, diag_every=None):
     L.set_seed(seed)
     L.nan_guard_state(reset=True)
@@ -1943,13 +1959,8 @@ def bootstrap_report(outdirs, out='analysis_v7/stats.json'):
         out_d['comparisons'][name] = res
     _factor_rep = L.sweep_contrast_factor_audit(
         ROPE_CONTRAST_FACTORS, factory=make_layer_cfgs_v7, verbose=False)
-    for _name, _rec in out_d['comparisons'].items():
-        _decl = ROPE_CONTRAST_FACTORS.get(_name)
-        if not isinstance(_decl, dict) or not isinstance(_rec, dict):
-            continue
-        _rec.update(_decl)
-        _rec['factor_declaration_verified'] = bool(
-            (_factor_rep.get('pairs', {}).get(_name) or {}).get('verified'))
+    attach_contrast_factor_metadata(
+        out_d['comparisons'], ROPE_CONTRAST_FACTORS, _factor_rep)
     # Family-wise correction over the report's five pre-listed comparisons
     # This is a guard against multiple-comparison
     # over-reading; the panel remains EXPLORATORY because its comparisons and

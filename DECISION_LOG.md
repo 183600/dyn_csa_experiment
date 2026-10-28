@@ -3036,3 +3036,36 @@ plan` 的冻结计划/比较数不受影响。
 v12_supp.py plan` 仍 72/72 合成冻结记录、6 个比较；`python audit_gates.py
 report` 的 `sensitivity` 块已输出 attrition 压力表，当前清单未声明 retention，
 因此保持 warning 而非绿色通过。
+
+## 2026-10-28 — NIAH 机制对照的单因素声明与推理 override 审计（no new runs）
+
+零 GPU 的设计/记录硬化；不新增训练、不读取 test split、不修改冻结清单的
+字节/种子/端点/alpha/Holm 规则，也不改 `CODE_SEMANTICS`。
+
+**Problem.** v10 的 NIAH 对照（randidx、allblocks、dense、from-scratch
+random/all-block）进入统计与报告，却没有 `single_factor`/`factors` 声明，
+也没有定义点审计。`allblocks` 的 H3 文本还写成「same top-k block budget」，
+但该臂实际把 top-k 放大到全部块，等于把读取预算干预误写成等预算机制对照。
+
+**Fix.** 新增 `exp_lib.NIAH_INFERENCE_ARM_OVERRIDES` 与
+`apply_niah_inference_arm()`：推理臂切换时先把声明键重置为 checkpoint
+基线，再应用当前臂 override，避免同 seed 跨臂复用时残留上一臂的键。
+`v10_supp.py` 改用该共享表，不再在 probe 路径硬编码两行赋值。
+新增 `NIAH_CONTRAST_FACTORS` 与 `niah_contrast_factor_audit()`：推理期
+条目核对共享 override 的键集，trained/dense 条目通过 v7 工厂重算 AttnCfg
+diff；声明和实际键集双向一致、单因素标签落在同一 cfg 族内才 verified。
+`audit_gates.audit_single_factor()` 新增 `niah_contrasts` 块。v10 的 NIAH
+NLL/accuracy 记录携带 factor metadata，审计未通过时保留
+`declared_single_factor=True` 并把 `single_factor` 清零。H3 文本改为
+read-rich all-block control，并明确不是等读取预算比较。
+
+**Boundary.** randidx/allblocks 是同一训练 checkpoint 的推理期干预；
+csa_randtrain/csa_alltrain 才是从头训练对照。allblocks 仍是单因素（只动
+`index_topk`），但不能写成同预算下的选择优势；dense 是架构级对照。
+NIAH 的 top-1 accuracy 仍是主端点，单因素声明不改变 Holm 族、种子、阈值
+或冻结决定。
+
+**Verification.** `python audit_gates.py single_factor` 返回整体 `ok`，
+`niah_contrasts` 五项全部 verified；`python test_review_fixes.py` 通过
+`565/565`（0 skipped，新增 L62c）。覆盖共享 override 的键集、
+跨臂不残留、错误 factors/override 标签 fail、记录层 fail-closed。
