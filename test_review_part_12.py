@@ -766,6 +766,23 @@ def test_directional_claim_verdicts_three_way():
         'min_seeds_for_confirmation' in x
         for x in _v['verdicts']['m']['gate_failures']), _v
 
+    # A malformed or negative floor is corrupt evidence, not a licence to
+    # fall back to the default (or to compare against a negative bar).  The
+    # same fail-closed rule applies to the observed effective n.
+    for _bad_min in (-1, 8.5, True, 'banana'):
+        _v = L.directional_claim_verdicts(
+            {'m': _case(min_seeds_for_confirmation=_bad_min)},
+            names=['m'], default_min_seeds=8)
+        assert _v['supported'] == [], (_bad_min, _v)
+        assert any('n floor is unverifiable' in x
+                   for x in _v['verdicts']['m']['gate_failures']), (_bad_min, _v)
+    for _bad_n in (-5, 1.5, True, 'banana'):
+        _v = L.directional_claim_verdicts(
+            {'m': _case(n_effective=_bad_n)},
+            names=['m'], default_min_seeds=8)
+        assert _v['supported'] == [], (_bad_n, _v)
+        assert 'n_effective_unverifiable' in _v['verdicts']['m']['gate_failures'], (_bad_n, _v)
+
     # p == alpha is not below alpha; two-sided p cannot be a boolean/NaN/out
     # of range.  The helper adds no test, so the boundary must be exact.
     _v = L.directional_claim_verdicts({'m': _case(p_holm=0.05)}, names=['m'])

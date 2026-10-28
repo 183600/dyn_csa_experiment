@@ -1053,15 +1053,30 @@ def directional_claim_verdicts(comparisons, *, names=None, alpha=0.05,
                 f'probability in [0,1], got {ph_raw!r}')
         out['p_holm'] = ph
         out['holm_significant'] = bool(ph < alpha)
-        n_eff = _as_seed_int(rec.get('n_effective'))
-        min_n = _as_seed_int(rec.get('min_seeds_for_confirmation'))
-        if min_n is None:
+        # Present-but-malformed floor fields are corrupt, not absent.  Falling
+        # back to the default (or accepting a negative floor) would let a
+        # record that cannot attest its own n floor support a claim.
+        _raw_n_eff = rec.get('n_effective')
+        n_eff = _as_seed_int(_raw_n_eff)
+        if _raw_n_eff is not None and (n_eff is None or n_eff < 0):
+            n_eff = None
+        _raw_min_n = rec.get('min_seeds_for_confirmation')
+        min_n = _as_seed_int(_raw_min_n)
+        _min_n_invalid = False
+        if _raw_min_n is None:
             min_n = _dmin
+        elif min_n is None or min_n < 0:
+            _min_n_invalid = True
+            min_n = None
         out['n_effective'] = (n_eff if n_eff is not None else 0)
         out['min_seeds'] = min_n
         failures = []
         if n_eff is None:
             failures.append('n_effective_unverifiable')
+        if _min_n_invalid:
+            failures.append(
+                f'min_seeds_for_confirmation={_raw_min_n!r} is not a '
+                'non-negative integer; the n floor is unverifiable')
         if min_n is not None and (n_eff is None or n_eff < min_n):
             failures.append(
                 f'n_effective={out["n_effective"]} < min_seeds_for_confirmation={min_n}')
