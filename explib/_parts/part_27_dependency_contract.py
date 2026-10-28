@@ -1,0 +1,1395 @@
+
+
+def dependency_contract(lock_path=None):
+    """Compare the declared lock with the versions actually installed.
+
+    A lock that is present but incomplete or stale is the reproducibility
+    failure mode a release must expose: the same git commit then runs on a
+    different numerical stack.  ``partial`` means every pinned entry matches
+    but extra installed distributions are not pinned, or the lock does not
+    declare the interpreter/platform (the lock is not a full environment
+    record).  ``mismatch`` also covers a declared interpreter/platform that
+    differs from the running one.  Tooling (pip/setuptools/wheel) is not a
+    runtime dependency and is excluded from the coverage check.
+    """
+    try:
+        parsed = parse_requirements_lock(lock_path)
+    except OSError as e:
+        # Provenance must never crash a training run because a lock file is
+        # unreadable; report it as an explicit contract failure instead.
+        return {'kind': 'dependency_contract',
+                'lock_path': os.path.abspath(str(lock_path or 'requirements.lock')),
+                'lock_sha256': None, 'n_pinned': 0, 'options': [],
+                'mismatches': [], 'missing': [], 'unpinned_installed': [],
+                'interpreter': _interpreter_contract(),
+                'invalid': [f'could not read the lock: {type(e).__name__}: {e}'],
+                'status': 'invalid',
+                'note': 'the lock file exists but could not be read'}
+    out = {'kind': 'dependency_contract', 'lock_path': parsed['path'],
+           'lock_sha256': parsed['sha256'], 'n_pinned': len(parsed['pins']),
+           'options': parsed['options'], 'mismatches': [], 'missing': [],
+           'interpreter': _interpreter_contract(parsed.get('environment')),
+           'invalid': list(parsed['invalid']), 'unpinned_installed': [],
+           'status': 'ok', 'note': ''}
+    if not parsed['exists']:
+        out['status'] = 'missing_lock'
+        out['note'] = 'requirements.lock is absent; the environment is not pinned'
+        return out
+    if parsed['invalid']:
+        out['status'] = 'invalid'
+        out['note'] = 'the lock has unparseable/ambiguous entries'
+        return out
+    installed = {}
+    try:
+        from importlib import metadata as _md
+        for dist in _md.distributions():
+            try:
+                name = dist.metadata['Name']
+                if name:
+                    installed[re.sub(r'[-_.]+', '-', str(name)).lower()] = str(dist.version)
+            except Exception:
+                continue
+    except Exception as e:
+        out['status'] = 'invalid'
+        out['invalid'].append(f'importlib.metadata unavailable: {type(e).__name__}: {e}')
+        return out
+    for name, ent in sorted(parsed['pins'].items()):
+        got = installed.get(name)
+        if got is None:
+            out['missing'].append({'name': ent['name'], 'expected': ent['version']})
+        elif str(got) != str(ent['version']):
+            out['mismatches'].append({'name': ent['name'], 'expected': ent['version'],
+                                      'installed': str(got)})
+    _tooling = {'pip', 'setuptools', 'wheel', 'pkg-resources', 'distribute',
+                'ruff'}
+    out['unpinned_installed'] = sorted(
+        n for n in installed if n not in parsed['pins'] and n not in _tooling)
+    out['n_installed'] = len(installed)
+    out['n_unpinned_installed'] = len(out['unpinned_installed'])
+    _interp = out['interpreter']
+    _version_bad = bool(out['mismatches'] or out['missing'])
+    _interp_bad = _interp.get('status') == 'mismatch'
+    _interp_missing = list(_interp.get('missing') or [])
+    if _version_bad or _interp_bad:
+        out['status'] = 'mismatch'
+        if _version_bad and _interp_bad:
+            out['note'] = ('installed versions and the running '
+                           'interpreter/platform do not match the lock')
+        elif _interp_bad:
+            out['note'] = 'the running interpreter/platform does not match the lock'
+        else:
+            out['note'] = 'installed versions do not match the lock'
+    elif (out['unpinned_installed'] or _interp.get('status') == 'unverified'
+          or _interp_missing):
+        out['status'] = 'partial'
+        _why = []
+        if out['unpinned_installed']:
+            _why.append('the lock does not pin all installed runtime distributions')
+        if _interp.get('status') == 'unverified':
+            _why.append('the lock does not declare the interpreter/platform')
+        elif _interp_missing:
+            _why.append('the lock does not declare ' + ', '.join(_interp_missing)
+                        + ' (the interpreter/platform contract is incomplete)')
+        out['note'] = ('every pinned entry matches, but ' + ' and '.join(_why))
+    else:
+        out['note'] = ('every installed runtime distribution and the '
+                       'interpreter/platform are pinned and match '
+                       '(pip/setuptools/wheel excluded as tooling)')
+    return out
+
+
+def environment_snapshot():
+    """Compact software/hardware snapshot for experiment tracking."""
+    import platform
+    import socket
+    try:
+        _hostname = socket.gethostname()
+    except Exception:
+        _hostname = None
+    env = {
+        'python': sys.version.split()[0],
+        'hostname': _hostname,
+        'process_id': os.getpid(),
+        'working_directory': os.getcwd(),
+        'executable': sys.executable,
+        'platform': platform.platform(),
+        'machine': platform.machine(),
+        'processor': platform.processor(),
+        'cpu_count': os.cpu_count(),
+        'torch': torch.__version__,
+        'torch_git_version': getattr(torch.version, 'git_version', None),
+        'numpy': np.__version__,
+        'cuda_available': bool(torch.cuda.is_available()),
+        'cuda_version': torch.version.cuda,
+        'cudnn_version': torch.backends.cudnn.version() if torch.backends.cudnn.is_available() else None,
+        'gpu_names': _gpu_names(),
+        'gpu_identity': _gpu_identity(),
+        'cuda_device_count': torch.cuda.device_count() if torch.cuda.is_available() else 0,
+        'cuda_visible_devices': os.environ.get('CUDA_VISIBLE_DEVICES'),
+        'determinism': determinism_label(),
+        'cudnn_deterministic': bool(torch.backends.cudnn.deterministic),
+        'cudnn_benchmark': bool(torch.backends.cudnn.benchmark),
+        'deterministic_algorithms': bool(torch.are_deterministic_algorithms_enabled()),
+        'tf32_matmul': bool(torch.backends.cuda.matmul.allow_tf32) if torch.cuda.is_available() else None,
+        'tf32_cudnn': bool(torch.backends.cudnn.allow_tf32) if torch.cuda.is_available() else None,
+        'fp16_reduced_precision_reduction': bool(torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction) if torch.cuda.is_available() else None,
+        'bf16_reduced_precision_reduction': bool(torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction) if torch.cuda.is_available() else None,
+        'float32_matmul_precision': torch.get_float32_matmul_precision(),
+        'cublas_workspace_config': os.environ.get('CUBLAS_WORKSPACE_CONFIG'),
+        'cpu_threads': int(torch.get_num_threads()),
+        'cpu_interop_threads': int(torch.get_num_interop_threads()) if hasattr(torch, 'get_num_interop_threads') else None,
+        'pythonhashseed': os.environ.get('PYTHONHASHSEED'),
+        'pythonhashseed_at_startup': _PYTHONHASHSEED_AT_STARTUP,
+        'pythonhashseed_pinned_at_startup': bool(
+            _hashseed_pinned_value(_PYTHONHASHSEED_AT_STARTUP)),
+        'hashseed_contract': hashseed_contract(),
+        'tensorflow': getattr(sys.modules.get('tensorflow'), '__version__', None),
+        'dependencies': _dependency_fingerprint(),
+        'dependency_contract': dependency_contract(),
+        'flags': {k: os.environ.get(k) for k in ('CSA_KERNEL', 'CSA_CKPT', 'CSA_DETERMINISTIC', 'CSA_CPU_THREADS', 'CSA_SKIP_OVERFIT', 'CSA_REQUIRE_REPRO', 'CSA_SKIP_REPRO', 'CUBLAS_WORKSPACE_CONFIG')},
+        # Every run-control variable, not just the historically documented
+        # subset: an unrecorded CSA_*/WT103_*/V12_* flag is an unexplained
+        # difference between two otherwise identical runs.  Secrets (tokens,
+        # passwords) do not use these prefixes and are never collected.
+        'env_flags': {k: os.environ.get(k) for k in sorted(os.environ)
+                      if k.startswith(('CSA_', 'WT103_', 'FWEDU_', 'M0_', 'V12_'))},
+    }
+    for _mod, _key in (('tokenizers', 'tokenizers'), ('datasets', 'datasets')):
+        try:
+            env[_key] = __import__(_mod).__version__
+        except Exception:
+            env[_key] = None
+    return env
+
+def execution_fingerprint(env=None):
+    """Fingerprint of the hardware/software/determinism class of a run.
+
+    Same-seed replication is only guaranteed on the same stack: a different
+    GPU architecture, CUDA/cuDNN build, precision policy or thread count can
+    change every result.  Paired seed contrasts therefore carry this digest,
+    and `pair_reason` refuses two records whose digests disagree.  Hostname and
+    process id are deliberately excluded so two machines of the same class can
+    still be compared; the GPU UUID is excluded for the same reason (hardware
+    model and compute capability are the reproducibility-relevant part).
+    """
+    env = environment_snapshot() if env is None else env
+    gpus = []
+    for g in env.get('gpu_identity') or []:
+        if not isinstance(g, dict):
+            continue
+        gpus.append({k: g.get(k) for k in ('name', 'major', 'minor', 'total_memory_bytes')})
+    deps = env.get('dependencies') or {}
+    fields = {
+        'python': env.get('python'),
+        'platform': env.get('platform'),
+        'machine': env.get('machine'),
+        'processor': env.get('processor'),
+        'cpu_count': env.get('cpu_count'),
+        'torch': env.get('torch'),
+        'torch_git_version': env.get('torch_git_version'),
+        'numpy': env.get('numpy'),
+        'cuda_available': env.get('cuda_available'),
+        'cuda_version': env.get('cuda_version'),
+        'cudnn_version': env.get('cudnn_version'),
+        'cuda_device_count': env.get('cuda_device_count'),
+        'gpus': gpus,
+        'determinism': env.get('determinism'),
+        'cudnn_deterministic': env.get('cudnn_deterministic'),
+        'cudnn_benchmark': env.get('cudnn_benchmark'),
+        'deterministic_algorithms': env.get('deterministic_algorithms'),
+        'tf32_matmul': env.get('tf32_matmul'),
+        'tf32_cudnn': env.get('tf32_cudnn'),
+        'fp16_reduced_precision_reduction': env.get('fp16_reduced_precision_reduction'),
+        'bf16_reduced_precision_reduction': env.get('bf16_reduced_precision_reduction'),
+        'float32_matmul_precision': env.get('float32_matmul_precision'),
+        'cublas_workspace_config': env.get('cublas_workspace_config'),
+        'cpu_threads': env.get('cpu_threads'),
+        'cpu_interop_threads': env.get('cpu_interop_threads'),
+        'packages': deps.get('packages') if isinstance(deps, dict) else None,
+    }
+    blob = json.dumps(fields, sort_keys=True, default=str, ensure_ascii=True)
+    return hashlib.sha256(blob.encode('utf-8')).hexdigest()[:16]
+
+def execution_environment_reason(ra, rb):
+    """Why two records cannot attest same-environment replication, or None.
+
+    Both-present is required for a verdict; legacy records without the digest
+    keep the historical permissive path.  This is only about the execution
+    environment, not the seed, data or recipe (those have their own gates).
+    """
+    def _fp(rec):
+        v = rec.get('exec_fp')
+        if v is None and isinstance(rec.get('hyperparams'), dict):
+            v = rec['hyperparams'].get('exec_fp')
+        return v
+    a, b = _fp(ra), _fp(rb)
+    ha = a is not None and str(a) != ''
+    hb = b is not None and str(b) != ''
+    if ha and hb and str(a) != str(b):
+        return (f'different execution environment ({str(a)[:12]}… vs '
+                f'{str(b)[:12]}…): same-seed replication is not controlled '
+                'across hardware/driver/precision classes')
+    return None
+
+def _corpus_prefix_fp(train_ids, cap=None):
+    """Fingerprint of the tokenizer-fit prefix, independent of training budget.
+
+    `train_fp` hashes the *served* training stream, so a 5B-token tier and a
+    12B-token tier over the same corpus necessarily disagree even when they
+    share one tokenizer.  The first `TOKENIZER_FIT_TOKENS` ids are exactly the
+    prefix the tokenizer was fitted on, and extending the training cap leaves
+    that prefix unchanged.  Hash only that prefix so a scale ladder can attest
+    "same corpus/tokenizer" without also requiring "same training volume".
+    """
+    if train_ids is None:
+        return None
+    try:
+        arr = np.asarray(train_ids)
+    except (TypeError, ValueError):
+        return None
+    if arr.ndim != 1:
+        arr = arr.reshape(-1)
+    _cap = TOKENIZER_FIT_TOKENS if cap is None else int(cap)
+    if _cap <= 0 or arr.size == 0:
+        return None
+    return _ids_fp(np.ascontiguousarray(arr[:min(int(arr.size), _cap)]))
+
+def _corpus_fp_from_data(data):
+    """Budget-independent corpus/tokenizer identity.
+
+    Deliberately excludes `requested_train_tokens`, `train_tokens`, `train_fp`
+    and the split lengths: those change when a scale tier trains longer, but
+    they do not change the corpus or tokenizer.  The tokenizer-fit prefix
+    fingerprint covers the text actually used to fit the BPE (and therefore
+    distinguishes different tokenisations even at equal vocabulary width).
+    """
+    keys = ('dataset', 'source', 'fw_fit_docs', 'vocab_size',
+            'corpus_prefix_fp', 'data_extra')
+    payload = {k: data.get(k) for k in keys if data.get(k) is not None}
+    if not payload.get('corpus_prefix_fp'):
+        return None
+    blob = json.dumps(_jsonable(payload), sort_keys=True, separators=(',', ':'), ensure_ascii=True)
+    return hashlib.sha256(blob.encode('utf-8')).hexdigest()[:16]
+
+def _data_version(data):
+    """Stable content digest of the corpus identity recorded in a panel.
+
+    The token fingerprints already hash the exact ids seen; this composite
+    makes the *data version* a single field a reader can compare across runs
+    (dataset/protocol, token counts, vocabulary and both split fingerprints)
+    without knowing which individual fields the loader happened to expose.
+    `corpus_fp` (when present) is the budget-independent subset used by the
+    scale ladder; `data_version` still identifies the exact served bytes.
+    """
+    keys = ('dataset', 'source', 'fw_fit_docs', 'requested_train_tokens', 'train_tokens', 'seq_len', 'vocab_size', 'val_sequences', 'train_fp', 'val_fp', 'eval_fp', 'cache_val_fp', 'corpus_fp', 'data_extra')
+    payload = {k: data.get(k) for k in keys if data.get(k) is not None}
+    blob = json.dumps(_jsonable(payload), sort_keys=True, separators=(',', ':'), ensure_ascii=True)
+    return hashlib.sha256(blob.encode('utf-8')).hexdigest()[:16]
+
+def code_provenance():
+    """Code + environment provenance block, without any data section.
+
+    Shared by `experiment_provenance` (training/panel records, which append the
+    data fingerprints) and by `stamped_analysis` (derived/audit artifacts,
+    which have no data of their own — their inputs are other stamped records
+    or on-disk panels, so a `data` block here would be misleading)."""
+    code = {'code_semantics': CODE_SEMANTICS, 'code_stamp': code_stamp(),
+            'kernel_stamp': _kernel_stamp(), **_git_provenance()}
+    # Content identity that survives a source tarball / dirty work tree.  It is
+    # recorded after the git fields so a reader can compare both: the commit
+    # answers "which revision", the tree digest answers "exactly which bytes".
+    code['source_tree'] = source_tree_summary()
+    return {'code': code, 'environment': environment_snapshot()}
+
+def experiment_provenance(cfg, *, train_ids=None, val_batch=None, vocab=None):
+    """Everything needed to identify a panel: code version (semantic stamp
+    + git commit + dirty-worktree digest), environment, and the exact data
+    bytes seen (token fingerprints + a composite data version)."""
+    data = {'dataset': cfg.get('dataset') or 'wikitext', 'requested_train_tokens': cfg.get('n_train_tokens'), 'seq_len': cfg.get('seq_len')}
+    for _k in ('cache_dir', 'fw_source', 'fw_fit_docs'):
+        if cfg.get(_k) is not None:
+            data[_k if _k != 'fw_source' else 'source'] = cfg.get(_k)
+    if train_ids is not None:
+        data['train_tokens'] = int(len(train_ids))
+        data['train_fp'] = _ids_fp(train_ids)
+        data['corpus_prefix_fp'] = _corpus_prefix_fp(train_ids)
+    if val_batch is not None:
+        _vb = np.ascontiguousarray(val_batch).reshape(-1)
+        data['val_sequences'] = int(np.asarray(val_batch).shape[0])
+        data['val_fp'] = _ids_fp(_vb)
+    if vocab is not None:
+        data['vocab_size'] = int(vocab)
+    _extra = cfg.get('data_extra')
+    if isinstance(_extra, dict):
+        # Synthetic/task-specific generators (NIAH recipe, corruption modes)
+        # must be part of the data identity, not only the human note.
+        data['data_extra'] = _jsonable(_extra)
+    # Record the source the loader is PINNED to.  The cache metadata records
+    # what the bytes were actually built from; this field makes the intent
+    # visible in every run/checkpoint record, and `audit_gates data_source`
+    # checks the two against each other.  It is deliberately not added to
+    # `_data_version` (the content fingerprints already bind the bytes).
+    try:
+        if data['dataset'] == 'wikitext':
+            data['configured_dataset_source'] = wikitext_dataset_source()
+        elif data['dataset'] == 'fineweb':
+            data['configured_dataset_source'] = fineweb_cache_source(
+                data.get('source') or 'sample-10BT')
+    except ValueError:
+        raise
+    except Exception as _dse:
+        data['configured_dataset_source'] = {
+            'status': 'unresolved',
+            'error': f'{type(_dse).__name__}: {_dse}',
+        }
+    # Compute the composite fingerprint AFTER data_extra is present:
+    # `_corpus_fp_from_data` deliberately includes that key, so computing it
+    # first made two distinct task/corruption corpora carry the same corpus_fp
+    # (the field used by cross-scale corpus binding).
+    _cfp = _corpus_fp_from_data(data)
+    if _cfp is not None:
+        data['corpus_fp'] = _cfp
+    data['data_version'] = _data_version(data)
+    prov = code_provenance()
+    prov['data'] = data
+    return prov
+
+def run_hyperparameters(cfg, *, seed, d, n_layers, n_heads, d_head, vocab, mlp_ratio, data_version=None, amp_dtype='auto', eager_batch='auto'):
+    """Structured hyper-parameter record (the run_cfg string stays the
+    pairing gate; this is the human/machine-readable copy).
+
+    ``amp_dtype`` / ``eager_batch`` must be the values the cell ACTUALLY ran,
+    not a fresh inference from the current process's global device.  Callers
+    that already have the training record pass its two fields here."""
+    hp = {str(k): _jsonable(v) for k, v in cfg.items() if k not in ('seeds', 'variants', 'outdir')}
+    hp.update({
+        'seed': int(seed),
+        'data_seed': int(seed),
+        'rng': {
+            'python': int(seed),
+            'numpy': int(seed),
+            'torch': int(seed),
+            'cuda': int(seed),
+            'tensorflow': int(seed),
+            'data': int(seed),
+            'eval_sampling': 0,
+            'dataloader_generator': int(seed),
+            'worker_seed_policy': 'torch.initial_seed() % 2**32',
+        },
+        'd': int(d),
+        'n_layers': int(n_layers),
+        'n_heads': int(n_heads),
+        'd_head': int(d_head),
+        'vocab_size': int(vocab),
+        'mlp_ratio': float(mlp_ratio),
+        'dataset': cfg.get('dataset') or 'wikitext',
+        'exec_fp': execution_fingerprint(),
+        'train_knobs': training_knobs(amp_dtype=amp_dtype, eager_batch=eager_batch),
+        'determinism': {
+            'level': determinism_label(),
+            'cudnn_deterministic': bool(torch.backends.cudnn.deterministic),
+            'cudnn_benchmark': bool(torch.backends.cudnn.benchmark),
+            'deterministic_algorithms': bool(torch.are_deterministic_algorithms_enabled()),
+            'tf32_matmul': (bool(torch.backends.cuda.matmul.allow_tf32) if torch.cuda.is_available() else None),
+            'fp16_reduced_precision_reduction': (bool(torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction) if torch.cuda.is_available() else None),
+            'bf16_reduced_precision_reduction': (bool(torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction) if torch.cuda.is_available() else None),
+            'cublas_workspace_config': os.environ.get('CUBLAS_WORKSPACE_CONFIG'),
+            'cpu_threads': int(torch.get_num_threads()),
+            'pythonhashseed': os.environ.get('PYTHONHASHSEED'),
+        },
+    })
+    _knobs = hp['train_knobs']
+    hp['amp_dtype'] = _knobs.get('amp_dtype')
+    hp['eager_batch'] = _knobs.get('eager_batch')
+    if data_version is not None:
+        hp['data_version'] = str(data_version)
+    return hp
+
+def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reproducibility=None, *, data_contract=None, seed_contract=None, status=None, planned_cells=None, started_at=None, cell_records=None, tracking_verification=None):
+    """Merge one panel's provenance/config/outcome summary into
+    `outdir/run_manifest.json` under the same flock used by summary.json.
+
+    The per-record `losses` / `ppl_history` curves stay in summary.json (to
+    avoid duplicating large arrays); each manifest cell points at its key.
+    `sanity` (the small-batch overfit reports), `reproducibility` (the
+    duplicate-run seed check), `seed_contract` (the explicit RNG-source
+    audit) and `data_contract` (the real batch iterator check) are embedded
+    when supplied, or read back from `outdir/overfit_sanity.json` /
+    `outdir/reproducibility.json` / `outdir/seed_contract.json` /
+    `outdir/data_contract.json` so an auto-preflight is traceable without a
+    second manual record.
+
+    `status` / `planned_cells` make the manifest a crash-safe tracking record:
+    `run()` writes it with status='running' before the first cell, so a killed
+    process still leaves the code version, config, data version and the list
+    of planned cells on disk; the final call marks it complete and lists any
+    cell that produced no measurement."""
+    os.makedirs(outdir, exist_ok=True)
+
+    def _evidence_for_this_panel(doc, path, what):
+        """Only evidence stamped with THIS panel's run_cfg may enter the
+        manifest.  A run_cfg-less (legacy/hand-written) doc must say
+        ``legacy: true`` explicitly; otherwise a stale pre-flight from a reused
+        outdir could silently certify a new configuration."""
+        if doc is None:
+            return None
+        if not isinstance(doc, dict):
+            print(f'[track] WARNING: {what} evidence is not a JSON object ({type(doc).__name__}) — not embedding it in this panel')
+            return None
+        _rc = doc.get('run_cfg')
+        if _rc is None:
+            if doc.get('legacy') is True:
+                print(f'[track] WARNING: {what} evidence ({path}) has no run_cfg and is explicitly marked legacy — embedding it as unverified legacy evidence')
+                return doc
+            print(f'[track] WARNING: {what} evidence ({path}) has NO run_cfg — refusing to embed it (it cannot be tied to this panel; mark legacy=True only for a deliberately imported old record)')
+            return None
+        if _rc != run_cfg:
+            print(f'[track] WARNING: {what} evidence ({path}) belongs to a DIFFERENT run_cfg ({_rc!r} != {run_cfg!r}) — not embedding it in this panel (a stale pre-flight must not certify a new config)')
+            return None
+        return doc
+
+    if sanity is None:
+        _san_path = os.path.join(outdir, 'overfit_sanity.json')
+        if os.path.exists(_san_path):
+            try:
+                with open(_san_path, encoding='utf-8') as _sf:
+                    sanity = json.load(_sf)
+            except Exception as _se:
+                print(f'[track] WARNING: could not read {_san_path} for the run manifest ({type(_se).__name__}: {_se})')
+    sanity = _evidence_for_this_panel(sanity, os.path.join(outdir, 'overfit_sanity.json'), 'sanity')
+    if reproducibility is None:
+        _rep_path = os.path.join(outdir, 'reproducibility.json')
+        if os.path.exists(_rep_path):
+            try:
+                with open(_rep_path, encoding='utf-8') as _rf:
+                    reproducibility = json.load(_rf)
+            except Exception as _re:
+                print(f'[track] WARNING: could not read {_rep_path} for the run manifest ({type(_re).__name__}: {_re})')
+    reproducibility = _evidence_for_this_panel(reproducibility, os.path.join(outdir, 'reproducibility.json'), 'reproducibility')
+    if data_contract is None:
+        _bc_path = os.path.join(outdir, 'data_contract.json')
+        if os.path.exists(_bc_path):
+            try:
+                with open(_bc_path, encoding='utf-8') as _bf:
+                    data_contract = json.load(_bf)
+            except Exception as _be:
+                print(f'[track] WARNING: could not read {_bc_path} for the run manifest ({type(_be).__name__}: {_be})')
+    data_contract = _evidence_for_this_panel(data_contract, os.path.join(outdir, 'data_contract.json'), 'data contract')
+    if seed_contract is None:
+        _sc_path = os.path.join(outdir, 'seed_contract.json')
+        if os.path.exists(_sc_path):
+            try:
+                with open(_sc_path, encoding='utf-8') as _scf:
+                    seed_contract = json.load(_scf)
+            except Exception as _sce:
+                print(f'[track] WARNING: could not read {_sc_path} for the run manifest ({type(_sce).__name__}: {_sce})')
+    seed_contract = _evidence_for_this_panel(seed_contract, os.path.join(outdir, 'seed_contract.json'), 'seed contract')
+    if cell_records is not None:
+        # Custom phases (warmup/NIAH/lenphase) have their own summary keys and
+        # metrics (PPL with warm-grid keys, NIAH accuracy, by-length PPL).
+        # They build already-normalised cell records and use the same
+        # crash-safe manifest/provenance/integrity machinery as run().
+        cells = {str(k): dict(v) for k, v in dict(cell_records).items() if isinstance(v, dict)}
+    else:
+        cells = {}
+        for seed in cfg.get('seeds') or []:
+            for v in cfg.get('variants') or []:
+                key = f'{v}::seed{seed}'
+                rec = summary.get(key)
+                if not isinstance(rec, dict) or not ppl_is_usable(rec.get('ppl')) or rec.get('synthesized'):
+                    continue
+                _curves = _cell_curve_data(outdir, rec)
+                _losses = rec.get('losses') if isinstance(rec.get('losses'), list) else (_curves.get('losses') if isinstance(_curves.get('losses'), list) else [])
+                _loss_nums = [float(x) for x in _losses if isinstance(x, (int, float)) and not isinstance(x, bool)]
+                _ph = rec.get('ppl_history') if isinstance(rec.get('ppl_history'), list) else (_curves.get('ppl_history') if isinstance(_curves.get('ppl_history'), list) else [])
+                if not _losses and rec.get('curve_n_points') is not None:
+                    _loss_nums = []
+                cells[key] = {
+                    'variant': v,
+                    'seed': int(seed),
+                    'run_id': rec.get('run_id'),
+                    'run_cfg': rec.get('run_cfg'),
+                    'started_at': rec.get('started_at'),
+                    'finished_at': rec.get('finished_at'),
+                    'ppl': rec.get('ppl'),
+                    'steps': rec.get('steps'),
+                    'tokens_seen': rec.get('tokens_seen'),
+                    'params': rec.get('params'),
+                    'train_time_s': rec.get('train_time_s'),
+                    'final_loss_smoothed': rec.get('final_loss_smoothed'),
+                    'rng_fp': rec.get('rng_fp'),
+                    'exec_fp': rec.get('exec_fp'),
+                    'data_fp': rec.get('data_fp'),
+                    'val_fp': rec.get('val_fp'),
+                    'data_version': rec.get('data_version') or prov.get('data', {}).get('data_version'),
+                    'corpus_fp': rec.get('corpus_fp') or prov.get('data', {}).get('corpus_fp'),
+                    'code_stamp': rec.get('_code'),
+                    'hyperparams': rec.get('hyperparams'),
+                    'curve_summary': {'n_points': (len(_losses) if _losses else int(rec.get('curve_n_points') or 0)),
+                                      'first': _loss_nums[0] if _loss_nums else rec.get('curve_first'),
+                                      'last': _loss_nums[-1] if _loss_nums else rec.get('curve_last'),
+                                      'best': min(_loss_nums) if _loss_nums else rec.get('curve_best'),
+                                      'ppl_history_points': (len(_ph) if _ph else int(rec.get('ppl_history_n_points') or 0))},
+                    'curve_ref': rec.get('curve_ref') or f'summary.json#{key}.losses',
+                    'curve_sha256': rec.get('curve_sha256'),
+                    'ppl_history_ref': rec.get('ppl_history_ref') or f'summary.json#{key}.ppl_history',
+                    'ppl_history_sha256': rec.get('ppl_history_sha256'),
+                    'sanity_ref': rec.get('sanity_ref') or ('overfit_sanity.json' if sanity else None),
+                }
+    if planned_cells is None:
+        planned_cells = [f'{v}::seed{seed}' for seed in cfg.get('seeds') or [] for v in cfg.get('variants') or []]
+    planned_cells = [str(_k) for _k in dict.fromkeys(planned_cells)]
+
+    def _curve_ref_ok(cell):
+        for _key in ('curve_ref', 'ppl_history_ref'):
+            _ref = cell.get(_key) if isinstance(cell, dict) else None
+            if not _ref or '#' in str(_ref):
+                continue
+            if not os.path.exists(os.path.join(outdir, str(_ref))):
+                return False
+        return True
+    # Machine-checkable completeness of the per-cell trace.  A record without
+    # provenance/hyperparameters/RNG fingerprint/curve is still a measurement,
+    # but it must not silently look as traceable as a complete one.
+    #
+    # Seed metadata is checked against the RESUME KEY, not against itself: a
+    # record copied/mis-keyed under `seed3` with `seed=2` would otherwise count
+    # as a third independent seed while actually duplicating the second.
+    _seed_mismatch = []
+    _seed_ok = 0
+    _run_cfg_mismatch = []
+    _data_version_mismatch = []
+    for _key, _c in cells.items():
+        try:
+            _expected = int(str(_key).rsplit('::seed', 1)[1])
+        except (ValueError, IndexError):
+            _seed_mismatch.append(_key)
+            continue
+        _hp = _c.get('hyperparams') if isinstance(_c.get('hyperparams'), dict) else {}
+        _rng = _hp.get('rng') if isinstance(_hp.get('rng'), dict) else {}
+        try:
+            _vals = [int(_hp.get('seed'))] if _hp.get('seed') is not None else []
+            if _hp.get('data_seed') is not None:
+                _vals.append(int(_hp.get('data_seed')))
+            _vals.extend(int(_rng[k]) for k in ('python', 'numpy', 'torch', 'cuda', 'tensorflow',
+                                                'data', 'dataloader_generator') if _rng.get(k) is not None)
+            _ok = (bool(_c.get('seed') is not None) and int(_c.get('seed')) == _expected
+                   and all(v == _expected for v in _vals))
+        except (TypeError, ValueError, OverflowError):
+            _ok = False
+        if _ok:
+            _seed_ok += 1
+        else:
+            _seed_mismatch.append(_key)
+        if _c.get('run_cfg') not in (None, run_cfg):
+            _run_cfg_mismatch.append(_key)
+        _cell_dv = _c.get('data_version')
+        _hp_dv = _hp.get('data_version')
+        if _cell_dv is not None and _hp_dv is not None and str(_cell_dv) != str(_hp_dv):
+            _data_version_mismatch.append(_key)
+    try:
+        _declared_seeds = [int(x) for x in (cfg.get('seeds') or [])]
+    except (TypeError, ValueError, OverflowError):
+        _declared_seeds = []
+    _integrity = {
+        'n_cells': len(cells),
+        'seeds_declared': _declared_seeds,
+        'seeds_unique': bool(len(_declared_seeds) == len(set(_declared_seeds))),
+        'with_seed_metadata': _seed_ok,
+        'seed_metadata_mismatch': _seed_mismatch[:20],
+        'with_provenance': sum(1 for c in cells.values() if c.get('data_fp') and c.get('code_stamp')),
+        'with_hyperparams': sum(1 for c in cells.values() if c.get('hyperparams')),
+        'with_rng_fp': sum(1 for c in cells.values() if c.get('rng_fp')),
+        'with_exec_fp': sum(1 for c in cells.values() if c.get('exec_fp')),
+        'with_data_version': sum(1 for c in cells.values() if c.get('data_version')),
+        'with_curve': sum(1 for c in cells.values() if (c.get('curve_summary') or {}).get('n_points')),
+        'with_curve_hash': sum(1 for c in cells.values() if c.get('curve_sha256')),
+        'with_sanity_ref': sum(1 for c in cells.values() if c.get('sanity_ref')),
+        'with_data_contract': int(bool(isinstance(data_contract, dict) and data_contract.get('passed'))),
+        'with_seed_contract': int(bool(isinstance(seed_contract, dict) and seed_contract.get('passed'))),
+    }
+    # Counts alone let a cell that is missing its code stamp / hyperparameters /
+    # data version / RNG fingerprint / curve still look like a normal member of
+    # a "complete" panel.  Name the incomplete cells and make panel completion
+    # a single machine-readable verdict, so an automated reader cannot mistake
+    # a partially traced panel for a fully reproducible one.
+    _missing_cells = [str(k) for k in planned_cells if k not in cells]
+    _incomplete_cells = []
+    _missing_curve_refs = []
+    for _k, _c in cells.items():
+        _hp2 = _c.get('hyperparams') if isinstance(_c.get('hyperparams'), dict) else {}
+        _curve_n = (_c.get('curve_summary') or {}).get('n_points')
+        _ref_ok = _curve_ref_ok(_c)
+        if not _ref_ok:
+            _missing_curve_refs.append(str(_k))
+        if not (_c.get('code_stamp') and _hp2 and _c.get('data_version')
+                and _c.get('rng_fp') and _curve_n and _ref_ok):
+            _incomplete_cells.append(str(_k))
+    _integrity['complete_cells'] = len(cells) - len(_incomplete_cells)
+    _integrity['incomplete_cells'] = _incomplete_cells[:20]
+    _integrity['missing_cells'] = _missing_cells[:20]
+    _integrity['missing_curve_refs'] = _missing_curve_refs[:20]
+    _integrity['run_cfg_mismatch'] = _run_cfg_mismatch[:20]
+    _integrity['data_version_mismatch'] = _data_version_mismatch[:20]
+    _integrity['complete'] = bool(not _incomplete_cells and not _missing_cells
+                                  and not _seed_mismatch and not _missing_curve_refs
+                                  and not _run_cfg_mismatch and not _data_version_mismatch)
+    _declared_status = status or 'complete'
+    if _declared_status in ('running', 'failed', 'error', 'incomplete'):
+        _completion_status = _declared_status
+    else:
+        _completion_status = 'complete' if _integrity['complete'] else 'incomplete'
+    _completion = {
+        'status': _completion_status,
+        # A panel explicitly declared incomplete/failed/running is not complete
+        # just because its recorded cells happen to be trace-complete.  The
+        # boolean is a conjunction of the declared terminal state and the
+        # per-cell integrity verdict.
+        'complete': bool(_integrity['complete'] and _completion_status == 'complete'),
+        'n_planned': len(planned_cells),
+        'n_measured': len(cells),
+        'n_missing': len(_missing_cells),
+        'missing_cells': _missing_cells[:20],
+        'incomplete_cells': _incomplete_cells[:20],
+        'incomplete_reasons': ('missing measurement for every planned cell; '
+                               'each measured cell carries code/hyperparameters/'
+                               'data_version/rng_fp/curve and seed metadata'
+                               if _integrity['complete'] else
+                               'panel is not fully traced: see missing_cells / '
+                               'incomplete_cells / missing_curve_refs / '
+                               'seed_metadata_mismatch / run_cfg_mismatch / '
+                               'data_version_mismatch'),
+    }
+    _prod_evidence = None
+    if isinstance(sanity, dict) and isinstance(sanity.get('production_loop'), dict):
+        _prod_evidence = bool((sanity.get('production_loop') or {}).get('passed'))
+    _evidence = {
+        'small_batch_overfit': (bool(sanity.get('passed')) if isinstance(sanity, dict) else None),
+        'production_loop_overfit': _prod_evidence,
+        'same_machine_reproducibility': (bool(reproducibility.get('passed')) if isinstance(reproducibility, dict) else None),
+        'rng_seed_contract': (bool(seed_contract.get('passed')) if isinstance(seed_contract, dict) else None),
+        'batch_iterator_contract': (bool(data_contract.get('passed')) if isinstance(data_contract, dict) else None),
+    }
+    entry = {
+        'run_cfg': run_cfg,
+        'status': status or 'complete',
+        'created_at': started_at or time.strftime('%Y-%m-%dT%H:%M:%S'),
+        'updated_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+        'config': _jsonable(cfg),
+        'provenance': prov,
+        'data_version': prov.get('data', {}).get('data_version'),
+        'corpus_fp': prov.get('data', {}).get('corpus_fp'),
+        'sanity': sanity,
+        'reproducibility': reproducibility,
+        'seed_contract': seed_contract,
+        'data_contract': data_contract,
+        'tracking_verification': tracking_verification,
+        'evidence': _evidence,
+        'experiment_log': 'experiments.jsonl',
+        'tracking_schema': 2,
+        'planned_cells': planned_cells,
+        'n_planned': len(planned_cells),
+        'n_completed': len(cells),
+        'missing_cells': _missing_cells,
+        'completion': _completion,
+        'tracking_integrity': _integrity,
+        'cells': cells,
+    }
+    path = os.path.join(outdir, 'run_manifest.json')
+
+    def _merge(m):
+        if not isinstance(m, dict):
+            m = {}
+        m['manifest_version'] = m.get('manifest_version') or 1
+        _prev = m.setdefault('panels', {}).get(run_cfg)
+        if isinstance(_prev, dict) and _prev.get('created_at') and status != 'running':
+            entry['created_at'] = _prev['created_at']
+        m['panels'][run_cfg] = entry
+        return m
+    locked_json_update(path, _merge)
+    return path
+
+def verify_run_tracking(outdir, run_cfg=None, *, require_ppl=True):
+    """Independently verify one panel's on-disk trace.
+
+    `write_run_manifest` builds the trace; this function reads it back from
+    disk and re-derives the checks a reader would otherwise have to trust:
+    every planned cell has a record, a code stamp, hyperparameters including
+    the full RNG map, a data version, a final result, and a curve whose
+    recorded digest still matches the file.  It is read-only and never touches
+    the test split, so it can run at the end of every panel (and by hand on an
+    archived outdir).
+
+    Returns a JSON-safe verdict.  Missing legacy fields are reported as
+    problems for a current panel; `warnings` carries non-fatal notes.
+    """
+    problems = []
+    warnings = []
+    outdir = os.path.abspath(outdir)
+    manifest_path = os.path.join(outdir, 'run_manifest.json')
+    summary_path = os.path.join(outdir, 'summary.json')
+    if not os.path.exists(manifest_path):
+        return {'kind': 'run_tracking_verification', 'outdir': outdir,
+                'run_cfg': run_cfg, 'passed': False,
+                'problems': ['run_manifest.json is missing'],
+                'warnings': [], 'n_checked': 0}
+    try:
+        with open(manifest_path, encoding='utf-8') as f:
+            manifest = json.load(f)
+    except Exception as e:
+        return {'kind': 'run_tracking_verification', 'outdir': outdir,
+                'run_cfg': run_cfg, 'passed': False,
+                'problems': [f'run_manifest.json cannot be parsed: {type(e).__name__}: {e}'],
+                'warnings': [], 'n_checked': 0}
+    panels = manifest.get('panels') if isinstance(manifest, dict) else None
+    if not isinstance(panels, dict) or not panels:
+        return {'kind': 'run_tracking_verification', 'outdir': outdir,
+                'run_cfg': run_cfg, 'passed': False,
+                'problems': ['run_manifest.json has no panels'], 'warnings': [],
+                'n_checked': 0}
+    if run_cfg is None:
+        # Newest panel by created_at / updated_at; insertion order is the
+        # fallback for legacy manifests without timestamps.
+        def _stamp(entry):
+            return str((entry or {}).get('updated_at') or (entry or {}).get('created_at') or '')
+        run_cfg = max(panels, key=lambda k: _stamp(panels.get(k)))
+    entry = panels.get(run_cfg)
+    if not isinstance(entry, dict):
+        return {'kind': 'run_tracking_verification', 'outdir': outdir,
+                'run_cfg': run_cfg, 'passed': False,
+                'problems': [f'panel {run_cfg!r} is absent from run_manifest.json'],
+                'warnings': [], 'n_checked': 0}
+    try:
+        with open(summary_path, encoding='utf-8') as f:
+            summary = json.load(f)
+    except Exception as e:
+        summary = {}
+        problems.append(f'summary.json cannot be parsed: {type(e).__name__}: {e}')
+    if not isinstance(summary, dict):
+        problems.append('summary.json is not a JSON object')
+        summary = {}
+    planned = [str(k) for k in (entry.get('planned_cells') or [])]
+    if not planned:
+        problems.append('panel records no planned_cells')
+    cells = entry.get('cells') if isinstance(entry.get('cells'), dict) else {}
+    prov_dv = ((entry.get('provenance') or {}).get('data') or {}).get('data_version')
+    checked = 0
+    for key in planned:
+        checked += 1
+        rec = summary.get(key)
+        cell = cells.get(key)
+        if not isinstance(rec, dict):
+            problems.append(f'{key}: no summary record')
+            continue
+        if not isinstance(cell, dict):
+            problems.append(f'{key}: no manifest cell entry')
+            cell = {}
+        if not rec.get('_code'):
+            problems.append(f'{key}: record has no code stamp')
+        if cell.get('code_stamp') and rec.get('_code') and cell['code_stamp'] != rec.get('_code'):
+            problems.append(f'{key}: manifest code_stamp disagrees with the record')
+        hp = rec.get('hyperparams') if isinstance(rec.get('hyperparams'), dict) else {}
+        if not hp:
+            problems.append(f'{key}: record has no hyperparameters')
+        if not cell.get('hyperparams'):
+            problems.append(f'{key}: manifest cell has no hyperparameters')
+        rng = hp.get('rng') if isinstance(hp.get('rng'), dict) else {}
+        if not rng:
+            problems.append(f'{key}: hyperparameters have no RNG map')
+        try:
+            _expected = int(str(key).rsplit('::seed', 1)[1])
+        except (ValueError, IndexError):
+            _expected = None
+        if _expected is None:
+            problems.append(f'{key}: key does not name a seed')
+        else:
+            _seed_vals = [hp.get('seed'), hp.get('data_seed')]
+            _seed_vals += [rng.get(k) for k in ('python', 'numpy', 'torch', 'cuda', 'tensorflow', 'data', 'dataloader_generator')]
+            if any(v is None for v in _seed_vals):
+                problems.append(f'{key}: RNG map is incomplete')
+            elif any(int(v) != _expected for v in _seed_vals):
+                problems.append(f'{key}: seed metadata disagrees with the key')
+        dv = rec.get('data_version') or cell.get('data_version')
+        if not dv:
+            problems.append(f'{key}: record has no data_version')
+        elif prov_dv and str(dv) != str(prov_dv):
+            problems.append(f'{key}: data_version disagrees with the panel provenance')
+        if not rec.get('rng_fp'):
+            problems.append(f'{key}: record has no rng_fp')
+        if not rec.get('exec_fp'):
+            warnings.append(f'{key}: record has no exec_fp (legacy record)')
+        if require_ppl and not ppl_is_usable(rec.get('ppl')):
+            problems.append(f'{key}: no usable final PPL/result')
+        ref = rec.get('curve_ref')
+        losses = rec.get('losses') if isinstance(rec.get('losses'), list) else []
+        if ref and '#' not in str(ref):
+            path = os.path.join(outdir, str(ref))
+            if not os.path.exists(path):
+                problems.append(f'{key}: curve sidecar {ref!r} is missing')
+            else:
+                want = rec.get('curve_sha256') or cell.get('curve_sha256')
+                got = _file_sha256(path)
+                if want and got != want:
+                    problems.append(f'{key}: curve sidecar digest no longer matches the record')
+                elif not want:
+                    warnings.append(f'{key}: curve sidecar has no recorded digest')
+                try:
+                    with open(path, encoding='utf-8') as f:
+                        payload = json.load(f)
+                    if not isinstance(payload, dict):
+                        problems.append(f'{key}: curve sidecar is not a JSON object')
+                    elif not (payload.get('losses') or payload.get('ppl_history')):
+                        problems.append(f'{key}: curve sidecar contains no curve data')
+                except Exception as e:
+                    problems.append(f'{key}: curve sidecar cannot be parsed ({type(e).__name__}: {e})')
+        elif not losses and not rec.get('curve_n_points'):
+            problems.append(f'{key}: no training curve (inline or sidecar)')
+        ph_ref = rec.get('ppl_history_ref')
+        if ph_ref and '#' not in str(ph_ref):
+            ph_path = os.path.join(outdir, str(ph_ref))
+            if not os.path.exists(ph_path):
+                problems.append(f'{key}: ppl_history sidecar {ph_ref!r} is missing')
+            else:
+                want = rec.get('ppl_history_sha256') or cell.get('ppl_history_sha256')
+                if want and _file_sha256(ph_path) != want:
+                    problems.append(f'{key}: ppl_history sidecar digest no longer matches the record')
+    verdict = {
+        'kind': 'run_tracking_verification',
+        'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+        'outdir': outdir,
+        'run_cfg': run_cfg,
+        'panel_status': entry.get('status'),
+        'panel_completion': entry.get('completion'),
+        'n_planned': len(planned),
+        'n_checked': checked,
+        'problems': problems,
+        'warnings': warnings,
+        'passed': bool(not problems),
+    }
+    verdict['diagnosis'] = ('ok' if not problems else
+                            f'{len(problems)} tracking problem(s); first: {problems[0]}')
+    return verdict
+
+_EVAL_TOKENS_PER_CHUNK = 1 << 20
+
+
+def _eval_row_working_bytes(model, T, d, elem_size, bytes_per_value=8):
+    """Conservative per-row activation/workspace estimate for one eval row.
+
+    The dense `T*d` term is only the hidden-state floor.  Long-sequence
+    workspace is usually set by the attention workspace instead: a full/sink
+    head materialises [nh, rows, T] logits, the CSA indexer scores [T, B_blocks,
+    nIH], and HCA's arange expansion is [T, B_blocks].  Estimate the largest of
+    those per layer (layers run one at a time under inference_mode) rather than
+    the hidden state alone."""
+    T = max(1, int(T))
+    d = max(1, int(d))
+    elem = max(1, int(elem_size))
+    per_row = max(1, T * d * elem * max(1, int(bytes_per_value)))
+    for blk in getattr(model, 'blocks', []):
+        attn = getattr(blk, 'attn', None)
+        cfg = getattr(attn, 'cfg', None)
+        if cfg is None:
+            continue
+        nh = max(1, int(getattr(attn, 'nh', 1) or 1))
+        kind = getattr(cfg, 'kind', 'full')
+        if kind == 'full':
+            win = max(0, int(getattr(cfg, 'window', 0) or 0))
+            if getattr(attn, 'sink', None) is not None or getattr(cfg, 'full_sink', False):
+                span = T
+            elif 0 < win < T:
+                span = win
+            else:
+                span = min(T, 1024)
+            attn_bytes = 3 * nh * T * span * elem
+        else:
+            bs = int(getattr(cfg, 'block_size', 0) or 0)
+            tgt = int(getattr(cfg, 'target_block_tokens', 0) or 0)
+            mn = max(1, int(getattr(cfg, 'min_block', 1) or 1))
+            step = max(1, bs or tgt or mn)
+            Bm = (T + step - 1) // step
+            nih = max(1, int(getattr(cfg, 'n_index_heads', 1) or 1))
+            topk = max(1, int(getattr(cfg, 'index_topk', 1) or 1))
+            hd = max(1, int(getattr(attn, 'hd', 1) or 1))
+            win = max(0, int(getattr(cfg, 'sliding_window', 0) or 0))
+            # HCA reads every block (arange expansion), so its effective
+            # selection width is Bm; CSA only scores min(topk, Bm) blocks.
+            nb_eff = Bm if kind == 'hca' else min(topk, Bm)
+            M = nb_eff + win
+            gather_bytes = (4 * M * nh * hd + 2 * M * nh) * elem
+            index_bytes = min(2 * T * Bm * nih * elem, 384 << 20) if kind != 'hca' else 0
+            attn_bytes = max(index_bytes, gather_bytes)
+            if kind == 'hca':
+                # _arange_exp_cache is a stride-0 expand view: its physical
+                # storage is one int32 [Bm] row, not [T, Bm].
+                attn_bytes = max(attn_bytes, 4 * Bm)
+        per_row = max(per_row, int(attn_bytes))
+    return per_row
+
+
+def _eval_adaptive_chunk(model, val_batch, device, chunk, _free_frac=0.5, _bytes_per_value=8):
+    """Bound an evaluation chunk by both token count and currently-free device capacity.
+
+    Rows are independent, so the partition changes no value; it only keeps a
+    long-sequence eval from launching a chunk whose attention/indexer
+    workspace cannot fit.  The estimate uses the model's actual parameter
+    element size (bf16 halves it) and the real per-layer attention shape, not
+    just `T*d`; the existing OOM retry remains the final backstop."""
+    rows = int(val_batch.shape[0])
+    T = int(val_batch.shape[1])
+    span = max(1, T - 1)
+    chunk = min(max(1, int(chunk)), max(1, _EVAL_TOKENS_PER_CHUNK // span))
+    if device.type == 'cuda' and rows > 0:
+        try:
+            free, _total = torch.cuda.mem_get_info(device)
+            d = int(model.tok.weight.shape[1])
+            elem = int(model.tok.weight.element_size())
+            per_row = _eval_row_working_bytes(model, T, d, elem, _bytes_per_value)
+            chunk = min(chunk, max(1, int(free * float(_free_frac)) // per_row))
+        except Exception:
+            pass
+    return max(1, min(chunk, rows))
+
+
+def _det_segment_sum(n_rows, indices, values, dtype=None, sorted_indices=False):
+    """Deterministic scatter-add by stable sort + segmented prefix sums.
+
+    CUDA's ``index_add_``/``index_put_(accumulate=True)`` use atomics, so the
+    addition order (and the last-bit result) can depend on thread scheduling.
+    Sorting by (index, original position) fixes the order; segment sums are
+    then formed with a cumsum and written through ``index_copy_`` (unique
+    destinations, no atomics).  Mirrors ``csa_kernels._det_scatter_add``: the
+    output keeps the caller's dtype, but floating (and complex) sums accumulate
+    in float64/complex128 before the final cast.  A shared prefix from an early
+    segment otherwise rounds away every later small segment in fp32, and the
+    loss grows with the number of rows/segments.
+
+    ``sorted_indices=True`` promises the flattened indices are already
+    non-decreasing (the sampled-eval path maps a sorted global-row table, so
+    its per-chunk rows are sorted by construction).  The stable sort is then
+    an identity permutation and is skipped; every element keeps the same
+    position the sort would have given it, so the segmented sums are
+    bit-identical while the sort's time and workspace disappear."""
+    idx = indices.reshape(-1).to(torch.int64)
+    vals = values.reshape(-1)
+    out_dtype = dtype if dtype is not None else vals.dtype
+    out = torch.zeros(int(n_rows), device=vals.device, dtype=out_dtype)
+    if idx.numel() == 0:
+        return out
+    valid = (idx >= 0) & (idx < int(n_rows))
+    if not bool(valid.all()):
+        idx = idx[valid]
+        vals = vals[valid]
+        if idx.numel() == 0:
+            return out
+    if out_dtype.is_complex:
+        _acc = torch.complex128
+    elif out_dtype.is_floating_point:
+        _acc = torch.float64
+    else:
+        # Integer destinations (token counts) stay exact; int64 is the widest
+        # representation the destination can require and avoids an unnecessary
+        # float round-trip.
+        _acc = torch.int64
+    if sorted_indices:
+        idx_s = idx
+        val_s = vals.to(_acc)
+    else:
+        order = torch.argsort(idx, stable=True)
+        idx_s = idx.index_select(0, order)
+        val_s = vals.index_select(0, order).to(_acc)
+    end = torch.ones_like(idx_s, dtype=torch.bool)
+    if idx_s.numel() > 1:
+        end[:-1] = idx_s[1:] != idx_s[:-1]
+    seg_end = torch.nonzero(end, as_tuple=False).reshape(-1)
+    csum = torch.cumsum(val_s, dim=0)
+    hi = csum.index_select(0, seg_end)
+    lo = torch.zeros_like(hi)
+    if seg_end.numel() > 1:
+        lo[1:] = csum.index_select(0, seg_end[:-1])
+    seg_sum = hi - lo
+    seg_id = idx_s.index_select(0, seg_end)
+    out.index_copy_(0, seg_id, seg_sum.to(out_dtype))
+    return out
+
+
+def document_index(doc_ids):
+    """Compact, deterministic index for an arbitrary per-token document-id array.
+
+    Returns ``(keys, inverse)`` where ``keys`` is the sorted unique document
+    id array and ``inverse`` maps every element back to its position in
+    ``keys``.  The same ``(keys, inverse)`` pair can be sliced for several
+    evaluation lengths/chunks, so document order cannot change between them.
+
+    Document ids are uint64 hashes; converting them to a dense index avoids
+    materialising a huge [n_docs] tensor indexed by the raw hash value.  The
+    function is intentionally NumPy-only and rejects non-integer / negative
+    ids, because a float id such as ``1.5`` would silently become document 1.
+    """
+    arr = np.asarray(doc_ids)
+    if arr.size == 0:
+        raise ValueError('document_index: document ids are empty')
+    if arr.dtype.kind not in 'iu':
+        raise ValueError(
+            f'document_index: document ids must be integers, got dtype {arr.dtype}')
+    if arr.dtype.kind == 'i' and int(arr.min()) < 0:
+        raise ValueError('document_index: document ids must be non-negative')
+    keys, inv = np.unique(arr.reshape(-1), return_inverse=True)
+    return keys, inv.reshape(arr.shape)
+
+
+def aggregate_nll_by_document(nll, doc_ids, *, document_index_map=None):
+    """Aggregate a per-target NLL matrix into per-DOCUMENT NLL / PPL.
+
+    ``nll`` is a ``[n_rows, span]`` (or flat) tensor/array of next-token NLLs;
+    ``doc_ids`` has exactly the same shape and gives the document identity of
+    each predicted target token.  Fixed evaluation rows are arbitrary windows,
+    so a document can span several rows and a row can mix several documents;
+    summing by row and calling each row a document double-counts documents in
+    the bootstrap.  This function groups tokens by document identity instead.
+
+    ``document_index_map`` is the ``(keys, inverse)`` returned by
+    :func:`document_index` for the FULL target slice.  Supplying it makes
+    chunked evaluation use one global document order; when omitted it is
+    computed here.  Documents with no target in this slice (the map came from a
+    longer prefix) are omitted from the returned vectors rather than reported
+    with a zero token count and a NaN PPL: a document that has not started yet
+    is not an evaluation unit of this cell.
+    """
+    if not torch.is_tensor(nll):
+        nll = torch.as_tensor(nll)
+    arr = np.asarray(doc_ids)
+    if tuple(arr.shape) != tuple(nll.shape):
+        raise ValueError(
+            f'aggregate_nll_by_document: doc_ids shape {arr.shape} != nll shape '
+            f'{tuple(nll.shape)}')
+    if document_index_map is None:
+        keys, inv = document_index(arr)
+    else:
+        try:
+            keys, inv = document_index_map
+        except (TypeError, ValueError):
+            raise ValueError(
+                'aggregate_nll_by_document: document_index_map must be a '
+                '(keys, inverse) pair') from None
+        keys = np.asarray(keys)
+        inv = np.asarray(inv)
+        if keys.ndim != 1 or keys.size == 0:
+            raise ValueError(
+                'aggregate_nll_by_document: document_index_map keys must be a '
+                f'non-empty 1-D array, got shape {keys.shape}')
+        if keys.dtype.kind not in 'iu':
+            raise ValueError(
+                'aggregate_nll_by_document: document_index_map keys must be '
+                f'integers, got dtype {keys.dtype}')
+        if keys.dtype.kind == 'i' and int(keys.min()) < 0:
+            raise ValueError(
+                'aggregate_nll_by_document: document_index_map keys must be '
+                'non-negative')
+        if inv.dtype.kind not in 'iu':
+            raise ValueError(
+                'aggregate_nll_by_document: document_index_map inverse must be '
+                f'integers, got dtype {inv.dtype}')
+        if inv.size != int(nll.numel()):
+            raise ValueError(
+                f'aggregate_nll_by_document: index covers {inv.size} targets, '
+                f'expected {int(nll.numel())}')
+        if inv.size:
+            _inv_min = int(inv.min())
+            _inv_max = int(inv.max())
+            if _inv_min < 0 or _inv_max >= int(keys.size):
+                raise ValueError(
+                    'aggregate_nll_by_document: document_index_map inverse '
+                    f'spans [{_inv_min}, {_inv_max}] but there are only '
+                    f'{int(keys.size)} documents')
+        inv = inv.reshape(arr.shape)
+        # A map for a longer prefix is valid here, but it must still describe
+        # THIS slice's identities.  Without this check a stale/mismatched map
+        # would silently regroup the same tokens into different documents.
+        if not np.array_equal(keys[inv.reshape(-1)], arr.reshape(-1)):
+            raise ValueError(
+                'aggregate_nll_by_document: document_index_map does not match '
+                'doc_ids; refusing to regroup tokens under a different map')
+    n_docs = int(keys.size)
+    idx = torch.as_tensor(inv.reshape(-1).astype(np.int64, copy=False),
+                          dtype=torch.long, device=nll.device)
+    vals = nll.reshape(-1)
+    nll_doc = _det_segment_sum(n_docs, idx, vals,
+                               dtype=torch.float64).detach().cpu().tolist()
+    tok_doc = _det_segment_sum(
+        n_docs, idx, torch.ones_like(idx), dtype=torch.long
+    ).detach().cpu().tolist()
+    n_tokens = [int(x) for x in tok_doc]
+    nll_values = [float(x) for x in nll_doc]
+    # Drop documents that have no target in this slice.  A global map (built
+    # on the longest requested prefix) otherwise carries documents that start
+    # later, giving them 0 tokens and NaN PPL; that inflates n_docs and makes
+    # the per-document vectors length-inconsistent for no measurement reason.
+    _present = [i for i, n in enumerate(n_tokens) if n > 0]
+    keys_present = np.asarray(keys)[_present]
+    nll_values = [nll_values[i] for i in _present]
+    n_tokens = [n_tokens[i] for i in _present]
+    ppl = [float(_safe_exp_ppl(nll_values[i] / n_tokens[i]))
+           for i in range(len(_present))]
+    return {
+        'doc_granularity': 'document',
+        'n_docs': len(_present),
+        'nll_per_doc': nll_values,
+        'n_tokens_per_doc': n_tokens,
+        'ppl_per_doc': ppl,
+        'doc_ids': [format(int(k), '016x') for k in keys_present.tolist()],
+        'doc_ids_fp': _ids_fp(keys_present),
+        'nll_per_doc_total': float(sum(nll_values)),
+        'n_tokens_total': int(sum(n_tokens)),
+    }
+
+
+def aggregate_nll_by_article(nll, article_ids, *, document_index_map=None):
+    """Aggregate per-target NLL into per-ARTICLE NLL / PPL.
+
+    WikiText rows are lines, not articles; a line-level bootstrap resamples
+    paragraphs of the same article and therefore understates the sampling
+    uncertainty of an article-level claim.  This is the same deterministic
+    segment sum as :func:`aggregate_nll_by_document`, with article-named
+    fields so a consumer cannot mistake one unit for the other.
+
+    The pooled totals are identical to the document aggregation for the SAME
+    targets (only the grouping differs); the caller keeps both vectors so the
+    frozen line-level contract is untouched and the article-level readout is
+    additive evidence.
+    """
+    doc = aggregate_nll_by_document(
+        nll, article_ids, document_index_map=document_index_map)
+    n_articles = int(doc['n_docs'])
+    return {
+        'article_granularity': 'article',
+        'unit_definition': ('top-level " = Title = " article; rows are lines '
+                            'and are not independent of their article'),
+        'n_articles': n_articles,
+        'nll_per_article': list(doc['nll_per_doc']),
+        'n_tokens_per_article': list(doc['n_tokens_per_doc']),
+        'ppl_per_article': list(doc['ppl_per_doc']),
+        'article_ids': list(doc['doc_ids']),
+        'article_ids_fp': doc['doc_ids_fp'],
+        'nll_per_article_total': float(doc['nll_per_doc_total']),
+        'n_tokens_article_total': int(doc['n_tokens_total']),
+        'article_source': 'per_token_article_map',
+    }
+
+
+@torch.inference_mode()
+def eval_ppl(model, val_batch, device, chunk=8, eval_rows=None, eval_seed=0, return_stats=False,
+             collect_block_stats=False, val_bnd=None, bnd_tol=1):
+    # `collect_block_stats=True` enables the compression-report hooks for this
+    # same forward pass, so block-length/boundary diagnostics come from it too.
+    # A chunk is a set of independent sequences (no cross-row op in the
+    # model), so capping it by token count does not change any per-row value.
+    _span = max(1, int(val_batch.shape[1]) - 1)
+    chunk = _eval_adaptive_chunk(model, val_batch, device, chunk)
+    was_training = model.training
+    model.eval()
+    need_reg_layers = [blk.attn for blk in model.blocks if hasattr(blk.attn, 'need_reg')]
+    need_reg_prior = [_a.need_reg for _a in need_reg_layers]
+    nll = torch.zeros((), dtype=torch.float64, device=device)
+    # Per-ROW NLL (eval-subset uncertainty must be visible, not only the
+    # seed-to-seed spread).  A row is a fixed evaluation WINDOW, not
+    # necessarily one document: use `eval_length_gen` with a per-token
+    # document mapping when a document-level bootstrap is required.  With
+    # eval_rows sampling, a row with no sampled target gets 0 tokens and is
+    # excluded by the bootstrap consumer.
+    _row_nll = torch.zeros(int(val_batch.shape[0]), dtype=torch.float64, device=device) if return_stats else None
+    _row_ntok = torch.zeros(int(val_batch.shape[0]), dtype=torch.long, device=device) if return_stats else None
+    for _a in need_reg_layers:
+        _a.need_reg = False
+    if collect_block_stats:
+        enable_block_stats(model, True)
+    _compression_out = None
+    try:
+        ntok = 0
+        V = None
+        _sel = None
+        if eval_rows is not None and int(eval_rows) > 0:
+            _n_rows = int(val_batch.shape[0])
+            _n_tgt = max(0, int(val_batch.shape[1]) - 1)
+            _flat = _n_rows * _n_tgt
+            _k = min(int(eval_rows), _flat)
+            if _k < _flat:
+                _g = torch.Generator().manual_seed(int(eval_seed))
+                # A full randperm costs O(n_rows*T) memory even for a tiny
+                # eval_rows sample (e.g. 1 GB at 4096x32768).  Sampling with
+                # replacement and de-duplicating gives the same uniform
+                # k-subset distribution with O(k) memory; only near-full
+                # samples fall back to the historical permutation.
+                if _k * 4 >= _flat:
+                    _sel = torch.randperm(_flat, generator=_g)[:_k]
+                else:
+                    _sel = torch.empty(0, dtype=torch.long)
+                    while int(_sel.numel()) < _k:
+                        _draw = torch.randint(0, _flat,
+                                              (max(16, 2 * int(_k - _sel.numel())),),
+                                              generator=_g)
+                        _sel = torch.unique(torch.cat([_sel, _draw]), sorted=True)
+                    if int(_sel.numel()) > _k:
+                        _sel = _sel[torch.randperm(int(_sel.numel()), generator=_g)[:_k]]
+                # keep the sorted host copy: per-chunk membership bounds are
+                # integer range queries on a sorted table — searchsorted on the
+                # host gives the same slice the boolean-mask form selected
+                # (host-side integer equivalence, design notes §6.2).
+                _sel_host = torch.sort(_sel).values
+                _sel_sorted = _sel_host.to(device)
+                print(f'[eval_ppl] scoring a uniform sample of {_k}/{_flat} target rows (eval_rows={int(eval_rows)}, eval_seed={int(eval_seed)}) — this is a SAMPLED estimate, not the full-set PPL')
+            else:
+                print(f'[eval_ppl] eval_rows={int(eval_rows)} covers the whole {_flat}-row target space; scoring the FULL set (this is the population statistic, not a sample)')
+        _vhost = None
+        if device.type == 'cuda':
+            _vdev = _dev_str(device)
+            _vc = _PINNED_HOST_CACHE.get('val')
+            # In-place mutation of the same tensor keeps its id/shape but
+            # changes `_version`; without it the pinned copy served stale rows.
+            _vver = getattr(val_batch, '_version', None)
+            if (_vc is not None and _vc[0] is val_batch and _vc[1] == tuple(val_batch.shape)
+                    and _vc[3] == _vdev and _vc[4] == _vver):
+                _vhost = _vc[2]
+            else:
+                try:
+                    _vhost = torch.as_tensor(val_batch).pin_memory()
+                    _PINNED_HOST_CACHE['val'] = (val_batch, tuple(val_batch.shape), _vhost,
+                                                 _vdev, _vver)
+                except RuntimeError:
+                    _vhost = torch.as_tensor(val_batch)
+        else:
+            _vhost = torch.as_tensor(val_batch)
+        _async = _vhost.is_pinned()
+        _span = max(0, int(val_batch.shape[1]) - 1)
+
+        def _run_rows(i, cur):
+            nonlocal ntok, V, nll, _row_nll, _row_ntok
+            _lo = _hi = 0
+            if _sel is not None:
+                # Host-side range count on the sorted selection: chunks with
+                # no sampled target contribute nothing to nll/ntok.
+                _base = i * _span
+                _wide = min(cur, int(val_batch.shape[0]) - i) * _span
+                if _wide > 0:
+                    _lo = int(torch.searchsorted(_sel_host, _base))
+                    _hi = int(torch.searchsorted(_sel_host, _base + _wide))
+                if _hi <= _lo:
+                    return
+            elif _span == 0:
+                return
+            ids = _vhost[i:i + cur].to(device, non_blocking=_async)
+            # Trunk + per-slice LM head; comp_reg / need_reg handling is
+            # identical to model(ids) because forward() itself is exactly
+            # trunk() followed by head().
+            h = model.trunk(ids)
+            if _sel is not None:
+                _local = _sel_sorted[_lo:_hi] - _base
+                _ri = torch.div(_local, _span, rounding_mode='floor')
+                _ci = _local - _ri * _span
+                # `_row_nll` / `_row_ntok` are indexed by the GLOBAL document
+                # row, while `_ri` is chunk-local because it indexes this
+                # chunk's `h`/`ids`.  Offset it before the scatters.
+                _src_rows = _ri + i
+                # gather the selected hidden rows BEFORE the head: each output
+                # row of the Linear is an independent function of one hidden
+                # row, so head(h[sel]) == head(h)[sel]
+                _rows = model.head(h[_ri, _ci, :])
+                if V is None:
+                    V = _rows.size(-1)
+                _tgts = ids[_ri, _ci + 1]
+                del _ri, _ci
+                _ce = F.cross_entropy(_rows, _tgts, reduction='none').double()
+                nll += _ce.sum()
+                if return_stats:
+                    # Deterministic segmented sum (no CUDA atomics): the
+                    # per-document NLL feeding the document bootstrap must be
+                    # reproducible on the same machine.
+                    # `_src_rows` is non-decreasing: it is derived from the
+                    # sorted global selection table, so the stable sort in the
+                    # accumulator would be an identity.
+                    _row_nll += _det_segment_sum(_row_nll.numel(), _src_rows, _ce, dtype=torch.float64, sorted_indices=True)
+                    _row_ntok += _det_segment_sum(_row_ntok.numel(), _src_rows, torch.ones_like(_src_rows), dtype=torch.long, sorted_indices=True)
+                ntok += int(_tgts.numel())
+                del _rows, _tgts, _ce, _src_rows
+            else:
+                _tgts = ids[:, 1:]
+                for _s0 in range(0, _span, 64):
+                    _sl = slice(_s0, min(_s0 + 64, _span))
+                    _lg = model.head(h[:, _sl, :])
+                    if V is None:
+                        V = _lg.size(-1)
+                    _ce = F.cross_entropy(_lg.transpose(1, 2), _tgts[:, _sl], reduction='none').double()
+                    nll += _ce.sum()
+                    if return_stats:
+                        _b = int(_ce.shape[0])
+                        _row_nll[i:i + _b] += _ce.sum(dim=1)
+                        _row_ntok[i:i + _b] += int(_ce.shape[1])
+                    del _lg, _ce
+                ntok += int(_tgts.numel())
+                del _tgts
+            del ids, h
+
+        i = 0
+        _n_rows = int(val_batch.shape[0])
+        while i < _n_rows:
+            _cur = min(chunk, _n_rows - i)
+            _nll_snap = nll.clone()
+            _rn_snap = _row_nll.clone() if return_stats else None
+            _rt_snap = _row_ntok.clone() if return_stats else None
+            _stats_snap = _snapshot_block_stats(model) if collect_block_stats else None
+            try:
+                _run_rows(i, _cur)
+            except RuntimeError as _oe:
+                nll.copy_(_nll_snap)
+                if return_stats:
+                    _row_nll.copy_(_rn_snap)
+                    _row_ntok.copy_(_rt_snap)
+                if _stats_snap is not None:
+                    _restore_block_stats(_stats_snap)
+                if ('out of memory' in str(_oe).lower()) and _cur > 1:
+                    if device.type == 'cuda':
+                        torch.cuda.empty_cache()
+                    chunk = max(1, _cur // 2)
+                    print(f'[eval_ppl] device-memory exhaustion; retrying with chunk={chunk}')
+                    continue
+                raise
+            i += _cur
+    finally:
+        if collect_block_stats:
+            try:
+                _compression_out = _compression_report_summary(model, int(val_batch.shape[1]), val_bnd, bnd_tol)
+            except Exception as _ce:
+                print(f'[eval_ppl] WARNING: compression diagnostics failed ({type(_ce).__name__}: {_ce})')
+                _compression_out = None
+            enable_block_stats(model, False)
+        for _a, _prev in zip(need_reg_layers, need_reg_prior):
+            _a.need_reg = _prev
+        model.train(was_training)
+    if not ntok:
+        if not return_stats:
+            return float('nan')
+        _empty = {'ppl': float('nan'), 'nll_sum': float('nan'), 'n_tokens': 0,
+                  'nll_per_row': [], 'n_tokens_per_row': [], 'eval_rows': int(eval_rows) if eval_rows is not None else None,
+                  'eval_seed': int(eval_seed), 'eval_subset': int(val_batch.shape[0])}
+        if collect_block_stats:
+            _empty['compression'] = _compression_out
+        return _empty
+    try:
+        ppl = math.exp(nll.item() / ntok)
+    except OverflowError:
+        ppl = float('inf')
+    if not return_stats:
+        return ppl
+    _out = {
+        'ppl': float(ppl),
+        'nll_sum': float(nll.item()),
+        'n_tokens': int(ntok),
+        'nll_per_row': [float(x) for x in _row_nll.detach().cpu().tolist()],
+        'n_tokens_per_row': [int(x) for x in _row_ntok.detach().cpu().tolist()],
+        'eval_rows': int(eval_rows) if eval_rows is not None else None,
+        'eval_seed': int(eval_seed),
+        'eval_subset': int(val_batch.shape[0]),
+    }
+    if collect_block_stats:
+        _out['compression'] = _compression_out
+    return _out

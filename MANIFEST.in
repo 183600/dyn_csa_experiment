@@ -18,7 +18,14 @@ include confirmation_frozen.json
 include confirmation_frozen_dynamic.json
 include test_review_fixes.py
 include test_open_block.py
+include test_support.py
+include test_review_part_*.py
 recursive-include docs *.md
+recursive-include explib *.py
+recursive-include _audit_gates *.py
+recursive-include _build_report *.py
+recursive-include _csa_kernels *.py
+recursive-include _data_guard *.py
 
 # Never ship regenerable corpora, checkpoints, result/analysis trees, caches or
 # CI configuration.  The repository's evidence model publishes those through

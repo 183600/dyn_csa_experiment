@@ -1,0 +1,916 @@
+
+
+def audit_confirmation_verdicts(path=None):
+    """Result-analysis audit: the three-way directional verdict is coherent.
+
+    ``explib.confirmation.finaltest_stats`` records ``supported`` / ``refuted`` /
+    ``inconclusive`` / ``not_testable`` plus a per-comparison ``verdicts``
+    block.  A Holm-significant result in the opposite direction is a
+    refutation of the pre-registered directional claim, not "not confirmed";
+    this gate independently replays the partition from the stored p-values,
+    directions and validity gates.  It never recomputes a p-value and never
+    changes the frozen decision.  A stored verdict that disagrees with the
+    replay, a comparison that appears in two buckets, or a missing verdict is
+    a ``fail``; an artifact produced before the three-way field existed is
+    ``not_verifiable_locally`` rather than silently passing.
+    """
+    L = _import_exp_lib()
+    p = path or os.path.join(REPO, 'analysis_v12', 'test_stats.json')
+    out = {'kind': 'confirmation_verdict_audit', 'status': 'ok', 'path': p,
+           'comparisons': {}, 'n_supported': 0, 'n_refuted': 0,
+           'n_inconclusive': 0, 'n_not_testable': 0,
+           'problems': [], 'warnings': [],
+           'note': ('replays the three-way directional partition on the SAME '
+                    'Holm family; it adds no test and never changes a frozen '
+                    'p/Holm/confirmed verdict')}
+    if not os.path.exists(p):
+        out['status'] = 'not_verifiable_locally'
+        out['reason'] = 'no final-test stats artifact on disk'
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return out
+    data = _load(p)
+    if data is None:
+        out['status'] = 'fail'
+        out['problems'].append(f'{p} exists but is not a readable JSON object')
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return out
+    ft = data.get('finaltest') if isinstance(data.get('finaltest'), dict) else data
+    comps = ft.get('comparisons') if isinstance(ft, dict) else None
+    if not isinstance(comps, dict) or not comps:
+        out['status'] = 'not_verifiable_locally'
+        out['reason'] = 'the stats artifact carries no comparisons'
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return out
+    stored = ft.get('verdicts')
+    if not isinstance(stored, dict) or not stored:
+        out['status'] = 'not_verifiable_locally'
+        out['reason'] = ('the stats artifact predates the three-way verdict '
+                         'block; regenerate it with the current v12 analysis')
+        out['warnings'].append(
+            'legacy artifact: a reverse-significant comparison cannot be '
+            'distinguished from an unconfirmed one until the analysis is rerun')
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return out
+    holm = ft.get('holm') if isinstance(ft.get('holm'), dict) else {}
+    vin = {}
+    for name, rec in comps.items():
+        if not isinstance(rec, dict):
+            out['problems'].append(
+                f'{name}: comparison is a {type(rec).__name__}, not an object')
+            continue
+        cv = dict(rec)
+        _h = holm.get(name) if isinstance(holm.get(name), dict) else {}
+        cv['p_holm'] = _h.get('p_holm', cv.get('p_holm'))
+        vin[str(name)] = cv
+    _cov = ((ft.get('coverage_requirement') or {}).get('require_complete_coverage')
+            if isinstance(ft.get('coverage_requirement'), dict) else False)
+    _par = ((ft.get('parameter_binding') or {}).get('required_by_manifest')
+            if isinstance(ft.get('parameter_binding'), dict) else False)
+    _m = ft.get('manifest') if isinstance(ft.get('manifest'), dict) else {}
+    _seeds = _m.get('seeds') if isinstance(_m.get('seeds'), list) else []
+    _alpha = ft.get('alpha', 0.05)
+    try:
+        replay = L.directional_claim_verdicts(
+            vin, names=list(vin), alpha=_alpha,
+            require_complete_coverage=bool(_cov),
+            require_param_match=bool(_par),
+            default_min_seeds=(len(_seeds) if _seeds else None))
+    except Exception as _e:
+        out['status'] = 'fail'
+        out['problems'].append(
+            f'the stored comparison records cannot be replayed '
+            f'({type(_e).__name__}: {_e})')
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return out
+    expected = replay['verdicts']
+    _allowed = {'supported', 'refuted', 'inconclusive',
+                'significant_nondirectional', 'not_testable'}
+    for name in vin:
+        srec = stored.get(name)
+        if not isinstance(srec, dict):
+            out['problems'].append(
+                f'{name}: stored verdict is missing or not an object')
+            continue
+        _v = srec.get('verdict')
+        if _v not in _allowed:
+            out['problems'].append(
+                f'{name}: stored verdict {_v!r} is not one of {sorted(_allowed)}')
+            continue
+        want = expected[name]['verdict']
+        if _v != want:
+            out['problems'].append(
+                f'{name}: stored verdict {_v!r} does not match the replay '
+                f'{want!r} from p_holm/direction/validity gates')
+        _sp, _wp = srec.get('p_holm'), expected[name].get('p_holm')
+        if (_sp is None) != (_wp is None):
+            out['problems'].append(
+                f'{name}: stored p_holm presence does not match the replay')
+        elif _sp is not None:
+            try:
+                if abs(float(_sp) - float(_wp)) > 1e-12:
+                    out['problems'].append(
+                        f'{name}: stored p_holm={_sp!r} does not match the '
+                        f'replayed {_wp!r}')
+            except (TypeError, ValueError, OverflowError):
+                out['problems'].append(
+                    f'{name}: stored p_holm is not numeric')
+        out['comparisons'][name] = {
+            'verdict': _v, 'expected': want,
+            'expected_sign': expected[name].get('expected_sign'),
+            'direction_ok': expected[name].get('direction_ok'),
+            'claim_scope': expected[name].get('claim_scope'),
+            'gate_failures': expected[name].get('gate_failures')}
+    _extra = sorted(set(map(str, stored)) - set(vin))
+    if _extra:
+        out['problems'].append(
+            f'stored verdicts contain undeclared comparisons: {_extra}')
+    # ``significant_nondirectional`` predates the three-way block: the frozen
+    # field includes every Holm rejection whose direction is unverifiable,
+    # even when a validity gate fails.  Replay that legacy field exactly rather
+    # than comparing it to the helper's stricter non-directional bucket.
+    _legacy_nd = []
+    for _name, _rec in vin.items():
+        try:
+            _p = float(_rec.get('p_holm'))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if math.isfinite(_p) and _p < float(replay['alpha']) and \
+                _rec.get('direction_ok') is None:
+            _legacy_nd.append(_name)
+    _lists = {'confirmed': replay['supported'],
+              'refuted': replay['refuted'],
+              'inconclusive': replay['inconclusive'],
+              'not_testable': replay['not_testable'],
+              'significant_nondirectional': _legacy_nd,
+              'opposite_nonsignificant': replay['opposite_nonsignificant'],
+              'reverse_significant_unverified': replay['reverse_significant_unverified']}
+    for key, want in _lists.items():
+        got = ft.get(key)
+        if got is None:
+            if key in ('confirmed', 'refuted'):
+                out['problems'].append(
+                    f'top-level {key!r} list is missing from the stats artifact')
+            continue
+        if isinstance(got, (str, bytes)) or not isinstance(got, (list, tuple)):
+            out['problems'].append(
+                f'top-level {key!r} is not a list')
+            continue
+        got_s = sorted(str(x) for x in got)
+        want_s = sorted(want)
+        if len(got_s) != len(set(got_s)):
+            out['problems'].append(
+                f'top-level {key!r} contains duplicate names')
+        if got_s != want_s:
+            out['problems'].append(
+                f'top-level {key!r}={got_s} does not match the replay {want_s}')
+    _overlap = (set(replay['supported']) & set(replay['refuted']))
+    if _overlap:
+        out['problems'].append(
+            f'comparisons cannot be both supported and refuted: {sorted(_overlap)}')
+    out['n_supported'] = len(replay['supported'])
+    out['n_refuted'] = len(replay['refuted'])
+    out['n_inconclusive'] = len(replay['inconclusive'])
+    out['n_not_testable'] = len(replay['not_testable'])
+    if replay['refuted']:
+        out['warnings'].append(
+            'refuted comparisons are directional conflicts, not "not '
+            'confirmed" or equivalence; the report must keep that wording')
+    if replay['reverse_significant_unverified']:
+        out['warnings'].append(
+            'some comparisons have a significant reverse point estimate but '
+            'failed a validity gate; they stay inconclusive, not refuted')
+    if out['problems']:
+        out['status'] = 'fail'
+    elif out['warnings']:
+        out['status'] = 'warnings'
+    print(json.dumps({k: v for k, v in out.items() if k != 'comparisons'},
+                     ensure_ascii=False, indent=2))
+    return out
+
+
+def _find_look_histories(paths=None, max_depth=3):
+    """Yield ``look_history.json`` paths from explicit paths or results_* trees."""
+    seen = set()
+
+    def _walk(base):
+        base = os.path.abspath(base)
+        for root, dirs, files in os.walk(base):
+            depth = root[len(base):].count(os.sep)
+            # Result trees can contain caches/checkpoints; the look file only
+            # ever sits next to a panel summary, so prune deep/generated trees.
+            dirs[:] = [d for d in dirs
+                       if d not in ('__pycache__', 'wt103_cache', 'checkpoints')
+                       and depth < max_depth]
+            if 'look_history.json' in files:
+                yield os.path.join(root, 'look_history.json')
+
+    if paths is not None:
+        for p in paths:
+            p = os.fspath(p)
+            if os.path.isdir(p):
+                for f in _walk(p):
+                    if f not in seen:
+                        seen.add(f)
+                        yield f
+            elif os.path.isfile(p) and p.endswith('.json'):
+                ap = os.path.abspath(p)
+                if ap not in seen:
+                    seen.add(ap)
+                    yield ap
+        return
+    for name in _iter_result_dirs():
+        for f in _walk(os.path.join(REPO, name)):
+            if f not in seen:
+                seen.add(f)
+                yield f
+
+
+def audit_look_history(paths=None):
+    """Audit recorded analysis looks and the sequential (optional-stopping) p.
+
+    Every seed top-up pass re-aggregates a panel; if the analyst then decides
+    to add more seeds, the final-n p is not the p the experiment spent.  The
+    driver records each distinct seed set as a look in ``look_history.json``.
+    This gate independently:
+
+      * validates the look file (schema, per-look seed/delta lengths, unique
+        seeds, finite deltas, recomputed per-look exact p);
+      * recomputes the exact max-over-looks sequential p with the same
+        ``exp_lib.sequential_signflip_p`` the audit used and compares it with
+        ``methodology_audit.json``;
+      * flags seed regressions, stale/missing audit blocks and any contrast
+        whose naive final-look family p would be significant but whose
+        sequential p is not.
+
+    A malformed or internally inconsistent look file is a ``fail``: an
+    untraceable correction cannot be quoted.  No look files at all is
+    ``not_verifiable_locally``, not a pass.
+    """
+    L = _import_exp_lib()
+    out = {'kind': 'look_history_audit', 'status': 'ok', 'panels': {},
+           'n_panels': 0, 'n_looks': 0, 'n_contrasts_adjusted': 0,
+           'downgraded_claims': [], 'problems': [], 'warnings': [],
+           'note': ('optional-stopping correction: a panel aggregated at several '
+                    'growing seed sets is judged by the exact max-over-looks '
+                    'sign-flip p, not only by the final-n p')}
+    files = sorted(_find_look_histories(paths))
+
+    def _finite(x):
+        # A numeric string (or bytes) is not a measurement: float("1.0")
+        # would let a hand-edited/stale artifact replay as a finite reading.
+        if (isinstance(x, (bool, np.bool_, str, bytes, bytearray))
+                or x is None):
+            return None
+        try:
+            y = float(x)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return y if math.isfinite(y) else None
+
+    for f in files:
+        panel_dir = os.path.dirname(f)
+        rec = {'path': f, 'looks': 0, 'contrasts': {},
+               'downgraded': [], 'warnings': [], 'problems': []}
+        hist = _load(f)
+        if hist is None:
+            rec['problems'].append('look_history.json is missing or not a JSON object')
+        elif not isinstance(hist.get('looks'), list):
+            rec['problems'].append('looks is not a list')
+        else:
+            series = {}
+            prev_look = 0
+            for look in hist['looks']:
+                if not isinstance(look, dict):
+                    rec['problems'].append(f'look entry is a {type(look).__name__}, not an object')
+                    continue
+                lid = look.get('look')
+                if not isinstance(lid, int) or isinstance(lid, bool) or lid <= prev_look:
+                    rec['problems'].append(f'look number {lid!r} is not a strictly increasing integer')
+                else:
+                    prev_look = lid
+                contrasts = look.get('contrasts')
+                if not isinstance(contrasts, dict):
+                    rec['problems'].append(f'look {lid}: contrasts is not an object')
+                    continue
+                rec['looks'] += 1
+                for key, c in contrasts.items():
+                    if not isinstance(c, dict):
+                        rec['problems'].append(f'look {lid} {key}: contrast is not an object')
+                        continue
+                    seeds, deltas = c.get('seeds'), c.get('deltas')
+                    if (not isinstance(seeds, list) or not isinstance(deltas, list)):
+                        rec['problems'].append(f'look {lid} {key}: seeds/deltas are not lists')
+                        continue
+                    if len(seeds) != len(deltas):
+                        rec['problems'].append(
+                            f'look {lid} {key}: {len(seeds)} seeds vs {len(deltas)} deltas')
+                        continue
+                    if not seeds or not deltas:
+                        rec['problems'].append(
+                            f'look {lid} {key}: empty seeds/deltas is not a look')
+                        continue
+                    try:
+                        # Use the library's exact seed reader: plain int()
+                        # would silently truncate 1.5 to seed 1 (and accept
+                        # True as 1), turning a corrupt record into a valid
+                        # looking one.  Booleans/fractional values are not
+                        # seed identities.
+                        _ss = [L._as_seed_int(s) for s in seeds]
+                    except (TypeError, ValueError, OverflowError):
+                        _ss = None
+                    if _ss is None or any(s is None for s in _ss):
+                        rec['problems'].append(
+                            f'look {lid} {key}: non-integer seed')
+                        continue
+                    if len(set(_ss)) != len(_ss):
+                        rec['problems'].append(f'look {lid} {key}: duplicate seeds')
+                        continue
+                    _dd = [_finite(x) for x in deltas]
+                    if any(x is None for x in _dd):
+                        rec['problems'].append(
+                            f'look {lid} {key}: non-finite/non-numeric delta')
+                        continue
+                    sf = L.exact_signflip_p(_dd)
+                    # A present-but-malformed p is corrupt evidence, not an
+                    # absent field: silently skipping the check would let a
+                    # tampered look replay as verified.  Keep the deltas in
+                    # the sequential family (dropping a look would erase the
+                    # optional-stopping correction it represents).
+                    if 'p_exact_signflip' in c:
+                        _raw_p = c.get('p_exact_signflip')
+                        recorded_p = _finite(_raw_p)
+                        if recorded_p is None:
+                            rec['problems'].append(
+                                f'look {lid} {key}: recorded p is not a finite '
+                                f'number ({_raw_p!r})')
+                        elif abs(recorded_p - float(sf['p'])) > 1e-9:
+                            rec['problems'].append(
+                                f'look {lid} {key}: recorded p={recorded_p:.6g} does not '
+                                f'recompute ({sf["p"]:.6g})')
+                    _entry = {'look': lid, 'seeds': _ss, 'deltas': _dd}
+                    # Interaction records additionally bind the four cell arms
+                    # and per-seed protocol tags; preserve them so a re-declared
+                    # result is not replayed as the same estimand.
+                    for _meta in ('cells', 'tags'):
+                        if isinstance(c.get(_meta), dict):
+                            _entry[_meta] = c[_meta]
+                    series.setdefault(key, []).append(_entry)
+            # Recompute the sequential p and compare with the audit artifact.
+            audit_path = os.path.join(panel_dir, 'methodology_audit.json')
+            audit = _load(audit_path) if os.path.exists(audit_path) else None
+            audit_entries = {}
+            if isinstance(audit, dict):
+                for group in ('components', 'baselines'):
+                    for _comp, es in (audit.get(group) or {}).items():
+                        for e in es or []:
+                            la = e.get('look_analysis') if isinstance(e, dict) else None
+                            if isinstance(la, dict) and la.get('contrast'):
+                                audit_entries[str(la['contrast'])] = (e, la)
+                # 2x2 interactions use the same look-history key namespace and
+                # the same sequential primitive; the gate must verify them too,
+                # not only the ablation/baseline contrasts.
+                _ix = audit.get('interactions') or {}
+                for _name, _rec in (_ix.get('factorials') or {}).items():
+                    cell = (_rec.get('interaction')
+                            if isinstance(_rec, dict) else None)
+                    la = (cell.get('look_analysis')
+                          if isinstance(cell, dict) else None)
+                    if isinstance(la, dict) and la.get('contrast'):
+                        audit_entries[str(la['contrast'])] = (cell, la)
+            for key, looks in sorted(series.items()):
+                if len(looks) < 2:
+                    continue
+                # Mirror `_attach_look_analysis`: a re-run can change one
+                # seed's paired delta.  An earlier look that disagrees with the
+                # current (last) record on a shared seed is stale and must not
+                # be mixed into the joint null; name it rather than fail the
+                # whole panel by recomputing a p the audit never used.
+                cur = dict(zip(looks[-1]['seeds'], looks[-1]['deltas']))
+                _last_cells = (looks[-1].get('cells')
+                               if isinstance(looks[-1].get('cells'), dict) else None)
+                _last_tags = (looks[-1].get('tags')
+                              if isinstance(looks[-1].get('tags'), dict) else None)
+                if _last_cells:
+                    _last_cells = {str(k): str(v) for k, v in _last_cells.items()}
+                _last_tags_n = {}
+                if _last_tags:
+                    for _s, _t in _last_tags.items():
+                        try:
+                            _si = L._as_seed_int(_s)
+                        except (TypeError, ValueError, OverflowError):
+                            _si = None
+                        if _si is not None:
+                            _last_tags_n[_si] = str(_t or '')
+                valid, stale = [], []
+                for lk in looks:
+                    _bad = [s for s, d in zip(lk['seeds'], lk['deltas'])
+                            if s in cur and abs(d - cur[s]) > 1e-9]
+                    _reason = 'seed delta changed across looks'
+                    _look_cells = (lk.get('cells')
+                                   if isinstance(lk.get('cells'), dict) else None)
+                    if (_last_cells and _look_cells
+                            and {str(k): str(v) for k, v in _look_cells.items()}
+                            != _last_cells):
+                        _bad = []
+                        _reason = 'cell arms changed across looks'
+                    if not _bad and _last_tags_n and isinstance(lk.get('tags'), dict) and lk.get('tags'):
+                        _look_tags = {}
+                        for _s, _t in lk['tags'].items():
+                            try:
+                                _si = L._as_seed_int(_s)
+                            except (TypeError, ValueError, OverflowError):
+                                _si = None
+                            if _si is not None:
+                                _look_tags[_si] = str(_t or '')
+                        _bad_tags = [s for s in lk['seeds']
+                                     if s in _last_tags_n
+                                     and _look_tags.get(s) != _last_tags_n[s]]
+                        if _bad_tags:
+                            _bad = _bad_tags
+                            _reason = 'protocol tag changed across looks'
+                    if _bad:
+                        stale.append({'look': lk['look'], 'reason': _reason,
+                                      'seeds': sorted(_bad)})
+                    else:
+                        valid.append(lk)
+                if stale:
+                    rec['warnings'].append(
+                        f'{key}: {len(stale)} stale look(s) excluded '
+                        f'(estimand changed across looks: {stale})')
+                if len(valid) < 2:
+                    continue
+                rec['contrasts'][key] = {'n_looks': len(valid),
+                                         'looks': [x['look'] for x in valid]}
+                out['n_contrasts_adjusted'] += 1
+                # Top-ups should be nested; a seed disappearing is suspicious
+                # (a re-run that removed a pair) and is named, not hidden.
+                for a, b in zip(valid, valid[1:]):
+                    if not set(a['seeds']).issubset(set(b['seeds'])):
+                        rec['warnings'].append(
+                            f'{key}: look {b["look"]} does not contain every seed of '
+                            f'look {a["look"]} (seed regression)')
+                try:
+                    seq = L.sequential_signflip_p(
+                        [{'seeds': x['seeds'], 'deltas': x['deltas']} for x in valid])
+                except Exception as e:
+                    rec['problems'].append(
+                        f'{key}: sequential test failed ({type(e).__name__}: {e})')
+                    continue
+                rec['contrasts'][key]['p_sequential'] = seq.get('p_sequential')
+                rec['contrasts'][key]['method'] = seq.get('method')
+                ent = audit_entries.get(key)
+                if ent is None:
+                    rec['warnings'].append(
+                        f'{key}: {len(looks)} looks are recorded but the audit has no '
+                        'look_analysis block; rerun methodology_audit on this panel')
+                    continue
+                e, la = ent
+                ap = _finite(la.get('p_sequential'))
+                if ap is None or abs(ap - float(seq['p_sequential'])) > 1e-9:
+                    rec['problems'].append(
+                        f'{key}: audit sequential p={la.get("p_sequential")!r} does not '
+                        f'match the recomputed {seq.get("p_sequential")!r}')
+                _naive = e.get('significant_global_naive')
+                _adj = e.get('significant_global')
+                _p_naive = e.get('p_holm_global_naive')
+                if _naive is None and _adj is None:
+                    # Interaction cells use the interaction-family names; the
+                    # sequential p is still the same primitive and the same
+                    # downgrade rule.
+                    _naive = e.get('significant_family_naive')
+                    _adj = e.get('significant_family')
+                    _p_naive = e.get('p_holm_naive')
+                if _naive and not _adj:
+                    rec['downgraded'].append(key)
+                    out['downgraded_claims'].append(
+                        {'panel': panel_dir, 'contrast': key,
+                         'p_naive': _p_naive,
+                         'p_sequential': la.get('p_sequential')})
+        out['n_panels'] += 1
+        out['n_looks'] += int(rec['looks'])
+        if rec['problems']:
+            out['problems'].extend(f'{panel_dir}: {x}' for x in rec['problems'])
+        if rec['warnings']:
+            out['warnings'].extend(f'{panel_dir}: {x}' for x in rec['warnings'])
+        out['panels'][panel_dir] = rec
+    if not files:
+        out['status'] = 'not_verifiable_locally'
+        out['reason'] = ('no results_*/look_history.json found — no panel has been '
+                         'aggregated since look tracking was added')
+    elif out['problems']:
+        out['status'] = 'fail'
+    elif out['warnings']:
+        out['status'] = 'warnings'
+    print(json.dumps({k: v for k, v in out.items() if k != 'panels'},
+                     ensure_ascii=False, indent=2))
+    return out
+
+
+def audit_error_case_inference(path=None):
+    """Replay the split-half paired error-bucket inference from its artifact.
+
+    The bad-case Markdown is a claim surface: it names a bucket as worse and
+    reports a replication-half interval.  This gate re-derives the bucket
+    means, the discovery-only selection, the replication sign/CI decision and
+    the within-family Holm correction from the stored cluster-level units.  It
+    reads a local artifact only (zero GPU) and starts no experiment.
+    """
+    L = _import_exp_lib()
+    if path is None:
+        path = os.path.join(REPO, 'analysis_errors', 'paired_errors.json')
+    path = os.path.abspath(str(path))
+    out = {'kind': 'error_case_inference', 'status': 'ok', 'path': path,
+           'policy_version_expected': L.ERROR_BUCKET_POLICY['version'],
+           'families': {}, 'problems': [], 'warnings': []}
+    if not os.path.exists(path):
+        out['status'] = 'not_verifiable'
+        out['warnings'].append(f'no paired error artifact at {path}; run error_analysis.py --compare-ckpt first')
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return out
+    try:
+        with open(path, encoding='utf-8') as f:
+            doc = json.load(f)
+    except Exception as exc:
+        out['status'] = 'fail'
+        out['problems'].append(f'artifact is unreadable: {type(exc).__name__}: {exc}')
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return out
+    fams = doc.get('bucket_inference') if isinstance(doc, dict) else None
+    if not isinstance(fams, list) or not fams:
+        out['status'] = 'not_verifiable'
+        out['warnings'].append('artifact has no bucket_inference block (legacy or aborted analysis)')
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return out
+
+    def _finite(x):
+        if isinstance(x, (bool, np.bool_)):
+            return None
+        try:
+            v = float(x)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return v if math.isfinite(v) else None
+
+    def _close(a, b, tol):
+        return (a is not None and b is not None and abs(a - b) <= tol)
+
+    def _close_optional(a, b, tol):
+        if a is None and b is None:
+            return True
+        return _close(a, b, tol)
+
+    def _mean(vals):
+        return float(np.mean(vals)) if vals else None
+
+    def _subset(units, keep):
+        return [u for u in units if str(u.get('cluster')) in keep]
+
+    for fi, fam in enumerate(fams):
+        tag = f'family[{fi}]'
+        if not isinstance(fam, dict):
+            out['problems'].append(f'{tag}: not an object')
+            continue
+        fname = str(fam.get('family') or tag)
+        tag = f'{fname}'
+        rec = {'status': fam.get('status'), 'problems': []}
+        out['families'][tag] = rec
+        _p = rec['problems']
+        if fam.get('policy_version') != L.ERROR_BUCKET_POLICY['version']:
+            _p.append(f"policy version {fam.get('policy_version')!r} != "
+                      f"{L.ERROR_BUCKET_POLICY['version']!r}")
+        alpha = _finite(fam.get('alpha'))
+        direction = fam.get('direction')
+        min_clusters = _finite(fam.get('min_clusters'))
+        min_tokens = _finite(fam.get('min_tokens'))
+        frac = _finite(fam.get('discovery_frac'))
+        seed = fam.get('split_seed')
+        if alpha is None or not (0.0 < alpha < 1.0):
+            _p.append('alpha missing/invalid')
+        if direction not in ('positive', 'negative', 'two-sided'):
+            _p.append(f'direction {direction!r} invalid')
+        if min_clusters is None or min_clusters < 2 or min_clusters != int(min_clusters):
+            _p.append('min_clusters missing/invalid')
+        if min_tokens is None or min_tokens < 1 or min_tokens != int(min_tokens):
+            _p.append('min_tokens missing/invalid')
+        if frac is None or not (0.0 < frac < 1.0):
+            _p.append('discovery_frac missing/invalid')
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            _p.append('split_seed missing/invalid')
+        if _p:
+            rec['status'] = 'fail'
+            continue
+        min_clusters = int(min_clusters)
+        min_tokens = int(min_tokens)
+        buckets = fam.get('buckets') if isinstance(fam.get('buckets'), dict) else {}
+        if fam.get('status') == 'no_data':
+            if buckets:
+                _p.append('status=no_data must not carry buckets')
+            if fam.get('selected') is not None:
+                _p.append('status=no_data must not carry a selected bucket')
+            if fam.get('split') is not None:
+                _p.append('status=no_data must not carry a split')
+            if _finite(fam.get('n_tokens')) != 0.0:
+                _p.append('status=no_data must record zero finite paired tokens')
+            rec['n_clusters'] = 0
+            rec['status'] = 'fail' if _p else 'ok'
+            continue
+        if not buckets:
+            _p.append('no buckets recorded')
+            rec['status'] = 'fail'
+            continue
+        units_by_bucket = {}
+        all_clusters = set()
+        ok_units = True
+        for b, brec in sorted(buckets.items()):
+            units = brec.get('cluster_units') if isinstance(brec, dict) else None
+            if not isinstance(units, list):
+                _p.append(f'bucket {b!r}: cluster_units missing (cannot replay)')
+                ok_units = False
+                continue
+            seen = set()
+            cleaned = []
+            for u in units:
+                if not isinstance(u, dict):
+                    _p.append(f'bucket {b!r}: malformed cluster unit')
+                    ok_units = False
+                    continue
+                c = u.get('cluster')
+                m = _finite(u.get('mean_delta'))
+                ntok = _finite(u.get('n_tokens'))
+                if c is None or m is None or ntok is None or ntok < 1:
+                    _p.append(f'bucket {b!r}: malformed cluster unit {u!r}')
+                    ok_units = False
+                    continue
+                c = str(c)
+                if c in seen:
+                    _p.append(f'bucket {b!r}: duplicate cluster {c!r}')
+                    ok_units = False
+                seen.add(c)
+                all_clusters.add(c)
+                cleaned.append({'cluster': c, 'mean_delta': m, 'n_tokens': int(ntok)})
+            units_by_bucket[b] = cleaned
+            vals = [u['mean_delta'] for u in cleaned]
+            ntok = sum(u['n_tokens'] for u in cleaned)
+            if not _close(_mean(vals), _finite(brec.get('mean')), 1e-9):
+                _p.append(f'bucket {b!r}: stored mean != replay')
+            if int(brec.get('n_clusters') or 0) != len(cleaned):
+                _p.append(f'bucket {b!r}: n_clusters != replay')
+            if int(brec.get('n_tokens') or 0) != ntok:
+                _p.append(f'bucket {b!r}: n_tokens != replay')
+            p = L.exact_signflip_p(vals)
+            pv = _finite(p.get('p'))
+            if not _close(pv, _finite(brec.get('p_exact_signflip')), 1e-12):
+                _p.append(f'bucket {b!r}: exact sign-flip p != replay')
+        if not ok_units:
+            rec['status'] = 'fail'
+            continue
+        # Recompute the within-family Holm correction from the replayed p-values.
+        raw_pairs = []
+        for b in sorted(buckets):
+            vals = [u['mean_delta'] for u in units_by_bucket[b]]
+            raw_pairs.append((b, _finite(L.exact_signflip_p(vals).get('p'))))
+        holm = L.holm_adjust(raw_pairs, alpha=alpha)
+        for b in sorted(buckets):
+            stored = _finite(buckets[b].get('p_holm'))
+            replay = _finite((holm.get(b) or {}).get('p_holm'))
+            if stored is not None or replay is not None:
+                if not _close(stored, replay, 1e-12):
+                    _p.append(f'bucket {b!r}: Holm p != replay')
+        split = fam.get('split')
+        if fam.get('status') == 'insufficient_clusters':
+            if split is not None:
+                _p.append('insufficient_clusters status must not carry a split')
+            if fam.get('selected') is not None:
+                _p.append('insufficient_clusters status must not carry a selected bucket')
+            if len(all_clusters) >= 2 * min_clusters:
+                _p.append('insufficient_clusters but replay finds enough clusters for two halves')
+            rec['n_clusters'] = len(all_clusters)
+            rec['status'] = 'fail' if _p else 'ok'
+            continue
+        if not isinstance(split, dict):
+            _p.append('split metadata missing')
+            rec['status'] = 'fail'
+            continue
+        disc = split.get('discovery_clusters')
+        repl = split.get('replication_clusters')
+        order_raw = split.get('cluster_order')
+        if not (isinstance(disc, list) and isinstance(repl, list)):
+            _p.append('split cluster lists missing')
+            rec['status'] = 'fail'
+            continue
+        disc_raw = [str(x) for x in disc]
+        repl_raw = [str(x) for x in repl]
+        disc = set(disc_raw)
+        repl = set(repl_raw)
+        if disc & repl:
+            _p.append('discovery/replication clusters overlap')
+        if disc | repl != all_clusters:
+            _p.append('split does not partition the observed clusters')
+        if len(disc_raw) != len(disc) or len(repl_raw) != len(repl):
+            _p.append('split cluster lists contain duplicates')
+        if split.get('seed') != seed:
+            _p.append(f"split seed {split.get('seed')!r} != declared split_seed {seed!r}")
+        if split.get('strategy') != 'sha256(seed, cluster) whole-cluster order; discovery then replication':
+            _p.append(f"split strategy {split.get('strategy')!r} is not the audited SHA-256 rule")
+        if not isinstance(order_raw, list):
+            _p.append('split cluster_order missing (cannot verify the SHA-256 split)')
+            rec['status'] = 'fail'
+            continue
+        ordered = [str(x) for x in order_raw]
+        if len(ordered) != len(set(ordered)) or set(ordered) != all_clusters:
+            _p.append('cluster_order is not a permutation of the observed clusters')
+        expected_order = L._error_bucket_split_order(all_clusters, seed)
+        if ordered != expected_order:
+            _p.append('cluster_order != SHA-256(split_seed, cluster) order')
+        if disc_raw != [c for c in ordered if c in disc]:
+            _p.append('discovery cluster order was not preserved')
+        if repl_raw != [c for c in ordered if c in repl]:
+            _p.append('replication cluster order was not preserved')
+        n_disc = int(round(frac * len(ordered)))
+        n_disc = max(min_clusters, min(len(ordered) - min_clusters, n_disc))
+        expected_disc = set(ordered[:n_disc])
+        if disc != expected_disc:
+            _p.append('discovery half is not the SHA-256 cluster split')
+        if split.get('disjoint') is not True:
+            _p.append('split metadata does not declare disjoint halves')
+        if split.get('n_discovery') != len(disc_raw):
+            _p.append('split n_discovery != replay')
+        if split.get('n_replication') != len(repl_raw):
+            _p.append('split n_replication != replay')
+        # Replay each half's mean/tokens and the discovery-only selection.
+        cand = []
+        for b in sorted(buckets):
+            for half, keep in (('discovery', disc), ('replication', repl)):
+                sub = _subset(units_by_bucket[b], keep)
+                vals = [u['mean_delta'] for u in sub]
+                ntok = sum(u['n_tokens'] for u in sub)
+                st = buckets[b].get(half) if isinstance(buckets[b].get(half), dict) else {}
+                if not _close_optional(_mean(vals), _finite(st.get('mean')), 1e-9):
+                    _p.append(f'bucket {b!r}: {half} mean != replay')
+                if int(st.get('n_clusters') or 0) != len(sub):
+                    _p.append(f'bucket {b!r}: {half} n_clusters != replay')
+                if int(st.get('n_tokens') or 0) != ntok:
+                    _p.append(f'bucket {b!r}: {half} n_tokens != replay')
+            dsub = _subset(units_by_bucket[b], disc)
+            dvals = [u['mean_delta'] for u in dsub]
+            dm = _mean(dvals)
+            if (len(dsub) >= min_clusters and sum(u['n_tokens'] for u in dsub) >= min_tokens
+                    and dm is not None
+                    and ((direction == 'positive' and dm > 0.0)
+                         or (direction == 'negative' and dm < 0.0)
+                         or (direction == 'two-sided' and dm != 0.0))):
+                cand.append((b, dm))
+        if direction == 'positive':
+            exp_sel = sorted(cand, key=lambda x: (-x[1], x[0]))
+        elif direction == 'negative':
+            exp_sel = sorted(cand, key=lambda x: (x[1], x[0]))
+        else:
+            exp_sel = sorted(cand, key=lambda x: (-abs(x[1]), x[0]))
+        selected = fam.get('selected') if isinstance(fam.get('selected'), dict) else None
+        if fam.get('status') == 'no_candidate':
+            if exp_sel:
+                _p.append(f'status=no_candidate but replay finds candidate {exp_sel[0][0]!r}')
+            if selected is not None:
+                _p.append('status=no_candidate must not carry a selected bucket')
+        elif fam.get('status') == 'ok':
+            if not exp_sel:
+                _p.append('status=ok but replay finds no eligible discovery bucket')
+            elif selected is None:
+                _p.append('status=ok but selected bucket is missing')
+            else:
+                sel_b = selected.get('bucket')
+                if sel_b != exp_sel[0][0]:
+                    _p.append(f'selected bucket {sel_b!r} != replay {exp_sel[0][0]!r}')
+                if sel_b in units_by_bucket:
+                    dsub = _subset(units_by_bucket[sel_b], disc)
+                    dvals = [u['mean_delta'] for u in dsub]
+                    dstat = L._error_cluster_stats(
+                        dvals, [u['n_tokens'] for u in dsub])
+                    rsub = _subset(units_by_bucket[sel_b], repl)
+                    rvals = [u['mean_delta'] for u in rsub]
+                    rntok = [u['n_tokens'] for u in rsub]
+                    rst = L._error_cluster_stats(rvals, rntok)
+                    if not _close(_finite(selected.get('discovery_mean')),
+                                  _finite(dstat.get('mean')), 1e-9):
+                        _p.append('selected discovery mean != replay')
+                    if not _close_optional(_finite(selected.get('replication_mean')),
+                                           _finite(rst.get('mean')), 1e-9):
+                        _p.append('selected replication mean != replay')
+                    _dci = selected.get('discovery_ci95')
+                    if (isinstance(_dci, (list, tuple)) and len(_dci) == 2
+                            and not (_close_optional(_finite(_dci[0]), _finite(dstat.get('ci95_low')), 1e-9)
+                                     and _close_optional(_finite(_dci[1]), _finite(dstat.get('ci95_high')), 1e-9))):
+                        _p.append('selected discovery CI != replay')
+                    _rci = selected.get('replication_ci95')
+                    if (isinstance(_rci, (list, tuple)) and len(_rci) == 2
+                            and not (_close_optional(_finite(_rci[0]), _finite(rst.get('ci95_low')), 1e-9)
+                                     and _close_optional(_finite(_rci[1]), _finite(rst.get('ci95_high')), 1e-9))):
+                        _p.append('selected replication CI != replay')
+                    if not _close_optional(_finite(selected.get('replication_p_exact_signflip')),
+                                           _finite(rst.get('p_exact_signflip')), 1e-12):
+                        _p.append('selected replication exact p != replay')
+                    same = (rst.get('mean') is not None
+                            and _finite(selected.get('discovery_mean')) is not None
+                            and float(selected['discovery_mean']) * float(rst['mean']) > 0.0)
+                    rep_ok = (rst.get('n_clusters', 0) >= min_clusters
+                              and rst.get('n_tokens', 0) >= min_tokens)
+                    replicated = bool(rep_ok and same and rst.get('ci_excludes_zero'))
+                    if bool(selected.get('replicated')) != replicated:
+                        _p.append('replicated verdict != replay')
+                    if bool(selected.get('same_sign')) != same:
+                        _p.append('same_sign != replay')
+                    _ph = _finite((holm.get(sel_b) or {}).get('p_holm'))
+                    if not _close(_finite(selected.get('full_sample_p_holm')), _ph, 1e-12):
+                        _p.append('selected full-sample Holm p != replay')
+        else:
+            _p.append(f'unknown family status {fam.get("status")!r}')
+        rec['n_clusters'] = len(all_clusters)
+        rec['n_candidates_discovery'] = len(cand)
+        rec['status'] = 'fail' if _p else 'ok'
+    if any(isinstance(r, dict) and r.get('status') == 'fail' for r in out['families'].values()):
+        out['status'] = 'fail'
+    for k, r in out['families'].items():
+        if isinstance(r, dict) and r.get('problems'):
+            out['problems'].extend(f"{k}: {x}" for x in r['problems'])
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return out
+
+
+def audit_statistical_calibration(*, n_sim=None, seed=None):
+    """Deterministic synthetic calibration of the analysis machinery.
+
+    The evidence pipeline quotes exact sign-flip p-values, a meet-in-the-middle
+    exact path, a saddlepoint tail for n>40, a max-over-looks sequential p,
+    paired TOST and Holm.  This gate runs negative controls (data generated
+    under the null: the false-positive rate may not exceed alpha beyond
+    Monte-Carlo noise) and positive controls (data with a known effect: the
+    same procedure must retain sensitivity) for each path.  It also calibrates
+    the reported interval estimators (seed-level paired t, paired bootstrap-t,
+    unit/document bootstrap-t and the combined seed x document interval):
+    coverage may not fall below nominal beyond Monte-Carlo noise, and the
+    mean width may not exceed a declared cap (a trivially wide interval is not
+    uncertainty quantification).  It uses only local RNG streams and synthetic
+    data, reads no result artifact and starts no training; it therefore cannot
+    change a measurement or a frozen verdict.
+
+    A pass says the statistical machinery has the advertised error rates and
+    interval coverage on idealized independent pairs.  It does not certify
+    exchangeability, randomisation or measurement identity in a real panel,
+    and it is not evidence for or against any substantive mechanism claim.
+    """
+    L = _import_exp_lib()
+    rep = L.statistical_calibration_suite(n_sim=n_sim, seed=seed)
+    print(json.dumps({k: v for k, v in rep.items()
+                      if k not in ('policy', 'tests')},
+                     ensure_ascii=False, indent=2))
+    for name, rec in (rep.get('tests') or {}).items():
+        if 'coverage_control' in rec:
+            _cc = rec['coverage_control']
+            _wc = rec['width_control']
+            print(f"[calibration] {name}: coverage={_cc.get('rate')!r} "
+                  f"(nominal={_cc.get('nominal')!r}, {_cc.get('status')}), "
+                  f"mean_width={_wc.get('mean_width')!r} "
+                  f"(cap={_wc.get('max_width')!r}, {_wc.get('status')})")
+        elif 'null_control' in rec:
+            print(f"[calibration] {name}: null={rec['null_control'].get('rate')!r} "
+                  f"({rec['null_control'].get('status')}), "
+                  f"positive={rec['positive_control'].get('rate')!r} "
+                  f"({rec['positive_control'].get('status')})")
+        else:
+            print(f"[calibration] {name}: {rec.get('status')} "
+                  f"(max_abs_error={rec.get('max_abs_error')!r})")
+    return rep
+
+
+def run_report(out='audit_report.json'):
+    res = {'generated_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'source_tree': audit_source_integrity(), 'dependencies': audit_dependencies(), 'data_source': audit_data_source(), 'leakage': audit_leakage(), 'split_discipline': audit_split_discipline(), 'document_unit': audit_document_unit(), 'sample_design': audit_sample_design(), 'attribution': audit_attribution(), 'boundary': audit_boundary(), 'length': audit_length(), 'fairness': audit_fairness(), 'metrics': audit_metrics(), 'tuning': audit_tuning(), 'simple_baseline': audit_simple_baseline(), 'hypotheses': audit_hypotheses(), 'sesoi': audit_sesoi_declaration(), 'baseline_sesoi': audit_baseline_sesoi(), 'interaction_sesoi': audit_interaction_sesoi(), 'unit_influence': audit_unit_influence(), 'analysis_choices': audit_analysis_choices(), 'verdicts': audit_confirmation_verdicts(), 'looks': audit_look_history(), 'methodology': audit_methodology(), 'single_factor': audit_single_factor(), 'factorial': audit_factorial_design(), 'design_preflight': audit_design_preflight(), 'sensitivity': audit_design_sensitivity(), 'evaluation': audit_evaluation_design(), 'dose_response': audit_dose_response(verbose=False), 'failures': audit_failures(), 'budget': audit_budget(), 'training_health': audit_training_health(), 'efficiency_pairs': audit_efficiency_pairs(), 'error_case_inference': audit_error_case_inference(), 'release': audit_release_readiness(), 'selection': audit_selection(), 'run_order': audit_run_order(), 'calibration': audit_statistical_calibration()}
+    L_atomic = None
+    try:
+        L = _import_exp_lib()
+        # The audit verdicts are quotable claims: stamp code/git provenance and
+        # append a ledger entry so an audit artifact regenerated after a code
+        # change is distinguishable from the original (the ledger lives under
+        # analysis_audit/; the artifact itself stays at the documented path).
+        res = L.stamped_analysis('audit_report', res)
+        L.atomic_write_json(os.path.join(REPO, out), res, indent=2)
+        L.log_experiment_event('analysis_audit', {'kind': 'analysis', 'tracking_schema': 2, 'artifact': out, 'created_at': res.get('created_at'), 'code': res.get('code'), 'label': 'audit_report', 'status': 'ok', 'audits': sorted(k for k in res if k not in ('kind', 'created_at', 'code', 'provenance', 'generated_at'))})
+        print(f'[audit] wrote {out}')
+    except Exception as e:
+        with open(os.path.join(REPO, out), 'w', encoding='utf-8') as f:
+            json.dump(res, f, ensure_ascii=False, indent=2)
+        print(f'[audit] wrote {out} (fallback writer: {type(e).__name__})')
+    return res
+
+
+def _run_cli():
+    _cmds = {'leakage': audit_leakage, 'split': audit_split_discipline, 'split_discipline': audit_split_discipline, 'document_unit': audit_document_unit, 'unit': audit_document_unit, 'sample_design': audit_sample_design, 'sampling': audit_sample_design, 'sample': audit_sample_design, 'causality': audit_causality, 'attribution': audit_attribution, 'boundary': audit_boundary, 'length': audit_length, 'fairness': audit_fairness, 'metrics': audit_metrics, 'tuning': audit_tuning, 'simple': audit_simple_baseline, 'baseline_floor': audit_simple_baseline, 'baseline_plan': audit_baseline_design, 'hypothesis_coverage': audit_hypothesis_coverage, 'hypotheses': audit_hypotheses, 'sesoi': audit_sesoi_declaration, 'baseline_sesoi': audit_baseline_sesoi, 'baseline_sesoi_declaration': audit_baseline_sesoi, 'interaction_sesoi': audit_interaction_sesoi, 'interaction': audit_interaction_sesoi, 'unit_influence': audit_unit_influence, 'influence': audit_unit_influence, 'analysis_choices': audit_analysis_choices, 'specification_curve': audit_analysis_choices, 'verdicts': audit_confirmation_verdicts, 'verdict': audit_confirmation_verdicts, 'three_way': audit_confirmation_verdicts, 'analysis_choice': audit_analysis_choices, 'looks': audit_look_history, 'look_history': audit_look_history, 'methodology': audit_methodology, 'single_factor': audit_single_factor, 'factorial': audit_factorial_design, 'factorial_design': audit_factorial_design, 'design': audit_design_preflight, 'design_preflight': audit_design_preflight, 'sensitivity': audit_design_sensitivity, 'design_sensitivity': audit_design_sensitivity, 'precision': audit_design_sensitivity, 'evaluation': audit_evaluation_design, 'evaluation_design': audit_evaluation_design, 'unit_precision': audit_evaluation_design, 'dose_response': audit_dose_response, 'dose_response_design': audit_dose_response, 'failures': audit_failures, 'budget': audit_budget, 'efficiency': audit_efficiency_demo, 'efficiency_pairs': audit_efficiency_pairs, 'training_health': audit_training_health, 'selection': audit_selection, 'release': audit_release_readiness, 'run_order': audit_run_order, 'error_case_inference': audit_error_case_inference, 'error_buckets': audit_error_case_inference, 'calibration': audit_statistical_calibration, 'stats_calibration': audit_statistical_calibration, 'type_i': audit_statistical_calibration, 'source': audit_source_integrity, 'source_tree': audit_source_integrity, 'dependencies': audit_dependencies, 'dependency': audit_dependencies, 'data_source': audit_data_source, 'dataset_source': audit_data_source, 'report': run_report}
+    _arg = sys.argv[1] if len(sys.argv) > 1 else 'report'
+    if _arg in ('-h', '--help'):
+        print(__doc__)
+        raise SystemExit(0)
+    if _arg not in _cmds:
+        print(f'[audit] unknown subcommand {_arg!r}; expected one of {sorted(_cmds)}')
+        raise SystemExit(2)
+    _r = _cmds[_arg]()
+    if isinstance(_r, dict) and _r.get('status') == 'fail':
+        raise SystemExit(1)

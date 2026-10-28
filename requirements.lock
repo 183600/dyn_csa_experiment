@@ -50,6 +50,7 @@ pillow==13.0.0
 propcache==0.5.4
 pyarrow==26.0.0
 pyparsing==3.3.3
+pytest==9.2.0
 python-dateutil==3.0.0
 PyYAML==6.0.3
 setuptools==84.2.1

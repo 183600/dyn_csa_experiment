@@ -608,7 +608,7 @@ jobs:
             python3 -m pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu >/dev/null 2>&1 \
               || python3 -m pip install --quiet torch >/dev/null 2>&1 \
               || exit 43
-            timeout 600 python3 -m pip install --quiet tokenizers datasets matplotlib >/dev/null 2>&1 || exit 43
+            timeout 600 python3 -m pip install --quiet pytest tokenizers datasets matplotlib >/dev/null 2>&1 || exit 43
             python3 test_review_fixes.py
             exit $?
           TGEOF

@@ -35,9 +35,9 @@ import torch
 import exp_lib as L
 
 try:  # installs the RoPE / v7 layer variants used by the frozen checkpoints
-    import v7_supp  # noqa: F401
+    import explib.rope  # noqa: F401
 except Exception as _v7e:
-    print(f'[errors] NOTE: v7_supp not importable ({type(_v7e).__name__}: {_v7e}); only built-in layer variants can be loaded')
+    print(f'[errors] NOTE: explib.rope not importable ({type(_v7e).__name__}: {_v7e}); only built-in layer variants can be loaded')
 
 
 def _sha256(path, cap=None):

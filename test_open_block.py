@@ -21,8 +21,8 @@ These are the substantive gates the panel must pass before any GPU run:
   K8  singleton semantics: a length-1 pooled block, not a raw-token K/V.
   K9  HCA budget declaration: open HCA must declare the extra-read budget.
 
-Run directly (`python test_open_block.py`) or through
-`python test_review_fixes.py` (the CI entry point imports CHECKS).
+Run with pytest (`pytest -q test_open_block.py`); the CI entry point runs the
+whole suite.
 """
 import math
 import os
@@ -73,7 +73,7 @@ def _tiny(mode='closed', scope='full_prefix', max_block=8, seq=32, window=6,
 # K1 config / segmenter
 # ---------------------------------------------------------------------------
 
-def t_config_and_segmenter():
+def test_config_and_segmenter():
     c = L.AttnCfg()
     assert c.max_block == 128 and c.position_capacity() == 129
     assert c.open_block_mode == 'closed', 'the default must preserve the historical closed rule'
@@ -136,7 +136,7 @@ def _pool_fixture(seed=0, T=41, Fd=7, ov=3, cap=64):
     return bid, Xa, Xb, Za, Zb, Ba, Bb
 
 
-def t_prefix_pool_reference():
+def test_prefix_pool_reference():
     bid, Xa, Xb, Za, Zb, Ba, Bb = _pool_fixture()
     T = int(bid.numel())
     nb = int(bid.max()) + 1
@@ -194,7 +194,7 @@ def _trunk_fp(m, ids):
         return m.trunk(ids)
 
 
-def t_prefix_invariance():
+def test_prefix_invariance():
     seq, cut = 56, 33
     g = torch.Generator().manual_seed(4)
     ids = torch.randint(0, 97, (1, seq), generator=g)
@@ -211,7 +211,7 @@ def t_prefix_invariance():
         assert d <= 3e-5, (mode, scope, d)
 
 
-def t_future_causality():
+def test_future_causality():
     seq, tcut = 44, 19
     g = torch.Generator().manual_seed(5)
     ids = torch.randint(0, 97, (1, seq), generator=g)
@@ -252,7 +252,7 @@ def t_future_causality():
 # K5 candidate masks
 # ---------------------------------------------------------------------------
 
-def t_candidate_masks():
+def test_candidate_masks():
     T, C, k = 7, 11, 5
     scores = torch.randn(T, C)
     valid = torch.zeros(T, C, dtype=torch.bool)
@@ -306,7 +306,7 @@ def t_candidate_masks():
 # K6 edge cases
 # ---------------------------------------------------------------------------
 
-def t_edge_cases():
+def test_edge_cases():
     cases = [(1, 'closed'), (1, 'prefix_summary'), (1, 'prefix_singletons'),
              (2, 'prefix_summary'), (3, 'prefix_singletons')]
     for seq, mode in cases:
@@ -338,7 +338,7 @@ def t_edge_cases():
 # K7 closed regression / untouched cut table
 # ---------------------------------------------------------------------------
 
-def t_closed_regression():
+def test_closed_regression():
     torch.manual_seed(12)
     ids = torch.randint(0, 97, (2, 40), generator=torch.Generator().manual_seed(12))
     m_default = L.SmallGPT(97, 32, 2, 2, 16, 40,
@@ -383,7 +383,7 @@ def t_closed_regression():
     L.enable_block_stats(m_closed2, False)
 
 
-def t_forced_vs_natural_cuts():
+def test_forced_vs_natural_cuts():
     st = L._BlockStats(min_block=2, max_block=5)
     bid = torch.tensor([0, 0, 0, 0, 0, 1, 1, 1, 2, 2, 2, 2])
     gate = torch.tensor([False, False, False, False, True, False, False, True,
@@ -412,7 +412,7 @@ def t_forced_vs_natural_cuts():
 # K8 singleton semantics
 # ---------------------------------------------------------------------------
 
-def t_singleton_is_length_one_pooled():
+def test_singleton_is_length_one_pooled():
     torch.manual_seed(13)
     T, Fd, cap = 6, 5, 12
     Xa = torch.randn(T, Fd)
@@ -440,7 +440,7 @@ def t_singleton_is_length_one_pooled():
 # K9 HCA budget declaration
 # ---------------------------------------------------------------------------
 
-def t_hca_budget_declaration():
+def test_hca_budget_declaration():
     try:
         L.AttnCfg(kind='hca', open_block_mode='prefix_summary')
     except ValueError:
@@ -452,7 +452,7 @@ def t_hca_budget_declaration():
     assert c.selection_budget == 'all_closed_plus_prefix'
 
 
-def t_open_candidate_edge_cases():
+def test_open_candidate_edge_cases():
     # Empty query sets and zero available candidates must return the same
     # shapes the non-empty path promises, not crash inside a gather.
     d, nIH = 8, 2
@@ -492,8 +492,8 @@ def t_open_candidate_edge_cases():
     assert mass.shape == (n,) and torch.isfinite(mass).all(), mass
 
 
-def t_open_analysis_control_gate():
-    import open_block_supp as OB
+def test_open_analysis_control_gate():
+    import explib.open_block as OB
     hp = {'steps': 10, 'tokens_seen': 100, 'n_train_tokens': 100,
           'seq_len': 8, 'batch_size': 1, 'lr': 3e-4, 'weight_decay': 0.1,
           'warmup': 1, 'comp_lambda': 0.0, 'delta_lr_mult': 10.0,
@@ -618,8 +618,8 @@ def t_open_analysis_control_gate():
         L.holm_min_attainable_p(4, 3, 0.05)
     assert OB._family_holm_floor([{'n': 8, 'n_nonzero': 0}], 3) == 1.0
 
-def t_open_record_identity_and_arm_summary():
-    import open_block_supp as OB
+def test_open_record_identity_and_arm_summary():
+    import explib.open_block as OB
     summary = {
         'v::seed0': {'seed': 0, 'variant': 'v', 'ppl': 10.0,
                      'nll_sum': 10.0, 'n_tokens': 10, 'run_fingerprint': 'r'},
@@ -677,10 +677,10 @@ def t_open_record_identity_and_arm_summary():
     assert L.signflip_min_n_for_holm(3, 0.05) == 7, L.signflip_min_n_for_holm(3, 0.05)
     assert L.signflip_p_floor(6) > 0.05 / 3, L.signflip_p_floor(6)
 
-def t_open_seed_plan_preflight():
+def test_open_seed_plan_preflight():
     import contextlib
     import io
-    import open_block_supp as OB
+    import explib.open_block as OB
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         short = OB._announce_seed_plan(dict(OB.BASE_CFG), 'main')
@@ -700,7 +700,7 @@ def t_open_seed_plan_preflight():
     assert dup['n_seeds'] == 4 and dup['seeds_sufficient'] is False, dup
 
 
-def t_open_block_hypotheses():
+def test_open_block_hypotheses():
     # Each declared primary contrast must state mechanism, sign, metric and
     # falsifier; an unregistered primary comparison is a design defect.
     aud = L.hypothesis_audit(L.OPEN_BLOCK_HYPOTHESIS_DESIGN, 'open_block')
@@ -717,41 +717,3 @@ def t_open_block_hypotheses():
     miss = L.hypothesis_audit(L.OPEN_BLOCK_HYPOTHESIS_DESIGN, 'open_block',
                               names=names + ['not declared'])
     assert 'not declared' in miss['invalid'] and miss['status'] == 'warn', miss
-
-
-CHECKS = [
-    ('K1 open-block config/segmenter', t_config_and_segmenter),
-    ('K2 prefix pooling reference/grad', t_prefix_pool_reference),
-    ('K3 prefix invariance', t_prefix_invariance),
-    ('K4 future perturbation/gradient', t_future_causality),
-    ('K5 candidate masks', t_candidate_masks),
-    ('K6 edge cases', t_edge_cases),
-    ('K7 closed regression/cut table', t_closed_regression),
-    ('K8 singleton semantics', t_singleton_is_length_one_pooled),
-    ('K9 HCA budget declaration', t_hca_budget_declaration),
-    ('K10 forced-vs-natural cuts', t_forced_vs_natural_cuts),
-    ('K11 open candidate edge cases', t_open_candidate_edge_cases),
-    ('K12 analysis control gate drops uncontrolled seeds', t_open_analysis_control_gate),
-    ('K13 open-block primary hypotheses declared', t_open_block_hypotheses),
-    ('K14 record identity + arm Mean/SD + family seed floor', t_open_record_identity_and_arm_summary),
-    ('K15 seed-plan preflight before training', t_open_seed_plan_preflight),
-]
-
-
-def main():
-    fails = 0
-    for name, fn in CHECKS:
-        try:
-            fn()
-            print(f'[open-block] PASS  {name}')
-        except Exception as e:
-            fails += 1
-            print(f'[open-block] FAIL  {name}: {type(e).__name__}: {e}')
-            import traceback
-            traceback.print_exc()
-    print(f'[open-block] {len(CHECKS) - fails}/{len(CHECKS)} passed')
-    return 1 if fails else 0
-
-
-if __name__ == '__main__':
-    raise SystemExit(main())

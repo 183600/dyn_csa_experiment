@@ -21,7 +21,7 @@ test:
 	$(PYTHON) test_review_fixes.py
 
 plan:
-	$(PYTHON) v12_supp.py plan
+	$(PYTHON) -m explib.confirmation plan
 
 audit:
 	$(PYTHON) audit_gates.py report

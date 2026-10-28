@@ -694,9 +694,9 @@ def run_child(job_path, result_path):
         mod = importlib.import_module(module_name)
 
         # Preserve the existing driver-specific checkpoint patch chain.
-        # The patch state lives in v9_supp; v10/v11 expose it via their `V9`
-        # alias, while v9_supp itself is the owner. Fall back to the module
-        # itself so v9 jobs (module='v9_supp', no `V9` attribute) are not
+        # The patch state lives in explib.resume; v10/v11 expose it via their `V9`
+        # alias, while explib.resume itself is the owner. Fall back to the module
+        # itself so v9 jobs (module='explib.resume', no `V9` attribute) are not
         # silently skipped.
         _ckpt_owner = getattr(mod, "V9", mod)
         if job.get("ckpt_install") and hasattr(_ckpt_owner, "_install_ckpt_patch"):
@@ -709,15 +709,15 @@ def run_child(job_path, result_path):
             response = getattr(mod, "L", mod).run_cell_job(job)
         elif kind == "lenphase":
             response = importlib.import_module(
-                "v7_supp"
+                "explib.rope"
             ).run_lenphase_cell_job(job)
         elif kind == "probe":
             response = importlib.import_module(
-                "v10_supp"
+                "explib.corruption"
             ).run_probe_cell_job(job)
         elif kind == "warm":
             response = importlib.import_module(
-                "v7_supp"
+                "explib.rope"
             ).run_warmup_cell_job(job)
         else:
             raise ValueError(f"Unknown job kind {kind!r}.")

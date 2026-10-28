@@ -34,4 +34,4 @@ jobs:
       - name: Run CPU test suite
         run: python test_review_fixes.py
       - name: Zero-GPU frozen-plan preflight (no test read)
-        run: python v12_supp.py plan
+        run: python -m explib.confirmation plan
