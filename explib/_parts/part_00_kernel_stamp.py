@@ -1175,6 +1175,37 @@ def _scaled_sum_of_squares(values, multiplier):
     return val if math.isfinite(val) else None
 
 
+def _scaled_mean_std_if_extreme(values, ddof=1):
+    """Return ``(mean, std)`` for representable-but-extreme magnitudes.
+
+    ``numpy.mean``/``numpy.std`` square deviations.  Finite values below
+    ``sqrt(tiny)`` underflow those squares to zero, while finite values above
+    ``sqrt(max_float)`` overflow them to inf, so a genuinely variable panel can
+    report ``std=0`` (or ``inf``) and fabricate a zero-width interval or an
+    infinite effect size.  Scale by the largest magnitude, compute a unitless
+    mean/std, then rescale.
+
+    Returns ``None`` when the ordinary NumPy path is safe, or when the input
+    cannot be scaled.  The 1e-100/1e100 cutoffs are the same convention used by
+    the exact sign-flip helpers.
+    """
+    vals = [float(v) for v in values]
+    n = len(vals)
+    if n == 0:
+        return None
+    scale = max(abs(v) for v in vals)
+    if (not math.isfinite(scale) or scale == 0.0
+            or 1e-100 <= scale <= 1e100):
+        return None
+    z = [v / scale for v in vals]
+    mean_z = math.fsum(z) / n
+    std = 0.0
+    if n > ddof:
+        ss = math.fsum((v - mean_z) ** 2 for v in z)
+        std = scale * math.sqrt(ss / (n - ddof))
+    return float(scale * mean_z), float(std)
+
+
 def _nll_doc_ci(nll_per_row, n_tokens_per_row):
     """Approximate 95% CI for PPL from per-DOCUMENT NLL (not per-token).
 

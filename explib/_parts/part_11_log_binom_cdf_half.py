@@ -170,8 +170,12 @@ def tost_paired(deltas, margin, conf=0.90):
         out['note'] = ('not decidable (n<2, non-positive/non-finite margin, '
                        'or conf outside (0,1))')
         return out
-    mean = float(d.mean())
-    sd = float(d.std(ddof=1))
+    _ms = _scaled_mean_std_if_extreme(d, ddof=1)
+    if _ms is not None:
+        mean, sd = _ms
+    else:
+        mean = float(d.mean())
+        sd = float(d.std(ddof=1))
     df = n - 1
     # A floating-point mean of k identical values need not be bit-identical to
     # the value (0.1*6 / 6 = 0.09999999999999999), which would turn a sample
@@ -191,7 +195,7 @@ def tost_paired(deltas, margin, conf=0.90):
         out['note'] = 't critical unavailable; fell back to the normal critical value'
     out['t_critical'] = float(tc)
     out['ci'] = [mean - tc * se, mean + tc * se]
-    if se <= 1e-300:
+    if not (se > 0.0):
         # Degenerate zero-variance sample.  At the margin boundary the exact
         # t limit is P(T >= 0) = 0.5, not 0: equality cannot be declared
         # equivalent with certainty.

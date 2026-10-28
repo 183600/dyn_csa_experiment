@@ -251,8 +251,12 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
         if p.get('vocab') is not None:
             row['vocab'] = p['vocab']
         if n:
-            m = float(d.mean())
-            sd = float(d.std(ddof=1)) if n > 1 else float('nan')
+            _ms = _scaled_mean_std_if_extreme(d, ddof=1) if n > 1 else None
+            if _ms is not None:
+                m, sd = _ms
+            else:
+                m = float(d.mean())
+                sd = float(d.std(ddof=1)) if n > 1 else float('nan')
             se = float(sd / math.sqrt(n)) if (n > 1 and math.isfinite(sd)) else float('nan')
             row.update({'mean': m, 'std': sd, 'se': se, 'underpowered': n < int(min_seeds)})
             if n > 1:

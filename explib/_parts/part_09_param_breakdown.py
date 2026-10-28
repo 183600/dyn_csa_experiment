@@ -1351,6 +1351,14 @@ def _bootstrap_t_interval(values, *, n_boot, seed, conf):
     """
     v = np.asarray(values, dtype=float)
     n = int(v.size)
+    # Square-based sd under/overflows for extreme but finite magnitudes.  The
+    # studentized statistic is scale invariant, so run the whole bootstrap on
+    # a unit-scaled copy and map the interval endpoints back afterwards.
+    _scale = (float(np.max(np.abs(v))) if n else 0.0)
+    _scaled = bool(math.isfinite(_scale) and _scale > 0.0
+                   and (_scale < 1e-100 or _scale > 1e100))
+    if _scaled:
+        v = v / _scale
     mean = float(v.mean())
     sd = float(v.std(ddof=1)) if n > 1 else float('nan')
     se = sd / math.sqrt(n) if n > 1 and math.isfinite(sd) else float('nan')
@@ -1385,6 +1393,9 @@ def _bootstrap_t_interval(values, *, n_boot, seed, conf):
         method = ('percentile bootstrap fallback (too few positive-variance '
                   'resamples for a studentized interval)')
         used = 0
+    if _scaled:
+        lo = float(lo) * _scale
+        hi = float(hi) * _scale
     return {'ci_low': float(lo), 'ci_high': float(hi), 'method': method,
             'n_boot_studentized': used}
 
@@ -1422,7 +1433,9 @@ def bootstrap_mean_ci(values, *, n_boot=4000, seed=20261018, conf=0.95):
     if nb < 20 or not (0.0 < c < 1.0):
         return None
     _ci = _bootstrap_t_interval(v, n_boot=nb, seed=sd, conf=c)
-    return {'n': n, 'n_boot': nb, 'seed': int(seed), 'mean': float(v.mean()),
+    _ms = _scaled_mean_std_if_extreme(v, ddof=1)
+    _mean = _ms[0] if _ms is not None else float(v.mean())
+    return {'n': n, 'n_boot': nb, 'seed': int(seed), 'mean': _mean,
             'ci_low': _ci['ci_low'], 'ci_high': _ci['ci_high'], 'conf': c,
             'method': _ci['method'],
             'n_boot_studentized': _ci['n_boot_studentized']}

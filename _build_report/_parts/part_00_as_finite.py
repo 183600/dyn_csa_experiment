@@ -120,6 +120,12 @@ def sample_std(vals):
     n = len(vals)
     if n < 2:
         return 0.0
+    scale = max((abs(float(v)) for v in vals), default=0.0)
+    if math.isfinite(scale) and scale > 0.0 and (scale < 1e-100 or scale > 1e100):
+        z = [float(v) / scale for v in vals]
+        mu = math.fsum(z) / n
+        ss = math.fsum((v - mu) ** 2 for v in z)
+        return scale * math.sqrt(ss / (n - 1))
     mu = sum(vals) / n
     return (sum(((v - mu) ** 2 for v in vals)) / (n - 1)) ** 0.5
 

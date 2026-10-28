@@ -61,7 +61,10 @@ def wilcoxon_signed_rank_p(deltas):
     panels."""
     d = np.asarray([f for f in (_finite_scalar(x) for x in (deltas if deltas is not None else []))
                     if f is not None], dtype=float)
-    d = d[np.abs(d) > 1e-15]
+    # Rescaling every delta must not change ranks or drop the panel: an
+    # absolute 1e-15 cutoff treats a 1e-200-scaled panel as all-zero.
+    _tol = 1e-15 * float(np.max(np.abs(d))) if d.size else 0.0
+    d = d[np.abs(d) > _tol]
     n = int(d.size)
     if n == 0:
         return {'p': float('nan'), 'method': 'none', 'n_nonzero': 0}
@@ -71,7 +74,7 @@ def wilcoxon_signed_rank_p(deltas):
     i = 0
     while i < n:
         j = i + 1
-        while j < n and abs(_abs[j] - _abs[i]) <= 1e-15:
+        while j < n and abs(_abs[j] - _abs[i]) <= _tol:
             j += 1
         ranks[order[i:j]] = (i + j + 1) / 2.0  # average rank (1-based)
         i = j
@@ -186,19 +189,26 @@ def paired_effect_stats(deltas, alpha=0.05, min_n=3, with_values=None, without_v
                     'seeds': seed_labels}
     if n == 0:
         return {'n': 0, 'mean': float('nan'), 'std': float('nan'), 'std_defined': False, 'sem': float('nan'), 'cohens_dz': float('nan'), 'ci95_low': float('nan'), 'ci95_high': float('nan'), 'loo_means': [], 'seed_driven': None, 'seed_robust': None, 'p_exact_signflip': float('nan'), 'p_floor': float('nan'), 'min_reachable_p': float('nan'), 'underpowered': True, 'resolution_limited': True, 'within_seed_noise': True, 'significant': False, 'effect_vs_noise': 'no data', 'unit': 'seed', 'assumption': 'none (no data)', 'sign_counts': {'positive': 0, 'negative': 0, 'zero': 0}, 'p_wilcoxon': None, 'p_wilcoxon_method': None, 'ci95_paired_bootstrap': None, 'ci95_unpaired_bootstrap': None, **_pair_fields}
-    mean = float(d.mean())
     # A single seed has no sample spread.  Keep the historical numeric 0.0 for
     # backward-compatible consumers, but mark it explicitly so a report cannot
     # quote it as a measured zero-variance result.
     std_defined = bool(n > 1)
-    std = float(d.std(ddof=1)) if std_defined else 0.0
+    _ms = _scaled_mean_std_if_extreme(d, ddof=1) if std_defined else None
+    if _ms is not None:
+        mean, std = _ms
+    else:
+        mean = float(d.mean())
+        std = float(d.std(ddof=1)) if std_defined else 0.0
     sem = float(std / math.sqrt(n)) if std_defined else float('nan')
     _sf = exact_signflip_p(d)
     p = _sf['p']
     n_nonzero = _sf.get('n_nonzero')
-    if std > 1e-12:
+    # Cohen's d_z is a ratio, so the only degenerate case is a measured zero
+    # spread.  An absolute std floor (the old 1e-12) makes a tiny but genuinely
+    # variable panel look infinitely strong.
+    if std > 0.0:
         dz = float(mean / std)
-    elif abs(mean) < 1e-300:
+    elif mean == 0.0:
         dz = 0.0
     else:
         dz = float('inf') if mean > 0 else float('-inf')
@@ -226,8 +236,15 @@ def paired_effect_stats(deltas, alpha=0.05, min_n=3, with_values=None, without_v
     loo_means = []
     seed_driven = None
     if n >= 3:
-        _total = float(d.sum())
-        loo_means = [(_total - float(d[i])) / (n - 1) for i in range(n)]
+        if _ms is not None:
+            _scale = max(abs(float(x)) for x in d)
+            _z = [float(x) / _scale for x in d]
+            _total_z = math.fsum(_z)
+            loo_means = [_scale * ((_total_z - _z[i]) / (n - 1))
+                         for i in range(n)]
+        else:
+            _total = float(d.sum())
+            loo_means = [(_total - float(d[i])) / (n - 1) for i in range(n)]
         seed_driven = False
         if abs(mean) > 1e-300:
             _full_sign = 1.0 if mean > 0 else -1.0
@@ -581,8 +598,12 @@ def paired_fragility(deltas, *, alpha=0.05, seeds=None):
                     'the Holm family, or any frozen decision')}
     if n == 0:
         return out
-    mean = float(d.mean())
-    std = float(d.std(ddof=1)) if n > 1 else float('nan')
+    _ms = _scaled_mean_std_if_extreme(d, ddof=1) if n > 1 else None
+    if _ms is not None:
+        mean, std = _ms
+    else:
+        mean = float(d.mean())
+        std = float(d.std(ddof=1)) if n > 1 else float('nan')
     sem = float(std / math.sqrt(n)) if (n > 1 and math.isfinite(std)) else float('nan')
     ci_lo = ci_hi = float('nan')
     if n > 1 and math.isfinite(sem):
@@ -648,7 +669,8 @@ def paired_fragility(deltas, *, alpha=0.05, seeds=None):
                 cur[i] = -cur[i]
                 k += 1
                 p_new = float(exact_signflip_p(cur)['p'])
-                m_new = float(cur.mean())
+                _ms_new = _scaled_mean_std_if_extreme(cur, ddof=1)
+                m_new = _ms_new[0] if _ms_new is not None else float(cur.mean())
                 if p_new >= alpha:
                     reason = 'p>=alpha'
                     break
@@ -664,7 +686,8 @@ def paired_fragility(deltas, *, alpha=0.05, seeds=None):
             sub = np.delete(d, i)
             sf_i = exact_signflip_p(sub)
             p_i = float(sf_i['p'])
-            m_i = float(sub.mean())
+            _ms_i = _scaled_mean_std_if_extreme(sub, ddof=1)
+            m_i = _ms_i[0] if _ms_i is not None else float(sub.mean())
             loo.append({'seed': labels[i], 'n': int(sub.size), 'mean': m_i,
                         'p': p_i,
                         'mean_shift': float(m_i - mean),

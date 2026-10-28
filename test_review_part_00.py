@@ -1831,6 +1831,41 @@ def test_paired_effect_resolution():
         raise AssertionError('a mismatched seed vector must be rejected')
 
 
+def test_paired_effect_extreme_scale_is_not_zero_variance():
+    base = [1.0] * 5 + [2.0]
+    ref = L.paired_effect_stats(base)
+    tiny = [x * 1e-200 for x in base]
+    r = L.paired_effect_stats(tiny)
+    # Squaring 1e-200 underflows: the old path reported std=sem=0, an infinite
+    # d_z and a zero-width CI while the panel was genuinely variable.
+    assert r['std'] > 0.0 and r['sem'] > 0.0, r
+    assert math.isfinite(r['cohens_dz']), r
+    assert r['ci95_low'] < r['ci95_high'], r
+    assert math.isclose(r['std'] / r['mean'], ref['std'] / ref['mean'],
+                        rel_tol=1e-12), (r, ref)
+    assert r['p_exact_signflip'] == ref['p_exact_signflip'], (r, ref)
+    assert r['p_wilcoxon'] == ref['p_wilcoxon'], (r, ref)
+    assert r['n_nonzero'] == ref['n_nonzero'] and r['significant'] == ref['significant'], (r, ref)
+    assert math.isclose(r['loo_means'][-1], 1e-200, rel_tol=1e-12), r['loo_means']
+    # The report-side std and the TOST/bootstrap helpers share the scale
+    # convention; a tiny but non-degenerate panel must not look exactly equal.
+    assert math.isclose(BR.sample_std(tiny) / 1e-200, math.sqrt(1.0 / 6.0),
+                        rel_tol=1e-12), BR.sample_std(tiny)
+    t = L.tost_paired([1e-200, -2e-200, 3e-200], margin=2e-200)
+    assert t['ci'][0] < t['ci'][1] and t['p_tost'] > 0.0, t
+    b = L.bootstrap_mean_ci(tiny)
+    assert math.isfinite(b['mean']) and b['mean'] > 0.0, b
+    assert b['ci_low'] < b['ci_high'], b
+    # Huge finite values overflow the same squares; the mean/std must remain
+    # finite and the panel must stay within seed noise.
+    h = L.paired_effect_stats([1e308, 1e308, -1e308])
+    assert math.isfinite(h['mean']) and math.isfinite(h['std']) and h['std'] > 0.0, h
+    assert math.isclose(h['mean'], 1e308 / 3.0, rel_tol=1e-12), h
+    assert h['within_seed_noise'] is True and h['significant'] is False, h
+    assert math.isclose(BR.sample_std([1e308, 1e308, -1e308]),
+                        1e308 * math.sqrt(4.0 / 3.0), rel_tol=1e-12)
+
+
 def test_scaling_trend_ragged_pairs():
     pts = [{'label': 'A', 'scale': 0.1, 'effects': [0.0, 1.0, 2.0, 3.0], 'seeds': [0, 1, 2, 3]},
            {'label': 'B', 'scale': 1.0, 'effects': [1.0, 0.0], 'seeds': [0, 1]}]
