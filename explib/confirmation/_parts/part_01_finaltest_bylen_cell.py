@@ -350,7 +350,7 @@ def run_finaltest(cfg=None, guard=None):
     只读冻结清单列出的臂/种子/终点；评估数据来自 `L.load_wikitest`（test
     split，其它 phase 不读）。产物：`results_lm_test/bylen.json`（干净
     by-length，含逐文档 ppl_per_seq）与 `results_lm_test/distractor.json`
-    （uniform 腐坏探针）；确认性统计由 `explib.confirmation.py analysis` 从这些产物
+    （uniform 腐坏探针）；确认性统计由 `python -m explib.confirmation analysis` 从这些产物
     现算。
 
     首次测试访问即写入冻结锁

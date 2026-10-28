@@ -39,7 +39,7 @@
 内核变体标识：`KERNEL_STAMP`。内核模式开启时 exp_lib 的 run_cfg 指纹与
 `_code` 戳追加 `-tk1:<backend>`，eager 记录的指纹逐字节不变（配对纪律，
 design_notes §3.1）。G0 数值对照的驱动入口是
-`python explib.m0.py kernel`。
+`python -m explib.m0 kernel`。
 """
 import math
 import os

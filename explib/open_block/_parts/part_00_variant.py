@@ -14,27 +14,27 @@ recipe; only the two declared factors change.
 
 Commands
 --------
-python explib.open_block.py smoke
+python -m explib.open_block smoke
     Zero-dataset end-to-end check: all eight cells, tiny model, a few steps,
     finite loss, open-block metadata present.
 
-python explib.open_block.py pilot  [--seeds 0] [--steps 100]
+python -m explib.open_block pilot  [--seeds 0] [--steps 100]
     One short seed per cell; excluded from the formal statistics.
 
-python explib.open_block.py main   [--seeds 0,1,2,3] [--steps 1500] [--max-hours H]
+python -m explib.open_block main   [--seeds 0,1,2,3] [--steps 1500] [--max-hours H]
     The 8-cell × 4-seed panel.  Resumable: a cell whose record is current
     (same code/recipe and a finite PPL) is skipped.
 
-python explib.open_block.py aux    [--seeds ...]
+python -m explib.open_block aux    [--seeds ...]
     The outside-window auxiliary panel: the same three reading rules at
     128/None, but the prefix is constructed from U_t = P_t \\ W_t only.
 
-python explib.open_block.py extended [--seeds ...]
+python -m explib.open_block extended [--seeds ...]
     Contingency panel: all 4 maximum-block values x all 3 reading rules
     (12 cells).  Only run this if the main matrix shows an interaction trend;
     it is not part of the 8-cell primary panel.
 
-python explib.open_block.py report [--outdir ...]
+python -m explib.open_block report [--outdir ...]
     Paired per-seed deltas, interaction effects, exact sign-flip p-values,
     Holm adjustment, and a Markdown report.  No GPU needed.
 

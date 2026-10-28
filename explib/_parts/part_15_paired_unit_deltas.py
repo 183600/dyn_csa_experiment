@@ -509,7 +509,7 @@ def evaluation_design_audit(manifest, pilot=None):
     Seed-level power answers whether the training replication can reject.
     This audit asks the orthogonal preparation questions: how many independent
     test units exist, whether that count can support a population claim, and
-    (when ``explib.confirmation.py power`` wrote per-unit deltas) what mean PPL difference
+    (when ``python -m explib.confirmation power`` wrote per-unit deltas) what mean PPL difference
     the frozen slice can resolve.
 
     ``pilot`` is the parsed ``power_validation.json`` object.  A missing pilot
@@ -712,7 +712,7 @@ def evaluation_design_audit(manifest, pilot=None):
             out['status'] = 'not_verifiable'
         out['warnings'].append(
             'no per-unit pilot deltas found in the power artifact; unit MDE and '
-            'SESOI precision are not verifiable (run `python explib.confirmation.py power`)')
+            'SESOI precision are not verifiable (run `python -m explib.confirmation power`)')
     if out['violations']:
         out['status'] = 'fail'
     return out

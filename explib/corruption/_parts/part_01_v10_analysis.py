@@ -443,7 +443,7 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
     A('')
     A(f'> 生成时间：{time.strftime('%Y-%m-%d %H:%M:%S')}')
     A('> 参考论文：arXiv:2606.19348。**范围声明**：本报告是小规模 WikiText-103 上的受控研究，不是 DeepSeek-V4 的全量复现，也不支持对其规模、语料或生产系统做外推。')
-    A('> 说明：本报告全部数字由 `explib.corruption.py report` 从 `results_*/`、`analysis_v10/` 的落盘产物计算得到，无手填数值。')
+    A('> 说明：本报告全部数字由 `python -m explib.corruption report` 从 `results_*/`、`analysis_v10/` 的落盘产物计算得到，无手填数值。')
     A('')
 
     A('---')
@@ -691,7 +691,7 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
     _n_all = sorted({v.get('n', 0) for v in contr.values() if isinstance(v, dict) and 'omitted' not in v})
     A(f'- 每个配对比较都给出逐种子 Δ、效应量 d_z 与该 n 下的双侧精确符号翻转 p 值下限 2/2^n（本表 n 集合 {_n_all}）。')
     A('- 上表全部 p 值按 **Holm step-down** 在本报告的对比族内做了多重校正（`analysis_v10/stats.json` 的 `probe.holm_exploratory`）；该校正族**未预先注册**，因此校正后的 p 只能防止过度宣称，不能当作确认性证据。')
-    A('- v7→v11 的多轮追加实验与既有面板属于**探索性**证据；确认性检验见 `explib.confirmation.py`（冻结清单 `confirmation_frozen.json`：固定主比较、终点、种子数，用 wiki.test.raw 独立 test split 一次性评估）。')
+    A('- v7→v11 的多轮追加实验与既有面板属于**探索性**证据；确认性检验见 `python -m explib.confirmation`（冻结清单 `confirmation_frozen.json`：固定主比较、终点、种子数，用 wiki.test.raw 独立 test split 一次性评估）。')
     A('')
     A('---')
     A('')
@@ -846,7 +846,7 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
     A('| `results_lm_v10_scale_lflop/` | P3S-2：6ND 参数量代理规模大模型臂（非实测等 FLOPs） |')
     A('| `results_lm_v9_seq2k/` | P3T：topk 扫描追加 seeds 2/3 后的 4-seed 面板 |')
     A('| `analysis_v10/stats.json` | 探针对比（含 ΔNLL、Holm）、交叉定位、等 token 切片与配对符号翻转检验 |')
-    A('| `explib.corruption.py` | 本阶段驱动（smoke/phase/analysis/report，可断点续跑） |')
+    A('| `python -m explib.corruption` | 本阶段驱动（smoke/phase/analysis/report，可断点续跑） |')
     A('')
     L.atomic_write_text(out, '\n'.join(lines) + '\n')
     print(f'[v10 report] wrote {out}')
@@ -969,7 +969,7 @@ def _run_cli():
         print(f"[v10] unknown mode {mode!r}; expected one of {_MODES} (no argument means 'full').  Refusing to start a run.")
         raise SystemExit(2)
     if mode == 'phase' and len(sys.argv) < 3:
-        print(f"[v10] mode 'phase' needs a phase name, e.g. `python explib.corruption.py phase P3MT`.  Available: {[p[0] for p in PHASES]}")
+        print(f"[v10] mode 'phase' needs a phase name, e.g. `python -m explib.corruption phase P3MT`.  Available: {[p[0] for p in PHASES]}")
         raise SystemExit(2)
     print(f'[v10] mode={mode} repo={REPO} device={DEVICE} ({(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'cpu')})')
     try:

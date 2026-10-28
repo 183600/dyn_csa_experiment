@@ -1237,7 +1237,7 @@ FLOOR_HYPOTHESIS_DESIGN = {
     },
 }
 
-# Open-block panel hypotheses (driver: explib.open_block.py).  These are the
+# Open-block panel hypotheses (driver: python -m explib.open_block).  These are the
 # declared primary contrasts; the remaining maximum-block x reading-rule cells
 # are descriptive.  Delta convention is a - b on token NLL, so predicted_sign
 # -1 means the first arm is expected to have lower NLL.

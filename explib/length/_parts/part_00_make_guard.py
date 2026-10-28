@@ -354,7 +354,7 @@ def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
     A('')
     A(f'> 生成时间：{time.strftime('%Y-%m-%d %H:%M:%S')}')
     A('> 参考论文：arXiv:2606.19348。**范围声明**：小规模 WikiText-103 上的受控研究，不是 DeepSeek-V4 的全量复现；结论不外推到其规模、语料、长上下文训练或生产系统。')
-    A('> 说明：本报告全部数字由 `explib.length.py report` 从 `results_*/`、`analysis_v11/` 的落盘产物计算得到，无手填数值。')
+    A('> 说明：本报告全部数字由 `python -m explib.length report` 从 `results_*/`、`analysis_v11/` 的落盘产物计算得到，无手填数值。')
     A('')
     if probe_ok:
         _probe_note = f'最弱对比停在 n={n_tree_min}、下限 {floor_p_tree:.3f}，跨不过 0.05，因此凡引用它的结论不作显著性主张' if floor_p_tree >= 0.05 else f'最弱对比也达 n={n_tree_min}、下限 {floor_p_tree:.3f}，已跨过 0.05'
@@ -662,7 +662,7 @@ def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
     A(f'| `results_lm_v10_scale_l/` | P4S：d=512/10L 面板 {_n_txt('results_lm_v10_scale_l', 4)} |')
     A(f'| `results_lm_v5_scale/` | P4F：d=384 `csa_fixed`/`full` 臂 {_n_txt('results_lm_v5_scale', 4, ('csa_fixed', 'full'))} |')
     A(f'| `analysis_v11/stats.json` | n={n_contr_max} 探针对比、交叉定位（{_xo_txt}）、配对检验 |')
-    A('| `explib.length.py` | 本阶段驱动（smoke/phase/analysis/report，可断点续跑） |')
+    A('| `python -m explib.length` | 本阶段驱动（smoke/phase/analysis/report，可断点续跑） |')
     A('')
     L.atomic_write_text(out, '\n'.join(lines) + '\n')
     print(f'[v11 report] wrote {out}')
@@ -748,7 +748,7 @@ def _run_cli():
         print(f"[v11] unknown mode {mode!r}; expected one of {_MODES} (no argument means 'full').  Refusing to start a run.")
         raise SystemExit(2)
     if mode == 'phase' and len(sys.argv) < 3:
-        print(f"[v11] mode 'phase' needs a phase name, e.g. `python explib.length.py phase P4MT`.  Available: {[p[0] for p in PHASES]}")
+        print(f"[v11] mode 'phase' needs a phase name, e.g. `python -m explib.length phase P4MT`.  Available: {[p[0] for p in PHASES]}")
         raise SystemExit(2)
     print(f'[v11] mode={mode} repo={REPO} device={DEVICE} ({(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'cpu')})')
     try:

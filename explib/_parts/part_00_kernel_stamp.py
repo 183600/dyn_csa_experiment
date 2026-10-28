@@ -156,7 +156,7 @@ def _uses_batched_eager(cfgs, device=None, batch_size=None):
     return any(
         getattr(c, 'kind', None) in ('csa', 'hca')
         # RoPE CSA/HCA layers ALWAYS take the per-row
-        # `HybridAttentionRoPE._single_rope` loop (explib.rope.py forward), and the
+        # `HybridAttentionRoPE._single_rope` loop (python -m explib.rope forward), and the
         # batched twin in csa_kernels has no RoPE/qk-norm implementation.  A
         # layer is batched only when it is NOT a rope layer.
         and not bool(getattr(c, 'rope', False))

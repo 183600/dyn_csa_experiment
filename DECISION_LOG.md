@@ -33,14 +33,14 @@ release archive produced by `archive_release.py`.
 | version | what was run / decided | evidence level |
 |---|---|---|
 | v6 (`run_gapfill.py`) | core 9-variant table, leave-one-out ablation, scale probe, long runs; 3-seed floor; results kept out of Git | exploratory |
-| v7 (`v7_supp.py`) | reviewer response: RoPE + QK-norm, dense warmup, 40k-step long run, scale re-seeding, length extrapolation, top-k sweep; analytic FLOPs / KV table | exploratory |
-| v8 (`v8_supp.py`) | scale panel to 4 seeds; RoPE 20k long run | exploratory |
-| v9 (`v9_supp.py`) | seq-2048 top-k sweep at batch size 1; third RoPE-20k seed | exploratory |
-| v10 (`v10_supp.py`) | from-scratch random-indexer / all-block controls, distractor-injection probe (uniform / realistic-token / mask / delete + span / doc / topical), NIAH-natural, crossover scaling, equal-token and 6ND-proxy large arms | exploratory |
-| v11 (`v11_supp.py`) | statistical close-out: distractor probe to n=6, crossover panels to n=4, d=384 paired arms; seed-level sign-flip with resolution floors | exploratory |
-| v12 (`v12_supp.py`) | **freeze**: fixed-chunk CSA confirmation plan v2 (12 seeds, 4 primary comparisons, exact sign-flip + Holm, held-out test split, freeze lock, strict record admission, per-document PPL); v1 was rejected by the load-time power gate (6 seeds × Holm/4 has minimum attainable p=0.125) | confirmatory plan |
+| v7 (`python -m explib.rope`) | reviewer response: RoPE + QK-norm, dense warmup, 40k-step long run, scale re-seeding, length extrapolation, top-k sweep; analytic FLOPs / KV table | exploratory |
+| v8 (`python -m explib.scale`) | scale panel to 4 seeds; RoPE 20k long run | exploratory |
+| v9 (`python -m explib.resume`) | seq-2048 top-k sweep at batch size 1; third RoPE-20k seed | exploratory |
+| v10 (`python -m explib.corruption`) | from-scratch random-indexer / all-block controls, distractor-injection probe (uniform / realistic-token / mask / delete + span / doc / topical), NIAH-natural, crossover scaling, equal-token and 6ND-proxy large arms | exploratory |
+| v11 (`python -m explib.length`) | statistical close-out: distractor probe to n=6, crossover panels to n=4, d=384 paired arms; seed-level sign-flip with resolution floors | exploratory |
+| v12 (`python -m explib.confirmation`) | **freeze**: fixed-chunk CSA confirmation plan v2 (12 seeds, 4 primary comparisons, exact sign-flip + Holm, held-out test split, freeze lock, strict record admission, per-document PPL); v1 was rejected by the load-time power gate (6 seeds × Holm/4 has minimum attainable p=0.125) | confirmatory plan |
 | review 2 | seed count revised 6→12 **before any test-split access**; scope block added; two-phase freeze lock; kernel mode refused for the frozen plan; evidence archiver; leakage/causality/fairness audits | frozen plan revision |
-| review 3 | external audit (`科研审查_autodl运行决策.md`) found the confirmation path was not runnable: manifest stamp v11.126 vs code v11.127, `eager_batch_expected=true` with all four arms on the per-row RoPE loop, and P5T records missing `train_knobs` (admitted=0 after the one-shot test access). Manifest **v3** re-signed before any test access: stamp v11.128, eager binding false, P5T/probe records carry the provenance descriptor, per-arm `mr` pinned, equal-budget wording corrected, decision rule declares an n_effective floor of 8, adaptive 2-SE health threshold, reachable leakage statistics, and `v12_supp.py plan` as a zero-GPU CI pre-flight. The continuous-loop CI was disabled/cancelled during the fix. | frozen plan v3 + code hardening |
+| review 3 | external audit (`科研审查_autodl运行决策.md`) found the confirmation path was not runnable: manifest stamp v11.126 vs code v11.127, `eager_batch_expected=true` with all four arms on the per-row RoPE loop, and P5T records missing `train_knobs` (admitted=0 after the one-shot test access). Manifest **v3** re-signed before any test access: stamp v11.128, eager binding false, P5T/probe records carry the provenance descriptor, per-arm `mr` pinned, equal-budget wording corrected, decision rule declares an n_effective floor of 8, adaptive 2-SE health threshold, reachable leakage statistics, and `python -m explib.confirmation plan` as a zero-GPU CI pre-flight. The continuous-loop CI was disabled/cancelled during the fix. | frozen plan v3 + code hardening |
 | review 3 (earlier same day) | pooled-NLL PPL + per-document NLL; pooled/bootstrap/Wilcoxon sensitivity; Holm in v7–v11 and `build_report`; objective/parameter/KV descriptors; opt-in task-learned boundary arm (`csa_dynamic_task`); synthesized records excluded from crossover; span-ΔNLL lookup fixed; kernel-stamp consistency; `DECISION_LOG.md` restored and guarded; dependency/Python declarations | code/evidence hardening |
 | review 4 (2026-10-20) | no new experiment panels. Unified claim gate (`reportable_claim`), Holm family-resolution ceiling, NIAH folded into the Holm family, crossover fit refusal rules + slope CI, matched-init `init_core_fp`, measured compute-control direction (`system_level_only`), stale records fail-closed in `build_report`/v10, missing `truncated` treated as unverifiable, doc-bootstrap CI + <64-doc population gate, token-coverage estimate, efficiency sweep/pair audit, selection-attribution contract, evidence-release readiness audit. The frozen v12 manifest was NOT modified. | code/reporting/evidence hardening; all earlier panels remain exploratory |
 | review 5 (2026-10-27) | no new experiment panels. Cross-panel ablation replication now records sampling identity (training seeds, validation/evaluation/holdout fingerprints, code/knobs) and splits the old `replicated` label into independent draws, new-seeds/same-evaluation, shared seeds, and unattested. Shared draws are repeated measurements, not independent replication; the new labels are descriptive and do not alter p values, Holm, or `all_components_useful_allowed`. Legacy reports without identity keep the old label and are never promoted to independent replication. The frozen v12 manifest was NOT modified. | code/reporting/evidence hardening; all earlier panels remain exploratory |
@@ -273,7 +273,7 @@ say:
 
 The frozen confirmation manifest (`confirmation_frozen.json`, manifest v3)
 and its power table were not changed; no test split was read.  The per-issue
-table is `REVIEW_4_RESPONSE.md`, and the statistical conventions are in
+record is this log's review-4 entry, and the statistical conventions are in
 `docs/design_notes.md` section 25.
 
 ## 2026-10-20 — comparison/ablation audit hardening (no new runs)
@@ -687,7 +687,7 @@ only versus a fixed pseudo-random pattern); the main/aligned-dense contrasts
 are system-level because MLP width/FLOPs, kernel, qk-norm/kv-norm width and
 the learned sink differ, and allblocks is not reading-budget matched.
 (3) The manifest's required pre-test power simulation is implemented as
-`python v12_supp.py power`: exact conditional power over the 2^12 sign
+`python -m explib.confirmation power`: exact conditional power over the 2^12 sign
 patterns of the P5C validation deltas, a minimum same-sign count, and a
 refusal when power at q=0.95 is below 0.8 (the q=0.90 sensitivity is
 reported alongside; it is expected to be ~0.66 at n=12) (`V12_ALLOW_LOW_POWER=1` is the
@@ -713,7 +713,7 @@ only) and the `fast_prompt()` wrapper that instructed the agent to scan for
 issues, keep editing and commit after every change was removed.  An
 unattended agent with push rights must not be able to mutate the frozen code
 or manifest while the confirmation awaits its single test access.
-(4) `python v12_supp.py power` and `phase P5PW` are the zero-GPU preflight;
+(4) `python -m explib.confirmation power` and `phase P5PW` are the zero-GPU preflight;
 `phase P5T` re-runs it, so a direct P5T cannot bypass the gate.
 
 The temporary issue list was removed after the fixes.
@@ -756,7 +756,7 @@ power gate and complete-coverage rule are unchanged.
 manifest `confirmation_frozen_dynamic.json` records the design and its
 precondition: a disjoint test corpus (or a disjoint, never-read document split),
 a new freeze, a pre-test power simulation and the same admission/freeze-lock
-machinery. `v12_supp.py` refuses `status=draft` (V12_ALLOW_DRAFT only permits
+machinery. `python -m explib.confirmation` refuses `status=draft` (V12_ALLOW_DRAFT only permits
 schema inspection, never a confirmation). Reusing the rows that the fixed v5
 study reads would make the second study non-independent; the freeze lock does
 not fix that.
@@ -801,7 +801,7 @@ inertly (dynamic segmentation never reads it). Both are now part of the
 declared contract and of the ABLATION_DESIGN contrast notes; dynamic-vs-fixed
 contrasts keep their §22.4 system-level reading.
 
-(3) **Frozen-manifest flag verification** (`v12_supp.py plan`): each primary
+(3) **Frozen-manifest flag verification** (`python -m explib.confirmation plan`): each primary
 comparison now gets a machine-derived `single_factor` verdict — cfg diff
 inside ONE declared intervention family (`exp_lib.cfg_keys_single_factor`,
 kind swaps excluded by definition) AND matching actual training objectives
@@ -935,7 +935,7 @@ endpoints and states why PR-AUC/ROC-AUC are not invented without per-class
 scores. `metric_policy_audit` requires all three together, rejects a micro F1
 that differs from accuracy, and recomputes the three aggregates from
 per-class counts (legacy records without F1 are unverifiable, not a pass).
-`v10_supp.py` persists the new fields and prints macro/weighted F1 with the
+`python -m explib.corruption` persists the new fields and prints macro/weighted F1 with the
 top-1/macro-recall/floors table. (2) `FLOOR_HYPOTHESIS_DESIGN` registers the
 floor comparison as a directional hypothesis (Δ = method − floor,
 `predicted_sign=-1`, primary `ppl`, falsifier covering non-comparability and
@@ -965,7 +965,7 @@ for scale, validation scanned in full), the first real batch verifies the
 one-token causal target shift, and `diagnose_training_instability` consumes the
 recorded `data_audit` instead of assuming the data were clean. A failed audit,
 or a failed label-shift check, is an observed cause; a missing one is
-`unknown`, never `not_observed`. `v7_supp.train_warmup` records the same audit.
+`unknown`, never `not_observed`. `explib.rope.train_warmup` records the same audit.
 Overfitting actions now name early stopping explicitly.
 
 (2) **Bad cases are printed, not only written to disk.** `error_analysis.py`
@@ -975,7 +975,7 @@ ambiguity) and worst sequences by default (`--print-samples` /
 artifact now include the target's measured training frequency, so
 "annotation/rare target" can be checked against a number.
 
-(3) **Scale analysis reports cost alongside the final PPL.** `m0_supp` panels
+(3) **Scale analysis reports cost alongside the final PPL.** `explib.m0` panels
 now carry `result_diagnostics`: curve-health counts, non-finite/overfitting/
 stalled/early-stopped/`final>best` records, and per-arm medians for PPL, params,
 training throughput, prefill latency and peak memory, with `≥2x` cost flags.
@@ -989,7 +989,7 @@ label-shift check (legacy records without the field keep their old warning
 path).
 
 Verification: `python test_review_fixes.py` passes 374/374 (data-audit/triage
-and scale result-diagnostics tests added); `python v12_supp.py plan` still
+and scale result-diagnostics tests added); `python -m explib.confirmation plan` still
 admits 72/72 synthetic records with the same six comparisons.
 
 ## 2026-10-22 — baseline design preflight + tuned-baseline hypothesis (no new runs)
@@ -1094,7 +1094,7 @@ next to the validation-health table.  (2) `analyze_errors` takes
 `context_scan_max_positions` (CLI `--context-scan-positions`, default 2M; 0 =
 unbounded) and records `scan_complete`, scanned row/position counts and a
 sampling note, so a bounded ambiguity count can never be quoted as a whole-split
-total.  (3) Both `m0_supp._panel_result_diagnostics` and
+total.  (3) Both `explib.m0._panel_result_diagnostics` and
 `build_report.efficiency_accuracy_summary` now emit
 `cost_increase_without_clear_gain` when a sub-0.5%-or-within-noise PPL change
 comes with a >=2x latency, parameter or memory increase; M0 also reports
@@ -1207,10 +1207,10 @@ that says `confirmatory` fails the audit. (3) `exp_lib.dynamic_design_audit`
 requires H1 segmentation quality (boundary F1), H2 retrieval precision (NIAH),
 H3 long-range coverage (PPL vs a read-matched fixed arm), plus H4/H5, the
 dedicated control arms and a disjoint-source/measured-calibration/passed-power
-precondition. (4) `v12_supp.plan` now runs the budget/evidence preflight before
-training; new `v12_supp dynamic-plan` audits the draft without treating it as a
+precondition. (4) `explib.confirmation.plan` now runs the budget/evidence preflight before
+training; new `explib.confirmation dynamic-plan` audits the draft without treating it as a
 confirmation; `audit_gates design` is the unified zero-GPU entry point.
-(5) `v7_supp` gains rope-consistent dynamic control arms
+(5) `explib.rope` gains rope-consistent dynamic control arms
 (`csa_dynamic_rope_randidx_seeded`, `csa_dynamic_rope_task`,
 `hybrid_dynamic_rope`, `csa_fixed_rope_topk{k}`) so the dynamic draft never
 mixes rope and non-rope arms.
@@ -1326,8 +1326,8 @@ a canonical-fingerprint failure. (4) `experiment_provenance` computed
 `corpus_fp` before adding `data_extra`; a read-only view of writable storage
 could keep a stale `_ids_fp` memo; `_ids_narrow` trusted only an upper bound
 and wrapped large negative ids; `_audit_sample_flat` exceeded tiny budgets.
-(5) `v7_supp.eval_length_gen` sliced a short panel but still allocated for the
-requested length. (6) `m0_supp._ladder_params` used S1's `seq_len` for every
+(5) `explib.rope.eval_length_gen` sliced a short panel but still allocated for the
+requested length. (6) `explib.m0._ladder_params` used S1's `seq_len` for every
 tier. (7) Result-dir audits resolved `_iter_result_dirs()` names against the
 process CWD, and the document-overlap gate certified a split after scanning a
 tiny fraction of a large train stream.
@@ -1389,7 +1389,7 @@ a measured calibration. (5) The dynamic draft records those fields and its
 Verification: new CPU tests L94-L97 (explicit mapping/orientation, power and
 calibration formula, mechanism-claim confirmation, evidence-family identity).
 `python test_review_fixes.py` passes 430/433 with the same 3 DataLoader
-environment skips; `python v12_supp.py dynamic-plan` reports the draft as
+environment skips; `python -m explib.confirmation dynamic-plan` reports the draft as
 coherent but non-runnable.
 
 ## 2026-10-22 — scale cast/geometry hardening + malformed-design fail-closed (no new runs)
@@ -1483,8 +1483,8 @@ stamps split, nested estimand label), L105 (code semantics in arm/control
 identity) and L106 (confirmation parameter binding + per-seed consistency).
 `python test_review_fixes.py` passes 439/442 with the same 3 DataLoader
 environment skips; `python test_open_block.py` passes 15/15;
-`python v12_supp.py plan` admits 72/72 synthetic frozen cells and
-`python v12_supp.py dynamic-plan` still reports the draft as non-runnable.
+`python -m explib.confirmation plan` admits 72/72 synthetic frozen cells and
+`python -m explib.confirmation dynamic-plan` still reports the draft as non-runnable.
 
 ## 2026-10-22 — confirmation-verdict robustness: fragility + seed-drop Holm jackknife (no new runs)
 
@@ -1525,7 +1525,7 @@ correction. (3) `exp_lib.confirmation_robustness` composes both, keeps the
 declared `family_size` (and refuses one smaller than the supplied comparison
 set), and adds the equal-magnitude projection margin
 (`min_same_sign_for_family_gate`, `same_sign_margin`) only as a planning
-reference. (4) `v12_supp.finaltest_stats` attaches `stats['robustness']` AFTER
+reference. (4) `explib.confirmation.finaltest_stats` attaches `stats['robustness']` AFTER
 `confirmed` is computed; `confirmed`, raw p, Holm p, alpha and the family are
 untouched. The complete-coverage gate is deliberately not replayed (dropping any
 seed makes coverage false by construction); instead the block reports
@@ -1554,7 +1554,7 @@ L108 (v12 integration appends only `robustness`; `confirmed`/`holm` unchanged;
 coverage gate not replayed; Markdown rendering; empty inputs) and L109
 (document-level breadth + mismatched-row refusal).
 `python test_review_fixes.py` passes 443/446 with the same 3 DataLoader
-environment skips; `python v12_supp.py plan` still admits 72/72 synthetic frozen
+environment skips; `python -m explib.confirmation plan` still admits 72/72 synthetic frozen
 records with the same six comparisons.
 
 ## 2026-10-22 — exact causal-quantile rank positions at scale (no new runs)
@@ -1619,10 +1619,10 @@ arbitrary uint64 ids; `exp_lib.aggregate_nll_by_document` groups per-token NLL
 by document and returns `nll_per_doc`, `n_tokens_per_doc`, `ppl_per_doc`,
 `doc_ids`, `n_docs` and a fingerprint. It uses the shared deterministic
 segmented-sum helper, so the grouping does not depend on chunk order.
-(4) `v7_supp.eval_length_gen(..., doc_ids=...)` attaches those fields to every
+(4) `explib.rope.eval_length_gen(..., doc_ids=...)` attaches those fields to every
 by-length cell (including the truncated-`max_pos` branch) while leaving the
 pooled `ppl`, `n_tok`, `nll_sum`, `nll_per_seq` and `ppl_per_seq` values
-untouched. (5) `v12_supp.P5T` requests the mapping from `load_wikitest` and
+untouched. (5) `explib.confirmation.P5T` requests the mapping from `load_wikitest` and
 passes it through; `_doc_level_analysis` now prefers `ppl_per_doc` and refuses
 mixed document/row granularity or mismatched per-document token counts/id
 order instead of pairing by position. The public `doc_sampling` dict records
@@ -1664,7 +1664,7 @@ README or CI configuration was touched. The pooled point estimate and the
 frozen decision rule are unchanged; this entry fixes the ESTIMAND of the
 document-sampling interval printed next to the primary comparison.
 
-**Problem.** `v12_supp._doc_level_analysis` built `ppl_per_doc`, averaged the
+**Problem.** `explib.confirmation._doc_level_analysis` built `ppl_per_doc`, averaged the
 per-seed arm difference with EQUAL weight per document, and bootstrapped those
 unit means. The primary endpoint is token-pooled PPL
 (`exp(sum NLL / sum tokens)`), so when document lengths differ "the average
@@ -1682,7 +1682,7 @@ seeds, variance `D/(D-1)*sum_i psi_i^2`, t critical value with `df=D-1`, and
 the corresponding seed-averaged log-ratio / PPL-ratio interval. It is
 deterministic (no bootstrap), conditions on the trained seeds, and validates
 shapes, finiteness, positive token counts and `conf`. (2)
-`v12_supp._doc_nll_matrix` checks that every per-document NLL vector is
+`explib.confirmation._doc_nll_matrix` checks that every per-document NLL vector is
 finite, reconstructs the cell's recorded `nll_sum`, and is consistent with
 `ppl_per_doc = exp(nll_i/t_i)`. (3) `_doc_level_analysis` attaches
 `pooled_delta_ppl`, `pooled_delta_ppl_ci95`, `pooled_delta_log_ratio`,
@@ -1717,7 +1717,7 @@ vectors are refused rather than silently used, row fallback stays row-level)
 and L117 (report helper prefers the pooled interval and labels the fallback).
 Extended L113 covers the new admission checks.
 `python test_review_fixes.py` passes 451/454 with the same 3 DataLoader
-environment skips; `python v12_supp.py plan` still admits 72/72 synthetic
+environment skips; `python -m explib.confirmation plan` still admits 72/72 synthetic
 frozen records with the same six comparisons.
 
 ## 2026-10-22 — device block orbit bound and pooled-CI provenance guard
@@ -1763,7 +1763,7 @@ the cluster interval) and new L118 (device vs host segmenter at `n=10003` for
 `(n, min_block, max_block, cut-table)` cases, including `n=10003` and
 `max_block < min_block`, found no further device/host mismatch.
 `python test_review_fixes.py` passes 452/455 with the same 3 DataLoader
-environment skips; `python v12_supp.py plan` still admits 72/72 synthetic
+environment skips; `python -m explib.confirmation plan` still admits 72/72 synthetic
 frozen records with the same six comparisons.
 
 ## 2026-10-22 — matched-initialization evidence reaches the confirmation test (no new runs)
@@ -1831,7 +1831,7 @@ L120 (end-to-end `finaltest_stats`: matched panel is verified; a mismatched
 seed is dropped by name and a complete-coverage plan becomes `omitted`;
 absent/one-sided evidence is `None`, never True).
 `python test_review_fixes.py` passes 454/457 with the same 3 DataLoader
-environment skips; `python v12_supp.py plan` still admits 72/72 synthetic
+environment skips; `python -m explib.confirmation plan` still admits 72/72 synthetic
 frozen records with the same six comparisons.
 
 ## 2026-10-22 — scale-safe segmentation / sidecar construction / host fallbacks
@@ -1869,7 +1869,7 @@ serve" and return `None`; the pinned-staging pools likewise fall back when
 `pin_memory` raises `MemoryError`. No integer/value changes on the successful
 path.
 
-**Bug 4 (ladder parameter audit).** `m0_supp.run_params` iterated a literal
+**Bug 4 (ladder parameter audit).** `explib.m0.run_params` iterated a literal
 `('S1', 'S2', 'S3', 'S4')`, so a newly declared `SCALE_LADDER` tier was
 silently absent from the planned-vs-observed parameter table even though the
 panel resolver and `scale_ladder_audit` had discovered it. The tier list is
@@ -1887,7 +1887,7 @@ row with exact values, the ≤64 list contract is preserved, and the host
 geometry builders return `None` on a simulated `MemoryError`) and L122
 (numeric ladder discovery, incl. S10 ordering and an unknown tier).
 `python test_review_fixes.py` passes 456/459 with the same 3 DataLoader
-environment skips; `python test_open_block.py` passes; `python v12_supp.py
+environment skips; `python test_open_block.py` passes; `python -m explib.confirmation
 plan` still admits 72/72 synthetic frozen records with the same six
 comparisons.
 
@@ -1897,7 +1897,7 @@ Zero-GPU design hardening; no training run, frozen manifest byte, test split,
 `CODE_SEMANTICS`, README or CI configuration was touched.
 
 **Problem.** The exact paired sign-flip test assumes within-seed exchangeability,
-but calendar time was never a controlled design variable. `v7_supp.run_lenphase`
+but calendar time was never a controlled design variable. `explib.rope.run_lenphase`
 (the training entry point used by v12 P5C) scheduled
 `[(v, seed) for v in variants for seed in seeds]`: every seed of arm A, then
 every seed of arm B. The two arms of each pair were therefore trained in
@@ -1917,7 +1917,7 @@ into an arm effect. This is a design defect, not a p-value problem.
 - the plan is built over ALL declared cells, so a resume cannot reshuffle it;
   `run_order.json` records the design, `blocks`, `planned_cells`,
   `cell_blocks` and `cell_variants` (inside the gitignored results dir);
-- `v7_supp.run_lenphase` and `exp_lib.run()` now execute in plan order; resume
+- `explib.rope.run_lenphase` and `exp_lib.run()` now execute in plan order; resume
   keys, seeds, training values and `run_cfg` are unchanged.
 
 New `audit_gates.py run_order` (also included in `run_report`) checks complete
@@ -1944,7 +1944,7 @@ run, and returns not_verifiable when no plan/events exist).
 `python test_review_fixes.py` passes 458/461 with the same 3 DataLoader
 environment skips; `python audit_gates.py run_order` reports
 `not_verifiable_locally` on this source-only tree (no `results_*/` artifacts);
-`python v12_supp.py plan` still admits 72/72 synthetic frozen records with the
+`python -m explib.confirmation plan` still admits 72/72 synthetic frozen records with the
 same six comparisons.
 
 ## 2026-10-22 — fixed-stride host tables, cached attachments and object-key scanning at scale
@@ -1987,7 +1987,7 @@ audit) and L121c (complex object rows rejected across hash-block boundaries).
 `python test_review_fixes.py` passes 460/463 with the same 3 DataLoader
 environment skips; `python test_open_block.py` passes 15/15;
 `python audit_gates.py run_order` still reports `not_verifiable_locally` on
-this source-only tree; `python v12_supp.py plan` still admits 72/72 synthetic
+this source-only tree; `python -m explib.confirmation plan` still admits 72/72 synthetic
 frozen records with the same six comparisons.
 
 ## 2026-10-22 — source-tree identity and a complete dependency lock
@@ -2017,7 +2017,7 @@ experiment box); its hash and contract are recorded separately in
 tests/docs/CI are excluded so a test edit cannot masquerade as a semantic
 change.  `code_provenance()` records the summary under `code.source_tree`; it
 is provenance only and does not enter `run_cfg`, resume fingerprints or
-`exec_fp`.  `v12_supp.py plan` now writes the
+`exec_fp`.  `python -m explib.confirmation plan` now writes the
 full manifest plus `dependency_contract()` into
 `analysis_v12/plan_snapshot.json`, binding the bytes and environment the plan
 gate approved.
@@ -2057,7 +2057,7 @@ environment skips; `python test_open_block.py` passes 15/15;
 `python audit_gates.py dependencies` reports `ok` with 48/48 pinned and 0
 unpinned installed distributions; `pip install --dry-run --no-deps
 --ignore-installed -r requirements.lock` resolves every pin, and `pip check`
-reports no broken requirements; `python v12_supp.py plan` still admits 72/72
+reports no broken requirements; `python -m explib.confirmation plan` still admits 72/72
 synthetic frozen records with the same six comparisons.
 
 
@@ -2119,7 +2119,7 @@ gave the tree a content digest for the plan snapshot and per-cell provenance
 (§50), but §49.2's boundary — "the analysis code itself is not hashed by the
 freeze lock" — remained open.
 
-**Changes.** `v12_supp._check_or_write_freeze_lock*` computes
+**Changes.** `explib.confirmation._check_or_write_freeze_lock*` computes
 `exp_lib.source_tree_manifest()` and writes the full manifest plus
 `source_tree_sha256` / `source_tree_bound_at` when the lock is first created
 (`preaccess`, before any test read).  Later calls compare the digest:
@@ -2158,7 +2158,7 @@ history, malformed injected manifest) and L142 (audit ok/fail against the lock,
 legacy-lock unverifiable boundary, declared drift is a fail).
 `python test_review_fixes.py` passes 478/481 with the same 3 DataLoader
 environment skips; `python test_open_block.py` passes 15/15;
-`python v12_supp.py plan` still admits 72/72 synthetic frozen records with the
+`python -m explib.confirmation plan` still admits 72/72 synthetic frozen records with the
 same six comparisons; `python audit_gates.py source` reports `ok` against the
 regenerated plan snapshot; `python audit_gates.py dependencies` reports `ok`
 with 48/48 pinned and 0 unpinned installed distributions.
@@ -2184,7 +2184,7 @@ reports (i) descriptive simple effects, (ii) per-seed
 paired bootstrap and a declared-family Holm adjustment, and (iii) an optional
 per-seed OLS slope on a supplied numeric axis (never a regression on condition
 means).  Missing/bool/non-finite cells drop the whole seed and are named.
-`v12_supp._length_interaction_analysis()` applies it to PPL as
+`explib.confirmation._length_interaction_analysis()` applies it to PPL as
 `log(PPL_a) − log(PPL_b)` with the training length 512 as reference (shortest
 length if absent) and `log2(length)` as the axis; `finaltest_stats` attaches
 `comparisons[*].length_interaction`, and `_length_interaction_markdown`
@@ -2202,7 +2202,7 @@ per-seed trend, whole-seed dropping, reference/axis guards, malformed inputs)
 and L150 (log-ratio definition, 512 reference and fallback, truncated-cell
 seed drop, single-length refusal, Markdown caveats).
 `python test_review_fixes.py` passes 486/489 with the same 3 DataLoader
-environment skips; `python v12_supp.py plan` still admits 72/72 synthetic
+environment skips; `python -m explib.confirmation plan` still admits 72/72 synthetic
 frozen records with the same six comparisons; `python audit_gates.py source`
 reports `ok` (23/23 files byte-identical to the regenerated plan snapshot).
 
@@ -2268,7 +2268,7 @@ non-verification, line/article classification, and a title whose lines straddle
 train/validation failing the audit).  `python test_review_fixes.py` passes
 489/492 with the same 3 DataLoader environment skips;
 `python audit_gates.py document_unit` reports `not_verifiable_locally` with no
-cache; `python v12_supp.py plan` still admits 72/72 synthetic frozen records.
+cache; `python -m explib.confirmation plan` still admits 72/72 synthetic frozen records.
 
 ## 2026-10-23 — evaluation uncertainty is clustered by article, not by raw line (no new runs)
 
@@ -2304,7 +2304,7 @@ leakage audit) is unchanged; cluster label and content identity are now
 separate concepts.  `load_wikitext_test_tokenizer()` reads the persisted test
 tokenizer JSON (width-checked) without touching `wiki.test.raw`.
 
-**(2) Additive evaluation fields.** `v7_supp.eval_length_gen` accepts an
+**(2) Additive evaluation fields.** `explib.rope.eval_length_gen` accepts an
 optional `article_ids` mapping and appends `article_granularity='article'`,
 `n_articles`, `nll_per_article`, `n_tokens_per_article`, `ppl_per_article`,
 `article_ids`, `article_ids_fp` and article totals.  The line-level
@@ -2360,9 +2360,9 @@ admission rejects partial/duplicate/inconsistent article cells, analysis
 prefers articles, mixed coverage falls back with a recorded reason,
 cross-seed article-id mismatch is refused).  `python test_review_fixes.py`
 passes 493/496 with the same 3 DataLoader environment skips;
-`python v12_supp.py plan` still admits 72/72 synthetic frozen records with the
+`python -m explib.confirmation plan` still admits 72/72 synthetic frozen records with the
 same six comparisons; `python audit_gates.py source` reports `ok` (23/23 files byte-identical)
-after regenerating the plan snapshot with `python v12_supp.py plan`.
+after regenerating the plan snapshot with `python -m explib.confirmation plan`.
 
 ## 2026-10-23 — validation article audit must trim the unserved sidecar tail (no new runs)
 
@@ -2390,7 +2390,7 @@ No token, id, fingerprint or article boundary changes for the served slice.
 sequence of sidecar ids): the audit decodes validation, records the trim and
 still classifies the line unit; a one-id-short map remains refused.
 `python test_review_fixes.py` passes 493/496 with the same 3 DataLoader
-environment skips; `python v12_supp.py plan` still admits 72/72 synthetic
+environment skips; `python -m explib.confirmation plan` still admits 72/72 synthetic
 frozen records; `python audit_gates.py source` is `ok` after regenerating the
 plan snapshot.
 
@@ -2438,7 +2438,7 @@ covers moving-reference refusal, env override, mismatched/legacy/local caches
 and the audit verdicts, and L157 exercises the cold local-raw build/write path.
 
 **Verification.** `python test_review_fixes.py` passes 496/499 with the same 3
-DataLoader environment skips; `python v12_supp.py plan` still admits 72/72
+DataLoader environment skips; `python -m explib.confirmation plan` still admits 72/72
 synthetic frozen records; `python audit_gates.py source` is `ok` after the plan
 snapshot refresh; `python audit_gates.py report` completes (its `data_source`
 section correctly reports the current legacy `wt103_cache` as
@@ -2478,7 +2478,7 @@ stale 并剔除。`methodology_audit` 的 `p_holm_global` /
 **Verification.** `python test_review_fixes.py` 通过 518/521，3 个
 DataLoader 环境跳过；新增 L176（原语：单 look 等价、单调、方向性、
 stale/大规模回退、malformed 拒绝）、L177（落盘/去重/stale 剔除/篡改 p
-fail-closed/缺 audit 块 warning）、L178（降级门）。`python v12_supp.py
+fail-closed/缺 audit 块 warning）、L178（降级门）。`python -m explib.confirmation
 plan` 仍 72/72 合成记录、6 个比较；`python audit_gates.py source` 在刷新
 plan snapshot 后 `ok`（23/23 文件逐字节一致）；`python audit_gates.py
 sesoi` 仍通过；`python audit_gates.py looks` 在无结果树时明确
@@ -2540,7 +2540,7 @@ protocol mismatch, scrambled dose-key order, post-hoc `direction='auto'`,
 invalid shape) and L182 (exact p=2/64, direction conflict, linear-vs-monotone
 shape gate,
 missing/non-finite complete-case exclusions, two-point refusal, protocol
-conflict, invalid direction/shape). `python v12_supp.py plan` still admits
+conflict, invalid direction/shape). `python -m explib.confirmation plan` still admits
 72/72 synthetic frozen records with the same six comparisons;
 `python audit_gates.py source` is `ok` (23/23 source files byte-identical);
 `python audit_gates.py dose_response` returns `not_applicable` because the
@@ -2591,7 +2591,7 @@ seed/n_sim/α/阈值，带覆盖参数运行不会复用默认策略的指纹。
 与 L184（审计入口、报告接线、CLI 文档、过小模拟拒绝）。
 `python audit_gates.py calibration` 在默认策略（seed=20261023, n_sim=2000）
 下 status=`ok`：null 拒绝率 0.038–0.061，正控制 0.78–1.0，鞍点对精确
-max |Δp|=0.0229、mean=0.00084。`python v12_supp.py plan` 仍 72/72 合成
+max |Δp|=0.0229、mean=0.00084。`python -m explib.confirmation plan` 仍 72/72 合成
 冻结记录、6 个比较。
 
 ## 2026-10-23 — 区间估计器也要先校准（no new runs）
@@ -2648,7 +2648,7 @@ suite fail。
 覆盖率/平均宽度分别为 `interval_seed_t` 0.9525/1.2369、
 `interval_paired_bootstrap` 0.9440/1.2848、`interval_unit_bootstrap`
 0.9520/0.8354、`interval_combined_seed_doc` 0.9775/0.6568（log 尺度），
-均通过且宽度低于上限。`python v12_supp.py plan` 仍 72/72 合成冻结记录、
+均通过且宽度低于上限。`python -m explib.confirmation plan` 仍 72/72 合成冻结记录、
 6 个比较；`python audit_gates.py source` 在刷新快照后 status=`ok`
 （23/23 文件字节一致），`audit_gates.py report` 的 `calibration` 键为
 `ok`。
@@ -2674,7 +2674,7 @@ suite fail。
 `insufficient_specs` 五态。它**不计算 p 值、不做多重校正、不新增检验**，
 只把口径选择显式化，避免把 forking paths 塞进显著性族。
 
-`v12_supp._doc_level_analysis` 现把 8 条口径写入
+`explib.confirmation._doc_level_analysis` 现把 8 条口径写入
 `doc_sampling.analysis_choice_concordance`：逐种子 mean（主口径）、
 median、20% trimmed mean，token 池化 ΔPPL，逐单元 mean、median、
 log-ratio、win-balance（`(n_positive - n_negative) / n_units`，负号表示
@@ -2700,7 +2700,7 @@ a 更常更低；全平局为 0）。种子不足 5 时 trimmed mean 显式不�
 非有限主口径/非法 `zero_tol` fail-closed、输入不变；审计稳定→ok、方向
 翻转→warnings、状态篡改/主均值不符/重复名→fail、旧产物→
 `not_verifiable_locally`；合成「token 池化正、逐单元中位数为负」panel 被
-标为 `direction_unstable` 且报告保留 caveat。`python v12_supp.py plan`
+标为 `direction_unstable` 且报告保留 caveat。`python -m explib.confirmation plan`
 仍 72/72 合成冻结记录、6 个比较；`python audit_gates.py analysis_choices`
 在无 `analysis_v12/test_stats.json` 时返回 `not_verifiable_locally`（不冒充
 通过）。
@@ -2817,7 +2817,7 @@ exact-row 检查后运行同一 helper。新参数全部进入 memo key 并做�
 被 passage 行级门 fail；精确复制同时触发两个门；重复模板语料基线≈1、
 超额 0 不误报；5% 覆盖降为 warnings/`not_verifiable`；短行
 `not_applicable`；`audit_split_discipline` 对干净/污染 cache 分别 ok/fail；
-NaN/负值/超范围参数被拒绝。`python v12_supp.py plan` 仍 72/72 合成冻结
+NaN/负值/超范围参数被拒绝。`python -m explib.confirmation plan` 仍 72/72 合成冻结
 记录、6 个比较。
 
 ## 2026-10-26 — 2x2 交互的 SESOI/TOST 等价性与设计门（no new runs）
@@ -2866,7 +2866,7 @@ TOST 区间落在 margin 内的 `additive` 才是对「实际交互」的正反�
 p=1 槽位/无完整 seed 列表不重复/畸形声明 fail，以及三个重复 factorial
 下超显著性与 TOST 两族 m=3 的 Holm；直接判定原语、
 单次迭代器、相对 margin 换算、畸形族 p 的 fail-closed 与输入校验。
-`python audit_gates.py interaction_sesoi` 返回 `ok`；`python v12_supp.py
+`python audit_gates.py interaction_sesoi` 返回 `ok`；`python -m explib.confirmation
 plan` 仍 72/72 合成冻结记录、6 个比较。
 
 ## 2026-10-27 — 预注册方向性主张的三向判定：确认、反证与不确定（no new runs）
@@ -2890,7 +2890,7 @@ plan` 仍 72/72 合成冻结记录、6 个比较。
 `param_matched=false` 始终失效，清单声明匹配契约时还要求
 `param_match_complete=true`，缺记录不是通过。
 
-`v12_supp.finaltest_stats` 写入 `verdicts`、`verdict_summary`、
+`explib.confirmation.finaltest_stats` 写入 `verdicts`、`verdict_summary`、
 `refuted`、`inconclusive`、`not_testable`、`opposite_nonsignificant`、
 `reverse_significant_unverified`、`verdict_consistency`，并为
 `not_confirmed_reasons` 补 `verdict`/`verdict_reason`/`gate_failures`；
@@ -2917,7 +2917,7 @@ p/Holm/`confirmed` 数值，也不改变冻结清单或实验执行。
 `not_confirmed_reasons.verdict`、`verdict_consistency` 与反证/反向不显著
 文案；L208 覆盖审计正常 `warnings`、列表/逐项 verdict 篡改 `fail`、旧
 artifact/缺文件 `not_verifiable_locally` 以及 `run_report`/CLI 接线。
-`python v12_supp.py plan` 仍 72/72 合成冻结记录、6 个比较。
+`python -m explib.confirmation plan` 仍 72/72 合成冻结记录、6 个比较。
 
 ## 2026-10-27 — 参数匹配基线的 SESOI/TOST 与设计期声明门（no new runs）
 
@@ -2954,7 +2954,7 @@ baseline panel 的等价结果不能授权整条主张。margin 仍需在看结�
 fail 或 warning、0.2% 差异停在 `sub_sesoi` 且不进入
 `verified_baselines`、2% 差异进入 `verified_baselines`，以及
 `sesoi={}` 恢复旧判定。`python audit_gates.py baseline_sesoi` 返回
-`ok`；`python audit_gates.py sesoi` 仍 `ok`；`python v12_supp.py plan`
+`ok`；`python audit_gates.py sesoi` 仍 `ok`；`python -m explib.confirmation plan`
 仍 72/72 合成冻结记录、6 个比较。
 
 ## 2026-10-27 — 坏例桶的 row-cluster 发现/复现推断与重放门（no new runs）
@@ -2995,7 +2995,7 @@ cluster units 重放均值、exact p、Holm、切分、选桶、replication 符�
 fail-closed、artifact 重放通过/篡改 `fail`/缺文件 `not_verifiable`、
 辅助家族缺输入时记录原因，以及 EA/BR Markdown 的 `replicated` 与边界
 文案。`python audit_gates.py error_case_inference` 对合成 artifact 返回
-`ok`、篡改后 `fail`；缺文件返回 `not_verifiable`。`python v12_supp.py
+`ok`、篡改后 `fail`；缺文件返回 `not_verifiable`。`python -m explib.confirmation
 plan` 的冻结计划/比较数不受影响。
 
 ## 2026-10-27 — 设计期功效把「分析能否运行」纳入：attrition-adjusted power（no new runs）
@@ -3003,7 +3003,7 @@ plan` 的冻结计划/比较数不受影响。
 零 GPU 的设计期方法学硬化；不新增训练、不读取 test split、不修改冻结清单
 的字节/种子/终点/alpha/Holm/覆盖规则，也不改 `CODE_SEMANTICS`。
 
-**Problem.** §68 的 `paired_design_sensitivity`、`v12_supp.py power` 与冻结
+**Problem.** §68 的 `paired_design_sensitivity`、`python -m explib.confirmation power` 与冻结
 功效门都条件在完整面板上。当前清单声明 `require_complete_coverage=true`，
 缺失一个配对就使该比较 unconfirmed，而不是用剩下的 k 个配对做小 n 确认；
 但已有读数仍报 `signflip_power(n,m,q,alpha)`，没有报「可运行且拒绝」的联合
@@ -3016,7 +3016,7 @@ plan` 的冻结计划/比较数不受影响。
 `P(K>=τ)`、联合功效 `Σ_{k>=τ} P(K=k)*signflip_power(k,m,q,alpha)`、期望完成
 配对数、达到目标所需最低 p、所需名义 n，以及 p=1.00/0.99/0.97/0.95/0.90 的
 压力表。`pair_retention` 必须显式声明；缺失时为 `not_declared`，不伪造通过；
-`require_attrition_power=true` 时才 fail-closed。`v12_supp.py power` 的每条
+`require_attrition_power=true` 时才 fail-closed。`python -m explib.confirmation power` 的每条
 方向性对照新增 `attrition` 块（q 优先取 pilot sign rate，缺失时退回
 `power_q_for_test`）；`audit_gates.audit_design_sensitivity()` 在每条对照和
 顶层汇总中接入，并支持可选的 `statistics.attrition.pair_retention` /
@@ -3033,7 +3033,7 @@ plan` 的冻结计划/比较数不受影响。
 新增 L212）：完整覆盖联合功效、5% 损失 0.882→0.476、8 配对下限与完整覆盖
 的不同失败模式、所需名义 n=13、最低保留率约 0.992、低于 Holm 下限的 warning、
 未声明/要求声明/满足三态、非法输入，以及 audit 清单三态。`python
-v12_supp.py plan` 仍 72/72 合成冻结记录、6 个比较；`python audit_gates.py
+python -m explib.confirmation plan` 仍 72/72 合成冻结记录、6 个比较；`python audit_gates.py
 report` 的 `sensitivity` 块已输出 attrition 压力表，当前清单未声明 retention，
 因此保持 warning 而非绿色通过。
 
@@ -3050,7 +3050,7 @@ random/all-block）进入统计与报告，却没有 `single_factor`/`factors` �
 **Fix.** 新增 `exp_lib.NIAH_INFERENCE_ARM_OVERRIDES` 与
 `apply_niah_inference_arm()`：推理臂切换时先把声明键重置为 checkpoint
 基线，再应用当前臂 override，避免同 seed 跨臂复用时残留上一臂的键。
-`v10_supp.py` 改用该共享表，不再在 probe 路径硬编码两行赋值。
+`python -m explib.corruption` 改用该共享表，不再在 probe 路径硬编码两行赋值。
 新增 `NIAH_CONTRAST_FACTORS` 与 `niah_contrast_factor_audit()`：推理期
 条目核对共享 override 的键集，trained/dense 条目通过 v7 工厂重算 AttnCfg
 diff；声明和实际键集双向一致、单因素标签落在同一 cfg 族内才 verified。
@@ -3102,4 +3102,4 @@ manifest。`requirements-ci.txt` 不再保存直接 pin，避免第二份列表�
 冲突声明 invalid；L140a CI 只引用 lock）。`python audit_gates.py
 dependencies` 返回 `status=ok`、`contract_status=ok`、
 `interpreter_status=match`，48 个 pin 与 50 个已安装分布一致（`ruff`
-作为开发工具排除）。`python v12_supp.py plan` 复跑确认计划/快照未变。
+作为开发工具排除）。`python -m explib.confirmation plan` 复跑确认计划/快照未变。

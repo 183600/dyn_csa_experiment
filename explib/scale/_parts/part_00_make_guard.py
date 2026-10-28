@@ -287,7 +287,7 @@ def _run_cli():
         print(f"[v8] unknown mode {mode!r}; expected one of {_MODES} (no argument means 'full').  Refusing to start a run.")
         raise SystemExit(2)
     if mode == 'phase' and len(sys.argv) < 3:
-        print(f"[v8] mode 'phase' needs a phase name, e.g. `python explib.scale.py phase P1S`.  Available: {[p[0] for p in PHASES]}")
+        print(f"[v8] mode 'phase' needs a phase name, e.g. `python -m explib.scale phase P1S`.  Available: {[p[0] for p in PHASES]}")
         raise SystemExit(2)
     print(f'[v8] mode={mode} repo={REPO} device={DEVICE} ({(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'cpu')})')
     try:

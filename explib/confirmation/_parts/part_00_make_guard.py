@@ -35,21 +35,21 @@
      （清单 scope 块）；动态分块/HCA 的优劣需要各自的预注册。
 
 模式：
-  python explib.confirmation.py smoke            # 端到端自检（微型 ckpt + 冻结清单副本）
-  python explib.confirmation.py plan             # 零 GPU 预检：戳/实现绑定/准入/功效/预算台账/证据等级，不读 test；
+  python -m explib.confirmation smoke            # 端到端自检（微型 ckpt + 冻结清单副本）
+  python -m explib.confirmation plan             # 零 GPU 预检：戳/实现绑定/准入/功效/预算台账/证据等级，不读 test；
                                       # 通过后自动把快照留档到 analysis_v12/plan_snapshot.json
-  python explib.confirmation.py dynamic-plan     # 零 GPU 预检动态/HCA 草稿：假设、专用对照、token/参数/读取预算、
+  python -m explib.confirmation dynamic-plan     # 零 GPU 预检动态/HCA 草稿：假设、专用对照、token/参数/读取预算、
                                       # disjoint-source/校准/功效前置；通过也只说明设计自洽，不是确认
-  python explib.confirmation.py power            # 零 GPU：用 P5C validation 差值做精确条件功效（同样不读 test）
-  python explib.confirmation.py full             # P5C -> P5H -> P5PW -> P5T -> P5MP -> P5S2/P5S3 -> report
-  python explib.confirmation.py auto             # 无人值守：与 full 同链，但把「plan 预检通过」的
+  python -m explib.confirmation power            # 零 GPU：用 P5C validation 差值做精确条件功效（同样不读 test）
+  python -m explib.confirmation full             # P5C -> P5H -> P5PW -> P5T -> P5MP -> P5S2/P5S3 -> report
+  python -m explib.confirmation auto             # 无人值守：与 full 同链，但把「plan 预检通过」的
                                       # 全部机器可查证据（清单哈希/代码戳/git 树/四个人工
                                       # 核对字段：arms/seeds/主比较/α）自动落盘为审计快照，
                                       # 人工核对变为事后异步，不再阻塞链的启动
-  python explib.confirmation.py phase P5C        # 单阶段（可断点续跑）
-  python explib.confirmation.py phase P5PW       # 仅功效预检
-  python explib.confirmation.py analysis         # 零 GPU：确认性统计 -> analysis_v12/
-  python explib.confirmation.py report           # 从落盘产物重建 REPORT_v12.md（零 GPU）
+  python -m explib.confirmation phase P5C        # 单阶段（可断点续跑）
+  python -m explib.confirmation phase P5PW       # 仅功效预检
+  python -m explib.confirmation analysis         # 零 GPU：确认性统计 -> analysis_v12/
+  python -m explib.confirmation report           # 从落盘产物重建 REPORT_v12.md（零 GPU）
 
 P5T 的防呆：代码语义戳与冻结清单不一致时拒绝运行（必须显式重冻结）；
 manifest 不存在时拒绝运行（不许「先看数据再补注册」）；清单不可确认、

@@ -374,7 +374,7 @@ def build_report(out='REPORT_v9.md', stats_p='analysis_v9/stats.json'):
     A('')
     A(f'> 生成时间：{time.strftime('%Y-%m-%d %H:%M:%S')}')
     A('> 参考论文：arXiv:2606.19348。**范围声明**：小规模 WikiText-103 上的受控研究，不是 DeepSeek-V4 的全量复现；结论不外推到其规模、语料、长上下文训练或生产系统。')
-    A('> 说明：本报告全部数字由 `explib.resume.py report` 从 `results_*/`、`analysis_v9/` 的落盘产物计算得到，无手填数值。')
+    A('> 说明：本报告全部数字由 `python -m explib.resume report` 从 `results_*/`、`analysis_v9/` 的落盘产物计算得到，无手填数值。')
     A('')
     _r_n = sorted({p['n'] for p in rope.values()}) if rope else []
     _r_n_txt = (str(_r_n[0]) if len(_r_n) == 1 else f'{_r_n[0]}–{_r_n[-1]}') if _r_n else '0'
@@ -508,7 +508,7 @@ def build_report(out='REPORT_v9.md', stats_p='analysis_v9/stats.json'):
     A(f"| `results_lm_v9_seq2k/` | P2T 完整 topk 扫描（bs=1，5 变体{f' × {_s2k_seeds}' if _s2k_seeds else ''}） |")
     A(f'| `results_lm_v8_rope20k/` | P2S3 追加 seed 2 后的 {_r20_seeds + ' ' if _r20_seeds else ''}RoPE 20k 面板 |')
     A('| `analysis_v9/stats.json` | 上述面板的配对符号翻转检验 |')
-    A('| `explib.resume.py` | 本阶段驱动（smoke/phase/analysis/report，可断点续跑） |')
+    A('| `python -m explib.resume` | 本阶段驱动（smoke/phase/analysis/report，可断点续跑） |')
     A('')
     L.atomic_write_text(out, '\n'.join(lines) + '\n')
     print(f'[v9 report] wrote {out}')
@@ -620,7 +620,7 @@ def _run_cli():
         print(f"[v9] unknown mode {mode!r}; expected one of {_MODES} (no argument means 'full').  Refusing to start a run.")
         raise SystemExit(2)
     if mode == 'phase' and len(sys.argv) < 3:
-        print(f"[v9] mode 'phase' needs a phase name, e.g. `python explib.resume.py phase P2T`.  Available: {[p[0] for p in PHASES]}")
+        print(f"[v9] mode 'phase' needs a phase name, e.g. `python -m explib.resume phase P2T`.  Available: {[p[0] for p in PHASES]}")
         raise SystemExit(2)
     print(f'[v9] mode={mode} repo={REPO} device={DEVICE} ({(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'cpu')})')
     try:

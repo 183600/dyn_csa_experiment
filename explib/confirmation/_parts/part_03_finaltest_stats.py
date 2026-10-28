@@ -937,7 +937,7 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
     A('')
     A(f'> 生成时间：{time.strftime("%Y-%m-%d %H:%M:%S")}')
     A('> 参考论文：arXiv:2606.19348。**范围声明**：小规模 WikiText-103 上的受控研究，不是 DeepSeek-V4 的全量复现；结论不外推到其规模、语料、长上下文训练或生产系统。')
-    A('> 说明：本报告全部数字由 `explib.confirmation.py report` 从 `results_lm_test/`、`results_v10_mech/`、`analysis_v12/` 的落盘产物计算得到，无手填数值。')
+    A('> 说明：本报告全部数字由 `python -m explib.confirmation report` 从 `results_lm_test/`、`results_v10_mech/`、`analysis_v12/` 的落盘产物计算得到，无手填数值。')
     A('')
     A('本驱动的确认性协议：v7→v11 的全部面板与 v10/v12 的机制扩展属于**探索性**证据；本报告只报告**冻结后**在 held-out test split（wiki.test.raw，其它 phase 不读）上的一次性确认评估。')
     A('')
@@ -979,7 +979,7 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
             A('| （冻结清单不可读——见运行日志） |')
         A('')
     else:
-        A(f'**尚未运行 P5T**：`{TEST_OUTDIR}/bylen.json` 不存在（或为空）。前置：`python explib.confirmation.py phase P5C`（覆盖全部六个冻结臂、种子取自清单），再跑 `python explib.confirmation.py phase P5T`（首次评估会写入冻结锁 `.freeze_lock.json`，此后清单不可再改）。')
+        A(f'**尚未运行 P5T**：`{TEST_OUTDIR}/bylen.json` 不存在（或为空）。前置：`python -m explib.confirmation phase P5C`（覆盖全部六个冻结臂、种子取自清单），再跑 `python -m explib.confirmation phase P5T`（首次评估会写入冻结锁 `.freeze_lock.json`，此后清单不可再改）。')
         A('')
     A('---')
     A('')
@@ -1011,7 +1011,7 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
             A('| `%s` | %s | %s | ' % (v, _p0 if _p0 is not None else '—', _n0 if _n0 is not None else '—') + ' | '.join(row) + ' |')
         A('')
     else:
-        A(f'**尚未运行 P5T**：`{TEST_OUTDIR}/bylen.json` 不存在（或为空）。前置：`python explib.confirmation.py phase P5C`（现覆盖全部六个冻结臂、种子数取自清单；主臂 0-5 已由 P3MT/P4MT 训练，resume 自动跳过），然后 `python explib.confirmation.py phase P5T`。冻结清单已入库（见上），随时可以执行；执行前请勿据任何 validation 读数调整冻结内容。')
+        A(f'**尚未运行 P5T**：`{TEST_OUTDIR}/bylen.json` 不存在（或为空）。前置：`python -m explib.confirmation phase P5C`（现覆盖全部六个冻结臂、种子数取自清单；主臂 0-5 已由 P3MT/P4MT 训练，resume 自动跳过），然后 `python -m explib.confirmation phase P5T`。冻结清单已入库（见上），随时可以执行；执行前请勿据任何 validation 读数调整冻结内容。')
         A('')
     comps = ft.get('comparisons') or {}
     if comps:
@@ -1213,7 +1213,7 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
     A('| `analysis_v12/test_stats.json` | 冻结主比较 + Holm 校正（含准入记录、逐文档 doc_sampling 与功效注记） |')
     A('| `confirmation_frozen.json` | 预注册冻结清单（含修订史、范围声明与机器可校验的绑定块） |')
     A('| `results_lm_test/.freeze_lock.json` | 首次测试访问锁（清单哈希 + test 切片指纹；gitignore 的结果目录内，不入库） |')
-    A('| `explib.confirmation.py` | 本驱动（smoke/phase/analysis/report，可断点续跑） |')
+    A('| `python -m explib.confirmation` | 本驱动（smoke/phase/analysis/report，可断点续跑） |')
     A('')
     L.atomic_write_text(out, '\n'.join(lines) + '\n')
     print(f'[v12 report] wrote {out}')

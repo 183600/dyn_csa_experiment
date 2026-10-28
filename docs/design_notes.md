@@ -305,7 +305,7 @@ revision。它与 §8 的证据分级一致：**不可验证就说不可验证**
 ## 8. 仓库边界
 
 仓库只承载**源码、驱动脚本与设计文档**：实验结果目录、分析目录、逐版
-报告、运行状态文件都不入库（`.gitignore` 白名单保证，`docs/` 仅留 `design_notes.md`；原 `compute_plan.md` 已退役并从仓库删除）。
+报告、运行状态文件都不入库（`.gitignore` 白名单保证，`docs/` 仅留 `design_notes.md`；原算力规划文档已退役并从仓库删除）。
 实测数字一律由零 GPU 的报告构建器从落盘产物现算，不写死在任何仓库
 文件中——写死的数字在仓库内没有可复核的来源，代码一改就会与报告静默
 矛盾。
@@ -501,7 +501,7 @@ Holm 校正后）不得写成确认。确认性证据只能来自：
   （重冻结必须显式改清单）；test split 评估之后**禁止**追加冻结比较或
   种子（那是选择偏差的定义），缺种子就如实报小 n。
 
-**评审二轮后的三条硬约束（v12_supp 代码化，不再只是约定）**：
+**评审二轮后的三条硬约束（explib.confirmation 代码化，不再只是约定）**：
 
 1. **功效门槛（意见一）**：加载清单即校验「该方案是否数学上可能确认」
    （min attainable Holm p = m·2/2^n 与 α 比较；`exp_lib.holm_min_
@@ -722,7 +722,7 @@ z（n=6 时 90% t 区间比 z 区间宽约 20%，用 z 会把「未判等价」�
   大规模结论自身的不确定性声明。
 - **外部有效性边界（意见十一）**：全部机制结论出自 WikiText-103 小模型
   （BPE-8k，d≤512）。跨语料、跨规模、跨任务的推广是**主张外的**——
-  B 档规模面板（`m0_supp.py`；FineWeb-Edu、0.14B+）是为此设计的独立
+  B 档规模面板（`python -m explib.m0`；FineWeb-Edu、0.14B+）是为此设计的独立
   验证路径，其判据见 §16 的口径约束；在此之前，标题与摘要不得把机制
   结论写成通用规律。
 - **九领域审计入口（意见十一）**：`audit_gates.py` 把数据泄漏（分词器
@@ -1098,7 +1098,7 @@ historical configuration, so the closed path is unchanged.
 
 ### 24.5 Running the matrix
 
-`open_block_supp.py` defines the main matrix:
+`python -m explib.open_block` defines the main matrix:
 
 ```
 max_block: 32  → closed
@@ -1111,12 +1111,12 @@ Commands:
 
 ```bash
 python test_open_block.py                 # K1-K14 causality/reference/mask/analysis gates
-python open_block_supp.py smoke           # all 8 cells, synthetic, a few steps
-python open_block_supp.py pilot --seeds 0 --steps 100
-python open_block_supp.py main --seeds 0,1,2,3 --steps 1500
-python open_block_supp.py report
-python open_block_supp.py aux             # outside-window auxiliary panel
-python open_block_supp.py extended        # contingency: 4 caps x 3 modes
+python -m explib.open_block smoke           # all 8 cells, synthetic, a few steps
+python -m explib.open_block pilot --seeds 0 --steps 100
+python -m explib.open_block main --seeds 0,1,2,3 --steps 1500
+python -m explib.open_block report
+python -m explib.open_block aux             # outside-window auxiliary panel
+python -m explib.open_block extended        # contingency: 4 caps x 3 modes
 ```
 
 `main` is resumable and refuses a record whose code stamp / recipe
@@ -1356,7 +1356,7 @@ statement / mechanism / predicted_sign / primary_metric / falsifier：
 2. 在相同 top-k 预算下，singleton 表示优于 pooled summary；
 3. 取消最大块长后，summary 的收益应更大（交互项为负）。
 
-`open_block_supp.py report` 调用 `hypothesis_audit`，把审计与逐条假设写入
+`python -m explib.open_block report` 调用 `hypothesis_audit`，把审计与逐条假设写入
 `stats.json` 和 Markdown；`audit_gates.hypotheses` 也覆盖这张表。描述性
 单元（其它块长 × 读取规则）仍不进入 Holm 家族，也不得被写成方向性结论。
 
@@ -1608,7 +1608,7 @@ resolution-limited；调用方给出的最低 n 门槛不能再只停留在说�
 
 ### 29.8 开放块主族的族下限也必须使用非零差值计数
 
-`open_block_supp._family_holm_floor` 过去只接收各主对比的配对 `n`。零差值
+`explib.open_block._family_holm_floor` 过去只接收各主对比的配对 `n`。零差值
 不改变符号翻转 p，却降低可达分辨率；当某主对比有大量 ties 时，按 `n`
 计算会把族下限说得比实际更细。现在 helper 同时接受旧式整数与结果字典：
 字典形式优先使用 `n_nonzero`（全零映射为 1，下限 1），越界/缺失才回退
@@ -1616,7 +1616,7 @@ resolution-limited；调用方给出的最低 n 门槛不能再只停留在说�
 
 ## 30. M0 规模分析由声明驱动，不再写死 S1/S2（本轮硬化）
 
-`m0_supp.scale_analysis` 过去在三个位置硬编码 S1/S2：默认 summary 发现、
+`explib.m0.scale_analysis` 过去在三个位置硬编码 S1/S2：默认 summary 发现、
 跨规模点的计划种子数、预算阶梯审计。以后增加 S3/S4 时，新 tier 会从
 「计划 vs 实际」检查中静默消失。现在从 `exp_lib.SCALE_LADDER` 的 tier
 名发现对应的 `RUN_<TIER>` 配置（不会误收 `RUN_SCALE` / `RUN_LONG` /
@@ -1801,7 +1801,7 @@ accuracy 无法区分「真的检索到了远端信息」与「答案类别频�
 - `majority_accuracy`（总是猜出现最多的答案 token）与对应 lift；
 - `answer_support` / `per_class_recall`，供审计重算。
 
-`v10_supp.py` 的 NIAH cell 记录写入这些字段，报告表并列展示 micro acc、
+`python -m explib.corruption` 的 NIAH cell 记录写入这些字段，报告表并列展示 micro acc、
 macro-recall、uniform chance 与 majority floor。`metric_policy_audit` 对
 新记录重算 `acc = n_correct/n_queries`、chance/majority floor 与 macro
 recall；手改 accuracy 或 floor 会失败。没有这些字段的旧记录被列为
@@ -1811,7 +1811,7 @@ recall；手改 accuracy 或 floor 会失败。没有这些字段的旧记录被
 
 之前 NIAH 的配对统计只检验 answer NLL，但 `METRIC_POLICY` 声明的主端点是
 top-1 accuracy；这会出现「NLL 显著、accuracy 无差异」却被写成检索收益的
-错位。`v10_supp.py stats` 现在同时构造逐种子配对 accuracy 对比
+错位。`python -m explib.corruption analysis` 现在同时构造逐种子配对 accuracy 对比
 （`accuracy_contrasts`），并与 NLL 对比一起进入同一个 Holm 族；报告分别
 列出两种端点，避免用次级 NLL 代替主端点结论。
 
@@ -1890,7 +1890,7 @@ dynamic-vs-fixed 对照（只差分段束）仍为单因素。契约的职责是
 
 v12 的清单为每条 primary comparison 手写 `mechanism_claim_allowed` 与
 `interpretation_caveat`；此前没有任何机器检查把标志与臂定义对账。现在
-`v12_supp.py plan`（零 GPU，读不到任何 test 数据）为每条比较计算：
+`python -m explib.confirmation plan`（零 GPU，读不到任何 test 数据）为每条比较计算：
 
 - attention-cfg diff 键集是否落在**一个**声明的干预族内
   （`exp_lib.cfg_keys_single_factor`；`kind` 互换按定义不属于任何族）；
@@ -1956,7 +1956,7 @@ macro recall（balanced accuracy）、均匀/多数类地板和 answer NLL，但
 `f1_micro == acc`。缺少 F1 的旧记录标为 legacy（不是通过）；声称 F1
 却没有 per-class 计数的记录标为不可复核。PR-AUC/ROC-AUC 仍不伪造：
 top-1 记录没有每类分数，硬造 one-vs-rest 分数会改变被测对象。
-`v10_supp.py` 的 NIAH 记录与报表同步持久化并展示 macro/weighted F1。
+`python -m explib.corruption` 的 NIAH 记录与报表同步持久化并展示 macro/weighted F1。
 
 ### 38.2 「战胜调参过的计数地板」是独立预注册假设
 
@@ -2076,8 +2076,8 @@ scope 声明同时成立。
 
 ```bash
 python audit_gates.py design          # 主清单 + 动态 draft 的预算/证据/假设审计
-python v12_supp.py plan               # 冻结清单 preflight（现在也包含预算台账与证据等级）
-python v12_supp.py dynamic-plan       # 动态 draft 的设计 preflight（不读 test）
+python -m explib.confirmation plan               # 冻结清单 preflight（现在也包含预算台账与证据等级）
+python -m explib.confirmation dynamic-plan       # 动态 draft 的设计 preflight（不读 test）
 python test_review_fixes.py           # L82-L97 覆盖上述合约
 ```
 
@@ -2223,8 +2223,8 @@ nested，其余一律 `full_validation`（missing/mixed 的显式 fallback 不�
 ### 41.5 入口与验证
 
 ```bash
-python v12_supp.py plan              # 冻结预检（参数绑定 + 原有功效/预算门）
-python v12_supp.py dynamic-plan      # 动态 draft 仍不可运行
+python -m explib.confirmation plan              # 冻结预检（参数绑定 + 原有功效/预算门）
+python -m explib.confirmation dynamic-plan      # 动态 draft 仍不可运行
 python test_review_fixes.py          # L104-L106 覆盖上述合约
 python test_open_block.py            # 15/15
 ```
@@ -2284,7 +2284,7 @@ p 都可能很好看，但结论对那一个种子高度敏感。报告若不写
 
 ### 42.4 与冻结决策的边界
 
-- `v12_supp.finaltest_stats` 只在原有 `confirmed` 算完之后追加
+- `explib.confirmation.finaltest_stats` 只在原有 `confirmed` 算完之后追加
   `stats['robustness']`；`confirmed`、`p`、`p_holm`、Holm 族、α 与
   `min_seeds_for_confirmation` 全部不改写。报告中的新表明确标注
   「post-hoc 诊断；不改变上面的冻结判定」。当
@@ -2303,7 +2303,7 @@ p 都可能很好看，但结论对那一个种子高度敏感。报告若不写
 
 ### 42.5 文档层广度：均值是否被单个文档支撑
 
-`v12_supp._doc_level_analysis` 新增 `doc_delta_negative/positive/zero`、
+`explib.confirmation._doc_level_analysis` 新增 `doc_delta_negative/positive/zero`、
 `doc_a_better_fraction`、`per_doc_delta_median` 与
 `top_doc_abs_share = max|Δ_doc| / Σ|Δ_doc|`。这些是描述性读数（文档不是臂的
 随机化单位），但能暴露「一个文档贡献了几乎全部均值差」的赢法；逐文档
@@ -2314,7 +2314,7 @@ bootstrap 区间仍然以已训练种子为条件。p5t 主表的「文档 Δ 95
 
 ```bash
 python test_review_fixes.py     # L107-L109
-python v12_supp.py plan         # 冻结预检不变：72/72 合成记录、6 个主比较
+python -m explib.confirmation plan         # 冻结预检不变：72/72 合成记录、6 个主比较
 ```
 
 L107 覆盖 drop/flip/LOO、种子对齐、非法输入、族门投影（n=6 无法通过
@@ -2351,7 +2351,7 @@ Holm/6 时返回 None），以及
   `n_tokens_per_doc` / `ppl_per_doc` / `doc_ids` / `n_docs`。池化 `ppl`、
   `n_tok`、`nll_sum`、`nll_per_seq`、`ppl_per_seq` 不变；新字段只是同一
   批预测的另一种分组。
-- `v12_supp._doc_level_analysis` 优先使用 `ppl_per_doc`；若记录混合了
+- `explib.confirmation._doc_level_analysis` 优先使用 `ppl_per_doc`；若记录混合了
   文档级与行级、或逐文档 token 数/文档顺序不一致，则拒绝配对，而不是
   按位置硬配。`granularity` 明确写出 `document` 或 `row`；报告中的
   「文档/行 Δ 95% CI」和「% Δ<0」使用对应的单位。
@@ -2371,7 +2371,7 @@ Holm/6 时返回 None），以及
 
 ```bash
 python test_review_fixes.py     # L111 逐 token 对齐、L112 跨行/混合文档聚合、L113 粒度拒绝
-python v12_supp.py plan         # 冻结预检不受影响
+python -m explib.confirmation plan         # 冻结预检不受影响
 ```
 
 ## 44. 文档级 Δ 区间必须与主终点同口径（token 池化 cluster）
@@ -2388,7 +2388,7 @@ python v12_supp.py plan         # 冻结预检不受影响
   种子平均后的方差为 `D/(D−1)·Σ_i ψ_i²`，用 `df=D−1` 的 t 临界值；同时
   给出种子平均 log-ratio 与 PPL ratio 区间。它不重采样、结果确定，且
   明确条件在已训练的种子上：种子间训练随机性仍由精确符号翻转检验负责。
-- `v12_supp._doc_nll_matrix` 在使用前校验逐文档 NLL 有限、逐文档 NLL 之和
+- `explib.confirmation._doc_nll_matrix` 在使用前校验逐文档 NLL 有限、逐文档 NLL 之和
   与单元记录的 `nll_sum` 一致、`ppl_per_doc = exp(nll_i/t_i)` 一致。任一
   不通过就拒绝计算，并写出 `pooled_ci_unavailable_reason`；绝不从错位的
   向量算出一个看起来正常的区间。
@@ -2412,7 +2412,7 @@ python v12_supp.py plan         # 冻结预检不受影响
 
 ```bash
 python test_review_fixes.py     # L113 准入、L115 cluster CI、L116 集成、L117 报告口径
-python v12_supp.py plan         # 冻结预检不受影响
+python -m explib.confirmation plan         # 冻结预检不受影响
 ```
 
 ## 45. 设备端分块轨道上界与 pooled-CI 来源守卫
@@ -2454,7 +2454,7 @@ python v12_supp.py plan         # 冻结预检不受影响
 ```bash
 python test_review_fixes.py     # L116 缺失 ppl 拒绝、L118 设备/宿主分块一致（n=10003）
 python test_open_block.py       # 分块与开块回归
-python v12_supp.py plan         # 冻结预检不变：72/72、6 个主比较
+python -m explib.confirmation plan         # 冻结预检不变：72/72、6 个主比较
 ```
 
 ## 46. 配对初始化的证据必须随权重走，并按种子核验
@@ -2527,8 +2527,8 @@ python v12_supp.py plan         # 冻结预检不变：72/72、6 个主比较
 
 ```bash
 python test_review_fixes.py     # L119 三值审计、L120 确认层剔除/未验证语义
-python v12_supp.py plan         # 冻结预检不变
-python v12_supp.py smoke        # P5T 往返仍覆盖，smoke 记录不可入确认
+python -m explib.confirmation plan         # 冻结预检不变
+python -m explib.confirmation smoke        # P5T 往返仍覆盖，smoke 记录不可入确认
 ```
 
 ## 47. 面向放大的分块/侧车/宿主几何：不要按 token 或 block 建 Python 列表
@@ -2566,7 +2566,7 @@ AttributeError，但 `MemoryError`（以及 `OverflowError`）不在此列：规
 
 ### 47.4 参数审计的档位必须从阶梯发现（S10 也按数值排序）
 
-`m0_supp.run_params` 过去遍历字面量 `('S1', 'S2', 'S3', 'S4')`。新增
+`explib.m0.run_params` 过去遍历字面量 `('S1', 'S2', 'S3', 'S4')`。新增
 `SCALE_LADDER` 档位时，面板解析器和 `scale_ladder_audit` 已能发现，但
 planned-vs-observed 参数量表会静默漏掉该档。现在档位列表由
 `SCALE_LADDER` 生成并按数值排序（`S2` 在 `S10` 前）；没有记录规划值的
@@ -2581,7 +2581,7 @@ planned-vs-observed 参数量表会静默漏掉该档。现在档位列表由
 ```bash
 python test_review_fixes.py     # L121 大行分块 + MemoryError 回退；L122 阶梯发现/排序
 python test_open_block.py       # 分块与开块回归
-python v12_supp.py plan         # 冻结预检不变：72/72、6 个主比较
+python -m explib.confirmation plan         # 冻结预检不变：72/72、6 个主比较
 ```
 
 ## 48. 运行顺序也是实验设计变量：按种子分块并随机化
@@ -2590,7 +2590,7 @@ python v12_supp.py plan         # 冻结预检不变：72/72、6 个主比较
 
 精确符号翻转检验的交换性前提（§20）要求同一种子下两臂除臂本身外一切
 随机因素相同。代码把数据顺序、初始化 RNG、评测行与腐坏网格都按种子对齐
-了，但**日历时间**从未进入设计的机器检查：`v7_supp.run_lenphase`
+了，但**日历时间**从未进入设计的机器检查：`explib.rope.run_lenphase`
 （v12 P5C 的训练入口）原来的单元格顺序是
 `[(v, seed) for v in variants for seed in seeds]`，即「臂 A 的全部种子跑完，
 再跑臂 B 的全部种子」。同一 pair 的两臂因此落在相隔数小时甚至数天的两个
@@ -2629,7 +2629,7 @@ block 的臂顺序）、`planned_cells`、`cell_blocks` 与 `cell_variants`。
 
 入口接线：
 
-- `v7_supp.run_lenphase`（v12 P5C 使用）先写计划，再按 `planned_cells`
+- `explib.rope.run_lenphase`（v12 P5C 使用）先写计划，再按 `planned_cells`
   的顺序执行；`_write_phase_manifest(planned_cells=...)` 也使用同一顺序。
 - `exp_lib.run()`（v6/v8/v9/v10/m0 等通用面板）在 `_plan_run` 之后写同一
   计划，并把待跑单元格按计划顺序排序；训练数值、resume 键和 `run_cfg`
@@ -2663,7 +2663,7 @@ block 的臂顺序）、`planned_cells`、`cell_blocks` 与 `cell_variants`。
 python test_review_fixes.py       # L123 计划/位置平衡/畸形输入；L124 审计的区组、
                                   #     重训去重、arm-major、无计划不可核验
 python audit_gates.py run_order   # 零 GPU：计划 + 实际顺序审计
-python v12_supp.py plan           # 冻结预检不变：72/72、6 个主比较
+python -m explib.confirmation plan           # 冻结预检不变：72/72、6 个主比较
 ```
 
 边界：48 是运行顺序的设计与审计，不触碰训练/评测数值路径、
@@ -2731,7 +2731,7 @@ python v12_supp.py plan           # 冻结预检不变：72/72、6 个主比较
 - `code_provenance()` 的 `code.source_tree` 记录 `sha256` / `n_files` /
   `bytes` / `scope`。它只进入 provenance，不进入 `run_cfg`、resume
   fingerprint 或 `exec_fp`，所以既有 cell 的 resume/pairing 完全不变。
-- `v12_supp.py plan` 的 `analysis_v12/plan_snapshot.json` 额外落盘完整
+- `python -m explib.confirmation plan` 的 `analysis_v12/plan_snapshot.json` 额外落盘完整
   `source_tree` 和 `dependency_contract`，让「机器在批准计划时看到的是
   哪份源码/哪个环境」可异步复核。
 - `exp_lib.parse_requirements_lock()` / `dependency_contract()`：解析
@@ -2775,7 +2775,7 @@ admission 判定。它也不把测试文件、README、docs 或 CI 配置纳入�
 ```bash
 python audit_gates.py source        # 与 plan_snapshot 的源码树比对
 python audit_gates.py dependencies  # lock 与已安装版本比对
-python v12_supp.py plan             # 预检不变：72/72、6 个主比较；快照含源码树/依赖契约
+python -m explib.confirmation plan             # 预检不变：72/72、6 个主比较；快照含源码树/依赖契约
 python test_review_fixes.py         # L137–L140a 覆盖摘要、lock 解析、门禁、完整 lock 与 CI 入口
 python -m pip install --dry-run --no-deps -r requirements.lock  # 验证每条 pin 可解析
 ```
@@ -2823,7 +2823,7 @@ provenance，仍未让它参与 freeze lock 的判定。
 
 ### 51.2 改动：首次访问时绑定，之后按阶段拒绝/披露
 
-`v12_supp._check_or_write_freeze_lock*` 现在：
+`explib.confirmation._check_or_write_freeze_lock*` 现在：
 
 - 在**第一次写入**（`preaccess`，即任何 test 读取之前）把
   `exp_lib.source_tree_manifest()` 的完整清单写入锁的 `source_tree`，
@@ -2864,7 +2864,7 @@ bump `CODE_SEMANTICS`。源码树摘要不进入 `run_cfg`、resume fingerprint 
 ```bash
 python test_review_fixes.py       # L141 锁绑定/漂移拒绝/披露/重冻结；L142 审计与旧锁边界
 python audit_gates.py source      # 有锁时按锁内源码树核验；无摘要则 not_verifiable
-python v12_supp.py plan           # 预检不变：72/72、6 个主比较
+python -m explib.confirmation plan           # 预检不变：72/72、6 个主比较
 ```
 
 ## 52. 结果分析要检验「效应是否随条件改变」，而不是比较两个显著性（本轮方法硬化）
@@ -2902,7 +2902,7 @@ condition_values=..., seeds=..., min_n=6)` 接收「每个条件一个逐种子�
 非有限值不是测量。`condition_values` 缺失/不单调/少于三个不同值时不报
 斜率，但交互仍然可算，原因写进 `trend_reason`。
 
-`v12_supp._length_interaction_analysis()` 把每个长度的 PPL 转成
+`explib.confirmation._length_interaction_analysis()` 把每个长度的 PPL 转成
 `log(PPL_a) − log(PPL_b)`（正 = a 更差），以训练长度 512 为参考（不在
 面板时退回最短长度），轴为 `log2(eval length)`。这样跨长度的效应可比，
 且交互不会被基线 PPL 随长度增长所污染。结果作为
@@ -2926,8 +2926,8 @@ condition_values=..., seeds=..., min_n=6)` 接收「每个条件一个逐种子�
 
 ```bash
 python test_review_fixes.py     # L149 effect_modification；L150 长度交互/渲染
-python v12_supp.py analysis     # 在 test_stats.json 增加 length_interaction（不读新数据）
-python v12_supp.py report       # 全长度曲线后追加 post-hoc 交互表
+python -m explib.confirmation analysis     # 在 test_stats.json 增加 length_interaction（不读新数据）
+python -m explib.confirmation report       # 全长度曲线后追加 post-hoc 交互表
 ```
 
 L149 覆盖：恒定效应的零交互、线性增长效应、Holm 族、逐种子趋势、缺失
@@ -3122,7 +3122,7 @@ cache-build 对偶：直接从 raw rows + 每行 token 长度构造同样的映�
 
 ### 54.4 评测记录：文章字段是**追加**的
 
-`v7_supp.eval_length_gen(..., article_ids=...)` 在原有
+`explib.rope.eval_length_gen(..., article_ids=...)` 在原有
 `nll_per_doc` / `n_tokens_per_doc` / `ppl_per_doc` / `doc_ids` **之外**
 追加：
 
@@ -3194,7 +3194,7 @@ token 计数为正整数且精确分割 `n_tok`、NLL 有限且重构 `nll_sum`�
 
 ```bash
 python test_review_fixes.py     # L153 文章原语/重建；L154 评测字段 + 分析偏好
-python v12_supp.py plan         # 零 GPU、不读 test，冻结计划不变
+python -m explib.confirmation plan         # 零 GPU、不读 test，冻结计划不变
 python audit_gates.py report     # 其余审计不变
 ```
 
@@ -3529,7 +3529,7 @@ unit_ids=..., conf=0.95, top_k=5)`：
 
 ### 57.3 接入 v12 分析、报告与审计
 
-- `v12_supp._doc_level_analysis` 只在 pooled cluster CI 已经与记录的主
+- `explib.confirmation._doc_level_analysis` 只在 pooled cluster CI 已经与记录的主
   终点逐值对齐时计算影响块（否则影响属于另一个估计量）；单位 id 取
   `article_ids`（优先）或 `doc_ids`，要求唯一且顺序已跨臂/种子核对。
   行级（`row`）单元没有 token 池化主终点，不生成该块。
@@ -3539,7 +3539,7 @@ unit_ids=..., conf=0.95, top_k=5)`：
   `fragile_to_one_unit`；`label_source` 区分 `provided` 与
   `index_fallback`。不可用时写 `unit_influence_unavailable_reason`，
   不静默省略。
-- `v12_supp._doc_influence_markdown` 在 REPORT_v12 的结论稳健性表之后
+- `explib.confirmation._doc_influence_markdown` 在 REPORT_v12 的结论稳健性表之后
   渲染「单元影响诊断」：最敏感单位、删除后 Δ、最大单单位变化、删除后
   是否同向、jackknife 区间与标记。`单单元主导` 行会额外给出「引用时必须
   同时报告该敏感度，不能描述为对评测文档稳健」的提示。
@@ -4140,7 +4140,7 @@ L186 覆盖：覆盖率门的已知值（0.95 通过、0.70 fail、保守通过�
 - 逐口径的 `sign`、`excludes_zero`、`available/reason`，以及反向/跨零的
   口径名单。
 
-`v12_supp._doc_level_analysis` 现在把 8 条口径写入
+`explib.confirmation._doc_level_analysis` 现在把 8 条口径写入
 `doc_sampling.analysis_choice_concordance`：逐种子 mean（主口径）、
 median、trimmed mean，token 池化，逐单元 mean、median、log-ratio、
 win-balance（`(n_positive - n_negative) / n_units`，负号表示 a 更常更低；全平局为 0）。
@@ -4176,7 +4176,7 @@ win-balance（`(n_positive - n_negative) / n_units`，负号表示 a 更常更�
 
 ```bash
 python audit_gates.py analysis_choices   # 零 GPU；读 analysis_v12/test_stats.json
-python v12_supp.py report                # 报告新增「分析口径一致性」表
+python -m explib.confirmation report                # 报告新增「分析口径一致性」表
 python test_review_fixes.py              # L188
 ```
 
@@ -4390,7 +4390,7 @@ L191 覆盖：p1 完整 verified、p2 完整但显著反方向时 A 被标为
 ```bash
 python audit_gates.py split              # 每个 cache 含 passage_overlap
 python test_review_fixes.py              # L193
-python v12_supp.py plan
+python -m explib.confirmation plan
 ```
 
 L193 覆盖：干净随机 split 的 passage `ok`；复制一段 train 后只改一个 token
@@ -4510,7 +4510,7 @@ margin」。
 python audit_gates.py interaction_sesoi   # 设计期：覆盖/单位/方向
 python audit_gates.py report              # 汇总含 interaction_sesoi
 python test_review_fixes.py               # L195-L197
-python v12_supp.py plan                   # 冻结计划预检不受影响
+python -m explib.confirmation plan                   # 冻结计划预检不受影响
 ```
 
 L195 覆盖默认声明全通过、绝对 log margin、缺 margin/歧义单位/NaN/布尔/
@@ -4520,7 +4520,7 @@ L196 覆盖正向支持/反向冲突/亚 SESOI/精确可加/不确定/n<min_n/�
 列表不重复/畸形声明 fail，以及三个重复 factorial 下超显著性与 TOST
 两个族的 m=3 Holm。L197 覆盖直接判定原语、单次迭代器、相对 margin 换算、
 畸形族 p 的 fail-closed、方向/ margin 输入校验与 normaliser 幂等。
-完整 CPU 套件 546/546 通过（0 skipped）；`python v12_supp.py plan` 仍
+完整 CPU 套件 546/546 通过（0 skipped）；`python -m explib.confirmation plan` 仍
 72/72 合成冻结记录、6 个比较。
 
 ## 68. 设计期功效必须对实际 margin 负责：MDE、精度与所需种子数
@@ -4531,7 +4531,7 @@ L196 覆盖正向支持/反向冲突/亚 SESOI/精确可加/不确定/n<min_n/�
 
 - `planned_power_audit` 检查冻结的 n/m/α、`2/2^n` 与 Holm 下限是否自洽，
   以及声明的 q 处投影功效是否达到 `min_power_for_test`；
-- `v12_supp.py power` 在 validation 差值上枚举 `2^12` 个符号模式，给出
+- `python -m explib.confirmation power` 在 validation 差值上枚举 `2^12` 个符号模式，给出
   条件功效与最小同向种子数。
 
 两者都回答「这个计划在某个 q 下有多大概率通过第一道 Holm 门」，但没有
@@ -4576,7 +4576,7 @@ SESOI 处功效不足都判 fail；默认 false 时只给 warning，并把
 
 ### 68.3 接线
 
-- `v12_supp.py power` 的每条对照新增 `sensitivity` 块，用冻结的 n、m 与
+- `python -m explib.confirmation power` 的每条对照新增 `sensitivity` 块，用冻结的 n、m 与
   同一条 validation 差值向量计算上述读数；不改变原有 q=0.95 功效门槛。
   若 sensitivity 自身 fail（例如声明了 SESOI 但计划在 margin 处欠功效），
   `all_pass` 会变 false，避免“声明了实际显著性却完全不检查”。
@@ -4592,7 +4592,7 @@ SESOI 处功效不足都判 fail；默认 false 时只给 warning，并把
 
 - **MDE 与 q_sesoi 是正态符号模型近似。** `signflip_power` 本身是等幅
   符号检验投影；`|d_i|` 不等时它是真实 sign-flip 功效的上界。MDE 不是精确
-  sign-flip 效应量，只是设计期标尺，不能替代 `v12_supp.py power` 的
+  sign-flip 效应量，只是设计期标尺，不能替代 `python -m explib.confirmation power` 的
   条件功效或最终数据。
 - **不是事后功效。** 函数只接受 pilot/validation 差值或显式 SD，不读取
   test 结果；审计入口也不调用 `load_wikitest`。它不改变任何 PPL、种子、
@@ -4620,14 +4620,14 @@ SESOI 处功效不足都判 fail；默认 false 时只给 warning，并把
 python audit_gates.py sensitivity   # 设计期：功效曲线/MDE/精度/SESOI
 python audit_gates.py report        # 汇总含 sensitivity
 python test_review_fixes.py         # L198/L199
-python v12_supp.py plan             # 冻结计划预检不变
+python -m explib.confirmation plan             # 冻结计划预检不变
 ```
 
 L198 覆盖：12×6 的精确下限、功效曲线与公开 `signflip_power` 对账、
 pilot 同向率/方向、MDE 与 t 区间半宽、目标半宽所需 n、SESOI 充足/不足/
 仅警告/非方向性、缺 pilot、非法 α/target/SD/margin/±方向/字符串 n_max，
 以及 n=6,m=4 的分辨率失败。L199 覆盖 manifest + pilot artifact + SESOI 门的接线、缺 pilot 或对照名不匹配时的 `not_verifiable`，以及无 SESOI 时的 warning。完整 CPU 套件 555/555 通过（0 skipped）；
-`python v12_supp.py plan` 仍 72/72 合成冻结记录、6 个比较。
+`python -m explib.confirmation plan` 仍 72/72 合成冻结记录、6 个比较。
 
 ## 69. 评测单位级设计：从「种子能拒绝吗」到「切片能估多准」
 
@@ -4670,15 +4670,15 @@ pilot 同向率/方向、MDE 与 t 区间半宽、目标半宽所需 n、SESOI �
   `eval.n_seqs_clean` / `binding.test_slice.n_seqs`）、`unit`、
   `test_slice_sampling`、`supports_population_claim`；
 - `analysis_v12/power_validation.json` 中每条主对照新增的 `unit_deltas`
-  （由 `v12_supp.py power` 从 validation 记录的逐单位 PPL 生成）。
+  （由 `python -m explib.confirmation power` 从 validation 记录的逐单位 PPL 生成）。
 
 输出逐对照的 `unit_precision`，并汇总 `population` 与 `sampling`。没有
 `unit_deltas` 时状态是 `not_verifiable`，不是绿色通过。若清单声明
 `supports_population_claim=true`，但单位数低于 floor、单位是 `row`，或
 切片被声明为 deterministic prefix / first-n，则判 fail。
 
-`v12_supp.py power` 新增 `evaluation_unit` 与 `unit_precision` 块；
-`v12_supp.py plan` 的 `design_preflight` 新增 `evaluation_design` 块（清单
+`python -m explib.confirmation power` 新增 `evaluation_unit` 与 `unit_precision` 块；
+`python -m explib.confirmation plan` 的 `design_preflight` 新增 `evaluation_design` 块（清单
 声明矛盾会在首次 test 访问前拒绝）；`audit_gates.py report` 新增
 `evaluation` 块。当前冻结清单没有 `evaluation_design` 块，因此审计会报告
 `n_units=48`、`claim_allowed=false`、`not_verifiable`（缺 unit pilot），
@@ -4710,9 +4710,9 @@ pilot 同向率/方向、MDE 与 t 区间半宽、目标半宽所需 n、SESOI �
 ```bash
 python audit_gates.py evaluation   # 单位数/精度/population/抽样设计
 python audit_gates.py report       # 汇总含 evaluation
-python v12_supp.py power           # validation 单位差值 + 单位级精度
+python -m explib.confirmation power           # validation 单位差值 + 单位级精度
 python test_review_fixes.py        # L202-L204
-python v12_supp.py plan            # 冻结计划预检不变
+python -m explib.confirmation plan            # 冻结计划预检不变
 ```
 
 L202 覆盖单位级 CI/MDE/SESOI 充足与不足、目标半宽所需 n、population floor、
@@ -4761,7 +4761,7 @@ L202 覆盖单位级 CI/MDE/SESOI 充足与不足、目标半宽所需 n、popul
 - `param_matched=false` 始终使主张无效；清单声明参数匹配契约时还要求
   `param_match_complete=true`，缺记录不再按「未知即通过」处理。
 
-`v12_supp.finaltest_stats` 在冻结 `confirmed` 计算完成后调用该函数，写入
+`explib.confirmation.finaltest_stats` 在冻结 `confirmed` 计算完成后调用该函数，写入
 `stats['verdicts']`、`verdict_summary`、`refuted`、`inconclusive`、
 `not_testable`、`opposite_nonsignificant`、
 `reverse_significant_unverified` 和 `verdict_consistency`。冻结
@@ -4803,10 +4803,10 @@ L202 覆盖单位级 CI/MDE/SESOI 充足与不足、目标半宽所需 n、popul
 ```bash
 python audit_gates.py verdicts   # 重放三向判定并核对 artifact
 python audit_gates.py report     # 汇总含 verdicts
-python v12_supp.py finaltest     # 写出 verdicts/refuted/verdict_consistency
-python v12_supp.py report        # 报告含反证/反向不显著段
+python -m explib.confirmation finaltest     # 写出 verdicts/refuted/verdict_consistency
+python -m explib.confirmation report        # 报告含反证/反向不显著段
 python test_review_fixes.py      # L206-L208
-python v12_supp.py plan          # 冻结计划预检不变
+python -m explib.confirmation plan          # 冻结计划预检不变
 ```
 
 L206 覆盖纯函数的三向划分、反向显著但门未过、无方向/缺失/省略、
@@ -4903,7 +4903,7 @@ baseline 生成 `report['component_draws'][name]`。该字段只包含身份元�
 
 ```bash
 python test_review_fixes.py      # L209 + 既有 coverage 回归
-python v12_supp.py plan          # 冻结计划预检不变
+python -m explib.confirmation plan          # 冻结计划预检不变
 python audit_gates.py methodology # 读取 results_*/summary.json 的零 GPU 审计
 ```
 
@@ -4912,7 +4912,7 @@ disjoint seeds + same evaluation、disjoint seeds + disjoint evaluation、
 缺失 seed 为 unattested、coverage 的四种新标签、legacy 无身份保留旧
 `replicated`，以及独立性字段不会把共享 draws 放进
 `independently_replicated_anywhere`。本轮完整 CPU 套件 `560/560` 通过，
-`v12_supp.py plan` 仍为 72/72 records / 6 comparisons。
+`python -m explib.confirmation plan` 仍为 72/72 records / 6 comparisons。
 
 ## 72. 参数匹配基线也需要自己的 SESOI，不能只看「显著」（本轮对比实验方法硬化）
 
@@ -4995,14 +4995,14 @@ python audit_gates.py baseline_sesoi  # 设计期 baseline margin/排程审计
 python audit_gates.py sesoi           # 消融 SESOI 声明（不变）
 python audit_gates.py report          # 汇总含 baseline_sesoi
 python test_review_fixes.py           # L210 + 既有回归
-python v12_supp.py plan               # 冻结计划预检不变
+python -m explib.confirmation plan               # 冻结计划预检不变
 ```
 
 L210 覆盖默认 baseline SESOI 覆盖/排程、缺 margin/拼写/畸形/未排程臂的
 fail 或 warning、0.2% 差异停在 `sub_sesoi` 且不进入
 `verified_baselines`、2% 差异进入 `verified_baselines`，以及显式
 `sesoi={}` 恢复旧统计判定。本轮完整 CPU 套件 `561/561` 通过（0 skipped），
-`v12_supp.py plan` 仍为 72/72 records / 6 comparisons。
+`python -m explib.confirmation plan` 仍为 72/72 records / 6 comparisons。
 
 ## 73. 坏例桶要按行做选择后推断：发现/复现切分、cluster 级区间与 Holm（本轮结果分析硬化）
 
@@ -5122,14 +5122,14 @@ L211 覆盖：整行切分的确定性/不重叠、discovery 选桶、replicatio
 区分、非法输入 fail-closed、artifact 重放通过/篡改 `fail`/缺文件
 `not_verifiable`、辅助家族缺输入时记录原因，以及 EA/BR Markdown 的
 `replicated` 与边界文案。完整 CPU 套件 `563/563` 通过（0 skipped）。
-`v12_supp.py plan` 的冻结计划/比较数不受影响。
+`python -m explib.confirmation plan` 的冻结计划/比较数不受影响。
 
 
 ## 74. 设计期功效必须把「分析能否运行」算进去：attrition-adjusted power
 
 ### 74.1 问题：条件功效不是确认成功概率
 
-§68 的 `paired_design_sensitivity`、`v12_supp.py power` 与冻结功效门都
+§68 的 `paired_design_sensitivity`、`python -m explib.confirmation power` 与冻结功效门都
 **条件在完整面板上**：它们假设计划的所有种子都进入比较。当前清单又声明
 `require_complete_coverage=true`，因此只要缺失一个配对，该比较就不能被
 确认，而不是用剩下的 k 个配对做「小 n 确认」。§68.4 已把这一点记为边界，
@@ -5175,7 +5175,7 @@ P(可确认的拒绝) = P(K=n) * signflip_power(n, m, q, alpha)
 
 ### 74.3 接线
 
-- `v12_supp.py power` 的每个方向性对照新增 `attrition` 块：
+- `python -m explib.confirmation power` 的每个方向性对照新增 `attrition` 块：
   `q` 优先取 validation 的 `pilot.q_sign_rate`，缺失时退回清单声明的
   `statistics.power_q_for_test`；`pair_retention`/`availability_target`
   来自可选的 `statistics.attrition`。原有 q=0.95 精确条件功效门不变。
@@ -5207,7 +5207,7 @@ P(可确认的拒绝) = P(K=n) * signflip_power(n, m, q, alpha)
   上界，不是保证。
 - **条件功效仍是符号检验投影。** 这里只把 §68 的条件功效按 K 的分布
   混合；没有把 `|d_i|` 的不等幅、非正态或种子间相关变成精确 sign-flip
-  计算。`attrition_power_audit` 也不替代 `v12_supp.py power` 的精确条件
+  计算。`attrition_power_audit` 也不替代 `python -m explib.confirmation power` 的精确条件
   功效表。
 - **完整覆盖不能靠补种子救回部分面板。** 若规则是
   `require_complete_coverage=true`，缺失配对对应的比较就是 unconfirmed；
@@ -5225,9 +5225,9 @@ P(可确认的拒绝) = P(K=n) * signflip_power(n, m, q, alpha)
 ```bash
 python audit_gates.py sensitivity   # 每条对照含 attrition 压力表
 python audit_gates.py report        # sensitivity 块自动携带
-python v12_supp.py power            # 预测试功效产物含 attrition 块
+python -m explib.confirmation power            # 预测试功效产物含 attrition 块
 python test_review_fixes.py         # L212 + 既有回归
-python v12_supp.py plan             # 冻结计划预检不变
+python -m explib.confirmation plan             # 冻结计划预检不变
 ```
 
 L212 覆盖：完整覆盖下 `p^n * power(n)`、5% 损失时条件 0.882 → 联合
@@ -5235,14 +5235,14 @@ L212 覆盖：完整覆盖下 `p^n * power(n)`、5% 损失时条件 0.882 → �
 约 0.992、低于 Holm 下限的 `min_complete_pairs` warning、未声明 retention
 时的 `not_declared`、`require_attrition_power` 的 fail-closed、非法输入，
 以及 audit 清单声明/缺失/满足三态。完整 CPU 套件 `564/564` 通过
-（0 skipped）；`python v12_supp.py plan` 的 72/72 合成冻结记录、6 个比较
+（0 skipped）；`python -m explib.confirmation plan` 的 72/72 合成冻结记录、6 个比较
 不受影响。
 
 ## 75. NIAH 机制对照也必须声明并核验单因素：共享推理 override + 定义点审计
 
 ### 75.1 问题
 
-NIAH-natural 的四类对照此前只在 `v10_supp.py` 的运行路径里硬编码：
+NIAH-natural 的四类对照此前只在 `python -m explib.corruption` 的运行路径里硬编码：
 
 - 同一 checkpoint 上把 `indexer_mode` 换成随机选择（`randidx`）；
 - 同一 checkpoint 上把 `index_topk` 放大到全部块（`allblocks`）；
@@ -5270,7 +5270,7 @@ NIAH-natural 的四类对照此前只在 `v10_supp.py` 的运行路径里硬编�
 `exp_lib.apply_niah_inference_arm()` 在每次切换臂时，先把所有声明键重置
 为 checkpoint 的基线值，再应用当前臂 override。这样模型在同一 seed 内
 跨臂复用时，不会把上一个臂的 `indexer_mode` 或 `index_topk` 残留到下一个
-臂。`v10_supp.py` 的实际 probe 路径改为调用该函数，声明表与执行路径不再
+臂。`python -m explib.corruption` 的实际 probe 路径改为调用该函数，声明表与执行路径不再
 各写一份。
 
 新增 `exp_lib.NIAH_CONTRAST_FACTORS`，对五类可测对照分别声明：
@@ -5291,7 +5291,7 @@ NIAH-natural 的四类对照此前只在 `v10_supp.py` 的运行路径里硬编�
 
 ### 75.3 记录与报告
 
-`v10_supp.py` 的 NIAH NLL/accuracy contrast 现在都携带
+`python -m explib.corruption` 的 NIAH NLL/accuracy contrast 现在都携带
 `single_factor`、`factors`、`factors_note` 与
 `factor_declaration_verified`。若定义点审计未通过，记录保留
 `declared_single_factor=True` 并把 `single_factor` 清零，和 v9 的
@@ -5314,7 +5314,7 @@ fail-closed 口径一致。H3 的预注册文本改为「read-rich all-block con
 python audit_gates.py single_factor   # 含 niah_contrasts
 python audit_gates.py report          # 汇总该块
 python test_review_fixes.py           # L62c + 既有回归
-python v12_supp.py plan               # 冻结计划预检不变
+python -m explib.confirmation plan               # 冻结计划预检不变
 ```
 
 L62c 覆盖：五类声明与真实 override/arm diff 一致、dense 不是单因素、

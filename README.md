@@ -40,35 +40,47 @@ run-state files are **not tracked** — the driver scripts below regenerate them
 on whatever machine runs the experiments, so you can simply reproduce them
 locally whenever needed (see the commands in the next section). `.gitignore`
 already keeps those path families out of the repository (`docs/` retains only
-`design_notes.md`; the former `compute_plan.md` was retired).
+`design_notes.md`).
 
 | path | what |
 |---|---|
-| `exp_lib.py` | **the library — and the source of truth**: model, CSA/HCA attention, pooling, indexer, segmenters, training loop, aggregation and statistics |
-| `csa_kernels.py` | **the fused-kernel path for the three core operators** (the retired compute-plan M0 work package): block-compression pooling, indexer top-k selection and sparse attention as Triton kernels (plus a CPU-runnable torch-reference twin of the same algorithmic decomposition); opt-in via `CSA_KERNEL`, off by default — see "Triton kernel path (M0/G0)" below |
+| `exp_lib.py` | **compatibility shim** that re-exports the split implementation in `explib/` |
+| `explib/` | **the library — and the source of truth**: model, CSA/HCA attention, pooling, indexer, segmenters, training loop, aggregation and statistics |
+| `csa_kernels.py` | **compatibility shim** that re-exports the split implementation in `_csa_kernels/` |
+| `_csa_kernels/` | **the fused-kernel path for the three core operators** (the retired compute-plan M0 work package): block-compression pooling, indexer top-k selection and sparse attention as Triton kernels (plus a CPU-runnable torch-reference twin of the same algorithmic decomposition); opt-in via `CSA_KERNEL`, off by default — see "Triton kernel path (M0/G0)" below |
 | `run_gapfill.py` | **the v6 driver**: the minimum-publishable supplementary runs, resumable, guarded by a run-time cap, pushes after every phase, auto-shuts the instance down |
 | `par.py` | **task-level parallel executor (opt-in)**: one GPU card per independent run — see "Task-level parallelism" below |
-| `v7_supp.py` | **the v7 driver**: reviewer-response supplementary suite — P0R RoPE+QK-norm, P0W dense-warmup, P0E 40k-step long run, P2S scale re-seeding, P1L length extrapolation, P1T topk sweep |
-| `v8_supp.py` | **the v8 driver**: P1S (scale panel seed completion to 4 seeds) and P2R (RoPE+QK-norm 20k-step long run) |
-| `v9_supp.py` | **the v9 driver**: P2T (the seq-2048 topk sweep at `batch_size=1`) and P2S3 (third seed for the RoPE 20k run) |
-| `v10_supp.py` | **the v10 driver**: P3M length-extrapolation mechanism + distractor-injection probe, P3S inversion-crossover scaling, P3T topk sweep to 4 seeds |
-| `v11_supp.py` | **the v11 driver**: statistical close-out — distractor probe to n=6 (P4MT/P4MP), crossover panels to n=4 (P4S), d=384 paired arms to n=4 (P4F) |
-| `v12_supp.py` | **the v12 confirmation driver (reviewer-response + review-2 hardening)**: P5C trains all four frozen arms at the manifest seed list, P5MP runs the extended corruption-mode probe (uniform/realistic-token/mask/delete + review-2 span/doc/topical + NIAH-natural), P5S2/P5S3 add the token-matched and 6ND-param-proxy scale arms, P5T performs the FROZEN final evaluation on the held-out WikiText-103 test split per `confirmation_frozen.json` — with a load-time plan-power gate (a plan that cannot mathematically confirm is refused), strict record admission (seed whitelist / unique records / one frozen test slice / recipe signature / manifest sha), a first-access freeze lock, and per-document PPL records |
-| `open_block_supp.py` | **open-block panel driver**: maximum block length (32/64/128/no cap) × current-block reading rule (`closed` / `prefix_summary` / `prefix_singletons`), with a shared top-k budget, causal prefix construction, outside-window auxiliary panel, paired per-seed deltas and interaction statistics — see `docs/design_notes.md` §24 |
+| `explib/rope/` | **the v7 driver** (`python -m explib.rope`): reviewer-response supplementary suite — P0R RoPE+QK-norm, P0W dense-warmup, P0E 40k-step long run, P2S scale re-seeding, P1L length extrapolation, P1T topk sweep |
+| `explib/scale/` | **the v8 driver** (`python -m explib.scale`): P1S (scale panel seed completion to 4 seeds) and P2R (RoPE+QK-norm 20k-step long run) |
+| `explib/resume/` | **the v9 driver** (`python -m explib.resume`): P2T (the seq-2048 topk sweep at `batch_size=1`) and P2S3 (third seed for the RoPE 20k run) |
+| `explib/corruption/` | **the v10 driver** (`python -m explib.corruption`): P3M length-extrapolation mechanism + distractor-injection probe, P3S inversion-crossover scaling, P3T topk sweep to 4 seeds |
+| `explib/length/` | **the v11 driver** (`python -m explib.length`): statistical close-out — distractor probe to n=6 (P4MT/P4MP), crossover panels to n=4 (P4S), d=384 paired arms to n=4 (P4F) |
+| `explib/confirmation/` | **the v12 confirmation driver** (`python -m explib.confirmation`; reviewer-response + review-2 hardening): P5C trains all four frozen arms at the manifest seed list, P5MP runs the extended corruption-mode probe (uniform/realistic-token/mask/delete + review-2 span/doc/topical + NIAH-natural), P5S2/P5S3 add the token-matched and 6ND-param-proxy scale arms, P5T performs the FROZEN final evaluation on the held-out WikiText-103 test split per `confirmation_frozen.json` — with a load-time plan-power gate (a plan that cannot mathematically confirm is refused), strict record admission (seed whitelist / unique records / one frozen test slice / recipe signature / manifest sha), a first-access freeze lock, and per-document PPL records |
+| `explib/open_block/` | **open-block panel driver** (`python -m explib.open_block`): maximum block length (32/64/128/no cap) × current-block reading rule (`closed` / `prefix_summary` / `prefix_singletons`), with a shared top-k budget, causal prefix construction, outside-window auxiliary panel, paired per-seed deltas and interaction statistics — see `docs/design_notes.md` §24 |
 | `test_open_block.py` | **open-block CPU gates**: config/segmenter, optimized-vs-reference prefix pooling (forward + gradients), prefix invariance, future perturbation/gradient, candidate masks, edge cases, closed regression, singleton semantics and HCA budget declaration |
+| `test_review_part_*.py`, `test_review_fixes.py` | **CPU review pytest suite**: compatibility entry point plus the split test modules (run with `make test` or `pytest`) |
 | `confirmation_frozen.json` | **pre-registered confirmation plan v2** (tracked): frozen arms, seeds 0-11 (revised 6->12 BEFORE any test-split access; power table recorded), endpoints, exact sign-flip + Holm, decision rule, machine-checkable binding block and a scope declaration — see `docs/design_notes.md` §17 and `DECISION_LOG.md` |
 | `RELEASES.md` | **evidence release index**: where each immutable `release_<tag>.tar.gz` + SHA-256 manifest is published; the Git repo itself stays source-only |
-| `pyproject.toml` / `requirements.txt` | Python ≥3.12 and dependency declarations; install explicitly (no import-time pip install) |
+| `pyproject.toml` / `requirements.txt` / `requirements.lock` | Python ≥3.12 and dependency declarations; install explicitly (no import-time pip install). `requirements.lock` is the verified CPU environment |
 | `DECISION_LOG.md` | **decision log** (tracked; reconstructed 2026-10-18 from the README/design notes/manifest because the snapshot has one squashed commit): why each version ran what it ran, what was seen, and what was decided next — the exploration/confirmation paper trail; formal releases additionally archive per-seed results via `archive_release.py` |
-| `REVIEW_4_RESPONSE.md` | **review-4 per-issue audit** (tracked): the 21 methodological issues, what this repository already enforced, what this revision changed, and what still cannot be answered without new experiments/artifacts |
-| `audit_gates.py` | **review-2/4/7 verification entry points** (zero-experiment): data-leakage audits (tokenizer provenance, vocab identity, train/test overlap), CPU causality unit checks (prefix invariance, label shift, decode consistency), block-attribution / boundary-vs-random / length-consistency / baseline-fairness / failure-concentration / budget-reconciliation audits, the review-7 single-factor design gate (declared contrasts' arm-cfg diffs vs their declared intervention key sets; frozen-manifest mechanism_claim_allowed flags) and prefill-decode-kv-growth measurement utilities |
+| `audit_gates.py` | **compatibility shim** for `_audit_gates/`, the **review-2/4/7 verification entry points** (zero-experiment): data-leakage audits (tokenizer provenance, vocab identity, train/test overlap), CPU causality unit checks (prefix invariance, label shift, decode consistency), block-attribution / boundary-vs-random / length-consistency / baseline-fairness / failure-concentration / budget-reconciliation audits, the review-7 single-factor design gate (declared contrasts' arm-cfg diffs vs their declared intervention key sets; frozen-manifest mechanism_claim_allowed flags) and prefill-decode-kv-growth measurement utilities |
 | `archive_release.py` | **immutable evidence archiver**: packs per-release artifacts (results, analyses, reports, freeze lock, decision log, environment, checkpoint hashes) into a tar.gz with a per-file SHA-256 manifest and an independent `verify` subcommand — the git repo stays source-only (design_notes §8) while every formal release gets an auditable fixed archive |
-| `m0_supp.py` | **the M0/S1 driver (adopted B tier)**: entry points for the scale-up roadmap — `params` (zero-GPU S1–S4 parameter audit), `data` (FineWeb-Edu + 32k-BPE corpus cache), `smoke` (end-to-end self-check on the B-tier data path), `kernel` (the G0 validation suite: kernel/eager numerical comparison for the three operators plus the sparse-attention throughput benchmark), `full` (the S1 panel); see "B-tier M0/S1" below |
-| `build_report.py` | zero-GPU report builder: regenerates the v7 report from `results_*/` + `analysis_*/` artifacts (every number is computed from disk; protocol constants and analytic FLOPs assumptions are explicit inputs, not measurements) |
+| `explib/m0/` | **the M0/S1 driver (adopted B tier)** (`python -m explib.m0`): entry points for the scale-up roadmap — `params` (zero-GPU S1–S4 parameter audit), `data` (FineWeb-Edu + 32k-BPE corpus cache), `smoke` (end-to-end self-check on the B-tier data path), `kernel` (the G0 validation suite: kernel/eager numerical comparison for the three operators plus the sparse-attention throughput benchmark), `full` (the S1 panel); see "B-tier M0/S1" below |
+| `build_report.py` | **compatibility shim** for `_build_report/`, the zero-GPU report builder: regenerates the v7 report from `results_*/` + `analysis_*/` artifacts (every number is computed from disk; protocol constants and analytic FLOPs assumptions are explicit inputs, not measurements) |
 | `fuse_analysis.py` | zero-GPU fuse-vs-no-fuse driver: recomputes per-layer boundary alignment (tol=1), block-length stats and PPL trajectories from a `results_*/summary.json` |
+| `Makefile` | zero-GPU entry points: `make test`, `make plan`, `make audit`, `make install-check`, `make build`, `make clean` |
 | `docs/design_notes.md` | **design and implementation notes**: why the block-read gate is strict and must be synced across five sites, the dynamic segmenter's prefix-invariance requirement, the pairing/measurability rules, the reporting conventions, and the contracts that keep attention row-chunking equivalent to its unbatched form |
 
-> **`exp_lib.py` is the single source of truth — edit it directly.**
+> **The measurement library lives in `explib/`; edit those modules directly.**
+> `exp_lib.py` (and `csa_kernels.py`, `audit_gates.py`, `build_report.py`,
+> `data_guard.py`) are compatibility shims that re-export the split packages.
+>
+> **Driver entry points.** The former top-level v7–v12, M0/S1 and open-block
+> scripts now live in modules under `explib/`: use `python -m explib.rope`,
+> `python -m explib.scale`, `python -m explib.resume`,
+> `python -m explib.corruption`, `python -m explib.length`,
+> `python -m explib.confirmation`, `python -m explib.m0`, and
+> `python -m explib.open_block`. The subcommands are unchanged.
 
 ### Regenerating the experiment artifacts
 
@@ -78,7 +90,7 @@ again:
 ```bash
 python run_gapfill.py smoke      # end-to-end self-check, zero GPU cost
 python run_gapfill.py full       # the v6 main experiment (bounded by the run-time cap)
-python v7_supp.py ...            # per-version supplementary runs; subcommands in each script's docstring
+python -m explib.rope ...        # per-version supplementary runs; subcommands in each module's help
 python build_report.py           # rebuild the report from on-disk results_*/ + analysis_*/
 ```
 
@@ -106,7 +118,7 @@ pip install -r requirements.lock
 # When `wt103_cache/` is already populated the corpus is served from the cache
 # and no dump or network access is needed at all.  Set `WT103_CACHE_DIR` to
 # relocate the cache; the loaders, `audit_leakage` and P5T all resolve the same
-# variable.  `v12_supp.py smoke` deliberately uses an isolated cache under its
+# variable.  `python -m explib.confirmation smoke` deliberately uses an isolated cache under its
 # smoke outdir so it can never leave a differently-tokenised file in the frozen
 # cache.  Test-cache hits verify the persisted tokenizer bytes (sha256 recorded
 # in test_meta) in addition to the train fit fingerprint.
@@ -116,13 +128,15 @@ pip install -r requirements.lock
 #     forward paths: random indexer, zero content, sink off, learned fusion,
 #     HCA layers, dense+sink control)
 python run_gapfill.py smoke
-python v10_supp.py smoke           # also covers the new corruption modes + NIAH + controls
+python -m explib.corruption smoke  # also covers the new corruption modes + NIAH + controls
 python test_open_block.py         # open-block causality/reference/mask gates (CPU)
-python open_block_supp.py smoke    # open-block matrix plumbing on a tiny synthetic run
-python open_block_supp.py main     # 8 cells x 4 seeds; resumable
-python open_block_supp.py report   # paired deltas + interaction + exact sign-flip/Holm
-python open_block_supp.py extended # contingency: all 4 caps x all 3 modes
-python v12_supp.py smoke           # also covers the frozen final-test roundtrip
+python -m explib.open_block smoke     # open-block matrix plumbing on a tiny synthetic run
+python -m explib.open_block pilot     # one cell, short run
+python -m explib.open_block main      # 8 cells x 4 seeds; resumable
+python -m explib.open_block aux       # outside-window auxiliary panel
+python -m explib.open_block report    # paired deltas + interaction + exact sign-flip/Holm
+python -m explib.open_block extended  # contingency: all 4 caps x all 3 modes
+python -m explib.confirmation smoke   # also covers the frozen final-test roundtrip
 
 # 2) the real supplementary study (bounded by the run-time cap):
 nohup python run_gapfill.py full > run_v6.log 2>&1 &
@@ -154,10 +168,10 @@ what you get when the variable is unset:
 
 ```bash
 # one worker per visible GPU (recommended):
-CSA_PAR=auto nohup python v11_supp.py full > run_v11.log 2>&1 &
+CSA_PAR=auto nohup python -m explib.length full > run_v11.log 2>&1 &
 
 # only 2 cards, only these cards:
-CSA_PAR=2 CSA_PAR_GPUS=0,3 python v10_supp.py phase P3SL
+CSA_PAR=2 CSA_PAR_GPUS=0,3 python -m explib.corruption phase P3SL
 
 # back to 100% serial (the default): unset CSA_PAR
 ```
@@ -188,19 +202,19 @@ Smoke modes always run serially regardless of `CSA_PAR`.
 
 ### B-tier M0 / S1 (scale-up entry point, adopted tier B)
 
-The adopted B-tier scale-up plan (entry point `m0_supp.py`; the former
-`docs/compute_plan.md` is retired) adds a second
+The adopted B-tier scale-up plan (entry point `python -m explib.m0`; the former
+compute-plan document is retired) adds a second
 corpus path and the S1–S4 scale ladder on top of the WikiText-103 mechanism
-layer; `m0_supp.py` is the entry point:
+layer; `python -m explib.m0` is the entry point:
 
 ```bash
-python m0_supp.py params   # zero GPU: S1–S4 parameter audit vs the plan
-python m0_supp.py data     # build / verify the FineWeb-Edu cache (M0_TOKENS=…)
-python m0_supp.py smoke    # end-to-end self-check on the B-tier data path
-python m0_supp.py kernel   # G0 suite: kernel/eager numerical comparison + throughput
-python m0_supp.py full     # the S1 panel (5 arms × 4 seeds; CSA_PAR=auto works)
-M0_PANEL=S2 python m0_supp.py full   # the S2 panel (5 arms × 3 seeds × 12B; M2_CAP_HOURS override)
-python m0_supp.py auto     # UNATTENDED: G0 gate (fail-closed) -> certificate re-check ->
+python -m explib.m0 params   # zero GPU: S1–S4 parameter audit vs the plan
+python -m explib.m0 data     # build / verify the FineWeb-Edu cache (M0_TOKENS=…)
+python -m explib.m0 smoke    # end-to-end self-check on the B-tier data path
+python -m explib.m0 kernel   # G0 suite: kernel/eager numerical comparison + throughput
+python -m explib.m0 full     # the S1 panel (5 arms × 4 seeds; CSA_PAR=auto works)
+M0_PANEL=S2 python -m explib.m0 full   # the S2 panel (5 arms × 3 seeds × 12B; M2_CAP_HOURS override)
+python -m explib.m0 auto     # UNATTENDED: G0 gate (fail-closed) -> certificate re-check ->
                            #   panel chain starts by itself; default panel S1,
                            #   M0_AUTO_CHAIN=S1,S2 sequences both; CSA_KERNEL=1 after a
                            #   green gate (explicit setting wins); a failed gate starts no
@@ -243,10 +257,10 @@ eager path cancels in the forward value and is reconstructed as a dual A/S
 Jacobian in the backward, matching the eager autograd graph.
 
 ```bash
-python m0_supp.py kernel                 # anywhere: ref-backend semantics check
-CSA_KERNEL=1 python m0_supp.py kernel    # CUDA + triton: full G0 suite
-CSA_KERNEL=1 python m0_supp.py full      # kernel-mode S1 panel (after G0)
-python m0_supp.py auto                   # unattended: G0 suite -> certificate -> panel chain
+python -m explib.m0 kernel                 # anywhere: ref-backend semantics check
+CSA_KERNEL=1 python -m explib.m0 kernel    # CUDA + triton: full G0 suite
+CSA_KERNEL=1 python -m explib.m0 full      # kernel-mode S1 panel (after G0)
+python -m explib.m0 auto                   # unattended: G0 suite -> certificate -> panel chain
                                          #   (the "after G0, may B-tier start?" decision is
                                          #   now machine-made: certificate present = both
                                          #   G0 criteria passed = the panel starts)
@@ -269,9 +283,9 @@ python m0_supp.py auto                   # unattended: G0 suite -> certificate -
 ### v11 statistical close-out suite
 
 ```bash
-python v11_supp.py smoke
-nohup python v11_supp.py full > run_v11.log 2>&1 &
-python v11_supp.py report         # rebuild REPORT_v11.md from disk (zero GPU)
+python -m explib.length smoke
+nohup python -m explib.length full > run_v11.log 2>&1 &
+python -m explib.length report         # rebuild REPORT_v11.md from disk (zero GPU)
 ```
 
 Phases: P4MT (RoPE-arm seeds 0-5, exact P1L/P3MT recipe; resume skips
@@ -285,10 +299,10 @@ n=4).
 
 ```bash
 # v10: distractor-injection mechanism probe + crossover scaling + topk seeds
-python v10_supp.py smoke
-nohup python v10_supp.py full > run_v10.log 2>&1 &
-python v10_supp.py analysis       # zero-GPU stats -> analysis_v10/
-python v10_supp.py report         # rebuild REPORT_v10.md from disk (zero GPU)
+python -m explib.corruption smoke
+nohup python -m explib.corruption full > run_v10.log 2>&1 &
+python -m explib.corruption analysis       # zero-GPU stats -> analysis_v10/
+python -m explib.corruption report         # rebuild REPORT_v10.md from disk (zero GPU)
 ```
 
 Phases (each resumable): P3MT (retrain the two RoPE arms, the P1L recipe),
@@ -311,21 +325,21 @@ distinction (§18).
 ### v12 confirmation suite (exploration / confirmation split)
 
 ```bash
-python v12_supp.py smoke           # end-to-end self-check (tiny ckpts + a smoke freeze manifest)
-python v12_supp.py plan            # zero-GPU pre-flight: stamps + implementation binding + admission + power, NO test read;
-                                   #   on pass, archives the audit snapshot analysis_v12/plan_snapshot.json
-python v12_supp.py auto            # UNATTENDED: the same chain as `full`, made explicitly pause-free —
-                                   #   the plan gate runs first (fail-closed) and its approval evidence
-                                   #   (manifest sha256 / code stamp / git tree / arms / seeds /
-                                   #   primary comparisons / alpha) is archived for ASYNCHRONOUS human
-                                   #   review instead of blocking the launch
-python v12_supp.py phase P5C       # train all four frozen arms at the manifest seed list (resumable; 0-5 main arms covered by P3MT/P4MT)
-python v12_supp.py phase P5MP      # extended probe (all modes + NIAH + controls) at the manifest seed list
-python v12_supp.py phase P5S2      # token-matched large scale arm (8000 steps)
-python v12_supp.py phase P5S3      # compute-matched large scale arm (param-ratio steps)
-python v12_supp.py phase P5T       # FROZEN final test on wiki.test.raw (requires the freeze manifest)
-python v12_supp.py analysis        # zero-GPU: shared v10 stats + frozen final-test stats
-python v12_supp.py report          # rebuild REPORT_v12.md from disk (zero GPU)
+python -m explib.confirmation smoke           # end-to-end self-check (tiny ckpts + a smoke freeze manifest)
+python -m explib.confirmation plan            # zero-GPU pre-flight: stamps + implementation binding + admission + power, NO test read;
+                                              #   on pass, archives the audit snapshot analysis_v12/plan_snapshot.json
+python -m explib.confirmation auto            # UNATTENDED: the same chain as `full`, made explicitly pause-free —
+                                              #   the plan gate runs first (fail-closed) and its approval evidence
+                                              #   (manifest sha256 / code stamp / git tree / arms / seeds /
+                                              #   primary comparisons / alpha) is archived for ASYNCHRONOUS human
+                                              #   review instead of blocking the launch
+python -m explib.confirmation phase P5C       # train all four frozen arms at the manifest seed list (resumable; 0-5 main arms covered by P3MT/P4MT)
+python -m explib.confirmation phase P5MP      # extended probe (all modes + NIAH + controls) at the manifest seed list
+python -m explib.confirmation phase P5S2      # token-matched large scale arm (8000 steps)
+python -m explib.confirmation phase P5S3      # compute-matched large scale arm (param-ratio steps)
+python -m explib.confirmation phase P5T       # FROZEN final test on wiki.test.raw (requires the freeze manifest)
+python -m explib.confirmation analysis        # zero-GPU: shared v10 stats + frozen final-test stats
+python -m explib.confirmation report          # rebuild REPORT_v12.md from disk (zero GPU)
 ```
 
 P5T refuses to run without `confirmation_frozen.json`, refuses a manifest whose
@@ -367,14 +381,14 @@ python archive_release.py plan v13 --dirs results_lm_test analysis_v12   # dry-r
 
 ```bash
 # v8: scale-panel seed completion (4 seeds) + RoPE 20k long run
-python v8_supp.py smoke
-python v8_supp.py full            # or: python v8_supp.py phase P1S / P2R
-python v8_supp.py analysis        # zero-GPU stats -> analysis_v8/
+python -m explib.scale smoke
+python -m explib.scale full            # or: python -m explib.scale phase P1S / P2R
+python -m explib.scale analysis        # zero-GPU stats -> analysis_v8/
 
 # v9: complete topk sweep (bs=1) + RoPE-20k third seed + report
-python v9_supp.py smoke
-nohup python v9_supp.py full > run_v9.log 2>&1 &
-python v9_supp.py report          # rebuild REPORT_v9.md from disk (zero GPU)
+python -m explib.resume smoke
+nohup python -m explib.resume full > run_v9.log 2>&1 &
+python -m explib.resume report          # rebuild REPORT_v9.md from disk (zero GPU)
 ```
 
 See `docs/design_notes.md` for the design rationale
@@ -387,12 +401,12 @@ phase-command layout) runs the reviewer-concern experiments and rebuilds the rep
 
 ```bash
 # zero-GPU: analytic FLOPs/KV-cache + paired sign-flip stats + report rebuild
-python v7_supp.py analysis
+python -m explib.rope analysis
 # one phase at a time (resumable), or the whole chain:
-python v7_supp.py phase P0E   # 40k-step long run
-python v7_supp.py phase P2S   # scale re-seeding to 4 seeds
-python v7_supp.py phase P1L   # length extrapolation
-python v7_supp.py phase P1T   # seq-2048 topk sweep
+python -m explib.rope phase P0E   # 40k-step long run
+python -m explib.rope phase P2S   # scale re-seeding to 4 seeds
+python -m explib.rope phase P1L   # length extrapolation
+python -m explib.rope phase P1T   # seq-2048 topk sweep
 python build_report.py        # regenerate REPORT_v7.md from artifacts (zero GPU)
 ```
 
@@ -413,8 +427,9 @@ script pushes and shuts the instance down (cancel with
 
 ## Review-4 hardening (what changed)
 
-See `REVIEW_4_RESPONSE.md` for the item-by-item table.  The main additions are
-machine gates rather than new prose:
+See the review-4 entry in `DECISION_LOG.md` and `docs/design_notes.md` §25 for
+the item-by-item record.  The main additions are machine gates rather than new
+prose:
 
 - **Claim wording** now goes through `exp_lib.reportable_claim` (n>=6, raw p,
   Holm p, |mean|>std, family resolution floor).  `attach_holm` reports

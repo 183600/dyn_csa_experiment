@@ -198,7 +198,7 @@ def _exp_blocks_fixed(n, block_size, device):
 
 # ============================================================================
 # G0 自检：算子级 kernel/eager 数值对照 + 模型级前反向对照
-# （驱动入口：python explib.m0.py kernel）
+# （驱动入口：python -m explib.m0 kernel）
 # ============================================================================
 
 import contextlib

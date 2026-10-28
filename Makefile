@@ -1,6 +1,6 @@
 # Reproducibility entry points for the source-only repository.
 #
-# The canonical contract remains `python <driver>.py <mode>` (see README); this
+# The canonical contract remains `python -m explib.<driver> <mode>` (see README); this
 # file only groups the zero-GPU checks so a fresh checkout can be verified with
 # one command and CI/contributors do not have to rediscover the order.
 PYTHON ?= python

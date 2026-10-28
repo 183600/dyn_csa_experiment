@@ -154,7 +154,7 @@ def audit_single_factor(manifest_path=None):
       * 冻结清单（confirmation_frozen.json）：每条 primary comparison 的
         attention-cfg diff 是否单因素（`cfg_keys_single_factor` 的一族判据），
         与 `mechanism_claim_allowed` 标志的一致性。`True` 标志但 cfg 非单因素
-        => fail（完整的含目标/参数量核验在 `explib.confirmation.py plan`，本审计给出
+        => fail（完整的含目标/参数量核验在 `python -m explib.confirmation plan`，本审计给出
         同一口径的 cfg 级读数）。
     """
     L = _import_exp_lib()
@@ -263,7 +263,7 @@ def audit_single_factor(manifest_path=None):
                                    'mechanism_claim_allowed': _flag,
                                    'claim_flag_cfg_consistent': _consistent,
                                    'note': ('full verdict (objectives + parameter totals) is '
-                                            'enforced by `explib.confirmation.py plan` at preflight')}
+                                            'enforced by `python -m explib.confirmation plan` at preflight')}
                 if comps_for_audit or out['frozen_manifest'].get('status') != 'fail':
                     out['frozen_manifest'] = {'status': ('fail' if _bad else 'ok'),
                                               'manifest': _mp, 'comparisons': _cmp,
@@ -527,7 +527,7 @@ def audit_design_sensitivity(manifest_path=None,
     The frozen design preflight verifies that the declared q has enough power.
     It cannot say whether that q corresponds to an effect the study would
     care about.  This audit reads the same manifest and, when available, the
-    validation power artifact written by ``explib.confirmation.py power``.  For every
+    validation power artifact written by ``python -m explib.confirmation power``.  For every
     primary comparison it reports the exact Holm floor, the sign-flip power
     curve, the minimum q needed for target power, the approximate MDE, the
     expected paired 95% CI half-width, and (if the manifest declares one) the
@@ -639,7 +639,7 @@ def audit_design_sensitivity(manifest_path=None,
     else:
         out['warnings'].append(
             f'no readable power-validation artifact at {pp}; pass a pilot SD '
-            'or run `python explib.confirmation.py power` before relying on MDE/SESOI '
+            'or run `python -m explib.confirmation power` before relying on MDE/SESOI '
             'readouts')
     pilot_cells = 0
     _seen_names = set()
@@ -738,7 +738,7 @@ def audit_evaluation_design(manifest_path=None,
     The sensitivity audit plans the seed panel.  This audit plans the other
     sampling axis: the frozen number of independent evaluation units
     (documents/articles) and whether that count can support a population
-    claim.  When ``explib.confirmation.py power`` has written per-unit deltas for each
+    claim.  When ``python -m explib.confirmation power`` has written per-unit deltas for each
     comparison, it also reports the approximate unit-level MDE, CI half-width
     and SESOI power.
 

@@ -18,32 +18,44 @@
 零 GPU 分析目录（`analysis_*/`）、逐版报告（`REPORT*.md`）与运行状态文件
 都**不入库**——它们由驱动脚本在跑实验的机器上重新生成，需要时本地复现即可
 （见下文命令）。`.gitignore` 已把这几类路径挡在仓库外（`docs/` 只保留
-`design_notes.md`；原 `compute_plan.md` 已退役）。
+`design_notes.md`）。
 
 | 路径 | 说明 |
 |---|---|
-| `exp_lib.py` | **核心库，也是唯一的代码来源**：模型、CSA/HCA 注意力、池化、indexer、分段器、训练循环、聚合与统计 |
-| `csa_kernels.py` | **三算子融合内核路径**（已退役算力规划的 M0 工作包）：块压缩池化、索引 top-k 选择与稀疏注意力的 Triton 内核（附带同一套算法分解、任意设备可跑的 torch 参考孪生实现）；`CSA_KERNEL` 选开、默认关闭——见下文「Triton 内核路径（M0/G0）」 |
+| `exp_lib.py` | **兼容 shim**，重新导出拆分后的 `explib/` 实现 |
+| `explib/` | **核心库，也是唯一的代码来源**：模型、CSA/HCA 注意力、池化、indexer、分段器、训练循环、聚合与统计 |
+| `csa_kernels.py` | **兼容 shim**，重新导出 `_csa_kernels/` 实现 |
+| `_csa_kernels/` | **三算子融合内核路径**（已退役算力规划的 M0 工作包）：块压缩池化、索引 top-k 选择与稀疏注意力的 Triton 内核（附带同一套算法分解、任意设备可跑的 torch 参考孪生实现）；`CSA_KERNEL` 选开、默认关闭——见下文「Triton 内核路径（M0/G0）」 |
 | `run_gapfill.py` | **v6 驱动**：最小可发表补充实验，支持断点续跑，受运行时上限约束，每阶段完成后自动 push，结束后自动关机 |
 | `par.py` | **任务级并行执行器（可选）**：每个独立实验占一张 GPU 卡——见下文「任务级并行」 |
-| `v7_supp.py` | **v7 驱动**：回应 reviewer 的补充实验套件——P0R RoPE+QK-norm、P0W 稠密预热、P0E 40k 步长跑、P2S 规模重播种、P1L 长度外推、P1T topk 扫描 |
-| `v8_supp.py` | **v8 驱动**：P1S（规模面板补齐至 4 seeds）与 P2R（RoPE+QK-norm 20k 步长跑） |
-| `v9_supp.py` | **v9 驱动**：P2T（seq-2048 的 topk 扫描，`batch_size=1`）与 P2S3（RoPE 20k 长跑的第三个 seed） |
-| `v10_supp.py` | **v10 驱动**：P3M 长度外推机制 + 干扰项注入探针、P3S 交叉面板扩规模、P3T topk 扫描补至 4 seeds |
-| `v11_supp.py` | **v11 驱动**：统计收尾——干扰探针扩到 n=6（P4MT/P4MP）、交叉面板扩到 n=4（P4S）、d=384 配对臂扩到 n=4（P4F） |
-| `v12_supp.py` | **v12 确认驱动（评审响应 + 评审二轮加固）**：P5C 按清单种子列表训练全部四个冻结臂，P5MP 跑扩展腐坏模式探针（uniform/realistic-token/mask/delete + 评审二轮新增 span/doc/topical + NIAH-natural），P5S2/P5S3 补等 token 与 6ND 参数量代理预算的大规模臂，P5T 按 `confirmation_frozen.json` 在 held-out 的 WikiText-103 test split 上做**冻结后一次性确认评估**——含加载期功效硬门槛（数学上不可能确认的清单直接拒绝）、严格记录准入（种子白名单/唯一记录/单一冻结切片/配方签名/manifest 哈希）、首次访问冻结锁与逐文档 PPL 落盘 |
-| `open_block_supp.py` | **未结束块读取面板驱动**：最大块长（32/64/128/无强制上限）× 当前未结束块读取方式（`closed` / `prefix_summary` / `prefix_singletons`）；共享 top-k 预算、因果前缀构造、窗口外辅助面板、逐种子配对差与交互统计——见 `docs/design_notes.md` §24 |
+| `explib/rope/` | **v7 驱动**（`python -m explib.rope`）：回应 reviewer 的补充实验套件——P0R RoPE+QK-norm、P0W 稠密预热、P0E 40k 步长跑、P2S 规模重播种、P1L 长度外推、P1T topk 扫描 |
+| `explib/scale/` | **v8 驱动**（`python -m explib.scale`）：P1S（规模面板补齐至 4 seeds）与 P2R（RoPE+QK-norm 20k 步长跑） |
+| `explib/resume/` | **v9 驱动**（`python -m explib.resume`）：P2T（seq-2048 的 topk 扫描，`batch_size=1`）与 P2S3（RoPE 20k 长跑的第三个 seed） |
+| `explib/corruption/` | **v10 驱动**（`python -m explib.corruption`）：P3M 长度外推机制 + 干扰项注入探针、P3S 交叉面板扩规模、P3T topk 扫描补至 4 seeds |
+| `explib/length/` | **v11 驱动**（`python -m explib.length`）：统计收尾——干扰探针扩到 n=6（P4MT/P4MP）、交叉面板扩到 n=4（P4S）、d=384 配对臂扩到 n=4（P4F） |
+| `explib/confirmation/` | **v12 确认驱动**（`python -m explib.confirmation`；评审响应 + 评审二轮加固）：P5C 按清单种子列表训练全部四个冻结臂，P5MP 跑扩展腐坏模式探针（uniform/realistic-token/mask/delete + 评审二轮新增 span/doc/topical + NIAH-natural），P5S2/P5S3 补等 token 与 6ND 参数量代理预算的大规模臂，P5T 按 `confirmation_frozen.json` 在 held-out 的 WikiText-103 test split 上做**冻结后一次性确认评估**——含加载期功效硬门槛（数学上不可能确认的清单直接拒绝）、严格记录准入（种子白名单/唯一记录/单一冻结切片/配方签名/manifest 哈希）、首次访问冻结锁与逐文档 PPL 落盘 |
+| `explib/open_block/` | **未结束块读取面板驱动**（`python -m explib.open_block`）：最大块长（32/64/128/无强制上限）× 当前未结束块读取方式（`closed` / `prefix_summary` / `prefix_singletons`）；共享 top-k 预算、因果前缀构造、窗口外辅助面板、逐种子配对差与交互统计——见 `docs/design_notes.md` §24 |
 | `test_open_block.py` | **未结束块 CPU 门禁**：配置/分段器、优化前缀池化与逐查询参考的前向/梯度一致、前缀不变性、未来扰动/未来梯度、候选掩码、边界情形、closed 回归、单 token 语义与 HCA 预算声明 |
+| `test_review_part_*.py`, `test_review_fixes.py` | **CPU 评审 pytest 套件**：兼容入口与拆分后的测试模块（用 `make test` 或 `pytest` 运行） |
 | `confirmation_frozen.json` | **预注册冻结清单 v2**（入库）：冻结臂、种子 0-11（在任何 test-split 访问**之前**由 6 修订为 12，含功效表）、终点、精确符号翻转 + Holm、决策规则、机器可校验的绑定块与范围声明——见 `docs/design_notes.md` §17 与 `DECISION_LOG.md` |
 | `DECISION_LOG.md` | **决策日志**（入库；因快照只有一个压缩提交，2026-10-18 依据 README/设计说明/清单重建）：每个版本为什么跑/不跑什么、看到什么、据此决定了什么——探索/确认分离的书面轨迹；正式版本的逐种子证据另由 `archive_release.py` 归档 |
-| `audit_gates.py` | **评审二/四/七轮的可执行审计入口**（零实验）：数据泄漏（分词器来源/词表一致性/文档重叠）、纯 CPU 因果性单元审计（前缀不变性/标签移位/解码一致性）、分块归因/边界 vs 随机基线/长度口径/基线公平/失败集中度/预算对账，评审七的单因素设计门（声明对照的臂配置 diff 对声明的干预键集；冻结清单 mechanism_claim_allowed 标志对账）与 prefill-decode-内存测量工具 |
+| `audit_gates.py` | **兼容 shim**，实现位于 `_audit_gates/`；即**评审二/四/七轮的可执行审计入口**（零实验）：数据泄漏（分词器来源/词表一致性/文档重叠）、纯 CPU 因果性单元审计（前缀不变性/标签移位/解码一致性）、分块归因/边界 vs 随机基线/长度口径/基线公平/失败集中度/预算对账，评审七的单因素设计门（声明对照的臂配置 diff 对声明的干预键集；冻结清单 mechanism_claim_allowed 标志对账）与 prefill-decode-内存测量工具 |
 | `archive_release.py` | **不可变证据归档器**：把每个正式版本的产物（结果/分析/报告/冻结锁/决策日志/环境/权重哈希）打包为带逐文件 sha256 清单的 tar.gz，附独立 verify 子命令——Git 主仓仍只承载源码（design_notes §8），归档发布到只读位置 |
-| `m0_supp.py` | **M0/S1 驱动（已选定 B 档）**：扩规模路线图的代码入口——`params`（零 GPU 的 S1–S4 参数量核算）、`data`（FineWeb-Edu + 32k BPE 语料缓存）、`smoke`（B 档数据路径端到端自检）、`kernel`（G0 验证套件：三算子 kernel/eager 数值对照 + 稀疏注意力吞吐基准）、`full`（S1 主面板）；见下文“B 档 M0/S1” |
-| `build_report.py` | 零 GPU 报告构建器：从 `results_*/` + `analysis_*/` 产物重建 v7 报告（所有数字现算，绝不硬编码） |
+| `explib/m0/` | **M0/S1 驱动（已选定 B 档）**（`python -m explib.m0`）：扩规模路线图的代码入口——`params`（零 GPU 的 S1–S4 参数量核算）、`data`（FineWeb-Edu + 32k BPE 语料缓存）、`smoke`（B 档数据路径端到端自检）、`kernel`（G0 验证套件：三算子 kernel/eager 数值对照 + 稀疏注意力吞吐基准）、`full`（S1 主面板）；见下文“B 档 M0/S1” |
+| `build_report.py` | **兼容 shim**，实现位于 `_build_report/`；即零 GPU 报告构建器：从 `results_*/` + `analysis_*/` 产物重建 v7 报告（所有数字现算，绝不硬编码） |
 | `fuse_analysis.py` | 零 GPU fuse 对比驱动：从 `results_*/summary.json` 重算逐层边界对齐（tol=1）、块长统计与 PPL 曲线 |
+| `Makefile` | 零 GPU 入口：`make test`、`make plan`、`make audit`、`make install-check`、`make build`、`make clean` |
 | `docs/design_notes.md` | **设计与实现笔记**：块读门为何必须严格、且五处位置必须同步；动态分段器的前缀不变性要求；配对/可测量规则；报告约定；保证注意力按行分块与不分批形式等价的契约 |
 
-> **`exp_lib.py` 是唯一的代码来源，直接改它。**
+> **测量库位于 `explib/`，直接编辑其中的模块。**
+> `exp_lib.py`（以及 `csa_kernels.py`、`audit_gates.py`、`build_report.py`、
+> `data_guard.py`）只是重新导出拆分包的兼容 shim。
+>
+> **驱动入口。** 历史顶层的 v7–v12、M0/S1 与未结束块脚本现已迁入 `explib/` 下的模块：
+> 使用 `python -m explib.rope`、`python -m explib.scale`、
+> `python -m explib.resume`、`python -m explib.corruption`、
+> `python -m explib.length`、`python -m explib.confirmation`、
+> `python -m explib.m0`、`python -m explib.open_block`。子命令不变。
 
 ### 重新生成实验产物
 
@@ -52,7 +64,7 @@
 ```bash
 python run_gapfill.py smoke      # 端到端自检，零 GPU 消耗
 python run_gapfill.py full       # v6 主实验（受运行时上限约束）
-python v7_supp.py ...            # 各版本补充实验，子命令见对应脚本的 docstring
+python -m explib.rope ...        # 各版本补充实验，子命令见对应模块的帮助
 python build_report.py           # 从落盘的 results_*/ + analysis_*/ 重建报告
 ```
 
@@ -85,14 +97,15 @@ pip install -r requirements.lock
 #    （除 dense / 固定 / 动态臂外，还覆盖去一法消融的全部独有前向路径：
 #     随机 indexer、零内容池化、关 sink、learned fusion、HCA 层、dense+sink 对照）
 python run_gapfill.py smoke
-python v10_supp.py smoke           # 同时覆盖新腐坏模式 + NIAH + 从头训练对照
+python -m explib.corruption smoke  # 同时覆盖新腐坏模式 + NIAH + 从头训练对照
 python test_open_block.py         # 未结束块因果性/参考实现/掩码门禁（CPU）
-python open_block_supp.py smoke    # 未结束块矩阵的微型合成自检
-python open_block_supp.py main     # 8 配置 × 4 种子；可续跑
-python open_block_supp.py report   # 配对差 + 交互效应 + 精确符号翻转/Holm
-python open_block_supp.py aux      # 窗口外辅助面板
-python open_block_supp.py extended # 应急：4 上限 × 3 模式
-python v12_supp.py smoke           # 同时覆盖冻结最终测试的完整往返
+python -m explib.open_block smoke     # 未结束块矩阵的微型合成自检
+python -m explib.open_block pilot     # 单格短程运行
+python -m explib.open_block main      # 8 配置 × 4 种子；可续跑
+python -m explib.open_block report    # 配对差 + 交互效应 + 精确符号翻转/Holm
+python -m explib.open_block aux       # 窗口外辅助面板
+python -m explib.open_block extended  # 应急：4 上限 × 3 模式
+python -m explib.confirmation smoke   # 同时覆盖冻结最终测试的完整往返
 
 # 2) 正式补充实验（受运行时上限约束）：
 nohup python run_gapfill.py full > run_v6.log 2>&1 &
@@ -122,10 +135,10 @@ tail -f run_v6.log
 
 ```bash
 # 每张可见 GPU 一个 worker（推荐）：
-CSA_PAR=auto nohup python v11_supp.py full > run_v11.log 2>&1 &
+CSA_PAR=auto nohup python -m explib.length full > run_v11.log 2>&1 &
 
 # 只有 2 张卡、且只用这两张：
-CSA_PAR=2 CSA_PAR_GPUS=0,3 python v10_supp.py phase P3SL
+CSA_PAR=2 CSA_PAR_GPUS=0,3 python -m explib.corruption phase P3SL
 
 # 回到 100% 串行（默认）：不设 CSA_PAR
 ```
@@ -149,17 +162,17 @@ CSA_PAR=2 CSA_PAR_GPUS=0,3 python v10_supp.py phase P3SL
 
 ### B 档 M0 / S1（扩规模入口，已选定 B 档）
 
-B 档规模计划（入口 `m0_supp.py`；原 `docs/compute_plan.md` 已退役）在 WikiText-103 机制层之上新增第二条语料路径与
-S1–S4 规模阶梯，代码入口为 `m0_supp.py`：
+B 档规模计划（入口 `python -m explib.m0`；原算力规划文档已退役）在 WikiText-103 机制层之上新增第二条语料路径与
+S1–S4 规模阶梯，代码入口为 `python -m explib.m0`：
 
 ```bash
-python m0_supp.py params   # 零 GPU：S1–S4 参数量核算（对照规划值）
-python m0_supp.py data     # 构建 / 校验 FineWeb-Edu 缓存（M0_TOKENS=… 可调 cap）
-python m0_supp.py smoke    # 端到端自检：B 档数据路径 + 三条注意力路径
-python m0_supp.py kernel   # G0 套件：kernel/eager 数值对照 + 吞吐基准
-python m0_supp.py full     # S1 主面板（5 臂 × 4 seeds；CSA_PAR=auto 可用）
-M0_PANEL=S2 python m0_supp.py full   # S2 主面板（5 臂 × 3 seeds × 12B；M2_CAP_HOURS 可覆盖）
-python m0_supp.py auto     # 无人值守：G0 门（fail-closed）→ 证书复核 → 面板链自动启动；
+python -m explib.m0 params   # 零 GPU：S1–S4 参数量核算（对照规划值）
+python -m explib.m0 data     # 构建 / 校验 FineWeb-Edu 缓存（M0_TOKENS=… 可调 cap）
+python -m explib.m0 smoke    # 端到端自检：B 档数据路径 + 三条注意力路径
+python -m explib.m0 kernel   # G0 套件：kernel/eager 数值对照 + 吞吐基准
+python -m explib.m0 full     # S1 主面板（5 臂 × 4 seeds；CSA_PAR=auto 可用）
+M0_PANEL=S2 python -m explib.m0 full   # S2 主面板（5 臂 × 3 seeds × 12B；M2_CAP_HOURS 可覆盖）
+python -m explib.m0 auto     # 无人值守：G0 门（fail-closed）→ 证书复核 → 面板链自动启动；
                            #   默认 S1，M0_AUTO_CHAIN=S1,S2 顺序串行（中间不关机）；
                            #   G0 通过后默认 CSA_KERNEL=1（显式设置优先）；门失败则
                            #   不启动面板、不 push、留 40 分钟诊断窗口后关机
@@ -192,10 +205,10 @@ softmax，sink 作为归一化初值质量）。每个算子另有同一套算�
 autograd 图一一对应。
 
 ```bash
-python m0_supp.py kernel                 # 任意设备：ref 后端语义验证
-CSA_KERNEL=1 python m0_supp.py kernel    # CUDA + triton：完整 G0 套件
-CSA_KERNEL=1 python m0_supp.py full      # 内核模式 S1 主面板（G0 通过后）
-python m0_supp.py auto                   # 无人值守：G0 套件 → 证书 → 面板链
+python -m explib.m0 kernel                 # 任意设备：ref 后端语义验证
+CSA_KERNEL=1 python -m explib.m0 kernel    # CUDA + triton：完整 G0 套件
+CSA_KERNEL=1 python -m explib.m0 full      # 内核模式 S1 主面板（G0 通过后）
+python -m explib.m0 auto                   # 无人值守：G0 套件 → 证书 → 面板链
                                          #   （「G0 之后 B 档是否继续」改由机器裁决：
                                          #   证书存在 = 双判据全过 = 面板启动）
 ```
@@ -214,9 +227,9 @@ python m0_supp.py auto                   # 无人值守：G0 套件 → 证书 �
 ### v11 统计收尾套件
 
 ```bash
-python v11_supp.py smoke
-nohup python v11_supp.py full > run_v11.log 2>&1 &
-python v11_supp.py report         # 从磁盘重建 REPORT_v11.md（零 GPU）
+python -m explib.length smoke
+nohup python -m explib.length full > run_v11.log 2>&1 &
+python -m explib.length report         # 从磁盘重建 REPORT_v11.md（零 GPU）
 ```
 
 阶段：P4MT（RoPE 臂 seeds 0-5，完全沿用 P1L/P3MT 配方；续跑时跳过代码
@@ -229,10 +242,10 @@ n=4）。
 
 ```bash
 # v10：干扰注入机制探针 + 交叉扩规模 + topk 补 seed
-python v10_supp.py smoke
-nohup python v10_supp.py full > run_v10.log 2>&1 &
-python v10_supp.py analysis       # 零 GPU 统计 -> analysis_v10/
-python v10_supp.py report         # 从磁盘重建 REPORT_v10.md（零 GPU）
+python -m explib.corruption smoke
+nohup python -m explib.corruption full > run_v10.log 2>&1 &
+python -m explib.corruption analysis       # 零 GPU 统计 -> analysis_v10/
+python -m explib.corruption report         # 从磁盘重建 REPORT_v10.md（零 GPU）
 ```
 
 阶段（均可续跑）：P3MT（重训两个 RoPE 臂，P1L 配方）、P3MTC（**同预算
@@ -251,20 +264,20 @@ FLOPs，见 `docs/design_notes.md` §16）。成对污染协议、预注册交�
 ### v12 确认套件（探索 / 确认分离）
 
 ```bash
-python v12_supp.py smoke           # 端到端自检（微型 ckpt + 冻结清单副本）
-python v12_supp.py plan            # 零 GPU 预检：语义戳 + 实现绑定 + 准入 + 功效，不读 test；
-                                   #   通过后自动留档审计快照 analysis_v12/plan_snapshot.json
-python v12_supp.py auto            # 无人值守：与 full 同链，但显式去掉了「P5T 前人工停顿」——
-                                   #   plan 门先跑（fail-closed），批准证据（清单哈希/
-                                   #   代码戳/git 树/arms/seeds/主比较/α）自动落盘，
-                                   #   人工核对变为事后异步，不再阻塞链的启动
-python v12_supp.py phase P5C       # 按清单种子训练全部四个冻结臂（可续跑；主臂 0-5 由 P3MT/P4MT 覆盖）
-python v12_supp.py phase P5MP      # 扩展探针（全部模式 + NIAH + 对照），种子取自清单
-python v12_supp.py phase P5S2      # 等 token 大规模臂（8000 步）
-python v12_supp.py phase P5S3      # 6ND 参数量代理预算大规模臂（参数量比例缩步）
-python v12_supp.py phase P5T       # 冻结后的最终测试（读 wiki.test.raw，需冻结清单）
-python v12_supp.py analysis        # 零 GPU：共享 v10 统计 + 冻结确认性统计
-python v12_supp.py report          # 从磁盘重建 REPORT_v12.md（零 GPU）
+python -m explib.confirmation smoke           # 端到端自检（微型 ckpt + 冻结清单副本）
+python -m explib.confirmation plan            # 零 GPU 预检：语义戳 + 实现绑定 + 准入 + 功效，不读 test；
+                                              #   通过后自动留档审计快照 analysis_v12/plan_snapshot.json
+python -m explib.confirmation auto            # 无人值守：与 full 同链，但显式去掉了「P5T 前人工停顿」——
+                                              #   plan 门先跑（fail-closed），批准证据（清单哈希/
+                                              #   代码戳/git 树/arms/seeds/主比较/α）自动落盘，
+                                              #   人工核对变为事后异步，不再阻塞链的启动
+python -m explib.confirmation phase P5C       # 按清单种子训练全部四个冻结臂（可续跑；主臂 0-5 由 P3MT/P4MT 覆盖）
+python -m explib.confirmation phase P5MP      # 扩展探针（全部模式 + NIAH + 对照），种子取自清单
+python -m explib.confirmation phase P5S2      # 等 token 大规模臂（8000 步）
+python -m explib.confirmation phase P5S3      # 6ND 参数量代理预算大规模臂（参数量比例缩步）
+python -m explib.confirmation phase P5T       # 冻结后的最终测试（读 wiki.test.raw，需冻结清单）
+python -m explib.confirmation analysis        # 零 GPU：共享 v10 统计 + 冻结确认性统计
+python -m explib.confirmation report          # 从磁盘重建 REPORT_v12.md（零 GPU）
 ```
 
 P5T 在 `confirmation_frozen.json` 缺失时拒绝运行，代码语义戳与清单不一致
@@ -298,14 +311,14 @@ python archive_release.py plan v13 --dirs results_lm_test analysis_v12   # 证�
 
 ```bash
 # v8：规模面板补齐 4 seeds + RoPE 20k 长跑
-python v8_supp.py smoke
-python v8_supp.py full            # 或：python v8_supp.py phase P1S / P2R
-python v8_supp.py analysis        # 零 GPU 统计 -> analysis_v8/
+python -m explib.scale smoke
+python -m explib.scale full            # 或：python -m explib.scale phase P1S / P2R
+python -m explib.scale analysis        # 零 GPU 统计 -> analysis_v8/
 
 # v9：补全 topk 扫描（bs=1）+ RoPE-20k 第三 seed + 报告
-python v9_supp.py smoke
-nohup python v9_supp.py full > run_v9.log 2>&1 &
-python v9_supp.py report          # 从磁盘重建 REPORT_v9.md（零 GPU）
+python -m explib.resume smoke
+nohup python -m explib.resume full > run_v9.log 2>&1 &
+python -m explib.resume report          # 从磁盘重建 REPORT_v9.md（零 GPU）
 ```
 
 设计依据与这些阶段依赖的配对/可测量规则见 `docs/design_notes.md`。
@@ -317,12 +330,12 @@ reviewer 关切的实验并重建报告：
 
 ```bash
 # 零 GPU：解析式 FLOPs/KV-cache + 成对符号翻转统计 + 报告重建
-python v7_supp.py analysis
+python -m explib.rope analysis
 # 逐阶段运行（可续跑），或一次跑完整链：
-python v7_supp.py phase P0E   # 40k 步长跑
-python v7_supp.py phase P2S   # 规模重播种至 4 seeds
-python v7_supp.py phase P1L   # 长度外推
-python v7_supp.py phase P1T   # seq-2048 topk 扫描
+python -m explib.rope phase P0E   # 40k 步长跑
+python -m explib.rope phase P2S   # 规模重播种至 4 seeds
+python -m explib.rope phase P1L   # 长度外推
+python -m explib.rope phase P1T   # seq-2048 topk 扫描
 python build_report.py        # 从产物重建 REPORT_v7.md（零 GPU）
 ```
 
@@ -339,7 +352,7 @@ python build_report.py        # 从产物重建 REPORT_v7.md（零 GPU）
 
 ## 评审四硬化（本轮）
 
-逐条核对见 `REVIEW_4_RESPONSE.md`。核心变化是把原先的软约束变成机器闸门：
+逐条核对见 `DECISION_LOG.md` 的 review-4 条目与 `docs/design_notes.md` §25。核心变化是把原先的软约束变成机器闸门：
 
 - 报告措辞统一走 `exp_lib.reportable_claim`（n≥6、原始 p、Holm p、
   `mean>std`、族级最小可达 p）；`attach_holm` 输出族级分辨率上限，
@@ -364,7 +377,7 @@ python build_report.py        # 从产物重建 REPORT_v7.md（零 GPU）
   AttnCfg 键集，`single_factor_design_audit` 逐层 diff 两个臂的实际配置
   ——多一个键（第二个因素）、少一个键（干预消失）、缺声明都 refuse；
   `kind` 在差集里标为 architecture_level，方法 vs 参数对齐稠密基线因此
-  是架构级对照。`v12_supp.py plan` 把冻结清单的 `mechanism_claim_allowed`
+  是架构级对照。`python -m explib.confirmation plan` 把冻结清单的 `mechanism_claim_allowed`
   变成可核验属性：cfg diff 落在单一干预族、两臂实际训练目标一致、参数量
   对齐同时成立才判单因素；True 标志挂上非单因素比较直接 refuse。HCA 动态
   臂的 comp_lambda_mult=4 与 block_size（inert）差异首次写进对照声明
