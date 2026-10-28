@@ -2735,19 +2735,27 @@ python v12_supp.py plan           # 冻结预检不变：72/72、6 个主比较
   `source_tree` 和 `dependency_contract`，让「机器在批准计划时看到的是
   哪份源码/哪个环境」可异步复核。
 - `exp_lib.parse_requirements_lock()` / `dependency_contract()`：解析
-  `name==version` lock（忽略注释与 `--extra-index-url` 等选项），逐条与
+  `name==version` lock（忽略普通注释与 `--extra-index-url` 等选项），逐条与
   `importlib.metadata` 的已安装版本比对，并报告未 pin 的已安装分布。
   `mismatch` / `missing` / `invalid` 是失败；`partial` 表示所有 pin 都匹配
-  但 lock 不是完整环境记录。
+  但 lock 不是完整环境记录。`# python-version:` /
+  `# python-implementation:` / `# platform:` 三条机器可读声明会被解析为
+  `interpreter` 契约：声明值与运行解释器不一致时直接 `mismatch`；没有声明
+  的旧 lock 保持可用但报告 `unverified`，绝不静默假定匹配。
 - `requirements.lock` 改为当前 CPU 测试环境的**完整 `pip freeze`**
-  （48 个分布，含 `torch==2.14.1+cpu`，并在文件头声明 CPU wheel index），
-  不再只有 5 个直接依赖。
+  （48 个分布，含 `torch==2.14.1+cpu`，并在文件头声明 CPU wheel index 与
+  解释器/平台），不再只有 5 个直接依赖。
+- `requirements-ci.txt` 不再重复五个直接 pin，而是 `-r requirements.lock`：
+  CI 安装的就是本地复核过的完整闭包，避免第二份列表与 lock 漂移。
 - `audit_gates.py source`：把当前源码树与 `plan_snapshot.json`（或
   `results_*/summary.json` 的 provenance）记录的 `source_tree` 比对；
   有完整 manifest 时给出 added/removed/changed 文件；无记录时明确
   `not_verifiable_locally`，绝不把 git commit 当作源码哈希。
 - `audit_gates.py dependencies`：执行 lock 契约；`partial` 作为 warning，
-  `mismatch`/`missing`/`invalid` 为 fail。两者都并入 `audit_gates.py report`。
+  `mismatch`/`missing`/`invalid` 为 fail。输出新增 `interpreter_status` /
+  `interpreter_declared` / `interpreter_actual` / `interpreter_problems`，
+  解释器不匹配时把具体 clause 差异列入 `problems`。两者都并入
+  `audit_gates.py report`。
 - `environment_snapshot()` 增加 `dependency_contract` 与
   `env_flags`（所有 `CSA_*` / `WT103_*` / `FWEDU_*` / `M0_*` / `V12_*`），
   补齐「未记录开关」这一类不可解释差异。
@@ -2768,12 +2776,39 @@ admission 判定。它也不把测试文件、README、docs 或 CI 配置纳入�
 python audit_gates.py source        # 与 plan_snapshot 的源码树比对
 python audit_gates.py dependencies  # lock 与已安装版本比对
 python v12_supp.py plan             # 预检不变：72/72、6 个主比较；快照含源码树/依赖契约
-python test_review_fixes.py         # L137–L140 覆盖摘要、lock 解析、门禁与完整 lock
+python test_review_fixes.py         # L137–L140a 覆盖摘要、lock 解析、门禁、完整 lock 与 CI 入口
 python -m pip install --dry-run --no-deps -r requirements.lock  # 验证每条 pin 可解析
 ```
 
 零 GPU、不读 test split；不改变 `confirmation_frozen*.json`、冻结臂/种子/
 终点/alpha/Holm family，也不需要 bump `CODE_SEMANTICS`。
+
+### 50.5 复核：解释器/平台也是一条环境契约（CPU-only）
+
+**问题.** §50 的 lock 只比较包版本；同一组 wheel 在另一个 Python patch 或
+平台上仍可能给出不同的数值/算子路径。同时 CI 的 `requirements-ci.txt` 只
+重复五个直接 pin，pip 会自行解析 transitive 闭包，绿色 CI 并不等于 lock
+环境通过。
+
+**改动.** `requirements.lock` 头增加 `python-version: 3.12.15`、
+`python-implementation: CPython`、`platform: Linux x86_64` 三条机器可读
+clause；`dependency_contract()` 新增 `interpreter` 子契约，比较
+`platform.python_version()` / `platform.python_implementation()` /
+`platform.system()+machine()`。`requirements-ci.txt` 只保留
+`-r requirements.lock`，让 CI 与本地共用同一份完整闭包。lock 同时把当前
+环境实际使用的 `fonttools==4.68.0`、`huggingface_hub==2.3.0`、
+`multidict==7.2.1` 对齐（567 项 CPU 测试已在上述版本上通过）；`ruff` 是
+开发期 lint 工具，明确不计入运行时闭包。
+
+**边界.** clause 是**声明**而非自动真理：旧 lock 仍可读取，但状态为
+`unverified`，不会伪造绿色；跨平台（例如 CUDA 机器）必须重新生成自己的
+lock 并改写三条 clause，不能用 CPU lock 的“匹配”掩盖 GPU 环境差异。
+`interpreter` 只进入 provenance/audit，不参与训练、resume、pairing 或冻结
+manifest。
+
+**复核.** `python audit_gates.py dependencies` 返回 `contract_status=ok`、
+`interpreter_status=match`；`python test_review_fixes.py` 为 `567/567`
+（新增 L138a 解释器/平台与非法声明、L140a CI 入口）。
 
 ## 51. 冻结锁绑定测量源码树：计划相同不再等于代码相同
 

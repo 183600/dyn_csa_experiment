@@ -37163,18 +37163,25 @@ def source_tree_summary(root=None):
     return out
 
 
+_LOCK_ENV_KEYS = ('python-version', 'python-implementation', 'platform')
+
+
 def parse_requirements_lock(path=None):
     """Parse a ``name==version`` lock without importing packaging.
 
-    Options (e.g. ``--extra-index-url``) and comments are recorded but ignored
-    for the version comparison; ambiguous/duplicate pins are an error rather
-    than "last line wins", because that would silently change the environment
-    a release was verified against.
+    Options (e.g. ``--extra-index-url``) are recorded but ignored for the
+    version comparison; ambiguous/duplicate pins are an error rather than
+    "last line wins", because that would silently change the environment a
+    release was verified against.  Machine-readable interpreter clauses
+    (``# python-version:``, ``# python-implementation:``, ``# platform:``)
+    are collected in ``environment``; every other comment is ignored.  A
+    legacy lock without the clauses is accepted but reports the interpreter
+    as unverified rather than inventing a match.
     """
     path = os.path.abspath(path or os.path.join(
         os.path.dirname(os.path.abspath(__file__)), 'requirements.lock'))
     out = {'path': path, 'exists': os.path.isfile(path), 'pins': {},
-           'options': [], 'invalid': [], 'sha256': None}
+           'options': [], 'invalid': [], 'sha256': None, 'environment': {}}
     if not out['exists']:
         return out
     with open(path, 'rb') as fh:
@@ -37183,7 +37190,25 @@ def parse_requirements_lock(path=None):
     text = raw.decode('utf-8', 'replace')
     _pin_re = re.compile(
         r'^([A-Za-z0-9][A-Za-z0-9._-]*)(?:\[[^\]]*\])?\s*==\s*([^\s;]+)$')
+    _env_re = re.compile(
+        r'^#\s*(' + '|'.join(re.escape(k) for k in _LOCK_ENV_KEYS)
+        + r')\s*:\s*(.+?)\s*$', re.IGNORECASE)
     for line in text.splitlines():
+        _comment = line.strip()
+        if _comment.startswith('#'):
+            _em = _env_re.match(_comment)
+            if _em:
+                _ek = _em.group(1).lower()
+                _ev = _em.group(2).strip()
+                if not _ev:
+                    out['invalid'].append(
+                        f'empty environment declaration: {_ek}')
+                elif _ek in out['environment'] and out['environment'][_ek] != _ev:
+                    out['invalid'].append(
+                        f'duplicate/conflicting environment declaration: {_ek}')
+                else:
+                    out['environment'][_ek] = _ev
+            continue
         s = line.split('#', 1)[0].strip()
         if not s:
             continue
@@ -37214,15 +37239,57 @@ def parse_requirements_lock(path=None):
     return out
 
 
+def _interpreter_contract(declared=None):
+    """Compare the lock's interpreter clauses with the running interpreter.
+
+    Package pins alone do not identify a numerical stack: the same wheels can
+    run on a different Python patch or platform.  A legacy lock without the
+    clauses is ``unverified`` (never a silent match).  Only clauses that are
+    actually declared are compared; the caller decides how to report it.
+    """
+    import platform as _platform
+    declared = declared if isinstance(declared, dict) else {}
+    expected = {}
+    for key in _LOCK_ENV_KEYS:
+        value = declared.get(key)
+        if isinstance(value, str) and value.strip():
+            expected[key] = value.strip()
+    actual = {
+        'python-version': _platform.python_version(),
+        'python-implementation': _platform.python_implementation(),
+        'platform': f'{_platform.system()} {_platform.machine()}'.strip(),
+    }
+    problems = []
+    for key, want in expected.items():
+        got = actual.get(key)
+        if str(got) != str(want):
+            problems.append(f'{key}: lock declares {want!r}, running {got!r}')
+    if not expected:
+        status = 'unverified'
+        note = ('the lock does not declare python-version / '
+                'python-implementation / platform; the interpreter identity '
+                'cannot be verified from the lock')
+    elif problems:
+        status = 'mismatch'
+        note = 'the running interpreter/platform does not match the lock'
+    else:
+        status = 'match'
+        note = 'the running interpreter/platform matches the lock clauses'
+    return {'declared': expected, 'actual': actual, 'status': status,
+            'problems': problems, 'note': note}
+
+
 def dependency_contract(lock_path=None):
     """Compare the declared lock with the versions actually installed.
 
     A lock that is present but incomplete or stale is the reproducibility
     failure mode a release must expose: the same git commit then runs on a
     different numerical stack.  ``partial`` means every pinned entry matches
-    but extra installed distributions are not pinned (the lock is not a full
-    environment record).  Tooling (pip/setuptools/wheel) is not a runtime
-    dependency and is excluded from the coverage check.
+    but extra installed distributions are not pinned, or the lock does not
+    declare the interpreter/platform (the lock is not a full environment
+    record).  ``mismatch`` also covers a declared interpreter/platform that
+    differs from the running one.  Tooling (pip/setuptools/wheel) is not a
+    runtime dependency and is excluded from the coverage check.
     """
     try:
         parsed = parse_requirements_lock(lock_path)
@@ -37233,12 +37300,14 @@ def dependency_contract(lock_path=None):
                 'lock_path': os.path.abspath(str(lock_path or 'requirements.lock')),
                 'lock_sha256': None, 'n_pinned': 0, 'options': [],
                 'mismatches': [], 'missing': [], 'unpinned_installed': [],
+                'interpreter': _interpreter_contract(),
                 'invalid': [f'could not read the lock: {type(e).__name__}: {e}'],
                 'status': 'invalid',
                 'note': 'the lock file exists but could not be read'}
     out = {'kind': 'dependency_contract', 'lock_path': parsed['path'],
            'lock_sha256': parsed['sha256'], 'n_pinned': len(parsed['pins']),
            'options': parsed['options'], 'mismatches': [], 'missing': [],
+           'interpreter': _interpreter_contract(parsed.get('environment')),
            'invalid': list(parsed['invalid']), 'unpinned_installed': [],
            'status': 'ok', 'note': ''}
     if not parsed['exists']:
@@ -37270,21 +37339,36 @@ def dependency_contract(lock_path=None):
         elif str(got) != str(ent['version']):
             out['mismatches'].append({'name': ent['name'], 'expected': ent['version'],
                                       'installed': str(got)})
-    _tooling = {'pip', 'setuptools', 'wheel', 'pkg-resources', 'distribute'}
+    _tooling = {'pip', 'setuptools', 'wheel', 'pkg-resources', 'distribute',
+                'ruff'}
     out['unpinned_installed'] = sorted(
         n for n in installed if n not in parsed['pins'] and n not in _tooling)
     out['n_installed'] = len(installed)
     out['n_unpinned_installed'] = len(out['unpinned_installed'])
-    if out['mismatches'] or out['missing']:
+    _interp = out['interpreter']
+    _version_bad = bool(out['mismatches'] or out['missing'])
+    _interp_bad = _interp.get('status') == 'mismatch'
+    if _version_bad or _interp_bad:
         out['status'] = 'mismatch'
-        out['note'] = 'installed versions do not match the lock'
-    elif out['unpinned_installed']:
+        if _version_bad and _interp_bad:
+            out['note'] = ('installed versions and the running '
+                           'interpreter/platform do not match the lock')
+        elif _interp_bad:
+            out['note'] = 'the running interpreter/platform does not match the lock'
+        else:
+            out['note'] = 'installed versions do not match the lock'
+    elif out['unpinned_installed'] or _interp.get('status') == 'unverified':
         out['status'] = 'partial'
-        out['note'] = ('every pinned entry matches, but the lock does not pin '
-                       'all installed runtime distributions')
+        _why = []
+        if out['unpinned_installed']:
+            _why.append('the lock does not pin all installed runtime distributions')
+        if _interp.get('status') == 'unverified':
+            _why.append('the lock does not declare the interpreter/platform')
+        out['note'] = ('every pinned entry matches, but ' + ' and '.join(_why))
     else:
-        out['note'] = ('every installed runtime distribution is pinned and '
-                       'matches (pip/setuptools/wheel excluded as tooling)')
+        out['note'] = ('every installed runtime distribution and the '
+                       'interpreter/platform are pinned and match '
+                       '(pip/setuptools/wheel excluded as tooling)')
     return out
 
 

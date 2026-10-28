@@ -1,16 +1,21 @@
-# CI-only dependency set (CPU, Python 3.12).
+# CI-only entry point into the verified environment (CPU, Python 3.12).
 #
-# 与 requirements.lock 保持一致，但只用于 CI：
-#   - continuous-loop.yml 里预热一次，供测试门直接复用；
-#   - test.yml 里作为 setup-python 的缓存键（cache-dependency-path）。
-# 这样 `actions/setup-python` 的 pip 缓存有稳定的依赖文件可 hash，
-# 也避免 CI 每次去解析 requirements.txt 的宽版本范围、导致缓存频繁失效。
+# This file used to repeat only the five direct dependencies.  CI then
+# resolved its own transitive closure and could install a different stack
+# than the local reproduction environment, so a green test run did not prove
+# that the locked environment passes.  Install the lock itself instead: the
+# lock is the single environment contract (including the +cpu torch wheel
+# selected by its --extra-index-url) and exp_lib.dependency_contract()
+# verifies the interpreter/platform clauses it declares.
+#
+#   - continuous-loop.yml installs this file once for the test gate;
+#   - test.yml uses it as the setup-python cache key (cache-dependency-path).
 #
 # 安装方式（CPU wheel）：
 #   python -m pip install -r requirements-ci.txt \
 #     --extra-index-url https://download.pytorch.org/whl/cpu
-numpy==2.5.4
-torch==2.14.1
-tokenizers==0.23.3
-datasets==5.1.0
-matplotlib==3.11.2
+#
+# Do not add direct pins here: a second list would silently drift from the
+# lock again.  Update requirements.lock (then regenerate it on the target
+# machine) and both local reproduction and CI move together.
+-r requirements.lock

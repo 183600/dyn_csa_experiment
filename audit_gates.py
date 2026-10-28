@@ -5647,6 +5647,7 @@ def audit_dependencies(lock_path=None):
     """Verify the installed environment against requirements.lock."""
     L = _import_exp_lib()
     c = L.dependency_contract(lock_path)
+    _interp = c.get('interpreter') if isinstance(c.get('interpreter'), dict) else {}
     out = {
         'kind': 'dependency_audit',
         'status': ('ok' if c.get('status') in ('ok', 'partial') else 'fail'),
@@ -5660,11 +5661,17 @@ def audit_dependencies(lock_path=None):
         'missing': c.get('missing') or [],
         'invalid': c.get('invalid') or [],
         'unpinned_installed': (c.get('unpinned_installed') or [])[:50],
+        'interpreter_status': _interp.get('status'),
+        'interpreter_declared': _interp.get('declared') or {},
+        'interpreter_actual': _interp.get('actual') or {},
+        'interpreter_problems': _interp.get('problems') or [],
         'problems': [],
         'warnings': [],
     }
     if c.get('status') not in ('ok', 'partial'):
         out['problems'].append(c.get('note') or f'dependency contract is {c.get("status")}')
+        if _interp.get('status') == 'mismatch':
+            out['problems'].extend(_interp.get('problems') or [])
     elif c.get('status') == 'partial':
         out['warnings'].append(c.get('note') or 'the lock does not pin every installed distribution')
     print(json.dumps(out, ensure_ascii=False, indent=2)[:4000])

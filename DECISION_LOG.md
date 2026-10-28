@@ -3069,3 +3069,37 @@ NIAH 的 top-1 accuracy 仍是主端点，单因素声明不改变 Holm 族、�
 `niah_contrasts` 五项全部 verified；`python test_review_fixes.py` 通过
 `565/565`（0 skipped，新增 L62c）。覆盖共享 override 的键集、
 跨臂不残留、错误 factors/override 标签 fail、记录层 fail-closed。
+
+## 2026-10-28 — CI 与解释器/平台纳入依赖锁契约（no new runs）
+
+零 GPU 的可复现性硬化；不新增训练、不读取 test split、不修改冻结清单的
+字节/种子/端点/alpha/Holm 规则，也不改 `CODE_SEMANTICS`。
+
+**Problem.** `requirements.lock` 是完整 48 包闭包，但 CI 安装的是另一份
+只有五个直接依赖的 `requirements-ci.txt`；pip 会自行解析 transitive 版本，
+所以绿色 CI 不能证明锁环境通过。lock 本身也只钉包版本，没有声明生成它的
+Python patch、实现和平台，无法阻止同一份 lock 在另一套解释器上被当作
+“匹配”。
+
+**Fix.** `requirements-ci.txt` 改为只含 `-r requirements.lock`，CI 与本地
+共用同一份完整闭包。`requirements.lock` 头新增机器可读的
+`# python-version: 3.12.15` / `# python-implementation: CPython` /
+`# platform: Linux x86_64`；`parse_requirements_lock()` 解析这三条声明，
+`dependency_contract()` 新增 `interpreter` 子契约并比较实际运行值，声明
+不一致即 `mismatch`，旧 lock 无声明时报告 `unverified` 而非静默匹配。
+`audit_gates.audit_dependencies()` 输出 declared/actual/problems 明细。
+同时把 lock 与实际已验证环境对齐（`fonttools==4.68.0`、
+`huggingface_hub==2.3.0`、`multidict==7.2.1`），并把开发期 `ruff` 明确
+排除在运行时闭包覆盖之外。
+
+**Boundary.** 解释器 clause 是声明，不是自动证明；CUDA/其他平台必须重新
+生成自己的 lock 并改写三条 clause，不能复用 CPU lock 的“匹配”。该契约只
+进入 provenance/audit，不参与训练、resume、pairing、P5T admission 或冻结
+manifest。`requirements-ci.txt` 不再保存直接 pin，避免第二份列表再次漂移。
+
+**Verification.** `python test_review_fixes.py` 通过 `567/567`（0 skipped；
+新增 L138a 解释器/平台匹配、三条 clause 各自 mismatch、legacy `unverified`、
+冲突声明 invalid；L140a CI 只引用 lock）。`python audit_gates.py
+dependencies` 返回 `status=ok`、`contract_status=ok`、
+`interpreter_status=match`，48 个 pin 与 50 个已安装分布一致（`ruff`
+作为开发工具排除）。`python v12_supp.py plan` 复跑确认计划/快照未变。

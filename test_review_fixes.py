@@ -19365,6 +19365,75 @@ def t_dependency_contract_parses_lock_and_detects_mismatch():
         assert c['status'] == 'missing_lock', c
 
 
+def t_dependency_contract_binds_interpreter_and_platform():
+    """Package pins alone are not an environment: the interpreter must match.
+
+    A lock is only the verified numerical stack when it declares which Python
+    implementation/patch and platform produced it.  Legacy locks without the
+    clauses stay usable but report `unverified`; a declared mismatch fails the
+    contract instead of silently accepting another stack.
+    """
+    import platform
+    from importlib import metadata as _md
+    with tempfile.TemporaryDirectory() as td:
+        lock = os.path.join(td, 'requirements.lock')
+        good = {
+            'python-version': platform.python_version(),
+            'python-implementation': platform.python_implementation(),
+            'platform': f'{platform.system()} {platform.machine()}'.strip(),
+        }
+
+        def _write(declared):
+            with open(lock, 'w', encoding='utf-8') as f:
+                f.write(f'numpy=={_md.version("numpy")}\n')
+                for k, v in declared.items():
+                    f.write(f'# {k}: {v}\n')
+
+        _write(good)
+        parsed = L.parse_requirements_lock(lock)
+        assert parsed['environment'] == good, parsed
+        c = L.dependency_contract(lock)
+        assert c['interpreter']['status'] == 'match', c['interpreter']
+        assert c['interpreter']['declared'] == good, c['interpreter']
+        assert c['status'] in ('ok', 'partial'), c
+        for key, bad in (('python-version', '0.0.0'),
+                         ('python-implementation', 'NotCPython'),
+                         ('platform', 'NotAPlatform')):
+            declared = dict(good, **{key: bad})
+            _write(declared)
+            c = L.dependency_contract(lock)
+            assert c['interpreter']['status'] == 'mismatch', (key, c['interpreter'])
+            assert c['status'] == 'mismatch', (key, c)
+            assert any(p.startswith(key) for p in c['interpreter']['problems']), (
+                key, c['interpreter']['problems'])
+        _write({})
+        c = L.dependency_contract(lock)
+        assert c['interpreter']['status'] == 'unverified', c['interpreter']
+        assert c['interpreter']['problems'] == [], c['interpreter']
+        assert c['status'] == 'partial', c
+        with open(lock, 'w', encoding='utf-8') as f:
+            f.write(f'numpy=={_md.version("numpy")}\n')
+            f.write('# python-version: 3.12.15\n')
+            f.write('# python-version: 3.13.0\n')
+        c = L.dependency_contract(lock)
+        assert c['status'] == 'invalid' and c['invalid'], c
+
+
+def t_requirements_ci_uses_the_verified_lock():
+    """CI must install the lock itself, not a second, drifting pin list."""
+    path = os.path.join(REPO, 'requirements-ci.txt')
+    with open(path, encoding='utf-8') as f:
+        lines = [ln.strip() for ln in f]
+    requirements = [ln for ln in lines if ln and not ln.startswith('#')]
+    assert requirements == ['-r requirements.lock'], (
+        'requirements-ci.txt must reference requirements.lock and contain no '
+        f'direct pins (found {requirements})')
+    parsed = L.parse_requirements_lock(os.path.join(REPO, 'requirements.lock'))
+    assert set(parsed['environment']) == {
+        'python-version', 'python-implementation', 'platform'}, parsed['environment']
+    assert not parsed['invalid'], parsed['invalid']
+
+
 def t_audit_source_and_dependency_gates():
     cur = L.source_tree_manifest()
     with tempfile.TemporaryDirectory() as td:
@@ -24591,8 +24660,10 @@ def main():
     _check('L136 open-block training receives the panel deadline', t_open_block_cell_receives_the_panel_deadline)
     _check('L137 source-tree digest tracks exact source bytes', t_source_tree_manifest_tracks_exact_bytes)
     _check('L138 dependency lock contract detects stale/missing pins', t_dependency_contract_parses_lock_and_detects_mismatch)
+    _check('L138a dependency lock binds interpreter/platform, not only pins', t_dependency_contract_binds_interpreter_and_platform)
     _check('L139 source/dependency gates fail closed and bind evidence', t_audit_source_and_dependency_gates)
     _check('L140 requirements.lock is a full transitive closure', t_requirements_lock_is_a_complete_environment)
+    _check('L140a CI installs the verified lock instead of a second pin list', t_requirements_ci_uses_the_verified_lock)
     _check('L141 freeze lock binds the measurement source and refuses drift', t_freeze_lock_binds_the_measurement_source)
     _check('L142 source audit verifies the freeze-lock digest and legacy boundary', t_freeze_lock_source_audit_and_legacy_boundary)
     _check('L143 disclosed source drift is persisted and audited with a snapshot', t_freeze_lock_persists_declared_drift)
