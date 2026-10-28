@@ -613,6 +613,333 @@ def methodology_seed_plan(n_seeds, design=None, baselines=None, alpha=0.05, vari
             'ablation_complete': _ablation.get('complete'),
             'note': 'a panel below the minimum is DESCRIPTIVE ONLY: the exact-test resolution floor, not the observed effect, bounds its p value'}
 
+def _interaction_pair(a, b):
+    """Order-insensitive component pair key; ``None`` if either id is invalid."""
+    if not isinstance(a, str) or not isinstance(b, str):
+        return None
+    a, b = a.strip(), b.strip()
+    if not a or not b or a == b:
+        return None
+    return tuple(sorted((a, b)))
+
+
+def _factorial_factor_names(spec):
+    """Return the two distinct factor names of a factorial declaration."""
+    if not isinstance(spec, dict):
+        return None
+    factors = spec.get('factors')
+    if (not isinstance(factors, (list, tuple)) or len(factors) != 2
+            or not all(isinstance(f, str) and f.strip() for f in factors)):
+        return None
+    a, b = factors[0].strip(), factors[1].strip()
+    if a == b:
+        return None
+    return a, b
+
+
+def _scope_pairs(scope, components):
+    """Normalise a declared interaction scope to a set of component pairs.
+
+    The canonical form is ``{name: {'factors': (...), ...}}``.  A bare list of
+    factor names is also accepted for a single scope.  Malformed declarations
+    raise, so the public audit can fail closed instead of silently dropping a
+    pair from the denominator.
+    """
+    if scope is None:
+        return set()
+    pairs = set()
+    if isinstance(scope, (list, tuple)):
+        factors = [str(x).strip() for x in scope if isinstance(x, str) and x.strip()]
+        scope = {'scope': {'factors': factors}}
+    if not isinstance(scope, dict):
+        raise ValueError(f'interaction scope must be a mapping or list, got {type(scope).__name__}')
+    for name, spec in scope.items():
+        if isinstance(spec, (list, tuple)):
+            factors = spec
+        elif isinstance(spec, dict):
+            factors = spec.get('factors')
+        else:
+            raise ValueError(f'interaction scope {name!r} must be a list or mapping')
+        if not isinstance(factors, (list, tuple)) or not factors:
+            raise ValueError(f'interaction scope {name!r} has no factor list')
+        clean = []
+        for f in factors:
+            if not isinstance(f, str) or not f.strip():
+                raise ValueError(f'interaction scope {name!r} has an invalid factor {f!r}')
+            clean.append(f.strip())
+        unknown = sorted(set(clean) - set(components))
+        if unknown:
+            raise ValueError(f'interaction scope {name!r} names undeclared component(s): '
+                             + ', '.join(unknown))
+        for a, b in itertools.combinations(sorted(set(clean)), 2):
+            pairs.add((a, b))
+    return pairs
+
+
+def _normalise_interaction_waivers(waivers, components):
+    """Return ``{(a, b): reason}`` with structural validation.
+
+    A waiver is a *scope* declaration, not evidence: it says why a pair is not
+    part of this study's interaction claim.  It must name two declared
+    components and carry a non-empty reason.  An empty reason is rejected
+    because "not tested" without a reason is exactly the silent omission this
+    audit exists to expose.
+    """
+    out = {}
+    if waivers is None:
+        return out
+    if not isinstance(waivers, dict):
+        raise ValueError(f'interaction waivers must be a mapping, got {type(waivers).__name__}')
+    for key, reason in waivers.items():
+        if not isinstance(key, (tuple, list)) or len(key) != 2:
+            raise ValueError(f'interaction waiver key {key!r} must be a component pair')
+        pair = _interaction_pair(key[0], key[1])
+        if pair is None:
+            raise ValueError(f'interaction waiver key {key!r} is not a distinct component pair')
+        unknown = sorted(set(pair) - set(components))
+        if unknown:
+            raise ValueError(f'interaction waiver {key!r} names undeclared component(s): '
+                             + ', '.join(unknown))
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError(f'interaction waiver {key!r} needs a non-empty reason')
+        if pair in out:
+            raise ValueError(f'interaction waiver {key!r} duplicates pair {pair!r}')
+        out[pair] = reason.strip()
+    return out
+
+
+def interaction_coverage_audit(design=None, factorials=None, scope=None,
+                               waivers=None):
+    """Zero-GPU coverage gate for pairwise ablation interactions.
+
+    Leave-one-out completeness answers a per-component question.  It does not
+    tell the reader which *pairs* of components were ever manipulated
+    factorially, so a panel can look complete while every interaction remains
+    unmeasured.  This audit enumerates the component pairs declared in scope
+    and classifies each one as:
+
+    * ``tested``   - at least one 2x2 factorial names both components;
+    * ``waived``   - the design explicitly excludes the pair, with a reason;
+    * ``missing``  - neither tested nor waived.
+
+    A missing interaction may not be reported as additivity, and a set of
+    individually verified leave-one-out effects may not be added together as if
+    the modules were independent.  The audit returns ``coverage_status='ok'``
+    only when every in-scope pair is tested or waived; otherwise it is
+    ``'partial'``.  This is deliberately separate from
+    :func:`factorial_design_audit`: a valid 2x2 is not evidence that every
+    relevant pair was considered.  Structural defects (unknown components,
+    duplicate or reasonless waivers) fail closed; an untested pair is a
+    *reported design gap*, not a fabricated failure of the pairwise tests that
+    were actually run.
+    """
+    design = ABLATION_DESIGN if design is None else design
+    factorials = FACTORIAL_DESIGN if factorials is None else factorials
+    scope_spec = INTERACTION_SCOPE if scope is None else scope
+    out = {
+        'kind': 'interaction_coverage', 'status': 'ok',
+        'coverage_status': 'not_applicable', 'components': [],
+        'tested_pairs': [], 'waived_pairs': [], 'missing_pairs': [],
+        'unexpected_pairs': [], 'duplicate_pairs': {},
+        'factorials': {}, 'scope': {}, 'warnings': [], 'problems': [],
+        'full_pairwise_measured': False,
+        'claim_policy': {
+            'tested': ('only a measured 2x2 factorial may support an '
+                       'interaction/sub-additivity claim'),
+            'missing': ('a missing interaction is NOT evidence of additivity; '
+                        'do not add leave-one-out effects as if modules were '
+                        'independent'),
+            'waived': ('a waiver is an explicit scope exclusion, not a null '
+                       'result and not evidence about the pair'),
+            'individual_claims': ('an already measured 2x2 remains usable even '
+                                  'if another in-scope pair is missing; only '
+                                  'the "all core interactions were measured" '
+                                  'claim is closed'),
+        },
+    }
+    if not isinstance(design, dict) or not design:
+        out['status'] = 'fail'
+        out['problems'].append(
+            f'ablation design must be a non-empty mapping, got {type(design).__name__}')
+        return out
+    components = sorted(str(k) for k in design)
+    out['components'] = components
+    if not isinstance(factorials, dict):
+        out['status'] = 'fail'
+        out['problems'].append(
+            f'factorial design must be a mapping, got {type(factorials).__name__}')
+        return out
+    try:
+        expected = _scope_pairs(scope_spec, components)
+        waived = _normalise_interaction_waivers(waivers, components)
+    except ValueError as e:
+        out['status'] = 'fail'
+        out['problems'].append(str(e))
+        return out
+    out['scope'] = {
+        'declared_pairs': [list(p) for p in sorted(expected)],
+        'n_pairs': len(expected),
+        'source': 'argument' if scope is not None else 'INTERACTION_SCOPE',
+    }
+    tested = {}
+    for name, spec in factorials.items():
+        sname = str(name)
+        factors = _factorial_factor_names(spec)
+        rec = {'factors': list(factors) if factors else None,
+               'pair': None, 'status': 'invalid'}
+        out['factorials'][sname] = rec
+        if factors is None:
+            out['warnings'].append(
+                f'{sname}: factorial has no two distinct factor names; it '
+                'cannot cover an interaction pair')
+            continue
+        unknown = sorted(set(factors) - set(components))
+        if unknown:
+            out['status'] = 'fail'
+            out['problems'].append(
+                f'{sname}: factor(s) {unknown} are not declared components in '
+                'the ablation design')
+            continue
+        pair = _interaction_pair(*factors)
+        rec['pair'] = list(pair)
+        rec['status'] = 'tested'
+        if pair in tested:
+            out['duplicate_pairs'].setdefault(str(list(pair)), []).append(sname)
+            out['duplicate_pairs'][str(list(pair))].append(tested[pair])
+            out['warnings'].append(
+                f'{sname}: interaction pair {pair} is also declared by '
+                f'{tested[pair]}; only one factorial should define that pair')
+        else:
+            tested[pair] = sname
+    out['tested_pairs'] = [list(p) for p in sorted(tested)]
+    out['waived_pairs'] = [
+        {'pair': list(p), 'reason': r} for p, r in sorted(waived.items())]
+    out['missing_pairs'] = [
+        list(p) for p in sorted(expected - set(tested) - set(waived))]
+    out['unexpected_pairs'] = [
+        list(p) for p in sorted(set(tested) - expected)]
+    out['full_pairwise_measured'] = bool(
+        expected and not out['missing_pairs'] and not out['unexpected_pairs'])
+    if out['missing_pairs']:
+        out['coverage_status'] = 'partial'
+        out['warnings'].append(
+            'interaction(s) in the declared scope were not measured: '
+            + ', '.join('%s x %s' % tuple(p) for p in out['missing_pairs'])
+            + ' — report them as untested, not additive')
+    elif expected:
+        out['coverage_status'] = 'complete'
+    else:
+        out['coverage_status'] = 'not_applicable'
+        out['warnings'].append('no interaction scope is declared; coverage is unverifiable')
+    if out['unexpected_pairs']:
+        out['warnings'].append(
+            'factorial(s) measure pair(s) outside the declared interaction '
+            'scope: ' + ', '.join('%s x %s' % tuple(p)
+                                  for p in out['unexpected_pairs'])
+            + ' — extend the scope declaration or move the factorial out of this family')
+    _in_scope = set().union(*expected) if expected else set()
+    outside = sorted(set(components) - _in_scope)
+    out['components_outside_scope'] = outside
+    if outside:
+        out['warnings'].append(
+            'component(s) outside the declared interaction scope: '
+            + ', '.join(outside)
+            + ' — this is a claim boundary, not a measured zero interaction')
+    if out['problems']:
+        out['status'] = 'fail'
+    return out
+
+
+def ablation_factorial_anchor_audit(design=None, factorials=None):
+    """Check that each 2x2 factor is anchored to a declared leave-one-out.
+
+    A factorial can pass the parallel-manipulation gate while comparing arms
+    that were never declared as the ablation of either factor.  The cells then
+    estimate an interaction between two *ad hoc* manipulations, not between the
+    components the paper names.  For every factor this audit checks both
+    simple-effect pairs used by the factorial against
+    ``ABLATION_DESIGN[factor]`` (orientation-insensitive).  At least one level
+    must reuse a declared contrast; the other level normally uses the parallel
+    arm (for example ``csa_dyn_randidx`` vs ``csa_fix_randidx`` for dynamic
+    blocking when selection is at its control level).  Zero matches is a hard
+    violation.  The report records partial anchoring explicitly instead of
+    pretending both levels are the same declared contrast.
+    """
+    design = ABLATION_DESIGN if design is None else design
+    factorials = FACTORIAL_DESIGN if factorials is None else factorials
+    out = {'kind': 'ablation_factorial_anchor', 'status': 'ok',
+           'factorials': {}, 'violations': [], 'warnings': []}
+    if not isinstance(design, dict) or not isinstance(factorials, dict):
+        out['status'] = 'fail'
+        out['violations'].append('design and factorials must both be mappings')
+        return out
+    declared = {}
+    for comp, contrasts in design.items():
+        pairs = set()
+        if isinstance(contrasts, (list, tuple)):
+            for item in contrasts:
+                if isinstance(item, (list, tuple)) and len(item) >= 2:
+                    p = _interaction_pair(item[0], item[1])
+                    if p is not None:
+                        pairs.add(p)
+        declared[str(comp)] = pairs
+    for name, spec in factorials.items():
+        sname = str(name)
+        rec = {'factors': None, 'levels': {}, 'component_anchored': None}
+        out['factorials'][sname] = rec
+        factors = _factorial_factor_names(spec)
+        cells = spec.get('cells') if isinstance(spec, dict) else None
+        if factors is None or not isinstance(cells, dict):
+            continue
+        rec['factors'] = list(factors)
+        arms = {}
+        for key in _FACTORIAL_CELL_KEYS:
+            arm = cells.get(key)
+            if not isinstance(arm, str) or not arm.strip():
+                arms = None
+                break
+            arms[key] = arm.strip()
+        if arms is None:
+            continue
+        level_pairs = {
+            factors[0]: [
+                (arms[('active', 'control')], arms[('control', 'control')]),
+                (arms[('active', 'active')], arms[('control', 'active')]),
+            ],
+            factors[1]: [
+                (arms[('control', 'active')], arms[('control', 'control')]),
+                (arms[('active', 'active')], arms[('active', 'control')]),
+            ],
+        }
+        for factor, pairs in level_pairs.items():
+            if factor not in declared:
+                out['warnings'].append(
+                    f'{sname}: factor {factor!r} is not a declared ablation '
+                    'component; anchoring is unverifiable')
+                rec['levels'][factor] = {'declared_matches': None,
+                                         'status': 'unverifiable'}
+                continue
+            norm = []
+            for a, b in pairs:
+                p = _interaction_pair(a, b)
+                norm.append({'pair': list(p) if p else None,
+                             'declared': bool(p is not None and p in declared[factor])})
+            n_match = sum(1 for x in norm if x['declared'])
+            rec['levels'][factor] = {
+                'pairs': norm, 'declared_matches': n_match,
+                'status': ('anchored' if n_match == 2 else
+                           'partially_anchored' if n_match == 1 else
+                           'unanchored')}
+            if n_match == 0:
+                out['violations'].append(
+                    f'{sname}: factor {factor!r} uses no declared leave-one-out '
+                    'contrast; the interaction is between ad hoc arms, not the '
+                    'declared component')
+    if out['violations']:
+        out['status'] = 'fail'
+    return out
+
+
 def factorial_design_audit(design=None, present=None, factory=None, n_layers=6):
     """Zero-GPU gate for the declared 2x2 ablation interactions.
 
@@ -804,6 +1131,16 @@ def factorial_design_audit(design=None, present=None, factory=None, n_layers=6):
                      + ', '.join(str(x) for x in bad_h))
         rec['complete'] = bool(_ok and not missing and not extra
                                and not missing_arms)
+    coverage = interaction_coverage_audit(factorials=design)
+    report['interaction_coverage'] = coverage
+    report['warnings'].extend(coverage.get('warnings') or [])
+    if coverage.get('status') == 'fail':
+        report['violations'].extend(
+            'interaction coverage: ' + str(p) for p in coverage.get('problems') or [])
+    anchor = ablation_factorial_anchor_audit(factorials=design)
+    report['component_anchor'] = anchor
+    report['warnings'].extend(anchor.get('warnings') or [])
+    report['violations'].extend(anchor.get('violations') or [])
     if report['violations']:
         report['status'] = 'fail'
     return report

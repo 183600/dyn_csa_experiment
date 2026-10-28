@@ -304,7 +304,13 @@ def audit_factorial_design(manifest_path=None, *, n_layers=6):
       * 每组交互都有完整、指标对齐的预注册假设。
 
     这是 `single_factor` 的补集：单因素审计回答「每个臂只动了一个组件吗」，
-    factorial 审计回答「两个组件的 2x2 是否可识别、交互是否可解释」。"""
+    factorial 审计回答「两个组件的 2x2 是否可识别、交互是否可解释」。
+
+    返回还包含：
+      * `interaction_coverage`：声明范围内哪些组件对已有 2x2、哪些缺失；
+      * `component_anchor`：每个 factorial 因子是否锚定到已声明的留一法对照。
+    未测交互只记为设计缺口，不会把已有 2x2 的结论作废；但也不能据此把
+    留一法效应相加后声称模块可加。"""
     L = _import_exp_lib()
     out = L.factorial_design_audit(n_layers=n_layers)
     if manifest_path:
@@ -328,6 +334,33 @@ def audit_factorial_design(manifest_path=None, *, n_layers=6):
                 f'cannot read manifest {manifest_path}: '
                 f'{type(_e).__name__}: {_e}')
     print(json.dumps(out, ensure_ascii=False, indent=2))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 7e-2b) interaction_coverage：核心组件两两交互覆盖审计（零 GPU）
+# ---------------------------------------------------------------------------
+
+def audit_interaction_coverage(scope=None, waivers=None, *, verbose=True):
+    """核心组件两两交互覆盖审计（零 GPU）。
+
+    留一法完整不等于交互已刻画。该审计枚举 `INTERACTION_SCOPE` 中的组件对，
+    区分 `tested` / `waived` / `missing`；缺失的交互只能报告为未测，不能
+    写成可加，也不能把单独验证的留一法效应直接相加。`waivers` 是可选的
+    `{(a, b): reason}` 显式排除，不是零交互证据。"""
+    L = _import_exp_lib()
+    out = L.interaction_coverage_audit(scope=scope, waivers=waivers)
+    if verbose:
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+    return out
+
+
+def audit_factorial_anchor(design=None, factorials=None, *, verbose=True):
+    """检查每个 2x2 因子的 cell 对照是否锚定到声明的留一法对照（零 GPU）。"""
+    L = _import_exp_lib()
+    out = L.ablation_factorial_anchor_audit(design=design, factorials=factorials)
+    if verbose:
+        print(json.dumps(out, ensure_ascii=False, indent=2))
     return out
 
 

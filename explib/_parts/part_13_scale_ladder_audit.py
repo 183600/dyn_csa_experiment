@@ -1013,6 +1013,32 @@ INTERACTION_SESOI = {
     },
 }
 
+# ---- 交互覆盖范围：留一法不能替代 2x2 --------------------------------------
+# 留一法只回答「单独移除 X 会怎样」，不能回答「X 和 Y 同时存在时收益是否
+# 重叠」。本仓库已声明三组 dynamic_blocking × core module 的 2x2；但核心模块
+# 之间的三对交互（selection × pooling、selection × sink、pooling × sink）
+# 没有任何 2x2 臂，因此不能把它们写成「互不重叠」或「可加」。这里把
+# 「哪些组件对属于本研究要解释的交互范围」显式声明出来；覆盖审计把
+# tested / missing / waived 逐对点名。未测的交互不是零交互，也不自动
+# 关闭单个已测交互的结论，只关闭「整个核心模块族的交互已被刻画」这一
+# 更强的项目级主张。
+#
+# 只声明核心机制族：hybrid × dynamic 的轴不同（见 design_notes §59.3），
+# compression_regularizer / task_learned_boundary / local_fusion 也各自
+# 缺少可识别的 2x2 双关臂；把它们硬塞进同一个交互族只会制造不可解释的
+# 空槽位。范围外的组件由审计单独列为 outside_scope，而不是静默算作已覆盖。
+INTERACTION_SCOPE = {
+    'core_dynamic_modules': {
+        'factors': ('dynamic_blocking', 'learned_selection',
+                    'content_pooling', 'attention_sink'),
+        'rationale': ('Every pair in this set changes a different read/selection '
+                      'mechanism under the same csa_dynamic recipe; their '
+                      'overlap is the interaction claim the paper can plausibly '
+                      'need. Pairs without a scheduled double-ablation arm are '
+                      'reported as missing, not assumed additive.'),
+    },
+}
+
 # 主方法 vs 参数对齐基线的对比也属于「受控对比」：它回答的是方法本身是否
 # 优于同参数量、同优化器、同训练规模、同数据的稠密基线，而不是只回答「消融臂
 # 之间谁高谁低」。两条基线都来自 `variant_mlp_ratio` 的参数对齐（MLP 加宽
