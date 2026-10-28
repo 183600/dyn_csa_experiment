@@ -227,6 +227,27 @@ def t_binomial_tail_large_scale():
     for _q in (0.5, 0.55, 0.9, 0.999999):
         assert abs(L.signflip_power(2000, 10, _q, 0.05)
                    - L._binomial_sf_stable(_kmin, 2000, _q)) < 1e-15
+    # The log helper must agree with the float CDF at the centre.  Its
+    # large-m geometric tail approximation was only valid far below the
+    # mean; at m=n//2 it returned a positive "probability" (or raised a
+    # domain error through log1p(-exp(positive))).
+    for n in (50000, 100000, 1000000):
+        cdf = L._binom_cdf_half(n, n // 2)
+        log_cdf = L._log_binom_cdf_half(n, n // 2)
+        assert 0.0 < cdf < 1.0 and math.isfinite(log_cdf), (n, cdf, log_cdf)
+        assert abs(log_cdf - math.log(cdf)) < 1e-12, (n, log_cdf, cdf)
+    # n near the largest float and beyond it must still be evaluable: the
+    # beta path's int->float conversion overflows there, so the normal
+    # limit keeps the planning tail defined instead of raising.
+    for n in (2 ** 1024 - 1, 10 ** 309):
+        assert abs(L._binom_cdf_half(n, n // 2) - 0.5) < 1e-12, n
+        assert abs(L._log_binom_cdf_half(n, n // 2) + math.log(2.0)) < 1e-12, n
+        k = L.signflip_min_consistency(n, 1, 0.05)
+        assert k is not None and 0 < k < n, (n, k)
+        assert 2.0 * L._binom_cdf_half(n, n - k) <= 0.05 + 1e-15, (n, k)
+        assert 2.0 * L._binom_cdf_half(n, n - k + 1) > 0.05 + 1e-15, (n, k)
+    assert L.holm_min_attainable_p(2 ** 1024 - 1, 1, 0.05) == 0.0
+    assert math.isfinite(L._log_binom_cdf_half(2 ** 1024 - 1, 20001))
 
 
 def t_power():
@@ -1721,6 +1742,15 @@ def t_exact_signflip_at_scale():
     # a random Monte-Carlo p-value for the pre-registered exact test at n>20.
     v = V7.exact_sign_permutation([0.7] * 21)
     assert abs(v['p_exact_signflip'] - 2.0 / (1 << 21)) < 1e-18 and v.get('method') == 'exact-mitm', v
+    for n in (6, 21):
+        base = [1.0] * (n - 1) + [-1.0]
+        ref = L.exact_signflip_p(base)['p']
+        for scale in (1e-300, 1e150, 1e308):
+            d = [x * scale for x in base]
+            got = L.exact_signflip_p(d)['p']
+            br = BR.exact_signflip(d)['p_exact_signflip']
+            assert abs(got - ref) <= max(1e-18, ref * 1e-12), (n, scale, got, ref)
+            assert abs(br - ref) <= max(1e-18, ref * 1e-12), (n, scale, br, ref)
     rng = np.random.default_rng(11)
     d = rng.normal(size=21)
     got = L.exact_signflip_p(d)['p']
@@ -1774,6 +1804,19 @@ def t_signflip_saddlepoint_large_n():
     v = V7.exact_sign_permutation(list(rng.normal(0.2, 1.0, size=50)))
     assert v['method'].startswith('saddlepoint'), v
     assert 'saddlepoint' in v['test'], v
+    # A positive rescaling of every delta cannot change the sign-flip p.
+    # Very large/small magnitudes used to overflow/underflow the squared
+    # null variance and either raise or silently collapse to the floor.
+    base = [1.0] * 40 + [-1.0]
+    ref = L.exact_signflip_p(base)['p']
+    for scale in (1e-300, 1e-150, 1e150, 1e154, 1e308):
+        d = [x * scale for x in base]
+        r = L.exact_signflip_p(d)
+        br = BR.exact_signflip(d)
+        tol = max(1e-18, ref * 1e-12)
+        assert r['method'].startswith('saddlepoint'), (scale, r)
+        assert abs(r['p'] - ref) <= tol, (scale, r['p'], ref)
+        assert abs(br['p_exact_signflip'] - ref) <= tol, (scale, br, ref)
 
 
 def t_wilcoxon_exact_dp():

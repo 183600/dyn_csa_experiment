@@ -13715,6 +13715,9 @@ def _signflip_saddlepoint_p(values):
     m = len(vals)
     if m == 0:
         return 1.0, 'saddlepoint'
+    amax = max(abs(x) for x in vals)
+    if amax > 1e100 or amax < 1e-100:
+        vals = [x / amax for x in vals]
     T = abs(math.fsum(vals))
     sabs = math.fsum(abs(x) for x in vals)
     floor = min(1.0, math.ldexp(2.0, -m))
@@ -13723,8 +13726,7 @@ def _signflip_saddlepoint_p(values):
     # |S| can only equal the maximum sum when every sign is the same.
     if T >= sabs * (1.0 - 1e-13):
         return floor, 'saddlepoint'
-    amax = max(abs(x) for x in vals)
-    inv = 1.0 / amax
+    inv = 1.0 / max(abs(x) for x in vals)
 
     def _kp(t):
         return math.fsum(x * math.tanh(t * x) for x in vals)
@@ -13820,7 +13822,10 @@ def exact_signflip_p(deltas):
     n_nonzero = int(np.count_nonzero(d))
     p_floor = (1.0 if n_nonzero == 0
                else min(1.0, math.ldexp(2.0, -n_nonzero)))
-    obs = abs(float(d.mean()))
+    _scale = float(np.max(np.abs(d))) if n_nonzero else 0.0
+    d_work = (d / _scale
+              if (_scale > 1e100 or 0.0 < _scale < 1e-100) else d)
+    obs = abs(float(d_work.mean()))
     if n <= _SIGNFLIP_ENUM_MAX_N:
         total = 1 << n
         cnt = 0
@@ -13830,14 +13835,15 @@ def exact_signflip_p(deltas):
             bs = min(step, total - off)
             masks = np.arange(off, off + bs, dtype=np.int64)[:, None]
             signs = np.where((masks & (1 << bitpos)) != 0, 1.0, -1.0)
-            cnt += int((np.abs((signs * d[None, :]).mean(1)) >= obs - 1e-12).sum())
+            cnt += int((np.abs((signs * d_work[None, :]).mean(1))
+                    >= obs - 1e-12).sum())
         return {'n': n, 'p': float(cnt / total), 'n_dropped': n_dropped,
                 'n_nonzero': n_nonzero, 'p_floor': p_floor, 'method': 'exact'}
     if n <= _SIGNFLIP_MITM_MAX_N:
-        cnt = _signflip_mitm_count(d)
+        cnt = _signflip_mitm_count(d_work)
         return {'n': n, 'p': float(cnt / float(1 << n)), 'n_dropped': n_dropped,
                 'n_nonzero': n_nonzero, 'p_floor': p_floor, 'method': 'exact-mitm'}
-    p, method = _signflip_saddlepoint_p(d.tolist())
+    p, method = _signflip_saddlepoint_p(d_work.tolist())
     return {'n': n, 'p': float(p), 'n_dropped': n_dropped,
             'n_nonzero': n_nonzero, 'p_floor': p_floor, 'method': method}
 
@@ -15321,9 +15327,7 @@ def holm_min_attainable_p(n_seeds, m_comparisons, alpha=0.05):
             return 1.0
     # 2**-n underflowed.  A large enough family can still have
     # m * 2**-n above alpha (or even above 1), so do not report 0.
-    if n.bit_length() > 1024:
-        return 0.0
-    log_p = math.log(m) + math.log(2.0) - n * math.log(2.0)
+    log_p = math.log(m) + math.log(2.0) - _int_times_log2(n)
     if log_p >= 0.0:
         return 1.0
     if log_p < -745.0:
@@ -15535,6 +15539,57 @@ def global_multiplicity_audit(named_pvals, *, alpha=0.05,
     return out
 
 
+def _int_times_log2(n):
+    if n.bit_length() <= 1023:
+        return n * math.log(2.0)
+    shift = max(0, n.bit_length() - 1000)
+    hi, lo = divmod(n, 1 << shift)
+    try:
+        head = math.ldexp(float(hi) * math.log(2.0), shift)
+    except OverflowError:
+        return float('inf')
+    return math.fsum((head, float(lo) * math.log(2.0)))
+
+
+def _binom_normal_z_half(n, m):
+    diff = 2 * m + 1 - n
+    if diff == 0:
+        return 0.0
+    try:
+        sd = math.sqrt(n)
+    except OverflowError:
+        root = math.isqrt(n)
+        try:
+            sd = float(root)
+        except OverflowError:
+            return None
+    try:
+        return diff / sd
+    except OverflowError:
+        return None
+
+
+def _log_binom_normal_cdf_half(n, m):
+    z = _binom_normal_z_half(n, m)
+    if z is None:
+        return float('-inf')
+    if z >= 0.0:
+        tail = 0.5 * math.erfc(z / math.sqrt(2.0))
+        return float(math.log1p(-tail)) if tail < 1.0 else float('-inf')
+    if z >= -37.0:
+        cdf = 0.5 * math.erfc(-z / math.sqrt(2.0))
+        return float(math.log(cdf)) if cdf > 0.0 else float('-inf')
+    z2 = z * z
+    if not math.isfinite(z2):
+        return float('-inf')
+    inv2 = 1.0 / z2
+    series = 1.0 + inv2 * (-1.0 + inv2 * (3.0 + inv2 * (-15.0 + inv2 * (105.0 + inv2 * (-945.0)))))
+    if series <= 0.0:
+        return float('-inf')
+    return float(-0.5 * z2 - math.log(-z) - 0.5 * math.log(2.0 * math.pi)
+                 + math.log(series))
+
+
 def _binom_cdf_half(n, m):
     """P(Bin(n, 1/2) <= m), evaluated in log space.
 
@@ -15555,14 +15610,16 @@ def _binom_cdf_half(n, m):
         # P(X <= m) = 1 - P(X <= n-m-1) with n-m-1 < n/2.
         return float(1.0 - _binom_cdf_half(n, n - m - 1))
     # Regularized incomplete beta: P(Bin(n,1/2) <= m) = I_{1/2}(n-m, m+1).
-    v = _betai(n - m, m + 1, 0.5)
+    try:
+        v = _betai(n - m, m + 1, 0.5)
+    except (OverflowError, ValueError):
+        v = float('nan')
     if math.isfinite(v):
         return float(min(1.0, max(0.0, v)))
-    log2n = n * math.log(2.0)
-    logs = [math.lgamma(n + 1) - math.lgamma(i + 1) - math.lgamma(n - i + 1) - log2n
-            for i in range(0, m + 1)]
-    mx = max(logs)
-    return float(min(1.0, math.exp(mx) * math.fsum(math.exp(x - mx) for x in logs)))
+    logp = _log_binom_cdf_half(n, m)
+    if not math.isfinite(logp) or logp < -745.0:
+        return 0.0
+    return float(min(1.0, math.exp(logp)))
 
 
 def _log_binom_cdf_half(n, m):
@@ -15583,15 +15640,17 @@ def _log_binom_cdf_half(n, m):
         return 0.0
     if m * 2 >= n:
         log_upper = _log_binom_cdf_half(n, n - m - 1)
-        if not math.isfinite(log_upper) or log_upper < -745.0:
+        if log_upper == float('-inf'):
+            return 0.0
+        if not math.isfinite(log_upper):
+            return log_upper
+        if log_upper < -745.0:
             return 0.0
         return float(math.log1p(-math.exp(log_upper)))
-    # Beyond the float exponent range even log2(n) is not representable, but
-    # the true log-CDF is then far below any family size expressible here.
-    if n.bit_length() > 1024:
-        return float('-inf')
-    log2n = n * math.log(2.0)
-    if m <= 20000:
+    log2n = _int_times_log2(n)
+    if m <= 20000 or (n.bit_length() > 1023 and m <= _BINOMIAL_EXACT_INDEX_MAX):
+        if not math.isfinite(log2n):
+            return float('-inf')
         logs = []
         log_term = -log2n
         for j in range(m + 1):
@@ -15600,13 +15659,24 @@ def _log_binom_cdf_half(n, m):
             logs.append(log_term)
         mx = max(logs)
         return float(mx + math.log(math.fsum(math.exp(x - mx) for x in logs)))
+    try:
+        cdf = _betai(n - m, m + 1, 0.5)
+    except (OverflowError, ValueError):
+        cdf = float('nan')
+    if math.isfinite(cdf) and cdf > 0.0:
+        return float(math.log(cdf))
+    if not math.isfinite(log2n):
+        return _log_binom_normal_cdf_half(n, m)
     # The tail is dominated by its largest term; sum the geometric correction
     # downward instead of iterating over m (which can be huge at scale).
-    log_term = (math.lgamma(n + 1.0) - math.lgamma(m + 1.0)
-                - math.lgamma(n - m + 1.0) - log2n)
-    if not math.isfinite(log_term):
-        return float('-inf')
-    r = m / (n - m + 1.0)
+    try:
+        log_term = (math.lgamma(n + 1.0) - math.lgamma(m + 1.0)
+                    - math.lgamma(n - m + 1.0) - log2n)
+        if not math.isfinite(log_term):
+            return _log_binom_normal_cdf_half(n, m)
+        r = m / (n - m + 1.0)
+    except OverflowError:
+        return _log_binom_normal_cdf_half(n, m)
     if r >= 1.0:
         return float(log_term)
     return float(log_term + math.log1p(r / (1.0 - r)))

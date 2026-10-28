@@ -167,6 +167,9 @@ def _signflip_saddlepoint_p(values):
     m = len(vals)
     if m == 0:
         return 1.0, 'saddlepoint'
+    amax = max(abs(x) for x in vals)
+    if amax > 1e100 or amax < 1e-100:
+        vals = [x / amax for x in vals]
     T = abs(math.fsum(vals))
     sabs = math.fsum(abs(x) for x in vals)
     floor = min(1.0, math.ldexp(2.0, -m))
@@ -174,8 +177,7 @@ def _signflip_saddlepoint_p(values):
         return 1.0, 'saddlepoint'
     if T >= sabs * (1.0 - 1e-13):
         return floor, 'saddlepoint'
-    amax = max(abs(x) for x in vals)
-    inv = 1.0 / amax
+    inv = 1.0 / max(abs(x) for x in vals)
 
     def _kp(t):
         return math.fsum(x * math.tanh(t * x) for x in vals)
@@ -239,14 +241,26 @@ def exact_signflip(deltas, *, n_input=None):
     n = len(deltas)
     if n == 0:
         return None
-    obs = abs(sum(deltas))
-    mu = sum(deltas) / n
-    std = (sum(((d - mu) ** 2 for d in deltas)) / (n - 1)) ** 0.5 if n > 1 else 0.0
+    _stat_scale = max((abs(x) for x in deltas), default=0.0)
+    if _stat_scale > 1e100 or 0.0 < _stat_scale < 1e-100:
+        _dn = [x / _stat_scale for x in deltas]
+        _mu_n = sum(_dn) / n
+        mu = _stat_scale * _mu_n
+        std = (_stat_scale
+               * ((sum((x - _mu_n) ** 2 for x in _dn) / (n - 1)) ** 0.5)
+               if n > 1 else 0.0)
+    else:
+        mu = sum(deltas) / n
+        std = (sum(((d - mu) ** 2 for d in deltas)) / (n - 1)) ** 0.5 if n > 1 else 0.0
     # Exact ties do not change p (their signs are arbitrary) but they do lower
     # the attainable resolution from 2/2**n to 2/2**(#nonzero).
     _n_nonzero = sum(1 for d in deltas if d != 0.0)
     _p_floor = (1.0 if _n_nonzero == 0
                 else min(1.0, math.ldexp(2.0, -_n_nonzero)))
+    _amax = max((abs(x) for x in deltas), default=0.0)
+    _p_deltas = ([x / _amax for x in deltas]
+                 if (_amax > 1e100 or 0.0 < _amax < 1e-100) else deltas)
+    _obs_p = abs(sum(_p_deltas))
     # Panel attrition is part of the result: `deltas` may be the complete-case
     # subset after unpaired/non-finite seeds were dropped.  The caller can pass
     # the planned/paired count so the report gate can refuse a
@@ -261,8 +275,12 @@ def exact_signflip(deltas, *, n_input=None):
     _loo = []
     _seed_driven = None
     if n >= 3:
-        _total = float(sum(deltas))
-        _loo = [(_total - float(d)) / (n - 1) for d in deltas]
+        if _stat_scale > 1e100 or 0.0 < _stat_scale < 1e-100:
+            _total_n = sum(_dn)
+            _loo = [_stat_scale * ((_total_n - x) / (n - 1)) for x in _dn]
+        else:
+            _total = float(sum(deltas))
+            _loo = [(_total - float(d)) / (n - 1) for d in deltas]
         _seed_driven = False
         if abs(mu) > 1e-300:
             _sign = 1.0 if mu > 0 else -1.0
@@ -273,7 +291,7 @@ def exact_signflip(deltas, *, n_input=None):
              **_attrition}
     if 20 < n <= 40:
         try:
-            _cnt = _signflip_mitm_count(deltas)
+            _cnt = _signflip_mitm_count(_p_deltas)
             return {'n': n, 'mean': mu, 'std': std,
                     'p_exact_signflip': _cnt / (1 << n),
                     'method': 'exact-mitm', **_diag}
@@ -282,7 +300,7 @@ def exact_signflip(deltas, *, n_input=None):
     if n > 40:
         # Same deterministic tail as exp_lib: no random MC draw, and the
         # variance is the sign-flip null variance sum(d_i**2).
-        _p, _method = _signflip_saddlepoint_p(deltas)
+        _p, _method = _signflip_saddlepoint_p(_p_deltas)
         return {'n': n, 'mean': mu, 'std': std, 'p_exact_signflip': _p,
                 'method': _method, **_diag}
     try:
@@ -291,8 +309,8 @@ def exact_signflip(deltas, *, n_input=None):
         _np = None
     if _np is not None:
         _total = 1 << n
-        _thr = obs - 1e-12 * n
-        _darr = _np.asarray(deltas, dtype=float)
+        _thr = _obs_p - 1e-12 * n
+        _darr = _np.asarray(_p_deltas, dtype=float)
         _ebnd = n * 2.220446049250313e-16 * float(_np.abs(_darr).sum())
         _bitpos = _np.arange(n, dtype=_np.int64)
         _step = max(1, min(_total, (1 << 24) // max(n, 1)))
@@ -304,14 +322,14 @@ def exact_signflip(deltas, *, n_input=None):
             _near = _np.abs(_s - _thr) <= _ebnd
             cnt += int((_s[~_near] >= _thr).sum())
             for _m in _masks[_near].tolist():
-                s = sum((d if _m >> i & 1 else -d for i, d in enumerate(deltas)))
+                s = sum((d if _m >> i & 1 else -d for i, d in enumerate(_p_deltas)))
                 if abs(s) >= _thr:
                     cnt += 1
     else:
         cnt = 0
         for mask in range(1 << n):
-            s = sum((d if mask >> i & 1 else -d for i, d in enumerate(deltas)))
-            if abs(s) >= obs - 1e-12 * n:
+            s = sum((d if mask >> i & 1 else -d for i, d in enumerate(_p_deltas)))
+            if abs(s) >= _obs_p - 1e-12 * n:
                 cnt += 1
     return {'n': n, 'mean': mu, 'std': std,
             'p_exact_signflip': cnt / (1 << n), 'method': 'exact', **_diag}
