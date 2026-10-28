@@ -19410,11 +19410,31 @@ def t_dependency_contract_binds_interpreter_and_platform():
         c = L.dependency_contract(lock)
         assert c['interpreter']['status'] == 'unverified', c['interpreter']
         assert c['interpreter']['problems'] == [], c['interpreter']
+        assert c['interpreter']['missing'] == list(L._LOCK_ENV_KEYS), c['interpreter']
         assert c['status'] == 'partial', c
+        # A lock that declares only SOME clauses has not identified the full
+        # numerical stack: matching declared clauses must not turn the
+        # interpreter contract green while implementation/platform are absent.
+        _write({'python-version': good['python-version']})
+        c = L.dependency_contract(lock)
+        assert c['interpreter']['status'] == 'match', c['interpreter']
+        assert c['interpreter']['missing'] == ['python-implementation', 'platform'], c['interpreter']
+        assert c['status'] == 'partial', c
+        assert 'python-implementation' in c['note'], c
         with open(lock, 'w', encoding='utf-8') as f:
             f.write(f'numpy=={_md.version("numpy")}\n')
             f.write('# python-version: 3.12.15\n')
             f.write('# python-version: 3.13.0\n')
+        c = L.dependency_contract(lock)
+        assert c['status'] == 'invalid' and c['invalid'], c
+        # An empty clause is an invalid declaration, not an absent one: silently
+        # dropping it would let the remaining clauses look complete.
+        with open(lock, 'w', encoding='utf-8') as f:
+            f.write(f'numpy=={_md.version("numpy")}\n')
+            f.write('# python-version:\n')
+        parsed = L.parse_requirements_lock(lock)
+        assert parsed['environment'] == {}, parsed
+        assert any('empty environment' in msg for msg in parsed['invalid']), parsed
         c = L.dependency_contract(lock)
         assert c['status'] == 'invalid' and c['invalid'], c
 

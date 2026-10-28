@@ -37192,7 +37192,7 @@ def parse_requirements_lock(path=None):
         r'^([A-Za-z0-9][A-Za-z0-9._-]*)(?:\[[^\]]*\])?\s*==\s*([^\s;]+)$')
     _env_re = re.compile(
         r'^#\s*(' + '|'.join(re.escape(k) for k in _LOCK_ENV_KEYS)
-        + r')\s*:\s*(.+?)\s*$', re.IGNORECASE)
+        + r')\s*:\s*(.*?)\s*$', re.IGNORECASE)
     for line in text.splitlines():
         _comment = line.strip()
         if _comment.startswith('#'):
@@ -37264,6 +37264,7 @@ def _interpreter_contract(declared=None):
         got = actual.get(key)
         if str(got) != str(want):
             problems.append(f'{key}: lock declares {want!r}, running {got!r}')
+    missing = [key for key in _LOCK_ENV_KEYS if key not in expected]
     if not expected:
         status = 'unverified'
         note = ('the lock does not declare python-version / '
@@ -37274,9 +37275,14 @@ def _interpreter_contract(declared=None):
         note = 'the running interpreter/platform does not match the lock'
     else:
         status = 'match'
-        note = 'the running interpreter/platform matches the lock clauses'
+        if missing:
+            note = ('the declared interpreter/platform clauses match, but the '
+                    'lock does not declare ' + ', '.join(missing)
+                    + '; the environment is only partially verified')
+        else:
+            note = 'the running interpreter/platform matches the lock clauses'
     return {'declared': expected, 'actual': actual, 'status': status,
-            'problems': problems, 'note': note}
+            'problems': problems, 'missing': missing, 'note': note}
 
 
 def dependency_contract(lock_path=None):
@@ -37348,6 +37354,7 @@ def dependency_contract(lock_path=None):
     _interp = out['interpreter']
     _version_bad = bool(out['mismatches'] or out['missing'])
     _interp_bad = _interp.get('status') == 'mismatch'
+    _interp_missing = list(_interp.get('missing') or [])
     if _version_bad or _interp_bad:
         out['status'] = 'mismatch'
         if _version_bad and _interp_bad:
@@ -37357,13 +37364,17 @@ def dependency_contract(lock_path=None):
             out['note'] = 'the running interpreter/platform does not match the lock'
         else:
             out['note'] = 'installed versions do not match the lock'
-    elif out['unpinned_installed'] or _interp.get('status') == 'unverified':
+    elif (out['unpinned_installed'] or _interp.get('status') == 'unverified'
+          or _interp_missing):
         out['status'] = 'partial'
         _why = []
         if out['unpinned_installed']:
             _why.append('the lock does not pin all installed runtime distributions')
         if _interp.get('status') == 'unverified':
             _why.append('the lock does not declare the interpreter/platform')
+        elif _interp_missing:
+            _why.append('the lock does not declare ' + ', '.join(_interp_missing)
+                        + ' (the interpreter/platform contract is incomplete)')
         out['note'] = ('every pinned entry matches, but ' + ' and '.join(_why))
     else:
         out['note'] = ('every installed runtime distribution and the '
