@@ -368,6 +368,50 @@ def pair_reason(ra, rb):
         return f'disagreeing {sorted(bad)}'
     return None
 
+def protocol_contrast_reason(ra, rb, declaration=None, *, factor=None):
+    """Pair gate for a contrast whose ONLY permitted protocol difference is a
+    declared protocol-level factor (currently ``warm_steps``).
+
+    ``pair_reason`` deliberately refuses records from different protocol tags,
+    because pooling a warmup/early-stop/eval variant with another protocol
+    fabricates seeds.  A warmup panel is the exception: the warmup schedule IS
+    its single factor, so comparing ``w=5000`` against ``w=0`` is the declared
+    experiment, not pooling.  This gate removes only that declared axis and
+    then runs the full ``pair_reason`` control check on the remaining record
+    fields.  Anything else that differs still refuses.
+
+    ``declaration`` must name ``protocol_factor='warm_steps'`` and the exact
+    ``a_level``/``b_level`` (the same object used by the design audit), so an
+    ad-hoc pair cannot opt into a different warmup schedule.
+    """
+    declaration = declaration or {}
+    factor = factor if factor is not None else declaration.get('protocol_factor')
+    if factor != 'warm_steps':
+        return f'unsupported protocol contrast factor {factor!r}'
+    if not isinstance(ra, dict) or not isinstance(rb, dict):
+        return 'a record is not a dict'
+    a_level = _as_seed_int(declaration.get('a_level'))
+    b_level = _as_seed_int(declaration.get('b_level'))
+    if a_level is None or b_level is None or a_level == b_level:
+        return ('unverifiable protocol declaration (a_level/b_level must be '
+                'distinct integer warmup cut points)')
+    wa = _as_seed_int(ra.get('warm_steps'))
+    wb = _as_seed_int(rb.get('warm_steps'))
+    if wa is None or wb is None:
+        return 'unverifiable warm_steps (only one record carries a warmup cut point)'
+    if (wa, wb) != (a_level, b_level):
+        return (f'recorded warm_steps ({wa}, {wb}) do not match the declared '
+                f'protocol contrast ({a_level}, {b_level})')
+    if ra.get('protocol') is not None or rb.get('protocol') is not None:
+        return ('unverifiable protocol tag alongside warm_steps: the declared '
+                'contrast is the warmup cut point, not another protocol axis')
+    # Remove only the declared protocol axis; every other controlled field is
+    # still checked by pair_reason (run_cfg, code stamp, knobs, content and
+    # initialization fingerprints, steps/tokens, ...).
+    ra_rest = {k: v for k, v in ra.items() if k != 'warm_steps'}
+    rb_rest = {k: v for k, v in rb.items() if k != 'warm_steps'}
+    return pair_reason(ra_rest, rb_rest)
+
 def _hyperparam_reason(ra, rb):
     """Strict structured-hyperparameter gate for a module ablation pair.
 

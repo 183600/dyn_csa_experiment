@@ -23,6 +23,12 @@ def sweep_contrast_factor_audit(declarations, *, factory=None, n_layers=6,
       * a malformed declaration (missing arms/factors/flag), because an
         unverifiable label cannot be used in a report.
 
+    A declaration may instead name a ``protocol_factor`` plus ``a_level`` /
+    ``b_level`` for a factor outside AttnCfg (the v7 warmup cut point).  Such
+    a declaration is checked structurally here; the record-level gate
+    ``protocol_contrast_reason`` then verifies that only that protocol axis
+    differs before a pair is quoted.
+
     Returns ``{status, pairs, violations}`` where every pair records the
     machine-derived diff, not just the declared label.
     """
@@ -40,11 +46,6 @@ def sweep_contrast_factor_audit(declarations, *, factory=None, n_layers=6,
         if not isinstance(spec, dict):
             report['violations'].append(f'{label}: declaration is not an object')
             continue
-        a, b = spec.get('a'), spec.get('b')
-        if not (isinstance(a, str) and a.strip() and isinstance(b, str) and b.strip()):
-            report['violations'].append(
-                f'{label}: declaration must name both arms (a/b)')
-            continue
         factors = spec.get('factors')
         if (not isinstance(factors, (list, tuple, set, frozenset))
                 or not factors
@@ -58,6 +59,57 @@ def sweep_contrast_factor_audit(declarations, *, factory=None, n_layers=6,
                 f'{label}: single_factor must be an explicit boolean')
             continue
         declared_set = {str(k) for k in factors}
+        protocol_factor = spec.get('protocol_factor')
+        if protocol_factor is not None:
+            # A warmup panel's factor is the protocol cut point, which is not
+            # an AttnCfg field.  It is still a single-factor contrast, so it
+            # gets a declaration rather than being silently unlabelled: the
+            # levels must be explicit, distinct integers and the record-level
+            # gate (`protocol_contrast_reason`) later refuses any second
+            # protocol/run difference.
+            a_level = _as_seed_int(spec.get('a_level'))
+            b_level = _as_seed_int(spec.get('b_level'))
+            ok = True
+            if a is not None or b is not None:
+                ok = False
+                report['violations'].append(
+                    f'{label}: a protocol-factor declaration must not also name '
+                    'AttnCfg arms (a/b)')
+            if protocol_factor != 'warm_steps':
+                ok = False
+                report['violations'].append(
+                    f'{label}: unsupported protocol factor {protocol_factor!r} '
+                    '(the only supported axis is warm_steps)')
+            if declared_set != {str(protocol_factor)}:
+                ok = False
+                report['violations'].append(
+                    f'{label}: protocol factors {sorted(declared_set)} must be '
+                    f'exactly {{protocol_factor!r}}'.format(protocol_factor))
+            if declared_sf is not True:
+                ok = False
+                report['violations'].append(
+                    f'{label}: a declared protocol contrast must be '
+                    'single_factor=True')
+            if a_level is None or b_level is None or a_level == b_level:
+                ok = False
+                report['violations'].append(
+                    f'{label}: a_level/b_level must be distinct integer warmup '
+                    'cut points')
+            entry = {'mode': 'protocol', 'protocol_factor': protocol_factor,
+                     'a_level': a_level, 'b_level': b_level,
+                     'declared_factors': sorted(declared_set),
+                     'actual_keys': sorted(declared_set),
+                     'extra_keys': [], 'missing_keys': [],
+                     'declared_single_factor': declared_sf,
+                     'actual_single_factor': True,
+                     'verified': bool(ok)}
+            report['pairs'][label] = entry
+            continue
+        a, b = spec.get('a'), spec.get('b')
+        if not (isinstance(a, str) and a.strip() and isinstance(b, str) and b.strip()):
+            report['violations'].append(
+                f'{label}: declaration must name both arms (a/b)')
+            continue
         actual, per_layer = _design_pair_cfg_keys(a, b, factory, n_layers)
         if isinstance(actual, Exception):
             report['violations'].append(
