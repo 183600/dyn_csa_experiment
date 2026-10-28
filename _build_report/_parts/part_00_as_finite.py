@@ -288,7 +288,7 @@ def exact_signflip(deltas, *, n_input=None):
             _total = float(sum(deltas))
             _loo = [(_total - float(d)) / (n - 1) for d in deltas]
         _seed_driven = False
-        if abs(mu) > 1e-300:
+        if abs(mu) > 1e-300 * _stat_scale:
             _sign = 1.0 if mu > 0 else -1.0
             _seed_driven = any((m == 0.0) or ((m > 0) != (_sign > 0)) for m in _loo)
     _diag = {'n_nonzero': _n_nonzero, 'p_floor': _p_floor,

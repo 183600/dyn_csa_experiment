@@ -246,7 +246,8 @@ def paired_effect_stats(deltas, alpha=0.05, min_n=3, with_values=None, without_v
             _total = float(d.sum())
             loo_means = [(_total - float(d[i])) / (n - 1) for i in range(n)]
         seed_driven = False
-        if abs(mean) > 1e-300:
+        _mean_scale = max((abs(float(x)) for x in d), default=0.0)
+        if abs(mean) > 1e-300 * _mean_scale:
             _full_sign = 1.0 if mean > 0 else -1.0
             seed_driven = any((_m == 0.0) or ((_m > 0) != (_full_sign > 0)) for _m in loo_means)
     seed_robust = None if seed_driven is None else (not seed_driven)

@@ -21,6 +21,13 @@ def test_holm_mixed_n_and_invalid_family_size():
           'B': {'omitted': 'no measurement', 'n': 12}}
     fam_om = L.attach_holm(om, family='omitted high n')
     assert fam_om['family_resolution_limited'] is True, fam_om
+    # An omitted high-n row also cannot certify a family floor when the tested
+    # row does not report its n at all.
+    unknown_n = {'A': {'p_exact_signflip': 0.02},
+                 'B': {'omitted': 'no measurement', 'n': 12}}
+    fam_unknown = L.attach_holm(unknown_n, family='unknown tested n')
+    assert fam_unknown['family_min_attainable_p_holm'] is None, fam_unknown
+    assert fam_unknown['family_resolution_limited'] is False, fam_unknown
     # An unmeasurable p still occupies its declared family slot; dropping it
     # would shrink m and make the remaining p anti-conservatively small.
     h = L.holm_adjust([('a', 0.04), ('b', float('nan'))], alpha=0.05)

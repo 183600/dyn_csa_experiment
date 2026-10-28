@@ -236,6 +236,11 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
         # point, but the random-effects weights below treat them as independent
         # studies — that would double-count one scale and understate tau^2.
         raise ValueError('meta_analyze_effects needs unique scale labels; got %r' % (labels,))
+    _effect_abs = [abs(float(e)) for p in pts for e in p['effects']]
+    _effect_scale = max(_effect_abs, default=0.0)
+    _effect_min_abs = min((a for a in _effect_abs if a > 0.0), default=0.0)
+    _scale_effects = bool(math.isfinite(_effect_scale) and _effect_scale > 0.0
+                          and (_effect_scale < 1e-100 or _effect_min_abs > 1e100))
     per = []
     for p in pts:
         d = np.asarray(p['effects'], dtype=float)
@@ -251,19 +256,31 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
         if p.get('vocab') is not None:
             row['vocab'] = p['vocab']
         if n:
-            _ms = _scaled_mean_std_if_extreme(d, ddof=1) if n > 1 else None
+            d_work = d / _effect_scale if _scale_effects else d
+            _ms = _scaled_mean_std_if_extreme(d_work, ddof=1) if n > 1 else None
             if _ms is not None:
-                m, sd = _ms
+                m_work, sd_work = _ms
             else:
-                m = float(d.mean())
-                sd = float(d.std(ddof=1)) if n > 1 else float('nan')
-            se = float(sd / math.sqrt(n)) if (n > 1 and math.isfinite(sd)) else float('nan')
-            row.update({'mean': m, 'std': sd, 'se': se, 'underpowered': n < int(min_seeds)})
+                m_work = float(d_work.mean())
+                sd_work = float(d_work.std(ddof=1)) if n > 1 else float('nan')
+            se_work = (float(sd_work / math.sqrt(n))
+                       if (n > 1 and math.isfinite(sd_work)) else float('nan'))
+            if _scale_effects:
+                m = float(m_work * _effect_scale)
+                sd = float(sd_work * _effect_scale)
+                se = float(se_work * _effect_scale)
+            else:
+                m, sd, se = m_work, sd_work, se_work
+            row.update({'mean': m, 'std': sd, 'se': se,
+                        '_mean_work': m_work, '_se_work': se_work,
+                        'underpowered': n < int(min_seeds)})
             if n > 1:
                 tc = _t_critical(1.0 - float(alpha), n - 1)
                 row['ci'] = [m - tc * se, m + tc * se]
         else:
-            row.update({'mean': float('nan'), 'std': float('nan'), 'se': float('nan'), 'underpowered': True})
+            row.update({'mean': float('nan'), 'std': float('nan'), 'se': float('nan'),
+                        '_mean_work': float('nan'), '_se_work': float('nan'),
+                        'underpowered': True})
         per.append(row)
     # A scale point with identical effects across seeds has zero within-scale
     # variance.  It is NOT the same as a missing/underpowered point, but the
@@ -276,10 +293,13 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
     # scale would dominate the pooled mean.  Treat it by scale-relative
     # tolerance, not just ``se == 0.0``.
     def _variance_is_zero(r):
-        se = r.get('se')
+        se = r.get('_se_work')
         if r['n'] <= 1 or se is None or not math.isfinite(se):
             return False
-        return se <= 1e-12 * max(1.0, abs(float(r.get('mean') or 0.0)))
+        mean_work = r.get('_mean_work')
+        if mean_work is None or not math.isfinite(mean_work):
+            mean_work = 0.0
+        return se <= 1e-12 * max(1.0, abs(float(mean_work)))
     _zero_variance = [r['label'] for r in per if _variance_is_zero(r)]
 
     def _weight_is_representable(r):
@@ -289,7 +309,7 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
         # pooled claim instead of silently disappearing from `usable`.
         if r['n'] <= 1:
             return False
-        se = r.get('se')
+        se = r.get('_se_work')
         if se is None or not math.isfinite(se) or se <= 0.0:
             return False
         se2 = se * se
@@ -354,8 +374,8 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
                     'underpowered_points': [r['label'] for r in per if r.get('underpowered')],
                     'note': 'every scale point has n<2 or zero within-scale variance; no random-effects weights can be formed'})
         return out
-    w = np.asarray([1.0 / (r['se'] ** 2) for r in usable], dtype=float)
-    y = np.asarray([r['mean'] for r in usable], dtype=float)
+    w = np.asarray([1.0 / (r['_se_work'] ** 2) for r in usable], dtype=float)
+    y = np.asarray([r['_mean_work'] for r in usable], dtype=float)
     sw = float(w.sum())
     mu_fe = float((w * y).sum() / sw)
     q = float((w * (y - mu_fe) ** 2).sum())
@@ -363,12 +383,23 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
     p_q = chi2_sf(q, df) if df > 0 else float('nan')
     i2 = float(max(0.0, (q - df) / q) * 100.0) if (df > 0 and q > 0) else 0.0
     c = float(sw - (w ** 2).sum() / sw)
-    tau2 = float(max(0.0, (q - df) / c)) if (df > 0 and c > 0) else 0.0
-    ws = 1.0 / (np.asarray([r['se'] ** 2 for r in usable], dtype=float) + tau2)
+    tau2_work = float(max(0.0, (q - df) / c)) if (df > 0 and c > 0) else 0.0
+    ws = 1.0 / (np.asarray([r['_se_work'] ** 2 for r in usable], dtype=float)
+                + tau2_work)
     sws = float(ws.sum())
     mu_re = float((ws * y).sum() / sws)
     se_re = float(math.sqrt(1.0 / sws))
     tc = _t_critical(1.0 - float(alpha), max(1, df))
+    if _scale_effects:
+        mu_fe_out = float(mu_fe * _effect_scale)
+        se_fe_out = float(math.sqrt(1.0 / sw) * _effect_scale)
+        mu_re_out = float(mu_re * _effect_scale)
+        se_re_out = float(se_re * _effect_scale)
+        tau2 = float(tau2_work * _effect_scale * _effect_scale)
+    else:
+        mu_fe_out, se_fe_out = mu_fe, float(math.sqrt(1.0 / sw))
+        mu_re_out, se_re_out = mu_re, se_re
+        tau2 = tau2_work
     # A prediction interval for a NEW scale point needs k-2 degrees of
     # freedom (the two estimated variance components); reusing the k-1
     # random-effects CI critical value makes it too narrow.  With fewer than
@@ -377,8 +408,12 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
     if len(usable) >= 3:
         _tc_pi = _t_critical(1.0 - float(alpha), len(usable) - 2)
         if math.isfinite(_tc_pi):
-            _half = _tc_pi * math.sqrt(tau2 + se_re ** 2)
-            _pi = [mu_re - _half, mu_re + _half]
+            _half = _tc_pi * math.sqrt(tau2_work + se_re ** 2)
+            if _scale_effects:
+                _half *= _effect_scale
+                _pi = [mu_re_out - _half, mu_re_out + _half]
+            else:
+                _pi = [mu_re - _half, mu_re + _half]
     # The DL pooled CI treats each scale point as an independent study.  When
     # the tiers were run on the SAME training seeds, their effects are paired
     # draws, not independent ones; the pooled interval can then be too narrow.
@@ -500,8 +535,12 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
         out.get('seed_dependence') == 'shared_seeds_paired'
         and isinstance(_paired_common, dict)
         and _paired_common.get('underpowered') is True)
-    out.update({'fixed_effect': {'mean': mu_fe, 'se': float(math.sqrt(1.0 / sw)), 'ci': [mu_fe - _t_critical(1.0 - float(alpha), max(1, df)) * math.sqrt(1.0 / sw), mu_fe + _t_critical(1.0 - float(alpha), max(1, df)) * math.sqrt(1.0 / sw)]},
-                'random_effects': {'mean': mu_re, 'se': se_re, 'ci': [mu_re - tc * se_re, mu_re + tc * se_re]},
+    out.update({'fixed_effect': {'mean': mu_fe_out, 'se': se_fe_out,
+                                 'ci': [mu_fe_out - _t_critical(1.0 - float(alpha), max(1, df)) * se_fe_out,
+                                        mu_fe_out + _t_critical(1.0 - float(alpha), max(1, df)) * se_fe_out]},
+                'random_effects': {'mean': mu_re_out, 'se': se_re_out,
+                                   'ci': [mu_re_out - tc * se_re_out,
+                                          mu_re_out + tc * se_re_out]},
                 'heterogeneity': {'Q': q, 'df': int(df), 'p': p_q, 'I2_percent': i2, 'tau2': tau2,
                                   'method': 'Cochran Q + DerSimonian-Laird tau^2'},
                 'prediction_interval': _pi,
@@ -979,8 +1018,19 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
         out.update({'status': 'refused_corpus_mismatch', 'verdict': 'refused_corpus_mismatch',
                     'note': out['corpus_binding']['refusal_reason']})
         return out
+    _effect_abs = [abs(float(e)) for p in pts for e in p['effects']]
+    _effect_scale = max(_effect_abs, default=0.0)
+    _effect_min_abs = min((a for a in _effect_abs if a > 0.0), default=0.0)
+    _scale_effects = bool(math.isfinite(_effect_scale) and _effect_scale > 0.0
+                          and (_effect_scale < 1e-100 or _effect_min_abs > 1e100))
+
+    def _effects_work(p):
+        if not _scale_effects:
+            return [float(e) for e in p['effects']]
+        return [float(e) / _effect_scale for e in p['effects']]
+
     x = np.asarray([math.log10(p['scale']) if log_scale else p['scale'] for p in pts], dtype=float)
-    y = np.asarray([float(np.mean(p['effects'])) for p in pts], dtype=float)
+    y = np.asarray([float(np.mean(_effects_work(p))) for p in pts], dtype=float)
     n = np.asarray([float(len(p['effects'])) for p in pts], dtype=float)
     sw = float(n.sum())
     xbar = float((n * x).sum() / sw)
@@ -989,24 +1039,27 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
     if sxx <= 0.0:
         out.update({'status': 'degenerate_scale_axis', 'verdict': 'degenerate_scale_axis'})
         return out
-    slope = float((n * (x - xbar) * (y - ybar)).sum() / sxx)
-    intercept = float(ybar - slope * xbar)
+    slope_work = float((n * (x - xbar) * (y - ybar)).sum() / sxx)
+    intercept_work = float(ybar - slope_work * xbar)
     k = len(pts)
-    resid = y - (slope * x + intercept)
+    resid = y - (slope_work * x + intercept_work)
+    slope = float(slope_work * _effect_scale) if _scale_effects else slope_work
+    intercept = float(intercept_work * _effect_scale) if _scale_effects else intercept_work
     wls = {'slope': slope, 'intercept': intercept, 'x_transform': 'log10' if log_scale else 'linear',
            'weights': 'n_seeds per scale', 'r2': (1.0 - float((n * resid ** 2).sum() / (n * (y - ybar) ** 2).sum())) if float((n * (y - ybar) ** 2).sum()) > 0 else float('nan')}
     if k > 2:
         sigma2 = float((n * resid ** 2).sum() / (k - 2))
-        se = float(math.sqrt(sigma2 / sxx))
+        se_work = float(math.sqrt(sigma2 / sxx))
         tc = _t_critical(1.0 - float(alpha), k - 2)
         # A zero-residual fit has no residual variance.  Its t statistic is
         # infinite only when the slope is non-zero; an exactly flat line is a
         # perfect fit with an undefined (not zero) p-value, so report p=1
         # instead of turning "no trend" into a maximally significant one.
-        if se > 0.0:
-            _p = student_t_two_sided_p(slope / se, k - 2)
+        if se_work > 0.0:
+            _p = student_t_two_sided_p(slope_work / se_work, k - 2)
         else:
-            _p = 1.0 if abs(slope) <= 1e-15 else 0.0
+            _p = 1.0 if abs(slope_work) <= 1e-15 else 0.0
+        se = float(se_work * _effect_scale) if _scale_effects else se_work
         wls.update({'se': se, 'ci': [slope - tc * se, slope + tc * se],
                     'p': _p, 'df': k - 2})
     out['wls'] = wls
@@ -1018,7 +1071,7 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
     _seed_identity_attested = all(p.get('seeds_declared') for p in pts)
     by_seed = {}
     for p in pts:
-        for s, e in zip(p['seeds'], p['effects']):
+        for s, e in zip(p['seeds'], _effects_work(p)):
             by_seed.setdefault(s, {})[p['label']] = float(e)
     complete = (sorted([s for s, m in by_seed.items() if all(lb in m for lb in labels)], key=str)
                 if _seed_identity_attested else [])
@@ -1046,12 +1099,17 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
         st = paired_effect_stats(slopes, alpha=alpha, min_n=min_seeds)
         tc = _t_critical(1.0 - float(alpha), len(slopes) - 1)
         se_s = float(slopes.std(ddof=1) / math.sqrt(len(slopes))) if len(slopes) > 1 else float('nan')
-        paired.update({'slope_mean': float(slopes.mean()), 'slope_std': float(slopes.std(ddof=1)) if len(slopes) > 1 else float('nan'),
-                       'se': se_s, 'ci': [float(slopes.mean()) - tc * se_s, float(slopes.mean()) + tc * se_s] if math.isfinite(se_s) else None,
+        slopes_out = (slopes * _effect_scale if _scale_effects else slopes)
+        mean_out = float(slopes_out.mean())
+        std_work = (float(slopes.std(ddof=1)) if len(slopes) > 1 else float('nan'))
+        std_out = (std_work * _effect_scale if _scale_effects else std_work)
+        se_out = (se_s * _effect_scale if _scale_effects else se_s)
+        paired.update({'slope_mean': mean_out, 'slope_std': std_out,
+                       'se': se_out, 'ci': [mean_out - tc * se_out, mean_out + tc * se_out] if math.isfinite(se_out) else None,
                        'p_exact_signflip': st['p_exact_signflip'], 'p_floor': st['p_floor'],
                        'resolution_limited': st['resolution_limited'], 'underpowered': st['underpowered'],
                        'within_seed_noise': st['within_seed_noise'], 'significant': st['significant'],
-                       'per_seed_slopes': {str(s): float(v) for s, v in zip(complete, slopes)}})
+                       'per_seed_slopes': {str(s): float(v) for s, v in zip(complete, slopes_out)}})
     else:
         paired.update({'note': 'no complete seed across every scale point; the paired exact test is unavailable'})
     out['paired'] = paired
@@ -1124,7 +1182,9 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
         i2 = float(max(0.0, (q - dfh) / q) * 100.0) if (dfh > 0 and q > 0) else 0.0
         c = float(n.sum() - (n ** 2).sum() / n.sum())
         tau2 = float(max(0.0, (q - dfh) / c)) if (dfh > 0 and c > 0) else 0.0
-        out['heterogeneity'] = {'Q': q, 'df': int(dfh), 'p': p_q, 'I2_percent': i2, 'tau2': tau2,
+        q_out = float(q * _effect_scale * _effect_scale) if _scale_effects else q
+        tau2_out = float(tau2 * _effect_scale * _effect_scale) if _scale_effects else tau2
+        out['heterogeneity'] = {'Q': q_out, 'df': int(dfh), 'p': p_q, 'I2_percent': i2, 'tau2': tau2_out,
                                 'method': 'lack-of-fit Q around the WLS slope (weights = n)',
                                 'note': 'high I2 means the scale points deviate from a single slope; it is not the spread of a monotone ladder around its mean'}
     # The paired path only uses seeds completed at EVERY scale.  Extra seeds at
@@ -1135,7 +1195,8 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
     het_for_verdict = out.get('heterogeneity') or {}
     if paired_primary:
         _yc = np.asarray([float(np.mean([by_seed[s][lb] for s in complete])) for lb in labels], dtype=float)
-        _sp = float(paired['slope_mean'])
+        _sp = (float(paired['slope_mean']) / _effect_scale
+               if _scale_effects else float(paired['slope_mean']))
         _ip = float(_yc.mean() - _sp * x.mean())
         _rp = _yc - (_sp * x + _ip)
         _cp = float(len(complete))
@@ -1143,7 +1204,9 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
         _df_p = k - 2
         _p_p = chi2_sf(_q_p, _df_p) if _df_p > 0 else None
         _i2_p = float(max(0.0, (_q_p - _df_p) / _q_p) * 100.0) if (_df_p > 0 and _q_p > 0) else 0.0
-        out['heterogeneity_paired'] = {'Q': _q_p, 'df': int(_df_p), 'p': _p_p,
+        _q_p_out = (float(_q_p * _effect_scale * _effect_scale)
+                    if _scale_effects else _q_p)
+        out['heterogeneity_paired'] = {'Q': _q_p_out, 'df': int(_df_p), 'p': _p_p,
                                        'I2_percent': _i2_p, 'n_complete_seeds': len(complete),
                                        'method': 'lack-of-fit over complete-seed scale means (weights = n_complete)',
                                        'note': 'gates the paired trend verdict; the all-seed heterogeneity above stays descriptive'}

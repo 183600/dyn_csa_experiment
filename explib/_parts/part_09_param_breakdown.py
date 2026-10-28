@@ -625,7 +625,10 @@ def attach_holm(comparisons, *, alpha=0.05, family='reported comparisons', explo
     _m = int(len(comparisons or {}))
     # Only a tested, measurable comparison can pass the first Holm gate; an
     # omitted or invalid row must not make the family look better powered.
-    _floor_ns = _tested_ns if _tested_ns else _ns
+    # If there are tested rows but none carry a usable n, no family floor can
+    # be certified; falling back to all rows would let an omitted high-n row
+    # supply the resolution instead.
+    _floor_ns = _tested_ns if tested else _ns
     _fam_floor = holm_min_attainable_p(max(_floor_ns), _m, alpha) if _floor_ns else None
     _fam_limited = bool(_fam_floor is not None and math.isfinite(_fam_floor) and _fam_floor > alpha)
     if _fam_limited:
@@ -1202,14 +1205,39 @@ def sequential_signflip_p(looks, *, alpha=0.05):
     alpha = _validated_alpha(alpha)
     series = _normalise_look_series(looks)
     k_looks = len(series)
+    # Seed deltas outside the ordinary range lose scale invariance: comparing
+    # them with an absolute 1e-9 tolerance, summing them, and thresholding the
+    # final sum at 1e-300 all depend on the arbitrary unit.  Normalise the
+    # whole look series by one common finite scale, exactly as the sign-flip
+    # helpers do; ordinary inputs keep the historical path bit-for-bit.
+    _delta_abs = [abs(float(d)) for lk in series for d in lk['deltas']]
+    _delta_scale = max(_delta_abs, default=0.0)
+    _delta_min_abs = min((a for a in _delta_abs if a > 0.0), default=0.0)
+    _scale_deltas = bool(math.isfinite(_delta_scale) and _delta_scale > 0.0
+                         and (_delta_scale < 1e-100 or _delta_min_abs > 1e100))
+
+    def _work_deltas(lk):
+        if not _scale_deltas:
+            return lk['deltas']
+        return [float(d) / _delta_scale for d in lk['deltas']]
+
     look_stats = []
     for i, lk in enumerate(series, 1):
         sf = exact_signflip_p(lk['deltas'])
+        work = _work_deltas(lk)
+        if _scale_deltas:
+            _ms = _scaled_mean_std_if_extreme(lk['deltas'], ddof=1)
+            mean_raw = (_ms[0] if _ms is not None
+                        else float(np.mean(lk['deltas'])))
+            sum_raw = float(_delta_scale * math.fsum(work))
+        else:
+            mean_raw = float(np.mean(lk['deltas']))
+            sum_raw = float(np.sum(lk['deltas']))
         look_stats.append({
             'look': int(i), 'n': int(sf.get('n') or 0),
             'seeds': list(lk['seeds']), 'p': float(sf.get('p', float('nan'))),
-            'mean': float(np.mean(lk['deltas'])),
-            'sum': float(np.sum(lk['deltas'])),
+            'mean': mean_raw,
+            'sum': sum_raw,
             'p_floor': sf.get('p_floor'), 'method': sf.get('method'),
             'n_dropped': int(lk.get('n_dropped') or 0),
         })
@@ -1235,7 +1263,7 @@ def sequential_signflip_p(looks, *, alpha=0.05):
     # not a look at the same estimand.
     seed_delta, inconsistent = {}, set()
     for lk in series:
-        for s, d in zip(lk['seeds'], lk['deltas']):
+        for s, d in zip(lk['seeds'], _work_deltas(lk)):
             if s in seed_delta:
                 if abs(seed_delta[s] - d) > 1e-9:
                     inconsistent.add(s)
@@ -1246,7 +1274,7 @@ def sequential_signflip_p(looks, *, alpha=0.05):
             'p_final_look': p_final, 'looks': look_stats,
             'alpha': float(alpha), 'n_union_seeds': len(union_seeds),
             'inconsistent_seeds': sorted(inconsistent)}
-    _final_sum = float(look_stats[-1]['sum'])
+    _final_sum = float(math.fsum(_work_deltas(series[-1])))
     if abs(_final_sum) <= 1e-300:
         base.update({'p_sequential': 1.0,
                      'method': 'degenerate-final-zero',

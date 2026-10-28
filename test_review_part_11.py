@@ -680,6 +680,20 @@ def test_sequential_look_signflip_primitives():
     # Determinism: the enumeration must not depend on hash ordering.
     assert L.sequential_signflip_p([(list(range(6)), d3[:6]),
                                     (list(range(10)), d3)])['p_sequential'] == s3['p_sequential']
+    for factor in (1e-200, 1e200):
+        scaled = [(list(range(6)), [x * factor for x in d3[:6]]),
+                  (list(range(10)), [x * factor for x in d3])]
+        ss = L.sequential_signflip_p(scaled)
+        assert ss['method'] == s3['method'], (factor, ss)
+        assert ss['p_sequential'] == s3['p_sequential'], (factor, ss)
+        assert ss['p_final_look'] == s3['p_final_look'], (factor, ss)
+        assert math.isclose(ss['looks'][-1]['mean'] / factor,
+                            s3['looks'][-1]['mean'], rel_tol=1e-12), (factor, ss)
+    _scaled_bad = [([0, 1, 2], [-1e-200, -1e-200, -1e-200]),
+                   ([0, 1, 2, 3], [-1e-200, -1e-200, -2e-200, -1e-200])]
+    _sb = L.sequential_signflip_p(_scaled_bad)
+    assert 'inconsistent' in _sb['method'] and _sb['inconsistent_seeds'] == [2], _sb
+    assert abs(_sb['p_sequential'] - s5['p_sequential']) < 1e-12, _sb
     # Input contract failures are explicit, not silent drops.
     for bad in ([([0, 0], [1.0, 2.0])],
                 [([0, 1], [1.0])],

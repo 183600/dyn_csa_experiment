@@ -1853,6 +1853,8 @@ def test_paired_effect_extreme_scale_is_not_zero_variance():
                         rel_tol=1e-12), BR.sample_std(tiny)
     t = L.tost_paired([1e-200, -2e-200, 3e-200], margin=2e-200)
     assert t['ci'][0] < t['ci'][1] and t['p_tost'] > 0.0, t
+
+
     b = L.bootstrap_mean_ci(tiny)
     assert math.isfinite(b['mean']) and b['mean'] > 0.0, b
     assert b['ci_low'] < b['ci_high'], b
@@ -1864,6 +1866,78 @@ def test_paired_effect_extreme_scale_is_not_zero_variance():
     assert h['within_seed_noise'] is True and h['significant'] is False, h
     assert math.isclose(BR.sample_std([1e308, 1e308, -1e308]),
                         1e308 * math.sqrt(4.0 / 3.0), rel_tol=1e-12)
+    _driven = [1e-310, 1e-310, -1e-310]
+    assert L.paired_effect_stats(_driven)['seed_driven'] is True
+    assert BR.exact_signflip(_driven)['seed_driven'] is True
+
+
+def test_meta_analysis_extreme_scale_is_not_zero_variance():
+    base = [
+        {'label': 'S0', 'scale': 1.0, 'seeds': [0, 1, 2, 3],
+         'effects': [0.05, 0.12, 0.08, 0.10]},
+        {'label': 'S1', 'scale': 10.0, 'seeds': [0, 1, 2, 3],
+         'effects': [0.20, 0.18, 0.25, 0.22]},
+        {'label': 'S2', 'scale': 100.0, 'seeds': [0, 1, 2, 3],
+         'effects': [0.35, 0.31, 0.40, 0.36]},
+    ]
+    ref = L.meta_analyze_effects(base)
+    assert ref['status'] == 'ok' and ref['n_usable'] == 3, ref
+    assert ref['zero_variance_points'] == [], ref
+    for factor in (1e-200, 1e200):
+        scaled = [dict(p, effects=[x * factor for x in p['effects']])
+                  for p in base]
+        got = L.meta_analyze_effects(scaled)
+        assert got['status'] == ref['status'], (factor, got)
+        assert got['n_usable'] == ref['n_usable'], (factor, got)
+        assert got['zero_variance_points'] == [], (factor, got)
+        assert got['non_estimable_points'] == [], (factor, got)
+        assert got['poolable'] == ref['poolable'], (factor, got)
+        for key in ('mean', 'se'):
+            assert math.isclose(got['fixed_effect'][key] / factor,
+                                ref['fixed_effect'][key], rel_tol=1e-12), (factor, key, got)
+            assert math.isclose(got['random_effects'][key] / factor,
+                                ref['random_effects'][key], rel_tol=1e-12), (factor, key, got)
+        for _got, _ref in zip(got['per_point'], ref['per_point']):
+            assert math.isclose(_got['mean'] / factor, _ref['mean'],
+                                rel_tol=1e-12), (factor, _got)
+            assert math.isclose(_got['se'] / factor, _ref['se'],
+                                rel_tol=1e-12), (factor, _got)
+
+
+def test_scaling_trend_extreme_scale_is_invariant():
+    base = []
+    for i in range(3):
+        effects = [0.1 * i + 0.01 * j + (0.003 if j == i else 0.0)
+                   for j in range(6)]
+        base.append({'label': 'S%d' % i, 'scale': 10.0 ** i,
+                     'seeds': list(range(6)), 'effects': effects})
+    ref = L.scaling_trend(base, min_seeds=3, min_points=3)
+    ref_unpaired = L.scaling_trend(
+        [{'label': p['label'], 'scale': p['scale'], 'effects': p['effects']}
+         for p in base], min_seeds=3, min_points=3)
+    for factor in (1e-200, 1e200):
+        scaled = [dict(p, effects=[e * factor for e in p['effects']])
+                  for p in base]
+        got = L.scaling_trend(scaled, min_seeds=3, min_points=3)
+        assert got['verdict'] == ref['verdict'], (factor, got)
+        assert math.isclose(got['wls']['slope'] / factor,
+                            ref['wls']['slope'], rel_tol=1e-12), (factor, got)
+        assert math.isclose(got['wls']['se'] / factor,
+                            ref['wls']['se'], rel_tol=1e-12), (factor, got)
+        assert math.isclose(got['wls']['p'], ref['wls']['p'],
+                            rel_tol=1e-12), (factor, got)
+        assert got['paired']['p_exact_signflip'] == ref['paired']['p_exact_signflip']
+        assert math.isclose(got['paired']['slope_mean'] / factor,
+                            ref['paired']['slope_mean'], rel_tol=1e-12), (factor, got)
+        assert math.isclose(got['paired']['se'] / factor,
+                            ref['paired']['se'], rel_tol=1e-12), (factor, got)
+        unpaired = [{'label': p['label'], 'scale': p['scale'],
+                     'effects': [e * factor for e in p['effects']]}
+                    for p in base]
+        got_unpaired = L.scaling_trend(unpaired, min_seeds=3, min_points=3)
+        assert got_unpaired['verdict'] == ref_unpaired['verdict'], (factor, got_unpaired)
+        assert math.isclose(got_unpaired['wls']['p'], ref_unpaired['wls']['p'],
+                            rel_tol=1e-12), (factor, got_unpaired)
 
 
 def test_scaling_trend_ragged_pairs():
