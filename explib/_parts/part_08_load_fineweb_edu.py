@@ -141,10 +141,19 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=None, val_seqs=512,
                             ('bands', _proto['bands']),
                             ('shingle_words', _proto['shingle_words']),
                             ('max_shingles', _proto['max_shingles'])):
-                        if (_dd_meta.get(_pk) is not None
-                                and int(_dd_meta[_pk]) != int(_pv)):
+                        _recorded = _dd_meta.get(_pk)
+                        if _recorded is None:
+                            continue
+                        _recorded_i = _as_seed_int(_recorded)
+                        if _recorded_i is None:
                             _problems.append(
-                                f'cache dedup field {_pk}={_dd_meta[_pk]!r} '
+                                f'cache dedup field {_pk}={_recorded!r} is not '
+                                'an exact integer; the redundant protocol field '
+                                'is unverifiable — rebuild the cache')
+                            continue
+                        if _recorded_i != int(_pv):
+                            _problems.append(
+                                f'cache dedup field {_pk}={_recorded!r} '
                                 f'disagrees with its protocol ({_pv!r})')
             elif isinstance(_dd_meta, dict):
                 _partial = [k for k in ('bands', 'shingle_words',

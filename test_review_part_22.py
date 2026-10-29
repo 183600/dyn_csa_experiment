@@ -290,3 +290,82 @@ def test_test_document_filter_accepts_the_paired_protocol():
     assert kept == ['new test'], kept
     assert excluded['train_exact'] == 0 and excluded['validation_exact'] == 0
     assert test_index.protocol() == protocol
+
+
+def test_data_processing_audit_keeps_hard_failure_for_legacy_nondefault_geometry():
+    """A legacy cache is not_verifiable only when it is otherwise honest.
+
+    A legacy block that declares a non-default threshold cannot be audited
+    (the shingle/band geometry is unknown).  That is a hard failure; the
+    final "legacy" status must not overwrite it with not_verifiable_locally.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        train = _train_meta()
+        block = train['dedup']
+        for k in ('protocol', 'protocol_fp', 'bands', 'shingle_words',
+                  'max_shingles'):
+            block.pop(k, None)
+        block['near_hamming_threshold'] = 5
+        _write(td, 'meta_v5_sl512.json', train)
+        out = A.audit_data_processing(td)
+        assert out['status'] == 'fail', out
+        assert any('legacy dedup block records threshold=5' in p
+                   for p in out['problems']), out['problems']
+
+
+def test_data_processing_audit_rejects_malformed_ledger_fields_without_crashing():
+    with tempfile.TemporaryDirectory() as td:
+        train = _train_meta()
+        train['val_sequences'] = 'two'   # not an exact integer
+        _write(td, 'meta_v5_sl512.json', train)
+        _write(td, 'test_meta_v5_sl4096.json', _test_meta())
+        out = A.audit_data_processing(td)
+        assert out['status'] == 'fail', out
+        assert any('val_sequences' in p for p in out['problems']), out['problems']
+    with tempfile.TemporaryDirectory() as td:
+        train = _train_meta()
+        train['dedup']['bands'] = '4'    # int("4") must not be accepted
+        _write(td, 'meta_v5_sl512.json', train)
+        _write(td, 'test_meta_v5_sl4096.json', _test_meta())
+        out = A.audit_data_processing(td)
+        assert out['status'] == 'fail', out
+        assert any('dedup field bands' in p for p in out['problems']), out['problems']
+    with tempfile.TemporaryDirectory() as td:
+        train = _train_meta()
+        train['fit_fp'] = ['not', 'hashable']
+        _write(td, 'meta_v5_sl512.json', train)
+        _write(td, 'test_meta_v5_sl4096.json', _test_meta())
+        out = A.audit_data_processing(td)
+        assert out['status'] == 'fail', out
+        assert any('fit_fp' in p for p in out['problems']), out['problems']
+
+
+def _write_audit_sidecars(td):
+    np.save(os.path.join(td, 'train_ids_v5_sl512.npy'),
+            np.zeros(100, dtype=np.int32))
+    np.save(os.path.join(td, 'val_batch_v5_sl512.npy'),
+            np.zeros((2, 512), dtype=np.int64))
+    np.save(os.path.join(td, 'train_doc_ids_v5_sl512.npy'),
+            np.zeros(7, dtype=np.uint64))
+    np.save(os.path.join(td, 'val_doc_ids_v5_sl512.npy'),
+            np.zeros(4, dtype=np.uint64))
+    np.save(os.path.join(td, 'test_ids_v5_sl4096.npy'),
+            np.zeros((8, 10), dtype=np.int64))
+    np.save(os.path.join(td, 'test_doc_ids_v5_sl4096.npy'),
+            np.zeros(8, dtype=np.uint64))
+    np.save(os.path.join(td, 'test_token_doc_ids_v5_sl4096.npy'),
+            np.zeros(80, dtype=np.uint64))
+
+
+def test_data_processing_audit_does_not_report_ok_when_a_declared_sidecar_is_missing():
+    with tempfile.TemporaryDirectory() as td:
+        _write(td, 'meta_v5_sl512.json', _train_meta())
+        _write(td, 'test_meta_v5_sl4096.json', _test_meta())
+        _write_audit_sidecars(td)
+        os.remove(os.path.join(td, 'test_ids_v5_sl4096.npy'))
+        out = A.audit_data_processing(td)
+        assert out['status'] == 'warnings', out
+        test = out['records']['test_meta_v5_sl4096.json']
+        assert test['file_checks']['test_ids_size'] is False, test
+        assert any('test_ids_v5_sl4096.npy is missing' in w
+                   for w in out['warnings']), out['warnings']

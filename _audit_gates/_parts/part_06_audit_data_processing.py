@@ -47,7 +47,16 @@ def _dp_protocol_check(protocol, block, problems, warnings, label):
         problems.append(f'{label}: invalid dedup protocol: ' + '; '.join(pp))
         return None
     recorded_fp = (block or {}).get('protocol_fp')
-    actual_fp = L.dedup_protocol_fp(protocol)
+    try:
+        actual_fp = L.dedup_protocol_fp(protocol)
+    except (TypeError, ValueError, OverflowError) as e:
+        # A syntactically valid object can still contain an extra
+        # non-JSON-safe value (e.g. NaN).  The protocol is then not a stable
+        # identity; report it instead of crashing the audit.
+        problems.append(
+            f'{label}: dedup protocol cannot be fingerprinted '
+            f'({type(e).__name__}: {e})')
+        return None
     if recorded_fp is None:
         problems.append(f'{label}: dedup protocol has no protocol_fp binding')
     elif str(recorded_fp) != str(actual_fp):
@@ -59,11 +68,21 @@ def _dp_protocol_check(protocol, block, problems, warnings, label):
         recorded = (block or {}).get(field)
         if recorded is None:
             continue
+        # The loader writes plain ints.  ``int("4")``/``int(True)``/``int(4.9)``
+        # would silently coerce a malformed redundant field into a match, so
+        # use the same exact-integer contract as the ledger fields.
+        recorded_i = _dp_int(recorded)
+        if recorded_i is None:
+            problems.append(
+                f'{label}: dedup field {field}={recorded!r} is not an exact '
+                'non-negative integer; the redundant protocol field is '
+                'unverifiable')
+            continue
         try:
-            ok = int(recorded) == int(protocol[field])
+            expected_i = int(protocol[field])
         except (TypeError, ValueError, OverflowError, KeyError):
-            ok = False
-        if not ok:
+            expected_i = None
+        if expected_i is None or recorded_i != expected_i:
             problems.append(
                 f'{label}: dedup field {field}={recorded!r} disagrees with the '
                 f'protocol ({protocol.get(field)!r})')
@@ -75,8 +94,19 @@ def _dp_protocol_check(protocol, block, problems, warnings, label):
     return actual_fp
 
 
-def _dp_check_file_size(path, expected, problems, label):
-    if expected is None or not os.path.exists(path):
+def _dp_check_file_size(path, expected, problems, warnings, label):
+    # ``expected is None`` means the metadata records no count for this
+    # sidecar, so there is nothing to bind.  A count with a missing file is a
+    # different case: the audit must not report ``ok`` while a declared
+    # sidecar cannot be checked.  Keep it a warning (a metadata-only snapshot
+    # can still have auditable accounting) but make the false green visible.
+    if expected is None:
+        return False
+    if not os.path.exists(path):
+        warnings.append(
+            f'{label}: {os.path.basename(path)} is missing; the metadata '
+            f'accounts for {int(expected)} value(s) but the sidecar length '
+            'cannot be verified')
         return False
     try:
         n = int(np.load(path, mmap_mode='r').size)
@@ -201,6 +231,20 @@ def audit_data_processing(cache_dir=None):
             'accounting': {},
         }
         out['records'][label] = rec
+        # `(vocab, fit_fp)` is the cross-split pairing key, so these fields
+        # must be usable as an identity.  A JSON list/object in either slot
+        # would be unhashable (crashing the grouping below) and cannot name a
+        # corpus; report it as a metadata problem instead.
+        if meta.get('vocab') is not None and rec['vocab'] is None:
+            rec['problems'].append(
+                f"{label}: vocab={meta.get('vocab')!r} is not a non-negative "
+                'integer; the corpus identity is malformed')
+        _fit_fp = meta.get('fit_fp')
+        if _fit_fp is not None and not isinstance(_fit_fp, str):
+            rec['problems'].append(
+                f'{label}: fit_fp={_fit_fp!r} is not a string; the corpus '
+                'identity is malformed')
+            rec['fit_fp'] = None
         actual_fp = _dp_protocol_check(
             protocol, block, rec['problems'], rec['warnings'], label)
         if protocol is not None and actual_fp is not None:
@@ -292,16 +336,20 @@ def audit_data_processing(cache_dir=None):
             if tokens_served is not None:
                 te = os.path.join(base, f'test_ids_{tag}.npy')
                 rec['file_checks']['test_ids_size'] = _dp_check_file_size(
-                    te, tokens_served, rec['problems'], label)
+                    te, tokens_served, rec['problems'], rec['warnings'], label)
             if rows_served is not None:
                 td = os.path.join(base, f'test_doc_ids_{tag}.npy')
                 rec['file_checks']['test_doc_ids_size'] = _dp_check_file_size(
-                    td, rows_served, rec['problems'], label)
+                    td, rows_served, rec['problems'], rec['warnings'], label)
             if tokens_served is not None:
                 ttd = os.path.join(base, f'test_token_doc_ids_{tag}.npy')
                 rec['file_checks']['test_token_doc_ids_size'] = _dp_check_file_size(
-                    ttd, tokens_served, rec['problems'], label)
-            if protocol is not None and kept is not None:
+                    ttd, tokens_served, rec['problems'], rec['warnings'], label)
+            # Cross-split geometry is a property of the declared protocol, not
+            # of whether the (optional for legacy) document-count ledger is
+            # complete: keep the record so an edited/missing kept_documents
+            # cannot also hide a protocol mismatch.
+            if protocol is not None:
                 test_rows.append(rec)
         else:
             sampling = meta.get('sampling') or {}
@@ -354,21 +402,30 @@ def audit_data_processing(cache_dir=None):
                     tr = os.path.join(base, f'train_ids_{tag}.npy')
                     rec['file_checks']['train_ids_size'] = _dp_check_file_size(
                         tr, rec['accounting'][split]['tokens_served'],
-                        rec['problems'], label)
+                        rec['problems'], rec['warnings'], label)
                     trd = os.path.join(base, f'train_doc_ids_{tag}.npy')
                     rec['file_checks']['train_doc_ids_size'] = _dp_check_file_size(
-                        trd, expected_docs, rec['problems'], label)
+                        trd, expected_docs, rec['problems'], rec['warnings'], label)
                 else:
                     va = os.path.join(base, f'val_batch_{tag}.npy')
                     va_expected = None
-                    if meta.get('val_sequences') is not None and meta.get('seq_len') is not None:
-                        va_expected = (_dp_int(meta.get('val_sequences'))
-                                       * _dp_int(meta.get('seq_len')))
+                    if (meta.get('val_sequences') is not None
+                            or meta.get('seq_len') is not None):
+                        _va_n = _dp_int(meta.get('val_sequences'))
+                        _va_len = _dp_int(meta.get('seq_len'))
+                        if _va_n is None or _va_len is None:
+                            rec['problems'].append(
+                                f'{label}: val_sequences={meta.get("val_sequences")!r} '
+                                f'and seq_len={meta.get("seq_len")!r} must both be '
+                                'non-negative integers to size the validation '
+                                'batch; the sidecar length is unverifiable')
+                        else:
+                            va_expected = _va_n * _va_len
                     rec['file_checks']['val_batch_size'] = _dp_check_file_size(
-                        va, va_expected, rec['problems'], label)
+                        va, va_expected, rec['problems'], rec['warnings'], label)
                     vad = os.path.join(base, f'val_doc_ids_{tag}.npy')
                     rec['file_checks']['val_doc_ids_size'] = _dp_check_file_size(
-                        vad, expected_docs, rec['problems'], label)
+                        vad, expected_docs, rec['problems'], rec['warnings'], label)
             # Validation cleanup in the train meta must match the split ledger.
             vc = dedup.get('validation_cleanup')
             if isinstance(vc, dict):
@@ -393,7 +450,12 @@ def audit_data_processing(cache_dir=None):
 
     # ---- cross-split protocol consistency --------------------------------
     def _pair_key(rec):
-        return (rec.get('vocab'), rec.get('fit_fp'))
+        fit = rec.get('fit_fp')
+        # Malformed metadata was converted to ``None`` above; keep this
+        # helper total so an unexpected caller cannot crash the grouping.
+        if fit is not None and not isinstance(fit, str):
+            fit = repr(fit)
+        return (rec.get('vocab'), fit)
     by_pair = {}
     for rec in train_rows:
         by_pair.setdefault(_pair_key(rec), set()).add(rec.get('protocol_fp'))
@@ -421,7 +483,13 @@ def audit_data_processing(cache_dir=None):
                 'is paired with')
     if n_protocol == 0:
         if n_legacy:
-            out['status'] = 'not_verifiable_locally'
+            # Legacy means "cannot certify the geometry", not "overwrite a
+            # hard failure with not_verifiable".  A legacy cache that records
+            # a non-default threshold is a fail-closed problem above; keep
+            # that fail so a reader cannot mistake a corrupt/unknown cache
+            # for an honestly-unverifiable one.
+            if out['status'] != 'fail':
+                out['status'] = 'not_verifiable_locally'
             out['note'] = (
                 'all caches are legacy (no full dedup protocol); the cleaning '
                 'geometry cannot be certified.  Rebuild the caches with the '
