@@ -323,17 +323,49 @@ def blocked_run_order(cells, *, block_key, seed=0, balance_positions=True,
     return out
 
 
+def _normalise_environment_slots(slots):
+    """Validate the optional hardware slots of a run-order plan.
+
+    Slots are labels (``gpu0``/``gpu1`` or the actual
+    ``CUDA_VISIBLE_DEVICES`` tokens).  They are metadata only: the plan does
+    not pin a physical device, it records the balanced assignment a scheduler
+    should follow.  Duplicate/empty labels would make "arm on slot" ambiguous,
+    so they fail closed.
+    """
+    if not isinstance(slots, (list, tuple)) or not slots:
+        raise ValueError('environment_slots must be a non-empty list/tuple')
+    out = []
+    for slot in slots:
+        if slot is None or isinstance(slot, (bool, np.bool_)):
+            raise ValueError(f'invalid environment slot {slot!r}')
+        text = str(slot).strip()
+        if not text:
+            raise ValueError('environment slots must be non-empty labels')
+        if text in out:
+            raise ValueError(f'duplicate environment slot {text!r}')
+        out.append(text)
+    return out
+
+
 def build_run_order_plan(cells, *, block_key, seed=0, block_name='seed',
                          variant_key=None, label=None,
                          balance_positions=True, balance_key=None,
                          design_name='randomized_complete_block_balanced',
-                         created_at=None):
+                         created_at=None, environment_slots=None):
     """Build the JSON-safe plan written next to a panel's summary.
 
     Only the plan is new metadata; the caller still trains the same cells with
     the same seeds and hyperparameters.  ``blocks`` records the within-block
     order and ``planned_cells`` the flat order, so a later audit can check both
     the design and the actual event order without re-deriving them.
+
+    ``environment_slots`` optionally adds a balanced hardware/device
+    assignment (``cell_environments``).  Within each complete block the slot
+    rotates with the arm's position; because the position design already gives
+    every arm every slot once across blocks, each arm then visits every
+    environment equally often.  The assignment is a recommendation, not a
+    measurement: a dynamic dispatcher may start a cell on a different device,
+    which the allocation audit reports rather than silently accepting.
     """
     if design_name not in RUN_ORDER_DESIGNS:
         raise ValueError(f'unknown run-order design {design_name!r}')
@@ -343,6 +375,8 @@ def build_run_order_plan(cells, *, block_key, seed=0, block_name='seed',
     ordered = blocked_run_order(raw, block_key=block_key, seed=seed,
                                 balance_positions=balance_positions,
                                 balance_key=balance_key)
+    slots = (None if environment_slots is None
+             else _normalise_environment_slots(environment_slots))
 
     def _variant(cell):
         if variant_key is not None:
@@ -376,7 +410,7 @@ def build_run_order_plan(cells, *, block_key, seed=0, block_name='seed',
     _pos_policy = ('cyclic_base_rotation'
                    if balance_positions and _same_blocks
                    else 'independent_block_shuffle')
-    return {
+    plan = {
         'kind': 'run_order',
         'schema': RUN_ORDER_SCHEMA,
         'created_at': created_at or time.strftime('%Y-%m-%dT%H:%M:%S'),
@@ -395,6 +429,25 @@ def build_run_order_plan(cells, *, block_key, seed=0, block_name='seed',
         'cell_blocks': cell_blocks,
         'cell_variants': cell_variants,
     }
+    if slots is not None:
+        # The position design already gives every arm every slot once across
+        # complete blocks.  Mapping position -> slot therefore balances arm
+        # across environments too; rotating by the block index as well would
+        # cancel that rotation (position = base - block-index) and put each
+        # arm on a single slot.
+        labels_by_block = collections.OrderedDict()
+        for lab in labels:
+            labels_by_block.setdefault(cell_blocks[lab], []).append(lab)
+        cell_environments = {}
+        for block_labels in labels_by_block.values():
+            for pos, lab in enumerate(block_labels):
+                cell_environments[lab] = slots[pos % len(slots)]
+        if set(cell_environments) != set(labels):
+            raise ValueError('environment assignment does not cover every planned cell')
+        plan['environment_slots'] = list(slots)
+        plan['cell_environments'] = cell_environments
+        plan['design']['environment_balance'] = 'cyclic_slot_rotation'
+    return plan
 
 
 def _evaluation_cell_label(cell):
@@ -675,11 +728,52 @@ def run_order_balance(plan, actual_order=None):
     return out
 
 
+def _same_run_order_plan(old, new):
+    """True when ``new`` describes the same allocation design as ``old``.
+
+    A resumed panel rebuilds the plan object from the same (arm, seed) grid.
+    That rebuild has a fresh ``created_at``; overwriting the original file
+    would turn a genuine precommitment into a post-hoc plan (and the allocation
+    audit would correctly fail it).  Identity is the planned cells, the block
+    mapping and the design seed — not the timestamp.
+    """
+    if not isinstance(old, dict) or not isinstance(new, dict):
+        return False
+    if old.get('kind') != 'run_order' or new.get('kind') != 'run_order':
+        return False
+    for key in ('planned_cells', 'blocks'):
+        if old.get(key) != new.get(key):
+            return False
+    # Older plans may predate the per-cell maps.  A present map still has to
+    # agree; an absent one is not evidence of a different design.
+    for key in ('cell_blocks', 'cell_variants'):
+        if key in old and old.get(key) != new.get(key):
+            return False
+    od = old.get('design') if isinstance(old.get('design'), dict) else {}
+    nd = new.get('design') if isinstance(new.get('design'), dict) else {}
+    return (od.get('name') == nd.get('name')
+            and od.get('design_seed') == nd.get('design_seed'))
+
+
 def write_run_order(outdir, plan):
-    """Persist the run-order plan beside the panel's other provenance."""
+    """Persist the run-order plan beside the panel's other provenance.
+
+    The first write is the precommitment.  A resume that rebuilds the same
+    design keeps that original file (including its ``created_at`` and any
+    device assignment), so the allocation audit can still distinguish a
+    prospective plan from one reconstructed after execution.
+    """
     if not isinstance(plan, dict) or plan.get('kind') != 'run_order':
         raise ValueError('write_run_order expects a plan from build_run_order_plan')
     path = os.path.join(outdir, 'run_order.json')
+    if os.path.exists(path):
+        try:
+            with open(path, encoding='utf-8') as fh:
+                old = json.load(fh)
+        except Exception:
+            old = None
+        if _same_run_order_plan(old, plan):
+            return path
     atomic_write_json(path, plan)
     return path
 

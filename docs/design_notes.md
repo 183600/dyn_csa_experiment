@@ -5543,3 +5543,130 @@ python -m explib.confirmation plan        # 冻结计划预检不变
 安全与伪造 `_ledger` 被覆盖；审计对目录/文件输入、混合 ok+fail 汇总与
 `report`/CLI 接线。完整 CPU 套件 `588 passed, 3 skipped`（新增 6 项）。
 冻结清单、种子、端点、`CODE_SEMANTICS` 与既有统计机器不变。
+
+## 78. 运行分配也是实验准备：计划必须前瞻，设备不能与臂共线
+
+### 78.1 问题：时间区组修好了，分配仍有两个漏洞
+
+§48 把训练面板改成「按种子分块 + 臂位置轮换」，§76 又把 P5T 的 clean
+by-length 与 distractor probe 改成预写评估顺序。两者解决的是**测量时间**
+与臂共线。但一次多卡实验还有两个同样属于「准备阶段」、当前却没有机器
+检查的分配变量：
+
+1. **计划的前瞻性没有被审计。** `build_run_order_plan` 已经写入
+   `created_at`，`audit_evaluation_order` 也核对「计划不晚于第一次测量」；
+   但 `audit_run_order` 只检查完整区组、位置平衡与实际顺序，从不比较
+   `run_order.json.created_at` 与第一条 `cell` 事件。于是执行结束后补写
+   一份「看起来随机」的计划，仍可能通过顺序审计。计划是不是在跑之前
+   写下的，是预注册与事后叙事的分界，不应只靠人工记忆。
+2. **设备/主机分配没有进入设计。** `par.py` 按「下一个空闲 worker」派发，
+   多卡机器上同一种子的两臂可能落在不同物理卡；更糟的是，如果每个 seed
+   的 A 臂总在 GPU 0、B 臂总在 GPU 1，臂就与设备、驱动、温度、ECC/MIG
+   差异完全共线。`exec_fp` 刻意排除 GPU UUID 与 hostname（为了让同型号
+   机器可以复现），所以这种共线**不会**被现有的配对有效性门发现。
+   `provenance.environment` 记录了 `hostname`、`cuda_visible_devices`、
+   `gpu_identity` 与 CUDA 栈，却没有任何审计读取这个维度。
+
+这不是「p 值不够小」，而是两种无法靠增加种子修复的设计混杂：事后计划
+不是预注册；完全共线的设备差异与臂效应在同一个配对差值里不可分离。
+
+### 78.2 方法：把分配写进计划，并把计划与环境都变成可拒绝的读数
+
+**(a) 设备槽位随位置轮换。** `exp_lib.build_run_order_plan(...,
+environment_slots=[...])` 新增可选的 `environment_slots`，写出
+`cell_environments`（每个 planned cell 的证据槽位）与
+`design.environment_balance='cyclic_slot_rotation'`。分配规则是**块内位置
+-> 槽位循环**：`slot = slots[position % len(slots)]`。
+
+§48 的位置设计已经保证「每个臂在每个位置各出现一次」（完整区块且块数
+≥ 臂数），所以按位置映射槽位会让每个臂在每个设备上出现次数相差不超过
+1，设备与臂不再共线。这里刻意**不**再叠加一次「块号旋转」：块内位置本身
+已经是 `base - block_index`，再加 `+block_index` 会相互抵消，最后每个臂
+固定在一个槽位上。`environment_slots` 只是建议性元数据，不改变训练数值、
+RNG、resume 或 `run_cfg`；`cell_environments` 只描述「计划让这个 cell 去
+哪个槽位」，不声称调度器一定照做。`write_run_order` 对「同一 planned_cells
++ blocks + design seed」的重建是幂等的：resume 时保留第一次写入的
+`created_at` 与设备分配，不把预注册计划改写成带新时间戳的事后计划；只有
+计划网格或设计种子真的变化时才覆盖。
+
+**(b) 计划时间戳审计。** 新增 `exp_lib.run_order_plan_timing(plan,
+events, kind='cell')`：解析 `plan.created_at` 与所有匹配事件的 `started_at`，
+要求计划时间不晚于最早一次执行。缺失时间戳报 `not_verifiable_locally`，
+不可解析报 `fail`，计划晚于首条事件报 `fail`；时区约定不一致时不冒险比较，
+明确报 `not_verifiable_locally`。它不把「计划文件存在」当成「计划在跑之前
+存在」。
+
+**(c) 臂 × 环境平衡审计。** 新增
+`exp_lib.environment_identity(env)` 与
+`exp_lib.environment_balance_audit(records)`。身份由
+`hostname`、`cuda_available`、`cuda_visible_devices`、`gpu_identity` 与
+torch/CUDA/cuDNN/determinism 组成，正是「换一张卡/换一台机器/换一个数值栈」
+这些可能制造系统差异的维度。审计按臂统计环境分布：
+
+- 若某两个臂的环境集合**不相交**，且两臂都有
+  `min_records_per_arm`（默认 2）条带环境的记录，则判 `fail`：
+  这是完全共线，配对差值无法把臂效应与环境效应分开；
+- 单臂记录不足 2 条时报 `not_verifiable_locally`，不把「一臂一条、两条不同
+  卡」误判成共线；
+- 某臂 >90% 的记录集中在同一环境时给 warning（近乎共线）；
+- 记录缺环境身份时给 warning；一条都没有时 `not_verifiable_locally`，
+  绝不报绿。
+
+**(d) 计划级设备设计审计。** `exp_lib.environment_plan_audit(plan)` 检查
+`cell_environments` 是否覆盖全部 `planned_cells`、槽位是否都在声明列表内、
+每个臂的槽位计数是否相差不超过 1；没有声明 `environment_slots` 的旧计划
+报 `not_declared`（warning），不是失败，避免追溯性否定历史面板。
+
+**(e) 汇总入口。** `exp_lib.run_allocation_audit(records, plan=...,
+events=...)` 合并上述三块；`audit_gates.audit_run_allocation(paths=None)`
+读取每个 `results_*/` 的 `run_order.json`、`summary.json` 与
+`experiments.jsonl`，汇总为 `ok` / `warnings` / `fail` /
+`not_verifiable_locally`。CLI 别名为 `run_allocation`、`allocation`、
+`environment_balance`，并接入 `audit_gates.py report` 的 `run_allocation`
+键。
+
+### 78.3 边界
+
+- **不是新测量，也不是新显著性检验。** 该审计只读计划时间、计划槽位与
+  已落盘环境快照；不改变 PPL、种子、终点、α、Holm 族、`confirmed` 或
+  `CODE_SEMANTICS`，也不修改 `confirmation_frozen.json`。
+- **平衡是设计，不是事后修复。** 审计发现完全共线时，即使重新加权/加种子
+  也不能把已经混在同一个配对差值里的设备效应拆开；正确做法是下一轮按
+  槽位均衡重跑，或把设备作为区组变量重新设计。
+- **槽位是建议，不是调度保证。** 动态调度、抢占或多节点环境可以让实际
+  设备与计划不同；`environment_balance_audit` 读实际 `provenance`，因此
+  能报告「计划平衡、实际不平衡」，而不是相信计划文件。
+- **环境身份不是因果归因。** `hostname`/CVD/GPU 型号相同不代表数值路径
+  完全相同（时钟、邻居负载、MIG 切分不在快照里）；审计只能排除「完全
+  共线」这一种最严重的混杂，不能证明环境无差异。若容器每次随机生成
+  hostname，审计会保守地把两次运行视为不同环境；这种部署应提供稳定的
+  节点标识，而不是让随机名字制造假共线。
+- **缺环境身份不是通过。** 旧记录没有 `provenance.environment` 时，
+  本审计报 `not_verifiable_locally`；不能把「没记录」写成「已平衡」。
+- **计划时间比较假设同一时钟口径。** 驱动使用本地 `strftime`；跨时区/
+  跨机器的计划与事件如果一方带时区一方不带，审计拒绝比较而不是猜测。
+- **幂等写入意味着「同设计 resume」不会刷新计划。** 若确实要在同一 outdir
+  开始一个全新的、独立的一轮，应换 outdir（或显式删除旧的
+  `run_order.json` 并承担丢失预注册时间的后果）；仅仅重跑驱动不会重置
+  `created_at`，这是有意为之。
+- **完全共线是 fail，部分不平衡是 warning。** 这与 §48/§76 的
+  arm-major 硬失败一致：完全共线是设计缺陷，不是「结果不显著」。
+
+### 78.4 入口与验证
+
+```bash
+python audit_gates.py run_allocation   # 或 allocation / environment_balance
+python audit_gates.py report           # 汇总含 run_allocation
+python test_review_fixes.py            # 包含 test_review_part_15.py（5 项）
+python -m explib.confirmation plan     # 冻结计划预检不变
+```
+
+新增测试覆盖：`environment_slots` 的块内位置轮换确实使每个臂在每个槽位
+出现次数相差不超过 1（并防住「块号旋转与位置旋转相互抵消」的回归）；
+缺覆盖、未声明槽位、臂槽位偏斜均 fail；平衡/完全共线/单臂样本不足/缺
+环境身份/跨主机共线分别得到 ok/fail/not_verifiable/not_verifiable/fail；
+计划早于/晚于首条 cell、缺时间戳、坏时间戳、无事件、时区不一致分别得到
+ok/fail/not_verifiable/fail/not_verifiable/not_verifiable；审计入口与
+`report`/CLI 接线；以及「无计划、无事件、无环境记录」的空目录明确报
+`not_verifiable_locally` 而不是假绿。现有 `run_order` /
+`evaluation_order` 审计的语义与测试保持不变。

@@ -375,6 +375,7 @@ python audit_gates.py sesoi       # design-time gate: every ablation component h
 python audit_gates.py unit_influence  # result-analysis gate: unit-influence block reproduces pooled Δ; flags one-unit-driven comparisons
 python audit_gates.py looks       # look-history gate: recompute per-look and exact max-over-looks sequential p; flags seed top-ups that only look significant at the final n
 python audit_gates.py experiment_ledger  # replay the experiments.jsonl hash chain + tail anchor; edited/deleted/reordered/truncated events fail
+python audit_gates.py run_allocation  # prospective run-order plan + arm×device balance; post-hoc plans and complete arm/device confounding fail
 python audit_gates.py report      # run every locally-verifiable audit -> audit_report.json
 python audit_gates.py selection   # selection-recall contract (refuses unsupported mechanism claims when absent)
 python audit_gates.py efficiency_pairs  # measured latency claims: same shape/device/KV required

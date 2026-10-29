@@ -42,6 +42,7 @@ _PARTS = [
 'part_32_pooled_ppl_from_records.py',
 'part_33_plot.py',
 'part_34_dump_aggregate.py',
+'part_35_run_allocation.py',
 ]
 
 for _part in _PARTS:

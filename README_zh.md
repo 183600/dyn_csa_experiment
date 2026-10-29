@@ -307,6 +307,7 @@ python audit_gates.py sesoi       # 设计期门：每个消融组件都有合�
 python audit_gates.py unit_influence  # 结果分析门：逐单元影响块必须复现主终点 pooled Δ；标记单单元主导/陈旧产物
 python audit_gates.py looks       # look-history 门：复核逐 look p 与精确 max-over-looks 序列 p；标记「补种子后才显著」的对照
 python audit_gates.py experiment_ledger  # 重放 experiments.jsonl 的哈希链与尾锚点；编辑/删除/重排/截断事件判 fail
+python audit_gates.py run_allocation  # 运行分配门：计划时间戳须早于首条 cell；臂×设备完全共线或计划覆盖不全判 fail
 python audit_gates.py report      # 运行本地可核验的全部审计 -> audit_report.json
 python archive_release.py plan v13 --dirs results_lm_test analysis_v12   # 证据归档 dry-run
 ```

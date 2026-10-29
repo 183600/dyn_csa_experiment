@@ -858,6 +858,105 @@ def audit_run_order(paths=None):
     return out
 
 
+def audit_run_allocation(paths=None):
+    """Prospective run-plan and arm x environment allocation audit (zero GPU).
+
+    Two confounds survive a correct within-seed temporal block:
+
+      * a ``run_order.json`` written *after* the first cell is a
+        reconstruction, not a precommitment; it can look randomized while the
+        executed order was chosen with knowledge of the results;
+      * in a multi-GPU campaign a dynamic dispatcher can put every seed of arm
+        A on GPU 0 and every seed of arm B on GPU 1, so device/driver/thermal
+        differences are collinear with the arm.  ``exec_fp`` deliberately
+        excludes the GPU UUID and hostname, so pairing still succeeds.
+
+    This audit reuses the plan's ``created_at``/``cell_environments`` and the
+    summary records' ``provenance.environment`` to report both.  It is
+    descriptive: it changes no PPL, seed, endpoint, alpha, Holm family or
+    frozen decision.  A panel with no environment metadata is
+    ``not_verifiable_locally``, never "balanced".
+    """
+    L = _import_exp_lib()
+    if paths is None:
+        paths = [os.path.join(REPO, d) for d in _iter_result_dirs()]
+    elif isinstance(paths, (str, os.PathLike)):
+        paths = [paths]
+    out = {'kind': 'run_allocation_audit', 'status': 'ok', 'panels': {},
+           'n_ok': 0, 'n_warnings': 0, 'n_fail': 0,
+           'n_not_verifiable': 0, 'problems': [], 'warnings': [],
+           'note': ('a run-order plan must predate execution and each arm '
+                    'must overlap the same hardware environments; complete '
+                    'arm x device confounding is a design failure, not a '
+                    'null result')}
+    for d in paths:
+        d = os.fspath(d)
+        if not os.path.isdir(d):
+            continue
+        name = os.path.basename(os.path.normpath(d))
+        if 'smoke' in name.lower():
+            continue
+        plan_path = os.path.join(d, 'run_order.json')
+        plan_exists = os.path.exists(plan_path)
+        plan = _load(plan_path) if plan_exists else None
+        summary_path = os.path.join(d, 'summary.json')
+        summary_exists = os.path.exists(summary_path)
+        summary = _load(summary_path)
+        events = _read_experiment_events(d)
+        rec = L.run_allocation_audit(
+            summary if isinstance(summary, dict) else {},
+            plan=plan if isinstance(plan, dict) else None,
+            events=events, kind='cell')
+        rec['plan_present'] = plan_exists
+        rec['summary_present'] = isinstance(summary, dict)
+        if summary_exists and not isinstance(summary, dict):
+            rec['status'] = 'fail'
+            rec['problems'].append(
+                'summary.json exists but is not a readable JSON object; the '
+                'observed environment balance cannot be verified')
+        if plan_exists and not isinstance(plan, dict):
+            rec['status'] = 'fail'
+            rec['problems'].append(
+                'run_order.json exists but is not a readable JSON object; '
+                'the allocation design cannot be verified')
+        elif plan_exists and isinstance(plan, dict) and plan.get('kind') != 'run_order':
+            rec['status'] = 'fail'
+            rec['problems'].append(
+                f"run_order.json has kind={plan.get('kind')!r}, expected "
+                "'run_order'; the allocation design cannot be verified")
+        elif not plan_exists and events:
+            rec['warnings'].append(
+                'no run_order.json plan exists; the actual cell order is '
+                'recorded but the execution was not governed by a preplanned '
+                'allocation')
+        if rec['status'] == 'ok':
+            out['n_ok'] += 1
+        elif rec['status'] == 'fail':
+            out['n_fail'] += 1
+        elif rec['status'] == 'warnings':
+            out['n_warnings'] += 1
+        else:
+            out['n_not_verifiable'] += 1
+        out['problems'].extend(f'{name}: {p}' for p in rec.get('problems') or [])
+        out['warnings'].extend(f'{name}: {w}' for w in rec.get('warnings') or [])
+        out['panels'][name] = rec
+    if out['n_fail']:
+        out['status'] = 'fail'
+    elif out['n_ok'] or out['n_warnings']:
+        out['status'] = 'warnings' if out['n_warnings'] else 'ok'
+    else:
+        out['status'] = 'not_verifiable_locally'
+    print(json.dumps({k: v for k, v in out.items() if k != 'panels'},
+                     ensure_ascii=False, indent=2)[:4000])
+    if out['panels']:
+        for _n, _r in out['panels'].items():
+            _timing = (_r.get('timing') or {}).get('status')
+            _actual = (_r.get('environment_actual') or {}).get('status')
+            print(f"  [allocation] {_n}: {_r.get('status')} "
+                  f"(timing={_timing}, environment={_actual})")
+    return out
+
+
 def audit_evaluation_order(paths=None):
     """Final-test evaluation-order / measurement-time audit (zero GPU).
 

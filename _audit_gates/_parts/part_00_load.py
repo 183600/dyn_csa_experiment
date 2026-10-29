@@ -91,6 +91,13 @@
   run_order    运行顺序 / 时间混杂：检查 run_order.json 的完整区组与位置
                平衡，并从 experiments.jsonl 复核实际执行顺序；arm-major
                顺序（一个臂全部种子跑完再跑下一个臂）判 fail（零 GPU）
+  run_allocation  运行分配：run_order.json 的 created_at 是否早于第一条
+               cell 事件（事后补计划不是预注册）、声明的设备槽位是否覆盖
+               并均衡全部 planned cells，以及 summary 记录里的
+               provenance.environment 是否让臂与设备/主机完全共线
+               （完全共线判 fail，缺环境身份报 not_verifiable；零 GPU，
+               不改任何测量或冻结判定）
+               别名：allocation / environment_balance
   evaluation_order  最终测试评估顺序 / 测量时间混杂：检查 P5T 在读取 test
                前写下的 clean_by_length_order.json / distractor_probe_order.json
                是否为完整区组、位置平衡、覆盖全部 (arm, seed)，并复核

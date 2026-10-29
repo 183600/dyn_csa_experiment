@@ -3231,3 +3231,47 @@ legacy 前缀 + 无尾换行追加、NaN/NumPy/集合 JSON 安全与 `_ledger` �
 账本，所以 `python audit_gates.py experiment_ledger` 返回
 `not_verifiable_locally` 而不是绿色通过；`python -m explib.confirmation
 plan` 的冻结计划/比较数不变。
+
+## 2026-10-29 — 运行分配的前瞻性、设备槽位与臂×环境共线审计（no new runs）
+
+零 GPU 的实验设计/准备硬化；不新增训练、不读取 test split、不修改冻结
+清单的字节/种子/端点/alpha/Holm 规则，也不改 `CODE_SEMANTICS`。
+
+**Problem.** §48 已把训练面板改成按种子分块并轮换臂位置，§76 又把 P5T
+评估顺序预注册；但 `run_order.json` 的 `created_at` 从未与第一条 `cell`
+事件比较，执行结束后补写的「看起来随机」的计划仍可通过 `audit_run_order`。
+同时，多卡调度按空闲 worker 派发，同一 seed 的两臂可能固定落在不同
+GPU；`exec_fp` 有意排除 GPU UUID/hostname，因此配对有效性门不会发现
+「臂 × 设备」完全共线。`provenance.environment` 已经记录 host/CVD/GPU/
+CUDA 栈，却没有任何审计读取它。
+
+**Fix.** 新增 `exp_lib.build_run_order_plan(..., environment_slots=...)`：
+按块内位置循环分配 `cell_environments`，使每个臂在每个槽位出现次数相差
+不超过 1；不叠加块号旋转（会与位置旋转抵消）。`write_run_order` 对同一
+planned_cells/blocks/design seed 的重建保持幂等，resume 不会用新时间戳
+覆盖第一次写入的预注册计划。新增
+`run_order_plan_timing(plan, events)`：计划晚于首条 cell 判 fail，缺时间戳
+报 not_verifiable，坏时间戳 fail，时区不一致 not_verifiable。新增
+`environment_identity` / `environment_balance_audit` /
+`environment_plan_audit` / `run_allocation_audit`：两臂环境集合不相交且
+各有 >=2 条记录判完全共线 fail；单臂样本不足或缺环境身份报
+not_verifiable；>90% 集中在一个环境给 warning。`audit_gates.audit_run_allocation`
+（CLI `run_allocation`/`allocation`/`environment_balance`）读取
+`run_order.json` + `summary.json` + `experiments.jsonl`，接入
+`audit_gates.py report` 的 `run_allocation` 块。
+
+**Boundary.** 平衡是设计而非事后修复：完全共线不能用加种子或重加权拆开。
+槽位是计划建议，实际调度可以不同，审计读实际环境快照而不是相信计划。
+环境身份不能证明数值路径完全相同（时钟/MIG/邻居负载不在快照内），只能
+排除完全共线。缺环境记录不是通过；旧面板报 not_verifiable。计划时间比较
+假设同一时钟口径，跨时区不一致时拒绝猜测。该审计不改变任何 PPL、种子、
+终点、alpha、Holm 族、`confirmed` 或 `CODE_SEMANTICS`。
+
+**Verification.** 新增 `test_review_part_15.py` 5 项：槽位位置轮换的
+臂×槽位平衡（含「块号旋转抵消位置旋转」回归）、计划覆盖/槽位合法性/
+偏斜 fail、平衡/完全共线/样本不足/缺环境/跨主机共线状态、计划时间
+前瞻性各分支、审计入口与 report/CLI 接线，以及空目录必须
+not_verifiable。现有 `run_order`/`evaluation_order` 测试保持通过；
+`python audit_gates.py run_allocation` 在当前无结果目录的仓库报
+`not_verifiable_locally` 而不是假绿；`python -m explib.confirmation plan`
+的冻结计划/比较数不变。
