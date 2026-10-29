@@ -311,8 +311,12 @@ def exact_signflip(deltas, *, n_input=None):
     _p_floor = (1.0 if _n_nonzero == 0
                 else min(1.0, math.ldexp(2.0, -_n_nonzero)))
     _amax = max((abs(x) for x in deltas), default=0.0)
+    # Mirror exp_lib.exact_signflip_p: always normalise the sign-flip
+    # comparison by the largest magnitude, so its 1e-12 tie tolerance is
+    # relative and a small-but-representable panel (e.g. 1e-13 deltas) cannot
+    # collapse to "every sign assignment qualifies".
     _p_deltas = ([x / _amax for x in deltas]
-                 if (_amax > 1e100 or 0.0 < _amax < 1e-100) else deltas)
+                 if _amax > 0.0 else deltas)
     _obs_p = abs(sum(_p_deltas))
     # Panel attrition is part of the result: `deltas` may be the complete-case
     # subset after unpaired/non-finite seeds were dropped.  The caller can pass

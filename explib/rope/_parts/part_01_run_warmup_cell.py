@@ -388,6 +388,13 @@ def exact_sign_permutation(deltas):
         d_z（配对差均值/样本标准差），并把该 n 下的 p 值分辨率下限
         一并写出，避免把分辨率上限误读为数据结论。纯增量字段。"""
         res['per_seed'] = [float(x) for x in d.tolist()]
+        if n > 1:
+            # The ordinary numpy std squares the deltas, so a finite but tiny
+            # (or huge) panel underflows/overflows to std=0/inf.  Rescale the
+            # same quantity instead of reporting a fabricated zero spread.
+            _ms = L._scaled_mean_std_if_extreme(d, ddof=1)
+            if _ms is not None:
+                res['mean'], res['std'] = _ms
         # Zero deltas are sign-neutral: they do not change p, but they lower
         # the attainable resolution from 2/2**n to 2/2**(#nonzero).
         _n_nonzero = int(np.count_nonzero(d))
@@ -399,9 +406,12 @@ def exact_sign_permutation(deltas):
         _mu = res.get('mean', float('nan'))
         if (not isinstance(_sd, (int, float))) or (not math.isfinite(_mu)):
             res['cohens_dz'] = float('nan')
-        elif _sd > 1e-12:
+        elif _sd > 0.0:
+            # A positive sample spread is measurable at any unit.  The old
+            # absolute 1e-12 floor turned a genuinely variable but tiny panel
+            # into an infinite effect size.
             res['cohens_dz'] = float(_mu / _sd)
-        elif abs(_mu) < 1e-300:
+        elif abs(_mu) == 0.0:
             res['cohens_dz'] = 0.0
         else:
             res['cohens_dz'] = float('inf') if _mu > 0 else float('-inf')
@@ -416,7 +426,13 @@ def exact_sign_permutation(deltas):
         return res
     if n == 0:
         return _extras({'n': 0, 'mean': float('nan'), 'std': float('nan'), 'p_exact_signflip': float('nan'), 'n_flips': 0, 'n_dropped': n_dropped}, d, n)
-    obs = abs(d.mean())
+    # Match exp_lib.exact_signflip_p: the enumeration compares means with an
+    # absolute 1e-12 tie tolerance, so work on a unit-scaled copy.  Otherwise
+    # a small-but-representable panel (e.g. 1e-13 deltas) has every sign
+    # assignment within the tolerance and reports p=1 regardless of the data.
+    _scale = float(np.max(np.abs(d)))
+    d_work = d / _scale if _scale > 0.0 else d
+    obs = abs(float(d_work.mean()))
     if n > 20:
         # exp_lib keeps the test exact via meet-in-the-middle through n=40
         # (and uses a deterministic saddlepoint tail, never a random
@@ -437,7 +453,7 @@ def exact_sign_permutation(deltas):
         bs = min(step, total - off)
         masks = np.arange(off, off + bs, dtype=np.int64)[:, None]
         flips = np.where((masks & (1 << bitpos)) != 0, 1.0, -1.0)
-        cnt += int((np.abs((flips * d[None, :]).mean(1)) >= obs - 1e-12).sum())
+        cnt += int((np.abs((flips * d_work[None, :]).mean(1)) >= obs - 1e-12).sum())
     p = float(cnt / total)
     return _extras({'n': n, 'mean': float(d.mean()), 'std': float(d.std(ddof=1)) if n > 1 else 0.0, 'p_exact_signflip': p, 'n_flips': int(total), 'n_dropped': n_dropped}, d, n)
 

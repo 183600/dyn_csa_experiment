@@ -1113,8 +1113,14 @@ def exact_signflip_p(deltas):
     p_floor = (1.0 if n_nonzero == 0
                else min(1.0, math.ldexp(2.0, -n_nonzero)))
     _scale = float(np.max(np.abs(d))) if n_nonzero else 0.0
-    d_work = (d / _scale
-              if (_scale > 1e100 or 0.0 < _scale < 1e-100) else d)
+    # Work on a unit-scaled copy unconditionally.  The sign-flip statistic is
+    # scale invariant, but the exact/MITM branches compare against an
+    # absolute 1e-12 tie tolerance.  Leaving a small-but-representable panel
+    # (e.g. deltas of 1e-13) unscaled makes that tolerance larger than the
+    # observed effect, so every sign assignment qualifies and p becomes 1.
+    # Scaling by the largest magnitude turns the tolerance into a relative
+    # one without changing the comparison for ordinary O(1) panels.
+    d_work = (d / _scale) if _scale > 0.0 else d
     obs = abs(float(d_work.mean()))
     if n <= _SIGNFLIP_ENUM_MAX_N:
         total = 1 << n
@@ -1249,16 +1255,17 @@ def sequential_signflip_p(looks, *, alpha=0.05):
     alpha = _validated_alpha(alpha)
     series = _normalise_look_series(looks)
     k_looks = len(series)
-    # Seed deltas outside the ordinary range lose scale invariance: comparing
-    # them with an absolute 1e-9 tolerance, summing them, and thresholding the
-    # final sum at 1e-300 all depend on the arbitrary unit.  Normalise the
-    # whole look series by one common finite scale, exactly as the sign-flip
-    # helpers do; ordinary inputs keep the historical path bit-for-bit.
+    # Seed deltas were previously normalised only for extreme magnitudes
+    # (<1e-100 / >1e100).  That left the absolute 1e-9 consistency tolerance
+    # and the exact 1e-12 enumeration tolerance scale-dependent for ordinary
+    # small panels: 1e-12-scaled deltas looked identical, and every sign
+    # assignment could pass the 1e-12 cutoff.  Normalise the whole look
+    # series by one common finite scale unconditionally (when non-zero); the
+    # sign-flip p and the relative tolerances are then invariant under a
+    # units-only rescaling.
     _delta_abs = [abs(float(d)) for lk in series for d in lk['deltas']]
     _delta_scale = max(_delta_abs, default=0.0)
-    _delta_min_abs = min((a for a in _delta_abs if a > 0.0), default=0.0)
-    _scale_deltas = bool(math.isfinite(_delta_scale) and _delta_scale > 0.0
-                         and (_delta_scale < 1e-100 or _delta_min_abs > 1e100))
+    _scale_deltas = bool(math.isfinite(_delta_scale) and _delta_scale > 0.0)
 
     def _work_deltas(lk):
         if not _scale_deltas:

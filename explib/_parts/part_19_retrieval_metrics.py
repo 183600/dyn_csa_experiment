@@ -120,8 +120,9 @@ def retrieval_metrics(y_true, y_pred, labels=None, label_names=None):
     _fn_micro = int(n - n_correct)
     _f1_micro = (2.0 * _tp_micro / (2 * _tp_micro + _fp_micro + _fn_micro)
                  if n else None)
+    _lab_key_set = set(_lab_keys)
     _n_undeclared_pred = int(sum(v for k, v in predicted.items()
-                                 if k not in set(_lab_keys)))
+                                 if k not in _lab_key_set))
     # Extreme answer-class imbalance: top-1 micro accuracy can be high while a
     # rare answer class is never retrieved.  Macro recall is the recall-aligned
     # conditional endpoint, not an invented PR-AUC from top-1 labels.
@@ -235,8 +236,9 @@ def _multiclass_ranking_metrics(y_true, y_score, labels, label_names=None):
             defined.append(_name)
             supports.append(n_pos)
             weights.append(float(n_pos))
+    _defined_set = set(defined)
     out = {'per_class': per_class, 'defined_classes': defined,
-           'undefined_classes': [n for n in label_names if n not in set(defined)],
+           'undefined_classes': [n for n in label_names if n not in _defined_set],
            'roc_auc_macro': None, 'roc_auc_weighted': None,
            'pr_auc_macro': None, 'pr_auc_weighted': None,
            'roc_auc_micro': None, 'pr_auc_micro': None,

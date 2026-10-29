@@ -1,4 +1,12 @@
 
+# Inverse-variance pooling squares a standard error again when it forms
+# ``w ** 2``.  For an effect scale below ~1e-77 the raw square overflows even
+# though every input is finite, so normalize the whole family first.  The
+# historical 1e-100 cutoff left 1e-100..1e-78 panels overflowing their
+# weights; 1e-75 keeps a safe margin while leaving ordinary inputs on the
+# established path.
+_EFFECT_SCALE_FLOOR = 1e-75
+
 
 def _scale_points(points):
     """Normalise [{label, scale, effects, seeds, corpus_fp?, vocab?}] /
@@ -240,7 +248,7 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
     _effect_scale = max(_effect_abs, default=0.0)
     _effect_min_abs = min((a for a in _effect_abs if a > 0.0), default=0.0)
     _scale_effects = bool(math.isfinite(_effect_scale) and _effect_scale > 0.0
-                          and (_effect_scale < 1e-100 or _effect_min_abs > 1e100))
+                          and (_effect_scale < _EFFECT_SCALE_FLOOR or _effect_min_abs > 1e100))
     per = []
     for p in pts:
         d = np.asarray(p['effects'], dtype=float)
@@ -273,6 +281,8 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
                 m, sd, se = m_work, sd_work, se_work
             row.update({'mean': m, 'std': sd, 'se': se,
                         '_mean_work': m_work, '_se_work': se_work,
+                        '_work_scale': (max(abs(float(x)) for x in d_work)
+                                        if n else 0.0),
                         'underpowered': n < int(min_seeds)})
             if n > 1:
                 tc = _t_critical(1.0 - float(alpha), n - 1)
@@ -296,10 +306,18 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
         se = r.get('_se_work')
         if r['n'] <= 1 or se is None or not math.isfinite(se):
             return False
-        mean_work = r.get('_mean_work')
-        if mean_work is None or not math.isfinite(mean_work):
-            mean_work = 0.0
-        return se <= 1e-12 * max(1.0, abs(float(mean_work)))
+        # Compare against the point's own effect magnitude, not an absolute
+        # floor of 1.0.  With the old ``max(1.0, |mean|)`` rule a point whose
+        # effects are genuinely variable but scaled to 1e-13 looked like
+        # exact zero variance (every point was then excluded from the pool),
+        # and the verdict changed under a units-only rescaling.
+        _scale = r.get('_work_scale')
+        if _scale is None or not math.isfinite(float(_scale)):
+            return False
+        _scale = float(_scale)
+        if _scale <= 0.0:
+            return se == 0.0
+        return se <= 1e-12 * _scale
     _zero_variance = [r['label'] for r in per if _variance_is_zero(r)]
 
     def _weight_is_representable(r):
@@ -1022,7 +1040,7 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
     _effect_scale = max(_effect_abs, default=0.0)
     _effect_min_abs = min((a for a in _effect_abs if a > 0.0), default=0.0)
     _scale_effects = bool(math.isfinite(_effect_scale) and _effect_scale > 0.0
-                          and (_effect_scale < 1e-100 or _effect_min_abs > 1e100))
+                          and (_effect_scale < _EFFECT_SCALE_FLOOR or _effect_min_abs > 1e100))
 
     def _effects_work(p):
         if not _scale_effects:
