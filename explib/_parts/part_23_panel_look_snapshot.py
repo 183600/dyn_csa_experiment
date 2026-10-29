@@ -731,7 +731,11 @@ def _compute_control_detail(recs, a, b, *, tolerance=0.25):
                     _tpt = float(_Fraction(tt) / int(tok))
                 except (OverflowError, ValueError, ZeroDivisionError):
                     _tpt = None
-                if _tpt is not None and math.isfinite(_tpt):
+                # A positive quotient that underflows to 0.0 is not a
+                # measured zero time-per-token: treating it as one would
+                # fabricate a compute rate.  Leave timing unverifiable and let
+                # the 6ND proxy (if available) speak instead.
+                if _tpt is not None and math.isfinite(_tpt) and _tpt > 0.0:
                     tpt.append(_tpt)
             p = _as_seed_int(r.get('params'))
             if p is not None and p > 0:
@@ -785,10 +789,33 @@ def _compute_control_detail(recs, a, b, *, tolerance=0.25):
            'more_compute_arm': None, 'note': None}
     ratio = None
     _proxy_within = None
+    _time_unrepresentable = False
+    _time_direction = None
     if ta and tb and ta > 0 and tb > 0:
-        ratio = ta / tb
-        out['time_ratio_a_over_b'] = float(ratio)
-        out['compute_matched_source'] = 'measured wall-clock per token'
+        try:
+            ratio = ta / tb
+        except (OverflowError, ZeroDivisionError):
+            ratio = None
+        if ratio is None or ratio == 0.0 or not math.isfinite(ratio):
+            # A ratio below float64's smallest positive value (or above its
+            # maximum) is still ordered: the larger arm can be named, but the
+            # factor is not representable.  Reporting 0/inf would make a
+            # later ``1.0 / ratio`` crash and would pretend an infinite
+            # multiplier is a measured quantity.
+            from fractions import Fraction as _Fraction
+            try:
+                _exact = _Fraction(ta) / _Fraction(tb)
+            except (OverflowError, ZeroDivisionError, ValueError):
+                _exact = None
+            if _exact is not None:
+                _time_unrepresentable = True
+                _time_direction = a if _exact > 1 else b
+                out['compute_matched_source'] = (
+                    'measured wall-clock per token')
+            ratio = None
+        if ratio is not None and math.isfinite(ratio):
+            out['time_ratio_a_over_b'] = float(ratio)
+            out['compute_matched_source'] = 'measured wall-clock per token'
     elif xa and xb and xa > 0 and xb > 0:
         # The proxy is an exact params x tokens product.  Its ratio can still
         # be representable when each product is not (including the all-equal
@@ -804,6 +831,14 @@ def _compute_control_detail(recs, a, b, *, tolerance=0.25):
             out['compute_matched_source'] = (
                 '6ND proxy (params x tokens); not a measurement')
     if ratio is None:
+        if _time_unrepresentable:
+            out['compute_matched'] = False
+            out['more_compute_arm'] = _time_direction
+            out['note'] = (
+                'the measured wall-clock-per-token ratio is outside float64 '
+                f'range; {_time_direction!r} consumed more compute per token, '
+                'so this is NOT an equal-compute comparison')
+            return out
         if _proxy_within is not None:
             # The relative difference was too small to float but the exact
             # tolerance comparison is defined.  Report the verdict; the
@@ -820,7 +855,9 @@ def _compute_control_detail(recs, a, b, *, tolerance=0.25):
     out['compute_matched'] = bool(abs(ratio - 1.0) <= float(tolerance))
     out['more_compute_arm'] = (a if ratio > 1.0 else b)
     if not out['compute_matched']:
-        out['note'] = (f'{out["more_compute_arm"]} consumed about {max(ratio, 1.0 / ratio):.2f}x the compute of the other arm '
+        _factor = (ratio if ratio >= 1.0
+                   else (1.0 / ratio if ratio > 0.0 else float('inf')))
+        out['note'] = (f'{out["more_compute_arm"]} consumed about {_factor:.2f}x the compute of the other arm '
                        f'({out["compute_matched_source"]}); this is NOT an equal-compute comparison')
     return out
 

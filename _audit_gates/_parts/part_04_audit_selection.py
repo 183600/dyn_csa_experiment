@@ -846,6 +846,9 @@ def audit_run_order(paths=None):
         out['panels'][name] = rec
     if out['n_fail']:
         out['status'] = 'fail'
+    elif out['n_not_verifiable']:
+        out['status'] = ('warnings' if out['n_ok']
+                         else 'not_verifiable_locally')
     elif out['n_ok'] == 0:
         out['status'] = 'not_verifiable_locally'
     print(json.dumps({k: v for k, v in out.items() if k != 'panels'},
@@ -942,8 +945,16 @@ def audit_run_allocation(paths=None):
         out['panels'][name] = rec
     if out['n_fail']:
         out['status'] = 'fail'
-    elif out['n_ok'] or out['n_warnings']:
-        out['status'] = 'warnings' if out['n_warnings'] else 'ok'
+    elif out['n_not_verifiable']:
+        # One verified panel must not turn another panel's unverifiable
+        # allocation into a green aggregate.  Keep the positive panels, but
+        # surface the gap as a non-green status.
+        out['status'] = ('warnings' if (out['n_ok'] or out['n_warnings'])
+                         else 'not_verifiable_locally')
+    elif out['n_warnings']:
+        out['status'] = 'warnings'
+    elif out['n_ok']:
+        out['status'] = 'ok'
     else:
         out['status'] = 'not_verifiable_locally'
     print(json.dumps({k: v for k, v in out.items() if k != 'panels'},

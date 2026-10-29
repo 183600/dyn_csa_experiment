@@ -275,3 +275,95 @@ def test_run_allocation_audit_wiring_and_panel_status():
     assert 'run_allocation' in inspect.getsource(A._run_cli)
     assert "'run_allocation': audit_run_allocation()" in \
         inspect.getsource(A.run_report)
+
+
+def test_environment_balance_under_sampled_arm_is_not_green():
+    # Two arms are measured enough and balanced; a third/ fourth arm has one
+    # observation each.  That comparison looks fine, but the under-sampled
+    # arms' device balance cannot be assessed, so the whole audit must not be
+    # reported as a green pass (design_notes §78.2(c)).
+    records = {}
+    for s in range(3):
+        records[f'a::s{s}'] = _record('a', s, '0' if s % 2 else '1')
+        records[f'b::s{s}'] = _record('b', s, '0' if s % 2 else '1')
+    records['c::s0'] = _record('c', 0, '0')
+    records['d::s0'] = _record('d', 0, '1')
+    rep = L.environment_balance_audit(records)
+    assert rep['status'] == 'not_verifiable_locally', rep
+    assert rep['insufficient_arms'] == ['c', 'd'], rep
+    assert any('cannot be assessed' in w for w in rep['warnings']), rep
+    # A complete confound among the measured arms is still the stronger,
+    # hard-failure verdict; insufficient arms must not mask it.
+    for s in range(3):
+        records[f'a::s{s}'] = _record('a', s, '1')
+        records[f'b::s{s}'] = _record('b', s, '0')
+    records['c::s0'] = _record('c', 0, '0')
+    records['d::s0'] = _record('d', 0, '1')
+    rep = L.environment_balance_audit(records)
+    assert rep['status'] == 'fail', rep
+
+
+def test_audit_aggregates_do_not_hide_an_unverifiable_panel():
+    variants = ['a', 'b']
+    cells = [(v, s) for s in range(2) for v in variants]
+    plan = L.build_run_order_plan(
+        cells, block_key=lambda c: c[1], seed=7,
+        created_at='2026-01-01T00:00:00', environment_slots=['0', '1'])
+    summary = {}
+    for lab in plan['planned_cells']:
+        v, s = lab.rsplit('::seed', 1)
+        summary[lab] = _record(v, int(s), plan['cell_environments'][lab])
+    events = []
+    for i, lab in enumerate(plan['planned_cells']):
+        v, s = lab.rsplit('::seed', 1)
+        events.append({'kind': 'cell', 'status': 'ok', 'variant': v,
+                       'seed': int(s),
+                       'started_at': f'2026-01-01T00:0{i + 1}:00'})
+    with tempfile.TemporaryDirectory() as measured, \
+            tempfile.TemporaryDirectory() as empty:
+        with open(os.path.join(measured, 'run_order.json'), 'w',
+                  encoding='utf-8') as f:
+            json.dump(plan, f)
+        with open(os.path.join(measured, 'summary.json'), 'w',
+                  encoding='utf-8') as f:
+            json.dump(summary, f)
+        with open(os.path.join(measured, 'experiments.jsonl'), 'w',
+                  encoding='utf-8') as f:
+            for e in events:
+                f.write(json.dumps(e) + '\n')
+        # A mixed directory set contains one verified panel and one panel with
+        # no plan/records.  The aggregate must surface the gap instead of
+        # turning it green because at least one panel passed.
+        rep = A.audit_run_allocation([measured, empty])
+        assert rep['n_ok'] == 1 and rep['n_not_verifiable'] == 1, rep
+        assert rep['status'] == 'warnings', rep
+        rep = A.audit_run_order([measured, empty])
+        assert rep['n_ok'] == 1 and rep['n_not_verifiable'] == 1, rep
+        assert rep['status'] == 'warnings', rep
+
+
+def test_compute_control_handles_unrepresentable_time_ratios():
+    # The measured per-token time ratio can be finite for each arm but outside
+    # float64's representable range.  It must name the larger-compute arm
+    # without dividing by an underflowed 0.0 (which used to raise
+    # ZeroDivisionError) and without reporting inf as a measured factor.
+    def pair(ta, tb, tokens=1):
+        return {('a', 'p', 0): {'params': 1000, 'train_time_s': ta,
+                                'tokens_seen': tokens},
+                ('b', 'p', 0): {'params': 1000, 'train_time_s': tb,
+                                'tokens_seen': tokens}}
+
+    slow_b = L._compute_control_detail(pair(1e-300, 1e300), 'a', 'b')
+    assert slow_b['time_ratio_a_over_b'] is None, slow_b
+    assert slow_b['compute_matched'] is False, slow_b
+    assert slow_b['more_compute_arm'] == 'b', slow_b
+    assert 'outside float64 range' in slow_b['note'], slow_b
+    slow_a = L._compute_control_detail(pair(1e300, 1e-300), 'a', 'b')
+    assert slow_a['time_ratio_a_over_b'] is None, slow_a
+    assert slow_a['more_compute_arm'] == 'a', slow_a
+    # A time-per-token quotient that underflows to zero is not a measured
+    # zero rate; timing is omitted (the 6ND proxy may still decide the gate).
+    H = 10 ** 400
+    tiny = L._compute_control_detail(pair(1.0, 2.0, tokens=H), 'a', 'b')
+    assert tiny['time_per_token_s'] == {'a': None, 'b': None}, tiny
+    assert tiny['time_ratio_a_over_b'] is None, tiny

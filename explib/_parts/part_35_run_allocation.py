@@ -269,6 +269,20 @@ def environment_balance_audit(records, *, min_records_per_arm=None):
                 f'arms {a!r} and {b!r} have disjoint environment sets; arm and '
                 'device/host are perfectly confounded, so no paired contrast '
                 'can separate them')
+    elif out['insufficient_arms']:
+        # A comparison among the sufficiently sampled arms can still look
+        # balanced, but the under-sampled arm(s) cannot be checked at all.
+        # That is an explicit gap in the allocation audit, not a green pass
+        # for the panel: every arm named in the design must be assessable.
+        out['status'] = 'not_verifiable_locally'
+        out['reason'] = (
+            f'arm(s) {out["insufficient_arms"]} have fewer than {min_per_arm} '
+            'environment-bearing record(s); their arm x environment balance '
+            'cannot be distinguished from a single observation')
+        out['warnings'].append(
+            f"{len(out['insufficient_arms'])} arm(s) have fewer than "
+            f'{min_per_arm} environment-bearing record(s) and cannot be '
+            f'assessed: {out["insufficient_arms"]}')
     elif out['warnings']:
         out['status'] = 'warnings'
     else:
