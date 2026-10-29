@@ -26,13 +26,19 @@ SHA-256 清单的固定归档**，可发布到任何只读位置（release 附�
   python archive_release.py make v13 --dirs results_lm_test analysis_v12 \
       [--include-ckpt] [--out archive/]
       # 产出 archive/release_v13.tar.gz + release_v13.MANIFEST.sha256
+  SOURCE_DATE_EPOCH=1700000000 python archive_release.py make v13 \
+      --reproducible --dirs results_lm_test analysis_v12
+      # 字节可复现：同一证据重建得到同一 tar.gz/sha256
   python archive_release.py verify archive/release_v13.tar.gz
 
 verify 独立于 make：任何拿到归档的人都能校验完整性。
 """
 import argparse
+import contextlib
 import glob
+import gzip
 import hashlib
+import io
 import json
 import os
 import platform
@@ -179,7 +185,229 @@ def _atomic_write_bytes(path, data):
         raise
 
 
-def _git_state():
+# ---------------------------------------------------------------------------
+# Byte-reproducible packaging
+#
+# Hashing every payload file makes a release *content*-verifiable, but the
+# default tar.gz also records when it was built (member mtimes, the manifest
+# member's mtime and the gzip header).  Two builds of identical evidence then
+# produce different bytes and a different external .sha256, so a third party
+# cannot rebuild the published archive and compare hashes.  Honour the
+# reproducible-builds convention instead: when SOURCE_DATE_EPOCH is present,
+# pin every timestamp/owner field and the gzip header to it.  The payload
+# digest below is independent of that metadata, so content equality remains
+# checkable even for legacy/wall-clock archives.
+# ---------------------------------------------------------------------------
+_PAYLOAD_ALGORITHM = 'sha256(sorted relpath NUL sha256 NUL bytes LF)'
+_MAX_SOURCE_DATE_EPOCH = 253402300799  # 9999-12-31T23:59:59Z
+
+
+def _source_date_epoch(value=None):
+    """Parse SOURCE_DATE_EPOCH (or an explicit value) into a non-negative int.
+
+    The value is a build timestamp, not a measurement.  Reject floats,
+    negatives and non-numeric strings instead of silently truncating them:
+    a malformed stamp would otherwise produce an archive that claims to be
+    deterministic under a timestamp nobody can reproduce.
+    """
+    raw = os.environ.get('SOURCE_DATE_EPOCH') if value is None else value
+    if raw is None:
+        return None
+    if isinstance(raw, bool):
+        raise ValueError('SOURCE_DATE_EPOCH must be a non-negative integer, not a boolean')
+    text = str(raw).strip()
+    if not text:
+        return None
+    if not re.fullmatch(r'[0-9]+', text):
+        raise ValueError(
+            f'SOURCE_DATE_EPOCH must be a non-negative integer, got {raw!r}')
+    epoch = int(text)
+    if epoch > _MAX_SOURCE_DATE_EPOCH:
+        raise ValueError(
+            f'SOURCE_DATE_EPOCH {epoch} is later than 9999-12-31T23:59:59Z; '
+            'refusing a value that cannot be represented portably')
+    return epoch
+
+
+def _iso_utc(epoch):
+    """Canonical UTC timestamp used by deterministic manifests."""
+    try:
+        return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(int(epoch)))
+    except (OverflowError, OSError, ValueError) as exc:
+        raise ValueError(f'invalid SOURCE_DATE_EPOCH {epoch!r}: {exc}') from None
+
+
+def _normalize_tarinfo(ti, epoch):
+    """Remove wall-clock and host ownership from one tar member."""
+    ti.mtime = int(epoch)
+    ti.uid = 0
+    ti.gid = 0
+    ti.uname = ''
+    ti.gname = ''
+    # gettarinfo may attach atime/ctime PAX records; they are host state, not
+    # content, and would make two builds differ.
+    ti.pax_headers = {}
+
+
+@contextlib.contextmanager
+def _open_archive(path, epoch):
+    """Open a tar writer, with deterministic gzip framing when epoch is set."""
+    if epoch is None:
+        with tarfile.open(path, 'w:gz') as tf:
+            yield tf
+        return
+    raw = open(path, 'wb')
+    try:
+        gz = gzip.GzipFile(filename='', mode='wb', fileobj=raw,
+                           compresslevel=9, mtime=int(epoch))
+        try:
+            tf = tarfile.open(fileobj=gz, mode='w',
+                              format=tarfile.PAX_FORMAT)
+            try:
+                yield tf
+            finally:
+                tf.close()
+        finally:
+            gz.close()
+    finally:
+        raw.close()
+
+
+def _payload_digest(files):
+    """Content digest of the packed file map, excluding tar/gzip metadata."""
+    blob = ''.join(
+        f'{rel}\0{files[rel]["sha256"]}\0{files[rel]["bytes"]}\n'
+        for rel in sorted(files)
+        if isinstance(files.get(rel), dict)
+        and files[rel].get('sha256') is not None
+        and files[rel].get('bytes') is not None)
+    return hashlib.sha256(blob.encode('utf-8')).hexdigest()
+
+
+def _payload_problems(man):
+    """Why the manifest's payload digest does not describe its own file map."""
+    has_digest = 'payload_sha256' in man
+    has_algorithm = 'payload_algorithm' in man
+    if not has_digest and not has_algorithm:
+        # Legacy archives predate the content digest; absence is not a pass
+        # claim, but it must not be reported as tampering either.
+        return []
+    problems = []
+    if man.get('payload_algorithm') != _PAYLOAD_ALGORITHM:
+        problems.append('payload_algorithm is not the documented algorithm')
+    want = man.get('payload_sha256')
+    if not isinstance(want, str) or not re.fullmatch(r'[0-9a-fA-F]{64}', want):
+        problems.append('payload_sha256 is missing or malformed')
+        return problems
+    files = man.get('files')
+    if not isinstance(files, dict):
+        problems.append('payload digest cannot be recomputed without a files map')
+        return problems
+    got = _payload_digest(files)
+    if got.lower() != want.lower():
+        problems.append('payload_sha256 does not recompute from the file map')
+    return problems
+
+
+def _gzip_mtime(path):
+    """The 32-bit MTIME field of a gzip header (None if not gzip)."""
+    try:
+        with open(path, 'rb') as f:
+            header = f.read(10)
+    except OSError:
+        return None
+    if len(header) < 10 or header[:2] != b'\x1f\x8b':
+        return None
+    return int.from_bytes(header[4:8], 'little')
+
+
+def _reproducibility_problems(man, tar_path, members):
+    """Check a deterministic archive's timestamp/ownership contract.
+
+    This runs on the archive alone (no exp_lib import), so a reader can decide
+    whether a published tar.gz really is the byte-reproducible object its
+    manifest claims.  Legacy archives without the block are not failures.
+    """
+    block = man.get('reproducibility')
+    if block is None:
+        return []
+    if not isinstance(block, dict):
+        return ['reproducibility block is not an object']
+    deterministic = block.get('deterministic')
+    if not isinstance(deterministic, bool):
+        return ['reproducibility.deterministic must be a boolean']
+    if not deterministic:
+        if block.get('source_date_epoch') is not None:
+            return ['a non-deterministic archive must not claim a SOURCE_DATE_EPOCH']
+        return []
+    problems = []
+    epoch = block.get('source_date_epoch')
+    if (isinstance(epoch, bool) or not isinstance(epoch, int)
+            or epoch < 0 or epoch > _MAX_SOURCE_DATE_EPOCH):
+        return [f'reproducibility.source_date_epoch is not a valid epoch: {epoch!r}']
+    created_at = _iso_utc(epoch)
+    if man.get('created_at') != created_at:
+        problems.append('created_at does not equal the SOURCE_DATE_EPOCH UTC stamp')
+    if block.get('created_at') not in (None, created_at):
+        problems.append('reproducibility.created_at disagrees with SOURCE_DATE_EPOCH')
+    if block.get('member_mtime') != epoch:
+        problems.append('reproducibility.member_mtime disagrees with SOURCE_DATE_EPOCH')
+    if block.get('gzip_mtime') != epoch:
+        problems.append('reproducibility.gzip_mtime disagrees with SOURCE_DATE_EPOCH')
+    if block.get('owner_normalized') is not True:
+        problems.append('reproducibility.owner_normalized is not true')
+    got_mtime = _gzip_mtime(tar_path)
+    if got_mtime != epoch:
+        problems.append(f'gzip header mtime is {got_mtime!r}, expected {epoch}')
+    for member in members:
+        if member.mtime != epoch:
+            problems.append(
+                f'{member.name}: member mtime is {member.mtime!r}, expected {epoch}')
+        if member.uid != 0 or member.gid != 0:
+            problems.append(
+                f'{member.name}: member uid/gid is {member.uid}/{member.gid}, expected 0/0')
+        if member.uname or member.gname:
+            problems.append(
+                f'{member.name}: member owner names are not normalised')
+    return problems
+
+
+def _reproducibility_block(epoch, created_at):
+    """Manifest record of the packaging policy used for this archive."""
+    if epoch is None:
+        return {
+            'deterministic': False,
+            'source_date_epoch': None,
+            'created_at': None,
+            'member_mtime': None,
+            'owner_normalized': False,
+            'gzip_mtime': None,
+            'note': ('wall-clock mtimes and the gzip header timestamp are '
+                     'recorded; set SOURCE_DATE_EPOCH for a byte-identical '
+                     'rebuild'),
+        }
+    return {
+        'deterministic': True,
+        'source_date_epoch': int(epoch),
+        'created_at': created_at,
+        'member_mtime': int(epoch),
+        'owner_normalized': True,
+        'gzip_mtime': int(epoch),
+        'note': ('all member mtimes, uid/gid/uname/gname and the gzip header '
+                 'mtime are pinned to SOURCE_DATE_EPOCH'),
+    }
+
+
+def _git_state(exclude=None):
+    """HEAD/branch/dirty state, optionally hiding the archive output tree.
+
+    The release writes its own tar.gz/manifest into ``--out``.  Without the
+    exclusion, a second build sees those new untracked files and records a
+    different dirty list, so the "reproducible" archive can never match the
+    first build.  Build outputs are not measurement source, so they are
+    excluded from the recorded work-tree state (the pathspec is only used for
+    this diagnostic block, never for the source digest).
+    """
     def _run(*args):
         try:
             return subprocess.run(['git', *args], cwd=REPO, capture_output=True, text=True, timeout=30).stdout.strip()
@@ -188,12 +416,21 @@ def _git_state():
     head = _run('rev-parse', 'HEAD')
     if head is None:
         return {'git': 'not a git repo / git unavailable'}
-    dirty = _run('status', '--porcelain') or ''
+    if exclude:
+        dirty = _run('status', '--porcelain', '--', '.',
+                     f':(exclude){exclude}')
+        if dirty is None:
+            # An old Git without pathspec magic should still record *some*
+            # state rather than silently claiming a clean tree.
+            dirty = _run('status', '--porcelain') or ''
+    else:
+        dirty = _run('status', '--porcelain') or ''
     return {'git_head': head, 'git_branch': _run('rev-parse', '--abbrev-ref', 'HEAD'), 'dirty_files': dirty.splitlines()}
 
 
-def _env_snapshot():
-    env = {'python': sys.version.split()[0], 'platform': platform.platform(), 'captured_at': time.strftime('%Y-%m-%dT%H:%M:%S')}
+def _env_snapshot(captured_at=None):
+    env = {'python': sys.version.split()[0], 'platform': platform.platform(),
+           'captured_at': captured_at or time.strftime('%Y-%m-%dT%H:%M:%S')}
     try:
         import torch
         env['torch'] = torch.__version__
@@ -441,6 +678,10 @@ def _collect(dirs, include_ckpt=False, *, include_source=False, source_tree=None
             continue
         seen.add(key)
         unique.append(p)
+    # os.walk order is filesystem-dependent; the archive manifest and tar
+    # member order must be derived from the repository-relative names so two
+    # builds of the same evidence produce the same bytes.
+    unique.sort(key=lambda p: os.path.relpath(p, REPO).replace(os.sep, '/'))
     return unique
 
 
@@ -481,7 +722,7 @@ def _ckpt_hash_table(dirs):
                         f'checkpoint {p!r} resolves outside the repository '
                         f'({_p_real!r}); refusing to hash it')
                 rows[os.path.relpath(p, REPO)] = _sha256(p)
-    return rows
+    return dict(sorted(rows.items()))
 
 
 def cmd_plan(tag, dirs, include_ckpt=False):
@@ -505,8 +746,20 @@ def cmd_plan(tag, dirs, include_ckpt=False):
     return files
 
 
-def cmd_make(tag, dirs, include_ckpt=False, outdir='archive'):
+def cmd_make(tag, dirs, include_ckpt=False, outdir='archive', *,
+             source_date_epoch=None, reproducible=False):
     tag = _release_tag(tag)
+    try:
+        epoch = _source_date_epoch(source_date_epoch)
+        created_at = _iso_utc(epoch) if epoch is not None else time.strftime('%Y-%m-%dT%H:%M:%S')
+    except ValueError as exc:
+        print(f'[archive] REFUSE: {exc}')
+        return 1
+    if reproducible and epoch is None:
+        print('[archive] REFUSE: --reproducible requires SOURCE_DATE_EPOCH '
+              '(or --source-date-epoch); a wall-clock archive cannot be '
+              'rebuilt byte-for-byte')
+        return 1
     _required = ['DECISION_LOG.md', 'RELEASES.md', 'confirmation_frozen.json']
     _missing = [f for f in _required if not os.path.exists(os.path.join(REPO, f))]
     if _missing:
@@ -526,23 +779,39 @@ def cmd_make(tag, dirs, include_ckpt=False, outdir='archive'):
     if not files:
         print('[archive] REFUSE: nothing to archive — the named result dirs do not exist here; run this on the machine holding the artifacts')
         return 1
+    files.sort(key=lambda p: os.path.relpath(p, REPO).replace(os.sep, '/'))
+    _outdir = _safe_outdir(outdir)
+    os.makedirs(_outdir, exist_ok=True)
+    _rel_outdir = os.path.relpath(_outdir, REPO).replace(os.sep, '/')
     identity = _release_identity(source_tree)
     _dep_status = (identity.get('dependency_contract') or {}).get('status')
     if _dep_status not in ('ok', 'partial'):
         print(f'[archive] WARNING: dependency contract status is {_dep_status!r}; '
               'the archive records the mismatch but this environment is not a '
               'verified lock environment')
-    _outdir = _safe_outdir(outdir)
-    os.makedirs(_outdir, exist_ok=True)
     base_name = f'release_{tag}'
     tar_path = os.path.join(_outdir, f'{base_name}.tar.gz')
-    man = {'schema': 2, 'release': base_name, 'tag': tag, 'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'created_by': 'archive_release.py', 'git': _git_state(), 'environment': _env_snapshot(), 'identity': identity, 'dirs': list(dirs), 'include_ckpt_bodies': bool(include_ckpt), 'files': {}, 'checkpoint_hashes': _ckpt_hash_table(dirs)}
+    man = {
+        'schema': 2,
+        'release': base_name,
+        'tag': tag,
+        'created_at': created_at,
+        'created_by': 'archive_release.py',
+        'git': _git_state(exclude=None if _rel_outdir in ('', '.') else _rel_outdir),
+        'environment': _env_snapshot(captured_at=created_at),
+        'identity': identity,
+        'dirs': list(dirs),
+        'include_ckpt_bodies': bool(include_ckpt),
+        'payload_algorithm': _PAYLOAD_ALGORITHM,
+        'files': {},
+        'checkpoint_hashes': _ckpt_hash_table(dirs),
+    }
     # Build the archive beside its final name; an interrupted or failed make
     # must not leave a truncated `release_<tag>.tar.gz` (or destroy a previous
     # good release with the same tag).
     tmp_tar = tar_path + f'.tmp{os.getpid()}'
     try:
-        with tarfile.open(tmp_tar, 'w:gz') as tf:
+        with _open_archive(tmp_tar, epoch) as tf:
             for p in files:
                 rel = os.path.relpath(p, REPO)
                 # Hash the bytes that are actually written into the archive,
@@ -552,6 +821,8 @@ def cmd_make(tag, dirs, include_ckpt=False, outdir='archive'):
                 st_before = os.stat(p)
                 ti = tf.gettarinfo(p, arcname=rel)
                 ti.size = int(st_before.st_size)
+                if epoch is not None:
+                    _normalize_tarinfo(ti, epoch)
                 with open(p, 'rb') as src:
                     fst = os.fstat(src.fileno())
                     if ((fst.st_dev, fst.st_ino, fst.st_size, fst.st_mtime_ns)
@@ -581,6 +852,12 @@ def cmd_make(tag, dirs, include_ckpt=False, outdir='archive'):
                         f'but tar expected {ti.size}; nothing was published')
                 man['files'][rel] = {'sha256': reader.hexdigest(),
                                      'bytes': int(reader.nbytes)}
+            # Content identity is computed after every member is hashed; it
+            # deliberately excludes tar/gzip metadata so two archives that
+            # carry the same evidence compare equal even when one was built
+            # without SOURCE_DATE_EPOCH.
+            man['payload_sha256'] = _payload_digest(man['files'])
+            man['reproducibility'] = _reproducibility_block(epoch, created_at)
             # The source manifest was scanned before packing.  A source edit
             # between that scan and the reads above would produce an archive
             # whose identity does not describe its own code; refuse to publish
@@ -593,10 +870,11 @@ def cmd_make(tag, dirs, include_ckpt=False, outdir='archive'):
                     + '; '.join(_ident_problems[:8]))
             man_path_rel = f'{base_name}.MANIFEST.sha256'
             man_bytes = json.dumps(man, ensure_ascii=False, indent=2).encode('utf-8')
-            import io
             ti = tarfile.TarInfo(man_path_rel)
             ti.size = len(man_bytes)
-            ti.mtime = int(time.time())
+            ti.mtime = epoch if epoch is not None else int(time.time())
+            if epoch is not None:
+                _normalize_tarinfo(ti, epoch)
             tf.addfile(ti, io.BytesIO(man_bytes))
         tar_sha = _sha256(tmp_tar)
         os.replace(tmp_tar, tar_path)
@@ -618,11 +896,16 @@ def cmd_make(tag, dirs, include_ckpt=False, outdir='archive'):
           f'({int(source_tree.get("n_files") or 0)} source files, '
           f'dependency={_dep_status})')
     print(f'[archive] archive sha256: {tar_sha}')
+    print(f'[archive] payload sha256: {man["payload_sha256"]} '
+          f'({"reproducible bytes" if epoch is not None else "wall-clock metadata; set SOURCE_DATE_EPOCH for byte-identical rebuilds"})')
     print('[archive] publish the tar.gz + MANIFEST + .sha256 to a read-only location (release attachment / object store); the git repo itself stays source-only (design_notes §8)')
     _atomic_write_bytes(
         os.path.join(_outdir, f'{base_name}.release_record.json'),
         json.dumps({'release': base_name, 'tag': tag, 'created_at': man['created_at'],
-                    'tar_sha256': tar_sha, 'n_files': len(man['files']),
+                    'tar_sha256': tar_sha, 'payload_sha256': man['payload_sha256'],
+                    'reproducible': bool(epoch is not None),
+                    'source_date_epoch': epoch,
+                    'n_files': len(man['files']),
                     'n_ckpt_hashes': len(man['checkpoint_hashes']),
                     'code_semantics': identity.get('code_semantics'),
                     'source_tree_sha256': identity.get('source_tree_sha256'),
@@ -754,6 +1037,19 @@ def cmd_verify(tar_path):
             _ident_bad = _release_identity_problems(man, identity=_ident)
             if _ident_bad:
                 bad.extend(f'identity: {p}' for p in _ident_bad[:20])
+        for _problem in _payload_problems(man):
+            bad.append(f'payload: {_problem}')
+        for _problem in _reproducibility_problems(
+                man, tar_path, tf.getmembers()):
+            bad.append(f'reproducibility: {_problem}')
+        _repro = man.get('reproducibility')
+        if isinstance(_repro, dict) and _repro.get('deterministic') is True:
+            print(f'[archive] reproducible build pinned to SOURCE_DATE_EPOCH='
+                  f'{_repro.get("source_date_epoch")}')
+        elif _repro is not None:
+            print('[archive] NOTE: archive uses wall-clock metadata; '
+                  'payload identity is still checkable but the tar.gz bytes '
+                  'are not rebuildable')
         print(f'[archive] verified {len(names)} members against the manifest; {len(ck)} checkpoint hashes recorded' + (' (bodies not packed — verify on the experiment machine by hash)' if ck else ''))
         if bad:
             print('[archive] FAIL:\n  - ' + '\n  - '.join(bad[:20]))
@@ -776,6 +1072,13 @@ def main(argv=None):
     p_make.add_argument('--dirs', nargs='*', default=DEFAULT_DIRS)
     p_make.add_argument('--include-ckpt', action='store_true')
     p_make.add_argument('--out', default='archive')
+    p_make.add_argument(
+        '--source-date-epoch', type=int, default=None,
+        help='pin tar/gzip metadata to this Unix timestamp (also honours the '
+             'SOURCE_DATE_EPOCH environment variable)')
+    p_make.add_argument(
+        '--reproducible', action='store_true',
+        help='require SOURCE_DATE_EPOCH and emit a byte-reproducible tar.gz')
     p_ver = sub.add_parser('verify', help='verify an archive against its manifest')
     p_ver.add_argument('tar')
     args = ap.parse_args(argv)
@@ -783,7 +1086,9 @@ def main(argv=None):
         cmd_plan(args.tag, args.dirs, args.include_ckpt)
         return 0
     if args.cmd == 'make':
-        return cmd_make(args.tag, args.dirs, args.include_ckpt, args.out)
+        return cmd_make(args.tag, args.dirs, args.include_ckpt, args.out,
+                        source_date_epoch=args.source_date_epoch,
+                        reproducible=args.reproducible)
     if args.cmd == 'verify':
         return cmd_verify(args.tar)
     return 2

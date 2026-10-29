@@ -3750,3 +3750,56 @@ artifact 只 warning。所有既有 p/Holm/`confirmed`/冻结族不变。
 **Boundary.** 这是对“产物自己能否重放”的算术/类型一致性检查，不是新的显著性检验；它不证明 per_seed 向量来自真实测量（后者仍由 P5T admission/freeze lock 约束），也不改变任何冻结 p/Holm/判定。
 
 **Verification.** 新增 `test_review_part_26.py` 2 项（引号数字、分数 seed、超白名单 seed、分数 n 全部 fail；manifest seed 类型/重复 fail）与 `test_review_part_27.py` 1 项（篡改 next_cell/ratio/current 或删除 allocation 均 fail）。完整 CPU 套件由 `686 passed, 3 skipped` 增至 `689 passed, 3 skipped`。
+
+## 2026-10-29 — 证据归档的字节可复现性：`SOURCE_DATE_EPOCH`、内容摘要与元数据重放（本轮可复现性/工程规范硬化，no new runs）
+
+零 GPU；不新增训练、不读取 test split、不修改冻结清单字节/种子/端点/
+alpha/Holm 规则，也不改 `CODE_SEMANTICS`。
+
+**Problem 1（归档自带墙钟，同一证据重建不是同一 tar）.** `archive_release.py`
+默认 `tarfile.open(..., 'w:gz')` 会把构建时刻写进每个 member 的 mtime、内部
+MANIFEST member 的 mtime 和 gzip header 的 MTIME；`created_at` 与
+`environment.captured_at` 也是墙钟；`_collect` 按 `os.walk` 的返回顺序排列
+文件，`checkpoint_hashes` 同样未排序。于是同一份 results/analysis/source
+证据两次构建得到不同的 tar.gz 字节和不同的外部 `.sha256`。`verify` 只能
+证明「这个 tar 的内部清单与内容一致」，不能证明「这个 tar 就是发布的
+tar」；发布物无法被第三方重建后对哈希。另一个自指问题：第一次构建写出的
+tar.gz 是未跟踪文件，第二次构建的 `git status` dirty 列表会因此变化，归档
+自己使自己不可重建。
+
+**Problem 2（内容身份被时间戳污染）.** 只有整个 tar 的哈希，没有与打包
+元数据无关的内容摘要。未设 epoch 或换一个输出目录时，即使证据字节完全
+相同也无法给出一个可比较的 identity；`verify` 也没有可重放的打包元数据
+契约。
+
+**Fix.** 引入 reproducible-builds 的 `SOURCE_DATE_EPOCH` 约定：`make` 新增
+`--source-date-epoch N` 与 `--reproducible`；epoch 存在时（环境变量或参数），
+所有 member 的 `mtime`、`uid/gid/uname/gname`、PAX atime/ctime 与 gzip
+header MTIME 固定到该值，`created_at` 用该 epoch 的 UTC 表示；
+`--reproducible` 缺 epoch 时 refuse，避免「以为可重建、实际仍是墙钟」。
+`_collect` 和 `_ckpt_hash_table` 按仓库相对路径排序，MANIFEST 的 `files`
+键顺序稳定；`_git_state` 用 pathspec 把归档输出目录从 dirty 列表排除，
+使同一输出目录的二次构建不会被自己写出的产物改变。新增 metadata-free 的
+`payload_sha256`（`sha256(sorted relpath NUL sha256 NUL bytes LF)`），只
+覆盖入包文件的摘要/字节数，不覆盖时间戳与打包元数据；`verify` 重算它，
+并重放 deterministic 块的 epoch/created_at/member mtime/uid/gid/uname/
+gname/gzip MTIME。旧归档没有这些块时只提示，不假绿。
+
+**Boundary.** 这是打包字节与元数据一致性的改进，不是新的测量、不是对
+PPL/p/Holm 的重算，也不证明归档内容是真实运行产物（后者仍由 P5T 的
+admission、freeze lock、`data_fp`/`ckpt_sha256`/`train_knobs` 门约束）。
+`payload_sha256` 是内容身份，不是签名或时间戳证明；能重算它的人也能改它。
+字节级重建假设同一份源码树、同一环境快照与同一输出目录：源码树中的未跟踪
+文件或 dirty 列表变化仍会改变 MANIFEST；跨机器/跨 checkout 的路径与依赖
+环境不同时，应比较 `payload_sha256`，而不是要求 tar 哈希相同。未设
+`SOURCE_DATE_EPOCH` 时保持原有墙钟行为，归档仍可 verify，但不承诺 tar
+字节可重建。它不替代真正的复制运行，也不改变任何冻结决定。
+
+**Verification.** 新增 `test_review_part_28.py` 8 项：严格解析 epoch（负数/
+小数/科学计数/日期/布尔/超范围全部拒绝）；同一 epoch 两次构建 tar.gz
+字节完全相同、所有 member mtime/owner 被固定、gzip header 与 manifest
+一致、`verify` 通过；不同 epoch 的 tar 字节不同但 `payload_sha256` 相同；
+篡改文件摘要/算法/`payload_sha256` 被重放门拒绝；篡改 `created_at`/
+`gzip_mtime`/member mtime/布尔类型/非确定性块借用 epoch 全部 fail；
+`--reproducible` 缺 epoch 时 refuse 且不落盘；墙钟归档仍能 verify。完整
+CPU 套件由 `689 passed, 3 skipped` 增至 `697 passed, 3 skipped`。

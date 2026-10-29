@@ -6753,3 +6753,51 @@ python -m pytest -q            # 完整 CPU 套件
 渲染含占比与「未验证」分支；审计门通过一致 artifact、对篡改
 `total_variance`/`mean_variance` fail、无分解块时
 `not_verifiable_locally` 而非 pass。
+
+## 90. 证据归档也要可重建：`SOURCE_DATE_EPOCH`、内容摘要与归档元数据重放（本轮可复现性/工程规范硬化）
+
+零 GPU；不新增训练、不读取 test split、不修改冻结清单的字节/种子/端点/
+alpha/Holm 规则，也不改 `CODE_SEMANTICS`。
+
+**Problem 1（同一证据打包两次不是同一个对象）.** `archive_release.py`
+生成的 `release_<tag>.tar.gz` 默认把构建时刻写进每个 tar member 的
+`mtime`、MANIFEST member 的 `mtime` 和 gzip header 的 MTIME；`_collect`
+又按 `os.walk` 的文件系统顺序返回文件。于是同一份 results/analysis/source
+证据重建两次会得到不同的 tar.gz 字节和不同的外部 `.sha256`，第三方无法
+「重建发布物再对哈希」；`created_at`、`environment.captured_at` 也是墙钟
+时间。归档此前只能证明「这份 tar 的内部清单与内容一致」，不能证明「这个
+tar 就是那次发布的 tar」。
+
+**Fix.** 引入 reproducible-builds 的 `SOURCE_DATE_EPOCH` 约定：
+`SOURCE_DATE_EPOCH`（或 `make --source-date-epoch N`）存在时，所有 member
+的 `mtime`、`uid/gid/uname/gname`、PAX atime/ctime 以及 gzip header 的
+MTIME 都固定到该 epoch，`created_at` 用该 epoch 的 UTC 表示；`--reproducible`
+要求必须提供 epoch，缺省时 refuse 而不是悄悄退回墙钟。`_collect` 与
+checkpoint 表按仓库相对路径排序，MANIFEST 的 `files` 键顺序因此稳定。
+归档输出目录从 `git status` 的 dirty 列表中排除：否则第一次构建写出的
+tar.gz 会让第二次构建记录到不同的未跟踪文件，归档自己使自己不可重建。
+新增 metadata-free 的 `payload_sha256`（`sha256(sorted relpath NUL sha256
+NUL bytes LF)`）：它只覆盖入包文件的摘要/字节数，不覆盖时间戳和打包元数据，
+因此即使两次构建的 tar 字节不同（未设 epoch），也能判断证据内容是否相同。
+`verify` 现在重放 deterministic 块的 epoch/created_at/member mtime/uid/gid/
+uname/gname/gzip MTIME，并重算 `payload_sha256`；篡改任一项都 fail，旧归档
+缺少这些块时只提示而不假绿。
+
+**Boundary.** 这是打包字节与元数据一致性的改进，不是新的测量、不是对
+PPL/p/Holm 的重算，也不证明归档内容是真实运行产物（后者仍由 P5T 的
+admission、freeze lock、`data_fp`/`ckpt_sha256`/`train_knobs` 门约束）。
+`payload_sha256` 是内容身份，不是签名/时间戳证明；能重算它的人也能改它。
+字节级重建假设同一份源码树、同一环境快照与同一输出目录：源码树中的未跟踪
+文件或 dirty 列表变化仍会改变 MANIFEST；跨机器/跨 checkout 的绝对路径与
+依赖环境不同时，应比较 `payload_sha256` 而不是 tar 哈希。未设
+`SOURCE_DATE_EPOCH` 时保持原有墙钟行为，归档仍可 verify，但不承诺 tar
+字节可重建。
+
+**Verification.** `test_review_part_28.py` 8 项：严格解析 epoch（负数/小数/
+科学计数/日期/布尔/超范围全部拒绝）；同一 epoch 两次构建 tar.gz 字节完全
+相同、所有 member mtime/owner 被固定、gzip header 与 manifest 一致、`verify`
+通过；不同 epoch 的 tar 字节不同但 `payload_sha256` 相同；篡改文件摘要/
+算法/`payload_sha256` 被重放门拒绝；篡改 `created_at`/`gzip_mtime`/
+member mtime/布尔类型/非确定性块借用 epoch 全部 fail；`--reproducible`
+缺 epoch 时 refuse 且不落盘；墙钟归档仍能 verify。完整 CPU 套件在本轮最终
+树通过。
