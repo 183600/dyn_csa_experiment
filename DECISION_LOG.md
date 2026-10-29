@@ -3734,3 +3734,19 @@ artifact 只 warning。所有既有 p/Holm/`confirmed`/冻结族不变。
 手工 per-token 矩阵一致；报告渲染与缺块分支；审计门一致 artifact ok、
 篡改 total/mean variance fail、无块 `not_verifiable_locally`。完整 CPU
 套件与 `python audit_gates.py variance_components` 在本轮最终树通过。
+
+## 2026-10-29 — 重放门只接受真实数字：p 值/种子/计数的类型防线（本轮可复现性硬化，no new runs）
+
+零 GPU；不新增训练、不读取 test split、不修改冻结清单字节/种子/端点/alpha/Holm 规则，也不改 `CODE_SEMANTICS`。
+
+**Problem 1（p 值重放接受被引号包住的数字）.** `audit_confirmation_pvalues` 的 `_pvr_finite` 用 `float(value)`，于是 `"0.05"` 这类 JSON 字符串会被当成测量值；`_pvr_replay_one` 对 `per_seed` 也直接 `float(x)`，并把 `seeds`、`n_effective` 直接 `int()`。结果：`"0.3"` 的 delta、`1.5` 的 seed（被截成 1）、`12.9` 的 n（被截成 12）都可能通过重放；`manifest.seeds` 只检查长度/唯一性，从不核对比较记录里的 seed 是否属于冻结白名单。
+
+**Fix.** `_pvr_finite` 拒绝 bool/str/bytes/bytearray；新增 `_pvr_int` 只接受精确整数（整值浮点可以，`1.5`/`"12"` 不行）；delta 拒绝字符串；seed 校验整数、`[0, MAX_SEED]` 与白名单子集；`n_effective`/`n_nonzero` 用精确整数比较；`manifest.seeds` 先按同一规则校验并去重。比较与 `by_length_curve` 的 seed 都必须落在白名单内。
+
+**Problem 2（方差分解审计只看 next_cell 的取值、不看推导）.** `audit_variance_components` 只验证 `next_cell ∈ {'seed','unit'}` 与非空 ratio，不重算有限差 `s/(S(S+1))` vs `u/(D(D+1))`，也允许整个 `allocation` 块缺席；`unit` 分量为 0 时 `recommended_seed_to_unit_ratio` 应为 null 的约束也没有检查。
+
+**Fix.** `allocation` 必须存在且 status 只能为 `ok`/`not_decidable`；`ok` 时重算 current counts、`S/D`、next_cell 的有限差比较、`sqrt(seed/unit)` 以及 unit=0 时的 null；`not_decidable` 时要求 seed/unit 估计都为 0。
+
+**Boundary.** 这是对“产物自己能否重放”的算术/类型一致性检查，不是新的显著性检验；它不证明 per_seed 向量来自真实测量（后者仍由 P5T admission/freeze lock 约束），也不改变任何冻结 p/Holm/判定。
+
+**Verification.** 新增 `test_review_part_26.py` 2 项（引号数字、分数 seed、超白名单 seed、分数 n 全部 fail；manifest seed 类型/重复 fail）与 `test_review_part_27.py` 1 项（篡改 next_cell/ratio/current 或删除 allocation 均 fail）。完整 CPU 套件由 `686 passed, 3 skipped` 增至 `689 passed, 3 skipped`。

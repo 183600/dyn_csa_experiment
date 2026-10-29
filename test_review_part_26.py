@@ -236,6 +236,54 @@ def test_pvalue_replay_rejects_malformed_vectors():
         assert L.exact_signflip_p([0.1] * 12)['p'] == float(2 / 2 ** 12)
 
 
+def test_pvalue_replay_rejects_quoted_and_inexact_numbers():
+    """A stored number is not the same thing as a string that parses as one.
+
+    The replay gate is the last line of defence between an edited JSON file and
+    a quoted p-value.  Numeric strings, fractional seed ids and truncated
+    counts must all be hard failures, not values silently coerced into a
+    different valid record.
+    """
+    ft = _make_artifact()
+    with tempfile.TemporaryDirectory() as td:
+        cases = {}
+        cases['quoted delta'] = lambda r: r['per_seed'].__setitem__(
+            0, str(r['per_seed'][0]))
+        cases['quoted p'] = lambda r: r.update(
+            p_exact_signflip=str(r['p_exact_signflip']))
+        cases['quoted p_floor'] = lambda r: r.update(
+            p_floor=str(r['p_floor']))
+        cases['quoted mean'] = lambda r: r.update(mean=str(r['mean']))
+        cases['quoted n'] = lambda r: r.update(n_effective=str(r['n_effective']))
+        cases['fractional n'] = lambda r: r.update(n_effective=12.9)
+        cases['fractional seed'] = lambda r: r['seeds'].__setitem__(0, 0.5)
+        cases['quoted seed'] = lambda r: r['seeds'].__setitem__(0, '0')
+        cases['seed outside whitelist'] = lambda r: r['seeds'].__setitem__(
+            -1, 99)
+        for label, mutate in cases.items():
+            bad = copy.deepcopy(ft)
+            mutate(bad['comparisons']['main'])
+            got = _run(bad, os.path.join(td, 'p.json'))
+            assert got['status'] == 'fail', (label, got)
+            assert got['problems'], label
+
+
+def test_pvalue_replay_validates_the_manifest_seed_whitelist():
+    ft = _make_artifact()
+    with tempfile.TemporaryDirectory() as td:
+        bad = copy.deepcopy(ft)
+        bad['manifest']['seeds'][0] = 0.5
+        got = _run(bad, os.path.join(td, 'p.json'))
+        assert got['status'] == 'fail', got
+        assert any('manifest.seeds[0]' in p for p in got['problems']), got
+
+        bad = copy.deepcopy(ft)
+        bad['manifest']['seeds'][1] = bad['manifest']['seeds'][0]
+        got = _run(bad, os.path.join(td, 'p.json'))
+        assert got['status'] == 'fail', got
+        assert any('duplicates' in p for p in got['problems']), got
+
+
 def test_pvalue_replay_is_wired_into_report_and_cli():
     import inspect
     src = inspect.getsource(A.run_report)

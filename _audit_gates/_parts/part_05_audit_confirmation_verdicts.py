@@ -189,14 +189,42 @@ def audit_confirmation_verdicts(path=None):
 
 
 def _pvr_finite(value):
-    """A finite float from a stored record, or None (booleans are not numbers)."""
-    if isinstance(value, (bool, np.bool_)):
+    """A finite float from a stored record, or None.
+
+    A numeric string is not a measurement.  ``float('0.05')`` would otherwise
+    let a hand-edited artifact turn a quoted p-value (or a quoted per-seed
+    delta into a quoted headline field) into a number this gate accepts.  The
+    same contract is already enforced by ``_finite_scalar`` elsewhere; the
+    replay gate must not be the one reader that silently coerces text.
+    """
+    if isinstance(value, (bool, np.bool_, str, bytes, bytearray)):
         return None
     try:
         number = float(value)
     except (TypeError, ValueError, OverflowError):
         return None
     return number if math.isfinite(number) else None
+
+
+def _pvr_int(value):
+    """An exact integer from a stored record, or None.
+
+    Counts and seed ids are integers, not approximate scalars: ``int(12.9)``
+    would silently turn a corrupted count into a different valid one, and a
+    boolean would become 0/1.  Integral floats (``12.0``) are accepted because
+    JSON writers may emit them, but fractional values and strings are not.
+    """
+    if value is None or isinstance(value, (bool, np.bool_, str, bytes, bytearray)):
+        return None
+    if isinstance(value, numbers.Integral):
+        return int(value)
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(number) or not number.is_integer():
+        return None
+    return int(number)
 
 
 def _pvr_close(a, b, *, rel=1e-9, abs_=1e-12):
@@ -230,8 +258,13 @@ def _pvr_replay_one(L, name, rec, *, where, problems, warnings):
         return out
     vals = []
     for i, x in enumerate(deltas):
-        if isinstance(x, (bool, np.bool_)):
-            problems.append(f'{where}: per_seed[{i}] is a boolean, not a paired delta')
+        if isinstance(x, (bool, np.bool_, str, bytes, bytearray)):
+            # A quoted number is not a measurement (same contract as
+            # _finite_scalar); accepting "0.3" here would let a text-only edit
+            # replay as the original numeric delta.
+            problems.append(
+                f'{where}: per_seed[{i}] is a {type(x).__name__}, not a '
+                'numeric paired delta')
             out['status'] = 'invalid'
             return out
         try:
@@ -257,12 +290,16 @@ def _pvr_replay_one(L, name, rec, *, where, problems, warnings):
             problems.append(f'{where}: seeds is a {type(seeds).__name__}, not a list')
             out['status'] = 'invalid'
             return out
-        try:
-            seed_ints = [int(s) for s in seeds]
-        except (TypeError, ValueError, OverflowError):
-            problems.append(f'{where}: seeds contains a non-integer entry')
-            out['status'] = 'invalid'
-            return out
+        seed_ints = []
+        for i, s in enumerate(seeds):
+            si = _pvr_int(s)
+            if si is None or si < 0 or si > int(L.MAX_SEED):
+                problems.append(
+                    f'{where}: seeds[{i}]={s!r} is not an exact seed integer '
+                    f'in [0, {int(L.MAX_SEED)}]')
+                out['status'] = 'invalid'
+                return out
+            seed_ints.append(si)
         if len(seed_ints) != len(vals):
             problems.append(
                 f'{where}: seeds has {len(seed_ints)} entries but per_seed has '
@@ -300,21 +337,18 @@ def _pvr_replay_one(L, name, rec, *, where, problems, warnings):
             f'recomputed exact sign-flip p={p!r}')
     _n = rec.get('n_effective', rec.get('n'))
     if _n is not None:
-        _n_int = None
-        if not isinstance(_n, (bool, np.bool_)):
-            try:
-                _n_int = int(_n)
-            except (TypeError, ValueError, OverflowError):
-                _n_int = None
+        _n_int = _pvr_int(_n)
         if _n_int != len(vals):
             problems.append(
                 f'{where}: stored n={_n!r} does not equal the number of paired '
                 f'deltas ({len(vals)})')
     _nn = rec.get('n_nonzero')
-    if _nn is not None and _nn != out['n_nonzero']:
-        problems.append(
-            f'{where}: stored n_nonzero={_nn!r} does not match the recomputed '
-            f'{out["n_nonzero"]}')
+    if _nn is not None:
+        _nn_int = _pvr_int(_nn)
+        if _nn_int != out['n_nonzero']:
+            problems.append(
+                f'{where}: stored n_nonzero={_nn!r} does not match the '
+                f'recomputed {out["n_nonzero"]}')
     _pf = rec.get('p_floor')
     if _pf is not None and not _pvr_close(_pf, out['p_floor'], rel=0.0, abs_=1e-15):
         problems.append(
@@ -389,6 +423,33 @@ def audit_confirmation_pvalues(path=None):
     _man = ft.get('manifest') if isinstance(ft.get('manifest'), dict) else {}
     _seeds = _man.get('seeds')
     _declared = _man.get('primary_comparison_names')
+    # The frozen seed list is the whitelist every replayable per-seed vector
+    # must be drawn from.  A comparison may be missing a seed (a dropped cell),
+    # but it may never introduce a seed the plan did not pre-register: that is
+    # how a hand-edited artifact would smuggle in a different observation while
+    # keeping the same comparison name and family size.
+    _seed_whitelist = None
+    if isinstance(_seeds, list):
+        _wl = []
+        _wl_ok = True
+        for i, s in enumerate(_seeds):
+            si = _pvr_int(s)
+            if si is None or si < 0 or si > int(L.MAX_SEED):
+                out['problems'].append(
+                    f'manifest.seeds[{i}]={s!r} is not an exact seed integer '
+                    f'in [0, {int(L.MAX_SEED)}]')
+                _wl_ok = False
+                break
+            _wl.append(si)
+        if _wl_ok:
+            if len(set(_wl)) != len(_wl):
+                out['problems'].append(
+                    f'manifest.seeds contains duplicates: {_wl}')
+            else:
+                _seed_whitelist = set(_wl)
+    elif _seeds is not None:
+        out['problems'].append(
+            f'manifest.seeds is a {type(_seeds).__name__}, not a list')
     if isinstance(_declared, list):
         _decl = [str(x) for x in _declared]
         if len(set(_decl)) != len(_decl):
@@ -479,6 +540,12 @@ def audit_confirmation_pvalues(path=None):
         rep = _pvr_replay_one(L, name, rec, where=where,
                               problems=out['problems'], warnings=out['warnings'])
         out['comparisons'][name] = rep
+        if _seed_whitelist is not None and rep.get('seeds') is not None:
+            _outside = sorted(set(rep['seeds']) - _seed_whitelist)
+            if _outside:
+                out['problems'].append(
+                    f'{where}: seeds {_outside} are not in the frozen '
+                    'manifest.seeds whitelist')
         if rep['status'] == 'replayed':
             out['n_replayed'] += 1
             family.append((name, float(rep['p'])))
@@ -503,6 +570,12 @@ def audit_confirmation_pvalues(path=None):
                     problems=out['problems'], warnings=out['warnings'])
                 if crep['status'] == 'replayed':
                     out['n_curve_replayed'] += 1
+                if _seed_whitelist is not None and crep.get('seeds') is not None:
+                    _coutside = sorted(set(crep['seeds']) - _seed_whitelist)
+                    if _coutside:
+                        out['problems'].append(
+                            f'{where} by_length L{ln}: seeds {_coutside} are '
+                            'not in the frozen manifest.seeds whitelist')
                 if (crep['status'] == 'replayed' and 'primary' in str(crec.get('role', ''))
                         and rep['status'] == 'replayed'
                         and len(crep['per_seed']) == len(rep['per_seed'])):
@@ -1384,10 +1457,11 @@ def audit_variance_components(path=None):
     The decomposition is descriptive, but it is still a quotable result: a
     component total that does not equal the sum of its parts, a share that is
     not ``component / total``, a mean variance that does not equal
-    ``s/S + u/D + e/(S*D)``, or an effective N that does not equal
-    ``total / var(mean)`` is a tampered/internally inconsistent artifact, not
-    a difference of opinion.  Legacy artifacts without the block are
-    ``warnings`` (the analysis predates the field), never a pass.
+    ``s/S + u/D + e/(S*D)``, an effective N that does not equal
+    ``total / var(mean)``, or an allocation recommendation that does not match
+    the finite-difference comparison is a tampered/internally inconsistent
+    artifact, not a difference of opinion.  Legacy artifacts without the block
+    are ``warnings`` (the analysis predates the field), never a pass.
     """
     L = _import_exp_lib()
     p = path or os.path.join(REPO, 'analysis_v12', 'test_stats.json')
@@ -1572,18 +1646,57 @@ def audit_variance_components(path=None):
         elif preds is not None:
             probs.append('prediction_intervals is not an object')
         alloc = vc.get('allocation')
-        if isinstance(alloc, dict) and alloc.get('status') == 'ok':
-            if alloc.get('next_cell') not in ('seed', 'unit'):
-                probs.append(f"allocation.next_cell must be 'seed' or 'unit', "
-                             f"got {alloc.get('next_cell')!r}")
+        if not isinstance(alloc, dict):
+            probs.append('allocation block missing for an estimable panel')
+        elif alloc.get('status') == 'not_decidable':
+            # This is the residual-only case: neither axis can reduce the
+            # mean variance.  A component estimate above zero contradicts it.
+            if est['seed'] > 0.0 or est['unit'] > 0.0:
+                probs.append('allocation.status is not_decidable but a seed/unit '
+                             'component is positive')
+        elif alloc.get('status') == 'ok':
+            _cur = alloc.get('current')
+            if not isinstance(_cur, dict):
+                probs.append('allocation.current is missing or not an object')
+            else:
+                for _key, _want in (('n_seeds', S), ('n_units', D),
+                                    ('n_cells', S * D)):
+                    _got = _pvr_int(_cur.get(_key))
+                    if _got != _want:
+                        probs.append(
+                            f'allocation.current.{_key}={_cur.get(_key)!r} != '
+                            f'{_want}')
+                _sr = _fin(_cur.get('seed_to_unit_ratio'))
+                if _sr is None or not _pvr_close(_sr, S / float(D)):
+                    probs.append(
+                        f'allocation.current.seed_to_unit_ratio='
+                        f'{_cur.get("seed_to_unit_ratio")!r} != S/D '
+                        f'{S / float(D)!r}')
+            _s_est, _u_est = est['seed'], est['unit']
+            _seed_gain = _s_est / float(S * (S + 1))
+            _unit_gain = _u_est / float(D * (D + 1))
+            _want_next = 'seed' if _seed_gain > _unit_gain else 'unit'
+            if alloc.get('next_cell') != _want_next:
+                probs.append(
+                    f'allocation.next_cell={alloc.get("next_cell")!r} does '
+                    f'not match the finite-difference comparison '
+                    f'({_want_next!r})')
             ratio = alloc.get('recommended_seed_to_unit_ratio')
-            if ratio is not None:
+            if _u_est <= 0.0:
+                if ratio is not None:
+                    probs.append(
+                        'allocation.recommended_seed_to_unit_ratio must be '
+                        'null when the unit component is zero')
+            else:
+                want_ratio = math.sqrt(_s_est / _u_est)
                 r = _fin(ratio)
-                want_ratio = (math.sqrt(est['seed'] / est['unit'])
-                              if est['unit'] > 0.0 else math.inf)
                 if r is None or not _pvr_close(r, want_ratio):
                     probs.append(f'allocation.recommended_seed_to_unit_ratio '
                                  f'{ratio!r} != sqrt(seed/unit) {want_ratio!r}')
+        else:
+            probs.append(
+                f'allocation.status={alloc.get("status")!r} is not '
+                "'ok' or 'not_decidable'")
         return probs, warns
 
     for name, comp in comps.items():

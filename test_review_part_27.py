@@ -7,6 +7,7 @@ the ANOVA identities, the non-negativity/truncation convention, the
 scale-free readouts, the paired-NLL wrapper, the report renderer and the
 artifact audit gate.
 """
+import copy
 import json
 import math
 import os
@@ -195,6 +196,58 @@ def test_audit_replays_identities_and_fails_tampering():
         got = A.audit_variance_components(p)
         assert got['status'] == 'fail', got
         assert any('mean_variance' in x for x in got['problems']), got
+
+
+def test_audit_replays_the_allocation_advice():
+    """The next-cell recommendation is computed from the components.
+
+    A descriptive table is still quotable; an edited ``next_cell`` (or a
+    deleted allocation block) must not pass as a replayed decomposition.
+    """
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        p = os.path.join(td, 'test_stats.json')
+
+        def run(vc):
+            art = _valid_artifact()
+            art['finaltest']['comparisons']['main']['doc_sampling'][
+                'variance_components'] = vc
+            with open(p, 'w', encoding='utf-8') as f:
+                json.dump(art, f)
+            return A.audit_variance_components(p)
+
+        good = _valid_artifact()['finaltest']['comparisons']['main'][
+            'doc_sampling']['variance_components']
+        assert run(good)['status'] == 'ok'
+
+        bad = copy.deepcopy(good)
+        cur = bad['allocation']['next_cell']
+        bad['allocation']['next_cell'] = 'unit' if cur == 'seed' else 'seed'
+        got = run(bad)
+        assert got['status'] == 'fail', got
+        assert any('next_cell' in x for x in got['problems']), got
+
+        bad = copy.deepcopy(good)
+        bad['allocation']['recommended_seed_to_unit_ratio'] = (
+            float(bad['allocation']['recommended_seed_to_unit_ratio']) * 2.0)
+        got = run(bad)
+        assert got['status'] == 'fail', got
+        assert any('recommended_seed_to_unit_ratio' in x
+                   for x in got['problems']), got
+
+        bad = copy.deepcopy(good)
+        bad['allocation']['current']['n_seeds'] += 1
+        got = run(bad)
+        assert got['status'] == 'fail', got
+        assert any('allocation.current.n_seeds' in x
+                   for x in got['problems']), got
+
+        bad = copy.deepcopy(good)
+        bad.pop('allocation')
+        got = run(bad)
+        assert got['status'] == 'fail', got
+        assert any('allocation block missing' in x
+                   for x in got['problems']), got
 
 
 def test_audit_is_not_verifiable_without_a_decomposition_block():
