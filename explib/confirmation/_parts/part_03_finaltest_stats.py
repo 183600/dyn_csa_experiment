@@ -30,7 +30,13 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
     _stat = manifest.get('statistics') or {}
     _alpha = float(_stat.get('alpha', 0.05))
     _require_cov = bool(_stat.get('require_complete_coverage'))
-    stats = {'alpha': float(_alpha), 'manifest': {'frozen_at': manifest.get('frozen_at'), 'manifest_sha256': manifest.get('manifest_sha256'), 'arms': manifest['arms'], 'seeds': manifest['seeds'], 'code_semantics_expected': manifest.get('code_semantics_expected'), 'statistics': manifest.get('statistics'), 'scope': manifest.get('scope'), 'revision': manifest.get('revision')}, 'admission': {'n_admitted': len(admitted), 'test_slice_fp': unified_fp, 'n_effective_seeds': len({int(s) for (_v, s) in admitted}), 'n_declared_seeds': len(manifest['seeds'])}, 'comparisons': {}, 'holm': {}, 'by_length': {}, 'probe': _test_probe_stats(probe_path, manifest, unified_fp)}
+    # The declared family is part of the artifact, not only of the manifest in
+    # the repository.  Without it a tampered artifact could delete one
+    # comparison and its Holm slot, shrinking the correction family while
+    # every surviving number stayed internally consistent.  The p-value replay
+    # audit compares the recorded names against the comparisons it can see.
+    _family_names = [str(c.get('name')) for c in (manifest.get('primary_comparisons') or [])]
+    stats = {'alpha': float(_alpha), 'manifest': {'frozen_at': manifest.get('frozen_at'), 'manifest_sha256': manifest.get('manifest_sha256'), 'arms': manifest['arms'], 'seeds': manifest['seeds'], 'code_semantics_expected': manifest.get('code_semantics_expected'), 'statistics': manifest.get('statistics'), 'scope': manifest.get('scope'), 'revision': manifest.get('revision'), 'primary_comparison_names': _family_names, 'family_size': len(_family_names)}, 'admission': {'n_admitted': len(admitted), 'test_slice_fp': unified_fp, 'n_effective_seeds': len({int(s) for (_v, s) in admitted}), 'n_declared_seeds': len(manifest['seeds'])}, 'comparisons': {}, 'holm': {}, 'by_length': {}, 'probe': _test_probe_stats(probe_path, manifest, unified_fp)}
     # The exact sign-flip p is valid only under within-seed exchangeability.
     # admission binds the corpus/slice/row count/recipe/code, but the RNG stream
     # and batch order are not independently re-derivable from a record; report
@@ -231,6 +237,15 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
             _o2 = L.exact_signflip_p(_dl2)
             res['by_length_curve'][str(_Ln2)] = {
                 'n': len(_dl2), 'seeds': _used2, 'mean': float(np.mean(_dl2)),
+                # Persist the exact paired deltas behind EVERY curve p, not
+                # only behind the primary endpoint.  A reader (or the replay
+                # audit) can then recompute the descriptive p instead of
+                # trusting the stored float; it is the same vector the test
+                # above consumed.
+                'per_seed': [float(x) for x in _dl2],
+                'n_nonzero': int(_o2.get('n_nonzero') or 0),
+                'p_floor': _o2.get('p_floor'),
+                'method': _o2.get('method'),
                 'p_exact_signflip': float(_o2['p']),
                 'role': ('primary' if _Ln2 == Ln else 'descriptive'),
                 'descriptive_only': bool(_Ln2 != Ln),

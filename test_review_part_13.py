@@ -78,6 +78,46 @@ def test_stamped_analysis_binds_body_and_inputs():
         shutil.rmtree(td, ignore_errors=True)
 
 
+def test_analysis_input_binding_cannot_be_stripped():
+    td = tempfile.mkdtemp()
+    try:
+        inp = _write(os.path.join(td, 'bylen.json'), {'a::s0': {'ppl': 1.0}})
+        rec = L.stamped_analysis('unit_stats', {'p': 0.01},
+                                 inputs={'bylen': inp})
+        assert len(rec['inputs_sha256']) == 64, rec
+        assert L.verify_stamped_analysis(rec, base=td)['status'] == 'ok'
+        # The raw inputs block carries abs_path/error diagnostics and is
+        # excluded from content_sha256; inputs_sha256 is inside the hashed
+        # body, so deletion or emptying the binding must fail.
+        stripped = json.loads(json.dumps(rec))
+        stripped.pop('inputs')
+        got = L.verify_stamped_analysis(stripped, base=td)
+        assert got['status'] == 'fail', got
+        assert any('binding was stripped' in p for p in got['problems']), got
+        emptied = json.loads(json.dumps(rec))
+        emptied['inputs'] = {}
+        got = L.verify_stamped_analysis(emptied, base=td)
+        assert got['status'] == 'fail', got
+        assert any('inputs_sha256 does not reproduce' in p for p in got['problems']), got
+        # An edited recorded digest is detected the same way.
+        edited = json.loads(json.dumps(rec))
+        edited['inputs']['bylen']['sha256'] = '0' * 64
+        got = L.verify_stamped_analysis(edited, base=td)
+        assert got['status'] == 'fail', got
+        # A moved checkout (different absolute root, same relative path) and
+        # volatile error text do not change the canonical input identity.
+        stable = json.loads(json.dumps(rec))
+        stable['inputs']['bylen']['abs_path'] = '/elsewhere/bylen.json'
+        stable['inputs']['bylen']['error'] = 'a different local note'
+        assert L.analysis_inputs_sha256(stable['inputs']) == rec['inputs_sha256']
+        # An artifact with no inputs still commits to the empty manifest.
+        bare = L.stamped_analysis('unit', {'x': 1})
+        assert bare['inputs'] == {} and len(bare['inputs_sha256']) == 64, bare
+        assert L.verify_stamped_analysis(bare)['status'] == 'ok'
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+
 def test_stamped_analysis_rejects_malformed_digest_and_inputs():
     rec = L.stamped_analysis('unit', {'x': 1})
     bad = json.loads(json.dumps(rec))

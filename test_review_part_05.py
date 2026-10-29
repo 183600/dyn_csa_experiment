@@ -1538,6 +1538,21 @@ def test_selection_attribution_contract():
         r7 = A.audit_selection()
         assert r7['status'] == 'fail' and any('per_seed' in x for x in r7['problems']), r7
         assert r7['cells'][0]['n_seeds_valid'] == 5, r7['cells'][0]
+        # Three displayed cells with the same p=2/64 are a family, not three
+        # independent claims: Holm/3 pushes p_holm above alpha and none may
+        # unlock the selection-mechanism claim.
+        multi = [dict(cell, arm=f'csa_arm{i}') for i in range(3)]
+        with open(os.path.join(td, 'analysis_mechanism',
+                               'selection_attribution.json'), 'w',
+                  encoding='utf-8') as f:
+            json.dump({'cells': multi}, f)
+        r8 = A.audit_selection()
+        assert r8['status'] == 'ok', r8
+        assert r8['claim_family']['m'] == 3, r8['claim_family']
+        for c in r8['cells']:
+            assert abs(c['seed_test']['p_exact_signflip'] - 0.03125) < 1e-12, c
+            assert c['p_holm'] >= 0.09, c
+            assert c['claim_allowed'] is False, c
     finally:
         A.REPO = old_repo
         shutil.rmtree(td, ignore_errors=True)

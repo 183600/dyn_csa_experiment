@@ -61,7 +61,12 @@ def dependency_contract(lock_path=None):
             out['mismatches'].append({'name': ent['name'], 'expected': ent['version'],
                                       'installed': str(got)})
     _tooling = {'pip', 'setuptools', 'wheel', 'pkg-resources', 'distribute',
-                'ruff'}
+                'ruff',
+                # The project itself, when a local wheel/install-check has
+                # registered it (dyn_csa_experiment.egg-info).  It is the code
+                # under test, not a dependency the lock is supposed to pin;
+                # counting it made every post-build environment look partial.
+                'dyn-csa-experiment'}
     out['unpinned_installed'] = sorted(
         n for n in installed if n not in parsed['pins'] and n not in _tooling)
     out['n_installed'] = len(installed)

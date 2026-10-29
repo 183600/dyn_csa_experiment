@@ -150,14 +150,50 @@ def audit_selection(path='analysis_mechanism/selection_attribution.json'):
                              'mass_excess': mass - base, 'recall_excess': rec - base,
                              'n_queries': nq, 'n_seeds': _n_seeds, 'n_seeds_valid': _n_valid,
                              'seed_test': _st,
-                             'claim_allowed': bool(mass > base and rec > base and nq > 0 and _st is not None
-                                                   and _st.get('mean_delta') is not None
-                                                   and float(_st['mean_delta']) > 0.0
-                                                   and _st.get('p_exact_signflip', 1.0) < 0.05
-                                                   and int(_st.get('n', 0)) >= 6)})
+                             'claim_allowed': False})
+    # The artifact can display several arms/lengths.  A per-cell p<0.05 is not
+    # a mechanism claim when the whole displayed family is tested: with 3
+    # independent cells at p=0.031 the family-wise error is ~9%, not 3%.
+    # Correct the displayed cells with Holm (each untestable cell keeps a p=1
+    # slot, so a missing cell cannot shrink the family).  The claim gate then
+    # uses the adjusted p; a single-cell artifact is unchanged (m=1).
+    if out['cells']:
+        try:
+            _L = _import_exp_lib()
+            _pf = []
+            for _j, _cell in enumerate(out['cells']):
+                _st = _cell.get('seed_test')
+                _p = (_st.get('p_exact_signflip') if isinstance(_st, dict) else None)
+                _pf.append((str(_j), float(_p)
+                            if isinstance(_p, (int, float))
+                            and math.isfinite(float(_p)) else 1.0))
+            _holm = _L.holm_adjust(_pf, alpha=0.05)
+            for _j, _cell in enumerate(out['cells']):
+                _h = _holm.get(str(_j)) or {}
+                _cell['p_holm'] = _h.get('p_holm')
+                _st = _cell.get('seed_test')
+                _cell['claim_allowed'] = bool(
+                    _cell['mass_excess'] > 0.0 and _cell['recall_excess'] > 0.0
+                    and _cell['n_queries'] > 0 and isinstance(_st, dict)
+                    and _st.get('mean_delta') is not None
+                    and float(_st['mean_delta']) > 0.0
+                    and _cell.get('p_holm') is not None
+                    and float(_cell['p_holm']) < 0.05
+                    and int(_st.get('n', 0)) >= 6)
+            out['claim_family'] = {
+                'method': 'holm step-down over the displayed selection cells',
+                'm': len(_pf), 'alpha': 0.05,
+                'note': ('per-cell exact sign-flip p is adjusted across every '
+                         'displayed cell; an untestable cell keeps a p=1 slot'),
+            }
+        except Exception as _he:
+            out['problems'].append(
+                f'could not apply the selection-cell Holm correction '
+                f'({type(_he).__name__}: {_he})')
     out['status'] = 'fail' if out['problems'] else 'ok'
     out['note'] = ('cells pass the structural contract; `claim_allowed` additionally requires mass/recall above the '
-                   'random baseline and a seed-level exact sign-flip p<0.05 with n>=6')
+                   'random baseline, a seed-level exact sign-flip p with n>=6, and that p Holm-adjusted across the '
+                   'displayed cell family below 0.05')
     print(json.dumps({k: v for k, v in out.items() if k != 'cells'}, ensure_ascii=False, indent=2)[:4000])
     return out
 

@@ -6360,3 +6360,271 @@ python -m pytest -q test_review_part_25.py
 覆盖）；缺 level/重复 role/未排程/复用臂/多旋钮/缺席臂多改容量/未声明族
 全部 fail-closed；`audit_gates.sink_controls`、`single_factor` 与 `report`
 接线。完整 CPU 套件在本轮为 `661 passed, 3 skipped`（原 656 + 新 5）。
+
+## 85. 结论里的 p 值不能只靠自证：从逐种子配对差重放 exact sign-flip 与 Holm（本轮可复现性/统计完整性硬化）
+
+### 85.1 问题：判定审计只重放「怎么读 p」，没有重算「p 是多少」
+
+`analysis_v12/test_stats.json` 是冻结确认轮的唯一统计产物；`audit_gates.py
+verdicts` 会从其中的 `p_holm`、方向与有效性门重放 supported / refuted /
+inconclusive 三向判定，并刻意声明「never recomputes a p-value」。这在防止
+判定逻辑漂移上是正确的，但留下一个更基础的缺口：
+
+- 产物里的 `p_exact_signflip`、`p_holm` 是**被信任的输入**。若分析脚本、
+  手工编辑或一次错误的聚合写入了不一致的 p，只要上层判定按同一组 p 重放，
+  审计仍会通过；
+- 逐种子配对差其实已经由 `exact_sign_permutation` 写进 `comparisons[*].
+  per_seed`，但没有任何门把它和 headline p 对账；它只是给人看的；
+- `by_length_curve` 保存了每个长度的 p，却没有保存产生它的逐种子差，因此
+  描述性曲线的 p 完全不可重算；
+- 产物没有记录冻结清单声明的**family 名称**。删除一个比较及其 Holm 槽位
+  后，剩下的比较仍然可以内部自洽，族大小从 m 缩到 m-1，校正反而变松；
+- `min_attainable_p_holm`、`p_floor`、`n_nonzero` 等分辨率字段也没有与
+  实际向量对账，"12 seeds" 可以是一个与 deltas 无关的标签。
+
+这不是「再跑一次 final test」能替代的检查：final test 是一次性的，重跑会
+消耗第二次 test 访问；需要的是**只读、零 GPU、从已落盘向量重算**的审计。
+
+### 85.2 设计：把 headline 统计量变成可重算的承诺
+
+新增 `audit_gates.audit_confirmation_pvalues(path=None)`（CLI `pvalues` /
+`pvalue_replay` / `recompute_p`，可传一个 artifact 路径）：
+
+1. 对每个未省略比较，读取 `per_seed` 配对差（`seeds` 必须等长、唯一、
+   整数；delta 必须有限，布尔值拒绝），用与最终分析相同的
+   `exp_lib.exact_signflip_p` 重算 exact two-sided sign-flip p；
+2. 对账 `p_exact_signflip`、`n_effective`/`n`、`n_nonzero`、`p_floor`、
+   `mean`；任一不一致判 `fail`，不是 warning；
+3. 对 `by_length_curve` 的每个长度做同一种重放（主端点还要求其
+   `per_seed` 与 primary comparison 的向量逐值一致），描述性 p 也不再是
+   不可复核的黑盒；
+4. 从 `manifest.primary_comparison_names` 核对比较集合是否等于预注册族；
+   省略比较保留 p=1 的族槽位；用 `exp_lib.holm_adjust` 重算整族
+   `p_holm`/`m_effective`，与产物逐项对账；
+5. 用 `manifest.seeds` 与族大小重算 `holm_min_attainable_p`，对账顶层
+   `min_attainable_p_holm`；分辨率字段与向量不一致同样是 fail。
+
+缺 `per_seed` 的 legacy 产物返回 `not_verifiable_locally`（若没有任何可重放
+向量）或 `warnings`（部分可重放），**缺证据不是通过**。所有检查只读
+`test_stats.json`，不调用 `load_wikitest`、不重训、不重算 PPL、不改任何
+冻结 p/Holm/判定。
+
+生产端只做两处增量（不改变任何数值）：
+
+- `finaltest_stats` 在 `manifest` 下写入 `primary_comparison_names` 与
+  `family_size`，使「比较集合被删了一项」可被机器发现；
+- `by_length_curve` 的每个 cell 增加 `per_seed` / `n_nonzero` / `p_floor`
+  / `method`，与 primary comparison 使用同一组向量；不改变原有 p、端点、
+  alpha 或 Holm 计算。
+
+### 85.3 边界
+
+- **重放的是算术一致性，不是测量来源。** 它证明「这个 p 确实由这组
+  deltas 算出」，不证明 deltas 来自冻结 test slice、同一 checkpoint 或
+  同一评测行。后者仍由 P5T 的 admission / freeze lock / `data_fp` /
+  `ckpt_sha256` / `train_knobs` 门约束；两层不能互相替代。
+- **不重算 PPL。** 若 per-seed 向量本身被替换成另一组同样能产生存储 p 的
+  数，本门不能发现；它只保证统计量与记录向量一致，不保证向量与原始
+  评测记录一致。要闭合那一层，需要从 `bylen.json` 的逐 cell PPL 重算
+  deltas，这会把审计耦合到 admission 规则；本轮明确不做。
+- **不是新检验。** 没有新 p、没有新 alpha、没有改变 Holm 族；它只是
+  复核已记录的统计量。`verdicts` 仍负责三向判定重放，两者互为补充。
+- **legacy 兼容。** 旧 `test_stats.json` 没有 `per_seed` 或
+  `primary_comparison_names` 时报告 `not_verifiable_locally`/`warnings`，
+  不伪造通过，也不要求重新读 test；重新生成分析产物即可获得完整重放。
+- **不触碰冻结清单。** `confirmation_frozen.json`、种子、端点、alpha、
+  族规则、`CODE_SEMANTICS` 均不变；新增字段只进入分析产物，不进入
+  `run_cfg`/resume 指纹。
+
+### 85.4 入口与验证
+
+```bash
+python audit_gates.py pvalues            # 默认 analysis_v12/test_stats.json
+python audit_gates.py pvalues PATH       # 复核一份拷贝
+python audit_gates.py report             # 顶层 pvalue_replay 块
+python -m pytest -q test_review_part_26.py
+```
+
+新增 `test_review_part_26.py` 6 项：一致产物 ok；篡改 p、Holm、n 分别
+fail；删除/新增族比较 fail、缺族名只 warning；缺 per_seed 为
+not_verifiable、部分缺失为 warnings；篡改 by-length p 或 primary 向量
+fail；重复种子/长度不符/布尔/NaN/p_floor/mean/过短向量全部 fail；CLI
+`pvalues PATH` 与 `report` 接线。完整 CPU 套件由 `665 passed, 3 skipped`
+增至 `673 passed, 3 skipped`。
+
+## 86. 生成的构建目录与输入清单不能改写测量身份（本轮可复现性/产物完整性硬化）
+
+### 86.1 问题 A：`make install-check` 的 `.build/` 被算进测量源码摘要
+
+`source_tree_manifest()` 是冻结锁、逐记录 `provenance.code.source_tree`、
+`explib.reproduce` 和 `archive_release.py` 共用的「测量源码字节」身份。
+`_SOURCE_TREE_SKIP_DIRS` 跳过了 `build`/`dist`/`__pycache__`，却没有跳过
+`.build`；而 `Makefile` 的 `install-check` 恰好把**整份源码副本**写到
+`.build/install-check/`，`build` 目标又写 `.build/dist`。后果：
+
+- 同一份源码，跑过一次 `make install-check` 就会得到不同的
+  `source_tree.sha256`；冻结锁会把「未改源码」误判为源码变化并拒绝，或
+  要求 `V12_REFREEZE=1` 把上一轮降级；
+- 两台机器只差是否跑过打包检查，`explib.reproduce` 会报 `code_changed`；
+- `archive_release.py` 会把 `.build/install-check/**` 的重复副本一起打包，
+  清单里出现与测量无关的字节。
+
+修复：把 `.build` / `.tox` / `.nox` / `.eggs` / `.hypothesis` 加入跳过集，
+并以 `*.egg-info` 后缀跳过构建元数据目录。目录筛选仍然只按名字/后缀，
+不读取这些目录的内容。
+
+### 86.2 问题 B：`stamped_analysis` 的输入清单可被整体删除而仍然 `ok`
+
+`stamped_analysis` 把派生结果的 `inputs`（路径 + SHA-256 + 字节数）写在
+`content_sha256` 之外，理由是 `inputs` 含绝对路径和 OS 错误文本，跨机器
+比较时应保持稳定。但这也让输入绑定本身可被删除：删掉 `inputs` 后
+`content_sha256` 不变，`verify_stamped_analysis` 只在 `inputs` 存在时才
+检查，于是 `audit_analysis_integrity` 仍报 `ok`。一个派生统计量可以在
+输入绑定被清空后继续显示为「已验证」。
+
+修复：新增 `analysis_inputs_sha256(inputs)`，对输入清单的稳定投影
+（label、记录路径、`exists`、`sha256`、`bytes`）做 canonical JSON 摘要；
+`abs_path` 和 `error` 仍不进入摘要（保持跨 checkout 可比）。`stamped_analysis`
+现在总是写入 `inputs`（无输入时为空对象）和 `inputs_sha256`，后者**在**
+`content_sha256` 的哈希体内。验证器：
+
+- `inputs_sha256` 存在但 `inputs` 缺失/不是对象 -> fail（绑定被剥离）；
+- `inputs` 被清空或 SHA/路径被改 -> 重算摘要不一致 -> fail；
+- 旧产物没有 `inputs_sha256` -> `warnings`（不能排除输入被删），而不是
+  `ok`；逐个输入的本地内容校验保持原样，输入不在本机仍是 warning。
+
+### 86.3 边界
+
+- **不是内容重算。** `inputs_sha256` 证明记录下来的输入清单没有被改；
+  输入文件本身若已不在本机，仍只能报 warning，不能证明其内容。
+- **不改变统计量。** 两个修复都不重算 PPL/p/Holm，不重训，不读 test
+  split，不改变 `confirmation_frozen*.json`、`CODE_SEMANTICS` 或任何判定。
+- **跳过的是目录名，不是语义。** 若有人把真实测量源码放进名为 `.build`
+  的目录，摘要会忽略它；这是与 `build`/`dist` 一致的既有约定，目录名本身
+  就是「生成物」的声明。
+- **旧产物兼容。** 旧的可复现产物重新生成一次即可获得
+  `inputs_sha256`；旧源码摘要与新的 `.build` 跳过规则不同，这是本轮
+  有意的身份修正，需在新一轮冻结前确认。
+- **依赖锁补齐。** `requirements.lock` 补上 pytest 的三个运行时依赖
+  （`iniconfig`/`pluggy`/`Pygments`），使「完整传递闭包」的声明与实际
+  `pip freeze` 一致；`dependency_contract` 同时把本项目自身的发行版
+  （`dyn-csa-experiment`，由本地 build/install-check 注册）排除出
+  「未 pin 的运行时依赖」。这只影响环境契约读数，不改变测量语义。
+
+### 86.4 验证
+
+```bash
+python -m pytest -q test_review_part_10.py::test_source_tree_manifest_tracks_exact_bytes
+python -m pytest -q test_review_part_13.py::test_analysis_input_binding_cannot_be_stripped
+python audit_gates.py analysis_integrity
+```
+
+新增/扩展测试覆盖：`.build/install-check`、`build/lib`、`.tox/env`、
+`demo.egg-info`、`.eggs/pkg` 中的 `*.py` 不改变源码树摘要；带输入的
+`stamped_analysis` 删除/清空/改写 `inputs` 均 fail，移动 checkout 的
+`abs_path` 与错误文本变化不改变摘要，无输入产物仍记录空清单并可验证。
+
+## 87. 完整案例子集不是完整面板：`significant` 与 TOST 都必须拒绝丢种子后的幸存者（本轮统计推断硬化）
+
+### 87.1 问题：`complete_pairs=False` 只在报告层被拒绝，底层判定却放行
+
+仓库的冻结确认规则要求完整覆盖（`require_complete_coverage=true`），
+`reportable_claim` 和 `scale_interaction` 也会在 `n_dropped>0` 时拒绝显著
+或交互主张。但两条更底层的路径没有继承这个前提：
+
+- `paired_effect_stats()` 计算并返回 `n_input/n_dropped/complete_pairs`，
+  但 `significant` 只看 `p<alpha`、`n>=min_n`、`|mean|>std` 与
+  `p_floor<=alpha`。一个 7 对里丢掉 1 对的完整案例子集（n=6）仍可得到
+  exact p=0.03125 并被标成 `significant=True`；
+- `_practical_decision_from_stats()`（`ablation_practical_decision`）与
+  `_interaction_decision_from_stats()`（`interaction_practical_decision`）
+  只在 `n<min_n` 时拒绝，TOST 等价分支甚至可以在 3/4 个幸存对上判
+  `equivalent` / `additive`。丢掉的种子会同时满足 min-n 下限并「制造」
+  可删/可加性结论。
+
+这不是小概率边界：缺失/失败的种子不是随机缺失，完整案例子集正是选择
+偏差的入口；仓库在别处已经明确拒绝它，底层函数却不一致。
+
+### 87.2 设计：完整配对是显著性/等价性的前置条件
+
+- `paired_effect_stats`：`significant = ... and complete_pairs`；新增
+  `incomplete_pairs` 字段；`effect_vs_noise` 在 `n_dropped>0` 时优先写成
+  `incomplete paired panel (k of n deltas non-finite); the surviving subset
+  is not a confirmatory result`。
+- `_practical_decision_from_stats`：在 `n<min_n` 之前检查
+  `complete_pairs is False` 或 `n_dropped>0`（`n_dropped` 非法也 fail
+  closed），返回 `decision='incomplete_pairs'`,
+  `claim='inconclusive_incomplete_panel'`，并回显 `complete_pairs`/
+  `n_dropped`； superiority 与 TOST 两条分支都不会到达。
+- `_interaction_decision_from_stats`：同一前置门，返回
+  `incomplete_pairs`；`additive`（正等价主张）不再能从幸存者子集产生。
+
+### 87.3 边界
+
+- **完整配对不等于独立随机抽样。** 它只排除「丢种子后仍宣称确认」这一
+  种选择偏差；种子仍不是从总体随机抽取的，跨语料/规模外推仍受 §20/§55
+  的限制。
+- **不改变已测量的完整面板。** 完整 `n_dropped=0` 的记录走原路径，
+  p、CI、TOST、Holm、SESOI、`seed_driven` 都不变。
+- **不是新增检验。** 没有新 alpha、新族或新 endpoint；只是把「完整面板」
+  从报告层下移为判定层的前置条件。
+- **`n_dropped` 缺失的 legacy 记录** 仍按完整处理（无法证明缺失），但
+  `complete_pairs is False` 优先；这与既有 legacy 兼容策略一致。
+
+### 87.4 验证
+
+```bash
+python -m pytest -q test_review_part_10.py::test_complete_case_survivors_are_not_promoted_to_a_claim
+python -m pytest -q test_review_part_00.py test_review_part_01.py test_review_part_11.py
+```
+
+新增测试覆盖：6/7 幸存对 exact p<0.05 但 `significant=False`；
+3/4 幸存对的 ablation TOST 返回 `incomplete_pairs` 而非 `equivalent`；
+交互 TOST 同样返回 `incomplete_pairs`；完整面板仍判 `equivalent` 并回显
+`complete_pairs=True`。
+
+## 88. 选择机制门也是一个多重检验族：逐 cell p<0.05 不是机制证据（本轮机制审计硬化）
+
+### 88.1 问题：多个 arm/length 的 `claim_allowed` 各自做一次 0.05 检验
+
+`audit_gates.selection` 从 `selection_attribution.json` 读取多个 cell
+（不同 arm/评测长度），每个 cell 用 6 个种子的 exact sign-flip
+`mass_covered - random_baseline` 得到一个 p，并在 `p<0.05` 且 n>=6 时把
+`claim_allowed` 置为 true。该字段是「学习到的选择器确实取回了相关块」的
+机器门。若 artifact 展示 3 个 cell 且每个 p=2/64=0.03125，则三次独立机会
+下至少一次假阳性的概率约 9.1%，而每个 cell 仍各自显示 3.1%；这与仓库在
+消融/基线/交互上统一使用 Holm 族的做法不一致。
+
+### 88.2 设计：显示出来的 cell 就是一个声明族
+
+- 对 `out['cells']` 逐项取 exact sign-flip p（无法检验的 cell 保留 p=1
+  槽位，不能让缺 cell 缩小族），调用 `exp_lib.holm_adjust(..., alpha=0.05)`；
+- 每个 cell 新增 `p_holm`；`claim_allowed` 改为要求
+  `mass_excess>0`、`recall_excess>0`、`n_queries>0`、种子均值 >0、
+  `n>=6` **且** `p_holm < 0.05`；
+- 新增 `claim_family = {'method':'holm step-down over the displayed selection
+  cells','m':..., 'alpha':0.05}`，把族大小显式写进审计输出；
+- 单 cell artifact 的 m=1，`p_holm == p`，历史行为不变。
+
+### 88.3 边界
+
+- **族是「显示出来的 cell」**，不是全部可能跑过的 arm/长度。审计只能纠正
+  artifact 声明的集合；若实验者只把显著的 cell 写进 artifact，审计无法
+  知道被隐藏的 cell。artifact 应保留全部计划 cell（本门对缺失字段仍 fail）。
+- **Holm 是保守的 FWER 控制**，不利用 cell 间相关性；它不会让结果更容易
+  显著，只会让多 cell 机制主张更难成立。
+- **不改变测量**：不改 exact p、n、seed 数据或任何冻结判定；`claim_allowed`
+  只是机器措辞门，不是新的确认性检验。
+- **不是冻结族**：该 Holm 族不进入 `confirmation_frozen.json` 的 m=6
+  主比较族，也不改变 P5T 的 alpha/Holm。
+
+### 88.4 验证
+
+```bash
+python audit_gates.py selection
+python -m pytest -q test_review_part_05.py::test_selection_attribution_contract
+```
+
+测试新增 3-cell 分支：每个 cell 的 raw p=0.03125，Holm/3 后
+`p_holm≈0.09375`，三个 `claim_allowed` 全为 false，`claim_family.m==3`；
+单 cell 的历史 `claim_allowed=True` 保持。

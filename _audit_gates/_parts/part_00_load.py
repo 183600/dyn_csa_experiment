@@ -47,6 +47,11 @@
   verdicts     三向方向性判定：supported / refuted / inconclusive /
                not_testable；显著反向不是「未确认」而是反证（读
                analysis_v12/test_stats.json，零 GPU，不改变 p/Holm）
+  pvalues      统计量重放：从 test_stats.json 的逐种子配对差重算 exact
+               sign-flip p、n/nonzero/p_floor/mean 与整族 Holm；并存
+               by-length 曲线逐项重放；缺 per_seed 报 not_verifiable，
+               存值与重算不一致判 fail（零 GPU，只读，不改 p/Holm）
+               别名：pvalue_replay / recompute_p；可传一个 artifact 路径
   analysis_choices  结果分析：同一主比较的多种分析口径（逐种子 mean/median/
                trimmed、token 池化、逐单元 mean/median/log-ratio/win-rate）
                是否方向一致、带区间的口径是否一致地排除零（读 analysis_v12/，

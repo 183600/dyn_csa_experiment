@@ -1548,6 +1548,43 @@ def analysis_input_manifest(inputs, *, base=None):
     return out
 
 
+def analysis_inputs_sha256(inputs):
+    """Canonical root-independent digest of an analysis input manifest.
+
+    The raw ``inputs`` block is excluded from ``content_sha256`` because it
+    embeds an absolute ``abs_path`` and OS error strings (two checkouts of the
+    same artifact would otherwise disagree).  That exclusion used to make the
+    input binding itself strippable: deleting ``inputs`` left the content
+    digest unchanged and the verifier still reported ``ok``.  This digest
+    binds the stable projection — label, recorded path, existence, SHA-256 and
+    byte count — into the hashed body via ``inputs_sha256``.  Volatile
+    diagnostics (``abs_path``/``error``) stay out of it, so a moved checkout
+    or a different local error message does not change the artifact identity.
+    """
+    if inputs is None:
+        inputs = {}
+    if not isinstance(inputs, dict):
+        raise TypeError(
+            f'inputs must be a mapping, got {type(inputs).__name__}')
+    canonical = {}
+    for label, ent in sorted(inputs.items(), key=lambda kv: str(kv[0])):
+        if not isinstance(ent, dict):
+            raise TypeError(
+                f'input {label!r} must be an object, got {type(ent).__name__}')
+        _exists = ent.get('exists')
+        canonical[str(label)] = {
+            'path': ent.get('path'),
+            'exists': (bool(_exists) if isinstance(_exists, (bool, np.bool_))
+                       else None),
+            'sha256': ent.get('sha256'),
+            'bytes': ent.get('bytes'),
+        }
+    text = json.dumps(_json_clean(_jsonable(canonical)), sort_keys=True,
+                      separators=(',', ':'), ensure_ascii=False,
+                      allow_nan=False, default=float)
+    return hashlib.sha256(text.encode('utf-8')).hexdigest()
+
+
 def verify_stamped_analysis(artifact, *, base=None, check_inputs=True):
     """Verify a stamped analysis against its own content and input hashes.
 
@@ -1603,6 +1640,46 @@ def verify_stamped_analysis(artifact, *, base=None, check_inputs=True):
                     'after it was written')
     if check_inputs:
         inputs = rec.get('inputs')
+        stored_inputs_sha = rec.get('inputs_sha256')
+        if stored_inputs_sha is not None:
+            if (not isinstance(stored_inputs_sha, str)
+                    or len(stored_inputs_sha) != 64
+                    or any(c not in '0123456789abcdef'
+                           for c in stored_inputs_sha.lower())):
+                out['status'] = 'fail'
+                out['problems'].append(
+                    f'inputs_sha256 is not a SHA-256 hex digest: '
+                    f'{stored_inputs_sha!r}')
+            elif not isinstance(inputs, dict):
+                out['status'] = 'fail'
+                out['problems'].append(
+                    'the artifact carries inputs_sha256 but its inputs block '
+                    'is absent or not an object — the input binding was '
+                    'stripped')
+            else:
+                try:
+                    want_inputs = analysis_inputs_sha256(inputs)
+                except (TypeError, ValueError, OverflowError) as e:
+                    out['status'] = 'fail'
+                    out['problems'].append(
+                        f'input manifest cannot be canonicalised '
+                        f'({type(e).__name__}: {e})')
+                else:
+                    if want_inputs != stored_inputs_sha.lower():
+                        out['status'] = 'fail'
+                        out['problems'].append(
+                            f'inputs_sha256 does not reproduce (stored '
+                            f'{stored_inputs_sha[:12]}…, recomputed '
+                            f'{want_inputs[:12]}…): the input binding was '
+                            'edited after the analysis was written')
+        elif inputs is not None or digest is not None:
+            # Legacy artifacts predate the hashed input binding.  They remain
+            # readable, but the absence of the digest means "the inputs could
+            # have been stripped" cannot be excluded: report it instead of
+            # silently treating the artifact as fully verified.
+            out['warnings'].append(
+                'no inputs_sha256: this artifact predates the hashed input '
+                'binding, so removal of its inputs block cannot be detected')
         if inputs is not None and not isinstance(inputs, dict):
             out['status'] = 'fail'
             out['problems'].append(
@@ -1685,8 +1762,13 @@ def stamped_analysis(kind, payload, *, outdir=None, name=None, event=True,
     rec['created_at'] = time.strftime('%Y-%m-%dT%H:%M:%S')
     rec['code'] = code_stamp()
     rec['provenance'] = code_provenance()
-    if inputs is not None:
-        rec['inputs'] = analysis_input_manifest(inputs)
+    # Always record an input block (possibly {}) plus its canonical digest.
+    # `inputs` itself stays out of `content_sha256` because it carries an
+    # absolute path and OS error strings; `inputs_sha256` is IN the hashed
+    # body, so deleting or editing the binding changes the content digest and
+    # a later verifier cannot be fooled by stripping it.
+    rec['inputs'] = analysis_input_manifest(inputs)
+    rec['inputs_sha256'] = analysis_inputs_sha256(rec['inputs'])
     rec['content_sha256'] = analysis_content_sha256(rec)
     if outdir is not None and name:
         path = os.path.join(outdir, name)

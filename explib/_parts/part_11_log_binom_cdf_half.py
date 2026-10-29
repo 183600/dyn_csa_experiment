@@ -344,7 +344,10 @@ def _practical_decision_from_stats(stats, tost, *, margin, direction, alpha, min
     n = 0 if n is None or n < 0 else n
     mean = _finite_scalar(stats.get('mean'))
     out = {
-        'n': n, 'mean': mean, 'margin': float(margin),
+        'n': n, 'mean': mean,
+        'complete_pairs': stats.get('complete_pairs'),
+        'n_dropped': stats.get('n_dropped'),
+        'margin': float(margin),
         'margin_ppl': float(margin),
         'p_floor': stats.get('p_floor'), 'n_nonzero': stats.get('n_nonzero'),
         'p_floor_scope': 'exact sign-flip superiority test (not TOST)',
@@ -362,6 +365,28 @@ def _practical_decision_from_stats(stats, tost, *, margin, direction, alpha, min
         out['decision'] = 'no_data'
         out['claim'] = 'no_data'
         out['reason'] = 'no finite paired difference'
+        return out
+    # A complete-case subset selected by missing/failed seeds is not the
+    # pre-registered paired panel.  `paired_effect_stats` already marks it
+    # `complete_pairs=False`, and the reporting gates refuse it; the practical
+    # decision path must do the same, otherwise dropping an inconvenient seed
+    # can manufacture either a "module useful" or a "module removable" claim
+    # from the survivors.  Malformed accounting fails closed.
+    _complete = stats.get('complete_pairs')
+    _dropped_raw = stats.get('n_dropped')
+    _dropped = None if _dropped_raw is None else _as_seed_int(_dropped_raw)
+    _incomplete = (_complete is False
+                   or (_dropped_raw is not None
+                       and (_dropped is None or _dropped > 0)))
+    if _incomplete:
+        out['decision'] = 'incomplete_pairs'
+        out['claim'] = 'inconclusive_incomplete_panel'
+        out['reason'] = (
+            'the paired panel is incomplete (dropped/missing seeds); the '
+            'surviving complete-case subset cannot support a superiority or '
+            'equivalence claim')
+        out['complete_pairs'] = False
+        out['n_dropped'] = _dropped
         return out
     if n < int(min_n):
         out['decision'] = 'underpowered'
@@ -676,6 +701,8 @@ def _interaction_decision_from_stats(stats, tost, *, margin, direction, alpha,
     margin_ratio = (float(math.exp(margin)) if margin < 700.0 else None)
     out = {
         'n': n, 'mean': mean,
+        'complete_pairs': stats.get('complete_pairs'),
+        'n_dropped': stats.get('n_dropped'),
         'margin': float(margin),
         'margin_log_ratio': float(margin),
         'margin_ratio': margin_ratio,
@@ -708,6 +735,24 @@ def _interaction_decision_from_stats(stats, tost, *, margin, direction, alpha,
         out['decision'] = 'no_data'
         out['claim'] = 'no_data'
         out['reason'] = 'no finite paired interaction difference'
+        return out
+    # Same complete-panel precondition as the ablation path: a TOST interval
+    # computed on survivors of dropped seeds cannot certify additivity.
+    _complete = stats.get('complete_pairs')
+    _dropped_raw = stats.get('n_dropped')
+    _dropped = None if _dropped_raw is None else _as_seed_int(_dropped_raw)
+    _incomplete = (_complete is False
+                   or (_dropped_raw is not None
+                       and (_dropped is None or _dropped > 0)))
+    if _incomplete:
+        out['decision'] = 'incomplete_pairs'
+        out['claim'] = 'inconclusive_incomplete_panel'
+        out['reason'] = (
+            'the paired interaction panel is incomplete (dropped/missing '
+            'seeds); the surviving complete-case subset cannot support a '
+            'directional or additivity claim')
+        out['complete_pairs'] = False
+        out['n_dropped'] = _dropped
         return out
     if n < min_n:
         out['decision'] = 'underpowered'

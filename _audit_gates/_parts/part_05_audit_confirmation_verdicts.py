@@ -188,6 +188,404 @@ def audit_confirmation_verdicts(path=None):
     return out
 
 
+def _pvr_finite(value):
+    """A finite float from a stored record, or None (booleans are not numbers)."""
+    if isinstance(value, (bool, np.bool_)):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _pvr_close(a, b, *, rel=1e-9, abs_=1e-12):
+    """Numeric equality that also handles infinities and NaN deliberately."""
+    fa, fb = _pvr_finite(a), _pvr_finite(b)
+    if fa is None or fb is None:
+        return False
+    return math.isclose(fa, fb, rel_tol=rel, abs_tol=abs_)
+
+
+def _pvr_replay_one(L, name, rec, *, where, problems, warnings):
+    """Recompute one sign-flip p from its stored per-seed paired deltas.
+
+    Returns ``{'kind', 'status', 'per_seed', 'p', ...}``.  A missing/invalid
+    delta vector is reported as ``not_replayable`` rather than fabricated;
+    a present vector whose stored p, n, seed set or p-floor disagrees is a
+    hard problem because the artifact no longer reproduces its own headline
+    statistic.
+    """
+    out = {'name': name, 'where': where, 'status': 'not_replayable',
+           'p': None, 'n': None, 'seeds': None, 'per_seed': None}
+    deltas = rec.get('per_seed')
+    if deltas is None:
+        warnings.append(
+            f'{where}: no per_seed paired deltas recorded — the stored p '
+            'cannot be replayed (legacy artifact, not a pass)')
+        return out
+    if isinstance(deltas, (str, bytes)) or not isinstance(deltas, (list, tuple)):
+        problems.append(f'{where}: per_seed is a {type(deltas).__name__}, not a list of paired deltas')
+        out['status'] = 'invalid'
+        return out
+    vals = []
+    for i, x in enumerate(deltas):
+        if isinstance(x, (bool, np.bool_)):
+            problems.append(f'{where}: per_seed[{i}] is a boolean, not a paired delta')
+            out['status'] = 'invalid'
+            return out
+        try:
+            v = float(x)
+        except (TypeError, ValueError, OverflowError):
+            problems.append(f'{where}: per_seed[{i}] is not numeric')
+            out['status'] = 'invalid'
+            return out
+        if not math.isfinite(v):
+            problems.append(f'{where}: per_seed[{i}] is not finite ({x!r})')
+            out['status'] = 'invalid'
+            return out
+        vals.append(v)
+    if len(vals) < 2:
+        problems.append(
+            f'{where}: a non-omitted comparison needs at least 2 paired '
+            f'deltas, got {len(vals)}')
+        out['status'] = 'invalid'
+        return out
+    seeds = rec.get('seeds')
+    if seeds is not None:
+        if isinstance(seeds, (str, bytes)) or not isinstance(seeds, (list, tuple)):
+            problems.append(f'{where}: seeds is a {type(seeds).__name__}, not a list')
+            out['status'] = 'invalid'
+            return out
+        try:
+            seed_ints = [int(s) for s in seeds]
+        except (TypeError, ValueError, OverflowError):
+            problems.append(f'{where}: seeds contains a non-integer entry')
+            out['status'] = 'invalid'
+            return out
+        if len(seed_ints) != len(vals):
+            problems.append(
+                f'{where}: seeds has {len(seed_ints)} entries but per_seed has '
+                f'{len(vals)} deltas')
+            out['status'] = 'invalid'
+            return out
+        if len(set(seed_ints)) != len(seed_ints):
+            problems.append(f'{where}: seeds contains duplicates {seed_ints}')
+            out['status'] = 'invalid'
+            return out
+        out['seeds'] = seed_ints
+    else:
+        warnings.append(
+            f'{where}: seeds is absent — the deltas cannot be tied to the '
+            'frozen seed whitelist, so this is not a complete replay')
+    rep = L.exact_signflip_p(vals)
+    p = _pvr_finite(rep.get('p'))
+    if p is None:
+        problems.append(f'{where}: the recomputed exact sign-flip p is not finite')
+        out['status'] = 'invalid'
+        return out
+    out.update({'per_seed': vals, 'p': float(p), 'n': int(rep.get('n') or 0),
+                'n_nonzero': int(rep.get('n_nonzero') or 0),
+                'p_floor': _pvr_finite(rep.get('p_floor')),
+                'method': rep.get('method'), 'status': 'replayed'})
+    # Every stored headline field must agree with the vector it claims to
+    # summarise.  This is what turns `per_seed` from decoration into a
+    # machine-checkable commitment.
+    _stored_p = rec.get('p_exact_signflip')
+    if _stored_p is None:
+        problems.append(f'{where}: per_seed is recorded but p_exact_signflip is missing')
+    elif not _pvr_close(_stored_p, p, rel=0.0, abs_=1e-12):
+        problems.append(
+            f'{where}: stored p_exact_signflip={_stored_p!r} does not match the '
+            f'recomputed exact sign-flip p={p!r}')
+    _n = rec.get('n_effective', rec.get('n'))
+    if _n is not None:
+        _n_int = None
+        if not isinstance(_n, (bool, np.bool_)):
+            try:
+                _n_int = int(_n)
+            except (TypeError, ValueError, OverflowError):
+                _n_int = None
+        if _n_int != len(vals):
+            problems.append(
+                f'{where}: stored n={_n!r} does not equal the number of paired '
+                f'deltas ({len(vals)})')
+    _nn = rec.get('n_nonzero')
+    if _nn is not None and _nn != out['n_nonzero']:
+        problems.append(
+            f'{where}: stored n_nonzero={_nn!r} does not match the recomputed '
+            f'{out["n_nonzero"]}')
+    _pf = rec.get('p_floor')
+    if _pf is not None and not _pvr_close(_pf, out['p_floor'], rel=0.0, abs_=1e-15):
+        problems.append(
+            f'{where}: stored p_floor={_pf!r} does not match the recomputed '
+            f'{out["p_floor"]!r}')
+    _mean = rec.get('mean')
+    if _mean is not None:
+        _mu = float(np.mean(np.asarray(vals, dtype=float)))
+        if not _pvr_close(_mean, _mu, rel=1e-9, abs_=1e-12):
+            problems.append(
+                f'{where}: stored mean={_mean!r} does not match mean(per_seed)={_mu!r}')
+    return out
+
+
+def audit_confirmation_pvalues(path=None):
+    """Recompute every stored confirmation p from its paired deltas.
+
+    The three-way verdict audit (:func:`audit_confirmation_verdicts`) replays
+    the decision partition from *stored* p-values and deliberately does not
+    recompute them.  That leaves the central numbers of the frozen round
+    trusted on faith: an edited p, a wrong family, a deleted comparison or a
+    stale ``by_length`` curve could remain internally consistent.  This gate
+    closes that gap.  For each comparison it takes the recorded per-seed
+    paired deltas, reruns the same exact two-sided sign-flip test, and checks
+    the stored p / n / non-zero count / resolution floor / mean.  It then
+    rebuilds the Holm step-down over the declared family (omitted comparisons
+    keep a p=1 slot) and compares every adjusted p.  Every by-length curve
+    entry is replayed the same way, and the primary endpoint's delta vector
+    must equal the primary curve's.
+
+    A missing ``per_seed`` vector is ``not_replayable`` (a warning, never a
+    pass); a present vector whose stored statistic disagrees is ``fail``.
+    The audit is read-only: it does not retrain, recompute PPL, read the test
+    split, or change any frozen verdict.
+    """
+    L = _import_exp_lib()
+    p = path or os.path.join(REPO, 'analysis_v12', 'test_stats.json')
+    out = {'kind': 'confirmation_pvalue_replay', 'status': 'ok', 'path': p,
+           'alpha': None, 'n_comparisons': 0, 'n_replayed': 0,
+           'n_omitted': 0, 'n_not_replayable': 0, 'n_curve_replayed': 0,
+           'comparisons': {}, 'holm': {}, 'problems': [], 'warnings': [],
+           'note': ('recomputes the exact two-sided sign-flip p and the Holm '
+                    'family from the stored per-seed deltas; a missing vector '
+                    'is not a pass and a disagreement is a fail')}
+    if not os.path.exists(p):
+        out['status'] = 'not_verifiable_locally'
+        out['reason'] = 'no final-test stats artifact on disk'
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return out
+    data = _load(p)
+    if data is None:
+        out['status'] = 'fail'
+        out['problems'].append(f'{p} exists but is not a readable JSON object')
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return out
+    ft = data.get('finaltest') if isinstance(data.get('finaltest'), dict) else data
+    comps = ft.get('comparisons') if isinstance(ft, dict) else None
+    if not isinstance(comps, dict) or not comps:
+        out['status'] = 'not_verifiable_locally'
+        out['reason'] = 'the stats artifact carries no comparisons'
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return out
+    _alpha = _pvr_finite(ft.get('alpha', 0.05))
+    if _alpha is None or not (0.0 < _alpha < 1.0):
+        out['problems'].append(f'alpha={ft.get("alpha")!r} is not in (0,1)')
+        _alpha = 0.05
+    out['alpha'] = float(_alpha)
+    out['n_comparisons'] = len(comps)
+
+    # The artifact's own declaration of the frozen family.  Without it a
+    # deletion is invisible; with it the comparison set must be exact.
+    _man = ft.get('manifest') if isinstance(ft.get('manifest'), dict) else {}
+    _seeds = _man.get('seeds')
+    _declared = _man.get('primary_comparison_names')
+    if isinstance(_declared, list):
+        _decl = [str(x) for x in _declared]
+        if len(set(_decl)) != len(_decl):
+            out['problems'].append(
+                f'manifest.primary_comparison_names has duplicates: {_decl}')
+        if set(_decl) != set(map(str, comps)):
+            out['problems'].append(
+                'the comparison set does not equal the declared frozen family: '
+                f'missing={sorted(set(_decl) - set(map(str, comps)))} '
+                f'extra={sorted(set(map(str, comps)) - set(_decl))}')
+        if _man.get('family_size') is not None and _man.get('family_size') != len(_decl):
+            out['problems'].append(
+                f'manifest.family_size={_man.get("family_size")!r} does not '
+                f'equal the declared family length {len(_decl)}')
+    elif _declared is None:
+        out['warnings'].append(
+            'the artifact does not record manifest.primary_comparison_names; '
+            'a deleted comparison and its Holm slot cannot be ruled out')
+    else:
+        out['problems'].append(
+            f'manifest.primary_comparison_names is a '
+            f'{type(_declared).__name__}, not a list')
+
+    # If the artifact says it was produced under the CURRENT frozen manifest,
+    # cross-check its embedded family against that file.  This closes the
+    # "edit both the comparison map and its embedded name list" case: the
+    # artifact's manifest_sha256 still points at the tracked file, whose
+    # primary_comparisons list is independent of the artifact.
+    _mfp = os.path.join(REPO, 'confirmation_frozen.json')
+    _stored_msha = _man.get('manifest_sha256')
+    if os.path.isfile(_mfp):
+        try:
+            import hashlib
+            with open(_mfp, 'rb') as _mfh:
+                _mraw = _mfh.read()
+            _msha = hashlib.sha256(_mraw).hexdigest()
+            _mf = json.loads(_mraw.decode('utf-8'))
+            _mnames = [str(c.get('name')) for c in (_mf.get('primary_comparisons') or [])]
+            if _stored_msha is None:
+                out['warnings'].append(
+                    'the artifact does not record manifest_sha256; the frozen '
+                    'family cannot be cross-checked against the tracked manifest')
+            elif str(_stored_msha) != _msha:
+                out['warnings'].append(
+                    'the artifact was produced from a different manifest '
+                    f'({str(_stored_msha)[:12]}… vs current {_msha[:12]}…); '
+                    'its embedded family is used, not the current plan')
+            else:
+                if isinstance(_declared, list) and _mnames and _mnames != _decl:
+                    out['problems'].append(
+                        'manifest.primary_comparison_names does not equal the '
+                        f'tracked manifest family: embedded={_decl} '
+                        f'tracked={_mnames}')
+                if set(_mnames) != set(map(str, comps)):
+                    out['problems'].append(
+                        'the comparison set does not equal the tracked frozen '
+                        f'family: missing={sorted(set(_mnames) - set(map(str, comps)))} '
+                        f'extra={sorted(set(map(str, comps)) - set(_mnames))}')
+                if isinstance(_mf.get('seeds'), list) and _mf.get('seeds') != _seeds:
+                    out['problems'].append(
+                        'manifest.seeds does not equal the tracked manifest seeds')
+        except Exception as _mfe:
+            out['warnings'].append(
+                f'the tracked manifest could not be cross-checked '
+                f'({type(_mfe).__name__}: {_mfe})')
+    else:
+        out['warnings'].append(
+            'confirmation_frozen.json is absent; the embedded family cannot be '
+            'cross-checked against the tracked plan')
+
+    family = []
+    for name in sorted(map(str, comps)):
+        rec = comps[name]
+        where = f'comparison {name!r}'
+        if not isinstance(rec, dict):
+            out['problems'].append(f'{where}: record is a {type(rec).__name__}, not an object')
+            family.append((name, 1.0))
+            continue
+        if 'omitted' in rec:
+            out['n_omitted'] += 1
+            if rec.get('p_exact_signflip') is not None:
+                out['warnings'].append(
+                    f'{where}: omitted comparison carries p_exact_signflip; '
+                    'the Holm slot is still p=1')
+            family.append((name, 1.0))
+            out['comparisons'][name] = {'status': 'omitted', 'family_p': 1.0}
+            continue
+        rep = _pvr_replay_one(L, name, rec, where=where,
+                              problems=out['problems'], warnings=out['warnings'])
+        out['comparisons'][name] = rep
+        if rep['status'] == 'replayed':
+            out['n_replayed'] += 1
+            family.append((name, float(rep['p'])))
+        else:
+            out['n_not_replayable'] += 1
+            # Keep the stored p for an *indicative* family rebuild, but do not
+            # compare Holm unless every slot is replayable (otherwise a legacy
+            # or malformed record would manufacture a false mismatch).
+            _sp = _pvr_finite(rec.get('p_exact_signflip'))
+            family.append((name, _sp if _sp is not None else 1.0))
+        # By-length curve: same exact vector replay for every descriptive
+        # endpoint.  The primary curve must equal the primary record vector.
+        _curve = rec.get('by_length_curve')
+        if isinstance(_curve, dict):
+            for ln, crec in sorted(_curve.items(), key=lambda kv: str(kv[0])):
+                if not isinstance(crec, dict):
+                    out['problems'].append(
+                        f'{where} L{ln}: curve cell is a {type(crec).__name__}, not an object')
+                    continue
+                crep = _pvr_replay_one(
+                    L, name, crec, where=f'{where} by_length L{ln}',
+                    problems=out['problems'], warnings=out['warnings'])
+                if crep['status'] == 'replayed':
+                    out['n_curve_replayed'] += 1
+                if (crep['status'] == 'replayed' and 'primary' in str(crec.get('role', ''))
+                        and rep['status'] == 'replayed'
+                        and len(crep['per_seed']) == len(rep['per_seed'])):
+                    _a = np.asarray(crep['per_seed'], dtype=float)
+                    _b = np.asarray(rep['per_seed'], dtype=float)
+                    if not np.allclose(_a, _b, rtol=1e-12, atol=1e-12):
+                        out['problems'].append(
+                            f'{where}: the primary by-length curve per_seed '
+                            'vector differs from the primary comparison vector')
+
+    _holm = ft.get('holm')
+    if not isinstance(_holm, dict):
+        out['problems'].append('holm is missing or not a JSON object')
+        _holm = {}
+    else:
+        _missing = sorted(set(map(str, comps)) - set(map(str, _holm)))
+        _extra = sorted(set(map(str, _holm)) - set(map(str, comps)))
+        if _missing:
+            out['problems'].append(f'holm is missing declared comparisons: {_missing}')
+        if _extra:
+            out['problems'].append(f'holm contains undeclared comparisons: {_extra}')
+    _rebuilt = L.holm_adjust(family, alpha=float(_alpha))
+    out['holm'] = {'m': len(family),
+                   'recomputed': {k: v.get('p_holm') for k, v in _rebuilt.items()},
+                   'stored': {k: (v.get('p_holm') if isinstance(v, dict) else None)
+                              for k, v in _holm.items()}}
+    _fully_replayable = (out['n_replayed'] == len(comps) - out['n_omitted'])
+    if _fully_replayable:
+        for name in sorted(map(str, comps)):
+            _srec = _holm.get(name)
+            _want = (_rebuilt.get(name) or {}).get('p_holm')
+            if not isinstance(_srec, dict):
+                out['problems'].append(
+                    f'holm[{name!r}] is missing or not an object')
+                continue
+            _got = _pvr_finite(_srec.get('p_holm'))
+            if _got is None or _want is None or not _pvr_close(_got, _want, rel=0.0, abs_=1e-12):
+                out['problems'].append(
+                    f'holm[{name!r}]={_srec.get("p_holm")!r} does not match '
+                    f'the recomputed {_want!r} over the declared family')
+            _me = _srec.get('m_effective')
+            if _me is not None and _me != len(family):
+                out['problems'].append(
+                    f'holm[{name!r}].m_effective={_me!r} does not match the '
+                    f'declared family size {len(family)}')
+    else:
+        out['warnings'].append(
+            'the Holm family was not rebuilt against the stored values because '
+            f'{out["n_not_replayable"]} comparison(s) have no replayable delta vector')
+
+    # The minimum attainable Holm p depends only on (n, m, alpha); it is a
+    # useful tripwire for a silently edited seed list or family size.
+    _seeds = _man.get('seeds')
+    _m = len(_declared) if isinstance(_declared, list) else len(comps)
+    if isinstance(_seeds, list) and _seeds:
+        try:
+            _n_seeds = len(_seeds)
+            _want_min = L.holm_min_attainable_p(_n_seeds, int(_m), float(_alpha))
+            _got_min = _pvr_finite(ft.get('min_attainable_p_holm'))
+            if _got_min is not None and not _pvr_close(_got_min, _want_min, rel=0.0, abs_=1e-12):
+                out['problems'].append(
+                    f'min_attainable_p_holm={ft.get("min_attainable_p_holm")!r} '
+                    f'does not match holm_min_attainable_p(n={_n_seeds}, '
+                    f'm={int(_m)}, alpha={float(_alpha)})={_want_min!r}')
+        except Exception:
+            pass
+    else:
+        out['warnings'].append(
+            'manifest.seeds is missing; the attainable-resolution tripwire '
+            'could not run')
+
+    if out['problems']:
+        out['status'] = 'fail'
+    elif out['n_replayed'] == 0:
+        out['status'] = 'not_verifiable_locally'
+        out['reason'] = 'no comparison records a replayable per_seed vector'
+    elif out['warnings']:
+        out['status'] = 'warnings'
+    print(json.dumps({k: v for k, v in out.items() if k != 'comparisons'},
+                     ensure_ascii=False, indent=2))
+    return out
+
+
 def _find_look_histories(paths=None, max_depth=3):
     """Yield ``look_history.json`` paths from explicit paths or results_* trees."""
     seen = set()
@@ -981,7 +1379,7 @@ def audit_analysis_integrity(paths=None):
 
 
 def run_report(out='audit_report.json'):
-    res = {'generated_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'source_tree': audit_source_integrity(), 'dependencies': audit_dependencies(), 'data_source': audit_data_source(), 'leakage': audit_leakage(), 'split_discipline': audit_split_discipline(), 'document_unit': audit_document_unit(), 'sample_design': audit_sample_design(), 'data_processing': audit_data_processing(), 'attribution': audit_attribution(), 'boundary': audit_boundary(), 'length': audit_length(), 'fairness': audit_fairness(), 'metrics': audit_metrics(), 'tuning': audit_tuning(), 'simple_baseline': audit_simple_baseline(), 'hypotheses': audit_hypotheses(), 'sesoi': audit_sesoi_declaration(), 'baseline_sesoi': audit_baseline_sesoi(), 'interaction_sesoi': audit_interaction_sesoi(), 'unit_influence': audit_unit_influence(), 'two_level_ci': audit_two_level_ci(), 'analysis_choices': audit_analysis_choices(), 'analysis_integrity': audit_analysis_integrity(), 'experiment_ledger': audit_experiment_ledger(), 'verdicts': audit_confirmation_verdicts(), 'looks': audit_look_history(), 'methodology': audit_methodology(), 'single_factor': audit_single_factor(), 'content_controls': audit_content_controls(), 'sink_controls': audit_sink_controls(), 'factorial': audit_factorial_design(), 'interaction_coverage': audit_interaction_coverage(verbose=False), 'factorial_anchor': audit_factorial_anchor(verbose=False), 'design_preflight': audit_design_preflight(), 'sensitivity': audit_design_sensitivity(), 'evaluation': audit_evaluation_design(), 'dose_response': audit_dose_response(verbose=False), 'failures': audit_failures(), 'budget': audit_budget(), 'training_health': audit_training_health(), 'efficiency_pairs': audit_efficiency_pairs(), 'error_case_inference': audit_error_case_inference(), 'release': audit_release_readiness(), 'selection': audit_selection(), 'run_order': audit_run_order(), 'run_allocation': audit_run_allocation(), 'evaluation_order': audit_evaluation_order(), 'reproduction': audit_reproduction(), 'calibration': audit_statistical_calibration()}
+    res = {'generated_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'source_tree': audit_source_integrity(), 'dependencies': audit_dependencies(), 'data_source': audit_data_source(), 'leakage': audit_leakage(), 'split_discipline': audit_split_discipline(), 'document_unit': audit_document_unit(), 'sample_design': audit_sample_design(), 'data_processing': audit_data_processing(), 'attribution': audit_attribution(), 'boundary': audit_boundary(), 'length': audit_length(), 'fairness': audit_fairness(), 'metrics': audit_metrics(), 'tuning': audit_tuning(), 'simple_baseline': audit_simple_baseline(), 'hypotheses': audit_hypotheses(), 'sesoi': audit_sesoi_declaration(), 'baseline_sesoi': audit_baseline_sesoi(), 'interaction_sesoi': audit_interaction_sesoi(), 'unit_influence': audit_unit_influence(), 'two_level_ci': audit_two_level_ci(), 'analysis_choices': audit_analysis_choices(), 'analysis_integrity': audit_analysis_integrity(), 'experiment_ledger': audit_experiment_ledger(), 'verdicts': audit_confirmation_verdicts(), 'pvalue_replay': audit_confirmation_pvalues(), 'looks': audit_look_history(), 'methodology': audit_methodology(), 'single_factor': audit_single_factor(), 'content_controls': audit_content_controls(), 'sink_controls': audit_sink_controls(), 'factorial': audit_factorial_design(), 'interaction_coverage': audit_interaction_coverage(verbose=False), 'factorial_anchor': audit_factorial_anchor(verbose=False), 'design_preflight': audit_design_preflight(), 'sensitivity': audit_design_sensitivity(), 'evaluation': audit_evaluation_design(), 'dose_response': audit_dose_response(verbose=False), 'failures': audit_failures(), 'budget': audit_budget(), 'training_health': audit_training_health(), 'efficiency_pairs': audit_efficiency_pairs(), 'error_case_inference': audit_error_case_inference(), 'release': audit_release_readiness(), 'selection': audit_selection(), 'run_order': audit_run_order(), 'run_allocation': audit_run_allocation(), 'evaluation_order': audit_evaluation_order(), 'reproduction': audit_reproduction(), 'calibration': audit_statistical_calibration()}
     L_atomic = None
     try:
         L = _import_exp_lib()
@@ -1001,7 +1399,7 @@ def run_report(out='audit_report.json'):
 
 
 def _run_cli():
-    _cmds = {'leakage': audit_leakage, 'split': audit_split_discipline, 'split_discipline': audit_split_discipline, 'document_unit': audit_document_unit, 'unit': audit_document_unit, 'sample_design': audit_sample_design, 'sampling': audit_sample_design, 'sample': audit_sample_design, 'data_processing': audit_data_processing, 'dedup_protocol': audit_data_processing, 'dedup': audit_data_processing, 'cleaning': audit_data_processing, 'causality': audit_causality, 'attribution': audit_attribution, 'boundary': audit_boundary, 'length': audit_length, 'fairness': audit_fairness, 'metrics': audit_metrics, 'tuning': audit_tuning, 'simple': audit_simple_baseline, 'baseline_floor': audit_simple_baseline, 'baseline_plan': audit_baseline_design, 'hypothesis_coverage': audit_hypothesis_coverage, 'hypotheses': audit_hypotheses, 'sesoi': audit_sesoi_declaration, 'baseline_sesoi': audit_baseline_sesoi, 'baseline_sesoi_declaration': audit_baseline_sesoi, 'interaction_sesoi': audit_interaction_sesoi, 'interaction': audit_interaction_sesoi, 'unit_influence': audit_unit_influence, 'influence': audit_unit_influence, 'two_level_ci': audit_two_level_ci, 'two_level': audit_two_level_ci, 'total_uncertainty': audit_two_level_ci, 'joint_ci': audit_two_level_ci, 'analysis_choices': audit_analysis_choices, 'specification_curve': audit_analysis_choices, 'analysis_integrity': audit_analysis_integrity, 'artifact_integrity': audit_analysis_integrity, 'content_integrity': audit_analysis_integrity, 'experiment_ledger': audit_experiment_ledger, 'event_ledger': audit_experiment_ledger, 'ledger': audit_experiment_ledger, 'verdicts': audit_confirmation_verdicts, 'verdict': audit_confirmation_verdicts, 'three_way': audit_confirmation_verdicts, 'analysis_choice': audit_analysis_choices, 'looks': audit_look_history, 'look_history': audit_look_history, 'methodology': audit_methodology, 'single_factor': audit_single_factor, 'content_controls': audit_content_controls, 'sink_controls': audit_sink_controls, 'sink_placebo': audit_sink_controls, 'control_ladder': audit_content_controls, 'content_alignment': audit_content_controls, 'factorial': audit_factorial_design, 'factorial_design': audit_factorial_design, 'interaction_coverage': audit_interaction_coverage, 'interaction_scope': audit_interaction_coverage, 'factorial_anchor': audit_factorial_anchor, 'component_anchor': audit_factorial_anchor, 'design': audit_design_preflight, 'design_preflight': audit_design_preflight, 'sensitivity': audit_design_sensitivity, 'design_sensitivity': audit_design_sensitivity, 'precision': audit_design_sensitivity, 'evaluation': audit_evaluation_design, 'evaluation_design': audit_evaluation_design, 'unit_precision': audit_evaluation_design, 'dose_response': audit_dose_response, 'dose_response_design': audit_dose_response, 'failures': audit_failures, 'budget': audit_budget, 'efficiency': audit_efficiency_demo, 'efficiency_pairs': audit_efficiency_pairs, 'training_health': audit_training_health, 'selection': audit_selection, 'release': audit_release_readiness, 'run_order': audit_run_order, 'run_allocation': audit_run_allocation, 'allocation': audit_run_allocation, 'environment_balance': audit_run_allocation, 'evaluation_order': audit_evaluation_order, 'eval_order': audit_evaluation_order, 'measurement_order': audit_evaluation_order, 'reproduction': audit_reproduction, 'reproduce': audit_reproduction, 'replication': audit_reproduction, 'rerun_check': audit_reproduction, 'error_case_inference': audit_error_case_inference, 'error_buckets': audit_error_case_inference, 'calibration': audit_statistical_calibration, 'stats_calibration': audit_statistical_calibration, 'type_i': audit_statistical_calibration, 'source': audit_source_integrity, 'source_tree': audit_source_integrity, 'dependencies': audit_dependencies, 'dependency': audit_dependencies, 'data_source': audit_data_source, 'dataset_source': audit_data_source, 'report': run_report}
+    _cmds = {'leakage': audit_leakage, 'split': audit_split_discipline, 'split_discipline': audit_split_discipline, 'document_unit': audit_document_unit, 'unit': audit_document_unit, 'sample_design': audit_sample_design, 'sampling': audit_sample_design, 'sample': audit_sample_design, 'data_processing': audit_data_processing, 'dedup_protocol': audit_data_processing, 'dedup': audit_data_processing, 'cleaning': audit_data_processing, 'causality': audit_causality, 'attribution': audit_attribution, 'boundary': audit_boundary, 'length': audit_length, 'fairness': audit_fairness, 'metrics': audit_metrics, 'tuning': audit_tuning, 'simple': audit_simple_baseline, 'baseline_floor': audit_simple_baseline, 'baseline_plan': audit_baseline_design, 'hypothesis_coverage': audit_hypothesis_coverage, 'hypotheses': audit_hypotheses, 'sesoi': audit_sesoi_declaration, 'baseline_sesoi': audit_baseline_sesoi, 'baseline_sesoi_declaration': audit_baseline_sesoi, 'interaction_sesoi': audit_interaction_sesoi, 'interaction': audit_interaction_sesoi, 'unit_influence': audit_unit_influence, 'influence': audit_unit_influence, 'two_level_ci': audit_two_level_ci, 'two_level': audit_two_level_ci, 'total_uncertainty': audit_two_level_ci, 'joint_ci': audit_two_level_ci, 'analysis_choices': audit_analysis_choices, 'specification_curve': audit_analysis_choices, 'analysis_integrity': audit_analysis_integrity, 'artifact_integrity': audit_analysis_integrity, 'content_integrity': audit_analysis_integrity, 'experiment_ledger': audit_experiment_ledger, 'event_ledger': audit_experiment_ledger, 'ledger': audit_experiment_ledger, 'verdicts': audit_confirmation_verdicts, 'verdict': audit_confirmation_verdicts, 'three_way': audit_confirmation_verdicts, 'pvalues': audit_confirmation_pvalues, 'pvalue_replay': audit_confirmation_pvalues, 'recompute_p': audit_confirmation_pvalues, 'analysis_choice': audit_analysis_choices, 'looks': audit_look_history, 'look_history': audit_look_history, 'methodology': audit_methodology, 'single_factor': audit_single_factor, 'content_controls': audit_content_controls, 'sink_controls': audit_sink_controls, 'sink_placebo': audit_sink_controls, 'control_ladder': audit_content_controls, 'content_alignment': audit_content_controls, 'factorial': audit_factorial_design, 'factorial_design': audit_factorial_design, 'interaction_coverage': audit_interaction_coverage, 'interaction_scope': audit_interaction_coverage, 'factorial_anchor': audit_factorial_anchor, 'component_anchor': audit_factorial_anchor, 'design': audit_design_preflight, 'design_preflight': audit_design_preflight, 'sensitivity': audit_design_sensitivity, 'design_sensitivity': audit_design_sensitivity, 'precision': audit_design_sensitivity, 'evaluation': audit_evaluation_design, 'evaluation_design': audit_evaluation_design, 'unit_precision': audit_evaluation_design, 'dose_response': audit_dose_response, 'dose_response_design': audit_dose_response, 'failures': audit_failures, 'budget': audit_budget, 'efficiency': audit_efficiency_demo, 'efficiency_pairs': audit_efficiency_pairs, 'training_health': audit_training_health, 'selection': audit_selection, 'release': audit_release_readiness, 'run_order': audit_run_order, 'run_allocation': audit_run_allocation, 'allocation': audit_run_allocation, 'environment_balance': audit_run_allocation, 'evaluation_order': audit_evaluation_order, 'eval_order': audit_evaluation_order, 'measurement_order': audit_evaluation_order, 'reproduction': audit_reproduction, 'reproduce': audit_reproduction, 'replication': audit_reproduction, 'rerun_check': audit_reproduction, 'error_case_inference': audit_error_case_inference, 'error_buckets': audit_error_case_inference, 'calibration': audit_statistical_calibration, 'stats_calibration': audit_statistical_calibration, 'type_i': audit_statistical_calibration, 'source': audit_source_integrity, 'source_tree': audit_source_integrity, 'dependencies': audit_dependencies, 'dependency': audit_dependencies, 'data_source': audit_data_source, 'dataset_source': audit_data_source, 'report': run_report}
     _arg = sys.argv[1] if len(sys.argv) > 1 else 'report'
     if _arg in ('-h', '--help'):
         print(__doc__)
@@ -1011,9 +1409,12 @@ def _run_cli():
         raise SystemExit(2)
     _pos = sys.argv[2:]
     # Most gates take no positional arguments (they discover their artifacts).
-    # The reproduction gate is the exception: it needs the two run directories
-    # or summary paths explicitly, and must never guess a comparison pair.
-    if _arg in ('reproduction', 'reproduce', 'replication', 'rerun_check'):
+    # The reproduction gate needs the two run directories or summary paths
+    # explicitly and must never guess a comparison pair; the p-value replay
+    # gate accepts one optional artifact path so a copy can be checked outside
+    # the default analysis_v12/ location.
+    if _arg in ('reproduction', 'reproduce', 'replication', 'rerun_check',
+                'pvalues', 'pvalue_replay', 'recompute_p'):
         _r = _cmds[_arg](*_pos)
     else:
         _r = _cmds[_arg]()

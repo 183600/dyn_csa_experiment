@@ -1183,7 +1183,15 @@ _SOURCE_TREE_SKIP_DIRS = {
     '.ruff_cache', '.pytest_cache', '.mypy_cache', '.cache', 'node_modules',
     'build', 'dist', 'site-packages', 'archive', 'par_jobs',
     'wt103_cache', 'fineweb_cache', 'wt103_raw', 'datasets', 'data', 't',
+    # `make install-check` populates .build/install-check with a full copy of
+    # the source, and `make build` writes .build/dist.  Hashing that scratch
+    # tree made the "measurement source" depend on whether a packaging check
+    # had run: the freeze lock would refuse an unchanged tree, reproduce-
+    # compare would report code_changed, and archives would pack duplicate
+    # copies.  These are generated build/venv trees, never measurement source.
+    '.build', '.tox', '.nox', '.eggs', '.hypothesis',
 }
+_SOURCE_TREE_SKIP_SUFFIXES = ('.egg-info',)
 _SOURCE_TREE_SKIP_PREFIXES = ('results_', 'analysis_')
 
 
@@ -1240,6 +1248,7 @@ def _source_tree_paths(root):
         dirs[:] = sorted(
             d for d in dirs
             if d not in _SOURCE_TREE_SKIP_DIRS
+            and not any(d.endswith(sfx) for sfx in _SOURCE_TREE_SKIP_SUFFIXES)
             and not any(d.startswith(pref) for pref in _SOURCE_TREE_SKIP_PREFIXES)
         )
         for n in sorted(names):

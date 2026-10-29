@@ -27,6 +27,19 @@ def test_source_tree_manifest_tracks_exact_bytes():
         assert m1['sha256'] == m2['sha256'], 'two identical scans must agree'
         assert set(m1['files']) == {'exp_lib.py', 'pyproject.toml'}, m1['files']
         assert m1['n_files'] == 2 and 'files' not in L.source_tree_summary(root=td)
+        # Generated build/venv trees must not enter the measurement digest.
+        # `make install-check` writes a full source copy under .build/, so
+        # hashing it made an unchanged checkout look like a source change (and
+        # made the freeze lock / reproduction comparator report code_changed).
+        for scratch in ('.build/install-check', 'build/lib', '.tox/env',
+                        'demo.egg-info', '.eggs/pkg'):
+            os.makedirs(os.path.join(td, scratch), exist_ok=True)
+            with open(os.path.join(td, scratch, 'copy.py'), 'w',
+                      encoding='utf-8') as f:
+                f.write('SCRATCH = True\n')
+        m_scratch = L.source_tree_manifest(root=td)
+        assert m_scratch['sha256'] == m1['sha256'], m_scratch['files']
+        assert m_scratch['n_files'] == 2, m_scratch['files']
         # A content change must change both the per-file digest and the aggregate.
         with open(os.path.join(td, 'exp_lib.py'), 'a', encoding='utf-8') as f:
             f.write('B = 2\n')
@@ -1874,6 +1887,41 @@ def test_interaction_practical_decision_primitives():
     again2 = L._normalise_interaction_sesoi_design({'x': norm})['x']
     assert again2['relative_pct'] == 2.0 and again2['absolute_log_ratio'] is None, again2
     assert abs(norm['margin_log_ratio'] - math.log1p(0.02)) < 1e-15, norm
+
+
+def test_complete_case_survivors_are_not_promoted_to_a_claim():
+    # Six surviving pairs can reach p=2/64, but they are survivors of a
+    # dropped-seed filter, not the pre-registered panel.  The significance
+    # flag and both practical-decision paths must refuse the subset.
+    d = [0.10, 0.11, 0.09, 0.12, 0.08, 0.10, float('nan')]
+    st = L.paired_effect_stats(d, alpha=0.05, min_n=3)
+    assert st['n'] == 6 and st['n_dropped'] == 1, st
+    assert st['p_exact_signflip'] < 0.05, st
+    assert st['complete_pairs'] is False and st['significant'] is False, st
+    assert st['incomplete_pairs'] is True and 'incomplete' in st['effect_vs_noise'], st
+
+    # TOST on 3/4 survivors must not certify "module removable".
+    pd = L.ablation_practical_decision(
+        [0.0, 0.001, -0.001, float('nan')],
+        margin=0.05, alpha=0.05, min_n=3, direction=-1)
+    assert pd['decision'] == 'incomplete_pairs', pd
+    assert pd['claim'] == 'inconclusive_incomplete_panel', pd
+    assert pd['complete_pairs'] is False and pd['n_dropped'] == 1, pd
+
+    # The interaction path has the same precondition; a tight TOST interval on
+    # survivors cannot prove additivity.
+    ir = L.interaction_practical_decision(
+        [0.002, -0.002, 0.002, -0.002, 0.002, -0.002, float('nan')],
+        margin=math.log(1.01), direction=1)
+    assert ir['decision'] == 'incomplete_pairs', ir
+    assert ir['complete_pairs'] is False and ir['n_dropped'] == 1, ir
+
+    # A complete panel keeps the historical behaviour.
+    clean = L.ablation_practical_decision(
+        [0.0, 0.001, -0.001, 0.0], margin=0.05, alpha=0.05, min_n=3,
+        direction=-1)
+    assert clean['decision'] == 'equivalent', clean
+    assert clean['complete_pairs'] is True, clean
 
 
 def test_sesoi_practical_decision_primitives():

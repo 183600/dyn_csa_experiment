@@ -338,10 +338,11 @@ def paired_effect_stats(deltas, alpha=0.05, min_n=3, with_values=None, without_v
             raise ValueError(f'paired_effect_stats: duplicate seeds {_norm_seeds!r}')
         seed_labels = [_norm_seeds[i] for i in kept_pos]
         dropped_seeds = [_norm_seeds[i] for i in dropped_pos]
+    complete_pairs = bool(n_dropped == 0)
     _pair_fields = {'n_input': n_input, 'n_dropped': n_dropped,
                     'dropped_positions': dropped_pos,
                     'dropped_seeds': dropped_seeds,
-                    'complete_pairs': bool(n_dropped == 0),
+                    'complete_pairs': complete_pairs,
                     'seeds': seed_labels}
     if n == 0:
         return {'n': 0, 'mean': float('nan'), 'std': float('nan'), 'std_defined': False, 'sem': float('nan'), 'cohens_dz': float('nan'), 'ci95_low': float('nan'), 'ci95_high': float('nan'), 'loo_means': [], 'seed_driven': None, 'seed_robust': None, 'p_exact_signflip': float('nan'), 'p_floor': float('nan'), 'min_reachable_p': float('nan'), 'underpowered': True, 'resolution_limited': True, 'within_seed_noise': True, 'significant': False, 'effect_vs_noise': 'no data', 'unit': 'seed', 'assumption': 'none (no data)', 'sign_counts': {'positive': 0, 'negative': 0, 'zero': 0}, 'p_wilcoxon': None, 'p_wilcoxon_method': None, 'ci95_paired_bootstrap': None, 'ci95_unpaired_bootstrap': None, 'prediction_interval_95': None, 'prob_new_seed_same_sign': None, 'new_seed_replication': new_seed_replication(d), **_pair_fields}
@@ -374,13 +375,18 @@ def paired_effect_stats(deltas, alpha=0.05, min_n=3, with_values=None, without_v
     underpowered = n < min_n
     resolution_limited = bool(math.isfinite(p_floor) and p_floor > alpha)
     within_seed_noise = abs(mean) <= std
-    # The n floor and the exact-test resolution are preconditions, not
-    # side-notes: a loose alpha (or an unusually permissive caller) must not
-    # promote an underpowered/resolution-limited panel to "significant".
+    # The n floor, the exact-test resolution AND complete paired coverage are
+    # preconditions, not side-notes: a loose alpha (or an unusually permissive
+    # caller) must not promote an underpowered/resolution-limited panel, nor a
+    # complete-case subset selected by dropped seeds, to "significant".  A
+    # complete-case subset can be selected by failed/missing seeds; the same
+    # rule is already enforced by reportable_claim/scale_interaction, and
+    # applied here so every consumer of `significant` inherits it.
     significant = bool(math.isfinite(p) and p < alpha
                        and (not within_seed_noise)
                        and (not underpowered)
-                       and (not resolution_limited))
+                       and (not resolution_limited)
+                       and complete_pairs)
     # Two-sided 95% CI on the paired mean (t interval; the normal approximation
     # is intentionally avoided at the 3-5 seed counts this repo reports).
     ci_lo = ci_hi = float('nan')
@@ -407,7 +413,11 @@ def paired_effect_stats(deltas, alpha=0.05, min_n=3, with_values=None, without_v
             _full_sign = 1.0 if mean > 0 else -1.0
             seed_driven = any((_m == 0.0) or ((_m > 0) != (_full_sign > 0)) for _m in loo_means)
     seed_robust = None if seed_driven is None else (not seed_driven)
-    if underpowered:
+    if not complete_pairs:
+        verdict = ('incomplete paired panel (%d of %d deltas non-finite); '
+                   'the surviving subset is not a confirmatory result'
+                   % (n_dropped, n_input))
+    elif underpowered:
         verdict = 'underpowered (n<%d)' % min_n
     elif within_seed_noise:
         verdict = 'effect within seed noise (|mean|<=std)'
@@ -438,7 +448,7 @@ def paired_effect_stats(deltas, alpha=0.05, min_n=3, with_values=None, without_v
     # to the confirmatory statistics, but never gate a verdict on them (that
     # would turn a model-based extrapolation into a new decision rule).
     _pred = new_seed_replication(d)
-    return {'n': n, 'mean': mean, 'std': std, 'std_defined': std_defined, 'sem': sem, 'cohens_dz': dz, 'ci95_low': ci_lo, 'ci95_high': ci_hi, 'loo_means': loo_means, 'seed_driven': seed_driven, 'seed_robust': seed_robust, 'p_exact_signflip': float(p), 'p_floor': p_floor, 'min_reachable_p': p_floor, 'underpowered': underpowered, 'resolution_limited': resolution_limited, 'within_seed_noise': within_seed_noise, 'significant': significant, 'effect_vs_noise': verdict,
+    return {'n': n, 'mean': mean, 'std': std, 'std_defined': std_defined, 'sem': sem, 'cohens_dz': dz, 'ci95_low': ci_lo, 'ci95_high': ci_hi, 'loo_means': loo_means, 'seed_driven': seed_driven, 'seed_robust': seed_robust, 'p_exact_signflip': float(p), 'p_floor': p_floor, 'min_reachable_p': p_floor, 'underpowered': underpowered, 'resolution_limited': resolution_limited, 'within_seed_noise': within_seed_noise, 'significant': significant, 'incomplete_pairs': (not complete_pairs), 'effect_vs_noise': verdict,
             'unit': 'seed', 'assumption': _assumption, 'sign_counts': _sign,
             'n_nonzero': n_nonzero,
             'p_wilcoxon': _wil.get('p'), 'p_wilcoxon_method': _wil.get('method'),
