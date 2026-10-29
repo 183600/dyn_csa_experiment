@@ -161,7 +161,7 @@ def audit_single_factor(manifest_path=None):
     out = {'status': 'ok', 'design': {}, 'open_block_matrix': {},
            'sweep_contrasts': {}, 'v7_contrasts': {}, 'niah_contrasts': {},
            'frozen_manifest': {}, 'factorial_design': {},
-           'content_controls': {}}
+           'content_controls': {}, 'sink_controls': {}}
     design_rep = L.single_factor_design_audit(verbose=False)
     out['design'] = design_rep
     ob_rep = L.open_block_matrix_audit(verbose=False)
@@ -170,9 +170,12 @@ def audit_single_factor(manifest_path=None):
     out['factorial_design'] = fact_rep
     ctrl_rep = L.content_control_audit()
     out['content_controls'] = ctrl_rep
+    sink_rep = L.sink_control_audit()
+    out['sink_controls'] = sink_rep
     if (design_rep.get('status') != 'ok' or ob_rep.get('status') != 'ok'
             or fact_rep.get('status') != 'ok'
-            or ctrl_rep.get('status') != 'ok'):
+            or ctrl_rep.get('status') != 'ok'
+            or sink_rep.get('status') != 'ok'):
         out['status'] = 'fail'
     # v9/v10 attach a `single_factor`/`factors` label to each seq2k paired
     # record.  Verify that label against the actual arm construction instead of
@@ -310,6 +313,21 @@ def audit_content_controls():
     """
     L = _import_exp_lib()
     out = L.content_control_audit()
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return out
+
+
+def audit_sink_controls():
+    """Attention-sink control-ladder audit (zero GPU, design point).
+
+    Checks that the sink ablation has a capacity-matched frozen-random placebo
+    in addition to the on/off absence control, that every ladder arm is
+    scheduled, that the placebo differs from the treatment in exactly
+    ``sink_mode`` with identical total/sink parameter counts and frozen
+    placebo parameters, and that both leave-one-out families are declared.
+    """
+    L = _import_exp_lib()
+    out = L.sink_control_audit()
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return out
 

@@ -487,6 +487,17 @@ CHUNK_SIGNAL_SOURCES = ('auto', 'context', 'fused')
 #            content helps" from "block-aligned content carries information".
 CONTENT_MODES = ('pooled', 'zero', 'shift')
 
+# Sink controls: `learned` is the treatment (a trainable per-head logit).
+# `random` keeps the SAME parameter shape/count but replaces the learned value
+# with a fixed pseudo-random vector and freezes it.  It therefore separates "a
+# learned sink absorbs off-context mass" from "the extra sink
+# parameter/capacity helps".  The vector is drawn from a LOCAL generator seeded
+# by a hash of the layer's initialized W_q: it consumes no global RNG, so the
+# two arms keep the same initialization for every other tensor (pair_reason's
+# init_core_fp and the per-layer W_q stay matched), while the placebo values
+# are not aligned with the layer's query directions.
+SINK_MODES = ('learned', 'random')
+
 
 def _shift_block_content(table):
     """Move each row of a block-content table back by one block.
@@ -546,6 +557,7 @@ class AttnCfg:
     content_mode: str = 'pooled'
     use_sink: bool = True
     full_sink: bool = False
+    sink_mode: str = 'learned'
     fuse_mode: str = 'none'
     fuse_kernel: int = 5
     # 'threshold' uses hard-cut decisions.  'reinforce'
@@ -576,6 +588,18 @@ class AttnCfg:
             raise ValueError(
                 f'unknown content_mode {self.content_mode!r}; expected one of '
                 f'{CONTENT_MODES}')
+        if self.sink_mode not in SINK_MODES:
+            raise ValueError(
+                f'unknown sink_mode {self.sink_mode!r}; expected one of '
+                f'{SINK_MODES}')
+        _sink_active = (self.full_sink if self.kind == 'full'
+                        else self.use_sink)
+        if self.sink_mode == 'random' and not _sink_active:
+            raise ValueError(
+                'sink_mode="random" requires the sink to be active for this '
+                'layer kind (use_sink for csa/hca, full_sink for full); the '
+                'absence control must use sink_mode="learned" with the sink '
+                'disabled')
         if self.open_block_mode not in OPEN_BLOCK_MODES:
             raise ValueError(f'unknown open_block_mode {self.open_block_mode!r}; expected one of {OPEN_BLOCK_MODES}')
         if self.open_block_scope not in OPEN_BLOCK_SCOPES:
@@ -687,7 +711,7 @@ class HybridAttention(nn.Module):
             nn.init.xavier_uniform_(self.W_v.weight)
             self.W_aKV = None
             self.W_kvhead = None
-            self.sink = nn.Parameter(torch.zeros(n_heads)) if cfg.full_sink else None
+            self.sink = self._make_sink(n_heads)
             return
         self.W_aKV = nn.Parameter(torch.empty(d_model, self.kv_dim))
         self.W_kvhead = nn.Linear(self.kv_dim, 2 * n_heads * d_head, bias=False)
@@ -700,7 +724,7 @@ class HybridAttention(nn.Module):
             self.W_bZ = None
             self.W_aZ = nn.Parameter(torch.empty(d_model, self.kv_dim))
             self.B_pos_a = nn.Parameter(torch.zeros(int(cfg.position_capacity()), self.kv_dim))
-            self.sink = nn.Parameter(torch.zeros(n_heads)) if getattr(cfg, 'use_sink', True) else None
+            self.sink = self._make_sink(n_heads)
             nn.init.xavier_uniform_(self.W_aZ)
             if cfg.chunking == 'cosine_learnable':
                 Tc = max(cfg.temperature, 0.001)
@@ -714,7 +738,7 @@ class HybridAttention(nn.Module):
         self.W_bZ = nn.Parameter(torch.empty(d_model, self.kv_dim))
         self.B_pos_a = nn.Parameter(torch.zeros(int(cfg.position_capacity()), self.kv_dim))
         self.B_pos_b = nn.Parameter(torch.zeros(int(cfg.position_capacity()), self.kv_dim))
-        self.sink = nn.Parameter(torch.zeros(n_heads)) if getattr(cfg, 'use_sink', True) else None
+        self.sink = self._make_sink(n_heads)
         self.W_DQ = nn.Parameter(torch.empty(d_model, cfg.c_index))
         self.W_DK = nn.Parameter(torch.empty(self.kv_dim, cfg.c_index))
         self.W_w = nn.Linear(d_model, cfg.n_index_heads, bias=False)
@@ -727,6 +751,34 @@ class HybridAttention(nn.Module):
         for p in [self.W_bKV, self.W_aZ, self.W_bZ, self.W_DQ, self.W_DK]:
             nn.init.xavier_uniform_(p)
         nn.init.xavier_uniform_(self.W_w.weight)
+
+    def _make_sink(self, n_heads):
+        """Learned or frozen-random sink parameter with identical shape.
+
+        The random placebo is drawn from a local generator whose seed is a
+        hash of the layer's initialized W_q.  It therefore consumes no global
+        RNG (constructing the placebo does not shift the initialization of any
+        later tensor) and its values are not aligned with the layer's query
+        directions.  That is what makes it a capacity-matched *placebo* rather
+        than a different model.
+        """
+        active = self.cfg.full_sink if self.cfg.kind == 'full' else getattr(self.cfg, 'use_sink', True)
+        if not active:
+            return None
+        if self.cfg.sink_mode == 'learned':
+            return nn.Parameter(torch.zeros(n_heads))
+        with torch.no_grad():
+            _w = self.W_q.weight.detach()
+            _bytes = _w.to('cpu').float().contiguous().numpy().tobytes()
+            _seed = int.from_bytes(hashlib.sha256(_bytes).digest()[:8], 'big')
+            _gen = torch.Generator(device='cpu')
+            _gen.manual_seed(_seed)
+            _base = torch.randn(int(n_heads), generator=_gen, dtype=torch.float32)
+            if not torch.isfinite(_base).all() or float(_base.norm()) == 0.0:
+                _base = torch.linspace(-1.0, 1.0, int(n_heads))
+            _base = _base / _base.norm() * math.sqrt(int(n_heads))
+            _base = _base.to(dtype=_w.dtype)
+        return nn.Parameter(_base, requires_grad=False)
 
     def _fuse(self, x):
         if self.fuse_conv is None:

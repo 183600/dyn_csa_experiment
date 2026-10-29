@@ -898,6 +898,16 @@ ABLATION_DESIGN = {
         ('csa_dynamic', 'csa_dyn_nosink', 'sink on vs off (dynamic blocking)'),
         ('full_sink', 'full', 'sink on vs off (dense control)'),
     ],
+    # On/off changes BOTH whether there is a trained sink and whether the extra
+    # sink parameter exists.  The capacity-matched placebo keeps the same
+    # parameter shape/count/read budget but freezes a fixed, non-learned sink
+    # vector, so `treatment - placebo` isolates the *learned* component while
+    # `treatment - absent` remains the total (mechanism + capacity) effect.
+    'attention_sink_learning': [
+        ('csa_fixed', 'csa_fix_randomsink', 'learned sink vs frozen random sink (fixed blocking); parameter-matched placebo'),
+        ('csa_dynamic', 'csa_dyn_randomsink', 'learned sink vs frozen random sink (dynamic blocking); parameter-matched placebo'),
+        ('full_sink', 'full_randomsink', 'learned sink vs frozen random sink (dense control); parameter-matched placebo'),
+    ],
     'compression_regularizer': [
         ('csa_dynamic', 'csa_dyn_nocomp', 'compression regularizer on vs off (dynamic blocking; the loss-term ablation; note this also freezes delta_logit because comp_reg was its only gradient source)'),
     ],
@@ -996,6 +1006,25 @@ FACTORIAL_DESIGN = {
         'note': ('Both a sink and adaptive blocks can absorb off-context mass; '
                  'the interaction asks whether their benefits overlap.'),
     },
+    # The on/off interaction above cannot say whether a *learned* sink is what
+    # overlaps with adaptive boundaries, because on/off also changes capacity.
+    # This factorial uses the frozen-random placebo at both blocking levels, so
+    # the second axis is learned-vs-placebo at identical parameter count.
+    'dynamic_blocking_x_attention_sink_learning': {
+        'factors': ('dynamic_blocking', 'attention_sink_learning'),
+        'levels': {'dynamic_blocking': ('fixed', 'dynamic'),
+                   'attention_sink_learning': ('random', 'learned')},
+        'cells': {
+            ('control', 'control'): 'csa_fix_randomsink',
+            ('active', 'control'): 'csa_dyn_randomsink',
+            ('control', 'active'): 'csa_fixed',
+            ('active', 'active'): 'csa_dynamic',
+        },
+        'hypothesis': 'dynamic_blocking_x_attention_sink_learning',
+        'note': ('Does the learned-sink advantage over an identical-capacity '
+                 'frozen placebo shrink once boundaries are adaptive?  The '
+                 'comparison is capacity-matched on both axes.'),
+    },
 }
 
 # ---- 预先注册的最小实际效应量（SESOI）------------------------------------
@@ -1032,6 +1061,12 @@ ABLATION_SESOI = {
     'attention_sink': {
         'relative_pct': 1.0,
         'rationale': 'A sink contribution below 1% PPL is treated as practically removable at this study scale.',
+    },
+    'attention_sink_learning': {
+        'relative_pct': 1.0,
+        'rationale': ('A learned sink that does not beat the same-shape frozen '
+                      'random sink by >=1% PPL is treated as an extra-capacity '
+                      'effect rather than evidence for a learned sink mechanism.'),
     },
     'compression_regularizer': {
         'relative_pct': 1.0,
@@ -1088,6 +1123,12 @@ INTERACTION_SESOI = {
         'rationale': ('A sink benefit that changes by <1% of its ratio-of-ratios '
                       'across blocking regimes is treated as practically additive.'),
     },
+    'dynamic_blocking_x_attention_sink_learning': {
+        'relative_pct': 1.0,
+        'rationale': ('A learned-sink advantage over the identical-capacity '
+                      'frozen placebo that changes by <1% of its ratio-of-ratios '
+                      'across blocking regimes is treated as practically additive.'),
+    },
 }
 
 # ---- 交互覆盖范围：留一法不能替代 2x2 --------------------------------------
@@ -1111,6 +1152,13 @@ INTERACTION_SCOPE = {
                       'dynamic blocking: aligned vs shifted content must be '
                       'compared under both boundary regimes, not only under '
                       'the fixed-block reference.'),
+    },
+    'attention_sink_learning_control': {
+        'factors': ('dynamic_blocking', 'attention_sink_learning'),
+        'rationale': ('The capacity-matched sink placebo has its own 2x2 '
+                      'against dynamic blocking, so the learned-vs-placebo '
+                      'interaction is not inferred from the on/off factorial '
+                      'that also changes parameter count.'),
     },
     'core_dynamic_modules': {
         'factors': ('dynamic_blocking', 'learned_selection',
@@ -1228,6 +1276,11 @@ ABLATION_INTERVENTION_KEYS = {
         ('csa_dynamic', 'csa_dyn_nosink'): frozenset({'use_sink'}),
         ('full_sink', 'full'): frozenset({'full_sink'}),
     },
+    'attention_sink_learning': {
+        ('csa_fixed', 'csa_fix_randomsink'): frozenset({'sink_mode'}),
+        ('csa_dynamic', 'csa_dyn_randomsink'): frozenset({'sink_mode'}),
+        ('full_sink', 'full_randomsink'): frozenset({'sink_mode'}),
+    },
     'compression_regularizer': {
         ('csa_dynamic', 'csa_dyn_nocomp'): frozenset({'comp_lambda_mult'}),
     },
@@ -1300,6 +1353,7 @@ SINGLE_FACTOR_CFG_FAMILIES = (
     frozenset({'use_sink'}),
     frozenset({'full_sink'}),
     frozenset({'content_mode'}),
+    frozenset({'sink_mode'}),
     frozenset({'boundary_policy'}),
     frozenset({'fuse_mode'}),
     frozenset({'comp_lambda_mult'}),

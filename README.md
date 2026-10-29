@@ -492,6 +492,17 @@ machine gates rather than new prose:
   is `equivalent` (positive evidence of removability).  `audit_gates.py sesoi` fails closed if a component has no
   declared margin or the ablation is not fully scheduled.  This is exploratory
   and does not modify the frozen confirmatory manifest.
+- **Capacity-matched ablation placebos**: the sink ablation now has a
+  three-level ladder — learned, frozen-random (same sink shape/count/read
+  budget, drawn from a local RNG seeded by a hash of the layer's own `W_q`
+  without consuming global RNG, parameters frozen) and absent.  `learned - random`
+  isolates the learned component; `learned - absent` remains the total
+  (mechanism + capacity) effect.  `audit_gates.py sink_controls` verifies the
+  exact cfg diff, identical total/sink parameter counts, frozen placebo and
+  the two declared leave-one-out families; a new capacity-matched
+  `dynamic_blocking x attention_sink_learning` 2x2 has its own SESOI.  The
+  on/off contrast can no longer alone support a "learned sink" mechanism claim
+  (design_notes §84).
 - **Single-unit influence**: the pooled ΔPPL now carries an exact
   leave-one-unit-out readout (`doc_sampling.unit_influence`): the most
   influential article/line, the Δ without it, direction stability across all

@@ -1129,6 +1129,15 @@ HYPOTHESIS_DESIGN = {
         'requires_param_match': False,
         'falsifier': 'Removing the sink does not increase PPL beyond seed noise, or improves it.',
     },
+    'attention_sink_learning': {
+        'statement': 'A learned attention sink lowers validation PPL versus an identical-shape frozen random sink at the same parameter count, read budget and initialization stream.',
+        'mechanism': 'The learned sink adapts its per-head off-context logit to the training distribution; a frozen random sink of the same capacity cannot adapt, so a gain isolates the learned component from mere extra parameters.',
+        'predicted_sign': -1,
+        'primary_metric': 'ppl',
+        'metric_policy': 'lm_perplexity',
+        'requires_param_match': True,
+        'falsifier': 'The frozen random sink matches or beats the learned sink after Holm correction, or the difference is within the pre-registered SESOI; then the sink on/off contrast alone can only support a capacity/regularisation claim, not a learned-sink mechanism.',
+    },
     'compression_regularizer': {
         'statement': 'The compression regularizer lowers validation PPL at the same architecture and optimization setting.',
         'mechanism': 'The loss term discourages degenerate block boundaries and keeps compression from collapsing to fixed chunks.',
@@ -1232,6 +1241,24 @@ INTERACTION_HYPOTHESIS_DESIGN = {
                       'declared interaction-family Holm correction, its sign is '
                       'negative (synergy), or the four cells fail the capacity/'
                       'recipe controls.'),
+    },
+    'dynamic_blocking_x_attention_sink_learning': {
+        'statement': ('The log-PPL benefit of the learned sink over an '
+                      'identical-capacity frozen random sink is smaller under '
+                      'dynamic blocking than under fixed blocking (positive '
+                      'sub-additive interaction).'),
+        'mechanism': ('Adaptive boundaries already absorb part of the '
+                      'off-context mass that the learned sink would otherwise '
+                      'redirect; the learned component therefore adds less.'),
+        'predicted_sign': 1,
+        'primary_metric': 'ppl',
+        'metric_policy': 'lm_perplexity',
+        'requires_param_match': True,
+        'falsifier': ('The interaction is not distinguishable from zero after the '
+                      'declared interaction-family Holm correction, its sign is '
+                      'negative (synergy), or the four cells fail the capacity/'
+                      'recipe controls; a null interaction does not prove '
+                      'additivity without the declared SESOI/TOST decision.'),
     },
 }
 

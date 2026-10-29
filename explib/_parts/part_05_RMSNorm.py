@@ -288,6 +288,8 @@ def make_layer_cfgs(n_layers, variant):
                 cfgs.append(AttnCfg(kind='hca', dynamic=True, chunking='cosine_learnable', target_block_tokens=64, temperature=0.1, comp_lambda_mult=4.0))
         elif variant == 'full_sink':
             cfgs.append(AttnCfg(kind='full', full_sink=True))
+        elif variant == 'full_randomsink':
+            cfgs.append(AttnCfg(kind='full', full_sink=True, sink_mode='random'))
         elif variant == 'hybrid_csa_dyn':
             if i % 2 == 0:
                 cfgs.append(AttnCfg(kind='csa', dynamic=True, chunking='cosine_learnable', target_block_tokens=4, overlap=OVERLAP, index_topk=32, temperature=0.1))
@@ -313,6 +315,8 @@ def make_layer_cfgs(n_layers, variant):
             cfgs.append(AttnCfg(kind='csa', dynamic=False, block_size=4, overlap=OVERLAP, index_topk=32, content_mode='shift'))
         elif variant == 'csa_fix_nosink':
             cfgs.append(AttnCfg(kind='csa', dynamic=False, block_size=4, overlap=OVERLAP, index_topk=32, use_sink=False))
+        elif variant == 'csa_fix_randomsink':
+            cfgs.append(AttnCfg(kind='csa', dynamic=False, block_size=4, overlap=OVERLAP, index_topk=32, sink_mode='random'))
         elif variant == 'csa_fix_topk8':
             cfgs.append(AttnCfg(kind='csa', dynamic=False, block_size=4, overlap=OVERLAP, index_topk=8))
         elif variant == 'csa_fix_topk64':
@@ -325,6 +329,8 @@ def make_layer_cfgs(n_layers, variant):
             cfgs.append(AttnCfg(kind='csa', dynamic=True, chunking='cosine_learnable', target_block_tokens=4, overlap=OVERLAP, index_topk=32, temperature=0.1, content_mode='shift'))
         elif variant == 'csa_dyn_nosink':
             cfgs.append(AttnCfg(kind='csa', dynamic=True, chunking='cosine_learnable', target_block_tokens=4, overlap=OVERLAP, index_topk=32, temperature=0.1, use_sink=False))
+        elif variant == 'csa_dyn_randomsink':
+            cfgs.append(AttnCfg(kind='csa', dynamic=True, chunking='cosine_learnable', target_block_tokens=4, overlap=OVERLAP, index_topk=32, temperature=0.1, sink_mode='random'))
         elif variant == 'csa_dynamic_task':
             # Opt-in end-to-end boundary arm: identical to
             # csa_dynamic except the hard cuts are sampled and trained by the

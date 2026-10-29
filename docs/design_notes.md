@@ -6221,3 +6221,142 @@ make reproduce A=<dir> B=<dir>               # 零 GPU
 fail-closed；批量报告的 `only_*`/`counts`/`not_comparable` 分支；CLI 的
 0/1/2 退出码、`--require exact`、`--json` 落盘，以及 audit 门的
 ok/fail/not_verifiable 与 `_run_cli` 位置参数接线。
+
+## 84. 消融的「模块有用」与「学习有用」是两条主张：同容量随机安慰剂（本轮对比/消融方法硬化）
+
+### 84.1 问题：on/off 消融同时改了两件事
+
+`ABLATION_DESIGN['attention_sink']` 用 `csa_fixed` / `csa_dynamic` /
+`full_sink` 与各自的 `*_nosink` / `full` 比较。这条对照能回答「有 sink 比
+没有 sink 好」，但它同时改变了：
+
+1. **是否存在一个可训练的 per-head sink**；
+2. **是否存在这份额外参数/容量**（每个 sink 张量 `n_heads` 个参数）；
+3. **是否把一份额外的注意力出口交给优化器**。
+
+因此即使 on/off 显著，也不能把原因唯一归给「学到的 sink 吸收了 off-context
+质量」：也可能只是「任何同形状的额外参数」带来的容量/正则化效应。§79 在
+内容轴上用 shift 安慰剂解决了同类问题，但参数化模块（sink、fusion、
+boundary gate）仍只有 on/off 一条读数。§72 给参数匹配基线加了 SESOI，但
+没有给「消融臂自身是否容量匹配」加设计门。
+
+审查里「random/all-blocks 不能隔离机制」「参数/计算/训练状态未同时匹配」
+的同类问题在 sink 轴上仍然存在。
+
+### 84.2 设计：learned / frozen-random / absent 三级阶梯
+
+新增 `AttnCfg.sink_mode`（`learned` / `random`）与三个新臂：
+
+| level | role | sink_mode | 固定分块 | 动态分块 | dense |
+|---|---|---|---|---|---|
+| learned | treatment | `learned` | `csa_fixed` | `csa_dynamic` | `full_sink` |
+| randomized | capacity_placebo | `random` | `csa_fix_randomsink` | `csa_dyn_randomsink` | `full_randomsink` |
+| absent | absence_control | `learned`，`use_sink=False` / `full_sink=False` | `csa_fix_nosink` | `csa_dyn_nosink` | `full` |
+
+`random` 与 `learned` 的 sink 张量形状/数量/总参数量完全相同，读取预算与
+其他 AttnCfg 字段完全相同，唯一差别是 `sink_mode`：
+
+- learned：`nn.Parameter(zeros(n_heads))`，可训练；
+- randomized：以该层已初始化的 `W_q` 的 SHA-256 摘要作种子的**局部**
+  RNG 抽出的 per-head 向量（归一化到 `||v||=sqrt(n_heads)`），
+  `requires_grad=False`。它**不从全局 RNG 抽样**，所以不会移动后续任何
+  张量的初始化流；treatment 与 placebo 的 `W_q`、trunk、`init_core_fp`
+  仍然逐值一致。这一点由单测直接比对 `torch.get_rng_state()` 验证。
+- absent：没有 sink 参数，sink 容量消失。
+
+两条留一对照因此有不同 estimand：
+
+```text
+learned - randomized = 学习成分（容量匹配）
+learned - absent     = 总效应（学习 + 容量）
+randomized - absent  = 容量/正则化成分（机制被破坏，参数仍在）
+```
+
+`attention_sink_learning` 是新增的声明组件，`attention_sink` 保留为总效应
+组件。两者都有独立 SESOI（默认 1%）与方向性假设；`attention_sink_learning`
+的 `requires_param_match=True`。另外新增
+`dynamic_blocking_x_attention_sink_learning` 2×2：在 fixed/dynamic 两个
+分块水平上比较 learned vs frozen-random，回答「学习成分的收益是否随自适应
+分块变小」，且四个 cell 都容量匹配。该交互有独立的 `INTERACTION_SESOI`，
+不进入 on/off 交互族，也不进入冻结确认族。
+
+### 84.3 设计点门：`sink_control_audit()`
+
+新增声明式 `SINK_CONTROL_DESIGN` 与
+`sink_control_audit(design=None, ladder=None, present=None, factory=None,
+n_layers=2)`。它在定义点用真实 `make_layer_cfgs` 构造每个臂，并用 tiny
+`SmallGPT` 统计参数，检查：
+
+1. 三个 role 必须齐全，每个 base（fixed/dynamic/dense）的每个 level 都有
+   一个已排程臂；
+2. 同一 base 的三级不能复用同一个臂；
+3. treatment 必须就是 base；capacity placebo 与 base 的 AttnCfg diff 必须
+   **恰好**是 `sink_mode`，且构造值等于 `random`；
+4. placebo 与 treatment 的 **总参数量、sink 参数量、sink 张量数**完全相等，
+   且 placebo 的 sink 参数 `requires_grad=False`；一个可训练的 placebo 不是
+   placebo；
+5. absent 与 base 的 diff 必须等于声明的缺席键（稀疏臂 `use_sink`，dense
+   臂 `full_sink`），且参数减少量**恰好**等于 treatment 的 sink 参数量；
+   on/off 若顺手改了别的容量，直接 fail；
+6. `ABLATION_DESIGN` 必须同时声明 `attention_sink_learning`（base→random）
+   与 `attention_sink`（base→absent），`ABLATION_INTERVENTION_KEYS` 对前者
+   只允许 `sink_mode`、对后者只允许对应的缺席键；
+7. 缺 level/未排程/复用臂/多旋钮/未冻结/参数不匹配/未声明族，全部
+   fail-closed，不写任何结果文件。
+
+`SINGLE_FACTOR_CFG_FAMILIES` 增加 `{'sink_mode'}`，因此 learned-vs-random
+在单因素门里是一条 knob 级单因素对照；on/off 仍是 `use_sink` /
+`full_sink` 的单因素对照。两者的区别由阶梯声明，而不是靠臂名推断。
+
+### 84.4 分析语义
+
+- `attention_sink_learning` 的预注册方向是 `predicted_sign=-1`（learned 的
+  PPL 更低），SESOI 1%；`HYPOTHESIS_DESIGN` 的 falsifier 明确写成
+  「frozen-random 追平/反超 learned」。
+- 如果只有 on/off 显著、learned-vs-random 不显著，报告只能写「sink
+  容量/存在性有证据」，不能写「学习到的 sink 机制被证实」；如果
+  learned-vs-random 也显著且超过 SESOI，才支持「学习成分有贡献」的更强
+  措辞。
+- `attention_sink` 的 on/off 对照仍然有效，但从此不能单独支撑
+  「learned sink absorbs off-context mass」这类机制句；它需要
+  `attention_sink_learning` 的配套读数。
+- 新组件进入与其它消融相同的族级 Holm、SESOI/TOST、方向一致性、
+  completeness、参数/计算控制与 `all_components_useful_allowed` 门；它不
+  进入冻结确认族，不改变 `confirmation_frozen.json`、种子、α、Holm 规则、
+  P5T 或 `CODE_SEMANTICS`。
+
+### 84.5 边界
+
+- **frozen-random 不是唯一可能的安慰剂。** 它保持形状/范数/参数量/读取
+  预算，只破坏「学习」；它不能排除「任何固定非零 sink 都比零好」这一
+  容量/正则化解释——那正是 `randomized - absent` 的 estimand。
+- **随机向量的种子来自 W_q。** 它确定性、逐层不同、零额外全局 RNG，但
+  不是从任务分布独立抽签；若未来改变 W_q 初始化，placebo 的值也会随之
+  改变。它仍然是「同容量、非学习」的对照，不是「随机噪声」的普遍上界。
+- **特殊数值。** 若抽出的向量非有限或范数为零，helper 回退到固定
+  `linspace` 向量；这是显式约定，不静默变成 learned。
+- **on/off 仍会移除参数。** 因此 `attention_sink` 的 `requires_param_match`
+  仍是 False；把 on/off 结果写成机制证据依然被 §72/参数控制门限制。
+- **新增臂是未来运行的计划，不是已有证据。** 当前仓库不含 `results_*`；
+  加入 `RUN_ABL` 只让下一轮真正训练这三条对照。旧面板没有这些臂时，
+  `ablation_completeness` 会如实报 `attention_sink_learning` 不完整。
+- **未覆盖其它参数化模块。** fusion / boundary gate / dynamic gate 仍只有
+  on/off 或架构级读数；本节的阶梯是 sink 轴的实例，不是「所有模块都已
+  有匹配安慰剂」的全局声明。`interaction_coverage` 会继续把未覆盖的交互
+  报为 missing，而不是可加。
+
+### 84.6 入口与验证
+
+```bash
+python audit_gates.py sink_controls     # 或 sink_placebo
+python audit_gates.py single_factor     # 含 sink_controls 块
+python audit_gates.py report            # 顶层 sink_controls
+python -m pytest -q test_review_part_25.py
+```
+
+新增 `test_review_part_25.py` 5 项：random sink 的同参数量/同 sink 张量数/
+冻结/全局 RNG 中性/确定性/输出不等于 learned 或 off；动态臂的前缀因果性；
+阶梯设计门通过（含参数差恰好等于 sink 参数量、factorial、SESOI、hypothesis
+覆盖）；缺 level/重复 role/未排程/复用臂/多旋钮/缺席臂多改容量/未声明族
+全部 fail-closed；`audit_gates.sink_controls`、`single_factor` 与 `report`
+接线。完整 CPU 套件在本轮为 `661 passed, 3 skipped`（原 656 + 新 5）。

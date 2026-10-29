@@ -81,6 +81,11 @@
                shift（错位、形状/范数/参数量/读取预算匹配）两个对照；
                两者与 base 的 cfg diff 都必须恰好是 content_mode，且
                各自的留一对照已在 ABLATION_DESIGN 声明（零 GPU）
+  sink_controls  消融对照阶梯：sink 消融同时具备 off（缺席）与
+               frozen-random（同形状/同参数量/冻结、只破坏学习）两个
+               对照；learned−random 隔离学习成分，learned−off 是总效应；
+               参数量、冻结状态、cfg diff 与两条留一对照都必须是机器读数
+               （零 GPU）
   design       设计前馈：token/参数/读取预算台账、专用对照臂、证据等级
                 （v6-v11 永远 exploratory；draft 不能 confirmatory）与动态
                 分块 H1-H5 假设/对照（零 GPU，不读 test）

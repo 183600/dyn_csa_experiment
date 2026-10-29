@@ -556,7 +556,7 @@ RUN = dict(seq_len=512, batch_size=12, n_train_tokens=1000000 if QUICK else 8000
 # 的去一法对照；`csa_dyn_*` 是同一组去一法在**动态分块**（主方法）下的对照——
 # 只报固定分块下的去一法无法支撑「该模块在提出的动态方法里各自有用」。两组
 # 都是「与 csa_dynamic / csa_fixed 逐字段同构，仅待验证模块不同」。
-ABL_VARIANTS = ['hybrid_csa_dyn', 'hybrid_hca_dyn', 'csa_dyn_fuse', 'hybrid_csa_dyn_fuse', 'csa_fix_randidx', 'csa_fix_zerocont', 'csa_fix_shiftcont', 'csa_fix_nosink', 'csa_fix_topk8', 'csa_fix_topk64', 'csa_dyn_randidx', 'csa_dyn_zerocont', 'csa_dyn_shiftcont', 'csa_dyn_nosink', 'csa_dyn_nocomp', 'csa_dynamic_task', 'full_sink']
+ABL_VARIANTS = ['hybrid_csa_dyn', 'hybrid_hca_dyn', 'csa_dyn_fuse', 'hybrid_csa_dyn_fuse', 'csa_fix_randidx', 'csa_fix_zerocont', 'csa_fix_shiftcont', 'csa_fix_nosink', 'csa_fix_randomsink', 'csa_fix_topk8', 'csa_fix_topk64', 'csa_dyn_randidx', 'csa_dyn_zerocont', 'csa_dyn_shiftcont', 'csa_dyn_nosink', 'csa_dyn_randomsink', 'csa_dyn_nocomp', 'csa_dynamic_task', 'full_sink', 'full_randomsink']
 # 去一法要成立，「Full」与各「Full−X」臂必须落在**同一个面板**里：ABLATION_DESIGN
 # 的每条对照都靠 pair_reason 在同一 run_cfg 下逐种子配对，methodology_audit 也按
 # 单面板 summary 审计——参照臂不在面板内时该面板只能报「缺臂」，撑不起任何

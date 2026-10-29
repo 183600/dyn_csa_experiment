@@ -410,6 +410,14 @@ python build_report.py        # 从产物重建 REPORT_v7.md（零 GPU）
   （可删的正证据）；部分消融只作描述性读数。`audit_gates.py
   sesoi` 对「缺 margin / 未完整排程」fail-closed。该层只约束探索性消融，
   不改冻结确认清单（详见 docs/design_notes.md §56）。
+- **容量匹配的消融安慰剂**：sink 消融新增三级阶梯——learned、frozen-random
+  （sink 形状/数量/读取预算相同，值以该层已有 `W_q` 的哈希作局部 RNG
+  种子抽取、不消耗全局 RNG、参数冻结）与 absent。`learned−random` 隔离学习成分；
+  `learned−absent` 仍是总效应（机制+容量）。`audit_gates.py sink_controls`
+  核验精确 cfg diff、总/sink 参数量相同、placebo 冻结与两条留一对照声明；
+  新增容量匹配的 `dynamic_blocking × attention_sink_learning` 2×2 独立
+  SESOI。on/off 对照不再能单独支撑「学习到的 sink」机制主张
+  （详见 docs/design_notes.md §84）。
 - **单单元影响**：pooled ΔPPL 新增精确的 leave-one-unit-out 读数
   （`doc_sampling.unit_influence`）：最敏感文章/行、删除它后的 Δ、全部
   LOO 折的方向稳定性、delete-one-unit jackknife 区间/SE 及其与
