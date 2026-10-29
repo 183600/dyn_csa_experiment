@@ -476,6 +476,33 @@ OPEN_BLOCK_SCOPES = ('full_prefix', 'outside_window')
 SELECTION_BUDGETS = ('shared_topk', 'all_closed_plus_prefix')
 POOL_POSITION_POLICIES = ('truncate',)
 CHUNK_SIGNAL_SOURCES = ('auto', 'context', 'fused')
+# Content controls for the compression ablation:
+#   pooled — the block's own pooled content (the treatment);
+#   zero   — no content at all (presence control);
+#   shift  — the SAME pooled content, moved back one block (alignment
+#            control).  `shift` keeps the tensor shape, parameter count,
+#            read budget and (after normalisation) the row norm of `pooled`,
+#            but destroys the correspondence between a block's content and
+#            its own token span.  It therefore separates "any non-zero
+#            content helps" from "block-aligned content carries information".
+CONTENT_MODES = ('pooled', 'zero', 'shift')
+
+
+def _shift_block_content(table):
+    """Move each row of a block-content table back by one block.
+
+    Row 0 has no predecessor and is zeroed (the same value as the zero-content
+    control for that one block); every other row is the previous row.  The
+    transform is strictly causal (row i depends only on rows < i), uses no
+    RNG and consumes no gradients into the current row, so prefix invariance
+    and deterministic replay are preserved.  The result has the same shape,
+    dtype and per-row norm as the input after the caller's normalisation.
+    """
+    if not torch.is_tensor(table) or table.ndim != 2:
+        raise ValueError(f'_shift_block_content expects a 2-D tensor, got {type(table).__name__}')
+    if table.shape[0] <= 1:
+        return torch.zeros_like(table)
+    return torch.cat([table.new_zeros((1, table.shape[1])), table[:-1]], dim=0)
 
 @dataclass
 class AttnCfg:
@@ -545,6 +572,10 @@ class AttnCfg:
             raise ValueError(
                 f'unknown cut_signal_source {self.cut_signal_source!r}; expected '
                 f'one of {CHUNK_SIGNAL_SOURCES}')
+        if self.content_mode not in CONTENT_MODES:
+            raise ValueError(
+                f'unknown content_mode {self.content_mode!r}; expected one of '
+                f'{CONTENT_MODES}')
         if self.open_block_mode not in OPEN_BLOCK_MODES:
             raise ValueError(f'unknown open_block_mode {self.open_block_mode!r}; expected one of {OPEN_BLOCK_MODES}')
         if self.open_block_scope not in OPEN_BLOCK_SCOPES:
@@ -1093,6 +1124,12 @@ class HybridAttention(nn.Module):
         # above is unchanged.  The candidate is a temporary representation of
         # the current block for THIS query, not a future block summary.
         _open_mode = cfg.open_block_mode
+        if cfg.content_mode == 'shift' and _open_mode != 'closed':
+            raise RuntimeError(
+                'content_mode="shift" is defined only for closed blocks; the '
+                'open-block prefix representations have a different candidate '
+                'geometry, so shifting their content would not be a controlled '
+                'content-alignment manipulation')
         _prefix_geo = None
         _prefix_comp = None
         _prefix_kind = None
@@ -1121,6 +1158,11 @@ class HybridAttention(nn.Module):
                 _prefix_kind = 'singletons'
             else:
                 raise ValueError(f'unknown open_block_mode {_open_mode!r}')
+        # The indexer keeps the block's true content; only the attention
+        # K/V source is shifted, so the ablation isolates content alignment
+        # in the read path rather than simultaneously blinding the selector.
+        _attn_comp_kv = (_shift_block_content(comp_kv)
+                         if cfg.content_mode == 'shift' else comp_kv)
         index_kv = comp_kv
         if self._stats is not None:
             # scatter_add of exact integer ones is order-independent (integer
@@ -1153,7 +1195,7 @@ class HybridAttention(nn.Module):
         # Normalizing an all-zero content table is exactly zero (0/eps == 0),
         # so the zero-content ablation keeps the same values.
         core_kv = (torch.zeros_like(comp_kv) if cfg.content_mode == 'zero'
-                   else F.normalize(comp_kv, dim=-1))
+                   else F.normalize(_attn_comp_kv, dim=-1))
         kv_local = F.normalize(Ca_raw, dim=-1)
         if x.device.type == 'cuda':
             # Fused K/V head (CUDA only — see _pre): every output row is a

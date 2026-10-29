@@ -1111,6 +1111,15 @@ HYPOTHESIS_DESIGN = {
         'requires_param_match': False,
         'falsifier': 'Zeroing block content does not increase PPL beyond seed noise.',
     },
+    'content_alignment': {
+        'statement': 'Block-aligned pooled content lowers validation PPL versus the same pooled content shifted one block back, at identical shape, norm, parameter count and read budget.',
+        'mechanism': 'A compressed block key/value is informative only when it summarises the tokens that block actually contains; content from another block is a matched-magnitude placebo.',
+        'predicted_sign': -1,
+        'primary_metric': 'ppl',
+        'metric_policy': 'lm_perplexity',
+        'requires_param_match': False,
+        'falsifier': 'The shifted-content control matches or beats aligned content after Holm correction, or the difference is within the pre-registered SESOI; then the zero-content contrast alone cannot support a content-information claim.',
+    },
     'attention_sink': {
         'statement': 'An attention sink lowers validation PPL by giving off-context probability mass a stable destination.',
         'mechanism': 'The sink absorbs attention that would otherwise be forced onto unrelated blocks, reducing normalization pressure.',
@@ -1182,6 +1191,23 @@ INTERACTION_HYPOTHESIS_DESIGN = {
         'mechanism': ('Adaptive cuts make blocks more internally homogeneous, '
                       'so the information lost by collapsing a block into one '
                       'summary is smaller than under fixed blocks.'),
+        'predicted_sign': 1,
+        'primary_metric': 'ppl',
+        'metric_policy': 'lm_perplexity',
+        'requires_param_match': True,
+        'falsifier': ('The interaction is not distinguishable from zero after the '
+                      'declared interaction-family Holm correction, its sign is '
+                      'negative (synergy), or the four cells fail the capacity/'
+                      'recipe controls.'),
+    },
+    'dynamic_blocking_x_content_alignment': {
+        'statement': ('The log-PPL benefit of block-aligned over shifted content '
+                      'is smaller under dynamic blocking than under fixed '
+                      'blocking (positive sub-additive interaction).'),
+        'mechanism': ('Adaptive cuts make a block more internally homogeneous, '
+                      'so replacing its content with the previous block\'s '
+                      'content destroys less of the block-specific signal than '
+                      'it does under fixed blocks.'),
         'predicted_sign': 1,
         'primary_metric': 'ppl',
         'metric_policy': 'lm_perplexity',

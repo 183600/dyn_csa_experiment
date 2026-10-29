@@ -73,6 +73,10 @@
                diff/共享 override 对账；冻结清单的 mechanism_claim_allowed
                标志与实际臂配置 diff 一致
                （零 GPU）
+  content_controls  消融对照阶梯：内容消融同时具备 zero（存在性）与
+               shift（错位、形状/范数/参数量/读取预算匹配）两个对照；
+               两者与 base 的 cfg diff 都必须恰好是 content_mode，且
+               各自的留一对照已在 ABLATION_DESIGN 声明（零 GPU）
   design       设计前馈：token/参数/读取预算台账、专用对照臂、证据等级
                 （v6-v11 永远 exploratory；draft 不能 confirmatory）与动态
                 分块 H1-H5 假设/对照（零 GPU，不读 test）

@@ -43,6 +43,7 @@ _PARTS = [
 'part_33_plot.py',
 'part_34_dump_aggregate.py',
 'part_35_run_allocation.py',
+'part_36_ablation_controls.py',
 ]
 
 for _part in _PARTS:

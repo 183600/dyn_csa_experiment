@@ -3275,3 +3275,53 @@ not_verifiable。现有 `run_order`/`evaluation_order` 测试保持通过；
 `python audit_gates.py run_allocation` 在当前无结果目录的仓库报
 `not_verifiable_locally` 而不是假绿；`python -m explib.confirmation plan`
 的冻结计划/比较数不变。
+
+## 2026-10-29 — 内容消融的匹配安慰剂：对齐 vs 存在（本轮消融方法硬化，no new runs）
+
+零 GPU 的设计/代码硬化；不新增训练、不读取 test split、不修改冻结清单的
+字节/种子/端点/alpha/Holm 规则，也不改 `CODE_SEMANTICS`。
+
+**Problem.** 内容消融只有 `zero` 对照（`csa_fix_zerocont` /
+`csa_dyn_zerocont`）。它同时改变了「有没有内容」「内容是否与本块对齐」
+和「行范数」三件事，因此 zero 变差不能唯一归因于「块内容携带了本块
+信息」：任何非零 K/V、尺度或与位置无关的偏置都可能产生同样的 PPL 差。
+在审查语境里，这就是「没有匹配安慰剂」的机制过度解释；现有 2×2 交互只
+覆盖 dynamic_blocking × 三个组件，不回答内容对齐。
+
+**Fix.** 新增 `content_mode='shift'` 与 `csa_fix_shiftcont` /
+`csa_dyn_shiftcont`：保留 pooled 内容的形状、参数、读取预算和归一化
+范数，只把每个块的内容换成前一块的内容（block 0 置零）。eager 单行、
+CUDA batched ref 与 kernel 路径都走同一语义；indexer 仍读真实内容，只
+改变注意力读取的 K/V。该变换严格因果、无 RNG，前缀不变性保持；shift +
+open-block prefix 直接拒绝而不是静默变成另一种操作。新增
+`ABLATION_DESIGN['content_alignment']`、`ABLATION_INTERVENTION_KEYS`、
+`HYPOTHESIS_DESIGN`、`ABLATION_SESOI` 与 `RUN_ABL` 排程，构成
+aligned / misaligned / absent 三级对照；并复用这四个臂新增
+`dynamic_blocking_x_content_alignment` 2×2（aligned vs shifted × fixed vs
+dynamic），交互方向预注册为 +1、独立 SESOI 与 `INTERACTION_SCOPE` 条目，
+回答「动态分块使块更同质后，对齐收益是否变小」。新增
+`CONTENT_CONTROL_DESIGN` + `exp_lib.content_control_audit()`：用真实
+`make_layer_cfgs` 检查每级都有已排程臂、三级不复用臂、非 aligned 级与
+base 的 cfg diff 恰好是 `content_mode` 且值匹配、两个留一对照都在
+`ABLATION_DESIGN` 中声明；`audit_gates.py single_factor` 新增
+`content_controls` 块，并提供 CLI `content_controls` /
+`control_ladder` / `content_alignment` 与 `report` 顶层键；
+`factorial` / `interaction_sesoi` 会自动覆盖新的 2×2。
+
+**Boundary.** shift 不是完美安慰剂：相邻块在自然文本中仍可能语义相关，
+shift≈pooled 只能说明本设计分辨率下未检出对齐效应；跨文档打乱、随机
+投影、参数匹配随机内容等更强对照未实现。首个块无前驱，按 zero 处理，
+是显式约定。indexer 仍看真实内容，因此该对照不能被解释成「选择器也
+不看内容」的联合消融。新增臂是下一轮运行的排程，不是已有证据；旧面板
+没有这些臂时 `content_alignment` 会被如实标为不完整。该改动不改变任何
+PPL、种子、终点、α/Holm、冻结决定或 `CODE_SEMANTICS`。
+
+**Verification.** `python -m pytest -q` 通过 `608 passed, 3 skipped`（新增
+`test_review_part_16.py` 8 项：shift 因果/范数/梯度、单行/批量/3-D 索引
+对拍、参数量不变但前向改变、prefix 因果、未知 mode/open-block 组合
+fail-closed、eager 与 kernel ref 逐值对拍、控制阶梯缺 level/复用臂/多旋钮/
+未排程/坏模式 fail、`single_factor`/`report`/CLI 接线）。`python
+audit_gates.py content_controls` 与
+`python audit_gates.py single_factor` 在当前仓库均为 `ok`；
+`python audit_gates.py report` 正常写出；`python -m explib.confirmation
+plan` 的冻结计划/比较数不受影响。

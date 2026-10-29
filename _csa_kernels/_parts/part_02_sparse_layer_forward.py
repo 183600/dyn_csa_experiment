@@ -4,6 +4,53 @@
 # HybridAttention 的稀疏内核路径（exp_lib.forward 的批量分发放到这里，
 # eager 路径零改动）
 # ============================================================================
+def _shift_content_batched(comp, counts_rows, batch, n_blocks_max):
+    """Previous-block content for the batched/kernel path.
+
+    `comp` is either the flat [batch * n_blocks_max, d] pooled table or the
+    batched [batch, n_blocks_max, d] table.  For each row (batch element),
+    block i receives block i-1's content; block 0 is zero.  Padded rows beyond
+    that row's real block count are zero.  This is the batched twin of
+    ``exp_lib._shift_block_content``; it uses only integer indexing (no RNG)
+    so it stays deterministic and causal.
+    """
+    import torch
+    if comp.ndim not in (2, 3):
+        raise ValueError('comp must be a 2-D flat or 3-D batched block table')
+    B = int(batch)
+    if comp.ndim == 3:
+        Bm = int(comp.shape[1])
+    else:
+        Bm = int(n_blocks_max)
+        if comp.shape[0] != B * Bm:
+            raise ValueError(
+                'flat comp must have exactly batch * n_blocks_max rows')
+    if B <= 0 or Bm <= 0:
+        return torch.zeros_like(comp)
+    if len(counts_rows) != B:
+        raise ValueError('counts_rows must describe exactly one row per batch element')
+    # Per-batch block counts; a row can have fewer real blocks than Bm.
+    n_real = [int(len(c)) for c in counts_rows]
+    if comp.ndim == 3:
+        out = torch.zeros_like(comp)
+        for b, n in enumerate(n_real):
+            n = min(max(n, 0), Bm)
+            if n > 1:
+                out[b, 1:n] = comp[b, 0:n - 1]
+        return out
+    dev = comp.device
+    rows = torch.arange(Bm, device=dev)
+    counts = torch.as_tensor(n_real, dtype=torch.long, device=dev)
+    src_rows = (rows - 1).clamp(min=0)
+    offset = torch.arange(B, device=dev).reshape(B, 1) * Bm
+    src_idx = (src_rows.reshape(1, Bm) + offset).reshape(-1)
+    valid = ((rows.reshape(1, Bm) >= 1)
+             & (rows.reshape(1, Bm) < counts.reshape(B, 1))).reshape(-1)
+    out = comp.index_select(0, src_idx.clamp(max=comp.shape[0] - 1))
+    out = torch.where(valid.reshape(-1, 1), out,
+                      torch.zeros_like(out))
+    return out
+
 
 def sparse_layer_forward(attn, x, pre_all, gate_sigs, pre_blocks, impl=None):
     """csa/hca 层的批量化内核前向（对应 eager 的 forward 稀疏分支 + _single）。
@@ -119,10 +166,14 @@ def sparse_layer_forward(attn, x, pre_all, gate_sigs, pre_blocks, impl=None):
     else:
         comp, last_tok, _Bn = pool_variable_blocks_kernel(Ca, pre_all['Cb'], Za, pre_all['Zb'], bid_full, geom,
                                                           attn.B_pos_a, attn.B_pos_b, impl=impl_pool)
-    # Same value as normalizing the zero table (0/eps == 0) for the
-    # zero-content ablation.
+    # The indexer below keeps the true block content; only the attention
+    # K/V source follows the declared content control.  Normalising the
+    # zero-content table is exactly zero (0/eps == 0), so the zero arm keeps
+    # the same values it had before this control ladder was added.
+    _attn_comp = (_shift_content_batched(comp, counts_rows, B, geom.Bm)
+                  if cfg.content_mode == 'shift' else comp)
     core_kv = (torch.zeros_like(comp) if cfg.content_mode == 'zero'
-               else F.normalize(comp, dim=-1))
+               else F.normalize(_attn_comp, dim=-1))
     kv_local = F.normalize(Ca, dim=-1)
     Bm = geom.Bm
     kv = core_kv.shape[-1]

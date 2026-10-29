@@ -681,7 +681,7 @@ def run_smoke():
     # sink off, learned local fusion, the HCA layer kind, and the dense
     # sink control) — otherwise a broken ablation arm would only surface
     # after the full panels.
-    smoke_cfg = dict(L.RUN, outdir='results_smoke', variants=['full', 'csa_fixed', 'hybrid_dynamic', 'csa_dyn_randidx', 'csa_dyn_zerocont', 'csa_dyn_nosink', 'csa_dyn_nocomp', 'csa_dyn_fuse', 'hybrid_hca_dyn', 'full_sink'], steps=60, eval_every=30, n_train_tokens=1000000, seeds=[0])
+    smoke_cfg = dict(L.RUN, outdir='results_smoke', variants=['full', 'csa_fixed', 'hybrid_dynamic', 'csa_dyn_randidx', 'csa_dyn_zerocont', 'csa_dyn_shiftcont', 'csa_fix_shiftcont', 'csa_dyn_nosink', 'csa_dyn_nocomp', 'csa_dyn_fuse', 'hybrid_hca_dyn', 'full_sink'], steps=60, eval_every=30, n_train_tokens=1000000, seeds=[0])
     run_overfit(cfg=smoke_cfg, variants=['full', 'csa_fixed', 'csa_dynamic', 'hybrid_dynamic', 'hybrid_hca_dyn', 'csa_dyn_nocomp'], steps=250)
     L.run(smoke_cfg, seeds=[0], guard=None, label='SMOKE (60 steps)', par=False)
     _sp = os.path.join('results_smoke', 'summary.json')

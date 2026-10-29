@@ -5670,3 +5670,139 @@ ok/fail/not_verifiable/fail/not_verifiable/not_verifiable；审计入口与
 `report`/CLI 接线；以及「无计划、无事件、无环境记录」的空目录明确报
 `not_verifiable_locally` 而不是假绿。现有 `run_order` /
 `evaluation_order` 审计的语义与测试保持不变。
+
+## 79. 消融对照也要有「匹配的安慰剂」：内容对齐 vs 内容存在（本轮消融方法硬化）
+
+### 79.1 问题：zero-content 同时改了两个东西
+
+`ABLATION_DESIGN['content_pooling']` 用 `csa_fix_zerocont` /
+`csa_dyn_zerocont` 与各自的全臂比较。这个对照能回答「有内容 vs 没内容」，
+但 zero 同时改变了：
+
+1. **是否存在内容**（非零张量变成全零）；
+2. **内容是否与自己的块对齐**（本来汇总的是本块 token，zero 没有任何块
+   对应关系）；
+3. **行的范数/尺度**（zero 行范数为 0，pooled 归一化后为 1）。
+
+因此即使 pooled 明显更好，也不能把原因唯一归给「块内容携带了本块信息」：
+也可能是「任何非零 K/V、任何与位置无关的偏置、或归一化尺度」带来的。
+审查里「random/all-blocks 不能隔离机制」的同类问题在内容轴上仍然存在。
+现有 2×2 交互只覆盖 dynamic_blocking × 另外三个组件，不回答内容对齐。
+
+### 79.2 设计：保留全部非机制属性的 shift 安慰剂
+
+新增 `content_mode='shift'` 与两个臂 `csa_fix_shiftcont` /
+`csa_dyn_shiftcont`。它们的构造与对应全臂逐字段相同，只把 `content_mode`
+从 `pooled` 改成 `shift`：
+
+```
+attention content (block i) = pooled content (block i-1),  i > 0
+                            = 0,                            i = 0
+```
+
+- **匹配**：张量形状、参数数量、读取预算、归一化后的行范数都与 pooled
+  相同（除首个块无前驱，按 zero 处理）；`indexer` 仍读取真实 `comp_kv`，
+  所以只改变注意力读取的内容，不把选择器一起致盲。
+- **因果**：第 i 行只依赖第 <i 行；不消耗 RNG、无未来信息。前缀不变性
+  因此保持（单测直接验证 prefix logits）。
+- **不是「随机噪声」**：固定、可复现、可解释；它保留内容的分布与范数，
+  只破坏「内容属于本块」这一个属性。若 shift ≈ pooled，说明内容是否对齐
+  不重要；若 shift ≈ zero，说明 pooled 的收益来自非零内容/尺度而非信息。
+
+`content_pooling`（presence）与 `content_alignment`（alignment）两个组件
+共享同一组 full 参照臂，因此可以并列报告「存在性」与「对齐性」两条对照，
+而不是把一条 zero 对照解释成两条主张。
+
+两者还各自有 `dynamic_blocking × content` 的 2×2：
+`dynamic_blocking_x_content_pooling` 使用 aligned vs zero，
+`dynamic_blocking_x_content_alignment` 使用 aligned vs shifted。后者全部
+复用已有四臂，不新增训练预算，回答「动态分块使块更同质之后，内容对齐的
+收益是否变小」；两条交互分别进入同一交互 Holm 族，预注册方向都是
+`predicted_sign=+1`（次可加）。`INTERACTION_SCOPE` 为内容对齐单独声明范围，
+因此覆盖审计既不会把它误算成核心选择/池化/汇点族的一员，也不会把「未测
+核心交互」与「对齐交互已测」混为一谈。
+
+### 79.3 设计点门：`content_control_audit()`
+
+新增声明式阶梯 `exp_lib.CONTENT_CONTROL_DESIGN`：
+
+| level | role | content_mode | fixed / dynamic arms |
+|---|---|---|---|
+| aligned | treatment | pooled | `csa_fixed` / `csa_dynamic` |
+| misaligned | alignment_placebo | shift | `csa_fix_shiftcont` / `csa_dyn_shiftcont` |
+| absent | presence_control | zero | `csa_fix_zerocont` / `csa_dyn_zerocont` |
+
+`content_control_audit(design=None, ladder=None, present=None, factory=None)`
+在定义点用真实 `make_layer_cfgs` 构造每个臂并检查：
+
+1. 三个 role 必须齐全，每个 base 的每个 level 都有一个已排程的臂；
+2. 同一 base 的三个 level 不能复用同一个臂（防止把一个臂改个名字当作
+   独立对照）；
+3. aligned 必须就是 base；misaligned/absent 与 base 的 AttnCfg diff 必须
+   **恰好**是 `content_mode`，且构造出的值等于声明值；多一个
+   `index_topk`/`use_sink` 等旋钮即 fail；
+4. `ABLATION_DESIGN` 必须同时声明 `content_pooling`（base→zero）与
+   `content_alignment`（base→shift），且
+   `ABLATION_INTERVENTION_KEYS` 对两条对照都只允许 `content_mode`；
+5. 任一臂未排程、构造失败或声明模式不在 `CONTENT_MODES` 内都 fail-closed。
+
+该审计接入 `audit_gates.py single_factor` 的 `content_controls` 块，并提供
+CLI `content_controls` / `control_ladder` / `content_alignment` 以及
+`report` 顶层键。`model` 层新增 `CONTENT_MODES` 校验：未知
+`content_mode` 直接 `ValueError`，不再静默走 pooled。
+
+### 79.4 分析语义
+
+- `content_alignment` 的预注册方向与 `content_pooling` 一样是
+  `predicted_sign=-1`（aligned 的 PPL 更低），SESOI 同为 1%；
+  `HYPOTHESIS_DESIGN` 的 falsifier 明确写成「shift 追平/反超 aligned」。
+- aligned vs shift 是**探索性留一对照**；它不进入冻结确认族，不改变
+  `confirmation_frozen.json`、种子、α、Holm 规则或 `CODE_SEMANTICS`。
+- 如果只有 zero 对照显著、shift 对照不显著，报告只能写「内容存在性有
+  证据」，不能写「块内容的信息/对齐机制被证实」；如果 shift 显著且
+  zero 显著，才支持「对齐本身有贡献」的更强措辞。
+- `content_pooling` 的 zero 对照仍然有效，但从此不能单独支撑
+  「compressed content retains token identity」这类机制句；它需要
+  `content_alignment` 的配套读数。
+
+### 79.5 边界
+
+- **shift 不是完美的安慰剂。** 相邻块在自然文本里可能语义相关，shift
+  仍可能保留一部分局部信息；因此 shift≈pooled 不能证明「对齐完全无关」，
+  只能说明在本设计的分辨率下没有检出对齐效应。更强的安慰剂（跨文档
+  打乱、随机投影、参数匹配的随机内容）仍未实现。
+- **首个块没有前驱。** 本实现把 block 0 置零；这是显式约定，不是
+  「无限历史」的近似。若将来做 no-cap 长块，首块占比会变化，应在报告
+  中披露。
+- **indexer 仍看真实内容。** 这使对照更接近「只换注意力读取的内容」，
+  但也意味着不能把结果解释成「选择器也不看内容」的联合消融；需要联合
+  消融时应另设臂，不能复用这一条。
+- **kernel / batched twin 已同步实现。** `_shift_content_batched` 按每行
+  的真实块数做前一块索引，pad 块置零；eager 单行与批量化路径的语义由
+  单测对拍。若未来新增第四条路径，必须复用同一个 `_shift_block_content`
+  语义并加对拍，否则 shift 臂可能在不同后端上变成 pooled。
+- **open-block prefix 不支持 shift。** `open_block_mode != 'closed'` 时
+  前缀候选的几何不同，强行 shift 会改变「当前块表示」而不是内容对齐；
+  实现直接 `RuntimeError`，不静默回退。
+- **新增臂是未来运行的计划，不是已有证据。** 当前仓库不包含
+  `results_*`；加入 `RUN_ABL` 只让下一轮真正训练这两个对照。旧面板没有
+  这两条臂时，`ablation_completeness` 会如实报 `content_alignment`
+  不完整，而不是把旧结果升级成对齐证据。
+
+### 79.6 入口与验证
+
+```bash
+python audit_gates.py content_controls   # 或 control_ladder / content_alignment
+python audit_gates.py single_factor      # 含 content_controls 块
+python audit_gates.py report             # 顶层 content_controls
+python -m pytest -q test_review_part_16.py
+```
+
+新增 `test_review_part_16.py` 8 项：shift 辅助函数的因果/范数/梯度语义、
+单行/批量/3-D 索引对拍、shift 臂参数量不变但前向确实改变、prefix 因果性、
+未知 mode/open-block 组合 fail-closed、eager 与 kernel ref 路径逐值对拍、
+控制阶梯设计门（缺 level、复用臂、多旋钮、未排程、坏 mode 全部 fail）、
+以及 `single_factor`/`report`/CLI 接线。完整 CPU 套件在本轮为
+`608 passed, 3 skipped`；`python
+audit_gates.py report` 正常写出，`content_controls` / `single_factor` 均为
+`ok`，冻结计划预检不受影响。

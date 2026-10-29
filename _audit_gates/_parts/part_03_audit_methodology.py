@@ -160,15 +160,19 @@ def audit_single_factor(manifest_path=None):
     L = _import_exp_lib()
     out = {'status': 'ok', 'design': {}, 'open_block_matrix': {},
            'sweep_contrasts': {}, 'v7_contrasts': {}, 'niah_contrasts': {},
-           'frozen_manifest': {}, 'factorial_design': {}}
+           'frozen_manifest': {}, 'factorial_design': {},
+           'content_controls': {}}
     design_rep = L.single_factor_design_audit(verbose=False)
     out['design'] = design_rep
     ob_rep = L.open_block_matrix_audit(verbose=False)
     out['open_block_matrix'] = ob_rep
     fact_rep = L.factorial_design_audit()
     out['factorial_design'] = fact_rep
+    ctrl_rep = L.content_control_audit()
+    out['content_controls'] = ctrl_rep
     if (design_rep.get('status') != 'ok' or ob_rep.get('status') != 'ok'
-            or fact_rep.get('status') != 'ok'):
+            or fact_rep.get('status') != 'ok'
+            or ctrl_rep.get('status') != 'ok'):
         out['status'] = 'fail'
     # v9/v10 attach a `single_factor`/`factors` label to each seq2k paired
     # record.  Verify that label against the actual arm construction instead of
@@ -292,6 +296,23 @@ def audit_single_factor(manifest_path=None):
 # ---------------------------------------------------------------------------
 # 7e-2) factorial：2x2 交互设计的定义点审计（零 GPU）
 # ---------------------------------------------------------------------------
+
+def audit_content_controls():
+    """Ablation control-ladder audit (zero GPU, design point).
+
+    Checks that the content ablation has BOTH a presence control (zero
+    content) and a matched alignment placebo (the same pooled table shifted
+    one block back), that both are scheduled, that each control differs from
+    its base in exactly ``content_mode``, and that the two leave-one-out
+    families are declared.  A missing/unconstructed control is a failure, not
+    a pass: "content matters" cannot be read from the zero-content contrast
+    alone.
+    """
+    L = _import_exp_lib()
+    out = L.content_control_audit()
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return out
+
 
 def audit_factorial_design(manifest_path=None, *, n_layers=6):
     """2x2 因子交互设计审计（零 GPU、零落盘依赖）。

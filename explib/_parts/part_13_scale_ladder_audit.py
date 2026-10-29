@@ -884,6 +884,15 @@ ABLATION_DESIGN = {
         ('csa_fixed', 'csa_fix_zerocont', 'pooled block content vs zero content (fixed blocking)'),
         ('csa_dynamic', 'csa_dyn_zerocont', 'pooled block content vs zero content (dynamic blocking)'),
     ],
+    # Presence is not alignment.  Zeroing the content changes BOTH whether the
+    # block carries any content and whether that content is aligned with the
+    # block's own tokens.  The shift control keeps the same non-zero content
+    # table, shape and norm but moves each block's content back one block, so
+    # the pair isolates *alignment* from mere presence/magnitude.
+    'content_alignment': [
+        ('csa_fixed', 'csa_fix_shiftcont', 'block-aligned vs previous-block pooled content (fixed blocking); norm-matched misalignment control'),
+        ('csa_dynamic', 'csa_dyn_shiftcont', 'block-aligned vs previous-block pooled content (dynamic blocking); norm-matched misalignment control'),
+    ],
     'attention_sink': [
         ('csa_fixed', 'csa_fix_nosink', 'sink on vs off (fixed blocking)'),
         ('csa_dynamic', 'csa_dyn_nosink', 'sink on vs off (dynamic blocking)'),
@@ -957,6 +966,22 @@ FACTORIAL_DESIGN = {
                  'pooled block content still add as much as it does under fixed '
                  'blocks?'),
     },
+    'dynamic_blocking_x_content_alignment': {
+        'factors': ('dynamic_blocking', 'content_alignment'),
+        'levels': {'dynamic_blocking': ('fixed', 'dynamic'),
+                   'content_alignment': ('misaligned', 'aligned')},
+        'cells': {
+            ('control', 'control'): 'csa_fix_shiftcont',
+            ('active', 'control'): 'csa_dyn_shiftcont',
+            ('control', 'active'): 'csa_fixed',
+            ('active', 'active'): 'csa_dynamic',
+        },
+        'hypothesis': 'dynamic_blocking_x_content_alignment',
+        'note': ('Does block-content alignment still matter once boundaries are '
+                 'adaptive?  Both levels use the same shifted/aligned content '
+                 'tables, so the interaction is measured against the matched '
+                 'placebo rather than against zero content.'),
+    },
     'dynamic_blocking_x_attention_sink': {
         'factors': ('dynamic_blocking', 'attention_sink'),
         'levels': {'dynamic_blocking': ('fixed', 'dynamic'),
@@ -999,6 +1024,10 @@ ABLATION_SESOI = {
     'content_pooling': {
         'relative_pct': 1.0,
         'rationale': 'Pooled block content must change PPL by >=1% versus zero-content blocks to support a content-pooling claim.',
+    },
+    'content_alignment': {
+        'relative_pct': 1.0,
+        'rationale': 'Moving the same pooled content one block back must change PPL by >=1% to support the stronger claim that content must be aligned with its own block, not merely present.',
     },
     'attention_sink': {
         'relative_pct': 1.0,
@@ -1048,6 +1077,12 @@ INTERACTION_SESOI = {
                       'ratio-of-ratios across blocking regimes is treated as '
                       'practically additive.'),
     },
+    'dynamic_blocking_x_content_alignment': {
+        'relative_pct': 1.0,
+        'rationale': ('A content-alignment benefit that changes by <1% of its '
+                      'ratio-of-ratios across blocking regimes is treated as '
+                      'practically additive.'),
+    },
     'dynamic_blocking_x_attention_sink': {
         'relative_pct': 1.0,
         'rationale': ('A sink benefit that changes by <1% of its ratio-of-ratios '
@@ -1070,6 +1105,13 @@ INTERACTION_SESOI = {
 # 缺少可识别的 2x2 双关臂；把它们硬塞进同一个交互族只会制造不可解释的
 # 空槽位。范围外的组件由审计单独列为 outside_scope，而不是静默算作已覆盖。
 INTERACTION_SCOPE = {
+    'content_alignment_control': {
+        'factors': ('dynamic_blocking', 'content_alignment'),
+        'rationale': ('The matched content placebo has its own 2x2 against '
+                      'dynamic blocking: aligned vs shifted content must be '
+                      'compared under both boundary regimes, not only under '
+                      'the fixed-block reference.'),
+    },
     'core_dynamic_modules': {
         'factors': ('dynamic_blocking', 'learned_selection',
                     'content_pooling', 'attention_sink'),
@@ -1176,6 +1218,10 @@ ABLATION_INTERVENTION_KEYS = {
     'content_pooling': {
         ('csa_fixed', 'csa_fix_zerocont'): frozenset({'content_mode'}),
         ('csa_dynamic', 'csa_dyn_zerocont'): frozenset({'content_mode'}),
+    },
+    'content_alignment': {
+        ('csa_fixed', 'csa_fix_shiftcont'): frozenset({'content_mode'}),
+        ('csa_dynamic', 'csa_dyn_shiftcont'): frozenset({'content_mode'}),
     },
     'attention_sink': {
         ('csa_fixed', 'csa_fix_nosink'): frozenset({'use_sink'}),
