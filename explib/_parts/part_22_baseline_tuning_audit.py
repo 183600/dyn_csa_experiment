@@ -410,7 +410,12 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
                         if _reported_sd is None:
                             problems.append(f'{arm}: trial ppl_std is not numeric or finite ({t.get("ppl_std")!r})')
                         else:
-                            _s = float(np.std(_vals, ddof=1))
+                            # Recompute with the same guarded SD used by the
+                            # writers: a finite PPL panel can still overflow the
+                            # raw squared deviations at extreme magnitudes.
+                            _ms = _scaled_mean_std_if_extreme(_vals, ddof=1)
+                            _s = (float(_ms[1]) if _ms is not None
+                                  else float(np.std(_vals, ddof=1)))
                             if abs(_s - _reported_sd) > 1e-9 * max(1.0, abs(_s)):
                                 problems.append(f'{arm}: trial ppl_std is not the sample std of its per-seed values')
         if _set:

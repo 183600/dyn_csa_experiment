@@ -1193,14 +1193,24 @@ def tuning_selection_margin(best, runner, *, metric='ppl', direction='lower_is_b
         if len(common) >= 2:
             diffs = [(rmap[s] - bmap[s]) if direction == 'lower_is_better'
                      else (bmap[s] - rmap[s]) for s in common]
-            sd = float(np.std(np.asarray(diffs, dtype=float), ddof=1))
+            # Per-seed PPL differences are unbounded in principle (PPL is
+            # exp(CE)).  A finite but huge difference overflows the squared
+            # deviations in np.std and would turn a real paired margin into
+            # se=inf / z=0.  The guarded mean/SD is scale invariant and leaves
+            # ordinary PPL magnitudes on their historical path.
+            _diffs_arr = np.asarray(diffs, dtype=float)
+            _ms = _scaled_mean_std_if_extreme(_diffs_arr, ddof=1)
+            if _ms is not None:
+                paired_margin, sd = _ms
+            else:
+                paired_margin = float(_diffs_arr.mean())
+                sd = float(np.std(_diffs_arr, ddof=1))
             se = sd / math.sqrt(len(diffs))
             # The paired SE is estimated on the COMMON seeds.  Comparing it
             # with a margin taken from the two rows' full (possibly
             # different-seed) means would put the numerator and denominator on
             # different samples.  Use the paired mean difference instead, and
             # keep the original row-level margin for transparency.
-            paired_margin = float(np.mean(np.asarray(diffs, dtype=float)))
             out.update({'margin': paired_margin,
                         'margin_unpaired': float(margin),
                         'se': float(se),

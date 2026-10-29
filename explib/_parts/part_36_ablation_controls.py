@@ -45,6 +45,45 @@ CONTENT_CONTROL_DESIGN = {
 }
 
 
+def _declared_arm_id(levels, level_name, base_label):
+    """A hashable arm id from a (possibly malformed) level table, or None.
+
+    Later consistency checks form ``(base_arm, control_arm)`` tuples and use
+    them as dict keys.  A malformed ladder can put a list/dict where an arm id
+    belongs; returning None keeps the audit fail-closed instead of raising
+    ``TypeError: unhashable type``.
+    """
+    spec = levels.get(level_name) if isinstance(levels, dict) else None
+    arms = spec.get('arms') if isinstance(spec, dict) else None
+    arm = arms.get(base_label) if isinstance(arms, dict) else None
+    return arm if isinstance(arm, str) and arm.strip() else None
+
+
+def _control_cfg_field_values(factory, n_layers, arm, field):
+    """Actual per-layer value of one config field for a constructed arm.
+
+    The level tables are *declarations*.  Comparing a placebo's declared mode
+    only against the field that happens to differ from the base cannot catch a
+    treatment or absence level whose declaration silently contradicts the
+    actual config (for example a treatment labelled ``random`` while the arm
+    it names is the learned base).  Read the constructed value for every layer
+    so the audit validates the declaration against the object, not the label.
+    """
+    cfgs = factory(int(n_layers), arm)
+    if isinstance(cfgs, (str, bytes, bytearray)):
+        raise TypeError('factory returned a string, not a sequence of layer configs')
+    cfgs = list(cfgs)
+    if len(cfgs) != int(n_layers):
+        raise ValueError(
+            f'arm {arm!r} has {len(cfgs)} layer config(s), expected {int(n_layers)}')
+    out = {}
+    for i, cfg in enumerate(cfgs):
+        if not hasattr(cfg, field):
+            raise TypeError(f'arm {arm!r} layer {i} has no {field!r} attribute')
+        out[i] = getattr(cfg, field)
+    return out
+
+
 def content_control_audit(design=None, ladder=None, present=None, factory=None,
                           n_layers=2):
     """Zero-GPU gate for the content presence/alignment control ladder.
@@ -206,38 +245,50 @@ def content_control_audit(design=None, ladder=None, present=None, factory=None,
                 continue
             diff = sorted(_keys)
             rec['cfg_diff_keys'] = diff
+            try:
+                _actual_modes = _control_cfg_field_values(
+                    factory, n_layers, arm, 'content_mode')
+            except Exception as _me:
+                out['violations'].append(
+                    f'{level_name}/{base_label}: cannot read the constructed '
+                    f'content_mode for {arm!r} ({type(_me).__name__}: {_me})')
+                rec['status'] = 'unconstructable'
+                continue
+            rec['observed_modes'] = _actual_modes
+            expected_mode = spec.get('content_mode')
+            _bad_modes = sorted({str(v) for v in _actual_modes.values()
+                                 if v != expected_mode})
             if level_name == treatment_name:
+                bad = []
                 if arm != base_arm:
+                    bad.append(f'treatment arm {arm!r} must be the base arm '
+                               f'{base_arm!r} (the aligned table is the reference)')
+                if diff:
+                    bad.append(f'treatment arm must not differ from the base '
+                               f'config, got {diff}')
+                if expected_mode not in CONTENT_MODES:
+                    bad.append(f'declared content_mode {expected_mode!r} is not '
+                               f'a declared mode {CONTENT_MODES}')
+                if _bad_modes:
+                    bad.append('constructed content_mode does not equal the '
+                               f'declared {expected_mode!r}: {_bad_modes}')
+                if bad:
                     out['violations'].append(
-                        f'{level_name}/{base_label}: treatment arm {arm!r} must '
-                        f'be the base arm {base_arm!r} (the aligned table is the '
-                        'reference)')
-                    rec['status'] = 'confounded'
-                elif diff:
-                    out['violations'].append(
-                        f'{level_name}/{base_label}: treatment arm must not differ '
-                        f'from the base config, got {diff}')
+                        f'{level_name}/{base_label}: ' + '; '.join(bad))
                     rec['status'] = 'confounded'
                 else:
                     rec['status'] = 'ok'
                 continue
-            expected_mode = spec.get('content_mode')
-            _values = {}
-            if _per:
-                for _layer, _fields in _per.items():
-                    if isinstance(_fields, dict) and 'content_mode' in _fields:
-                        _values[_layer] = _fields['content_mode'][0]
-            rec['observed_modes'] = _values
             bad = []
             if diff != ['content_mode']:
                 bad.append(f'cfg diff is {diff}, not exactly ["content_mode"]')
             if expected_mode not in CONTENT_MODES:
                 bad.append(f'expected content_mode {expected_mode!r} is not a '
                            f'declared mode {CONTENT_MODES}')
-            if _values and any(v != expected_mode for v in _values.values()):
+            if _bad_modes:
                 bad.append(
                     'constructed content_mode does not equal the declared '
-                    f'{expected_mode!r}')
+                    f'{expected_mode!r}: {_bad_modes}')
             if bad:
                 out['violations'].append(
                     f'{level_name}/{base_label}: ' + '; '.join(bad))
@@ -247,10 +298,8 @@ def content_control_audit(design=None, ladder=None, present=None, factory=None,
         out['base_checks'][base_label] = base_rec
     # Tie each control level to its declared leave-one-out family.
     for base_label, base_arm in bases.items():
-        _mis_arms = levels[misaligned_name].get('arms')
-        _abs_arms = levels[absent_name].get('arms')
-        _mis = (_mis_arms.get(base_label) if isinstance(_mis_arms, dict) else None)
-        _abs = (_abs_arms.get(base_label) if isinstance(_abs_arms, dict) else None)
+        _mis = _declared_arm_id(levels, misaligned_name, base_label)
+        _abs = _declared_arm_id(levels, absent_name, base_label)
         if presence_pairs is not None and (base_arm, _abs) not in presence_pairs:
             out['violations'].append(
                 f'content_pooling does not declare {base_arm!r} vs {_abs!r} '
@@ -279,9 +328,7 @@ def content_control_audit(design=None, ladder=None, present=None, factory=None,
     for base_label in bases:
         seen = {}
         for level_name in (treatment_name, misaligned_name, absent_name):
-            _level_arms = levels[level_name].get('arms')
-            arm = (_level_arms.get(base_label)
-                   if isinstance(_level_arms, dict) else None)
+            arm = _declared_arm_id(levels, level_name, base_label)
             if arm is not None:
                 seen.setdefault(arm, []).append(level_name)
         for arm, names in seen.items():
@@ -403,11 +450,21 @@ def sink_control_audit(design=None, ladder=None, present=None, factory=None,
         out['violations'].append(
             'absence_keys must name exactly the declared base labels')
         return out
+    _absence_norm = {}
     for _b, _ks in absence_keys.items():
         if not isinstance(_ks, (set, frozenset)) or not _ks:
             out['status'] = 'fail'
             out['violations'].append(
                 f'absence_keys[{_b!r}] must be a non-empty set of cfg keys')
+            _absence_norm[_b] = frozenset()
+        elif not all(isinstance(_k, str) and _k.strip() for _k in _ks):
+            out['status'] = 'fail'
+            out['violations'].append(
+                f'absence_keys[{_b!r}] must contain non-empty cfg field names')
+            _absence_norm[_b] = frozenset()
+        else:
+            _absence_norm[_b] = frozenset(_ks)
+    absence_keys = _absence_norm
     out['bases'] = dict(bases)
     try:
         present_set = set(RUN_ABL['variants']) if present is None else set(present)
@@ -476,16 +533,22 @@ def sink_control_audit(design=None, ladder=None, present=None, factory=None,
     }
 
     def _model_counts(arm):
-        torch.manual_seed(1234)
-        model = SmallGPT(32, 16, n_layers, 2, 8, 16, factory(n_layers, arm))
-        named = dict(model.named_parameters())
-        total = sum(int(p.numel()) for p in named.values())
-        sink_names = [n for n in named if n == 'sink' or n.endswith('.sink')]
-        sink = sum(int(named[n].numel()) for n in sink_names)
-        frozen = bool(sink_names) and all(
-            not bool(named[n].requires_grad) for n in sink_names)
-        return {'total': total, 'sink_params': sink, 'sink_frozen': frozen,
-                'n_sink_tensors': len(sink_names)}
+        # This is a zero-GPU design probe.  It must not perturb the caller's
+        # RNG streams: a later training cell would otherwise start from a
+        # different data order/dropout stream merely because an audit ran
+        # first.  `_preserve_rng_state` restores Python/NumPy/Torch/CUDA (and
+        # the hash-seed environment) even on error.
+        with _preserve_rng_state():
+            torch.manual_seed(1234)
+            model = SmallGPT(32, 16, n_layers, 2, 8, 16, factory(n_layers, arm))
+            named = dict(model.named_parameters())
+            total = sum(int(p.numel()) for p in named.values())
+            sink_names = [n for n in named if n == 'sink' or n.endswith('.sink')]
+            sink = sum(int(named[n].numel()) for n in sink_names)
+            frozen = bool(sink_names) and all(
+                not bool(named[n].requires_grad) for n in sink_names)
+            return {'total': total, 'sink_params': sink, 'sink_frozen': frozen,
+                    'n_sink_tensors': len(sink_names)}
 
     # Construct every level against its base and verify the exact diff.
     for base_label, base_arm in bases.items():
@@ -517,22 +580,36 @@ def sink_control_audit(design=None, ladder=None, present=None, factory=None,
                 continue
             diff = sorted(_keys)
             rec['cfg_diff_keys'] = diff
-            _values = {}
-            if _per:
-                for _layer, _fields in _per.items():
-                    if isinstance(_fields, dict) and 'sink_mode' in _fields:
-                        _values[_layer] = _fields['sink_mode'][0]
-            rec['observed_sink_modes'] = _values
+            try:
+                _actual_modes = _control_cfg_field_values(
+                    factory, n_layers, arm, 'sink_mode')
+            except Exception as _me:
+                out['violations'].append(
+                    f'{level_name}/{base_label}: cannot read the constructed '
+                    f'sink_mode for {arm!r} ({type(_me).__name__}: {_me})')
+                rec['status'] = 'unconstructable'
+                continue
+            rec['observed_sink_modes'] = _actual_modes
+            expected_mode = spec.get('sink_mode')
+            _bad_modes = sorted({str(v) for v in _actual_modes.values()
+                                 if v != expected_mode})
             if level_name == treatment_name:
+                bad = []
                 if arm != base_arm:
+                    bad.append(f'treatment arm {arm!r} must be the base arm '
+                               f'{base_arm!r}')
+                if diff:
+                    bad.append(f'treatment arm must not differ from the base '
+                               f'config, got {diff}')
+                if expected_mode != 'learned':
+                    bad.append(f'treatment must declare sink_mode="learned", '
+                               f'got {expected_mode!r}')
+                if _bad_modes:
+                    bad.append('constructed sink_mode does not equal the '
+                               f'declared {expected_mode!r}: {_bad_modes}')
+                if bad:
                     out['violations'].append(
-                        f'{level_name}/{base_label}: treatment arm {arm!r} must '
-                        f'be the base arm {base_arm!r}')
-                    rec['status'] = 'confounded'
-                elif diff:
-                    out['violations'].append(
-                        f'{level_name}/{base_label}: treatment arm must not differ '
-                        f'from the base config, got {diff}')
+                        f'{level_name}/{base_label}: ' + '; '.join(bad))
                     rec['status'] = 'confounded'
                 else:
                     rec['status'] = 'ok'
@@ -541,13 +618,13 @@ def sink_control_audit(design=None, ladder=None, present=None, factory=None,
                 bad = []
                 if diff != ['sink_mode']:
                     bad.append(f'cfg diff is {diff}, not exactly ["sink_mode"]')
-                expected_mode = spec.get('sink_mode')
                 if expected_mode != 'random':
                     bad.append(
                         f'capacity placebo must declare sink_mode="random", got '
                         f'{expected_mode!r}')
-                if _values and any(v != 'random' for v in _values.values()):
-                    bad.append('constructed sink_mode is not "random"')
+                if _bad_modes:
+                    bad.append('constructed sink_mode is not "random": '
+                               f'{_bad_modes}')
                 if bad:
                     out['violations'].append(
                         f'{level_name}/{base_label}: ' + '; '.join(bad))
@@ -556,11 +633,20 @@ def sink_control_audit(design=None, ladder=None, present=None, factory=None,
                     rec['status'] = 'ok'
                 continue
             # absence control
+            bad = []
             expected = absence_keys[base_label]
             if set(diff) != set(expected):
+                bad.append(f'cfg diff is {diff}, not the declared absence '
+                           f'key(s) {sorted(expected)}')
+            if expected_mode != 'learned':
+                bad.append(f'absence control must declare '
+                           f'sink_mode="learned", got {expected_mode!r}')
+            if _bad_modes:
+                bad.append('constructed sink_mode is not "learned": '
+                           f'{_bad_modes}')
+            if bad:
                 out['violations'].append(
-                    f'{level_name}/{base_label}: cfg diff is {diff}, not the '
-                    f'declared absence key(s) {sorted(expected)}')
+                    f'{level_name}/{base_label}: ' + '; '.join(bad))
                 rec['status'] = 'confounded'
             else:
                 rec['status'] = 'ok'
@@ -614,10 +700,8 @@ def sink_control_audit(design=None, ladder=None, present=None, factory=None,
 
     # Tie each control level to its declared leave-one-out family.
     for base_label, base_arm in bases.items():
-        _p_arms = levels[placebo_name].get('arms')
-        _a_arms = levels[absent_name].get('arms')
-        _p = _p_arms.get(base_label) if isinstance(_p_arms, dict) else None
-        _a = _a_arms.get(base_label) if isinstance(_a_arms, dict) else None
+        _p = _declared_arm_id(levels, placebo_name, base_label)
+        _a = _declared_arm_id(levels, absent_name, base_label)
         if treatment_pairs is not None and (base_arm, _p) not in treatment_pairs:
             out['violations'].append(
                 f'attention_sink_learning does not declare {base_arm!r} vs {_p!r} '
@@ -636,8 +720,7 @@ def sink_control_audit(design=None, ladder=None, present=None, factory=None,
             'attention_sink_learning: no declared intervention-key mapping')
     else:
         for base_label, base_arm in bases.items():
-            _p_arms = levels[placebo_name].get('arms')
-            _p = _p_arms.get(base_label) if isinstance(_p_arms, dict) else None
+            _p = _declared_arm_id(levels, placebo_name, base_label)
             kset = _pkeys.get((base_arm, _p))
             if kset != frozenset({'sink_mode'}):
                 out['violations'].append(
@@ -651,8 +734,7 @@ def sink_control_audit(design=None, ladder=None, present=None, factory=None,
             'attention_sink: no declared intervention-key mapping')
     else:
         for base_label, base_arm in bases.items():
-            _a_arms = levels[absent_name].get('arms')
-            _a = _a_arms.get(base_label) if isinstance(_a_arms, dict) else None
+            _a = _declared_arm_id(levels, absent_name, base_label)
             kset = _akeys.get((base_arm, _a))
             if kset != frozenset(absence_keys[base_label]):
                 out['violations'].append(
@@ -664,9 +746,7 @@ def sink_control_audit(design=None, ladder=None, present=None, factory=None,
     for base_label in bases:
         seen = {}
         for level_name in (treatment_name, placebo_name, absent_name):
-            _level_arms = levels[level_name].get('arms')
-            arm = (_level_arms.get(base_label)
-                   if isinstance(_level_arms, dict) else None)
+            arm = _declared_arm_id(levels, level_name, base_label)
             if arm is not None:
                 seen.setdefault(arm, []).append(level_name)
         for arm, names in seen.items():

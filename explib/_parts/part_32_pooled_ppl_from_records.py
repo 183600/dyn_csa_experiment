@@ -121,13 +121,44 @@ def _paired_primary_delta(rec_a, rec_b):
     return float(_a) - float(_b)
 
 
+def _scaled_std_or_raw(values):
+    """Sample SD (ddof=1) that survives extreme-but-finite PPL magnitudes."""
+    try:
+        if len(values) < 2:
+            return 0.0
+    except TypeError:
+        return 0.0
+    _ms = _scaled_mean_std_if_extreme(values, ddof=1)
+    if _ms is not None:
+        return float(_ms[1])
+    return float(np.std(values, ddof=1))
+
+
+def _scaled_std_or_none(values):
+    """Sample SD (ddof=1) or None when fewer than two values are available."""
+    try:
+        if len(values) < 2:
+            return None
+    except TypeError:
+        return None
+    return _scaled_std_or_raw(values)
+
+
 def _seed_t_ci(ppls, alpha=0.05):
     alpha = _validated_alpha(alpha, context='_seed_t_ci alpha')
     n = len(ppls)
     if n < 2:
         return None
-    mu = float(np.mean(ppls))
-    sd = float(np.std(ppls, ddof=1))
+    # PPL is exp(CE): a finite but very large value (or a tiny positive
+    # difference) can overflow/underflow the squared deviations in np.std even
+    # though the interval endpoints are representable.  Use the same guarded
+    # mean/SD helper as the paired-effect statistics.
+    _ms = _scaled_mean_std_if_extreme(ppls, ddof=1)
+    if _ms is not None:
+        mu, sd = _ms
+    else:
+        mu = float(np.mean(ppls))
+        sd = float(np.std(ppls, ddof=1))
     try:
         tc = _t_critical(1.0 - alpha, n - 1)
     except Exception:
@@ -777,9 +808,8 @@ def paired_nll_two_way_bootstrap(nll_a, nll_b, n_tokens, *, n_boot=2000,
         'delta_ppl_ci95': [float(ci[0]), float(ci[1])],
         'delta_log_ratio_ci95': [float(ci_lr[0]), float(ci_lr[1])],
         'ratio_ci95': ratio_ci,
-        'se_ppl': float(np.std(ppl_valid, ddof=1)) if ppl_valid.size >= 2 else None,
-        'se_log_ratio': (float(np.std(lr_valid, ddof=1))
-                         if lr_valid.size >= 2 else None),
+        'se_ppl': _scaled_std_or_none(ppl_valid),
+        'se_log_ratio': _scaled_std_or_none(lr_valid),
     })
     if ppl_valid.size < int(_nb):
         out['warnings'].append(
@@ -991,7 +1021,7 @@ def aggregate(summary):
         entry = {'variant': v, 'protocol': tag, 'n_seeds': len(recs),
                  'ppl_mean': float(ppls.mean()),
                  'ppl_mean_arithmetic': float(ppls.mean()),
-                 'ppl_std': float(ppls.std(ddof=1)) if len(ppls) > 1 else 0.0,
+                 'ppl_std': _scaled_std_or_raw(ppls),
                  'ppls': [float(p) for p in ppls], 'seeds': [r.get('seed') for r in recs],
                  'ppl_primary_estimand': _primary_estimand,
                  'ppl_primary_missing': int(_n_primary_missing),
@@ -1206,7 +1236,7 @@ def aggregate(summary):
         if ds:
             d = np.array(ds, dtype=float)
             agg[key]['dPPL_vs_full_mean'] = float(d.mean())
-            agg[key]['dPPL_vs_full_std'] = float(d.std(ddof=1)) if len(d) > 1 else 0.0
+            agg[key]['dPPL_vs_full_std'] = _scaled_std_or_raw(d)
             agg[key]['n_paired'] = len(d)
             agg[key]['n_paired_skipped'] = len(skipped)
             agg[key]['dPPL_vs_full_base'] = base_tag or '(untagged)'
@@ -1228,7 +1258,7 @@ def aggregate(summary):
         if ds:
             d = np.array(ds, dtype=float)
             agg[key]['dPPL_vs_sw128m_mean'] = float(d.mean())
-            agg[key]['dPPL_vs_sw128m_std'] = float(d.std(ddof=1)) if len(d) > 1 else 0.0
+            agg[key]['dPPL_vs_sw128m_std'] = _scaled_std_or_raw(d)
             agg[key]['n_paired_sw128m'] = len(d)
             agg[key]['n_paired_sw128m_skipped'] = len(skipped)
     if _base_amb:
