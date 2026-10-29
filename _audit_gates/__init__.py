@@ -13,6 +13,7 @@ _PARTS = [
 'part_03_audit_methodology.py',
 'part_04_audit_selection.py',
 'part_06_audit_data_processing.py',
+'part_07_reproduction.py',
 'part_05_audit_confirmation_verdicts.py',
 ]
 

@@ -35,6 +35,7 @@
 | `explib/length/` | **v11 驱动**（`python -m explib.length`）：统计收尾——干扰探针扩到 n=6（P4MT/P4MP）、交叉面板扩到 n=4（P4S）、d=384 配对臂扩到 n=4（P4F） |
 | `explib/confirmation/` | **v12 确认驱动**（`python -m explib.confirmation`；评审响应 + 评审二轮加固）：P5C 按清单种子列表训练全部四个冻结臂，P5MP 跑扩展腐坏模式探针（uniform/realistic-token/mask/delete + 评审二轮新增 span/doc/topical + NIAH-natural），P5S2/P5S3 补等 token 与 6ND 参数量代理预算的大规模臂，P5T 按 `confirmation_frozen.json` 在 held-out 的 WikiText-103 test split 上做**冻结后一次性确认评估**——含加载期功效硬门槛（数学上不可能确认的清单直接拒绝）、严格记录准入（种子白名单/唯一记录/单一冻结切片/配方签名/manifest 哈希）、首次访问冻结锁与逐文档 PPL 落盘 |
 | `explib/open_block/` | **未结束块读取面板驱动**（`python -m explib.open_block`）：最大块长（32/64/128/无强制上限）× 当前未结束块读取方式（`closed` / `prefix_summary` / `prefix_singletons`）；共享 top-k 预算、因果前缀构造、窗口外辅助面板、逐种子配对差与交互统计——见 `docs/design_notes.md` §24 |
+| `explib/reproduce/` | **跨运行复现比较器**（`python -m explib.reproduce compare 原始目录 重跑目录`）：按 `variant::seedN` 逐格比较两份 panel，分别报告源码字节、数据切片、配置、执行环境、匹配初始化与最终 PPL 容差；缺指纹一律 `provenance_incomplete`，绝不当作通过。同一检查也暴露为 `audit_gates.py reproduction 原始目录 重跑目录`——见 `docs/design_notes.md` §83 |
 | `test_open_block.py` | **未结束块 CPU 门禁**：配置/分段器、优化前缀池化与逐查询参考的前向/梯度一致、前缀不变性、未来扰动/未来梯度、候选掩码、边界情形、closed 回归、单 token 语义与 HCA 预算声明 |
 | `test_review_part_*.py`, `test_review_fixes.py` | **CPU 评审 pytest 套件**：兼容入口与拆分后的测试模块（用 `make test` 或 `pytest` 运行） |
 | `confirmation_frozen.json` | **预注册冻结清单 v2**（入库）：冻结臂、种子 0-11（在任何 test-split 访问**之前**由 6 修订为 12，含功效表）、终点、精确符号翻转 + Holm、决策规则、机器可校验的绑定块与范围声明——见 `docs/design_notes.md` §17 与 `DECISION_LOG.md` |
@@ -44,7 +45,7 @@
 | `explib/m0/` | **M0/S1 驱动（已选定 B 档）**（`python -m explib.m0`）：扩规模路线图的代码入口——`params`（零 GPU 的 S1–S4 参数量核算）、`data`（FineWeb-Edu + 32k BPE 语料缓存）、`smoke`（B 档数据路径端到端自检）、`kernel`（G0 验证套件：三算子 kernel/eager 数值对照 + 稀疏注意力吞吐基准）、`full`（S1 主面板）；见下文“B 档 M0/S1” |
 | `build_report.py` | **兼容 shim**，实现位于 `_build_report/`；即零 GPU 报告构建器：从 `results_*/` + `analysis_*/` 产物重建 v7 报告（所有数字现算，绝不硬编码） |
 | `fuse_analysis.py` | 零 GPU fuse 对比驱动：从 `results_*/summary.json` 重算逐层边界对齐（tol=1）、块长统计与 PPL 曲线 |
-| `Makefile` | 零 GPU 入口：`make test`、`make plan`、`make audit`、`make install-check`、`make build`、`make clean` |
+| `Makefile` | 零 GPU 入口：`make test`、`make plan`、`make audit`、`make integrity`、`make reproduce`、`make install-check`、`make build`、`make clean` |
 | `docs/design_notes.md` | **设计与实现笔记**：块读门为何必须严格、且五处位置必须同步；动态分段器的前缀不变性要求；配对/可测量规则；报告约定；保证注意力按行分块与不分批形式等价的契约 |
 
 > **测量库位于 `explib/`，直接编辑其中的模块。**
@@ -67,6 +68,19 @@ python run_gapfill.py full       # v6 主实验（受运行时上限约束）
 python -m explib.rope ...        # 各版本补充实验，子命令见对应模块的帮助
 python build_report.py           # 从落盘的 results_*/ + analysis_*/ 重建报告
 ```
+
+如果同一批格子跑了两遍（串行 vs 并行、换一台机器、或修复后重跑），不要
+直接相信报告，先比较第二份产物：
+
+```bash
+python -m explib.reproduce compare results_lm_v6 results_lm_v6_rerun
+# 仅当源码字节、数据切片、配置、执行环境、匹配初始化与声明的 PPL 容差
+# 全部对齐时退出码才为 0；`--require exact` 要求逐位相同。
+```
+
+该检查逐维报告，因此 `environment_changed` / `data_changed` /
+`code_changed` / `numerical_drift` 不会被压成一句「没复现」；缺指纹是
+`provenance_incomplete`，不会被当成通过。
 
 ## 复现方法（任意 CUDA 机器）
 

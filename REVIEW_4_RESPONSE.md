@@ -27,8 +27,8 @@
 | 14 | eval_subset 与测量误差 | PARTIAL | 文档/代码明确最终 PPL 用完整固定验证批，`eval_subset` 只控曲线；`ppl_ci95_doc_bootstrap` 进入 P2 表；v12 加文档 Δ cluster CI，并新增 seed×unit 两层 bootstrap 的总不确定性读数与 `audit_gates.two_level_ci`；<64 文档禁止总体主张 | 冻结 test 的 n=48 仍低于 64 单元总体门槛；两层 bootstrap 是设计型重采样，不是联合 hierarchical/随机效应模型，12 个种子 cluster 时百分位覆盖率有限；未做 token 级测量误差模型 |
 | 15 | 配对检验的独立性/匹配 | PARTIAL | 新增 `init_core_fp`（tok/pos/head/norm）并纳入 `pair_reason`；v12 输出 `same_init_core_fp`；`rng_fp` 仍按设计只报告不强制 | 没有逐张量全参数匹配；架构导致的 RNG 差异仍属于臂 |
 | 16 | 陈旧/重构记录可能进入结论 | FIXED | `sec_p1l` 与 v10 按长度表整臂排除无当前戳记录（不列表/不算 ratio）；`_agg_entry` 多组无当前戳或显式旧 run_cfg 直接拒绝；`build_report` 的 Monte-Carlo 旧文案更正 | 单条无 `run_cfg` 的历史 aggregate 仍走兼容路径；synthesized 记录仍可用于曲线展示 |
-| 17 | 结果产物不入库，无法独立审计 | PARTIAL | README/README_zh 增加「证据状态」段；`audit_gates.release` 解析 `RELEASES.md`，无完整行即 `no_release`；归档增加 logs/cache meta/pyproject | **本快照没有随附 release**；没有真实数值可复核，只有可执行归档工具 |
-| 18 | 复现环境不可控 | PARTIAL | import-time pip install 早已移除；HF mirror 仅 opt-in；`requirements.lock`/`pyproject.toml` 在位；归档记录 pip freeze/GPU | CI 仍按未锁版本安装；没有跨硬件逐位复现；lock 不是 CUDA 参考环境 |
+| 17 | 结果产物不入库，无法独立审计 | PARTIAL | README/README_zh 增加「证据状态」段；`audit_gates.release` 解析 `RELEASES.md`，无完整行即 `no_release`；归档增加 logs/cache meta/pyproject；新增 `explib.reproduce` 跨运行复现比较器（源码/数据/配置/环境/初始化逐维对账） | **本快照没有随附 release**；没有真实数值可复核，只有可执行归档/比较工具 |
+| 18 | 复现环境不可控 | PARTIAL | import-time pip install 早已移除；HF mirror 仅 opt-in；`requirements.lock`/`pyproject.toml` 在位；CI 安装 `requirements-ci.txt` → `requirements.lock`；归档记录 pip freeze/GPU | 仍没有跨硬件逐位复现；lock 不是 CUDA 参考环境 |
 | 19 | 效率结论缺真实测量 | PARTIAL | v7 长度阶段开启 `measure_eff`；新增 `measure_efficiency_sweep`（batch×length、CUDA event、环境元数据）；`audit_gates.efficiency_pairs` 只在同 token 数/同设备/同 KV/±5% 外才允许「更快」；FLOPs 文案改为结构性估计 | 本机无 GPU，未产生实测数字；没有 energy/真实 KV cache；dense 基线优化程度未逐项对齐 |
 | 20 | 缺机制层面直接验证 | PARTIAL | NIAH、boundary-vs-random、block stats 已在；新增 selection-attribution 契约与 `audit_gates.selection`；缺工件时明确「未支持」 | 没有 selection recall/precision、与 dense attention 权重的相关性、oracle 分割/检索上界、selector 稳定性实验 |
 | 21 | 方向性证据被写成因果结论 | PARTIAL | 「压缩不是瓶颈」「容量红利」「优势随长度放大」「渐近线坐实」等段落加显著性/口径限制或改写；`system_level_only` 阻止把目标/计算混杂的显著结果标成 `verified` | 报告是动态生成的，仍可能有未覆盖的措辞；需要在真实产物上重跑后复核 |
@@ -40,6 +40,7 @@
 - `exp_lib.init_core_fingerprint` + `pair_reason` 的 init gate
 - `exp_lib._param_control_detail`、`exp_lib._compute_control_detail`、`system_level_only`
 - `exp_lib.paired_nll_two_way_bootstrap` + `audit_gates.two_level_ci`
+- `exp_lib.reproduction_diagnosis` / `compare_reproductions` + `python -m explib.reproduce` + `audit_gates.reproduction`
 - `exp_lib.measure_efficiency_sweep`
 - `build_report.sec_p1l` / `_agg_entry` 的 stale fail-closed
 - `explib/corruption/`（v10）的 NIAH-Holm 合并、`_all_sig` 走统一闸门、按长度表 stale 排除

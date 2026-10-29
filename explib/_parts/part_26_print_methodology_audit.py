@@ -647,6 +647,37 @@ def dataloader_contract_check(seed=0, *, num_workers=2, batch_size=4, batches=2,
     if _nb is None:
         raise ValueError(f'dataloader_contract_check: batches must be a positive integer, got {batches!r}')
     num_workers, batch_size, batches = int(_nw), int(_bs), int(_nb)
+    if num_workers > 0:
+        # Probe the OS primitive before constructing torch's worker iterator.
+        # When POSIX semaphores are unavailable (a restricted sandbox), the
+        # iterator's __init__ can fail after allocating a partially
+        # initialised object whose __del__ raises an unraisable
+        # AttributeError.  A clean contract report is both more reproducible
+        # and easier for a caller to skip than a late GC failure.
+        try:
+            import multiprocessing as _mp
+            _sem_probe = _mp.Semaphore(1)
+        except (PermissionError, OSError) as e:
+            return {
+                'kind': 'dataloader_contract', 'seed': int(seed),
+                'num_workers': num_workers, 'batch_size': batch_size,
+                'batches': batches, 'device': str(DEVICE if device is None else device),
+                'checks': {'stream_nonempty': False,
+                           'same_seed_reproducible': False,
+                           'different_seed_changes_stream': False,
+                           'rng_state_preserved': None,
+                           'worker_semaphores': False},
+                'error': f'{type(e).__name__}: {e}',
+                'passed': False,
+                'diagnosis': ('DataLoader worker processes require POSIX '
+                              f'semaphores, which this sandbox forbids '
+                              f'({type(e).__name__}: {e})'),
+            }
+        else:
+            try:
+                _sem_probe.close()
+            except Exception:
+                pass
     try:
         from torch.utils.data import Dataset
     except Exception as e:  # pragma: no cover - torch is a hard dependency

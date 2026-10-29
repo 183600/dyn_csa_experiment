@@ -3461,3 +3461,71 @@ validation/test 索引，cache-hit 与冷构建都拒绝协议字符串之外的
 重建索引）。`python audit_gates.py data_processing` 在当前无 `wt103_cache/`
 的仓库报 `not_verifiable_locally`，不假绿。`python -m
 explib.confirmation plan` 的冻结计划/比较数不受影响。
+
+## 2026-10-29 — 复现是两次运行之间的比较：逐维身份诊断与可执行复现门（本轮可复现性/工程规范硬化，no new runs）
+
+零 GPU 的可复现性/工程规范硬化；不新增训练、不读取 test split、不修改冻结
+清单的字节/种子/端点/alpha/Holm 规则，也不改 `CODE_SEMANTICS`。
+
+**Problem.** 仓库已有 `reproducibility_check`（同进程重复一小段训练流）、
+`seed_contract_check`（RNG 来源）、`exec_fp` / `source_tree` /
+`data_version` / `run_cfg` / `init_core_fp` 等逐记录身份字段，但**两份独立
+产物之间**没有可执行的比较。README 中并行 vs 串行「identical numbers」只是
+本地脚本侧检查，无法作为命令重放；`pair_reason` 是臂间配对门，不是同格重跑
+门；直接比较 PPL 会把「环境不同」「数据切片不同」「代码字节不同」都压成
+「数值漂移」，也会把「PPL 接近」误读成复现。缺指纹时没有任何机制阻止读者
+把「没记录」当成「相等」。
+
+**Fix.** 新增 `exp_lib.reproduction_diagnosis(original, rerun, *, rtol=1e-6,
+atol=0.0)`：按 `code`（`source_tree.sha256` + `code_semantics` /
+`code_stamp`）、`data`（两侧都存在的 `data_fp`/`val_fp`/`eval_fp`/
+`data_version`/`corpus_fp`）、`config`（`run_cfg`/`protocol`/`warm_steps`/
+`amp_dtype`/`eager_batch`，并复用 `training_knobs_reason` 与
+`objective_reason`）、`environment`（`exec_fp`）、`initialization`
+（`init_core_fp`）逐维比较；`rng_fp` 只作诊断（与 `pair_reason` 的既有约定
+一致，架构差异本就消耗不同 RNG）。每维只有 `match`/`mismatch`/`unverified`
+三种状态，缺失证据不是相等。`metric` 单独比较 `ppl` 与 `n_tokens`：token
+数不同判 `metric_mismatch`；PPL 在 `atol + rtol*|a|` 内为
+`within_tolerance`，严格相等才是 `identical`。判定优先级为
+`*_changed` > `provenance_incomplete` > `metric_missing`/
+`metric_mismatch` > `identical`/`within_tolerance` > `numerical_drift`，
+`reproduced` 只在最后两档成立，`bit_identical` 额外要求 PPL 严格相等。
+`synthesized` 记录（由旧 aggregate 重建、无权重/运行）直接 `not_comparable`。
+
+新增 `exp_lib.compare_reproductions(original, rerun, ...)`：接受 summary
+mapping、结果目录或 `summary.json`，按 `variant::seedN` 逐格匹配；只在一侧
+出现的格子进入 `only_original`/`only_rerun` 并把汇总判为 `incomplete`，
+没有共同格子判 `not_comparable`，任一格身份 mismatch 判 `not_reproduced`，
+只有全部身份匹配而 PPL 漂移才判 `drift`。新增 CLI
+`python -m explib.reproduce compare A B [--rtol/--atol/--json/--require
+exact]`（0 复现 / 1 未复现 / 2 用法或输入错误）、`make reproduce A=... B=...`
+与 `audit_gates.audit_reproduction`（CLI `reproduction`/`reproduce`/
+`replication`/`rerun_check`，接受两个显式路径；并进入 `report` 的
+`reproduction` 块）。没有显式两份目录时审计返回 `not_verifiable_locally`，
+不猜哪两个目录是一对重跑。另在 `dataloader_contract_check` 构造 worker
+iterator 前先探测 POSIX semaphore：受限沙箱缺信号量时返回干净的
+`passed=False` 报告，避免 torch 部分初始化的
+`_MultiProcessingDataLoaderIter.__del__` 在 GC 时抛 unraisable
+`AttributeError`，把零 GPU 测试门随机变红。该改动只作用于 probe 的失败
+路径，不改变任何训练/评测数值。
+
+**Boundary.** 这是描述性身份比较，不是统计检验：没有 p 值/置信区间，不修复
+选择偏差、测量误差或跨硬件数值差异；`rtol`/`atol` 必须由调用方声明并原样
+回显。`exec_fp` 相同不等于逐位可复现，不同也不自动说明代码有错；工具只把
+区别显式化，不替读者裁决。`rng_fp` 只诊断；`source_tree`、`exec_fp`、
+`init_core_fp`、数据指纹缺失时结果是 `unverified`/
+`provenance_incomplete`，不会降级成 `match`。该机制不重跑、不重算 PPL、不
+读取 test split，也不改变任何冻结决定；它不能替代真正的新种子/新运行，更不
+能把两份相同的旧产物变成独立证据。
+
+**Verification.** `python -m pytest -q` 通过 `650 passed, 3 skipped`（新增
+`test_review_part_23.py` 7 项：完全相同/容差内/漂移；源码/数据/配置/环境/
+初始化各自的 `*_changed`；同种子不同 `rng_fp` 只诊断；缺源码摘要/`exec_fp`/
+`init_core_fp`/数据身份 -> `provenance_incomplete`；token 数不同 ->
+`metric_mismatch`；坏 PPL -> `metric_missing`；synthesized ->
+`not_comparable`；非法容差/非 mapping fail-closed；批量报告的 `only_*`/
+`counts`/`not_comparable`；CLI 0/1/2、`--require exact`、`--json` 落盘；
+audit 的 ok/fail/not_verifiable 与 `_run_cli` 位置参数接线）。`python -m
+explib.reproduce --help` 与 `python audit_gates.py reproduction` 在当前无
+两份结果的仓库分别返回用法/`not_verifiable_locally`，不假绿。`python -m
+explib.confirmation plan` 的冻结计划/比较数不受影响。

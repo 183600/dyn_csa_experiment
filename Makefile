@@ -7,13 +7,14 @@ PYTHON ?= python
 BUILD_DIR := .build
 INSTALL_DIR := $(BUILD_DIR)/install-check
 
-.PHONY: help test plan audit integrity install-check build clean
+.PHONY: help test plan audit integrity reproduce install-check build clean
 
 help:
 	@echo "make test          # CPU unit/reproducibility suite (zero GPU)"
 	@echo "make plan          # frozen-manifest preflight, no test-split read"
 	@echo "make audit         # local audit gates -> audit_report.json"
 	@echo "make integrity     # verify stamped analysis bodies/inputs (zero GPU)"
+	@echo "make reproduce A=<dir> B=<dir>  # compare two independent runs (zero GPU)"
 	@echo "make install-check # verify the project builds/installs as a wheel"
 	@echo "make build         # sdist + wheel via python -m build"
 	@echo "make clean         # remove packaging scratch space"
@@ -29,6 +30,12 @@ audit:
 
 integrity:
 	$(PYTHON) audit_gates.py analysis_integrity
+
+reproduce:
+	@test -n "$(A)" -a -n "$(B)" || { \
+		echo "usage: make reproduce A=<original result dir> B=<rerun result dir>"; \
+		exit 2; }
+	$(PYTHON) -m explib.reproduce compare "$(A)" "$(B)"
 
 install-check:
 	rm -rf "$(INSTALL_DIR)"

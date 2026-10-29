@@ -57,6 +57,7 @@ the design notes, `docs/design_notes.md`).
 | `explib/length/` | **the v11 driver** (`python -m explib.length`): statistical close-out — distractor probe to n=6 (P4MT/P4MP), crossover panels to n=4 (P4S), d=384 paired arms to n=4 (P4F) |
 | `explib/confirmation/` | **the v12 confirmation driver** (`python -m explib.confirmation`; reviewer-response + review-2 hardening): P5C trains all four frozen arms at the manifest seed list, P5MP runs the extended corruption-mode probe (uniform/realistic-token/mask/delete + review-2 span/doc/topical + NIAH-natural), P5S2/P5S3 add the token-matched and 6ND-param-proxy scale arms, P5T performs the FROZEN final evaluation on the held-out WikiText-103 test split per `confirmation_frozen.json` — with a load-time plan-power gate (a plan that cannot mathematically confirm is refused), strict record admission (seed whitelist / unique records / one frozen test slice / recipe signature / manifest sha), a first-access freeze lock, and per-document PPL records |
 | `explib/open_block/` | **open-block panel driver** (`python -m explib.open_block`): maximum block length (32/64/128/no cap) × current-block reading rule (`closed` / `prefix_summary` / `prefix_singletons`), with a shared top-k budget, causal prefix construction, outside-window auxiliary panel, paired per-seed deltas and interaction statistics — see `docs/design_notes.md` §24 |
+| `explib/reproduce/` | **cross-run reproduction comparator** (`python -m explib.reproduce compare ORIGINAL RERUN`): matches two panel summaries cell by cell and reports whether they share source bytes, data slice, configuration, execution environment and matched initialization, plus whether the final PPL is exact/within a declared tolerance. Missing provenance is `provenance_incomplete`, never a pass; the same check is exposed as `audit_gates.py reproduction ORIGINAL RERUN` — see `docs/design_notes.md` §83 |
 | `test_open_block.py` | **open-block CPU gates**: config/segmenter, optimized-vs-reference prefix pooling (forward + gradients), prefix invariance, future perturbation/gradient, candidate masks, edge cases, closed regression, singleton semantics and HCA budget declaration |
 | `test_review_part_*.py`, `test_review_fixes.py` | **CPU review pytest suite**: compatibility entry point plus the split test modules (run with `make test` or `pytest`) |
 | `confirmation_frozen.json` | **pre-registered confirmation plan v2** (tracked): frozen arms, seeds 0-11 (revised 6->12 BEFORE any test-split access; power table recorded), endpoints, exact sign-flip + Holm, decision rule, machine-checkable binding block and a scope declaration — see `docs/design_notes.md` §17 and `DECISION_LOG.md` |
@@ -69,7 +70,7 @@ the design notes, `docs/design_notes.md`).
 | `explib/m0/` | **the M0/S1 driver (adopted B tier)** (`python -m explib.m0`): entry points for the scale-up roadmap — `params` (zero-GPU S1–S4 parameter audit), `data` (FineWeb-Edu + 32k-BPE corpus cache), `smoke` (end-to-end self-check on the B-tier data path), `kernel` (the G0 validation suite: kernel/eager numerical comparison for the three operators plus the sparse-attention throughput benchmark), `full` (the S1 panel); see "B-tier M0/S1" below |
 | `build_report.py` | **compatibility shim** for `_build_report/`, the zero-GPU report builder: regenerates the v7 report from `results_*/` + `analysis_*/` artifacts (every number is computed from disk; protocol constants and analytic FLOPs assumptions are explicit inputs, not measurements) |
 | `fuse_analysis.py` | zero-GPU fuse-vs-no-fuse driver: recomputes per-layer boundary alignment (tol=1), block-length stats and PPL trajectories from a `results_*/summary.json` |
-| `Makefile` | zero-GPU entry points: `make test`, `make plan`, `make audit`, `make install-check`, `make build`, `make clean` |
+| `Makefile` | zero-GPU entry points: `make test`, `make plan`, `make audit`, `make integrity`, `make reproduce`, `make install-check`, `make build`, `make clean` |
 | `docs/design_notes.md` | **design and implementation notes**: why the block-read gate is strict and must be synced across five sites, the dynamic segmenter's prefix-invariance requirement, the pairing/measurability rules, the reporting conventions, and the contracts that keep attention row-chunking equivalent to its unbatched form |
 
 > **The measurement library lives in `explib/`; edit those modules directly.**
@@ -94,6 +95,21 @@ python run_gapfill.py full       # the v6 main experiment (bounded by the run-ti
 python -m explib.rope ...        # per-version supplementary runs; subcommands in each module's help
 python build_report.py           # rebuild the report from on-disk results_*/ + analysis_*/
 ```
+
+If the same cells were executed twice (parallel vs serial, a second machine, or
+a re-run after a fix), verify the second copy instead of trusting the report:
+
+```bash
+python -m explib.reproduce compare results_lm_v6 results_lm_v6_rerun
+# exit 0 only when source bytes, data slice, config, environment, matched
+# initialization and the declared PPL tolerance all line up; use
+# --require exact for a bit-identical demand.
+```
+
+The verifier reports each dimension separately, so `environment_changed`,
+`data_changed`, `code_changed` and `numerical_drift` are not collapsed into one
+"did not reproduce" message. A missing fingerprint is
+`provenance_incomplete` (never a pass).
 
 ## Reproducing (any CUDA box)
 

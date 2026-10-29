@@ -60,6 +60,10 @@
                重排/截断判 fail，缺 anchor 或 anchor 落后为 warning，全部
                事件早于链化的 legacy 账本报 not_verifiable（零 GPU，
                不改任何测量或冻结决定）
+  reproduction  跨运行复现：显式给两份结果目录（或 summary.json），逐格比较
+               源码字节、数据切片、配置、执行环境、匹配初始化与最终 PPL；
+               缺指纹报 not_verifiable，环境/数据/配置/代码变化各报各的，
+               不把「PPL 接近」当成复现（零 GPU，不重跑、不读 test split）
   looks        序列观测 / optional stopping：逐面板 look history 的种子集合、
                逐种子配对差、逐 look p 与 max-over-looks 序列 p 是否自洽；
                朴素最终 p 显著但序列 p 不显著的对照会被点名（零 GPU）

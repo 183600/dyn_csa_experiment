@@ -6110,3 +6110,114 @@ python audit_gates.py report                 # 汇总新增 data_processing 块
 test 使用不同有效几何、held-out 台账不闭合、train 台账不闭合均 `fail`；
 legacy 全部 `not_verifiable_locally`；`_filter_test_documents(protocol=...)`
 用配对协议重建 test 索引。
+
+## 83. 复现是两次独立运行之间的比较，不是一句声明（本轮可复现性/工程规范硬化）
+
+### 83.1 问题
+
+仓库已经有 `reproducibility_check`（同一进程内串行重跑同一小段训练流）和
+`seed_contract_check`（Python/NumPy/Torch/CUDA/DataLoader 的种子来源），也有
+`exec_fp`、`source_tree`、`data_version`、`run_cfg`、`init_core_fp` 等逐记录
+身份字段。但**两份独立产物之间**没有可执行的比较：
+
+- 并行执行器与串行执行的「identical numbers」只在 README 中声明为本地脚本
+  侧检查，仓库没有把它变成任何可重复的命令；
+- 一个 `.freeze_lock.json` / `summary.json` 只能证明自己的来源，不能回答
+  「`results_A` 和 `results_B` 是不是同一实验的两次运行」；
+- 若直接比较 PPL，环境不同、数据切片不同、代码字节不同都会被压成
+  「数值漂移」；反过来，PPL 接近也可能来自不同的执行环境或评测集；
+- `pair_reason` 是**臂间**配对门（A 臂 vs B 臂），不是**同格重跑**门；
+  两者需要不同的输出：前者拒绝一次对照，后者要逐维回答「哪一维变了」。
+
+### 83.2 设计
+
+新增 `exp_lib.reproduction_diagnosis(original, rerun, *, rtol=1e-6,
+atol=0.0)`。它把复现拆成互相独立的维度，每一维只有三种状态：
+`match` / `mismatch` / `unverified`（缺失证据不是相等）：
+
+| 维度 | 比较的字段（任一 mismatch 即该维 mismatch） |
+|---|---|
+| `code` | `provenance.code.source_tree.sha256`；同时核对 `code_semantics` 与 `code_stamp`。只有语义戳、没有源码摘要 -> `unverified` |
+| `data` | 两侧都存在的 `data_fp` / `val_fp` / `eval_fp` / `data_version` / `corpus_fp`；单侧缺失的字段不作为相等证据 |
+| `config` | `run_cfg`、`protocol`、`warm_steps`、`amp_dtype`、`eager_batch`；复用 `training_knobs_reason` 与 `objective_reason`，因此优化器/调度/损失项变化不会被 `run_cfg` 掩盖 |
+| `environment` | `exec_fp`（硬件/驱动/精度/线程类） |
+| `initialization` | `init_core_fp`（同种子共享主干初始化；同种子重跑必须相同） |
+| `rng_state` | `rng_fp` 仅作**诊断**：架构差异本来就会消耗不同 RNG，和 `pair_reason` 的约定一致；mismatch 会写进 `problems`，但不单独判失败 |
+
+`metric` 单独比较 `ppl` 与 `n_tokens`：token 数不同是
+`metric_mismatch`（不是同一次测量），PPL 在 `atol + rtol*|a|` 内为
+`within_tolerance`，严格相等才是 `identical`。判定优先级：
+
+```
+任一 code/data/config/environment/initialization mismatch -> 对应 *_changed
+否则任一 unverified                    -> provenance_incomplete
+否则 metric 缺失/分母不同              -> metric_missing / metric_mismatch
+否则 PPL 严格相等                      -> identical
+否则 PPL 在容差内                      -> within_tolerance
+否则                                    -> numerical_drift
+```
+
+只有 `identical` / `within_tolerance` 的 `reproduced` 为真；
+`bit_identical` 额外要求 PPL 严格相等。**缺任何必需指纹都不是通过**，这和
+仓库其它 tri-state 门一致。
+
+`exp_lib.compare_reproductions(original, rerun, ...)` 接受两份 summary
+mapping、结果目录或 `summary.json` 路径，按 `variant::seedN` 逐格匹配：
+
+- 只在一边出现的格子进入 `only_original` / `only_rerun`，汇总判
+  `incomplete`，不静默取交集；
+- 没有共同格子 -> `not_comparable`；
+- 任一格 `*_changed` -> `not_reproduced`；只有全部身份维匹配而 PPL 漂移
+  才判 `drift`；全部匹配为 `reproduced`；
+- `synthesized`（由旧 aggregate 重建、没有权重/运行的记录）直接
+  `not_comparable`。
+
+### 83.3 入口
+
+```bash
+python -m explib.reproduce compare results_A results_B
+python -m explib.reproduce compare results_A results_B --require exact
+python -m explib.reproduce compare results_A results_B --json reproduction.json
+python audit_gates.py reproduction results_A results_B   # 同样的检查，status=ok/fail/not_verifiable
+make reproduce A=results_A B=results_B
+```
+
+退出码：`0` 复现（`--require exact` 时还要求逐位相同）、`1` 未复现、
+`2` 用法/输入错误。`audit_gates.py report` 的 `reproduction` 块在没有显式
+两份目录时为 `not_verifiable_locally`：审计不会猜哪两个目录是一对重跑。
+
+### 83.4 边界
+
+- 这是**描述性身份比较**，不是统计检验：没有 p 值、没有置信区间，也不
+  修复选择偏差、测量误差或跨硬件数值差异。`rtol`/`atol` 必须由调用方声明
+  并原样回显；`reproduced` 只表示「在这些声明下两产物是同一实验」。
+- 它比较的是**记录里的身份字段**，不重新训练、不重算 PPL、不读取 test
+  split，也不改变 `CODE_SEMANTICS`、冻结清单、种子、端点或 Holm 族。
+- `exec_fp` 相同不等于逐位可复现；不同也不自动说明代码有错（可能是另一
+  台合法机器）。工具把这个区别显式化，而不是替读者裁决。
+- `rng_fp` 只诊断；`init_core_fp`、`data_*`、`source_tree` 等缺失时结果
+  是 `unverified`/`provenance_incomplete`，不会降级成 `match`。
+- 并行 vs 串行、跨机器、修复后重跑都可以用同一命令比较；它不能替代真正
+  的新种子/新运行，也不把「两份相同的旧产物」变成独立证据。
+- 测试套件本身也依赖可复现的失败语义：`dataloader_contract_check` 在
+  `num_workers>0` 前先探测 POSIX semaphore。受限沙箱缺信号量时返回
+  `passed=False` 的干净报告（调用方 skip），而不是让 torch 部分初始化的
+  worker iterator 在 GC 时抛 unraisable `AttributeError`，把零 GPU 门随机
+  变红；这不改变任何训练/评测数值。
+
+### 83.5 验证
+
+```bash
+python -m pytest -q test_review_part_23.py   # 7 项：逐维/容差/缺失/CLI/审计接线
+make reproduce A=<dir> B=<dir>               # 零 GPU
+```
+
+新增 `test_review_part_23.py` 覆盖：完全相同 -> `identical`；容差内 ->
+`within_tolerance`（`bit_identical=False`）；超容差 -> `numerical_drift`；
+源码/数据/配置/环境/初始化分别产生自己的 `*_changed`；同种子不同 `rng_fp`
+只诊断不误判；缺源码摘要/`exec_fp`/`init_core_fp`/数据身份 ->
+`provenance_incomplete`；token 数不同 -> `metric_mismatch`；坏 PPL ->
+`metric_missing`；synthesized -> `not_comparable`；非法容差/非 mapping 输入
+fail-closed；批量报告的 `only_*`/`counts`/`not_comparable` 分支；CLI 的
+0/1/2 退出码、`--require exact`、`--json` 落盘，以及 audit 门的
+ok/fail/not_verifiable 与 `_run_cli` 位置参数接线。
