@@ -162,6 +162,8 @@ def _doc_level_analysis(recs_a, recs_b, common, Ln, primary_deltas=None):
     _unit_influence_reason = None
     _two_level_ci = None
     _two_level_ci_reason = None
+    _variance_components = None
+    _variance_components_reason = None
     if _granularity in ('document', 'article'):
         _nll_a, _why_a = _doc_nll_matrix(rows_a, n_docs, _ref_tok,
                                          unit=_granularity)
@@ -173,6 +175,14 @@ def _doc_level_analysis(recs_a, recs_b, common, Ln, primary_deltas=None):
                 + (_why_a or _why_b
                    or f'{_granularity} NLL vectors are unusable'))
         else:
+            try:
+                _variance_components = L.paired_delta_variance_components(
+                    _nll_a, _nll_b, _ref_tok)
+            except (ValueError, TypeError, FloatingPointError,
+                    OverflowError) as _vce:
+                _variance_components = None
+                _variance_components_reason = (
+                    f'{type(_vce).__name__}: {_vce}')
             _pc = L._paired_nll_doc_ci(_nll_a, _nll_b, _ref_tok)
             if _pc is None:
                 _pooled_ci_reason = (
@@ -318,6 +328,13 @@ def _doc_level_analysis(recs_a, recs_b, common, Ln, primary_deltas=None):
                             'mean is outlier-sensitive).  Both are descriptive: units are not an arm randomisation.'),
            'article_fallback_reason': _article_fallback,
            'note': _unit_notes[_granularity]}
+    if _variance_components is not None:
+        out['variance_components'] = _variance_components
+    else:
+        out['variance_components_unavailable_reason'] = (
+            _variance_components_reason
+            or ('variance decomposition needs per-unit NLL vectors; this '
+                'row-level readout has no unit NLL matrix'))
     if _granularity == 'article':
         out['n_articles'] = int(len(doc_deltas))
         _line_units = rows_a[0].get('ppl_per_doc') if rows_a else None
@@ -827,6 +844,92 @@ def _doc_influence_markdown(ft):
         out += ['**解读提示**：' + '、'.join(frag) +
                 ' 的方向/幅度依赖单个评测单位；引用时必须同时报告该敏感度，'
                 '不能把结论描述为「对评测文档稳健」。', '']
+    return out
+
+
+def _variance_components_markdown(ft):
+    """Render the crossed seed x unit variance decomposition.
+
+    Pure function of the final-test stats dict: the table is a descriptive
+    companion to the two-level bootstrap, not a new test.  The shares answer
+    "where is the noise?" and the allocation column answers "which extra cell
+    would reduce the mean variance most?".
+    """
+    comps = (ft or {}).get('comparisons') if isinstance(ft, dict) else None
+    if not isinstance(comps, dict):
+        return []
+
+    def _pct(value):
+        if isinstance(value, (int, float)) and math.isfinite(float(value)):
+            return f'{100.0 * float(value):.0f}%'
+        return '—'
+
+    def _num(value, fmt='{:.4g}'):
+        if isinstance(value, (int, float)) and math.isfinite(float(value)):
+            return fmt.format(float(value))
+        return '—'
+
+    rows = []
+    missing = []
+    for name, comp in comps.items():
+        if not isinstance(comp, dict):
+            continue
+        dsm = comp.get('doc_sampling')
+        dsm = dsm if isinstance(dsm, dict) else {}
+        vc = dsm.get('variance_components')
+        if not isinstance(vc, dict):
+            if (dsm.get('variance_components_unavailable_reason')
+                    or dsm.get('pooled_delta_ppl_ci95') is not None):
+                missing.append(
+                    f'{name}（{dsm.get("variance_components_unavailable_reason") or "缺少方差分解块"}）')
+            continue
+        unit = {'article': '文章', 'document': '文档'}.get(
+            dsm.get('unit') or dsm.get('granularity'), '单元')
+        status = vc.get('status')
+        if status != 'ok':
+            rows.append('| %s | %s | %s×%s | — | — | — | — | %s | — |'
+                        % (name, unit, vc.get('n_seeds', '—'),
+                           vc.get('n_units', '—'),
+                           '；'.join(vc.get('warnings') or []) or status or '—'))
+            continue
+        c = vc.get('components') or {}
+        eff = vc.get('effective_n') or {}
+        ci = vc.get('mean_ci') or {}
+        alloc = vc.get('allocation') or {}
+        nxt = alloc.get('next_cell')
+        nxt_txt = {'seed': '加种子', 'unit': '加评测单元'}.get(nxt, '—')
+        ci_txt = '—'
+        if isinstance(ci.get('low'), (int, float)) and isinstance(ci.get('high'), (int, float)):
+            ci_txt = f'[{ci["low"]:+.4f}, {ci["high"]:+.4f}]'
+        rows.append('| %s | %s | %s×%s | %s | %s | %s | %s / %s× | %s | %s |'
+                    % (name, unit, vc.get('n_seeds', '—'),
+                       vc.get('n_units', '—'),
+                       _pct((c.get('seed') or {}).get('share')),
+                       _pct((c.get('unit') or {}).get('share')),
+                       _pct((c.get('residual') or {}).get('share')),
+                       _num(eff.get('equivalent'), '{:.1f}'),
+                       _num(eff.get('design_effect'), '{:.1f}'),
+                       nxt_txt, ci_txt))
+    if not rows and not missing:
+        return []
+    out = ['### 种子 × 评测单元方差分解（描述性；不改变冻结判定）', '']
+    if rows:
+        out += ['| 比较 | 单元 | S×D | seed 方差占比 | unit 方差占比 | 残差占比 | 等效独立单元 / 设计效应 | 下一格建议 | 均值 95% CI（NLL/token） |',
+                '|---|---|---|---|---|---|---|---|---|']
+        out.extend(rows)
+        out += ['',
+                '> 模型：`y[s,u] = μ + seed[s] + unit[u] + residual[s,u]`，矩估计'
+                '（two-way ANOVA）。`seed` 占比高表示主要不确定性来自训练随机性，'
+                '加种子的边际收益更大；`unit` 占比高表示结论依赖评测单元组成，'
+                '应扩大/更换评测单元；残差占比高表示单元内 seed×unit 交互大，'
+                '单靠加种子或加单元都不够。`等效独立单元` = 总方差 / 面板均值的方差，'
+                '`设计效应` = 实际格数 / 等效独立单元；二者越接近 1，格子越接近独立。'
+                '均值 CI 对**超总体**（seed 与 unit 都视为随机）而言；'
+                '`mean_ci_conditional_on_units` 固定当前评测单元，只覆盖 seed/残差抽样。'
+                '这些是矩估计与 t 近似，不是拟合的 hierarchical/Bayes 模型；'
+                '种子/单元很少时方差分量本身很不精确，不能据此宣称总体方差。', '']
+    if missing:
+        out += ['> 以下比较没有可用的方差分解块，**未验证**：' + '；'.join(missing) + '。', '']
     return out
 
 

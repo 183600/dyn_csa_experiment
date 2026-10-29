@@ -3693,3 +3693,44 @@ pytest 的 `iniconfig==2.3.1`/`pluggy==1.7.0`/`Pygments==2.21.0`，并把
 `dependency_contract()` 在装过本项目后仍能为 `ok`。`python
 audit_gates.py analysis_integrity`、`python audit_gates.py dependencies`
 与全量 CPU 套件在本轮最终树通过。
+
+## 2026-10-29 — 结果分析补上「方差从哪来」：seed × 评测单元矩估计分解（本轮结果分析硬化，no new runs）
+
+零 GPU；不新增训练、不读取 test split、不修改冻结清单字节/种子/端点/
+alpha/Holm 规则，也不改 `CODE_SEMANTICS`。
+
+**Problem.** 结果表同时有 seed 级精确 sign-flip、document cluster CI 和
+seed×unit 两层 bootstrap，但没有任何读数回答「面板均值的方差主要来自
+种子、评测单元还是 seed×unit 交互」。方差来源不同，下一步完全不同：
+seed 占比高时加评测文档只是把同一训练噪声估得更细；unit 占比高时加种子
+修不了「结论依赖哪几个文档」；残差占比高时单独加任何一轴都不够。把两层
+bootstrap 的区间宽度当作「再加种子会变窄」的依据，等于把未知的方差结构
+当成已知。
+
+**Fix.** 新增 `exp_lib.crossed_variance_components`：对完整平衡的
+`[n_seeds, n_units]` 面板做 two-way ANOVA 矩估计
+`σ²_seed=(MS_seed−MS_e)/D`、`σ²_unit=(MS_unit−MS_e)/S`、`σ²_e=MS_e`；
+负的 raw 估计保留、estimate 截断到 0；报告三个 share/ICC、超总体与
+固定单元两种均值方差、Satterthwaite 均值 CI、等效独立单元/设计效应、
+三类预测区间，以及「下一格加种子还是加单元」的有限差建议。配对端点由
+`paired_delta_variance_components` 在 `(nll_a−nll_b)/n_tokens` 上调用，
+同时报告等权单元均值与 token 池化均值，避免把两个估计量混成一个。
+
+**Wiring.** v12 的 `_doc_level_analysis` 把分解写进
+`doc_sampling.variance_components`；v12 报告新增一节表格（缺失时写
+「未验证」）；`audit_gates.py variance_components` 重放分量和、share、
+`mean_variance`、`effective_n`、区间与 allocation 比例，篡改 fail，旧
+artifact 只 warning。所有既有 p/Holm/`confirmed`/冻结族不变。
+
+**Boundary.** 这是描述性矩估计，不是新的显著性检验；小面板上分量本身
+不精确，没有 hierarchical/Bayes 后验；只接受完整平衡面板；`unit` 仍是
+文章/行级文档/行，行级 readout 无单元 NLL 因而明确不产生该块；residual
+混合了 seed×unit 交互与 token 抽样，不能全解释成测量误差；n_units<64 的
+总体主张门不变。它不替代新运行，也不修复选择偏差或外推问题。
+
+**Verification.** 新增 `test_review_part_27.py` 9 项：精确可加面板恢复
+行/列样本方差；checkerboard 负矩估计 raw/truncation/share；常数面板
+`not_estimable`；1e6 缩放不变性；非法输入与 conf 拒绝；配对 wrapper 与
+手工 per-token 矩阵一致；报告渲染与缺块分支；审计门一致 artifact ok、
+篡改 total/mean variance fail、无块 `not_verifiable_locally`。完整 CPU
+套件与 `python audit_gates.py variance_components` 在本轮最终树通过。

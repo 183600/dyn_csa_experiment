@@ -1378,8 +1378,261 @@ def audit_analysis_integrity(paths=None):
     return out
 
 
+def audit_variance_components(path=None):
+    """Replay the crossed seed x unit variance decomposition from its cells.
+
+    The decomposition is descriptive, but it is still a quotable result: a
+    component total that does not equal the sum of its parts, a share that is
+    not ``component / total``, a mean variance that does not equal
+    ``s/S + u/D + e/(S*D)``, or an effective N that does not equal
+    ``total / var(mean)`` is a tampered/internally inconsistent artifact, not
+    a difference of opinion.  Legacy artifacts without the block are
+    ``warnings`` (the analysis predates the field), never a pass.
+    """
+    L = _import_exp_lib()
+    p = path or os.path.join(REPO, 'analysis_v12', 'test_stats.json')
+    out = {'kind': 'variance_components_audit', 'status': 'ok', 'path': p,
+           'comparisons': {}, 'n_checked': 0, 'n_ok': 0, 'n_legacy': 0,
+           'n_not_estimable': 0, 'n_warnings': 0,
+           'problems': [], 'warnings': [],
+           'note': ('replays the descriptive crossed seed x unit decomposition; '
+                    'it adds no test and never changes a frozen p/Holm/verdict')}
+    if not os.path.exists(p):
+        out['status'] = 'not_verifiable_locally'
+        out['reason'] = 'no final-test stats artifact on disk'
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return out
+    data = _load(p)
+    if not isinstance(data, dict):
+        out['status'] = 'fail'
+        out['problems'].append(f'{p} exists but is not a readable JSON object')
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return out
+    ft = data.get('finaltest') if isinstance(data.get('finaltest'), dict) else data
+    comps = ft.get('comparisons') if isinstance(ft, dict) else None
+    if not isinstance(comps, dict) or not comps:
+        out['status'] = 'not_verifiable_locally'
+        out['reason'] = 'no per-comparison block in the final-test stats artifact'
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return out
+
+    def _check(name, vc, dsm):
+        probs, warns = [], []
+        if not isinstance(vc, dict):
+            return ['variance_components is not an object'], warns
+        status = vc.get('status')
+        if status not in ('ok', 'not_estimable'):
+            probs.append(f'unknown status {status!r}')
+            return probs, warns
+        S = vc.get('n_seeds')
+        D = vc.get('n_units')
+        if (not isinstance(S, int) or isinstance(S, bool) or S < 2
+                or not isinstance(D, int) or isinstance(D, bool) or D < 2):
+            probs.append(f'n_seeds/n_units must be integers >=2, got {S!r}/{D!r}')
+            return probs, warns
+        if vc.get('n_cells') != S * D:
+            probs.append(f"n_cells {vc.get('n_cells')!r} != n_seeds*n_units {S * D}")
+        if isinstance(dsm, dict):
+            if dsm.get('n_seeds') is not None and dsm.get('n_seeds') != S:
+                probs.append(f"doc_sampling n_seeds {dsm.get('n_seeds')!r} != "
+                             f'variance n_seeds {S}')
+            if dsm.get('n_units') is not None and dsm.get('n_units') != D:
+                probs.append(f"doc_sampling n_units {dsm.get('n_units')!r} != "
+                             f'variance n_units {D}')
+        if status != 'ok':
+            warns.append(vc.get('warnings') or
+                         'not estimable (constant panel or unusable scale)')
+            return probs, warns
+
+        def _fin(value):
+            f = L._finite_scalar(value)
+            return f if f is not None else None
+
+        c = vc.get('components')
+        if not isinstance(c, dict):
+            probs.append('components block missing')
+            return probs, warns
+        est = {}
+        raw = {}
+        for key in ('seed', 'unit', 'residual'):
+            rec = c.get(key)
+            if not isinstance(rec, dict):
+                probs.append(f'components[{key!r}] missing')
+                continue
+            e = _fin(rec.get('estimate'))
+            r = _fin(rec.get('raw'))
+            if e is None or e < 0.0:
+                probs.append(f'components[{key!r}].estimate must be finite >=0, '
+                             f'got {rec.get("estimate")!r}')
+            else:
+                est[key] = e
+            if r is None:
+                probs.append(f'components[{key!r}].raw must be finite, '
+                             f'got {rec.get("raw")!r}')
+            else:
+                raw[key] = r
+        if len(est) != 3:
+            return probs, warns
+        total = _fin(vc.get('total_variance'))
+        total_raw = _fin(vc.get('total_variance_raw'))
+        if total is None or total < 0.0:
+            probs.append(f'total_variance must be finite >=0, got {vc.get("total_variance")!r}')
+            return probs, warns
+        if total_raw is None:
+            probs.append(f'total_variance_raw must be finite, got {vc.get("total_variance_raw")!r}')
+        if not _pvr_close(total, sum(est.values())):
+            probs.append(f'total_variance {total!r} != sum(components) '
+                         f'{sum(est.values())!r}')
+        if total_raw is not None and not _pvr_close(total_raw, sum(raw.values())):
+            probs.append(f'total_variance_raw {total_raw!r} != sum(raw) '
+                         f'{sum(raw.values())!r}')
+        if total <= 0.0:
+            probs.append('status ok but total_variance is zero')
+            return probs, warns
+        for key in ('seed', 'unit', 'residual'):
+            share = _fin((c.get(key) or {}).get('share'))
+            want = est[key] / total
+            if share is None or not _pvr_close(share, want):
+                probs.append(f'components[{key!r}].share {share!r} != '
+                             f'estimate/total {want!r}')
+        icc = vc.get('icc')
+        if not isinstance(icc, dict):
+            probs.append('icc block missing')
+        else:
+            for key in ('seed', 'unit', 'residual'):
+                got = _fin(icc.get(key))
+                want = est[key] / total
+                if got is None or not _pvr_close(got, want):
+                    probs.append(f'icc[{key!r}] {got!r} != {want!r}')
+        mv = vc.get('mean_variance')
+        if not isinstance(mv, dict):
+            probs.append('mean_variance block missing')
+            return probs, warns
+        want_mv = {
+            'seed': est['seed'] / S,
+            'unit': est['unit'] / D,
+            'residual': est['residual'] / (S * D),
+        }
+        want_total = sum(want_mv.values())
+        want_cond = want_mv['seed'] + want_mv['residual']
+        for key, want in want_mv.items():
+            got = _fin(mv.get(key))
+            if got is None or not _pvr_close(got, want):
+                probs.append(f'mean_variance[{key!r}] {got!r} != {want!r}')
+        for key, want in (('total', want_total),
+                          ('conditional_on_units', want_cond)):
+            got = _fin(mv.get(key))
+            if got is None or not _pvr_close(got, want):
+                probs.append(f'mean_variance[{key!r}] {got!r} != {want!r}')
+        se = _fin(mv.get('se'))
+        if se is None or not _pvr_close(se, math.sqrt(want_total)):
+            probs.append(f'mean_variance.se {se!r} != sqrt({want_total!r})')
+        grand = _fin(vc.get('grand_mean'))
+        if grand is None:
+            probs.append(f'grand_mean is not finite ({vc.get("grand_mean")!r})')
+            return probs, warns
+        for label in ('mean_ci', 'mean_ci_conditional_on_units'):
+            ci = vc.get(label)
+            if not isinstance(ci, dict):
+                probs.append(f'{label} missing')
+                continue
+            lo, hi = _fin(ci.get('low')), _fin(ci.get('high'))
+            if lo is None or hi is None or lo > hi or not (lo <= grand <= hi):
+                probs.append(f'{label} must be an ordered interval containing '
+                             f'grand_mean, got {ci!r}')
+            half = _fin(ci.get('halfwidth'))
+            if half is not None and lo is not None and hi is not None:
+                if not _pvr_close(half, 0.5 * (hi - lo)):
+                    probs.append(f'{label}.halfwidth {half!r} != (hi-lo)/2')
+        eff = vc.get('effective_n')
+        if not isinstance(eff, dict):
+            probs.append('effective_n block missing')
+        else:
+            if eff.get('iid_cells') != S * D:
+                probs.append(f"effective_n.iid_cells {eff.get('iid_cells')!r} != {S * D}")
+            eq = _fin(eff.get('equivalent'))
+            de = _fin(eff.get('design_effect'))
+            want_eq = total / want_total if want_total > 0.0 else None
+            if want_eq is not None:
+                if eq is None or not _pvr_close(eq, want_eq):
+                    probs.append(f'effective_n.equivalent {eq!r} != total/var(mean) {want_eq!r}')
+                if de is None or not _pvr_close(de, (S * D) / want_eq):
+                    probs.append(f'effective_n.design_effect {de!r} != n_cells/equivalent '
+                                 f'{(S * D) / want_eq!r}')
+        preds = vc.get('prediction_intervals')
+        if isinstance(preds, dict):
+            for label, ci in preds.items():
+                if not isinstance(ci, dict):
+                    probs.append(f'prediction_intervals[{label!r}] is not an object')
+                    continue
+                lo, hi = _fin(ci.get('low')), _fin(ci.get('high'))
+                if lo is None or hi is None or lo > hi or not (lo <= grand <= hi):
+                    probs.append(f'prediction_intervals[{label!r}] must be an '
+                                 f'ordered interval containing grand_mean')
+        elif preds is not None:
+            probs.append('prediction_intervals is not an object')
+        alloc = vc.get('allocation')
+        if isinstance(alloc, dict) and alloc.get('status') == 'ok':
+            if alloc.get('next_cell') not in ('seed', 'unit'):
+                probs.append(f"allocation.next_cell must be 'seed' or 'unit', "
+                             f"got {alloc.get('next_cell')!r}")
+            ratio = alloc.get('recommended_seed_to_unit_ratio')
+            if ratio is not None:
+                r = _fin(ratio)
+                want_ratio = (math.sqrt(est['seed'] / est['unit'])
+                              if est['unit'] > 0.0 else math.inf)
+                if r is None or not _pvr_close(r, want_ratio):
+                    probs.append(f'allocation.recommended_seed_to_unit_ratio '
+                                 f'{ratio!r} != sqrt(seed/unit) {want_ratio!r}')
+        return probs, warns
+
+    for name, comp in comps.items():
+        if not isinstance(comp, dict):
+            continue
+        dsm = comp.get('doc_sampling')
+        if not isinstance(dsm, dict):
+            continue
+        vc = dsm.get('variance_components')
+        if vc is None and 'omitted' in comp:
+            continue
+        if vc is None:
+            reason = dsm.get('variance_components_unavailable_reason')
+            if reason:
+                out['n_not_estimable'] += 1
+                out['warnings'].append(f'{name}: {reason}')
+            else:
+                out['n_legacy'] += 1
+                out['warnings'].append(
+                    f'{name}: no variance_components block (artifact predates '
+                    'the decomposition)')
+            continue
+        probs, warns = _check(name, vc, dsm)
+        out['n_checked'] += 1
+        if probs:
+            out['comparisons'][name] = {'status': 'fail', 'problems': probs}
+            out['problems'].extend(f'{name}: {x}' for x in probs)
+        elif warns:
+            out['n_warnings'] += 1
+            out['comparisons'][name] = {'status': 'warnings', 'warnings': warns}
+            out['warnings'].extend(f'{name}: {x}' for x in warns)
+        else:
+            out['n_ok'] += 1
+            out['comparisons'][name] = {'status': 'ok'}
+    if out['problems']:
+        out['status'] = 'fail'
+    elif out['n_checked'] == 0:
+        out['status'] = 'not_verifiable_locally'
+        out['reason'] = ('no comparison carries a variance_components block; '
+                         'run the analysis with the current code to produce one')
+    elif out['warnings']:
+        out['status'] = 'warnings'
+    print(json.dumps({k: v for k, v in out.items() if k != 'comparisons'},
+                     ensure_ascii=False, indent=2))
+    return out
+
+
 def run_report(out='audit_report.json'):
-    res = {'generated_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'source_tree': audit_source_integrity(), 'dependencies': audit_dependencies(), 'data_source': audit_data_source(), 'leakage': audit_leakage(), 'split_discipline': audit_split_discipline(), 'document_unit': audit_document_unit(), 'sample_design': audit_sample_design(), 'data_processing': audit_data_processing(), 'attribution': audit_attribution(), 'boundary': audit_boundary(), 'length': audit_length(), 'fairness': audit_fairness(), 'metrics': audit_metrics(), 'tuning': audit_tuning(), 'simple_baseline': audit_simple_baseline(), 'hypotheses': audit_hypotheses(), 'sesoi': audit_sesoi_declaration(), 'baseline_sesoi': audit_baseline_sesoi(), 'interaction_sesoi': audit_interaction_sesoi(), 'unit_influence': audit_unit_influence(), 'two_level_ci': audit_two_level_ci(), 'analysis_choices': audit_analysis_choices(), 'analysis_integrity': audit_analysis_integrity(), 'experiment_ledger': audit_experiment_ledger(), 'verdicts': audit_confirmation_verdicts(), 'pvalue_replay': audit_confirmation_pvalues(), 'looks': audit_look_history(), 'methodology': audit_methodology(), 'single_factor': audit_single_factor(), 'content_controls': audit_content_controls(), 'sink_controls': audit_sink_controls(), 'factorial': audit_factorial_design(), 'interaction_coverage': audit_interaction_coverage(verbose=False), 'factorial_anchor': audit_factorial_anchor(verbose=False), 'design_preflight': audit_design_preflight(), 'sensitivity': audit_design_sensitivity(), 'evaluation': audit_evaluation_design(), 'dose_response': audit_dose_response(verbose=False), 'failures': audit_failures(), 'budget': audit_budget(), 'training_health': audit_training_health(), 'efficiency_pairs': audit_efficiency_pairs(), 'error_case_inference': audit_error_case_inference(), 'release': audit_release_readiness(), 'selection': audit_selection(), 'run_order': audit_run_order(), 'run_allocation': audit_run_allocation(), 'evaluation_order': audit_evaluation_order(), 'reproduction': audit_reproduction(), 'calibration': audit_statistical_calibration()}
+    res = {'generated_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'source_tree': audit_source_integrity(), 'dependencies': audit_dependencies(), 'data_source': audit_data_source(), 'leakage': audit_leakage(), 'split_discipline': audit_split_discipline(), 'document_unit': audit_document_unit(), 'sample_design': audit_sample_design(), 'data_processing': audit_data_processing(), 'attribution': audit_attribution(), 'boundary': audit_boundary(), 'length': audit_length(), 'fairness': audit_fairness(), 'metrics': audit_metrics(), 'tuning': audit_tuning(), 'simple_baseline': audit_simple_baseline(), 'hypotheses': audit_hypotheses(), 'sesoi': audit_sesoi_declaration(), 'baseline_sesoi': audit_baseline_sesoi(), 'interaction_sesoi': audit_interaction_sesoi(), 'unit_influence': audit_unit_influence(), 'two_level_ci': audit_two_level_ci(), 'variance_components': audit_variance_components(), 'analysis_choices': audit_analysis_choices(), 'analysis_integrity': audit_analysis_integrity(), 'experiment_ledger': audit_experiment_ledger(), 'verdicts': audit_confirmation_verdicts(), 'pvalue_replay': audit_confirmation_pvalues(), 'looks': audit_look_history(), 'methodology': audit_methodology(), 'single_factor': audit_single_factor(), 'content_controls': audit_content_controls(), 'sink_controls': audit_sink_controls(), 'factorial': audit_factorial_design(), 'interaction_coverage': audit_interaction_coverage(verbose=False), 'factorial_anchor': audit_factorial_anchor(verbose=False), 'design_preflight': audit_design_preflight(), 'sensitivity': audit_design_sensitivity(), 'evaluation': audit_evaluation_design(), 'dose_response': audit_dose_response(verbose=False), 'failures': audit_failures(), 'budget': audit_budget(), 'training_health': audit_training_health(), 'efficiency_pairs': audit_efficiency_pairs(), 'error_case_inference': audit_error_case_inference(), 'release': audit_release_readiness(), 'selection': audit_selection(), 'run_order': audit_run_order(), 'run_allocation': audit_run_allocation(), 'evaluation_order': audit_evaluation_order(), 'reproduction': audit_reproduction(), 'calibration': audit_statistical_calibration()}
     L_atomic = None
     try:
         L = _import_exp_lib()
@@ -1399,7 +1652,7 @@ def run_report(out='audit_report.json'):
 
 
 def _run_cli():
-    _cmds = {'leakage': audit_leakage, 'split': audit_split_discipline, 'split_discipline': audit_split_discipline, 'document_unit': audit_document_unit, 'unit': audit_document_unit, 'sample_design': audit_sample_design, 'sampling': audit_sample_design, 'sample': audit_sample_design, 'data_processing': audit_data_processing, 'dedup_protocol': audit_data_processing, 'dedup': audit_data_processing, 'cleaning': audit_data_processing, 'causality': audit_causality, 'attribution': audit_attribution, 'boundary': audit_boundary, 'length': audit_length, 'fairness': audit_fairness, 'metrics': audit_metrics, 'tuning': audit_tuning, 'simple': audit_simple_baseline, 'baseline_floor': audit_simple_baseline, 'baseline_plan': audit_baseline_design, 'hypothesis_coverage': audit_hypothesis_coverage, 'hypotheses': audit_hypotheses, 'sesoi': audit_sesoi_declaration, 'baseline_sesoi': audit_baseline_sesoi, 'baseline_sesoi_declaration': audit_baseline_sesoi, 'interaction_sesoi': audit_interaction_sesoi, 'interaction': audit_interaction_sesoi, 'unit_influence': audit_unit_influence, 'influence': audit_unit_influence, 'two_level_ci': audit_two_level_ci, 'two_level': audit_two_level_ci, 'total_uncertainty': audit_two_level_ci, 'joint_ci': audit_two_level_ci, 'analysis_choices': audit_analysis_choices, 'specification_curve': audit_analysis_choices, 'analysis_integrity': audit_analysis_integrity, 'artifact_integrity': audit_analysis_integrity, 'content_integrity': audit_analysis_integrity, 'experiment_ledger': audit_experiment_ledger, 'event_ledger': audit_experiment_ledger, 'ledger': audit_experiment_ledger, 'verdicts': audit_confirmation_verdicts, 'verdict': audit_confirmation_verdicts, 'three_way': audit_confirmation_verdicts, 'pvalues': audit_confirmation_pvalues, 'pvalue_replay': audit_confirmation_pvalues, 'recompute_p': audit_confirmation_pvalues, 'analysis_choice': audit_analysis_choices, 'looks': audit_look_history, 'look_history': audit_look_history, 'methodology': audit_methodology, 'single_factor': audit_single_factor, 'content_controls': audit_content_controls, 'sink_controls': audit_sink_controls, 'sink_placebo': audit_sink_controls, 'control_ladder': audit_content_controls, 'content_alignment': audit_content_controls, 'factorial': audit_factorial_design, 'factorial_design': audit_factorial_design, 'interaction_coverage': audit_interaction_coverage, 'interaction_scope': audit_interaction_coverage, 'factorial_anchor': audit_factorial_anchor, 'component_anchor': audit_factorial_anchor, 'design': audit_design_preflight, 'design_preflight': audit_design_preflight, 'sensitivity': audit_design_sensitivity, 'design_sensitivity': audit_design_sensitivity, 'precision': audit_design_sensitivity, 'evaluation': audit_evaluation_design, 'evaluation_design': audit_evaluation_design, 'unit_precision': audit_evaluation_design, 'dose_response': audit_dose_response, 'dose_response_design': audit_dose_response, 'failures': audit_failures, 'budget': audit_budget, 'efficiency': audit_efficiency_demo, 'efficiency_pairs': audit_efficiency_pairs, 'training_health': audit_training_health, 'selection': audit_selection, 'release': audit_release_readiness, 'run_order': audit_run_order, 'run_allocation': audit_run_allocation, 'allocation': audit_run_allocation, 'environment_balance': audit_run_allocation, 'evaluation_order': audit_evaluation_order, 'eval_order': audit_evaluation_order, 'measurement_order': audit_evaluation_order, 'reproduction': audit_reproduction, 'reproduce': audit_reproduction, 'replication': audit_reproduction, 'rerun_check': audit_reproduction, 'error_case_inference': audit_error_case_inference, 'error_buckets': audit_error_case_inference, 'calibration': audit_statistical_calibration, 'stats_calibration': audit_statistical_calibration, 'type_i': audit_statistical_calibration, 'source': audit_source_integrity, 'source_tree': audit_source_integrity, 'dependencies': audit_dependencies, 'dependency': audit_dependencies, 'data_source': audit_data_source, 'dataset_source': audit_data_source, 'report': run_report}
+    _cmds = {'leakage': audit_leakage, 'split': audit_split_discipline, 'split_discipline': audit_split_discipline, 'document_unit': audit_document_unit, 'unit': audit_document_unit, 'sample_design': audit_sample_design, 'sampling': audit_sample_design, 'sample': audit_sample_design, 'data_processing': audit_data_processing, 'dedup_protocol': audit_data_processing, 'dedup': audit_data_processing, 'cleaning': audit_data_processing, 'causality': audit_causality, 'attribution': audit_attribution, 'boundary': audit_boundary, 'length': audit_length, 'fairness': audit_fairness, 'metrics': audit_metrics, 'tuning': audit_tuning, 'simple': audit_simple_baseline, 'baseline_floor': audit_simple_baseline, 'baseline_plan': audit_baseline_design, 'hypothesis_coverage': audit_hypothesis_coverage, 'hypotheses': audit_hypotheses, 'sesoi': audit_sesoi_declaration, 'baseline_sesoi': audit_baseline_sesoi, 'baseline_sesoi_declaration': audit_baseline_sesoi, 'interaction_sesoi': audit_interaction_sesoi, 'interaction': audit_interaction_sesoi, 'unit_influence': audit_unit_influence, 'influence': audit_unit_influence, 'two_level_ci': audit_two_level_ci, 'two_level': audit_two_level_ci, 'total_uncertainty': audit_two_level_ci, 'joint_ci': audit_two_level_ci, 'variance_components': audit_variance_components, 'variance': audit_variance_components, 'variance_decomposition': audit_variance_components, 'analysis_choices': audit_analysis_choices, 'specification_curve': audit_analysis_choices, 'analysis_integrity': audit_analysis_integrity, 'artifact_integrity': audit_analysis_integrity, 'content_integrity': audit_analysis_integrity, 'experiment_ledger': audit_experiment_ledger, 'event_ledger': audit_experiment_ledger, 'ledger': audit_experiment_ledger, 'verdicts': audit_confirmation_verdicts, 'verdict': audit_confirmation_verdicts, 'three_way': audit_confirmation_verdicts, 'pvalues': audit_confirmation_pvalues, 'pvalue_replay': audit_confirmation_pvalues, 'recompute_p': audit_confirmation_pvalues, 'analysis_choice': audit_analysis_choices, 'looks': audit_look_history, 'look_history': audit_look_history, 'methodology': audit_methodology, 'single_factor': audit_single_factor, 'content_controls': audit_content_controls, 'sink_controls': audit_sink_controls, 'sink_placebo': audit_sink_controls, 'control_ladder': audit_content_controls, 'content_alignment': audit_content_controls, 'factorial': audit_factorial_design, 'factorial_design': audit_factorial_design, 'interaction_coverage': audit_interaction_coverage, 'interaction_scope': audit_interaction_coverage, 'factorial_anchor': audit_factorial_anchor, 'component_anchor': audit_factorial_anchor, 'design': audit_design_preflight, 'design_preflight': audit_design_preflight, 'sensitivity': audit_design_sensitivity, 'design_sensitivity': audit_design_sensitivity, 'precision': audit_design_sensitivity, 'evaluation': audit_evaluation_design, 'evaluation_design': audit_evaluation_design, 'unit_precision': audit_evaluation_design, 'dose_response': audit_dose_response, 'dose_response_design': audit_dose_response, 'failures': audit_failures, 'budget': audit_budget, 'efficiency': audit_efficiency_demo, 'efficiency_pairs': audit_efficiency_pairs, 'training_health': audit_training_health, 'selection': audit_selection, 'release': audit_release_readiness, 'run_order': audit_run_order, 'run_allocation': audit_run_allocation, 'allocation': audit_run_allocation, 'environment_balance': audit_run_allocation, 'evaluation_order': audit_evaluation_order, 'eval_order': audit_evaluation_order, 'measurement_order': audit_evaluation_order, 'reproduction': audit_reproduction, 'reproduce': audit_reproduction, 'replication': audit_reproduction, 'rerun_check': audit_reproduction, 'error_case_inference': audit_error_case_inference, 'error_buckets': audit_error_case_inference, 'calibration': audit_statistical_calibration, 'stats_calibration': audit_statistical_calibration, 'type_i': audit_statistical_calibration, 'source': audit_source_integrity, 'source_tree': audit_source_integrity, 'dependencies': audit_dependencies, 'dependency': audit_dependencies, 'data_source': audit_data_source, 'dataset_source': audit_data_source, 'report': run_report}
     _arg = sys.argv[1] if len(sys.argv) > 1 else 'report'
     if _arg in ('-h', '--help'):
         print(__doc__)

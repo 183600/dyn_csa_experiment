@@ -6628,3 +6628,128 @@ python -m pytest -q test_review_part_05.py::test_selection_attribution_contract
 测试新增 3-cell 分支：每个 cell 的 raw p=0.03125，Holm/3 后
 `p_holm≈0.09375`，三个 `claim_allowed` 全为 false，`claim_family.m==3`；
 单 cell 的历史 `claim_allowed=True` 保持。
+
+## 89. 结果分析要说明「方差从哪来」：seed × 评测单元的矩估计方差分解（本轮结果分析硬化）
+
+### 89.1 问题：两层 bootstrap 给了区间，却没有回答「加种子还是加评测单元」
+
+`paired_nll_two_way_bootstrap`（§81）同时重采样训练种子和评测单元，给出
+一个总不确定性的描述性区间；`unit_precision_design`（§69）回答「冻结的
+评测单元数能估多准」。两者都重要，但它们不回答一个更基本的结果分析问题：
+**观测到的面板均值方差，主要来自种子、评测单元，还是 seed×unit 交互？**
+
+这个区分会直接改变下一步：
+
+- 若方差主要在 **seed** 轴，扩大评测文档只会让同一个训练噪声估得更细，
+  不会让「换一个种子是否复现」更确定；
+- 若方差主要在 **unit** 轴，加种子不会修复「结论依赖哪几个评测文档」的
+  问题，应该扩大/更换评测单元；
+- 若 **残差（seed×unit 交互）** 占主导，单独加种子或加单元都不够，因为
+  效应在不同种子和不同文档的组合上本身就不稳定。
+
+当 S=12、D=48 时，同一个 ±Δ 区间可以由 80/20 或 20/80 的方差结构产生，
+而现有报告只把它们显示成同一个「总不确定性」。把两层 bootstrap 的区间
+宽度当作「再加几个种子就能变窄」的依据，是把方差来源当成了已知。
+
+### 89.2 方法：平衡交叉设计的矩估计（two-way ANOVA）
+
+对 `[n_seeds, n_units]` 的完整面板 `y[s,u]` 建平衡交叉随机效应模型
+
+```
+y[s,u] = μ + seed[s] + unit[u] + residual[s,u]
+```
+
+用两因素 ANOVA 的均方做矩估计：
+
+```
+MS_seed = D · Σ_s(ȳ_s. − ȳ..)² / (S−1)
+MS_unit = S · Σ_u(ȳ_.u − ȳ..)² / (D−1)
+MS_e    = Σ_{s,u}(y_su − ȳ_s. − ȳ_.u + ȳ..)² / ((S−1)(D−1))
+
+σ²_seed = (MS_seed − MS_e) / D
+σ²_unit = (MS_unit − MS_e) / S
+σ²_e    = MS_e
+```
+
+- 矩估计可能出现负值；`raw` 保留负估计，`estimate` 截断到 0，并在
+  `negative_components` / `warnings` 中点名。零方差不能被伪装成「精确
+  测量」。
+- 面板均值的方差为
+  `σ²_seed/S + σ²_unit/D + σ²_e/(S·D)`；固定当前评测单元（只覆盖种子和
+  残差抽样）时为 `σ²_seed/S + σ²_e/(S·D)`。两个口径分开报告，避免把
+  「超总体均值」的区间当成「这个冻结切片均值」的区间。
+- 均值区间用 Satterthwaite 自由度；`等效独立单元 = 总方差 / Var(mean)`，
+  `设计效应 = S·D / 等效独立单元`。它们把「48 个评测单元」翻译成「实际
+  相当于多少个独立观测」。
+- 预测区间分开命名：`new_cell`（新种子×新单元）、
+  `new_seed_same_units`（在冻结评测切片上重训一个种子）、
+  `new_unit_same_seeds`（固定种子面板换一个评测单元）。三者目标不同，
+  不能互相替代，也不能都当作均值 CI。
+- 分配读数：固定总格数时最小化均值方差的连续最优比为
+  `S*/D* = sqrt(σ²_seed / σ²_unit)`；当前设计下「下一格加种子还是加单元」
+  用精确有限差 `σ²_seed/(S(S+1))` 与 `σ²_unit/(D(D+1))` 比较。它回答的是
+  「下一步边际收益」，不是「必须按这个比例重跑」。
+- 对配对端点，`paired_delta_variance_components(nll_a, nll_b, n_tokens)`
+  在 `(nll_a − nll_b)/n_tokens` 的格矩阵上做同一分解，并同时报告等权
+  单元均值与 token 池化均值。两者在文档长度不齐时本来就不是同一个估计量；
+  方差分解描述的是等宽格矩阵，主终点仍是 token 池化 Δ。
+
+### 89.3 接线：只增加描述，不进入冻结判定
+
+- 新增 `explib/_parts/part_38_variance_components.py`，`exp_lib` 直接
+  导出 `crossed_variance_components` 与
+  `paired_delta_variance_components`。
+- v12 的 `_doc_level_analysis` 在已有 NLL 矩阵上附加
+  `doc_sampling.variance_components`；已有 `pooled_delta_ppl_ci95`、
+  `pooled_two_level_ci95`、`unit_influence`、`analysis_choice_concordance`
+  全部保留。
+- v12 报告新增「种子 × 评测单元方差分解」表：三个方差占比、等效独立
+  单元/设计效应、下一格建议、均值 CI。缺块时明确写「未验证」，不静默
+  跳过。
+- `audit_gates.py variance_components` 重放同一组恒等式：分量和等于总方差、
+  share=component/total、`mean_variance` 等于 `s/S+u/D+e/(SD)`、
+  `effective_n=total/Var(mean)`、区间包含均值、allocation 比例等于
+  `sqrt(seed/unit)`。篡改任一数字 fail；旧 artifact 没有该块只给 warning
+  （`not_verifiable_locally` / `warnings`），不假绿。
+- 该块不重算 PPL、p、Holm 或 `confirmed`，不进入冻结族，不改变
+  `confirmation_frozen.json` 的字节、种子、α、终点或 `CODE_SEMANTICS`。
+
+### 89.4 边界
+
+- **这是描述性方差分解，不是新的显著性检验。** 它不提供「种子效应显著」
+  或「文档异质性显著」的 p 值；`MS_seed/MS_e` 的 F 检验在本仓库的小样本
+  与选择偏差下不会比已有的精确 sign-flip 更可信。
+- **矩估计在小面板上很不精确。** S=12、D=48 已经能给出有用的量级，但
+  分量本身的抽样误差没有解析地传播；报告的是点估计与近似 t 区间，不是
+  拟合的 hierarchical/Bayes 后验。`negative_components` 出现时应把分解
+  读作「没有可检测的该轴方差」，而不是「该轴方差精确为 0」。
+- **只接受完整平衡面板。** 缺一格就拒绝，而不是按可用格做不平衡 ANOVA；
+  后者需要另一套估计与自由度，不能悄悄替换。
+- **`unit` 的身份仍是文章/行级文档/行。** 文章是独立语料单元；WikiText
+  的行级 document 会把同一文章段落伪重复。行级 readout 没有单元 NLL
+  矩阵，因此不产生该分解，并明确写出原因。
+- **残差不是纯「测量误差」。** 它包含 seed×unit 交互、token 级抽样和
+  未建模的异质性；不能把 residual 全部解释为评测噪声。
+- **均值 CI 的目标要写清楚。** 超总体区间把 unit 也当随机抽样；条件区间
+  固定当前评测单元。仓库仍然拒绝在 n_units<64 时做总体主张，方差分解
+  不会绕过这道门。
+- **不替代新运行。** 它不能修复选择偏差、winner's curse、跨规模/跨语料
+  外推，也不能证明「再加 6 个种子就会显著」；它只是把已有面板的方差
+  结构说清楚。
+
+### 89.5 验证
+
+```bash
+python -m pytest -q test_review_part_27.py
+python audit_gates.py variance_components
+python -m pytest -q            # 完整 CPU 套件
+```
+
+`test_review_part_27.py` 9 项覆盖：精确可加面板恢复行/列样本方差且残差
+为零；checkerboard 的负矩估计保留 raw、截断 estimate、share=0；常数面板
+`not_estimable` 而不是零宽区间；1e6 缩放下 share/ICC/等效 N 不变、分量
+按平方缩放；非矩阵/单行/单列/NaN/inf/ragged/bool/非法 conf 全部拒绝；
+配对 NLL wrapper 与手工 `(A−B)/tokens` 一致且等权/池化均值分开；报告
+渲染含占比与「未验证」分支；审计门通过一致 artifact、对篡改
+`total_variance`/`mean_variance` fail、无分解块时
+`not_verifiable_locally` 而非 pass。

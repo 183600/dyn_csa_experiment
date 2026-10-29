@@ -1151,6 +1151,9 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
         _doc_inf_lines = _doc_influence_markdown(ft)
         if _doc_inf_lines:
             lines.extend(_doc_inf_lines)
+        _var_lines = _variance_components_markdown(ft)
+        if _var_lines:
+            lines.extend(_var_lines)
         _choice_lines = _analysis_choice_markdown(ft)
         if _choice_lines:
             lines.extend(_choice_lines)
