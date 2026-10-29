@@ -1947,6 +1947,44 @@ def test_kernel_det_scatter_precision_and_nonfinite_topk():
         exp_v, exp_i = torch.sort(x, dim=-1, descending=True, stable=True)
         assert torch.equal(got_i, exp_i[..., :k]), (k, got_i, exp_i)
         assert torch.equal(got_v.nan_to_num(0), exp_v[..., :k].nan_to_num(0)), (k, got_v, exp_v)
+    # +/-inf is a routine indexer mask, not a NaN.  The fast rank/scatter path
+    # must handle it without falling back to an O(Bm) full sort.
+    x_inf = torch.tensor([[1.0, 0.5, float('-inf'), float('-inf')]])
+    _orig_sort = torch.sort
+    _calls = []
+
+    def _spy_sort(*args, **kwargs):
+        _calls.append(tuple(args[0].shape))
+        return _orig_sort(*args, **kwargs)
+
+    torch.sort = _spy_sort
+    try:
+        got_v, got_i = CK._stable_topk_desc(x_inf, 2)
+    finally:
+        torch.sort = _orig_sort
+    exp_v, exp_i = _orig_sort(x_inf, dim=-1, descending=True, stable=True)
+    assert not _calls, _calls
+    assert torch.equal(got_i, exp_i[..., :2]), (got_i, exp_i)
+    assert torch.equal(got_v, exp_v[..., :2]), (got_v, exp_v)
+
+
+def test_kernel_dense_arange_checks_budget_before_allocating():
+    import csa_kernels as CK
+    # The stride-0 lane table must remain available at long context.
+    lane = CK._full_arange_cached(1, 3, 4, 'cpu', contiguous=False)
+    assert lane.shape == (1, 3, 4)
+    # The batch/sequence axes are expanded (a size-1 axis may still report a
+    # non-zero stride); the lane axis is the real arange.
+    assert lane.stride()[1] == 0 and lane.stride()[2] == 1, lane.stride()
+    # A dense table whose logical size exceeds the cache budget is refused
+    # before `.contiguous()` allocates it (with Bm~T/block_size this would be
+    # an O(T^2) allocation).
+    try:
+        CK._full_arange_cached(1, 100000, 50000, 'cpu', contiguous=True)
+    except RuntimeError as exc:
+        assert 'contiguous=False' in str(exc), exc
+    else:
+        raise AssertionError('an oversized dense arange table must be refused')
 
 
 

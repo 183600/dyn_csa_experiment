@@ -1322,7 +1322,22 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=None, val_seqs=512,
         'validation', val_seqs * seq_len + seq_len, 'val', _dtype=np.int64,
         want_token_doc_ids=True, stats=_val_stream_stats)
     n_val = min(len(val_ids) // seq_len, val_seqs)
-    val_batch = val_ids[:n_val * seq_len].reshape(n_val, seq_len)
+    # The tokenizer cap includes one EXTRA sequence so a full val_seqs window
+    # can be formed.  Only the first n_val*seq_len tokens are served in
+    # `val_batch`; truncate the document/token sidecars to that served prefix.
+    # Otherwise the metadata counts a trailing partial sequence and documents
+    # with zero served tokens as part of the evaluation sample.
+    _n_served = int(n_val * seq_len)
+    val_ids = val_ids[:_n_served]
+    val_token_doc_ids = val_token_doc_ids[:_n_served]
+    if val_token_doc_ids.size:
+        _, _first = np.unique(val_token_doc_ids, return_index=True)
+        val_doc_ids = val_token_doc_ids[np.sort(_first)]
+    else:
+        val_doc_ids = val_token_doc_ids
+    _val_stream_stats['rows_served'] = int(len(val_doc_ids))
+    _val_stream_stats['tokens_served'] = int(_n_served)
+    val_batch = val_ids.reshape(n_val, seq_len)
     _validate_token_ids(train_ids, vocab, 'wikitext train_ids')
     _validate_token_ids(val_batch, vocab, 'wikitext val_batch')
     print(f'[data] val sequences = {n_val} (seq_len={seq_len})')

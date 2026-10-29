@@ -21,6 +21,8 @@ def paired_bootstrap_ci(deltas, *, n_boot=4000, seed=20261018):
     if nb is None or sd is None or nb < 2:
         return None
     _ci = _bootstrap_t_interval(d, n_boot=nb, seed=sd, conf=0.95)
+    if _ci.get('ci_low') is None or _ci.get('ci_high') is None:
+        return None
     return [_ci['ci_low'], _ci['ci_high']]
 
 def unpaired_bootstrap_ci(with_values, without_values, *, n_boot=4000, seed=20261018):

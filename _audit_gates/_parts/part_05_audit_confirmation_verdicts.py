@@ -356,7 +356,10 @@ def _pvr_replay_one(L, name, rec, *, where, problems, warnings):
             f'{out["p_floor"]!r}')
     _mean = rec.get('mean')
     if _mean is not None:
-        _mu = float(np.mean(np.asarray(vals, dtype=float)))
+        # np.mean sums first: finite 1e308-scale deltas overflow to inf even
+        # when their mean is representable, which would falsely flag a valid
+        # artifact as tampered.  Reuse the same guarded mean the panel uses.
+        _mu = L._scaled_mean_or_raw(vals)
         if not _pvr_close(_mean, _mu, rel=1e-9, abs_=1e-12):
             problems.append(
                 f'{where}: stored mean={_mean!r} does not match mean(per_seed)={_mu!r}')
@@ -1673,8 +1676,11 @@ def audit_variance_components(path=None):
                         f'{_cur.get("seed_to_unit_ratio")!r} != S/D '
                         f'{S / float(D)!r}')
             _s_est, _u_est = est['seed'], est['unit']
-            _seed_gain = _s_est / float(S * (S + 1))
-            _unit_gain = _u_est / float(D * (D + 1))
+            _e_est = est['residual']
+            # Fixed-cell finite differences: an extra cell on either axis also
+            # reduces the residual term e/(S*D).
+            _seed_gain = (_s_est + _e_est / D) / float(S * (S + 1))
+            _unit_gain = (_u_est + _e_est / S) / float(D * (D + 1))
             _want_next = 'seed' if _seed_gain > _unit_gain else 'unit'
             if alloc.get('next_cell') != _want_next:
                 probs.append(
@@ -1688,11 +1694,11 @@ def audit_variance_components(path=None):
                         'allocation.recommended_seed_to_unit_ratio must be '
                         'null when the unit component is zero')
             else:
-                want_ratio = math.sqrt(_s_est / _u_est)
+                want_ratio = (_s_est / _u_est) if _s_est > 0.0 else 0.0
                 r = _fin(ratio)
                 if r is None or not _pvr_close(r, want_ratio):
                     probs.append(f'allocation.recommended_seed_to_unit_ratio '
-                                 f'{ratio!r} != sqrt(seed/unit) {want_ratio!r}')
+                                 f'{ratio!r} != seed/unit {want_ratio!r}')
         else:
             probs.append(
                 f'allocation.status={alloc.get("status")!r} is not '

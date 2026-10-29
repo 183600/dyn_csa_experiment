@@ -58,6 +58,27 @@ def test_exact_additive_panel_recovers_components():
         'new_cell', 'new_seed_same_units', 'new_unit_same_seeds'}
 
 
+def test_allocation_ratio_and_gains_match_the_fixed_cell_objective():
+    # For a fixed number of cells N=S*D, the variance-minimising ratio is
+    # s/u, not sqrt(s/u) (the latter is the fixed S+D rule).  The next-cell
+    # advice also includes the residual term e/(S*D).
+    y, _a, _b = _additive_panel()
+    vc = L.crossed_variance_components(y)
+    s = vc['components']['seed']['estimate']
+    u = vc['components']['unit']['estimate']
+    e = vc['components']['residual']['estimate']
+    S, D = vc['n_seeds'], vc['n_units']
+    alloc = vc['allocation']
+    assert math.isclose(alloc['recommended_seed_to_unit_ratio'], s / u,
+                        rel_tol=1e-12)
+    seed_gain = (s + e / D) / (S * (S + 1))
+    unit_gain = (u + e / S) / (D * (D + 1))
+    assert alloc['next_cell'] == ('seed' if seed_gain > unit_gain else 'unit')
+    # The additive panel has zero residual, but the ratio check above already
+    # distinguishes s/u from sqrt(s/u) for these components.
+    assert not math.isclose(s / u, math.sqrt(s / u), rel_tol=1e-6)
+
+
 def test_negative_moments_are_reported_raw_and_truncated():
     # A checkerboard has zero row/column means and all variance in the
     # residual, so both variance components have negative raw estimates.

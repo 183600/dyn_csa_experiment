@@ -247,10 +247,15 @@ def _collect(design_group, kind):
                         st['mechanism_claim_allowed'] = False
                         report.setdefault('compute_confounded', []).append('%s vs %s: the arm that wins by %.2f PPL also consumed about %.2fx the compute (%s); the performance difference is not separable from the compute difference' % (a, b, abs(float(st['mean'])), float(st['compute_ratio']), _cc.get('compute_matched_source')))
                 if _a_vals and _b_vals:
-                    _a_mean = float(np.mean(_a_vals))
-                    _b_mean = float(np.mean(_b_vals))
-                    _a_std = float(np.std(_a_vals, ddof=1)) if len(_a_vals) > 1 else 0.0
-                    _b_std = float(np.std(_b_vals, ddof=1)) if len(_b_vals) > 1 else 0.0
+                    # A finite PPL panel near float64's limit overflows a
+                    # naive sum/square even though its mean/SD is
+                    # representable.  The guarded helpers keep ordinary
+                    # panels bit-identical and only rescale for an extreme
+                    # one; JSON/summary consumers must never receive inf.
+                    _a_mean = _scaled_mean_or_raw(_a_vals)
+                    _b_mean = _scaled_mean_or_raw(_b_vals)
+                    _a_std = _scaled_std_or_raw(_a_vals)
+                    _b_std = _scaled_std_or_raw(_b_vals)
                     _rel_effect = 100.0 * float(st['mean']) / _b_mean if _b_mean > 0 else float('nan')
                     _rel_std = 100.0 * float(st['std']) / _b_mean if _b_mean > 0 else float('nan')
                     if float(st['std']) > 0:
@@ -416,7 +421,13 @@ for (v, t, _fpk), _by_seed in sorted(_arm_groups.items()):
         _base_seen[v, t] = _idx + 1
         _key = '%s::slice%d' % (_key, _idx)
         report['warnings'].append('%s: records span different validation slices or code-semantics stamps; arm summary is split instead of pooling different documents/implementations' % _key)
-    report['arm_summary'][_key] = {'variant': v, 'protocol': t, 'n_seeds': len(_vals), 'seeds': sorted(_by_seed), 'ppl_mean': float(np.mean(_vals)), 'ppl_mean_arithmetic': float(np.mean(_vals)), 'ppl_pooled': _pooled, 'ppl_primary': float(_pooled) if _pooled is not None else float(np.mean(_vals)), 'ppl_estimand': _estimand, 'ppl_primary_missing': int(_miss), 'nll_sum': _nll_tot, 'n_tokens': _ntok_tot, 'ppl_std': float(np.std(_vals, ddof=1)) if len(_vals) > 1 else 0.0, 'ppl_std_defined': bool(len(_vals) > 1), 'meets_min_seeds': len(_vals) >= int(min_n)}
+    # `np.mean`/`np.std` overflow on a finite panel whose values are near the
+    # float64 limit even though the summary itself is representable.  Reuse
+    # the guarded helpers so a huge-but-finite PPL panel cannot write `inf`
+    # into the arm summary (and the pooled fallback stays finite too).
+    _arm_mean = (_scaled_mean_or_raw(_vals) if _vals else float('nan'))
+    _arm_std = (_scaled_std_or_raw(_vals) if len(_vals) > 1 else 0.0)
+    report['arm_summary'][_key] = {'variant': v, 'protocol': t, 'n_seeds': len(_vals), 'seeds': sorted(_by_seed), 'ppl_mean': _arm_mean, 'ppl_mean_arithmetic': _arm_mean, 'ppl_pooled': _pooled, 'ppl_primary': float(_pooled) if _pooled is not None else _arm_mean, 'ppl_estimand': _estimand, 'ppl_primary_missing': int(_miss), 'nll_sum': _nll_tot, 'n_tokens': _ntok_tot, 'ppl_std': _arm_std, 'ppl_std_defined': bool(len(_vals) > 1), 'meets_min_seeds': len(_vals) >= int(min_n)}
     if len(_vals) < int(min_n):
         report['arms_below_min_seeds'].append(_key)
 

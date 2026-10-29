@@ -804,13 +804,30 @@ def _error_cluster_stats(values, token_counts=None):
                 'se': None, 'ci95_low': None, 'ci95_high': None,
                 'p_exact_signflip': None, 'p_floor': None,
                 'ci_excludes_zero': False, 'direction': 0}
-    mean = float(vals.mean())
+    # Finite per-cluster deltas near the float64 limit overflow a naive
+    # sum/squared-deviation even when the mean and SD are representable.  The
+    # guarded helper leaves ordinary panels bit-identical and rescales only an
+    # extreme one.  If the SD is genuinely beyond float64, withhold the
+    # interval rather than emitting inf (a strict JSON writer would turn it
+    # into null after downstream consumers already accepted it).
+    mean = _scaled_mean_or_raw(vals)
     if n >= 2:
-        sd = float(vals.std(ddof=1))
-        se = sd / math.sqrt(n)
-        half = float(_t_critical(0.95, n - 1)) * se
-        lo, hi = mean - half, mean + half
-        ci_excludes_zero = bool(lo > 0.0 or hi < 0.0)
+        _ms = _scaled_mean_std_if_extreme(vals, ddof=1)
+        sd = float(_ms[1]) if _ms is not None else float(vals.std(ddof=1))
+        if not math.isfinite(sd):
+            # The true SD is beyond float64; `None` is "not representable",
+            # not a measured infinite spread.
+            sd = None
+        if sd is not None and math.isfinite(mean):
+            se = sd / math.sqrt(n)
+            half = float(_t_critical(0.95, n - 1)) * se
+            lo, hi = mean - half, mean + half
+            if not (math.isfinite(lo) and math.isfinite(hi)):
+                lo = hi = None
+        else:
+            se = lo = hi = None
+        ci_excludes_zero = bool(lo is not None and hi is not None
+                                and (lo > 0.0 or hi < 0.0))
     else:
         sd = se = lo = hi = None
         ci_excludes_zero = False

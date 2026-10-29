@@ -1092,7 +1092,7 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
     slope = float(slope_work * _effect_scale) if _scale_effects else slope_work
     intercept = float(intercept_work * _effect_scale) if _scale_effects else intercept_work
     wls = {'slope': slope, 'intercept': intercept, 'x_transform': 'log10' if log_scale else 'linear',
-           'weights': 'n_seeds per scale', 'r2': (1.0 - float((n * resid ** 2).sum() / (n * (y - ybar) ** 2).sum())) if float((n * (y - ybar) ** 2).sum()) > 0 else float('nan')}
+           'weights': 'n_seeds per scale', 'r2': (1.0 - float((n * resid ** 2).sum() / (n * (y - ybar) ** 2).sum())) if float((n * (y - ybar) ** 2).sum()) > 0 else 1.0}
     if k > 2:
         sigma2 = float((n * resid ** 2).sum() / (k - 2))
         se_work = float(math.sqrt(sigma2 / sxx))

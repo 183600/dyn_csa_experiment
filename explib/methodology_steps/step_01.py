@@ -85,7 +85,12 @@ if _scoped_baselines:
                 if _seed_vals:
                     _deltas = [x - _floor_ppl for x in _seed_vals]
                     _fst = paired_effect_stats(_deltas, alpha=alpha, min_n=int(report.get('min_n') or 3))
-                    _pt = float(np.mean(_deltas))
+                    # paired_effect_stats already uses the guarded mean; do
+                    # not re-average the raw deltas here (their naive sum can
+                    # overflow even when the mean is representable).
+                    _pt = _fst.get('mean')
+                    if _pt is None or not math.isfinite(float(_pt)):
+                        _pt = _scaled_mean_or_raw(_deltas)
                     if _pt < 0:
                         if _fst.get('significant'):
                             _verdict = 'beats_floor_significant'
@@ -117,7 +122,12 @@ if _scoped_baselines:
                         continue
                     _deltas = [x - _floor_ppl for x in _vals]
                     _fst = paired_effect_stats(_deltas, alpha=alpha, min_n=int(report.get('min_n') or 3))
-                    _pt = float(np.mean(_deltas))
+                    # paired_effect_stats already uses the guarded mean; do
+                    # not re-average the raw deltas here (their naive sum can
+                    # overflow even when the mean is representable).
+                    _pt = _fst.get('mean')
+                    if _pt is None or not math.isfinite(float(_pt)):
+                        _pt = _scaled_mean_or_raw(_deltas)
                     if _pt < 0:
                         if _fst.get('significant'):
                             _av = 'beats_floor_significant'

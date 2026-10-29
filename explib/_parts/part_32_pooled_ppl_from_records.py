@@ -311,7 +311,8 @@ def _doc_bootstrap_ppl_ci(recs, *, n_boot=2000, seed=20261018):
         nn = counts @ nll_col
         ok = nt > 0
         out = np.full(_nb, np.nan, dtype=float)
-        out[ok] = np.exp(nn[ok] / nt[ok])
+        with np.errstate(over='ignore', invalid='ignore'):
+            out[ok] = np.exp(nn[ok] / nt[ok])
         vals[_b:_b + _nb] = out
         _b += _nb
     vals = vals[np.isfinite(vals) & (vals > 0)]
@@ -495,9 +496,20 @@ def _combined_seed_doc_ci(recs, *, n_boot=2000, seed=20261018, conf=0.95):
         tc = None
     if tc is not None and math.isfinite(tc):
         m = float(seed_logppl.mean())
-        out['ci95_ppl'] = [float(_safe_exp_ppl(m - tc * out['se_combined_logppl'])),
-                           float(_safe_exp_ppl(m + tc * out['se_combined_logppl']))]
-        out['status'] = 'ok'
+        _lo = float(_safe_exp_ppl(m - tc * out['se_combined_logppl']))
+        _hi = float(_safe_exp_ppl(m + tc * out['se_combined_logppl']))
+        if math.isfinite(_lo) and math.isfinite(_hi):
+            out['ci95_ppl'] = [_lo, _hi]
+            out['status'] = 'ok'
+        else:
+            # The endpoint exceeds float64 even though the log-scale interval
+            # is finite; an infinite PPL bound would break strict JSON and is
+            # not a measured interval.
+            out['ci95_ppl'] = None
+            out['ci95_ppl_unavailable_reason'] = (
+                'an exponentiated confidence endpoint exceeds the '
+                'representable float64 range')
+            out['status'] = 'ci_unavailable'
     else:
         out['status'] = 'ci_unavailable'
     return out
@@ -1209,8 +1221,14 @@ def aggregate(summary):
             # then raises instead of reporting an empty curve.
             good = np.array([[ppl_is_usable(v) for v in row] for row in mat], dtype=bool)
             n_good = good.sum(axis=0)
-            sums = np.where(good, mat, 0.0).sum(axis=0)
-            mean_ppl = np.where(n_good > 0, sums / np.maximum(n_good, 1), np.nan)
+            # A naive column sum over two finite 1.5e308 seed points overflows
+            # to inf although their mean is representable.  Average each step
+            # with the guarded mean (ordinary panels keep the NumPy value).
+            mean_ppl = np.full(len(steps_h), np.nan, dtype=float)
+            for _j in range(len(steps_h)):
+                _col = mat[good[:, _j], _j]
+                if _col.size:
+                    mean_ppl[_j] = float(_scaled_mean_or_raw(_col))
             n_dropped = int((~good).sum())
             if n_dropped:
                 print(f'[aggregate] {key}: {n_dropped} non-finite PPL curve point(s) across {len(hists)} seed(s) excluded from the seed-averaged curve ({int((n_good == 0).sum())} step(s) had no usable seed and are omitted)')

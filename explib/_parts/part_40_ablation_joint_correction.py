@@ -268,7 +268,8 @@ def maxt_signflip_adjust(named_deltas, *, alpha=0.05,
     mean_n = Dn.mean(axis=1)
     sd_n = Dn.std(axis=1, ddof=1)
     mean = mean_n * row_scale
-    sd = sd_n * row_scale
+    with np.errstate(over='ignore', invalid='ignore'):
+        sd = sd_n * row_scale
     scale = sd_n * math.sqrt(n)          # == sd*sqrt(n)/row_scale
     if np.any((sd == 0.0) & (mean != 0.0)):
         raise ValueError(
@@ -342,9 +343,27 @@ def maxt_signflip_adjust(named_deltas, *, alpha=0.05,
     critical, achieved = _joint_tail_threshold(np.sort(max_all), alpha)
     contrasts = {}
     for k, name in enumerate(names):
-        half = (critical * sd[k] / math.sqrt(n)) if critical is not None else None
-        ci = ([float(mean[k] - half), float(mean[k] + half)]
-              if half is not None and math.isfinite(half) else None)
+        # `sd` can exceed float64 even though the standard error (and the
+        # interval half-width) is representable: e.g. 20 balanced deltas at
+        # +/-1.79e308.  Keep the SD unavailable as JSON-safe None, but build
+        # the interval from the representable normalized standard error.
+        _sd = float(sd[k])
+        _sd_out = _sd if math.isfinite(_sd) else None
+        if _sd_out is not None:
+            sem = float(_sd / math.sqrt(n))
+            half = (critical * _sd / math.sqrt(n)) if critical is not None else None
+        else:
+            _sem = float((sd_n[k] / math.sqrt(n)) * row_scale[k])
+            sem = _sem if math.isfinite(_sem) else None
+            half = (critical * sem
+                    if critical is not None and sem is not None else None)
+        ci = None
+        if (half is not None and math.isfinite(half)
+                and math.isfinite(float(mean[k]))):
+            _lo = float(mean[k] - half)
+            _hi = float(mean[k] + half)
+            if math.isfinite(_lo) and math.isfinite(_hi):
+                ci = [_lo, _hi]
         contrasts[name] = {
             'p_raw_signflip': float(raw_p[k]),
             'p_maxt_single': float(single_p[k]),
@@ -353,8 +372,10 @@ def maxt_signflip_adjust(named_deltas, *, alpha=0.05,
             'rank': int(np.nonzero(order == k)[0][0]) + 1,
             'reject_maxt': bool(p_maxt[k] <= alpha),
             'mean': float(mean[k]),
-            'sd': float(sd[k]),
-            'sem': float(sd[k] / math.sqrt(n)),
+            'sd': _sd_out,
+            'sd_available': _sd_out is not None,
+            'sem': sem,
+            'sem_available': sem is not None,
             'ci_simultaneous': ci,
         }
     return {

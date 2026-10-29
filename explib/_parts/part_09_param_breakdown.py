@@ -1544,6 +1544,13 @@ def _bootstrap_t_interval(values, *, n_boot, seed, conf):
     if _scaled:
         lo = float(lo) * _scale
         hi = float(hi) * _scale
+    if not (math.isfinite(lo) and math.isfinite(hi)):
+        # The true endpoint is beyond float64.  Do not hand an infinite bound
+        # to a caller that writes JSON; the interval is unavailable.
+        return {'ci_low': None, 'ci_high': None,
+                'method': method + '; interval unavailable: an endpoint '
+                          'exceeds the representable float64 range',
+                'n_boot_studentized': used}
     return {'ci_low': float(lo), 'ci_high': float(hi), 'method': method,
             'n_boot_studentized': used}
 
@@ -1581,6 +1588,8 @@ def bootstrap_mean_ci(values, *, n_boot=4000, seed=20261018, conf=0.95):
     if nb < 20 or not (0.0 < c < 1.0):
         return None
     _ci = _bootstrap_t_interval(v, n_boot=nb, seed=sd, conf=c)
+    if _ci.get('ci_low') is None or _ci.get('ci_high') is None:
+        return None
     _ms = _scaled_mean_std_if_extreme(v, ddof=1)
     _mean = _ms[0] if _ms is not None else float(v.mean())
     return {'n': n, 'n_boot': nb, 'seed': int(seed), 'mean': _mean,

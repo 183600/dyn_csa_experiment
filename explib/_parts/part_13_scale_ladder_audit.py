@@ -475,7 +475,7 @@ def loglog_regression(points, *, alpha=0.05):
             _p = 1.0 if abs(slope) <= 1e-15 else 0.0
         out.update({'se': se, 'ci': [slope - tc * se, slope + tc * se],
                     'p': _p,
-                    'df': k - 2, 'r2': (1.0 - ss_res / ss_tot) if ss_tot > 0 else float('nan'),
+                    'df': k - 2, 'r2': (1.0 - ss_res / ss_tot) if ss_tot > 0 else 1.0,
                     'residual_sigma_log10': float(math.sqrt(sigma2))})
         loo = []
         for i in range(k):

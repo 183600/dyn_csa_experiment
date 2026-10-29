@@ -490,6 +490,18 @@ def _full_arange_cached(B, T, Bm, device, contiguous=True):
     key = (int(B), int(T), int(Bm), str(device), bool(contiguous))
     out = _ARANGE_CACHE.get(key)
     if out is None:
+        # Compute the dense logical size BEFORE `.contiguous()` allocates it.
+        # For HCA Bm ~ T/block_size, so a dense table is O(B*T^2/block_size)
+        # and an oversized call would otherwise materialise the whole thing
+        # only to discover it cannot be cached (and then evict everything).
+        _dense_need = (int(B) * int(T) * int(Bm)
+                       * torch.empty((), dtype=torch.int32).element_size())
+        if contiguous and _dense_need > _ARANGE_CACHE_BUDGET:
+            raise RuntimeError(
+                f'refusing to materialise a dense arange table '
+                f'[{int(B)}, {int(T)}, {int(Bm)}] ({_dense_need / (1 << 20):.1f} '
+                f'MiB > cache budget {_ARANGE_CACHE_BUDGET / (1 << 20):.1f} '
+                'MiB); use contiguous=False for the stride-0 lane table')
         # Cache-normal tensor even when first filled from eval inference mode;
         # FusedSparseAttention saves this table for a later training backward.
         with torch.inference_mode(False):
@@ -499,7 +511,7 @@ def _full_arange_cached(B, T, Bm, device, contiguous=True):
             # Shape (B,T,Bm) with stride (0,0,1) is the row-constant arange
             # table; mark it so the attention launcher can recognise it.
             out._idx_arange = True
-        _need = _arange_nbytes(out)
+        _need = _dense_need if contiguous else _arange_nbytes(out)
         _full_arange_evict(_need)
         if _need <= _ARANGE_CACHE_BUDGET:
             _ARANGE_CACHE[key] = out
@@ -810,13 +822,18 @@ def _stable_topk_desc(x, k):
     if kk >= B:
         val, idx = torch.sort(x, dim=-1, descending=True, stable=True)
         return val, idx
-    # The rank/scatter construction below needs a finite k-th value: with NaN
+    # The rank/scatter construction below needs a defined k-th value: with NaN
     # in a row, comparisons against kth are all false, rank slot 0 is never
     # written and `buf` keeps uninitialised indices (a crash or garbage
-    # selection depending on allocator contents).  Delegate the non-finite
-    # case to sort, whose stable NaN ordering is the contract this helper
-    # documents ("exactly the first k columns of torch.sort").
-    if not bool(torch.isfinite(x).all()):
+    # selection depending on allocator contents).  Delegate the NaN case to
+    # sort, whose stable NaN ordering is the contract this helper documents
+    # ("exactly the first k columns of torch.sort").  +/-inf is NOT a reason
+    # to fall back: the indexer masks non-causal/invalid blocks with -inf, and
+    # the rank/scatter path handles it correctly (kth=-inf, gt is all false,
+    # eq selects the earliest k), while a full sort would allocate an
+    # O(Bm) values+indices table per row at exactly the long-context scale the
+    # tiled indexer is trying to bound.
+    if bool(torch.isnan(x).any()):
         val, idx = torch.sort(x, dim=-1, descending=True, stable=True)
         return val[..., :kk], idx[..., :kk]
     lead = x.shape[:-1]

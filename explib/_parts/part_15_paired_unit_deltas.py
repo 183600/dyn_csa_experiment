@@ -80,8 +80,10 @@ def paired_unit_deltas(rows_a, rows_b, *, unit='auto'):
                 diffs.append(diff)
             if not usable:
                 break
-            values.append(float(np.mean(diffs)))
-        mean = float(np.mean(values)) if values else None
+            # A finite difference near float64's limit overflows a naive sum
+            # over seeds even though the per-unit mean is representable.
+            values.append(_scaled_mean_or_raw(diffs))
+        mean = _scaled_mean_or_raw(values) if values else None
         sd = None
         # A finite but very small/large unit panel underflows/overflows the
         # squared deviations in numpy.std.  The scale is arbitrary (a PPL

@@ -290,10 +290,19 @@ def crossed_variance_components(values, *, conf=0.95):
                 'reason': ('both seed and unit components are zero; residual '
                            'noise cannot be reduced by reallocating cells')}
         else:
+            # For a fixed number of CELLS N = S*D, minimising
+            # s/S + u/D + e/(S*D) gives S/D = s/u.  (The sqrt(s/u) rule
+            # belongs to a fixed S+D budget, which this design does not hold.)
+            # The next-cell comparison uses the exact finite differences,
+            # including the residual term that an extra cell on either axis
+            # also reduces.
+            e_est = est['residual']
             ratio = (math.inf if u_est <= 0.0
-                     else (math.sqrt(s_est / u_est) if s_est > 0.0 else 0.0))
-            seed_gain = s_est / float(S * (S + 1))
-            unit_gain = u_est / float(D * (D + 1))
+                     else (s_est / u_est if s_est > 0.0 else 0.0))
+            seed_gain = ((s_est + e_est / D) / float(S * (S + 1))
+                         if S > 0 else 0.0)
+            unit_gain = ((u_est + e_est / S) / float(D * (D + 1))
+                         if D > 0 else 0.0)
             allocation = {
                 'status': 'ok',
                 'current': {'n_seeds': int(S), 'n_units': int(D),
@@ -302,19 +311,21 @@ def crossed_variance_components(values, *, conf=0.95):
                 'recommended_seed_to_unit_ratio': (
                     float(ratio) if math.isfinite(ratio) else None),
                 'recommended_seed_to_unit_ratio_note': (
-                    'infinite: all estimated between-cell variance is on the '
-                    'seed axis, so additional seeds are the only variance '
-                    'reduction available' if math.isinf(ratio) else None),
+                    'infinite: the estimated unit component is zero, so the '
+                    'fixed-cell optimum puts all cells on the seed axis; the '
+                    'next-cell advice still includes the residual term, which '
+                    'additional units can reduce' if math.isinf(ratio) else None),
                 'next_cell': ('seed' if seed_gain > unit_gain else 'unit'),
                 'next_cell_note': (
                     'one more seed removes about %.6g of the mean variance; '
-                    'one more unit removes about %.6g (same component scale)'
+                    'one more unit removes about %.6g (same component scale; '
+                    'both finite differences include the residual term)'
                     % (seed_gain, unit_gain)),
                 'basis': ('for a fixed number of cells the variance-minimising '
-                          'seed:unit ratio is sqrt(seed_component / '
-                          'unit_component); the next-cell advice compares the '
-                          'exact finite differences s/(S(S+1)) and '
-                          'u/(D(D+1)) at the observed design'),
+                          'seed:unit ratio is seed_component / unit_component; '
+                          'the next-cell advice compares the exact finite '
+                          'differences (s+e/D)/(S(S+1)) and (u+e/S)/(D(D+1)) '
+                          'at the observed design'),
             }
 
     out = {

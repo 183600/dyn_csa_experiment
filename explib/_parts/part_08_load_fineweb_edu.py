@@ -225,6 +225,10 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=None, val_seqs=512,
     import array as _array_mod
     train_doc_ids = _array_mod.array('Q')
     val_doc_ids = _array_mod.array('Q')
+    # Token length of each validation document written to the raw stream.
+    # Needed to drop documents that start only in the unserved trailing
+    # sequence when the token cap is reached.
+    val_doc_lengths = []
 
     try:
         buf = []
@@ -295,6 +299,7 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=None, val_seqs=512,
                     buf.extend(enc.ids)
                     buf.append(eos_id)
                     val_doc_ids.append(int(_doc_id_u64(doc_id)))
+                    val_doc_lengths.append(int(len(enc.ids)) + 1)
                     if len(buf) >= (1 << 22):
                         _disk_ids_chunk(buf, disk_dt, vocab).tofile(fh)
                         n_val_total += len(buf)
@@ -377,7 +382,20 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=None, val_seqs=512,
         val_bnd = np.isin(val_batch, bnd_ids)
         print(f'[data] boundary tokens: {int(val_bnd.sum())} ({val_bnd.mean() * 100:.1f}% of val tokens)')
         _train_doc_arr = np.frombuffer(train_doc_ids, dtype=np.uint64).copy() if train_doc_ids else np.empty(0, dtype=np.uint64)
-        _val_doc_arr = np.frombuffer(val_doc_ids, dtype=np.uint64).copy() if val_doc_ids else np.empty(0, dtype=np.uint64)
+        _val_doc_all = np.frombuffer(val_doc_ids, dtype=np.uint64).copy() if val_doc_ids else np.empty(0, dtype=np.uint64)
+        # `val_batch` serves only n_val*seq_len tokens, but the tokeniser cap
+        # carried one extra sequence.  Keep only documents whose first token
+        # lies in the served prefix; a document starting in the unserved tail
+        # was never evaluated and must not enter the validation document count
+        # or the train/validation overlap audit.
+        _n_val_served = int(n_val * seq_len)
+        if val_doc_lengths and _val_doc_all.size == len(val_doc_lengths):
+            _starts = np.concatenate(
+                (np.zeros(1, dtype=np.int64),
+                 np.cumsum(np.asarray(val_doc_lengths, dtype=np.int64))))
+            _val_doc_arr = _val_doc_all[_starts[:-1] < _n_val_served]
+        else:
+            _val_doc_arr = _val_doc_all
         _shared_docs = int(np.intersect1d(_train_doc_arr, _val_doc_arr, assume_unique=True).size)
         if _shared_docs:
             raise RuntimeError(f'load_fineweb_edu: {_shared_docs} document ids occur in both train and validation — refusing to write a leaking split')
@@ -477,7 +495,7 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=None, val_seqs=512,
             'validation_region': {
                 'policy': 'per_cap_closed_no_cross_cap_reuse',
                 'start_token_approx': int(n_train_total),
-                'end_token_approx': int(n_train_total + n_val_tokens),
+                'end_token_approx': int(n_train_total + _n_val_served),
                 'note': ('this validation region is closed for this protocol tag; '
                          'never reuse it as another cap\'s validation and never '
                          'compare runs whose val_fp differs'),

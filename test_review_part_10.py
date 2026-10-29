@@ -1215,6 +1215,14 @@ def test_local_raw_cache_records_dataset_source():
             assert _samp['train']['source_rows'] == 1600, _samp
             assert _samp['train']['rows_served'] > 0, _samp
             assert _samp['validation']['source_rows'] == 800, _samp
+            # Only the served val_batch prefix may be counted: the tokeniser
+            # cap carries one extra sequence for window formation, but those
+            # trailing tokens (and any document starting there) are never
+            # evaluated and must not inflate the sidecars/counters.
+            assert meta['doc_ids']['validation_token_count'] == int(a[1].size), meta['doc_ids']
+            assert _samp['validation']['tokens_served'] == int(a[1].size), _samp
+            assert (_samp['validation']['rows_served']
+                    == meta['doc_ids']['validation_count']), _samp
             assert src.get('provider') == 'local' and src.get('revision') is None, src
             assert src.get('revision_pinned') is False, src
             # A cache hit must serve exactly the same bytes and not fabricate a
