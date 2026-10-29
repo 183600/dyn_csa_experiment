@@ -854,18 +854,62 @@ class _DocDeduplicator:
     both sides of the split.
     """
 
-    def __init__(self, *, near_threshold=3, bands=4):
-        # Both controls define the LSH geometry.  int(2.5) would silently run
-        # a different band layout, and a negative threshold disables near
-        # duplicate detection while looking like a validated setting.
+    def __init__(self, *, near_threshold=None, bands=None,
+                 shingle_words=None, max_shingles=None, scope=None):
+        # Every control defines the LSH/similarity geometry and therefore the
+        # cleaned corpus.  int(2.5) would silently run a different band layout,
+        # and a negative threshold would disable near-duplicate detection while
+        # looking like a validated setting.  ``None`` resolves to the declared
+        # project protocol so the loader and the audit share one default.
+        near_threshold = (DEDUP_PROTOCOL_DEFAULTS['near_hamming_threshold']
+                          if near_threshold is None else near_threshold)
+        bands = DEDUP_PROTOCOL_DEFAULTS['bands'] if bands is None else bands
+        shingle_words = (DEDUP_PROTOCOL_DEFAULTS['shingle_words']
+                         if shingle_words is None else shingle_words)
+        max_shingles = (DEDUP_PROTOCOL_DEFAULTS['max_shingles']
+                        if max_shingles is None else max_shingles)
+        scope = DEDUP_PROTOCOL_DEFAULTS['scope'] if scope is None else scope
         _near = _as_seed_int(near_threshold)
         if _near is None or not (0 <= _near <= 64):
             raise ValueError(f'near_threshold must be an integer in [0, 64], got {near_threshold!r}')
         _bands = _as_seed_int(bands)
         if _bands is None or not (1 <= _bands <= 8):
             raise ValueError(f'bands must be an integer in [1, 8], got {bands!r}')
+        if _near >= _bands:
+            # With fewer differing bits than bands, some pair within the
+            # threshold must share a full band.  Once threshold >= bands that
+            # guarantee is gone and the index can silently miss a near copy;
+            # fail closed instead of reporting a weaker cleanup as exact.
+            raise ValueError(
+                'near_threshold must be < bands for exhaustive LSH candidate '
+                f'search (got near_threshold={_near}, bands={_bands})')
+        if 64 % _bands:
+            # The band hash is built from ``64 // bands``-bit chunks.  A band
+            # count that does not divide 64 leaves high bits out of every
+            # bucket key, so even a zero-bit pair can differ only in those
+            # uncovered bits and evade the candidate search.
+            raise ValueError(
+                'bands must divide 64 so every SimHash bit is indexed '
+                f'(got bands={_bands})')
+        _words = _as_seed_int(shingle_words)
+        if _words is None or not (1 <= _words <= (1 << 20)):
+            raise ValueError(
+                f'shingle_words must be a positive integer, got {shingle_words!r}')
+        _max_sh = _as_seed_int(max_shingles)
+        if _max_sh is None or not (1 <= _max_sh <= (1 << 20)):
+            raise ValueError(
+                f'max_shingles must be a positive integer, got {max_shingles!r}')
+        if _words > _max_sh:
+            raise ValueError(
+                f'shingle_words ({_words}) must not exceed max_shingles ({_max_sh})')
+        if scope not in ('raw_line', 'document'):
+            raise ValueError(
+                f"scope must be 'raw_line' or 'document', got {scope!r}")
         self.near_threshold = _near
         self.bands = _bands
+        self.shingle_words = _words
+        self.max_shingles = _max_sh
+        self.scope = str(scope)
         self.bits = 64 // self.bands
         self.mask = (1 << self.bits) - 1
         self.exact = set()
@@ -891,7 +935,15 @@ class _DocDeduplicator:
         fp_key = int(fp, 16) if isinstance(fp, (str, bytes)) else int(fp)
         if fp_key in self.exact:
             return True, 'exact', fp_key, None
-        h = _doc_simhash(text)
+        # Keep the historical single-argument call on the default geometry:
+        # callers/tests that substitute ``_doc_simhash`` still work, while a
+        # non-default protocol passes its shingle geometry explicitly.
+        if (self.shingle_words == DEDUP_SIMHASH_SHINGLE_WORDS
+                and self.max_shingles == DEDUP_SIMHASH_MAX_SHINGLES):
+            h = _doc_simhash(text)
+        else:
+            h = _doc_simhash(text, shingle_words=self.shingle_words,
+                             max_shingles=self.max_shingles)
         for key in self._bucket_keys(h):
             for other in self.buckets.get(key, ()):
                 if _hamming64(h, other) <= self.near_threshold:
@@ -931,16 +983,40 @@ class _DocDeduplicator:
             self.buckets.setdefault(key, []).append(h)
         return False, None
 
+    def protocol(self):
+        """The complete cleaning geometry, suitable for cache metadata."""
+        return {
+            'schema': DEDUP_PROTOCOL_SCHEMA,
+            'exact_hash': 'blake2b-128',
+            'simhash_bits': 64,
+            'shingle_unit': 'word',
+            'shingle_words': int(self.shingle_words),
+            'max_shingles': int(self.max_shingles),
+            'bands': int(self.bands),
+            'near_hamming_threshold': int(self.near_threshold),
+            'scope': self.scope,
+        }
+
+    def protocol_fp(self):
+        return dedup_protocol_fp(self.protocol())
+
     def stats(self):
+        protocol = self.protocol()
         return {'policy': 'exact_content_hash+simhash_lsh',
                 'simhash_bits': 64,
                 'near_hamming_threshold': self.near_threshold,
+                'shingle_words': int(self.shingle_words),
+                'max_shingles': int(self.max_shingles),
+                'bands': int(self.bands),
+                'protocol': protocol,
+                'protocol_fp': dedup_protocol_fp(protocol),
                 'added_documents': int(self.n_seen),
                 'exact_duplicates_skipped': int(self.n_exact_skipped),
                 'near_duplicates_skipped': int(self.n_near_skipped)}
 
 
-def _filter_test_documents(train_rows, val_index, test_rows, *, label='test'):
+def _filter_test_documents(train_rows, val_index, test_rows, *, label='test',
+                          protocol=None):
     """Remove test documents that duplicate an earlier split or each other.
 
     ``train_rows`` are the raw training documents and ``val_index`` is the
@@ -952,17 +1028,23 @@ def _filter_test_documents(train_rows, val_index, test_rows, *, label='test'):
     documents that are excluded on an earlier-split match, so transitive
     near-duplicate chains stay together.
 
+    ``protocol`` is the dedup protocol recorded by the paired train cache.
+    Rebuilding the test index from that object (instead of the current code
+    defaults) makes the held-out cleanup use the same shingle/band geometry as
+    the training split.
+
     Returns ``(kept_rows, excluded_counts, test_index)``.  ``excluded_counts``
     keys are ``train_exact``, ``train_near``, ``validation_exact``,
     ``validation_near``, ``test_exact`` and ``test_near``.  The set of kept
     documents is the same as the historical mutating form; only the
     attribution of a self/train/validation match is made honest.
     """
-    train_index = _DocDeduplicator()
+    _kwargs = dedup_kwargs_from_protocol(protocol) if protocol is not None else {}
+    train_index = _DocDeduplicator(**_kwargs)
     for _r in train_rows:
         if isinstance(_r, str) and _r.strip():
             train_index.is_duplicate(_r)
-    test_index = _DocDeduplicator()
+    test_index = _DocDeduplicator(**_kwargs)
     kept = []
     excluded = {'train_exact': 0, 'train_near': 0,
                 'validation_exact': 0, 'validation_near': 0,

@@ -120,6 +120,11 @@
                document-stratified 概率样本；prefix 明确标记为不可外推，
                raw train/valid 可用时量化文章覆盖率、文章长度 KS 与分层覆盖；
                永不读取 wiki.test.raw
+  data_processing  数据处理身份：把 exact/SimHash 近重复清理的 shingle 宽度、
+               LSH band/Hamming 阈值、exact hash 与 `protocol_fp` 纳入缓存
+               身份；同 vocab/fit_fp 的 train/val/test 必须共享同一协议；
+               核对 source→served 行/文档/token 台账及 .npy 侧边长度；
+               legacy 缓存明确降级，缺缓存报 not_verifiable
   calibration  统计机器的零假设校准：精确符号翻转 / MITM / n>40 鞍点 /
                max-over-looks 序列 p / 配对 TOST / Holm 的负控制（超发率）
                与正控制（灵敏度），以及 seed-t / paired bootstrap-t /

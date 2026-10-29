@@ -3417,3 +3417,47 @@ not_verifiable，不把缺失当零方差。population-claim 的 64 单元门槛
 not-verifiable 分支）。`python audit_gates.py two_level_ci` 在当前无
 `analysis_v12/test_stats.json` 的仓库报 `not_verifiable_locally`，不假绿。
 `python -m explib.confirmation plan` 的冻结计划/比较数不受影响。
+
+## 2026-10-29 — 数据处理身份：近重复清理几何与 source→served 台账（本轮数据方法硬化，no new runs）
+
+零 GPU 的数据处理/方法学硬化；不新增训练、不读取 test raw、不修改冻结
+清单的字节/种子/端点/alpha/Holm 规则，也不改 `CODE_SEMANTICS`。
+
+**Problem.** `dedup` 元数据此前只记录 `near_hamming_threshold` 和 policy
+字符串，但清理集合实际由 exact hash、SimHash shingle 宽度、shingle 采样
+上限、LSH band 数与 Hamming 阈值共同决定。任一参数不同，两个 cache 即使
+token 指纹、`fit_fp` 与 policy 完全相同，也可能保留不同的评测文档；test
+cache 仍会声称与 train 使用同一清理。源行数、删除数、服务行/文档/token
+数又分散在 `sampling`、`dedup.splits`、`doc_ids`，没有可机器核对的闭合
+台账。
+
+**Fix.** 新增 `DEDUP_PROTOCOL_DEFAULTS` / `dedup_protocol_fp` /
+`dedup_protocol_problems` / `dedup_protocol_from_meta`；`_DocDeduplicator`
+接受完整 shingle/band 几何并在 `stats()` 中携带协议与指纹。新增两条
+fail-closed 几何约束：`near_hamming_threshold < bands`（鸽巢候选完备性）
+与 `bands` 整除 64（不留未索引高位）。train/validation meta 的 `dedup` 与
+test meta 的 `near_duplicate_cleanup` 与 FineWeb 的 `dedup` 写
+`protocol`/`protocol_fp`；test 冷构建从配对 train cache 读取协议重建
+validation/test 索引，cache-hit 与冷构建都拒绝协议字符串之外的几何不一致。新增
+`audit_gates.audit_data_processing`（`data_processing` /
+`dedup_protocol` / `dedup` / `cleaning`，并进入 `report`）：重算指纹、
+核对冗余字段、按 `(vocab, fit_fp)` 要求 train/val/test 协议一致，并检查
+`nonempty_rows_scanned - rows_served == exact+near`、sampling 与 doc-id
+计数、test 非空源文档台账、以及存在的 `.npy` 侧边长度。test meta 新增
+`source_documents_nonempty` 使 held-out 台账精确闭合。
+
+**Boundary.** 不重采样、不重新清理、不重跑，不改变任何 token、split
+成员、清理决策或 PPL；旧 cache 不回填，legacy 缺完整协议只报
+`not_verifiable_locally`/warning，记录非默认 threshold 的 legacy cache
+无法知道 shingle/band 几何时拒绝读取。SimHash 仍是近似近重复；本改动
+保证的是同一清理几何与 LSH 候选完备性，不是语义近重复的完备检测。台账
+闭合不证明上游 raw dump 内容正确。
+
+**Verification.** `python -m pytest -q` 通过 `640 passed, 3 skipped`（新增
+`test_review_part_22.py` 7 项：默认协议/指纹、非默认几何、threshold≥bands
+与 band 不整除 64 拒绝、协议校验器与 metadata 读取、干净台账 ok、
+`protocol_fp` 篡改/跨 split 几何不一致/台账不闭合 fail、legacy 与缺缓存
+`not_verifiable_locally`、`_filter_test_documents(protocol=...)` 用配对协议
+重建索引）。`python audit_gates.py data_processing` 在当前无 `wt103_cache/`
+的仓库报 `not_verifiable_locally`，不假绿。`python -m
+explib.confirmation plan` 的冻结计划/比较数不受影响。

@@ -505,6 +505,7 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=None, cache_dir=None,
         _train_fit_fps = set()
         _train_semantics = set()
         _train_vocab_shas = set()
+        _train_dedup_fps = []
         for _mp in _glob2.glob(os.path.join(cache_dir, 'meta_v5_*.json')):
             try:
                 _mt = json.load(open(_mp, encoding='utf-8'))
@@ -518,6 +519,14 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=None, cache_dir=None,
                 _train_semantics.add(str(_mt['code_semantics']))
             if _mt.get('tokenizer_vocab_sha256'):
                 _train_vocab_shas.add(str(_mt['tokenizer_vocab_sha256']))
+            _train_proto = dedup_protocol_from_meta(_mt)
+            if _train_proto is not None:
+                _train_dedup_fps.append({
+                    'meta': os.path.basename(_mp),
+                    'fit_fp': _mt.get('fit_fp'),
+                    'vocab': _mt.get('vocab'),
+                    'protocol_fp': dedup_protocol_fp(_train_proto),
+                })
         if _train_fit_fps and meta.get('fit_fp') not in _train_fit_fps:
             raise RuntimeError(
                 'load_wikitest: the cached test split was tokenised with a fit '
@@ -525,6 +534,45 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=None, cache_dir=None,
                 'the train cache metas — this test cache cannot be paired with '
                 'the current train/validation split; delete the test cache and '
                 'rebuild it from the same train tokenizer')
+        # Cleaning geometry must also match: if train and test were built with
+        # different shingle widths / LSH bands / Hamming thresholds, one split
+        # may retain documents the other removed even though both policy
+        # strings say "deduplicated".  A missing protocol is legacy and is
+        # reported, never treated as a match.
+        _test_proto = dedup_protocol_from_meta(meta)
+        if _test_proto is not None:
+            _tpp = dedup_protocol_problems(_test_proto)
+            if _tpp:
+                raise RuntimeError(
+                    'load_wikitest: the cached test split records an invalid '
+                    'dedup protocol (' + '; '.join(_tpp) + ') — the cleaning '
+                    'geometry cannot be trusted; rebuild the test cache')
+            _test_dedup_fp = dedup_protocol_fp(_test_proto)
+            # Compare only caches that describe the SAME corpus protocol.
+            # A cache directory may hold several scale/vocab variants; using
+            # the union of every train protocol would make a correctly paired
+            # test cache fail merely because another variant was present.
+            _paired_dedup = [
+                x for x in _train_dedup_fps
+                if (x.get('fit_fp') in (None, meta.get('fit_fp'))
+                    and x.get('vocab') in (None, meta.get('vocab')))]
+            _train_dedup_fp_set = {x['protocol_fp'] for x in _paired_dedup}
+            if not _train_dedup_fp_set and _train_dedup_fps:
+                # No cache declared a matching corpus identity; fall back to
+                # the union but report that the pairing is ambiguous.
+                _train_dedup_fp_set = {x['protocol_fp'] for x in _train_dedup_fps}
+            if _train_dedup_fp_set and _test_dedup_fp not in _train_dedup_fp_set:
+                raise RuntimeError(
+                    'load_wikitest: the test cache was deduplicated with a '
+                    f'different protocol ({_test_dedup_fp[:16]}…) than the '
+                    f'paired train cache(s) {sorted(x[:16] for x in _train_dedup_fp_set)} '
+                    '— the two splits did not use the same near-duplicate '
+                    'cleaning geometry; delete and rebuild the test cache from '
+                    'the paired train protocol')
+        elif _train_dedup_fps:
+            print('[data] NOTE: the test cache is legacy (no full dedup '
+                  'protocol); its cleaning geometry cannot be compared with '
+                  'the train cache.  Rebuild the test cache to bind it.')
         if meta.get('fit_fp') and not _train_fit_fps:
             print('[data] NOTE: no train-cache meta found; the cached TEST fit provenance cannot be cross-checked locally')
         # Code-semantics binding across the pair.  The data-construction stamp
@@ -786,12 +834,48 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=None, cache_dir=None,
             raise RuntimeError('load_wikitest: no validation-split source is available; the test subset cannot be proven disjoint from the selection split — provide wiki.valid.raw or the HF validation split')
     val_rows_source = [r for r in val_rows_source
                        if isinstance(r, str) and r.strip()]
+    # Pair the held-out cleanup with the TRAIN cache's declared cleaning
+    # protocol.  Using the current code defaults here would silently rebuild
+    # the test index under a different shingle/band geometry if the code
+    # default ever changed after the train cache was frozen.
+    _paired_train_metas = [
+        _m for _m in _train_meta_objs
+        if not _m.get('fit_fp') or _m.get('fit_fp') == _fit_fp_build]
+    _paired_protocols = {}
+    for _m in _paired_train_metas:
+        _p = dedup_protocol_from_meta(_m)
+        if _p is not None:
+            _pfp = dedup_protocol_fp(_p)
+            _paired_protocols.setdefault(_pfp, _p)
+    if len(_paired_protocols) > 1:
+        raise RuntimeError(
+            'load_wikitest: the paired train metas declare '
+            f'{len(_paired_protocols)} different dedup protocols '
+            f'({sorted(k[:16] for k in _paired_protocols)}) for the same fit '
+            'corpus — cannot choose the held-out cleaning geometry; rebuild '
+            'the train cache so one protocol defines the split')
+    _pair_protocol = (next(iter(_paired_protocols.values()))
+                      if _paired_protocols else None)
+    if _pair_protocol is not None:
+        _pp = dedup_protocol_problems(_pair_protocol)
+        if _pp:
+            raise RuntimeError(
+                'load_wikitest: the paired train cache records an invalid dedup '
+                'protocol (' + '; '.join(_pp) + '); rebuild it before touching '
+                'the held-out split')
+        _dedup_kwargs = dedup_kwargs_from_protocol(_pair_protocol)
+        print('[data] held-out cleanup uses the train cache dedup protocol '
+              f'({dedup_protocol_fp(_pair_protocol)[:16]}…)')
+    else:
+        _dedup_kwargs = {}
+        print('[data] NOTE: no paired train dedup protocol found; the held-out '
+              'cleanup uses the current code defaults (legacy cache pair)')
     # Screen the raw validation documents against train exactly as the
     # validation split itself was screened, then index only the documents that
     # could actually have been served for model selection.  Doing this BEFORE
     # the test read means a validation/train source mismatch is caught before
     # the held-out split is touched.
-    _val_screen = _DocDeduplicator()
+    _val_screen = _DocDeduplicator(**_dedup_kwargs)
     for _r in train_rows_source:
         if isinstance(_r, str) and _r.strip():
             _val_screen.is_duplicate(_r)
@@ -806,7 +890,7 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=None, cache_dir=None,
     # documents that survive our train screen could miss a validation document
     # the real (capped) validation stream retained, so index all raw
     # validation documents (de-duplicated among themselves) instead.
-    _val_only = _DocDeduplicator()
+    _val_only = _DocDeduplicator(**_dedup_kwargs)
     _val_indexed_docs = 0
     for _r in val_rows_source:
         _dup_v, _kind_v = _val_only.is_duplicate(_r)
@@ -876,7 +960,8 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=None, cache_dir=None,
     # before tokenisation.  Both indices are built from the earlier splits
     # only; test rows never decide what counts as a duplicate of train/val.
     _kept_test, _excluded, _test_dedup = _filter_test_documents(
-        train_rows_source, _val_only, _trows, label='test')
+        train_rows_source, _val_only, _trows, label='test',
+        protocol=_pair_protocol)
     _removed_test = _excluded['test_exact'] + _excluded['test_near']
     if _removed_test:
         # Test-to-test cleanup is not train/val leakage, but it changes the
@@ -1082,17 +1167,30 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=None, cache_dir=None,
         'tokenizer_fit_max_rows': int(_fit_max_rows),
         'tokenizer_fit_tokens': int(n_fit_tokens),
         'near_duplicate_cleanup': {
+            'accounting_schema': 'wikitext_dedup_accounting_v1',
             'policy': 'test_documents_deduplicated_against_train_and_validation',
+            'protocol': _test_dedup.protocol(),
+            'protocol_fp': _test_dedup.protocol_fp(),
             'train_exact_removed': int(_excluded['train_exact']),
             'train_near_removed': int(_excluded['train_near']),
             'test_exact_removed': int(_excluded['test_exact']),
             'test_near_removed': int(_excluded['test_near']),
             'test_self_cleanup_policy': 'test_documents_deduplicated_among_themselves',
             'near_hamming_threshold': int(_test_dedup.near_threshold),
+            'bands': int(_test_dedup.bands),
+            'shingle_words': int(_test_dedup.shingle_words),
+            'max_shingles': int(_test_dedup.max_shingles),
             'source_documents': int(len(test_rows)),
+            # Blank raw rows never enter the dedup index.  Recording the
+            # non-empty count makes the cleaning ledger close exactly:
+            # nonempty = kept + train/val/test exact+near removals.
+            'source_documents_nonempty': int(sum(
+                1 for _r in test_rows if isinstance(_r, str) and _r.strip())),
             'kept_documents': int(len(_trows)),
             'validation_cleanup': {
                 'policy': 'validation_documents_deduplicated_against_train',
+                'protocol': _test_dedup.protocol(),
+                'protocol_fp': _test_dedup.protocol_fp(),
                 'source_documents': int(len(val_rows_source)),
                 'kept_documents': int(len(_kept_val_docs)),
                 'indexed_documents': int(_val_indexed_docs),
@@ -1277,7 +1375,170 @@ def _doc_exact_fp(text):
     return h.hexdigest()
 
 
-def _doc_simhash(text, *, shingle_words=5, max_shingles=128):
+# The near-duplicate cleaning geometry is part of the DATA identity, not an
+# implementation detail.  Two caches whose token ids are identical but whose
+# exact/near filters used different shingle widths, band layouts or Hamming
+# thresholds are different datasets: one may contain evaluation rows that the
+# other removed.  Keep every parameter in one declared protocol so the cache
+# metadata, the loader pairing checks and `audit_gates.py data_processing` can
+# all compare the same object instead of trusting a policy string.
+DEDUP_SIMHASH_SHINGLE_WORDS = 5
+DEDUP_SIMHASH_MAX_SHINGLES = 128
+DEDUP_PROTOCOL_SCHEMA = 'wikitext_exact_blake2b128_simhash64_lsh_v1'
+DEDUP_PROTOCOL_DEFAULTS = {
+    'schema': DEDUP_PROTOCOL_SCHEMA,
+    'exact_hash': 'blake2b-128',
+    'simhash_bits': 64,
+    'shingle_unit': 'word',
+    'shingle_words': DEDUP_SIMHASH_SHINGLE_WORDS,
+    'max_shingles': DEDUP_SIMHASH_MAX_SHINGLES,
+    'bands': 4,
+    'near_hamming_threshold': 3,
+    'scope': 'raw_line',
+}
+
+
+def _dedup_jsonable(value):
+    """Normalise protocol values so a fingerprint is stable across containers.
+
+    JSON metadata yields Python ints/floats, but a caller may hand the helper a
+    NumPy scalar (e.g. from a parsed array).  Normalising before hashing keeps
+    the same protocol from producing two different identities.
+    """
+    if isinstance(value, dict):
+        return {str(k): _dedup_jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_dedup_jsonable(v) for v in value]
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating):
+        return float(value)
+    return value
+
+
+def dedup_protocol_fp(protocol):
+    """Stable SHA-256 digest of a dedup protocol object.
+
+    The digest covers every key, so adding/changing any cleaning parameter
+    changes the data identity even when the policy string stays the same.
+    """
+    if not isinstance(protocol, dict):
+        raise ValueError(f'dedup protocol must be an object, got {type(protocol).__name__}')
+    blob = json.dumps(_dedup_jsonable(protocol), sort_keys=True,
+                      separators=(',', ':'), ensure_ascii=True,
+                      allow_nan=False)
+    return hashlib.sha256(blob.encode('utf-8')).hexdigest()
+
+
+def dedup_protocol_problems(protocol):
+    """Validate a recorded dedup protocol; returns a list of problems.
+
+    ``near_hamming_threshold < bands`` is required: the band index is only
+    exhaustive for pairs within the threshold when fewer bits differ than
+    there are bands (pigeonhole).  A larger threshold would silently lose
+    near duplicates instead of failing closed.
+    """
+    if not isinstance(protocol, dict):
+        return [f'protocol must be an object, got {type(protocol).__name__}']
+    problems = []
+    required = {
+        'schema', 'exact_hash', 'simhash_bits', 'shingle_unit',
+        'shingle_words', 'max_shingles', 'bands', 'near_hamming_threshold',
+        'scope',
+    }
+    missing = sorted(required - set(protocol))
+    if missing:
+        problems.append('missing field(s): ' + ', '.join(missing))
+    if protocol.get('schema') != DEDUP_PROTOCOL_SCHEMA:
+        problems.append(
+            f"schema must be {DEDUP_PROTOCOL_SCHEMA!r}, got {protocol.get('schema')!r}")
+    if protocol.get('exact_hash') != 'blake2b-128':
+        problems.append(
+            f"exact_hash must be 'blake2b-128', got {protocol.get('exact_hash')!r}")
+    if protocol.get('shingle_unit') != 'word':
+        problems.append(
+            f"shingle_unit must be 'word', got {protocol.get('shingle_unit')!r}")
+    if protocol.get('scope') not in ('raw_line', 'document'):
+        problems.append(
+            "scope must be 'raw_line' or 'document', got "
+            f"{protocol.get('scope')!r}")
+
+    def _int_field(name, lo, hi):
+        value = protocol.get(name)
+        if isinstance(value, bool) or not isinstance(value, numbers.Integral):
+            problems.append(f'{name} must be an integer, got {value!r}')
+            return None
+        value = int(value)
+        if not (lo <= value <= hi):
+            problems.append(f'{name} must be in [{lo}, {hi}], got {value}')
+            return None
+        return value
+
+    _bits = _int_field('simhash_bits', 64, 64)
+    if _bits is None and 'simhash_bits' in protocol:
+        # The SimHash implementation is fixed at 64 bits; report the concrete
+        # constraint rather than a generic range failure above.
+        problems.append('simhash_bits must be exactly 64')
+    _words = _int_field('shingle_words', 1, 1 << 20)
+    _max_sh = _int_field('max_shingles', 1, 1 << 20)
+    _bands = _int_field('bands', 1, 8)
+    _near = _int_field('near_hamming_threshold', 0, 64)
+    if _bands is not None and 64 % _bands:
+        problems.append(
+            f'bands must divide 64 so every bit is covered (got {_bands}); '
+            'a partial band layout can miss near duplicates in the uncovered '
+            'high bits')
+    if _bands is not None and _near is not None and _near >= _bands:
+        problems.append(
+            'near_hamming_threshold must be < bands for an exhaustive LSH '
+            f'candidate search (got threshold={_near}, bands={_bands})')
+    if _words is not None and _max_sh is not None and _words > _max_sh:
+        problems.append(
+            f'shingle_words ({_words}) must not exceed max_shingles ({_max_sh})')
+    return problems
+
+
+def dedup_kwargs_from_protocol(protocol):
+    """Translate a recorded protocol into ``_DocDeduplicator`` constructor args.
+
+    Rebuilding a test/validation index from the TRAIN cache's protocol (rather
+    than the current code defaults) is what makes the pair use one cleaning
+    geometry.  Unknown extra keys are ignored here; the protocol digest still
+    binds them.
+    """
+    problems = dedup_protocol_problems(protocol)
+    if problems:
+        raise ValueError('invalid dedup protocol: ' + '; '.join(problems))
+    return {
+        'near_threshold': int(protocol['near_hamming_threshold']),
+        'bands': int(protocol['bands']),
+        'shingle_words': int(protocol['shingle_words']),
+        'max_shingles': int(protocol['max_shingles']),
+        'scope': str(protocol['scope']),
+    }
+
+
+def dedup_protocol_from_meta(meta):
+    """Return a cache's full dedup protocol object, or ``None`` for legacy.
+
+    Train/validation metadata stores it under ``dedup.protocol``; held-out
+    metadata stores the same object under ``near_duplicate_cleanup.protocol``.
+    A legacy cache has only scattered count/threshold fields, so it cannot be
+    compared for exact geometry.
+    """
+    if not isinstance(meta, dict):
+        return None
+    for _key in ('dedup', 'near_duplicate_cleanup'):
+        _block = meta.get(_key)
+        if isinstance(_block, dict):
+            _proto = _block.get('protocol')
+            if isinstance(_proto, dict):
+                return _proto
+    return None
+
+
+def _doc_simhash(text, *, shingle_words=DEDUP_SIMHASH_SHINGLE_WORDS,
+                 max_shingles=DEDUP_SIMHASH_MAX_SHINGLES):
     """Deterministic 64-bit SimHash over word shingles (near-duplicate key).
 
     The shingle set is sub-sampled on an evenly spaced grid so very long

@@ -1025,6 +1025,56 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=None, val_seqs=512,
                 _problems.append(
                     'cache does not record validation duplicate-removal counts '
                     '(exact/near)')
+            # The near-duplicate geometry is part of the data identity.  A
+            # cache that records a protocol must be self-consistent (digest
+            # matches every parameter, redundant fields agree).  A legacy
+            # cache without the object is accepted only when its recorded
+            # threshold matches the declared default; otherwise the cleaning
+            # semantics are unknown and the split must be rebuilt.
+            _proto = _dd_meta.get('protocol')
+            if _proto is not None:
+                _pp = dedup_protocol_problems(_proto)
+                if _pp:
+                    _problems.append(
+                        'cache dedup protocol is invalid: ' + '; '.join(_pp))
+                else:
+                    if _dd_meta.get('protocol_fp') != dedup_protocol_fp(_proto):
+                        _problems.append(
+                            'cache dedup protocol fingerprint does not match '
+                            'its recorded parameters (mixed or edited metadata)')
+                    for _pk, _pv in (
+                            ('near_hamming_threshold', _proto['near_hamming_threshold']),
+                            ('bands', _proto['bands']),
+                            ('shingle_words', _proto['shingle_words']),
+                            ('max_shingles', _proto['max_shingles'])):
+                        if (_dd_meta.get(_pk) is not None
+                                and int(_dd_meta[_pk]) != int(_pv)):
+                            _problems.append(
+                                f'cache dedup field {_pk}={_dd_meta[_pk]!r} '
+                                f'disagrees with its protocol ({_pv!r})')
+            else:
+                _partial = [k for k in ('bands', 'shingle_words',
+                                        'max_shingles', 'protocol_fp')
+                            if _dd_meta.get(k) is not None]
+                if _partial:
+                    _problems.append(
+                        'cache records partial dedup geometry fields '
+                        f'{_partial} but no full protocol; the cleaning '
+                        'identity is incomplete — rebuild the cache')
+                _legacy_thr = _dd_meta.get('near_hamming_threshold')
+                if _legacy_thr is not None:
+                    try:
+                        _legacy_thr = int(_legacy_thr)
+                    except (TypeError, ValueError, OverflowError):
+                        _problems.append(
+                            'cache dedup near_hamming_threshold is not an integer')
+                    else:
+                        if _legacy_thr != int(DEDUP_PROTOCOL_DEFAULTS['near_hamming_threshold']):
+                            _problems.append(
+                                'legacy cache records a non-default near-duplicate '
+                                'threshold but no full protocol; its cleaning '
+                                'geometry (shingle width/bands) is unknowable — '
+                                'rebuild the cache')
         # Document ids are the group identity.  When the cache carries them,
         # prove the groups are disjoint instead of trusting the build-time
         # deduplicator; a sidecar pair that disagrees with the metadata is a
@@ -1412,11 +1462,23 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=None, val_seqs=512,
             'policy': 'whole_document_exact_and_near_duplicate_filtered',
         },
         'dedup': {
+            'accounting_schema': 'wikitext_dedup_accounting_v1',
+            # The cleaning geometry is part of the data identity.  `protocol`
+            # is the complete object; `protocol_fp` binds it into the cache so
+            # a train/test pair built with different shingle/band parameters
+            # cannot be served as if it were one dataset.
+            'protocol': _dedup.protocol(),
+            'protocol_fp': _dedup.protocol_fp(),
             'fit': _fit_dedup,
             'splits': _dedup_by_split,
             'policy': 'exact_and_near_duplicate_documents_filtered_across_fit_train_validation',
             'near_hamming_threshold': int(_dedup.near_threshold),
+            'bands': int(_dedup.bands),
+            'shingle_words': int(_dedup.shingle_words),
+            'max_shingles': int(_dedup.max_shingles),
             'validation_cleanup': {
+                'protocol': _dedup.protocol(),
+                'protocol_fp': _dedup.protocol_fp(),
                 'policy': 'validation_docs_deduped_against_fit_and_train',
                 'exact_removed': int(_dedup_by_split.get('validation', {}).get('exact', 0)),
                 'near_removed': int(_dedup_by_split.get('validation', {}).get('near', 0)),

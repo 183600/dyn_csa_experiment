@@ -5994,3 +5994,119 @@ python audit_gates.py report                 # 汇总新增 two_level_ci 块
 复现、conf 变宽、点估计不随重采样改变；形状/布尔/非有限/分数 token/非法
 conf/n_boot/seed fail-closed；单种子/单单位拒绝；v12 分析接入且报告格同时
 含 cluster 与两层区间；审计的 ok/fail/warning/legacy/not-verifiable 分支。
+
+## 82. 数据处理身份：近重复清理参数与 source→served 台账不能只写在 policy 字符串里（本轮数据方法硬化）
+
+### 82.1 问题
+
+`dedup` 元数据此前只记录 `near_hamming_threshold` 和一个 policy 字符串。
+但清理结果实际由一组几何参数共同决定：exact hash 算法、SimHash 的 shingle
+宽度、shingle 采样上限、LSH band 数、Hamming 阈值。只要其中任一参数不同，
+即使 token 指纹、`fit_fp` 和 policy 字符串完全相同，两个 cache 也可能保留
+不同的文档：一个把某篇评测文章当近重复删除，另一个没有。此时：
+
+- `audit_leakage` 的 train/test 重叠检查会重新发现污染，但**无法回答
+  「两个 cache 是否是同一次清理」**；
+- test cache 的 `near_duplicate_cleanup.policy` 仍写着
+  `test_documents_deduplicated_against_train_and_validation`，读者会把它
+  当成与 train 同一协议，实际却可能用了不同的 shingle/band 几何；
+- `near_hamming_threshold` 只是清理强度的一个数，不能单独复现清理集合；
+- 源行数、去重删除数、服务行/文档/token 数分散在 `sampling`、
+  `dedup.splits`、`doc_ids` 三处，缺少一个可机器核对的闭合台账。
+
+### 82.2 协议对象与指纹
+
+新增 `DEDUP_PROTOCOL_DEFAULTS`，把清理几何显式化为：
+
+```text
+schema                  = wikitext_exact_blake2b128_simhash64_lsh_v1
+exact_hash              = blake2b-128
+simhash_bits            = 64
+shingle_unit            = word
+shingle_words           = 5
+max_shingles            = 128
+bands                   = 4
+near_hamming_threshold  = 3
+scope                   = raw_line（WikiText 行）；FineWeb 文档用 document
+```
+
+`_DocDeduplicator` 现在接受 `shingle_words`/`max_shingles`/`scope`，并在
+`protocol()` 中返回完整对象；`protocol_fp` 是 canonical JSON 的 SHA-256，
+覆盖所有键。`stats()` 同时携带对象与指纹，旧字段保持兼容。
+
+两个 fail-closed 的几何约束：
+
+- `near_hamming_threshold < bands`：只有当不同 bit 数少于 band 数时，
+  鸽巢原理才保证近重复对至少共享一个完整 band；阈值不小于 band 数时 LSH
+  可能漏检，不能继续把它标成「已清理」。
+- `bands` 必须整除 64：band 哈希按 `64 // bands` 位切块；5/6/7 个 band
+  会留下未索引的高位，即使 Hamming 距离为 0 也可能逃过候选搜索。
+
+### 82.3 缓存身份与配对
+
+新构建的 train/validation meta 在 `dedup` 中写 `protocol` 与
+`protocol_fp`；test meta 在 `near_duplicate_cleanup`（以及
+`validation_cleanup`）中写同一对象；FineWeb 的 `dedup` 也记录同一对象。
+test 冷构建时从**配对 train cache**
+读取协议并用它构造 validation/test 的 SimHash 索引，而不是使用当前代码
+默认值；这样即使代码默认以后改变，旧 train cache 的清理几何仍被沿用。
+cache-hit 与冷构建都会拒绝：
+
+- 协议对象自身不合法、`protocol_fp` 与参数不符、冗余字段
+  （threshold/bands/shingle_words/max_shingles）与协议不一致；
+- 同一 `(vocab, fit_fp)` 的 train/validation cache 声明多个协议；
+- test cache 的 `protocol_fp` 不在配对 train cache 的协议集合中。
+
+legacy cache（只有 threshold、没有完整对象）仍可读取，但审计明确标为
+不可验证；如果它记录的 threshold 与当前默认不同，则无法知道 shingle/band
+几何，读取路径直接拒绝，而不是猜测。
+
+### 82.4 清理台账
+
+新增 `audit_gates.audit_data_processing`（CLI `data_processing`，别名
+`dedup_protocol` / `dedup` / `cleaning`，并进入 `report`）做三类检查：
+
+1. **身份**：每个记录协议的 cache 都重算 `protocol_fp`，核对冗余字段，
+   并验证几何约束；
+2. **配对**：按 `(vocab, fit_fp)` 分组，要求同组 train/validation 协议
+   唯一，且 test 协议属于该组；
+3. **台账**：核对
+   `nonempty_rows_scanned - rows_served == exact + near`、
+   `sampling.rows_served == doc_ids.*_count`、
+   `sampling.tokens_served == doc_ids.test_token_count`、
+   `source_documents_nonempty == kept + train/val/test exact+near`，
+   以及（存在时）`train_ids_*.npy` / `val_batch_*.npy` /
+   `*_doc_ids_*.npy` 的长度与元数据一致。空行不进 dedup 索引，因此 test
+   meta 额外记录 `source_documents_nonempty`，让 held-out 台账精确闭合。
+
+缺缓存、无任何完整协议、或全部为 legacy 时返回
+`not_verifiable_locally`；协议自相矛盾、跨 split 几何不一致、台账不闭合
+才是 `fail`。这不改变任何 token、split 成员、清理决策、训练或 PPL：它把
+**已经发生的清理**变成可复核的数据身份。
+
+### 82.5 边界
+
+- 不重采样、不重新清理、不重跑；现有 v12 cache 不因本改动改变任一 token
+  或 split 成员。新字段只对未来构建生效，旧 cache 不回填。
+- SimHash 仍是近似近重复：协议保证的是**同一清理几何**与 LSH 候选搜索的
+  完备性，不是「所有语义近重复都已被删除」。同义改写、翻译回写、摘要复用
+  仍可能漏检。
+- 台账闭合只证明元数据与侧边文件自洽，不证明上游 raw dump 的内容正确；
+  raw 身份仍由 `dataset_source` / revision pin / `fit_fp` / `src_fp` 负责。
+- 该审计不读取 `wiki.test.raw`，不改变 `CODE_SEMANTICS`、冻结清单、种子、
+  端点、alpha/Holm 或任何确认判定。
+
+### 82.6 入口与验证
+
+```bash
+python -m pytest -q test_review_part_22.py   # 协议/指纹/配对/台账/legacy
+python audit_gates.py data_processing        # 零 GPU；缺缓存 -> not_verifiable
+python audit_gates.py report                 # 汇总新增 data_processing 块
+```
+
+`test_review_part_22.py` 覆盖：默认协议完整且指纹稳定；非默认几何改变
+指纹；threshold≥bands、band 不整除 64、shingle 宽度非法均被拒绝；协议
+校验器与 metadata 读取；干净 train/test 台账 `ok`；篡改 `protocol_fp`、
+test 使用不同有效几何、held-out 台账不闭合、train 台账不闭合均 `fail`；
+legacy 全部 `not_verifiable_locally`；`_filter_test_documents(protocol=...)`
+用配对协议重建 test 索引。

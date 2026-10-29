@@ -121,6 +121,40 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=None, val_seqs=512,
                 _problems.append(
                     'cache does not attest exact/near-duplicate cleanup of the '
                     'validation split against the tokenizer-fit and training documents')
+            # The near-duplicate geometry is part of the data identity.  A
+            # cache that records a protocol must be self-consistent; a legacy
+            # cache without one stays readable but is explicitly unverified.
+            _proto = _dd_meta.get('protocol') if isinstance(_dd_meta, dict) else None
+            if _proto is not None:
+                _pp = dedup_protocol_problems(_proto)
+                if _pp:
+                    _problems.append(
+                        'cache dedup protocol is invalid: ' + '; '.join(_pp))
+                else:
+                    if (_dd_meta.get('protocol_fp')
+                            != dedup_protocol_fp(_proto)):
+                        _problems.append(
+                            'cache dedup protocol fingerprint does not match '
+                            'its recorded parameters (mixed or edited metadata)')
+                    for _pk, _pv in (
+                            ('near_hamming_threshold', _proto['near_hamming_threshold']),
+                            ('bands', _proto['bands']),
+                            ('shingle_words', _proto['shingle_words']),
+                            ('max_shingles', _proto['max_shingles'])):
+                        if (_dd_meta.get(_pk) is not None
+                                and int(_dd_meta[_pk]) != int(_pv)):
+                            _problems.append(
+                                f'cache dedup field {_pk}={_dd_meta[_pk]!r} '
+                                f'disagrees with its protocol ({_pv!r})')
+            elif isinstance(_dd_meta, dict):
+                _partial = [k for k in ('bands', 'shingle_words',
+                                        'max_shingles', 'protocol_fp')
+                            if _dd_meta.get(k) is not None]
+                if _partial:
+                    _problems.append(
+                        'cache records partial dedup geometry fields '
+                        f'{_partial} but no full protocol; the cleaning '
+                        'identity is incomplete — rebuild the cache')
             if _problems:
                 _cache_warning('FineWeb train/validation split', _problems)
             else:
@@ -132,7 +166,7 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=None, val_seqs=512,
                 _memo_put(_FWEB_MEMO, _mkey, _out, _FWEB_MEMO_CAP)
                 return _out
     rows = _fineweb_docs(source)
-    _dedup = _DocDeduplicator()
+    _dedup = _DocDeduplicator(scope='document')
     _skipped = {'fit': {'exact': 0, 'near': 0},
                 'train': {'exact': 0, 'near': 0},
                 'validation': {'exact': 0, 'near': 0}}
@@ -393,11 +427,20 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=None, val_seqs=512,
                 'policy': 'whole_document_exact_and_near_duplicate_filtered',
             },
             'dedup': {
+                'accounting_schema': 'fineweb_dedup_accounting_v1',
+                'protocol': _dedup.protocol(),
+                'protocol_fp': _dedup.protocol_fp(),
                 'fit': dict(_skipped['fit']),
                 'train': dict(_skipped['train']),
                 'validation': dict(_skipped['validation']),
+                'near_hamming_threshold': int(_dedup.near_threshold),
+                'bands': int(_dedup.bands),
+                'shingle_words': int(_dedup.shingle_words),
+                'max_shingles': int(_dedup.max_shingles),
                 'validation_cleanup': {
                     'policy': 'validation_docs_deduped_against_fit_and_train',
+                    'protocol': _dedup.protocol(),
+                    'protocol_fp': _dedup.protocol_fp(),
                     'exact_removed': int(_skipped['validation'].get('exact', 0)),
                     'near_removed': int(_skipped['validation'].get('near', 0)),
                 },
