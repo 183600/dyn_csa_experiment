@@ -256,3 +256,55 @@ def test_missingness_gate_is_registered_in_cli_and_report():
     src = inspect.getsource(A)
     assert "'missingness': audit_missingness" in src
     assert "'missingness': audit_missingness()" in src
+
+
+def test_missingness_extreme_finite_panel_stays_json_safe():
+    # Non-finite intermediates must not leak into a strict JSON artifact even
+    # when every input delta/endpoint is finite.  The overall-mean bound is
+    # representable (0..8.95e307) but an intermediate endpoint difference
+    # (-1.79e308 - 1.79e308) overflows, and the sample SD is itself beyond
+    # float64.
+    d = [1.79e308, -1.79e308, 1.79e308]
+    r = L.missingness_sensitivity(
+        d, seeds=[0, 1, 2], planned_seeds=[0, 1, 2, 3],
+        delta_range=[-1.79e308, 1.79e308], margin=1e307)
+    assert r['observed_std'] is None
+    assert r['overall_mean_bounds'] is not None
+    assert all(math.isfinite(v) for v in r['overall_mean_bounds'])
+    assert r['unobserved_mean_for_zero'] is not None
+    assert math.isfinite(r['unobserved_mean_for_zero'])
+    json.dumps(r, allow_nan=False)
+    # A genuinely unrepresentable tipping value is withheld, not reported as
+    # +/-inf, and the bounds that are representable are still computed.
+    r2 = L.missingness_sensitivity(
+        [1e308, 1.5e308], seeds=[0, 1], planned_seeds=[0, 1, 2],
+        delta_range=[-1e308, 1e308])
+    assert r2['unobserved_mean_for_zero'] is None
+    assert _close(r2['overall_mean_bounds'][0], 5e307)
+    assert _close(r2['overall_mean_bounds'][1], 1.1666666666666665e308)
+    assert r2['robust_zero'] is True
+    json.dumps(r2, allow_nan=False)
+
+
+def test_panel_coverage_uses_primary_ppl_and_rejects_ambiguous_cells():
+    nested = {
+        'a::seed0': {
+            'variant': 'a', 'seed': 0, 'ppl': None,
+            'ppl_estimation_rows': 'nested_validation_holdout',
+            'ppl_holdout': 50.0, 'run_cfg': _RUN_CFG,
+            'steps': 1, 'tokens_seen': 1, 'params': 100,
+        },
+    }
+    c = L.panel_missingness_audit(nested, planned_cells=['a::seed0'])
+    assert c['status'] == 'complete', c
+    assert c['n_usable_cells'] == 1 and c['n_unusable_cells'] == 0, c
+    # Two physical records for the same (variant, protocol, seed) cannot be
+    # chosen between, so the cell is present but not usable coverage.
+    base = {'variant': 'a', 'seed': 0, 'ppl': 50.0, 'run_cfg': _RUN_CFG,
+            'steps': 1, 'tokens_seen': 1, 'params': 100}
+    c2 = L.panel_missingness_audit(
+        {'a::seed0': dict(base), 'a::seed0_duplicate': dict(base)},
+        planned_cells=['a::seed0'])
+    assert c2['ambiguous_records']
+    assert c2['n_usable_cells'] == 0 and c2['n_unusable_cells'] == 1, c2
+    assert c2['status'] == 'incomplete'

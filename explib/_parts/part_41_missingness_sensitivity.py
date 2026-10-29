@@ -162,11 +162,41 @@ def _miss_range(delta_range, deltas):
 
 
 def _miss_lerp(mean, weight, value):
-    """``mean + weight*(value-mean)`` without an intermediate overflow."""
+    """``mean + weight*(value-mean)`` without an intermediate overflow.
+
+    Returns ``None`` when the result is not representable as a finite float.
+    The obvious expression can overflow twice even when the mathematical
+    result is small: ``value - mean`` overflows for endpoints of opposite
+    signs near the float limit, and ``weight * (value - mean)`` overflows for
+    a large extrapolation weight.  In that case both endpoints are divided by
+    a common scale first, so the interpolation happens on values in [-1, 1]
+    and only the final (already interpolated) value is multiplied back.
+    """
     try:
-        return float(math.fsum((mean, weight * (value - mean))))
+        mean = float(mean)
+        weight = float(weight)
+        value = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not (math.isfinite(mean) and math.isfinite(weight)
+            and math.isfinite(value)):
+        return None
+    try:
+        out = float(math.fsum((mean, weight * (value - mean))))
+    except (OverflowError, ValueError):
+        out = None
+    if out is not None and math.isfinite(out):
+        return out
+    scale = max(abs(mean), abs(value))
+    if scale == 0.0:
+        # 0 + weight*(0-0) is exactly zero for every finite weight.
+        return 0.0
+    try:
+        unit = (mean / scale) + weight * ((value / scale) - (mean / scale))
+        out = unit * scale
     except (OverflowError, ValueError):
         return None
+    return float(out) if math.isfinite(out) else None
 
 
 def missingness_sensitivity(deltas, *, seeds, planned_seeds, excluded_seeds=(),
@@ -234,6 +264,11 @@ def missingness_sensitivity(deltas, *, seeds, planned_seeds, excluded_seeds=(),
     st = paired_effect_stats(d, alpha=alpha, min_n=min_n)
     mean = float(st.get('mean')) if st.get('n') else float('nan')
     std = float(st.get('std')) if st.get('std_defined') else None
+    if std is not None and not math.isfinite(std):
+        # A finite panel can have a sample SD beyond float64 (e.g. alternating
+        # +/-1.79e308 seeds).  The SD is then unavailable, not an infinite
+        # measured spread; keep the report strict-JSON safe.
+        std = None
     direction = _sign_of(mean) if n else None
     rng, range_basis = _miss_range(delta_range, d)
     out = {
@@ -302,19 +337,39 @@ def missingness_sensitivity(deltas, *, seeds, planned_seeds, excluded_seeds=(),
         out['scenario_note'] = 'complete frame; no imputed scenario'
         return out
     if mean != 0.0:
+        # x0 = -n*mean/u.  Keep the historical expression for ordinary values,
+        # but an intermediate ``mean*n`` can overflow while the final tipping
+        # value is representable (large n, small u).  Re-order to
+        # ``mean*(n/u)`` only when needed, and withhold a value that is truly
+        # outside float64 instead of emitting an infinite tipping point.
         try:
             x0 = float(-(mean * n) / u)
         except (OverflowError, ValueError):
+            x0 = None
+        if x0 is None or not math.isfinite(x0):
+            try:
+                x0 = float(-(mean * (float(n) / float(u))))
+            except (OverflowError, ValueError, ZeroDivisionError):
+                x0 = None
+        if x0 is not None and not math.isfinite(x0):
             x0 = None
         out['unobserved_mean_for_zero'] = x0
         out['tipping_ratio_for_zero'] = (float(n) / float(u))
         if x0 is not None and rng is not None:
             out['tipping_in_range_zero'] = bool(rng[0] <= x0 <= rng[1])
     if threshold is not None:
+        # xt = threshold + (n/u)*(threshold-mean).  The ordinary expression is
+        # kept exactly (the report replays it), but either subtraction or
+        # multiplication can overflow for finite extreme-scale deltas.  Fall
+        # back to the equivalent unit-scaled linear extrapolation
+        # mean + (N/u)*(threshold-mean), which evaluates the same number with
+        # no intermediate wider than the final result.
         try:
             xt = float(math.fsum((threshold, (float(n) / float(u)) * (threshold - mean))))
         except (OverflowError, ValueError):
             xt = None
+        if xt is None or not math.isfinite(xt):
+            xt = _miss_lerp(mean, float(n + u) / float(u), threshold)
         out['unobserved_mean_for_threshold'] = xt
         if xt is not None and rng is not None:
             out['tipping_in_range_threshold'] = bool(rng[0] <= xt <= rng[1])
@@ -474,7 +529,12 @@ def panel_missingness_audit(summary, *, planned_cells=None, planned_seeds=None):
             'policy': MISSINGNESS_POLICY,
             'by_arm': {}, 'warnings': [],
         }
-    recs, ambiguous = _variant_seed_map(summary)
+    _recs, ambiguous = _variant_seed_map(summary)
+    # A cell whose identity has two measurable records is ambiguous: no
+    # complete-case contrast can choose between them, so it must not count as
+    # usable coverage even though both physical records are present.  The
+    # planned-cell format is arm::seed, so collapse the tag dimension here.
+    _ambiguous_cells = {(v, s) for (v, _t, s) in ambiguous}
     present, usable = {}, {}
     _legacy_ok = legacy_warm_tags(summary)
     for _key, _rec in summary.items():
@@ -485,10 +545,15 @@ def panel_missingness_audit(summary, *, planned_cells=None, planned_seeds=None):
             continue
         _variant, _tag, _seed = _rk
         present.setdefault(_variant, set()).add(_seed)
-        if (ppl_is_usable(_rec.get('ppl'))
-                and _record_primary_ppl(_rec) is not None):
+        # Use the record's PRIMARY PPL, not the raw ``ppl``.  A nested
+        # (holdout-estimated) record may legitimately omit full-validation
+        # ``ppl`` while carrying a usable held-out PPL; testing the raw field
+        # would call that cell unusable and understate coverage.
+        _primary = _record_primary_ppl(_rec)
+        if (ppl_is_usable(_primary)
+                and (_variant, _seed) not in _ambiguous_cells):
             usable.setdefault(_variant, set()).add(_seed)
-    observed_seeds = sorted({s for (_v, _t, s) in recs})
+    observed_seeds = sorted({s for ss in present.values() for s in ss})
     usable_seeds = sorted({s for v, ss in usable.items() for s in ss})
     plan = None
     plan_basis = None
