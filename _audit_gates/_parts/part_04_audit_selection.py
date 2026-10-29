@@ -1305,6 +1305,162 @@ def audit_unit_influence(path=None):
     return out
 
 
+
+def audit_two_level_ci(path=None):
+    """Result-analysis audit: the seed x unit total-uncertainty interval is sound.
+
+    The cluster-robust Δ CI conditions on the trained seeds; the two-level
+    bootstrap adds seed-to-seed variation.  This gate checks that every
+    comparison which publishes the pooled cluster interval also publishes a
+    coherent two-level block:
+
+      * its point estimate reproduces the frozen pooled Δ;
+      * the point lies inside its own percentile interval;
+      * both endpoints and the seed/unit/draw counts are finite/exact;
+      * the joint interval is not narrower than the conditional cluster
+        interval (that would mean the seed component was dropped).
+
+    A malformed block is a ``fail``.  A pooled CI without the block (an older
+    artifact) is a ``warning``: the total uncertainty is unverified, not zero.
+    This audit never changes a p-value, a Holm family or a frozen verdict; it
+    only prevents a conditional interval from being quoted as total
+    uncertainty.
+    """
+    p = path or os.path.join(REPO, 'analysis_v12', 'test_stats.json')
+    out = {'kind': 'two_level_ci_audit', 'status': 'ok', 'path': p,
+           'comparisons': {}, 'n_ok': 0, 'n_missing': 0,
+           'problems': [], 'warnings': [],
+           'note': ('descriptive total-uncertainty interval; a missing block '
+                    'leaves seed-to-seed uncertainty unverified and never '
+                    'changes the frozen p/Holm/confirmed verdict')}
+    if not os.path.exists(p):
+        out['status'] = 'not_verifiable_locally'
+        out['reason'] = 'no final-test stats artifact on disk'
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return out
+    data = _load(p)
+    if data is None:
+        out['status'] = 'fail'
+        out['problems'].append(f'{p} exists but is not a readable JSON object')
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return out
+    ft = data.get('finaltest') if isinstance(data.get('finaltest'), dict) else data
+    comps = ft.get('comparisons') if isinstance(ft, dict) else None
+    if not isinstance(comps, dict) or not comps:
+        out['status'] = 'not_verifiable_locally'
+        out['reason'] = 'the stats artifact carries no comparisons'
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return out
+
+    def _finite(x):
+        if (isinstance(x, (bool, np.bool_, str, bytes, bytearray))
+                or x is None):
+            return None
+        try:
+            y = float(x)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return y if math.isfinite(y) else None
+
+    def _count(x):
+        if isinstance(x, (bool, np.bool_, str, bytes, bytearray)) or x is None:
+            return None
+        try:
+            y = float(x)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(y) or not y.is_integer():
+            return None
+        return int(y)
+
+    for name, comp in comps.items():
+        if not isinstance(comp, dict):
+            # Corrupt comparisons are reported by the other result-analysis
+            # gates; this gate only inspects comparisons it can read.
+            continue
+        ds = comp.get('doc_sampling')
+        if not isinstance(ds, dict) or ds.get('pooled_delta_ppl_ci95') is None:
+            continue
+        rec = {'present': False}
+        ci = ds.get('pooled_two_level_ci95')
+        if ci is None:
+            out['n_missing'] += 1
+            out['warnings'].append(
+                f'{name}: pooled cluster CI exists but no two-level '
+                'seed x unit interval (stale/legacy analysis artifact); the '
+                'total uncertainty is unverified')
+            out['comparisons'][name] = rec
+            continue
+        point = _finite(ds.get('pooled_two_level_delta_ppl'))
+        pooled = _finite(ds.get('pooled_delta_ppl'))
+        lo = hi = None
+        if isinstance(ci, (list, tuple)) and len(ci) == 2:
+            lo, hi = _finite(ci[0]), _finite(ci[1])
+        n_seeds = _count(ds.get('pooled_two_level_n_seeds'))
+        n_units = _count(ds.get('pooled_two_level_n_units'))
+        n_boot = _count(ds.get('pooled_two_level_n_boot'))
+        method = ds.get('pooled_two_level_method')
+        rec.update({'present': True, 'delta_ppl': point,
+                    'ci95': ([lo, hi] if lo is not None and hi is not None else None),
+                    'n_seeds': n_seeds, 'n_units': n_units,
+                    'n_boot': n_boot})
+        _problems_before = len(out['problems'])
+        if lo is None or hi is None or lo > hi:
+            out['problems'].append(
+                f'{name}: two-level CI is not a finite ordered pair ({ci!r})')
+        if point is None or pooled is None:
+            out['problems'].append(
+                f'{name}: pooled or two-level point estimate is missing/non-finite')
+        else:
+            if abs(point - pooled) > 1e-6 * max(1.0, abs(pooled)):
+                out['problems'].append(
+                    f'{name}: two-level point {point!r} does not reproduce the '
+                    f'reported pooled Δ {pooled!r}')
+            if lo is not None and hi is not None and not (lo - 1e-12 <= point <= hi + 1e-12):
+                out['problems'].append(
+                    f'{name}: two-level point {point!r} lies outside its own '
+                    f'interval [{lo!r}, {hi!r}]')
+        if n_seeds is None or n_seeds < 2:
+            out['problems'].append(
+                f'{name}: two-level n_seeds is missing or < 2 ({n_seeds!r})')
+        if n_units is None or n_units < 2:
+            out['problems'].append(
+                f'{name}: two-level n_units is missing or < 2 ({n_units!r})')
+        if n_boot is None or n_boot < 20:
+            out['problems'].append(
+                f'{name}: two-level n_boot is missing or < 20 ({n_boot!r})')
+        if not isinstance(method, str) or 'two-way' not in method:
+            out['problems'].append(
+                f'{name}: two-level method is missing or does not name the '
+                'two-way bootstrap')
+        # The joint interval must not be narrower than the interval that
+        # conditions on the seeds; that would mean the seed component was lost.
+        _doc = ds.get('pooled_delta_ppl_ci95')
+        if (lo is not None and hi is not None
+                and isinstance(_doc, (list, tuple)) and len(_doc) == 2):
+            _dlo, _dhi = _finite(_doc[0]), _finite(_doc[1])
+            if _dlo is not None and _dhi is not None and _dhi >= _dlo:
+                if (hi - lo) + 1e-12 < (_dhi - _dlo):
+                    out['warnings'].append(
+                        f'{name}: two-level interval is narrower than the '
+                        'conditional cluster interval; the seed component may '
+                        'be missing from the total-uncertainty readout')
+        rec['ok'] = len(out['problems']) == _problems_before
+        if rec['ok']:
+            out['n_ok'] += 1
+        out['comparisons'][name] = rec
+    if out['problems']:
+        out['status'] = 'fail'
+    elif out['n_missing'] or out['warnings']:
+        out['status'] = 'warnings'
+    elif out['n_ok'] == 0:
+        out['status'] = 'not_verifiable_locally'
+        out['reason'] = ('no comparison carries both a pooled cluster CI and a '
+                         'two-level interval')
+    print(json.dumps({k: v for k, v in out.items() if k != 'comparisons'},
+                     ensure_ascii=False, indent=2))
+    return out
+
 def audit_analysis_choices(path=None):
     """Result-analysis audit: multi-specification concordance is coherent.
 

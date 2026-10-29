@@ -1035,7 +1035,7 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
         A('')
     comps = ft.get('comparisons') or {}
     if comps:
-        A('| 冻结主比较（test split，配对） | n | 覆盖完整 | 参数匹配 | 初始化配对 | Δ mean±std | Δ 95% CI（文章/文档 token 池化 cluster / 行 bootstrap） | d_z | p (exact) | p 下限 | Holm p | Holm 拒绝 | 方向符合 |')
+        A('| 冻结主比较（test split，配对） | n | 覆盖完整 | 参数匹配 | 初始化配对 | Δ mean±std | Δ 95% CI（文章/文档 token 池化 cluster；seed×unit 两层 bootstrap / 行 bootstrap） | d_z | p (exact) | p 下限 | Holm p | Holm 拒绝 | 方向符合 |')
         A('|---|---|---|---|---|---|---|---|---|---|---|---|---|')
         holm = ft.get('holm') or {}
         for k, v in comps.items():
@@ -1077,7 +1077,10 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
               'raw row 是一行，不是一篇文章，行级 bootstrap 会把同一文章的段落当作独立样本'
               '（伪重复），因此文章级区间是主口径，行列字段仅作冻结契约的兼容证据。'
               '点估计与冻结比较的 token 池化 Δ 相同；同表 `Δ mean±std` 的离散度是种子间'
-              '训练随机性，两者不确定性来源不同。等权逐单元 bootstrap 仍保存在 '
+              '训练随机性，两者不确定性来源不同。cluster 区间**条件在已训练种子上**，'
+              '只覆盖评测单元抽样；紧跟其后的 seed×unit 两层 bootstrap 同时重采样种子与'
+              '单元，是总不确定性的描述性读数（不是新的检验，不进入 p/Holm/confirmed，'
+              '种子数很少时百分位区间可能偏窄）。等权逐单元 bootstrap 仍保存在 '
               '`analysis_v12/test_stats.json` 的 `per_doc_delta_ppl_ci95`，只作描述，'
               '不再占据主表 CI 列。）')
             A('')

@@ -160,6 +160,8 @@ def _doc_level_analysis(recs_a, recs_b, common, Ln, primary_deltas=None):
     _pooled_ci_reason = None
     _unit_influence = None
     _unit_influence_reason = None
+    _two_level_ci = None
+    _two_level_ci_reason = None
     if _granularity in ('document', 'article'):
         _nll_a, _why_a = _doc_nll_matrix(rows_a, n_docs, _ref_tok,
                                          unit=_granularity)
@@ -209,6 +211,34 @@ def _doc_level_analysis(recs_a, recs_b, common, Ln, primary_deltas=None):
                             _unit_influence = None
                             _unit_influence_reason = (
                                 f'{type(_ie).__name__}: {_ie}')
+                        # Total uncertainty: the cluster CI above conditions on
+                        # the trained seeds, so it can be much narrower than the
+                        # uncertainty of a result that also samples seeds.  The
+                        # two-way bootstrap uses the SAME point estimate and
+                        # resamples both levels; it is a descriptive companion,
+                        # never a replacement for the frozen sign-flip test.
+                        try:
+                            _two = L.paired_nll_two_way_bootstrap(
+                                _nll_a, _nll_b, _ref_tok)
+                        except (ValueError, TypeError, FloatingPointError,
+                                OverflowError) as _te:
+                            _two = None
+                            _two_level_ci_reason = (
+                                f'{type(_te).__name__}: {_te}')
+                        if _two is not None and _two.get('status') == 'ok':
+                            _tp = L._finite_scalar(_two.get('delta_ppl'))
+                            _pp = L._finite_scalar(_pooled_ci.get('delta_ppl'))
+                            if (_tp is None or _pp is None
+                                    or abs(_tp - _pp) > 1e-6 * max(1.0, abs(_pp))):
+                                _two_level_ci_reason = (
+                                    'two-level bootstrap refused: its point '
+                                    'estimate does not reproduce the pooled Δ')
+                            else:
+                                _two_level_ci = _two
+                        elif _two is not None:
+                            _two_level_ci_reason = (
+                                _two.get('reason')
+                                or 'two-level bootstrap unavailable')
                 else:
                     # The frozen comparison has no finite per-seed pooled PPL
                     # for this cell, so the document vectors cannot be tied to
@@ -328,6 +358,31 @@ def _doc_level_analysis(recs_a, recs_b, common, Ln, primary_deltas=None):
             out['unit_influence_unavailable_reason'] = (
                 _unit_influence_reason or
                 'leave-one-unit-out influence not available for this cell')
+        if _two_level_ci is not None:
+            out.update({
+                'pooled_two_level_delta_ppl': _two_level_ci['delta_ppl'],
+                'pooled_two_level_ci95': _two_level_ci['delta_ppl_ci95'],
+                'pooled_two_level_ratio_ci95': _two_level_ci['ratio_ci95'],
+                'pooled_two_level_n_boot': _two_level_ci['n_boot'],
+                'pooled_two_level_n_boot_valid': _two_level_ci['n_boot_valid'],
+                'pooled_two_level_n_seeds': _two_level_ci['n_seeds'],
+                'pooled_two_level_n_units': _two_level_ci['n_units'],
+                'pooled_two_level_method': _two_level_ci['method'],
+                'pooled_two_level_note': (
+                    'seed x unit percentile bootstrap: both training-seed and '
+                    'evaluation-unit sampling are resampled.  It is a '
+                    'descriptive total-uncertainty interval, not a new test; '
+                    'the exact sign-flip p/Holm/confirmed verdict is unchanged. '
+                    'A dozen seed clusters can make a percentile interval '
+                    'under-cover, so read it with n.'),
+            })
+            if _two_level_ci.get('warnings'):
+                out['pooled_two_level_warnings'] = list(
+                    _two_level_ci['warnings'])
+        else:
+            out['pooled_two_level_ci_unavailable_reason'] = (
+                _two_level_ci_reason
+                or 'two-level bootstrap not available for this cell')
     elif _granularity in ('document', 'article'):
         out['pooled_ci_unavailable_reason'] = (
             _pooled_ci_reason or
@@ -666,6 +721,10 @@ def _doc_ci_markdown_cell(dsm):
 
     pooled = _fmt(dsm.get('pooled_delta_ppl_ci95'))
     if pooled is not None:
+        joint = _fmt(dsm.get('pooled_two_level_ci95'))
+        if joint is not None:
+            return (f'{pooled}（{unit} cluster，token 池化；'
+                    f'seed×{unit} 两层 bootstrap {joint}）')
         return f'{pooled}（{unit} cluster，token 池化）'
     unit_ci = _fmt(dsm.get('per_doc_delta_ppl_ci95'))
     if unit_ci is not None:

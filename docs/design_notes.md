@@ -5901,3 +5901,96 @@ python -m pytest -q            # 完整 CPU 套件
 fail-closed 且零均值时 `prob_same_sign=None`；非法 `conf`/`direction`/
 字符串载荷拒绝；`paired_effect_stats` 与 `reportable_claim` 的字段回显及
 坏字段不被升级成门。
+
+## 81. 总不确定性不是一个更窄的区间：seed × evaluation-unit 两层 bootstrap（本轮结果分析硬化）
+
+### 81.1 问题：两个区间各自只回答一半
+
+v12 的主比较同时报两种不确定性：
+
+- 逐种子精确符号翻转 p / `Δ mean ± std`：把**训练种子**当作抽样单位；
+- `_paired_nll_doc_ci`（`doc_sampling.pooled_delta_ppl_ci95`）：固定已训练种子，
+  把**评测文章/文档**当作 cluster，给出 token 池化 Δ 的 cluster-robust 区间。
+
+两者都不是「这个 Δ 一共有多不确定」。cluster 区间条件在种子集合上，n=12 时
+可能很窄；种子区间又不含评测切片抽样。读者若只引用较窄的那个，就会把
+「条件在 12 个种子上、条件在 48 个评测单位上」误读成「换一批种子和文档也
+这么准」。`explib/_parts/part_32_pooled_ppl_from_records.py` 里已有的
+`_combined_seed_doc_ci` 只处理**绝对 PPL**，`paired_row_bootstrap_delta` 只
+重采样**行**且明确不重采样种子；配对 Δ 的两层联合区间仍然缺失。
+
+### 81.2 方法：在同一个估计量上同时重采样两个交叉因子
+
+新增 `exp_lib.paired_nll_two_way_bootstrap(nll_a, nll_b, n_tokens, *,
+n_boot=2000, seed=20261018, conf=0.95)`。输入仍是 `[n_seeds, n_units]` 的
+逐单位 NLL 与共享 token 数，主终点与 `_paired_nll_doc_ci` 完全一致：
+
+```
+Δ = mean_s [ exp(Σ_i a_si / T) − exp(Σ_i b_si / T) ]
+```
+
+每个 bootstrap draw 独立地：
+
+1. 从 S 个种子里有放回抽 S 个（`seed_counts ~ Multinomial(S, 1/S)`）；
+2. 从 D 个评测单位里有放回抽 D 个（`doc_counts ~ Multinomial(D, 1/D)`）；
+3. 用抽中的单位重算每个抽中种子的 token 池化 PPL 差；
+4. 对抽中的种子按 `seed_counts / S` 加权平均。
+
+重复 `n_boot` 次，取 percentile 区间（同时给出 log ratio 尺度与 ratio CI）。
+点估计保持全 panel 的 `mean_s(PPL_a − PPL_b)`，不因重采样而改变。
+
+这是**设计型（design-based）两层 cluster bootstrap**：两个因子在设计上交叉且
+独立（种子训练不依赖评测文档），因此可以分别重采样；它不假设两个方差分量
+可加，也不拟合 hierarchical/Bayesian 模型。它与 `_combined_seed_doc_ci` 的
+「两个独立方差源相加」是不同口径：后者是近似公式，前者直接对联合重采样
+分布取分位数。两者都不替代冻结的精确符号翻转检验。
+
+### 81.3 接入 v12 分析与报告
+
+- `_doc_level_analysis` 在 cluster 区间已经与记录的主终点逐值对齐之后，才
+  计算两层 bootstrap；点估计若不能复现 `pooled_delta_ppl`，该块显式关闭
+  （`pooled_two_level_ci_unavailable_reason`），不发布另一个估计量的区间。
+- `doc_sampling` 新增 `pooled_two_level_delta_ppl`、`pooled_two_level_ci95`、
+  `pooled_two_level_ratio_ci95`、`n_seeds/n_units/n_boot/n_boot_valid`、
+  `method`、`warnings` 与边界说明。种子或评测单位数量少时（S<5 或 D<20）在块内给出
+  「百分位区间可能偏窄/粗糙」的 warning，而不是静默省略。
+- `_doc_ci_markdown_cell` 在同一格中渲染
+  `[cluster CI]（…；seed×unit 两层 bootstrap [..]）`，并在表下说明 cluster
+  区间条件在种子上、两层区间是总不确定性的描述性读数。
+- 新增 `audit_gates.audit_two_level_ci`（`python audit_gates.py two_level_ci`，
+  别名 `two_level` / `total_uncertainty` / `joint_ci`）：检查点估计复现
+  pooled Δ、点落在自己的区间内、n_seeds/n_units/n_boot 合法、方法名含
+  `two-way`，并在联合区间**窄于**条件 cluster 区间时给 warning（提示种子
+  分量可能丢失）。缺块是 warning（旧产物），块自相矛盾才是 fail。该审计
+  接入 `audit_gates.py report` 的 `two_level_ci` 顶层键。
+
+### 81.4 边界
+
+- **不改**任何 PPL、token、split、种子、alpha、Holm 族、SESOI 决策、
+  `confirmed` 或 `confirmation_frozen*.json`；不需要 bump
+  `CODE_SEMANTICS`。两层区间不是新的检验，不产生 p 值。
+- 这是 **superpopulation over seeds and units** 的描述：它回答「再抽一批
+  种子和评测单位，这个 Δ 可能落在哪」，不回答「语言总体上的机制是否成立」。
+  `n_units < 64` 的 population-claim 门槛仍由 `unit_precision_design` 与报告
+  的总体声明门控制。
+- 只有 S=12 个种子 cluster 时，percentile bootstrap 的覆盖率可能低于名义
+  95%；因此必须同时报告 S/D/n_boot 与 warning，不能把区间宽度当成精确的
+  95% 保证。需要更高精度时应增加独立种子或评测文章，而不是缩窄区间。
+- 单位内部 token 相关只通过「单位 cluster」保留；不重采样 token，也不把
+  token 当独立重复。行级单元没有 token 池化 NLL 矩阵，因此不生成该块。
+- 历史 v6–v11 产物没有该字段，不重跑、不回填；旧 `test_stats.json` 在
+  审计中如实报 warning/not_verifiable，不把缺失当零方差。
+
+### 81.5 入口与验证
+
+```bash
+python -m pytest -q test_review_part_20.py   # 两层 bootstrap / v12 接入 / 审计
+python audit_gates.py two_level_ci           # 零 GPU：核对已落盘的两层区间
+python audit_gates.py report                 # 汇总新增 two_level_ci 块
+```
+
+`test_review_part_20.py` 覆盖：点估计与 `_paired_nll_doc_ci` 逐值一致；只有
+种子变化、文档内无变化时 cluster 区间退化为零而两层区间仍为正；同 seed 可
+复现、conf 变宽、点估计不随重采样改变；形状/布尔/非有限/分数 token/非法
+conf/n_boot/seed fail-closed；单种子/单单位拒绝；v12 分析接入且报告格同时
+含 cluster 与两层区间；审计的 ok/fail/warning/legacy/not-verifiable 分支。

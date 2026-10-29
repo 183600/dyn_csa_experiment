@@ -3364,3 +3364,56 @@ Holm 族、不改变任何 `confirmed` 判定或冻结决定，也不改变 `COD
 且零均值时同向概率为 `None`；非法 `conf`/`direction`/字符串载荷拒绝；
 `paired_effect_stats`/`reportable_claim` 回显与坏字段不被升级成门）。
 `python -m explib.confirmation plan` 的冻结计划/比较数不受影响。
+
+## 2026-10-29 — 总不确定性不是「较窄的那个区间」：配对 Δ 的 seed × evaluation-unit 两层 bootstrap（本轮结果分析硬化，no new runs）
+
+零 GPU 的结果分析硬化；不新增训练、不读取 test split、不修改冻结清单的
+字节/种子/端点/alpha/Holm 规则，也不改 `CODE_SEMANTICS`。
+
+**Problem.** v12 的主比较同时报逐种子符号翻转 p（种子抽样）与
+`doc_sampling.pooled_delta_ppl_ci95`（条件在已训练种子上、按评测文章/文档
+聚类的 token 池化 Δ 区间）。两者各自只覆盖一个不确定性来源：cluster 区间
+在 n=12 时可能很窄，逐种子区间又不含评测切片抽样。读者若引用较窄的那个，
+就会把「条件在 12 个种子、48 个评测单位上」误读成「换一批种子和文档也这么
+准」。现有的 `_combined_seed_doc_ci` 只处理**绝对 PPL**，
+`paired_row_bootstrap_delta` 只重采样行且明确不含种子；配对 Δ 的两层联合
+区间仍是缺口（review-4 第 14 条「seed-level 与 doc-level 仍是两层各自报告」
+的直接残留）。
+
+**Fix.** 新增 `exp_lib.paired_nll_two_way_bootstrap(nll_a, nll_b,
+n_tokens, *, n_boot=2000, seed=20261018, conf=0.95)`：在 `[n_seeds,
+n_units]` 的逐单位 NLL 上，每个 draw 独立重采样种子与评测单位，按抽中单位
+重算每个抽中种子的 token 池化 PPL 差，再按种子权重平均，取 percentile
+区间（同时给 log-ratio 与 ratio CI）。点估计仍为全 panel 的
+`mean_s(PPL_a − PPL_b)`，与 `_paired_nll_doc_ci` 逐值一致；不拟合
+hierarchical 模型，不假设两个方差分量可加。`_doc_level_analysis` 只在
+cluster 区间已与记录主终点对齐后计算该块，点估计不能复现 pooled Δ 时显式
+关闭并记录原因；`doc_sampling` 新增 `pooled_two_level_*` 字段、n_seeds/
+n_units/n_boot 与「百分位区间在少 cluster 时可能偏窄」的 warning。
+`_doc_ci_markdown_cell` 在同一格同时渲染 cluster 与两层区间；表下说明前者
+条件在种子上、后者是总不确定性的描述性读数。新增
+`audit_gates.audit_two_level_ci`（CLI `two_level_ci` / `two_level` /
+`total_uncertainty` / `joint_ci`）：检查点估计复现 pooled Δ、点落在自己的
+区间内、计数合法、方法名含 `two-way`；联合区间窄于条件 cluster 区间时给
+warning（种子分量可能丢失）。缺块对旧产物是 warning，块自相矛盾才是 fail；
+接入 `audit_gates.py report` 的 `two_level_ci` 顶层键。
+
+**Boundary.** 这是 **superpopulation over seeds and units** 的描述性读数，
+不是新的检验、不产生 p、不进入 Holm 族、不改变任何 SESOI 决策或
+`confirmed`。它不替代真正的新种子/新评测切片，也不把 token 当独立重复；
+单位内部相关只通过 cluster 保留。S=12 个种子 cluster 时 percentile 覆盖率
+可能低于名义 95%，必须同时报告 S/D/n_boot 与 warning；要提高精度应增加独立
+种子或文章，而不是缩窄区间。行级单元没有 token 池化 NLL 矩阵，不生成该块；
+历史 v6–v11 产物不重跑、不回填，缺块在审计中如实报 warning/
+not_verifiable，不把缺失当零方差。population-claim 的 64 单元门槛仍由
+`unit_precision_design` 与报告总体声明门控制。
+
+**Verification.** `python -m pytest -q` 通过 `631 passed, 3 skipped`（新增
+`test_review_part_20.py` 5 项：点估计与 `_paired_nll_doc_ci` 逐值一致；
+只有种子变化、文档内无变化时 cluster 区间退化为零而两层区间仍为正；
+同 seed 可复现、conf 变宽、点估计不随重采样改变；形状/布尔/非有限/
+分数 token/非法 conf/n_boot/seed fail-closed；单种子/单单位拒绝；v12 分析
+接入且报告格同时含 cluster 与两层区间；审计的 ok/fail/warning/legacy/
+not-verifiable 分支）。`python audit_gates.py two_level_ci` 在当前无
+`analysis_v12/test_stats.json` 的仓库报 `not_verifiable_locally`，不假绿。
+`python -m explib.confirmation plan` 的冻结计划/比较数不受影响。

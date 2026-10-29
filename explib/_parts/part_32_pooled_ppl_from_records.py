@@ -559,6 +559,234 @@ def paired_row_bootstrap_delta(pairs, *, n_boot=1000, seed=20261018, conf=0.95):
                    'substitute for the seed-level exact sign-flip p-value.')
     return out
 
+
+_TWO_WAY_BOOTSTRAP_ASSUMPTION = (
+    'the paired seeds and the evaluation units are each exchangeable samples '
+    'from their respective populations, and the two resampling dimensions are '
+    'independent; this is a design-based uncertainty readout, not a fitted '
+    'hierarchical/random-effects model'
+)
+
+
+def paired_nll_two_way_bootstrap(nll_a, nll_b, n_tokens, *, n_boot=2000,
+                                 seed=20261018, conf=0.95):
+    """Two-level (seed x evaluation-unit) bootstrap CI for a paired ΔPPL.
+
+    The seed-level exact sign-flip test answers "is the direction stable across
+    training draws"; the cluster-robust document interval answers "how much do
+    the frozen evaluation units move the token-pooled Δ, conditional on these
+    seeds".  Neither is the total uncertainty of the reported number: with 3-12
+    seeds and a few dozen documents, both sources act at once.  Reporting the
+    two intervals side by side lets a reader under-state the uncertainty by
+    picking the narrower one.
+
+    This helper resamples BOTH levels of the crossed design, independently and
+    with replacement: a draw selects ``S`` seed indices and ``D`` unit indices,
+    recomputes the paired token-pooled PPL difference on the resampled units
+    for each resampled seed, and averages over the resampled seeds.  The
+    resulting percentile interval covers seed-to-seed training noise and
+    evaluation-unit sampling together, on the SAME estimand as
+    :func:`_paired_nll_doc_ci` (point estimate unchanged).
+
+    Inputs are ``[n_seeds, n_units]`` per-unit summed NLLs for the two arms and
+    the shared per-unit token counts.  Malformed accounting raises ``ValueError``
+    (a wrong interval is worse than an explicit refusal); too few seeds/units or
+    too few finite draws returns ``status='unverifiable'`` with a reason.
+
+    The interval is a **descriptive total-uncertainty readout**, not a new
+    test: it never changes the exact sign-flip p, the Holm family, a SESOI
+    decision or a frozen verdict.  It also does not model within-unit token
+    correlation beyond the unit cluster, and a percentile interval with only a
+    dozen seed clusters can under-cover; the seed/unit counts are reported so
+    the reader can see that limitation.
+    """
+    out = {'kind': 'paired_two_way_bootstrap', 'status': 'unverifiable',
+           'n_seeds': None, 'n_units': None,
+           'n_boot': None, 'n_boot_valid': 0, 'conf': None,
+           'delta_ppl': None, 'delta_ppl_ci95': None,
+           'se_ppl': None,
+           'delta_log_ratio': None, 'delta_log_ratio_ci95': None,
+           'ratio_ci95': None, 'se_log_ratio': None,
+           'warnings': [],
+           'method': ('two-way (seed x evaluation-unit) percentile bootstrap '
+                      'of the paired token-pooled ΔPPL; both levels resampled '
+                      'independently'),
+           'assumption': _TWO_WAY_BOOTSTRAP_ASSUMPTION,
+           'role': ('descriptive total-uncertainty interval; it does not '
+                    'change any p-value, Holm family, SESOI decision or '
+                    'frozen confirmation verdict'),
+           'note': ('point estimate is the same mean-over-seeds token-pooled '
+                    'ΔPPL as the document cluster interval; the bootstrap only '
+                    'widens the uncertainty to include training-seed draws'),
+           'reason': None}
+
+    def _matrix(x, name):
+        try:
+            raw = np.asarray(x)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(f'{name}: values must be numeric') from None
+        if _contains_bool_value(x) or raw.dtype.kind == 'b':
+            raise ValueError(f'{name}: booleans are not NLL measurements')
+        try:
+            arr = np.asarray(raw, dtype=float)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(f'{name}: values must be numeric') from None
+        if arr.ndim == 1:
+            arr = arr[None, :]
+        if arr.ndim != 2 or arr.shape[0] < 1 or arr.shape[1] < 1:
+            raise ValueError(
+                f'{name}: expected [n_seeds, n_units], got shape {arr.shape}')
+        if not np.all(np.isfinite(arr)):
+            raise ValueError(f'{name}: all per-unit NLLs must be finite')
+        return arr
+
+    A = _matrix(nll_a, 'paired_nll_two_way_bootstrap(nll_a)')
+    B = _matrix(nll_b, 'paired_nll_two_way_bootstrap(nll_b)')
+    if A.shape != B.shape:
+        raise ValueError(
+            'paired_nll_two_way_bootstrap: arm shapes differ '
+            f'({A.shape} vs {B.shape}); a paired interval needs the same seeds '
+            'and units')
+    try:
+        raw_t = np.asarray(n_tokens).reshape(-1)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError('paired_nll_two_way_bootstrap: n_tokens must be numeric') from None
+    if _contains_bool_value(n_tokens) or raw_t.dtype.kind == 'b':
+        raise ValueError(
+            'paired_nll_two_way_bootstrap: token counts must be integers, not booleans')
+    counts = [_exact_count(v, minimum=1) for v in raw_t.tolist()]
+    if any(c is None for c in counts):
+        raise ValueError(
+            'paired_nll_two_way_bootstrap: every unit needs a finite positive '
+            'integer token count')
+    T = np.asarray(counts, dtype=float)
+    if T.size != A.shape[1]:
+        raise ValueError(
+            f'paired_nll_two_way_bootstrap: {T.size} token counts for '
+            f'{A.shape[1]} units')
+    if isinstance(conf, (bool, np.bool_)):
+        raise ValueError(
+            'paired_nll_two_way_bootstrap: conf must be a probability in (0, 1)')
+    try:
+        conf = float(conf)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(
+            'paired_nll_two_way_bootstrap: conf must be a probability in (0, 1)') from None
+    if not (0.0 < conf < 1.0):
+        raise ValueError(
+            'paired_nll_two_way_bootstrap: conf must be a probability in (0, 1)')
+    _nb = _as_seed_int(n_boot)
+    if _nb is None or _nb < 20:
+        raise ValueError(
+            f'paired_nll_two_way_bootstrap: n_boot={n_boot!r} must be an '
+            'integer >= 20 for a percentile bootstrap')
+    _seed = _as_seed_int(seed)
+    if _seed is None:
+        raise ValueError(
+            f'paired_nll_two_way_bootstrap: seed={seed!r} is not an integer; '
+            'draws are not reproducible')
+    S, D = A.shape
+    out.update({'n_seeds': int(S), 'n_units': int(D),
+                'n_boot': int(_nb), 'conf': float(conf)})
+    if S < 2:
+        out['reason'] = ('a one-seed panel gives no seed-to-seed variation; '
+                         'the two-level interval is undefined')
+        return out
+    if D < 2:
+        out['reason'] = ('a one-unit panel gives no evaluation-unit variation; '
+                         'the two-level interval is undefined')
+        return out
+    if S < 5:
+        out['warnings'].append(
+            f'only {S} seed clusters: the percentile two-level interval may be '
+            'too narrow')
+    if D < 20:
+        out['warnings'].append(
+            f'only {D} evaluation units: the percentile two-level interval may '
+            'be coarse')
+    total_tok = float(T.sum())
+    if not math.isfinite(total_tok) or total_tok <= 0.0:
+        out['reason'] = 'the total token count must be positive'
+        return out
+    ce_a = A.sum(axis=1) / total_tok
+    ce_b = B.sum(axis=1) / total_tok
+    ea = np.asarray([_safe_exp_ppl(x) for x in ce_a], dtype=float)
+    eb = np.asarray([_safe_exp_ppl(x) for x in ce_b], dtype=float)
+    if not (np.all(np.isfinite(ea)) and np.all(np.isfinite(eb))):
+        out['reason'] = ('the full-panel pooled PPL overflows the representable '
+                         'float range; the paired Δ is not a finite measurement')
+        return out
+    delta_ppl = float(np.mean(ea - eb))
+    delta_lr = float(np.mean(ce_a - ce_b))
+    out['delta_ppl'] = delta_ppl
+    out['delta_log_ratio'] = delta_lr
+
+    rng = np.random.default_rng(_seed)
+    draw_ppl = np.full(int(_nb), np.nan, dtype=float)
+    draw_lr = np.full(int(_nb), np.nan, dtype=float)
+    # Each draw materialises [draws, n_seeds] arrays plus the [draws, n_units]
+    # count matrix, so size the chunk from the crossed cell count.
+    chunk = _bootstrap_draw_chunk(D * S)
+    filled = 0
+    while filled < int(_nb):
+        m = min(chunk, int(_nb) - filled)
+        # Independent resampling of the two crossed sampling levels.  Counts
+        # (rather than index tables) keep duplicated units explicit and make
+        # the token-weighted recomputation one matrix product.
+        doc_counts = rng.multinomial(D, np.full(D, 1.0 / D), size=m).astype(float)
+        seed_counts = rng.multinomial(S, np.full(S, 1.0 / S), size=m).astype(float)
+        tot = doc_counts @ T
+        with np.errstate(divide='ignore', invalid='ignore', over='ignore'):
+            nll_a_draw = doc_counts @ A.T
+            nll_b_draw = doc_counts @ B.T
+            denom = tot[:, None]
+            ppl_a = np.exp(nll_a_draw / denom)
+            ppl_b = np.exp(nll_b_draw / denom)
+            per_seed = ppl_a - ppl_b
+            per_seed_lr = (nll_a_draw - nll_b_draw) / denom
+            weights = seed_counts / float(S)
+            ppl_mean = np.sum(per_seed * weights, axis=1)
+            lr_mean = np.sum(per_seed_lr * weights, axis=1)
+        draw_ppl[filled:filled + m] = ppl_mean
+        draw_lr[filled:filled + m] = lr_mean
+        filled += m
+    keep = np.isfinite(draw_ppl) & np.isfinite(draw_lr)
+    ppl_valid = draw_ppl[keep]
+    lr_valid = draw_lr[keep]
+    out['n_boot_valid'] = int(ppl_valid.size)
+    if ppl_valid.size < max(20, int(0.5 * int(_nb))):
+        out['reason'] = ('too few finite bootstrap draws; the resampled PPL '
+                         'overflowed or produced non-finite values')
+        return out
+    lo_q = 100.0 * (1.0 - conf) / 2.0
+    hi_q = 100.0 - lo_q
+    ci = _percentile_ci(ppl_valid.tolist(), lo_q, hi_q)
+    ci_lr = _percentile_ci(lr_valid.tolist(), lo_q, hi_q)
+    if ci is None or ci_lr is None:
+        out['reason'] = 'the percentile interval has fewer than two valid draws'
+        return out
+    ratio_ci = None
+    try:
+        _rlo, _rhi = _safe_exp_ppl(ci_lr[0]), _safe_exp_ppl(ci_lr[1])
+        if (math.isfinite(_rlo) and math.isfinite(_rhi)):
+            ratio_ci = [float(_rlo), float(_rhi)]
+    except (TypeError, ValueError, OverflowError):
+        ratio_ci = None
+    out.update({
+        'status': 'ok',
+        'delta_ppl_ci95': [float(ci[0]), float(ci[1])],
+        'delta_log_ratio_ci95': [float(ci_lr[0]), float(ci_lr[1])],
+        'ratio_ci95': ratio_ci,
+        'se_ppl': float(np.std(ppl_valid, ddof=1)) if ppl_valid.size >= 2 else None,
+        'se_log_ratio': (float(np.std(lr_valid, ddof=1))
+                         if lr_valid.size >= 2 else None),
+    })
+    if ppl_valid.size < int(_nb):
+        out['warnings'].append(
+            f'{int(_nb) - int(ppl_valid.size)} of {int(_nb)} bootstrap draws were '
+            'non-finite and were excluded before the percentile interval')
+    return out
+
 def measurement_semantics_key(rec):
     """Identity of the code semantics that produced a measurement.
 

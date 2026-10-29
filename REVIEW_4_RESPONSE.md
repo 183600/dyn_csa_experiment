@@ -24,7 +24,7 @@
 | 11 | 动态分块混淆块数/读取量 | PARTIAL | `audit_attribution` 从 `stats` 重算块数/块长/p95，并给 fixed-vs-dynamic 块数比与 10% 匹配判据 | 没有 matched-read-token 的再切分实验；读取 token 数仍无直接字段 |
 | 12 | 交叉点 scaling 统计基础弱 | FIXED（分析层） | `crossover_scaling_fit`：≥4 个去重宽度、任一点删失即拒绝、训练量差 >25% 拒绝、重复 d 保留 token-matched、斜率 CI/p/R²/留一范围；报告被拒绝时不再报斜率 | 没做 Tobit/生存回归；点数少，仍是描述性趋势，不是 scaling law |
 | 13 | 训练/评估数据独立性 | PARTIAL | 分词器 train-only、test 近重复清理、train/val/test 指纹、泄漏审计 hard-refuse；DECISION_LOG 更正「不删除近重复」的旧说法；新增 `tokens_seen_unique_estimate`/覆盖率估计与记账说明 | 估计假设独立均匀窗口抽样，不是精确计数；validation 被反复用于选择 |
-| 14 | eval_subset 与测量误差 | PARTIAL | 文档/代码明确最终 PPL 用完整固定验证批，`eval_subset` 只控曲线；`ppl_ci95_doc_bootstrap` 进入 P2 表；v12 加文档 Δ CI；<64 文档禁止总体主张 | 冻结 test 只有 16 条文档；seed-level 与 doc-level 仍是两层各自报告，未做联合随机效应模型 |
+| 14 | eval_subset 与测量误差 | PARTIAL | 文档/代码明确最终 PPL 用完整固定验证批，`eval_subset` 只控曲线；`ppl_ci95_doc_bootstrap` 进入 P2 表；v12 加文档 Δ cluster CI，并新增 seed×unit 两层 bootstrap 的总不确定性读数与 `audit_gates.two_level_ci`；<64 文档禁止总体主张 | 冻结 test 的 n=48 仍低于 64 单元总体门槛；两层 bootstrap 是设计型重采样，不是联合 hierarchical/随机效应模型，12 个种子 cluster 时百分位覆盖率有限；未做 token 级测量误差模型 |
 | 15 | 配对检验的独立性/匹配 | PARTIAL | 新增 `init_core_fp`（tok/pos/head/norm）并纳入 `pair_reason`；v12 输出 `same_init_core_fp`；`rng_fp` 仍按设计只报告不强制 | 没有逐张量全参数匹配；架构导致的 RNG 差异仍属于臂 |
 | 16 | 陈旧/重构记录可能进入结论 | FIXED | `sec_p1l` 与 v10 按长度表整臂排除无当前戳记录（不列表/不算 ratio）；`_agg_entry` 多组无当前戳或显式旧 run_cfg 直接拒绝；`build_report` 的 Monte-Carlo 旧文案更正 | 单条无 `run_cfg` 的历史 aggregate 仍走兼容路径；synthesized 记录仍可用于曲线展示 |
 | 17 | 结果产物不入库，无法独立审计 | PARTIAL | README/README_zh 增加「证据状态」段；`audit_gates.release` 解析 `RELEASES.md`，无完整行即 `no_release`；归档增加 logs/cache meta/pyproject | **本快照没有随附 release**；没有真实数值可复核，只有可执行归档工具 |
@@ -39,6 +39,7 @@
 - `exp_lib.crossover_scaling_fit`、`exp_lib.loglog_regression` 的 CI 路径接入 v10/v11
 - `exp_lib.init_core_fingerprint` + `pair_reason` 的 init gate
 - `exp_lib._param_control_detail`、`exp_lib._compute_control_detail`、`system_level_only`
+- `exp_lib.paired_nll_two_way_bootstrap` + `audit_gates.two_level_ci`
 - `exp_lib.measure_efficiency_sweep`
 - `build_report.sec_p1l` / `_agg_entry` 的 stale fail-closed
 - `explib/corruption/`（v10）的 NIAH-Holm 合并、`_all_sig` 走统一闸门、按长度表 stale 排除
