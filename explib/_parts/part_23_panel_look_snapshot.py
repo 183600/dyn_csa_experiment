@@ -454,10 +454,32 @@ def _params_of_arm(recs, arm):
         return None
     return vals[0]
 
+def _int_ratio_within(numerator, denominator, tolerance):
+    """Exact ``numerator / denominator <= tolerance`` for integer counts.
+
+    A near-tie between two counts beyond float64's range has an unrepresentable
+    relative difference but a well-defined answer to the capacity gate.
+    """
+    try:
+        numerator, denominator = int(numerator), int(denominator)
+        tolerance = float(tolerance)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if denominator <= 0 or numerator < 0 or not math.isfinite(tolerance):
+        return None
+    try:
+        from fractions import Fraction
+        return bool(Fraction(numerator, denominator)
+                    <= Fraction.from_float(tolerance))
+    except (OverflowError, ValueError):
+        return None
+
 def _param_control(recs, a, b):
     """Relative parameter-count difference between two arms, and whether it is
     small enough to call them parameter-controlled (<=1%).  None means one or
-    both records do not expose `params` (unverifiable, not a mismatch).
+    both records do not expose `params` (unverifiable, not a mismatch); an
+    unrepresentably small/large ratio can also be None in the first slot while
+    the exact tolerance verdict remains in the second.
 
     This is only the TOTAL count.  `_param_control_detail` additionally
     compares the recorded `param_breakdown` (non-embedding / active), because
@@ -469,8 +491,16 @@ def _param_control(recs, a, b):
     pa, pb = _params_of_arm(recs, a), _params_of_arm(recs, b)
     if pa is None or pb is None:
         return (None, None)
-    rel = abs(pa - pb) / float(max(pa, pb, 1))
-    return (float(rel), bool(rel <= 0.01))
+    # Exact integer difference / max: a declared/legacy parameter count can be
+    # larger than float64's range, and converting it to float would crash the
+    # audit.  An unrepresentable ratio is unverifiable, never a silent match.
+    rel = _finite_int_ratio(abs(pa - pb), max(pa, pb, 1))
+    # The gate itself is exact: an underflowed relative difference can still
+    # prove the 1% capacity match for two enormous near-equal counts.
+    matched = _int_ratio_within(abs(pa - pb), max(pa, pb, 1), 0.01)
+    if rel is None and matched is None:
+        return (None, None)
+    return (None if rel is None else float(rel), matched)
 
 def param_pair_reason(ra, rb, *, tolerance=0.01, require_breakdown=False):
     """Fail-closed parameter control for a single arm pair.
@@ -496,8 +526,16 @@ def param_pair_reason(ra, rb, *, tolerance=0.01, require_breakdown=False):
     pa, pb = _as_seed_int(ra.get('params')), _as_seed_int(rb.get('params'))
     if pa is None or pb is None or pa <= 0 or pb <= 0:
         return 'unverifiable params (at least one record omits a usable parameter count)'
-    rel = abs(pa - pb) / float(max(pa, pb, 1))
-    if rel > tol:
+    rel = _finite_int_ratio(abs(pa - pb), max(pa, pb, 1))
+    if rel is None:
+        _within = _int_ratio_within(abs(pa - pb), max(pa, pb, 1), tol)
+        if _within is None:
+            return ('unverifiable parameter ratio (the counts exceed the exact '
+                    'float-reporting range); not treated as a capacity match')
+        if not _within:
+            return (f'parameter mismatch ({pa} vs {pb}); the relative '
+                    f'difference exceeds the {100.0 * tol:.2f}% tolerance')
+    elif rel > tol:
         return f'parameter mismatch ({pa} vs {pb}, {100.0 * rel:.2f}% > {100.0 * tol:.2f}%)'
     ba, bb = ra.get('param_breakdown'), rb.get('param_breakdown')
     _ba = isinstance(ba, dict) and bool(ba)
@@ -551,8 +589,12 @@ def _param_control_detail(recs, a, b):
            'breakdown_one_sided': False, 'unavailable': True}
     pa, pb = _params_of_arm(recs, a), _params_of_arm(recs, b)
     if pa is not None and pb is not None:
-        rel = abs(pa - pb) / float(max(pa, pb, 1))
-        out.update({'total_rel_diff': float(rel), 'total_controlled': bool(rel <= 0.01), 'unavailable': False})
+        rel = _finite_int_ratio(abs(pa - pb), max(pa, pb, 1))
+        matched = _int_ratio_within(abs(pa - pb), max(pa, pb, 1), 0.01)
+        if rel is not None or matched is not None:
+            out.update({'total_rel_diff': (None if rel is None else float(rel)),
+                        'total_controlled': matched,
+                        'unavailable': False})
     ba, bb = _param_breakdown_of_arm(recs, a), _param_breakdown_of_arm(recs, b)
     _ba = isinstance(ba, dict) and bool(ba)
     _bb = isinstance(bb, dict) and bool(bb)
@@ -626,14 +668,48 @@ def _compute_control_detail(recs, a, b, *, tolerance=0.25):
             tt = _finite_scalar(r.get('train_time_s'))
             tok = _exact_count(r.get('tokens_seen'), minimum=1)
             if tt is not None and tt > 0.0 and tok is not None:
-                tpt.append(tt / float(tok))
+                # A declared token count can exceed float64's range, so
+                # ``tt / float(tok)`` can raise even when the quotient itself
+                # is representable (e.g. 1e308 / 1e309 == 0.1).  Divide
+                # exactly through ``Fraction`` and round only the quotient.
+                try:
+                    from fractions import Fraction as _Fraction
+                    _tpt = float(_Fraction(tt) / int(tok))
+                except (OverflowError, ValueError, ZeroDivisionError):
+                    _tpt = None
+                if _tpt is not None and math.isfinite(_tpt):
+                    tpt.append(_tpt)
             p = _as_seed_int(r.get('params'))
             if p is not None and p > 0:
-                par.append(float(p))
+                # Keep exact integers here.  Converting an enormous count to
+                # float is exactly the overflow the median helper below
+                # avoids; ordinary counts still take the float path.
+                par.append(int(p))
                 if tok is not None:
-                    prox.append(float(p) * float(tok))
-        med = (lambda xs: float(np.median(xs)) if xs else None)
-        return med(tpt), med(par), med(prox)
+                    prox.append(int(p) * int(tok))
+
+        def _median_value(xs):
+            if not xs:
+                return None
+            try:
+                _v = float(np.median(xs))
+            except (OverflowError, TypeError, ValueError):
+                _v = None
+            if _v is not None and math.isfinite(_v):
+                return _v
+            # Exact fallback for counts beyond float64: odd-length medians are
+            # an element; an even-length median is emitted only when its exact
+            # average is an integer, otherwise it is unverifiable.
+            ys = sorted(xs)
+            n = len(ys)
+            mid = n // 2
+            if n % 2:
+                return int(ys[mid])
+            _total = int(ys[mid - 1]) + int(ys[mid])
+            return _total // 2 if _total % 2 == 0 else None
+
+        return (_median_value(tpt), _median_value(par),
+                _median_value(prox))
 
     # Same gate-parameter contract as param_pair_reason.
     if isinstance(tolerance, (bool, np.bool_)):
@@ -654,15 +730,37 @@ def _compute_control_detail(recs, a, b, *, tolerance=0.25):
            'compute_matched': None, 'compute_matched_source': None,
            'more_compute_arm': None, 'note': None}
     ratio = None
+    _proxy_within = None
     if ta and tb and ta > 0 and tb > 0:
         ratio = ta / tb
         out['time_ratio_a_over_b'] = float(ratio)
         out['compute_matched_source'] = 'measured wall-clock per token'
     elif xa and xb and xa > 0 and xb > 0:
-        ratio = xa / xb
-        out['proxy_ratio_a_over_b'] = float(ratio)
-        out['compute_matched_source'] = '6ND proxy (params x tokens); not a measurement'
+        # The proxy is an exact params x tokens product.  Its ratio can still
+        # be representable when each product is not (including the all-equal
+        # case), so use the exact-integer ratio instead of dividing floats.
+        if isinstance(xa, int) and isinstance(xb, int):
+            ratio = _finite_int_ratio(xa, xb)
+            _proxy_within = _int_ratio_within(
+                abs(xa - xb), max(xa, xb, 1), tolerance)
+        else:
+            ratio = xa / xb
+        if ratio is not None:
+            out['proxy_ratio_a_over_b'] = float(ratio)
+            out['compute_matched_source'] = (
+                '6ND proxy (params x tokens); not a measurement')
     if ratio is None:
+        if _proxy_within is not None:
+            # The relative difference was too small to float but the exact
+            # tolerance comparison is defined.  Report the verdict; the
+            # direction of a near-equal pair is not estimable from a ratio
+            # that underflowed.
+            out['compute_matched'] = bool(_proxy_within)
+            out['compute_matched_source'] = (
+                '6ND proxy (params x tokens; exact tolerance comparison)')
+            out['note'] = ('the 6ND ratio underflowed float64; the equal-compute '
+                           'gate was evaluated with exact integers')
+            return out
         out['note'] = 'no timing or 6ND inputs on the records: compute matching is unverifiable for this pair'
         return out
     out['compute_matched'] = bool(abs(ratio - 1.0) <= float(tolerance))

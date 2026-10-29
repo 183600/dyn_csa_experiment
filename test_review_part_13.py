@@ -178,3 +178,89 @@ def test_stamped_analysis_event_records_content_digest():
         assert ev['content_sha256'] == rec['content_sha256'], (ev, rec)
     finally:
         shutil.rmtree(td, ignore_errors=True)
+
+
+def test_design_and_record_audits_report_huge_counts_without_float_overflow():
+    # A syntactically valid design/record may declare a token or parameter
+    # count far beyond float64's range.  The audits must compare exact
+    # integers and report an unrepresentable ratio as unverifiable, not crash
+    # while converting the count to float.
+    H = 10 ** 400
+    with open(os.path.join(REPO, 'confirmation_frozen.json'),
+              encoding='utf-8') as fh:
+        manifest = json.load(fh)
+    sig = manifest['binding']['training_recipe_signature']
+    sig.update(steps=H, bs=1, sl=1, nt=H)
+    rep = L.comparison_budget_ledger(manifest)
+    tb = rep['token_budget']
+    assert tb['consumed_tokens'] == H, tb
+    assert tb['shared_by_all_arms'] is True, tb
+    # H / H is exactly one epoch without ever forming H as a float.
+    assert tb['definitions']['epochs_over_cache'] == 1.0, tb
+    for rec in rep['arms'].values():
+        assert rec['token_budget'] == H, rec
+        # params / H underflows: report unverifiable, not a fabricated zero.
+        assert rec['params_per_token'] is None, rec
+    for comp in rep['comparisons'].values():
+        assert (comp['compute_6nd_rel_diff'] is None
+                or math.isfinite(comp['compute_6nd_rel_diff'])), comp
+        assert isinstance(comp['compute_6nd_matched'], bool), comp
+
+    # The read-budget proxy accepts a declared sequence length beyond float64
+    # too: the block count is an exact integer ceiling and the fractional read
+    # is reported through the same finite-ratio contract.
+    cfgs = L.make_layer_cfgs(1, 'csa_dynamic')
+    rb = L._ledger_read_budget(cfgs, H)
+    assert all(0.0 <= layer['read_fraction'] <= 1.0 for layer in rb['layers']), rb
+    assert rb['selected_read_fraction_mean'] is None or math.isfinite(
+        rb['selected_read_fraction_mean']), rb
+
+    # Record-level parameter/compute audits share the same untrusted-count
+    # contract.  Equal huge counts are still an exact match; their relative
+    # time/proxy rates are unverifiable rather than a float conversion crash.
+    recs = {('a', 'p', 0): {'params': H, 'train_time_s': 10.0,
+                            'tokens_seen': H},
+            ('b', 'p', 0): {'params': H, 'train_time_s': 20.0,
+                            'tokens_seen': H}}
+    assert L._param_control(recs, 'a', 'b') == (0.0, True)
+    assert L.param_pair_reason(recs[('a', 'p', 0)],
+                               recs[('b', 'p', 0)]) is None
+    assert L._param_control_detail(recs, 'a', 'b')['total_controlled'] is True
+    # A near-tie beyond float64 has an unrepresentable ratio but the 1% gate
+    # itself is still exactly decidable.
+    near = {('a', 'p', 0): {'params': H}, ('b', 'p', 0): {'params': H + 1}}
+    _rel, _ok = L._param_control(near, 'a', 'b')
+    assert _rel is None and _ok is True, (_rel, _ok)
+    assert L.param_pair_reason(near[('a', 'p', 0)],
+                               near[('b', 'p', 0)]) is None
+    comp = L._compute_control_detail(recs, 'a', 'b')
+    # Equal huge products are an exact 6ND match even though each product is
+    # not individually representable as a float.
+    assert comp['compute_matched'] is True, comp
+    assert comp['flops_proxy_6nd'] == {'a': H * H, 'b': H * H}, comp
+    # A quotient whose denominator alone overflows float64 can still be
+    # representable; divide exactly and round only the result.
+    timed = {('a', 'p', 0): {'params': 1000, 'train_time_s': 1e300,
+                             'tokens_seen': H},
+             ('b', 'p', 0): {'params': 1000, 'train_time_s': 2e300,
+                             'tokens_seen': H}}
+    tc = L._compute_control_detail(timed, 'a', 'b')
+    assert tc['time_ratio_a_over_b'] == 0.5, tc
+
+    # The report builder's parameter-gap helper is the same exact-integer
+    # gate: equal enormous counts match; an unrepresentable near-tie is
+    # unverifiable instead of raising from int -> float conversion.
+    assert BR.param_gap({'params': H}, {'params': H}) == 0.0
+    assert BR.param_gap({'params': H}, {'params': H + 1}) is None
+    assert BR.is_param_matched({'params': H}, {'params': H}) is True
+    assert BR.is_param_matched({'params': H}, {'params': H + 1}) is True
+
+    # The read-budget calibration formula multiplies a declared top-k by the
+    # measured mean block length; that product must not be floated first when
+    # the top-k exceeds float64's range.
+    cal = {'precondition': {'read_budget_calibration': {
+        'status': 'pending', 'fixed_block_size': 1,
+        'topk_dynamic': H, 'mean_dynamic_block_tokens': 1.0,
+        'matched_fixed_topk': H}}}
+    cr = L.dynamic_read_budget_calibration(cal)
+    assert cr['expected_topk'] == H, cr

@@ -1,5 +1,27 @@
 
 
+def _int_ratio_within(numerator, denominator, tolerance):
+    """Exact ``numerator / denominator <= tolerance`` for integer counts.
+
+    The ratio itself may be too small to float (e.g. two 401-digit counts
+    differing by one), but the comparison against a gate tolerance is still
+    well defined.  Return None only when the inputs cannot form a ratio.
+    """
+    try:
+        numerator, denominator = int(numerator), int(denominator)
+        tolerance = float(tolerance)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if denominator <= 0 or numerator < 0 or not math.isfinite(tolerance):
+        return None
+    try:
+        from fractions import Fraction
+        return bool(Fraction(numerator, denominator)
+                    <= Fraction.from_float(tolerance))
+    except (OverflowError, ValueError):
+        return None
+
+
 def comparison_budget_ledger(manifest, *, factory=None, seq_lens=(512, 4096),
                              read_tolerance=0.10, param_tolerance=0.01,
                              build_params=True):
@@ -131,7 +153,11 @@ def comparison_budget_ledger(manifest, *, factory=None, seq_lens=(512, 4096),
         'definitions': {
             'train_cache_tokens': 'n_train_tokens in the recipe signature: the served train cache size',
             'consumed_tokens': 'steps * batch_size * seq_len: tokens actually consumed by the run',
-            'epochs_over_cache': (effective_tokens / float(nt) if nt > 0 else None),
+            # A design-time plan may declare a budget far beyond float64's
+            # range.  The ratio is then unverifiable, not a crash: use the
+            # exact-integer helper shared with the scale-ladder audit.
+            'epochs_over_cache': (_finite_int_ratio(effective_tokens, nt)
+                                  if nt > 0 else None),
         },
     }
 
@@ -181,7 +207,8 @@ def comparison_budget_ledger(manifest, *, factory=None, seq_lens=(512, 4096),
                     rec['errors'].append(
                         f'parameter count failed ({type(_e).__name__}: {_e})')
         if rec['params'] and rec['token_budget']:
-            rec['params_per_token'] = rec['params'] / float(rec['token_budget'])
+            rec['params_per_token'] = _finite_int_ratio(rec['params'],
+                                                        rec['token_budget'])
         for Ln in out['seq_lens']:
             rec['read_budget'][str(Ln)] = _ledger_read_budget(cfgs, Ln)
         out['arms'][arm] = rec
@@ -328,9 +355,12 @@ def comparison_budget_ledger(manifest, *, factory=None, seq_lens=(512, 4096),
         entry['train_cache_tokens'] = {a: _ca, b: _cb}
         pa, pb = out['arms'][a].get('params'), out['arms'][b].get('params')
         if pa and pb:
-            rel = abs(pa - pb) / float(max(pa, pb, 1))
-            entry['param_rel_diff'] = float(rel)
-            entry['param_matched'] = bool(rel <= _ptol)
+            rel = _finite_int_ratio(abs(pa - pb), max(pa, pb, 1))
+            entry['param_rel_diff'] = rel
+            # Compare exactly against the gate tolerance even when the ratio
+            # itself underflows/overflows as a float.
+            entry['param_matched'] = _int_ratio_within(
+                abs(pa - pb), max(pa, pb, 1), _ptol)
         else:
             entry['param_matched'] = None
             entry['problems'].append('parameter totals are unverifiable for this pair')
@@ -366,12 +396,18 @@ def comparison_budget_ledger(manifest, *, factory=None, seq_lens=(512, 4096),
         # 6ND (params x tokens) and the attention read budget are separate
         # axes: two arms can match parameters and still read 32x differently.
         if pa and pb and _ta and _tb:
-            _fa = float(pa) * float(_ta)
-            _fb = float(pb) * float(_tb)
-            _frel = abs(_fa - _fb) / max(_fa, _fb, 1.0)
-            entry['compute_6nd_rel_diff'] = float(_frel)
+            # params x consumed tokens is an exact integer product; converting
+            # each factor to float first can overflow on a declared scale-plan
+            # budget.  Compare the products with exact integers and report the
+            # relative difference only when it is representable.
+            _fa = int(pa) * int(_ta)
+            _fb = int(pb) * int(_tb)
+            _frel = _finite_int_ratio(abs(_fa - _fb), max(_fa, _fb, 1))
+            entry['compute_6nd_rel_diff'] = _frel
+            _fmatched = _int_ratio_within(abs(_fa - _fb),
+                                          max(_fa, _fb, 1), _ptol)
             entry['compute_6nd_matched'] = bool(
-                _frel <= _ptol and entry['token_matched'] is True)
+                _fmatched is True and entry['token_matched'] is True)
         else:
             entry['compute_6nd_matched'] = False
         entry['compute_proxy_matched'] = bool(

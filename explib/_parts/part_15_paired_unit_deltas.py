@@ -772,7 +772,17 @@ def dynamic_read_budget_calibration(manifest):
         topk = None
     expected = None
     if mean is not None and fixed_bs and topk:
-        expected = int(math.floor(topk * mean / float(fixed_bs) + 0.5))
+        try:
+            expected = int(math.floor(topk * mean / float(fixed_bs) + 0.5))
+        except OverflowError:
+            # A declared top-k beyond float64's range still has an exact
+            # formula result.  Keep the historical float expression for the
+            # ordinary path (so existing expected_topk values do not move) and
+            # fall back to exact rational arithmetic only when it overflows.
+            from fractions import Fraction as _Fraction
+            _q = (_Fraction(int(topk)) * _Fraction.from_float(float(mean))
+                  / int(fixed_bs))
+            expected = int(math.floor(_q + _Fraction(1, 2)))
         out['expected_topk'] = expected
     declared_k = _design_int(cal.get('matched_fixed_topk', cal.get('k_fixed')))
     if status in ('measured', 'passed', 'frozen'):
@@ -1042,6 +1052,22 @@ def _ledger_read_budget(cfgs, seq_len):
     from `target_block_tokens` and is flagged as such.
     """
     T = max(int(seq_len), 1)
+
+    def _read_ratio(numerator, denominator, *, cap=None):
+        """Finite exact-integer ratio, with an explicit capped fallback.
+
+        A declared sequence length or block count can exceed float64's range;
+        converting it to float would raise ``OverflowError``.  The audit must
+        still report a usable read fraction (0 or the cap) in that case, not
+        crash on a syntactically valid scale plan.
+        """
+        value = _finite_int_ratio(numerator, denominator)
+        if value is None:
+            if cap is None:
+                return None
+            return float(cap) if int(numerator) >= int(denominator) else 0.0
+        return min(float(cap), value) if cap is not None else value
+
     layers = []
     for cfg in cfgs:
         kind = str(getattr(cfg, 'kind', 'full') or 'full')
@@ -1059,7 +1085,9 @@ def _ledger_read_budget(cfgs, seq_len):
             estimate = False
         elif kind == 'hca':
             unit = max(int(getattr(cfg, 'block_size', 64) or 64), 1)
-            n_blocks = int(math.ceil(T / float(unit)))
+            # Exact integer ceiling: converting T to float first overflows for
+            # a declared length beyond float64's range.
+            n_blocks = (T + unit - 1) // unit
             k = n_blocks
             selected = min(T, n_blocks * unit)
             overlap = int(getattr(cfg, 'overlap', 0) or 0)
@@ -1067,32 +1095,36 @@ def _ledger_read_budget(cfgs, seq_len):
         else:
             unit = (max(int(getattr(cfg, 'target_block_tokens', 1) or 1), 1)
                     if dyn else max(int(getattr(cfg, 'block_size', 4) or 4), 1))
-            n_blocks = int(math.ceil(T / float(unit)))
+            n_blocks = (T + unit - 1) // unit
             _topk = int(getattr(cfg, 'index_topk', 0) or 0)
             k = min(_topk, n_blocks) if _topk > 0 else n_blocks
             selected = k * unit
             # The local window is additive, not part of the selected blocks.
             overlap = int(getattr(cfg, 'sliding_window', 0) or getattr(cfg, 'overlap', 0) or 0)
             estimate = dyn
+        _read_lanes = selected + (0 if kind == 'full' else overlap)
         layers.append({
             'kind': kind, 'dynamic': dyn, 'block_unit_tokens': unit,
             'n_blocks_available': n_blocks, 'blocks_read': k,
             'selected_block_tokens': selected,
             'local_window_tokens': overlap,
-            'tokens_read_per_query': min(T, selected + (0 if kind == 'full' else overlap)),
-            'read_fraction': min(1.0, (selected + (0 if kind == 'full' else overlap)) / float(T)),
+            'tokens_read_per_query': min(T, _read_lanes),
+            'read_fraction': _read_ratio(_read_lanes, T, cap=1.0),
             'read_budget_is_estimate': estimate,
         })
     n = max(len(layers), 1)
-    mean_selected = sum(x['selected_block_tokens'] for x in layers) / float(n)
-    mean_tokens = sum(x['tokens_read_per_query'] for x in layers) / float(n)
+    _sum_selected = sum(x['selected_block_tokens'] for x in layers)
+    _sum_tokens = sum(x['tokens_read_per_query'] for x in layers)
+    _sum_blocks = sum(x['blocks_read'] for x in layers)
+    mean_selected = _read_ratio(_sum_selected, n)
+    mean_tokens = _read_ratio(_sum_tokens, n)
     mean_fraction = sum(x['read_fraction'] for x in layers) / float(n)
     return {
         'seq_len': T,
         'n_layers': len(layers),
-        'blocks_read_per_query_mean': sum(x['blocks_read'] for x in layers) / float(n),
+        'blocks_read_per_query_mean': _read_ratio(_sum_blocks, n),
         'selected_block_tokens_per_query_mean': mean_selected,
-        'selected_read_fraction_mean': mean_selected / float(T),
+        'selected_read_fraction_mean': _read_ratio(_sum_selected, n * T),
         'tokens_read_per_query_mean': mean_tokens,
         'read_fraction_mean': mean_fraction,
         'read_budget_is_estimate': any(x['read_budget_is_estimate'] for x in layers),

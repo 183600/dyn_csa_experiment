@@ -523,6 +523,46 @@ PARAM_MATCH_TOL = 0.01  # same 1% gate as exp_lib._param_control
 PARAM_MATCH_SMALL = 0.3
 PARAM_MATCH_ARCH = 0.06
 
+def _exact_int_ratio(numerator, denominator):
+    """Representable float of an exact non-negative integer ratio, or None.
+
+    Parameter counts in an in-memory/JSON record can exceed float64's range.
+    ``abs(pa - pb) / max(pa, pb)`` then raises ``OverflowError`` even though
+    the ratio itself is in [0, 1].  Build the exact quotient first and round
+    once; an underflowed nonzero ratio is unverifiable (None), never a silent
+    zero that would look like a capacity match.
+    """
+    try:
+        numerator, denominator = int(numerator), int(denominator)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if denominator <= 0 or numerator < 0:
+        return None
+    try:
+        value = numerator / denominator
+    except OverflowError:
+        from fractions import Fraction
+        value = float(Fraction(numerator, denominator))
+    if value == 0.0 and numerator != 0:
+        return None
+    return float(value)
+
+def _exact_int_ratio_within(numerator, denominator, tolerance):
+    """Exact integer ``numerator / denominator <= tolerance``, or None."""
+    try:
+        numerator, denominator = int(numerator), int(denominator)
+        tolerance = float(tolerance)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if denominator <= 0 or numerator < 0 or not math.isfinite(tolerance):
+        return None
+    try:
+        from fractions import Fraction
+        return bool(Fraction(numerator, denominator)
+                    <= Fraction.from_float(tolerance))
+    except (OverflowError, ValueError):
+        return None
+
 def param_gap(a, b, tol=PARAM_MATCH_TOL):
     if not isinstance(a, dict) or not isinstance(b, dict):
         return None
@@ -534,17 +574,38 @@ def param_gap(a, b, tol=PARAM_MATCH_TOL):
         return None
     if pa <= 0 or pb <= 0:
         return None
-    return abs(pa - pb) / max(pa, pb)
+    return _exact_int_ratio(abs(pa - pb), max(pa, pb))
 
 def is_param_matched(a, b, tol=PARAM_MATCH_TOL):
     g = param_gap(a, b, tol)
-    return None if g is None else g <= tol
+    if g is not None:
+        return g <= tol
+    # The relative gap may underflow float64 for enormous near-equal counts;
+    # the tolerance gate itself is still exactly decidable.
+    if not isinstance(a, dict) or not isinstance(b, dict):
+        return None
+    pa = _int_or(a.get('params'), None)
+    pb = _int_or(b.get('params'), None)
+    if pa is None or pb is None or pa <= 0 or pb <= 0:
+        return None
+    return _exact_int_ratio_within(abs(pa - pb), max(pa, pb), tol)
 
 def gap_is_architecture(a, b, tol=PARAM_MATCH_TOL, arch=PARAM_MATCH_ARCH):
     g = param_gap(a, b, tol)
-    if g is None:
+    if g is not None:
+        return tol < g <= arch
+    if not isinstance(a, dict) or not isinstance(b, dict):
         return None
-    return tol < g <= arch
+    pa = _int_or(a.get('params'), None)
+    pb = _int_or(b.get('params'), None)
+    if pa is None or pb is None or pa <= 0 or pb <= 0:
+        return None
+    _num, _den = abs(pa - pb), max(pa, pb)
+    _within_tol = _exact_int_ratio_within(_num, _den, tol)
+    _within_arch = _exact_int_ratio_within(_num, _den, arch)
+    if _within_tol is None or _within_arch is None:
+        return None
+    return (not _within_tol) and _within_arch
 
 def unmatched_tag(a, b, tol=PARAM_MATCH_TOL, small=PARAM_MATCH_SMALL):
     g = param_gap(a, b, tol)
