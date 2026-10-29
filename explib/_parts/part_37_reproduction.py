@@ -27,22 +27,85 @@ def _repro_text(value):
     Booleans are not identities: ``True`` must not become the string ``'True'``
     and compare equal to a malformed record that stored the same typo.
     """
-    if value is None or isinstance(value, bool):
+    if value is None or isinstance(value, (bool, np.bool_)):
         return None
-    if isinstance(value, (str, int, float)):
-        text = str(value).strip()
+    if isinstance(value, str):
+        text = value.strip()
         return text or None
+    if isinstance(value, numbers.Integral):
+        return str(int(value))
+    if isinstance(value, numbers.Real):
+        as_float = float(value)
+        if not math.isfinite(as_float):
+            # NaN/inf are not identities: str() would turn them into the
+            # tokens 'nan'/'inf' and let two corrupt records compare equal.
+            return None
+        return str(as_float)
     return None
 
 
 def _repro_int(value):
-    if isinstance(value, bool) or value is None:
+    """An exact positive integer count, or None.
+
+    Token counts are denominators, not seeds.  ``int(1000.9)`` would silently
+    turn a malformed count into a different valid denominator, and a boolean
+    would become 0/1, so fractional, boolean, zero and negative values are
+    refused here instead of being truncated into a comparable measurement.
+    """
+    if value is None or isinstance(value, (bool, np.bool_)):
         return None
-    try:
+    if isinstance(value, numbers.Integral):
         number = int(value)
-    except (TypeError, ValueError, OverflowError):
+    elif isinstance(value, numbers.Real):
+        as_float = float(value)
+        if not math.isfinite(as_float) or not as_float.is_integer():
+            return None
+        number = int(as_float)
+    elif isinstance(value, (str, bytes)):
+        try:
+            number = int(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+    else:
+        # Objects outside numbers.Real can define __int__ and would be
+        # truncated silently by int(value); require an exact numeric reading.
+        try:
+            as_float = float(value)
+            number = int(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(as_float) or float(number) != as_float:
+            return None
+    return number if number > 0 else None
+
+
+def _repro_config_identity(value):
+    """Type-aware identity token for one configuration value.
+
+    The text normaliser used for fingerprints deliberately rejects booleans,
+    because ``True`` must not compare equal to a malformed string ``'True'``.
+    Configuration values are different: ``eager_batch=False`` and
+    ``eager_batch=True`` are both valid, and collapsing either to "absent"
+    made two different runs look identical.  Keep the JSON type in the token
+    so ``False``/``True``, ``1``/``1.0`` and missing values stay distinct.
+    """
+    if value is None:
         return None
-    return number
+    if isinstance(value, (bool, np.bool_)):
+        return 'bool:true' if bool(value) else 'bool:false'
+    if isinstance(value, numbers.Integral):
+        return 'int:' + str(int(value))
+    if isinstance(value, numbers.Real):
+        as_float = float(value)
+        if not math.isfinite(as_float):
+            return None
+        return 'float:' + repr(as_float)
+    if isinstance(value, str):
+        text = value.strip()
+        return 'str:' + text if text else None
+    # A structured config value (a policy list/object) is still an identity;
+    # canonical JSON keeps it comparable and JSON-safe.
+    return 'json:' + _repro_canonical(value)
 
 
 def _repro_canonical(value):
@@ -53,6 +116,12 @@ def _repro_canonical(value):
                           allow_nan=False)
     except Exception:
         return repr(value)
+
+
+def _repro_render(value):
+    """Human/JSON-safe rendering of a raw identity value for a report field."""
+    text = _repro_text(value)
+    return text if text is not None else _repro_canonical(value)
 
 
 def _repro_validate_tolerance(name, value):
@@ -67,14 +136,24 @@ def _repro_validate_tolerance(name, value):
     return number
 
 
-def _repro_field(name, a, b, *, required=False):
+def _repro_field(name, a, b, *, required=False, normalize=None):
     """Compare one optional/required identity field.
 
     ``required`` means the field must be present on both sides for a match;
     otherwise a both-absent field is treated as equal (legacy optional).
+    ``normalize`` selects the identity representation; the default is the
+    textual fingerprint normaliser.  A value that is present but cannot be
+    normalised is ``unverified`` either way -- it is never silently equal to
+    an absent value.
     """
-    va, vb = _repro_text(a), _repro_text(b)
+    _norm = _repro_text if normalize is None else normalize
+    va, vb = _norm(a), _norm(b)
     if va is None and vb is None:
+        if a is not None or b is not None:
+            return {'field': name, 'original': _repro_canonical(a),
+                    'rerun': _repro_canonical(b), 'status': 'unverified',
+                    'detail': ('one or both records carry a value that is not '
+                               'a usable identity')}
         return {'field': name, 'original': None, 'rerun': None,
                 'status': 'unverified' if required else 'match',
                 'detail': ('both records omit this required identity' if required
@@ -82,7 +161,7 @@ def _repro_field(name, a, b, *, required=False):
     if va is None or vb is None:
         return {'field': name, 'original': va, 'rerun': vb,
                 'status': 'unverified',
-                'detail': 'only one record carries this identity'}
+                'detail': 'only one record carries a usable identity'}
     if va == vb:
         return {'field': name, 'original': va, 'rerun': vb, 'status': 'match',
                 'detail': 'equal'}
@@ -109,11 +188,17 @@ def _repro_code_dimension(original, rerun):
         prov = rec.get('provenance') if isinstance(rec.get('provenance'), dict) else {}
         code = prov.get('code') if isinstance(prov.get('code'), dict) else {}
         tree = code.get('source_tree') if isinstance(code.get('source_tree'), dict) else {}
+        # Keep raw values so a present-but-malformed optional stamp becomes
+        # unverified instead of silently disappearing from the field list.
+        _stamp = rec.get('_code')
+        if _repro_text(_stamp) is None:
+            _fallback = code.get('code_stamp')
+            if _repro_text(_fallback) is not None:
+                _stamp = _fallback
         return {
-            'source_sha256': _repro_text(tree.get('sha256')),
-            'code_semantics': _repro_text(code.get('code_semantics')),
-            'code_stamp': (_repro_text(rec.get('_code'))
-                           or _repro_text(code.get('code_stamp'))),
+            'source_sha256': tree.get('sha256'),
+            'code_semantics': code.get('code_semantics'),
+            'code_stamp': _stamp,
         }
 
     a, b = _ident(original), _ident(rerun)
@@ -147,7 +232,10 @@ def _repro_data_dimension(original, rerun):
             value = rec.get(key)
             if value is None:
                 value = data.get(key)
-            out[key] = _repro_text(value)
+            # Keep the raw value: presence (including a malformed non-string)
+            # is itself part of the identity, so normalisation happens in
+            # _repro_field rather than erasing it here.
+            out[key] = value
         return out
 
     a, b = _ident(original), _ident(rerun)
@@ -157,7 +245,14 @@ def _repro_data_dimension(original, rerun):
         if va is None and vb is None:
             continue
         if va is None or vb is None:
+            # A one-sided fingerprint cannot attest the same data slice.  The
+            # field is reported as unverified (not merely omitted from the
+            # evidence set) so a matching sibling field cannot hide it.
             one_sided.append(key)
+            fields.append({
+                'field': key, 'original': _repro_render(va),
+                'rerun': _repro_render(vb), 'status': 'unverified',
+                'detail': 'only one record carries this data fingerprint'})
             continue
         common.append(key)
         fields.append(_repro_field(key, va, vb))
@@ -176,7 +271,8 @@ def _repro_config_dimension(original, rerun):
     fields = [_repro_field('run_cfg', original.get('run_cfg'),
                            rerun.get('run_cfg'), required=True)]
     for key in ('protocol', 'warm_steps', 'amp_dtype', 'eager_batch'):
-        fields.append(_repro_field(key, original.get(key), rerun.get(key)))
+        fields.append(_repro_field(key, original.get(key), rerun.get(key),
+                                   normalize=_repro_config_identity))
     # The compact run_cfg does not carry the optimizer/schedule descriptor or
     # the objective terms; compare those with the same strict helpers the
     # arm-pairing gates use, so a silent MLP/optimizer/loss-term change cannot
@@ -189,14 +285,18 @@ def _repro_config_dimension(original, rerun):
             fields.append({'field': label, 'original': None, 'rerun': None,
                            'status': 'match', 'detail': 'equal'})
             continue
-        status = ('unverified'
-                  if str(reason).startswith(('unverifiable', 'a record'))
-                  or 'only one' in str(reason)
-                  else 'mismatch')
+        # Only a definite "these two valid descriptors differ" is a
+        # mismatch.  A malformed/partial/one-sided descriptor is unverified:
+        # we cannot claim the configurations differ, only that they cannot be
+        # shown to match.
+        _reason = str(reason)
+        _mismatch = (_reason.startswith(('different ', 'objective differs'))
+                     or ' differ' in _reason)
         fields.append({'field': label,
                        'original': _repro_canonical(original.get(label)),
                        'rerun': _repro_canonical(rerun.get(label)),
-                       'status': status, 'detail': str(reason)})
+                       'status': 'mismatch' if _mismatch else 'unverified',
+                       'detail': _reason})
     return _repro_dimension('config', fields)
 
 
@@ -205,7 +305,7 @@ def _repro_environment_dimension(original, rerun):
         value = rec.get('exec_fp')
         if value is None and isinstance(rec.get('hyperparams'), dict):
             value = rec['hyperparams'].get('exec_fp')
-        return _repro_text(value)
+        return value
 
     return _repro_dimension('environment', [
         _repro_field('exec_fp', _fp(original), _fp(rerun), required=True)])
@@ -216,7 +316,7 @@ def _repro_initialization_dimension(original, rerun):
         value = rec.get('init_core_fp')
         if value is None and isinstance(rec.get('hyperparams'), dict):
             value = rec['hyperparams'].get('init_core_fp')
-        return _repro_text(value)
+        return value
 
     return _repro_dimension('initialization', [
         _repro_field('init_core_fp', _fp(original), _fp(rerun), required=True)])
@@ -230,8 +330,8 @@ def _repro_rng_dimension(original, rerun):
     of RNG.  For two executions of the SAME cell it is still a useful warning,
     so it is reported but does not by itself make the runs non-reproducible.
     """
-    va = _repro_text(original.get('rng_fp'))
-    vb = _repro_text(rerun.get('rng_fp'))
+    va = original.get('rng_fp')
+    vb = rerun.get('rng_fp')
     return _repro_field('rng_fp', va, vb)
 
 
@@ -249,7 +349,19 @@ def _repro_metric(original, rerun, *, rtol, atol):
         out['status'] = 'missing'
         out['detail'] = 'one or both records carry no usable PPL (>=1, finite)'
         return out
-    if na is not None and nb is not None and na != nb:
+    if na is None or nb is None:
+        # A PPL is exp(mean CE) over a token denominator.  Without an exact
+        # count on both sides the two numbers cannot be shown to average the
+        # same measurement, so equality of the scalar alone is not a
+        # reproduction.  Malformed counts (fractional/boolean/negative) are
+        # reported the same way rather than truncated into a match.
+        missing_side = ('both records' if na is None and nb is None
+                        else 'one record')
+        out['status'] = 'denominator_unverified'
+        out['detail'] = (f'{missing_side} carry no exact positive token '
+                         'count; the PPL denominators cannot be shown to match')
+        return out
+    if na != nb:
         out['status'] = 'denominator_mismatch'
         out['detail'] = (f'the PPLs are averaged over different token counts '
                          f'({na} vs {nb}); they are not the same measurement')
@@ -342,7 +454,8 @@ def reproduction_diagnosis(original, rerun, *, rtol=1e-6, atol=0.0):
     elif metric['status'] == 'missing':
         verdict = 'metric_missing'
         reproduced = False
-    elif metric['status'] == 'denominator_mismatch':
+    elif metric['status'] in ('denominator_mismatch',
+                              'denominator_unverified'):
         verdict = 'metric_mismatch'
         reproduced = False
     elif metric['status'] == 'exact':
@@ -378,7 +491,9 @@ def _repro_load_summary(source, label):
     except TypeError:
         raise ValueError(f'reproduction: {label} must be a summary mapping, '
                          'a directory or a summary.json path') from None
-    path = os.path.abspath(path)
+    # ``os.fspath`` may yield bytes; joining that with the literal
+    # ``'summary.json'`` raises TypeError, so decode before path arithmetic.
+    path = os.path.abspath(os.fsdecode(path))
     if os.path.isdir(path):
         path = os.path.join(path, 'summary.json')
     if not os.path.isfile(path):
@@ -392,15 +507,24 @@ def _repro_load_summary(source, label):
 
 
 def _repro_cells(summary):
+    """Split a summary into comparable cells and malformed declared cells.
+
+    Non-cell aggregate/metadata entries (keys without ``::seed``) are allowed
+    and ignored.  A key that declares itself a cell but does not carry an
+    object record is corrupt: silently dropping it would let the remaining
+    cells produce a green "reproduced" verdict for an incomplete panel.
+    """
     out = {}
+    malformed = []
     for key, rec in summary.items():
-        if not isinstance(rec, dict):
-            continue
         key = str(key)
         if '::seed' not in key:
             continue
+        if not isinstance(rec, dict):
+            malformed.append(key)
+            continue
         out[key] = rec
-    return out
+    return out, sorted(malformed)
 
 
 def compare_reproductions(original, rerun, *, rtol=1e-6, atol=0.0):
@@ -416,7 +540,8 @@ def compare_reproductions(original, rerun, *, rtol=1e-6, atol=0.0):
     atol = _repro_validate_tolerance('atol', atol)
     a_summary, a_label = _repro_load_summary(original, 'original')
     b_summary, b_label = _repro_load_summary(rerun, 'rerun')
-    a_cells, b_cells = _repro_cells(a_summary), _repro_cells(b_summary)
+    a_cells, a_malformed = _repro_cells(a_summary)
+    b_cells, b_malformed = _repro_cells(b_summary)
     common = sorted(set(a_cells) & set(b_cells))
     only_original = sorted(set(a_cells) - set(b_cells))
     only_rerun = sorted(set(b_cells) - set(a_cells))
@@ -436,6 +561,10 @@ def compare_reproductions(original, rerun, *, rtol=1e-6, atol=0.0):
         problems.append(f'{key}: recorded only in the original summary')
     for key in only_rerun:
         problems.append(f'{key}: recorded only in the rerun summary')
+    for key in a_malformed:
+        problems.append(f'{key}: original cell is not an object record')
+    for key in b_malformed:
+        problems.append(f'{key}: rerun cell is not an object record')
 
     if not common:
         verdict = 'not_comparable'
@@ -443,7 +572,7 @@ def compare_reproductions(original, rerun, *, rtol=1e-6, atol=0.0):
                    'environment_changed', 'initialization_changed')
              for v in counts):
         verdict = 'not_reproduced'
-    elif only_original or only_rerun:
+    elif only_original or only_rerun or a_malformed or b_malformed:
         verdict = 'incomplete'
     elif any(v in ('provenance_incomplete', 'metric_missing',
                    'metric_mismatch', 'not_comparable') for v in counts):
@@ -477,8 +606,12 @@ def compare_reproductions(original, rerun, *, rtol=1e-6, atol=0.0):
         'n_compared': len(common),
         'n_only_original': len(only_original),
         'n_only_rerun': len(only_rerun),
+        'n_malformed_original': len(a_malformed),
+        'n_malformed_rerun': len(b_malformed),
         'only_original': only_original[:50],
         'only_rerun': only_rerun[:50],
+        'malformed_original': a_malformed[:50],
+        'malformed_rerun': b_malformed[:50],
         'counts': dict(sorted(counts.items())),
         'cells': cells,
         'problems': problems,
