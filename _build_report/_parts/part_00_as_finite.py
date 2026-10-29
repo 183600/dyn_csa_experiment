@@ -116,18 +116,65 @@ def _hist_points(r):
             continue
         yield (_st, _pv)
 
+def _sample_std_exact_integral(vals):
+    """Sample SD of exact integer values, without converting them to float.
+
+    A declared count/parameter total can exceed float64 even though the
+    variance (and its square root) is representable.  The ordinary path
+    converts every value to float and raises ``OverflowError``; compute the
+    exact numerator/denominator instead and round only the final square root.
+    Returns None when the values are not all exact integers.
+    """
+    if not vals:
+        return None
+    for v in vals:
+        if isinstance(v, (bool, np.bool_)) or not isinstance(v, numbers.Integral):
+            return None
+    ints = [int(v) for v in vals]
+    n = len(ints)
+    if n < 2:
+        return 0.0
+    total = sum(ints)
+    # n * sum(x^2) - (sum x)^2 == n * sum((x - mean)^2), exactly.
+    numerator = n * sum(x * x for x in ints) - total * total
+    if numerator <= 0:
+        return 0.0
+    denominator = n * (n - 1)
+    try:
+        from decimal import Decimal, localcontext
+        with localcontext() as ctx:
+            # 50 digits is enough to round a binary64 result correctly for
+            # the ordinary scales this helper serves.
+            ctx.prec = 50
+            root = (Decimal(numerator) / Decimal(denominator)).sqrt()
+            return float(root)
+    except (ArithmeticError, TypeError, ValueError):
+        return float('nan')
+
 def sample_std(vals):
     n = len(vals)
     if n < 2:
         return 0.0
-    scale = max((abs(float(v)) for v in vals), default=0.0)
+    try:
+        scale = max((abs(float(v)) for v in vals), default=0.0)
+    except (OverflowError, TypeError, ValueError):
+        exact = _sample_std_exact_integral(vals)
+        if exact is not None:
+            return exact
+        raise
     if math.isfinite(scale) and scale > 0.0 and (scale < 1e-100 or scale > 1e100):
         z = [float(v) / scale for v in vals]
         mu = math.fsum(z) / n
         ss = math.fsum((v - mu) ** 2 for v in z)
         return scale * math.sqrt(ss / (n - 1))
-    mu = sum(vals) / n
-    return (sum(((v - mu) ** 2 for v in vals)) / (n - 1)) ** 0.5
+    try:
+        mu = sum(vals) / n
+        return (sum(((v - mu) ** 2 for v in vals)) / (n - 1)) ** 0.5
+    except (OverflowError, TypeError, ValueError):
+        exact = _sample_std_exact_integral(vals)
+        if exact is not None:
+            return exact
+        raise
 
 def _signflip_mitm_count(deltas):
     """Exact sign-assignment count by meet-in-the-middle (NumPy).

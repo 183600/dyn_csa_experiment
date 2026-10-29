@@ -461,6 +461,30 @@ def _design_probability(value, *, name, lo=0.0, hi=1.0,
 
 
 def _design_close(a, b, tol=1e-12):
+    """Absolute closeness for design-time scalars, exact for integer counts.
+
+    A declared seed/family count may exceed float64's range.  Converting both
+    sides to float then made two equal 401-digit counts fail their own audit
+    (OverflowError -> False).  Compare exact integers directly and reserve the
+    float path for fractional values.
+    """
+    try:
+        tol = float(tol)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if not math.isfinite(tol) or tol < 0.0:
+        return False
+    if (not isinstance(a, (bool, np.bool_))
+            and not isinstance(b, (bool, np.bool_))
+            and isinstance(a, numbers.Integral)
+            and isinstance(b, numbers.Integral)):
+        if int(a) == int(b):
+            return True
+        try:
+            from fractions import Fraction
+            return abs(int(a) - int(b)) <= Fraction.from_float(tol)
+        except (OverflowError, ValueError):
+            return False
     try:
         return abs(float(a) - float(b)) <= tol
     except (TypeError, ValueError, OverflowError):

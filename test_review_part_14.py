@@ -231,3 +231,44 @@ def test_experiment_ledger_audit_status_and_wiring():
         # key must not hide the fields they consume.
         got = A._read_experiment_events(good_dir)
         assert len(got) == 2 and all(e['kind'] == 'cell' for e in got), got
+
+
+def test_experiment_ledger_refuses_to_grow_corrupt_evidence():
+    with tempfile.TemporaryDirectory() as d:
+        for i in range(2):
+            _append(d, {'kind': 'cell', 'i': i})
+        path = os.path.join(d, 'experiments.jsonl')
+        original = open(path, encoding='utf-8').read()
+
+        # A malformed sidecar is not "no anchor": appending must not replace
+        # it with a fresh anchor and erase the warning.
+        with open(path + '.anchor.json', 'w', encoding='utf-8') as fh:
+            fh.write('[]')
+        assert _append(d, {'kind': 'after'}) is None
+        assert open(path, encoding='utf-8').read() == original
+        assert L.verify_experiment_ledger(path)['status'] == 'fail'
+
+        # A corrupt/malformed line must not be re-anchored by the next append.
+        with open(path + '.anchor.json', 'w', encoding='utf-8') as fh:
+            json.dump({'count': 2}, fh)
+        lines = original.split('\n')
+        lines[1] = '{bad'
+        with open(path, 'w', encoding='utf-8') as fh:
+            fh.write('\n'.join(lines))
+        before = open(path, encoding='utf-8').read()
+        assert _append(d, {'kind': 'after'}) is None
+        assert open(path, encoding='utf-8').read() == before
+        assert L.verify_experiment_ledger(path)['status'] == 'fail'
+
+
+def test_experiment_ledger_handles_unicode_line_separators():
+    # JSON strings may contain U+2028/U+2029 unescaped.  They are not physical
+    # ledger line breaks; treating them as such made a valid event unreadable.
+    with tempfile.TemporaryDirectory() as d:
+        _append(d, {'kind': 'cell', 'text': 'a\u2028b\u2029c\x85d'})
+        _append(d, {'kind': 'cell', 'text': 'next'})
+        path = os.path.join(d, 'experiments.jsonl')
+        raw = open(path, encoding='utf-8').read()
+        assert raw.count('\n') == 2, raw
+        rep = L.verify_experiment_ledger(path)
+        assert rep['status'] == 'ok' and rep['n_events'] == 2, rep

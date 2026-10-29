@@ -2020,3 +2020,19 @@ def test_scale_missing_seed_identity_is_not_paired():
     assert rw['verdict'] == 'underpowered', rw['verdict']
     assert rw['underpowered_points'] == ['W0', 'W1', 'W2'], rw
 
+
+
+def test_report_sample_std_accepts_exact_huge_integers():
+    H = 10 ** 400
+    # Converting H to float raised before any sample spread was computed, so a
+    # perfectly well-defined SD (or a zero-variance panel) crashed the report.
+    assert BR.sample_std([H, H]) == 0.0
+    assert math.isclose(BR.sample_std([H, H + 1]), math.sqrt(0.5), rel_tol=1e-12)
+    assert math.isclose(BR.sample_std([H, H + 2]), math.sqrt(2.0), rel_tol=1e-12)
+    assert math.isclose(BR.sample_std([H, H + 1, H + 2]), 1.0, rel_tol=1e-12)
+    # A spread genuinely beyond float64 is reported as inf, not an exception.
+    assert math.isinf(BR.sample_std([H, 0]))
+    # The normal and tiny/huge-float paths keep their previous values.
+    assert math.isclose(BR.sample_std([1.0, 2.0, 3.0]), 1.0, rel_tol=1e-12)
+    assert math.isclose(BR.sample_std([1e-300, 2e-300]),
+                        math.sqrt(0.5) * 1e-300, rel_tol=1e-12)

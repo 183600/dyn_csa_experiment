@@ -1046,7 +1046,13 @@ def _ledger_scan_text(text):
     n_chained = 0
     n_legacy = 0
     seen_chained = False
-    for lineno, raw in enumerate(text.splitlines(), 1):
+    # Split on the physical line-feed only.  ``str.splitlines()`` also breaks
+    # on U+2028/U+2029/U+0085 and several C0 controls, which JSON permits
+    # unescaped inside a string; a normal event containing one would be read
+    # as two malformed lines and make a healthy ledger look corrupt.
+    for lineno, raw in enumerate(text.split('\n'), 1):
+        if raw.endswith('\r'):
+            raw = raw[:-1]
         if not raw.strip():
             continue
         link = None
@@ -1142,9 +1148,14 @@ def _ledger_anchor_prefix_ok(anchor, scan):
     to append over it instead of silently re-anchoring the shorter history.
     A *behind* anchor whose last link matches the prefix is the documented
     crash window and is safe to continue."""
+    # No sidecar (None) is the documented missing-anchor case, but a sidecar
+    # that exists and is malformed is not a prefix: it must not be silently
+    # replaced by the next append.
+    if anchor is None:
+        return True
     count = _ledger_anchor_count(anchor)
     if count is None:
-        return True
+        return False
     if count > scan['n_events']:
         return False
     expected = (_LEDGER_ZERO if count == 0 else scan['links'][count - 1])
@@ -1161,7 +1172,12 @@ def _ledger_next_state(path):
     when the sidecar disagrees with the log.  A full scan that finds the
     anchor ahead of the ledger (truncated tail) or pointing at a different
     prefix refuses the append: re-anchoring it would erase the evidence."""
-    anchor, _ = _load_ledger_anchor(path)
+    anchor, aproblem = _load_ledger_anchor(path)
+    if aproblem:
+        raise RuntimeError(
+            f'experiment ledger tail anchor is corrupt ({aproblem}); refusing '
+            'to append over it — inspect with '
+            '`python audit_gates.py experiment_ledger` first')
     last_raw = _read_last_nonempty_line(path)
     if last_raw:
         try:
@@ -1187,6 +1203,15 @@ def _ledger_next_state(path):
         raise RuntimeError(
             'experiment ledger tail/anchor disagree (truncated or edited '
             'ledger); refusing to append over it — inspect with '
+            '`python audit_gates.py experiment_ledger` first')
+    if scan['problems']:
+        # A malformed/edited line is already evidence of corruption.  Do not
+        # grow the file on top of it and then re-anchor the tail: that hides
+        # the damage from every later append even though verification still
+        # fails.  The caller (``log_experiment_event``) reports and continues.
+        raise RuntimeError(
+            'experiment ledger contains corrupt lines or a broken chain; '
+            'refusing to append over it — inspect with '
             '`python audit_gates.py experiment_ledger` first')
     return scan['n_events'], scan['last_sha256'], True
 

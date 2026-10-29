@@ -264,3 +264,41 @@ def test_design_and_record_audits_report_huge_counts_without_float_overflow():
         'matched_fixed_topk': H}}}
     cr = L.dynamic_read_budget_calibration(cal)
     assert cr['expected_topk'] == H, cr
+
+
+def test_huge_parameter_breakdown_is_compared_exactly():
+    H = 10 ** 400
+    good = {'non_embedding': H, 'active': H}
+    near = {'non_embedding': H, 'active': H + 1}
+    bad = {'non_embedding': H, 'active': 2 * H}
+    recs = {('a', 'p', 0): {'params': H, 'param_breakdown': good},
+            ('b', 'p', 0): {'params': H, 'param_breakdown': near}}
+    detail = L._param_control_detail(recs, 'a', 'b')
+    assert detail['total_controlled'] is True, detail
+    # H+1/H differs by 1/H, too small for a float, but the 1% gate is exact.
+    assert detail['active_controlled'] is True, detail
+    assert detail['active_rel_diff'] is None, detail
+    assert L._param_capacity_controlled(detail) is True, detail
+    assert L.param_pair_reason(recs[('a', 'p', 0)],
+                               recs[('b', 'p', 0)]) is None
+
+    recs[('b', 'p', 0)]['param_breakdown'] = bad
+    detail = L._param_control_detail(recs, 'a', 'b')
+    assert detail['active_controlled'] is False, detail
+    assert L._param_capacity_controlled(detail) is False, detail
+    why = L.param_pair_reason(recs[('a', 'p', 0)], recs[('b', 'p', 0)])
+    assert why and 'breakdown' in why, why
+
+    # A present-but-unusable breakdown fails closed instead of falling back to
+    # the (matching) total count.
+    unusable = {('a', 'p', 0): {'params': H, 'param_breakdown':
+                                {'non_embedding': H, 'active': 'bad'}},
+                ('b', 'p', 0): {'params': H, 'param_breakdown':
+                                {'non_embedding': H, 'active': 2 * H}}}
+    ud = L._param_control_detail(unusable, 'a', 'b')
+    assert ud['breakdown_unverifiable'] is True, ud
+    assert L._param_capacity_controlled(ud) is None, ud
+
+    # The design-time close helper must not overflow on the same counts.
+    assert L._design_close(H, H) is True
+    assert L._design_close(H, H + 1) is False

@@ -474,6 +474,46 @@ def _int_ratio_within(numerator, denominator, tolerance):
     except (OverflowError, ValueError):
         return None
 
+def _integral_value(value):
+    """Exact integer for an integer-valued scalar, else None.
+
+    Used only where an exact integer comparison is stronger than the float
+    path; booleans, strings and fractional values are left to that path so a
+    malformed flag cannot become a count.
+    """
+    if isinstance(value, (bool, np.bool_)):
+        return None
+    if isinstance(value, numbers.Integral):
+        return int(value)
+    if isinstance(value, numbers.Real):
+        try:
+            f = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if math.isfinite(f) and f.is_integer():
+            return int(f)
+    return None
+
+def _param_ratio_pair(a, b, tolerance):
+    """(relative gap, within tolerance) for two capacity counts.
+
+    Integer counts are compared exactly, so a 401-digit pair neither raises
+    on int -> float conversion nor silently skips the breakdown check.  The
+    second slot has the exact gate verdict even when the relative gap itself
+    underflows/overflows float64.
+    """
+    ia, ib = _integral_value(a), _integral_value(b)
+    if ia is not None and ib is not None:
+        numerator = abs(ia - ib)
+        denominator = max(abs(ia), abs(ib), 1)
+        return (_finite_int_ratio(numerator, denominator),
+                _int_ratio_within(numerator, denominator, tolerance))
+    fa, fb = _finite_scalar(a), _finite_scalar(b)
+    if fa is None or fb is None:
+        return None, None
+    rel = abs(fa - fb) / max(abs(fa), abs(fb), 1.0)
+    return float(rel), bool(rel <= tolerance)
+
 def _param_control(recs, a, b):
     """Relative parameter-count difference between two arms, and whether it is
     small enough to call them parameter-controlled (<=1%).  None means one or
@@ -544,15 +584,21 @@ def param_pair_reason(ra, rb, *, tolerance=0.01, require_breakdown=False):
         return 'unverifiable param_breakdown (only one record carries it)'
     if _ba and _bb:
         for key, label in (('non_embedding', 'non-embedding'), ('active', 'active')):
-            va, vb = _finite_scalar(ba.get(key)), _finite_scalar(bb.get(key))
-            if va is None or vb is None:
+            if key not in ba or key not in bb:
                 if require_breakdown:
                     return f'unverifiable param_breakdown.{key}'
                 continue
-            _rel = abs(va - vb) / max(abs(va), abs(vb), 1.0)
-            if _rel > tol:
-                return (f'parameter breakdown mismatch ({label}: {va:g} vs {vb:g}, '
-                        f'{100.0 * _rel:.2f}% > {100.0 * tol:.2f}%)')
+            _rel, _within = _param_ratio_pair(ba.get(key), bb.get(key), tol)
+            if _rel is None and _within is None:
+                if require_breakdown:
+                    return f'unverifiable param_breakdown.{key}'
+                continue
+            if _within is False:
+                _shown = (f'{100.0 * _rel:.2f}%' if _rel is not None
+                          else 'a relative difference above')
+                return (f'parameter breakdown mismatch ({label}: '
+                        f'{ba.get(key)!r} vs {bb.get(key)!r}, {_shown} the '
+                        f'{100.0 * tol:.2f}% tolerance)')
     elif require_breakdown:
         return 'unverifiable param_breakdown (at least one record omits it)'
     return None
@@ -586,7 +632,8 @@ def _param_control_detail(recs, a, b):
     out = {'total_rel_diff': None, 'total_controlled': None,
            'non_embedding_rel_diff': None, 'non_embedding_controlled': None,
            'active_rel_diff': None, 'active_controlled': None,
-           'breakdown_one_sided': False, 'unavailable': True}
+           'breakdown_one_sided': False, 'breakdown_unverifiable': False,
+           'unavailable': True}
     pa, pb = _params_of_arm(recs, a), _params_of_arm(recs, b)
     if pa is not None and pb is not None:
         rel = _finite_int_ratio(abs(pa - pb), max(pa, pb, 1))
@@ -602,15 +649,18 @@ def _param_control_detail(recs, a, b):
     if not (_ba and _bb):
         return out
 
-    def _num(d, key):
-        return _finite_scalar(d.get(key))
     for key, label in (('non_embedding', 'non_embedding'), ('active', 'active')):
-        va, vb = _num(ba, key), _num(bb, key)
-        if va is None or vb is None:
+        if key not in ba or key not in bb:
             continue
-        rel = abs(va - vb) / max(va, vb, 1.0)
-        out[f'{label}_rel_diff'] = float(rel)
-        out[f'{label}_controlled'] = bool(rel <= 0.01)
+        rel, within = _param_ratio_pair(ba.get(key), bb.get(key), 0.01)
+        if rel is None and within is None:
+            # The key is recorded on both arms but cannot be compared (e.g. a
+            # non-numeric/corrupt value).  Falling back to the total would
+            # silently turn an unverifiable breakdown into a capacity pass.
+            out['breakdown_unverifiable'] = True
+            continue
+        out[f'{label}_rel_diff'] = (None if rel is None else float(rel))
+        out[f'{label}_controlled'] = within
     out['unavailable'] = False
     return out
 
@@ -631,6 +681,10 @@ def _param_capacity_controlled(detail):
         # One arm records the breakdown and the other does not: the capacity
         # match cannot be verified, so this is unverifiable (None), never a
         # pass that silently trusts the total count.
+        return None
+    if detail.get('breakdown_unverifiable') is True:
+        # Both arms name the key but its value cannot be compared.  This is a
+        # present-but-unusable breakdown, not a legacy missing block.
         return None
     total = detail.get('total_controlled')
     if total is None:
