@@ -36,7 +36,10 @@ def _vc_matrix(values, *, name='values'):
     if raw.ndim != 2:
         raise ValueError(f'{name} must be a 2-D [n_seeds, n_units] matrix, '
                          f'got {raw.ndim}-D')
-    if raw.dtype.kind in ('U', 'S', 'c'):
+    if raw.dtype.kind not in ('i', 'u', 'f', 'O'):
+        # Datetime/timedelta/void/string/boolean/complex arrays can be
+        # coerced by ``astype(float)``; they are labels or clocks, not
+        # measurements, so refuse them instead of silently scoring them.
         raise ValueError(f'{name} contains non-numeric values')
     if raw.dtype.kind == 'O':
         for v in raw.reshape(-1):
@@ -167,6 +170,8 @@ def crossed_variance_components(values, *, conf=0.95):
     arr = _vc_matrix(values)
     S, D = arr.shape
     N = S * D
+    if isinstance(conf, (bool, np.bool_, str, bytes, bytearray)):
+        raise ValueError(f'conf must be a probability in (0,1), got {conf!r}')
     try:
         conf = float(conf)
     except (TypeError, ValueError, OverflowError):
@@ -406,7 +411,13 @@ def paired_delta_variance_components(nll_a, nll_b, n_tokens, *, conf=0.95):
     if _contains_bool_value(n_tokens):
         raise ValueError('n_tokens contains a boolean')
     try:
-        tok = np.asarray(n_tokens, dtype=float)
+        tok_raw = np.asarray(n_tokens)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f'n_tokens is not a numeric vector: {exc}') from None
+    if tok_raw.dtype.kind not in ('i', 'u', 'f', 'O'):
+        raise ValueError('n_tokens contains non-numeric values')
+    try:
+        tok = tok_raw.astype(float)
     except (TypeError, ValueError, OverflowError):
         raise ValueError('n_tokens is not a numeric vector') from None
     if tok.ndim != 1 or tok.shape[0] != A.shape[1]:

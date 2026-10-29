@@ -196,6 +196,78 @@ def test_malformed_interaction_inputs_fail_closed():
     assert any('not present in the design' in w for w in ep['warnings'])
 
 
+def test_invalid_design_inputs_fail_even_below_the_resolution_floor():
+    # A resolution-limited panel is a design limitation, not an excuse to
+    # accept malformed margins, flags, n_max or n_seeds.  Every invalid
+    # parameter must still fail closed.
+    cells = _cells_from_deltas(_STRONG[:6])
+    assert cells
+    for kwargs in ({'relative_pct': -1.0}, {'relative_pct': 0.0},
+                   {'expected_sign': 2}, {'n_max': 1},
+                   {'pair_retention': 1.5}, {'pair_retention': True},
+                   {'require_sesoi_power': 'yes'},
+                   {'require_attrition_power': 1},
+                   {'require_attrition_power': True},
+                   {'require_sesoi_power': True, 'relative_pct': None},
+                   {'alpha': '0.05'}, {'target_power': '0.8'}):
+        args = dict(m_family=5, relative_pct=1.0, expected_sign=1)
+        args.update(kwargs)
+        r = L.factorial_interaction_power(cells, **args)
+        assert r['status'] == 'fail', (kwargs, r)
+        assert r['violations'], (kwargs, r)
+    # A planned-n mismatch is also a hard violation, not a resolution note.
+    r = L.factorial_interaction_power(
+        cells, n_seeds=5, m_family=5, relative_pct=1.0, expected_sign=1)
+    assert r['status'] == 'fail', r
+    assert any('does not equal' in v for v in r['violations']), r
+    # The same valid panel without violations is still clearly labelled as
+    # resolution-limited, and a no-attrition (retention=1.0) plan is valid.
+    r = L.factorial_interaction_power(
+        cells, m_family=5, relative_pct=1.0, expected_sign=1)
+    assert r['status'] == 'resolution_limited', r
+    ok = L.factorial_interaction_power(
+        _cells_from_deltas(_STRONG), m_family=5, relative_pct=1.0,
+        expected_sign=1, pair_retention=1.0)
+    assert ok['status'] == 'ok', ok
+    assert ok['attrition'].get('status') != 'not_verifiable', ok['attrition']
+
+
+def test_resolution_scan_scales_past_the_legacy_512_seed_default():
+    # A tiny alpha needs more than 512 seeds; the resolution ceiling must not
+    # silently become ``None`` at the old helper default.
+    assert L._min_n_for_holm_family(5, 1e-300) == 1000
+    r = L.factorial_power_audit(n_seeds=8, alpha=1e-300)
+    assert r['family_resolution']['min_n_for_alpha'] == 1000, r
+    assert r['status'] == 'warnings', r
+    assert len(r['resolution_limited']) == len(L.FACTORIAL_DESIGN), r
+
+
+def test_audit_rejects_malformed_pilot_metadata_without_raising():
+    # A metadata-only pilot is a planning declaration, not a factorial named
+    # "n_seeds"; a direct caller can also pass a non-string factorial key.
+    meta = L.factorial_power_audit({'m_family': 5, 'n_seeds': 6})
+    assert meta['status'] == 'warnings', meta
+    assert len(meta['resolution_limited']) == len(L.FACTORIAL_DESIGN)
+    assert not meta['violations'], meta
+    plan = L.factorial_power_audit({'m_family': 5, 'n_seeds': 8})
+    assert plan['status'] == 'warnings', plan
+    assert plan['resolution_limited'] == []
+    bad = L.factorial_power_audit(
+        {'factorials': {1: {'cells': _cells_from_deltas(_STRONG)}}},
+        n_seeds=8)
+    assert bad['status'] == 'fail', bad
+    assert any('not a string' in v for v in bad['violations']), bad
+    # A bad global retention/flag must fail even when no pilot is available.
+    for kwargs in ({'pair_retention': 2.0},
+                   {'require_sesoi_power': 'no'},
+                   {'require_attrition_power': 'no'},
+                   {'require_attrition_power': True}):
+        args = dict(n_seeds=8)
+        args.update(kwargs)
+        r = L.factorial_power_audit(**args)
+        assert r['status'] == 'fail', (kwargs, r)
+
+
 def test_attrition_projection_is_optional_and_complete_coverage_aware():
     r = L.factorial_interaction_power(
         _cells_from_deltas(_STRONG), m_family=5, relative_pct=1.0,

@@ -24,6 +24,12 @@
 
 FACTORIAL_POWER_CELL_KEYS = ('11', '10', '01', '00')
 
+# Keys a metadata-only (or legacy bare) pilot may carry at the top level.
+# They are not factorial names when their value is a scalar.
+_FACTORIAL_PILOT_META_KEYS = frozenset({
+    'm_family', 'n_seeds', 'kind', 'schema', 'source', 'generated_at', 'note',
+})
+
 FACTORIAL_POWER_POLICY = {
     'alpha': 0.05,
     'target_power': 0.80,
@@ -58,6 +64,31 @@ def _fp_positive(name, value):
         raise TypeError(f'{name} must be a finite positive number, got {type(value).__name__}') from None
     if not math.isfinite(out) or out <= 0.0:
         raise ValueError(f'{name} must be a finite positive number, got {value!r}')
+    return out
+
+
+def _fp_bool(name, value):
+    """Strict boolean for a fail-closed design flag."""
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    raise TypeError(f'{name} must be a boolean, got {type(value).__name__}')
+
+
+def _fp_probability(name, value, *, lo_open=False, hi_open=False):
+    """Strict probability for a design parameter.
+
+    ``_design_probability`` also accepts numeric strings because it is reused
+    by legacy text parsers.  A JSON design object should carry real numbers;
+    a quoted probability is a label, not a declared threshold, so the design
+    API rejects it before it can silently become a valid plan.
+    """
+    if isinstance(value, (bool, np.bool_, str, bytes, bytearray)):
+        raise TypeError(
+            f'{name} must be a real probability, got {type(value).__name__}')
+    out = _design_probability(value, name=name,
+                              lo_open=lo_open, hi_open=hi_open)
+    if out is None:
+        raise ValueError(f'{name}={value!r} must be a finite probability')
     return out
 
 
@@ -98,7 +129,7 @@ def _fp_cell_vectors(cells):
     return normalised, n
 
 
-def _min_n_for_holm_family(m_family, alpha, n_max=512):
+def _min_n_for_holm_family(m_family, alpha, n_max=10000):
     """Smallest seed count whose two-sided sign-flip floor can clear Holm.
 
     This is the design resolution limit: below it no effect size can produce
@@ -111,7 +142,7 @@ def _min_n_for_holm_family(m_family, alpha, n_max=512):
         raise ValueError(f'alpha={alpha!r} must be a finite probability in (0,1)')
     n_max = _fp_int('n_max', n_max, minimum=2, maximum=10000)
     for n in range(2, n_max + 1):
-        if holm_min_attainable_p(n, m, a) <= a + 1e-15:
+        if holm_min_attainable_p(n, m, a) <= a:
             return n
     return None
 
@@ -120,16 +151,28 @@ def _factorial_resolution(n, m_family, alpha):
     """Resolution-floor block shared by the single- and multi-factorial APIs."""
     floor = float(signflip_p_floor(n))
     min_holm = float(holm_min_attainable_p(n, m_family, alpha))
+    # The resolution limit is a property of the design, not of the particular
+    # n being audited.  Scan the full supported range (the same 10,000-seed
+    # cap the rest of the planning helpers use) so a scale-up panel with
+    # n > 512 and a small alpha still gets a real ``min_n_for_alpha`` instead
+    # of a spurious ``None``.
+    min_n = _min_n_for_holm_family(m_family, alpha, n_max=10000)
+    if min_n is None:
+        note = ('two-sided exact sign-flip floor with a Holm family of m; '
+                'no seed count up to the 10,000-seed planning cap can make '
+                'this family significant')
+    else:
+        note = ('two-sided exact sign-flip floor with a Holm family of m; '
+                'below min_n_for_alpha no effect can be significant')
     return {
         'n_seeds': int(n),
         'm_family': int(m_family),
         'alpha': float(alpha),
         'p_floor': floor,
         'min_attainable_p_holm': min_holm,
-        'resolution_ok': bool(min_holm <= float(alpha) + 1e-15),
-        'min_n_for_alpha': _min_n_for_holm_family(m_family, alpha),
-        'note': ('two-sided exact sign-flip floor with a Holm family of m; '
-                 'below min_n_for_alpha no effect can be significant'),
+        'resolution_ok': bool(min_holm <= float(alpha)),
+        'min_n_for_alpha': min_n,
+        'note': note,
     }
 
 
@@ -173,33 +216,58 @@ def factorial_interaction_power(cells, *, n_seeds=None, m_family=1,
         out['violations'].append(str(exc))
         return out
     out['n_seeds'] = n_cells
-    if n_seeds is not None:
-        try:
-            declared_n = _fp_int('n_seeds', n_seeds, minimum=2)
-        except (TypeError, ValueError) as exc:
-            out['status'] = 'fail'
-            out['violations'].append(str(exc))
-            return out
-        if declared_n != n_cells:
-            out['violations'].append(
-                f'n_seeds={declared_n} does not equal the {n_cells} aligned '
-                'pilot cells; the planned and pilot panels must be the same '
-                'seed-complete design')
+    # Validate every design parameter BEFORE the resolution early return.  A
+    # malformed n/margin/flag must fail closed even when the panel happens to
+    # be resolution-limited; otherwise the "no effect can be significant"
+    # branch would silently accept an invalid plan.
     try:
+        if n_seeds is not None:
+            declared_n = _fp_int('n_seeds', n_seeds, minimum=2)
+            if declared_n != n_cells:
+                out['violations'].append(
+                    f'n_seeds={declared_n} does not equal the {n_cells} aligned '
+                    'pilot cells; the planned and pilot panels must be the same '
+                    'seed-complete design')
         m = _fp_int('m_family', m_family, minimum=1)
-        a = _design_probability(alpha, name='alpha', lo_open=True, hi_open=True)
-        if a is None:
-            raise ValueError(f'alpha={alpha!r} must be a finite probability in (0,1)')
-        tp = _design_probability(target_power, name='target_power',
-                                 lo_open=True, hi_open=True)
-        if tp is None:
-            raise ValueError(f'target_power={target_power!r} must be a finite probability in (0,1)')
+        a = _fp_probability('alpha', alpha, lo_open=True, hi_open=True)
+        tp = _fp_probability('target_power', target_power,
+                             lo_open=True, hi_open=True)
         min_n = _fp_int('min_n', min_n, minimum=0)
+        n_max = _fp_int('n_max', n_max, minimum=2, maximum=10000)
+        pct = None
+        margin = None
+        if relative_pct is not None:
+            pct = _fp_positive('relative_pct', relative_pct)
+            margin = float(math.log1p(pct / 100.0))
+        direction, direction_error = _design_direction(expected_sign)
+        if direction_error:
+            out['violations'].append(direction_error)
+        retention = None
+        if pair_retention is not None:
+            # Match ``attrition_power_audit``: a retention probability is
+            # defined on [0, 1].  A value of exactly 1.0 is the no-attrition
+            # plan and is legitimate; values outside the interval are not.
+            retention = _fp_probability('pair_retention', pair_retention)
+        req_sesoi_power = _fp_bool(
+            'require_sesoi_power', require_sesoi_power)
+        req_attrition_power = _fp_bool(
+            'require_attrition_power', require_attrition_power)
+        if req_sesoi_power and relative_pct is None:
+            out['violations'].append(
+                'require_sesoi_power=true but no SESOI/relative_pct was '
+                'declared')
+        if req_attrition_power and pair_retention is None:
+            out['violations'].append(
+                'require_attrition_power=true but no pair_retention was '
+                'declared')
     except (TypeError, ValueError) as exc:
         out['status'] = 'fail'
         out['violations'].append(str(exc))
         return out
     out['m_family'], out['alpha'], out['target_power'] = m, a, tp
+    out['relative_pct'] = pct
+    out['sesoi_margin'] = margin
+    out['expected_sign'] = direction
     if n_cells < min_n:
         out['warnings'].append(
             f'n_seeds={n_cells} is below the declared min_n={min_n}; the '
@@ -220,29 +288,20 @@ def factorial_interaction_power(cells, *, n_seeds=None, m_family=1,
     resolution = _factorial_resolution(n_cells, m, a)
     out['resolution'] = resolution
     if not resolution['resolution_ok']:
-        out['status'] = 'resolution_limited'
+        # Input violations outrank the resolution readout: an invalid plan is
+        # not merely under-resolved.
+        out['status'] = 'fail' if out['violations'] else 'resolution_limited'
+        need = resolution['min_n_for_alpha']
+        need_txt = (f'at least {need} seeds' if need is not None
+                    else 'more seeds than the 10,000-seed planning cap')
         out['note'] = (
             f'with n={n_cells} seeds and m={m} interactions the smallest '
             f'attainable Holm p is {resolution["min_attainable_p_holm"]:.6g} '
             f'> alpha={a}; no effect size can make a significant interaction. '
-            f'This family needs at least {resolution["min_n_for_alpha"]} seeds '
+            f'This family needs {need_txt} '
             '(or a smaller pre-registered family).')
+        out['warnings'] = list(dict.fromkeys(out['warnings']))
         return out
-    margin = None
-    if relative_pct is not None:
-        try:
-            pct = _fp_positive('relative_pct', relative_pct)
-        except (TypeError, ValueError) as exc:
-            out['status'] = 'fail'
-            out['violations'].append(str(exc))
-            return out
-        out['relative_pct'] = pct
-        margin = float(math.log1p(pct / 100.0))
-        out['sesoi_margin'] = margin
-    direction, direction_error = _design_direction(expected_sign)
-    if direction_error:
-        out['violations'].append(direction_error)
-    out['expected_sign'] = direction
     if direction is None:
         out['warnings'].append(
             'no directional interaction hypothesis; a sign-flip SESOI power '
@@ -250,7 +309,7 @@ def factorial_interaction_power(cells, *, n_seeds=None, m_family=1,
     base = paired_design_sensitivity(
         n_cells, m, alpha=a, target_power=tp, pilot_deltas=deltas,
         expected_sign=direction, sesoi=margin,
-        require_sesoi_power=bool(require_sesoi_power), n_max=n_max)
+        require_sesoi_power=req_sesoi_power, n_max=n_max)
     out['sensitivity'] = base
     out['warnings'].extend(base.get('warnings') or [])
     if base.get('status') == 'fail':
@@ -288,39 +347,36 @@ def factorial_interaction_power(cells, *, n_seeds=None, m_family=1,
             out['mde_relative_pct'] = float(100.0 * math.expm1(abs(float(mde))))
         except OverflowError:
             out['mde_relative_pct'] = None
-    if pair_retention is not None:
-        try:
-            retention = _design_probability(pair_retention, name='pair_retention',
-                                            lo_open=True, hi_open=True)
-            if retention is None:
-                raise ValueError('pair_retention must be in (0,1)')
-            q = (base.get('pilot') or {}).get('q_sign_rate')
-            if q is None:
-                q = base.get('min_q_for_target_power')
-            if q is None:
-                out['attrition'] = {
-                    'status': 'not_verifiable',
-                    'reason': 'no directional sign rate is available for an attrition projection',
-                }
-            else:
-                att = attrition_power_audit(
-                    n_cells, m, q=q, alpha=a, target_power=tp,
-                    pair_retention=retention,
-                    require_complete_coverage=True,
-                    require_attrition_power=bool(require_attrition_power))
-                out['attrition'] = att
-                if att.get('status') == 'fail':
-                    out['status'] = 'fail'
-                    out['violations'].extend(
-                        f'attrition: {v}' for v in (att.get('violations') or []))
-                elif att.get('status') not in ('ok', 'not_declared'):
-                    out['warnings'].append(
-                        f'attrition status={att.get("status")!r}; the joint '
-                        'run-and-reject probability is below the declared target')
-        except (TypeError, ValueError) as exc:
-            out['status'] = 'fail'
-            out['violations'].append(str(exc))
+    if retention is not None:
+        q = (base.get('pilot') or {}).get('q_sign_rate')
+        if q is None:
+            q = base.get('min_q_for_target_power')
+        if q is None:
+            out['attrition'] = {
+                'status': 'not_verifiable',
+                'reason': 'no directional sign rate is available for an attrition projection',
+            }
+            if req_attrition_power:
+                out['violations'].append(
+                    'require_attrition_power=true but no directional sign '
+                    'rate is available for an attrition projection')
+        else:
+            att = attrition_power_audit(
+                n_cells, m, q=q, alpha=a, target_power=tp,
+                pair_retention=retention,
+                require_complete_coverage=True,
+                require_attrition_power=req_attrition_power)
+            out['attrition'] = att
+            if att.get('status') == 'fail':
+                out['status'] = 'fail'
+                out['violations'].extend(
+                    f'attrition: {v}' for v in (att.get('violations') or []))
+            elif att.get('status') not in ('ok', 'not_declared'):
+                out['warnings'].append(
+                    f'attrition status={att.get("status")!r}; the joint '
+                    'run-and-reject probability is below the declared target')
     out['warnings'] = list(dict.fromkeys(out['warnings']))
+    out['violations'] = list(dict.fromkeys(out['violations']))
     if out['violations']:
         out['status'] = 'fail'
     return out
@@ -377,44 +433,66 @@ def factorial_power_audit(pilot=None, *, design=None, sesoi=None,
     try:
         m = (_fp_int('m_family', m_family, minimum=1)
              if m_family is not None else len(design))
-        a = _design_probability(alpha, name='alpha', lo_open=True, hi_open=True)
-        if a is None:
-            raise ValueError(f'alpha={alpha!r} must be a finite probability in (0,1)')
-        tp = _design_probability(target_power, name='target_power',
-                                 lo_open=True, hi_open=True)
-        if tp is None:
-            raise ValueError(f'target_power={target_power!r} must be a finite probability in (0,1)')
+        a = _fp_probability('alpha', alpha, lo_open=True, hi_open=True)
+        tp = _fp_probability('target_power', target_power,
+                             lo_open=True, hi_open=True)
         min_n = _fp_int('min_n', min_n, minimum=0)
         n_max = _fp_int('n_max', n_max, minimum=2, maximum=10000)
-        if not isinstance(require_power, (bool, np.bool_)):
-            raise TypeError('require_power must be a boolean')
+        req_power = _fp_bool('require_power', require_power)
+        req_sesoi = _fp_bool('require_sesoi_power', require_sesoi_power)
+        req_attr = _fp_bool('require_attrition_power',
+                            require_attrition_power)
+        retention = None
+        if pair_retention is not None:
+            retention = _fp_probability('pair_retention', pair_retention)
+        if req_attr and retention is None:
+            out['violations'].append(
+                'require_attrition_power=true but no pair_retention was '
+                'declared')
     except (TypeError, ValueError) as exc:
         out['status'] = 'fail'
         out['violations'].append(str(exc))
         return out
     out['m_family'], out['alpha'], out['target_power'] = m, a, tp
     out['min_n'] = min_n
-    out['require_power'] = bool(require_power)
-    min_n_family = _min_n_for_holm_family(m, a, n_max)
+    out['require_power'] = req_power
+    out['require_sesoi_power'] = req_sesoi
+    out['require_attrition_power'] = req_attr
+    out['pair_retention'] = retention
+    # ``n_max`` bounds the required-n search, not the resolution ceiling: the
+    # ceiling is what makes a design impossible, so scan the full supported
+    # range even when the caller only searches for a small required n.
+    min_n_family = _min_n_for_holm_family(m, a, n_max=10000)
+    if min_n_family is None:
+        _fam_note = ('no seed count up to the 10,000-seed planning cap can '
+                     'make this family significant, regardless of effect size')
+    else:
+        _fam_note = ('no interaction in this family can be significant below '
+                     'min_n_for_alpha, regardless of effect size')
     out['family_resolution'] = {
         'm_family': m, 'alpha': a, 'min_n_for_alpha': min_n_family,
         'p_floor_rule': '2/2**n', 'holm_rule': 'm * 2/2**n',
-        'note': ('no interaction in this family can be significant below '
-                 'min_n_for_alpha, regardless of effect size'),
+        'note': _fam_note,
     }
     # ---- planned n (scalar or per-factorial) ---------------------------
     n_scalar, n_map = None, {}
     if n_seeds is not None:
         if isinstance(n_seeds, dict):
             for name, value in n_seeds.items():
+                if not isinstance(name, str):
+                    out['violations'].append(
+                        f'n_seeds key {name!r} is not a string')
+                    continue
                 try:
-                    n_map[str(name)] = _fp_int(f'n_seeds[{name!r}]', value, minimum=2)
+                    n_map[name] = _fp_int(
+                        f'n_seeds[{name!r}]', value, minimum=2)
                 except (TypeError, ValueError) as exc:
                     out['violations'].append(str(exc))
-            extra = sorted(set(n_map) - set(design))
+            extra = sorted(set(n_map) - set(design), key=str)
             if extra:
                 out['warnings'].append(
-                    'n_seeds names factorial(s) not present in the design: ' + ', '.join(extra))
+                    'n_seeds names factorial(s) not present in the design: '
+                    + ', '.join(str(x) for x in extra))
         else:
             try:
                 n_scalar = _fp_int('n_seeds', n_seeds, minimum=2)
@@ -433,11 +511,28 @@ def factorial_power_audit(pilot=None, *, design=None, sesoi=None,
             out['violations'].append('pilot.factorials must be an object')
             p_map = {}
     else:
-        p_map = pilot
-    extra_p = sorted(set(p_map) - set(design))
+        # A bare mapping is the legacy direct factorial map, but top-level
+        # metadata such as {"n_seeds": 8, "m_family": 5} (or a planned-n
+        # mapping) is not a factorial.  The declared factorial names are the
+        # design keys, so metadata keys can be removed unconditionally here.
+        p_map = {_k: _v for _k, _v in pilot.items()
+                 if _k not in _FACTORIAL_PILOT_META_KEYS}
+    # A direct Python caller can pass non-string keys even though JSON object
+    # keys are strings.  Refuse them explicitly instead of letting a mixed-type
+    # ``sorted()`` raise after some records have already been processed.
+    p_map_clean = {}
+    for _key, _value in p_map.items():
+        if not isinstance(_key, str):
+            out['violations'].append(
+                f'pilot factorial key {_key!r} is not a string')
+            continue
+        p_map_clean[_key] = _value
+    p_map = p_map_clean
+    extra_p = sorted(set(p_map) - set(design), key=str)
     if extra_p:
         out['warnings'].append(
-            'pilot contains factorial(s) not present in the design: ' + ', '.join(extra_p))
+            'pilot contains factorial(s) not present in the design: '
+            + ', '.join(str(x) for x in extra_p))
     for name, spec in design.items():
         rec = {'name': name, 'status': 'not_verifiable', 'n_seeds': None,
                'resolution': {}, 'power': None, 'warnings': []}
@@ -467,12 +562,13 @@ def factorial_power_audit(pilot=None, *, design=None, sesoi=None,
             rec['resolution'] = _factorial_resolution(n_for_rec, m, a)
             if not rec['resolution']['resolution_ok']:
                 rec['status'] = 'resolution_limited'
+                _need = rec['resolution']['min_n_for_alpha']
+                _need_txt = (f'at least {_need} seeds' if _need is not None
+                             else 'more seeds than the 10,000-seed cap')
                 rec['warnings'].append(
                     f'n={n_for_rec} with m={m} has minimum Holm p '
                     f'{rec["resolution"]["min_attainable_p_holm"]:.6g} > '
-                    f'alpha={a}; this factorial family needs at least '
-                    f'{rec["resolution"]["min_n_for_alpha"]} seeds')
-                out['resolution_limited'].append(name)
+                    f'alpha={a}; this factorial family needs {_need_txt}')
             if n_for_rec < min_n:
                 rec['warnings'].append(
                     f'n={n_for_rec} is below min_n={min_n}')
@@ -505,21 +601,36 @@ def factorial_power_audit(pilot=None, *, design=None, sesoi=None,
                     f'the policy default {rel}% is reported as a design aid, '
                     'not as a declared margin')
             rec['relative_pct_source'] = rel_source
+            spec_req_sesoi = p_spec.get('require_sesoi_power', req_sesoi)
+            spec_req_attr = p_spec.get('require_attrition_power', req_attr)
+            if spec_req_sesoi and rel_source == 'policy_default':
+                out['violations'].append(
+                    f'{name}: require_sesoi_power=true but no pre-registered '
+                    'SESOI is declared; the policy default is only a design aid')
             sign = p_spec.get('expected_sign')
             if sign is None:
                 h = INTERACTION_HYPOTHESIS_DESIGN.get(name)
                 sign = h.get('predicted_sign') if isinstance(h, dict) else None
             pw = factorial_interaction_power(
-                p_spec['cells'], n_seeds=(n_for_rec if isinstance(n_for_rec, int) else None),
+                p_spec['cells'],
+                n_seeds=(n_for_rec if isinstance(n_for_rec, int) else None),
                 m_family=m, alpha=a, target_power=tp, relative_pct=rel,
                 expected_sign=sign,
-                require_sesoi_power=bool(
-                    p_spec.get('require_sesoi_power', require_sesoi_power)),
-                min_n=min_n, n_max=n_max, pair_retention=pair_retention,
-                require_attrition_power=bool(
-                    p_spec.get('require_attrition_power', require_attrition_power)))
+                # Per-factorial flags are passed through unchanged: the
+                # single-factorial API validates their type fail-closed
+                # instead of coercing a string such as "no" to true.
+                require_sesoi_power=spec_req_sesoi,
+                min_n=min_n, n_max=n_max, pair_retention=retention,
+                require_attrition_power=spec_req_attr)
             rec['power'] = pw
-            rec['n_seeds'] = pw.get('n_seeds', rec['n_seeds'])
+            _pw_n = pw.get('n_seeds')
+            if (isinstance(planned, int) and isinstance(_pw_n, int)
+                    and int(planned) != int(_pw_n)):
+                _msg = (f'{name}: planned n_seeds={planned} != pilot cell '
+                        f'n={_pw_n}')
+                if _msg not in out['violations']:
+                    out['violations'].append(_msg)
+            rec['n_seeds'] = _pw_n if isinstance(_pw_n, int) else rec['n_seeds']
             rec['resolution'] = pw.get('resolution', rec['resolution'])
             rec['status'] = pw.get('status', 'not_verifiable')
             rec['warnings'].extend(pw.get('warnings') or [])
@@ -535,7 +646,19 @@ def factorial_power_audit(pilot=None, *, design=None, sesoi=None,
             elif rec['status'] == 'not_verifiable':
                 out['not_measured'].append(name)
         else:
-            if rec['resolution']:
+            if req_sesoi:
+                out['violations'].append(
+                    f'{name}: require_sesoi_power=true but no pilot cells are '
+                    'available to compute SESOI power')
+            if req_attr:
+                out['violations'].append(
+                    f'{name}: require_attrition_power=true but no pilot cells '
+                    'are available to compute attrition power')
+            if rec['status'] == 'resolution_limited':
+                # A resolution-limited panel has no power curve to measure;
+                # do not also report it as merely "power_not_measured".
+                out['resolution_limited'].append(name)
+            elif rec['resolution']:
                 rec['status'] = 'power_not_measured'
                 rec['warnings'].append(
                     'the panel is resolution-capable but no pilot cells are '
@@ -579,4 +702,5 @@ def factorial_power_audit(pilot=None, *, design=None, sesoi=None,
             'non-significant result from such a panel cannot distinguish '
             'additivity from an undetected interaction of the declared SESOI')
     out['warnings'] = list(dict.fromkeys(out['warnings']))
+    out['violations'] = list(dict.fromkeys(out['violations']))
     return out

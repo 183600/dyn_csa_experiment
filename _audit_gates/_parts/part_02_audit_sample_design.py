@@ -1380,11 +1380,17 @@ def audit_interaction_power(pilot_path=None, n_seeds=None, m_family=None,
                 pilot = json.load(f)
         except Exception as exc:
             pilot_error = f'{pp} is not readable JSON ({type(exc).__name__}: {exc})'
+    if pilot is not None and not isinstance(pilot, dict):
+        pilot_error = pilot_error or (
+            f'{pp} is not a JSON object ({type(pilot).__name__}); a pilot '
+            'artifact must be a mapping')
     rep = L.factorial_power_audit(
         pilot, n_seeds=n_seeds, m_family=m_family,
         require_power=require_power)
     rep['pilot_path'] = pp
-    rep['pilot_available'] = pilot is not None
+    # "Available" means a usable object artifact, not merely a file that
+    # parsed to a scalar/list.
+    rep['pilot_available'] = isinstance(pilot, dict)
     if pilot_error:
         rep['pilot_error'] = pilot_error
         rep.setdefault('warnings', []).append(
