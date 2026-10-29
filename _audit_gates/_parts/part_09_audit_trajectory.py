@@ -116,12 +116,38 @@ def audit_trajectory(path=None):
             return False
         status = tr.get('status')
         if status in ('invalid', 'insufficient_history'):
+            # "Explicitly unavailable" is a valid state, but it must not be a
+            # hiding place for a replayable series or a convention that says
+            # the grid actually met the minimum.  A caller can always delete
+            # the block (reported as not_verifiable); it cannot keep the
+            # numbers and relabel the status.
+            series_top = tr.get('series')
+            if isinstance(series_top, list) and series_top:
+                problems.append(f'{label}: status is {status!r} but a non-empty '
+                                'series is stored; the trajectory is replayable '
+                                'and must carry its measured status')
+                return False
+            if status == 'insufficient_history':
+                _policy_top = (tr.get('policy')
+                               if isinstance(tr.get('policy'), dict) else {})
+                _min_steps = _count(_policy_top.get('min_shared_steps'), minimum=2)
+                _n_shared = _count(tr.get('n_shared_steps'), minimum=0)
+                if (_min_steps is not None and _n_shared is not None
+                        and _n_shared >= _min_steps):
+                    problems.append(f'{label}: status is insufficient_history '
+                                    f'but n_shared_steps={_n_shared} meets '
+                                    f'policy.min_shared_steps={_min_steps}')
+                    return False
             return True  # explicitly unavailable; nothing numeric to replay
         policy = tr.get('policy') if isinstance(tr.get('policy'), dict) else {}
         tail_points = _count(policy.get('tail_points'), minimum=2)
         if tail_points is None:
             problems.append(f'{label}: policy.tail_points is not an integer >= 2')
             return False
+        _stored_tail = _count(tr.get('tail_points'), minimum=2)
+        if _stored_tail is not None and _stored_tail != tail_points:
+            problems.append(f'{label}: tail_points is {_stored_tail}, but '
+                            f'policy.tail_points is {tail_points}')
         zero = _finite(policy.get('zero_tol_log'))
         if zero is None or zero < 0.0:
             problems.append(f'{label}: policy.zero_tol_log is not a finite '

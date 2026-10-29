@@ -142,8 +142,12 @@ def _joint_deltas_fingerprint(names, matrix, seeds):
     h = hashlib.sha256()
     h.update(b'maxt-signflip-v1\0')
     h.update((','.join(str(int(s)) for s in seeds) + '\0').encode('ascii'))
+    # A dict lookup keeps this linear in m.  `names.index(name)` made the
+    # fingerprint quadratic in the family size, which is exactly the axis a
+    # larger ablation panel grows along.
+    name_index = {name: i for i, name in enumerate(names)}
     for name in sorted(names):
-        idx = names.index(name)
+        idx = name_index[name]
         h.update(name.encode('utf-8'))
         h.update(b'\0')
         for x in matrix[idx]:
@@ -341,6 +345,10 @@ def maxt_signflip_adjust(named_deltas, *, alpha=0.05,
                 p_maxt[order[k]] = tied
         i = j
     critical, achieved = _joint_tail_threshold(np.sort(max_all), alpha)
+    # Rank lookup is O(1) per contrast; recomputing `np.nonzero(order == k)`
+    # inside the loop made it O(m**2) for a large ablation family.
+    rank_by_name = np.empty(m, dtype=np.int64)
+    rank_by_name[order] = np.arange(1, m + 1, dtype=np.int64)
     contrasts = {}
     for k, name in enumerate(names):
         # `sd` can exceed float64 even though the standard error (and the
@@ -352,6 +360,12 @@ def maxt_signflip_adjust(named_deltas, *, alpha=0.05,
         if _sd_out is not None:
             sem = float(_sd / math.sqrt(n))
             half = (critical * _sd / math.sqrt(n)) if critical is not None else None
+            if half is not None and not math.isfinite(half) and sem is not None:
+                # `critical * sd` can overflow even when the half-width
+                # `critical * sem` is representable (mean and half can even
+                # cancel to finite endpoints).  Reorder only on that extreme
+                # path so ordinary intervals keep their historical value.
+                half = critical * sem
         else:
             _sem = float((sd_n[k] / math.sqrt(n)) * row_scale[k])
             sem = _sem if math.isfinite(_sem) else None
@@ -369,7 +383,7 @@ def maxt_signflip_adjust(named_deltas, *, alpha=0.05,
             'p_maxt_single': float(single_p[k]),
             'p_maxt': float(p_maxt[k]),
             't_stat': float(t[k]),
-            'rank': int(np.nonzero(order == k)[0][0]) + 1,
+            'rank': int(rank_by_name[k]),
             'reject_maxt': bool(p_maxt[k] <= alpha),
             'mean': float(mean[k]),
             'sd': _sd_out,

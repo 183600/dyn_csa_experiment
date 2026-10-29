@@ -66,7 +66,7 @@ def _traj_step_int(value):
 
 def _traj_history(raw, *, seed, label):
     """Parse one ``[(step, ppl), ...]`` history into a sorted step->PPL map."""
-    if raw is None or raw == []:
+    if raw is None:
         return {}
     if isinstance(raw, (str, bytes, bytearray)) or isinstance(raw, dict):
         raise ValueError(f'{label} history for seed {seed} must be a list of '
@@ -87,6 +87,12 @@ def _traj_history(raw, *, seed, label):
         if isinstance(point[1], (bool, np.bool_)):
             raise ValueError(f'{label} history for seed {seed} row #{i} has a '
                              'boolean PPL')
+        if isinstance(point[1], (str, bytes, bytearray)):
+            # A numeric-looking string is still a serialisation artefact, not
+            # a measurement; the rest of the statistics layer rejects strings
+            # through `_finite_scalar`, and the step parser above does too.
+            raise ValueError(f'{label} history for seed {seed} row #{i} has a '
+                             'non-numeric PPL')
         try:
             ppl = float(point[1])
         except (TypeError, ValueError, OverflowError):
@@ -201,6 +207,16 @@ def paired_trajectory_stability(history_a, history_b, *, seeds=None,
             raise ValueError(f'endpoint_step must be a non-negative integer or '
                              f'None, got {endpoint_step!r}')
 
+    # Record the EFFECTIVE policy, not only the module defaults.  The audit
+    # gate replays the stored series with `policy.tail_points` /
+    # `policy.zero_tol_log`; leaving the defaults here made every caller that
+    # legitimately overrode tail_points or zero_tol look like a tampered
+    # artifact (and mis-stated the convention in the report).
+    _policy = dict(TRAJECTORY_POLICY)
+    _policy['tail_points'] = int(_tail)
+    _policy['min_shared_steps'] = int(_min_steps)
+    _policy['zero_tol_log'] = float(_zero)
+
     def _normalise(mapping, label):
         out = {}
         for key, value in mapping.items():
@@ -247,7 +263,7 @@ def paired_trajectory_stability(history_a, history_b, *, seeds=None,
 
     out = {
         'kind': 'paired_trajectory_stability',
-        'policy': dict(TRAJECTORY_POLICY),
+        'policy': _policy,
         'status': 'insufficient_history',
         'seeds': included,
         'skipped_seeds': skipped,

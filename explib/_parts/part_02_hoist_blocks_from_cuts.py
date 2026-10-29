@@ -822,6 +822,14 @@ def causal_window_mask_f(T, window, device, dtype):
         base = causal_mask(T, device)
         if base.dtype == dtype:
             return base
+        # The bool donor passed the 1-byte cap, but the additive copy needs
+        # `dtype`'s element size.  At the cap boundary a float copy was
+        # 2-4x the advertised limit; refuse before allocating it.
+        if not _dense_mask_fits(T, torch.empty((), dtype=dtype).element_size()):
+            raise RuntimeError(
+                f'refusing to materialise a full [{int(T)}, {int(T)}] {dtype} '
+                f'mask (> {int(_DENSE_MASK_ROW_CAP_BYTES)} bytes); use the '
+                'row-chunked mask path')
         m = _cache_get(_MASK_CACHE, key)
         if m is None:
             with torch.inference_mode(False):
@@ -931,6 +939,13 @@ def _window_attn_local(q, k, v, window, scale):
     return _window_attn_local_impl(q, k, v, window, scale)
 
 def _tri_full(n, device, k):
+    # `window_band` reaches this helper directly; without the cap check a long
+    # sequence could materialise an unbounded [n, n] float table even though
+    # every other full-mask entry point refuses above the row cap.
+    if not _dense_mask_fits(n, 4):
+        raise RuntimeError(
+            f'refusing to materialise a full [{int(n)}, {int(n)}] float mask '
+            f'(> {int(_DENSE_MASK_ROW_CAP_BYTES)} bytes); use the row-chunked mask path')
     with torch.inference_mode(False):
         m = torch.empty((n, n), device=device)
         m.fill_(float('-inf'))

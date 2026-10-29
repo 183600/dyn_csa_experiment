@@ -290,11 +290,14 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
             # Rescaling a finite within-scale SD/SE back to input units can
             # exceed float64 (opposite-signed extreme effects).  Keep the
             # internal work-scale values for the pooling arithmetic, but the
-            # report fields are unavailable rather than infinite.
+            # report fields are unavailable rather than infinite.  n=1 has no
+            # within-scale SE at all; None keeps the returned record
+            # strict-JSON safe instead of leaking NaN.
             row.update({'mean': _finite_or_none(m),
                         'std': _finite_or_none(sd),
                         'se': _finite_or_none(se),
-                        '_mean_work': m_work, '_se_work': se_work,
+                        '_mean_work': _finite_or_none(m_work),
+                        '_se_work': _finite_or_none(se_work),
                         '_work_scale': (max(abs(float(x)) for x in d_work)
                                         if n else 0.0),
                         'underpowered': n < int(min_seeds)})
@@ -309,7 +312,11 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
                 row['ci'] = None
         else:
             row.update({'mean': None, 'std': None, 'se': None,
-                        '_mean_work': float('nan'), '_se_work': float('nan'),
+                        # These are internal work-scale slots, but they are
+                        # part of the returned per-point record.  NaN here
+                        # would make `json.dumps(report, allow_nan=False)`
+                        # fail for a declared-but-empty tier.
+                        '_mean_work': None, '_se_work': None,
                         'underpowered': True, 'ci': None})
         per.append(row)
     # A scale point with identical effects across seeds has zero within-scale
@@ -418,7 +425,10 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
     mu_fe = float((w * y).sum() / sw)
     q = float((w * (y - mu_fe) ** 2).sum())
     df = len(usable) - 1
-    p_q = chi2_sf(q, df) if df > 0 else float('nan')
+    # A single usable scale has no residual heterogeneity df.  `chi2_sf`
+    # legitimately returns NaN there, but NaN is not a JSON value and "no
+    # heterogeneity test exists" is better represented as unavailable.
+    p_q = chi2_sf(q, df) if df > 0 else None
     i2 = float(max(0.0, (q - df) / q) * 100.0) if (df > 0 and q > 0) else 0.0
     c = float(sw - (w ** 2).sum() / sw)
     tau2_work = float(max(0.0, (q - df) / c)) if (df > 0 and c > 0) else 0.0
@@ -593,6 +603,22 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
         lo, hi = _finite_out(pair[0]), _finite_out(pair[1])
         return [lo, hi] if lo is not None and hi is not None else None
 
+    def _finite_tree(value):
+        """Recursively replace non-finite floats with None (strict JSON)."""
+        if isinstance(value, dict):
+            return {k: _finite_tree(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [_finite_tree(v) for v in value]
+        if isinstance(value, tuple):
+            return [_finite_tree(v) for v in value]
+        if isinstance(value, (bool, np.bool_)):
+            return bool(value)
+        if isinstance(value, (float, np.floating)):
+            return _finite_out(value)
+        if isinstance(value, np.integer):
+            return int(value)
+        return value
+
     # The paired common-effect block is a paired_effect_stats report.  Its
     # mean/CI can be non-finite for opposite-signed extreme per-seed means;
     # an unavailable estimate is None, not an infinite JSON value.
@@ -609,6 +635,7 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
             _paired_common['ci95_low'], _paired_common['ci95_high'] = _pc_ci
         _pc_pi = _finite_ci(_paired_common.get('prediction_interval_95'))
         _paired_common['prediction_interval_95'] = _pc_pi
+    _paired_common = _finite_tree(_paired_common)
 
     _tc_fe = _t_critical(1.0 - float(alpha), max(1, df))
     _fe_ci = _finite_ci([mu_fe_out - _tc_fe * se_fe_out,
@@ -865,17 +892,31 @@ def effect_modification(effects_by_condition, *, reference=None, condition_value
         kept.append(seed_labels[i])
     n = len(kept)
 
+    def _cell_num(st, key):
+        # `paired_effect_stats` withholds an unrepresentable SD/SE and uses
+        # NaN for an undefined p/CI.  `float(None)` crashed the whole
+        # interaction report on an extreme (but finite) panel; report an
+        # unavailable number as None so the artifact stays strict-JSON safe.
+        value = st.get(key)
+        if value is None:
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return number if math.isfinite(number) else None
+
     def _cell(st):
         return {
             'n': int(st.get('n') or 0),
-            'mean': float(st.get('mean', float('nan'))),
-            'std': float(st.get('std', float('nan'))),
+            'mean': _cell_num(st, 'mean'),
+            'std': _cell_num(st, 'std'),
             'std_defined': st.get('std_defined'),
-            'ci95_low': float(st.get('ci95_low', float('nan'))),
-            'ci95_high': float(st.get('ci95_high', float('nan'))),
-            'cohens_dz': float(st.get('cohens_dz', float('nan'))),
-            'p_exact_signflip': float(st.get('p_exact_signflip', float('nan'))),
-            'p_floor': float(st.get('p_floor', float('nan'))),
+            'ci95_low': _cell_num(st, 'ci95_low'),
+            'ci95_high': _cell_num(st, 'ci95_high'),
+            'cohens_dz': _cell_num(st, 'cohens_dz'),
+            'p_exact_signflip': _cell_num(st, 'p_exact_signflip'),
+            'p_floor': _cell_num(st, 'p_floor'),
             'underpowered': bool(st.get('underpowered')),
             'resolution_limited': bool(st.get('resolution_limited')),
             'within_seed_noise': bool(st.get('within_seed_noise')),
@@ -899,7 +940,7 @@ def effect_modification(effects_by_condition, *, reference=None, condition_value
         st = paired_effect_stats(diff, alpha=alpha, min_n=min_n, seeds=kept)
         cell = _cell(st)
         m = cell['mean']
-        if math.isfinite(m) and -700.0 < m < 700.0:
+        if m is not None and math.isfinite(m) and -700.0 < m < 700.0:
             cell['ratio'] = float(math.exp(m))
             cell['percent_change'] = float(100.0 * (math.exp(m) - 1.0))
         else:
@@ -920,8 +961,9 @@ def effect_modification(effects_by_condition, *, reference=None, condition_value
     # else in this repo an omitted/invalid member stays at p=1.0 so the family
     # cannot shrink and relax the correction.
     if interactions:
-        _fam = [(lab, (float(c['p_exact_signflip'])
-                       if math.isfinite(float(c['p_exact_signflip'])) else 1.0))
+        _fam = [(lab,
+                 (float(c['p_exact_signflip'])
+                  if c.get('p_exact_signflip') is not None else 1.0))
                 for lab, c in interactions.items()]
         h = holm_adjust(_fam, alpha=alpha)
         for lab, c in interactions.items():
