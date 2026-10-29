@@ -5806,3 +5806,98 @@ python -m pytest -q test_review_part_16.py
 `608 passed, 3 skipped`；`python
 audit_gates.py report` 正常写出，`content_controls` / `single_factor` 均为
 `ok`，冻结计划预检不受影响。
+
+## 80. 均值置信区间不是「下一个种子」的预测区间：前瞻性复制读数（本轮结果分析硬化）
+
+### 80.1 问题：把 CI for the mean 读成 CI for a new seed
+
+当前所有种子级对比都报告 `paired_effect_stats.ci95_low/high`。这是**均值**
+的置信区间：
+
+```
+mean ± t(0.95, n-1) * sd / sqrt(n)
+```
+
+它回答的是「这个面板的均值估得有多准」，不是「再训一个种子，它的效应可
+能落在哪里」。在 n=3–6 的预算下两者差一个因子 `sqrt(n+1)`：n=3 时预测
+区间约是均值 CI 的 2 倍宽，n=6 时约 2.65 倍。把前者当成后者，会把
+「均值方向在 3–6 个种子上可分辨」误读成「下一个种子大概率复现同样大小/
+方向」，这正是小样本结果分析中最常见的过度外推之一。
+
+现有的 `seed_driven` / LOO 稳定性是**回顾性**的：它问「删掉一个已经观察到
+的种子，均值会不会翻向」；它不回答「再抽一个新种子会怎样」。两者不能互相
+替代。
+
+### 80.2 方法：Student-t 预测分布
+
+把逐种子配对效应 `d_i` 显式建模为 `d_i ~ N(mu, sigma^2)`（iid、共同方差、
+可交换）。给定样本均值 `mean` 与样本标准差 `sd`，一个新种子的预测分布是
+
+```
+d_new | sample ~ mean + t_{n-1} * sd * sqrt(1 + 1/n)
+```
+
+因此：
+
+- 双侧 `conf` 预测区间为
+  `mean ± t(conf, n-1) * sd * sqrt(1 + 1/n)`；它必然比均值 CI 宽，且
+  宽度比恰好是 `sqrt(n+1)`（同 `conf`、同 `n` 下）。
+- 符号概率由同一个 t 位置-尺度律给出：
+  `P(d_new > 0) = P(T > -mean / (sd*sqrt(1+1/n)))`，
+  `P(d_new < 0) = 1 - P(d_new > 0)`；
+  `prob_same_sign` 是「新种子与已观察均值同向」的概率（均值恰为 0 时该
+  问题无定义，返回 `None`）。
+- 若调用方声明方向（PPL 的 `direction=-1`、准确率的 `direction=+1`），
+  同时返回 `prob_improvement`：新种子优于 0 的模型概率。方向声明不会被
+  猜测；`direction=None/0` 时该字段为 `None`。
+
+入口是 `exp_lib.new_seed_replication(deltas, conf=0.95, direction=None)`。
+它复用与 `paired_effect_stats` 相同的有限值过滤与极端量级缩放，并返回
+`n/n_input/n_dropped`，因此缺失种子的账目仍然可见。
+
+### 80.3 接线：结果里同时出现，但不改变判定
+
+- `paired_effect_stats` 新增顶层字段
+  `prediction_interval_95`、`prob_new_seed_same_sign`，以及完整的嵌套
+  `new_seed_replication`；原有 `ci95_*`、`p_exact_signflip`、`p_floor`、
+  `significant`、`seed_driven` 全部不变。
+- `reportable_claim` 把这两个字段**原样回显**，供报告措辞使用；格式错误
+  的字段被丢弃为 `None`，绝不升级成新的拒绝理由。预测区间不是显著性
+  门，也不参与 `p_holm`/Holm 族。
+- methodology audit 在均值 CI 之后打印一行
+  `predictive 95% interval for ONE new seed` 和同向概率，明确标注
+  `not a CI for the mean and not a posterior`。`step_00` 的对比记录携带
+  同样的字段，因此下游报告无需重新计算。
+
+### 80.4 边界
+
+- **这是模型预测，不是后验概率。** 它没有先验，也不是「真实效应大于 0 的
+  概率」；它是在 iid 正态、共同方差、种子可交换的显式模型下，对一个新
+  种子的频率学预测。模型不成立时（重尾、种子间方差不同、架构导致不同
+  RNG/优化轨迹）区间会过窄或过宽。
+- **它不能替代新种子/新运行。** 预测区间只把已有的 3–6 个种子外推一步；
+  它不修复选择偏差、winner's curse、跨规模/跨语料外推或已发生的测量漂移。
+- **零方差面板被拒绝。** 常数面板没有可估计的种子间散布；返回
+  `available=False` 而不是 `[mean, mean]` 的零宽「确定性」。n<2 同理。
+- **仍以种子为分析单位。** 它不把 token 当独立重复，也不替代文档级
+  cluster-robust 区间或 `paired_nll_unit_influence` 的单文档影响读数。
+- **不改变任何冻结决定。** 该读数不重算 p、不重排 Holm 族、不修改
+  `confirmation_frozen.json`、种子、α、终点或 `CODE_SEMANTICS`；它只是
+  在结果旁边多放一个更贴近「复现」问题的描述量。
+- **相关种子会使它偏乐观。** 若两个种子共享超出 `init_core_fp` 所覆盖范围
+  的状态，iid 假设变弱；应结合 `pair_reason`、`same_init_core_fp` 和
+  LOO/脆弱性读数一起解释。
+
+### 80.5 入口与验证
+
+```bash
+python -m pytest -q test_review_part_18.py
+python -m pytest -q            # 完整 CPU 套件
+```
+
+`test_review_part_18.py` 7 项覆盖：预测区间比均值 CI 宽且逐值匹配 t 公式；
+用独立的 `numpy.random.standard_t` 采样核对符号概率；1e-200–1e150 的尺度
+不变性与方向反转对称；`direction=-1/+1` 不颠倒；空/单种子/常数面板
+fail-closed 且零均值时 `prob_same_sign=None`；非法 `conf`/`direction`/
+字符串载荷拒绝；`paired_effect_stats` 与 `reportable_claim` 的字段回显及
+坏字段不被升级成门。

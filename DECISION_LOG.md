@@ -3325,3 +3325,42 @@ audit_gates.py content_controls` 与
 `python audit_gates.py single_factor` 在当前仓库均为 `ok`；
 `python audit_gates.py report` 正常写出；`python -m explib.confirmation
 plan` 的冻结计划/比较数不受影响。
+
+## 2026-10-29 — 均值置信区间之外的「下一个种子」预测读数（本轮结果分析硬化，no new runs）
+
+零 GPU 的结果分析硬化；不新增训练、不读取 test split、不修改冻结清单的
+字节/种子/端点/alpha/Holm 规则，也不改 `CODE_SEMANTICS`。
+
+**Problem.** 所有种子级对比只报告均值的 t 置信区间
+`mean ± t * sd / sqrt(n)`。它回答「均值估得多准」，但读者和报告措辞经常
+把它当成「再训一个种子会落在哪里」。n=3–6 时两者的宽度差
+`sqrt(n+1)`（n=6 约 2.65 倍）：一个在 6 个种子上可分辨的均值，仍可能让
+下一个种子有相当概率落到相反方向。现有 `seed_driven` / LOO 是删除已观察
+种子的回顾性诊断，不能替代前瞻性预测。
+
+**Fix.** 新增 `exp_lib.new_seed_replication(deltas, conf=0.95,
+direction=None)`：在显式 iid 正态、共同方差、种子可交换模型下，用
+Student-t 预测分布给出
+`mean ± t(conf, n-1) * sd * sqrt(1 + 1/n)` 的单新种子预测区间、
+`P(new > 0)` / `P(new < 0)`、与观察均值同向的 `prob_same_sign`，以及
+调用方声明方向时的 `prob_improvement`。`paired_effect_stats` 现在同时
+输出 `prediction_interval_95`、`prob_new_seed_same_sign` 和完整的
+`new_seed_replication`；`reportable_claim` 原样回显这两个告示字段但**不**
+把它们变成拒绝理由；methodology audit 在均值 CI 后打印预测区间并明确
+标注 `not a CI for the mean and not a posterior`；`step_00` 的对比记录
+携带同一组字段。零方差面板与 n<2 返回 `available=False`，不生成零宽
+「确定性」区间；非有限种子照旧丢弃并记录 `n_input/n_dropped`。
+
+**Boundary.** 这是模型预测，不是后验概率，也不是「真实效应为正的概率」；
+它不修复选择偏差、winner's curse、跨规模/跨语料外推或测量漂移，不能替代
+真正的新种子/新运行。它仍以种子为分析单位，不把 token 当独立重复；共享
+初始化之外的相关 RNG/优化状态会使 iid 预测偏乐观。该读数不重算 p、不重排
+Holm 族、不改变任何 `confirmed` 判定或冻结决定，也不改变 `CODE_SEMANTICS`。
+
+**Verification.** `python -m pytest -q` 通过 `621 passed, 3 skipped`（新增
+`test_review_part_18.py` 7 项：预测区间比均值 CI 宽且逐值匹配 t 公式；
+独立 `numpy.random.standard_t` 采样核对符号概率；1e-200–1e150 尺度不变性
+与方向反转对称；`direction=-1/+1` 不颠倒；空/单种子/常数面板 fail-closed
+且零均值时同向概率为 `None`；非法 `conf`/`direction`/字符串载荷拒绝；
+`paired_effect_stats`/`reportable_claim` 回显与坏字段不被升级成门）。
+`python -m explib.confirmation plan` 的冻结计划/比较数不受影响。

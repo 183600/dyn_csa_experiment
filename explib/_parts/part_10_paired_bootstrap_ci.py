@@ -108,6 +108,162 @@ def wilcoxon_signed_rank_p(deltas):
     return {'p': float(p), 'method': 'normal', 'n_nonzero': n, 'w_plus': w_plus, 'w_min': w,
             'note': f'normal approximation; exact DP is used for n<={_WILCOXON_EXACT_MAX_N}'}
 
+_NEW_SEED_ASSUMPTION = (
+    'exchangeable iid normal seed effects with a common mean and variance; '
+    'the Student-t predictive law is a model-based summary, not a posterior '
+    'probability, not a guarantee for a new architecture/seed, and not a '
+    'substitute for running that seed'
+)
+
+
+def new_seed_replication(deltas, *, conf=0.95, direction=None):
+    """Prospective predictive readout for ONE new training seed.
+
+    A 95% confidence interval for the mean paired effect answers "how well is
+    the mean estimated?".  It does **not** answer the replication question a
+    reader usually asks: "if we trained one more seed, how likely is it to
+    move in the same direction, and how wide is its plausible effect?"  With
+    the 3-6 seeds this project can afford, those two intervals differ sub-
+    stantially: the predictive scale is ``sd * sqrt(1 + 1/n)``, not
+    ``sd / sqrt(n)``.
+
+    Under the explicit model ``d_i ~ N(mu, sigma^2)``, the predictive
+    distribution of a new seed ``d_new`` given the sample mean and SD is
+    ``mean + t_{n-1} * sd * sqrt(1 + 1/n)``.  This function returns:
+
+      * ``prediction_interval``: the two-sided ``conf`` predictive interval
+        for one new seed (wider than the CI for the mean);
+      * ``prob_new_positive`` / ``prob_new_negative``: model-based sign
+        probabilities from the same t law;
+      * ``prob_same_sign``: probability the new seed has the observed mean's
+        sign (``None`` when the observed mean is exactly zero);
+      * ``prob_improvement``: when ``direction`` is +1 (larger is better) or
+        -1 (smaller is better), the model-based probability that a new seed
+        is better than zero.  ``direction=None`` leaves it undefined.
+
+    A zero sample SD (a degenerate, constant panel) is refused rather than
+    turned into a zero-width prediction interval: it carries no estimate of
+    the between-seed spread.  The function is deliberately descriptive: it
+    never changes a p-value, a Holm family, a frozen decision or a claim of
+    significance, and it conditions on the same paired deltas as the primary
+    seed-level test.
+    """
+    if isinstance(conf, (bool, np.bool_)):
+        raise ValueError('new_seed_replication: conf must be a probability in (0, 1)')
+    try:
+        conf = float(conf)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError('new_seed_replication: conf must be a probability in (0, 1)') from None
+    if not (0.0 < conf < 1.0):
+        raise ValueError('new_seed_replication: conf must be a probability in (0, 1)')
+    if direction is not None:
+        if isinstance(direction, (bool, np.bool_)):
+            raise ValueError('new_seed_replication: direction must be -1, 0, +1 or None')
+        _dir = _as_seed_int(direction)
+        if _dir not in (-1, 0, 1):
+            raise ValueError(f'new_seed_replication: direction must be -1, 0, +1 or None, got {direction!r}')
+        direction = None if _dir == 0 else _dir
+    if isinstance(deltas, (str, bytes, bytearray)):
+        raise ValueError('new_seed_replication: deltas must be an iterable of numbers, not a string')
+    try:
+        raw = list(deltas if deltas is not None else [])
+    except TypeError:
+        raise ValueError('new_seed_replication: deltas must be an iterable') from None
+    vals, dropped = [], []
+    for i, x in enumerate(raw):
+        f = _finite_scalar(x)
+        if f is None:
+            dropped.append(i)
+        else:
+            vals.append(f)
+    d = np.asarray(vals, dtype=float)
+    n = int(d.size)
+    out = {
+        'kind': 'new_seed_replication',
+        'available': False,
+        'n': n,
+        'n_input': len(raw),
+        'n_dropped': len(dropped),
+        'dropped_positions': dropped,
+        'conf': float(conf),
+        'direction': direction,
+        'df': (n - 1) if n > 0 else None,
+        'mean': None,
+        'std': None,
+        'prediction_scale': None,
+        'prediction_interval': None,
+        'prob_new_positive': None,
+        'prob_new_negative': None,
+        'prob_same_sign': None,
+        'prob_improvement': None,
+        'method': ('Student-t predictive law for one new seed: '
+                   'mean +/- t(conf, n-1) * sd * sqrt(1 + 1/n)'),
+        'assumption': _NEW_SEED_ASSUMPTION,
+        'role': ('prospective descriptive readout; it is not used to change any '
+                 'p-value, Holm family, confirmation verdict or frozen decision'),
+        'reason': None,
+    }
+    if n < 2:
+        out['reason'] = ('a one-seed panel gives no estimate of between-seed '
+                         'spread; the predictive interval is undefined')
+        return out
+    _ms = _scaled_mean_std_if_extreme(d, ddof=1)
+    if _ms is not None:
+        mean, sd = _ms
+    else:
+        mean = float(d.mean())
+        sd = float(d.std(ddof=1))
+    out['mean'] = mean
+    out['std'] = sd
+    if not (math.isfinite(mean) and math.isfinite(sd)):
+        out['reason'] = 'the sample mean or SD is not finite'
+        return out
+    if not (sd > 0.0):
+        # A constant panel has no measurable between-seed spread.  Emitting a
+        # zero-width interval would convert missing information into
+        # certainty, so refuse the predictive readout instead.
+        out['reason'] = ('the sample SD is zero; a constant panel carries no '
+                         'between-seed spread estimate for a new seed')
+        return out
+    df = n - 1
+    scale = sd * math.sqrt(1.0 + 1.0 / n)
+    if not (math.isfinite(scale) and scale > 0.0):
+        out['reason'] = 'the predictive scale is not a finite positive number'
+        return out
+    tc = _t_critical(conf, float(df))
+    if not math.isfinite(tc):
+        out['reason'] = 'the t critical value is not finite for this n/conf'
+        return out
+    half = tc * scale
+    lo, hi = mean - half, mean + half
+    if not (math.isfinite(lo) and math.isfinite(hi)):
+        out['reason'] = 'the predictive interval exceeds the representable float range'
+        return out
+    # Same t law as the interval: P(d_new > 0) = P(T > -mean/scale).
+    p_pos = _student_t_sf(-mean / scale, float(df))
+    if not math.isfinite(p_pos):
+        out['reason'] = 'the predictive sign probability is not finite'
+        return out
+    p_pos = float(min(1.0, max(0.0, p_pos)))
+    p_neg = float(1.0 - p_pos)
+    p_same = None if mean == 0.0 else float(max(p_pos, p_neg))
+    prob_improvement = None
+    if direction == 1:
+        prob_improvement = p_pos
+    elif direction == -1:
+        prob_improvement = p_neg
+    out.update({
+        'available': True,
+        'prediction_scale': float(scale),
+        'prediction_interval': [float(lo), float(hi)],
+        'prob_new_positive': p_pos,
+        'prob_new_negative': p_neg,
+        'prob_same_sign': p_same,
+        'prob_improvement': prob_improvement,
+    })
+    return out
+
+
 def paired_effect_stats(deltas, alpha=0.05, min_n=3, with_values=None, without_values=None,
                         seeds=None):
     """Paired contrast summary with an explicit effect-vs-seed-noise verdict.
@@ -188,7 +344,7 @@ def paired_effect_stats(deltas, alpha=0.05, min_n=3, with_values=None, without_v
                     'complete_pairs': bool(n_dropped == 0),
                     'seeds': seed_labels}
     if n == 0:
-        return {'n': 0, 'mean': float('nan'), 'std': float('nan'), 'std_defined': False, 'sem': float('nan'), 'cohens_dz': float('nan'), 'ci95_low': float('nan'), 'ci95_high': float('nan'), 'loo_means': [], 'seed_driven': None, 'seed_robust': None, 'p_exact_signflip': float('nan'), 'p_floor': float('nan'), 'min_reachable_p': float('nan'), 'underpowered': True, 'resolution_limited': True, 'within_seed_noise': True, 'significant': False, 'effect_vs_noise': 'no data', 'unit': 'seed', 'assumption': 'none (no data)', 'sign_counts': {'positive': 0, 'negative': 0, 'zero': 0}, 'p_wilcoxon': None, 'p_wilcoxon_method': None, 'ci95_paired_bootstrap': None, 'ci95_unpaired_bootstrap': None, **_pair_fields}
+        return {'n': 0, 'mean': float('nan'), 'std': float('nan'), 'std_defined': False, 'sem': float('nan'), 'cohens_dz': float('nan'), 'ci95_low': float('nan'), 'ci95_high': float('nan'), 'loo_means': [], 'seed_driven': None, 'seed_robust': None, 'p_exact_signflip': float('nan'), 'p_floor': float('nan'), 'min_reachable_p': float('nan'), 'underpowered': True, 'resolution_limited': True, 'within_seed_noise': True, 'significant': False, 'effect_vs_noise': 'no data', 'unit': 'seed', 'assumption': 'none (no data)', 'sign_counts': {'positive': 0, 'negative': 0, 'zero': 0}, 'p_wilcoxon': None, 'p_wilcoxon_method': None, 'ci95_paired_bootstrap': None, 'ci95_unpaired_bootstrap': None, 'prediction_interval_95': None, 'prob_new_seed_same_sign': None, 'new_seed_replication': new_seed_replication(d), **_pair_fields}
     # A single seed has no sample spread.  Keep the historical numeric 0.0 for
     # backward-compatible consumers, but mark it explicitly so a report cannot
     # quote it as a measured zero-variance result.
@@ -277,11 +433,19 @@ def paired_effect_stats(deltas, alpha=0.05, min_n=3, with_values=None, without_v
     _assumption = ('exact sign-flip is valid as a sign test under symmetric paired differences; '
                    'same seed does NOT randomise the arm, and architecture-induced RNG/optimisation '
                    'differences are part of the arm. p is SEED-level, never token-level.')
+    # Prospective replication readout: a CI for the MEAN is not a prediction
+    # for the next seed.  Keep the predictive interval/sign probability next
+    # to the confirmatory statistics, but never gate a verdict on them (that
+    # would turn a model-based extrapolation into a new decision rule).
+    _pred = new_seed_replication(d)
     return {'n': n, 'mean': mean, 'std': std, 'std_defined': std_defined, 'sem': sem, 'cohens_dz': dz, 'ci95_low': ci_lo, 'ci95_high': ci_hi, 'loo_means': loo_means, 'seed_driven': seed_driven, 'seed_robust': seed_robust, 'p_exact_signflip': float(p), 'p_floor': p_floor, 'min_reachable_p': p_floor, 'underpowered': underpowered, 'resolution_limited': resolution_limited, 'within_seed_noise': within_seed_noise, 'significant': significant, 'effect_vs_noise': verdict,
             'unit': 'seed', 'assumption': _assumption, 'sign_counts': _sign,
             'n_nonzero': n_nonzero,
             'p_wilcoxon': _wil.get('p'), 'p_wilcoxon_method': _wil.get('method'),
             'ci95_paired_bootstrap': _paired_ci, 'ci95_unpaired_bootstrap': _unpaired_ci,
+            'prediction_interval_95': _pred.get('prediction_interval'),
+            'prob_new_seed_same_sign': _pred.get('prob_same_sign'),
+            'new_seed_replication': _pred,
             **_pair_fields}
 
 ANALYSIS_CHOICE_POLICY = {

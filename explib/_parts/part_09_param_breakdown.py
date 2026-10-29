@@ -730,7 +730,8 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
     out = {'allowed': False, 'level': 'unverifiable', 'reasons': [],
            'n': None, 'p_raw': None, 'p_holm': None, 'p_floor': None,
            'min_attainable_p_holm_family': None, 'min_n': _min_n,
-           'alpha': alpha}
+           'alpha': alpha, 'prediction_interval_95': None,
+           'prob_new_seed_same_sign': None}
     if _min_n is None or _min_n < 1:
         out['reasons'].append(
             f'min_n={min_n!r} is not a positive integer; the n floor is unverifiable')
@@ -914,6 +915,18 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
             out['min_attainable_p_holm_family'] = _fl
             if _fl is not None and math.isfinite(_fl) and _fl > alpha:
                 out['reasons'].append(f'family of m={_fam_n} at n={n} has minimum attainable Holm p {_fl:.4g} > alpha')
+    # Echo the prospective replication readout so a report can print the
+    # predictive interval beside the significance verdict.  It is advisory:
+    # a low sign probability never rewrites a p-value or the frozen verdict,
+    # and a malformed field is dropped rather than converted into a gate.
+    _pi = stats.get('prediction_interval_95')
+    if isinstance(_pi, (list, tuple)) and len(_pi) == 2:
+        _lo_pi, _hi_pi = _finite_scalar(_pi[0]), _finite_scalar(_pi[1])
+        if (_lo_pi is not None and _hi_pi is not None and _lo_pi <= _hi_pi):
+            out['prediction_interval_95'] = [float(_lo_pi), float(_hi_pi)]
+    _ps = _finite_scalar(stats.get('prob_new_seed_same_sign'))
+    if _ps is not None and 0.0 <= _ps <= 1.0:
+        out['prob_new_seed_same_sign'] = float(_ps)
     out['allowed'] = not out['reasons']
     if out['allowed']:
         out['level'] = 'confirmatory' if str(evidence_level).lower() == 'confirmatory' else 'exploratory_significant'

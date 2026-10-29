@@ -98,6 +98,17 @@ def _print_methodology_audit(report):
                     _lo, _hi, '; SEED-DRIVEN (dropping one seed flips the sign)' if e.get('seed_driven') else ''))
             elif e.get('seed_driven'):
                 print('        SEED-DRIVEN: dropping one seed flips the sign of the mean')
+            _pi = e.get('prediction_interval_95')
+            _ps = e.get('prob_new_seed_same_sign')
+            if (isinstance(_pi, (list, tuple)) and len(_pi) == 2
+                    and all(isinstance(v, (int, float)) and math.isfinite(v)
+                            for v in _pi)):
+                _tail = ''
+                if isinstance(_ps, (int, float)) and math.isfinite(float(_ps)):
+                    _tail = ('; P(new seed has the observed sign)=%.3f' % float(_ps))
+                print('        predictive 95%% interval for ONE new seed: [%+.4f, %+.4f]%s '
+                      '(model-based; not a CI for the mean and not a posterior)'
+                      % (float(_pi[0]), float(_pi[1]), _tail))
             _rb = e.get('paired_row_bootstrap_delta') or {}
             if _rb.get('status') == 'ok' and _rb.get('ci95_delta_ppl'):
                 print('        evaluation-row bootstrap 95%% CI for Δ: [%+.4f, %+.4f] (%d rows; row uncertainty only)' % (
