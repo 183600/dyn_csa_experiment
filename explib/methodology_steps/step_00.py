@@ -109,6 +109,20 @@ def _attach_look_analysis(st, key, final_seeds, final_deltas):
         if si is None:
             raise ValueError('final look seeds must be integers')
         cur[si] = float(d)
+    # One common scale for every delta in this contrast's history, including
+    # the current look.  Delta units are arbitrary; comparing or deduplicating
+    # with absolute constants would make a tiny (or huge) panel either
+    # invisible to the stale check or spuriously stale.
+    _look_scale_values = list(cur.values())
+    for _lk0 in _look_series.get(key) or []:
+        if isinstance(_lk0, dict):
+            _raw0 = _lk0.get('deltas')
+            if _raw0 is not None and not isinstance(_raw0, (str, bytes, bytearray)):
+                try:
+                    _look_scale_values.extend(_raw0)
+                except TypeError:
+                    pass
+    _look_scale = _look_values_scale(_look_scale_values)
     series, stale = ([], [])
     seen = set()
     for lk in _look_series.get(key) or []:
@@ -127,17 +141,19 @@ def _attach_look_analysis(st, key, final_seeds, final_deltas):
         seeds = [s for s, _d in _rows]
         deltas = [d for _s, d in _rows]
         dm = dict(zip(seeds, deltas))
-        bad = [s for s in seeds if s in cur and abs(dm[s] - cur[s]) > 1e-09]
+        bad = [s for s in seeds
+               if s in cur and not _look_values_close(dm[s], cur[s], _look_scale)]
         if bad:
             stale.append({'look': lk.get('look'), 'reason': 'seed delta changed across looks', 'seeds': sorted(bad)})
             continue
-        sig = (tuple(seeds), tuple((round(v, 12) for v in deltas)))
+        sig = (tuple(seeds), _look_values_signature(deltas, _look_scale))
         if sig in seen:
             continue
         seen.add(sig)
         series.append({'look': lk.get('look'), 'seeds': seeds, 'deltas': deltas})
     _final_order = sorted(cur)
-    sig = (tuple(_final_order), tuple((round(cur[s], 12) for s in _final_order)))
+    sig = (tuple(_final_order),
+           _look_values_signature([cur[s] for s in _final_order], _look_scale))
     if sig not in seen:
         series.append({'look': series[-1].get('look', 0) + 1 if series else 1, 'seeds': _final_order, 'deltas': [cur[s] for s in _final_order], 'current': True})
     if not series:

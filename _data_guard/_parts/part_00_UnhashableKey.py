@@ -1224,17 +1224,28 @@ def _safe_mean(values):
 
 
 def _safe_std(values):
-    """Population std that falls back to a max-scaled computation."""
+    """Population std that avoids under/overflow at extreme magnitudes.
+
+    ``np.std`` squares the deviations.  Finite values below ``sqrt(tiny)``
+    therefore underflow the squares to zero and a genuinely variable column
+    reports ``std=0``; values above ``sqrt(max_float)`` overflow to ``inf``.
+    Compute on a max-scaled copy for either extreme, then map the unitless
+    result back.  Ordinary data keeps the direct (bit-identical) path.
+    """
     if values.size == 0:
         return 0.0
     with np.errstate(over='ignore', invalid='ignore'):
         value = float(np.std(values, ddof=0))
-    if math.isfinite(value):
-        return value
     scaled, m = _scaled_maxabs(values)
+    _extreme = (scaled is not None
+                and (m < 1e-100 or m > 1e100))
+    if math.isfinite(value) and not _extreme:
+        return value
     if scaled is None:
-        return 0.0
-    value = float(np.std(scaled, ddof=0)) * m
+        return value if math.isfinite(value) else 0.0
+    scaled_value = float(np.std(scaled, ddof=0)) * m
+    if math.isfinite(scaled_value):
+        return scaled_value
     return value if math.isfinite(value) else 0.0
 
 

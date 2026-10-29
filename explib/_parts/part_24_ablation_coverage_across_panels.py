@@ -1563,6 +1563,21 @@ def _interaction_look_analysis(look_series, key, final_seeds, final_deltas,
         pairs = sorted(zip(seeds, deltas), key=lambda t: t[0])
         return [int(s) for s, _d in pairs], [float(d) for _s, d in pairs]
 
+    # A delta's unit is arbitrary.  Compare every recorded look with the
+    # current one, and deduplicate them, at ONE scale for this contrast; an
+    # absolute 1e-9/round(...,12) rule makes a tiny panel look unchanged and a
+    # large panel spuriously stale.
+    _look_scale_values = list(cur.values())
+    for _lk0 in (look_series or {}).get(key) or []:
+        if isinstance(_lk0, dict):
+            _raw0 = _lk0.get('deltas')
+            if _raw0 is not None and not isinstance(_raw0, (str, bytes, bytearray)):
+                try:
+                    _look_scale_values.extend(_raw0)
+                except TypeError:
+                    pass
+    _look_scale = _look_values_scale(_look_scale_values)
+
     series, stale, seen = [], [], set()
     for lk in (look_series or {}).get(key) or []:
         if not isinstance(lk, dict):
@@ -1601,20 +1616,22 @@ def _interaction_look_analysis(look_series, key, final_seeds, final_deltas,
                               'seeds': sorted(bad_tags)})
                 continue
         dm = dict(zip(seeds, deltas))
-        bad = [s for s in seeds if s in cur and abs(dm[s] - cur[s]) > 1e-9]
+        bad = [s for s in seeds
+               if s in cur and not _look_values_close(dm[s], cur[s], _look_scale)]
         if bad:
             stale.append({'look': lk.get('look'),
                           'reason': 'seed delta changed across looks',
                           'seeds': sorted(bad)})
             continue
-        sig = (tuple(seeds), tuple(round(v, 12) for v in deltas))
+        sig = (tuple(seeds), _look_values_signature(deltas, _look_scale))
         if sig in seen:
             continue
         seen.add(sig)
         series.append({'look': lk.get('look'), 'seeds': seeds,
                        'deltas': deltas})
     _order = sorted(cur)
-    sig = (tuple(_order), tuple(round(cur[s], 12) for s in _order))
+    sig = (tuple(_order),
+           _look_values_signature([cur[s] for s in _order], _look_scale))
     if sig not in seen:
         series.append({
             'look': (series[-1].get('look', 0) + 1 if series else 1),

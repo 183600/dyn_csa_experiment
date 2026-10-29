@@ -100,6 +100,27 @@ class LeakageSafePreprocessor:
             return _safe_median(values)
         return 0.0
 
+    def _eps_floor(self, values):
+        """Noise floor for a fitted scale, measured in the feature's units.
+
+        ``eps`` is a *relative* guard, not an absolute one: a feature whose
+        values are all around 1e-200 is not constant merely because 1e-12
+        looks small next to it.  Using the column's largest magnitude keeps
+        ordinary data on the historical threshold (``eps * 1``) while making
+        standard/robust/minmax scaling invariant under a units-only rescaling.
+        """
+        try:
+            if values.size:
+                ref = float(np.max(np.abs(values)))
+            else:
+                ref = 0.0
+        except (TypeError, ValueError, OverflowError):
+            return float(self.eps)
+        if not (math.isfinite(ref) and ref > 0.0):
+            return float(self.eps)
+        floor = float(self.eps) * ref
+        return floor if math.isfinite(floor) and floor >= 0.0 else float(self.eps)
+
     def fit(self, X, y=None):
         """Learn imputation/clipping/scaling statistics from ``X`` (train)."""
         X = _as_numeric_2d(X)
@@ -138,20 +159,21 @@ class LeakageSafePreprocessor:
             # never recomputed from validation/test data.
             center, factor = 0.0, 1.0
             unit_scale = None
+            scale_floor = self._eps_floor(imputed)
             if self.scale == 'standard':
                 center = _safe_mean(imputed)
                 sd = _safe_std(imputed)
-                factor = sd if sd > self.eps else 1.0
+                factor = sd if sd > scale_floor else 1.0
             elif self.scale == 'robust':
                 center = _safe_median(imputed)
                 q1, q3 = _safe_quantiles(imputed, (0.25, 0.75))
                 with np.errstate(over='ignore', invalid='ignore'):
                     iqr = float(q3 - q1)
-                if math.isfinite(iqr) and iqr > self.eps:
+                if math.isfinite(iqr) and iqr > scale_floor:
                     factor = iqr
                 else:
                     sd = _safe_std(imputed)
-                    factor = sd if sd > self.eps else 1.0
+                    factor = sd if sd > scale_floor else 1.0
             elif self.scale == 'minmax':
                 center = float(np.min(imputed))
                 with np.errstate(over='ignore', invalid='ignore'):
@@ -172,10 +194,10 @@ class LeakageSafePreprocessor:
                             # x/m - min/m the range is (_smax-_smin), so a
                             # finite post-scale restores the documented [0,1].
                             unit_scale = 1.0 / (_smax - _smin)
-                factor = span if math.isfinite(span) and span > self.eps else factor
+                factor = span if math.isfinite(span) and span > scale_floor else factor
             if not np.isfinite(center):
                 center = 0.0
-            if not np.isfinite(factor) or factor <= self.eps:
+            if not np.isfinite(factor) or factor <= scale_floor:
                 factor = 1.0
             # Every persisted descriptive statistic must itself be finite:
             # from_stats() refuses a non-finite mean/std/median, so an

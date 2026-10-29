@@ -401,10 +401,17 @@ def audit_look_history(paths=None):
                             _si = None
                         if _si is not None:
                             _last_tags_n[_si] = str(_t or '')
+                # Delta units are arbitrary; a stale look must be detected by
+                # a scale-relative comparison against the current record, not
+                # by an absolute 1e-9 margin that ignores a tiny panel.
+                _look_scale = L._look_values_scale(
+                    list(cur.values())
+                    + [d for _lk in looks for d in _lk['deltas']])
                 valid, stale = [], []
                 for lk in looks:
                     _bad = [s for s, d in zip(lk['seeds'], lk['deltas'])
-                            if s in cur and abs(d - cur[s]) > 1e-9]
+                            if s in cur
+                            and not L._look_values_close(d, cur[s], _look_scale)]
                     _reason = 'seed delta changed across looks'
                     _look_cells = (lk.get('cells')
                                    if isinstance(lk.get('cells'), dict) else None)

@@ -1235,6 +1235,56 @@ def _normalise_look_series(looks, *, where='sequential_signflip_p'):
     return out
 
 
+# Look histories compare deltas from successive analyses of the same contrast.
+# A delta's unit is arbitrary (a log-PPL difference can be rescaled by any
+# positive constant), so both the stale check and the "same look" dedup
+# signature must use one common scale.  An absolute tolerance (historically
+# 1e-9) and ``round(v, 12)`` silently treat every tiny panel as unchanged and
+# collapse distinct looks to one zero signature; a large panel can conversely
+# flag a byte-identical value as stale because its last-bit differences exceed
+# the absolute margin.  These helpers normalise once per contrast instead.
+_LOOK_REL_TOL = 1e-9
+_LOOK_SIG_DECIMALS = 12
+
+
+def _look_values_scale(values):
+    """Largest finite magnitude in a look/history sequence (0 if none)."""
+    scale = 0.0
+    try:
+        iterator = iter(values)
+    except TypeError:
+        return 0.0
+    for value in iterator:
+        f = _finite_scalar(value)
+        if f is not None:
+            scale = max(scale, abs(f))
+    return scale if math.isfinite(scale) else 0.0
+
+
+def _look_values_close(a, b, scale, *, rel_tol=_LOOK_REL_TOL):
+    """Scale-relative equality for two look deltas.
+
+    ``scale`` is the common magnitude of the whole contrast history.  When it
+    is zero both values must be exactly zero (the only finite value at that
+    scale); otherwise the difference is measured in units of ``scale``.
+    """
+    fa = _finite_scalar(a)
+    fb = _finite_scalar(b)
+    if fa is None or fb is None:
+        return False
+    if scale and math.isfinite(scale):
+        return abs(fa / scale - fb / scale) <= rel_tol
+    return fa == fb
+
+
+def _look_values_signature(values, scale):
+    """Hashable identity of a look's deltas at the contrast's common scale."""
+    if scale and math.isfinite(scale):
+        return tuple(round(float(v) / scale, _LOOK_SIG_DECIMALS)
+                     for v in values)
+    return tuple(0.0 for _ in values)
+
+
 def sequential_signflip_p(looks, *, alpha=0.05):
     """Family-wise sign-flip p over multiple looks at a growing seed set.
 
