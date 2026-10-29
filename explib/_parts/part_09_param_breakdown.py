@@ -1457,7 +1457,13 @@ def _percentile_ci(vals, lo=2.5, hi=97.5):
         i = int(math.floor(pos))
         j = min(i + 1, len(v) - 1)
         return v[i] + (v[j] - v[i]) * (pos - i)
-    return [_pct(lo), _pct(hi)]
+    lo_v, hi_v = _pct(lo), _pct(hi)
+    if not (math.isfinite(lo_v) and math.isfinite(hi_v)):
+        # Interpolation between two finite but opposite-signed extremes can
+        # overflow the subtraction; that is an unrepresentable interval, not a
+        # measured bound.
+        return None
+    return [lo_v, hi_v]
 
 # Bootstrap draws are generated in row-chunks.  A fixed chunk of 256 draws
 # needs 256 * n_units index/count elements; for a scale-up evaluation panel

@@ -34,6 +34,16 @@ def unpaired_bootstrap_ci(with_values, without_values, *, n_boot=4000, seed=2026
     sd = _as_seed_int(seed)
     if nb is None or sd is None or nb < 2:
         return None
+    # The bootstrap is a mean-difference, so its unit is arbitrary.  For a
+    # finite but extreme panel, numpy's reduction can overflow while the mean
+    # (and the interval) is representable — e.g. three values at 1e308 sum to
+    # inf but their mean is 1e308.  Run both arms on one common unit scale and
+    # map the endpoints back; ordinary panels keep the historical path.
+    _scale = max(float(np.max(np.abs(a))), float(np.max(np.abs(b))))
+    _scaled = bool(math.isfinite(_scale) and _scale > 0.0
+                   and (_scale < 1e-100 or _scale > 1e100))
+    a_work = a / _scale if _scaled else a
+    b_work = b / _scale if _scaled else b
     rng = np.random.default_rng(sd)
     diff = np.empty(nb, dtype=float)
     # Each draw materialises one index table per arm, so size the chunk from
@@ -41,10 +51,19 @@ def unpaired_bootstrap_ci(with_values, without_values, *, n_boot=4000, seed=2026
     chunk = _bootstrap_draw_chunk(a.size + b.size)
     for off in range(0, nb, chunk):
         m = min(chunk, nb - off)
-        ai = rng.integers(0, a.size, size=(m, a.size))
-        bi = rng.integers(0, b.size, size=(m, b.size))
-        diff[off:off + m] = a[ai].mean(axis=1) - b[bi].mean(axis=1)
-    return _percentile_ci(diff.tolist())
+        ai = rng.integers(0, a_work.size, size=(m, a_work.size))
+        bi = rng.integers(0, b_work.size, size=(m, b_work.size))
+        diff[off:off + m] = a_work[ai].mean(axis=1) - b_work[bi].mean(axis=1)
+    ci = _percentile_ci(diff.tolist())
+    if ci is None:
+        return None
+    if _scaled:
+        ci = [ci[0] * _scale, ci[1] * _scale]
+        if not all(math.isfinite(v) for v in ci):
+            # The true endpoint exceeds the representable float range; an
+            # infinite JSON bound is not a measured interval.
+            return None
+    return ci
 
 _WILCOXON_EXACT_MAX_N = 200
 
@@ -394,6 +413,10 @@ def paired_effect_stats(deltas, alpha=0.05, min_n=3, with_values=None, without_v
         tc = _t_critical(0.95, n - 1)
         if math.isfinite(tc):
             ci_lo, ci_hi = mean - tc * sem, mean + tc * sem
+            if not (math.isfinite(ci_lo) and math.isfinite(ci_hi)):
+                # The endpoint is mathematically beyond float64; report it as
+                # unavailable (NaN) rather than an infinite interval.
+                ci_lo = ci_hi = float('nan')
     # Leave-one-seed-out stability: does any single seed own the direction?
     loo_means = []
     seed_driven = None
@@ -785,6 +808,10 @@ def paired_fragility(deltas, *, alpha=0.05, seeds=None):
         tc = _t_critical(0.95, n - 1)
         if math.isfinite(tc):
             ci_lo, ci_hi = mean - tc * sem, mean + tc * sem
+            if not (math.isfinite(ci_lo) and math.isfinite(ci_hi)):
+                # The endpoint is mathematically beyond float64; report it as
+                # unavailable (NaN) rather than an infinite interval.
+                ci_lo = ci_hi = float('nan')
     sf = exact_signflip_p(d)
     p = float(sf['p'])
     n_nonzero = int(sf.get('n_nonzero') or 0)

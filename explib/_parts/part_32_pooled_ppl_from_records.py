@@ -134,6 +134,69 @@ def _scaled_std_or_raw(values):
     return float(np.std(values, ddof=1))
 
 
+def _scaled_mean_or_raw(values):
+    """Arithmetic mean that survives extreme-but-finite PPL magnitudes.
+
+    ``np.mean`` sums the panel first, so a finite vector whose sum overflows
+    reports ``inf`` even when the mean itself is representable (e.g. three
+    seeds at ``1e308``).  Reuse the guarded mean/SD helper, which scales by the
+    largest magnitude only for an extreme panel and therefore leaves ordinary
+    panels bit-identical to the historical ``np.mean``.
+    """
+    arr = np.asarray(values, dtype=float)
+    if arr.size == 0:
+        return float(np.mean(arr))
+    _ms = _scaled_mean_std_if_extreme(arr, ddof=1)
+    if _ms is not None:
+        return float(_ms[0])
+    return float(np.mean(arr))
+
+
+def _scaled_median_or_raw(values):
+    """Median that survives extreme-but-finite magnitudes.
+
+    NumPy's even-count median computes ``(a + b) / 2``, which overflows for two
+    finite PPLs near the float limit even though the median is representable.
+    The ordinary path keeps ``np.median`` exactly (``np.percentile(..., 50)``
+    can differ in the last bit), so persisted non-extreme aggregates do not
+    change.
+    """
+    arr = np.asarray(values, dtype=float)
+    if arr.size == 0:
+        return float(np.median(arr))
+    scale = float(np.max(np.abs(arr)))
+    if (math.isfinite(scale) and scale > 0.0
+            and (scale < 1e-100 or scale > 1e100)):
+        med = float(np.median(arr / scale)) * scale
+        if math.isfinite(med):
+            return med
+    return float(np.median(arr))
+
+
+def _scaled_percentile_or_raw(values, qs):
+    """Percentiles with a scaled interpolation path for extreme magnitudes.
+
+    ``np.percentile`` interpolates as ``a + (b - a) * t``; near the float limit
+    that subtraction can overflow although every input and the requested
+    quantile are finite.  Returns the requested quantiles in input order.
+    """
+    arr = np.asarray(values, dtype=float)
+    _qs = tuple(float(q) for q in qs)
+    if arr.size == 0:
+        return tuple(float('nan') for _q in _qs)
+    scale = float(np.max(np.abs(arr)))
+    if (math.isfinite(scale) and scale > 0.0
+            and (scale < 1e-100 or scale > 1e100)):
+        with np.errstate(over='ignore', invalid='ignore'):
+            out = np.asarray(np.percentile(arr / scale, _qs), dtype=float) * scale
+        vals = tuple(float(v) for v in out.reshape(-1))
+        if all(math.isfinite(v) for v in vals):
+            return vals
+    with np.errstate(over='ignore', invalid='ignore'):
+        out = np.percentile(arr, _qs)
+    return tuple(float(v) for v in np.asarray(out, dtype=float).reshape(-1))
+
+
 def _scaled_std_or_none(values):
     """Sample SD (ddof=1) or None when fewer than two values are available."""
     try:
@@ -164,7 +227,12 @@ def _seed_t_ci(ppls, alpha=0.05):
     except Exception:
         return None
     half = tc * sd / math.sqrt(n)
-    return [mu - half, mu + half]
+    lo, hi = mu - half, mu + half
+    if not (math.isfinite(lo) and math.isfinite(hi)):
+        # A true endpoint beyond float64 is not a measured bound; the
+        # interval is unavailable rather than an infinite-width JSON null.
+        return None
+    return [lo, hi]
 
 def _primary_row_arrays(rec):
     """Per-row NLL/token arrays for the record's PRIMARY estimand.
@@ -554,7 +622,7 @@ def paired_row_bootstrap_delta(pairs, *, n_boot=1000, seed=20261018, conf=0.95):
         return out
     out['n_rows'] = int(R)
     out['n_seeds_used'] = int(_ok.sum())
-    out['mean_delta'] = float(np.mean(_pa[_ok] - _pb[_ok]))
+    out['mean_delta'] = _scaled_mean_or_raw(_pa[_ok] - _pb[_ok])
     rng = np.random.default_rng(_seed)
     vals = np.full(int(_nb), np.nan, dtype=float)
     _chunk = _bootstrap_draw_chunk(R)
@@ -727,7 +795,7 @@ def paired_nll_two_way_bootstrap(nll_a, nll_b, n_tokens, *, n_boot=2000,
         out['reason'] = ('the full-panel pooled PPL overflows the representable '
                          'float range; the paired Δ is not a finite measurement')
         return out
-    delta_ppl = float(np.mean(ea - eb))
+    delta_ppl = _scaled_mean_or_raw(ea - eb)
     delta_lr = float(np.mean(ce_a - ce_b))
     out['delta_ppl'] = delta_ppl
     out['delta_log_ratio'] = delta_lr
@@ -996,11 +1064,13 @@ def aggregate(summary):
                 else 'full_validation')
             _pooled, _nll_total, _ntok_total = _pooled_ppl_from_records(recs)
         _sorted = np.sort(ppls)
-        _med = float(np.median(_sorted))
-        _q1, _q3 = (float(np.percentile(_sorted, 25)), float(np.percentile(_sorted, 75))) if len(_sorted) >= 2 else (_med, _med)
+        _med = _scaled_median_or_raw(_sorted)
+        _q1, _q3 = (_scaled_percentile_or_raw(_sorted, (25, 75))
+                    if len(_sorted) >= 2 else (_med, _med))
+        _ppl_mean = _scaled_mean_or_raw(ppls)
         entry = {'variant': v, 'protocol': tag, 'n_seeds': len(recs),
-                 'ppl_mean': float(ppls.mean()),
-                 'ppl_mean_arithmetic': float(ppls.mean()),
+                 'ppl_mean': _ppl_mean,
+                 'ppl_mean_arithmetic': _ppl_mean,
                  'ppl_std': _scaled_std_or_raw(ppls),
                  'ppls': [float(p) for p in ppls], 'seeds': [r.get('seed') for r in recs],
                  'ppl_primary_estimand': _primary_estimand,
@@ -1013,7 +1083,8 @@ def aggregate(summary):
                  'ppl_ci95_doc_bootstrap': _doc_bootstrap_ppl_ci(recs),
                  'ppl_ci_seed_doc_combined': _combined_seed_doc_ci(recs),
                  'ppl_aggregation': ('pooled_token_nll' if _pooled is not None else 'arithmetic_seed_mean_fallback (records lack nll_sum/n_tokens)'),
-                 'ppl_primary': (float(_pooled) if _pooled is not None else float(ppls.mean()))}
+                 'ppl_primary': (float(_pooled) if _pooled is not None
+                                 else _ppl_mean)}
         _pb = next((r.get('param_breakdown') for r in recs if isinstance(r.get('param_breakdown'), dict)), None)
         if _pb:
             entry['param_breakdown'] = _pb
@@ -1215,7 +1286,7 @@ def aggregate(summary):
             print(f'[aggregate] {key}: {len(skipped)} seed(s) NOT paired with `full` — {_why}; excluded from dPPL_vs_full')
         if ds:
             d = np.array(ds, dtype=float)
-            agg[key]['dPPL_vs_full_mean'] = float(d.mean())
+            agg[key]['dPPL_vs_full_mean'] = _scaled_mean_or_raw(d)
             agg[key]['dPPL_vs_full_std'] = _scaled_std_or_raw(d)
             agg[key]['n_paired'] = len(d)
             agg[key]['n_paired_skipped'] = len(skipped)
@@ -1237,7 +1308,7 @@ def aggregate(summary):
             print(f'[aggregate] {key}: {len(skipped)} seed(s) NOT paired with `full_sw128_matched` — {_why}; excluded')
         if ds:
             d = np.array(ds, dtype=float)
-            agg[key]['dPPL_vs_sw128m_mean'] = float(d.mean())
+            agg[key]['dPPL_vs_sw128m_mean'] = _scaled_mean_or_raw(d)
             agg[key]['dPPL_vs_sw128m_std'] = _scaled_std_or_raw(d)
             agg[key]['n_paired_sw128m'] = len(d)
             agg[key]['n_paired_sw128m_skipped'] = len(skipped)
