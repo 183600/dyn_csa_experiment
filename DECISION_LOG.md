@@ -3103,3 +3103,41 @@ manifest。`requirements-ci.txt` 不再保存直接 pin，避免第二份列表�
 dependencies` 返回 `status=ok`、`contract_status=ok`、
 `interpreter_status=match`，48 个 pin 与 50 个已安装分布一致（`ruff`
 作为开发工具排除）。`python -m explib.confirmation plan` 复跑确认计划/快照未变。
+
+## 2026-10-29 — P5T 最终测试评估顺序预注册与测量时间混杂审计（no new runs）
+
+零 GPU 的设计/记录硬化；不新增训练、不读取 test split、不修改冻结清单的
+字节/种子/端点/alpha/Holm 规则，也不改 `CODE_SEMANTICS`。
+
+**Problem.** §48 已把训练面板改成 seed 分块随机顺序，但 P5T 的 clean
+by-length 与 distractor probe 仍按 arm-major 循环（先跑完一个臂的全部
+seed，再跑下一个臂）。这会让确认性终点的臂效应与测量时间/机器漂移完全
+共线，配对符号检验无法修复；评估中断后的恢复也没有落盘顺序可供复核。
+
+**Fix.** 新增 `exp_lib.build_evaluation_order_plan()`，复用
+`blocked_run_order` 的 seed 区组、块内臂随机化与位置轮换，标签采用 P5T
+事件键 `variant::s{seed}`。P5T 在 `preaccess` 锁之后、`load_wikitest`
+之前分别写下 `clean_by_length_order.json` 与
+`distractor_probe_order.json`；同清单恢复复用原计划，网格不匹配只有在
+test 尚未绑定时才允许重写，绑定后拒绝事后洗牌。
+`evaluation_cells_in_plan_order()` 要求计划与 (arm, seed) 网格完全一致。
+新增 `audit_gates.audit_evaluation_order()`：核对完整区组、位置平衡、
+计划覆盖、`created_at` 早于首条测量，以及 `experiments.jsonl` 的实际
+顺序；clean 有测量无计划或实际 arm-major 判 fail，计划无事件报不可核验，
+probe 缺计划只给 warning。该审计接入 `report` 并提供 `evaluation_order` /
+`eval_order` / `measurement_order` CLI 别名。
+
+**Boundary.** 顺序计划只控制测量时间与臂的共线，不修复已发生的漂移；
+P5T 仍串行，不改变 checkpoint、test 行、PPL、种子、终点、α/Holm 或冻结
+决定。`created_at` 与事件时间比较假设同一时钟口径，时钟回拨会 fail-closed。
+旧 P5T 结果没有预计划时会被明确标为 fail/不可核验，这是证据强度标注，
+不是追溯性修复；新的确认性轮次必须从预计划开始。
+
+**Verification.** `python test_review_fixes.py` 通过 `577/577`（0 skipped；
+新增 L213/L214/L215：计划确定性/区组/位置平衡/网格覆盖、P5T 预计划写入/
+恢复复用/pre-access 重写/post-access 拒绝、审计的计划顺序/arm-major/事后
+计划/缺计划/无事件/损坏计划）。`python -m explib.confirmation plan` 仍
+72/72 合成冻结记录、6 个比较；`python audit_gates.py single_factor` 仍
+`ok`。当前仓库没有 `results_lm_test`，所以
+`python audit_gates.py evaluation_order` 报 `not_verifiable_locally` 而不是
+绿色通过；合成测试覆盖了 ok/fail 分支。

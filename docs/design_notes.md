@@ -5321,3 +5321,100 @@ L62c 覆盖：五类声明与真实 override/arm diff 一致、dense 不是单�
 推理 override 跨臂复用时不残留上一个臂的键、错误的 factors/override 标签
 使审计 `fail`，以及记录层未验证时 fail-closed。完整 CPU 套件预期
 `565/565` 通过（0 skipped）；冻结清单、种子、端点与 `CODE_SEMANTICS` 不变。
+
+## 76. 最终测试的评估顺序也必须是预注册的完整区组
+
+### 76.1 问题
+
+§48 已经把训练面板改成按 seed 分块、块内臂顺序随机化并做位置轮换，但 P5T
+的一次性测试评估仍然沿用
+
+```python
+for v in manifest['arms']:
+    for seed in manifest['seeds']:
+        ...
+```
+
+也就是先把一个臂的全部种子测完，再测下一个臂。训练顺序的混杂并没有因为
+进入测试阶段而消失：驱动更新、机器负载、热漂移、缓存状态或同机噪声都可能
+与臂完全共线，而配对符号检验只能消掉 seed 主效应，消不掉「臂 × 测量时间」
+的混杂。更糟的是，评估中断后恢复、或显式部分评估时，没有落盘的顺序计划，
+事后无法区分「按计划恢复」与「恰好按臂跑完」。
+
+P5T 的 clean by-length 是确认性终点，distractor probe 是次要描述性终点；
+两者都需要一个在读取 test 之前写下的顺序计划，而不是从结果或事件时间反推。
+
+### 76.2 方法：测试前写下顺序，测试后只复核
+
+新增 `exp_lib.build_evaluation_order_plan(cells, task=..., seed=...)`，复用
+§48 的 `build_run_order_plan` / `blocked_run_order`：
+
+- 区组键固定为 seed；同一 seed 的所有臂连续评估；
+- 块内臂顺序由设计种子决定，并用循环基排列做位置平衡，避免某个臂总是
+  占据第一个槽位；
+- 标签使用 P5T 事件本身的键格式 `variant::s{seed}`，审计不再猜标签；
+- 设计种子优先取清单可选的 `order.seed`，否则取冻结清单 sha256 的前 16 位
+  十六进制。这样同一冻结清单的恢复运行得到完全相同的顺序，而清单在首次
+  test 访问前修订会得到新的顺序；
+- `evaluation_cells_in_plan_order()` 要求计划与当前 (arm, seed) 网格**完全**
+  一致：多一个、少一个、重复标签都拒绝，防止实际测量了一个未计划的面板。
+
+P5T 在 `preaccess` 冻结锁之后、`load_wikitest` 之前调用
+`_ensure_evaluation_order_plan()`，分别写下：
+
+- `clean_by_length_order.json`（确认性 clean by-length）；
+- `distractor_probe_order.json`（次要 probe）。
+
+同一清单恢复时复用原计划及其 `created_at`；计划与当前网格不匹配时，只有在
+test split 尚未绑定（没有 `bylen.json`，冻结锁仍是 `preaccess`）才允许重写，
+一旦已绑定就硬拒绝——看到测量后再洗牌不是预注册。smoke 仍使用带 `smoke`
+标记的独立 outdir，不进入确认性结果目录。
+
+### 76.3 审计：计划、时间戳与实际执行三者对账
+
+新增 `audit_gates.audit_evaluation_order()`：
+
+- clean 计划必须是 `evaluation_order`、task 正确、完整区组、位置平衡、
+  `cell_blocks` 与 `planned_cells` 一一对应；
+- 计划 `created_at` 不得晚于该 task 的第一条完成事件，否则视为事后补计划；
+- 从 `experiments.jsonl` 的 `kind='eval'`（clean）和 `kind='cell'`（probe）
+  重建实际开始顺序；完整实际顺序若仍是 arm-major，判 fail（计划存在但驱动
+  没执行）；
+- clean 有测量但完全没有预计划：fail-closed。legacy 结果可以保留为历史，
+  但不能据此声称确认性顺序已控制；probe 缺计划只给 warning，因为它是次要
+  描述性终点；
+- 计划存在但没有匹配事件：设计可核验、执行不可核验，报
+  `not_verifiable_locally`，不把「写了计划」冒充「按计划跑了」。
+
+该审计接入 `audit_gates.py report` 的 `evaluation_order` 块，并提供
+`evaluation_order` / `eval_order` / `measurement_order` 三个 CLI 别名。
+
+### 76.4 边界
+
+- 顺序计划控制的是**测量时间与臂的共线**，不是所有测量噪声；它不能修复
+  已经发生的漂移，只能让漂移与臂不再系统共线，并让执行是否遵守计划可审计。
+- P5T 仍是串行评估；本改动不引入并行调度，也不改变每个 cell 的
+  checkpoint、test 行、PPL、种子、终点、α/Holm 或冻结决定。
+- `created_at` 与事件 `started_at` 的比较假设同一台机器、同一时钟口径；
+  时钟回拨会触发 fail-closed，需要人工检查，而不是静默接受。
+- clean 与 probe 分开计划、分开审计；probe 的 arm-major 仍是该端点的设计
+  失败，但不会把 clean 的确认性判定降级为「未确认」。
+- 旧 P5T 结果若没有顺序计划，审计会明确报 fail/不可核验；这是对历史证据
+  强度的诚实标注，不是对已发生测量的追溯性修复。新的确认性轮次必须从
+  预计划开始。
+
+### 76.5 入口与验证
+
+```bash
+python audit_gates.py evaluation_order   # 或 eval_order / measurement_order
+python audit_gates.py report             # 含 evaluation_order 块
+python -m explib.confirmation plan       # 冻结计划预检不变
+python test_review_fixes.py              # 新增 L213/L214/L215
+```
+
+L213 覆盖计划的确定性、seed 区组、位置平衡、网格完全覆盖与非法 task/seed；
+L214 覆盖 P5T 预计划写入、同清单恢复复用、pre-access 重写、post-access
+拒绝重洗与非对象计划 fail-closed；L215 覆盖计划顺序通过、arm-major fail、
+事后计划 fail、clean 无计划 fail、计划无事件不可核验与损坏计划 fail。
+完整 CPU 套件 `577/577` 通过（0 skipped）；冻结清单、种子、端点、
+`CODE_SEMANTICS` 与既有统计机器不变。

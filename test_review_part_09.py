@@ -1642,6 +1642,200 @@ def test_run_order_audit_detects_temporal_confounding():
         assert rep['panels'][os.path.basename(d)]['status'] == 'fail'
 
 
+def test_evaluation_order_plan_is_seed_blocked_and_covers_grid():
+    # P5T used to evaluate every seed of arm A before arm B.  The final-test
+    # order must be precommitted with the same complete-block/position-balance
+    # contract as training, and it must cover the frozen (arm, seed) grid
+    # exactly.
+    variants = ['a', 'b', 'c', 'd']
+    seeds = [0, 1, 2, 3]
+    cells = [(v, s) for s in seeds for v in variants]
+    plan = L.build_evaluation_order_plan(
+        cells, task='clean_by_length', seed=9,
+        created_at='2026-01-01T00:00:00')
+    assert plan['kind'] == 'evaluation_order'
+    assert plan['schema'] == L.EVALUATION_ORDER_SCHEMA
+    assert plan['task'] == 'clean_by_length'
+    assert len(plan['planned_cells']) == len(cells)
+    assert all(lab.endswith(tuple(f'::s{s}' for s in seeds))
+               for lab in plan['planned_cells'])
+    # Every seed block is contiguous and contains every arm exactly once.
+    blocks = []
+    for lab in plan['planned_cells']:
+        v, s = lab.rsplit('::s', 1)
+        if not blocks or blocks[-1][0] != s:
+            blocks.append((s, []))
+        blocks[-1][1].append(v)
+    assert [s for s, _vs in blocks] == [str(s) for s in seeds]
+    for _s, vs in blocks:
+        assert sorted(vs) == sorted(variants), vs
+    # Position balance: every arm visits every within-block slot once.
+    for v in variants:
+        slots = [vs.index(v) for _s, vs in blocks]
+        assert sorted(slots) == list(range(len(seeds))), (v, slots)
+    assert plan['planned_cells'] == L.build_evaluation_order_plan(
+        cells, task='clean_by_length', seed=9,
+        created_at='2026-01-01T00:00:00')['planned_cells']
+    assert plan['planned_cells'] != L.build_evaluation_order_plan(
+        cells, task='clean_by_length', seed=10,
+        created_at='2026-01-01T00:00:00')['planned_cells']
+    ordered = L.evaluation_cells_in_plan_order(cells, plan)
+    assert [f'{v}::s{s}' for v, s in ordered] == plan['planned_cells']
+    runs = 1 + sum(a[0] != b[0] for a, b in zip(ordered, ordered[1:]))
+    assert runs > len(variants), ordered
+    for bad in (cells[:-1], cells + [('e', 0)]):
+        try:
+            L.evaluation_cells_in_plan_order(bad, plan)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('an evaluation plan with a different grid was accepted')
+    for bad_task in ('', '   ', None):
+        try:
+            L.build_evaluation_order_plan(cells, task=bad_task, seed=9)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'bad evaluation task accepted: {bad_task!r}')
+    try:
+        L.build_evaluation_order_plan([('a', True)], task='x', seed=9)
+    except TypeError:
+        pass
+    else:
+        raise AssertionError('a boolean evaluation seed must be rejected')
+
+
+def test_finaltest_evaluation_order_plan_is_precommitted_and_resume_stable():
+    man = {'arms': ['a', 'b', 'c', 'd'], 'seeds': [0, 1, 2, 3],
+           'manifest_sha256': 'ab' * 32}
+    with tempfile.TemporaryDirectory() as d:
+        p1 = V12._ensure_evaluation_order_plan(d, man, 'clean_by_length')
+        path = os.path.join(d, 'clean_by_length_order.json')
+        assert os.path.exists(path)
+        with open(path, encoding='utf-8') as f:
+            assert json.load(f)['planned_cells'] == p1['planned_cells']
+        # Resume under the same manifest reuses the original plan/timestamp.
+        p2 = V12._ensure_evaluation_order_plan(d, man, 'clean_by_length')
+        assert p2['created_at'] == p1['created_at']
+        assert p2['planned_cells'] == p1['planned_cells']
+        # Before the test split is bound, a revised manifest may be planned.
+        man2 = dict(man, arms=['a', 'b', 'c', 'd', 'e'])
+        p3 = V12._ensure_evaluation_order_plan(d, man2, 'clean_by_length')
+        assert set(p3['variants']) == set(man2['arms'])
+        with open(os.path.join(d, '.freeze_lock.json'), 'w', encoding='utf-8') as f:
+            json.dump({'stage': 'preaccess'}, f)
+        man3 = dict(man, seeds=[0, 1, 2, 3, 4])
+        p4 = V12._ensure_evaluation_order_plan(d, man3, 'clean_by_length')
+        assert p4['seeds'] == [str(s) for s in man3['seeds']]
+        # Once the one-shot slice is bound, a mismatching plan is a hard
+        # refusal: reshuffling after measurement is not a precommitment.
+        with open(os.path.join(d, '.freeze_lock.json'), 'w', encoding='utf-8') as f:
+            json.dump({'stage': 'accessed', 'test_ids_fp': 'deadbeef'}, f)
+        try:
+            V12._ensure_evaluation_order_plan(d, man, 'clean_by_length')
+        except SystemExit as e:
+            assert 'refusing to reshuffle' in str(e), str(e)
+        else:
+            raise AssertionError('a post-access plan mismatch was accepted')
+        # A missing plan after access cannot be reconstructed post hoc either.
+        os.remove(path)
+        try:
+            V12._ensure_evaluation_order_plan(d, man3, 'clean_by_length')
+        except SystemExit as e:
+            assert 'plan' in str(e) and 'missing' in str(e), str(e)
+        else:
+            raise AssertionError('a post-access missing plan was recreated')
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, 'clean_by_length_order.json'), 'w', encoding='utf-8') as f:
+            f.write('[]')
+        try:
+            V12._ensure_evaluation_order_plan(d, man, 'clean_by_length')
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError('a non-object evaluation plan was accepted')
+
+
+def test_evaluation_order_audit_detects_measurement_time_confounding():
+    # The zero-GPU audit must (a) accept a plan executed in blocked order,
+    # (b) fail arm-major execution, (c) fail a plan written after measurement,
+    # (d) fail a clean measurement with no precommitted plan, and (e) mark a
+    # plan without matching events as not verifiable.
+    variants = ['a', 'b', 'c', 'd']
+    seeds = [0, 1, 2, 3]
+    cells = [(v, s) for s in seeds for v in variants]
+    plan = L.build_evaluation_order_plan(
+        cells, task='clean_by_length', seed=3,
+        created_at='2026-01-01T00:00:00')
+    probe = L.build_evaluation_order_plan(
+        cells, task='distractor_probe', seed=4,
+        created_at='2026-01-01T00:00:00')
+
+    def _write_plan(d, name, obj):
+        with open(os.path.join(d, name), 'w', encoding='utf-8') as f:
+            json.dump(obj, f)
+
+    def _write_events(d, kind, order, prefix, append=False):
+        mode = 'a' if append else 'w'
+        with open(os.path.join(d, 'experiments.jsonl'), mode, encoding='utf-8') as f:
+            for i, lab in enumerate(order):
+                v, s = lab.rsplit('::s', 1)
+                f.write(json.dumps({'kind': kind, 'status': 'ok', 'variant': v,
+                                    'seed': int(s),
+                                    'started_at': f'{prefix}:{i:02d}'}) + '\n')
+
+    with tempfile.TemporaryDirectory() as d:
+        name = os.path.basename(d)
+        _write_plan(d, 'clean_by_length_order.json', plan)
+        _write_events(d, 'eval', plan['planned_cells'], '2026-01-02T00:00')
+        rep = A.audit_evaluation_order([d])
+        clean = rep['panels'][name]['tasks']['clean_by_length']
+        assert rep['status'] == 'ok' and clean['status'] == 'ok', rep
+        assert clean['actual']['complete'] is True
+        assert clean['arm_major'] is False
+        # Probe plan is optional, but when present it is audited with the
+        # probe's own event kind and label convention.
+        _write_plan(d, 'distractor_probe_order.json', probe)
+        _write_events(d, 'cell', probe['planned_cells'], '2026-01-02T01:00',
+                      append=True)
+        rep = A.audit_evaluation_order([d])
+        assert rep['panels'][name]['tasks']['distractor_probe']['status'] == 'ok'
+        assert rep['panels'][name]['status'] == 'ok', rep
+        # A completed arm-major clean run is a hard failure.
+        arm_major = [f'{v}::s{s}' for v in variants for s in seeds]
+        _write_events(d, 'eval', arm_major, '2026-01-02T02:00')
+        rep = A.audit_evaluation_order([d])
+        clean = rep['panels'][name]['tasks']['clean_by_length']
+        assert rep['status'] == 'fail' and clean['arm_major'] is True, rep
+        # A plan timestamped after the first measurement is not a precommitment.
+        late = dict(plan, created_at='2026-01-03T00:00:00')
+        _write_plan(d, 'clean_by_length_order.json', late)
+        _write_events(d, 'eval', plan['planned_cells'], '2026-01-02T03:00')
+        rep = A.audit_evaluation_order([d])
+        assert rep['status'] == 'fail'
+        assert any('not recorded before measurement' in p
+                   for p in rep['panels'][name]['problems'])
+        # Clean measurements without a plan fail closed; the probe's optional
+        # missing plan is only a warning.
+        os.remove(os.path.join(d, 'clean_by_length_order.json'))
+        os.remove(os.path.join(d, 'distractor_probe_order.json'))
+        rep = A.audit_evaluation_order([d])
+        clean = rep['panels'][name]['tasks']['clean_by_length']
+        assert rep['status'] == 'fail' and clean['status'] == 'fail', rep
+        assert any('no precommitted evaluation-order plan' in p
+                   for p in clean['problems'])
+        # Plan present but no matching events: design verified, execution not.
+        _write_plan(d, 'clean_by_length_order.json', plan)
+        os.remove(os.path.join(d, 'experiments.jsonl'))
+        rep = A.audit_evaluation_order([d])
+        assert rep['status'] == 'not_verifiable_locally'
+        assert rep['panels'][name]['tasks']['clean_by_length']['status'] == 'not_verifiable_locally'
+        # A malformed plan file fails closed.
+        _write_plan(d, 'clean_by_length_order.json', [])
+        rep = A.audit_evaluation_order([d])
+        assert rep['status'] == 'fail'
+
+
 def test_target_encoder_groups_keep_duplicate_rows_together():
     # Same feature row in two different groups must not be split into
     # different folds: the twin's label would encode this row's target.

@@ -699,16 +699,23 @@ def _read_experiment_events(outdir):
     return events
 
 
-def _actual_run_order(events):
-    """Cell start order from the append-only event log (completed cells only)."""
+def _actual_run_order(events, *, kind='cell', label_fmt='{v}::seed{s}'):
+    """Cell start order from the append-only event log (completed cells only).
+
+    ``label_fmt`` must match the label convention of the plan being audited:
+    training uses ``variant::seed{seed}``, while P5T evaluation/probe events use
+    ``variant::s{seed}``.  Deriving the label from the event's variant/seed
+    (rather than trusting an arbitrary ``key`` field) keeps a corrupted event
+    from inventing a planned cell.
+    """
     cells = []
     for e in events:
-        if (e.get('kind') != 'cell' or e.get('status') != 'ok'
+        if (e.get('kind') != kind or e.get('status') != 'ok'
                 or e.get('variant') is None or e.get('seed') is None):
             continue
         try:
-            label = f"{e['variant']}::seed{int(e['seed'])}"
-        except (TypeError, ValueError, OverflowError):
+            label = label_fmt.format(v=e['variant'], s=int(e['seed']))
+        except (TypeError, ValueError, OverflowError, KeyError):
             continue
         cells.append((str(e.get('started_at') or ''), label))
     # A retrained/resumed cell legitimately appears more than once; its LAST
@@ -848,6 +855,180 @@ def audit_run_order(paths=None):
             print(f"  [run-order] {_n}: {_r.get('status')} "
                   f"(blocks={_r.get('n_blocks')}, complete={_r.get('complete_blocks')}, "
                   f"arm_major={_r.get('arm_major')})")
+    return out
+
+
+def audit_evaluation_order(paths=None):
+    """Final-test evaluation-order / measurement-time audit (zero GPU).
+
+    Training is blocked by seed (``run_order.json``), but the one-shot P5T
+    evaluation used to iterate arms outside seeds: every seed of arm A, then
+    every seed of arm B.  That makes arm and measurement time perfectly
+    confounded for the confirmatory endpoint too (a driver update, thermal
+    drift or noisy neighbour can masquerade as an arm effect).  P5T now writes
+    ``clean_by_length_order.json`` and ``distractor_probe_order.json`` before
+    reading the test split.  This audit verifies:
+
+      * the plan is a complete-block, position-balanced design;
+      * the plan covers every planned cell exactly once;
+      * the plan was created no later than the first matching measurement;
+      * the executed order honours the plan (a completed arm-major run fails);
+      * a clean P5T measurement with no precommitted plan fails closed; the
+        secondary probe without a plan is reported as not-verifiable with a
+        warning instead.
+
+    It is descriptive and never changes a PPL, seed, endpoint or decision rule.
+    """
+    L = _import_exp_lib()
+    if paths is None:
+        paths = [os.path.join(REPO, d) for d in _iter_result_dirs()]
+    elif isinstance(paths, (str, os.PathLike)):
+        paths = [paths]
+    out = {'kind': 'evaluation_order_audit', 'status': 'ok', 'panels': {},
+           'n_ok': 0, 'n_fail': 0, 'n_not_verifiable': 0,
+           'problems': [], 'warnings': [],
+           'note': ('the clean P5T evaluation must be seed-blocked and '
+                    'position-balanced; arm-major execution is a measurement-'
+                    'time confound, not a null result')}
+    tasks = (
+        ('clean_by_length', 'clean_by_length_order.json', 'eval', True),
+        ('distractor_probe', 'distractor_probe_order.json', 'cell', False),
+    )
+    for d in paths:
+        d = os.fspath(d)
+        if not os.path.isdir(d):
+            continue
+        name = os.path.basename(os.path.normpath(d))
+        if 'smoke' in name.lower():
+            continue
+        events = _read_experiment_events(d)
+        # Only audit directories that actually carry P5T artifacts or clean
+        # evaluation events; training panels have kind='cell' events too, but
+        # no evaluation plan/records and no kind='eval' events.
+        _p5t_marker = any(os.path.exists(os.path.join(d, f)) for f in (
+            'bylen.json', 'distractor.json', 'clean_by_length_order.json',
+            'distractor_probe_order.json', '.freeze_lock.json'))
+        _eval_event = any(e.get('kind') == 'eval' for e in events)
+        if not (_p5t_marker or _eval_event):
+            continue
+        panel = {'status': 'ok', 'tasks': {}, 'problems': [], 'warnings': []}
+        clean_status = None
+        for task, fname, kind, required in tasks:
+            plan_path = os.path.join(d, fname)
+            plan_exists = os.path.exists(plan_path)
+            plan = _load(plan_path) if plan_exists else None
+            actual = _actual_run_order(events, kind=kind,
+                                       label_fmt='{v}::s{s}')
+            rec = {'task': task, 'plan_present': plan_exists, 'kind': kind,
+                   'n_observed': len(actual), 'status': 'ok',
+                   'problems': [], 'warnings': []}
+            _measured = bool(actual) or (
+                required and os.path.exists(os.path.join(d, 'bylen.json')))
+            if plan_exists and plan is None:
+                rec['status'] = 'fail'
+                rec['problems'].append(
+                    f'{fname} exists but is not a readable JSON object; the '
+                    'recorded design cannot be verified')
+            elif plan is None:
+                if required and _measured:
+                    rec['status'] = 'fail'
+                    rec['problems'].append(
+                        f'{task}: {max(1, len(actual))} measurement(s) exist '
+                        'but no precommitted evaluation-order plan was found; '
+                        'the measurement-time order is confounded/unverifiable')
+                else:
+                    rec['status'] = 'not_verifiable_locally'
+                    if actual:
+                        rec['warnings'].append(
+                            f'{task}: no precommitted plan; the observed order '
+                            'is classified but the design is not claimed')
+            else:
+                if plan.get('kind') != 'evaluation_order':
+                    rec['problems'].append(
+                        f'plan.kind={plan.get("kind")!r}, expected '
+                        "'evaluation_order'")
+                if plan.get('task') != task:
+                    rec['problems'].append(
+                        f'plan.task={plan.get("task")!r}, expected {task!r}')
+                planned = plan.get('planned_cells')
+                cell_blocks = plan.get('cell_blocks')
+                if not isinstance(planned, list) or not planned:
+                    rec['problems'].append(
+                        'plan.planned_cells must be a non-empty list')
+                elif len(set(map(str, planned))) != len(planned):
+                    rec['problems'].append(
+                        'plan.planned_cells contains duplicate labels')
+                if not isinstance(cell_blocks, dict) or not cell_blocks:
+                    rec['problems'].append(
+                        'plan.cell_blocks must be a non-empty object')
+                elif isinstance(planned, list) and set(map(str, planned)) != set(map(str, cell_blocks)):
+                    rec['problems'].append(
+                        'plan.cell_blocks keys do not match planned_cells')
+                rec2 = L.run_order_balance(plan, actual)
+                for k in ('n_blocks', 'n_cells', 'n_variants',
+                          'complete_blocks', 'arm_major', 'position_balanced',
+                          'design_ok', 'actual'):
+                    if k in rec2:
+                        rec[k] = rec2[k]
+                rec['problems'].extend(rec2.get('problems') or [])
+                rec['warnings'].extend(rec2.get('warnings') or [])
+                # A plan written after the first measurement is not a
+                # precommitment, even if its permutation happens to match.
+                _starts = [str(e.get('started_at') or '') for e in events
+                           if e.get('kind') == kind and e.get('status') == 'ok'
+                           and e.get('started_at')]
+                _created = str(plan.get('created_at') or '')
+                if _starts and _created and _created > min(_starts):
+                    rec['problems'].append(
+                        f'plan.created_at={_created!r} is later than the first '
+                        f'{task} measurement ({min(_starts)!r}); the order was '
+                        'not recorded before measurement')
+                if not _created:
+                    rec['warnings'].append('plan has no created_at timestamp')
+                if not actual and not rec['problems']:
+                    rec['status'] = 'not_verifiable_locally'
+                    rec['warnings'].append(
+                        'the plan exists but no completed measurement event '
+                        'matches it; the design is verified, the execution is not')
+                elif rec['problems']:
+                    rec['status'] = 'fail'
+            if rec['status'] == 'ok':
+                out['n_ok'] += 1
+            elif rec['status'] == 'fail':
+                out['n_fail'] += 1
+            else:
+                out['n_not_verifiable'] += 1
+            if task == 'clean_by_length':
+                clean_status = rec['status']
+            panel['tasks'][task] = rec
+            panel['problems'].extend(rec['problems'])
+            panel['warnings'].extend(rec['warnings'])
+        if clean_status == 'fail' or any(
+                r['status'] == 'fail' for r in panel['tasks'].values()):
+            panel['status'] = 'fail'
+        elif clean_status == 'ok':
+            panel['status'] = 'ok'
+        else:
+            panel['status'] = 'not_verifiable_locally'
+        out['problems'].extend(f'{name}: {p}' for p in panel['problems'])
+        out['warnings'].extend(f'{name}: {w}' for w in panel['warnings'])
+        out['panels'][name] = panel
+    _statuses = [r.get('status') for r in out['panels'].values()]
+    if any(s == 'fail' for s in _statuses):
+        out['status'] = 'fail'
+    elif any(s == 'ok' for s in _statuses):
+        out['status'] = 'ok'
+    else:
+        out['status'] = 'not_verifiable_locally'
+    print(json.dumps({k: v for k, v in out.items() if k != 'panels'},
+                     ensure_ascii=False, indent=2)[:4000])
+    for _n, _r in out['panels'].items():
+        _clean = (_r.get('tasks') or {}).get('clean_by_length') or {}
+        print(f"  [eval-order] {_n}: {_r.get('status')} "
+              f"(clean={_clean.get('status')}, "
+              f"blocks={_clean.get('n_blocks')}, "
+              f"complete={_clean.get('complete_blocks')}, "
+              f"arm_major={_clean.get('arm_major')})")
     return out
 
 

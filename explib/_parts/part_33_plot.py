@@ -205,6 +205,7 @@ def _run_fp(cfg, d, n_layers, n_heads, d_head, vocab, train_ids, val_batch, devi
 
 RUN_ORDER_SCHEMA = 1
 RUN_ORDER_DESIGNS = ('randomized_complete_block_balanced', 'inferred_no_plan')
+EVALUATION_ORDER_SCHEMA = 1
 
 
 def _run_order_u64(*parts):
@@ -394,6 +395,84 @@ def build_run_order_plan(cells, *, block_key, seed=0, block_name='seed',
         'cell_blocks': cell_blocks,
         'cell_variants': cell_variants,
     }
+
+
+def _evaluation_cell_label(cell):
+    if not isinstance(cell, (tuple, list)) or len(cell) < 2:
+        raise TypeError(
+            'evaluation-order cells must be (variant, seed) pairs, got '
+            f'{cell!r}')
+    s = cell[1]
+    if isinstance(s, bool) or not isinstance(s, numbers.Integral):
+        raise TypeError(f'evaluation-order seed must be an integer, got {s!r}')
+    return f'{cell[0]}::s{int(s)}'
+
+
+def build_evaluation_order_plan(cells, *, task, seed=0, created_at=None):
+    """Build the precommitted execution order for one final-test task.
+
+    The final-test panel has the same temporal-confounding hazard as training:
+    evaluating every seed of arm A before arm B makes arm and measurement time
+    perfectly confounded.  This wraps the training run-order design (seed
+    blocks, randomized within-block arm order, cyclic position balance) and
+    labels cells with the P5T event key ``variant::s{seed}`` so the audit can
+    compare the plan with `experiments.jsonl` without guessing.
+
+    The plan is metadata only: it never changes a checkpoint, a test row, a
+    PPL, or the frozen comparison.  ``task`` names the endpoint family (for
+    P5T: ``clean_by_length`` or ``distractor_probe``) so the clean confirmatory
+    evaluation and the secondary probe are audited separately.
+    """
+    if not isinstance(task, str) or not task.strip():
+        raise ValueError('an evaluation-order plan needs a non-empty task name')
+
+    def _block_key(cell):
+        if not isinstance(cell, (tuple, list)) or len(cell) < 2:
+            raise TypeError(
+                'evaluation-order cells must be (variant, seed) pairs, got '
+                f'{cell!r}')
+        s = cell[1]
+        if isinstance(s, bool) or not isinstance(s, numbers.Integral):
+            raise TypeError(
+                f'evaluation-order seed must be an integer, got {s!r}')
+        return int(s)
+
+    plan = build_run_order_plan(
+        cells, block_key=_block_key, seed=seed, block_name='seed',
+        label=_evaluation_cell_label, created_at=created_at)
+    plan['kind'] = 'evaluation_order'
+    plan['schema'] = EVALUATION_ORDER_SCHEMA
+    plan['task'] = task.strip()
+    return plan
+
+
+def evaluation_cells_in_plan_order(cells, plan):
+    """Return ``cells`` in the exact order recorded by an evaluation plan.
+
+    A plan that does not cover the current (arm, seed) grid exactly is
+    rejected: silently evaluating an unplanned cell, or skipping a planned
+    one, would make the recorded order describe a different measurement panel.
+    """
+    if not isinstance(plan, dict):
+        raise ValueError('evaluation plan must be an object')
+    labels = plan.get('planned_cells')
+    if not isinstance(labels, list) or not labels:
+        raise ValueError('evaluation plan has no planned_cells list')
+    by_label = {}
+    for cell in cells:
+        lab = _evaluation_cell_label(cell)
+        if lab in by_label:
+            raise ValueError(f'duplicate evaluation cell {lab!r}')
+        by_label[lab] = (cell[0], int(cell[1]))
+    planned = [str(x) for x in labels]
+    planned_set = set(planned)
+    missing = [x for x in by_label if x not in planned_set]
+    extra = [x for x in planned if x not in by_label]
+    if missing or extra or len(planned) != len(by_label):
+        raise ValueError(
+            'evaluation plan does not cover the current cell grid exactly '
+            f'(missing={missing[:5]}, extra={extra[:5]})')
+    return [by_label[x] for x in planned]
 
 
 def run_order_balance(plan, actual_order=None):

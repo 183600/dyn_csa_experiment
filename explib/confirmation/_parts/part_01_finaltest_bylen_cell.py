@@ -344,6 +344,114 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test',
     del d
     return out
 
+
+def _evaluation_order_design_seed(manifest):
+    """Deterministic design seed for the P5T evaluation-order plan.
+
+    A manifest-declared ``order.seed`` wins; otherwise the first 16 hex digits
+    of the frozen manifest hash are used.  Tying the permutation to the frozen
+    plan means a pre-access manifest revision changes the order, while a
+    resumed run under the same manifest reuses exactly the same plan.
+    """
+    order = manifest.get('order') if isinstance(manifest.get('order'), dict) else {}
+    raw = order.get('seed') if isinstance(order, dict) else None
+    if isinstance(raw, numbers.Integral) and not isinstance(raw, bool):
+        return int(raw)
+    sha = manifest.get('manifest_sha256')
+    if isinstance(sha, str) and len(sha) >= 16:
+        try:
+            return int(sha[:16], 16)
+        except ValueError:
+            pass
+    return 0
+
+
+def _test_access_consumed(outdir):
+    """True once the one-shot test slice has been bound (or cannot be checked)."""
+    if os.path.exists(os.path.join(outdir, 'bylen.json')):
+        return True
+    lp = _freeze_lock_path(outdir)
+    if not os.path.exists(lp):
+        return False
+    try:
+        with open(lp, encoding='utf-8') as f:
+            lock = json.load(f)
+    except Exception:
+        return True
+    if not isinstance(lock, dict):
+        return True
+    return bool(str(lock.get('stage') or '') == 'accessed'
+                or lock.get('test_ids_fp') is not None)
+
+
+def _ensure_evaluation_order_plan(outdir, manifest, task):
+    """Write (or verify) the evaluation-order plan BEFORE the test read.
+
+    The plan is derived only from the frozen (arm, seed) grid.  If a matching
+    plan already exists it is reused byte-for-byte, so a resumed run keeps the
+    original permutation and timestamp.  A mismatch is rewritten only while
+    the test split is still unbound; after the first access it is a hard
+    refusal, because reshuffling after seeing measurements would make the
+    recorded order describe a different experiment.
+    """
+    cells = [(str(v), int(s)) for v in manifest['arms'] for s in manifest['seeds']]
+    want = L.build_evaluation_order_plan(
+        cells, task=task, seed=_evaluation_order_design_seed(manifest))
+    path = os.path.join(outdir, f'{task}_order.json')
+    stable = ('kind', 'schema', 'task', 'variants', 'seeds', 'blocks',
+              'planned_cells', 'cell_blocks', 'cell_variants')
+    if not os.path.exists(path) and _test_access_consumed(outdir):
+        raise SystemExit(
+            f'[v12] REFUSE: the one-shot test split is already bound but the '
+            f'{task} evaluation-order plan {path} is missing — a plan written '
+            'after measurement cannot establish that the order was '
+            'precommitted; archive this results directory for a new round')
+    if os.path.exists(path):
+        try:
+            with open(path, encoding='utf-8') as f:
+                existing = json.load(f)
+        except Exception as e:
+            raise SystemExit(
+                f'[v12] REFUSE: evaluation-order plan {path} exists but cannot '
+                f'be parsed ({type(e).__name__}: {e}) — delete it only if you '
+                'can prove no test-split measurement was written under it')
+        if not isinstance(existing, dict):
+            raise SystemExit(
+                f'[v12] REFUSE: evaluation-order plan {path} is a '
+                f'{type(existing).__name__}, not a JSON object')
+        _same = (all(existing.get(k) == want.get(k) for k in stable)
+                 and (existing.get('design') or {}).get('design_seed')
+                 == want['design']['design_seed'])
+        if not _same:
+            if _test_access_consumed(outdir):
+                raise SystemExit(
+                    f'[v12] REFUSE: existing evaluation-order plan {path} does '
+                    'not match the frozen (arm, seed) grid or design seed, and '
+                    'the one-shot test split is already bound — refusing to '
+                    'reshuffle after measurement; archive this results '
+                    'directory for a genuinely new round')
+            L.atomic_write_json(path, want, indent=2)
+            return want
+        _bal = L.run_order_balance(existing)
+        if _bal.get('status') == 'fail':
+            raise SystemExit(
+                f'[v12] REFUSE: evaluation-order plan {path} is not a valid '
+                f'complete-block design: {_bal.get("problems")[:3]}')
+        return existing
+    L.atomic_write_json(path, want, indent=2)
+    return want
+
+
+def _ordered_evaluation_cells(cells, plan, *, task):
+    try:
+        return L.evaluation_cells_in_plan_order(cells, plan)
+    except Exception as e:
+        raise SystemExit(
+            f'[v12] REFUSE: {task} evaluation-order plan does not cover the '
+            f'frozen cell grid ({type(e).__name__}: {e}) — refusing to '
+            'measure an unplanned or incomplete panel')
+
+
 def run_finaltest(cfg=None, guard=None):
     """Evaluate the FROZEN confirmation set on the held-out test split.
 
@@ -450,6 +558,13 @@ def run_finaltest(cfg=None, guard=None):
     # manifest mismatch is discovered before the one-shot access is used.
     _check_or_write_freeze_lock(outdir, manifest, None, stage='preaccess',
                                 train_fp=_want_train_fp)
+    # Precommit the measurement order BEFORE load_wikitest.  The order is
+    # derived only from the frozen (arm, seed) grid, so writing it cannot leak
+    # test information; it keeps a resume or a machine-drift episode from
+    # silently reverting to arm-major evaluation.  The probe has its own plan
+    # because it is a separate task (and a separate event kind).
+    _clean_plan = _ensure_evaluation_order_plan(outdir, manifest, 'clean_by_length')
+    _probe_plan = _ensure_evaluation_order_plan(outdir, manifest, 'distractor_probe')
     _frozen_vocab = _frozen_vocab_size(manifest, cfg)
     test_doc_ids = None
     test_article_ids = None
@@ -561,17 +676,19 @@ def run_finaltest(cfg=None, guard=None):
     _split_label = 'smoke' if _smoke else 'test'
     _ft_env_once = L.environment_snapshot()
     _cell_status = {}
-    for v in manifest['arms']:
-        for seed in manifest['seeds']:
-            _cell = _finaltest_bylen_cell(
-                cfg, manifest, v, seed, test_ids,
-                split=_split_label, train_fp=_want_train_fp,
-                frozen_vocab=_frozen_vocab,
-                env=_ft_env_once,
-                test_doc_ids=test_doc_ids,
-                test_article_ids=test_article_ids,
-                article_diag=article_diag)
-            _cell_status[f'{v}::s{seed}'] = (_cell or {}).get('status')
+    _clean_cells = [(str(v), int(s)) for v in manifest['arms']
+                    for s in manifest['seeds']]
+    for v, seed in _ordered_evaluation_cells(
+            _clean_cells, _clean_plan, task='clean_by_length'):
+        _cell = _finaltest_bylen_cell(
+            cfg, manifest, v, seed, test_ids,
+            split=_split_label, train_fp=_want_train_fp,
+            frozen_vocab=_frozen_vocab,
+            env=_ft_env_once,
+            test_doc_ids=test_doc_ids,
+            test_article_ids=test_article_ids,
+            article_diag=article_diag)
+        _cell_status[f'{v}::s{seed}'] = (_cell or {}).get('status')
     # 2) frozen uniform-corruption probe on the SAME test rows (secondary,
     #    descriptive-only per the manifest)
     _probe_eval = (manifest.get('eval') or {}).get('distractor_probe') or {}
@@ -579,9 +696,12 @@ def run_finaltest(cfg=None, guard=None):
     mech_summ = {}
     if os.path.exists(cfg['mech_summary']):
         mech_summ = json.load(open(cfg['mech_summary'], encoding='utf-8'))
-    for v in pcfg['variants']:
-        for seed in pcfg['seeds']:
-            V10.run_probe_cell(pcfg, v, seed, guard=guard, val_ids=test_ids, mech_summ=mech_summ)
+    _probe_cells = [(str(v), int(s)) for v in pcfg['variants']
+                    for s in pcfg['seeds']]
+    for v, seed in _ordered_evaluation_cells(
+            _probe_cells, _probe_plan, task='distractor_probe'):
+        V10.run_probe_cell(pcfg, v, seed, guard=guard, val_ids=test_ids,
+                           mech_summ=mech_summ)
     # 3) confirmation statistics (zero GPU, from disk)
     _stats = finaltest_stats(manifest=manifest, bylen_path=cfg['bylen_summary'],
                              probe_path=cfg['probe_summary'],
