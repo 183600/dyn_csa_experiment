@@ -18,7 +18,7 @@
 零 GPU 分析目录（`analysis_*/`）、逐版报告（`REPORT*.md`）与运行状态文件
 都**不入库**——它们由驱动脚本在跑实验的机器上重新生成，需要时本地复现即可
 （见下文命令）。`.gitignore` 已把这几类路径挡在仓库外（`docs/` 只保留
-`design_notes.md`）。
+设计说明 `docs/design_notes.md`）。
 
 | 路径 | 说明 |
 |---|---|
@@ -352,7 +352,7 @@ python build_report.py        # 从产物重建 REPORT_v7.md（零 GPU）
 
 ## 评审四硬化（本轮）
 
-逐条核对见 `DECISION_LOG.md` 的 review-4 条目与 `docs/design_notes.md` §25。核心变化是把原先的软约束变成机器闸门：
+逐条核对见 `REVIEW_4_RESPONSE.md`、`DECISION_LOG.md` 的 review-4 条目与 `docs/design_notes.md` §25。核心变化是把原先的软约束变成机器闸门：
 
 - 报告措辞统一走 `exp_lib.reportable_claim`（n≥6、原始 p、Holm p、
   `mean>std`、族级最小可达 p）；`attach_holm` 输出族级分辨率上限，

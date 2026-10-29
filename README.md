@@ -40,7 +40,7 @@ run-state files are **not tracked** — the driver scripts below regenerate them
 on whatever machine runs the experiments, so you can simply reproduce them
 locally whenever needed (see the commands in the next section). `.gitignore`
 already keeps those path families out of the repository (`docs/` retains only
-`design_notes.md`).
+the design notes, `docs/design_notes.md`).
 
 | path | what |
 |---|---|
@@ -63,6 +63,7 @@ already keeps those path families out of the repository (`docs/` retains only
 | `RELEASES.md` | **evidence release index**: where each immutable `release_<tag>.tar.gz` + SHA-256 manifest is published; the Git repo itself stays source-only |
 | `pyproject.toml` / `requirements.txt` / `requirements.lock` | Python ≥3.12 and dependency declarations; install explicitly (no import-time pip install). `requirements.lock` is the verified CPU environment |
 | `DECISION_LOG.md` | **decision log** (tracked; reconstructed 2026-10-18 from the README/design notes/manifest because the snapshot has one squashed commit): why each version ran what it ran, what was seen, and what was decided next — the exploration/confirmation paper trail; formal releases additionally archive per-seed results via `archive_release.py` |
+| `REVIEW_4_RESPONSE.md` | **review-4 per-issue audit** (tracked): the 21 methodological issues, what this repository already enforced, what this revision changed, and what still cannot be answered without new experiments/artifacts |
 | `audit_gates.py` | **compatibility shim** for `_audit_gates/`, the **review-2/4/7 verification entry points** (zero-experiment): data-leakage audits (tokenizer provenance, vocab identity, train/test overlap), CPU causality unit checks (prefix invariance, label shift, decode consistency), block-attribution / boundary-vs-random / length-consistency / baseline-fairness / failure-concentration / budget-reconciliation audits, the review-7 single-factor design gate (declared contrasts' arm-cfg diffs vs their declared intervention key sets; frozen-manifest mechanism_claim_allowed flags) and prefill-decode-kv-growth measurement utilities |
 | `archive_release.py` | **immutable evidence archiver**: packs per-release artifacts (results, analyses, reports, freeze lock, decision log, environment, checkpoint hashes) into a tar.gz with a per-file SHA-256 manifest and an independent `verify` subcommand — the git repo stays source-only (design_notes §8) while every formal release gets an auditable fixed archive |
 | `explib/m0/` | **the M0/S1 driver (adopted B tier)** (`python -m explib.m0`): entry points for the scale-up roadmap — `params` (zero-GPU S1–S4 parameter audit), `data` (FineWeb-Edu + 32k-BPE corpus cache), `smoke` (end-to-end self-check on the B-tier data path), `kernel` (the G0 validation suite: kernel/eager numerical comparison for the three operators plus the sparse-attention throughput benchmark), `full` (the S1 panel); see "B-tier M0/S1" below |
@@ -427,9 +428,9 @@ script pushes and shuts the instance down (cancel with
 
 ## Review-4 hardening (what changed)
 
-See the review-4 entry in `DECISION_LOG.md` and `docs/design_notes.md` §25 for
-the item-by-item record.  The main additions are machine gates rather than new
-prose:
+See `REVIEW_4_RESPONSE.md` for the item-by-item table, the review-4 entry in
+`DECISION_LOG.md`, and `docs/design_notes.md` §25.  The main additions are
+machine gates rather than new prose:
 
 - **Claim wording** now goes through `exp_lib.reportable_claim` (n>=6, raw p,
   Holm p, |mean|>std, family resolution floor).  `attach_holm` reports

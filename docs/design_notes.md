@@ -305,7 +305,7 @@ revision。它与 §8 的证据分级一致：**不可验证就说不可验证**
 ## 8. 仓库边界
 
 仓库只承载**源码、驱动脚本与设计文档**：实验结果目录、分析目录、逐版
-报告、运行状态文件都不入库（`.gitignore` 白名单保证，`docs/` 仅留 `design_notes.md`；原算力规划文档已退役并从仓库删除）。
+报告、运行状态文件都不入库（`.gitignore` 白名单保证，`docs/` 仅留本文件；原算力规划文档已退役并从仓库删除）。
 实测数字一律由零 GPU 的报告构建器从落盘产物现算，不写死在任何仓库
 文件中——写死的数字在仓库内没有可复核的来源，代码一改就会与报告静默
 矛盾。
@@ -2719,7 +2719,7 @@ python -m explib.confirmation plan           # 冻结预检不变：72/72、6 �
 ### 50.2 改动（只增加证据，不改测量语义）
 
 - `exp_lib.source_tree_manifest()` / `source_tree_summary()`：对
-  **非生成、非测试**的 `*.py`（`test_*.py` / `conftest.py` 除外）以及
+  **非生成、非测试**的 `*.py`（`test_*.py` 与 pytest 的 conftest 文件除外）以及
   `pyproject.toml`、`setup.py/cfg`、`requirements.txt`、两份冻结清单
   做确定性 SHA-256。`requirements.lock` 是**机器特定**的环境记录（README
   要求每台机器重新生成），不进入源码树摘要，否则 CPU 测试机与 CUDA 实验
@@ -4204,7 +4204,7 @@ caveat。完整 CPU 套件 536/536 通过（0 skipped）。
 
 `archive_release.py` 复用
 `exp_lib.source_tree_manifest()`（与冻结锁/运行清单同一扫描口径，排除
-`test_*.py`、`conftest.py`、`results_*`、`analysis_*` 等），在 `plan`
+`test_*.py`、pytest 的 conftest 文件、`results_*`、`analysis_*` 等），在 `plan`
 和 `make` 时把每个源码文件按仓库相对路径加入归档。manifest 新增
 `identity` 块，记录：
 

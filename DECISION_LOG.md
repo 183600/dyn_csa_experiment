@@ -40,7 +40,7 @@ release archive produced by `archive_release.py`.
 | v11 (`python -m explib.length`) | statistical close-out: distractor probe to n=6, crossover panels to n=4, d=384 paired arms; seed-level sign-flip with resolution floors | exploratory |
 | v12 (`python -m explib.confirmation`) | **freeze**: fixed-chunk CSA confirmation plan v2 (12 seeds, 4 primary comparisons, exact sign-flip + Holm, held-out test split, freeze lock, strict record admission, per-document PPL); v1 was rejected by the load-time power gate (6 seeds × Holm/4 has minimum attainable p=0.125) | confirmatory plan |
 | review 2 | seed count revised 6→12 **before any test-split access**; scope block added; two-phase freeze lock; kernel mode refused for the frozen plan; evidence archiver; leakage/causality/fairness audits | frozen plan revision |
-| review 3 | external audit (`科研审查_autodl运行决策.md`) found the confirmation path was not runnable: manifest stamp v11.126 vs code v11.127, `eager_batch_expected=true` with all four arms on the per-row RoPE loop, and P5T records missing `train_knobs` (admitted=0 after the one-shot test access). Manifest **v3** re-signed before any test access: stamp v11.128, eager binding false, P5T/probe records carry the provenance descriptor, per-arm `mr` pinned, equal-budget wording corrected, decision rule declares an n_effective floor of 8, adaptive 2-SE health threshold, reachable leakage statistics, and `python -m explib.confirmation plan` as a zero-GPU CI pre-flight. The continuous-loop CI was disabled/cancelled during the fix. | frozen plan v3 + code hardening |
+| review 3 | an external audit document (not part of this source-only snapshot) found the confirmation path was not runnable: manifest stamp v11.126 vs code v11.127, `eager_batch_expected=true` with all four arms on the per-row RoPE loop, and P5T records missing `train_knobs` (admitted=0 after the one-shot test access). Manifest **v3** re-signed before any test access: stamp v11.128, eager binding false, P5T/probe records carry the provenance descriptor, per-arm `mr` pinned, equal-budget wording corrected, decision rule declares an n_effective floor of 8, adaptive 2-SE health threshold, reachable leakage statistics, and `python -m explib.confirmation plan` as a zero-GPU CI pre-flight. The continuous-loop CI was disabled/cancelled during the fix. | frozen plan v3 + code hardening |
 | review 3 (earlier same day) | pooled-NLL PPL + per-document NLL; pooled/bootstrap/Wilcoxon sensitivity; Holm in v7–v11 and `build_report`; objective/parameter/KV descriptors; opt-in task-learned boundary arm (`csa_dynamic_task`); synthesized records excluded from crossover; span-ΔNLL lookup fixed; kernel-stamp consistency; `DECISION_LOG.md` restored and guarded; dependency/Python declarations | code/evidence hardening |
 | review 4 (2026-10-20) | no new experiment panels. Unified claim gate (`reportable_claim`), Holm family-resolution ceiling, NIAH folded into the Holm family, crossover fit refusal rules + slope CI, matched-init `init_core_fp`, measured compute-control direction (`system_level_only`), stale records fail-closed in `build_report`/v10, missing `truncated` treated as unverifiable, doc-bootstrap CI + <64-doc population gate, token-coverage estimate, efficiency sweep/pair audit, selection-attribution contract, evidence-release readiness audit. The frozen v12 manifest was NOT modified. | code/reporting/evidence hardening; all earlier panels remain exploratory |
 | review 5 (2026-10-27) | no new experiment panels. Cross-panel ablation replication now records sampling identity (training seeds, validation/evaluation/holdout fingerprints, code/knobs) and splits the old `replicated` label into independent draws, new-seeds/same-evaluation, shared seeds, and unattested. Shared draws are repeated measurements, not independent replication; the new labels are descriptive and do not alter p values, Holm, or `all_components_useful_allowed`. Legacy reports without identity keep the old label and are never promoted to independent replication. The frozen v12 manifest was NOT modified. | code/reporting/evidence hardening; all earlier panels remain exploratory |
@@ -273,8 +273,9 @@ say:
 
 The frozen confirmation manifest (`confirmation_frozen.json`, manifest v3)
 and its power table were not changed; no test split was read.  The per-issue
-record is this log's review-4 entry, and the statistical conventions are in
-`docs/design_notes.md` section 25.
+record is `REVIEW_4_RESPONSE.md` (rebuilt from this log's review-4 entry and
+the README), and the statistical conventions are in `docs/design_notes.md`
+section 25.
 
 ## 2026-10-20 — comparison/ablation audit hardening (no new runs)
 
@@ -1150,7 +1151,7 @@ test split, README or CI configuration was touched.
 
 **Problem.** (1) The seed contract recorded child-process `PYTHONHASHSEED` but
 not whether the *current* interpreter was launched with one; CPython consumes
-that variable before `exp_lib` imports, so a normal `python driver.py` launch
+that variable before `exp_lib` imports, so a normal direct `python ...` launch
 remains hash-randomised even though every spawned child is pinned.  The
 DataLoader check drew the worker hook in-process and never exercised real
 worker processes.  (2) The small-batch overfit cache key covered code, data,
