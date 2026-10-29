@@ -3179,3 +3179,55 @@ manifest/bylen/probe，`run_power` 绑定 manifest/summary。
 规范化、audit 扫描与 report/CLI 接线、实验事件携带摘要）。
 `make integrity` 在无新分析产物的当前仓库返回 `warnings`（只点名 legacy
 `audit_report.json`）而不是假绿；合成测试覆盖 ok/fail/not_verifiable 分支。
+
+## 2026-10-29 — 实验事件账本的逐事件哈希链与尾锚点（no new runs）
+
+零 GPU 的可复现性硬化；不新增训练、不读取 test split、不修改冻结清单的
+字节/种子/端点/alpha/Holm 规则，也不改 `CODE_SEMANTICS`。
+
+**Problem.** `experiments.jsonl` 是 `audit_run_order` /
+`audit_evaluation_order` / 失败集中度等审计重建「实际执行顺序与失败」的
+唯一依据，但它只是普通 append-only JSONL：删除一条 error 事件、改一个
+`started_at`、删掉尾部截断记录，文件仍是合法 JSONL；`_read_experiment_events`
+对坏行 `continue`，一行损坏会被静默跳过。分析产物已有正文/输入哈希，而
+产生这些产物的执行账本没有完整性证明，顺序与失败读数因此可被单行编辑
+改变而不留痕。
+
+**Fix.** `append_jsonl()` 在原有 flock + 单写 + fsync 之上，为每条事件
+写入保留的 `_ledger={schema,seq,prev,sha256}`：`sha256` 对
+`domain || seq || prev || canonical_json(event without _ledger)` 计算，第一
+条的 `prev` 为 64 个 0；每次追加在同一把锁内原子替换
+`experiments.jsonl.anchor.json`（`count`/`last_sha256`/`bytes`），从而同时
+检测编辑、插入、删除、重排与尾部截断。正常追加只读最后一行 + 锚点（O(1)），
+legacy 前缀/崩溃窗口才全量重扫；若重扫发现锚点领先于账本（尾部被截断）
+或锚点最后链接与重扫前缀不符，追加会拒绝并报警，而不是把更短的历史重新
+锚定。新增
+`exp_lib.verify_experiment_ledger()`：ok / warnings（缺锚点或锚点落后）/
+fail（链断、正文改、坏 JSON、锚点损坏或 count 大于账本）/
+not_verifiable_locally（空账本或全 legacy）；legacy 行以原始字节哈希作为
+链接贡献，因此链可以从旧前缀之后开始；但链化开始后再出现 legacy 行判
+fail，防止删掉尾部 `_ledger` 后把编辑过的链化事件伪装成 legacy 尾行。
+调用方传入的 `_ledger` 一律忽略并
+重写。新增 `audit_gates.audit_experiment_ledger()`（CLI
+`experiment_ledger` / `event_ledger` / `ledger`），扫描 `results_*/` 与
+`analysis_*/` 下的账本，接入 `report` 的 `experiment_ledger` 块。
+
+**Boundary.** 这是 tamper-evident，不是密码学签名：同时重写账本、重算链
+并替换锚点的人仍可伪造；它不能替代外部时间戳或只读归档。追加与锚点替换
+不是同一个原子操作，二者之间被杀会留下「锚点落后」的 warning 而不是
+fail；下一次追加会重扫并写回新锚点。若锚点反而领先于账本（截断）或与
+重扫前缀不符，追加会拒绝并只打印 warning，避免把截断证据重新锚定掉。
+legacy 事件被链绑定但没有写入时的
+自证，审计报告 `n_legacy`，不把旧账本升级成新证据。该机制只覆盖执行
+事件日志，不替代 `stamped_analysis` 的产物/输入哈希，也不替代
+`archive_release.py` 的发布清单；不改变任何测量、p 值、Holm 族、顺序
+审计语义或冻结决定。
+
+**Verification.** 新增 `test_review_part_14.py` 6 项：链与锚点自洽、
+正文编辑/删除中间事件/截断尾部 fail、锚点缺失/落后 warning 与损坏 fail、
+legacy 前缀 + 无尾换行追加、NaN/NumPy/集合 JSON 安全与 `_ledger` 伪造被
+覆盖、审计目录输入/混合 ok+fail/report/CLI 接线。`python -m pytest -q`
+通过 `588 passed, 3 skipped`。当前仓库只有 legacy `analysis_audit`
+账本，所以 `python audit_gates.py experiment_ledger` 返回
+`not_verifiable_locally` 而不是绿色通过；`python -m explib.confirmation
+plan` 的冻结计划/比较数不变。

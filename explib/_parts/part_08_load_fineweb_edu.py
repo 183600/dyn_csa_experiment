@@ -926,32 +926,447 @@ def new_experiment_id(prefix='run'):
     attempts of the same (variant, seed, run_cfg) distinguishable."""
     return f'{prefix}-{time.strftime("%Y%m%dT%H%M%S", time.gmtime())}-{os.getpid()}-{os.urandom(4).hex()}'
 
+_LEDGER_KEY = '_ledger'
+_LEDGER_SCHEMA = 1
+_LEDGER_DOMAIN = b'dyn-csa-experiment-ledger-v1\x00'
+_LEDGER_ZERO = '0' * 64
+
+
+def _ledger_clean_event(record):
+    """JSON-safe event body with the reserved ledger key removed.
+
+    ``_ledger`` is reserved: a caller cannot supply its own chain metadata and
+    have it accepted (that would let one forged event inherit another event's
+    link).  A non-dict record is wrapped under ``value`` so the line is still
+    a JSON object the chain can carry."""
+    if isinstance(record, dict):
+        body = {k: v for k, v in record.items() if k != _LEDGER_KEY}
+    else:
+        body = {'value': record}
+    return _json_clean(_jsonable(body))
+
+
+def _ledger_canonical_json(body):
+    """Canonical serialisation used by both the writer and the verifier."""
+    return json.dumps(body, sort_keys=True, separators=(',', ':'),
+                      ensure_ascii=False, default=float, allow_nan=False)
+
+
+def ledger_link_sha256(seq, prev, event):
+    """Hash that binds one ledger event to its position and predecessor.
+
+    The domain separator makes this hash unusable in another protocol, and the
+    canonical JSON body excludes ``_ledger`` itself (otherwise the hash would
+    be self-referential).  ``prev`` is the previous event's link hash, or 64
+    zeroes for the first event, so deleting/reordering a line breaks the next
+    line's chain instead of silently renumbering it."""
+    body = _ledger_clean_event(event)
+    payload = (_LEDGER_DOMAIN + str(int(seq)).encode('ascii') + b'\x00'
+               + str(prev).encode('ascii') + b'\x00'
+               + _ledger_canonical_json(body).encode('utf-8'))
+    return hashlib.sha256(payload).hexdigest()
+
+
+def experiment_ledger_anchor_path(path):
+    """Sidecar anchor for a JSONL ledger (same directory, stable name)."""
+    return os.fsdecode(os.path.abspath(os.fspath(path))) + '.anchor.json'
+
+
+def _ledger_meta_problems(meta):
+    """Why a line's ``_ledger`` block is not a valid chain link."""
+    if not isinstance(meta, dict):
+        return [f'_ledger is a {type(meta).__name__}, not an object']
+    bad = []
+    if meta.get('schema') != _LEDGER_SCHEMA:
+        bad.append(f"_ledger.schema={meta.get('schema')!r} is not {_LEDGER_SCHEMA}")
+    seq = meta.get('seq')
+    if (isinstance(seq, bool) or not isinstance(seq, numbers.Integral)
+            or int(seq) < 0):
+        bad.append(f'_ledger.seq={seq!r} is not a non-negative integer')
+    for key in ('prev', 'sha256'):
+        val = meta.get(key)
+        if (not isinstance(val, str) or len(val) != 64
+                or any(c not in '0123456789abcdef' for c in val.lower())):
+            bad.append(f'_ledger.{key} is not a SHA-256 hex digest: {val!r}')
+    return bad
+
+
+def _read_last_nonempty_line(path):
+    """Last non-empty line of a file, read backwards (no whole-file read)."""
+    try:
+        with open(path, 'rb') as f:
+            f.seek(0, os.SEEK_END)
+            pos = f.tell()
+            buf = b''
+            while pos > 0:
+                step = min(65536, pos)
+                pos -= step
+                f.seek(pos)
+                buf = f.read(step) + buf
+                stripped = buf.rstrip(b'\r\n')
+                if b'\n' in stripped:
+                    return stripped.rsplit(b'\n', 1)[1]
+            return buf.rstrip(b'\r\n')
+    except OSError:
+        return b''
+
+
+def _load_ledger_anchor(path):
+    """Return ``(anchor, problem)``; ``(None, None)`` means no sidecar."""
+    p = experiment_ledger_anchor_path(path)
+    if not os.path.isfile(p):
+        return None, None
+    try:
+        with open(p, encoding='utf-8') as fh:
+            obj = json.load(fh)
+    except (OSError, ValueError) as e:
+        return None, f'anchor is unreadable ({type(e).__name__}: {e})'
+    if not isinstance(obj, dict):
+        return None, (f'anchor is a {type(obj).__name__}, not a JSON object')
+    return obj, None
+
+
+def _ledger_scan_text(text):
+    """Walk a ledger's lines and recompute the chain.
+
+    Legacy lines (written before chaining) have no embedded link; their
+    contribution is the SHA-256 of their raw bytes, so a chain that starts
+    after a legacy prefix still binds that prefix.  Blank lines are ignored
+    for sequence numbering; a malformed JSON line is an explicit problem, not
+    a silent skip (the historical order audits did skip them, which is exactly
+    how a deleted/failed event could go unnoticed).
+
+    Once a chained event has appeared, a later legacy line is a failure rather
+    than a tolerated prefix: removing ``_ledger`` from a tail event would
+    otherwise let an edited line pass as "legacy" with a matching raw-byte
+    anchor, i.e. the chain could be exited at will."""
+    prev = _LEDGER_ZERO
+    links = []
+    problems = []
+    n_chained = 0
+    n_legacy = 0
+    seen_chained = False
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        if not raw.strip():
+            continue
+        link = None
+        obj = None
+        try:
+            obj = json.loads(raw)
+        except (ValueError, TypeError) as e:
+            problems.append(f'line {lineno}: not valid JSON ({type(e).__name__}: {e})')
+            link = hashlib.sha256(raw.encode('utf-8')).hexdigest()
+        if link is None:
+            if not isinstance(obj, dict):
+                problems.append(f'line {lineno}: event is a {type(obj).__name__}, not an object')
+                link = hashlib.sha256(raw.encode('utf-8')).hexdigest()
+            elif obj.get(_LEDGER_KEY) is None:
+                # Legacy line: its raw bytes are the link contribution.
+                if seen_chained:
+                    problems.append(
+                        f'line {lineno}: legacy event after chained events — '
+                        'the tail was rewritten or an old writer appended '
+                        'after chaining')
+                n_legacy += 1
+                link = hashlib.sha256(raw.encode('utf-8')).hexdigest()
+            else:
+                seen_chained = True
+                meta = obj[_LEDGER_KEY]
+                bad = _ledger_meta_problems(meta)
+                if bad:
+                    problems.extend(f'line {lineno}: {p}' for p in bad)
+                    link = hashlib.sha256(raw.encode('utf-8')).hexdigest()
+                else:
+                    seq = int(meta['seq'])
+                    got_prev = str(meta['prev']).lower()
+                    stored = str(meta['sha256']).lower()
+                    if seq != len(links):
+                        problems.append(
+                            f'line {lineno}: _ledger.seq={seq} but this is event '
+                            f'{len(links)} — a line was deleted, inserted or reordered')
+                    if got_prev != prev:
+                        problems.append(
+                            f'line {lineno}: _ledger.prev={got_prev[:12]}… does not '
+                            f'match the previous event link {prev[:12]}…')
+                    try:
+                        want = ledger_link_sha256(seq, got_prev, obj)
+                    except (TypeError, ValueError, OverflowError) as e:
+                        problems.append(
+                            f'line {lineno}: event cannot be canonicalised '
+                            f'({type(e).__name__}: {e})')
+                        want = None
+                    if want is not None and want != stored:
+                        problems.append(
+                            f'line {lineno}: _ledger.sha256 does not reproduce '
+                            f'(stored {stored[:12]}…, recomputed {want[:12]}…) — '
+                            'the event body was edited after it was written')
+                    n_chained += 1
+                    link = stored
+        links.append(link)
+        prev = link
+    return {'n_events': len(links), 'n_chained': n_chained,
+            'n_legacy': n_legacy, 'last_sha256': prev, 'links': links,
+            'problems': problems}
+
+
+def _file_ends_with_newline(path):
+    try:
+        with open(path, 'rb') as f:
+            f.seek(0, os.SEEK_END)
+            if f.tell() == 0:
+                return True
+            f.seek(-1, os.SEEK_END)
+            return f.read(1) == b'\n'
+    except OSError:
+        return True
+
+
+def _ledger_anchor_count(anchor):
+    """Validated anchor count, or ``None`` for a missing/malformed sidecar."""
+    if not isinstance(anchor, dict):
+        return None
+    count = anchor.get('count')
+    if isinstance(count, bool) or not isinstance(count, numbers.Integral):
+        return None
+    if int(count) < 0:
+        return None
+    return int(count)
+
+
+def _ledger_anchor_prefix_ok(anchor, scan):
+    """Does the anchor pin a prefix of what the full scan just read?
+
+    A truncated tail makes ``anchor.count`` exceed the scanned event count; an
+    edited/replaced anchor makes its last link disagree with the scanned
+    prefix.  Either is a tamper/corruption signal, so ``append_jsonl`` refuses
+    to append over it instead of silently re-anchoring the shorter history.
+    A *behind* anchor whose last link matches the prefix is the documented
+    crash window and is safe to continue."""
+    count = _ledger_anchor_count(anchor)
+    if count is None:
+        return True
+    if count > scan['n_events']:
+        return False
+    expected = (_LEDGER_ZERO if count == 0 else scan['links'][count - 1])
+    got = str(anchor.get('last_sha256') or '').lower()
+    return got == expected
+
+
+def _ledger_next_state(path):
+    """``(next_seq, prev_link, needed_full_scan)`` under the caller's flock.
+
+    The fast path uses the last line plus the anchor; the full scan is only
+    needed for a legacy prefix, a crash-window mismatch or a corrupt anchor.
+    That keeps appending O(1) in the normal case while never guessing a link
+    when the sidecar disagrees with the log.  A full scan that finds the
+    anchor ahead of the ledger (truncated tail) or pointing at a different
+    prefix refuses the append: re-anchoring it would erase the evidence."""
+    anchor, _ = _load_ledger_anchor(path)
+    last_raw = _read_last_nonempty_line(path)
+    if last_raw:
+        try:
+            obj = json.loads(last_raw.decode('utf-8'))
+        except (ValueError, UnicodeDecodeError):
+            obj = None
+        if isinstance(obj, dict) and isinstance(obj.get(_LEDGER_KEY), dict):
+            meta = obj[_LEDGER_KEY]
+            if not _ledger_meta_problems(meta):
+                seq = int(meta['seq'])
+                link = str(meta['sha256']).lower()
+                if (isinstance(anchor, dict)
+                        and _ledger_anchor_count(anchor) == seq + 1
+                        and str(anchor.get('last_sha256') or '').lower() == link):
+                    return seq + 1, link, False
+    try:
+        with open(path, encoding='utf-8') as fh:
+            text = fh.read()
+    except OSError:
+        text = ''
+    scan = _ledger_scan_text(text)
+    if not _ledger_anchor_prefix_ok(anchor, scan):
+        raise RuntimeError(
+            'experiment ledger tail/anchor disagree (truncated or edited '
+            'ledger); refusing to append over it — inspect with '
+            '`python audit_gates.py experiment_ledger` first')
+    return scan['n_events'], scan['last_sha256'], True
+
+
 def append_jsonl(path, record):
-    """Append one JSON object to a shared JSONL log under an exclusive flock.
+    """Append one hash-chained JSON object to a shared JSONL log.
 
     Append-only tracking is deliberately separate from summary.json: summary's
     keys are the resume identity `variant::seed`, so a rerun legitimately
     overwrites an old value.  The JSONL ledger keeps every attempt (including
     failures and cap truncations), which is what makes the paper trail
-    auditable after the fact.  A write failure is the caller's to report; this
-    helper never swallows a partially written line (single write + flush)."""
+    auditable after the fact.  Each line now carries ``_ledger`` = ``{schema,
+    seq, prev, sha256}``: the chain detects an edited, inserted, deleted or
+    reordered event, and the adjacent ``*.anchor.json`` sidecar pins the event
+    count and last link so trailing truncation is visible too.
+
+    The write is single-write + flush + fsync under an exclusive flock; the
+    anchor is replaced atomically while that lock is still held.  A caller's
+    own ``_ledger`` key is ignored, never trusted.  This helper still never
+    swallows a partially written line: a write failure propagates to the
+    caller (``log_experiment_event`` reports it and continues)."""
     d = os.path.dirname(os.path.abspath(path))
     os.makedirs(d, exist_ok=True)
-    line = json.dumps(_json_clean(_jsonable(record)), sort_keys=True, ensure_ascii=False, default=float, allow_nan=False) + '\n'
     try:
         import fcntl
     except ImportError:
         fcntl = None
-    with open(path, 'a', encoding='utf-8') as f:
+    with open(path, 'a+', encoding='utf-8') as f:
         if fcntl is not None:
             fcntl.flock(f.fileno(), fcntl.LOCK_EX)
         try:
+            seq, prev, _scanned = _ledger_next_state(path)
+            body = _ledger_clean_event(record)
+            link = ledger_link_sha256(seq, prev, body)
+            event = dict(body)
+            event[_LEDGER_KEY] = {'schema': _LEDGER_SCHEMA, 'seq': seq,
+                                  'prev': prev, 'sha256': link}
+            prefix = '' if _file_ends_with_newline(path) else '\n'
+            line = prefix + json.dumps(event, sort_keys=True, ensure_ascii=False,
+                                       default=float, allow_nan=False) + '\n'
+            f.seek(0, os.SEEK_END)
             f.write(line)
             f.flush()
             os.fsync(f.fileno())
+            anchor = {
+                'kind': 'experiment_ledger_anchor',
+                'ledger': os.path.basename(os.path.abspath(path)),
+                'schema': _LEDGER_SCHEMA,
+                'count': seq + 1,
+                'last_sha256': link,
+                'bytes': os.path.getsize(path),
+                'updated_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+            }
+            atomic_write_json(experiment_ledger_anchor_path(path), anchor)
         finally:
             if fcntl is not None:
                 fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+
+def verify_experiment_ledger(ledger, *, check_anchor=True):
+    """Replay a JSONL ledger's hash chain and optional tail anchor.
+
+    Status is ``ok`` when every chained event reproduces and the sidecar (if
+    present) pins the current tail; ``warnings`` when the chain is intact but
+    a tail anchor is absent or behind (crash window / an older writer);
+    ``fail`` on any edited, missing, inserted, reordered or malformed event;
+    and ``not_verifiable_locally`` for a missing/empty ledger or one written
+    entirely before chaining.
+
+    This is tamper-EVIDENT, not a cryptographic signature: someone who
+    rewrites the log and regenerates the chain and anchor can still forge it.
+    It does, however, make an accidental truncation or a one-line edit
+    detectable without a trusted external timestamp."""
+    path = os.fsdecode(os.path.abspath(os.fspath(ledger)))
+    out = {'kind': 'experiment_ledger', 'status': 'ok', 'path': path,
+           'n_events': 0, 'n_chained': 0, 'n_legacy': 0,
+           'last_sha256': None, 'anchor': None,
+           'problems': [], 'warnings': [],
+           'note': ('hash-chained append-only ledger: an edited, deleted, '
+                    'inserted or reordered event breaks the next link, and the '
+                    'tail anchor exposes truncation')}
+    if not os.path.isfile(path):
+        out['status'] = 'not_verifiable_locally'
+        out['note'] = 'no experiments.jsonl ledger exists'
+        return out
+    try:
+        with open(path, 'rb') as f:
+            raw_bytes = f.read()
+        text = raw_bytes.decode('utf-8')
+    except (OSError, UnicodeDecodeError) as e:
+        out['status'] = 'fail'
+        out['problems'].append(f'ledger cannot be read as UTF-8 ({type(e).__name__}: {e})')
+        return out
+    scan = _ledger_scan_text(text)
+    out.update({'n_events': scan['n_events'],
+                'n_chained': scan['n_chained'],
+                'n_legacy': scan['n_legacy'],
+                'last_sha256': (scan['last_sha256']
+                                if scan['n_events'] else None)})
+    out['problems'].extend(scan['problems'])
+    if out['problems']:
+        out['status'] = 'fail'
+        return out
+    if scan['n_events'] == 0:
+        out['status'] = 'not_verifiable_locally'
+        out['note'] = 'the ledger exists but is empty'
+        return out
+    if scan['n_chained'] == 0:
+        out['status'] = 'not_verifiable_locally'
+        out['note'] = ('every event predates hash chaining; regenerate the '
+                       'ledger with the current writer to make it verifiable')
+        return out
+    if check_anchor:
+        anchor, aproblem = _load_ledger_anchor(path)
+        if aproblem:
+            out['status'] = 'fail'
+            out['problems'].append(aproblem)
+            return out
+        if anchor is None:
+            out['status'] = 'warnings'
+            out['warnings'].append(
+                'no tail anchor sidecar: the chain is intact but a deleted '
+                'suffix would not be detectable')
+        else:
+            out['anchor'] = {k: anchor.get(k) for k in
+                             ('count', 'last_sha256', 'bytes', 'updated_at')}
+            acount = anchor.get('count')
+            alast = anchor.get('last_sha256')
+            if (isinstance(acount, bool) or not isinstance(acount, numbers.Integral)
+                    or int(acount) < 0):
+                out['status'] = 'fail'
+                out['problems'].append(f'anchor.count={acount!r} is not a non-negative integer')
+            elif (not isinstance(alast, str) or len(alast) != 64
+                  or any(c not in '0123456789abcdef' for c in alast.lower())):
+                out['status'] = 'fail'
+                out['problems'].append(f'anchor.last_sha256 is not a SHA-256 hex digest: {alast!r}')
+            else:
+                acount = int(acount)
+                alast = alast.lower()
+                if acount > scan['n_events']:
+                    out['status'] = 'fail'
+                    out['problems'].append(
+                        f'anchor pins {acount} events but the ledger has only '
+                        f'{scan["n_events"]} — the tail was truncated')
+                elif acount == scan['n_events']:
+                    if alast != scan['last_sha256']:
+                        out['status'] = 'fail'
+                        out['problems'].append(
+                            'anchor.last_sha256 does not match the ledger tail')
+                    else:
+                        abytes = anchor.get('bytes')
+                        if (abytes is not None
+                                and (isinstance(abytes, bool)
+                                     or not isinstance(abytes, numbers.Integral)
+                                     or int(abytes) != len(raw_bytes))):
+                            out['status'] = 'fail'
+                            out['problems'].append(
+                                f'anchor.bytes={abytes!r} but the ledger is '
+                                f'{len(raw_bytes)} bytes')
+                else:
+                    expected = (_LEDGER_ZERO if acount == 0
+                                else scan['links'][acount - 1])
+                    if alast != expected:
+                        out['status'] = 'fail'
+                        out['problems'].append(
+                            'anchor.last_sha256 does not match the ledger at '
+                            f'its pinned event {acount}')
+                    else:
+                        out['status'] = 'warnings'
+                        out['warnings'].append(
+                            f'tail anchor is behind the ledger ({acount} of '
+                            f'{scan["n_events"]} events): an append crashed '
+                            'before the anchor was replaced, or a writer did '
+                            'not update it')
+    if out['status'] == 'ok' and scan['n_legacy']:
+        out['note'] = ('hash chain reproduces; ' + str(scan['n_legacy'])
+                       + ' legacy event(s) before chaining are bound as raw-byte '
+                       'links but were not written with chain metadata')
+    return out
+
 
 def log_experiment_event(outdir, event):
     """Append a trace event to `outdir/experiments.jsonl` (never raises).

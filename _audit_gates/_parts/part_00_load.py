@@ -55,6 +55,11 @@
                并核对它记录的全部输入文件哈希；正文被改或输入在分析后被
                改判 fail，输入不在本机则明确 warning，legacy 无摘要报
                not_verifiable（零 GPU，不重算统计量、不改任何判定）
+  experiment_ledger  实验事件账本完整性：逐行重放 experiments.jsonl 的
+               hash chain（seq/prev/sha256）与 tail anchor；编辑/删除/插入/
+               重排/截断判 fail，缺 anchor 或 anchor 落后为 warning，全部
+               事件早于链化的 legacy 账本报 not_verifiable（零 GPU，
+               不改任何测量或冻结决定）
   looks        序列观测 / optional stopping：逐面板 look history 的种子集合、
                逐种子配对差、逐 look p 与 max-over-looks 序列 p 是否自洽；
                朴素最终 p 显著但序列 p 不显著的对照会被点名（零 GPU）

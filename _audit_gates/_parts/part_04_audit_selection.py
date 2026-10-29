@@ -1467,3 +1467,94 @@ def audit_analysis_choices(path=None):
     print(json.dumps({k: v for k, v in out.items() if k != 'comparisons'},
                      ensure_ascii=False, indent=2))
     return out
+
+
+def audit_experiment_ledger(paths=None):
+    """Verify the hash-chained experiment ledgers used by the order audits.
+
+    ``experiments.jsonl`` is the execution record from which run-order,
+    evaluation-order and failure/selection audits reconstruct what actually
+    happened.  It was append-only but not tamper-evident: deleting the one
+    failed event, editing a ``started_at`` or dropping the tail could make an
+    arm-major run look blocked without leaving a trace.  Every event written
+    by the current code now carries ``_ledger`` = ``{schema, seq, prev,
+    sha256}`` and an atomic ``*.anchor.json`` sidecar pins the count and last
+    link.  This gate:
+
+      * replays the chain and checks sequence, predecessor and body hashes;
+      * checks the anchor count/last link/file size, so a truncated suffix is
+        detected rather than accepted as "the run ended early";
+      * reports a legacy ledger (all events before chaining) as
+        ``not_verifiable_locally`` and a missing anchor as ``warnings`` — it
+        never upgrades an unverifiable log to a green pass;
+      * reads local files only, starts no training and changes no measurement,
+        p-value, Holm family or frozen verdict.
+
+    It is tamper-EVIDENT, not a signature: rewriting the log and regenerating
+    its chain/anchor can still forge it.  Its job is to make accidental or
+    one-line tampering visible, not to defend against a malicious author with
+    write access to both files.
+    """
+    L = _import_exp_lib()
+    import glob as _glob
+    if paths is None:
+        found = []
+        for name in _iter_result_dirs():
+            p = os.path.join(REPO, name, 'experiments.jsonl')
+            if os.path.isfile(p):
+                found.append(p)
+        found.extend(sorted(_glob.glob(
+            os.path.join(REPO, 'analysis_*', 'experiments.jsonl'))))
+        paths = found
+    elif isinstance(paths, (str, bytes, os.PathLike)):
+        paths = [paths]
+    out = {'kind': 'experiment_ledger_audit', 'status': 'ok',
+           'ledgers': {}, 'n_ledgers': 0, 'n_ok': 0, 'n_fail': 0,
+           'n_warnings': 0, 'n_not_verifiable': 0,
+           'n_events': 0, 'n_chained': 0, 'n_legacy_events': 0,
+           'problems': [], 'warnings': [],
+           'note': ('hash-chained experiment ledger: an edited, deleted, '
+                    'inserted or reordered event breaks the next link, and the '
+                    'tail anchor exposes truncation; this does not change any '
+                    'measurement or frozen decision')}
+    seen = set()
+    for raw in paths:
+        p = os.fsdecode(os.path.abspath(os.fspath(raw)))
+        if os.path.isdir(p):
+            p = os.path.join(p, 'experiments.jsonl')
+        if p in seen:
+            continue
+        seen.add(p)
+        rep = L.verify_experiment_ledger(p)
+        out['n_ledgers'] += 1
+        out['n_events'] += int(rep.get('n_events') or 0)
+        out['n_chained'] += int(rep.get('n_chained') or 0)
+        out['n_legacy_events'] += int(rep.get('n_legacy') or 0)
+        short = os.path.relpath(p, REPO) if p.startswith(REPO + os.sep) else p
+        out['ledgers'][short] = rep
+        status = rep.get('status')
+        if status == 'fail':
+            out['n_fail'] += 1
+            out['problems'].extend(f'{short}: {x}' for x in rep.get('problems') or [])
+        elif status == 'warnings':
+            out['n_warnings'] += 1
+            out['warnings'].extend(f'{short}: {x}' for x in rep.get('warnings') or [])
+        elif status == 'not_verifiable_locally':
+            out['n_not_verifiable'] += 1
+            out['warnings'].append(
+                f'{short}: {rep.get("note") or "ledger is not verifiable"}')
+        else:
+            out['n_ok'] += 1
+    if out['n_ledgers'] == 0:
+        out['status'] = 'not_verifiable_locally'
+        out['reason'] = ('no experiments.jsonl ledger exists yet; run a panel '
+                         'with the current code to produce a chained one')
+    elif out['n_fail']:
+        out['status'] = 'fail'
+    elif out['n_ok'] == 0 and out['n_warnings'] == 0:
+        out['status'] = 'not_verifiable_locally'
+    elif out['n_warnings'] or out['n_not_verifiable']:
+        out['status'] = 'warnings'
+    print(json.dumps({k: v for k, v in out.items() if k != 'ledgers'},
+                     ensure_ascii=False, indent=2))
+    return out

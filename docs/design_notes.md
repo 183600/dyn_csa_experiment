@@ -5418,3 +5418,128 @@ L214 覆盖 P5T 预计划写入、同清单恢复复用、pre-access 重写、po
 事后计划 fail、clean 无计划 fail、计划无事件不可核验与损坏计划 fail。
 完整 CPU 套件 `577/577` 通过（0 skipped）；冻结清单、种子、端点、
 `CODE_SEMANTICS` 与既有统计机器不变。
+
+## 77. 实验事件账本必须是可复核的：逐事件哈希链 + 尾锚点
+
+### 77.1 问题：顺序审计信任的 `experiments.jsonl` 本身没有完整性证明
+
+`audit_run_order` / `audit_evaluation_order` / 失败与选择审计都从
+`experiments.jsonl` 重建「实际发生了什么」：哪个臂在哪个 seed 的哪个时间
+开始、哪个 cell 失败、预注册计划是否被遵守。该文件此前是 append-only，
+但只是**普通 JSONL**：
+
+- 删掉唯一一条 `status='error'` 事件，失败集中度读数会变干净；
+- 把一条 `started_at` 改早/改晚，arm-major 可能被读成时间区组；
+- 删掉文件尾部（例如最后一次截断/崩溃事件），文件仍然「合法」，审计只
+  看到更短的历史；
+- 读事件的 `_read_experiment_events()` 对坏行是 `continue`，一行坏 JSON
+  被静默跳过，正好掩盖一次丢失的测量。
+
+也就是说，分析产物已经有 `content_sha256` + 输入哈希，但**产生这些产物
+的执行账本**仍可被一行编辑而不留痕。这是可复现性链条上的缺口，不是统计
+方法问题。
+
+### 77.2 方法：每条事件绑定序号、前驱与正文；尾锚点绑定长度
+
+`append_jsonl()` 现在在原有 flock + 单次写 + fsync 之外，为每条事件写入
+保留字段：
+
+```json
+"_ledger": {"schema": 1, "seq": 3,
+            "prev": "<上一条的 sha256>",
+            "sha256": "<本条链接哈希>"}
+```
+
+链接哈希定义为
+
+```text
+SHA256("dyn-csa-experiment-ledger-v1\0" + seq + "\0" + prev + "\0"
+       + canonical_json(event_without__ledger))
+```
+
+`canonical_json` 复用写日志的 `_json_clean(_jsonable(...))` 与
+`sort_keys=True, separators=(',', ':')`，所以同一个事件在写入和复核时得到
+相同字节；`_ledger` 自身被排除，避免自指。第一条的 `prev` 是 64 个 0。
+
+每次追加在**同一把 flock 内**原子替换相邻的
+`experiments.jsonl.anchor.json`：
+
+```json
+{"kind": "experiment_ledger_anchor", "count": 4,
+ "last_sha256": "<最后一条链接哈希>", "bytes": 1234}
+```
+
+链检测编辑/插入/删除/重排（下一条的 `seq`/`prev` 对不上），锚点检测尾部
+截断（`count` 大于账本事件数）。追加正常路径只读最后一行 + 锚点，O(1)；
+只有 legacy 前缀、崩溃窗口或锚点不匹配时才全量重扫，避免 O(n²) I/O。
+若全量重扫发现锚点 **领先** 于账本（尾部被截断），或锚点的最后链接与重扫
+前缀不符，追加会拒绝并报警，而不是把更短的历史重新锚定；否则一次截断会
+被下一次正常追加「修复」成合法链。
+
+**Legacy 兼容。** 链化前写下的行没有 `_ledger`；复核时以该行原始字节的
+SHA-256 作为链接贡献，因此链可以从 legacy 前缀之后开始，且该前缀仍被
+后续链绑定。全 legacy 账本明确报 `not_verifiable_locally`，不假装通过。
+链化开始后若再出现 legacy 行，判 fail：否则删掉尾部事件的 `_ledger` 并把
+锚点改成原始字节哈希，就能把一条被编辑的链化事件伪装成「legacy 尾行」，
+从而退出链。若 legacy 文件末尾缺换行，追加前补一个换行；链接哈希按不含
+行尾的字节计算，所以这不改变前缀的链接。
+
+**保留键。** 调用方传入的 `_ledger` 一律被忽略并重写，不能借伪造的
+`seq`/`sha256` 让一条事件继承另一条事件的链位置。
+
+### 77.3 复核与审计
+
+`exp_lib.verify_experiment_ledger(path)` 返回：
+
+- `ok`：逐事件 `seq` 连续、`prev` 对上、正文哈希可重算，且锚点的
+  `count`/`last_sha256`/`bytes` 与当前文件一致；
+- `warnings`：链完整但缺锚点（无法发现尾部删除）或锚点落后（追加成功、
+  替换锚点前崩溃的窗口）；
+- `fail`：坏 JSON、非对象事件、`seq`/`prev` 断裂、正文被改、锚点损坏、
+  锚点 count 大于账本（尾部被截断）或锚点哈希/字节数不匹配；
+- `not_verifiable_locally`：文件不存在/为空，或全部事件早于链化。
+
+`audit_gates.audit_experiment_ledger()`（CLI `experiment_ledger` /
+`event_ledger` / `ledger`）扫描 `results_*/experiments.jsonl` 与
+`analysis_*/experiments.jsonl`，逐账本输出状态并把 fail/warning 汇总到
+`audit_gates.py report` 的新 `experiment_ledger` 块。任一账本 fail 即整体
+fail；全部 legacy 时整体是 `not_verifiable_locally`，不是绿色通过。
+
+### 77.4 边界
+
+- **是 tamper-evident，不是签名。** 能同时重写账本、重算整条链并替换
+  锚点的人仍可伪造；本机制不能替代外部时间戳/只读归档。它让**一行编辑、
+  一次误删、一次截断**在不拥有可信外部锚时也可被发现。
+- **不改变测量与判定。** 只改日志写入/复核，不改变任何 PPL、种子、终点、
+  α、Holm 族、冻结清单字节或 `CODE_SEMANTICS`；不新增训练、不读取 test。
+- **崩溃窗口是有意的 warning，不是 fail。** 追加与锚点替换不是同一个
+  原子操作；若进程在两者之间被杀，账本比锚点多一条。下一次追加会全量
+  重扫并写回新锚点；审计在修复前明确报 warning，而不是把「崩溃」误判为
+  「篡改」，也不把「锚点落后」当成通过。若锚点**领先**于账本（尾部被
+  截断）或最后链接与重扫前缀不符，追加会拒绝而不是静默重锚，避免把
+  截断证据抹掉；此时 `log_experiment_event` 只打印 warning，训练本身
+  不受影响。
+- **legacy 事件不是链化事件。** 它们的原始字节被链绑定，但没有写入时的
+  `seq`/`prev` 自证；审计会报告 `n_legacy`，不会把旧账本升级成新证据。
+- **链只覆盖事件日志。** 它不替代 `stamped_analysis` 的产物正文/输入
+  哈希，也不替代 `archive_release.py` 的归档清单；三者分别约束执行记录、
+  分析推导与发布包完整性。
+- **顺序审计的语义不变。** `audit_run_order` / `audit_evaluation_order`
+  仍按 `kind`/`variant`/`seed`/时间重建顺序；`_ledger` 只是附加字段。链
+  验证通过不等于顺序设计正确，反之亦然。
+
+### 77.5 入口与验证
+
+```bash
+python audit_gates.py experiment_ledger   # 或 event_ledger / ledger
+python audit_gates.py report              # 含 experiment_ledger 块
+python test_review_fixes.py               # 新增 test_review_part_14.py（6 项）
+python -m explib.confirmation plan        # 冻结计划预检不变
+```
+
+新增测试覆盖：链的 `seq`/`prev`/`sha256` 与锚点自洽；正文编辑、删除中间
+事件、截断尾部均 fail；锚点缺失/落后为 warning、锚点损坏 fail；legacy
+前缀 + 无尾换行的追加仍可复核且报告 `n_legacy`；NaN/NumPy/集合的 JSON
+安全与伪造 `_ledger` 被覆盖；审计对目录/文件输入、混合 ok+fail 汇总与
+`report`/CLI 接线。完整 CPU 套件 `588 passed, 3 skipped`（新增 6 项）。
+冻结清单、种子、端点、`CODE_SEMANTICS` 与既有统计机器不变。
