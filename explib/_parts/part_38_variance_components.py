@@ -137,7 +137,14 @@ def _vc_interval(mean, variance, conf, df):
     half = float(tc * math.sqrt(variance))
     if not math.isfinite(half):
         return None
-    return {'low': float(mean) - half, 'high': float(mean) + half,
+    low = float(mean) - half
+    high = float(mean) + half
+    if not (math.isfinite(low) and math.isfinite(high)):
+        # A finite mean and half-width can still produce an endpoint beyond
+        # float64 (e.g. mean=1.7e308 and half=1e307).  An infinite JSON bound
+        # is not a measured interval; mark the whole interval unavailable.
+        return None
+    return {'low': low, 'high': high,
             'halfwidth': half, 'df': float(df), 'conf': float(conf),
             'degenerate': False}
 
@@ -435,14 +442,52 @@ def paired_delta_variance_components(nll_a, nll_b, n_tokens, *, conf=0.95):
         raise ValueError(f'n_tokens must have length {A.shape[1]}, got {tok.shape}')
     if not np.all(np.isfinite(tok)) or np.any(tok <= 0.0):
         raise ValueError('n_tokens must be finite and strictly positive')
-    delta = (A - B) / tok[None, :]
+    # NLL sums are usually O(tokens); a finite panel can still be near the
+    # float limit.  Both the per-cell subtraction and the token-pooled row sum
+    # can then overflow even though the per-token result is representable.
+    # Use the platform's wider machine float (x86 long double) only for that
+    # extreme path; ordinary panels stay on the exact historical NumPy path.
+    _max_abs = max(float(np.max(np.abs(A))), float(np.max(np.abs(B))))
+    with np.errstate(over='ignore', invalid='ignore'):
+        _tok_total = float(np.sum(tok))
+    _tok_overflow = not math.isfinite(_tok_total)
+    _extreme = ((math.isfinite(_max_abs) and _max_abs > 1e100)
+                or (0.0 < _max_abs < 1e-100) or _tok_overflow)
+    _wide = None
+    if _extreme:
+        try:
+            if np.finfo(np.longdouble).max > np.finfo(float).max:
+                _wide = np.longdouble
+        except (AttributeError, TypeError, ValueError):
+            _wide = None
+    if _wide is not None:
+        _ld = _wide
+        _diff = A.astype(_ld) - B.astype(_ld)
+        delta = (_diff / tok.astype(_ld)[None, :]).astype(float)
+        _tok_ld = tok.astype(_ld).sum(dtype=_ld)
+        _row_pooled = _diff.sum(axis=1, dtype=_ld) / _tok_ld
+        try:
+            token_pooled = float(np.mean(_row_pooled, dtype=_ld))
+        except (TypeError, ValueError, OverflowError):
+            token_pooled = None
+    else:
+        delta = (A - B) / tok[None, :]
+        per_seed = np.sum(A - B, axis=1) / _tok_total
+        try:
+            token_pooled = float(np.mean(per_seed))
+        except (TypeError, ValueError, OverflowError):
+            token_pooled = None
     out = crossed_variance_components(delta, conf=conf)
     out['kind'] = 'paired_delta_variance_components'
     out['delta_unit'] = ('NLL per token, arm a minus arm b '
                          '(negative = arm a better)')
     out['mean_delta_nll_per_token_equal_units'] = out.get('grand_mean')
-    per_seed = np.sum(A - B, axis=1) / float(np.sum(tok))
-    out['token_pooled_delta_nll_per_token'] = float(np.mean(per_seed))
+    if token_pooled is None or not math.isfinite(token_pooled):
+        token_pooled = None
+        out['warnings'].append(
+            'the token-pooled per-token delta is not representable as a finite '
+            'float; only the equal-unit matrix summary is reported')
+    out['token_pooled_delta_nll_per_token'] = token_pooled
     out['weighting_note'] = (
         'variance components are estimated on the equal-width cell matrix '
         '(one per-token delta per seed x unit); the token-pooled mean weights '

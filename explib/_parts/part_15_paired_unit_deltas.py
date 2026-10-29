@@ -368,7 +368,20 @@ def unit_precision_design(n_units, *, pilot_unit_deltas=None,
     if sd is not None and a is not None and n is not None:
         tc = _t_critical(1.0 - a, float(n) - 1.0)
         if math.isfinite(tc):
-            half = float(tc * sd / math.sqrt(n))
+            try:
+                half = float(tc * sd / math.sqrt(n))
+            except (OverflowError, ValueError):
+                half = None
+            if half is not None and not math.isfinite(half):
+                # The product tc*sd can overflow even when the final
+                # half-width is representable for a large n.  Reorder the
+                # division before the multiplication on that extreme path.
+                try:
+                    half = float((sd / math.sqrt(n)) * tc)
+                except (OverflowError, ValueError):
+                    half = None
+                if half is not None and not math.isfinite(half):
+                    half = None
         out['precision'] = {
             'confidence': 1.0 - a,
             't_critical': float(tc) if math.isfinite(tc) else None,
@@ -392,6 +405,15 @@ def unit_precision_design(n_units, *, pilot_unit_deltas=None,
         ze = float(_normal_quantile(tp))
         tc = _t_critical(1.0 - a, float(n) - 1.0)
         mde = ((tc + ze) * sd / math.sqrt(n)) if math.isfinite(tc) else None
+        if mde is not None and not math.isfinite(mde):
+            # Same intermediate-overflow pattern as the CI: at a large n the
+            # final MDE can be representable even when (tc+ze)*sd is not.
+            try:
+                mde = float((sd / math.sqrt(n)) * (tc + ze))
+            except (OverflowError, ValueError):
+                mde = None
+            if mde is not None and not math.isfinite(mde):
+                mde = None
         out['mde'] = {
             'absolute': float(mde) if mde is not None else None,
             'relative_to_pilot_sd': (float(mde) / sd if mde is not None else None),

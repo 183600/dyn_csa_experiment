@@ -235,7 +235,8 @@ def new_seed_replication(deltas, *, conf=0.95, direction=None):
         mean = float(d.mean())
         sd = float(d.std(ddof=1))
     out['mean'] = mean
-    out['std'] = sd
+    if math.isfinite(sd):
+        out['std'] = sd
     if not (math.isfinite(mean) and math.isfinite(sd)):
         out['reason'] = 'the sample mean or SD is not finite'
         return out
@@ -377,19 +378,31 @@ def paired_effect_stats(deltas, alpha=0.05, min_n=3, with_values=None, without_v
     else:
         mean = float(d.mean())
         std = float(d.std(ddof=1)) if std_defined else 0.0
-    sem = float(std / math.sqrt(n)) if std_defined else float('nan')
+    # A finite panel can have a sample SD beyond float64 (two deltas at
+    # +/-1.7e308).  The SD is then unavailable, not an infinite measured
+    # spread: keep the strict-JSON report finite while preserving the
+    # variance-derived verdict below (an unrepresentably wide spread is still
+    # not "within seed noise").
+    _std_available = bool(std_defined and math.isfinite(std))
+    _std_out = float(std) if _std_available else (0.0 if not std_defined else None)
+    _sem_out = (float(std / math.sqrt(n)) if _std_available
+                else (float('nan') if not std_defined else None))
+    sem = _sem_out
     _sf = exact_signflip_p(d)
     p = _sf['p']
     n_nonzero = _sf.get('n_nonzero')
     # Cohen's d_z is a ratio, so the only degenerate case is a measured zero
     # spread.  An absolute std floor (the old 1e-12) makes a tiny but genuinely
-    # variable panel look infinitely strong.
+    # variable panel look infinitely strong.  A spread too large to represent
+    # makes the ratio unavailable rather than +-inf.
     if std > 0.0:
-        dz = float(mean / std)
+        dz = float(mean / std) if math.isfinite(std) else None
     elif mean == 0.0:
         dz = 0.0
     else:
         dz = float('inf') if mean > 0 else float('-inf')
+    if dz is not None and not math.isfinite(dz) and not math.isfinite(std):
+        dz = None
     # Use the attainable floor of THIS vector (zeros reduce resolution), not
     # the theoretical all-nonzero floor 2/2**n.
     p_floor = _sf.get('p_floor', signflip_p_floor(n))
@@ -411,7 +424,7 @@ def paired_effect_stats(deltas, alpha=0.05, min_n=3, with_values=None, without_v
     # Two-sided 95% CI on the paired mean (t interval; the normal approximation
     # is intentionally avoided at the 3-5 seed counts this repo reports).
     ci_lo = ci_hi = float('nan')
-    if n > 1 and math.isfinite(sem):
+    if n > 1 and sem is not None and math.isfinite(sem):
         tc = _t_critical(0.95, n - 1)
         if math.isfinite(tc):
             ci_lo, ci_hi = mean - tc * sem, mean + tc * sem
@@ -473,7 +486,9 @@ def paired_effect_stats(deltas, alpha=0.05, min_n=3, with_values=None, without_v
     # to the confirmatory statistics, but never gate a verdict on them (that
     # would turn a model-based extrapolation into a new decision rule).
     _pred = new_seed_replication(d)
-    return {'n': n, 'mean': mean, 'std': std, 'std_defined': std_defined, 'sem': sem, 'cohens_dz': dz, 'ci95_low': ci_lo, 'ci95_high': ci_hi, 'loo_means': loo_means, 'seed_driven': seed_driven, 'seed_robust': seed_robust, 'p_exact_signflip': float(p), 'p_floor': p_floor, 'min_reachable_p': p_floor, 'underpowered': underpowered, 'resolution_limited': resolution_limited, 'within_seed_noise': within_seed_noise, 'significant': significant, 'incomplete_pairs': (not complete_pairs), 'effect_vs_noise': verdict,
+    return {'n': n, 'mean': mean, 'std': _std_out, 'std_defined': std_defined,
+            'std_available': _std_available,
+            'sem': _sem_out, 'cohens_dz': dz, 'ci95_low': ci_lo, 'ci95_high': ci_hi, 'loo_means': loo_means, 'seed_driven': seed_driven, 'seed_robust': seed_robust, 'p_exact_signflip': float(p), 'p_floor': p_floor, 'min_reachable_p': p_floor, 'underpowered': underpowered, 'resolution_limited': resolution_limited, 'within_seed_noise': within_seed_noise, 'significant': significant, 'incomplete_pairs': (not complete_pairs), 'effect_vs_noise': verdict,
             'unit': 'seed', 'assumption': _assumption, 'sign_counts': _sign,
             'n_nonzero': n_nonzero,
             'p_wilcoxon': _wil.get('p'), 'p_wilcoxon_method': _wil.get('method'),
@@ -827,7 +842,9 @@ def paired_fragility(deltas, *, alpha=0.05, seeds=None):
     else:
         direction = None
     same = pos if direction == 'positive' else (neg if direction == 'negative' else max(pos, neg))
-    out.update({'mean': mean, 'std': std, 'sem': sem,
+    out.update({'mean': mean,
+                'std': (std if math.isfinite(std) else None),
+                'sem': (sem if sem is not None and math.isfinite(sem) else None),
                 'ci95_low': float(ci_lo), 'ci95_high': float(ci_hi),
                 'ci_excludes_zero': (None if not (math.isfinite(ci_lo) and math.isfinite(ci_hi))
                                      else bool(ci_lo > 0.0 or ci_hi < 0.0)),

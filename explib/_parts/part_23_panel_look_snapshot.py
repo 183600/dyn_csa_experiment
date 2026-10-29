@@ -59,7 +59,7 @@ def panel_look_snapshot(recs, *, design=None, baselines=None, factorials=None):
                         'seeds': [int(s) for s in seeds],
                         'deltas': [float(d) for d in deltas],
                         'n': int(len(deltas)),
-                        'mean': float(np.mean(deltas)),
+                        'mean': _scaled_mean_or_raw(deltas),
                         'p_exact_signflip': float(sf.get('p', float('nan'))),
                         'n_skipped_pairs': int(len(skipped)),
                     }

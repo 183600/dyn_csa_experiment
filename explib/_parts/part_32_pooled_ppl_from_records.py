@@ -122,7 +122,14 @@ def _paired_primary_delta(rec_a, rec_b):
 
 
 def _scaled_std_or_raw(values):
-    """Sample SD (ddof=1) that survives extreme-but-finite PPL magnitudes."""
+    """Sample SD (ddof=1), or ``None`` when the true SD exceeds float64.
+
+    A finite panel can have a sample SD beyond the representable range even
+    though each measurement is finite (e.g. ``[1.7e308, -1.7e308]``).  The
+    historical return of ``inf`` is not a measured spread and is not strict-
+    JSON safe, so callers get the same "unavailable" value they already use
+    for a missing SD.
+    """
     try:
         if len(values) < 2:
             return 0.0
@@ -130,8 +137,10 @@ def _scaled_std_or_raw(values):
         return 0.0
     _ms = _scaled_mean_std_if_extreme(values, ddof=1)
     if _ms is not None:
-        return float(_ms[1])
-    return float(np.std(values, ddof=1))
+        sd = float(_ms[1])
+    else:
+        sd = float(np.std(values, ddof=1))
+    return sd if math.isfinite(sd) else None
 
 
 def _scaled_mean_or_raw(values):
@@ -1554,7 +1563,13 @@ def _fmt_pair(main, spread, width, main_fmt, spread_fmt, absent='—', main_cap=
             fmt = main_fmt
         else:
             fmt = main_cap if abs(main) >= 100000000.0 else main_fmt
-        s = f'{main:{fmt}}±{spread:{spread_fmt}}'
+        try:
+            _spread_ok = (spread is not None
+                          and math.isfinite(float(spread)))
+        except (TypeError, ValueError, OverflowError):
+            _spread_ok = False
+        s = (f'{main:{fmt}}±{spread:{spread_fmt}}' if _spread_ok
+             else f'{main:{fmt}}±{absent}')
     return s if len(s) >= width else f'{s:>{width}s}'
 
 def _print_table(agg):

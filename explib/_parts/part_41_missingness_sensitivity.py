@@ -263,7 +263,9 @@ def missingness_sensitivity(deltas, *, seeds, planned_seeds, excluded_seeds=(),
         raise ValueError('missingness_sensitivity: observed/excluded/missing do not partition the planned frame')
     st = paired_effect_stats(d, alpha=alpha, min_n=min_n)
     mean = float(st.get('mean')) if st.get('n') else float('nan')
-    std = float(st.get('std')) if st.get('std_defined') else None
+    _std_raw = st.get('std')
+    std = (float(_std_raw) if st.get('std_defined') and _std_raw is not None
+           else None)
     if std is not None and not math.isfinite(std):
         # A finite panel can have a sample SD beyond float64 (e.g. alternating
         # +/-1.79e308 seeds).  The SD is then unavailable, not an infinite

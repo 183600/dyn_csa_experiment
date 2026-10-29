@@ -530,14 +530,29 @@ def _frozen_random_fuse_weight(w_q, d_model, kernel, dtype):
         _gen.manual_seed(_seed)
         w = torch.randn(shape, generator=_gen, dtype=torch.float32)
     except Exception:
-        w = torch.empty(shape, dtype=torch.float32)
+        # Do NOT fall back to an uninitialised buffer: `torch.empty` can
+        # contain stale-but-finite memory, which would make the "deterministic"
+        # placebo kernel differ between two builds of the same arm.  Use a
+        # fixed deterministic sequence instead; it is rescaled below exactly
+        # like the hashed kernel.
+        w = torch.linspace(-1.0, 1.0, out_channels * kernel,
+                           dtype=torch.float32).reshape(shape)
     if not torch.isfinite(w).all() or float(w.norm()) == 0.0:
         w = torch.linspace(-1.0, 1.0, out_channels * kernel,
                            dtype=torch.float32).reshape(shape)
-    # Identity fusion has per-channel kernel norm 1; scale the random kernel
-    # the same way so it is a magnitude-matched placebo, not a larger/smaller
-    # intervention.
-    w = w / math.sqrt(max(kernel, 1))
+    # Identity fusion has per-channel L2 kernel norm exactly 1 (a single
+    # one-hot tap).  Normalise each output channel to the same radius; merely
+    # dividing by sqrt(kernel) only matches the EXPECTED norm of a Gaussian
+    # vector, leaving individual channels much smaller/larger and making the
+    # "magnitude-matched" placebo a different intervention strength.  A
+    # zero/non-finite channel falls back to the fixed deterministic ramp.
+    _norms = w.reshape(out_channels, -1).norm(dim=1)
+    if not (torch.isfinite(_norms).all() and bool((_norms > 0.0).all())):
+        w = torch.linspace(-1.0, 1.0, out_channels * kernel,
+                           dtype=torch.float32).reshape(shape)
+        _norms = w.reshape(out_channels, -1).norm(dim=1)
+    _norms = _norms.clamp_min(torch.finfo(w.dtype).tiny)
+    w = w / _norms.reshape(out_channels, 1, 1)
     return w.to(dtype=dtype)
 
 

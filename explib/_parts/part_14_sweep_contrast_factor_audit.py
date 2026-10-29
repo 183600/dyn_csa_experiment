@@ -990,6 +990,15 @@ def paired_design_sensitivity(n_seeds, m_comparisons, *, alpha=0.05,
     if sd is not None and n is not None:
         tc = _t_critical(0.95, float(n - 1))
         half = (float(tc) * sd / math.sqrt(n)) if math.isfinite(tc) else None
+        if half is not None and not math.isfinite(half):
+            # tc*sd can overflow while a large planned n still makes the
+            # half-width representable; reorder before declaring it missing.
+            try:
+                half = float((sd / math.sqrt(n)) * tc)
+            except (OverflowError, ValueError):
+                half = None
+            if half is not None and not math.isfinite(half):
+                half = None
         out['precision'] = {
             'confidence': 0.95, 't_critical': float(tc) if math.isfinite(tc) else None,
             'ci95_halfwidth': half, 'target_halfwidth': None,
@@ -1020,16 +1029,23 @@ def paired_design_sensitivity(n_seeds, m_comparisons, *, alpha=0.05,
         q_target = out['min_q_for_target_power']
         if q_target > 0.5 + 1e-12:
             mde = sd * _normal_quantile(q_target)
+            if not math.isfinite(mde):
+                # The model-implied detectable effect is beyond float64; keep
+                # the planning field visible but unavailable instead of JSON
+                # emitting Infinity.
+                mde = None
             out['mde'] = {
-                'absolute': float(mde), 'q_for_target_power': float(q_target),
-                'relative_to_pilot_sd': (float(mde) / sd if sd else None),
+                'absolute': (float(mde) if mde is not None else None),
+                'q_for_target_power': float(q_target),
+                'relative_to_pilot_sd': (float(mde) / sd if mde is not None else None),
                 'method': ('normal sign-probability approximation '
                            '(sd * Phi^-1(q_target)); sign-flip power remains '
                            'a symbol-test planning projection'),
             }
             if sesoi is not None:
                 sesoi_value = _finite_scalar(sesoi)
-                if sesoi_value is not None and sesoi_value > 0.0:
+                if (mde is not None and sesoi_value is not None
+                        and sesoi_value > 0.0):
                     out['mde']['multiple_of_sesoi'] = float(mde / sesoi_value)
     sesoi_value = None
     if sesoi is not None:

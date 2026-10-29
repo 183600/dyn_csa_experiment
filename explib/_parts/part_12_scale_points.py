@@ -249,6 +249,14 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
     _effect_min_abs = min((a for a in _effect_abs if a > 0.0), default=0.0)
     _scale_effects = bool(math.isfinite(_effect_scale) and _effect_scale > 0.0
                           and (_effect_scale < _EFFECT_SCALE_FLOOR or _effect_min_abs > 1e100))
+
+    def _finite_or_none(value):
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return number if math.isfinite(number) else None
+
     per = []
     for p in pts:
         d = np.asarray(p['effects'], dtype=float)
@@ -279,18 +287,30 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
                 se = float(se_work * _effect_scale)
             else:
                 m, sd, se = m_work, sd_work, se_work
-            row.update({'mean': m, 'std': sd, 'se': se,
+            # Rescaling a finite within-scale SD/SE back to input units can
+            # exceed float64 (opposite-signed extreme effects).  Keep the
+            # internal work-scale values for the pooling arithmetic, but the
+            # report fields are unavailable rather than infinite.
+            row.update({'mean': _finite_or_none(m),
+                        'std': _finite_or_none(sd),
+                        'se': _finite_or_none(se),
                         '_mean_work': m_work, '_se_work': se_work,
                         '_work_scale': (max(abs(float(x)) for x in d_work)
                                         if n else 0.0),
                         'underpowered': n < int(min_seeds)})
             if n > 1:
                 tc = _t_critical(1.0 - float(alpha), n - 1)
-                row['ci'] = [m - tc * se, m + tc * se]
+                _lo = m - tc * se
+                _hi = m + tc * se
+                row['ci'] = ([_lo, _hi]
+                             if math.isfinite(_lo) and math.isfinite(_hi)
+                             else None)
+            else:
+                row['ci'] = None
         else:
-            row.update({'mean': float('nan'), 'std': float('nan'), 'se': float('nan'),
+            row.update({'mean': None, 'std': None, 'se': None,
                         '_mean_work': float('nan'), '_se_work': float('nan'),
-                        'underpowered': True})
+                        'underpowered': True, 'ci': None})
         per.append(row)
     # A scale point with identical effects across seeds has zero within-scale
     # variance.  It is NOT the same as a missing/underpowered point, but the
@@ -335,7 +355,7 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
 
     _non_estimable = [r['label'] for r in per
                       if r['n'] > 1
-                      and (not math.isfinite(r.get('mean', float('nan')))
+                      and (_finite_or_none(r.get('mean')) is None
                            or not _weight_is_representable(r))
                       and not _variance_is_zero(r)]
     usable = [r for r in per
@@ -466,7 +486,7 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
                     'note': ('fewer than two seeds were measured at EVERY scale '
                              'point; the paired common effect is unavailable')}
             else:
-                _per_seed = [float(np.mean(_by_seed_all[_s]))
+                _per_seed = [_scaled_mean_or_raw(_by_seed_all[_s])
                              for _s in _complete_seeds]
                 _pst = paired_effect_stats(_per_seed, alpha=alpha,
                                            min_n=min_seeds,
@@ -573,6 +593,23 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
         lo, hi = _finite_out(pair[0]), _finite_out(pair[1])
         return [lo, hi] if lo is not None and hi is not None else None
 
+    # The paired common-effect block is a paired_effect_stats report.  Its
+    # mean/CI can be non-finite for opposite-signed extreme per-seed means;
+    # an unavailable estimate is None, not an infinite JSON value.
+    if isinstance(_paired_common, dict) and _paired_common.get('status') == 'ok':
+        for _key in ('mean', 'std', 'sem', 'cohens_dz'):
+            if _key in _paired_common:
+                _paired_common[_key] = _finite_out(_paired_common.get(_key))
+        _pc_ci = _finite_ci([_paired_common.get('ci95_low'),
+                             _paired_common.get('ci95_high')])
+        if _pc_ci is None:
+            _paired_common['ci95_low'] = None
+            _paired_common['ci95_high'] = None
+        else:
+            _paired_common['ci95_low'], _paired_common['ci95_high'] = _pc_ci
+        _pc_pi = _finite_ci(_paired_common.get('prediction_interval_95'))
+        _paired_common['prediction_interval_95'] = _pc_pi
+
     _tc_fe = _t_critical(1.0 - float(alpha), max(1, df))
     _fe_ci = _finite_ci([mu_fe_out - _tc_fe * se_fe_out,
                          mu_fe_out + _tc_fe * se_fe_out])
@@ -585,7 +622,7 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
     _tau2_out = _finite_out(tau2)
     out.update({'fixed_effect': {'mean': _fr, 'se': _fs, 'ci': _fe_ci},
                 'random_effects': {'mean': _rr, 'se': _rs, 'ci': _re_ci},
-                'heterogeneity': {'Q': q, 'df': int(df), 'p': p_q,
+                'heterogeneity': {'Q': _finite_out(q), 'df': int(df), 'p': p_q,
                                   'I2_percent': i2, 'tau2': _tau2_out,
                                   'tau2_available': _tau2_out is not None,
                                   'method': 'Cochran Q + DerSimonian-Laird tau^2'},

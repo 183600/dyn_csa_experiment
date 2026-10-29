@@ -229,9 +229,25 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
         budget_matched = None
         tpp_ratio = None
         if len(tpp) == len(rows):
-            tpp_ratio = max(tpp) / min(tpp) if min(tpp) > 0 else float('inf')
-            budget_matched = bool(tpp_ratio <= 1.0 + tol)
-            if not budget_matched:
+            _lo, _hi = min(tpp), max(tpp)
+            if _lo > 0:
+                try:
+                    tpp_ratio = float(_hi / _lo)
+                except (OverflowError, ZeroDivisionError):
+                    tpp_ratio = None
+                if tpp_ratio is not None and not math.isfinite(tpp_ratio):
+                    tpp_ratio = None
+            else:
+                tpp_ratio = None
+            budget_matched = bool(tpp_ratio is not None
+                                  and tpp_ratio <= 1.0 + tol)
+            if tpp_ratio is None:
+                warnings.append(
+                    'tokens-per-parameter is not matched across the ladder '
+                    '(the max/min ratio exceeds the representable float range); '
+                    'a cross-scale effect is confounded with a different '
+                    'exposure budget')
+            elif not budget_matched:
                 warnings.append(
                     'tokens-per-parameter is not matched across the ladder '
                     f'(max/min={tpp_ratio:.2f} > {1.0 + tol:.2f}); a cross-scale '
@@ -1687,6 +1703,16 @@ def single_factor_initialization_audit(design=None, *, factory=None,
            'note': ('non-intervention parameters must be bit-identical at the '
                     'same seed; optional-module construction must not consume '
                     'the global RNG stream')}
+    # Fail closed when the definition-site audit rejects the design.  The loop
+    # below only inspects pairs the cfg gate labels `single_factor`; an
+    # undeclared extra key or a multi-factor contrast is therefore absent from
+    # `single_factor_pairs`, and without this propagation the initialization
+    # report would say "ok" for precisely the designs the caller must refuse.
+    if cfg_rep.get('status') != 'ok':
+        out['violations'].append(
+            'the definition-site single-factor audit failed; initialization '
+            'cannot certify a contrast whose cfg diff is undeclared or '
+            'multi-factor')
 
     def _allowed_param(name, keys):
         leaf = name.rsplit('.', 1)[-1]
@@ -1699,16 +1725,27 @@ def single_factor_initialization_audit(design=None, *, factory=None,
             return True
         return False
 
+    _state_cache = {}
+
     def _state(arm):
+        try:
+            _ckey = ('arm', arm)
+            if _ckey in _state_cache:
+                return _state_cache[_ckey]
+        except TypeError:
+            _ckey = None
         _prev = torch.get_rng_state()
         try:
             torch.manual_seed(seed)
             model = SmallGPT(32, 16, n_layers, 2, 8, 16,
                              factory(n_layers, arm))
-            return {n: p.detach().clone()
-                    for n, p in model.named_parameters()}
+            _state = {n: p.detach().clone()
+                      for n, p in model.named_parameters()}
         finally:
             torch.set_rng_state(_prev)
+        if _ckey is not None:
+            _state_cache[_ckey] = _state
+        return _state
 
     for label in cfg_rep.get('single_factor_pairs') or []:
         rec = cfg_rep.get('pairs', {}).get(label) or {}

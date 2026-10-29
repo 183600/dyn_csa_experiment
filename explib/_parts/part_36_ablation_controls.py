@@ -688,6 +688,10 @@ def sink_control_audit(design=None, ladder=None, present=None, factory=None,
             out['violations'].append(
                 f'{base_label}: capacity placebo sink parameters are trainable; '
                 'a learned placebo is not a placebo')
+        if _t['n_sink_tensors'] and _t['sink_frozen']:
+            out['violations'].append(
+                f'{base_label}: treatment sink parameters are frozen; the '
+                '"learned" level cannot be a treatment')
         if _t['total'] - _a['total'] != _t['sink_params']:
             out['violations'].append(
                 f'{base_label}: absence control removes '
@@ -1132,6 +1136,10 @@ def fusion_control_audit(design=None, ladder=None, present=None, factory=None,
             out['violations'].append(
                 f'{base_label}: capacity placebo fusion parameters are trainable; '
                 'a learned placebo is not a placebo')
+        if _t['n_fuse_tensors'] and _t['fuse_frozen']:
+            out['violations'].append(
+                f'{base_label}: treatment fusion parameters are frozen; the '
+                '"learned" level cannot be a treatment')
         if _t['total'] - _a['total'] != _t['fuse_params']:
             out['violations'].append(
                 f'{base_label}: absence control removes '
