@@ -99,6 +99,29 @@ def _print_methodology_audit(report):
         if _md.get('margin_not_robust_contrasts'):
             print('      MARGIN-NOT-ROBUST: ' + ', '.join(
                 _md['margin_not_robust_contrasts'][:5]))
+    _ts = report.get('trajectory_stability') or {}
+    _trows = [r for r in (_ts.get('contrasts') or [])
+              if r.get('status') not in (None, 'insufficient_history', 'invalid')]
+    if _trows:
+        print('  --- endpoint trajectory (balanced per-eval-step history; '
+              'descriptive) ---')
+        print('      stable: %s; late crossing: %s; final-point-only: %s; '
+              'gap narrowing: %s; history/primary sign disagreement: %s'
+              % (_ts.get('n_stable'), _ts.get('n_late_crossing'),
+                 _ts.get('n_final_point_only'), _ts.get('n_gap_narrowing'),
+                 _ts.get('n_primary_history_disagreement')))
+        for _r in _trows[:12]:
+            print('      %-42s %-16s steps=%-3s final-sign=%s primary-sign=%s '
+                  'gap=%s'
+                  % (_r.get('name'), _r.get('status'), _r.get('n_shared_steps'),
+                     _r.get('final_sign'), _r.get('primary_sign'),
+                     _r.get('gap_trend')))
+        if _ts.get('late_crossing_contrasts'):
+            print('      LATE-CROSSING: ' + ', '.join(
+                _ts['late_crossing_contrasts'][:5]))
+        if _ts.get('primary_history_disagreement_contrasts'):
+            print('      HISTORY/PRIMARY SIGN DISAGREEMENT: ' + ', '.join(
+                _ts['primary_history_disagreement_contrasts'][:5]))
     for comp, entries in report['components'].items():
         live = [e for e in entries if e['n_shared'] > 0]
         if not live:

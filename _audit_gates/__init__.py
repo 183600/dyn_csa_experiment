@@ -21,6 +21,7 @@ _PARTS = [
 'part_07_reproduction.py',
 'part_05_audit_confirmation_verdicts.py',
 'part_08_audit_missingness.py',
+'part_09_audit_trajectory.py',
 ]
 
 for _part in _PARTS:

@@ -7315,3 +7315,130 @@ parameter 不同、或出现未解释的 extra/missing tensor，都判 fail。�
   结果不能单独写成学习机制证据。
 - 新臂是下一轮运行的排程，不是已有证据；旧面板缺臂时
   `ablation_completeness` 会如实报不完整。
+
+## 95. 最终一步不是整条轨迹：配对评测历史的符号稳定性（本轮结果分析硬化）
+
+### 95.1 问题：终点是一个快照，历史却只被画成图
+
+本仓库的冻结端点是**固定最终评测**，这是正确的。但同一批配对种子在训练
+过程中还有逐评测步的验证 PPL（`ppl_history`）；旧代码只用它画 seed 平均
+曲线、做训练健康诊断。于是报告可以出现两种未被说明的情形：
+
+1. **late crossing。** 两个臂在大部分训练中同向，最后一步才交叉；最终符号
+   只描述一个很新的 regime，不是持续排序。
+2. **仍在收敛的 gap。** gap 在最后几次评测中持续缩小；最终值在数学上有效，
+   但把它写成「settled」会外推到训练停止之后。
+
+这两种情形都不会被 `within_seed_noise`、逐种子 LOO 或 max-T 捕获：它们
+回答「种子间是否稳定」，不回答「最终符号在训练轨迹上是否是同一个 regime」。
+反过来，也不能用轨迹上的多个点当独立重复检验——评测步之间高度相关，且
+最终端点用的是完整验证行、历史用的是评测子集。
+
+### 95.2 方法：声明尾窗 + 平衡共同步网格 + log-PPL 差
+
+`exp_lib.paired_trajectory_stability(history_a, history_b, ...)` 接收
+`{seed: [(step, ppl), ...]}` 两条臂的历史，并：
+
+- **只使用所有纳入种子、两条臂都有的共同评测步**。任何只在部分种子上出现
+  的步被丢弃并计数（`steps_dropped_unbalanced`），避免「评测更频繁的种子」
+  对某一步的均值加权。缺失整条历史的种子被点名跳过（`skipped_seeds`）；
+  少于 `min_shared_steps` 时显式 `insufficient_history`。
+- 每步计算配对 **log-PPL 差** `mean_s[log(a_s) - log(b_s)]`，它等于配对
+  NLL 差、对两臂整体乘同一个常数不变；同时给出原始 `mean_delta_ppl`。
+- **尾窗是声明值，不是看结果后挑的**：默认最后 3 个共同评测步（含最终步），
+  写在 `TRAJECTORY_POLICY` 里。
+- `status` 只描述轨迹形状：
+  - `stable`：尾窗内所有非零符号都与最终符号一致；
+  - `late_crossing`：尾窗内存在与最终符号相反的点；
+  - `final_point_only`：尾窗内最终步之前全为 0（只有终点有符号）；
+  - `zero_final`：最终 log 差在 `zero_tol` 内为 0；
+  - `insufficient_history`：共同步不足。
+- 另报 `n_sign_changes` / `last_sign_change_step`、每个种子的最终符号是否与
+  面板一致（`n_seeds_final_sign_matches`）、每个种子自己的尾窗是否稳定
+  （`n_seeds_tail_stable`）、两臂尾窗 log-PPL 斜率与 gap 斜率
+  （每 1000 步），以及 `gap_trend`（`widening` / `narrowing` / `flat`）。
+- 把历史最终的**原始 PPL 差符号**与**主端点** `primary_delta` 的符号对比
+  （同一尺度），另把历史最终的 log 比符号与主端点符号对比。历史在评测
+  子集上测得，主端点用完整固定验证行，因此两者不是同一个样本；原始差
+  符号不一致时输出 `primary_vs_history_sign=False` 并警告检查样本差异，
+  而不是假设它们相等。log 符号与原始差符号本身不一致时输出
+  `scale_sensitive_final=True`：这说明「效应方向」依赖 log 比还是 PPL 点
+  差，引用时必须点明估计量，不能只报一个符号。
+- 检查共同步是否覆盖主端点：`endpoint_step` 由记录的 `steps_completed`
+  （或 `steps`）传入；历史若在更早的步结束，标 `final_step_is_endpoint=False`
+  并警告「轨迹不覆盖报告端点」。同时记录历史所用的 `eval_subset_fp` 集合，
+  多个 distinct 指纹时警告各 seed/臂可能不是在同一批评测行上取历史。
+
+整个函数**不产生 p 值、不构造区间、不改变任何判定**。`narrowing` 与
+`late_crossing` 是持久性警告，不是「未确认」的新阈值。
+
+### 95.3 接线
+
+- 新增 `explib/_parts/part_42_trajectory_stability.py`，导出策略与
+  `paired_trajectory_stability`；追加到 `explib/_PARTS` 顺序末尾。
+- `methodology_audit` 在逐对照写 `missingness` 之后，对每条有配对 `deltas`
+  的对照，用 `(with, tag_with, seed)` / `(without, tag_without, seed)` 取出
+  两条记录的 `ppl_history`，写入 `entry['trajectory_stability']`；
+  面板级汇总写入 `report['trajectory_stability']`。
+- 汇总字段包括 `n_stable` / `n_late_crossing` / `n_zero_final` /
+  `n_final_point_only` / `n_gap_narrowing` / `n_primary_history_disagreement`
+  / `n_insufficient_history` / `n_invalid` /
+  `n_history_short_of_endpoint` / `n_mixed_history_subset` /
+  `n_mixed_endpoint_step` / `n_scale_sensitive_final` 与逐对照行；
+  late crossing、narrowing、history/primary 不一致、历史不覆盖端点、
+  子集指纹混合、端点步不一致、log/raw 符号尺度敏感各输出一条带名单的
+  warning。
+- `_print_methodology_audit` 增加「endpoint trajectory」小节；缺历史或历史
+  畸形时只把该诊断标为 `insufficient_history` / `invalid`，不阻断聚合，也
+  不在 legacy 面板上伪造 stable。
+- 新增 `audit_gates.py trajectory`（别名 `traj` / `trajectory_stability`）：
+  从落盘 `methodology_audit.json` 的 `series` 与 `per_seed_tail` 重算
+  final sign、尾窗 status、符号变化、gap 斜率/trend、逐种子一致计数与
+  `final_step_is_endpoint`，并核对面板计数；篡改任一读数判 `fail`，旧产物
+  无该块判 `not_verifiable`（不冒充通过）。该门只验证 artifact 内部可复算，
+  不验证历史曲线本身是否来自可信训练。
+
+### 95.4 边界
+
+- **不替代固定最终端点。** 冻结判定仍只读最终评测；`stable` 不是
+  「效应真实」的证书，`late_crossing` 也不是「效应无效」的证明。
+- **不是新检验。** 尾窗内的多个评测步高度相关；本块不把它们的数量当 n，
+  不产生轨迹 p 值，也不进入 Holm/max-T 族。否则等于用更多相关读数扩大
+  forking paths。
+- **历史与主端点可能测在不同行上。** `ppl_history` 是逐评测步的子集
+  （`eval_subset`）PPL，最终 `ppl` 是完整固定验证批；两者符号不一致可能只是
+  子集抽样差异，所以只报警、不覆盖主端点。反过来，符号一致也不证明主端点
+  在轨迹上稳定。
+- **平衡网格会丢步。** 若某些种子评测频率不同，共同步可能很少；此时
+  `insufficient_history` 比拿不等 n 的步均值更诚实。丢步数会落盘，不能被
+  静默忽略。
+- **默认尾窗是 convention。** 3 个点只描述最近一段；训练早期的交叉不算
+  late crossing，也不应被解释为「一直不稳定」。要问更长/更短窗口必须
+  事先声明，不能看结果后调。
+- **缺历史不等于稳定。** v6–v11 的一些记录可能没有内联 `ppl_history`；
+  该块只报不可用，不回溯、不重跑、不补造曲线。
+
+### 95.5 入口与验证
+
+```bash
+python -m pytest -q test_review_part_33.py
+python audit_gates.py trajectory                   # 零 GPU；重放落盘轨迹块
+python audit_gates.py trajectory OUTDIR            # 指定面板目录或 JSON
+python audit_gates.py traj                         # 别名
+python audit_gates.py report                       # 顶层 trajectory
+python -m explib.confirmation report   # 若面板带 ppl_history，报告/JSON 含 trajectory_stability
+```
+
+`test_review_part_33.py` 13 项覆盖：稳定轨迹与主端点同向；late crossing
+不被改写成 stable；`final_point_only` 与 `zero_final`；gap narrowing 的
+描述性警告；不等步网格丢步与被点名跳过的种子；两臂整体缩放下符号/斜率/
+log 差不变（原始 PPL 差按比例缩放）；重复步/非正 PPL/布尔 PPL/非整数步/
+非法尾窗/重复请求种子/非数值主端点 fail-closed；共同步不足显式不可用；
+历史在端点前结束被标 `final_step_is_endpoint=False`、恰在端点时标 True；
+log 比与原始 PPL 差符号相反时标 `scale_sensitive_final` 且 raw/log 的
+primary 对比分别正确；
+审计门对干净产物 `ok`、篡改 final sign 判 `fail`、无该块的旧产物只
+`not_verifiable`；
+`methodology_audit` 在有/无历史两种输入下所有判定承载字段逐值相同、只增加
+轨迹块；以及 late crossing 与 history/primary 不一致的顶层 warning。完整
+CPU 套件在本轮最终树通过。

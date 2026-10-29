@@ -63,6 +63,12 @@
                artifact 报 not_verifiable，篡改判 fail。它不改变任何
                p/Holm/verified 或冻结判定（零 GPU；别名 missing /
                missing_data / attrition_sensitivity）
+  trajectory    评测轨迹稳定性：从 methodology_audit.json 的配对逐评测步
+               log-PPL 序列重算最终符号、late crossing、尾窗 gap trend、
+               逐种子一致计数与端点覆盖；缺块或旧 artifact 报
+               not_verifiable，篡改判 fail。它不产生 p 值、不改变
+               p/Holm/verified 或冻结判定（零 GPU；别名 traj /
+               trajectory_stability；可传面板目录或 artifact 路径）
   joint_correction  消融族的相关性感知联合校正：从逐种子配对差重放 exact
                sign-flip max-T（Westfall-Young free step-down）与同时
                区间；缺 family.maxt 报 not_verifiable，篡改 p/区间/排名/

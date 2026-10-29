@@ -4033,3 +4033,56 @@ dynamic_study、动态 H1 换成多因素臂对后该门 fail。完整 CPU 套�
 `749 passed, 3 skipped`；`python -m explib.confirmation plan` 仍为
 72/72 合成记录、6 个比较；`python audit_gates.py single_factor` 与
 `python audit_gates.py report` 在当前树均为 `ok`。
+
+## 2026-10-29 — 最终一步不是整条轨迹：配对评测历史的符号稳定性（本轮结果分析硬化，no new runs）
+
+零 GPU 的结果分析硬化；不新增训练、不读取 test split、不修改冻结清单的
+字节/种子/端点/alpha/Holm 规则，也不改 `CODE_SEMANTICS`；`.github/` 与所有
+README 未触碰。
+
+**Problem.** 冻结端点是固定最终评测，这是正确的；但同一批配对种子的
+`ppl_history` 只用被画成 seed 平均曲线/做训练健康诊断。报告因此无法区分
+「最终符号是持续 regime」与「最后一步才交叉」或「gap 仍在缩小」。现有
+`within_seed_noise`、逐种子 LOO、`seed_driven`、max-T 都回答种子间稳定性，
+不回答轨迹上的符号稳定性；而把轨迹上的多个评测步当独立重复检验又会引入
+强相关读数，扩大 forking paths。
+
+**Fix.** 新增 `exp_lib.paired_trajectory_stability(history_a, history_b, ...)`：
+在**所有纳入种子、两条臂都有的共同评测步**上计算配对 log-PPL 差（与 NLL
+差同尺度、对两臂整体缩放不变）和原始 PPL 差；尾窗固定为最后 3 个共同步
+（`TRAJECTORY_POLICY`，不是看结果后挑的），给出 `stable` /
+`late_crossing` / `final_point_only` / `zero_final` / `insufficient_history`，
+以及全轨迹符号变化次数、最后变化步、每个种子的最终符号一致性、尾窗两臂
+log 斜率、gap 斜率与 `widening`/`narrowing`/`flat`。历史最终符号与主端点
+符号单独对比：历史用评测子集、主端点用完整固定验证行，两者不同样本，只
+报 `primary_vs_history_sign` 并警告，不假设相等；同时报历史最终的 log 比
+符号 `primary_vs_history_log_sign`，log 与原始 PPL 差符号相反时标
+`scale_sensitive_final`，强制引用时点明估计量。`methodology_audit` 对每条
+有配对 `deltas` 的对照写 `entry['trajectory_stability']`，面板写
+`report['trajectory_stability']`（逐对照行 + late/narrowing/disagreement
+名单），`_print_methodology_audit` 增加对应小节。无历史/畸形历史只标
+`insufficient_history`/`invalid`，不阻断聚合，也不在 legacy 面板上伪造
+stable。新增 `audit_gates.py trajectory`（别名 `traj`/
+`trajectory_stability`）从落盘 `series`/`per_seed_tail` 重算 final sign、
+尾窗 status、符号变化、gap 斜率/trend、逐种子一致计数与
+`final_step_is_endpoint`，并核对面板计数；篡改判 `fail`，旧产物无该块判
+`not_verifiable`。
+
+**Boundary.** 不替代固定最终端点：`stable` 不是「效应真实」的证书，
+`late_crossing` 也不是「无效」的证明；仍只由既有 p/Holm/TOST/max-T 与冻结
+规则作判定。不是新检验：尾窗多个评测步高度相关，不产生轨迹 p 值、不进入
+任何 Holm/max-T 族、不改变 `verified`/`significant`。历史与主端点可能测在
+不同行上，符号不一致可能只是评测子集差异；一致也不证明主端点在轨迹上
+稳定。共同步不足时显式不可用，丢步数落盘，不用不等 n 的步均值补造轨迹。
+默认 3 点只是最近一段的描述性 convention；训练早期交叉不算 late crossing。
+缺 `ppl_history` 的旧记录不回溯、不重跑。
+
+**Verification.** 新增 `test_review_part_33.py` 13 项：稳定轨迹/主端点同向、
+late crossing、`final_point_only`/`zero_final`、gap narrowing 警告、不等步
+网格丢步与跳过种子、整体缩放不变性、重复步/非正 PPL/布尔 PPL/非整数步/
+非法尾窗/重复种子/非数值主端点 fail-closed、共同步不足、历史在端点前结束时标
+`final_step_is_endpoint=False`、log/raw 符号相反时 `scale_sensitive_final`
+与两个 primary 对比字段分别正确、`methodology_audit`
+有/无历史时所有判定承载字段逐值相同、late crossing 与 history/primary 不
+一致的顶层 warning；审计门干净→`ok`、篡改 final sign→`fail`、旧产物→
+`not_verifiable`。完整 CPU 套件在本轮最终树通过。

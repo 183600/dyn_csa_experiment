@@ -56,6 +56,7 @@ _PARTS = [
 'part_39_factorial_power.py',
 'part_40_ablation_joint_correction.py',
 'part_41_missingness_sensitivity.py',
+'part_42_trajectory_stability.py',
 ]
 
 for _part in _PARTS:

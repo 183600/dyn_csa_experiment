@@ -143,6 +143,207 @@ report['missingness'] = {
              'Holm family, verified verdict or any frozen decision'),
 }
 
+# ---- evaluation-trajectory stability: is the final sign a persistent regime? ----
+# The frozen endpoint stays the fixed final evaluation.  This readout only asks
+# whether the per-eval-step history on the same paired seeds tells the same
+# story, and it never changes significant/verified/Holm or a frozen verdict.
+_traj_rows = []
+_traj_late = []
+_traj_narrow = []
+_traj_disagree = []
+_traj_final_only = []
+_traj_unavailable = []
+_traj_invalid = []
+_traj_short = []
+_traj_subset_mixed = []
+_traj_endpoint_mixed = []
+_traj_scale_sensitive = []
+for _traj_entry in all_entries:
+    if not isinstance(_traj_entry, dict) or not _traj_entry.get('deltas'):
+        continue
+    _tr_name = '%s::%s - %s' % (_traj_entry.get('kind') or 'contrast',
+                                _traj_entry.get('with'),
+                                _traj_entry.get('without'))
+    _tr_seeds = list(_traj_entry.get('seeds') or [])
+    _tr_a, _tr_b = _traj_entry.get('with'), _traj_entry.get('without')
+    _tr_ta, _tr_tb = _traj_entry.get('tag_with'), _traj_entry.get('tag_without')
+    _tr_ha, _tr_hb = {}, {}
+    _tr_endpoint_steps = set()
+    _tr_subset_fps = set()
+    for _tr_s in _tr_seeds:
+        _tr_ra = recs.get((_tr_a, _tr_ta, _tr_s))
+        _tr_rb = recs.get((_tr_b, _tr_tb, _tr_s))
+        if isinstance(_tr_ra, dict) and _tr_ra.get('ppl_history') is not None:
+            _tr_ha[_tr_s] = _tr_ra.get('ppl_history')
+        if isinstance(_tr_rb, dict) and _tr_rb.get('ppl_history') is not None:
+            _tr_hb[_tr_s] = _tr_rb.get('ppl_history')
+        for _tr_rec in (_tr_ra, _tr_rb):
+            if not isinstance(_tr_rec, dict):
+                continue
+            _tr_step = _as_seed_int(_tr_rec.get('steps_completed')
+                                    if _tr_rec.get('steps_completed') is not None
+                                    else _tr_rec.get('steps'))
+            if _tr_step is not None:
+                _tr_endpoint_steps.add(_tr_step)
+            if _tr_rec.get('eval_subset_fp'):
+                _tr_subset_fps.add(str(_tr_rec.get('eval_subset_fp')))
+    _tr_endpoint = (next(iter(_tr_endpoint_steps))
+                    if len(_tr_endpoint_steps) == 1 else None)
+    try:
+        _tr = paired_trajectory_stability(
+            _tr_ha, _tr_hb, seeds=_tr_seeds,
+            primary_delta=_traj_entry.get('mean'),
+            endpoint_step=_tr_endpoint)
+    except (ValueError, TypeError) as _tr_exc:
+        _tr = {
+            'kind': 'paired_trajectory_stability',
+            'status': 'invalid',
+            'reason': f'{type(_tr_exc).__name__}: {_tr_exc}',
+            'warnings': ['the stored evaluation history is malformed; the '
+                         'endpoint trajectory is not interpreted'],
+        }
+        _traj_invalid.append(_tr_name)
+    _tr['history_subset_fps'] = sorted(_tr_subset_fps)
+    _tr['endpoint_step_shared'] = _tr_endpoint
+    if len(_tr_endpoint_steps) > 1:
+        _tr['warnings'] = list(_tr.get('warnings') or []) + [
+            'the paired records do not share one endpoint step (%d distinct '
+            'values); the primary endpoint is not measured at a common '
+            'training horizon' % len(_tr_endpoint_steps)]
+        _traj_endpoint_mixed.append(_tr_name)
+    if len(_tr_subset_fps) > 1:
+        _tr['warnings'] = list(_tr.get('warnings') or []) + [
+            'the paired records do not share one evaluation-subset '
+            'fingerprint (%d distinct values); the per-eval-step history is '
+            'not known to score the same rows across every seed/arm'
+            % len(_tr_subset_fps)]
+        _traj_subset_mixed.append(_tr_name)
+    if _tr.get('final_step_is_endpoint') is False:
+        _tr['warnings'] = list(_tr.get('warnings') or []) + [
+            'the history trajectory ends before the primary endpoint step']
+        _traj_short.append(_tr_name)
+    _traj_entry['trajectory_stability'] = _tr
+    _tr_row = {
+        'name': _tr_name,
+        'component': _traj_entry.get('component'),
+        'status': _tr.get('status'),
+        'n_seeds_included': _tr.get('n_seeds_included'),
+        'n_shared_steps': _tr.get('n_shared_steps'),
+        'final_step': _tr.get('final_step'),
+        'final_sign': _tr.get('final_sign'),
+        'primary_sign': _tr.get('primary_sign'),
+        'primary_vs_history_sign': _tr.get('primary_vs_history_sign'),
+        'primary_vs_history_log_sign': _tr.get('primary_vs_history_log_sign'),
+        'scale_sensitive_final': _tr.get('scale_sensitive_final'),
+        'n_seeds_final_sign_matches': _tr.get('n_seeds_final_sign_matches'),
+        'n_seeds_tail_stable': _tr.get('n_seeds_tail_stable'),
+        'tail_gap_slope_log_per_1k': _tr.get('tail_gap_slope_log_per_1k'),
+        'gap_trend': _tr.get('gap_trend'),
+        'endpoint_step': _tr.get('endpoint_step'),
+        'final_step_is_endpoint': _tr.get('final_step_is_endpoint'),
+        'history_subset_fps': _tr.get('history_subset_fps'),
+        'skipped_seeds': _tr.get('skipped_seeds'),
+    }
+    _traj_rows.append(_tr_row)
+    if _tr.get('status') == 'late_crossing':
+        _traj_late.append(_tr_name)
+    elif _tr.get('status') == 'final_point_only':
+        _traj_final_only.append(_tr_name)
+    elif _tr.get('status') == 'insufficient_history':
+        _traj_unavailable.append(_tr_name)
+    if _tr.get('gap_trend') == 'narrowing':
+        _traj_narrow.append(_tr_name)
+    if _tr.get('primary_vs_history_sign') is False:
+        _traj_disagree.append(_tr_name)
+    if _tr.get('scale_sensitive_final') is True:
+        _traj_scale_sensitive.append(_tr_name)
+    if _tr.get('status') in ('final_point_only', 'zero_final'):
+        for _tr_w in _tr.get('warnings') or []:
+            report['warnings'].append('trajectory (%s): %s' % (_tr_name, _tr_w))
+
+if _traj_late:
+    report['warnings'].append(
+        'endpoint trajectory: %d contrast(s) end on a late-crossing sign '
+        'that differs from an earlier point in the declared tail (%s). The '
+        'frozen final-step endpoint still stands, but do not describe the '
+        'ordering as persistent without reporting the crossing.'
+        % (len(_traj_late), ', '.join(_traj_late[:5])))
+if _traj_narrow:
+    report['warnings'].append(
+        'endpoint trajectory: the history-series gap is narrowing over the '
+        'declared tail for %d contrast(s) (%s); the final gap may shrink with '
+        'more training, so do not quote it as a converged ordering.'
+        % (len(_traj_narrow), ', '.join(_traj_narrow[:5])))
+if _traj_short:
+    report['warnings'].append(
+        'endpoint trajectory: %d contrast(s) have a balanced history that ends '
+        'before the primary endpoint step (%s); the trajectory cannot '
+        'corroborate the final endpoint.' % (len(_traj_short),
+                                             ', '.join(_traj_short[:5])))
+if _traj_scale_sensitive:
+    report['warnings'].append(
+        'endpoint trajectory: %d contrast(s) have a final mean log-PPL ratio '
+        'whose sign differs from the final mean raw PPL difference (%s); the '
+        'effect is scale-sensitive across seeds, so the sign claim must name '
+        'the estimand (log ratio vs PPL points).'
+        % (len(_traj_scale_sensitive), ', '.join(_traj_scale_sensitive[:5])))
+if _traj_endpoint_mixed:
+    report['warnings'].append(
+        'endpoint trajectory: %d contrast(s) mix endpoint steps across their '
+        'records (%s); the trajectory cannot be aligned to one reported '
+        'training horizon.' % (len(_traj_endpoint_mixed),
+                               ', '.join(_traj_endpoint_mixed[:5])))
+if _traj_subset_mixed:
+    report['warnings'].append(
+        'endpoint trajectory: %d contrast(s) mix evaluation-subset '
+        'fingerprints across seeds/arms (%s); the history may not score the '
+        'same rows everywhere, so read its step mean as descriptive only.'
+        % (len(_traj_subset_mixed), ', '.join(_traj_subset_mixed[:5])))
+if _traj_invalid:
+    report['warnings'].append(
+        'endpoint trajectory: %d contrast(s) carry a malformed evaluation '
+        'history (%s); the trajectory is marked invalid rather than silently '
+        'omitted.' % (len(_traj_invalid), ', '.join(_traj_invalid[:5])))
+if _traj_disagree:
+    report['warnings'].append(
+        'endpoint trajectory: %d contrast(s) have a history-series final sign '
+        'that disagrees with the primary-endpoint sign (%s). The history is '
+        'measured on the evaluation subset while the primary PPL uses the full '
+        'fixed validation rows; inspect the sample difference before treating '
+        'the trajectory as corroboration.'
+        % (len(_traj_disagree), ', '.join(_traj_disagree[:5])))
+
+report['trajectory_stability'] = {
+    'kind': 'panel_trajectory_stability',
+    'policy': TRAJECTORY_POLICY,
+    'n_contrasts': len(_traj_rows),
+    'n_stable': sum(1 for r in _traj_rows if r.get('status') == 'stable'),
+    'n_late_crossing': len(_traj_late),
+    'n_zero_final': sum(1 for r in _traj_rows if r.get('status') == 'zero_final'),
+    'n_final_point_only': len(_traj_final_only),
+    'n_gap_narrowing': len(_traj_narrow),
+    'n_primary_history_disagreement': len(_traj_disagree),
+    'n_insufficient_history': len(_traj_unavailable),
+    'n_invalid': len(_traj_invalid),
+    'n_history_short_of_endpoint': len(_traj_short),
+    'n_mixed_history_subset': len(_traj_subset_mixed),
+    'n_mixed_endpoint_step': len(_traj_endpoint_mixed),
+    'n_scale_sensitive_final': len(_traj_scale_sensitive),
+    'late_crossing_contrasts': _traj_late,
+    'gap_narrowing_contrasts': _traj_narrow,
+    'primary_history_disagreement_contrasts': _traj_disagree,
+    'final_point_only_contrasts': _traj_final_only,
+    'invalid_contrasts': _traj_invalid,
+    'history_short_of_endpoint_contrasts': _traj_short,
+    'mixed_history_subset_contrasts': _traj_subset_mixed,
+    'mixed_endpoint_step_contrasts': _traj_endpoint_mixed,
+    'scale_sensitive_final_contrasts': _traj_scale_sensitive,
+    'contrasts': _traj_rows,
+    'role': ('descriptive final-sign/trajectory consistency; the primary '
+             'endpoint remains the fixed final evaluation and this block does '
+             'not add a test, change p/Holm/verified or a frozen verdict'),
+}
+
 if write and outdir:
     try:
         os.makedirs(outdir, exist_ok=True)
