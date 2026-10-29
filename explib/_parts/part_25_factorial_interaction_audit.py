@@ -1286,7 +1286,7 @@ def _methodology_step_sources():
     return _METHODOLOGY_STEPS_CACHE
 
 
-def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n=3, outdir=None, write=True, verbose=True, sesoi=None, look_history=None):
+def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n=3, outdir=None, write=True, verbose=True, sesoi=None, look_history=None, planned_cells=None):
     """Zero-GPU audit of controlled comparison, ablation completeness and
     statistical reliability for one panel's `summary` dict.
 
@@ -1329,10 +1329,28 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
     the optional-stopping correction: topping up seeds after seeing a
     non-significant result cannot buy the final-n p for free.
 
+    ``planned_cells`` is the run manifest's flat ``arm::seedN`` list.  When it
+    is omitted and ``outdir`` holds a ``run_manifest.json``, that manifest's
+    plan is loaded automatically.  The planned frame makes the missing-data
+    block possible: each contrast gets a partial-identification bound and a
+    tipping point for the seeds/cells the run-time cap, a failure or the
+    control gate removed.  The block is descriptive and never changes a
+    p-value, Holm family, ``verified`` verdict or the frozen plan; without a
+    plan the audit says so instead of inventing one.
+
     This report is single-panel evidence.  Project-level replication and
     cross-panel contradictions are computed by
     :func:`ablation_coverage_across_panels`; do not read one panel's
     `verified_components` as an independently replicated result."""
+    if planned_cells is None and outdir:
+        try:
+            _manifest_path = os.path.join(outdir, 'run_manifest.json')
+            with open(_manifest_path, encoding='utf-8') as _mh:
+                _manifest = json.load(_mh)
+            if isinstance(_manifest, dict) and isinstance(_manifest.get('planned_cells'), list):
+                planned_cells = list(_manifest['planned_cells'])
+        except (OSError, ValueError, TypeError):
+            planned_cells = None
     _step_env = dict(globals())
     _step_env.update(locals())
     for _step_src in _methodology_step_sources():

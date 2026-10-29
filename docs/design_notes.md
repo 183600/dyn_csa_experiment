@@ -7098,3 +7098,144 @@ p/t 与常数量级一致；audit gate 干净产物 `ok`、篡改 p/区间/rank/
 `family_ready`/`maxt_only`/`p_maxt_single`/`deltas_fp` 判 `fail`、legacy
 只 `warn`、无产物 `not_verifiable_locally`，以及 CLI 别名接线。完整 CPU
 套件（`720 passed, 3 skipped`）在本轮最终树通过。
+
+## 93. 完整案例不是计划面板：缺失种子的部分识别与 tipping point（本轮结果分析硬化）
+
+### 93.1 问题：`complete_pairs=False` 拒绝了结论，却没有说明缺了多少
+
+`paired_effect_stats` 已经把「不完整配对」作为显著性的硬前提：只要有一个
+计划中的配对种子缺失，`significant` 就必须为 False。这个决策规则是正确
+的，但它留下了两个结果分析问题：
+
+1. **缺的到底是什么？** 运行时限、失败、resume、控制门（same-run_cfg /
+   train_knobs / 主终点不一致）都可能让一个 `(arm, seed)` 不进对比。旧报告
+   只留下 `n_paired` / `n_skipped` 与一句「不要当成更大样本」，没有把
+   「计划了但没跑」「跑了但主终点不可用」「跑了但被控制门排除」分开；
+2. **观察到的方向有多稳健？** 若一个面板在 6/7 个种子上给出 +1% 的效应，
+   剩下 1 个种子需要多极端才能把符号抹掉？旧报告无法回答，读者只能把
+   complete-case 均值当成整个计划面板的均值。
+
+这不是「再跑几个种子」的问题，而是**在现有产物上把缺失机制说清楚**的
+结果分析问题。尤其在本仓库的运行时限模式下，缺失很可能不是完全随机的：
+昂贵的臂更可能先被截断，控制门也可能只排除某些组合。
+
+### 93.2 方法：sharp partial-identification bounds + tipping value
+
+设计划种子数为 `N = n + u`，其中 `n` 个有可用的配对差 `d_i`，`u` 个
+未观测（`n_missing` 个完全没有记录 + `n_excluded` 个有记录但被控制门
+排除/主终点不可用）。记观察均值为 `m`，未观测种子的平均差为 `x`。整个
+计划面板的均值恒为
+
+```
+M(x) = m + (u / N) * (x - m)
+```
+
+因此只要给未观测差一个**声明范围** `[lo, hi]`，总体均值的 sharp bounds
+就是 `M(lo)` 与 `M(hi)`，不需要 MAR/MCAR 假设，也不需要插补。报告同时给出
+
+- `unobserved_mean_for_zero = -(n/u) * m`：把所有未观测种子都设成同一个
+  值 `x` 时，使 `M(x)=0` 的 tipping value；
+- `unobserved_mean_for_threshold = T + (n/u) * (T - m)`：使总体均值正好
+  落在 SESOI `T`（按观察方向取 `+margin` 或 `-margin`）上的 tipping value；
+- `tipping_ratio_for_zero = n/u`：未观测种子平均需要贡献多少倍于观察效应
+  的反向差值；
+- `tipping_in_range_zero` / `tipping_in_range_threshold`：tipping value
+  是否落在声明范围内。若在范围外，则**任何**落在该范围内的未观测配置都
+  不能反转符号/抹掉 margin；若在范围内，就存在一个允许的配置可以做到。
+
+默认范围是观察到的 `min(d_i)` / `max(d_i)`，并显式标成
+`range_basis='observed_delta_min_max'`；它只是描述性的，未观测种子完全
+可能更极端。分析者可以传预注册的 `delta_range`，这时 bounds 才对应一个
+事先声明的敏感性区间。`margin=0` 时只问符号；`margin>0` 时同时问
+「符号是否稳健」和「SESOI margin 是否稳健」，两者分开报告。
+
+`status` 的语义：
+
+| status | 含义 |
+|---|---|
+| `complete` | 计划帧完整，无需缺失敏感性 |
+| `robust_beyond_margin` | 范围内任何未观测值都保持符号与 SESOI |
+| `sign_robust_margin_not` | 符号稳健，但 margin 可被范围内的值抹掉 |
+| `not_robust_within_range` | 范围内存在能反转符号的未观测配置 |
+| `zero_observed` | 观察均值恰为 0，没有可判定的方向 |
+| `no_observed_pairs` | 没有可用配对，无法给 bounds |
+| `bounds_unavailable` | 范围/数值不可表示，明确拒绝而不是猜 |
+
+此外，`N <= 16` 时把未观测种子统一设为范围端点/0/观察均值/tipping value，
+在补全后的向量上重算 exact sign-flip p，作为**情景读数**。这些行都标
+`imputed=True`，不构成测量，也不进入 `significant`。`N>16` 直接跳过而不
+近似。
+
+面板级 `panel_missingness_audit` 另外把三类单元分开计数：
+
+- `n_missing_cells`：计划了但完全没有记录；
+- `n_unusable_cells`：有记录但没有可用的 primary PPL（不能进入配对）；
+- `unequal_arm_coverage`：不同臂缺失的种子集合不一致。这是
+  complete-case 子集可能由「哪条臂碰巧丢了种子」选择出来的具体信号。
+
+### 93.3 接线：只增加描述，不进入任何判定
+
+- 新增 `explib/_parts/part_41_missingness_sensitivity.py`，导出
+  `missingness_sensitivity` 与 `panel_missingness_audit`；
+- `methodology_audit(..., planned_cells=None)` 在 `outdir` 有
+  `run_manifest.json` 时自动读取其 `planned_cells`；每个 contrast 的
+  `st['missingness']` 与面板级 `report['missingness']` 同时落盘。计划帧
+  不存在时走 `observed_seed_union` 的相对帧，并明确标记
+  `no_plan`/`observed_seed_union`，不假装计划完整；
+- `step_00` 额外保存 `shared_seeds` / `skipped_seeds`，使「有记录但被
+  控制门排除」的种子能和「完全没有记录」分开；`step_02` 在所有既有
+  Holm/max-T/SESOI 计算之后附加该块，写盘/打印移到本步，因此 JSON 与
+  stdout 都包含缺失敏感性；
+- `audit_gates.py missingness`（别名 `missing` / `missing_data` /
+  `attrition_sensitivity`）从落盘 `methodology_audit.json` 的
+  `observed_deltas` / `planned_seeds` / `excluded_seeds` 重算 bounds、
+  tipping value、计数与 `status`；篡改任一数字判 `fail`，旧 artifact 无
+  该块报 `not_verifiable_locally`；
+- `audit_gates.py report` 顶层增加 `missingness`；
+  `audit_methodology` 的逐面板输出带 `missingness` 与
+  `missing_sign_not_robust_contrasts`。
+
+该步骤不读取 test split，不重跑训练，不改变 `p_exact_signflip` /
+`p_holm` / `significant` / `verified` / max-T 读数，也不修改
+`confirmation_frozen*.json` 的字节、种子、端点、alpha 或决策规则。
+
+### 93.4 边界
+
+- **不是缺失机制检验。** 它不检验 MCAR/MAR，也不给缺失概率建模；它给的是
+  「在声明范围内，结论是否可能被未观测值改写」的 sharp bounds。范围之外
+  的值不受此保护。
+- **不是新的显著性检验。** 情景 p 只是把未观测种子设成某个值的重算，
+  不能被引用为「缺失种子也显著」；主判定仍只使用完整配对。
+- **`n_excluded` 的语义是「效果未知」。** 控制门排除的记录可能携带真实
+  效应，也可能根本不可配对；把它和 missing 一起放进 `u` 是保守的，不能
+  把 `n_excluded` 解释成「已证明无效应」。
+- **默认范围是观察范围。** 观察到的 `min/max` 会随 `n` 变化；这正是默认
+  范围只能作描述性读数的原因。预注册范围必须由分析者在看结果前给出，不能
+  事后挑一个刚好包含/排除 tipping value 的区间。
+- **`unequal_arm_coverage` 不是偏倚的证明。** 它只说明缺失集合与臂有关，
+  因而 complete-case 均值可能不是计划面板均值；是否真的偏倚仍取决于未观测
+  值，这正是 bounds 要回答的。
+- **不替代补跑。** 它能说明「现有 complete-case 结论有多脆弱」，不能把
+  缺失的种子变成已测量；要让结论可确认，仍须补齐计划单元或按预注册范围
+  报告敏感性。
+
+### 93.5 入口与验证
+
+```bash
+python -m pytest -q test_review_part_31.py
+python audit_gates.py missingness                  # 默认扫描 results_*/methodology_audit.json
+python audit_gates.py missingness OUTDIR           # 指定面板目录或 JSON
+python audit_gates.py missing_data                 # 别名
+python audit_gates.py report                       # 顶层 missingness
+```
+
+`test_review_part_31.py` 12 项覆盖：完整帧的恒等 bounds；已知 tipping
+value / margin crossing / 范围端点与 `status`；范围跨零时的
+`not_robust_within_range`；`n_excluded` 与 `n_missing` 分开计数但仍进入
+`u`；整体缩放不变性；重复种子/越界观察种子/观察与排除重叠/布尔/NaN/负
+margin/反向范围/空计划/长度不齐的 fail-closed；面板按臂的
+missing/unusable/unequal coverage；无计划时 `no_plan` 而非假装完整；
+`methodology_audit` 附加块但不改变 `verified_components` /
+`significant_components` / `family`；审计门对干净产物 `ok`、篡改 bounds
+或 `status` 判 `fail`、legacy artifact 只 `warn` 且
+`not_verifiable_locally`；以及 CLI/report 接线。完整 CPU 套件在本轮最终树通过。

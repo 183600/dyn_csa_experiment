@@ -72,6 +72,33 @@ def _print_methodology_audit(report):
             print('    %-30s n=%-2d  %.4f ± %.4f%s' % (
                 _k, _e['n_seeds'], _e.get('ppl_primary', _e['ppl_mean']), _e['ppl_std'],
                 '' if _e['meets_min_seeds'] else '  (BELOW min_n)'))
+    _md = report.get('missingness') or {}
+    _mrows = [r for r in (_md.get('contrasts') or [])
+              if (r.get('n_unobserved') or r.get('n_missing') or r.get('n_excluded'))]
+    if _mrows:
+        _cov = _md.get('coverage') or {}
+        print('  --- missing-data sensitivity (planned frame: %s) ---'
+              % (_md.get('frame_basis') or 'observed union'))
+        print('      planned cells: %s; missing: %s; present-but-unusable: %s; '
+              'coverage=%s%s'
+              % (_cov.get('n_planned_cells'), _cov.get('n_missing_cells'),
+                 _cov.get('n_unusable_cells'),
+                 ('%.3f' % float(_cov['coverage_rate']))
+                 if isinstance(_cov.get('coverage_rate'), (int, float)) else 'n/a',
+                 '; UNEQUAL ARM COVERAGE' if _cov.get('unequal_arm_coverage') else ''))
+        for _r in _mrows[:12]:
+            _b = _r.get('overall_mean_bounds')
+            _bs = ('[%+.4f, %+.4f]' % (float(_b[0]), float(_b[1]))
+                   if isinstance(_b, (list, tuple)) and len(_b) == 2 else 'n/a')
+            print('      %-42s missing=%-2s excluded=%-2s Δ-bounds=%s  %s'
+                  % (_r.get('name'), _r.get('n_missing'), _r.get('n_excluded'),
+                     _bs, _r.get('status')))
+        if _md.get('sign_not_robust_contrasts'):
+            print('      SIGN-NOT-ROBUST: ' + ', '.join(
+                _md['sign_not_robust_contrasts'][:5]))
+        if _md.get('margin_not_robust_contrasts'):
+            print('      MARGIN-NOT-ROBUST: ' + ', '.join(
+                _md['margin_not_robust_contrasts'][:5]))
     for comp, entries in report['components'].items():
         live = [e for e in entries if e['n_shared'] > 0]
         if not live:

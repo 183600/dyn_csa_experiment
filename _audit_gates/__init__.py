@@ -20,6 +20,7 @@ _PARTS = [
 'part_06_audit_data_processing.py',
 'part_07_reproduction.py',
 'part_05_audit_confirmation_verdicts.py',
+'part_08_audit_missingness.py',
 ]
 
 for _part in _PARTS:
@@ -31,7 +32,8 @@ del _part, _path, _fh, _src
 
 # Keep module introspection on the implementation fragment (the historical
 # script body lived in one file) while REPO still points at the repository root.
-__file__ = _os.path.join(_HERE, '_parts', _PARTS[-1])
+__file__ = _os.path.join(
+    _HERE, '_parts', 'part_05_audit_confirmation_verdicts.py')
 REPO = _REPO
 
 if __name__ == '__main__':

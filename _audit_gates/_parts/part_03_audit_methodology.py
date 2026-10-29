@@ -86,6 +86,9 @@ def audit_methodology(outdirs=None, design=None, alpha=0.05, min_n=3, write=True
             # reader can see when Holm was much more conservative than the
             # exact max-T correction, and why (family not ready vs ready).
             'joint_correction': (rep.get('family') or {}).get('maxt'),
+            'missingness': rep.get('missingness'),
+            'missing_sign_not_robust_contrasts': (
+                (rep.get('missingness') or {}).get('sign_not_robust_contrasts')),
             'maxt_only_contrasts': rep.get('maxt_only_contrasts'),
             'holm_only_contrasts': rep.get('holm_only_contrasts'),
             'warnings': rep.get('warnings'),

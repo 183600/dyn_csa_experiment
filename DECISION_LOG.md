@@ -3943,3 +3943,44 @@ bootstrap/document-cluster 仍回答「换文档会怎样」）。`family_ready`
 `family_ready`/`maxt_only`/`p_maxt_single` 判 fail、legacy 只 warn、
 无产物 `not_verifiable_locally`，以及 CLI 别名接线。完整 CPU 套件在本轮
 最终树通过。
+
+## 2026-10-29 — 完整案例不是计划面板：缺失种子的部分识别、tipping point 与覆盖台账（本轮结果分析硬化，no new runs）
+
+零 GPU；不新增训练、不读取 test split、不修改冻结清单字节/种子/端点/
+alpha/Holm 规则，也不改 `CODE_SEMANTICS`；`.github/` 与所有 README 未触碰。
+
+**Problem.** 既有规则只在 `complete_pairs=False` 时拒绝显著，却没有把
+「计划了但没跑」「有记录但主终点不可用」「有记录但被控制门排除」分开，
+也没有回答「剩下的 complete-case 方向需要多极端的未观测种子才能反转」。
+在运行时限/失败/resume 下，缺失可能是臂相关的；把 complete-case 均值当成
+计划面板均值是一个未声明的选择。
+
+**Fix.** 新增 `missingness_sensitivity`：以计划种子帧 `N=n+u` 为分母，
+在声明的未观测差范围 `[lo,hi]` 上给出总体均值的 sharp bounds
+`m + (u/N)(x-m)`，并给出 `x0=-(n/u)m`、SESOI tipping
+`xT=T+(n/u)(T-m)`、`tipping_ratio`、`tipping_in_range_*`；
+`n_missing` 与 `n_excluded` 分开计数但都进入 `u`。默认范围是观察
+`min/max` 并显式标成描述性；`N<=16` 时附 imputed 情景 p，`N>16` 跳过。
+新增 `panel_missingness_audit` 统计 planned/present/usable/unusable/
+missing 与 `unequal_arm_coverage`。
+
+**Wiring.** `methodology_audit` 新增 `planned_cells` 参数（缺省从
+`outdir/run_manifest.json` 自动读取），每个 contrast 写
+`missingness`，面板写 `report['missingness']`；`step_00` 保存
+`shared_seeds`/`skipped_seeds`，新 `step_02` 在既有 Holm/max-T/SESOI
+之后附加该块并负责写盘/打印。新增
+`audit_gates.py missingness`（别名 `missing`/`missing_data`/
+`attrition_sensitivity`）从落盘 `observed_deltas`/`planned_seeds` 重放
+bounds/tipping/status；篡改判 fail，legacy 报 not_verifiable；`report`
+顶层与 `audit_methodology` 面板均带该块。它不改变任何 p/Holm/
+`verified`/max-T 或冻结判定。
+
+**Boundary.** 不检验 MCAR/MAR、不是新显著性检验、不把 `n_excluded`
+当成无效应；默认观察范围之外的值不受保护；`unequal_arm_coverage` 不是
+偏倚的证明，只说明 complete-case 子集可能由臂选择；不能替代补跑。
+
+**Verification.** 新增 `test_review_part_31.py` 12 项：完整帧恒等、
+已知 tipping/margin/范围端点、跨零 fragile、excluded 与 missing 分账、
+缩放不变、畸形帧 fail-closed、面板 coverage 三态、无计划 `no_plan`、
+`methodology_audit` 附加块但不改变判定、gate 重放/篡改/legacy、CLI/
+report 接线。完整 CPU 套件在本轮最终树通过。

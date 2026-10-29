@@ -57,6 +57,12 @@
                by-length 曲线逐项重放；缺 per_seed 报 not_verifiable，
                存值与重算不一致判 fail（零 GPU，只读，不改 p/Holm）
                别名：pvalue_replay / recompute_p；可传一个 artifact 路径
+  missingness   缺失数据敏感性：按 run_manifest 的计划单元重算每个对照的
+               观测/缺失/被控制门排除计数、声明范围内总体均值的 sharp
+               bounds 与「抹掉符号/SESOI」的 tipping value；缺计划或旧
+               artifact 报 not_verifiable，篡改判 fail。它不改变任何
+               p/Holm/verified 或冻结判定（零 GPU；别名 missing /
+               missing_data / attrition_sensitivity）
   joint_correction  消融族的相关性感知联合校正：从逐种子配对差重放 exact
                sign-flip max-T（Westfall-Young free step-down）与同时
                区间；缺 family.maxt 报 not_verifiable，篡改 p/区间/排名/

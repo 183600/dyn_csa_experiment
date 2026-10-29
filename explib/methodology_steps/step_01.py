@@ -262,13 +262,3 @@ report['look_history'] = {'schema': LOOK_HISTORY_SCHEMA, 'panel_looks': int(max(
 
 if _downgraded:
     report['warnings'].append('optional-stopping correction DOWNGRADED %d contrast(s): %s — the naive final-look family p was < alpha, but the exact max-over-looks p was not. Adding seeds after seeing a non-significant result is one of the looks, not a free rerun.' % (len(_downgraded), ', '.join(_downgraded[:5])))
-
-if write and outdir:
-    try:
-        os.makedirs(outdir, exist_ok=True)
-        atomic_write_json(os.path.join(outdir, 'methodology_audit.json'), report)
-    except Exception as e:
-        print('[audit] could not write methodology_audit.json: %s: %s' % (type(e).__name__, e))
-
-if verbose:
-    _print_methodology_audit(report)
