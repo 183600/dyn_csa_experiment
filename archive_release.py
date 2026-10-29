@@ -303,6 +303,16 @@ def _payload_problems(man):
     if not isinstance(files, dict):
         problems.append('payload digest cannot be recomputed without a files map')
         return problems
+    # The digest is defined over (relpath, sha256, byte count).  Skipping an
+    # entry whose byte count was deleted would let that field be stripped
+    # without changing the digest, so a modern manifest must carry an exact
+    # size for every packed file.
+    _missing_bytes = [rel for rel, meta in files.items()
+                      if _bad_file_entry(meta, require_bytes=True)]
+    if _missing_bytes:
+        problems.append('payload file map has a missing/malformed byte count: '
+                        + ', '.join(sorted(_missing_bytes)[:5]))
+        return problems
     got = _payload_digest(files)
     if got.lower() != want.lower():
         problems.append('payload_sha256 does not recompute from the file map')
@@ -973,8 +983,15 @@ def cmd_verify(tar_path):
         if not isinstance(man, dict) or not isinstance(man.get('files'), dict):
             print('[archive] REFUSE: the MANIFEST has no files mapping')
             return 1
+        # A manifest that carries the content digest (every current one) must
+        # also carry each file's byte count: that field is part of the
+        # payload identity, and dropping it must not silently shrink what the
+        # digest covers.  Legacy archives without the digest keep the lenient
+        # reader so they remain verifiable.
+        _require_bytes = ('payload_sha256' in man
+                          or 'payload_algorithm' in man)
         _bad_entries = [n for n, meta in man['files'].items()
-                        if _bad_file_entry(meta)]
+                        if _bad_file_entry(meta, require_bytes=_require_bytes)]
         if _bad_entries:
             print('[archive] REFUSE: the MANIFEST has malformed file entr(ies) '
                   f'(expected objects with a 64-hex sha256 and a non-negative '

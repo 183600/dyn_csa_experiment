@@ -67,6 +67,12 @@ def _mean_std(values):
     vals = [float(v) for v in values if L.ppl_is_usable(v)]
     if not vals:
         return float('nan'), float('nan')
+    # A finite PPL panel near float64's limit can overflow np.mean's sum and
+    # np.std's squared deviations.  The guarded helper keeps ordinary values
+    # bit-identical and only rescales for an extreme finite panel.
+    _ms = L._scaled_mean_std_if_extreme(vals, ddof=1) if len(vals) > 1 else None
+    if _ms is not None:
+        return float(_ms[0]), float(_ms[1])
     mean = float(np.mean(vals))
     std = float(np.std(vals, ddof=1)) if len(vals) > 1 else 0.0
     return mean, std
@@ -949,11 +955,13 @@ def _run_final(base, outdir, protocol, selected):
         _full = [float(r['ppl']) for r in merged.values()
                  if isinstance(r, dict) and r.get('variant') == arm
                  and r.get('seed') is not None and L.ppl_is_usable(r.get('ppl'))]
+        _vals_mean, _vals_std = _mean_std(_vals)
+        _full_mean, _ = _mean_std(_full)
         arm_summary[arm] = {
             'n_seeds': len(_vals), 'seeds': sorted(_recs),
-            'ppl_mean': float(np.mean(_vals)) if _vals else float('nan'),
-            'ppl_std': float(np.std(_vals, ddof=1)) if len(_vals) > 1 else 0.0,
-            'ppl_full_validation_mean': float(np.mean(_full)) if _full else float('nan'),
+            'ppl_mean': _vals_mean,
+            'ppl_std': _vals_std if len(_vals) > 1 else 0.0,
+            'ppl_full_validation_mean': _full_mean,
             'estimation_rows': ('nested_validation_holdout' if _final_rows_meta.get('applied')
                                 else 'full_validation'),
             'selected': dict(entry.get('selected') or {}),

@@ -170,12 +170,34 @@ def tost_paired(deltas, margin, conf=0.90):
         out['note'] = ('not decidable (n<2, non-positive/non-finite margin, '
                        'or conf outside (0,1))')
         return out
-    _ms = _scaled_mean_std_if_extreme(d, ddof=1)
-    if _ms is not None:
-        mean, sd = _ms
+    # A finite but extreme panel can overflow ``mean +/- t*se`` even when the
+    # interval is representable, and ``margin - mean`` can overflow before the
+    # t statistic is formed.  Both are scale-invariant quantities: compute them
+    # on a max-scaled copy when the panel is extreme, then map the mean and the
+    # endpoints back.  Ordinary panels keep the historical path bit-for-bit.
+    _abs_max = float(np.max(np.abs(d))) if n else 0.0
+    _scaled = bool(math.isfinite(_abs_max) and _abs_max > 0.0
+                   and (_abs_max < 1e-100 or _abs_max > 1e100))
+    if _scaled:
+        d_work = d / _abs_max
+        margin_work = margin / _abs_max
+        mean_work = float(math.fsum(float(x) for x in d_work) / n)
+        if n > 1:
+            sd_work = math.sqrt(math.fsum(
+                (float(x) - mean_work) ** 2 for x in d_work) / (n - 1))
+        else:
+            sd_work = float('nan')
+        mean = float(mean_work * _abs_max)
     else:
-        mean = float(d.mean())
-        sd = float(d.std(ddof=1))
+        d_work, margin_work = d, margin
+        _ms = _scaled_mean_std_if_extreme(d, ddof=1)
+        if _ms is not None:
+            mean, sd = _ms
+        else:
+            mean = float(d.mean())
+            sd = float(d.std(ddof=1))
+        mean_work = mean
+        sd_work = sd
     df = n - 1
     # A floating-point mean of k identical values need not be bit-identical to
     # the value (0.1*6 / 6 = 0.09999999999999999), which would turn a sample
@@ -184,9 +206,10 @@ def tost_paired(deltas, margin, conf=0.90):
     identical = bool(n > 0 and np.all(d == d[0]))
     if identical:
         mean = float(d[0])
+        mean_work = float(d_work[0])
     out['mean'] = mean
     out['df'] = int(df)
-    se = 0.0 if identical else sd / math.sqrt(n)
+    se_work = 0.0 if identical else sd_work / math.sqrt(n)
     tc = _t_critical(float(conf), float(df))
     if not math.isfinite(tc):
         # _t_critical only rejects invalid conf/df; keep a deterministic
@@ -194,8 +217,24 @@ def tost_paired(deltas, margin, conf=0.90):
         tc = {0.80: 1.2815515655446004, 0.90: 1.6448536269514722, 0.95: 1.959963984540054}.get(round(float(conf), 4), 1.6448536269514722)
         out['note'] = 't critical unavailable; fell back to the normal critical value'
     out['t_critical'] = float(tc)
-    out['ci'] = [mean - tc * se, mean + tc * se]
-    if not (se > 0.0):
+    ci_lo_work = mean_work - tc * se_work
+    ci_hi_work = mean_work + tc * se_work
+    if _scaled:
+        ci_lo = float(ci_lo_work * _abs_max)
+        ci_hi = float(ci_hi_work * _abs_max)
+    else:
+        ci_lo, ci_hi = float(ci_lo_work), float(ci_hi_work)
+    if math.isfinite(ci_lo) and math.isfinite(ci_hi):
+        out['ci'] = [ci_lo, ci_hi]
+    else:
+        # The endpoint is mathematically beyond float64.  An infinite bound is
+        # not a measured interval (and strict JSON writers turn it into null),
+        # so mark the interval unavailable instead of reporting [-inf, inf].
+        out['ci'] = None
+        out['ci_unavailable_reason'] = (
+            'the confidence interval endpoint exceeds the representable '
+            'float64 range')
+    if not (se_work > 0.0):
         # Degenerate zero-variance sample.  At the margin boundary the exact
         # t limit is P(T >= 0) = 0.5, not 0: equality cannot be declared
         # equivalent with certainty.
@@ -204,8 +243,8 @@ def tost_paired(deltas, margin, conf=0.90):
     else:
         # H0_upper: mean >= margin  -> T = (margin - mean)/se
         # H0_lower: mean <= -margin -> T = (mean + margin)/se
-        p_hi = _student_t_sf((margin - mean) / se, float(df))
-        p_lo = _student_t_sf((mean + margin) / se, float(df))
+        p_hi = _student_t_sf((margin_work - mean_work) / se_work, float(df))
+        p_lo = _student_t_sf((mean_work + margin_work) / se_work, float(df))
     out['p_hi'] = float(p_hi)
     out['p_lo'] = float(p_lo)
     out['p_tost'] = float(max(p_hi, p_lo))
@@ -215,7 +254,10 @@ def tost_paired(deltas, margin, conf=0.90):
     _alpha_one = (1.0 - float(conf)) / 2.0
     out['alpha_one_sided'] = float(_alpha_one)
     out['equivalent'] = bool(p_hi < _alpha_one and p_lo < _alpha_one)
-    out['ci_within_margin'] = bool(out['ci'][0] > -margin and out['ci'][1] < margin)
+    # Compare on the scaled grid: the interval can be unrepresentable in the
+    # input units even though this containment question is still decidable.
+    out['ci_within_margin'] = bool(ci_lo_work > -margin_work
+                                   and ci_hi_work < margin_work)
     return out
 
 

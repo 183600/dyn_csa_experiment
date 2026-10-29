@@ -120,3 +120,37 @@ def test_extreme_interval_is_unavailable_not_infinite():
     assert not np.isinf(stats['ci95_low'])
     assert not np.isinf(stats['ci95_high'])
     assert np.isnan(stats['ci95_low']) and np.isnan(stats['ci95_high'])
+
+
+def test_tost_extreme_finite_panel_does_not_emit_infinite_bounds():
+    # The t statistic and its interval are scale invariant.  A finite panel
+    # near the float limit can have a representable mean/p-value but an
+    # endpoint beyond float64; that interval must be withheld, never reported
+    # as an infinite bound.  A tiny but finite panel keeps a real interval.
+    r = L.tost_paired([1e308, 1.5e308], margin=1e308)
+    assert math.isfinite(r['mean']) and math.isfinite(r['p_tost']), r
+    assert r['ci'] is None or all(math.isfinite(v) for v in r['ci']), r
+    t = L.tost_paired([1e-200, -2e-200, 3e-200], margin=2e-200)
+    assert t['ci'] is not None and all(math.isfinite(v) for v in t['ci']), t
+    assert t['ci'][0] < t['ci'][1] and t['p_tost'] > 0.0, t
+
+
+def test_extreme_finite_scale_analysis_withholds_unrepresentable_variance():
+    base = [{'label': f'S{i}', 'scale': 10.0 ** i, 'seeds': [0, 1, 2],
+             'effects': [0.1 * i + 0.01 * j for j in range(3)]}
+            for i in range(3)]
+    factor = 1e200
+    scaled = [dict(p, effects=[e * factor for e in p['effects']])
+              for p in base]
+    meta = L.meta_analyze_effects(scaled, min_seeds=2)
+    assert meta['status'] == 'ok', meta
+    assert meta['heterogeneity']['tau2'] is None, meta['heterogeneity']
+    assert meta['heterogeneity']['tau2_available'] is False, meta['heterogeneity']
+    for block in ('fixed_effect', 'random_effects'):
+        assert math.isfinite(meta[block]['mean']), (block, meta[block])
+        if meta[block]['ci'] is not None:
+            assert all(math.isfinite(v) for v in meta[block]['ci']), meta[block]
+    trend = L.scaling_trend(scaled, min_seeds=3, min_points=3)
+    het = trend.get('heterogeneity') or {}
+    assert het.get('Q') is None or math.isfinite(het['Q']), het
+    assert het.get('tau2') is None or math.isfinite(het['tau2']), het

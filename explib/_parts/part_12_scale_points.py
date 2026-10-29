@@ -553,15 +553,43 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
         out.get('seed_dependence') == 'shared_seeds_paired'
         and isinstance(_paired_common, dict)
         and _paired_common.get('underpowered') is True)
-    out.update({'fixed_effect': {'mean': mu_fe_out, 'se': se_fe_out,
-                                 'ci': [mu_fe_out - _t_critical(1.0 - float(alpha), max(1, df)) * se_fe_out,
-                                        mu_fe_out + _t_critical(1.0 - float(alpha), max(1, df)) * se_fe_out]},
-                'random_effects': {'mean': mu_re_out, 'se': se_re_out,
-                                   'ci': [mu_re_out - tc * se_re_out,
-                                          mu_re_out + tc * se_re_out]},
-                'heterogeneity': {'Q': q, 'df': int(df), 'p': p_q, 'I2_percent': i2, 'tau2': tau2,
+    def _finite_out(value):
+        # Scaling back to the input units can overflow even though every
+        # input effect is finite.  An infinite SE/variance is not a measured
+        # bound; withhold it (the pooled claim is already blocked by the
+        # resolution/heterogeneity gates) instead of emitting inf to a strict
+        # JSON writer.
+        if value is None or isinstance(value, (bool, np.bool_)):
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return number if math.isfinite(number) else None
+
+    def _finite_ci(pair):
+        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+            return None
+        lo, hi = _finite_out(pair[0]), _finite_out(pair[1])
+        return [lo, hi] if lo is not None and hi is not None else None
+
+    _tc_fe = _t_critical(1.0 - float(alpha), max(1, df))
+    _fe_ci = _finite_ci([mu_fe_out - _tc_fe * se_fe_out,
+                         mu_fe_out + _tc_fe * se_fe_out])
+    _re_ci = _finite_ci([mu_re_out - tc * se_re_out,
+                         mu_re_out + tc * se_re_out])
+    _fr = _finite_out(mu_fe_out)
+    _fs = _finite_out(se_fe_out)
+    _rr = _finite_out(mu_re_out)
+    _rs = _finite_out(se_re_out)
+    _tau2_out = _finite_out(tau2)
+    out.update({'fixed_effect': {'mean': _fr, 'se': _fs, 'ci': _fe_ci},
+                'random_effects': {'mean': _rr, 'se': _rs, 'ci': _re_ci},
+                'heterogeneity': {'Q': q, 'df': int(df), 'p': p_q,
+                                  'I2_percent': i2, 'tau2': _tau2_out,
+                                  'tau2_available': _tau2_out is not None,
                                   'method': 'Cochran Q + DerSimonian-Laird tau^2'},
-                'prediction_interval': _pi,
+                'prediction_interval': _finite_ci(_pi),
                 'underpowered_points': _underpowered_points,
                 'poolable': bool(len(usable) >= 3 and df > 0 and i2 <= 50.0
                                  and (not math.isfinite(p_q) or p_q >= alpha)
@@ -1078,8 +1106,11 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
         else:
             _p = 1.0 if abs(slope_work) <= 1e-15 else 0.0
         se = float(se_work * _effect_scale) if _scale_effects else se_work
-        wls.update({'se': se, 'ci': [slope - tc * se, slope + tc * se],
-                    'p': _p, 'df': k - 2})
+        _wls_ci = [slope - tc * se, slope + tc * se]
+        if not all(math.isfinite(float(_x)) for _x in _wls_ci):
+            _wls_ci = None
+        wls.update({'se': se if math.isfinite(float(se)) else None,
+                    'ci': _wls_ci, 'p': _p, 'df': k - 2})
     out['wls'] = wls
     # paired per-seed slopes: complete cases only (same seed at every scale).
     # When any point omitted its seed identities, the positional indices that
@@ -1122,8 +1153,13 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
         std_work = (float(slopes.std(ddof=1)) if len(slopes) > 1 else float('nan'))
         std_out = (std_work * _effect_scale if _scale_effects else std_work)
         se_out = (se_s * _effect_scale if _scale_effects else se_s)
+        _paired_ci = ([mean_out - tc * se_out, mean_out + tc * se_out]
+                      if math.isfinite(se_out) else None)
+        if (_paired_ci is not None
+                and not all(math.isfinite(float(_x)) for _x in _paired_ci)):
+            _paired_ci = None
         paired.update({'slope_mean': mean_out, 'slope_std': std_out,
-                       'se': se_out, 'ci': [mean_out - tc * se_out, mean_out + tc * se_out] if math.isfinite(se_out) else None,
+                       'se': se_out, 'ci': _paired_ci,
                        'p_exact_signflip': st['p_exact_signflip'], 'p_floor': st['p_floor'],
                        'resolution_limited': st['resolution_limited'], 'underpowered': st['underpowered'],
                        'within_seed_noise': st['within_seed_noise'], 'significant': st['significant'],
@@ -1202,6 +1238,13 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
         tau2 = float(max(0.0, (q - dfh) / c)) if (dfh > 0 and c > 0) else 0.0
         q_out = float(q * _effect_scale * _effect_scale) if _scale_effects else q
         tau2_out = float(tau2 * _effect_scale * _effect_scale) if _scale_effects else tau2
+        # Scaling back to input units can exceed float64 even though every
+        # effect is finite.  Withhold an unrepresentable absolute Q/tau2
+        # rather than emitting inf; the I2/p verdict remains scale-free.
+        if not math.isfinite(q_out):
+            q_out = None
+        if not math.isfinite(tau2_out):
+            tau2_out = None
         out['heterogeneity'] = {'Q': q_out, 'df': int(dfh), 'p': p_q, 'I2_percent': i2, 'tau2': tau2_out,
                                 'method': 'lack-of-fit Q around the WLS slope (weights = n)',
                                 'note': 'high I2 means the scale points deviate from a single slope; it is not the spread of a monotone ladder around its mean'}
@@ -1224,6 +1267,8 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
         _i2_p = float(max(0.0, (_q_p - _df_p) / _q_p) * 100.0) if (_df_p > 0 and _q_p > 0) else 0.0
         _q_p_out = (float(_q_p * _effect_scale * _effect_scale)
                     if _scale_effects else _q_p)
+        if not math.isfinite(_q_p_out):
+            _q_p_out = None
         out['heterogeneity_paired'] = {'Q': _q_p_out, 'df': int(_df_p), 'p': _p_p,
                                        'I2_percent': _i2_p, 'n_complete_seeds': len(complete),
                                        'method': 'lack-of-fit over complete-seed scale means (weights = n_complete)',

@@ -136,6 +136,11 @@ def test_payload_digest_detects_file_map_tampering(repo_tmp, monkeypatch):
     bad = json.loads(json.dumps(man))
     bad['payload_algorithm'] = 'md5'
     assert any('algorithm' in p for p in AR._payload_problems(bad))
+    # The byte count is part of the payload identity.  Deleting it must not
+    # silently shrink the digest's coverage (the old reader skipped it).
+    bad = json.loads(json.dumps(man))
+    del bad['files'][first]['bytes']
+    assert any('byte count' in p for p in AR._payload_problems(bad))
     # A legacy manifest without the content digest is not a tampering finding.
     legacy = {k: v for k, v in man.items()
               if k not in ('payload_sha256', 'payload_algorithm')}

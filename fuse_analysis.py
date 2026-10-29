@@ -165,7 +165,13 @@ def sample_std(deltas, axis=None):
             d = d[np.isfinite(d)]
         # ddof=1 is undefined for fewer than two finite values; a zero here
         # would falsely report "no spread measured" as a measured zero.
-        return float(np.std(d, ddof=1)) if d.size > 1 else float('nan')
+        if d.size <= 1:
+            return float('nan')
+        # Finite PPL differences can still overflow/underflow the squared
+        # deviations.  The scale is arbitrary, so reuse the library's guarded
+        # mean/std; ordinary panels keep the historical NumPy value.
+        _ms = L._scaled_mean_std_if_extreme(d, ddof=1)
+        return float(_ms[1]) if _ms is not None else float(np.std(d, ddof=1))
     if not isinstance(axis, (int, np.integer)):
         raise TypeError(f'axis must be an integer, got {axis!r}')
     axis = int(axis)
@@ -180,7 +186,12 @@ def sample_std(deltas, axis=None):
     out = np.full(srt.shape[1], np.nan)
     for j in range(srt.shape[1]):
         col = srt[:, j][np.isfinite(srt[:, j])]
-        out[j] = float(np.std(col, ddof=1)) if col.size > 1 else float('nan')
+        if col.size <= 1:
+            out[j] = float('nan')
+            continue
+        _ms = L._scaled_mean_std_if_extreme(col, ddof=1)
+        out[j] = (float(_ms[1]) if _ms is not None
+                  else float(np.std(col, ddof=1)))
     return out.reshape(out_shape)
 
 def _fmt_sd(value, fmt='.4f'):
@@ -195,12 +206,15 @@ def _row_nanmean(M):
     # With no NaNs, a 2-D mean along the (contiguous) last axis is
     # bitwise-identical to per-row np.mean (verified by differential test).
     if M.shape[1] and np.isfinite(M).all():
-        return M.mean(axis=1)
+        _abs = float(np.max(np.abs(M)))
+        if not (math.isfinite(_abs) and 0.0 < _abs
+                and (_abs < 1e-100 or _abs > 1e100)):
+            return M.mean(axis=1)
     out = np.full(M.shape[0], np.nan)
     for i in range(M.shape[0]):
         r = M[i][np.isfinite(M[i])]
         if r.size:
-            out[i] = r.mean()
+            out[i] = L._scaled_mean_or_raw(r)
     return out
 
 def _lay_nanmean(M):
@@ -208,13 +222,17 @@ def _lay_nanmean(M):
     for j in range(M.shape[1]):
         c = M[:, j][np.isfinite(M[:, j])]
         if c.size:
-            out[j] = c.mean()
+            out[j] = L._scaled_mean_or_raw(c)
     return out
 
 def _finite_mean(v):
     v = np.asarray(v, dtype=float)
     v = v[np.isfinite(v)]
-    return float(v.mean()) if v.size else float('nan')
+    if not v.size:
+        return float('nan')
+    # np.mean sums before dividing; a finite panel near float64's limit can
+    # overflow even when its mean is representable.
+    return L._scaled_mean_or_raw(v)
 
 def _context_reason(ra, rb):
     # `_variant_records` keeps one protocol group PER VARIANT, so the two arms
