@@ -36,6 +36,7 @@ dev = ["build>=1.2,<2"]
 # module or split package is added without being listed here.
 [tool.setuptools]
 py-modules = [
+  "_split_loader",
   "archive_release",
   "audit_gates",
   "baseline_tune",

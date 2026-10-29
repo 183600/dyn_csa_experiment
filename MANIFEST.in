@@ -12,6 +12,7 @@ include DECISION_LOG.md
 include REVIEW_4_RESPONSE.md
 include RELEASES.md
 include pyproject.toml
+include _split_loader.py
 include requirements.txt
 include requirements-ci.txt
 include requirements.lock

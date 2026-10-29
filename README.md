@@ -33,10 +33,16 @@ split). Only the frozen v12 fixed-chunk comparisons are confirmatory. See
 
 ## Contents
 
+- [Start here](#start-here)
 - [Quick start](#quick-start)
+- [Where to look](#where-to-look)
 - [Repository layout](#repository-layout)
   - [Regenerating the experiment artifacts](#regenerating-the-experiment-artifacts)
 - [Reproducing (any CUDA box)](#reproducing-any-cuda-box)
+  - [Environment](#environment)
+  - [Data and cache fallbacks](#data-and-cache-fallbacks)
+  - [Validate the pipeline before training](#validate-the-pipeline-before-training)
+  - [Run the v6 supplementary study](#run-the-v6-supplementary-study)
   - [Task-level parallelism (one GPU per run)](#task-level-parallelism-one-gpu-per-run)
   - [B-tier M0 / S1 (scale-up entry point, adopted tier B)](#b-tier-m0--s1-scale-up-entry-point-adopted-tier-b)
   - [Triton kernel path (M0/G0)](#triton-kernel-path-m0g0)
@@ -45,33 +51,46 @@ split). Only the frozen v12 fixed-chunk comparisons are confirmatory. See
   - [v12 confirmation suite (exploration / confirmation split)](#v12-confirmation-suite-exploration--confirmation-split)
   - [v8 / v9 close-out suites](#v8--v9-close-out-suites)
   - [v7 reviewer-response suite](#v7-reviewer-response-suite)
-- [Review-4 hardening (what changed)](#review-4-hardening-what-changed)
-- [Review-3 hardening (what changed)](#review-3-hardening-what-changed)
+- [Measurement guardrails](#measurement-guardrails)
+
+## Start here
+
+| goal | start with | starts training? |
+|---|---|---|
+| verify that a checkout is healthy | `python -m pip install -r requirements.lock`, then `make test` | no |
+| validate the frozen plan without touching the test split | `make plan` | no |
+| run the open-block causality/reference gates | `python -m pytest -q test_open_block.py` | no |
+| try the pipeline end to end | `python run_gapfill.py smoke` | smoke run only |
+| run or resume a study panel | the driver table under [Repository layout](#repository-layout) | yes |
+| rebuild a report from local artifacts | `python build_report.py` or `python -m explib.<driver> report` | no |
+| check whether two runs agree | `python -m explib.reproduce compare ORIGINAL RERUN` | no |
+| understand why a measurement is defined this way | the [Where to look](#where-to-look) table | no |
 
 ## Quick start
 
-Python 3.12 is required. The lock file is the verified CPU environment used by
-the tests and the zero-GPU analysis path; on a CUDA machine, install the torch
-wheel that matches the local driver first, then the ranges in
-`requirements.txt` (see [Reproducing](#reproducing-any-cuda-box)).
+Python 3.12 is required. `requirements.lock` is the verified CPU environment
+used by the tests and the zero-GPU analysis path. On a CUDA machine, install
+the torch wheel that matches the local driver first, then the ranges in
+`requirements.txt` (see [Environment](#environment)).
 
 ```bash
 python -m pip install -r requirements.lock
-make test                              # CPU test suite
+make test                              # complete CPU pytest suite
 make plan                              # frozen-manifest preflight; no test-split read
 python -m explib.confirmation --help   # list subcommands without starting a run
 ```
 
-The commands above do not start an experiment. Training is always explicit:
-invoke a driver's `full`, `phase <name>`, or `auto` mode when you intend to run
-it, and start with that driver's `smoke` mode when validating a change to the
-pipeline.
+None of these commands starts a training run. Training is always explicit:
+invoke a driver's `full`, `phase <name>`, or `auto` mode when you intend to
+run it, and start with that driver's `smoke` mode when validating a change to
+the pipeline.
 
 ### Where to look
 
 | question | document |
 |---|---|
 | How do I run or re-run an experiment? | this README |
+| Which command and subcommand should I use? | [Repository layout](#repository-layout) and the per-driver sections below |
 | Why is a measurement or comparison defined this way? | `docs/design_notes.md` |
 | What was decided, and in what order? | `DECISION_LOG.md` |
 | Where is the released evidence? | `RELEASES.md` |
@@ -91,6 +110,7 @@ the design notes, `docs/design_notes.md`).
 | path | what |
 |---|---|
 | `exp_lib.py` | **compatibility shim** that re-exports the split implementation in `explib/` |
+| `_split_loader.py` | shared loader for the split packages: runs each `_parts/` fragment in the caller's module globals, in declared order, with the fragment path as the compile filename (so tracebacks point at the reviewable source) |
 | `explib/` | **the library — and the source of truth**: model, CSA/HCA attention, pooling, indexer, segmenters, training loop, aggregation and statistics |
 | `csa_kernels.py` | **compatibility shim** that re-exports the split implementation in `_csa_kernels/` |
 | `_csa_kernels/` | **the fused-kernel path for the three core operators** (the retired compute-plan M0 work package): block-compression pooling, indexer top-k selection and sparse attention as Triton kernels (plus a CPU-runnable torch-reference twin of the same algorithmic decomposition); opt-in via `CSA_KERNEL`, off by default — see "Triton kernel path (M0/G0)" below |
@@ -137,7 +157,7 @@ Result directories and reports are not kept in the repository. To obtain them
 again:
 
 ```bash
-python run_gapfill.py smoke      # end-to-end self-check, zero GPU cost
+python run_gapfill.py smoke      # end-to-end self-check; no research measurement
 python run_gapfill.py full       # the v6 main experiment (bounded by the run-time cap)
 python -m explib.rope ...        # per-version supplementary runs; subcommands in each module's help
 python build_report.py           # rebuild the report from on-disk results_*/ + analysis_*/
@@ -160,66 +180,101 @@ The verifier reports each dimension separately, so `environment_changed`,
 
 ## Reproducing (any CUDA box)
 
-```bash
-# 0) environment — Python 3.12 (see pyproject.toml / requirements.txt):
-#    For the verified CPU test/reproduction environment use the lock (includes torch):
-pip install -r requirements.lock
-#    On a CUDA box install the matching torch wheel first, then the ranges:
-#      python -m pip install --index-url https://download.pytorch.org/whl/cu124 torch
-#      pip install -r requirements.txt
-#    Regenerate and archive a machine-specific lock with `python -m pip freeze > requirements.lock`;
-#    requirements.lock records the verified CPU environment, not the paper-scale CUDA one.
-#    Torch note: the lock pins torch==2.14.1+cpu.  The scatter paths cast their
-#    int32 indices to int64, so they no longer rely on torch >= 2.14 scatter
-#    behaviour; the supported range remains torch>=2.8,<3 (requirements.txt).
-# The code no longer pip-installs at import time.  Set CSA_AUTO_INSTALL=1 only
-# for a throwaway environment.  The Hugging Face mirror is opt-in via
-# CSA_HF_MIRROR=1; the default endpoint is the official Hub.
-#
-# If the Hub is unreachable, `load_wikitext` falls back to a local raw dump:
-# point `WT103_RAW_TXT` at a directory holding `wiki.train.raw` /
-# `wiki.valid.raw` (the search also tries `./wt103_raw` next to the repo and
-# `/root/wt103_raw`).  Only those two files are read, and tokenising them
-# reproduces the `wt103_cache/*.npy` cache token-for-token, so the
-# fallback is a pure availability path and never changes a measurement.
-# When `wt103_cache/` is already populated the corpus is served from the cache
-# and no dump or network access is needed at all.  Set `WT103_CACHE_DIR` to
-# relocate the cache; the loaders, `audit_leakage` and P5T all resolve the same
-# variable.  `python -m explib.confirmation smoke` deliberately uses an isolated cache under its
-# smoke outdir so it can never leave a differently-tokenised file in the frozen
-# cache.  Test-cache hits verify the persisted tokenizer bytes (sha256 recorded
-# in test_meta) in addition to the train fit fingerprint.
-# The separate v12 P5T final test reads `wiki.test.raw` via `load_wikitest`
-# (same search path; no earlier phase reads that split).  After changing the
-# train corpus, delete the whole `wt103_cache/` and rebuild it: the test cache
-# is not rebuilt silently.
+The commands below are grouped by side effect: environment, zero-GPU checks,
+then training. Run them from the repository root.
 
-# 1) validate the whole pipeline end to end (smoke run, no push):
-#    (covers dense / fixed / dynamic arms AND the leave-one-out ablation
-#     forward paths: random indexer, zero content, sink off, learned fusion,
-#     HCA layers, dense+sink control)
+### Environment
+
+Python 3.12 is required (see `pyproject.toml`).
+
+- **Verified CPU environment (tests and zero-GPU analysis):**
+
+  ```bash
+  python -m pip install -r requirements.lock
+  ```
+
+  The lock is a complete pinned closure and includes the CPU torch wheel.
+
+- **CUDA machine:** install the torch wheel that matches the local driver
+  first, then the compatibility ranges:
+
+  ```bash
+  python -m pip install --index-url https://download.pytorch.org/whl/cu124 torch
+  python -m pip install -r requirements.txt
+  ```
+
+  The supported range is `torch>=2.8,<3`. The lock pins `torch==2.14.1+cpu`
+  for the CPU path only; regenerate a machine-specific lock with
+  `python -m pip freeze > requirements.lock` and archive it with the release.
+  The scatter paths cast int32 indices to int64, so they do not rely on a
+  particular torch ≥ 2.14 scatter behaviour.
+
+- **No hidden installs:** importing the library never installs packages.
+  `CSA_AUTO_INSTALL=1` is an explicit opt-in for a throwaway environment.
+
+- **Hugging Face mirror:** the official Hub is the default;
+  `CSA_HF_MIRROR=1` opts into `hf-mirror.com` when the official endpoint is
+  unreachable.
+
+### Data and cache fallbacks
+
+- `load_wikitext` first tries the Hub. If the Hub is unreachable, set
+  `WT103_RAW_TXT` to a directory containing `wiki.train.raw` and
+  `wiki.valid.raw`; the loader also checks `./wt103_raw` next to the repo and
+  `/root/wt103_raw`.
+- Only those two files are read, and tokenising them reproduces the
+  `wt103_cache/*.npy` cache token-for-token. The fallback is an availability
+  path, not a different measurement.
+- Once `wt103_cache/` is populated, the corpus is served from the cache and no
+  dump or network access is needed. `WT103_CACHE_DIR` relocates the cache; the
+  loaders, `audit_leakage` and P5T all resolve the same variable.
+- `python -m explib.confirmation smoke` uses an isolated cache under its smoke
+  outdir, so it cannot leave a differently tokenised file in the frozen cache.
+- Test-cache hits verify the persisted tokenizer bytes (sha256 recorded in
+  `test_meta`) in addition to the train fit fingerprint.
+- The v12 P5T final test reads `wiki.test.raw` via `load_wikitest` (same search
+  path). No earlier phase reads that split. After changing the train corpus,
+  delete the whole `wt103_cache/` and rebuild it; the test cache is not rebuilt
+  silently.
+
+### Validate the pipeline before training
+
+These checks exercise the plumbing without producing a research measurement.
+The smoke run covers dense / fixed / dynamic arms and the leave-one-out
+ablation forward paths (random indexer, zero content, sink off, learned
+fusion, HCA layers, dense+sink control):
+
+```bash
 python run_gapfill.py smoke
-python -m explib.corruption smoke  # also covers the new corruption modes + NIAH + controls
+python -m explib.corruption smoke   # corruption modes + NIAH + controls
 python -m pytest -q test_open_block.py   # open-block causality/reference/mask gates (CPU)
-python -m explib.open_block smoke     # open-block matrix plumbing on a tiny synthetic run
+python -m explib.open_block smoke   # open-block matrix plumbing on a tiny synthetic run
+python -m explib.confirmation smoke # frozen final-test roundtrip
+```
+
+The remaining open-block modes are real runs:
+
+```bash
 python -m explib.open_block pilot     # one cell, short run
 python -m explib.open_block main      # 8 cells x 4 seeds; resumable
 python -m explib.open_block aux       # outside-window auxiliary panel
-python -m explib.open_block report    # paired deltas + interaction + exact sign-flip/Holm
 python -m explib.open_block extended  # contingency: all 4 caps x all 3 modes
-python -m explib.confirmation smoke   # also covers the frozen final-test roundtrip
+python -m explib.open_block report    # paired deltas + interaction + exact sign-flip/Holm
+```
 
-# 2) the real supplementary study (bounded by the run-time cap):
+### Run the v6 supplementary study
+
+```bash
 nohup python run_gapfill.py full > run_v6.log 2>&1 &
 tail -f run_v6.log
 ```
 
-`run_gapfill.py full` runs, in order (each phase is resumable; re-running the
-same command skips completed `variant::seed` pairs).  The cheap, statistically
-foundational panels run first so a run-time-capped box secures them before the
-20k-step long runs; every phase schedules at least the 3-seed floor the
-methodology audit requires (`min_n`), and seed-completion passes (P2S / P3T /
-P4SS / P5C …) top individual panels up to n=4–6:
+`run_gapfill.py full` runs the phases below in order. Each phase is resumable:
+re-running the same command skips completed `variant::seed` pairs. The core,
+ablation and scale panels are scheduled before the 20k-step long runs, and
+every phase starts at the 3-seed floor required by the methodology audit
+(`min_n`). Seed-completion passes (P2S / P3T / P4SS / P5C …) later top
+individual panels up to n=4–6:
 
 | phase | output dir | what |
 |---|---|---|
@@ -227,8 +282,6 @@ P4SS / P5C …) top individual panels up to n=4–6:
 | P-ABL | `results_lm_v4_abl` | leave-one-out ablation table — in-panel references (`full` / `csa_fixed` / `csa_dynamic` / `hybrid_fixed` / `hybrid_dynamic`) + `csa_fix_*` / `csa_dyn_*` module-off arms, fuse/HCA/topk arms, 1500 steps x 3 seeds |
 | P-SCALE | `results_lm_v5_scale` | d=384 / 8 layers / seq-1024 probe, 5 variants x 3 seeds x 4000 steps |
 | P-LONG | `results_lm_v3_long` | hybrid_fixed / hybrid_dynamic / hybrid_csa_dyn at seeds 0-2 → 3-seed long-run table |
-
-`full` is bounded by the run-time cap described at the end of this section.
 
 ### Task-level parallelism (one GPU per run)
 
@@ -498,117 +551,37 @@ script pushes and shuts the instance down (cancel with
 > on the fly from the on-disk `results_*/` and `analysis_*/` artifacts; no
 > quantity is ever hard-coded in the repository prose.
 
-## Review-4 hardening (what changed)
+## Measurement guardrails
 
-See `REVIEW_4_RESPONSE.md` for the item-by-item table, the review-4 entry in
-`DECISION_LOG.md`, and `docs/design_notes.md` §25.  The main additions are
-machine gates rather than new prose:
+The analysis path fails closed: absent, stale, or mismatched provenance is
+reported as `not_verifiable_locally` / `provenance_incomplete`, never as a
+pass. The main contracts are:
 
-- **Claim wording** now goes through `exp_lib.reportable_claim` (n>=6, raw p,
-  Holm p, |mean|>std, family resolution floor).  `attach_holm` reports
-  `family_min_attainable_p_holm`, so `p_holm=1.0` from an oversized family is
-  printed as a resolution ceiling, not as a null result.  v10's NIAH contrasts
-  are now inside the Holm family.
-- **Crossover scaling** uses `exp_lib.crossover_scaling_fit`: >=4 de-duplicated
-  widths, no censored subset, training volume within 25%, slope CI/p/R²/LOO,
-  claim level fixed to descriptive.  Otherwise it refuses and says why.
-- **Matched initialization and compute**: every training record carries
-  `init_core_fp` (tok/pos/head/norm) and `pair_reason` refuses a pair whose
-  digests differ.  `_compute_control_detail` reports measured time/token (or
-  the 6ND proxy) and its direction; a significant contrast whose extra compute
-  favours the claimed winner becomes `system_level_only`, not `verified`.
-- **Stale records fail closed**: `build_report.sec_p1l` and v10 exclude any arm
-  with no current code stamp (no table cell, no ratio, no conclusion);
-  `_agg_entry` refuses a multi-group aggregate with no current stamp.  Missing
-  `truncated` flags are treated as unverifiable, not full-length.
-- **Doc-level uncertainty**: `ppl_ci95_doc_bootstrap` is displayed; v12 adds a
-  per-comparison document Δ 95% CI and refuses population-level claims below
-  64 documents.
-- **Efficiency**: the length phase records `measure_efficiency`; the new
-  `measure_efficiency_sweep` covers batch x length, and
-  `audit_gates.efficiency_pairs` only permits a "faster" claim when token
-  count, device, torch version, KV semantics match and the ratio exceeds ±5%.
-  Analytic FLOPs are labelled structural, never as measured speed.
-- **Mechanism**: `audit_gates.selection` defines the selection-recall artifact
-  contract and reports `not_verifiable_locally` (with an explicit "unsupported
-  mechanism claim" note) until that artifact exists.  Boundary alignment,
-  block/read diagnostics and NIAH remain the available direct readouts.
-- **Ablation practical significance**: every declared ablation component now
-  carries a declared SESOI (relative PPL margin, default 1%; exploratory
-  panels only) and is adjudicated with paired TOST plus family-adjusted
-  equivalence p.  A
-  non-significant contrast is never relabelled "removable" without TOST; a
-  statistically significant but sub-SESOI effect is `sub_sesoi`, not
-  `verified`; a TOST-inside-margin result on a COMPLETE declared ablation
-  is `equivalent` (positive evidence of removability).  `audit_gates.py sesoi` fails closed if a component has no
-  declared margin or the ablation is not fully scheduled.  This is exploratory
-  and does not modify the frozen confirmatory manifest.
-- **Capacity-matched ablation placebos**: the sink ablation now has a
-  three-level ladder — learned, frozen-random (same sink shape/count/read
-  budget, drawn from a local RNG seeded by a hash of the layer's own `W_q`
-  without consuming global RNG, parameters frozen) and absent.  `learned - random`
-  isolates the learned component; `learned - absent` remains the total
-  (mechanism + capacity) effect.  `audit_gates.py sink_controls` verifies the
-  exact cfg diff, identical total/sink parameter counts, frozen placebo and
-  the two declared leave-one-out families; a new capacity-matched
-  `dynamic_blocking x attention_sink_learning` 2x2 has its own SESOI.  The
-  on/off contrast can no longer alone support a "learned sink" mechanism claim
-  (design_notes §84).
-- **Single-unit influence**: the pooled ΔPPL now carries an exact
-  leave-one-unit-out readout (`doc_sampling.unit_influence`): the most
-  influential article/line, the Δ without it, direction stability across all
-  folds, a delete-one-unit jackknife interval/SE and its ratio to the
-  cluster-robust SE.  A comparison whose direction or magnitude depends on one
-  evaluation unit is flagged in `REPORT_v12.md`; `audit_gates.py
-  unit_influence` independently checks the block against the reported pooled
-  estimate and warns on fragile/stale artifacts.  It is post-hoc and never
-  changes the frozen p/Holm/`confirmed` verdict (design_notes §57).
-- **Optional stopping / seed top-ups**: every aggregation with a new seed set
-  records each measured declared ablation/baseline contrast in
-  `<outdir>/look_history.json`.  When a contrast has more than
-  one look, `methodology_audit` judges it by the exact **max-over-looks**
-  sign-flip p in the final effect direction (joint sign enumeration over the
-  seed union), and the family-Holm `verified` gate uses that sequential p; the
-  naive final-n p is retained only as `p_holm_global_naive`.  TOST equivalence
-  gets a Bonferroni-over-looks correction as well.  Stale looks (a re-run seed
-  whose delta changed) are excluded and named.  `audit_gates.py looks`
-  independently recomputes the per-look and sequential p and flags
-  naive-significant / sequential-null claims.  This is exploratory only and
-  never changes the frozen manifest (design_notes §58).
-- **Evidence**: `audit_gates.release` parses `RELEASES.md`; with no complete
-  row the repository is declared source-only/not auditable.  `archive_release.py`
-  now also packs `pyproject.toml`, cache/tokenizer metadata and `run_*.log`.
+- **Claim wording** goes through `exp_lib.reportable_claim`: n≥6, raw p, Holm
+  p, |mean|>std, and the family-resolution floor. `attach_holm` reports the
+  minimum attainable Holm p, so an oversized family is shown as a resolution
+  ceiling rather than a null result.
+- **Pairs must be matched** on data slice, recipe, code stamp and
+  initialization (`init_core_fp`); `pair_reason` refuses a pair whose
+  digests differ. A contrast whose measured compute favours the claimed
+  winner is labelled `system_level_only`, not `verified`.
+- **Crossover scaling** requires at least four de-duplicated widths, no
+  censored subset, training volume within 25%, and reports slope CI/p/R²/LOO;
+  otherwise it refuses and states why. The claim level is descriptive.
+- **Ablations** carry a declared SESOI (relative PPL margin, default 1% for
+  exploratory panels) and are judged with paired TOST plus family-adjusted
+  equivalence p. A non-significant contrast is never relabelled "removable"
+  without TOST; a sub-SESOI effect is `sub_sesoi`, not `verified`.
+- **Unit influence and repeated looks** are explicit. Pooled ΔPPL carries an
+  exact leave-one-unit-out readout, and repeated seed sets are judged by the
+  exact max-over-looks sign-flip p recorded in `look_history.json`; neither
+  changes a frozen p/Holm/`confirmed` verdict.
+- **Design and release gates** are executable: `audit_gates.py` covers
+  leakage, causality, single-factor contrasts, SESOI scheduling, unit
+  influence, look history, allocation and evidence readiness;
+  `archive_release.py verify` checks a published archive independently.
+  With no complete row in `RELEASES.md`, the repository stays source-only.
 
-## Review-3 hardening (what changed)
-
-- **PPL aggregation**: training/length records now carry `nll_sum`,
-  `n_tokens` and per-document NLL; `aggregate` reports `ppl_pooled =
-  exp(ΣNLL/Σtokens)` as `ppl_primary` (with the arithmetic seed mean,
-  median/IQR, seed-level t interval and document bootstrap kept alongside).
-  The final PPL is still measured on the full fixed validation batch;
-  `eval_subset` only controls the in-training curve.
-- **Statistics**: v7–v11 analysis and `build_report.py` attach Holm
-  step-down over the displayed family (omitted comparisons keep a dummy p=1
-  slot). Report prose may say “significant” only when n≥6, raw p<0.05, Holm
-  p<0.05 and |mean|>std.
-- **Sign-flip assumptions**: `paired_effect_stats` now also reports the sign
-  split, a paired bootstrap interval, an exact Wilcoxon sensitivity p, and an
-  unpaired bootstrap interval when both arms are supplied. The primary p
-  remains seed-level.
-- **Objectives/parameters**: each record carries a `train_objective`
-  descriptor (does `comp_reg` actually apply? is the delta-LR effective? what
-  boundary policy?) plus `param_breakdown` and
-  `kv_cache_elements_per_token`. `methodology_audit` flags same-run_cfg but
-  different-objective contrasts as system-level, not isolated mechanism.
-- **Boundary learning**: the default `csa_dynamic` remains a cosine threshold
-  with a learned scalar offset trained by `comp_reg`; it is **not**
-  task-learned. The new opt-in `csa_dynamic_task` samples cuts and adds a
-  score-function term, and is scheduled in the ablation panel.
-- **Synthesized records**: `run_gapfill.py full` no longer reconstructs the
-  long summary unless `V6_SYNTH=1`; crossover statistics exclude synthesized
-  seeds entirely and refuse a slope with fewer than 3 independent points.
-- **Reproducibility**: `pyproject.toml` declares Python ≥3.12,
-  `requirements.txt` plus a verified CPU `requirements.lock` are tracked,
-  import-time pip install and the HF mirror are opt-in (`CSA_AUTO_INSTALL=1`, `CSA_HF_MIRROR=1`), and
-  `archive_release.py` packs `DECISION_LOG.md`, the dependency declarations,
-  the freeze lock and a SHA-256 manifest. See `RELEASES.md`.
+The item-by-item review disposition is in `REVIEW_4_RESPONSE.md`; the full
+design rationale is in `docs/design_notes.md` (§25, §56–§58, §84), and the
+chronology is in `DECISION_LOG.md`.

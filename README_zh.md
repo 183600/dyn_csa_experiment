@@ -14,10 +14,16 @@
 
 ## 目录
 
+- [从这里开始](#从这里开始)
 - [快速开始](#快速开始)
+- [从哪里读起](#从哪里读起)
 - [仓库结构](#仓库结构)
   - [重新生成实验产物](#重新生成实验产物)
 - [复现方法（任意 CUDA 机器）](#复现方法任意-cuda-机器)
+  - [环境](#环境)
+  - [数据与缓存回退](#数据与缓存回退)
+  - [训练前校验流水线](#训练前校验流水线)
+  - [运行 v6 补充实验](#运行-v6-补充实验)
   - [任务级并行（每个实验一张卡）](#任务级并行每个实验一张卡)
   - [B 档 M0 / S1（扩规模入口，已选定 B 档）](#b-档-m0--s1扩规模入口已选定-b-档)
   - [Triton 内核路径（M0/G0）](#triton-内核路径m0g0)
@@ -26,22 +32,35 @@
   - [v12 确认套件（探索 / 确认分离）](#v12-确认套件探索--确认分离)
   - [v8 / v9 收尾套件](#v8--v9-收尾套件)
   - [v7 回应 reviewer 套件](#v7-回应-reviewer-套件)
-- [评审四硬化（本轮）](#评审四硬化本轮)
+- [测量护栏](#测量护栏)
+
+## 从这里开始
+
+| 目标 | 先运行 | 会启动训练吗？ |
+|---|---|---|
+| 检查代码与环境是否正常 | `python -m pip install -r requirements.lock`，再 `make test` | 不会 |
+| 预检冻结清单，不读 test split | `make plan` | 不会 |
+| 运行未结束块因果性/参考实现门禁 | `python -m pytest -q test_open_block.py` | 不会 |
+| 端到端试跑整条流水线 | `python run_gapfill.py smoke` | 仅 smoke 小跑 |
+| 运行或续跑正式面板 | [仓库结构](#仓库结构)中的驱动表 | 会 |
+| 从本地产物重建报告 | `python build_report.py` 或 `python -m explib.<driver> report` | 不会 |
+| 比较两次运行是否一致 | `python -m explib.reproduce compare 原始目录 重跑目录` | 不会 |
+| 理解某个测量为什么这样定义 | [从哪里读起](#从哪里读起) | 不会 |
 
 ## 快速开始
 
-需要 Python 3.12。lock 文件是测试与零 GPU 分析路径使用的已验证 CPU 环境；
-CUDA 机器请先安装与本机驱动匹配的 torch wheel，再安装 `requirements.txt`
-中的范围（见[复现方法](#复现方法任意-cuda-机器)）。
+需要 Python 3.12。`requirements.lock` 是测试与零 GPU 分析路径使用的已验证
+CPU 环境；CUDA 机器请先安装与本机驱动匹配的 torch wheel，再安装
+`requirements.txt` 中的范围（见[环境](#环境)）。
 
 ```bash
 python -m pip install -r requirements.lock
-make test                              # CPU 测试套件
+make test                              # 完整 CPU pytest 套件
 make plan                              # 冻结清单预检；不读取 test split
 python -m explib.confirmation --help   # 列出子命令，不启动实验
 ```
 
-以上命令不会启动实验。训练始终需要显式调用驱动的 `full`、`phase <name>`
+以上命令都不会启动训练。训练始终需要显式调用驱动的 `full`、`phase <name>`
 或 `auto` 模式；修改流水线后，先用该驱动的 `smoke` 模式验证。
 
 ### 从哪里读起
@@ -49,6 +68,7 @@ python -m explib.confirmation --help   # 列出子命令，不启动实验
 | 问题 | 文档 |
 |---|---|
 | 实验如何运行或重跑？ | 本 README |
+| 该用哪个命令和子命令？ | [仓库结构](#仓库结构)与下文各驱动小节 |
 | 某个测量或比较为什么这样定义？ | `docs/design_notes.md` |
 | 做过哪些决定，顺序如何？ | `DECISION_LOG.md` |
 | 已发布的证据在哪里？ | `RELEASES.md` |
@@ -65,6 +85,7 @@ python -m explib.confirmation --help   # 列出子命令，不启动实验
 | 路径 | 说明 |
 |---|---|
 | `exp_lib.py` | **兼容 shim**，重新导出拆分后的 `explib/` 实现 |
+| `_split_loader.py` | 拆分包的共享加载器：按声明顺序把 `_parts/` 片段执行到调用方模块的 globals 中，并以片段路径作为 compile 文件名（traceback 指向可审查的源码） |
 | `explib/` | **核心库，也是唯一的代码来源**：模型、CSA/HCA 注意力、池化、indexer、分段器、训练循环、聚合与统计 |
 | `csa_kernels.py` | **兼容 shim**，重新导出 `_csa_kernels/` 实现 |
 | `_csa_kernels/` | **三算子融合内核路径**（已退役算力规划的 M0 工作包）：块压缩池化、索引 top-k 选择与稀疏注意力的 Triton 内核（附带同一套算法分解、任意设备可跑的 torch 参考孪生实现）；`CSA_KERNEL` 选开、默认关闭——见下文「Triton 内核路径（M0/G0）」 |
@@ -109,7 +130,7 @@ python -m explib.confirmation --help   # 列出子命令，不启动实验
 结果目录与报告都不在仓库里。要重新得到它们：
 
 ```bash
-python run_gapfill.py smoke      # 端到端自检，零 GPU 消耗
+python run_gapfill.py smoke      # 端到端自检，不产生研究测量
 python run_gapfill.py full       # v6 主实验（受运行时上限约束）
 python -m explib.rope ...        # 各版本补充实验，子命令见对应模块的帮助
 python build_report.py           # 从落盘的 results_*/ + analysis_*/ 重建报告
@@ -130,56 +151,92 @@ python -m explib.reproduce compare results_lm_v6 results_lm_v6_rerun
 
 ## 复现方法（任意 CUDA 机器）
 
-```bash
-# 0) 环境 — Python 3.12（见 pyproject.toml / requirements.txt）：
-#    CPU 复现/测试请使用已验证的 lock（含 torch）：
-pip install -r requirements.lock
-#    CUDA 机器请按本机 CUDA 版本先装 torch，再安装其余依赖：
-#      python -m pip install --index-url https://download.pytorch.org/whl/cu124 torch
-#      pip install -r requirements.txt
-#    随后用 `python -m pip freeze > requirements.lock` 生成本机 lock 并归档；
-#    requirements.lock 记录的是已验证的 CPU 环境，不是论文规模的 CUDA 环境。
-#    torch 说明：lock 固定 torch==2.14.1+cpu；scatter 路径已把 int32 索引
-#    转成 int64，不再依赖 torch >= 2.14 的 scatter 行为，支持范围仍为
-#    requirements.txt 中的 torch>=2.8,<3。
-# 代码不再在 import 时自动安装依赖；如确需临时环境可显式设置
-# CSA_AUTO_INSTALL=1。Hugging Face 镜像为 opt-in（CSA_HF_MIRROR=1），
-# 默认走官方 Hub。
-#
-# 如果 Hub 不可达，`load_wikitext` 会回退到本地原始文本：
-# 将 `WT103_RAW_TXT` 指向包含 `wiki.train.raw` / `wiki.valid.raw` 的目录
-# （搜索路径还包括仓库旁的 ./wt103_raw 和 /root/wt103_raw）。
-# 只读这两个文件，对其分词可逐 token 复现 `wt103_cache/*.npy` 缓存，
-# 因此该回退是纯可用性路径，不会改变任何测量结果。
-# 若 `wt103_cache/` 已有缓存，语料直接由缓存提供，完全无需下载。
-# v12 P5T 的独立最终测试另读 `wiki.test.raw`（load_wikitest，同一目录
-# 搜索路径；该 split 此前任何阶段都不读）。更换 train 语料后请删除整个
-# wt103_cache/ 重建（test 缓存不会跟随静默重建）。
+以下命令按副作用分组：先准备环境，再跑零 GPU 校验，最后才启动训练。
+均在仓库根目录执行。
 
-# 1) 端到端校验整个流水线（smoke，不 push）：
-#    （除 dense / 固定 / 动态臂外，还覆盖去一法消融的全部独有前向路径：
-#     随机 indexer、零内容池化、关 sink、learned fusion、HCA 层、dense+sink 对照）
+### 环境
+
+需要 Python 3.12（见 `pyproject.toml`）。
+
+- **已验证的 CPU 环境（测试与零 GPU 分析）：**
+
+  ```bash
+  python -m pip install -r requirements.lock
+  ```
+
+  lock 是完整的固定依赖闭包，包含 CPU 版 torch。
+
+- **CUDA 机器：** 先安装与本机驱动匹配的 torch wheel，再安装兼容范围：
+
+  ```bash
+  python -m pip install --index-url https://download.pytorch.org/whl/cu124 torch
+  python -m pip install -r requirements.txt
+  ```
+
+  支持范围为 `torch>=2.8,<3`。lock 中的 `torch==2.14.1+cpu` 只用于 CPU
+  路径；在实验机器上用 `python -m pip freeze > requirements.lock` 生成
+  该机器的 lock，并随发布归档。scatter 路径已把 int32 索引转成 int64，
+  不依赖某个特定的 torch ≥ 2.14 scatter 行为。
+
+- **不会隐式安装：** import 库时不会安装任何包。只有显式设置
+  `CSA_AUTO_INSTALL=1` 才会为一次性环境安装缺失依赖。
+
+- **Hugging Face 镜像：** 默认走官方 Hub；官方端点不可达时可显式设置
+  `CSA_HF_MIRROR=1` 使用 `hf-mirror.com`。
+
+### 数据与缓存回退
+
+- `load_wikitext` 先尝试 Hub。若 Hub 不可达，将 `WT103_RAW_TXT` 指向包含
+  `wiki.train.raw` 与 `wiki.valid.raw` 的目录；加载器还会检查仓库旁的
+  `./wt103_raw` 和 `/root/wt103_raw`。
+- 只读这两个文件；对其分词可逐 token 复现 `wt103_cache/*.npy` 缓存。
+  该回退是纯可用性路径，不会改变测量结果。
+- 若 `wt103_cache/` 已有缓存，语料直接由缓存提供，无需下载或原始文本。
+  `WT103_CACHE_DIR` 可迁移缓存位置；加载器、`audit_leakage` 与 P5T
+  解析同一个变量。
+- `python -m explib.confirmation smoke` 在 smoke 输出目录下使用隔离缓存，
+  不会把不同分词结果的缓存写进冻结缓存。
+- 命中 test 缓存时，除 train fit 指纹外，还会校验落盘分词器字节
+  （sha256 记录在 `test_meta` 中）。
+- v12 P5T 的独立最终测试另读 `wiki.test.raw`（`load_wikitest`，同一目录
+  搜索路径）；此前任何阶段都不读该 split。更换 train 语料后请删除整个
+  `wt103_cache/` 重建（test 缓存不会跟随静默重建）。
+
+### 训练前校验流水线
+
+以下命令只验证流水线，不产生研究测量。smoke 运行覆盖 dense / 固定 /
+动态臂，以及去一法消融的全部独有前向路径（随机 indexer、零内容池化、
+关 sink、learned fusion、HCA 层、dense+sink 对照）：
+
+```bash
 python run_gapfill.py smoke
-python -m explib.corruption smoke  # 同时覆盖新腐坏模式 + NIAH + 从头训练对照
+python -m explib.corruption smoke   # 腐坏模式 + NIAH + 对照
 python -m pytest -q test_open_block.py   # 未结束块因果性/参考实现/掩码门禁（CPU）
-python -m explib.open_block smoke     # 未结束块矩阵的微型合成自检
+python -m explib.open_block smoke   # 未结束块矩阵的微型合成自检
+python -m explib.confirmation smoke # 冻结最终测试的完整往返
+```
+
+其余未结束块模式是真实运行：
+
+```bash
 python -m explib.open_block pilot     # 单格短程运行
 python -m explib.open_block main      # 8 配置 × 4 种子；可续跑
-python -m explib.open_block report    # 配对差 + 交互效应 + 精确符号翻转/Holm
 python -m explib.open_block aux       # 窗口外辅助面板
 python -m explib.open_block extended  # 应急：4 上限 × 3 模式
-python -m explib.confirmation smoke   # 同时覆盖冻结最终测试的完整往返
+python -m explib.open_block report    # 配对差 + 交互效应 + 精确符号翻转/Holm
+```
 
-# 2) 正式补充实验（受运行时上限约束）：
+### 运行 v6 补充实验
+
+```bash
 nohup python run_gapfill.py full > run_v6.log 2>&1 &
 tail -f run_v6.log
 ```
 
-`run_gapfill.py full` 按顺序运行（每阶段可断点续跑；重跑同一命令会跳过
-已完成的 `variant::seed` 组合）。便宜且统计上根本性的面板排在最前，
-受运行时上限约束的机器先拿到 n≥3 的核心/消融/规模表，20k 步长跑最后；
-每个阶段都至少排满方法学审计要求的 3-seed 下限（`min_n`），个别面板
-再由补种子阶段（P2S / P3T / P4SS / P5C …）加到 n=4–6：
+`run_gapfill.py full` 按顺序运行下列阶段（每阶段可断点续跑；重跑同一命令
+会跳过已完成的 `variant::seed` 组合）。核心、消融与规模面板排在 20k 步
+长跑之前；每个阶段都至少排满方法学审计要求的 3-seed 下限（`min_n`），
+个别面板再由补种子阶段（P2S / P3T / P4SS / P5C …）加到 n=4–6：
 
 | 阶段 | 输出目录 | 内容 |
 |---|---|---|
@@ -187,8 +244,6 @@ tail -f run_v6.log
 | P-ABL | `results_lm_v4_abl` | 去一法消融表——面板内参照臂（`full` / `csa_fixed` / `csa_dynamic` / `hybrid_fixed` / `hybrid_dynamic`）+ `csa_fix_*` / `csa_dyn_*` 去模块臂，以及 fuse/HCA/topk 臂，1500 步 × 3 seeds |
 | P-SCALE | `results_lm_v5_scale` | d=384 / 8 层 / seq-1024 探针，5 变体 × 3 seeds × 4000 步 |
 | P-LONG | `results_lm_v3_long` | hybrid_fixed / hybrid_dynamic / hybrid_csa_dyn，seeds 0-2 → 三 seed 长跑表 |
-
-`full` 受本节末尾描述的运行时上限约束。
 
 ### 任务级并行（每个实验一张卡）
 
@@ -415,71 +470,30 @@ python build_report.py        # 从产物重建 REPORT_v7.md（零 GPU）
 > 构建器从 `results_*/`、`analysis_*/` 落盘产物现算出的表格为准，仓库正文
 > 不写死任何量值。
 
-## 评审四硬化（本轮）
+## 测量护栏
 
-逐条核对见 `REVIEW_4_RESPONSE.md`、`DECISION_LOG.md` 的 review-4 条目与 `docs/design_notes.md` §25。核心变化是把原先的软约束变成机器闸门：
+分析路径采用 fail-closed：缺失、陈旧或不匹配的来源信息一律报为
+`not_verifiable_locally` / `provenance_incomplete`，绝不当作通过。主要契约：
 
-- 报告措辞统一走 `exp_lib.reportable_claim`（n≥6、原始 p、Holm p、
-  `mean>std`、族级最小可达 p）；`attach_holm` 输出族级分辨率上限，
-  v10 的 NIAH 对照并入同一 Holm 族。
-- 交叉点标度改用 `crossover_scaling_fit`：≥4 个去重宽度、任一点删失即
-  拒绝、训练量差 >25% 拒绝、斜率带 95% CI；否则不报告斜率。
-- 每条训练记录新增 `init_core_fp`，`pair_reason` 拒绝共享 trunk 初始化
-  不同的配对；`_compute_control_detail` 报告实测计算量比及方向，偏袒
-  赢家的混杂结果标为 `system_level_only` 而非 `verified`。
-- 陈旧记录 fail-closed：无当前代码戳的按长度臂整臂排除，不列表、不算
-  ratio；缺失 `truncated` 标记按不可验证处理。
-- P2 表显示文档 bootstrap CI；v12 主比较表新增文档 Δ CI，文档数 <64 时
-  禁止总体主张。
-- 长度阶段记录实测效率；新增 `measure_efficiency_sweep` 与
-  `audit_gates.py efficiency_pairs`，只有同形状/同设备/同 KV 语义且
-  比值超出 ±5% 才允许说「更快」。
-- 新增 `audit_gates.py selection`：选择召回工件缺失时明确「学习选择器
-  找到相关信息」为未支持主张；`release` 在 `RELEASES.md` 无完整行时
-  声明仓库 source-only、数值不可独立复核。
-- 新增 `audit_gates.py single_factor`（评审七·定义点单因素门）：
-  `exp_lib.ABLATION_INTERVENTION_KEYS` 为每条声明对照声明允许差的
-  AttnCfg 键集，`single_factor_design_audit` 逐层 diff 两个臂的实际配置
-  ——多一个键（第二个因素）、少一个键（干预消失）、缺声明都 refuse；
-  `kind` 在差集里标为 architecture_level，方法 vs 参数对齐稠密基线因此
-  是架构级对照。`python -m explib.confirmation plan` 把冻结清单的 `mechanism_claim_allowed`
-  变成可核验属性：cfg diff 落在单一干预族、两臂实际训练目标一致、参数量
-  对齐同时成立才判单因素；True 标志挂上非单因素比较直接 refuse。HCA 动态
-  臂的 comp_lambda_mult=4 与 block_size（inert）差异首次写进对照声明
-  （详见 docs/design_notes.md §37）。
-- **消融的实际显著性**：每个声明组件新增 SESOI（默认相对 PPL 1%；只用于
-  探索性面板；历史面板是分析前固定的 convention，不是当年预注册），
-  用配对 TOST + 族校正等价 p 判定「实际有用 / 实际可删 / 亚 SESOI /
-  有害 / 不确定」。**不显著**绝不会在没有 TOST 的情况下被改写成「可删」；
-  显著但小于 SESOI 的结果是 `sub_sesoi`，不再进入 `verified`；TOST 区间
-  整体落在 margin 内、且该组件的声明对照全部在场，才是 `equivalent`
-  （可删的正证据）；部分消融只作描述性读数。`audit_gates.py
-  sesoi` 对「缺 margin / 未完整排程」fail-closed。该层只约束探索性消融，
-  不改冻结确认清单（详见 docs/design_notes.md §56）。
-- **容量匹配的消融安慰剂**：sink 消融新增三级阶梯——learned、frozen-random
-  （sink 形状/数量/读取预算相同，值以该层已有 `W_q` 的哈希作局部 RNG
-  种子抽取、不消耗全局 RNG、参数冻结）与 absent。`learned−random` 隔离学习成分；
-  `learned−absent` 仍是总效应（机制+容量）。`audit_gates.py sink_controls`
-  核验精确 cfg diff、总/sink 参数量相同、placebo 冻结与两条留一对照声明；
-  新增容量匹配的 `dynamic_blocking × attention_sink_learning` 2×2 独立
-  SESOI。on/off 对照不再能单独支撑「学习到的 sink」机制主张
-  （详见 docs/design_notes.md §84）。
-- **单单元影响**：pooled ΔPPL 新增精确的 leave-one-unit-out 读数
-  （`doc_sampling.unit_influence`）：最敏感文章/行、删除它后的 Δ、全部
-  LOO 折的方向稳定性、delete-one-unit jackknife 区间/SE 及其与
-  cluster-robust SE 的比值。方向或幅度依赖单个评测单位的比较会在
-  `REPORT_v12.md` 中标记；`audit_gates.py unit_influence` 独立核对影响块
-  与报告 pooled Δ 一致，并对 fragile/陈旧产物给 warning。该层是 post-hoc
-  描述，**不改变**冻结 p/Holm/`confirmed` 判定（详见 docs/design_notes.md
-  §57）。
-- **补种子 / optional stopping**：每次聚合出现新种子集合时，驱动把每个
-  已测的声明式留一/基线对照的种子集合与逐种子配对差写入
-  `<outdir>/look_history.json`。同一对照有多个 look 时，`methodology_audit`
-  改用**最终效应方向上的精确
-  max-over-looks** 符号翻转 p（对种子并集做联合符号枚举），族校正后的
-  `verified` 门使用该序列 p；最终 n 的朴素 p 只保留为
-  `p_holm_global_naive` 供对照。TOST 等价判定也做 Bonferroni-over-looks
-  修正；被重跑改变配对差的 stale look 会被剔除并点名。
-  `audit_gates.py looks` 独立重算逐 look p 与序列 p，并点名「朴素显著
-  但序列不显著」的对照。该层只约束探索性面板，**不改**冻结清单
-  （详见 docs/design_notes.md §58）。
+- **报告措辞**统一走 `exp_lib.reportable_claim`（n≥6、原始 p、Holm p、
+  `|mean|>std`、族级分辨率下限）。`attach_holm` 同时给出族级最小可达 p，
+  过大的比较族会显示为分辨率上限，而不是零结果。
+- **配对必须匹配**数据切片、配方、代码戳与初始化（`init_core_fp`）；
+  `pair_reason` 拒绝摘要不一致的配对。若实测计算量方向偏袒声称的赢家，
+  该对照标为 `system_level_only`，不进入 `verified`。
+- **交叉点标度**要求至少 4 个去重宽度、无删失子集、训练量差不超过 25%，
+  并报告斜率 CI/p/R²/LOO；否则拒绝并说明原因，主张级别固定为描述性。
+- **消融**必须声明 SESOI（探索性面板默认相对 PPL 1%），并用配对 TOST
+  加族校正等价 p 判定。没有 TOST 时，不显著的结果不会被改写成「可删」；
+  显著但小于 SESOI 的结果是 `sub_sesoi`，不是 `verified`。
+- **单元影响与重复 look** 是显式读数。pooled ΔPPL 带精确的
+  leave-one-unit-out 诊断；新增种子集合按 `look_history.json` 中的精确
+  max-over-looks 符号翻转 p 判定。两者都不改变冻结的 p/Holm/`confirmed`
+  判定。
+- **设计与发布门**可执行：`audit_gates.py` 覆盖泄漏、因果性、单因素对照、
+  SESOI 排程、单元影响、look 历史、运行分配与证据就绪；
+  `archive_release.py verify` 可独立校验已发布归档。当 `RELEASES.md`
+  没有完整记录时，仓库保持 source-only。
+
+逐条评审处置见 `REVIEW_4_RESPONSE.md`；完整设计依据见
+`docs/design_notes.md`（§25、§56–§58、§84），时间线见 `DECISION_LOG.md`。
