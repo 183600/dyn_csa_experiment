@@ -1,4 +1,9 @@
-"""Split implementation package for audit_gates.py."""
+"""Split implementation package for audit_gates.py.
+
+Fragments are executed in ``_PARTS`` order, which is dependency order rather
+than numeric filename order.  Keep a new fragment in its required execution
+position instead of re-sorting the list.
+"""
 
 import os as _os
 

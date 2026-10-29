@@ -59,6 +59,25 @@ def _declared_arm_id(levels, level_name, base_label):
     return arm if isinstance(arm, str) and arm.strip() else None
 
 
+def _declared_pairs(design, component):
+    """String arm pairs declared for one ``ABLATION_DESIGN`` component.
+
+    Returns ``None`` when the component is absent or is not a list/tuple, and
+    otherwise a set of the well-formed ``(arm_a, arm_b)`` entries.  Malformed
+    entries are skipped rather than raised: a broken declaration must make the
+    consuming audit fail closed, not crash it with a ``TypeError``.
+    """
+    raw = design.get(component) if isinstance(design, dict) else None
+    if not isinstance(raw, (list, tuple)):
+        return None
+    pairs = set()
+    for item in raw:
+        if (isinstance(item, (tuple, list)) and len(item) >= 2
+                and isinstance(item[0], str) and isinstance(item[1], str)):
+            pairs.add((item[0], item[1]))
+    return pairs
+
+
 def _control_cfg_field_values(factory, n_layers, arm, field):
     """Actual per-layer value of one config field for a constructed arm.
 
@@ -193,18 +212,8 @@ def content_control_audit(design=None, ladder=None, present=None, factory=None,
         out['status'] = 'fail'
         return out
     # Check the leave-one-out families that consume these controls.
-    def _pairs_for(comp):
-        raw = design.get(comp) if isinstance(design, dict) else None
-        if not isinstance(raw, (list, tuple)):
-            return None
-        pairs = set()
-        for _item in raw:
-            if (isinstance(_item, (tuple, list)) and len(_item) >= 2
-                    and isinstance(_item[0], str) and isinstance(_item[1], str)):
-                pairs.add((_item[0], _item[1]))
-        return pairs
-    presence_pairs = _pairs_for('content_pooling')
-    alignment_pairs = _pairs_for('content_alignment')
+    presence_pairs = _declared_pairs(design, 'content_pooling')
+    alignment_pairs = _declared_pairs(design, 'content_alignment')
     if not presence_pairs:
         out['violations'].append(
             'ABLATION_DESIGN has no content_pooling contrast for the presence control')
@@ -507,19 +516,8 @@ def sink_control_audit(design=None, ladder=None, present=None, factory=None,
         out['status'] = 'fail'
         return out
 
-    def _pairs_for(comp):
-        raw = design.get(comp) if isinstance(design, dict) else None
-        if not isinstance(raw, (list, tuple)):
-            return None
-        pairs = set()
-        for _item in raw:
-            if (isinstance(_item, (tuple, list)) and len(_item) >= 2
-                    and isinstance(_item[0], str) and isinstance(_item[1], str)):
-                pairs.add((_item[0], _item[1]))
-        return pairs
-
-    treatment_pairs = _pairs_for('attention_sink_learning')
-    total_pairs = _pairs_for('attention_sink')
+    treatment_pairs = _declared_pairs(design, 'attention_sink_learning')
+    total_pairs = _declared_pairs(design, 'attention_sink')
     if not treatment_pairs:
         out['violations'].append(
             'ABLATION_DESIGN has no attention_sink_learning contrast for the '

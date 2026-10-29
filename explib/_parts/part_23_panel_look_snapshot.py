@@ -454,25 +454,6 @@ def _params_of_arm(recs, arm):
         return None
     return vals[0]
 
-def _int_ratio_within(numerator, denominator, tolerance):
-    """Exact ``numerator / denominator <= tolerance`` for integer counts.
-
-    A near-tie between two counts beyond float64's range has an unrepresentable
-    relative difference but a well-defined answer to the capacity gate.
-    """
-    try:
-        numerator, denominator = int(numerator), int(denominator)
-        tolerance = float(tolerance)
-    except (TypeError, ValueError, OverflowError):
-        return None
-    if denominator <= 0 or numerator < 0 or not math.isfinite(tolerance):
-        return None
-    try:
-        from fractions import Fraction
-        return bool(Fraction(numerator, denominator)
-                    <= Fraction.from_float(tolerance))
-    except (OverflowError, ValueError):
-        return None
 
 def _integral_value(value):
     """Exact integer for an integer-valued scalar, else None.

@@ -1,4 +1,11 @@
-"""Measurement library (split by responsibility; source-compatible with exp_lib)."""
+"""Measurement library assembled from ordered source fragments.
+
+``_parts/*.py`` are executed in ``_PARTS`` order into this module's globals,
+which reproduces the historical single-file body while keeping each fragment
+reviewable.  Later fragments may use names defined by earlier ones, so append a
+new part (or insert a self-contained one) and keep the list in execution order.
+``exp_lib.py`` re-exports this module for the historical import path.
+"""
 
 import os as _os
 

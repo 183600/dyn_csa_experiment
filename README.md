@@ -15,9 +15,9 @@ scope in `confirmation_frozen.json`; everything else is exploratory.
 > **Version naming.** `v12` is the driver/study generation; `CODE_SEMANTICS =`
 > `v11.128` is the library measurement-semantics stamp that the frozen plan
 > binds. They are not the same numbering scheme, and the mismatch is intentional.
-> The frozen manifest is at `manifest_version: 3` (see its `revision.history`);
-> the continuous-loop CI is intentionally disabled until that signed commit is
-> fixed and P5T has run.
+> The frozen manifest is at `manifest_version: 3` (see its `revision.history`).
+> P5T is deferred, and the continuous-loop workflow is currently re-enabled,
+> gated by the repository variable `CONTINUOUS_LOOP_ENABLED`.
 
 > **Evidence levels.** v6-v11 are exploratory (selected on the same validation
 split). Only the frozen v12 fixed-chunk comparisons are confirmatory. See
@@ -30,6 +30,52 @@ split). Only the frozen v12 fixed-chunk comparisons are confirmatory. See
 > the numbers in any report you have not regenerated are not independently
 > auditable. A claim becomes auditable only when its `release_<tag>.tar.gz`
 > plus manifest is published and `archive_release.py verify` passes.
+
+## Contents
+
+- [Quick start](#quick-start)
+- [Repository layout](#repository-layout)
+  - [Regenerating the experiment artifacts](#regenerating-the-experiment-artifacts)
+- [Reproducing (any CUDA box)](#reproducing-any-cuda-box)
+  - [Task-level parallelism (one GPU per run)](#task-level-parallelism-one-gpu-per-run)
+  - [B-tier M0 / S1 (scale-up entry point, adopted tier B)](#b-tier-m0--s1-scale-up-entry-point-adopted-tier-b)
+  - [Triton kernel path (M0/G0)](#triton-kernel-path-m0g0)
+  - [v11 statistical close-out suite](#v11-statistical-close-out-suite)
+  - [v10 mechanism / scaling / stats suite](#v10-mechanism--scaling--stats-suite)
+  - [v12 confirmation suite (exploration / confirmation split)](#v12-confirmation-suite-exploration--confirmation-split)
+  - [v8 / v9 close-out suites](#v8--v9-close-out-suites)
+  - [v7 reviewer-response suite](#v7-reviewer-response-suite)
+- [Review-4 hardening (what changed)](#review-4-hardening-what-changed)
+- [Review-3 hardening (what changed)](#review-3-hardening-what-changed)
+
+## Quick start
+
+Python 3.12 is required. The lock file is the verified CPU environment used by
+the tests and the zero-GPU analysis path; on a CUDA machine, install the torch
+wheel that matches the local driver first, then the ranges in
+`requirements.txt` (see [Reproducing](#reproducing-any-cuda-box)).
+
+```bash
+python -m pip install -r requirements.lock
+make test                              # CPU test suite
+make plan                              # frozen-manifest preflight; no test-split read
+python -m explib.confirmation --help   # list subcommands without starting a run
+```
+
+The commands above do not start an experiment. Training is always explicit:
+invoke a driver's `full`, `phase <name>`, or `auto` mode when you intend to run
+it, and start with that driver's `smoke` mode when validating a change to the
+pipeline.
+
+### Where to look
+
+| question | document |
+|---|---|
+| How do I run or re-run an experiment? | this README |
+| Why is a measurement or comparison defined this way? | `docs/design_notes.md` |
+| What was decided, and in what order? | `DECISION_LOG.md` |
+| Where is the released evidence? | `RELEASES.md` |
+| How were the review issues resolved? | `REVIEW_4_RESPONSE.md` |
 
 ## Repository layout
 
@@ -55,12 +101,13 @@ the design notes, `docs/design_notes.md`).
 | `explib/resume/` | **the v9 driver** (`python -m explib.resume`): P2T (the seq-2048 topk sweep at `batch_size=1`) and P2S3 (third seed for the RoPE 20k run) |
 | `explib/corruption/` | **the v10 driver** (`python -m explib.corruption`): P3M length-extrapolation mechanism + distractor-injection probe, P3S inversion-crossover scaling, P3T topk sweep to 4 seeds |
 | `explib/length/` | **the v11 driver** (`python -m explib.length`): statistical close-out — distractor probe to n=6 (P4MT/P4MP), crossover panels to n=4 (P4S), d=384 paired arms to n=4 (P4F) |
-| `explib/confirmation/` | **the v12 confirmation driver** (`python -m explib.confirmation`; reviewer-response + review-2 hardening): P5C trains all four frozen arms at the manifest seed list, P5MP runs the extended corruption-mode probe (uniform/realistic-token/mask/delete + review-2 span/doc/topical + NIAH-natural), P5S2/P5S3 add the token-matched and 6ND-param-proxy scale arms, P5T performs the FROZEN final evaluation on the held-out WikiText-103 test split per `confirmation_frozen.json` — with a load-time plan-power gate (a plan that cannot mathematically confirm is refused), strict record admission (seed whitelist / unique records / one frozen test slice / recipe signature / manifest sha), a first-access freeze lock, and per-document PPL records |
+| `explib/confirmation/` | **the v12 confirmation driver** (`python -m explib.confirmation`; reviewer-response + review-2 hardening): P5C trains all six frozen arms at the manifest seed list, P5MP runs the extended corruption-mode probe (uniform/realistic-token/mask/delete + review-2 span/doc/topical + NIAH-natural), P5S2/P5S3 add the token-matched and 6ND-param-proxy scale arms, P5T performs the FROZEN final evaluation on the held-out WikiText-103 test split per `confirmation_frozen.json` — with a load-time plan-power gate (a plan that cannot mathematically confirm is refused), strict record admission (seed whitelist / unique records / one frozen test slice / recipe signature / manifest sha), a first-access freeze lock, and per-document PPL records |
 | `explib/open_block/` | **open-block panel driver** (`python -m explib.open_block`): maximum block length (32/64/128/no cap) × current-block reading rule (`closed` / `prefix_summary` / `prefix_singletons`), with a shared top-k budget, causal prefix construction, outside-window auxiliary panel, paired per-seed deltas and interaction statistics — see `docs/design_notes.md` §24 |
 | `explib/reproduce/` | **cross-run reproduction comparator** (`python -m explib.reproduce compare ORIGINAL RERUN`): matches two panel summaries cell by cell and reports whether they share source bytes, data slice, configuration, execution environment and matched initialization, plus whether the final PPL is exact/within a declared tolerance. Missing provenance is `provenance_incomplete`, never a pass; the same check is exposed as `audit_gates.py reproduction ORIGINAL RERUN` — see `docs/design_notes.md` §83 |
 | `test_open_block.py` | **open-block CPU gates**: config/segmenter, optimized-vs-reference prefix pooling (forward + gradients), prefix invariance, future perturbation/gradient, candidate masks, edge cases, closed regression, singleton semantics and HCA budget declaration |
 | `test_review_part_*.py`, `test_review_fixes.py` | **CPU review pytest suite**: compatibility entry point plus the split test modules (run with `make test` or `pytest`) |
-| `confirmation_frozen.json` | **pre-registered confirmation plan v2** (tracked): frozen arms, seeds 0-11 (revised 6->12 BEFORE any test-split access; power table recorded), endpoints, exact sign-flip + Holm, decision rule, machine-checkable binding block and a scope declaration — see `docs/design_notes.md` §17 and `DECISION_LOG.md` |
+| `confirmation_frozen.json` | **pre-registered confirmation plan** (tracked; `manifest_version: 3`, revision history v1-v5): frozen arms and seeds 0-11 (revised 6->12 BEFORE any test-split access; power table recorded), endpoints, exact sign-flip + Holm, decision rule, machine-checkable binding block and a scope declaration — see `docs/design_notes.md` §17 and `DECISION_LOG.md` |
+| `confirmation_frozen_dynamic.json` | **separate draft pre-registration for dynamic chunking and HCA** (`manifest_version: 4`; not frozen): H1 segmentation quality, H2 retrieval precision and H3 long-range coverage, plus the controls that must be scheduled before a disjoint test corpus is reserved — see `DECISION_LOG.md` |
 | `RELEASES.md` | **evidence release index**: where each immutable `release_<tag>.tar.gz` + SHA-256 manifest is published; the Git repo itself stays source-only |
 | `pyproject.toml` / `requirements.txt` / `requirements.lock` | Python ≥3.12 and dependency declarations; install explicitly (no import-time pip install). `requirements.lock` is the verified CPU environment |
 | `DECISION_LOG.md` | **decision log** (tracked; reconstructed 2026-10-18 from the README/design notes/manifest because the snapshot has one squashed commit): why each version ran what it ran, what was seen, and what was decided next — the exploration/confirmation paper trail; formal releases additionally archive per-seed results via `archive_release.py` |
@@ -142,6 +189,10 @@ pip install -r requirements.lock
 # smoke outdir so it can never leave a differently-tokenised file in the frozen
 # cache.  Test-cache hits verify the persisted tokenizer bytes (sha256 recorded
 # in test_meta) in addition to the train fit fingerprint.
+# The separate v12 P5T final test reads `wiki.test.raw` via `load_wikitest`
+# (same search path; no earlier phase reads that split).  After changing the
+# train corpus, delete the whole `wt103_cache/` and rebuild it: the test cache
+# is not rebuilt silently.
 
 # 1) validate the whole pipeline end to end (smoke run, no push):
 #    (covers dense / fixed / dynamic arms AND the leave-one-out ablation
@@ -149,7 +200,7 @@ pip install -r requirements.lock
 #     HCA layers, dense+sink control)
 python run_gapfill.py smoke
 python -m explib.corruption smoke  # also covers the new corruption modes + NIAH + controls
-python test_open_block.py         # open-block causality/reference/mask gates (CPU)
+python -m pytest -q test_open_block.py   # open-block causality/reference/mask gates (CPU)
 python -m explib.open_block smoke     # open-block matrix plumbing on a tiny synthetic run
 python -m explib.open_block pilot     # one cell, short run
 python -m explib.open_block main      # 8 cells x 4 seeds; resumable
@@ -353,7 +404,7 @@ python -m explib.confirmation auto            # UNATTENDED: the same chain as `f
                                               #   (manifest sha256 / code stamp / git tree / arms / seeds /
                                               #   primary comparisons / alpha) is archived for ASYNCHRONOUS human
                                               #   review instead of blocking the launch
-python -m explib.confirmation phase P5C       # train all four frozen arms at the manifest seed list (resumable; 0-5 main arms covered by P3MT/P4MT)
+python -m explib.confirmation phase P5C       # train all six frozen arms at the manifest seed list (resumable; 0-5 main arms covered by P3MT/P4MT)
 python -m explib.confirmation phase P5MP      # extended probe (all modes + NIAH + controls) at the manifest seed list
 python -m explib.confirmation phase P5S2      # token-matched large scale arm (8000 steps)
 python -m explib.confirmation phase P5S3      # compute-matched large scale arm (param-ratio steps)

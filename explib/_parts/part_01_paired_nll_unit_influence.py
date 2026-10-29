@@ -47,30 +47,8 @@ def paired_nll_unit_influence(nll_a, nll_b, n_tokens, *, unit_ids=None,
         raise ValueError('paired_nll_unit_influence: top_k must be a positive integer')
     top_k = _top_k
 
-    def _matrix(x, name):
-        try:
-            raw = np.asarray(x)
-        except (TypeError, ValueError, OverflowError):
-            raise ValueError(f'{name}: values must be numeric') from None
-        if _contains_bool_value(x) or raw.dtype.kind == 'b':
-            # A boolean is a flag, not an NLL measurement (same scalar
-            # contract as _finite_scalar/_nll_doc_ci).  Without this check
-            # True/False would silently become 1.0/0.0.
-            raise ValueError(f'{name}: booleans are not NLL measurements')
-        try:
-            arr = np.asarray(raw, dtype=float)
-        except (TypeError, ValueError, OverflowError):
-            raise ValueError(f'{name}: values must be numeric') from None
-        if arr.ndim == 1:
-            arr = arr[None, :]
-        if arr.ndim != 2 or arr.shape[0] < 1 or arr.shape[1] < 1:
-            raise ValueError(f'{name}: expected [n_seeds, n_units], got shape {arr.shape}')
-        if not np.all(np.isfinite(arr)):
-            raise ValueError(f'{name}: all per-unit NLLs must be finite')
-        return arr
-
-    A = _matrix(nll_a, 'paired_nll_unit_influence(nll_a)')
-    B = _matrix(nll_b, 'paired_nll_unit_influence(nll_b)')
+    A = _as_nll_matrix(nll_a, 'paired_nll_unit_influence(nll_a)')
+    B = _as_nll_matrix(nll_b, 'paired_nll_unit_influence(nll_b)')
     if A.shape != B.shape:
         raise ValueError(
             f'paired_nll_unit_influence: arm shapes differ ({A.shape} vs {B.shape}); '

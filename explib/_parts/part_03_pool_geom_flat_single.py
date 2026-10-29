@@ -1,8 +1,8 @@
 
 def _pool_geom_flat_single(counts_l, B, n, max_len, p_rows, pad_to=1):
-    # Single-block-form twin of _pool_geom_flat_single's variable sibling
-    # (pool_blocks_single's g/mask/pos_a flats): same exact-integer host
-    # build (§6.2).  Returns (flat_i, mask_np, n_g, max_len) or None.
+    # Single-block-form twin of the variable-block host builder behind
+    # pool_blocks_single (the same g/mask/pos_a flats and exact-integer host
+    # build, §6.2).  Returns (flat_i, mask_np, n_g, max_len) or None.
     try:
         B = int(B)
         n = int(n)

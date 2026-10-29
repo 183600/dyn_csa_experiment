@@ -4,13 +4,55 @@
 
 在小型从零训练语言模型（BPE-8k，WikiText-103）中，对**压缩块稀疏注意力**
 （CSA / HCA，固定分块与动态分块）与稠密注意力进行受控对比研究。本仓库包含
-实验代码以及在自己机器上**重跑实验**所需的协议。仓库**不包含数值结果**：没有随仓库发布证据归档（见 `RELEASES.md`），因此仅凭 Git 树无法独立复核任何报告中的 PPL 数值。
+实验代码以及在自己机器上**重跑实验**所需的协议。仓库**不包含数值结果**：没有随仓库发布证据归档（见 `RELEASES.md`），因此仅凭 Git 树无法独立复核任何报告中的 PPL 数值。仓库中的主张仅限 `confirmation_frozen.json` 冻结的范围；其余均为探索性。
 
 > **证据等级**：v6–v11 为探索性（在同一 validation split 上选择后观察）；只有 v12 冻结的固定分块比较是确认性。详见 `DECISION_LOG.md` 与 `docs/design_notes.md` §17/§20。
 >
-> **版本命名**：`v12` 是驱动/研究代次；`CODE_SEMANTICS = v11.128` 是冻结清单绑定的库测量语义戳，两者故意不同号。冻结清单当前为 `manifest_version: 3`（见其 `revision.history`）；continuous-loop CI 已被有意停用，直到签署后的提交固定且 P5T 完成。
+> **版本命名**：`v12` 是驱动/研究代次；`CODE_SEMANTICS = v11.128` 是冻结清单绑定的库测量语义戳，两者故意不同号。冻结清单当前为 `manifest_version: 3`（见其 `revision.history`）；P5T 已推迟，continuous-loop 工作流目前重新启用，并由仓库变量 `CONTINUOUS_LOOP_ENABLED` 控制。
 
 > **证据状态（引用数字前必读）**：`results_*/`、`analysis_*/`、`REPORT*.md` 有意不入库，且**没有随仓库发布证据归档**（`RELEASES.md` 尚无记录）。报告可由你自己产生的产物重建，但任何你没有重建过的报告数值都无法独立复核。只有当 `release_<tag>.tar.gz` 与清单发布到只读位置并通过 `archive_release.py verify` 时，相应主张才可审计。
+
+## 目录
+
+- [快速开始](#快速开始)
+- [仓库结构](#仓库结构)
+  - [重新生成实验产物](#重新生成实验产物)
+- [复现方法（任意 CUDA 机器）](#复现方法任意-cuda-机器)
+  - [任务级并行（每个实验一张卡）](#任务级并行每个实验一张卡)
+  - [B 档 M0 / S1（扩规模入口，已选定 B 档）](#b-档-m0--s1扩规模入口已选定-b-档)
+  - [Triton 内核路径（M0/G0）](#triton-内核路径m0g0)
+  - [v11 统计收尾套件](#v11-统计收尾套件)
+  - [v10 机制 / 扩规模 / 统计套件](#v10-机制--扩规模--统计套件)
+  - [v12 确认套件（探索 / 确认分离）](#v12-确认套件探索--确认分离)
+  - [v8 / v9 收尾套件](#v8--v9-收尾套件)
+  - [v7 回应 reviewer 套件](#v7-回应-reviewer-套件)
+- [评审四硬化（本轮）](#评审四硬化本轮)
+
+## 快速开始
+
+需要 Python 3.12。lock 文件是测试与零 GPU 分析路径使用的已验证 CPU 环境；
+CUDA 机器请先安装与本机驱动匹配的 torch wheel，再安装 `requirements.txt`
+中的范围（见[复现方法](#复现方法任意-cuda-机器)）。
+
+```bash
+python -m pip install -r requirements.lock
+make test                              # CPU 测试套件
+make plan                              # 冻结清单预检；不读取 test split
+python -m explib.confirmation --help   # 列出子命令，不启动实验
+```
+
+以上命令不会启动实验。训练始终需要显式调用驱动的 `full`、`phase <name>`
+或 `auto` 模式；修改流水线后，先用该驱动的 `smoke` 模式验证。
+
+### 从哪里读起
+
+| 问题 | 文档 |
+|---|---|
+| 实验如何运行或重跑？ | 本 README |
+| 某个测量或比较为什么这样定义？ | `docs/design_notes.md` |
+| 做过哪些决定，顺序如何？ | `DECISION_LOG.md` |
+| 已发布的证据在哪里？ | `RELEASES.md` |
+| 评审问题是如何处理的？ | `REVIEW_4_RESPONSE.md` |
 
 ## 仓库结构
 
@@ -33,13 +75,17 @@
 | `explib/resume/` | **v9 驱动**（`python -m explib.resume`）：P2T（seq-2048 的 topk 扫描，`batch_size=1`）与 P2S3（RoPE 20k 长跑的第三个 seed） |
 | `explib/corruption/` | **v10 驱动**（`python -m explib.corruption`）：P3M 长度外推机制 + 干扰项注入探针、P3S 交叉面板扩规模、P3T topk 扫描补至 4 seeds |
 | `explib/length/` | **v11 驱动**（`python -m explib.length`）：统计收尾——干扰探针扩到 n=6（P4MT/P4MP）、交叉面板扩到 n=4（P4S）、d=384 配对臂扩到 n=4（P4F） |
-| `explib/confirmation/` | **v12 确认驱动**（`python -m explib.confirmation`；评审响应 + 评审二轮加固）：P5C 按清单种子列表训练全部四个冻结臂，P5MP 跑扩展腐坏模式探针（uniform/realistic-token/mask/delete + 评审二轮新增 span/doc/topical + NIAH-natural），P5S2/P5S3 补等 token 与 6ND 参数量代理预算的大规模臂，P5T 按 `confirmation_frozen.json` 在 held-out 的 WikiText-103 test split 上做**冻结后一次性确认评估**——含加载期功效硬门槛（数学上不可能确认的清单直接拒绝）、严格记录准入（种子白名单/唯一记录/单一冻结切片/配方签名/manifest 哈希）、首次访问冻结锁与逐文档 PPL 落盘 |
+| `explib/confirmation/` | **v12 确认驱动**（`python -m explib.confirmation`；评审响应 + 评审二轮加固）：P5C 按清单种子列表训练全部六个冻结臂，P5MP 跑扩展腐坏模式探针（uniform/realistic-token/mask/delete + 评审二轮新增 span/doc/topical + NIAH-natural），P5S2/P5S3 补等 token 与 6ND 参数量代理预算的大规模臂，P5T 按 `confirmation_frozen.json` 在 held-out 的 WikiText-103 test split 上做**冻结后一次性确认评估**——含加载期功效硬门槛（数学上不可能确认的清单直接拒绝）、严格记录准入（种子白名单/唯一记录/单一冻结切片/配方签名/manifest 哈希）、首次访问冻结锁与逐文档 PPL 落盘 |
 | `explib/open_block/` | **未结束块读取面板驱动**（`python -m explib.open_block`）：最大块长（32/64/128/无强制上限）× 当前未结束块读取方式（`closed` / `prefix_summary` / `prefix_singletons`）；共享 top-k 预算、因果前缀构造、窗口外辅助面板、逐种子配对差与交互统计——见 `docs/design_notes.md` §24 |
 | `explib/reproduce/` | **跨运行复现比较器**（`python -m explib.reproduce compare 原始目录 重跑目录`）：按 `variant::seedN` 逐格比较两份 panel，分别报告源码字节、数据切片、配置、执行环境、匹配初始化与最终 PPL 容差；缺指纹一律 `provenance_incomplete`，绝不当作通过。同一检查也暴露为 `audit_gates.py reproduction 原始目录 重跑目录`——见 `docs/design_notes.md` §83 |
 | `test_open_block.py` | **未结束块 CPU 门禁**：配置/分段器、优化前缀池化与逐查询参考的前向/梯度一致、前缀不变性、未来扰动/未来梯度、候选掩码、边界情形、closed 回归、单 token 语义与 HCA 预算声明 |
 | `test_review_part_*.py`, `test_review_fixes.py` | **CPU 评审 pytest 套件**：兼容入口与拆分后的测试模块（用 `make test` 或 `pytest` 运行） |
-| `confirmation_frozen.json` | **预注册冻结清单 v2**（入库）：冻结臂、种子 0-11（在任何 test-split 访问**之前**由 6 修订为 12，含功效表）、终点、精确符号翻转 + Holm、决策规则、机器可校验的绑定块与范围声明——见 `docs/design_notes.md` §17 与 `DECISION_LOG.md` |
+| `confirmation_frozen.json` | **预注册确认清单**（入库；`manifest_version: 3`，修订历史 v1–v5）：冻结臂与种子 0-11（在任何 test-split 访问**之前**由 6 修订为 12，含功效表）、终点、精确符号翻转 + Holm、决策规则、机器可校验的绑定块与范围声明——见 `docs/design_notes.md` §17 与 `DECISION_LOG.md` |
+| `confirmation_frozen_dynamic.json` | **动态分块与 HCA 的独立预注册草案**（`manifest_version: 4`；尚未冻结）：H1 分段质量、H2 检索精度、H3 长程覆盖，以及冻结前必须排期的对照——见 `DECISION_LOG.md` |
+| `RELEASES.md` | **证据发布索引**：每个不可变 `release_<tag>.tar.gz` 与 SHA-256 清单发布在哪里；Git 仓库本身只承载源码 |
+| `pyproject.toml` / `requirements.txt` / `requirements.lock` | Python ≥3.12 与依赖声明；需显式安装（无 import 时 pip install）。`requirements.lock` 是已验证的 CPU 环境 |
 | `DECISION_LOG.md` | **决策日志**（入库；因快照只有一个压缩提交，2026-10-18 依据 README/设计说明/清单重建）：每个版本为什么跑/不跑什么、看到什么、据此决定了什么——探索/确认分离的书面轨迹；正式版本的逐种子证据另由 `archive_release.py` 归档 |
+| `REVIEW_4_RESPONSE.md` | **评审四逐条回应**（入库）：21 个方法学问题、仓库已强制执行的部分、本轮修订了什么，以及哪些仍需新实验/产物才能回答 |
 | `audit_gates.py` | **兼容 shim**，实现位于 `_audit_gates/`；即**评审二/四/七轮的可执行审计入口**（零实验）：数据泄漏（分词器来源/词表一致性/文档重叠）、纯 CPU 因果性单元审计（前缀不变性/标签移位/解码一致性）、分块归因/边界 vs 随机基线/长度口径/基线公平/失败集中度/预算对账，评审七的单因素设计门（声明对照的臂配置 diff 对声明的干预键集；冻结清单 mechanism_claim_allowed 标志对账）与 prefill-decode-内存测量工具 |
 | `archive_release.py` | **不可变证据归档器**：把每个正式版本的产物（结果/分析/报告/冻结锁/决策日志/环境/权重哈希）打包为带逐文件 sha256 清单的 tar.gz，附独立 verify 子命令——Git 主仓仍只承载源码（design_notes §8），归档发布到只读位置 |
 | `explib/m0/` | **M0/S1 驱动（已选定 B 档）**（`python -m explib.m0`）：扩规模路线图的代码入口——`params`（零 GPU 的 S1–S4 参数量核算）、`data`（FineWeb-Edu + 32k BPE 语料缓存）、`smoke`（B 档数据路径端到端自检）、`kernel`（G0 验证套件：三算子 kernel/eager 数值对照 + 稀疏注意力吞吐基准）、`full`（S1 主面板）；见下文“B 档 M0/S1” |
@@ -115,7 +161,7 @@ pip install -r requirements.lock
 #     随机 indexer、零内容池化、关 sink、learned fusion、HCA 层、dense+sink 对照）
 python run_gapfill.py smoke
 python -m explib.corruption smoke  # 同时覆盖新腐坏模式 + NIAH + 从头训练对照
-python test_open_block.py         # 未结束块因果性/参考实现/掩码门禁（CPU）
+python -m pytest -q test_open_block.py   # 未结束块因果性/参考实现/掩码门禁（CPU）
 python -m explib.open_block smoke     # 未结束块矩阵的微型合成自检
 python -m explib.open_block pilot     # 单格短程运行
 python -m explib.open_block main      # 8 配置 × 4 种子；可续跑
@@ -288,7 +334,7 @@ python -m explib.confirmation auto            # 无人值守：与 full 同链�
                                               #   plan 门先跑（fail-closed），批准证据（清单哈希/
                                               #   代码戳/git 树/arms/seeds/主比较/α）自动落盘，
                                               #   人工核对变为事后异步，不再阻塞链的启动
-python -m explib.confirmation phase P5C       # 按清单种子训练全部四个冻结臂（可续跑；主臂 0-5 由 P3MT/P4MT 覆盖）
+python -m explib.confirmation phase P5C       # 按清单种子训练全部六个冻结臂（可续跑；主臂 0-5 由 P3MT/P4MT 覆盖）
 python -m explib.confirmation phase P5MP      # 扩展探针（全部模式 + NIAH + 对照），种子取自清单
 python -m explib.confirmation phase P5S2      # 等 token 大规模臂（8000 步）
 python -m explib.confirmation phase P5S3      # 6ND 参数量代理预算大规模臂（参数量比例缩步）

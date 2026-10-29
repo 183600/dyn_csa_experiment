@@ -5,7 +5,9 @@ def _int_ratio_within(numerator, denominator, tolerance):
 
     The ratio itself may be too small to float (e.g. two 401-digit counts
     differing by one), but the comparison against a gate tolerance is still
-    well defined.  Return None only when the inputs cannot form a ratio.
+    well defined.  A near-tie beyond float64's range likewise has an
+    unrepresentable relative difference but a well-defined answer here.
+    Return None only when the inputs cannot form a ratio.
     """
     try:
         numerator, denominator = int(numerator), int(denominator)

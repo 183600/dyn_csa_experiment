@@ -1140,6 +1140,39 @@ def _contains_bool_value(x):
     return False
 
 
+def _as_nll_matrix(x, name, *, axis_label='n_units',
+                   value_label='per-unit'):
+    """Validate a ``[n_seeds, n_units]`` NLL matrix for the paired readouts.
+
+    The document-cluster interval, the leave-one-unit-out influence readout and
+    the two-level bootstrap all consume the same array contract: one summed-NLL
+    row per seed and one column per evaluation unit.  Keeping the conversion and
+    its error messages in one place means the three estimators cannot disagree
+    about booleans, non-finite values or the accepted orientation.
+    """
+    try:
+        raw = np.asarray(x)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f'{name}: values must be numeric') from None
+    if _contains_bool_value(x) or raw.dtype.kind == 'b':
+        # A boolean is a flag, not an NLL measurement (same scalar contract as
+        # _finite_scalar/_nll_doc_ci).  Without this check True/False would
+        # silently become 1.0/0.0.
+        raise ValueError(f'{name}: booleans are not NLL measurements')
+    try:
+        arr = np.asarray(raw, dtype=float)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f'{name}: values must be numeric') from None
+    if arr.ndim == 1:
+        arr = arr[None, :]
+    if arr.ndim != 2 or arr.shape[0] < 1 or arr.shape[1] < 1:
+        raise ValueError(
+            f'{name}: expected [n_seeds, {axis_label}], got shape {arr.shape}')
+    if not np.all(np.isfinite(arr)):
+        raise ValueError(f'{name}: all {value_label} NLLs must be finite')
+    return arr
+
+
 def _scaled_sum_of_squares(values, multiplier):
     """``multiplier * sum(v**2)`` without overflowing representable results.
 
@@ -1361,29 +1394,10 @@ def _paired_nll_doc_ci(nll_a, nll_b, n_tokens, *, conf=0.95):
     document-sampling interval for the observed document panel, not a claim
     that the panel covers the language population.
     """
-    def _matrix(x, name):
-        try:
-            raw = np.asarray(x)
-        except (TypeError, ValueError, OverflowError):
-            raise ValueError(f'{name}: values must be numeric') from None
-        if _contains_bool_value(x) or raw.dtype.kind == 'b':
-            # A boolean is a flag, not an NLL measurement (same scalar
-            # contract as _finite_scalar/_nll_doc_ci).  Without this check
-            # True/False would silently become 1.0/0.0.
-            raise ValueError(f'{name}: booleans are not NLL measurements')
-        try:
-            arr = np.asarray(raw, dtype=float)
-        except (TypeError, ValueError, OverflowError):
-            raise ValueError(f'{name}: values must be numeric') from None
-        if arr.ndim == 1:
-            arr = arr[None, :]
-        if arr.ndim != 2 or arr.shape[0] < 1 or arr.shape[1] < 1:
-            raise ValueError(f'{name}: expected [n_seeds, n_docs], got shape {arr.shape}')
-        if not np.all(np.isfinite(arr)):
-            raise ValueError(f'{name}: all per-document NLLs must be finite')
-        return arr
-    A = _matrix(nll_a, '_paired_nll_doc_ci(nll_a)')
-    B = _matrix(nll_b, '_paired_nll_doc_ci(nll_b)')
+    A = _as_nll_matrix(nll_a, '_paired_nll_doc_ci(nll_a)',
+                       axis_label='n_docs', value_label='per-document')
+    B = _as_nll_matrix(nll_b, '_paired_nll_doc_ci(nll_b)',
+                       axis_label='n_docs', value_label='per-document')
     if A.shape != B.shape:
         raise ValueError(
             f'_paired_nll_doc_ci: arm shapes differ ({A.shape} vs {B.shape}); '
