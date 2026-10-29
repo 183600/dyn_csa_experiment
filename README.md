@@ -106,6 +106,9 @@ pip install -r requirements.lock
 #      pip install -r requirements.txt
 #    Regenerate and archive a machine-specific lock with `python -m pip freeze > requirements.lock`;
 #    requirements.lock records the verified CPU environment, not the paper-scale CUDA one.
+#    Torch note: the lock pins torch==2.14.1+cpu.  The scatter paths cast their
+#    int32 indices to int64, so they no longer rely on torch >= 2.14 scatter
+#    behaviour; the supported range remains torch>=2.8,<3 (requirements.txt).
 # The code no longer pip-installs at import time.  Set CSA_AUTO_INSTALL=1 only
 # for a throwaway environment.  The Hugging Face mirror is opt-in via
 # CSA_HF_MIRROR=1; the default endpoint is the official Hub.

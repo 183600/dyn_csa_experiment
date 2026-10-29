@@ -651,13 +651,15 @@ def _attn_bwd_triton(q, k_blk, v_blk, k_sw, v_sw, topk_idx, valid, last_tok, sof
             # 计数是整数（块 id 非负且 < Bm），scatter_add_ 与逐行 bincount
             # 给出同一组精确整数。lane 值域 [0, T·NB) 只在确实越过 int32
             # 时才用 int64；常规规模下 order/计数/偏移表全部用 int32。
+            # 但 torch < 2.14 的 scatter_add_ 同样要求 int64 索引，故调用处
+            # 只把索引加宽为 int64（计数与值不变，仅 dtype 兼容性转换）。
             _narrow = int(T) * int(nb) < (1 << 31)
             _idt = torch.int32 if _narrow else torch.int64
             if _narrow:
                 order = order.to(torch.int32)
             flat_l = flat.to(_idt)
             cnt = torch.zeros((R, Bm), device=dev, dtype=_idt)
-            cnt.scatter_add_(1, flat_l, torch.ones_like(flat_l))
+            cnt.scatter_add_(1, flat_l.long(), torch.ones_like(flat_l))
             del flat_l
             offs = torch.zeros((R, Bm + 1), device=dev, dtype=_idt)
             offs[:, 1:] = cnt.cumsum(dim=1)

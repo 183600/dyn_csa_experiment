@@ -79,6 +79,9 @@ pip install -r requirements.lock
 #      pip install -r requirements.txt
 #    随后用 `python -m pip freeze > requirements.lock` 生成本机 lock 并归档；
 #    requirements.lock 记录的是已验证的 CPU 环境，不是论文规模的 CUDA 环境。
+#    torch 说明：lock 固定 torch==2.14.1+cpu；scatter 路径已把 int32 索引
+#    转成 int64，不再依赖 torch >= 2.14 的 scatter 行为，支持范围仍为
+#    requirements.txt 中的 torch>=2.8,<3。
 # 代码不再在 import 时自动安装依赖；如确需临时环境可显式设置
 # CSA_AUTO_INSTALL=1。Hugging Face 镜像为 opt-in（CSA_HF_MIRROR=1），
 # 默认走官方 Hub。

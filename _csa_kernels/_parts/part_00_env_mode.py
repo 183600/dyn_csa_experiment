@@ -834,6 +834,9 @@ def _stable_topk_desc(x, k):
     # Same candidate construction as exp_lib._rank_blocks: strictly greater
     # entries plus the earliest equal-to-kth entries.  Prefix ranks use int32
     # (B < 2^31), the same exact integers; the sentinel is filled in place.
+    # torch < 2.14 requires an int64 scatter index, so only the index is
+    # widened below; `cols` stays int32 to match the destination dtype
+    # (scatter_ also requires src and self to share a dtype).
     gt = flat > kth
     eq = flat == kth
     need = (kk - gt.sum(dim=1)).clamp_min(0).to(torch.int32)
@@ -845,7 +848,7 @@ def _stable_topk_desc(x, k):
     rank.masked_fill_(~sel, kk)
     cols = torch.arange(B, device=dev, dtype=torch.int32)[None, :].expand(m, B)
     buf = torch.empty(m, kk + 1, dtype=torch.int32, device=dev)
-    buf.scatter_(1, rank, cols)
+    buf.scatter_(1, rank.long(), cols)
     cand = buf[:, :kk].long()
     order = torch.argsort(flat.gather(1, cand), dim=1, stable=True, descending=True)
     cand = cand.gather(1, order)
