@@ -335,7 +335,11 @@ def paired_nll_unit_influence(nll_a, nll_b, n_tokens, *, unit_ids=None,
         _cand = np.where(use_lr, abs_change_lr, -np.inf)
         best_idx = int(np.argmax(_cand))
         best_val = float(_cand[best_idx])
-        tied = int(np.sum(np.isclose(_cand, best_val, rtol=0.0, atol=1e-12)))
+        # `best_val` is the largest |LOO change| and is > 0 here.  A relative
+        # tolerance keeps "how many units are tied with the most influential
+        # one" a property of the panel, not of the arbitrary PPL unit; an
+        # absolute 1e-12 marked every tiny fold as tied.
+        tied = int(np.sum(np.isclose(_cand, best_val, rtol=1e-12, atol=0.0)))
 
     def _vector_with_unavailable_as_none(values):
         # An unavailable fold is marked by `loo_available`; emitting inf/NaN

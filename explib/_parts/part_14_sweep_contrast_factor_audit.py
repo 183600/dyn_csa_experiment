@@ -906,6 +906,19 @@ def paired_design_sensitivity(n_seeds, m_comparisons, *, alpha=0.05,
                 f'pilot_deltas must be an iterable of finite numbers, got {type(pilot_deltas).__name__}')
             raw_deltas = []
     d = np.asarray(raw_deltas, dtype=float)
+    # The seed-delta scale is arbitrary.  numpy.mean/std square deviations, so
+    # a finite pilot panel below sqrt(tiny) (or above sqrt(max_float)) reports
+    # sd=0/inf and the whole planning output would lose its MDE and SESOI
+    # fields for a units-only reason.  Rescale once and use the same mean/SD
+    # for the consistency check and the reported pilot.
+    mean = float(d.mean()) if d.size else None
+    _pilot_sd_calc = None
+    if d.size >= 2:
+        _ms = _scaled_mean_std_if_extreme(d, ddof=1)
+        if _ms is not None:
+            mean, _pilot_sd_calc = _ms
+        else:
+            _pilot_sd_calc = float(d.std(ddof=1))
     explicit_sd = None
     if pilot_sd is not None:
         explicit_sd = _finite_scalar(pilot_sd)
@@ -913,18 +926,18 @@ def paired_design_sensitivity(n_seeds, m_comparisons, *, alpha=0.05,
             out['violations'].append(
                 f'pilot_sd={pilot_sd!r} must be a finite positive number')
             explicit_sd = None
-    mean = float(d.mean()) if d.size else None
     sd = None
     if explicit_sd is not None:
         sd = float(explicit_sd)
-        if d.size >= 2:
-            calculated = float(d.std(ddof=1))
-            if abs(calculated - sd) > 1e-12 * max(1.0, abs(sd)):
+        if _pilot_sd_calc is not None:
+            # Relative agreement: an absolute 1e-12 margin calls any two tiny
+            # pilot SDs equal and any two 1e150 SDs different.
+            if not math.isclose(_pilot_sd_calc, sd, rel_tol=1e-12, abs_tol=0.0):
                 out['warnings'].append(
                     'pilot_sd overrides the SD recomputed from pilot_deltas; '
                     'report which sample each value came from')
     elif d.size >= 2:
-        sd = float(d.std(ddof=1))
+        sd = _pilot_sd_calc
         if not (math.isfinite(sd) and sd > 0.0):
             out['warnings'].append(
                 'pilot deltas have zero/non-finite SD; MDE and SESOI power '

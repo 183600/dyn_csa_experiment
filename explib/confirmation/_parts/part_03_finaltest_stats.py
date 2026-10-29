@@ -561,6 +561,16 @@ def _signflip_power_table(abs_d, m_family, alpha, qs, expected_sign):
         raise ValueError('power needs at least two paired deltas')
     if n > 20:
         raise ValueError(f'power enumeration is capped at n<=20 (got {n}); split the panel or add a Monte-Carlo path consciously')
+    # The conditional power table is a property of the sign-flip ranks, so a
+    # units-only rescaling of the observed |deltas| must not change it.  The
+    # null sums below are compared with an absolute 1e-12 tie tolerance; left
+    # unscaled, a small-but-representable validation panel (e.g. 1e-13
+    # deltas) makes every pattern look tied while a large one can overflow the
+    # sums.  Work on a unit-scaled copy, exactly as `exact_signflip_p` does;
+    # the tolerance is then relative to the panel.
+    _scale = float(np.max(abs_d)) if n else 0.0
+    if math.isfinite(_scale) and _scale > 0.0:
+        abs_d = abs_d / _scale
     total = 1 << n
     bits = (1 << np.arange(n, dtype=np.int64))[None, :]
     _idx = np.arange(total, dtype=np.int64)

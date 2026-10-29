@@ -82,7 +82,17 @@ def paired_unit_deltas(rows_a, rows_b, *, unit='auto'):
                 break
             values.append(float(np.mean(diffs)))
         mean = float(np.mean(values)) if values else None
-        sd = float(np.std(values, ddof=1)) if len(values) >= 2 else None
+        sd = None
+        # A finite but very small/large unit panel underflows/overflows the
+        # squared deviations in numpy.std.  The scale is arbitrary (a PPL
+        # difference has no fixed unit), so rescale before declaring the
+        # panel unusable: std=0 must mean a constant panel, not an unmeasured
+        # one.
+        _ms = _scaled_mean_std_if_extreme(values, ddof=1) if len(values) >= 2 else None
+        if _ms is not None:
+            mean, sd = _ms
+        elif len(values) >= 2:
+            sd = float(np.std(values, ddof=1))
         if (not usable or len(values) < 2 or mean is None or sd is None
                 or not (math.isfinite(mean) and math.isfinite(sd))):
             reasons[label] = f'{key} contains non-finite/sub-1 PPL values'
@@ -293,6 +303,19 @@ def unit_precision_design(n_units, *, pilot_unit_deltas=None,
                 f'got {type(pilot_unit_deltas).__name__}')
             raw = []
     d = np.asarray(raw, dtype=float)
+    # A PPL difference has no fixed unit; numpy.mean/std square the
+    # deviations, so a finite pilot panel below sqrt(tiny) (or above
+    # sqrt(max_float)) reports sd=0/inf and the design would be called
+    # unverifiable for a units-only reason.  Rescale once and use the same
+    # mean/SD for the consistency check and the reported pilot.
+    _pilot_mean = float(d.mean()) if d.size else None
+    _pilot_sd_calc = None
+    if d.size >= 2:
+        _ms = _scaled_mean_std_if_extreme(d, ddof=1)
+        if _ms is not None:
+            _pilot_mean, _pilot_sd_calc = _ms
+        else:
+            _pilot_sd_calc = float(d.std(ddof=1))
     explicit_sd = None
     if pilot_unit_sd is not None:
         explicit_sd = _finite_scalar(pilot_unit_sd)
@@ -303,14 +326,15 @@ def unit_precision_design(n_units, *, pilot_unit_deltas=None,
     sd = None
     if explicit_sd is not None:
         sd = float(explicit_sd)
-        if d.size >= 2:
-            calculated = float(d.std(ddof=1))
-            if abs(calculated - sd) > 1e-12 * max(1.0, abs(sd)):
+        if _pilot_sd_calc is not None:
+            # Relative agreement: an absolute 1e-12 margin would call any two
+            # tiny pilot SDs equal and any two 1e150 SDs different.
+            if not math.isclose(_pilot_sd_calc, sd, rel_tol=1e-12, abs_tol=0.0):
                 out['warnings'].append(
                     'pilot_unit_sd overrides the SD recomputed from '
                     'pilot_unit_deltas; report which sample each value came from')
     elif d.size >= 2:
-        sd = float(d.std(ddof=1))
+        sd = _pilot_sd_calc
         if not (math.isfinite(sd) and sd > 0.0):
             out['warnings'].append(
                 'pilot unit deltas have zero/non-finite SD; MDE and SESOI '
@@ -326,7 +350,7 @@ def unit_precision_design(n_units, *, pilot_unit_deltas=None,
         'status': ('not_provided' if (not d.size and explicit_sd is None)
                    else 'available'),
         'n': int(d.size), 'n_dropped': int(dropped),
-        'mean': float(d.mean()) if d.size else None, 'sd': sd,
+        'mean': _pilot_mean, 'sd': sd,
         'source': ('deltas' if d.size else ('pilot_unit_sd' if sd is not None else None)),
     }
     target_halfwidth_value = None
