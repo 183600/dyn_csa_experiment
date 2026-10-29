@@ -6801,3 +6801,134 @@ admission、freeze lock、`data_fp`/`ckpt_sha256`/`train_knobs` 门约束）。
 member mtime/布尔类型/非确定性块借用 epoch 全部 fail；`--reproducible`
 缺 epoch 时 refuse 且不落盘；墙钟归档仍能 verify。完整 CPU 套件在本轮最终
 树通过。
+
+## 91. 2×2 交互也要有设计期功效：主效应能检出不等于交互能检出（本轮实验设计与准备硬化）
+
+### 91.1 问题：交互 SESOI 有了，交互功效还没有
+
+§67/§84 已经给 2×2 交互加了预注册的 log ratio-of-ratios SESOI 与配对
+TOST：只有区间落在 margin 内才能说「实际可加」，不显著只能报
+`indeterminate`。这是结果解释层的必要修复，但它没有回答**跑之前**就必须
+回答的问题：这个计划中的种子数，能否检出研究关心的交互？
+
+主效应的功效不能替代交互的功效：
+
+- 交互是**差中之差**：每个种子的
+  `d_i = log(PPL11/PPL10) − log(PPL01/PPL00)`，其种子间 SD 通常大于任一
+  主效应的 SD；
+- 精确双侧符号翻转在 n 个种子上最小只能给出 `2/2^n`；交互族有 m 个声明
+  对照并做 Holm 时，最小可达 `m·2/2^n`。**这个下限与效应量无关**，再大的
+  交互也无法让它变小；
+- 当前声明的 5 个交互（`INTERACTION_SESOI` 全覆盖）在 m=5 时：
+  n=5 → 0.3125，n=6 → 0.15625，n=7 → 0.078125，n=8 → 0.0390625。
+  也就是说，n≤7 的交互面板在 alpha=0.05 下**没有任何机会**显著；
+  一个「不显著」的交互只说明设计分辨率不足，不能当作可加性证据。
+
+`factorial_interaction_audit` 的 `min_n=3` 是「可以计算」的下限，不是
+「可以拒绝」的下限；它没有、也不应该假装有设计期功效。把两者混在一起，
+正是小样本 factorial 最常见的过度解释来源。
+
+### 91.2 方法：先算分辨率下限，再算 SESOI 处的功效
+
+新增 `exp_lib.factorial_interaction_power(cells, ...)`：
+
+1. 输入 `cells = {'11': [...], '10': [...], '01': [...], '00': [...]}`，
+   四个 cell 必须等长、逐种子对齐、全部为有限正 PPL；缺 cell、长度不齐、
+   布尔/字符串/NaN/inf/≤0 全部 fail-closed，不做 complete-case 交互。
+2. 逐种子计算
+   `d_i = log(PPL11/PPL10) − log(PPL01/PPL00)`，并报告 `mean/sd/n`。
+3. 先检查 `m·2/2^n` 的 Holm 分辨率下限。不达标返回
+   `status='resolution_limited'`，明确写出 `min_n_for_alpha`；此时不生成
+   一条会被误读的 power 曲线。
+4. 达标后复用 `paired_design_sensitivity`：SESOI 为
+   `margin = log(1 + relative_pct/100)`，方向来自交互假设的
+   `predicted_sign`，输出 SESOI 处功效、近似 MDE、配对 95% CI 半宽、
+   达到目标功效所需 n；可选 `pair_retention` 再把完整覆盖下的
+   attrition 联合功效附上（§74）。
+5. MDE 从 log 交互尺度换算回 `expm1(|MDE|)·100` 的「交互百分比」，
+   便于与声明的 1% margin 直接比较；它不是把 PPL 百分比当 log 差。
+
+新增 `exp_lib.factorial_power_audit(pilot=None, ...)` 对
+`FACTORIAL_DESIGN` 的全部声明做同一检查：
+
+- `m_family` 默认等于声明的 factorial 数（当前 5），也可显式指定；
+- `n_seeds` 可以是标量或 `factorial -> n` 映射；即使没有 pilot，也能先
+  报 `family_resolution.min_n_for_alpha`（当前 m=5 时为 8）；
+- `pilot` 的格式是
+  `{"factorials": {name: {"cells": {...}, "relative_pct": 1.0}}}`；
+  可选顶层 `m_family`/`n_seeds` 让 artifact 自描述，显式参数优先；pilot
+  必须来自 validation/设计期，不允许读 test；
+- 每个 factorial 的状态是 `ok` / `underpowered` /
+  `resolution_limited` / `power_not_measured` / `not_verifiable` /
+  `fail`。缺 pilot 时是 `power_not_measured`（有 n）或
+  `not_verifiable`（连 n 都没有），都不是通过；未声明 SESOI 时使用
+  policy 默认 1% 会显式标成 `policy_default` 并 warning，不冒充预注册；
+- 默认 `require_power=False` 时，欠功效/分辨率不足只进 warnings；
+  显式 `require_power=True` 时，未测量、欠功效或分辨率不足都判 fail。
+
+`_min_n_for_holm_family(m, alpha)` 给出最小的「数学上有机会」种子数：
+m=1→6，m=2/3→7，m=4/5/6→8，m=7–10→9。它不是功效计算，而是**先排除
+不可能的设计**，再谈 MDE。
+
+### 91.3 接线
+
+```bash
+python audit_gates.py interaction_power                # 默认读 analysis_v12/factorial_power_pilot.json
+python audit_gates.py interaction_power PILOT.json     # 显式给 pilot
+python audit_gates.py factorial_power                 # 别名
+python audit_gates.py power_2x2                       # 别名
+python audit_gates.py report                          # 顶层 interaction_power
+```
+
+- `audit_interaction_power()` 只读 pilot JSON 与声明表，不读
+  `results_*`/test；pilot 缺失时仍输出分辨率表（若给了 n），状态
+  `not_verifiable_locally`。
+- `audit_gates.py report` 的 `interaction_power` 块与既有
+  `interaction_sesoi` 并列：前者回答「设计能否检出」，后者回答「检出后
+  能否说可加」。
+- 纯设计期（还没有 pilot）可以直接
+  `L.factorial_power_audit(n_seeds=6)` 看分辨率表，或在 pilot 顶层写
+  `"n_seeds": 6` 后跑 CLI；它不会因为「还没测」而给出绿色通过。
+- 该块不改变 `factorial_interaction_audit` 的任何 p/TOST/判定，不进入
+  冻结确认族，不修改 `confirmation_frozen*.json`、种子、alpha、Holm、
+  `INTERACTION_SESOI` 或 `CODE_SEMANTICS`。
+
+### 91.4 边界
+
+- **这是设计期投影，不是 observed power。** SESOI 处功效来自 pilot 差值
+  的符号投影与正态 MDE 近似；`|d_i|` 不等时它只是符号检验上界，不能当成
+  精确 sign-flip 功效。pilot 本身来自 validation 且经过方法选择，存在
+  winner's curse；它只用于设计，不能写进确认性结论。
+- **分辨率下限不是保守估计，是硬约束。** n 低于 `min_n_for_alpha` 时，
+  唯一正确的动作是加种子、缩小预先声明的交互族，或承认该面板只能描述；
+  不能通过换端点、挑种子或改用未校正 p 来「救」。
+- **完整四 cell 是前提。** 缺一个 cell 的「完整案例交互」会改变 estimand
+  并引入选择偏差；本函数直接拒绝，不做插补。
+- **MDE 的百分比是交互尺度。** `expm1(|MDE|)` 是 ratio-of-ratios 的
+  相对变化，不是任一臂 PPL 的百分比；与 1% SESOI 比较时口径一致，但不能
+  改写成「PPL 只差 1%」。
+- **attrition 是独立配对保留模型。** 同一机器/同一周的成组失败、与效应
+  相关的丢失会让联合功效更差；`pair_retention` 必须显式声明，不能从结果
+  反推。
+- **旧面板不被追溯性改写。** 已经跑完的 n=3–6 交互仍按
+  `factorial_interaction_audit` 的规则报 `indeterminate`/描述性结果；本节
+  只阻止下一轮继续用不可能拒绝的 n 去声称交互，或把「没检出」写成
+  「可加」。
+- **不读 test、不改冻结决定。** 没有新训练、没有新 test 访问、没有新
+  p 值/Holm 族；它只是把「设计能否回答交互问题」变成可复核的读数。
+
+### 91.5 入口与验证
+
+```bash
+python -m pytest -q test_review_part_29.py
+python audit_gates.py interaction_power
+python audit_gates.py report
+python -m explib.confirmation plan     # 冻结计划预检不变
+```
+
+`test_review_part_29.py` 7 项覆盖：交互差值与 `paired_design_sensitivity`
+逐值对账、m=5 的分辨率下限（n=5/6/7 为 resolution_limited，n=8 可分辨）、
+欠功效面板的 SESOI 功效/MDE/所需 n 与 `require_power` 硬门、方向镜像与
+PPL 整体缩放不变性、缺 cell/长度不齐/非法 PPL/非法参数的 fail-closed、
+attrition 的可选接线与完整覆盖语义，以及 audit gate/CLI/report/design preflight 接线。
+完整 CPU 套件（`706 passed, 3 skipped`）在本轮最终树通过。

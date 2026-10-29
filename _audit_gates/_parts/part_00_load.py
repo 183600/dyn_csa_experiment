@@ -41,6 +41,11 @@
   interaction_sesoi  2x2 交互 SESOI 声明：每个声明的 factorial 都有唯一、
                有限、>0 的 log ratio-of-ratios margin 与方向假设；缺 margin
                时交互仍可报告，但不能声称可加/可删（设计期，零 GPU）
+  interaction_power  2x2 交互设计功效：声明族大小下的精确 sign-flip 分辨率
+               下限（n=6、m=5 时最小可达 Holm p=0.15625，任何效应量都
+               无法显著）、交互 MDE 与达到 SESOI 所需种子数；pilot 缺失
+               报 not_verifiable，不虚构 SD（设计期，零 GPU，不读 test）
+               别名：factorial_power / power_2x2；可传一个 pilot JSON 路径
   unit_influence  结果分析：逐评测单位删除（leave-one-out）影响读数是否
                与主终点同口径、是否由单个文章/文档主导（读 analysis_v12/，
                零 GPU；warning 级，不改变冻结判定）

@@ -1353,6 +1353,48 @@ def audit_interaction_sesoi(spec=None, design=None):
     return out
 
 
+def audit_interaction_power(pilot_path=None, n_seeds=None, m_family=None,
+                            require_power=False):
+    """2x2 interaction power / minimum-detectable-effect design audit.
+
+    Design-stage only: it reads an optional validation pilot artifact and the
+    declared factorial/SESOI tables, never the held-out test split.  A missing
+    pilot is ``not_verifiable_locally``; a family whose exact sign-flip floor
+    cannot clear alpha (for example n=6 with m=5 interactions) is
+    ``resolution_limited`` and is reported by name.  ``require_power=True``
+    turns an unmeasured or underpowered interaction family into a hard
+    failure; the default keeps it a warning so an exploratory panel is not
+    silently promoted or silently deleted.
+    """
+    L = _import_exp_lib()
+    pp = pilot_path or 'analysis_v12/factorial_power_pilot.json'
+    if not os.path.isabs(str(pp)):
+        pp = os.path.join(REPO, str(pp))
+    pilot = None
+    pilot_error = None
+    if not os.path.exists(pp):
+        pilot_error = f'no pilot artifact at {pp}'
+    else:
+        try:
+            with open(pp, encoding='utf-8') as f:
+                pilot = json.load(f)
+        except Exception as exc:
+            pilot_error = f'{pp} is not readable JSON ({type(exc).__name__}: {exc})'
+    rep = L.factorial_power_audit(
+        pilot, n_seeds=n_seeds, m_family=m_family,
+        require_power=require_power)
+    rep['pilot_path'] = pp
+    rep['pilot_available'] = pilot is not None
+    if pilot_error:
+        rep['pilot_error'] = pilot_error
+        rep.setdefault('warnings', []).append(
+            pilot_error + '; only the resolution floor can be audited')
+        if pilot is None and rep.get('status') == 'ok':
+            rep['status'] = 'not_verifiable_locally'
+    print(json.dumps(rep, ensure_ascii=False, indent=2))
+    return rep
+
+
 def audit_hypotheses():
     """预注册假设完整性 / 指标对齐审计（零 GPU）。
 

@@ -53,6 +53,7 @@ _PARTS = [
 'part_36_ablation_controls.py',
 'part_37_reproduction.py',
 'part_38_variance_components.py',
+'part_39_factorial_power.py',
 ]
 
 for _part in _PARTS:

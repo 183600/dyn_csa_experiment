@@ -582,6 +582,39 @@ def audit_design_preflight(manifest_path=None, dynamic_path=None):
                 'dynamic draft is intentionally non-runnable: `promotion_ready` '
                 'must become true (disjoint source + measured read-budget '
                 'calibration + passed power gate) before any dynamic confirmation')
+    # The 2x2 interaction family has its own exact sign-flip resolution floor
+    # that is independent of the effect size.  Surface it in the same design
+    # preflight even when no pilot is available: the factorial table can say
+    # "this family needs at least n seeds" before any GPU run.
+    try:
+        _ip = L.factorial_power_audit()
+        out['interaction_power'] = {
+            'status': _ip.get('status'),
+            'family_resolution': _ip.get('family_resolution'),
+            'powered': _ip.get('powered'),
+            'underpowered': _ip.get('underpowered'),
+            'resolution_limited': _ip.get('resolution_limited'),
+            'not_measured': _ip.get('not_measured'),
+            'warnings': _ip.get('warnings'),
+        }
+        if _ip.get('status') == 'fail':
+            out['violations'].extend(
+                f'interaction_power: {v}' for v in (_ip.get('violations') or []))
+        _min_n_ip = (_ip.get('family_resolution') or {}).get('min_n_for_alpha')
+        if _min_n_ip:
+            out['warnings'].append(
+                f'interaction_power: the {_ip.get("m_family")} declared 2x2 '
+                f'interactions need at least {_min_n_ip} seeds before any '
+                'family-Holm interaction can be significant; an n below that '
+                'is resolution-limited, not evidence of additivity')
+    except Exception as _e:
+        out['interaction_power'] = {
+            'status': 'fail',
+            'violations': [f'{type(_e).__name__}: {_e}'],
+        }
+        out['violations'].append(
+            f'interaction_power: the design-time interaction gate could not '
+            f'run ({type(_e).__name__}: {_e})')
     # A recorded violation is a hard design defect, including the case where
     # the frozen manifest is missing/unreadable.  Previously that branch only
     # appended to `violations` while `status` stayed 'ok', so the CLI exited 0
