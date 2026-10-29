@@ -137,6 +137,15 @@ def content_control_audit(design=None, ladder=None, present=None, factory=None,
         out['violations'].append(
             'ladder roles must be exactly treatment/alignment_placebo/'
             f'presence_control, got {sorted(roles.values())}')
+    elif len(roles) != len(expected_roles):
+        # A second level claiming an already-used role passes the set
+        # comparison, but `by_role` silently keeps only one of them: the
+        # extra level is then never constructed or checked, so a malformed
+        # ladder with (say) two presence controls could pass as complete.
+        out['status'] = 'fail'
+        out['violations'].append(
+            'ladder levels must use each of treatment/alignment_placebo/'
+            f'presence_control exactly once, got {sorted(roles.items())}')
     by_role = {v: k for k, v in roles.items()}
     treatment_name = by_role.get('treatment')
     absent_name = by_role.get('presence_control')

@@ -291,8 +291,18 @@ class HybridAttentionRoPE(L.HybridAttention):
             comp_kv, last_tok, Bn = L._pool_trainable(L.pool_blocks_single, Ca_raw, Za, self.B_pos_a, bid, n_blocks=nblk, monotonic=True)
         else:
             comp_kv, last_tok, Bn = L._pool_trainable(L.pool_variable_blocks, Ca_raw, Cb_raw, Za, Zb, bid, self.B_pos_a, self.B_pos_b, cfg.overlap, n_blocks=nblk, monotonic=True)
+        # The indexer always reads the block's true pooled content; only the
+        # attention K/V source follows the declared content control.  This
+        # path used to handle only `zero`, so a `shift` arm silently ran as
+        # `pooled` here even though the eager and kernel paths shifted the
+        # table (the alignment placebo became the treatment).
         index_kv = comp_kv
-        attn_kv = torch.zeros_like(comp_kv) if cfg.content_mode == 'zero' else comp_kv
+        if cfg.content_mode == 'shift':
+            attn_kv = L._shift_block_content(comp_kv)
+        elif cfg.content_mode == 'zero':
+            attn_kv = torch.zeros_like(comp_kv)
+        else:
+            attn_kv = comp_kv
         if self._stats is not None:
             self._stats.append(torch.bincount(bid))
             if self._cuts is not None:

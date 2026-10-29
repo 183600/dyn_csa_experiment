@@ -229,6 +229,14 @@ def test_content_control_ladder_audit_fails_closed_on_drift():
     ladder['levels']['misaligned']['arms'] = ['csa_fix_shiftcont']
     rep = L.content_control_audit(ladder=ladder)
     assert rep['status'] == 'fail', rep
+    # A second level claiming an already-used role must not be silently
+    # dropped by the role->level lookup (the set comparison alone would pass).
+    ladder = json.loads(json.dumps(L.CONTENT_CONTROL_DESIGN))
+    ladder['levels']['absent_copy'] = json.loads(
+        json.dumps(ladder['levels']['absent']))
+    rep = L.content_control_audit(ladder=ladder)
+    assert rep['status'] == 'fail' and any(
+        'exactly once' in v for v in rep['violations']), rep
 
 
 def test_audit_gate_entry_reports_content_controls():
@@ -259,3 +267,35 @@ def test_shift_arm_matches_kernel_reference_path():
         pooled_out = pooled(ids)
     assert not torch.allclose(reference, pooled_out), \
         'kernel shifted-content path collapsed to pooled content'
+
+
+def test_rope_shift_arm_is_not_silently_pooled():
+    """Every attention read path must honour content_mode='shift'.
+
+    The RoPE layer had its own pooled/zero K/V construction and only checked
+    `zero`, so a shift arm ran exactly as the pooled treatment.  That turns the
+    alignment placebo into a duplicate of the reference and makes the contrast
+    look null by construction.
+    """
+    import dataclasses
+    import torch
+    import explib.rope as V7
+
+    d, n_heads, d_head, T = 16, 2, 8, 16
+    base = V7.AttnCfgRope(kind='csa', dynamic=False, block_size=4, overlap=2,
+                          index_topk=32, rope=True, rope_dim=8, qk_norm=True)
+    x = torch.randn(1, T, d)
+
+    def _build(mode):
+        cfg = dataclasses.replace(base, content_mode=mode)
+        torch.manual_seed(99)
+        return V7.HybridAttentionRoPE(d, n_heads, d_head, cfg)
+
+    with torch.no_grad():
+        pooled = _build('pooled')(x)
+        shift = _build('shift')(x)
+        zero = _build('zero')(x)
+    assert not torch.allclose(shift, pooled), \
+        'RoPE shifted-content path collapsed to pooled content'
+    assert not torch.allclose(shift, zero), \
+        'presence and alignment controls must stay distinct in the RoPE path'
