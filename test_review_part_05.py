@@ -677,6 +677,31 @@ def test_scale_ladder_budget_and_transfer_audit():
             raise AssertionError(f'policy={_bad_policy!r} must be refused')
 
 
+def test_scale_ladder_huge_token_budget_is_reportable():
+    # A syntactically valid scale plan is allowed to declare a token budget
+    # far beyond any training hardware.  The audit must compare it with exact
+    # integer arithmetic and report an unrepresentable tokens/parameter ratio
+    # as unverifiable, not crash while converting the budget to float.
+    H = 10 ** 400
+
+    def tier(name, steps, params):
+        return {'name': name,
+                'cfg': {'steps': steps, 'batch_size': 1, 'seq_len': 1,
+                        'n_train_tokens': steps, 'lr': 3e-4,
+                        'warmup': steps // 10, 'seeds': [0, 1]},
+                'params': params}
+
+    out = L.scale_ladder_audit([tier('S1', H, H), tier('S2', 2 * H, H)])
+    assert out['status'] in ('ok', 'warn'), out
+    assert out['budget_matched'] is False, out  # 1 vs 2 tokens/param
+    assert out['tiers'][0]['tokens_per_param'] == 1.0, out['tiers'][0]
+
+    out2 = L.scale_ladder_audit([tier('S1', H, 1), tier('S2', 2 * H, 1)])
+    assert out2['budget_matched'] is None, out2
+    assert all(t['tokens_per_param'] is None for t in out2['tiers']), out2
+    assert sum('not representable' in w for w in out2['warnings']) == 2, out2
+
+
 def test_init_core_fingerprint_and_pair_gate():
     dev = torch.device('cpu')
     L.set_seed(3)

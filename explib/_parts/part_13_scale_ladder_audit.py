@@ -1,5 +1,36 @@
 
 
+def _finite_int_ratio(numerator, denominator):
+    """Exact integer ratio as a finite float, or None when unrepresentable.
+
+    Python's integer true division is exact for values whose quotient fits a
+    float, but converting a huge numerator/denominator to float (or forming a
+    quotient above ``float.max``) raises ``OverflowError``.  Scale planning is
+    allowed to declare token budgets/parameter counts far beyond training
+    hardware; the audit must report the budget as unverifiable instead of
+    crashing on a syntactically valid plan.
+    """
+    try:
+        numerator = int(numerator)
+        denominator = int(denominator)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if denominator == 0:
+        return None
+    try:
+        value = numerator / denominator
+    except (OverflowError, ZeroDivisionError):
+        return None
+    if not math.isfinite(value):
+        return None
+    # A nonzero integer ratio can underflow to 0.0 (e.g. 1 / 10**400);
+    # reporting that as a measured zero would make the budget comparison look
+    # defined.  None keeps it explicitly unverifiable.
+    if value == 0.0 and numerator != 0:
+        return None
+    return float(value)
+
+
 def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
     """Pre-flight audit of the scale ladder's budget and transfer assumptions.
 
@@ -152,7 +183,12 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
         if lr is None or not (math.isfinite(lr) and lr > 0):
             problems.append(f'{name}: lr={cfg.get("lr")!r} is not a positive finite number')
         effective_tokens = steps * batch * seq
-        if declared_tokens > 0 and abs(effective_tokens - declared_tokens) > 0.01 * declared_tokens:
+        # Compare the integer difference to the exact 1% bound.  Multiplying a
+        # large declared token budget by 0.01 converts it to float and can
+        # overflow even though the integer comparison is well defined.
+        if (declared_tokens > 0
+                and abs(effective_tokens - declared_tokens) * 100
+                > declared_tokens):
             problems.append(
                 f'{name}: declared n_train_tokens={declared_tokens:,} differs from '
                 f'steps*batch_size*seq_len={effective_tokens:,} by more than 1%')
@@ -165,13 +201,19 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
         if params is not None and params <= 0:
             problems.append(f'{name}: params must be positive')
             params = None
+        _tokens_per_param = (_finite_int_ratio(effective_tokens, params)
+                             if params else None)
+        if params is not None and _tokens_per_param is None:
+            warnings.append(
+                f'{name}: tokens-per-parameter is not representable as a '
+                'finite float; budget matching is unverifiable')
         row.update({
             'steps': steps, 'batch_size': batch, 'seq_len': seq,
             'declared_tokens': (declared_tokens or None),
             'effective_tokens': int(effective_tokens),
-            'tokens_per_param': (effective_tokens / params if params else None),
+            'tokens_per_param': _tokens_per_param,
             'params': params, 'lr': lr, 'warmup': warmup,
-            'warmup_fraction': (warmup / steps if steps else None),
+            'warmup_fraction': _finite_int_ratio(warmup, steps) if steps else None,
             'n_seeds': len(_seed_set),
             'seeds': sorted(_seed_set),
             'train_knobs': train_knobs,
