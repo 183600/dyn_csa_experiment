@@ -498,7 +498,15 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
               f'{_rob_s.get("min_flip_fragility")}; unstable seeds='
               f'{_rob_s.get("unstable_seeds")}')
     os.makedirs(os.path.dirname(out) or '.', exist_ok=True)
-    stats = L.stamped_analysis('finaltest_stats', stats, outdir=(os.path.dirname(out) or '.'), name=os.path.basename(out))
+    _analysis_inputs = {
+        'manifest': manifest.get('_path') or FREEZE_MANIFEST,
+        'bylen': bylen_path,
+    }
+    if os.path.exists(probe_path):
+        _analysis_inputs['probe'] = probe_path
+    stats = L.stamped_analysis(
+        'finaltest_stats', stats, outdir=(os.path.dirname(out) or '.'),
+        name=os.path.basename(out), inputs=_analysis_inputs)
     print(f'[p5t stats] wrote {out}')
     return stats
 
@@ -819,7 +827,9 @@ def run_power(manifest_path=FREEZE_MANIFEST, summary='results_v10_mech/summary.j
     report['status'] = 'pass' if all_pass else 'fail'
     os.makedirs(os.path.dirname(out) or '.', exist_ok=True)
     L.stamped_analysis('power_validation', report, outdir=(os.path.dirname(out) or '.'),
-                       name=os.path.basename(out))
+                       name=os.path.basename(out),
+                       inputs={'manifest': manifest.get('_path') or manifest_path,
+                               'summary': summary})
     print(f'[p5pw] power preflight: {report["status"]} (q={power_q:.2f}, min={min_power:.2f}) -> {out}')
     for _k, _v in report['comparisons'].items():
         _pw = ((_v.get('power') or {}).get('power') or {}).get(f'q={power_q:.2f}')

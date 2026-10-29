@@ -967,7 +967,204 @@ def log_experiment_event(outdir, event):
         print(f'[track] WARNING: could not append to {os.path.join(outdir, "experiments.jsonl")} ({type(_e).__name__}: {_e}) — the training record itself is unaffected')
         return None
 
-def stamped_analysis(kind, payload, *, outdir=None, name=None, event=True):
+# Keys that describe *when/where/with which code* an artifact was produced,
+# rather than the analysis result itself.  They are excluded from the content
+# digest so two identical analyses run on two machines compare equal, while a
+# changed statistic/verdict does not.
+_ANALYSIS_VOLATILE_KEYS = frozenset({
+    'kind', 'created_at', 'code', 'provenance', 'content_sha256', 'inputs',
+})
+
+
+def _analysis_repo_root():
+    """Repository root used to store input paths relative to the checkout."""
+    p = os.path.dirname(os.path.abspath(__file__))
+    for _ in range(4):
+        if os.path.exists(os.path.join(p, 'pyproject.toml')):
+            return p
+        p = os.path.dirname(p)
+    return os.getcwd()
+
+
+def analysis_content_sha256(record):
+    """Canonical digest of the RESULT body of a stamped analysis.
+
+    The digest is deliberately independent of timestamp, git state, installed
+    environment and absolute paths: a reproduced analysis must be comparable
+    across machines.  Unknown values are converted with the same helpers the
+    JSON writer uses, and the serialisation is key-sorted and separator-stable,
+    so a dict reordering cannot change the digest.
+    """
+    if not isinstance(record, dict):
+        raise TypeError(f'analysis record must be a dict, got {type(record).__name__}')
+    body = {k: v for k, v in record.items() if k not in _ANALYSIS_VOLATILE_KEYS}
+    text = json.dumps(_json_clean(_jsonable(body)), sort_keys=True,
+                      separators=(',', ':'), ensure_ascii=False,
+                      allow_nan=False, default=float)
+    return hashlib.sha256(text.encode('utf-8')).hexdigest()
+
+
+def analysis_input_manifest(inputs, *, base=None):
+    """Content hashes of the files an analysis consumed.
+
+    ``inputs`` is either an iterable of paths or a ``label -> path`` mapping.
+    Relative paths resolve against ``base`` (default: the repository root) and
+    are stored relative to that root when possible, so an artifact moved
+    between checkouts still points at the same logical file.  A missing input
+    is recorded as ``exists: false`` rather than raising: the analysis may
+    legitimately have run on an absent optional probe, and the verifier must be
+    able to say so explicitly instead of crashing on the provenance block.
+    """
+    if inputs is None:
+        return {}
+    base = os.path.abspath(base or _analysis_repo_root())
+    if isinstance(inputs, dict):
+        items = list(inputs.items())
+    else:
+        if isinstance(inputs, (str, bytes, os.PathLike)):
+            inputs = [inputs]
+        items = [(f'input_{i}', p) for i, p in enumerate(inputs)]
+    out = {}
+    for label, raw in items:
+        label = str(label)
+        if raw is None:
+            out[label] = {'path': None, 'exists': False, 'sha256': None,
+                          'bytes': None, 'error': 'no path supplied'}
+            continue
+        raw_s = os.fspath(raw)
+        path = (os.path.abspath(raw_s) if os.path.isabs(raw_s)
+                else os.path.abspath(os.path.join(base, raw_s)))
+        try:
+            rel = os.path.relpath(path, base)
+            shown = rel.replace(os.sep, '/')
+            if shown == '..' or shown.startswith('../'):
+                shown = path
+        except (OSError, ValueError):
+            shown = path
+        ent = {'path': shown, 'abs_path': path, 'exists': os.path.isfile(path),
+               'sha256': None, 'bytes': None}
+        if ent['exists']:
+            try:
+                st = os.stat(path)
+                ent['sha256'] = file_sha256(path)
+                ent['bytes'] = int(st.st_size)
+            except OSError as e:
+                ent['error'] = f'{type(e).__name__}: {e}'
+        else:
+            ent['error'] = 'file does not exist at provenance time'
+        out[label] = ent
+    return out
+
+
+def verify_stamped_analysis(artifact, *, base=None, check_inputs=True):
+    """Verify a stamped analysis against its own content and input hashes.
+
+    This is the local reproducibility check for a derived number: the body
+    digest detects an edited statistic/verdict/curve, and the input hashes
+    detect a changed ``bylen.json``/summary/manifest that the artifact was
+    actually derived from.  A legacy artifact without ``content_sha256`` is
+    reported as not verifiable, never silently accepted; an input that is no
+    longer present is a warning (an archived artifact is still valid evidence)
+    rather than a false failure.
+    """
+    path = None
+    if isinstance(artifact, (str, bytes, os.PathLike)):
+        path = os.path.abspath(os.fspath(artifact))
+        try:
+            with open(path, encoding='utf-8') as fh:
+                rec = json.load(fh)
+        except (OSError, ValueError) as e:
+            return {'kind': 'analysis_integrity', 'status': 'not_verifiable_locally',
+                    'path': path, 'problems': [],
+                    'warnings': [f'cannot read/parse the artifact: {type(e).__name__}: {e}'],
+                    'note': 'no readable stamped artifact'}
+    else:
+        rec = artifact
+    if not isinstance(rec, dict):
+        return {'kind': 'analysis_integrity', 'status': 'fail', 'path': path,
+                'problems': [f'artifact is a {type(rec).__name__}, not a JSON object'],
+                'warnings': [], 'note': 'malformed artifact'}
+    out = {'kind': 'analysis_integrity', 'status': 'ok', 'path': path,
+           'artifact_kind': rec.get('kind'), 'problems': [], 'warnings': []}
+    digest = rec.get('content_sha256')
+    if digest is None:
+        out['status'] = 'not_verifiable_locally'
+        out['note'] = ('legacy artifact: no content_sha256, so a body edit '
+                       'cannot be detected; regenerate it with the current code')
+    elif (not isinstance(digest, str) or len(digest) != 64
+          or any(c not in '0123456789abcdef' for c in digest.lower())):
+        out['status'] = 'fail'
+        out['problems'].append(f'content_sha256 is not a SHA-256 hex digest: {digest!r}')
+    else:
+        try:
+            want = analysis_content_sha256(rec)
+        except (TypeError, ValueError, OverflowError) as e:
+            out['status'] = 'fail'
+            out['problems'].append(
+                f'content body cannot be canonicalised: {type(e).__name__}: {e}')
+        else:
+            if want != digest.lower():
+                out['status'] = 'fail'
+                out['problems'].append(
+                    f'content_sha256 does not reproduce (stored {digest[:12]}…, '
+                    f'recomputed {want[:12]}…): the analysis body was edited '
+                    'after it was written')
+    if check_inputs:
+        inputs = rec.get('inputs')
+        if inputs is not None and not isinstance(inputs, dict):
+            out['status'] = 'fail'
+            out['problems'].append(
+                f'inputs is a {type(inputs).__name__}, not an object')
+        elif isinstance(inputs, dict):
+            base_abs = os.path.abspath(base or _analysis_repo_root())
+            for label, ent in sorted(inputs.items()):
+                if not isinstance(ent, dict):
+                    out['status'] = 'fail'
+                    out['problems'].append(f'input {label!r} is not an object')
+                    continue
+                raw = ent.get('path')
+                if not isinstance(raw, str) or not raw:
+                    raw = ent.get('abs_path')
+                if not isinstance(raw, str) or not raw:
+                    out['status'] = 'fail'
+                    out['problems'].append(f'input {label!r} has no path')
+                    continue
+                p = raw if os.path.isabs(raw) else os.path.join(base_abs, raw)
+                want = ent.get('sha256')
+                if not isinstance(want, str) or len(want) != 64:
+                    out['status'] = 'fail'
+                    out['problems'].append(
+                        f'input {label!r} does not record a SHA-256 digest')
+                    continue
+                if ent.get('exists') is False or not os.path.isfile(p):
+                    out['warnings'].append(
+                        f'input {label!r} is absent locally ({raw}); its '
+                        'content cannot be re-verified from this checkout')
+                    continue
+                try:
+                    got = file_sha256(p)
+                except OSError as e:
+                    out['warnings'].append(
+                        f'input {label!r} cannot be read ({type(e).__name__}: {e})')
+                    continue
+                if got != want.lower():
+                    out['status'] = 'fail'
+                    out['problems'].append(
+                        f'input {label!r} changed after the analysis '
+                        f'({raw}: recorded {want[:12]}…, now {got[:12]}…)')
+    if out['status'] == 'ok' and out['warnings']:
+        out['status'] = 'warnings'
+    if out['status'] == 'ok':
+        out['note'] = ('content digest and every locally available input '
+                       'match the recorded provenance')
+    elif out['status'] == 'warnings':
+        out['note'] = ('content digest matches; some inputs are not available '
+                       'locally, so the full derivation is not re-verifiable')
+    return out
+
+
+def stamped_analysis(kind, payload, *, outdir=None, name=None, event=True,
+                     inputs=None):
     """Return `payload` merged with the standard traceability stamp — and
     optionally persist it plus an experiments.jsonl entry.
 
@@ -982,6 +1179,12 @@ def stamped_analysis(kind, payload, *, outdir=None, name=None, event=True):
     atomically; `event` additionally appends a ledger entry so analysis runs
     appear in the same experiments.jsonl trace as training panels.
 
+    ``inputs`` optionally binds the exact input bytes the analysis consumed
+    (path + SHA-256 + size).  `content_sha256` binds the result body itself,
+    excluding volatile provenance fields; `verify_stamped_analysis` replays
+    both checks, so a hand-edited number or a changed input cannot silently
+    masquerade as the recorded derivation.
+
     The stamp overwrites its own keys (`kind`/`created_at`/`code`/
     `provenance`), so re-stamping a loaded record on rewrite updates the
     trace instead of accumulating stale copies."""
@@ -990,11 +1193,14 @@ def stamped_analysis(kind, payload, *, outdir=None, name=None, event=True):
     rec['created_at'] = time.strftime('%Y-%m-%dT%H:%M:%S')
     rec['code'] = code_stamp()
     rec['provenance'] = code_provenance()
+    if inputs is not None:
+        rec['inputs'] = analysis_input_manifest(inputs)
+    rec['content_sha256'] = analysis_content_sha256(rec)
     if outdir is not None and name:
         path = os.path.join(outdir, name)
         atomic_write_json(path, rec)
         if event:
-            log_experiment_event(outdir, {'kind': 'analysis', 'tracking_schema': 2, 'artifact': name, 'created_at': rec['created_at'], 'code': rec['code'], 'label': kind, 'status': 'ok'})
+            log_experiment_event(outdir, {'kind': 'analysis', 'tracking_schema': 2, 'artifact': name, 'created_at': rec['created_at'], 'code': rec['code'], 'label': kind, 'status': 'ok', 'content_sha256': rec['content_sha256']})
     return rec
 
 _PINNED_HOST_CACHE = {}

@@ -7,12 +7,13 @@ PYTHON ?= python
 BUILD_DIR := .build
 INSTALL_DIR := $(BUILD_DIR)/install-check
 
-.PHONY: help test plan audit install-check build clean
+.PHONY: help test plan audit integrity install-check build clean
 
 help:
 	@echo "make test          # CPU unit/reproducibility suite (zero GPU)"
 	@echo "make plan          # frozen-manifest preflight, no test-split read"
 	@echo "make audit         # local audit gates -> audit_report.json"
+	@echo "make integrity     # verify stamped analysis bodies/inputs (zero GPU)"
 	@echo "make install-check # verify the project builds/installs as a wheel"
 	@echo "make build         # sdist + wheel via python -m build"
 	@echo "make clean         # remove packaging scratch space"
@@ -25,6 +26,9 @@ plan:
 
 audit:
 	$(PYTHON) audit_gates.py report
+
+integrity:
+	$(PYTHON) audit_gates.py analysis_integrity
 
 install-check:
 	rm -rf "$(INSTALL_DIR)"

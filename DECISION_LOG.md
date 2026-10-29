@@ -3142,3 +3142,40 @@ P5T 仍串行，不改变 checkpoint、test 行、PPL、种子、终点、α/Hol
 `ok`。当前仓库没有 `results_lm_test`，所以
 `python audit_gates.py evaluation_order` 报 `not_verifiable_locally` 而不是
 绿色通过；合成测试覆盖了 ok/fail 分支。
+
+## 2026-10-29 — 分析产物的内容寻址溯源与输入绑定（no new runs）
+
+零 GPU 的可复现性硬化；不新增训练、不读取 test split、不修改冻结清单的
+字节/种子/端点/alpha/Holm 规则，也不改 `CODE_SEMANTICS`。
+
+**Problem.** `stamped_analysis` 已经记录 code/git/environment provenance，
+但没有绑定（a）产物正文本身和（b）它实际读取的输入文件。手工改一个
+p/verdict/curve，或在分析之后重写 `bylen.json`/manifest/summary，产物仍会
+带着同一 code stamp 看起来“当前”；legacy 产物与刚重跑的结果也无法区分。
+这使“报告中的数字来自磁盘上的哪份输入、哪段代码”只能靠人工记忆。
+
+**Fix.** `stamped_analysis(..., inputs=...)` 现在可选记录每个输入文件的
+仓库相对路径、SHA-256 与字节数（`analysis_input_manifest`）；同时写入
+`content_sha256`，对结果正文（排除 `kind`/`created_at`/`code`/`provenance`/
+`inputs` 等易变字段）做键排序、分隔符稳定的 SHA-256。新增
+`verify_stamped_analysis()`：重算正文摘要并复核所有本机仍存在的输入哈希；
+正文被改或输入在分析后被改判 fail，输入不在本机给 warning，legacy 无摘要
+明确报 not_verifiable。确认统计入口 `finaltest_stats` 绑定
+manifest/bylen/probe，`run_power` 绑定 manifest/summary。
+新增 `audit_gates.audit_analysis_integrity()`（CLI `analysis_integrity` /
+`artifact_integrity` / `content_integrity`）：只扫描带 stamp 的
+`analysis_*/*.json` 与 `audit_report.json`，逐产物报告 ok/fail/legacy；
+接入 `audit report`，并提供 `make integrity` 零 GPU 入口。
+
+**Boundary.** 这是篡改/陈旧检测，不是密码学签名：能重写正文并同时重算
+摘要的人仍可伪造。外部输入（仓库外路径）按绝对路径记录，换机器后可能
+显示“输入不在本机”；这是显式 warning，不把归档产物误判为损坏。该机制
+不重算任何统计量、不改变 p/Holm/confirmed 判定；缺少输入的归档产物仍可
+作为证据使用，只是不能在本机完整复核推导链。
+
+**Verification.** `python -m pytest -q` 通过 `581 passed, 3 skipped`
+（新增 `test_review_part_13.py` 6 项：正文摘要稳定性/易变性隔离、正文与
+输入篡改 fail、缺失输入 warning、malformed digest/inputs fail、输入路径
+规范化、audit 扫描与 report/CLI 接线、实验事件携带摘要）。
+`make integrity` 在无新分析产物的当前仓库返回 `warnings`（只点名 legacy
+`audit_report.json`）而不是假绿；合成测试覆盖 ok/fail/not_verifiable 分支。

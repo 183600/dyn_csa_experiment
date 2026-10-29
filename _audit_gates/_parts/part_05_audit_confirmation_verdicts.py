@@ -882,8 +882,99 @@ def audit_statistical_calibration(*, n_sim=None, seed=None):
     return rep
 
 
+def audit_analysis_integrity(paths=None):
+    """Verify stamped analysis artifacts against their content and inputs.
+
+    A report number is reproducible only if the artifact that states it can be
+    tied to the bytes it was derived from.  Every ``stamped_analysis`` now
+    carries ``content_sha256`` (the result body, excluding volatile
+    provenance) and, when the producer supplies them, ``inputs`` with the
+    SHA-256 of each consumed file.  This gate replays both checks:
+
+      * a changed statistic/verdict/curve fails the body digest;
+      * a ``bylen.json``/manifest/summary edited after the analysis fails the
+        input digest;
+      * an input absent from this checkout is an explicit warning (an archived
+        artifact remains valid evidence), never a silent pass;
+      * a legacy artifact without the digest is ``not_verifiable_locally``,
+        not accepted as verified.
+
+    It reads local artifacts only, starts no experiment and changes no
+    measurement, p-value, Holm family or frozen verdict.
+    """
+    L = _import_exp_lib()
+    import glob as _glob
+    if paths is None:
+        roots = [os.path.join(REPO, 'audit_report.json')]
+        for pattern in ('analysis_*/*.json', 'analysis_audit/*.json'):
+            roots.extend(sorted(_glob.glob(os.path.join(REPO, pattern))))
+        paths = roots
+    elif isinstance(paths, (str, bytes, os.PathLike)):
+        paths = [paths]
+    files = []
+    seen = set()
+    for p in paths:
+        p = os.fspath(p)
+        if os.path.isdir(p):
+            for q in sorted(_glob.glob(os.path.join(p, '*.json'))):
+                if q not in seen:
+                    seen.add(q)
+                    files.append(q)
+        elif os.path.isfile(p) and p.endswith('.json'):
+            ap = os.path.abspath(p)
+            if ap not in seen:
+                seen.add(ap)
+                files.append(ap)
+    out = {'kind': 'analysis_integrity_audit', 'status': 'ok',
+           'artifacts': {}, 'n_checked': 0, 'n_ok': 0, 'n_fail': 0,
+           'n_warnings': 0, 'n_legacy': 0, 'n_skipped': 0,
+           'problems': [], 'warnings': [],
+           'note': ('content-addressed analysis provenance: the result body '
+                    'and every locally available input are checked against '
+                    'the hashes recorded when the artifact was written; this '
+                    'never recomputes or changes a statistical result')}
+    for f in sorted(files):
+        rec = _load(f)
+        if not isinstance(rec, dict):
+            out['n_skipped'] += 1
+            continue
+        # Only stamped analysis artifacts are in scope.  Plain data/summary
+        # files are inputs, not derivations; requiring a stamp on them would
+        # misreport an untracked input as a failed analysis.
+        if 'content_sha256' not in rec and not isinstance(rec.get('provenance'), dict):
+            out['n_skipped'] += 1
+            continue
+        rep = L.verify_stamped_analysis(rec, base=REPO)
+        out['n_checked'] += 1
+        short = os.path.relpath(f, REPO) if f.startswith(REPO + os.sep) else f
+        out['artifacts'][short] = rep
+        if rep.get('status') == 'fail':
+            out['n_fail'] += 1
+            out['problems'].extend(f'{short}: {p}' for p in rep.get('problems') or [])
+        elif rep.get('status') == 'warnings':
+            out['n_warnings'] += 1
+            out['warnings'].extend(f'{short}: {w}' for w in rep.get('warnings') or [])
+        elif rep.get('status') == 'not_verifiable_locally':
+            out['n_legacy'] += 1
+            out['warnings'].append(
+                f'{short}: {rep.get("note") or "legacy artifact without a content digest"}')
+        else:
+            out['n_ok'] += 1
+    if out['n_checked'] == 0:
+        out['status'] = 'not_verifiable_locally'
+        out['reason'] = ('no stamped analysis artifact exists yet; run the '
+                         'analysis with the current code to produce one')
+    elif out['n_fail']:
+        out['status'] = 'fail'
+    elif out['n_legacy'] or out['n_warnings']:
+        out['status'] = 'warnings'
+    print(json.dumps({k: v for k, v in out.items() if k != 'artifacts'},
+                     ensure_ascii=False, indent=2))
+    return out
+
+
 def run_report(out='audit_report.json'):
-    res = {'generated_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'source_tree': audit_source_integrity(), 'dependencies': audit_dependencies(), 'data_source': audit_data_source(), 'leakage': audit_leakage(), 'split_discipline': audit_split_discipline(), 'document_unit': audit_document_unit(), 'sample_design': audit_sample_design(), 'attribution': audit_attribution(), 'boundary': audit_boundary(), 'length': audit_length(), 'fairness': audit_fairness(), 'metrics': audit_metrics(), 'tuning': audit_tuning(), 'simple_baseline': audit_simple_baseline(), 'hypotheses': audit_hypotheses(), 'sesoi': audit_sesoi_declaration(), 'baseline_sesoi': audit_baseline_sesoi(), 'interaction_sesoi': audit_interaction_sesoi(), 'unit_influence': audit_unit_influence(), 'analysis_choices': audit_analysis_choices(), 'verdicts': audit_confirmation_verdicts(), 'looks': audit_look_history(), 'methodology': audit_methodology(), 'single_factor': audit_single_factor(), 'factorial': audit_factorial_design(), 'interaction_coverage': audit_interaction_coverage(verbose=False), 'factorial_anchor': audit_factorial_anchor(verbose=False), 'design_preflight': audit_design_preflight(), 'sensitivity': audit_design_sensitivity(), 'evaluation': audit_evaluation_design(), 'dose_response': audit_dose_response(verbose=False), 'failures': audit_failures(), 'budget': audit_budget(), 'training_health': audit_training_health(), 'efficiency_pairs': audit_efficiency_pairs(), 'error_case_inference': audit_error_case_inference(), 'release': audit_release_readiness(), 'selection': audit_selection(), 'run_order': audit_run_order(), 'evaluation_order': audit_evaluation_order(), 'calibration': audit_statistical_calibration()}
+    res = {'generated_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'source_tree': audit_source_integrity(), 'dependencies': audit_dependencies(), 'data_source': audit_data_source(), 'leakage': audit_leakage(), 'split_discipline': audit_split_discipline(), 'document_unit': audit_document_unit(), 'sample_design': audit_sample_design(), 'attribution': audit_attribution(), 'boundary': audit_boundary(), 'length': audit_length(), 'fairness': audit_fairness(), 'metrics': audit_metrics(), 'tuning': audit_tuning(), 'simple_baseline': audit_simple_baseline(), 'hypotheses': audit_hypotheses(), 'sesoi': audit_sesoi_declaration(), 'baseline_sesoi': audit_baseline_sesoi(), 'interaction_sesoi': audit_interaction_sesoi(), 'unit_influence': audit_unit_influence(), 'analysis_choices': audit_analysis_choices(), 'analysis_integrity': audit_analysis_integrity(), 'verdicts': audit_confirmation_verdicts(), 'looks': audit_look_history(), 'methodology': audit_methodology(), 'single_factor': audit_single_factor(), 'factorial': audit_factorial_design(), 'interaction_coverage': audit_interaction_coverage(verbose=False), 'factorial_anchor': audit_factorial_anchor(verbose=False), 'design_preflight': audit_design_preflight(), 'sensitivity': audit_design_sensitivity(), 'evaluation': audit_evaluation_design(), 'dose_response': audit_dose_response(verbose=False), 'failures': audit_failures(), 'budget': audit_budget(), 'training_health': audit_training_health(), 'efficiency_pairs': audit_efficiency_pairs(), 'error_case_inference': audit_error_case_inference(), 'release': audit_release_readiness(), 'selection': audit_selection(), 'run_order': audit_run_order(), 'evaluation_order': audit_evaluation_order(), 'calibration': audit_statistical_calibration()}
     L_atomic = None
     try:
         L = _import_exp_lib()
@@ -903,7 +994,7 @@ def run_report(out='audit_report.json'):
 
 
 def _run_cli():
-    _cmds = {'leakage': audit_leakage, 'split': audit_split_discipline, 'split_discipline': audit_split_discipline, 'document_unit': audit_document_unit, 'unit': audit_document_unit, 'sample_design': audit_sample_design, 'sampling': audit_sample_design, 'sample': audit_sample_design, 'causality': audit_causality, 'attribution': audit_attribution, 'boundary': audit_boundary, 'length': audit_length, 'fairness': audit_fairness, 'metrics': audit_metrics, 'tuning': audit_tuning, 'simple': audit_simple_baseline, 'baseline_floor': audit_simple_baseline, 'baseline_plan': audit_baseline_design, 'hypothesis_coverage': audit_hypothesis_coverage, 'hypotheses': audit_hypotheses, 'sesoi': audit_sesoi_declaration, 'baseline_sesoi': audit_baseline_sesoi, 'baseline_sesoi_declaration': audit_baseline_sesoi, 'interaction_sesoi': audit_interaction_sesoi, 'interaction': audit_interaction_sesoi, 'unit_influence': audit_unit_influence, 'influence': audit_unit_influence, 'analysis_choices': audit_analysis_choices, 'specification_curve': audit_analysis_choices, 'verdicts': audit_confirmation_verdicts, 'verdict': audit_confirmation_verdicts, 'three_way': audit_confirmation_verdicts, 'analysis_choice': audit_analysis_choices, 'looks': audit_look_history, 'look_history': audit_look_history, 'methodology': audit_methodology, 'single_factor': audit_single_factor, 'factorial': audit_factorial_design, 'factorial_design': audit_factorial_design, 'interaction_coverage': audit_interaction_coverage, 'interaction_scope': audit_interaction_coverage, 'factorial_anchor': audit_factorial_anchor, 'component_anchor': audit_factorial_anchor, 'design': audit_design_preflight, 'design_preflight': audit_design_preflight, 'sensitivity': audit_design_sensitivity, 'design_sensitivity': audit_design_sensitivity, 'precision': audit_design_sensitivity, 'evaluation': audit_evaluation_design, 'evaluation_design': audit_evaluation_design, 'unit_precision': audit_evaluation_design, 'dose_response': audit_dose_response, 'dose_response_design': audit_dose_response, 'failures': audit_failures, 'budget': audit_budget, 'efficiency': audit_efficiency_demo, 'efficiency_pairs': audit_efficiency_pairs, 'training_health': audit_training_health, 'selection': audit_selection, 'release': audit_release_readiness, 'run_order': audit_run_order, 'evaluation_order': audit_evaluation_order, 'eval_order': audit_evaluation_order, 'measurement_order': audit_evaluation_order, 'error_case_inference': audit_error_case_inference, 'error_buckets': audit_error_case_inference, 'calibration': audit_statistical_calibration, 'stats_calibration': audit_statistical_calibration, 'type_i': audit_statistical_calibration, 'source': audit_source_integrity, 'source_tree': audit_source_integrity, 'dependencies': audit_dependencies, 'dependency': audit_dependencies, 'data_source': audit_data_source, 'dataset_source': audit_data_source, 'report': run_report}
+    _cmds = {'leakage': audit_leakage, 'split': audit_split_discipline, 'split_discipline': audit_split_discipline, 'document_unit': audit_document_unit, 'unit': audit_document_unit, 'sample_design': audit_sample_design, 'sampling': audit_sample_design, 'sample': audit_sample_design, 'causality': audit_causality, 'attribution': audit_attribution, 'boundary': audit_boundary, 'length': audit_length, 'fairness': audit_fairness, 'metrics': audit_metrics, 'tuning': audit_tuning, 'simple': audit_simple_baseline, 'baseline_floor': audit_simple_baseline, 'baseline_plan': audit_baseline_design, 'hypothesis_coverage': audit_hypothesis_coverage, 'hypotheses': audit_hypotheses, 'sesoi': audit_sesoi_declaration, 'baseline_sesoi': audit_baseline_sesoi, 'baseline_sesoi_declaration': audit_baseline_sesoi, 'interaction_sesoi': audit_interaction_sesoi, 'interaction': audit_interaction_sesoi, 'unit_influence': audit_unit_influence, 'influence': audit_unit_influence, 'analysis_choices': audit_analysis_choices, 'specification_curve': audit_analysis_choices, 'analysis_integrity': audit_analysis_integrity, 'artifact_integrity': audit_analysis_integrity, 'content_integrity': audit_analysis_integrity, 'verdicts': audit_confirmation_verdicts, 'verdict': audit_confirmation_verdicts, 'three_way': audit_confirmation_verdicts, 'analysis_choice': audit_analysis_choices, 'looks': audit_look_history, 'look_history': audit_look_history, 'methodology': audit_methodology, 'single_factor': audit_single_factor, 'factorial': audit_factorial_design, 'factorial_design': audit_factorial_design, 'interaction_coverage': audit_interaction_coverage, 'interaction_scope': audit_interaction_coverage, 'factorial_anchor': audit_factorial_anchor, 'component_anchor': audit_factorial_anchor, 'design': audit_design_preflight, 'design_preflight': audit_design_preflight, 'sensitivity': audit_design_sensitivity, 'design_sensitivity': audit_design_sensitivity, 'precision': audit_design_sensitivity, 'evaluation': audit_evaluation_design, 'evaluation_design': audit_evaluation_design, 'unit_precision': audit_evaluation_design, 'dose_response': audit_dose_response, 'dose_response_design': audit_dose_response, 'failures': audit_failures, 'budget': audit_budget, 'efficiency': audit_efficiency_demo, 'efficiency_pairs': audit_efficiency_pairs, 'training_health': audit_training_health, 'selection': audit_selection, 'release': audit_release_readiness, 'run_order': audit_run_order, 'evaluation_order': audit_evaluation_order, 'eval_order': audit_evaluation_order, 'measurement_order': audit_evaluation_order, 'error_case_inference': audit_error_case_inference, 'error_buckets': audit_error_case_inference, 'calibration': audit_statistical_calibration, 'stats_calibration': audit_statistical_calibration, 'type_i': audit_statistical_calibration, 'source': audit_source_integrity, 'source_tree': audit_source_integrity, 'dependencies': audit_dependencies, 'dependency': audit_dependencies, 'data_source': audit_data_source, 'dataset_source': audit_data_source, 'report': run_report}
     _arg = sys.argv[1] if len(sys.argv) > 1 else 'report'
     if _arg in ('-h', '--help'):
         print(__doc__)
