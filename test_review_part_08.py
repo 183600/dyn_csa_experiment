@@ -1948,3 +1948,91 @@ def test_kernel_det_scatter_precision_and_nonfinite_topk():
         assert torch.equal(got_i, exp_i[..., :k]), (k, got_i, exp_i)
         assert torch.equal(got_v.nan_to_num(0), exp_v[..., :k].nan_to_num(0)), (k, got_v, exp_v)
 
+
+
+def test_sweep_factor_protocol_declarations_do_not_crash():
+    # A protocol-factor declaration (the v7 warmup cut point) has no AttnCfg
+    # arms.  The audit used to read local ``a``/``b`` before assigning them,
+    # raising UnboundLocalError instead of returning a verdict.
+    decl = {'warm50_vs_100': {'factors': ['warm_steps'], 'single_factor': True,
+                              'protocol_factor': 'warm_steps',
+                              'a_level': 50, 'b_level': 100}}
+    rep = L.sweep_contrast_factor_audit(decl, verbose=False)
+    assert rep['status'] == 'ok', rep
+    entry = rep['pairs']['warm50_vs_100']
+    assert entry['mode'] == 'protocol' and entry['verified'] is True, entry
+    assert entry['a_level'] == 50 and entry['b_level'] == 100, entry
+    # Arms must not be smuggled into a protocol declaration, and the levels
+    # must be distinct integers.
+    bad = {
+        'bad_arms': dict(decl['warm50_vs_100'], a='csa_dynamic', b='csa_fixed'),
+        'bad_levels': dict(decl['warm50_vs_100'], a_level=50, b_level=50),
+    }
+    rep = L.sweep_contrast_factor_audit(bad, verbose=False)
+    assert rep['status'] == 'fail', rep
+    assert rep['pairs']['bad_arms']['verified'] is False, rep
+    assert rep['pairs']['bad_levels']['verified'] is False, rep
+    assert any('must not also name' in v for v in rep['violations']), rep
+    assert any('distinct integer' in v for v in rep['violations']), rep
+
+
+def test_interaction_coverage_names_duplicate_factorials_and_out_of_scope_waivers():
+    design = {k: [] for k in ('a', 'b', 'c', 'd')}
+    factorials = {
+        'first': {'factors': ('a', 'b')},
+        'second': {'factors': ('b', 'a')},
+    }
+    r = L.interaction_coverage_audit(
+        design=design, factorials=factorials, scope=['a', 'b'],
+        waivers={('c', 'd'): 'not part of the core interaction family'})
+    assert r['status'] == 'ok', r
+    assert r['coverage_status'] == 'complete', r
+    assert r['full_pairwise_measured'] is True, r
+    assert r['duplicate_pairs'] == {"['a', 'b']": ['first', 'second']}, r['duplicate_pairs']
+    assert [x['pair'] for x in r['waivers_outside_scope']] == [['c', 'd']], r
+    assert any('outside the declared interaction scope' in w for w in r['warnings']), r
+    # A malformed scope is a reported failure, not a silently shrunken denominator.
+    bad = L.interaction_coverage_audit(
+        design=design, factorials=factorials, scope=['a', 'a'])
+    assert bad['status'] == 'fail', bad
+    assert any('at least two distinct factors' in p for p in bad['problems']), bad
+    # A malformed factorial cannot silently count as "not covering" only.
+    badfac = L.interaction_coverage_audit(
+        design=design, factorials={'bad': {'factors': ['a']}}, scope=['a', 'b'])
+    assert badfac['status'] == 'fail', badfac
+    assert any('no two distinct factor names' in p
+               for p in badfac['problems']), badfac
+
+
+def test_factorial_design_audit_accepts_custom_fixture_arms():
+    import dataclasses
+    base = L.AttnCfg(kind='csa', dynamic=False, block_size=4,
+                     overlap=L.OVERLAP, index_topk=32)
+
+    def _dyn():
+        return dataclasses.replace(base, dynamic=True,
+                                   chunking='cosine_learnable',
+                                   target_block_tokens=4)
+
+    def factory(_n, variant):
+        return {
+            'a0': [base],
+            'a1': [_dyn()],
+            'b0': [dataclasses.replace(base, use_sink=False)],
+            'b1': [dataclasses.replace(_dyn(), use_sink=False)],
+        }[variant]
+
+    design = {'fixture': {
+        'factors': ('dynamic_blocking', 'attention_sink'),
+        'cells': {('control', 'control'): 'a0',
+                  ('active', 'control'): 'a1',
+                  ('control', 'active'): 'b0',
+                  ('active', 'active'): 'b1'},
+        'hypothesis': 'dynamic_blocking_x_attention_sink',
+    }}
+    r = L.factorial_design_audit(
+        design, factory=factory, present={'a0', 'a1', 'b0', 'b1'})
+    assert r['status'] == 'ok', (r['violations'], r['warnings'])
+    assert r['interaction_coverage']['coverage_status'] == 'complete', r
+    assert r['component_anchor']['status'] == 'not_applicable', r['component_anchor']
+    assert not r['violations'], r['violations']

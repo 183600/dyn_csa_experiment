@@ -59,6 +59,7 @@ def sweep_contrast_factor_audit(declarations, *, factory=None, n_layers=6,
                 f'{label}: single_factor must be an explicit boolean')
             continue
         declared_set = {str(k) for k in factors}
+        a, b = spec.get('a'), spec.get('b')
         protocol_factor = spec.get('protocol_factor')
         if protocol_factor is not None:
             # A warmup panel's factor is the protocol cut point, which is not
@@ -105,7 +106,6 @@ def sweep_contrast_factor_audit(declarations, *, factory=None, n_layers=6,
                      'verified': bool(ok)}
             report['pairs'][label] = entry
             continue
-        a, b = spec.get('a'), spec.get('b')
         if not (isinstance(a, str) and a.strip() and isinstance(b, str) and b.strip()):
             report['violations'].append(
                 f'{label}: declaration must name both arms (a/b)')
