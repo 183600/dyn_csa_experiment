@@ -93,10 +93,12 @@
                discovery 选桶与 replication 符号/区间/复现判定；缺产物报
                not_verifiable，篡改判 fail（零 GPU，不读 test）
   single_factor  单因素设计契约：每条声明对照的臂配置 diff 恰好等于声明的
-               干预键集（定义点审计，不读 results_*）；open-block 矩阵只沿
-               两根声明轴变化；v7/v9 扫描与 v10 NIAH 的 factors 与真实 arm
-               diff/共享 override 对账；冻结清单的 mechanism_claim_allowed
-               标志与实际臂配置 diff 一致
+               干预键集（定义点审计，不读 results_*）；同 seed 下非干预参数
+               必须逐值相同（可选模块构造不能移动共享初始化）；open-block
+               矩阵只沿两根声明轴变化；v7/v9 扫描与 v10 NIAH 的 factors 与
+               真实 arm diff/共享 override 对账；动态草稿的 mechanism-
+               eligible 假设必须由单因素臂对检验；冻结清单的
+               mechanism_claim_allowed 标志与实际臂配置 diff 一致
                （零 GPU）
   content_controls  消融对照阶梯：内容消融同时具备 zero（存在性）与
                shift（错位、形状/范数/参数量/读取预算匹配）两个对照；
@@ -107,6 +109,10 @@
                对照；learned−random 隔离学习成分，learned−off 是总效应；
                参数量、冻结状态、cfg diff 与两条留一对照都必须是机器读数
                （零 GPU）
+  fusion_controls  消融对照阶梯：local fusion 同时具备 identity（缺席）与
+               frozen-random（同 conv 形状/参数量、冻结、不移动共享初始化）
+               两个对照；learned−random 隔离学习成分，learned−identity 是
+               总效应；别名 fusion_placebo / local_fusion（零 GPU）
   design       设计前馈：token/参数/读取预算台账、专用对照臂、证据等级
                 （v6-v11 永远 exploratory；draft 不能 confirmatory）与动态
                 分块 H1-H5 假设/对照（零 GPU，不读 test）

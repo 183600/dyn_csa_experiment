@@ -918,6 +918,16 @@ ABLATION_DESIGN = {
         ('csa_dyn_fuse', 'csa_dynamic', 'learned local fusion on vs off (CSA)'),
         ('hybrid_csa_dyn_fuse', 'hybrid_csa_dyn', 'learned local fusion on vs off (hybrid)'),
     ],
+    # On/off changes BOTH whether the depth-wise fusion convolution is trained
+    # AND whether its parameters exist.  The capacity-matched placebo keeps the
+    # same conv shape/count, freezes a non-learned kernel, and is constructed
+    # without consuming the global RNG, so `treatment - placebo` isolates the
+    # *learned* fusion component.  `treatment - absent` remains the total
+    # (mechanism + capacity) effect.
+    'local_fusion_learning': [
+        ('csa_dyn_fuse', 'csa_dyn_randfuse', 'learned fusion vs frozen random fusion (CSA); parameter-matched placebo'),
+        ('hybrid_csa_dyn_fuse', 'hybrid_csa_dyn_randfuse', 'learned fusion vs frozen random fusion (hybrid); parameter-matched placebo'),
+    ],
     'hybrid_hierarchy': [
         ('hybrid_csa_dyn', 'csa_dynamic', 'CSA+HCA hybrid vs CSA-only (dynamic blocking)'),
     ],
@@ -1079,6 +1089,13 @@ ABLATION_SESOI = {
     'local_fusion': {
         'relative_pct': 1.0,
         'rationale': 'The learned fusion convolution must move PPL by >=1% versus identity fusion to be practically relevant.',
+    },
+    'local_fusion_learning': {
+        'relative_pct': 1.0,
+        'rationale': ('A learned fusion convolution that does not beat the same-'
+                      'shape frozen random kernel by >=1% PPL is treated as an '
+                      'extra-capacity effect rather than evidence for a learned '
+                      'fusion mechanism.'),
     },
     'hybrid_hierarchy': {
         'relative_pct': 1.0,
@@ -1290,6 +1307,10 @@ ABLATION_INTERVENTION_KEYS = {
     'local_fusion': {
         ('csa_dyn_fuse', 'csa_dynamic'): frozenset({'fuse_mode'}),
         ('hybrid_csa_dyn_fuse', 'hybrid_csa_dyn'): frozenset({'fuse_mode'}),
+    },
+    'local_fusion_learning': {
+        ('csa_dyn_fuse', 'csa_dyn_randfuse'): frozenset({'fuse_mode'}),
+        ('hybrid_csa_dyn_fuse', 'hybrid_csa_dyn_randfuse'): frozenset({'fuse_mode'}),
     },
     'hybrid_hierarchy': {
         # kind 互换（部分层 csa→hca）= 换算子，architecture_level。
@@ -1606,3 +1627,129 @@ def single_factor_design_audit(design=None, *, baseline_design=None, factory=Non
                   f"{len(report['architecture_level_pairs'])} architecture-level, "
                   f"{len(report['system_level_pairs'])} system-level (declared multi-factor)")
     return report
+
+
+# ---- single-factor initialization contract ---------------------------------
+# The cfg-diff gate above answers "does the arm definition differ in exactly
+# the declared attention fields?".  It cannot see whether ADDING an optional
+# parameter shifted the global RNG stream: an `nn.Conv1d` constructed only in
+# the fusion treatment consumes torch randomness, so every later block
+# parameter is drawn differently and the on/off contrast silently becomes
+# "fusion + a different initialization".  This audit builds the two declared
+# single-factor arms at the same seed and requires every parameter that is not
+# explained by the declared intervention to be bit-identical.
+#
+# Intervention-specific parameters are whitelisted by the declared cfg keys:
+#   fuse_mode                 -> fuse_conv.*
+#   use_sink/full_sink/sink_mode -> sink
+#   dynamic/chunking/target_block_tokens -> delta_logit (the learned gate)
+# Everything else (W_q/W_o/W_aKV/W_bKV/W_aZ/W_bZ/W_DQ/W_DK/W_w/W_kvhead/...)
+# must match exactly; an unexpected extra/missing tensor is also a violation.
+def single_factor_initialization_audit(design=None, *, factory=None,
+                                       n_layers=2, seed=1234,
+                                       intervention_keys=None,
+                                       baseline_design=None,
+                                       baseline_intervention_keys=None,
+                                       verbose=False):
+    """Design-time check that a single-factor contrast changes only its factor.
+
+    For every pair the cfg gate labels ``single_factor``, construct both arms
+    through the real factory at the same seed and compare their parameter
+    tensors.  Parameters named by the declared intervention are allowed to
+    differ (or to exist on only one side); any other difference means the
+    experiment also changed the initialization of the shared trunk/blocks.
+
+    Returns a report dict; ``status`` is ``'ok'`` only when every checked pair
+    is clean.  The audit uses a tiny CPU model and never reads a result file.
+    """
+    design = ABLATION_DESIGN if design is None else design
+    factory = make_layer_cfgs if factory is None else factory
+    _nl = _as_seed_int(n_layers)
+    if _nl is None or _nl < 1:
+        raise ValueError(
+            f'single_factor_initialization_audit: n_layers must be a positive '
+            f'integer, got {n_layers!r}')
+    n_layers = int(_nl)
+    _seed = _as_seed_int(seed)
+    if _seed is None or _seed < 0:
+        raise ValueError(
+            f'single_factor_initialization_audit: seed must be a non-negative '
+            f'integer, got {seed!r}')
+    seed = int(_seed)
+    cfg_rep = single_factor_design_audit(
+        design, baseline_design=baseline_design, factory=factory,
+        intervention_keys=intervention_keys,
+        baseline_intervention_keys=baseline_intervention_keys,
+        n_layers=n_layers, verbose=False)
+    out = {'kind': 'single_factor_initialization', 'status': 'ok',
+           'seed': seed, 'n_layers': n_layers, 'pairs': {},
+           'violations': [], 'design_status': cfg_rep.get('status'),
+           'note': ('non-intervention parameters must be bit-identical at the '
+                    'same seed; optional-module construction must not consume '
+                    'the global RNG stream')}
+
+    def _allowed_param(name, keys):
+        leaf = name.rsplit('.', 1)[-1]
+        if 'fuse_mode' in keys and 'fuse_conv' in name:
+            return True
+        if (keys & {'use_sink', 'full_sink', 'sink_mode'}) and leaf == 'sink':
+            return True
+        if (keys & {'dynamic', 'chunking', 'target_block_tokens'}
+                and leaf == 'delta_logit'):
+            return True
+        return False
+
+    def _state(arm):
+        _prev = torch.get_rng_state()
+        try:
+            torch.manual_seed(seed)
+            model = SmallGPT(32, 16, n_layers, 2, 8, 16,
+                             factory(n_layers, arm))
+            return {n: p.detach().clone()
+                    for n, p in model.named_parameters()}
+        finally:
+            torch.set_rng_state(_prev)
+
+    for label in cfg_rep.get('single_factor_pairs') or []:
+        rec = cfg_rep.get('pairs', {}).get(label) or {}
+        a, b = rec.get('a'), rec.get('b')
+        keys = set(rec.get('actual_keys') or [])
+        entry = {'a': a, 'b': b, 'declared_keys': sorted(keys)}
+        out['pairs'][label] = entry
+        try:
+            sa, sb = _state(a), _state(b)
+        except Exception as e:
+            entry['status'] = 'unconstructable'
+            out['violations'].append(
+                f'{label}: cannot build both arms for the initialization '
+                f'check ({type(e).__name__}: {e})')
+            continue
+        common = sorted(set(sa) & set(sb))
+        extra_a = sorted(set(sa) - set(sb))
+        extra_b = sorted(set(sb) - set(sa))
+        unexpected_extra = [n for n in extra_a + extra_b
+                            if not _allowed_param(n, keys)]
+        changed = [n for n in common
+                   if not torch.equal(sa[n], sb[n])]
+        unexpected_changed = [n for n in changed
+                              if not _allowed_param(n, keys)]
+        entry['n_common'] = len(common)
+        entry['changed_params'] = changed
+        entry['unexpected_changed'] = unexpected_changed
+        entry['unexpected_extra_or_missing'] = unexpected_extra
+        if unexpected_changed:
+            out['violations'].append(
+                f'{label}: non-intervention parameter(s) {unexpected_changed[:6]} '
+                'differ at the same seed; the contrast also changes the shared '
+                'initialization')
+        if unexpected_extra:
+            out['violations'].append(
+                f'{label}: parameter set differs outside the declared '
+                f'intervention ({unexpected_extra[:6]})')
+        entry['status'] = ('ok' if not (unexpected_changed or unexpected_extra)
+                           else 'confounded')
+    if out['violations']:
+        out['status'] = 'fail'
+    if verbose:
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+    return out

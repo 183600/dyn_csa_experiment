@@ -3984,3 +3984,52 @@ bounds/tipping/status；篡改判 fail，legacy 报 not_verifiable；`report`
 缩放不变、畸形帧 fail-closed、面板 coverage 三态、无计划 `no_plan`、
 `methodology_audit` 附加块但不改变判定、gate 重放/篡改/legacy、CLI/
 report 接线。完整 CPU 套件在本轮最终树通过。
+
+## 2026-10-29 — 单因素实验的初始化契约与融合安慰剂（本轮实验设计与准备硬化，no new runs）
+
+零 GPU 的设计点硬化；不新增训练、不读取 test split、不修改冻结清单的
+字节/种子/端点/alpha/Holm 规则，也不改 `CODE_SEMANTICS`；`.github/` 与所有
+README 未触碰。
+
+**Problem.** `local_fusion` 的 on/off 对照在 cfg 上只差 `fuse_mode`，但
+learned 臂构造 `nn.Conv1d` 会消耗全局 torch RNG，使该臂从这一层起所有后续
+块参数的初始化都与 no-fuse 臂不同；`single_factor_design_audit` 只看
+AttnCfg diff，`init_core_fp` 只覆盖 trunk，二者都看不见这个第二因素。另外
+`audit_gates.py single_factor` 之前没有读取动态/HCA 草稿，H1/H2/H4 这类
+`mechanism_claim_eligible=true` 的对照若被换成多因素臂对，只有
+`dynamic-plan` 会拒绝。
+
+**Fix.** (1) 构造 `fuse_conv` 时保存/恢复全局 torch RNG；learned 保持
+identity 初始化，random 用 W_q 哈希 + `b'fuse'` 的局部 generator 抽同 shape
+kernel 并冻结，因此 learned/random/absent 的非 fuse 参数逐值相同。
+(2) 新增 `AttnCfg.fuse_mode='random'`、`_frozen_random_fuse_weight`、臂
+`csa_dyn_randfuse`/`hybrid_csa_dyn_randfuse`（并保留 `fuserand` 别名），
+`FUSION_CONTROL_DESIGN` 与 `fusion_control_audit`：treatment learned /
+capacity placebo frozen-random / absent identity 三级；逐 base 核验
+`fuse_mode` 精确 diff、同参数、placebo 冻结、absent 参数差等于 fuse 参数、
+三级非 fuse 初始化一致、两族声明与键集齐全。
+(3) 新增 `single_factor_initialization_audit`：对 cfg 门判为 `single_factor`
+的每条对照，同 seed 建 tiny 模型并逐参数对账；只放行声明干预对应的参数
+（`fuse_conv`/`sink`/`delta_logit`），其余任何差异 fail。
+(4) `audit_single_factor` 增加 `initialization`、`dynamic_study` 与
+`fusion_controls` 块；`fusion_controls` 同时进 `report` 顶层；
+`audit_gates.py fusion_controls`（别名 `fusion_placebo`/`local_fusion`）
+接线。新增 `local_fusion_learning` 的 `ABLATION_DESIGN` /
+`ABLATION_INTERVENTION_KEYS` / `HYPOTHESIS_DESIGN` / `ABLATION_SESOI`，并将
+新臂排程到 `RUN_ABL`。
+
+**Boundary.** 初始化审计只回答「同 seed 下非干预参数是否相同」，不检验
+训练轨迹；random fusion 是固定非学习安慰剂，不是「任意固定 kernel 都比
+identity 好」的检验；on/off 仍移除参数，故 `local_fusion` 的
+`requires_param_match` 仍为 False。动态门只把单因素要求纳入本门，其他动态
+设计问题保留在 `design_status`/`design_violations`。新臂是下一轮排程，不是
+已有证据。
+
+**Verification.** 新增 `test_review_part_32.py` 6 项：融合阶梯通过 shipped
+design、缺 level/未排程/复用臂/多改一个键/重复 role fail-closed、learned
+与 placebo/absent 的非 fuse 参数逐值相同且 placebo 冻结、故意消耗全局 RNG
+的 factory 被初始化审计拒绝、`single_factor` 门包含 fusion/initialization/
+dynamic_study、动态 H1 换成多因素臂对后该门 fail。完整 CPU 套件
+`749 passed, 3 skipped`；`python -m explib.confirmation plan` 仍为
+72/72 合成记录、6 个比较；`python audit_gates.py single_factor` 与
+`python audit_gates.py report` 在当前树均为 `ok`。

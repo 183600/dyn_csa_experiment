@@ -7239,3 +7239,79 @@ missing/unusable/unequal coverage；无计划时 `no_plan` 而非假装完整；
 `significant_components` / `family`；审计门对干净产物 `ok`、篡改 bounds
 或 `status` 判 `fail`、legacy artifact 只 `warn` 且
 `not_verifiable_locally`；以及 CLI/report 接线。完整 CPU 套件在本轮最终树通过。
+
+## 94. 单因素不只差一个字段：可选模块的构造不能移动共享初始化（本轮实验设计与准备硬化）
+
+### 94.1 问题：融合臂同时改了「有没有 conv」和「后面所有层的初始化」
+
+`ABLATION_DESIGN['local_fusion']` 的 `csa_dyn_fuse` / `hybrid_csa_dyn_fuse`
+与 `csa_dynamic` / `hybrid_csa_dyn` 在 cfg 上只差 `fuse_mode`，但
+`AttnCfg.fuse_mode='learned'` 会实例化 `nn.Conv1d`。`nn.Conv1d` 的默认
+初始化会消耗全局 torch RNG；于是 treatment 臂从这一层开始，`W_aKV`、
+`W_bKV`、`W_aZ`、`W_bZ`、`W_DQ`、`W_DK`、`W_kvhead`、`W_w` 等**后续所有
+块参数**的初始化都与 no-fuse 臂不同。`single_factor_design_audit` 只看
+AttnCfg diff，记录级 `init_core_fp` 只覆盖 trunk（embedding/pos/head/norm），
+两者都看不见这个差异；同 seed 的 on/off 对比因此同时检验了融合和一套不同
+的块初始化。
+
+### 94.2 设计：构造可选参数时保存/恢复全局 RNG，并加同 seed 参数对账
+
+`AttnCfg` 构造 `fuse_conv` 时先把 `torch.get_rng_state()` 存下，构造完
+（learned 或 random）再恢复；learned 仍初始化为 identity，random 用
+`_frozen_random_fuse_weight` 从 W_q 的 SHA-256 + `b'fuse'` 做局部 generator
+抽固定 kernel 并 `requires_grad_(False)`。两种模式都不消耗全局 RNG，所以
+treatment / placebo / absent 的**非 fuse 参数**逐值相同，只有 `fuse_conv`
+存在或取值不同。
+
+新增 `single_factor_initialization_audit`：对 `single_factor_design_audit`
+判为 `single_factor` 的每条对照，在同一 seed 下用真实工厂各建一个 tiny
+`SmallGPT`，逐参数比较。由声明键集解释的参数（`fuse_mode`→`fuse_conv`、
+sink 键→`sink`、动态分块键→`delta_logit`）允许不同；其余任何 common
+parameter 不同、或出现未解释的 extra/missing tensor，都判 fail。该审计
+接入 `audit_gates.py single_factor` 的 `initialization` 块。
+
+### 94.3 融合的 capacity-matched placebo：learned / frozen-random / absent
+
+新增 `FUSION_CONTROL_DESIGN` 与 `fusion_control_audit`：
+
+- `learned`（treatment）：`csa_dyn_fuse` / `hybrid_csa_dyn_fuse`，可训练
+  depth-wise conv；
+- `randomized`（capacity placebo）：`csa_dyn_randfuse` /
+  `hybrid_csa_dyn_randfuse`，同 shape/count/读取预算，固定非学习 kernel；
+- `absent`（absence control）：`csa_dynamic` / `hybrid_csa_dyn`，identity
+  fusion、无 conv 参数。
+
+审计逐 base 核验：每级只差 `fuse_mode`、字段真实取值正确（hybrid 的 HCA
+层允许 `none`）、arm 已排程、treatment 就是 base、placebo 参数冻结、总参数
+与 fuse 参数相同、absent 的参数减少量恰好等于 fuse 参数量、三级非 fuse
+初始化逐值相同；同时要求 `ABLATION_DESIGN` 的 `local_fusion` /
+`local_fusion_learning` 两族及 `ABLATION_INTERVENTION_KEYS` 同键集都已声明。
+`learned - randomized` 是学习成分，`learned - absent` 仍是总效应。新增
+`HYPOTHESIS_DESIGN['local_fusion_learning']` 与 `ABLATION_SESOI`，并在
+`RUN_ABL` 排程；`audit_gates.py fusion_controls`（别名 `fusion_placebo`）
+与 `report` 顶层 `fusion_controls` 接线。
+
+### 94.4 单因素门覆盖动态清单
+
+`audit_gates.py single_factor` 之前只读冻结主清单；动态/HCA 草稿里的
+`mechanism_claim_eligible=true` 假设（H1/H2/H4）若被换成多因素臂对，只有
+`dynamic-plan` 会拒绝。现在 `audit_single_factor` 增加 `dynamic_study`
+块，复用 `dynamic_design_audit` 的逐对照 `single_factor_required` /
+`single_factor_cfg` 读数；任一机制合格假设的对照不落在一个声明单因素族
+内，或 `mechanism_claim_allowed=true` 而 cfg 非单因素，整体 `fail`。其他
+动态设计问题仍保留在 `design_status`/`design_violations`，不冒充本门结论。
+
+### 94.5 边界
+
+- 零 GPU；不新增训练、不读取 test split、不修改冻结清单字节/种子/端点/
+  alpha/Holm 规则，也不改 `CODE_SEMANTICS`。`.github/` 与所有 README 未
+  触碰。
+- `single_factor_initialization_audit` 只覆盖 `single_factor` 级对照；
+  architecture/system-level 对照仍在各自的声明里读数。它检查初始化，不
+  检查训练轨迹或评测单位。
+- fusion 的 random kernel 是固定非学习安慰剂，不是「任意固定 kernel 都比
+  identity 好」的检验；后者是 `randomized - absent` 的 estimand。on/off 仍
+  移除参数，故 `local_fusion` 的 `requires_param_match` 仍是 False，on/off
+  结果不能单独写成学习机制证据。
+- 新臂是下一轮运行的排程，不是已有证据；旧面板缺臂时
+  `ablation_completeness` 会如实报不完整。

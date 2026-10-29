@@ -498,6 +498,48 @@ CONTENT_MODES = ('pooled', 'zero', 'shift')
 # are not aligned with the layer's query directions.
 SINK_MODES = ('learned', 'random')
 
+# Fusion controls: `none` is identity fusion (no convolution), `learned` is the
+# shipped trainable depth-wise convolution, and `random` keeps the SAME
+# parameter shape/count but replaces the learned weight with a fixed
+# pseudo-random tensor and freezes it.  The random placebo is the capacity-
+# matched control for "the learned fusion matters"; it consumes no global RNG
+# so the treatment and placebo still start from the same weights everywhere
+# else.  The learned arm's Conv1d is also constructed while the global torch RNG
+# is saved/restored: otherwise merely *having* the extra convolution would
+# shift the initialization of every later block parameter, making the on/off
+# contrast a joint test of fusion AND a different initialization.
+FUSE_MODES = ('none', 'learned', 'random')
+
+
+def _frozen_random_fuse_weight(w_q, d_model, kernel, dtype):
+    """A deterministic, non-learned depth-wise fusion kernel.
+
+    The seed is a hash of the layer's initialized W_q plus a fuse-specific
+    domain separator.  It therefore draws from a LOCAL generator (no global
+    RNG consumption) and is independent of the learned projection, while the
+    shape and parameter count match the treatment exactly.
+    """
+    out_channels = int(d_model)
+    kernel = int(kernel)
+    shape = (out_channels, 1, kernel)
+    try:
+        _bytes = w_q.detach().to('cpu').float().contiguous().numpy().tobytes()
+        _seed = int.from_bytes(
+            hashlib.sha256(_bytes + b'fuse').digest()[:8], 'big')
+        _gen = torch.Generator(device='cpu')
+        _gen.manual_seed(_seed)
+        w = torch.randn(shape, generator=_gen, dtype=torch.float32)
+    except Exception:
+        w = torch.empty(shape, dtype=torch.float32)
+    if not torch.isfinite(w).all() or float(w.norm()) == 0.0:
+        w = torch.linspace(-1.0, 1.0, out_channels * kernel,
+                           dtype=torch.float32).reshape(shape)
+    # Identity fusion has per-channel kernel norm 1; scale the random kernel
+    # the same way so it is a magnitude-matched placebo, not a larger/smaller
+    # intervention.
+    w = w / math.sqrt(max(kernel, 1))
+    return w.to(dtype=dtype)
+
 
 def _shift_block_content(table):
     """Move each row of a block-content table back by one block.
@@ -600,6 +642,17 @@ class AttnCfg:
                 'layer kind (use_sink for csa/hca, full_sink for full); the '
                 'absence control must use sink_mode="learned" with the sink '
                 'disabled')
+        if self.fuse_mode not in FUSE_MODES:
+            raise ValueError(
+                f'unknown fuse_mode {self.fuse_mode!r}; expected one of '
+                f'{FUSE_MODES}')
+        _fuse_active = (self.kind in ('csa', 'hca')
+                        and self.chunking == 'cosine_learnable')
+        if self.fuse_mode == 'random' and not _fuse_active:
+            raise ValueError(
+                'fuse_mode="random" requires a csa/hca layer with '
+                'chunking="cosine_learnable"; a layer that cannot fuse must '
+                'keep fuse_mode="none" (or the historical inert "learned")')
         if self.open_block_mode not in OPEN_BLOCK_MODES:
             raise ValueError(f'unknown open_block_mode {self.open_block_mode!r}; expected one of {OPEN_BLOCK_MODES}')
         if self.open_block_scope not in OPEN_BLOCK_SCOPES:
@@ -699,11 +752,33 @@ class HybridAttention(nn.Module):
         # their autograd `_version` counters (bumped by every in-place
         # optimizer update) makes a stale hit impossible.
         self._wcat_cache = {}
-        if cfg.kind in ('csa', 'hca') and cfg.chunking == 'cosine_learnable' and (cfg.fuse_mode == 'learned'):
-            self.fuse_conv = nn.Conv1d(d_model, d_model, cfg.fuse_kernel, groups=d_model, bias=False)
+        if (cfg.kind in ('csa', 'hca')
+                and cfg.chunking == 'cosine_learnable'
+                and cfg.fuse_mode in ('learned', 'random')):
+            # `nn.Conv1d` initializes its weight from the global torch RNG.
+            # Creating it here would shift every later block parameter's draw
+            # relative to the no-fuse arm, so the fusion on/off contrast would
+            # also change the initialisation of W_aKV/W_bKV/... .  Save and
+            # restore the stream around construction; fusion then differs from
+            # identity ONLY in the fuse_conv parameter, for both the learned
+            # treatment and the frozen-random placebo.
+            _rng_state = torch.get_rng_state()
+            try:
+                self.fuse_conv = nn.Conv1d(
+                    d_model, d_model, cfg.fuse_kernel, groups=d_model,
+                    bias=False)
+            finally:
+                torch.set_rng_state(_rng_state)
             with torch.no_grad():
-                self.fuse_conv.weight.zero_()
-                self.fuse_conv.weight[:, :, -1] = 1.0
+                if cfg.fuse_mode == 'learned':
+                    self.fuse_conv.weight.zero_()
+                    self.fuse_conv.weight[:, :, -1] = 1.0
+                else:
+                    _w = _frozen_random_fuse_weight(
+                        self.W_q.weight, d_model, cfg.fuse_kernel,
+                        self.fuse_conv.weight.dtype)
+                    self.fuse_conv.weight.copy_(_w)
+                    self.fuse_conv.weight.requires_grad_(False)
         if cfg.kind == 'full':
             self.W_k = nn.Linear(d_model, n_heads * d_head, bias=False)
             self.W_v = nn.Linear(d_model, n_heads * d_head, bias=False)

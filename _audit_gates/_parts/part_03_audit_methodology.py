@@ -168,12 +168,16 @@ def audit_single_factor(manifest_path=None):
         同一口径的 cfg 级读数）。
     """
     L = _import_exp_lib()
-    out = {'status': 'ok', 'design': {}, 'open_block_matrix': {},
-           'sweep_contrasts': {}, 'v7_contrasts': {}, 'niah_contrasts': {},
+    out = {'status': 'ok', 'design': {}, 'initialization': {},
+           'open_block_matrix': {}, 'sweep_contrasts': {}, 'v7_contrasts': {},
+           'niah_contrasts': {}, 'dynamic_study': {},
            'frozen_manifest': {}, 'factorial_design': {},
-           'content_controls': {}, 'sink_controls': {}}
+           'content_controls': {}, 'sink_controls': {},
+           'fusion_controls': {}}
     design_rep = L.single_factor_design_audit(verbose=False)
     out['design'] = design_rep
+    init_rep = L.single_factor_initialization_audit()
+    out['initialization'] = init_rep
     ob_rep = L.open_block_matrix_audit(verbose=False)
     out['open_block_matrix'] = ob_rep
     fact_rep = L.factorial_design_audit()
@@ -182,10 +186,14 @@ def audit_single_factor(manifest_path=None):
     out['content_controls'] = ctrl_rep
     sink_rep = L.sink_control_audit()
     out['sink_controls'] = sink_rep
-    if (design_rep.get('status') != 'ok' or ob_rep.get('status') != 'ok'
+    fusion_rep = L.fusion_control_audit()
+    out['fusion_controls'] = fusion_rep
+    if (design_rep.get('status') != 'ok' or init_rep.get('status') != 'ok'
+            or ob_rep.get('status') != 'ok'
             or fact_rep.get('status') != 'ok'
             or ctrl_rep.get('status') != 'ok'
-            or sink_rep.get('status') != 'ok'):
+            or sink_rep.get('status') != 'ok'
+            or fusion_rep.get('status') != 'ok'):
         out['status'] = 'fail'
     # v9/v10 attach a `single_factor`/`factors` label to each seq2k paired
     # record.  Verify that label against the actual arm construction instead of
@@ -302,6 +310,74 @@ def audit_single_factor(manifest_path=None):
             if (isinstance(out.get('frozen_manifest'), dict)
                     and out['frozen_manifest'].get('status') == 'fail'):
                 out['status'] = 'fail'
+    # ---- dynamic/HCA draft: hypotheses that NEED a single-factor contrast ----
+    # The dynamic study declares `mechanism_claim_eligible` per hypothesis; the
+    # audit above only reads the frozen main manifest, so a draft comparison
+    # whose H1/H2/H4 pair silently becomes multi-factor would not affect this
+    # gate.  Reuse the same definition-site verdict and fail only on the
+    # single-factor requirement (other dynamic-design problems stay visible in
+    # `design_status` but are not this gate's claim).
+    _dyn_path = os.path.join(REPO, 'confirmation_frozen_dynamic.json')
+    if not os.path.exists(_dyn_path):
+        out['dynamic_study'] = {
+            'status': 'not_verifiable_locally',
+            'manifest': _dyn_path,
+            'note': 'no dynamic design record; mechanism-eligible hypotheses are unverifiable'}
+    else:
+        try:
+            with open(_dyn_path, encoding='utf-8') as _df:
+                _dyn_man = json.load(_df)
+        except Exception as _de:
+            out['dynamic_study'] = {
+                'status': 'fail', 'manifest': _dyn_path,
+                'note': f'dynamic design is not readable JSON ({type(_de).__name__}: {_de})'}
+            out['status'] = 'fail'
+            _dyn_man = None
+        if _dyn_man is not None:
+            if not isinstance(_dyn_man, dict):
+                out['dynamic_study'] = {
+                    'status': 'fail', 'manifest': _dyn_path,
+                    'note': f'dynamic design must be a JSON object, got {type(_dyn_man).__name__}'}
+                out['status'] = 'fail'
+            else:
+                _dyn_rep = L.dynamic_design_audit(
+                    _dyn_man, manifest_path=_dyn_path)
+                _dyn_cmp = {}
+                _dyn_bad = []
+                for _dname, _dent in (_dyn_rep.get('comparisons') or {}).items():
+                    _req = _dent.get('single_factor_required')
+                    _sf = _dent.get('single_factor_cfg')
+                    _claim = _dent.get('mechanism_claim_allowed')
+                    _dyn_cmp[_dname] = {
+                        'a': _dent.get('a'), 'b': _dent.get('b'),
+                        'hypothesis_id': _dent.get('hypothesis_id'),
+                        'single_factor_required': _req,
+                        'cfg_diff_keys': _dent.get('cfg_diff_keys'),
+                        'single_factor_cfg': _sf,
+                        'mechanism_claim_allowed': _claim,
+                    }
+                    if _req is True and _sf is not True:
+                        _dyn_bad.append(
+                            f'{_dname}: hypothesis {_dent.get("hypothesis_id")} '
+                            f'is mechanism-claim eligible but its cfg diff '
+                            f'{_dent.get("cfg_diff_keys")} is not one declared '
+                            'single-factor family')
+                    if _claim is True and _sf is not True:
+                        _dyn_bad.append(
+                            f'{_dname}: mechanism_claim_allowed=true but the cfg '
+                            f'diff {_dent.get("cfg_diff_keys")} is not one '
+                            'declared single-factor family')
+                out['dynamic_study'] = {
+                    'status': ('fail' if _dyn_bad else 'ok'),
+                    'manifest': _dyn_path,
+                    'design_status': _dyn_rep.get('status'),
+                    'evidence_level': _dyn_rep.get('evidence_level'),
+                    'comparisons': _dyn_cmp,
+                    'violations': _dyn_bad,
+                    'design_violations': list(_dyn_rep.get('violations') or []),
+                }
+                if _dyn_bad:
+                    out['status'] = 'fail'
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return out
 
@@ -338,6 +414,23 @@ def audit_sink_controls():
     """
     L = _import_exp_lib()
     out = L.sink_control_audit()
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return out
+
+
+def audit_fusion_controls():
+    """Local-fusion control-ladder audit (zero GPU, design point).
+
+    Checks that the fusion ablation has a capacity-matched frozen-random
+    placebo in addition to the identity/absence control, that every ladder arm
+    is scheduled, that the placebo differs from the treatment in exactly
+    ``fuse_mode`` with identical total/fusion parameter counts and frozen
+    placebo parameters, and that both leave-one-out families are declared.
+    It also checks that adding/removing the optional convolution does not
+    shift the initialization of the shared (non-fusion) parameters.
+    """
+    L = _import_exp_lib()
+    out = L.fusion_control_audit()
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return out
 

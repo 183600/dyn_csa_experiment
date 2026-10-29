@@ -307,6 +307,15 @@ def make_layer_cfgs(n_layers, variant):
                 cfgs.append(AttnCfg(kind='csa', dynamic=True, chunking='cosine_learnable', target_block_tokens=4, overlap=OVERLAP, index_topk=32, temperature=0.1, fuse_mode='learned'))
             else:
                 cfgs.append(AttnCfg(kind='hca', dynamic=False, block_size=64))
+        elif variant in ('csa_dyn_randfuse', 'csa_dyn_fuserand',
+                         'csa_dyn_fuse_rand'):
+            cfgs.append(AttnCfg(kind='csa', dynamic=True, chunking='cosine_learnable', target_block_tokens=4, overlap=OVERLAP, index_topk=32, temperature=0.1, fuse_mode='random'))
+        elif variant in ('hybrid_csa_dyn_randfuse', 'hybrid_csa_dyn_fuserand',
+                         'hybrid_csa_dyn_fuse_rand'):
+            if i % 2 == 0:
+                cfgs.append(AttnCfg(kind='csa', dynamic=True, chunking='cosine_learnable', target_block_tokens=4, overlap=OVERLAP, index_topk=32, temperature=0.1, fuse_mode='random'))
+            else:
+                cfgs.append(AttnCfg(kind='hca', dynamic=False, block_size=64))
         elif variant == 'csa_fix_randidx':
             cfgs.append(AttnCfg(kind='csa', dynamic=False, block_size=4, overlap=OVERLAP, index_topk=32, indexer_mode='random'))
         elif variant == 'csa_fix_zerocont':

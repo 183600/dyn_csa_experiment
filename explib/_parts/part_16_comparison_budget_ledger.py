@@ -1167,6 +1167,15 @@ HYPOTHESIS_DESIGN = {
         'requires_param_match': False,
         'falsifier': 'The learned fusion convolution matches or loses to the identity rule after Holm correction.',
     },
+    'local_fusion_learning': {
+        'statement': 'The learned fusion convolution lowers validation PPL versus an identical-shape frozen random convolution at the same parameter count, read budget and initialization stream.',
+        'mechanism': 'The learned depth-wise kernel can reshape the local similarity signal for the boundary gate; a frozen random kernel of the same capacity cannot adapt, so a gain isolates the learned component from the extra parameters.',
+        'predicted_sign': -1,
+        'primary_metric': 'ppl',
+        'metric_policy': 'lm_perplexity',
+        'requires_param_match': True,
+        'falsifier': 'The frozen random fusion kernel matches or beats the learned kernel after Holm correction, or the difference is within the pre-registered SESOI; then the on/off contrast alone can only support a capacity/regularisation claim, not a learned-fusion mechanism.',
+    },
     'hybrid_hierarchy': {
         'statement': 'The CSA+HCA hybrid lowers validation PPL versus CSA-only at matched parameters and training length.',
         'mechanism': 'Alternating local HCA layers and sparse CSA layers cover complementary short- and long-range structure.',

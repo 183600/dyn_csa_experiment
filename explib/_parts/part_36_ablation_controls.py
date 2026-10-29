@@ -755,3 +755,450 @@ def sink_control_audit(design=None, ladder=None, present=None, factory=None,
     if out['violations']:
         out['status'] = 'fail'
     return out
+
+
+# ---- local-fusion control ladder -------------------------------------------
+# The on/off fusion contrast changes two things at once: whether the depth-wise
+# convolution is trained AND whether its parameters exist.  A "learned fusion
+# helps" claim from on/off alone therefore cannot distinguish a learned kernel
+# from "any extra capacity helps".  The ladder below keeps the conv shape/count,
+# read budget and every other attention field fixed:
+#
+#   learned    -> treatment (the shipped arm, trainable fusion kernel)
+#   randomized -> capacity placebo (same shape/count, frozen random kernel)
+#   absent     -> absence control (identity fusion, no conv parameter)
+#
+# `learned - randomized` isolates the learned component; `learned - absent`
+# remains the total effect.  Both the learned and the random Conv1d are built
+# without consuming the global torch RNG, so all three arms start from the same
+# weights for every non-fusion tensor.  Without that, merely adding the conv
+# would shift the initialization of the later block parameters and the
+# comparison would be multi-factor by construction.
+FUSION_CONTROL_DESIGN = {
+    'component': 'local_fusion_learning',
+    'total_effect_component': 'local_fusion',
+    'base_arms': {'csa': 'csa_dyn_fuse',
+                  'hybrid': 'hybrid_csa_dyn_fuse'},
+    'absence_keys': {'csa': frozenset({'fuse_mode'}),
+                     'hybrid': frozenset({'fuse_mode'})},
+    'levels': {
+        'learned': {
+            'role': 'treatment',
+            'fuse_mode': 'learned',
+            'arms': {'csa': 'csa_dyn_fuse',
+                     'hybrid': 'hybrid_csa_dyn_fuse'},
+            'note': 'the shipped trainable depth-wise fusion convolution',
+        },
+        'randomized': {
+            'role': 'capacity_placebo',
+            'fuse_mode': 'random',
+            'arms': {'csa': 'csa_dyn_randfuse',
+                     'hybrid': 'hybrid_csa_dyn_randfuse'},
+            'note': ('identical conv shape/count/read budget, fixed non-learned '
+                     'kernel, frozen: isolates learning from extra capacity'),
+        },
+        'absent': {
+            'role': 'absence_control',
+            'fuse_mode': 'none',
+            'arms': {'csa': 'csa_dynamic', 'hybrid': 'hybrid_csa_dyn'},
+            'note': ('identity fusion, no conv parameter; changes capacity as '
+                     'well as the mechanism, so it is the total-effect control'),
+        },
+    },
+    'note': ('the on/off control alone cannot support a *learned* fusion claim; '
+             'the frozen-random placebo is the capacity-matched control for it'),
+}
+
+
+def fusion_control_audit(design=None, ladder=None, present=None, factory=None,
+                         n_layers=2):
+    """Zero-GPU gate for the local-fusion control ladder.
+
+    For every declared base (pure CSA and hybrid) the audit constructs the real
+    arm configs, checks that each non-absent level differs from the base in
+    exactly ``fuse_mode`` (and that the field really takes the declared value
+    on every fusable layer), builds tiny models to compare total and fusion
+    parameter counts, verifies the capacity placebo's kernel is frozen, and
+    checks that all non-fusion parameters start identically for the three
+    levels at the same seed.  The two leave-one-out families that consume the
+    controls must be declared in ``ABLATION_DESIGN`` with exactly the expected
+    intervention keys.
+
+    A missing level/arm, a relabelled copy, a second knob in the placebo diff,
+    an unfrozen placebo, a parameter mismatch, a shifted non-fusion
+    initialization or an undeclared family is ``fail`` (never a pass).  The
+    audit never reads a result file.
+    """
+    design = ABLATION_DESIGN if design is None else design
+    ladder = FUSION_CONTROL_DESIGN if ladder is None else ladder
+    factory = make_layer_cfgs if factory is None else factory
+    _nl = _as_seed_int(n_layers)
+    if _nl is None or _nl < 1:
+        raise ValueError(
+            f'fusion_control_audit: n_layers must be a positive integer, got {n_layers!r}')
+    n_layers = int(_nl)
+    out = {'kind': 'fusion_control_ladder', 'status': 'ok',
+           'n_layers': n_layers, 'levels': {}, 'bases': {},
+           'base_checks': {}, 'component_design': {}, 'violations': [],
+           'warnings': [],
+           'treatment_component': 'local_fusion_learning',
+           'total_effect_component': 'local_fusion',
+           'note': ('learned - randomized isolates the learned component at '
+                    'matched capacity; learned - absent is the total effect')}
+    if not isinstance(ladder, dict) or not ladder:
+        out['status'] = 'fail'
+        out['violations'].append(
+            f'fusion control ladder must be a non-empty mapping, got '
+            f'{type(ladder).__name__}')
+        return out
+    bases = ladder.get('base_arms')
+    levels = ladder.get('levels')
+    absence_keys = ladder.get('absence_keys')
+    if (not isinstance(bases, dict) or not bases
+            or not all(isinstance(k, str) and k.strip() and isinstance(v, str)
+                       and v.strip() for k, v in bases.items())):
+        out['status'] = 'fail'
+        out['violations'].append('base_arms must map non-empty base labels to arm ids')
+        return out
+    if not isinstance(levels, dict) or not levels:
+        out['status'] = 'fail'
+        out['violations'].append('levels must be a non-empty mapping')
+        return out
+    if not isinstance(absence_keys, dict) or set(absence_keys) != set(bases):
+        out['status'] = 'fail'
+        out['violations'].append(
+            'absence_keys must name exactly the declared base labels')
+        return out
+    _absence_norm = {}
+    for _b, _ks in absence_keys.items():
+        if not isinstance(_ks, (set, frozenset)) or not _ks:
+            out['status'] = 'fail'
+            out['violations'].append(
+                f'absence_keys[{_b!r}] must be a non-empty set of cfg keys')
+            _absence_norm[_b] = frozenset()
+        elif not all(isinstance(_k, str) and _k.strip() for _k in _ks):
+            out['status'] = 'fail'
+            out['violations'].append(
+                f'absence_keys[{_b!r}] must contain non-empty cfg field names')
+            _absence_norm[_b] = frozenset()
+        else:
+            _absence_norm[_b] = frozenset(_ks)
+    absence_keys = _absence_norm
+    out['bases'] = dict(bases)
+    try:
+        present_set = set(RUN_ABL['variants']) if present is None else set(present)
+    except TypeError:
+        out['status'] = 'fail'
+        out['violations'].append('present arm ids must be a collection of strings')
+        return out
+    roles = {}
+    for name, spec in levels.items():
+        if not isinstance(spec, dict):
+            out['violations'].append(f'{name}: level must be a mapping')
+            continue
+        roles[name] = str(spec.get('role') or '')
+        _arms = spec.get('arms')
+        _arms_norm = dict(_arms) if isinstance(_arms, dict) and _arms else _arms
+        if not isinstance(_arms, dict) or not _arms:
+            out['violations'].append(
+                f'{name}: arms must be a non-empty mapping base label -> arm id')
+        out['levels'][str(name)] = {
+            'role': spec.get('role'),
+            'fuse_mode': spec.get('fuse_mode'),
+            'arms': _arms_norm,
+        }
+    expected_roles = {'treatment', 'capacity_placebo', 'absence_control'}
+    if set(roles.values()) != expected_roles:
+        out['status'] = 'fail'
+        out['violations'].append(
+            'ladder roles must be exactly treatment/capacity_placebo/'
+            f'absence_control, got {sorted(roles.values())}')
+    elif len(roles) != len(expected_roles):
+        out['status'] = 'fail'
+        out['violations'].append(
+            'ladder levels must use each of treatment/capacity_placebo/'
+            f'absence_control exactly once, got {sorted(roles.items())}')
+    by_role = {v: k for k, v in roles.items()}
+    treatment_name = by_role.get('treatment')
+    placebo_name = by_role.get('capacity_placebo')
+    absent_name = by_role.get('absence_control')
+    if treatment_name is None or placebo_name is None or absent_name is None:
+        out['status'] = 'fail'
+        return out
+
+    treatment_pairs = _declared_pairs(design, 'local_fusion_learning')
+    total_pairs = _declared_pairs(design, 'local_fusion')
+    if not treatment_pairs:
+        out['violations'].append(
+            'ABLATION_DESIGN has no local_fusion_learning contrast for the '
+            'capacity placebo')
+    if not total_pairs:
+        out['violations'].append(
+            'ABLATION_DESIGN has no local_fusion contrast for the absence control')
+    out['component_design'] = {
+        'local_fusion_learning': sorted(treatment_pairs or ()),
+        'local_fusion': sorted(total_pairs or ()),
+    }
+
+    def _fuse_layers(factory_arm):
+        cfgs = factory(n_layers, factory_arm)
+        if isinstance(cfgs, (str, bytes, bytearray)):
+            raise TypeError('factory returned a string, not a sequence of layer configs')
+        cfgs = list(cfgs)
+        if len(cfgs) != n_layers:
+            raise ValueError(
+                f'arm {factory_arm!r} has {len(cfgs)} layer config(s), expected {n_layers}')
+        return cfgs
+
+    def _model_bundle(arm):
+        # Build under a restored RNG so the audit itself is neutral, then use
+        # the SAME seed for every level so a shifted initialization is visible.
+        with _preserve_rng_state():
+            torch.manual_seed(1234)
+            model = SmallGPT(32, 16, n_layers, 2, 8, 16, factory(n_layers, arm))
+            named = dict(model.named_parameters())
+            state = {n: p.detach().clone() for n, p in named.items()}
+            fuse_names = [n for n in named if 'fuse_conv' in n]
+            return {
+                'total': sum(int(p.numel()) for p in named.values()),
+                'fuse_params': sum(int(named[n].numel()) for n in fuse_names),
+                'n_fuse_tensors': len(fuse_names),
+                'fuse_frozen': bool(fuse_names) and all(
+                    not bool(named[n].requires_grad) for n in fuse_names),
+                'non_fuse_state': {n: p for n, p in state.items()
+                                   if 'fuse_conv' not in n},
+            }
+
+    def _non_fuse_equal(sa, sb):
+        if set(sa) != set(sb):
+            return False
+        return all(torch.equal(sa[n], sb[n]) for n in sa)
+
+    # Construct every level against its base and verify the exact diff.
+    for base_label, base_arm in bases.items():
+        base_rec = {'base_arm': base_arm, 'expected_absence_keys':
+                    sorted(absence_keys[base_label])}
+        try:
+            _base_cfgs = _fuse_layers(base_arm)
+        except Exception as _be:
+            out['violations'].append(
+                f'{base_label}: cannot construct base arm {base_arm!r} '
+                f'({type(_be).__name__}: {_be})')
+            out['base_checks'][base_label] = base_rec
+            continue
+        for level_name in (treatment_name, placebo_name, absent_name):
+            spec = levels[level_name]
+            arms = spec.get('arms') if isinstance(spec, dict) else None
+            arm = arms.get(base_label) if isinstance(arms, dict) else None
+            rec = {'arm': arm, 'expected_mode': spec.get('fuse_mode')}
+            base_rec[level_name] = rec
+            if not isinstance(arm, str) or not arm.strip():
+                out['violations'].append(
+                    f'{level_name}/{base_label}: no single arm id declared')
+                rec['status'] = 'invalid'
+                continue
+            if arm not in present_set:
+                out['violations'].append(
+                    f'{level_name}/{base_label}: arm {arm!r} is not scheduled in '
+                    'the ablation panel')
+                rec['status'] = 'missing'
+                continue
+            _keys, _per = _design_pair_cfg_keys(arm, base_arm, factory, n_layers)
+            if isinstance(_keys, Exception):
+                out['violations'].append(
+                    f'{level_name}/{base_label}: cannot construct {arm!r} vs '
+                    f'{base_arm!r} ({type(_keys).__name__}: {_keys})')
+                rec['status'] = 'unconstructable'
+                continue
+            diff = sorted(_keys)
+            rec['cfg_diff_keys'] = diff
+            try:
+                _cfgs = _fuse_layers(arm)
+            except Exception as _me:
+                out['violations'].append(
+                    f'{level_name}/{base_label}: cannot construct {arm!r} '
+                    f'({type(_me).__name__}: {_me})')
+                rec['status'] = 'unconstructable'
+                continue
+            expected_mode = spec.get('fuse_mode')
+            _actual_modes = {}
+            _bad_modes = []
+            for _i, (_c, _bc) in enumerate(zip(_cfgs, _base_cfgs)):
+                _active = (getattr(_bc, 'kind', None) in ('csa', 'hca')
+                           and getattr(_bc, 'chunking', None) == 'cosine_learnable')
+                _expected_i = expected_mode if _active else 'none'
+                _got = getattr(_c, 'fuse_mode', None)
+                _actual_modes[_i] = _got
+                if _got != _expected_i:
+                    _bad_modes.append((_i, _got, _expected_i))
+            rec['observed_fuse_modes'] = _actual_modes
+            if level_name == treatment_name:
+                bad = []
+                if arm != base_arm:
+                    bad.append(f'treatment arm {arm!r} must be the base arm '
+                               f'{base_arm!r}')
+                if diff:
+                    bad.append(f'treatment arm must not differ from the base '
+                               f'config, got {diff}')
+                if expected_mode != 'learned':
+                    bad.append(f'treatment must declare fuse_mode="learned", '
+                               f'got {expected_mode!r}')
+                if _bad_modes:
+                    bad.append('constructed fuse_mode does not equal the '
+                               f'declared per-layer mode: {_bad_modes}')
+                if bad:
+                    out['violations'].append(
+                        f'{level_name}/{base_label}: ' + '; '.join(bad))
+                    rec['status'] = 'confounded'
+                else:
+                    rec['status'] = 'ok'
+                continue
+            if level_name == placebo_name:
+                bad = []
+                if diff != ['fuse_mode']:
+                    bad.append(f'cfg diff is {diff}, not exactly ["fuse_mode"]')
+                if expected_mode != 'random':
+                    bad.append(
+                        f'capacity placebo must declare fuse_mode="random", got '
+                        f'{expected_mode!r}')
+                if _bad_modes:
+                    bad.append('constructed fuse_mode is not the declared '
+                               f'random/identity pattern: {_bad_modes}')
+                if bad:
+                    out['violations'].append(
+                        f'{level_name}/{base_label}: ' + '; '.join(bad))
+                    rec['status'] = 'confounded'
+                else:
+                    rec['status'] = 'ok'
+                continue
+            # absence control
+            bad = []
+            expected = absence_keys[base_label]
+            if set(diff) != set(expected):
+                bad.append(f'cfg diff is {diff}, not the declared absence '
+                           f'key(s) {sorted(expected)}')
+            if expected_mode != 'none':
+                bad.append(f'absence control must declare fuse_mode="none", '
+                           f'got {expected_mode!r}')
+            if _bad_modes:
+                bad.append('constructed fuse_mode is not the declared '
+                           f'none/identity pattern: {_bad_modes}')
+            if bad:
+                out['violations'].append(
+                    f'{level_name}/{base_label}: ' + '; '.join(bad))
+                rec['status'] = 'confounded'
+            else:
+                rec['status'] = 'ok'
+        # Parameter-count and non-fusion-initialization checks.
+        try:
+            counts = {
+                level_name: _model_bundle(
+                    levels[level_name]['arms'][base_label])
+                for level_name in (treatment_name, placebo_name, absent_name)
+            }
+        except Exception as e:  # fail closed: an unbuildable arm is a defect
+            out['violations'].append(
+                f'{base_label}: cannot build the three ladder arms '
+                f'({type(e).__name__}: {e})')
+            out['base_checks'][base_label] = base_rec
+            continue
+        for level_name, c in counts.items():
+            base_rec[level_name]['params'] = c['total']
+            base_rec[level_name]['fuse_params'] = c['fuse_params']
+            base_rec[level_name]['n_fuse_tensors'] = c['n_fuse_tensors']
+        _t, _p, _a = (counts[treatment_name], counts[placebo_name],
+                      counts[absent_name])
+        base_rec['params_checked'] = True
+        base_rec['treatment_placebo_matched'] = _t['total'] == _p['total']
+        base_rec['treatment_absence_delta'] = _t['total'] - _a['total']
+        base_rec['expected_absence_delta'] = _t['fuse_params']
+        base_rec['shared_init_matched'] = (
+            _non_fuse_equal(_t['non_fuse_state'], _p['non_fuse_state'])
+            and _non_fuse_equal(_t['non_fuse_state'], _a['non_fuse_state']))
+        if not base_rec['treatment_placebo_matched']:
+            out['violations'].append(
+                f'{base_label}: treatment and capacity placebo differ in total '
+                f'parameters ({_t["total"]} vs {_p["total"]}); the placebo is '
+                'not capacity-matched')
+        if _t['fuse_params'] != _p['fuse_params']:
+            out['violations'].append(
+                f'{base_label}: treatment and capacity placebo differ in fusion '
+                f'parameters ({_t["fuse_params"]} vs {_p["fuse_params"]})')
+        if _p['n_fuse_tensors'] != _t['n_fuse_tensors']:
+            out['violations'].append(
+                f'{base_label}: capacity placebo has a different number of fusion '
+                f'tensors ({_p["n_fuse_tensors"]} vs {_t["n_fuse_tensors"]})')
+        if not _p['fuse_frozen']:
+            out['violations'].append(
+                f'{base_label}: capacity placebo fusion parameters are trainable; '
+                'a learned placebo is not a placebo')
+        if _t['total'] - _a['total'] != _t['fuse_params']:
+            out['violations'].append(
+                f'{base_label}: absence control removes '
+                f'{_t["total"] - _a["total"]} parameters but fusion accounts for '
+                f'{_t["fuse_params"]}; the on/off contrast changed more than the '
+                'fusion capacity')
+        if not base_rec['shared_init_matched']:
+            out['violations'].append(
+                f'{base_label}: the three levels do not start from the same '
+                'non-fusion parameter initialization; adding/removing the conv '
+                'shifted the global RNG stream')
+        out['base_checks'][base_label] = base_rec
+
+    # Tie each control level to its declared leave-one-out family.
+    for base_label, base_arm in bases.items():
+        _p = _declared_arm_id(levels, placebo_name, base_label)
+        _a = _declared_arm_id(levels, absent_name, base_label)
+        if treatment_pairs is not None and (base_arm, _p) not in treatment_pairs:
+            out['violations'].append(
+                f'local_fusion_learning does not declare {base_arm!r} vs {_p!r} '
+                'for the capacity placebo')
+        if total_pairs is not None and (base_arm, _a) not in total_pairs:
+            out['violations'].append(
+                f'local_fusion does not declare {base_arm!r} vs {_a!r} for the '
+                'absence control')
+    keys = ABLATION_INTERVENTION_KEYS if isinstance(
+        ABLATION_INTERVENTION_KEYS, dict) else {}
+    _pkeys = keys.get('local_fusion_learning')
+    if not isinstance(_pkeys, dict):
+        out['violations'].append(
+            'local_fusion_learning: no declared intervention-key mapping')
+    else:
+        for base_label, base_arm in bases.items():
+            _p = _declared_arm_id(levels, placebo_name, base_label)
+            kset = _pkeys.get((base_arm, _p))
+            if kset != frozenset({'fuse_mode'}):
+                out['violations'].append(
+                    f'local_fusion_learning: contrast {(base_arm, _p)} declares '
+                    f'intervention keys '
+                    f'{sorted(kset) if isinstance(kset, (set, frozenset)) else kset!r}, '
+                    'expected exactly {"fuse_mode"}')
+    _akeys = keys.get('local_fusion')
+    if not isinstance(_akeys, dict):
+        out['violations'].append(
+            'local_fusion: no declared intervention-key mapping')
+    else:
+        for base_label, base_arm in bases.items():
+            _a = _declared_arm_id(levels, absent_name, base_label)
+            kset = _akeys.get((base_arm, _a))
+            if kset != frozenset(absence_keys[base_label]):
+                out['violations'].append(
+                    f'local_fusion: contrast {(base_arm, _a)} declares '
+                    f'intervention keys '
+                    f'{sorted(kset) if isinstance(kset, (set, frozenset)) else kset!r}, '
+                    f'expected {sorted(absence_keys[base_label])}')
+    # Distinct arm per level per base (a relabelled copy is not a control).
+    for base_label in bases:
+        seen = {}
+        for level_name in (treatment_name, placebo_name, absent_name):
+            arm = _declared_arm_id(levels, level_name, base_label)
+            if arm is not None:
+                seen.setdefault(arm, []).append(level_name)
+        for arm, names in seen.items():
+            if len(names) > 1:
+                out['violations'].append(
+                    f'{base_label}: arm {arm!r} is reused by levels {names}; the '
+                    'control is a relabelled copy, not an independent level')
+    if out['violations']:
+        out['status'] = 'fail'
+    return out
