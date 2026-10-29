@@ -1,10 +1,14 @@
 name: OpenCode Issue
 
 # 用法：由仓库所有者 183600 新建（或重新打开）一个 issue。
-# issue 的正文就是 prompt（标题不提供给模型，仅用于人工索引和 commit message），OpenCode 会直接修改默认分支并推送（不建 PR）。
+# issue 的正文就是 prompt（标题不提供给模型，仅用于人工索引和 commit message），agent 会直接修改默认分支并推送（不建 PR）。
 # 开始前会取消其他 workflow 的运行并临时禁用它们；结束后（无论本次运行成功还是失败）
 # 只重新启用它们，不重新触发；它们会按自身的事件/计划恢复。
-# 模型优先使用 OpenCode 自带的免费 deepseek-v4.1-flash-free：
+#
+# harness 策略：优先 DeepSeek Harness（dsh）搭配 DeepSeek 官方 API（deepseek-flash，
+# 读取 secret DEEPSEEK_API_KEY）；dsh 不可用（未安装 / key 未配置 / 冒烟失败 /
+# 运行中失败且剩余时间充裕）时自动改用 opencode 兜底。
+# opencode 兜底模型优先使用 OpenCode 自带的免费 deepseek-v4.1-flash-free：
 # 若模型列表中暂时找不到它，会刷新模型目录后反复重试，最多 5 次；
 # 5 次后仍没有 deepseek-v4.1-flash-free 但找到其他免费模型时，改用其他免费模型
 # （big-pickle 优先，再次为随机免费模型）；任何时候都优先 deepseek-v4.1-flash-free。
@@ -43,6 +47,7 @@ env:
   PYTHONIOENCODING: utf-8
   PYTHONUTF8: '1'
   OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+  DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
 
 jobs:
   opencode:
@@ -190,11 +195,30 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-npm-opencode-
 
-      - name: Install OpenCode
+      - name: Install AI harnesses (dsh primary, opencode fallback)
         shell: bash
-        run: npm i -g opencode-ai
+        run: |
+          set +e
+          # 主 harness：DeepSeek Harness（dsh，官方 CLI，走 DeepSeek 官方 API）
+          npm i -g @deepseek-ai/dsh@0.2.1-rc.2
+          if command -v dsh >/dev/null 2>&1; then
+            dsh --version
+          else
+            echo "[warn] dsh 安装失败，将使用 opencode 兜底"
+          fi
+          # 兜底 harness：opencode（Zen 免费模型池）
+          npm i -g opencode-ai
+          if command -v opencode >/dev/null 2>&1; then
+            opencode --version
+          else
+            echo "[warn] opencode 安装失败"
+          fi
+          if ! command -v dsh >/dev/null 2>&1 && ! command -v opencode >/dev/null 2>&1; then
+            echo "[error] dsh 与 opencode 均不可用" >&2
+            exit 1
+          fi
 
-      - name: Select a free OpenCode model
+      - name: Select harness (dsh primary, opencode fallback)
         id: select
         shell: bash
         timeout-minutes: 40
@@ -203,6 +227,39 @@ jobs:
 
           PREFERRED_DEEPSEEK="opencode/deepseek-v4.1-flash-free"
           PREFERRED_PICKLE="opencode/big-pickle"
+
+          # ---------- 阶段 0：优先 DeepSeek Harness（dsh + DeepSeek 官方 API + deepseek-flash） ----------
+          if command -v dsh >/dev/null 2>&1 && [ -n "${DEEPSEEK_API_KEY:-}" ]; then
+            echo "[harness] dsh 已安装且 DEEPSEEK_API_KEY 已配置，冒烟测试 dsh ..."
+            if timeout --kill-after=30 180 dsh --profile headless "只回复两个字：OK" > /tmp/dsh_smoke_test.log 2>&1; then
+              echo "[harness] dsh 冒烟通过：harness=dsh | provider=deepseek-official | model=deepseek-flash"
+              echo "harness=dsh" >> "$GITHUB_OUTPUT"
+              echo "model=deepseek-official/deepseek-flash" >> "$GITHUB_OUTPUT"
+              # 预选一个免费兜底模型（不做冒烟，仅列表查找；dsh 运行中失败时由 run 步骤改用）
+              FALLBACK_MODEL=""
+              timeout 60 opencode models opencode --refresh >/dev/null 2>&1 || true
+              while IFS= read -r m; do
+                [ -n "$m" ] || continue
+                case "$m" in
+                  "$PREFERRED_DEEPSEEK") FALLBACK_MODEL="$m"; break ;;
+                  "$PREFERRED_PICKLE") FALLBACK_MODEL="${FALLBACK_MODEL:-$m}" ;;
+                esac
+              done < <(timeout 60 opencode models 2>/dev/null | awk '/^[[:space:]]*opencode\//{print $1}')
+              [ -n "$FALLBACK_MODEL" ] || FALLBACK_MODEL="$PREFERRED_DEEPSEEK"
+              echo "fallback_model=$FALLBACK_MODEL" >> "$GITHUB_OUTPUT"
+              echo "[harness] 预选 opencode 兜底模型：$FALLBACK_MODEL"
+              exit 0
+            fi
+            echo "[harness] dsh 冒烟测试失败（API key / 网络 / 配额），改用 opencode 兜底："
+            tail -n 15 /tmp/dsh_smoke_test.log 2>/dev/null || true
+          else
+            if ! command -v dsh >/dev/null 2>&1; then
+              echo "[harness] dsh 未安装，改用 opencode 兜底"
+            else
+              echo "[harness] DEEPSEEK_API_KEY 未配置，dsh 无法调用官方 API，改用 opencode 兜底"
+            fi
+          fi
+          echo "harness=opencode" >> "$GITHUB_OUTPUT"
 
           KNOWN_FREE=(
             "opencode/beam-free"
@@ -345,7 +402,7 @@ jobs:
           echo "model=$SELECTED" >> "$GITHUB_OUTPUT"
           echo "[model] 最终选择：$SELECTED"
 
-      - name: Run OpenCode on issue
+      - name: Run AI harness on issue
         id: run
         continue-on-error: true
         shell: bash
@@ -353,7 +410,9 @@ jobs:
         # 给 publish/resume/comment/close 等收尾步骤留约 20 分钟。
         timeout-minutes: 290
         env:
+          HARNESS: ${{ steps.select.outputs.harness }}
           MODEL: ${{ steps.select.outputs.model }}
+          FALLBACK_MODEL: ${{ steps.select.outputs.fallback_model }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
           ISSUE_BODY: ${{ github.event.issue.body }}
         run: |
@@ -377,13 +436,40 @@ jobs:
           } > /tmp/opencode-prompt.txt
 
           PROMPT="$(cat /tmp/opencode-prompt.txt)"
-          echo "[opencode] model=$MODEL issue=#$ISSUE_NUMBER"
           # 280 分钟（16800s）硬超时：比步骤上限 290 分钟留 10 分钟余量；
-          # --kill-after=120 给 opencode 更充分的优雅退出时间。
-          timeout --kill-after=120 16800 opencode run --auto -m "$MODEL" "$PROMPT" 2>&1 | tee "$LOG"
-          EC=${PIPESTATUS[0]}
+          # --kill-after=120 给 agent 更充分的优雅退出时间。
+          USED_HARNESS="${HARNESS:-opencode}"
+          if [ "$USED_HARNESS" = "dsh" ]; then
+            # 主 harness：DeepSeek Harness + DeepSeek 官方 API（deepseek-flash）
+            echo "[run] harness=dsh | model=$MODEL | issue=#$ISSUE_NUMBER"
+            timeout --kill-after=120 16800 dsh --profile headless "$PROMPT" 2>&1 | tee "$LOG"
+            EC=${PIPESTATUS[0]}
+            # dsh 失败（非超时）且剩余时间充足 → 自动改用 opencode 免费模型兜底重跑
+            if [ "$EC" -ne 0 ] && [ "$EC" -ne 124 ] && [ "$EC" -ne 137 ] && [ "$EC" -ne 143 ]; then
+              OC_BUDGET=$(( 16800 - SECONDS - 600 ))
+              if [ -n "${FALLBACK_MODEL:-}" ] && [ "$OC_BUDGET" -gt 600 ]; then
+                echo "[run][warn] dsh 失败 (exit=$EC)，剩余 ${OC_BUDGET}s，改用 opencode 兜底重跑（model=$FALLBACK_MODEL）"
+                timeout --kill-after=120 "$OC_BUDGET" opencode run --auto -m "$FALLBACK_MODEL" "$PROMPT" 2>&1 | tee -a "$LOG"
+                EC2=${PIPESTATUS[0]}
+                if [ "$EC2" -eq 0 ]; then
+                  EC=0
+                  USED_HARNESS="opencode"
+                else
+                  echo "[run][warn] opencode 兜底也失败 (exit=$EC2)，以失败结果为准"
+                fi
+              else
+                echo "[run][warn] dsh 失败 (exit=$EC)，但无兜底模型或剩余时间不足，放弃 opencode 重试"
+              fi
+            fi
+          else
+            # 兜底 harness：opencode（Zen 免费模型池）
+            echo "[opencode] model=$MODEL issue=#$ISSUE_NUMBER"
+            timeout --kill-after=120 16800 opencode run --auto -m "$MODEL" "$PROMPT" 2>&1 | tee "$LOG"
+            EC=${PIPESTATUS[0]}
+          fi
+          echo "used_harness=$USED_HARNESS" >> "$GITHUB_OUTPUT"
           echo "exit_code=$EC" >> "$GITHUB_OUTPUT"
-          echo "[opencode] exit=$EC"
+          echo "[run] harness=$USED_HARNESS exit=$EC"
           exit 0
 
       - name: Commit and push to default branch
@@ -400,6 +486,7 @@ jobs:
           # 因此涉及 workflow 文件的提交必须改用 PUSH_TOKEN 推送。
           PUSH_TOKEN: ${{ secrets.PUSH_TOKEN }}
           MODEL: ${{ steps.select.outputs.model }}
+          USED_HARNESS: ${{ steps.run.outputs.used_harness }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
           ISSUE_TITLE: ${{ github.event.issue.title }}
           BASE_BRANCH: ${{ github.event.repository.default_branch }}
@@ -429,9 +516,11 @@ jobs:
             else
               SAFE_TITLE="${ISSUE_TITLE//$'\n'/ }"
               SAFE_TITLE="${SAFE_TITLE:0:80}"
-              git commit -m "opencode: issue #${ISSUE_NUMBER} ${SAFE_TITLE}" \
-                         -m "Model: ${MODEL}" \
-                         -m "Generated by OpenCode in GitHub Actions."
+              AGENT_TAG="opencode"
+              if [ "${USED_HARNESS:-}" = "dsh" ]; then AGENT_TAG="dsh"; fi
+              git commit -m "${AGENT_TAG}: issue #${ISSUE_NUMBER} ${SAFE_TITLE}" \
+                         -m "Harness: ${USED_HARNESS:-unknown} | Model: ${MODEL}" \
+                         -m "Generated by ${AGENT_TAG} in GitHub Actions."
             fi
           fi
 
@@ -577,7 +666,9 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
           SELECT_OUTCOME: ${{ steps.select.outcome }}
+          SELECT_HARNESS: ${{ steps.select.outputs.harness }}
           SELECT_MODEL: ${{ steps.select.outputs.model }}
+          USED_HARNESS: ${{ steps.run.outputs.used_harness }}
           RUN_OUTCOME: ${{ steps.run.outcome }}
           RUN_EXIT: ${{ steps.run.outputs.exit_code }}
           PUBLISH_OUTCOME: ${{ steps.publish.outcome }}
@@ -596,18 +687,19 @@ jobs:
           COMMENT=/tmp/opencode-comment.md
 
           {
-            echo "## OpenCode 运行结果"
+            echo "## Issue Agent 运行结果"
             echo
+            echo "- Harness：\`${SELECT_HARNESS:-unknown}\`（实际执行：\`${USED_HARNESS:-unknown}\`）"
             echo "- 模型：\`${SELECT_MODEL:-未选择}\`"
             echo "- Actions 日志：${RUN_URL}"
             echo
 
             if [ "$SELECT_OUTCOME" != "success" ]; then
-              echo "❌ 模型选择失败：没有找到可用的免费模型。"
+              echo "❌ 模型选择失败：dsh 与 opencode 兜底均不可用。"
             elif [ "$RUN_OUTCOME" != "success" ] || [ "${RUN_EXIT:-}" != "0" ]; then
-              echo "❌ OpenCode 执行失败（exit=${RUN_EXIT:-unknown}）。"
+              echo "❌ Agent 执行失败（exit=${RUN_EXIT:-unknown}）。"
             elif [ "$PUBLISH_OUTCOME" != "success" ]; then
-              echo "❌ OpenCode 已执行，但提交或推送失败。"
+              echo "❌ Agent 已执行，但提交或推送失败。"
             elif [ "$PUBLISH_CHANGED" = "true" ] && [ -n "${COMMIT_SHA:-}" ]; then
               echo "✅ 已直接推送到 \`${BASE_BRANCH}\`："
               echo
@@ -615,7 +707,7 @@ jobs:
             elif [ "$PUBLISH_CHANGED" = "true" ]; then
               echo "✅ 已推送到 \`${BASE_BRANCH}\`，但未能获取 commit SHA，请查看 Actions 日志。"
             else
-              echo "ℹ️ OpenCode 已执行，但没有产生代码修改。"
+              echo "ℹ️ Agent 已执行，但没有产生代码修改。"
             fi
 
             echo
@@ -635,7 +727,7 @@ jobs:
 
             echo
             if [ -s /tmp/opencode-run.log ]; then
-              echo "<details><summary>OpenCode 输出（末尾 120 行）</summary>"
+              echo "<details><summary>Agent 输出（末尾 120 行）</summary>"
               echo
               echo '````text'
               tail -n 120 /tmp/opencode-run.log | head -c 50000
