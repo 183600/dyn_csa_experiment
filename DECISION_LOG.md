@@ -3868,3 +3868,78 @@ attrition 是独立配对保留模型，成组失败或与效应相关的丢失�
 audit gate/CLI/report 接线。完整 CPU 套件（`706 passed, 3 skipped`）与
 `python audit_gates.py interaction_power`、`python audit_gates.py report`
 在本轮最终树通过。
+
+## 2026-10-29 — 消融族的多重校正要利用相关性：精确符号翻转 max-T 与同时区间（本轮对比/消融方法硬化，no new runs）
+
+零 GPU；不新增训练、不读取 test split、不修改冻结清单字节/种子/端点/
+alpha/Holm 规则，也不改 `CODE_SEMANTICS`；`.github/` 与所有 README 未触碰。
+
+**Problem.** 消融表的多重校正只有 Holm step-down。Holm 合法，但它把每条
+对比当成独立证据：`m` 条共享同一参照臂、同一组种子、同一批评测行的对比，
+其逐种子配对差高度相关，Holm 仍对最小 p 乘 `m`，在强相关族上系统性
+过度保守。反过来，若事后改用更宽松的校正、只报显著项，又等于用未预注册的
+门槛替代 Holm。两种误读都需要一个可复核的中间读数：在不改变声明校正的
+前提下，说明「Holm 在这个相关族上保守了多少」，并给出整族同时可读的区间。
+
+**Fix.** 新增 `exp_lib.maxt_signflip_adjust`：在既有逐对比精确符号翻转的
+同一个零假设下（配对差关于 0 对称、各种子符号独立等概率），枚举全部
+`2**n` 个符号指派，得到**整族** max-T 的精确联合零分布；学生化用的
+`sd_k` 在符号翻转下不变，所以这不是近似。按观测 `T` 从大到小做
+Westfall-Young free step-down，调整 p 额外要求 `>=` 自身未调整 p 并
+单调化；族最大值零分布的 `1-alpha` 分位点给出 `mean ± c*sd/sqrt(n)` 的
+同时区间；该区间是 studentised 的 t 型近似（p 值精确，区间不是精确反演），
+并显式返回临界值处的 `ci_tail_level`（n=5 时最小可达双侧尾概率
+2/32=0.0625，达不到 95%，返回 `ci_simultaneous=None` 而不是把 93.75%
+标成 95%）。
+
+新增 `exp_lib.maxt_min_n_for_alpha`：给出最佳情形（完全相关对比）的种子
+下限，alpha=0.05 时为 6（2/64），与 Holm 在 m=5 时的 8 并列显示；文件明确
+标注这是乐观下界，独立对比会趋近 Holm 的 m*2/2**n。
+
+新增 `exp_lib.maxt_joint_correction`：按精确种子集合分组，只接受完整、
+受控的配对；`family_ready` 要求 `m_eligible == m_family` 且只有一个
+种子组，否则 `status='subset_only'`，保留描述性 `p_maxt` 但
+`significant_maxt=False`、`maxt_only` 为空——「跑完的对比越少、校正越宽」
+正是要堵住的反方向。`n>20` 拒绝（不 Monte-Carlo 冒充精确）；零种子方差
+且非零均值的退化对比整族 `not_estimable`，不制造 p。
+
+**Wiring.** `methodology_audit` 在既有 `_holm_assign` 之后，把
+`components` + `baselines` 的完整受控对比放进同一个 `m_family`，每个
+entry 写 `p_maxt` / `p_maxt_single` / `p_raw_signflip_maxt` / `t_maxt` /
+`maxt_rank` / `reject_maxt` / `significant_maxt` / `ci_simultaneous` /
+`maxt_group`；`report['family']['maxt']` 汇总 `status`、`family_ready`、
+`m_eligible`、`n_groups`、`best_case`、逐组 `critical_value`/
+`ci_tail_level`/`ci_method`/`p_floor_single`/`deltas_fp`/`contrasts`、`n_holm_reject`/`n_maxt_reject`、
+`holm_only`/`maxt_only` 与 warnings；顶层增加 `maxt_only_contrasts` /
+`holm_only_contrasts` / `*_pairs`。`verified_components` 仍只由
+`p_holm_global` 决定，`significant_maxt` 不进入
+`_classify_group_status`；max-T 多拒绝时只写 warning，明说这是
+「Holm 保守」的敏感度读数，要变成主张必须下一轮预注册 max-t。
+
+新增 `audit_gates.py joint_correction [OUTDIR...]`（别名 `joint` / `maxt` /
+`max_t`）：从落盘 `methodology_audit.json` 的逐种子 deltas 重算整族
+max-T，逐项核对 `p_maxt`、`p_maxt_single`、原始 p、rank、reject、
+同时区间、组号、单调性与 `holm_only`/`maxt_only`；缺 `family.maxt` 的
+legacy 产物 `not_verifiable`，篡改判 `fail`。`audit_gates.py report` 增加
+顶层 `joint_correction`，`audit_methodology` 的逐面板输出带
+`joint_correction` / `maxt_only_contrasts` / `holm_only_contrasts`。
+
+**Boundary.** 这是同一数据的第二个多重校正读数，不是新检验、不是新实验；
+不改变任何 p/Holm/`verified`/`ablation_complete`/冻结判定，也不进入冻结
+确认族。其有效性与逐对比符号翻转相同（配对内交换性：同数据顺序、同评测
+行、同腐坏网格；初始化 RNG 按种子播种），不修复不满足交换性的面板，也
+不把种子变成随机总体抽样。它不解决选择偏差、optional stopping（
+`look_history` 的序列校正仍独立适用）或评测单位不确定性（两层
+bootstrap/document-cluster 仍回答「换文档会怎样」）。`family_ready` 依赖
+声明族本身；看结果后扩大族仍是 forking path，max-T 不能修复。
+`ci_tail_level` 低于请求水平时不给有限区间。
+
+**Verification.** 新增 `test_review_part_30.py` 11 项：m=1 与
+`exact_signflip_p` 逐值对账（n=3..8）、p_floor/区间/排名；两条完全相关
+对比下 max-T 拒绝而 Holm 不拒绝（n=6 时 .03125 vs .0625）；整体缩放、重复调用与名称序颠倒（并列 t 的确定性）的不变性；缺臂族 `subset_only` 且
+`significant_maxt=False`；完整族写入但不提升 `verified`；多种子集合分组
+与 excluded/退化对比的 fail-closed；空/不齐/布尔/NaN/n<2/超上限/小数上限/小数族大小/零方差/
+非法 alpha 全部拒绝；极端量级 1e308/1e-300 与常数量级 p/t 一致；audit gate 干净产物 ok、篡改 p/区间/rank/
+`family_ready`/`maxt_only`/`p_maxt_single` 判 fail、legacy 只 warn、
+无产物 `not_verifiable_locally`，以及 CLI 别名接线。完整 CPU 套件在本轮
+最终树通过。

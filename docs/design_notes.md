@@ -6932,3 +6932,169 @@ python -m explib.confirmation plan     # 冻结计划预检不变
 PPL 整体缩放不变性、缺 cell/长度不齐/非法 PPL/非法参数的 fail-closed、
 attrition 的可选接线与完整覆盖语义，以及 audit gate/CLI/report/design preflight 接线。
 完整 CPU 套件（`706 passed, 3 skipped`）在本轮最终树通过。
+
+## 92. 消融族的 Holms 不是唯一读法：精确符号翻转 max-T 与同时区间（本轮对比/消融方法硬化）
+
+### 92.1 问题：Holm 把相关对比当成独立证据
+
+留一消融表里的对比并不是相互独立的研究。多条对比共享同一个参照臂
+（例如所有 `csa_*` 都对照 `csa_fixed` / `csa_dynamic`）、同一组种子、
+同一批评测行，因此逐种子的配对差高度相关。Holm 仍然对最小的 p 乘上
+整个声明族的大小 `m`：这是合法的 FWER 控制，但当 `m` 条对比实际上
+「同向同动」时，它把一份证据重复罚了 `m` 次，导致面板的可检出效应被
+系统性低估。
+
+这里有两个相反的误读需要同时堵住：
+
+1. **把 max-T 当成新证据。** 如果事后换用更宽松的校正，只报告
+   max-T 显著的对比，这等于用更弱的门槛替代预注册的 Holm，是典型的
+   forking path。
+2. **把 Holm 的不显著当成「模块无用」。** Holm 在强相关族上过度保守，
+   `p_holm > alpha` 可能只说明它没有利用相关性，不说明效应不存在。
+
+因此本节只增加一个**同一组逐种子差值的相关性感知读数**：精确
+Westfall-Young free step-down max-T，加上同时置信区间。它不改变
+`p_holm`、`verified`、`ablation_complete` 或任何冻结判定。
+
+### 92.2 方法：在同一个符号翻转零分布上取 family maximum
+
+零假设与既有逐对比精确检验完全相同：每个种子下的配对差关于 0 对称，
+各种子的符号独立等概率。于是全部 `2**n` 个符号指派给出**整族对比向量**
+的联合零分布，而不只是单条对比的零分布。
+
+设第 `k` 条对比的逐种子差为 `d_{k,i}`，`i=1..n`，统计量
+
+```
+T_k = |mean_i d_{k,i}| / (sd_k / sqrt(n))
+     = |sum_i d_{k,i}| / (sd_k * sqrt(n))
+```
+
+在符号翻转下 `|d_{k,i}|` 不变，所以 `sd_k` 是**翻转不变量**；用观测 SD
+做学生化不改变枚举中的排序，也不引入近似。对每个符号指派计算
+`max_j T*_j`，得到族最大值的精确零分布。free step-down 按观测 `T` 从大到小
+排序，第 `r` 位的调整 p 为
+
+```
+p_(r) = max( p_(r-1), P(max_{j>=r} T*_j >= T_(r)), P(T*_(r) >= T_(r)) )
+```
+
+最后一项保证「调整 p 不小于自身未调整 p」；单调化保证 step-down 向量
+可读。`m=1` 时它与既有 `exact_signflip_p` 逐值相同（已由测试对账）。
+
+**设计期读数。** `maxt_min_n_for_alpha(alpha)` 给出「完全相关」这一最佳
+情形下达到 `alpha` 所需的最少种子：`alpha=0.05` 时为 6（`2/64=0.03125`），
+而 Holm 在 `m=5` 时需 8。这个 6 是**乐观下界**，不是任何面板都会达到：
+独立对比的 max-T 会趋近 Holm 的 `m*2/2**n`。因此 `family.maxt.best_case`
+与既有 `min_seeds_for_family_significance`（Holm）并列显示，不能只引用
+最佳情形。
+
+**同时区间（t 型近似，不是精确反演）。** 族最大值零分布的 `1-alpha`
+分位点 `c` 给出 `mean_k ± c * sd_k/sqrt(n)` 的 studentised 区间，作为整族
+同时阅读的近似。`p_maxt` 在符号对称零假设下是精确的，但这个
+`mean ± c*se` 区间不是多维符号翻转检验的精确反演：它沿用仓库既有 t 区间
+的 studentised 形式，只是把乘数换成了精确的 max-T 临界值。因此返回
+`ci_tail_level`（该临界值处的精确零分布尾质量）而不是宣称它等于覆盖
+概率；n=5 时最小可达双侧尾概率是 `2/32=0.0625`，达不到 95%，此时函数
+返回 `ci_simultaneous=None` 与 `ci_tail_level`，而不是把 93.75% 标成
+95%。
+
+### 92.3 「family-ready」是硬前提，不是注释
+
+max-T 只有在**整个声明族**都能进入同一个 `n x m` 矩阵时才是族级校正。
+任何一条对比缺臂、丢种子、不是受控配对，都会让 `m_eligible < m_family`。
+此时仍在已完成的子集上计算并保留 `p_maxt`（描述性），但：
+
+- `family_ready=False`，`status='subset_only'`；
+- 每个对比的 `significant_maxt=False`；
+- `maxt_only_contrasts` 为空；
+- 报告 warning 明说「这不是 Holm 的替代」。
+
+这防止「跑完的对比越少、max-T 越宽松」的选择性偏差：如果允许用幸存
+子集做校正，那么丢臂反而会提高显著性，正好与正确方向相反。不同种子集合
+的对比也分组计算，不跨种子集合拼一个联合零分布。
+
+**枚举上限。** `n > 20` 直接拒绝（`2**21` 起枚举成本与内存不再适合
+常规分析），调用方继续用 Holm；不做 Monte-Carlo 近似冒充实精确。
+**退化对比。** 零种子方差 + 非零均值的学生化 `T` 是无穷大，会让族最大值
+退化；整族报 `not_estimable`，不制造 p。全零差值（零方差且零均值）仍是
+合法的 `T=0`。
+
+### 92.4 接线：只增加读数，不改变判定
+
+`exp_lib.maxt_signflip_adjust(named_deltas)` 是纯函数；`maxt_joint_correction(records)`
+负责按种子集合分组、标记 excluded、计算 `family_ready`。`methodology_audit`
+在既有 `_holm_assign` 之后，把 `components` + `baselines` 的完整受控对比
+放进同一个声明族 `m_family`，并为每个 entry 写：
+
+- `p_maxt` / `p_maxt_single` / `p_raw_signflip_maxt` / `t_maxt` / `maxt_rank`
+- `ci_simultaneous`（同时区间）
+- `reject_maxt` 与 `significant_maxt`（后者还要求 `family_ready`）
+- `maxt_group` / `maxt_family_ready` / `maxt_status`
+
+`report['family']['maxt']` 汇总 `status`、`family_ready`、`m_eligible`、
+`n_groups`、`best_case`（`maxt_min_n_for_alpha` 的最佳情形种子下限与
+p floor）、`groups`（逐组的 `critical_value` / `ci_tail_level` /
+`ci_method` / `p_floor_single` / `deltas_fp` / `contrasts`）、`n_holm_reject` / `n_maxt_reject`、
+`holm_only` / `maxt_only` 与 warnings。顶层另有 `maxt_only_contrasts` /
+`holm_only_contrasts` 及可读的 `*_pairs`。
+
+**判定不变。** `verified_components` 仍只由 `p_holm_global` 与既有
+`within_seed_noise`/受控/完整配对条件决定；`significant_maxt` 不进入
+`_classify_group_status`。如果 max-T 比 Holm 多拒绝，报告写明确 warning：
+这是「Holm 在本族上保守」的敏感度读数，**不是确认的消融结果**；要把它
+变成主张，必须在下一轮预注册 `max-t` 作为族校正（当前冻结清单仍写
+Holm，不能事后替换）。
+
+`audit_gates.py joint_correction`（别名 `joint` / `maxt` / `max_t`）从落盘
+`methodology_audit.json` 的逐种子 deltas 重算整族 max-T，逐项核对
+`p_maxt`、`p_maxt_single`、原始 p、rank、reject、同时区间、组号、单调性
+与 `holm_only`/`maxt_only`。缺 `family.maxt` 的 legacy 产物
+`not_verifiable`，篡改判 `fail`。`audit_gates.py report` 增加顶层
+`joint_correction` 块，`audit_methodology` 的逐面板输出也带
+`joint_correction` / `maxt_only_contrasts` / `holm_only_contrasts`。
+
+### 92.5 边界
+
+- **这是同一数据的第二个多重校正读数，不是新检验、不是新实验。** 没有
+  新训练、没有新种子、不读 test split、不改 `confirmation_frozen*.json`、
+  `CODE_SEMANTICS`、alpha、端点、Holm 规则或任何冻结 p/判定。
+- **max-T 的有效性与逐对比符号翻转相同**：依赖配对内交换性（同数据
+  顺序、同评测行、同腐坏网格；初始化 RNG 按种子播种）。它不修复不满足
+  交换性的面板，也不把种子变成随机总体抽样。
+- **它没有解决选择偏差或 optional stopping。** `look_history` 的序列
+  校正仍独立适用；max-T 只是给定最终 `n` 与声明族后的相关性感知读数。
+  两者不能互相替代。
+- **它不替代评测单位不确定性。** seed × unit 两层 bootstrap、
+  document-cluster CI 与 `paired_nll_unit_influence` 仍回答「换文档会
+  怎样」；max-T 只在 seed 层回答「整族同时看」。
+- **family-ready 依赖「声明族」本身。** 如果声明族是在看结果后扩大的，
+  再精确的 max-T 也不能修复 forking path；`ABLATION_DESIGN` 的族选择
+  仍由设计门与 decision log 负责。
+- **n>20 不近似。** 拒绝而不是给一个可能被误读为精确的 Monte-Carlo p。
+- **同时区间是 t 型近似。** `ci_tail_level` 是临界值处的精确零分布尾
+  质量，不是 t 区间的覆盖证明；低于请求水平时不给有限区间，任何情况下
+  都不能把 `[mean ± c*se]` 写成精确的 95% 置信区间。精确的多维符号翻转
+  反演没有实现，这是本读数的明确剩余近似。
+
+### 92.6 入口与验证
+
+```bash
+python -m pytest -q test_review_part_30.py
+python audit_gates.py joint_correction            # 默认扫描 results_*/methodology_audit.json
+python audit_gates.py joint_correction OUTDIR ... # 指定面板
+python audit_gates.py maxt                        # 别名
+python audit_gates.py report                      # 顶层 joint_correction
+python -m explib.confirmation plan                # 冻结计划预检不变
+```
+
+`test_review_part_30.py` 11 项覆盖：m=1 与 `exact_signflip_p` 逐值对账
+（n=3..8）、`p_floor_single` 与同时区间的定义；两条完全相关对比下
+max-T 拒绝而 Holm 不拒绝；整体缩放/重复调用/名称序颠倒（并列 t 的确定性）不变性；最佳情形种子下限
+`maxt_min_n_for_alpha`（含 0.25/0.5 的精确幂次边界）与超枚举上限标记；缺臂族 `subset_only` 且
+`significant_maxt=False`；完整族写入但不提升 `verified`；多种子集合分组、
+excluded 与退化对比的 fail-closed；空/不齐/布尔/NaN/n<2/超上限/小数上限/
+小数族大小/零方差/非法 alpha 全部拒绝；极端量级（1e308/1e-300）的
+p/t 与常数量级一致；audit gate 干净产物 `ok`、篡改 p/区间/rank/
+`family_ready`/`maxt_only`/`p_maxt_single`/`deltas_fp` 判 `fail`、legacy
+只 `warn`、无产物 `not_verifiable_locally`，以及 CLI 别名接线。完整 CPU
+套件（`720 passed, 3 skipped`）在本轮最终树通过。

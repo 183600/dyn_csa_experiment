@@ -452,6 +452,142 @@ for _iw in report['interactions'].get('warnings') or []:
 
 report['family'] = {'name': ('ABLATION_DESIGN+BASELINE_DESIGN' if _scoped_baselines else 'ABLATION_DESIGN') + ' (exploratory; not pre-registered)', 'declared_contrasts': int(declared_m), 'effective_m': int(m_family), 'alpha': float(alpha), 'min_seeds_for_family_significance': signflip_min_n_for_holm(m_family, alpha), 'note': 'Holm step-down over every declared contrast; missing arms keep their slot (dummy p=1). A panel below min_seeds_for_family_significance is resolution-limited, however large the observed effect.'}
 
+# ---- correlation-aware joint (max-T) reading of the same family ---------
+# Holm is the declared correction.  The contrasts in an ablation table share
+# reference arms, seeds and evaluation rows, so their deltas are correlated;
+# an exact sign-flip max-T step-down uses that joint null and is generally
+# more powerful than Holm for the same FWER.  It is computed here only when
+# every declared contrast is a complete controlled pair on ONE seed set, so a
+# partial panel cannot silently replace Holm's m with the smaller number of
+# contrasts that finished.  Nothing below changes p_holm, the declared
+# correction, `verified`, or any frozen decision.
+_joint_records = {}
+_joint_entries = {}
+for _jk_kind, _jk_group in (('component', comp_entries), ('baseline', base_entries)):
+    for _jk_comp, _jk_entries in _jk_group.items():
+        for _jk_i, _jk_e in enumerate(_jk_entries):
+            _jk_key = '%s::%s::%d' % (_jk_kind, _jk_comp, _jk_i)
+            _jk_ok = bool(_jk_e.get('controlled') and _jk_e.get('fully_paired')
+                          and _jk_e.get('deltas')
+                          and int(_jk_e.get('n') or 0) >= 2)
+            if _jk_ok:
+                _jk_reason = None
+            elif not _jk_e.get('controlled'):
+                _jk_reason = 'no controlled paired delta'
+            elif not _jk_e.get('fully_paired'):
+                _jk_reason = 'incomplete paired coverage'
+            elif not _jk_e.get('deltas'):
+                _jk_reason = 'no per-seed deltas recorded'
+            else:
+                _jk_reason = 'fewer than 2 paired seeds'
+            _joint_records[_jk_key] = {
+                'deltas': list(_jk_e.get('deltas') or []),
+                'seeds': list(_jk_e.get('seeds') or []),
+                'eligible': _jk_ok,
+                'reason': _jk_reason,
+            }
+            _joint_entries[_jk_key] = _jk_e
+if int(m_family) > 0:
+    _joint = maxt_joint_correction(_joint_records, alpha=alpha,
+                                   family_size=m_family)
+else:
+    _joint = {
+        'status': 'not_applicable', 'method': None, 'family_ready': False,
+        'm_eligible': 0, 'family_size': 0, 'n_groups': 0, 'by_key': {},
+        'excluded': {}, 'role': None,
+        'warnings': ['no declared ablation/baseline contrast'],
+    }
+for _jk_key, _jk_entry in _joint_entries.items():
+    _jk_rec = (_joint.get('by_key') or {}).get(_jk_key)
+    if _jk_rec and _jk_rec.get('status') == 'ok':
+        _jk_entry['p_maxt'] = _jk_rec['p_maxt']
+        _jk_entry['p_maxt_single'] = _jk_rec['p_maxt_single']
+        _jk_entry['p_raw_signflip_maxt'] = _jk_rec['p_raw_signflip']
+        _jk_entry['t_maxt'] = _jk_rec['t_stat']
+        _jk_entry['maxt_rank'] = _jk_rec['rank']
+        _jk_entry['reject_maxt'] = _jk_rec['reject_maxt']
+        _jk_entry['significant_maxt'] = bool(
+            _jk_rec['reject_maxt'] and _joint.get('family_ready'))
+        _jk_entry['ci_simultaneous'] = _jk_rec['ci_simultaneous']
+        _jk_entry['maxt_group'] = _jk_rec['group']
+        _jk_entry['maxt_family_ready'] = bool(_joint.get('family_ready'))
+        _jk_entry['maxt_status'] = _joint.get('status')
+    else:
+        _jk_entry['p_maxt'] = None
+        _jk_entry['reject_maxt'] = False
+        _jk_entry['significant_maxt'] = False
+        _jk_entry['maxt_family_ready'] = bool(_joint.get('family_ready'))
+        _jk_entry['maxt_status'] = (
+            (_jk_rec or {}).get('status')
+            or ('not_eligible' if _jk_key in (_joint.get('excluded') or {})
+                else 'not_computed'))
+        if _jk_key in (_joint.get('excluded') or {}):
+            _jk_entry['maxt_excluded_reason'] = _joint['excluded'][_jk_key]
+_joint_holm_only = sorted(
+    _jk_key for _jk_key, _jk_e in _joint_entries.items()
+    if _jk_e.get('significant_global') and not _jk_e.get('reject_maxt'))
+_joint_maxt_only = sorted(
+    _jk_key for _jk_key, _jk_e in _joint_entries.items()
+    if _jk_e.get('significant_maxt') and not _jk_e.get('significant_global'))
+report['family']['maxt'] = {
+    'status': _joint.get('status'),
+    'method': _joint.get('method'),
+    'family_ready': bool(_joint.get('family_ready')),
+    'm_eligible': _joint.get('m_eligible'),
+    'family_size': _joint.get('family_size'),
+    'n_groups': _joint.get('n_groups'),
+    'alpha': float(alpha),
+    'best_case': maxt_min_n_for_alpha(alpha),
+    'role': _joint.get('role'),
+    'n_maxt_reject': sum(1 for _r in (_joint.get('by_key') or {}).values()
+                         if _r.get('reject_maxt')),
+    'n_maxt_significant': sum(1 for _e in _joint_entries.values()
+                              if _e.get('significant_maxt')),
+    'n_holm_reject': sum(1 for _e in _joint_entries.values()
+                         if _e.get('significant_global')),
+    'holm_only': _joint_holm_only,
+    'maxt_only': _joint_maxt_only,
+    'groups': _joint.get('groups'),
+    'excluded': _joint.get('excluded'),
+    'warnings': _joint.get('warnings'),
+    'note': ('max-T is a correlation-aware sensitivity readout of the same '
+             'per-seed deltas; Holm remains the declared correction and a '
+             'max-T-only rejection is NOT promoted to `verified`'),
+}
+report['maxt_only_contrasts'] = _joint_maxt_only
+report['holm_only_contrasts'] = _joint_holm_only
+report['maxt_only_pairs'] = [
+    '%s - %s (%s)' % ((_joint_entries[_k].get('with') or '?'),
+                      (_joint_entries[_k].get('without') or '?'),
+                      _joint_entries[_k].get('kind') or '?')
+    for _k in _joint_maxt_only]
+report['holm_only_pairs'] = [
+    '%s - %s (%s)' % ((_joint_entries[_k].get('with') or '?'),
+                      (_joint_entries[_k].get('without') or '?'),
+                      _joint_entries[_k].get('kind') or '?')
+    for _k in _joint_holm_only]
+if _joint.get('family_ready') and _joint_maxt_only:
+    report['warnings'].append(
+        'the exact max-T family rejects %d contrast(s) that Holm does not '
+        '(%s): the declared Holm reading is conservative for this correlated '
+        'family, but a max-T-only rejection is a sensitivity readout, not a '
+        'confirmed ablation result — pre-register max-t as the correction '
+        'before using it for a claim'
+        % (len(_joint_maxt_only), ', '.join(_joint_maxt_only[:3])))
+elif _joint_holm_only:
+    report['warnings'].append(
+        'Holm rejects %d contrast(s) that the max-T readout does not (%s); '
+        'this can happen when the complete family spans several seed sets or '
+        'a degenerate contrast is excluded — inspect the group table before '
+        'quoting either correction'
+        % (len(_joint_holm_only), ', '.join(_joint_holm_only[:3])))
+if not _joint.get('family_ready'):
+    report['warnings'].append(
+        'the correlation-aware max-T correction is not family-ready '
+        '(%s); no max-T p is promoted and Holm remains the only correction '
+        'over the declared family'
+        % ((_joint.get('warnings') or ['family incomplete'])[0]))
+
 def _publish(group_name, design_group, entries_by_comp, meta, kind, require_param_match):
     status_names = ('verified', 'system_level_only', 'direction_conflict', 'direction_unspecified', 'equivalent', 'sub_sesoi', 'practically_indeterminate', 'measured', 'significant', 'nominally_significant', 'resolution_limited', 'underpowered', 'noise_level', 'unverified')
     lists = {s: [] for s in status_names}

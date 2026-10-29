@@ -81,6 +81,13 @@ def audit_methodology(outdirs=None, design=None, alpha=0.05, min_n=3, write=True
                 (rep.get('interactions') or {}).get('significant_interactions')),
             'interaction_direction_conflicts': (
                 (rep.get('interactions') or {}).get('direction_conflict_interactions')),
+            # Correlation-aware joint reading of the same ablation family.
+            # It never changes Holm/verified; surface it at panel level so a
+            # reader can see when Holm was much more conservative than the
+            # exact max-T correction, and why (family not ready vs ready).
+            'joint_correction': (rep.get('family') or {}).get('maxt'),
+            'maxt_only_contrasts': rep.get('maxt_only_contrasts'),
+            'holm_only_contrasts': rep.get('holm_only_contrasts'),
             'warnings': rep.get('warnings'),
         }
         out['panels'][d] = _panel
@@ -1558,4 +1565,308 @@ def audit_release_readiness(path='RELEASES.md'):
     else:
         out['status'] = 'ok'
     print(json.dumps({k: v for k, v in out.items() if k != 'rows'}, ensure_ascii=False, indent=2))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 7f-bis) joint (max-T) correction replay: correlation-aware multiplicity
+# ---------------------------------------------------------------------------
+
+def _joint_gate_close(a, b, tol=1e-12):
+    if a is None and b is None:
+        return True
+    if a is None or b is None:
+        return False
+    try:
+        return abs(float(a) - float(b)) <= tol * max(1.0, abs(float(a)), abs(float(b)))
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def audit_joint_correction(outdirs=None, alpha=0.05):
+    """Replay the exact max-T family correction stored in methodology audits.
+
+    The per-contrast exact sign-flip test and Holm adjustment already have a
+    replay gate (``pvalue_replay``).  The correlation-aware max-T readout added
+    in this revision has its own arithmetic: it consumes the same per-seed
+    deltas, groups them by seed set, enumerates the joint sign-flip null and
+    writes ``p_maxt``/simultaneous intervals/ranks.  This gate recomputes all
+    of that from the stored deltas and refuses an artifact whose max-T numbers
+    no longer follow from them.
+
+    It checks that adjusted p is never below its own raw p or the previous
+    rank, that step-down p never exceeds the single-step p, that the
+    simultaneous interval is ``mean ± critical*se``, that ``significant_maxt``
+    is only set for a family-ready panel, and that the Holm-only / max-T-only
+    lists match the stored per-contrast verdicts.  Legacy artifacts without a
+    ``family.maxt`` block are ``not_verifiable`` (warn), never a pass.
+
+    This is arithmetic replay, not measurement provenance: it does not prove
+    the deltas came from the runs (that remains P5T's admission/freeze-lock
+    job), and it does not change p_holm or any frozen decision.
+    """
+    L = _import_exp_lib()
+    alpha = L._validated_alpha(alpha, context='audit_joint_correction alpha')
+    if isinstance(outdirs, (str, bytes, os.PathLike)):
+        outdirs = [outdirs]
+    dirs = list(outdirs) if outdirs is not None else list(_iter_result_dirs())
+    out = {'status': 'ok', 'alpha': float(alpha), 'panels': {},
+           'violations': [], 'warnings': [],
+           'note': ('replays the correlation-aware max-T readout from stored '
+                    'per-seed deltas; Holm remains the declared correction')}
+    for d in dirs:
+        _dir = _audit_artifact(d)
+        path = os.path.join(_dir, 'methodology_audit.json')
+        rep = _load(path)
+        if not rep:
+            continue
+        fam = (rep.get('family') or {}).get('maxt')
+        panel = {'status': 'ok', 'path': path, 'violations': [],
+                 'warnings': []}
+        if not isinstance(fam, dict):
+            panel['status'] = 'not_verifiable'
+            panel['warnings'].append(
+                'no family.maxt block (legacy artifact); the joint correction '
+                'was not recorded, so it cannot be replayed')
+            out['panels'][d] = panel
+            out['warnings'].extend(f'{d}: {w}' for w in panel['warnings'])
+            continue
+        records, stored = {}, {}
+        for kind in ('components', 'baselines'):
+            group = rep.get(kind)
+            if not isinstance(group, dict):
+                continue
+            prefix = 'component' if kind == 'components' else 'baseline'
+            for comp, entries in group.items():
+                if not isinstance(entries, list):
+                    continue
+                for i, e in enumerate(entries):
+                    if not isinstance(e, dict):
+                        continue
+                    key = f'{prefix}::{comp}::{i}'
+                    if e.get('maxt_status') in (None, 'not_computed'):
+                        # Entries written before this revision have no max-T
+                        # fields at all; do not invent a record for them.
+                        continue
+                    excluded_here = e.get('maxt_excluded_reason')
+                    records[key] = {
+                        'deltas': list(e.get('deltas') or []),
+                        'seeds': list(e.get('seeds') or []),
+                        'eligible': not bool(excluded_here),
+                        'reason': excluded_here,
+                    }
+                    stored[key] = e
+        if not records:
+            panel['status'] = 'not_verifiable'
+            panel['warnings'].append(
+                'the artifact has no per-entry max-T fields to replay')
+            out['panels'][d] = panel
+            out['warnings'].extend(f'{d}: {w}' for w in panel['warnings'])
+            continue
+        _fam_alpha = fam.get('alpha', alpha)
+        try:
+            _fam_alpha = L._validated_alpha(
+                _fam_alpha, context='family.maxt.alpha')
+        except Exception:
+            panel['violations'].append(
+                f'family.maxt.alpha={_fam_alpha!r} is not a probability in (0,1)')
+            _fam_alpha = alpha
+        try:
+            rec = L.maxt_joint_correction(
+                records, alpha=_fam_alpha,
+                family_size=fam.get('family_size'))
+        except Exception as exc:
+            panel['status'] = 'fail'
+            panel['violations'].append(
+                f'max-T recomputation raised {type(exc).__name__}: {exc}')
+            out['panels'][d] = panel
+            out['violations'].extend(f'{d}: {v}' for v in panel['violations'])
+            out['status'] = 'fail'
+            continue
+        panel['recomputed'] = {
+            'status': rec.get('status'),
+            'family_ready': rec.get('family_ready'),
+            'm_eligible': rec.get('m_eligible'),
+            'n_groups': rec.get('n_groups'),
+            'n_maxt_reject': sum(1 for r in (rec.get('by_key') or {}).values()
+                                 if r.get('reject_maxt')),
+        }
+        if str(fam.get('status')) != str(rec.get('status')):
+            panel['violations'].append(
+                f"stored max-T status {fam.get('status')!r} != recomputed "
+                f"{rec.get('status')!r}")
+        if bool(fam.get('family_ready')) != bool(rec.get('family_ready')):
+            panel['violations'].append(
+                f"stored family_ready={fam.get('family_ready')!r} != "
+                f"recomputed {rec.get('family_ready')!r}")
+        if fam.get('m_eligible') != rec.get('m_eligible'):
+            panel['violations'].append(
+                f"stored m_eligible={fam.get('m_eligible')!r} != "
+                f"recomputed {rec.get('m_eligible')!r}")
+        _want_best = L.maxt_min_n_for_alpha(_fam_alpha)
+        _stored_best = fam.get('best_case') if isinstance(fam.get('best_case'), dict) else {}
+        if (_stored_best.get('min_n') != _want_best['min_n']
+                or not _joint_gate_close(_stored_best.get('p_floor'),
+                                         _want_best['p_floor'])):
+            panel['violations'].append(
+                f"stored max-T best_case {_stored_best!r} != recomputed "
+                f"{_want_best!r}")
+        by_key = rec.get('by_key') or {}
+        stored_groups = fam.get('groups') if isinstance(fam.get('groups'), dict) else {}
+        for gid in stored_groups:
+            if gid not in (rec.get('groups') or {}):
+                panel['violations'].append(
+                    f'group {gid}: the artifact stores a group that the '
+                    'recomputation does not produce')
+        for gid, g in (rec.get('groups') or {}).items():
+            sg = stored_groups.get(gid)
+            if not isinstance(sg, dict):
+                panel['violations'].append(
+                    f'group {gid}: recomputed group is missing from the stored '
+                    'group table')
+                continue
+            if sg.get('deltas_fp') != g.get('deltas_fp'):
+                panel['violations'].append(
+                    f'group {gid}: deltas_fp {sg.get("deltas_fp")!r} != '
+                    f'recomputed {g.get("deltas_fp")!r}')
+            if not _joint_gate_close(sg.get('critical_value'),
+                                     g.get('critical_value')):
+                panel['violations'].append(
+                    f'group {gid}: critical_value {sg.get("critical_value")!r} '
+                    f'!= recomputed {g.get("critical_value")!r}')
+            if not _joint_gate_close(sg.get('ci_tail_level'),
+                                     g.get('ci_tail_level')):
+                panel['violations'].append(
+                    f'group {gid}: ci_tail_level {sg.get("ci_tail_level")!r} != '
+                    f'recomputed {g.get("ci_tail_level")!r}')
+            if sg.get('n_patterns') != g.get('n_patterns'):
+                panel['violations'].append(
+                    f'group {gid}: n_patterns {sg.get("n_patterns")!r} != '
+                    f'recomputed {g.get("n_patterns")!r}')
+            if list(sg.get('contrasts') or []) != list(g.get('contrasts') or []):
+                panel['violations'].append(
+                    f'group {gid}: contrasts {sg.get("contrasts")!r} != '
+                    f'recomputed {g.get("contrasts")!r}')
+        for key, e in stored.items():
+            r = by_key.get(key)
+            if r is None:
+                if e.get('p_maxt') is not None:
+                    panel['violations'].append(
+                        f'{key}: artifact stores p_maxt={e.get("p_maxt")!r} '
+                        'but the recomputation has no such contrast')
+                continue
+            if r.get('status') != 'ok':
+                if e.get('p_maxt') is not None:
+                    panel['violations'].append(
+                        f'{key}: recomputation is {r.get("status")!r} but the '
+                        'artifact stores a max-T p')
+                continue
+            if not _joint_gate_close(e.get('p_maxt'), r.get('p_maxt')):
+                panel['violations'].append(
+                    f'{key}: p_maxt {e.get("p_maxt")!r} != recomputed '
+                    f'{r.get("p_maxt")!r}')
+            if not _joint_gate_close(e.get('p_maxt_single'), r.get('p_maxt_single')):
+                panel['violations'].append(
+                    f'{key}: p_maxt_single {e.get("p_maxt_single")!r} != '
+                    f'recomputed {r.get("p_maxt_single")!r}')
+            if not _joint_gate_close(e.get('p_raw_signflip_maxt'),
+                                     r.get('p_raw_signflip')):
+                panel['violations'].append(
+                    f'{key}: p_raw_signflip_maxt '
+                    f'{e.get("p_raw_signflip_maxt")!r} != recomputed '
+                    f'{r.get("p_raw_signflip")!r}')
+            if not _joint_gate_close(e.get('p_raw_signflip_maxt'),
+                                     e.get('p_exact_signflip')):
+                panel['violations'].append(
+                    f'{key}: the max-T raw p '
+                    f'{e.get("p_raw_signflip_maxt")!r} disagrees with the '
+                    f'panel exact sign-flip p {e.get("p_exact_signflip")!r}')
+            if e.get('maxt_rank') != r.get('rank'):
+                panel['violations'].append(
+                    f'{key}: maxt_rank {e.get("maxt_rank")!r} != '
+                    f'recomputed {r.get("rank")!r}')
+            if bool(e.get('reject_maxt')) != bool(r.get('reject_maxt')):
+                panel['violations'].append(
+                    f'{key}: reject_maxt {e.get("reject_maxt")!r} != '
+                    f'recomputed {r.get("reject_maxt")!r}')
+            want_sig = bool(r.get('reject_maxt') and rec.get('family_ready'))
+            if bool(e.get('significant_maxt')) != want_sig:
+                panel['violations'].append(
+                    f'{key}: significant_maxt {e.get("significant_maxt")!r} '
+                    f'!= reject_maxt and family_ready ({want_sig})')
+            si, ri = e.get('ci_simultaneous'), r.get('ci_simultaneous')
+            if (si is None) != (ri is None):
+                panel['violations'].append(
+                    f'{key}: ci_simultaneous presence {si!r} != {ri!r}')
+            elif si is not None:
+                if not (isinstance(si, (list, tuple)) and len(si) == 2
+                        and _joint_gate_close(si[0], ri[0], tol=1e-9)
+                        and _joint_gate_close(si[1], ri[1], tol=1e-9)):
+                    panel['violations'].append(
+                        f'{key}: ci_simultaneous {si!r} != recomputed {ri!r}')
+                _mean = e.get('mean')
+                if isinstance(_mean, (int, float)) and not isinstance(_mean, bool):
+                    if not (float(si[0]) - 1e-9 <= float(_mean) <= float(si[1]) + 1e-9):
+                        panel['violations'].append(
+                            f'{key}: the simultaneous interval does not contain '
+                            f'the contrast mean {_mean!r}')
+            if str(e.get('maxt_group')) != str(r.get('group')):
+                panel['violations'].append(
+                    f'{key}: maxt_group {e.get("maxt_group")!r} != '
+                    f'recomputed {r.get("group")!r}')
+            p_raw = e.get('p_raw_signflip_maxt')
+            p_maxt = e.get('p_maxt')
+            p_single = e.get('p_maxt_single')
+            if all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                   for v in (p_raw, p_maxt, p_single)):
+                if p_maxt + 1e-12 < p_raw:
+                    panel['violations'].append(
+                        f'{key}: p_maxt {p_maxt!r} < its own raw p {p_raw!r}')
+                if p_maxt > p_single + 1e-12:
+                    panel['violations'].append(
+                        f'{key}: step-down p_maxt {p_maxt!r} > single-step '
+                        f'{p_single!r}')
+        # Monotone adjusted p across ranks.
+        ranked = sorted(((e.get('maxt_rank'), e.get('p_maxt'))
+                         for e in stored.values()
+                         if isinstance(e.get('maxt_rank'), int)
+                         and isinstance(e.get('p_maxt'), (int, float))),
+                        key=lambda t: t[0])
+        prev = 0.0
+        for rank, pv in ranked:
+            if float(pv) + 1e-12 < prev:
+                panel['violations'].append(
+                    f'rank {rank}: p_maxt {pv!r} is smaller than the previous '
+                    f'rank {prev!r}; the step-down vector is not monotone')
+            prev = max(prev, float(pv))
+        # Holm-only / max-T-only lists must match the stored verdicts.
+        holm_sig = {k for k, e in stored.items() if e.get('significant_global')}
+        want_maxt_only = sorted(
+            k for k, e in stored.items()
+            if bool(e.get('significant_maxt')) and k not in holm_sig)
+        want_holm_only = sorted(
+            k for k, e in stored.items()
+            if k in holm_sig and not bool(e.get('reject_maxt')))
+        if list(fam.get('maxt_only') or []) != want_maxt_only:
+            panel['violations'].append(
+                f'maxt_only {fam.get("maxt_only")!r} != stored verdicts '
+                f'{want_maxt_only!r}')
+        if list(fam.get('holm_only') or []) != want_holm_only:
+            panel['violations'].append(
+                f'holm_only {fam.get("holm_only")!r} != stored verdicts '
+                f'{want_holm_only!r}')
+        if panel['violations']:
+            panel['status'] = 'fail'
+            out['violations'].extend(f'{d}: {v}' for v in panel['violations'])
+            out['status'] = 'fail'
+        out['panels'][d] = panel
+    if not out['panels']:
+        out['status'] = 'not_verifiable_locally'
+        out['note'] = ('no results_*/methodology_audit.json found — the joint '
+                       'correction cannot be replayed before a panel is '
+                       'aggregated')
+    elif out['status'] != 'fail' and out['warnings']:
+        out['status'] = 'warn'
+    print(f"[joint] status={out['status']}; panels={len(out['panels'])}; "
+          f"violations={len(out['violations'])}")
     return out
