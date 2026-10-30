@@ -71,7 +71,10 @@ def _lpd_key_int(value, name, *, minimum=None, maximum=None):
 def _lpd_number(value, name):
     if isinstance(value, bool) or not isinstance(value, (int, float, np.integer, np.floating)):
         raise ValueError(f'{name} must be a number, got {value!r}')
-    out = float(value)
+    try:
+        out = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f'{name} must be a finite number, got {value!r}') from None
     if not math.isfinite(out):
         raise ValueError(f'{name} must be finite, got {value!r}')
     return out
@@ -82,8 +85,11 @@ def _lpd_seed_map(value, name):
         raise ValueError(f'{name} must be a non-empty seed -> value mapping')
     out = {}
     for raw, val in value.items():
-        seed = _lpd_key_int(raw, f'{name} key', minimum=0,
-                            maximum=int(MAX_SEED))
+        # Seed labels are exact integer identities in this module (they are
+        # never passed to a NumPy/PyTorch RNG), so a label beyond ``MAX_SEED``
+        # is still a valid label.  Do not round-trip it through float64 or
+        # reject it merely because another subsystem's RNG range is smaller.
+        seed = _lpd_key_int(raw, f'{name} key', minimum=0)
         if seed in out:
             raise ValueError(f'{name} contains seed {seed} more than once '
                              '(JSON "0" and 0 are the same seed)')
@@ -110,7 +116,13 @@ def _lpd_parse_cell(cell, label):
             raise ValueError(f'{label}.ppl_by_seed[{seed}] must be > 0')
         if nll_s < 0.0:
             raise ValueError(f'{label}.nll_by_seed[{seed}] must be >= 0')
-        implied = nll_s / float(n_tok)
+        try:
+            n_tok_f = float(n_tok)
+        except OverflowError:
+            raise ValueError(
+                f'{label}.n_tokens_by_seed[{seed}]={n_tok!r} is outside the '
+                'representable float range') from None
+        implied = nll_s / n_tok_f
         # The record's PPL is exp(nll_sum/n_tok); a cell whose own three
         # numbers do not satisfy that identity is not a measurement we can
         # decompose (it may be a different metric or a hand-edited row).
@@ -161,16 +173,33 @@ def _lpd_stats(values, *, alpha, min_seeds, seeds):
     else:
         mean = float(d.mean())
         sd = float(d.std(ddof=1)) if n > 1 else None
+    # Finite inputs can still have an unrepresentable sample SD (e.g.
+    # +/-1.7e308); withhold the derived field instead of propagating inf into
+    # a strict-JSON artifact.  The exact p-value only needs the signed values.
+    if mean is not None and not math.isfinite(mean):
+        mean = None
+    if sd is not None and not math.isfinite(sd):
+        sd = None
     ci = None
-    if n > 1 and sd is not None and math.isfinite(sd) and sd > 0.0:
+    if (mean is not None and n > 1 and sd is not None
+            and math.isfinite(sd) and sd > 0.0):
         sem = sd / math.sqrt(n)
         tc = _t_critical(0.95, n - 1)
         if math.isfinite(tc) and math.isfinite(sem):
-            ci = [mean - tc * sem, mean + tc * sem]
-    direction = None if mean == 0.0 else ('negative' if mean < 0.0 else 'positive')
+            lo = mean - tc * sem
+            hi = mean + tc * sem
+            if math.isfinite(lo) and math.isfinite(hi):
+                ci = [lo, hi]
+    direction = (None if mean is None or mean == 0.0
+                 else ('negative' if mean < 0.0 else 'positive'))
     p = sf.get('p')
     p_floor = sf.get('p_floor')
-    within_noise = (sd is not None and abs(mean) <= sd)
+    if p is not None and not math.isfinite(p):
+        p = None
+    if p_floor is not None and not math.isfinite(p_floor):
+        p_floor = None
+    within_noise = (mean is not None and sd is not None
+                    and abs(mean) <= sd)
     significant = bool(
         p is not None and math.isfinite(p) and p < alpha
         and n >= min_seeds and not within_noise
@@ -228,10 +257,23 @@ def _lpd_max_band_signflip(band_rows, *, alpha):
     D = np.asarray([[float(next(item['log_ratio'] for item in row['per_seed']
                               if item['seed'] == s)) for s in seeds]
                     for row in band_rows], dtype=float)
-    scale = np.sqrt((D * D).sum(axis=1))
+    if not np.all(np.isfinite(D)):
+        return {'status': 'not_estimable',
+                'reason': ('at least one band log ratio is not finite, so the '
+                           'sign-flip score cannot be enumerated'),
+                'n_bands': len(band_rows)}
+    # Work on each row's max-abs scale.  The score is scale invariant, and
+    # squaring a finite log ratio near the float limit would otherwise turn a
+    # perfectly valid family into an inf/nan table (same guard as the primary
+    # max-T helper).
+    row_scale = np.max(np.abs(D), axis=1)
+    nz = row_scale > 0.0
+    Dn = np.zeros_like(D)
+    if np.any(nz):
+        Dn[nz] = D[nz] / row_scale[nz, None]
+    scale = np.sqrt((Dn * Dn).sum(axis=1))
     obs = np.zeros(len(labels), dtype=float)
-    nz = scale > 0.0
-    obs[nz] = np.abs(D[nz].sum(axis=1)) / scale[nz]
+    obs[nz] = np.abs(Dn[nz].sum(axis=1)) / scale[nz]
     total = 1 << n
     bitpos = np.arange(n, dtype=np.int64)[None, :]
     step = max(1, min(total, (1 << 20) // max(len(labels), 1)))
@@ -240,8 +282,9 @@ def _lpd_max_band_signflip(band_rows, *, alpha):
         bs = min(step, total - off)
         masks = np.arange(off, off + bs, dtype=np.int64)[:, None]
         signs = np.where((masks & (1 << bitpos)) != 0, 1.0, -1.0)
-        T = np.abs(signs @ D.T)
-        T[:, nz] = T[:, nz] / scale[nz]
+        T = np.abs(signs @ Dn.T)
+        if np.any(nz):
+            T[:, nz] = T[:, nz] / scale[nz]
         max_null.append(T.max(axis=1))
     max_null = np.concatenate(max_null)
     tol = 1e-12 * max(1.0, float(np.max(obs)) if obs.size else 1.0)
@@ -312,8 +355,8 @@ def _lpd_arm(panel):
             'n': len(rows),
             'seeds': seeds,
             'n_tokens_per_seed': sorted({int(r['n_tokens']) for r in rows}),
-            'mean_band_ppl': float(np.mean(ppls)),
-            'mean_band_nll_per_token': float(np.mean(rates)),
+            'mean_band_ppl': _scaled_mean_or_raw(ppls),
+            'mean_band_nll_per_token': _scaled_mean_or_raw(rates),
             'per_seed': [{'seed': r['seed'], 'band_ppl': r['ppl'],
                           'band_nll': r['nll'],
                           'n_tokens': r['n_tokens']} for r in rows],
@@ -396,6 +439,10 @@ def length_position_decomposition(by_length, *, pairs=None, alpha=None,
         b = entry.get('b')
         if not isinstance(name, str) or not name:
             raise ValueError(f'pair name must be a non-empty string, got {name!r}')
+        if not isinstance(a, str) or not a:
+            raise ValueError(f'pair {name!r} arm a must be a non-empty string, got {a!r}')
+        if not isinstance(b, str) or not b:
+            raise ValueError(f'pair {name!r} arm b must be a non-empty string, got {b!r}')
         if name in seen_names:
             raise ValueError(f'pair name {name!r} is declared more than once')
         seen_names.add(name)
@@ -424,13 +471,70 @@ def length_position_decomposition(by_length, *, pairs=None, alpha=None,
                 'seeds': pair_seeds,
             }
             continue
-        band_rows = []
+        # The shortest common cell is not a band *difference*: it already
+        # contains the target positions 1..L0-1.  Keep that prefix as its own
+        # explicit contribution.  Without it, two arms that already differ on
+        # the common prefix can never satisfy the absolute-sum reconstruction
+        # invariant below, and a genuine prefix effect would be mislabelled as
+        # an unrepresentable decomposition.
         errors = []
+        base_len = int(common_lengths[0])
+        max_len = int(common_lengths[-1])
+        prefix_seeds = []
+        prefix_ppl, prefix_log, prefix_nll, prefix_contrib = [], [], [], []
+        prefix_tokens = []
+        for seed in pair_seeds:
+            ca = panels[a][base_len][seed]
+            cb = panels[b][base_len][seed]
+            if int(ca['n_tokens']) != int(cb['n_tokens']):
+                errors.append(
+                    f'arms {a}/{b} have different token counts at the '
+                    f'shortest common length {base_len} (seed {seed})')
+                continue
+            ntok = int(ca['n_tokens'])
+            total_tok = int(panels[a][max_len][seed]['n_tokens'])
+            nll_d = float(ca['nll']) - float(cb['nll'])
+            prefix_seeds.append(int(seed))
+            prefix_tokens.append(ntok)
+            prefix_ppl.append(float(ca['ppl']) - float(cb['ppl']))
+            prefix_log.append(nll_d / float(ntok))
+            prefix_nll.append(nll_d)
+            prefix_contrib.append(nll_d / float(total_tok))
+        prefix = None
+        if prefix_seeds:
+            prefix = {
+                'label': f'1-{base_len - 1}',
+                'position_lo': 1,
+                'position_hi': int(base_len - 1),
+                'lower_length': 1,
+                'upper_length': int(base_len),
+                'n': len(prefix_seeds),
+                'seeds': prefix_seeds,
+                'n_tokens_per_seed': sorted(set(prefix_tokens)),
+                'band_ppl_delta': _lpd_stats(
+                    prefix_ppl, alpha=alpha, min_seeds=min_seeds,
+                    seeds=prefix_seeds),
+                'band_log_ratio': _lpd_stats(
+                    prefix_log, alpha=alpha, min_seeds=min_seeds,
+                    seeds=prefix_seeds),
+                'mean_band_nll_delta': _scaled_mean_or_raw(prefix_nll),
+                'mean_contribution_to_total_log_ratio_at_max':
+                    _scaled_mean_or_raw(prefix_contrib),
+                'per_seed': [
+                    {'seed': s, 'ppl_delta': dp, 'log_ratio': dl,
+                     'band_nll_delta': bn, 'contribution_at_max': c}
+                    for s, dp, dl, bn, c in zip(
+                        prefix_seeds, prefix_ppl, prefix_log,
+                        prefix_nll, prefix_contrib)],
+                'note': ('target positions 1..L0-1, read directly from the '
+                         'shortest common cell; it is a level shared by every '
+                         'longer cell, not a difference of two lengths'),
+            }
+        band_rows = []
         for lower, upper in zip(common_lengths, common_lengths[1:]):
             seeds = list(pair_seeds)
             d_ppl, d_log, contrib, band_nlls = [], [], [], []
             band_tokens = []
-            max_len = int(common_lengths[-1])
             for seed in seeds:
                 ra = _lpd_band_row(panels[a], lower, upper, seed)
                 rb = _lpd_band_row(panels[b], lower, upper, seed)
@@ -473,8 +577,9 @@ def length_position_decomposition(by_length, *, pairs=None, alpha=None,
                 'n_tokens_per_seed': sorted(set(band_tokens)),
                 'band_ppl_delta': stats_ppl,
                 'band_log_ratio': stats_log,
-                'mean_band_nll_delta': float(np.mean(band_nlls)),
-                'mean_contribution_to_total_log_ratio_at_max': float(np.mean(contrib)),
+                'mean_band_nll_delta': _scaled_mean_or_raw(band_nlls),
+                'mean_contribution_to_total_log_ratio_at_max':
+                    _scaled_mean_or_raw(contrib),
                 'per_seed': [{'seed': s, 'ppl_delta': dp,
                               'log_ratio': dl, 'band_nll_delta': bn,
                               'contribution_at_max': c}
@@ -525,11 +630,22 @@ def length_position_decomposition(by_length, *, pairs=None, alpha=None,
                             - cb['nll'] / float(cb['n_tokens']))
             reconstruction[Ln] = _lpd_stats(
                 vals, alpha=alpha, min_seeds=min_seeds, seeds=seeds)
-        # Sum the band contributions up to each length.
+        # Sum the prefix level and the band contributions up to each length.
+        # The prefix is what makes this an *absolute* decomposition: bands
+        # starting at L0 cover only positions >= L0, while total_by_length is
+        # the full log ratio at Ln (positions 1..Ln-1).
+        prefix_nll_by_seed = {
+            item['seed']: float(item['band_nll_delta'])
+            for item in ((prefix or {}).get('per_seed') or [])}
         max_err = 0.0
         for Ln in common_lengths:
             for seed in reconstruction[Ln].get('seeds') or []:
-                band_sum = 0.0
+                if seed not in prefix_nll_by_seed:
+                    errors.append(
+                        f'no common-prefix contribution for seed {seed} at '
+                        f'L={Ln}; the absolute log ratio cannot be rebuilt')
+                    continue
+                band_sum = prefix_nll_by_seed[seed]
                 for row in band_rows:
                     if int(row['upper_length']) <= int(Ln):
                         for item in row['per_seed']:
@@ -549,10 +665,31 @@ def length_position_decomposition(by_length, *, pairs=None, alpha=None,
                 f'band contributions do not reconstruct the total log ratio '
                 f'(max error {max_err:.3g})')
         max_len = common_lengths[-1]
-        contribs = [(row['label'],
-                     abs(float(row['mean_contribution_to_total_log_ratio_at_max'])))
-                    for row in band_rows if int(row['upper_length']) <= int(max_len)]
-        dominant = max(contribs, key=lambda x: x[1])[0] if contribs else None
+
+        def _lpd_abs_contribution(row):
+            value = row.get('mean_contribution_to_total_log_ratio_at_max')
+            if not isinstance(value, (int, float)):
+                return -1.0
+            value = abs(float(value))
+            return value if math.isfinite(value) else -1.0
+
+        band_contribs = [
+            (row['label'], _lpd_abs_contribution(row))
+            for row in band_rows
+            if int(row['upper_length']) <= int(max_len)]
+        best_band = (max(band_contribs, key=lambda x: x[1])
+                     if band_contribs and max(v for _l, v in band_contribs) >= 0.0
+                     else None)
+        prefix_abs = (_lpd_abs_contribution(prefix)
+                      if prefix is not None else -1.0)
+        # Keep the historical first-band tie break when every contribution is
+        # zero; only let the prefix win when it is strictly the largest.
+        if prefix is not None and (best_band is None or prefix_abs > best_band[1]):
+            dominant = prefix['label']
+        elif best_band is not None:
+            dominant = best_band[0]
+        else:
+            dominant = None
         # Family-level scan readout: selecting the most extreme band and
         # quoting its single-band p is a forking path.  The exact sign-flip
         # max-T over the band vector asks "does ANY band differ" while keeping
@@ -600,15 +737,17 @@ def length_position_decomposition(by_length, *, pairs=None, alpha=None,
             'lengths': [int(x) for x in common_lengths],
             'seeds': list(pair_seeds),
             'n': len(pair_seeds),
+            'prefix': prefix,
             'bands': {row['label']: row for row in band_rows},
             'band_family_max_t': _bmax,
             'total_by_length': {str(Ln): reconstruction[Ln] for Ln in common_lengths},
             'dominant_band_at_max_length': dominant,
             'max_reconstruction_error': float(max_err),
             'decomposition': (
-                'log(PPL_a/PPL_b) at length L equals the token-weighted sum of '
-                'the band log ratios up to L; each band holds the position '
-                'range fixed across arms'),
+                'log(PPL_a/PPL_b) at length L equals the common-prefix level '
+                '(positions 1..L0-1, read from the shortest common cell) plus '
+                'the token-weighted sum of the band log ratios up to L; each '
+                'band holds the position range fixed across arms'),
         }
     out['pairs'] = pair_out
     out['status'] = 'ok' if any(

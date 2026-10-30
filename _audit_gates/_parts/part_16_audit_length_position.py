@@ -149,7 +149,14 @@ def audit_length_position(path=None):
                     out['problems'].append(
                         f'{arm}@{Ln} seed {s}: invalid ppl/nll/n_tokens')
                     continue
-                rate = nv / float(tv)
+                try:
+                    tv_f = float(tv)
+                except OverflowError:
+                    out['problems'].append(
+                        f'{arm}@{Ln} seed {s}: n_tokens is outside the '
+                        'representable float range')
+                    continue
+                rate = nv / tv_f
                 if not math.isfinite(rate) or abs(math.log(pv) - rate) > 1e-9 * max(1.0, abs(rate)):
                     out['problems'].append(
                         f'{arm}@{Ln} seed {s}: ppl is not exp(nll_sum/n_tok)')
@@ -208,7 +215,7 @@ def audit_length_position(path=None):
         out['problems'].append(
             f"status={lp.get('status')!r} does not replay "
             f"(got {replay.get('status')!r})")
-    for key in ('alpha', 'lengths', 'arms', 'pairs'):
+    for key in ('alpha', 'lengths', 'arms', 'pairs', 'policy'):
         _lpa_same(lp.get(key), replay.get(key), key, out['problems'])
     if out['problems']:
         out['status'] = 'fail'

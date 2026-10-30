@@ -111,7 +111,18 @@ def _wc_percentile(values, q):
     if lo == hi:
         return float(arr[lo])
     frac = pos - float(lo)
-    value = float(arr[lo]) * (1.0 - frac) + float(arr[hi]) * frac
+    a = float(arr[lo])
+    b = float(arr[hi])
+    scale = max(abs(a), abs(b))
+    if not math.isfinite(scale):
+        return None
+    if scale > 1e100 or (0.0 < scale < 1e-100):
+        # Interpolating two finite endpoints can overflow even when the
+        # requested percentile is representable (e.g. a=1.7e308, b=-1.7e308).
+        # Interpolate on the unit-scaled copy and restore the scale.
+        value = ((a / scale) * (1.0 - frac) + (b / scale) * frac) * scale
+    else:
+        value = a * (1.0 - frac) + b * frac
     return value if math.isfinite(value) else None
 
 

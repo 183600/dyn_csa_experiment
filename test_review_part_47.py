@@ -381,3 +381,107 @@ def test_wiring_is_in_audit_cli_and_confirmation():
         assert alias in cli, alias
     assert 'length_position_decomposition' in inspect.getsource(V12.finaltest_stats)
     assert '长度位置分段' in inspect.getsource(V12.build_report)
+
+
+def test_common_prefix_level_is_part_of_the_absolute_decomposition():
+    # The shortest cell is a prefix *level*, not a difference of two lengths.
+    # A pair that already differs there must still decompose: the prefix is an
+    # explicit first contribution, and prefix + bands equals the total log
+    # ratio at every common length.
+    by = _panels(lengths=(512, 1024, 2048))
+    for Ln in ('512', '1024', '2048'):
+        cell = by['a'][Ln]
+        for seed in list(cell['nll_by_seed']):
+            nll = float(cell['nll_by_seed'][seed]) - 40.0
+            cell['nll_by_seed'][seed] = nll
+            cell['ppl_by_seed'][seed] = math.exp(
+                nll / float(cell['n_tokens_by_seed'][seed]))
+    r = L.length_position_decomposition(
+        by, pairs=[{'name': 'a vs b', 'a': 'a', 'b': 'b'}])
+    assert r['status'] == 'ok', r
+    pair = r['pairs']['a vs b']
+    assert pair['status'] == 'ok', pair
+    prefix = pair['prefix']
+    assert prefix['label'] == '1-511', prefix
+    assert prefix['n'] == 6 and prefix['position_hi'] == 511, prefix
+    assert prefix['mean_contribution_to_total_log_ratio_at_max'] < 0.0, prefix
+    for Ln in (512, 1024, 2048):
+        total = pair['total_by_length'][str(Ln)]['mean']
+        max_tok = int(by['a']['2048']['n_tokens_by_seed']['0'])
+        n_tok = int(by['a'][str(Ln)]['n_tokens_by_seed']['0'])
+        # Stored contributions use the maximum-length token denominator.
+        expected = (
+            prefix['mean_contribution_to_total_log_ratio_at_max']
+            + sum(row['mean_contribution_to_total_log_ratio_at_max']
+                  for row in pair['bands'].values())) * (max_tok / n_tok)
+        assert math.isclose(total, expected, rel_tol=1e-12, abs_tol=1e-12), (
+            Ln, total, expected)
+    assert pair['dominant_band_at_max_length'] == '1-511', pair
+    assert pair['max_reconstruction_error'] < 1e-12, pair
+    json.dumps(r, allow_nan=False)
+
+
+def test_absurd_integer_accounting_and_bad_pair_names_fail_closed():
+    by = _panels(lengths=(512, 1024))
+    by['a']['512']['nll_by_seed']['0'] = 10 ** 400
+    try:
+        L.length_position_decomposition(
+            by, pairs=[{'name': 'a vs b', 'a': 'a', 'b': 'b'}])
+    except ValueError as exc:
+        assert 'number' in str(exc) or 'finite' in str(exc), exc
+    else:
+        raise AssertionError('an integer beyond the float range was accepted')
+
+    by = _panels(lengths=(512, 1024))
+    by['a']['512']['n_tokens_by_seed']['0'] = 10 ** 400
+    try:
+        L.length_position_decomposition(
+            by, pairs=[{'name': 'a vs b', 'a': 'a', 'b': 'b'}])
+    except ValueError as exc:
+        assert 'representable' in str(exc), exc
+    else:
+        raise AssertionError('an unrepresentable token count was accepted')
+
+    by = _panels(lengths=(512, 1024))
+    try:
+        L.length_position_decomposition(
+            by, pairs=[{'name': 'bad', 'a': ['a'], 'b': 'b'}])
+    except ValueError as exc:
+        assert 'arm a' in str(exc), exc
+    else:
+        raise AssertionError('a non-string pair arm was accepted')
+
+
+def test_zero_effect_comparison_stays_strict_json_and_replayable():
+    # All paired deltas are exactly zero.  The by-length decomposition and the
+    # comparison diagnostics must still be strict-JSON safe: a degenerate
+    # floor must not be passed to the planning helper as n=0 (which returns
+    # NaN) and then leak into the artifact.
+    with tempfile.TemporaryDirectory() as td:
+        st, p = _synthetic_stats(td)
+        json.dumps(st, allow_nan=False)
+        assert st['length_position']['status'] == 'ok', st['length_position']
+        pair = st['length_position']['pairs']['a vs b']
+        assert pair['prefix']['mean_contribution_to_total_log_ratio_at_max'] == 0.0, pair
+        with contextlib.redirect_stdout(io.StringIO()):
+            out = A.audit_length_position(path=p)
+        assert out['status'] == 'ok', out
+
+
+def test_exact_huge_seed_labels_are_labels_not_float_measurements():
+    # Seed keys are exact identities; this module never feeds them to an RNG.
+    # A label beyond MAX_SEED or 2**53 must survive, like the ranking readout.
+    huge = 10 ** 400
+    def cell(n, t):
+        return {'ppl_by_seed': {str(huge): math.exp(n / t),
+                                '0': math.exp(n / t)},
+                'nll_by_seed': {str(huge): n, '0': n},
+                'n_tokens_by_seed': {str(huge): t, '0': t}}
+    by = {'a': {'512': cell(2048.0, 512), '1024': cell(4096.0, 1024)},
+          'b': {'512': cell(2048.0, 512), '1024': cell(4100.0, 1024)}}
+    r = L.length_position_decomposition(
+        by, pairs=[{'name': 'a vs b', 'a': 'a', 'b': 'b'}])
+    pair = r['pairs']['a vs b']
+    assert pair['status'] == 'ok', pair
+    assert huge in pair['seeds'] and huge in pair['prefix']['seeds'], pair
+    json.dumps(r, allow_nan=False)

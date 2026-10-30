@@ -141,9 +141,25 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
                         _pool_ok = False
             if _by_seed:
                 _dl = list(_by_seed.values())
-                _pooled = L._safe_exp_ppl(_nll_sum / _n_tok) if (_pool_ok and _n_tok > 0) else None
-                stats['by_length'].setdefault(v, {})[str(Ln)] = {'mean': float(_pooled if _pooled is not None else np.mean(_dl)),
-                                                                  'mean_arithmetic': float(np.mean(_dl)),
+                _pooled = None
+                if _pool_ok and _n_tok > 0 and math.isfinite(_nll_sum):
+                    try:
+                        _pooled = L._safe_exp_ppl(_nll_sum / _n_tok)
+                    except (OverflowError, ZeroDivisionError):
+                        # A token count beyond float64's exponent range is
+                        # still an exact integer in the artifact, but its
+                        # ratio is not representable.  Withhold the pooled
+                        # PPL instead of aborting the whole stats build.
+                        _pooled = None
+                    if _pooled is not None and not math.isfinite(_pooled):
+                        # A diverged/exponent-overflowing pooled PPL is not a
+                        # JSON value (and its float sum may itself have
+                        # overflowed even though every per-seed cell was
+                        # finite).  The per-seed PPLs remain available.
+                        _pooled = None
+                _dl_mean = L._scaled_mean_or_raw(_dl)
+                stats['by_length'].setdefault(v, {})[str(Ln)] = {'mean': float(_pooled if _pooled is not None else _dl_mean),
+                                                                  'mean_arithmetic': float(_dl_mean),
                                                                   'ppl_pooled': _pooled, 'n_tokens': _n_tok,
                                                                   'n': len(_dl), 'ppl_by_seed': {str(s): p for s, p in _by_seed.items()},
                                                                   **({'nll_by_seed': {str(s): x for s, x in _nll_by_seed.items()},
@@ -393,7 +409,15 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
         _fl_eff = (1.0 if _floor_n == 0 else L.signflip_p_floor(_floor_n))
         if math.isfinite(_fl_eff):
             res['p_floor_effective'] = _fl_eff
-            res['min_attainable_p_holm_effective'] = L.holm_min_attainable_p(_floor_n, len(manifest['primary_comparisons']), _alpha)
+            # A comparison with no non-zero paired delta has p_floor=1 and can
+            # never reach any alpha.  ``holm_min_attainable_p(0, ...)`` is
+            # intentionally NaN in the planning helper (n<=0 is undefined),
+            # so do not pass the degenerate n into it and leak NaN into the
+            # strict-JSON artifact.
+            res['min_attainable_p_holm_effective'] = (
+                1.0 if _floor_n <= 0
+                else L.holm_min_attainable_p(
+                    _floor_n, len(manifest['primary_comparisons']), _alpha))
             res['power_first_holm_gate_effective'] = {f'q={q:.2f}': L.signflip_power(_floor_n, len(manifest['primary_comparisons']), q, _alpha) for q in (0.8, 0.85, 0.9, 0.95)}
         _param = _param_match_detail(recs_a, recs_b, usable, a, b)
         res.update(_param)
@@ -1453,20 +1477,35 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
                 A('| band | n | band ΔPPL (a−b) | band log ratio | p (sign-flip) | 对总 log 比的贡献@最大长度 | 与首段交互 p |')
                 A('|---|---|---|---|---|---|---|')
                 _bands = _pair.get('bands') or {}
-                for _b, _row in sorted(_bands.items(),
-                                       key=lambda kv: int(str(kv[0]).split('-')[0])):
+                _rows = []
+                _prefix = _pair.get('prefix')
+                if isinstance(_prefix, dict):
+                    # The shortest common cell carries positions 1..L0-1.  It
+                    # is a level, not a difference, but the absolute total log
+                    # ratio needs it; show it as the first row so the table
+                    # really adds up instead of silently omitting the prefix.
+                    _rows.append((_prefix.get('label', 'prefix'), _prefix, True))
+                _rows.extend(
+                    (label, row, False)
+                    for label, row in sorted(
+                        _bands.items(),
+                        key=lambda kv: int(str(kv[0]).split('-')[0])))
+                for _b, _row, _is_prefix in _rows:
                     _bd = _row.get('band_ppl_delta') or {}
                     _bl = _row.get('band_log_ratio') or {}
                     _ia = _row.get('interaction_vs_first_band') or {}
-                    A(f'| {_b} | {_row.get("n", "—")} | '
+                    A(f'| {_b}{" (prefix)" if _is_prefix else ""} | '
+                      f'{_row.get("n", "—")} | '
                       f'{_lp_num(_bd.get("mean"))} | {_lp_num(_bl.get("mean"))} | '
                       f'{_lp_num(_bd.get("p_exact_signflip"), "{:.4g}")} | '
                       f'{_lp_num(_row.get("mean_contribution_to_total_log_ratio_at_max"))} | '
-                      f'{_lp_num(_ia.get("p_exact_signflip"), "{:.4g}")} |')
+                      f'{"—" if _is_prefix else _lp_num(_ia.get("p_exact_signflip"), "{:.4g}")} |')
                 A('')
-                A('（逐 band 的 95% t 区间在 `test_stats.json` 的 '
-                  '`band_ppl_delta.ci95` / `band_log_ratio.ci95`；上表只摘均值与 '
-                  'exact sign-flip p，不把区间宽度当作实际重要性。）')
+                A('（首行 `1-L0-1 (prefix)` 是最短公共 cell 自带的共同前缀层，'
+                  '不是两个长度的差；后面的 band 才是新增位置段。逐 band 的 95% t '
+                  '区间在 `test_stats.json` 的 `band_ppl_delta.ci95` / '
+                  '`band_log_ratio.ci95`；上表只摘均值与 exact sign-flip p，'
+                  '不把区间宽度当作实际重要性。）')
                 A('')
                 _bf = _pair.get('band_family_max_t') or {}
                 if _bf.get('status') == 'ok':

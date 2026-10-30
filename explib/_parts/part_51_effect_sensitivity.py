@@ -86,8 +86,13 @@ _EFFECT_SENSITIVITY_BOUNDARY = (
 
 
 def _es_number(value):
-    """Finite float or ``None``; booleans are flags, not measurements."""
+    """Finite float or ``None``; booleans and strings are not measurements."""
     if isinstance(value, (bool, _es_np.bool_)):
+        return None
+    # JSON round-trips can leave a numeric value as ``"1.25"``.  Treating that
+    # as a measurement silently invents a PPL instead of dropping the invalid
+    # pair (the same contract as the scale/location regression suite).
+    if isinstance(value, (str, bytes, bytearray, dict)):
         return None
     try:
         out = float(value)
