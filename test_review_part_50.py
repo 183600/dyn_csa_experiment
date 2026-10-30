@@ -126,9 +126,50 @@ def test_gate_mode_validation_is_fail_closed():
         L.AttnCfg(gate_mode='bogus')
     with _pytest.raises(ValueError):
         L.AttnCfg(gate_mode='frozen', chunking='fixed', dynamic=False)
+    # A full layer never constructs delta_logit, even if the chunking field is
+    # left at its learnable value: freezing it would silently do nothing.
+    with _pytest.raises(ValueError):
+        L.AttnCfg(kind='full', chunking='cosine_learnable', gate_mode='frozen')
     # A frozen gate needs a learnable offset to freeze.
     cfg = L.AttnCfg(gate_mode='frozen', chunking='cosine_learnable', dynamic=True)
     assert cfg.gate_mode == 'frozen'
+
+
+def test_gate_objective_reports_the_declared_trainability_difference():
+    a = _tiny('csa_dynamic')
+    b = _tiny('csa_dyn_frozengate')
+    oa = L.train_objective(a, comp_lambda=0.05, delta_lr_mult=10.0)
+    ob = L.train_objective(b, comp_lambda=0.05, delta_lr_mult=10.0)
+    reason, keys = L._objective_diff({'train_objective': oa},
+                                     {'train_objective': ob})
+    assert reason and keys == ['delta_lr_effective', 'delta_trainable'], keys
+    assert set(keys) <= L.OBJECTIVE_INTERVENTION_KEYS[
+        'dynamic_blocking_learning'], keys
+    # A one-sided optional field is unverifiable, not silently "matched".
+    legacy = {k: v for k, v in oa.items() if k != 'delta_trainable'}
+    reason, keys = L._objective_diff({'train_objective': legacy},
+                                     {'train_objective': oa})
+    assert reason and reason.startswith('unverifiable') and keys == [], reason
+
+
+def test_gate_control_audit_validates_labels_and_keeps_base_diagnostics():
+    ladder = copy.deepcopy(L.GATE_CONTROL_DESIGN)
+    ladder['component'] = 'something_else'
+    assert L.gate_control_audit(ladder=ladder)['status'] == 'fail'
+    ladder = copy.deepcopy(L.GATE_CONTROL_DESIGN)
+    ladder['total_effect_component'] = 'something_else'
+    assert L.gate_control_audit(ladder=ladder)['status'] == 'fail'
+    # The total-effect family the learned contrast is conditioned on must be
+    # declared, not silently assumed.
+    design = dict(L.ABLATION_DESIGN)
+    design.pop('dynamic_blocking')
+    assert L.gate_control_audit(design=design)['status'] == 'fail'
+    # A missing arm is still diagnosable per base instead of dropping the base.
+    ladder = copy.deepcopy(L.GATE_CONTROL_DESIGN)
+    ladder['levels']['frozen']['arms']['csa'] = 'csa_dyn_missing'
+    rep = L.gate_control_audit(ladder=ladder)
+    assert rep['status'] == 'fail'
+    assert rep['base_checks']['csa']['frozen']['status'] == 'missing', rep
 
 
 def test_gate_control_ladder_fails_closed():

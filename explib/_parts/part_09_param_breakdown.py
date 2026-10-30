@@ -448,7 +448,17 @@ def _hyperparam_reason(ra, rb):
     return None
 
 _OBJECTIVE_COMPARE_KEYS = ('comp_reg_applies', 'comp_lambda', 'comp_lambda_effective',
-                           'delta_lr_effective', 'boundary_policy', 'loss_terms')
+                           'delta_lr_effective', 'boundary_policy', 'loss_terms',
+                           'delta_trainable')
+# Newer descriptors also state whether the boundary offset is trainable.  It
+# is an objective/intervention field (learned vs frozen changes it), but old
+# records predate it, so a pair of legacy descriptors that BOTH omit it stays
+# on the historical permissive path.  A one-sided descriptor is unverifiable,
+# and when both carry the field a difference is a real objective difference.
+_OBJECTIVE_OPTIONAL_COMPARE_KEYS = frozenset({'delta_trainable'})
+_OBJECTIVE_REQUIRED_KEYS = tuple(
+    k for k in _OBJECTIVE_COMPARE_KEYS
+    if k not in _OBJECTIVE_OPTIONAL_COMPARE_KEYS)
 
 # A component ablation may deliberately change an objective term.  For the
 # loss-term and boundary-policy innovations the objective difference IS the
@@ -482,12 +492,22 @@ def _objective_diff(ra, rb):
     # missing key returns None on BOTH sides and would otherwise look like a
     # matched objective.  Old descriptors that only carry a subset are
     # unverifiable, not a pass.
-    _miss_a = [k for k in _OBJECTIVE_COMPARE_KEYS if k not in oa]
-    _miss_b = [k for k in _OBJECTIVE_COMPARE_KEYS if k not in ob]
+    _miss_a = [k for k in _OBJECTIVE_REQUIRED_KEYS if k not in oa]
+    _miss_b = [k for k in _OBJECTIVE_REQUIRED_KEYS if k not in ob]
     if _miss_a or _miss_b:
         _miss = sorted(set(_miss_a) | set(_miss_b))
         return ('unverifiable train_objective (descriptor misses ' + ', '.join(_miss) + ')', [])
-    diffs = [k for k in _OBJECTIVE_COMPARE_KEYS if oa.get(k) != ob.get(k)]
+    # Optional fields are compared only when both records carry them.  A
+    # one-sided optional field means the two descriptors were produced by
+    # different code generations and cannot attest the same objective.
+    _opt_a = {k for k in _OBJECTIVE_OPTIONAL_COMPARE_KEYS if k in oa}
+    _opt_b = {k for k in _OBJECTIVE_OPTIONAL_COMPARE_KEYS if k in ob}
+    if _opt_a != _opt_b:
+        _miss = sorted(_OBJECTIVE_OPTIONAL_COMPARE_KEYS
+                       - (_opt_a & _opt_b))
+        return ('unverifiable train_objective (descriptor misses ' + ', '.join(_miss) + ')', [])
+    diffs = [k for k in _OBJECTIVE_COMPARE_KEYS
+             if k in oa and k in ob and oa.get(k) != ob.get(k)]
     return (('objective differs: ' + ', '.join(diffs)) if diffs else None), diffs
 
 def objective_reason(ra, rb):

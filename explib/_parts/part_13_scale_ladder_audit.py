@@ -1806,8 +1806,12 @@ def single_factor_initialization_audit(design=None, *, factory=None,
             return True
         if (keys & {'use_sink', 'full_sink', 'sink_mode'}) and leaf == 'sink':
             return True
-        if (keys & {'dynamic', 'chunking', 'target_block_tokens', 'gate_mode'}
+        if (keys & {'dynamic', 'chunking', 'target_block_tokens'}
                 and leaf == 'delta_logit'):
+            # gate_mode is deliberately absent: freezing the offset must not
+            # change its value, so a learned/frozen pair is expected to keep
+            # this tensor bit-identical (only requires_grad may differ, which
+            # `gate_control_audit` checks directly).
             return True
         return False
 

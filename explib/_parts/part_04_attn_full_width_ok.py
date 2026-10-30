@@ -716,11 +716,14 @@ class AttnCfg:
             raise ValueError(
                 f'unknown gate_mode {self.gate_mode!r}; expected one of '
                 f'{GATE_MODES}')
-        if self.gate_mode != 'learned' and self.chunking != 'cosine_learnable':
+        if self.gate_mode != 'learned' and not (
+                self.kind in ('csa', 'hca')
+                and self.chunking == 'cosine_learnable'):
             raise ValueError(
-                'gate_mode=' + repr(self.gate_mode) + ' requires a layer with a '
-                'learnable boundary offset (chunking="cosine_learnable"); '
-                'a fixed-block arm has no delta_logit to freeze')
+                'gate_mode=' + repr(self.gate_mode) + ' requires a csa/hca '
+                'layer with a learnable boundary offset '
+                '(chunking="cosine_learnable"); a fixed-block or full layer '
+                'has no delta_logit to freeze')
         if self.fuse_mode not in FUSE_MODES:
             raise ValueError(
                 f'unknown fuse_mode {self.fuse_mode!r}; expected one of '

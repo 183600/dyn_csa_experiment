@@ -859,6 +859,16 @@ def gate_control_audit(design=None, ladder=None, present=None, factory=None,
         out['violations'].append('levels must be a non-empty mapping')
         return out
     out['bases'] = dict(bases)
+    # The ladder names the component it is a control for.  A missing or
+    # relabelled declaration would print the same `treatment_component` while
+    # its levels audit some other contrast, so require the exact labels.
+    for _field, _expected in (('component', out['treatment_component']),
+                              ('total_effect_component',
+                               out['total_effect_component'])):
+        if ladder.get(_field) != _expected:
+            out['violations'].append(
+                f'gate control ladder {_field}={ladder.get(_field)!r}, '
+                f'expected {_expected!r}')
     try:
         present_set = set(RUN_ABL['variants']) if present is None else set(present)
     except TypeError:
@@ -900,13 +910,18 @@ def gate_control_audit(design=None, ladder=None, present=None, factory=None,
         return out
 
     pairs = _declared_pairs(design, 'dynamic_blocking_learning')
+    total_pairs = _declared_pairs(design, 'dynamic_blocking')
     if not pairs:
         out['violations'].append(
             'ABLATION_DESIGN has no dynamic_blocking_learning contrast for the '
             'learned/frozen gate ladder')
+    if not total_pairs:
+        out['violations'].append(
+            'ABLATION_DESIGN has no dynamic_blocking contrast for the total '
+            'effect that the learned-gate contrast is conditioned on')
     out['component_design'] = {
         'dynamic_blocking_learning': sorted(pairs or ()),
-        'dynamic_blocking': sorted(_declared_pairs(design, 'dynamic_blocking') or ()),
+        'dynamic_blocking': sorted(total_pairs or ()),
     }
 
     def _model(arm):
@@ -983,6 +998,9 @@ def gate_control_audit(design=None, ladder=None, present=None, factory=None,
                 rec['status'] = 'confounded'
                 continue
             rec['status'] = 'ok'
+        # Keep the per-level diagnostics even when an arm is missing/invalid;
+        # a later `continue` must not make the base disappear from the report.
+        out['base_checks'][base_label] = base_rec
         # Construct both models once per base and check capacity, initialization
         # and objective identity.
         treat = base_rec.get(treatment_name) or {}
@@ -1020,6 +1038,10 @@ def gate_control_audit(design=None, ladder=None, present=None, factory=None,
         for n in set(sa) & set(sb):
             if n in delta_a:
                 continue
+            if bool(sa[n].requires_grad) != bool(sb[n].requires_grad):
+                bad.append(f'non-gate parameter {n!r} trainability differs; '
+                           'only the boundary offset may be frozen')
+                break
             if not torch.equal(sa[n], sb[n]):
                 bad.append(f'non-gate parameter {n!r} differs at the same seed')
                 break
@@ -1068,7 +1090,6 @@ def gate_control_audit(design=None, ladder=None, present=None, factory=None,
             rec['status'] = 'confounded'
         else:
             rec['status'] = 'ok'
-        out['base_checks'][base_label] = base_rec
     # Distinct arm per level per base (a relabelled copy is not a control).
     for base_label in bases:
         seen = {}

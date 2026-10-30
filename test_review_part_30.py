@@ -335,3 +335,34 @@ def test_joint_correction_gate_replays_and_refuses_tampering():
     import inspect
     assert "'maxt': audit_joint_correction" in inspect.getsource(A._run_cli)
     assert "'joint_correction': audit_joint_correction" in inspect.getsource(A._run_cli)
+
+
+def test_joint_correction_keeps_large_exact_seed_labels():
+    # Labels above 2**53 are still exact grouping keys.  Converting through
+    # float first turned the adjacent labels below into one duplicate label.
+    huge = 2 ** 53
+    rep = L.maxt_joint_correction({
+        'a': {'deltas': [1.0, 2.0], 'seeds': [huge, huge + 1]},
+    })
+    assert rep['status'] == 'ok', rep
+    assert list(rep['groups']) == [str([huge, huge + 1])], rep['groups']
+    assert rep['groups'][str([huge, huge + 1])]['seeds'] == [huge, huge + 1]
+    # The declared family size is a count, not a float; it must survive the
+    # same scale without being rounded.
+    declared = 2 ** 53 + 1
+    rep = L.maxt_joint_correction({
+        'a': {'deltas': [1.0, 2.0], 'seeds': [0, 1]},
+    }, family_size=declared)
+    assert rep['family_size'] == declared, rep
+    json.dumps(rep, allow_nan=False)
+
+
+def test_empty_joint_correction_family_is_not_estimable():
+    rep = L.maxt_joint_correction({})
+    assert rep['status'] == 'not_estimable', rep
+    assert rep['family_ready'] is False and rep['m_eligible'] == 0
+    # Explicitly excluded-only input is equally uninformative, not a subset.
+    rep = L.maxt_joint_correction({'a': {'deltas': [], 'eligible': False,
+                                         'reason': 'arm absent'}})
+    assert rep['status'] == 'not_estimable', rep
+    assert rep['excluded'] == {'a': 'arm absent'}, rep

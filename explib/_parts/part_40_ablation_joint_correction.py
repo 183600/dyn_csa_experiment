@@ -51,6 +51,7 @@ Boundaries (all fail closed)
 """
 import hashlib
 import math
+import numbers
 
 import numpy as np
 
@@ -126,20 +127,57 @@ def _joint_alpha(alpha, *, where):
     return out
 
 
-def _joint_max_n(value, *, where):
+def _joint_exact_int(value, *, where, name, minimum):
+    """Parse an exact integer without a float round-trip.
+
+    Counts and seed labels can legitimately exceed 2**53.  ``float(value)``
+    would silently round them (and can turn distinct labels into duplicates),
+    so integral values are taken exactly and non-integral reals are refused.
+    """
     if isinstance(value, (bool, np.bool_, str, bytes, bytearray)):
-        raise ValueError(f'{where}: max_n must be a positive integer, got {value!r}')
-    try:
-        raw = float(value)
-    except (TypeError, ValueError, OverflowError):
-        raise ValueError(f'{where}: max_n must be a positive integer, got {value!r}') from None
-    if not math.isfinite(raw) or raw != int(raw):
-        raise ValueError(f'{where}: max_n must be an exact positive integer, '
-                         f'got {value!r}')
-    out = int(raw)
-    if out < 2:
-        raise ValueError(f'{where}: max_n must be >= 2, got {value!r}')
+        raise ValueError(f'{where}: {name} must be an exact integer, got {value!r}')
+    if isinstance(value, numbers.Integral):
+        out = int(value)
+    else:
+        try:
+            out = int(value)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(
+                f'{where}: {name} must be an exact integer, got {value!r}') from None
+        try:
+            if value != out:
+                raise ValueError
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(
+                f'{where}: {name} must be an exact integer, got {value!r}') from None
+    if out < minimum:
+        raise ValueError(f'{where}: {name} must be >= {minimum}, got {value!r}')
     return out
+
+
+def _joint_max_n(value, *, where):
+    try:
+        return _joint_exact_int(value, where=where, name='max_n', minimum=2)
+    except ValueError:
+        raise ValueError(
+            f'{where}: max_n must be an exact positive integer, got {value!r}') from None
+
+
+def _joint_seed(value, *, where):
+    """Exact non-negative integer seed label for family grouping.
+
+    Seeds are only grouping labels here, so they do not have to fit an RNG
+    word.  Converting through ``float`` first would round labels above 2**53
+    (and reject larger ones as "duplicate"), silently merging or renaming the
+    seed sets a max-T family is built on.  Keep Python/NumPy integers exact;
+    non-integral reals and numeric strings are still refused.
+    """
+    try:
+        return _joint_exact_int(value, where=where, name='seeds', minimum=0)
+    except ValueError:
+        raise ValueError(
+            f'{where}: seeds must be exact non-negative integers, '
+            f'got {value!r}') from None
 
 
 def _joint_deltas_fingerprint(names, matrix, seeds):
@@ -458,20 +496,13 @@ def maxt_joint_correction(records, *, alpha=0.05,
                          f'{type(records).__name__}')
     fs = None
     if family_size is not None:
-        if isinstance(family_size, (bool, np.bool_, str, bytes, bytearray)):
-            raise ValueError(f'{where}: family_size must be a positive '
-                             f'integer, got {family_size!r}')
         try:
-            _fs_raw = float(family_size)
-        except (TypeError, ValueError, OverflowError):
-            raise ValueError(f'{where}: family_size must be a positive '
-                             f'integer, got {family_size!r}') from None
-        if not math.isfinite(_fs_raw) or _fs_raw != int(_fs_raw):
-            raise ValueError(f'{where}: family_size must be an exact positive '
-                             f'integer, got {family_size!r}')
-        fs = int(_fs_raw)
-        if fs < 1:
-            raise ValueError(f'{where}: family_size must be >= 1, got {family_size!r}')
+            fs = _joint_exact_int(family_size, where=where,
+                                  name='family_size', minimum=1)
+        except ValueError:
+            raise ValueError(
+                f'{where}: family_size must be an exact positive integer, '
+                f'got {family_size!r}') from None
     groups = {}
     excluded = {}
     for key, rec in records.items():
@@ -484,14 +515,8 @@ def maxt_joint_correction(records, *, alpha=0.05,
             continue
         raw_seeds = rec.get('seeds')
         try:
-            seeds = []
-            for s in (raw_seeds if raw_seeds is not None else []):
-                if isinstance(s, (bool, np.bool_, str, bytes, bytearray)):
-                    raise ValueError
-                _sf = float(s)
-                if not math.isfinite(_sf) or _sf != int(_sf) or _sf < 0:
-                    raise ValueError
-                seeds.append(int(_sf))
+            seeds = [_joint_seed(s, where=where)
+                     for s in (raw_seeds if raw_seeds is not None else [])]
         except (TypeError, ValueError, OverflowError):
             excluded[key] = 'seeds are not exact non-negative integers'
             continue
@@ -567,8 +592,8 @@ def maxt_joint_correction(records, *, alpha=0.05,
             f'the complete contrasts fall into {n_groups} different seed '
             'sets; each max-T is corrected only within its own seed set')
     status = ('ok' if ready else
-              ('not_estimable' if group_out and
-               all(g.get('status') != 'ok' for g in group_out.values())
+              ('not_estimable' if (not group_out or
+               all(g.get('status') != 'ok' for g in group_out.values()))
                else 'subset_only'))
     return {
         'kind': 'maxt_joint_correction',
