@@ -331,3 +331,121 @@ def test_exact_rational_counts_do_not_round_or_raise():
     # distinguished exactly.
     gap, within = L._param_ratio_pair(huge, huge + 1, 1e-9)
     assert gap is None and within is True, (gap, within)
+
+
+def _length_strata_stats(block, seeds, n_units):
+    return {'finaltest': {'comparisons': {'c1': {
+        'doc_sampling': {'length_strata': block,
+                         'pooled_ci_n_units': n_units},
+        'per_seed': [{'seed': s} for s in seeds]}}}}
+
+
+def _run_length_strata_audit(obj):
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, 'test_stats.json')
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(obj, f)
+        with contextlib.redirect_stdout(io.StringIO()):
+            return A.audit_length_strata(path)
+
+
+def test_length_strata_audit_replays_nonmonotone_aggregate_order():
+    # Equal-count bins are contiguous in *individual* length, but a two-unit
+    # stratum can hold more tokens than the next one-unit stratum.  Replaying
+    # the aggregated strata must preserve the declared order instead of
+    # re-sorting them by summed token count (which would silently swap L2/L3).
+    tok = np.array([1, 2, 3, 3, 4, 5, 6], dtype=np.int64)
+    a = np.tile(tok * 3.0, (3, 1))
+    b = a + tok
+    block = L.length_stratified_effect(
+        a, b, tok, n_strata=5, min_units_per_stratum=1)
+    assert block['status'] == 'ok', block
+    assert [s['n_tokens'] for s in block['strata']] == [1, 2, 6, 4, 11]
+    got = _run_length_strata_audit(
+        _length_strata_stats(block, list(range(3)), len(tok)))
+    assert got['status'] == 'ok', got['problems']
+
+
+def test_length_strata_audit_accepts_a_single_seed_and_huge_token_counts():
+    # The generator emits an `ok` block for one seed too; there is simply no
+    # seed-level interval.  Token counts beyond float64 must remain exact
+    # denominators and token reference weights must not raise OverflowError.
+    huge = 10 ** 400
+    tok = [huge, 2 * huge]
+    block = L.length_stratified_effect(
+        [[1e300, 2e300]], [[1e300, 1e300]], tok,
+        n_strata=2, min_units_per_stratum=1, reference='token')
+    assert block['status'] == 'ok', block
+    assert block['n_seeds'] == 1
+    assert block['units']['n_tokens'] == 3 * huge
+    assert math.isclose(block['standardized']['weights'][0], 1.0 / 3.0,
+                        rel_tol=1e-15)
+    got = _run_length_strata_audit(
+        _length_strata_stats(block, [0], len(tok)))
+    assert got['status'] == 'ok', got['problems']
+
+
+def test_length_strata_accepts_numpy_and_huge_custom_weights():
+    # A NumPy reference array is a legitimate numeric sequence; comparing it
+    # with `reference == 'equal_strata'` used to raise "truth value of an
+    # array is ambiguous".  Huge integer weights have a representable
+    # normalisation even though `float(w)` overflows.
+    tok = np.array([10, 1000], dtype=np.int64)
+    a = np.tile(tok * 3.0, (3, 1))
+    b = a + tok
+    block = L.length_stratified_effect(
+        a, b, tok, n_strata=2, min_units_per_stratum=1,
+        reference=np.array([1, 2], dtype=np.int64))
+    assert block['standardized']['weights'] == [1.0 / 3.0, 2.0 / 3.0]
+    huge = 10 ** 400
+    block = L.length_stratified_effect(
+        a, b, tok, n_strata=2, min_units_per_stratum=1,
+        reference=[huge, huge])
+    assert block['standardized']['weights'] == [0.5, 0.5]
+
+
+def test_length_strata_cochran_q_survives_subnormal_se():
+    # A per-seed stratum SE around 1e-200 is finite, but se*se underflows to
+    # zero.  The inverse-variance weights must be formed on a common scale,
+    # not by dividing by zero.
+    tiny = 1e-200
+    a = np.array([
+        [0.0, 0.0, 0.0, 0.0],
+        [tiny, tiny, 2 * tiny, 2 * tiny],
+        [2 * tiny, 2 * tiny, 4 * tiny, 4 * tiny],
+        [tiny, tiny, 2 * tiny, 2 * tiny],
+    ])
+    b = np.zeros_like(a)
+    block = L.length_stratified_effect(
+        a, b, [1, 1, 1, 1], n_strata=2, min_units_per_stratum=2)
+    het = block['heterogeneity']
+    assert block['status'] == 'ok', block
+    assert isinstance(het['q'], float) and math.isfinite(het['q']), het
+    assert het['reason'] is None, het
+    assert 0.0 <= het['i2'] <= 1.0, het
+    # The true tau^2 (~8e-402) is below the smallest subnormal; a fabricated
+    # 0.0 would claim no between-stratum variance, so it must be withheld.
+    assert het['tau2'] is None, het
+    json.dumps(block, allow_nan=False)
+
+
+def test_length_strata_audit_rejects_non_quantile_membership():
+    tok = np.array([1, 2, 3, 3, 4, 5, 6], dtype=np.int64)
+    a = np.tile(tok * 3.0, (3, 1))
+    b = a + tok
+    block = L.length_stratified_effect(
+        a, b, tok, n_strata=5, min_units_per_stratum=1)
+    obj = json.loads(json.dumps(_length_strata_stats(
+        block, list(range(3)), len(tok))))
+    strata = (obj['finaltest']['comparisons']['c1']['doc_sampling']
+              ['length_strata']['strata'])
+    # Swap two whole one-unit strata and relabel them.  The partition, token
+    # sums and NLL sums all stay self-consistent, so only a check against the
+    # declared equal-count bins can catch the fabricated membership.
+    strata[0], strata[1] = strata[1], strata[0]
+    for i, s in enumerate(strata):
+        s['index'] = i
+    got = _run_length_strata_audit(obj)
+    assert got['status'] == 'fail', got
+    assert any('declared equal-count length bins' in p
+               for p in got['problems']), got['problems']

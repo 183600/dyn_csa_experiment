@@ -1,6 +1,11 @@
 def _lsa_close(got, want, rel=1e-9, abs_=1e-12):
     if got is None or want is None:
         return got is None and want is None
+    if isinstance(got, (bool, str, bytes, bytearray)) or isinstance(
+            want, (bool, str, bytes, bytearray)):
+        # A flag or its textual spelling is not a measured number
+        # (float(True) == 1.0 and float("1.0") == 1.0 used to pass).
+        return False
     try:
         a, b = float(got), float(want)
     except (TypeError, ValueError, OverflowError):
@@ -180,7 +185,11 @@ def audit_length_strata(path=None):
         if n_strata is None or n_strata < 2 or n_strata != len(strata):
             row['problems'].append(
                 f'n_strata={n_strata!r} does not match the {len(strata)} strata')
-        if n_seeds is None or n_seeds < 2 or n_seeds != len(per_seed):
+        # One trained seed is still a valid descriptive block: the estimator
+        # then has no seed-level interval, but the sufficient statistics and
+        # every point estimate replay exactly.  Requiring two here made the
+        # audit reject an `ok` block that the generator itself emitted.
+        if n_seeds is None or n_seeds < 1 or n_seeds != len(per_seed):
             row['problems'].append(
                 f'n_seeds={n_seeds!r} does not match the {len(per_seed)} '
                 'per-seed rows')
@@ -214,10 +223,17 @@ def audit_length_strata(path=None):
             if total is None or token_counts is None or total != sum(token_counts):
                 row['problems'].append(
                     'units.n_tokens does not equal the sum of token_counts')
+            if _lsa_int(units.get('n_units')) != n_units:
+                row['problems'].append(
+                    'units.n_units does not equal n_units')
         # Per-seed totals and stratum sums must partition each other.
         if token_counts is not None:
             seen = []
-            total_tokens = float(sum(token_counts))
+            # Keep the denominator exact: a float round-trip of a token total
+            # above 2**53 would describe a different panel than the stored
+            # integer counts.  Both the share check and the per-seed replay
+            # below use this integer.
+            total_tokens = int(sum(token_counts))
             for gi, s in enumerate(strata):
                 if not isinstance(s, dict):
                     row['problems'].append(f'strata[{gi}] is not an object')
@@ -237,12 +253,23 @@ def audit_length_strata(path=None):
                 seen.extend(idx)
                 want_units = len(idx)
                 want_tokens = sum(token_counts[i] for i in idx)
+                want_lo = min(token_counts[i] for i in idx)
+                want_hi = max(token_counts[i] for i in idx)
                 if _lsa_int(s.get('n_units')) != want_units:
                     row['problems'].append(
                         f'strata[{gi}].n_units does not equal its index count')
                 if _lsa_int(s.get('n_tokens')) != want_tokens:
                     row['problems'].append(
                         f'strata[{gi}].n_tokens does not equal its token sum')
+                if _lsa_int(s.get('lo_tokens')) != want_lo:
+                    row['problems'].append(
+                        f'strata[{gi}].lo_tokens does not equal its shortest unit')
+                if _lsa_int(s.get('hi_tokens')) != want_hi:
+                    row['problems'].append(
+                        f'strata[{gi}].hi_tokens does not equal its longest unit')
+                if _lsa_int(s.get('index')) != gi:
+                    row['problems'].append(
+                        f'strata[{gi}].index does not equal its position')
                 want_share = want_tokens / total_tokens if total_tokens else None
                 if not _lsa_close(s.get('token_share'), want_share):
                     row['problems'].append(
@@ -264,6 +291,11 @@ def audit_length_strata(path=None):
                     row['problems'].append(f'strata[{gi}].per_seed_delta_ppl is misaligned')
                     continue
                 for si in range(n_seeds):
+                    if (isinstance(a_sum[si], (bool, str, bytes, bytearray))
+                            or isinstance(b_sum[si], (bool, str, bytes, bytearray))):
+                        row['problems'].append(
+                            f'strata[{gi}].nll sums contain a non-numeric flag')
+                        continue
                     a_v = _lsa_int(a_sum[si]) if isinstance(a_sum[si], int) else a_sum[si]
                     try:
                         a_f = float(a_v)
@@ -276,13 +308,16 @@ def audit_length_strata(path=None):
                         row['problems'].append(
                             f'strata[{gi}].nll sums contain a non-finite value')
                         continue
-                    want_lr = (a_f - b_f) / want_tokens
+                    _a_pooled = L._ls_div(a_f, want_tokens)
+                    _b_pooled = L._ls_div(b_f, want_tokens)
+                    want_lr = (None if _a_pooled is None or _b_pooled is None
+                               else _a_pooled - _b_pooled)
                     if not _lsa_close(lr[si], want_lr):
                         row['problems'].append(
                             f'strata[{gi}].per_seed_log_ratio[{si}] does not '
                             'replay from the stored NLL sums')
-                    pa = L._safe_exp_ppl(a_f / want_tokens)
-                    pb = L._safe_exp_ppl(b_f / want_tokens)
+                    pa = L._safe_exp_ppl(_a_pooled)
+                    pb = L._safe_exp_ppl(_b_pooled)
                     want_dp = None
                     if (pa is not None and pb is not None
                             and math.isfinite(pa) and math.isfinite(pb)
@@ -295,6 +330,37 @@ def audit_length_strata(path=None):
             if len(seen) != n_units or sorted(seen) != list(range(n_units)):
                 row['problems'].append(
                     'stratum unit_indices do not partition all evaluation units')
+        # The membership itself is part of the claim: strata must be the
+        # deterministic equal-count length bins declared by the policy, not an
+        # arbitrary partition chosen after seeing the arm outcomes.  A pure
+        # partition check would accept a hand-built grouping whose sufficient
+        # statistics were then recomputed to match, so compare the exact
+        # index vectors with the generator's own grouping.
+        if not row['problems'] and token_counts is not None and isinstance(policy, dict):
+            requested = _lsa_int(policy.get('requested_n_strata'))
+            min_units = _lsa_int(policy.get('min_units_per_stratum'))
+            if requested is None or requested < 2:
+                row['problems'].append(
+                    'policy.requested_n_strata is not an integer >= 2')
+            elif min_units is None or min_units < 1:
+                row['problems'].append(
+                    'policy.min_units_per_stratum is not an integer >= 1')
+            else:
+                expected = L._ls_groups(token_counts, requested, min_units)
+                # The membership is the claim; the order *within* a stratum is
+                # not (sums are order-independent), so compare sorted index
+                # vectors while preserving the stratum order.
+                stored_groups = [
+                    sorted(int(i) for i in s.get('unit_indices', []))
+                    for s in strata]
+                if expected is None:
+                    row['problems'].append(
+                        'the declared policy cannot form the stored strata')
+                elif [sorted(int(i) for i in group)
+                      for group in expected] != stored_groups:
+                    row['problems'].append(
+                        'stratum unit_indices are not the declared equal-count '
+                        'length bins')
         # Per-seed totals must equal the sum of the stratum sufficient stats.
         if isinstance(strata, list) and all(
                 isinstance(s, dict) and isinstance(s.get('nll_a_sum'), list)
@@ -316,9 +382,24 @@ def audit_length_strata(path=None):
                 if not _lsa_close(rec.get('nll_b_total'), b_tot):
                     row['problems'].append(
                         f'per_seed[{si}].nll_b_total != sum of stratum NLLs')
-                if not _lsa_close(rec.get('log_ratio'), (a_tot - b_tot) / total_tokens):
+                _a_pooled = L._ls_div(a_tot, total_tokens)
+                _b_pooled = L._ls_div(b_tot, total_tokens)
+                want_lr = (None if _a_pooled is None or _b_pooled is None
+                           else _a_pooled - _b_pooled)
+                if not _lsa_close(rec.get('log_ratio'), want_lr):
                     row['problems'].append(
                         f'per_seed[{si}].log_ratio != token-pooled total')
+                want_dp = None
+                if (_a_pooled is not None and _b_pooled is not None):
+                    _pa = L._safe_exp_ppl(_a_pooled)
+                    _pb = L._safe_exp_ppl(_b_pooled)
+                    if (_pa is not None and _pb is not None
+                            and math.isfinite(_pa) and math.isfinite(_pb)
+                            and math.isfinite(_pa - _pb)):
+                        want_dp = float(_pa - _pb)
+                if not _lsa_close(rec.get('delta_ppl'), want_dp):
+                    row['problems'].append(
+                        f'per_seed[{si}].delta_ppl != token-pooled total')
         if row['problems']:
             out['n_not_replayable'] += 1
             out['problems'].extend(f'{name}: {x}' for x in row['problems'])
@@ -335,7 +416,7 @@ def audit_length_strata(path=None):
                 a_mat, b_mat, toks,
                 n_strata=len(strata), min_units_per_stratum=1,
                 conf=policy.get('conf'), reference=ref,
-                seeds=seeds)
+                seeds=seeds, preserve_stratum_order=True)
         except Exception as exc:
             row['problems'].append(
                 f'replay raised {type(exc).__name__}: {exc}')
@@ -350,7 +431,8 @@ def audit_length_strata(path=None):
         # Derived blocks: compare every field except the identities that
         # legitimately change when units are aggregated into strata.
         for key in ('overall', 'standardized', 'heterogeneity',
-                    'sign_consistency', 'concentration'):
+                    'sign_consistency', 'concentration', 'role', 'boundary',
+                    'upstream'):
             _lsa_same(ls.get(key), replay.get(key), key, row['problems'])
         for gi, (stored, want) in enumerate(zip(strata, replay['strata'])):
             for key in ('n_tokens', 'log_ratio', 'ratio', 'log_ratio_ci95',

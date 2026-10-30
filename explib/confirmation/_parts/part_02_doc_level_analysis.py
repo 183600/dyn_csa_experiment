@@ -947,7 +947,9 @@ def _length_strata_markdown(ft):
 
         sign = _obj(ls.get('sign_consistency'))
         concentration = _obj(ls.get('concentration'))
-        opposite = sign.get('opposite_strata') or []
+        opposite = sign.get('opposite_strata')
+        if not isinstance(opposite, (list, tuple)):
+            opposite = []
         dom = concentration.get('dominant_stratum')
         overall = _obj(ls.get('overall'))
         std = _obj(ls.get('standardized'))
@@ -978,10 +980,14 @@ def _length_strata_markdown(ft):
             if dom is not None and idx == dom:
                 marker.append('最大贡献层')
             share = s.get('token_share')
-            share_txt = ('%.1f%%' % (100.0 * float(share))
-                         if isinstance(share, (int, float))
-                         and not isinstance(share, bool)
-                         and math.isfinite(float(share)) else '—')
+            share_txt = '—'
+            if isinstance(share, (int, float)) and not isinstance(share, bool):
+                try:
+                    share_f = float(share)
+                except (TypeError, ValueError, OverflowError):
+                    share_f = None
+                if share_f is not None and math.isfinite(share_f):
+                    share_txt = '%.1f%%' % (100.0 * share_f)
             rows.append('| %s | L%s（%s–%s tok） | %s | %s | %s %s | %s (%s) %s | %s |'
                         % (name, idx, s.get('lo_tokens', '—'),
                            s.get('hi_tokens', '—'), s.get('n_units', '—'),

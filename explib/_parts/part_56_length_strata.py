@@ -136,6 +136,26 @@ def _ls_mean_std(values):
             std if _ls_math.isfinite(std) else None)
 
 
+def _ls_div(num, den):
+    """``num / den`` with an exact positive-integer denominator.
+
+    Python converts the integer divisor to float before dividing, so a token
+    denominator beyond ``float64``'s exponent range raises ``OverflowError``
+    even when the quotient is representable.  The fallback does the division
+    in the exact rational domain and rounds once.  Ordinary panels keep the
+    historical float division bit-for-bit.
+    """
+    try:
+        return float(num) / int(den)
+    except OverflowError:
+        from fractions import Fraction as _Fraction
+        try:
+            quotient = _Fraction(num) / int(den)
+            return float(quotient)
+        except (OverflowError, ValueError, ZeroDivisionError):
+            return None
+
+
 def _ls_summary(values, conf):
     """Mean and two-sided t interval for a seed-level vector."""
     finite = [float(v) for v in values if _finite_scalar(v) is not None]
@@ -162,15 +182,25 @@ def _ls_summary(values, conf):
     return out
 
 
-def _ls_groups(tokens, n_strata, min_units):
+def _ls_groups(tokens, n_strata, min_units, *, preserve_order=False):
     """Deterministic equal-count length strata; returns index arrays or None.
 
     Equal-count bins make the comparison of short and long units use a
     similar number of units in each bin.  Boundaries come only from the token
     counts (never from the arm outcomes), so seeing the data cannot choose
     which strata to report.
+
+    ``preserve_order`` is an internal replay hook used by the audit gate after
+    it has aggregated the stored strata into one unit per stratum.  In that
+    representation ``n_strata == len(tokens)`` and the caller has already
+    fixed the stratum order: re-sorting by the *summed* token count can move a
+    two-unit stratum with 6 tokens before a one-unit stratum with 4 tokens,
+    even though every individual token count in the first stratum is smaller.
+    The ordinary path (the default) still sorts by unit length.
     """
     d = len(tokens)
+    if preserve_order and int(n_strata) == d and int(min_units) <= 1 and d >= 2:
+        return [[i] for i in range(d)]
     # Sort by the exact integer token count (not float64, which would round
     # counts above 2**53 and could merge distinct lengths into a fake tie).
     order = sorted(range(d), key=lambda i: (int(tokens[i]), i))
@@ -189,11 +219,22 @@ def _ls_groups(tokens, n_strata, min_units):
 def _ls_reference_weights(reference, strata, total_tokens):
     """Normalised reference weights for standardisation."""
     g = len(strata)
-    if reference is None or reference == 'equal_strata':
+    if reference is None:
         return 'equal_strata', [1.0 / g] * g
-    if reference == 'token':
-        return 'token', [float(s['n_tokens']) / total_tokens for s in strata]
-    if isinstance(reference, (str, bytes, bytearray)):
+    if isinstance(reference, str):
+        if reference == 'equal_strata':
+            return 'equal_strata', [1.0 / g] * g
+        if reference == 'token':
+            # Divide the exact Python integer counts instead of converting
+            # each count through float64 first.  Besides avoiding a rounding
+            # step, this keeps a token total beyond the float64 exponent range
+            # from raising OverflowError even though every normalised weight
+            # is representable.
+            return 'token', [s['n_tokens'] / total_tokens for s in strata]
+        raise ValueError(
+            "reference must be 'equal_strata', 'token', or a numeric sequence "
+            f"of {g} weights, got {reference!r}")
+    if isinstance(reference, (bytes, bytearray)):
         raise ValueError(
             "reference must be 'equal_strata', 'token', or a numeric sequence "
             f"of {g} weights, got {reference!r}")
@@ -206,20 +247,57 @@ def _ls_reference_weights(reference, strata, total_tokens):
     if len(raw) != g:
         raise ValueError(f'reference has {len(raw)} weights for {g} strata')
     weights = []
+    _need_exact = False
     for w in raw:
         if isinstance(w, (bool, _ls_np.bool_)):
             raise ValueError('reference weights must be finite positive numbers, not booleans')
         try:
             f = float(w)
         except (TypeError, ValueError, OverflowError):
-            raise ValueError('reference weights must be finite positive numbers') from None
+            _need_exact = True
+            continue
         if not (_ls_math.isfinite(f) and f > 0.0):
-            raise ValueError('reference weights must be finite and positive')
+            # The declared value may still be a finite positive integer or
+            # Decimal beyond float64 (or a tiny positive value that rounded to
+            # zero); defer the verdict to the exact path below.
+            _need_exact = True
+            continue
         weights.append(f)
-    total = _ls_math.fsum(weights)
-    if not (_ls_math.isfinite(total) and total > 0.0):
+    if not _need_exact:
+        try:
+            total = _ls_math.fsum(weights)
+        except (OverflowError, ValueError):
+            total = None
+        if total is None or not (_ls_math.isfinite(total) and total > 0.0):
+            _need_exact = True
+        else:
+            return 'custom', [w / total for w in weights]
+    # Exact normalisation for huge/tiny rational weights and for a float sum
+    # that overflows even though each normalised weight is representable.
+    from fractions import Fraction as _Fraction
+    exact = []
+    for w in raw:
+        if isinstance(w, (bool, _ls_np.bool_)):
+            raise ValueError('reference weights must be finite positive numbers, not booleans')
+        try:
+            fr = _Fraction(w)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError('reference weights must be finite positive numbers') from None
+        if fr <= 0:
+            raise ValueError('reference weights must be finite and positive')
+        exact.append(fr)
+    total = sum(exact, _Fraction(0, 1))
+    if total <= 0:
         raise ValueError('reference weights must have a finite positive sum')
-    return 'custom', [w / total for w in weights]
+    try:
+        normalised = [float(fr / total) for fr in exact]
+    except (OverflowError, ValueError):
+        raise ValueError('reference weights are not representable') from None
+    if not all(_ls_math.isfinite(x) and x > 0.0 for x in normalised):
+        # A positive but extremely small share may round to 0.0; the weights
+        # would then no longer form a positive reference distribution.
+        raise ValueError('reference weights are not representable as positive floats')
+    return 'custom', normalised
 
 
 def _ls_not_estimable(reason, *, n_units=None, n_seeds=None, n_strata=None):
@@ -231,7 +309,8 @@ def _ls_not_estimable(reason, *, n_units=None, n_seeds=None, n_strata=None):
 
 def length_stratified_effect(nll_a, nll_b, n_tokens, *, n_strata=None,
                              min_units_per_stratum=None, conf=None,
-                             reference=None, seeds=None):
+                             reference=None, seeds=None,
+                             preserve_stratum_order=False):
     """Post-stratify a paired PPL contrast by evaluation-unit length.
 
     ``nll_a`` / ``nll_b`` are ``[n_seeds, n_units]`` summed per-unit NLLs for
@@ -300,7 +379,8 @@ def length_stratified_effect(nll_a, nll_b, n_tokens, *, n_strata=None,
             'length post-stratification needs at least two evaluation units',
             n_units=d_count, n_seeds=s_count, n_strata=0)
 
-    groups = _ls_groups(T, n_strata, min_units)
+    groups = _ls_groups(T, n_strata, min_units,
+                        preserve_order=bool(preserve_stratum_order))
     if groups is None:
         return _ls_not_estimable(
             f'cannot form two length strata with at least {min_units} units '
@@ -339,8 +419,12 @@ def length_stratified_effect(nll_a, nll_b, n_tokens, *, n_strata=None,
         lr = []
         dp = []
         for a_s, b_s in zip(a_sum, b_sum):
-            nll_a_g = a_s / n_tok_g
-            nll_b_g = b_s / n_tok_g
+            nll_a_g = _ls_div(a_s, n_tok_g)
+            nll_b_g = _ls_div(b_s, n_tok_g)
+            if nll_a_g is None or nll_b_g is None:
+                return _ls_not_estimable(
+                    f'length stratum {gi} pooled NLL is not representable',
+                    n_units=d_count, n_seeds=s_count, n_strata=len(groups))
             one_lr = nll_a_g - nll_b_g
             if not _ls_math.isfinite(one_lr):
                 return _ls_not_estimable(
@@ -398,13 +482,19 @@ def length_stratified_effect(nll_a, nll_b, n_tokens, *, n_strata=None,
             return _ls_not_estimable(
                 'overall summed NLL is not representable',
                 n_units=d_count, n_seeds=s_count, n_strata=len(groups))
-        one_lr = a_tot / total_tokens - b_tot / total_tokens
+        _a_pooled = _ls_div(a_tot, total_tokens)
+        _b_pooled = _ls_div(b_tot, total_tokens)
+        if _a_pooled is None or _b_pooled is None:
+            return _ls_not_estimable(
+                'overall pooled NLL is not representable',
+                n_units=d_count, n_seeds=s_count, n_strata=len(groups))
+        one_lr = _a_pooled - _b_pooled
         if not _ls_math.isfinite(one_lr):
             return _ls_not_estimable(
                 'overall log ratio is not representable',
                 n_units=d_count, n_seeds=s_count, n_strata=len(groups))
-        pa = _safe_exp_ppl(a_tot / total_tokens)
-        pb = _safe_exp_ppl(b_tot / total_tokens)
+        pa = _safe_exp_ppl(_a_pooled)
+        pb = _safe_exp_ppl(_b_pooled)
         one_dp = None
         if pa is not None and pb is not None and _ls_math.isfinite(pa) and _ls_math.isfinite(pb):
             val = pa - pb
@@ -474,32 +564,97 @@ def length_stratified_effect(nll_a, nll_b, n_tokens, *, n_strata=None,
             ses.append(float(_std / _ls_math.sqrt(len(vals))))
     if all(m is not None for m in means) and all(
             se is not None and _ls_math.isfinite(se) for se in ses):
+        # Inverse-variance weights are scale-invariant for Q.  Dividing every
+        # SE by their maximum keeps the ordinary path bit-identical (scale 1)
+        # but avoids `1 / (se * se)` overflowing or, for a subnormal SE,
+        # underflowing to zero and raising ZeroDivisionError.  The returned
+        # tau^2 is converted back to the original SE units.
+        _naive_se_ok = all(
+            se > 0.0 and math.isfinite(se * se) and se * se > 0.0
+            for se in ses)
+        _se_scale = (1.0 if _naive_se_ok
+                     else max(float(se) for se in ses))
+        _scaled_ses = [float(se) / _se_scale for se in ses] if _se_scale > 0.0 else []
         w = []
-        for se in ses:
+        for se in _scaled_ses:
             if se > 0.0:
-                w.append(1.0 / (se * se))
+                var = se * se
+                w.append(1.0 / var if var > 0.0 and _ls_math.isfinite(var) else None)
             else:
                 w.append(None)
-        if all(x is not None for x in w) and _ls_math.fsum(w) > 0.0:
-            mu = _ls_math.fsum(w[i] * means[i] for i in range(len(groups))) / _ls_math.fsum(w)
+        _wsum = None
+        if all(x is not None and _ls_math.isfinite(x) for x in w):
+            try:
+                _wsum = _ls_math.fsum(w)
+            except (OverflowError, ValueError):
+                _wsum = None
+        if _wsum is not None and _wsum > 0.0:
+            mu = None
+            try:
+                mu = _ls_math.fsum(
+                    w[i] * means[i] for i in range(len(groups))) / _wsum
+            except (OverflowError, ValueError):
+                mu = None
+            good = mu is not None and _ls_math.isfinite(mu)
             terms = []
-            bad = False
-            for i in range(len(groups)):
-                dev = means[i] - mu
-                term = (dev * dev) / (ses[i] * ses[i])
-                if not _ls_math.isfinite(term):
-                    bad = True
-                    break
-                terms.append(term)
-            if not bad:
-                q = float(_ls_math.fsum(terms))
-                df = len(groups) - 1
-                q_p = float(chi2_sf(q, df))
-                if q > 0.0:
-                    i2 = float(max(0.0, (q - df) / q))
-                    denom = _ls_math.fsum(w) - (_ls_math.fsum(x * x for x in w) / _ls_math.fsum(w))
-                    tau2 = (float(max(0.0, (q - df) / denom))
-                            if denom > 0.0 and _ls_math.isfinite(denom) else None)
+            if good:
+                for i in range(len(groups)):
+                    dev = means[i] - mu
+                    if not _ls_math.isfinite(dev):
+                        good = False
+                        break
+                    if _se_scale == 1.0:
+                        # Keep the historical expression for ordinary SEs.
+                        term = (dev * dev) / (_scaled_ses[i] * _scaled_ses[i])
+                    else:
+                        # ``dev`` is in original units; put it on the same
+                        # scale as the normalised SE before squaring.
+                        ratio = (dev / _se_scale) / _scaled_ses[i]
+                        term = ratio * ratio
+                    if not _ls_math.isfinite(term):
+                        good = False
+                        break
+                    terms.append(term)
+            if good:
+                try:
+                    q = float(_ls_math.fsum(terms))
+                except (OverflowError, ValueError):
+                    q = None
+                if q is not None and _ls_math.isfinite(q):
+                    q_p = float(chi2_sf(q, len(groups) - 1))
+                    if q > 0.0:
+                        i2 = float(max(0.0, (q - (len(groups) - 1)) / q))
+                        denom = None
+                        try:
+                            w2 = _ls_math.fsum(x * x for x in w)
+                            denom = _wsum - (w2 / _wsum)
+                        except (OverflowError, ValueError):
+                            denom = None
+                        if denom is not None and denom > 0.0 and _ls_math.isfinite(denom):
+                            _tau_scaled = float(max(
+                                0.0, (q - (len(groups) - 1)) / denom))
+                            if _tau_scaled == 0.0:
+                                # q <= df: the between-stratum variance is
+                                # exactly zero, independent of the SE scale.
+                                tau2 = 0.0
+                            else:
+                                # tau2 is in squared scaled-SE units.
+                                try:
+                                    tau2 = _tau_scaled * (_se_scale * _se_scale)
+                                except OverflowError:
+                                    tau2 = None
+                                if tau2 is not None and not _ls_math.isfinite(tau2):
+                                    tau2 = None
+                                # A positive (q - df) cannot have tau2 == 0;
+                                # that value is an underflow, not evidence of
+                                # no between-stratum variance.  Withhold it.
+                                if tau2 == 0.0:
+                                    tau2 = None
+                else:
+                    q = None
+                    q_reason = 'Cochran Q is not representable in float64'
+            else:
+                q_reason = 'Cochran Q deviation/SE is not representable in float64'
         else:
             q_reason = ('a stratum has zero seed-level standard error and a '
                         'non-zero deviation, or the inverse-variance weights '
