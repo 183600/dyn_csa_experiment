@@ -23,17 +23,8 @@ def audit_missingness(path=None):
                     'of a block leaves missing-data robustness unverified; it '
                     'does not make the contrast wrong or significant')}
 
-    def _finite(x):
-        if isinstance(x, (bool, np.bool_, str, bytes, bytearray)) or x is None:
-            return None
-        try:
-            y = float(x)
-        except (TypeError, ValueError, OverflowError):
-            return None
-        return y if math.isfinite(y) else None
-
     def _count(x):
-        y = _finite(x)
+        y = _finite_number(x)
         return int(y) if y is not None and y.is_integer() else None
 
     def _close(a, b, tol=1e-9):
@@ -103,8 +94,8 @@ def audit_missingness(path=None):
                         'n_observed': (m.get('n_observed'), rec.get('n_observed'), _count),
                         'n_missing': (m.get('n_missing'), rec.get('n_missing'), _count),
                         'n_excluded': (m.get('n_excluded'), rec.get('n_excluded'), _count),
-                        'observed_mean': (m.get('observed_mean'), rec.get('observed_mean'), _finite),
-                        'unobserved_mean_for_zero': (m.get('unobserved_mean_for_zero'), rec.get('unobserved_mean_for_zero'), _finite),
+                        'observed_mean': (m.get('observed_mean'), rec.get('observed_mean'), _finite_number),
+                        'unobserved_mean_for_zero': (m.get('unobserved_mean_for_zero'), rec.get('unobserved_mean_for_zero'), _finite_number),
                         'overall_mean_bounds': (m.get('overall_mean_bounds'), rec.get('overall_mean_bounds'), None),
                         'robust_zero': (m.get('robust_zero'), rec.get('robust_zero'), None),
                         'robust_margin': (m.get('robust_margin'), rec.get('robust_margin'), None),
@@ -120,7 +111,7 @@ def audit_missingness(path=None):
                         elif parser is _count:
                             ok = _count(stored) == fresh
                         else:
-                            ok = _close(_finite(stored), fresh)
+                            ok = _close(_finite_number(stored), fresh)
                         if not ok:
                             problems.append(
                                 f'{label}: {key} is {stored!r}, recomputed {fresh!r}')

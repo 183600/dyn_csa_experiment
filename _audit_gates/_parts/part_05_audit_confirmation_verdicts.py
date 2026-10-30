@@ -729,18 +729,6 @@ def audit_look_history(paths=None):
                     'sign-flip p, not only by the final-n p')}
     files = sorted(_find_look_histories(paths))
 
-    def _finite(x):
-        # A numeric string (or bytes) is not a measurement: float("1.0")
-        # would let a hand-edited/stale artifact replay as a finite reading.
-        if (isinstance(x, (bool, np.bool_, str, bytes, bytearray))
-                or x is None):
-            return None
-        try:
-            y = float(x)
-        except (TypeError, ValueError, OverflowError):
-            return None
-        return y if math.isfinite(y) else None
-
     for f in files:
         panel_dir = os.path.dirname(f)
         rec = {'path': f, 'looks': 0, 'contrasts': {},
@@ -809,7 +797,7 @@ def audit_look_history(paths=None):
                     if len(set(_ss)) != len(_ss):
                         rec['problems'].append(f'look {lid} {key}: duplicate seeds')
                         continue
-                    _dd = [_finite(x) for x in deltas]
+                    _dd = [_finite_number(x) for x in deltas]
                     if any(x is None for x in _dd):
                         rec['problems'].append(
                             f'look {lid} {key}: non-finite/non-numeric delta')
@@ -822,7 +810,7 @@ def audit_look_history(paths=None):
                     # optional-stopping correction it represents).
                     if 'p_exact_signflip' in c:
                         _raw_p = c.get('p_exact_signflip')
-                        recorded_p = _finite(_raw_p)
+                        recorded_p = _finite_number(_raw_p)
                         if recorded_p is None:
                             rec['problems'].append(
                                 f'look {lid} {key}: recorded p is not a finite '
@@ -956,7 +944,7 @@ def audit_look_history(paths=None):
                         'look_analysis block; rerun methodology_audit on this panel')
                     continue
                 e, la = ent
-                ap = _finite(la.get('p_sequential'))
+                ap = _finite_number(la.get('p_sequential'))
                 if ap is None or abs(ap - float(seq['p_sequential'])) > 1e-9:
                     rec['problems'].append(
                         f'{key}: audit sequential p={la.get("p_sequential")!r} does not '

@@ -87,30 +87,11 @@ def audit_winner_curse(path=None):
         print(json.dumps(out, ensure_ascii=False, indent=2))
         return out
 
-    def _wc_int(name, default=None):
-        raw = pol.get(name, default)
-        if isinstance(raw, (bool, np.bool_)) or raw is None:
-            return None
-        if isinstance(raw, numbers.Integral):
-            return int(raw)
-        if isinstance(raw, float):
-            return int(raw) if raw.is_integer() else None
-        try:
-            as_int = int(raw)
-        except (TypeError, ValueError, OverflowError):
-            return None
-        try:
-            if raw != as_int:
-                return None
-        except (TypeError, ValueError, OverflowError):
-            return None
-        return as_int
-
-    n_boot = _wc_int('n_boot')
-    boot_seed = _wc_int('bootstrap_seed')
-    split_seed = _wc_int('split_seed')
-    max_partitions = _wc_int('max_partitions')
-    min_seeds = _wc_int('min_seeds')
+    n_boot = _int_field(pol, 'n_boot')
+    boot_seed = _int_field(pol, 'bootstrap_seed')
+    split_seed = _int_field(pol, 'split_seed')
+    max_partitions = _int_field(pol, 'max_partitions')
+    min_seeds = _int_field(pol, 'min_seeds')
     better = pol.get('better')
     lead_level = pol.get('lead_level')
     tie_tol = pol.get('tie_tol', 0.0)

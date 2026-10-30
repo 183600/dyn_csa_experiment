@@ -337,6 +337,75 @@ def _import_exp_lib():
     return L
 
 
+def _finite_number(value):
+    """Return ``value`` as a finite float, or ``None`` if it is not a measurement.
+
+    Numeric strings and bytes are rejected: ``float("1.0")`` would let a
+    hand-edited or stale artifact replay as a finite reading.  Booleans are
+    flags rather than numbers (``float(True) == 1.0``).  Every replay audit
+    uses this one predicate so the contract cannot drift between audit
+    families.
+    """
+    if isinstance(value, (bool, np.bool_, str, bytes, bytearray)) or value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _exact_int(value):
+    """Exact integer for a JSON value, or ``None``.
+
+    Numeric strings are accepted here because JSON object *keys* are strings;
+    a count read from a measurement field goes through :func:`_exact_count`,
+    which rejects them.
+    """
+    if value is None or isinstance(value, (bool, np.bool_)):
+        return None
+    if isinstance(value, numbers.Integral):
+        return int(value)
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return int(number) if math.isfinite(number) and number == math.floor(number) else None
+
+
+def _exact_count(value):
+    """Exact integer read from a measurement field (numeric strings rejected)."""
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, numbers.Real):
+        return None
+    number = float(value)
+    return int(number) if math.isfinite(number) and number == math.floor(number) else None
+
+
+def _int_field(mapping, key, default=None):
+    """Exact integer stored under ``key`` in ``mapping``, or ``None``.
+
+    Large integral seeds stay exact instead of round-tripping through float64,
+    and booleans remain flags rather than becoming 0/1.
+    """
+    raw = mapping.get(key, default)
+    if isinstance(raw, (bool, np.bool_)) or raw is None:
+        return None
+    if isinstance(raw, numbers.Integral):
+        return int(raw)
+    if isinstance(raw, float):
+        return int(raw) if raw.is_integer() else None
+    try:
+        as_int = int(raw)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    try:
+        if raw != as_int:
+            return None
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return as_int
+
+
 # ---------------------------------------------------------------------------
 # 1) leakage：分词器来源 / 词表一致性 / 缓存指纹 / 文档重叠
 # ---------------------------------------------------------------------------

@@ -121,17 +121,8 @@ def audit_family_correction(path=None):
         print(json.dumps(out, ensure_ascii=False, indent=2))
         return out
 
-    def _fin(x):
-        if isinstance(x, (bool, np.bool_, str, bytes, bytearray)) or x is None:
-            return None
-        try:
-            y = float(x)
-        except (TypeError, ValueError, OverflowError):
-            return None
-        return y if math.isfinite(y) else None
-
     def _close(a, b, *, rel=1e-9, abs_=1e-12):
-        x, y = _fin(a), _fin(b)
+        x, y = _finite_number(a), _finite_number(b)
         if x is None or y is None:
             return x is None and y is None
         return math.isclose(x, y, rel_tol=rel, abs_tol=abs_)
@@ -196,16 +187,16 @@ def audit_family_correction(path=None):
     # with the declared family.
     for name in names:
         r = rows.get(name) or {}
-        ps = _fin(r.get('p_raw_score'))
-        pm = _fin(r.get('p_maxt_score'))
-        ph = _fin(r.get('p_holm_score'))
+        ps = _finite_number(r.get('p_raw_score'))
+        pm = _finite_number(r.get('p_maxt_score'))
+        ph = _finite_number(r.get('p_holm_score'))
         # The mean columns must keep the raw/adjusted distinction: the raw
         # mean p is the comparison's p_exact_signflip, while the Holm(mean)
         # column must equal the already-adjusted frozen Holm value verbatim.
         # This is checked against the ORIGINAL inputs, not only the replay, so
         # a replay that shares the same bug cannot hide it.
-        raw_mean = _fin(r.get('p_raw_mean'))
-        comp_raw = _fin((comps.get(name) or {}).get('p_exact_signflip'))
+        raw_mean = _finite_number(r.get('p_raw_mean'))
+        comp_raw = _finite_number((comps.get(name) or {}).get('p_exact_signflip'))
         if raw_mean is not None and comp_raw is not None:
             if not _close(raw_mean, comp_raw):
                 out['problems'].append(
@@ -216,8 +207,8 @@ def audit_family_correction(path=None):
             _hp = _stored_holm.get(name)
             if isinstance(_hp, dict):
                 _hp = _hp.get('p_holm')
-            frozen_holm_p = _fin(_hp)
-            holm_mean_p = _fin(r.get('p_holm_mean'))
+            frozen_holm_p = _finite_number(_hp)
+            holm_mean_p = _finite_number(r.get('p_holm_mean'))
             if frozen_holm_p is not None and holm_mean_p is not None:
                 if not _close(holm_mean_p, frozen_holm_p):
                     out['problems'].append(
@@ -237,7 +228,7 @@ def audit_family_correction(path=None):
                     f'disagrees with its p={pm!r}')
         ci = r.get('ci_simultaneous')
         if isinstance(ci, (list, tuple)) and len(ci) == 2:
-            a0, b0 = _fin(ci[0]), _fin(ci[1])
+            a0, b0 = _finite_number(ci[0]), _finite_number(ci[1])
             if a0 is None or b0 is None or a0 > b0:
                 out['problems'].append(
                     f'{name}: simultaneous interval {ci!r} is not ordered/finite')

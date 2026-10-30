@@ -125,30 +125,9 @@ def audit_arm_ranking(path=None):
         print(json.dumps(out, ensure_ascii=False, indent=2))
         return out
 
-    def _positive_int(key, default=None):
-        raw = rk.get(key, default)
-        if isinstance(raw, (bool, np.bool_)) or raw is None:
-            return None
-        if isinstance(raw, numbers.Integral):
-            # Keep large exact integers exact instead of forcing them through
-            # float64 (a legal bootstrap seed may exceed the float range).
-            return int(raw)
-        if isinstance(raw, float):
-            return int(raw) if raw.is_integer() else None
-        try:
-            as_int = int(raw)
-        except (TypeError, ValueError, OverflowError):
-            return None
-        try:
-            if raw != as_int:
-                return None
-        except (TypeError, ValueError, OverflowError):
-            return None
-        return as_int
-
-    n_boot = _positive_int('n_boot')
-    boot_seed = _positive_int('bootstrap_seed')
-    min_seeds = _positive_int('min_seeds', 5)
+    n_boot = _int_field(rk, 'n_boot')
+    boot_seed = _int_field(rk, 'bootstrap_seed')
+    min_seeds = _int_field(rk, 'min_seeds', 5)
     if n_boot is None or boot_seed is None or min_seeds is None:
         out['status'] = 'fail'
         out['problems'].append(

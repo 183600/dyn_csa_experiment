@@ -36,28 +36,6 @@ def audit_selection(path='analysis_mechanism/selection_attribution.json'):
     if not isinstance(cells, list) or not cells:
         out.update({'status': 'fail', 'problems': ['artifact has no cells list']})
         return out
-    def _exact_int(value):
-        # Block/query counts are exact: int(1.5) would silently certify a
-        # different geometry (and a boolean is a flag, not a count).
-        if value is None or isinstance(value, (bool, np.bool_)):
-            return None
-        if isinstance(value, numbers.Integral):
-            return int(value)
-        try:
-            f = float(value)
-        except (TypeError, ValueError, OverflowError):
-            return None
-        return int(f) if math.isfinite(f) and f == math.floor(f) else None
-
-    def _exact_count(value):
-        # A numeric string is not an exact count.  `_exact_int` stays
-        # permissive for seed *keys* (JSON object keys are strings), but cell
-        # geometry is a measurement and must arrive as a real number.
-        if isinstance(value, (bool, np.bool_)) or not isinstance(value, numbers.Real):
-            return None
-        f = float(value)
-        return int(f) if math.isfinite(f) and f == math.floor(f) else None
-
     def _measurement(value):
         # Numeric strings are not recall/mass readings; float("0.9") would
         # otherwise let a hand-edited artifact unlock the claim gate.
@@ -1220,18 +1198,6 @@ def audit_unit_influence(path=None):
         print(json.dumps(out, ensure_ascii=False, indent=2))
         return out
 
-    def _finite(x):
-        # A numeric string (or bytes) is not a measurement: float("1.0")
-        # would let a hand-edited/stale artifact replay as a finite reading.
-        if (isinstance(x, (bool, np.bool_, str, bytes, bytearray))
-                or x is None):
-            return None
-        try:
-            y = float(x)
-        except (TypeError, ValueError, OverflowError):
-            return None
-        return y if math.isfinite(y) else None
-
     for name, comp in comps.items():
         if not isinstance(comp, dict):
             # A non-object comparison cannot carry a measured influence block;
@@ -1272,8 +1238,8 @@ def audit_unit_influence(path=None):
             continue
         n_units = inf.get('n_units')
         ids = inf.get('unit_ids')
-        pooled = _finite(ds.get('pooled_delta_ppl'))
-        full = _finite(inf.get('full_delta_ppl'))
+        pooled = _finite_number(ds.get('pooled_delta_ppl'))
+        full = _finite_number(inf.get('full_delta_ppl'))
         rec.update({'n_units': n_units, 'fragile_to_one_unit': inf.get('fragile_to_one_unit'),
                     'most_influential_unit': inf.get('most_influential_unit'),
                     'max_abs_relative_change_log_ratio':
@@ -1293,7 +1259,7 @@ def audit_unit_influence(path=None):
                 out['problems'].append(
                     f'{name}: {_vec_key} length does not match n_units={n_units!r}')
                 continue
-            if any(v is not None and _finite(v) is None for v in _vec):
+            if any(v is not None and _finite_number(v) is None for v in _vec):
                 out['problems'].append(
                     f'{name}: {_vec_key} contains a non-finite, non-null value')
         _idx = inf.get('most_influential_index')
@@ -1388,16 +1354,6 @@ def audit_two_level_ci(path=None):
         print(json.dumps(out, ensure_ascii=False, indent=2))
         return out
 
-    def _finite(x):
-        if (isinstance(x, (bool, np.bool_, str, bytes, bytearray))
-                or x is None):
-            return None
-        try:
-            y = float(x)
-        except (TypeError, ValueError, OverflowError):
-            return None
-        return y if math.isfinite(y) else None
-
     def _count(x):
         if isinstance(x, (bool, np.bool_, str, bytes, bytearray)) or x is None:
             return None
@@ -1427,11 +1383,11 @@ def audit_two_level_ci(path=None):
                 'total uncertainty is unverified')
             out['comparisons'][name] = rec
             continue
-        point = _finite(ds.get('pooled_two_level_delta_ppl'))
-        pooled = _finite(ds.get('pooled_delta_ppl'))
+        point = _finite_number(ds.get('pooled_two_level_delta_ppl'))
+        pooled = _finite_number(ds.get('pooled_delta_ppl'))
         lo = hi = None
         if isinstance(ci, (list, tuple)) and len(ci) == 2:
-            lo, hi = _finite(ci[0]), _finite(ci[1])
+            lo, hi = _finite_number(ci[0]), _finite_number(ci[1])
         n_seeds = _count(ds.get('pooled_two_level_n_seeds'))
         n_units = _count(ds.get('pooled_two_level_n_units'))
         n_boot = _count(ds.get('pooled_two_level_n_boot'))
@@ -1474,7 +1430,7 @@ def audit_two_level_ci(path=None):
         _doc = ds.get('pooled_delta_ppl_ci95')
         if (lo is not None and hi is not None
                 and isinstance(_doc, (list, tuple)) and len(_doc) == 2):
-            _dlo, _dhi = _finite(_doc[0]), _finite(_doc[1])
+            _dlo, _dhi = _finite_number(_doc[0]), _finite_number(_doc[1])
             if _dlo is not None and _dhi is not None and _dhi >= _dlo:
                 if (hi - lo) + 1e-12 < (_dhi - _dlo):
                     out['warnings'].append(
@@ -1537,16 +1493,6 @@ def audit_analysis_choices(path=None):
         print(json.dumps(out, ensure_ascii=False, indent=2))
         return out
 
-    def _finite(x):
-        if (isinstance(x, (bool, np.bool_, str, bytes, bytearray))
-                or x is None):
-            return None
-        try:
-            y = float(x)
-        except (TypeError, ValueError, OverflowError):
-            return None
-        return y if math.isfinite(y) else None
-
     def _same_choice_value(a, b):
         # bool must not compare equal to 1/0, and a numeric string must not
         # replay as a float (the concordance helper deliberately rejects both).
@@ -1563,7 +1509,7 @@ def audit_analysis_choices(path=None):
             if (isinstance(a, (complex, np.complexfloating))
                     or isinstance(b, (complex, np.complexfloating))):
                 return False
-            _fa, _fb = _finite(a), _finite(b)
+            _fa, _fb = _finite_number(a), _finite_number(b)
             return (_fa is not None and _fb is not None
                     and abs(_fa - _fb) <= 1e-12 * max(1.0, abs(_fa), abs(_fb)))
         return a == b
@@ -1719,7 +1665,7 @@ def audit_analysis_choices(path=None):
                             f'{name}: effect_range_ppl.{k}={_a!r} does not '
                             f'reproduce {_b!r}')
                     continue
-                _fa, _fb = _finite(_a), _finite(_b)
+                _fa, _fb = _finite_number(_a), _finite_number(_b)
                 if (_fa is None) != (_fb is None):
                     out['problems'].append(
                         f'{name}: effect_range_ppl.{k} presence does not '
@@ -1729,8 +1675,8 @@ def audit_analysis_choices(path=None):
                     out['problems'].append(
                         f'{name}: effect_range_ppl.{k}={_fa!r} does not '
                         f'reproduce {_fb!r}')
-        _pm = _finite(primaries[0].get('point'))
-        _mean = _finite(comp.get('mean'))
+        _pm = _finite_number(primaries[0].get('point'))
+        _mean = _finite_number(comp.get('mean'))
         if _pm is None or _mean is None:
             out['problems'].append(
                 f'{name}: primary analysis-choice point or frozen mean is '

@@ -1678,6 +1678,21 @@ def _fmt_pair(main, spread, width, main_fmt, spread_fmt, absent='—', main_cap=
              else f'{main:{fmt}}±{absent}')
     return s if len(s) >= width else f'{s:>{width}s}'
 
+def format_mean_std(cell, std=None):
+    """Render a report cell as ``mean ±std`` with two decimals.
+
+    ``cell`` is either a scalar mean or a mapping with ``mean`` / ``std``
+    keys; ``std`` supplies the spread for the scalar form.  A missing mean
+    renders as an em dash so a table never turns "no measurement" into zero.
+    """
+    if isinstance(cell, dict):
+        if cell.get('mean') is None:
+            return '—'
+        mean, std = cell['mean'], cell.get('std', 0.0)
+    else:
+        mean = cell
+    return f'{mean:.2f} ±{std or 0.0:.2f}'
+
 def _print_table(agg):
     print('\n============== validation perplexity (corpus per run cfg) ==============')
     print(f'{'variant':{_TW['variant']}s} {'PPL mean±std':>{_TW['ppl']}s} {'Δvs full':>{_TW['d']}s} {'Δvs sw128m':>{_TW['d2']}s} {'params(M)':>{_TW['params']}s} {'seeds':>{_TW['seeds']}s} {'blklen':>{_TW['blklen']}s} {'bndF1':>{_TW['bnd']}s}')

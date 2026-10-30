@@ -26,15 +26,6 @@ def audit_trajectory(path=None):
                     'endpoint remains the fixed final evaluation and a missing '
                     'block leaves stability unverified, not wrong')}
 
-    def _finite(x):
-        if isinstance(x, (bool, np.bool_, str, bytes, bytearray)) or x is None:
-            return None
-        try:
-            y = float(x)
-        except (TypeError, ValueError, OverflowError):
-            return None
-        return y if math.isfinite(y) else None
-
     def _count(x, minimum=None):
         # Step labels are exact integers.  Reading an integral value through
         # float64 rejected a legal label beyond float64's mantissa/exponent
@@ -45,7 +36,7 @@ def audit_trajectory(path=None):
         if isinstance(x, (numbers.Integral, np.integer)):
             y = int(x)
             return y if (minimum is None or y >= minimum) else None
-        value = _finite(x)
+        value = _finite_number(x)
         if value is None or not value.is_integer():
             return None
         y = int(value)
@@ -162,7 +153,7 @@ def audit_trajectory(path=None):
         if _stored_tail is not None and _stored_tail != tail_points:
             problems.append(f'{label}: tail_points is {_stored_tail}, but '
                             f'policy.tail_points is {tail_points}')
-        zero = _finite(policy.get('zero_tol_log'))
+        zero = _finite_number(policy.get('zero_tol_log'))
         if zero is None or zero < 0.0:
             problems.append(f'{label}: policy.zero_tol_log is not a finite '
                             'non-negative number')
@@ -186,8 +177,8 @@ def audit_trajectory(path=None):
                 problems.append(f'{label}: series steps are not strictly '
                                 f'increasing at index {i}')
             prev_step = step
-            mean_log = _finite(row.get('mean_log_ratio'))
-            mean_delta = _finite(row.get('mean_delta_ppl'))
+            mean_log = _finite_number(row.get('mean_log_ratio'))
+            mean_delta = _finite_number(row.get('mean_delta_ppl'))
             if mean_log is None or mean_delta is None:
                 problems.append(f'{label}: series[{i}] has a non-finite mean')
                 continue
@@ -227,13 +218,13 @@ def audit_trajectory(path=None):
                     # step label); float64 cannot hold every such label.
                     ok = int(stored) == int(fresh)
                 else:
-                    ok = _close(_finite(stored), _finite(fresh))
+                    ok = _close(_finite_number(stored), _finite_number(fresh))
             else:
                 ok = stored == fresh
             if not ok:
                 problems.append(f'{label}: {key} is {stored!r}, recomputed {fresh!r}')
-        if not _close(_finite(tr.get('tail_gap_slope_log_per_1k')),
-                      _finite(shape['gap_slope'])):
+        if not _close(_finite_number(tr.get('tail_gap_slope_log_per_1k')),
+                      _finite_number(shape['gap_slope'])):
             problems.append(f'{label}: tail_gap_slope_log_per_1k is '
                             f'{tr.get("tail_gap_slope_log_per_1k")!r}, '
                             f'recomputed {shape["gap_slope"]!r}')
@@ -242,12 +233,12 @@ def audit_trajectory(path=None):
                             'stored series length')
         if tr.get('shared_steps') != [r['step'] for r in parsed]:
             problems.append(f'{label}: shared_steps does not match the series')
-        if not _close(_finite(tr.get('final_mean_log_ratio')),
-                      _finite(parsed[-1]['mean_log_ratio'])):
+        if not _close(_finite_number(tr.get('final_mean_log_ratio')),
+                      _finite_number(parsed[-1]['mean_log_ratio'])):
             problems.append(f'{label}: final_mean_log_ratio does not match the '
                             'last series row')
-        if not _close(_finite(tr.get('final_mean_delta_ppl')),
-                      _finite(parsed[-1]['mean_delta_ppl'])):
+        if not _close(_finite_number(tr.get('final_mean_delta_ppl')),
+                      _finite_number(parsed[-1]['mean_delta_ppl'])):
             problems.append(f'{label}: final_mean_delta_ppl does not match the '
                             'last series row')
         delta_sign = _sign(parsed[-1]['mean_delta_ppl'], zero)
@@ -313,9 +304,9 @@ def audit_trajectory(path=None):
             if psign is not None:
                 problems.append(f'{label}: primary_sign is set without a '
                                 'primary_delta_ppl')
-        elif _finite(pd) is None:
+        elif _finite_number(pd) is None:
             problems.append(f'{label}: primary_delta_ppl is not finite')
-        elif psign != _sign(_finite(pd), zero):
+        elif psign != _sign(_finite_number(pd), zero):
             problems.append(f'{label}: primary_sign does not match '
                             'primary_delta_ppl and zero_tol')
         pv = tr.get('primary_vs_history_sign')

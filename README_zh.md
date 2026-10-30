@@ -2,24 +2,44 @@
 
 [English](README.md) | **中文说明**
 
-在小型从零训练语言模型（BPE-8k，WikiText-103）中，对**压缩块稀疏注意力**
-（CSA / HCA，固定分块与动态分块）与稠密注意力进行受控对比研究。本仓库包含
-实验代码以及在自己机器上**重跑实验**所需的协议。仓库**不包含数值结果**：没有随仓库发布证据归档（见 `RELEASES.md`），因此仅凭 Git 树无法独立复核任何报告中的 PPL 数值。仓库中的主张仅限 `confirmation_frozen.json` 冻结的范围；其余均为探索性。
+本仓库包含实验代码，以及在自己机器上**重跑**一项受控研究所需的协议。该研究
+在小型从零训练语言模型（BPE-8k，WikiText-103）中，对比**压缩块稀疏注意力**
+（CSA / HCA，固定分块与动态分块）与稠密注意力。
 
-> **证据等级**：v6–v11 为探索性（在同一 validation split 上选择后观察）；只有 v12 冻结的固定分块比较是确认性。详见 `DECISION_LOG.md` 与 `docs/design_notes.md` §17/§20。
->
-> **版本命名**：`v12` 是驱动/研究代次；`CODE_SEMANTICS = v11.128` 是冻结清单绑定的库测量语义戳，两者故意不同号。冻结清单当前为 `manifest_version: 3`（见其 `revision.history`）；P5T 已推迟，continuous-loop 工作流目前重新启用，并由仓库变量 `CONTINUOUS_LOOP_ENABLED` 控制。
+这是一个**只承载源码**的仓库：没有随仓库发布数值证据归档（见
+`RELEASES.md`）。因此，任何你没有用自己产物重建过的报告 PPL 数值，仅凭
+Git 树无法独立复核。仓库中的主张仅限 `confirmation_frozen.json` 冻结的
+范围；其余均为探索性。
 
-> **证据状态（引用数字前必读）**：`results_*/`、`analysis_*/`、`REPORT*.md` 有意不入库，且**没有随仓库发布证据归档**（`RELEASES.md` 尚无记录）。报告可由你自己产生的产物重建，但任何你没有重建过的报告数值都无法独立复核。只有当 `release_<tag>.tar.gz` 与清单发布到只读位置并通过 `archive_release.py verify` 时，相应主张才可审计。
+> **版本命名**：`v12` 是驱动/研究代次；`CODE_SEMANTICS = v11.128` 是冻结
+> 清单绑定的库测量语义戳。两套编号故意不同。冻结清单当前为
+> `manifest_version: 3`（见其 `revision.history`）。
+
+> **证据等级**：v6–v11 为探索性（在同一 validation split 上观察后继续
+> 扩展面板）；只有 v12 冻结的固定分块比较是确认性。详见 `DECISION_LOG.md`
+> 与 `docs/design_notes.md` §17/§20。
+
+> **证据状态（引用数字前必读）**：`results_*/`、`analysis_*/` 与
+> `REPORT*.md` 有意不入库，且**没有随仓库发布证据归档**
+> （`RELEASES.md` 尚无记录）。报告可由你自己产生的产物重建，但没有重建过
+> 的报告数值无法独立复核。只有当 `release_<tag>.tar.gz` 与清单发布到只读
+> 位置，并通过 `archive_release.py verify` 时，相应主张才可审计。
 
 ## 目录
 
+- [研究一览](#研究一览)
 - [从这里开始](#从这里开始)
 - [快速开始](#快速开始)
+  - [示例流程](#示例流程)
 - [从哪里读起](#从哪里读起)
 - [仓库结构](#仓库结构)
+  - [核心代码](#核心代码)
+  - [驱动模块](#驱动模块)
+  - [测试与冻结输入](#测试与冻结输入)
+  - [证据与设计记录](#证据与设计记录)
+  - [工具](#工具)
   - [重新生成实验产物](#重新生成实验产物)
-- [复现方法（任意 CUDA 机器）](#复现方法任意-cuda-机器)
+- [复现方法（任意机器）](#复现方法任意机器)
   - [环境](#环境)
   - [数据与缓存回退](#数据与缓存回退)
   - [训练前校验流水线](#训练前校验流水线)
@@ -32,9 +52,48 @@
   - [v12 确认套件（探索 / 确认分离）](#v12-确认套件探索--确认分离)
   - [v8 / v9 收尾套件](#v8--v9-收尾套件)
   - [v7 回应 reviewer 套件](#v7-回应-reviewer-套件)
+  - [常见注意事项](#常见注意事项)
 - [测量护栏](#测量护栏)
+- [延伸阅读](#延伸阅读)
+
+## 研究一览
+
+驱动按研究代次组织。每个驱动都有用于流水线自检的 `smoke` 模式、用于正式
+面板的训练模式，以及在适用时提供零 GPU 的分析/报告子命令。v6 保留历史
+脚本入口；v7 及之后位于 `explib/` 下。
+
+| 代次 | 范围 | 入口 | 生成的产物 |
+|---|---|---|---|
+| v6 | 核心 CSA/HCA 表、去一法消融、规模探针、长跑 | `python run_gapfill.py full` | `results_lm_v3_1500/`、`results_lm_v4_abl/`、`results_lm_v5_scale/`、`results_lm_v3_long/` |
+| v7 | RoPE + QK-norm、长度外推、top-k 扫描 | `python -m explib.rope` | `REPORT_v7.md` |
+| v8 | 规模面板补种子与 20k RoPE 长跑 | `python -m explib.scale` | `analysis_v8/` |
+| v9 | seq-2048 top-k 收尾与第三个 20k seed | `python -m explib.resume` | `REPORT_v9.md` |
+| v10 | 干扰项注入机制探针、交叉扩规模、选择器对照 | `python -m explib.corruption` | `analysis_v10/`、`REPORT_v10.md` |
+| v11 | v10/v11 面板的统计收尾 | `python -m explib.length` | `analysis_v11/`、`REPORT_v11.md` |
+| v12 | 冻结的固定分块确认 | `python -m explib.confirmation` | `analysis_v12/`、`REPORT_v12.md` |
+| M0 | FineWeb-Edu 数据路径、内核 G0 门、S1/S2 规模面板 | `python -m explib.m0` | `results_b_s1/`、`results_b_s2/`、`analysis_m0/` |
+| open-block | 最大块长 × 未结束块读取规则 | `python -m explib.open_block` | `analysis_open_block/` |
+
+训练从不隐式启动：只有名为 `full`、`phase <name>`、`main` 或 `auto` 的模式
+才会开始训练。各驱动的模式见下表；`--help` 打印驱动说明，argparse 驱动的
+子命令也会一并列出。
+
+| 驱动 | 模式 |
+|---|---|
+| `python run_gapfill.py` | `smoke`、`overfit`、`topup`、`full`（默认 `full`） |
+| `python -m explib.rope` | `smoke`、`analysis`、`phase P0R` / `P0W` / `P0E` / `P2S` / `P1L` / `P1T`、`full` |
+| `python -m explib.scale` | `smoke`、`analysis`、`phase P1S` / `P2R`、`full` |
+| `python -m explib.resume` | `smoke`、`analysis`、`report`、`phase P2T` / `P2S3`、`full` |
+| `python -m explib.corruption` | `smoke`、`analysis`、`report`、`phase <name>`、`full` |
+| `python -m explib.length` | `smoke`、`analysis`、`report`、`phase <name>`、`full` |
+| `python -m explib.confirmation` | `smoke`、`plan`、`dynamic-plan`、`power`、`phase <name>`、`analysis`、`report`、`full`、`auto` |
+| `python -m explib.open_block` | `smoke`、`pilot`、`main`、`aux`、`extended`、`report` |
+| `python -m explib.m0` | `params`、`data`、`smoke`、`kernel`、`analysis`、`full`、`auto` |
+| `python -m explib.reproduce` | `compare 原始目录 重跑目录`、`report OLD.json NEW.json` |
 
 ## 从这里开始
+
+所有命令均在仓库根目录执行。`make test` 通过即表示检出可用。
 
 | 目标 | 先运行 | 会启动训练吗？ |
 |---|---|---|
@@ -42,8 +101,8 @@
 | 预检冻结清单，不读 test split | `make plan` | 不会 |
 | 运行未结束块因果性/参考实现门禁 | `python -m pytest -q test_open_block.py` | 不会 |
 | 端到端试跑整条流水线 | `python run_gapfill.py smoke` | 仅 smoke 小跑 |
-| 运行或续跑正式面板 | [仓库结构](#仓库结构)中的驱动表 | 会 |
-| 从本地产物重建报告 | `python build_report.py` 或 `python -m explib.<driver> report` | 不会 |
+| 运行或续跑正式面板 | [研究一览](#研究一览)中的驱动表 | 会 |
+| 从本地产物重建报告 | `python build_report.py`，或该驱动提供 `report` 模式时使用它 | 不会 |
 | 比较两次运行是否一致 | `python -m explib.reproduce compare 原始目录 重跑目录` | 不会 |
 | 理解某个测量为什么这样定义 | [从哪里读起](#从哪里读起) | 不会 |
 
@@ -63,12 +122,41 @@ python -m explib.confirmation --help   # 列出子命令，不启动实验
 以上命令都不会启动训练。训练始终需要显式调用驱动的 `full`、`phase <name>`
 或 `auto` 模式；修改流水线后，先用该驱动的 `smoke` 模式验证。
 
+### 示例流程
+
+在动正式面板前先校验检出：
+
+```bash
+make test                              # CPU 套件
+python run_gapfill.py smoke            # v6 流水线自检，不产生研究测量
+python -m explib.confirmation plan     # 冻结清单预检，不读 test
+```
+
+逐阶段运行冻结确认链（每阶段可续跑；只有 `P5T` 读取 test split）：
+
+```bash
+python -m explib.confirmation plan
+python -m explib.confirmation phase P5C
+python -m explib.confirmation phase P5MP
+python -m explib.confirmation phase P5S2
+python -m explib.confirmation phase P5S3
+python -m explib.confirmation phase P5T
+python -m explib.confirmation analysis
+python -m explib.confirmation report
+```
+
+在相信重跑报告前，先与原始产物比较：
+
+```bash
+python -m explib.reproduce compare results_lm_v6 results_lm_v6_rerun
+```
+
 ### 从哪里读起
 
 | 问题 | 文档 |
 |---|---|
 | 实验如何运行或重跑？ | 本 README |
-| 该用哪个命令和子命令？ | [仓库结构](#仓库结构)与下文各驱动小节 |
+| 该用哪个命令和子命令？ | [研究一览](#研究一览)与下文各驱动小节 |
 | 某个测量或比较为什么这样定义？ | `docs/design_notes.md` |
 | 做过哪些决定，顺序如何？ | `DECISION_LOG.md` |
 | 已发布的证据在哪里？ | `RELEASES.md` |
@@ -78,9 +166,10 @@ python -m explib.confirmation --help   # 列出子命令，不启动实验
 
 仓库只保留**源码、驱动脚本与设计文档**。所有实验结果目录（`results_*/`）、
 零 GPU 分析目录（`analysis_*/`）、逐版报告（`REPORT*.md`）与运行状态文件
-都**不入库**——它们由驱动脚本在跑实验的机器上重新生成，需要时本地复现即可
-（见下文命令）。`.gitignore` 已把这几类路径挡在仓库外（`docs/` 只保留
-设计说明 `docs/design_notes.md`）。
+都**不入库**——它们由驱动脚本在跑实验的机器上重新生成。`.gitignore` 已把
+这几类路径挡在仓库外；`docs/` 只保留固定设计说明。
+
+### 核心代码
 
 | 路径 | 说明 |
 |---|---|
@@ -88,9 +177,15 @@ python -m explib.confirmation --help   # 列出子命令，不启动实验
 | `_split_loader.py` | 拆分包的共享加载器：按声明顺序把 `_parts/` 片段执行到调用方模块的 globals 中，并以片段路径作为 compile 文件名（traceback 指向可审查的源码） |
 | `explib/` | **核心库，也是唯一的代码来源**：模型、CSA/HCA 注意力、池化、indexer、分段器、训练循环、聚合与统计 |
 | `csa_kernels.py` | **兼容 shim**，重新导出 `_csa_kernels/` 实现 |
-| `_csa_kernels/` | **三算子融合内核路径**（已退役算力规划的 M0 工作包）：块压缩池化、索引 top-k 选择与稀疏注意力的 Triton 内核（附带同一套算法分解、任意设备可跑的 torch 参考孪生实现）；`CSA_KERNEL` 选开、默认关闭——见下文「Triton 内核路径（M0/G0）」 |
-| `run_gapfill.py` | **v6 驱动**：最小可发表补充实验，支持断点续跑，受运行时上限约束，每阶段完成后自动 push，结束后自动关机 |
-| `par.py` | **任务级并行执行器（可选）**：每个独立实验占一张 GPU 卡——见下文「任务级并行」 |
+| `_csa_kernels/` | **三算子融合内核路径**：块压缩池化、索引 top-k 选择与稀疏注意力的 Triton 内核（附带同一套算法分解、任意设备可跑的 torch 参考孪生实现）；`CSA_KERNEL` 选开、默认关闭——见下文 [Triton 内核路径](#triton-内核路径m0g0) |
+| `run_gapfill.py` | **v6 驱动**：核心/消融/规模/长跑面板，支持断点续跑，受运行时上限约束，每阶段完成后自动 push，结束后自动关机 |
+| `par.py` | **任务级并行执行器（可选）**：每个独立实验占一张 GPU 卡——见下文[任务级并行](#任务级并行每个实验一张卡) |
+| `data_guard.py` / `_data_guard/` | 防泄漏预处理与编码基础函数；shim 重新导出拆分包 |
+
+### 驱动模块
+
+| 路径 | 说明 |
+|---|---|
 | `explib/rope/` | **v7 驱动**（`python -m explib.rope`）：回应 reviewer 的补充实验套件——P0R RoPE+QK-norm、P0W 稠密预热、P0E 40k 步长跑、P2S 规模重播种、P1L 长度外推、P1T topk 扫描 |
 | `explib/scale/` | **v8 驱动**（`python -m explib.scale`）：P1S（规模面板补齐至 4 seeds）与 P2R（RoPE+QK-norm 20k 步长跑） |
 | `explib/resume/` | **v9 驱动**（`python -m explib.resume`）：P2T（seq-2048 的 topk 扫描，`batch_size=1`）与 P2S3（RoPE 20k 长跑的第三个 seed） |
@@ -98,29 +193,46 @@ python -m explib.confirmation --help   # 列出子命令，不启动实验
 | `explib/length/` | **v11 驱动**（`python -m explib.length`）：统计收尾——干扰探针扩到 n=6（P4MT/P4MP）、交叉面板扩到 n=4（P4S）、d=384 配对臂扩到 n=4（P4F） |
 | `explib/confirmation/` | **v12 确认驱动**（`python -m explib.confirmation`；评审响应 + 评审二轮加固）：P5C 按清单种子列表训练全部六个冻结臂，P5MP 跑扩展腐坏模式探针（uniform/realistic-token/mask/delete + 评审二轮新增 span/doc/topical + NIAH-natural），P5S2/P5S3 补等 token 与 6ND 参数量代理预算的大规模臂，P5T 按 `confirmation_frozen.json` 在 held-out 的 WikiText-103 test split 上做**冻结后一次性确认评估**——含加载期功效硬门槛（数学上不可能确认的清单直接拒绝）、严格记录准入（种子白名单/唯一记录/单一冻结切片/配方签名/manifest 哈希）、首次访问冻结锁与逐文档 PPL 落盘 |
 | `explib/open_block/` | **未结束块读取面板驱动**（`python -m explib.open_block`）：最大块长（32/64/128/无强制上限）× 当前未结束块读取方式（`closed` / `prefix_summary` / `prefix_singletons`）；共享 top-k 预算、因果前缀构造、窗口外辅助面板、逐种子配对差与交互统计——见 `docs/design_notes.md` §24 |
+| `explib/m0/` | **M0/S1 驱动（已选定 B 档）**（`python -m explib.m0`）：扩规模路线图的代码入口——`params`（零 GPU 的 S1–S4 参数量核算）、`data`（FineWeb-Edu + 32k BPE 语料缓存）、`smoke`（B 档数据路径端到端自检）、`kernel`（G0 验证套件：三算子 kernel/eager 数值对照 + 稀疏注意力基准）、`analysis`、`full`（S1 主面板）与 `auto`；见下文 [B 档 M0/S1](#b-档-m0--s1扩规模入口已选定-b-档) |
 | `explib/reproduce/` | **跨运行复现比较器**（`python -m explib.reproduce compare 原始目录 重跑目录`）：按 `variant::seedN` 逐格比较两份 panel，分别报告源码字节、数据切片、配置、执行环境、匹配初始化与最终 PPL 容差；缺指纹一律 `provenance_incomplete`，绝不当作通过。同一检查也暴露为 `audit_gates.py reproduction 原始目录 重跑目录`——见 `docs/design_notes.md` §83 |
+
+### 测试与冻结输入
+
+| 路径 | 说明 |
+|---|---|
 | `test_open_block.py` | **未结束块 CPU 门禁**：配置/分段器、优化前缀池化与逐查询参考的前向/梯度一致、前缀不变性、未来扰动/未来梯度、候选掩码、边界情形、closed 回归、单 token 语义与 HCA 预算声明 |
-| `test_review_part_*.py`, `test_review_fixes.py` | **CPU 评审 pytest 套件**：兼容入口与拆分后的测试模块（用 `make test` 或 `pytest` 运行） |
+| `test_review_part_*.py`、`test_review_fixes.py` | **CPU 评审 pytest 套件**：兼容入口与拆分后的测试模块（用 `make test` 或 `pytest` 运行） |
 | `confirmation_frozen.json` | **预注册确认清单**（入库；`manifest_version: 3`，修订历史 v1–v5）：冻结臂与种子 0-11（在任何 test-split 访问**之前**由 6 修订为 12，含功效表）、终点、精确符号翻转 + Holm、决策规则、机器可校验的绑定块与范围声明——见 `docs/design_notes.md` §17 与 `DECISION_LOG.md` |
 | `confirmation_frozen_dynamic.json` | **动态分块与 HCA 的独立预注册草案**（`manifest_version: 4`；尚未冻结）：H1 分段质量、H2 检索精度、H3 长程覆盖，以及冻结前必须排期的对照——见 `DECISION_LOG.md` |
+
+### 证据与设计记录
+
+| 路径 | 说明 |
+|---|---|
 | `RELEASES.md` | **证据发布索引**：每个不可变 `release_<tag>.tar.gz` 与 SHA-256 清单发布在哪里；Git 仓库本身只承载源码 |
-| `pyproject.toml` / `requirements.txt` / `requirements.lock` | Python ≥3.12 与依赖声明；需显式安装（无 import 时 pip install）。`requirements.lock` 是已验证的 CPU 环境 |
 | `DECISION_LOG.md` | **决策日志**（入库；因快照只有一个压缩提交，2026-10-18 依据 README/设计说明/清单重建）：每个版本为什么跑/不跑什么、看到什么、据此决定了什么——探索/确认分离的书面轨迹；正式版本的逐种子证据另由 `archive_release.py` 归档 |
 | `REVIEW_4_RESPONSE.md` | **评审四逐条回应**（入库）：21 个方法学问题、仓库已强制执行的部分、本轮修订了什么，以及哪些仍需新实验/产物才能回答 |
+| `docs/design_notes.md` | **设计与实现笔记**：块读门为何必须严格、且五处位置必须同步；动态分段器的前缀不变性要求；配对/可测量规则；报告约定；保证注意力按行分块与不分批形式等价的契约 |
+
+### 工具
+
+| 路径 | 说明 |
+|---|---|
 | `audit_gates.py` | **兼容 shim**，实现位于 `_audit_gates/`；即**评审二/四/七轮的可执行审计入口**（零实验）：数据泄漏（分词器来源/词表一致性/文档重叠）、纯 CPU 因果性单元审计（前缀不变性/标签移位/解码一致性）、分块归因/边界 vs 随机基线/长度口径/基线公平/失败集中度/预算对账，评审七的单因素设计门（声明对照的臂配置 diff 对声明的干预键集；冻结清单 mechanism_claim_allowed 标志对账）与 prefill-decode-内存测量工具 |
 | `archive_release.py` | **不可变证据归档器**：把每个正式版本的产物（结果/分析/报告/冻结锁/决策日志/环境/权重哈希）打包为带逐文件 sha256 清单的 tar.gz，附独立 verify 子命令——Git 主仓仍只承载源码（design_notes §8），归档发布到只读位置 |
-| `explib/m0/` | **M0/S1 驱动（已选定 B 档）**（`python -m explib.m0`）：扩规模路线图的代码入口——`params`（零 GPU 的 S1–S4 参数量核算）、`data`（FineWeb-Edu + 32k BPE 语料缓存）、`smoke`（B 档数据路径端到端自检）、`kernel`（G0 验证套件：三算子 kernel/eager 数值对照 + 稀疏注意力吞吐基准）、`full`（S1 主面板）；见下文“B 档 M0/S1” |
 | `build_report.py` | **兼容 shim**，实现位于 `_build_report/`；即零 GPU 报告构建器：从 `results_*/` + `analysis_*/` 产物重建 v7 报告（所有数字现算，绝不硬编码） |
 | `fuse_analysis.py` | 零 GPU fuse 对比驱动：从 `results_*/summary.json` 重算逐层边界对齐（tol=1）、块长统计与 PPL 曲线 |
-| `Makefile` | 零 GPU 入口：`make test`、`make plan`、`make audit`、`make integrity`、`make reproduce`、`make install-check`、`make build`、`make clean` |
-| `docs/design_notes.md` | **设计与实现笔记**：块读门为何必须严格、且五处位置必须同步；动态分段器的前缀不变性要求；配对/可测量规则；报告约定；保证注意力按行分块与不分批形式等价的契约 |
+| `baseline_tune.py` | 等搜索量基线调参驱动：所有臂使用同一份声明网格、只在 validation 上选择，并提供零 GPU 的 `plan`/`report` 审计路径 |
+| `error_analysis.py` | 零训练坏例分析：对已保存 checkpoint 只在 validation split 上统计最差 token/序列并做启发式归因 |
+| `Makefile` | 零 GPU 入口：`make test`、`make plan`、`make audit`、`make manipulation`、`make integrity`、`make env-check`、`make reproduce`、`make report-diff`、`make install-check`、`make build`、`make clean` |
+| `pyproject.toml` / `requirements.txt` / `requirements.lock` | Python ≥3.12 与依赖声明；需显式安装（无 import 时 pip install）。`requirements.lock` 是已验证的 CPU 环境 |
 
 > **测量库位于 `explib/`，直接编辑其中的模块。**
 > `exp_lib.py`（以及 `csa_kernels.py`、`audit_gates.py`、`build_report.py`、
 > `data_guard.py`）只是重新导出拆分包的兼容 shim。
 >
-> **驱动入口。** 历史顶层的 v7–v12、M0/S1 与未结束块脚本现已迁入 `explib/` 下的模块：
-> 使用 `python -m explib.rope`、`python -m explib.scale`、
+> **驱动入口。** 历史顶层的 v7–v12、M0/S1 与未结束块脚本现已迁入 `explib/`
+> 下的模块：使用 `python -m explib.rope`、`python -m explib.scale`、
 > `python -m explib.resume`、`python -m explib.corruption`、
 > `python -m explib.length`、`python -m explib.confirmation`、
 > `python -m explib.m0`、`python -m explib.open_block`。子命令不变。
@@ -130,14 +242,15 @@ python -m explib.confirmation --help   # 列出子命令，不启动实验
 结果目录与报告都不在仓库里。要重新得到它们：
 
 ```bash
-python run_gapfill.py smoke      # 端到端自检，不产生研究测量
-python run_gapfill.py full       # v6 主实验（受运行时上限约束）
-python -m explib.rope ...        # 各版本补充实验，子命令见对应模块的帮助
-python build_report.py           # 从落盘的 results_*/ + analysis_*/ 重建报告
+python run_gapfill.py smoke       # 端到端自检，不产生研究测量
+python run_gapfill.py full        # v6 主实验（受运行时上限约束）
+python -m explib.<driver> --help  # 驱动说明；适用时列出子命令
+python -m explib.<driver> report  # 仅对提供 report 模式的驱动重建报告
+python build_report.py            # 从落盘的 results_*/ + analysis_*/ 重建 v7 报告
 ```
 
-如果同一批格子跑了两遍（串行 vs 并行、换一台机器、或修复后重跑），不要
-直接相信报告，先比较第二份产物：
+如果同一批格子跑了两遍（串行 vs 并行、换一台机器、或修改代码后重跑），
+不要直接相信报告，先比较第二份产物：
 
 ```bash
 python -m explib.reproduce compare results_lm_v6 results_lm_v6_rerun
@@ -149,10 +262,11 @@ python -m explib.reproduce compare results_lm_v6 results_lm_v6_rerun
 `code_changed` / `numerical_drift` 不会被压成一句「没复现」；缺指纹是
 `provenance_incomplete`，不会被当成通过。
 
-## 复现方法（任意 CUDA 机器）
+## 复现方法（任意机器）
 
 以下命令按副作用分组：先准备环境，再跑零 GPU 校验，最后才启动训练。
-均在仓库根目录执行。
+均在仓库根目录执行。训练面板需要 GPU；测试、分析、报告构建与审计门在
+CPU 上运行。
 
 ### 环境
 
@@ -210,10 +324,10 @@ python -m explib.reproduce compare results_lm_v6 results_lm_v6_rerun
 
 ```bash
 python run_gapfill.py smoke
-python -m explib.corruption smoke   # 腐坏模式 + NIAH + 对照
+python -m explib.corruption smoke        # 腐坏模式 + NIAH + 对照
 python -m pytest -q test_open_block.py   # 未结束块因果性/参考实现/掩码门禁（CPU）
-python -m explib.open_block smoke   # 未结束块矩阵的微型合成自检
-python -m explib.confirmation smoke # 冻结最终测试的完整往返
+python -m explib.open_block smoke        # 未结束块矩阵的微型合成自检
+python -m explib.confirmation smoke      # 冻结最终测试的完整往返
 ```
 
 其余未结束块模式是真实运行：
@@ -244,6 +358,9 @@ tail -f run_v6.log
 | P-ABL | `results_lm_v4_abl` | 去一法消融表——面板内参照臂（`full` / `csa_fixed` / `csa_dynamic` / `hybrid_fixed` / `hybrid_dynamic`）+ `csa_fix_*` / `csa_dyn_*` 去模块臂，以及 fuse/HCA/topk 臂，1500 步 × 3 seeds |
 | P-SCALE | `results_lm_v5_scale` | d=384 / 8 层 / seq-1024 探针，5 变体 × 3 seeds × 4000 步 |
 | P-LONG | `results_lm_v3_long` | hybrid_fixed / hybrid_dynamic / hybrid_csa_dyn，seeds 0-2 → 三 seed 长跑表 |
+
+`python run_gapfill.py overfit` 是正式面板前的小批量过拟合自检（损失应能
+拟合、流水线保持有限）；`topup` 只补齐缺失种子，不重跑已完成单元。
 
 ### 任务级并行（每个实验一张卡）
 
@@ -280,30 +397,31 @@ CSA_PAR=2 CSA_PAR_GPUS=0,3 python -m explib.corruption phase P3SL
 
 ### B 档 M0 / S1（扩规模入口，已选定 B 档）
 
-B 档规模计划（入口 `python -m explib.m0`；原算力规划文档已退役）在 WikiText-103 机制层之上新增第二条语料路径与
-S1–S4 规模阶梯，代码入口为 `python -m explib.m0`：
+B 档规模计划（入口 `python -m explib.m0`；原算力规划文档已退役）在
+WikiText-103 机制层之上新增第二条语料路径与 S1–S4 规模阶梯：
 
 ```bash
 python -m explib.m0 params   # 零 GPU：S1–S4 参数量核算（对照规划值）
 python -m explib.m0 data     # 构建 / 校验 FineWeb-Edu 缓存（M0_TOKENS=… 可调 cap）
 python -m explib.m0 smoke    # 端到端自检：B 档数据路径 + 三条注意力路径
-python -m explib.m0 kernel   # G0 套件：kernel/eager 数值对照 + 吞吐基准
+python -m explib.m0 kernel   # G0 套件：kernel/eager 数值对照 + 基准
+python -m explib.m0 analysis # 零 GPU：S1/S2 描述性配对统计
 python -m explib.m0 full     # S1 主面板（5 臂 × 4 seeds；CSA_PAR=auto 可用）
 M0_PANEL=S2 python -m explib.m0 full   # S2 主面板（5 臂 × 3 seeds × 12B；M2_CAP_HOURS 可覆盖）
 python -m explib.m0 auto     # 无人值守：G0 门（fail-closed）→ 证书复核 → 面板链自动启动；
                            #   默认 S1，M0_AUTO_CHAIN=S1,S2 顺序串行（中间不关机）；
                            #   G0 通过后默认 CSA_KERNEL=1（显式设置优先）；门失败则
-                           #   不启动面板、不 push、留 40 分钟诊断窗口后关机
+                           #   不启动面板、不 push、留诊断窗口后关机
 ```
 
-- 语料：FineWeb-Edu（默认 `sample-10BT` 配置），自训 32k BPE；npy 缓存 + sha256
-  内容指纹，纪律与 `wt103_cache/` 完全一致；token id 以 2 字节落盘、int32 供给，
-  取批后照旧回宽 int64，下游路径不变；
-- 离线 / 内网机器：`FWEDU_LOCAL_JSONL` 指向本地 jsonl/txt 文档（纯可用性回退——
-  不同语料内容必然产生不同指纹，不会与真缓存混淆）；
-- `full` 受 `M0_CAP` 上限约束（状态文件 `run_time_state_m0.json`，`M0_CAP_HOURS`
-  可覆盖）：Triton 内核通过 G0 判据之前，eager 路径的预计耗时会被拒绝启动——
-  这是规划文档自身的前提判断（§3），不是缺陷。
+- 语料：FineWeb-Edu（默认 `sample-10BT` 配置），自训 32k BPE；npy 缓存 +
+  sha256 内容指纹，纪律与 `wt103_cache/` 完全一致；token id 以 2 字节落盘、
+  int32 供给，取批后照旧回宽 int64，下游路径不变；
+- 离线 / 内网机器：`FWEDU_LOCAL_JSONL` 指向本地 jsonl/txt 文档（纯可用性
+  回退——不同语料内容必然产生不同指纹，不会与真缓存混淆）；
+- `full` 受 `M0_CAP` 上限约束（状态文件 `run_time_state_m0.json`，
+  `M0_CAP_HOURS` 可覆盖）：Triton 内核通过 G0 判据之前，eager 路径的预计
+  耗时会被拒绝启动——这是规划文档自身的前提判断，不是缺陷。
 
 ### Triton 内核路径（M0/G0）
 
@@ -385,6 +503,8 @@ FLOPs，见 `docs/design_notes.md` §16）。成对污染协议、预注册交�
 python -m explib.confirmation smoke           # 端到端自检（微型 ckpt + 冻结清单副本）
 python -m explib.confirmation plan            # 零 GPU 预检：语义戳 + 实现绑定 + 准入 + 功效，不读 test；
                                               #   通过后自动留档审计快照 analysis_v12/plan_snapshot.json
+python -m explib.confirmation dynamic-plan    # 零 GPU 预检动态/HCA 草稿：设计自洽，不是确认
+python -m explib.confirmation power           # 零 GPU：用 P5C validation 差值做条件功效（不读 test）
 python -m explib.confirmation auto            # 无人值守：与 full 同链，但显式去掉了「P5T 前人工停顿」——
                                               #   plan 门先跑（fail-closed），批准证据（清单哈希/
                                               #   代码戳/git 树/arms/seeds/主比较/α）自动落盘，
@@ -424,6 +544,9 @@ python audit_gates.py looks       # look-history 门：复核逐 look p 与精�
 python audit_gates.py experiment_ledger  # 重放 experiments.jsonl 的哈希链与尾锚点；编辑/删除/重排/截断事件判 fail
 python audit_gates.py run_allocation  # 运行分配门：计划时间戳须早于首条 cell；臂×设备完全共线或计划覆盖不全判 fail
 python audit_gates.py report      # 运行本地可核验的全部审计 -> audit_report.json
+python audit_gates.py selection   # 选择召回契约：缺产物时拒绝不支持的选择机制主张
+python audit_gates.py efficiency_pairs  # 延迟主张必须同 shape/device/KV
+python audit_gates.py release     # 证据发布就绪：无完整记录 => source-only
 python archive_release.py plan v13 --dirs results_lm_test analysis_v12   # 证据归档 dry-run
 ```
 
@@ -456,7 +579,7 @@ python -m explib.rope phase P0E   # 40k 步长跑
 python -m explib.rope phase P2S   # 规模重播种至 4 seeds
 python -m explib.rope phase P1L   # 长度外推
 python -m explib.rope phase P1T   # seq-2048 topk 扫描
-python build_report.py        # 从产物重建 REPORT_v7.md（零 GPU）
+python build_report.py            # 从产物重建 REPORT_v7.md（零 GPU）
 ```
 
 所有驱动都按配置的运行时上限计量自己的加速器时间：超过上限的运行拒绝
@@ -466,9 +589,24 @@ python build_report.py        # 从产物重建 REPORT_v7.md（零 GPU）
 阶段完成后脚本自动 push 并关机（取消关机：`pkill -f v6autoshutdown`；
 禁止关机：`V6_NO_SHUTDOWN=1`；禁止 push：`V6_NO_PUSH=1`）。
 
-> 量值一律以 `build_report.py` / `fuse_analysis.py` 与各 `v*_supp.py report`
+> 量值一律以 `build_report.py` / `fuse_analysis.py` 与各驱动 `report`
 > 构建器从 `results_*/`、`analysis_*/` 落盘产物现算出的表格为准，仓库正文
 > 不写死任何量值。
+
+### 常见注意事项
+
+- **在仓库根目录运行。** 驱动按检出路径解析 `results_*/`、`analysis_*/`
+  与冻结清单。
+- **先看 `--help` 再选模式。** `python -m explib.<driver> --help` 打印驱动
+  说明，模式列表见[研究一览](#研究一览)。注意
+  `python -m explib.<driver> smoke --help` 不是帮助命令——位置式驱动会忽略
+  第二个 token，直接开始 smoke 运行。
+- **test split 是一次性的。** 只有 P5T 读 `wiki.test.raw`；不要在其外围
+  再写读 test 的脚本。
+- **陈旧缓存不会静默重建。** 更换 train 语料后先删除 `wt103_cache/` 再
+  重建，然后才比较两次运行。
+- **报告本身不等于证据。** 引用数字前先发布并校验归档
+  （`archive_release.py`）。
 
 ## 测量护栏
 
@@ -499,5 +637,10 @@ python build_report.py        # 从产物重建 REPORT_v7.md（零 GPU）
   `archive_release.py verify` 可独立校验已发布归档。当 `RELEASES.md`
   没有完整记录时，仓库保持 source-only。
 
-逐条评审处置见 `REVIEW_4_RESPONSE.md`；完整设计依据见
-`docs/design_notes.md`（§25、§56–§58、§84），时间线见 `DECISION_LOG.md`。
+## 延伸阅读
+
+- `docs/design_notes.md`——完整设计依据与测量契约（通常可从 §25、
+  §56–§58、§84 读起）。
+- `REVIEW_4_RESPONSE.md`——逐条评审处置。
+- `DECISION_LOG.md`——跑过什么、决定了什么的时间线。
+- `RELEASES.md`——证据发布索引（当前为 source-only）。

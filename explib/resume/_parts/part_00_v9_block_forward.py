@@ -326,14 +326,7 @@ def v9_analysis(out='analysis_v9/stats.json'):
         print(f'  {k:38s} Δ={v['mean']:+7.2f} ± {v.get('std', 0):5.2f}  p(sign-flip)={v['p_exact_signflip']:.3f}  n={v['n']}{_cap}')
     return out_d
 
-def _fmt_pm(cell, std=None):
-    if isinstance(cell, dict):
-        if cell.get('mean') is None:
-            return '—'
-        mean, std = (cell['mean'], cell.get('std', 0.0))
-    else:
-        mean = cell
-    return f'{mean:.2f} ±{std or 0.0:.2f}'
+_fmt_pm = L.format_mean_std
 
 def _holm_txt(v):
     _p = v.get('p_holm') if isinstance(v, dict) else None

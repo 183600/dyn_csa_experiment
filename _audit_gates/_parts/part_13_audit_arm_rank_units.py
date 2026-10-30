@@ -150,31 +150,10 @@ def audit_arm_rank_units(path=None):
         print(json.dumps(out, ensure_ascii=False, indent=2))
         return out
 
-    def _positive_int(key, default=None):
-        raw = rk.get(key, default)
-        if isinstance(raw, (bool, np.bool_)) or raw is None:
-            return None
-        if isinstance(raw, numbers.Integral):
-            # Keep large exact integers exact instead of forcing them through
-            # float64 (a legal bootstrap seed may exceed the float range).
-            return int(raw)
-        if isinstance(raw, float):
-            return int(raw) if raw.is_integer() else None
-        try:
-            as_int = int(raw)
-        except (TypeError, ValueError, OverflowError):
-            return None
-        try:
-            if raw != as_int:
-                return None
-        except (TypeError, ValueError, OverflowError):
-            return None
-        return as_int
-
-    n_boot = _positive_int('n_boot')
-    boot_seed = _positive_int('bootstrap_seed')
-    min_seeds = _positive_int('min_seeds', 5)
-    min_units = _positive_int('min_units', 8)
+    n_boot = _int_field(rk, 'n_boot')
+    boot_seed = _int_field(rk, 'bootstrap_seed')
+    min_seeds = _int_field(rk, 'min_seeds', 5)
+    min_units = _int_field(rk, 'min_units', 8)
     tie_tol = rk.get('tie_tol', 0.0)
     for _name, _v in (('n_boot', n_boot), ('bootstrap_seed', boot_seed),
                       ('min_seeds', min_seeds), ('min_units', min_units)):

@@ -654,26 +654,6 @@ def audit_length(bylen_path='results_lm_test/bylen.json'):
     L = _import_exp_lib()
     import numpy as np
 
-    def _exact_int(value):
-        if value is None or isinstance(value, (bool, np.bool_)):
-            return None
-        if isinstance(value, numbers.Integral):
-            return int(value)
-        try:
-            f = float(value)
-        except (TypeError, ValueError, OverflowError):
-            return None
-        return int(f) if math.isfinite(f) and f == math.floor(f) else None
-
-    def _exact_value(value):
-        # `_exact_int` stays permissive for by_len *keys* (JSON object keys
-        # are strings); a count stored as a numeric string is not a
-        # measurement and must not certify the target set.
-        if isinstance(value, (bool, np.bool_)) or not isinstance(value, numbers.Real):
-            return None
-        f = float(value)
-        return int(f) if math.isfinite(f) and f == math.floor(f) else None
-
     def _hashable(value):
         # Artifact cells are JSON, but a direct caller can supply a list/dict
         # where a count/flag belongs.  Such a value is unverifiable and must
@@ -712,18 +692,18 @@ def audit_length(bylen_path='results_lm_test/bylen.json'):
                 problems.append(f'{key}: L{Ln} cell is not a JSON object')
                 continue
             e = by_len.setdefault(Ln, {'n_tok': set(), 'eval_span': set(), 'truncated': set(), 'n_seq': set()})
-            e['n_tok'].add(_exact_value(c.get('n_tok')))
-            e['eval_span'].add(_exact_value(c.get('eval_span')))
+            e['n_tok'].add(_exact_count(c.get('n_tok')))
+            e['eval_span'].add(_exact_count(c.get('eval_span')))
             e['truncated'].add(_hashable(c.get('truncated')))
             for _field in ('n_tok', 'eval_span'):
-                if _exact_value(c.get(_field)) is None:
+                if _exact_count(c.get(_field)) is None:
                     problems.append(
                         f'{key}: L{Ln} cell has no exact integer `{_field}` '
                         f'({c.get(_field)!r}) — the scored target set is unverifiable')
             _nseq_cell = None
             _seq_explicit = None
             if c.get('n_seq') is not None:
-                _seq_explicit = _exact_value(c.get('n_seq'))
+                _seq_explicit = _exact_count(c.get('n_seq'))
                 if _seq_explicit is None:
                     problems.append(
                         f'{key}: L{Ln} cell has a non-integer `n_seq` '
@@ -751,8 +731,8 @@ def audit_length(bylen_path='results_lm_test/bylen.json'):
             # (but equally wrong) counts across arms are not a valid target
             # set, so verify the formula whenever the cell claims to be a
             # full-length measurement.
-            _nt = _exact_value(c.get('n_tok'))
-            _ns = _exact_value(_nseq_cell)
+            _nt = _exact_count(c.get('n_tok'))
+            _ns = _exact_count(_nseq_cell)
             _trunc = c.get('truncated')
             if (isinstance(_trunc, (bool, np.bool_)) and not bool(_trunc)
                     and _ns is not None and _nt is not None):

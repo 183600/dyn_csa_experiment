@@ -456,14 +456,7 @@ def v10_analysis(out='analysis_v10/stats.json'):
                 print(f'  crossover {label:10s} mean-traj: step {v['mean_crossover_step']:g} (tokens/step unknown)')
     return out_d
 
-def _fmt_pm(cell, std=None):
-    if isinstance(cell, dict):
-        if cell.get('mean') is None:
-            return '—'
-        mean, std = (cell['mean'], cell.get('std', 0.0))
-    else:
-        mean = cell
-    return f'{mean:.2f} ±{std or 0.0:.2f}'
+_fmt_pm = L.format_mean_std
 
 def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
     v10_analysis(out=stats_p)

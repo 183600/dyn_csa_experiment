@@ -275,14 +275,7 @@ def v11_analysis(out='analysis_v11/stats.json'):
 def contrasts_headline(probe):
     return {k: v for k, v in probe.get('contrasts', {}).items() if k.startswith('L4096') and ('r0.25' in k or 'r0.5' in k)}
 
-def _fmt_pm(cell, std=None):
-    if isinstance(cell, dict):
-        if cell.get('mean') is None:
-            return '—'
-        mean, std = (cell['mean'], cell.get('std', 0.0))
-    else:
-        mean = cell
-    return f'{mean:.2f} ±{std or 0.0:.2f}'
+_fmt_pm = L.format_mean_std
 
 def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
     v11_analysis(out=stats_p)

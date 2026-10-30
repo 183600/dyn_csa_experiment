@@ -69,17 +69,8 @@ def audit_practical_significance(path=None):
             'the descriptive practical block must not carry frozen decision '
             f'fields: {bad_keys}')
 
-    def _fin(x):
-        if isinstance(x, (bool, np.bool_, str, bytes, bytearray)) or x is None:
-            return None
-        try:
-            y = float(x)
-        except (TypeError, ValueError, OverflowError):
-            return None
-        return y if math.isfinite(y) else None
-
     def _close(a, b, *, abs_tol=1e-12, rel_tol=1e-9):
-        x, y = _fin(a), _fin(b)
+        x, y = _finite_number(a), _finite_number(b)
         if x is None or y is None:
             return x is None and y is None
         return math.isclose(x, y, rel_tol=rel_tol, abs_tol=abs_tol)
@@ -123,7 +114,7 @@ def audit_practical_significance(path=None):
         if source.get('status') in ('not_declared',) or source.get('margin') is None:
             out['n_skipped'] += 1
             continue
-        margin = _fin(source.get('margin'))
+        margin = _finite_number(source.get('margin'))
         if margin is None or margin <= 0.0:
             out['problems'].append(f'{name}: margin is not finite/positive')
             continue
@@ -133,16 +124,16 @@ def audit_practical_significance(path=None):
         if _pm is not None and not _close(_pm, margin):
             out['problems'].append(
                 f'{name}: row margin={margin!r} != policy margin={_pm!r}')
-        if _fin(_pol.get('alpha')) is not None and not _close(_pol.get('alpha'), block.get('alpha')):
+        if _finite_number(_pol.get('alpha')) is not None and not _close(_pol.get('alpha'), block.get('alpha')):
             out['problems'].append(
                 f'policy.alpha={_pol.get("alpha")!r} != family alpha={block.get("alpha")!r}')
-        if _fin(_pol.get('tost_conf')) is not None and not _close(
+        if _finite_number(_pol.get('tost_conf')) is not None and not _close(
                 _pol.get('tost_conf'), block.get('tost_conf')):
             out['problems'].append(
                 f'policy.tost_conf={_pol.get("tost_conf")!r} != family '
                 f'tost_conf={block.get("tost_conf")!r}')
-        alpha = _fin(source.get('alpha', block.get('alpha')))
-        tost_conf = _fin(source.get('tost_conf', block.get('tost_conf')))
+        alpha = _finite_number(source.get('alpha', block.get('alpha')))
+        tost_conf = _finite_number(source.get('tost_conf', block.get('tost_conf')))
         scale = source.get('scale', block.get('scale', 'log_ratio'))
         seeds = source.get('seeds')
         if seeds is not None and not isinstance(seeds, list):
@@ -181,7 +172,7 @@ def audit_practical_significance(path=None):
                                 f'{name}: frozen per_seed[{i}]={raw!r} != arm difference {a - b!r}')
                             break
         elif isinstance(stored_lr, list) and stored_lr:
-            d = [_fin(x) for x in stored_lr]
+            d = [_finite_number(x) for x in stored_lr]
             if any(x is None for x in d):
                 d = None
         if not d:

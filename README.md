@@ -2,34 +2,59 @@
 
 **English** | [中文说明](README_zh.md)
 
+This repository contains the experiment code and the protocols needed to
+**re-run** a controlled study of compressed-block sparse attention (CSA / HCA,
+fixed and dynamic blocking) against dense attention in a small from-scratch
+language model (BPE-8k, WikiText-103).
 
-Controlled study of compressed-block sparse attention (CSA / HCA, fixed and
-dynamic blocking) vs dense attention in a small from-scratch LM (BPE-8k,
-WikiText-103). This repository contains the experiment code and the
-protocols needed to RE-RUN the experiments on a machine of your own. It does
-**not** contain the numeric results: no evidence release is bundled (see
-`RELEASES.md`), so no PPL number in the generated reports is independently
-auditable from this Git tree alone. Claims are limited to the frozen
-scope in `confirmation_frozen.json`; everything else is exploratory.
+It is a **source-only** repository: no numeric evidence release is bundled (see
+`RELEASES.md`). A PPL number in a report you have not regenerated from your own
+artifacts is therefore not independently auditable from this Git tree alone.
+Claims are limited to the frozen scope in `confirmation_frozen.json`; everything
+else is exploratory.
 
-> **Version naming.** `v12` is the driver/study generation; `CODE_SEMANTICS =`
-> `v11.128` is the library measurement-semantics stamp that the frozen plan
-> binds. They are not the same numbering scheme, and the mismatch is intentional.
-> The frozen manifest is at `manifest_version: 3` (see its `revision.history`).
-> P5T is deferred, and the continuous-loop workflow is currently re-enabled,
-> gated by the repository variable `CONTINUOUS_LOOP_ENABLED`.
+> **Version naming.** `v12` is the driver/study generation. `CODE_SEMANTICS =
+> v11.128` is the library measurement-semantics stamp bound by the frozen plan.
+> The two numbering schemes are intentionally different. The frozen manifest is
+> at `manifest_version: 3` (see its `revision.history`).
 
-> **Evidence levels.** v6-v11 are exploratory (selected on the same validation
-split). Only the frozen v12 fixed-chunk comparisons are confirmatory. See
-`DECISION_LOG.md` and `docs/design_notes.md` §17/§20.
+> **Evidence levels.** v6-v11 are exploratory: panels were extended after
+> looking at the same validation split. Only the frozen v12 fixed-chunk
+> comparisons are confirmatory. See `DECISION_LOG.md` and
+> `docs/design_notes.md` §17/§20.
 
-> **Evidence status (read this before quoting a number).** `results_*/`,
-> `analysis_*/` and `REPORT*.md` are intentionally not tracked, and **no
-> formal evidence release is bundled** (`RELEASES.md` has no row yet). The
-> generated reports are reproducible from artifacts you produce yourself, but
-> the numbers in any report you have not regenerated are not independently
-> auditable. A claim becomes auditable only when its `release_<tag>.tar.gz`
-> plus manifest is published and `archive_release.py verify` passes.
+> **Evidence status — read this before quoting a number.** `results_*/`,
+> `analysis_*/` and `REPORT*.md` are intentionally not tracked, and no formal
+> evidence release is bundled (`RELEASES.md` has no row yet). Generated reports
+> are reproducible from artifacts you produce yourself, but a claim becomes
+> auditable only when its `release_<tag>.tar.gz` plus manifest is published and
+> `archive_release.py verify` passes.
+
+## Contents
+
+- [Study at a glance](#study-at-a-glance)
+- [Start here](#start-here)
+- [Quick start](#quick-start)
+  - [Example workflows](#example-workflows)
+- [Where to look](#where-to-look)
+- [Repository layout](#repository-layout)
+  - [Regenerating the experiment artifacts](#regenerating-the-experiment-artifacts)
+- [Running the experiments](#running-the-experiments)
+  - [Environment](#environment)
+  - [Data and cache fallbacks](#data-and-cache-fallbacks)
+  - [Validate the pipeline before training](#validate-the-pipeline-before-training)
+  - [Run the v6 supplementary study](#run-the-v6-supplementary-study)
+  - [Task-level parallelism (one GPU per run)](#task-level-parallelism-one-gpu-per-run)
+  - [B-tier M0 / S1 (scale-up entry point, adopted tier B)](#b-tier-m0--s1-scale-up-entry-point-adopted-tier-b)
+  - [Triton kernel path (M0/G0)](#triton-kernel-path-m0g0)
+  - [v11 statistical close-out suite](#v11-statistical-close-out-suite)
+  - [v10 mechanism / scaling / stats suite](#v10-mechanism--scaling--stats-suite)
+  - [v12 confirmation suite (exploration / confirmation split)](#v12-confirmation-suite-exploration--confirmation-split)
+  - [v8 / v9 close-out suites](#v8--v9-close-out-suites)
+  - [v7 reviewer-response suite](#v7-reviewer-response-suite)
+  - [Common pitfalls](#common-pitfalls)
+- [Measurement guardrails](#measurement-guardrails)
+- [Further reading](#further-reading)
 
 ## Study at a glance
 
@@ -50,36 +75,27 @@ entry point; v7 onwards live under `explib/`.
 | M0 | FineWeb-Edu data path, kernel G0 gate, S1/S2 scale panels | `python -m explib.m0` | `results_b_s1/`, `results_b_s2/`, `analysis_m0/` |
 | open-block | maximum block length × open-block reading rule | `python -m explib.open_block` | `analysis_open_block/` |
 
-Run a driver with `--help` for its exact subcommands. Training is never
-implicit: it starts only in a mode named `full`, `phase <name>`, `main`, or
-`auto`.
+Training is never implicit: it starts only in a mode named `full`,
+`phase <name>`, `main`, or `auto`. The modes are summarized below; `--help`
+prints the driver description, and the argparse-based drivers also list their
+subcommands.
 
-## Contents
-
-- [Study at a glance](#study-at-a-glance)
-- [Start here](#start-here)
-- [Quick start](#quick-start)
-- [Where to look](#where-to-look)
-- [Repository layout](#repository-layout)
-  - [Regenerating the experiment artifacts](#regenerating-the-experiment-artifacts)
-- [Running the experiments](#running-the-experiments)
-  - [Environment](#environment)
-  - [Data and cache fallbacks](#data-and-cache-fallbacks)
-  - [Validate the pipeline before training](#validate-the-pipeline-before-training)
-  - [Run the v6 supplementary study](#run-the-v6-supplementary-study)
-  - [Task-level parallelism (one GPU per run)](#task-level-parallelism-one-gpu-per-run)
-  - [B-tier M0 / S1 (scale-up entry point, adopted tier B)](#b-tier-m0--s1-scale-up-entry-point-adopted-tier-b)
-  - [Triton kernel path (M0/G0)](#triton-kernel-path-m0g0)
-  - [v11 statistical close-out suite](#v11-statistical-close-out-suite)
-  - [v10 mechanism / scaling / stats suite](#v10-mechanism--scaling--stats-suite)
-  - [v12 confirmation suite (exploration / confirmation split)](#v12-confirmation-suite-exploration--confirmation-split)
-  - [v8 / v9 close-out suites](#v8--v9-close-out-suites)
-  - [v7 reviewer-response suite](#v7-reviewer-response-suite)
-- [Measurement guardrails](#measurement-guardrails)
+| driver | modes |
+|---|---|
+| `python run_gapfill.py` | `smoke`, `overfit`, `topup`, `full` (default `full`) |
+| `python -m explib.rope` | `smoke`, `analysis`, `phase P0R` / `P0W` / `P0E` / `P2S` / `P1L` / `P1T`, `full` |
+| `python -m explib.scale` | `smoke`, `analysis`, `phase P1S` / `P2R`, `full` |
+| `python -m explib.resume` | `smoke`, `analysis`, `report`, `phase P2T` / `P2S3`, `full` |
+| `python -m explib.corruption` | `smoke`, `analysis`, `report`, `phase <name>`, `full` |
+| `python -m explib.length` | `smoke`, `analysis`, `report`, `phase <name>`, `full` |
+| `python -m explib.confirmation` | `smoke`, `plan`, `dynamic-plan`, `power`, `phase <name>`, `analysis`, `report`, `full`, `auto` |
+| `python -m explib.open_block` | `smoke`, `pilot`, `main`, `aux`, `extended`, `report` |
+| `python -m explib.m0` | `params`, `data`, `smoke`, `kernel`, `analysis`, `full`, `auto` |
+| `python -m explib.reproduce` | `compare ORIGINAL RERUN`, `report OLD.json NEW.json` |
 
 ## Start here
 
-All commands below run from the repository root. A checkout is healthy when
+Run every command from the repository root. A checkout is healthy when
 `make test` passes.
 
 | goal | start with | starts training? |
@@ -88,16 +104,16 @@ All commands below run from the repository root. A checkout is healthy when
 | validate the frozen plan without touching the test split | `make plan` | no |
 | run the open-block causality/reference gates | `python -m pytest -q test_open_block.py` | no |
 | try the pipeline end to end | `python run_gapfill.py smoke` | smoke run only |
-| run or resume a study panel | [Study at a glance](#study-at-a-glance) | yes |
-| rebuild a report from local artifacts | `python build_report.py` or `python -m explib.<driver> report` | no |
+| run or resume a study panel | the [Study at a glance](#study-at-a-glance) table | yes |
+| rebuild a report from local artifacts | `python build_report.py`, or the driver's `report` mode where it has one | no |
 | check whether two runs agree | `python -m explib.reproduce compare ORIGINAL RERUN` | no |
 | understand why a measurement is defined this way | the [Where to look](#where-to-look) table | no |
 
 ## Quick start
 
 Python 3.12 is required. `requirements.lock` is the verified CPU environment
-used by the tests and the zero-GPU analysis path. On a CUDA machine, install
-the torch wheel that matches the local driver first, then the ranges in
+used by the tests and the zero-GPU analysis path. On a CUDA machine, install the
+torch wheel that matches the local driver first, then the ranges in
 `requirements.txt` (see [Environment](#environment)).
 
 ```bash
@@ -108,9 +124,39 @@ python -m explib.confirmation --help   # list subcommands without starting a run
 ```
 
 None of these commands starts a training run. Training is always explicit:
-invoke a driver's `full`, `phase <name>`, or `auto` mode when you intend to
-run it, and start with that driver's `smoke` mode when validating a change to
-the pipeline.
+invoke a driver's `full`, `phase <name>`, or `auto` mode when you intend to run
+it, and start with that driver's `smoke` mode when validating a change to the
+pipeline.
+
+### Example workflows
+
+Validate a checkout before touching a panel:
+
+```bash
+make test                              # CPU suite
+python run_gapfill.py smoke            # v6 plumbing, no research measurement
+python -m explib.confirmation plan     # frozen-plan preflight, no test read
+```
+
+Run the frozen confirmation chain phase by phase (each phase is resumable; only
+`P5T` reads the test split):
+
+```bash
+python -m explib.confirmation plan
+python -m explib.confirmation phase P5C
+python -m explib.confirmation phase P5MP
+python -m explib.confirmation phase P5S2
+python -m explib.confirmation phase P5S3
+python -m explib.confirmation phase P5T
+python -m explib.confirmation analysis
+python -m explib.confirmation report
+```
+
+Compare a re-run against the original before trusting its report:
+
+```bash
+python -m explib.reproduce compare results_lm_v6 results_lm_v6_rerun
+```
 
 ### Where to look
 
@@ -125,14 +171,14 @@ the pipeline.
 
 ## Repository layout
 
-The repository keeps only **source code, driver scripts and design
-documents**. All experiment result directories (`results_*/`), zero-GPU
-analysis directories (`analysis_*/`), per-version reports (`REPORT*.md`) and
-run-state files are **not tracked** — the driver scripts below regenerate them
-on whatever machine runs the experiments, so you can simply reproduce them
-locally whenever needed (see the commands in the next section). `.gitignore`
-already keeps those path families out of the repository (`docs/` retains only
-the design notes, `docs/design_notes.md`).
+The repository keeps only **source code, driver scripts and design documents**.
+Experiment result directories (`results_*/`), zero-GPU analysis directories
+(`analysis_*/`), per-version reports (`REPORT*.md`) and run-state files are
+**not tracked**: the drivers regenerate them on whichever machine runs the
+experiments. `.gitignore` keeps those path families out of the repository;
+`docs/` retains only the fixed design notes.
+
+### Core code
 
 | path | what |
 |---|---|
@@ -140,32 +186,55 @@ the design notes, `docs/design_notes.md`).
 | `_split_loader.py` | shared loader for the split packages: runs each `_parts/` fragment in the caller's module globals, in declared order, with the fragment path as the compile filename (so tracebacks point at the reviewable source) |
 | `explib/` | **the library — and the source of truth**: model, CSA/HCA attention, pooling, indexer, segmenters, training loop, aggregation and statistics |
 | `csa_kernels.py` | **compatibility shim** that re-exports the split implementation in `_csa_kernels/` |
-| `_csa_kernels/` | **the fused-kernel path for the three core operators** (the retired compute-plan M0 work package): block-compression pooling, indexer top-k selection and sparse attention as Triton kernels (plus a CPU-runnable torch-reference twin of the same algorithmic decomposition); opt-in via `CSA_KERNEL`, off by default — see "Triton kernel path (M0/G0)" below |
+| `_csa_kernels/` | **fused-kernel path for the three core operators**: block-compression pooling, indexer top-k selection and sparse attention as Triton kernels (plus a CPU-runnable torch-reference twin of the same algorithmic decomposition); opt-in via `CSA_KERNEL`, off by default — see [Triton kernel path (M0/G0)](#triton-kernel-path-m0g0) |
 | `run_gapfill.py` | **the v6 driver**: core/ablation/scale/long panels, resumable, guarded by a run-time cap, pushes after every phase, auto-shuts the instance down |
-| `par.py` | **task-level parallel executor (opt-in)**: one GPU card per independent run — see "Task-level parallelism" below |
+| `par.py` | **task-level parallel executor (opt-in)**: one GPU card per independent run — see [Task-level parallelism](#task-level-parallelism-one-gpu-per-run) |
+| `data_guard.py` / `_data_guard/` | leakage-safe preprocessing and encoding primitives; the shim re-exports the split package |
+
+### Driver modules
+
+| path | what |
+|---|---|
 | `explib/rope/` | **the v7 driver** (`python -m explib.rope`): reviewer-response supplementary suite — P0R RoPE+QK-norm, P0W dense-warmup, P0E 40k-step long run, P2S scale re-seeding, P1L length extrapolation, P1T topk sweep |
 | `explib/scale/` | **the v8 driver** (`python -m explib.scale`): P1S (scale panel seed completion to 4 seeds) and P2R (RoPE+QK-norm 20k-step long run) |
 | `explib/resume/` | **the v9 driver** (`python -m explib.resume`): P2T (the seq-2048 topk sweep at `batch_size=1`) and P2S3 (third seed for the RoPE 20k run) |
 | `explib/corruption/` | **the v10 driver** (`python -m explib.corruption`): P3M length-extrapolation mechanism + distractor-injection probe, P3S inversion-crossover scaling, P3T topk sweep to 4 seeds |
 | `explib/length/` | **the v11 driver** (`python -m explib.length`): statistical close-out — distractor probe to n=6 (P4MT/P4MP), crossover panels to n=4 (P4S), d=384 paired arms to n=4 (P4F) |
-| `explib/confirmation/` | **the v12 confirmation driver** (`python -m explib.confirmation`; reviewer-response + review-2 hardening): P5C trains all six frozen arms at the manifest seed list, P5MP runs the extended corruption-mode probe (uniform/realistic-token/mask/delete + review-2 span/doc/topical + NIAH-natural), P5S2/P5S3 add the token-matched and 6ND-param-proxy scale arms, P5T performs the FROZEN final evaluation on the held-out WikiText-103 test split per `confirmation_frozen.json` — with a load-time plan-power gate (a plan that cannot mathematically confirm is refused), strict record admission (seed whitelist / unique records / one frozen test slice / recipe signature / manifest sha), a first-access freeze lock, and per-document PPL records |
+| `explib/confirmation/` | **the v12 confirmation driver** (`python -m explib.confirmation`; reviewer-response + review-2 hardening): P5C trains all six frozen arms at the manifest seed list, P5MP runs the extended corruption-mode probe (uniform/realistic-token/mask/delete + review-2 span/doc/topical + NIAH-natural), P5S2/P5S3 add the token-matched and 6ND-param-proxy scale arms, P5T performs the frozen final evaluation on the held-out WikiText-103 test split per `confirmation_frozen.json` — with a load-time plan-power gate (a plan that cannot mathematically confirm is refused), strict record admission (seed whitelist / unique records / one frozen test slice / recipe signature / manifest sha), a first-access freeze lock, and per-document PPL records |
 | `explib/open_block/` | **open-block panel driver** (`python -m explib.open_block`): maximum block length (32/64/128/no cap) × current-block reading rule (`closed` / `prefix_summary` / `prefix_singletons`), with a shared top-k budget, causal prefix construction, outside-window auxiliary panel, paired per-seed deltas and interaction statistics — see `docs/design_notes.md` §24 |
+| `explib/m0/` | **the M0/S1 driver (adopted B tier)** (`python -m explib.m0`): entry points for the scale-up roadmap — `params` (zero-GPU S1–S4 parameter audit), `data` (FineWeb-Edu + 32k-BPE corpus cache), `smoke` (end-to-end self-check on the B-tier data path), `kernel` (the G0 validation suite: kernel/eager numerical comparison for the three operators plus the sparse-attention benchmark), `analysis`, `full` (the S1 panel) and `auto`; see [B-tier M0/S1](#b-tier-m0--s1-scale-up-entry-point-adopted-tier-b) |
 | `explib/reproduce/` | **cross-run reproduction comparator** (`python -m explib.reproduce compare ORIGINAL RERUN`): matches two panel summaries cell by cell and reports whether they share source bytes, data slice, configuration, execution environment and matched initialization, plus whether the final PPL is exact/within a declared tolerance. Missing provenance is `provenance_incomplete`, never a pass; the same check is exposed as `audit_gates.py reproduction ORIGINAL RERUN` — see `docs/design_notes.md` §83 |
+
+### Tests and frozen inputs
+
+| path | what |
+|---|---|
 | `test_open_block.py` | **open-block CPU gates**: config/segmenter, optimized-vs-reference prefix pooling (forward + gradients), prefix invariance, future perturbation/gradient, candidate masks, edge cases, closed regression, singleton semantics and HCA budget declaration |
 | `test_review_part_*.py`, `test_review_fixes.py` | **CPU review pytest suite**: compatibility entry point plus the split test modules (run with `make test` or `pytest`) |
 | `confirmation_frozen.json` | **pre-registered confirmation plan** (tracked; `manifest_version: 3`, revision history v1-v5): frozen arms and seeds 0-11 (revised 6->12 BEFORE any test-split access; power table recorded), endpoints, exact sign-flip + Holm, decision rule, machine-checkable binding block and a scope declaration — see `docs/design_notes.md` §17 and `DECISION_LOG.md` |
 | `confirmation_frozen_dynamic.json` | **separate draft pre-registration for dynamic chunking and HCA** (`manifest_version: 4`; not frozen): H1 segmentation quality, H2 retrieval precision and H3 long-range coverage, plus the controls that must be scheduled before a disjoint test corpus is reserved — see `DECISION_LOG.md` |
+
+### Evidence and design records
+
+| path | what |
+|---|---|
 | `RELEASES.md` | **evidence release index**: where each immutable `release_<tag>.tar.gz` + SHA-256 manifest is published; the Git repo itself stays source-only |
-| `pyproject.toml` / `requirements.txt` / `requirements.lock` | Python ≥3.12 and dependency declarations; install explicitly (no import-time pip install). `requirements.lock` is the verified CPU environment |
 | `DECISION_LOG.md` | **decision log** (tracked; reconstructed 2026-10-18 from the README/design notes/manifest because the snapshot has one squashed commit): why each version ran what it ran, what was seen, and what was decided next — the exploration/confirmation paper trail; formal releases additionally archive per-seed results via `archive_release.py` |
 | `REVIEW_4_RESPONSE.md` | **review-4 per-issue audit** (tracked): the 21 methodological issues, what this repository already enforced, what this revision changed, and what still cannot be answered without new experiments/artifacts |
+| `docs/design_notes.md` | **design and implementation notes**: why the block-read gate is strict and must be synced across five sites, the dynamic segmenter's prefix-invariance requirement, the pairing/measurability rules, the reporting conventions, and the contracts that keep attention row-chunking equivalent to its unbatched form |
+
+### Tooling
+
+| path | what |
+|---|---|
 | `audit_gates.py` | **compatibility shim** for `_audit_gates/`, the **review-2/4/7 verification entry points** (zero-experiment): data-leakage audits (tokenizer provenance, vocab identity, train/test overlap), CPU causality unit checks (prefix invariance, label shift, decode consistency), block-attribution / boundary-vs-random / length-consistency / baseline-fairness / failure-concentration / budget-reconciliation audits, the review-7 single-factor design gate (declared contrasts' arm-cfg diffs vs their declared intervention key sets; frozen-manifest mechanism_claim_allowed flags) and prefill-decode-kv-growth measurement utilities |
-| `archive_release.py` | **immutable evidence archiver**: packs per-release artifacts (results, analyses, reports, freeze lock, decision log, environment, checkpoint hashes) into a tar.gz with a per-file SHA-256 manifest and an independent `verify` subcommand — the git repo stays source-only (design_notes §8) while every formal release gets an auditable fixed archive |
-| `explib/m0/` | **the M0/S1 driver (adopted B tier)** (`python -m explib.m0`): entry points for the scale-up roadmap — `params` (zero-GPU S1–S4 parameter audit), `data` (FineWeb-Edu + 32k-BPE corpus cache), `smoke` (end-to-end self-check on the B-tier data path), `kernel` (the G0 validation suite: kernel/eager numerical comparison for the three operators plus the sparse-attention throughput benchmark), `full` (the S1 panel); see "B-tier M0/S1" below |
+| `archive_release.py` | **immutable evidence archiver**: packs per-release artifacts (results, analyses, reports, freeze lock, decision log, environment, checkpoint hashes) into a tar.gz with a per-file SHA-256 manifest and an independent `verify` subcommand — the Git repo stays source-only (design_notes §8) while every formal release gets an auditable fixed archive |
 | `build_report.py` | **compatibility shim** for `_build_report/`, the zero-GPU report builder: regenerates the v7 report from `results_*/` + `analysis_*/` artifacts (every number is computed from disk; protocol constants and analytic FLOPs assumptions are explicit inputs, not measurements) |
 | `fuse_analysis.py` | zero-GPU fuse-vs-no-fuse driver: recomputes per-layer boundary alignment (tol=1), block-length stats and PPL trajectories from a `results_*/summary.json` |
-| `Makefile` | zero-GPU entry points: `make test`, `make plan`, `make audit`, `make integrity`, `make reproduce`, `make install-check`, `make build`, `make clean` |
-| `docs/design_notes.md` | **design and implementation notes**: why the block-read gate is strict and must be synced across five sites, the dynamic segmenter's prefix-invariance requirement, the pairing/measurability rules, the reporting conventions, and the contracts that keep attention row-chunking equivalent to its unbatched form |
+| `baseline_tune.py` | equal-search baseline tuning driver: the same declared grid for every arm, validation-only selection, and a zero-GPU `plan`/`report` audit path |
+| `error_analysis.py` | zero-training bad-case analysis for a saved checkpoint: validation-only token/sequence summaries and heuristic cause triage |
+| `Makefile` | zero-GPU entry points: `make test`, `make plan`, `make audit`, `make manipulation`, `make integrity`, `make env-check`, `make reproduce`, `make report-diff`, `make install-check`, `make build`, `make clean` |
+| `pyproject.toml` / `requirements.txt` / `requirements.lock` | Python ≥3.12 and dependency declarations; install explicitly (no import-time pip install). `requirements.lock` is the verified CPU environment |
 
 > **The measurement library lives in `explib/`; edit those modules directly.**
 > `exp_lib.py` (and `csa_kernels.py`, `audit_gates.py`, `build_report.py`,
@@ -186,12 +255,14 @@ again:
 ```bash
 python run_gapfill.py smoke            # end-to-end self-check; no research measurement
 python run_gapfill.py full             # the v6 main experiment (bounded by the run-time cap)
-python -m explib.<driver> --help       # exact subcommands for a v7-v12/M0/open-block driver
-python build_report.py                 # rebuild the report from on-disk results_*/ + analysis_*/
+python -m explib.<driver> --help       # driver description and, where applicable, subcommands
+python -m explib.<driver> report       # rebuild a report for drivers that expose `report`
+python build_report.py                 # rebuild the v7 report from results_*/ + analysis_*/
 ```
 
 If the same cells were executed twice (parallel vs serial, a second machine, or
-a re-run after a code change), verify the second copy instead of trusting the report:
+a re-run after a code change), verify the second copy instead of trusting the
+report:
 
 ```bash
 python -m explib.reproduce compare results_lm_v6 results_lm_v6_rerun
@@ -205,7 +276,7 @@ The verifier reports each dimension separately, so `environment_changed`,
 "did not reproduce" message. A missing fingerprint is
 `provenance_incomplete` (never a pass).
 
-## Running the experiments (any machine)
+## Running the experiments
 
 The commands below are grouped by side effect: environment, zero-GPU checks,
 then training. Run them from the repository root. Training panels need a GPU;
@@ -274,10 +345,10 @@ fusion, HCA layers, dense+sink control):
 
 ```bash
 python run_gapfill.py smoke
-python -m explib.corruption smoke   # corruption modes + NIAH + controls
+python -m explib.corruption smoke        # corruption modes + NIAH + controls
 python -m pytest -q test_open_block.py   # open-block causality/reference/mask gates (CPU)
-python -m explib.open_block smoke   # open-block matrix plumbing on a tiny synthetic run
-python -m explib.confirmation smoke # frozen final-test roundtrip
+python -m explib.open_block smoke        # open-block matrix plumbing on a tiny synthetic run
+python -m explib.confirmation smoke      # frozen final-test roundtrip
 ```
 
 The remaining open-block modes are real runs:
@@ -311,10 +382,14 @@ individual panels up to n=4–6:
 | P-SCALE | `results_lm_v5_scale` | d=384 / 8 layers / seq-1024 probe, 5 variants x 3 seeds x 4000 steps |
 | P-LONG | `results_lm_v3_long` | hybrid_fixed / hybrid_dynamic / hybrid_csa_dyn at seeds 0-2 → 3-seed long-run table |
 
+`python run_gapfill.py overfit` is a small single-run sanity check (loss should
+fit and the pipeline should stay finite); `topup` fills missing cells without
+re-running completed ones.
+
 ### Task-level parallelism (one GPU per run)
 
 Every driver can run its independent cells — one `(variant, seed)` training
-run each — in parallel, **one card per run**, on multi-GPU boxes.  It is
+run each — in parallel, **one card per run**, on multi-GPU boxes. It is
 strictly opt-in and off by default, so the serial behaviour above is exactly
 what you get when the variable is unset:
 
@@ -333,8 +408,7 @@ What it guarantees (see `docs/design_notes.md` §13 for the full contracts):
 - **identical numbers** — each cell seeds its own RNG in its own process, so
   the parallel pass is designed to reproduce the serial pass; the bit-for-bit
   equivalence check is a local scripts-side test, not a CI-enforced guarantee;
-  fingerprints,
-  resume rules and `CODE_SEMANTICS` are unchanged;
+  fingerprints, resume rules and `CODE_SEMANTICS` are unchanged;
 - **merge-safe artifacts** — all `summary.json` updates go through an
   flock-guarded load-modify-write, so concurrently finishing runs never lose
   each other's records; aggregation / plots / git push / shutdown happen once,
@@ -343,34 +417,33 @@ What it guarantees (see `docs/design_notes.md` §13 for the full contracts):
   projected time into the shared `TimeGuard` state and refunds the difference
   after the run, so concurrently launched cells still respect the cap, and the
   cap keeps metering **GPU-seconds** (4 cards x 1 h = 4 h against the cap);
-- **same failure semantics as serial** — a failed cell writes its error
-  record and the phase continues; a crashed child aborts the phase like a
-  serial exception would, completed cells stay on disk and re-running
-  resumes.
+- **same failure semantics as serial** — a failed cell writes its error record
+  and the phase continues; a crashed child aborts the phase like a serial
+  exception would, completed cells stay on disk and re-running resumes.
 
-Per-cell logs land under `par_jobs/<phase>_<timestamp>/` (gitignored); the
-main log reports start/done/heartbeat lines and tails a failed child's log.
-Smoke modes always run serially regardless of `CSA_PAR`.
+Per-cell logs land under `par_jobs/<phase>_<timestamp>/` (gitignored); the main
+log reports start/done/heartbeat lines and tails a failed child's log. Smoke
+modes always run serially regardless of `CSA_PAR`.
 
 ### B-tier M0 / S1 (scale-up entry point, adopted tier B)
 
 The adopted B-tier scale-up plan (entry point `python -m explib.m0`; the former
-compute-plan document is retired) adds a second
-corpus path and the S1–S4 scale ladder on top of the WikiText-103 mechanism
-layer; `python -m explib.m0` is the entry point:
+compute-plan document is retired) adds a second corpus path and the S1–S4 scale
+ladder on top of the WikiText-103 mechanism layer:
 
 ```bash
 python -m explib.m0 params   # zero GPU: S1–S4 parameter audit vs the plan
 python -m explib.m0 data     # build / verify the FineWeb-Edu cache (M0_TOKENS=…)
 python -m explib.m0 smoke    # end-to-end self-check on the B-tier data path
-python -m explib.m0 kernel   # G0 suite: kernel/eager numerical comparison + throughput
+python -m explib.m0 kernel   # G0 suite: kernel/eager numerical comparison + benchmark
+python -m explib.m0 analysis # zero GPU: descriptive S1/S2 paired statistics
 python -m explib.m0 full     # the S1 panel (5 arms × 4 seeds; CSA_PAR=auto works)
 M0_PANEL=S2 python -m explib.m0 full   # the S2 panel (5 arms × 3 seeds × 12B; M2_CAP_HOURS override)
 python -m explib.m0 auto     # UNATTENDED: G0 gate (fail-closed) -> certificate re-check ->
                            #   panel chain starts by itself; default panel S1,
                            #   M0_AUTO_CHAIN=S1,S2 sequences both; CSA_KERNEL=1 after a
                            #   green gate (explicit setting wins); a failed gate starts no
-                           #   panel and leaves a 40-min diagnosis window
+                           #   panel and leaves a diagnosis window
 ```
 
 - Corpus: FineWeb-Edu (default `sample-10BT` config), self-trained 32k BPE;
@@ -383,7 +456,7 @@ python -m explib.m0 auto     # UNATTENDED: G0 gate (fail-closed) -> certificate 
 - `full` is gated by `M0_CAP` (state file `run_time_state_m0.json`,
   `M0_CAP_HOURS` overrides): before the Triton kernels pass the G0 gate the
   eager throughput projections are refused — that is the plan's own
-  precondition of that plan, not a defect.
+  precondition, not a defect.
 
 ### Triton kernel path (M0/G0)
 
@@ -444,8 +517,7 @@ Phases: P4MT (RoPE-arm seeds 0-5, exact P1L/P3MT recipe; resume skips
 checkpoints whose code stamp is still current), P4MP (probe resume for
 the same seed set, eval-only, stale cells re-measured), P4SS/P4SL
 (crossover panels seeds 0-3, same resume rule), P4F (d=384
-`csa_fixed`/`full` seeds 0-3 under one config, so the panel pairs at
-n=4).
+`csa_fixed`/`full` seeds 0-3 under one config, so the panel pairs at n=4).
 
 ### v10 mechanism / scaling / stats suite
 
@@ -468,7 +540,7 @@ corruption modes** + the NIAH-natural far-necessity task), P3T
 (topk sweep seeds 2/3 → n=4), P3SS/P3SL (d=128/4L 8000-step and d=512/10L
 4000-step crossover panels), P3SL2/P3SL3 (**token-matched and
 compute-matched large arms** — the scale-confound fix; see
-docs/design_notes.md §16).
+`docs/design_notes.md` §16).
 See `docs/design_notes.md` for the design rationale behind the
 paired-corruption protocol, the pre-registered crossover criterion, the
 corruption-mode/ΔNLL semantics (§15) and the intervention-vs-trained-control
@@ -480,6 +552,8 @@ distinction (§18).
 python -m explib.confirmation smoke           # end-to-end self-check (tiny ckpts + a smoke freeze manifest)
 python -m explib.confirmation plan            # zero-GPU pre-flight: stamps + implementation binding + admission + power, NO test read;
                                               #   on pass, archives the audit snapshot analysis_v12/plan_snapshot.json
+python -m explib.confirmation dynamic-plan    # zero-GPU preflight of the dynamic/HCA draft; design self-consistency, not confirmation
+python -m explib.confirmation power           # zero GPU: conditional power from the P5C validation deltas (no test read)
 python -m explib.confirmation auto            # UNATTENDED: the same chain as `full`, made explicitly pause-free —
                                               #   the plan gate runs first (fail-closed) and its approval evidence
                                               #   (manifest sha256 / code stamp / git tree / arms / seeds /
@@ -545,8 +619,8 @@ nohup python -m explib.resume full > run_v9.log 2>&1 &
 python -m explib.resume report          # rebuild REPORT_v9.md from disk (zero GPU)
 ```
 
-See `docs/design_notes.md` for the design rationale
-and the pairing/measurability rules these phases rely on.
+See `docs/design_notes.md` for the design rationale and the
+pairing/measurability rules these phases rely on.
 
 ### v7 reviewer-response suite
 
@@ -561,23 +635,38 @@ python -m explib.rope phase P0E   # 40k-step long run
 python -m explib.rope phase P2S   # scale re-seeding to 4 seeds
 python -m explib.rope phase P1L   # length extrapolation
 python -m explib.rope phase P1T   # seq-2048 topk sweep
-python build_report.py        # regenerate REPORT_v7.md from artifacts (zero GPU)
+python build_report.py            # regenerate REPORT_v7.md from artifacts (zero GPU)
 ```
 
 Every driver meters its own accelerator time against a configured run-time
 cap: it refuses to start a run that would pass the cap, and hard-truncates a
-run that reaches it mid-flight.  On a multi-GPU box, `CSA_PAR=auto` runs the
+run that reaches it mid-flight. On a multi-GPU box, `CSA_PAR=auto` runs the
 same phases with one independent run per card (the cap then meters aggregate
-GPU-seconds, i.e. N parallel runs consume it N times faster in wall clock) — a truncated cell leaves no partial
-measurement and is retried on the next pass. When all phases finish the
-script pushes and shuts the instance down (cancel with
-`pkill -f v6autoshutdown`; suppress with `V6_NO_SHUTDOWN=1`, pushes with
+GPU-seconds, i.e. N parallel runs consume it N times faster in wall clock) — a
+truncated cell leaves no partial measurement and is retried on the next pass.
+When all phases finish the script pushes and shuts the instance down (cancel
+with `pkill -f v6autoshutdown`; suppress with `V6_NO_SHUTDOWN=1`, pushes with
 `V6_NO_PUSH=1`).
 
 > All quantities are taken from the tables that `build_report.py` /
-> `fuse_analysis.py` and the per-version `v*_supp.py report` builders compute
-> on the fly from the on-disk `results_*/` and `analysis_*/` artifacts; no
-> quantity is ever hard-coded in the repository prose.
+> `fuse_analysis.py` and the per-driver `report` builders compute on the fly
+> from the on-disk `results_*/` and `analysis_*/` artifacts; no quantity is
+> ever hard-coded in the repository prose.
+
+### Common pitfalls
+
+- **Run from the repository root.** The drivers resolve `results_*/`,
+  `analysis_*/` and the frozen manifests relative to the checkout.
+- **Use `--help` before a mode.** `python -m explib.<driver> --help` prints the
+  driver description; the mode list is in [Study at a glance](#study-at-a-glance).
+  `python -m explib.<driver> smoke --help` is not a help command — the second
+  token is ignored by the positional-mode drivers, so it starts a smoke run.
+- **The test split is one-shot.** Only P5T reads `wiki.test.raw`; do not add a
+  test-reading script around it.
+- **A stale cache is not rebuilt silently.** Delete `wt103_cache/` after
+  changing the train corpus, then rebuild before comparing runs.
+- **A report is not evidence by itself.** Publish and verify an archive
+  (`archive_release.py`) before quoting a number.
 
 ## Measurement guardrails
 
@@ -616,6 +705,10 @@ pass. The main contracts are:
   `archive_release.py verify` checks a published archive independently.
   With no complete row in `RELEASES.md`, the repository stays source-only.
 
-The item-by-item review disposition is in `REVIEW_4_RESPONSE.md`; the full
-design rationale is in `docs/design_notes.md` (§25, §56–§58, §84), and the
-chronology is in `DECISION_LOG.md`.
+## Further reading
+
+- `docs/design_notes.md` — full design rationale and measurement contracts
+  (§25, §56–§58, §84 are the usual starting points).
+- `REVIEW_4_RESPONSE.md` — item-by-item review disposition.
+- `DECISION_LOG.md` — chronology of what was run and what was decided.
+- `RELEASES.md` — evidence release index (currently source-only).
