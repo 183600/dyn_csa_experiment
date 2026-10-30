@@ -421,6 +421,9 @@ def lesion_effect(intact_ppl, lesion_ppl, *, seeds=None, component=None,
             f'intact_ppl and lesion_ppl must be paired per seed, got '
             f'{len(intact)} and {len(lesion)}')
     if seeds is not None:
+        if isinstance(seeds, (str, bytes, bytearray, dict)):
+            raise ValueError('lesion_effect: seeds must be an iterable of '
+                             f'integers, not a {type(seeds).__name__}')
         seeds = list(seeds)
         if len(seeds) != len(intact):
             raise ValueError(

@@ -152,11 +152,18 @@ def tost_paired(deltas, margin, conf=0.90):
     单边 p、conf 水平 CI 与 `equivalent` 判定。margin 必须由计划预先注册
     （如 kernel/eager 面板平均 PPL 相对差 <1%）；本函数不替调用方选择
     margin。n<2 或 margin<=0 时不判定。"""
-    d = np.asarray([f for f in (_finite_scalar(x) for x in (deltas if deltas is not None else []))
+    if isinstance(deltas, (str, bytes, bytearray, dict)):
+        raise ValueError('tost_paired: deltas must be an iterable of numbers, '
+                         f'not a {type(deltas).__name__}')
+    try:
+        _raw_deltas = list(deltas if deltas is not None else [])
+    except TypeError:
+        raise ValueError('tost_paired: deltas must be an iterable') from None
+    d = np.asarray([f for f in (_finite_scalar(x) for x in _raw_deltas)
                     if f is not None], dtype=float)
     n = int(d.size)
-    _bad_option = (isinstance(margin, (bool, np.bool_))
-                   or isinstance(conf, (bool, np.bool_)))
+    _bad_option = (isinstance(margin, (bool, np.bool_, str, bytes, bytearray))
+                   or isinstance(conf, (bool, np.bool_, str, bytes, bytearray)))
     try:
         margin = float(margin)
         conf = float(conf)
@@ -1444,10 +1451,24 @@ def paired_log_ratio(with_values, without_values, seeds=None):
     对称，且不随基线 PPL 的规模漂移——这是跨 d/token 规模比较的前提。
     只接受有限正数对；非正/非有限对整对丢弃并计数（不会静默变成 NaN）。
     """
-    wa = list(with_values)
-    wb = list(without_values)
+    if isinstance(with_values, (str, bytes, bytearray, dict)) or isinstance(
+            without_values, (str, bytes, bytearray, dict)):
+        # A string is an iterable of characters and a mapping iterates its
+        # keys; neither is a per-seed PPL vector.  Treating them as such used
+        # to return a misleading "n=0" panel instead of rejecting the input.
+        raise ValueError('paired_log_ratio: with_values/without_values must '
+                         'be iterables of numbers, not strings or mappings')
+    try:
+        wa = list(with_values)
+        wb = list(without_values)
+    except TypeError:
+        raise ValueError('paired_log_ratio: with_values/without_values must '
+                         'be iterables') from None
     if len(wa) != len(wb):
         raise ValueError('paired_log_ratio needs equal-length vectors (%d vs %d)' % (len(wa), len(wb)))
+    if seeds is not None and isinstance(seeds, (str, bytes, bytearray, dict)):
+        raise ValueError('paired_log_ratio seeds must be an iterable of '
+                         f'integers, not a {type(seeds).__name__}')
     ss = list(range(len(wa))) if seeds is None else list(seeds)
     if len(ss) != len(wa):
         raise ValueError('paired_log_ratio seeds length %d does not match vectors length %d' % (len(ss), len(wa)))
@@ -1461,15 +1482,15 @@ def paired_log_ratio(with_values, without_values, seeds=None):
         raise ValueError('paired_log_ratio got duplicate seeds %r' % (ss,))
     effects, kept, dropped = [], [], []
     for s, a, b in zip(ss, wa, wb):
-        if isinstance(a, (bool, np.bool_)) or isinstance(b, (bool, np.bool_)):
+        # Numeric strings are not measurements (same contract as
+        # _finite_scalar/scale_interaction); a malformed pair is dropped and
+        # counted, never silently converted with float().
+        fa = _finite_scalar(a)
+        fb = _finite_scalar(b)
+        if fa is None or fb is None:
             dropped.append(s)
             continue
-        try:
-            fa, fb = float(a), float(b)
-        except (TypeError, ValueError, OverflowError):
-            dropped.append(s)
-            continue
-        if not (math.isfinite(fa) and math.isfinite(fb) and fa > 0.0 and fb > 0.0):
+        if not (fa > 0.0 and fb > 0.0):
             dropped.append(s)
             continue
         effects.append(float(math.log(fa) - math.log(fb)))

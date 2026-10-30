@@ -236,6 +236,24 @@ def audit_test_access(paths=None):
                 rec['ambiguous_stats'] = [_ta_display(p) for p in hits[1:]]
         else:
             rec['stats'] = None
+            # A test_stats.json sitting next to the lock but matching neither
+            # its manifest hash nor its test-slice fingerprint is not
+            # "no statistics": it is an artifact that cannot be tied to this
+            # pre-registered plan.  Silently ignoring it would report a clean
+            # access ledger while an unbound confirmation table exists.
+            _lock_dir = os.path.dirname(os.path.abspath(lp))
+            _unmatched = [p for p in stats_paths
+                          if os.path.dirname(os.path.abspath(p)) == _lock_dir]
+            if _unmatched:
+                rec['unmatched_stats'] = [_ta_display(p) for p in _unmatched]
+                rec['problems'].append(
+                    'test_stats.json is co-located with the freeze lock but '
+                    'matches neither its manifest hash nor its test-slice '
+                    'fingerprint; the statistics cannot be tied to this '
+                    'access ledger')
+                rec['confirmatory_allowed'] = False
+                rec['confirmed_effective'] = []
+                rec['status'] = 'fail'
         out['locks'][rec_path] = rec
         out['n_locks'] += 1
         if rec.get('confirmatory_allowed') is True:

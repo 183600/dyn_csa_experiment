@@ -58,9 +58,12 @@ JOINT_SIGNFLIP_METHOD = 'westfall-young free step-down max-T (exact sign flips)'
 
 
 def _joint_finite(value, *, where, name):
-    """A finite real measurement; booleans are flags, not deltas."""
+    """A finite real measurement; booleans and numeric strings are not deltas."""
     if isinstance(value, (bool, np.bool_)):
         raise ValueError(f'{where}: {name} is a boolean, not a measurement')
+    if isinstance(value, (str, bytes, bytearray, dict, complex,
+                          np.complexfloating)):
+        raise ValueError(f'{where}: {name} is not a real number ({value!r})')
     try:
         out = float(value)
     except (TypeError, ValueError, OverflowError):

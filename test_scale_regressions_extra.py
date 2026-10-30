@@ -158,4 +158,93 @@ def test_scale_interaction_withholds_nonrepresentable_and_undefined_fields():
             raise AssertionError(f'non-sequence effects accepted: {bad!r}')
 
 
+def test_seed_and_measurement_iterables_are_not_strings_or_mappings():
+    # `list("012")` is ['0','1','2'] and the legacy integer reader accepts
+    # those characters as seeds 0,1,2.  A string is one malformed descriptor,
+    # never a seed panel (or a per-seed effect vector).
+    bad_calls = (
+        lambda: L._scale_points([{'label': 'a', 'scale': 1,
+                                  'effects': [1.0, 2.0, 3.0],
+                                  'seeds': '012'}]),
+        lambda: L._scale_points([{'label': 'a', 'scale': 1,
+                                  'effects': [1.0, 2.0, 3.0],
+                                  'planned_seeds': '012'}]),
+        lambda: L.scale_interaction([1, 2, 3], [1, 2, 3], seeds='012'),
+        lambda: L.paired_effect_stats([1, 2, 3], seeds='012'),
+        lambda: L.paired_effect_stats('abc'),
+        lambda: L.paired_log_ratio([1, 2], [2, 1], seeds='01'),
+        lambda: L.paired_log_ratio('12', '12'),
+        lambda: L.loglog_regression('abc'),
+        lambda: L.crossover_scaling_fit('abc'),
+        lambda: L.missingness_sensitivity([1, 2], seeds='01',
+                                          planned_seeds=[0, 1]),
+        lambda: L.missingness_sensitivity([1, 2], seeds=[0, 1],
+                                          planned_seeds=[0, 1],
+                                          delta_range='12'),
+        lambda: L.lesion_effect([1, 1], [1, 1], seeds='01'),
+        lambda: L.tost_paired('abc', 0.1),
+    )
+    for call in bad_calls:
+        try:
+            call()
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'malformed iterable accepted: {call}')
+
+    # Numeric strings are serialisation artefacts, not measurements.  A
+    # per-seed effect pair is dropped (and counted), never float()-converted;
+    # axis points are skipped for the same reason.
+    ratio = L.paired_log_ratio(['1.0', '2.0'], ['2.0', '1.0'])
+    assert ratio['n'] == 0 and ratio['n_dropped'] == 2, ratio
+    assert L.loglog_regression([('1', '2'), ('2', '4')])['n_points'] == 0
+    assert L.crossover_scaling_fit([
+        {'d': '1', 'crossover_tokens': '100', 'train_tokens': '1000'}
+        for _ in range(4)])['n_input'] == 0
+    for bad in ([{'label': 'a', 'scale': 1,
+                  'effects': {'s0': 1.0}, 'seeds': [0]}],):
+        try:
+            L._scale_points(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'mapping effects accepted: {bad!r}')
+    point = L._scale_points([{'label': 'a', 'scale': '1',
+                              'effects': [1.0], 'seeds': [0]}])[0]
+    assert math.isnan(point['scale']), point
+
+
+def test_crossover_volume_ratio_is_not_infinite():
+    # Finite token budgets can still have an unrepresentable ratio.  The
+    # confound is real, but the report must not carry an `inf` ratio or a
+    # "x inf" reason string, and it must not let `tmin*(1+tol)` overflow and
+    # hide a genuine mismatch.
+    pts = [{'label': str(i), 'd': 2 ** i, 'crossover_tokens': 100,
+            'train_tokens': tokens}
+           for i, tokens in enumerate([1e-300, 1.0, 1e308, 1.7e308])]
+    rep = L.crossover_scaling_fit(pts)
+    assert rep['status'] == 'training_volume_confounded', rep
+    assert rep['volume_ratio'] is None, rep
+    assert 'inf' not in ' '.join(rep['reasons']), rep['reasons']
+    json.dumps(rep, allow_nan=False)
+
+
+def test_scaling_trend_withholds_unrepresentable_slope_but_keeps_direction():
+    # Every effect is finite, but mapping a steep unit-scaled slope back to
+    # those units exceeds float64.  The slope fields are unavailable; the
+    # direction and the lack-of-fit p remain finite and the report is strict-
+    # JSON safe (previously `direction_slope=inf`, `heterogeneity_paired.p=nan`).
+    pts = []
+    for i, scale in enumerate((1.0, 1.000001, 1.000002)):
+        effect = 1.4e308 * (0.7 + 0.15 * i)
+        pts.append({'label': str(i), 'scale': scale, 'seeds': [0, 1, 2],
+                    'effects': [effect, effect * 0.99, effect * 1.01]})
+    rep = L.scaling_trend(pts, min_seeds=2, min_points=2)
+    assert rep['direction'] == 'increases', rep
+    assert rep['direction_slope'] is None, rep
+    assert rep['direction_slope_available'] is False, rep
+    assert rep['wls']['slope'] is None and rep['paired']['slope_mean'] is None, rep
+    assert rep['heterogeneity_paired']['p'] is not None
+    assert math.isfinite(rep['heterogeneity_paired']['p'])
+    json.dumps(rep, allow_nan=False)
 

@@ -19,6 +19,12 @@ def _scale_points(points):
     scale point measured the SAME corpus and tokenizer — a mixed family must
     be refused by the consumers (meta_analyze_effects / scaling_trend), not
     pooled into a trend."""
+    # A bare string/bytes (or a mapping used as a point list) is an iterable
+    # of characters/keys, not a scale family.  Iterating it used to invent
+    # empty or mislabelled points, so fail closed before the loop.
+    if isinstance(points, (str, bytes, bytearray, dict)):
+        raise ValueError('scale points must be an iterable of point records, '
+                         f'got {type(points).__name__}')
     out = []
     for i, p in enumerate(points if points is not None else []):
         if isinstance(p, dict):
@@ -47,9 +53,15 @@ def _scale_points(points):
             vals = []
             seeds = None
         else:
-            if isinstance(eff, (str, bytes)):
+            if isinstance(eff, (str, bytes, bytearray)):
                 raise ValueError('scale point %r: effects must be an iterable of '
                                  'measurements, got a string %r'
+                                 % (label, eff))
+            if isinstance(eff, dict):
+                # A mapping iterates its keys, which are labels, not
+                # measurements; accepting it would silently analyse the keys.
+                raise ValueError('scale point %r: effects must be an iterable '
+                                 'of measurements, not a mapping %r'
                                  % (label, eff))
             try:
                 vals = list(eff)
@@ -68,6 +80,13 @@ def _scale_points(points):
             seeds_kept = [j for j, _v in keep]
             effects = [f for _j, f in keep]
         else:
+            if isinstance(seeds, (str, bytes, bytearray, dict)):
+                # `list("012")` yields ['0', '1', '2'] and the legacy integer
+                # reader turns those characters into seeds 0, 1, 2.  A string
+                # is one malformed seed descriptor, never a seed panel.
+                raise ValueError('scale point %r: seeds must be an iterable of '
+                                 'integers, not %s'
+                                 % (label, type(seeds).__name__))
             try:
                 seeds = list(seeds)
             except TypeError:
@@ -101,6 +120,10 @@ def _scale_points(points):
         _planned_set = None
         _seed_plan_attested = None
         if planned_seeds is not None:
+            if isinstance(planned_seeds, (str, bytes, bytearray, dict)):
+                raise ValueError('scale point %r: planned_seeds must be an '
+                                 'iterable of integers, not %s'
+                                 % (label, type(planned_seeds).__name__))
             try:
                 _ps = [_as_seed_int(v) for v in planned_seeds]
             except TypeError:
@@ -144,13 +167,14 @@ def _scale_points(points):
         _complete = bool(_n_dropped == 0 and _n_missing == 0
                          and _n_unexpected == 0
                          and _seed_plan_attested is not False)
-        if isinstance(scale, (bool, np.bool_)):
+        # A scale is a positive real number on the x axis.  Use the same
+        # measurement contract as the effects: booleans, numeric strings,
+        # complex values and containers are not scales and stay invalid
+        # (NaN), so the consumers can report the tier as invalid instead of
+        # placing it on the axis with a coerced value.
+        sc = _finite_scalar(scale)
+        if sc is None:
             sc = float('nan')
-        else:
-            try:
-                sc = float(scale)
-            except (TypeError, ValueError, OverflowError):
-                sc = float('nan')
         # Vocab size is an exact count: reject non-integral numeric objects
         # instead of truncating them into a different tokenisation.
         vb = None if vocab is None else _as_seed_int(vocab)
@@ -717,7 +741,8 @@ def scale_interaction(low_effects, high_effects, *, low_label='low', high_label=
     def _effect_vector(value, name):
         # A string is an iterable of characters, not a per-seed effect panel;
         # accepting it silently produces a misleading "no data" report.
-        if isinstance(value, (str, bytes)) or not hasattr(value, '__iter__'):
+        if (isinstance(value, (str, bytes, bytearray, dict))
+                or not hasattr(value, '__iter__')):
             raise ValueError(
                 f'scale_interaction {name} must be an iterable of per-seed '
                 f'effects, got {type(value).__name__}')
@@ -733,6 +758,9 @@ def scale_interaction(low_effects, high_effects, *, low_label='low', high_label=
     _seeds_declared = seeds is not None
     if len(a) != len(b):
         raise ValueError('scale_interaction needs equal-length effects (%d vs %d)' % (len(a), len(b)))
+    if seeds is not None and isinstance(seeds, (str, bytes, bytearray, dict)):
+        raise ValueError('scale_interaction seeds must be an iterable of '
+                         f'integers, not {type(seeds).__name__}')
     ss = list(range(len(a))) if seeds is None else list(seeds)
     if len(ss) != len(a):
         raise ValueError('scale_interaction seeds length does not match effects')
@@ -861,8 +889,10 @@ def effect_modification(effects_by_condition, *, reference=None, condition_value
     n_input = None
     for k in keys:
         raw = effects_by_condition[k]
-        if isinstance(raw, (str, bytes)):
-            raise ValueError(f'effect_modification: condition {k!r} must map to a sequence, not a string')
+        if isinstance(raw, (str, bytes, bytearray, dict)):
+            raise ValueError(
+                f'effect_modification: condition {k!r} must map to a sequence, '
+                f'not a {type(raw).__name__}')
         try:
             seq = list(raw)
         except TypeError:
@@ -880,8 +910,9 @@ def effect_modification(effects_by_condition, *, reference=None, condition_value
     if seeds is None:
         seed_labels = list(range(int(n_input)))
     else:
-        if isinstance(seeds, (str, bytes)):
-            raise ValueError('effect_modification: seeds must be an iterable of integers, not a string')
+        if isinstance(seeds, (str, bytes, bytearray, dict)):
+            raise ValueError('effect_modification: seeds must be an iterable of '
+                             f'integers, not a {type(seeds).__name__}')
         try:
             raw_seeds = list(seeds)
         except TypeError:
@@ -1183,6 +1214,19 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
             return [float(e) for e in p['effects']]
         return [float(e) / _effect_scale for e in p['effects']]
 
+    def _finite_out(value):
+        # Mapping a work-scale slope back to input units can overflow even
+        # though every effect is finite.  An infinite slope is not a measured
+        # trend, so expose None and keep the direction from the finite
+        # work-scale statistic for the verdict.
+        if value is None:
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return number if math.isfinite(number) else None
+
     x = np.asarray([math.log10(p['scale']) if log_scale else p['scale'] for p in pts], dtype=float)
     y = np.asarray([float(np.mean(_effects_work(p))) for p in pts], dtype=float)
     n = np.asarray([float(len(p['effects'])) for p in pts], dtype=float)
@@ -1199,7 +1243,9 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
     resid = y - (slope_work * x + intercept_work)
     slope = float(slope_work * _effect_scale) if _scale_effects else slope_work
     intercept = float(intercept_work * _effect_scale) if _scale_effects else intercept_work
-    wls = {'slope': slope, 'intercept': intercept, 'x_transform': 'log10' if log_scale else 'linear',
+    slope_out, intercept_out = _finite_out(slope), _finite_out(intercept)
+    wls = {'slope': slope_out, 'intercept': intercept_out,
+           'x_transform': 'log10' if log_scale else 'linear',
            'weights': 'n_seeds per scale', 'r2': (1.0 - float((n * resid ** 2).sum() / (n * (y - ybar) ** 2).sum())) if float((n * (y - ybar) ** 2).sum()) > 0 else 1.0}
     if k > 2:
         sigma2 = float((n * resid ** 2).sum() / (k - 2))
@@ -1214,11 +1260,17 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
         else:
             _p = 1.0 if abs(slope_work) <= 1e-15 else 0.0
         se = float(se_work * _effect_scale) if _scale_effects else se_work
-        _wls_ci = [slope - tc * se, slope + tc * se]
-        if not all(math.isfinite(float(_x)) for _x in _wls_ci):
+        se_out = _finite_out(se)
+        _wls_ci = ([slope - tc * se, slope + tc * se]
+                   if se_out is not None and slope_out is not None else None)
+        if (_wls_ci is not None
+                and not all(math.isfinite(float(_x)) for _x in _wls_ci)):
             _wls_ci = None
-        wls.update({'se': se if math.isfinite(float(se)) else None,
-                    'ci': _wls_ci, 'p': _p, 'df': k - 2})
+        wls.update({'se': se_out, 'ci': _wls_ci, 'p': _p, 'df': k - 2})
+    if _scale_effects and slope_out is None:
+        wls['scaled_slope_unavailable_reason'] = (
+            'the slope in input units exceeds the representable float range; '
+            'the sign is still available from the unit-scaled fit')
     out['wls'] = wls
     # paired per-seed slopes: complete cases only (same seed at every scale).
     # When any point omitted its seed identities, the positional indices that
@@ -1234,6 +1286,7 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
                 if _seed_identity_attested else [])
     paired = {'n_complete_seeds': len(complete), 'seeds': complete, 'labels': labels,
               'seed_identity_attested': bool(_seed_identity_attested)}
+    paired_slope_work = None
     if not _seed_identity_attested:
         paired['note'] = ('at least one scale point omitted its seed identities; '
                           'positional effect indices are not the same seed, so the '
@@ -1253,25 +1306,37 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
             yybar = float(yy.mean())
             slopes.append(float(((x - xbar_s) * (yy - yybar)).sum() / sxx_s))
         slopes = np.asarray(slopes, dtype=float)
+        paired_slope_work = float(slopes.mean())
         st = paired_effect_stats(slopes, alpha=alpha, min_n=min_seeds)
         tc = _t_critical(1.0 - float(alpha), len(slopes) - 1)
         se_s = float(slopes.std(ddof=1) / math.sqrt(len(slopes))) if len(slopes) > 1 else float('nan')
-        slopes_out = (slopes * _effect_scale if _scale_effects else slopes)
+        with np.errstate(over='ignore', invalid='ignore'):
+            slopes_out = (slopes * _effect_scale if _scale_effects else slopes)
         mean_out = float(slopes_out.mean())
         std_work = (float(slopes.std(ddof=1)) if len(slopes) > 1 else float('nan'))
         std_out = (std_work * _effect_scale if _scale_effects else std_work)
         se_out = (se_s * _effect_scale if _scale_effects else se_s)
-        _paired_ci = ([mean_out - tc * se_out, mean_out + tc * se_out]
-                      if math.isfinite(se_out) else None)
+        mean_out_f = _finite_out(mean_out)
+        std_out_f = _finite_out(std_out)
+        se_out_f = _finite_out(se_out)
+        _paired_ci = (([mean_out - tc * se_out, mean_out + tc * se_out]
+                       if se_out_f is not None and mean_out_f is not None
+                       else None))
         if (_paired_ci is not None
                 and not all(math.isfinite(float(_x)) for _x in _paired_ci)):
             _paired_ci = None
-        paired.update({'slope_mean': mean_out, 'slope_std': std_out,
-                       'se': se_out, 'ci': _paired_ci,
+        paired.update({'slope_mean': mean_out_f, 'slope_std': std_out_f,
+                       'se': se_out_f, 'ci': _paired_ci,
                        'p_exact_signflip': st['p_exact_signflip'], 'p_floor': st['p_floor'],
                        'resolution_limited': st['resolution_limited'], 'underpowered': st['underpowered'],
                        'within_seed_noise': st['within_seed_noise'], 'significant': st['significant'],
-                       'per_seed_slopes': {str(s): float(v) for s, v in zip(complete, slopes_out)}})
+                       'per_seed_slopes': {str(s): _finite_out(v)
+                                           for s, v in zip(complete, slopes_out)}})
+        if _scale_effects and mean_out_f is None:
+            paired['scaled_slope_unavailable_reason'] = (
+                'the mean per-seed slope in input units exceeds the '
+                'representable float range; its sign is still available from '
+                'the unit-scaled slopes')
     else:
         paired.update({'note': 'no complete seed across every scale point; the paired exact test is unavailable'})
     out['paired'] = paired
@@ -1364,15 +1429,22 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
     het_for_verdict = out.get('heterogeneity') or {}
     if paired_primary:
         _yc = np.asarray([float(np.mean([by_seed[s][lb] for s in complete])) for lb in labels], dtype=float)
-        _sp = (float(paired['slope_mean']) / _effect_scale
-               if _scale_effects else float(paired['slope_mean']))
+        # Use the work-scale paired slope, not the rescaled report field: the
+        # latter may be unrepresentable (None) or inf, and dividing it back
+        # would turn the residual lack-of-fit into NaN.
+        _sp = (float(paired_slope_work) if _scale_effects
+               else float(paired['slope_mean']))
         _ip = float(_yc.mean() - _sp * x.mean())
         _rp = _yc - (_sp * x + _ip)
         _cp = float(len(complete))
         _q_p = float((_cp * _rp ** 2).sum())
         _df_p = k - 2
-        _p_p = chi2_sf(_q_p, _df_p) if _df_p > 0 else None
-        _i2_p = float(max(0.0, (_q_p - _df_p) / _q_p) * 100.0) if (_df_p > 0 and _q_p > 0) else 0.0
+        _p_p = (chi2_sf(_q_p, _df_p)
+                if (_df_p > 0 and math.isfinite(_q_p)) else None)
+        _i2_p = (0.0 if (_df_p > 0 and _q_p == 0.0)
+                 else (float(max(0.0, (_q_p - _df_p) / _q_p) * 100.0)
+                       if (_df_p > 0 and _q_p > 0 and math.isfinite(_q_p))
+                       else None))
         _q_p_out = (float(_q_p * _effect_scale * _effect_scale)
                     if _scale_effects else _q_p)
         if not math.isfinite(_q_p_out):
@@ -1418,8 +1490,12 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
     # WLS fit weights each scale by its seed count, so on a ragged panel its
     # sign can disagree with the paired per-seed slope the exact test just
     # evaluated.  Reporting a verdict from the unpaired slope would then say
-    # "decreases" while the primary evidence says "increases".
-    direction_slope = float(paired['slope_mean']) if paired_primary else slope
+    # "decreases" while the primary evidence says "increases".  The sign is
+    # taken from the finite WORK-scale slope; the rescaled report field may be
+    # unavailable when it exceeds float64.
+    direction_work = (float(paired_slope_work) if paired_primary
+                      else float(slope_work))
+    direction_slope = (paired['slope_mean'] if paired_primary else slope_out)
     out['primary_inference'] = 'paired per-seed slope (exact sign-flip)' if paired_primary else 'WLS point-mean t-test (unpaired scales)'
     out['p_primary'] = float(p_primary) if isinstance(p_primary, (int, float)) and math.isfinite(float(p_primary)) else None
     out['significant'] = sig
@@ -1430,10 +1506,14 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
     out['effect_vs_noise'] = ('within_seed_noise' if _within_seed_noise
                               else 'exceeds_seed_noise')
     out['direction_slope'] = direction_slope
+    out['direction_slope_available'] = direction_slope is not None
+    out['direction'] = ('increases' if direction_work > 0.0
+                        else 'decreases' if direction_work < 0.0 else 'zero')
     if heterogeneous:
         verdict = 'heterogeneous_trend'
     elif sig:
-        verdict = 'effect_decreases_with_scale' if direction_slope < 0 else 'effect_increases_with_scale'
+        verdict = ('effect_decreases_with_scale' if direction_work < 0
+                   else 'effect_increases_with_scale')
     elif _incomplete:
         verdict = 'incomplete_scale_point'
     elif underpowered:
@@ -1449,7 +1529,7 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
     else:
         verdict = 'no_detectable_trend'
     out['verdict'] = verdict
-    out['benefit_grows_with_scale'] = (bool(sig and direction_slope < 0) if not heterogeneous else None)
+    out['benefit_grows_with_scale'] = (bool(sig and direction_work < 0) if not heterogeneous else None)
     if too_few_scales:
         out['note'] = 'fewer than min_points=%d scales: slope is descriptive even if the exact test rejects' % int(min_points)
     if _incomplete_points:

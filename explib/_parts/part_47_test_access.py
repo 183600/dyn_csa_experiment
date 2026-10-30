@@ -457,6 +457,21 @@ def confirmatory_access_audit(lock, *, stats=None, manifest=None, alpha=None,
     holm = {}
     confirmed_frozen = None
     if isinstance(stats, dict):
+        # A present-but-malformed identity block is not "no identity".  The
+        # old code silently turned e.g. manifest=[] into {}, skipped every
+        # cross-check and could report the artifact as clean.
+        for _key in ('manifest', 'admission'):
+            if _key in stats and stats.get(_key) is not None \
+                    and not isinstance(stats.get(_key), dict):
+                out['problems'].append(
+                    f'stats.{_key} must be an object, got '
+                    f'{type(stats.get(_key)).__name__}')
+        for _key in ('comparisons', 'holm'):
+            if _key in stats and stats.get(_key) is not None \
+                    and not isinstance(stats.get(_key), dict):
+                out['problems'].append(
+                    f'stats.{_key} must be an object, got '
+                    f'{type(stats.get(_key)).__name__}')
         if isinstance(stats.get('comparisons'), dict):
             comps = stats['comparisons']
         if isinstance(stats.get('holm'), dict):
@@ -516,6 +531,16 @@ def confirmatory_access_audit(lock, *, stats=None, manifest=None, alpha=None,
                 and p_eff < out['alpha_effective']):
             effective.append(name)
         out['comparisons'][name] = rec
+    # Every comparison the frozen table calls confirmed must have a replayable
+    # p value.  A name that is absent from (or p-less in) both blocks cannot be
+    # checked, so it must not silently vanish from `confirmed_effective`
+    # while the audit still reports a clean status.
+    for _name in sorted(confirmed_set):
+        _rec = out['comparisons'].get(_name)
+        if _rec is None or _rec.get('p') is None:
+            out['problems'].append(
+                f'confirmed comparison {_name!r} has no replayable p/Holm '
+                'value in the stats artifact')
     if allowed is True:
         out['confirmed_effective'] = effective
     elif allowed is False:
@@ -555,8 +580,29 @@ def confirmatory_access_audit(lock, *, stats=None, manifest=None, alpha=None,
                 out['problems'].append(
                     'the stats artifact test_access block is not an object')
             else:
-                for key in ('n_test_reads', 'confirmatory_allowed',
-                            'alpha_effective', 'confirmed_effective'):
+                # Replay every stored field that is a deterministic function
+                # of the lock + stats.  Checking only four keys let a tampered
+                # `comparisons`, `policy` or `alpha_nominal` block survive.
+                _keys = ['lock_present', 'stage', 'n_test_reads',
+                         'test_reads_inferred', 'n_reread_events',
+                         'n_rereads_without_reason', 'n_accessed_events',
+                         'n_post_access_plan_changes',
+                         'n_pre_access_plan_revisions',
+                         'n_analysis_source_drift_events',
+                         'test_slice_changed_after_access',
+                         'confirmatory_allowed', 'descriptive_only',
+                         'confirmed_frozen', 'confirmed_effective',
+                         'downgrade_reasons']
+                # These fields depend on the manifest/policy supplied *now*.
+                # When the locked manifest is unavailable, the documented
+                # fallback is the historical single-look rule plus a warning;
+                # the replay must not turn that fallback into a false tamper
+                # verdict merely because the stored block used a declared
+                # multi-look policy.
+                if isinstance(manifest, dict):
+                    _keys.extend(('policy', 'alpha_nominal', 'alpha_effective',
+                                  'manifest_changed_since_lock'))
+                for key in _keys:
                     if key not in stored:
                         continue
                     if not _ta_same(stored.get(key), out.get(key)):
@@ -564,6 +610,34 @@ def confirmatory_access_audit(lock, *, stats=None, manifest=None, alpha=None,
                             f'the stored test_access.{key} does not replay '
                             f'(stored={stored.get(key)!r}, '
                             f'recomputed={out.get(key)!r})')
+                _stored_comps = stored.get('comparisons')
+                if _stored_comps is not None:
+                    if not isinstance(_stored_comps, dict):
+                        out['problems'].append(
+                            'the stored test_access.comparisons is not an '
+                            'object')
+                    else:
+                        _now_comps = out.get('comparisons') or {}
+                        for _name in sorted(set(_stored_comps) | set(_now_comps)):
+                            if _name not in _stored_comps or _name not in _now_comps:
+                                out['problems'].append(
+                                    f'the stored test_access.comparisons has a '
+                                    f'different comparison set at {_name!r}')
+                                continue
+                            _cmp_keys = ('p', 'p_source', 'confirmed_frozen')
+                            if isinstance(manifest, dict):
+                                _cmp_keys += ('p_holm_effective',
+                                              'p_holm_bonferroni_descriptive')
+                            for _ck in _cmp_keys:
+                                if not _ta_same(_stored_comps[_name].get(_ck)
+                                                if isinstance(_stored_comps[_name], dict)
+                                                else None,
+                                                _now_comps[_name].get(_ck)
+                                                if isinstance(_now_comps[_name], dict)
+                                                else None):
+                                    out['problems'].append(
+                                        f'the stored test_access.comparisons'
+                                        f'[{_name!r}].{_ck} does not replay')
         if 'confirmed_effective' in stats:
             if not _ta_same(stats.get('confirmed_effective'),
                             out.get('confirmed_effective')):

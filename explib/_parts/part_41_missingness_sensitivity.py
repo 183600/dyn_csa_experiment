@@ -90,8 +90,9 @@ def _miss_nonneg(value, label):
 def _miss_seed_set(values, label, *, allow_empty=True):
     if values is None:
         values = []
-    if isinstance(values, (str, bytes, bytearray)):
-        raise ValueError(f'{label} must be an iterable of seed integers, not a string')
+    if isinstance(values, (str, bytes, bytearray, dict)):
+        raise ValueError(f'{label} must be an iterable of seed integers, not '
+                         f'a {type(values).__name__}')
     try:
         raw = list(values)
     except TypeError:
@@ -112,8 +113,9 @@ def _miss_seed_set(values, label, *, allow_empty=True):
 def _miss_delta_list(deltas):
     if deltas is None:
         return []
-    if isinstance(deltas, (str, bytes, bytearray)):
-        raise ValueError('deltas must be an iterable of finite per-seed differences')
+    if isinstance(deltas, (str, bytes, bytearray, dict)):
+        raise ValueError('deltas must be an iterable of finite per-seed '
+                         f'differences, not a {type(deltas).__name__}')
     try:
         raw = list(deltas)
     except TypeError:
@@ -122,12 +124,12 @@ def _miss_delta_list(deltas):
     for item in raw:
         if isinstance(item, (bool, np.bool_)):
             raise ValueError(f'a boolean is a flag, not a paired difference: {item!r}')
-        try:
-            value = float(item)
-        except (TypeError, ValueError, OverflowError):
-            raise ValueError(f'a paired difference is not numeric: {item!r}') from None
-        if not math.isfinite(value):
-            raise ValueError(f'a paired difference is not finite: {item!r}')
+        value = _finite_scalar(item)
+        if value is None:
+            # Numeric strings are not measurements (same contract as
+            # _finite_scalar/paired_effect_stats); a hand-edited "'1.0'" must
+            # not become a real paired difference.
+            raise ValueError(f'a paired difference is not a finite real number: {item!r}')
         out.append(value)
     return out
 
@@ -137,8 +139,9 @@ def _miss_range(delta_range, deltas):
         if not deltas:
             return None, 'unavailable_no_observed_delta'
         return [min(deltas), max(deltas)], 'observed_delta_min_max'
-    if isinstance(delta_range, (str, bytes, bytearray)):
-        raise ValueError('delta_range must be a (low, high) pair')
+    if isinstance(delta_range, (str, bytes, bytearray, dict)):
+        raise ValueError('delta_range must be a (low, high) pair, not a '
+                         f'{type(delta_range).__name__}')
     try:
         pair = list(delta_range)
     except TypeError:
@@ -149,12 +152,9 @@ def _miss_range(delta_range, deltas):
     for item in pair:
         if isinstance(item, (bool, np.bool_)):
             raise ValueError(f'delta_range endpoints must be finite reals, got {item!r}')
-        try:
-            value = float(item)
-        except (TypeError, ValueError, OverflowError):
-            raise ValueError(f'delta_range endpoint is not numeric: {item!r}') from None
-        if not math.isfinite(value):
-            raise ValueError(f'delta_range endpoint is not finite: {item!r}')
+        value = _finite_scalar(item)
+        if value is None:
+            raise ValueError(f'delta_range endpoint is not a finite real number: {item!r}')
         endpoints.append(value)
     if endpoints[0] > endpoints[1]:
         raise ValueError(f'delta_range low {endpoints[0]!r} exceeds high {endpoints[1]!r}')

@@ -31,6 +31,25 @@ def _finite_int_ratio(numerator, denominator):
     return float(value)
 
 
+def _finite_float_ratio(numerator, denominator):
+    """Finite quotient of two finite positive measurements, or ``None``.
+
+    A crossover panel can declare finite token budgets whose ratio is beyond
+    float64 (e.g. 1.7e308 and 1e-300).  Dividing them yields ``inf``; that is
+    an unverifiable exposure ratio, not a measured "x inf" confound.
+    """
+    try:
+        numerator = float(numerator)
+        denominator = float(denominator)
+        if not (math.isfinite(numerator) and math.isfinite(denominator)
+                and denominator > 0.0):
+            return None
+        value = numerator / denominator
+    except (TypeError, ValueError, OverflowError, ZeroDivisionError):
+        return None
+    return float(value) if math.isfinite(value) else None
+
+
 def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
     """Pre-flight audit of the scale ladder's budget and transfer assumptions.
 
@@ -298,8 +317,13 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
             else:
                 train_knobs_binding = 'shared'
         warm = [r['warmup_fraction'] for r in rows if r.get('warmup_fraction') is not None]
-        warm_ratio = (max(warm) / min(warm)) if len(warm) == len(rows) and min(warm) > 0 else None
-        if warm_ratio is not None and warm_ratio > 2.0:
+        warm_ratio = (_finite_float_ratio(max(warm), min(warm))
+                      if len(warm) == len(rows) and min(warm) > 0 else None)
+        if (warm_ratio is None and len(warm) == len(rows) and min(warm) > 0):
+            warnings.append(
+                'warmup fractions differ by more than the representable float '
+                'range across scales; the schedule is not transfer-matched')
+        elif warm_ratio is not None and warm_ratio > 2.0:
             warnings.append(f'warmup fraction varies {warm_ratio:.2f}x across scales')
         _family_alpha = 0.05
         _family_n = (signflip_min_n_for_holm(family_m, _family_alpha)
@@ -437,6 +461,9 @@ def loglog_regression(points, *, alpha=0.05):
     自由度、无 R²」。x 本身的测量误差未计入（观测性拟合，不是因果估计）。
     """
     alpha = _validated_alpha(alpha, context='loglog_regression alpha')
+    if isinstance(points, (str, bytes, bytearray, dict)):
+        raise ValueError('loglog_regression points must be an iterable of '
+                         f'point records, not a {type(points).__name__}')
     rows = []
     for i, p in enumerate(points if points is not None else []):
         if isinstance(p, dict):
@@ -445,7 +472,13 @@ def loglog_regression(points, *, alpha=0.05):
             x, y, label = p[0], p[1], i
         else:
             continue
-        if isinstance(x, (bool, np.bool_)) or isinstance(y, (bool, np.bool_)):
+        if isinstance(x, (bool, np.bool_, str, bytes, bytearray, dict,
+                          complex, np.complexfloating)) or isinstance(
+                y, (bool, np.bool_, str, bytes, bytearray, dict,
+                    complex, np.complexfloating)):
+            # Numeric strings are labels, not measurements (same contract as
+            # _finite_scalar); a mapping/string point is malformed, not a
+            # zero-effect observation.
             continue
         try:
             fx, fy = float(x), float(y)
@@ -565,6 +598,9 @@ def crossover_scaling_fit(entries, *, min_points=4, volume_tol=0.25,
     volume_tol = float(volume_tol)
     d_spread_min = float(d_spread_min)
     rows = []
+    if isinstance(entries, (str, bytes, bytearray)):
+        raise ValueError('crossover_scaling_fit entries must be an iterable '
+                         'of panel records, not a string')
     if isinstance(entries, dict):
         entries = [(k, v) for k, v in entries.items()]
     else:
@@ -583,7 +619,11 @@ def crossover_scaling_fit(entries, *, min_points=4, volume_tol=0.25,
         dur = e.get('d')
         tok = e.get('crossover_tokens')
         tr = e.get('train_tokens')
-        if any(isinstance(v, (bool, np.bool_)) for v in (dur, tok, tr)):
+        if any(isinstance(v, (bool, np.bool_, str, bytes, bytearray, dict,
+                              complex, np.complexfloating))
+               for v in (dur, tok, tr)):
+            # Numeric strings are not measurements; a mapping/string field is
+            # malformed, not a positive width or token budget.
             continue
         try:
             fd = float(dur)
@@ -643,11 +683,16 @@ def crossover_scaling_fit(entries, *, min_points=4, volume_tol=0.25,
         return out
     tmin = min(p['train_tokens'] for p in pts)
     tmax = max(p['train_tokens'] for p in pts)
-    if tmax > tmin * (1.0 + float(volume_tol)):
+    volume_ratio = _finite_float_ratio(tmax, tmin)
+    # Compare with the ratio, not `tmin * (1 + tol)`: the product can overflow
+    # for a finite-but-large tmin and turn a real mismatch into "not greater".
+    if volume_ratio is None or volume_ratio > 1.0 + float(volume_tol):
+        _ratio_txt = (f'x{volume_ratio:.2f}' if volume_ratio is not None
+                      else 'a ratio beyond the representable float range')
         out.update({'status': 'training_volume_confounded',
-                    'reasons': [f'training volume ranges {tmin:.3g}..{tmax:.3g} tokens (x{tmax / tmin:.2f}); the d-axis is confounded with training length. '
+                    'reasons': [f'training volume ranges {tmin:.3g}..{tmax:.3g} tokens ({_ratio_txt}); the d-axis is confounded with training length. '
                                 'Add token-matched arms or model log(tokens) as a covariate before reporting a d slope.'],
-                    'volume_ratio': float(tmax / tmin)})
+                    'volume_ratio': volume_ratio})
         return out
     # A crossover cannot happen after the training run ended.  A panel whose
     # crossover position exceeds its own training budget is internally
@@ -667,7 +712,7 @@ def crossover_scaling_fit(entries, *, min_points=4, volume_tol=0.25,
     fit = loglog_regression([{'x': p['d'], 'y': p['crossover_tokens'], 'label': p['label']} for p in pts])
     out.update(fit)
     out['status'] = fit.get('status', 'ok')
-    out['volume_ratio'] = float(tmax / tmin)
+    out['volume_ratio'] = volume_ratio
     out['slope_per_doubling'] = (float(fit['slope']) * math.log10(2.0)) if isinstance(fit.get('slope'), (int, float)) else None
     out['claim_level'] = 'descriptive'
     out['note'] = ('observational log-log fit over uncensored, token-comparable panels; '

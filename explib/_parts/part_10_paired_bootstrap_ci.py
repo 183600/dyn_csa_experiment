@@ -329,7 +329,17 @@ def paired_effect_stats(deltas, alpha=0.05, min_n=3, with_values=None, without_v
     if _min_n is None or _min_n < 0:
         raise ValueError(f'min_n must be a non-negative integer, got {min_n!r}')
     min_n = _min_n
-    raw = list(deltas if deltas is not None else [])
+    if isinstance(deltas, (str, bytes, bytearray, dict)):
+        # A string is an iterable of characters and a mapping iterates its
+        # keys; neither is a per-seed delta panel.  Filtering them as
+        # non-finite values used to turn malformed input into a misleading
+        # "n=0" result.
+        raise ValueError('paired_effect_stats: deltas must be an iterable of '
+                         f'numbers, not a {type(deltas).__name__}')
+    try:
+        raw = list(deltas if deltas is not None else [])
+    except TypeError:
+        raise ValueError('paired_effect_stats: deltas must be an iterable') from None
     n_input = len(raw)
     d_vals, kept_pos, dropped_pos = [], [], []
     for _i, _x in enumerate(raw):
@@ -345,6 +355,9 @@ def paired_effect_stats(deltas, alpha=0.05, min_n=3, with_values=None, without_v
     seed_labels = list(kept_pos)
     dropped_seeds = list(dropped_pos)
     if seeds is not None:
+        if isinstance(seeds, (str, bytes, bytearray, dict)):
+            raise ValueError('paired_effect_stats: seeds must be an iterable of '
+                             f'integers, not a {type(seeds).__name__}')
         try:
             _seed_in = list(seeds)
         except TypeError:
