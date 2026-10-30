@@ -287,6 +287,8 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
         dl = []
         usable = []
         dropped = []
+        _pa_used = []
+        _pb_used = []
         for s in common:
             if _init_status.get(int(s)) == 'mismatch':
                 dropped.append({'seed': int(s), 'reason': 'init_core_fp mismatch: the two arms did not start from the same shared trunk, so the seed is not a matched pair'})
@@ -297,6 +299,8 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
                 continue
             dl.append(pa - pb)
             usable.append(s)
+            _pa_used.append(pa)
+            _pb_used.append(pb)
         if len(usable) < 2:
             stats['comparisons'][name] = {'omitted': f'<2 complete seed pairs at the frozen endpoint (common records: {common}; usable pairs: {usable}; whitelist {manifest["seeds"]})', 'n': 0, 'expected_sign': exp_sign, 'dropped_pairs': dropped, 'init_core_fp': _init_aud}
             continue
@@ -313,6 +317,25 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
         res['init_core_fp_recorded'] = any(('a' in e) or ('b' in e)
                                           for e in _init_aud['per_seed'])
         res['min_seeds_for_confirmation'] = _n_min
+        # Effect-scale / robust-location sensitivity: the frozen test is on
+        # the raw PPL difference.  Report whether the same paired seeds give
+        # the same direction and zero-exclusion under the log-PPL scale and
+        # under an exact signed-rank location interval.  This is descriptive:
+        # it adds no p-value to the frozen Holm family and never changes
+        # `confirmed`.
+        try:
+            res['effect_sensitivity'] = L.effect_sensitivity(
+                _pa_used, _pb_used, seeds=[int(s) for s in usable],
+                alpha=_alpha)
+        except Exception as _ese:
+            res['effect_sensitivity'] = {
+                'kind': 'effect_scale_location_sensitivity',
+                'status': 'not_estimable',
+                'status_reason': f'{type(_ese).__name__}: {_ese}',
+                'alpha': float(_alpha),
+                'n': int(len(usable)),
+                'seeds': [int(s) for s in usable],
+            }
         # Diagnostics must use the n that actually entered THIS comparison,
         # so p_floor / min_attainable_p_holm / power describe the test that
         # really ran.
@@ -1576,6 +1599,52 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
               + '。这些种子的两臂 shared-trunk 初始化摘要不同，已按「不是配对」剔除，'
                 '不进入精确符号翻转检验；覆盖门因此会拒绝把它们当作完整面板。）')
             A('')
+        _es_rows = [(k, v.get('effect_sensitivity')) for k, v in comps.items()
+                    if isinstance(v.get('effect_sensitivity'), dict)]
+        if _es_rows:
+            A('| 效应尺度/位置敏感性 | n | raw Δ mean | raw p | log ratio mean | log p | 几何比（相对效应） | HL 伪中位数 [区间] | 状态 |')
+            A('|---|---|---|---|---|---|---|---|---|')
+            for _ek, _es in _es_rows:
+                _er = _es.get('raw') or {}
+                _el = _es.get('log_ratio') or {}
+                _eloc = _es.get('location') or {}
+                _erm = _er.get('mean')
+                _elp = _er.get('p_exact_signflip')
+                _elm = _el.get('mean')
+                _ellp = _el.get('p_exact_signflip')
+                _eg = _el.get('geometric_ratio')
+                _erel = _el.get('relative_pct')
+                _eci = _eloc.get('ci')
+                _eest = _eloc.get('estimate')
+                _egt = ('—' if _eg is None else
+                        f'{_eg:.4f}' + ('' if _erel is None else f' ({_erel:+.2f}%)'))
+                _eci_t = ('—' if not isinstance(_eci, (list, tuple)) or len(_eci) < 2
+                          else f'[{_eci[0]:+.3f}, {_eci[1]:+.3f}]')
+                _eest_t = '—' if _eest is None else f'{_eest:+.3f}'
+                _efm = '—' if _erm is None else f'{_erm:+.3f}'
+                _efp = '—' if _elp is None else f'{_elp:.4f}'
+                _efl = '—' if _elm is None else f'{_elm:+.4f}'
+                _eflp = '—' if _ellp is None else f'{_ellp:.4f}'
+                A(f'| {_ek} | {_es.get("n", "—")} | {_efm} | {_efp} | {_efl} | {_eflp} | {_egt} | {_eest_t} {_eci_t} | {_es.get("status")} |')
+            A('')
+            A('（口径：raw Δ = `with - without` 的逐种子 PPL 点差，负值表示 with 更低；'
+              'log ratio = `log(with) - log(without)`，几何比 = exp(mean log ratio)，'
+              '相对效应 = 几何比 − 1。两者是不同的估计量，不是两个独立检验：'
+              '它们回答「同一批种子上换一个效应尺度，方向和零排除是否改变」。'
+              'HL 伪中位数区间由精确 signed-rank 分布反演得到，对配对位置的对称性假设给出'
+              '分布无关区间，不是算术均值的置信区间；零差值不参与秩，Walsh 平均并列时使用'
+              '未并列临界值（保守）。以上读数**不进入**冻结 Holm 族、不改变 '
+              '`p_exact_signflip` / `p_holm` / `verified` / `confirmed`；'
+              '`concordant` 只表示三种描述口径一致，不表示效应有实际重要性、因果性或可迁移性。）')
+            A('')
+            _es_bad = [k for k, es in _es_rows
+                       if es.get('status') not in (None, 'concordant')]
+            if _es_bad:
+                A('**效应尺度/位置提醒**：' + '；'.join(
+                    f'{k} → `{(es or {}).get("status")}`' for k, es in _es_bad)
+                  + '。这些比较的冻结 p/Holm 仍按原始 PPL 差计算；引用结论时必须同时'
+                    '说明效应尺度或位置读数的分歧，不能只写「已确认」。')
+                A('')
         if any(isinstance((_v.get('doc_sampling') or {}).get('pooled_delta_ppl_ci95'),
                           (list, tuple))
                for _v in comps.values()):

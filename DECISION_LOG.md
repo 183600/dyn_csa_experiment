@@ -4641,3 +4641,68 @@ token 或评测单元；后两者由 §54/§57/§81/§103 负责。
 一致判 `fail`；`run_report`/CLI/`finaltest_stats`/报告接线；合成六 seed
 三臂端到端落盘 → 审计 `ok`；以及 `REPORT_v12` 渲染选择偏差小节与边界段。
 完整 CPU 套件在本轮最终树通过。
+
+## 2026-10-30 — 确认效应的尺度与位置：raw PPL vs log PPL、精确 Hodges–Lehmann 区间（本轮结果分析硬化，no new runs）
+
+零 GPU 的结果分析硬化；不新增训练、不读取 test split、不修改
+`confirmation_frozen*.json` 的字节/种子/端点/α/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未触碰。
+
+**Problem.** §102–§104 把「哪个臂最好、排序/赢家均值被选择噪声偏了多少」
+讲清楚了，但冻结确认检验本身仍是**原始 PPL 点差**上的精确符号翻转。
+报告读者会把它读成「a 比 b 更好」，而这句话还依赖两个未被冻结清单写明的
+选择：(1) 效应尺度——`mean(Δ)` 与 `mean(log ratio)` 是不同估计量，各 seed
+PPL 量级不同时可以给出相反方向（例如大基线配对贡献 +1 个 PPL 点但 log
+比只有 1e-6）；(2) 位置 vs 均值——均值检验由 |Δ| 驱动，少数大|Δ| seed 可以
+主导 p，raw 检验拒绝而秩位置区间包含 0 并不矛盾。已有读数
+（`p_exact_signflip`、bootstrap/t 区间、`analysis_choice_concordance`、
+`paired_fragility`、`winner_curse`）都没有回答「换一个尺度或改用秩位置，
+方向和零排除是否还成立」。
+
+**Fix.** 新增 `exp_lib.EFFECT_SENSITIVITY_POLICY` /
+`effect_sensitivity()` / `hodges_lehmann_interval()`：输入两臂在同一组
+seed 上的正 PPL。同一批配对上同时报告：
+- raw 差与 log 比的精确 sign-flip p、方向、p 下限与非零计数；log 块另给
+  几何 PPL 比与相对效应；
+- 精确 signed-rank 反演的 Hodges–Lehmann 伪中位数与
+  `[W_(k+1), W_(N-k)]` 区间、`attained_conf`、`critical_k`、并列/零差值
+  计数；n<2 或水平不可达报 `unbounded`，零宽并列报 `degenerate`，n>200
+  拒绝，不伪造区间；
+- 三向状态 `concordant` / `scale_direction_discordant` /
+  `scale_significance_discordant` /
+  `scale_concordant_location_unavailable` / `location_discordant` /
+  `zero_effect` / `not_estimable`，并给
+  `direction_agree`/`significance_agree`/`location_excludes_zero`/
+  `all_agree`。非正/非有限 PPL 对具名剔除；重复或非整数 seed 硬拒绝。
+
+`finaltest_stats` 在每个主比较上用与冻结检验同一组 `usable` seed 写入
+`effect_sensitivity`；`build_report` 新增尺度/位置表并在非 `concordant`
+时提醒；`audit_gates.py effect_sensitivity`（别名 `effect_scale` /
+`scale_location`）从块内 `per_seed` 独立重建全部读数，并要求其
+`raw_delta` 与主比较的 `per_seed` 向量、seed 集合/白名单一致；缺块报
+`not_verifiable_locally`，bare `not_estimable` 报 `not_applicable`，篡改
+或夹带确认性字段判 `fail`，并入 `report` 顶层。
+
+**Boundary.** 不是新的显著性检验：没有新 p 值、没有 Holm 成员、不做
+FWER 控制，不改变 `p_exact_signflip`、`p_holm`、`verified` 或冻结
+`confirmed`。raw 与 log 不是两个独立检验；HL 区间目标是伪中位数，不是
+算术均值，只在配对位置对称下分布无关，也不校正不对称；Walsh 并列时用
+未并列临界值（保守）。`concordant` 不表示效应实际重要、因果或可迁移；
+实际重要性仍要预注册 SESOI/TOST。尺度选择仍是选择：本轮不追认 log 为
+「正确尺度」，只把 raw 隐含的估计量明示出来；未来确认清单应在冻结前把
+相对效应与 SESOI 一起预注册。不重采样 token 或评测单元；后两者仍由
+§54/§57/§81/§103 负责。
+
+**Verification.** 新增 `test_review_part_46.py` 19 项：策略/状态；清晰
+配对移动→`concordant`、HL 区间排除零且覆盖 ≥95%；n=6/n=8 的 HL 端点与
+attained coverage 对账 order statistics；n=3 `unbounded`、n=201 拒绝、
+全并列 `degenerate`、零/非有限值剔除；raw 正/log 负的方向分歧；同向但
+仅一个尺度显著；raw 显著而 HL 含 0 的位置分歧；全零 `zero_effect`；
+正负抵消导致方向未定义；非法
+PPL 对具名剔除；重复/非整数 seed、非法参数、字符串 fail-closed；严格
+JSON 与同输入重放；`1e308` 级有限值不产生 NaN/inf；合成六 seed 三臂面板
+`finaltest_stats` 落盘 → 审计 `ok`；篡改 raw p/log p/HL 区间/状态/
+per_seed/concordance/夹带 `confirmed` 判 `fail`；legacy 缺块与 bare
+`not_estimable` 的 `not_verifiable_locally`/`not_applicable`；报告渲染新表
+与边界段；`run_report`/CLI/`finaltest_stats`/报告接线。完整 CPU 套件在本
+轮最终树通过。
