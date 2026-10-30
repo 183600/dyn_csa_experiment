@@ -294,6 +294,13 @@ Python 3.12 is required (see `pyproject.toml`).
 
   The lock is a complete pinned closure and includes the CPU torch wheel.
 
+- **Environment identity is checked, not just installed:** `make env-check`
+  compares each local panel's recorded `env_fp_v2` / `env_fp_v3` with the
+  current stack. v3 adds the BLAS/LAPACK/SIMD build and runtime identity and
+  the versions of unpinned (non-tooling) distributions to v2's lock-pinned
+  closure, so "same lock" cannot silently stand in for "same numerical
+  backend".
+
 - **CUDA machine:** install the torch wheel that matches the local driver
   first, then the compatibility ranges:
 

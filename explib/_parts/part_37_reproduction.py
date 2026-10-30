@@ -313,6 +313,12 @@ def _repro_environment_dimension(original, rerun):
             value = rec['hyperparams'].get('env_fp_v2')
         return value
 
+    def _fp_v3(rec):
+        value = rec.get('env_fp_v3')
+        if value is None and isinstance(rec.get('hyperparams'), dict):
+            value = rec['hyperparams'].get('env_fp_v3')
+        return value
+
     fields = [_repro_field('exec_fp', _fp(original), _fp(rerun), required=True)]
     a2, b2 = _fp_v2(original), _fp_v2(rerun)
     notes = []
@@ -329,6 +335,22 @@ def _repro_environment_dimension(original, rerun):
         notes.append('both records predate env_fp_v2; only the legacy '
                      'six-package exec_fp is compared (transitive pins, the '
                      'lock bytes and the OS/driver block are unverified)')
+    a3, b3 = _fp_v3(original), _fp_v3(rerun)
+    if a3 is not None or b3 is not None:
+        # v3 adds the BLAS/LAPACK/SIMD backend and unpinned runtime
+        # distributions.  It is only meaningful when both sides carry it;
+        # a one-sided v3 is a generation difference and is reported as
+        # unverified rather than silently downgraded to the v2 match.
+        fields.append(_repro_field('env_fp_v3', a3, b3))
+        if a3 is None or b3 is None:
+            notes.append('one record predates env_fp_v3; the numerical '
+                         'backend (BLAS/LAPACK/SIMD) and unpinned runtime '
+                         'distributions cannot be compared and this dimension '
+                         'stays unverified')
+        else:
+            notes.append('env_fp_v3 additionally binds the NumPy/PyTorch '
+                         'BLAS, LAPACK and SIMD build/runtime identity and '
+                         'every unpinned non-tooling distribution')
     return _repro_dimension('environment', fields, notes=notes)
 
 

@@ -508,6 +508,13 @@ def _release_identity(source_tree):
         'source_tree_sha256': source_tree.get('sha256'),
         'dependency_contract': _L.dependency_contract(),
         'execution_fingerprint': _L.execution_fingerprint(env=env),
+        # Archive both strict generations: v2 keeps old releases comparable,
+        # v3 adds the NumPy/PyTorch numerical backend and every unpinned
+        # runtime distribution.  `numerical_backend` is kept in readable form
+        # so a verifier can say WHAT differed, not only that v3 did.
+        'env_fp_v2': env.get('env_fp_v2'),
+        'env_fp_v3': env.get('env_fp_v3'),
+        'numerical_backend': env.get('numerical_backend'),
         'environment': {k: env.get(k) for k in _env_keys},
         'note': ('the measurement source files are packed at repository-relative '
                  'paths; verify recomputes source_tree.sha256 from the packed '

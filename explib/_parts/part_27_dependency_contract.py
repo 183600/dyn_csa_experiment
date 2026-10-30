@@ -1,4 +1,19 @@
 
+# Distributions that are packaging/development tooling, not part of the
+# numerical runtime.  They are excluded from the "is every installed
+# distribution pinned?" check so installing a linter does not make a healthy
+# experiment environment look partial.  Keep this list explicit: an unpinned
+# package that is NOT here is treated as a possible numerical dependency and
+# enters `environment_fingerprint_v3`.
+_TOOLING_DISTRIBUTIONS = frozenset({
+    'pip', 'setuptools', 'wheel', 'pkg-resources', 'distribute',
+    'ruff', 'mypy', 'black', 'flake8', 'pyflakes', 'isort', 'coverage',
+    'pytest-cov', 'tox', 'nox', 'pre-commit', 'build', 'twine',
+    # The project itself, when a local wheel/install-check has registered it
+    # (dyn_csa_experiment.egg-info): the code under test, not a dependency.
+    'dyn-csa-experiment',
+})
+
 
 def dependency_contract(lock_path=None):
     """Compare the declared lock with the versions actually installed.
@@ -9,8 +24,11 @@ def dependency_contract(lock_path=None):
     but extra installed distributions are not pinned, or the lock does not
     declare the interpreter/platform (the lock is not a full environment
     record).  ``mismatch`` also covers a declared interpreter/platform that
-    differs from the running one.  Tooling (pip/setuptools/wheel) is not a
-    runtime dependency and is excluded from the coverage check.
+    differs from the running one.  Tooling (pip/setuptools/wheel and the
+    editors/linters in ``_TOOLING_DISTRIBUTIONS``) is not a runtime
+    dependency and is excluded from the coverage check.  ``unpinned_versions``
+    keeps the version of every remaining unpinned distribution so the strict
+    ``environment_fingerprint_v3`` can bind it.
     """
     try:
         parsed = parse_requirements_lock(lock_path)
@@ -21,7 +39,7 @@ def dependency_contract(lock_path=None):
                 'lock_path': os.path.abspath(str(lock_path or 'requirements.lock')),
                 'lock_sha256': None, 'n_pinned': 0, 'options': [],
                 'mismatches': [], 'missing': [], 'unpinned_installed': [],
-                'pinned_installed': {},
+                'unpinned_versions': {}, 'pinned_installed': {},
                 'interpreter': _interpreter_contract(),
                 'invalid': [f'could not read the lock: {type(e).__name__}: {e}'],
                 'status': 'invalid',
@@ -32,7 +50,7 @@ def dependency_contract(lock_path=None):
            'pinned_installed': {},
            'interpreter': _interpreter_contract(parsed.get('environment')),
            'invalid': list(parsed['invalid']), 'unpinned_installed': [],
-           'status': 'ok', 'note': ''}
+           'unpinned_versions': {}, 'status': 'ok', 'note': ''}
     if not parsed['exists']:
         out['status'] = 'missing_lock'
         out['note'] = 'requirements.lock is absent; the environment is not pinned'
@@ -53,6 +71,7 @@ def dependency_contract(lock_path=None):
                 continue
     except Exception as e:
         out['status'] = 'invalid'
+        out['unpinned_versions'] = {}
         out['invalid'].append(f'importlib.metadata unavailable: {type(e).__name__}: {e}')
         return out
     for name, ent in sorted(parsed['pins'].items()):
@@ -70,15 +89,16 @@ def dependency_contract(lock_path=None):
         elif str(got) != str(ent['version']):
             out['mismatches'].append({'name': ent['name'], 'expected': ent['version'],
                                       'installed': str(got)})
-    _tooling = {'pip', 'setuptools', 'wheel', 'pkg-resources', 'distribute',
-                'ruff',
-                # The project itself, when a local wheel/install-check has
-                # registered it (dyn_csa_experiment.egg-info).  It is the code
-                # under test, not a dependency the lock is supposed to pin;
-                # counting it made every post-build environment look partial.
-                'dyn-csa-experiment'}
     out['unpinned_installed'] = sorted(
-        n for n in installed if n not in parsed['pins'] and n not in _tooling)
+        n for n in installed if n not in parsed['pins']
+        and n not in _TOOLING_DISTRIBUTIONS)
+    # The version of every unpinned runtime distribution is part of the
+    # environment identity: two machines can have the same pinned lock and
+    # different unpinned numerical packages (or versions of them).  Keep the
+    # historical list for readers and add the name -> version mapping for the
+    # strict v3 digest.
+    out['unpinned_versions'] = {n: installed[n]
+                                for n in out['unpinned_installed']}
     out['n_installed'] = len(installed)
     out['n_unpinned_installed'] = len(out['unpinned_installed'])
     _interp = out['interpreter']
@@ -314,6 +334,191 @@ def environment_fingerprint_v2(env=None):
     return hashlib.sha256(blob.encode('utf-8')).hexdigest()[:16]
 
 
+ENVIRONMENT_FP_V3_SCHEMA = 3
+
+
+def _numpy_build_identity():
+    """Build/runtime identity of the NumPy numerical backend.
+
+    ``numpy.__version__`` pins the wheel, not the BLAS/LAPACK implementation
+    inside it or the CPU dispatch it selects.  A conda build with MKL and a
+    pip build with OpenBLAS can both report the same version; their reductions
+    and matmuls can differ in the last bits, which is enough to move a PPL
+    comparison.  This block records the BLAS/LAPACK name+version, the build's
+    SIMD baseline/targets, the runtime dispatched features and a digest of the
+    whole build configuration.  Every probe is best-effort: a missing field
+    stays ``None`` instead of crashing provenance.
+    """
+    out = {'version': getattr(np, '__version__', None), 'blas': None,
+           'lapack': None, 'simd_baseline': None, 'simd_found': None,
+           'simd_runtime_dispatch': None, 'simd_runtime_features': None,
+           'build_config_sha256': None}
+    try:
+        cfg = getattr(getattr(np, '__config__', None), 'CONFIG', None)
+        if isinstance(cfg, dict):
+            deps = cfg.get('Build Dependencies')
+            deps = deps if isinstance(deps, dict) else {}
+            for key in ('blas', 'lapack'):
+                dep = deps.get(key)
+                if not isinstance(dep, dict):
+                    continue
+                out[key] = {
+                    'name': dep.get('name'),
+                    'version': dep.get('version'),
+                    'found': dep.get('found'),
+                    'openblas_config': dep.get('openblas configuration'),
+                }
+            simd = cfg.get('SIMD Extensions')
+            if isinstance(simd, dict):
+                if isinstance(simd.get('baseline'), list):
+                    out['simd_baseline'] = [str(x) for x in simd['baseline']]
+                if isinstance(simd.get('found'), list):
+                    out['simd_found'] = [str(x) for x in simd['found']]
+            out['build_config_sha256'] = hashlib.sha256(
+                json.dumps(cfg, sort_keys=True, separators=(',', ':'),
+                           ensure_ascii=True, default=str).encode('utf-8')
+            ).hexdigest()[:16]
+    except Exception:
+        pass
+    try:
+        try:
+            from numpy._core import _multiarray_umath as _mu
+        except ImportError:  # NumPy < 2
+            from numpy.core import _multiarray_umath as _mu
+        features = getattr(_mu, '__cpu_features__', None)
+        if isinstance(features, dict):
+            out['simd_runtime_features'] = sorted(
+                str(k) for k, enabled in features.items() if enabled)
+        dispatch = getattr(_mu, '__cpu_dispatch__', None)
+        if isinstance(dispatch, (list, tuple, set, frozenset)):
+            out['simd_runtime_dispatch'] = sorted(str(x) for x in dispatch)
+    except Exception:
+        pass
+    return out
+
+
+def _torch_build_identity():
+    """Build/runtime identity of the PyTorch numerical backend.
+
+    The wheel pin does not say whether this build uses MKL, oneDNN, OpenMP or
+    a particular LAPACK, nor which CPU capability path ATen dispatches to.
+    The full build report is hashed, and the human-readable version lines are
+    kept so a reader can see *what* differs without re-running torch.
+    """
+    out = {'build_report_sha256': None, 'mkl': None, 'mkldnn': None,
+           'openmp': None, 'mkl_version': None, 'mkldnn_version': None,
+           'openmp_version': None, 'blas_info': None, 'lapack_info': None,
+           'cpu_capability': None, 'commit_sha': None,
+           'cuda_build': getattr(torch.version, 'cuda', None)}
+    for name in ('mkl', 'mkldnn', 'openmp'):
+        try:
+            backend = getattr(torch.backends, name, None)
+            out[name] = bool(backend.is_available()) if backend is not None else None
+        except Exception:
+            out[name] = None
+    try:
+        import contextlib
+        import io
+        cfg = getattr(torch, '__config__', None)
+        show = getattr(cfg, 'show', None)
+        if not callable(show):
+            return out
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            ret = show()
+        text = ret if isinstance(ret, str) else buf.getvalue()
+        text = str(text or '')
+    except Exception:
+        return out
+    if not text.strip():
+        return out
+    out['build_report_sha256'] = hashlib.sha256(
+        text.encode('utf-8', 'replace')).hexdigest()[:16]
+
+    def _first(pattern):
+        try:
+            m = re.search(pattern, text)
+            return m.group(1).strip() if m else None
+        except Exception:
+            return None
+    out['mkl_version'] = _first(
+        r'oneAPI Math Kernel Library Version ([^\n]+?)\s+for ')
+    out['mkldnn_version'] = _first(r'MKL-DNN v([^\s]+)')
+    out['openmp_version'] = _first(r'OpenMP (\d+)')
+    out['blas_info'] = _first(r'BLAS_INFO=([^,\s]+)')
+    out['lapack_info'] = _first(r'LAPACK_INFO=([^,\s]+)')
+    out['cpu_capability'] = _first(r'CPU capability usage:\s*([^\n]+)')
+    out['commit_sha'] = _first(r'COMMIT_SHA=([0-9a-fA-F]+)')
+    try:
+        out['cpu_capability'] = out['cpu_capability'] or str(
+            torch.backends.cpu.get_cpu_capability())
+    except Exception:
+        pass
+    return out
+
+
+def _numerical_backend_identity():
+    """BLAS/LAPACK/SIMD identity that a wheel version does not capture."""
+    return {'numpy': _numpy_build_identity(), 'torch': _torch_build_identity()}
+
+
+def environment_fingerprint_v3(env=None):
+    """Strict numerical-stack identity, extending ``env_fp_v2``.
+
+    ``env_fp_v2`` binds the lock bytes and every lock-pinned distribution, but
+    two processes can still share it while differing in
+
+    * an **unpinned runtime distribution** (and its version) that happens to
+      be installed next to the lock, and
+    * the **numerical backend inside the pinned wheels**: NumPy's BLAS/LAPACK
+      build and SIMD dispatch, PyTorch's MKL/oneDNN/OpenMP build and CPU
+      capability path.
+
+    Either difference can change floating-point reductions while every
+    declared version matches.  v3 therefore hashes the v2 digest, the
+    name -> version map of every installed distribution that is neither
+    pinned nor declared tooling, and the backend identity above.  It is a
+    separate digest rather than a redefinition of v2 so archived records that
+    carry only v2 remain comparable: a caller prefers v3 only when both sides
+    have it.
+
+    Hostname, PID, cwd, hash seed and scheduling variables are still excluded;
+    this is a stack identity, not a process identity.
+    """
+    env = environment_snapshot() if env is None else env
+    if not isinstance(env, dict):
+        raise TypeError(
+            'environment_fingerprint_v3: env must be a mapping, got '
+            f'{type(env).__name__}')
+    contract = env.get('dependency_contract')
+    if not isinstance(contract, dict):
+        contract = dependency_contract()
+    unpinned = contract.get('unpinned_versions')
+    if not isinstance(unpinned, dict):
+        # Older/partial snapshots expose only the name list.  Record null
+        # versions rather than dropping the names: presence still matters.
+        names = contract.get('unpinned_installed')
+        if isinstance(names, list):
+            unpinned = {str(n): None for n in names}
+        else:
+            unpinned = {}
+    unpinned = {str(k): (None if v is None else str(v))
+                for k, v in unpinned.items()}
+    backend = env.get('numerical_backend')
+    if not isinstance(backend, dict):
+        backend = _numerical_backend_identity()
+    fields = {
+        'schema': ENVIRONMENT_FP_V3_SCHEMA,
+        'env_fp_v2': environment_fingerprint_v2(env),
+        'unpinned_versions': {k: unpinned[k] for k in sorted(unpinned)},
+        'n_unpinned': len(unpinned),
+        'numerical_backend': backend,
+    }
+    blob = json.dumps(fields, sort_keys=True, separators=(',', ':'),
+                      ensure_ascii=True, default=str)
+    return hashlib.sha256(blob.encode('utf-8')).hexdigest()[:16]
+
+
 def environment_snapshot():
     """Compact software/hardware snapshot for experiment tracking."""
     import platform
@@ -378,9 +583,14 @@ def environment_snapshot():
             env[_key] = None
     # OS-level identity is recorded separately from the digest so an auditor
     # can see which field changed; `env_fp_v2` binds the same block (and the
-    # full lock-pinned stack) into one comparable value.
+    # full lock-pinned stack) into one comparable value.  v3 adds the
+    # numerical backend and unpinned runtime distributions; both are recorded
+    # as structured fields so a differing digest can be explained.
     env['os_identity'] = _os_stack_identity()
+    env['numerical_backend'] = _numerical_backend_identity()
     env['env_fp_v2'] = environment_fingerprint_v2(env)
+    env['env_fp_v3'] = environment_fingerprint_v3(env)
+    env['env_fp_v3_schema'] = ENVIRONMENT_FP_V3_SCHEMA
     return env
 
 def execution_fingerprint(env=None):
@@ -445,6 +655,23 @@ def _environment_fp_v2(rec):
     return text or None
 
 
+def _environment_fp_v3(rec):
+    """Read the numerical-backend environment digest, or None.
+
+    v3 is intentionally separate from v2.  A record written before v3 keeps a
+    valid v2 identity; the absence of v3 is unverified, never a mismatch.
+    """
+    if not isinstance(rec, dict):
+        return None
+    value = rec.get('env_fp_v3')
+    if value is None and isinstance(rec.get('hyperparams'), dict):
+        value = rec['hyperparams'].get('env_fp_v3')
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
 def execution_environment_reason(ra, rb):
     """Why two records cannot attest same-environment replication, or None.
 
@@ -452,19 +679,33 @@ def execution_environment_reason(ra, rb):
     keep the historical permissive path.  This is only about the execution
     environment, not the seed, data or recipe (those have their own gates).
 
-    The strict ``env_fp_v2`` digest is preferred when both sides carry it: it
+    Preference order is ``env_fp_v3`` -> ``env_fp_v2`` -> ``exec_fp``.  v3
+    adds the BLAS/LAPACK/SIMD backend and unpinned runtime distributions; v2
     covers every lock-pinned distribution, the lock bytes and the OS/driver
-    block, which the legacy six-package ``exec_fp`` does not.  A one-sided v2
-    digest is not treated as a mismatch here (a seed-completion run may pair
-    with a legacy arm); it stays visible as a warning in the reproduction
-    comparator instead.  When neither side carries v2, the legacy digest is
-    compared exactly as before.
+    block; both are stricter than the legacy six-package ``exec_fp``.  A
+    one-sided newer digest is not a mismatch here (a seed-completion run may
+    pair with an older arm), so the comparison falls back to the strongest
+    digest both sides carry.  The reproduction comparator still reports the
+    missing layer as unverified rather than a match.
     """
     def _fp(rec):
         v = rec.get('exec_fp')
         if v is None and isinstance(rec.get('hyperparams'), dict):
             v = rec['hyperparams'].get('exec_fp')
         return v
+    # Prefer v3 when both sides carry it: it includes the v2 digest plus the
+    # BLAS/LAPACK/SIMD backend and any unpinned runtime distribution.  A
+    # one-sided v3 is a generation difference, not evidence of a different
+    # stack, so it falls back to v2 exactly as the v2 introduction did.
+    a3, b3 = _environment_fp_v3(ra), _environment_fp_v3(rb)
+    if a3 is not None and b3 is not None:
+        if a3 != b3:
+            return (f'different declared environment (env_fp_v3 {a3[:12]}… vs '
+                    f'{b3[:12]}…): lock-pinned packages, numerical backend '
+                    '(BLAS/LAPACK/SIMD), unpinned runtime distributions, '
+                    'interpreter or OS/driver stack differ; same-seed '
+                    'replication is not controlled')
+        return None
     a2, b2 = _environment_fp_v2(ra), _environment_fp_v2(rb)
     if a2 is not None and b2 is not None and a2 != b2:
         return (f'different declared environment (env_fp_v2 {a2[:12]}… vs '
@@ -633,6 +874,8 @@ def run_hyperparameters(cfg, *, seed, d, n_layers, n_heads, d_head, vocab, mlp_r
         'dataset': cfg.get('dataset') or 'wikitext',
         'exec_fp': execution_fingerprint(),
         'env_fp_v2': environment_fingerprint_v2(),
+        'env_fp_v3': environment_fingerprint_v3(),
+        'env_fp_v3_schema': ENVIRONMENT_FP_V3_SCHEMA,
         'train_knobs': training_knobs(amp_dtype=amp_dtype, eager_batch=eager_batch),
         'determinism': {
             'level': determinism_label(),
@@ -769,6 +1012,9 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reprodu
                     'rng_fp': rec.get('rng_fp'),
                     'exec_fp': rec.get('exec_fp'),
                     'env_fp_v2': rec.get('env_fp_v2'),
+                    'env_fp_v3': rec.get('env_fp_v3') or (
+                        (rec.get('hyperparams') or {}).get('env_fp_v3')
+                        if isinstance(rec.get('hyperparams'), dict) else None),
                     'data_fp': rec.get('data_fp'),
                     'val_fp': rec.get('val_fp'),
                     'data_version': rec.get('data_version') or prov.get('data', {}).get('data_version'),
@@ -856,6 +1102,10 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reprodu
         # not an incomplete one.  New panels must expose the count so a silent
         # loss of the field is visible.
         'with_env_fp_v2': sum(1 for c in cells.values() if c.get('env_fp_v2')),
+        # v3 is additive, like v2: an older panel is a legacy measurement,
+        # not an incomplete one.  New panels must expose the count so a
+        # silent loss of the stricter digest is visible.
+        'with_env_fp_v3': sum(1 for c in cells.values() if c.get('env_fp_v3')),
         'with_data_version': sum(1 for c in cells.values() if c.get('data_version')),
         'with_curve': sum(1 for c in cells.values() if (c.get('curve_summary') or {}).get('n_points')),
         'with_curve_hash': sum(1 for c in cells.values() if c.get('curve_sha256')),

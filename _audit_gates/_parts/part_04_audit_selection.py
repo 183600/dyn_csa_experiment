@@ -505,6 +505,10 @@ def audit_dependencies(lock_path=None):
         'missing': c.get('missing') or [],
         'invalid': c.get('invalid') or [],
         'unpinned_installed': (c.get('unpinned_installed') or [])[:50],
+        # The strict v3 digest binds versions as well as names; expose them so
+        # an operator can see which unpinned distribution makes v3 differ.
+        'unpinned_versions': dict(sorted(
+            (c.get('unpinned_versions') or {}).items())[:50]),
         'interpreter_status': _interp.get('status'),
         'interpreter_declared': _interp.get('declared') or {},
         'interpreter_actual': _interp.get('actual') or {},

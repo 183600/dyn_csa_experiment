@@ -261,6 +261,13 @@ def _report_identity(record):
         'source_sha256': tree.get('sha256'),
         'code_semantics': code.get('code_semantics'),
         'dependency_lock_sha256': contract.get('lock_sha256'),
+        # The strict environment generations recorded by the snapshot: v2
+        # covers the lock closure/OS identity, v3 adds the numerical backend
+        # and unpinned runtime distributions.  A report rebuilt on a
+        # different BLAS build is not the same analysis even when torch and
+        # the lock agree.
+        'env_fp_v2': env.get('env_fp_v2'),
+        'env_fp_v3': env.get('env_fp_v3'),
         'torch': env.get('torch'),
         'cuda_version': env.get('cuda_version'),
         'determinism': env.get('determinism'),
@@ -285,7 +292,8 @@ def analysis_report_diff(original, rerun, *, ignore=(), max_differences=200):
       * ``body`` — the result/verdict/curve body, excluding volatile stamps;
       * ``inputs`` — the recorded input-byte binding;
       * ``code`` — source-tree digest and semantic stamp;
-      * ``environment`` — dependency lock, torch/CUDA and determinism class.
+      * ``environment`` — lock closure, v2/v3 environment fingerprints,
+        torch/CUDA and determinism class.
 
     A bare "the JSON files differ" cannot tell a corrected statistic from a
     new timestamp, so the verdict is one of ``reproduced``, ``body_changed``,
@@ -405,8 +413,8 @@ def analysis_report_diff(original, rerun, *, ignore=(), max_differences=200):
     }
 
     env_fields = {}
-    for key in ('dependency_lock_sha256', 'torch', 'cuda_version',
-                'determinism', 'gpu_names'):
+    for key in ('dependency_lock_sha256', 'env_fp_v2', 'env_fp_v3', 'torch',
+                'cuda_version', 'determinism', 'gpu_names'):
         env_fields[key] = _dimension_status(ident_a[key], ident_b[key])
     if 'mismatch' in env_fields.values():
         env_verdict = 'mismatch'

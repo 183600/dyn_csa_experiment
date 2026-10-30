@@ -43,6 +43,16 @@ def _environment_fp_of(record):
     return text or None
 
 
+def _environment_fp3_of(record):
+    value = record.get('env_fp_v3')
+    if value is None and isinstance(record.get('hyperparams'), dict):
+        value = record['hyperparams'].get('env_fp_v3')
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
 def audit_environment_identity(results_dirs=None):
     """Compare local full-stack environment digests with recorded panels.
 
@@ -65,8 +75,9 @@ def audit_environment_identity(results_dirs=None):
     try:
         local_env = L.environment_snapshot()
         local_fp = L.environment_fingerprint_v2(local_env)
+        local_fp3 = L.environment_fingerprint_v3(local_env)
     except Exception as e:
-        local_env, local_fp = {}, None
+        local_env, local_fp, local_fp3 = {}, None, None
         local_error = f'{type(e).__name__}: {e}'
     else:
         local_error = None
@@ -79,6 +90,8 @@ def audit_environment_identity(results_dirs=None):
         'status': 'ok',
         'local': {
             'env_fp_v2': local_fp,
+            'env_fp_v3': local_fp3,
+            'env_fp_v3_schema': getattr(L, 'ENVIRONMENT_FP_V3_SCHEMA', None),
             'error': local_error,
             'lock_path': contract.get('lock_path'),
             'lock_sha256': contract.get('lock_sha256'),
@@ -97,6 +110,10 @@ def audit_environment_identity(results_dirs=None):
         'n_match': 0,
         'n_different_from_local': 0,
         'n_missing_v2': 0,
+        'n_with_v3': 0,
+        'n_match_v3': 0,
+        'n_different_v3': 0,
+        'n_missing_v3': 0,
         'panels': {},
         'problems': [],
         'warnings': [],
@@ -127,6 +144,7 @@ def audit_environment_identity(results_dirs=None):
         seen.add(panel_dir)
         panel_name = os.path.basename(panel_dir.rstrip(os.sep)) or panel_dir
         by_key = {}
+        by_key_v3 = {}
         conflicts = []
         for filename in ('run_manifest.json', 'summary.json'):
             path = os.path.join(panel_dir, filename)
@@ -135,6 +153,15 @@ def audit_environment_identity(results_dirs=None):
                 continue
             for key, rec in _environment_records_from_doc(doc):
                 fp = _environment_fp_of(rec)
+                fp3 = _environment_fp3_of(rec)
+                if fp3 is not None:
+                    old3 = by_key_v3.get(key)
+                    if old3 is None:
+                        by_key_v3[key] = fp3
+                    elif old3 != fp3:
+                        conflicts.append({'record': key, 'field': 'env_fp_v3',
+                                          'digests': sorted({old3, fp3}),
+                                          'source': filename})
                 if key not in by_key:
                     by_key[key] = fp
                     continue
@@ -142,7 +169,8 @@ def audit_environment_identity(results_dirs=None):
                 if old is None:
                     by_key[key] = fp
                 elif fp is not None and fp != old:
-                    conflicts.append({'record': key, 'digests': sorted({old, fp}),
+                    conflicts.append({'record': key, 'field': 'env_fp_v2',
+                                      'digests': sorted({old, fp}),
                                       'source': filename})
         records = sorted(by_key.items())
         if not records:
@@ -150,11 +178,31 @@ def audit_environment_identity(results_dirs=None):
         out['n_panels'] += 1
         panel = {'n_records': 0, 'n_with_v2': 0, 'n_match': 0,
                  'n_different_from_local': 0, 'n_missing_v2': 0,
-                 'recorded': {}, 'different': [], 'missing_v2': [],
+                 'n_with_v3': 0, 'n_match_v3': 0, 'n_different_v3': 0,
+                 'n_missing_v3': 0,
+                 'recorded': {}, 'recorded_v3': {}, 'different': [],
+                 'missing_v2': [], 'different_v3': [], 'missing_v3': [],
                  'conflicts': conflicts[:20]}
         for key, fp in records:
             panel['n_records'] += 1
             out['n_records'] += 1
+            fp3 = by_key_v3.get(key)
+            if fp3 is None:
+                panel['n_missing_v3'] += 1
+                out['n_missing_v3'] += 1
+                panel['missing_v3'].append(key)
+            else:
+                panel['n_with_v3'] += 1
+                out['n_with_v3'] += 1
+                panel['recorded_v3'][fp3] = panel['recorded_v3'].get(fp3, 0) + 1
+                if local_fp3 is not None and fp3 == local_fp3:
+                    panel['n_match_v3'] += 1
+                    out['n_match_v3'] += 1
+                elif local_fp3 is not None:
+                    panel['n_different_v3'] += 1
+                    out['n_different_v3'] += 1
+                    panel['different_v3'].append({'record': key,
+                                                  'env_fp_v3': fp3})
             if fp is None:
                 panel['n_missing_v2'] += 1
                 out['n_missing_v2'] += 1
@@ -171,7 +219,9 @@ def audit_environment_identity(results_dirs=None):
                 out['n_different_from_local'] += 1
                 panel['different'].append({'record': key, 'env_fp_v2': fp})
         panel['different'] = panel['different'][:20]
+        panel['different_v3'] = panel['different_v3'][:20]
         panel['missing_v2'] = panel['missing_v2'][:20]
+        panel['missing_v3'] = panel['missing_v3'][:20]
         out['panels'][panel_name] = panel
 
     n_conflicts = sum(len(p.get('conflicts') or [])
@@ -179,9 +229,10 @@ def audit_environment_identity(results_dirs=None):
     if n_conflicts:
         out['warnings'].append(
             f'{n_conflicts} cell(s) carry two different non-null env_fp_v2 '
-            'digests across run_manifest.json/summary.json; the copies were '
-            'not produced by one environment and the conflict is reported, '
-            'not silently resolved')
+            'digests (or two different env_fp_v3 digests) across '
+            'run_manifest.json/summary.json; the copies were not produced by '
+            'one environment and the conflict is reported, not silently '
+            'resolved')
     if out['n_records'] == 0:
         out['status'] = 'not_verifiable_locally'
         out['note'] = ('no local results_*/summary.json or run_manifest.json; '
@@ -193,20 +244,29 @@ def audit_environment_identity(results_dirs=None):
             'the coarse six-package exec_fp is available, so full-stack '
             'identity is unverified (not a match)')
         out['note'] = 'all local records are legacy (no env_fp_v2)'
-    elif out['n_different_from_local']:
+    elif out['n_different_from_local'] or out['n_different_v3']:
         out['status'] = 'warning'
         out['warnings'].append(
             f'{out["n_different_from_local"]}/{out["n_with_v2"]} recorded '
             'cell(s) were produced in a different declared environment than '
-            'this audit process; this is expected for a CPU audit of GPU '
-            'evidence and is not by itself a reproduction failure')
+            'this audit process (env_fp_v2), and '
+            f'{out["n_different_v3"]}/{out["n_with_v3"]} differ in env_fp_v3 '
+            '(numerical backend / unpinned runtime); this is expected for a '
+            'CPU audit of GPU evidence and is not by itself a reproduction '
+            'failure')
         out['note'] = ('some recorded environments differ from the local '
                        'stack; compare those panels on their original machine '
                        'before claiming same-environment reproduction')
     else:
         out['status'] = 'ok'
         out['note'] = ('every recorded cell with env_fp_v2 matches the local '
-                       'lock-pinned stack, interpreter and OS/driver identity')
+                       'lock-pinned stack, interpreter and OS/driver identity'
+                       + ('; every recorded env_fp_v3 also matches the local '
+                          'BLAS/LAPACK/SIMD backend and unpinned runtime'
+                          if out['n_with_v3'] and not out['n_missing_v3']
+                          else '; env_fp_v3 (numerical backend) is not '
+                               'recorded for every cell, so that layer stays '
+                               'unverified'))
     if contract.get('status') in ('mismatch', 'invalid', 'missing_lock'):
         out['warnings'].append(
             f'local dependency contract is {contract.get("status")!r}; '

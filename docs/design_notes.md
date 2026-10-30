@@ -9833,3 +9833,115 @@ python -m pytest -q test_review_part_53.py
 未声明 tag 拒绝；元数据在未验证时清零 `single_factor`；v10/v11 分析接线；
 audit gate/report/CLI 接线；审计不修改注册表。相关既有测试与完整 CPU
 套件在本轮最终树通过。
+
+## 113. 环境身份还缺数值后端：BLAS/LAPACK/SIMD 与未 pin 运行时分布（本轮可复现性/工程规范硬化，no new runs）
+
+### 113.1 问题：同一把锁、同一个 wheel 版本，不等于同一套数值内核
+
+§110 的 `env_fp_v2` 已经把 `requirements.lock` 的字节、全部 52 个 pin 的
+实际版本、解释器/平台契约和 OS/kernel/libc/driver 纳入摘要，解决了「六包
+指纹」漏掉传递依赖的问题。但还有两层没有被绑定：
+
+1. **未 pin 的运行时分布。** `dependency_contract` 会把未在 lock 中的已安装
+   发行版列进 `unpinned_installed` 并给出 `status='partial'`，但
+   `environment_fingerprint_v2` 只哈希 lock 里的 `pinned_installed`。两台
+   机器可以都满足 lock，却一台多装了某个未 pin 的数值库（或版本不同），
+   `env_fp_v2` 仍然相同。`partial` 是警告，不是摘要的一部分。
+2. **wheel 内部的数值后端。** `numpy==2.5.4` 只说明版本号；pip 的
+   OpenBLAS 构建与 conda 的 MKL 构建可以报告同一个版本，矩阵乘、归约和
+   特征值路径的最后几位可能不同。PyTorch 同理：`USE_MKL` /
+   `USE_MKLDNN` / `USE_OPENMP`、MKL/MKL-DNN 版本、`BLAS_INFO` /
+   `LAPACK_INFO` 与运行时 CPU capability（AVX2/AVX512 等）都不在 wheel
+   版本号里。同一份 PPL 比较在「锁相同、后端不同」的两台机器上并不受控。
+
+这两层都可能改变数值，却不改变任何已有指纹；把它们写进记录，才能让
+「同环境复现」这句话有可比较的对象。
+
+### 113.2 方法：`env_fp_v3` 是加一层，不是改写 v2
+
+新增 `exp_lib.ENVIRONMENT_FP_V3_SCHEMA = 3` 与
+`environment_fingerprint_v3(env=None)`，摘要绑定：
+
+- `schema=3`；
+- **`env_fp_v2` 的完整摘要**（因此 v2 覆盖的 lock 字节、全部 pin、
+  解释器/平台、OS/driver、精度与线程设置都仍在 v3 中）；
+- **全部未 pin、且不属于显式工具白名单的分布及其实际版本**。白名单
+  `_TOOLING_DISTRIBUTIONS` 明确列出 pip/setuptools/wheel、ruff、mypy、
+  black、flake8、pyflakes、isort、coverage、pytest-cov、tox、nox、
+  pre-commit、build、twine 与本项目自身；安装 linter 不应让数值环境看起来
+  变了，但一个未声明的数值库必须进入身份；
+- **NumPy 构建/运行时身份**：BLAS/LAPACK 的 name/version/
+  `openblas configuration`、构建期 SIMD baseline/found、运行时
+  `__cpu_dispatch__` 与 `__cpu_features__`，以及整份
+  `numpy.__config__.CONFIG` 的 canonical sha256；
+- **PyTorch 构建/运行时身份**：`torch.__config__.show()` 全文的 sha256，
+  MKL/MKLDNN/OpenMP 是否可用，解析出的 MKL、MKL-DNN、OpenMP 版本，
+  `BLAS_INFO`/`LAPACK_INFO`、CPU capability、build commit 与 CUDA build。
+
+hostname、PID、cwd、`PYTHONHASHSEED`、`CUDA_VISIBLE_DEVICES` 与
+`CSA_*` 运行开关仍然**不进入**摘要：v3 是声明栈/构建身份，不是进程身份。
+所有后端探针都是 best-effort，缺失字段记 `null`，不崩溃、不猜值。
+
+### 113.3 接线：保留旧记录的可比性
+
+v3 是独立字段 `env_fp_v3`，不是把 `ENVIRONMENT_FP_SCHEMA` 从 2 改成 3：
+
+- `environment_snapshot()` 同时写 `env_fp_v2`、`env_fp_v3`、
+  `env_fp_v3_schema` 与可读的 `numerical_backend`；
+- 训练记录（`train_variant`）与 `run_hyperparameters()` 写
+  `env_fp_v3` / `env_fp_v3_schema`；`write_run_manifest()` 的逐 cell
+  也抄录 v3，并在 `tracking_integrity` 增加 `with_env_fp_v3` 计数。该计数
+  **不进入** `complete`：旧面板是 legacy measurement，不是不完整测量；
+- `execution_environment_reason()` 的优先顺序是
+  **v3 -> v2 -> exec_fp**：两侧都有 v3 才比较 v3，且 v3 相同直接放行
+  （v3 已包含 v2）；只有一侧有 v3 时回退到 v2，避免把「新旧记录代际差」
+  误判成「环境变了」，从而不阻断 seed completion；
+- `reproduction_diagnosis` 的 `environment` 维度在**至少一侧**有 v3 时
+  增加 `env_fp_v3` 字段：两侧都有则 `match`/`mismatch`，只有一侧有则
+  `unverified`（并在 notes 说明缺的是数值后端层）；两侧都没有 v3 时保持
+  历史行为，不新增字段；
+- `audit_gates.py environment_identity`（别名 `environment` / `env_drift` /
+  `declared_environment`）新增 `local.env_fp_v3`、`n_with_v3` /
+  `n_match_v3` / `n_different_v3` / `n_missing_v3` 与逐 panel 的
+  `recorded_v3` / `different_v3` / `missing_v3`；v3 冲突也进入
+  `conflicts` 并带 `field`，不会把 manifest/summary 两份不同摘要静默合并；
+- `archive_release` 的 release identity 同时记录 `env_fp_v2`、
+  `env_fp_v3` 与可读的 `numerical_backend`，所以归档不只知道「v3 不同」，
+  还知道是 BLAS、MKL-DNN 还是 CPU capability 不同。
+
+### 113.4 边界：身份不是逐位复现证明
+
+- v3 证明的是「声明栈 + 构建/运行时数值后端 + 未 pin 运行时分布」这套
+  **身份**；它不证明两次执行逐位相同。逐位数值复现仍由
+  `reproduction_diagnosis` 的 `metric`、`reproducibility_check` 与
+  `seed_contract` 负责。
+- 后端探针是只读的 best-effort：在某些平台/构建上 `numpy.__config__`
+  或 `torch.__config__.show()` 不可用，字段为 `null`；这时身份**更弱**，
+  不会被补成猜测值。
+- CPU capability 可能受 hypervisor、OS 或 `ATEN_CPU_CAPABILITY` 影响；
+  这正属于「同一台机器也可能换数值路径」的情形，记录它比忽略更诚实。
+- v3 是内容身份，不是签名；会重写记录的人仍能重算摘要。它也不改变
+  `exec_fp`、`run_cfg`、resume 键、冻结清单、种子、alpha、Holm 或任何
+  p 值/终点判定；零 GPU、不新增训练、不读取 test split；`.github/` 与
+  所有 README 未删除或移动。
+
+### 113.5 入口与验证
+
+```bash
+python audit_gates.py environment_identity   # 本地 v2/v3 与落盘 panel 对账
+make env-check                               # 同一个入口
+python -m pytest -q test_review_part_54.py   # 本轮新增 12 项
+```
+
+`test_review_part_54.py` 覆盖：snapshot 的 v3/schema 与 backend 字段；改变
+BLAS/LAPACK/SIMD runtime/build、torch build report/MKL/OpenMP 版本都会改变
+v3；未 pin 分布的名称或版本改变 v3，而 hostname/PID/cwd/hash seed/
+`CUDA_VISIBLE_DEVICES`/`CSA_*` 不改变；`dependency_contract` 的
+`unpinned_versions` 与 `unpinned_installed` 键集一致且工具白名单不进入；
+非 mapping 拒绝、重复调用稳定、v3 与 v2 是不同的代际摘要；配对门优先 v3、
+单侧 v3 回退 v2；复现比较器对两侧 v3 的 match/mismatch/unverified 与
+notes；`analysis_report_diff` 的 environment 维度也绑定 v2/v3（改 v3 判
+`provenance_changed`）；`run_hyperparameters`/manifest 的 v3 字段与
+`with_env_fp_v3` 计数；环境审计的 v3 计数、legacy v2 不降级、v3 冲突合并；
+release identity 同时记录 v2/v3/backend。`test_review_part_51.py` 的 19 项
+v2 行为保持通过。完整 CPU 套件 1091 passed / 3 skipped（本机 DataLoader 环境跳过）。

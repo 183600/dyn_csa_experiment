@@ -280,6 +280,12 @@ CPU 上运行。
 
   lock 是完整的固定依赖闭包，包含 CPU 版 torch。
 
+- **环境身份会被核对，而不只是「装上了」：** `make env-check` 会把本地各
+  panel 记录的 `env_fp_v2` / `env_fp_v3` 与当前栈比较。v3 在 v2 的
+  lock 闭包之上加入 BLAS/LAPACK/SIMD 的构建与运行时身份，以及未 pin
+  （且非工具类）分布的实际版本，因此「同一把锁」不能悄悄代替「同一套
+  数值后端」。
+
 - **CUDA 机器：** 先安装与本机驱动匹配的 torch wheel，再安装兼容范围：
 
   ```bash
