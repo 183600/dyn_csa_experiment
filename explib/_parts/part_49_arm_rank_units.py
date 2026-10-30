@@ -94,18 +94,17 @@ _ARM_RANK_UNIT_BOUNDARY = (
 
 
 def _aru_seed_int(value):
-    """Normalise a seed key to a Python int; return None if it is not one."""
+    """Normalise a seed key to a Python int; return None if it is not one.
+
+    Python integers are kept exact (and are not round-tripped through
+    float64), so a large seed label does not fail merely because it exceeds
+    the float mantissa or exponent range.
+    """
     if isinstance(value, (bool,)) or value is None:
         return None
-    try:
-        import numbers
-        import numpy as _np
-    except Exception:  # pragma: no cover - numpy is a hard dependency
-        numbers = None
-        _np = None
-    if numbers is not None and isinstance(value, numbers.Integral):
-        return int(value)
-    if _np is not None and isinstance(value, _np.integer):
+    import numbers
+    import numpy as _np
+    if isinstance(value, (numbers.Integral, _np.integer)):
         return int(value)
     if isinstance(value, float):
         return int(value) if value.is_integer() else None
@@ -113,6 +112,13 @@ def _aru_seed_int(value):
         _s = value.strip()
         if not _s:
             return None
+        # Exact decimal integer spelling first: int('10**400') is cheap and
+        # exact, while float() would overflow.
+        if _s.lstrip('+-').isdigit():
+            try:
+                return int(_s)
+            except (TypeError, ValueError, OverflowError):
+                return None
         try:
             _f = float(_s)
         except (TypeError, ValueError, OverflowError):
@@ -131,9 +137,11 @@ def _aru_float_list(value, *, name):
         raise ValueError(f'{name} must be a numeric sequence') from None
     if not raw:
         raise ValueError(f'{name} must not be empty')
+    import numpy as _np
     out = []
     for i, x in enumerate(raw):
-        if (isinstance(x, (bool, str, bytes, bytearray, complex))
+        if (isinstance(x, (bool, _np.bool_, str, bytes, bytearray,
+                          complex, _np.complexfloating))
                 or x is None):
             raise ValueError(f'{name}[{i}] must be a finite number, got {x!r}')
         try:
@@ -152,6 +160,57 @@ def _aru_finite(value):
         return math.isfinite(float(value))
     except (TypeError, ValueError, OverflowError):
         return False
+
+
+def _aru_ratio(num, den):
+    """Return ``sum(num) / sum(den)`` without overflow in either partial sum.
+
+    Every value is divided by one common finite scale before the sums, so the
+    ratio is unchanged mathematically but a panel of ``1e308`` token counts no
+    longer raises ``OverflowError`` in ``math.fsum``.  ``None`` means the
+    ratio (or one of its sums) is not representable in float64.
+    """
+    import math
+    try:
+        values = [float(x) for x in num]
+        weights = [float(x) for x in den]
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not values or not weights:
+        return None
+    try:
+        scale = max(max(abs(x) for x in values),
+                    max(abs(x) for x in weights))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not (math.isfinite(scale) and scale > 0.0):
+        return None
+    try:
+        numerator = math.fsum(x / scale for x in values)
+        denominator = math.fsum(x / scale for x in weights)
+    except (OverflowError, ValueError):
+        return None
+    if not (math.isfinite(numerator) and math.isfinite(denominator)
+            and denominator > 0.0):
+        return None
+    ratio = numerator / denominator
+    return ratio if math.isfinite(ratio) else None
+
+
+def _aru_display_scale(max_log):
+    """The common ``exp(max_log)`` display factor, or ``None`` if unrepresentable.
+
+    A very negative ``max_log`` is a perfectly valid ranking panel in the
+    shifted log scale, but its original PPL values underflow float64.  In that
+    case the original-unit means/gaps must be withheld rather than written as
+    misleading zeros.
+    """
+    import math
+    try:
+        scale = math.exp(float(max_log))
+    except (OverflowError, ValueError):
+        return None
+    return scale if (math.isfinite(scale) and scale > 0.0) else None
 
 
 def _aru_not_estimable(reason, *, kind='arm_rank_unit_sensitivity'):
@@ -262,16 +321,52 @@ def _aru_check_alignment(per_arm, seeds):
 
 
 def _aru_ranks(values, better):
-    """Competition ranks (1,1,3) for a (K, B) array; ties share a rank."""
+    """Competition ranks (1,1,3) for a (K, B) array; ties share a rank.
+
+    Ranking is computed by sorting each bootstrap replicate, not by building
+    the (K, K, B) all-pairs comparison tensor.  The old tensor needed
+    ``8 * K**2 * B`` bytes and made a wide arm panel exhaust memory even
+    though the rank readout only needs O(K * B) storage.
+    """
     import numpy as np
     v = np.asarray(values, dtype=float)
     if v.ndim != 2:
         raise ValueError('rank values must be 2-D')
-    if better == 'min':
-        better_count = (v[None, :, :] < v[:, None, :]).sum(axis=1)
-    else:
-        better_count = (v[None, :, :] > v[:, None, :]).sum(axis=1)
-    return better_count + 1
+    k, b = v.shape
+    if k == 0 or b == 0:
+        return np.empty((k, b), dtype=np.int64)
+    key = v if better == 'min' else -v
+    order = np.argsort(key, axis=0, kind='stable')
+    ordered = np.take_along_axis(v, order, axis=0)
+    new_group = np.ones((k, b), dtype=bool)
+    if k > 1:
+        new_group[1:] = ordered[1:] != ordered[:-1]
+    positions = np.arange(k, dtype=np.int64)[:, None]
+    # Index (within the sorted column) of the first row of each tie group.
+    first = np.maximum.accumulate(np.where(new_group, positions, 0), axis=0)
+    sorted_ranks = first + 1
+    ranks = np.empty((k, b), dtype=np.int64)
+    np.put_along_axis(ranks, order, sorted_ranks, axis=0)
+    return ranks
+
+
+def _aru_sample_sd(values):
+    """Sample SD, with an exact zero for a constant vector.
+
+    ``ndarray.std(ddof=1)`` can return a ~1e-17 value for a vector whose
+    entries are all bit-identical: the rounded mean used for centring need not
+    equal the common value.  A constant bootstrap readout is exactly zero
+    variance, and the reported variance shares depend on that being true.
+    """
+    import numpy as np
+    a = np.asarray(values, dtype=float).reshape(-1)
+    if a.size == 0:
+        return None
+    if a.size == 1:
+        return 0.0
+    if np.all(a == a[0]):
+        return 0.0
+    return float(a.std(ddof=1))
 
 
 def _aru_axis(values, *, arms, better, scale, level):
@@ -316,7 +411,7 @@ def _aru_axis(values, *, arms, better, scale, level):
         # The axis stores scaled mean PPL (ranking is invariant to the common
         # exp(max_log) factor).  Report the gap in original PPL units when
         # that factor is representable, otherwise in the common scaled units.
-        if scale is not None and math.isfinite(scale):
+        if scale is not None and math.isfinite(scale) and scale > 0.0:
             gap = np.asarray(gap_scaled * scale, dtype=float)
             gap_units = 'ppl'
         else:
@@ -324,8 +419,7 @@ def _aru_axis(values, *, arms, better, scale, level):
             gap_units = 'scaled_ppl'
 
         gap_mean = float(gap.mean()) if np.all(np.isfinite(gap)) else None
-        gap_sd = ((float(gap.std(ddof=1)) if gap.size > 1 else
-                   (0.0 if gap.size == 1 else None))
+        gap_sd = (_aru_sample_sd(gap)
                   if np.all(np.isfinite(gap)) else None)
         g_lo, g_hi = (np.percentile(gap, [2.5, 97.5]).tolist()
                       if gap.size and np.all(np.isfinite(gap)) else [None, None])
@@ -344,7 +438,7 @@ def _aru_axis(values, *, arms, better, scale, level):
         'p_top2': {arms[i]: float(p_top2[i]) for i in range(k)},
         'mean_rank': {arms[i]: float(mean_rank[i]) for i in range(k)},
         'rank_ci95': {arms[i]: rank_ci[i] for i in range(k)},
-        'rank_sd': {arms[i]: float(ranks[i].std(ddof=1)) if b > 1 else 0.0
+        'rank_sd': {arms[i]: float(_aru_sample_sd(ranks[i]))
                     for i in range(k)},
         'p_best_max': float(p_best.max()) if k else None,
         'p_best_argmax': arms[int(np.argmax(p_best))] if k else None,
@@ -361,8 +455,15 @@ def _aru_axis(values, *, arms, better, scale, level):
     }
 
 
-def _aru_observed(values, *, arms, better, scale, log_offset, tie_tol):
-    """Observed arm values/ranks/gap from scaled arithmetic-mean PPLs."""
+def _aru_observed(values, *, arms, better, scale, log_offset, tie_tol,
+                  log_values=None):
+    """Observed arm values/ranks/gap from scaled arithmetic-mean PPLs.
+
+    ``log_values`` is the per-arm per-seed shifted log-PPL matrix.  When it is
+    supplied, the reported log means use a per-arm log-sum-exp, so an arm whose
+    relative PPL underflows ``exp()`` still gets its finite original-scale log
+    mean instead of ``None``.
+    """
     import math
     import numpy as np
     v = np.asarray(values, dtype=float)
@@ -380,30 +481,41 @@ def _aru_observed(values, *, arms, better, scale, log_offset, tie_tol):
             if v[i] != best:
                 runner = arms[i]
                 break
-    if scale is not None and math.isfinite(scale):
+    # ``v`` is the scaled mean PPL ``exp(z)``; its maximum is at least 1/K,
+    # so the log of the observed mean is representable even when the
+    # original-unit mean underflows/would overflow float64.  Keep the log
+    # readout in that case and withhold only the unrepresentable linear one.
+    log_means = {}
+    for i in range(k):
+        _lm = None
+        if math.isfinite(log_offset):
+            if log_values is not None:
+                _row = np.asarray(log_values[i], dtype=float)
+                if _row.size:
+                    _m = float(np.max(_row))
+                    _rel = np.exp(_row - _m)
+                    _lm = float(_m + math.log(float(np.mean(_rel))) + log_offset)
+            elif v[i] > 0.0:
+                _lm = float(math.log(float(v[i])) + log_offset)
+        log_means[arms[i]] = _lm if (_lm is not None
+                                     and math.isfinite(_lm)) else None
+    if scale is not None and math.isfinite(scale) and scale > 0.0:
         means = {}
-        log_means = {}
         for i in range(k):
             m = float(scale * v[i])
-            if math.isfinite(m):
-                means[arms[i]] = m
-                log_means[arms[i]] = (float(math.log(v[i]) + log_offset)
-                                      if v[i] > 0.0 and math.isfinite(log_offset)
-                                      else None)
-            else:
-                means[arms[i]] = None
-                log_means[arms[i]] = None
+            means[arms[i]] = m if math.isfinite(m) else None
     else:
         means = {arms[i]: None for i in range(k)}
-        log_means = {arms[i]: None for i in range(k)}
     gap = None
     gap_units = None
     if runner is not None:
         ri = arms.index(runner)
-        if scale is not None and math.isfinite(scale):
-            gap = abs(float(scale * (v[order[0]] - v[ri])))
-            gap_units = 'ppl'
-        else:
+        if scale is not None and math.isfinite(scale) and scale > 0.0:
+            _gap = abs(float(scale * (v[order[0]] - v[ri])))
+            if math.isfinite(_gap):
+                gap = _gap
+                gap_units = 'ppl'
+        if gap is None:
             gap = abs(float(v[order[0]] - v[ri]))
             gap_units = 'scaled_ppl'
     practical_tie = bool(gap is not None and tie_tol > 0.0 and gap <= tie_tol)
@@ -499,7 +611,9 @@ def arm_rank_unit_sensitivity(arm_units, *, better=None, n_boot=None, seed=None,
     lead_level = policy['lead_level'] if lead_level is None else lead_level
     tie_tol = policy['tie_tol'] if tie_tol is None else tie_tol
     for name, value, lo, hi in (
-            ('n_boot', n_boot, 1, None),
+            # The upper bound mirrors arm_rank_inference: an accidental
+            # ``n_boot=10**9`` must fail closed instead of exhausting memory.
+            ('n_boot', n_boot, 1, 200000),
             ('bootstrap_seed', seed, 0, None),
             ('min_seeds', min_seeds, 1, None),
             ('min_units', min_units, 2, None)):
@@ -557,20 +671,17 @@ def arm_rank_unit_sensitivity(arm_units, *, better=None, n_boot=None, seed=None,
     for i, arm in enumerate(arms):
         for j, sd in enumerate(seeds):
             cell = per_arm[arm][sd]
-            tot = float(math.fsum(cell['tokens']))
-            if not (math.isfinite(tot) and tot > 0.0):
+            ratio = _aru_ratio(cell['nll'], cell['tokens'])
+            if ratio is None:
                 return _aru_not_estimable(
-                    f'{arm!r}/seed {sd}: total tokens are not positive/finite')
-            _nll = float(math.fsum(cell['nll']))
-            if not math.isfinite(_nll):
-                return _aru_not_estimable(
-                    f'{arm!r}/seed {sd}: NLL sum is not finite')
-            logp[i, j] = _nll / tot
+                    f'{arm!r}/seed {sd}: NLL/token sums are not positive/'
+                    'finite or do not form a representable ratio')
+            logp[i, j] = ratio
     if not np.all(np.isfinite(logp)):
         return _aru_not_estimable('the per-unit NLL/token matrix produced a non-finite per-seed log-PPL')
     max_log = float(np.max(logp))
     z = logp - max_log
-    scale = (math.exp(max_log) if max_log <= 709.0 else None)
+    scale = _aru_display_scale(max_log)
     observed_seed_values = {}
     for i, arm in enumerate(arms):
         observed_seed_values[arm] = {}
@@ -596,6 +707,14 @@ def arm_rank_unit_sensitivity(arm_units, *, better=None, n_boot=None, seed=None,
                 sd = _aru_seed_int(raw_s)
                 if sd is None:
                     mismatches.append(f'{arm!r}: non-integer seed {raw_s!r}')
+                    continue
+                if sd in norm:
+                    mismatches.append(
+                        f'{arm!r}: duplicate seed label {sd} after normalisation')
+                    continue
+                if isinstance(raw_v, (bool, np.bool_)):
+                    mismatches.append(
+                        f'{arm!r}: seed {sd} endpoint is a boolean')
                     continue
                 norm[sd] = raw_v
             for sd in seeds:
@@ -630,46 +749,77 @@ def arm_rank_unit_sensitivity(arm_units, *, better=None, n_boot=None, seed=None,
     observed_values = np.exp(z).mean(axis=1)
     observed = _aru_observed(observed_values, arms=arms, better=better,
                              scale=scale, log_offset=max_log,
-                             tie_tol=float(tie_tol))
+                             tie_tol=float(tie_tol), log_values=z)
 
     rng = np.random.default_rng(int(seed))
-    doc_idx = rng.integers(0, n_units, size=(int(n_boot), n_units))
-    seed_idx = rng.integers(0, s, size=(int(n_boot), s))
+    n_boot = int(n_boot)
     tok = np.asarray(tokens, dtype=float)
     nll_mats = {arm: np.asarray([per_arm[arm][sd]['nll'] for sd in seeds],
                                 dtype=float) for arm in arms}
+    # Work on one common data-derived scale for the resampling sums.  The
+    # ratio NLL/tokens is invariant under this positive factor, while the
+    # partial sums stay bounded even when a legitimate panel stores 1e308
+    # token counts (``math.fsum``/``np.sum`` would otherwise overflow).
+    work_scale = max(float(np.max(np.abs(arr))) for arr in nll_mats.values())
+    work_scale = max(work_scale, float(np.max(tok)))
+    if not (math.isfinite(work_scale) and work_scale > 0.0):
+        return _aru_not_estimable(
+            'the per-unit NLL/token panel has no finite positive work scale')
+    nll_work = {arm: arr / work_scale for arm, arr in nll_mats.items()}
+    tok_work = tok / work_scale
 
     # Seed-only: same design as arm_rank_inference, on the observed units.
-    seed_values = np.empty((k, int(n_boot)), dtype=float)
-    for i, arm in enumerate(arms):
-        seed_values[i] = np.exp(z[i][seed_idx]).mean(axis=1)
+    # Chunk the (B, S) index draw so a very large bootstrap does not allocate
+    # the whole index matrix at once.
+    seed_values = np.empty((k, n_boot), dtype=float)
+    seed_chunk = max(1, min(n_boot, (1 << 20) // max(1, s)))
+    for off in range(0, n_boot, seed_chunk):
+        m = min(seed_chunk, n_boot - off)
+        seed_idx = rng.integers(0, s, size=(m, s))
+        for i, arm in enumerate(arms):
+            seed_values[i, off:off + m] = np.exp(z[i][seed_idx]).mean(axis=1)
     seed_axis = _aru_axis(seed_values, arms=arms, better=better, scale=scale,
                           level=seed_level)
     seed_axis['p_best_observed_winner'] = float(seed_axis['p_best'][observed['observed_winner']])
 
-    # Unit-only: one shared unit index set for every arm and seed.
-    unit_values = np.empty((k, int(n_boot)), dtype=float)
-    for i, arm in enumerate(arms):
-        _nll = nll_mats[arm]
-        # (S, B): sum the selected unit NLLs for every seed.
-        num = _nll[:, doc_idx].sum(axis=-1)
-        den = tok[doc_idx].sum(axis=-1)
-        unit_values[i] = np.exp(num / den - max_log).mean(axis=0)
+    # Unit-only and two-way share the same unit index set within a replicate,
+    # so every arm and every selected seed sees the same resampled units.
+    # Chunk both axes: the old (S, B, U) gather needed O(S*B*U) memory and the
+    # Python loop over B in the two-way axis was O(B*K*S*U) interpreter work.
+    unit_values = np.empty((k, n_boot), dtype=float)
+    two_values = np.empty((k, n_boot), dtype=float)
+    unit_chunk = max(1, min(n_boot, (1 << 22) // max(1, s * n_units)))
+    for off in range(0, n_boot, unit_chunk):
+        m = min(unit_chunk, n_boot - off)
+        doc_idx = rng.integers(0, n_units, size=(m, n_units))
+        seed_idx = rng.integers(0, s, size=(m, s))
+        den = tok_work[doc_idx].sum(axis=-1)
+        if np.any(den <= 0.0):
+            return _aru_not_estimable(
+                'a unit resample has no positive token denominator at the '
+                'scale used for the bootstrap')
+        for i, arm in enumerate(arms):
+            # (S, M): selected-unit NLL sums for every seed and replicate.
+            num = nll_work[arm][:, doc_idx].sum(axis=-1)
+            vals = np.exp(num / den - max_log)
+            if not np.all(np.isfinite(vals)):
+                return _aru_not_estimable(
+                    'a unit resample produced a non-finite endpoint; the '
+                    'panel exceeds the representable PPL range')
+            # Unit-only averages over all observed seeds.
+            unit_values[i, off:off + m] = vals.mean(axis=0)
+            # Two-way: choose a fresh seed set per replicate (shared across
+            # arms), then average those selected per-seed endpoints.
+            selected = np.take_along_axis(num.T, seed_idx, axis=1)
+            two_vals = np.exp(selected / den[:, None] - max_log).mean(axis=1)
+            if not np.all(np.isfinite(two_vals)):
+                return _aru_not_estimable(
+                    'a two-way resample produced a non-finite endpoint; the '
+                    'panel exceeds the representable PPL range')
+            two_values[i, off:off + m] = two_vals
     unit_axis = _aru_axis(unit_values, arms=arms, better=better, scale=scale,
                           level=unit_level)
     unit_axis['p_best_observed_winner'] = float(unit_axis['p_best'][observed['observed_winner']])
-
-    # Two-way: draw a fresh seed index and a fresh unit index per replicate.
-    # The loop is over B (not over arms) and uses vectorised sums per seed, so
-    # it stays cheap even at the default 2000 replicates.
-    two_values = np.empty((k, int(n_boot)), dtype=float)
-    for b in range(int(n_boot)):
-        _di = doc_idx[b]
-        den = float(tok[_di].sum())
-        for i, arm in enumerate(arms):
-            _nll = nll_mats[arm][:, _di]
-            two_values[i, b] = float(
-                np.exp(_nll.sum(axis=-1) / den - max_log).mean())
     two_axis = _aru_axis(two_values, arms=arms, better=better, scale=scale,
                          level=unit_level)
     two_axis['p_best_observed_winner'] = float(two_axis['p_best'][observed['observed_winner']])

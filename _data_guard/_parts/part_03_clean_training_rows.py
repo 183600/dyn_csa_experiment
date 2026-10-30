@@ -1311,6 +1311,22 @@ def _row_keys(X):
                             elif v is None or not (v == fv):
                                 _exact = False
                                 break
+                        else:
+                            # A non-finite float image is only a faithful
+                            # identity for a value that is itself non-finite
+                            # (or a missing-like NaN, whose spelling is
+                            # canonicalised by the code table).  A finite
+                            # Decimal such as Decimal('1e400') converts to
+                            # inf but must keep its exact wide key; otherwise
+                            # it collides with a genuine float('inf') row.
+                            if not np.isnan(fv):
+                                try:
+                                    if not bool(v == fv):
+                                        _exact = False
+                                        break
+                                except (TypeError, ValueError, OverflowError):
+                                    _exact = False
+                                    break
                         # Non-finite object values map to their float image;
                         # NaN/Inf identity is carried by the code table below.
                     if _exact:

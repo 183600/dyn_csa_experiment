@@ -94,13 +94,21 @@ def _rank_seed_label(value):
         except (TypeError, ValueError, OverflowError):
             raise ValueError(
                 f'arm_rank_inference: seed label {value!r} is not an integer') from None
+    import numbers
+    if isinstance(value, (numbers.Integral, np.integer)):
+        # Exact Python integers are not round-tripped through float64: a
+        # large seed label is a perfectly valid label even when it exceeds
+        # 2**53 or the float exponent range.
+        return int(value)
     try:
         as_int = int(value)
     except (TypeError, ValueError, OverflowError):
         raise ValueError(
             f'arm_rank_inference: seed label {value!r} is not an integer') from None
+    # Compare in the value's own domain (not via float) so integral Decimals
+    # and very large integers stay exact.
     try:
-        if float(value) != float(as_int):
+        if value != as_int:
             raise ValueError(
                 f'arm_rank_inference: seed label {value!r} is not an integer')
     except (TypeError, ValueError, OverflowError):

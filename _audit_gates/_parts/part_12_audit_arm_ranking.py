@@ -7,6 +7,10 @@ def _arm_rank_close(a, b, *, rel=1e-12, abs_=1e-12):
                 and bool(a) == bool(b))
     if a is None or b is None:
         return a is None and b is None
+    if (isinstance(a, numbers.Integral) and isinstance(b, numbers.Integral)):
+        # Exact comparison first: converting a large seed/step integer to
+        # float64 can raise OverflowError even when the two values are equal.
+        return int(a) == int(b)
     if isinstance(a, numbers.Number) and isinstance(b, numbers.Number):
         if (isinstance(a, (complex, np.complexfloating))
                 or isinstance(b, (complex, np.complexfloating))):
@@ -125,12 +129,18 @@ def audit_arm_ranking(path=None):
         raw = rk.get(key, default)
         if isinstance(raw, (bool, np.bool_)) or raw is None:
             return None
+        if isinstance(raw, numbers.Integral):
+            # Keep large exact integers exact instead of forcing them through
+            # float64 (a legal bootstrap seed may exceed the float range).
+            return int(raw)
+        if isinstance(raw, float):
+            return int(raw) if raw.is_integer() else None
         try:
             as_int = int(raw)
         except (TypeError, ValueError, OverflowError):
             return None
         try:
-            if float(raw) != float(as_int):
+            if raw != as_int:
                 return None
         except (TypeError, ValueError, OverflowError):
             return None

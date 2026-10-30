@@ -681,7 +681,9 @@ def _rank_unit_payload(admitted, arms, seeds, Ln):
                 cell = _by_len_cell(rec, Ln)
                 if cell is None:
                     return None, None, f'{arm!r}/seed {sd} has no L{int(Ln)} cell'
-                if cell.get('truncated') is not False:
+                _truncated = cell.get('truncated')
+                if not (isinstance(_truncated, (bool, np.bool_))
+                        and not bool(_truncated)):
                     return None, None, (f'{arm!r}/seed {sd} is truncated/undetermined at L{int(Ln)}')
                 ppl = cell.get(ppl_key)
                 tok = cell.get(tok_key)
@@ -689,6 +691,15 @@ def _rank_unit_payload(admitted, arms, seeds, Ln):
                         or not ppl or len(ppl) != len(tok)):
                     return None, None, (f'{arm!r}/seed {sd} lacks aligned {ppl_key}/{tok_key}')
                 nll = cell.get(nll_key)
+                # An absent NLL vector is allowed (the PPL vector is then
+                # sufficient); a present but misaligned/non-list NLL vector is
+                # malformed and must not silently fall back to PPL, which
+                # would hide the inconsistency this readout is meant to bind.
+                if nll is not None and (not isinstance(nll, list)
+                                        or len(nll) != len(ppl)):
+                    return None, None, (
+                        f'{arm!r}/seed {sd} has a {nll_key} vector that is not '
+                        f'aligned with {ppl_key}')
                 has_nll = isinstance(nll, list) and len(nll) == len(ppl)
                 vals_nll = []
                 vals_tok = []
@@ -739,7 +750,15 @@ def _rank_unit_payload(admitted, arms, seeds, Ln):
                         'per-unit token counts differ across arms/seeds; the '
                         'units are not the same weighted denominator')
                 ids = cell.get(id_key)
-                if isinstance(ids, list) and len(ids) == len(ppl):
+                if ids is not None:
+                    # A present id vector is part of the pairing contract; a
+                    # wrong length must refuse instead of being ignored (an
+                    # ignored vector left the readout unable to verify unit
+                    # identity at all).
+                    if not isinstance(ids, list) or len(ids) != len(ppl):
+                        return None, None, (
+                            f'{arm!r}/seed {sd} has a {id_key} vector that is '
+                            'not aligned with the per-unit values')
                     ids = [str(x) for x in ids]
                     ids_seen += 1
                     if ref_ids is None:
