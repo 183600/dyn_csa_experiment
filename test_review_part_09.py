@@ -2115,3 +2115,62 @@ def test_archive_manifest_covers_bytes_actually_written():
         assert not os.path.exists(
             os.path.join(td, 'archive', 'release_race_test.tar.gz'))
 
+
+
+def test_doc_level_analysis_rejects_an_overflowing_cell_ppl_mean():
+    # The per-document vectors are ordinary and reconstruct a finite pooled Δ,
+    # but the per-seed top-level PPLs are near the float limit.  np.mean sums
+    # them to inf, and the old `inf > inf` comparison accepted the unrelated
+    # document CI.  The guarded mean must refuse the mismatch.
+    docs = ['0000000000000001', '0000000000000002', '0000000000000003']
+    toks = [10, 20, 70]
+    nll_a = [2.0, 6.0, 30.0]
+    nll_b = [3.0, 5.0, 31.0]
+    cell_a = _document_cell(nll_a, toks, docs)
+    cell_b = _document_cell(nll_b, toks, docs)
+    cell_a['ppl'] = 1.5e308
+    cell_b['ppl'] = 1e-300
+    recs_a = {s: {'by_len': {512: dict(cell_a)}} for s in (0, 1)}
+    recs_b = {s: {'by_len': {512: dict(cell_b)}} for s in (0, 1)}
+    got = V12._doc_level_analysis(recs_a, recs_b, [0, 1], 512)
+    assert got is not None, got
+    assert 'pooled_delta_ppl_ci95' not in got, got
+    reason = got.get('pooled_ci_unavailable_reason', '')
+    assert 'do not reproduce' in reason or 'not representable' in reason, reason
+
+
+def test_analysis_choice_block_keeps_extreme_seed_deltas_finite():
+    # Raw np.mean/np.median/np.std overflow for a finite per-seed panel near
+    # the float limit; the robustness block must stay reportable instead of
+    # raising from a non-finite `point`.
+    out = {'unit': 'seed', 'pooled_delta_ppl': 1.5e308}
+    got = V12._analysis_choice_block(out, [1.5e308, 1.5e308])
+    assert got is not None, got
+    primary = got['specifications'][0] if 'specifications' in got else got['primary']
+    assert primary['point'] is not None and math.isfinite(primary['point']), primary
+    assert got['n_available'] >= 1, got
+    json.dumps(got, allow_nan=False)
+    # Ordinary panels keep the historical NumPy point estimate.
+    ordinary = V12._analysis_choice_block({'unit': 'seed'}, [1.0, 2.0, 3.0])
+    ordinary_primary = (ordinary['specifications'][0]
+                        if 'specifications' in ordinary else ordinary['primary'])
+    assert ordinary_primary['point'] == float(np.mean([1.0, 2.0, 3.0]))
+
+
+def test_analysis_choice_span_is_json_safe_for_opposite_extremes():
+    got = L.analysis_choice_concordance(
+        {'spec': 'primary', 'estimand': 'ppl delta', 'unit': 'seed',
+         'scale': 'ppl_delta', 'point': 1.7e308, 'ci95': None},
+        [{'spec': 'alt', 'estimand': 'ppl delta', 'unit': 'seed',
+          'scale': 'ppl_delta', 'point': -1.7e308, 'ci95': None}])
+    assert got['effect_range_ppl']['span'] is None, got['effect_range_ppl']
+    assert got['effect_range_ppl']['span_unavailable_reason'], got['effect_range_ppl']
+    json.dumps(got, allow_nan=False)
+    rel = L.analysis_choice_concordance(
+        {'spec': 'primary', 'estimand': 'ppl delta', 'unit': 'seed',
+         'scale': 'ppl_delta', 'point': 1e-300, 'ci95': None},
+        [{'spec': 'alt', 'estimand': 'ppl delta', 'unit': 'seed',
+          'scale': 'ppl_delta', 'point': 1.7e308, 'ci95': None}])
+    assert rel['effect_range_ppl']['span'] is not None
+    assert rel['effect_range_ppl']['relative_span'] is None
+    json.dumps(rel, allow_nan=False)

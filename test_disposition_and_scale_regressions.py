@@ -188,3 +188,110 @@ def test_scaling_trend_normalises_mixed_extreme_and_ordinary_effects():
     json.dumps(trend, allow_nan=False)
     meta = L.meta_analyze_effects(points, min_seeds=2)
     json.dumps(meta, allow_nan=False)
+
+
+def _tuning_artifact(per_arm):
+    """Minimal tuning artifact; each trial row carries an explicit seed panel."""
+    trials = L.BASELINE_TUNING_PROTOCOL['trials'][:2]
+
+    def _arm(rows):
+        out = []
+        for cfg, row in zip(trials, rows):
+            rec = {'config': dict(cfg), 'ppl': row['ppl'], 'ppl_std': 0.0,
+                   'seed_ppls': {str(k): v for k, v in row['seeds'].items()}}
+            rec.update({k: v for k, v in row.items()
+                        if k not in ('ppl', 'seeds', 'ppl_std')})
+            out.append(rec)
+        best = min(out, key=lambda r: r['ppl'])
+        return {'trials': out, 'selected': dict(best['config']),
+                'selected_metric_value': best['ppl']}
+
+    return {'selection_metric': 'ppl', 'selection_split': 'validation',
+            'direction': 'lower_is_better',
+            'arms': {'full_matched': _arm(per_arm[0]),
+                     'csa_dynamic': _arm(per_arm[1])}}
+
+
+def test_tuning_audit_recomputes_an_overflowing_per_seed_mean():
+    # The true mean of [1.5e308, 1.5e308] is representable, but np.mean's sum
+    # overflows to inf.  The old comparison `inf > inf` was False, so a
+    # forged finite `ppl` passed the replay gate.  The guarded mean must catch
+    # the mismatch, and the correctly reported extreme mean must still pass.
+    protocol = dict(L.BASELINE_TUNING_PROTOCOL,
+                    arms=['full_matched', 'csa_dynamic'])
+    forged = _tuning_artifact([
+        [{'ppl': 1.4e308, 'seeds': {0: 1.5e308, 1: 1.5e308}},
+         {'ppl': 1.6e308, 'seeds': {0: 1.55e308, 1: 1.55e308}}],
+        [{'ppl': 1.4e308, 'seeds': {0: 1.5e308, 1: 1.5e308}},
+         {'ppl': 1.5e308, 'seeds': {0: 1.45e308, 1: 1.45e308}}],
+    ])
+    rep = L.baseline_tuning_audit(forged, protocol=protocol)
+    assert rep['tuning_verified'] is False, rep
+    assert any('mean of its per-seed' in p for p in rep['problems']), rep['problems']
+    assert not any('not representable' in p for p in rep['problems']), rep['problems']
+
+    good = _tuning_artifact([
+        [{'ppl': 1.5e308, 'seeds': {0: 1.5e308, 1: 1.5e308}},
+         {'ppl': 1.55e308, 'seeds': {0: 1.55e308, 1: 1.55e308}}],
+        [{'ppl': 1.5e308, 'seeds': {0: 1.5e308, 1: 1.5e308}},
+         {'ppl': 1.45e308, 'seeds': {0: 1.45e308, 1: 1.45e308}}],
+    ])
+    rep_good = L.baseline_tuning_audit(good, protocol=protocol)
+    assert not any('mean of its per-seed' in p for p in rep_good['problems']), \
+        rep_good['problems']
+    assert not any('not representable' in p for p in rep_good['problems']), \
+        rep_good['problems']
+
+
+def test_tuning_audit_rejects_an_unrepresentable_pooled_ppl():
+    # exp(nll_sum/n_tokens) is beyond float64.  A finite reported PPL cannot
+    # be that value; the old `inf > inf` comparison accepted it silently.
+    row = {'ppl': 1.0, 'seeds': {0: 1.0, 1: 1.0}, 'nll_sum': 1e308,
+           'n_tokens': 1, 'ppl_aggregation': 'pooled_token_nll'}
+    protocol = dict(L.BASELINE_TUNING_PROTOCOL,
+                    arms=['full_matched', 'csa_dynamic'])
+    rep = L.baseline_tuning_audit(
+        _tuning_artifact([[row, row], [row, row]]), protocol=protocol)
+    assert rep['tuning_verified'] is False, rep
+    assert any('not representable' in p for p in rep['problems']), rep['problems']
+    assert any('exp(nll_sum/n_tokens)' in p for p in rep['problems']), rep['problems']
+
+
+def test_lesion_design_rejects_an_unhashable_source_without_crashing():
+    # A hand-written/third-party declaration can carry a list/dict where a
+    # registry key belongs.  The design gate must report a violation, not
+    # raise TypeError from `source in ABLATION_DESIGN` / `.get(source)`.
+    for bad_source in ([], {'name': 'attention_sink'}):
+        design = dict(L.LESION_DESIGN)
+        design['attention_sink'] = dict(design['attention_sink'],
+                                        source_component=bad_source)
+        rep = L.lesion_design_audit(design)
+        assert rep['status'] == 'fail', rep
+        assert any('source_component' in v for v in rep['violations']), \
+            rep['violations']
+    # A hashable but unregistered source reports the same failure.
+    design = dict(L.LESION_DESIGN)
+    design['attention_sink'] = dict(design['attention_sink'],
+                                    source_component='not_a_component')
+    rep = L.lesion_design_audit(design)
+    assert rep['status'] == 'fail', rep
+    assert any('source_component' in v for v in rep['violations']), rep['violations']
+
+
+def test_paired_fragility_extreme_ci_is_unavailable_not_nan():
+    # Every delta is finite, but the true sample SD (and therefore the t
+    # interval) is beyond float64.  The old report returned NaN bounds, which
+    # a strict-JSON writer rejects; "unavailable" must be None.
+    rep = L.paired_fragility([1.7e308, -1.7e308, 1.7e308])
+    assert rep['ci95_low'] is None and rep['ci95_high'] is None, rep
+    assert rep['ci_excludes_zero'] is None, rep
+    assert rep['std'] is None and rep['sem'] is None, rep
+    json.dumps(rep, allow_nan=False)
+    # The composite robustness block inherits the same fields.
+    rob = L.confirmation_robustness({'a': [1.7e308, -1.7e308, 1.7e308]})
+    assert rob['per_comparison']['a']['ci95_low'] is None, rob
+    json.dumps(rob, allow_nan=False)
+    # Ordinary panels keep a real interval.
+    ordinary = L.paired_fragility([0.5] * 12)
+    assert ordinary['ci95_low'] is not None and ordinary['ci95_high'] is not None
+    assert ordinary['ci_excludes_zero'] is True

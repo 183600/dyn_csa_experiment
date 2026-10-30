@@ -665,13 +665,27 @@ def analysis_choice_concordance(primary, alternatives, *, zero_tol=0.0):
     if ppl_points:
         _lo, _hi = min(ppl_points), max(ppl_points)
         _span = float(_hi - _lo)
-        effect_range = {
-            'min': float(_lo), 'max': float(_hi), 'span': _span,
-            'relative_span': (float(_span / abs(p['point']))
-                              if (p['scale'] == 'ppl_delta'
-                                  and abs(p['point']) > 0.0) else None),
-            'n': len(ppl_points),
-        }
+        if math.isfinite(_span):
+            _relative = (float(_span / abs(p['point']))
+                         if (p['scale'] == 'ppl_delta'
+                             and abs(p['point']) > 0.0) else None)
+            if _relative is not None and not math.isfinite(_relative):
+                _relative = None
+            effect_range = {
+                'min': float(_lo), 'max': float(_hi), 'span': _span,
+                'relative_span': _relative,
+                'n': len(ppl_points),
+            }
+        else:
+            # The two endpoints are finite but their distance is beyond
+            # float64.  Keep the min/max and withhold the span rather than
+            # emitting an infinite JSON number.
+            effect_range = {
+                'min': float(_lo), 'max': float(_hi), 'span': None,
+                'relative_span': None, 'n': len(ppl_points),
+                'span_unavailable_reason': ('the max-min span exceeds the '
+                                            'representable float64 range'),
+            }
     claim = {
         'stable': ('all non-zero specifications agree on the primary direction '
                    'and, where intervals exist, agree on whether zero is '
@@ -793,7 +807,7 @@ def paired_fragility(deltas, *, alpha=0.05, seeds=None):
            'n': n, 'n_input': n_input, 'n_dropped': n_dropped,
            'seeds': labels, 'per_seed': [float(x) for x in d.tolist()],
            'mean': float('nan'), 'std': float('nan'), 'sem': float('nan'),
-           'ci95_low': float('nan'), 'ci95_high': float('nan'),
+           'ci95_low': None, 'ci95_high': None,
            'ci_excludes_zero': None,
            'p': float('nan'), 'p_floor': float('nan'), 'p_signal': False,
            'n_nonzero': 0, 'sign_counts': {'positive': 0, 'negative': 0, 'zero': 0},
@@ -820,15 +834,15 @@ def paired_fragility(deltas, *, alpha=0.05, seeds=None):
         mean = float(d.mean())
         std = float(d.std(ddof=1)) if n > 1 else float('nan')
     sem = float(std / math.sqrt(n)) if (n > 1 and math.isfinite(std)) else float('nan')
-    ci_lo = ci_hi = float('nan')
+    ci_lo = ci_hi = None
     if n > 1 and math.isfinite(sem):
         tc = _t_critical(0.95, n - 1)
         if math.isfinite(tc):
             ci_lo, ci_hi = mean - tc * sem, mean + tc * sem
             if not (math.isfinite(ci_lo) and math.isfinite(ci_hi)):
-                # The endpoint is mathematically beyond float64; report it as
-                # unavailable (NaN) rather than an infinite interval.
-                ci_lo = ci_hi = float('nan')
+                # The endpoint is mathematically beyond float64; `None` is "not
+                # representable", not measured bounds (and keeps strict JSON).
+                ci_lo = ci_hi = None
     sf = exact_signflip_p(d)
     p = float(sf['p'])
     n_nonzero = int(sf.get('n_nonzero') or 0)
@@ -845,8 +859,9 @@ def paired_fragility(deltas, *, alpha=0.05, seeds=None):
     out.update({'mean': mean,
                 'std': (std if math.isfinite(std) else None),
                 'sem': (sem if sem is not None and math.isfinite(sem) else None),
-                'ci95_low': float(ci_lo), 'ci95_high': float(ci_hi),
-                'ci_excludes_zero': (None if not (math.isfinite(ci_lo) and math.isfinite(ci_hi))
+                'ci95_low': (float(ci_lo) if ci_lo is not None else None),
+                'ci95_high': (float(ci_hi) if ci_hi is not None else None),
+                'ci_excludes_zero': (None if (ci_lo is None or ci_hi is None)
                                      else bool(ci_lo > 0.0 or ci_hi < 0.0)),
                 'p': p, 'p_floor': sf.get('p_floor'), 'p_signal': bool(p < alpha),
                 'n_nonzero': n_nonzero,

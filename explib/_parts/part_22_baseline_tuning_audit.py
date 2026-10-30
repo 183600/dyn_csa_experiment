@@ -396,11 +396,27 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
                 if _vals:
                     if _trial_nll is not None and _trial_ntok is not None and _trial_ntok > 0:
                         _expected = float(_safe_exp_ppl(_trial_nll / _trial_ntok))
-                        if abs(_expected - _trial_ppl) > 1e-9 * max(1.0, abs(_expected)):
+                        if not math.isfinite(_expected):
+                            # The pooled value itself is beyond float64.  A
+                            # finite reported PPL cannot equal it, and the old
+                            # comparison `inf > inf` was False, so the artifact
+                            # silently passed an unrepresentable aggregate.
+                            problems.append(
+                                f'{arm}: trial ppl cannot be verified: '
+                                'exp(nll_sum/n_tokens) is not representable')
+                        elif abs(_expected - _trial_ppl) > 1e-9 * max(1.0, abs(_expected)):
                             problems.append(f'{arm}: trial ppl is not exp(nll_sum/n_tokens)')
                     else:
-                        _expected = float(np.mean(_vals))
-                        if abs(_expected - _trial_ppl) > 1e-9 * max(1.0, abs(_expected)):
+                        # `np.mean` sums first: a finite per-seed panel near the
+                        # float limit overflows to inf, and `inf > inf` is
+                        # False, so a forged finite mean used to pass.  Use the
+                        # same guarded mean as the writers.
+                        _expected = float(_scaled_mean_or_raw(_vals))
+                        if not math.isfinite(_expected):
+                            problems.append(
+                                f'{arm}: trial ppl cannot be verified: the '
+                                'per-seed mean is not representable')
+                        elif abs(_expected - _trial_ppl) > 1e-9 * max(1.0, abs(_expected)):
                             problems.append(f'{arm}: trial ppl is not the mean of its per-seed values')
                     if t.get('ppl_std') is not None and len(_vals) > 1:
                         # A non-finite/bool std is not a spread measurement;
@@ -416,7 +432,14 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
                             _ms = _scaled_mean_std_if_extreme(_vals, ddof=1)
                             _s = (float(_ms[1]) if _ms is not None
                                   else float(np.std(_vals, ddof=1)))
-                            if abs(_s - _reported_sd) > 1e-9 * max(1.0, abs(_s)):
+                            if not math.isfinite(_s):
+                                # An unrepresentable sample SD cannot match a
+                                # finite reported value; `inf > inf` would
+                                # otherwise accept it.
+                                problems.append(
+                                    f'{arm}: trial ppl_std cannot be verified: '
+                                    'the sample std is not representable')
+                            elif abs(_s - _reported_sd) > 1e-9 * max(1.0, abs(_s)):
                                 problems.append(f'{arm}: trial ppl_std is not the sample std of its per-seed values')
         if _set:
             search_seed_sets[arm] = _set

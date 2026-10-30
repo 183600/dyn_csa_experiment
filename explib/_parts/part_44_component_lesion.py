@@ -675,6 +675,7 @@ def lesion_panel_audit(records, *, relative_pct=LESION_POLICY['relative_pct'],
         g['records'].append({'seed': seed, 'intact_ppl': intact,
                              'lesion_ppl': lesion,
                              'checkpoint_sha256': ckpt,
+                             'eval_fp': eval_fp,
                              'sensitivity': sens})
     panels = {}
     for (component, arm), g in sorted(groups.items()):
@@ -682,6 +683,16 @@ def lesion_panel_audit(records, *, relative_pct=LESION_POLICY['relative_pct'],
             problems.append(
                 f'{component}/{arm}: records use {len(g["eval_fps"])} distinct '
                 'eval_fp values; a lesion panel must score the same rows')
+        elif (0 < sum(1 for r in g['records'] if r['eval_fp'])
+              < len(g['records'])):
+            # Partial attestation is not a mixed panel, but "same rows" cannot
+            # be verified for the records that omit the fingerprint.  Surface
+            # it instead of treating the group as fully attested.
+            warnings.append(
+                f'{component}/{arm}: only '
+                f'{sum(1 for r in g["records"] if r["eval_fp"])} of '
+                f'{len(g["records"])} records carry eval_fp; the panel cannot '
+                'verify that every seed scored the same rows')
         if len(g['records']) > 1 and len(g['checkpoints']) < len(g['records']):
             warnings.append(
                 f'{component}/{arm}: {len(g["records"])} seeds share only '
@@ -803,10 +814,16 @@ def lesion_design_audit(design=None, *, factory=None, n_layers=2,
             out['violations'].append(f'{component}: declaration must be a mapping')
             continue
         source = entry.get('source_component')
-        if source not in ABLATION_DESIGN:
+        if not isinstance(source, str) or source not in ABLATION_DESIGN:
             rec['status'] = 'fail'
             out['violations'].append(
                 f'{component}: source_component {source!r} is not in ABLATION_DESIGN')
+            # A list/dict source is unhashable: the later
+            # ABLATION_INTERVENTION_KEYS.get(source) lookup would raise
+            # TypeError instead of reporting a failed declaration.  Stop this
+            # component here and keep auditing the other declarations.
+            if not isinstance(source, str):
+                continue
         arms = entry.get('arms')
         if (not isinstance(arms, (list, tuple)) or not arms
                 or not all(isinstance(a, str) and a.strip() for a in arms)):

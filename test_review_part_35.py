@@ -339,3 +339,31 @@ def test_audit_lesion_reads_and_replays_an_artifact():
         with contextlib.redirect_stdout(io.StringIO()):
             rep_bad = A.audit_lesion(bad)
         assert rep_bad['status'] == 'fail', rep_bad
+
+
+def test_lesion_panel_flags_partially_attested_eval_fingerprints():
+    # One record carries the rows fingerprint, the rest do not.  This is not a
+    # conflicting panel, but "same rows" is unverifiable; the audit must not
+    # treat it as a clean, fully attested pass.
+    records = _records()
+    for rec in records[1:]:
+        rec.pop('eval_fp', None)
+    rep = L.lesion_panel_audit(records)
+    assert rep['status'] == 'warn', rep
+    assert any('only 1 of 6 records carry eval_fp' in w
+               for w in rep['warnings']), rep['warnings']
+    assert rep['panels']['attention_sink/csa_dynamic']['verdict'] == 'necessary'
+
+
+def test_lesion_design_reports_unhashable_source_without_crashing():
+    # Hand-written declarations can carry a list/dict where the registry key
+    # belongs; the gate must fail closed instead of raising TypeError from the
+    # dictionary membership/lookup.
+    for bad_source in ([], {'component': 'attention_sink'}):
+        design = dict(L.LESION_DESIGN)
+        design['attention_sink'] = dict(design['attention_sink'],
+                                        source_component=bad_source)
+        rep = L.lesion_design_audit(design)
+        assert rep['status'] == 'fail', rep
+        assert any('source_component' in v for v in rep['violations']), \
+            rep['violations']

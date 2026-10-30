@@ -1332,14 +1332,20 @@ def _analysis_choice_block(out, primary_deltas=None):
     if not deltas:
         return None
     n = len(deltas)
-    mean = float(np.mean(deltas))
+    # A finite per-seed panel near the float limit overflows raw np.mean /
+    # np.std; the guarded helpers keep the point estimate representable (and
+    # leave ordinary panels bit-identical to the historical NumPy path).
+    mean = float(L._scaled_mean_or_raw(deltas))
     seed_ci = None
-    if n > 1:
-        _sd = float(np.std(deltas, ddof=1))
-        _sem = _sd / math.sqrt(n)
-        _tc = L._t_critical(0.95, n - 1)
-        if math.isfinite(_tc) and math.isfinite(_sem):
-            seed_ci = [mean - _tc * _sem, mean + _tc * _sem]
+    if n > 1 and math.isfinite(mean):
+        _sd = L._scaled_std_or_raw(deltas)
+        if _sd is not None and math.isfinite(_sd):
+            _sem = _sd / math.sqrt(n)
+            _tc = L._t_critical(0.95, n - 1)
+            if math.isfinite(_tc) and math.isfinite(_sem):
+                _lo, _hi = mean - _tc * _sem, mean + _tc * _sem
+                if math.isfinite(_lo) and math.isfinite(_hi):
+                    seed_ci = [_lo, _hi]
     unit = out.get('unit') or out.get('granularity') or 'unit'
 
     def _ci_or_none(ci):
@@ -1370,13 +1376,13 @@ def _analysis_choice_block(out, primary_deltas=None):
 
     _add('seed_median_ppl_delta',
          'median of per-seed token-pooled PPL differences (a-b)',
-         'seed', 'ppl_delta', float(np.median(deltas)))
+         'seed', 'ppl_delta', float(L._scaled_median_or_raw(deltas)))
     if n >= 5:
         _k = int(math.floor(0.2 * n))
         _trimmed = sorted(deltas)[_k:n - _k]
         _add('seed_trimmed_mean_ppl_delta',
              '20% trimmed mean of per-seed token-pooled PPL differences (a-b)',
-             'seed', 'ppl_delta', float(np.mean(_trimmed)))
+             'seed', 'ppl_delta', float(L._scaled_mean_or_raw(_trimmed)))
     else:
         alts.append({'spec': 'seed_trimmed_mean_ppl_delta',
                      'estimand': '20% trimmed mean of per-seed PPL differences',

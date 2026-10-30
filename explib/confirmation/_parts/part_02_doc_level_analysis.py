@@ -205,8 +205,18 @@ def _doc_level_analysis(recs_a, recs_b, common, Ln, primary_deltas=None):
                         break
                     _pt.append(_fa - _fb)
                 if _pt:
-                    _want = float(np.mean(_pt))
-                    if abs(_pc['delta_ppl'] - _want) > 1e-5 * max(1.0, abs(_want)):
+                    # np.mean sums first: a finite per-seed panel near the float
+                    # limit overflows to inf, and `inf > inf` is False, which
+                    # would accept vectors that do not reproduce the recorded
+                    # pooled Δ.  The guarded mean keeps ordinary panels
+                    # bit-identical to np.mean.
+                    _want = float(L._scaled_mean_or_raw(_pt))
+                    if not math.isfinite(_want):
+                        _pooled_ci_reason = (
+                            f'token-pooled cluster CI refused: the '
+                            f'{_granularity} vectors imply a per-seed mean '
+                            'difference that is not representable')
+                    elif abs(_pc['delta_ppl'] - _want) > 1e-5 * max(1.0, abs(_want)):
                         _pooled_ci_reason = (
                             f'token-pooled cluster CI refused: the '
                             f'{_granularity} vectors do not reproduce the '
