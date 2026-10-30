@@ -1,7 +1,24 @@
 #!/usr/bin/env python3
-import json, math, os, shutil, statistics, subprocess, sys, time, traceback
+"""v6 supplementary-study driver.
+
+Runs the core, ablation, scale and long panels, resuming completed
+``variant::seed`` cells.  The zero-GPU entry points are ``smoke`` and
+``topup``; ``full`` starts the training panels.  Git pushes and the shutdown
+hook are opt-out through ``V6_NO_PUSH`` / ``V6_NO_SHUTDOWN``.
+"""
 import copy
+import json
+import math
+import os
+import shutil
+import statistics
+import subprocess
+import sys
+import time
+import traceback
+
 import numpy as np
+
 for _stream in (sys.stdout, sys.stderr):
     if hasattr(_stream, 'reconfigure'):
         try:
@@ -39,49 +56,55 @@ def _announce_seed_plan(label, cfg, seeds):
     the table is interpreted after the run.
     """
     plan = L.methodology_seed_plan(len(list(seeds)), variants=cfg.get('variants'))
-    _need = plan.get('min_seeds_for_family_significance')
+    min_seeds = plan.get('min_seeds_for_family_significance')
     print(f'[seed-plan] {label}: n={plan["n_seeds"]}, declared contrasts={plan["declared_contrasts"]}, '
-          f'family-corrected minimum n={_need}, sufficient={plan["sufficient_for_family_rejection"]}')
+          f'family-corrected minimum n={min_seeds}, sufficient={plan["sufficient_for_family_rejection"]}')
     if not plan.get('sufficient_for_family_rejection'):
         print(f'[seed-plan] WARNING: {label} at n={plan["n_seeds"]} is exploratory/descriptive only '
-              f'(need n>={_need} for any Holm-corrected claim). Add seeds with the seed-topup path before '
+              f'(need n>={min_seeds} for any Holm-corrected claim). Add seeds with the seed-topup path before '
               'reading a family-corrected p as significant.')
     return plan
+
+
+def _git(*args):
+    """Run a git command in the repository and capture its text output."""
+    return subprocess.run(args, cwd=REPO, capture_output=True, text=True,
+                          encoding='utf-8', errors='replace')
 
 
 def git_push(msg):
     if os.environ.get('V6_NO_PUSH'):
         print(f'[git] push skipped (V6_NO_PUSH): {msg}')
         return True
-    run = lambda *a: subprocess.run(a, cwd=REPO, capture_output=True, text=True, encoding='utf-8', errors='replace')
-    ra = run('git', 'add', '-A')
-    if ra.returncode != 0:
-        print(f'[git] add FAILED: {(ra.stdout + ra.stderr)[-300:]} — NOT pushing (a commit could miss unstaged work); leaving the tree for inspection')
+    added = _git('git', 'add', '-A')
+    if added.returncode != 0:
+        print(f'[git] add FAILED: {(added.stdout + added.stderr)[-300:]} — NOT pushing (a commit could miss unstaged work); leaving the tree for inspection')
         return False
-    r = run('git', 'commit', '-m', msg)
-    committed = r.returncode == 0
-    if not committed and 'nothing to commit' not in r.stdout + r.stderr:
-        print(f'[git] commit problem: {(r.stdout + r.stderr)[-300:]}')
-        if run('git', 'status', '--porcelain').stdout.strip():
+    commit = _git('git', 'commit', '-m', msg)
+    committed = commit.returncode == 0
+    if not committed and 'nothing to commit' not in commit.stdout + commit.stderr:
+        print(f'[git] commit problem: {(commit.stdout + commit.stderr)[-300:]}')
+        if _git('git', 'status', '--porcelain').stdout.strip():
             print('[git] the commit failed while changes are still uncommitted — NOT pushing (a push would publish stale history and report success); leaving the tree for inspection')
             return False
-    _branch = run('git', 'rev-parse', '--abbrev-ref', 'HEAD').stdout.strip()
-    if _branch != 'HEAD':
-        rb = run('git', 'pull', '--rebase', '--autostash', 'origin', _branch)
-        if rb.returncode != 0:
-            print(f'[git] rebase onto origin failed: {(rb.stdout + rb.stderr)[-300:]}')
-            run('git', 'rebase', '--abort')
-        r = run('git', 'push', 'origin', 'HEAD')
+    branch = _git('git', 'rev-parse', '--abbrev-ref', 'HEAD').stdout.strip()
+    if branch != 'HEAD':
+        rebase = _git('git', 'pull', '--rebase', '--autostash', 'origin', branch)
+        if rebase.returncode != 0:
+            print(f'[git] rebase onto origin failed: {(rebase.stdout + rebase.stderr)[-300:]}')
+            _git('git', 'rebase', '--abort')
+        pushed = _git('git', 'push', 'origin', 'HEAD')
     else:
-        _up = run('git', 'symbolic-ref', '-q', 'refs/remotes/origin/HEAD').stdout.strip()
-        _dst = _up[len('refs/remotes/origin/'):] if _up.startswith('refs/remotes/origin/') else ''
-        if not _dst or run('git', 'rev-parse', '--verify', '-q', f'refs/remotes/origin/{_dst}').returncode != 0:
-            _dst = 'main'
-        print(f'[git] detached HEAD — pushing explicitly to origin/{_dst}')
-        r = run('git', 'push', 'origin', f'HEAD:{_dst}')
-    ok = r.returncode == 0
-    tail = (r.stdout + r.stderr).strip()[-300:]
-    print(f'[git] push {('OK' if ok else 'FAILED')}: {msg}' + ('' if ok else f'  ({tail})'))
+        upstream = _git('git', 'symbolic-ref', '-q', 'refs/remotes/origin/HEAD').stdout.strip()
+        destination = upstream[len('refs/remotes/origin/'):] if upstream.startswith('refs/remotes/origin/') else ''
+        if not destination or _git('git', 'rev-parse', '--verify', '-q', f'refs/remotes/origin/{destination}').returncode != 0:
+            destination = 'main'
+        print(f'[git] detached HEAD — pushing explicitly to origin/{destination}')
+        pushed = _git('git', 'push', 'origin', f'HEAD:{destination}')
+    ok = pushed.returncode == 0
+    tail = (pushed.stdout + pushed.stderr).strip()[-300:]
+    status = 'OK' if ok else 'FAILED'
+    print(f'[git] push {status}: {msg}' + ('' if ok else f'  ({tail})'))
     if not ok and committed:
         print('[git] WARNING: the commit is only on this instance — the work is NOT on the remote.  Re-push before shutting down.')
     return ok

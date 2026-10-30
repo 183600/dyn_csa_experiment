@@ -31,14 +31,38 @@ split). Only the frozen v12 fixed-chunk comparisons are confirmatory. See
 > auditable. A claim becomes auditable only when its `release_<tag>.tar.gz`
 > plus manifest is published and `archive_release.py verify` passes.
 
+## Study at a glance
+
+The drivers are organized by study generation. Each has a `smoke` mode for
+plumbing checks, a training mode for the real panels, and zero-GPU
+analysis/report subcommands where applicable. v6 keeps its historical script
+entry point; v7 onwards live under `explib/`.
+
+| generation | scope | entry point | generated artifacts |
+|---|---|---|---|
+| v6 | core CSA/HCA table, leave-one-out ablations, scale probe, long runs | `python run_gapfill.py full` | `results_lm_v3_1500/`, `results_lm_v4_abl/`, `results_lm_v5_scale/`, `results_lm_v3_long/` |
+| v7 | RoPE + QK-norm, length extrapolation, top-k sweep | `python -m explib.rope` | `REPORT_v7.md` |
+| v8 | scale-panel seed completion and the 20k RoPE run | `python -m explib.scale` | `analysis_v8/` |
+| v9 | seq-2048 top-k completion and the third 20k seed | `python -m explib.resume` | `REPORT_v9.md` |
+| v10 | distractor-injection mechanism probe, crossover scaling, selector controls | `python -m explib.corruption` | `analysis_v10/`, `REPORT_v10.md` |
+| v11 | statistical close-out of the v10/v11 panels | `python -m explib.length` | `analysis_v11/`, `REPORT_v11.md` |
+| v12 | frozen fixed-chunk confirmation | `python -m explib.confirmation` | `analysis_v12/`, `REPORT_v12.md` |
+| M0 | FineWeb-Edu data path, kernel G0 gate, S1/S2 scale panels | `python -m explib.m0` | `results_b_s1/`, `results_b_s2/`, `analysis_m0/` |
+| open-block | maximum block length × open-block reading rule | `python -m explib.open_block` | `analysis_open_block/` |
+
+Run a driver with `--help` for its exact subcommands. Training is never
+implicit: it starts only in a mode named `full`, `phase <name>`, `main`, or
+`auto`.
+
 ## Contents
 
+- [Study at a glance](#study-at-a-glance)
 - [Start here](#start-here)
 - [Quick start](#quick-start)
 - [Where to look](#where-to-look)
 - [Repository layout](#repository-layout)
   - [Regenerating the experiment artifacts](#regenerating-the-experiment-artifacts)
-- [Reproducing (any CUDA box)](#reproducing-any-cuda-box)
+- [Running the experiments](#running-the-experiments)
   - [Environment](#environment)
   - [Data and cache fallbacks](#data-and-cache-fallbacks)
   - [Validate the pipeline before training](#validate-the-pipeline-before-training)
@@ -55,13 +79,16 @@ split). Only the frozen v12 fixed-chunk comparisons are confirmatory. See
 
 ## Start here
 
+All commands below run from the repository root. A checkout is healthy when
+`make test` passes.
+
 | goal | start with | starts training? |
 |---|---|---|
 | verify that a checkout is healthy | `python -m pip install -r requirements.lock`, then `make test` | no |
 | validate the frozen plan without touching the test split | `make plan` | no |
 | run the open-block causality/reference gates | `python -m pytest -q test_open_block.py` | no |
 | try the pipeline end to end | `python run_gapfill.py smoke` | smoke run only |
-| run or resume a study panel | the driver table under [Repository layout](#repository-layout) | yes |
+| run or resume a study panel | [Study at a glance](#study-at-a-glance) | yes |
 | rebuild a report from local artifacts | `python build_report.py` or `python -m explib.<driver> report` | no |
 | check whether two runs agree | `python -m explib.reproduce compare ORIGINAL RERUN` | no |
 | understand why a measurement is defined this way | the [Where to look](#where-to-look) table | no |
@@ -90,7 +117,7 @@ the pipeline.
 | question | document |
 |---|---|
 | How do I run or re-run an experiment? | this README |
-| Which command and subcommand should I use? | [Repository layout](#repository-layout) and the per-driver sections below |
+| Which command and subcommand should I use? | [Study at a glance](#study-at-a-glance) and the per-driver sections below |
 | Why is a measurement or comparison defined this way? | `docs/design_notes.md` |
 | What was decided, and in what order? | `DECISION_LOG.md` |
 | Where is the released evidence? | `RELEASES.md` |
@@ -114,7 +141,7 @@ the design notes, `docs/design_notes.md`).
 | `explib/` | **the library — and the source of truth**: model, CSA/HCA attention, pooling, indexer, segmenters, training loop, aggregation and statistics |
 | `csa_kernels.py` | **compatibility shim** that re-exports the split implementation in `_csa_kernels/` |
 | `_csa_kernels/` | **the fused-kernel path for the three core operators** (the retired compute-plan M0 work package): block-compression pooling, indexer top-k selection and sparse attention as Triton kernels (plus a CPU-runnable torch-reference twin of the same algorithmic decomposition); opt-in via `CSA_KERNEL`, off by default — see "Triton kernel path (M0/G0)" below |
-| `run_gapfill.py` | **the v6 driver**: the minimum-publishable supplementary runs, resumable, guarded by a run-time cap, pushes after every phase, auto-shuts the instance down |
+| `run_gapfill.py` | **the v6 driver**: core/ablation/scale/long panels, resumable, guarded by a run-time cap, pushes after every phase, auto-shuts the instance down |
 | `par.py` | **task-level parallel executor (opt-in)**: one GPU card per independent run — see "Task-level parallelism" below |
 | `explib/rope/` | **the v7 driver** (`python -m explib.rope`): reviewer-response supplementary suite — P0R RoPE+QK-norm, P0W dense-warmup, P0E 40k-step long run, P2S scale re-seeding, P1L length extrapolation, P1T topk sweep |
 | `explib/scale/` | **the v8 driver** (`python -m explib.scale`): P1S (scale panel seed completion to 4 seeds) and P2R (RoPE+QK-norm 20k-step long run) |
@@ -157,14 +184,14 @@ Result directories and reports are not kept in the repository. To obtain them
 again:
 
 ```bash
-python run_gapfill.py smoke      # end-to-end self-check; no research measurement
-python run_gapfill.py full       # the v6 main experiment (bounded by the run-time cap)
-python -m explib.rope ...        # per-version supplementary runs; subcommands in each module's help
-python build_report.py           # rebuild the report from on-disk results_*/ + analysis_*/
+python run_gapfill.py smoke            # end-to-end self-check; no research measurement
+python run_gapfill.py full             # the v6 main experiment (bounded by the run-time cap)
+python -m explib.<driver> --help       # exact subcommands for a v7-v12/M0/open-block driver
+python build_report.py                 # rebuild the report from on-disk results_*/ + analysis_*/
 ```
 
 If the same cells were executed twice (parallel vs serial, a second machine, or
-a re-run after a fix), verify the second copy instead of trusting the report:
+a re-run after a code change), verify the second copy instead of trusting the report:
 
 ```bash
 python -m explib.reproduce compare results_lm_v6 results_lm_v6_rerun
@@ -178,10 +205,11 @@ The verifier reports each dimension separately, so `environment_changed`,
 "did not reproduce" message. A missing fingerprint is
 `provenance_incomplete` (never a pass).
 
-## Reproducing (any CUDA box)
+## Running the experiments (any machine)
 
 The commands below are grouped by side effect: environment, zero-GPU checks,
-then training. Run them from the repository root.
+then training. Run them from the repository root. Training panels need a GPU;
+tests, analysis, report builders and audit gates run on CPU.
 
 ### Environment
 

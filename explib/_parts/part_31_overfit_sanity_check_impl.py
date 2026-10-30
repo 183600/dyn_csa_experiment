@@ -409,9 +409,13 @@ def _overfit_probe_config(*, seed, steps, seq_len, batch_size, vocab, target_los
     }
     return cfg
 
-def _overfit_probe_digest(cfg):
-    blob = json.dumps(cfg, sort_keys=True, separators=(',', ':'), ensure_ascii=True)
+def _canonical_json_digest(obj):
+    """Short, stable digest of a JSON-serialisable probe key."""
+    blob = json.dumps(obj, sort_keys=True, separators=(',', ':'), ensure_ascii=True)
     return hashlib.sha256(blob.encode('utf-8')).hexdigest()[:16]
+
+def _overfit_probe_digest(cfg):
+    return _canonical_json_digest(cfg)
 
 def _overfit_probe_semantics(cfg):
     """Digest of everything except WHERE the batch came from.
@@ -421,8 +425,7 @@ def _overfit_probe_semantics(cfg):
     invalidate the model-plumbing certificate, but the data certificate itself
     is still keyed by the full config (source + fingerprint)."""
     sem = {k: v for k, v in (cfg or {}).items() if k not in ('source', 'data_fp')}
-    blob = json.dumps(sem, sort_keys=True, separators=(',', ':'), ensure_ascii=True)
-    return hashlib.sha256(blob.encode('utf-8')).hexdigest()[:16]
+    return _canonical_json_digest(sem)
 
 def probe_seq_len(seq_len, *, min_blocks=128, cap=256):
     """Sequence length for the pre-flight probe.
@@ -819,8 +822,7 @@ def _repro_probe_config(*, seed, steps, tol, arch, seq_len, batch_size, vocab, m
     }
 
 def _repro_probe_digest(cfg):
-    blob = json.dumps(cfg, sort_keys=True, separators=(',', ':'), ensure_ascii=True)
-    return hashlib.sha256(blob.encode('utf-8')).hexdigest()[:16]
+    return _canonical_json_digest(cfg)
 
 def reproducibility_check(variant='full', *, seed=0, steps=3, tol=1e-06, device=None, arch=None, train_ids=None, vocab=None, mlp_ratio=None, seq_len=None, batch_size=2, lr=0.003):
     """Two identical short runs + one different-seed run, compared.

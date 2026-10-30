@@ -973,15 +973,25 @@ class LeakageSafeFrequencyEncoder:
         return obj
 
 
-def prepare_frequency_features(X_train, X_val=None, X_test=None, **kwargs):
-    """Fit frequency tables on train, then transform the holdouts."""
-    encoder = LeakageSafeFrequencyEncoder(**kwargs).fit(X_train)
-    out = {'train': encoder.transform(X_train), 'encoder': encoder}
+def _fit_and_transform(encoder, X_train, X_val, X_test, fitted_key):
+    """Fit-on-train / transform-holdouts result bundle.
+
+    ``fitted_key`` keeps the historical return key for the fitted object
+    (``encoder`` for the feature encoders, ``preprocessor`` for the
+    preprocessor) and its position in the dictionary.
+    """
+    out = {'train': encoder.transform(X_train), fitted_key: encoder}
     if X_val is not None:
         out['val'] = encoder.transform(X_val)
     if X_test is not None:
         out['test'] = encoder.transform(X_test)
     return out
+
+
+def prepare_frequency_features(X_train, X_val=None, X_test=None, **kwargs):
+    """Fit frequency tables on train, then transform the holdouts."""
+    encoder = LeakageSafeFrequencyEncoder(**kwargs).fit(X_train)
+    return _fit_and_transform(encoder, X_train, X_val, X_test, 'encoder')
 
 
 def fit_categorical_encoder(X_train, **kwargs):
@@ -992,12 +1002,7 @@ def fit_categorical_encoder(X_train, **kwargs):
 def prepare_categorical_features(X_train, X_val=None, X_test=None, **kwargs):
     """Encode train categories first, then transform the holdouts."""
     encoder = LeakageSafeCategoricalEncoder(**kwargs).fit(X_train)
-    out = {'train': encoder.transform(X_train), 'encoder': encoder}
-    if X_val is not None:
-        out['val'] = encoder.transform(X_val)
-    if X_test is not None:
-        out['test'] = encoder.transform(X_test)
-    return out
+    return _fit_and_transform(encoder, X_train, X_val, X_test, 'encoder')
 
 
 # Conventional short alias.
@@ -1016,12 +1021,7 @@ def prepare_features(X_train, X_val=None, X_test=None, **kwargs):
     with ``transform``.  No holdout row contributes to any statistic.
     """
     prep = LeakageSafePreprocessor(**kwargs).fit(X_train)
-    out = {'train': prep.transform(X_train), 'preprocessor': prep}
-    if X_val is not None:
-        out['val'] = prep.transform(X_val)
-    if X_test is not None:
-        out['test'] = prep.transform(X_test)
-    return out
+    return _fit_and_transform(prep, X_train, X_val, X_test, 'preprocessor')
 
 
 def _stats_match_float(a, b, *, atol, rtol):

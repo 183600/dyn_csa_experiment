@@ -185,6 +185,28 @@ def _search_final_seeds(protocol):
     return search, final, sorted(set(search) & set(final))
 
 
+def _nested_row_split_inputs(base, n_rows, spec):
+    """Resolve the document-id sidecar and fold arguments once.
+
+    ``run_corpus_row_groups`` stays outside the caller's fallback ``try``
+    block: only a legitimate "these groups cannot form the requested folds"
+    error may fall back to the row-only split, while a corrupt sidecar must
+    remain an evidence error.
+    """
+    groups, group_meta = L.run_corpus_row_groups(base, n_rows)
+    kwargs = dict(seed=spec['seed'], n_folds=spec['n_folds'],
+                  selection_fold=spec['selection_fold'],
+                  evaluation_fold=spec['evaluation_fold'])
+    return groups, group_meta, kwargs
+
+
+def _nested_row_split_call(n_rows, groups, kwargs):
+    """Run the fold assignment, passing the sidecar only when it exists."""
+    if groups is not None:
+        return L.validation_row_split(n_rows, groups=groups, **kwargs)
+    return L.validation_row_split(n_rows, **kwargs)
+
+
 def _nested_row_split(base, n_rows, spec):
     """Chronological selection/evaluation rows, group-aware when possible.
 
@@ -195,16 +217,10 @@ def _nested_row_split(base, n_rows, spec):
     returned with an explicit `groups_aware=False` reason, never silently
     presented as document-disjoint.
     """
-    _groups, _gmeta = L.run_corpus_row_groups(base, n_rows)
-    _kw = dict(seed=spec['seed'], n_folds=spec['n_folds'],
-               selection_fold=spec['selection_fold'],
-               evaluation_fold=spec['evaluation_fold'])
-    if _groups is not None:
-        _sel, _ev, _meta = L.validation_row_split(n_rows, groups=_groups, **_kw)
-    else:
-        _sel, _ev, _meta = L.validation_row_split(n_rows, **_kw)
+    groups, group_meta, kwargs = _nested_row_split_inputs(base, n_rows, spec)
+    _sel, _ev, _meta = _nested_row_split_call(n_rows, groups, kwargs)
     _meta = dict(_meta)
-    _meta.update(_gmeta or {})
+    _meta.update(group_meta or {})
     return _sel, _ev, _meta
 
 
@@ -222,23 +238,16 @@ def _nested_row_split_checked(base, n_rows, spec):
     # validation sample.  A corrupt/inconsistent sidecar or malformed metadata
     # is an evidence error: swallowing it here would silently drop the nested
     # contract and select on the rows used for the final estimate.
-    _groups, _gmeta = L.run_corpus_row_groups(base, n_rows)
-    _kw = dict(seed=spec['seed'], n_folds=spec['n_folds'],
-               selection_fold=spec['selection_fold'],
-               evaluation_fold=spec['evaluation_fold'])
+    groups, group_meta, kwargs = _nested_row_split_inputs(base, n_rows, spec)
     try:
-        if _groups is not None:
-            _sel, _ev, _meta = L.validation_row_split(
-                n_rows, groups=_groups, **_kw)
-        else:
-            _sel, _ev, _meta = L.validation_row_split(n_rows, **_kw)
+        _sel, _ev, _meta = _nested_row_split_call(n_rows, groups, kwargs)
     except ValueError as _e:
-        _meta = dict(_gmeta or {})
+        _meta = dict(group_meta or {})
         _meta.update({'groups_aware': False,
                       'reason': f'group-aware row split unavailable: {_e}'})
         return None, None, _meta, str(_e)
     _meta = dict(_meta)
-    _meta.update(_gmeta or {})
+    _meta.update(group_meta or {})
     return _sel, _ev, _meta, None
 
 

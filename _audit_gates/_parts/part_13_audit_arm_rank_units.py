@@ -1,36 +1,12 @@
 
 def _aru_close(a, b, *, rel=1e-12, abs_=1e-12):
-    """Structural equality with a numeric tolerance for replay comparisons."""
-    if isinstance(a, (bool, np.bool_)) or isinstance(b, (bool, np.bool_)):
-        return (isinstance(a, (bool, np.bool_))
-                and isinstance(b, (bool, np.bool_))
-                and bool(a) == bool(b))
-    if a is None or b is None:
-        return a is None and b is None
-    if (isinstance(a, numbers.Integral) and isinstance(b, numbers.Integral)):
-        # Exact comparison first: converting a large seed/step integer to
-        # float64 can raise OverflowError even when the two values are equal.
-        return int(a) == int(b)
-    if isinstance(a, numbers.Number) and isinstance(b, numbers.Number):
-        if (isinstance(a, (complex, np.complexfloating))
-                or isinstance(b, (complex, np.complexfloating))):
-            return False
-        try:
-            fa, fb = float(a), float(b)
-        except (TypeError, ValueError, OverflowError):
-            return False
-        if not (math.isfinite(fa) and math.isfinite(fb)):
-            return fa == fb
-        return abs(fa - fb) <= max(abs_, rel * max(1.0, abs(fa), abs(fb)))
-    if isinstance(a, dict) and isinstance(b, dict):
-        if set(a) != set(b):
-            return False
-        return all(_aru_close(a[k], b[k], rel=rel, abs_=abs_) for k in a)
-    if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
-        if len(a) != len(b):
-            return False
-        return all(_aru_close(x, y, rel=rel, abs_=abs_) for x, y in zip(a, b))
-    return a == b
+    """Structural equality with a numeric tolerance for replay comparisons.
+
+    Part 12 defines the same replay comparison for arm-level rankings; both
+    audits must accept exactly the same stored JSON, so this stays a thin
+    alias rather than a second implementation that could drift.
+    """
+    return _arm_rank_close(a, b, rel=rel, abs_=abs_)
 
 
 def _aru_axis_coherent(axis, *, arms, key):
