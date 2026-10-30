@@ -8053,3 +8053,178 @@ report diff 对 body/inputs/code 的三类变化分别判定、篡改判 `invali
 --ignore-ledger` 返回 `reproduced`（body/inputs/code/environment 全 match；
 唯一增长的是被 ignore 的 `analysis_audit` ledger 事件数）。完整 CPU 套件在
 本轮最终树通过。
+
+## 100. held-out split 只评估一次：把 test access 变成预注册预算（本轮实验设计/统计完整性硬化）
+
+零 GPU 的设计/分析硬化；不新增训练、不读取 test split、不修改
+`confirmation_frozen*.json` 的字节/种子/端点/alpha/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未触碰。
+
+### 100.1 问题：锁会拒绝第二次读取，但分析从不读计数器
+
+`_check_or_write_freeze_lock` 早就把 held-out 访问写成了机器可读的账本：
+`test_reads`、`history`、`superseded` 与 `source_tree_drift`。第二次
+P5T `preaccess` 会被拒绝，除非同时设置 `V12_REFREEZE=1` 与
+`V12_ALLOW_TEST_REREAD=1`；显式重读会自增 `test_reads` 并追加
+`reread` 事件；访问后改清单/切片会写 `superseded`。但
+`finaltest_stats` 只以 `stage='analysis'` 复用同一把锁做身份核对，
+**从未读取这些计数器**。于是：
+
+1. 一个显式允许的第二次 P5T 评估，仍然可以用 12 个种子的名义
+   `alpha=0.05` 产出 `confirmed`；
+2. 访问后 `V12_REFREEZE=1` 改清单/切片，只在控制台打印「前一轮降级为
+   探索性」，最终统计仍可能把新一轮标成确认；
+3. 分析阶段披露的源码漂移只是警告，报告层没有「这次不是冻结代码的
+   逐字节重放」的机器字段；
+4. 审计门的 `source_tree` 只看源码字节，`looks` 只看探索性面板的
+   `look_history.json`，两者都不回答「这个 held-out 结果被评估了几次」。
+
+这正是 §58 的 held-out 版本：补种子有 look history，test split 却没有。
+区别在于 test 读数不是独立样本：重复读取同一冻结切片（换 checkpoint、
+换代码、换分析口径后再看）是**选择机会**，不能按名义 α 当作一次检验。
+§96 处理训练失败/重跑的处置，§98 处理 checkpoint 端点选择，§99 处理
+报告重建；它们都没有覆盖「held-out 访问次数」本身。
+
+### 100.2 预注册访问策略
+
+`exp_lib.TEST_ACCESS_POLICY` 固定默认契约：**一次读取**。计划可在
+`statistics.test_access_policy`（或顶层同名字段）声明：
+
+```json
+{
+  "test_access_policy": {
+    "schema": 1,
+    "method": "single_look",
+    "max_looks": 1,
+    "require_reason_for_reread": true,
+    "rationale": "one-shot held-out evaluation"
+  }
+}
+```
+
+| 字段 | 默认 | 含义 |
+|---|---|---|
+| `method` | `single_look` | `single_look` 只允许一次读取；`bonferroni` 允许预注册的多次 look 预算 |
+| `max_looks` | 1 | **计划**的 held-out 评估次数；`single_look` 必须为 1 |
+| `require_reason_for_reread` | true | 显式重读应带 `V12_TEST_REREAD_REASON`；缺失只告警并记录 |
+| `schema` | 1 | 本分析器实现的策略 schema |
+
+- 键名白名单：未知键（例如拼错的 `max_look`）直接 `ValueError`，不会
+  静默退回一次 look；
+- `_load_manifest` 在**任何训练/test 读取之前**调用
+  `test_access_policy`，畸形策略直接 `SystemExit`；
+- 没有该字段的旧清单按历史 `single_look` 契约处理，不改写已发布结论。
+
+多次 look 的 α 分配使用 `method='bonferroni'`：
+`alpha_effective = alpha / max_looks`，逐比较
+`p_holm_effective = min(1, p_holm * max_looks)`。**分母是计划
+`max_looks`，不是实际观测到的 `test_reads`**：如果实际只看了 1 次就停，
+不能把没花掉的 α 退回来，否则「看几次后决定停」本身又变成选择。
+
+### 100.3 重放：从锁、历史与统计工件判定 effective verdict
+
+`exp_lib.confirmatory_access_audit(lock, stats=..., manifest=...)`：
+
+- 解析 `test_reads`；缺失时只从 `reread` 事件推断（旧锁在没有任何重读
+  事件时读为 1，且 `test_reads_inferred=true`）；
+- 校验 `test_reads` 与 `history` 的 `reread` 数一致；`test_reads>0` 必须
+  绑定 `test_ids_fp`，`test_ids_fp` 非空则 `test_reads>=1`；
+- `superseded` 中 prior `test_ids_fp` 非空 = 访问后改计划；prior 为
+  `null` = 首次读取前的正常预注册修订，不惩罚；
+- `test_slice_changed_after_access`：prior 切片指纹与当前不同；
+- `source_tree_drift` 中 `stage='analysis'` 的事件 = 访问后分析源码漂移，
+  只告警（测量源码仍由锁绑定）；
+- 策略来源按哈希绑定：优先读锁内 `manifest_path` 指向且字节仍匹配的
+  清单；否则用工作树 `confirmation_frozen.json`（仅当其哈希等于锁的
+  manifest 哈希）；两者都不匹配才回退 `single_look` 并告警，避免访问后
+  把 `max_looks` 改成 2 来「合法化」重读；
+- 与 `test_stats.json` 对账：manifest 哈希、test slice 指纹、alpha；
+  已存 `test_access`/`confirmed_effective` 必须能逐值重放，否则判 fail。
+
+判定：
+
+| 观测 | 状态 | `confirmatory_allowed` |
+|---|---|---|
+| 1 次读取，无访问后计划/切片变化 | `ok` | `true` |
+| `test_reads>1`，默认 `single_look` | `fail`，`unplanned_reread` | `false` |
+| `test_reads>1`，预注册 `bonferroni` 且 `<=max_looks` | `ok`（α 已分配） | `true` |
+| `test_reads>max_looks` | `fail`，`more_looks_than_declared` | `false` |
+| 访问后改清单/切片 | `fail`，`plan_changed_after_access` | `false` |
+| 锁结构/工件身份不一致 | `fail` | `false` |
+| 没有 test 读取记录 | `not_applicable` | `null` |
+| 没有锁且没有统计工件 | `not_verifiable_locally` | `null` |
+| 只有统计工件、没有锁 | `fail` | `false` |
+
+`confirmed_effective` 只从冻结 `confirmed` 集合里筛出在 effective
+α 下仍成立的比较；**未预注册的重读不会得到任何 effective 确认**。
+`p_holm_bonferroni_descriptive = min(1, p*test_reads)` 只作为「如果
+把重读次数当作 look 数」的描述性敏感度，不进入判定。
+
+### 100.4 接线
+
+- 新增 `explib/_parts/part_47_test_access.py`，追加到 `_PARTS` 末尾；
+  `exp_lib` 兼容 shim 自动可见。
+- `finaltest_stats` 在写完冻结 p/Holm/`confirmed` 之后追加
+  `stats['test_access']` 与 `stats['confirmed_effective']`，并在访问
+  不合法时打印警告；**不改** `stats['confirmed']`、`alpha`、`p_holm`
+  或任何比较数值。
+- `REPORT_v12` 的「确认结果」行改用 `confirmed_effective`；访问不合法时
+  增加「测试访问降级」段，并抑制反证段（反证也是方向性确认陈述）。
+- `audit_gates.py test_access`（别名 `test_access_audit` / `heldout` /
+  `test_looks`）扫描 `results_*/.freeze_lock.json` 与
+  `analysis_*/test_stats.json`；`audit_gates.py report` 增加顶层
+  `test_access` 块。
+- `_check_or_write_freeze_lock` 在 `reread` 事件里记录
+  `V12_TEST_REREAD_REASON`（缺失为 `None` 并告警）；审计输出
+  `n_rereads_without_reason`。
+
+### 100.5 边界
+
+- **不是新的显著性检验。** 它没有新的 p 值、区间或 Holm 成员；`fail`
+  表示「这个访问模式不能支持确认性主张」，不是「测量算错了」。它不改写
+  已经发生的访问，只能把结论降级。
+- **锁是防误改，不是防恶意。** 能重写锁的人也能把 `test_reads` 改成 1；
+  本门只让意外/一行篡改可见。真正的权重/数据身份仍由
+  checkpoint/`data_fp`/`source_tree`/release manifest 负责。
+- **一次读取不等于一次分析。** 同一次 test 读取仍可跑很多分析口径；那是
+  §63 的 specification concordance 与 §51/§99 的源码绑定要回答的问题。
+  本门只数 held-out **访问**，不数分析变体。
+- **Bonferroni 是保守上界，不是最优 α spending。** 这里的多次 look 是
+  对**同一批最终数据**换 checkpoint/代码/口径，不是累积信息的序贯设计，
+  所以 Pocock/O'Brien-Fleming 的信息分数不适用；Bonferroni 对任意相关
+  结构有效。`max_looks` 必须在首次读取前声明，事后补声明不能追溯生效。
+- **首次读取前的预注册修订是允许的。** 只有 prior `test_ids_fp` 非空的
+  `superseded` 才判访问后改计划；只看 `manifest_sha256` 会把正常的
+  首读前修订误伤。
+- **源码漂移只告警。** 测量树仍由锁绑定；分析树漂移由 §51/§99 的 source
+  gate 单独判 fail。把两者混成一个字段会让「修报告 typo」和「换测量代码」
+  无法区分。
+- **没有产物就是不可核验，不是干净。** 缺锁/缺 `test_stats.json` 一律
+  `not_verifiable_locally`，不返回 `ok`。
+
+### 100.6 入口与验证
+
+```bash
+python -m pytest -q test_review_part_38.py
+python audit_gates.py test_access                 # 扫描 results_*/.freeze_lock.json
+python audit_gates.py test_access PATH            # 指定锁/统计工件/目录
+python audit_gates.py heldout                     # 别名
+python audit_gates.py report                      # 顶层 test_access
+python -m explib.confirmation plan                # 读取/校验 test_access_policy
+```
+
+`test_review_part_38.py` 16 项覆盖：默认策略与顶层/`statistics` 声明；
+锁内 `manifest_path` 指向的重命名计划按哈希读取策略；
+畸形策略（非对象、`single_look` + 2 looks、0/布尔/小数 `max_looks`、未知
+method/键、非法 schema）fail-closed；`descriptive_only` 计划归
+`not_applicable`、不计作确认性 look；单次读取 `ok` 且不改冻结 p；未预注册
+重读降级为空 `confirmed_effective` 并给描述性 Bonferroni p；预注册
+`bonferroni` 按 `max_looks` 分配 α 并正确筛比较（含提前停止仍按计划数）；
+超过 `max_looks` 判 fail；访问后改计划/切片判 fail、首读前修订放行；
+空锁/`test_reads` 类型/负数/零读取带指纹/重读数与 history 不一致/
+`history` 非列表等 fail-closed；统计工件的 manifest/slice/alpha 不符、
+零读取却带 `confirmed`、非法 p、存储 `test_access`/`confirmed_effective`
+篡改判 fail；审计门的干净/降级/缺工件三态与 CLI/report 接线；
+`V12_TEST_REREAD_REASON` 被写入 history；以及
+`confirmation._load_manifest` 在首读前拒绝畸形访问策略。完整 CPU 套件
+在本轮最终树通过。

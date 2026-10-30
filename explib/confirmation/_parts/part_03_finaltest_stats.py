@@ -410,6 +410,37 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
                                           'verdict_reason': (stats['verdicts'].get(k) or {}).get('reason'),
                                           'gate_failures': (stats['verdicts'].get(k) or {}).get('gate_failures')}
                                       for k in _rej if k not in _conf}
+    # ---- held-out access accounting ---------------------------------------
+    # The freeze lock has always counted test reads and recorded re-freezes,
+    # but this analysis never consumed the counter.  A panel evaluated twice
+    # (or re-frozen after its first read) could therefore keep a non-empty
+    # `confirmed` set at nominal alpha.  The access audit exports
+    # `confirmed_effective`; it never changes the frozen p/Holm or the
+    # historical `confirmed` field.  A pre-declared multi-look budget applies
+    # its Bonferroni spending against the PLANNED look count, not the observed
+    # one, so an early stop cannot buy back alpha.
+    if unified_fp is not None and admitted:
+        _ta = L.confirmatory_access_audit(
+            _freeze_lock_path(_lock_dir), stats=stats, manifest=manifest,
+            alpha=_alpha,
+            lock_label=os.path.join(TEST_OUTDIR, '.freeze_lock.json'))
+        stats['test_access'] = _ta
+        _ta_eff = _ta.get('confirmed_effective')
+        stats['confirmed_effective'] = (
+            list(_ta_eff) if _ta_eff is not None else None)
+        if _ta.get('confirmatory_allowed') is False:
+            _why = (_ta.get('downgrade_reasons')
+                    or _ta.get('problems') or ['unknown'])
+            print('[p5t stats] WARNING: the held-out access ledger cannot '
+                  f'support a confirmatory claim ({", ".join(str(x) for x in _why)}); '
+                  '`confirmed` remains the frozen arithmetic set, but '
+                  '`confirmed_effective` is empty. See stats["test_access"].')
+        elif (_ta.get('policy') or {}).get('declared'):
+            print('[p5t stats] held-out access: '
+                  f'{_ta.get("n_test_reads")} read(s) under a pre-declared '
+                  f'{(_ta.get("policy") or {}).get("method")} budget; '
+                  f'alpha_effective={_ta.get("alpha_effective")!r}, '
+                  f'confirmed_effective={stats["confirmed_effective"]}')
     _m = len(manifest['primary_comparisons'])
     _n = len(manifest['seeds'])
     _fl = L.signflip_p_floor(_n)
@@ -517,6 +548,11 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
         'manifest': manifest.get('_path') or FREEZE_MANIFEST,
         'bylen': bylen_path,
     }
+    if unified_fp is not None and admitted:
+        # The access ledger is an input to the access verdict: bind its bytes
+        # so editing test_reads/superseded after the analysis invalidates the
+        # stamped stats artifact as well as the replay gate.
+        _analysis_inputs['freeze_lock'] = _freeze_lock_path(_lock_dir)
     if os.path.exists(probe_path):
         _analysis_inputs['probe'] = probe_path
     stats = L.stamped_analysis(
@@ -1099,7 +1135,33 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
               '`analysis_v12/test_stats.json` 的 `per_doc_delta_ppl_ci95`，只作描述，'
               '不再占据主表 CI 列。）')
             A('')
-        _conf = ft.get('confirmed')
+        _ta = (ft.get('test_access')
+               if isinstance(ft.get('test_access'), dict) else {})
+        _ta_blocked = _ta.get('confirmatory_allowed') is False
+        if _ta_blocked:
+            _ta_policy = (_ta.get('policy')
+                          if isinstance(_ta.get('policy'), dict) else {})
+            _ta_reasons = ', '.join(
+                str(x) for x in (_ta.get('downgrade_reasons') or []))
+            _ta_probs = '; '.join(str(x) for x in (_ta.get('problems') or []))
+            A('**测试访问降级（held-out split）**：冻结锁记录 '
+              f'`test_reads={_ta.get("n_test_reads")}`，预注册访问策略为 '
+              f'`{_ta_policy.get("method", "unknown")}`（max_looks='
+              f'`{_ta_policy.get("max_looks", "?")}`），降级原因：'
+              f'{_ta_reasons or "冻结锁结构/工件不一致"}。'
+              + (f' 结构问题：{_ta_probs}。' if _ta_probs else '')
+              + ' 冻结 p/Holm 与 `confirmed` 字段没有被改写，但它只是按冻结公式'
+              '算出的算术集合；`confirmed_effective` 为空。重复读取同一 test 切片'
+              '（换 checkpoint、代码或分析口径后再看）是选择机会，不能按名义 α '
+              '当作确认性证据；该读数只能标为探索性，或在**首次访问前**预注册'
+              '多次 look 的 α 分配后重跑。')
+            A('')
+        _conf = (ft.get('confirmed_effective')
+                 if 'confirmed_effective' in ft else ft.get('confirmed'))
+        if _conf is None and _ta.get('descriptive_only'):
+            # A descriptive-only plan has no confirmatory claim to fall back
+            # to; do not re-derive one from the frozen arithmetic table.
+            _conf = []
         if _conf is None:
             _conf = [k for k, v in holm.items() if v.get('reject') and (comps.get(k, {}).get('direction_ok') is True) and (comps.get(k, {}).get('param_matched') is not False) and (comps.get(k, {}).get('same_init_core_fp') is not False) and (comps.get(k, {}).get('coverage_ok') is True)]
         if _conf:
@@ -1157,7 +1219,13 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
         _choice_lines = _analysis_choice_markdown(ft)
         if _choice_lines:
             lines.extend(_choice_lines)
-        _ref_lines = _refutation_markdown(ft, _report_alpha)
+        if _ta_blocked:
+            # A refutation is a directional confirmatory statement too.  When
+            # the access ledger is downgraded, the frozen `refuted` set cannot
+            # be presented as a confirmatory reversal either.
+            _ref_lines = []
+        else:
+            _ref_lines = _refutation_markdown(ft, _report_alpha)
         if _ref_lines:
             lines.extend(_ref_lines)
         _nd = ft.get('significant_nondirectional') or []

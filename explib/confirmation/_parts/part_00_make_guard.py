@@ -354,6 +354,17 @@ def _load_manifest(path):
     # implement exactly the frozen test/correction, so a mismatch is refused
     # rather than silently computed and mislabelled in the report.
     _stat = m.get('statistics') or {}
+    # The held-out access budget is part of the pre-registration.  Validate it
+    # before any training or test read so a typo cannot silently disable the
+    # repeated-look accounting (the analysis would otherwise fall back to the
+    # single-look default).
+    try:
+        L.test_access_policy(m)
+    except ValueError as _ta_exc:
+        raise SystemExit(
+            '[v12] REFUSE: statistics.test_access_policy is invalid: '
+            f'{_ta_exc} — the held-out access budget must be valid BEFORE the '
+            'first test read')
     _ns = _stat.get('n_seeds')
     if _ns is not None and _int_field(_ns, 'statistics.n_seeds') != len(m['seeds']):
         raise SystemExit(f'[v12] REFUSE: freeze manifest declares n_seeds={_ns} but lists {len(m["seeds"])} seeds — the pre-registered resolution and the seed list disagree')
@@ -940,6 +951,7 @@ def _check_or_write_freeze_lock_locked(outdir, manifest, test_ids_fp, stage='acc
         _source_override = (os.environ.get('V12_ALLOW_SOURCE_DRIFT', '').strip().lower()
                             in ('1', 'true', 'yes', 'on'))
         _allow_reread = os.environ.get('V12_ALLOW_TEST_REREAD', '').strip().lower() in ('1', 'true', 'yes', 'on')
+        _reread_reason = os.environ.get('V12_TEST_REREAD_REASON', '').strip()
         _already_accessed = (str(lock.get('stage') or '') == 'accessed'
                              or lock.get('test_ids_fp') is not None)
         _forced_reread = False
@@ -1006,11 +1018,21 @@ def _check_or_write_freeze_lock_locked(outdir, manifest, test_ids_fp, stage='acc
                   f'reads: {lock.get("test_reads", 1)}).  Re-evaluation can '
                   'turn test into an implicit validation set; record why the '
                   'new round is necessary and whether the decision rule changed.')
+            try:
+                _reread_policy = L.test_access_policy(manifest)
+            except ValueError:
+                _reread_policy = {'require_reason_for_reread': True}
+            if (_reread_policy.get('require_reason_for_reread', True)
+                    and not _reread_reason):
+                print('[v12] WARNING: no V12_TEST_REREAD_REASON was supplied; '
+                      'the reread history will carry reason=None and the '
+                      'test-access audit will report an unexplained extra look.')
             lock['test_reads'] = int(lock.get('test_reads', 1)) + 1
             lock['history'] = list(lock.get('history') or []) + [{
                 'stage': 'reread', 'at': time.strftime('%Y-%m-%dT%H:%M:%S'),
                 'test_reads': lock['test_reads'],
                 'code_semantics': L.code_stamp(),
+                'reason': _reread_reason or None,
             }]
             _dirty = True
         if (_manifest_changed or _test_changed or _train_changed or _source_changed) and _refreeze:

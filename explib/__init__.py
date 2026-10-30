@@ -63,6 +63,7 @@ _PARTS = [
 'part_44_component_lesion.py',
 'part_45_endpoint_selection.py',
 'part_46_reproducibility.py',
+'part_47_test_access.py',
 ]
 
 _load_parts(globals(), _HERE, _PARTS)

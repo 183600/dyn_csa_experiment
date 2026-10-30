@@ -4361,3 +4361,76 @@ MANIFEST 覆盖全部顶层 `test_*.py`、`.gitattributes` 固定 LF。最终树
 `python -m explib.reproduce report A B --ignore-ledger` 返回 `reproduced`
 （body/inputs/code/environment 全 match；唯一增长的是被 ignore 的
 `analysis_audit` ledger 事件数）。完整 CPU 套件在本轮最终树通过。
+
+## 2026-10-30 — held-out 只评估一次：test access 计数、预注册 look 预算与 effective verdict（本轮实验设计/统计完整性硬化，no new runs）
+
+零 GPU 的设计/分析硬化；不新增训练、不读取 test split、不修改
+`confirmation_frozen*.json` 的字节/种子/端点/alpha/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未触碰。
+
+**Problem.** 冻结锁 `_check_or_write_freeze_lock` 早已把 held-out 访问
+写成机器可读账本：`test_reads`、`history`、`superseded`、
+`source_tree_drift`。第二次 P5T `preaccess` 会被拒绝，除非同时设置
+`V12_REFREEZE=1` 与 `V12_ALLOW_TEST_REREAD=1`；显式重读会自增
+`test_reads` 并追加 `reread`。但 `finaltest_stats` 只以
+`stage='analysis'` 复用同一把锁做身份核对，**从未读取这些计数器**。因此
+一个被显式允许的第二次 test 评估，仍可按 12 个种子的名义
+`alpha=0.05` 产出 `confirmed`；访问后 `V12_REFREEZE=1` 改清单/切片只在
+控制台打印「前一轮降级为探索性」，最终统计仍可能把它标成确认；分析阶段
+的源码漂移也只是警告。§58 给探索性补种子加了 look history，§96 给训练
+失败/重跑加了 disposition，§98 给 checkpoint 选择加了端点来源，§99 给
+报告重建加了证据绑定，但「held-out 访问了几次」本身没有下游消费者。
+
+**Fix.**
+
+- 新增 `exp_lib.TEST_ACCESS_POLICY` / `test_access_policy` /
+  `confirmatory_access_audit`。默认 `single_look`（`max_looks=1`）；计划可
+  在 `statistics.test_access_policy` 预注册 `bonferroni` 多次 look 预算。
+  策略键名白名单、`max_looks` 整数边界、`single_look` 必须 1 次、未知
+  method/键/ schema 全部 fail-closed；`_load_manifest` 在首读前校验。
+- `confirmatory_access_audit` 校验 `test_reads` 与 `history` 的 `reread`
+  数一致、`test_reads>0` 必须绑定 test 切片、空锁/类型错误/负数
+  fail-closed；`superseded` 中 prior `test_ids_fp` 非空才判「访问后改
+  计划」，prior 为 `null` 是正常的首读前预注册修订。它还与
+  `test_stats.json` 的 manifest 哈希、test slice 指纹、alpha 对账，并
+  重放已存 `test_access`/`confirmed_effective`，不一致即 fail。
+- 多次 look 的 α 分配用**计划** `max_looks`：
+  `alpha_effective = alpha/max_looks`，
+  `p_holm_effective = min(1, p_holm*max_looks)`；未预注册的重读不给任何
+  effective 确认，只给 `p_holm_bonferroni_descriptive` 描述性读数。提前
+  停止不退 α，避免「看一次就停」再次变成选择。
+- `finaltest_stats` 追加 `stats['test_access']` 与
+  `stats['confirmed_effective']`，打印降级警告；**不改** `confirmed`、
+  `alpha`、`p_holm` 或任何测量值。`REPORT_v12` 的确认行改用
+  `confirmed_effective`，访问不合法时增加降级段并抑制反证段（反证也是
+  方向性确认陈述）。
+- `audit_gates.py test_access`（别名 `test_access_audit` / `heldout` /
+  `test_looks`）扫描 `results_*/.freeze_lock.json` 与
+  `analysis_*/test_stats.json`；`audit_gates.py report` 增加顶层
+  `test_access`。没有锁/统计工件一律 `not_verifiable_locally`。
+- 当前 `confirmation_frozen.json` 哈希与锁不一致时，不把工作树里的策略
+  当作锁的策略：回退单次 look 并告警，防止访问后补声明 `max_looks=2`
+  把重读洗白。`_check_or_write_freeze_lock` 的 `reread` 事件记录
+  `V12_TEST_REREAD_REASON`（缺失为 `None`，审计输出
+  `n_rereads_without_reason`）。
+
+**Boundary.** 这不是新的显著性检验：没有新 p 值、区间或 Holm 成员，
+也不改写已发生的访问；`fail` 只表示「该访问模式不能支持确认性主张」。
+锁是防误改而非防恶意，能重写锁的人也能改 `test_reads`。一次 test 读取
+仍可跑多种分析口径，那由 §63 与 §51/§99 负责；本门只数访问，不数分析
+变体。Bonferroni 是对同一批最终数据换 checkpoint/代码/口径的保守上界，
+不是累积信息序贯设计，Pocock/OBF 的信息分数不适用。首读前的预注册修订
+放行；源码漂移只告警（测量树仍由锁绑定，分析树由 source gate 单独判）。
+没有随附 release，本门只能约束「你自己的 artifact」，不能替代
+`RELEASES.md` 的外部归档。
+
+**Verification.** 新增 `test_review_part_38.py` 16 项：默认策略、顶层与
+`statistics` 声明、锁内重命名计划策略；畸形策略 fail-closed；
+`descriptive_only` 计划归 `not_applicable`；单次读取 ok 且冻结 p 不变；
+未预注册重读降级并给描述性 Bonferroni p；预注册 `bonferroni` 按计划数
+分配 α 并筛比较（含提前停止）；超 `max_looks` fail；访问后改计划/切片
+fail、首读前修订放行；空锁/类型/负数/零读取带指纹/重读计数不一致/
+`history` 非列表 fail；工件 manifest/slice/alpha 不符、零读取却带
+confirmed、非法 p、存储块篡改 fail；审计门三态与 CLI/report 接线；
+`V12_TEST_REREAD_REASON` 写入 history；`_load_manifest` 首读前拒绝畸形
+策略。完整 CPU 套件在本轮最终树通过（868 passed, 3 skipped）。

@@ -102,6 +102,12 @@
   looks        序列观测 / optional stopping：逐面板 look history 的种子集合、
                逐种子配对差、逐 look p 与 max-over-looks 序列 p 是否自洽；
                朴素最终 p 显著但序列 p 不显著的对照会被点名（零 GPU）
+  test_access  一次性 held-out 访问：重放 .freeze_lock.json 的 test_reads、
+               reread history、superseded 计划与源码漂移，判定确认性结论是否
+               仍成立；未预注册的重复 test 读取、访问后改计划、锁/统计工件
+               身份不一致判 fail；预注册的多次 look 预算按计划数做 Bonferroni
+               α 分配并导出 confirmed_effective。不改变冻结 p/Holm/confirmed
+               （零 GPU；别名 test_access_audit / heldout / test_looks）
   error_case_inference  坏例桶推断重放：从 paired_errors.json 的 row-cluster
                聚合重算全样本均值/exact p/Holm、确定性发现/复现切分、
                discovery 选桶与 replication 符号/区间/复现判定；缺产物报
