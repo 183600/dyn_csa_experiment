@@ -546,6 +546,26 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
         _fam.append((k, float(p) if isinstance(p, (int, float)) and math.isfinite(p) else 1.0))
     if _fam:
         stats['holm'] = L.holm_adjust(_fam, alpha=_alpha)
+    # Correction-method sensitivity: the declared Holm family is conservative
+    # when the per-seed contrasts are correlated.  Replay the SAME complete
+    # family under an exact sign-flip Westfall-Young max-T and report, next to
+    # it, Holm applied to the same marginal statistic.  This isolates the
+    # correction-method effect from the statistic choice.  It is descriptive:
+    # `_rej`, `_conf`, verdicts, the frozen p-values and `confirmed` below are
+    # untouched.
+    try:
+        stats['family_correction'] = L.confirmation_family_correction(
+            stats['comparisons'], family_names=_family_names,
+            frozen_holm=stats.get('holm'), alpha=_alpha)
+    except Exception as _fce:
+        stats['family_correction'] = {
+            'kind': 'confirmation_family_correction',
+            'status': 'not_estimable',
+            'reason': f'{type(_fce).__name__}: {_fce}',
+            'family_names': list(_family_names),
+            'role': ('descriptive dependence-aware family-correction '
+                     'sensitivity; no frozen p/Holm/verdict is changed'),
+        }
     _rej = [k for k, v in stats['holm'].items() if v.get('p_holm') is not None and float(v['p_holm']) < _alpha]
     # The pre-registered decision rule (manifest v4) requires p_holm < alpha
     # AND the observed direction AND parameter matching AND, when
@@ -1930,6 +1950,10 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
             _pf_t = _cmp_num(v.get('p_floor'), '.3f')
             A(f'| {k} | {v.get("n", "—")} | {v.get("coverage_ok")} | {v.get("param_matched")} | {_ipa_txt} | {_mean_t} ± {_std_t} | {_dcitxt} | {_dz_t} | {_p_t} | {_pf_t} | {_hp} | {_hr} | {_ds} |')
         A('')
+        _fc_md = L._family_correction_markdown(ft.get('family_correction'))
+        if _fc_md:
+            for _line in _fc_md:
+                A(_line)
         _init_dropped = {k: [d for d in (v.get('dropped_pairs') or [])
                              if 'init_core_fp' in str(d.get('reason', ''))]
                          for k, v in comps.items()}

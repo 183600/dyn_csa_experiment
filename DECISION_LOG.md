@@ -4849,3 +4849,61 @@ Holm/夹带 `confirmed` 判 `fail`，缺块 `not_verifiable_locally`、bare
 `not_estimable` `not_applicable`；报告渲染新表与边界；CLI 别名与审计
 文档接线，以及 `confirmation_sesoi_design_audit` 的缺声明/必需/完整
 三态。完整 CPU 套件在本轮最终树通过。
+
+## 2026-10-30 — 确认族的 Holm 不是唯一读法：依赖感知的精确 max-T 与有效检验数（本轮结果分析硬化，no new runs）
+
+**Context.** 冻结主比较族用 Holm step-down；它控制 FWER 但不利用族内
+相关。六个确认比较在同一批 12 个种子上计算，并共享 `csa_fixed_rope`
+对照臂，逐种子配对差通常正相关。旧报告只给 Holm，读者无法判断「换一个
+同样控制 FWER 的校正，拒绝集是否改变」「族里有多少独立信息」「Holm 的
+保守性是否正好压在阈值附近」。§92 的 `maxt_signflip_adjust` 只用于消融
+族，`joint_correction` 审计也只覆盖消融族；确认主族仍是单一读法。
+
+**Fix.** 新增 `exp_lib.FAMILY_CORRECTION_POLICY` /
+`exp_lib.confirmation_family_correction`：
+- **主读数**：在 `|Σd|/sqrt(Σd²)` 这个 sign-invariant score 上做精确
+  Westfall-Young free step-down max-T。一次符号指派同时应用到族内所有
+  比较，保留跨比较相关；`n<=20` 精确枚举，超过上限拒绝而不是近似。
+  score 有共同零尺度，不会被 SD 最大的比较主导；常数非零效应下 score
+  仍有定义（样本 SD 为 0 时 t 退化，但 score 不退化）。
+- **同统计量 Holm**：对同一组 score 边际 p 再做 Holm；它与 max-T 的差
+  只反映校正方法。冻结的 mean 检验另列 `p_raw_mean`/`p_holm_mean`，
+  `score_vs_mean_changed` 点名统计量选择改变拒绝集的比较。
+- **studentised t 孪生**：仅在样本 SD 可用时给同时区间与
+  `MDE = critical_t × sem`，并与 score 的 raw/max-T p 逐项交叉核对；
+  常数非零比较明确写 `studentized.available=false`，不因此丢弃 score
+  读数。
+- **族依赖**：Pearson 相关矩阵、特征值、
+  `effective_tests=(Σλ)²/Σλ²`、Nyholt 形式、`max|r|`/`mean|r|`；任一
+  行零方差时明确不可用。
+- **失效方式**：缺失/`omitted`/种子不齐/重复 seed/非有限值/n<2/n>20
+  一律 `not_estimable` 并具名；全零 `degenerate`；不缩族、不取交集后
+  继续、不把近似标成 exact。
+- `finaltest_stats` 在 `stats['holm']` 之后、冻结决策之前写
+  `stats['family_correction']`，只增不改；`build_report` 在主比较表后
+  渲染「校正方法与族依赖性的敏感性」表；`audit_gates.py
+  family_correction`（别名 `family_maxt` / `correction_sensitivity`）
+  从落盘逐种子差独立重放全部 p/区间/依赖/集合，篡改判 `fail`，缺块
+  `not_verifiable_locally`，并入 `audit_gates.py report` 顶层。
+
+**Boundary.** 不是第二个确认性检验：不进入冻结 Holm 族、不做新的
+FWER 控制、不改变 `p_exact_signflip`、`p_holm`、`verified` 或
+`confirmed`。`max-T(score)` 对 `Holm(score)` 是纯校正比较；score 与
+冻结 mean 是两个统计量，两套 p 不能混读，也不能把更小的 max-T p 当作
+更强证据。max-T 在近独立/SD 异质族里可能比 Holm 更保守，表内
+`correction_effect` 明确写方向。`effective_tests` 只是 12 个种子的
+描述量，不是因子结构或因果断言；MDE 是观测 SD 下的 t 型半宽，不是
+功效。联合零假设仍只覆盖种子级符号交换，不覆盖数据顺序、语料、规模或
+checkpoint 选择。未来清单若要把 max-T 写成决策规则，必须在首次 test
+读取前预注册，并同步扩展当前只接受 Holm 的分析器；本轮不追认。
+
+**Verification.** 新增 `test_review_part_49.py` 12 项：策略/状态与
+空族/重复名/缺失/`omitted`/种子不齐/重复 seed/非有限值/n<2/n>20 的
+fail-closed；单比较 score p 与 max-T 一致；完全相关族有效检验数≈1、
+max-T 不更少拒绝且集合差分自洽；近独立族不伪造更强功效；常数非零效应
+在 t 孪生不可用时仍有有限 score p 且 CI/MDE 为 `None`；全零族
+`degenerate`；studentised 孪生交叉核对、CI 有序、MDE 比值有限；
+`1e308` 级有限值严格 JSON；`finaltest_stats` 落盘 → 审计 `ok`；篡改
+p/CI/集合/summary/依赖/夹带 `confirmed`/删族成员判 `fail`，缺块
+`not_verifiable_locally`、bare `not_estimable` `not_applicable`；报告
+渲染与 CLI 别名/文档接线。完整 CPU 套件在本轮最终树通过。

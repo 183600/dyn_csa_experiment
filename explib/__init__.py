@@ -70,6 +70,7 @@ _PARTS = [
 'part_51_effect_sensitivity.py',
 'part_52_length_position.py',
 'part_53_confirmation_practical.py',
+'part_54_family_correction.py',
 ]
 
 _load_parts(globals(), _HERE, _PARTS)

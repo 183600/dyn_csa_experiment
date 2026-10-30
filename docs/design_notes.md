@@ -9224,3 +9224,153 @@ python audit_gates.py equivalence              # 别名
 python audit_gates.py report                   # 顶层汇总含 practical_significance
 make audit
 ```
+
+## 108. 确认族的 Holm 不是唯一读法：依赖感知的精确 max-T 与有效检验数（本轮结果分析硬化，no new runs）
+
+零 GPU 的结果分析硬化；不新增训练、不读取 test split、不修改
+`confirmation_frozen*.json` 的字节/种子/端点/α/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未触碰。
+
+### 108.1 问题：Holm 的保守性本身是一个未报告的分析选择
+
+冻结清单的主比较族用 Holm step-down。Holm 只要求每个边际 p 有效，不假设
+独立性，因此在任何相关结构下都控制 FWER；代价是它对每个比较都按完整
+声明族 `m` 收费。六个确认比较是在**同一批 12 个种子上**计算的，而且多个
+比较共享同一个 `csa_fixed_rope` 臂；它们的逐种子配对差通常正相关。在这种
+结构下，Holm 可能把一个边际上已经可检出的效应压在门外，而相关感知的
+联合检验（max-T）在同一份数据上会拒绝它。反过来，若几个比较的种子 SD
+差异很大，一个直接在原始尺度上取最大值的 max-T 会被 SD 最大的比较主导，
+对小 SD 的比较反而不如 Holm。
+
+因此「确认了哪些」不只取决于数据，还取决于**校正方法**和**边际统计量**。
+旧报告只给 Holm，读者无法判断：换一个同样控制 FWER 的校正，结论会不会
+变；族内到底有多少独立信息；Holm 的保守性是否正好压在阈值附近。已有
+`maxt_signflip_adjust`（§92）只用于消融族，`joint_correction` 审计也只
+覆盖消融族；确认主族仍只有 Holm。§102–§107 的排序/选择偏差/效应尺度/
+位置分段读数都不回答这个问题。
+
+### 108.2 方法：同一批逐种子配对差上的三种读法
+
+新增 `exp_lib.FAMILY_CORRECTION_POLICY` 与
+`exp_lib.confirmation_family_correction()`。输入是
+`{name: {'per_seed': [...], 'seeds': [...], 'p_exact_signflip': ...}}`
+与**预注册的族名顺序**；候选结论必须同时给出完整声明族，不能只报能算的
+子集。
+
+1. **精确 score max-T（主读数）**。统计量
+   `s_i = |Σ_j d_ij| / sqrt(Σ_j d_ij²)` 对每个种子的符号翻转不变，因此
+   精确零分布可枚举；它把每个比较放到共同的零尺度上，不会像 raw-mean
+   max-T 那样被 SD 最大的比较主导，并且在「常数非零效应」下仍有定义
+   （样本 SD 为 0 时 t 统计量退化，但 score 不退化为 0）。对
+   `n <= max_n=20` 枚举全部 `2^n` 个符号指派；**同一次符号指派应用到
+   族内所有比较**，从而保留跨比较相关。报告 raw p、单步 max-T p、
+   Westfall-Young free step-down max-T p、排名、族最大临界值与该 n 下的
+   p 分辨率；拒绝集使用与冻结相同的 `< alpha` 口径。
+2. **同统计量 Holm**。对同一组 score 边际 p 再做 Holm step-down；它与
+   max-T 的差异**只**反映校正方法。冻结的 mean 检验另列为
+   `p_raw_mean` / `p_holm_mean`；`score_vs_mean_changed` 点名那些「换
+   边际统计量会改变 Holm 拒绝集」的比较，避免把统计量选择藏在校正选择
+   里。
+3. **studentised t 孪生（辅助）**。调用 §92 的
+   `maxt_signflip_adjust` 给出 t 型同时区间与族级 MDE
+   `critical_t × sem`；它和 score 的 raw/max-T p 逐项交叉核对
+   （`raw_score_matches` / `maxt_score_matches`）。样本 SD 为 0 的常数
+   非零比较使 t 孪生不可用，此时明确写 `studentized.available=false`
+   与原因，但**不**因此丢弃有效的 score max-T 读数。
+4. **族依赖**。从逐种子配对差矩阵计算 Pearson 相关矩阵、特征值、
+   `effective_tests = (Σλ)² / Σλ²`（Li & Ji）与 Nyholt 方差形式，并报
+   `max|r|` / `mean|r|`。任一行零方差时相关无定义，明确写
+   `dependence.available=false`，不补 0、不伪造 1。
+5. **分辨率与门槛**。报告 `p_floor = 2/2^n`（全零时为 1）、
+   `holm_threshold = α/m`、`holm_gate_attainable = p_floor <= α/m`，
+   以及 score max-T 的族临界值（若有）。`holm_critical_t` 是两双侧
+   Holm 首门的 t 临界值，只用于 MDE 对照。
+
+**失效方式。** 声明族成员缺失、任一比较被 `omitted`、各比较种子向量
+不完全相同、`n<2`、`n>20`、非有限/布尔/重复 seed 均使整块
+`status='not_estimable'` 并保留具名原因；不会把缺失比较悄悄删出族、
+不会取种子交集后继续、不会在超过精确枚举上限时改用近似还称 exact。
+全部配对差恰为 0 时报 `degenerate`（p=1、无拒绝），不冒充「无效应」。
+
+### 108.3 边界：这是校正敏感性，不是第二个确认性检验
+
+- **不进入冻结族、不改变任何判定。** `family_correction` 只读
+  `p_exact_signflip` / `p_holm` / 逐种子差；`stats['confirmed']`、
+  `p_holm`、`directional_claim_verdicts`、`Holm` 族、α 与
+  `CODE_SEMANTICS` 全部不变。它不产生新的 `confirmed` 字段，也不把
+  max-T 拒绝写成「已确认」；若未来要把 max-T 作为决策规则，必须在首次
+  test 读取前把它写进清单并重新预注册；当前加载器仍只接受 Holm，
+  真正切换还需同步扩展分析器与清单，本轮不追认。
+- **score 与冻结 mean 不是同一个统计量。** `max-T(score)` 对
+  `Holm(score)` 是纯校正比较；`score_vs_mean_changed` 是统计量选择的
+  描述，不是「哪个统计量正确」的裁决。两套 p 不能混读，也不能把
+  max-T 的更小 p 当作更强的证据；它们回答不同的问题。
+- **max-T 不必然比 Holm 更有力。** 在近独立或 SD 差异大的族里，max-T
+  可能更保守；表内 `correction_effect` 明确写 `same` /
+  `maxt_rejects_more` / `maxt_rejects_fewer` / `crossed`，不预设方向。
+- **有效检验数是描述量。** n=12 的相关矩阵很粗，特征值方法与 Nyholt
+  只在观测到的种子面板上概括「族有多相关」；不是种子总体的因子结构，
+  也不是「真正独立的检验数」的因果断言。
+- **MDE 不是功效。** `critical_t × sem` 是观测 SD 下的 t 型半宽；
+  它不推断未来种子的效应分布，也不替代 §68 的设计期功效。常数非零
+  比较没有样本 SD，MDE/同时区间为 `None`，不写 `inf`。
+- **联合零假设仍是种子级符号交换。** 它不覆盖数据顺序、语料、模型规模
+  或 checkpoint 选择的不确定性；这些仍由各自的门与范围声明负责。
+- **旧产物不回填。** 旧 `test_stats.json` 没有 `family_correction` 时
+  审计报 `not_verifiable_locally`；不反推、不重跑、不改写旧结论。
+
+### 108.4 落盘、报告与审计
+
+- `explib.confirmation.finaltest_stats` 在 `stats['holm']` 之后、冻结
+  `_rej`/`_conf`/verdict 之前写 `stats['family_correction']`：含
+  `family_names`、`m_declared`、`n_seeds`、`n_patterns`、`p_floor`、
+  `holm_threshold`、`dependence`、`studentized`、逐比较
+  `p_raw_mean`/`p_holm_mean`/`p_raw_score`/`p_holm_score`/
+  `p_maxt_score`/`reject_*`/`ci_simultaneous`/`mde_*`，以及 `sets` /
+  `summary` / `boundary`。异常时写 `not_estimable` 并保留原因，绝不伪造
+  数值。
+- `build_report`（`REPORT_v12`）在主比较表后新增「校正方法与族依赖性的
+  敏感性（探索性）」表：逐比较 raw mean、Holm(mean)、raw score、
+  Holm(score)、max-T(score)、拒绝、t 同时区间、MDE，并列出冻结/
+  同统计量/max-T 三个拒绝集、校正方法效应、统计量效应、有效检验数与
+  MDE 比值；`not_estimable` 只打印原因，不渲染假表。
+- `audit_gates.py family_correction`（别名 `family_maxt` /
+  `correction_sensitivity`）读取 `analysis_v12/test_stats.json` 的
+  `family_correction`，用块内 `per_seed`/`seeds`/`frozen_holm`/`alpha`
+  独立重放 score max-T、同统计量 Holm、studentised 孪生、相关矩阵、
+  有效检验数、MDE 与三个拒绝集，逐字段比较；同时检查
+  `p_maxt_score >= p_raw_score`、`p_holm_score >= p_raw_score`、
+  `n_patterns == 2**n`、`m_declared == len(family_names)`、拒绝集与
+  逐行 `reject_*` 一致、CI 有序、族名与 `ft.comparisons` /
+  `manifest.primary_comparison_names` 一致，并拒绝块里出现
+  `confirmed`/`p_holm`/`verified`/`verdict`/`decision` 等冻结字段。
+  缺块报 `not_verifiable_locally`；无行的合法 `not_estimable`/
+  `degenerate` 报 `not_applicable`；有行但重放不一致判 `fail`。它并入
+  `audit_gates.py report` 的顶层 `family_correction`，`make audit`
+  因此在真实篡改时非零退出。
+- 它是**内部重放**：能发现「改了派生 p/区间/依赖读数却没同步改原始逐
+  种子差」和删字段；但不能证明 `per_seed` 就是 test 切片上的原始测量。
+  后者由 stamped 输入绑定、冻结锁与 `analysis_integrity` 负责。
+
+### 108.5 入口与验证
+
+```bash
+python -m pytest -q test_review_part_49.py
+python audit_gates.py family_correction        # 重放 analysis_v12/test_stats.json
+python audit_gates.py family_maxt              # 别名
+python audit_gates.py correction_sensitivity   # 别名
+python audit_gates.py report                   # 顶层汇总含 family_correction
+make audit
+```
+
+`test_review_part_49.py` 12 项覆盖：策略/状态声明与空族/重复名/缺失成员/
+`omitted`/种子不齐/重复 seed/非有限值/n<2/n>20 的 fail-closed；单比较
+score p 与 max-T 一致；完全相关族的有效检验数≈1、max-T 相对同统计量
+Holm 不更少拒绝、集合差分自洽；近独立族不伪造更强功效；常数非零效应在
+studentised t 不可用时仍给出有限 score p 且 CI/MDE 为 `None`；全零族
+`degenerate` 且不冒充通过；studentised 孪生与 score 逐项交叉核对、CI
+有序、MDE 比值有限；`1e308` 级有限值严格 JSON 不产生 NaN/inf；
+`finaltest_stats` 落盘 → 审计 `ok`；篡改 p/CI/集合/summary/依赖/夹带
+`confirmed`/删族成员均判 `fail`，缺块 `not_verifiable_locally`、bare
+`not_estimable` `not_applicable`；报告渲染新表与边界段；CLI 别名与审计
+文档接线。完整 CPU 套件在本轮最终树通过。

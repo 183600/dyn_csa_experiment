@@ -115,6 +115,14 @@
                p/Holm/verified/confirmed（读 analysis_v12/test_stats.json
                的逐种子 NLL/token 记账并重放，篡改判 fail；零 GPU；别名
                length_bands / position_bands）
+  family_correction  结果分析：重放确认主族的**依赖感知联合校正**——从逐种子
+               配对差重建 sign-invariant score 的精确 Westfall-Young
+               step-down max-T、同统计量 Holm、可用时的 studentised t
+               同时区间/MDE，以及种子相关矩阵/有效检验数；回答「Holm 的
+               保守性是否改变了拒绝集、族内的相关性有多大」。不是新检验、
+               不进入冻结 Holm 族、不改变 p/Holm/verified/confirmed
+               （读 analysis_v12/test_stats.json 并重放，篡改判 fail；
+               零 GPU；别名 family_maxt / correction_sensitivity）
   analysis_integrity  分析产物溯源：重算 stamped_analysis 的 content_sha256，
                并核对它记录的全部输入文件哈希；正文被改或输入在分析后被
                改判 fail，输入不在本机则明确 warning，legacy 无摘要报
