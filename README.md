@@ -600,6 +600,12 @@ pass. The main contracts are:
   exploratory panels) and are judged with paired TOST plus family-adjusted
   equivalence p. A non-significant contrast is never relabelled "removable"
   without TOST; a sub-SESOI effect is `sub_sesoi`, not `verified`.
+- **A declared ablation must be a real manipulation.** A config diff is not
+  enough: `audit_gates.py manipulation` builds both arms through the real
+  factory and requires either a changed forward at initialization (`forward`
+  mode) or a changed trainable-parameter/gradient/objective path (`training`
+  mode). An inert contrast fails the design gate, so a later null PPL
+  difference cannot be read as "the module is unnecessary".
 - **Unit influence and repeated looks** are explicit. Pooled ΔPPL carries an
   exact leave-one-unit-out readout, and repeated seed sets are judged by the
   exact max-over-looks sign-flip p recorded in `look_history.json`; neither

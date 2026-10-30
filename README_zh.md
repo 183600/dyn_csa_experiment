@@ -486,6 +486,10 @@ python build_report.py        # 从产物重建 REPORT_v7.md（零 GPU）
 - **消融**必须声明 SESOI（探索性面板默认相对 PPL 1%），并用配对 TOST
   加族校正等价 p 判定。没有 TOST 时，不显著的结果不会被改写成「可删」；
   显著但小于 SESOI 的结果是 `sub_sesoi`，不是 `verified`。
+- **声明的消融必须是真实干预。** 仅有配置差不够：
+  `audit_gates.py manipulation` 用真实工厂建两臂，要求初始化前向改变
+  （`forward` 模式）或可训练参数/梯度/目标路径改变（`training` 模式）。
+  惰性对照会 fail-closed，因此后续 PPL 零差不能被写成「模块不必要」。
 - **单元影响与重复 look** 是显式读数。pooled ΔPPL 带精确的
   leave-one-unit-out 诊断；新增种子集合按 `look_history.json` 中的精确
   max-over-looks 符号翻转 p 判定。两者都不改变冻结的 p/Holm/`confirmed`

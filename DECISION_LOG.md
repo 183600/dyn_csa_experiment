@@ -5027,3 +5027,52 @@ driver、determinism 或线程数改变 v2；hostname/PID/cwd/argv/hash seed/
 摘要冲突、synthesized 记录忽略等情形的状态与计数；`report` 键与 CLI 别名
 接线。`test_review_part_23/24/02/08/37` 共 143 项
 通过，完整 CPU 套件在本轮最终树通过。
+
+## 2026-10-30 — 配置不同不等于干预有效：消融/对比臂的功能操作检查（本轮对比/消融方法硬化，no new runs）
+
+**Problem.** `single_factor` 证明两臂的 AttnCfg diff 恰好是声明键集，
+`single_factor_initialization` 证明非干预参数逐值相同；两者都是构造层证据。
+它们不能排除一个惰性开关：`index_topk=32` 覆盖全部块时 learned/random
+选择器退化成同一函数；内容表未被读时 zero/pooled 前向相同；frozen 参数仍
+可能经第二条路径得到梯度；local fusion 的 identity 初值本来就让 on/off
+前向逐值相同。此时终点 PPL 的零差会被误写成「模块不必要」，而真实原因
+是「干预没有发生」。推理期 lesion 已有操作检查（§97），训练期消融没有。
+
+**Fix.** 新增 `exp_lib.ablation_manipulation_audit()`、
+`ABLATION_MANIPULATION_POLICY` 与组件级闭集声明
+`ABLATION_MANIPULATION_DESIGN`。对 `ABLATION_DESIGN` 的每条对照，用真实
+factory 在同一种子下建 tiny 臂，在固定 ids/targets 上做一次前向与一次
+`ce_loss + comp_reg` 反向，记录：logits 相对差、参数集合/`requires_grad`
+差、梯度范数相对差、`train_objective` 目标差。每条对照预先声明
+`mode='forward'`（初始化前向必须不同）或 `mode='training'`（初始化可以
+相同，但参数/梯度/目标路径必须不同）；两种证据都没有 => `inert` 并 fail。
+声明表是闭集：新增对照不声明、或留下陈旧声明都 fail-closed。探针在
+`_preserve_rng_state()` 内运行，同臂只构造一次；非有限梯度报
+`not_verifiable` 并 fail。
+
+接线：`audit_gates.py manipulation`（别名 `intervention_fidelity` /
+`ablation_manipulation` / `functional_ablation`）单命令入口；
+`audit_single_factor()` 新增 `manipulation` 子块并纳入其整体状态；
+`audit_gates.py report` 新增顶层 `manipulation`。shipped 25 条对照全部
+通过：19 条 forward 模式、6 条 training 模式（两条 learned/frozen gate、comp_reg
+off、REINFORCE boundary、两条 identity fusion）。
+
+**Boundary.** 这是「干预真的改变了模型/训练路径」的**必要**条件，不是
+「机制有用」的证明：前向不同可能来自容量/初始化值，training 证据也不能
+保证训练后不是 no-op（仍要 §97 的 checkpoint lesion 与终点/轨迹证据）。
+tiny 探针不是真实数据分布；探针上不触发时正确动作是改探针或承认该对照
+在当前实现下不可解释，不是判「模块无用」。不新增训练/种子/test 访问，
+不产生 p 值，不改变 `methodology_audit` 的 Holm/`verified`/
+`ablation_complete`，不修改冻结清单字节/端点/alpha/Holm 或
+`CODE_SEMANTICS`；`.github/` 与所有 README 未删除或移动（README 仅增补
+一条 guardrail 说明）。
+
+**Verification.** 新增 `test_review_part_52.py` 7 项：shipped 25 条对照
+全部有 forward/training 证据且声明表与 `ABLATION_DESIGN` 闭集一致；四条
+training-only 对照初始化前向相同但训练路径不同（gate 的可训练性、
+comp_reg 的 delta_logit 梯度/目标、fusion 的 conv 参数）；inert factory
+让全部对照 fail；缺声明/陈旧声明/未知 mode/frozen gate 错标 forward
+全部 fail-closed；非法参数与空 design/declaration 被拒绝；
+audit gate/`single_factor`/`report`/CLI 别名接线；探针不泄漏 RNG 状态。
+`test_review_part_50/16/25/08/10` 共 120 项与本轮新增 7 项通过；完整 CPU
+套件在本轮最终树通过。

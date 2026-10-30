@@ -183,6 +183,12 @@
                learned−frozen 在容量与目标匹配下隔离学习成分，dynamic
                on/off 仍是总效应；别名 gate_placebo / boundary_gate /
                dynamic_gate（零 GPU）
+  manipulation  功能操作检查：配置/初始化都不同的臂仍可能是惰性开关。用真实
+               工厂建 tiny 臂，逐条声明对照核验 forward（logits 改变）或
+               training（参数可训练性/梯度/目标改变）证据；两种模式都没有
+               证据的干预判 inert/fail，因此后续零 PPL 差不能被写成「模块
+               无用」。别名 intervention_fidelity / ablation_manipulation /
+               functional_ablation（零 GPU，不读 results_*）
   lesion       同 checkpoint 的推理期 lesion：声明组件可构造/可干预、
                权重不变的操作检查，以及逐种子 intact/lesion PPL 的
                necessary/harmful/redundant/inert 判定；缺 checkpoint 或

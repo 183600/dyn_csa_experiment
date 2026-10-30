@@ -9610,3 +9610,137 @@ v2 相同但旧 `exec_fp` 不同仍拒绝、单侧 v2 不误杀；复现比较�
 全匹配、跨机器、全旧记录、`run_manifest.json` cell、manifest/summary 去重
 与摘要冲突、synthesized 记录忽略等情形下的状态与计数；`report` 键与 CLI
 别名接线。完整 CPU 套件在本轮最终树通过。
+
+## 111. 配置不同不等于干预有效：消融/对比臂的功能操作检查（本轮对比/消融方法硬化）
+
+### 111.1 问题：一个「差一个字段」的对照仍可能是惰性的
+
+§94 的初始化契约证明「非干预参数没有被可选模块移动」，`single_factor`
+证明「两条臂的 AttnCfg diff 恰好是声明的键集」。两者都是**构造层**证据，
+它们仍不能回答：这个声明的字段在真实前向/反向里是否真的起作用？
+
+至少四类反例会在所有既有设计门都绿色的情况下让消融变成惰性开关：
+
+1. **选择器被读取预算覆盖。** `index_topk=32`，而探针序列只产生不超过
+   32 个块时，learned top-k 与 random top-k 都退化成「读全部块」；两臂的
+   前向逐值相同，PPL 差异只剩训练噪声。代码本身会打印
+   `requested topk=32 but only B=... blocks are available`，但这不是一个
+   fail-closed 的设计门。
+2. **内容路径没有被读到。** 内容投影被零初始化、被门控完全抑制，或
+   `content_mode` 在 dispatch 里被另一个字段覆盖时，`zero` 与 `pooled`
+   的 cfg 差仍在，实际读入却相同。
+3. **frozen 不是「没有梯度」。** 某个参数虽然 `requires_grad=False`，但
+   同一个机制还有第二条可训练路径（例如通过另一个投影、共享 bias 或
+   目标项进入计算图）；这时 learned-vs-frozen 只冻结了名字，没有冻结
+   机制。
+4. **identity 初始化的 on/off 本来就是同一函数。** local fusion 的
+   depthwise kernel 初值为 identity，所以 on/off 在初始化时前向逐值相同
+   是**正常**的；真正要核验的是这个可选 conv 是否存在、是否可训练、是否
+   进入目标/梯度路径。把「初始化相同」误判成「模块无用」与把「配置不同」
+   误判成「干预有效」是同一个错误的两个方向。
+
+因此，只看 cfg diff 的消融表有一个无法从终点 PPL 反推的解释漏洞：零差
+可能是「模块不必要」，也可能是「这次干预根本没有发生」。前者的措辞需要
+TOST/SESOI（§84/§107），后者的正确处置是拒绝解释。
+
+### 111.2 方法：在真实工厂上做一次固定前向/反向
+
+新增 `exp_lib.ablation_manipulation_audit()` 与声明表
+`ABLATION_MANIPULATION_DESIGN`。对 `ABLATION_DESIGN` 的每一条对照：
+
+1. 用**真实** `make_layer_cfgs`/调用方 factory，在同一种子下各建一个 tiny
+   `SmallGPT`（默认 2 层、d=32、2 头、d_head=16、256 token 探针）；
+2. 在固定 ids 上做一次 `eval()` 前向，比较 logits 的
+   `max|Δ| / max(|a|,|b|,1)`；超过 `forward_rtol` 记为 forward 证据；
+3. 在固定 ids/targets 上做一次 `ce_loss + 0.05*comp_reg` 反向（只加图上
+   真实存在的 comp_reg 项），记录每个参数的名字、`requires_grad` 与梯度
+   范数；参数集合/可训练性差异、梯度相对差异都记为 training 证据；
+4. 比较 `train_objective()` 的目标描述（`comp_reg_applies` /
+   `comp_lambda_effective` / `delta_trainable` / `boundary_policy` /
+   `loss_terms` 等），目标差异也记为 training 证据。
+
+每条对照在声明表里预先写死 `mode`：
+
+| mode | 硬性要求 | 典型对照 |
+|---|---|---|
+| `forward` | 初始化 logits 必须不同 | dynamic vs fixed、learned vs random selection、zero/shift content、sink on/off、random fusion、hybrid hierarchy |
+| `training` | 初始化 logits 可以相同，但参数可训练性/梯度/目标必须不同 | learned vs frozen gate、comp_reg on/off、REINFORCE boundary、identity fusion on/off |
+
+`forward` 对照若 logits 逐值相同 => `inert`；`training` 对照若参数集合、
+可训练性、梯度、目标全部相同 => 也是 `inert`。两者都 fail-closed，并
+在 `audit_gates.py report` 里把整体状态拉成 fail。声明表是闭集：新增一条
+`ABLATION_DESIGN` 对照却不声明 mode，或留下一条已不存在的声明，都是
+violation；不能靠「没声明就默认 forward」蒙混过关。
+
+**操作细节是方法的一部分：**
+
+- 探针使用固定 `torch.Generator` 生成 ids/targets，模型构造与前向/反向
+  都在 `_preserve_rng_state()` 内；审计结束后调用方的 Python/NumPy/Torch/
+  CUDA RNG 状态逐值恢复，不会因为跑了一次设计门而改变后续训练的数据顺序
+  或 dropout 流。
+- 同一个 arm 在一个审计里只构造一次，避免同一臂在不同对照里拿到不同的
+  初始化（那会把「初始化抽样」混进「干预证据」）。
+- 反向只使用 CE 与图上真实存在的 comp_reg，不编造 REINFORCE 的 reward；
+  REINFORCE 臂的 `boundary_policy`/`loss_terms` 目标差异仍会被记录。
+- 探针出现非有限梯度时该条报 `not_verifiable` 并 fail，不把 NaN 当成
+  「有差异」的证据。
+
+### 111.3 接线：只增加设计门，不改变任何终点判定
+
+```bash
+make manipulation                              # = audit_gates.py manipulation
+python audit_gates.py manipulation            # = intervention_fidelity
+python audit_gates.py ablation_manipulation   # 别名
+python audit_gates.py functional_ablation     # 别名
+python audit_gates.py single_factor           # 内含 manipulation 子块
+python audit_gates.py report                  # 顶层 manipulation
+make audit                                    # 汇总审计
+```
+
+`audit_single_factor()` 的 `manipulation` 子块与 `design`/`initialization`
+并列；`report` 顶层新增 `manipulation`。它不进入 `methodology_audit` 的
+p 值、Holm 族、`verified`/`ablation_complete`，也不读
+`results_*/summary.json`、不读 test split、不改
+`confirmation_frozen*.json`、种子、端点、alpha、Holm 或
+`CODE_SEMANTICS`。
+
+### 111.4 边界：这是「干预发生了」的必要条件，不是「机制有用」的证明
+
+- **前向不同不等于机制被定位。** 它只说明两条臂不是同一个函数；差异可能
+  来自容量、初始化值或实现路径（这些仍由 §94/§109 的容量/目标门另行
+  检查）。`forward` 证据不能替代 selection/attribution/NIAH 等机制读数。
+- **`training` 证据不等于训练后一定不同。** 一个参数可训练、有梯度，
+  仍可能在真实数据上被优化成 no-op；这需要训练后的 lesion（§97）与
+  终点/轨迹证据。本门只排除「训练前就没有任何干预路径」。
+- **tiny 探针不是真实数据分布。** 探针上 dynamic cut 可能触发、也可能
+  恰好与 fixed 相同；本门用固定随机 token 只做存在性检查。探针上
+  `forward` 不触发时，正确动作是增大/设计探针或承认该对照在当前实现下
+  不可解释，而不是直接判「模块无用」。反过来，探针上触发也不保证真实
+  序列上触发；它是**必要**条件，不是充分条件。
+- **identity/zero 初始化要分开处理。** local fusion 的 identity 初值是
+  `training` 模式（可选 conv 必须存在/可训练）；learned sink 的零值不是
+  no-op（sink 槽仍以 exp(0)=1 进入 softmax 分母），sink on/off 仍是
+  `forward` 模式。不能因为初始化相同就跳过目标/梯度检查，也不能因为
+  初始化不同就把它写成机制证据。
+- **不改变已有证据。** 本节没有新训练、没有新种子、没有新 test 访问、
+  没有新 p 值；旧面板的 `verified`/`confirmed` 不因本门被追溯改写。
+
+### 111.5 入口与验证
+
+```bash
+python -m pytest -q test_review_part_52.py
+python audit_gates.py manipulation
+python audit_gates.py single_factor
+python audit_gates.py report
+```
+
+`test_review_part_52.py` 7 项覆盖：shipped 25 条对照全部有 forward 或
+training 证据（其中 6 条 training-only：两个 learned/frozen gate、
+comp_reg off、REINFORCE boundary、两个 identity fusion）且声明表与
+`ABLATION_DESIGN` 闭集一致；测试逐条核对四条代表性 training-only
+对照初始化前向相同但训练路径不同；把所有臂映射到同一 config 的
+inert factory 让每条对照都 fail；缺声明/陈旧声明/未知 mode/把 frozen gate
+错标成 forward 全部 fail-closed；非法 n_layers/probe_tokens/seed/容差与
+空 design/空 declaration 被拒绝；`audit_gates.audit_manipulation()`、
+`single_factor` 子块、`run_report` 与 CLI 别名接线；探针不泄漏调用方
+RNG 状态。完整 CPU 套件在本轮最终树通过。

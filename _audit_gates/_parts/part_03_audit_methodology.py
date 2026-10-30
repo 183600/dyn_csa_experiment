@@ -165,7 +165,12 @@ def audit_single_factor(manifest_path=None):
         attention-cfg diff 是否单因素（`cfg_keys_single_factor` 的一族判据），
         与 `mechanism_claim_allowed` 标志的一致性。`True` 标志但 cfg 非单因素
         => fail（完整的含目标/参数量核验在 `python -m explib.confirmation plan`，本审计给出
-        同一口径的 cfg 级读数）。
+        同一口径的 cfg 级读数）；
+      * **功能操作检查**（`manipulation`）：配置差与初始化契约都通过，仍可能
+        是一个惰性开关（选择器的 top-k 覆盖全部块、内容表从未被读、frozen 参数
+        仍有第二条梯度路径）。本块用真实工厂建 tiny 臂，在一次固定前向/反向
+        上核验声明的 `forward` 或 `training` 干预确实改变 logits / 参数可训练性
+        / 梯度 / 目标；惰性干预 fail-closed。
     """
     L = _import_exp_lib()
     out = {'status': 'ok', 'design': {}, 'initialization': {},
@@ -173,11 +178,14 @@ def audit_single_factor(manifest_path=None):
            'niah_contrasts': {}, 'dynamic_study': {},
            'frozen_manifest': {}, 'factorial_design': {},
            'content_controls': {}, 'sink_controls': {},
-           'fusion_controls': {}, 'gate_controls': {}}
+           'fusion_controls': {}, 'gate_controls': {},
+           'manipulation': {}}
     design_rep = L.single_factor_design_audit(verbose=False)
     out['design'] = design_rep
     init_rep = L.single_factor_initialization_audit()
     out['initialization'] = init_rep
+    manip_rep = L.ablation_manipulation_audit()
+    out['manipulation'] = manip_rep
     ob_rep = L.open_block_matrix_audit(verbose=False)
     out['open_block_matrix'] = ob_rep
     fact_rep = L.factorial_design_audit()
@@ -196,7 +204,8 @@ def audit_single_factor(manifest_path=None):
             or ctrl_rep.get('status') != 'ok'
             or sink_rep.get('status') != 'ok'
             or fusion_rep.get('status') != 'ok'
-            or gate_rep.get('status') != 'ok'):
+            or gate_rep.get('status') != 'ok'
+            or manip_rep.get('status') != 'ok'):
         out['status'] = 'fail'
     # v9/v10 attach a `single_factor`/`factors` label to each seq2k paired
     # record.  Verify that label against the actual arm construction instead of
@@ -451,6 +460,30 @@ def audit_gate_controls():
     """
     L = _import_exp_lib()
     out = L.gate_control_audit()
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return out
+
+
+def audit_manipulation(design=None, declarations=None):
+    """Functional manipulation fidelity audit (zero GPU, design point).
+
+    The config-diff and initialization gates prove that the arm definitions
+    differ in the declared fields and that the shared trunk is unchanged.
+    They cannot prove that the declared field changes the computation: a
+    selector whose top-k covers every block, a content table that is never
+    read, or a frozen parameter with a second gradient path are all inert
+    interventions.  This gate builds both arms through the real factory and
+    checks, per declared contrast, either a changed forward output
+    (``mode='forward'``) or a changed parameter/gradient/objective path
+    (``mode='training'``).  An inert contrast fails closed, because a null PPL
+    difference from an inert manipulation cannot be read as "the module is
+    unnecessary".
+
+    It is a design-time check only: no result file is read, no p-value/Holm
+    family/frozen verdict is changed, and the caller's RNG state is restored.
+    """
+    L = _import_exp_lib()
+    out = L.ablation_manipulation_audit(design=design, declarations=declarations)
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return out
 
