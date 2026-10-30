@@ -1,0 +1,28 @@
+# Keep the source tree byte-identical across platforms.  source_tree_manifest()
+# hashes file bytes, so an autocrlf checkout must not change a Python/JSON file
+# and make the same commit look like different measurement code.
+* text=auto eol=lf
+*.py text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.jsonl text eol=lf
+*.toml text eol=lf
+*.txt text eol=lf
+*.in text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.lock text eol=lf
+*.cfg text eol=lf
+
+# Binary/generated payloads: never normalise these.
+*.tar.gz binary
+*.whl binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.npy binary
+*.npz binary
+*.pt binary
+*.pth binary
+*.ckpt binary

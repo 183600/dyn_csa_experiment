@@ -103,6 +103,50 @@ def dependency_contract(lock_path=None):
     return out
 
 
+_INVOCATION_SECRET_RE = re.compile(
+    r'(?i)(token|secret|passw(?:or)?d|api[-_]?key|credential|auth)')
+
+
+def _invocation_identity(argv=None):
+    """The exact command that produced a record, with secret values redacted.
+
+    A seed/config/fingerprint does not tell a reader which driver and mode were
+    invoked.  Recording argv closes that gap for a rerun, while a value passed
+    after a token/password/api-key flag is replaced by ``***`` so provenance
+    does not become a credential leak.  Callers that need the unredacted argv
+    (e.g. a deliberate audit) can still inspect ``sys.argv`` themselves.
+    """
+    raw = [str(a) for a in (sys.argv if argv is None else argv)]
+    out = []
+    redact_next = False
+    for text in raw:
+        if redact_next:
+            out.append('***')
+            redact_next = False
+            continue
+        if text.startswith('-') and '=' in text:
+            name = text.partition('=')[0]
+            if _INVOCATION_SECRET_RE.search(name):
+                out.append(name + '=***')
+                continue
+        out.append(text)
+        if text.startswith('-') and _INVOCATION_SECRET_RE.search(text):
+            redact_next = True
+    module = None
+    if '-m' in raw:
+        try:
+            module = raw[raw.index('-m') + 1]
+        except IndexError:
+            module = None
+    return {
+        'argv': out,
+        'entrypoint': out[0] if out else None,
+        'python_module': module,
+        'n_args': len(out),
+        'redacted': out != raw,
+    }
+
+
 def environment_snapshot():
     """Compact software/hardware snapshot for experiment tracking."""
     import platform
@@ -113,6 +157,7 @@ def environment_snapshot():
         _hostname = None
     env = {
         'python': sys.version.split()[0],
+        'invocation': _invocation_identity(),
         'hostname': _hostname,
         'process_id': os.getpid(),
         'working_directory': os.getcwd(),

@@ -190,7 +190,10 @@ def test_audit_analysis_integrity_scans_only_stamped_artifacts():
 
 def test_analysis_integrity_is_wired_into_report_and_cli():
     src = inspect.getsource(A.run_report)
-    assert "'analysis_integrity': audit_analysis_integrity()" in src, src
+    # The aggregate report audits the other analysis artifacts, not the report
+    # file it is about to replace: auditing itself made the body depend on the
+    # previous run's freshness (fail on the first rebuild, ok on the next).
+    assert "'analysis_integrity': audit_analysis_integrity(exclude=" in src, src
     assert 'analysis_integrity' in (A.__doc__ or ''), (
         'analysis-integrity audit is not documented in the CLI help')
     assert 'analysis_integrity' in inspect.getsource(A._run_cli), (

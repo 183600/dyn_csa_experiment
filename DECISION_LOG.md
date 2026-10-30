@@ -4284,3 +4284,80 @@ split 的 fail-closed；tag 不跨池与 summary key 兼容；单臂/未知规�
 `not_verifiable_locally` 与 CLI/report 接线；以及 `methodology_audit` 在
 有/无端点字段下所有判定承载字段逐值相同、只在早停面板增加 warning。完整
 CPU 套件在本轮最终树通过（830 passed, 3 skipped）。
+
+## 2026-10-30 — 同一份证据要重建出同一份报告：schema 2 时间戳、证据输入绑定与源码树卫生（本轮可复现性/工程规范硬化，no new runs）
+
+零 GPU 的可复现性/工程规范硬化；不新增训练、不读取 test split、不修改
+`confirmation_frozen*.json` 的字节/种子/端点/alpha/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未触碰。
+
+**Problem.** `stamped_analysis` 的 `created_at` 是墙钟，聚合器又把
+`generated_at` 写进被哈希的 body，所以同一份结论连续生成两次会得到不同的
+`content_sha256`；内容寻址只能发现篡改，不能把重建识别为同一结果。更关键
+的是 `run_report` 调 `stamped_analysis('audit_report', res)` 时没有传
+`inputs`，顶层审计报告因此 `inputs == {}`：改动 `results_*/summary.json`、
+`analysis_*/test_stats.json` 或冻结清单后，报告自身仍然验证通过，`body` 与
+证据之间没有机器可检的绑定。跨报告也没有「同一证据重建」的比较器，
+`explib.reproduce compare` 只覆盖训练结果目录。工程侧还有三处遗留：
+`.tmp_lint/`（vendored pyflakes + 拼接草稿）和
+`archive_test_dcgf_cjz/out/*.tmp27904` 被 Git 跟踪；`MANIFEST.in` 手写测试
+白名单，漏掉三个顶层回归测试；没有 `.gitattributes` 固定 LF，而
+`source_tree_manifest()` 按字节计算源码身份。运行记录也没有命令行，复现者
+只能从 README 猜 driver/mode/flag。
+
+**Fix.**
+
+- 新增 `exp_lib.source_date_epoch` / `reproducible_timestamp`（与
+  `archive_release._source_date_epoch` 同语义），并引入
+  `content_schema = 2`：schema 2 把 `generated_at` 视为 volatile，同时把
+  `content_schema` 本身纳入摘要；旧记录没有该字段，继续按旧规则验证，
+  不追溯作废已发布哈希。设 `SOURCE_DATE_EPOCH` 时 `created_at` /
+  `generated_at` 固定为 UTC，同一 checkout 上的 stamp 可字节重建。
+- 新增 `audit_gates.audit_evidence_inputs(root)`：确定排序地枚举
+  `results_*/`、`analysis_*/` 下的文本/JSON 证据（`.json/.jsonl/.csv/.tsv/
+  .md/.txt/.yaml/.yml`）、冻结清单和 `RELEASES.md`，返回
+  `evidence:<relpath> -> path` 与 `scope`（文件数/字节数/上限/跳过项）。
+  `run_report` 把它们传给 `stamped_analysis(inputs=...)`，并把 `scope`
+  写进 body；`analysis_integrity` 随即可重放输入字节。`analysis_audit/`
+  被排除，因为报告会向该 ledger 追加事件，且它另有 hash-chain/anchor 审计。
+  `run_report` 的 `analysis_integrity` 还排除即将被替换的
+  `audit_report.json` 自身：否则新报告会审计上一份报告的新鲜度，证据一变
+  就出现 fail→ok 的一次性滞后；独立 `analysis_integrity` 子命令仍审计它。
+- 新增 `exp_lib.analysis_report_diff` 与
+  `python -m explib.reproduce report A B`：分开 body / inputs / code /
+  environment 四个维度，给出 JSON pointer 级 body 差异，判定
+  `reproduced` / `body_changed` / `inputs_changed` / `provenance_changed` /
+  `schema_changed` / `unverified` / `invalid`；`invalid` 优先，一侧摘要与
+  自身 body 不符是篡改。`--ignore /experiment_ledger`（或
+  `--ignore-ledger`）用于只追加审计 trace。
+- `environment_snapshot()` 增加 `invocation`（argv/entrypoint/`-m` 模块/
+  参数个数），token、password、secret、api-key、credential、auth 的值脱敏
+  为 `***`；它不进入 `execution_fingerprint()`，不改变同环境配对。
+- 工程卫生：删除被跟踪的 `.tmp_lint/` 与 `archive_test_dcgf_cjz/`，加入
+  `.gitignore`；`MANIFEST.in` 改为 `include test_*.py` 并纳入 `Makefile` /
+  `.gitattributes`；新增 `.gitattributes` 固定 `text=auto eol=lf` 与二进制
+  标记；`prune` 缓存/草稿目录。
+
+**Boundary.** 这不是新的统计检验，不改变任何 PPL/p/Holm/`verified`/冻结
+判定。`content_sha256` 是内容身份而非签名；`inputs_sha256` 只覆盖枚举到的
+文本/JSON 证据，超过 64 MiB 的文件、二进制 checkpoint、`.npy` 缓存与
+`analysis_audit` ledger 不在其中，它们仍由 run record / release manifest /
+ledger chain 负责。`reproduced` 只表示 body 与输入绑定一致；源码/环境变化
+单独报 `provenance_changed`，不会被「数字相同」掩盖。`SOURCE_DATE_EPOCH`
+只固定时间字段，不虚构原始运行时间；不设时仍记录墙钟。仓库仍无随附
+evidence release，本轮绑定不能替代 `RELEASES.md` 的外部归档与 verifier。
+删除的两个目录全仓库无引用，是历史迭代的本地草稿，不是实验输入。
+
+**Verification.** 新增 `test_review_part_37.py` 9 项：epoch 解析与 archive
+解析器逐值一致（含 bool/负数/小数/日期/科学计数/超范围/空白）；固定 epoch
+下时间戳与整份 stamp 字节稳定；legacy 的 `generated_at` 仍参与摘要而
+schema 2 不参与；证据枚举的确定性、扩展名、上限与 `analysis_audit` 排除；
+输入被编辑后 `verify_stamped_analysis` 判 fail；report diff 对
+body/inputs/code 三类变化分别判定、篡改判 `invalid`、`/experiment_ledger`
+可忽略；CLI 退出码 0/1/2；argv 脱敏与 `-m` 模块识别；以及 `git ls-files`
+无 `.tmp_lint`/`archive_test_*`/缓存/结果目录、`.github/` 与 README 仍在、
+MANIFEST 覆盖全部顶层 `test_*.py`、`.gitattributes` 固定 LF。最终树上用
+`SOURCE_DATE_EPOCH=1700000000` 连续生成两份 `audit_report.json`，
+`python -m explib.reproduce report A B --ignore-ledger` 返回 `reproduced`
+（body/inputs/code/environment 全 match；唯一增长的是被 ignore 的
+`analysis_audit` ledger 事件数）。完整 CPU 套件在本轮最终树通过。

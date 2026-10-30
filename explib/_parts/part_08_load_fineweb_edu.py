@@ -1484,6 +1484,28 @@ def log_experiment_event(outdir, event):
 _ANALYSIS_VOLATILE_KEYS = frozenset({
     'kind', 'created_at', 'code', 'provenance', 'content_sha256', 'inputs',
 })
+# `generated_at` is a second wall-clock field emitted by aggregate/report
+# builders.  Leaving it in the hashed body meant two byte-for-byte identical
+# audit runs received different content hashes, so a "content-addressed"
+# artifact could not be recognised as a rebuild.  It is volatile only from
+# schema 2 onward: legacy artifacts keep their historical digest so an
+# existing release still verifies.
+ANALYSIS_CONTENT_SCHEMA = 2
+_ANALYSIS_VOLATILE_KEYS_V2 = _ANALYSIS_VOLATILE_KEYS | frozenset({'generated_at'})
+
+
+def _analysis_volatile_keys(record):
+    """Volatile-key set for this record's declared content schema.
+
+    An absent/older ``content_schema`` deliberately keeps the legacy set: a
+    schema migration must not silently invalidate every already-published
+    artifact hash.
+    """
+    schema = record.get('content_schema') if isinstance(record, dict) else None
+    if (isinstance(schema, numbers.Integral) and not isinstance(schema, bool)
+            and int(schema) >= ANALYSIS_CONTENT_SCHEMA):
+        return _ANALYSIS_VOLATILE_KEYS_V2
+    return _ANALYSIS_VOLATILE_KEYS
 
 
 def _analysis_repo_root():
@@ -1507,7 +1529,8 @@ def analysis_content_sha256(record):
     """
     if not isinstance(record, dict):
         raise TypeError(f'analysis record must be a dict, got {type(record).__name__}')
-    body = {k: v for k, v in record.items() if k not in _ANALYSIS_VOLATILE_KEYS}
+    _volatile = _analysis_volatile_keys(record)
+    body = {k: v for k, v in record.items() if k not in _volatile}
     text = json.dumps(_json_clean(_jsonable(body)), sort_keys=True,
                       separators=(',', ':'), ensure_ascii=False,
                       allow_nan=False, default=float)
@@ -1774,10 +1797,13 @@ def stamped_analysis(kind, payload, *, outdir=None, name=None, event=True,
 
     The stamp overwrites its own keys (`kind`/`created_at`/`code`/
     `provenance`), so re-stamping a loaded record on rewrite updates the
-    trace instead of accumulating stale copies."""
+    trace instead of accumulating stale copies.  ``created_at`` honours
+    SOURCE_DATE_EPOCH (schema 2), so a rebuild can be byte-reproducible
+    without pretending the original run happened at the rebuild time."""
     rec = dict(payload) if isinstance(payload, dict) else {'result': payload}
     rec['kind'] = kind
-    rec['created_at'] = time.strftime('%Y-%m-%dT%H:%M:%S')
+    rec['created_at'] = reproducible_timestamp()
+    rec['content_schema'] = ANALYSIS_CONTENT_SCHEMA
     rec['code'] = code_stamp()
     rec['provenance'] = code_provenance()
     # Always record an input block (possibly {}) plus its canonical digest.

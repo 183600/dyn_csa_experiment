@@ -623,17 +623,30 @@ def compare_reproductions(original, rerun, *, rtol=1e-6, atol=0.0):
     }
 
 
-_REPRODUCTION_USAGE = """usage: python -m explib.reproduce compare ORIGINAL RERUN [options]
+_REPRODUCTION_USAGE = """usage:
+  python -m explib.reproduce compare ORIGINAL RERUN [options]
+  python -m explib.reproduce report ORIGINAL.json RERUN.json [options]
 
-Compare two independent executions of the same cells (result directories or
+compare: two independent executions of the same cells (result directories or
 summary.json paths).  Exit status: 0 reproduced, 1 not reproduced, 2 usage or
 input error.  --require exact removes the tolerance and demands identical PPL.
 
-options:
+report: two stamped analysis/report JSON files (for example an audit_report.json
+and its rebuild).  Separates a changed result body from changed evidence inputs,
+changed code and a changed execution environment.
+
+compare options:
   --rtol FLOAT   relative PPL tolerance (default 1e-6)
   --atol FLOAT   absolute PPL tolerance (default 0)
   --json PATH    also write the machine-readable report
   --require {tolerance,exact}
+
+report options:
+  --ignore POINTER       ignore a JSON pointer (repeatable), e.g.
+                         /experiment_ledger for an append-only audit trace
+  --ignore-ledger        shorthand for --ignore /experiment_ledger
+  --max-differences N    stop after N reported pointers (default 200)
+  --json PATH            also write the machine-readable report
 """
 
 
@@ -647,6 +660,8 @@ def _reproduction_cli(argv=None):
         print(_REPRODUCTION_USAGE)
         return 0
     command = args.pop(0)
+    if command in ('report', 'artifact', 'analysis_report', 'analysis'):
+        return _report_diff_cli(args)
     if command not in ('compare', 'check', 'reproduce'):
         print(f'reproduction: unknown subcommand {command!r}\n\n'
               + _REPRODUCTION_USAGE)
@@ -690,3 +705,48 @@ def _reproduction_cli(argv=None):
     if ns.require == 'exact':
         ok = ok and bool(report['bit_identical'])
     return 0 if ok else 1
+
+
+def _report_diff_cli(args):
+    """CLI for ``python -m explib.reproduce report A B`` (see usage above)."""
+    import argparse
+    parser = argparse.ArgumentParser(prog='python -m explib.reproduce report',
+                                     add_help=False)
+    parser.add_argument('original')
+    parser.add_argument('rerun')
+    parser.add_argument('--ignore', action='append', default=[])
+    parser.add_argument('--ignore-ledger', action='store_true')
+    parser.add_argument('--max-differences', type=int, default=200)
+    parser.add_argument('--json', dest='json_path', default=None)
+    try:
+        ns = parser.parse_args(args)
+    except SystemExit:
+        print(_REPRODUCTION_USAGE)
+        return 2
+    if ns.max_differences < 1:
+        print('reproduction: --max-differences must be a positive integer')
+        return 2
+    ignore = list(ns.ignore)
+    if ns.ignore_ledger and '/experiment_ledger' not in ignore:
+        ignore.append('/experiment_ledger')
+    try:
+        report = analysis_report_diff(
+            ns.original, ns.rerun, ignore=ignore,
+            max_differences=ns.max_differences)
+    except (OSError, ValueError, TypeError) as exc:
+        print(json.dumps({'kind': 'analysis_report_diff', 'verdict': 'error',
+                          'reproduced': False,
+                          'error': f'{type(exc).__name__}: {exc}'},
+                         ensure_ascii=False, indent=2))
+        return 2
+    print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True,
+                     allow_nan=False, default=float))
+    if ns.json_path:
+        try:
+            out_path = os.path.abspath(ns.json_path)
+            os.makedirs(os.path.dirname(out_path), exist_ok=True)
+            atomic_write_json(out_path, report, indent=2)
+        except OSError as exc:
+            print(f'reproduction: could not write {ns.json_path}: {exc}')
+            return 2
+    return 0 if report.get('reproduced') else 1

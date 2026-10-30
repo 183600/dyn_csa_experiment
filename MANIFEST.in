@@ -18,10 +18,12 @@ include requirements-ci.txt
 include requirements.lock
 include confirmation_frozen.json
 include confirmation_frozen_dynamic.json
-include test_review_fixes.py
-include test_open_block.py
-include test_support.py
-include test_review_part_*.py
+include Makefile
+include .gitattributes
+# Every top-level test module, not a hand-maintained list: the sdist is meant
+# to be self-checking, and test_review_part_*.py is not the only regression
+# suite (test_control_audit_scale_guards.py etc. were silently omitted).
+include test_*.py
 recursive-include docs *.md
 recursive-include explib *.py
 recursive-include _audit_gates *.py
@@ -46,4 +48,10 @@ prune archive
 prune .build
 prune dist
 prune build
+prune .pytest_cache
+prune .ruff_cache
+prune .mypy_cache
+prune .tmp_lint
+prune archive_test_dcgf_cjz
+prune archive_test_*
 global-exclude *.py[cod] *.npy *.npz *.arrow *.pt *.pth *.ckpt *.log *.tmp

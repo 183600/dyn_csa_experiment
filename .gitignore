@@ -109,3 +109,8 @@ results_smoke_bench/
 # 审计报告与证据归档为本地产物（归档发布到只读位置，不入库）
 audit_report.json
 archive/
+
+# 本地 lint 草稿与一次性归档冒烟产物（绝不入库；见 DECISION_LOG §99）
+.tmp_lint/
+archive_test_*/
+release_test_*/

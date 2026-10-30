@@ -1363,7 +1363,7 @@ def audit_statistical_calibration(*, n_sim=None, seed=None):
     return rep
 
 
-def audit_analysis_integrity(paths=None):
+def audit_analysis_integrity(paths=None, *, exclude=()):
     """Verify stamped analysis artifacts against their content and inputs.
 
     A report number is reproducible only if the artifact that states it can be
@@ -1382,9 +1382,17 @@ def audit_analysis_integrity(paths=None):
 
     It reads local artifacts only, starts no experiment and changes no
     measurement, p-value, Holm family or frozen verdict.
+
+    ``exclude`` lets ``run_report`` skip the aggregate report it is about to
+    replace.  Auditing the previous report inside the new report made the new
+    body depend on the previous run's freshness: after any evidence change the
+    first rebuild recorded ``fail``, the next recorded ``ok``, so two rebuilds
+    of the same evidence could not compare equal.  The standalone
+    ``analysis_integrity`` command still audits ``audit_report.json``.
     """
     L = _import_exp_lib()
     import glob as _glob
+    excluded = {os.path.abspath(os.fspath(x)) for x in exclude}
     if paths is None:
         roots = [os.path.join(REPO, 'audit_report.json')]
         for pattern in ('analysis_*/*.json', 'analysis_audit/*.json'):
@@ -1398,17 +1406,21 @@ def audit_analysis_integrity(paths=None):
         p = os.fspath(p)
         if os.path.isdir(p):
             for q in sorted(_glob.glob(os.path.join(p, '*.json'))):
-                if q not in seen:
-                    seen.add(q)
-                    files.append(q)
+                aq = os.path.abspath(q)
+                if aq in excluded or aq in seen:
+                    continue
+                seen.add(aq)
+                files.append(aq)
         elif os.path.isfile(p) and p.endswith('.json'):
             ap = os.path.abspath(p)
-            if ap not in seen:
-                seen.add(ap)
-                files.append(ap)
+            if ap in excluded or ap in seen:
+                continue
+            seen.add(ap)
+            files.append(ap)
     out = {'kind': 'analysis_integrity_audit', 'status': 'ok',
            'artifacts': {}, 'n_checked': 0, 'n_ok': 0, 'n_fail': 0,
            'n_warnings': 0, 'n_legacy': 0, 'n_skipped': 0,
+           'n_excluded': len(excluded),
            'problems': [], 'warnings': [],
            'note': ('content-addressed analysis provenance: the result body '
                     'and every locally available input are checked against '
@@ -1443,8 +1455,14 @@ def audit_analysis_integrity(paths=None):
             out['n_ok'] += 1
     if out['n_checked'] == 0:
         out['status'] = 'not_verifiable_locally'
-        out['reason'] = ('no stamped analysis artifact exists yet; run the '
-                         'analysis with the current code to produce one')
+        if out['n_excluded']:
+            out['reason'] = ('every candidate was the aggregate report being '
+                             'replaced; run the standalone analysis_integrity '
+                             'command to audit that file, or produce another '
+                             'stamped analysis artifact first')
+        else:
+            out['reason'] = ('no stamped analysis artifact exists yet; run the '
+                             'analysis with the current code to produce one')
     elif out['n_fail']:
         out['status'] = 'fail'
     elif out['n_legacy'] or out['n_warnings']:
@@ -1750,8 +1768,133 @@ def audit_variance_components(path=None):
     return out
 
 
+# Evidence files the aggregate report derives its verdicts from.  The report
+# used to be stamped with an EMPTY input block, so editing a results_*/summary
+# or analysis_*/test_stats file left `verify_stamped_analysis` green: the top
+# level synthesis was content-addressed but not bound to the evidence it read.
+# Text/JSON artifacts are hashed; multi-GB tensors/checkpoints are not (their
+# identity belongs in the run records / release manifest, not in a report).
+_AUDIT_INPUT_SUFFIXES = ('.json', '.jsonl', '.csv', '.tsv', '.md', '.txt',
+                         '.yaml', '.yml')
+_AUDIT_INPUT_SKIP_DIRS = frozenset({'analysis_audit'})
+_AUDIT_INPUT_MAX_BYTES = 64 << 20
+_AUDIT_INPUT_ROOT_FILES = ('confirmation_frozen.json',
+                          'confirmation_frozen_dynamic.json',
+                          'RELEASES.md')
+
+
+def audit_evidence_inputs(root=None, *, max_file_bytes=_AUDIT_INPUT_MAX_BYTES):
+    """Return ``(inputs, scope)`` for the local evidence an audit reads.
+
+    ``inputs`` is a deterministic ``label -> path`` mapping suitable for
+    ``exp_lib.stamped_analysis(inputs=...)``.  ``scope`` records the file
+    count/bytes and anything deliberately skipped, so a reader can tell
+    "bound to every evidence file" from "bound to the small text subset".
+
+    ``analysis_audit/`` is excluded on purpose: it is the audit's own
+    append-only trace, and binding a report to a log that the report appends
+    to would make every rebuild look like changed evidence.  That ledger has
+    its own hash-chain/anchor audit.
+    """
+    root = os.path.abspath(root or REPO)
+    root_real = os.path.realpath(root)
+    max_bytes = int(max_file_bytes)
+    if max_bytes < 0:
+        raise ValueError('max_file_bytes must be a non-negative integer')
+    picked = {}
+    sizes = {}
+    skipped = {'large': [], 'outside_root': [], 'unreadable': []}
+
+    def _inside(path):
+        try:
+            return os.path.commonpath(
+                [root_real, os.path.realpath(path)]) == root_real
+        except (OSError, ValueError):
+            return False
+
+    def _rel(path):
+        try:
+            text = os.path.relpath(path, root).replace(os.sep, '/')
+        except (OSError, ValueError):
+            return path
+        return text
+
+    def _add(path):
+        path = os.path.abspath(path)
+        rel = _rel(path)
+        if not _inside(path):
+            skipped['outside_root'].append(rel)
+            return
+        try:
+            size = int(os.path.getsize(path))
+        except OSError as exc:
+            skipped['unreadable'].append(
+                {'path': rel, 'error': f'{type(exc).__name__}: {exc}'})
+            return
+        if size > max_bytes:
+            skipped['large'].append(rel)
+            return
+        picked[rel] = path
+        sizes[rel] = size
+
+    for name in _AUDIT_INPUT_ROOT_FILES:
+        path = os.path.join(root, name)
+        if os.path.isfile(path):
+            _add(path)
+
+    import glob as _glob
+    for pattern in ('results_*', 'analysis_*'):
+        for directory in sorted(_glob.glob(os.path.join(root, pattern))):
+            if not os.path.isdir(directory):
+                continue
+            if os.path.basename(directory) in _AUDIT_INPUT_SKIP_DIRS:
+                continue
+            for cur, dirs, names in os.walk(directory, followlinks=False):
+                dirs[:] = sorted(
+                    d for d in dirs
+                    if d not in _AUDIT_INPUT_SKIP_DIRS
+                    and not d.startswith('.'))
+                for name in sorted(names):
+                    if not name.lower().endswith(_AUDIT_INPUT_SUFFIXES):
+                        continue
+                    _add(os.path.join(cur, name))
+
+    inputs = {f'evidence:{rel}': picked[rel] for rel in sorted(picked)}
+    scope = {
+        'schema': 1,
+        'roots': ['results_*', 'analysis_*', *_AUDIT_INPUT_ROOT_FILES],
+        'extensions': list(_AUDIT_INPUT_SUFFIXES),
+        'n_files': len(picked),
+        'n_bytes': sum(sizes[rel] for rel in picked),
+        'max_file_bytes': max_bytes,
+        'excluded_dirs': sorted(_AUDIT_INPUT_SKIP_DIRS),
+        'skipped_large': sorted(skipped['large']),
+        'skipped_outside_root': sorted(skipped['outside_root']),
+        'skipped_unreadable': sorted(
+            skipped['unreadable'], key=lambda e: e.get('path', '')),
+        'note': ('text/JSON evidence read by the aggregate audit; the '
+                 'analysis_audit ledger is deliberately excluded because the '
+                 'report appends to it and it has its own chain audit'),
+    }
+    return inputs, scope
+
+
+def _report_timestamp():
+    """SOURCE_DATE_EPOCH-aware stamp; invalid epochs fail closed.
+
+    Only an import failure (a source tarball without the full library) falls
+    back to the wall clock.  A malformed SOURCE_DATE_EPOCH is a user error and
+    must not silently produce a non-reproducible report.
+    """
+    try:
+        L = _import_exp_lib()
+    except Exception:
+        return time.strftime('%Y-%m-%dT%H:%M:%S')
+    return L.reproducible_timestamp()
+
+
 def run_report(out='audit_report.json'):
-    res = {'generated_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'source_tree': audit_source_integrity(), 'dependencies': audit_dependencies(), 'data_source': audit_data_source(), 'leakage': audit_leakage(), 'split_discipline': audit_split_discipline(), 'document_unit': audit_document_unit(), 'sample_design': audit_sample_design(), 'data_processing': audit_data_processing(), 'attribution': audit_attribution(), 'boundary': audit_boundary(), 'length': audit_length(), 'fairness': audit_fairness(), 'metrics': audit_metrics(), 'tuning': audit_tuning(), 'simple_baseline': audit_simple_baseline(), 'hypotheses': audit_hypotheses(), 'sesoi': audit_sesoi_declaration(), 'baseline_sesoi': audit_baseline_sesoi(), 'interaction_sesoi': audit_interaction_sesoi(), 'interaction_power': audit_interaction_power(), 'unit_influence': audit_unit_influence(), 'two_level_ci': audit_two_level_ci(), 'variance_components': audit_variance_components(), 'analysis_choices': audit_analysis_choices(), 'analysis_integrity': audit_analysis_integrity(), 'experiment_ledger': audit_experiment_ledger(), 'verdicts': audit_confirmation_verdicts(), 'pvalue_replay': audit_confirmation_pvalues(), 'looks': audit_look_history(), 'methodology': audit_methodology(), 'missingness': audit_missingness(), 'trajectory': audit_trajectory(), 'disposition': audit_run_disposition(), 'joint_correction': audit_joint_correction(), 'single_factor': audit_single_factor(), 'content_controls': audit_content_controls(), 'sink_controls': audit_sink_controls(), 'fusion_controls': audit_fusion_controls(), 'lesion': audit_lesion(), 'endpoint_selection': audit_endpoint_selection(), 'factorial': audit_factorial_design(), 'interaction_coverage': audit_interaction_coverage(verbose=False), 'factorial_anchor': audit_factorial_anchor(verbose=False), 'design_preflight': audit_design_preflight(), 'sensitivity': audit_design_sensitivity(), 'evaluation': audit_evaluation_design(), 'dose_response': audit_dose_response(verbose=False), 'failures': audit_failures(), 'budget': audit_budget(), 'training_health': audit_training_health(), 'efficiency_pairs': audit_efficiency_pairs(), 'error_case_inference': audit_error_case_inference(), 'release': audit_release_readiness(), 'selection': audit_selection(), 'run_order': audit_run_order(), 'run_allocation': audit_run_allocation(), 'evaluation_order': audit_evaluation_order(), 'reproduction': audit_reproduction(), 'calibration': audit_statistical_calibration()}
+    res = {'generated_at': _report_timestamp(), 'source_tree': audit_source_integrity(), 'dependencies': audit_dependencies(), 'data_source': audit_data_source(), 'leakage': audit_leakage(), 'split_discipline': audit_split_discipline(), 'document_unit': audit_document_unit(), 'sample_design': audit_sample_design(), 'data_processing': audit_data_processing(), 'attribution': audit_attribution(), 'boundary': audit_boundary(), 'length': audit_length(), 'fairness': audit_fairness(), 'metrics': audit_metrics(), 'tuning': audit_tuning(), 'simple_baseline': audit_simple_baseline(), 'hypotheses': audit_hypotheses(), 'sesoi': audit_sesoi_declaration(), 'baseline_sesoi': audit_baseline_sesoi(), 'interaction_sesoi': audit_interaction_sesoi(), 'interaction_power': audit_interaction_power(), 'unit_influence': audit_unit_influence(), 'two_level_ci': audit_two_level_ci(), 'variance_components': audit_variance_components(), 'analysis_choices': audit_analysis_choices(), 'analysis_integrity': audit_analysis_integrity(exclude=(os.path.join(REPO, out),)), 'experiment_ledger': audit_experiment_ledger(), 'verdicts': audit_confirmation_verdicts(), 'pvalue_replay': audit_confirmation_pvalues(), 'looks': audit_look_history(), 'methodology': audit_methodology(), 'missingness': audit_missingness(), 'trajectory': audit_trajectory(), 'disposition': audit_run_disposition(), 'joint_correction': audit_joint_correction(), 'single_factor': audit_single_factor(), 'content_controls': audit_content_controls(), 'sink_controls': audit_sink_controls(), 'fusion_controls': audit_fusion_controls(), 'lesion': audit_lesion(), 'endpoint_selection': audit_endpoint_selection(), 'factorial': audit_factorial_design(), 'interaction_coverage': audit_interaction_coverage(verbose=False), 'factorial_anchor': audit_factorial_anchor(verbose=False), 'design_preflight': audit_design_preflight(), 'sensitivity': audit_design_sensitivity(), 'evaluation': audit_evaluation_design(), 'dose_response': audit_dose_response(verbose=False), 'failures': audit_failures(), 'budget': audit_budget(), 'training_health': audit_training_health(), 'efficiency_pairs': audit_efficiency_pairs(), 'error_case_inference': audit_error_case_inference(), 'release': audit_release_readiness(), 'selection': audit_selection(), 'run_order': audit_run_order(), 'run_allocation': audit_run_allocation(), 'evaluation_order': audit_evaluation_order(), 'reproduction': audit_reproduction(), 'calibration': audit_statistical_calibration()}
     L_atomic = None
     try:
         L = _import_exp_lib()
@@ -1759,7 +1902,12 @@ def run_report(out='audit_report.json'):
         # append a ledger entry so an audit artifact regenerated after a code
         # change is distinguishable from the original (the ledger lives under
         # analysis_audit/; the artifact itself stays at the documented path).
-        res = L.stamped_analysis('audit_report', res)
+        # Bind the report to the evidence files it actually read.  Without
+        # this, editing a result/analysis input left the report's own digest
+        # green and made a stale synthesis look current.
+        _inputs, _scope = audit_evidence_inputs()
+        res['audit_inputs'] = _scope
+        res = L.stamped_analysis('audit_report', res, inputs=_inputs)
         L.atomic_write_json(os.path.join(REPO, out), res, indent=2)
         L.log_experiment_event('analysis_audit', {'kind': 'analysis', 'tracking_schema': 2, 'artifact': out, 'created_at': res.get('created_at'), 'code': res.get('code'), 'label': 'audit_report', 'status': 'ok', 'audits': sorted(k for k in res if k not in ('kind', 'created_at', 'code', 'provenance', 'generated_at'))})
         print(f'[audit] wrote {out}')

@@ -7,7 +7,7 @@ PYTHON ?= python
 BUILD_DIR := .build
 INSTALL_DIR := $(BUILD_DIR)/install-check
 
-.PHONY: help test plan audit integrity reproduce install-check build clean
+.PHONY: help test plan audit integrity reproduce report-diff install-check build clean
 
 help:
 	@echo "make test          # CPU unit/reproducibility suite (zero GPU)"
@@ -15,6 +15,7 @@ help:
 	@echo "make audit         # local audit gates -> audit_report.json"
 	@echo "make integrity     # verify stamped analysis bodies/inputs (zero GPU)"
 	@echo "make reproduce A=<dir> B=<dir>  # compare two independent runs (zero GPU)"
+	@echo "make report-diff A=<json> B=<json>  # compare two stamped reports (zero GPU)"
 	@echo "make install-check # verify the project builds/installs as a wheel"
 	@echo "make build         # sdist + wheel via python -m build"
 	@echo "make clean         # remove packaging scratch space"
@@ -36,6 +37,12 @@ reproduce:
 		echo "usage: make reproduce A=<original result dir> B=<rerun result dir>"; \
 		exit 2; }
 	$(PYTHON) -m explib.reproduce compare "$(A)" "$(B)"
+
+report-diff:
+	@test -n "$(A)" -a -n "$(B)" || { \
+		echo "usage: make report-diff A=<old report.json> B=<rebuilt report.json>"; \
+		exit 2; }
+	$(PYTHON) -m explib.reproduce report "$(A)" "$(B)" --ignore-ledger
 
 install-check:
 	rm -rf "$(INSTALL_DIR)"
