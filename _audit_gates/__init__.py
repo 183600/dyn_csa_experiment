@@ -27,6 +27,7 @@ _PARTS = [
 'part_10_audit_disposition.py',
 'part_11_audit_test_access.py',
 'part_12_audit_arm_ranking.py',
+'part_13_audit_arm_rank_units.py',
 ]
 
 _load_parts(globals(), _HERE, _PARTS)

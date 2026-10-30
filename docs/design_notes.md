@@ -8491,3 +8491,151 @@ make audit
 `not_applicable`；`run_report`/CLI/报告/`finaltest_stats` 接线；合成六 seed 三臂面板的
 端到端落盘 → 审计 `ok`；以及用合成 stats 渲染 `REPORT_v12` 的排序表
 （表头、行与「不是各臂等效」caveat）。完整 CPU 套件在本轮最终树通过。
+
+## 103. 排序的另一个抽样轴：评测单元重采样下的固定臂排序（本轮结果分析硬化）
+
+零 GPU 的结果分析硬化；不新增训练、不读取 test split、不修改
+`confirmation_frozen*.json` 的字节/种子/端点/α/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未触碰。
+
+### 103.1 问题：种子 bootstrap 回答不了「换一批评测文档会怎样」
+
+§102 把「哪个臂最好」从逐对 Holm 里单独拿出来，用**配对种子 bootstrap**
+给出 `P(best)`、排名区间与前二差距；但它只重采样观测到的种子，并明确写出
+「不重采样评测单元」。这不是一个小遗漏：真实报告的排序同时条件在
+
+- 12 个训练种子，和
+- 冻结的 48 个评测单元（文章或行级 document）上。
+
+如果若干长文档占了大部分 token，token 池化端点会把很大的权重放在这些
+文档上；一个在 47 个短文档上略差的臂，可能靠 1 个长文档赢下观测最优。
+这正是「换一批文档后排序是否还成立」的问题。现有的 cluster / two-level
+bootstrap（§54/§81）给的是**均值差**的区间，`unit_influence` 给的是
+**单文档删除**对均值差的影响，`variance_components`（§89）拆的是
+seed × unit 的方差——它们都没有给**排序**的 P(best) 或「赢家是否依赖
+这批评测单元」。
+
+### 103.2 方法：同一固定臂集合上的两轴配对 bootstrap
+
+新增 `exp_lib.ARM_RANK_UNIT_POLICY` 与
+`exp_lib.arm_rank_unit_sensitivity()`，输入是
+`{arm: {seed: {'nll': [...], 'tokens': [...]}}}`（也接受 `ppl` 代替
+`nll`）。每个臂每个种子的观测端点是：
+
+```
+per-seed PPL = exp( sum_unit NLL / sum_unit tokens )
+arm value    = mean_seed( per-seed PPL )
+```
+
+这与 §102 的排序估计量一致；逐单元矩阵必须能重建 `finaltest_stats`
+记录的逐种子 PPL，否则拒绝（`endpoint_values_match` 会写 `checked`，
+不重建则明确 `not_checked`）。然后：
+
+- **seed-only**：与 §102 相同的配对种子下标重采样（所有臂共用一组
+  seed 下标），作为同一端点上的交叉核对；它不替代 §102 的正式读数。
+- **unit-only**：对评测单元做有放回重采样，**所有臂、所有种子共用同一组
+  unit 下标**。这样跨臂的配对和跨种子的配对都被保留；若每个臂各自抽
+  unit，差值的方差会被错误地放大。
+- **two-way**：每个 replicate 同时抽一组 seed 下标和一组 unit 下标；
+  两轴联合的排序不确定性。
+- 每条轴报告 `p_best`/`p_top2`/`mean_rank`/`rank_ci95`/`rank_sd`/
+  `p_unique_winner`/`p_best_observed_winner`/`top2_gap_*`；其中
+  `p_unique_winner` 是「该 replicate 只有一个 rank-1 臂」的频率，
+  用来区分「赢家稳定」与「多个臂并列第一」。
+- **状态带**（声明阈值，不是检验）：
+  - `stable`：观测赢家在 seed-only、unit-only、two-way 三条轴上都达到
+    声明 band（seed 0.60、unit/two-way 0.90），且都是该轴的
+    `p_best_argmax`；
+  - `seed_sensitive`：只有 seed 轴失败；
+  - `unit_sensitive`：seed 轴通过，但 unit-only 或 two-way 失败；
+  - `both_sensitive`：seed 轴和 unit/two-way 同时失败；
+  - `undifferentiated`：观测 top 值由多个臂共享，或没有任何臂在
+    unit-only 达到 `lead_level`（0.60）；
+  - `not_estimable`：少于 2 个臂、共有种子 < `min_seeds`（默认 5）、
+    单元 < `min_units`（默认 8），或逐单元矩阵无法对齐/重建端点。
+- **前二差距的方差分解**：报告 top-two gap 的
+  `gap_sd_seed`/`gap_sd_unit`/`gap_sd_two_way` 与 seed/unit 方差占比，
+  并给出 `dominant_axis`（seed / unit / balanced）。两轴在 two-way 中
+  并不独立，所以占比是描述性读数，不是 ANOVA 分解。
+- **数值稳定**：所有排序在 `logp - max(logp)` 的共同平移尺度上计算；
+  即使原始 PPL 超出 float64 的指数范围，排名仍可计算。原单位均值和
+  gap 只有在可表示时才输出，否则明确 `None`，不写 `inf`/`NaN`。
+  固定 `n_boot=2000`、bootstrap seed `20261018` 可重放；`p_best` 的
+  分辨率写成 `1/n_boot`。
+
+### 103.3 边界：这是排序敏感性，不是第二个确认性检验
+
+- **没有新 p 值、没有 FWER 控制、没有 Holm 成员。** `P(best)` 是
+  bootstrap 频率，不是后验概率或精确抽样概率；百分位区间在 12 seeds ×
+  10–48 units 上可能偏窄。它不改变 `p_exact_signflip`、`p_holm`、
+  `verified` 或冻结 `confirmed`。
+- **重采样的是观测单元，不是从语言总体抽样。** 48 个单元仍低于仓库的
+  64-unit 总体门槛时，`population_claim_allowed` 为 false，报告必须把
+  读数限定在冻结切片；这与 §54/§81 的 cluster 口径一致。
+- **单元粒度必须明示。** 优先用 article（独立语料单元）；只有全部记录都
+  有 article 单元时才用，否则退回行级 document。行级 document 是
+  WikiText 的一行，同一文章的多行会伪重复；报告写 `unit_granularity`，
+  不静默把行级读数冒充成文章级。
+- **只重采样单元/种子，不重采样 token。** token 级重采样会破坏文档内
+  相关；本读数保持文档整体。
+- **排序集合是固定的、非随机化的，臂的容量/配方/计算量不同。** 这是
+  「这些已训练配置在这个端点、这批评测单元上的排序」，不是架构因果排序；
+  高 `P(best)` 不能替代独立复现。
+- **`stable` 不是「各臂等效」。** 它只表示观测赢家在当前面板上没有因
+  种子或单元重采样而失去领先；等效性仍要预注册 SESOI/TOST（§56/§67）。
+- **两轴不能当作独立方差分量。** two-way 的 `gap_sd` 同时包含两轴，
+  seed/unit 占比只用于提示「哪一轴更值得扩」，不是精确的方差分析。
+- **不适用于混合端点/混合单元的排名。** `finaltest_stats` 只在冻结主比较
+  共享一个端点且逐单元矩阵可对齐时计算；否则 `not_estimable` 并说明原因，
+  不把不同长度/单元混成一张排序表。
+
+### 103.4 落盘、报告与审计
+
+- `explib.confirmation.finaltest_stats` 在 §102 的 `arm_ranking` 之后，
+  从准入的 `(arm, seed)` 记录重建端点长度的逐单元 NLL/token 矩阵，写入
+  `stats['arm_rank_units']`（含 `per_arm_seed_nll`、`per_unit_tokens`、
+  `unit_ids`、三条轴、`gap_decomposition` 与 `unit_granularity`）。
+  端点值必须与 `by_length` 的逐种子 PPL 一致；不一致时明确
+  `not_estimable`，不换一个估计量继续算。
+- `build_report` 在「冻结臂的排序分辨率」之后新增「排序的评测单元敏感性」
+  表：逐臂三条轴的 `P(best)`、unit-only rank CI、观测赢家、前二差距的
+  unit 区间、三种 gap SD 与主导轴、单元数与粒度、总体主张门槛。
+  `not_estimable` 只打印原因，不渲染假表。
+- `audit_gates.py arm_rank_units`（别名 `ranking_units` / `unit_ranking`）
+  读取 `analysis_v12/test_stats.json` 的 `arm_rank_units`，用块内
+  `per_arm_seed_nll`/`per_unit_tokens`/`unit_ids`/`n_boot`/`bootstrap_seed`/
+  `better`/bands/`min_*`/`tie_tol` **独立重放**三条轴、gap 分解与
+  `observed_*`，逐字段比对；任何不一致判 `fail`。它还检查：
+  `p_best` 和为 1、rank CI 在 `1..K`、`stable` 必须三轴都达到 band 且
+  argmax 是观测赢家、`status` 属于声明集合；拒绝 `confirmed`/`p_holm`/
+  `verified`/verdict 等确认性字段。缺块（legacy artifact）判
+  `not_verifiable_locally`；无原始矩阵的合法 `not_estimable` 判
+  `not_applicable`；有原始矩阵的 `not_estimable` 仍重放并判 `ok`。该门
+  并入 `audit_gates.py report` 的顶层 `arm_rank_units`，`make audit`
+  因此在真实篡改/不一致时非零退出。它是**内部重放**：能发现改了派生
+  读数却没同步改原始矩阵，但不能证明矩阵就是原始 test 切片上的测量；
+  后者由 stamped 输入绑定、冻结锁与 `analysis_integrity` 负责。
+
+### 103.5 入口与验证
+
+```bash
+python -m pytest -q test_review_part_43.py
+python audit_gates.py arm_rank_units              # 重放 analysis_v12/test_stats.json
+python audit_gates.py ranking_units               # 别名
+python audit_gates.py report                      # 顶层汇总含 arm_rank_units
+make audit
+```
+
+`test_review_part_43.py` 14 项覆盖：策略/状态声明；清晰分离→`stable`、
+三轴 P(best)≈1、rank CI [1,1]、严格 JSON、同 seed 可重放；`better='max'`
+方向；seed 交集与 `dropped_seeds` 具名报告；单元主导面板
+→seed-only P(best)≈1 而 unit-only 明显下降、`unit_sensitive`、gap 分解
+主导轴为 unit；端点交叉核对拒绝错误估计量并接受一致矩阵；逐种子 PPL 的**算术均值**
+排序（几何均值会选错赢家）被单独锁定；13 类非法载荷 + 7 类非法参数
+fail-closed；ragged 单元、token 数不一致、unit id 顺序/部分
+缺失、种子/单元不足的拒绝；`1e300` token 级有限值不产生 NaN/inf；
+审计对合法块 `ok`、篡改 `p_best`/夹带 `confirmed` 判 `fail`、缺块
+`not_verifiable_locally`、bare `not_estimable` `not_applicable`；
+`run_report`/CLI 接线；合成六 seed 三臂逐单元面板的端到端落盘 → 审计
+`ok`；以及 `REPORT_v12` 渲染「排序的评测单元敏感性」表与边界段。
+完整 CPU 套件在本轮最终树通过。

@@ -4530,3 +4530,58 @@ fail-closed/审计重放与 `p_best`、rank CI、确认性字段篡改/缺块与
 bare `not_estimable`/CLI、report、`finaltest_stats`、报告接线/合成三臂
 六 seed 端到端落盘审计，以及合成 stats 的 `REPORT_v12` 排序表渲染。
 完整 CPU 套件在本轮最终树通过（916 passed, 3 skipped）。
+
+## 2026-10-30 — 排序的另一个抽样轴：评测单元重采样下的固定臂排序（本轮结果分析硬化，no new runs）
+
+零 GPU 的结果分析硬化；不新增训练、不读取 test split、不修改
+`confirmation_frozen*.json` 的字节/种子/端点/α/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未触碰。
+
+**Problem.** §102 的排序分辨率只重采样观测到的种子，并在边界里明确写出
+「不重采样评测文档」。但报告里的「哪个臂最好」同时条件在 12 个训练种子和
+冻结的 48 个评测单元上；若干长文档占掉大部分 token 时，token 池化端点会
+把很大权重放在这些文档上，一个在多数短文档上略差的臂可能靠 1 个长文档
+赢下观测最优。已有读数各自回答别的问题——cluster/two-level bootstrap 是
+均值差的区间，`unit_influence` 是删一个单元对均值差的影响，
+`variance_components` 拆的是 seed × unit 的方差——没有一个给出「换一批
+评测文档后排序/赢家是否改变」。这正是固定臂排序缺失的第二个抽样轴。
+
+**Fix.** 新增 `exp_lib.ARM_RANK_UNIT_POLICY` /
+`arm_rank_unit_sensitivity`：输入逐臂、逐种子、逐单元 NLL/token 矩阵，按
+`exp(sum NLL/sum tokens)` 重建与 §102 同口径的逐种子 token 池化 PPL，再对
+种子算术均值排序。三条配对轴：seed-only（与 §102 相同，共用 seed 下标）、
+unit-only（所有臂/种子共用同一组 unit 下标）、two-way（两轴同时重采样）。
+每条轴输出 `p_best`/`p_top2`/`mean_rank`/`rank_ci95`/`rank_sd`/
+`p_unique_winner`/`p_best_observed_winner`/`top2_gap_*`；并报告 top-two gap
+的 seed/unit/two-way SD 与方差占比、`dominant_axis`。状态带为 `stable` /
+`seed_sensitive` / `unit_sensitive` / `both_sensitive` / `undifferentiated` /
+`not_estimable`：seed 轴 0.60，unit/two-way 0.90，`lead_level` 0.60；
+`stable` 要求观测赢家在三轴都达到 band 且都是该轴 argmax。逐单元矩阵必须
+重建 `finaltest_stats` 的逐种子 PPL，否则拒绝（`endpoint_values_match`）；
+优先 article 单元，全部记录都有才用，否则退回行级 document 并在报告中
+明示；`n_units<64` 时 `population_claim_allowed=false`。固定
+`n_boot=2000`/seed `20261018` 可重放；排序在 `logp-max(logp)` 尺度上算，
+`1e300` 级 token 也不产生 inf/NaN。
+
+**Boundary.** 不是新的显著性检验：没有新 p 值/区间/Holm 成员，不做 FWER
+控制，不改变 exact sign-flip p、Holm、`verified` 或冻结 `confirmed`。
+`p_best` 是 bootstrap 频率，不是后验/精确抽样概率；重采样的是观测单元，
+不是语言总体样本，48 单元仍低于 64-unit 总体门槛。行级 document 是
+WikiText 一行，同一文章多行会伪重复；必须报告 `unit_granularity`，不能把
+行级读数冒充文章级。两轴在 two-way 中不独立，gap 方差占比是描述性读数，
+不是 ANOVA。臂集合固定且容量/配方/计算量不同，排序不是架构因果排序；
+高 `P(best)` 不替代独立复现；`stable` 不是各臂等效。只在冻结主比较共享
+一个端点且逐单元矩阵可对齐时计算，否则 `not_estimable`，不混合端点/单元。
+
+**Verification.** 新增 `test_review_part_43.py` 14 项：策略/状态声明；
+清晰分离→`stable`、三轴 P(best)≈1、rank CI [1,1]、严格 JSON、同 seed 可
+重放；`better='max'` 方向；seed 交集与 `dropped_seeds` 具名报告；单元主导面板→seed-only P(best)≈1 但 unit-only 明显下降、
+`unit_sensitive`、gap 分解主导轴为 unit；端点交叉核对拒绝错误估计量并
+接受一致矩阵；逐种子 PPL 的**算术均值**排序（几何均值会选错赢家）被
+单独锁定；13 类非法载荷 + 7 类非法参数 fail-closed；ragged 单元、token 数不一致、
+unit id 顺序/部分缺失、种子/单元不足的拒绝；`1e300` token 级有限值不产生
+NaN/inf；审计对合法块 `ok`、篡改 `p_best`/夹带 `confirmed` 判 `fail`、
+缺块 `not_verifiable_locally`、bare `not_estimable` `not_applicable`；
+`run_report`/CLI 接线；合成六 seed 三臂逐单元面板的端到端落盘 → 审计
+`ok`；以及 `REPORT_v12` 渲染「排序的评测单元敏感性」表与边界段。完整
+CPU 套件在本轮最终树通过。

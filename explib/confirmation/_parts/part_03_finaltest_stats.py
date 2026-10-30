@@ -178,6 +178,52 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
             stats['arm_ranking']['endpoint'] = f'by_len.ppl@{_rank_len}'
             stats['arm_ranking']['upstream'] = ('finaltest_stats: frozen '
                                                 'by_len cells, one common endpoint')
+            # The section-102 ranking resamples seeds only.  Report the other
+            # sampling axis of the same ranking: the frozen evaluation units.
+            # The matrices are the per-unit decomposition of the SAME
+            # token-pooled PPL cells; the cross-check in the helper refuses a
+            # matrix that does not reproduce those cells.
+            _ru_seeds = sorted(set.intersection(
+                *[set(v) for v in _rank_cells.values()])) if _rank_cells else []
+            try:
+                _ru_payload, _ru_ids, _ru_why, _ru_gran = _rank_unit_payload(
+                    admitted, _rank_arms, _ru_seeds, int(_rank_len))
+            except Exception as _rue:
+                _ru_payload, _ru_ids, _ru_why, _ru_gran = (
+                    None, None, f'{type(_rue).__name__}: {_rue}', None)
+            if _ru_payload is None:
+                stats['arm_rank_units'] = {
+                    'kind': 'arm_rank_unit_sensitivity',
+                    'status': 'not_estimable',
+                    'reason': _ru_why or 'no usable per-unit cells',
+                    'endpoint': f'by_len.ppl@{_rank_len}',
+                }
+            else:
+                try:
+                    _ru = L.arm_rank_unit_sensitivity(
+                        _ru_payload, better='min', n_boot=2000, seed=20261018,
+                        min_seeds=5, min_units=8, unit_ids=_ru_ids,
+                        per_arm_seed_values=_rank_cells,
+                        unit_granularity=_ru_gran)
+                    _ru['endpoint'] = f'by_len.ppl@{_rank_len}'
+                    _ru['upstream'] = ('finaltest_stats: frozen by_len cells; '
+                                       'per-unit NLL/token matrices')
+                    stats['arm_rank_units'] = _ru
+                except Exception as _rue:
+                    stats['arm_rank_units'] = {
+                        'kind': 'arm_rank_unit_sensitivity',
+                        'status': 'not_estimable',
+                        'reason': (f'{type(_rue).__name__}: {_rue}'),
+                        'endpoint': f'by_len.ppl@{_rank_len}',
+                    }
+
+    if 'arm_rank_units' not in stats:
+        stats['arm_rank_units'] = {
+            'kind': 'arm_rank_unit_sensitivity',
+            'status': 'not_estimable',
+            'reason': ('the cross-arm ranking is not estimable, so its '
+                       'evaluation-unit sensitivity is not defined'),
+        }
 
     for comp in manifest['primary_comparisons']:
         name = comp['name']
@@ -604,6 +650,119 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
         name=os.path.basename(out), inputs=_analysis_inputs)
     print(f'[p5t stats] wrote {out}')
     return stats
+
+def _rank_unit_payload(admitted, arms, seeds, Ln):
+    """Build per-unit NLL/token matrices for the ranking-unit bootstrap.
+
+    The section-102 ranking is computed from the per-seed token-pooled PPL
+    cells.  The unit-sensitivity readout needs the same endpoint decomposed
+    over the frozen evaluation units.  Article cells are preferred when every
+    arm/seed record carries them (the independent corpus unit); otherwise the
+    line-level document cells are used, and the caller reports that unit.
+    A missing/ragged token vector, inconsistent unit order or a record that
+    does not reproduce a finite positive PPL refuses the readout rather than
+    silently mixing units.
+    """
+    def _try(gran):
+        ppl_key = 'ppl_per_article' if gran == 'article' else 'ppl_per_doc'
+        tok_key = 'n_tokens_per_article' if gran == 'article' else 'n_tokens_per_doc'
+        nll_key = 'nll_per_article' if gran == 'article' else 'nll_per_doc'
+        id_key = 'article_ids' if gran == 'article' else 'doc_ids'
+        payload = {}
+        ref_tok = None
+        ref_ids = None
+        ids_seen = 0
+        for arm in arms:
+            payload[arm] = {}
+            for sd in seeds:
+                rec = admitted.get((arm, sd))
+                if rec is None:
+                    return None, None, f'no admitted record for {arm!r}/seed {sd}'
+                cell = _by_len_cell(rec, Ln)
+                if cell is None:
+                    return None, None, f'{arm!r}/seed {sd} has no L{int(Ln)} cell'
+                if cell.get('truncated') is not False:
+                    return None, None, (f'{arm!r}/seed {sd} is truncated/undetermined at L{int(Ln)}')
+                ppl = cell.get(ppl_key)
+                tok = cell.get(tok_key)
+                if (not isinstance(ppl, list) or not isinstance(tok, list)
+                        or not ppl or len(ppl) != len(tok)):
+                    return None, None, (f'{arm!r}/seed {sd} lacks aligned {ppl_key}/{tok_key}')
+                nll = cell.get(nll_key)
+                has_nll = isinstance(nll, list) and len(nll) == len(ppl)
+                vals_nll = []
+                vals_tok = []
+                for _i, (p, t) in enumerate(zip(ppl, tok)):
+                    if (isinstance(p, (bool, np.bool_))
+                            or isinstance(t, (bool, np.bool_))):
+                        return None, None, f'{arm!r}/seed {sd} has a boolean per-unit value'
+                    try:
+                        pf, tf = float(p), float(t)
+                    except (TypeError, ValueError, OverflowError):
+                        return None, None, f'{arm!r}/seed {sd} has a non-numeric per-unit value'
+                    if not (math.isfinite(pf) and pf > 0.0
+                            and math.isfinite(tf) and tf > 0.0):
+                        return None, None, (f'{arm!r}/seed {sd} has a non-positive/'
+                                            'non-finite per-unit PPL or token count')
+                    vals_tok.append(tf)
+                    if has_nll:
+                        x = nll[_i]
+                        if isinstance(x, (bool, np.bool_)):
+                            return None, None, f'{arm!r}/seed {sd} has a boolean per-unit NLL'
+                        try:
+                            xf = float(x)
+                        except (TypeError, ValueError, OverflowError):
+                            return None, None, f'{arm!r}/seed {sd} has a non-numeric per-unit NLL'
+                        if not math.isfinite(xf):
+                            return None, None, f'{arm!r}/seed {sd} has a non-finite per-unit NLL'
+                        # The per-unit NLL and PPL must describe the same
+                        # measurement: a vector that keeps the total NLL but
+                        # moves it between units would leave the endpoint
+                        # unchanged and still change the unit bootstrap.
+                        _want_ppl = L._safe_exp_ppl(xf / tf)
+                        if (_want_ppl is None or not math.isfinite(_want_ppl)
+                                or abs(_want_ppl - pf) > 1e-6 * max(1.0, abs(pf))):
+                            return None, None, (
+                                f'{arm!r}/seed {sd} has a per-unit NLL that '
+                                'does not reproduce its per-unit PPL')
+                        vals_nll.append(xf)
+                    else:
+                        nll_v = math.log(pf) * tf
+                        if not math.isfinite(nll_v):
+                            return None, None, (f'{arm!r}/seed {sd} per-unit PPL/token '
+                                                'product is not representable')
+                        vals_nll.append(nll_v)
+                if ref_tok is None:
+                    ref_tok = list(vals_tok)
+                elif vals_tok != ref_tok:
+                    return None, None, (
+                        'per-unit token counts differ across arms/seeds; the '
+                        'units are not the same weighted denominator')
+                ids = cell.get(id_key)
+                if isinstance(ids, list) and len(ids) == len(ppl):
+                    ids = [str(x) for x in ids]
+                    ids_seen += 1
+                    if ref_ids is None:
+                        ref_ids = list(ids)
+                    elif ids != ref_ids:
+                        return None, None, (
+                            'per-unit ids differ across arms/seeds; the units '
+                            'cannot be paired by position')
+                payload[arm][sd] = {'nll': vals_nll, 'tokens': vals_tok}
+        if ids_seen and ids_seen != len(arms) * len(seeds):
+            return None, None, (
+                'per-unit ids are present for only some arms/seeds; the unit '
+                'identity cannot be verified across the whole panel')
+        return payload, (list(ref_ids) if ids_seen else None), None
+
+    reasons = []
+    for gran in ('article', 'document'):
+        payload, ids, why = _try(gran)
+        if payload is not None:
+            return payload, ids, None, gran
+        reasons.append(f'{gran}: {why}')
+    return None, None, '; '.join(reasons), None
+
 
 def _by_len_cell(rec, Ln):
     """The by-length cell for one record/length, else None."""
@@ -1197,6 +1356,70 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
               '表内 `endpoint mean` 是逐种子 PPL 的算术均值（与配对 sign-flip '
               '同口径）；上方 by-length 表的 PPL 是 token 池化值，两者可能在'
               '小数位不同，不能混读。')
+            A('')
+
+    _ru = ft.get('arm_rank_units')
+    if isinstance(_ru, dict):
+        A('#### 排序的评测单元敏感性（探索性）')
+        A('')
+        if _ru.get('status') == 'not_estimable':
+            A(f'- 不可估计：{_ru.get("reason", "insufficient per-unit data")}')
+            A('')
+        else:
+            _ru_arms = _ru.get('arms') or []
+            _su = _ru.get('seed_only') or {}
+            _uu = _ru.get('unit_only') or {}
+            _tu = _ru.get('two_way') or {}
+            _supb = _su.get('p_best') or {}
+            _uupb = _uu.get('p_best') or {}
+            _tupb = _tu.get('p_best') or {}
+            _uuci = _uu.get('rank_ci95') or {}
+            _uugap = _uu.get('top2_gap_ci95') or [None, None]
+            A('| 臂 | P(best) seed-only | P(best) unit-only | P(best) two-way | unit-only rank 95% CI |')
+            A('|---|---|---|---|---|')
+            for _a in _ru_arms:
+                _ci = _uuci.get(_a) or ['—', '—']
+                def _p(obj, key):
+                    _v = obj.get(key)
+                    return f'{float(_v):.3f}' if isinstance(_v, (int, float)) else '—'
+                A(f'| `{_a}` | {_p(_supb, _a)} | {_p(_uupb, _a)} | '
+                  f'{_p(_tupb, _a)} | [{_ci[0]}, {_ci[1]}] |')
+            A('')
+            _rgap = _ru.get('gap_decomposition') or {}
+            _rg_txt = (f'seed {float(_rgap.get("gap_sd_seed")):.4g} / '
+                       f'unit {float(_rgap.get("gap_sd_unit")):.4g} / '
+                       f'two-way {float(_rgap.get("gap_sd_two_way")):.4g}'
+                       if all(isinstance(_rgap.get(k), (int, float))
+                              for k in ('gap_sd_seed', 'gap_sd_unit', 'gap_sd_two_way'))
+                       else '—')
+            _ug_txt = (f'[{float(_uugap[0]):.4g}, {float(_uugap[1]):.4g}]'
+                       if len(_uugap) >= 2
+                       and isinstance(_uugap[0], (int, float))
+                       and isinstance(_uugap[1], (int, float)) else '—')
+            A(f'- 观测最优：`{_ru.get("observed_winner", "?")}`；'
+              f'前二差距在 unit-only 的 95% 区间 {_ug_txt}'
+              f'（单位：{_uu.get("top2_gap_units") or "—"}）。')
+            A(f'- 状态：`{_ru.get("status")}` — {_ru.get("status_reason", "")}')
+            A(f'- 评测单元：{_ru.get("n_units")} 个（{_ru.get("unit_granularity") or _ru.get("unit_estimand") or "—"}）；'
+              f'n_seeds={_ru.get("n_seeds")}，n_boot={_ru.get("n_boot")}，'
+              f'分辨率 {float(_ru.get("p_best_resolution", float("nan"))):.5f}。')
+            A(f'- 前二差距的标准差分解（{_rgap.get("units", "—")}）：{_rg_txt}；'
+              f'主导轴 `{_rgap.get("dominant_axis", "—")}`'
+              f'（seed share {_rgap.get("seed_variance_share")}，'
+              f'unit share {_rgap.get("unit_variance_share")}）。')
+            if _ru.get('population_note'):
+                A(f'- {_ru.get("population_note")}')
+            A('')
+            A('> 边界：此表把 §102 的排序分辨率从**种子轴**扩展到**评测单元轴**：'
+              'unit-only 重采样观测到的评测单元（文章/文档）并保持跨臂、跨种子'
+              '共享同一组下标；two-way 同时重采样两轴。它仍是探索性读数，'
+              '不是新的显著性检验，不进入 Holm 族、不做 FWER 控制、不改变'
+              '`p_exact_signflip`、`p_holm`、`verified` 或冻结 `confirmed`。'
+              '`P(best)` 是 bootstrap 频率，不是后验/精确抽样概率；'
+              '评测单元数低于 64 时只描述冻结切片，不支持总体主张；'
+              '行级文档不是独立文章，可能把同一文章拆成多行而伪重复。'
+              '观测最优仍是在同一批数据上选出的，高 `P(best)` 不能替代'
+              '独立复现。')
             A('')
 
     comps = ft.get('comparisons') or {}

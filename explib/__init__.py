@@ -65,6 +65,7 @@ _PARTS = [
 'part_46_reproducibility.py',
 'part_47_test_access.py',
 'part_48_arm_rank_inference.py',
+'part_49_arm_rank_units.py',
 ]
 
 _load_parts(globals(), _HERE, _PARTS)
