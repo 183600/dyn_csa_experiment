@@ -133,6 +133,12 @@
                操作检查不进 pass，缺产物报 not_verifiable（零 GPU，
                不重训、不读 test split）；别名 inference_lesion /
                lesion_panel / component_lesion
+  endpoint_selection  端点来源：逐记录核验引用的是固定最终步、验证集最佳步、
+               早停步还是截断步；跨臂规则不一致/同臂内混规则/选点与评测同一
+               split/checkpoint 步不符判 fail，数据依赖选点但独立 split 已声明
+               只 warn；它不产生 p 值、不改 Holm/verified/冻结判定（零 GPU；
+               别名 endpoint / checkpoint / checkpoint_selection；可传面板目录
+               或 summary.json）
   design       设计前馈：token/参数/读取预算台账、专用对照臂、证据等级
                 （v6-v11 永远 exploratory；draft 不能 confirmatory）与动态
                 分块 H1-H5 假设/对照（零 GPU，不读 test）

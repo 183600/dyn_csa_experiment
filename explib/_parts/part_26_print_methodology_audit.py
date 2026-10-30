@@ -122,6 +122,25 @@ def _print_methodology_audit(report):
         if _ts.get('primary_history_disagreement_contrasts'):
             print('      HISTORY/PRIMARY SIGN DISAGREEMENT: ' + ', '.join(
                 _ts['primary_history_disagreement_contrasts'][:5]))
+    _ep = report.get('endpoint_selection') or {}
+    _ep_comps = _ep.get('comparisons') or {}
+    if _ep_comps:
+        print('  --- endpoint selection provenance (which checkpoint/step is '
+              'quoted; no p-value) ---')
+        print('      status=%s; rule counts=%s; final/best/early/truncated '
+              'mixing is a comparability failure, not a metric choice'
+              % (_ep.get('status'),
+                 (_ep.get('counts') or {}).get('rule_counts')))
+        for _name, _c in list(_ep_comps.items())[:12]:
+            if not isinstance(_c, dict) or _c.get('status') == 'ok':
+                continue
+            print('      %-42s %-10s rule=%s selection-split=%s eval-split=%s'
+                  % (_name, _c.get('status'), _c.get('rule'),
+                     _c.get('selection_split'), _c.get('eval_split')))
+            for _v in (_c.get('violations') or [])[:2]:
+                print('        VIOLATION: ' + str(_v))
+            for _w in (_c.get('warnings') or [])[:2]:
+                print('        warning: ' + str(_w))
     for comp, entries in report['components'].items():
         live = [e for e in entries if e['n_shared'] > 0]
         if not live:

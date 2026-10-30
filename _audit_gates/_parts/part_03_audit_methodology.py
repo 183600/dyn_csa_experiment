@@ -514,6 +514,126 @@ def audit_lesion(path=None, *, verbose=True):
     return out
 
 
+def audit_endpoint_selection(path=None, *, require_preregistered=False, verbose=True):
+    """Endpoint/checkpoint-selection provenance audit (zero GPU).
+
+    A run's ``ppl`` can be the final step, the best validation step, or an
+    early-stopped step.  These are different estimands.  This gate reads the
+    recorded step fields (``steps``/``steps_completed``/``reported_step``/
+    ``early_stop``/``curve_health``/``checkpoint``) and replays
+    :func:`exp_lib.endpoint_selection_audit` over each panel's
+    ``summary.json``.  It fails a comparison whose arms use different rules or
+    whose selected step disagrees with the reported step, and warns when a
+    data-dependent selection is not tied to an independent split.
+
+    ``path`` may be a panel directory, a ``summary.json`` file, or None (scan
+    ``results_*``).  A manifest in the same directory is used for optional
+    ``endpoint_policy`` declarations.  Missing artifacts return
+    ``not_verifiable_locally``; they never fabricate a clean final-step panel.
+    No training, test-split read, p-value or frozen decision is involved.
+    """
+    L = _import_exp_lib()
+    if not isinstance(require_preregistered, (bool, np.bool_)):
+        raise ValueError(
+            f'require_preregistered must be a boolean, got '
+            f'{require_preregistered!r}')
+    require_preregistered = bool(require_preregistered)
+    candidates = []
+    if path:
+        if os.path.isdir(path):
+            candidate = os.path.join(path, 'summary.json')
+            if os.path.isfile(candidate):
+                candidates.append(candidate)
+        elif os.path.isfile(path):
+            candidates.append(path)
+    else:
+        try:
+            for name in sorted(os.listdir(REPO)):
+                if not (name.startswith('results_') or name.startswith('analysis_')):
+                    continue
+                candidate = os.path.join(REPO, name, 'summary.json')
+                if os.path.isfile(candidate):
+                    candidates.append(candidate)
+        except OSError:
+            candidates = []
+    panels = {}
+    problems = []
+    warnings = []
+    for candidate in candidates:
+        label = os.path.relpath(candidate, REPO)
+        try:
+            with open(candidate, encoding='utf-8') as f:
+                summary = json.load(f)
+        except Exception as exc:
+            problems.append(
+                f'{label}: cannot read summary ({type(exc).__name__}: {exc})')
+            continue
+        manifest = None
+        manifest_path = os.path.join(os.path.dirname(candidate),
+                                     'run_manifest.json')
+        if os.path.isfile(manifest_path):
+            try:
+                with open(manifest_path, encoding='utf-8') as f:
+                    manifest = json.load(f)
+            except Exception as exc:
+                warnings.append(
+                    f'{label}: run_manifest.json is unreadable '
+                    f'({type(exc).__name__}: {exc}); endpoint policy is '
+                    'unverified')
+        # summary keys are `arm::seedN` / `arm::tag::seedN`, not records
+        # that carry an explicit arm/seed.  Rebuild that identity from the
+        # same readers the rest of the audit uses instead of treating the
+        # summary mapping as a list of already-normalised records.
+        endpoint_records = []
+        legacy_ok = L.legacy_warm_tags(summary) if isinstance(summary, dict) else {}
+        if isinstance(summary, dict):
+            for key, raw in summary.items():
+                if not isinstance(raw, dict):
+                    continue
+                rec = dict(raw)
+                if rec.get('variant') is None:
+                    rec['variant'] = str(key).split('::', 1)[0]
+                rec['arm'] = rec.get('arm') or rec.get('variant')
+                rec['tag'] = L.record_tag(rec, key, legacy_ok) or ''
+                rec['seed'] = rec.get('seed', None)
+                endpoint_records.append(rec)
+        try:
+            rep = L.endpoint_selection_audit(
+                endpoint_records, manifest=manifest,
+                require_preregistered=require_preregistered)
+        except Exception as exc:
+            problems.append(
+                f'{label}: endpoint_selection_audit failed '
+                f'({type(exc).__name__}: {exc})')
+            continue
+        panels[label] = rep
+        problems.extend(f'{label}: {p}' for p in (rep.get('violations') or []))
+        warnings.extend(f'{label}: {w}' for w in (rep.get('warnings') or []))
+        if rep.get('status') == 'fail':
+            problems.append(f'{label}: endpoint selection status=fail')
+    if problems:
+        status = 'fail'
+    elif not panels:
+        status = 'not_verifiable_locally'
+    elif all(p.get('status') == 'not_verifiable' for p in panels.values()):
+        status = 'not_verifiable'
+    elif any(p.get('status') in ('warn', 'not_verifiable')
+             for p in panels.values()):
+        status = 'warn'
+    else:
+        status = 'ok'
+    out = {'kind': 'endpoint_selection_gate', 'status': status,
+           'panels': panels,
+           'artifacts': [os.path.relpath(p, REPO) for p in candidates],
+           'problems': problems, 'warnings': warnings,
+           'note': ('provenance/reporting only: a clean final-step panel is '
+                    'not thereby a valid treatment claim, and a selected best '
+                    'step is not a free accuracy gain')}
+    if verbose:
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+    return out
+
+
 def audit_factorial_design(manifest_path=None, *, n_layers=6):
     """2x2 因子交互设计审计（零 GPU、零落盘依赖）。
 

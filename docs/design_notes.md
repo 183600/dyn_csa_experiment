@@ -7776,3 +7776,168 @@ inert/not_checked/invalid/underpowered 判定与长度/布尔/非正 PPL/重复�
 checkpoint、权重变化、未声明臂、NaN PPL 的 fail-closed 与无记录
 `not_verifiable`；以及 `audit_gates lesion PATH` 的干净重放和篡改判 fail。
 完整 CPU 套件在本轮最终树通过（新增 8 项）。
+
+## 98. 报的是哪一个 checkpoint：端点选择必须可追溯，跨臂规则必须一致（本轮结果分析/实验设计硬化）
+
+### 98.1 问题：一个 `ppl` 字段背后可能是四种不同的估计量
+
+本仓库的冻结端点是**固定最终评测**，但训练记录同时保存了
+`steps`/`steps_completed`、`early_stop`、`best_step`/`best_val_ppl`/
+`final_minus_best` 与 `checkpoints`。因此同一条 `ppl` 可能来自：
+
+1. **最终步**：计划步数全部跑完，引用最后一步评测；
+2. **验证集最佳步**：按验证 PPL 选一个中间 checkpoint，再引用该点；
+3. **早停步**：验证曲线触发 patience，引用停止时的步；
+4. **截断步**：runtime cap/失败使实际步数小于计划步数，但记录仍有 PPL。
+
+这四种不是同一个 estimand。把「每个臂各自选验证集最佳点」得到的值放在
+一起比较，是在比较**两个被选择的最大值**（winner's curse）；把 A 臂的
+最终步和 B 臂的最佳步相比，连训练预算和选择规则都不同；在被用来选点的
+同一批 validation 行上报告该点，则是乐观偏差。§95 的轨迹稳定性回答
+「最终符号在历史上是否持续」，§97 的 lesion 回答「同一个 checkpoint 在
+推理时是否使用组件」，都没有回答「这个 checkpoint 是怎么被选出来的」。
+
+### 98.2 方法：先归一化规则，再按配对比较核验
+
+新增 `exp_lib.endpoint_selection_audit(records, ...)`。每条记录以
+`(arm, tag, seed)` 为身份，读取：
+
+- `steps` / `steps_planned`、`steps_completed` / `steps_done`；
+- `reported_step` / `eval_step` / `endpoint_step`；
+- `selection_rule`（可选显式声明）、`selection_split`、`eval_split`；
+- `checkpoint`（`mode` / `step` / `sha256`，可选）；
+- `early_stop`（`stopped` / `best_step`）与
+  `curve_health` / 顶层 `best_step`、`best_val_ppl`、`final_minus_best`。
+
+规则推断按以下顺序，**只在字段支持时**下结论：
+
+| 观测 | 规则 | 是否数据依赖 |
+|---|---|---|
+| 显式 `selection_rule` | 声明值（并与步数字段对账） | 按规则 |
+| `checkpoint.mode='final'` / `'best'` | `final_step` / `best_validation_step` | best 是 |
+| `early_stop.stopped=true` 且 `best_step == reported_step` | `early_stopped_best` | 是 |
+| `early_stop.stopped=true` 但报告步不是最佳步 | `early_stopped_stop` | 是 |
+| `steps_completed < steps_planned` 且无早停声明 | `truncated_step` | 否（预算缺失） |
+| 报告步等于 `best_step` 且早于完成步 | `best_validation_step` | 是 |
+| 报告步早于完成步 | `intermediate_step` | 是 |
+| 报告步等于完成步 | `final_step` | 否 |
+| 只有 `steps`、没有 `steps_completed`（旧/rope 记录） | `final_step`，且 `steps_completed_inferred=true` | 否（无独立预算字段） |
+| `cap_truncated=true` | `truncated_step` | 否（预算缺失） |
+| 缺步数字段 | `unknown` | 不可判定 |
+
+`reported_step` 未显式给出时默认等于 `steps_completed`：`train_variant`
+的 `ppl` 是运行结束时的评测，不是历史里的任意点。显式声明若与
+`steps_completed`/`best_step`/`early_stop` 矛盾，判 violation，而不是让
+声明覆盖记录。
+
+配对比较（默认同一 tag 下的每对臂，也可显式给 `(a, tag_a, b, tag_b)`）
+逐项检查：
+
+- 同一臂内跨种子的规则必须一致；混合规则判 fail（面板是多个 estimand
+  的混合物）；
+- 两臂的规则必须一致；`final_step` vs `best_validation_step` 判 fail；
+- `selection_split='test'` 判 fail；对数据依赖规则，选择 split 与
+  `eval_split` 相同判 fail（同一批行既选点又报告）；
+- 数据依赖规则若在独立 split 上，只 warn；没有记录 `selection_split` 时
+  警告「独立性不可核验」；
+- 同一配对种子的 `steps_completed` 不同时警告训练预算不一致；
+- `checkpoint.step` 与 `reported_step` 不同判 fail；
+  `checkpoint.mode='both'` 说明不了引用哪份权重，判 fail；
+- 记录部分携带 checkpoint 身份、部分不携带时警告「部分证明」；
+  `require_checkpoint_identity=True` 时缺失判 fail；
+- `final_minus_best < 0` 与「最佳」标签矛盾，警告。
+
+### 98.3 预注册声明与默认值
+
+`endpoint_selection_audit` 可接收 `manifest`。`manifest['endpoint_policy']`
+（或 `manifest['statistics']['endpoint_policy']`）可以声明一条或一组：
+
+```json
+{
+  "endpoint_policy": {
+    "kind": "final_step",
+    "selection_split": "validation",
+    "comparison": "csa_fixed - dense",
+    "require_checkpoint_identity": true
+  }
+}
+```
+
+- `kind` / `selection_split` 必须与记录实际实现的规则一致，否则 fail；
+- `require_preregistered=True` 时，没有覆盖该比较的声明判 fail；声明了
+  数据依赖规则却没有 `selection_split` 也判 fail；
+- 声明 `final_step` 但记录是 `best_validation_step` 判 fail；
+- 没有该字段的旧清单不被猜成 `final_step`，只是「未声明」；默认
+  `require_preregistered=False` 时是描述性读数。
+
+### 98.4 接线
+
+- 新增 `explib/_parts/part_45_endpoint_selection.py`，追加到
+  `explib/_PARTS` 顺序末尾；`exp_lib` 兼容 shim 自动可见。
+- `methodology_audit` 在逐对照块之后、写盘/打印之前，从 `recs` 构造逐
+  记录输入，从 `all_entries` 取
+  `(with, tag_with, without, tag_without)`，写入
+  `report['endpoint_selection']`（该方法体片段是
+  `methodology_steps/step_01b_endpoint_selection.py`，按文件名顺序在
+  `step_02` 的 missingness/trajectory 与写盘之前执行）。只有最终步的
+  普通面板状态为 `ok`；早停/最佳步面板状态为 `warn` 并产生一条顶层
+  warning；规则不可判定的旧记录状态为 `not_verifiable`，**不伪造
+  clean**。
+- `audit_gates.py endpoint_selection`（别名 `endpoint` / `checkpoint` /
+  `checkpoint_selection`）扫描 `results_*/summary.json`（或显式给面板目录/
+  `summary.json`），同一目录有 `run_manifest.json` 时读取其中的
+  `endpoint_policy`；无产物返回 `not_verifiable_locally`。`audit_gates.py
+  report` 增加顶层 `endpoint_selection` 块。
+- 该块不改变 `methodology_audit` 的 p/Holm/max-T/`verified`/
+  `ablation_complete`，不进入冻结确认族。
+
+### 98.5 边界
+
+- **不是新的显著性检验。** 它没有 p 值、区间或 Holm 成员；`warn` 是
+  「这个数字的来源需要说明」，`fail` 是「两个臂的端点规则不可比」。它不
+  证明一个 `final_step` 训练正确，也不证明一个最佳步结果错误。
+- **`unknown` 不是 `final_step`。** 只在既没有 `steps_completed`、也没有
+  `steps` 可读时才报不可判定。只有 `steps` 的旧/rope 记录按运行长度读成
+  `final_step`，但输出 `steps_completed_inferred=true`，不把它包装成有
+  独立预算字段的记录。`cap_truncated=true` 优先判 `truncated_step`。
+- **checkpoint 身份是自报的来源，不是权重审计。** `sha256` 只证明记录
+  声称的来源；真正的权重内容仍需 `lesion`/复现门单独核验。`ckpt_mode` 是
+  「保存了哪些 checkpoint」，不是「引用了哪个 checkpoint」，因此不能单独
+  作为端点规则的证据。
+- **早停不是免费的正则化。** 即使早停规则预注册，不同臂在不同步停止也
+  可能改变预算；本门把步数差异显式点名，但不替代 §74 的
+  attrition-adjusted power 或 §96 的处置审计。
+- **同一个最佳步仍可能是合理的。** 在独立 validation 上选点、在独立
+  test 上报告，是允许的设计；本门只要求声明 `selection_split` 并给
+  warning。真正禁止的是同 split 选点+报告、在 test 上选点、以及跨臂规则
+  不一致。
+- **不修复已经发生的选择。** 已经按「挑最好 checkpoint」产生的面板，
+  本门只能把它标出来；正确动作是重跑/降级为描述性，而不是换一个字段名。
+- **不读 test、不重训、不改冻结。** 零 GPU；不修改
+  `confirmation_frozen*.json`、`CODE_SEMANTICS`、种子/端点/alpha/Holm，
+  也不触碰 `.github/` 与任何 README。
+
+### 98.6 入口与验证
+
+```bash
+python -m pytest -q test_review_part_36.py
+python audit_gates.py endpoint_selection            # 扫描 results_*/
+python audit_gates.py endpoint_selection PANEL_DIR  # 指定面板
+python audit_gates.py endpoint_selection summary.json
+python audit_gates.py checkpoint                    # 别名
+python audit_gates.py report                        # 顶层 endpoint_selection
+```
+
+`test_review_part_36.py` 12 项覆盖：干净最终步面板 ok 且缺 checkpoint
+身份只计数不告警；跨臂 final/best 规则不一致判 fail；同臂跨种子混规则判
+fail；早停最佳/早停停止/截断/最终四类规则与预算警告；数据依赖规则在独立
+validation→test 上只 warn、同 split 或 test 选点判 fail、缺 selection_split
+警告；manifest 的 `final_step`/`best_validation_step` 声明与
+`require_preregistered`、arms 匹配、畸形声明；checkpoint step 不符、
+`mode='both'`、部分身份与 `require_checkpoint_identity`；长度/布尔/非正
+PPL/重复记录/非法规则/非法 split 的 fail-closed；tag 不跨池与 summary key
+兼容；单臂/未知规则 `not_verifiable`；audit gate 干净重放 ok、篡改 fail、
+缺产物 `not_verifiable_locally` 与 CLI/report 接线；以及
+`methodology_audit` 在有/无端点字段两种输入下所有判定承载字段逐值相同、
+只在早停面板增加 warning。完整 CPU 套件在本轮最终树通过（830 passed,
+3 skipped）。
