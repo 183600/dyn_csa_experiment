@@ -107,6 +107,14 @@
                不进入 Holm 族、不改变 p/Holm/verified/confirmed（读
                analysis_v12/test_stats.json 并重放，篡改判 fail；
                零 GPU；别名 effect_scale / scale_location）
+  length_position  结果分析：按长度位置分段重放 by-length PPL——利用因果
+               前缀恒等把相邻长度 cell 的 NLL 差解释为新增位置段的 NLL，
+               在同一位置段内比较臂差异，并核对各段贡献精确重构总 log
+               PPL 比；回答「随长度变化的优势是共同前缀已有，还是只出现在
+               延伸位置」。不是新检验、不进入 Holm 族、不改变
+               p/Holm/verified/confirmed（读 analysis_v12/test_stats.json
+               的逐种子 NLL/token 记账并重放，篡改判 fail；零 GPU；别名
+               length_bands / position_bands）
   analysis_integrity  分析产物溯源：重算 stamped_analysis 的 content_sha256，
                并核对它记录的全部输入文件哈希；正文被改或输入在分析后被
                改判 fail，输入不在本机则明确 warning，legacy 无摘要报

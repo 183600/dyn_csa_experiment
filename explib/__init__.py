@@ -68,6 +68,7 @@ _PARTS = [
 'part_49_arm_rank_units.py',
 'part_50_winner_curse.py',
 'part_51_effect_sensitivity.py',
+'part_52_length_position.py',
 ]
 
 _load_parts(globals(), _HERE, _PARTS)

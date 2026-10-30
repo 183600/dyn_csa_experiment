@@ -4706,3 +4706,80 @@ per_seed/concordance/夹带 `confirmed` 判 `fail`；legacy 缺块与 bare
 `not_estimable` 的 `not_verifiable_locally`/`not_applicable`；报告渲染新表
 与边界段；`run_report`/CLI/`finaltest_stats`/报告接线。完整 CPU 套件在本
 轮最终树通过。
+
+## 2026-10-30 — 长度优势发生在哪些位置：by-length PPL 的因果前缀分段（本轮结果分析硬化，no new runs）
+
+零 GPU 的结果分析硬化；不新增训练、不读取 test split、不修改
+`confirmation_frozen*.json` 的字节/种子/端点/α/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未触碰。
+
+**Problem.** §102–§105 把「哪个臂最好、选择偏差多大、换尺度/位置后
+结论是否仍成立」讲清楚了，但长度主张仍只读每个长度的**总 PPL**。
+`PPL@512` 与 `PPL@4096` 不是只差长度的两个样本：长度 `L` 只对位置
+`1..L-1` 取平均，更长 cell 在相同行上多包含 `L1..L2-1` 的延伸位置。
+总 PPL 的长度变化因此混合了「共同前缀上的表现」「新增位置的 NLL」和
+token 权重变化。把 `PPL(4096) < PPL(512)` 或「优势随长度扩大」直接
+写成位置机制，会把晚期位置更难/更易与同一位置上的方法差异混为一谈。
+
+**Fix.** 新增 `exp_lib.LENGTH_POSITION_POLICY` /
+`length_position_decomposition(by_length, ...)`：利用因果 LM 的前缀恒等
+（位置 `t` 只读 `<t`；动态分段器前缀不变）把排序后的长度
+`L0<L1<...` 的相邻 cell 差分成互不重叠的位置段
+`L_{j-1}..L_j-1`：
+- `NLL_band = nll_sum(L_j)-nll_sum(L_{j-1})`、
+  `n_tok_band` 同理，`PPL_band=exp(NLL_band/n_tok_band)`；
+- 在**同一 band、同一批完整覆盖的种子**上给 `band_ppl_delta` 与
+  `band_log_ratio` 的 n/mean/CI/精确符号翻转 p/p 下限/方向；
+- 总 `log(PPL_a/PPL_b)` 分解为各 band `ΔNLL/n_tok_total` 的贡献，
+  统一用最大长度 token 分母，因此贡献精确相加；给
+  `dominant_band_at_max_length`；
+- 后续 band 与首段做逐种子 difference-in-differences
+  （`interaction_vs_first_band`），直接回答「相对优势是否只在离开
+  共同前缀后出现」；
+- 对 band 向量做精确 sign-flip max-T（复用 §92
+  `maxt_signflip_adjust`），给 `band_family_max_t.p_family` 与逐 band
+  调整 p，避免「挑 p 最小的 band」这一 forking path；它仍是描述性扫描；
+  常数 band 使 §92 helper 拒绝整族时，改用同一 sign-invariant score 的
+  精确 fallback，不静默删段；
+- 用 band NLL 反推每个长度的累计 log 比并核对
+  `max_reconstruction_error<=1e-8`；加不起来就 `not_estimable`，
+  不发布分解。
+
+`finaltest_stats` 在 by-length cell 上追加逐种子
+`nll_by_seed`/`n_tokens_by_seed`（仅当 seed 集合与 `ppl_by_seed` 完全
+一致时），并从同一批 cell 写 `length_position`。`build_report` 在
+by-length 表后新增臂级 band PPL、逐 band 对比、总 log 比/几何比与
+交互 p 表。`audit_gates.py length_position`（别名 `length_bands` /
+`position_bands`）从落盘逐种子记账独立重建整个分解并逐字段比较；
+缺块报 `not_verifiable_locally`，bare `not_estimable` 报
+`not_applicable`，篡改或夹带确认性字段判 `fail`，并入
+`audit_gates.py report` 顶层。顺带修复 `build_report` 在非 concordant
+效应尺度块上的一个解包错误（`_es_bad` 列表元素是 `(name, block)` 而
+旧代码按 `name` 解包），并使主比较表的数值格式在字段缺失时写 `—`
+而不是抛 `TypeError`。
+
+**Boundary.** 不是新的显著性检验：band p 是描述性、种子级读数，没有
+新 Holm 成员；单段 p 不做跨 band FWER，`band_family_max_t` 只在这个
+描述性 band 扫描族内做精确 FWER 控制（回答「任一段有差异」），不改变
+`p_exact_signflip`、`p_holm`、`verified` 或冻结 `confirmed`。
+分段精确性依赖因果/前缀契约；不同行/
+不同 checkpoint/截断 span 下差值不再是同一位置段（由 `data_fp`、
+`n_seq`、by_len 形状门和冻结锁负责，本模块不替代）。位置段内 token
+高度相关，本模块只翻转种子，绝不把 position 当独立评测单位；评测
+文章/行抽样仍由 `doc_sampling`、`paired_nll_unit_influence` 与
+§81 两层 bootstrap 负责。band ΔNLL 贡献大不等于实际重要；PPL 差与
+log 比不可混读；`dominant_band` 不是机制因果证据。即使优势来自延伸
+位置，仍是 train@512 的长度外推，不是长上下文训练，也不能外推到
+其他语料/规模/生产。旧产物没有逐种子 NLL/token 记账，不回填、不猜。
+
+**Verification.** 新增 `test_review_part_47.py` 11 项：策略/状态；
+band 精确重构与贡献相加；首段相同/延伸段不同→首段 p=1、延伸段显著、
+交互显著；缺种子使整个 pair 收缩到完整覆盖 seed 集；非单调 NLL、
+`ppl` 与 NLL/token 不一致、非整数 seed key、自比较 pair fail-closed；
+确定性重放与 `1e200` 级 PPL 严格 JSON；合成六 seed 两臂 by-length
+面板 → `finaltest_stats` 落盘逐种子记账、`audit_length_position` `ok`；
+篡改 band p/贡献/状态/夹带 `confirmed`/改 cell NLL 判 `fail`；缺块与
+bare/重放后 `not_estimable` 的 `not_verifiable_locally`/`not_applicable`；
+band max-T 的 family p 重放；
+报告渲染新表与边界段；CLI/别名/`run_report`/`build_report`/
+`finaltest_stats` 接线。完整 CPU 套件在本轮最终树通过。

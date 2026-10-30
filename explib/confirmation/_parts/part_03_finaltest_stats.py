@@ -113,6 +113,8 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
                         if n is not None})
         for Ln in _lens:
             _by_seed = {}
+            _nll_by_seed = {}
+            _ntok_by_seed = {}
             _nll_sum = 0.0
             _n_tok = 0
             _pool_ok = True
@@ -120,12 +122,21 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
                 bl = r.get('by_len') or {}
                 c = bl.get(Ln, bl.get(str(Ln)))
                 if isinstance(c, dict) and L.ppl_is_usable(c.get('ppl')) and isinstance(c.get('truncated'), (bool, np.bool_)) and not bool(c.get('truncated')):
-                    _by_seed[r.get('seed')] = float(c['ppl'])
+                    _seed_i = _record_int(r.get('seed'))
+                    if _seed_i is None:
+                        continue
+                    _by_seed[_seed_i] = float(c['ppl'])
                     _nll_f = L._finite_scalar(c.get('nll_sum'))
                     _nt_i = _record_int(c.get('n_tok'))
                     if _nll_f is not None and _nt_i is not None and _nt_i > 0:
                         _nll_sum += _nll_f
                         _n_tok += _nt_i
+                        # Per-seed accounting is what makes the by-length
+                        # cells position-decomposable without a second test
+                        # read: the difference of two length totals on the
+                        # same seed is the NLL of the newly covered targets.
+                        _nll_by_seed[_seed_i] = float(_nll_f)
+                        _ntok_by_seed[_seed_i] = int(_nt_i)
                     else:
                         _pool_ok = False
             if _by_seed:
@@ -134,7 +145,43 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
                 stats['by_length'].setdefault(v, {})[str(Ln)] = {'mean': float(_pooled if _pooled is not None else np.mean(_dl)),
                                                                   'mean_arithmetic': float(np.mean(_dl)),
                                                                   'ppl_pooled': _pooled, 'n_tokens': _n_tok,
-                                                                  'n': len(_dl), 'ppl_by_seed': {str(s): p for s, p in _by_seed.items()}, 'params': next((r.get('params') for r in rows if isinstance(r.get('params'), (int, float))), None), 'n_seqs': next((c.get('n_seq') for _r in rows for c in [((_r.get('by_len') or {}).get(Ln) or (_r.get('by_len') or {}).get(str(Ln)) or {})] if isinstance(c, dict) and c.get('n_seq') is not None), None)}
+                                                                  'n': len(_dl), 'ppl_by_seed': {str(s): p for s, p in _by_seed.items()},
+                                                                  **({'nll_by_seed': {str(s): x for s, x in _nll_by_seed.items()},
+                                                                      'n_tokens_by_seed': {str(s): x for s, x in _ntok_by_seed.items()}}
+                                                                     if set(_nll_by_seed) == set(_by_seed) else {}),
+                                                                  'params': next((r.get('params') for r in rows if isinstance(r.get('params'), (int, float))), None), 'n_seqs': next((c.get('n_seq') for _r in rows for c in [((_r.get('by_len') or {}).get(Ln) or (_r.get('by_len') or {}).get(str(Ln)) or {})] if isinstance(c, dict) and c.get('n_seq') is not None), None)}
+    # Position decomposition of the SAME by-length cells: a causal prefix is
+    # identical across lengths, so consecutive length totals differ exactly by
+    # the newly covered target positions.  This separates a length effect that
+    # is already present on the common prefix from one that only appears in
+    # the extension, without another test read or any new training.
+    if stats.get('by_length'):
+        _lp_pairs = []
+        _lp_seen = set()
+        for _c in (manifest.get('primary_comparisons') or []):
+            _a, _b = _c.get('a'), _c.get('b')
+            _key = (str(_a), str(_b))
+            if not _a or not _b or _a == _b or _key in _lp_seen:
+                continue
+            _lp_seen.add(_key)
+            _lp_pairs.append({'name': str(_c.get('name') or f'{_a} vs {_b}'),
+                              'a': str(_a), 'b': str(_b)})
+        try:
+            _lp = L.length_position_decomposition(
+                stats['by_length'], pairs=_lp_pairs, alpha=_alpha)
+            _lp['upstream'] = ('finaltest_stats: frozen by_len cells; every '
+                               'band is a difference of two length totals on '
+                               'the same seeds/rows')
+            stats['length_position'] = _lp
+        except Exception as _lpe:
+            stats['length_position'] = {
+                'kind': 'length_position_decomposition',
+                'status': 'not_estimable',
+                'reason': f'{type(_lpe).__name__}: {_lpe}',
+                'role': ('descriptive position decomposition; no frozen '
+                         'p/Holm/verdict is changed'),
+            }
+
     # Ranking resolution across the frozen arms: the pairwise Holm family
     # answers pre-registered contrasts, not "which of the six arms is best and
     # how much of that ordering is resolved".  The endpoint is shared by every
@@ -1358,6 +1405,106 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
     else:
         A(f'**尚未运行 P5T**：`{TEST_OUTDIR}/bylen.json` 不存在（或为空）。前置：`python -m explib.confirmation phase P5C`（现覆盖全部六个冻结臂、种子数取自清单；主臂 0-5 已由 P3MT/P4MT 训练，resume 自动跳过），然后 `python -m explib.confirmation phase P5T`。冻结清单已入库（见上），随时可以执行；执行前请勿据任何 validation 读数调整冻结内容。')
         A('')
+    _lp = ft.get('length_position')
+    if isinstance(_lp, dict):
+        A('### 长度位置分段：共同前缀 vs 延伸位置（探索性）')
+        A('')
+        _lp_status = _lp.get('status')
+
+        def _lp_num(x, fmt='{:+.4f}'):
+            return fmt.format(float(x)) if isinstance(x, (int, float)) else '—'
+
+        if _lp_status == 'not_estimable':
+            A(f'- 不可估计：{_lp.get("reason", "insufficient by-length cells")}')
+            A('')
+        else:
+            _lp_arms = _lp.get('arms') or {}
+            _lp_bands = []
+            for _arm in sorted(_lp_arms):
+                _lp_bands.extend((_lp_arms[_arm].get('bands') or []))
+            _labels = sorted({b.get('label') for b in _lp_bands if b.get('label')},
+                             key=lambda s: int(str(s).split('-')[0]))
+            if _labels:
+                A('| 臂 | ' + ' | '.join(f'band {b} PPL' for b in _labels) + ' |')
+                A('|---|' + '---|' * len(_labels))
+                for _arm in sorted(_lp_arms):
+                    _by = {b.get('label'): b for b in (_lp_arms[_arm].get('bands') or [])}
+                    _cells = []
+                    for _b in _labels:
+                        _row = _by.get(_b)
+                        _cells.append(f'{float(_row["mean_band_ppl"]):.3f}'
+                                      if isinstance(_row, dict)
+                                      and isinstance(_row.get('mean_band_ppl'), (int, float))
+                                      else '—')
+                    A(f'| `{_arm}` | ' + ' | '.join(_cells) + ' |')
+                A('')
+                A('> band `L0-L1` 表示目标位置 `L0..L1`：它由长度 `L0` 与 `L1` 两个 cell 的 NLL/token 总数之差得到。'
+                  '同一 band 内两臂评测的是**完全相同的位置段**，所以逐段比较不受「长序列包含更多晚期位置」的构成混淆。')
+                A('')
+            for _name, _pair in sorted((_lp.get('pairs') or {}).items()):
+                if not isinstance(_pair, dict):
+                    continue
+                A(f'#### `{_name}`')
+                A('')
+                if _pair.get('status') != 'ok':
+                    A(f'- 不可估计：{_pair.get("reason", "no replayable band")}')
+                    A('')
+                    continue
+                A('| band | n | band ΔPPL (a−b) | band log ratio | p (sign-flip) | 对总 log 比的贡献@最大长度 | 与首段交互 p |')
+                A('|---|---|---|---|---|---|---|')
+                _bands = _pair.get('bands') or {}
+                for _b, _row in sorted(_bands.items(),
+                                       key=lambda kv: int(str(kv[0]).split('-')[0])):
+                    _bd = _row.get('band_ppl_delta') or {}
+                    _bl = _row.get('band_log_ratio') or {}
+                    _ia = _row.get('interaction_vs_first_band') or {}
+                    A(f'| {_b} | {_row.get("n", "—")} | '
+                      f'{_lp_num(_bd.get("mean"))} | {_lp_num(_bl.get("mean"))} | '
+                      f'{_lp_num(_bd.get("p_exact_signflip"), "{:.4g}")} | '
+                      f'{_lp_num(_row.get("mean_contribution_to_total_log_ratio_at_max"))} | '
+                      f'{_lp_num(_ia.get("p_exact_signflip"), "{:.4g}")} |')
+                A('')
+                A('（逐 band 的 95% t 区间在 `test_stats.json` 的 '
+                  '`band_ppl_delta.ci95` / `band_log_ratio.ci95`；上表只摘均值与 '
+                  'exact sign-flip p，不把区间宽度当作实际重要性。）')
+                A('')
+                _bf = _pair.get('band_family_max_t') or {}
+                if _bf.get('status') == 'ok':
+                    _bfp = _bf.get('p_family')
+                    A(f'- 跨 band 扫描读数（精确 sign-flip max-T，{_bf.get("n_bands")} 段）：'
+                      f'family p = {_lp_num(_bfp, "{:.4g}")}；'
+                      f'这是「任一段有差异」的描述性族读数，不进入冻结 Holm 族。')
+                else:
+                    A(f'- 跨 band max-T 不可估计：{_bf.get("reason", "fewer than two bands")}')
+                A('')
+                _tot = _pair.get('total_by_length') or {}
+                if _tot:
+                    A('| 长度 | 总 log(PPL_a/PPL_b) | 几何 PPL 比 | p (sign-flip) |')
+                    A('|---|---|---|---|')
+                    for _Ln in sorted(_tot, key=lambda x: int(x)):
+                        _t = _tot[_Ln] or {}
+                        _m = _t.get('mean')
+                        _ratio = (math.exp(float(_m))
+                                  if isinstance(_m, (int, float))
+                                  and abs(float(_m)) < 700.0 else None)
+                        A(f'| {_Ln} | {_lp_num(_m)} | {_lp_num(_ratio, "{:.4f}")} | '
+                          f'{_lp_num(_t.get("p_exact_signflip"), "{:.4g}")} |')
+                    A('')
+                A(f'- 最大长度上贡献最大的位置段：`{_pair.get("dominant_band_at_max_length", "—")}`；'
+                  f'分段重构总 log 比的最大误差 {_pair.get("max_reconstruction_error", "—")}。')
+                A('')
+            A('> 边界：上表是**同一批冻结 by-length cell 的位置分解**，不是新检验，'
+              '不进入冻结 Holm 族、不改变 `p_exact_signflip`、'
+              '`p_holm`、`verified` 或冻结 `confirmed`。分段精确性依赖因果前缀恒等'
+              '（位置 t 只读 t 之前的 token，且动态分段器前缀不变），这正是仓库的'
+              '前缀不变性契约；它不依赖把位置当独立样本。band 内的 sign-flip p 仍是'
+              '种子级、描述性读数，单段 p 不校正跨 band 的多重性；表内另给的'
+              '精确 max-T 只控制这个描述性 band 扫描族的 FWER，是「任一段有差异」'
+              '的扫描读法，仍不进入冻结 Holm 族。位置分解不能替代'
+              'seed×unit 总不确定性、效应尺度/位置敏感性或独立复现；它只回答'
+              '「长度效应里有多少来自共同前缀、多少来自新增位置」，不能把'
+              '「晚期位置更差/更好」外推成训练长度之外的语言总体规律。')
+            A('')
     _rk = ft.get('arm_ranking')
     if isinstance(_rk, dict):
         A('### 冻结臂的排序分辨率（探索性）')
@@ -1586,7 +1733,14 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
             _dunit = {'article': '文章', 'document': '文档'}.get(_du, '行')
             if isinstance(_dwin, (int, float)) and _dcitxt != '—':
                 _dcitxt += f'；{100.0 * _dwin:.0f}% {_dunit} Δ<0'
-            A(f'| {k} | {v["n"]} | {v.get("coverage_ok")} | {v.get("param_matched")} | {_ipa_txt} | {v["mean"]:+.2f} ± {v.get("std", 0):.2f} | {_dcitxt} | {v.get("cohens_dz", float("nan")):+.2f} | {v["p_exact_signflip"]:.3f} | {v.get("p_floor", float("nan")):.3f} | {_hp} | {_hr} | {_ds} |')
+            def _cmp_num(x, fmt):
+                return format(float(x), fmt) if isinstance(x, (int, float)) else '—'
+            _mean_t = _cmp_num(v.get('mean'), '+.2f')
+            _std_t = _cmp_num(v.get('std'), '.2f')
+            _dz_t = _cmp_num(v.get('cohens_dz'), '+.2f')
+            _p_t = _cmp_num(v.get('p_exact_signflip'), '.3f')
+            _pf_t = _cmp_num(v.get('p_floor'), '.3f')
+            A(f'| {k} | {v.get("n", "—")} | {v.get("coverage_ok")} | {v.get("param_matched")} | {_ipa_txt} | {_mean_t} ± {_std_t} | {_dcitxt} | {_dz_t} | {_p_t} | {_pf_t} | {_hp} | {_hr} | {_ds} |')
         A('')
         _init_dropped = {k: [d for d in (v.get('dropped_pairs') or [])
                              if 'init_core_fp' in str(d.get('reason', ''))]
@@ -1637,7 +1791,7 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
               '`p_exact_signflip` / `p_holm` / `verified` / `confirmed`；'
               '`concordant` 只表示三种描述口径一致，不表示效应有实际重要性、因果性或可迁移性。）')
             A('')
-            _es_bad = [k for k, es in _es_rows
+            _es_bad = [(k, es) for k, es in _es_rows
                        if es.get('status') not in (None, 'concordant')]
             if _es_bad:
                 A('**效应尺度/位置提醒**：' + '；'.join(
