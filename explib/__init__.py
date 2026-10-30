@@ -60,6 +60,7 @@ _PARTS = [
 'part_41_missingness_sensitivity.py',
 'part_42_trajectory_stability.py',
 'part_43_run_disposition.py',
+'part_44_component_lesion.py',
 ]
 
 _load_parts(globals(), _HERE, _PARTS)

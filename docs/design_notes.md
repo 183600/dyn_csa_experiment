@@ -7621,3 +7621,158 @@ reconstruction 时只 warn）；cap 状态 `skipped_cap`/`truncated` 即使 reas
 不匹配模式也归入 `runtime_cap`；损坏/篡改的计划判 fail 而非「缺证据」；
 `design` 前馈对 confirmatory 的 `last_success`/`allow_supersede` 判
 violate、合法策略通过；以及 gate/CLI 接线与账本被篡改时判 fail。
+
+## 97. 训练时去掉不等于推理时在用：同 checkpoint 的 lesion 阶梯（本轮对比/消融方法硬化）
+
+### 97.1 问题：between-model on/off 同时问了两件事
+
+现有消融的读数是「带模块训练」与「不带模块训练」两个模型的终点差
+（§84/§94 又加了同容量 frozen-random 安慰剂）。这条对照能回答「训练时
+有模块是否改变了模型」，但不能回答「训练出来的模型在推理时是否使用该
+模块」：
+
+1. 模块可能只是**优化支架/正则器**：训练时有帮助，测试时网络可以完全
+   不依赖它；between-model 的显著差异仍会被误写成「机制在推理时起作用」。
+2. 模块也可能**被训练成 no-op**：learned sink 初始为零，learned fusion
+   初始为 identity。此时 on/off 的差异仍可能存在（训练轨迹不同），但
+   推理时 lesion 不改变任何输出——这与「模块无用」在终点表里不可区分。
+3. 反过来，模块可以在推理时被使用却**功能冗余**（改输出但不改 PPL），
+   也可以**有害**（lesion 后 PPL 反而更好）。这些都不是 on/off 能单独
+   区分的状态。
+
+已有 `single_factor` 门检查 cfg diff，`single_factor_initialization_audit`
+检查非干预参数逐值一致，§84/§94 检查同容量 placebo；它们都在**训练前**
+或**训练配方**层，仍没有一条**同一个 checkpoint 内部**的干预读数。
+
+### 97.2 方法：固定权重与评测行，只关掉一个组件
+
+新增 `exp_lib.component_lesion(model, component)`：在 `with` 块内对每个
+适用层复制一份 `AttnCfg` 并设置声明字段，或临时把声明子模块置空；退出时
+（包括异常）逐层恢复**原对象**。权重不进 `state_dict` 的增删，不重训、
+不改 checkpoint、不读 test split。
+
+| 条件 | 训练 | 推理 | 测量 |
+|---|---|---|---|
+| intact | 带模块 | 带模块 | 现有臂的 PPL/输出 |
+| lesion | 带模块 | **关掉模块** | 同一 checkpoint、同一评测行的 PPL/输出 |
+| absence | 不带模块 | 不带模块 | 现有留一臂 |
+
+由此把「总效应」与「推理使用」拆开：
+
+```text
+between-model training effect = intact - absence
+within-checkpoint lesion      = lesion - intact
+```
+
+lesion 是**同 checkpoint 的配对差**，消掉了 run-to-run 方差；其单位仍是
+seed，不是 token。判定分两步，顺序不能反：
+
+1. **manipulation check（操作检查）**：`lesion_sensitivity()` 在同一输入
+   上比较 intact/lesion 的 logits。
+   - `changed=True` 且 `weights_unchanged=True` 才是有效干预；
+   - `changed=False` 说明该 checkpoint 下 lesion 是 no-op，不能把 PPL
+     的零差读成「冗余」；
+   - 权重指纹在前后不一致判 `weights_changed`，不是测量。
+2. **功能效应**：`lesion_effect()` 对
+   `d_i = log(PPL_lesion / PPL_intact)` 做 exact sign-flip 与配对 TOST
+   （margin 仍来自预注册的相对 SESOI，默认 1%）。判定词汇固定为：
+
+| verdict | 含义 | 允许的措辞 |
+|---|---|---|
+| `necessary` | 输出变了，且 lesion 显著变差超过 SESOI | 该 checkpoint 在推理时使用且需要该组件 |
+| `harmful` | 输出变了，且 lesion 显著变好超过 SESOI | 组件被使用但在推理时有害；不能把 on/off 收益写成推理机制收益 |
+| `redundant` | 输出变了，但 PPL 在 SESOI 内等价（或精确为零） | 组件被使用但功能冗余 |
+| `engaged_below_sesoi` | 输出变了、显著，但效应小于 SESOI | 可检出但无实际必要性 |
+| `inert` | 输出完全没变 | 该 checkpoint 未在推理时使用；on/off 只能报训练期效应 |
+| `not_checked` | 缺操作检查 | 不得作推理使用声明 |
+| `invalid` | lesion 改了权重 | 不是有效测量 |
+| `underpowered` | 种子不足或 exact-test 分辨率下限 > alpha | 不是「无效应」证据 |
+| `inconclusive` | 既非超 SESOI 显著，也非 SESOI 内等价 | 不作声明 |
+
+两个实现细节是方法的一部分，不是工程噪声：
+
+- **sink 的零值不是 no-op。** 即使 learned sink 全零，sink 槽仍以
+  `exp(0)=1` 进入 softmax 分母；关掉它改变归一化。`component_lesion_state`
+  因此把零值 sink 记为 `present`/`zero_valued`，只把 fusion 的 identity
+  kernel 记为 `trivial`。这正是「必须在真实 checkpoint 上做操作检查」的
+  理由。
+- **fusion 的 lesion 不改 `cfg.fuse_mode`。** 该字段参与 backend dispatch
+  （`_eager_batch`）；若 lesion 把它改成 `none`，intact 走 row path、lesion
+  走 batched path，就把数值后端混进了干预。正确做法是只移除
+  `fuse_conv` 子模块，保持 dispatch 的 cfg 表面不变。
+
+### 97.3 接线：声明、设计门、面板重放
+
+`LESION_DESIGN` 白名单声明三类组件及其适用臂、cfg/module 干预和机制键：
+`attention_sink`（`use_sink`/`full_sink`）、`local_fusion`
+（`fuse_conv`）、`content_pooling`（`content_mode='zero'`）。未声明组件
+直接报错，不静默退化成空 context。
+
+- `lesion_design_audit()` 用真实 `make_layer_cfgs` 建 tiny `SmallGPT`，逐臂
+  检查：组件存在、lesion 至少作用一层、臂已排程、属于声明的留一法族、
+  机制键被 `ABLATION_INTERVENTION_KEYS` 覆盖。fusion 的 identity 初值只
+  warning（提示必须到训练后的 checkpoint 再做操作检查），不是 pass。
+- `lesion_panel_audit(records)` 重放落盘的面板：每条记录是
+  `{component, arm, seed, checkpoint_sha256, intact_ppl, lesion_ppl,
+  sensitivity, eval_fp}`。同一组内 seed 必须唯一、`eval_fp` 必须一致、
+  `checkpoint_sha256` 必须存在、权重必须未变；缺操作检查只 warning，
+  不冒充必要/冗余。同一组内多个 seed 共用同一 checkpoint 只给 warning
+  （这是伪重复，不是独立 lesion 证据），而不是把它当成更多样本。输出 `necessary_panels` / `redundant_panels` /
+  `inert_panels` / `harmful_panels` 与 `verdict_counts`。
+- `audit_gates.py lesion`（别名 `inference_lesion` / `lesion_panel` /
+  `component_lesion`）既跑设计门，也扫描 `results_*/lesion.json` 与
+  `analysis_*/lesion.json`；无产物返回 `not_verifiable_locally`，不假绿。
+  `audit_gates.py report` 增加顶层 `lesion` 块。
+- 该块只新增读数，不改变 `methodology_audit` 的 Holm/`verified`/max-T/
+  `ablation_complete`，也不进入冻结确认族。
+
+### 97.4 边界
+
+- **不是重训，也不是新的确认性检验。** 它需要已保存的 checkpoint；本
+  快照没有 `results_*/`，所以没有任何 lesion 数值。它把「下次跑完后该
+  怎么读」变成可执行工具与硬门，而不是声称已有证据。
+- **lesion 不是「删除模块的因果效应」的完整证明。** 它固定权重，因此
+  回答的是「这个训练好的网络在推理时是否依赖它」；`intact - absence`
+  的 between-model 训练效应仍需原来的留一/安慰剂设计。两者互补，不能
+  互相替代。
+- **操作检查不是机制定位。** `changed=True` 只说明干预改变了输出，不
+  说明改变来自声明子电路；它不能替代 selection/attribution/NIAH 等机制
+  读数。检查在 logits 层做：内部激活变了但最终 logits 恰好抵消时会被
+  记为 `unchanged`/`inert`，所以它回答的是「这次评测输出是否依赖该
+  组件」，不是「该组件在计算图上是否存在」。
+- **同 checkpoint 也可能有评测行/后端混杂。** 面板门要求同一
+  `eval_fp`；后端 dispatch 由「不改 `fuse_mode`」的约定保护，但未来若
+  新增 lesion 组件，必须逐项证明它不改变 `_eager_batch`/kernel 选择。
+  面板审计重放的是记录里的 intact/lesion 数值，不是从 checkpoint 重算
+  PPL；checkpoint 身份只证明记录自报的来源，不替代评测产物本身的审计。
+- **不是替代 missingness/attrition。** 没有某个 seed 的 checkpoint 就是
+  缺一个配对，不由插补或 complete-case 补齐；§93 的 bounds 仍独立适用。
+- **TOST 与 exact sign-flip 各有假设。** 前者是配对 t 近似、需要预注册
+  margin；后者是 seed 级符号检验。`redundant` 是「在 SESOI 内等价」，
+  不是「绝对零效应」；`inert` 是「这个 checkpoint 的这次前向没变」，
+  不是「组件永远无用」。
+- **不触碰 `.github/` 与 README。** 零 GPU、零训练、零 test 读取；不改
+  `confirmation_frozen*.json`、`CODE_SEMANTICS`、种子/端点/alpha/Holm。
+
+### 97.5 入口与验证
+
+```bash
+python -m pytest -q test_review_part_35.py
+python audit_gates.py lesion                    # 设计门 + 扫描 lesion.json
+python audit_gates.py lesion PANEL/lesion.json  # 指定一份产物
+python audit_gates.py inference_lesion          # 别名
+python audit_gates.py report                    # 顶层 lesion
+```
+
+`test_review_part_35.py` 8 项覆盖：设计门接受 shipped 三类组件且每个臂可
+构造/可干预；context 在异常时恢复原 cfg 对象与 `fuse_conv` 对象、权重指纹
+不变、未知/已缺席组件 fail-closed；零值 sink 仍是有效干预（`present`/
+`zero_valued`），非零 sink 的 lesion 改变输出且 lesion 内改 sink 不再影响
+输出；identity fusion 初值是 `trivial`/`unchanged`，非 identity kernel 的
+lesion 改变输出且 lesion 内改 kernel 不再影响输出；content lesion 改变
+前向但不改权重；`lesion_effect` 的 necessary/harmful/redundant/exact-zero/
+inert/not_checked/invalid/underpowered 判定与长度/布尔/非正 PPL/重复种子/
+非法 alpha 的 fail-closed；面板门对 `eval_fp` 混杂、重复 seed、缺
+checkpoint、权重变化、未声明臂、NaN PPL 的 fail-closed 与无记录
+`not_verifiable`；以及 `audit_gates lesion PATH` 的干净重放和篡改判 fail。
+完整 CPU 套件在本轮最终树通过（新增 8 项）。

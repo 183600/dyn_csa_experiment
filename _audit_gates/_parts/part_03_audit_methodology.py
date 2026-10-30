@@ -435,6 +435,85 @@ def audit_fusion_controls():
     return out
 
 
+def audit_lesion(path=None, *, verbose=True):
+    """Within-checkpoint lesion design + panel audit (zero GPU).
+
+    Two layers are reported together because neither is sufficient alone:
+
+    * `design`: every declared component can be constructed on the shipped
+      arms, the lesion applies to at least one layer, and the mechanism key is
+      covered by the declared single-factor intervention set;
+    * `panels`: saved `lesion.json` artifacts are replayed from their paired
+      per-seed intact/lesion PPL values.  A record without a passed forward
+      manipulation check (`changed=True` and `weights_unchanged=True`) is a
+      warning, not a pass: a no-op lesion cannot establish inference-time use.
+
+    Missing artifacts return `not_verifiable_locally`; they never fabricate a
+    pass.  This gate does not retrain, does not read the test split and does
+    not alter any between-model ablation verdict.
+    """
+    L = _import_exp_lib()
+    design = L.lesion_design_audit()
+    if path:
+        candidates = [path]
+    else:
+        candidates = []
+        try:
+            for name in sorted(os.listdir(REPO)):
+                if not (name.startswith('results_') or name.startswith('analysis_')):
+                    continue
+                candidate = os.path.join(REPO, name, 'lesion.json')
+                if os.path.isfile(candidate):
+                    candidates.append(candidate)
+        except OSError as exc:
+            candidates = []
+            design.setdefault('warnings', []).append(
+                f'cannot scan result directories: {type(exc).__name__}: {exc}')
+    panels = {}
+    problems = list(design.get('violations') or [])
+    warnings = list(design.get('warnings') or [])
+    for candidate in candidates:
+        label = os.path.relpath(candidate, REPO)
+        try:
+            with open(candidate, encoding='utf-8') as f:
+                doc = json.load(f)
+        except Exception as exc:
+            problems.append(
+                f'{label}: cannot read lesion artifact '
+                f'({type(exc).__name__}: {exc})')
+            continue
+        try:
+            rep = L.lesion_panel_audit(doc)
+        except Exception as exc:
+            problems.append(
+                f'{label}: lesion_panel_audit failed '
+                f'({type(exc).__name__}: {exc})')
+            continue
+        panels[label] = rep
+        problems.extend(f'{label}: {p}' for p in (rep.get('problems') or []))
+        warnings.extend(f'{label}: {w}' for w in (rep.get('warnings') or []))
+        if rep.get('status') == 'fail':
+            problems.append(f'{label}: lesion panel status=fail')
+    if problems:
+        status = 'fail'
+    elif not panels:
+        status = 'not_verifiable_locally'
+    elif any(p.get('status') == 'warn' for p in panels.values()):
+        status = 'warn'
+    else:
+        status = 'ok'
+    out = {'kind': 'lesion_audit', 'status': status,
+           'design': design, 'panels': panels,
+           'artifacts': [os.path.relpath(p, REPO) for p in candidates],
+           'problems': problems, 'warnings': warnings,
+           'note': ('within-checkpoint lesion only; a between-model on/off '
+                    'contrast is not evidence that the trained component is '
+                    'used at inference')}
+    if verbose:
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+    return out
+
+
 def audit_factorial_design(manifest_path=None, *, n_layers=6):
     """2x2 因子交互设计审计（零 GPU、零落盘依赖）。
 

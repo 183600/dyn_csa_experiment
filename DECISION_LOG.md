@@ -4149,3 +4149,68 @@ fail-closed、NaN/未知失败重试 fail、cell 与总尝试预算、supersede 
 not_verifiable、评测/探针 cell 只计数、计划晚于首条 cell 判 reconstruction、
 cap 状态归入 runtime_cap、损坏/篡改计划判 fail、`design` 前馈拒绝
 confirmatory 的 last_success/supersede，以及 gate/CLI 接线与账本篡改 fail。
+
+## 2026-10-30 — 训练时去掉不等于推理时在用：同 checkpoint lesion 与操作检查（本轮对比/消融方法硬化，no new runs）
+
+零 GPU 的设计/分析硬化；不新增训练、不读取 test split、不修改
+`confirmation_frozen*.json` 的字节/种子/端点/alpha/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未触碰。
+
+**Problem.** `ABLATION_DESIGN` 的 on/off 与 §84/§94 的同容量 placebo 都是
+**between-model** 对照：它们比较两个分别训练的模型。显著差异只能说明「带
+模块训练改变了模型」，不能说明「训练出来的模型在推理时使用该模块」。一个
+模块可以只是训练期优化支架；learned sink 初始为零、learned fusion 初始为
+identity，也可能在训练后仍是 no-op。终点表无法区分「模块无用」与「模块在
+推理时没被使用」；反向的「被使用但冗余」或「被使用但有害」也没有读数。
+§94 的初始化审计只保证训练前非干预参数一致，仍没有同 checkpoint 的干预。
+
+**Fix.** 新增 `exp_lib.component_lesion` / `lesion_sensitivity` /
+`lesion_effect` / `lesion_panel_audit` / `lesion_design_audit`：
+
+- `LESION_DESIGN` 白名单声明 `attention_sink`（`use_sink`/`full_sink`）、
+  `local_fusion`（移除 `fuse_conv`）、`content_pooling`
+  （`content_mode='zero'`）的适用臂与干预键。`component_lesion` 复制每层
+  `AttnCfg`、临时替换声明的子模块，并在 `finally` 恢复**原对象**；权重
+  `state_dict` 不变，异常也恢复。
+- `component_lesion_state` 区分参数存在/功能初值；**零值 sink 仍是
+  `present`/`zero_valued`**（sink 槽以 `exp(0)` 进入 softmax 分母，不是
+  no-op），只有 fusion 的 identity kernel 是 `trivial`。
+- `lesion_sensitivity` 在同一输入上比较 intact/lesion logits，要求
+  `changed=True` 且 `weights_unchanged=True`；`lesion_effect` 对
+  `log(PPL_lesion/PPL_intact)` 做 exact sign-flip + 配对 TOST，输出
+  `necessary`/`harmful`/`redundant`/`engaged_below_sesoi`/`inert`/
+  `not_checked`/`invalid`/`underpowered`/`inconclusive`。操作检查未通过时
+  `claim_allowed=False`，PPL 零差不得写成冗余。
+- `lesion_panel_audit` 重放
+  `{component, arm, seed, checkpoint_sha256, intact_ppl, lesion_ppl,
+  sensitivity, eval_fp}`：同组 seed 唯一、`eval_fp` 一致、checkpoint 身份
+  存在、权重未变；缺操作检查只 warning，多个 training seed 共用同一
+  checkpoint 也只 warning（伪重复，不是独立样本）。`lesion_design_audit`
+  用真实工厂
+  构造每个声明臂，检查组件存在、lesion 至少作用一层、臂已排程且属于留一
+  法族、机制键被 `ABLATION_INTERVENTION_KEYS` 覆盖。fusion 的 identity
+  初值只 warning（必须到训练后 checkpoint 再做操作检查）。
+- `audit_gates.py lesion`（别名 `inference_lesion` / `lesion_panel` /
+  `component_lesion`）扫描 `results_*/lesion.json` 与
+  `analysis_*/lesion.json`；无产物 `not_verifiable_locally`。`report` 增加
+  顶层 `lesion`。该块不改变 `methodology_audit` 的 Holm/`verified`/max-T/
+  `ablation_complete`，不进入冻结确认族。
+
+**Boundary.** 它需要已保存的 checkpoint；本快照没有 `results_*/`，所以没有
+任何 lesion 数值。lesion 固定权重，回答「这个训练好的网络在推理时是否依赖
+它」，不替代 `intact - absence` 的训练效应，也不定位子电路。操作检查只说明
+干预改变了输出，不是机制证据。面板内 `eval_fp` 必须一致；fusion 的 lesion
+刻意不改 `cfg.fuse_mode`，以免把 row/batched 后端切换混进干预。`redundant`
+是 SESOI 内等价，不是绝对零效应；`inert` 是本次前向不变，不是组件永远无用。
+缺 checkpoint 的 seed 不能插补，§93 的 missingness bounds 仍独立适用。
+
+**Verification.** 新增 `test_review_part_35.py` 8 项：设计门接受 shipped
+三类组件且每臂可构造/可干预；context 异常恢复原 cfg/`fuse_conv` 对象且权重
+指纹不变、未知/缺席组件 fail-closed；零值 sink 仍 `present` 且 lesion 改变
+输出、lesion 内改 sink 不再影响输出；identity fusion 初值 `trivial`、
+非 identity lesion 改变输出且 lesion 内改 kernel 不再影响输出；content
+lesion 改前向不改权重；`lesion_effect` 全部判定与长度/布尔/非正 PPL/重复
+种子/非法 alpha 的 fail-closed；面板门对 `eval_fp` 混杂、重复 seed、缺
+checkpoint、权重变化、未声明臂、NaN PPL 判 fail、无记录
+`not_verifiable`；`audit_gates lesion PATH` 干净重放 ok、篡改 fail。完整
+CPU 套件在本轮最终树通过。

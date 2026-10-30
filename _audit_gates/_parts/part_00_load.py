@@ -127,6 +127,12 @@
                frozen-random（同 conv 形状/参数量、冻结、不移动共享初始化）
                两个对照；learned−random 隔离学习成分，learned−identity 是
                总效应；别名 fusion_placebo / local_fusion（零 GPU）
+  lesion       同 checkpoint 的推理期 lesion：声明组件可构造/可干预、
+               权重不变的操作检查，以及逐种子 intact/lesion PPL 的
+               necessary/harmful/redundant/inert 判定；缺 checkpoint 或
+               操作检查不进 pass，缺产物报 not_verifiable（零 GPU，
+               不重训、不读 test split）；别名 inference_lesion /
+               lesion_panel / component_lesion
   design       设计前馈：token/参数/读取预算台账、专用对照臂、证据等级
                 （v6-v11 永远 exploratory；draft 不能 confirmatory）与动态
                 分块 H1-H5 假设/对照（零 GPU，不读 test）
