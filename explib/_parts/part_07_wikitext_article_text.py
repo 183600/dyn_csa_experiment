@@ -434,6 +434,39 @@ def _sampling_plan_fp(plan):
     return hashlib.sha256(blob.encode('utf-8')).hexdigest()
 
 
+def _sampling_finite_sum(values):
+    """Sum a finite size vector, or return ``None`` when truly unrepresentable.
+
+    Ordinary corpora keep the exact NumPy sum (so persisted plans do not
+    change).  A syntactically valid scale-up declaration may carry sizes near
+    ``float.max``; summing those overflows even though every element is finite,
+    and a NaN/inf coverage fraction makes the whole plan non-JSON.  Normalise
+    by the largest element only on that overflow path.
+    """
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.size == 0:
+        return 0.0
+    with np.errstate(over='ignore', invalid='ignore'):
+        total = float(arr.sum())
+    if math.isfinite(total):
+        return total
+    scale = float(np.max(np.abs(arr)))
+    if not (math.isfinite(scale) and scale > 0.0):
+        return None
+    with np.errstate(over='ignore', invalid='ignore'):
+        unit = math.fsum((arr / scale).tolist())
+    if not (math.isfinite(unit) and unit > 0.0):
+        return None
+    try:
+        log_total = math.log(scale) + math.log(unit)
+    except (ValueError, OverflowError):
+        return None
+    if log_total > math.log(sys.float_info.max):
+        return None
+    out = math.exp(log_total)
+    return out if math.isfinite(out) else None
+
+
 def _sampling_allocation(n_units, n_select, stratum_sizes, allocation,
                          min_per_stratum, stratum_size_sums=None):
     """Integer allocation of ``n_select`` units over non-empty strata.
@@ -464,8 +497,19 @@ def _sampling_allocation(n_units, n_select, stratum_sizes, allocation,
     else:
         raise ValueError(
             f'allocation must be one of proportional/equal/size_weighted, got {allocation!r}')
-    if not np.isfinite(weights).all() or weights.sum() <= 0:
-        weights = counts.astype(np.float64)
+    with np.errstate(over='ignore', invalid='ignore'):
+        _wsum = float(weights.sum())
+    if not np.isfinite(weights).all() or not math.isfinite(_wsum) or _wsum <= 0:
+        if (math.isfinite(weights).all() and np.any(weights > 0.0)):
+            # The elements are representable but their sum is not.  Only the
+            # relative weights enter the allocation; normalise by the largest
+            # weight so a scale-up size declaration keeps size weighting
+            # instead of silently falling back to unit-count weighting.
+            weights = weights / float(np.max(weights))
+            _wsum = float(weights.sum())
+        if not (math.isfinite(_wsum) and _wsum > 0):
+            weights = counts.astype(np.float64)
+            _wsum = float(weights.sum())
     min_per_stratum = int(min_per_stratum)
     if min_per_stratum < 0:
         raise ValueError(
@@ -478,7 +522,7 @@ def _sampling_allocation(n_units, n_select, stratum_sizes, allocation,
         raise ValueError(
             f'n_select={n_select} cannot give {min_per_stratum} unit(s) '
             f'to each of {S} non-empty strata; lower min_per_stratum or select more')
-    ideal = weights / weights.sum() * float(n_select)
+    ideal = weights / _wsum * float(n_select)
     alloc = np.floor(ideal).astype(np.int64)
     alloc = np.minimum(alloc, counts)
     # Guarantee the per-stratum minimum before spending the remainder.
@@ -571,7 +615,7 @@ def document_stratified_plan(sizes, n_select, *, seed=0, n_strata=4,
         raise ValueError('sizes must be finite (no NaN/inf)')
     if (sizes_f < 0).any():
         raise ValueError('sizes must be non-negative')
-    if float(sizes_f.sum()) <= 0:
+    if not np.any(sizes_f > 0.0):
         raise ValueError('sizes must have a positive total')
     seed = _sampling_int('seed', seed, minimum=0)
     n_strata = _sampling_int('n_strata', n_strata, minimum=1)
@@ -587,7 +631,15 @@ def document_stratified_plan(sizes, n_select, *, seed=0, n_strata=4,
     stratum_members = [np.asarray(x, dtype=np.int64)
                        for x in np.array_split(order, n_strata)]
     stratum_sizes = [int(m.size) for m in stratum_members]
-    _size_sums = [float(sizes_f[m].sum()) for m in stratum_members]
+    _size_sums = [_sampling_finite_sum(sizes_f[m]) for m in stratum_members]
+    if any(v is None for v in _size_sums):
+        # Only the relative weights matter for `size_weighted`; use a common
+        # scale so an overflow in one stratum cannot silently fall back to the
+        # unit-count weighting.
+        _sum_scale = float(np.max(np.abs(sizes_f)))
+        _size_sums = [math.fsum((sizes_f[m] / _sum_scale).tolist())
+                      if math.isfinite(_sum_scale) and _sum_scale > 0.0 else 1.0
+                      for m in stratum_members]
     alloc = _sampling_allocation(n_units, n_select, stratum_sizes,
                                  allocation, min_per_stratum,
                                  stratum_size_sums=_size_sums)
@@ -615,7 +667,7 @@ def document_stratified_plan(sizes, n_select, *, seed=0, n_strata=4,
             'index': int(_i),
             'n_units': int(_members.size),
             'n_selected': _k,
-            'size_sum': float(_sizes.sum()),
+            'size_sum': _sampling_finite_sum(_sizes),
             'min_size': float(_sizes.min()) if _members.size else None,
             'max_size': float(_sizes.max()) if _members.size else None,
             'selected_fraction': (float(_k) / float(_members.size)
@@ -626,8 +678,24 @@ def document_stratified_plan(sizes, n_select, *, seed=0, n_strata=4,
         raise RuntimeError('internal error: stratified sample is not a '
                            f'without-replacement sample of size {n_select}')
     all_represented = all(s['n_selected'] > 0 for s in strata)
-    total_size = float(sizes_f.sum())
-    selected_size = float(sizes_f[np.asarray(selected, dtype=np.int64)].sum())
+    total_size = _sampling_finite_sum(sizes_f)
+    selected_size = _sampling_finite_sum(
+        sizes_f[np.asarray(selected, dtype=np.int64)])
+    if (total_size is not None and selected_size is not None
+            and total_size > 0.0):
+        size_coverage = selected_size / total_size
+    else:
+        # The absolute sums can overflow while their ratio is a well-defined
+        # fraction in [0, 1].  Compute that ratio on a common unit scale.
+        _size_scale = float(np.max(np.abs(sizes_f)))
+        if math.isfinite(_size_scale) and _size_scale > 0.0:
+            _all_units = math.fsum((sizes_f / _size_scale).tolist())
+            _sel_units = math.fsum(
+                (sizes_f[np.asarray(selected, dtype=np.int64)] / _size_scale).tolist())
+            size_coverage = (_sel_units / _all_units
+                             if _all_units > 0.0 else 0.0)
+        else:
+            size_coverage = 0.0
     # Hash the size vector incrementally: the same digest as
     # ','.join(format(float(x), '.17g') ...), without materialising a string
     # with one entry per corpus unit (which is large for a scale-up corpus).
@@ -651,8 +719,7 @@ def document_stratified_plan(sizes, n_select, *, seed=0, n_strata=4,
         'selection_without_replacement': True,
         'all_strata_represented': bool(all_represented),
         'unit_coverage_fraction': float(n_select) / float(n_units),
-        'size_coverage_fraction': (selected_size / total_size
-                                   if total_size > 0 else 0.0),
+        'size_coverage_fraction': float(size_coverage),
         'strata': strata,
     }
     plan['plan_fp'] = _sampling_plan_fp(plan)

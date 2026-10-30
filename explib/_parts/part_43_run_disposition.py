@@ -241,12 +241,50 @@ def _dispo_canonical(obj):
 
 
 def _dispo_timestamp(value):
-    """Parse the drivers' ISO wall-clock stamp; ``None`` if not comparable."""
+    """Parse the drivers' ISO wall-clock stamp, or ``None`` when unparseable.
+
+    The drivers write ``time.strftime('%Y-%m-%dT%H:%M:%S')``, but a hand-written
+    or third-party ledger may use the equally valid ``...Z`` / fractional-second
+    forms.  Treating those as "no timestamp" silently disabled the
+    plan-before-first-attempt check on exactly the artifacts an auditor is most
+    likely to inspect, so accept the ISO forms ``datetime`` already understands
+    before falling back to the historical strptime list.
+    """
     if not isinstance(value, str) or not value.strip():
         return None
+    text = value.strip()
+    if text.endswith('Z'):
+        text = text[:-1] + '+00:00'
     try:
-        return time.strptime(value.strip(), '%Y-%m-%dT%H:%M:%S')
-    except (ValueError, OverflowError):
+        return _dt.datetime.fromisoformat(text)
+    except (TypeError, ValueError, OverflowError):
+        pass
+    for fmt in ('%Y-%m-%dT%H:%M:%S', '%Y-%m-%d %H:%M:%S',
+                '%Y-%m-%dT%H:%M', '%Y-%m-%d'):
+        try:
+            return _dt.datetime.strptime(text, fmt)
+        except (TypeError, ValueError, OverflowError):
+            continue
+    return None
+
+
+def _dispo_epoch(value):
+    """Comparable epoch seconds for a disposition timestamp.
+
+    Naive stamps are interpreted as UTC: the drivers' ``strftime`` stamps carry
+    no zone, and both the plan and the attempt are written by the same process,
+    so only their order matters.  Using one fixed zone (instead of
+    ``time.mktime``, which follows the host's local/DST rules) keeps the
+    comparison stable when an artifact is audited on another machine.
+    """
+    stamp = _dispo_timestamp(value)
+    if stamp is None:
+        return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=_dt.timezone.utc)
+    try:
+        return float(stamp.timestamp())
+    except (OverflowError, OSError, ValueError):
         return None
 
 
@@ -527,9 +565,13 @@ def run_disposition_audit(events, *, planned_cells=None, plan=None,
         'n_planned_without_success': 0,
         'n_retained_without_success_event': 0,
         'n_retained_second_success': 0,
+        'n_retained_not_declared_success': 0,
         'n_failures': 0,
         'n_unclassified_failures': 0,
+        'n_ambiguous_failures': 0,
+        'n_ambiguous_retried': 0,
         'n_non_replaceable_retried': 0,
+        'n_single_attempt_violations': 0,
         'n_attempt_budget_exceeded': 0,
         'n_superseded_cells': 0,
         'n_legacy_events': 0,
@@ -593,28 +635,27 @@ def run_disposition_audit(events, *, planned_cells=None, plan=None,
     # A precommitment written after the first attempt is a reconstruction.  The
     # same rule the run-order audit applies to its plan applies here.
     if out['frame'] == 'precommitted':
-        _plan_ts = _dispo_timestamp(out.get('plan_created_at'))
-        _first_ts = next((_dispo_timestamp(r['started_at']) for r in rows
-                          if _dispo_timestamp(r['started_at']) is not None), None)
+        _plan_epoch = _dispo_epoch(out.get('plan_created_at'))
+        _first_epoch = next((_dispo_epoch(r['started_at']) for r in rows
+                             if _dispo_epoch(r['started_at']) is not None), None)
         first_started = next((r['started_at'] for r in rows
-                              if _dispo_timestamp(r['started_at']) is not None),
+                              if _dispo_epoch(r['started_at']) is not None),
                              None)
         out['first_attempt_at'] = first_started
-        if _first_ts is None:
+        if _first_epoch is None:
             # No attempt timestamp (synthetic/legacy ledger): the plan-before-
             # attempt relation is simply not testable here.  The run-order
             # timing gate owns the general plan-timing check; do not invent a
             # warning from a ledger that carries no wall-clock stamps.
             out['plan_before_first_attempt'] = None
-        elif _plan_ts is None:
+        elif _plan_epoch is None:
             out['plan_before_first_attempt'] = None
             out['warnings'].append(
                 'the first attempt has a timestamp but the plan does not; '
                 'whether the disposition was registered before execution '
                 'cannot be established')
         else:
-            out['plan_before_first_attempt'] = bool(
-                time.mktime(_plan_ts) <= time.mktime(_first_ts))
+            out['plan_before_first_attempt'] = bool(_plan_epoch <= _first_epoch)
             if not out['plan_before_first_attempt']:
                 _msg = ('run_disposition.json was written after the first cell '
                         f"started ({out.get('plan_created_at')!r} > "
@@ -674,12 +715,21 @@ def run_disposition_audit(events, *, planned_cells=None, plan=None,
             r['matched_terms'] = list(terms)
             if cls in ('unclassified', '__unknown__', '__invalid__'):
                 out['n_unclassified_failures'] += 1
+            if r['ambiguous_class']:
+                # A free-text failure that matches both a replaceable and a
+                # non-replaceable class cannot be classified as infrastructure
+                # noise.  The first class is kept for display, but the retry
+                # check below treats the ambiguity as fail-closed.
+                out['n_ambiguous_failures'] += 1
             key = f"{r['key']}::{r['status']}"
             rec = out['failure_classes'].setdefault(
                 cls, {'class': cls, 'n_attempts': 0, 'n_cells': 0,
-                      'n_retried': 0, 'replaceable': cls in
+                      'n_retried': 0, 'n_ambiguous': 0,
+                      'replaceable': cls in
                       set(pol['replaceable_failure_classes'])})
             rec['n_attempts'] += 1
+            if r['ambiguous_class']:
+                rec['n_ambiguous'] += 1
     # Count failed cells once per class (a cell can have two identical errors).
     _seen_class_cells = {}
     for key, cell_rows in grouped.items():
@@ -698,6 +748,11 @@ def run_disposition_audit(events, *, planned_cells=None, plan=None,
             f"{out['n_unclassified_failures']} failed attempt(s) have no "
             'declared failure class; the policy cannot say whether replacing '
             'them is infrastructure noise or an arm property')
+    if out['n_ambiguous_failures']:
+        out['warnings'].append(
+            f"{out['n_ambiguous_failures']} failed attempt(s) match more than "
+            'one declared failure class; an ambiguous failure is never treated '
+            'as replaceable infrastructure noise')
     if out['n_unplanned_attempts'] and not out['n_unplanned_measurements']:
         out['warnings'].append(
             f"{out['n_unplanned_attempts']} attempt(s) belong to a cell outside "
@@ -754,9 +809,11 @@ def run_disposition_audit(events, *, planned_cells=None, plan=None,
         fail_rows = [r for r in cell_rows if r['failure']]
         first_ok = ok_rows[0] if ok_rows else None
         first_ok_idx = first_ok['index'] if first_ok else None
+        last_ok = ok_rows[-1] if ok_rows else None
         rec = retained_valid.get(key)
         rec_rid = (rec or {}).get('run_id')
         first_ok_rid = (first_ok or {}).get('run_id')
+        last_ok_rid = (last_ok or {}).get('run_id')
         later_attempts = ([r for r in cell_rows
                            if first_ok_idx is not None and r['index'] > first_ok_idx]
                           if first_ok_idx is not None else [])
@@ -794,7 +851,14 @@ def run_disposition_audit(events, *, planned_cells=None, plan=None,
                 cls = r['failure_class']
                 if cls in out['failure_classes']:
                     out['failure_classes'][cls]['n_retried'] += 1
-                if cls in set(pol['non_replaceable_failure_classes']):
+                if r['ambiguous_class']:
+                    out['n_ambiguous_retried'] += 1
+                    out['problems'].append(
+                        f'cell {key!r}: the failure text matches more than one '
+                        f'declared class ({", ".join(r["matched_terms"])}); an '
+                        'ambiguous failure cannot be treated as replaceable '
+                        'infrastructure noise, so the retry is not permitted')
+                elif cls in set(pol['non_replaceable_failure_classes']):
                     out['n_non_replaceable_retried'] += 1
                     out['problems'].append(
                         f'cell {key!r}: failure class {cls!r} is declared '
@@ -878,11 +942,32 @@ def run_disposition_audit(events, *, planned_cells=None, plan=None,
                     out['problems'].append(
                         f'cell {key!r} has more than one successful attempt but '
                         'the policy requires a single attempt')
-                else:
+                elif rec_rid == last_ok_rid:
                     out['warnings'].append(
                         f'cell {key!r}: the policy explicitly retains the last '
                         'success; the result is descriptive/exploratory, not a '
                         'confirmatory measurement')
+            if (pol['retention'] == 'last_success'
+                    and rec_rid is not None and rec_rid in ok_rids
+                    and last_ok_rid is not None and rec_rid != last_ok_rid):
+                # The declared rule is "last success"; keeping an earlier
+                # success under that rule is selection in the opposite
+                # direction, and it would otherwise pass silently because the
+                # generic later-than-first check only covers first_success.
+                out['n_retained_not_declared_success'] += 1
+                out['problems'].append(
+                    f'cell {key!r}: the policy declares retention=last_success '
+                    f'but the retained attempt is {rec_rid!r}, not the last '
+                    f'success ({last_ok_rid!r}); the declared rule was not '
+                    'applied')
+        if len(cell_rows) > 1 and pol['retention'] == 'single_attempt' \
+                and len(ok_rows) <= 1:
+            # A failure followed by a success is still two attempts, not the
+            # single attempt this policy declares.
+            out['n_single_attempt_violations'] += 1
+            out['problems'].append(
+                f'cell {key!r} has {len(cell_rows)} attempts but the policy '
+                'requires a single attempt')
         if len(ok_rows) > 1 and pol['retention'] == 'first_success' \
                 and rec_rid is not None and rec_rid == first_ok_rid:
             out['warnings'].append(

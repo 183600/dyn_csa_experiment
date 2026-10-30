@@ -1206,18 +1206,38 @@ def tuning_selection_margin(best, runner, *, metric='ppl', direction='lower_is_b
                 paired_margin = float(_diffs_arr.mean())
                 sd = float(np.std(_diffs_arr, ddof=1))
             se = sd / math.sqrt(len(diffs))
-            # The paired SE is estimated on the COMMON seeds.  Comparing it
-            # with a margin taken from the two rows' full (possibly
-            # different-seed) means would put the numerator and denominator on
-            # different samples.  Use the paired mean difference instead, and
-            # keep the original row-level margin for transparency.
-            out.update({'margin': paired_margin,
-                        'margin_unpaired': float(margin),
-                        'se': float(se),
-                        'z': (float(paired_margin / se) if se > 0 else None),
-                        'decisive': bool(paired_margin > se),
-                        'method': 'paired_search_seeds',
-                        'n_paired': len(common), 'common_seeds': common})
+            # A finite paired panel can still have an SD beyond float64 (for
+            # example opposite-signed differences near the limit).  The SE and
+            # z are then unavailable, not infinite; `decisive` must not be
+            # decided from an unrepresentable spread, and an infinite value is
+            # not strict-JSON safe.
+            if not (math.isfinite(float(paired_margin)) and math.isfinite(float(se))):
+                out.update({'margin': (float(paired_margin)
+                                       if math.isfinite(float(paired_margin))
+                                       else None),
+                            'margin_unpaired': (float(margin)
+                                                if math.isfinite(float(margin))
+                                                else None),
+                            'se': None, 'z': None, 'decisive': None,
+                            'method': 'paired_search_seeds',
+                            'n_paired': len(common), 'common_seeds': common,
+                            'reason': ('the paired margin or its standard error '
+                                       'exceeds the representable float range; '
+                                       'the pick is not decidable from this '
+                                       'sample')})
+            else:
+                # The paired SE is estimated on the COMMON seeds.  Comparing it
+                # with a margin taken from the two rows' full (possibly
+                # different-seed) means would put the numerator and denominator
+                # on different samples.  Use the paired mean difference instead,
+                # and keep the original row-level margin for transparency.
+                out.update({'margin': float(paired_margin),
+                            'margin_unpaired': float(margin),
+                            'se': float(se),
+                            'z': (float(paired_margin / se) if se > 0 else None),
+                            'decisive': bool(paired_margin > se),
+                            'method': 'paired_search_seeds',
+                            'n_paired': len(common), 'common_seeds': common})
         else:
             # Both rows DO expose per-seed evidence, but they do not share
             # enough draws for a paired margin.  Falling back to the
@@ -1242,9 +1262,12 @@ def tuning_selection_margin(best, runner, *, metric='ppl', direction='lower_is_b
             s1 = abs(float(_std_b)) / math.sqrt(n1)
             s2 = abs(float(_std_r)) / math.sqrt(n2)
             se_i = math.hypot(s1, s2)
-            out['se_independent'] = float(se_i)
-            out['decisive_independent'] = bool(margin > se_i)
-            if out['method'] != 'paired_search_seeds' and not _paired_insufficient:
+            _se_i_ok = math.isfinite(float(se_i))
+            out['se_independent'] = float(se_i) if _se_i_ok else None
+            out['decisive_independent'] = (bool(margin > se_i)
+                                           if _se_i_ok else None)
+            if (out['method'] != 'paired_search_seeds'
+                    and not _paired_insufficient and _se_i_ok):
                 out.update({'se': float(se_i),
                             'z': (float(margin / se_i) if se_i > 0 else None),
                             'decisive': bool(margin > se_i),
@@ -1343,7 +1366,10 @@ def tuning_selection_stability(trials, metric='ppl', direction='lower_is_better'
                 _tok = sum(acc_maps[i][s][1] for s in keep)
                 value = float(_safe_exp_ppl(_nll / _tok))
             else:
-                value = float(np.mean([m[s] for s in keep]))
+                # A finite per-seed PPL panel can overflow a naive sum at the
+                # float limit; the guarded mean is scale invariant and leaves
+                # ordinary PPL magnitudes on the historical NumPy path.
+                value = _scaled_mean_or_raw([m[s] for s in keep])
             vals.append((sig, value))
         best = (min(vals, key=lambda kv: kv[1]) if direction == 'lower_is_better'
                 else max(vals, key=lambda kv: kv[1]))

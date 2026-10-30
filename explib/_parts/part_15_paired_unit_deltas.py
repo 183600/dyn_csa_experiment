@@ -416,7 +416,9 @@ def unit_precision_design(n_units, *, pilot_unit_deltas=None,
                 mde = None
         out['mde'] = {
             'absolute': float(mde) if mde is not None else None,
-            'relative_to_pilot_sd': (float(mde) / sd if mde is not None else None),
+            'relative_to_pilot_sd': (float(mde) / sd if (mde is not None
+                                                        and math.isfinite(float(mde) / sd))
+                                     else None),
             'method': ('normal power approximation with the t critical value: '
                        '(t_crit + Phi^-1(target_power)) * sd / sqrt(n)'),
             'multiple_of_sesoi': None,
@@ -473,8 +475,12 @@ def unit_precision_design(n_units, *, pilot_unit_deltas=None,
                         'require_sesoi_power=true and the planned unit count is '
                         'underpowered at the pre-registered SESOI')
     if out['mde'].get('absolute') is not None and sesoi_value is not None:
-        out['mde']['multiple_of_sesoi'] = float(
-            out['mde']['absolute'] / sesoi_value)
+        _multiple = float(out['mde']['absolute'] / sesoi_value)
+        # mde / a tiny-but-positive SESOI can exceed float64 even when both
+        # operands are representable; an infinite JSON number is not a usable
+        # planning statement.
+        out['mde']['multiple_of_sesoi'] = (_multiple
+                                           if math.isfinite(_multiple) else None)
     claim_allowed = False
     claim_note = None
     if n is not None and label is not None:
