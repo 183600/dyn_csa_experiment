@@ -207,7 +207,10 @@ def crossed_variance_components(values, *, conf=0.95):
     absolute_ok = bool(math.isfinite(scale2) and scale2 > 0.0)
 
     def _scale_mean(value):
-        if value is None or not absolute_ok:
+        # A mean is not a squared quantity: it can still be representable when
+        # ``scale**2`` is not (e.g. a 1e200 panel whose mean is 5e199).  Only
+        # require the final product to fit float64.
+        if value is None or not (math.isfinite(scale) and scale > 0.0):
             return None
         value = float(value) * scale
         return value if math.isfinite(value) else None
@@ -243,7 +246,12 @@ def crossed_variance_components(values, *, conf=0.95):
 
     var_mean = _var_of_mean(True)
     var_mean_cond = _var_of_mean(False)
-    status = 'ok' if (total > 0.0 and absolute_ok) else 'not_estimable'
+    # A non-constant extreme panel still has a well-defined scale-free
+    # decomposition: component shares, ICCs, effective N and the allocation
+    # ratio are computed on the normalised work matrix and do not need the
+    # absolute (squared) values.  Withholding the absolute fields must not
+    # turn that into "not_estimable", which would discard a valid readout.
+    status = 'ok' if total > 0.0 else 'not_estimable'
     if total <= 0.0:
         warnings.append('all estimated variance components are zero; the '
                         'panel is constant and no sampling variance can be '

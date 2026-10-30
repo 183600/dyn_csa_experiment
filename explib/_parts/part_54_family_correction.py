@@ -43,6 +43,11 @@ import numpy as _fc_np
 # declared family multiply the working set by m.
 FAMILY_SIGNFLIP_CHUNK_TARGET = 1 << 18
 
+# Absolute allocation guard for the exact 2**n enumeration.  ``max_n`` may be
+# tightened per panel, but a caller must not be able to disable the guard and
+# turn an accidental/injected cap into an unbounded ``np.empty(1 << n)``.
+FAMILY_SIGNFLIP_HARD_MAX_N = 24
+
 
 FAMILY_CORRECTION_POLICY = {
     'version': 'confirmation-family-correction-3',
@@ -129,6 +134,11 @@ def _fc_score_maxt(matrix, alpha):
     """
     A = _fc_np.asarray(matrix, dtype=float)
     m, n = A.shape
+    if n > FAMILY_SIGNFLIP_HARD_MAX_N:
+        raise ValueError(
+            f'exact family max-T: n={n} exceeds the absolute hard cap '
+            f'{FAMILY_SIGNFLIP_HARD_MAX_N}; refusing an unbounded 2**n '
+            'allocation')
     total = 1 << n
     row_scale = _fc_np.max(_fc_np.abs(A), axis=1)
     nz_row = row_scale > 0.0
@@ -416,6 +426,11 @@ def confirmation_family_correction(comparisons, *, family_names, frozen_holm=Non
         return _fc_not_estimable(
             f'n={n} exceeds the exact-enumeration cap max_n={cap}; the '
             'block refuses an approximation rather than mislabel it exact')
+    if n > FAMILY_SIGNFLIP_HARD_MAX_N:
+        return _fc_not_estimable(
+            f'n={n} exceeds the absolute exact-enumeration hard cap '
+            f'{FAMILY_SIGNFLIP_HARD_MAX_N}; refusing an unbounded 2**n '
+            'allocation rather than exhausting memory')
     m = len(names)
     D = [rows[name] for name in names]
 
@@ -439,9 +454,16 @@ def confirmation_family_correction(comparisons, *, family_names, frozen_holm=Non
     raw_mean_p = {}
     for name in names:
         p = comparisons[name].get('p_exact_signflip')
-        raw_mean_p[name] = (None if p is None
-                            else _fc_number(p, f'{name}.p_exact_signflip'))
-    frozen_holm_p = _fc_frozen_holm(frozen_holm, names)
+        try:
+            raw_mean_p[name] = (None if p is None
+                                else _fc_number(
+                                    p, f'{name}.p_exact_signflip'))
+        except ValueError as e:
+            return _fc_not_estimable(f'invalid stored mean p-value: {e}')
+    try:
+        frozen_holm_p = _fc_frozen_holm(frozen_holm, names)
+    except ValueError as e:
+        return _fc_not_estimable(f'invalid frozen_holm mapping: {e}')
     holm_mean = None
     if frozen_holm_p is not None:
         # Preserve the frozen adjusted values verbatim.  A missing slot stays

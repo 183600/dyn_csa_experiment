@@ -56,6 +56,14 @@ import numbers
 import numpy as np
 
 JOINT_SIGNFLIP_MAX_N = 20
+# Absolute allocation guard for the exact 2**n enumeration.  ``max_n`` is an
+# optional cap a caller can *tighten* for a panel, but letting it be raised
+# without bound would turn an accidental ``max_n=10**9`` (or an untrusted
+# record) into a multi-gigabyte ``np.empty(1 << n)`` instead of a clean
+# refusal.  Keep a hard ceiling that is still large enough for a deliberately
+# extended exact panel; above it the caller must use Holm rather than an
+# approximation.
+JOINT_SIGNFLIP_HARD_MAX_N = 24
 JOINT_SIGNFLIP_CHUNK_TARGET = 1 << 18
 JOINT_SIGNFLIP_METHOD = 'westfall-young free step-down max-T (exact sign flips)'
 
@@ -302,6 +310,14 @@ def maxt_signflip_adjust(named_deltas, *, alpha=0.05,
         raise ValueError(f'{where}: n={n} exceeds the exact-enumeration cap '
                          f'max_n={max_n}; use Holm rather than an '
                          'approximation')
+    if n > JOINT_SIGNFLIP_HARD_MAX_N:
+        # A caller-controlled ``max_n`` must not be able to disable the
+        # memory guard: 2**n is materialised below, so an unbounded cap is an
+        # allocation bug rather than a larger exact computation.
+        raise ValueError(
+            f'{where}: n={n} exceeds the absolute exact-enumeration hard cap '
+            f'{JOINT_SIGNFLIP_HARD_MAX_N}; use Holm (or a smaller panel) '
+            'rather than attempting an unbounded 2**n allocation')
     m = len(names)
     # Row-scale before the mean/SD/sum: deltas near 1e308 overflow a naive
     # sum/var even though every delta is finite.  The sign-flip statistic is

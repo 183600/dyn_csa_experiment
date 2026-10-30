@@ -265,6 +265,11 @@ def confirmation_practical_significance(deltas, *, margin=None, alpha=0.05,
     conf = (1.0 - a) if tost_conf is None else _cp_number(tost_conf, 'tost_conf')
     if not (0.0 < conf < 1.0):
         raise ValueError(f'tost_conf must be in (0,1), got {conf!r}')
+    if not isinstance(scale, str) or scale not in ('log_ratio', 'raw_ppl'):
+        # Silently falling back to log_ratio makes a raw-PPL margin mean
+        # something else than the caller declared.  Fail closed instead.
+        raise ValueError(
+            f"scale must be 'log_ratio' or 'raw_ppl', got {scale!r}")
     sign = None
     if expected_sign is not None:
         if isinstance(expected_sign, str):
@@ -289,7 +294,7 @@ def confirmation_practical_significance(deltas, *, margin=None, alpha=0.05,
         'version': (policy_version or CONFIRMATION_SESOI['version']),
         'role': ('descriptive practical-significance/equivalence readout; it '
                  'does not alter p_exact_signflip, p_holm, verified or confirmed'),
-        'scale': scale if scale in ('log_ratio', 'raw_ppl') else 'log_ratio',
+        'scale': scale,
         'unit': 'seed',
         'alpha': float(a),
         'alpha_one_sided': float(a / 2.0),
@@ -368,15 +373,31 @@ def confirmation_practical_significance(deltas, *, margin=None, alpha=0.05,
     # Store the analysis-scale vector so an audit can replay the test even
     # when the source PPL cells are absent.
     out['per_seed_log_ratio'] = [float(x) for x in d]
-    if ppl_a is not None and ppl_b is not None:
+    if (ppl_a is None) != (ppl_b is None):
+        raise ValueError('ppl_a and ppl_b must be provided together')
+    if ppl_a is not None:
+        if isinstance(ppl_a, (str, bytes, bytearray, dict)) or isinstance(
+                ppl_b, (str, bytes, bytearray, dict)):
+            raise ValueError('ppl_a/ppl_b must be iterables of PPL values')
         try:
             pa = list(ppl_a)
             pb = list(ppl_b)
         except TypeError:
             raise ValueError('ppl_a/ppl_b must be iterables') from None
-        if len(pa) == len(raw) and len(pb) == len(raw):
-            out['per_seed_ppl_a'] = [float(pa[i]) for i in kept]
-            out['per_seed_ppl_b'] = [float(pb[i]) for i in kept]
+        if len(pa) != len(raw) or len(pb) != len(raw):
+            # The arrays are indexed by the SAME original positions as
+            # ``deltas``; a shorter/longer provenance vector cannot be
+            # aligned and must not be silently ignored.
+            raise ValueError(
+                'ppl_a/ppl_b length must match deltas '
+                f'({len(pa)}/{len(pb)} vs {len(raw)})')
+        # A PPL is a finite positive measurement.  Validating here keeps an
+        # inf/NaN/string/None provenance cell from leaking into a strict-JSON
+        # report (and from masking which input was malformed).
+        out['per_seed_ppl_a'] = [
+            _cp_number(pa[i], f'ppl_a[{i}]', positive=True) for i in kept]
+        out['per_seed_ppl_b'] = [
+            _cp_number(pb[i], f'ppl_b[{i}]', positive=True) for i in kept]
     _ms = _scaled_mean_std_if_extreme(arr, ddof=1)
     if _ms is not None:
         mean, sd = _ms
