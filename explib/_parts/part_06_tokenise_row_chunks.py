@@ -215,8 +215,23 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=None, cache_dir=None,
             _sig_paths['test_token_doc_ids'] = ttd_path
         if os.path.exists(tk_path):
             _sig_paths['tokenizer'] = tk_path
+        # The verification path also reads every paired train meta and the
+        # train/validation document-id sidecars, and it compares the recorded
+        # dataset source.  Those files were absent from the memo key, so a
+        # replaced/deleted sidecar or a different declared source could keep
+        # serving an "already verified" test tuple from this process.  Bind
+        # them to the key as well.
+        import glob as _glob_memo
+        for _pm in sorted(_glob_memo.glob(os.path.join(
+                cache_dir, 'meta_v5_*.json'))):
+            _sig_paths['paired_meta:' + os.path.basename(_pm)] = _pm
+        for _pat in ('train_doc_ids_v5_*.npy', 'val_doc_ids_*.npy'):
+            for _p in sorted(_glob_memo.glob(os.path.join(cache_dir, _pat))):
+                _sig_paths['paired_docs:' + os.path.basename(_p)] = _p
         _sig = _memo_file_sig(_sig_paths)
-        _mkey = (os.path.abspath(cache_dir), tag, _sig)
+        _src_key = json.dumps(wikitext_dataset_source(), sort_keys=True,
+                              default=str)
+        _mkey = (os.path.abspath(cache_dir), tag, _sig, _src_key)
         _hit = _WT103_TEST_MEMO.get(_mkey)
         if _hit is not None:
             print('[data] serving TEST token ids from the in-process memo (same cache files, already verified) ...')
@@ -363,6 +378,18 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=None, cache_dir=None,
                 f'{type(_mdoc_raw).__name__}, not an object; group isolation '
                 'cannot be verified')
         _mdoc = _mdoc_raw if isinstance(_mdoc_raw, dict) else {}
+        if not _mdoc and test_doc_ids is None:
+            # Neither the metadata ledger nor the sidecar names the served
+            # documents.  The train/test and val/test intersections cannot be
+            # recomputed, so the frozen slice has no evidence that its groups
+            # are disjoint from the selection/training splits.  A row-level
+            # fallback is not isolation evidence; fail closed and require an
+            # explicit rebuild (legacy caches without a doc-id sidecar must be
+            # rebuilt before the one-shot final evaluation).
+            _problems.append(
+                'test cache has no document-id evidence (neither the metadata '
+                'doc_ids block nor test_doc_ids_*.npy is present); '
+                'train/validation/test group isolation cannot be verified')
         if _mdoc or test_doc_ids is not None:
             if test_doc_ids is None:
                 _problems.append('test cache metadata records document ids but the sidecar is missing')
@@ -800,11 +827,23 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=None, cache_dir=None,
             _mt = json.load(open(_mp, encoding='utf-8'))
         except Exception:
             continue
+        if not isinstance(_mt, dict):
+            # A valid-JSON list/scalar is not train-cache metadata.  The
+            # earlier builder loop already skips these; this cross-check must
+            # use the same guard instead of crashing on ``.get``.
+            continue
         _mv = _mt.get('vocab')
         if _mv is None:
             continue
-        if int(_mv) != int(vocab):
-            raise RuntimeError(f'load_wikitest: the freshly fitted tokenizer (vocab={vocab}) disagrees with the cached train corpus (vocab={_mv} in {_mp}) — the splits cannot be paired; delete wt103_cache/ and rebuild both')
+        try:
+            _mv = int(_mv)
+        except (TypeError, ValueError, OverflowError):
+            raise RuntimeError(
+                f'load_wikitest: cached train corpus {_mp} records a '
+                f'non-integer vocab ({_mt.get("vocab")!r}); the test/train '
+                'tokenizer pairing cannot be verified — rebuild the cache')
+        if _mv != int(vocab):
+            raise RuntimeError(f'load_wikitest: the freshly fitted tokenizer (vocab={vocab}) disagrees with the cached train corpus (vocab={_mt.get("vocab")!r} in {_mp}) — the splits cannot be paired; delete wt103_cache/ and rebuild both')
     if not _train_meta_objs:
         raise RuntimeError('load_wikitest: no train/validation meta exists in the cache directory — build (or copy) the frozen train cache FIRST; the test tokenizer and the dedup index are functions of that train split, and touching test before it exists cannot be audited')
     # Validation is the SELECTION split.  A test document that duplicates a

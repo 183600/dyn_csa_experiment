@@ -55,7 +55,11 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=None, val_seqs=512,
         _sig = _memo_file_sig({'train': tr_path, 'val': va_path, 'bnd': vp_path,
                                'meta': me_path, 'train_doc_ids': trd_path,
                                'val_doc_ids': vad_path, 'tokenizer': tk_path})
-        _mkey = (os.path.abspath(cache_dir), tag, _sig, _local_sig)
+        # The verified path also compares the declared dataset source (Hub
+        # revision / local stand-in identity).  Without it in the key, changing
+        # the revision env var kept a stale memo entry alive.
+        _src_key = json.dumps(_fw_source, sort_keys=True, default=str)
+        _mkey = (os.path.abspath(cache_dir), tag, _sig, _local_sig, _src_key)
         _hit = _FWEB_MEMO.get(_mkey)
         if _hit is not None:
             print('[data] serving fineweb token ids from the in-process memo (same cache files, already verified) ...')
@@ -507,7 +511,16 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=None, val_seqs=512,
         audit_corpus_split(train_ids, val_batch, vocab, dataset='fineweb',
                            meta=json.load(open(me_path, encoding='utf-8')))
         _out = (train_ids, val_batch, vocab, tok, val_bnd)
-        _memo_put(_FWEB_MEMO, (os.path.abspath(cache_dir), tag, _memo_file_sig({'train': tr_path, 'val': va_path, 'bnd': vp_path, 'meta': me_path, 'train_doc_ids': trd_path, 'val_doc_ids': vad_path, 'tokenizer': tk_path}), _local_sig), _out, _FWEB_MEMO_CAP)
+        _memo_put(_FWEB_MEMO, (os.path.abspath(cache_dir), tag,
+                               _memo_file_sig({'train': tr_path, 'val': va_path,
+                                               'bnd': vp_path, 'meta': me_path,
+                                               'train_doc_ids': trd_path,
+                                               'val_doc_ids': vad_path,
+                                               'tokenizer': tk_path}),
+                               _local_sig,
+                               json.dumps(_fw_source, sort_keys=True,
+                                          default=str)),
+                  _out, _FWEB_MEMO_CAP)
         return _out
     finally:
         for _raw in (raw_train, raw_val):

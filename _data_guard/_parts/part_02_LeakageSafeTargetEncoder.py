@@ -1102,6 +1102,15 @@ def audit_preprocessor_fit(preprocessor, X_train, X_holdout=None, *,
     Xtr = _as_float_2d(X_train, name='X_train')
     if Xtr.shape[0] == 0:
         raise ValueError('audit_preprocessor_fit: X_train is empty')
+    # Refit on the ORIGINAL dtype, not the float64 view.  The fitted
+    # ``train_fp`` hashes the table it actually saw; for int64/timestamp
+    # values above 2**53 the native-int branch preserves bits that float64
+    # rounds away.  Comparing against a float refit made a genuine train-only
+    # fit permanently ``unverifiable`` (and weakened the leak check for the
+    # same rows).
+    Xtr_native = _as_numeric_2d(X_train, name='X_train')
+    if Xtr_native.shape != Xtr.shape:
+        raise ValueError('audit_preprocessor_fit: X_train changed shape during validation')
 
     def _ref_stats(rows):
         ref = LeakageSafePreprocessor(
@@ -1135,7 +1144,7 @@ def audit_preprocessor_fit(preprocessor, X_train, X_holdout=None, *,
                 bad.append(j)
         return (not bad), bad
 
-    train_ref = _ref_stats(Xtr)
+    train_ref = _ref_stats(Xtr_native)
     train_ok, train_bad = _compare(train_ref)
     out = {
         'status': 'unverifiable',
@@ -1160,15 +1169,21 @@ def audit_preprocessor_fit(preprocessor, X_train, X_holdout=None, *,
     if X_holdout is None:
         return out
     parts = _holdout_parts(X_holdout)
-    parts = [_as_float_2d(part, name='X_holdout') for part in parts]
-    parts = [p for p in parts if p.shape[0] > 0]
+    # Validate exactly as before (complex/ragged input is rejected), but keep
+    # the native dtype for the refit so the fingerprint still sees exact
+    # int64/timestamp bits above 2**53.
+    _parts_native = []
+    for part in parts:
+        _as_float_2d(part, name='X_holdout')
+        _parts_native.append(_as_numeric_2d(part, name='X_holdout'))
+    parts = [p for p in _parts_native if p.shape[0] > 0]
     if not parts:
         return out
     if any(p.shape[1] != Xtr.shape[1] for p in parts):
         raise ValueError(
             'audit_preprocessor_fit: holdout features do not match X_train')
     Xh = np.vstack(parts)
-    full_ref = _ref_stats(np.vstack([Xtr, Xh]))
+    full_ref = _ref_stats(np.vstack([Xtr_native, Xh]))
     full_ok, full_bad = _compare(full_ref)
     out.update({'n_holdout': int(Xh.shape[0]),
                 'stats_match_train_plus_holdout': bool(full_ok),

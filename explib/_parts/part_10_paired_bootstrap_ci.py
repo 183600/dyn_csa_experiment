@@ -413,8 +413,14 @@ def paired_effect_stats(deltas, alpha=0.05, min_n=3, with_values=None, without_v
     elif mean == 0.0:
         dz = 0.0
     else:
-        dz = float('inf') if mean > 0 else float('-inf')
-    if dz is not None and not math.isfinite(dz) and not math.isfinite(std):
+        # A constant non-zero panel has an unbounded standardised effect.
+        # Emitting +-inf made every strict-JSON report writer fail (or turn
+        # the value into null only after downstream code had accepted it).
+        # The ratio is genuinely not representable as a finite measurement,
+        # so use the same explicit "unavailable" sentinel as an unrepresentable
+        # SD instead of encoding infinity.
+        dz = None
+    if dz is not None and not math.isfinite(dz):
         dz = None
     # Use the attainable floor of THIS vector (zeros reduce resolution), not
     # the theoretical all-nonzero floor 2/2**n.

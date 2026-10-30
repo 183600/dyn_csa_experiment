@@ -270,6 +270,12 @@ def confirmation_practical_significance(deltas, *, margin=None, alpha=0.05,
         # something else than the caller declared.  Fail closed instead.
         raise ValueError(
             f"scale must be 'log_ratio' or 'raw_ppl', got {scale!r}")
+    # TOST decisions must use the level implied by the DECLARED confidence
+    # level, not always alpha/2.  With the default tost_conf=1-alpha the two
+    # are identical; with a stricter tost_conf=0.99 the old code used the
+    # 95% decision level and could call a panel equivalent even though its
+    # own 99% interval was wider than the margin.
+    _alpha_one = (1.0 - conf) / 2.0
     sign = None
     if expected_sign is not None:
         if isinstance(expected_sign, str):
@@ -297,7 +303,8 @@ def confirmation_practical_significance(deltas, *, margin=None, alpha=0.05,
         'scale': scale,
         'unit': 'seed',
         'alpha': float(a),
-        'alpha_one_sided': float(a / 2.0),
+        'alpha_one_sided': float(_alpha_one),
+        'superiority_alpha_one_sided': float(a / 2.0),
         'tost_conf': float(conf),
         'expected_sign': sign,
         'n': 0,
@@ -445,9 +452,9 @@ def confirmation_practical_significance(deltas, *, margin=None, alpha=0.05,
     else:
         point_direction = None
     out['point_direction'] = point_direction
-    equivalent = bool(p_lo < a / 2.0 and p_hi < a / 2.0)
-    beyond_better = bool(p_better < a / 2.0 and mean < 0.0)
-    beyond_worse = bool(p_worse < a / 2.0 and mean > 0.0)
+    equivalent = bool(p_lo < _alpha_one and p_hi < _alpha_one)
+    beyond_better = bool(p_better < _alpha_one and mean < 0.0)
+    beyond_worse = bool(p_worse < _alpha_one and mean > 0.0)
     out['equivalent'] = equivalent
     out['beyond_sesoi_better'] = beyond_better
     out['beyond_sesoi_worse'] = beyond_worse
@@ -617,8 +624,18 @@ def confirmation_practical_family(comparisons, *, confirmed=(), policy=None,
             'beyond_sesoi': blk.get('beyond_sesoi'),
             'expected_sign': blk.get('expected_sign'),
         }
+    # The beyond-margin family uses the declared superiority level.  The TOST
+    # family must use the level implied by the policy's declared confidence
+    # (which may be stricter than 1-alpha); otherwise a 0.99-confidence
+    # equivalence row could be called equivalent by a 0.95-level Holm test.
+    _tost_raw = (policy or {}).get('tost_conf')
+    _tost_conf = ((1.0 - a) if _tost_raw is None
+                  else _cp_number(_tost_raw, 'policy.tost_conf'))
+    if not (0.0 < _tost_conf < 1.0):
+        raise ValueError(f'policy.tost_conf must be in (0,1), got {_tost_conf!r}')
+    _tost_alpha_one = (1.0 - _tost_conf) / 2.0
     beyond_holm = holm_adjust(beyond_pairs, alpha=a / 2.0)
-    tost_holm = holm_adjust(tost_pairs, alpha=a / 2.0)
+    tost_holm = holm_adjust(tost_pairs, alpha=_tost_alpha_one)
     for name in names:
         _b = beyond_holm.get(name) or {}
         _t = tost_holm.get(name) or {}
@@ -632,7 +649,7 @@ def confirmation_practical_family(comparisons, *, confirmed=(), policy=None,
         rows[name]['equivalent_holm'] = bool(
             rows[name].get('status') == 'equivalent_within_sesoi'
             and rows[name].get('equivalent') is True
-            and _pth is not None and float(_pth) < a / 2.0)
+            and _pth is not None and float(_pth) < _tost_alpha_one)
     _conf = {str(x) for x in (confirmed or [])}
     meaningful = sorted(n for n in names if rows[n].get('practically_meaningful'))
     _nondirectional = {n for n in names if rows[n].get('expected_sign') is None}
@@ -652,7 +669,8 @@ def confirmation_practical_family(comparisons, *, confirmed=(), policy=None,
                          else 'ok')),
         'alpha': float(a),
         'alpha_one_sided': float(a / 2.0),
-        'tost_conf': (policy or {}).get('tost_conf', 1.0 - a),
+        'tost_conf': float(_tost_conf),
+        'tost_alpha_one_sided': float(_tost_alpha_one),
         'policy': policy,
         'family_names': list(names),
         'family_size': len(names),
@@ -661,6 +679,7 @@ def confirmation_practical_family(comparisons, *, confirmed=(), policy=None,
             'beyond_sesoi': beyond_holm,
             'tost_equivalence': tost_holm,
             'alpha_one_sided': float(a / 2.0),
+            'tost_alpha_one_sided': float(_tost_alpha_one),
             'note': ('two Holm families over the SAME declared primary set; '
                      'missing/unestimable slots enter at p=1 so the correction '
                      'family cannot shrink'),

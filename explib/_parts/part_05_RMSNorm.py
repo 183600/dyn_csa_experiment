@@ -988,6 +988,14 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=None, val_seqs=512,
     if all((os.path.exists(p) for p in (tr_path, va_path, vp_path, me_path))):
         _sig = _memo_file_sig({'train': tr_path, 'val': va_path,
                                'bnd': vp_path, 'meta': me_path,
+                               # Verification reads the document-id
+                               # sidecars too; omitting them let a replaced
+                               # sidecar be served from an already-verified
+                               # memo entry without re-running the
+                               # leakage/disjointness checks.
+                               'train_doc_ids': trd_path,
+                               'val_doc_ids': vad_path,
+                               'val_token_doc_ids': vad_tok_path,
                                'tokenizer': os.path.join(cache_dir, f'tok_{tag}.json')})
         _mkey = (os.path.abspath(cache_dir), tag, _sig)
         _hit = _WT103_MEMO.get(_mkey)

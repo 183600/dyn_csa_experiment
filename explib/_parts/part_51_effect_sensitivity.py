@@ -307,7 +307,7 @@ def effect_sensitivity(with_values, without_values, *, seeds=None, alpha=None,
     * ``scale_concordant_location_unavailable``: raw and log agree, but the
       signed-rank interval is unavailable or degenerate;
     * ``location_discordant``: the raw test and the exact signed-rank interval
-      disagree about excluding zero;
+      disagree about excluding zero, or exclude zero on opposite sides;
     * ``direction_unspecified``: both means are exactly zero although some
       paired differences are non-zero (the signs cancel);
     * ``zero_effect``: every valid paired difference is exactly zero;
@@ -480,13 +480,40 @@ def effect_sensitivity(with_values, without_values, *, seeds=None, alpha=None,
     significance_agree = bool(raw_sig == log_sig)
     loc = out['location']
     loc_excl = loc.get('excludes_zero') if isinstance(loc, dict) else None
-    loc_agree = (None if loc_excl is None else bool(loc_excl == raw_sig))
+    # Excluding zero is not enough: the interval must exclude it on the SAME
+    # side as the raw effect.  A significant positive raw mean can coexist
+    # with a Hodges-Lehmann interval entirely below zero when a few very large
+    # positive deltas carry the mean; calling that "concordant" would hide the
+    # sign conflict.  Derive the side from the interval endpoints (the
+    # estimate's sign is not sufficient for a tied/asymmetric panel).
+    loc_dir = None
+    if loc_excl:
+        _ci = loc.get('ci') if isinstance(loc, dict) else None
+        if isinstance(_ci, (list, tuple)) and len(_ci) == 2:
+            try:
+                _lo, _hi = float(_ci[0]), float(_ci[1])
+            except (TypeError, ValueError, OverflowError):
+                _lo = _hi = float('nan')
+            if _lo > 0.0:
+                loc_dir = 'positive'
+            elif _hi < 0.0:
+                loc_dir = 'negative'
+        if loc_dir is None:
+            loc_dir = loc.get('direction') if isinstance(loc, dict) else None
+    loc_side_agree = (None if loc_excl is None else
+                      (True if not loc_excl else
+                       bool(raw_dir is not None and loc_dir == raw_dir)))
+    loc_agree = (None if loc_excl is None else
+                 bool(loc_excl == raw_sig
+                      and (not (loc_excl and raw_sig) or loc_side_agree is True)))
     out['concordance'].update({
         'direction_agree': direction_agree,
         'significance_agree': significance_agree,
         'raw_significant': bool(raw_sig),
         'log_significant': bool(log_sig),
         'location_excludes_zero': loc_excl,
+        'location_direction': loc_dir,
+        'location_direction_agree': loc_side_agree,
         'all_agree': (None if (direction_agree is None or loc_agree is None)
                       else bool(direction_agree and significance_agree and loc_agree)),
     })
@@ -513,7 +540,8 @@ def effect_sensitivity(with_values, without_values, *, seeds=None, alpha=None,
         out['status'] = 'location_discordant'
         out['status_reason'] = ('the raw-PPL sign-flip test and the exact '
                                 'signed-rank location interval disagree about '
-                                'excluding zero; the raw mean may be carried by '
+                                'excluding zero, or exclude it on opposite '
+                                'sides; the raw mean may be carried by '
                                 'large-magnitude seeds rather than a shift of '
                                 'the typical seed')
     elif loc_agree is None:

@@ -14,6 +14,14 @@ def _attn_full_width_ok(n, k, w, need_dedup):
     _m = int(k) + int(w)
     _bytes = int(n) * (2 * _m * 1 + 8 + (2 * int(k) if need_dedup else 0)
                        + 8 * _m)
+    # For the CSA indexer form the block half is built as
+    # ``last_tok[topk_l]`` (an int64 [n,k] gather) and compared with
+    # ``pos_all[:, None]`` (another [n,k] boolean temporary).  The broadcast
+    # HCA/arange form avoids the gather, but the gate does not know that at
+    # this point; charging the conservative 9 bytes/lane keeps the 64 MiB
+    # promise for both forms and only makes the value-identical chunked path
+    # run a little earlier.
+    _bytes += int(n) * _m * (8 + 1)
     if need_dedup:
         # first_occurrence_mask materialises a [rows, k, k] bool comparison
         # for k <= 64 and a [rows, k] int64 key; leaving that O(n*k^2)

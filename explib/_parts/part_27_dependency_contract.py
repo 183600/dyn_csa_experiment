@@ -1062,8 +1062,20 @@ def verify_run_tracking(outdir, run_cfg=None, *, require_ppl=True):
             _seed_vals += [rng.get(k) for k in ('python', 'numpy', 'torch', 'cuda', 'tensorflow', 'data', 'dataloader_generator')]
             if any(v is None for v in _seed_vals):
                 problems.append(f'{key}: RNG map is incomplete')
-            elif any(int(v) != _expected for v in _seed_vals):
-                problems.append(f'{key}: seed metadata disagrees with the key')
+            else:
+                # A hand-edited/archived manifest can contain a non-numeric
+                # seed field (for example ``rng.python='bad'``).  ``int()``
+                # used to raise out of the verifier, aborting the whole audit
+                # instead of recording a failed check.  Normalise through the
+                # exact-integer reader and report malformed values as a
+                # problem; the returned verdict must stay JSON-safe.
+                _seed_norm = [_as_seed_int(v) for v in _seed_vals]
+                if any(v is None for v in _seed_norm):
+                    problems.append(
+                        f'{key}: seed metadata is not an exact integer '
+                        f'({_seed_vals!r})')
+                elif any(v != _expected for v in _seed_norm):
+                    problems.append(f'{key}: seed metadata disagrees with the key')
         dv = rec.get('data_version') or cell.get('data_version')
         if not dv:
             problems.append(f'{key}: record has no data_version')

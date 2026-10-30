@@ -1976,22 +1976,28 @@ def audit_report_status(report):
         n_problems += n
         if n:
             problem_gates.append(name)
+        # Some gates historically used the singular ``warning`` or the short
+        # ``not_verifiable`` status.  Those spellings describe the same
+        # aggregate level; treating them as unknown would let a different
+        # recorded environment (or an unverifiable design block) disappear
+        # behind a top-level ``ok``.
         if st == 'fail':
             failed.append(name)
-        elif st in ('warnings', 'warn'):
+        elif st in ('warnings', 'warn', 'warning'):
             warned.append(name)
-        elif st == 'not_verifiable_locally':
+        elif st in ('not_verifiable_locally', 'not_verifiable'):
             not_verifiable.append(name)
         elif st == 'not_applicable':
             not_applicable.append(name)
-        elif n:
-            # A gate that returned problems under a non-fail status (legacy
-            # audited vocabulary) must not let the aggregate claim "ok".
-            warned.append(name)
-        if n and name not in warned and st != 'fail':
-            # `not_verifiable_locally` / `not_applicable` with problems is
-            # still a warning-level report: a missing artifact is surfaced,
-            # not silently counted as a clean gate.
+        # A child can return `ok` (or a legacy status) while recording
+        # warnings instead of problems.  Warnings are evidence that the gate
+        # is not fully clean; count them so the aggregate cannot print `ok`.
+        gate_warnings = value.get('warnings')
+        n_warnings = len(gate_warnings) if isinstance(gate_warnings, list) else 0
+        if (n or n_warnings) and name not in warned and st != 'fail':
+            # `not_verifiable_locally` / `not_applicable` with problems or
+            # warnings is still a warning-level report: a missing artifact is
+            # surfaced, not silently counted as a clean gate.
             warned.append(name)
     if failed:
         status = 'fail'

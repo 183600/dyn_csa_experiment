@@ -117,8 +117,13 @@ def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
     was_training = model.training
     model.eval()
     vb = np.asarray(val_batch)
-    if vb.ndim != 2 or vb.shape[1] < 2:
-        raise ValueError(f'analyze_errors needs a 2-D val_batch with >=2 tokens, got {vb.shape}')
+    if vb.ndim != 2 or vb.shape[1] < 2 or vb.shape[0] < 1:
+        # An empty split has no token-id range (and no measurement).  Reject it
+        # with this documented error before ``vb.min()`` raises a raw NumPy
+        # "zero-size array" exception that looks like an infrastructure bug.
+        raise ValueError(
+            'analyze_errors needs a non-empty 2-D val_batch with >=2 tokens, '
+            f'got {vb.shape}')
     n_rows, seq = int(vb.shape[0]), int(vb.shape[1])
     span = seq - 1
     V = int(vocab)
@@ -1162,8 +1167,10 @@ def compare_token_errors(model_a, model_b, val_batch, vocab, device, *, tokenize
     comparing aggregate PPL.  Positive ``delta = ce_b - ce_a`` means B is
     worse at that exact token."""
     vb = np.asarray(val_batch)
-    if vb.ndim != 2 or vb.shape[1] < 2:
-        raise ValueError(f'compare_token_errors needs a 2-D val_batch, got {vb.shape}')
+    if vb.ndim != 2 or vb.shape[1] < 2 or vb.shape[0] < 1:
+        raise ValueError(
+            'compare_token_errors needs a non-empty 2-D val_batch with '
+            f'>=2 tokens, got {vb.shape}')
     if not np.issubdtype(vb.dtype, np.integer):
         raise TypeError(f'compare_token_errors needs integer token ids, got dtype {vb.dtype}')
     _V = int(vocab)

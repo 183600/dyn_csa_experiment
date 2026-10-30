@@ -46,6 +46,7 @@ import re
 import subprocess
 import sys
 import tarfile
+import tempfile
 import time
 
 for _stream in (sys.stdout, sys.stderr):
@@ -170,9 +171,14 @@ class _HashingReader:
 
 def _atomic_write_bytes(path, data):
     """Write a complete file and only then replace the previous artifact."""
-    tmp = path + f'.tmp{os.getpid()}'
+    directory = os.path.dirname(os.path.abspath(path)) or '.'
+    # PID alone is unique across processes but not across threads sharing one
+    # process; a fixed sibling name could then be truncated by two writers.
+    fd, tmp = tempfile.mkstemp(dir=directory,
+                               prefix=os.path.basename(path) + '.',
+                               suffix='.tmp')
     try:
-        with open(tmp, 'wb') as f:
+        with os.fdopen(fd, 'wb') as f:
             f.write(data)
             f.flush()
             os.fsync(f.fileno())

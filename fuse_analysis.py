@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import json, math, os, sys, functools, warnings
+import json, math, os, sys, functools, tempfile, warnings
 for _stream in (sys.stdout, sys.stderr):
     if hasattr(_stream, 'reconfigure'):
         try:
@@ -18,9 +18,23 @@ import exp_lib as L
 
 def _save_fig(fig, name, **kw):
     path = os.path.join(OUT, name)
-    tmp = path + '.tmp.png'
-    fig.savefig(tmp, format='png', **kw)
-    os.replace(tmp, path)
+    os.makedirs(os.path.dirname(path) or OUT, exist_ok=True)
+    # A fixed temp name let two concurrent analyses truncate/replace the same
+    # file and publish the other process's image (or lose the replace race).
+    # Create a unique sibling, then atomically replace the destination.
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or OUT,
+                               prefix=os.path.basename(path) + '.',
+                               suffix='.tmp.png')
+    os.close(fd)
+    try:
+        fig.savefig(tmp, format='png', **kw)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 def load(panel):
     path = os.path.join(ROOT, panel, 'summary.json')

@@ -1,5 +1,20 @@
 
 
+def _methodology_fmt(value, fmt):
+    """Format a derived statistic for text output, or ``n/a`` if unavailable.
+
+    ``paired_effect_stats`` intentionally withholds an unrepresentable SD or a
+    standardised effect (for example a constant non-zero panel has
+    ``cohens_dz=None``).  Printing those values with ``%f`` used to raise
+    ``TypeError`` and abort the whole report renderer.
+    """
+    try:
+        f = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return 'n/a'
+    return (fmt % f) if math.isfinite(f) else 'n/a'
+
+
 def _print_methodology_audit(report):
     print('\n========== methodology audit: controlled comparison / ablation / statistics ==========')
     print('  variants with measurable records: ' + (', '.join(report['variants_present']) or '(none)'))
@@ -155,7 +170,12 @@ def _print_methodology_audit(report):
             _ph = e.get('p_holm_global')
             _phs = ('%.4f' % _ph) if isinstance(_ph, (int, float)) and math.isfinite(_ph) else 'n/a'
             _tag = '' if e.get('tag_with', '') == e.get('tag_without', '') == '' else '   [%s vs %s]' % (e.get('tag_with') or '(base)', e.get('tag_without') or '(base)')
-            print('    %-22s − %-22s  n=%-2d  Δ=%+.3f ± %.3f  d_z=%+.2f  p=%s  p_Holm=%s%s' % (e['with'], e['without'], e['n'], e['mean'], e['std'], e['cohens_dz'], _p, _phs, _tag))
+            print('    %-22s − %-22s  n=%-2d  Δ=%s ± %s  d_z=%s  p=%s  p_Holm=%s%s' % (
+                e['with'], e['without'], e['n'],
+                _methodology_fmt(e.get('mean'), '%+.3f'),
+                _methodology_fmt(e.get('std'), '%.3f'),
+                _methodology_fmt(e.get('cohens_dz'), '%+.2f'),
+                _p, _phs, _tag))
             print('        with %.4f±%.4f vs without %.4f±%.4f; relative Δ=%+.2f%% of baseline, seed noise=%.2f%% (SNR=%.2f)' % (
                 e.get('with_mean', float('nan')), e.get('with_std', float('nan')),
                 e.get('without_mean', float('nan')), e.get('without_std', float('nan')),
@@ -263,7 +283,14 @@ def _print_methodology_audit(report):
                 _p = ('%.4f' % e['p_exact_signflip']) if math.isfinite(e['p_exact_signflip']) else 'n/a'
                 _ph = e.get('p_holm_global')
                 _phs = ('%.4f' % _ph) if isinstance(_ph, (int, float)) and math.isfinite(_ph) else 'n/a'
-                print('    %-22s − %-22s  n=%-2d  Δ=%+.3f ± %.3f  d_z=%+.2f  p=%s  p_Holm=%s  params=%s' % (e['with'], e['without'], e['n'], e['mean'], e['std'], e['cohens_dz'], _p, _phs, ('yes' if e.get('param_controlled') else ('no' if e.get('param_controlled') is False else 'n/a'))))
+                print('    %-22s − %-22s  n=%-2d  Δ=%s ± %s  d_z=%s  p=%s  p_Holm=%s  params=%s' % (
+                    e['with'], e['without'], e['n'],
+                    _methodology_fmt(e.get('mean'), '%+.3f'),
+                    _methodology_fmt(e.get('std'), '%.3f'),
+                    _methodology_fmt(e.get('cohens_dz'), '%+.2f'),
+                    _p, _phs,
+                    ('yes' if e.get('param_controlled') else
+                     ('no' if e.get('param_controlled') is False else 'n/a'))))
                 print('        %s | %s' % ('controlled (same run_cfg)' if e['controlled'] else ('UNCONTROLLED: ' + '; '.join(e['skipped_reasons'])), e['effect_vs_noise']))
         _mt = report.get('metric_audit') or {}
         print('  metric policy: %s (warnings: %d)' % (_mt.get('status') or 'n/a', len(_mt.get('warnings') or [])))
