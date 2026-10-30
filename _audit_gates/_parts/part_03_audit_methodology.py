@@ -1540,8 +1540,14 @@ def audit_training_health(outdirs=None):
                 e.append(f'nan_guard is not an object ({type(_guard_raw).__name__})')
             guard = _guard_raw if isinstance(_guard_raw, dict) else {}
             def _nonneg(v):
-                if (isinstance(v, (bool, np.bool_))
-                        or not isinstance(v, numbers.Real)):
+                if isinstance(v, (bool, np.bool_)):
+                    return None
+                if isinstance(v, numbers.Integral):
+                    # Keep exact counts exact above 2**53; float64 would round
+                    # two different event counts to the same integer.
+                    i = int(v)
+                    return i if i >= 0 else None
+                if not isinstance(v, numbers.Real):
                     return None
                 f = float(v)
                 if not (math.isfinite(f) and f >= 0.0 and f == math.floor(f)):

@@ -24,8 +24,7 @@ def audit_missingness(path=None):
                     'does not make the contrast wrong or significant')}
 
     def _count(x):
-        y = _finite_number(x)
-        return int(y) if y is not None and y.is_integer() else None
+        return _exact_count(x)
 
     def _close(a, b, tol=1e-9):
         if a is None or b is None:

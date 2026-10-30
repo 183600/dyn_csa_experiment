@@ -1355,15 +1355,9 @@ def audit_two_level_ci(path=None):
         return out
 
     def _count(x):
-        if isinstance(x, (bool, np.bool_, str, bytes, bytearray)) or x is None:
-            return None
-        try:
-            y = float(x)
-        except (TypeError, ValueError, OverflowError):
-            return None
-        if not math.isfinite(y) or not y.is_integer():
-            return None
-        return int(y)
+        # Share the one exact-count predicate across audit families: converting
+        # a large integral count through float64 would round it above 2**53.
+        return _exact_count(x)
 
     for name, comp in comps.items():
         if not isinstance(comp, dict):

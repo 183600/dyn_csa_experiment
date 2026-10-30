@@ -253,7 +253,10 @@ def confirmation_practical_significance(deltas, *, margin=None, alpha=0.05,
     ``log_ratio`` (positive = arm a worse) or PPL_a-PPL_b for ``raw_ppl``.
     A positive ``margin`` is the SESOI in the same units.  The function
     reports a paired-t CI, TOST equivalence within +/-margin, and a one-sided
-    "beyond the margin" p in the pre-registered direction.
+    "beyond the margin" p in the pre-registered direction.  The equivalence
+    decision uses ``tost_conf`` (default ``1-alpha``), while the superiority
+    claim keeps its own declared level ``alpha/2``; changing ``tost_conf``
+    cannot move a beyond-margin verdict.
 
     It never selects the margin from the data and never changes the frozen
     p/Holm/verdict.  A missing margin is ``not_declared`` rather than a
@@ -276,6 +279,12 @@ def confirmation_practical_significance(deltas, *, margin=None, alpha=0.05,
     # 95% decision level and could call a panel equivalent even though its
     # own 99% interval was wider than the margin.
     _alpha_one = (1.0 - conf) / 2.0
+    # The beyond-margin superiority test is a separate decision with its own
+    # declared level, alpha/2.  It must NOT inherit tost_conf: a looser
+    # equivalence confidence would otherwise make a superiority claim at
+    # 0.05 one-sided, and a stricter one (0.99) would suppress a claim that
+    # clears the documented alpha/2 level.  Keep the two levels explicit.
+    _alpha_superiority = a / 2.0
     sign = None
     if expected_sign is not None:
         if isinstance(expected_sign, str):
@@ -304,7 +313,7 @@ def confirmation_practical_significance(deltas, *, margin=None, alpha=0.05,
         'unit': 'seed',
         'alpha': float(a),
         'alpha_one_sided': float(_alpha_one),
-        'superiority_alpha_one_sided': float(a / 2.0),
+        'superiority_alpha_one_sided': float(_alpha_superiority),
         'tost_conf': float(conf),
         'expected_sign': sign,
         'n': 0,
@@ -453,8 +462,8 @@ def confirmation_practical_significance(deltas, *, margin=None, alpha=0.05,
         point_direction = None
     out['point_direction'] = point_direction
     equivalent = bool(p_lo < _alpha_one and p_hi < _alpha_one)
-    beyond_better = bool(p_better < _alpha_one and mean < 0.0)
-    beyond_worse = bool(p_worse < _alpha_one and mean > 0.0)
+    beyond_better = bool(p_better < _alpha_superiority and mean < 0.0)
+    beyond_worse = bool(p_worse < _alpha_superiority and mean > 0.0)
     out['equivalent'] = equivalent
     out['beyond_sesoi_better'] = beyond_better
     out['beyond_sesoi_worse'] = beyond_worse

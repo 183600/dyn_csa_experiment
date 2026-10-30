@@ -374,10 +374,22 @@ def _exact_int(value):
 
 
 def _exact_count(value):
-    """Exact integer read from a measurement field (numeric strings rejected)."""
-    if isinstance(value, (bool, np.bool_)) or not isinstance(value, numbers.Real):
+    """Exact integer read from a measurement field (numeric strings rejected).
+
+    A Python/NumPy integer is returned directly.  Converting it through
+    float64 first would round counts above 2**53 and let a malformed
+    denominator replay as a different (apparently integral) count.
+    """
+    if isinstance(value, (bool, np.bool_)):
         return None
-    number = float(value)
+    if isinstance(value, numbers.Integral):
+        return int(value)
+    if not isinstance(value, numbers.Real):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
     return int(number) if math.isfinite(number) and number == math.floor(number) else None
 
 

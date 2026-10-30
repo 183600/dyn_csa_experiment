@@ -5108,3 +5108,33 @@ override 表，逐条重算实际 diff，声明/实际键集双向相等，单�
 fail-closed、未声明记录 tag 拒绝、未验证时清零单因素标签、v10/v11 分析
 与 audit gate/report/CLI 接线、注册表不被审计修改。相关既有测试与完整
 CPU 套件在本轮最终树通过。
+
+## 2026-10-30 — beyond-SESOI 阈值与精确计数（本轮 bug 修复，no new runs）
+
+**Bug 1（决策阈值）。** `confirmation_practical_significance` 在同一函数里用
+`_alpha_one=(1-tost_conf)/2` 判 TOST 等价，但 beyond-margin 的
+`beyond_better`/`beyond_worse` 也继承了同一个阈值。§107.2 与函数自己输出
+的 `superiority_alpha_one_sided=alpha/2` 都说明 superiority 是独立决策：
+`tost_conf=0.90` 时会把 `p_beyond∈(0.025,0.05)` 误标为 beyond，
+`tost_conf=0.99` 时又会把 `p_beyond∈(0.005,0.025)` 的真 beyond 抑制掉。
+现把 superiority 固定为 `alpha/2`，TOST 仍用 `(1-tost_conf)/2`；single
+block 与 family 的 beyond Holm（本来就用 `alpha/2`）恢复一致。
+
+**Bug 2（scale/精确整数）。** audit 的 exact-count helper `_exact_count`
+先把 Python/NumPy 整数转成 float64，`2**53+1` 会舍入为 `2**53`；
+`audit_length` 的 `n_tok == n_seq*(L-1)` 因此可以放过一个多一个 target 的
+畸形 cell。改为整数直接返回（与 `_int_field`/`_as_seed_int` 同口径），并
+让 `audit_two_level_ci`、`audit_missingness`、`audit_training_health` 的
+局部 count parser 共用该口径；numeric string 仍拒绝，fractional/boolean
+仍拒绝。
+
+**Boundary.** 不改变任何 p/Holm/`confirmed`、冻结清单、训练/评测数值路径、
+alpha、种子或 `CODE_SEMANTICS`；只修正描述性 SESOI 读数的阈值和审计解析。
+`.github/` 与所有 README 未删除或移动。
+
+**Verification.** `test_bugfix_regressions.py` 新增 2 项：同一
+`p_beyond∈(0.025,0.05)` 面板在 `tost_conf∈{None,0.90,0.99}` 下都不得标
+beyond，同一 `p_beyond∈(0.005,0.025)` 面板在三种置信度下都必须标 beyond
+（并镜像正方向分支）；`2**53+1` 的 token count 必须保留精确值，畸形
+`n_tok` 必须触发 `audit_length` 的 `n_seq*(L-1)` 失败。完整 CPU 套件
+1079 passed / 3 skipped（本机 DataLoader 环境跳过）。

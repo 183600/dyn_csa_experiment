@@ -18,10 +18,18 @@ Each test pins one concrete defect found by inspection:
 * the full-width attention gate omitted the ``last_tok[topk_l]`` gather and
   its comparison temporary;
 * an empty validation batch reached ``ndarray.min()`` and raised a raw NumPy
-  error instead of the documented validation error.
+  error instead of the documented validation error;
+* the beyond-SESOI superiority test used the TOST confidence level instead of
+  the declared ``alpha/2``, so a looser ``tost_conf`` could create a false
+  beyond-margin claim and a stricter one could suppress a true claim;
+* the length audit read a large integral count through float64, rounding
+  ``2**53 + 1`` to ``2**53`` and letting a malformed ``n_tok`` equal the
+  ``n_seq*(L-1)`` formula it was supposed to fail.
 
 These are CPU-only, zero-experiment checks.
 """
+import contextlib
+import io
 import json
 import math
 import os
@@ -167,3 +175,66 @@ def test_error_analysis_rejects_empty_validation_batch_cleanly():
     with np.testing.assert_raises_regex(ValueError, 'non-empty'):
         L.compare_token_errors(None, None, np.empty((0, 4), dtype=np.int64),
                                8, L.torch.device('cpu'))
+
+
+def test_beyond_sesoi_uses_superiority_level_not_tost_conf():
+    margin = math.log(1.01)
+    # p_beyond is ~0.0486: above the documented alpha/2=0.025 superiority
+    # level but below the one-sided level implied by tost_conf=0.90.  The
+    # latter must not create a beyond-margin claim.
+    below = [3.0, 3.0] + [-3.0] * 7
+    for conf in (None, 0.90, 0.99):
+        got = L.confirmation_practical_significance(
+            below, margin=margin, alpha=0.05, tost_conf=conf,
+            expected_sign='negative')
+        assert math.isclose(got['superiority_alpha_one_sided'], 0.025,
+                            rel_tol=0.0, abs_tol=1e-15), got
+        assert got['p_beyond'] > 0.025, got
+        assert got['beyond_sesoi'] is False, got
+        assert got['status'] != 'beyond_sesoi', got
+    # p_beyond is ~0.0152: below alpha/2=0.025 but above the 0.005 level
+    # implied by tost_conf=0.99.  A strict equivalence confidence must not
+    # suppress a superiority claim that clears its own declared level.
+    behind = [2.0] + [-4.0] * 5
+    for conf in (None, 0.90, 0.99):
+        got = L.confirmation_practical_significance(
+            behind, margin=margin, alpha=0.05, tost_conf=conf,
+            expected_sign='negative')
+        assert got['p_beyond'] < 0.025, got
+        assert got['beyond_sesoi'] is True, got
+        assert got['status'] == 'beyond_sesoi', got
+        assert got['equivalent'] is False, got
+        # alpha_one_sided remains the TOST decision level, so the two
+        # thresholds are not confused when tost_conf is non-default.
+        expected_tost = 0.025 if conf is None else (1.0 - conf) / 2.0
+        assert math.isclose(got['alpha_one_sided'], expected_tost,
+                            rel_tol=0.0, abs_tol=1e-15), got
+    # The mirrored positive-direction panel exercises beyond_worse with the
+    # same threshold rule.
+    got = L.confirmation_practical_significance(
+        [-2.0] + [4.0] * 5, margin=margin, alpha=0.05, tost_conf=0.99,
+        expected_sign='positive')
+    assert got['p_beyond'] < 0.025 and got['beyond_sesoi'] is True, got
+
+
+def test_length_audit_reads_large_counts_without_float64_rounding():
+    big = 2 ** 53
+    assert A._exact_count(big + 1) == big + 1
+    assert A._exact_count(np.int64(big + 1)) == big + 1
+    # Numeric strings are still not measurements, and non-integral floats are
+    # still refused.
+    assert A._exact_count(str(big + 1)) is None
+    assert A._exact_count(1000.5) is None
+    raw = {'arm': {'by_len': {'2': {
+        'n_tok': big + 1, 'n_seq': big, 'eval_span': 1,
+        'truncated': False}}}}
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, 'bylen.json')
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(raw, f)
+        with contextlib.redirect_stdout(io.StringIO()):
+            got = A.audit_length(path)
+    # The extra target token must make the n_seq*(L-1) identity fail; rounding
+    # the count to 2**53 used to make this malformed cell pass as `ok`.
+    assert got['status'] == 'fail', got
+    assert any('n_tok' in p and 'n_seq*(L-1)' in p for p in got['problems']), got
