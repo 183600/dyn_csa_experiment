@@ -202,32 +202,49 @@ def audit_effect_sensitivity(path=None):
             if not _es_close(es.get(key), replay.get(key)):
                 row['problems'].append(
                     f'{key}={es.get(key)!r} does not replay ({replay.get(key)!r})')
+        def _es_same(got, want):
+            """Compare a stored derived field with its replayed value.
+
+            ``None`` is a legitimate "not available" reading, so missing and
+            null are the same only when the replay is also unavailable.
+            Booleans are flags (not 0/1 numbers) and integers are compared
+            exactly; other numbers use the same tolerance as the rest of the
+            gate.
+            """
+            if got is None or want is None:
+                return got is None and want is None
+            if isinstance(got, (bool, np.bool_)) or isinstance(want, (bool, np.bool_)):
+                return (isinstance(got, (bool, np.bool_))
+                        and isinstance(want, (bool, np.bool_))
+                        and bool(got) == bool(want))
+            if isinstance(got, numbers.Integral) and isinstance(want, numbers.Integral):
+                return int(got) == int(want)
+            if isinstance(got, (int, float)) and isinstance(want, (int, float)):
+                return _es_close(got, want)
+            return got == want
+
         _pairs = (
-            ('raw', ('mean', 'p_exact_signflip', 'geometric_ratio')),
-            ('log_ratio', ('mean', 'p_exact_signflip', 'geometric_ratio',
-                           'relative_pct')),
+            ('raw', ('mean', 'median', 'direction', 'p_exact_signflip',
+                     'n_nonzero', 'p_floor', 'significant')),
+            ('log_ratio', ('mean', 'geometric_ratio', 'relative_pct',
+                           'direction', 'p_exact_signflip', 'n_nonzero',
+                           'p_floor', 'significant')),
         )
         for block, keys in _pairs:
             got = es.get(block) if isinstance(es.get(block), dict) else {}
             want = replay.get(block) or {}
             for key in keys:
                 gv, wv = got.get(key), want.get(key)
-                if gv is None and wv is None:
-                    continue
-                if gv is None or wv is None or not _es_close(gv, wv):
+                if not _es_same(gv, wv):
                     row['problems'].append(
                         f'{block}.{key}={gv!r} does not replay ({wv!r})')
         loc = es.get('location') if isinstance(es.get('location'), dict) else {}
         wloc = replay.get('location') or {}
-        if loc.get('status') != wloc.get('status'):
-            row['problems'].append(
-                f"location.status={loc.get('status')!r} does not replay "
-                f"({wloc.get('status')!r})")
-        for key in ('estimate', 'attained_conf'):
+        for key in ('status', 'conf', 'n_input', 'n_dropped', 'n_zero', 'n',
+                    'n_walsh', 'critical_k', 'attained_conf', 'estimate',
+                    'excludes_zero', 'direction', 'ties_present'):
             gv, wv = loc.get(key), wloc.get(key)
-            if gv is None and wv is None:
-                continue
-            if gv is None or wv is None or not _es_close(gv, wv):
+            if not _es_same(gv, wv):
                 row['problems'].append(
                     f'location.{key}={gv!r} does not replay ({wv!r})')
         gci, wci = loc.get('ci'), wloc.get('ci')

@@ -834,11 +834,22 @@ def _as_seed_int(v):
     if isinstance(v, numbers.Integral):
         return int(v)
     if isinstance(v, numbers.Real):
-        # np.float32/np.float64 are Real but not all are Python ``float``;
-        # int() would silently truncate 1.5 to 1, turning an invalid seed
-        # into a different valid one.
-        f = float(v)
-        return int(f) if math.isfinite(f) and f.is_integer() else None
+        # np.float32/np.float64 and exact rationals are Real.  Check
+        # integrality in the value's own domain instead of round-tripping
+        # through float64: a large integral Fraction (or any Real beyond 2**53
+        # with a fractional tail) would otherwise be rounded to a different,
+        # apparently valid integer.  ``int(v)`` is exact for an integral Real;
+        # comparing back to ``v`` rejects 1.5 and NaN/Inf without truncation.
+        try:
+            i = int(v)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        try:
+            if v != i:
+                return None
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return i
     try:
         i = int(v)
     except (TypeError, ValueError, OverflowError):

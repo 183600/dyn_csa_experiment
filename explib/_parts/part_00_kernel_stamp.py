@@ -281,24 +281,38 @@ def _curve_slope_stats(points, key, k=4):
         except (TypeError, ValueError, OverflowError):
             continue
         if math.isfinite(y):
-            by_step[float(step)] = y
+            # Keep the exact integer label.  Going through float64 here
+            # collapsed neighbouring evaluations once the step counter
+            # exceeded the float64 integer spacing (and raised OverflowError
+            # beyond its exponent range), even though ``_as_seed_int`` had
+            # already validated an exact label.
+            by_step[step] = y
     pts = sorted(by_step.items())[-max(2, int(k)):]
     if len(pts) < 2:
         return None, None
     n = len(pts)
-    mx = sum(x for x, _ in pts) / n
-    my = sum(y for _, y in pts) / n
-    den = sum((x - mx) ** 2 for x, _ in pts)
+    # Translate the step origin before entering float64.  An OLS slope is
+    # translation invariant, but converting absolute labels directly loses
+    # differences below the local float64 spacing (e.g. steps 10**18,
+    # 10**18+100, 10**18+200 collapse to one value) and can overflow for a
+    # legal integer label beyond the float64 exponent range.  Subtracting the
+    # first exact integer step keeps the differences exact and finite.
+    base = pts[0][0]
+    xs = [float(x - base) for x, _ in pts]
+    ys = [y for _, y in pts]
+    mx = sum(xs) / n
+    my = sum(ys) / n
+    den = sum((x - mx) ** 2 for x in xs)
     if den <= 0:
         return None, None
-    slope = sum((x - mx) * (y - my) for x, y in pts) / den
+    slope = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / den
     # Residual standard error of the slope.  With n=2 the residual dof is 0;
     # the slope is then interpolating the two points, so no noise estimate is
     # possible (None -> the caller falls back to the fixed floor).
     dof = n - 2
     if dof <= 0:
         return slope, None
-    rss = sum((y - (my + slope * (x - mx))) ** 2 for x, y in pts)
+    rss = sum((y - (my + slope * (x - mx))) ** 2 for x, y in zip(xs, ys))
     se = math.sqrt((rss / dof) / den) if den > 0 else None
     return slope, se
 
@@ -350,12 +364,15 @@ def classify_training_health(history, *, tail_k=4, slope_tol=None, gap_tol=None)
     if val_s is None:
         _val_from_ppl = []
         for _p in entries:
+            # Keep the exact step label, exactly as the CE curve does: a
+            # float64 round-trip would collapse neighbouring evaluations for
+            # a long run and can overflow for a legal integer label.
+            _st = _as_seed_int(_p.get('step'))
             try:
-                _st = float(_p.get('step'))
                 _vp = float(_p.get('val_ppl'))
             except (TypeError, ValueError, OverflowError):
                 continue
-            if math.isfinite(_st) and math.isfinite(_vp) and _vp > 0.0:
+            if _st is not None and math.isfinite(_vp) and _vp > 0.0:
                 _val_from_ppl.append({'step': _st, 'val_ce': math.log(_vp)})
         val_s, val_se = _curve_slope_stats(_val_from_ppl, 'val_ce', k=tail_k)
     if slope_tol is None:
