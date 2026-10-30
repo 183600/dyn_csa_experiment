@@ -7442,3 +7442,182 @@ primary 对比分别正确；
 `methodology_audit` 在有/无历史两种输入下所有判定承载字段逐值相同、只增加
 轨迹块；以及 late crossing 与 history/primary 不一致的顶层 warning。完整
 CPU 套件在本轮最终树通过。
+
+## 96. 预注册的不只是假设：失败/重跑的处置规则与逐次尝试审计（本轮实验设计与准备硬化）
+
+零 GPU；不新增训练、不读取 test split、不修改 `confirmation_frozen*.json`
+的字节/种子/端点/alpha/Holm 规则，也不改 `CODE_SEMANTICS`。
+
+### 96.1 问题：计划单元 ≠ 测量单元，重跑是一种选择机制
+
+仓库已经把「计划了哪些 `(arm, seed)`」写进 `run_manifest.json`，把每次
+尝试写进 `experiments.jsonl`，并在缺失分析里把缺种子当作不可替换的缺失。
+但**从计划到最终表格之间的尝试次数**没有被任何门审计：
+
+- 一个 cell 可能先 OOM/timeout/NaN/被 runtime cap 截断，再在下一轮成功；
+- 一个已经成功的 cell 可能因为改了代码/配置被 resume 逻辑删掉重跑
+  （`_plan_run` 对 `run_cfg` 不一致的记录会先 drop 再训练）；
+- 一个失败可能被当成「基础设施噪声」直接换掉，也可能被当作该臂的真实
+  结果保留；
+- 昂贵/动态臂更容易触发 cap 和 OOM，因此它们的「最终值」比便宜臂多经历
+  了几次筛选。
+
+当「跑不出数就再跑一次、直到有数」没有事先声明时，保留哪个成功值就成了
+分析者可以在看到结果后决定的事情；而重试次数在臂间不均等时，complete-case
+面板本身也不再是可交换的。§93 的 shadow bounds 回答「缺了多少、结论有多
+脆弱」，但它假设缺失集合已经确定；它回答不了「这个 cell 是第几次尝试、
+为什么留下这一次」。
+
+这不是工程细节，而是实验准备阶段必须写清的处置规则：**哪些失败可以替换、
+替换必须回到同一个 cell、一个 cell 最多几次、哪个成功是绑定的**。
+
+### 96.2 方法：先写处置计划，再逐次对账
+
+新增 `exp_lib.build_run_disposition_plan` / `write_run_disposition`：
+
+```json
+{
+  "kind": "run_disposition",
+  "schema": 1,
+  "revision": 0,
+  "supersedes": [],
+  "reason": null,
+  "planned_cells": ["csa_fixed::seed0", "full::seed0", "..."],
+  "policy": {
+    "retention": "first_success",
+    "replacement": "same_cell",
+    "max_attempts_per_cell": 2,
+    "max_total_attempts": null,
+    "allow_supersede": false,
+    "replaceable_failure_classes": ["infrastructure", "resource_exhausted",
+                                    "timeout", "runtime_cap"],
+    "non_replaceable_failure_classes": ["numerical", "config", "protocol"],
+    "failure_class_patterns": {"...": ["..."]}
+  },
+  "content_sha256": "..."
+}
+```
+
+设计要点：
+
+- **身份只覆盖 `planned_cells + policy`。** `content_sha256` 不含时间戳、
+  run_cfg 或 revision 历史，所以同一计划的 resume 是同一个 precommitment；
+  改计划必须显式成为新 revision，带 `reason` 和旧 `content_sha256` 的
+  `supersedes`。`write_run_disposition` 第一次写入即绑定；之后的同内容写入
+  是 no-op，不同内容要么按 revision 写入，要么保留原计划并返回
+  `conflict=True`，**绝不静默覆盖**。计划还必须早于第一次尝试：
+  `run_disposition_audit` 比较 `plan.created_at` 与最早一条 cell 的
+  `started_at`，计划晚于首条 cell 判 `fail`（那是事后重建，不是预注册）；
+  事件没有时间戳时只报 `plan_before_first_attempt=None`，不伪造通过。
+- **默认保留第一次成功。** `retention='first_success'` 是确认性面板的
+  预注册规则：后来的成功可以是真实的重跑，也可以是「再试到更好看」的
+  选择；只有第一次成功是计划内测量。`last_success` 只能作为显式的
+  探索性处置，`single_attempt` 则禁止任何 cell 出现第二次成功。
+- **失败分类先声明、后匹配。** 事件若自带 `failure_class` 就按声明类；
+  否则在 `error/reason/diagnosis/detail` 上做**词边界**匹配（`oom` 不会
+  命中 `kaboom`，`nan` 不会命中 `financial`）。未声明的类、显式给出的
+  未知类、以及同时命中可替换/不可替换类的歧义消息都 fail-closed：若这种
+  失败被重试，审计判 fail，而不是把它猜成基础设施噪声。
+- **替换必须回到同一个 cell。** `replacement='same_cell'`；任何不在
+  `planned_cells` 里的成功测量都是未计划的种子/臂，判 fail。换 seed 不是
+  「补一个种子」，而是改变计划帧。
+- **尝试预算。** 每个 cell 的尝试数不得超过 `max_attempts_per_cell`；
+  可选 `max_total_attempts` 约束整个面板。预算在跑之前声明，不是跑完后
+  按「还差几个数」追加。
+- **成功后的 supersede 需要显式许可。** 同一 cell 在两个不同 `run_cfg`
+  上都成功，说明测量代码/配置在第一次成功之后变过。默认
+  `allow_supersede=false` 判 fail；显式允许时只给 warning，并标明保留值
+  是「最后一次声明」而不是独立重复。
+- **非训练 cell 不硬塞进 seed 帧。** 同一账本还记录 `arm::s7` 的最终评测
+  或 `arm::seed3::niah_train` 探针；它们不是训练 cell。审计把它们计入
+  `n_ignored_cell_events` 并给 warning，而不是让 key 解析失败或把它们当作
+  另一个种子。
+
+`run_disposition_audit(events, plan=..., retained=...)` 的输出包括逐 cell
+的 `attempts`（run_id/status/失败类/run_cfg）、`first_success_run_id`、
+`retained_run_id`、`retained_is_first_success`、`retried_after_failure`、
+`attempt_after_success`、`superseded_run_cfgs`，以及面板级
+`n_cells_retried` / `n_multiple_success_cells` / `n_retained_second_success`
+/ `n_non_replaceable_retried` / `n_attempt_budget_exceeded` /
+`n_unplanned_measurements` / `n_planned_without_success` 等计数。逐臂表
+`by_arm` 与 `differential_attempts` 给出每臂的尝试率、重试率、每 cell
+最大尝试数和 `concentrated` / `balanced` / `no_retries` 读数——这是**描述
+性**的：几个 cell/臂不足以支撑差性流失的正式检验，因此它不产生 p 值，只
+把「重试只发生在部分臂」点名。
+
+### 96.3 接线
+
+- `run()` 在 `write_run_order` 之后、第一枚 cell 之前调用
+  `build_run_disposition_plan(_planned_keys, policy=cfg['disposition_policy'])`
+  并 `write_run_disposition(..., keep_existing=True)`；冲突只保留原计划并
+  打印警告，不覆盖。`panel_start` 事件写入
+  `disposition_plan_sha256` / `disposition_plan_revision` /
+  `disposition_plan_conflict`，使「计划在第一条 cell 之前存在」可由链化账本
+  复核。`cfg['disposition_policy']` 可覆盖默认策略。
+- `audit_gates.py disposition`（别名 `attempts` / `retries` /
+  `run_disposition`）扫描 `results_*`（以及带 cell 事件的 `analysis_*`）
+  或显式传入的面板目录：读 `run_disposition.json`、`experiments.jsonl`、
+  `summary.json`（缺失时回退 `run_manifest.json` 的 cells），先跑
+  `verify_experiment_ledger`；链失败直接 fail，缺计划/缺事件
+  `not_verifiable_locally`，其余按上表判 ok/warn/fail。
+- `audit_gates.py report` 增加顶层 `disposition` 块。该门不重算 PPL/p/
+  Holm，不进入任何冻结族。
+- 设计前馈也读策略声明：`audit_gates.py design`（`design_preflight`）在
+  manifest 的 `statistics.disposition_policy` 存在时调用
+  `validate_run_disposition_policy` 逐项校验；confirmatory 清单必须
+  `retention='first_success'`、`replacement='same_cell'`、
+  `allow_supersede=false`，否则 violate。没有该声明只 warning（冻结清单
+  早于本字段），并提示「失败/替换规则尚未预注册」；有声明但缺
+  `max_total_attempts` 也 warning（per-cell 上限不约束整个面板的重试预算）。
+
+### 96.4 边界
+
+- **不是新的显著性检验。** 它是预注册/协议偏差审计；`concentrated` 是
+  描述性读数，不是「差性流失显著」的证明。少量 cell/臂下做 Fisher/McNemar
+  会把噪声当机制，本轮明确不做。
+- **账本是 tamper-evident，不是签名。** 能同时改写 JSONL 和 anchor 的人
+  仍可伪造尝试历史；本门只让无意的编辑/删除/重排/截断可见，并与
+  `experiment_ledger` 门互补。
+- **缺计划不是通过。** 没有 `run_disposition.json` 时只能退回
+  `observed_only`/`caller_supplied` 帧，后者无法发现「事后加了一个 cell」；
+  门返回 `not_verifiable_locally` 或 `warn`，不假绿。
+- **旧面板补写计划会被标成 reconstruction。** 引入本门之前开始的 outdir
+  没有计划；第一次 resume 会补写 `run_disposition.json`，其 `created_at`
+  晚于账本里已有的 cell，因此 `plan_before_first_attempt=False` 并判 fail。
+  这是有意的：补写的计划不是原始预注册。若要把它当描述性记录，必须显式
+  声明 `require_plan_before_first_attempt=false`，让门只给 warning。
+- **第一次成功不是「唯一正确」的普遍规则。** 如果确实是基础设施故障，
+  替换是合理的——前提是失败类可替换、回到同一个 cell、在声明的尝试预算内，
+  并且**所有尝试都留在账本里**。规则约束的是「看结果后再决定」，不是禁止
+  重跑。
+- **不修复选择偏差，只使它可见。** 已经按「跑到显著为止」产生的面板，
+  本门会标出多个成功/超预算/臂间集中，但不能把已经发生的选择变成随机
+  抽样；正确动作仍是按预注册规则重跑或把结论降级。
+- **不替代 §93 的 missingness bounds。** 本门回答「保留的是哪次尝试」；
+  §93 回答「未观测的种子能把结论推到哪」。两者不能互相替代。
+- **不改变 `run_cfg`/resume 语义。** 它只在计划层记录 cell 集合与策略，
+  不改变训练、数据顺序、评测行或 `CODE_SEMANTICS`。
+
+### 96.5 入口与验证
+
+```bash
+python audit_gates.py disposition                 # 扫描 results_*/
+python audit_gates.py disposition PANEL_DIR ...   # 指定面板
+python audit_gates.py attempts                    # 别名
+python audit_gates.py report                      # 顶层 disposition
+python -m pytest -q test_review_part_34.py
+```
+
+`test_review_part_34.py` 20 项覆盖：干净单次面板 ok；可替换失败（OOM/
+timeout）重试后保留第一次成功只 warn 并逐臂计数；第二次成功被保留判
+post-hoc selection；保留第一次成功但存在重复成功只 warn；未计划测量/未计划
+尝试判 fail；key/seed 不一致、重复 run_id、未知 status、布尔 seed、非对象
+事件 fail-closed；NaN/未知失败被重试判 fail；cell 与总尝试预算；未声明
+supersede 判 fail、显式允许时只 warn；计划写入器绑定第一次 precommitment、
+同内容 no-op、不同内容冲突不覆盖、显式 revision 可写；重试集中在单一臂
+时 `concentrated` 且不产生 p 值；无计划 `not_verifiable_locally`；评测/
+探针 cell 只计数不硬塞；计划晚于首条 cell 判 reconstruction（策略显式允许
+reconstruction 时只 warn）；cap 状态 `skipped_cap`/`truncated` 即使 reason
+不匹配模式也归入 `runtime_cap`；损坏/篡改的计划判 fail 而非「缺证据」；
+`design` 前馈对 confirmatory 的 `last_success`/`allow_supersede` 判
+violate、合法策略通过；以及 gate/CLI 接线与账本被篡改时判 fail。

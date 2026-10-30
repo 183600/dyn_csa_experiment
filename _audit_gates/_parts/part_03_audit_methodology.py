@@ -638,6 +638,73 @@ def audit_design_preflight(manifest_path=None, dynamic_path=None):
         out['warnings'].extend(f'frozen: {w}' for w in
                                (ledger.get('warnings') or []) +
                                (ev.get('warnings') or []))
+        # Design-time disposition declaration: a manifest that says nothing
+        # about failed/replaced cells has not pre-registered how retries are
+        # handled.  The frozen v12 manifest predates this field, so absence is
+        # a warning; an invalid declaration or a confirmatory plan that allows
+        # last-success/supersede is a hard violation.
+        _raw_decl = None
+        _stats = main.get('statistics') if isinstance(main.get('statistics'), dict) else {}
+        if 'disposition_policy' in _stats:
+            _raw_decl = _stats.get('disposition_policy')
+        elif 'disposition_policy' in main:
+            _raw_decl = main.get('disposition_policy')
+        _decl = _raw_decl if isinstance(_raw_decl, dict) else None
+        if _raw_decl is not None and not isinstance(_raw_decl, dict):
+            out['frozen']['disposition_policy'] = {
+                'status': 'fail',
+                'error': f'{type(_raw_decl).__name__} is not an object'}
+            out['violations'].append(
+                'frozen: disposition_policy must be an object, got '
+                f'{type(_raw_decl).__name__}')
+            out['frozen']['status'] = 'fail'
+        elif _decl is None:
+            out['frozen']['disposition_policy'] = {'status': 'not_declared'}
+            out['warnings'].append(
+                'frozen: no statistics.disposition_policy is declared; the '
+                'freeze does not pre-register which run failures may be '
+                'replaced, how many attempts a cell gets, or which success is '
+                'binding (`python audit_gates.py disposition` audits the '
+                'attempt ledger, but the rule itself should be frozen first)')
+        else:
+            try:
+                _pol = L.validate_run_disposition_policy(_decl)
+            except Exception as _de:
+                out['frozen']['disposition_policy'] = {
+                    'status': 'fail', 'error': f'{type(_de).__name__}: {_de}'}
+                out['violations'].append(
+                    f'frozen: invalid disposition_policy: '
+                    f'{type(_de).__name__}: {_de}')
+                out['frozen']['status'] = 'fail'
+            else:
+                _pol_problems = []
+                if ev.get('manifest_level') == 'confirmatory':
+                    if _pol['retention'] != 'first_success':
+                        _pol_problems.append(
+                            "a confirmatory plan must set retention="
+                            "'first_success' (a later success is post-hoc "
+                            'selection)')
+                    if _pol['replacement'] != 'same_cell':
+                        _pol_problems.append(
+                            "a confirmatory plan must set replacement="
+                            "'same_cell' (a new seed is a new plan)")
+                    if _pol['allow_supersede']:
+                        _pol_problems.append(
+                            'a confirmatory plan must not allow superseding a '
+                            'measured cell after a code/config change')
+                out['frozen']['disposition_policy'] = {
+                    'status': ('fail' if _pol_problems else 'ok'),
+                    'policy': _pol,
+                    'problems': _pol_problems,
+                }
+                out['violations'].extend(f'frozen: {p}' for p in _pol_problems)
+                if _pol_problems:
+                    out['frozen']['status'] = 'fail'
+                if not _pol_problems and _pol['max_total_attempts'] is None:
+                    out['warnings'].append(
+                        'frozen: disposition_policy has no max_total_attempts; '
+                        'a per-cell cap alone does not bound a whole-panel '
+                        '"retry until it works" budget')
         if out['frozen']['status'] == 'fail':
             out['status'] = 'fail'
     dyn = _load_manifest_file(dp)

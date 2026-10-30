@@ -1457,6 +1457,26 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
         _all_order_cells, block_key=lambda c: int(c[1]), seed=_first_seed,
         block_name='seed')
     write_run_order(outdir, _run_order_plan)
+    # Pre-register the failure/replacement rule before the first cell can fail.
+    # The first write binds; a later, different plan is kept as a visible
+    # conflict instead of silently rewriting the precommitment (the disposition
+    # audit will report the resulting unplanned/missing cells).
+    try:
+        _dispo_plan = build_run_disposition_plan(
+            _planned_keys,
+            policy=(cfg.get('disposition_policy')
+                    if isinstance(cfg.get('disposition_policy'), dict) else None),
+            run_cfg=fp)
+        _dispo = write_run_disposition(outdir, _dispo_plan, keep_existing=True)
+    except Exception as _de:
+        _dispo = {'written': False, 'conflict': True,
+                  'reason': f'{type(_de).__name__}: {_de}',
+                  'content_sha256': None}
+    if _dispo.get('conflict'):
+        print('[disposition] WARNING: the existing run_disposition.json does '
+              f'not match this panel ({_dispo.get("reason")}); the original '
+              'precommitment is kept and the deviation will be visible to '
+              '`python audit_gates.py disposition`')
     _run_rank = {lab: i for i, lab in enumerate(_run_order_plan['planned_cells'])}
     cells.sort(key=lambda c: _run_rank.get(f'{c[0]}::seed{c[1]}', len(_run_rank)))
     _panel_started = time.strftime('%Y-%m-%dT%H:%M:%S')
@@ -1477,6 +1497,9 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
         'sanity': ({'passed': all(bool(r.get('passed')) for r in _sanity), 'n_reports': len(_sanity), 'ref': 'overfit_sanity.json'} if _sanity else None),
         'reproducibility': ({'passed': all(bool(r.get('passed')) for r in _repro), 'n_reports': len(_repro), 'ref': 'reproducibility.json'} if _repro else None),
         'seed_contract': ({'passed': bool(_seed_contract.get('passed')), 'ref': 'seed_contract.json'} if isinstance(_seed_contract, dict) else None),
+        'disposition_plan_sha256': _dispo.get('content_sha256'),
+        'disposition_plan_revision': _dispo.get('revision'),
+        'disposition_plan_conflict': bool(_dispo.get('conflict')),
     })
     dropped_truncations = []
     ratios = {}

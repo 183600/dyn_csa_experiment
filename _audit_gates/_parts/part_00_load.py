@@ -87,6 +87,14 @@
                重排/截断判 fail，缺 anchor 或 anchor 落后为 warning，全部
                事件早于链化的 legacy 账本报 not_verifiable（零 GPU，
                不改任何测量或冻结决定）
+  disposition  运行处置预注册：把 run_disposition.json 的计划与
+               experiments.jsonl 的逐次尝试对账——保留的测量必须是声明的
+               那次尝试（默认第一次成功），未计划的种子/臂、成功后被改了
+               run_cfg 的重跑、被声明为不可替换的失败类型仍重试、超过尝试
+               预算、以及重试只集中在部分臂，分别判 fail/warn；缺计划或缺
+               事件报 not_verifiable，账本哈希链失败判 fail。它不重算任何
+               PPL/p/Holm，也不改变冻结判定（零 GPU；别名 attempts /
+               retries / run_disposition；可传面板目录）
   reproduction  跨运行复现：显式给两份结果目录（或 summary.json），逐格比较
                源码字节、数据切片、配置、执行环境、匹配初始化与最终 PPL；
                缺指纹报 not_verifiable，环境/数据/配置/代码变化各报各的，

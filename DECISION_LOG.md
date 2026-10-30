@@ -4086,3 +4086,66 @@ late crossing、`final_point_only`/`zero_final`、gap narrowing 警告、不等�
 有/无历史时所有判定承载字段逐值相同、late crossing 与 history/primary 不
 一致的顶层 warning；审计门干净→`ok`、篡改 final sign→`fail`、旧产物→
 `not_verifiable`。完整 CPU 套件在本轮最终树通过。
+
+## 2026-10-29 — 预注册的不只是假设：失败/重跑处置与逐次尝试审计（本轮实验设计与准备硬化，no new runs）
+
+零 GPU；不新增训练、不读取 test split、不修改 `confirmation_frozen*.json`
+的字节/种子/端点/alpha/Holm 规则，也不改 `CODE_SEMANTICS`；`.github/` 与所有
+README 未触碰。
+
+**Problem.** 计划单元与测量单元不是同一个对象。一个 `(arm, seed)` cell 可能
+先 OOM/timeout/NaN/被 runtime cap 截断，再在下一轮成功；已经成功的 cell 也
+可能因 `run_cfg` 变化被 resume 逻辑删除重跑。原仓库把每次尝试留在
+`experiments.jsonl`，却没有门回答「最终保留的是第几次成功、为什么」。
+「跑不出数就再跑一次，直到有数」是一种选择机制，而且昂贵/动态臂更容易触发
+cap/OOM，重试次数在臂间并不均等；§93 的 bounds 假设缺失集合已确定，无法
+替代尝试层的审计。
+
+**Fix.** 新增 `exp_lib.build_run_disposition_plan` /
+`write_run_disposition` / `run_disposition_audit` 与
+`audit_gates.py disposition`（别名 `attempts` / `retries` /
+`run_disposition`）：
+
+- 每面板在第一条 cell 之前写 `run_disposition.json`，声明 planned cells 与
+  处置策略：默认 `retention=first_success`、`replacement=same_cell`、
+  `max_attempts_per_cell=2`、`allow_supersede=false`；失败类分成可替换
+  （infrastructure/resource_exhausted/timeout/runtime_cap）与不可替换
+  （numerical/config/protocol），未声明/歧义类 fail-closed。
+- 计划身份只覆盖 `planned_cells + policy`（`content_sha256`），resume 同内容
+  no-op；不同内容必须作为带 `reason` 与旧 `content_sha256` 的 revision 写入，
+  否则保留原计划并返回 conflict，绝不静默覆盖。`panel_start` 事件绑定计划
+  摘要，使「计划先于第一次尝试」可由链化账本复核；审计另外比较
+  `plan.created_at` 与最早 cell 的 `started_at`，计划晚于首条 cell 判
+  reconstruction（策略显式允许时只 warning）。
+- 审计从 `experiments.jsonl` + `summary.json`/`run_manifest.json` 重放每次
+  尝试：保留值必须是第一次成功；未计划种子/臂、成功后改了 `run_cfg`、
+  不可替换失败被重试、未知失败被重试、超过每 cell 或总尝试预算，分别判
+  fail；链化账本哈希失败直接 fail；缺计划/缺 cell 事件
+  `not_verifiable_locally`。失败文本用词边界匹配（`oom` 不命中
+  `kaboom`），评测/探针 cell（`arm::s7`、`arm::seed3::niah_train`）只计数
+  为 `n_ignored_cell_events`，不硬塞进 seed 帧。
+- 逐臂 `by_arm` 与 `differential_attempts` 报告尝试率/重试率/每 cell 最大
+  尝试数和 `concentrated`/`balanced`/`no_retries`。它是描述性读数，不产生
+  p 值：少量 cell/臂下做差性流失检验会把噪声当机制。
+- `audit_gates.py report` 增加顶层 `disposition`；该门不重算 PPL/p/Holm，
+  不进入冻结族。
+- 设计前馈 `audit_gates.py design` 读 `statistics.disposition_policy`：
+  confirmatory 必须 `first_success` / `same_cell` / 不允许 supersede，否则
+  violate；缺声明只 warning 并提示尚未预注册失败/替换规则；缺
+  `max_total_attempts` 也 warning。
+
+**Boundary.** 不是新检验，也不修复已经发生的选择偏差；它让「保留的是哪次
+尝试」可见。可替换失败的重试是允许的，前提是失败类已声明、回到同一 cell、
+在尝试预算内且所有尝试都留在账本。账本 tamper-evident 而非签名。缺计划时
+只能退回 observed/caller-supplied 帧，后者无法发现事后加 cell，因此不假绿。
+与 §93 missingness 互补：本门回答「保留的是哪次尝试」，§93 回答「未观测
+种子能把结论推到哪」。
+
+**Verification.** 新增 `test_review_part_34.py` 20 项：干净单次 ok、可替换
+失败重试 warn、第二次成功被保留 fail、保留第一次成功只 warn、未计划测量/
+尝试 fail、key/seed 不一致/重复 run_id/未知 status/布尔 seed/非对象事件
+fail-closed、NaN/未知失败重试 fail、cell 与总尝试预算、supersede 默认 fail
+与显式允许、计划写入器绑定/冲突/revision、重试集中单臂为描述性、无计划
+not_verifiable、评测/探针 cell 只计数、计划晚于首条 cell 判 reconstruction、
+cap 状态归入 runtime_cap、损坏/篡改计划判 fail、`design` 前馈拒绝
+confirmatory 的 last_success/supersede，以及 gate/CLI 接线与账本篡改 fail。
