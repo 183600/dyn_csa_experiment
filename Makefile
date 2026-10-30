@@ -12,7 +12,7 @@ INSTALL_DIR := $(BUILD_DIR)/install-check
 help:
 	@echo "make test          # CPU unit/reproducibility suite (zero GPU)"
 	@echo "make plan          # frozen-manifest preflight, no test-split read"
-	@echo "make audit         # local audit gates -> audit_report.json"
+	@echo "make audit         # local audit gates -> audit_report.json (non-zero on a failed gate)"
 	@echo "make integrity     # verify stamped analysis bodies/inputs (zero GPU)"
 	@echo "make reproduce A=<dir> B=<dir>  # compare two independent runs (zero GPU)"
 	@echo "make report-diff A=<json> B=<json>  # compare two stamped reports (zero GPU)"

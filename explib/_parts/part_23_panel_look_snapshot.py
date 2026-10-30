@@ -93,6 +93,278 @@ def load_look_history(outdir):
     return obj
 
 
+LOOK_ATTESTATION_SCHEMA = 1
+LOOK_ATTESTATION_KIND = 'look_history_attestation'
+LOOK_LEDGER_EVENT_KIND = 'panel_look'
+
+
+def look_entry_digest(entry):
+    """Content digest of one look entry (without its own digest field).
+
+    ``look_sha256`` is deliberately excluded so the digest can be stored in
+    the entry it describes.  The canonical encoding is the same one used by
+    the rest of the tracking layer (sorted keys, compact separators, ASCII).
+    """
+    if not isinstance(entry, dict):
+        raise TypeError('a look entry must be an object')
+    body = {k: v for k, v in entry.items() if k != 'look_sha256'}
+    blob = json.dumps(body, sort_keys=True, separators=(',', ':'),
+                      ensure_ascii=True, default=str)
+    return hashlib.sha256(blob.encode('utf-8')).hexdigest()
+
+
+def _look_ledger_events(ledger_path):
+    """Parse ``experiments.jsonl`` into panel-look events (best effort)."""
+    events = []
+    try:
+        with open(ledger_path, encoding='utf-8') as fh:
+            for line_no, line in enumerate(fh, start=1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    # The chain verifier reports the malformed line; the
+                    # attestation check below must not crash on it.
+                    continue
+                if isinstance(obj, dict) and obj.get('kind') == LOOK_LEDGER_EVENT_KIND:
+                    events.append((line_no, obj))
+    except OSError:
+        pass
+    return events
+
+
+def _attest_look_events(outdir, looks):
+    """Append a ``panel_look`` event for every look not already in the ledger.
+
+    Called after the history is written.  Using "not already present" rather
+    than "only the new look" makes migration of a pre-attestation history and
+    recovery from a crashed event write self-healing: the next aggregation
+    fills the missing events instead of leaving an unattestable file.
+    """
+    path = os.path.join(os.fspath(outdir), 'experiments.jsonl')
+    existing = set()
+    for _line, ev in _look_ledger_events(path):
+        lid = ev.get('look')
+        if isinstance(lid, numbers.Integral) and not isinstance(lid, bool):
+            existing.add(int(lid))
+    for ent in looks:
+        if not isinstance(ent, dict):
+            continue
+        lid = ent.get('look')
+        if (isinstance(lid, bool) or not isinstance(lid, numbers.Integral)
+                or int(lid) < 1 or int(lid) in existing):
+            continue
+        try:
+            digest = look_entry_digest(ent)
+        except Exception:
+            continue
+        log_experiment_event(outdir, {
+            'kind': LOOK_LEDGER_EVENT_KIND,
+            'tracking_schema': 2,
+            'panel': os.path.abspath(os.fspath(outdir)),
+            'look': int(lid),
+            'n_contrasts': (len(ent.get('contrasts') or {})
+                            if isinstance(ent.get('contrasts'), dict) else None),
+            'look_sha256': digest,
+            'recorded_at': ent.get('recorded_at'),
+        })
+        existing.add(int(lid))
+
+
+def verify_look_history_attestation(outdir, history, *, ledger_path=None):
+    """Cross-check a look history against the hash-chained experiment ledger.
+
+    ``look_history.json`` is a mutable JSON file: deleting an early look (or
+    truncating the file) removes the optional-stopping correction it implies,
+    and recomputing the remaining p-values still looks internally consistent.
+    The recorder therefore appends one ``panel_look`` event to
+    ``experiments.jsonl`` (a hash-chained, tail-anchored ledger) for every
+    distinct look, carrying the look number, contrast count and a digest of
+    the entry.  This function replays that binding:
+
+    * a look file with neither an attestation block nor ledger events is a
+      legacy artifact (pre-attestation): reported as ``legacy``, never as a
+      pass or a failure;
+    * events without an attestation block, or a missing/extra look, is a
+      ``fail`` (the history no longer describes the recorded sequence);
+    * an attested history whose ledger is absent is a ``warning`` (a crash or
+      a cleared ledger; the history cannot be cross-checked);
+    * a per-entry digest mismatch is a ``warning``: the file was edited after
+      it was attested, even though the remaining p-values may still replay.
+
+    This is tamper-EVIDENT, not a signature: rewriting the ledger and its
+    anchor can forge it.  It makes an accidental truncation or a one-line
+    deletion detectable, which the p-recomputation alone cannot do.
+    """
+    out = {
+        'schema': 1,
+        'status': 'legacy',
+        'attested': False,
+        'ledger': None,
+        'n_events': 0,
+        'n_looks': 0,
+        'n_truncated': 0,
+        'problems': [],
+        'warnings': [],
+        'note': ('cross-check of look_history.json against the hash-chained '
+                 'panel_look events; legacy histories have no attestation'),
+    }
+    if not isinstance(history, dict):
+        out['warnings'].append('look history is not an object; attestation '
+                               'cannot be checked')
+        out['status'] = 'warnings'
+        return out
+    looks = history.get('looks') if isinstance(history.get('looks'), list) else []
+    looks = [l for l in looks if isinstance(l, dict)]
+    out['n_looks'] = len(looks)
+    try:
+        out['n_truncated'] = int(history.get('truncated_oldest_looks') or 0)
+    except (TypeError, ValueError, OverflowError):
+        out['n_truncated'] = 0
+    ledger = (os.fspath(ledger_path) if ledger_path is not None
+              else os.path.join(os.fspath(outdir), 'experiments.jsonl'))
+    out['ledger'] = os.path.abspath(ledger)
+    attestation = history.get('attestation')
+    attested = (isinstance(attestation, dict)
+                and attestation.get('kind') == LOOK_ATTESTATION_KIND)
+    out['attested'] = bool(attested)
+    events = _look_ledger_events(ledger)
+    out['n_events'] = len(events)
+    if history.get('invalid'):
+        # A file that already failed to parse is not attestable; the caller
+        # reports the structural problem, and this function must not claim a
+        # clean binding.
+        out['warnings'].append(
+            f'look history is marked invalid ({history.get("invalid")}); '
+            'attestation is not verifiable')
+        out['status'] = 'warnings'
+        return out
+    if not attested and not events:
+        return out
+    if events and not attested:
+        out['problems'].append(
+            'the ledger records panel_look event(s) but look_history.json has '
+            'no attestation block; the attestation was removed or the history '
+            'was replaced after the looks were recorded')
+        out['status'] = 'fail'
+        return out
+    if attested and not events:
+        out['warnings'].append(
+            'look_history.json is attested but the ledger has no panel_look '
+            'event; the ledger was cleared/moved or the event write failed, '
+            'so the look sequence cannot be cross-checked')
+        out['status'] = 'warnings'
+        return out
+    # A present ledger must itself replay.  The dedicated ledger audit reports
+    # the same failure; surfacing it here makes a look-history verdict
+    # impossible to quote from an edited chain.
+    try:
+        chain = verify_experiment_ledger(ledger, check_anchor=True)
+    except Exception as e:
+        chain = {'status': 'fail',
+                 'problems': [f'{type(e).__name__}: {e}']}
+    if chain.get('status') == 'fail':
+        out['problems'].append(
+            'the experiment ledger does not replay ('
+            + '; '.join(str(x) for x in (chain.get('problems') or [])[:4])
+            + ')')
+    elif chain.get('status') != 'ok':
+        out['warnings'].append(
+            'the experiment ledger is not fully verifiable ('
+            + str(chain.get('status')) + '); look events are matched but the '
+            'chain/anchor itself is not attested')
+    by_look = {}
+    prev_look = None
+    ordered = True
+    for _line, ev in events:
+        lid = ev.get('look')
+        if (isinstance(lid, bool) or not isinstance(lid, numbers.Integral)
+                or int(lid) < 1):
+            out['problems'].append(
+                f'ledger panel_look event at line {_line} has no positive '
+                'integer look number')
+            continue
+        lid = int(lid)
+        if prev_look is not None and lid <= prev_look:
+            ordered = False
+        prev_look = lid
+        if lid in by_look:
+            out['problems'].append(
+                f'ledger has duplicate panel_look events for look {lid}')
+        else:
+            by_look[lid] = ev
+    if not ordered:
+        out['problems'].append(
+            'ledger panel_look events are not in strictly increasing look '
+            'order')
+    digest_bad = 0
+    count_bad = 0
+    for ent in looks:
+        lid = ent.get('look')
+        if (isinstance(lid, bool) or not isinstance(lid, numbers.Integral)
+                or int(lid) < 1):
+            # The structural parser reports malformed look numbers; do not
+            # duplicate that failure here as a missing event.
+            continue
+        ev = by_look.pop(int(lid), None)
+        if ev is None:
+            out['problems'].append(
+                f'look {int(lid)} is present in look_history.json but has no '
+                'panel_look event in the ledger')
+            continue
+        expected_sha = str(ev.get('look_sha256') or '')
+        try:
+            actual_sha = look_entry_digest(ent)
+        except Exception:
+            actual_sha = None
+        if actual_sha is not None and expected_sha != actual_sha:
+            digest_bad += 1
+        try:
+            n_contrasts = len(ent.get('contrasts') or {})
+        except TypeError:
+            n_contrasts = None
+        if (n_contrasts is not None
+                and ev.get('n_contrasts') != n_contrasts):
+            count_bad += 1
+    _valid_nos = []
+    for ent in looks:
+        lid = ent.get('look')
+        if (not isinstance(lid, bool) and isinstance(lid, numbers.Integral)
+                and int(lid) >= 1):
+            _valid_nos.append(int(lid))
+    _min_look = min(_valid_nos) if _valid_nos else None
+    early = [lid for lid in sorted(by_look)
+             if _min_look is not None and lid < _min_look]
+    late = [lid for lid in sorted(by_look)
+            if _min_look is None or lid >= _min_look]
+    for lid in late:
+        out['problems'].append(
+            f'ledger records look {lid} but look_history.json has no such '
+            'entry')
+    if len(early) > int(out['n_truncated']):
+        out['problems'].append(
+            f'{len(early)} early look event(s) are absent from '
+            f'look_history.json but only {out["n_truncated"]} look(s) are '
+            'declared truncated; a look was deleted from the history')
+    if digest_bad:
+        out['warnings'].append(
+            f'{digest_bad} look entr(y/ies) no longer match the digest '
+            'attested in the ledger; the history was edited after recording')
+    if count_bad:
+        out['warnings'].append(
+            f'{count_bad} look entr(y/ies) changed their contrast count after '
+            'attestation')
+    if out['problems']:
+        out['status'] = 'fail'
+    elif out['warnings']:
+        out['status'] = 'warnings'
+    else:
+        out['status'] = 'ok'
+    return out
+
+
 def record_panel_look(outdir, recs, *, design=None, baselines=None,
                       factorials=None, now=None):
     """Append a look snapshot when the measured contrast set changed.
@@ -104,6 +376,13 @@ def record_panel_look(outdir, recs, *, design=None, baselines=None,
     never silently becomes a different kind of evidence.  ``factorials`` is
     forwarded to :func:`panel_look_snapshot` so declared 2x2 interactions are
     covered by the same optional-stopping correction as ablations.
+
+    Every distinct look is also appended to the hash-chained experiment ledger
+    as a ``panel_look`` event (look number, contrast count and entry digest),
+    and the history carries an ``attestation`` block.  That makes a later
+    deletion/truncation of an early look distinguishable from a panel that was
+    genuinely only aggregated once (see
+    :func:`verify_look_history_attestation`).
     """
     snapshot = panel_look_snapshot(recs, design=design, baselines=baselines,
                                    factorials=factorials)
@@ -124,12 +403,20 @@ def record_panel_look(outdir, recs, *, design=None, baselines=None,
                                  separators=(',', ':'), ensure_ascii=True,
                                  default=str)
         if last_marker == marker:
+            # A crash between the history write and the ledger append can
+            # leave an attested file with a missing event.  An unchanged
+            # re-aggregation must repair that gap without inventing a new
+            # look.  Legacy (unattested) histories stay legacy: adding events
+            # without an attestation block would make them fail instead.
+            if isinstance(hist.get('attestation'), dict):
+                _attest_look_events(outdir, looks)
             return hist
     look_no = int(last.get('look') or len(looks)) + 1 if looks else 1
     entry = {'look': look_no,
              'recorded_at': now or time.strftime('%Y-%m-%dT%H:%M:%S'),
              'n_contrasts': len(snapshot),
              'contrasts': snapshot}
+    entry['look_sha256'] = look_entry_digest(entry)
     looks.append(entry)
     truncated = 0
     if len(looks) > LOOK_HISTORY_MAX_LOOKS:
@@ -140,7 +427,23 @@ def record_panel_look(outdir, recs, *, design=None, baselines=None,
     if truncated:
         hist['truncated_oldest_looks'] = int(
             hist.get('truncated_oldest_looks') or 0) + int(truncated)
+    hist['attestation'] = {
+        'schema': LOOK_ATTESTATION_SCHEMA,
+        'kind': LOOK_ATTESTATION_KIND,
+        'ledger': 'experiments.jsonl',
+        'n_looks': len(looks),
+        'truncated_oldest_looks': int(hist.get('truncated_oldest_looks') or 0),
+        'note': ('each look is attested by a panel_look event in the '
+                 'hash-chained experiments.jsonl; deleting a look leaves an '
+                 'unmatched event'),
+    }
     atomic_write_json(os.path.join(os.fspath(outdir), 'look_history.json'), hist)
+    # The events are appended after the history so a failed ledger write
+    # leaves an attested-but-unmatched history (a warning), never a silently
+    # un-attested look.  The helper also backfills a legacy history's retained
+    # looks on first migration, so upgrading the code does not turn an
+    # existing panel into a permanently unattestable one.
+    _attest_look_events(outdir, looks)
     return hist
 
 

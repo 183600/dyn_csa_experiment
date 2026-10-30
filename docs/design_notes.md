@@ -8228,3 +8228,111 @@ method/键、非法 schema）fail-closed；`descriptive_only` 计划归
 `V12_TEST_REREAD_REASON` 被写入 history；以及
 `confirmation._load_manifest` 在首读前拒绝畸形访问策略。完整 CPU 套件
 在本轮最终树通过。
+
+## 101. 分析的「看」也要入链：look history 的哈希链 attestation 与聚合审计的失败退出
+
+零 GPU 的可复现性/工程规范硬化；不新增训练、不读取 test split、不修改
+`confirmation_frozen*.json` 的字节/种子/端点/alpha/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未触碰。
+
+### 101.1 问题：删掉一次 look，p 仍然能重放
+
+§58 用 `look_history.json` 记录探索性面板每一次不同的种子集合，并用
+max-over-looks 的精确 sign-flip p 收紧「补种子后再决定」的结论。§77 又把
+逐事件哈希链与尾锚点加到 `experiments.jsonl` 上。但 look history 本身是
+一个独立的可变 JSON：
+
+- `audit_look_history` 会逐 look 重算 p，并和 `methodology_audit.json`
+  对账。它证明的是**剩余条目内部一致**，不是这些条目就是实际发生过的
+  全部 look。删掉较早的一条 look，文件仍是合法的 1-look 序列；重算的
+  `p_sequential` 等于最终 p，optional-stopping 校正被静默取消。
+- 文件被截断、被旧的聚合覆盖、或从备份恢复时，没有任何交叉证据能说明
+ 少了一次看。
+- 同一类问题在聚合审计上还有工程版本：`python audit_gates.py report`
+  把 60 个子审计写进 `audit_report.json`，却没有顶层状态；某个门返回
+  `fail` 时命令仍退出 0，`make audit` 因此不能作为 CI 闸门。
+
+### 101.2 look 的链上 attestation
+
+`record_panel_look` 现在为每条 look 计算 `look_sha256`（canonical JSON，
+不含自身摘要），并在 `look_history.json` 写入 `attestation`：
+
+```json
+{
+  "schema": 1,
+  "kind": "look_history_attestation",
+  "ledger": "experiments.jsonl",
+  "n_looks": 2,
+  "truncated_oldest_looks": 0
+}
+```
+
+同一个函数向 `experiments.jsonl` 追加一条 `panel_look` 事件，携带
+`look`、`n_contrasts`、`look_sha256`、`recorded_at`。事件写失败不会回滚
+已经完成的聚合，但会留下「attested 但 ledger 无事件」的可检出状态。首次
+把旧（无 attestation）目录升级时，`_attest_look_events` 会为**保留的**
+历史 look 补事件；否则每个旧面板都会永久缺事件。
+
+`verify_look_history_attestation(outdir, history)` 的判定：
+
+| 观测 | 状态 |
+|---|---|
+| 既无 attestation 也无 `panel_look` 事件（旧工件） | `legacy`，不追溯判 fail |
+| 有事件但无 attestation（attestation 被删/文件被换） | `fail` |
+| attestation 在、ledger 完全缺失（崩溃/清空） | `warnings` |
+| 历史 look 无对应事件，或事件在保留区间之外 | `fail`（删除/插入） |
+| ledger 链或尾锚点不通过 | `fail` |
+| 条目内容在 attestation 后被改（digest 不符） | `warnings` |
+| 全部事件与条目一一对应 | `ok` |
+
+截断合法：`truncated_oldest_looks` 声明的最早 look 允许没有条目；但
+**多出**未声明的早期事件判 fail。`audit_look_history` 把该块并入
+`problems`/`warnings`，`audit_gates.py report` 的顶层 `looks` 因此能
+区分「少看了一次」和「只看了一次」。
+
+### 101.3 聚合审计的显式状态与退出码
+
+`audit_report_status(report)` 汇总每个子审计的 `status`：
+
+- 任一 `fail` → 顶层 `status='fail'`、`exit_code=1`；
+- 否则任一 `warnings`/`warn` 或非空 `problems` → `'warnings'`、退出 0；
+- 否则 `'ok'`。
+
+`not_verifiable_locally` / `not_applicable` 被计数并点名，但不升级为
+fail：source-only checkout 缺 GPU 产物是预期状态。`run_report` 在写
+`audit_report.json` 前把该块放到顶层 `status`/`audit_status`；CLI 的
+`report` 命令因此与其它子命令一致，真实失败退出 1，`make audit` 成为
+可执行的闸门。警告仍由报告正文呈现，不会因为退出 0 而被当作通过。源码
+改动后应先跑 `make plan` 重建 `analysis_v12/plan_snapshot.json`；否则
+`source` 门会按设计判 fail（这正是「代码已变、计划快照未变」的告警）。
+
+### 101.4 边界
+
+- 不是新的显著性检验：没有新 p 值/区间/Holm 成员，不改变
+  `p_sequential`、`verified`、冻结 `confirmed` 或任何测量。
+- **tamper-evident，不是签名。** 能重写 ledger 并重建链/锚点的人仍能
+  伪造；本门让意外截断、旧文件覆盖、单行删除与「升级后缺事件」可见。
+- 内容 digest 不符只判 warning：一条旧 look 的 delta 被改写时，p 重算
+  通常已经能判 fail；digest 是第二层证据，不把「重放器可修复的漂移」
+  直接升级为伪造。
+- 顶层 `status` 只汇总，不代替子审计的证据；`make audit` 不读 test
+  split、不训练、不需要 GPU。
+- `panel_look` 事件会进入实验账本；它是 tracking 事件，不进入
+  `run_cfg`/resume 指纹，也不改变任何数值路径。
+
+### 101.5 入口与验证
+
+```bash
+python -m pytest -q test_review_part_39.py
+python audit_gates.py looks                       # 逐 look 重放 + attestation
+python audit_gates.py report                      # 顶层 status/audit_status
+make audit                                        # 真实 fail 时非零退出
+```
+
+`test_review_part_39.py` 10 项覆盖：记录后 `look_sha256`/attestation 与
+ledger 事件一致，重复聚合不重复记事件；截断历史判 fail；删除
+attestation 判 fail；ledger 缺失判 warnings；改写历史 delta 且把 p 改成
+自洽值时由 digest 判 warnings；篡改 ledger 事件体使链重放失败；旧 look
+目录首次升级自动补事件；纯 legacy 历史保持 `legacy`；聚合状态的
+ok/warnings/fail/空报告；以及 CLI 在顶层 fail 时退出 1。完整 CPU 套件在
+本轮最终树通过。

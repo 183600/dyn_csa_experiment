@@ -746,6 +746,16 @@ def audit_look_history(paths=None):
         rec = {'path': f, 'looks': 0, 'contrasts': {},
                'downgraded': [], 'warnings': [], 'problems': []}
         hist = _load(f)
+        if isinstance(hist, dict):
+            # The p-value replay below proves internal consistency, not
+            # provenance: deleting an early look leaves a perfectly
+            # consistent, shorter series.  The recorder also writes a
+            # ``panel_look`` event to the hash-chained ledger; replay that
+            # binding so a truncated/edited history is visible.
+            att = L.verify_look_history_attestation(panel_dir, hist)
+            rec['attestation'] = att
+            rec['problems'].extend(att.get('problems') or [])
+            rec['warnings'].extend(att.get('warnings') or [])
         if hist is None:
             rec['problems'].append('look_history.json is missing or not a JSON object')
         elif not isinstance(hist.get('looks'), list):
@@ -1930,8 +1940,85 @@ def _report_timestamp():
     return L.reproducible_timestamp()
 
 
+def audit_report_status(report):
+    """Aggregate the per-gate verdicts into one enforceable report status.
+
+    The aggregate report is the CI entry point (`make audit`).  It used to
+    write every child verdict but carry no top-level status, so the command
+    exited 0 even when one of the methodological gates returned ``fail``.
+    This helper makes the whole-report contract explicit:
+
+    * ``fail``     — at least one gate returned ``status='fail'``;
+    * ``warnings`` — no failure, but a gate reported warnings/problems (for
+      example a missing artifact, which is honest to surface but not a
+      failed measurement gate);
+    * ``ok``       — every gate that ran is clean.
+
+    ``not_verifiable_locally`` / ``not_applicable`` children are counted and
+    named but do not become failures: a source-only checkout is expected to
+    lack GPU artifacts.  A gate that adds ``problems`` without a ``fail``
+    status is still surfaced, never silently dropped.
+    """
+    if not isinstance(report, dict):
+        raise TypeError('report must be an object')
+    failed, warned, not_verifiable, not_applicable = [], [], [], []
+    problem_gates = []
+    n_problems = 0
+    for name, value in report.items():
+        if name in ('status', 'audit_status', 'generated_at', 'code',
+                    'provenance', 'content_sha256', 'inputs', 'audit_inputs'):
+            continue
+        if not isinstance(value, dict):
+            continue
+        st = value.get('status')
+        problems = value.get('problems')
+        n = len(problems) if isinstance(problems, list) else 0
+        n_problems += n
+        if n:
+            problem_gates.append(name)
+        if st == 'fail':
+            failed.append(name)
+        elif st in ('warnings', 'warn'):
+            warned.append(name)
+        elif st == 'not_verifiable_locally':
+            not_verifiable.append(name)
+        elif st == 'not_applicable':
+            not_applicable.append(name)
+        elif n:
+            # A gate that returned problems under a non-fail status (legacy
+            # audited vocabulary) must not let the aggregate claim "ok".
+            warned.append(name)
+    if failed:
+        status = 'fail'
+    elif warned or n_problems:
+        status = 'warnings'
+    else:
+        status = 'ok'
+    return {
+        'schema': 1,
+        'status': status,
+        'gates_failed': sorted(failed),
+        'gates_warned': sorted(warned),
+        'gates_with_problems': sorted(problem_gates),
+        'gates_not_verifiable_locally': sorted(not_verifiable),
+        'gates_not_applicable': sorted(not_applicable),
+        'n_gates': sum(1 for v in report.values() if isinstance(v, dict)),
+        'n_gate_problems': int(n_problems),
+        'exit_code': 1 if status == 'fail' else 0,
+        'note': ('aggregate of the per-gate verdicts; `fail` exits non-zero '
+                 'from `python audit_gates.py report`/`make audit`, while a '
+                 'not-verifiable child (missing local artifact) does not'),
+    }
+
+
 def run_report(out='audit_report.json'):
     res = {'generated_at': _report_timestamp(), 'source_tree': audit_source_integrity(), 'dependencies': audit_dependencies(), 'data_source': audit_data_source(), 'leakage': audit_leakage(), 'split_discipline': audit_split_discipline(), 'document_unit': audit_document_unit(), 'sample_design': audit_sample_design(), 'data_processing': audit_data_processing(), 'attribution': audit_attribution(), 'boundary': audit_boundary(), 'length': audit_length(), 'fairness': audit_fairness(), 'metrics': audit_metrics(), 'tuning': audit_tuning(), 'simple_baseline': audit_simple_baseline(), 'hypotheses': audit_hypotheses(), 'sesoi': audit_sesoi_declaration(), 'baseline_sesoi': audit_baseline_sesoi(), 'interaction_sesoi': audit_interaction_sesoi(), 'interaction_power': audit_interaction_power(), 'unit_influence': audit_unit_influence(), 'two_level_ci': audit_two_level_ci(), 'variance_components': audit_variance_components(), 'analysis_choices': audit_analysis_choices(), 'analysis_integrity': audit_analysis_integrity(exclude=(os.path.join(REPO, out),)), 'experiment_ledger': audit_experiment_ledger(), 'verdicts': audit_confirmation_verdicts(), 'pvalue_replay': audit_confirmation_pvalues(), 'looks': audit_look_history(), 'test_access': audit_test_access(), 'methodology': audit_methodology(), 'missingness': audit_missingness(), 'trajectory': audit_trajectory(), 'disposition': audit_run_disposition(), 'joint_correction': audit_joint_correction(), 'single_factor': audit_single_factor(), 'content_controls': audit_content_controls(), 'sink_controls': audit_sink_controls(), 'fusion_controls': audit_fusion_controls(), 'lesion': audit_lesion(), 'endpoint_selection': audit_endpoint_selection(), 'factorial': audit_factorial_design(), 'interaction_coverage': audit_interaction_coverage(verbose=False), 'factorial_anchor': audit_factorial_anchor(verbose=False), 'design_preflight': audit_design_preflight(), 'sensitivity': audit_design_sensitivity(), 'evaluation': audit_evaluation_design(), 'dose_response': audit_dose_response(verbose=False), 'failures': audit_failures(), 'budget': audit_budget(), 'training_health': audit_training_health(), 'efficiency_pairs': audit_efficiency_pairs(), 'error_case_inference': audit_error_case_inference(), 'release': audit_release_readiness(), 'selection': audit_selection(), 'run_order': audit_run_order(), 'run_allocation': audit_run_allocation(), 'evaluation_order': audit_evaluation_order(), 'reproduction': audit_reproduction(), 'calibration': audit_statistical_calibration()}
+    # The aggregate verdict is part of the report body, so a reader (and the
+    # CLI below) can act on one status instead of re-scanning every child
+    # block.  Compute it BEFORE inserting it, so the status cannot depend on
+    # its own prior value.
+    res['audit_status'] = audit_report_status(res)
+    res['status'] = res['audit_status']['status']
     L_atomic = None
     try:
         L = _import_exp_lib()

@@ -4434,3 +4434,55 @@ fail、首读前修订放行；空锁/类型/负数/零读取带指纹/重读计
 confirmed、非法 p、存储块篡改 fail；审计门三态与 CLI/report 接线；
 `V12_TEST_REREAD_REASON` 写入 history；`_load_manifest` 首读前拒绝畸形
 策略。完整 CPU 套件在本轮最终树通过（868 passed, 3 skipped）。
+
+## 2026-10-30 — 分析的「看」也要入链：look-history attestation 与聚合审计的失败退出（本轮可复现性/工程规范硬化，no new runs）
+
+零 GPU 的可复现性/工程规范硬化；不新增训练、不读取 test split、不修改
+`confirmation_frozen*.json` 的字节/种子/端点/alpha/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未触碰。
+
+**Problem.** §58 的 optional-stopping 校正完全依赖
+`results_*/look_history.json`，但它是普通可变 JSON：`audit_look_history`
+只重算剩余条目的 p 并和 `methodology_audit.json` 对账。删掉较早的一次
+look 后，文件仍是一条合法的短序列，`p_sequential` 退化成最终 p，校正被
+静默取消；截断/旧文件覆盖也没有交叉证据。工程侧同样有一个「没有失败
+状态」的问题：`python audit_gates.py report` 汇总 60 个子审计写进
+`audit_report.json`，但顶层没有 `status`，子审计 `fail` 时命令仍退出 0，
+`make audit` 不能作为闸门。
+
+**Fix.** (1) `record_panel_look` 为每条 look 计算 `look_sha256`，在
+`look_history.json` 写 `attestation`（schema/kind/ledger/n_looks/
+truncated_oldest_looks），并向哈希链
+`experiments.jsonl` 追加 `panel_look` 事件（look、n_contrasts、
+look_sha256、recorded_at）。首次升级旧目录时
+`_attest_look_events` 为保留的历史 look 补事件，避免旧面板永久缺证据。
+(2) 新增 `exp_lib.verify_look_history_attestation`：legacy（无
+attestation/事件）不追溯判 fail；有事件无 attestation、历史 look 无事件、
+事件落在保留区间之外、ledger 链/锚点失败判 fail；attestation 在但 ledger
+缺失、条目 digest 不符判 warning；合法的 `truncated_oldest_looks` 允许
+早期事件没有条目，但多余的未声明早期事件判 fail。`audit_look_history`
+并入该块，`audit_gates.py report` 的顶层 `looks` 能看到 attestation。
+(3) 新增 `audit_gates.audit_report_status`：任一子审计 `fail` → 顶层
+`status='fail'`、`exit_code=1`；有 warning/problems → `'warnings'`；
+`not_verifiable_locally`/`not_applicable` 只计数、不升级为 fail。
+`run_report` 在落盘前写顶层 `status`/`audit_status`，CLI 的 `report`
+与其它子命令一样在真实失败时退出 1。
+
+**Boundary.** 不是新的显著性检验：没有新 p/区间/Holm 成员，不改变
+`p_sequential`、`verified`、冻结 `confirmed` 或任何测量。attestation 是
+tamper-evident 不是签名：能重写 ledger 并重建链/锚点的人仍能伪造；本门
+让意外截断、旧文件覆盖、单行删除和升级后缺事件可见。内容 digest 不符只
+判 warning（p 重算通常已能判 fail，digest 是第二层）；顶层状态只汇总，
+不代替子审计证据；`panel_look` 是 tracking 事件，不进 `run_cfg`/resume
+指纹，不改变数值路径。`make audit` 仍不读 test split、不训练、不需要
+GPU；source-only checkout 缺产物时保持 `warnings` 而不是 `fail`。源码
+改动后应先 `make plan` 重建 plan snapshot，否则 `source` 门会按设计判
+fail（表示代码已变而计划快照未变）。
+
+**Verification.** 新增 `test_review_part_39.py` 10 项：记录后 digest/
+attestation 与 ledger 事件一致且重复聚合不重复记事件；截断历史判 fail；
+删除 attestation 判 fail；ledger 缺失判 warnings；改写历史 delta 并把 p
+改成自洽值时由 digest 判 warnings；篡改 ledger 事件体使链重放失败；旧
+look 目录首次升级自动补事件；纯 legacy 历史保持 `legacy`；聚合状态的
+ok/warnings/fail/空报告；CLI 在顶层 fail 时退出 1。完整 CPU 套件在本轮
+最终树通过（881 passed, 3 skipped）。
