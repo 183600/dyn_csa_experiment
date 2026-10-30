@@ -178,6 +178,28 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
             stats['arm_ranking']['endpoint'] = f'by_len.ppl@{_rank_len}'
             stats['arm_ranking']['upstream'] = ('finaltest_stats: frozen '
                                                 'by_len cells, one common endpoint')
+            # The ranking table reports the observed winner's mean, which is
+            # the maximum of K noisy arm means.  Add the selection-bias
+            # readout on the SAME cells: bootstrap optimism, the
+            # optimism-corrected endpoint, and the split-sample honest value /
+            # selection regret.  It is descriptive and never changes a frozen
+            # verdict.
+            try:
+                _wc = L.winner_curse_correction(
+                    _rank_cells, better='min', n_boot=4000, seed=20261018,
+                    split_seed=20261018, max_partitions=2000,
+                    lead_level=0.60, min_seeds=5)
+                _wc['endpoint'] = f'by_len.ppl@{_rank_len}'
+                _wc['upstream'] = ('finaltest_stats: frozen by_len cells; '
+                                   'same cells as arm_ranking')
+                stats['winner_curse'] = _wc
+            except Exception as _wce:
+                stats['winner_curse'] = {
+                    'kind': 'winner_curse_correction',
+                    'status': 'not_estimable',
+                    'reason': f'{type(_wce).__name__}: {_wce}',
+                    'endpoint': f'by_len.ppl@{_rank_len}',
+                }
             # The section-102 ranking resamples seeds only.  Report the other
             # sampling axis of the same ranking: the frozen evaluation units.
             # The matrices are the per-unit decomposition of the SAME
@@ -223,6 +245,13 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
             'status': 'not_estimable',
             'reason': ('the cross-arm ranking is not estimable, so its '
                        'evaluation-unit sensitivity is not defined'),
+        }
+    if 'winner_curse' not in stats:
+        stats['winner_curse'] = {
+            'kind': 'winner_curse_correction',
+            'status': 'not_estimable',
+            'reason': ('the cross-arm ranking is not estimable, so the '
+                       'selection-bias readout is not defined'),
         }
 
     for comp in manifest['primary_comparisons']:
@@ -1375,6 +1404,76 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
               '表内 `endpoint mean` 是逐种子 PPL 的算术均值（与配对 sign-flip '
               '同口径）；上方 by-length 表的 PPL 是 token 池化值，两者可能在'
               '小数位不同，不能混读。')
+            A('')
+
+    _wc = ft.get('winner_curse')
+    if isinstance(_wc, dict):
+        A('#### 最优臂的选择偏差与赢家诅咒校正（探索性）')
+        A('')
+        if _wc.get('status') == 'not_estimable':
+            A(f'- 不可估计：{_wc.get("reason", "insufficient data")}')
+            A('')
+        else:
+            _wc_bs = _wc.get('bootstrap') or {}
+            _wc_ss = _wc.get('split_sample') or {}
+            _wc_means = _wc.get('observed_means') or {}
+            _wc_pb = _wc.get('p_best') or {}
+            _wc_sf = _wc_ss.get('selection_frequency') or {}
+            A('| 臂 | observed mean | P(best) | split-sample selection freq |')
+            A('|---|---|---|---|')
+            for _a in (_wc.get('arms') or sorted(_wc_means)):
+                _m = _wc_means.get(_a)
+                _mt = f'{float(_m):.4f}' if isinstance(_m, (int, float)) else '—'
+                _p = _wc_pb.get(_a)
+                _pt = f'{float(_p):.3f}' if isinstance(_p, (int, float)) else '—'
+                _f = _wc_sf.get(_a)
+                _ft2 = f'{float(_f):.3f}' if isinstance(_f, (int, float)) else '—'
+                A(f'| `{_a}` | {_mt} | {_pt} | {_ft2} |')
+            A('')
+
+            def _wfmt(value, fmt='{:+.4f}'):
+                return fmt.format(float(value)) if isinstance(value, (int, float)) else '—'
+
+            def _wci(pair):
+                if (isinstance(pair, (list, tuple)) and len(pair) >= 2
+                        and isinstance(pair[0], (int, float))
+                        and isinstance(pair[1], (int, float))):
+                    return f'[{float(pair[0]):+.4f}, {float(pair[1]):+.4f}]'
+                return '—'
+
+            _gap = _wc.get('observed_gap')
+            A(f'- 观测最优：`{_wc.get("observed_winner", "?")}`；前二差距 '
+              f'{_wfmt(_gap)}（正值 = 观测最优领先）。')
+            _opt = _wc_bs.get('optimism_mean')
+            _opt_txt = (_wfmt(_opt) if isinstance(_opt, (int, float)) else '—')
+            A(f'- bootstrap 选择乐观度（apparent − full-sample；负值 = 选择后'
+              f'看起来更好）{_opt_txt}，95% 区间 {_wci(_wc_bs.get("optimism_ci95"))}；'
+              f'校正后端点 {_wfmt(_wc_bs.get("corrected_winner_value"))}'
+              f'（观测 {_wfmt(_wc.get("observed_winner_value"))}）。')
+            _breg = _wc_bs.get('selection_regret_mean')
+            _breg_txt = _wfmt(_breg) if isinstance(_breg, (int, float)) else '—'
+            A(f'- bootstrap selection regret（全 S 个种子的选择规则）{_breg_txt}；'
+              f'regret/观测差距 = {_wc_bs.get("regret_share_of_gap")}；'
+              f'差距大于 bootstrap regret = {_wc_bs.get("observed_gap_exceeds_regret")}。')
+            A(f'- 分半诚实值（在另一半种子上评分）'
+              f'{_wfmt(_wc_ss.get("honest_value_mean"))}，95% 区间 '
+              f'{_wci(_wc_ss.get("honest_value_ci95"))}；分半 regret '
+              f'{_wfmt(_wc_ss.get("selection_regret_mean"))}，95% 区间 '
+              f'{_wci(_wc_ss.get("selection_regret_ci95"))}。'
+              '分半只在一半种子上选优，是更保守的独立核对。')
+            A(f'- 状态：`{_wc.get("status")}` — {_wc.get("status_reason", "")}')
+            A('')
+            A('> 边界：上表把「观测最优的均值」与「选择过程的期望表现」分开：'
+              '`observed mean` 是六选一（或 K 选一）的极值，不能当作该臂的'
+              '无偏均值；bootstrap 乐观度是对**选择规则**的 Efron 近似，'
+              '校正值是近似读数，不是后验均值，且有限 `n_boot` 的蒙特卡洛'
+              '误差会让清晰分离面板上的微小校正方向不可解释。分半估计针对「一半种子上'
+              '选优」这个过程，不是观测赢家本身，也不能替代独立复现。'
+              '两者都不是新的显著性检验：不产生 p 值、不进入 Holm 族、'
+              '不做 FWER 控制、不改变 `p_exact_signflip`、`p_holm`、'
+              '`verified` 或冻结 `confirmed`。臂集合固定且容量/配方/计算量'
+              '不同，校正后的端点不是架构因果效应；`P(best)` 高也不等于'
+              '独立复现。')
             A('')
 
     _ru = ft.get('arm_rank_units')

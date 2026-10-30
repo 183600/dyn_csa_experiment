@@ -8639,3 +8639,152 @@ fail-closed；ragged 单元、token 数不一致、unit id 顺序/部分
 `run_report`/CLI 接线；合成六 seed 三臂逐单元面板的端到端落盘 → 审计
 `ok`；以及 `REPORT_v12` 渲染「排序的评测单元敏感性」表与边界段。
 完整 CPU 套件在本轮最终树通过。
+
+## 104. 观测最优的均值是选择极值：bootstrap 乐观度、校正值与选择 regret（本轮结果分析硬化）
+
+零 GPU 的结果分析硬化；不新增训练、不读取 test split、不修改
+`confirmation_frozen*.json` 的字节/种子/端点/α/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未触碰。
+
+### 104.1 问题：p_best 回答「谁赢」，不回答「赢家均值有多偏」
+
+§102 的排序读数把「观测最低均值」从逐对 Holm 中单独拿出来，用配对种子
+bootstrap 给出 `P(best)`、排名区间和前二差距；§103 又把同一排序放到评测
+单元轴上重采样。它们回答的是**排序/赢家身份**是否被噪声分辨，但仍然把
+`observed_means[winner]` 当作该臂的端点读数印在表里。这个均值是 K 个带
+噪声臂均值的**最大值**（PPL 下是最小值），即使排序完全分辨，它仍然系统
+性地偏向有利方向。12 个种子、6 个臂时，几个 PPL 点的「领先」完全可能是
+选择噪声；把 `observed_gap` 或赢家均值直接写成「方法比基线好多少」正是
+winner's curse。
+
+已有读数各自回答别的问题：`p_best` 是频率而不是偏差大小；
+`top2_gap_ci95` 是前二差距的抽样区间，不是「选择过程在未见种子上会损失
+多少」；`variance_components` 的预测区间描述单次测量，不描述「从 K 个臂
+里挑最大」这个动作；`winner_stable_loo` 只检查删一个种子后赢家是否换人，
+不给出均值偏差。结果分析需要把**观测极值**与**选择规则的期望表现**分开。
+
+### 104.2 方法：两条互补的选择偏差读数
+
+新增 `exp_lib.WINNER_CURSE_POLICY` 与
+`exp_lib.winner_curse_correction()`，输入与 §102 相同：
+`{arm: {seed: value}}` 或 `{arm: [value, ...]}`（可带 `seeds=`）。所有臂在
+共同种子上配对；缺 seed 的臂具名写入 `dropped_seeds`，不静默补值。默认
+`better='min'`（PPL），`better='max'` 时内部取反。
+
+1. **bootstrap 选择乐观度（Efron optimism）**。每次配对 bootstrap 抽取
+   一组 seed 下标，所有臂共用；在重采样上选出 `w*`，记
+   `optimism_b = apparent(w*) - full_sample(w*)`（端点原单位；负值表示
+   重采样上看起来更好）。平均乐观度 `optimism_mean` 是对这个**选择规则**
+   的乐观度估计；`corrected_winner_value = observed_winner_value -
+   optimism_mean` 是近似校正值。另报
+   `conditional_optimism_mean`（只在 `w*` 等于观测赢家的 replicate 上取
+   平均）和 `n_conditional`，让读者看到条件在「同一个赢家」上的偏差。
+2. **bootstrap selection regret**。对每个 replicate，用**全样本**各臂均值
+   评估 `w*` 的 regret：`full_sample(w*) - min_k full_sample(k)`（≥0）。
+   它回答「在这个 K 选一规则下，选中的臂平均比真正最好的臂差多少」。
+   同时报 95% 百分位区间。
+3. **分半诚实值（split-sample honest evaluation）**。把 S 个种子分成两个
+   不重叠的半区：在一个半区选优，在另一个半区评分；两个方向都做。
+   `honest_value_mean` 是「选优后未见半区」的平均端点，
+   `selection_frequency` 是各臂被选中的频率，`selection_regret_mean` 是
+   选中臂在评分半区相对该半区最优臂的 excess（≥0）。当
+   `C(S, floor(S/2)) <= max_partitions`（默认 2000）时枚举全部分区，
+   否则用固定 `split_seed` 抽 2000 个分区；分区与方向都确定性可重放。
+4. **状态带**（报告阈值，不是检验）：
+   - `selection_robust`：唯一观测赢家、`P(best) >= lead_level`（0.60），
+     且**观测前二差距 > bootstrap regret**；
+   - `selection_noise_dominated`：唯一赢家且 `P(best)` 达 lead，但观测
+     差距不大于 bootstrap regret；
+   - `winner_unstable`：`P(best) < lead_level`，赢家身份未分辨；
+   - `tied_best`：多个臂共享最优观测均值（完全相等，或落在声明的
+     `tie_tol` 实际并列边界内），没有唯一赢家可校正；
+   - `not_estimable`：少于 2 个臂、共同种子少于 `min_seeds`（默认 5）、
+     没有非空分区，或校正值不可表示。
+
+   分半 regret 只在一半种子上选优，是**更保守的独立核对**；状态带用的是
+   全 S 个种子的 bootstrap regret，因为那才对应被报告的选择规则。两者
+   并列报告，不能互相替代。
+
+### 104.3 边界：这是选择偏差读数，不是第二个确认性检验
+
+- **没有新 p 值、没有 FWER 控制、没有 Holm 成员。** `optimism_mean` 是
+  选择规则的 bootstrap 近似，不是后验均值；`corrected_winner_value` 是
+  近似校正，不是「该臂真实均值」的无偏估计。乐观度由有限 `n_boot` 估计，
+  本身有蒙特卡洛误差；清晰分离面板上它可能在小数点后为正或负，不能把
+  `corrected` 与 `observed` 的微小差异解释成真实偏差方向。它不改变
+  `p_exact_signflip`、`p_holm`、`verified` 或冻结 `confirmed`。
+- **分半估计针对过程，不针对观测赢家。** `honest_value_mean` 是「在一半
+  种子上选优、在另一半评分」的规则表现；它不等于观测赢家本身的均值，也
+  不能替代独立复现。`selection_frequency` 低说明赢家身份不稳定，而不是
+  某个臂一定更差。
+- **bootstrap 与分半回答相关问题但不相同。** bootstrap 用 S 个重采样种子，
+  分半只在一半种子上选优，因此分半 regret 通常更大；报告分别给出，不用
+  一个更有利的读数覆盖另一个。
+- **臂集合固定且非随机化，容量/配方/计算量不同。** 校正值是这些已训练
+  配置在这个端点上的选择偏差读数，不是架构因果效应；参数匹配也不等于
+  计算匹配。
+- **不能把 `selection_robust` 写成「赢家真实存在」。** 它只表示观测前二
+  差距大于这个面板上的 bootstrap 选择 regret，且 `P(best)` 达到报告 band；
+  高 `P(best)` 仍是在同一批数据上选出的，独立复现需要新面板或预注册复制。
+- **数值极端时只保证不伪造。** 排序/选择在 `oriented/scale - shift` 的
+  共同仿射尺度上计算；原始单位均值、校正值和区间只有在可表示时才输出，
+  否则明确 `None`，不写 `inf`/`NaN`。
+- **不重采样 token、不重采样评测单元。** 该读数只重采样观测到的训练种子；
+  评测单元不确定性仍由 §54/§57/§81/§103 负责。
+
+### 104.4 落盘、报告与审计
+
+- `explib.confirmation.finaltest_stats` 在 §102 的 `arm_ranking` 之后，用
+  同一 `_rank_cells` 调用 `winner_curse_correction`，写入
+  `stats['winner_curse']`（含 `per_arm_seed_values`、`policy`、`bootstrap`、
+  `split_sample` 与 `endpoint`/`upstream`）。排序不可估计时写
+  `not_estimable` 并说明原因，不伪造校正值。
+- `build_report` 在「冻结臂的排序分辨率」之后新增「最优臂的选择偏差与
+  赢家诅咒校正（探索性）」小节：逐臂 observed mean / `P(best)` / 分半
+  selection frequency，观测赢家与前二差距，bootstrap 乐观度及其区间、
+  校正值，bootstrap regret 与 regret/gap，分半诚实值与 regret，状态与
+  边界段。`not_estimable` 只打印原因。
+- `audit_gates.py winner_curse`（别名 `selection_bias` /
+  `selection_adjusted`）读取 `analysis_v12/test_stats.json` 的
+  `finaltest.winner_curse`，用块内 `per_arm_seed_values` 与
+  `policy`（`n_boot`/`bootstrap_seed`/`split_seed`/`max_partitions`/
+  `lead_level`/`min_seeds`/`tie_tol`/`better`）**独立重放**，逐字段比较
+  observed/winners/optimism/corrected/regret/selection frequency/status；
+  任何不一致判 `fail`。它拒绝块里出现 `confirmed`/`p_holm`/`verified`/
+  verdict 等确认性字段，检查 `p_best` 与 `selection_frequency` 归一、
+  regret 与区间非负有序、`selection_robust` 必须 `P(best) >= lead` 且
+  差距大于 bootstrap regret、`winner_unstable` 必须 `P(best) < lead`、
+  `tied_best` 必须至少两个并列臂。缺块（legacy artifact）判
+  `not_verifiable_locally`；无原始值的合法 `not_estimable` 判
+  `not_applicable`；带原始值的 `not_estimable` 仍重放并判 `ok`。该门并入
+  `audit_gates.py report` 的顶层 `winner_curse`，`make audit` 因此在真实
+  篡改/不一致时非零退出。它是**内部重放**：能发现「改了派生读数却没同步
+  改原始值」和「删字段」，但不能证明 `per_arm_seed_values` 就是原始 test
+  切片上的测量；后者由 stamped 输入绑定、冻结锁与 `analysis_integrity`
+  负责。
+
+### 104.5 入口与验证
+
+```bash
+python -m pytest -q test_review_part_44.py
+python audit_gates.py winner_curse        # 重放 analysis_v12/test_stats.json
+python audit_gates.py selection_bias      # 别名
+python audit_gates.py report              # 顶层汇总含 winner_curse
+make audit
+```
+
+`test_review_part_44.py` 16 项覆盖：策略/状态声明；清晰分离→
+`selection_robust`、乐观度≈0、校正值接近观测、分半选择频率=1、严格 JSON
+与同输入重放；噪声主导面板→`selection_noise_dominated`、校正/诚实值高于
+观测、bootstrap 与分半 regret 均大于观测差距；`better='max'` 方向与校正
+符号；分半分区上限、确定性与不同 `split_seed`；seed 交集/`dropped_seeds`；
+并列最优→`tied_best`（完全并列与声明的 `tie_tol` 实际并列）；少于 2 臂/
+种子不足→`not_estimable`；布尔/NaN/inf/
+字符串/长度不一致/混合输入/非法参数的 fail-closed；`1e308` 级有限值不产生
+NaN/inf；审计对合法块 `ok`、篡改校正值/乐观度/`p_best`/夹带 `confirmed`/
+改状态判 `fail`、缺文件 `not_verifiable_locally`、bare `not_estimable`
+`not_applicable`；结构不一致（robust 却差距不大于 regret、tied 却只有一个
+并列、概率不归一）判 `fail`；`run_report`/CLI/`finaltest_stats`/报告接线；
+合成六 seed 三臂面板的端到端落盘 → 审计 `ok`；以及 `REPORT_v12` 渲染
+选择偏差小节与「不是新的显著性检验」边界段。完整 CPU 套件在本轮最终树
+通过。

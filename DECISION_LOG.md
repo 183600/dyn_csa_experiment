@@ -4585,3 +4585,59 @@ NaN/inf；审计对合法块 `ok`、篡改 `p_best`/夹带 `confirmed` 判 `fail
 `run_report`/CLI 接线；合成六 seed 三臂逐单元面板的端到端落盘 → 审计
 `ok`；以及 `REPORT_v12` 渲染「排序的评测单元敏感性」表与边界段。完整
 CPU 套件在本轮最终树通过。
+
+## 2026-10-30 — 观测最优的均值是选择极值：乐观度、校正值与选择 regret（本轮结果分析硬化，no new runs）
+
+零 GPU 的结果分析硬化；不新增训练、不读取 test split、不修改
+`confirmation_frozen*.json` 的字节/种子/端点/α/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未触碰。
+
+**Problem.** §102/§103 的排序读数回答「谁赢、排序被种子/评测单元噪声
+分辨了多少」，但报告仍把 `observed_means[winner]` 当作赢家的端点读数。
+这个均值是 K 个带噪声臂均值的最大值（PPL 下为最小值），即使排序完全
+分辨，它仍系统性地偏向有利方向；`observed_gap` 也是被选择的最大差距。
+`P(best)` 是频率，`top2_gap_ci95` 是差距的抽样区间，`variance_components`
+的预测区间描述单次测量，`winner_stable_loo` 只检查删一个种子是否换赢家：
+它们都没有给出「K 选一这个动作让均值/差距偏了多少」。
+
+**Fix.** 新增 `exp_lib.WINNER_CURSE_POLICY` /
+`winner_curse_correction`：输入与 §102 相同的逐臂逐种子端点，共同种子上
+配对。两条互补读数：
+- **Efron bootstrap optimism**：每次重采样所有臂共用一组 seed 下标，选出
+  `w*`，记 `apparent(w*) - full_sample(w*)`；平均乐观度
+  `optimism_mean`，`corrected_winner_value = observed_winner_value -
+  optimism_mean`；另报条件在观测赢家上的乐观度。
+- **selection regret**：bootstrap 中用全样本均值评估 `w*` 的 excess
+  （`full_sample(w*) - min_k full_sample(k)`），并给 95% 区间；分半
+  （一半选优、另一半评分，两个方向）另给 `honest_value_mean`、
+  `selection_frequency` 与分半 `selection_regret_mean`。分半只在一半
+  种子上选优，是更保守的独立核对；状态带用全 S 个种子的 bootstrap regret。
+状态带：`selection_robust`（唯一赢家、`P(best)>=0.60`、观测差距 >
+bootstrap regret）、`selection_noise_dominated`（`P(best)` 达 lead 但差距
+不大于 regret）、`winner_unstable`（`P(best)<0.60`）、`tied_best`（多个
+并列最优，含声明的 `tie_tol` 实际并列）、`not_estimable`（<2 臂、共同种子 <5、无分区或校正值不可
+表示）。固定 `n_boot=4000`/seed `20261018`/split seed `20261018`/
+`max_partitions=2000` 可重放；极端有限值在共同仿射尺度上计算，原始单位
+不可表示时明确 `None`，不写 inf/NaN。
+
+**Boundary.** 不是新的显著性检验：没有新 p 值/区间/Holm 成员，不做 FWER
+控制，不改变 exact sign-flip p、Holm、`verified` 或冻结 `confirmed`。
+bootstrap 乐观度是选择规则的 Efron 近似，不是后验均值；校正值不是观测
+赢家真实均值的无偏估计。分半诚实值是「在一半种子上选优」这个过程的表现，
+不是观测赢家本身，也不能替代独立复现。臂集合固定且容量/配方/计算量不同，
+校正值不是架构因果效应；高 `P(best)` 仍是在同一批数据上选出的。不重采样
+token 或评测单元；后两者由 §54/§57/§81/§103 负责。
+
+**Verification.** 新增 `test_review_part_44.py` 16 项：策略/状态声明；
+清晰分离→`selection_robust`、乐观度≈0、校正值接近观测、分半选择频率=1、
+严格 JSON 与同输入重放；噪声主导面板→`selection_noise_dominated`、校正/
+诚实值高于观测、bootstrap 与分半 regret 均大于观测差距；`better='max'`
+方向；分半分区上限/确定性/不同 split seed；seed 交集与 `dropped_seeds`；
+并列最优→`tied_best`（含 `tie_tol` 实际并列）；臂/种子不足→
+`not_estimable`；非法输入 fail-closed；
+`1e308` 级有限值 JSON 安全；审计对合法块 `ok`、篡改校正值/乐观度/
+`p_best`/夹带 `confirmed`/改状态判 `fail`、缺文件
+`not_verifiable_locally`、bare `not_estimable` `not_applicable`、结构不
+一致判 `fail`；`run_report`/CLI/`finaltest_stats`/报告接线；合成六 seed
+三臂端到端落盘 → 审计 `ok`；以及 `REPORT_v12` 渲染选择偏差小节与边界段。
+完整 CPU 套件在本轮最终树通过。
