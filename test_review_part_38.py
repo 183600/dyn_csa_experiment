@@ -154,7 +154,10 @@ def test_declared_bonferroni_look_budget_spends_against_planned_count():
     assert a['status'] == 'ok', a
     assert a['confirmatory_allowed'] is True
     assert abs(a['alpha_effective'] - 0.025) < 1e-15
-    assert a['confirmed_effective'] == ['c1']
+    # The look correction is applied once: alpha_effective = 0.05/2, so both
+    # frozen p=0.01 and p=0.02 clear it (comparing p_eff=p*2 against
+    # alpha_effective would require 0.04 < 0.025 and double-count the budget).
+    assert a['confirmed_effective'] == ['c1', 'c2']
     assert a['comparisons']['c1']['p_holm_effective'] == 0.02
     assert a['comparisons']['c2']['p_holm_effective'] == 0.04
 
@@ -163,7 +166,7 @@ def test_declared_bonferroni_look_budget_spends_against_planned_count():
     one = L.confirmatory_access_audit(_lock(), stats=stats, manifest=man)
     assert one['confirmatory_allowed'] is True
     assert abs(one['alpha_effective'] - 0.025) < 1e-15
-    assert one['confirmed_effective'] == ['c1']
+    assert one['confirmed_effective'] == ['c1', 'c2']
 
 
 def test_more_looks_than_declared_is_a_failure():

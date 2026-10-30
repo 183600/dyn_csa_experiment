@@ -526,9 +526,12 @@ def confirmatory_access_audit(lock, *, stats=None, manifest=None, alpha=None,
                'p_holm_effective': p_eff,
                'p_holm_bonferroni_descriptive': p_desc,
                'confirmed_frozen': name in confirmed_set}
-        if (allowed is True and name in confirmed_set and p_eff is not None
+        if (allowed is True and name in confirmed_set and p is not None
                 and out['alpha_effective'] is not None
-                and p_eff < out['alpha_effective']):
+                and p < out['alpha_effective']):
+            # Apply the look correction ONCE.  `p_holm_effective` already
+            # multiplies by max_looks (for display), so comparing it against
+            # the already-divided alpha would require p < alpha/L**2.
             effective.append(name)
         out['comparisons'][name] = rec
     # Every comparison the frozen table calls confirmed must have a replayable

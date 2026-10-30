@@ -140,16 +140,18 @@ def clean_training_rows(X, y=None, *, train_idx, drop_duplicates=True,
             'target fence can be learned from training labels only')
 
     def _missing(lab):
-        return lab is None or (isinstance(lab, tuple)
-                               and all(v is None for v in lab))
+        return _is_missing_scalar(lab) or (isinstance(lab, tuple)
+                                           and all(_is_missing_scalar(v)
+                                                   for v in lab))
 
     drop = np.zeros(train_rows.size, dtype=bool)
     n_invalid_label_rows = 0
     if drop_invalid_labels and labels is not None:
         for pos, row in enumerate(train_rows.tolist()):
             lab = labels[int(row)]
-            if lab is None or (isinstance(lab, tuple)
-                               and any(v is None for v in lab)):
+            if _is_missing_scalar(lab) or (isinstance(lab, tuple)
+                                           and any(_is_missing_scalar(v)
+                                                   for v in lab)):
                 drop[pos] = True
                 n_invalid_label_rows += 1
     n_nonfinite_feature_rows = 0
@@ -642,13 +644,16 @@ def _matrix_fingerprint(X):
         def _row_float_exact(row):
             vals, exact = [], True
             for v in row:
-                if v is None or (not isinstance(v, (np.datetime64, np.timedelta64))
-                                 and _numeric_is_nan(v)):
-                    # None and every numeric NaN spelling are one missing-like
-                    # value in _row_keys; the digest must not split a Decimal
-                    # NaN from None merely because Fraction(Decimal('NaN'))
-                    # cannot be formed.  Temporal NaT stays a distinct
-                    # temporal identity (matching _row_keys).
+                if v is None or (_is_missing_scalar(v) and not isinstance(
+                        v, (np.datetime64, np.timedelta64,
+                            _datetime.date, _datetime.datetime,
+                            _datetime.timedelta))):
+                    # None and every non-temporal missing spelling (numeric
+                    # NaN, Decimal NaN, pandas NA) are one missing-like value
+                    # in _row_keys; the digest must not split a Decimal NaN
+                    # from None merely because Fraction(Decimal('NaN')) cannot
+                    # be formed.  Temporal NaT stays a distinct temporal
+                    # identity (matching _row_keys).
                     vals.append(float('nan'))
                     continue
                 if isinstance(v, (complex, np.complexfloating)):
@@ -874,6 +879,14 @@ def _temporal_canonical_key(v):
     an ``A`` prefix so a naive datetime with the same wall-clock text stays
     distinct (the two are not equal in Python).
     """
+    if _pandas_missing(v):
+        # pd.NaT is a datetime subclass but its underlying value is not a
+        # valid datetime (np.datetime64(pd.NaT) raises).  Keep the same
+        # temporal-NaT identity as np.datetime64('NaT') so an object column
+        # and a native datetime column agree.
+        if isinstance(v, (_datetime.datetime, _datetime.date)):
+            return b'DNaT'
+        return b'TNaT'
     if isinstance(v, np.datetime64):
         return _temporal_key(v)
     if isinstance(v, np.timedelta64):
@@ -1085,6 +1098,12 @@ def _row_keys(X):
                 # date/datetime/timedelta values that compare equal to a NumPy
                 # temporal scalar.
                 return _temporal_canonical_key(v)
+            if _pandas_missing(v):
+                # pandas NA is the library's missing scalar; NaT is a temporal
+                # missing value and keeps the same identity as NumPy NaT.
+                if isinstance(v, (_datetime.datetime, _datetime.date)):
+                    return b'DNaT'
+                return b'Fnan'
             if _numeric_is_nan(v):
                 # Decimal('sNaN') raises in float(), so the generic path below
                 # would key it as an ordinary categorical string.  A numeric
@@ -1154,9 +1173,26 @@ def _row_keys(X):
                 _vals = []
                 _numeric = True
                 for v in row:
-                    if v is None:
+                    if v is None or (_is_missing_scalar(v) and not isinstance(
+                            v, (np.datetime64, np.timedelta64,
+                                _datetime.date, _datetime.datetime,
+                                _datetime.timedelta))):
+                        # Every non-temporal missing scalar (None, NaN,
+                        # Decimal NaN, pandas NA) is one missing-like NaN in
+                        # the numeric fast path; temporal NaT is routed below
+                        # so it keeps its distinct temporal identity.
                         _vals.append(float('nan'))
                         continue
+                    if isinstance(v, (np.datetime64, np.timedelta64,
+                                      _datetime.date, _datetime.datetime,
+                                      _datetime.timedelta)):
+                        # np.timedelta64 is numbers.Integral and [ns] even
+                        # converts to float successfully, so it used to be
+                        # hashed as a raw nanosecond integer instead of its
+                        # temporal identity (and could collide with a real
+                        # integer row).  Route it to _real_key below.
+                        _numeric = False
+                        break
                     if (not isinstance(v, (numbers.Number, _decimal.Decimal))
                             or isinstance(v, (complex, np.complexfloating))):
                         _numeric = False
@@ -1183,7 +1219,18 @@ def _row_keys(X):
                     _exact = True
                     for v, fv in zip(row, _frow.tolist()):
                         if math.isfinite(fv):
-                            if v is None or not (v == fv):
+                            # NumPy integer scalars compare equal to a rounded
+                            # float (np.int64(2**53+1) == float(2**53+1) is
+                            # True), so `v == fv` accepted values that the
+                            # float64 image cannot represent and collapsed
+                            # distinct rows.  Require an exact integer image.
+                            if isinstance(v, numbers.Integral) and not isinstance(
+                                    v, (bool, np.bool_)):
+                                if not (float(fv).is_integer()
+                                        and int(fv) == int(v)):
+                                    _exact = False
+                                    break
+                            elif v is None or not (v == fv):
                                 _exact = False
                                 break
                         # Non-finite object values map to their float image;
@@ -1361,6 +1408,11 @@ def _split_array(X, idx):
 
 
 def _hashable_label(value):
+    if _is_missing_scalar(value):
+        # Missing labels must share one identity.  pandas NA is otherwise a
+        # perfectly hashable object and becomes a real level in conflict and
+        # shift audits.
+        return None
     if isinstance(value, (np.datetime64, np.timedelta64,
                           _datetime.date, _datetime.datetime,
                           _datetime.timedelta)):
@@ -1393,12 +1445,10 @@ def _label_array(y):
 
 
 def _label_key(v):
-    if v is None:
+    if _is_missing_scalar(v):
+        # None, NaN, NaT and pandas NA are all missing labels.  Checking only
+        # None/NumPy-NaT let pd.NA through as an ordinary class label.
         return None
-    # NaT is a missing timestamp label, not a category: treating it as an
-    # ordinary value would hide it from the missing/non-finite label audit.
-    if isinstance(v, (np.datetime64, np.timedelta64)):
-        return None if np.isnat(v) else v
     # Only actual numeric scalars are checked for NaN/Inf.  Coercing every
     # value through float() turned legitimate categorical labels spelled
     # like "nan"/"inf" into missing targets and also conflated numeric

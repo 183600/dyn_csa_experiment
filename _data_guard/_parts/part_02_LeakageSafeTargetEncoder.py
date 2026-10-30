@@ -63,7 +63,10 @@ class LeakageSafeTargetEncoder:
                 f'y must be 1-D with {n} rows, got shape {arr.shape}')
         out = np.full(n, np.nan, dtype=np.float64)
         for i, value in enumerate(arr.tolist()):
-            if value is None or isinstance(value, (bool, np.bool_)):
+            if _is_missing_scalar(value) or isinstance(value, (bool, np.bool_)):
+                # None/NaN/NaT/pandas NA are all missing targets.  pd.NA is
+                # not a numbers.Number, so without this it fell through to the
+                # categorical-label rejection.
                 continue
             if isinstance(value, (np.datetime64, np.timedelta64)):
                 # NaT is a missing label, exactly like None/NaN.  Without this

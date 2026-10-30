@@ -19,11 +19,13 @@ Why the sign-flip null makes this exact
 Under H0 each paired difference is symmetric about zero, so each seed's sign
 is exchangeable independently of the others.  Enumerating all ``2**n`` sign
 assignments gives the exact joint null of the whole contrast vector, not just
-of one contrast.  Studentising by each contrast's own observed SD is harmless:
-a sign flip changes signs but not ``|d_i|``, so the SD (and therefore the
-scaling constant) is invariant across the enumeration.  The max-T statistic is
-thus an exact permutation statistic under the same assumption the per-contrast
-exact sign-flip test already relies on.
+of one contrast.  The studentising denominator must itself be invariant under
+the sign flip: the sample SD is not (a flipped row has a different mean), so
+using it for every pattern would make the null anti-conservative.  This
+implementation uses the null-score scale ``sqrt(sum_i d_i**2)``, which is a
+function of ``|d_i|`` only, so the max-T statistic is an exact permutation
+statistic under the same assumption the per-contrast exact sign-flip test
+already relies on.
 
 Boundaries (all fail closed)
 ----------------------------
@@ -277,14 +279,19 @@ def maxt_signflip_adjust(named_deltas, *, alpha=0.05,
     mean = mean_n * row_scale
     with np.errstate(over='ignore', invalid='ignore'):
         sd = sd_n * row_scale
-    scale = sd_n * math.sqrt(n)          # == sd*sqrt(n)/row_scale
+    # The null-studentising denominator must be INVARIANT under a sign flip.
+    # The sample SD is not: flipping signs changes the flipped row's mean and
+    # therefore sd_n, so reusing the observed SD for every pattern made the
+    # enumerated max-T null anti-conservative.  |sum| / sqrt(sum d_i^2) is the
+    # score statistic of the same null and is exactly sign-invariant.
+    scale = np.sqrt((Dn * Dn).sum(axis=1))
     if np.any((sd == 0.0) & (mean != 0.0)):
         raise ValueError(
             f'{where}: a contrast has zero seed variance but a non-zero mean; '
             'the studentised max-T statistic is degenerate (infinite t) and '
             'no exact family p exists')
-    # |sum| / (sd*sqrt(n)) == |mean| / (sd/sqrt(n)); the sign-flip loop divides
-    # each column by its own (sign-invariant) constant.
+    # |sum| / sqrt(sum d_i^2); the sign-flip loop divides each column by its
+    # own (sign-invariant) constant.
     t = np.zeros(m, dtype=float)
     nz = scale > 0.0
     t[nz] = np.abs(Dn[nz].sum(axis=1)) / scale[nz]

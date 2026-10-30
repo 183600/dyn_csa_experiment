@@ -1,3 +1,5 @@
+import datetime as _py_datetime
+
 
 def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=None, val_seqs=512,
                      cache_dir='./fineweb_cache', source='sample-10BT',
@@ -831,6 +833,20 @@ def _json_clean(obj):
         return _json_clean(obj.tolist())
     if isinstance(obj, np.generic):
         return _json_clean(obj.item())
+    # NumPy datetime64/timedelta64 .item() returns Python date/datetime/
+    # timedelta objects, which json.dumps(default=float) cannot encode.  A
+    # ledger row carrying a timestamp used to raise TypeError and vanish
+    # behind log_experiment_event's warning.  ISO text / seconds are stable
+    # and round-trip without losing the temporal identity.
+    _cls = type(obj)
+    if (getattr(_cls, '__module__', '') or '').startswith('pandas') \
+            and _cls.__name__ in ('NAType', 'NaTType'):
+        return None
+    if isinstance(obj, (_py_datetime.datetime, _py_datetime.date,
+                        _py_datetime.time)):
+        return obj.isoformat()
+    if isinstance(obj, _py_datetime.timedelta):
+        return obj.total_seconds()
     if isinstance(obj, float):
         return obj if math.isfinite(obj) else None
     return obj

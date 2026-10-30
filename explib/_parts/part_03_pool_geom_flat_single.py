@@ -856,21 +856,26 @@ def causal_prefix_pool_reference(Xa, Xb, Za, Zb, bid, B_pos_a, B_pos_b, overlap,
     cap_b = int(B_pos_b.shape[0])
     starts = geo['starts'].tolist()
     counts = geo['counts'].tolist()
+    # The optimized causal_prefix_pool accumulates in float64.  A reference
+    # oracle that unconditionally casts to float32 is only fp32-accurate even
+    # for fp64 inputs, so it cannot validate the optimized path at fp64 (or
+    # even exactly reproduce its fp32 accumulation).
+    _acc = torch.float64
     for tt in range(T):
         u_start = int(pg['u_start'][tt].item())
         if int(pg['plen'][tt].item()) <= 0:
             continue
         idx = list(range(u_start, u_start + int(pg['plen'][tt].item())))
-        zs = [Za[u].float() + B_pos_a[min(u - int(geo['start_of_token'][tt].item()), cap_a - 1)].float() for u in idx]
-        xs = [Xa[u].float() for u in idx]
+        zs = [Za[u].to(_acc) + B_pos_a[min(u - int(geo['start_of_token'][tt].item()), cap_a - 1)].to(_acc) for u in idx]
+        xs = [Xa[u].to(_acc) for u in idx]
         b = int(geo['block_of_token'][tt].item())
         if (str(scope) == 'full_prefix' and int(overlap) > 0 and b > 0
                 and Xb is not None and Zb is not None):
             ps, pend = int(starts[b - 1]), int(starts[b - 1]) + int(counts[b - 1])
             ovs = max(ps, pend - int(overlap))
             for u in range(ovs, pend):
-                zs.append(Zb[u].float() + B_pos_b[min(u - ps, cap_b - 1)].float())
-                xs.append(Xb[u].float())
+                zs.append(Zb[u].to(_acc) + B_pos_b[min(u - ps, cap_b - 1)].to(_acc))
+                xs.append(Xb[u].to(_acc))
         zz = torch.stack(zs, 0)
         xx = torch.stack(xs, 0)
         w = torch.softmax(zz, dim=0)
@@ -1293,6 +1298,14 @@ def lightning_indexer_open(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, *,
         kIt = (prefix_token_kv @ W_DK).view(n, nIH, hd)
     topk = max(int(topk), 0)
     q_chunk = max(1, min(int(query_chunk), max(n, 1)))
+    # The closed-block scores are [C, nIH, B] (plus [C, B] reductions); with
+    # P=1 the prefix cap below is huge, so a long-context open-block panel
+    # could materialise an O(C*B) table.  Mirror the closed indexer's byte
+    # cap, then apply the singleton-prefix cap independently.
+    if B > 0:
+        _per_blocks = max(1, int(B) * (int(nIH) * int(H.element_size()) + 40)
+                          + 64)
+        q_chunk = max(1, min(q_chunk, (256 << 20) // _per_blocks))
     # The singleton gather is [C, P, nIH, hd]; cap it so long contexts use
     # smaller query chunks instead of materialising a huge candidate table.
     if P > 0:
@@ -1428,13 +1441,25 @@ def _sink_log_normalizer(logits, sink_logits):
 def _sink_softmax_impl(logits, sink_logits, dim=-1):
     if sink_logits is None:
         return _safe_nan_to_num(torch.softmax(logits, dim), where='sink_softmax')
-    lse = _sink_log_normalizer(logits, _safe_nan_to_num(sink_logits, where='sink_logit'))
+    sink_logits = _safe_nan_to_num(sink_logits, where='sink_logit')
+    # Under autocast the module sink parameter stays fp32 while q/k/v are
+    # fp16/bf16.  logaddexp promotes the result to fp32, so `(logits - lse)`
+    # and the final einsum with a half-precision V mixed dtypes and raised.
+    # Match the kernel reference, which casts the sink to the attention work
+    # dtype before combining.
+    if sink_logits.dtype != logits.dtype:
+        sink_logits = sink_logits.to(dtype=logits.dtype)
+    lse = _sink_log_normalizer(logits, sink_logits)
     return _safe_nan_to_num((logits - lse).exp(), where='sink_softmax')
 
 def _sink_split_softmax(logits, sink_logits, want_sink=True):
     if sink_logits is None:
         return (sink_softmax(logits, None, -1), None)
     sink_logits = _safe_nan_to_num(sink_logits, where='sink_split')
+    if sink_logits.dtype != logits.dtype:
+        # See _sink_softmax_impl: a mixed sink dtype silently promoted the
+        # attention table and broke the V einsum on fp16/bf16 activations.
+        sink_logits = sink_logits.to(dtype=logits.dtype)
     lse = _sink_log_normalizer(logits, sink_logits)
     soft = (logits - lse).exp()
     if not want_sink:

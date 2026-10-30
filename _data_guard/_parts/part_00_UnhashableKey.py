@@ -1000,6 +1000,8 @@ def _temporal_group_key(value):
     a naive datetime with the same wall-clock text (which Python also does not
     compare equal to it).
     """
+    if _is_missing_scalar(value):
+        return _MISSING_GROUP_KEY
     if isinstance(value, (np.datetime64, np.timedelta64)):
         if np.isnat(value):
             return _MISSING_GROUP_KEY
@@ -1026,14 +1028,15 @@ def _group_key(value):
     group-overlap check will ever fire.  ``None``, NaN and NaT share the
     historical ``('__nan__',)`` missing identity.
     """
-    if value is None:
+    if _is_missing_scalar(value):
+        # None, NaN, NaT and pandas NA must share one missing-group identity;
+        # pd.NA is otherwise a hashable object and pd.NaT is a datetime
+        # subclass, so both became separate "real" groups.
         return _MISSING_GROUP_KEY
     if isinstance(value, (np.datetime64, np.timedelta64,
                           _datetime.date, _datetime.datetime,
                           _datetime.timedelta)):
         return _temporal_group_key(value)
-    if _numeric_is_nan(value):
-        return _MISSING_GROUP_KEY
     try:
         hash(value)
     except TypeError:

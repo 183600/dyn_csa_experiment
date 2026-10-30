@@ -14,6 +14,12 @@ def _attn_full_width_ok(n, k, w, need_dedup):
     _m = int(k) + int(w)
     _bytes = int(n) * (2 * _m * 1 + 8 + (2 * int(k) if need_dedup else 0)
                        + 8 * _m)
+    if need_dedup:
+        # first_occurrence_mask materialises a [rows, k, k] bool comparison
+        # for k <= 64 and a [rows, k] int64 key; leaving that O(n*k^2)
+        # temporary out of the cap let this "64 MiB" gate admit hundreds of
+        # MiB at long context.
+        _bytes += int(n) * int(k) * (int(k) + 8)
     if int(w) > 0:
         _bytes += int(n) * int(w) * (4 + 1 + 4)
     return _bytes <= _FO_FULL_CAP_BYTES
@@ -63,7 +69,16 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         win_idx, win_valid_all = _window_geometry(n, w, dev)
     else:
         win_idx = win_valid_all = None
-    _MINL = _finfo_min(k_blk.dtype)
+    # Match the kernel reference's work dtype.  fp16/bf16 logits can overflow
+    # to -inf on a finite dot product, and filling invalid lanes with the
+    # INPUT dtype minimum (-65504 for fp16) made those lanes outrank a valid
+    # -inf lane.  Computing in float32 (fp64 stays fp64) makes the sentinel a
+    # true -inf for half types and keeps eager/kernel bit-compatible.
+    _work = torch.promote_types(torch.promote_types(q.dtype, k_blk.dtype),
+                                torch.float32)
+    _MINL = _finfo_min(_work)
+    if sink_logits is not None and sink_logits.dtype != _work:
+        sink_logits = sink_logits.to(dtype=_work)
     # The V halves are laid out contiguously once and gathered with one
     # combined row index per chunk: the selected rows of `v_all` are exactly
     # the two gather outputs concatenated in the same order, so Vset holds
@@ -183,6 +198,7 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         if e > n:
             e = n
         qseg = q[s:e]
+        qseg_w = qseg if qseg.dtype == _work else qseg.to(dtype=_work)
         if _plan is not None:
             keep, nvalid, anyrow = _plan[s // q_chunk]
             _win_local = win_idx[s:e]
@@ -230,7 +246,9 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         # 硬分支逐位一致；它不改变任何取值，只固定走哪套既有分解。
         if soft is None and not soft_form:
             Kset = _tk2(k_all, _rows)
-            logits = _einsum('qhd,qmhd->qhm', qseg, Kset)
+            if Kset.dtype != _work:
+                Kset = Kset.to(dtype=_work)
+            logits = _einsum('qhd,qmhd->qhm', qseg_w, Kset)
             del Kset
             if scale != 1.0:
                 # x·1.0 is the IEEE identity (and grad·1.0 is bit-identical on
@@ -240,8 +258,11 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
             attn, _sink_unused = _sink_split_softmax(logits, sink_logits, want_sink=False)
             if not _has_sink:
                 attn.mul_(anyrow[:, None, None])
-            out[s:e] = _einsum('qhm,qmhd->qhd', attn, _tk2(v_all, _rows))
-            del logits, attn, nvalid, anyrow, keep, _sel_rows, _win_local, _win_rows, _rows, qseg
+            _v = _tk2(v_all, _rows)
+            if _v.dtype != _work:
+                _v = _v.to(dtype=_work)
+            out[s:e] = _einsum('qhm,qmhd->qhd', attn, _v)
+            del logits, attn, nvalid, anyrow, keep, _sel_rows, _win_local, _win_rows, _rows, qseg, qseg_w, _v
             continue
         # The soft branch reads its K halves as two contiguous gathers: the
         # concatenated V gather below holds exactly the same rows as two
@@ -256,14 +277,18 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         else:
             kb = _tk2(k_blk, _sel_rows)
             kw = _tk2(k_sw, _win_local)
+        if kb.dtype != _work:
+            kb = kb.to(dtype=_work)
+        if kw.dtype != _work:
+            kw = kw.to(dtype=_work)
         if _soft_live:
             # The live-soft path keeps the cat form: its clone is fed to the
             # straight-through branch, and a slice-assigned CopySlices table
             # does not reproduce that graph's gradients exactly.
-            blk_logits = _einsum('qhd,qmhd->qhm', qseg, kb)
+            blk_logits = _einsum('qhd,qmhd->qhm', qseg_w, kb)
             if scale != 1.0:
                 blk_logits.mul_(scale)
-            win_logits = _einsum('qhd,qmhd->qhm', qseg, kw)
+            win_logits = _einsum('qhd,qmhd->qhm', qseg_w, kw)
             if scale != 1.0:
                 win_logits.mul_(scale)
             logits = torch.cat([blk_logits, win_logits], -1)
@@ -274,14 +299,16 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
             # concatenated copy.  The slice assignment feeds the same einsum
             # values to the same lanes.
             _w0 = int(_win_local.shape[1])
-            logits = qseg.new_empty((qseg.shape[0], qseg.shape[1], _nb + _w0))
-            logits[:, :, :_nb] = _einsum('qhd,qmhd->qhm', qseg, kb)
-            logits[:, :, _nb:] = _einsum('qhd,qmhd->qhm', qseg, kw)
+            logits = qseg_w.new_empty((qseg_w.shape[0], qseg_w.shape[1], _nb + _w0))
+            logits[:, :, :_nb] = _einsum('qhd,qmhd->qhm', qseg_w, kb)
+            logits[:, :, _nb:] = _einsum('qhd,qmhd->qhm', qseg_w, kw)
             if scale != 1.0:
                 logits.mul_(scale)
         del kb, kw
         if _soft_live:
             soft_g = soft[s:e]
+            if soft_g.dtype != _work:
+                soft_g = soft_g.to(dtype=_work)
             if keep is not None:
                 soft_g = soft_g * keep
             soft_log_g = torch.log(soft_g.clamp_min(1e-12))
@@ -298,9 +325,12 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
             attn = (soft_attn - soft_attn.detach()).add_(attn)
         if not _has_sink:
             attn.mul_(anyrow[:, None, None])
-        out[s:e] = _einsum('qhm,qmhd->qhd', attn, _tk2(v_all, _rows))
+        _v = _tk2(v_all, _rows)
+        if _v.dtype != _work:
+            _v = _v.to(dtype=_work)
+        out[s:e] = _einsum('qhm,qmhd->qhd', attn, _v)
         # `soft_attn` only exists on the live-soft path.
-        del logits, attn, nvalid, anyrow, keep, _sel_rows, _win_local, _win_rows, _rows, qseg
+        del logits, attn, nvalid, anyrow, keep, _sel_rows, _win_local, _win_rows, _rows, qseg, qseg_w, _v
         if _soft_live:
             del soft_attn
     return out
@@ -340,7 +370,13 @@ def gathered_attention_open(q, k_blk, v_blk, topk_idx, sel_valid, last_tok,
     per_row = 4 * M * nh * hd + 2 * M * nh
     q_chunk = max(1, min(int(q_chunk), max(1, int(mem_budget_bytes) // max(1, per_row * q.element_size()))))
     q_chunk = max(1, min(q_chunk, n))
-    _MINL = _finfo_min(k_blk.dtype)
+    # Same work dtype as the closed path and the kernel reference; an fp16
+    # invalid-lane sentinel of -65504 would beat a valid -inf logit.
+    _work = torch.promote_types(torch.promote_types(q.dtype, k_blk.dtype),
+                                torch.float32)
+    _MINL = _finfo_min(_work)
+    if sink_logits is not None and sink_logits.dtype != _work:
+        sink_logits = sink_logits.to(dtype=_work)
     out = torch.empty_like(q)
     mass = None
     if return_prefix_mass:
@@ -348,6 +384,7 @@ def gathered_attention_open(q, k_blk, v_blk, topk_idx, sel_valid, last_tok,
     for s in range(0, n, q_chunk):
         e = min(s + q_chunk, n)
         qseg = q[s:e]
+        qseg_w = qseg if qseg.dtype == _work else qseg.to(dtype=_work)
         ids = topk_idx[s:e].long()
         valid = sel_valid[s:e]
         is_pref = ids >= B
@@ -386,7 +423,11 @@ def gathered_attention_open(q, k_blk, v_blk, topk_idx, sel_valid, last_tok,
         Kall = torch.cat([Kc, kw], 1)
         Vall = torch.cat([Vc, vw], 1)
         valid_all = torch.cat([valid, _win_valid], 1)
-        logits = torch.einsum('qhd,qmhd->qhm', qseg, Kall)
+        if Kall.dtype != _work:
+            Kall = Kall.to(dtype=_work)
+        if Vall.dtype != _work:
+            Vall = Vall.to(dtype=_work)
+        logits = torch.einsum('qhd,qmhd->qhm', qseg_w, Kall)
         if scale != 1.0:
             logits.mul_(scale)
         # Straight-through indexer prior: its forward contribution cancels
@@ -396,6 +437,8 @@ def gathered_attention_open(q, k_blk, v_blk, topk_idx, sel_valid, last_tok,
         attn_soft = None
         if _soft_live:
             soft_g = soft[s:e]
+            if soft_g.dtype != _work:
+                soft_g = soft_g.to(dtype=_work)
             s_log = torch.log(soft_g.clamp_min(1e-12))
             s_log.masked_fill_(~valid, _MINL)
             logits_soft = logits.clone()
@@ -415,7 +458,7 @@ def gathered_attention_open(q, k_blk, v_blk, topk_idx, sel_valid, last_tok,
             _pm = (attn[:, :, :K] * is_pref[:, None, :].to(attn.dtype)).sum(-1).mean(-1)
             mass[s:e] = _pm
         out[s:e] = torch.einsum('qhm,qmhd->qhd', attn, Vall)
-        del Kall, Vall, Kc, Vc, kw, vw, kb, vb, pk, pv, logits, attn, valid_all
+        del Kall, Vall, Kc, Vc, kw, vw, kb, vb, pk, pv, logits, attn, valid_all, qseg_w
     return (out, mass) if return_prefix_mass else (out, None)
 
 

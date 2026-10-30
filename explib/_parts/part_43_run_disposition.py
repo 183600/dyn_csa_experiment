@@ -636,11 +636,17 @@ def run_disposition_audit(events, *, planned_cells=None, plan=None,
     # same rule the run-order audit applies to its plan applies here.
     if out['frame'] == 'precommitted':
         _plan_epoch = _dispo_epoch(out.get('plan_created_at'))
-        _first_epoch = next((_dispo_epoch(r['started_at']) for r in rows
-                             if _dispo_epoch(r['started_at']) is not None), None)
-        first_started = next((r['started_at'] for r in rows
-                              if _dispo_epoch(r['started_at']) is not None),
-                             None)
+        # JSONL rows are appended on completion, so "the first row with a
+        # timestamp" is the first FINISHED attempt, not the first STARTED one.
+        # Take the minimum start time over every row.
+        _timed_rows = [(_dispo_epoch(r['started_at']), r['started_at'])
+                       for r in rows
+                       if _dispo_epoch(r['started_at']) is not None]
+        if _timed_rows:
+            _first_epoch, first_started = min(_timed_rows,
+                                              key=lambda pair: pair[0])
+        else:
+            _first_epoch = first_started = None
         out['first_attempt_at'] = first_started
         if _first_epoch is None:
             # No attempt timestamp (synthetic/legacy ledger): the plan-before-

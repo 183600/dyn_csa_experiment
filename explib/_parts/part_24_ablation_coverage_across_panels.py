@@ -752,6 +752,7 @@ def interaction_coverage_audit(design=None, factorials=None, scope=None,
         'duplicate_pairs': {},
         'factorials': {}, 'scope': {}, 'warnings': [], 'problems': [],
         'full_pairwise_measured': False,
+        'coverage_complete': False,
         'claim_policy': {
             'tested': ('only a measured 2x2 factorial may support an '
                        'interaction/sub-additivity claim'),
@@ -843,8 +844,12 @@ def interaction_coverage_audit(design=None, factorials=None, scope=None,
         list(p) for p in sorted(set(tested) - expected)]
     # "Full pairwise measured" is a property of the declared scope.  A
     # factorial that lies outside the scope is reported separately; it does
-    # not un-measure the in-scope pairs.
-    out['full_pairwise_measured'] = bool(expected and not out['missing_pairs'])
+    # not un-measure the in-scope pairs.  A WAIVER is not a measurement, so
+    # full_pairwise_measured additionally requires every expected pair to be
+    # in `tested`; coverage_complete keeps the tested-or-waived status.
+    out['full_pairwise_measured'] = bool(expected
+                                         and expected <= set(tested))
+    out['coverage_complete'] = bool(expected and not out['missing_pairs'])
     if out['missing_pairs']:
         out['coverage_status'] = 'partial'
         out['warnings'].append(

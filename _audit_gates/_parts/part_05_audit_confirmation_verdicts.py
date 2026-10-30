@@ -1988,12 +1988,22 @@ def audit_report_status(report):
             # A gate that returned problems under a non-fail status (legacy
             # audited vocabulary) must not let the aggregate claim "ok".
             warned.append(name)
+        if n and name not in warned and st != 'fail':
+            # `not_verifiable_locally` / `not_applicable` with problems is
+            # still a warning-level report: a missing artifact is surfaced,
+            # not silently counted as a clean gate.
+            warned.append(name)
     if failed:
         status = 'fail'
     elif warned or n_problems:
         status = 'warnings'
     else:
         status = 'ok'
+    _gate_names = [name for name, value in report.items()
+                   if name not in ('status', 'audit_status', 'generated_at',
+                                   'code', 'provenance', 'content_sha256',
+                                   'inputs', 'audit_inputs')
+                   and isinstance(value, dict)]
     return {
         'schema': 1,
         'status': status,
@@ -2002,7 +2012,7 @@ def audit_report_status(report):
         'gates_with_problems': sorted(problem_gates),
         'gates_not_verifiable_locally': sorted(not_verifiable),
         'gates_not_applicable': sorted(not_applicable),
-        'n_gates': sum(1 for v in report.values() if isinstance(v, dict)),
+        'n_gates': len(_gate_names),
         'n_gate_problems': int(n_problems),
         'exit_code': 1 if status == 'fail' else 0,
         'note': ('aggregate of the per-gate verdicts; `fail` exits non-zero '

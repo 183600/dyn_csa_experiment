@@ -236,7 +236,8 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
             'n_seeds': len(_seed_set),
             'seeds': sorted(_seed_set),
             'train_knobs': train_knobs,
-            'p_floor': signflip_p_floor(len(_seed_set)),
+            'p_floor': (signflip_p_floor(len(_seed_set))
+                        if _seed_set else None),
             'min_seeds_for_family_significance': (signflip_min_n_for_holm(family_m, 0.05)
                                                   if family_m is not None else None),
         })
@@ -348,6 +349,14 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
                     else 'raw_signflip')
                 r['seeds_sufficient_for_family'] = (
                     None if _family_n is None else bool(r['n_seeds'] >= _family_n))
+            else:
+                # No declared seed plan (or no attainable floor): the tier
+                # cannot support a family-level claim, and a NaN floor must not
+                # leak into a strict-JSON report.
+                r['p_floor_family_holm'] = None
+                r['descriptive_only'] = True
+                r['descriptive_only_basis'] = 'no_declared_seeds'
+                r['seeds_sufficient_for_family'] = None
         # Corpus/tokenizer binding across the ladder: a MISMATCH is a hard
         # problem (the cross-tier log-ratios the ladder exists to compute are
         # not defined), while missing fingerprints stay a warning (the audit
@@ -408,7 +417,7 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
         # added seeds the other never ran.  Make the paired design's own
         # resolution floor explicit instead of borrowing a tier's raw n.
         _n_common = len(_seed_common)
-        _common_floor = (signflip_p_floor(_n_common) if _n_common > 0 else float('nan'))
+        _common_floor = (signflip_p_floor(_n_common) if _n_common > 0 else None)
         _common_fam_floor = (holm_min_attainable_p(_n_common, family_m,
                                                    _family_alpha)
                              if (_n_common > 0 and family_m is not None)

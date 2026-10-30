@@ -367,14 +367,38 @@ def _numeric_is_nan(value):
         return False
 
 
-def _category_is_missing(value):
+def _pandas_missing(value):
+    """Duck-typed pandas ``NA``/``NaT`` without importing pandas.
+
+    The module is NumPy-only, but pandas nullable dtypes are a common input
+    (the experiment lock installs pandas).  ``pd.NA`` is not a
+    ``numbers.Number`` and ``pd.NaT`` is a ``datetime`` subclass, so both
+    slipped through the ordinary missing checks and became real categories /
+    labels / row identities.  Their types are stable and module-qualified;
+    checking those is sufficient and keeps the optional dependency lazy.
+    """
+    cls = type(value)
+    module = getattr(cls, '__module__', '') or ''
+    if not module.startswith('pandas'):
+        return False
+    return cls.__name__ in ('NAType', 'NaTType')
+
+
+def _is_missing_scalar(value):
+    """True for None/NaN/NaT/pandas NA, independent of storage library."""
     if value is None:
         return True
     if isinstance(value, (np.datetime64, np.timedelta64)):
         return bool(np.isnat(value))
+    if _pandas_missing(value):
+        return True
     # Decimal (and other exact numeric objects) can represent NaN too;
     # treating it as an ordinary category would hide a missing value.
     return _numeric_is_nan(value)
+
+
+def _category_is_missing(value):
+    return _is_missing_scalar(value)
 
 
 def _sorted_categories(values):
