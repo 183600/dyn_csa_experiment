@@ -11,6 +11,11 @@
 Git 树无法独立复核。仓库中的主张仅限 `confirmation_frozen.json` 冻结的
 范围；其余均为探索性。
 
+一分钟上手：用 `make test` 检查检出是否可用；从[研究一览](#研究一览)选择
+一个代次来运行或续跑；已有产物时，用零 GPU 的 `analysis` / `report` 模式
+重建结果。生成的报告描述的是**你自己这轮运行**，在发布并校验归档之前不要
+把它当作已发布证据。
+
 > **版本命名**：`v12` 是驱动/研究代次；`CODE_SEMANTICS = v11.128` 是冻结
 > 清单绑定的库测量语义戳。两套编号故意不同。冻结清单当前为
 > `manifest_version: 3`（见其 `revision.history`）。
@@ -30,6 +35,7 @@ Git 树无法独立复核。仓库中的主张仅限 `confirmation_frozen.json` 
 - [研究一览](#研究一览)
 - [从这里开始](#从这里开始)
 - [快速开始](#快速开始)
+  - [命令约定](#命令约定)
   - [示例流程](#示例流程)
 - [从哪里读起](#从哪里读起)
 - [仓库结构](#仓库结构)
@@ -74,9 +80,12 @@ Git 树无法独立复核。仓库中的主张仅限 `confirmation_frozen.json` 
 | M0 | FineWeb-Edu 数据路径、内核 G0 门、S1/S2 规模面板 | `python -m explib.m0` | `results_b_s1/`、`results_b_s2/`、`analysis_m0/` |
 | open-block | 最大块长 × 未结束块读取规则 | `python -m explib.open_block` | `analysis_open_block/` |
 
-训练从不隐式启动：只有名为 `full`、`phase <name>`、`main` 或 `auto` 的模式
-才会开始训练。各驱动的模式见下表；`--help` 打印驱动说明，argparse 驱动的
-子命令也会一并列出。
+训练模式不会隐式启动；唯一的历史例外是 v6 脚本：它默认使用 `full`，因此
+裸跑 `python run_gapfill.py` 会启动主面板。训练模式之外的模式（`smoke`、
+`plan`、`analysis`、`report`）不启动研究面板；训练模式（`full`、
+`phase <name>`、`main`、`pilot`、`aux`、`extended`、`auto`，以及 v6 的
+`overfit` / `topup` 辅助模式）会启动训练。各驱动的模式见下表；`--help`
+打印驱动说明，argparse 驱动的子命令也会一并列出。
 
 | 驱动 | 模式 |
 |---|---|
@@ -119,8 +128,19 @@ make plan                              # 冻结清单预检；不读取 test spl
 python -m explib.confirmation --help   # 列出子命令，不启动实验
 ```
 
-以上命令都不会启动训练。训练始终需要显式调用驱动的 `full`、`phase <name>`
-或 `auto` 模式；修改流水线后，先用该驱动的 `smoke` 模式验证。
+以上命令都不会启动训练。训练需要显式选择模式，例外是 `python
+run_gapfill.py`（默认 `full`）：要跑正式面板时调用驱动的 `full`、
+`phase <name>` 或 `auto`；修改流水线后，先用该驱动的 `smoke` 模式验证。
+
+### 命令约定
+
+- 所有命令都在仓库根目录执行；产物与清单按检出路径解析。
+- `python -m explib.<driver>` 是包入口；`python run_gapfill.py` 是历史 v6
+  脚本，保留位置参数式模式。
+- 用 `--help` 查看驱动说明最稳妥；对位置式驱动而言 `smoke --help` 不是
+  帮助命令，第二个 token 会被忽略并直接开始 smoke 运行。
+- 训练驱动写入 `results_*/` 与 `analysis_*/`（两者均已 gitignore）；
+  `plan`、`analysis`、`report` 模式不产生新的研究测量。
 
 ### 示例流程
 
@@ -148,7 +168,7 @@ python -m explib.confirmation report
 在相信重跑报告前，先与原始产物比较：
 
 ```bash
-python -m explib.reproduce compare results_lm_v6 results_lm_v6_rerun
+python -m explib.reproduce compare results_lm_v3_1500 results_lm_v3_1500_rerun
 ```
 
 ### 从哪里读起
@@ -158,6 +178,8 @@ python -m explib.reproduce compare results_lm_v6 results_lm_v6_rerun
 | 实验如何运行或重跑？ | 本 README |
 | 该用哪个命令和子命令？ | [研究一览](#研究一览)与下文各驱动小节 |
 | 某个测量或比较为什么这样定义？ | `docs/design_notes.md` |
+| 到底冻结了什么、允许主张什么？ | `confirmation_frozen.json` 与 `docs/design_notes.md` §17/§20 |
+| 如何理解某个判定或审计状态？ | [测量护栏](#测量护栏) |
 | 做过哪些决定，顺序如何？ | `DECISION_LOG.md` |
 | 已发布的证据在哪里？ | `RELEASES.md` |
 | 评审问题是如何处理的？ | `REVIEW_4_RESPONSE.md` |
@@ -174,7 +196,7 @@ python -m explib.reproduce compare results_lm_v6 results_lm_v6_rerun
 | 路径 | 说明 |
 |---|---|
 | `exp_lib.py` | **兼容 shim**，重新导出拆分后的 `explib/` 实现 |
-| `_split_loader.py` | 拆分包的共享加载器：按声明顺序把 `_parts/` 片段执行到调用方模块的 globals 中，并以片段路径作为 compile 文件名（traceback 指向可审查的源码） |
+| `_split_loader.py` | 拆分包的共享加载器：`load_split_package` 负责包级引导（设置历史 `__file__` 与 `_HERE` / `_REPO`，再按顺序执行片段），`load_parts` 是底层执行器。片段以真实路径编译，因此 traceback 指向可审查的源码 |
 | `explib/` | **核心库，也是唯一的代码来源**：模型、CSA/HCA 注意力、池化、indexer、分段器、训练循环、聚合与统计 |
 | `csa_kernels.py` | **兼容 shim**，重新导出 `_csa_kernels/` 实现 |
 | `_csa_kernels/` | **三算子融合内核路径**：块压缩池化、索引 top-k 选择与稀疏注意力的 Triton 内核（附带同一套算法分解、任意设备可跑的 torch 参考孪生实现）；`CSA_KERNEL` 选开、默认关闭——见下文 [Triton 内核路径](#triton-内核路径m0g0) |
@@ -253,7 +275,7 @@ python build_report.py            # 从落盘的 results_*/ + analysis_*/ 重建
 不要直接相信报告，先比较第二份产物：
 
 ```bash
-python -m explib.reproduce compare results_lm_v6 results_lm_v6_rerun
+python -m explib.reproduce compare results_lm_v3_1500 results_lm_v3_1500_rerun
 # 仅当源码字节、数据切片、配置、执行环境、匹配初始化与声明的 PPL 容差
 # 全部对齐时退出码才为 0；`--require exact` 要求逐位相同。
 ```
@@ -366,7 +388,10 @@ tail -f run_v6.log
 | P-LONG | `results_lm_v3_long` | hybrid_fixed / hybrid_dynamic / hybrid_csa_dyn，seeds 0-2 → 三 seed 长跑表 |
 
 `python run_gapfill.py overfit` 是正式面板前的小批量过拟合自检（损失应能
-拟合、流水线保持有限）；`topup` 只补齐缺失种子，不重跑已完成单元。
+拟合、流水线保持有限）；`topup` 只补齐缺失种子，不重跑已完成单元。`full`
+/ `topup` 链结束后，v6 驱动会自动 push 并安排关机（取消关机：
+`pkill -f v6autoshutdown`；禁止关机：`V6_NO_SHUTDOWN=1`；禁止 push：
+`V6_NO_PUSH=1`）。
 
 ### 任务级并行（每个实验一张卡）
 
@@ -386,8 +411,9 @@ CSA_PAR=2 CSA_PAR_GPUS=0,3 python -m explib.corruption phase P3SL
 
 它保证的性质（完整契约见 `docs/design_notes.md` §13）：
 
-- **数字完全一致**——每个单元在自己的进程里独立播种 RNG，并行结果与串行
-  逐位一致；指纹、续跑规则与 `CODE_SEMANTICS` 均不变；
+- **数字设计上与串行一致**——每个单元在自己的进程里独立播种 RNG；逐位
+  等价检查是本地脚本测试，不是 CI 强制保证；指纹、续跑规则与
+  `CODE_SEMANTICS` 均不变；
 - **合并安全的产物**——所有 `summary.json` 更新都走 flock 保护的
   读-改-写，并发结束的实验不会互相丢记录；聚合 / 画图 / git push / 关机
   只在父进程做一次；
@@ -438,7 +464,7 @@ python -m explib.m0 auto     # 无人值守：G0 门（fail-closed）→ 证书�
 softmax，sink 作为归一化初值质量）。每个算子另有同一套算法分解的 torch
 参考孪生实现，任意设备可跑，CPU 侧的语义验证走的正是它。
 
-内核路径是**独立变体**而非逐位置写：G0 判据是与 eager 的统计等价（同
+内核路径是**独立变体**而非逐位重写：G0 判据是与 eager 的统计等价（同
 种子、同数据）；eager 路径本身零改动——`CSA_KERNEL` 未设置时 run_cfg
 指纹与历史版本逐字节一致，开启后指纹与 `_code` 戳追加 `-tk1:<backend>`
 后缀，内核记录只与同模式记录配对（design_notes §3.1）。反向全部为固定
@@ -588,12 +614,11 @@ python -m explib.rope phase P1T   # seq-2048 topk 扫描
 python build_report.py            # 从产物重建 REPORT_v7.md（零 GPU）
 ```
 
-所有驱动都按配置的运行时上限计量自己的加速器时间：超过上限的运行拒绝
+所有训练驱动都按配置的运行时上限计量自己的加速器时间：超过上限的运行拒绝
 启动，运行中途到达上限则被硬截断。多卡机器上 `CSA_PAR=auto` 以一卡一
-实验并行运行相同阶段（上限此时按 GPU-秒总账计量，即 N 路并行按 N 倍
-墙钟速度消耗）——被截断的单元不会留下不完整测量，会在下一轮重试。全部
-阶段完成后脚本自动 push 并关机（取消关机：`pkill -f v6autoshutdown`；
-禁止关机：`V6_NO_SHUTDOWN=1`；禁止 push：`V6_NO_PUSH=1`）。
+实验并行运行相同阶段（上限此时按 GPU-秒总账计量）——被截断的单元不会留下
+不完整测量，会在下一轮重试。上面描述的 push / 关机钩子属于 v6 驱动；
+`explib` 驱动不会主动关闭实例。
 
 > 量值一律以 `build_report.py` / `fuse_analysis.py` 与各驱动 `report`
 > 构建器从 `results_*/`、`analysis_*/` 落盘产物现算出的表格为准，仓库正文
@@ -603,6 +628,8 @@ python build_report.py            # 从产物重建 REPORT_v7.md（零 GPU）
 
 - **在仓库根目录运行。** 驱动按检出路径解析 `results_*/`、`analysis_*/`
   与冻结清单。
+- **v6 裸跑会训练。** `python run_gapfill.py` 默认使用 `full` 模式；只想
+  做流水线自检时请显式运行 `smoke`。
 - **先看 `--help` 再选模式。** `python -m explib.<driver> --help` 打印驱动
   说明，模式列表见[研究一览](#研究一览)。注意
   `python -m explib.<driver> smoke --help` 不是帮助命令——位置式驱动会忽略
@@ -613,6 +640,15 @@ python build_report.py            # 从产物重建 REPORT_v7.md（零 GPU）
   重建，然后才比较两次运行。
 - **报告本身不等于证据。** 引用数字前先发布并校验归档
   （`archive_release.py`）。
+- **新检出不带结果。** `results_*/` 与 `analysis_*/` 已 gitignore；
+  `python -m explib.confirmation report`、`python build_report.py` 及其他
+  `report` 模式只能从本机已有产物重建。
+- **内核模式是可选且依赖硬件的。** `CSA_KERNEL` 未设置时 eager 路径随处
+  可跑；`CSA_KERNEL=1` 需要 CUDA + Triton，`CSA_KERNEL=ref` 选择可在 CPU
+  运行的参考孪生实现用于调试。
+- **缺可选包 / Hub 不可达。** 先安装 `requirements.lock` 再跑套件；数据
+  访问可把 `WT103_RAW_TXT` 指向本地原始文本目录，或仅在官方 Hub 不可达时
+  显式设置 `CSA_HF_MIRROR=1`。
 
 ## 测量护栏
 

@@ -7,15 +7,11 @@ location differ between them, so the loading mechanics live here: one
 implementation for encoding, path handling and the compile filename used in
 tracebacks.
 
-A split package keeps its own thin ``__init__.py``:
-
-* set ``__file__`` to the historical module path, so relative paths in the
-  fragments keep resolving against the repository root;
-* declare the fragments in execution (dependency) order;
-* call :func:`load_parts` with its module globals.
-
-Appending a fragment therefore stays a one-line change in that package's
-``_PARTS`` list, independent of how many split packages exist.
+A split package keeps its own thin ``__init__.py``: declare the fragments in
+execution (dependency) order, then hand the package directory and that list to
+:func:`load_split_package`.  Appending a fragment therefore stays a one-line
+change in that package's ``_PARTS`` list, independent of how many split
+packages exist.
 """
 
 from __future__ import annotations
@@ -41,3 +37,30 @@ def load_parts(namespace: dict[str, Any], package_dir: str,
         with open(path, encoding='utf-8') as fh:
             source = fh.read()
         exec(compile(source, path, 'exec'), namespace)
+
+
+def load_split_package(namespace: dict[str, Any], package_dir: str,
+                       parts: Iterable[str], *, repo_depth: int = 1,
+                       historical_path: str | None = None) -> None:
+    """Bootstrap a split package into ``namespace``.
+
+    ``package_dir`` is the package directory that holds ``_parts/``.
+    ``repo_depth`` is the number of parent directories between it and the
+    repository root (``1`` for a top-level package such as ``explib``, ``2``
+    for a driver such as ``explib.rope``).
+
+    ``historical_path`` is the repository-relative path of the module whose
+    single-file behaviour the package preserves.  It becomes ``__file__``
+    before any fragment executes, so resource lookups and
+    ``os.path.dirname(__file__)`` inside the fragments resolve exactly as they
+    did in the historical module.  ``_HERE`` and ``_REPO`` are also published
+    in the namespace for fragments and callers that need the two directories.
+    """
+    repo_root = package_dir
+    for _ in range(repo_depth):
+        repo_root = os.path.dirname(repo_root)
+    if historical_path is not None:
+        namespace['__file__'] = os.path.join(repo_root, historical_path)
+    namespace['_HERE'] = package_dir
+    namespace['_REPO'] = repo_root
+    load_parts(namespace, package_dir, parts)

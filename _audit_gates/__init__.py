@@ -7,11 +7,9 @@ position instead of re-sorting the list.
 
 import os as _os
 
-from _split_loader import load_parts as _load_parts
+from _split_loader import load_split_package
 
 _HERE = _os.path.dirname(_os.path.abspath(__file__))
-_REPO = _os.path.dirname(_HERE)
-__file__ = _os.path.join(_REPO, 'audit_gates.py')
 
 _PARTS = [
 'part_00_load.py',
@@ -36,8 +34,9 @@ _PARTS = [
 'part_19_audit_environment_identity.py',
 ]
 
-_load_parts(globals(), _HERE, _PARTS)
-del _load_parts
+load_split_package(globals(), _HERE, _PARTS, repo_depth=1,
+                   historical_path='audit_gates.py')
+del load_split_package
 
 # Keep module introspection on the implementation fragment (the historical
 # script body lived in one file) while REPO still points at the repository root.

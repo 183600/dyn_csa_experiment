@@ -13,6 +13,12 @@ artifacts is therefore not independently auditable from this Git tree alone.
 Claims are limited to the frozen scope in `confirmation_frozen.json`; everything
 else is exploratory.
 
+In one minute: use `make test` to check a checkout, pick a generation from the
+[Study at a glance](#study-at-a-glance) table to run or resume a panel, and use
+the zero-GPU `analysis` / `report` modes to rebuild results from artifacts you
+already have. Treat a generated report as a description of *your* run, not as
+released evidence, until an archive is published and verified.
+
 > **Version naming.** `v12` is the driver/study generation. `CODE_SEMANTICS =
 > v11.128` is the library measurement-semantics stamp bound by the frozen plan.
 > The two numbering schemes are intentionally different. The frozen manifest is
@@ -35,6 +41,7 @@ else is exploratory.
 - [Study at a glance](#study-at-a-glance)
 - [Start here](#start-here)
 - [Quick start](#quick-start)
+  - [Command conventions](#command-conventions)
   - [Example workflows](#example-workflows)
 - [Where to look](#where-to-look)
 - [Repository layout](#repository-layout)
@@ -75,8 +82,12 @@ entry point; v7 onwards live under `explib/`.
 | M0 | FineWeb-Edu data path, kernel G0 gate, S1/S2 scale panels | `python -m explib.m0` | `results_b_s1/`, `results_b_s2/`, `analysis_m0/` |
 | open-block | maximum block length × open-block reading rule | `python -m explib.open_block` | `analysis_open_block/` |
 
-Training is never implicit: it starts only in a mode named `full`,
-`phase <name>`, `main`, or `auto`. The modes are summarized below; `--help`
+Training modes are never implicit, with one historical exception: the v6
+script defaults to `full`, so a bare `python run_gapfill.py` starts the main
+panel. Modes other than the training modes (`smoke`, `plan`, `analysis`,
+`report`) do not start a research panel; the training modes (`full`,
+`phase <name>`, `main`, `pilot`, `aux`, `extended`, `auto`, and the v6
+`overfit` / `topup` helpers) do. The modes are summarized below; `--help`
 prints the driver description, and the argparse-based drivers also list their
 subcommands.
 
@@ -123,10 +134,23 @@ make plan                              # frozen-manifest preflight; no test-spli
 python -m explib.confirmation --help   # list subcommands without starting a run
 ```
 
-None of these commands starts a training run. Training is always explicit:
-invoke a driver's `full`, `phase <name>`, or `auto` mode when you intend to run
-it, and start with that driver's `smoke` mode when validating a change to the
-pipeline.
+None of these commands starts a training run. Training is explicit except for
+`python run_gapfill.py`, whose default mode is `full`: invoke a driver's
+`full`, `phase <name>`, or `auto` mode when you intend to run it, and start
+with that driver's `smoke` mode when validating a change to the pipeline.
+
+### Command conventions
+
+- Run every command from the repository root; artifacts and manifests are
+  resolved relative to the checkout.
+- `python -m explib.<driver>` is a package entry point. `python run_gapfill.py`
+  is the historical v6 script and keeps its positional modes.
+- `--help` is the safe way to inspect a driver. `smoke --help` is not a help
+  command on the positional drivers: the second token is ignored and a smoke
+  run starts.
+- Training drivers write into `results_*/` and `analysis_*/` (both are
+  gitignored); `plan`, `analysis`, and `report` modes do not add a research
+  measurement.
 
 ### Example workflows
 
@@ -155,7 +179,7 @@ python -m explib.confirmation report
 Compare a re-run against the original before trusting its report:
 
 ```bash
-python -m explib.reproduce compare results_lm_v6 results_lm_v6_rerun
+python -m explib.reproduce compare results_lm_v3_1500 results_lm_v3_1500_rerun
 ```
 
 ### Where to look
@@ -165,6 +189,8 @@ python -m explib.reproduce compare results_lm_v6 results_lm_v6_rerun
 | How do I run or re-run an experiment? | this README |
 | Which command and subcommand should I use? | [Study at a glance](#study-at-a-glance) and the per-driver sections below |
 | Why is a measurement or comparison defined this way? | `docs/design_notes.md` |
+| What exactly is frozen, and what may be claimed? | `confirmation_frozen.json` and `docs/design_notes.md` §17/§20 |
+| How should I read a verdict or an audit status? | [Measurement guardrails](#measurement-guardrails) |
 | What was decided, and in what order? | `DECISION_LOG.md` |
 | Where is the released evidence? | `RELEASES.md` |
 | How were the review issues resolved? | `REVIEW_4_RESPONSE.md` |
@@ -183,7 +209,7 @@ experiments. `.gitignore` keeps those path families out of the repository;
 | path | what |
 |---|---|
 | `exp_lib.py` | **compatibility shim** that re-exports the split implementation in `explib/` |
-| `_split_loader.py` | shared loader for the split packages: runs each `_parts/` fragment in the caller's module globals, in declared order, with the fragment path as the compile filename (so tracebacks point at the reviewable source) |
+| `_split_loader.py` | shared loader for the split packages: `load_split_package` bootstraps a package (sets the historical `__file__` / `_HERE` / `_REPO`, then runs each `_parts/` fragment in order in the caller's module globals), and `load_parts` is the lower-level executor. Fragments are compiled with their real path, so tracebacks point at the reviewable source |
 | `explib/` | **the library — and the source of truth**: model, CSA/HCA attention, pooling, indexer, segmenters, training loop, aggregation and statistics |
 | `csa_kernels.py` | **compatibility shim** that re-exports the split implementation in `_csa_kernels/` |
 | `_csa_kernels/` | **fused-kernel path for the three core operators**: block-compression pooling, indexer top-k selection and sparse attention as Triton kernels (plus a CPU-runnable torch-reference twin of the same algorithmic decomposition); opt-in via `CSA_KERNEL`, off by default — see [Triton kernel path (M0/G0)](#triton-kernel-path-m0g0) |
@@ -265,7 +291,7 @@ a re-run after a code change), verify the second copy instead of trusting the
 report:
 
 ```bash
-python -m explib.reproduce compare results_lm_v6 results_lm_v6_rerun
+python -m explib.reproduce compare results_lm_v3_1500 results_lm_v3_1500_rerun
 # exit 0 only when source bytes, data slice, config, environment, matched
 # initialization and the declared PPL tolerance all line up; use
 # --require exact for a bit-identical demand.
@@ -391,7 +417,10 @@ individual panels up to n=4–6:
 
 `python run_gapfill.py overfit` is a small single-run sanity check (loss should
 fit and the pipeline should stay finite); `topup` fills missing cells without
-re-running completed ones.
+re-running completed ones. When the `full` / `topup` chain finishes, the v6
+driver pushes and schedules its instance shutdown (cancel with
+`pkill -f v6autoshutdown`; suppress with `V6_NO_SHUTDOWN=1`, suppress pushes
+with `V6_NO_PUSH=1`).
 
 ### Task-level parallelism (one GPU per run)
 
@@ -645,15 +674,13 @@ python -m explib.rope phase P1T   # seq-2048 topk sweep
 python build_report.py            # regenerate REPORT_v7.md from artifacts (zero GPU)
 ```
 
-Every driver meters its own accelerator time against a configured run-time
-cap: it refuses to start a run that would pass the cap, and hard-truncates a
-run that reaches it mid-flight. On a multi-GPU box, `CSA_PAR=auto` runs the
-same phases with one independent run per card (the cap then meters aggregate
-GPU-seconds, i.e. N parallel runs consume it N times faster in wall clock) — a
-truncated cell leaves no partial measurement and is retried on the next pass.
-When all phases finish the script pushes and shuts the instance down (cancel
-with `pkill -f v6autoshutdown`; suppress with `V6_NO_SHUTDOWN=1`, pushes with
-`V6_NO_PUSH=1`).
+Every training driver meters its own accelerator time against a configured
+run-time cap: it refuses to start a run that would pass the cap, and
+hard-truncates a run that reaches it mid-flight. On a multi-GPU box,
+`CSA_PAR=auto` runs the same phases with one independent run per card (the cap
+then meters aggregate GPU-seconds) — a truncated cell leaves no partial
+measurement and is retried on the next pass. The push/shutdown hooks described
+above belong to the v6 driver; `explib` drivers leave the instance running.
 
 > All quantities are taken from the tables that `build_report.py` /
 > `fuse_analysis.py` and the per-driver `report` builders compute on the fly
@@ -664,6 +691,8 @@ with `pkill -f v6autoshutdown`; suppress with `V6_NO_SHUTDOWN=1`, pushes with
 
 - **Run from the repository root.** The drivers resolve `results_*/`,
   `analysis_*/` and the frozen manifests relative to the checkout.
+- **A bare v6 invocation trains.** `python run_gapfill.py` uses the default
+  `full` mode; use `smoke` when you only want a plumbing check.
 - **Use `--help` before a mode.** `python -m explib.<driver> --help` prints the
   driver description; the mode list is in [Study at a glance](#study-at-a-glance).
   `python -m explib.<driver> smoke --help` is not a help command — the second
@@ -674,6 +703,17 @@ with `pkill -f v6autoshutdown`; suppress with `V6_NO_SHUTDOWN=1`, pushes with
   changing the train corpus, then rebuild before comparing runs.
 - **A report is not evidence by itself.** Publish and verify an archive
   (`archive_release.py`) before quoting a number.
+- **Fresh checkouts have no results.** `results_*/` and `analysis_*/` are
+  gitignored; `python -m explib.confirmation report`,
+  `python build_report.py`, and the other `report` modes rebuild only from
+  artifacts that exist locally.
+- **Kernel mode is opt-in and hardware-dependent.** With `CSA_KERNEL` unset the
+  eager path runs anywhere; `CSA_KERNEL=1` requires CUDA + Triton, while
+  `CSA_KERNEL=ref` selects the CPU-runnable reference twin for debugging.
+- **Missing optional packages / offline Hub.** Install `requirements.lock`
+  before running the suite; for data access, set `WT103_RAW_TXT` to a local
+  raw-text directory or opt into `CSA_HF_MIRROR=1` only when the official Hub
+  is unreachable.
 
 ## Measurement guardrails
 

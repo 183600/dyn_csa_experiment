@@ -924,8 +924,12 @@ def _json_clean(obj):
     return obj
 
 
-def atomic_write_json(path, obj, indent=2):
-    text = json.dumps(_json_clean(obj), indent=indent, default=float, allow_nan=False)
+def _write_text_atomic(path, text):
+    """Write UTF-8 ``text`` to ``path`` via a same-directory temp file.
+
+    ``os.replace`` makes the final rename atomic, and the explicit flush/fsync
+    keeps a crash from leaving a truncated artifact behind.
+    """
     d = os.path.dirname(os.path.abspath(path))
     os.makedirs(d, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=d, prefix=os.path.basename(path) + '.', suffix='.tmp')
@@ -942,22 +946,13 @@ def atomic_write_json(path, obj, indent=2):
             pass
         raise
 
+
+def atomic_write_json(path, obj, indent=2):
+    text = json.dumps(_json_clean(obj), indent=indent, default=float, allow_nan=False)
+    _write_text_atomic(path, text)
+
 def atomic_write_text(path, text):
-    d = os.path.dirname(os.path.abspath(path))
-    os.makedirs(d, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=d, prefix=os.path.basename(path) + '.', suffix='.tmp')
-    try:
-        with os.fdopen(fd, 'w', encoding='utf-8') as f:
-            f.write(text)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, path)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+    _write_text_atomic(path, text)
 
 def locked_json_read(path):
     """Consistent read of a shared JSON file under the same flock the writers

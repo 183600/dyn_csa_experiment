@@ -1317,6 +1317,7 @@ def _nll_doc_ci(nll_per_row, n_tokens_per_row):
             return None
         return nll, ntok
 
+    pairs = []
     doc_ce = []
     total_nll = 0.0
     total_tok = 0
@@ -1324,10 +1325,10 @@ def _nll_doc_ci(nll_per_row, n_tokens_per_row):
         pair = _parse_pair(nll, ntok)
         if pair is None:
             continue
-        nll, ntok = pair
-        total_nll += nll
-        total_tok += ntok
-        doc_ce.append(nll / ntok)
+        pairs.append(pair)
+        total_nll += pair[0]
+        total_tok += pair[1]
+        doc_ce.append(pair[0] / pair[1])
     if len(doc_ce) < 2 or total_tok <= 0:
         return {'ppl': (_safe_exp_ppl(total_nll / total_tok) if total_tok else None),
                 'doc_ce_mean': None, 'doc_ce_sem': None,
@@ -1346,13 +1347,7 @@ def _nll_doc_ci(nll_per_row, n_tokens_per_row):
     #   Var(CE) ~= N/(N-1) * sum_i (nll_i - CE*n_tok_i)^2 / (sum_i n_tok_i)^2.
     # A t critical value (df=N-1), not 1.96, keeps small document panels from
     # claiming a normal-theory interval.
-    _resid = []
-    for nll, ntok in zip(_nll, _ntok):
-        pair = _parse_pair(nll, ntok)
-        if pair is None:
-            continue
-        nll, ntok = pair
-        _resid.append(nll - ce * ntok)
+    _resid = [nll - ce * ntok for nll, ntok in pairs]
     n_docs = len(_resid)
     # Scale each residual by the total before squaring: r**2 and
     # total_tok**2 can each overflow while their ratio is representable.

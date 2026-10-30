@@ -9,11 +9,9 @@ new part (or insert a self-contained one) and keep the list in execution order.
 
 import os as _os
 
-from _split_loader import load_parts as _load_parts
+from _split_loader import load_split_package
 
 _HERE = _os.path.dirname(_os.path.abspath(__file__))
-_REPO = _os.path.dirname(_HERE)
-__file__ = _os.path.join(_REPO, 'exp_lib.py')
 
 _PARTS = [
 'part_00_kernel_stamp.py',
@@ -74,5 +72,6 @@ _PARTS = [
 'part_55_ablation_manipulation.py',
 ]
 
-_load_parts(globals(), _HERE, _PARTS)
-del _load_parts
+load_split_package(globals(), _HERE, _PARTS, repo_depth=1,
+                   historical_path='exp_lib.py')
+del load_split_package
