@@ -938,11 +938,8 @@ def run_disposition_audit(events, *, planned_cells=None, plan=None,
                         f'({first_ok_rid!r}); retaining a later run of the same '
                         'cell is post-hoc selection, not a pre-registered '
                         'measurement')
-                elif pol['retention'] == 'single_attempt':
-                    out['problems'].append(
-                        f'cell {key!r} has more than one successful attempt but '
-                        'the policy requires a single attempt')
-                elif rec_rid == last_ok_rid:
+                elif pol['retention'] == 'last_success' \
+                        and rec_rid == last_ok_rid:
                     out['warnings'].append(
                         f'cell {key!r}: the policy explicitly retains the last '
                         'success; the result is descriptive/exploratory, not a '
@@ -975,6 +972,11 @@ def run_disposition_audit(events, *, planned_cells=None, plan=None,
                 'success was retained, so this is not a selection, but the '
                 'repeated attempt should be explained in the decision log')
         if len(ok_rows) > 1 and pol['retention'] == 'single_attempt':
+            # Count every single_attempt violation once.  The retained-record
+            # branch above intentionally does not append its own duplicate:
+            # two successes are a violation whether the retained attempt is
+            # the first or the last one.
+            out['n_single_attempt_violations'] += 1
             out['problems'].append(
                 f'cell {key!r} succeeded {len(ok_rows)} times but the policy '
                 'requires a single attempt')

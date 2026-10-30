@@ -79,6 +79,19 @@ def test_single_attempt_policy_rejects_a_retry_after_failure():
     assert rep['n_single_attempt_violations'] == 1, rep
 
 
+def test_single_attempt_policy_counts_multiple_successes_once():
+    plan = _plan(['a::seed0'], retention='single_attempt')
+    rep = L.run_disposition_audit(
+        [_event('a::seed0', 'ok', 'r1'), _event('a::seed0', 'ok', 'r2')],
+        plan=plan, retained=_retained(**{'a::seed0': 'r2'}))
+    assert rep['status'] == 'fail', rep
+    assert rep['n_single_attempt_violations'] == 1, rep
+    assert sum('requires a single attempt' in p
+               for p in rep['problems']) == 1, rep['problems']
+    assert not any('explicitly retains the last success' in w
+                   for w in rep['warnings']), rep['warnings']
+
+
 def test_iso_z_and_fractional_timestamps_are_comparable():
     plan = L.build_run_disposition_plan(
         ['a::seed0'], created_at='2026-01-01T00:00:00Z')
@@ -132,3 +145,46 @@ def test_document_sampling_extreme_finite_sizes_is_json_safe():
     assert all(s['size_sum'] is None or math.isfinite(s['size_sum'])
                for s in plan['strata']), plan['strata']
     json.dumps(plan, allow_nan=False)
+
+
+def test_size_weighted_sampling_handles_a_total_weight_overflow():
+    # Each stratum sum is finite (1e308), but their total is not.  The
+    # allocation must normalise the representable weights instead of calling
+    # math.isfinite on the whole NumPy array (which raises TypeError) or
+    # silently falling back to unit-count weighting.
+    plan = L.document_stratified_plan(
+        [1e308, 1e308], 2, n_strata=2, allocation='size_weighted')
+    assert plan['selected'] == [0, 1], plan
+    assert plan['size_coverage_fraction'] == 1.0, plan
+    assert all(s['n_selected'] == 1 for s in plan['strata']), plan['strata']
+    json.dumps(plan, allow_nan=False)
+
+    # Same guard at the allocation helper: the relative size weights are
+    # retained (stratum 1 has the larger population cap here), rather than
+    # being replaced by the unit-count fallback [1, 1, 1].
+    alloc = L._sampling_allocation(
+        6, 3, [1, 2, 3], 'size_weighted', 0,
+        stratum_size_sums=[1.7e308, 1e308, 1e-300])
+    assert alloc.tolist() == [1, 2, 0], alloc
+
+
+def test_scaling_trend_normalises_mixed_extreme_and_ordinary_effects():
+    # The largest effect is above the safe-squaring limit but one seed is
+    # ordinary.  Scaling on the maximum (not only when EVERY non-zero effect
+    # is huge) is required: otherwise np.mean overflows and the whole trend
+    # turns into NaN.  The sign-flip inference is scale invariant.
+    points = [
+        {'label': 'a', 'scale': 1.0, 'seeds': [0, 1, 2],
+         'effects': [1.7e308, 1.7e308, 1.0]},
+        {'label': 'b', 'scale': 10.0, 'seeds': [0, 1, 2],
+         'effects': [1.6e308, 1.6e308, 1.0]},
+        {'label': 'c', 'scale': 100.0, 'seeds': [0, 1, 2],
+         'effects': [1.5e308, 1.5e308, 1.0]},
+    ]
+    trend = L.scaling_trend(points, min_seeds=2, min_points=2)
+    assert math.isfinite(trend['wls']['slope']), trend['wls']
+    assert math.isfinite(trend['direction_slope']), trend
+    assert math.isfinite(trend['paired']['slope_mean']), trend['paired']
+    json.dumps(trend, allow_nan=False)
+    meta = L.meta_analyze_effects(points, min_seeds=2)
+    json.dumps(meta, allow_nan=False)

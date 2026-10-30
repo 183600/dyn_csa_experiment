@@ -500,7 +500,7 @@ def _sampling_allocation(n_units, n_select, stratum_sizes, allocation,
     with np.errstate(over='ignore', invalid='ignore'):
         _wsum = float(weights.sum())
     if not np.isfinite(weights).all() or not math.isfinite(_wsum) or _wsum <= 0:
-        if (math.isfinite(weights).all() and np.any(weights > 0.0)):
+        if (np.isfinite(weights).all() and np.any(weights > 0.0)):
             # The elements are representable but their sum is not.  Only the
             # relative weights enter the allocation; normalise by the largest
             # weight so a scale-up size declaration keeps size weighting

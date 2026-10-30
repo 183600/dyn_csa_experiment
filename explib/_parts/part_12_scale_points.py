@@ -248,7 +248,8 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
     _effect_scale = max(_effect_abs, default=0.0)
     _effect_min_abs = min((a for a in _effect_abs if a > 0.0), default=0.0)
     _scale_effects = bool(math.isfinite(_effect_scale) and _effect_scale > 0.0
-                          and (_effect_scale < _EFFECT_SCALE_FLOOR or _effect_min_abs > 1e100))
+                          and (_effect_scale < _EFFECT_SCALE_FLOOR
+                               or _effect_min_abs > 1e100))
 
     def _finite_or_none(value):
         try:
@@ -1145,9 +1146,9 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
         return out
     _effect_abs = [abs(float(e)) for p in pts for e in p['effects']]
     _effect_scale = max(_effect_abs, default=0.0)
-    _effect_min_abs = min((a for a in _effect_abs if a > 0.0), default=0.0)
     _scale_effects = bool(math.isfinite(_effect_scale) and _effect_scale > 0.0
-                          and (_effect_scale < _EFFECT_SCALE_FLOOR or _effect_min_abs > 1e100))
+                          and (_effect_scale < _EFFECT_SCALE_FLOOR
+                               or _effect_scale > 1e100))
 
     def _effects_work(p):
         if not _scale_effects:
