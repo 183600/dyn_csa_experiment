@@ -303,8 +303,11 @@ def maxt_signflip_adjust(named_deltas, *, alpha=0.05,
     tol = 1e-12 * max(1.0, float(np.max(t)) if m else 1.0)
     total = 1 << n
     bitpos = np.arange(n, dtype=np.int64)[None, :]
+    # Each chunk materialises a (patterns x m) matrix.  A family grows along
+    # m as well as n, so cap the cell count, not only the pattern count.
     chunk = max(1, min(total,
-                       max(1, JOINT_SIGNFLIP_CHUNK_TARGET // max(n, 1))))
+                       max(1, JOINT_SIGNFLIP_CHUNK_TARGET // max(n, 1)),
+                       max(1, JOINT_SIGNFLIP_CHUNK_TARGET // max(m, 1))))
     raw_counts = np.zeros(m, dtype=np.int64)
     single_counts = np.zeros(m, dtype=np.int64)
     step_counts = np.zeros(m, dtype=np.int64)

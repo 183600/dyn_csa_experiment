@@ -38,11 +38,18 @@ import math as _fc_math
 import numpy as _fc_np
 
 
+# Upper bound on the number of (pattern row x contrast) cells materialised per
+# enumeration chunk.  Bounding only the pattern count would let a larger
+# declared family multiply the working set by m.
+FAMILY_SIGNFLIP_CHUNK_TARGET = 1 << 18
+
+
 FAMILY_CORRECTION_POLICY = {
     'version': 'confirmation-family-correction-3',
     'alpha': 0.05,
     'max_n': 20,
     'min_seeds': 2,
+    'dependence_max_contrasts': 512,
     'method': ('exact sign-flip Westfall-Young free step-down max-T on the '
                'sign-invariant score statistic'),
     'statistic': '|sum_i d_i| / sqrt(sum_i d_i^2) (sign-invariant)',
@@ -138,7 +145,13 @@ def _fc_score_maxt(matrix, alpha):
                            dtype=_fc_np.int64)
     t_sorted = t[order]
     bitpos = _fc_np.arange(n, dtype=_fc_np.int64)[None, :]
-    chunk = max(1, min(total, max(1, (1 << 18) // max(n, 1))))
+    # Each chunk materialises a (patterns x m) matrix.  Sizing the chunk from
+    # n alone is fine for the small frozen family, but a scale-up panel can
+    # grow the number of declared contrasts: cap the cell count as well, so
+    # memory stays O(target) instead of O(target * m).
+    chunk = max(1, min(total,
+                       max(1, FAMILY_SIGNFLIP_CHUNK_TARGET // max(n, 1)),
+                       max(1, FAMILY_SIGNFLIP_CHUNK_TARGET // max(m, 1))))
     raw_counts = _fc_np.zeros(m, dtype=_fc_np.int64)
     single_counts = _fc_np.zeros(m, dtype=_fc_np.int64)
     step_counts = _fc_np.zeros(m, dtype=_fc_np.int64)
@@ -206,6 +219,20 @@ def _fc_dependence(matrix):
     if m < 2 or n < 2:
         return {'available': False,
                 'reason': 'at least two contrasts and two seeds are needed'}
+    # A dense correlation matrix and its eigendecomposition are O(m**2) and
+    # O(m**3).  The score max-T above already scales with the family, so a very
+    # large declared family should still get its p-values without attempting
+    # an infeasible dependence summary.  Fail this DESCRIPTIVE sub-block closed
+    # (with a reason) instead of allocating an unbounded matrix.
+    _cap = FAMILY_CORRECTION_POLICY['dependence_max_contrasts']
+    if m > _cap:
+        return {'available': False,
+                'n_contrasts': int(m),
+                'n_seeds': int(n),
+                'reason': (f'{m} contrasts exceed the dense dependence-summary '
+                           f'cap {int(_cap)}; the score max-T p-values remain '
+                           'valid but the correlation/eigenvalue summary is '
+                           'not computed')}
     # Row-scale first: a finite 1e308 panel would overflow a naive variance.
     # Correlation is invariant to a positive per-row scale.
     row_scale = _fc_np.max(_fc_np.abs(A), axis=1)
@@ -403,20 +430,28 @@ def confirmation_family_correction(comparisons, *, family_names, frozen_holm=Non
     except ValueError as e:
         return _fc_not_estimable(f'score-statistic Holm failed: {e}')
 
-    frozen_p = _fc_frozen_holm(frozen_holm, names)
-    if frozen_p is None:
-        frozen_p = {}
-        for name in names:
-            p = comparisons[name].get('p_exact_signflip')
-            frozen_p[name] = (None if p is None
-                              else _fc_number(p, f'{name}.p_exact_signflip'))
-    if all(v is None for v in frozen_p.values()):
-        frozen_p = {name: None for name in names}
+    # ``frozen_holm`` (when supplied) is ALREADY the adjusted Holm mapping.
+    # Keep it separate from the raw mean p: using the adjusted value as
+    # ``p_raw_mean`` and then applying Holm again would report the wrong raw
+    # p and a double-corrected Holm p.  The raw mean statistic always comes
+    # from each comparison's ``p_exact_signflip``; only fall back to
+    # recomputing Holm when the caller did not supply the frozen mapping.
+    raw_mean_p = {}
+    for name in names:
+        p = comparisons[name].get('p_exact_signflip')
+        raw_mean_p[name] = (None if p is None
+                            else _fc_number(p, f'{name}.p_exact_signflip'))
+    frozen_holm_p = _fc_frozen_holm(frozen_holm, names)
     holm_mean = None
-    if all(v is not None for v in frozen_p.values()):
+    if frozen_holm_p is not None:
+        # Preserve the frozen adjusted values verbatim.  A missing slot stays
+        # None rather than being silently re-estimated from the raw p.
+        holm_mean = {name: {'p_holm': frozen_holm_p.get(name)}
+                     for name in names}
+    elif all(v is not None for v in raw_mean_p.values()):
         try:
-            holm_mean = holm_adjust([(name, frozen_p[name]) for name in names],
-                                    alpha=a)
+            holm_mean = holm_adjust(
+                [(name, raw_mean_p[name]) for name in names], alpha=a)
         except ValueError as e:
             return _fc_not_estimable(f'mean-statistic Holm failed: {e}')
 
@@ -468,16 +503,25 @@ def confirmation_family_correction(comparisons, *, family_names, frozen_holm=Non
             'mean': float(_fc_math.fsum(x / float(n) for x in rows[name])),
             'rank_score': int(score_mx['rank'][i]),
             'score_stat': float(score_mx['score'][i]),
-            'p_raw_mean': frozen_p.get(name),
+            'p_raw_mean': raw_mean_p.get(name),
             'p_holm_mean': (float(holm_mean[name]['p_holm'])
-                            if holm_mean is not None else None),
+                            if (holm_mean is not None
+                                and holm_mean.get(name, {}).get('p_holm')
+                                is not None)
+                            else None),
             'p_raw_score': raw_score[name],
             'p_holm_score': float(holm_score[name]['p_holm']),
             'p_maxt_score': maxt_score[name],
-            'reject_frozen_holm': (None if frozen_p.get(name) is None
-                                   else bool(float(frozen_p[name]) < a)),
+            'reject_frozen_holm': (None if holm_mean is None
+                                   or holm_mean.get(name, {}).get('p_holm')
+                                   is None
+                                   else bool(float(holm_mean[name]['p_holm'])
+                                             < a)),
             'reject_holm_mean': (None if holm_mean is None
-                                 else bool(float(holm_mean[name]['p_holm']) < a)),
+                                 or holm_mean.get(name, {}).get('p_holm')
+                                 is None
+                                 else bool(float(holm_mean[name]['p_holm'])
+                                           < a)),
             'reject_holm_score': bool(float(holm_score[name]['p_holm']) < a),
             'reject_maxt_score': bool(maxt_score[name] < a),
             't_stat': (float(t_block['contrasts'][name]['t_stat'])
@@ -695,7 +739,7 @@ def _family_correction_markdown(block):
     if block.get('note'):
         A(f'- 注：{block.get("note")}')
     A('')
-    A('| 比较 | n | raw p (mean, frozen) | Holm(mean) p | raw p (score) | Holm(score) p | max-T(score) p | max-T 拒绝 | 同时 CI (t) | MDE Holm | MDE max-T |')
+    A('| 比较 | n | raw p (mean) | Holm(mean) p | raw p (score) | Holm(score) p | max-T(score) p | max-T 拒绝 | 同时 CI (t) | MDE Holm | MDE max-T |')
     A('|---|---|---|---|---|---|---|---|---|---|---|')
     rows = block.get('comparisons') or {}
     for name in names:

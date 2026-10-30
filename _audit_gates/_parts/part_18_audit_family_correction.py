@@ -199,6 +199,30 @@ def audit_family_correction(path=None):
         ps = _fin(r.get('p_raw_score'))
         pm = _fin(r.get('p_maxt_score'))
         ph = _fin(r.get('p_holm_score'))
+        # The mean columns must keep the raw/adjusted distinction: the raw
+        # mean p is the comparison's p_exact_signflip, while the Holm(mean)
+        # column must equal the already-adjusted frozen Holm value verbatim.
+        # This is checked against the ORIGINAL inputs, not only the replay, so
+        # a replay that shares the same bug cannot hide it.
+        raw_mean = _fin(r.get('p_raw_mean'))
+        comp_raw = _fin((comps.get(name) or {}).get('p_exact_signflip'))
+        if raw_mean is not None and comp_raw is not None:
+            if not _close(raw_mean, comp_raw):
+                out['problems'].append(
+                    f'{name}: p_raw_mean={raw_mean!r} != '
+                    f'p_exact_signflip={comp_raw!r}')
+        _stored_holm = ft.get('holm')
+        if isinstance(_stored_holm, dict):
+            _hp = _stored_holm.get(name)
+            if isinstance(_hp, dict):
+                _hp = _hp.get('p_holm')
+            frozen_holm_p = _fin(_hp)
+            holm_mean_p = _fin(r.get('p_holm_mean'))
+            if frozen_holm_p is not None and holm_mean_p is not None:
+                if not _close(holm_mean_p, frozen_holm_p):
+                    out['problems'].append(
+                        f'{name}: p_holm_mean={holm_mean_p!r} != frozen '
+                        f'p_holm={frozen_holm_p!r}')
         if ps is not None and pm is not None and pm < ps - 1e-12:
             out['problems'].append(
                 f'{name}: p_maxt_score={pm!r} < p_raw_score={ps!r}')

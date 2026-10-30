@@ -198,6 +198,27 @@ def test_independent_family_is_not_falsely_more_powerful():
         'same', 'maxt_rejects_more', 'maxt_rejects_fewer', 'crossed')
 
 
+def test_large_family_keeps_max_t_but_caps_dense_dependence():
+    # The score max-T and Holm are linear in the declared family, while a
+    # dense correlation/eigenvalue summary is O(m**2)/O(m**3).  A scale-up
+    # family must still get its p-values instead of exhausting memory on the
+    # descriptive dependence block.
+    rng = np.random.default_rng(23)
+    size = int(L.FAMILY_CORRECTION_POLICY['dependence_max_contrasts']) + 8
+    rows = {f'c{i:04d}': rng.normal(size=4).tolist() for i in range(size)}
+    comps, names = _family(rows)
+    out = L.confirmation_family_correction(comps, family_names=names)
+    assert out['status'] == 'ok', out
+    assert out['dependence']['available'] is False, out['dependence']
+    assert 'cap' in out['dependence']['reason'], out['dependence']
+    assert out['dependence']['n_contrasts'] == size, out['dependence']
+    sample = out['comparisons'][names[0]]
+    assert math.isfinite(sample['p_raw_score'])
+    assert math.isfinite(sample['p_maxt_score'])
+    assert math.isfinite(sample['p_holm_score'])
+    json.dumps(out, allow_nan=False)
+
+
 def test_constant_effect_is_estimable_without_studentised_twin():
     rows = {f'c{i}': [0.1 * (i + 1)] * 8 for i in range(3)}
     comps, names = _family(rows)
@@ -265,11 +286,43 @@ def test_finaltest_emits_block_and_audit_replays_it():
         assert fc['m_declared'] == 2 and fc['n_seeds'] == 8, fc
         assert fc['n_patterns'] == 256, fc
         assert set(fc['family_names']) == set(st['comparisons']), fc
+        # The frozen Holm values are already adjusted.  They must appear only
+        # in the Holm(mean) column, never as the raw mean p (which would also
+        # make the displayed Holm(mean) a double correction).
+        for name in fc['family_names']:
+            row = fc['comparisons'][name]
+            assert row['p_raw_mean'] == st['comparisons'][name]['p_exact_signflip'], row
+            assert row['p_holm_mean'] == st['holm'][name]['p_holm'], row
+            assert row['reject_frozen_holm'] == row['reject_holm_mean'], row
         json.dumps(fc, allow_nan=False)
         with contextlib.redirect_stdout(io.StringIO()):
             out = A.audit_family_correction(path=p)
         assert out['status'] == 'ok', out
         assert out['n_replayed'] == 2 and not out['problems'], out
+
+
+def test_supplied_frozen_holm_is_not_applied_twice():
+    rng = np.random.default_rng(17)
+    rows = {f'c{i}': (rng.normal(size=6) * 0.2 + 0.3).tolist()
+            for i in range(4)}
+    comps, names = _family(rows)
+    raw = {n: comps[n]['p_exact_signflip'] for n in names}
+    frozen = {n: {'p_holm': min(1.0, 4.0 * raw[n])} for n in names}
+    out = L.confirmation_family_correction(
+        comps, family_names=names, frozen_holm=frozen)
+    assert out['status'] == 'ok', out
+    for n in names:
+        row = out['comparisons'][n]
+        # Raw stays raw; the supplied already-adjusted value is preserved
+        # verbatim instead of being passed through Holm a second time.
+        assert row['p_raw_mean'] == raw[n], row
+        assert row['p_holm_mean'] == frozen[n]['p_holm'], row
+        assert row['reject_frozen_holm'] == (frozen[n]['p_holm'] < 0.05), row
+    # Without the frozen map the same panel recomputes Holm from the raw p.
+    replay = L.confirmation_family_correction(comps, family_names=names)
+    for n in names:
+        assert replay['comparisons'][n]['p_raw_mean'] == raw[n], replay
+        assert replay['comparisons'][n]['p_holm_mean'] >= raw[n], replay
 
 
 def test_audit_detects_tampering_and_legacy_artifacts():
@@ -290,6 +343,14 @@ def test_audit_detects_tampering_and_legacy_artifacts():
         cases = []
         d = copy.deepcopy(good)
         d['family_correction']['comparisons'][name]['p_maxt_score'] = 0.99
+        cases.append(d)
+        d = copy.deepcopy(good)
+        # The raw mean p is an independent read of p_exact_signflip; swapping
+        # in the frozen (already adjusted) value must not pass the replay.
+        d['family_correction']['comparisons'][name]['p_raw_mean'] = 0.99
+        cases.append(d)
+        d = copy.deepcopy(good)
+        d['family_correction']['comparisons'][name]['p_holm_mean'] = 0.5
         cases.append(d)
         d = copy.deepcopy(good)
         d['family_correction']['comparisons'][name]['ci_simultaneous'] = [1.0, 0.0]
