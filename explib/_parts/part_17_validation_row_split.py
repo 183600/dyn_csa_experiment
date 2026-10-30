@@ -446,16 +446,37 @@ def record_subset_ppl(rec, rows):
     _parsed_tok = [_exact_count(ntok[int(i)]) for i in idx]
     if any(v is None for v in _parsed_tok):
         return None
-    _ntok = np.asarray(_parsed_tok, dtype=np.int64)
     if not np.isfinite(_nll).all():
         return None
-    total_tok = float(_ntok.sum())
+    # Token counts are exact denominators.  Summing them through a float (or
+    # narrowing them to int64) rounds sums above 2**53, so the reported
+    # n_tokens would no longer describe the rows this estimate was computed
+    # on.  Keep the Python integer total and only convert for the division.
+    total_tok = int(sum(_parsed_tok))
     if total_tok <= 0:
         return None
-    nll_sum = float(_nll.sum())
-    nll_mean = nll_sum / total_tok
+    _nll_vals = [float(x) for x in _nll]
+    try:
+        nll_sum = float(math.fsum(_nll_vals))
+    except (OverflowError, ValueError):
+        nll_sum = None
+    if nll_sum is None or not math.isfinite(nll_sum):
+        # The individual NLLs are finite, but their sum can overflow while the
+        # pooled rate is still representable; fall back to the scaled ratio.
+        nll_sum_out = None
+        nll_mean = _pooled_nll_ratio(_nll_vals, _parsed_tok)
+    else:
+        nll_sum_out = nll_sum
+        try:
+            nll_mean = nll_sum / total_tok
+        except (OverflowError, ValueError, ZeroDivisionError):
+            nll_mean = _pooled_nll_ratio(_nll_vals, _parsed_tok)
+        if nll_mean is None or not math.isfinite(nll_mean):
+            nll_mean = _pooled_nll_ratio(_nll_vals, _parsed_tok)
+    if nll_mean is None or not math.isfinite(nll_mean):
+        return None
     return {'ppl': _safe_exp_ppl(nll_mean), 'nll': nll_mean,
-            'nll_sum': nll_sum, 'n_tokens': int(total_tok),
+            'nll_sum': nll_sum_out, 'n_tokens': total_tok,
             'n_rows': int(idx.size)}
 
 # 基线调参协议：主方法与基线必须获得相同的搜索范围、在同一训练集上拟合、

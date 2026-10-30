@@ -819,6 +819,15 @@ def diagnose_training_instability(record, *, data_checked=None):
         if isinstance(raw, (bool, np.bool_)):
             malformed.append(f'{key}={raw!r}')
             return 0
+        if isinstance(raw, numbers.Integral):
+            # Event counters are exact integers.  Round-tripping a JSON int
+            # through float64 first would report 2**53+1 as 2**53 and could
+            # even change a malformed/valid verdict at scale.
+            value = int(raw)
+            if value < 0:
+                malformed.append(f'{key}={raw!r}')
+                return 0
+            return value
         try:
             f = float(raw)
         except (TypeError, ValueError, OverflowError):

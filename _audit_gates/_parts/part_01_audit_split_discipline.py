@@ -598,17 +598,40 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
 # ---------------------------------------------------------------------------
 
 def _unit_meta_int(meta, key):
-    """Integer metadata field or None (bool/fraction/NaN are not ints)."""
+    """Integer metadata field or None (bool/fraction/NaN are not ints).
+
+    Integral values are returned without a float round-trip: a JSON integer
+    above 2**53 would otherwise be silently rounded to a different count.
+    """
     v = (meta or {}).get(key)
     if v is None or isinstance(v, (bool, np.bool_)):
         return None
+    if isinstance(v, numbers.Integral):
+        return int(v)
+    if isinstance(v, (str, bytes, bytearray)):
+        # Keep the historical acceptance of integral numeric strings (JSON
+        # object keys / hand-written metadata) while still rejecting '3.5'.
+        # Parse an exact decimal-integer spelling first so a count above
+        # 2**53 is not rounded through float64.
+        try:
+            return int(v)
+        except (TypeError, ValueError, OverflowError):
+            pass
+        try:
+            f = float(v)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return int(f) if math.isfinite(f) and f == math.floor(f) else None
     try:
-        f = float(v)
+        i = int(v)
     except (TypeError, ValueError, OverflowError):
         return None
-    if not math.isfinite(f) or f != math.floor(f):
+    try:
+        if v != i:
+            return None
+    except (TypeError, ValueError, OverflowError):
         return None
-    return int(f)
+    return int(i)
 
 
 def _unit_decode_runs(ids, ttd, tok, L, label, rec):

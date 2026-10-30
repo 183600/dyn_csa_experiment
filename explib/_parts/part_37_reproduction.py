@@ -57,10 +57,26 @@ def _repro_int(value):
     if isinstance(value, numbers.Integral):
         number = int(value)
     elif isinstance(value, numbers.Real):
-        as_float = float(value)
-        if not math.isfinite(as_float) or not as_float.is_integer():
-            return None
-        number = int(as_float)
+        try:
+            as_float = float(value)
+        except (OverflowError, ValueError):
+            # An exact Rational (Fraction) can be integral yet beyond
+            # float64's exponent range; fall through to the exact check.
+            as_float = None
+        if as_float is not None:
+            if not math.isfinite(as_float) or not as_float.is_integer():
+                return None
+            number = int(as_float)
+        else:
+            try:
+                number = int(value)
+            except (TypeError, ValueError, OverflowError):
+                return None
+            try:
+                if value != number:
+                    return None
+            except (TypeError, ValueError, OverflowError):
+                return None
     elif isinstance(value, (str, bytes)):
         try:
             number = int(value)
@@ -69,13 +85,22 @@ def _repro_int(value):
     else:
         # Objects outside numbers.Real can define __int__ and would be
         # truncated silently by int(value); require an exact numeric reading.
+        # Decimal (not a numbers.Real) may be integral far beyond float64, so
+        # check its value in the integer domain before falling back to float.
         try:
-            as_float = float(value)
             number = int(value)
         except (TypeError, ValueError, OverflowError):
             return None
-        if not math.isfinite(as_float) or float(number) != as_float:
-            return None
+        try:
+            if value != number:
+                return None
+        except (TypeError, ValueError, OverflowError):
+            try:
+                as_float = float(value)
+            except (TypeError, ValueError, OverflowError):
+                return None
+            if not math.isfinite(as_float) or float(number) != as_float:
+                return None
     return number if number > 0 else None
 
 

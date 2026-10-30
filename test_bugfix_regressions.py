@@ -24,7 +24,13 @@ Each test pins one concrete defect found by inspection:
   beyond-margin claim and a stricter one could suppress a true claim;
 * the length audit read a large integral count through float64, rounding
   ``2**53 + 1`` to ``2**53`` and letting a malformed ``n_tok`` equal the
-  ``n_seq*(L-1)`` formula it was supposed to fail.
+  ``n_seq*(L-1)`` formula it was supposed to fail;
+* the overflow-safe pooled-NLL ratio took a token-weighted mean of the
+  normalised NLLs instead of the ratio of sums, changing PPL whenever record
+  lengths/rates differ;
+* event counters, metadata counts, compute-control medians and reproduction
+  counts were still round-tripped through float64, and an exact ``Fraction``
+  count beyond float64 could raise ``OverflowError`` instead of comparing.
 
 These are CPU-only, zero-experiment checks.
 """
@@ -238,3 +244,90 @@ def test_length_audit_reads_large_counts_without_float64_rounding():
     # the count to 2**53 used to make this malformed cell pass as `ok`.
     assert got['status'] == 'fail', got
     assert any('n_tok' in p and 'n_seq*(L-1)' in p for p in got['problems']), got
+
+
+def test_pooled_nll_ratio_preserves_unequal_token_weights():
+    # The overflow fallback used to take a token-weighted mean of the
+    # normalised NLLs; that only equals sum(nll)/sum(tokens) when every
+    # record has the same NLL-per-token ratio.  Ordinary and scale paths must
+    # both keep the ratio of sums.
+    assert math.isclose(L._pooled_nll_ratio([1.0, 2.0], [10, 30]),
+                        3.0 / 40.0, rel_tol=1e-15)
+    pooled, nll_total, tok_total = L._pooled_ppl_from_records(
+        [{'nll_sum': 1.0, 'n_tokens': 10},
+         {'nll_sum': 2.0, 'n_tokens': 30}])
+    assert math.isclose(pooled, math.exp(0.075), rel_tol=1e-15), pooled
+    assert nll_total == 3.0 and tok_total == 40, (nll_total, tok_total)
+    # Same check through the overflow fallback: the NLL total is inf and the
+    # exact token total is beyond float64, but the represented ratio is 0.2.
+    huge = 10 ** 308
+    recs = [{'nll_sum': 1.5e308, 'n_tokens': huge},
+            {'nll_sum': 0.5e308, 'n_tokens': 9 * huge}]
+    pooled, nll_total, tok_total = L._pooled_ppl_from_records(recs)
+    assert math.isclose(pooled, math.exp(0.2), rel_tol=1e-15), pooled
+    assert nll_total is None, nll_total
+    assert tok_total == 10 * huge, tok_total
+    # record_subset_ppl shares the same overflow-safe ratio.
+    subset = L.record_subset_ppl(
+        {'nll_per_row': [1.5e308, 0.5e308],
+         'n_tokens_per_row': [huge, 9 * huge]}, [0, 1])
+    assert subset is not None and math.isclose(
+        subset['nll'], 0.2, rel_tol=1e-15), subset
+
+
+def test_subset_ppl_keeps_exact_token_denominator_at_scale():
+    big = 2 ** 53 + 1
+    rec = {'nll_per_row': [1.0, 2.0],
+           'n_tokens_per_row': [big, big]}
+    got = L.record_subset_ppl(rec, [0, 1])
+    assert got['n_tokens'] == 2 * big, got
+    assert math.isclose(got['nll'], 3.0 / (2 * big), rel_tol=1e-15), got
+    # A token total beyond float64 is still an exact denominator and the
+    # represented per-token ratio is not fabricated as zero by an intermediate
+    # float conversion.
+    from fractions import Fraction
+    huge = 10 ** 400
+    got = L.record_subset_ppl(
+        {'nll_per_row': [1e300, 2e300],
+         'n_tokens_per_row': [huge, huge]}, [0, 1])
+    assert got['n_tokens'] == 2 * huge, got
+    expected = float(Fraction(3 * 10 ** 300, 2 * huge))
+    assert math.isclose(got['nll'], expected, rel_tol=1e-12), got
+
+
+def test_event_metadata_and_config_counts_stay_exact_at_scale():
+    big = 2 ** 53 + 1
+    diag = L.diagnose_training_instability({
+        'opt_diag_summary': {'nonfinite_loss_steps': big,
+                             'nonfinite_grad_steps': 0,
+                             'amp_scaler_overflows': 0, 'events': []}})
+    evidence = [c['evidence'] for c in diag['checks']
+                if c['check'] == 'forward_loss_numerics'][0]
+    assert str(big) in evidence, evidence
+    assert A._unit_meta_int({'vocab': big}, 'vocab') == big
+    # Numeric-string metadata keeps its historical acceptance; a fractional
+    # string is still not an integer.
+    assert A._unit_meta_int({'vocab': str(big)}, 'vocab') == big
+    assert A._unit_meta_int({'vocab': '3.5'}, 'vocab') is None
+    # A huge exact parameter count is not rounded when the compute-control
+    # median is formed.
+    recs = {('a', 't', 0): {'params': big, 'tokens_seen': 10},
+            ('b', 't', 0): {'params': big, 'tokens_seen': 10}}
+    detail = L._compute_control_detail(recs, 'a', 'b')
+    assert detail['params'] == {'a': big, 'b': big}, detail['params']
+
+
+def test_exact_rational_counts_do_not_round_or_raise():
+    from decimal import Decimal
+    from fractions import Fraction
+    huge = 10 ** 400
+    assert L._repro_int(Fraction(huge, 1)) == huge
+    assert L._repro_int(Decimal(huge)) == huge
+    assert L._repro_int(Decimal('3.5')) is None
+    assert L._integral_value(Decimal(huge)) == huge
+    assert L._integral_value(Fraction(huge, 1)) == huge
+    # Exact capacity verdict survives a pair whose float relative gap
+    # underflows; a huge integer pair with one extra parameter is still
+    # distinguished exactly.
+    gap, within = L._param_ratio_pair(huge, huge + 1, 1e-9)
+    assert gap is None and within is True, (gap, within)

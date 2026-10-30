@@ -767,16 +767,35 @@ def _integral_value(value):
     """
     if isinstance(value, (bool, np.bool_)):
         return None
+    if isinstance(value, (str, bytes, bytearray)):
+        # Preserve the documented contract: strings are not counts here.
+        return None
     if isinstance(value, numbers.Integral):
         return int(value)
     if isinstance(value, numbers.Real):
         try:
             f = float(value)
         except (TypeError, ValueError, OverflowError):
+            # An exact rational (Fraction) can be integral yet beyond float64;
+            # fall through to the exact int-domain check below.
+            pass
+        else:
+            if math.isfinite(f) and f.is_integer():
+                return int(f)
             return None
-        if math.isfinite(f) and f.is_integer():
-            return int(f)
-    return None
+    # Exact rationals outside numbers.Real (notably Decimal), and Real values
+    # beyond float64's range, can be integral.  Check integrality in the
+    # value's own domain instead of rounding through float first.
+    try:
+        i = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    try:
+        if value != i:
+            return None
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return int(i)
 
 def _param_ratio_pair(a, b, tolerance):
     """(relative gap, within tolerance) for two capacity counts.
@@ -1033,15 +1052,40 @@ def _compute_control_detail(recs, a, b, *, tolerance=0.25):
         def _median_value(xs):
             if not xs:
                 return None
+            # Integer counts are medians in their own right; running them
+            # through np.median first converts to float64 and silently rounds
+            # an odd median above 2**53.  Compute the exact count median, then
+            # return a float only when that float round-trips exactly (so
+            # ordinary outputs keep their historical numeric type).
+            if all(isinstance(x, numbers.Integral) for x in xs):
+                ys = sorted(int(x) for x in xs)
+                n = len(ys)
+                mid = n // 2
+                if n % 2:
+                    med = ys[mid]
+                else:
+                    total = ys[mid - 1] + ys[mid]
+                    if total % 2:
+                        try:
+                            half = float(total) / 2.0
+                        except (OverflowError, ValueError):
+                            return None
+                        return half if math.isfinite(half) else None
+                    med = total // 2
+                try:
+                    as_float = float(med)
+                except (OverflowError, ValueError):
+                    return int(med)
+                return as_float if int(as_float) == med else int(med)
             try:
                 _v = float(np.median(xs))
             except (OverflowError, TypeError, ValueError):
                 _v = None
             if _v is not None and math.isfinite(_v):
                 return _v
-            # Exact fallback for counts beyond float64: odd-length medians are
-            # an element; an even-length median is emitted only when its exact
-            # average is an integer, otherwise it is unverifiable.
+            # Exact fallback for non-integer containers whose float median is
+            # unrepresentable: odd-length medians are an element; an even
+            # median is emitted only when its exact average is an integer.
             ys = sorted(xs)
             n = len(ys)
             mid = n // 2

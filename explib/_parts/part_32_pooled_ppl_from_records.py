@@ -5,9 +5,15 @@ def _pooled_nll_ratio(nlls, nts):
     ``nll_sum`` values are finite floats and token counts are exact integers,
     so at scale-up sizes the raw NLL sum can overflow and an int total beyond
     float64 cannot even be converted.  The ratio itself is still representable
-    in that regime: normalise the NLLs by their largest magnitude and the
-    token counts by the largest count, then take the weighted mean.  Ordinary
-    panels never call this path (the caller keeps the historical float totals).
+    in that regime: write ``nll_i = max_nll * a_i`` and
+    ``tokens_i = max_tok * w_i``, then
+
+        sum(nll) / sum(tokens) = (max_nll / max_tok)
+                                 * sum(a_i) / sum(w_i).
+
+    The two unitless sums are O(n) even when the absolute totals overflow.
+    Ordinary panels never call this path (the caller keeps the historical
+    float totals).
     """
     if not nlls or len(nlls) != len(nts):
         return None
@@ -27,10 +33,19 @@ def _pooled_nll_ratio(nlls, nts):
         total_w = math.fsum(weights)
         if not (math.isfinite(total_w) and total_w > 0.0):
             return None
-        weighted = math.fsum((float(v) / max_nll) * w
-                             for v, w in zip(nlls, weights))
-        # numerator = max_nll * weighted, denominator = max_tok * total_w.
-        ratio = (max_nll / max_tok) * (weighted / total_w)
+        total_a = math.fsum(float(v) / max_nll for v in nlls)
+        if not math.isfinite(total_a):
+            return None
+        # numerator = max_nll * sum(a_i), denominator = max_tok * sum(w_i).
+        # Build the scale exactly first: ``max_nll / max_tok`` would raise
+        # OverflowError when the token total is beyond float64 even though
+        # the (possibly tiny) quotient is representable.
+        from fractions import Fraction as _Fraction
+        try:
+            scale = float(_Fraction(max_nll) / max_tok)
+        except OverflowError:
+            return None
+        ratio = scale * (total_a / total_w)
     except (OverflowError, ValueError, ZeroDivisionError):
         return None
     return ratio if math.isfinite(ratio) else None
