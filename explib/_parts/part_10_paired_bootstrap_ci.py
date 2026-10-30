@@ -499,12 +499,19 @@ def paired_effect_stats(deltas, alpha=0.05, min_n=3, with_values=None, without_v
     # to the confirmatory statistics, but never gate a verdict on them (that
     # would turn a model-based extrapolation into a new decision rule).
     _pred = new_seed_replication(d)
+    # The signed-rank sensitivity test has no rank distribution when every
+    # valid delta is zero (or there are no data); its "unavailable" sentinel
+    # is NaN.  A report-level caller may serialise this record with
+    # allow_nan=False, so withhold that p instead of leaking a NaN.
+    _wil_p = _wil.get('p')
+    if _wil_p is not None and not math.isfinite(float(_wil_p)):
+        _wil_p = None
     return {'n': n, 'mean': mean, 'std': _std_out, 'std_defined': std_defined,
             'std_available': _std_available,
             'sem': _sem_out, 'cohens_dz': dz, 'ci95_low': ci_lo, 'ci95_high': ci_hi, 'loo_means': loo_means, 'seed_driven': seed_driven, 'seed_robust': seed_robust, 'p_exact_signflip': float(p), 'p_floor': p_floor, 'min_reachable_p': p_floor, 'underpowered': underpowered, 'resolution_limited': resolution_limited, 'within_seed_noise': within_seed_noise, 'significant': significant, 'incomplete_pairs': (not complete_pairs), 'effect_vs_noise': verdict,
             'unit': 'seed', 'assumption': _assumption, 'sign_counts': _sign,
             'n_nonzero': n_nonzero,
-            'p_wilcoxon': _wil.get('p'), 'p_wilcoxon_method': _wil.get('method'),
+            'p_wilcoxon': _wil_p, 'p_wilcoxon_method': _wil.get('method'),
             'ci95_paired_bootstrap': _paired_ci, 'ci95_unpaired_bootstrap': _unpaired_ci,
             'prediction_interval_95': _pred.get('prediction_interval'),
             'prob_new_seed_same_sign': _pred.get('prob_same_sign'),

@@ -1,4 +1,61 @@
 
+def _pooled_nll_ratio(nlls, nts):
+    """``sum(nll) / sum(tokens)`` without overflowing either total.
+
+    ``nll_sum`` values are finite floats and token counts are exact integers,
+    so at scale-up sizes the raw NLL sum can overflow and an int total beyond
+    float64 cannot even be converted.  The ratio itself is still representable
+    in that regime: normalise the NLLs by their largest magnitude and the
+    token counts by the largest count, then take the weighted mean.  Ordinary
+    panels never call this path (the caller keeps the historical float totals).
+    """
+    if not nlls or len(nlls) != len(nts):
+        return None
+    try:
+        max_nll = max(abs(float(v)) for v in nlls)
+        max_tok = max(int(v) for v in nts)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(max_nll) or max_tok <= 0:
+        return None
+    if max_nll == 0.0:
+        return 0.0
+    try:
+        # int/int yields a float ratio in [0, 1] even when the operands are
+        # far beyond float64's exponent range.
+        weights = [int(v) / max_tok for v in nts]
+        total_w = math.fsum(weights)
+        if not (math.isfinite(total_w) and total_w > 0.0):
+            return None
+        weighted = math.fsum((float(v) / max_nll) * w
+                             for v, w in zip(nlls, weights))
+        # numerator = max_nll * weighted, denominator = max_tok * total_w.
+        ratio = (max_nll / max_tok) * (weighted / total_w)
+    except (OverflowError, ValueError, ZeroDivisionError):
+        return None
+    return ratio if math.isfinite(ratio) else None
+
+
+def _nll_per_token_ratio(nll, n_tokens):
+    """One finite NLL total divided by one exact token count.
+
+    A token count above float64's exponent range cannot be converted to float
+    by the ordinary division operator, even when the quotient is tiny and
+    representable.  Fall back to the scaled helper only on that path so
+    ordinary records keep their historical division.
+    """
+    try:
+        nt = int(n_tokens)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if nt <= 0:
+        return None
+    try:
+        return float(nll / nt)
+    except (TypeError, ValueError, OverflowError, ZeroDivisionError):
+        return _pooled_nll_ratio([nll], [nt])
+
+
 def _pooled_ppl_from_records(recs, *, estimand=None):
     """Token-pooled PPL: exp(sum NLL / sum N tokens) over all seeds.
 
@@ -21,11 +78,16 @@ def _pooled_ppl_from_records(recs, *, estimand=None):
             return None, None, None
         estimand = next(iter(declared)) if declared else False
     nlls, nts = [], []
+    # Fallback components retain per-row values where a record only carries
+    # row arrays, so an overflowing record-level sum does not erase the
+    # representable pooled ratio.
+    components = []
     for r in recs:
         # When the primary estimate is the nested holdout, the matching
         # accounting is nll_sum_holdout/n_tokens_holdout.  A missing halfword
         # cannot fall back to the full-validation totals: the pooled value and
         # the record's primary PPL would then describe different samples.
+        _from_rows = None
         if bool(estimand) and r.get('ppl_estimation_rows') == 'nested_validation_holdout':
             nll = _finite_scalar(r.get('nll_sum_holdout'))
             nt = _exact_count(r.get('n_tokens_holdout'), minimum=1)
@@ -43,6 +105,12 @@ def _pooled_ppl_from_records(recs, *, estimand=None):
                             and all(v is not None for v in _toks)):
                         nll = float(sum(_vals))
                         nt = int(sum(_toks))
+                        if not math.isfinite(nll):
+                            # Keep the individual rows only when the record
+                            # total itself overflowed; otherwise the totals
+                            # are enough for any later aggregate fallback and
+                            # avoid a second O(rows) copy.
+                            _from_rows = list(zip(_vals, _toks))
         else:
             nll = _finite_scalar(r.get('nll_sum'))
             nt = _exact_count(r.get('n_tokens'), minimum=1)
@@ -50,13 +118,44 @@ def _pooled_ppl_from_records(recs, *, estimand=None):
             return None, None, None
         nlls.append(nll)
         nts.append(nt)
-    total_n, total_t = float(sum(nlls)), float(sum(nts))
-    if total_t <= 0:
+        if _from_rows is None:
+            components.append((nll, nt))
+        else:
+            components.extend(_from_rows)
+    # Keep the token total as an exact Python integer.  Converting it through
+    # float first both rounds sums above 2**53 and raises OverflowError for a
+    # scale-up count beyond float64.
+    exact_total_t = int(sum(nts))
+    if exact_total_t <= 0:
         return None, None, None
-    _pooled = _safe_exp_ppl(total_n / total_t)
+    try:
+        total_t = float(exact_total_t)
+    except OverflowError:
+        total_t = None
+    try:
+        total_n = float(sum(nlls))
+    except OverflowError:
+        total_n = None
+    if (total_n is None or not math.isfinite(total_n)
+            or total_t is None or not math.isfinite(total_t)):
+        # The true pooled ratio can still be representable when one of the
+        # raw totals is not (e.g. three records at 1e308 NLL and 1e308
+        # tokens).  The NLL total is unavailable in that case, but the pooled
+        # PPL and the exact token total are still reportable.  Row-array
+        # records contribute their individual rows here, so a record sum that
+        # overflowed does not hide a representable pooled ratio.
+        ratio = _pooled_nll_ratio([c[0] for c in components],
+                                  [c[1] for c in components])
+        total_n_out = None
+    else:
+        ratio = total_n / total_t
+        total_n_out = total_n
+    if ratio is None or not math.isfinite(ratio):
+        return None, None, None
+    _pooled = _safe_exp_ppl(ratio)
     if _pooled is None or not math.isfinite(_pooled) or _pooled < 1.0:
         return None, None, None
-    return _pooled, total_n, int(total_t)
+    return _pooled, total_n_out, exact_total_t
 
 def _record_primary_ppl(rec):
     """The per-seed PPL on the same rows as the record's primary aggregate.
@@ -81,7 +180,8 @@ def _record_primary_ppl(rec):
         _nll = _finite_scalar(rec.get('nll_sum_holdout'))
         _nt = _exact_count(rec.get('n_tokens_holdout'), minimum=1)
         if _nll is not None and _nt is not None:
-            _v = _safe_exp_ppl(_nll / _nt)
+            _ratio = _nll_per_token_ratio(_nll, _nt)
+            _v = _safe_exp_ppl(_ratio) if _ratio is not None else None
             return _v if ppl_is_usable(_v) else None
         _rn = rec.get('nll_per_row_holdout')
         _rt = rec.get('n_tokens_per_row_holdout')
@@ -93,7 +193,13 @@ def _record_primary_ppl(rec):
                     and all(v is not None for v in _toks)):
                 _tot_t = int(sum(_toks))
                 if _tot_t > 0:
-                    _v = _safe_exp_ppl(float(sum(_vals)) / _tot_t)
+                    _ratio = _nll_per_token_ratio(sum(_vals), _tot_t)
+                    if _ratio is None or not math.isfinite(_ratio):
+                        # The row-level sum overflowed although the per-row
+                        # values and their weighted ratio are finite.
+                        _ratio = _pooled_nll_ratio(_vals, _toks)
+                    _v = (_safe_exp_ppl(_ratio)
+                          if _ratio is not None else None)
                     return _v if ppl_is_usable(_v) else None
         return None
     _v = _finite_scalar(rec.get('ppl'))

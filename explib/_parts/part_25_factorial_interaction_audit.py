@@ -1163,13 +1163,54 @@ def dose_response_trend(levels, *, direction, alpha=0.05, min_n=3,
         out['status'] = 'invalid'
         out['violations'].append('doses have zero spread; a trend slope is undefined')
         return out
+    # An arbitrary finite metric panel near the float limit can overflow the
+    # raw OLS mean/deviation arithmetic even though the true per-seed slope is
+    # representable.  Normalise only that extreme path; ordinary panels keep
+    # the historical NumPy arithmetic bit-for-bit.
+    _y_abs_max = max((abs(vals_by_level[r['label']][s])
+                      for s in complete for r in rows), default=0.0)
+    _y_extreme = bool(math.isfinite(_y_abs_max) and _y_abs_max > 0.0
+                      and (_y_abs_max < 1e-100 or _y_abs_max > 1e100))
     slopes = []
     for s in complete:
         y = np.asarray([vals_by_level[r['label']][s] for r in rows], dtype=float)
-        slopes.append(float(((xc) * (y - float(y.mean()))).sum() / sxx))
-    stats = paired_effect_stats(slopes, alpha=alpha, min_n=min_n, seeds=complete)
+        if _y_extreme:
+            y_work = y / _y_abs_max
+            y_mean = _scaled_mean_or_raw(y_work)
+            if y_mean is None or not math.isfinite(float(y_mean)):
+                slopes.append(None)
+                continue
+            slope = (float(((xc) * (y_work - float(y_mean))).sum() / sxx)
+                     * _y_abs_max)
+        else:
+            y_mean = _scaled_mean_or_raw(y)
+            if y_mean is None or not math.isfinite(float(y_mean)):
+                slopes.append(None)
+                continue
+            slope = float(((xc) * (y - float(y_mean))).sum() / sxx)
+        slopes.append(float(slope) if math.isfinite(slope) else None)
+    slope_seeds = [s for s, v in zip(complete, slopes) if v is not None]
+    slope_values = [v for v in slopes if v is not None]
+    if len(slope_values) < len(complete):
+        for s, v in zip(complete, slopes):
+            if v is None:
+                out['excluded_seeds'].append({
+                    'seed': s,
+                    'reason': ('per-seed trend slope is not representable as '
+                               'a finite float')})
+    out['per_seed_slopes'] = {
+        str(s): float(v) for s, v in zip(complete, slopes) if v is not None}
+    if not slope_values:
+        out['status'] = 'not_estimable'
+        out['verdict'] = 'not_estimable'
+        out['slope_stats'] = None
+        out['warnings'].append(
+            'no per-seed trend slope is representable as a finite float; the '
+            'ordered test cannot be formed')
+        return out
+    stats = paired_effect_stats(slope_values, alpha=alpha, min_n=min_n,
+                                seeds=slope_seeds)
     out['slope_stats'] = stats
-    out['per_seed_slopes'] = {str(s): float(v) for s, v in zip(complete, slopes)}
     mean_slope = stats.get('mean')
     p = stats.get('p_exact_signflip')
     p_f = _finite_scalar(p)
@@ -1188,27 +1229,49 @@ def dose_response_trend(levels, *, direction, alpha=0.05, min_n=3,
     out['direction_match'] = direction_match
     # Adjacent mean steps answer the shape question.  Individual reversals are
     # reported as a seed count; they are not additional hypothesis tests.
+    # Compare values directly instead of subtracting them, so a finite panel
+    # whose adjacent difference exceeds float64 is not misclassified.
     steps = []
     strict_seeds = 0
     for s in complete:
         _all = True
         for i in range(len(rows) - 1):
             a, b = rows[i], rows[i + 1]
-            d = vals_by_level[b['label']][s] - vals_by_level[a['label']][s]
-            _all = _all and (d * sign > 0)
+            _va = vals_by_level[a['label']][s]
+            _vb = vals_by_level[b['label']][s]
+            _all = _all and ((_vb > _va) if sign > 0 else (_vb < _va))
         if _all:
             strict_seeds += 1
     for i in range(len(rows) - 1):
         a, b = rows[i], rows[i + 1]
-        ds = [vals_by_level[b['label']][s] - vals_by_level[a['label']][s]
-              for s in complete]
-        md = float(np.mean(ds))
+        _a_vals = [vals_by_level[a['label']][s] for s in complete]
+        _b_vals = [vals_by_level[b['label']][s] for s in complete]
+        ds = [bv - av for av, bv in zip(_a_vals, _b_vals)]
+        if all(math.isfinite(d) for d in ds):
+            md = _scaled_mean_or_raw(ds)
+            if md is not None and not math.isfinite(float(md)):
+                md = None
+        else:
+            # A pairwise difference overflowed even though both level means
+            # are finite; mean(b) - mean(a) is the same estimand and stays
+            # representable in that case.
+            _mb = _scaled_mean_or_raw(_b_vals)
+            _ma = _scaled_mean_or_raw(_a_vals)
+            md = (float(_mb) - float(_ma)
+                  if (_mb is not None and _ma is not None
+                      and math.isfinite(float(_mb))
+                      and math.isfinite(float(_ma)))
+                  else None)
+            if md is not None and not math.isfinite(md):
+                md = None
         steps.append({
             'from': a['label'], 'to': b['label'],
             'dose_gap': float(b['dose'] - a['dose']),
-            'mean_delta': md, 'n': len(ds),
-            'direction_match': bool(md * sign > 0),
-            'zero': bool(abs(md) <= 1e-15),
+            'mean_delta': (None if md is None else float(md)),
+            'n': len(ds),
+            'direction_match': (None if md is None
+                                else bool(float(md) * sign > 0)),
+            'zero': (None if md is None else bool(abs(float(md)) <= 1e-15)),
         })
     all_steps = bool(steps) and all(step['direction_match'] for step in steps)
     out['monotonicity'] = {
@@ -1220,13 +1283,28 @@ def dose_response_trend(levels, *, direction, alpha=0.05, min_n=3,
         'strict_monotone_seed_fraction': (float(strict_seeds) / len(complete)
                                           if complete else None),
     }
+    _first_vals = [vals_by_level[rows[0]['label']][s] for s in complete]
+    _last_vals = [vals_by_level[rows[-1]['label']][s] for s in complete]
+    _ep_diffs = [lv - fv for fv, lv in zip(_first_vals, _last_vals)]
+    if all(math.isfinite(d) for d in _ep_diffs):
+        _ep_mean = _scaled_mean_or_raw(_ep_diffs)
+        if _ep_mean is not None and not math.isfinite(float(_ep_mean)):
+            _ep_mean = None
+    else:
+        _last_mean = _scaled_mean_or_raw(_last_vals)
+        _first_mean = _scaled_mean_or_raw(_first_vals)
+        _ep_mean = (float(_last_mean) - float(_first_mean)
+                    if (_last_mean is not None and _first_mean is not None
+                        and math.isfinite(float(_last_mean))
+                        and math.isfinite(float(_first_mean)))
+                    else None)
+        if _ep_mean is not None and not math.isfinite(_ep_mean):
+            _ep_mean = None
     out['endpoint_delta'] = {
-        'first_to_last_mean': float(np.mean(
-            [vals_by_level[rows[-1]['label']][s] - vals_by_level[rows[0]['label']][s]
-             for s in complete])),
-        'per_seed': {str(s): float(vals_by_level[rows[-1]['label']][s]
-                                   - vals_by_level[rows[0]['label']][s])
-                     for s in complete},
+        'first_to_last_mean': (None if _ep_mean is None else float(_ep_mean)),
+        'per_seed': {
+            str(s): (float(lv - fv) if math.isfinite(lv - fv) else None)
+            for s, fv, lv in zip(complete, _first_vals, _last_vals)},
     }
     raw_sig = bool(p is not None and p < alpha)
     if out['n_complete_seeds'] < min_n:

@@ -130,7 +130,16 @@ def _traj_slope(points, *, unit=1000.0):
     # the differences exact and finite even when the label itself exceeds the
     # float64 exponent range.
     base = int(points[0][0])
-    xs = np.asarray([float(int(p[0]) - base) for p in points], dtype=float)
+    offsets = [int(p[0]) - base for p in points]
+    # A step label is an exact integer, so the offsets above survive labels
+    # beyond 2**53.  Their SPAN can still exceed the float64 exponent range
+    # (e.g. a synthetic look at step 10**400); converting such an offset to
+    # float raises OverflowError, which would crash the whole stability block.
+    # A slope over an unrepresentable step axis is unavailable, not infinite.
+    try:
+        xs = np.asarray([float(offset) for offset in offsets], dtype=float)
+    except (OverflowError, ValueError):
+        return None
     ys = np.asarray([float(p[1]) for p in points], dtype=float)
     xm = float(np.mean(xs))
     ym = float(np.mean(ys))

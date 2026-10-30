@@ -785,7 +785,15 @@ def scale_interaction(low_effects, high_effects, *, low_label='low', high_label=
             # seed instead of calling the surviving subset a complete panel.
             diff.append(float('nan'))
             continue
-        diff.append(fy - fx)
+        delta = fy - fx
+        if not math.isfinite(delta):
+            # Both endpoints are finite, but their difference is beyond
+            # float64.  That pair is unmeasured, not a +inf effect: keep its
+            # position (so the panel stays incomplete) and do not report its
+            # seed as kept.  Otherwise `n` and the reported `seeds` disagree.
+            diff.append(float('nan'))
+            continue
+        diff.append(delta)
         kept.append(s)
     st = paired_effect_stats(diff, alpha=alpha, min_n=min_n, seeds=ss)
     # `significant` on the underlying paired test only speaks about alpha and

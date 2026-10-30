@@ -248,3 +248,98 @@ def test_scaling_trend_withholds_unrepresentable_slope_but_keeps_direction():
     assert math.isfinite(rep['heterogeneity_paired']['p'])
     json.dumps(rep, allow_nan=False)
 
+
+def test_scale_interaction_overflowing_pair_does_not_report_a_kept_seed():
+    # Both endpoints are finite, but their difference is beyond float64.  The
+    # pair is unavailable; `n` and the reported `seeds` must agree (the old
+    # bookkeeping kept the seed while paired_effect_stats dropped its value).
+    rep = L.scale_interaction([-1.7e308, 0.0, 1.0], [1.7e308, 1.0, 2.0])
+    assert rep['n'] == len(rep['seeds']) == 2, rep
+    assert rep['n_dropped'] == 1 and rep['complete_pairs'] is False, rep
+    json.dumps(rep, allow_nan=False)
+
+
+def test_zero_paired_panel_has_a_json_safe_wilcoxon_field():
+    # A signed-rank test has no rank distribution when every delta is zero.
+    # The old NaN sentinel made a perfectly valid all-zero panel impossible to
+    # serialise with allow_nan=False.
+    rep = L.paired_effect_stats([0.0] * 3)
+    assert rep['p_exact_signflip'] == 1.0, rep
+    assert rep['p_wilcoxon'] is None, rep
+    json.dumps(rep, allow_nan=False)
+
+
+def test_trajectory_step_span_beyond_float64_withholds_slope_only():
+    # Step labels are exact integers and may exceed float64.  A synthetic
+    # look at 10**400 must not raise OverflowError while converting the OLS
+    # x-axis; the slope becomes unavailable and the rest of the block survives.
+    huge = 10 ** 400
+    with_hist = {0: [(0, 1.0), (huge, 2.0), (huge + 1, 3.0)]}
+    without_hist = {0: [(0, 1.0), (huge, 1.5), (huge + 1, 2.0)]}
+    rep = L.paired_trajectory_stability(with_hist, without_hist,
+                                        primary_delta=0.1)
+    assert rep['status'] == 'stable', rep
+    for key in ('tail_slope_log_per_1k_with',
+                'tail_slope_log_per_1k_without',
+                'tail_gap_slope_log_per_1k'):
+        assert rep[key] is None, (key, rep)
+    json.dumps(rep, allow_nan=False)
+
+
+def test_dose_response_extreme_adjacent_steps_are_strict_json():
+    # Adjacent differences can overflow even though each level mean is finite.
+    # Report the unavailable step as None (not inf/NaN) and keep the endpoint
+    # difference, which is representable because the two level means coincide.
+    levels = [
+        {'label': 'l1', 'dose': 1,
+         'values': {0: 1.7e308, 1: 1.5e308, 2: 1.6e308}},
+        {'label': 'l2', 'dose': 2,
+         'values': {0: -1.7e308, 1: -1.5e308, 2: -1.6e308}},
+        {'label': 'l3', 'dose': 3,
+         'values': {0: 1.7e308, 1: 1.5e308, 2: 1.6e308}},
+    ]
+    rep = L.dose_response_trend(levels, direction='increasing', min_n=2)
+    for step in rep['monotonicity']['adjacent_steps']:
+        assert step['mean_delta'] is None, step
+        assert step['direction_match'] is None, step
+        assert step['zero'] is None, step
+    assert rep['endpoint_delta']['first_to_last_mean'] == 0.0, rep
+    assert all(v == 0.0 for v in
+               rep['endpoint_delta']['per_seed'].values()), rep
+    for value in rep['per_seed_slopes'].values():
+        assert math.isfinite(float(value)), rep
+    json.dumps(rep, allow_nan=False)
+
+
+def test_pooled_ppl_survives_totals_beyond_float64():
+    # Every record is finite, but the NLL total overflows and the exact token
+    # total is beyond float64.  The pooled per-token ratio (1.0) is still
+    # representable: the old path raised OverflowError converting the token
+    # total, and the NLL total was inf.
+    huge = 10 ** 308
+    recs = [{'nll_sum': 1e308, 'n_tokens': huge} for _ in range(3)]
+    pooled, nll_total, tok_total = L._pooled_ppl_from_records(recs)
+    assert math.isclose(pooled, math.e, rel_tol=1e-15), pooled
+    assert nll_total is None, nll_total
+    assert tok_total == 3 * huge and isinstance(tok_total, int), tok_total
+    json.dumps([pooled, nll_total])
+
+    # The same holds when the record carries only per-row arrays: their sums
+    # overflow, but the row-weighted ratio is representable.
+    nested = {'ppl_estimation_rows': 'nested_validation_holdout',
+              'nll_per_row_holdout': [1e308, 1e308],
+              'n_tokens_per_row_holdout': [huge, huge]}
+    pooled, nll_total, tok_total = L._pooled_ppl_from_records([nested])
+    assert math.isclose(pooled, math.e, rel_tol=1e-15), pooled
+    assert nll_total is None and tok_total == 2 * huge, (nll_total, tok_total)
+
+    # A finite token total above 2**53 must stay exact instead of being
+    # rounded through float64.
+    n_big = 2 ** 53 + 1
+    pooled, _nll, tok_total = L._pooled_ppl_from_records(
+        [{'nll_sum': 1e-300, 'n_tokens': n_big} for _ in range(2)])
+    assert tok_total == 2 * n_big, tok_total
+    assert pooled == 1.0, pooled
+
+
+

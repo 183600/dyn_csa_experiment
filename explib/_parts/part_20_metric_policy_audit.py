@@ -73,6 +73,7 @@ def metric_policy_audit(summary=None, policy=None):
         _lm_bad = []
         _lm_checked = 0
         for _r in lm:
+            _row_vals = _row_toks = None
             _nested = (_r.get('ppl_estimation_rows') == 'nested_validation_holdout')
             # Never mix the full-validation totals with a holdout primary
             # estimate.  If a nested record lacks either holdout total, use
@@ -95,11 +96,18 @@ def metric_policy_audit(summary=None, policy=None):
                     _toks = [_exact_count(x, minimum=0) for x in _rt]
                     if all(v is not None for v in _vals) and all(t is not None for t in _toks) and sum(_toks) > 0:
                         _nll, _ntok = float(sum(_vals)), int(sum(_toks))
+                        _row_vals, _row_toks = list(_vals), list(_toks)
             if _nll is None or _ntok is None:
                 continue
             _lm_checked += 1
-            _want = _safe_exp_ppl(_nll / _ntok)
-            if not math.isfinite(float(_want)):
+            _ratio = _nll_per_token_ratio(_nll, _ntok)
+            if ((_ratio is None or not math.isfinite(_ratio))
+                    and _row_vals is not None):
+                # A per-row sum can overflow while the row-weighted ratio is
+                # finite; recover it from the individual rows.
+                _ratio = _pooled_nll_ratio(_row_vals, _row_toks)
+            _want = _safe_exp_ppl(_ratio) if _ratio is not None else None
+            if _want is None or not math.isfinite(float(_want)):
                 _lm_bad.append(_r.get('variant') or _r.get('name') or '?')
                 continue
             # Compare against the PPL on the SAME rows as the accounting
