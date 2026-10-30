@@ -33,6 +33,7 @@ _PARTS = [
 'part_16_audit_length_position.py',
 'part_17_audit_practical.py',
 'part_18_audit_family_correction.py',
+'part_19_audit_environment_identity.py',
 ]
 
 _load_parts(globals(), _HERE, _PARTS)

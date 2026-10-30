@@ -307,8 +307,29 @@ def _repro_environment_dimension(original, rerun):
             value = rec['hyperparams'].get('exec_fp')
         return value
 
-    return _repro_dimension('environment', [
-        _repro_field('exec_fp', _fp(original), _fp(rerun), required=True)])
+    def _fp_v2(rec):
+        value = rec.get('env_fp_v2')
+        if value is None and isinstance(rec.get('hyperparams'), dict):
+            value = rec['hyperparams'].get('env_fp_v2')
+        return value
+
+    fields = [_repro_field('exec_fp', _fp(original), _fp(rerun), required=True)]
+    a2, b2 = _fp_v2(original), _fp_v2(rerun)
+    notes = []
+    if a2 is not None or b2 is not None:
+        # Present on at least one side: compare it.  A one-sided value is
+        # unverified, never an inferred match (the digests were computed by
+        # different provenance generations).
+        fields.append(_repro_field('env_fp_v2', a2, b2))
+        if a2 is None or b2 is None:
+            notes.append('one record predates env_fp_v2; the strict '
+                         'lock-pinned environment identity cannot be compared '
+                         'and this dimension stays unverified')
+    else:
+        notes.append('both records predate env_fp_v2; only the legacy '
+                     'six-package exec_fp is compared (transitive pins, the '
+                     'lock bytes and the OS/driver block are unverified)')
+    return _repro_dimension('environment', fields, notes=notes)
 
 
 def _repro_initialization_dimension(original, rerun):

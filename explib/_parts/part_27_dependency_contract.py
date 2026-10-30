@@ -21,6 +21,7 @@ def dependency_contract(lock_path=None):
                 'lock_path': os.path.abspath(str(lock_path or 'requirements.lock')),
                 'lock_sha256': None, 'n_pinned': 0, 'options': [],
                 'mismatches': [], 'missing': [], 'unpinned_installed': [],
+                'pinned_installed': {},
                 'interpreter': _interpreter_contract(),
                 'invalid': [f'could not read the lock: {type(e).__name__}: {e}'],
                 'status': 'invalid',
@@ -28,6 +29,7 @@ def dependency_contract(lock_path=None):
     out = {'kind': 'dependency_contract', 'lock_path': parsed['path'],
            'lock_sha256': parsed['sha256'], 'n_pinned': len(parsed['pins']),
            'options': parsed['options'], 'mismatches': [], 'missing': [],
+           'pinned_installed': {},
            'interpreter': _interpreter_contract(parsed.get('environment')),
            'invalid': list(parsed['invalid']), 'unpinned_installed': [],
            'status': 'ok', 'note': ''}
@@ -55,6 +57,14 @@ def dependency_contract(lock_path=None):
         return out
     for name, ent in sorted(parsed['pins'].items()):
         got = installed.get(name)
+        # `pinned_installed` is the exact lock-declared stack this process
+        # actually has.  It is the material `environment_fingerprint_v2`
+        # hashes: the legacy `exec_fp` covers only six direct packages, so a
+        # transitive numerical dependency (or a transitive pin resolving to a
+        # different wheel) could otherwise collide while the environment is
+        # different.  A missing pin is recorded as null, never dropped: an
+        # absent distribution is part of the environment identity.
+        out['pinned_installed'][name] = None if got is None else str(got)
         if got is None:
             out['missing'].append({'name': ent['name'], 'expected': ent['version']})
         elif str(got) != str(ent['version']):
@@ -147,6 +157,163 @@ def _invocation_identity(argv=None):
     }
 
 
+ENVIRONMENT_FP_SCHEMA = 2
+
+
+def _os_stack_identity():
+    """OS / kernel / C library / driver identity not captured by wheel pins.
+
+    ``platform.platform()`` is deliberately not enough: two boxes can report
+    the same Python and wheel versions while differing in the kernel, libc or
+    NVIDIA driver, and the last two can change numerical kernels.  Every probe
+    is best-effort and returns ``None`` rather than raising, because this block
+    is provenance, not a gate: a missing value must stay visibly unverified
+    instead of crashing a run or being filled with a guessed placeholder.
+    """
+    import platform
+    libc_name = libc_version = None
+    try:
+        libc_name, libc_version = platform.libc_ver()
+    except Exception:
+        pass
+    driver = os.environ.get('NVIDIA_DRIVER_VERSION') or None
+    if driver is None:
+        # Linux exposes the loaded NVIDIA kernel module here; on other
+        # platforms the absence is expected and stays None.
+        try:
+            with open('/proc/driver/nvidia/version', encoding='utf-8',
+                      errors='replace') as fh:
+                line = fh.readline().strip()
+            driver = line or None
+        except OSError:
+            driver = None
+    cpu_model = None
+    try:
+        with open('/proc/cpuinfo', encoding='utf-8', errors='replace') as fh:
+            for line in fh:
+                if line.lower().startswith('model name'):
+                    cpu_model = line.split(':', 1)[1].strip() or None
+                    break
+    except OSError:
+        pass
+    return {
+        'system': platform.system() or None,
+        'release': platform.release() or None,
+        'version': platform.version() or None,
+        'machine': platform.machine() or None,
+        'libc_name': libc_name or None,
+        'libc_version': libc_version or None,
+        'cpu_model': cpu_model or platform.processor() or None,
+        'nvidia_driver': driver,
+    }
+
+
+def environment_fingerprint_v2(env=None):
+    """Strict identity of the *declared* numerical stack of a process.
+
+    Why a second fingerprint next to ``execution_fingerprint`` (``exec_fp``):
+    the legacy digest hashes only the six direct packages in
+    ``_dependency_fingerprint``.  ``requirements.lock`` pins the full
+    transitive closure, so two runs can differ in a transitive numerical
+    package (or in a pin that resolved to a different wheel) and still share
+    ``exec_fp``.  The cross-run reproduction comparator would then report the
+    environment as "matching" when the actual stack differed.
+
+    ``env_fp_v2`` hashes, without any host/process identity:
+
+    * the lock bytes (``lock_sha256``), so a changed declaration is visible
+      even when the current install still satisfies it;
+    * every lock-pinned distribution and its installed version (a missing pin
+      stays ``null``);
+    * the interpreter/platform contract and the OS/kernel/libc/driver block;
+    * torch/numpy/CUDA/cuDNN builds, GPU model + compute capability, precision
+      flags, determinism flags and CPU thread counts.
+
+    Hostname, process id, working directory, ``CUDA_VISIBLE_DEVICES`` (a
+    scheduling choice, not a stack identity) and per-run hash seeds are
+    excluded, so two executions on the same declared stack produce the same
+    digest.  Unpinned *tooling* is excluded too: installing a linter must not
+    look like an environment change.  The result is a 16-hex digest for
+    consistency with ``exec_fp``; it is an identity, not a security hash.
+    """
+    env = environment_snapshot() if env is None else env
+    if not isinstance(env, dict):
+        raise TypeError(
+            f'environment_fingerprint_v2: env must be a mapping, got {type(env).__name__}')
+    contract = env.get('dependency_contract')
+    if not isinstance(contract, dict):
+        contract = dependency_contract()
+    pinned = contract.get('pinned_installed')
+    if not isinstance(pinned, dict):
+        # A caller may hand in an older snapshot whose contract predates
+        # `pinned_installed`; recompute rather than silently hashing an empty
+        # stack (which would make every such process look identical).  Reuse
+        # the recorded lock path so a custom-lock snapshot is not silently
+        # re-identified against the default requirements.lock.
+        contract = dependency_contract(contract.get('lock_path'))
+        pinned = contract.get('pinned_installed')
+        if not isinstance(pinned, dict):
+            pinned = {}
+    gpus = []
+    for gpu in env.get('gpu_identity') or []:
+        if not isinstance(gpu, dict):
+            continue
+        gpus.append({k: gpu.get(k) for k in
+                     ('name', 'major', 'minor', 'total_memory_bytes')})
+    os_identity = env.get('os_identity')
+    if not isinstance(os_identity, dict):
+        os_identity = _os_stack_identity()
+    interpreter = contract.get('interpreter')
+    if not isinstance(interpreter, dict):
+        interpreter = {}
+    missing_or_mismatched = bool(contract.get('missing') or contract.get('mismatches')
+                                 or contract.get('invalid'))
+    fields = {
+        'schema': ENVIRONMENT_FP_SCHEMA,
+        'lock_sha256': contract.get('lock_sha256'),
+        'lock_complete': bool(contract.get('lock_sha256') and not missing_or_mismatched),
+        'n_pinned': contract.get('n_pinned'),
+        'pinned': {name: pinned[name] for name in sorted(pinned)},
+        'interpreter': {
+            'declared': interpreter.get('declared') or {},
+            'actual': interpreter.get('actual') or {},
+            'status': interpreter.get('status'),
+        },
+        'os': os_identity,
+        'python': env.get('python'),
+        'platform': env.get('platform'),
+        'machine': env.get('machine'),
+        'processor': env.get('processor'),
+        'cpu_count': env.get('cpu_count'),
+        'torch': env.get('torch'),
+        'torch_git_version': env.get('torch_git_version'),
+        'numpy': env.get('numpy'),
+        'tokenizers': env.get('tokenizers'),
+        'datasets': env.get('datasets'),
+        'tensorflow': env.get('tensorflow'),
+        'cuda_available': env.get('cuda_available'),
+        'cuda_version': env.get('cuda_version'),
+        'cudnn_version': env.get('cudnn_version'),
+        'cuda_device_count': env.get('cuda_device_count'),
+        'gpus': gpus,
+        'determinism': env.get('determinism'),
+        'cudnn_deterministic': env.get('cudnn_deterministic'),
+        'cudnn_benchmark': env.get('cudnn_benchmark'),
+        'deterministic_algorithms': env.get('deterministic_algorithms'),
+        'tf32_matmul': env.get('tf32_matmul'),
+        'tf32_cudnn': env.get('tf32_cudnn'),
+        'fp16_reduced_precision_reduction': env.get('fp16_reduced_precision_reduction'),
+        'bf16_reduced_precision_reduction': env.get('bf16_reduced_precision_reduction'),
+        'float32_matmul_precision': env.get('float32_matmul_precision'),
+        'cublas_workspace_config': env.get('cublas_workspace_config'),
+        'cpu_threads': env.get('cpu_threads'),
+        'cpu_interop_threads': env.get('cpu_interop_threads'),
+    }
+    blob = json.dumps(fields, sort_keys=True, separators=(',', ':'),
+                      ensure_ascii=True, default=str)
+    return hashlib.sha256(blob.encode('utf-8')).hexdigest()[:16]
+
+
 def environment_snapshot():
     """Compact software/hardware snapshot for experiment tracking."""
     import platform
@@ -209,6 +376,11 @@ def environment_snapshot():
             env[_key] = __import__(_mod).__version__
         except Exception:
             env[_key] = None
+    # OS-level identity is recorded separately from the digest so an auditor
+    # can see which field changed; `env_fp_v2` binds the same block (and the
+    # full lock-pinned stack) into one comparable value.
+    env['os_identity'] = _os_stack_identity()
+    env['env_fp_v2'] = environment_fingerprint_v2(env)
     return env
 
 def execution_fingerprint(env=None):
@@ -260,18 +432,44 @@ def execution_fingerprint(env=None):
     blob = json.dumps(fields, sort_keys=True, default=str, ensure_ascii=True)
     return hashlib.sha256(blob.encode('utf-8')).hexdigest()[:16]
 
+def _environment_fp_v2(rec):
+    """Read the strict environment digest from a record, if it carries one."""
+    if not isinstance(rec, dict):
+        return None
+    value = rec.get('env_fp_v2')
+    if value is None and isinstance(rec.get('hyperparams'), dict):
+        value = rec['hyperparams'].get('env_fp_v2')
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
 def execution_environment_reason(ra, rb):
     """Why two records cannot attest same-environment replication, or None.
 
     Both-present is required for a verdict; legacy records without the digest
     keep the historical permissive path.  This is only about the execution
     environment, not the seed, data or recipe (those have their own gates).
+
+    The strict ``env_fp_v2`` digest is preferred when both sides carry it: it
+    covers every lock-pinned distribution, the lock bytes and the OS/driver
+    block, which the legacy six-package ``exec_fp`` does not.  A one-sided v2
+    digest is not treated as a mismatch here (a seed-completion run may pair
+    with a legacy arm); it stays visible as a warning in the reproduction
+    comparator instead.  When neither side carries v2, the legacy digest is
+    compared exactly as before.
     """
     def _fp(rec):
         v = rec.get('exec_fp')
         if v is None and isinstance(rec.get('hyperparams'), dict):
             v = rec['hyperparams'].get('exec_fp')
         return v
+    a2, b2 = _environment_fp_v2(ra), _environment_fp_v2(rb)
+    if a2 is not None and b2 is not None and a2 != b2:
+        return (f'different declared environment (env_fp_v2 {a2[:12]}… vs '
+                f'{b2[:12]}…): lock-pinned packages, interpreter or OS/driver '
+                'stack differ; same-seed replication is not controlled')
     a, b = _fp(ra), _fp(rb)
     ha = a is not None and str(a) != ''
     hb = b is not None and str(b) != ''
@@ -434,6 +632,7 @@ def run_hyperparameters(cfg, *, seed, d, n_layers, n_heads, d_head, vocab, mlp_r
         'mlp_ratio': float(mlp_ratio),
         'dataset': cfg.get('dataset') or 'wikitext',
         'exec_fp': execution_fingerprint(),
+        'env_fp_v2': environment_fingerprint_v2(),
         'train_knobs': training_knobs(amp_dtype=amp_dtype, eager_batch=eager_batch),
         'determinism': {
             'level': determinism_label(),
@@ -569,6 +768,7 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reprodu
                     'final_loss_smoothed': rec.get('final_loss_smoothed'),
                     'rng_fp': rec.get('rng_fp'),
                     'exec_fp': rec.get('exec_fp'),
+                    'env_fp_v2': rec.get('env_fp_v2'),
                     'data_fp': rec.get('data_fp'),
                     'val_fp': rec.get('val_fp'),
                     'data_version': rec.get('data_version') or prov.get('data', {}).get('data_version'),
@@ -651,6 +851,11 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reprodu
         'with_hyperparams': sum(1 for c in cells.values() if c.get('hyperparams')),
         'with_rng_fp': sum(1 for c in cells.values() if c.get('rng_fp')),
         'with_exec_fp': sum(1 for c in cells.values() if c.get('exec_fp')),
+        # Additive coverage count, deliberately NOT part of `complete`: an
+        # older panel without the strict digest is still a legacy measurement,
+        # not an incomplete one.  New panels must expose the count so a silent
+        # loss of the field is visible.
+        'with_env_fp_v2': sum(1 for c in cells.values() if c.get('env_fp_v2')),
         'with_data_version': sum(1 for c in cells.values() if c.get('data_version')),
         'with_curve': sum(1 for c in cells.values() if (c.get('curve_summary') or {}).get('n_points')),
         'with_curve_hash': sum(1 for c in cells.values() if c.get('curve_sha256')),

@@ -9485,3 +9485,128 @@ frozen 配置 fail-closed；缺 level/未排程/改名副本/多改一个键/重
 声明错 mode/删声明/额外 cfg 旋钮全部 refuse；`audit_gate_controls` 与
 `single_factor` 的 gate/initialization 块均为 `ok`，`report` 含
 `gate_controls`。相关既有测试与完整 CPU 套件在本轮最终树通过。
+
+## 110. 六包指纹不是环境身份：全 lock 栈 `env_fp_v2` 与跨代比较（本轮可复现性/工程规范硬化）
+
+零 GPU 的可复现性硬化；不新增训练、不读取 test split、不修改
+`confirmation_frozen*.json` 的字节/种子/端点/α/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未删除或移动。
+
+### 110.1 问题：`exec_fp` 只覆盖六个包，锁的传递闭包没有进入记录
+
+`execution_fingerprint()`（`exec_fp`）是配对门和复现比较器共用的环境身份。
+它把解释器、平台、torch/numpy、CUDA/cuDNN、GPU 型号/算力、精度策略、
+determinism 与线程数纳入哈希，但包版本只来自
+`_dependency_fingerprint()` 的六个名字：`torch`、`numpy`、`tokenizers`、
+`datasets`、`matplotlib`、`tensorflow`。
+
+`requirements.lock` 实际 pin 了 52 个发行版（含 `pyarrow`、
+`huggingface_hub`、`filelock` 等传递依赖）。因此两次运行可以：
+
+- 在同一 `exec_fp` 下，某个传递 pin 解析到不同 wheel；
+- 在同一 `exec_fp` 下，`requirements.lock` 本身已被改写（但当前安装仍满足
+  旧记录的子集）；
+- 在同一 `exec_fp` 下，OS/kernel/libc 或 NVIDIA driver 已变化；
+
+而 `execution_environment_reason()` 仍把两条记录判为同一环境，
+`reproduce compare` 的 `environment` 维度仍显示 `match`。这不是「数值一定
+变了」，而是「环境身份没有覆盖那些能改变数值的声明」。`audit_dependencies`
+能检查**当前进程**是否满足锁，但它不检查**落盘记录**的环境，也无法在另一台
+机器上重建当时的栈。
+
+### 110.2 方法：`env_fp_v2` 绑定完整声明栈
+
+新增 `exp_lib.ENVIRONMENT_FP_SCHEMA = 2`、
+`exp_lib.environment_fingerprint_v2(env=None)` 与
+`exp_lib._os_stack_identity()`。v2 摘要的输入是：
+
+1. **锁字节**：`requirements.lock` 的 `sha256`（声明变化即使当前安装仍满足
+   旧 pin 也可检出），以及 `lock_complete`（无 missing/mismatch/invalid）。
+2. **全部 lock pin 的实际版本**：`dependency_contract()` 新增
+   `pinned_installed`，逐条记录锁中每个发行版的已安装版本；缺失的 pin 记为
+   `null`，不从身份中删除。`n_pinned` 同时进入摘要。
+3. **解释器/平台契约**：锁声明的 `python-version` /
+   `python-implementation` / `platform` 与运行值、以及契约 `status`。
+4. **OS/kernel/libc/driver**：`platform.system()/release()/version()`、
+   libc 名称/版本、CPU model、`/proc/driver/nvidia/version`（或
+   `NVIDIA_DRIVER_VERSION`）的首行。所有探针 best-effort，缺失写 `null`，
+   不猜测。
+5. **数值栈**：torch/numpy/tokenizers/datasets/tensorflow 版本、
+   torch git version、CUDA/cuDNN、GPU 型号/算力/显存、TF32/fp16/bf16
+   精度开关、`float32_matmul_precision`、`CUBLAS_WORKSPACE_CONFIG`、
+   determinism 级别、CPU/inter-op 线程数。
+
+**刻意排除**：hostname、PID、工作目录、`CUDA_VISIBLE_DEVICES`（调度选择，
+不是栈身份）、进程级 `PYTHONHASHSEED`/`CSA_*` 运行开关（属于每次运行，不是
+机器栈）、以及不参与数值的未 pin 工具（`pip`/`setuptools`/`wheel`/`ruff`
+等）。因此同一台机器的两次执行得到同一摘要，换机器/换锁/换驱动/换精度策略
+得到不同摘要。摘要为 16 个十六进制字符，与 `exec_fp` 一致；它是身份，不是
+密码学安全哈希。
+
+### 110.3 接线：记录、配对与复现比较
+
+- **记录**：`environment_snapshot()` 末尾写入 `os_identity` 与
+  `env_fp_v2`；训练记录（`explib/_parts/part_29_ledger_curve.py`）在每个
+  cell 顶层写 `env_fp_v2`；`run_hyperparameters()` 同样写入，供
+  synthesized/curve 记录使用；`write_run_manifest()` 的 cell 复制该字段，
+  `integrity` 新增 `with_env_fp_v2` 计数。
+- **配对门**：`execution_environment_reason()` 在两侧都有
+  `env_fp_v2` 时优先比较它，差异返回
+  `different declared environment (env_fp_v2 …)`；一侧缺失时**不**因此
+  拒绝配对（seed completion 可能与旧臂配对），继续走旧 `exec_fp` 路径。
+  两侧都缺失时保持历史行为。
+- **复现比较**：`_repro_environment_dimension()` 在 `exec_fp` 之外追加
+  `env_fp_v2` 字段。两侧都有则比较；一侧有则 `unverified`，整体
+  `provenance_incomplete`；两侧都无则保留旧 `exec_fp`，并在 `notes` 中
+  明确写「只比较了六包粗指纹，传递 pin/锁字节/OS/driver 未验证」。新记录
+  因此不能被旧的粗指纹「证明」为同环境。
+- **审计**：`audit_gates.py environment_identity`（别名 `environment` /
+  `env_drift` / `declared_environment`）计算本地 v2，并扫描本地
+  `results_*/summary.json` 与 `run_manifest.json` 的逐 cell 摘要。全部
+  匹配为 `ok`；跨机器差异为 `warning`（CPU 审计 GPU 证据本来就应不同，
+  不是复现失败）；没有记录或全部是旧记录为 `not_verifiable_locally`；
+  本地锁契约 mismatch/invalid 追加 warning（该失败由 `dependencies` 门
+  负责）。它并入 `audit_gates.py report` 顶层，`make env-check` 是单命令
+  入口。
+
+### 110.4 边界：v2 是身份，不是复现证明
+
+- `env_fp_v2` 相同只证明**声明栈**相同；它不能证明两次执行的数值逐位相同。
+  数值复现仍由 `reproduction_check` / `seed_contract` / `reproduce compare`
+  的 `metric` 维度负责。
+- 未 pin 的工具版本被排除是故意的：安装 `ruff` 不应让一份训练记录看起来
+  换了环境。若某个未 pin 包实际参与数值，`dependency_contract.status` 会
+  是 `partial`，该警告仍在审计输出中；v2 不会把它伪装成完整契约。
+- 跨机器 `warning` 不是「结果不可信」：GPU 证据在 CPU 审计机上的 v2 必然
+  不同。它只说明「不能在这台机器上声称同环境复现」，需要在原机器或同型号
+  栈上比较。
+- OS 探针在非 Linux 平台返回 `null`（例如没有 `/proc`），这不是错误；同一
+  平台的两次运行仍然一致。驱动字符串包含内核模块版本，驱动升级会改变摘要。
+- 旧记录不回填：没有 `env_fp_v2` 的 cell 保持旧字段与旧结论；新比较会报
+  `provenance_incomplete`，而不是推断当时的环境。
+- 不改变任何 `exec_fp` / `run_cfg` / resume 键 / 冻结清单 / 种子 / α /
+  Holm / `CODE_SEMANTICS`；`env_fp_v2` 是追加身份字段。
+
+### 110.5 入口与验证
+
+```bash
+python -m pytest -q test_review_part_51.py
+make env-check                    # = python audit_gates.py environment_identity
+python audit_gates.py environment # 别名
+python audit_gates.py env_drift   # 别名
+python audit_gates.py report      # 顶层含 environment_identity
+make audit                        # 汇总审计
+```
+
+`test_review_part_51.py` 19 项覆盖：锁的每个 pin 都进入
+`pinned_installed`（缺失记 null 而非删除）；改变一个非六包的传递 pin、
+锁字节、NVIDIA driver、determinism 或线程数都会改变 v2；hostname/PID/
+cwd/argv/hash seed/`CSA_*`/`CUDA_VISIBLE_DEVICES` 不改变 v2；非 mapping
+输入被拒绝；同进程重复调用稳定且为 16 位小写十六进制；配对门优先 v2、
+v2 相同但旧 `exec_fp` 不同仍拒绝、单侧 v2 不误杀；复现比较器逐字段给出
+`match`/`mismatch`/`unverified` 与 `environment_changed`/
+`provenance_incomplete`，旧记录保留粗指纹并写明边界；
+`run_hyperparameters` 与 `environment_snapshot` 一致；审计门在无记录、
+全匹配、跨机器、全旧记录、`run_manifest.json` cell、manifest/summary 去重
+与摘要冲突、synthesized 记录忽略等情形下的状态与计数；`report` 键与 CLI
+别名接线。完整 CPU 套件在本轮最终树通过。

@@ -231,6 +231,11 @@
                报 not_verifiable_locally，不把 git commit 当成源码哈希）
   dependencies 依赖锁契约：requirements.lock 的每条 pin 与已安装版本比对；
                mismatch/missing/invalid 判 fail，partial 给出覆盖率警告
+  environment_identity  声明环境身份：把本地 env_fp_v2（全部 lock pin +
+               lock 字节 + 解释器/平台 + OS/kernel/libc/驱动）与本地
+               results_* 中记录的逐 cell 摘要比对；跨机器差异只 warning，
+               缺记录/旧记录报 not_verifiable_locally，绝不把六包 exec_fp
+               的粗匹配当成同一数值栈（别名 environment / env_drift）
   data_source  上游语料版本：每个 cache meta 是否记录并匹配固定的 Hub commit
                （WikiText-103 / FineWeb-Edu）；train/validation/test 必须同一
                快照；legacy/local 缓存明确报不可验证而非算作干净

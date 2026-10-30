@@ -663,6 +663,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
     _data_audit = audit_token_data(train_ids, val_batch, vocab)
     _rng_fp = rng_fingerprint()
     _exec_fp = execution_fingerprint()
+    _env_fp_v2 = environment_fingerprint_v2()
     _attb_bump_epoch()
     _amp, _ = _resolve_impl_modes({'amp_dtype': amp_dtype, 'eager_batch': False}, device=device)
     _amp_dtype = torch.bfloat16 if _amp == 'bf16' else (torch.float16 if _amp == 'fp16' else None)
@@ -1291,7 +1292,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
     if _n_train > 0:
         _p = min(float(seq_len) / float(_n_train), 1.0)
         _uniq_frac = (1.0 if _p >= 1.0 else float(1.0 - math.exp(_draws * math.log1p(-_p))))
-    result = {'variant': variant, 'seed': seed, 'data_seed': int(_data_seed), 'exec_fp': _exec_fp, 'ppl': ppl, 'params': n_param, 'losses': losses, 'stats': stats, 'steps': steps, 'steps_completed': int(_steps_completed), 'early_stop': _early_stop, 'tokens_seen': _steps_completed * batch_size * seq_len * _world,
+    result = {'variant': variant, 'seed': seed, 'data_seed': int(_data_seed), 'exec_fp': _exec_fp, 'env_fp_v2': _env_fp_v2, 'ppl': ppl, 'params': n_param, 'losses': losses, 'stats': stats, 'steps': steps, 'steps_completed': int(_steps_completed), 'early_stop': _early_stop, 'tokens_seen': _steps_completed * batch_size * seq_len * _world,
               'tokens_seen_unique_estimate': (int(round(_n_train * _uniq_frac)) if _uniq_frac is not None else None),
               'tokens_seen_unique_frac_estimate': _uniq_frac,
               'token_accounting_note': 'tokens_seen counts window draws; unique-token coverage is an estimate under independent uniform window draws, not a measurement',
