@@ -5235,3 +5235,70 @@ seed-level t 区间；按声明的参考层权重（默认等层）标准化逐�
 `_doc_level_analysis` 接线、审计 `ok`/篡改 `fail`/缺块
 `not_verifiable_locally`/bare `not_estimable` `not_applicable`、报告渲染
 与边界段。完整 CPU 套件在本轮最终树通过。
+
+## 2026-10-30 — 平均改善不等于每个单位都改善：逐单位分位、尾部与收益/伤害分解（本轮结果分析硬化，no new runs）
+
+零 GPU 的结果分析硬化；不新增训练、不读取 test split、不修改
+`confirmation_frozen*.json` 的字节/种子/端点/alpha/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未删除或移动。
+
+**Problem.** 主终点是 seed 平均的 token 池化 PPL 差。cluster CI 只描述
+这个均值的评测单位抽样噪声，leave-one-unit-out 只问「删掉一个单位会
+不会翻转」，长度分层只问「换一个长度构成会不会翻转」。三者都没有给出
+**整个单位效应分布**：大多数单位小幅改善、少数单位大幅受损；所有单位
+都小幅改善；改善只发生在长单位而典型单位不变——这三种数据可以有相同
+的均值与显著性，却支持不同的科学结论。把「平均更好」写成「典型单位
+更好」或隐藏受损尾，是结果分析层面的过度概括。
+
+**Fix.** 新增 `exp_lib.UNIT_QUANTILE_POLICY`、
+`unit_quantile_profile(per_seed_nll_diff, n_tokens, ...)` 与
+`paired_nll_quantile_profile(nll_a, nll_b, n_tokens, ...)`。对每个评测
+单位计算 `d=(nll_a−nll_b)/tokens=log(PPL_a/PPL_b)`，先在种子上平均，
+再报告：
+
+- 等权分位轮廓（默认 q=0.05/0.10/0.25/0.50/0.75/0.90/0.95）与
+  **分布无关的顺序统计区间**（二项秩；该 n 无法定界的一侧返回 `null`，
+  不伪造端点）；分位是逐点区间，不是同时区间。
+- 改善比例与**精确 Clopper–Pearson** 区间（平局按未改善计），以及
+  token 加权的改善/变差比例；等权与 token 加权是两个估计量。
+- gross gain/harm：`gross_gain=Σ_{δ<0}|δ|`、`gross_harm=Σ_{δ>0}δ`、
+  `net=gross_gain−gross_harm`、`gain_harm_ratio`/`harm_share`/
+  `net_share`（等权 log 量，不是 token 加权）。
+- 最好/最差 10% 尾均值、`tail_asymmetry=(最差尾−中位数)−(中位数−
+  最好尾)`、最差尾伤害占比、最好尾增益占比、最差/最好单位。
+- 等权均值与 token 池化均值并列，带 `weighting_flips_sign`；主终点仍是
+  token 池化，等权分位只是「典型单位」读数。
+- 逐种子分位范围与逐单位跨种子符号一致/混合计数（描述性，不冒充检验）。
+- 块内存逐种子 NLL 差矩阵、token 数、ids、seeds 与请求分位，供审计
+  端用同一函数重放。
+
+接线：`explib.confirmation._doc_level_analysis` 在 pooled CI、unit
+influence、length strata 之后写入 `doc_sampling.unit_quantile_profile`；
+`REPORT_v12` 在长度分层表后新增「逐单位分布 / 分位敏感性」表；
+`audit_gates.py unit_quantiles`（别名 `unit_quantile` /
+`unit_distribution` / `effect_distribution` / `qte`）校对充分统计量后
+整块重放，并入 `audit_gates.py report` 的顶层 `unit_quantiles`。
+
+**Boundary.** 这是 post-hoc 分布描述，不是第二个确认性检验：不新增
+p 值、不进入冻结 Holm 族、不改变 `p_exact_signflip`/`p_holm`/
+`verified`/`confirmed`。顺序统计区间只覆盖评测单位抽样并条件在已训练
+种子上，假设单位独立且在小 n 时很宽/单侧不可定界；`delta` 是种子平均
+后的单位效应，其离散度仍含残余训练种子噪声（由逐种子分位范围与方差
+分解提示），不是潜在单位异质性的无误差估计；尾部均值与 gross 分解是
+点估计、没有区间。等权分位与 token 池化均值不可互相替换或看到方向后
+挑选。旧产物无法反推分布时审计报 `not_verifiable_locally`，不猜测、
+不重跑。
+
+**Verification.** 新增 `test_review_part_56.py` 14 项：policy/status/
+无确认字段；分位与 `np.quantile` 同口径、顺序统计区间覆盖不低于名义
+水平、n=48 时 5%/95% 分位不可定界侧为 `null`；等权中位数与 token
+池化均值符号相反的 `weighting_flips_sign` 与 token 加权改善比例；
+全改善/全变差/平局的精确 Clopper–Pearson 端点；多数小幅改善 + 少数
+大幅受损时的尾均值/尾不对称/gross 分解；逐种子分位范围与单位级符号
+计数；wrapper 与 `_paired_nll_doc_ci` 同口径、非法输入 fail-closed、
+NLL 差溢出 `not_estimable` 且严格 JSON；`_doc_level_analysis` 落盘；
+审计对合法块 `ok`、篡改分位/充分统计量/`n_units`/seed 集合/夹带
+`confirmed` 判 `fail`、缺块 `not_verifiable_locally`、bare
+`not_estimable` `not_applicable`、非对象工件 `fail`；报告渲染与损坏块
+容错。相关既有套件通过；完整 CPU 套件 1126 passed / 3 skipped
+（本机 DataLoader 环境跳过）。

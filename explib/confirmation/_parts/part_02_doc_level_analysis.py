@@ -162,6 +162,8 @@ def _doc_level_analysis(recs_a, recs_b, common, Ln, primary_deltas=None):
     _unit_influence_reason = None
     _length_strata = None
     _length_strata_reason = None
+    _unit_quantiles = None
+    _unit_quantiles_reason = None
     _two_level_ci = None
     _two_level_ci_reason = None
     _variance_components = None
@@ -246,6 +248,20 @@ def _doc_level_analysis(recs_a, recs_b, common, Ln, primary_deltas=None):
                             _length_strata = None
                             _length_strata_reason = (
                                 f'{type(_lse).__name__}: {_lse}')
+                        # Distribution across units: the pooled mean and every
+                        # significance test are silent about whether the
+                        # improvement is broad, tail-heavy, or carried by the
+                        # longest units.  Report the equal-unit quantile
+                        # profile next to the token-pooled estimand.
+                        try:
+                            _unit_quantiles = L.paired_nll_quantile_profile(
+                                _nll_a, _nll_b, _ref_tok, unit_ids=_unit_ids,
+                                seeds=common)
+                        except (ValueError, TypeError, FloatingPointError,
+                                OverflowError) as _uqe:
+                            _unit_quantiles = None
+                            _unit_quantiles_reason = (
+                                f'{type(_uqe).__name__}: {_uqe}')
                         # Total uncertainty: the cluster CI above conditions on
                         # the trained seeds, so it can be much narrower than the
                         # uncertainty of a result that also samples seeds.  The
@@ -406,6 +422,12 @@ def _doc_level_analysis(recs_a, recs_b, common, Ln, primary_deltas=None):
             out['length_strata_unavailable_reason'] = (
                 _length_strata_reason or
                 'length post-stratification not available for this cell')
+        if _unit_quantiles is not None:
+            out['unit_quantile_profile'] = _unit_quantiles
+        else:
+            out['unit_quantile_profile_unavailable_reason'] = (
+                _unit_quantiles_reason or
+                'unit-effect distribution not available for this cell')
         if _two_level_ci is not None:
             out.update({
                 'pooled_two_level_delta_ppl': _two_level_ci['delta_ppl'],
@@ -1057,6 +1079,165 @@ def _length_strata_markdown(ft):
                 ' 的效应依赖长度构成、极端层差、层间抵消或标准化口径；引用时必须同时报告本表，'
                 '不能把 token 池化结论描述为「对评测文档长度分布稳健」，也不能用等层标准化'
                 '替换主估计。', '']
+    return out
+
+
+def _unit_quantile_markdown(ft):
+    """Render the equal-unit distribution of the paired PPL effect.
+
+    Pure function of the final-test stats dict.  The table puts the unit
+    quantiles, the improvement fraction and the tail readouts next to the
+    token-pooled mean so the estimand choice is visible; it never presents the
+    unit distribution as a second confirmatory test.
+    """
+    comps = (ft or {}).get('comparisons') if isinstance(ft, dict) else None
+    if not isinstance(comps, dict):
+        return []
+
+    def _num(value, fmt='{:+.4f}'):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return '—'
+        try:
+            f = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return '—'
+        return fmt.format(f) if math.isfinite(f) else '—'
+
+    def _ci(pair):
+        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+            return '—'
+        lo = _num(pair[0]) if pair[0] is not None else '—'
+        hi = _num(pair[1]) if pair[1] is not None else '—'
+        return f'[{lo}, {hi}]'
+
+    def _pct(value):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return '—'
+        try:
+            f = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return '—'
+        return f'{100.0 * f:.1f}%' if math.isfinite(f) else '—'
+
+    def _pct_ci(pair):
+        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+            return '—'
+        return f'[{_pct(pair[0])}, {_pct(pair[1])}]'
+
+    def _obj(value):
+        return value if isinstance(value, dict) else {}
+
+    rows = []
+    missing = []
+    corrupt = []
+    not_estimable = []
+    fragile = []
+    for name, comp in comps.items():
+        if not isinstance(comp, dict):
+            continue
+        dsm = comp.get('doc_sampling') or {}
+        uq = dsm.get('unit_quantile_profile') if isinstance(dsm, dict) else None
+        if not isinstance(uq, dict):
+            if (isinstance(dsm, dict)
+                    and dsm.get('pooled_delta_ppl_ci95') is not None):
+                missing.append(name)
+            continue
+        if uq.get('status') == 'not_estimable':
+            not_estimable.append(
+                f'{name}（{uq.get("reason") or "不可估计"}）')
+            continue
+        qrows = uq.get('quantiles')
+        if uq.get('status') != 'ok' or not isinstance(qrows, list) or not qrows:
+            corrupt.append(name)
+            continue
+        by_q = {}
+        for row in qrows:
+            if isinstance(row, dict) and isinstance(row.get('q'), (int, float)):
+                by_q[float(row['q'])] = row
+
+        def _qcell(q):
+            row = by_q.get(q)
+            if not isinstance(row, dict):
+                return '—'
+            return f'{_num(row.get("log_ratio"))} {_ci(row.get("ci95"))}'
+
+        mean = _obj(uq.get('mean'))
+        imp = _obj(uq.get('improvement'))
+        tails = _obj(uq.get('tails'))
+        sign = _obj(uq.get('sign'))
+        flags = []
+        concern = False
+        if mean.get('weighting_flips_sign') is True:
+            flags.append('⚠ 等权/token 池化反向')
+            concern = True
+        if sign.get('direction_agree') is False:
+            flags.append('⚠ 中位数/均值方向不一致')
+            concern = True
+        if sign.get('q90_negative') is True:
+            flags.append('≥90% 单位改善')
+        if sign.get('q10_positive') is True:
+            flags.append('≥90% 单位变差')
+            concern = True
+        asym = tails.get('tail_asymmetry')
+        worst_tail = tails.get('worst_tail_mean_log')
+        if (isinstance(asym, (int, float)) and not isinstance(asym, bool)
+                and math.isfinite(float(asym)) and float(asym) > 0.0):
+            flags.append('上尾更分散')
+        if (isinstance(worst_tail, (int, float))
+                and not isinstance(worst_tail, bool)
+                and math.isfinite(float(worst_tail))
+                and float(worst_tail) > 0.0):
+            flags.append('最差 10% 平均受损（>0）')
+            concern = True
+        share = tails.get('worst_tail_harm_share')
+        if (isinstance(share, (int, float)) and not isinstance(share, bool)
+                and math.isfinite(float(share)) and float(share) >= 0.5):
+            flags.append('最差 10% 占多数伤害')
+            concern = True
+        if concern:
+            fragile.append(name)
+        rows.append('| %s | %s / %s | %s | %s | %s | %s | %s | %s %s | %s | %s | %s |'
+                    % (name, uq.get('n_units', '—'), uq.get('n_seeds', '—'),
+                       _num(mean.get('equal_unit_log_ratio')),
+                       _num(mean.get('token_pooled_log_ratio')),
+                       _qcell(0.1), _qcell(0.5), _qcell(0.9),
+                       _pct(imp.get('fraction_better')),
+                       _pct_ci(imp.get('fraction_better_ci95')),
+                       _num(tails.get('worst_tail_mean_log')),
+                       _num(asym),
+                       '；'.join(flags) if flags else '—'))
+    if not rows and not missing and not corrupt and not not_estimable:
+        return []
+    out = ['### 逐单位分布 / 分位敏感性（post-hoc；不改变上面的冻结判定）', '']
+    if rows:
+        out += ['| 比较 | 单位 / 种子 | 等权均值 | token 池化均值 | q10 | q50 | q90 | 改善比例 [95% CI] | 最差 10% 均值 | 尾不对称 | 标记 |',
+                '|---|---|---|---|---|---|---|---|---|---|---|']
+        out.extend(rows)
+        out += ['',
+                '> 定义：对每个评测单位取 `d = log(PPL_a/PPL_b) = (nll_a − nll_b) / tokens`，'
+                '先在训练种子上平均，再对单位取分位。分位区间是**分布无关的顺序统计区间**'
+                '（二项秩；该 n 无法用 95% 定界的一侧写 `—`，不伪造端点），只做逐点覆盖，'
+                '并条件在已训练种子上；改善比例区间是精确 Clopper–Pearson，平局按「未改善」计。'
+                '`最差 10% 均值` 为正表示 a 在该尾平均更差；`尾不对称 = '
+                '(最差尾均值 − 中位数) − (中位数 − 最好尾均值)`，正值表示受损尾离中位数更远。'
+                '`等权均值` 回答「典型单位」，`token 池化均值` 是冻结主终点；两者是不同估计量，'
+                '符号相反时不能只报其中一个。所有读数都是 post-hoc 描述：不新增 p 值、'
+                '不进入冻结 Holm 族、不改变 `p_exact_signflip`/`p_holm`/`verified`/`confirmed`。', '']
+    if not_estimable:
+        out += ['> 以下比较的逐单位分布不可估计（不伪造分位读数）：'
+                + '；'.join(not_estimable) + '。', '']
+    if missing:
+        out += ['> 以下比较有 pooled CI 但没有逐单位分布块（旧产物或未重新生成分析），'
+                '分布敏感性**未验证**：' + '；'.join(missing) + '。', '']
+    if corrupt:
+        out += ['> 以下比较的逐单位分布块损坏或状态未知，分布敏感性**未验证**：'
+                + '；'.join(corrupt) + '。', '']
+    if fragile:
+        names = sorted(set(fragile))
+        out += ['**解读提示**：' + '、'.join(names) +
+                ' 的等权分布与 token 池化结论不一致、受损尾明显或分位区间跨零；'
+                '引用时必须同时报告本表，不能只用 token 池化均值概括逐单位效应，'
+                '也不能用等权分位替换冻结主估计。', '']
     return out
 
 

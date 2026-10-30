@@ -125,6 +125,16 @@
                逐单位 token 数、层成员与逐种子 NLL 充分统计量重放，篡改
                判 fail；零 GPU；别名 length_composition /
                composition_sensitivity / doc_length_strata）
+  unit_quantiles  结果分析：配对 PPL 效应的**逐单位分布**——先对每个评测单位
+               取 log(PPL_a/PPL_b)，再在种子上平均，报告等权分位（q10/q50/
+               q90 等）与分布无关的顺序统计区间、改善比例及精确
+               Clopper–Pearson 区间、最差/最好尾均值与尾不对称、gross
+               gain/harm 分解、token 加权与等权口径的符号差，以及逐种子
+               分位范围。回答「平均改善是普遍的还是由少数单位/长尾驱动、
+               最差的一批单位是否反而受损」。不是新检验、不进入 Holm 族、
+               不改变 p/Holm/verified/confirmed（从 test_stats.json 的逐种子
+               NLL 差与 token 数重放，篡改判 fail；零 GPU；别名
+               unit_quantile / unit_distribution / effect_distribution / qte）
   family_correction  结果分析：重放确认主族的**依赖感知联合校正**——从逐种子
                配对差重建 sign-invariant score 的精确 Westfall-Young
                step-down max-T、同统计量 Holm、可用时的 studentised t

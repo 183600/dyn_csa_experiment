@@ -2111,6 +2111,9 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
         _len_strata_lines = _length_strata_markdown(ft)
         if _len_strata_lines:
             lines.extend(_len_strata_lines)
+        _unit_quant_lines = _unit_quantile_markdown(ft)
+        if _unit_quant_lines:
+            lines.extend(_unit_quant_lines)
         _var_lines = _variance_components_markdown(ft)
         if _var_lines:
             lines.extend(_var_lines)
