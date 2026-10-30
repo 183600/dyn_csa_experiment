@@ -1409,11 +1409,21 @@ def _dedup_jsonable(value):
         return {str(k): _dedup_jsonable(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
         return [_dedup_jsonable(v) for v in value]
-    if isinstance(value, np.integer):
-        return int(value)
-    if isinstance(value, np.floating):
-        return float(value)
-    return value
+    if isinstance(value, np.ndarray):
+        if value.dtype.kind in 'Mm':
+            # `tolist()` would turn ns-resolution values into raw integers.
+            return _json_clean(value)
+        return _dedup_jsonable(value.tolist())
+    if isinstance(value, np.generic):
+        # `.item()` alone is not JSON-safe for every NumPy scalar type:
+        # np.timedelta64 is an np.integer subclass that raises on int(),
+        # np.longdouble returns another NumPy scalar, and np.datetime64
+        # returns a Python date.  Reuse the artifact writer's canonical
+        # converter so the protocol identity is stable for all of them.
+        return _json_clean(value)
+    # The remaining scalar types (bytes, Decimal/Fraction, non-finite floats)
+    # also need the canonical JSON-safe image used by the artifact writer.
+    return _json_clean(value)
 
 
 def dedup_protocol_fp(protocol):

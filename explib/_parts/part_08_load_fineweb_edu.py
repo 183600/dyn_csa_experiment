@@ -830,18 +830,66 @@ def _json_clean(obj):
     if isinstance(obj, (list, tuple)):
         return [_json_clean(v) for v in obj]
     if isinstance(obj, np.ndarray):
+        if obj.dtype.kind in 'Mm':
+            # `tolist()` converts datetime64[ns]/timedelta64[ns] to raw
+            # integers, so the same instant would be an int in one unit and
+            # an ISO string/seconds in another.  Walk the scalars instead.
+            def _temporal_array(value):
+                if value.ndim == 0:
+                    return _json_clean(value[()])
+                return [_temporal_array(v) for v in value]
+            return _temporal_array(obj)
         return _json_clean(obj.tolist())
     if isinstance(obj, np.generic):
+        # `np.longdouble`/`np.clongdouble.item()` returns another NumPy
+        # scalar, so recursing on `.item()` alone never reaches a Python
+        # type (RecursionError on a finite float128 value).  Convert the
+        # scalar dtypes explicitly; longdouble is rounded to float64 only
+        # here, where the contract is a JSON-safe report value.
+        # NumPy temporal scalars are also `np.generic`; `np.timedelta64` is
+        # even an `np.integer` subclass, so they must be routed explicitly
+        # before the int/float branches (int(timedelta64('D')) raises).
+        if isinstance(obj, np.datetime64):
+            return None if np.isnat(obj) else str(obj)
+        if isinstance(obj, np.timedelta64):
+            if np.isnat(obj):
+                return None
+            try:
+                seconds = float(obj / np.timedelta64(1, 's'))
+            except (TypeError, ValueError, OverflowError, ZeroDivisionError):
+                return str(obj)
+            return seconds if math.isfinite(seconds) else None
+        if isinstance(obj, np.bool_):
+            return bool(obj)
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return _json_clean(float(obj))
+        if isinstance(obj, np.complexfloating):
+            # JSON has no complex scalar.  Keep both components instead of
+            # dropping the imaginary part or recursing forever.
+            return {'real': _json_clean(float(obj.real)),
+                    'imag': _json_clean(float(obj.imag))}
         return _json_clean(obj.item())
-    # NumPy datetime64/timedelta64 .item() returns Python date/datetime/
-    # timedelta objects, which json.dumps(default=float) cannot encode.  A
-    # ledger row carrying a timestamp used to raise TypeError and vanish
+    # Python date/datetime/timedelta objects (for example the ``.item()`` of a
+    # temporal NumPy scalar) are not encodable by json.dumps(default=float).
+    # A ledger row carrying a timestamp used to raise TypeError and vanish
     # behind log_experiment_event's warning.  ISO text / seconds are stable
     # and round-trip without losing the temporal identity.
     _cls = type(obj)
     if (getattr(_cls, '__module__', '') or '').startswith('pandas') \
             and _cls.__name__ in ('NAType', 'NaTType'):
         return None
+    if isinstance(obj, (bytes, bytearray)):
+        # JSON has strings, not bytes; an explicit decode keeps the value
+        # readable instead of relying on json.dumps(default=float), which
+        # only happens to accept numeric byte strings and raises otherwise.
+        return bytes(obj).decode('utf-8', 'replace')
+    if isinstance(obj, complex):
+        # Match the NumPy complex branch above: keep both components rather
+        # than emitting an unserialisable Python complex.
+        return {'real': _json_clean(obj.real),
+                'imag': _json_clean(obj.imag)}
     if isinstance(obj, (_py_datetime.datetime, _py_datetime.date,
                         _py_datetime.time)):
         return obj.isoformat()
@@ -849,6 +897,17 @@ def _json_clean(obj):
         return obj.total_seconds()
     if isinstance(obj, float):
         return obj if math.isfinite(obj) else None
+    # Exact numeric objects (Decimal/Fraction) are not `float` but are emitted
+    # by `json.dumps(default=float)`.  Clean their non-finite spellings here
+    # too, otherwise a Decimal NaN/Infinity reaches allow_nan=False and makes
+    # the artifact write fail.
+    if (isinstance(obj, numbers.Number)
+            and not isinstance(obj, (bool, int, float, complex))):
+        try:
+            value = float(obj)
+        except (OverflowError, TypeError, ValueError):
+            return str(obj)
+        return value if math.isfinite(value) else None
     return obj
 
 

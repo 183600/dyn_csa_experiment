@@ -777,8 +777,15 @@ def _matrix_fingerprint(X):
             # longdouble table fingerprint differently from the same values
             # in an object column (which only tails inexact rows), and the
             # old tail also lacked the row position used by the other paths.
-            _ld_exact = (np.isfinite(block_f)
-                         & (block_f.astype(np.longdouble) == block))
+            # `NaN` is the missing-like value and the object path emits it
+            # through the common float64 block (every NaN spelling is one
+            # identity), so a native longdouble NaN row is exact for this
+            # purpose.  Without treating NaN as exact here, the same missing
+            # row got an extra exact tail only in the native-dtype table and
+            # fingerprinted differently from its object/float64 twin.
+            _ld_exact = (np.isnan(block)
+                         | (np.isfinite(block_f)
+                            & (block_f.astype(np.longdouble) == block)))
             _bad_rows = (~_ld_exact.all(axis=-1) if _ld_exact.ndim > 1
                          else ~_ld_exact)
             if np.any(_bad_rows):
@@ -1043,9 +1050,25 @@ def _row_keys(X):
         for start in range(0, src.shape[0], _step):
             for row in src[start:start + _step].tolist():
                 h = hashlib.blake2b(digest_size=16)
-                for v in row:
-                    h.update(_wide_float_key(v))
+                # An all-NaN row is the missing-like value, and the object
+                # path hashes it through the common float64 encoding (the
+                # dtype-specific wide key would make the same missing row
+                # distinct when stored as longdouble vs float64/object).
+                if not row or all(np.isnan(v) for v in row):
+                    _frow = np.asarray(row, dtype=np.float64).reshape(-1)
+                    _finite = np.isfinite(_frow)
+                    h.update(np.ascontiguousarray(_frow[_finite]).tobytes())
                     h.update(b'|')
+                    h.update(np.packbits(~_finite).tobytes())
+                    _code = np.zeros(_frow.shape, dtype=np.uint8)
+                    _code[np.isnan(_frow)] = 1
+                    _code[np.isposinf(_frow)] = 2
+                    _code[np.isneginf(_frow)] = 3
+                    h.update(_code.tobytes())
+                else:
+                    for v in row:
+                        h.update(_wide_float_key(v))
+                        h.update(b'|')
                 keys.append(h.digest())
         return keys
     if src.dtype.kind in 'SUV':

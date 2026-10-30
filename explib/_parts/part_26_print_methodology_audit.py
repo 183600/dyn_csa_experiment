@@ -1131,9 +1131,18 @@ def _jsonable(v):
     if isinstance(v, (list, tuple)):
         return [_jsonable(x) for x in v]
     if isinstance(v, np.ndarray):
+        if v.dtype.kind in 'Mm':
+            # `tolist()` would turn ns-resolution values into raw integers;
+            # the shared converter keeps them as ISO text / seconds.
+            return _json_clean(v)
         return _jsonable(v.tolist())
     if isinstance(v, np.generic):
-        return v.item()
+        # `.item()` is not enough: np.longdouble/np.clongdouble return another
+        # NumPy scalar, and np.datetime64/timedelta64 return Python date/
+        # timedelta objects that json cannot encode.  Share the canonical
+        # converter used by the artifact writers so provenance values stay
+        # JSON-safe and deterministic.
+        return _json_clean(v)
     if isinstance(v, (str, int, float, bool)) or v is None:
         return v
     return str(v)
