@@ -5076,3 +5076,35 @@ comp_reg 的 delta_logit 梯度/目标、fusion 的 conv 参数）；inert facto
 audit gate/`single_factor`/`report`/CLI 别名接线；探针不泄漏 RNG 状态。
 `test_review_part_50/16/25/08/10` 共 120 项与本轮新增 7 项通过；完整 CPU
 套件在本轮最终树通过。
+
+## 2026-10-30 — 干扰注入探针的机制对照也必须有单因素声明（本轮单因素实验检查）
+
+**Problem.** v10/v11 的 P3MP/P4MP/P5MP 探针把
+`dense/randidx/allblocks - learned` 与两条从头训练对照写进
+`probe.contrasts` 并在报告里作「机制结论」，但这些对照不在
+`ABLATION_DESIGN`，也没有 `single_factor`/`factors` 声明或定义点审计。
+`dense` 是 `kind` 交换的架构级参考，`retrain-gap`/`arch-aligned` 是复合
+读数；任何探针臂的第二个键漂移都不会被记录级配对门看见。
+
+**Fix.** 新增 `exp_lib.PROBE_CONTRAST_FACTORS`（含 `dense` 非单因素、
+`randidx`/`allblocks` 推理期 override、`csa_randtrain`/`csa_alltrain`
+从头训练对照）与 `probe_contrast_factor_audit()`：复用 v7 工厂和共享
+override 表，逐条重算实际 diff，声明/实际键集双向相等，单因素标签还须
+落在一个声明族；`observed_tags` 拒绝未声明的记录 tag；
+`attach_probe_factor_metadata()` 把声明与验证状态写入 v10/v11 探针记录，
+未验证时清零 `single_factor`。`retrain-gap` 显式标 `system_level`，
+`arch-aligned` 标 `architecture_level`，`dense` 标 `architecture_level`。
+`audit_gates.py single_factor`/`report` 新增 `probe_contrasts` 块，CLI
+新增 `probe_contrasts`（别名 `probe_controls`/`probe_factor`/
+`distractor_probe`）；v10/v11 报告在机制段前声明因素结构，并把
+`dense−learned` 标为架构级参考。
+
+**Boundary.** 定义点证据，不证明干预有效（§111 负责）或机制有用；不新增
+训练/种子/test 访问，不修改冻结清单字节/端点/alpha/Holm 或
+`CODE_SEMANTICS`；`.github/` 与所有 README 未删除或移动。
+
+**Verification.** 新增 `test_review_part_53.py` 7 项：shipped 五类对照
+逐条通过、`dense` 架构级、漂移/不可构造/非法声明/未知 override
+fail-closed、未声明记录 tag 拒绝、未验证时清零单因素标签、v10/v11 分析
+与 audit gate/report/CLI 接线、注册表不被审计修改。相关既有测试与完整
+CPU 套件在本轮最终树通过。

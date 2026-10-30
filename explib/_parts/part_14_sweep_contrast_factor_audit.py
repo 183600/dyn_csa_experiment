@@ -278,6 +278,241 @@ def niah_contrast_factor_audit(declarations=None, *, overrides=None,
                   'verified against the shared overrides/arm configs')
     return report
 
+def probe_contrast_factor_audit(declarations=None, *, overrides=None,
+                                factory=None, n_layers=6, observed_tags=None,
+                                verbose=True):
+    """Verify the v10/v11 distractor-probe mechanism contrasts against the arms.
+
+    The probe panel quotes ``dense/randidx/allblocks - learned`` (and the two
+    from-scratch selector controls) as mechanism readings, but those labels
+    were never checked at the definition site.  In particular ``dense`` is an
+    attention-operator swap, so it cannot back a knob-level single-factor
+    claim, while ``randidx``/``allblocks`` reuse the same shared inference
+    override map as NIAH-natural.
+
+    Every declaration must name either an override tag or a trained arm pair,
+    the exact AttnCfg keys it is allowed to move, and an explicit
+    ``single_factor`` boolean.  The audit builds the arms/overrides and
+    refuses an undeclared extra key, a disappeared declared key, a
+    ``single_factor=True`` that the actual diff does not support, or a
+    malformed declaration.  ``observed_tags`` additionally closes the record
+    side: a probe contrast emitted by the analysis whose tag is not in the
+    registry fails closed instead of silently carrying no factor label.
+
+    ``dense`` is reported as ``architecture_level``; it is only a reference,
+    never a single-factor mechanism control.
+    """
+    declarations = (PROBE_CONTRAST_FACTORS if declarations is None
+                    else declarations)
+    overrides = (NIAH_INFERENCE_ARM_OVERRIDES if overrides is None
+                 else overrides)
+    factory = make_layer_cfgs if factory is None else factory
+    report = {'kind': 'probe_contrast_factors', 'pairs': {},
+              'violations': [], 'warnings': [], 'status': 'ok',
+              'observed_tags': [], 'undeclared_observed_tags': []}
+    if not isinstance(declarations, dict) or not declarations:
+        report['status'] = 'fail'
+        report['violations'].append(
+            'probe factor declarations must be a non-empty name -> declaration object')
+        if verbose:
+            print('[probe-factor] REFUSED: no declarations to verify')
+        return report
+    if not isinstance(overrides, dict):
+        report['status'] = 'fail'
+        report['violations'].append(
+            'probe inference overrides must be a name -> key/value object')
+        if verbose:
+            print('[probe-factor] REFUSED: malformed override map')
+        return report
+    missing_factory = False
+    for name, spec in declarations.items():
+        label = str(name)
+        if not isinstance(spec, dict):
+            report['violations'].append(f'{label}: declaration is not an object')
+            continue
+        factors = spec.get('factors')
+        if (not isinstance(factors, (list, tuple, set, frozenset))
+                or not factors
+                or any(not isinstance(k, str) or not k.strip() for k in factors)):
+            report['violations'].append(
+                f'{label}: factors must be a non-empty list of AttnCfg key names')
+            continue
+        declared_sf = spec.get('single_factor')
+        if not isinstance(declared_sf, bool):
+            report['violations'].append(
+                f'{label}: single_factor must be an explicit boolean')
+            continue
+        declared_set = {str(k) for k in factors}
+        override_tag = spec.get('override')
+        a, b = spec.get('a'), spec.get('b')
+        if override_tag is not None and (a is not None or b is not None):
+            report['violations'].append(
+                f'{label}: declaration cannot be both an inference override and an arm pair')
+            continue
+        if override_tag is not None:
+            if not isinstance(override_tag, str) or override_tag not in overrides:
+                report['violations'].append(
+                    f'{label}: override {override_tag!r} is not in the shared '
+                    'inference override map')
+                continue
+            _override_spec = overrides.get(override_tag)
+            if not isinstance(_override_spec, dict):
+                report['violations'].append(
+                    f'{label}: override {override_tag!r} must be an object')
+                continue
+            actual_set = {str(k) for k in _override_spec}
+            entry = {'mode': 'inference_override', 'override': override_tag,
+                     'a': 'csa_fixed_rope', 'b': 'csa_fixed_rope'}
+        else:
+            if not (isinstance(a, str) and a.strip()
+                    and isinstance(b, str) and b.strip()):
+                report['violations'].append(
+                    f'{label}: declaration must name an override tag or both arms (a/b)')
+                continue
+            if factory is None:
+                missing_factory = True
+                continue
+            actual, per_layer = _design_pair_cfg_keys(a, b, factory, n_layers)
+            if isinstance(actual, Exception):
+                report['violations'].append(
+                    f'{label}: arm construction failed '
+                    f'({type(actual).__name__}: {actual})')
+                continue
+            actual_set = set(actual)
+            entry = {'mode': 'trained_pair', 'a': a, 'b': b,
+                     'per_layer': {str(i): {k: [v0, v1] for k, (v0, v1) in d.items()}
+                                   for i, d in per_layer.items()}}
+        extra = sorted(actual_set - declared_set)
+        missing = sorted(declared_set - actual_set)
+        actual_sf = bool(cfg_keys_single_factor(actual_set))
+        if 'kind' in actual_set:
+            level = 'architecture_level'
+        elif actual_sf:
+            level = 'single_factor'
+        else:
+            level = 'multi_factor'
+        entry.update({'declared_factors': sorted(declared_set),
+                      'actual_keys': sorted(actual_set),
+                      'extra_keys': extra, 'missing_keys': missing,
+                      'declared_single_factor': declared_sf,
+                      'actual_single_factor': actual_sf,
+                      'contrast_level': level})
+        ok = True
+        if extra:
+            ok = False
+            report['violations'].append(
+                f'{label}: arms/overrides also differ in undeclared key(s) '
+                f'{extra}; the declared factors {sorted(declared_set)} do not '
+                'describe the contrast')
+        if missing:
+            ok = False
+            report['violations'].append(
+                f'{label}: declared factor key(s) {missing} do not differ; the '
+                'declared intervention is absent')
+        if declared_sf:
+            if actual_set != declared_set:
+                ok = False
+            if not actual_sf:
+                ok = False
+                report['violations'].append(
+                    f'{label}: declared single-factor but the actual diff '
+                    f'{sorted(actual_set)} is not one declared intervention family '
+                    f'(kind swaps and multi-family bundles are not single factors)')
+        entry['verified'] = bool(ok)
+        report['pairs'][label] = entry
+    if observed_tags is not None:
+        try:
+            if isinstance(observed_tags, (str, bytes)):
+                _observed = [observed_tags]
+            elif isinstance(observed_tags, dict):
+                _observed = list(observed_tags.keys())
+            else:
+                _observed = list(observed_tags)
+        except TypeError:
+            _observed = []
+        _seen = []
+        for _tag in _observed:
+            _tag = str(_tag)
+            if _tag in _seen:
+                continue
+            _seen.append(_tag)
+            if _tag not in declarations:
+                report['undeclared_observed_tags'].append(_tag)
+                report['violations'].append(
+                    f'probe contrast {_tag!r} was emitted without a factor '
+                    'declaration; add it to PROBE_CONTRAST_FACTORS before it can '
+                    'be read as mechanism evidence')
+        report['observed_tags'] = _seen
+        _unobserved = [str(k) for k in declarations if str(k) not in _seen]
+        if _seen and _unobserved:
+            report['warnings'].append(
+                f'declared probe contrast(s) not observed in this panel: '
+                f'{_unobserved}')
+    if report['violations']:
+        report['status'] = 'fail'
+    elif missing_factory:
+        report['status'] = 'not_verifiable'
+        report['note'] = ('the trained-arm factory is unavailable; inference '
+                          'overrides were checked but trained pairs were not')
+    if verbose:
+        if report['violations']:
+            print('[probe-factor] REFUSED — declarations do not match the probe arms:')
+            for _v in report['violations']:
+                print(f'  - {_v}')
+        elif report['status'] == 'ok':
+            print(f"[probe-factor] OK: {len(report['pairs'])} probe contrast(s) "
+                  'verified against the shared overrides/arm configs')
+    return report
+
+def probe_factor_audit(*args, **kwargs):
+    """Alias for :func:`probe_contrast_factor_audit` (stable public spelling)."""
+    return probe_contrast_factor_audit(*args, **kwargs)
+
+def distractor_probe_factor_audit(*args, **kwargs):
+    """Alias used by callers that name the v10/v11 panel after its probe."""
+    return probe_contrast_factor_audit(*args, **kwargs)
+
+def attach_probe_factor_metadata(record, tag, factor_report, *, declarations=None):
+    """Attach the verified factor structure to one probe contrast record.
+
+    The analysis path used to write bare ``randidx - learned`` records; a
+    reader could not tell a knob-level single factor from an operator swap.
+    This helper copies the declaration, records whether the definition-site
+    audit verified it, and clears a ``single_factor=True`` label when the
+    audit did not verify it (fail-closed, same contract as the NIAH records).
+    """
+    declarations = (PROBE_CONTRAST_FACTORS if declarations is None
+                    else declarations)
+    if not isinstance(record, dict):
+        return record
+    _decl = declarations.get(tag) if isinstance(declarations, dict) else None
+    if not isinstance(_decl, dict):
+        if record.get('single_factor') is True:
+            record['declared_single_factor'] = True
+        record['single_factor'] = False
+        record['factor_declaration_verified'] = False
+        record['factors_note'] = (
+            f'no probe factor declaration for {tag!r}; the contrast cannot '
+            'be read as single-factor mechanism evidence')
+        record['contrast_level'] = 'undeclared'
+        return record
+    for _key in ('single_factor', 'factors', 'factors_note'):
+        if _key in _decl:
+            record[_key] = _decl[_key]
+    _pair = (factor_report.get('pairs') or {}).get(tag) if isinstance(factor_report, dict) else None
+    _verified = isinstance(_pair, dict) and _pair.get('verified') is True
+    record['factor_declaration_verified'] = _verified
+    if isinstance(_pair, dict):
+        record['contrast_level'] = _pair.get('contrast_level')
+        record['factor_actual_keys'] = _pair.get('actual_keys')
+    if not _verified and record.get('single_factor') is True:
+        record['declared_single_factor'] = True
+        record['single_factor'] = False
+    return record
+
+# Backwards/private alias for the historical NIAH helper naming.
+_attach_probe_factor_metadata = attach_probe_factor_metadata
+
 def open_block_matrix_audit(factory=None, *, n_layers=6, verbose=True):
     """Zero-GPU check of the open-block panel's declared 2-factor factorial.
 

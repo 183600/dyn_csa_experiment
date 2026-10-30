@@ -175,7 +175,7 @@ def audit_single_factor(manifest_path=None):
     L = _import_exp_lib()
     out = {'status': 'ok', 'design': {}, 'initialization': {},
            'open_block_matrix': {}, 'sweep_contrasts': {}, 'v7_contrasts': {},
-           'niah_contrasts': {}, 'dynamic_study': {},
+           'niah_contrasts': {}, 'probe_contrasts': {}, 'dynamic_study': {},
            'frozen_manifest': {}, 'factorial_design': {},
            'content_controls': {}, 'sink_controls': {},
            'fusion_controls': {}, 'gate_controls': {},
@@ -241,6 +241,19 @@ def audit_single_factor(manifest_path=None):
         out['niah_contrasts'] = _niah_rep
         if _niah_rep.get('status') == 'fail':
             out['status'] = 'fail'
+        # The v10/v11 distractor probe quotes the same randidx/allblocks
+        # contrasts as mechanism readings.  It is a separate panel from NIAH
+        # and was previously unlabelled; audit its registry through the same
+        # real v7 factory so a definition-site drift cannot hide there.
+        _probe_rep = L.probe_contrast_factor_audit(
+            factory=_factory, verbose=False)
+        out['probe_contrasts'] = _probe_rep
+        if _probe_rep.get('status') == 'fail':
+            out['status'] = 'fail'
+    elif _factory is None:
+        out['probe_contrasts'] = {
+            'status': 'not_verifiable_locally',
+            'note': 'cannot import the v7 arm factory; probe contrasts are unverifiable'}
     _mp = manifest_path or os.path.join(REPO, 'confirmation_frozen.json')
     if _factory is not None:
         if not os.path.exists(_mp):
@@ -397,6 +410,27 @@ def audit_single_factor(manifest_path=None):
 # ---------------------------------------------------------------------------
 # 7e-2) factorial：2x2 交互设计的定义点审计（零 GPU）
 # ---------------------------------------------------------------------------
+
+def audit_probe_contrasts():
+    """Definition-site audit of the v10/v11 distractor-probe contrasts.
+
+    The probe panel is a separate experiment from ``ABLATION_DESIGN`` and
+    NIAH-natural.  Its ``dense`` reference is an operator swap, while
+    ``randidx``/``allblocks`` and the from-scratch selector controls must be
+    knob-level single factors.  This entry point verifies that registry
+    against the real v7 arm factory / shared inference overrides.
+    """
+    L = _import_exp_lib()
+    try:
+        import explib.rope as V7
+        out = L.probe_contrast_factor_audit(
+            factory=V7.make_layer_cfgs_v7, verbose=False)
+    except Exception as _e:
+        out = {'kind': 'probe_contrast_factors',
+               'status': 'not_verifiable_locally',
+               'note': f'cannot import the v7 arm factory ({type(_e).__name__}: {_e})'}
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return out
 
 def audit_content_controls():
     """Ablation control-ladder audit (zero GPU, design point).

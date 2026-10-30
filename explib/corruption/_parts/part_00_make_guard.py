@@ -527,6 +527,14 @@ def _attach_niah_factor_metadata(record, tag, factor_report):
         record['single_factor'] = False
     return record
 
+def _attach_probe_factor_metadata(record, tag, factor_report):
+    """v10 local spelling of the shared probe-metadata helper."""
+    return L.attach_probe_factor_metadata(record, tag, factor_report)
+
+def _probe_contrast_factor_audit(*args, **kwargs):
+    """v10 local spelling of the shared probe-factor audit."""
+    return L.probe_contrast_factor_audit(*args, **kwargs)
+
 def _niah_fingerprint(cfg, condition=None):
     _n = cfg.get('niah') or {}
     _need = max((int(_x) for _x in cfg['eval_lens'])) + 1

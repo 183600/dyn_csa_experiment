@@ -18,6 +18,14 @@ import torch
 import explib.corruption as V10
 V9 = V10.V9
 V8 = V10.V8
+
+def _probe_contrast_factor_audit(*args, **kwargs):
+    """v11 local spelling of the shared probe-factor audit."""
+    return L.probe_contrast_factor_audit(*args, **kwargs)
+
+def _attach_probe_factor_metadata(record, tag, factor_report):
+    """v11 local spelling of the shared probe-metadata helper."""
+    return L.attach_probe_factor_metadata(record, tag, factor_report)
 V = V10.V
 L = V10.L
 REPO = V10.REPO
@@ -84,7 +92,16 @@ def run_phase(name, guard, par=None):
 
 def v11_analysis(out='analysis_v11/stats.json'):
     os.makedirs(os.path.dirname(out) or '.', exist_ok=True)
-    probe = {'cells': [], 'contrasts': {}}
+    _probe_factory = None
+    try:
+        import explib.rope as _V7
+        _probe_factory = _V7.make_layer_cfgs_v7
+        _probe_factor_rep = L.probe_contrast_factor_audit(
+            factory=_probe_factory, verbose=False)
+    except Exception as _e:
+        _probe_factor_rep = {'status': 'not_verifiable', 'pairs': {},
+                             'note': f'{type(_e).__name__}: {_e}'}
+    probe = {'cells': [], 'contrasts': {}, 'factor_audit': _probe_factor_rep}
     sp = V10.PROBE['summary']
     if os.path.exists(sp):
         try:
@@ -134,6 +151,7 @@ def v11_analysis(out='analysis_v11/stats.json'):
             assert means, (v, arm, Ln, rho, mode)
             probe_cells.append({'variant': v, 'arm': arm, 'eval_len': Ln, 'rho': rho, 'mode': mode, 'seeds': sorted(means), 'ppl_by_seed': means, 'probe_params': json.loads(_pp), '_code': _cd, 'recipe': _recipe, 'val_fp': _vfp, 'mean': float(np.mean(list(means.values()))), 'std': float(np.std(list(means.values()), ddof=1)) if len(means) > 1 else 0.0, 'n': len(means)})
         contrasts = {}
+        _observed_probe_tags = set()
 
         # The grouped lists are exactly what a scan of probe_cells would have
         # collected, so the ambiguity/unambiguous outcomes (and the picked
@@ -173,7 +191,17 @@ def v11_analysis(out='analysis_v11/stats.json'):
                         dl = [other['ppl_by_seed'][s] - learned['ppl_by_seed'][s] for s in common]
                         contrasts[f'L{Ln} r{rho}: {tag} - csa+learned'] = V.exact_sign_permutation(dl)
                         contrasts[f'L{Ln} r{rho}: {tag} - csa+learned']['seeds'] = common
-        probe = {'cells': probe_cells, 'contrasts': contrasts, 'holm_exploratory': L.attach_holm(contrasts, family='v11 distractor probe contrasts')}
+                        _observed_probe_tags.add(str(arm))
+                        L.attach_probe_factor_metadata(
+                            contrasts[f'L{Ln} r{rho}: {tag} - csa+learned'],
+                            arm, _probe_factor_rep)
+        if _probe_factory is not None:
+            _probe_factor_rep = L.probe_contrast_factor_audit(
+                factory=_probe_factory,
+                observed_tags=sorted(_observed_probe_tags), verbose=False)
+        probe = {'cells': probe_cells, 'contrasts': contrasts,
+                 'factor_audit': _probe_factor_rep,
+                 'holm_exploratory': L.attach_holm(contrasts, family='v11 distractor probe contrasts')}
         _n_cell_max = max((c['n'] for c in probe_cells), default=0)
         _n_pair_max = max((v['n'] for v in contrasts.values()), default=0)
         _n_pair_min = min((v['n'] for v in contrasts.values()), default=0)
@@ -524,7 +552,9 @@ def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
     else:
         _ri_txt = 'randidx 至少在一格与 learned 相当或更优：抗噪性主要来自稀疏归纳偏置本身，「学习检索滤噪」的强版本不成立。'
     if contr:
-        A(f'**机制结论（区间实时算自上方配对检验，n={n_contr_max}，Δ = 对照臂 − 学习选择臂）：**dense−learned Δ {_fmt(dn)} PPL，allblocks−learned Δ {_fmt(ab)} PPL，randidx−learned Δ {_fmt(ri)} PPL——' + _ri_txt + (f'（统计分辨率：本段引用的对比中，最全的为 n={n_contr_max}、最弱的仅 n={n_tree_min}，精确符号翻转 p 值下限因此是 {_floor_txt}，**未**跨过 0.05——上述读法只作方向性表述。）' if not probe_ok else '') + (f'（统计分辨率：本段引用的是 n={n_tree_min}–{n_contr_max} 的对比，最弱者下限 {floor_p_tree:.3f}；最弱一格仅 n={n_tree_min}，其分辨率仍不足以支撑显著性主张。）' if probe_ok and _pair_ragged else ''))
+        A('**因素结构（定义点核验）**：`dense` 是 `kind` 交换的架构级参考，不进入单因子机制主张；`randidx`/`allblocks` 是同一 checkpoint 上的推理期单因子干预（分别只改 `indexer_mode`/`index_topk`）；`csa_randtrain`/`csa_alltrain` 是从头训练的单因子选择对照。`retrain-gap` 与 `arch-aligned` 是复合/架构级读数，不能当作单因子机制证据。')
+        A('')
+        A(f'**机制结论（区间实时算自上方配对检验，n={n_contr_max}，Δ = 对照臂 − 学习选择臂）：**dense−learned（架构级参考，不进入单因子机制主张）Δ {_fmt(dn)} PPL，allblocks−learned Δ {_fmt(ab)} PPL，randidx−learned Δ {_fmt(ri)} PPL——' + _ri_txt + (f'（统计分辨率：本段引用的对比中，最全的为 n={n_contr_max}、最弱的仅 n={n_tree_min}，精确符号翻转 p 值下限因此是 {_floor_txt}，**未**跨过 0.05——上述读法只作方向性表述。）' if not probe_ok else '') + (f'（统计分辨率：本段引用的是 n={n_tree_min}–{n_contr_max} 的对比，最弱者下限 {floor_p_tree:.3f}；最弱一格仅 n={n_tree_min}，其分辨率仍不足以支撑显著性主张。）' if probe_ok and _pair_ragged else ''))
         A('')
     else:
         A('**机制结论**：`analysis_v11/stats.json` 的 `probe.contrasts` 为空，因此 dense/allblocks/randidx 相对 learned 的 Δ 区间**无数据**，本轮不给出机制读法。这不是「无差异」——是**未测量**。')

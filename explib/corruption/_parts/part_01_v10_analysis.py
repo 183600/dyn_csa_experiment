@@ -1,14 +1,20 @@
 
 def v10_analysis(out='analysis_v10/stats.json'):
     os.makedirs(os.path.dirname(out) or '.', exist_ok=True)
+    _probe_factory = None
     try:
         import explib.rope as _V7
+        _probe_factory = _V7.make_layer_cfgs_v7
         _niah_factor_rep = L.niah_contrast_factor_audit(
-            factory=_V7.make_layer_cfgs_v7, verbose=False)
+            factory=_probe_factory, verbose=False)
+        _probe_factor_rep = L.probe_contrast_factor_audit(
+            factory=_probe_factory, verbose=False)
     except Exception as _e:
         _niah_factor_rep = {'status': 'not_verifiable', 'pairs': {},
                             'note': f'{type(_e).__name__}: {_e}'}
-    probe = {}
+        _probe_factor_rep = {'status': 'not_verifiable', 'pairs': {},
+                             'note': f'{type(_e).__name__}: {_e}'}
+    probe = {'factor_audit': _probe_factor_rep}
     sp = PROBE['summary']
     if os.path.exists(sp):
         try:
@@ -98,12 +104,18 @@ def v10_analysis(out='analysis_v10/stats.json'):
                 return False
             return True
 
-        def _add_contrast(name, a, b):
+        _observed_probe_tags = set()
+
+        def _add_contrast(name, a, b, factor_tag=None):
             common = sorted(set(a['ppl_by_seed']) & set(b['ppl_by_seed']))
             if len(common) >= 2:
                 dl = [b['ppl_by_seed'][s] - a['ppl_by_seed'][s] for s in common]
                 contrasts[name] = V.exact_sign_permutation(dl)
                 contrasts[name]['seeds'] = common
+                if factor_tag is not None:
+                    _observed_probe_tags.add(str(factor_tag))
+                    L.attach_probe_factor_metadata(
+                        contrasts[name], factor_tag, _probe_factor_rep)
         # ---- legacy uniform-mode contrasts (names unchanged for report compat) ----
         for Ln in PROBE['eval_lens']:
             for rho in PROBE['rhos']:
@@ -114,7 +126,8 @@ def v10_analysis(out='analysis_v10/stats.json'):
                         continue
                     if not _pairable(learned, other, Ln, rho, tag):
                         continue
-                    _add_contrast(f'L{Ln} r{rho}: {tag} - csa+learned', learned, other)
+                    _add_contrast(f'L{Ln} r{rho}: {tag} - csa+learned', learned, other,
+                                  factor_tag=arm)
         # ---- from-scratch selector controls ----
         for Ln in PROBE['eval_lens']:
             for rho in PROBE['rhos']:
@@ -125,7 +138,8 @@ def v10_analysis(out='analysis_v10/stats.json'):
                     other = cell_mean(ov, oarm, Ln, rho, 'uniform')
                     if not other or not _pairable(learned, other, Ln, rho, tag):
                         continue
-                    _add_contrast(f'L{Ln} r{rho}: {tag} - csa+learned', learned, other)
+                    _add_contrast(f'L{Ln} r{rho}: {tag} - csa+learned', learned, other,
+                                  factor_tag=tag)
                 # intervention-vs-retrain gap (NOT a causal
                 # mismatch decomposition): test-time intervention minus the
                 # trained-with-that-selection control at the same (L, rho).
@@ -141,12 +155,34 @@ def v10_analysis(out='analysis_v10/stats.json'):
                     if not tt or not sc or not _pairable(tt, sc, Ln, rho, tag):
                         continue
                     _add_contrast(f'L{Ln} r{rho}: {tag}', sc, tt)
+                    _rec = contrasts.get(f'L{Ln} r{rho}: {tag}')
+                    if isinstance(_rec, dict):
+                        _rec['single_factor'] = False
+                        _rec['contrast_level'] = 'system_level'
+                        _rec['factors'] = []
+                        _rec['factor_declaration_verified'] = False
+                        _rec['factors_note'] = ('test-time intervention minus the '
+                                                'from-scratch control: training/'
+                                                'checkpoint and inference-time '
+                                                'adaptation are bundled, so this '
+                                                'is a system-level raw gap, not a '
+                                                'single-factor mechanism contrast')
                 # architecture-aligned dense: full_rope minus
                 # the all-blocks CSA twin (same projections/norm/RoPE/sink)
                 dense = cell_mean('full_rope', 'dense', Ln, rho, 'uniform')
                 allt = cell_mean('csa_fixed_rope_allblocks', 'learned', Ln, rho, 'uniform')
                 if dense and allt and _pairable(dense, allt, Ln, rho, 'arch-aligned'):
                     _add_contrast(f'L{Ln} r{rho}: arch-aligned: full_rope - csa_alltrain', allt, dense)
+                    _rec = contrasts.get(f'L{Ln} r{rho}: arch-aligned: full_rope - csa_alltrain')
+                    if isinstance(_rec, dict):
+                        _rec['single_factor'] = False
+                        _rec['contrast_level'] = 'architecture_level'
+                        _rec['factors'] = ['kind']
+                        _rec['factor_declaration_verified'] = False
+                        _rec['factors_note'] = ('dense vs the all-block CSA twin: an '
+                                                'attention-operator swap, so it is '
+                                                'the architecture-aligned reference, '
+                                                'not a knob-level single factor')
         # ---- delta-NLL on the corruption modes ----
         delta_nll = {}
 
@@ -224,6 +260,7 @@ def v10_analysis(out='analysis_v10/stats.json'):
                             dl = [other['per_seed'][s] - learned['per_seed'][s] for s in common]
                             res = V.exact_sign_permutation(dl)
                             res['seeds'] = common
+                            L.attach_probe_factor_metadata(res, arm, _probe_factor_rep)
                             contrasts[f'ΔNLL L{Ln} {mode} r{rho}: {arm} - csa+learned'] = res
         # ---- Holm correction over the whole contrast family ----
         holm = {}
@@ -235,7 +272,12 @@ def v10_analysis(out='analysis_v10/stats.json'):
                     _v['p_holm'] = (holm.get(_k) or {}).get('p_holm') if _k in holm else None
             _rej = [k for k, v in holm.items() if v.get('reject')]
             print(f'[v10 stats] Holm step-down over the {len(_fam)}-contrast family (EXPLORATORY — not pre-registered): {len(_rej)} survive at alpha=0.05' + (f': {sorted(_rej)[:4]}' if _rej else ''))
-        probe = {'cells': probe_cells, 'contrasts': contrasts, 'delta_nll': delta_nll, 'holm_exploratory': holm}
+        if _probe_factory is not None:
+            _probe_factor_rep = L.probe_contrast_factor_audit(
+                factory=_probe_factory,
+                observed_tags=sorted(_observed_probe_tags), verbose=False)
+        probe = {'cells': probe_cells, 'contrasts': contrasts, 'delta_nll': delta_nll,
+                 'factor_audit': _probe_factor_rep, 'holm_exploratory': holm}
         # ---- NIAH-natural (far-necessity task) ----
         _nsp = (PROBE.get('niah') or {}).get('summary')
         if _nsp and os.path.exists(_nsp):
@@ -606,7 +648,9 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
         learned_helps = ri_sig
         _dpos = bool(dn) and dn[0] > 0 and bool(ab) and ab[0] > 0
         _dtxt = '正值表示「看得见远距噪声就会受害」，支持限制远距注意力暴露带来抗噪性' if _dpos else '区间并非全正，「远距暴露致害」的方向在本轮产物上不成立，以配对数字为准'
-        A(f'**结论（区间实时算自上方配对检验，Δ = 对照臂 − 学习选择臂）：**(1) dense−learned Δ 区间 {_fmt(dn)} PPL，allblocks−learned Δ 区间 {_fmt(ab)} PPL——{_dtxt}；(2) randidx−learned Δ 区间 {_fmt(ri)} PPL——' + ('全为正值且全部对照达到 p<0.05：学习到的检索对抗噪性有**独立贡献**（强版本成立）。' if learned_helps else f'未能在 p<0.05 上成立（randidx 对照的最小 n={n_min_ri}，全表最小 n={n_min}[{', '.join(sorted(_bind)[:2])}{('…' if len(_bind) > 2 else '')}]，精确符号翻转的 p 下限为 {p_floor:.3f}，' + ('该种子数下无法达到 0.05 显著性' if not (p_floor <= 0.05) else '分辨率已足以达到 0.05，未显著是数据结论而非分辨率上限') + '），「抗噪性来自学习到的检索质量」的强版本**不成立**；现有数据只支持「抗噪性主要来自稀疏归纳偏置本身」这一较弱表述。') + '）')
+        A('**因素结构（定义点核验）**：`dense` 是 `kind` 交换的架构级参考，不进入单因子机制主张；`randidx`/`allblocks` 是同一 checkpoint 上的推理期单因子干预（分别只改 `indexer_mode`/`index_topk`）；`csa_randtrain`/`csa_alltrain` 是从头训练的单因子选择对照。`retrain-gap` 与 `arch-aligned` 是复合/架构级读数，不能当作单因子机制证据。')
+        A('')
+        A(f'**结论（区间实时算自上方配对检验，Δ = 对照臂 − 学习选择臂）：**(1) dense−learned（架构级参考，不进入单因子机制主张）Δ 区间 {_fmt(dn)} PPL，allblocks−learned Δ 区间 {_fmt(ab)} PPL——{_dtxt}；(2) randidx−learned Δ 区间 {_fmt(ri)} PPL——' + ('全为正值且全部对照达到 p<0.05：学习到的检索对抗噪性有**独立贡献**（强版本成立）。' if learned_helps else f'未能在 p<0.05 上成立（randidx 对照的最小 n={n_min_ri}，全表最小 n={n_min}[{', '.join(sorted(_bind)[:2])}{('…' if len(_bind) > 2 else '')}]，精确符号翻转的 p 下限为 {p_floor:.3f}，' + ('该种子数下无法达到 0.05 显著性' if not (p_floor <= 0.05) else '分辨率已足以达到 0.05，未显著是数据结论而非分辨率上限') + '），「抗噪性来自学习到的检索质量」的强版本**不成立**；现有数据只支持「抗噪性主要来自稀疏归纳偏置本身」这一较弱表述。') + '）')
         A('')
     # ---- P3M-2：从头训练的选择器对照 ----
     _new_c = {k: v for k, v in contr.items() if k not in _legacy and not k.startswith('ΔNLL')}

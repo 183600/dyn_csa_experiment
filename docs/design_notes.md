@@ -9744,3 +9744,92 @@ inert factory 让每条对照都 fail；缺声明/陈旧声明/未知 mode/把 f
 空 design/空 declaration 被拒绝；`audit_gates.audit_manipulation()`、
 `single_factor` 子块、`run_report` 与 CLI 别名接线；探针不泄漏调用方
 RNG 状态。完整 CPU 套件在本轮最终树通过。
+
+## 112. 干扰注入探针的机制对照也必须声明并核验单因素（本轮单因素实验检查）
+
+### 112.1 问题
+
+v10/v11 的远距干扰注入探针（P3MP/P4MP/P5MP）把
+`dense/randidx/allblocks - learned` 与两条从头训练的选择器对照写进
+`probe.contrasts`，报告里也以「机制结论」引用。但这条面板此前只有
+`NIAH_CONTRAST_FACTORS` 覆盖 NIAH-natural，探针自己的对照**没有任何
+`single_factor`/`factors` 声明，也没有定义点审计**：
+
+- `dense` 是 `kind` 交换的架构级对照，不是 knob 级单因素；
+- `randidx` / `allblocks` 是同一 checkpoint 上的推理期 override，分别只
+  应改 `indexer_mode` / `index_topk`；
+- `csa_randtrain` / `csa_alltrain` 是从头训练的选择器对照，必须只差同一
+  个选择器键；
+- `retrain-gap`（测试时干预 − 从头训练）与 `arch-aligned`（dense −
+  all-block 孪生）本来就是复合/架构级读数，不能写成单因素机制证据。
+
+一个臂定义漂移（例如 `allblocks` 同时改了 `use_sink`）不会被任何记录级
+配对门看见，因为探针记录并不进入 `ABLATION_DESIGN`。
+
+### 112.2 方法：独立注册表 + 同一套定义点审计
+
+新增 `exp_lib.PROBE_CONTRAST_FACTORS`（别名
+`PROBE_FACTOR_DECLARATIONS` / `DISTRACTOR_PROBE_CONTRAST_FACTORS`），
+对五类探针对照逐条声明 `a`/`b` 或共享 `override`、`factors`、
+`single_factor` 与读数边界：
+
+| 对照 | 实际改动 | 单因素 | 读数边界 |
+|---|---|---|---|
+| `dense` | `kind` | 否 | 架构级 dense 参考 |
+| `randidx` | `indexer_mode` | 是 | 同 checkpoint、同 top-k 的推理期随机选择 |
+| `allblocks` | `index_topk` | 是 | 读取预算干预，不是等预算比较 |
+| `csa_randtrain` | `indexer_mode` | 是 | 从头训练、同 top-k |
+| `csa_alltrain` | `index_topk` | 是 | 从头训练的全块读取，预算不等 |
+
+`exp_lib.probe_contrast_factor_audit()` 复用与 NIAH 相同的真实 v7 工厂和
+共享 override 表，逐条重算臂/override diff：
+
+- 声明/实际键集两个方向都必须完全一致（多一个键 = 第二个因素，少一个 =
+  干预消失）；
+- `single_factor=True` 还必须落在 `cfg_keys_single_factor()` 的同一个
+  声明族内；
+- `observed_tags` 把记录侧也闭合：分析路径若发出未声明的探针 tag，审计
+  fail-closed，而不是让记录静默地没有因素标签；
+- `attach_probe_factor_metadata()` 把声明、`contrast_level` 与
+  `factor_declaration_verified` 写进每条探针记录；未通过定义点审计时
+  保留 `declared_single_factor=True` 并把 `single_factor` 清零。
+
+探针记录还显式标注：`dense` 为 `architecture_level`；`retrain-gap` 为
+`system_level`（训练/checkpoint 与推理期适应捆绑）；`arch-aligned` 为
+`architecture_level`。v10/v11 报告在机制段前增加因素结构说明，并把
+`dense−learned` 标为「架构级参考，不进入单因子机制主张」。
+
+### 112.3 接线
+
+- `audit_gates.py single_factor` 新增 `probe_contrasts` 块；
+- 顶层 `audit_gates.py report` 新增 `probe_contrasts`；
+- 单命令入口 `audit_gates.py probe_contrasts`（别名 `probe_controls` /
+  `probe_factor` / `distractor_probe`）。
+
+### 112.4 边界
+
+- 这是**定义点**证据：它证明探针的 `randidx` / `allblocks` 对照在臂配置
+  上只差一个声明键，不证明干预在真实前向上有效（那由 §111 的功能操作
+  检查负责），也不证明机制有用（仍需终点、区间与种子证据）。
+- `allblocks` 仍是单因素但**不是 read-budget matched**；`dense` 永远不
+  进入 knob 级单因素主张。
+- `retrain-gap` / `arch-aligned` 保留为复合/系统级读数，不因注册表新增
+  而被追认为单因素。
+- 零 GPU；不新增训练、不读取 test split、不修改冻结清单的字节/种子/
+  端点/alpha/Holm 规则，也不改 `CODE_SEMANTICS`；`.github/` 与所有
+  README 未删除或移动。
+
+### 112.5 入口与验证
+
+```bash
+python audit_gates.py probe_contrasts  # 探针五类对照的定义点审计
+python audit_gates.py single_factor    # 含 probe_contrasts
+python audit_gates.py report           # 顶层含 probe_contrasts
+python -m pytest -q test_review_part_53.py
+```
+
+`test_review_part_53.py` 7 项覆盖：shipped 注册表逐条通过且 `dense` 为
+架构级；声明漂移/不可构造臂/非法声明/未知 override fail-closed；记录侧
+未声明 tag 拒绝；元数据在未验证时清零 `single_factor`；v10/v11 分析接线；
+audit gate/report/CLI 接线；审计不修改注册表。相关既有测试与完整 CPU
+套件在本轮最终树通过。

@@ -1470,6 +1470,60 @@ NIAH_CONTRAST_FACTORS = {
     },
 }
 
+# The v10/v11 distractor-injection probe (P3MP/P4MP/P5MP) reuses the same
+# inference-time intervention map as NIAH-natural, but its contrasts were
+# never declared or machine-checked.  A panel that quotes
+# ``randidx/allblocks - learned`` as mechanism evidence therefore had no
+# definition-site guarantee that the two arms really differed in exactly one
+# attention-cfg key.  This registry makes the factor structure explicit:
+# ``dense`` is an architecture/operator swap (never a knob-level single
+# factor); ``randidx``/``allblocks`` are inference-time overrides on the same
+# checkpoint; the two ``*train`` entries are from-scratch selector controls.
+# The ``retrain-gap`` and ``arch-aligned`` compound contrasts are deliberately
+# NOT in this table: they are differences of two interventions/checkpoints and
+# are reported as system-level readings, never as a single-factor ablation.
+PROBE_CONTRAST_FACTORS = {
+    'dense': {
+        'a': 'csa_fixed_rope', 'b': 'full_rope',
+        'single_factor': False,
+        'factors': ['kind'],
+        'factors_note': ('parameter-matched dense baseline: attention-operator '
+                         'swap, architecture-level rather than a single knob'),
+    },
+    'randidx': {
+        'override': 'randidx',
+        'single_factor': True,
+        'factors': ['indexer_mode'],
+        'factors_note': ('inference-time random block-selection control on the '
+                         'same checkpoint and top-k'),
+    },
+    'allblocks': {
+        'override': 'allblocks',
+        'single_factor': True,
+        'factors': ['index_topk'],
+        'factors_note': ('read-rich all-block intervention on the same '
+                         'checkpoint; single-factor but NOT read-budget matched'),
+    },
+    'csa_randtrain': {
+        'a': 'csa_fixed_rope_randidx', 'b': 'csa_fixed_rope',
+        'single_factor': True,
+        'factors': ['indexer_mode'],
+        'factors_note': 'from-scratch random-selection control at the same top-k',
+    },
+    'csa_alltrain': {
+        'a': 'csa_fixed_rope_allblocks', 'b': 'csa_fixed_rope',
+        'single_factor': True,
+        'factors': ['index_topk'],
+        'factors_note': ('from-scratch read-rich all-block control; single-factor '
+                         'but not read-budget matched'),
+    },
+}
+# Historical/alias names kept small and explicit; the registry is the source of
+# truth, so downstream callers should not maintain a second copy.
+PROBE_FACTOR_DECLARATIONS = PROBE_CONTRAST_FACTORS
+PROBE_CONTRAST_FACTOR_DECLARATIONS = PROBE_CONTRAST_FACTORS
+DISTRACTOR_PROBE_CONTRAST_FACTORS = PROBE_CONTRAST_FACTORS
+
 def apply_niah_inference_arm(cfg, base_cfg, arm, overrides=None):
     overrides = NIAH_INFERENCE_ARM_OVERRIDES if overrides is None else overrides
     if not isinstance(overrides, dict):
