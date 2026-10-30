@@ -115,6 +115,16 @@
                p/Holm/verified/confirmed（读 analysis_v12/test_stats.json
                的逐种子 NLL/token 记账并重放，篡改判 fail；零 GPU；别名
                length_bands / position_bands）
+  length_strata  结果分析：长度**构成**敏感性——按评测单位 token 数做等数量
+               分位分层，逐层重算同一 token 池化配对 ΔPPL 与 log 比，
+               并按声明的参考层权重做等层标准化；回答「token 池化的效应
+               是否被长文档主导、换一个长度构成后方向/幅度是否改变」。
+               同时报告层间异质性（Cochran Q/I²，因同一批种子而近似）、
+               极端层差、符号一致性与贡献集中度。不是新检验、不进入 Holm
+               族、不改变 p/Holm/verified/confirmed（从 test_stats.json 的
+               逐单位 token 数、层成员与逐种子 NLL 充分统计量重放，篡改
+               判 fail；零 GPU；别名 length_composition /
+               composition_sensitivity / doc_length_strata）
   family_correction  结果分析：重放确认主族的**依赖感知联合校正**——从逐种子
                配对差重建 sign-invariant score 的精确 Westfall-Young
                step-down max-T、同统计量 Holm、可用时的 studentised t

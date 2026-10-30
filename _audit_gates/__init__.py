@@ -32,6 +32,7 @@ _PARTS = [
 'part_17_audit_practical.py',
 'part_18_audit_family_correction.py',
 'part_19_audit_environment_identity.py',
+'part_20_audit_length_strata.py',
 ]
 
 load_split_package(globals(), _HERE, _PARTS, repo_depth=1,

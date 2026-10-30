@@ -160,6 +160,8 @@ def _doc_level_analysis(recs_a, recs_b, common, Ln, primary_deltas=None):
     _pooled_ci_reason = None
     _unit_influence = None
     _unit_influence_reason = None
+    _length_strata = None
+    _length_strata_reason = None
     _two_level_ci = None
     _two_level_ci_reason = None
     _variance_components = None
@@ -231,6 +233,19 @@ def _doc_level_analysis(recs_a, recs_b, common, Ln, primary_deltas=None):
                             _unit_influence = None
                             _unit_influence_reason = (
                                 f'{type(_ie).__name__}: {_ie}')
+                        # Length post-stratification: the token-pooled estimate
+                        # is dominated by the longest units.  Recompute the
+                        # SAME paired estimand inside length strata and under
+                        # an equal-strata reference so the composition
+                        # sensitivity is visible next to the pooled Δ.
+                        try:
+                            _length_strata = L.length_stratified_effect(
+                                _nll_a, _nll_b, _ref_tok, seeds=common)
+                        except (ValueError, TypeError, FloatingPointError,
+                                OverflowError) as _lse:
+                            _length_strata = None
+                            _length_strata_reason = (
+                                f'{type(_lse).__name__}: {_lse}')
                         # Total uncertainty: the cluster CI above conditions on
                         # the trained seeds, so it can be much narrower than the
                         # uncertainty of a result that also samples seeds.  The
@@ -385,6 +400,12 @@ def _doc_level_analysis(recs_a, recs_b, common, Ln, primary_deltas=None):
             out['unit_influence_unavailable_reason'] = (
                 _unit_influence_reason or
                 'leave-one-unit-out influence not available for this cell')
+        if _length_strata is not None:
+            out['length_strata'] = _length_strata
+        else:
+            out['length_strata_unavailable_reason'] = (
+                _length_strata_reason or
+                'length post-stratification not available for this cell')
         if _two_level_ci is not None:
             out.update({
                 'pooled_two_level_delta_ppl': _two_level_ci['delta_ppl'],
@@ -854,6 +875,182 @@ def _doc_influence_markdown(ft):
         out += ['**解读提示**：' + '、'.join(frag) +
                 ' 的方向/幅度依赖单个评测单位；引用时必须同时报告该敏感度，'
                 '不能把结论描述为「对评测文档稳健」。', '']
+    return out
+
+
+def _length_strata_markdown(ft):
+    """Render the post-hoc length post-stratification table.
+
+    Pure function of the final-test stats dict, so the wording and the
+    "composition sensitivity, not a new test" boundary can be checked without
+    a panel.  The token-pooled overall row and the equal-strata standardised
+    row are shown together: the difference is the composition sensitivity,
+    not an alternative estimate that may be chosen after seeing the sign.
+    """
+    comps = (ft or {}).get('comparisons') if isinstance(ft, dict) else None
+    if not isinstance(comps, dict):
+        return []
+
+    def _num(value, fmt='{:+.3f}'):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return '—'
+        try:
+            f = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return '—'
+        return fmt.format(f) if math.isfinite(f) else '—'
+
+    def _ci(pair):
+        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+            return '—'
+        lo, hi = _num(pair[0]), _num(pair[1])
+        if lo == '—' or hi == '—':
+            return '—'
+        return f'[{lo}, {hi}]'
+
+    def _ratio(value):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return '—'
+        try:
+            f = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return '—'
+        if not (math.isfinite(f) and f > 0.0):
+            return '—'
+        return f'{f:.4g}'
+
+    rows = []
+    missing = []
+    corrupt = []
+    not_estimable = []
+    summary_lines = []
+    fragile = []
+    for name, comp in comps.items():
+        if not isinstance(comp, dict):
+            continue
+        dsm = comp.get('doc_sampling') or {}
+        ls = dsm.get('length_strata') if isinstance(dsm, dict) else None
+        if not isinstance(ls, dict):
+            if (isinstance(dsm, dict)
+                    and dsm.get('pooled_delta_ppl_ci95') is not None):
+                missing.append(name)
+            continue
+        if ls.get('status') == 'not_estimable':
+            not_estimable.append(f'{name}（{ls.get("reason") or "不可估计"}）')
+            continue
+        strata = ls.get('strata')
+        if ls.get('status') != 'ok' or not isinstance(strata, list) or not strata:
+            corrupt.append(name)
+            continue
+        def _obj(value):
+            return value if isinstance(value, dict) else {}
+
+        sign = _obj(ls.get('sign_consistency'))
+        concentration = _obj(ls.get('concentration'))
+        opposite = sign.get('opposite_strata') or []
+        dom = concentration.get('dominant_stratum')
+        overall = _obj(ls.get('overall'))
+        std = _obj(ls.get('standardized'))
+        rows.append('| %s | 全体（token 池化） | %s | 100%% | %s %s | %s (%s) %s | — |'
+                    % (name, ls.get('n_units', '—'),
+                       _num(overall.get('delta_ppl')),
+                       _ci(overall.get('delta_ppl_ci95')),
+                       _num(overall.get('log_ratio')),
+                       _ratio(overall.get('ratio')),
+                       _ci(overall.get('log_ratio_ci95'))))
+        _ls_policy = ls.get('policy') if isinstance(ls.get('policy'), dict) else {}
+        ref = std.get('reference') or _ls_policy.get('reference') or '—'
+        rows.append('| %s | 标准化（%s） | %s | — | %s %s | %s (%s) %s | 参考口径 |'
+                    % (name, ref, ls.get('n_units', '—'),
+                       _num(std.get('delta_ppl')),
+                       _ci(std.get('delta_ppl_ci95')),
+                       _num(std.get('log_ratio')),
+                       _ratio(std.get('ratio')),
+                       _ci(std.get('log_ratio_ci95'))))
+        for s in strata:
+            if not isinstance(s, dict):
+                corrupt.append(name)
+                break
+            idx = s.get('index')
+            marker = []
+            if idx in opposite:
+                marker.append('⚠ 与总体反向')
+            if dom is not None and idx == dom:
+                marker.append('最大贡献层')
+            share = s.get('token_share')
+            share_txt = ('%.1f%%' % (100.0 * float(share))
+                         if isinstance(share, (int, float))
+                         and not isinstance(share, bool)
+                         and math.isfinite(float(share)) else '—')
+            rows.append('| %s | L%s（%s–%s tok） | %s | %s | %s %s | %s (%s) %s | %s |'
+                        % (name, idx, s.get('lo_tokens', '—'),
+                           s.get('hi_tokens', '—'), s.get('n_units', '—'),
+                           share_txt, _num(s.get('delta_ppl')),
+                           _ci(s.get('delta_ppl_ci95')),
+                           _num(s.get('log_ratio')), _ratio(s.get('ratio')),
+                           _ci(s.get('log_ratio_ci95')),
+                           '；'.join(marker) if marker else '—'))
+        het = _obj(ls.get('heterogeneity'))
+        q = _num(het.get('q'), '{:.3f}')
+        p = _num(het.get('p_chi2'), '{:.4g}')
+        i2 = _num(het.get('i2'), '{:.3f}')
+        ext = het.get('extreme_contrast') or {}
+        extra = []
+        if q != '—':
+            extra.append(f'Cochran Q={q}（df={het.get("df", "—")}, p≈{p}, I²={i2}）')
+        if isinstance(ext, dict) and ext.get('log_ratio_diff') is not None:
+            extra.append(
+                '极端层差 L%s−L%s = %s %s（PPL 比 %s）'
+                % (ext.get('high_stratum'), ext.get('low_stratum'),
+                   _num(ext.get('log_ratio_diff')), _ci(ext.get('ci95')),
+                   _ratio(ext.get('ratio'))))
+            if ext.get('excludes_zero'):
+                fragile.append(name)
+        if extra:
+            summary_lines.append(f'{name}: ' + '；'.join(extra))
+        elif het.get('reason'):
+            summary_lines.append(
+                f'{name}: 异质性读数不可用（{het.get("reason")}）')
+        if sign.get('standardization_flips_sign'):
+            fragile.append(name)
+        if concentration.get('cancellation'):
+            fragile.append(name)
+    if not rows and not missing and not corrupt and not not_estimable:
+        return []
+    out = ['### 长度分层 / 构成敏感性（post-hoc；不改变上面的冻结判定）', '']
+    if rows:
+        out += ['| 比较 | 口径 | 单位数 | token 份额 | ΔPPL [95% CI] | log 比 (PPL 比) [95% CI] | 标记 |',
+                '|---|---|---|---|---|---|---|']
+        out.extend(rows)
+        out += ['',
+                '> 定义：按评测单位的 token 数做**等数量分位分层**（只看 token 数，不看臂结果）；'
+                '每层重算与主比较同口径的 token 池化 ΔPPL 与 `log(PPL_a/PPL_b)`，区间是逐种子 t 区间'
+                '（条件在已训练种子上）。`标准化` 把逐种子 log 效应按声明的参考层权重（默认等层）重加权；'
+                '它与 `全体` 的差就是**长度构成敏感性**。`token 份额` 是自然 token 池化权重；'
+                '`最大贡献层` 是 `token 份额 × 层 log 比` 绝对值最大的层。'
+                '`标准化` 的 ΔPPL 是各层 ΔPPL 的加权平均（层内仍 token 池化），'
+                '不是把 token 按参考权重重排后重算的单一 PPL；PPL 非线性使二者不同，'
+                '构成比较应以 log 比为准。'
+                '该表是**对已发生数据的 post-hoc 描述**：不新增 p 值、不进入冻结 Holm 族、'
+                '不改变 `p_exact_signflip`/`p_holm`/`verified`/`confirmed`，也不允许在看到方向后'
+                '挑选更有利的参考权重。', '']
+    if summary_lines:
+        out += ['**分层异质性**：' + '；'.join(summary_lines) + '。', '']
+    if not_estimable:
+        out += ['> 以下比较的长度分层不可估计（不伪造分层读数）：'
+                + '；'.join(not_estimable) + '。', '']
+    if missing:
+        out += ['> 以下比较有 pooled CI 但没有长度分层块（旧产物或未重新生成分析），'
+                '构成敏感性**未验证**：' + '；'.join(missing) + '。', '']
+    if corrupt:
+        out += ['> 以下比较的长度分层块损坏或状态未知，构成敏感性**未验证**：'
+                + '；'.join(corrupt) + '。', '']
+    if fragile:
+        names = sorted(set(fragile))
+        out += ['**解读提示**：' + '、'.join(names) +
+                ' 的效应依赖长度构成、极端层差、层间抵消或标准化口径；引用时必须同时报告本表，'
+                '不能把 token 池化结论描述为「对评测文档长度分布稳健」，也不能用等层标准化'
+                '替换主估计。', '']
     return out
 
 

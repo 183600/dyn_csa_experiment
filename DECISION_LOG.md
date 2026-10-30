@@ -5203,3 +5203,35 @@ environment 维度绑定 v2/v3；`run_hyperparameters`/manifest 的 v3 字段与
 计数；环境审计的 v3 计数、legacy v2 不降级、v3 冲突；release identity
 同时记录 v2/v3/backend。`test_review_part_51.py` 19 项 v2 行为保持通过；
 完整 CPU 套件 1091 passed / 3 skipped（本机 DataLoader 环境跳过）。
+
+## 2026-10-30 — token 池化 PPL 的长度构成敏感性：等数量分层与声明式标准化（本轮结果分析硬化，no new runs）
+
+**Problem.** 主终点按 token 池化，长评测单位天然占更大权重。已有 cluster
+CI（§54/§57）、排序/选择偏差（§102–104）和 leave-one-unit-out 影响（§58）
+分别回答抽样噪声、选择极值与单单位杠杆，但没有回答「效应是否只存在于
+最长的一批单位、换一个长度构成是否还成立」。把 token 池化 ΔPPL 直接读成
+「平均文档更好」会把一个对长度构成敏感的读数当成总体结论。
+
+**Fix.** 新增 `exp_lib.LENGTH_STRATA_POLICY` 与
+`length_stratified_effect()`：按单位 token 数做等数量分位分层（只看
+token 数，不看臂结果），逐层重算同一 token 池化 ΔPPL 与 log PPL 比并给
+seed-level t 区间；按声明的参考层权重（默认等层）标准化逐种子 log 效应，
+报告标准化位移/符号翻转；给出 Cochran Q/I²/τ²（明确近似，因同一批种子
+服务所有层）、极端层差、两两层差、符号一致性、逐层 signed contribution
+与集中度。块内存逐单位 token 数、层成员与逐种子 NLL 充分统计量，供
+`audit_gates.py length_strata` 独立重放。
+
+**Boundary.** 分层由观测 token 数定义，不是预注册的语料长度分布；t 区间
+条件在已训练种子上，不重采样文档/token；Q 的卡方参考因共享种子而近似；
+标准化的等层权重只是一个声明参考，不能看到方向后挑选；不新增 p 值、不
+进入冻结 Holm 族、不改变 `p_exact_signflip`/`p_holm`/`verified`/
+`confirmed`；不新增训练/种子/test 访问；`.github/` 与所有 README 未删除
+或移动。
+
+**Verification.** 新增 `test_review_part_55.py`：policy/status、分层效应
+随长度增强、全体与 `_paired_nll_doc_ci` 同口径、短/长层反向时等层标准化
+翻转、符号一致/反向点名、自定义/`token` 参考、自动减层与
+`not_estimable`、非法输入 fail-closed、极端有限值严格 JSON、
+`_doc_level_analysis` 接线、审计 `ok`/篡改 `fail`/缺块
+`not_verifiable_locally`/bare `not_estimable` `not_applicable`、报告渲染
+与边界段。完整 CPU 套件在本轮最终树通过。

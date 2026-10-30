@@ -70,6 +70,7 @@ _PARTS = [
 'part_53_confirmation_practical.py',
 'part_54_family_correction.py',
 'part_55_ablation_manipulation.py',
+'part_56_length_strata.py',
 ]
 
 load_split_package(globals(), _HERE, _PARTS, repo_depth=1,

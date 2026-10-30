@@ -9945,3 +9945,121 @@ notes；`analysis_report_diff` 的 environment 维度也绑定 v2/v3（改 v3 �
 `with_env_fp_v3` 计数；环境审计的 v3 计数、legacy v2 不降级、v3 冲突合并；
 release identity 同时记录 v2/v3/backend。`test_review_part_51.py` 的 19 项
 v2 行为保持通过。完整 CPU 套件 1091 passed / 3 skipped（本机 DataLoader 环境跳过）。
+
+## 114. token 池化 PPL 的效应不只是「平均」：按评测单位长度后分层与构成敏感性（本轮结果分析硬化，no new runs）
+
+零 GPU 的结果分析硬化；不新增训练、不读取 test split、不修改
+`confirmation_frozen*.json` 的字节/种子/端点/α/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未删除或移动。
+
+### 114.1 问题：token 池化会自动给长文档更大权重
+
+主终点是 token 池化的 PPL 差：每个评测单位按 `nll_sum / n_tokens` 进入
+总分母，长文档天然占更大权重。§54/§57 的 cluster CI 与 §102–104 的排序
+读数解决的是**抽样噪声**与**选择偏差**；`paired_nll_unit_influence`
+（§58）解决的是「删掉一个单位后结论是否翻转」。它们都没有回答另一个
+结果分析问题：**这个效应是每一类长度都有的，还是只由最长的一批单位
+贡献？** 如果短单位与长单位方向不同，那么 token 池化的符号/幅度就依赖
+这批评测切片的长度构成；换一个语料（或换一个评测采样计划）就可能得到
+不同的答案。把「平均文档更好」与「token 池化 PPL 更低」混读，正是
+§63 已指出但未按长度拆开的估计量差异。
+
+### 114.2 方法：等数量长度分层 + 声明式标准化
+
+新增 `exp_lib.LENGTH_STRATA_POLICY` 与
+`exp_lib.length_stratified_effect(nll_a, nll_b, n_tokens, *, n_strata=4,
+min_units_per_stratum=2, conf=0.95, reference='equal_strata', seeds=None)`：
+
+- **分层只看 token 数**：按单位 token 数稳定排序，做等数量分位分箱
+  （默认 4 层，最少 2 个单位/层；不足时自动减层，仍不足则
+  `not_estimable`）。分箱不使用臂结果，避免看到方向后挑层。
+- **同一估计量**：每层用与主比较相同的 token 池化构造
+  `ΔPPL = exp(Σnll_a/Σtok) − exp(Σnll_b/Σtok)` 与
+  `log(PPL_a/PPL_b) = Σnll_a/Σtok − Σnll_b/Σtok`；逐种子计算，报告
+  seed-level t 区间（条件在已训练种子上）。全体行与主比较同口径。
+- **标准化**：把逐种子 log 效应按声明的参考层权重重加权
+  （默认 `equal_strata`，也接受 `token` 或显式权重序列），得到
+  `standardized.log_ratio`、PPL 比与区间；`log_ratio_shift_from_overall`
+  是构成敏感性的大小，`standardization_flips_sign` 是符号是否被
+  参考权重改变。标准化后的 PPL 差是各层 `ΔPPL_g` 的加权平均，必须与
+  log 比分开读。
+- **异质性读数**：Cochran `Q`、`I²`、`τ²`（逆方差合并的 log 比）、
+  极端层差 `L_high − L_low` 及其区间、全部两两层的描述性区间；
+  因为同一批种子出现在所有层，`Q` 的卡方参考是**近似**的，明确写在
+  policy 与报告中，不冒充独立研究间的异质性检验。
+- **构成/符号读数**：层符号与总体符号是否一致、哪些层与总体反向、
+  各层对总 log 效应的 signed contribution 与绝对占比
+  （`max_abs_share` / `dominant_stratum` / `cancellation`）。同一批单位
+  上「每层 ΔPPL 都与总体反向」在数学上不可能（pooled CE 是层 CE 的正
+  加权平均且 exp 单调），所以不输出这种伪 Simpson 字段；真正可发生的
+  是标准权重改变后的符号翻转与层间部分抵消。
+- **可重放**：块内存逐单位 token 数、层成员 `unit_indices`、逐层逐种子
+  的 `nll_a_sum`/`nll_b_sum` 与逐种子总计，足以在审计端重建全部派生
+  数字，不依赖重新读 test split。
+
+### 114.3 边界：这是构成敏感性，不是第二个确认性检验
+
+- **没有新 p 值进入冻结族。** `ΔPPL`/log 比区间是 seed-level t 区间；
+  `Q`/`I²` 是描述性异质性读数，两两区间不做多重校正、不构成「某层显著
+  更好」的确认。它们不改变 `p_exact_signflip`、`p_holm`、`verified` 或
+  冻结 `confirmed`。
+- **分层由观测 token 数定义。** 不是预注册的语料长度分布，也不是
+  从总体抽样的层；换一批评测单位可能得到不同的层边界。等层标准化只是
+  一个声明参考，不能被追认为「正确」的语料构成。
+- **区间条件在种子上。** 它不重采样文档/token；文档与文章的抽样不确定性
+  仍由 `doc_sampling`、two-level bootstrap 与 §81 负责。层内单位高度
+  相关，不能把层内单位数当独立样本量。
+- **`Q` 的近似性来自共享种子。** 层间是配对的，不是独立研究；卡方
+  p 只作为量级参考，不能据此宣称「异质性已检验」。若要把它变成确认性
+  交互主张，必须在首次 test 读取前预注册层边界、对比与校正族。
+- **不替代主估计。** `standardized` 与 `overall` 并列报告；看到方向后
+  不能挑一个更有利的参考权重。主终点仍是冻结清单声明的 token 池化
+  ΔPPL，`标准化` 只是它的构成敏感性。
+- **旧产物不回填。** 没有逐单位 token/NLL 的旧 `test_stats.json` 不能
+  反推分层；审计报 `not_verifiable_locally`，不猜测、不重跑。
+
+### 114.4 落盘、报告与审计
+
+- `explib.confirmation._doc_level_analysis` 在 pooled CI 与
+  leave-one-unit-out 影响块之后调用 `length_stratified_effect`，写入
+  `comparisons[name]['doc_sampling']['length_strata']`（含 `units`、
+  `strata`、`per_seed`、`overall`、`standardized`、`heterogeneity`、
+  `sign_consistency`、`concentration`、`policy`、`boundary`）。
+- `REPORT_v12` 在「单元影响诊断」之后新增「长度分层 / 构成敏感性」表：
+  全体 token 池化行、等层标准化行、逐层 ΔPPL/log 比/区间/token 份额/
+  标记，以及 `Q`/`I²`、极端层差、符号一致性与集中度；`not_estimable`
+  只打印原因，不渲染假表。
+- `audit_gates.py length_strata`（别名 `length_composition` /
+  `composition_sensitivity` / `doc_length_strata`）读取
+  `analysis_v12/test_stats.json` 的 `doc_sampling.length_strata`，先核对
+  单位/层成员/逐种子 NLL 充分统计量自洽，再把每层聚合成一个单位调用同一
+  `length_stratified_effect` 重放 `overall`/`standardized`/
+  `heterogeneity`/`sign_consistency`/`concentration` 与逐层派生值，逐字段
+  比较；夹带 `confirmed`/`p_holm`/`verified`/verdict 判 `fail`，缺块报
+  `not_verifiable_locally`，bare `not_estimable` 报 `not_applicable`。
+  它并入 `audit_gates.py report` 的顶层 `length_strata`，`make audit`
+  因此在真实篡改/不一致时非零退出。它是**内部重放**：能发现「改了派生
+  读数却没同步改充分统计量」和删字段，但不能证明 token 数/NLL 就是原始
+  test 切片上的测量；后者由 stamped 输入绑定、冻结锁与
+  `analysis_integrity` 负责。
+
+### 114.5 入口与验证
+
+```bash
+python -m pytest -q test_review_part_55.py
+python audit_gates.py length_strata          # 重放 analysis_v12/test_stats.json
+python audit_gates.py length_composition     # 别名
+python audit_gates.py report                 # 顶层汇总含 length_strata
+make audit
+```
+
+`test_review_part_55.py` 覆盖：policy/status；清晰分层效应随长度增强时
+逐层 log 比有序、全体与 `_paired_nll_doc_ci` 同口径、标准化与 Q/I² 有限；
+短层改善/长层变差时 token 池化符号与等层标准化符号相反并置
+`standardization_flips_sign`；层符号与总体反向被点名；自定义权重与
+`token` 参考；等数量分层不足时自动减层/`not_estimable`；非法 token 数/
+布尔/非有限/形状不一致/重复 seed/非法参数 fail-closed；极端有限值严格
+JSON；`_doc_level_analysis` 落盘接线；审计对合法块 `ok`、篡改
+`standardized`/逐层 log 比/充分统计量/夹带 `confirmed` 判 `fail`、缺块
+`not_verifiable_locally`、bare `not_estimable` `not_applicable`；报告渲染
+新表与「不改变冻结判定」边界段。完整 CPU 套件在本轮最终树通过。
