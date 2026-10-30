@@ -173,7 +173,7 @@ def audit_single_factor(manifest_path=None):
            'niah_contrasts': {}, 'dynamic_study': {},
            'frozen_manifest': {}, 'factorial_design': {},
            'content_controls': {}, 'sink_controls': {},
-           'fusion_controls': {}}
+           'fusion_controls': {}, 'gate_controls': {}}
     design_rep = L.single_factor_design_audit(verbose=False)
     out['design'] = design_rep
     init_rep = L.single_factor_initialization_audit()
@@ -188,12 +188,15 @@ def audit_single_factor(manifest_path=None):
     out['sink_controls'] = sink_rep
     fusion_rep = L.fusion_control_audit()
     out['fusion_controls'] = fusion_rep
+    gate_rep = L.gate_control_audit()
+    out['gate_controls'] = gate_rep
     if (design_rep.get('status') != 'ok' or init_rep.get('status') != 'ok'
             or ob_rep.get('status') != 'ok'
             or fact_rep.get('status') != 'ok'
             or ctrl_rep.get('status') != 'ok'
             or sink_rep.get('status') != 'ok'
-            or fusion_rep.get('status') != 'ok'):
+            or fusion_rep.get('status') != 'ok'
+            or gate_rep.get('status') != 'ok'):
         out['status'] = 'fail'
     # v9/v10 attach a `single_factor`/`factors` label to each seq2k paired
     # record.  Verify that label against the actual arm construction instead of
@@ -431,6 +434,23 @@ def audit_fusion_controls():
     """
     L = _import_exp_lib()
     out = L.fusion_control_audit()
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return out
+
+
+def audit_gate_controls():
+    """Learned/frozen boundary-gate control ladder audit (zero GPU, design point).
+
+    Checks that the learned boundary offset has a capacity- and objective-
+    matched frozen placebo: same delta_logit shape/count/initial value and the
+    same comp_reg term, with only trainability (and the effective delta LR)
+    changed.  Both controls must be scheduled and declared as the
+    ``dynamic_blocking_learning`` single-factor contrast with exactly
+    ``gate_mode`` as the intervention key.  The on/off dynamic contrast remains
+    the total effect and cannot support a learned-gate claim by itself.
+    """
+    L = _import_exp_lib()
+    out = L.gate_control_audit()
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return out
 

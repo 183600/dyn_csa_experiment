@@ -518,7 +518,7 @@ freeze and need their own pre-registration.
 ```bash
 python audit_gates.py causality   # CPU unit audit: prefix invariance / label shift / decode consistency
 python audit_gates.py leakage     # tokenizer provenance, vocab identity, train/test overlap
-python audit_gates.py single_factor  # design-time gate: every declared contrast's arm-cfg diff equals its declared intervention key set; open-block matrix axes; frozen-manifest mechanism_claim_allowed flags vs the actual cfg diff
+python audit_gates.py single_factor  # design-time gate: every declared contrast's arm-cfg diff equals its declared intervention key set; open-block matrix axes; frozen-manifest mechanism_claim_allowed flags vs the actual cfg diff; also the learned/frozen boundary-gate, sink, content and fusion control ladders
 python audit_gates.py sesoi       # design-time gate: every ablation component has a valid declared SESOI and is fully scheduled
 python audit_gates.py unit_influence  # result-analysis gate: unit-influence block reproduces pooled Δ; flags one-unit-driven comparisons
 python audit_gates.py looks       # look-history gate: recompute per-look and exact max-over-looks sequential p; flags seed top-ups that only look significant at the final n

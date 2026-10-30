@@ -417,7 +417,7 @@ phase 只读 train/valid。首次 test split 评估之后禁止追加冻结比�
 ```bash
 python audit_gates.py causality   # 纯 CPU 单元审计：前缀不变性 / 标签移位 / 解码一致性
 python audit_gates.py leakage     # 分词器来源 / 词表一致性 / train-test 文档重叠
-python audit_gates.py single_factor  # 定义点单因素门：每条声明对照的臂配置 diff 恰等于声明的干预键集；开放块矩阵只沿声明轴变化；冻结清单的 mechanism_claim_allowed 标志与实际 cfg diff 对账
+python audit_gates.py single_factor  # 定义点单因素门：每条声明对照的臂配置 diff 恰等于声明的干预键集；开放块矩阵只沿声明轴变化；冻结清单的 mechanism_claim_allowed 标志与实际 cfg diff 对账；并核验 learned/frozen 边界门、sink、content、fusion 的容量/目标匹配对照阶梯
 python audit_gates.py sesoi       # 设计期门：每个消融组件都有合法已声明 SESOI，且声明对照完整排程
 python audit_gates.py unit_influence  # 结果分析门：逐单元影响块必须复现主终点 pooled Δ；标记单单元主导/陈旧产物
 python audit_gates.py looks       # look-history 门：复核逐 look p 与精确 max-over-looks 序列 p；标记「补种子后才显著」的对照

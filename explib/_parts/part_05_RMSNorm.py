@@ -276,6 +276,10 @@ def make_layer_cfgs(n_layers, variant):
             cfgs.append(AttnCfg(kind='csa', dynamic=False, block_size=4, overlap=OVERLAP, index_topk=32))
         elif variant == 'csa_dynamic':
             cfgs.append(AttnCfg(kind='csa', dynamic=True, chunking='cosine_learnable', target_block_tokens=4, overlap=OVERLAP, index_topk=32, temperature=0.1))
+        elif variant == 'csa_dyn_frozengate':
+            # Capacity/objective-matched placebo: same delta_logit parameter
+            # and comp_reg term as csa_dynamic, frozen at its initial value.
+            cfgs.append(AttnCfg(kind='csa', dynamic=True, chunking='cosine_learnable', target_block_tokens=4, overlap=OVERLAP, index_topk=32, temperature=0.1, gate_mode='frozen'))
         elif variant == 'hybrid_fixed':
             if i % 2 == 0:
                 cfgs.append(AttnCfg(kind='csa', dynamic=False, block_size=4, overlap=OVERLAP, index_topk=32))
@@ -286,6 +290,13 @@ def make_layer_cfgs(n_layers, variant):
                 cfgs.append(AttnCfg(kind='csa', dynamic=True, chunking='cosine_learnable', target_block_tokens=4, overlap=OVERLAP, index_topk=32, temperature=0.1))
             else:
                 cfgs.append(AttnCfg(kind='hca', dynamic=True, chunking='cosine_learnable', target_block_tokens=64, temperature=0.1, comp_lambda_mult=4.0))
+        elif variant == 'hybrid_dyn_frozengate':
+            # Same hybrid geometry and HCA 4x objective multiplier as
+            # hybrid_dynamic, but every learnable boundary offset is frozen.
+            if i % 2 == 0:
+                cfgs.append(AttnCfg(kind='csa', dynamic=True, chunking='cosine_learnable', target_block_tokens=4, overlap=OVERLAP, index_topk=32, temperature=0.1, gate_mode='frozen'))
+            else:
+                cfgs.append(AttnCfg(kind='hca', dynamic=True, chunking='cosine_learnable', target_block_tokens=64, temperature=0.1, comp_lambda_mult=4.0, gate_mode='frozen'))
         elif variant == 'full_sink':
             cfgs.append(AttnCfg(kind='full', full_sink=True))
         elif variant == 'full_randomsink':

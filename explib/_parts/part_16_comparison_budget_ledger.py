@@ -1095,6 +1095,15 @@ HYPOTHESIS_DESIGN = {
         'requires_param_match': True,
         'falsifier': 'No family-Holm-corrected PPL reduction, a reduction within seed noise, or a reduction that reverses when fixed/dynamic blocking is swapped.',
     },
+    'dynamic_blocking_learning': {
+        'statement': 'A learned boundary-gate offset lowers validation PPL versus the identical-shape frozen offset at the same parameter count, read budget and compression objective.',
+        'mechanism': 'The compression-regularized gate can move its per-layer offset to place cuts where they reduce the language-modelling loss; a frozen offset of the same capacity cannot adapt, so a gain isolates the learned component from the parameter and objective terms.',
+        'predicted_sign': -1,
+        'primary_metric': 'ppl',
+        'metric_policy': 'lm_perplexity',
+        'requires_param_match': True,
+        'falsifier': 'The frozen offset matches or beats the learned offset after Holm correction, or the difference is within the pre-registered SESOI; then the dynamic on/off contrast alone can only support a total-effect/capacity claim, not a learned-boundary mechanism.',
+    },
     'learned_selection': {
         'statement': 'Learned top-k block selection lowers validation PPL versus random selection with the same number of attended blocks.',
         'mechanism': 'Query-conditioned indexer scores retrieve blocks that carry token-relevant content instead of an arbitrary subset.',

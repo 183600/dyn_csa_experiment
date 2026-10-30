@@ -9374,3 +9374,114 @@ studentised t 不可用时仍给出有限 score p 且 CI/MDE 为 `None`；全零
 `confirmed`/删族成员均判 `fail`，缺块 `not_verifiable_locally`、bare
 `not_estimable` `not_applicable`；报告渲染新表与边界段；CLI 别名与审计
 文档接线。完整 CPU 套件在本轮最终树通过。
+
+## 109. 学习边界门也需要容量/目标匹配的安慰剂（本轮实验设计与准备硬化）
+
+### 109.1 问题：dynamic on/off 不是「学习边界门」的单因素对照
+
+`ABLATION_DESIGN['dynamic_blocking']` 的 on/off 对照看起来只差
+`dynamic/chunking/target_block_tokens`，但实际同时移动了三件事：
+
+1. 切分几何（固定块 vs 余弦阈值 + 可学习 offset）；
+2. 每层多出 `delta_logit` 参数（本仓库 tiny 配置下 2 个/层）；
+3. 训练目标：`csa_dynamic` 的 `comp_reg_applies=True`、
+   `delta_lr_effective=10`，`csa_fixed` 则没有 `comp_reg`、delta LR 为 1。
+
+因此 on/off 显著只能支持「动态分块总效应（几何 + 容量 + 目标）」，
+不能单独归因到「边界门学到了东西」。这与 sink / content / fusion 的问题
+同型：前三者已通过 capacity-matched placebo 把「学习成分」和「额外容量/
+存在性」分开，边界门仍只有 on/off，是单因素实验覆盖的最后一块缺口。
+
+### 109.2 设计：`gate_mode='frozen'` 保留同一参数与同一目标
+
+`AttnCfg` 增加 `gate_mode ∈ {'learned','frozen'}`。`frozen` 不做「换一个
+随机 offset」这种会同时改变干预值的做法，而是保留与 learned **完全相同**的
+`delta_logit`：
+
+- 同 shape、同数量、同初值（仍由 `temperature/target_block_tokens` 的
+  确定性公式给出）；
+- 同 `comp_reg` 目标项（`train_objective` 仍报告
+  `comp_reg_applies=True`、相同的 `comp_lambda_effective`）；
+- 只把该参数 `requires_grad_(False)`，因此它不能从 `comp_reg` 得到更新；
+- 不消耗全局 RNG，构造 learned/frozen 两臂时后续所有参数逐值相同。
+
+`train_objective` 增加 `delta_trainable` / `delta_trainable_param_count` /
+`gate_modes`；`delta_lr_effective` 只在 delta 参数可训练时取
+`delta_lr_mult`，否则为 1。这样「冻结学习」不是隐藏在 `requires_grad`
+里的实现细节，而是目标描述里显式、可审计的字段。
+
+### 109.3 声明与对照阶梯
+
+新增臂：
+
+- `csa_dyn_frozengate`：与 `csa_dynamic` 同几何、同目标，gate 冻结；
+- `hybrid_dyn_frozengate`：与 `hybrid_dynamic` 同 CSA/HCA 分层、HCA 仍保留
+  `comp_lambda_mult=4`，所有可学习边界 offset 冻结。
+
+新增声明组件 `dynamic_blocking_learning`：
+
+| 对照 | 实际干预 | 读数 |
+|---|---|---|
+| `csa_dynamic - csa_dyn_frozengate` | 只差 `gate_mode` | CSA 学习边界门 |
+| `hybrid_dynamic - hybrid_dyn_frozengate` | 只差 `gate_mode` | hybrid 学习边界门（HCA 目标仍匹配） |
+
+两条对照的 `ABLATION_INTERVENTION_KEYS` 都恰好是 `{'gate_mode'}`，
+`SINGLE_FACTOR_CFG_FAMILIES` 增加 `{'gate_mode'}`，并补齐
+`ABLATION_SESOI`、`HYPOTHESIS_DESIGN`、`ABLATION_DESIGN` 与
+`RUN_ABL`/`ABL_VARIANTS` 排程。
+
+新增 `GATE_CONTROL_DESIGN` / `gate_control_audit`，逐 base 用真实工厂与
+tiny model 核验：
+
+- 两级 role 恰好 treatment / capacity_placebo，各自恰好一次；
+- treatment 就是 base（cfg diff 为空）；placebo 与 base 的 cfg diff 恰好
+  `['gate_mode']`，且构造出的每层 `gate_mode` 等于声明值；
+- 两臂都已排程，且不是同一 arm 的改名副本；
+- 总参数量、delta 参数量相同；delta 张量名相同、初值相同；
+- 非 delta 参数同 seed 逐值相同；
+- treatment 的 delta 参数全部 `requires_grad=True`，placebo 全部为
+  `False`；
+- 两个 `train_objective` 在 `comp_reg_applies`、`comp_lambda_effective`、
+  `delta_param_count`、`loss_terms`、`boundary_policy` 等字段上相同，只在
+  声明的 `delta_trainable` / `delta_lr_effective` 上不同；
+- `dynamic_blocking_learning` 的留一对照与 `{'gate_mode'}` 键集都已声明。
+
+`audit_gates.py single_factor` 新增 `gate_controls` 块；顶层 `report` 与
+CLI `gate_controls`（别名 `gate_placebo` / `boundary_gate` /
+`dynamic_gate`）接线。任何缺 level、未排程、改名副本、多改一个 cfg 键、
+重复 role、声明错 mode、删除声明或额外旋钮都 fail-closed。
+
+### 109.4 边界：frozen 只隔离「学习」，不回答「动态切分是否更好」
+
+- `learned - frozen` 的 estimand 是「同一容量、同一目标下，允许这个
+  offset 学习是否带来差异」；它不回答动态切分本身是否优于固定切分。
+- 后者仍是 `dynamic_blocking` 的 on/off 总效应，包含几何、参数和目标
+  三类差异；on/off 仍不能单独写成学习机制证据。
+- frozen 不是随机 offset 安慰剂：它保留同一初值，只破坏学习，因此不能
+  排除「任何固定 offset 都足够」的更强替代解释；该解释需要另一个随机
+  offset 阶梯，本轮不追认。
+- 新臂是下一轮运行的排程，不是已有证据；旧面板缺臂时
+  `ablation_completeness` 会如实报不完整。
+- 零 GPU；不新增训练、不读取 test split、不修改冻结清单字节/种子/端点/
+  alpha/Holm 规则，也不改 `CODE_SEMANTICS`。`.github/` 与所有 README 未
+  删除或移动（README 仅增补说明）。
+
+### 109.5 入口与验证
+
+```bash
+python -m pytest -q test_review_part_50.py
+python audit_gates.py gate_controls       # 新的 learned/frozen 边界门阶梯
+python audit_gates.py gate_placebo        # 别名
+python audit_gates.py single_factor       # 含 gate_controls/initialization
+python audit_gates.py report              # 顶层含 gate_controls
+```
+
+`test_review_part_50.py` 6 项覆盖：shipped ladder 通过（两个 base、参数/
+delta 参数相等、声明族与 SESOI/hypothesis 覆盖）；learned/frozen 同参数
+量、同 delta 初值、非 delta 参数逐值相同、treatment 可训练 / placebo
+冻结、comp_reg 目标匹配、只有 `delta_trainable`/`delta_lr_effective` 按
+声明不同；初始化时前向逐值相等；非法 `gate_mode` 与无 learnable offset 的
+frozen 配置 fail-closed；缺 level/未排程/改名副本/多改一个键/重复 role/
+声明错 mode/删声明/额外 cfg 旋钮全部 refuse；`audit_gate_controls` 与
+`single_factor` 的 gate/initialization 块均为 `ok`，`report` 含
+`gate_controls`。相关既有测试与完整 CPU 套件在本轮最终树通过。

@@ -155,6 +155,8 @@ def train_objective(m, *, comp_lambda=0.0, delta_lr_mult=1.0):
     _named = dict(m.named_parameters())
     delta_names = [n for n in _named if 'delta_logit' in n]
     delta_params = sum(int(_named[n].numel()) for n in delta_names)
+    delta_trainable_params = sum(int(_named[n].numel()) for n in delta_names
+                                 if bool(getattr(_named[n], 'requires_grad', False)))
     applies = bool(comp_lambda) and reg_layers > 0
     _weights = [float(comp_lambda) * m for m in _active]
     return {
@@ -165,8 +167,13 @@ def train_objective(m, *, comp_lambda=0.0, delta_lr_mult=1.0):
         'comp_reg_applies': bool(applies),
         'comp_lambda_effective': (max(_weights) if _weights else 0.0),
         'delta_param_count': int(delta_params),
+        'delta_trainable_param_count': int(delta_trainable_params),
+        'delta_trainable': bool(delta_trainable_params),
         'delta_lr_mult': float(delta_lr_mult),
-        'delta_lr_effective': float(delta_lr_mult) if delta_params else 1.0,
+        'delta_lr_effective': (float(delta_lr_mult)
+                               if delta_trainable_params else 1.0),
+        'gate_modes': sorted({str(getattr(a.cfg, 'gate_mode', 'learned'))
+                              for a in layers}),
         'boundary_policy': policies,
         'loss_terms': ['ce'] + (['comp_reg'] if applies else []) + (
             ['boundary_policy_gradient'] if any(p != 'threshold' for p in policies) else []),
@@ -453,6 +460,13 @@ OBJECTIVE_INTERVENTION_KEYS = {
                                           'comp_lambda_effective',
                                           'loss_terms'}),
     'task_learned_boundary': frozenset({'boundary_policy', 'loss_terms'}),
+    # Learned vs frozen boundary gate: the parameter, its initial value and
+    # the comp_reg term are identical; only trainability (and therefore the
+    # effective delta LR) changes.  `delta_lr_effective` is compared here;
+    # the `requires_grad` state itself is verified directly by
+    # `gate_control_audit`.
+    'dynamic_blocking_learning': frozenset({'delta_trainable',
+                                            'delta_lr_effective'}),
 }
 
 def _objective_diff(ra, rb):

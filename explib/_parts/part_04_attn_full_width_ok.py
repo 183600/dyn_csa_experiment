@@ -541,6 +541,14 @@ CONTENT_MODES = ('pooled', 'zero', 'shift')
 # are not aligned with the layer's query directions.
 SINK_MODES = ('learned', 'random')
 
+# Boundary-gate controls: `learned` is the shipped trainable per-layer
+# `delta_logit` offset; `frozen` keeps the SAME parameter (identical shape,
+# count, initial value and objective term) but freezes it at its initial
+# value.  The only difference is therefore whether the gate learns, making
+# learned-vs-frozen a single-factor contrast at matched capacity and
+# identical compression objective.  It also consumes no global RNG.
+GATE_MODES = ('learned', 'frozen')
+
 # Fusion controls: `none` is identity fusion (no convolution), `learned` is the
 # shipped trainable depth-wise convolution, and `random` keeps the SAME
 # parameter shape/count but replaces the learned weight with a fixed
@@ -665,6 +673,10 @@ class AttnCfg:
     # so the task objective can actually learn the boundary policy instead of
     # only the compression-rate regularizer.
     boundary_policy: str = 'threshold'
+    # 'learned' trains the per-layer boundary offset; 'frozen' keeps the
+    # identical parameter and comp_reg term but does not update it.  Used by
+    # the capacity/objective-matched gate placebo.
+    gate_mode: str = 'learned'
     # For indexer_mode='random': a per-(seed, layer) additive salt.  The
     # legacy fixed hash corresponds to salt 0 (bit-identical path).  A
     # non-zero salt makes the 'random' control a draw per seed/layer, so
@@ -700,6 +712,15 @@ class AttnCfg:
                 'layer kind (use_sink for csa/hca, full_sink for full); the '
                 'absence control must use sink_mode="learned" with the sink '
                 'disabled')
+        if self.gate_mode not in GATE_MODES:
+            raise ValueError(
+                f'unknown gate_mode {self.gate_mode!r}; expected one of '
+                f'{GATE_MODES}')
+        if self.gate_mode != 'learned' and self.chunking != 'cosine_learnable':
+            raise ValueError(
+                'gate_mode=' + repr(self.gate_mode) + ' requires a layer with a '
+                'learnable boundary offset (chunking="cosine_learnable"); '
+                'a fixed-block arm has no delta_logit to freeze')
         if self.fuse_mode not in FUSE_MODES:
             raise ValueError(
                 f'unknown fuse_mode {self.fuse_mode!r}; expected one of '
@@ -863,6 +884,8 @@ class HybridAttention(nn.Module):
                 Tc = max(cfg.temperature, 0.001)
                 Lb = max(cfg.target_block_tokens, 2)
                 self.delta_logit = nn.Parameter(torch.tensor(float(Tc * math.log(1.0 / (Lb - 1)))))
+                if cfg.gate_mode == 'frozen':
+                    self.delta_logit.requires_grad_(False)
             else:
                 self.delta_logit = None
             return
@@ -879,6 +902,8 @@ class HybridAttention(nn.Module):
             Tc = max(cfg.temperature, 0.001)
             Lb = max(cfg.target_block_tokens, 2)
             self.delta_logit = nn.Parameter(torch.tensor(float(Tc * math.log(1.0 / (Lb - 1)))))
+            if cfg.gate_mode == 'frozen':
+                self.delta_logit.requires_grad_(False)
         else:
             self.delta_logit = None
         for p in [self.W_bKV, self.W_aZ, self.W_bZ, self.W_DQ, self.W_DK]:

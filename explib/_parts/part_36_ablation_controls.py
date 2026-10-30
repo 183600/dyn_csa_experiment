@@ -761,6 +761,358 @@ def sink_control_audit(design=None, ladder=None, present=None, factory=None,
     return out
 
 
+# ---- boundary-gate control ladder ------------------------------------------
+# The dynamic-vs-fixed contrast changes the cut geometry, adds the per-layer
+# delta_logit offset and (through comp_reg) applies a different training
+# objective.  It is the total effect, not a learned-gate single factor.  This
+# ladder keeps the parameter, its initial value, the parameter count and the
+# comp_reg term identical and freezes only its gradient:
+#
+#   learned -> treatment (the shipped trainable boundary offset)
+#   frozen  -> capacity/objective placebo (same tensor, frozen at init)
+#
+# `learned - frozen` isolates the learned boundary-gate component at matched
+# capacity and identical compression objective.  The frozen arm consumes no
+# RNG, so every non-gate parameter is bit-identical at the same seed.
+GATE_CONTROL_DESIGN = {
+    'component': 'dynamic_blocking_learning',
+    'total_effect_component': 'dynamic_blocking',
+    'base_arms': {'csa': 'csa_dynamic', 'hybrid': 'hybrid_dynamic'},
+    'levels': {
+        'learned': {
+            'role': 'treatment',
+            'gate_mode': 'learned',
+            'arms': {'csa': 'csa_dynamic', 'hybrid': 'hybrid_dynamic'},
+            'note': 'the shipped trainable boundary offset and comp_reg term',
+        },
+        'frozen': {
+            'role': 'capacity_placebo',
+            'gate_mode': 'frozen',
+            'arms': {'csa': 'csa_dyn_frozengate',
+                     'hybrid': 'hybrid_dyn_frozengate'},
+            'note': ('identical delta_logit parameter, initial value and '
+                     'comp_reg term, frozen: isolates learning from capacity '
+                     'and from the objective term'),
+        },
+    },
+    'note': ('the dynamic on/off contrast alone cannot support a *learned* '
+             'boundary claim; the frozen-offset placebo is the capacity- and '
+             'objective-matched control for it'),
+}
+
+
+def gate_control_audit(design=None, ladder=None, present=None, factory=None,
+                       n_layers=2, seed=1234):
+    """Zero-GPU gate for the learned/frozen boundary-gate control ladder.
+
+    For every declared base the audit constructs the real arm configs and
+    checks that the placebo differs in exactly ``gate_mode``, that both arms
+    are scheduled, that total and delta parameter counts match, that the
+    delta_logit initial values match, that only the treatment's offset is
+    trainable, and that the actual training objectives agree except for the
+    declared trainability/delta-LR difference.  It also verifies that
+    ``ABLATION_DESIGN['dynamic_blocking_learning']`` declares the same pair
+    with exactly the ``gate_mode`` intervention key.
+
+    A missing level/arm, a relabelled copy, a second knob in the placebo diff,
+    an unfrozen placebo, a parameter/objective mismatch or an undeclared
+    family is ``fail`` (never a pass).  The audit never reads a result file.
+    """
+    design = ABLATION_DESIGN if design is None else design
+    ladder = GATE_CONTROL_DESIGN if ladder is None else ladder
+    factory = make_layer_cfgs if factory is None else factory
+    _nl = _as_seed_int(n_layers)
+    if _nl is None or _nl < 1:
+        raise ValueError(
+            f'gate_control_audit: n_layers must be a positive integer, got {n_layers!r}')
+    n_layers = int(_nl)
+    _seed = _as_seed_int(seed)
+    if _seed is None or _seed < 0:
+        raise ValueError(
+            f'gate_control_audit: seed must be a non-negative integer, got {seed!r}')
+    seed = int(_seed)
+    out = {'kind': 'gate_control_ladder', 'status': 'ok',
+           'n_layers': n_layers, 'seed': seed, 'levels': {}, 'bases': {},
+           'base_checks': {}, 'component_design': {}, 'violations': [],
+           'warnings': [],
+           'treatment_component': 'dynamic_blocking_learning',
+           'total_effect_component': 'dynamic_blocking',
+           'note': ('learned - frozen isolates the learned boundary-gate '
+                    'component at matched capacity and identical comp_reg '
+                    'objective; dynamic on/off is the total effect')}
+    if not isinstance(ladder, dict) or not ladder:
+        out['status'] = 'fail'
+        out['violations'].append(
+            f'gate control ladder must be a non-empty mapping, got '
+            f'{type(ladder).__name__}')
+        return out
+    bases = ladder.get('base_arms')
+    levels = ladder.get('levels')
+    if (not isinstance(bases, dict) or not bases
+            or not all(isinstance(k, str) and k.strip() and isinstance(v, str)
+                       and v.strip() for k, v in bases.items())):
+        out['status'] = 'fail'
+        out['violations'].append('base_arms must map non-empty base labels to arm ids')
+        return out
+    if not isinstance(levels, dict) or not levels:
+        out['status'] = 'fail'
+        out['violations'].append('levels must be a non-empty mapping')
+        return out
+    out['bases'] = dict(bases)
+    try:
+        present_set = set(RUN_ABL['variants']) if present is None else set(present)
+    except TypeError:
+        out['status'] = 'fail'
+        out['violations'].append('present arm ids must be a collection of strings')
+        return out
+    roles = {}
+    for name, spec in levels.items():
+        if not isinstance(spec, dict):
+            out['violations'].append(f'{name}: level must be a mapping')
+            continue
+        roles[name] = str(spec.get('role') or '')
+        _arms = spec.get('arms')
+        _arms_norm = dict(_arms) if isinstance(_arms, dict) and _arms else _arms
+        if not isinstance(_arms, dict) or not _arms:
+            out['violations'].append(
+                f'{name}: arms must be a non-empty mapping base label -> arm id')
+        out['levels'][str(name)] = {
+            'role': spec.get('role'),
+            'gate_mode': spec.get('gate_mode'),
+            'arms': _arms_norm,
+        }
+    expected_roles = {'treatment', 'capacity_placebo'}
+    if set(roles.values()) != expected_roles:
+        out['status'] = 'fail'
+        out['violations'].append(
+            'ladder roles must be exactly treatment/capacity_placebo, got '
+            f'{sorted(roles.values())}')
+    elif len(roles) != len(expected_roles):
+        out['status'] = 'fail'
+        out['violations'].append(
+            'ladder levels must use each of treatment/capacity_placebo exactly '
+            f'once, got {sorted(roles.items())}')
+    by_role = {v: k for k, v in roles.items()}
+    treatment_name = by_role.get('treatment')
+    placebo_name = by_role.get('capacity_placebo')
+    if treatment_name is None or placebo_name is None:
+        out['status'] = 'fail'
+        return out
+
+    pairs = _declared_pairs(design, 'dynamic_blocking_learning')
+    if not pairs:
+        out['violations'].append(
+            'ABLATION_DESIGN has no dynamic_blocking_learning contrast for the '
+            'learned/frozen gate ladder')
+    out['component_design'] = {
+        'dynamic_blocking_learning': sorted(pairs or ()),
+        'dynamic_blocking': sorted(_declared_pairs(design, 'dynamic_blocking') or ()),
+    }
+
+    def _model(arm):
+        _prev = torch.get_rng_state()
+        try:
+            torch.manual_seed(seed)
+            m = SmallGPT(32, 16, n_layers, 2, 8, 16, factory(n_layers, arm))
+        finally:
+            torch.set_rng_state(_prev)
+        return m
+
+    for base_label, base_arm in bases.items():
+        base_rec = {'base_arm': base_arm}
+        for level_name in (treatment_name, placebo_name):
+            spec = levels[level_name]
+            arms = spec.get('arms') if isinstance(spec, dict) else None
+            arm = arms.get(base_label) if isinstance(arms, dict) else None
+            expected_mode = spec.get('gate_mode') if isinstance(spec, dict) else None
+            rec = {'arm': arm, 'expected_gate_mode': expected_mode}
+            base_rec[level_name] = rec
+            if not isinstance(arm, str) or not arm.strip():
+                out['violations'].append(
+                    f'{level_name}/{base_label}: no single arm id declared')
+                rec['status'] = 'invalid'
+                continue
+            if arm not in present_set:
+                out['violations'].append(
+                    f'{level_name}/{base_label}: arm {arm!r} is not scheduled in '
+                    'the ablation panel')
+                rec['status'] = 'missing'
+                continue
+            _keys, _per = _design_pair_cfg_keys(arm, base_arm, factory, n_layers)
+            if isinstance(_keys, Exception):
+                out['violations'].append(
+                    f'{level_name}/{base_label}: cannot construct {arm!r} vs '
+                    f'{base_arm!r} ({type(_keys).__name__}: {_keys})')
+                rec['status'] = 'unconstructable'
+                continue
+            diff = sorted(_keys)
+            rec['cfg_diff_keys'] = diff
+            try:
+                _actual_modes = _control_cfg_field_values(
+                    factory, n_layers, arm, 'gate_mode')
+            except Exception as _me:
+                out['violations'].append(
+                    f'{level_name}/{base_label}: cannot read the constructed '
+                    f'gate_mode for {arm!r} ({type(_me).__name__}: {_me})')
+                rec['status'] = 'unconstructable'
+                continue
+            rec['observed_gate_modes'] = _actual_modes
+            _bad_modes = sorted({str(v) for v in _actual_modes.values()
+                                 if v != expected_mode})
+            bad = []
+            if expected_mode not in GATE_MODES:
+                bad.append(f'declared gate_mode {expected_mode!r} is not a '
+                           f'declared mode {GATE_MODES}')
+            if _bad_modes:
+                bad.append(
+                    'constructed gate_mode does not equal the declared '
+                    f'{expected_mode!r}: {_bad_modes}')
+            if level_name == treatment_name:
+                if arm != base_arm:
+                    bad.append(f'treatment arm {arm!r} must be the base arm '
+                               f'{base_arm!r}')
+                if diff:
+                    bad.append(f'treatment arm must not differ from the base '
+                               f'config, got {diff}')
+            else:
+                if diff != ['gate_mode']:
+                    bad.append(f'cfg diff is {diff}, not exactly ["gate_mode"]')
+            if bad:
+                out['violations'].append(
+                    f'{level_name}/{base_label}: ' + '; '.join(bad))
+                rec['status'] = 'confounded'
+                continue
+            rec['status'] = 'ok'
+        # Construct both models once per base and check capacity, initialization
+        # and objective identity.
+        treat = base_rec.get(treatment_name) or {}
+        plac = base_rec.get(placebo_name) or {}
+        ta, pa = treat.get('arm'), plac.get('arm')
+        if not (isinstance(ta, str) and isinstance(pa, str)):
+            continue
+        try:
+            ma, mb = _model(ta), _model(pa)
+        except Exception as _e:
+            out['violations'].append(
+                f'{base_label}: model construction failed for {ta!r}/{pa!r} '
+                f'({type(_e).__name__}: {_e})')
+            continue
+        sa = dict(ma.named_parameters())
+        sb = dict(mb.named_parameters())
+        ta_params = sum(int(p.numel()) for p in sa.values())
+        tb_params = sum(int(p.numel()) for p in sb.values())
+        delta_a = sorted(n for n in sa if 'delta_logit' in n)
+        delta_b = sorted(n for n in sb if 'delta_logit' in n)
+        rec = {'a': ta, 'b': pa, 'a_params': ta_params, 'b_params': tb_params,
+               'delta_params_a': sum(int(sa[n].numel()) for n in delta_a),
+               'delta_params_b': sum(int(sb[n].numel()) for n in delta_b),
+               'delta_tensors_a': delta_a, 'delta_tensors_b': delta_b}
+        base_rec['capacity_check'] = rec
+        bad = []
+        if ta_params != tb_params:
+            bad.append(f'total parameters differ ({ta_params} vs {tb_params})')
+        if delta_a != delta_b:
+            bad.append(f'delta_logit tensors differ ({delta_a} vs {delta_b})')
+        if not delta_a:
+            bad.append('treatment has no delta_logit parameter to freeze')
+        if set(sa) != set(sb):
+            bad.append('parameter names differ outside delta_logit')
+        for n in set(sa) & set(sb):
+            if n in delta_a:
+                continue
+            if not torch.equal(sa[n], sb[n]):
+                bad.append(f'non-gate parameter {n!r} differs at the same seed')
+                break
+        for n in delta_b:
+            if bool(sb[n].requires_grad):
+                bad.append(f'placebo delta parameter {n!r} is still trainable')
+                break
+        for n in delta_a:
+            if not bool(sa[n].requires_grad):
+                bad.append(f'treatment delta parameter {n!r} is unexpectedly frozen')
+                break
+        if delta_a == delta_b and delta_a:
+            for n in delta_a:
+                if sa[n].shape != sb[n].shape:
+                    bad.append(f'delta parameter {n!r} shape differs')
+                    break
+                if not torch.equal(sa[n], sb[n]):
+                    bad.append(f'delta parameter {n!r} does not start at the '
+                               'same frozen init value')
+                    break
+        # Objectives: capacity and the compression term must match; only the
+        # declared trainability / effective delta LR may differ.
+        try:
+            oa = train_objective(ma, comp_lambda=0.05, delta_lr_mult=10.0)
+            ob = train_objective(mb, comp_lambda=0.05, delta_lr_mult=10.0)
+        except Exception as _oe:
+            bad.append(f'objective descriptor failed ({type(_oe).__name__}: {_oe})')
+            oa = ob = {}
+        if oa and ob:
+            _must_match = ('comp_reg_applies', 'comp_lambda', 'comp_reg_layers',
+                           'comp_reg_configured_layers', 'comp_lambda_mults',
+                           'comp_lambda_effective', 'delta_param_count',
+                           'boundary_policy', 'loss_terms')
+            for _k in _must_match:
+                if oa.get(_k) != ob.get(_k):
+                    bad.append(f'objective field {_k!r} differs '
+                               f'({oa.get(_k)!r} vs {ob.get(_k)!r})')
+            if oa.get('delta_trainable') is not True:
+                bad.append('treatment objective does not report a trainable delta gate')
+            if ob.get('delta_trainable') is not False:
+                bad.append('placebo objective still reports a trainable delta gate')
+            if oa.get('delta_lr_effective') == ob.get('delta_lr_effective'):
+                bad.append('delta LR effective did not change with trainability')
+        if bad:
+            out['violations'].append(f'{base_label}: ' + '; '.join(bad))
+            rec['status'] = 'confounded'
+        else:
+            rec['status'] = 'ok'
+        out['base_checks'][base_label] = base_rec
+    # Distinct arm per level per base (a relabelled copy is not a control).
+    for base_label in bases:
+        seen = {}
+        for level_name in (treatment_name, placebo_name):
+            _arms = (levels.get(level_name) or {}).get('arms') if isinstance(
+                levels.get(level_name), dict) else None
+            arm = _arms.get(base_label) if isinstance(_arms, dict) else None
+            if isinstance(arm, str):
+                seen.setdefault(arm, []).append(level_name)
+        for arm, names in seen.items():
+            if len(names) > 1:
+                out['violations'].append(
+                    f'{base_label}: arm {arm!r} is reused by levels {names}; the '
+                    'placebo is a relabelled treatment, not an independent level')
+    # Declared contrast and intervention-key contract.
+    keys = ABLATION_INTERVENTION_KEYS.get('dynamic_blocking_learning') if isinstance(
+        ABLATION_INTERVENTION_KEYS, dict) else None
+    if not isinstance(keys, dict) or not pairs:
+        out['violations'].append(
+            'dynamic_blocking_learning: no declared intervention-key mapping')
+    else:
+        for base_label, base_arm in bases.items():
+            arms_t = (levels.get(treatment_name) or {}).get('arms') if isinstance(
+                levels.get(treatment_name), dict) else None
+            arms_p = (levels.get(placebo_name) or {}).get('arms') if isinstance(
+                levels.get(placebo_name), dict) else None
+            ta = arms_t.get(base_label) if isinstance(arms_t, dict) else None
+            pa = arms_p.get(base_label) if isinstance(arms_p, dict) else None
+            if isinstance(ta, str) and isinstance(pa, str) and (ta, pa) not in pairs:
+                out['violations'].append(
+                    f'dynamic_blocking_learning does not declare {ta!r} vs '
+                    f'{pa!r} for the frozen-gate control')
+            kset = keys.get((ta, pa)) if isinstance(ta, str) and isinstance(pa, str) else None
+            if kset != frozenset({'gate_mode'}):
+                out['violations'].append(
+                    f'dynamic_blocking_learning: contrast {(ta, pa)!r} declares '
+                    f'intervention keys '
+                    f'{sorted(kset) if isinstance(kset, (set, frozenset)) else kset!r}, '
+                    'expected exactly {"gate_mode"}')
+    if out['violations']:
+        out['status'] = 'fail'
+    return out
+
+
 # ---- local-fusion control ladder -------------------------------------------
 # The on/off fusion contrast changes two things at once: whether the depth-wise
 # convolution is trained AND whether its parameters exist.  A "learned fusion

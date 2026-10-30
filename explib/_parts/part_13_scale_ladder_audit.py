@@ -957,6 +957,15 @@ ABLATION_DESIGN = {
         ('hybrid_csa_dyn', 'hybrid_fixed', 'dynamic vs fixed CSA blocking inside the hybrid (HCA fixed)'),
         ('hybrid_hca_dyn', 'hybrid_fixed', 'dynamic vs fixed HCA blocking inside the hybrid (CSA fixed); the dynamic HCA layers train their boundary gates with comp_lambda_mult=4 (comp_lambda_effective 0.05->0.2) — part of the declared dynamic-HCA recipe, kept visible in train_objective and by the single-factor design gate (design_notes: single-factor contract)'),
     ],
+    # On/off dynamic blocking changes the cut geometry, the delta_logit
+    # parameters and (through comp_reg) the training objective.  It is the
+    # total effect.  This matched ladder keeps the logit parameter, its
+    # initial value and the comp_reg term identical and freezes only its
+    # gradient, so learned-vs-frozen isolates the *learned* boundary gate.
+    'dynamic_blocking_learning': [
+        ('csa_dynamic', 'csa_dyn_frozengate', 'learned vs frozen boundary offset (CSA dynamic); capacity/objective-matched placebo'),
+        ('hybrid_dynamic', 'hybrid_dyn_frozengate', 'learned vs frozen boundary offset (hybrid dynamic); capacity/objective-matched placebo'),
+    ],
     'learned_selection': [
         ('csa_fixed', 'csa_fix_randidx', 'learned top-k vs random selection (fixed blocking)'),
         ('csa_dynamic', 'csa_dyn_randidx', 'learned top-k vs random selection (dynamic blocking)'),
@@ -1136,6 +1145,13 @@ ABLATION_SESOI = {
     'dynamic_blocking': {
         'relative_pct': 1.0,
         'rationale': 'A boundary-policy change must move PPL by >=1% to be treated as practically useful; smaller shifts are within the study\'s recipe/evaluation variation.',
+    },
+    'dynamic_blocking_learning': {
+        'relative_pct': 1.0,
+        'rationale': ('A learned boundary offset that does not beat the same-'
+                      'capacity frozen offset by >=1% PPL is treated as an '
+                      'optimization/extra-capacity effect rather than evidence '
+                      'that the gate learned a useful segmentation policy.'),
     },
     'learned_selection': {
         'relative_pct': 1.0,
@@ -1357,6 +1373,10 @@ ABLATION_INTERVENTION_KEYS = {
         ('hybrid_hca_dyn', 'hybrid_fixed'): frozenset({'dynamic', 'chunking', 'target_block_tokens',
                                                       'block_size', 'comp_lambda_mult'}),
     },
+    'dynamic_blocking_learning': {
+        ('csa_dynamic', 'csa_dyn_frozengate'): frozenset({'gate_mode'}),
+        ('hybrid_dynamic', 'hybrid_dyn_frozengate'): frozenset({'gate_mode'}),
+    },
     'learned_selection': {
         ('csa_fixed', 'csa_fix_randidx'): frozenset({'indexer_mode'}),
         ('csa_dynamic', 'csa_dyn_randidx'): frozenset({'indexer_mode'}),
@@ -1459,6 +1479,7 @@ SINGLE_FACTOR_CFG_FAMILIES = (
     frozenset({'boundary_policy'}),
     frozenset({'fuse_mode'}),
     frozenset({'comp_lambda_mult'}),
+    frozenset({'gate_mode'}),
 )
 
 def cfg_keys_single_factor(keys):
@@ -1785,7 +1806,7 @@ def single_factor_initialization_audit(design=None, *, factory=None,
             return True
         if (keys & {'use_sink', 'full_sink', 'sink_mode'}) and leaf == 'sink':
             return True
-        if (keys & {'dynamic', 'chunking', 'target_block_tokens'}
+        if (keys & {'dynamic', 'chunking', 'target_block_tokens', 'gate_mode'}
                 and leaf == 'delta_logit'):
             return True
         return False

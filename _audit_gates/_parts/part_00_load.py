@@ -178,6 +178,11 @@
                frozen-random（同 conv 形状/参数量、冻结、不移动共享初始化）
                两个对照；learned−random 隔离学习成分，learned−identity 是
                总效应；别名 fusion_placebo / local_fusion（零 GPU）
+  gate_controls  消融对照阶梯：边界门具备 learned 与 frozen（同 delta_logit
+               形状/参数量/初值/comp_reg 目标、只冻结学习）两个对照；
+               learned−frozen 在容量与目标匹配下隔离学习成分，dynamic
+               on/off 仍是总效应；别名 gate_placebo / boundary_gate /
+               dynamic_gate（零 GPU）
   lesion       同 checkpoint 的推理期 lesion：声明组件可构造/可干预、
                权重不变的操作检查，以及逐种子 intact/lesion PPL 的
                necessary/harmful/redundant/inert 判定；缺 checkpoint 或
