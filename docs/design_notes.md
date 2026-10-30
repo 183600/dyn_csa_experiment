@@ -9081,3 +9081,146 @@ JSON；`finaltest_stats` 落盘逐种子记账 → 审计 `ok`；篡改 band p/�
 bare `not_estimable` `not_applicable`；报告渲染新表与边界段；
 CLI/别名/`run_report`/`build_report`/`finaltest_stats` 接线。完整 CPU
 套件在本轮最终树通过。
+
+## 107. 统计显著不等于实际重要：确认主对照的声明式 SESOI / TOST 读数（本轮结果分析硬化，no new runs）
+
+### 107.1 问题：冻结族只回答「能否排除零」
+
+v12 冻结主对照的判定是「Holm 校正后 p<α 且方向符合预注册」。
+`p_exact_signflip` 是精确的零效应检验，但零效应被拒绝不等于效应达到
+研究真正关心的最小实际幅度。n=12 时一个 0.05% 的 PPL 差异也可能显著；
+反过来，p≥α 也不能写成「实际等价」。§49.4 早已把这个边界写成
+「实际显著性仍依赖判断」，§68 又指出冻结清单没有主对照 SESOI，因此
+`audit_gates.sensitivity` 只能停在 `not_verifiable`。本轮不新增训练、
+不读取 test split、不修改冻结清单，而是给**已有**逐种子配对数据加一个
+独立的、可重放的 SESOI/TOST 读数，并把「统计上可检出」与「实际值得
+关心」在报告里分开。
+
+### 107.2 方法：相对 SESOI、配对 t TOST 与 beyond-margin 单侧检验
+
+`CONFIRMATION_SESOI`（`exp_lib`）声明库级策略：
+
+```python
+CONFIRMATION_SESOI = {
+    'version': 'confirmation-sesoi-1',
+    'scale': 'log_ratio',
+    'relative_pct': 1.0,          # 1% relative PPL
+    'tost_conf': None,            # -> 1 - alpha (95% CI at alpha=.05)
+    'declared_in_frozen_manifest': False,
+}
+```
+
+`relative_pct=1.0` 换算为 log 尺度 margin
+`m = log(1 + 1/100)`；估计量是逐种子
+`d_s = log(PPL_a,s) - log(PPL_b,s)`（正值表示 a 更差）。选择 log ratio
+而不是 raw PPL 差，是因为相对 margin 不应随观测到的 baseline PPL 改变；
+raw PPL 差的尺度敏感性仍由 §105 的 `effect_sensitivity` 负责。
+
+对每个主对照，`confirmation_practical_significance` 输出：
+
+- `n`/`seeds`/`per_seed_log_ratio`，并在有逐种子两臂 PPL 时同时保存
+  `per_seed_ppl_a`/`per_seed_ppl_b`，使审计能从两臂重建 log ratio，
+  而不是只信一个已算好的向量；
+- 配对 t 的 95% 区间（`ci`）与 TOST 的两个单侧 p：
+  `p_lo = P(T > (mean+m)/se)`、`p_hi = P(T > (m-mean)/se)`；
+  `equivalent = p_lo<α/2 and p_hi<α/2`，即 95% 区间完全落在
+  `(-m,+m)` 内；
+- 预注册方向上的 beyond-margin 单侧 p：方向为负（a 更低）时
+  `p_better = P(T < (mean+m)/se)`，方向为正时
+  `p_worse = P(T > (mean-m)/se)`；只有相应 p<α/2 才标记
+  `beyond_sesoi`；
+- `status`：`beyond_sesoi`、`direction_conflict`、
+  `equivalent_within_sesoi`、`indeterminate`、`zero_effect`、
+  `not_declared`、`not_estimable`。`zero_effect` 不冒充等价；
+  `equivalent_within_sesoi` 只表示「小于声明 margin」，不是零效应。
+
+`confirmation_practical_family` 在**同一组声明主对照**上分别做两个
+Holm 族：一个对 `p_beyond`，一个对 `p_tost`；缺失/不可估的对照以
+p=1 占位，不能通过少报对照缩小校正族。两组 p 都是单侧 α/2 口径，
+并在顶层显式写出 `alpha_one_sided`。它们与冻结的
+`p_exact_signflip`/`p_holm` **不是同一个族**，也不合并。
+
+### 107.3 与冻结清单的关系
+
+- 当前 `confirmation_frozen.json` 没有 `practical_significance` 块，
+  因此 `confirmation_sesoi_for_manifest` 返回 `source='library_policy'`、
+  `declared_in_frozen_manifest=False`；报告必须明确写「这是描述性读数，
+  不是冻结判定」。
+- 若未来清单在首次 test 读取前声明
+  `practical_significance`（`relative_pct` 或 `absolute_log_ratio`，
+  可带 per-comparison `comparisons` 覆盖），同一个函数读取清单并校验
+  名字/单位/尺度；拼错一个对照名会失败，而不是静默丢掉一个 margin。
+  `statistics.require_practical_significance=true` 时，
+  `confirmation_sesoi_design_audit` 在 `python -m explib.confirmation
+  plan` 预检中把缺失/不完整声明判 fail；未打开该开关的旧清单只得到
+  一条 note，不会被追溯性判死。
+- 无论来源如何，SESOI 块都不能改 `confirmed`：`finaltest_stats` 在
+  `stats['confirmed']` 之后才写 `stats['practical_significance']`，
+  只新增字段，不删除、不覆盖任何冻结字段。
+
+### 107.4 报告、审计与入口
+
+- `finaltest_stats` 在每个主比较的 `practical_significance` 中写逐种子
+  log ratio、两臂 PPL、margin、CI、TOST/beyond p/status；顶层写
+  `practical_significance.summary`，其中
+  `frozen_confirmed_but_not_beyond_sesoi` 明确列出「统计上确认、实际
+  未超过 margin」的对照。
+- `build_report` 在效应尺度表之后渲染「实际显著性（SESOI / TOST，
+  描述性）」表，并附边界段：不进入冻结 Holm 族、不改变
+  `p_exact_signflip`/`p_holm`/`verified`/`confirmed`；等价不是零效应；
+  beyond SESOI 不是因果或可迁移证据。
+- `audit_gates.py practical_significance`（别名 `practical` /
+  `sesoi_confirmation` / `equivalence`）从 `analysis_v12/test_stats.json`
+  的逐种子两臂 PPL 独立重建 log ratio、TOST、CI、beyond p 与两个
+  Holm 族，并逐字段比较；同时核对 family 行与 per-comparison 块一致。
+  缺块报 `not_verifiable_locally`，bare `not_estimable` 报
+  `not_applicable`，篡改/夹带冻结字段判 `fail`；该门并入
+  `audit_gates.py report` 顶层，`make audit` 因此会非零退出。
+
+### 107.5 边界
+
+- **不是新的确认性检验。** 两个 Holm 族只做描述性实际显著性/等价性
+  读数；不进入冻结 superiority 族，不改变 `confirmed`，也不把
+  library-policy margin 追认为预注册。
+- **不是事后功效。** TOST/区间只使用已落盘的逐种子配对值与已声明
+  margin；不读 test split 重新选 margin，不补种子，不重跑。
+- **TOST 依赖配对 t 近似。** n=12 很小，极端偏态或重尾时区间覆盖率
+  有限；§61/§62 的校准边界仍适用。`equivalent_within_sesoi` 是相对
+  声明 margin 的结论，不是精确零效应。
+- **`frozen_confirmed_but_not_beyond_sesoi` 不是降级。** 它只是提醒
+  引用者同时报告效应量；冻结 `confirmed` 仍是冻结规则算出的集合。
+- **一个 margin 不能跨尺度混用。** log ratio 的 1% 与 raw PPL 的 1
+  不是同一个量；清单若声明 `absolute_ppl`，只能配 `scale='raw_ppl'`，
+  由 normaliser 拒绝混用。
+- **无预注册方向的对照没有 beyond 结论。** 清单里
+  `expected_sign=None` 的对照只报告等价性/点估计，不构造单侧
+  beyond-margin 主张；若它同时被冻结确认，在
+  `frozen_confirmed_nondirectional` 中单独列出，不混入
+  `frozen_confirmed_but_not_beyond_sesoi`。
+- **旧产物不回填。** 没有逐种子两臂 PPL 的旧 `test_stats.json` 不
+  猜测、不反推；审计报 `not_verifiable_locally`。
+
+### 107.6 验证
+
+`test_review_part_48.py` 11 项覆盖：策略/单位/非法 margin/布尔/字符串/
+双单位 fail-closed；清单覆盖与拼错对照名；beyond/等价/方向冲突/不确定/
+零效应/无方向/n<2/未声明 margin 的分类；两个 Holm 族的 m 不因缺失槽位
+缩小与 `frozen_confirmed_but_not_beyond_sesoi`；极端有限值严格 JSON、
+非有限值点名丢弃、重复 seed/非法 tost_conf/方向 fail；`finaltest_stats`
+落盘逐种子两臂 PPL 与 log ratio、审计 `ok`、弱效应给 caveat、强效应
+进入 practically meaningful；篡改 p/两臂 PPL/summary/Holm/夹带
+`confirmed` 判 `fail`，缺块 `not_verifiable_locally`、bare
+`not_estimable` `not_applicable`；报告渲染新表与边界；CLI 别名与审计
+文档接线；以及
+`confirmation_sesoi_design_audit` 在缺声明/`require_practical_significance`
+/完整声明三种状态下的设计期判定。完整 CPU 套件在本轮最终树通过。
+
+```bash
+python -m pytest -q test_review_part_48.py
+python audit_gates.py practical_significance   # 重放 analysis_v12/test_stats.json
+python audit_gates.py practical               # 别名
+python audit_gates.py sesoi_confirmation       # 别名
+python audit_gates.py equivalence              # 别名
+python audit_gates.py report                   # 顶层汇总含 practical_significance
+make audit
+```

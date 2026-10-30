@@ -230,6 +230,12 @@
                身份；同 vocab/fit_fp 的 train/val/test 必须共享同一协议；
                核对 source→served 行/文档/token 台账及 .npy 侧边长度；
                legacy 缓存明确降级，缺缓存报 not_verifiable
+  practical_significance  结果分析：重放确认主对照的 SESOI/TOST 块——从逐种子
+               两臂 PPL 重建 log ratio、配对 t 区间、TOST 等价判定与
+               「超越 margin」单侧 p，并核对两个独立 Holm 族与汇总；
+               缺块报 not_verifiable，篡改读数/夹带冻结字段判 fail；
+               不改变冻结 p/Holm/confirmed（零 GPU；别名 practical /
+               sesoi_confirmation / equivalence）
   calibration  统计机器的零假设校准：精确符号翻转 / MITM / n>40 鞍点 /
                max-over-looks 序列 p / 配对 TOST / Holm 的负控制（超发率）
                与正控制（灵敏度），以及 seed-t / paired bootstrap-t /

@@ -231,12 +231,27 @@ def plan_check(manifest_path=FREEZE_MANIFEST):
             f'the design preflight could not run ({type(_e).__name__}: {_e}); a '
             'confirmation needs a verifiable token/parameter/read-budget ledger '
             'and evidence-level declaration')
+    # Practical-significance readiness: a future plan that requires a SESOI
+    # must declare one for every primary comparison.  The shipped v3 manifest
+    # predates the block, so this is only a note today (never a retroactive
+    # failure of the already-frozen plan).
+    try:
+        _psd = L.confirmation_sesoi_design_audit(m)
+        if _psd.get('status') == 'fail':
+            errs.extend(f'practical significance: {p}' for p in (_psd.get('problems') or []))
+        else:
+            notes.extend(f'practical significance: {w}' for w in (_psd.get('warnings') or []))
+    except Exception as _pse:
+        _psd = {'kind': 'confirmation_sesoi_design_audit', 'status': 'not_estimable',
+                'problems': [f'{type(_pse).__name__}: {_pse}']}
+        notes.append(f'practical significance: design audit unavailable ({_pse})')
     report = {'ok': not errs, 'manifest': manifest_path, 'manifest_sha256': m.get('manifest_sha256'),
               'code_semantics': L.CODE_SEMANTICS, 'n_arms': len(arms), 'n_seeds': len(seeds),
               'n_min_for_confirmation': _n_min, 'min_attainable_p_holm': _min_holm,
               'predicted': _pred, 'admitted': len(admitted), 'comparisons': _comp_report,
               'design_preflight': _design,
-              'errors': errs, 'notes': notes}
+              'errors': errs, 'notes': notes,
+              'practical_significance_design': _psd}
     if errs:
         print('[v12 plan] REFUSED — the frozen plan is not runnable end-to-end:')
         for _e in errs:

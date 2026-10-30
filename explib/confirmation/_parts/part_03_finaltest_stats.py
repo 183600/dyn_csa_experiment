@@ -36,6 +36,24 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
     # every surviving number stayed internally consistent.  The p-value replay
     # audit compares the recorded names against the comparisons it can see.
     _family_names = [str(c.get('name')) for c in (manifest.get('primary_comparisons') or [])]
+    # Practical-significance policy: a manifest-level SESOI block is used when
+    # declared; otherwise the library policy is an explicitly descriptive
+    # sensitivity (never part of the frozen decision rule).  A malformed
+    # declaration is recorded as not_declared rather than guessed.
+    try:
+        _ps_policy = L.confirmation_sesoi_for_manifest(manifest, alpha=_alpha)
+    except Exception as _pse:
+        _ps_policy = {
+            'kind': 'confirmation_sesoi_policy',
+            'version': getattr(L, 'CONFIRMATION_SESOI', {}).get('version', 'confirmation-sesoi-1'),
+            'source': 'invalid',
+            'status': 'not_declared',
+            'reason': f'{type(_pse).__name__}: {_pse}',
+            'margins': {},
+            'tost_conf': 1.0 - float(_alpha),
+            'alpha': float(_alpha),
+            'alpha_one_sided': float(_alpha) / 2.0,
+        }
     stats = {'alpha': float(_alpha), 'manifest': {'frozen_at': manifest.get('frozen_at'), 'manifest_sha256': manifest.get('manifest_sha256'), 'arms': manifest['arms'], 'seeds': manifest['seeds'], 'code_semantics_expected': manifest.get('code_semantics_expected'), 'statistics': manifest.get('statistics'), 'scope': manifest.get('scope'), 'revision': manifest.get('revision'), 'primary_comparison_names': _family_names, 'family_size': len(_family_names)}, 'admission': {'n_admitted': len(admitted), 'test_slice_fp': unified_fp, 'n_effective_seeds': len({int(s) for (_v, s) in admitted}), 'n_declared_seeds': len(manifest['seeds'])}, 'comparisons': {}, 'holm': {}, 'by_length': {}, 'probe': _test_probe_stats(probe_path, manifest, unified_fp)}
     # The exact sign-flip p is valid only under within-seed exchangeability.
     # admission binds the corpus/slice/row count/recipe/code, but the RNG stream
@@ -487,6 +505,37 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
                                    primary_deltas=dl)
         if _doc is not None:
             res['doc_sampling'] = _doc
+        # Practical significance on the SAME paired seeds.  The estimand is
+        # the per-seed log ratio (positive = arm a worse), so the margin is a
+        # relative PPL effect and does not depend on the observed baseline.
+        _ps_margin = (_ps_policy.get('margins') or {}).get(name)
+        if _ps_margin is None:
+            _ps_margin = {'margin': None, 'relative_pct': None, 'unit': None}
+        try:
+            _ps = L.confirmation_practical_significance(
+                [math.log(pa) - math.log(pb)
+                 for pa, pb in zip(_pa_used, _pb_used)],
+                margin=_ps_margin.get('margin'),
+                relative_pct=_ps_margin.get('relative_pct'),
+                alpha=_alpha,
+                tost_conf=_ps_policy.get('tost_conf'),
+                expected_sign=exp_sign,
+                seeds=[int(x) for x in usable],
+                ppl_a=_pa_used, ppl_b=_pb_used,
+                policy_version=_ps_policy.get('version'))
+            _ps['policy_source'] = _ps_policy.get('source')
+            _ps['margin_declared_in_frozen_manifest'] = bool(
+                _ps_policy.get('declared_in_frozen_manifest'))
+            _ps['family_size'] = len(_family_names)
+            res['practical_significance'] = _ps
+        except Exception as _pse:
+            res['practical_significance'] = {
+                'kind': 'confirmation_practical_significance',
+                'status': 'not_estimable',
+                'reason': f'{type(_pse).__name__}: {_pse}',
+                'role': ('descriptive practical-significance readout; no '
+                         'frozen p/Holm/verdict is changed'),
+            }
         stats['comparisons'][name] = res
     # Holm is corrected over the DECLARED frozen family, not over whichever
     # comparisons happened to produce a finite p: an omitted comparison enters
@@ -572,6 +621,22 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
          'opposite_nonsignificant', 'reverse_significant_unverified',
          'counts', 'rule', 'role')}
     stats['confirmed'] = _conf
+    # Aggregate the per-comparison practical readouts into two separate Holm
+    # families (beyond-SESOI and TOST equivalence).  This block is written
+    # next to the frozen verdict, never into it.
+    try:
+        stats['practical_significance'] = L.confirmation_practical_family(
+            stats['comparisons'], confirmed=stats.get('confirmed') or [],
+            policy=_ps_policy, alpha=_alpha,
+            family_names=_family_names)
+    except Exception as _psfe:
+        stats['practical_significance'] = {
+            'kind': 'confirmation_practical_significance_family',
+            'status': 'not_estimable',
+            'reason': f'{type(_psfe).__name__}: {_psfe}',
+            'role': ('descriptive practical-significance readout; no frozen '
+                     'p/Holm/verdict is changed'),
+        }
     stats['refuted'] = list(_verdict_block['refuted'])
     stats['inconclusive'] = list(_verdict_block['inconclusive'])
     stats['not_testable'] = list(_verdict_block['not_testable'])
@@ -1343,6 +1408,90 @@ def _refutation_markdown(ft, alpha=0.05):
     return out
 
 
+def _practical_significance_markdown(block):
+    """Render the SESOI/TOST readout without touching a frozen verdict.
+
+    The block is deliberately a pure function of the final-test stats so the
+    wording boundary ("below SESOI" is not "no effect"; "equivalent" is not
+    "zero"; the library policy is not a pre-registered margin) can be tested
+    without a GPU panel.
+    """
+    if not isinstance(block, dict) or not isinstance(block.get('comparisons'), dict):
+        return []
+    rows = block.get('comparisons') or {}
+    if not rows:
+        return []
+
+    def _n(x, fmt):
+        if isinstance(x, (bool, np.bool_)) or not isinstance(x, (int, float)):
+            return '—'
+        x = float(x)
+        return format(x, fmt) if math.isfinite(x) else '—'
+
+    def _rel(x):
+        if isinstance(x, (bool, np.bool_)) or not isinstance(x, (int, float)):
+            return '—'
+        x = float(x)
+        return f'{x:+.2f}%' if math.isfinite(x) else '—'
+
+    pol = block.get('policy') if isinstance(block.get('policy'), dict) else {}
+    out = []
+    A = out.append
+    A('### 实际显著性（SESOI / TOST，描述性）')
+    A('')
+    A('| 比较 | n | SESOI（相对 PPL） | 点估计（相对效应） | 95% CI（log ratio） | TOST p | TOST p (Holm) | 超越 SESOI p (Holm) | 状态 |')
+    A('|---|---|---|---|---|---|---|---|---|')
+    for name in (block.get('family_names') or list(rows)):
+        r = rows.get(name) or {}
+        rel = r.get('relative_pct')
+        sesoi = ('—' if rel is None else f'{float(rel):g}%')
+        eff = _rel(r.get('relative_effect_pct'))
+        ci = r.get('ci')
+        if isinstance(ci, (list, tuple)) and len(ci) == 2:
+            cit = f'[{_n(ci[0], "+.4f")}, {_n(ci[1], "+.4f")}]'
+        else:
+            cit = '—'
+        A(f"| {name} | {r.get('n', '—')} | {sesoi} | {eff} | {cit} | "
+          f"{_n(r.get('p_tost'), '.4g')} | {_n(r.get('p_tost_holm'), '.4g')} | "
+          f"{_n(r.get('p_beyond_holm'), '.4g')} | {r.get('status') or '—'} |")
+    A('')
+    if pol.get('source') == 'library_policy':
+        A('> **口径提醒**：当前冻结清单没有声明主对照 SESOI。上表使用库级策略'
+          f'（1% 相对 PPL，TOST {pol.get("tost_conf", 0.95):.2f}）作为'
+          '**描述性**实际显著性读数；它不是冻结判定的一部分，不能升级或降级 '
+          '`confirmed`。未来冻结应在首次 test 读取前把 margin 写进清单并打开'
+          '设计期 SESOI 门。')
+    elif pol.get('source') == 'manifest':
+        A('> **口径提醒**：SESOI 来自清单声明；它仍与被冻结的 p/Holm 族分开，'
+          'TOST 的等价结论不能替代冻结的优越性判定。')
+    else:
+        A('> **口径提醒**：SESOI 声明无效或缺失；下表只给出可重放的描述性读数，'
+          '不应把缺失 margin 当作通过。')
+    A('')
+    sm = block.get('summary') if isinstance(block.get('summary'), dict) else {}
+    bad = sm.get('frozen_confirmed_but_not_beyond_sesoi') or []
+    if bad:
+        A('**实际显著性提醒**：' + '；'.join(f'`{k}`' for k in bad)
+          + ' 在冻结检验中成立，但点估计未超过（或无法在 Holm 后确认超过）声明的 SESOI。'
+            '统计上可检出 ≠ 实际值得关心；引用这些比较时必须同时给出 SESOI 与效应量，'
+            '不能只写「已确认」。')
+        A('')
+    eq = sm.get('equivalent_within_sesoi') or []
+    if eq:
+        A('**等价性提醒**：' + '；'.join(f'`{k}`' for k in eq)
+          + ' 的 TOST 区间落在声明的 margin 内。这是「实际小于 margin」，'
+            '不是「效应恰好为零」，也不证明机制无作用；不能写成「无差异」。')
+        A('')
+    A('> 边界：本表使用配对 t 的 TOST/区间，依赖配对差值的近似正态性；'
+      '它不进入冻结 Holm 族，不改变 `p_exact_signflip`、`p_holm`、`verified` 或 '
+      '`confirmed`。两个 Holm 族（超越 margin 与等价性）都从同一批逐种子 '
+      'log ratio 重算，缺失/不可估的对照以 p=1 占位，不能通过少报对照缩小校正族。'
+      '「超越 SESOI」仍不是因果或可迁移证据；「等价」只相对于声明的 margin，'
+      '不是「效应恰好为零」，也不证明机制无作用。')
+    A('')
+    return out
+
+
 def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
     v12_analysis(out=stats_p)
     st = json.load(open(stats_p, encoding='utf-8'))
@@ -1838,6 +1987,10 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
                   + '。这些比较的冻结 p/Holm 仍按原始 PPL 差计算；引用结论时必须同时'
                     '说明效应尺度或位置读数的分歧，不能只写「已确认」。')
                 A('')
+        _ps_md = _practical_significance_markdown(ft.get('practical_significance'))
+        if _ps_md:
+            for _line in _ps_md:
+                A(_line)
         if any(isinstance((_v.get('doc_sampling') or {}).get('pooled_delta_ppl_ci95'),
                           (list, tuple))
                for _v in comps.values()):
