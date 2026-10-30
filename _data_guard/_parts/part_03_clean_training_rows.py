@@ -690,8 +690,12 @@ def _matrix_fingerprint(X):
                         # A wider float is exact in this block only if its
                         # float64 image round-trips to the same value.
                         try:
-                            _same = (math.isfinite(f)
-                                     and np.longdouble(f) == v)
+                            # An infinity has the same float64 image as a
+                            # Python/float64 infinity, so it needs no exact
+                            # tail (matching the native longdouble branch).
+                            _same = (np.isinf(v)
+                                     or (math.isfinite(f)
+                                         and np.longdouble(f) == v))
                         except (TypeError, ValueError, OverflowError):
                             _same = False
                         if not _same:
@@ -783,7 +787,7 @@ def _matrix_fingerprint(X):
             # purpose.  Without treating NaN as exact here, the same missing
             # row got an extra exact tail only in the native-dtype table and
             # fingerprinted differently from its object/float64 twin.
-            _ld_exact = (np.isnan(block)
+            _ld_exact = (np.isnan(block) | np.isinf(block)
                          | (np.isfinite(block_f)
                             & (block_f.astype(np.longdouble) == block)))
             _bad_rows = (~_ld_exact.all(axis=-1) if _ld_exact.ndim > 1
@@ -873,6 +877,28 @@ def _wide_float_key(v):
     n, d = int(n), int(d)
     return (b'I' + str(n).encode('ascii') if d == 1
             else b'R' + str(n).encode('ascii') + b'/' + str(d).encode('ascii'))
+
+
+def _wide_row_is_float64_exact(row):
+    """Whether every finite value in a longdouble row is exactly float64.
+
+    A longdouble column and an object/float64 column holding the same values
+    are the same row identity.  The wide branch already treats an all-NaN row
+    through the common float64 encoding; this predicate extends that to rows
+    whose finite values fit float64 exactly.  Values that need the extra
+    mantissa (or overflow/underflow float64) still take the exact wide key so
+    distinct wide values cannot collapse.
+    """
+    for v in row:
+        if np.isnan(v) or np.isinf(v):
+            continue
+        try:
+            f = float(v)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if not math.isfinite(f) or np.longdouble(f) != v:
+            return False
+    return True
 
 
 def _temporal_canonical_key(v):
@@ -1050,21 +1076,34 @@ def _row_keys(X):
         for start in range(0, src.shape[0], _step):
             for row in src[start:start + _step].tolist():
                 h = hashlib.blake2b(digest_size=16)
-                # An all-NaN row is the missing-like value, and the object
-                # path hashes it through the common float64 encoding (the
-                # dtype-specific wide key would make the same missing row
-                # distinct when stored as longdouble vs float64/object).
-                if not row or all(np.isnan(v) for v in row):
+                # A row whose finite values all fit float64 (including the
+                # all-NaN missing-like row) uses the same float64 encoding as
+                # the object/float64 paths, so equal rows stored at different
+                # dtypes keep one duplicate identity.  Rows that need the
+                # wider mantissa still use the exact per-cell wide key.
+                if not row or _wide_row_is_float64_exact(row):
                     _frow = np.asarray(row, dtype=np.float64).reshape(-1)
+                    if np.any(_frow == 0.0):
+                        # Normalise signed zero exactly as the object/float64
+                        # paths do; -0.0 and 0.0 are the same row value.
+                        _frow = _frow.copy()
+                        _frow[_frow == 0.0] = 0.0
                     _finite = np.isfinite(_frow)
                     h.update(np.ascontiguousarray(_frow[_finite]).tobytes())
                     h.update(b'|')
+                    # Mirror the object/float64 fast path's framing: the
+                    # non-finite mask is always part of the row identity, but
+                    # the per-lane code table is written only when some lane
+                    # is non-finite.  Always writing the all-zero code made
+                    # the same finite row key differently in a longdouble
+                    # table.
                     h.update(np.packbits(~_finite).tobytes())
-                    _code = np.zeros(_frow.shape, dtype=np.uint8)
-                    _code[np.isnan(_frow)] = 1
-                    _code[np.isposinf(_frow)] = 2
-                    _code[np.isneginf(_frow)] = 3
-                    h.update(_code.tobytes())
+                    if not _finite.all():
+                        _code = np.zeros(_frow.shape, dtype=np.uint8)
+                        _code[np.isnan(_frow)] = 1
+                        _code[np.isposinf(_frow)] = 2
+                        _code[np.isneginf(_frow)] = 3
+                        h.update(_code.tobytes())
                 else:
                     for v in row:
                         h.update(_wide_float_key(v))
@@ -1220,13 +1259,29 @@ def _row_keys(X):
                             or isinstance(v, (complex, np.complexfloating))):
                         _numeric = False
                         break
-                    # A longdouble has more than float64's 53-bit mantissa;
-                    # the native >8-byte branch hashes its exact wide key, so
-                    # do not round it into the common float64 path here.
+                    # A longdouble has more than float64's 53-bit mantissa.
+                    # Keep the common float64 encoding when the value is
+                    # exactly representable there (the native >8-byte branch
+                    # makes the same choice); only values that need the wide
+                    # mantissa fall back to the exact per-cell wide key.
                     if (isinstance(v, np.floating)
                             and v.dtype.itemsize > 8):
-                        _numeric = False
-                        break
+                        if np.isnan(v):
+                            _vals.append(float('nan'))
+                            continue
+                        if np.isinf(v):
+                            _vals.append(float(v))
+                            continue
+                        try:
+                            _fv = float(v)
+                        except (TypeError, ValueError, OverflowError):
+                            _numeric = False
+                            break
+                        if not math.isfinite(_fv) or np.longdouble(_fv) != v:
+                            _numeric = False
+                            break
+                        _vals.append(_fv)
+                        continue
                     # Decimal('sNaN') raises in float(); it is still one
                     # missing-like NaN identity, not a categorical value.
                     if _numeric_is_nan(v):

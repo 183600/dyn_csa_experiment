@@ -131,3 +131,52 @@ def test_longdouble_nan_is_one_missing_row_identity_across_dtypes():
         assert (DG._matrix_fingerprint(wide[:1])
                 != DG._matrix_fingerprint(wide[1:]))
 
+
+def test_float64_exact_longdouble_rows_match_object_and_float64_storage():
+    import data_guard as DG
+
+    LD = np.longdouble
+    # A longdouble row whose finite values are exactly float64 (and whose
+    # non-finite lanes are NaN/Inf) is the same row identity as an object or
+    # float64 row.  The native wide branch used to append an all-zero code
+    # table that the object/float64 fast path omitted, so duplicate detection
+    # across storage dtypes silently missed a real duplicate.
+    pairs = [
+        (np.array([[LD('1.5'), LD('2.5')]], dtype=LD),
+         np.array([[1.5, 2.5]], dtype=object)),
+        (np.array([[LD('1.5'), LD('2.5')]], dtype=LD),
+         np.array([[1.5, 2.5]], dtype=np.float64)),
+        (np.array([[LD('1.5'), LD('2.5')]], dtype=LD),
+         np.array([[LD('1.5'), LD('2.5')]], dtype=object)),
+        (np.array([[LD('1.5'), LD('nan')]], dtype=LD),
+         np.array([[1.5, LD('nan')]], dtype=object)),
+        (np.array([[LD('inf'), LD('1.5')]], dtype=LD),
+         np.array([[float('inf'), 1.5]], dtype=object)),
+        (np.array([[LD('inf'), LD('1.5')]], dtype=LD),
+         np.array([[LD('inf'), LD('1.5')]], dtype=object)),
+        (np.array([[LD('-inf'), LD('1.5')]], dtype=LD),
+         np.array([[float('-inf'), 1.5]], dtype=object)),
+        (np.array([[LD('-inf'), LD('1.5')]], dtype=LD),
+         np.array([[LD('-inf'), LD('1.5')]], dtype=object)),
+        (np.array([[LD('-0.0'), LD('1.5')]], dtype=LD),
+         np.array([[-0.0, 1.5]], dtype=object)),
+    ]
+    for native, other in pairs:
+        assert DG._row_keys(native)[0] == DG._row_keys(other)[0], (
+            native.dtype, other.dtype)
+        assert (DG._matrix_fingerprint(native)
+                == DG._matrix_fingerprint(other)), (native.dtype, other.dtype)
+    # A row and its object/float64 twin stacked into one table must be
+    # reported as an exact duplicate, not as two distinct rows.
+    table = np.vstack([
+        np.array([[LD('1.5'), LD('nan')]], dtype=LD),
+        np.array([[1.5, LD('nan')]], dtype=object),
+    ])
+    assert DG.duplicate_mask(table).tolist() == [False, True], table
+    # Extra longdouble mantissa still forces the exact wide key, so those
+    # values cannot collapse merely because they fit the common path.
+    if np.finfo(LD).eps < np.finfo(np.float64).eps:
+        a = np.array([[LD('1.0000000000000000001')]], dtype=LD)
+        b = np.array([[LD('1.0000000000000000002')]], dtype=LD)
+        assert DG._row_keys(a)[0] != DG._row_keys(b)[0]
+        assert DG._matrix_fingerprint(a) != DG._matrix_fingerprint(b)
