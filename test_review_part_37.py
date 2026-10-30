@@ -122,6 +122,16 @@ def test_audit_evidence_inputs_is_deterministic_and_bounded():
         with open(os.path.join(td, 'results_a', 'huge.json'), 'w',
                   encoding='utf-8') as fh:
             fh.write('{"x": "' + 'a' * 2048 + '"}')
+        # A FIFO (or other non-regular object) with a text suffix is not a
+        # file the report can hash; it must be skipped, not opened as a
+        # stream (which would block forever).
+        fifo = os.path.join(td, 'results_a', 'stream.json')
+        have_fifo = hasattr(os, 'mkfifo')
+        if have_fifo:
+            try:
+                os.mkfifo(fifo)
+            except OSError:
+                have_fifo = False
 
         inputs1, scope1 = A.audit_evidence_inputs(td, max_file_bytes=1024)
         inputs2, scope2 = A.audit_evidence_inputs(td, max_file_bytes=1024)
@@ -138,10 +148,25 @@ def test_audit_evidence_inputs_is_deterministic_and_bounded():
         assert 'weights.bin' not in joined, 'binary checkpoints are not report inputs'
         assert 'huge.json' not in joined
         assert 'results_a/huge.json' in scope1['skipped_large']
+        if have_fifo:
+            assert 'stream.json' not in joined
+            assert any(e.get('path') == 'results_a/stream.json'
+                       for e in scope1['skipped_unreadable']), scope1
         assert scope1['n_files'] == len(inputs1)
         assert scope1['n_bytes'] > 0
         assert scope1['max_file_bytes'] == 1024
         assert scope1['excluded_dirs'] == ['analysis_audit']
+        # The report being replaced is not evidence about itself.  If the
+        # caller writes it under analysis_*/, binding the previous copy would
+        # make every rebuild depend on the previous run.
+        report = _write(os.path.join(td, 'analysis_b', 'report.json'), {'v': 1})
+        excluded_inputs, _ = A.audit_evidence_inputs(
+            td, max_file_bytes=1024, exclude=report)
+        assert 'evidence:analysis_b/report.json' not in excluded_inputs, excluded_inputs
+        assert 'evidence:analysis_b/stats.jsonl' in excluded_inputs, excluded_inputs
+        string_excluded, _ = A.audit_evidence_inputs(
+            td, max_file_bytes=1024, exclude=[report])
+        assert string_excluded == excluded_inputs
     finally:
         import shutil
         shutil.rmtree(td, ignore_errors=True)
@@ -316,10 +341,88 @@ def test_analysis_integrity_can_exclude_the_report_being_replaced():
         rep = A.audit_analysis_integrity(
             [td], exclude=[os.path.join(td, 'derived.json')])
         assert rep['n_checked'] == 0 and rep['status'] == 'not_verifiable_locally', rep
+        # A single path and None are the natural spellings too; neither may be
+        # iterated character by character or rejected.
+        single = A.audit_analysis_integrity(
+            [td], exclude=os.path.join(td, 'derived.json'))
+        assert single['n_checked'] == 0, single
+        assert A.audit_analysis_integrity([td], exclude=None)['n_checked'] == 1
         # An explicit path list keeps the artifact when it is not excluded.
         assert A.audit_analysis_integrity(
             [os.path.join(td, 'derived.json')])['n_ok'] == 1
         assert rec['content_schema'] == 2
+    finally:
+        import shutil
+        shutil.rmtree(td, ignore_errors=True)
+
+
+def test_json_pointer_supports_the_empty_key_and_rejects_bad_indices():
+    # RFC 6901: "" is the whole document, "/" selects the member with the
+    # empty key.  Treating "/" as the root made an ignored block under the
+    # empty key impossible to remove.
+    assert L._pointer_parts(None) == []
+    assert L._pointer_parts('') == []
+    assert L._pointer_parts('/') == ['']
+    assert L._pointer_parts('//') == ['', '']
+    doc = {'': {'value': 1}, 'list': [10, 20, 30]}
+    assert L._drop_pointer(doc, '/') == {'list': [10, 20, 30]}
+    assert L._drop_pointer(doc, '/list/1') == {
+        '': {'value': 1}, 'list': [10, 30]}
+    # A NaN-like negative/leading-zero/float index names no RFC array slot;
+    # silently letting int() accept it deletes a different element.
+    for pointer in ('/list/-1', '/list/01', '/list/1.0', '/list/-', '/list/9'):
+        assert L._drop_pointer(doc, pointer) == doc, pointer
+
+
+def test_analysis_report_diff_reports_a_schema_migration_without_a_body_change():
+    current = _stamp({'comparison': {'p': 0.01}})
+    legacy = json.loads(json.dumps(current))
+    legacy.pop('content_schema', None)
+    # Recompute the digest under the legacy schema this record now declares.
+    legacy['content_sha256'] = L.analysis_content_sha256(legacy)
+    assert L.analysis_content_sha256(legacy) != L.analysis_content_sha256(current)
+    rep = L.analysis_report_diff(legacy, current)
+    assert rep['verdict'] == 'schema_changed', rep
+    assert rep['dimensions']['body']['status'] == 'schema_changed', rep
+    assert rep['dimensions']['body']['n_differences'] == 0, rep
+    assert rep['dimensions']['body']['original_schema'] is None, rep
+    assert rep['dimensions']['body']['rerun_schema'] == 2, rep
+    assert rep['stored_integrity'] == {
+        'original': 'match', 'rerun': 'match'}, rep
+    assert any('schema' in w for w in rep['warnings']), rep
+    # Rebuilding with the same schema still compares as reproduced.
+    assert L.analysis_report_diff(current, _stamp(
+        {'comparison': {'p': 0.01}}))['verdict'] == 'reproduced'
+
+
+def test_analysis_report_diff_truncation_flag_is_exact_at_the_limit():
+    # Exactly `max_differences` differences are a complete report; only a
+    # difference beyond the limit means the list was truncated.  The old
+    # `len >= limit` test mislabeled the exact-boundary case.
+    one = L.analysis_report_diff({'a': 1, 'b': 2}, {'a': 9, 'b': 2},
+                                 max_differences=1)
+    assert one['n_differences'] == 1 and one['truncated'] is False, one
+    two = L.analysis_report_diff({'a': 1, 'b': 2}, {'a': 9, 'b': 8},
+                                 max_differences=1)
+    assert two['n_differences'] == 1 and two['truncated'] is True, two
+
+
+def test_analysis_integrity_ignores_ledger_anchor_sidecars():
+    # The report appends to analysis_audit/experiments.jsonl and rewrites its
+    # anchor.  The anchor is not a stamped analysis; counting it as a skipped
+    # artifact made the next rebuild's n_skipped (and thus the hashed body)
+    # depend on the previous rebuild.
+    td = tempfile.mkdtemp()
+    try:
+        _write(os.path.join(td, 'analysis_audit',
+                            'experiments.jsonl.anchor.json'), {'count': 1})
+        rep = A.audit_analysis_integrity([td])
+        assert rep['n_checked'] == 0 and rep['n_skipped'] == 0, rep
+        # An explicit anchor path is likewise not a stamped analysis.
+        rep = A.audit_analysis_integrity(
+            [os.path.join(td, 'analysis_audit',
+                          'experiments.jsonl.anchor.json')])
+        assert rep['n_checked'] == 0 and rep['n_skipped'] == 0, rep
     finally:
         import shutil
         shutil.rmtree(td, ignore_errors=True)

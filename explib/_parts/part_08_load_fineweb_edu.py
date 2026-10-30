@@ -1564,7 +1564,11 @@ def analysis_input_manifest(inputs, *, base=None):
             out[label] = {'path': None, 'exists': False, 'sha256': None,
                           'bytes': None, 'error': 'no path supplied'}
             continue
-        raw_s = os.fspath(raw)
+        # ``bytes`` is a valid OS path type, but the manifest mixes the path
+        # with a str base/label and JSON cannot carry bytes.  Decode with the
+        # platform filesystem codec instead of raising "Can't mix strings and
+        # bytes in path components" halfway through a provenance block.
+        raw_s = os.fsdecode(os.fspath(raw))
         path = (os.path.abspath(raw_s) if os.path.isabs(raw_s)
                 else os.path.abspath(os.path.join(base, raw_s)))
         try:

@@ -84,15 +84,40 @@ def _load_report_arg(value):
 
 
 def _pointer_parts(pointer):
-    """Decode a JSON pointer (RFC 6901) into dict keys / list indexes."""
-    if pointer in (None, '', '/'):
+    """Decode a JSON pointer (RFC 6901) into dict keys / list indexes.
+
+    The empty string is the whole document.  A single slash is the pointer to
+    the object member whose key is the empty string (``{"": ...}``), not the
+    document root: conflating the two made it impossible to ignore a report
+    block stored under the empty key.  The leading slash is optional only for
+    the convenience of callers that pass ``experiment_ledger`` instead of
+    ``/experiment_ledger``.
+    """
+    if pointer is None or pointer == '':
         return []
     if not isinstance(pointer, str):
         raise TypeError(f'JSON pointer must be a string, got {type(pointer).__name__}')
     text = pointer[1:] if pointer.startswith('/') else pointer
-    if not text:
-        return []
     return [p.replace('~1', '/').replace('~0', '~') for p in text.split('/')]
+
+
+def _pointer_list_index(part):
+    """Canonical non-negative list index for a JSON pointer segment.
+
+    RFC 6901 array indices are decimal digits with no sign and no leading
+    zero.  Python's ``int()`` would otherwise accept ``-1`` (silently removing
+    the last element) and ``01``; a malformed pointer must be a no-op instead
+    of deleting a different element than the caller named.
+    """
+    if not isinstance(part, str) or not part:
+        return None
+    if (not part.isascii() or not part.isdigit()
+            or (len(part) > 1 and part[0] == '0')):
+        return None
+    try:
+        return int(part)
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 def _pointer_escape(part):
@@ -111,24 +136,23 @@ def _drop_pointer(obj, pointer):
         return obj
     root = copy.deepcopy(obj)
     cur = root
-    for i, part in enumerate(parts[:-1]):
+    for part in parts[:-1]:
         if isinstance(cur, dict) and part in cur:
             cur = cur[part]
         elif isinstance(cur, list):
-            try:
-                cur = cur[int(part)]
-            except (ValueError, IndexError):
+            index = _pointer_list_index(part)
+            if index is None or index >= len(cur):
                 return root
+            cur = cur[index]
         else:
             return root
     last = parts[-1]
     if isinstance(cur, dict):
         cur.pop(last, None)
     elif isinstance(cur, list):
-        try:
-            cur.pop(int(last))
-        except (ValueError, IndexError):
-            pass
+        index = _pointer_list_index(last)
+        if index is not None and index < len(cur):
+            cur.pop(index)
     return root
 
 
@@ -178,9 +202,40 @@ def _report_body_for_diff(record):
     be stripped), but it is not a result: a changed evidence file must be
     reported as ``inputs_changed``, not as a changed statistic.  It therefore
     has its own dimension below.
+
+    ``content_schema`` names the digest/volatile-field convention, not a
+    measured result.  It is compared separately so a schema migration of an
+    otherwise identical body is reported as ``schema_changed`` instead of
+    being indistinguishable from a changed statistic.
     """
     return {k: v for k, v in record.items()
-            if k not in _ANALYSIS_VOLATILE_KEYS_V2 and k != 'inputs_sha256'}
+            if k not in _ANALYSIS_VOLATILE_KEYS_V2
+            and k not in ('inputs_sha256', 'content_schema')}
+
+
+def _report_schema(record):
+    """Declared content schema, normalised to the legacy convention.
+
+    An absent/older schema deliberately reads as legacy (1) because
+    ``_analysis_volatile_keys`` hashes it with the legacy volatile set.  A
+    boolean or non-integral value is not a schema declaration; keep it as
+    ``None`` so the caller follows that same legacy digest convention instead
+    of inventing a version.
+    """
+    schema = record.get('content_schema') if isinstance(record, dict) else None
+    if schema is None:
+        return None
+    if isinstance(schema, bool) or not isinstance(schema, numbers.Integral):
+        return None
+    return int(schema)
+
+
+def _effective_schema(record):
+    """Schema generation whose digest/volatile-field semantics apply."""
+    schema = _report_schema(record)
+    if schema is None or schema < ANALYSIS_CONTENT_SCHEMA:
+        return ANALYSIS_CONTENT_SCHEMA - 1
+    return schema
 
 
 def _fingerprint_object(obj):
@@ -286,17 +341,25 @@ def analysis_report_diff(original, rerun, *, ignore=(), max_differences=200):
     for pointer in ignore:
         body_a = _drop_pointer(body_a, pointer)
         body_b = _drop_pointer(body_b, pointer)
-    differences = _diff_json(body_a, body_b, limit=max_differences)
+    # Request one pointer past the display limit so "exactly N differences"
+    # is not mislabeled as truncated.  `_diff_json` stops as soon as it has
+    # enough, so this costs at most one extra comparison.
+    _probe = _diff_json(body_a, body_b, limit=max_differences + 1)
+    truncated = len(_probe) > max_differences
+    differences = _probe[:max_differences]
     n_differences = len(differences)
-    truncated = n_differences >= max_differences
 
     body_fp_a = _fingerprint_object(body_a)
     body_fp_b = _fingerprint_object(body_b)
+    schema_a = _report_schema(a)
+    schema_b = _report_schema(b)
+    schema_changed = _effective_schema(a) != _effective_schema(b)
     if body_fp_a == body_fp_b and not differences:
-        body_status = 'match'
+        # A schema migration changes the digest convention, not the numbers.
+        body_status = 'schema_changed' if schema_changed else 'match'
     elif not differences and body_fp_a != body_fp_b:
-        # The only difference is in a hashed-but-not-displayed field such as
-        # `content_schema`; this is a schema migration, not a changed number.
+        # The only observable difference is in a hashed-but-not-displayed
+        # field; this is a schema migration, not a changed number.
         body_status = 'schema_changed'
     else:
         body_status = 'mismatch'
@@ -304,6 +367,8 @@ def analysis_report_diff(original, rerun, *, ignore=(), max_differences=200):
         'status': body_status,
         'original_sha256': hash_a,
         'rerun_sha256': hash_b,
+        'original_schema': schema_a,
+        'rerun_schema': schema_b,
         'n_differences': n_differences,
     }
 
@@ -371,8 +436,10 @@ def analysis_report_diff(original, rerun, *, ignore=(), max_differences=200):
     warnings = []
     if body_status == 'schema_changed':
         warnings.append(
-            'bodies are identical but content_schema/digest semantics differ; '
-            'the rebuild used a newer analysis schema')
+            'bodies are identical but content_schema/digest semantics differ '
+            f'(original={dimensions["body"]["original_schema"]!r}, '
+            f'rerun={dimensions["body"]["rerun_schema"]!r}); the rebuild used '
+            'a newer analysis schema')
     if inputs_status == 'unverified':
         warnings.append(
             'one or both reports do not record inputs_sha256; the same body '

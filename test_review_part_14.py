@@ -233,6 +233,28 @@ def test_experiment_ledger_audit_status_and_wiring():
         assert len(got) == 2 and all(e['kind'] == 'cell' for e in got), got
 
 
+def test_experiment_ledger_default_scan_skips_the_reports_own_trace(monkeypatch):
+    # `analysis_audit/experiments.jsonl` is appended to by every report build;
+    # including it in the report body would make two rebuilds of the same
+    # evidence differ.  The default scan covers evidence ledgers only; an
+    # explicit path still audits the report's own trace.
+    with tempfile.TemporaryDirectory() as td:
+        audit_dir = os.path.join(td, 'analysis_audit')
+        result_dir = os.path.join(td, 'results_demo')
+        os.makedirs(audit_dir)
+        os.makedirs(result_dir)
+        _append(audit_dir, {'kind': 'analysis', 'label': 'audit_report'})
+        _append(result_dir, {'kind': 'cell', 'i': 0})
+        monkeypatch.setattr(A, 'REPO', td)
+        rep = A.audit_experiment_ledger()
+        assert rep['n_ledgers'] == 1, rep
+        assert list(rep['ledgers']) == ['results_demo/experiments.jsonl'], rep
+        assert rep['status'] == 'ok', rep
+        own = A.audit_experiment_ledger(
+            [os.path.join(audit_dir, 'experiments.jsonl')])
+        assert own['n_ledgers'] == 1 and own['n_ok'] == 1, own
+
+
 def test_experiment_ledger_refuses_to_grow_corrupt_evidence():
     with tempfile.TemporaryDirectory() as d:
         for i in range(2):

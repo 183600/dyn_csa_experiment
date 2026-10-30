@@ -168,6 +168,34 @@ def test_size_weighted_sampling_handles_a_total_weight_overflow():
     assert alloc.tolist() == [1, 2, 0], alloc
 
 
+def test_document_sampling_accepts_large_python_ints_but_not_boolean_sizes():
+    # A corpus token/byte count can exceed int64, so NumPy would expose the
+    # list as an object array even though every element is an ordinary real
+    # number.  The plan must coerce it instead of reporting "non-numeric".
+    plan = L.document_stratified_plan(
+        [10 ** 300, 10 ** 299], 2, n_strata=2, allocation='size_weighted')
+    assert plan['selected'] == [0, 1], plan
+    assert plan['size_coverage_fraction'] == 1.0, plan
+    json.dumps(plan, allow_nan=False)
+    # An int-64 overflow that is not even representable as a finite float is
+    # an explicit input error, not a silent truncation.
+    try:
+        L.document_stratified_plan([10 ** 400, 1], 1)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('a size beyond float64 was accepted')
+    # NumPy promotes a mixed [True, 1] list to int, so the dtype check alone
+    # cannot see the flag; booleans are not sizes.
+    for sizes in ([True, 1], [False, 2]):
+        try:
+            L.document_stratified_plan(sizes, 1)
+        except TypeError:
+            pass
+        else:
+            raise AssertionError(f'boolean sizes accepted: {sizes!r}')
+
+
 def test_scaling_trend_normalises_mixed_extreme_and_ordinary_effects():
     # The largest effect is above the safe-squaring limit but one seed is
     # ordinary.  Scaling on the maximum (not only when EVERY non-zero effect

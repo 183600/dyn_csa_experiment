@@ -1792,6 +1792,11 @@ def audit_experiment_ledger(paths=None):
       * reads local files only, starts no training and changes no measurement,
         p-value, Holm family or frozen verdict.
 
+    With ``paths=None`` the aggregate report's own append-only trace
+    (``analysis_audit/experiments.jsonl``) is skipped: every rebuild appends
+    to it, so auditing it inside the new report would make two rebuilds of the
+    same evidence differ.  Pass its path explicitly to audit that ledger.
+
     It is tamper-EVIDENT, not a signature: rewriting the log and regenerating
     its chain/anchor can still forge it.  Its job is to make accidental or
     one-line tampering visible, not to defend against a malicious author with
@@ -1807,6 +1812,13 @@ def audit_experiment_ledger(paths=None):
                 found.append(p)
         found.extend(sorted(_glob.glob(
             os.path.join(REPO, 'analysis_*', 'experiments.jsonl'))))
+        # `analysis_audit/` is the aggregate report's own append-only event
+        # trace: every rebuild appends to it, so including it in the report
+        # body makes two rebuilds of the same evidence differ.  It is still
+        # audited by passing its path explicitly (and by its own anchor
+        # check); the default aggregate scan covers the evidence ledgers.
+        found = [p for p in found
+                 if os.path.basename(os.path.dirname(p)) != 'analysis_audit']
         paths = found
     elif isinstance(paths, (str, bytes, os.PathLike)):
         paths = [paths]

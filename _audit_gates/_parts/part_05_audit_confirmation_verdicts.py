@@ -1392,6 +1392,14 @@ def audit_analysis_integrity(paths=None, *, exclude=()):
     """
     L = _import_exp_lib()
     import glob as _glob
+    # `exclude` is an iterable of paths, but a single path (the natural call
+    # for "skip this report") must not be mistaken for an iterable of
+    # characters.  The same normalisation `paths` already applies above is
+    # needed here, including the common `exclude=None` spelling.
+    if exclude is None:
+        exclude = ()
+    elif isinstance(exclude, (str, bytes, os.PathLike)):
+        exclude = (exclude,)
     excluded = {os.path.abspath(os.fspath(x)) for x in exclude}
     if paths is None:
         roots = [os.path.join(REPO, 'audit_report.json')]
@@ -1406,12 +1414,18 @@ def audit_analysis_integrity(paths=None, *, exclude=()):
         p = os.fspath(p)
         if os.path.isdir(p):
             for q in sorted(_glob.glob(os.path.join(p, '*.json'))):
+                # Ledger anchor sidecars (`*.anchor.json`) are not stamped
+                # analyses; counting one as a skipped artifact made a report
+                # rebuild depend on the previous report's own trace.
+                if q.endswith('.anchor.json'):
+                    continue
                 aq = os.path.abspath(q)
                 if aq in excluded or aq in seen:
                     continue
                 seen.add(aq)
                 files.append(aq)
-        elif os.path.isfile(p) and p.endswith('.json'):
+        elif (os.path.isfile(p) and p.endswith('.json')
+              and not str(p).endswith('.anchor.json')):
             ap = os.path.abspath(p)
             if ap in excluded or ap in seen:
                 continue
@@ -1783,7 +1797,8 @@ _AUDIT_INPUT_ROOT_FILES = ('confirmation_frozen.json',
                           'RELEASES.md')
 
 
-def audit_evidence_inputs(root=None, *, max_file_bytes=_AUDIT_INPUT_MAX_BYTES):
+def audit_evidence_inputs(root=None, *, max_file_bytes=_AUDIT_INPUT_MAX_BYTES,
+                         exclude=()):
     """Return ``(inputs, scope)`` for the local evidence an audit reads.
 
     ``inputs`` is a deterministic ``label -> path`` mapping suitable for
@@ -1795,12 +1810,23 @@ def audit_evidence_inputs(root=None, *, max_file_bytes=_AUDIT_INPUT_MAX_BYTES):
     append-only trace, and binding a report to a log that the report appends
     to would make every rebuild look like changed evidence.  That ledger has
     its own hash-chain/anchor audit.
+
+    ``exclude`` names files that are not inputs (normally the report being
+    replaced).  Without it, calling ``run_report(out=analysis_*/report.json)``
+    binds the new report to the previous one, so two rebuilds of unchanged
+    evidence can never compare equal.
     """
     root = os.path.abspath(root or REPO)
     root_real = os.path.realpath(root)
     max_bytes = int(max_file_bytes)
     if max_bytes < 0:
         raise ValueError('max_file_bytes must be a non-negative integer')
+    if exclude is None:
+        exclude = ()
+    elif isinstance(exclude, (str, bytes, os.PathLike)):
+        exclude = (exclude,)
+    excluded = {os.path.abspath(os.fsdecode(os.fspath(x))) for x in exclude}
+    excluded_real = {os.path.realpath(x) for x in excluded}
     picked = {}
     sizes = {}
     skipped = {'large': [], 'outside_root': [], 'unreadable': []}
@@ -1822,8 +1848,19 @@ def audit_evidence_inputs(root=None, *, max_file_bytes=_AUDIT_INPUT_MAX_BYTES):
     def _add(path):
         path = os.path.abspath(path)
         rel = _rel(path)
+        if excluded and (path in excluded
+                         or os.path.realpath(path) in excluded_real):
+            return
         if not _inside(path):
             skipped['outside_root'].append(rel)
+            return
+        # Only regular files are evidence.  A directory/FIFO/socket whose
+        # name happens to end in `.json` would otherwise be hashed later as a
+        # file (or block forever on a pipe); symlinks to regular files are
+        # still accepted because isfile() follows them.
+        if not os.path.isfile(path):
+            skipped['unreadable'].append(
+                {'path': rel, 'error': 'not a regular file'})
             return
         try:
             size = int(os.path.getsize(path))
@@ -1905,7 +1942,8 @@ def run_report(out='audit_report.json'):
         # Bind the report to the evidence files it actually read.  Without
         # this, editing a result/analysis input left the report's own digest
         # green and made a stale synthesis look current.
-        _inputs, _scope = audit_evidence_inputs()
+        _inputs, _scope = audit_evidence_inputs(
+            exclude=(os.path.join(REPO, out),))
         res['audit_inputs'] = _scope
         res = L.stamped_analysis('audit_report', res, inputs=_inputs)
         L.atomic_write_json(os.path.join(REPO, out), res, indent=2)

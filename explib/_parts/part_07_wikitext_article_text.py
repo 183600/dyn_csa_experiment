@@ -600,6 +600,12 @@ def document_stratified_plan(sizes, n_select, *, seed=0, n_strata=4,
     changing it changes the selected units even when the sizes and seed are
     unchanged.
     """
+    # Mixed [True, 1] is silently promoted to an integer array by NumPy, so
+    # the dtype check below cannot see the boolean flag.  Reject it on the
+    # input sequence (a scalar array keeps the bool dtype and is caught too).
+    if isinstance(sizes, (list, tuple)) and any(
+            isinstance(_v, (bool, np.bool_)) for _v in sizes):
+        raise TypeError('sizes must be numeric, not boolean flags')
     try:
         arr = np.asarray(sizes)
     except Exception as e:
@@ -608,6 +614,30 @@ def document_stratified_plan(sizes, n_select, *, seed=0, n_strata=4,
         raise ValueError(f'sizes must be 1-D, got shape {arr.shape}')
     if arr.size == 0:
         raise ValueError('sizes must contain at least one unit')
+    if arr.dtype == object:
+        # A Python int larger than int64 (a token/byte count from a large
+        # corpus, or an extreme-scale regression fixture) makes NumPy fall
+        # back to object dtype even though the value is an ordinary real
+        # number.  Coerce the scalar types explicitly so it is not rejected as
+        # non-numeric; strings, booleans and complex values stay invalid.
+        _vals = []
+        for _v in arr.tolist():
+            if isinstance(_v, (bool, np.bool_)):
+                raise TypeError('sizes must be numeric, not boolean flags')
+            if isinstance(_v, (complex, np.complexfloating)):
+                raise TypeError('sizes must be real, not complex')
+            if not isinstance(_v, numbers.Real):
+                raise TypeError(
+                    'sizes must be numeric, got an object array containing '
+                    f'{type(_v).__name__}')
+            try:
+                _f = float(_v)
+            except (TypeError, ValueError, OverflowError):
+                raise ValueError('sizes must be representable as finite floats') from None
+            if not math.isfinite(_f):
+                raise ValueError('sizes must be finite (no NaN/inf)')
+            _vals.append(_f)
+        arr = np.asarray(_vals, dtype=np.float64)
     if not (np.issubdtype(arr.dtype, np.number) and not np.iscomplexobj(arr)):
         raise TypeError(f'sizes must be numeric, got dtype {arr.dtype}')
     sizes_f = arr.astype(np.float64, copy=False)

@@ -149,6 +149,12 @@ def test_analysis_input_manifest_is_relative_and_explicit():
         same = L.analysis_input_manifest(
             {'a': os.path.join(td, 'input.json'), 'b': 'input.json'}, base=td)
         assert same['a']['sha256'] == same['b']['sha256'], same
+        # A bytes path is a valid OS path; decoding it must not make the
+        # manifest (or its JSON digest) fail halfway through.
+        raw = L.analysis_input_manifest(
+            {'a': os.fsencode(os.path.join(td, 'input.json'))}, base=td)
+        assert raw['a']['exists'] is True, raw
+        assert raw['a']['sha256'] == same['a']['sha256'], raw
     finally:
         shutil.rmtree(td, ignore_errors=True)
 
