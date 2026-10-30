@@ -36,10 +36,19 @@ def audit_trajectory(path=None):
         return y if math.isfinite(y) else None
 
     def _count(x, minimum=None):
-        y = _finite(x)
-        if y is None or not y.is_integer():
+        # Step labels are exact integers.  Reading an integral value through
+        # float64 rejected a legal label beyond float64's mantissa/exponent
+        # range and then reported a faithfully stored trajectory as a replay
+        # failure.
+        if isinstance(x, (bool, np.bool_, str, bytes, bytearray)) or x is None:
             return None
-        y = int(y)
+        if isinstance(x, (numbers.Integral, np.integer)):
+            y = int(x)
+            return y if (minimum is None or y >= minimum) else None
+        value = _finite(x)
+        if value is None or not value.is_integer():
+            return None
+        y = int(value)
         return y if (minimum is None or y >= minimum) else None
 
     def _close(a, b, tol=1e-9):
@@ -57,7 +66,12 @@ def audit_trajectory(path=None):
     def _slope(rows):
         if len(rows) < 2:
             return None
-        xs = [float(r['step']) for r in rows]
+        # Translate the exact integer step origin before float64, matching
+        # exp_lib._traj_slope: an OLS slope is translation invariant, but
+        # absolute labels above the float64 integer spacing collapsed and
+        # made the replayed slope undefined or wrong.
+        base = int(rows[0]['step'])
+        xs = [float(int(r['step']) - base) for r in rows]
         ys = [float(r['mean_log_ratio']) for r in rows]
         xm = sum(xs) / len(xs)
         ym = sum(ys) / len(ys)
@@ -205,7 +219,15 @@ def audit_trajectory(path=None):
             if isinstance(fresh, list):
                 ok = (isinstance(stored, list) and stored == fresh)
             elif isinstance(fresh, (int, float)) and not isinstance(fresh, bool):
-                ok = _close(_finite(stored), _finite(fresh))
+                if (isinstance(fresh, numbers.Integral)
+                        and not isinstance(fresh, (bool, np.bool_))
+                        and isinstance(stored, numbers.Integral)
+                        and not isinstance(stored, (bool, np.bool_))):
+                    # Exact comparison for an integer-valued field (e.g. a
+                    # step label); float64 cannot hold every such label.
+                    ok = int(stored) == int(fresh)
+                else:
+                    ok = _close(_finite(stored), _finite(fresh))
             else:
                 ok = stored == fresh
             if not ok:

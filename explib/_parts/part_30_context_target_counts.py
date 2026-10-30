@@ -21,7 +21,11 @@ def _context_target_counts(vb, ctx_len, *, max_positions=None):
                        'n_positions_scanned': 0, 'max_positions': max_positions,
                        'complete': True, 'rows': []}
     ctx_len = max(1, min(int(ctx_len), span))
-    scan_rows = list(range(n_rows))
+    # Keep the unbounded/no-subsample case as a range object: `list(range(...))`
+    # materialised one Python integer per validation row *before* the
+    # max_positions branch below could replace it, so a bounded scan over a
+    # multi-million-row split still paid an O(n_rows) host allocation.
+    scan_rows = range(n_rows)
     positions_per_row = span
     complete = True
     if max_positions is not None:

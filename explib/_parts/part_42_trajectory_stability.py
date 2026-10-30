@@ -47,17 +47,27 @@ TRAJECTORY_POLICY = {
 
 
 def _traj_step_int(value):
-    """An exact non-negative integer step, or ``None``."""
+    """An exact non-negative integer step, or ``None``.
+
+    Integrality is checked in the value's own domain.  Round-tripping through
+    float64 rejected exact Python/NumPy integers once they exceeded the float
+    mantissa or exponent range, although a step label is just an exact
+    integer (the same rule the seed-label parsers follow).
+    """
     if isinstance(value, (bool, np.bool_)):
         return None
     if isinstance(value, str) or isinstance(value, (bytes, bytearray)):
         return None
+    import numbers
+    if isinstance(value, (numbers.Integral, np.integer)):
+        as_int = int(value)
+        return as_int if as_int >= 0 else None
     try:
         as_int = int(value)
     except (TypeError, ValueError, OverflowError):
         return None
     try:
-        if float(value) != float(as_int):
+        if value != as_int:
             return None
     except (TypeError, ValueError, OverflowError):
         return None
@@ -112,7 +122,15 @@ def _traj_slope(points, *, unit=1000.0):
     """OLS slope of y on step, per ``unit`` steps; ``None`` when undefined."""
     if len(points) < 2:
         return None
-    xs = np.asarray([float(p[0]) for p in points], dtype=float)
+    # Translate the step origin before entering float64.  An OLS slope is
+    # translation invariant, but converting absolute step labels directly
+    # loses every difference below the local float64 spacing (e.g. steps
+    # 10**18, 10**18+100, 10**18+200 collapse to one value, giving den == 0
+    # or a badly wrong slope).  Subtracting the first exact integer step keeps
+    # the differences exact and finite even when the label itself exceeds the
+    # float64 exponent range.
+    base = int(points[0][0])
+    xs = np.asarray([float(int(p[0]) - base) for p in points], dtype=float)
     ys = np.asarray([float(p[1]) for p in points], dtype=float)
     xm = float(np.mean(xs))
     ym = float(np.mean(ys))
