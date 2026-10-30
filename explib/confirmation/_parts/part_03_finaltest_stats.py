@@ -135,6 +135,50 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
                                                                   'mean_arithmetic': float(np.mean(_dl)),
                                                                   'ppl_pooled': _pooled, 'n_tokens': _n_tok,
                                                                   'n': len(_dl), 'ppl_by_seed': {str(s): p for s, p in _by_seed.items()}, 'params': next((r.get('params') for r in rows if isinstance(r.get('params'), (int, float))), None), 'n_seqs': next((c.get('n_seq') for _r in rows for c in [((_r.get('by_len') or {}).get(Ln) or (_r.get('by_len') or {}).get(str(Ln)) or {})] if isinstance(c, dict) and c.get('n_seq') is not None), None)}
+    # Ranking resolution across the frozen arms: the pairwise Holm family
+    # answers pre-registered contrasts, not "which of the six arms is best and
+    # how much of that ordering is resolved".  The endpoint is shared by every
+    # primary comparison in the shipped manifest; if a future manifest uses
+    # different endpoints, a single ranking is not defined and is refused
+    # rather than silently mixing them.  This is exploratory and never enters
+    # the Holm family or the confirmation rule.
+    _rank_arms = sorted({str(c.get(k)) for c in (manifest.get('primary_comparisons') or [])
+                         for k in ('a', 'b') if c.get(k)})
+    _rank_eps = sorted({str(c.get('endpoint', 'by_len.ppl@4096'))
+                        for c in (manifest.get('primary_comparisons') or [])})
+    if len(_rank_arms) < 2:
+        stats['arm_ranking'] = {'kind': 'arm_rank_inference',
+                                'status': 'not_estimable',
+                                'reason': ('fewer than two arms appear in the '
+                                           'frozen primary comparisons')}
+    elif len(_rank_eps) != 1:
+        stats['arm_ranking'] = {'kind': 'arm_rank_inference',
+                                'status': 'not_estimable',
+                                'reason': ('the frozen primary comparisons use '
+                                           f'multiple endpoints {_rank_eps}; a '
+                                           'single cross-arm ranking is not defined')}
+    else:
+        _rank_len = str(_rank_eps[0]).rsplit('@', 1)[-1]
+        _rank_cells = {}
+        for _arm in _rank_arms:
+            _cell = ((stats['by_length'].get(_arm) or {}).get(_rank_len) or {})
+            _vals = _cell.get('ppl_by_seed') or {}
+            _rank_cells[_arm] = {_record_int(_s): float(_p) for _s, _p in _vals.items()
+                                 if _record_int(_s) is not None}
+        _rank_empty = sorted(a for a, v in _rank_cells.items() if not v)
+        if _rank_empty:
+            stats['arm_ranking'] = {'kind': 'arm_rank_inference',
+                                    'status': 'not_estimable',
+                                    'reason': ('no usable frozen-endpoint cell '
+                                               f'for arm(s) {_rank_empty}')}
+        else:
+            stats['arm_ranking'] = L.arm_rank_inference(
+                _rank_cells, better='min', n_boot=4000, seed=20261018,
+                rank_level=0.95, lead_level=0.60, min_seeds=5)
+            stats['arm_ranking']['endpoint'] = f'by_len.ppl@{_rank_len}'
+            stats['arm_ranking']['upstream'] = ('finaltest_stats: frozen '
+                                                'by_len cells, one common endpoint')
+
     for comp in manifest['primary_comparisons']:
         name = comp['name']
         a, b = (comp['a'], comp['b'])
@@ -1084,6 +1128,77 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
     else:
         A(f'**尚未运行 P5T**：`{TEST_OUTDIR}/bylen.json` 不存在（或为空）。前置：`python -m explib.confirmation phase P5C`（现覆盖全部六个冻结臂、种子数取自清单；主臂 0-5 已由 P3MT/P4MT 训练，resume 自动跳过），然后 `python -m explib.confirmation phase P5T`。冻结清单已入库（见上），随时可以执行；执行前请勿据任何 validation 读数调整冻结内容。')
         A('')
+    _rk = ft.get('arm_ranking')
+    if isinstance(_rk, dict):
+        A('### 冻结臂的排序分辨率（探索性）')
+        A('')
+        _rk_status = _rk.get('status')
+        if _rk_status == 'not_estimable':
+            A(f'- 不可估计：{_rk.get("reason", "insufficient data")}')
+            A('')
+        elif _rk_status in ('decisive', 'leading', 'undifferentiated', 'pairwise_only'):
+            _rk_means = _rk.get('observed_means') or {}
+            _rk_rank = _rk.get('observed_rank') or {}
+            _rk_pb = _rk.get('p_best') or {}
+            _rk_pt = _rk.get('p_top2') or {}
+            _rk_mr = _rk.get('mean_rank') or {}
+            _rk_ci = _rk.get('rank_ci95') or {}
+            A('| 臂 | n seeds | endpoint mean | observed rank | P(best) | P(top2) | mean rank | rank 95% CI |')
+            A('|---|---|---|---|---|---|---|---|')
+            for _a in (_rk.get('arms') or sorted(_rk_means)):
+                _m = _rk_means.get(_a)
+                _mt = f'{float(_m):.4f}' if isinstance(_m, (int, float)) else '—'
+                _ci = _rk_ci.get(_a) or ['—', '—']
+                A(f'| `{_a}` | {_rk.get("n_seeds", "?")} | {_mt} | '
+                  f'{_rk_rank.get(_a, "—")} | {_rk_pb.get(_a, float("nan")):.3f} | '
+                  f'{_rk_pt.get(_a, float("nan")):.3f} | '
+                  f'{_rk_mr.get(_a, float("nan")):.2f} | [{_ci[0]}, {_ci[1]}] |')
+            A('')
+            _rk_gap = _rk.get('observed_gap')
+            _rk_gci = _rk.get('top2_gap_ci95') or [None, None]
+            _gap_txt = (f'{float(_rk_gap):+.4f}' if isinstance(_rk_gap, (int, float))
+                        else '—')
+            _gci_txt = (f'[{float(_rk_gci[0]):+.4f}, {float(_rk_gci[1]):+.4f}]'
+                        if all(isinstance(x, (int, float)) for x in _rk_gci[:2])
+                        else '—')
+            A(f'- 观测最优：`{_rk.get("observed_winner", "?")}`；观测前二差距 '
+              f'{_gap_txt}（配对种子 bootstrap 95% 区间 {_gci_txt}；'
+              f'P(前二顺序)= {float(_rk.get("top2_order_prob", float("nan"))):.3f}；'
+              f'区间排除零={_rk.get("top2_gap_resolved")}）。')
+            A(f'- 状态：`{_rk_status}` — {_rk.get("status_reason", "")}')
+            _rk_nb = _rk.get('n_boot')
+            _rk_res = _rk.get('p_best_resolution')
+            if isinstance(_rk_nb, int) and isinstance(_rk_res, (int, float)):
+                A(f'- bootstrap：n_boot={_rk_nb}，seed={_rk.get("bootstrap_seed")}，'
+                  f'`P(best)` 分辨率 {float(_rk_res):.5f}（网格值，不是连续概率）。')
+            if _rk.get('p_best_note'):
+                A(f'- 注：{_rk.get("p_best_note")}')
+            if _rk.get('complete_coverage') is False:
+                _drops = {a: ds for a, ds in (_rk.get('dropped_seeds') or {}).items() if ds}
+                A(f'- 覆盖不完整：排序只使用各臂共有的 {_rk.get("n_seeds")} 个种子；'
+                  f'被丢弃的种子 {_drops}。这不是完整冻结面板的排序。')
+            if _rk.get('winner_stable_loo') is False:
+                A('- **留一种子不稳定**：删掉任一种子后观测最优臂会改变；'
+                  '该排序不能按「面板级最优」引用。')
+            if _rk.get('practical_tie') is True:
+                A('- **实际并列**：前二差距落在声明的 `tie_tol` 内；'
+                  '统计上可分辨不等于实际差异有意义。')
+            A('')
+            A('> 边界：上表是**固定臂集合内**的配对种子 bootstrap 排序读数'
+              '（重采样观测到的种子，保持跨臂配对），不是新的显著性检验，'
+              '不进入 Holm 族、不做 FWER 控制、不改变 `p_exact_signflip`、'
+              '`p_holm`、`confirmed` 或任何冻结判定。它不重采样评测文档，'
+              '也不把 12 个种子当作种子总体的随机样本。各臂的容量/配方/计算量'
+              '并不相同，排序不是架构因果排序；集合同时包含主方法与对照/'
+              '安慰剂臂，端点排序不等于「方法优劣」的因果结论。观测最优是在'
+              '同一批数据上选出的，高 `P(best)` 不能替代独立复现；'
+              '`undifferentiated` 只表示这个 seed 面板没有分辨出领先臂，'
+              '不是「各臂等效」的证据（等效性需要预注册 SESOI/TOST）。'
+              '表内 `endpoint mean` 是逐种子 PPL 的算术均值（与配对 sign-flip '
+              '同口径）；上方 by-length 表的 PPL 是 token 池化值，两者可能在'
+              '小数位不同，不能混读。')
+            A('')
+
     comps = ft.get('comparisons') or {}
     if comps:
         A('| 冻结主比较（test split，配对） | n | 覆盖完整 | 参数匹配 | 初始化配对 | Δ mean±std | Δ 95% CI（文章/文档 token 池化 cluster；seed×unit 两层 bootstrap / 行 bootstrap） | d_z | p (exact) | p 下限 | Holm p | Holm 拒绝 | 方向符合 |')

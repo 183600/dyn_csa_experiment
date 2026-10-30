@@ -4486,3 +4486,47 @@ attestation 与 ledger 事件一致且重复聚合不重复记事件；截断历
 look 目录首次升级自动补事件；纯 legacy 历史保持 `legacy`；聚合状态的
 ok/warnings/fail/空报告；CLI 在顶层 fail 时退出 1。完整 CPU 套件在本轮
 最终树通过（881 passed, 3 skipped）。
+
+## 2026-10-30 — 排序也要有分辨率：固定臂集合的配对种子 bootstrap（本轮结果分析硬化，no new runs）
+
+零 GPU 的结果分析硬化；不新增训练、不读取 test split、不修改
+`confirmation_frozen*.json` 的字节/种子/端点/α/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未触碰。
+
+**Problem.** 六个冻结臂只有预注册的**逐对**比较和 Holm 族；报告仍以逐臂
+`by_length` 均值表呈现结果，读者会把观测最低均值读成「最优臂」。这是
+六选一的选择极值：12 个 seed 上几个 PPL 点的差距可能小于 seed 训练噪声，
+而逐对检验显著也不回答「第一名与第二名的顺序是否分辨」。已有读数各自
+回答别的问题——单对照 bootstrap 区间、max-T 同时区间（§92）、方差分解
+（§89）、口径对账（§63）——没有一个给出 P(best)、排名区间、前二差距、
+逐对顺序概率或「删一个 seed 后赢家是否改变」。
+
+**Fix.** 新增 `exp_lib.ARM_RANK_POLICY` / `arm_rank_inference`：对固定臂
+集合、按 seed 均值端点排序，用**跨臂共享 seed 下标**的配对 bootstrap
+重采样；输出 `p_best`/`p_top2`/`mean_rank`/`rank_ci95`/前二差距及其区间/
+`pairwise_p_better`/归一化最优熵/有效候选数/留一种子赢家稳定性。全同臂或
+前二均值完全相等判 `undifferentiated` 并共享名次；K=2 判 `pairwise_only`；
+共有种子少于 `min_seeds`（默认 5）判 `not_estimable`。`decisive` 还要求
+前二差距区间排除零且留一稳定；`tie_tol` 只给 `practical_tie`，与统计可分辨性分开。数值在
+共同仿射尺度上计算以防极端有限值溢出；固定 `n_boot=4000`/seed 可重放。
+`finaltest_stats` 在唯一端点、主比较臂并集上写入 `stats['arm_ranking']`
+（含原始逐 seed 值）；`build_report` 新增排序分辨率表与边界段；
+`audit_gates.py arm_ranking` 从块内原始值独立重放并逐字段比对，拒绝夹带
+`confirmed`/`p_holm`/`verified` 等确认性字段，并入顶层 `report` 与
+`make audit`。
+
+**Boundary.** 不是新的显著性检验：没有新 p 值/区间/Holm 成员，不做 FWER
+控制，不改变 exact sign-flip p、Holm、`verified` 或冻结 `confirmed`。
+`p_best` 是 bootstrap 频率，不是后验/精确抽样概率；n=12 的百分位区间可能
+偏窄。臂集合固定且非随机化，容量/配方/计算量不同，排序不是架构因果排序；
+只重采样观测 seed，不重采样评测文档，12 个 seed 不是 seed 总体样本。高
+`p_best` 不替代独立复现；留一稳定只排除单 seed 决定赢家这一小类脆弱性。
+只在所有主比较共享一个端点时计算，否则明确 `not_estimable`，不混合端点。
+
+**Verification.** 新增 `test_review_part_42.py` 16 项：清晰分离/重叠面板/
+`better='max'`/前二差距与 `tie_tol`/全同臂/均值相等但方差不同/seed 键交集
+与覆盖/K=2 与种子不足/可重放与换 bootstrap seed/极端有限值/非法输入
+fail-closed/审计重放与 `p_best`、rank CI、确认性字段篡改/缺块与畸形块/
+bare `not_estimable`/CLI、report、`finaltest_stats`、报告接线/合成三臂
+六 seed 端到端落盘审计，以及合成 stats 的 `REPORT_v12` 排序表渲染。
+完整 CPU 套件在本轮最终树通过（916 passed, 3 skipped）。

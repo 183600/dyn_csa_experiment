@@ -8336,3 +8336,158 @@ attestation 判 fail；ledger 缺失判 warnings；改写历史 delta 且把 p �
 目录首次升级自动补事件；纯 legacy 历史保持 `legacy`；聚合状态的
 ok/warnings/fail/空报告；以及 CLI 在顶层 fail 时退出 1。完整 CPU 套件在
 本轮最终树通过。
+
+## 102. 排序也要有分辨率：固定臂集合的配对种子 bootstrap 排序读数（本轮结果分析硬化）
+
+零 GPU 的结果分析/统计报告硬化；不新增训练、不读取 test split、不修改
+`confirmation_frozen*.json` 的字节/种子/端点/α/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未触碰。
+
+### 102.1 问题：逐对 Holm 不能回答「哪个臂最好」
+
+冻结族里的六个主比较都是**预注册的逐对问题**（csa−dense、random−csa、
+allblocks−csa、sink-matched 等），Holm 校正也只覆盖这六个对照。但报告读者
+真正会问的是另一件事：**这六个臂里谁最好，观测到的排序被种子噪声分辨了
+多少？** 旧报告只给出 `by_length` 的逐臂 `mean (n=…)`；把其中最小的均值
+写成「最优臂」是六选一的选择极值（winner's curse）。12 个种子上几个 PPL
+点的差距完全可能小于 seed 间训练随机性；「每个逐对检验都显著」也不等于
+「第一名与第二名的顺序已分辨」，更不等于「第一名真实存在」。
+
+已有的区间/校正读数各自回答不同问题：`paired_bootstrap_ci` 是单对照的
+均值区间，max-T（§92）是同一 Holm 族的 simultaneous 区间，`variance_components`
+（§89）说明方差来自 seed 还是评测单元，`analysis_choice_concordance`（§63）
+只对账同一对照的多种聚合口径；现有的单种子稳健性重放的是 **Holm 拒绝
+集合**（§87），不是「谁排第一」。它们都没有给出 **P(best)、排名区间、前二
+差距、逐对顺序概率与「删一个种子后排序赢家是否改变」**。没有这些读数，
+报告就只能把「观测最低」当成「最好」。
+
+### 102.2 方法：固定臂集合上的配对种子 bootstrap 排序
+
+新增 `exp_lib.ARM_RANK_POLICY` 与 `exp_lib.arm_rank_inference()`：
+
+- **估计量**：对固定臂集合 `K`，令 `μ_k = E_seed[endpoint_k]`；按 `μ_k`
+  排序（PPL 默认 `better='min'`，越大越好时 `better='max'`）。观测排序用
+  competition ranking：**完全相等的均值共享同一名次**（1, 1, 3），不用
+  臂名字典序伪造 1/2/3。
+- **配对重采样**：每次 bootstrap 抽取一组 seed 下标，**所有臂共用同一组
+  下标**。两臂是在同一 seed、同一数据顺序、同一评测行上配对的；若各臂
+  独立重采样，差值的方差会被高估，排序分辨率会被错误地缩小。这与 exact
+  sign-flip 的配对设计一致。
+- **读数**（全部由同一组 bootstrap 均值派生，写入一个 JSON 块）：
+  - `p_best`：该臂在 bootstrap 中排第 1 的频率；`p_top2`：排前 2 的频率；
+  - `mean_rank` / `rank_ci95`：bootstrap 排名均值与 95% 百分位区间；
+  - `observed_winner` / `observed_runner_up` / `observed_gap`：观测前二及
+    其差（PPL 点，按 `better` 定向为正）；
+  - `top2_gap_ci95` / `top2_order_prob`：前二差距的 bootstrap 区间与
+    「观测前二顺序成立」的频率；
+  - `pairwise_p_better[a][b]`：bootstrap 中 a 优于 b 的频率（对角为
+    `null`；不是 p 值）；`p_best_entropy_normalized` 与
+    `effective_best_candidates` 概括「最优候选有多分散」；
+  - `winner_stable_loo` / `loo.dropped_seed_winners`：删掉任一种子后重新
+    计算观测最优；只要有一个 fold 换人，`decisive` 就被降为 `leading`。
+- **状态带**（报告阈值，不是检验）：`decisive`（`p_best_argmax` 就是观测
+  赢家、其 `p_best >= 0.95`、前二差距的 95% bootstrap 区间排除 0 且留一
+  稳定）、`leading`（`>= 0.60`）、`undifferentiated`（低于 0.60，或
+  前二均值完全相等/所有臂值全同）、`pairwise_only`（K=2，等价于已有配对
+  比较的顺序概率）、`not_estimable`（K<2 或共有种子数 `< min_seeds`，
+  默认 5）。声明的 `tie_tol`（端点原单位）另给 `practical_tie`，与统计
+  可分辨性分开：可分辨不等于实际差异有意义。`undifferentiated` 只表示
+  这个 seed 面板没有分辨出领先臂，**不是「各臂等效」的证据**；等效性仍要
+  预注册 SESOI/TOST（§56/§67），排序读数不提供它。
+- **数值稳定**：排序在 `raw / max|raw| - min` 的共同仿射尺度上计算，避免
+  `1e308` 级有限值在 bootstrap 均值中溢出；原单位均值用 divide-first
+  `fsum` 显示，排序本身不依赖该显示值。固定 `n_boot=4000`、bootstrap
+  seed `20261018`，同一输入可逐位重放；`p_best` 的分辨率为 `1/n_boot`
+  （默认 0.00025），块内以 `p_best_resolution` 明示，避免把网格值读成
+  连续概率。
+- **输入**：`arm -> 位置序列` 或 `arm -> {seed: value}`。前者要求各臂等长
+  （可选 `seeds=` 标签）；后者在**所有臂的种子交集**上排序，并把每个臂
+  被丢弃的种子写入 `dropped_seeds` 与 `complete_coverage`。缺 seed 的
+  臂不会被静默补一个值，也不会让面板悄悄缩水而不报告。
+
+### 102.3 边界：这是读数，不是第二个确认性检验
+
+- **没有新 p 值、没有 FWER 控制、没有 Holm 成员。** `p_best` 是 bootstrap
+  频率，不是后验概率，也不是精确抽样概率；百分位区间在 n=12 时可能偏窄。
+  它不改变 `p_exact_signflip`、`p_holm`、`verified` 或任何冻结
+  `confirmed` 判定，也不进入 `REPORT_v12` 的确认/反证段落。
+- **臂集合是固定的、非随机化的。** 六臂在容量、配方（`mlp_ratio`）、
+  读预算与计算量上并不相同（冻结清单已披露）。排序是「这些已训练配置
+  在这个端点上的排序」，不是架构因果排序；参数匹配也不等于计算匹配。
+- **只重采样种子，不重采样评测单元。** 它回答「换一批 seed 后这个排序
+  有多稳」，不回答「换一批文档后有多稳」；评测单元不确定性由 cluster /
+  two-level bootstrap（§61/§81）单独负责。12 个 seed 是观测到的有限面板，
+  不是从 seed 总体抽出的随机样本。
+- **`min_seeds=5` 是读数下限，不是冻结的确认下限。** 冻结清单的
+  `min_seeds_for_confirmation=8`（以及 `require_complete_coverage`）仍只约束
+  主比较的 sign-flip/Holm 判定；排序表在 5 个共有种子上就可以给描述性
+  区间，但会同时报告 `n_seeds` 与覆盖是否完整。n<5 时明确
+  `not_estimable`，不把更窄的面板冒充成完整排序。
+- **最优仍是在同一批数据上选出的。** 高 `p_best` 不能替代独立复现；把
+  「观测最优」升级为论文级主张仍需要新面板（或在首读前预注册的复现）。
+  留一种子稳定只排除「单个 seed 决定赢家」这一小类脆弱性。
+- **不适用于**多端点混合排序：`finaltest_stats` 只在所有主比较共享同一
+  端点时计算；否则写入 `not_estimable` 并说明原因，不把不同长度/端点的
+  均值混成一张排名表。
+- **排序口径是逐种子算术均值，不是 token 池化。** 配对 sign-flip 的
+  输入是每个 seed 的端点值之差，因此排序也用逐种子 PPL 的算术均值；
+  `by_length` 表显示的 `mean` 是 token 池化 PPL（存在 `nll_sum/n_tok`
+  时）。两者可能在小数位不同，报告已并列说明，不能把排序名次直接读到
+  池化均值上。
+- **集合里有主方法也有对照/安慰剂臂。** 端点排序包含全部冻结臂（例如
+  `randidx_seeded`、`allblocks`、`no_sink`），这是为了显示对照在端点上的
+  位置；它不是「主方法优于对照」的因果排序，机制主张仍由预注册对照与
+  `mechanism_claim_allowed` 约束。
+
+### 102.4 落盘、报告与审计
+
+- `explib.confirmation.finaltest_stats` 在冻结 `by_length` 聚合之后，按
+  `primary_comparisons` 的 **a/b 臂并集**和**唯一端点**调用
+  `arm_rank_inference`，写入 `stats['arm_ranking']`（含
+  `per_arm_seed_values`、`endpoint`、`upstream`）。`v12_analysis` 把它随
+  `finaltest` 一并写入 `analysis_v12/stats.json`。
+- `build_report` 在主比较表前新增「冻结臂的排序分辨率（探索性）」表：
+  逐臂 `n`、端点均值、观测名次、`P(best)`、`P(top2)`、排名均值/区间、
+  前二差距与区间、状态与边界。覆盖不完整、留一不稳定、实际并列都会在
+  表下点名；`not_estimable` 只打印原因。
+- `audit_gates.py arm_ranking`（别名 `ranking` / `best_arm`）读取
+  `analysis_v12/test_stats.json` 的 `arm_ranking`，用其自带的
+  `per_arm_seed_values`、`n_boot`、`seed`、`rank_level`、`lead_level`、
+  `tie_tol`、`min_seeds` **独立重放**，逐字段比较 `p_best`/`p_top2`/
+  排名区间/winner/status/gap/order-prob/LOO 等；任何不一致判 `fail`。
+  它还会拒绝块里出现 `confirmed`/`p_holm`/`verified`/verdict 等确认性
+  字段（排序读数不得夹带冻结判定），检查 `p_best` 和为 1、rank CI 在
+  `1..K`、`decisive` 必须满足 `p_best_argmax` 就是观测赢家、观测赢家的
+  `p_best` 达到 `rank_level`、`top2_gap_resolved` 为真且留一稳定；
+  `pairwise_only` 必须 K=2。缺块
+  （legacy artifact）判 `not_verifiable_locally`；无原始值的合法
+  `not_estimable` 判 `not_applicable`；带原始值的 `not_estimable` 仍会
+  重放并判 `ok`。该审计并入 `audit_gates.py report` 的顶层
+  `arm_ranking`，`make audit` 因此在真实篡改/不一致时非零退出。它是
+  **内部重放**：能发现「改了派生读数却没同步改原始值」和「删字段」，
+  但不能证明 `per_arm_seed_values` 就是原始 test 切片上的测量；后者由
+  `finaltest_stats` 的 stamped 输入绑定、冻结锁与 `analysis_integrity`
+  负责。能重写整块并连原始值一起重算的人仍可伪造，这与 §99/§101 的
+  tamper-evident 边界一致。
+
+### 102.5 入口与验证
+
+```bash
+python -m pytest -q test_review_part_42.py
+python audit_gates.py arm_ranking                  # 重放 analysis_v12/test_stats.json
+python audit_gates.py report                       # 顶层汇总含 arm_ranking
+make audit
+```
+
+`test_review_part_42.py` 16 项覆盖：清晰分离→`decisive`/P(best)≈1/rank CI
+[1,1]/留一稳定；重叠面板不冒充 `decisive` 且 `p_best` 归一；`better='max'`
+方向与逐对顺序概率的互补性；前二差距区间与 `tie_tol` 实际并列；全同臂与
+「均值相等但方差不同」都判 `undifferentiated` 且共享名次；seed 键交集、
+丢弃种子与覆盖标志；K=2 / 1 臂 / 种子不足的 `pairwise_only` 与
+`not_estimable`；同 seed 可重放、换 bootstrap seed 只允许频率末位变化；
+`1e308` 级有限值不溢出；15 类非法输入 fail-closed；审计对合法块 `ok`、
+篡改 `p_best`/rank CI/夹带 `confirmed` 判 `fail`、缺块/空块
+`not_verifiable_locally`、畸形块 `fail`、bare `not_estimable`
+`not_applicable`；`run_report`/CLI/报告/`finaltest_stats` 接线；合成六 seed 三臂面板的
+端到端落盘 → 审计 `ok`；以及用合成 stats 渲染 `REPORT_v12` 的排序表
+（表头、行与「不是各臂等效」caveat）。完整 CPU 套件在本轮最终树通过。
