@@ -120,3 +120,42 @@ def test_unit_precision_design_reorders_an_overflowing_ci_product():
     for key in ('ci_halfwidth', 'ci95_halfwidth'):
         assert math.isfinite(rep['precision'][key]), (key, rep)
     assert math.isfinite(rep['mde']['absolute']), rep
+
+
+def test_scale_interaction_withholds_nonrepresentable_and_undefined_fields():
+    # An all-zero interaction has no non-zero rank for the Wilcoxon
+    # sensitivity test, and a constant non-zero interaction has an unbounded
+    # Cohen's d_z.  Both must be unavailable (None), not NaN/Infinity, because
+    # the report is serialised with allow_nan=False.
+    zero = L.scale_interaction([0.0] * 6, [0.0] * 6)
+    assert zero['p_wilcoxon'] is None, zero
+    assert zero['p_exact_signflip'] == 1.0, zero
+    json.dumps(zero, allow_nan=False)
+    constant = L.scale_interaction([0.0] * 6, [1.0] * 6)
+    assert constant['cohens_dz'] is None, constant
+    assert math.isfinite(constant['mean']), constant
+    json.dumps(constant, allow_nan=False)
+    # An interval endpoint beyond float64 is likewise withheld.
+    extreme = L.scale_interaction([1e308, -1e308, 5e307],
+                                  [1.7e308, -1.7e308, 1.7e308])
+    for key in ('ci95_low', 'ci95_high'):
+        assert extreme[key] is None or math.isfinite(extreme[key]), (key, extreme)
+    json.dumps(extreme, allow_nan=False)
+    # Ordinary panels keep the historical finite values.
+    ordinary = L.scale_interaction([1.0] * 6, [1.5] * 6)
+    assert ordinary['mean'] == 0.5 and ordinary['cohens_dz'] is None
+    # A numeric string is not a measurement.  The old float() path accepted
+    # '1.0' as if it were a recorded effect.
+    strings = L.scale_interaction(['1.0'] * 6, ['2.0'] * 6)
+    assert strings['n'] == 0 and strings['n_dropped'] == 6, strings
+    json.dumps(strings, allow_nan=False)
+    for bad in (('1.0', '2.0'), (None, [1.0])):
+        try:
+            L.scale_interaction(*bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'non-sequence effects accepted: {bad!r}')
+
+
+

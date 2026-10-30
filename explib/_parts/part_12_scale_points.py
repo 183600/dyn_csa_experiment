@@ -714,8 +714,22 @@ def scale_interaction(low_effects, high_effects, *, low_label='low', high_label=
     更大）。逐种子配对后做精确符号翻转检验，避免把「大规模 PPL 基线更高」
     误读成「效应随规模变大」。
     """
-    a = list(low_effects)
-    b = list(high_effects)
+    def _effect_vector(value, name):
+        # A string is an iterable of characters, not a per-seed effect panel;
+        # accepting it silently produces a misleading "no data" report.
+        if isinstance(value, (str, bytes)) or not hasattr(value, '__iter__'):
+            raise ValueError(
+                f'scale_interaction {name} must be an iterable of per-seed '
+                f'effects, got {type(value).__name__}')
+        try:
+            return list(value)
+        except TypeError:
+            raise ValueError(
+                f'scale_interaction {name} must be an iterable of per-seed '
+                f'effects') from None
+
+    a = _effect_vector(low_effects, 'low_effects')
+    b = _effect_vector(high_effects, 'high_effects')
     _seeds_declared = seeds is not None
     if len(a) != len(b):
         raise ValueError('scale_interaction needs equal-length effects (%d vs %d)' % (len(a), len(b)))
@@ -732,21 +746,19 @@ def scale_interaction(low_effects, high_effects, *, low_label='low', high_label=
         raise ValueError('scale_interaction got duplicate seeds %r' % (ss,))
     diff, kept = [], []
     for s, x, y in zip(ss, a, b):
-        if isinstance(x, (bool, np.bool_)) or isinstance(y, (bool, np.bool_)):
+        # Use the repository-wide measurement contract: booleans, complex
+        # values and numeric *strings* are not measurements.  The old
+        # ``float(x)`` silently accepted "'1.0'" as a real effect, so a
+        # hand-edited/replayed artifact could pass as numeric data.
+        fx = _finite_scalar(x)
+        fy = _finite_scalar(y)
+        if fx is None or fy is None:
             # Keep the position so paired_effect_stats can report the dropped
             # seed instead of calling the surviving subset a complete panel.
             diff.append(float('nan'))
             continue
-        try:
-            fx, fy = float(x), float(y)
-        except (TypeError, ValueError, OverflowError):
-            diff.append(float('nan'))
-            continue
-        if math.isfinite(fx) and math.isfinite(fy):
-            diff.append(fy - fx)
-            kept.append(s)
-        else:
-            diff.append(float('nan'))
+        diff.append(fy - fx)
+        kept.append(s)
     st = paired_effect_stats(diff, alpha=alpha, min_n=min_n, seeds=ss)
     # `significant` on the underlying paired test only speaks about alpha and
     # seed noise; it does not know this caller's declared minimum-n floor.  A
@@ -777,7 +789,23 @@ def scale_interaction(low_effects, high_effects, *, low_label='low', high_label=
         st['seed_pairing_note'] = ('no seed identities were supplied; positions are '
                                    'paired mechanically and are not attested to be the '
                                    'same training draw')
-    return st
+    # This report is serialised (often through a strict allow_nan=False writer).
+    # A zero interaction has no non-zero rank to test, a constant non-zero
+    # interaction has an unbounded Cohen's d_z, and an interval whose endpoint
+    # is beyond float64 is unavailable; none of them is a measured number.
+    # Withhold them as None instead of NaN/Infinity.  Ordinary panels keep the
+    # historical floats unchanged.
+    for _key in ('mean', 'std', 'sem', 'cohens_dz', 'ci95_low', 'ci95_high',
+                 'p_exact_signflip', 'p_floor', 'p_wilcoxon'):
+        _value = st.get(_key)
+        if (isinstance(_value, (float, np.floating))
+                and not math.isfinite(float(_value))):
+            st[_key] = None
+    # The nested robustness readouts (bootstrap/predictive intervals) can be
+    # NaN as well when the panel has no data.  Run the same strict-JSON clean
+    # used by the artifact writer so this public report never carries a
+    # NaN/Infinity token, including for n=0.
+    return _json_clean(st)
 
 
 def effect_modification(effects_by_condition, *, reference=None, condition_values=None,

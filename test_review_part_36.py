@@ -391,3 +391,111 @@ def test_methodology_audit_attaches_without_changing_decisions():
     assert early_rep['endpoint_selection']['status'] == 'warn'
     assert any('endpoint selection' in w for w in early_rep['warnings'])
     assert early_rep['verified_components'] == with_ep['verified_components']
+
+
+def test_planned_budget_without_completion_is_not_a_final_step():
+    # A training record declares `steps_planned` but the actual
+    # `steps_completed` was not written.  The plan is not evidence that the
+    # budget was reached: inferring completion from it would turn an
+    # unrecorded truncation into a clean final-step endpoint.
+    recs = []
+    for s in range(3):
+        recs.append(_rec('a', s, 30.0 + s, steps_planned=1000))
+        recs.append(_rec('b', s, 34.0 + s, steps_planned=1000))
+    r = L.endpoint_selection_audit(recs, comparisons=[('a', 'b')])
+    assert r['status'] == 'not_verifiable', r
+    assert r['records']['a::s0']['rule'] == 'unknown', r['records']['a::s0']
+    assert r['records']['a::s0']['steps_completed'] is None
+    # Legacy/rope records with only `steps` keep the documented inference.
+    legacy = _panel(steps=1000)
+    r = L.endpoint_selection_audit(legacy, comparisons=[('a', 'b')])
+    assert r['records']['a::s0']['rule'] == 'final_step'
+    assert r['records']['a::s0']['steps_completed_inferred'] is True
+
+
+def test_cap_truncation_wins_and_checkpoint_mode_is_not_rule_evidence():
+    # `cap_truncated` is an explicit budget statement; an early-stop flag
+    # cannot relabel the same run as a best-step endpoint.
+    recs = _panel(steps=1000, steps_completed=800,
+                  early_stop={'stopped': True, 'best_step': 800},
+                  cap_truncated=True)
+    r = L.endpoint_selection_audit(recs, comparisons=[('a', 'b')])
+    assert r['comparisons']['a - b']['rule'] == 'truncated_step', r
+    # `checkpoint.mode` records which weights were saved, not which weight
+    # produced the quoted number.  On its own it must not infer a rule.
+    recs = _panel(checkpoint={'mode': 'best', 'step': 1, 'sha256': 'abc'})
+    r = L.endpoint_selection_audit(recs, comparisons=[('a', 'b')])
+    assert r['records']['a::s0']['rule'] == 'unknown', r['records']['a::s0']
+
+
+def test_malformed_record_identity_fails_closed_without_crashing():
+    # A malformed arm/seed has no comparison identity.  Its violations must
+    # still fail the audit, but it must not poison the default comparison
+    # builder with a None key mixed with valid strings/integers.
+    recs = [
+        {'arm': None, 'seed': 0, 'ppl': 1.0},
+        {'variant': 'a', 'seed': 'not-an-int', 'ppl': 2.0},
+        {'arm': 'a', 'seed': 0, 'ppl': 30.0, 'steps': 10,
+         'steps_completed': 10},
+        {'arm': 'a', 'seed': 1, 'ppl': 31.0, 'steps': 10,
+         'steps_completed': 10},
+        {'arm': 'b', 'seed': 0, 'ppl': 34.0, 'steps': 10,
+         'steps_completed': 10},
+        {'arm': 'b', 'seed': 1, 'ppl': 35.0, 'steps': 10,
+         'steps_completed': 10},
+    ]
+    r = L.endpoint_selection_audit(recs)
+    assert r['status'] == 'fail', r
+    assert r['counts']['n_records'] == 4, r['counts']
+    assert any('arm must be' in v for v in r['violations']), r['violations']
+    assert any('seed must be' in v for v in r['violations']), r['violations']
+
+
+def test_audit_gate_derives_seed_from_the_summary_key():
+    import audit_gates as A
+    with tempfile.TemporaryDirectory() as td:
+        summary = {}
+        for s in range(3):
+            # The redundant `seed` field is omitted; the key is canonical.
+            summary[f'a::seed{s}'] = {'variant': 'a', 'ppl': 30.0 + s,
+                                      'steps': 1000, 'steps_completed': 1000}
+            summary[f'b::seed{s}'] = {'variant': 'b', 'ppl': 34.0 + s,
+                                      'steps': 1000, 'steps_completed': 1000}
+        with open(os.path.join(td, 'summary.json'), 'w',
+                  encoding='utf-8') as f:
+            json.dump(summary, f)
+        with contextlib.redirect_stdout(io.StringIO()):
+            rep = A.audit_endpoint_selection(td)
+        assert rep['status'] == 'ok', rep
+        (panel,) = rep['panels'].values()
+        assert panel['status'] == 'ok', panel
+        assert panel['counts']['n_records'] == 6, panel['counts']
+
+
+def test_audit_gate_keeps_generic_summary_tags_separate():
+    # `arm::tag::seedN` is the documented summary key form.  A generic tag
+    # (not just the historical warm-up label) must not be silently pooled into
+    # the base comparison when the record itself carries no tag field.
+    import audit_gates as A
+    with tempfile.TemporaryDirectory() as td:
+        summary = {}
+        for tag in ('cold', 'warm'):
+            for s in range(3):
+                summary[f'a::{tag}::seed{s}'] = {
+                    'variant': 'a', 'ppl': 30.0 + s,
+                    'steps': 1000, 'steps_completed': 1000}
+                summary[f'b::{tag}::seed{s}'] = {
+                    'variant': 'b', 'ppl': 34.0 + s,
+                    'steps': 1000, 'steps_completed': 1000}
+        with open(os.path.join(td, 'summary.json'), 'w',
+                  encoding='utf-8') as f:
+            json.dump(summary, f)
+        with contextlib.redirect_stdout(io.StringIO()):
+            rep = A.audit_endpoint_selection(td)
+        assert rep['status'] == 'ok', rep
+        (panel,) = rep['panels'].values()
+        assert set(panel['comparisons']) == {'a - b [cold]',
+                                             'a - b [warm]'}, panel
+        assert panel['counts']['n_records'] == 12, panel['counts']
+
+

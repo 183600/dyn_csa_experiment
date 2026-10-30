@@ -150,11 +150,15 @@ def _endpoint_record(raw, *, where):
     completed_raw = _endpoint_first(raw, 'steps_completed', 'steps_done')
     # Legacy/rope records carry only `steps` (the run length); the training
     # record carries both the planned `steps` and the actual
-    # `steps_completed`.  When the actual field is absent, read `steps` as the
-    # run length but keep the distinction visible in the output.
+    # `steps_completed`.  Only that legacy shape may be read as a completed
+    # run.  A record that declares `steps_planned` but omits
+    # `steps_completed`/`steps_done` is *not* evidence that the planned budget
+    # was reached: treating the plan as the actual count would turn an
+    # unrecorded truncation into a clean `final_step`.
     completed_inferred = False
-    if completed_raw is None and planned_raw is not None:
-        completed_raw = planned_raw
+    if (completed_raw is None and raw.get('steps_planned') is None
+            and raw.get('steps') is not None):
+        completed_raw = raw.get('steps')
         completed_inferred = True
     planned = None
     completed = None
@@ -400,18 +404,19 @@ def _endpoint_record(raw, *, where):
                 violations.append(
                     f'{where}: declared truncated_step but steps_completed >= '
                     'steps_planned')
-    elif ckpt_mode in ('final', 'best'):
-        rule = 'final_step' if ckpt_mode == 'final' else 'best_validation_step'
-        source = 'checkpoint'
+    elif cap_truncated:
+        # The runtime cap is an explicit budget statement.  It takes priority
+        # over an early-stop flag: the run did not reach its planned budget,
+        # so the quoted value is a truncated endpoint regardless of what the
+        # validation curve was doing when the cap fired.
+        rule = 'truncated_step'
+        source = 'inferred'
     elif early_stopped is True:
         if (best_step is not None and reported is not None
                 and best_step == reported):
             rule = 'early_stopped_best'
         else:
             rule = 'early_stopped_stop'
-        source = 'inferred'
-    elif cap_truncated:
-        rule = 'truncated_step'
         source = 'inferred'
     elif planned is not None and completed is not None and completed < planned:
         rule = 'truncated_step'
@@ -616,9 +621,19 @@ def endpoint_selection_audit(records, *, comparisons=None, manifest=None,
                     parts = key.split('::')
                     rec.setdefault('arm', parts[0])
                     last = parts[-1]
-                    digits = ''.join(ch for ch in last if ch.isdigit())
-                    if digits:
-                        rec.setdefault('seed', int(digits))
+                    # Parse (do not scavenge) the seed suffix.  Taking every
+                    # digit from the label turned `arm::seed-1` into seed 1
+                    # and `arm::seed12x` into seed 12, silently inventing an
+                    # identity that the key does not encode.
+                    seed_text = last[4:] if last.startswith('seed') else None
+                    try:
+                        seed_val = (int(seed_text) if seed_text is not None
+                                    else None)
+                    except (TypeError, ValueError, OverflowError):
+                        seed_val = None
+                    if (seed_val is not None and seed_val >= 0
+                            and str(seed_val) == seed_text):
+                        rec.setdefault('seed', seed_val)
                     if len(parts) >= 3:
                         rec.setdefault('tag', '::'.join(parts[1:-1]))
             raw_items.append(rec)
@@ -635,7 +650,15 @@ def endpoint_selection_audit(records, *, comparisons=None, manifest=None,
         where = f'record[{i}]'
         rec, rec_viol, rec_warn = _endpoint_record(raw, where=where)
         violations.extend(rec_viol)
+        warnings.extend(rec_warn)
         if rec is None:
+            continue
+        # A record without a valid arm or seed has no comparison identity.
+        # Keep its violations (so the audit fails closed) but do not insert a
+        # ``(None, ...)`` key into the panel: the default comparison builder and
+        # the paired-seed sort would otherwise raise TypeError on mixed
+        # malformed/valid records instead of reporting a failed audit.
+        if rec['arm'] is None or rec['seed'] is None:
             continue
         key = (rec['arm'], rec['tag'], rec['seed'])
         label = (f'{rec["arm"]}::s{rec["seed"]}' if not rec['tag']
@@ -645,7 +668,6 @@ def endpoint_selection_audit(records, *, comparisons=None, manifest=None,
                 f'{label}: duplicate record for the same (arm, tag, seed)')
             continue
         normalized[key] = rec
-        warnings.extend(rec_warn)
     warnings = sorted(set(warnings))
     # Normalise the comparison list.
     if comparisons is None:

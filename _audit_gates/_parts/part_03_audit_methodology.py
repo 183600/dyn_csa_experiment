@@ -595,7 +595,28 @@ def audit_endpoint_selection(path=None, *, require_preregistered=False, verbose=
                     rec['variant'] = str(key).split('::', 1)[0]
                 rec['arm'] = rec.get('arm') or rec.get('variant')
                 rec['tag'] = L.record_tag(rec, key, legacy_ok) or ''
-                rec['seed'] = rec.get('seed', None)
+                if not rec['tag']:
+                    # `record_tag` only knows the historical warm-up labels and
+                    # explicit protocol/warm_steps fields.  Generic summary tags
+                    # are encoded in the key itself (`arm::tag::seedN`), so read
+                    # the middle segments instead of silently pooling the tag
+                    # into the base comparison.
+                    _key_parts = str(key).split('::')
+                    if len(_key_parts) >= 3:
+                        rec['tag'] = '::'.join(_key_parts[1:-1])
+                # Summary writers normally store `seed`, but the key is the
+                # canonical identity.  Derive it when the stored field is
+                # absent so a valid panel is not rejected as a non-integer
+                # record merely because the redundant field was omitted.
+                if rec.get('seed') is None:
+                    _seed_arm, _seed_sep, _seed_text = str(key).rpartition('::seed')
+                    try:
+                        _seed_val = int(_seed_text) if _seed_sep and _seed_arm else None
+                    except (TypeError, ValueError, OverflowError):
+                        _seed_val = None
+                    if (_seed_val is not None and _seed_val >= 0
+                            and str(_seed_val) == _seed_text):
+                        rec['seed'] = _seed_val
                 endpoint_records.append(rec)
         try:
             rep = L.endpoint_selection_audit(
