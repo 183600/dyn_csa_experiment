@@ -685,3 +685,45 @@ def test_tiny_positive_headroom_and_mee_are_not_absolute_epsilon_events():
     coarse = L.endpoint_measurement_resolution(
         [1e-13, 2e-13], minimum_meaningful_effect=1e-14)
     assert coarse['resolves_mee'] is False, coarse
+
+
+def test_wilcoxon_drops_only_exact_zeros_at_mixed_scales():
+    # A relative "zero" cutoff of 1e-15 * max|d| deleted every tiny but
+    # genuine delta whenever the panel also contained a normal-sized effect.
+    # The signed-rank test must keep those observations (and use the same
+    # exact-zero convention as the Hodges-Lehmann interval), otherwise n and
+    # the exact null distribution silently change.
+    mixed = [1.0, 1e-16, -1e-16]
+    got = L.wilcoxon_signed_rank_p(mixed)
+    assert got['n_nonzero'] == 3, got
+    # Ranks are 3, 1.5, 1.5; the exact two-sided p is 6/8.
+    assert got['p'] == 0.75, got
+    assert L.hodges_lehmann_interval(mixed)['n'] == got['n_nonzero']
+    # A wholly subnormal panel is still a real, non-zero measurement panel.
+    tiny = L.wilcoxon_signed_rank_p([1e-300, 2e-300, -3e-300])
+    assert tiny['n_nonzero'] == 3 and math.isfinite(tiny['p']), tiny
+    # Exact zeros remain absent observations, independent of the panel scale.
+    zeros = L.wilcoxon_signed_rank_p([0.0, 1.0, -1.0, 0.0])
+    assert zeros['n_nonzero'] == 2 and zeros['p'] == 1.0, zeros
+
+
+def test_ordered_batch_means_se_is_on_the_input_scale():
+    # The batch-means design effect is computed on a unit-scaled copy so it
+    # cannot overflow.  Its SE is a measured quantity, not a scale-free ratio,
+    # so it must be mapped back just like the i.i.d. and block-bootstrap SEs.
+    vals = [2.0, -2.0] * 6
+    block = L.ordered_unit_inference(vals, n_boot=40, n_perm=10, seed=3)
+    assert block['status'] == 'ok', block
+    raw = {g: L._od_batch_design(vals, g) for g in
+           (row['n_batches'] for row in block['batch_means'])}
+    for row in block['batch_means']:
+        expected = raw[row['n_batches']]['se']
+        assert math.isclose(row['se'], expected, rel_tol=1e-12), (row, expected)
+    # Rescaling the whole panel rescales the SE, not the design effect.
+    scaled = L.ordered_unit_inference([10.0 * v for v in vals],
+                                      n_boot=40, n_perm=10, seed=3)
+    assert scaled['batch_means'][0]['design_effect'] == (
+        block['batch_means'][0]['design_effect'])
+    assert math.isclose(scaled['batch_means'][0]['se'],
+                        10.0 * block['batch_means'][0]['se'],
+                        rel_tol=1e-12)

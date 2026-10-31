@@ -82,10 +82,15 @@ def wilcoxon_signed_rank_p(deltas):
     panels."""
     d = np.asarray([f for f in (_finite_scalar(x) for x in (deltas if deltas is not None else []))
                     if f is not None], dtype=float)
-    # Rescaling every delta must not change ranks or drop the panel: an
-    # absolute 1e-15 cutoff treats a 1e-200-scaled panel as all-zero.
-    _tol = 1e-15 * float(np.max(np.abs(d))) if d.size else 0.0
-    d = d[np.abs(d) > _tol]
+    # Signed-rank statistics are rank based: only an EXACT zero is an absent
+    # observation.  A scale-relative cutoff (the old ``1e-15 * max|d|``) is
+    # not harmless: when a panel mixes a normal-sized effect with a tiny but
+    # genuine one, the cutoff silently deletes the tiny observation and
+    # changes both n and the exact null law.  Dropping exact zeros only keeps
+    # this function's convention identical to ``hodges_lehmann_interval`` and
+    # preserves every non-zero measurement at any common scale, including a
+    # wholly subnormal panel.
+    d = d[d != 0.0]
     n = int(d.size)
     if n == 0:
         return {'p': float('nan'), 'method': 'none', 'n_nonzero': 0}
@@ -95,7 +100,10 @@ def wilcoxon_signed_rank_p(deltas):
     i = 0
     while i < n:
         j = i + 1
-        while j < n and abs(_abs[j] - _abs[i]) <= _tol:
+        # Exact equality is the tie definition for rank data.  A relative
+        # tolerance would merge genuinely distinct magnitudes and then charge
+        # them an average rank, while a common rescaling preserves exact ties.
+        while j < n and _abs[j] == _abs[i]:
             j += 1
         ranks[order[i:j]] = (i + j + 1) / 2.0  # average rank (1-based)
         i = j

@@ -571,6 +571,14 @@ def ordered_unit_inference(values, *, unit_ids=None, block_lengths=None,
     for gi in batch_counts:
         row = _od_batch_design(work, gi)
         if row is not None:
+            # ``work`` is the unit-scaled copy used so the design effect and
+            # n_effective stay overflow-safe.  The batch SE, like the block
+            # SE below, is a measured quantity and must be mapped back to the
+            # input scale; leaving it in work units made the same panel report
+            # a batch SE that was smaller by exactly the (arbitrary) common
+            # scale factor.
+            row['se'] = (row['se'] * scale
+                         if _od_math.isfinite(row['se']) else None)
             batch_rows.append(row)
     if not batch_rows:
         base.update({'status': 'not_estimable',
