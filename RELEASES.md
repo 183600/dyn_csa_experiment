@@ -23,8 +23,8 @@ python archive_release.py verify archive/release_v13.tar.gz
 
 `archive_release.py` packs `DECISION_LOG.md`, `confirmation_frozen.json`,
 `RELEASES.md`, `pyproject.toml`, `requirements.txt`, `requirements.lock` (if
-present), cache/tokenizer metadata, every `run_*.log` at the repo root (if
-present), the freeze lock, the measurement source files and a per-file
+present), `design_protocol.json` (if present), cache/tokenizer metadata,
+every `run_*.log` at the repo root (if present), the freeze lock, the measurement source files and a per-file
 SHA-256 manifest. The manifest also carries an `identity` block (the source
 tree digest, `CODE_SEMANTICS`, dependency contract and execution fingerprint);
 `verify` recomputes every file hash and the source-tree digest from the packed

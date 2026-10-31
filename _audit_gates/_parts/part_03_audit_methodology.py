@@ -1137,6 +1137,32 @@ def audit_design_preflight(manifest_path=None, dynamic_path=None):
         out['warnings'].append(
             f'endpoint sensitivity: the design-time endpoint gate could not '
             f'run ({type(_e).__name__}: {_e})')
+    # One prospective registration for the whole study: the individual
+    # decisions already checked above (budget, evidence level, power,
+    # disposition, endpoint range) are only a design if they were bound
+    # together before the first cell.  The standalone gate re-checks the
+    # stored protocol; here we surface its verdict.  An absent protocol is a
+    # warning, not a pass, but it does not retroactively fail a legacy plan.
+    try:
+        _dp = L.design_protocol_preflight_summary(manifest_path=mp)
+        out['design_protocol'] = _dp
+        if _dp.get('status') == 'fail':
+            out['violations'].extend(
+                f'design protocol: {x}' for x in (_dp.get('problems') or [])[:12])
+        elif _dp.get('status') in ('warnings', 'not_verifiable_locally'):
+            out['warnings'].append(
+                'design protocol: %s%s' % (
+                    _dp.get('status'),
+                    ('; ' + '; '.join((_dp.get('problems') or [])[:3]))
+                    if _dp.get('problems') else ''))
+    except Exception as _dpe:
+        out['design_protocol'] = {
+            'status': 'not_verifiable_locally',
+            'problems': [f'{type(_dpe).__name__}: {_dpe}'],
+        }
+        out['warnings'].append(
+            f'design protocol: the registration gate could not run '
+            f'({type(_dpe).__name__}: {_dpe})')
     # A recorded violation is a hard design defect, including the case where
     # the frozen manifest is missing/unreadable.  Previously that branch only
     # appended to `violations` while `status` stayed 'ok', so the CLI exited 0

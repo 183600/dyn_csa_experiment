@@ -61,7 +61,7 @@ DEFAULT_DIRS = ['results_lm_test', 'analysis_v12']
 _CKPT_SUFFIXES = ('.pt', '.ckpt', '.pth', '.safetensors')
 
 ENV_FILES = ['confirmation_frozen.json', 'DECISION_LOG.md', 'RELEASES.md', 'requirements.txt',
-            'requirements.lock', 'pyproject.toml',
+            'requirements.lock', 'pyproject.toml', 'design_protocol.json',
             # data/cache provenance: a tokenizer or cache that changes the ids
             # must be visible in the archive, not only in a local directory.
             'wt103_cache/test_meta.json', 'wt103_cache/train_meta.json',

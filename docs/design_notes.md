@@ -11582,3 +11582,203 @@ B 在两个对中 PPL 不同被具名为 split node 且排序门关闭；两个�
 族大小；连通但两侧种子不相交时排序门关闭；gate 重放 ok、篡改排序门/
 夹带 `verdict`/缺块分别 fail 与 `not_verifiable_locally`。完整 CPU 套件
 在本轮最终树通过。
+
+## 127. 设计不是一个清单，而是一份事前绑定：`design_protocol`（本轮实验设计与准备硬化）
+
+零 GPU；不新增训练、不读取 test split、不修改
+`confirmation_frozen*.json` 的字节/种子/端点/α/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未删除、未修改、未移动。
+
+### 127.1 问题：每个部件都合格，不等于同一份设计
+
+仓库已经把设计的各个部件分别做成了机器可查的东西：冻结清单里的臂/种子/
+α、`statistics` 里的功效与最小可达 p、`run_order.json` 的区组随机化、
+`run_disposition.json` 的失败重跑规则、`statistics.test_access_policy`
+的 held-out 访问预算，以及结果层的 `design_preflight`。但这些部件没有
+一个共同的**登记对象**：
+
+- 功效表可以来自一份清单，随机化计划可以来自另一份运行目录，处置策略
+  可以来自第三次写入；三者都「有效」，却可能描述不同的实验；
+- 一份 `run_order.json` 可以在事后补写；`created_at` 检查只在
+  `run_allocation` 里单独存在，不会阻止一份同样晚写的功效/处置声明；
+- 一份清单可以在注册后被改臂、改种子、改 α；各单件审计只看到自己那
+  一维，没有对象可以回答「这仍然是注册时那份设计吗」；
+- 确认性研究最需要的「事前承诺」不是某个字段的值，而是**这些决定在
+  第一条 cell 之前同时存在且互相一致**。没有这层绑定，事后组装的
+  设计可以逐项通过，却不能支持确认性解释。
+
+这不是再增加一个统计量，而是把「设计」从若干可选声明变成一个有身份、
+有完整性判据、有时间顺序的登记。
+
+### 127.2 方法：一份规范化的 `design_protocol.json`
+
+新增 `exp_lib.build_design_protocol(manifest, ...)`：它只**誊写**已有
+声明，不发明新承诺。输入是冻结清单，以及可选的
+`run_order.json`、`run_disposition.json`（或其 policy）、
+`test_access_policy`；输出固定十个 section：
+
+| section | 记录什么 |
+|---|---|
+| `study` | 研究名、证据等级、manifest 的 canonical SHA-256、代码语义戳、α |
+| `research_question` | 逐假设的陈述/端点/方向/可证伪条件；主比较族 |
+| `arms` / `comparisons` | 臂集合、逐对照的 a/b、端点、方向、机制声明资格 |
+| `sample_size` | 计划种子数、确认下限 `min_n`、族大小、评测单位数、目标功效、分辨率 |
+| `randomization` | 区组设计、`design_seed`、位置平衡、计划 cell 列表、设备槽位 |
+| `stopping` | 训练步数/token 预算、评测间隔、早停、test/analysis look 预算、禁止数据依赖停止 |
+| `analysis` | 检验、Holm 族大小、α、最小可达 p、代码语义、缺失数据政策 |
+| `data` | selection/test 切分、训练与 test 切片指纹、评测长度、held-out 访问预算 |
+| `operations` | 失败处置策略（保留哪次成功、同 cell 替换、尝试上限、supersede） |
+| `extras` | 仅由调用方显式提供的补充声明；不参与自动推断 |
+
+关键点：
+
+- **canonical hash**：`content_sha256` 只排除 `created_at`、`revision`、
+  `supersedes`、`reason`、`history`；其余十个 section、commitments 与
+  任何 extras 都在哈希内。改一个端点、方向、族大小、处置模式或计划
+  cell，都会得到不同身份。时间戳和修订说明是 provenance，不是科学内容。
+- **逐 section commitments**：每个 section 另存 SHA-256，审计可以指出
+  是哪一块被改，而不是只说「整份文件不匹配」。
+- **不推断缺失项**：清单没有 `n_seeds` 就写 `None`，没有 run order 就
+  写 `randomization=None`，没有处置策略就写 `operations.disposition=None`。
+  `validate_design_protocol` 随后把这些缺口报出来；不会补一个「通常
+  如此」的默认值。
+- **修订只能追加**：`revision=0` 不允许 `supersedes`；`revision>0` 必须
+  列出被替代的 `content_sha256` 并写非空 `reason`。`write_design_protocol`
+  对同内容 no-op，对不同内容默认返回 `conflict=True` 且**不覆盖**；只有
+  `keep_existing=False` 且满足修订链才写新文件。
+
+### 127.3 完整性判据：confirmatory 严格，exploratory/draft 只告警
+
+`validate_design_protocol(protocol, require_complete=None)` 默认按
+`study.level` 决定强度：
+
+- confirmatory：十个 section 全为硬要求；缺 hypothesis 的
+  statement/endpoint/falsifier、缺对照方向、缺 run order、缺处置策略、
+  缺 held-out 预算、缺 `content_sha256` 均判 `fail`；
+- exploratory/draft：同样的缺口降为 warning 并记入 `missing`，状态为
+  `warnings`；它可以在探索阶段跑，但不能被当作已注册的确认性设计。
+
+硬算术检查：
+
+- `family_size` 必须等于主比较族大小；`min_n` 必须 ≤ `planned_seeds`；
+- 在声明的 `min_n`/`family_size`/α 下重算
+  `m·2/2^{min_n}`，若 ≥ α 判 fail——这是**与效应量无关**的分辨率下限；
+  即使种子数本身「够多」，只要这个下限不达标，任何效应都不可能显著；
+- 在 `planned_seeds` 下另算一次分辨率，并与 `sample_size.resolution_floor`
+  对账；固定 v12 清单的 `min_attainable_p_holm=0.00293` 对应 n=12，
+  而 `min_n=8` 的硬下限是 `6·2/2^8=0.046875`，两者不能混写；
+- `analysis.alpha` 必须等于 `study.alpha`；`analysis.family_size` 必须
+  等于 `sample_size.family_size`；`stopping.test_looks` 必须等于
+  `data.test_access.max_looks`；
+- confirmatory 的处置策略必须是 `retention='first_success'`、
+  `replacement='same_cell'`、`allow_supersede=false`，且
+  `max_attempts_per_cell` 为整数；
+- `data.disjoint_declared=false` 判 fail；`None` 只告警，明确
+  「未记录不等于已证明不相交」；
+- `power_simulated` 不为 true 时告警：「这是设计投影，不是本面板逐种子
+  delta 上的精确 sign-flip 模拟」。它不会被升级成「已测量功效」。
+
+### 127.4 一致性、时间顺序与重放
+
+`design_protocol_conformance(protocol, manifest)` 把登记与**当前清单**
+逐项对账：manifest canonical SHA-256、arms、seed 数、`min_n`、族大小、
+α、correction、代码语义戳；如果清单显式声明了 held-out 预算或处置策略，
+还会核对 method/max_looks 与 retention/replacement/allow_supersede。
+清单在注册后被改一个臂或一个种子，conformance 直接 fail。
+
+`design_protocol_timing(protocol, events)` 取事件中最早的
+`started_at`/`created_at`，要求 `protocol.created_at` 不晚于它。晚于
+第一条事件即 `reconstruction=True` 判 fail；时间戳缺失/不可比/没有事件
+时返回 `not_verifiable`，不伪造通过。它补上了既有 `run_allocation`/
+`run_disposition` 只检查各自计划的时间缺口：现在**整份设计**必须早于
+执行。
+
+`design_protocol_audit(path, manifest_path, events, panel_dirs)` 组合以
+上四步：读取并重算 body hash、validation、conformance、timing。默认在
+仓库根、`analysis_v12/` 与 `results_*/` 找 `design_protocol.json`；找不到
+时状态是 `not_verifiable_locally`，同时给出 ten-section 清单和编译提示。
+它不把「没有登记」当成「没有做过预注册」，也不把它当成绿色通过。
+
+### 127.5 接线与入口
+
+```bash
+python audit_gates.py design_protocol [design_protocol.json]
+python audit_gates.py protocol          # 别名
+python audit_gates.py protocol_gate     # 别名
+python audit_gates.py design_registration
+python audit_gates.py report            # 顶层 design_protocol 块
+```
+
+`audit_design_preflight` 末尾附加 `design_protocol` 摘要；缺登记时只
+warning，**已存在但不合格**时把问题并入 `violations` 并使
+`design_preflight` fail。`audit_gates.py report` 的顶层键也直接调用同一
+gate，因此 `make audit` 不会漏掉它。
+
+使用顺序是：先写 `run_order.json` 与 `run_disposition.json`（驱动已在
+第一条 cell 之前写），再用冻结清单编译 protocol 并写入；
+`write_design_protocol` 的哈希与 revision 规则使它不能静默覆盖。探索性
+阶段可以用 `level='exploratory'` 生成 `warnings` 版本，但不得把它改写
+成 confirmatory；那需要重新编译并产生新的 `content_sha256`。
+
+最小编译示例（零 GPU；`PANEL` 是已经写出两份计划的运行目录）：
+
+```python
+import json
+import exp_lib as L
+
+manifest = json.load(open('confirmation_frozen.json', encoding='utf-8'))
+order = json.load(open(f'{PANEL}/run_order.json', encoding='utf-8'))
+dispo = json.load(open(f'{PANEL}/run_disposition.json', encoding='utf-8'))
+protocol = L.build_design_protocol(
+    manifest, study_name='v12 fixed-chunk confirmation',
+    run_order=order, disposition=dispo,
+    test_access={'method': 'single_look', 'max_looks': 1,
+                 'require_reason_for_reread': True, 'declared': True},
+    disjoint_declared=True)
+print(L.write_design_protocol('.', protocol))
+```
+
+若 `PANEL` 尚未产生，`randomization`/`operations.disposition` 会保持
+`null`，`write_design_protocol` 因 confirmatory 校验失败而拒绝写入；这是
+刻意的：没有计划就不应该有一份看起来完整的事前登记。
+
+### 127.6 边界
+
+- **不是新的显著性检验。** 它不产生 p 值、不进入 Holm、不改变
+  `verified`/`confirmed`、不重算任何 PPL；它只回答「这份设计是否在同一
+  对象里、是否与清单一致、是否早于执行」。
+- **登记不是执行证明。** 一份 hash 正确的 protocol 不能证明分析者没有
+  看过数据，也不能证明驱动真的按计划跑了；它只让「事后改写设计」变成
+  可检测的，而不是让不端行为不可能。真正的执行一致性仍由
+  `run_allocation`、`disposition`、`looks`、`test_access` 与结果层审计
+  分别回答。
+- **canonical hash 不是签名。** 能同时改写 protocol 与重新计算 hash 的
+  人仍可伪造；它不是密码学签名，只是让无意的编辑、字段漂移和「补写
+  一份更漂亮的设计」可见。若要抗恶意，需要外部时间戳/签名，超出本仓库
+  范围。
+- **不追溯性改写旧面板。** 旧 v6–v11 没有这份登记，本块不会补写一个
+  假的早期时间戳；对它们只能是 `not_verifiable_locally` 或显式的
+  reconstruction warning。v12 若在首条 cell 之后才补 protocol，timing
+  会判 fail，这是有意的。
+- **不替代 `design_preflight` 的预算/证据等级检查。** 后者回答
+  「这条对照的 token/参数/读取预算是否匹配、证据等级是否被冒认」；
+  本块回答「这些决定是否被绑成一份事前登记」。两者互补，不能互相
+  替代。
+- **不读 test、不新增训练。** 所有输入都是本地 JSON；编译与审计都不调用
+  `load_wikitest`，也不改变任何冻结文件。
+
+### 127.7 验证
+
+新增 `test_review_part_68.py` 12 项：完整 protocol 的 ten-section/
+canonical hash/commitments 与时间戳不改变身份；confirmatory 缺
+randomization/disposition 判 fail 而 draft 只告警；5 种子/m=6 的
+分辨率下限判 fail（8 种子通过）；改 falsifier 或处置 retention 后
+hash/严格判据 fail；清单改臂/种子/α/对照后 conformance fail；protocol
+晚于首条事件判 reconstruction、无事件/时间戳不可比报
+not_verifiable；writer 对同内容 no-op、对不同内容 conflict 不覆盖、
+带 `supersedes` 的 revision 才可写；缺文件报
+`not_verifiable_locally`，篡改 body 判 fail；audit 重放 timing 与
+manifest mismatch；gate/CLI/`report`/`design_preflight` 接线存在且不
+新增任何 p/Holm/verdict 字段；以及 planned cell 的 arm/seed 必须属于
+声明的网格（未声明臂或未声明种子判 fail），以及未知方向标签不会被
+静默当成 non_directional。完整 CPU 套件在本轮最终树通过。

@@ -6034,3 +6034,85 @@ split，不新增训练，不改冻结清单、种子、α、Holm 规则或
 且不改变 Holm 族大小；连通但两侧种子不相交时排序门关闭；gate 重放
 ok、篡改/夹带/缺块分别 fail/`not_verifiable_locally`。完整 CPU 套件在
 本轮最终树通过。
+
+## 2026-10-31 — 设计不是一个清单，而是一份事前绑定：`design_protocol` 登记与重放（本轮实验设计与准备硬化，no new runs）
+
+零 GPU；不新增训练、不读取 test split、不修改
+`confirmation_frozen*.json` 的字节/种子/端点/α/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未删除、未修改、未移动。
+
+**Problem.** 设计的各个部件都已分别可查：冻结清单的臂/种子/α、统计块
+的功效与分辨率、`run_order.json` 的区组随机化、`run_disposition.json`
+的失败处置、`test_access_policy` 的 held-out 预算，以及
+`design_preflight` 的预算/证据等级检查。但它们没有被绑成一个有身份的
+对象。三份各自有效的元件可以描述不同的实验；一份 run order 可以在事后
+补写，而功效/处置声明不会因此被检查；清单在注册后改一个臂或 α，各单件
+审计只看到自己那一维。确认性研究需要的不是「每个字段都有值」，而是
+「这些决定在第一条 cell 之前同时存在、互相一致、且事后可检测」。
+
+**Fix.** 新增 `explib/_parts/part_66_design_protocol.py`：
+
+- `build_design_protocol(manifest, run_order=..., disposition=...,
+  test_access=..., ...)` 只誊写已有声明，输出固定十段：`study`、
+  `research_question`、`arms`、`comparisons`、`sample_size`、
+  `randomization`、`stopping`、`analysis`、`data`、`operations`（另可带
+  显式 `extras`）。缺输入保持 `None`，不补默认值。`study.manifest_sha256`
+  是清单的 canonical SHA-256；`content_sha256` 只排除
+  `created_at`/`revision`/`supersedes`/`reason`/`history`，十个科学
+  section、逐 section `commitments` 与 extras 都在哈希内。
+- `validate_design_protocol` 默认按 `study.level` 分级：confirmatory
+  十段全为硬要求，exploratory/draft 的缺口降为 warning 并记入
+  `missing`。硬算术包括：`family_size` 等于主比较族；`min_n ≤
+  planned_seeds`；在 `min_n`/m/α 下重算 `m·2/2^min_n`，≥ α 判 fail
+  （与效应量无关的分辨率下限）；在 `planned_seeds` 下另算一次并与
+  `resolution_floor` 对账；`analysis.alpha == study.alpha`、
+  `analysis.family_size == sample_size.family_size`、
+  `stopping.test_looks == data.test_access.max_looks`；confirmatory 的
+  处置必须是 `first_success`/`same_cell`/`allow_supersede=false`；
+  `data.disjoint_declared=false` 判 fail；`power_simulated` 非 true 时
+  只告警「投影不是本面板的精确 sign-flip 模拟」。
+- `design_protocol_conformance` 对当前清单重算 canonical SHA-256，并逐项
+  核对 arms、seed 数、`min_n`、族大小、α、correction、代码语义戳；若
+  清单显式声明 held-out 预算/处置策略，再核对 method/max_looks 与
+  retention/replacement/allow_supersede。注册后改一个臂/种子/α 即 fail。
+- `design_protocol_timing` 取最早 `started_at`/`created_at`，要求
+  protocol 不晚于它；晚于首条事件判 `reconstruction`，缺时间戳/无事件/
+  不可比报 `not_verifiable`。这补上了 run_order/run_disposition 各查
+  各的时间缺口：整份设计必须早于执行。
+- `write_design_protocol` 同内容 no-op；不同内容默认 `conflict=True` 且
+  不覆盖；只有 `keep_existing=False` 且 `revision>0`、`supersedes`
+  含旧 `content_sha256`、`reason` 非空时才写新文件。identity 不因
+  resume/时间戳改变，但科学内容的任何改动都会改变 hash。
+- `design_protocol_audit` 组合 body-hash/validation/conformance/timing；
+  默认在根、`analysis_v12/`、`results_*/` 查找，缺文件报
+  `not_verifiable_locally` 并列出十段与编译提示，不把缺失当通过。
+- 证据归档在 `design_protocol.json` 存在时把它写入 release
+  （`archive_release.ENV_FILES`），使事后归档也带着事前登记，而不是只带
+  结果目录。
+- `_audit_gates/_parts/part_32_audit_design_protocol.py` 提供
+  `audit_design_protocol(path=None, manifest_path=None)`；CLI 别名
+  `design_protocol`/`protocol`/`protocol_gate`/`design_registration`。
+  `audit_design_preflight` 末尾附加摘要：缺登记只 warning，已有但不合格
+  则并入 `violations` 并使 preflight fail；`run_report` 顶层也直接调用。
+
+**Boundary.** 不是新的显著性检验：不产生 p 值、不进入 Holm、不改变
+`verified`/`confirmed`、不重算 PPL。登记不是执行证明，也不是签名：它让
+「事后改写设计」可见，不能让恶意伪造不可能；真正的执行一致性仍由
+`run_allocation`、`disposition`、`looks`、`test_access` 与结果层审计
+分别回答。不追溯性改写旧面板：v6–v11 只能是
+`not_verifiable_locally` 或显式 reconstruction；v12 若在首条 cell 之后
+补 protocol，timing 会判 fail。canonical hash 与 `content_sha256` 不替代
+`design_preflight` 的预算/证据等级检查，也不读 test、不新增训练。
+
+**Verification.** 新增 `test_review_part_68.py` 12 项：完整 protocol 的
+十段/hash/commitments 与时间戳不改变身份；confirmatory 缺
+randomization/disposition 判 fail 而 draft 只告警；5 种子/m=6 分辨率
+下限 fail、8 种子通过；改 falsifier/处置后 hash 或严格判据 fail；清单
+改臂/种子/α/对照后 conformance fail；protocol 晚于首条事件判
+reconstruction，无事件/不可比报 not_verifiable；writer 同内容 no-op、
+不同内容 conflict 不覆盖、带 supersedes 的 revision 才可写；缺文件
+not_verifiable、篡改 body fail；audit 重放 timing 与 manifest mismatch；
+gate/CLI/`report`/`design_preflight` 接线存在且不新增 p/Holm/verdict
+字段；以及 planned cell 的 arm/seed 必须属于声明的网格（未声明臂或
+未声明种子判 fail），未知方向标签不会被静默当成 non_directional。
+完整 CPU 套件在本轮最终树通过。

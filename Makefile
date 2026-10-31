@@ -7,11 +7,12 @@ PYTHON ?= python
 BUILD_DIR := .build
 INSTALL_DIR := $(BUILD_DIR)/install-check
 
-.PHONY: help test plan audit manipulation integrity env-check reproduce report-diff install-check build clean
+.PHONY: help test plan protocol audit manipulation integrity env-check reproduce report-diff install-check build clean
 
 help:
 	@echo "make test          # CPU unit/reproducibility suite (zero GPU)"
 	@echo "make plan          # frozen-manifest preflight, no test-split read"
+	@echo "make protocol      # prospective design registration gate (design_protocol.json)"
 	@echo "make audit         # local audit gates -> audit_report.json (non-zero on a failed gate)"
 	@echo "make manipulation  # functional manipulation check for every declared ablation (zero GPU)"
 	@echo "make integrity     # verify stamped analysis bodies/inputs (zero GPU)"
@@ -27,6 +28,9 @@ test:
 
 plan:
 	$(PYTHON) -m explib.confirmation plan
+
+protocol:
+	$(PYTHON) audit_gates.py design_protocol
 
 audit:
 	$(PYTHON) audit_gates.py report
