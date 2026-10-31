@@ -1,19 +1,21 @@
-"""Experiment driver moved from v10_supp.py into the measurement package."""
+"""v10 mechanism / scaling / statistics driver (`python -m explib.corruption`).
 
-import os as _os
+Modes: `full` (default), `smoke`, `analysis`, `report` and
+`phase <name>` for P3MT / P3MTC / P3MP / P3T / P3SS / P3SL / P3SL2 / P3SL3.
+It runs the distractor-injection mechanism probe, the crossover scaling panels,
+the selector controls and the top-k seed completion.
+"""
 
-from _split_loader import load_split_package
-
-_HERE = _os.path.dirname(_os.path.abspath(__file__))
+from _split_loader import load_driver_package
 
 _PARTS = [
 'part_00_make_guard.py',
 'part_01_v10_analysis.py',
 ]
 
-load_split_package(globals(), _HERE, _PARTS, repo_depth=2,
-                   historical_path='v10_supp.py')
-del load_split_package
+load_driver_package(globals(), __file__, _PARTS,
+                    historical_path='v10_supp.py')
+del load_driver_package
 
 if __name__ == '__main__':
     _run_cli()

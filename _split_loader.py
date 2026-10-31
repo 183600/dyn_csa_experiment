@@ -9,7 +9,10 @@ tracebacks.
 
 A split package keeps its own thin ``__init__.py``: declare the fragments in
 execution (dependency) order, then hand the package directory and that list to
-:func:`load_split_package`.  Appending a fragment therefore stays a one-line
+:func:`load_split_package`.  Top-level packages use
+:func:`load_root_package` and the study drivers under ``explib/`` use
+:func:`load_driver_package`, so neither has to repeat the depth calculation or
+the ``__file__`` handling.  Appending a fragment therefore stays a one-line
 change in that package's ``_PARTS`` list, independent of how many split
 packages exist.
 """
@@ -64,3 +67,38 @@ def load_split_package(namespace: dict[str, Any], package_dir: str,
     namespace['_HERE'] = package_dir
     namespace['_REPO'] = repo_root
     load_parts(namespace, package_dir, parts)
+
+
+def load_root_package(namespace: dict[str, Any], module_file: str,
+                      parts: Iterable[str], *,
+                      historical_path: str) -> None:
+    """Bootstrap a top-level split package (``explib``, ``_audit_gates``, …).
+
+    This is the common ``repo_depth=1`` case of :func:`load_split_package`.
+    The package directory is derived from ``module_file`` (pass ``__file__``),
+    so each package declares only its fragment order and historical script.
+    """
+    package_dir = os.path.dirname(os.path.abspath(module_file))
+    load_split_package(namespace, package_dir, parts, repo_depth=1,
+                       historical_path=historical_path)
+
+
+def load_driver_package(namespace: dict[str, Any], module_file: str,
+                        parts: Iterable[str], *,
+                        historical_path: str) -> None:
+    """Bootstrap one of the study drivers under ``explib/``.
+
+    Driver packages (``explib.rope``, ``explib.confirmation``, …) live one
+    directory below the repository root and each preserves a historical
+    top-level script (``v7_supp.py`` …).  Passing the package's ``__file__``
+    keeps the path handling in one place instead of rebuilding the directory
+    and the ``repo_depth=2`` call in every ``__init__.py``.
+
+    The resulting namespace is identical to calling
+    :func:`load_split_package` with ``repo_depth=2``: ``_HERE`` is the package
+    directory, ``_REPO`` is the repository root and ``__file__`` is the
+    historical script path.
+    """
+    package_dir = os.path.dirname(os.path.abspath(module_file))
+    load_split_package(namespace, package_dir, parts, repo_depth=2,
+                       historical_path=historical_path)

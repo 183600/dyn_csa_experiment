@@ -11,10 +11,16 @@
 Git 树无法独立复核。仓库中的主张仅限 `confirmation_frozen.json` 冻结的
 范围；其余均为探索性。
 
-一分钟上手：用 `make test` 检查检出是否可用；从[研究一览](#研究一览)选择
-一个代次来运行或续跑；已有产物时，用零 GPU 的 `analysis` / `report` 模式
-重建结果。生成的报告描述的是**你自己这轮运行**，在发布并校验归档之前不要
-把它当作已发布证据。
+常见有三种使用方式：
+
+- **检查检出**：安装已验证的 CPU 环境并运行 `make test`，不需要 GPU。
+- **运行或续跑研究面板**：在[研究一览](#研究一览)中选择代次，再按
+  [复现方法（任意机器）](#复现方法任意机器)中的对应小节执行。
+- **从已有产物重建结果**：使用驱动的零 GPU `analysis` / `report` 模式，
+  或用 `python build_report.py` 重建 v7 报告。
+
+生成的报告描述的是**你自己这轮运行**，不是已发布证据；只有归档发布并通过
+`archive_release.py verify` 后，相应结果才可独立复核。
 
 > **版本命名**：`v12` 是驱动/研究代次；`CODE_SEMANTICS = v11.128` 是冻结
 > 清单绑定的库测量语义戳。两套编号故意不同。冻结清单当前为
@@ -56,6 +62,7 @@ Git 树无法独立复核。仓库中的主张仅限 `confirmation_frozen.json` 
   - [v11 统计收尾套件](#v11-统计收尾套件)
   - [v10 机制 / 扩规模 / 统计套件](#v10-机制--扩规模--统计套件)
   - [v12 确认套件（探索 / 确认分离）](#v12-确认套件探索--确认分离)
+  - [未结束块面板](#未结束块面板)
   - [v8 / v9 收尾套件](#v8--v9-收尾套件)
   - [v7 回应 reviewer 套件](#v7-回应-reviewer-套件)
   - [常见注意事项](#常见注意事项)
@@ -70,15 +77,15 @@ Git 树无法独立复核。仓库中的主张仅限 `confirmation_frozen.json` 
 
 | 代次 | 范围 | 入口 | 生成的产物 |
 |---|---|---|---|
-| v6 | 核心 CSA/HCA 表、去一法消融、规模探针、长跑 | `python run_gapfill.py full` | `results_lm_v3_1500/`、`results_lm_v4_abl/`、`results_lm_v5_scale/`、`results_lm_v3_long/` |
-| v7 | RoPE + QK-norm、长度外推、top-k 扫描 | `python -m explib.rope` | `REPORT_v7.md` |
-| v8 | 规模面板补种子与 20k RoPE 长跑 | `python -m explib.scale` | `analysis_v8/` |
-| v9 | seq-2048 top-k 收尾与第三个 20k seed | `python -m explib.resume` | `REPORT_v9.md` |
-| v10 | 干扰项注入机制探针、交叉扩规模、选择器对照 | `python -m explib.corruption` | `analysis_v10/`、`REPORT_v10.md` |
-| v11 | v10/v11 面板的统计收尾 | `python -m explib.length` | `analysis_v11/`、`REPORT_v11.md` |
-| v12 | 冻结的固定分块确认 | `python -m explib.confirmation` | `analysis_v12/`、`REPORT_v12.md` |
-| M0 | FineWeb-Edu 数据路径、内核 G0 门、S1/S2 规模面板 | `python -m explib.m0` | `results_b_s1/`、`results_b_s2/`、`analysis_m0/` |
-| open-block | 最大块长 × 未结束块读取规则 | `python -m explib.open_block` | `analysis_open_block/` |
+| v6 | 核心 CSA/HCA 表、去一法消融、规模探针、长跑 | [`python run_gapfill.py full`](#运行-v6-补充实验) | `results_lm_v3_1500/`、`results_lm_v4_abl/`、`results_lm_v5_scale/`、`results_lm_v3_long/` |
+| v7 | RoPE + QK-norm、长度外推、top-k 扫描 | [`python -m explib.rope`](#v7-回应-reviewer-套件) | `REPORT_v7.md` |
+| v8 | 规模面板补种子与 20k RoPE 长跑 | [`python -m explib.scale`](#v8--v9-收尾套件) | `analysis_v8/` |
+| v9 | seq-2048 top-k 收尾与第三个 20k seed | [`python -m explib.resume`](#v8--v9-收尾套件) | `REPORT_v9.md` |
+| v10 | 干扰项注入机制探针、交叉扩规模、选择器对照 | [`python -m explib.corruption`](#v10-机制--扩规模--统计套件) | `analysis_v10/`、`REPORT_v10.md` |
+| v11 | v10/v11 面板的统计收尾 | [`python -m explib.length`](#v11-统计收尾套件) | `analysis_v11/`、`REPORT_v11.md` |
+| v12 | 冻结的固定分块确认 | [`python -m explib.confirmation`](#v12-确认套件探索--确认分离) | `analysis_v12/`、`REPORT_v12.md` |
+| M0 | FineWeb-Edu 数据路径、内核 G0 门、S1/S2 规模面板 | [`python -m explib.m0`](#b-档-m0--s1扩规模入口已选定-b-档) | `results_b_s1/`、`results_b_s2/`、`analysis_m0/` |
+| open-block | 最大块长 × 未结束块读取规则 | [`python -m explib.open_block`](#未结束块面板) | `analysis_open_block/` |
 
 训练模式不会隐式启动；唯一的历史例外是 v6 脚本：它默认使用 `full`，因此
 裸跑 `python run_gapfill.py` 会启动主面板。训练模式之外的模式（`smoke`、
@@ -117,7 +124,7 @@ Git 树无法独立复核。仓库中的主张仅限 `confirmation_frozen.json` 
 
 ## 快速开始
 
-需要 Python 3.12。`requirements.lock` 是测试与零 GPU 分析路径使用的已验证
+需要 Python ≥3.12。`requirements.lock` 是测试与零 GPU 分析路径使用的已验证
 CPU 环境；CUDA 机器请先安装与本机驱动匹配的 torch wheel，再安装
 `requirements.txt` 中的范围（见[环境](#环境)）。
 
@@ -125,7 +132,7 @@ CPU 环境；CUDA 机器请先安装与本机驱动匹配的 torch wheel，再�
 python -m pip install -r requirements.lock
 make test                              # 完整 CPU pytest 套件
 make plan                              # 冻结清单预检；不读取 test split
-python -m explib.confirmation --help   # 列出子命令，不启动实验
+python -m explib.confirmation --help   # 查看驱动说明，不启动实验
 ```
 
 以上命令都不会启动训练。训练需要显式选择模式，例外是 `python
@@ -171,18 +178,21 @@ python -m explib.confirmation report
 python -m explib.reproduce compare results_lm_v3_1500 results_lm_v3_1500_rerun
 ```
 
-### 从哪里读起
+## 从哪里读起
+
+先看[从这里开始](#从这里开始)确定当前任务，再用[研究一览](#研究一览)
+查找具体命令。需要更多背景时，按下表定位权威文档。
 
 | 问题 | 文档 |
 |---|---|
-| 实验如何运行或重跑？ | 本 README |
+| 实验如何运行或重跑？ | 本 README，从[复现方法（任意机器）](#复现方法任意机器)开始 |
 | 该用哪个命令和子命令？ | [研究一览](#研究一览)与下文各驱动小节 |
-| 某个测量或比较为什么这样定义？ | `docs/design_notes.md` |
+| 某个测量或比较为什么这样定义？ | [`docs/design_notes.md`](docs/design_notes.md) |
 | 到底冻结了什么、允许主张什么？ | `confirmation_frozen.json` 与 `docs/design_notes.md` §17/§20 |
 | 如何理解某个判定或审计状态？ | [测量护栏](#测量护栏) |
-| 做过哪些决定，顺序如何？ | `DECISION_LOG.md` |
-| 已发布的证据在哪里？ | `RELEASES.md` |
-| 评审问题是如何处理的？ | `REVIEW_4_RESPONSE.md` |
+| 做过哪些决定，顺序如何？ | [`DECISION_LOG.md`](DECISION_LOG.md) |
+| 已发布的证据在哪里？ | [`RELEASES.md`](RELEASES.md) |
+| 评审问题是如何处理的？ | [`REVIEW_4_RESPONSE.md`](REVIEW_4_RESPONSE.md) |
 
 ## 仓库结构
 
@@ -191,18 +201,37 @@ python -m explib.reproduce compare results_lm_v3_1500 results_lm_v3_1500_rerun
 都**不入库**——它们由驱动脚本在跑实验的机器上重新生成。`.gitignore` 已把
 这几类路径挡在仓库外；`docs/` 只保留固定设计说明。
 
+先看一个最小地图：
+
+```text
+exp_lib.py                  历史导入 shim -> explib/
+explib/                     测量库（模型、注意力、训练、统计）
+explib/<driver>/            v7-v12、M0/S1 与 open-block 研究驱动
+run_gapfill.py              v6 驱动（历史入口）
+audit_gates.py              零实验审计门
+archive_release.py          证据归档构建与校验
+```
+
+完整清单见下表。
+
 ### 核心代码
 
 | 路径 | 说明 |
 |---|---|
 | `exp_lib.py` | **兼容 shim**，重新导出拆分后的 `explib/` 实现 |
-| `_split_loader.py` | 拆分包的共享加载器：`load_split_package` 负责包级引导（设置历史 `__file__` 与 `_HERE` / `_REPO`，再按顺序执行片段），`load_parts` 是底层执行器。片段以真实路径编译，因此 traceback 指向可审查的源码 |
+| `_split_loader.py` | 拆分包的共享加载器：`load_split_package` 负责包级引导（设置历史 `__file__` 与 `_HERE` / `_REPO`，再按顺序执行片段）；`load_root_package` 与 `load_driver_package` 分别是顶层包和 `explib/<driver>/` 的同一引导快捷方式；`load_parts` 是底层执行器。片段以真实路径编译，因此 traceback 指向可审查的源码 |
 | `explib/` | **核心库，也是唯一的代码来源**：模型、CSA/HCA 注意力、池化、indexer、分段器、训练循环、聚合与统计 |
 | `csa_kernels.py` | **兼容 shim**，重新导出 `_csa_kernels/` 实现 |
 | `_csa_kernels/` | **三算子融合内核路径**：块压缩池化、索引 top-k 选择与稀疏注意力的 Triton 内核（附带同一套算法分解、任意设备可跑的 torch 参考孪生实现）；`CSA_KERNEL` 选开、默认关闭——见下文 [Triton 内核路径](#triton-内核路径m0g0) |
 | `run_gapfill.py` | **v6 驱动**：核心/消融/规模/长跑面板，支持断点续跑，受运行时上限约束，每阶段完成后自动 push，结束后自动关机 |
 | `par.py` | **任务级并行执行器（可选）**：每个独立实验占一张 GPU 卡——见下文[任务级并行](#任务级并行每个实验一张卡) |
 | `data_guard.py` / `_data_guard/` | 防泄漏预处理与编码基础函数；shim 重新导出拆分包 |
+
+拆分包的引导契约统一为：把片段按执行顺序写进 `_PARTS`，再把 `__file__`
+传给 `load_root_package`（顶层包）或 `load_driver_package`
+（`explib/<driver>/`）。加载器设置 `_HERE`、`_REPO` 与历史 `__file__`，
+再以片段真实路径编译执行。新增片段只需在 `_PARTS` 加一行；新增驱动还需
+一个调用 `_run_cli` 的简短 `__main__.py` 入口。
 
 ### 驱动模块
 
@@ -292,7 +321,7 @@ CPU 上运行。
 
 ### 环境
 
-需要 Python 3.12（见 `pyproject.toml`）。
+需要 Python ≥3.12（见 `pyproject.toml`）。
 
 - **已验证的 CPU 环境（测试与零 GPU 分析）：**
 
@@ -581,6 +610,27 @@ python audit_gates.py efficiency_pairs  # 延迟主张必须同 shape/device/KV
 python audit_gates.py release     # 证据发布就绪：无完整记录 => source-only
 python archive_release.py plan v13 --dirs results_lm_test analysis_v12   # 证据归档 dry-run
 ```
+
+### 未结束块面板
+
+open-block 驱动在相同的 top-k 读取上限下，改变最大块长（32 / 64 / 128 / 不设
+上限）与当前开放块的读取规则（`closed`、`prefix_summary`、
+`prefix_singletons`）。主矩阵有 8 个 cell，按 seed 配对，因此报告在同一
+seed 内比较各臂。
+
+```bash
+python -m explib.open_block smoke       # 合成数据流水线自检
+python -m explib.open_block pilot       # 每个 cell 跑一个短 seed
+python -m explib.open_block main        # 8 cells x 4 seeds；可续跑
+python -m explib.open_block aux         # 窗口外辅助面板
+python -m explib.open_block extended    # 应急面板：4 种上限 x 3 种读取规则
+python -m explib.open_block report      # 配对差值 + 交互 + 精确符号翻转/Holm
+```
+
+记录写入 `results_open_block/`（`aux` / `extended` 变体分别写入独立目录）；
+`report` 生成 `analysis_open_block/stats.json` 与
+`analysis_open_block/OPEN_BLOCK_REPORT.md`。设计依据见
+`docs/design_notes.md` §24。
 
 ### v8 / v9 收尾套件
 

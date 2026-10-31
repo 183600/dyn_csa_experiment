@@ -1,10 +1,12 @@
-"""Experiment driver moved from v7_supp.py into the measurement package."""
+"""v7 reviewer-response driver (`python -m explib.rope`).
 
-import os as _os
+Modes: `full` (default), `smoke`, `analysis` and `phase <name>` for
+P0R / P0W / P0E / P2S / P1L / P1T.  The suite covers RoPE + QK-norm, dense
+warm-up, the 40k-step long run, scale re-seeding, length extrapolation and the
+sequence-2048 top-k sweep.
+"""
 
-from _split_loader import load_split_package
-
-_HERE = _os.path.dirname(_os.path.abspath(__file__))
+from _split_loader import load_driver_package
 
 _PARTS = [
 'part_00_soft_check_call.py',
@@ -12,9 +14,9 @@ _PARTS = [
 'part_02_run_lenphase_cell.py',
 ]
 
-load_split_package(globals(), _HERE, _PARTS, repo_depth=2,
-                   historical_path='v7_supp.py')
-del load_split_package
+load_driver_package(globals(), __file__, _PARTS,
+                    historical_path='v7_supp.py')
+del load_driver_package
 
 if __name__ == '__main__':
     _run_cli()

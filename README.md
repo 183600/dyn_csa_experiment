@@ -13,11 +13,19 @@ artifacts is therefore not independently auditable from this Git tree alone.
 Claims are limited to the frozen scope in `confirmation_frozen.json`; everything
 else is exploratory.
 
-In one minute: use `make test` to check a checkout, pick a generation from the
-[Study at a glance](#study-at-a-glance) table to run or resume a panel, and use
-the zero-GPU `analysis` / `report` modes to rebuild results from artifacts you
-already have. Treat a generated report as a description of *your* run, not as
-released evidence, until an archive is published and verified.
+There are three common ways to use this tree:
+
+- **Check a checkout.** Install the verified CPU environment and run
+  `make test`; no GPU is required.
+- **Run or resume a study panel.** Pick a generation in
+  [Study at a glance](#study-at-a-glance), then follow its section under
+  [Running the experiments](#running-the-experiments).
+- **Rebuild results from artifacts you already have.** Use a driver's zero-GPU
+  `analysis` / `report` mode, or `python build_report.py` for the v7 report.
+
+A generated report describes *your* run, not released evidence. Treat it as
+independently auditable only after its archive is published and
+`archive_release.py verify` passes.
 
 > **Version naming.** `v12` is the driver/study generation. `CODE_SEMANTICS =
 > v11.128` is the library measurement-semantics stamp bound by the frozen plan.
@@ -45,6 +53,11 @@ released evidence, until an archive is published and verified.
   - [Example workflows](#example-workflows)
 - [Where to look](#where-to-look)
 - [Repository layout](#repository-layout)
+  - [Core code](#core-code)
+  - [Driver modules](#driver-modules)
+  - [Tests and frozen inputs](#tests-and-frozen-inputs)
+  - [Evidence and design records](#evidence-and-design-records)
+  - [Tooling](#tooling)
   - [Regenerating the experiment artifacts](#regenerating-the-experiment-artifacts)
 - [Running the experiments](#running-the-experiments)
   - [Environment](#environment)
@@ -57,6 +70,7 @@ released evidence, until an archive is published and verified.
   - [v11 statistical close-out suite](#v11-statistical-close-out-suite)
   - [v10 mechanism / scaling / stats suite](#v10-mechanism--scaling--stats-suite)
   - [v12 confirmation suite (exploration / confirmation split)](#v12-confirmation-suite-exploration--confirmation-split)
+  - [Open-block panel](#open-block-panel)
   - [v8 / v9 close-out suites](#v8--v9-close-out-suites)
   - [v7 reviewer-response suite](#v7-reviewer-response-suite)
   - [Common pitfalls](#common-pitfalls)
@@ -72,15 +86,15 @@ entry point; v7 onwards live under `explib/`.
 
 | generation | scope | entry point | generated artifacts |
 |---|---|---|---|
-| v6 | core CSA/HCA table, leave-one-out ablations, scale probe, long runs | `python run_gapfill.py full` | `results_lm_v3_1500/`, `results_lm_v4_abl/`, `results_lm_v5_scale/`, `results_lm_v3_long/` |
-| v7 | RoPE + QK-norm, length extrapolation, top-k sweep | `python -m explib.rope` | `REPORT_v7.md` |
-| v8 | scale-panel seed completion and the 20k RoPE run | `python -m explib.scale` | `analysis_v8/` |
-| v9 | seq-2048 top-k completion and the third 20k seed | `python -m explib.resume` | `REPORT_v9.md` |
-| v10 | distractor-injection mechanism probe, crossover scaling, selector controls | `python -m explib.corruption` | `analysis_v10/`, `REPORT_v10.md` |
-| v11 | statistical close-out of the v10/v11 panels | `python -m explib.length` | `analysis_v11/`, `REPORT_v11.md` |
-| v12 | frozen fixed-chunk confirmation | `python -m explib.confirmation` | `analysis_v12/`, `REPORT_v12.md` |
-| M0 | FineWeb-Edu data path, kernel G0 gate, S1/S2 scale panels | `python -m explib.m0` | `results_b_s1/`, `results_b_s2/`, `analysis_m0/` |
-| open-block | maximum block length × open-block reading rule | `python -m explib.open_block` | `analysis_open_block/` |
+| v6 | core CSA/HCA table, leave-one-out ablations, scale probe, long runs | [`python run_gapfill.py full`](#run-the-v6-supplementary-study) | `results_lm_v3_1500/`, `results_lm_v4_abl/`, `results_lm_v5_scale/`, `results_lm_v3_long/` |
+| v7 | RoPE + QK-norm, length extrapolation, top-k sweep | [`python -m explib.rope`](#v7-reviewer-response-suite) | `REPORT_v7.md` |
+| v8 | scale-panel seed completion and the 20k RoPE run | [`python -m explib.scale`](#v8--v9-close-out-suites) | `analysis_v8/` |
+| v9 | seq-2048 top-k completion and the third 20k seed | [`python -m explib.resume`](#v8--v9-close-out-suites) | `REPORT_v9.md` |
+| v10 | distractor-injection mechanism probe, crossover scaling, selector controls | [`python -m explib.corruption`](#v10-mechanism--scaling--stats-suite) | `analysis_v10/`, `REPORT_v10.md` |
+| v11 | statistical close-out of the v10/v11 panels | [`python -m explib.length`](#v11-statistical-close-out-suite) | `analysis_v11/`, `REPORT_v11.md` |
+| v12 | frozen fixed-chunk confirmation | [`python -m explib.confirmation`](#v12-confirmation-suite-exploration--confirmation-split) | `analysis_v12/`, `REPORT_v12.md` |
+| M0 | FineWeb-Edu data path, kernel G0 gate, S1/S2 scale panels | [`python -m explib.m0`](#b-tier-m0--s1-scale-up-entry-point-adopted-tier-b) | `results_b_s1/`, `results_b_s2/`, `analysis_m0/` |
+| open-block | maximum block length × open-block reading rule | [`python -m explib.open_block`](#open-block-panel) | `analysis_open_block/` |
 
 Training modes are never implicit, with one historical exception: the v6
 script defaults to `full`, so a bare `python run_gapfill.py` starts the main
@@ -122,7 +136,7 @@ Run every command from the repository root. A checkout is healthy when
 
 ## Quick start
 
-Python 3.12 is required. `requirements.lock` is the verified CPU environment
+Python ≥3.12 is required. `requirements.lock` is the verified CPU environment
 used by the tests and the zero-GPU analysis path. On a CUDA machine, install the
 torch wheel that matches the local driver first, then the ranges in
 `requirements.txt` (see [Environment](#environment)).
@@ -131,7 +145,7 @@ torch wheel that matches the local driver first, then the ranges in
 python -m pip install -r requirements.lock
 make test                              # complete CPU pytest suite
 make plan                              # frozen-manifest preflight; no test-split read
-python -m explib.confirmation --help   # list subcommands without starting a run
+python -m explib.confirmation --help   # driver help; no run starts
 ```
 
 None of these commands starts a training run. Training is explicit except for
@@ -182,18 +196,22 @@ Compare a re-run against the original before trusting its report:
 python -m explib.reproduce compare results_lm_v3_1500 results_lm_v3_1500_rerun
 ```
 
-### Where to look
+## Where to look
+
+Start with [Start here](#start-here) for the task you have in mind, then use
+[Study at a glance](#study-at-a-glance) for the exact command. The table below
+maps a question to its authoritative source when you need more detail.
 
 | question | document |
 |---|---|
-| How do I run or re-run an experiment? | this README |
+| How do I run or re-run an experiment? | this README, starting at [Running the experiments](#running-the-experiments) |
 | Which command and subcommand should I use? | [Study at a glance](#study-at-a-glance) and the per-driver sections below |
-| Why is a measurement or comparison defined this way? | `docs/design_notes.md` |
+| Why is a measurement or comparison defined this way? | [`docs/design_notes.md`](docs/design_notes.md) |
 | What exactly is frozen, and what may be claimed? | `confirmation_frozen.json` and `docs/design_notes.md` §17/§20 |
 | How should I read a verdict or an audit status? | [Measurement guardrails](#measurement-guardrails) |
-| What was decided, and in what order? | `DECISION_LOG.md` |
-| Where is the released evidence? | `RELEASES.md` |
-| How were the review issues resolved? | `REVIEW_4_RESPONSE.md` |
+| What was decided, and in what order? | [`DECISION_LOG.md`](DECISION_LOG.md) |
+| Where is the released evidence? | [`RELEASES.md`](RELEASES.md) |
+| How were the review issues resolved? | [`REVIEW_4_RESPONSE.md`](REVIEW_4_RESPONSE.md) |
 
 ## Repository layout
 
@@ -204,18 +222,38 @@ Experiment result directories (`results_*/`), zero-GPU analysis directories
 experiments. `.gitignore` keeps those path families out of the repository;
 `docs/` retains only the fixed design notes.
 
+At a glance:
+
+```text
+exp_lib.py                  historical import shim -> explib/
+explib/                     measurement library (model, attention, training, statistics)
+explib/<driver>/            v7-v12, M0/S1 and open-block study drivers
+run_gapfill.py              v6 driver (historical entry point)
+audit_gates.py              zero-experiment audit gates
+archive_release.py          evidence archive builder and verifier
+```
+
+The tables below give the full inventory.
+
 ### Core code
 
 | path | what |
 |---|---|
 | `exp_lib.py` | **compatibility shim** that re-exports the split implementation in `explib/` |
-| `_split_loader.py` | shared loader for the split packages: `load_split_package` bootstraps a package (sets the historical `__file__` / `_HERE` / `_REPO`, then runs each `_parts/` fragment in order in the caller's module globals), and `load_parts` is the lower-level executor. Fragments are compiled with their real path, so tracebacks point at the reviewable source |
+| `_split_loader.py` | shared loader for the split packages: `load_split_package` bootstraps a package (sets the historical `__file__` / `_HERE` / `_REPO`, then runs each `_parts/` fragment in order in the caller's module globals); `load_root_package` and `load_driver_package` are the top-level and `explib/<driver>/` shortcuts for the same bootstrap; `load_parts` is the lower-level executor. Fragments are compiled with their real path, so tracebacks point at the reviewable source |
 | `explib/` | **the library — and the source of truth**: model, CSA/HCA attention, pooling, indexer, segmenters, training loop, aggregation and statistics |
 | `csa_kernels.py` | **compatibility shim** that re-exports the split implementation in `_csa_kernels/` |
 | `_csa_kernels/` | **fused-kernel path for the three core operators**: block-compression pooling, indexer top-k selection and sparse attention as Triton kernels (plus a CPU-runnable torch-reference twin of the same algorithmic decomposition); opt-in via `CSA_KERNEL`, off by default — see [Triton kernel path (M0/G0)](#triton-kernel-path-m0g0) |
 | `run_gapfill.py` | **the v6 driver**: core/ablation/scale/long panels, resumable, guarded by a run-time cap, pushes after every phase, auto-shuts the instance down |
 | `par.py` | **task-level parallel executor (opt-in)**: one GPU card per independent run — see [Task-level parallelism](#task-level-parallelism-one-gpu-per-run) |
 | `data_guard.py` / `_data_guard/` | leakage-safe preprocessing and encoding primitives; the shim re-exports the split package |
+
+The split packages share one bootstrap contract: list the fragments in `_PARTS`
+in execution order and call `load_root_package` (top-level package) or
+`load_driver_package` (`explib/<driver>/`) with `__file__`. The loader sets
+`_HERE`, `_REPO` and the historical `__file__`, then compiles each fragment
+under its real path. Adding a fragment is one line in `_PARTS`; adding a driver
+also needs the small `__main__.py` entry point that calls `_run_cli`.
 
 ### Driver modules
 
@@ -310,7 +348,7 @@ tests, analysis, report builders and audit gates run on CPU.
 
 ### Environment
 
-Python 3.12 is required (see `pyproject.toml`).
+Python ≥3.12 is required (see `pyproject.toml`).
 
 - **Verified CPU environment (tests and zero-GPU analysis):**
 
@@ -640,6 +678,27 @@ python audit_gates.py efficiency_pairs  # measured latency claims: same shape/de
 python audit_gates.py release     # evidence-release readiness (no complete row => source-only)
 python archive_release.py plan v13 --dirs results_lm_test analysis_v12   # dry-run an evidence archive
 ```
+
+### Open-block panel
+
+The open-block driver varies the maximum block length (32 / 64 / 128 / no cap)
+against the rule for reading the current block (`closed`, `prefix_summary`,
+`prefix_singletons`) with the same top-k read limit. The main matrix has eight
+cells, and cells are paired by seed so the report compares arms within a seed.
+
+```bash
+python -m explib.open_block smoke       # synthetic plumbing run
+python -m explib.open_block pilot       # one short seed per cell
+python -m explib.open_block main        # 8 cells x 4 seeds; resumable
+python -m explib.open_block aux         # outside-window auxiliary panel
+python -m explib.open_block extended    # contingency: 4 caps x 3 reading rules
+python -m explib.open_block report      # paired deltas + interaction + exact sign-flip/Holm
+```
+
+Records go to `results_open_block/` (plus the `_aux` / `_extended` variants);
+`report` writes `analysis_open_block/stats.json` and
+`analysis_open_block/OPEN_BLOCK_REPORT.md`. See `docs/design_notes.md` §24 for
+the design rationale.
 
 ### v8 / v9 close-out suites
 

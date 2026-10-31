@@ -7,11 +7,7 @@ new part (or insert a self-contained one) and keep the list in execution order.
 ``exp_lib.py`` re-exports this module for the historical import path.
 """
 
-import os as _os
-
-from _split_loader import load_split_package
-
-_HERE = _os.path.dirname(_os.path.abspath(__file__))
+from _split_loader import load_root_package
 
 _PARTS = [
 'part_00_kernel_stamp.py',
@@ -75,6 +71,6 @@ _PARTS = [
 'part_58_endpoint_sensitivity.py',
 ]
 
-load_split_package(globals(), _HERE, _PARTS, repo_depth=1,
-                   historical_path='exp_lib.py')
-del load_split_package
+load_root_package(globals(), __file__, _PARTS,
+                  historical_path='exp_lib.py')
+del load_root_package
