@@ -842,6 +842,20 @@ def audit_fairness(summary_path='results_v10_mech/summary.json', arms=None):
             return ('__unhashable__', json.dumps(value, sort_keys=True, default=str))
         return value
 
+    def _param_sort_key(value):
+        # A JSON integer can exceed float64 (e.g. 10**400).  Treat it as a
+        # present-but-unrepresentable value instead of letting float() abort
+        # the whole fairness audit.
+        if isinstance(value, numbers.Real) and not isinstance(
+                value, (bool, np.bool_)):
+            try:
+                f = float(value)
+            except (TypeError, ValueError, OverflowError):
+                f = None
+            if f is not None and math.isfinite(f):
+                return (0, f, '')
+        return (1, 0.0, repr(value))
+
     for a, recs in per_arm.items():
         cfgs = {_setting_key(r.get('run_cfg')) for r in recs}
         knob_vals = {json.dumps(r.get('train_knobs'), sort_keys=True)
@@ -859,12 +873,7 @@ def audit_fairness(summary_path='results_v10_mech/summary.json', arms=None):
             # A malformed JSON value (dict/list) is unhashable; canonicalise it
             # for the set instead of aborting the whole fairness audit.
             'params': sorted({_setting_key(r.get('params')) for r in recs},
-                             key=lambda x: (
-                                 x is None,
-                                 0 if isinstance(x, numbers.Real)
-                                 and not isinstance(x, (bool, np.bool_)) else 1,
-                                 float(x) if isinstance(x, numbers.Real)
-                                 and not isinstance(x, (bool, np.bool_)) else repr(x))),
+                             key=_param_sort_key),
         }
         if len(cfgs) > 1:
             problems.append(f'{a}: {len(cfgs)} distinct run_cfg values within one arm — mixed protocols inside an arm')

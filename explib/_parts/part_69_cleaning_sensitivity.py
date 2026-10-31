@@ -764,6 +764,52 @@ def cleaning_sensitivity_audit(cache_dir=None, raw_dir=None, *,
             'counts; a replay of a different row range would describe another '
             'corpus')
         return out
+    if max_rows is None:
+        max_rows = CLEANING_SENSITIVITY_MAX_ROWS
+    try:
+        max_rows = _cs_int(max_rows, 'max_rows')
+    except ValueError as exc:
+        out['status'] = 'fail'
+        out['problems'].append(
+            f'cannot replay the recorded cleaning protocol (ValueError: {exc})')
+        return out
+    if max_rows:
+        # The full raw dump is materialised below, so a declared dump above
+        # the row budget must be refused BEFORE reading it.  The direct helper
+        # can only guard after materialisation; the audit wrapper has the
+        # recorded source/scanned counts and can fail closed here.
+        _over = []
+        for _label, _count in (
+                ('train source rows', train_block.get('source_rows')),
+                ('validation source rows', val_block.get('source_rows')),
+                ('train rows', train_scanned),
+                ('validation rows', val_scanned),
+                ('fit rows', fit_rows)):
+            if (isinstance(_count, numbers.Integral)
+                    and not isinstance(_count, (bool, np.bool_))
+                    and int(_count) > int(max_rows)):
+                _over.append((_label, int(_count)))
+        if _over:
+            out.update({
+                'kind': 'cleaning_sensitivity_audit',
+                'schema': CLEANING_SENSITIVITY_SCHEMA,
+                'status': 'not_verifiable_locally',
+                'policy': dict(CLEANING_SENSITIVITY_POLICY),
+                'protocol': dict(protocol),
+                'protocol_fp': dedup_protocol_fp(protocol),
+                'max_rows': int(max_rows),
+                'problems': [
+                    f'{label} would be replayed above max_rows='
+                    f'{int(max_rows)}; rerun explicitly with a larger '
+                    'max_rows to measure this corpus'
+                    for label, _count in _over],
+                'warnings': list(out.get('warnings') or []),
+                'note': ('a sensitivity readout that skips rows is not the '
+                         'corpus; raise max_rows deliberately'),
+                'cache': {'meta': os.path.basename(meta_path), 'tag': tag},
+                'test_raw_read': False,
+            })
+            return out
     raw_train = os.path.join(raw_dir, 'wiki.train.raw')
     raw_val = os.path.join(raw_dir, 'wiki.valid.raw')
     if not (os.path.exists(raw_train) and os.path.exists(raw_val)):
@@ -819,8 +865,6 @@ def cleaning_sensitivity_audit(cache_dir=None, raw_dir=None, *,
     if out['problems']:
         out['status'] = 'fail'
         return out
-    if max_rows is None:
-        max_rows = CLEANING_SENSITIVITY_MAX_ROWS
     try:
         result = cleaning_sensitivity(
             train_rows, val_rows, protocol=protocol, fit_rows=int(fit_rows),

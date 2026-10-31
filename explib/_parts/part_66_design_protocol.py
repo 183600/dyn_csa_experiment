@@ -408,15 +408,15 @@ def _dp_resolution_floor(family_size, n):
         n = int(n)
     except (TypeError, ValueError, OverflowError):
         return float('inf')
-    # Anything past the smallest subnormal underflows to exactly zero; this
-    # also avoids ``math.ldexp`` rejecting an exponent too large for a C int
-    # (n itself may be an arbitrary-precision JSON integer).
-    if n > 1075:
-        return 0.0
+    # For a single seed m * 2**(1-n) underflows quickly, but a very large
+    # family can keep the product representable well past n=1075 (e.g.
+    # m=1e308 at n=1076 is still ~1e-15).  Let ldexp do the scaling and only
+    # fall back to zero when the exponent itself is beyond a C int; a huge
+    # family that overflows float is still reported as infinite.
     try:
         return math.ldexp(m, 1 - n)
     except OverflowError:
-        return float('inf')
+        return 0.0 if math.isfinite(m) else float('inf')
 
 
 def _dp_int(value, *, minimum=None, allow_none=False):
@@ -1200,8 +1200,15 @@ def validate_design_protocol(protocol, *, require_complete=None):
             if arm_set and arm not in arm_set:
                 _dp_problem(out, f'planned cell {lab!r} names undeclared arm {arm!r}')
             seed_value = _dp_int(seed_text, minimum=0)
-            if seed_value is None and seed_text.isdigit():
-                seed_value = int(seed_text)
+            if seed_value is None and seed_text.isascii() and seed_text.isdigit():
+                # ``str.isdigit()`` also accepts non-ASCII digits (e.g. '²')
+                # that int() rejects; Python also caps decimal conversions at
+                # a few thousand digits.  A malformed label is a reported
+                # validation problem, never an exception that aborts the gate.
+                try:
+                    seed_value = int(seed_text)
+                except (ValueError, OverflowError):
+                    seed_value = None
             if seed_value is None:
                 _dp_problem(out, f'planned cell {lab!r} has a non-integer seed')
             elif declared_seeds and seed_value not in declared_seeds:

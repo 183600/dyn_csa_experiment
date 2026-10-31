@@ -1178,12 +1178,20 @@ def _compute_control_detail(recs, a, b, *, tolerance=0.25):
         # The proxy is an exact params x tokens product.  Its ratio can still
         # be representable when each product is not (including the all-equal
         # case), so use the exact-integer ratio instead of dividing floats.
-        if isinstance(xa, int) and isinstance(xb, int):
-            ratio = _finite_int_ratio(xa, xb)
+        # Normalise through the exact-integer reader: the 6ND product can be a
+        # Python int for one arm (above float64) and a float for the other, so
+        # checking ``isinstance(..., int)`` alone let a mixed pair fall through
+        # to ``xa / xb`` and raise OverflowError.
+        _ixa, _ixb = _integral_value(xa), _integral_value(xb)
+        if _ixa is not None and _ixb is not None:
+            ratio = _finite_int_ratio(_ixa, _ixb)
             _proxy_within = _int_ratio_within(
-                abs(xa - xb), max(xa, xb, 1), tolerance)
+                abs(_ixa - _ixb), max(_ixa, _ixb, 1), tolerance)
         else:
-            ratio = xa / xb
+            try:
+                ratio = xa / xb
+            except (OverflowError, ZeroDivisionError, TypeError):
+                ratio = None
         if ratio is not None:
             out['proxy_ratio_a_over_b'] = float(ratio)
             out['compute_matched_source'] = (

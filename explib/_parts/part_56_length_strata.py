@@ -146,14 +146,23 @@ def _ls_div(num, den):
     historical float division bit-for-bit.
     """
     try:
-        return float(num) / int(den)
-    except OverflowError:
+        d = int(den)
+    except (OverflowError, ValueError, ZeroDivisionError, TypeError):
+        return None
+    if abs(d) <= (1 << 53):
+        try:
+            return float(num) / d
+        except OverflowError:
+            pass
+    try:
         from fractions import Fraction as _Fraction
         try:
-            quotient = _Fraction(num) / int(den)
-            return float(quotient)
-        except (OverflowError, ValueError, ZeroDivisionError):
-            return None
+            quotient = _Fraction(num) / d
+        except TypeError:
+            quotient = _Fraction(float(num)) / d
+        return float(quotient)
+    except (OverflowError, ValueError, ZeroDivisionError, TypeError):
+        return None
 
 
 def _ls_summary(values, conf):

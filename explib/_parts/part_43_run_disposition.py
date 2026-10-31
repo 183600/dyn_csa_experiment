@@ -472,6 +472,25 @@ def _dispo_failure_class(event, policy):
     return unique[0], len(unique) > 1, unique
 
 
+def _dispo_run_cfg(value):
+    """Hashable canonical spelling of a cell's run_cfg descriptor.
+
+    Events and retained records are untrusted JSON.  A mapping/list in the
+    optional ``run_cfg`` field used to reach a dict key and raise TypeError;
+    canonical JSON keeps the comparison deterministic while leaving a legacy
+    string unchanged.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, sort_keys=True, separators=(',', ':'),
+                          ensure_ascii=True, default=str, allow_nan=False)
+    except (TypeError, ValueError, OverflowError):
+        return repr(value)
+
+
 def _dispo_event_rows(events):
     """Parse canonical training-cell events; return ``(rows, ignored_keys)``.
 
@@ -521,7 +540,7 @@ def _dispo_event_rows(events):
             run_id = None
         rows.append({'index': i, 'key': key, 'variant': arm, 'seed': seed_int,
                      'status': status, 'run_id': run_id,
-                     'run_cfg': ev.get('run_cfg'),
+                     'run_cfg': _dispo_run_cfg(ev.get('run_cfg')),
                      'started_at': ev.get('started_at'),
                      'finished_at': ev.get('finished_at'),
                      'failure_class': None, 'ambiguous_class': False,
@@ -800,7 +819,7 @@ def run_disposition_audit(events, *, planned_cells=None, plan=None,
             rid = rec.get('run_id')
             retained_valid[key] = {'run_id': (rid if isinstance(rid, str) and
                                               rid.strip() else None),
-                                   'run_cfg': rec.get('run_cfg'),
+                                   'run_cfg': _dispo_run_cfg(rec.get('run_cfg')),
                                    'record': rec}
             if key not in planned_set:
                 out['n_unplanned_measurements'] += 1

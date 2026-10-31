@@ -962,8 +962,13 @@ def validate_preparation_clearance(clearance, *, protocol=None):
                 f'checks.{name}.required must be boolean')
         out['checks'][name] = status
         if status == 'fail':
-            out['problems'].append(f'checks.{name} failed: '
-                                   + '; '.join((check.get('problems') or [])[:3]))
+            # ``checks`` is untrusted JSON: problems may be a mapping, a
+            # scalar, or a list of non-strings.  Slicing/joining it directly
+            # aborts the validator instead of returning the named failure.
+            _detail = _prep_detail_head(check.get('problems'), limit=3)
+            out['problems'].append(
+                f'checks.{name} failed: '
+                + '; '.join(str(x) for x in _detail))
         elif status in ('warnings', 'not_verifiable'):
             out['warnings'].append(f'checks.{name} is {status}')
     required = set(recorded_required)
@@ -1281,11 +1286,20 @@ def preparation_clearance_audit(
                 loaded = None
             if isinstance(loaded, dict):
                 rehearsal = loaded.get('plan') or loaded
+    _auto_dependency = False
     if dependency_contract is None:
-        try:
-            dependency_contract = dependency_contract()  # noqa: F821
-        except Exception:
-            dependency_contract = None
+        # The parameter has the same name as the module-level
+        # ``dependency_contract()`` helper, so a direct call here would recurse
+        # into the (None) local and always fail.  Resolve the live helper
+        # through the module globals instead; a monkeypatched helper is still
+        # honoured, and an unavailable helper remains missing evidence.
+        _live_contract = globals().get('dependency_contract')
+        if callable(_live_contract):
+            try:
+                dependency_contract = _live_contract()
+                _auto_dependency = dependency_contract is not None
+            except Exception:
+                dependency_contract = None
     recorded_checks = clearance.get('checks') if isinstance(
         clearance.get('checks'), dict) else {}
     recorded_access = recorded_checks.get('test_access')
@@ -1363,6 +1377,22 @@ def preparation_clearance_audit(
                     'lock_sha256', 'current_analysis_source_sha256'):
             if key in recorded and key in current \
                     and recorded.get(key) != current.get(key):
+                if (_auto_dependency and name == 'dependency'
+                        and key == 'lock_sha256'
+                        and current.get('status') == recorded.get('status')
+                        == 'ok'):
+                    # The caller did not supply the environment artifact: the
+                    # helper found THIS checkout's lock, which need not be the
+                    # one a clearance copied from another panel records.  A
+                    # healthy but different lock is not a failed replay; a
+                    # live contract that is itself not ok is still replayed
+                    # and fails through the status comparison above.
+                    out['warnings'].append(
+                        f'{name}.{key} differs between the clearance and the '
+                        'auto-discovered local environment; the local lock is '
+                        'not the artifact recorded by this clearance, so it '
+                        'was not treated as a failing replay')
+                    continue
                 out['problems'].append(
                     f'{name}.{key} differs between the clearance and the '
                     'artifact supplied for replay')

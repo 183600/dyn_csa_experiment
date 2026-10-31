@@ -138,15 +138,31 @@ def _uq_tail_fraction(value):
 
 
 def _uq_div(num, den):
-    """``num / den`` with an exact positive-integer denominator."""
+    """``num / den`` with an exact positive-integer denominator.
+
+    A denominator above 2**53 is not exactly a float, so the direct float
+    division would divide by a different integer.  Use the exact rational only
+    for that case; ordinary panels keep the historical float division
+    bit-for-bit.
+    """
     try:
-        return float(num) / int(den)
-    except OverflowError:
+        d = int(den)
+    except (OverflowError, ValueError, ZeroDivisionError, TypeError):
+        return None
+    if abs(d) <= (1 << 53):
+        try:
+            return float(num) / d
+        except OverflowError:
+            pass
+    try:
         from fractions import Fraction as _Fraction
         try:
-            return float(_Fraction(num) / int(den))
-        except (OverflowError, ValueError, ZeroDivisionError):
-            return None
+            quotient = _Fraction(num) / d
+        except TypeError:
+            quotient = _Fraction(float(num)) / d
+        return float(quotient)
+    except (OverflowError, ValueError, ZeroDivisionError, TypeError):
+        return None
 
 
 def _uq_mean(values):
@@ -169,6 +185,11 @@ def _uq_mean(values):
 
 
 def _uq_lerp(lo, hi, frac):
+    # Interpolating between two equal order statistics must return that value,
+    # not a rounded weighted sum (which can move by one ulp and hide an exact
+    # per-token denominator).
+    if lo == hi:
+        return float(lo)
     if frac <= 0.0:
         return float(lo)
     if frac >= 1.0:
@@ -506,7 +527,14 @@ def unit_quantile_profile(per_seed_nll_diff, n_tokens, *, unit_ids=None,
         Tf = _uq_np.asarray(T, dtype=float)
     except (OverflowError, ValueError):
         Tf = None
+    # A finite float is not enough: a count above 2**53 rounds to a different
+    # integer, so the vectorised division would use a denominator that is not
+    # the recorded one.  Require an exact round-trip before taking that path.
     if Tf is not None and Tf.shape == (D,) and _uq_np.all(_uq_np.isfinite(Tf)):
+        _exact_t = all(int(tf) == int(t) for tf, t in zip(Tf.tolist(), T))
+    else:
+        _exact_t = False
+    if _exact_t:
         with _uq_np.errstate(over='ignore', invalid='ignore', divide='ignore'):
             d = A / Tf[None, :]
         if _uq_np.any((d == 0.0) & (A != 0.0)):

@@ -208,7 +208,10 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                     rec['status'] = 'fail'
                     _fail(f'{cd}/{tag}: {_bad} NaN/Inf values in the {_name} split')
             if np.asarray(va).ndim == 2:
-                _dup_val = int(DG.duplicate_mask(np.asarray(va)).sum())
+                # ``_va_scan`` is the max_rows-capped readout.  Hashing the
+                # full validation cache here bypassed the audit's own scale
+                # guard (the test-side scan already uses its sample).
+                _dup_val = int(DG.duplicate_mask(np.asarray(_va_scan)).sum())
                 rec['duplicate_rows_within_val'] = _dup_val
                 if _dup_val:
                     _warn(f'{cd}/{tag}: {_dup_val} duplicate validation rows '
@@ -1297,7 +1300,17 @@ def audit_document_unit(cache_dir=None, *, seq_len=None, raw_dir=None,
                 else:
                     trec['status'] = 'fail'
                     _fail('test: ' + (_cls.get('reason') or 'unknown unit'))
-                if _token_article is not None and _n_rows and _sl:
+                _expected_te = int(_n_rows) * int(_sl) if _n_rows and _sl else 0
+                if (_token_article is not None and _n_rows and _sl
+                        and int(np.asarray(_te).size) != _expected_te):
+                    trec['status'] = 'fail'
+                    trec['problems'].append(
+                        f'test id cache has {int(np.asarray(_te).size)} '
+                        f'token(s) but metadata declares {_n_rows} rows x '
+                        f'{_sl} seq_len = {_expected_te}; the served prefix '
+                        'geometry is inconsistent')
+                    _fail('test: ' + trec['problems'][-1])
+                elif _token_article is not None and _n_rows and _sl:
                     _token_article = np.asarray(_token_article)
                     _prefix_n = min(_prefix_n, _n_rows * _sl)
                     _art_pref = _token_article[:_prefix_n]

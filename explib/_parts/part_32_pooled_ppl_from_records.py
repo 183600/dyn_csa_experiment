@@ -383,6 +383,37 @@ def _primary_row_arrays(rec):
     return rec.get('nll_per_row'), rec.get('n_tokens_per_row')
 
 
+def _token_matrix(tok):
+    """Per-row token counts as a float matrix, or None when unrepresentable.
+
+    The token accounting is deliberately exact (arbitrary-precision Python
+    ints), but the bootstrap arithmetic is floating point.  Narrowing to
+    ``np.int64`` raised OverflowError above 2**63 and could also overflow on a
+    row sum; building the float matrix directly is the same arithmetic for
+    ordinary counts and makes an unrepresentable count an unavailable interval
+    instead of an exception.
+    """
+    try:
+        ints = [int(v) for v in tok]
+    except (TypeError, ValueError, OverflowError):
+        ints = None
+    if ints is not None:
+        _max = np.iinfo(np.int64).max
+        if (all(0 <= v <= _max for v in ints)
+                and int(sum(ints)) <= int(_max)):
+            # Keep the historical exact-int64 path whenever the matrix and
+            # every row sum are representable; only fall back to float for the
+            # scale cases that used to overflow.
+            return np.asarray(ints, dtype=np.int64)
+    try:
+        arr = np.asarray(tok, dtype=float)
+    except (OverflowError, ValueError, TypeError):
+        return None
+    if not np.isfinite(arr).all() or (arr < 0).any():
+        return None
+    return arr
+
+
 def _doc_bootstrap_ppl_ci(recs, *, n_boot=2000, seed=20261018):
     """Row-level bootstrap CI for the pooled PPL (legacy name kept).
 
@@ -423,7 +454,10 @@ def _doc_bootstrap_ppl_ci(recs, *, n_boot=2000, seed=20261018):
         _nll = np.asarray(nll, dtype=float)
         if not np.isfinite(_nll).all():
             return None
-        rows.append((_nll, np.asarray(_tok, dtype=np.int64)))
+        _tok_arr = _token_matrix(_tok)
+        if _tok_arr is None:
+            return None
+        rows.append((_nll, _tok_arr))
     if len({len(a) for a, _ in rows}) != 1:
         return None
     R = len(rows[0][0])
@@ -501,7 +535,11 @@ def _combined_seed_doc_ci(recs, *, n_boot=2000, seed=20261018, conf=0.95):
         if any(v is None for v in _tok) or not np.isfinite(_nll).all():
             rows = None
             break
-        rows.append((_nll, np.asarray(_tok, dtype=np.int64)))
+        _tok_arr = _token_matrix(_tok)
+        if _tok_arr is None:
+            rows = None
+            break
+        rows.append((_nll, _tok_arr))
     if isinstance(rows, list):
         if len({len(a) for a, _ in rows}) != 1:
             rows = None
@@ -717,7 +755,10 @@ def paired_row_bootstrap_delta(pairs, *, n_boot=1000, seed=20261018, conf=0.95):
             return None
         if not np.isfinite(_nll).all():
             return None
-        return _nll, np.asarray(_tok, dtype=np.int64)
+        _tok_arr = _token_matrix(_tok)
+        if _tok_arr is None:
+            return None
+        return _nll, _tok_arr
 
     if not pairs:
         out['reason'] = 'no shared paired seeds'

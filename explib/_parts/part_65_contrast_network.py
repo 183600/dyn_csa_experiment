@@ -545,19 +545,30 @@ def contrast_network_audit(entries, *, reference_arm=None, alpha=0.05, min_n=3):
     out['n_nodes'] = len(comp_index)
     out['n_components'] = len(components)
     degree = {node: len(adj.get(node, ())) for node in comp_index}
+    # Aggregate the per-node seed union and the per-component edge list in one
+    # pass.  Rescanning every clean edge (and, for the seed set, every seed)
+    # inside the per-node and per-component loops made a wide panel
+    # O(nodes*edges*seeds) even though the graph indexes already carry the
+    # answer.
+    node_seeds = {node: set() for node in comp_index}
+    comp_edges = {cid: [] for cid in range(len(components))}
+    for eid, e in clean.items():
+        for node in (e['node_with'], e['node_without']):
+            if node in node_seeds:
+                node_seeds[node].update(e['seeds'])
+        _cid = comp_index.get(e['node_without'])
+        if _cid is not None and comp_index.get(e['node_with']) == _cid:
+            comp_edges[_cid].append(eid)
     for node in sorted(comp_index):
         out['nodes'][node] = {
             'arm': node.split('::', 1)[0],
             'tag': (node.split('::', 1)[1] if '::' in node else ''),
-            'seeds': sorted({s for eid, e in clean.items()
-                             if node in (e['node_with'], e['node_without'])
-                             for s in e['seeds']}),
+            'seeds': sorted(node_seeds[node]),
             'degree': int(degree[node]),
             'graph_component': int(comp_index[node]),
         }
     for cid, nodes in enumerate(components):
-        cedges = sorted(eid for eid, e in clean.items()
-                        if e['node_with'] in nodes and e['node_without'] in nodes)
+        cedges = sorted(comp_edges[cid])
         local_ref = sorted(nodes, key=lambda n: (-degree[n], n))[0]
         out['graph_components'][str(cid)] = {
             'nodes': list(nodes), 'edges': cedges,
@@ -848,34 +859,40 @@ def contrast_network_audit(entries, *, reference_arm=None, alpha=0.05, min_n=3):
         pairs = len(nodes) * (len(nodes) - 1) // 2
         total_candidates += pairs - direct_by_comp.get(cid, 0)
     candidates = []
-    # Keep at most `cap` lexicographically first pairs per component.  The
-    # global first `cap` can contain no more than `cap` from any one
-    # component, so the merge below is exact while avoiding an all-pairs path
-    # search in a large component.
-    for cid in sorted(nodes_by_comp):
-        nodes = nodes_by_comp[cid]
-        if len(nodes) < 2:
-            continue
-        local = []
-        for i, a in enumerate(nodes):
-            for b in nodes[i + 1:]:
-                if (a, b) in direct_declared:
-                    continue
-                # Report log(PPL_from / PPL_to): traverse from the comparison
-                # endpoint back to `from`, so a negative value means `from`
-                # has the lower PPL.  This matches the without -> with edge
-                # direction.
-                steps = _cn_shortest_path(b, a, adj)
-                if steps is None:
-                    continue
-                local.append((a, b, steps))
-                if len(local) >= cap:
-                    break
-            if len(local) >= cap:
-                break
-        candidates.extend(local)
-    candidates.sort(key=lambda t: (t[0], t[1]))
-    candidates = candidates[:cap]
+    # Merge the per-component pair streams in lexicographic order and stop as
+    # soon as the global `cap` is reached.  The historical form first built up
+    # to `cap` candidates PER component and sorted them afterwards: with many
+    # small components that searched components*cap pairs (and ran one BFS for
+    # each) to publish only `cap` rows.  A heap over one lazy iterator per
+    # component keeps the same globally sorted first-`cap` selection while
+    # doing at most `cap` path searches in the common case.
+    if cap > 0:
+        import heapq as _heapq
+
+        def _pairs(nodes):
+            for i, a in enumerate(nodes):
+                for b in nodes[i + 1:]:
+                    if (a, b) not in direct_declared:
+                        yield a, b
+
+        _heap = []
+        for cid in sorted(nodes_by_comp):
+            _it = _pairs(nodes_by_comp[cid])
+            _first = next(_it, None)
+            if _first is not None:
+                _heap.append((_first[0], _first[1], cid, _it))
+        _heapq.heapify(_heap)
+        while _heap and len(candidates) < cap:
+            a, b, cid, _it = _heapq.heappop(_heap)
+            # Report log(PPL_from / PPL_to): traverse from the comparison
+            # endpoint back to `from`, so a negative value means `from` has
+            # the lower PPL.  This matches the without -> with edge direction.
+            steps = _cn_shortest_path(b, a, adj)
+            if steps is not None:
+                candidates.append((a, b, steps))
+            _nxt = next(_it, None)
+            if _nxt is not None:
+                _heapq.heappush(_heap, (_nxt[0], _nxt[1], cid, _it))
     for a, b, steps in candidates[:cap]:
         vals = _cn_path_values(steps, clean, set().union(
             *[set(clean[e]['seeds']) for _p, e, _s in steps]))

@@ -789,6 +789,15 @@ def _tuned_significant(st, p_holm, alpha=0.05):
             return False
         if int(_dropped) > 0:
             return False
+    # Survivors plus dropped inputs must reconstruct a declared input panel.
+    # A smaller n with n_dropped=0 means observations vanished from the
+    # accounting; it is not a complete paired panel.  Mirrors
+    # exp_lib.reportable_claim's reconciliation.
+    if _n_input is not None and _dropped is not None:
+        if _n != int(_n_input) - int(_dropped):
+            return False
+    elif _n_input is not None and _n != int(_n_input):
+        return False
     # Exact ties reduce the exact-test resolution below the n-seed floor.
     _n_nonzero = st.get('n_nonzero')
     if _n_nonzero is not None:
