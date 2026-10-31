@@ -302,20 +302,24 @@ def _po_cluster_iid(series, point, conf, df):
     D = len(series)
     if D < 2:
         return None
-    try:
-        ss = _po_math.fsum(float(v) * float(v) for v in series)
-    except (OverflowError, ValueError):
-        return None
-    # The endpoint is a SUM over units (the token-pooled contrast), not a
-    # mean over units.  Its delta-method error is Sum(psi), so the cluster
-    # variance is D/(D-1) * Sum(psi**2).  The influence vector itself is
-    # centred (Sum(psi)=0 by construction at the sample estimate); the
-    # bootstrap below therefore uses the resampled sum as the error
-    # distribution around the reported point.
-    var = ss * (D / (D - 1.0))
-    if not _po_math.isfinite(var) or var < 0.0:
-        return None
-    se = _po_math.sqrt(var)
+    vals = [float(v) for v in series]
+    factor = D / (D - 1.0)
+    # Use the shared scaled variance helper so the i.i.d. interval is
+    # bit-identical to the existing cluster CI on ordinary panels.  It
+    # returns a variance, which can underflow to 0.0 or overflow to None even
+    # when the standard error is representable; fall back to the square root
+    # of the same scaled sum of squares in that case.
+    var = _scaled_sum_of_squares(vals, factor)
+    se = None
+    if var is not None and _po_math.isfinite(var) and var > 0.0:
+        se = _po_math.sqrt(var)
+    elif var == 0.0 and not any(v != 0.0 for v in vals):
+        # A genuinely constant zero influence has zero sampling variance.
+        se = 0.0
+    if se is None:
+        se = _scaled_root_sum_of_squares(vals, factor)
+        if se is None:
+            return None
     tcrit = _t_critical(conf, float(df))
     if not (_po_math.isfinite(se) and _po_math.isfinite(tcrit)):
         return None
@@ -526,6 +530,11 @@ def pooled_order_inference_from_influence(
         # reject every valid influence series.
         _sum = _po_math.fsum(series) if series else 0.0
         _abs = _po_math.fsum(abs(v) for v in series) if series else 0.0
+        # Keep the historical practical tolerance: a computed influence can
+        # carry a non-zero sum from cancellation in ``ce * n_tokens`` even
+        # though the exact series is centred.  Tightening this to a purely
+        # relative bound would reject previously stored artifact series whose
+        # values are themselves numerical residuals.
         if abs(_sum) > 1e-8 * max(1.0, _abs):
             raise ValueError(
                 f'{name} has non-zero sum {_sum!r}; a delta-method influence '
@@ -558,6 +567,10 @@ def pooled_order_inference_from_influence(
         n_seeds = len(seed_list) if seed_list is not None else None
     if n_seeds is not None:
         n_seeds = _po_int(n_seeds, 'n_seeds', minimum=1)
+    if seed_list is not None and n_seeds is not None and len(seed_list) != n_seeds:
+        raise ValueError(
+            f'{len(seed_list)} seed ids but n_seeds={n_seeds}; the seed list '
+            'and the declared training-seed count must agree')
 
     base = {
         'kind': 'pooled_order_inference',
@@ -673,6 +686,66 @@ def pooled_order_inference_from_influence(
     return base
 
 
+def _po_extreme_pooled(A, B, counts):
+    """Exact-rational influence for a token total beyond float64.
+
+    The ordinary path forms ``ce = sum(nll) / total_tokens`` in float64.  A
+    total such as ``10**400`` cannot be represented even though the pooled
+    rate and every influence are.  Keep the denominator exact and round once
+    per reported value, mirroring ``_paired_nll_doc_ci_extreme``.
+    """
+    from fractions import Fraction as _Fraction
+    S, D = A.shape
+    total = int(sum(counts))
+    if total <= 0:
+        return None
+    try:
+        ce_a_q = [sum((_Fraction(float(A[s, i])) for i in range(D)),
+                      _Fraction(0, 1)) / total for s in range(S)]
+        ce_b_q = [sum((_Fraction(float(B[s, i])) for i in range(D)),
+                      _Fraction(0, 1)) / total for s in range(S)]
+        ce_a = [float(q) for q in ce_a_q]
+        ce_b = [float(q) for q in ce_b_q]
+    except (OverflowError, ValueError, ZeroDivisionError):
+        return None
+    if any(x == 0.0 and q != 0 for x, q in zip(ce_a, ce_a_q)):
+        return None
+    if any(x == 0.0 and q != 0 for x, q in zip(ce_b, ce_b_q)):
+        return None
+    if not all(_po_math.isfinite(x) for x in ce_a + ce_b):
+        return None
+    ea = [_safe_exp_ppl(x) for x in ce_a]
+    eb = [_safe_exp_ppl(x) for x in ce_b]
+    if not (all(_po_math.isfinite(x) for x in ea)
+            and all(_po_math.isfinite(x) for x in eb)):
+        return None
+    diff_ppl = [_ppl_difference(ce_a[s], ce_b[s]) for s in range(S)]
+    if any(v is None for v in diff_ppl):
+        return None
+    delta_ppl = float(_po_np.mean(_po_np.asarray(diff_ppl, dtype=float)))
+    delta_log = float(_po_np.mean(_po_np.asarray(ce_a)
+                                  - _po_np.asarray(ce_b)))
+    if not (_po_math.isfinite(delta_ppl) and _po_math.isfinite(delta_log)):
+        return None
+    psi = _po_np.empty((S, D), dtype=float)
+    q = _po_np.empty((S, D), dtype=float)
+    try:
+        for s in range(S):
+            for i in range(D):
+                ra = ((_Fraction(float(A[s, i])) - ce_a_q[s] * counts[i])
+                      / total)
+                rb = ((_Fraction(float(B[s, i])) - ce_b_q[s] * counts[i])
+                      / total)
+                psi[s, i] = float(_Fraction(ea[s]) * ra
+                                  - _Fraction(eb[s]) * rb)
+                q[s, i] = float(ra - rb)
+    except (OverflowError, ValueError, ZeroDivisionError):
+        return None
+    if not (_po_np.all(_po_np.isfinite(psi)) and _po_np.all(_po_np.isfinite(q))):
+        return None
+    return psi.mean(axis=0), q.mean(axis=0), delta_ppl, delta_log
+
+
 def pooled_order_inference(nll_a, nll_b, n_tokens, *, unit_ids=None,
                            seeds=None, block_lengths=None, n_batches=None,
                            n_boot=None, n_perm=None, conf=None, alpha=None,
@@ -721,12 +794,29 @@ def pooled_order_inference(nll_a, nll_b, n_tokens, *, unit_ids=None,
         if not _po_math.isfinite(total_f) or total_f <= 0.0:
             raise OverflowError
     except (OverflowError, ValueError):
-        return {'kind': 'pooled_order_inference',
-                'policy_version': POOLED_ORDER_POLICY['version'],
-                'status': 'not_estimable',
-                'n_units': D, 'n_seeds': S,
-                'reason': ('the token total exceeds the representable float64 '
-                           'range; the pooled influence is not formed')}
+        _extreme = _po_extreme_pooled(A, B, counts)
+        if _extreme is None:
+            return {'kind': 'pooled_order_inference',
+                    'policy_version': POOLED_ORDER_POLICY['version'],
+                    'status': 'not_estimable',
+                    'n_units': D, 'n_seeds': S,
+                    'reason': ('the token total exceeds the representable '
+                               'float64 range and the exact-ratio influence '
+                               'is not representable')}
+        _psi_x, _q_x, _delta_ppl_x, _delta_log_x = _extreme
+        _out = pooled_order_inference_from_influence(
+            _psi_x, _q_x, delta_ppl=_delta_ppl_x,
+            delta_log_ratio=_delta_log_x,
+            unit_ids=unit_ids, seeds=seeds, n_seeds=S,
+            block_lengths=block_lengths, n_batches=n_batches,
+            n_boot=n_boot, n_perm=n_perm, conf=conf, alpha=alpha,
+            seed=seed, design_effect_tolerance=design_effect_tolerance,
+            material_ci_inflation=material_ci_inflation)
+        _out['upstream'] = (
+            'pooled_order_inference: exact-rational per-seed token-pooled '
+            'NLL influence for a token total beyond float64; same estimand '
+            'as the primary comparison')
+        return _out
     with _po_np.errstate(over='ignore', invalid='ignore'):
         ce_a = A.sum(axis=1) / total_f
         ce_b = B.sum(axis=1) / total_f
@@ -748,7 +838,19 @@ def pooled_order_inference(nll_a, nll_b, n_tokens, *, unit_ids=None,
                 'n_units': D, 'n_seeds': S,
                 'reason': ('a per-seed token-pooled PPL is not representable; '
                            'the confidence readout is withheld')}
-    delta_ppl = float(_po_np.mean(ea - eb))
+    # Use the eval library's expm1 path, not a naive exp(a)-exp(b): when the
+    # two pooled log rates are close, both exponentials can round to the same
+    # float and the direct subtraction reports a fake zero PPL difference.
+    # This is the same point estimator as ``_paired_nll_doc_ci``.
+    diff_ppl = [_ppl_difference(ce_a[s], ce_b[s]) for s in range(S)]
+    if any(v is None for v in diff_ppl):
+        return {'kind': 'pooled_order_inference',
+                'policy_version': POOLED_ORDER_POLICY['version'],
+                'status': 'not_estimable',
+                'n_units': D, 'n_seeds': S,
+                'reason': ('a per-seed token-pooled PPL difference is not '
+                           'representable; the confidence readout is withheld')}
+    delta_ppl = float(_po_np.mean(_po_np.asarray(diff_ppl, dtype=float)))
     delta_log = float(_po_np.mean(ce_a - ce_b))
     if not (_po_math.isfinite(delta_ppl) and _po_math.isfinite(delta_log)):
         return {'kind': 'pooled_order_inference',
@@ -764,7 +866,8 @@ def pooled_order_inference(nll_a, nll_b, n_tokens, *, unit_ids=None,
     with _po_np.errstate(over='ignore', invalid='ignore'):
         psi = (ea[:, None] * (A - ce_a[:, None] * T[None, :]) / total_f
                - eb[:, None] * (B - ce_b[:, None] * T[None, :]) / total_f)
-        q = ((A - B) - (ce_a - ce_b)[:, None] * T[None, :]) / total_f
+        q = (((A - ce_a[:, None] * T[None, :])
+              - (B - ce_b[:, None] * T[None, :])) / total_f)
     if not (_po_np.all(_po_np.isfinite(psi)) and _po_np.all(_po_np.isfinite(q))):
         return {'kind': 'pooled_order_inference',
                 'policy_version': POOLED_ORDER_POLICY['version'],

@@ -727,3 +727,60 @@ def test_ordered_batch_means_se_is_on_the_input_scale():
     assert math.isclose(scaled['batch_means'][0]['se'],
                         10.0 * block['batch_means'][0]['se'],
                         rel_tol=1e-12)
+
+
+def test_pooled_order_uses_the_stable_ppl_difference_at_small_effects():
+    # exp(a) and exp(b) both round to 1.0 for a tiny log ratio, so the old
+    # direct `ea - eb` reported a fake zero point and centred the interval on
+    # it.  The pooled readout must use the same expm1 path as the existing
+    # cluster CI.
+    a = np.array([[1e-100 * i for i in range(1, 9)],
+                  [1.1e-100 * i for i in range(1, 9)]])
+    b = np.zeros_like(a)
+    tokens = [1] * 8
+    pc = L._paired_nll_doc_ci(a, b, tokens)
+    block = L.pooled_order_inference(a, b, tokens, n_boot=40, n_perm=0)
+    assert block['status'] == 'ok', block
+    assert math.isclose(block['point_ppl'], pc['delta_ppl'],
+                        rel_tol=1e-12, abs_tol=0.0), block
+    assert block['ppl']['iid_ci'][0] > 0.0, block['ppl']
+
+
+def test_pooled_order_subnormal_influence_keeps_a_positive_width():
+    # Squaring a 1e-200 influence underflows to zero; the cluster SE itself is
+    # still representable.  Withholding it (or reporting a zero-width
+    # interval) would turn a real panel into fake certainty.
+    psi = [1e-200 * (-1) ** i for i in range(12)]
+    block = L.pooled_order_inference_from_influence(
+        psi, psi, delta_ppl=1e-200, delta_log_ratio=1e-200,
+        n_seeds=2, n_boot=40, n_perm=0)
+    assert block['status'] == 'ok', block
+    for key in ('ppl', 'log_ratio'):
+        ep = block[key]
+        assert ep['iid_se'] > 0.0 and ep['iid_ci_width'] > 0.0, ep
+    json.dumps(block, allow_nan=False)
+
+
+def test_pooled_order_supports_token_totals_beyond_float64():
+    # The pooled log ratio (1e-100) is representable even though the token
+    # total (10**400) is not.  The exact-rational fallback must keep the point
+    # and the influence instead of rejecting the whole panel.
+    tokens = [10 ** 400 * (i + 1) for i in range(8)]
+    a = np.array([[1e300 * (i + 1) + (1e300 if i % 2 else -1e300)
+                   for i in range(8)] for _ in range(2)])
+    b = np.array([[0.5e300 * (i + 1) for i in range(8)] for _ in range(2)])
+    pc = L._paired_nll_doc_ci(a, b, tokens)
+    block = L.pooled_order_inference(a, b, tokens, n_boot=40, n_perm=0)
+    assert block['status'] == 'ok', block
+    assert math.isclose(block['point_ppl'], pc['delta_ppl'],
+                        rel_tol=1e-12, abs_tol=0.0), block
+    assert math.isclose(block['point_log_ratio'], pc['delta_log_ratio'],
+                        rel_tol=1e-12, abs_tol=0.0), block
+    json.dumps(block, allow_nan=False)
+
+
+def test_pooled_order_rejects_seed_count_mismatch():
+    with np.testing.assert_raises(ValueError):
+        L.pooled_order_inference_from_influence(
+            [1.0, -1.0], [1.0, -1.0], delta_ppl=0.0,
+            delta_log_ratio=0.0, seeds=[0, 1], n_seeds=3)

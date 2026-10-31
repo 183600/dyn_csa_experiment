@@ -1285,6 +1285,41 @@ def _scaled_sum_of_squares(values, multiplier):
     return val if math.isfinite(val) else None
 
 
+def _scaled_root_sum_of_squares(values, multiplier):
+    """``sqrt(multiplier * sum(v**2))`` with a single final scaling.
+
+    The variance itself can underflow to zero or overflow to infinity while
+    its square root (the standard error) is representable.  ``_scaled_sum_of_squares``
+    deliberately returns a variance (or ``None``), so callers that need a
+    standard error should use this helper instead of taking ``sqrt(var)``
+    after an underflow.
+    """
+    vals = [float(v) for v in values]
+    if not vals:
+        return 0.0
+    if not (math.isfinite(multiplier) and multiplier >= 0.0):
+        return None
+    scale = max((abs(v) for v in vals), default=0.0)
+    if not math.isfinite(scale):
+        return None
+    if scale == 0.0:
+        return 0.0
+    try:
+        ss = math.fsum((v / scale) ** 2 for v in vals)
+        if not (math.isfinite(ss) and ss > 0.0):
+            return None
+        out = scale * math.sqrt(ss * multiplier)
+    except (OverflowError, ValueError):
+        return None
+    if not math.isfinite(out):
+        return None
+    if out == 0.0 and any(v != 0.0 for v in vals):
+        # The standard error is below the smallest representable float; do not
+        # report a fake exact-zero uncertainty.
+        return None
+    return out
+
+
 def _scaled_mean_std_if_extreme(values, ddof=1):
     """Return ``(mean, std)`` for representable-but-extreme magnitudes.
 
@@ -1424,6 +1459,12 @@ def _nll_doc_ci(nll_per_row, n_tokens_per_row):
         [x - mean for x in doc_ce], 1.0 / (len(doc_ce) - 1))
     sem = (math.sqrt(max(_doc_var, 0.0) / len(doc_ce))
            if _doc_var is not None else None)
+    if sem == 0.0 and any(x != mean for x in doc_ce):
+        # The variance underflowed although the standard error is
+        # representable; do not report a fake zero-width interval.
+        sem = _scaled_root_sum_of_squares(
+            [x - mean for x in doc_ce],
+            1.0 / ((len(doc_ce) - 1) * len(doc_ce)))
     # The point estimate is token-pooled, so the interval must be for that
     # same estimand.  Resampling/weighting per-document CEs as if the pooled
     # CE were their unweighted mean mixes two different estimators and is
@@ -1461,6 +1502,9 @@ def _nll_doc_ci(nll_per_row, n_tokens_per_row):
     _var = (_scaled_sum_of_squares(_scaled, n_docs / (n_docs - 1.0))
             if _scaled is not None else None)
     _sem_ce = (math.sqrt(max(_var, 0.0)) if _var is not None else None)
+    if _sem_ce == 0.0 and any(v != 0.0 for v in _scaled):
+        _sem_ce = _scaled_root_sum_of_squares(
+            _scaled, n_docs / (n_docs - 1.0))
     _tc = _t_critical(0.95, n_docs - 1)
     if not math.isfinite(_tc):
         _tc = 1.959963984540054
@@ -1557,9 +1601,15 @@ def _paired_nll_doc_ci_extreme(A, B, counts, conf):
     bar = psi.mean(axis=0)
     var = _scaled_sum_of_squares(bar, D / (D - 1.0))
     se = (math.sqrt(max(var, 0.0)) if var is not None else None)
+    if se == 0.0 and any(v != 0.0 for v in bar):
+        # The variance underflowed although the standard error is
+        # representable; do not report a fake zero-width interval.
+        se = _scaled_root_sum_of_squares(bar, D / (D - 1.0))
     bar_lr = psi_lr.mean(axis=0)
     var_lr = _scaled_sum_of_squares(bar_lr, D / (D - 1.0))
     se_lr = (math.sqrt(max(var_lr, 0.0)) if var_lr is not None else None)
+    if se_lr == 0.0 and any(v != 0.0 for v in bar_lr):
+        se_lr = _scaled_root_sum_of_squares(bar_lr, D / (D - 1.0))
     if se is None or se_lr is None:
         out['method'] = ('point estimate only: the cluster-robust variance '
                          'exceeds the representable float range')
@@ -1693,11 +1743,17 @@ def _paired_nll_doc_ci(nll_a, nll_b, n_tokens, *, conf=0.95):
     bar = psi.mean(axis=0)
     var = _scaled_sum_of_squares(bar, D / (D - 1.0))
     se = (math.sqrt(max(var, 0.0)) if var is not None else None)
+    if se == 0.0 and any(v != 0.0 for v in bar):
+        # The variance underflowed although the standard error is
+        # representable; do not report a fake zero-width interval.
+        se = _scaled_root_sum_of_squares(bar, D / (D - 1.0))
     psi_lr = ((A - ce_a[:, None] * T[None, :])
               - (B - ce_b[:, None] * T[None, :])) / total_tok
     bar_lr = psi_lr.mean(axis=0)
     var_lr = _scaled_sum_of_squares(bar_lr, D / (D - 1.0))
     se_lr = (math.sqrt(max(var_lr, 0.0)) if var_lr is not None else None)
+    if se_lr == 0.0 and any(v != 0.0 for v in bar_lr):
+        se_lr = _scaled_root_sum_of_squares(bar_lr, D / (D - 1.0))
     if se is None or se_lr is None:
         out['method'] = ('point estimate only: the cluster-robust variance '
                          'exceeds the representable float range')

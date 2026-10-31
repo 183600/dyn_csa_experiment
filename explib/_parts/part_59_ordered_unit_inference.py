@@ -673,6 +673,7 @@ def ordered_unit_inference(values, *, unit_ids=None, block_lengths=None,
     iid_excludes_zero = bool(iid_ci[0] > 0.0 or iid_ci[1] < 0.0)
     block_zero = {}
     zero_changed = False
+    zero_lost = False
     for r in block_rows:
         ci = r.get('ci')
         if ci is None:
@@ -681,11 +682,18 @@ def ordered_unit_inference(values, *, unit_ids=None, block_lengths=None,
         block_zero[str(r['block_length'])] = exc
         if exc != iid_excludes_zero:
             zero_changed = True
+        if iid_excludes_zero and not exc:
+            # Only a lost exclusion means the i.i.d. interval UNDERSTATED the
+            # uncertainty.  The opposite direction (i.i.d. included zero but
+            # a narrower block interval excludes it) is negative dependence;
+            # it is still reported through zero_exclusion_changed, but it is
+            # not evidence for the ``iid_understates`` wording.
+            zero_lost = True
     inflation = bool(
         order_detected
         and ((de_max is not None and de_max > tol)
              or (ci_inflation is not None and ci_inflation > infl)
-             or zero_changed))
+             or zero_lost))
     iid_understates = inflation
 
     if perm is None:
@@ -737,6 +745,7 @@ def ordered_unit_inference(values, *, unit_ids=None, block_lengths=None,
         'robust_ci_width': robust_width,
         'ci_inflation': ci_inflation,
         'zero_exclusion_changed': zero_changed,
+        'zero_exclusion_lost': zero_lost,
         'block_zero_exclusion': block_zero,
         'wording': wording,
         'notes': [

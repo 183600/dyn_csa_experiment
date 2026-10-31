@@ -146,6 +146,17 @@ def audit_pooled_order(path=None):
             out['n_not_replayable'] += 1
             out['problems'].extend(f'{name}: {x}' for x in row['problems'])
             continue
+        # The surrounding doc_sampling block names the same evaluation
+        # units.  A hand edit that changes its unit count while leaving the
+        # influence series untouched must not replay as a pass.
+        _block_units = _oda_int(block.get('n_units'))
+        if isinstance(dsm, dict) and _block_units is not None:
+            for _key in ('pooled_ci_n_units', 'n_docs'):
+                _ds_units = _oda_int(dsm.get(_key))
+                if _ds_units is not None and _ds_units != _block_units:
+                    row['problems'].append(
+                        f'doc_sampling.{_key} does not match '
+                        'pooled_order_inference.n_units')
         stats = block.get('sufficient_statistics')
         if not isinstance(stats, dict):
             row['problems'].append(
