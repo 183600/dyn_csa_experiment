@@ -10620,3 +10620,106 @@ i.i.d.；独立面板不误报；batch/block 表与「最宽区间」精确选�
 `load_wikitest` 被 monkeypatch 抛错时审计仍完成（证明不读 test）；报告
 表与 CLI/`run_report`/`build_report` 接线。相关既有套件通过；完整 CPU
 套件在本轮最终树通过（新增 11 项）。
+
+## 119. 训练窗口的「tokens_seen」不是数据覆盖：精确区间并集、跨 rank 重放与按覆盖设计预算（本轮数据方法硬化，no new runs）
+
+### 119.1 问题
+
+`batch_iter` 每一步从 `[0, len(train_ids)-seq_len-1]` 独立均匀、有放回地
+抽 `batch_size` 个窗口起点；`tokens_seen = steps × batch_size × seq_len`
+是**抽取量**，不是被访问过的不同数据量。相邻窗口共享 `seq_len-1` 个
+token，同一起点还可能被重复抽到，因此：
+
+- 一次「1.2 个 epoch」的训练可能只覆盖 70% 的可预测位置；FineWeb 这类
+  大语料上，固定 step 预算的覆盖率可能只有百分之十几；
+- 不同 seed 的数据流不同，覆盖率也不同；同 seed 的不同臂共享数据流，
+  但「按 token 预算匹配」并不等于「按数据覆盖匹配」；
+- 不同 `seq_len` 的臂在相同 `tokens_seen` 下覆盖不同数量的位置，长度
+  对比会混入数据暴露差异；
+- 旧记录只有 `tokens_seen_unique_estimate`：它把窗口当成独立 token 抽样
+  的 Poisson 近似，无法从 seed 重放，也没有进入 v7/v12 的记录字段，读者
+  无法区分「测量」与「估计」。
+
+把 draw count 写成 data exposure，是数据口径而非统计口径的过度概括。
+
+### 119.2 方法：从实际 seed 流精确算区间并集
+
+新增 `TRAINING_EXPOSURE_POLICY` 与
+`training_window_exposure(n_tokens, seq_len, batch_size, steps, seed,
+world_size=1, data_seeds=None, max_exact_draws=4_000_000)`：
+
+- 逐步重放 `batch_iter` 的 RNG：每步一次
+  `rng.integers(0, n+1, size=batch_size, dtype=...)`，整数 dtype 的
+  `int32/int64` 选择规则与 `batch_iter` 完全一致；DDP 下按
+  `data_seed_for_rank(seed, rank)` 为每个 rank 建独立流，或直接使用记录中
+  已存的 `data_seeds`，使审计不依赖派生函数以后是否改变。
+- 每个 draw 在起点 `s` 预测目标位置 `[s+1, s+1+seq_len)`；所有窗口等长，
+  所以并集长度无需逐 token 物化：
+  `unique_tokens = seq_len + Σ min(seq_len, diff(sorted(unique_starts)))`。
+- 报告 `draws`、`processed_tokens`、`window_positions`、
+  `target_positions`、`unique_starts`、`unique_tokens`、
+  `start_coverage`、`token_coverage`、`unique_epochs`、
+  `effective_epochs`、`reuse_factor`、`duplicate_token_fraction`、
+  `start_collision_fraction`、`max_start_multiplicity`。
+- 当 `draws > max_exact_draws` 时返回显式的 Poisson 近似，置
+  `exact=False`、`coverage_quality='estimated'` 并在 `warnings` 说明；
+  绝不把估计冒充测量。输入完整回显在 `inputs`，审计可零数据重放。
+- `training_coverage_budget(..., target_coverage=q)` 反解同一模型：在
+  有放回窗口抽样下达到目标唯一覆盖所需的 step/draw 预算，给出
+  `expected_steps/expected_draws/expected_unique_tokens` 与
+  `achievable`。这是设计工具；实际 seed 的覆盖仍以测量块为准。
+
+`tokens_seen` 与 `unique_tokens` 现在是两个并列字段：前者是计算/抽样量，
+后者是实际触达的数据量；记录同时保留旧 Poisson 字段以兼容旧读者，但
+`token_accounting_note` 明确区分二者。
+
+### 119.3 接线
+
+- `explib/__init__.py` 追加 `part_61_training_data_exposure.py`；
+- `train_variant` 在写结果前用**实际完成的 steps、world size 与 seed**
+  生成 `data_exposure`；DDP 的 rank seeds 一并落盘；
+- `explib.rope.train_warmup` 同样在 v7/v12 的 warmup 记录中写
+  `data_exposure`，不改任何训练、checkpoint、PPL 或评估；
+- `audit_gates.py data_exposure`（别名 `exposure` / `token_coverage` /
+  `coverage` / `tokens_seen`）从记录的 `inputs` 重放整个块，核对
+  `tokens_seen`、`steps_completed`、`distributed_world_size`、
+  `data_seed` 与覆盖字段；缺块报 `not_verifiable_locally`，篡改或
+  自相矛盾判 `fail`，并入 `audit_gates.py report` 的顶层
+  `data_exposure`。
+
+### 119.4 边界
+
+- 这是**描述性数据口径**：不改变 `batch_iter`、token、split、tokenizer、
+  去重、训练、checkpoint、PPL、种子、端点、α/Holm 或任何冻结判定；不
+  bump `CODE_SEMANTICS`。
+- 覆盖只描述该 seed 在该冻结切片上的窗口流，不是对上游语料总体的概率
+  抽样；`source_order_prefix` 的外部效度边界（§55）继续成立。resume 记录
+  只覆盖本段 steps，不是各段并集。
+- 「唯一 token」是预测目标位置的并集，不等于「独立样本数」；相邻窗口
+  仍高度相关，覆盖率不能替代有效样本量或 §117/§118 的顺序诊断。
+- Poisson 预算/回退是近似，不能当作测量；`exact=True` 也只证明重放与
+  输入一致，不证明语料内容正确（后者由 `fit_fp`/`src_fp`/`val_fp`/
+  `dataset_source` 负责）。
+- 旧记录不回填、不重跑；没有 `data_exposure` 的 artifact 明确标为
+  legacy，不能用 `tokens_seen` 反推唯一覆盖。
+
+### 119.5 入口与验证
+
+```bash
+python -m pytest -q test_review_part_60.py
+python audit_gates.py data_exposure          # 重放本地 run/summary
+python audit_gates.py tokens_seen            # 别名
+python audit_gates.py report                 # 汇总新增 data_exposure
+```
+
+`test_review_part_60.py` 12 项覆盖：策略/状态/边界；精确并集与逐 token
+暴力掩码在多组 `seq_len`（含 1 和 `n=seq_len+1` 单窗口）上逐位一致；
+起点流与真实 `batch_iter` 的首列逐值一致；DDP 三个 rank 的并集与显式
+`data_seeds` 重放一致；`max_exact_draws` 触发时显式 `exact=False` 且
+严格 JSON；超大语料不物化数组；非法尺寸/布尔/浮点/零 step/负 world/
+非法目标覆盖 fail-closed；预算对 q 单调且与实际绘制的 draw 记账一致；
+审计对合法块 `ok`、篡改覆盖/输入 seed/schema/quality/夹带 `confirmed`
+判 `fail`、`tokens_seen`/`steps_completed`/world/rank-0 seed 交叉不一致
+判 `fail`、缺块/`not_estimable`/坏 JSON 的语义、目录输入、以及
+`load_wikitest` 被 monkeypatch 抛错时仍完成（证明不读 test）。相关既有
+套件通过；`test_review_part_57/58/59` 共 36 项通过。

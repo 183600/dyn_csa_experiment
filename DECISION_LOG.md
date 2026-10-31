@@ -5486,3 +5486,65 @@ seed 可复现；形状/NaN/布尔 token/零 token/重复 unit id/重复 seed/�
 `not_verifiable_locally`、坏 JSON `fail`、monkeypatch `load_wikitest`
 抛错时审计仍完成；报告与 CLI/`run_report`/`build_report` 接线。相关既有
 套件通过；完整 CPU 套件在本轮最终树通过（新增 11 项）。
+
+## 2026-10-31 — 训练窗口的 tokens_seen 不是数据覆盖：精确区间并集、跨 rank 重放与按覆盖设计预算（本轮数据方法硬化，no new runs）
+
+零 GPU；不新增训练、不读取 test split、不修改
+`confirmation_frozen*.json` 的字节/种子/端点/α/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未删除、未修改、未移动。
+
+**Problem.** `batch_iter` 每一步有放回地抽 `batch_size` 个窗口起点，
+`tokens_seen = steps × batch_size × seq_len` 只是抽取量，不是被访问过的
+不同数据量。窗口之间共享 `seq_len-1` 个 token，同一起点可能重复；因此
+固定 step 预算在大语料上可能只覆盖很小一部分，不同 seed 的覆盖率不同，
+不同 `seq_len` 的臂在相同 tokens_seen 下覆盖的位置数也不同。旧记录只有
+一个 Poisson 近似 `tokens_seen_unique_estimate`：不能按 seed 重放，
+v7/v12 的 warmup 记录甚至没有该字段，读者无法区分测量与估计。把 draw
+count 写成 data exposure，会让「等 token 预算」被误读成「等数据暴露」。
+
+**Fix.** 新增 `TRAINING_EXPOSURE_POLICY`、
+`training_window_exposure(...)` 与 `training_coverage_budget(...)`：
+
+- 逐步重放 `batch_iter` 的 RNG（同样的 high bound、每步一次
+  `integers`、同样的 int32/int64 选择），单进程用 run seed，DDP 用
+  `data_seed_for_rank(seed, rank)` 或记录中的 `data_seeds`；
+- 每个窗口预测 `[s+1, s+1+seq_len)`，等长区间并集用
+  `seq_len + Σ min(seq_len, diff(sorted(unique_starts)))` 精确计算，不物化
+  逐 token 数组；
+- 报告 draws / processed_tokens / unique_starts / unique_tokens /
+  start_coverage / token_coverage / unique_epochs / effective_epochs /
+  reuse_factor / duplicate_token_fraction / start_collision_fraction /
+  max_start_multiplicity，并回显全部 inputs 供审计重放；
+- `draws > max_exact_draws` 时显式返回 Poisson 近似，
+  `exact=False`、`coverage_quality='estimated'`，不冒充测量；
+- `training_coverage_budget(target_coverage=q)` 反解达到目标唯一覆盖所需
+  的 step/draw 预算，供下一次 freeze 按数据暴露而不是按名义 token 数
+  匹配；
+- `train_variant` 与 `explib.rope.train_warmup` 在记录中追加
+  `data_exposure`；旧的 `tokens_seen_unique_estimate` 与
+  `tokens_seen` 保持兼容，`token_accounting_note` 明确二者不同；
+- `audit_gates.py data_exposure`（别名 `exposure` / `token_coverage` /
+  `coverage` / `tokens_seen`）从 inputs 整块重放，核对 tokens_seen、
+  steps_completed、world size、rank-0 seed 与全部覆盖字段；缺块
+  `not_verifiable_locally`，自相矛盾或篡改 `fail`，并入
+  `audit_gates.py report` 顶层。
+
+**Boundary.** 这是描述性数据口径：不改 `batch_iter`、token、split、
+tokenizer、去重、训练、checkpoint、PPL、种子、端点、α/Holm 或任何冻结
+判定；不 bump `CODE_SEMANTICS`。覆盖只描述该 seed 在冻结切片上的窗口
+流，不是对上游语料的概率抽样（§55 继续成立）；resume 记录只覆盖本段
+steps，不是各段并集；唯一 token 是预测目标位置的并集，不是独立样本数，
+不能替代有效样本量或 §117/§118 的顺序诊断。Poisson 预算是近似；
+`exact=True` 只证明重放与输入一致，不证明语料内容正确。旧 artifact 不
+回填、不重跑，没有块就明确标 legacy。
+
+**Verification.** 新增 `test_review_part_60.py` 12 项：策略/状态/边界；
+精确并集与逐 token 暴力掩码在多组 seq_len（含 1 与 n=seq_len+1 单窗口）
+逐位一致；起点流与真实 `batch_iter` 首列逐值一致；DDP 三 rank 并集与
+显式 `data_seeds` 重放一致；`max_exact_draws` 回退显式且严格 JSON；
+超大语料不物化数组；非法尺寸/布尔/浮点/零 step/负 world/非法目标覆盖
+fail-closed；预算单调且 draw 记账一致；审计合法块 `ok`、篡改覆盖/输入
+seed/schema/quality/夹带 `confirmed` 判 `fail`、tokens_seen/
+steps_completed/world/rank-0 seed 交叉不一致判 `fail`、缺块/
+`not_estimable`/坏 JSON 语义、目录输入、以及 `load_wikitest` 被
+monkeypatch 抛错时审计仍完成。`test_review_part_57/58/59` 共 36 项通过。

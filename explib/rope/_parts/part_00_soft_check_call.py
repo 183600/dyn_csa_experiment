@@ -1249,7 +1249,25 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
         except Exception as _ee:
             print(f'[efficiency] WARNING: measurement failed ({type(_ee).__name__}: {_ee})')
             _efficiency = {'status': 'error', 'error': f'{type(_ee).__name__}: {_ee}'}
-    res = {'variant': variant, 'seed': seed, 'ppl': ppl, 'params': n_param, 'losses': losses, 'stats': stats, 'steps': steps, 'tokens_seen': steps * batch_size * seq_len, 'train_time_s': wall, 'warm_steps': warm_steps, 'ppl_at_switch': switch_ppl, 'final_loss_smoothed': float(torch.stack(list(_tail)).mean()) if _tail else float('nan'), 'ppl_history': ppl_hist, 'ppl_history_dense_prefix': warm_hist, 'delta_trace': {}, 'train_knobs': _v7_knobs(device, batch_size), 'rng_fp': _rng_fp, 'data_fp': L._ids_fp(train_ids), 'data_audit': _data_audit,
+    # `tokens_seen` is a draw count, not distinct data; measure the seeded
+    # interval union so a v7/v12 record states its actual corpus exposure.
+    _n_train_for_exposure = (int(len(train_ids))
+                             if hasattr(train_ids, '__len__') else 0)
+    try:
+        _data_exposure = L.training_window_exposure(
+            _n_train_for_exposure, int(seq_len), int(batch_size), int(steps),
+            seed=int(seed))
+    except (ValueError, TypeError, OverflowError, MemoryError) as _txe:
+        _data_exposure = {
+            'kind': 'training_data_exposure', 'status': 'not_estimable',
+            'reason': f'{type(_txe).__name__}: {_txe}',
+            'policy': L.TRAINING_EXPOSURE_POLICY['version'],
+            'inputs': {'n_tokens': int(_n_train_for_exposure),
+                       'seq_len': int(seq_len),
+                       'batch_size': int(batch_size), 'steps': int(steps),
+                       'seed': int(seed), 'world_size': 1},
+        }
+    res = {'variant': variant, 'seed': seed, 'ppl': ppl, 'params': n_param, 'losses': losses, 'stats': stats, 'steps': steps, 'tokens_seen': steps * batch_size * seq_len, 'train_time_s': wall, 'warm_steps': warm_steps, 'ppl_at_switch': switch_ppl, 'final_loss_smoothed': float(torch.stack(list(_tail)).mean()) if _tail else float('nan'), 'ppl_history': ppl_hist, 'ppl_history_dense_prefix': warm_hist, 'delta_trace': {}, 'train_knobs': _v7_knobs(device, batch_size), 'rng_fp': _rng_fp, 'data_fp': L._ids_fp(train_ids), 'data_audit': _data_audit, 'data_exposure': _data_exposure, 'token_accounting_note': 'tokens_seen counts window draws; unique-token coverage is measured in data_exposure (exact seeded interval union)',
            'nll_sum': _eval_stats.get('nll_sum'), 'n_tokens': _eval_stats.get('n_tokens'),
            'nll_per_row': _eval_stats.get('nll_per_row'), 'n_tokens_per_row': _eval_stats.get('n_tokens_per_row'),
            'eval_rows': _eval_stats.get('eval_rows'), 'eval_seed': _eval_stats.get('eval_seed'),

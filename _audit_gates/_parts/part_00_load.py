@@ -277,6 +277,11 @@
   data_source  上游语料版本：每个 cache meta 是否记录并匹配固定的 Hub commit
                （WikiText-103 / FineWeb-Edu）；train/validation/test 必须同一
                快照；legacy/local 缓存明确报不可验证而非算作干净
+  data_exposure  训练数据暴露：重放 `batch_iter` 的 seed/step/batch/world
+               窗口流，按预测目标区间并集计算 unique_tokens 与覆盖率，核对
+               记录里的 tokens_seen/steps_completed/world/rank-0 seed；缺
+               块报 not_verifiable，篡改判 fail；不读语料/test、不改 PPL
+               （别名 exposure / token_coverage / coverage / tokens_seen）
   sample_design  抽样设计：缓存声明的是 source-order prefix 还是可复核的
                document-stratified 概率样本；prefix 明确标记为不可外推，
                raw train/valid 可用时量化文章覆盖率、文章长度 KS 与分层覆盖；

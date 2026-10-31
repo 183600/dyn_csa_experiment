@@ -71,6 +71,7 @@ _PARTS = [
 'part_58_endpoint_sensitivity.py',
 'part_59_ordered_unit_inference.py',
 'part_60_pooled_order_inference.py',
+'part_61_training_data_exposure.py',
 ]
 
 load_root_package(globals(), __file__, _PARTS,

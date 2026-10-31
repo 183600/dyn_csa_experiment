@@ -1293,10 +1293,31 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
     if _n_train > 0:
         _p = min(float(seq_len) / float(_n_train), 1.0)
         _uniq_frac = (1.0 if _p >= 1.0 else float(1.0 - math.exp(_draws * math.log1p(-_p))))
+    # Exact, replayable coverage of the seeded draw stream.  `tokens_seen`
+    # counts draws; this block measures how many distinct prediction targets
+    # those draws actually reached (including overlap between adjacent
+    # windows), so a run cannot silently equate compute with data exposure.
+    try:
+        _data_exposure = training_window_exposure(
+            _n_train, int(seq_len), int(batch_size), int(_steps_completed),
+            seed=int(seed), world_size=int(_world),
+            data_seeds=[data_seed_for_rank(seed, _r)
+                        for _r in range(int(_world))])
+    except (ValueError, TypeError, OverflowError, MemoryError) as _txe:
+        _data_exposure = {
+            'kind': 'training_data_exposure', 'status': 'not_estimable',
+            'reason': f'{type(_txe).__name__}: {_txe}',
+            'policy': TRAINING_EXPOSURE_POLICY['version'],
+            'inputs': {'n_tokens': int(_n_train), 'seq_len': int(seq_len),
+                       'batch_size': int(batch_size),
+                       'steps': int(_steps_completed), 'seed': int(seed),
+                       'world_size': int(_world)},
+        }
     result = {'variant': variant, 'seed': seed, 'data_seed': int(_data_seed), 'exec_fp': _exec_fp, 'env_fp_v2': _env_fp_v2, 'env_fp_v3': _env_fp_v3, 'env_fp_v3_schema': ENVIRONMENT_FP_V3_SCHEMA, 'ppl': ppl, 'params': n_param, 'losses': losses, 'stats': stats, 'steps': steps, 'steps_completed': int(_steps_completed), 'early_stop': _early_stop, 'tokens_seen': _steps_completed * batch_size * seq_len * _world,
               'tokens_seen_unique_estimate': (int(round(_n_train * _uniq_frac)) if _uniq_frac is not None else None),
               'tokens_seen_unique_frac_estimate': _uniq_frac,
-              'token_accounting_note': 'tokens_seen counts window draws; unique-token coverage is an estimate under independent uniform window draws, not a measurement',
+              'token_accounting_note': 'tokens_seen counts window draws; unique-token coverage is measured in data_exposure (exact seeded interval union) and the legacy *_estimate field is a Poisson approximation, not a measurement',
+              'data_exposure': _data_exposure,
               'data_audit': _data_audit,
               'train_time_s': wall, 'train_tokens_per_s': ((_steps_completed * batch_size * seq_len * _world) / wall if wall and wall > 0 else None), 'distributed_rank': _rank, 'distributed_world_size': _world, 'final_loss_smoothed': _final_loss_smoothed, 'final_loss_smoothed_window': 50, 'final_loss_smoothed_n': len(_tail_losses), 'ppl_history': ppl_hist, 'delta_trace': delta_trace, 'train_knobs': training_knobs(amp_dtype=_amp, eager_batch=_eager_batch_used), 'amp_dtype': _amp, 'amp_grad_scaler': bool(_scaler is not None), 'eager_batch': _eager_batch_used, 'ckpt_mode': _ckpt_effective, 'ckpt_estimated_bytes': _auto_need, 'rng_fp': _rng_fp, 'init_core_fp': _init_core_fp, 'data_fp': _ids_fp(train_ids),
               # The token-level evidence behind the reported PPL.
