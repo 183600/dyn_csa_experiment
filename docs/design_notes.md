@@ -11891,3 +11891,163 @@ manifest mismatch；gate/CLI/`report`/`design_preflight` 接线存在且不
 派生 manifest 的情形）时拒绝、并拒绝本地 invalid 注册；审计门对匹配/不符/缺失分别给 `ok`/`fail`/
 `not_verifiable`，且 CLI 可执行；归档 `verify` 从打包字节独立重算注册，
 篡改摘要或片段计数判 fail。完整 CPU 套件在本轮最终树通过。
+
+## 129. 登记的是设计，不是执行体：`analysis.implementation` 绑定分析闭包（本轮实验设计与准备硬化）
+
+零 GPU；不新增训练、不读取 test split、不修改
+`confirmation_frozen*.json` 的字节/种子/端点/α/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未删除、未修改、未移动。
+
+### 129.1 问题：清单可以不变，计算端点的代码却变了
+
+§127 的 `design_protocol` 把问题、端点、臂、种子、随机化、停止规则、
+分析族、数据切分与失败处置绑进了一份有 `content_sha256` 的对象；§128
+又把「哪些 `_parts` 片段按什么顺序执行」从文件树摘要里独立出来。但这两
+层都还没有回答一个更基本的问题：**登记的分析，是不是实际会跑的那份
+分析代码？**
+
+- `design_protocol` 的 `analysis` section 记录的是
+  `test`/`correction`/`alpha`/`code_semantics` 等声明；改
+  `holm_adjust`、`exact_signflip_p`、`directional_claim_verdicts` 或
+  `finaltest_stats` 的实现，只要不改这些字符串，protocol 的正文哈希
+  完全不变。
+- 冻结锁确实会绑定源码树，但它是在**首次 test 读取时**才写。若协议在
+  第一条 cell 前登记、分析代码在登记之后、首次 test 读取之前被改，
+  `design_protocol_timing` 仍会通过，`manifest_sha256` 仍会通过，
+  只有到 P5T 才看到「当前源码」——而那时已经无法区分「注册时的分析」
+  与「看到 validation 之后改过的分析」。
+- 反向问题同样存在：把整个仓库的源码摘要都当成协议身份，会让另一个
+  panel 的驱动、动态草稿或一篇文档的改动无端作废一份 fixed-chunk 的
+  确认性登记。**绑定范围必须与分析主张的范围一致**。
+
+因此，事前登记需要第三个身份：不是整棵源码树，也不是一句
+`code_semantics`，而是**实际计算声明端点的代码闭包**。
+
+### 129.2 方法：`analysis.implementation` 与窄闭包摘要
+
+`build_design_protocol(..., source_tree=...)` 在 `analysis` 下新增
+`implementation` 块，默认从当前 `source_tree_manifest()` 读取，测试可
+注入 fixture。它记录：
+
+| 字段 | 含义 |
+|---|---|
+| `analysis_source_sha256` | 分析闭包的摘要；硬失效判据 |
+| `analysis_n_files` | 闭包内文件数；防止空/部分摘要冒充完整绑定 |
+| `analysis_prefixes` / `analysis_files` | 闭包的声明范围，可复核 |
+| `full_source_tree_sha256` | 整棵测量源码树的摘要；provenance，不单独判 fail |
+| `split_registry_sha256` / `split_registry_status` / `split_registry_n_parts` | 执行片段的顺序/成员身份 |
+| `code_semantics` | 与 `analysis.code_semantics` 必须一致 |
+| `source_unreadable` | 不完整源码树的具名文件；非空即 fail |
+| `scope` / `policy` | 说明「硬失效只作用于分析闭包」的规则 |
+
+分析闭包由三部分组成：
+
+- `explib/_parts/`：核心测量库（统计、配对、报告、审计辅助函数）；
+- `explib/confirmation/`：计算冻结端点与决策的 v12 驱动；
+- `explib/__init__.py`、`_split_loader.py`、`exp_lib.py`：装载顺序与
+  历史导入 shim。
+
+闭包摘要复用
+`source_tree_manifest` 的 `relpath NUL bytes NUL sha256 LF` 构造，只是
+把文件集合缩到上述范围。`__init__.py` 里的 `_PARTS` 字面量在闭包内，
+所以**换序也会改变闭包摘要**；`explib/rope/`、`explib/corruption/` 等
+其他 panel 驱动与 `confirmation_frozen_dynamic.json` 不在硬闭包内。
+这与 §128 的分工一致：split registry 仍负责「执行注册」的独立身份，
+分析闭包负责「这份设计的端点由哪段代码计算」。
+
+### 129.3 判据：confirmatory 必须绑定，闭包漂移即新设计
+
+`validate_design_protocol` 在 confirmatory 下要求
+`analysis.implementation` 存在，且：
+
+- `analysis_source_sha256` 与 `full_source_tree_sha256` 是 64 位十六
+  进制摘要；`analysis_n_files >= 1`；
+- `implementation.code_semantics == analysis.code_semantics`；
+- `source_unreadable` 为空（分析闭包不完整时不能登记）；
+- `split_registry_status` 缺失只 warning；present 但不是 `ok` 也只
+  warning——因为闭包文件摘要已经覆盖实际执行的片段字节，registry 是
+  补充身份；
+- `analysis_prefixes`/`analysis_files` 若出现，必须是字符串列表。
+
+exploratory/draft 的同类缺口降为 warning 并进入 `missing`：草稿可以没有
+执行体绑定，但不能因此被当成已注册的确认性分析。
+
+`design_protocol_conformance(protocol, manifest, source_tree=None)` 重算
+当前（或注入的）闭包摘要，并把结果分成两层：
+
+- **analysis closure 改变**：`fail`，具名「analysis implementation
+  changed after registration」。清单、α、种子一字未动也一样 fail；要
+  改代码就必须重新登记 revision 并写 reason，而不是在旧 protocol 下
+  偷偷换实现。
+- **闭包外源码/注册表改变**：`warnings`，说明端点实现未变但应复核。
+  这样另一个 panel 或动态草稿的合法改动不会误伤 fixed-chunk 登记。
+
+`design_protocol_audit(..., source_tree=None)` 把该块作为
+`implementation` 输出；缺文件仍是 `not_verifiable_locally`，缺绑定在
+confirmatory 下是 fail，闭包不可哈希是 `not_verifiable`，不是 pass。
+`design_protocol_preflight_summary` 也带上 `implementation` 状态。
+
+### 129.4 接线与使用
+
+```bash
+python audit_gates.py design_protocol [design_protocol.json]
+python audit_gates.py protocol
+python audit_gates.py design_implementation   # 新别名
+python audit_gates.py analysis_binding        # 新别名
+make protocol
+```
+
+编译时显式传入源码树（推荐在第一条 cell 前）：
+
+```python
+import json
+import exp_lib as L
+manifest = json.load(open('confirmation_frozen.json', encoding='utf-8'))
+protocol = L.build_design_protocol(
+    manifest, study_name='v12 fixed-chunk confirmation',
+    run_order=order, disposition=disposition,
+    test_access={'method': 'single_look', 'max_looks': 1,
+                 'require_reason_for_reread': True, 'declared': True},
+    disjoint_declared=True,
+    source_tree=L.source_tree_manifest())
+print(L.write_design_protocol('.', protocol))
+```
+
+若登记之后分析代码需要修正，正确路径是：保留旧 protocol（它的
+`content_sha256` 仍在历史里），用新的 `source_tree` 重新 build，设置
+`revision>0`、`supersedes=[旧 content_sha256]`、非空 `reason`，再
+`write_design_protocol(..., keep_existing=False)`。闭包摘要不同、但
+revision 链缺失的写法会被 writer 拒绝。
+
+### 129.5 边界
+
+- **不是新的显著性检验。** 它不产生 p 值、不进入 Holm、不改变
+  `verified`/`confirmed`、不重算 PPL；只回答「登记时的分析闭包是否
+  仍是当前的分析闭包」。
+- **不是冻结锁的替代。** 冻结锁仍绑定 test 切片、训练指纹、清单哈希和
+  完整源码树；本块补的是「登记时」而非「首次 test 读取时」的分析身份。
+  两者回答不同时间点的问题。
+- **不是签名。** 能同时改写分析代码与重新登记的人仍可伪造；它让无意
+  漂移和「清单不动、代码动」可见，不抗恶意。真正的执行一致性仍由
+  `run_allocation`、`disposition`、`looks`、`test_access`、`reproduce`
+  与结果层审计分别回答。
+- **不把整棵树当硬约束。** 闭包外源码和 split registry 漂移只 warning；
+  否则另一个 panel 的合法改动会让 fixed-chunk 登记无端失效。代价是：
+  若某个新 helper 被放进闭包外、却被端点调用，本块看不到它；这要求
+  新增分析依赖时同步更新 `DESIGN_PROTOCOL_ANALYSIS_PREFIXES`/`FILES`。
+- **不读 test、不新增训练。** 所有输入都是本地源码与 JSON；编译、审计、
+  conformance 都不调用 `load_wikitest`。
+
+### 129.6 验证
+
+新增 `test_review_part_71.py` 9 项：登记携带闭包摘要、整树摘要与
+split registry 状态，且闭包包含核心库/确认驱动/loader 而不包含其他
+panel 与动态草稿；confirmatory 缺绑定判 fail 而 draft 只告警；闭包内
+单文件改变/`_PARTS` 声明改变会改变摘要，闭包外文件改变不会；同一
+清单下闭包改变使 `design_protocol_conformance` fail，而闭包外漂移只
+warning；实现里的 `code_semantics` 必须与分析 section 一致；非法摘要/
+零文件数/不可读文件判 fail；`content_sha256` 覆盖 implementation 而
+`created_at` 仍不覆盖；`design_protocol_audit` 在注入闭包漂移时 fail 并
+输出 `implementation`，且不产生任何 test/p/Holm/verdict 字段；
+`design_protocol_preflight_summary` 带 implementation 状态。完整 CPU
+套件在本轮最终树通过。

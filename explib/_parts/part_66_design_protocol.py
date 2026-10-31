@@ -65,6 +65,49 @@ DESIGN_PROTOCOL_POLICY = {
         'protocol never proves that the analyst did not look at the data.'),
 }
 
+# A declaration is not a pre-registration unless the executable analysis is
+# part of it.  The manifest can stay byte-identical while the code that turns
+# a stored by-length cell into a p-value, a Holm decision or a direction
+# verdict changes.  The freeze lock binds the source only at the first test
+# read, so an edit made between registration and that read would be invisible.
+# The protocol therefore carries a digest of the analysis closure:
+#
+#   * the core measurement library (``explib/_parts``);
+#   * the confirmation driver that computes the frozen endpoint
+#     (``explib/confirmation``);
+#   * the loader and the historical import shim that assemble those fragments.
+#
+# The whole source-tree digest is also recorded for provenance, but only this
+# closure is a hard invalidation: editing an unrelated panel driver or the
+# dynamic draft must not silently invalidate a fixed-chunk registration.
+DESIGN_PROTOCOL_ANALYSIS_PREFIXES = (
+    'explib/_parts/',
+    'explib/confirmation/',
+)
+DESIGN_PROTOCOL_ANALYSIS_FILES = (
+    'explib/__init__.py',
+    '_split_loader.py',
+    'exp_lib.py',
+)
+DESIGN_PROTOCOL_IMPLEMENTATION_POLICY = {
+    'version': 1,
+    'analysis_prefixes': DESIGN_PROTOCOL_ANALYSIS_PREFIXES,
+    'analysis_files': DESIGN_PROTOCOL_ANALYSIS_FILES,
+    'rule': (
+        'confirmatory: the protocol must bind a digest of the analysis '
+        'closure and the code-semantics stamp; a changed analysis closure is '
+        'a new registration, not an edit.  exploratory/draft: a missing '
+        'binding is a warning because it cannot support a confirmatory claim.'),
+    'whole_tree_rule': (
+        'the whole measurement source-tree digest is recorded as provenance; '
+        'drift outside the analysis closure is a warning, because a different '
+        'panel driver or draft manifest does not implement this endpoint.'),
+    'boundary': (
+        'a digest makes code drift visible; it is not a signature and cannot '
+        'stop someone who rewrites both the code and the registration.  The '
+        'registered analysis is still the one that must be reported.'),
+}
+
 
 def _dp_sha_text(text):
     return hashlib.sha256(str(text).encode('utf-8')).hexdigest()
@@ -78,6 +121,240 @@ def _dp_canonical(obj):
 
 def _dp_sha_obj(obj):
     return _dp_sha_text(_dp_canonical(obj))
+
+
+def _dp_sha256_text(value):
+    """Return a lower-case SHA-256 hex digest, or ``None`` when malformed."""
+    text = _dp_text(value)
+    if text is None:
+        return None
+    text = text.lower()
+    if len(text) != 64 or any(ch not in '0123456789abcdef' for ch in text):
+        return None
+    return text
+
+
+def _dp_analysis_relpaths(files):
+    """Select the analysis closure from a source-tree file map.
+
+    The selection is deliberately a whitelist, not "whatever changed": an
+    unrelated exploratory driver or the dynamic draft may be edited while a
+    fixed-chunk study is pending, and that must not look like a change to the
+    endpoint that computes the frozen decision.
+    """
+    if not isinstance(files, dict):
+        return []
+    out = []
+    for rel in files:
+        if not isinstance(rel, str):
+            continue
+        if rel in DESIGN_PROTOCOL_ANALYSIS_FILES:
+            out.append(rel)
+        elif any(rel.startswith(p) for p in DESIGN_PROTOCOL_ANALYSIS_PREFIXES):
+            out.append(rel)
+    return sorted(set(out))
+
+
+def _dp_subset_source_sha(files, relpaths):
+    """Recompute the source-tree digest over a declared subset of files.
+
+    Uses the same ``relpath NUL bytes NUL sha256 LF`` construction as
+    ``source_tree_manifest`` so the subset digest has exactly the meaning of
+    the full-tree digest, just over a narrower, declared scope.
+    """
+    if not isinstance(files, dict) or not relpaths:
+        return None
+    rows = []
+    for rel in sorted(set(relpaths)):
+        entry = files.get(rel)
+        if not isinstance(entry, dict):
+            return None
+        digest = _dp_sha256_text(entry.get('sha256'))
+        size = _dp_int(entry.get('bytes'), minimum=0)
+        if digest is None or size is None:
+            return None
+        rows.append(f'{rel}\0{size}\0{digest}\n')
+    return _dp_sha_text(''.join(rows))
+
+
+def _dp_implementation_binding(source_tree=None):
+    """Copy the executable-analysis identity into the design protocol.
+
+    ``source_tree`` is the output of ``source_tree_manifest``.  Injecting it
+    makes the timing/conformance tests deterministic;
+    production callers omit it and the current tree is hashed.  Missing or
+    partial input returns ``None``: the validator then reports a missing
+    binding instead of the builder inventing a convenient digest.
+    """
+    if source_tree is None:
+        manifest = globals().get('source_tree_manifest')
+        if not callable(manifest):
+            return None
+        try:
+            source_tree = manifest()
+        except Exception:
+            return None
+    if not isinstance(source_tree, dict):
+        return None
+    files = source_tree.get('files')
+    relpaths = _dp_analysis_relpaths(files)
+    analysis_sha = _dp_subset_source_sha(files, relpaths)
+    if analysis_sha is None:
+        return None
+    registry = source_tree.get('split_registry')
+    registry = registry if isinstance(registry, dict) else None
+    unreadable = source_tree.get('unreadable')
+    return {
+        'code_semantics': _dp_text(CODE_SEMANTICS),  # noqa: F821
+        'analysis_source_algorithm': _dp_text(source_tree.get('algorithm')),
+        'analysis_source_sha256': analysis_sha,
+        'analysis_n_files': len(relpaths),
+        'analysis_prefixes': list(DESIGN_PROTOCOL_ANALYSIS_PREFIXES),
+        'analysis_files': list(DESIGN_PROTOCOL_ANALYSIS_FILES),
+        'full_source_tree_sha256': _dp_sha256_text(source_tree.get('sha256')),
+        'full_source_tree_n_files': _dp_int(source_tree.get('n_files'),
+                                           minimum=0),
+        'split_registry_sha256': (_dp_sha256_text(registry.get('sha256'))
+                                  if registry else None),
+        'split_registry_status': (_dp_text(registry.get('status'))
+                                  if registry else None),
+        'split_registry_n_parts': (_dp_int(registry.get('n_parts'),
+                                          minimum=0) if registry else None),
+        'source_unreadable': list(unreadable) if isinstance(
+            unreadable, list) else [],
+        'scope': ('core measurement library + confirmation endpoint driver + '
+                  'loader/import shim; the whole-tree digest is provenance, '
+                  'not part of the hard invalidation rule'),
+        'policy': dict(DESIGN_PROTOCOL_IMPLEMENTATION_POLICY),
+    }
+
+
+def _dp_implementation_audit(protocol, *, source_tree=None):
+    """Compare a registered analysis closure with the current tree.
+
+    Returns a compact block with both digests, the exact problems and the
+    whole-tree warnings kept separate.  A missing registration is a hard
+    problem for a confirmatory protocol and a warning otherwise; a missing
+    current tree is ``not_verifiable`` rather than a pass.
+    """
+    out = {'kind': 'design_protocol_implementation',
+           'status': 'not_verifiable',
+           'registered': None, 'current': None,
+           'problems': [], 'warnings': []}
+    analysis = protocol.get('analysis') if isinstance(
+        protocol.get('analysis'), dict) else {}
+    registered = analysis.get('implementation')
+    if not isinstance(registered, dict):
+        out['status'] = 'missing'
+        out['warnings'].append(
+            'analysis.implementation is not registered; the protocol binds '
+            'the design declarations but not the code that computes them')
+        return out
+    out['registered'] = {
+        'code_semantics': registered.get('code_semantics'),
+        'analysis_source_sha256': registered.get('analysis_source_sha256'),
+        'analysis_n_files': registered.get('analysis_n_files'),
+        'full_source_tree_sha256': registered.get('full_source_tree_sha256'),
+        'split_registry_sha256': registered.get('split_registry_sha256'),
+    }
+    if _dp_sha256_text(registered.get('analysis_source_sha256')) is None:
+        out['problems'].append(
+            'analysis.implementation.analysis_source_sha256 is missing or not '
+            'a 64-character SHA-256 digest')
+    if _dp_sha256_text(registered.get('full_source_tree_sha256')) is None:
+        out['problems'].append(
+            'analysis.implementation.full_source_tree_sha256 is missing or '
+            'not a 64-character SHA-256 digest')
+    if _dp_int(registered.get('analysis_n_files'), minimum=1) is None:
+        out['problems'].append(
+            'analysis.implementation.analysis_n_files must be an integer >= 1')
+    code_semantics = _dp_text(analysis.get('code_semantics'))
+    if (code_semantics is not None
+            and _dp_text(registered.get('code_semantics')) != code_semantics):
+        out['problems'].append(
+            'analysis.implementation.code_semantics does not equal '
+            'analysis.code_semantics')
+    status = _dp_text(registered.get('split_registry_status'))
+    if status is None:
+        out['warnings'].append(
+            'analysis.implementation does not record the split-registry '
+            'status; executed-fragment order cannot be checked')
+    elif status != 'ok':
+        out['warnings'].append(
+            f'analysis.implementation.split_registry_status={status!r}; '
+            'the executed analysis fragments were not fully registered')
+    unreadable = registered.get('source_unreadable')
+    if isinstance(unreadable, list) and unreadable:
+        out['problems'].append(
+            f'analysis.implementation.source_unreadable is non-empty '
+            f'({len(unreadable)} file(s)); the analysis closure is incomplete')
+    if source_tree is None:
+        manifest = globals().get('source_tree_manifest')
+        if callable(manifest):
+            try:
+                source_tree = manifest()
+            except Exception as exc:
+                out['warnings'].append(
+                    'the current analysis tree could not be hashed: '
+                    f'{type(exc).__name__}: {exc}')
+                source_tree = None
+    if not isinstance(source_tree, dict):
+        out['warnings'].append(
+            'no current source-tree identity was supplied; implementation '
+            'drift cannot be checked')
+        out['status'] = 'fail' if out['problems'] else 'not_verifiable'
+        return out
+    current_files = source_tree.get('files')
+    current_relpaths = _dp_analysis_relpaths(current_files)
+    current_sha = _dp_subset_source_sha(current_files, current_relpaths)
+    out['current'] = {
+        'code_semantics': _dp_text(CODE_SEMANTICS),  # noqa: F821
+        'analysis_source_sha256': current_sha,
+        'analysis_n_files': len(current_relpaths),
+        'full_source_tree_sha256': _dp_sha256_text(
+            source_tree.get('sha256')),
+        'split_registry_sha256': (
+            _dp_sha256_text((source_tree.get('split_registry') or {}).get(
+                'sha256'))
+            if isinstance(source_tree.get('split_registry'), dict) else None),
+    }
+    if current_sha is None:
+        out['problems'].append(
+            'the current analysis closure could not be hashed (the source '
+            'tree is partial or malformed)')
+    elif current_sha != _dp_sha256_text(
+            registered.get('analysis_source_sha256')):
+        out['problems'].append(
+            'analysis implementation changed after registration: the '
+            'analysis-closure digest no longer matches.  A code change is a '
+            'design change; register a revision with a reason instead of '
+            'editing the implementation under the old protocol')
+    registered_full = _dp_sha256_text(
+        registered.get('full_source_tree_sha256'))
+    current_full = _dp_sha256_text(source_tree.get('sha256'))
+    if (registered_full is not None and current_full is not None
+            and registered_full != current_full and not out['problems']):
+        out['warnings'].append(
+            'measurement source outside the analysis closure changed after '
+            'registration; the endpoint implementation is unchanged, but '
+            'review whether the change affects the study')
+    registered_reg = _dp_sha256_text(registered.get('split_registry_sha256'))
+    current_registry = source_tree.get('split_registry')
+    current_reg = (_dp_sha256_text(current_registry.get('sha256'))
+                   if isinstance(current_registry, dict) else None)
+    if (registered_reg is not None and current_reg is not None
+            and registered_reg != current_reg and not out['problems']):
+        out['warnings'].append(
+            'split-package registration changed after the protocol was '
+            'written; no analysis-closure file changed, but the executed '
+            'order of another panel is now different')
+    if out['problems']:
+        out['status'] = 'fail'
+    elif out['warnings']:
+        out['status'] = 'warnings'
+    else:
+        out['status'] = 'ok'
+    return out
 
 
 def _dp_is_number(value):
@@ -425,17 +702,23 @@ def build_design_protocol(
         manifest, *, level=None, study_name=None, run_order=None,
         disposition=None, test_access=None, resource_budget=None,
         disjoint_declared=None, extras=None, created_at=None, revision=0,
-        supersedes=None, reason=None):
+        supersedes=None, reason=None, source_tree=None):
     """Compile one canonical protocol from the existing declarations.
 
     This does not create new scientific commitments: every value is copied
     from the manifest, the run-order plan, the disposition policy or the
     held-out access policy.  Missing inputs stay missing; the validation gate
     then reports them instead of filling in a convenient default.
+
+    ``source_tree`` is the ``source_tree_manifest`` of the measurement tree.
+    It is captured so the protocol binds the analysis closure that will
+    compute the endpoint, not only the prose around it.  Production callers
+    omit it and the current checkout is hashed; tests inject a fixture.
     """
     if not isinstance(manifest, dict):
         raise TypeError('manifest must be an object')
     level = _dp_level(manifest, level)
+    implementation = _dp_implementation_binding(source_tree)
     stats = manifest.get('statistics')
     stats = stats if isinstance(stats, dict) else {}
     comps = []
@@ -569,6 +852,7 @@ def build_design_protocol(
             'endpoint_rule': 'pre_registered_primary_then_descriptive_by_length',
             'missing_data_policy': 'report_as_is_no_topup_no_imputation',
             'decision_rule': _dp_text(stats.get('decision_rule')),
+            'implementation': implementation,
             'source': 'manifest.statistics',
         },
         'data': {
@@ -941,6 +1225,56 @@ def validate_design_protocol(protocol, *, require_complete=None):
     need(_dp_text(an.get('missing_data_policy')) is not None,
          'analysis.missing_data_policy is missing',
          missing='analysis.missing_data_policy')
+    impl = an.get('implementation')
+    if not isinstance(impl, dict):
+        need(False, 'analysis.implementation is missing: the protocol does '
+                    'not bind the code that computes the endpoint',
+             missing='analysis.implementation')
+    else:
+        _impl_sha = _dp_sha256_text(impl.get('analysis_source_sha256'))
+        if _impl_sha is None:
+            need(False, 'analysis.implementation.analysis_source_sha256 must '
+                        'be a 64-character SHA-256 digest',
+                 missing='analysis.implementation.analysis_source_sha256')
+        _impl_full = _dp_sha256_text(impl.get('full_source_tree_sha256'))
+        if _impl_full is None:
+            need(False, 'analysis.implementation.full_source_tree_sha256 must '
+                        'be a 64-character SHA-256 digest',
+                 missing='analysis.implementation.full_source_tree_sha256')
+        _impl_n = _dp_int(impl.get('analysis_n_files'), minimum=1)
+        if _impl_n is None:
+            need(False, 'analysis.implementation.analysis_n_files must be an '
+                        'integer >= 1',
+                 missing='analysis.implementation.analysis_n_files')
+        _impl_code = _dp_text(impl.get('code_semantics'))
+        if _impl_code is None:
+            need(False, 'analysis.implementation.code_semantics is missing',
+                 missing='analysis.implementation.code_semantics')
+        elif (_dp_text(an.get('code_semantics')) is not None
+              and _impl_code != _dp_text(an.get('code_semantics'))):
+            _dp_problem(out, 'analysis.implementation.code_semantics does not '
+                             'equal analysis.code_semantics')
+        _reg_status = _dp_text(impl.get('split_registry_status'))
+        if _reg_status is None:
+            _dp_warn(out, 'analysis.implementation does not record the '
+                          'split-registry status; executed-fragment order '
+                          'cannot be checked')
+        elif _reg_status != 'ok':
+            _dp_warn(out, f'analysis.implementation.split_registry_status='
+                          f'{_reg_status!r}; the executed analysis fragments '
+                          'were not fully registered')
+        _impl_unreadable = impl.get('source_unreadable')
+        if isinstance(_impl_unreadable, list) and _impl_unreadable:
+            _dp_problem(out, f'analysis.implementation.source_unreadable is '
+                             f'non-empty ({len(_impl_unreadable)} file(s)); '
+                             'the analysis closure is incomplete')
+        for _key in ('analysis_prefixes', 'analysis_files'):
+            _val = impl.get(_key)
+            if _val is not None and (not isinstance(_val, list)
+                                     or not all(isinstance(x, str)
+                                                and x for x in _val)):
+                _dp_problem(out, f'analysis.implementation.{_key} must be a '
+                                 'list of non-empty strings')
 
     # ---- data --------------------------------------------------------------
     data = protocol.get('data')
@@ -1063,10 +1397,17 @@ def validate_design_protocol(protocol, *, require_complete=None):
     return out
 
 
-def design_protocol_conformance(protocol, manifest):
-    """Check that the registration describes the manifest being run."""
+def design_protocol_conformance(protocol, manifest, source_tree=None):
+    """Check that the registration describes the manifest being run.
+
+    ``source_tree`` is injectable so an audit can replay a recorded tree; when
+    omitted, the current checkout is hashed.  The analysis-closure digest is a
+    hard invalidation.  Whole-tree drift outside that closure is a warning:
+    another panel or the dynamic draft may legitimately change while a
+    fixed-chunk registration is pending.
+    """
     out = {'kind': 'design_protocol_conformance', 'status': 'ok',
-           'problems': [], 'warnings': []}
+           'problems': [], 'warnings': [], 'implementation': None}
     if not isinstance(protocol, dict) or not isinstance(manifest, dict):
         out['status'] = 'fail'
         out['problems'].append('protocol and manifest must be objects')
@@ -1171,6 +1512,25 @@ def design_protocol_conformance(protocol, manifest):
                 if p_disp.get(key) != m_pol.get(key):
                     out['problems'].append(
                         f'operations.disposition.{key}={p_disp.get(key)!r} != manifest {m_pol.get(key)!r}')
+    # The design is only pre-registered if the implementation that computes
+    # the declared endpoint is part of the registration.  A manifest match
+    # with a changed analysis closure is exactly the post-registration drift
+    # this gate exists to catch.
+    impl = _dp_implementation_audit(protocol, source_tree=source_tree)
+    out['implementation'] = impl
+    level = _dp_text(study.get('level'))
+    if impl.get('status') == 'missing':
+        if level in DESIGN_PROTOCOL_POLICY['strict_levels']:
+            out['problems'].append(
+                'analysis.implementation is missing: a confirmatory '
+                'registration must bind the analysis closure')
+        else:
+            out['warnings'].append(
+                'analysis.implementation is missing: the design is not bound '
+                'to the executable analysis')
+    else:
+        out['problems'].extend(impl.get('problems') or [])
+        out['warnings'].extend(impl.get('warnings') or [])
     if out['problems']:
         out['status'] = 'fail'
     elif out['warnings']:
@@ -1325,13 +1685,14 @@ def _dp_read_events(events=None, panel_dirs=None):
 
 def design_protocol_audit(path=None, manifest_path=None, events=None,
                           panel_dirs=None, require_complete=None,
-                          verbose=False):
+                          verbose=False, source_tree=None):
     """Audit one registered design protocol against the manifest and history.
 
     The gate fails closed on a tampered body, a manifest mismatch, a
-    confirmatory protocol that lacks a design decision, or a protocol written
-    after the first event.  An absent protocol is ``not_verifiable_locally``
-    (with the required sections and a compile hint), not a green pass.
+    confirmatory protocol that lacks a design decision, a changed analysis
+    closure, or a protocol written after the first event.  An absent protocol
+    is ``not_verifiable_locally`` (with the required sections and a compile
+    hint), not a green pass.
     """
     root = globals().get('_REPO') or os.getcwd()
     candidates = []
@@ -1352,6 +1713,7 @@ def design_protocol_audit(path=None, manifest_path=None, events=None,
            'candidates': [str(p) for p in candidates],
            'manifest_path': manifest_path,
            'validation': None, 'conformance': None, 'timing': None,
+           'implementation': None,
            'problems': [], 'warnings': []}
     if chosen is None:
         out['required_sections'] = list(DESIGN_PROTOCOL_SECTIONS)
@@ -1390,8 +1752,10 @@ def design_protocol_audit(path=None, manifest_path=None, events=None,
         except Exception as exc:
             out['warnings'].append(f'manifest is unreadable ({type(exc).__name__}: {exc}); conformance not checked')
         else:
-            conf = design_protocol_conformance(protocol, manifest)
+            conf = design_protocol_conformance(protocol, manifest,
+                                               source_tree=source_tree)
             out['conformance'] = conf
+            out['implementation'] = conf.get('implementation')
             if conf['status'] == 'fail':
                 out['problems'].extend(f'conformance: {x}' for x in conf['problems'])
             out['warnings'].extend(f'conformance: {x}' for x in conf['warnings'])
@@ -1491,6 +1855,7 @@ def design_protocol_preflight_summary(path=None, manifest_path=None):
         'n_warnings': len(rep.get('warnings') or []),
         'timing': (rep.get('timing') or {}).get('status'),
         'conformance': (rep.get('conformance') or {}).get('status'),
+        'implementation': (rep.get('implementation') or {}).get('status'),
         'problems': list(rep.get('problems') or [])[:12],
         'warnings': list(rep.get('warnings') or [])[:12],
     }

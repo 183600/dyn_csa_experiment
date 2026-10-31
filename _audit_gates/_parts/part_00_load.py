@@ -289,11 +289,14 @@
                别名：allocation / environment_balance
   design_protocol  前瞻设计登记：一份 content-hash 绑定的 design_protocol.json
                必须把问题/端点、臂/对照、种子/功效、随机化/分配、停止规则、
-               分析族、数据切分与失败处置绑成同一份事前登记；缺任一项
+               分析族、数据切分与失败处置绑成同一份事前登记；并且必须绑定
+               实际计算端点的 analysis closure（explib/_parts +
+               explib/confirmation + loader），清单不变而分析代码改变即
+               conformance fail；闭包外源码漂移只 warning。缺任一项
                confirmatory 判 fail，登记晚于首条事件判 reconstruction，正文
                被改判 fail，缺文件报 not_verifiable。它不新增检验/p 值/Holm
                槽位，也不改冻结判定（零 GPU；别名 protocol / protocol_gate /
-               design_registration）
+               design_registration / analysis_binding）
   evaluation_order  最终测试评估顺序 / 测量时间混杂：检查 P5T 在读取 test
                前写下的 clean_by_length_order.json / distractor_probe_order.json
                是否为完整区组、位置平衡、覆盖全部 (arm, seed)，并复核

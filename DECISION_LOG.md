@@ -6158,3 +6158,53 @@ gate/CLI/`report`/`design_preflight` 接线存在且不新增 p/Holm/verdict
   code_changed/unverified/legacy 三态；冻结锁在注册摘要改变而文件摘要
   仍相同时拒绝；审计门的 ok/fail/not_verifiable 与 CLI；归档 verify 从打包字节
   独立重算并拒绝篡改摘要/片段计数。完整 CPU 套件在本轮最终树通过。
+
+## 2026-10-31 — 登记的是设计，不是执行体：分析闭包绑定（本轮实验设计与准备硬化，no new runs）
+
+零 GPU；不新增训练、不读取 test split、不修改
+`confirmation_frozen*.json` 的字节/种子/端点/α/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未删除、未修改、未移动。
+
+**Problem.** §127 的 `design_protocol` 已经把声明绑成一份有
+`content_sha256` 的事前登记，§128 又把 `_PARTS` 的执行顺序独立成
+registry；但两者都允许「清单与声明一字未动，计算端点的代码已经换了」。
+冻结锁只在首次 test 读取时绑定源码树，因此「登记之后、首次 test 读取
+之前」改分析实现，timing、manifest hash、protocol body hash 全部通过。
+这是 pre-registration 的实质缺口：登记的是一段设计文字，不是实际会
+执行的分析。
+
+**Fix.** `build_design_protocol` 在 `analysis` 下新增
+`implementation`，默认从 `source_tree_manifest()` 读取分析闭包并记录：
+
+- `analysis_source_sha256`：`explib/_parts/` +
+  `explib/confirmation/` + `explib/__init__.py` + `_split_loader.py` +
+  `exp_lib.py` 的子集摘要，复用
+  `relpath NUL bytes NUL sha256 LF` 构造，是硬失效判据；
+- `full_source_tree_sha256`：整棵测量源码树身份，作为 provenance；
+- `split_registry_sha256/status/n_parts`、`code_semantics`、
+  `analysis_n_files`、`source_unreadable`、`scope`/`policy`。
+
+`validate_design_protocol` 在 confirmatory 下要求绑定存在且摘要/文件数/
+代码语义合法，缺绑定判 fail，draft 只告警；`design_protocol_conformance`
+重算闭包摘要，闭包改变判 fail（即使清单相同），闭包外整树/registry
+漂移只 warning，避免其他 panel 或动态草稿的合法改动误伤 fixed-chunk
+登记。`design_protocol_audit` 输出 `implementation` 块；
+`design_protocol_preflight_summary` 带上其状态；CLI 增加
+`analysis_binding` / `design_implementation` 别名，`make protocol` 仍
+是零 GPU 入口。
+
+**Boundary.** 不是新的显著性检验：不产生 p/Holm、不改变
+`verified`/`confirmed`、不重算 PPL、不进入训练/resume/RNG。不是冻结锁
+的替代：冻结锁绑定首次 test 读取时的 test 切片/训练指纹/完整源码树，
+本块绑定登记时的分析闭包，二者是不同时间点。不是签名，不抗同时改写
+代码与重新登记的恶意；闭包外 helper 若被端点调用不会被硬绑定，要求
+新增分析依赖时同步更新闭包范围。不读 test、不新增训练。
+
+**Verification.** 新增 `test_review_part_71.py` 9 项：闭包摘要的
+范围/文件数/整树与 registry 字段；confirmatory 缺绑定 fail、draft
+告警；闭包内文件与 `_PARTS` 改变会改变摘要、闭包外不会；同一清单下
+闭包漂移 conformance fail、闭包外漂移 warning；实现代码语义必须与
+analysis section 一致；非法摘要/零文件数/不可读文件 fail；身份哈希
+覆盖 implementation 而不覆盖 `created_at`；audit 注入闭包漂移时 fail
+且输出 implementation，不产生 p/Holm/verdict 字段；preflight summary
+带 implementation 状态。完整 CPU 套件在本轮最终树通过。
