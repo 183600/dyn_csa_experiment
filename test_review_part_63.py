@@ -157,6 +157,11 @@ def test_document_unit_audit_records_truncated_article_scan():
         assert scan['n_scanned'] == 1 and scan['coverage'] == 0.5, scan
         assert rec['article_leakage']['status'] == 'not_verifiable_locally', rec
         assert any('truncated' in p for p in rec['article_leakage']['problems']), rec
+        # A clean test-article result against only a sample of the references
+        # is not a full-corpus proof either.
+        assert rec['test_article_leakage']['status'] == 'not_verifiable_locally', rec
+        assert any('reference scan is truncated' in p for p in
+                   rec['test_article_leakage']['problems']), rec
     finally:
         shutil.rmtree(td, ignore_errors=True)
 
@@ -176,3 +181,131 @@ def test_article_leakage_scan_does_not_fail_a_clean_article():
         reference_line_hashes={'train': {1, 2, 3}})
     assert scan['status'] != 'fail' and not scan['matches'], scan
     assert scan['test_articles_scanned'] == 1, scan
+
+
+def test_article_leakage_scan_index_matches_exhaustive_lookup():
+    """The indexed lookup must return the same reference and kind as the old
+    exhaustive O(test*reference) scan, including the first-split/first-entry
+    tie order and the fallback when an override makes LSH incomplete."""
+    import random as _random
+
+    rng = _random.Random(1234)
+    vocab = ['w%02d' % i for i in range(120)]
+
+    def _text(tag, n_words=40):
+        return (' = %s = \n' % tag) + ' '.join(
+            rng.choice(vocab) for _ in range(n_words))
+
+    references = {'train': [], 'validation': []}
+    for _i in range(30):
+        _t = _text('train_%d' % _i)
+        references['train'].append((' = train_%d = ' % _i, _t))
+    for _i in range(20):
+        _t = _text('validation_%d' % _i)
+        references['validation'].append((' = validation_%d = ' % _i, _t))
+    # Put one exact and one near copy in both splits so split order matters.
+    references['validation'].append(references['train'][0])
+    _near_ref = (' = validation_near = ', references['train'][1][1])
+    references['validation'].append(_near_ref)
+
+    units = []
+    units.append({
+        'title': ' = exact_train = ', 'text': references['train'][0][1],
+        'line_ids': [1], 'n_lines': 2,
+        'n_words': A._article_word_count(references['train'][0][1]),
+        'has_heading': True, 'truncated': False,
+    })
+    units.append({
+        'title': ' = near_train = ', 'text': references['train'][1][1],
+        'line_ids': [2], 'n_lines': 2,
+        'n_words': A._article_word_count(references['train'][1][1]),
+        'has_heading': True, 'truncated': False,
+    })
+    units.append({
+        'title': ' = exact_validation = ',
+        'text': references['validation'][0][1],
+        'line_ids': [3], 'n_lines': 2,
+        'n_words': A._article_word_count(references['validation'][0][1]),
+        'has_heading': True, 'truncated': False,
+    })
+    units.append({
+        'title': ' = clean = ', 'text': _text('clean'),
+        'line_ids': [4], 'n_lines': 2,
+        'n_words': A._article_word_count(_text('clean')),
+        'has_heading': True, 'truncated': False,
+    })
+
+    def _brute(threshold):
+        """Reference implementation of the pre-index scan."""
+        _refs = {}
+        for _split, _items in references.items():
+            _entries = []
+            for _title, _text in _items:
+                if not _text:
+                    continue
+                _nw = A._article_word_count(_text)
+                if _nw < 20:
+                    continue
+                _entries.append({
+                    'title': str(_title),
+                    'text_hash': L._doc_exact_fp(_text),
+                    'simhash': int(L._doc_simhash(_text)),
+                })
+            _refs[_split] = _entries
+        _matches = []
+        for _art in units:
+            _text = _art['text']
+            _h = int(L._doc_simhash(_text))
+            _text_hash = L._doc_exact_fp(_text)
+            _found = False
+            for _split, _entries in _refs.items():
+                for _e in _entries:
+                    if _e['text_hash'] == _text_hash:
+                        _matches.append(('exact', _split, _e['title'], 0))
+                        _found = True
+                        break
+                if _found:
+                    break
+                _best = None
+                for _e in _entries:
+                    _dist = int((_h ^ int(_e['simhash'])).bit_count())
+                    if _best is None or _dist < _best[0]:
+                        _best = (_dist, _e)
+                if _best is not None and _best[0] <= threshold:
+                    _matches.append(
+                        ('near', _split, _best[1]['title'], int(_best[0])))
+                    _found = True
+                    break
+        return _matches
+
+    for _threshold in (0, 1, 3, 4, 64):
+        scan = A._article_leakage_scan(
+            references, units, reference_line_hashes={'train': {}},
+            near_threshold=_threshold)
+        got = [(m['kind'], m['reference_split'], m['reference_title'],
+                int(m['hamming'])) for m in scan['matches']]
+        assert got == _brute(_threshold), (_threshold, got, _brute(_threshold))
+
+
+def test_document_unit_audit_records_unsegmented_raw_reference():
+    """A raw dump without top-level headings cannot certify test articles.
+
+    The per-cache block must say ``not_verifiable_locally`` rather than being
+    absent (absent reads like "not applicable" and leaves claims allowed).
+    """
+    td = tempfile.mkdtemp(prefix='articlerawbad_')
+    try:
+        info = _write_document_unit_fixture(td)
+        for name in ('wiki.train.raw', 'wiki.valid.raw'):
+            with open(os.path.join(info['raw'], name), 'w',
+                      encoding='utf-8') as fh:
+                fh.write('plain line without a heading\n')
+                fh.write('another plain line\n')
+        with contextlib.redirect_stdout(io.StringIO()):
+            rep = A.audit_document_unit(td, raw_dir=info['raw'])
+        rec = rep['caches'][os.path.abspath(td)]
+        assert rec['article_leakage']['status'] == 'not_verifiable_locally', rec
+        assert rec['test_article_leakage']['status'] == 'not_verifiable_locally', rec
+        assert rec['test_article_leakage']['problems'], rec
+    finally:
+        shutil.rmtree(td, ignore_errors=True)

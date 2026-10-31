@@ -5763,3 +5763,39 @@ served test cache 后端到端 fail，`max_articles=1` 记录
 `deterministic_even_spacing` / `truncated` / `coverage=0.5` 且
 `not_verifiable_locally`。干净文章不误报；完整 CPU 套件在本轮最终树通过（1246 passed,
 3 skipped）。
+
+## 2026-10-31 — held-out 文章扫描的规模与覆盖诚实（本轮 bug 修复，no new runs）
+
+**Bug 1（scale）。** §123 新增的 `_article_leakage_scan` 对每个
+line-invisible test 文章线性扫描全部 served train/validation 参照文章：
+WikiText-103 约 80 万参照文章、2 千 test 文章就是约 16 亿次 Python
+Hamming 比较，`audit_gates.py report` 默认调用 `audit_document_unit`
+时不可用；更大语料只会更差。该扫描还在确认 test 文章单元是否存在之前
+就先为 raw train/validation 的每一行建哈希集合，白做一次全量哈希。
+
+**Fix 1.** 按清洗协议同一几何预先建两类索引：exact text-hash 表，以及
+64-bit SimHash 的 4 带 LSH 桶；查询时只比较同桶候选，并用
+`(hamming, 首次出现位置)` 保持与旧全量扫描相同的 split/entry 选择顺序。
+`near_threshold >= bands` 或 band 不能整除 64 时（调用者覆盖默认协议）
+自动退回全量比较，保证不因索引漏掉 near copy。raw line 哈希集合改为只在
+test 文章单元可重建时才构建。
+
+**Bug 2（覆盖/接线）。** `max_articles` 截断 train/validation 参照集时，
+`rawrec` 会降为 `not_verifiable_locally`，但嵌套的
+`test_article_leakage.status` 仍可为 `ok`；raw dump 无法读取或没有顶层
+标题时，该嵌套块甚至完全缺席，读起来像「不适用」。二者都会让 per-cache
+记录比实际证据更强。
+
+**Fix 2.** 参照集被截断时，若 test scan 没有硬失败，则把
+`test_article_leakage.status` 降为 `not_verifiable_locally` 并记录原因；
+raw 读取失败/无法分段时也写入显式的 `test_article_leakage` 记录。
+不改 exact/near 的判定阈值、标题碰撞规则、`document_level_claims_allowed`
+的硬失败语义，不新增训练、不读 test raw、不改冻结清单、种子、alpha、
+Holm family、`CODE_SEMANTICS`；`.github/` 与所有 README 未删除、未修改、
+未移动。
+
+**Verification.** `test_review_part_63.py` 新增 2 项（共 8 项）：
+索引查询与旧全量实现在 threshold={0,1,3,4,64}、多 split/重复参照上逐项
+一致；截断参照时 `test_article_leakage` 也是
+`not_verifiable_locally`；raw dump 无顶层标题时该块存在并明确
+`not_verifiable_locally`。完整 CPU 套件 1248 passed / 3 skipped。

@@ -891,9 +891,27 @@ def _article_leakage_scan(reference_articles, test_articles, *,
     }
     refs = {}
     ref_titles = {}
+    # A scale-up corpus has millions of reference articles.  Comparing every
+    # test article with every reference is O(test * train) 64-bit hamming
+    # operations, which is not a usable audit on WikiText-103, let alone a
+    # larger corpus.  Build the same exact-hash map plus SimHash LSH bands the
+    # cleaning protocol uses, and query only the candidate buckets.  The LSH
+    # guarantee (every pair within the threshold shares a whole band) needs
+    # ``threshold < bands`` and a band layout that covers all 64 bits; when a
+    # caller overrides either, fall back to the exhaustive scan so the result
+    # stays exact rather than silently missing a near copy.
+    _bands = int(L.DEDUP_PROTOCOL_DEFAULTS['bands'])
+    _use_lsh = (_bands > 0 and 0 <= threshold < _bands
+                and 64 % _bands == 0)
+    _band_bits = (64 // _bands) if _use_lsh else 0
+    _band_mask = ((1 << _band_bits) - 1) if _use_lsh else 0
+    _exact_by_split = {}
+    _flat = []
+    _buckets = {}
     for _split, _items in reference_articles.items():
         _entries = []
         _titles = set()
+        _exact = _exact_by_split.setdefault(_split, {})
         for _title, _text in _items:
             if not _text:
                 continue
@@ -901,12 +919,21 @@ def _article_leakage_scan(reference_articles, test_articles, *,
             _nw = _article_word_count(_text)
             if _nw < int(min_words):
                 continue
-            _entries.append({
+            _entry = {
                 'title': str(_title),
                 'text_hash': L._doc_exact_fp(_text),
                 'simhash': int(L._doc_simhash(_text)),
                 'n_words': int(_nw),
-            })
+            }
+            _entry_pos = int(len(_flat))
+            _flat.append((_split, _entry))
+            _exact.setdefault(_entry['text_hash'], _entry)
+            if _use_lsh:
+                _h = int(_entry['simhash'])
+                for _b in range(_bands):
+                    _key = (_b, (_h >> (_b * _band_bits)) & _band_mask)
+                    _buckets.setdefault(_key, []).append(_entry_pos)
+            _entries.append(_entry)
         refs[_split] = _entries
         ref_titles[_split] = _titles
         out['references'][_split] = {
@@ -942,31 +969,50 @@ def _article_leakage_scan(reference_articles, test_articles, *,
         _text = _art.get('text') or ''
         _h = int(L._doc_simhash(_text))
         _text_hash = L._doc_exact_fp(_text)
+        # Best near candidate per split; the split order determines which
+        # reference is reported, matching the historical exhaustive scan.
+        _near = {}
+        if _use_lsh:
+            _seen = set()
+            for _b in range(_bands):
+                _key = (_b, (_h >> (_b * _band_bits)) & _band_mask)
+                for _pos in _buckets.get(_key, ()):
+                    if _pos in _seen:
+                        continue
+                    _seen.add(_pos)
+                    _split, _e = _flat[_pos]
+                    _dist = int((_h ^ int(_e['simhash'])).bit_count())
+                    if _dist > threshold:
+                        continue
+                    _prev = _near.get(_split)
+                    if _prev is None or (_dist, _pos) < (_prev[0], _prev[1]):
+                        _near[_split] = (_dist, _pos, _e)
+        else:
+            for _split, _entries in refs.items():
+                for _pos, _e in enumerate(_entries):
+                    _dist = int((_h ^ int(_e['simhash'])).bit_count())
+                    _prev = _near.get(_split)
+                    if _prev is None or _dist < _prev[0]:
+                        _near[_split] = (_dist, _pos, _e)
         _found = False
-        for _split, _entries in refs.items():
-            for _e in _entries:
-                if _e['text_hash'] == _text_hash:
-                    out['matches'].append({
-                        'kind': 'exact', 'reference_split': _split,
-                        'test_title': _art.get('title'),
-                        'reference_title': _e['title'],
-                        'test_line_ids': list(_art.get('line_ids') or ()),
-                        'hamming': 0,
-                    })
-                    _found = True
-                    break
-            if _found:
+        for _split in refs:
+            _e = _exact_by_split.get(_split, {}).get(_text_hash)
+            if _e is not None:
+                out['matches'].append({
+                    'kind': 'exact', 'reference_split': _split,
+                    'test_title': _art.get('title'),
+                    'reference_title': _e['title'],
+                    'test_line_ids': list(_art.get('line_ids') or ()),
+                    'hamming': 0,
+                })
+                _found = True
                 break
-            _best = None
-            for _e in _entries:
-                _dist = int((_h ^ int(_e['simhash'])).bit_count())
-                if _best is None or _dist < _best[0]:
-                    _best = (_dist, _e)
+            _best = _near.get(_split)
             if _best is not None and _best[0] <= threshold:
                 out['matches'].append({
                     'kind': 'near', 'reference_split': _split,
                     'test_title': _art.get('title'),
-                    'reference_title': _best[1]['title'],
+                    'reference_title': _best[2]['title'],
                     'test_line_ids': list(_art.get('line_ids') or ()),
                     'hamming': int(_best[0]),
                 })
@@ -1396,12 +1442,30 @@ def audit_document_unit(cache_dir=None, *, seq_len=None, raw_dir=None,
         except Exception as e:
             rawrec['status'] = 'not_verifiable_locally'
             rawrec['problems'].append(f'raw dump unreadable ({type(e).__name__}: {e})')
+            terec = {
+                'status': 'not_verifiable_locally',
+                'problems': [
+                    'the raw train/validation dumps are unreadable, so the '
+                    'served test articles have no line-index reference to '
+                    'compare against'],
+                'warnings': [],
+            }
+            rec['test_article_leakage'] = terec
         else:
             if not (_tr_g.get('valid') and _va_g.get('valid')):
                 rawrec['status'] = 'not_verifiable_locally'
                 rawrec['problems'].append(
                     'raw dumps are not segmented by top-level headings; '
                     'article-level leakage is unverifiable')
+                terec = {
+                    'status': 'not_verifiable_locally',
+                    'problems': [
+                        'the raw train/validation dumps cannot be segmented '
+                        'into articles, so the served test articles have no '
+                        'article-level reference to compare against'],
+                    'warnings': [],
+                }
+                rec['test_article_leakage'] = terec
             else:
                 rawrec.update({
                     'raw_train_lines': int(_tr_g['n_nonempty_rows']),
@@ -1520,16 +1584,6 @@ def audit_document_unit(cache_dir=None, *, seq_len=None, raw_dir=None,
                 # A unit whose lines all miss the raw line index but whose
                 # whole article matches is exactly the leak that line-level
                 # dedup cannot detect.
-                _tr_line_hashes = {
-                    int(L._doc_id_u64(L._doc_exact_fp(_r)))
-                    for _r in _tr_rows
-                    if isinstance(_r, str) and _r.strip()
-                }
-                _va_line_hashes = {
-                    int(L._doc_id_u64(L._doc_exact_fp(_r)))
-                    for _r in _va_rows
-                    if isinstance(_r, str) and _r.strip()
-                }
                 terec = {'status': 'ok', 'problems': [], 'warnings': []}
                 rec['test_article_leakage'] = terec
                 if _test_article_units is None:
@@ -1542,6 +1596,19 @@ def audit_document_unit(cache_dir=None, *, seq_len=None, raw_dir=None,
                         'wiki.test.raw')
                     _warn('test article leakage: ' + terec['problems'][-1])
                 else:
+                    # The sets are only needed when test units exist; building
+                    # them first would hash every raw train/validation line on
+                    # a scale-up dump even when the scan cannot run.
+                    _tr_line_hashes = {
+                        int(L._doc_id_u64(L._doc_exact_fp(_r)))
+                        for _r in _tr_rows
+                        if isinstance(_r, str) and _r.strip()
+                    }
+                    _va_line_hashes = {
+                        int(L._doc_id_u64(L._doc_exact_fp(_r)))
+                        for _r in _va_rows
+                        if isinstance(_r, str) and _r.strip()
+                    }
                     try:
                         _test_scan = _article_leakage_scan(
                             {'train': _tr_served,
@@ -1571,6 +1638,18 @@ def audit_document_unit(cache_dir=None, *, seq_len=None, raw_dir=None,
                             terec['status'] = 'not_verifiable_locally'
                             _warn('test article leakage: ' + '; '.join(
                                 _test_scan.get('problems') or []))
+                    if ((_tr_scan.get('truncated')
+                         or _va_scan.get('truncated'))
+                            and terec.get('status') != 'fail'):
+                        # The test scan is only as complete as the reference
+                        # sample it was given.  A clean result against a
+                        # truncated train/validation sample must not be
+                        # reported as a clean per-cache test-article record.
+                        terec['status'] = 'not_verifiable_locally'
+                        terec.setdefault('problems', []).append(
+                            'the train/validation reference scan is truncated, '
+                            'so the clean test-article result is not a full-'
+                            'corpus proof; pass max_articles=None')
                 if rawrec['problems']:
                     # A truncated scan is not the same claim as a clean sample:
                     # keep the explicit not_verifiable status instead of
