@@ -12257,3 +12257,110 @@ ok、磁盘 plan 漂移与正文篡改分别 fail、缺文件 not_verifiable；w
 `audit_gates.py single_factor` 的 `lesion` 块为 ok；`build_models=False`
 不构造模型；把 `LESION_DESIGN` 换成带第二因素的声明后总门与 `lesion`
 块同时 fail。完整 CPU 套件在本轮最终树通过。
+
+## 132. 清洗协议不是唯一可能的数据集：清洗规格曲线与行序敏感性（本轮数据方法硬化，no new runs）
+
+零 GPU；不新增训练、不读取 test split、不修改
+`confirmation_frozen*.json` 的字节/种子/端点/α/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未删除、未修改、未移动。
+
+### 132.1 问题：协议可复现，不等于数据对清洗选择稳健
+
+§82 把 exact/SimHash 几何纳入缓存身份，§122 又证明「服务的文档集合 =
+记录协议 + 这批 raw rows 的确定性输出」。这两件事回答的是
+**recorded protocol 是否被实际执行**，不是
+**换一个同样合理的清洗选择，served corpus 会变多少**。
+
+近重复过滤是贪心且顺序相关的：一个 near-duplicate 簇里先出现的成员被
+保留，后出现的成员被删除并隔离；一旦 shingle 宽度、LSH band 数、Hamming
+阈值或 `max_shingles` 子采样改变，簇的边界和代表都可能改变；即使协议完全
+不变，只把两行原始数据的先后顺序对调，也可能让另一个代表进入训练流。于是
+同一篇论文的「数据」在不同清洗规格下并不是同一个集合，而当前报告只有
+一个协议、一个 membership，没有任何读数告诉读者这个集合有多依赖清洗
+决定。
+
+这不是统计功效或种子问题，不能靠增加训练种子修补：如果 held-out 比较
+的效应在清洗规格变化下方向/幅度不稳，结论就不是「模型差异」而是
+「模型 + 某个数据清洗选择」的联合效应。数据清洗本身是研究者自由度，
+必须像分析规格曲线一样被显式测量。
+
+### 132.2 方法：以记录协议为基线，重放邻近合法规格与行序
+
+新增 `explib/_parts/part_69_cleaning_sensitivity.py`：
+
+- `cleaning_sensitivity(train_rows, validation_rows, *, protocol, fit_rows,
+  train_scanned, validation_scanned, expected_*_doc_ids, ...)` 先在
+  **source order** 下重放记录协议，得到 baseline kept ids；再对每个变体
+  重放同一决策序列。`fit_rows` 之前的前缀在行序变体中保持固定，因为
+  改变 fit 前缀会同时改变 tokenizer，那是另一个阶段；
+- 协议变体只生成通过 `dedup_protocol_problems` 的近邻：strict/loose
+  Hamming 阈值（须 `threshold < bands`）、8-band 布局、shingle 宽度 4/8、
+  `max_shingles=256`。每个变体记录 `protocol_fp`；无法合法构造的轴明确
+  `skipped` 并给出原因，不静默丢弃；
+- 行序变体：`order_reverse` 加 `n_order_permutations` 个带 seed 的
+  permutation，作用于 fit 前缀之后的 train rows 和 validation rows；
+- 对每个变体报告 train/validation 的 kept 数、kept-set Jaccard、
+  retained/added fraction、count delta、exact/near removal 变化，并单独
+  记录 `kept_sequence_identical`：token 流是有序的，同一 kept 集合的
+  不同排列仍是不同的数据（也会改变固定 validation 前缀实际读到哪些
+  行）。汇总给出 `min_kept_jaccard` / `max_count_delta_fraction` /
+  `n_sequence_changed_variants` / `material_variants`。汇总同时区分
+  `membership_stable`（集合/计数阈值）与 `order_identical`（顺序完全
+  不变），避免把「集合稳定但顺序变了」误读成整体不变；
+- baseline 必须与 sidecar 的 served prefix 逐位一致（尾部允许 loader
+  chunk/cap 的多余 kept row）；不一致判 `fail`。`max_rows` 超限判
+  `not_verifiable`，不抽样冒充全量；显式 `max_rows=0` 表示关闭该门
+  （与 `cleaning_replay` 一致）；
+- exact-hash 与 doc id 只预计算一次，SimHash 按 `(split, shingle_words,
+  max_shingles)` 缓存；`_HashedDedup` 逐位复刻生产
+  `_DocDeduplicator` 的 exact 集合、LSH bucket 与 near-copy quarantine
+  语义。
+
+`audit_gates.py cleaning_sensitivity`（别名 `dedup_sensitivity` /
+`cleaning_specification` / `data_sensitivity` / `cleaning_curve`）读取
+cache meta、`wiki.train.raw`、`wiki.valid.raw` 与 doc-id sidecar；只打开
+train/validation，**不读 `wiki.test.raw`、不读 test cache**。缺完整协议、
+`tokenizer_fit_rows`、精确 scanned 行数、raw dump 或 sidecar 时明确
+`not_verifiable_locally`。`CSA_CLEANING_SENSITIVITY_IN_REPORT=1` 时才并入
+`audit_gates.py report` 顶层，因为完整曲线需要对每个变体重放清洗。
+
+### 132.3 判据与边界
+
+- `status=ok` 只表示所有已测变体的 kept Jaccard ≥ 0.95 且 kept 数变化
+  ≤ 1%；顺序变化不混入 membership material，而由 `order_identical` /
+  `fully_identical` 单独报告。`warnings` 表示至少一个变体越过 membership
+  阈值，应把清洗规格曲线与冻结 split 一起报告，不能把 served set 说成
+  「协议中立」；`fail` 仅用于 baseline 与缓存 sidecar/源行数矛盾；
+  `not_verifiable` 是缺输入。
+- 这是描述性数据口径：不产生 p 值、不进入 Holm、不改变
+  `verified`/`confirmed`、不重算 PPL、不改变 token/split/tokenizer/
+  训练/种子/端点/α/Holm 或冻结判定，也不 bump `CODE_SEMANTICS`。
+- 不证明某个清洗规格「更好」；它只测量记录规格附近的数据集变化幅度。
+  不重放 tokenization，不评价 near 删除是否应该发生；这些仍由
+  `dataset_source`、`cleaning_replay`、`data_processing` 与 release
+  manifest 分别承担。
+- 行序变体固定 fit 前缀，因此不测量「fit 前缀本身变化」对 tokenizer 的
+  影响；那是 tokenizer 规格敏感性问题，不在本门范围。协议变体的
+  `protocol_fp` 都通过同一 validator，但本门不是新的清洗协议注册。
+- 旧缓存缺协议/精确行数/sidecar 时不回填、不重跑、不推断；test split
+  的清洗规格敏感性不在本门内，避免消耗一次性 held-out 访问。
+
+### 132.4 验证
+
+```bash
+make data-sensitivity
+python audit_gates.py cleaning_sensitivity
+python audit_gates.py cleaning_sensitivity CACHE_DIR RAW_DIR
+CSA_CLEANING_SENSITIVITY_IN_REPORT=1 python audit_gates.py report
+```
+
+新增 `test_review_part_73.py` 11 项：`_HashedDedup` 在多种 band/
+threshold/shingle 几何下与生产 `_DocDeduplicator` 的 exact/near 决定和
+quarantine 计数逐项一致；baseline 与生产重放逐位一致；Hamming strict 轴改变 kept 数并被判 material；行序反转在 kept
+数不变时改变代表（count-only 检查看不见）；仅顺序变化（集合相同）由
+`sequence_changed` / `order_identical` 单独记录而不混入 membership
+material；fit 前缀不参与行序置换；同 seed
+结果确定；非法 protocol/参数/行类型、源行数或 sidecar 不符、`max_rows`
+门均 fail-closed；端到端 fixture 记录 `test_raw_read=false`、raw 同行数
+篡改判 fail、缺 raw/缺协议判 `not_verifiable`、缺或空的 sidecar 不冒充
+verified。完整 CPU 套件在本轮最终树通过。

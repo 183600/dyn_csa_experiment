@@ -7,7 +7,7 @@ PYTHON ?= python
 BUILD_DIR := .build
 INSTALL_DIR := $(BUILD_DIR)/install-check
 
-.PHONY: help test plan protocol preparation audit manipulation integrity env-check registry reproduce report-diff install-check build clean
+.PHONY: help test plan protocol preparation audit manipulation integrity env-check registry data-sensitivity reproduce report-diff install-check build clean
 
 help:
 	@echo "make test          # CPU unit/reproducibility suite (zero GPU)"
@@ -19,6 +19,7 @@ help:
 	@echo "make integrity     # verify stamped analysis bodies/inputs (zero GPU)"
 	@echo "make env-check     # local lock/OS stack vs recorded env_fp_v2 (zero GPU)"
 	@echo "make registry      # split-package _PARTS registration integrity (zero GPU)"
+	@echo "make data-sensitivity # cleaning-choice/order sensitivity of the cached corpus (zero GPU)"
 	@echo "make reproduce A=<dir> B=<dir>  # compare two independent runs (zero GPU)"
 	@echo "make report-diff A=<json> B=<json>  # compare two stamped reports (zero GPU)"
 	@echo "make install-check # verify the project builds/installs as a wheel"
@@ -51,6 +52,9 @@ env-check:
 
 registry:
 	$(PYTHON) audit_gates.py split_registry
+
+data-sensitivity:
+	$(PYTHON) audit_gates.py cleaning_sensitivity
 
 reproduce:
 	@test -n "$(A)" -a -n "$(B)" || { \

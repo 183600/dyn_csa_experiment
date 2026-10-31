@@ -2021,6 +2021,9 @@ def run_report(out='audit_report.json'):
     if str(os.environ.get('CSA_REPLAY_IN_REPORT', '')).strip().lower() in (
             '1', 'true', 'yes', 'on'):
         res['cleaning_replay'] = audit_cleaning_replay()
+    if str(os.environ.get('CSA_CLEANING_SENSITIVITY_IN_REPORT', '')
+           ).strip().lower() in ('1', 'true', 'yes', 'on'):
+        res['cleaning_sensitivity'] = audit_cleaning_sensitivity()
     # The aggregate verdict is part of the report body, so a reader (and the
     # CLI below) can act on one status instead of re-scanning every child
     # block.  Compute it BEFORE inserting it, so the status cannot depend on
@@ -2069,6 +2072,11 @@ def _run_cli():
                   'cleanup_replay': audit_cleaning_replay,
                   'dedup_replay': audit_cleaning_replay,
                   'replay_cleaning': audit_cleaning_replay})
+    _cmds.update({'cleaning_sensitivity': audit_cleaning_sensitivity,
+                  'dedup_sensitivity': audit_cleaning_sensitivity,
+                  'cleaning_specification': audit_cleaning_sensitivity,
+                  'data_sensitivity': audit_cleaning_sensitivity,
+                  'cleaning_curve': audit_cleaning_sensitivity})
     _cmds.update({'plan_conformance': audit_plan_conformance,
                   'confirmation_plan': audit_plan_conformance,
                   'plan_match': audit_plan_conformance,
@@ -2127,6 +2135,9 @@ def _run_cli():
                 'unit_order', 'order_attestation', 'corpus_order',
                 'cleaning_replay', 'cleanup_replay', 'dedup_replay',
                 'replay_cleaning',
+                'cleaning_sensitivity', 'dedup_sensitivity',
+                'cleaning_specification', 'data_sensitivity',
+                'cleaning_curve',
                 'family_correction', 'family_maxt', 'correction_sensitivity',
                 'contrast_network', 'contrast_graph', 'comparison_graph',
                 'multi_arm', 'network',

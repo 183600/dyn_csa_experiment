@@ -6295,3 +6295,80 @@ lesion 逐臂单因素且 dense sink 的 `use_sink` 记为 inert；多改 `index
 `full_sink` 被拒绝；`audit_gates.py single_factor` 的 `lesion` 块 ok；
 `build_models=False` 不构造模型；替换 `LESION_DESIGN` 为带第二因素的声明
 后总门与 `lesion` 块同时 fail。完整 CPU 套件在本轮最终树通过。
+
+## 2026-10-31 — 协议可复现不等于数据稳健：清洗规格曲线与行序敏感性（本轮数据方法硬化，no new runs）
+
+零 GPU；不新增训练、不读取 test split、不修改
+`confirmation_frozen*.json` 的字节/种子/端点/α/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未删除、未修改、未移动。
+
+**Problem.** §82 把 exact/SimHash 几何纳入缓存身份，§122 证明
+「served membership = 记录协议 + 这批 raw rows 的确定性输出」。但两者
+都只回答「记录的协议是否被实际执行」，没有回答「换一个同样合理的清洗
+选择，训练/选择语料会变多少」。近重复过滤是贪心且顺序相关的：同一
+near-duplicate 簇中先出现者保留、后出现者删除并隔离；shingle 宽度、
+LSH band 数、Hamming 阈值或 `max_shingles` 子采样一变，簇边界和代表就
+可能变；即使协议不变，仅交换两行原始数据的顺序也可能换一个代表进入
+训练流。当前报告只有一个协议、一个 membership，读者无法判断结论是否
+只是「模型 + 某个数据清洗选择」的联合效应。这是数据口径上的研究者
+自由度，不能靠增加种子或换统计检验修补。
+
+**Fix.** 新增 `explib/_parts/part_69_cleaning_sensitivity.py`：
+
+- `cleaning_sensitivity(...)` 在 source order 下重放记录协议得到
+  baseline kept ids，再对每个变体重放同一决策序列；`fit_rows` 前缀在
+  行序变体中固定（改变 fit 前缀会同时改变 tokenizer，属于另一阶段）；
+- 协议变体只生成通过 `dedup_protocol_problems` 的近邻：strict/loose
+  Hamming（要求 `threshold < bands`）、8-band 布局、shingle 宽度 4/8、
+  `max_shingles=256`；无法合法构造的轴记录 `skipped` 与具体原因，不
+  静默丢弃；
+- 行序变体为 `order_reverse` 加 `n_order_permutations` 个 seeded
+  permutation，作用于 fit 前缀之后的 train rows 与 validation rows；
+- 每个变体报告 train/validation 的 kept 数、kept-set Jaccard、
+  retained/added fraction、count delta、exact/near removal 变化，并单独
+  记录 `kept_sequence_identical`：token 流有序，同一 kept 集合的不同
+  排列仍是不同数据（也会改变固定 validation 前缀实际读到哪些行）；汇总
+  给出 `min_kept_jaccard` / `max_count_delta_fraction` /
+  `n_sequence_changed_variants` / `material_variants`。汇总同时区分
+  `membership_stable`（集合/计数阈值）与 `order_identical`（顺序完全
+  不变），避免把「集合稳定但顺序变了」误读成整体不变；
+- baseline 必须与 sidecar 的 served prefix 逐位一致（只允许 loader
+  chunk/cap 的尾部多余 kept row），否则 `fail`；`max_rows` 超限
+  `not_verifiable`，不抽样冒充全量；
+- exact hash/doc id 预计算一次，SimHash 按 `(split, shingle_words,
+  max_shingles)` 缓存；`_HashedDedup` 复刻生产 `_DocDeduplicator` 的
+  exact 集合、LSH bucket 与 near-copy quarantine 语义；
+- `audit_gates.py cleaning_sensitivity`（别名 `dedup_sensitivity` /
+  `cleaning_specification` / `data_sensitivity` / `cleaning_curve`）读取
+  cache meta、`wiki.train.raw`、`wiki.valid.raw` 与 doc-id sidecar；只
+  打开 train/validation，**不读 `wiki.test.raw`、不读 test cache**。缺
+  完整协议、`tokenizer_fit_rows`、精确 scanned 行数、raw dump 或 sidecar
+  时明确 `not_verifiable_locally`。`make data-sensitivity` 是零 GPU 入口；
+  `CSA_CLEANING_SENSITIVITY_IN_REPORT=1` 时才并入 `audit_gates.py report`
+  顶层。
+
+**Boundary.** 这是描述性数据口径：`status=ok` 只表示所有已测变体的
+kept Jaccard ≥ 0.95 且 kept 数变化 ≤ 1%；顺序变化由 `order_identical` /
+`fully_identical` 单独报告，不混入 membership material。`warnings`
+表示至少一个变体
+越过该报告阈值，应把清洗规格曲线与冻结 split 一起报告，不能把 served
+set 说成「协议中立」；`fail` 仅用于 baseline 与缓存 sidecar/源行数
+矛盾。不产生 p 值、不进入 Holm、不改变 `verified`/`confirmed`、不重算
+PPL、不改变 token/split/tokenizer/训练/种子/端点/α/Holm 或冻结判定，也
+不 bump `CODE_SEMANTICS`。不证明某个清洗规格「更好」，不重放
+tokenization，不评价 near 删除是否应该发生；行序变体固定 fit 前缀，
+不测量 fit 前缀变化对 tokenizer 的影响；test 侧清洗规格敏感性不在本门
+内，避免消耗一次性 held-out 访问。旧缓存缺协议/精确行数/sidecar 时不
+回填、不重跑、不推断。
+
+**Verification.** 新增 `test_review_part_73.py` 11 项：`_HashedDedup` 在
+多种 band/threshold/shingle 几何下与生产 `_DocDeduplicator` 的 exact/near
+决定和 quarantine 计数逐项一致；baseline 与生产重放逐位一致；Hamming strict 轴改变 kept 数并被判
+material；行序反转在 kept 数不变时改变代表（count-only 检查看不见）；
+仅顺序变化（集合相同）由 `sequence_changed` / `order_identical` 单独
+记录而不混入 membership material；fit 前缀不参与行序置换；同 seed
+结果确定；非法 protocol/参数/行类型、
+源行数或 sidecar 不符、`max_rows` 门均 fail-closed；端到端 fixture 记录
+`test_raw_read=false`、raw 同行数篡改判 fail、缺 raw/缺协议判
+`not_verifiable`、缺或空的 sidecar 不冒充 verified。完整 CPU 套件在本轮最终
+树通过。
