@@ -10723,3 +10723,151 @@ python audit_gates.py report                 # 汇总新增 data_exposure
 判 `fail`、缺块/`not_estimable`/坏 JSON 的语义、目录输入、以及
 `load_wikitest` 被 monkeypatch 抛错时仍完成（证明不读 test）。相关既有
 套件通过；`test_review_part_57/58/59` 共 36 项通过。
+
+## 120. 顺序读数必须先证明顺序：sorted-id 向量不是语料顺序（本轮可复现性/工程规范硬化，no new runs）
+
+零 GPU；不新增训练、不读取 test split、不修改
+`confirmation_frozen*.json` 的字节/种子/端点/α/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未删除、未修改、未移动。
+
+### 120.1 问题：分析器以为自己在读语料顺序，产物其实是 id 排序
+
+§117/§118 新增的顺序依赖读数明确以「输入是按语料/评测顺序排列」为前提：
+`ordered_unit_inference` 与 `pooled_order_inference` 都不排序、不洗牌，
+`design_effect`、`n_eff`、块区间和顺序置换 p 都只对观测到的相邻关系有意义。
+但评测聚合器 `aggregate_nll_by_document` / `aggregate_nll_by_article` 的
+逐单位向量来自 `document_index`，而后者用 `np.unique(...)` 返回
+**按 id 排序**的唯一键。于是：
+
+- `ppl_per_doc` / `nll_per_doc` / `doc_ids` 的布局是 sorted-id，不是
+  first-occurrence；
+- `_doc_level_analysis` 直接把这些向量喂给顺序读数；
+- 报告却写着「输入按语料/评测顺序排列；函数不排序、不洗牌」。
+
+这比「函数无法发现调用者先排序」更严重：默认管线自己就排序了。对
+WikiText 的 article id 是内容哈希，sorted-id 顺序与文章在切片中的出现
+顺序无关；因此设计效应、有效样本量、顺序稳健区间和置换 p 描述的是
+一个不存在于语料中的排列。测试只直接调用顺序函数、用手工排好序的数组，
+没有经过 `eval_length_gen` → `_doc_level_analysis` 的真实路径，所以没有
+发现这个假设与生产者的矛盾。
+
+### 120.2 方法：在观测点记录 first-occurrence 顺序，并让分析器验证它
+
+**1）聚合器记录顺序，而不是改向量布局。** 为保持既有 bootstrap/cluster
+区间的数值入口稳定，`doc_ids` / `article_ids` 仍是 canonical sorted-id
+布局；新增 `unit_order` 块：
+
+```
+schema / policy_version / basis = first_occurrence_in_scored_targets
+unit_kind = document | article
+n_units / n_tokens
+permutation        # sorted-id 向量 -> first-occurrence 顺序的下标置换
+first_positions    # 每个单位在展平目标流中首次出现的位置（严格递增）
+sha256             # 按 first-occurrence 顺序对 id 做长度前缀哈希
+```
+
+`permutation` 从目标流本身用 `np.unique(inv, return_index=True)` 得到，
+不是从 id 值推断；`first_positions` 让审计可以检查顺序与 token 流一致。
+摘要采用长度前缀（`len:bytes\n`），避免 `['a','bc']` 与 `['ab','c']`
+碰撞；函数 `unit_order_sha256` / `unit_order_attestation` /
+`unit_order_problems` 是该块的唯一构造/校验入口。
+
+**2）顺序函数拒绝不匹配的 attestation。** `ordered_unit_inference` 与
+`pooled_order_inference(_from_influence)` 新增可选
+`order_attestation`。提供时重算有序 id 摘要并要求 `basis` 为
+first-occurrence；sorted/shuffled 向量、错误摘要、非法 permutation 直接
+`ValueError`，不再静默计算。输出顶层 `unit_order`（`verified` /
+`unverified`）并把完整 attestation 放进 `sufficient_statistics`，供审计
+重放。没有 attestation 时仍可做探索性调用，但状态是 `unverified`，报告
+不得称其为语料顺序。
+
+**3）`_doc_level_analysis` 先验证、再置换、否则拒绝。** 它检查所有
+arm/seed cell 的 `unit_order` 完全一致、`unit_kind` 与 doc/article 粒度
+匹配、`permutation` 是合法置换、`first_positions` 严格递增且在
+`n_tokens` 内、摘要可由 `[doc_ids[i] for i in permutation]` 重算。通过后
+只对**顺序读数**使用置换后的 `_nll_a`/`_nll_b`/`n_tokens`/`unit_ids`
+（cluster CI、bootstrap、长度分层、逐单位分位仍用 canonical 布局，保持
+既有数值）；legacy cell 没有 attestation 时顺序读数明确 unavailable，
+不再按 sorted-id 计算。
+
+**4）报告与审计同时改口径。** 顺序表定义改为「由落盘 `unit_order`
+（first-occurrence permutation + 有序 id 摘要）证明的顺序」，只有
+`unit_order.status=verified` 的读数进入；未核验比较单独列警告。新增
+`audit_gates.py unit_order`（别名 `order_attestation` / `corpus_order`）：
+
+- 对 `by_len` cell 重算 permutation/摘要/first_positions/n_tokens 与
+  `doc_ids`/`article_ids`、`n_tok` 的一致性；
+- 对 `doc_sampling.order_inference` / `pooled_order_inference` 要求
+  `unit_order.status=verified`、摘要与 cell 一致，且
+  `sufficient_statistics.unit_order_attestation` 可重放；
+- 缺 attestation 但有顺序读数判 `fail`（旧分析正是这种情形）；
+  纯 legacy 无读数报 `not_verifiable_locally`；cell 间有的有、有的没有
+  判 `fail`；
+- 目录输入取 `test_stats.json` / `summary.json`；`report` 顶层新增
+  `unit_order`。
+
+### 120.3 边界
+
+- **attestation 证明的是「评测器观测到的顺序 = 分析使用的顺序」，不是
+  「上游抽取器一定保序」。** 它把默认管线的自我矛盾消掉，并把
+  sorted/shuffled 向量变成可检测的失败；仍不能从 id 值证明语料顺序，
+  也不能把 source-order prefix 变成概率样本（§55 继续成立）。
+- **不改变任何已有测量。** 点估计、逐单位 PPL/NLL、cluster CI、
+  bootstrap、长度分层、逐单位分位、精确 sign-flip p、Holm、端点、
+  种子、α 与冻结判定都不变；`doc_ids`/`article_ids` 仍是 sorted-id 布局。
+  只有此前未定义的「顺序读数」改为使用真实 first-occurrence 顺序。
+- **不 bump `CODE_SEMANTICS`。** 冻结清单绑定的是测量语义；本轮修的是
+  一个新描述性读数的输入前提，不改变 tokenizer/split/token/PPL。旧
+  artifact 没有 `unit_order`，不回填、不重跑；其顺序读数标
+  `not_verifiable_locally`，不能把旧 sorted-id 读数当语料顺序重发。
+- **不能证明 first-occurrence 就是「文章首次被提到」的语义顺序。** 它
+  是评测切片内目标 token 的首次出现顺序；文章跨行、行跨 row 时仍按
+  展平目标流计算，这与评测的因果前缀一致。
+- 审计是结构/摘要重放，不是对恶意伪造的密码学证明；伪造者仍可构造
+  自洽的 permutation/positions。它与 `source_tree`、`data_fp`、
+  `fit_fp`、release manifest 一起使用，不能单独承担证据真实性。
+
+### 120.4 落盘、报告与入口
+
+- `aggregate_nll_by_document` / `aggregate_nll_by_article` 的每个
+  document/article cell 新增 `unit_order`；
+- `ordered_unit_inference` / `pooled_order_inference` 新增
+  `unit_order` 与 `sufficient_statistics.unit_order_attestation`；
+- `_doc_level_analysis` 的 `doc_sampling` 新增 `unit_order`（含
+  `status` / `permutation_verified` / `sha256` / `problems`），并按
+  attestation 置换顺序读数；
+- 报告 `_order_inference_markdown` / `_pooled_order_markdown` 显示
+  first-occurrence 口径并列出未核验比较；
+- `audit_gates.py report` 顶层新增 `unit_order`。
+
+```bash
+python audit_gates.py unit_order                  # 默认 analysis_v12/test_stats.json
+python audit_gates.py unit_order <artifact.json>  # 或一个 summary/目录
+python audit_gates.py order_attestation
+python audit_gates.py corpus_order
+python -m pytest -q test_review_part_61.py
+```
+
+### 120.5 验证
+
+新增 `test_review_part_61.py` 14 项：策略/摘要长度前缀/非法 primitive；
+`aggregate_nll_by_document` 在 id 出现顺序为 30→10→20 时仍返回 sorted-id
+向量但 `permutation=[2,0,1]`、`first_positions=[0,2,4]` 且摘要只匹配
+first-occurrence 顺序；文章包装保留同一摘要并标 `unit_kind='article'`；
+短前缀按切片内首次出现重算；`ordered_unit_inference` /
+`pooled_order_inference` 接受匹配 attestation 并输出 `verified`，拒绝
+sorted 向量/错误 basis/错误摘要；`_doc_level_analysis` 的真实路径使用
+反向置换，逐项等于手工置换后的 `ordered_unit_inference`，且与 sorted-id
+读数的 batch-means/设计效应不同；legacy 无 attestation 时不再生成顺序
+读数；篡改 attestation 时 `unit_order.status='fail'` 且读数缺席；
+`eval_length_gen` 端到端在非排序 doc id 上生成
+`permutation=[2,0,1]`、`first_positions=[0,11,23]`；审计对干净
+summary/stats artifact `ok`、legacy `not_verifiable_locally`、混合
+cell `fail`、逐项篡改摘要/置换/位置/n_tokens/unit_kind/basis/n_units
+判 `fail`、有读数但无 cell attestation 判 `fail`、目录输入可用、
+`load_wikitest` 被 monkeypatch 抛错时审计仍完成；row-level 面板按
+evaluation-panel 顺序的 `unverified` 读数被允许（warning，不冒充
+attested 语料顺序）；报告 markdown 出现
+first-occurrence 口径并在 legacy 比较上写「未核验」；CLI/report 接线。
+相关既有 `test_review_part_09/23/24/59/60` 通过；完整 CPU 套件在本轮
+最终树通过（新增 14 项）。

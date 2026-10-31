@@ -176,6 +176,38 @@ def audit_pooled_order(path=None):
             out['n_not_replayable'] += 1
             out['problems'].extend(f'{name}: {x}' for x in row['problems'])
             continue
+        _order_att = stats.get('unit_order_attestation')
+        if _order_att is not None:
+            try:
+                _order_ids = stats.get('unit_ids')
+                if not isinstance(_order_ids, list):
+                    row['problems'].append(
+                        'unit_order_attestation is stored without unit_ids; '
+                        'the order cannot be replayed')
+                else:
+                    _order_problems = L.unit_order_problems(
+                        _order_att, [str(x) for x in _order_ids])
+                    row['problems'].extend(
+                        f'unit_order: {x}' for x in _order_problems)
+                    if (not _order_problems
+                            and (block.get('unit_order') or {}).get(
+                                'status') != 'verified'):
+                        row['problems'].append(
+                            'unit_order_attestation is replayable but '
+                            'pooled_order_inference.unit_order.status is not '
+                            'verified')
+            except Exception as exc:
+                row['problems'].append(
+                    f'unit_order_attestation is malformed: '
+                    f'{type(exc).__name__}: {exc}')
+        elif (block.get('unit_order') or {}).get('status') == 'verified':
+            row['problems'].append(
+                'pooled_order_inference claims a verified unit order but '
+                'stores no unit_order_attestation')
+        if row['problems']:
+            out['n_not_replayable'] += 1
+            out['problems'].extend(f'{name}: {x}' for x in row['problems'])
+            continue
         try:
             replay = L.pooled_order_inference_from_influence(
                 stats['ppl_influence'], stats['log_ratio_influence'],
@@ -190,7 +222,8 @@ def audit_pooled_order(path=None):
                 conf=stats['conf'], alpha=stats['alpha'],
                 seed=stats['seed'],
                 design_effect_tolerance=stats.get('design_effect_tolerance'),
-                material_ci_inflation=stats.get('material_ci_inflation'))
+                material_ci_inflation=stats.get('material_ci_inflation'),
+                order_attestation=_order_att)
         except Exception as exc:
             row['problems'].append(
                 f'replay raised {type(exc).__name__}: {exc}')

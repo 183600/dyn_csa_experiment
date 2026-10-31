@@ -5548,3 +5548,78 @@ seed/schema/quality/夹带 `confirmed` 判 `fail`、tokens_seen/
 steps_completed/world/rank-0 seed 交叉不一致判 `fail`、缺块/
 `not_estimable`/坏 JSON 语义、目录输入、以及 `load_wikitest` 被
 monkeypatch 抛错时审计仍完成。`test_review_part_57/58/59` 共 36 项通过。
+
+## 2026-10-31 — 顺序读数必须先证明顺序：sorted-id 向量不是语料顺序（本轮可复现性/工程规范硬化，no new runs）
+
+零 GPU；不新增训练、不读取 test split、不修改
+`confirmation_frozen*.json` 的字节/种子/端点/α/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未删除、未修改、未移动。
+
+**Problem.** §117/§118 的顺序依赖读数以「输入按语料/评测顺序排列」为
+前提，函数不排序、不洗牌。但评测聚合器 `aggregate_nll_by_document` /
+`aggregate_nll_by_article` 的逐单位向量来自 `document_index`，后者用
+`np.unique(...)` 返回**按 id 排序**的唯一键；`_doc_level_analysis` 又把
+这些 sorted-id 向量直接喂给 `ordered_unit_inference` /
+`pooled_order_inference`。因此设计效应、`n_eff`、块重采样区间与顺序置换
+p 描述的是一个语料中不存在的排列，报告却写着「按语料/评测顺序排列；
+函数不排序」。这是生产者的默认行为与消费者声明的直接矛盾，不是调用者
+偶发洗牌；既有测试只直接调用顺序函数、用手工排好序的数组，没有经过
+`eval_length_gen` → `_doc_level_analysis` 的真实路径，所以未暴露。
+
+**Fix.** 保留 `doc_ids`/`article_ids` 的 canonical sorted-id 布局（不改变
+既有 cluster CI/bootstrap/分位/长度分层数值），新增
+`UNIT_ORDER_POLICY`、`unit_order_sha256`、`unit_order_attestation`、
+`unit_order_problems` 与 `_unit_order_from_index`：每个 document/article
+cell 追加 `unit_order`，记录 `basis=first_occurrence_in_scored_targets`、
+`unit_kind`、`n_units`、`n_tokens`、`permutation`（sorted-id 向量 →
+first-occurrence 顺序）、`first_positions`（严格递增）和按有序 id 的
+长度前缀 SHA-256。`permutation` 从目标流 `np.unique(inv,
+return_index=True)` 得到，不从 id 值猜。
+
+接线：`ordered_unit_inference` / `pooled_order_inference` /
+`pooled_order_inference_from_influence` 新增可选 `order_attestation`，
+提供时重算摘要并拒绝 sorted/shuffled、错误 basis/摘要/置换；输出顶层
+`unit_order`（`verified`/`unverified`）并把完整 attestation 存入
+`sufficient_statistics`。`_doc_level_analysis` 校验所有 arm/seed cell 的
+attestation 一致、粒度匹配、置换合法、位置与 token 总数自洽后，仅对
+**顺序读数**使用置换后的 NLL/token/id 向量；legacy 无 attestation 时
+顺序读数明确 unavailable，不再按 sorted-id 计算。报告把口径改为
+「由落盘 `unit_order` 证明的 first-occurrence 顺序」，只列 verified
+读数并单列未核验比较。新增 `audit_gates.py unit_order`（别名
+`order_attestation` / `corpus_order`）：重算 cell 的
+permutation/摘要/positions/n_tokens，核对 readout 的 `verified` 与完整
+attestation；缺 attestation 但有顺序读数判 `fail`，纯 legacy 报
+`not_verifiable_locally`，cell 间不一致判 `fail`；目录输入取
+`test_stats.json`/`summary.json`，并入 `audit_gates.py report` 顶层
+`unit_order`。
+
+**Boundary.** Attestation 证明「评测器观测到的顺序 = 分析使用的顺序」，
+不证明上游抽取器必然保序，也不能把 source-order prefix 变成概率样本。
+它不改变 tokenizer/split/token/PPL/点估计/逐单位向量/cluster CI/
+bootstrap/长度分层/分位/种子/端点/α/Holm/冻结判定，不 bump
+`CODE_SEMANTICS`。旧 artifact 没有该块，不回填、不重跑；其顺序读数标
+`not_verifiable_locally`，不能把旧 sorted-id 读数当语料顺序重发。审计是
+结构/摘要重放，不是对恶意伪造的密码学证明，仍需与 `source_tree`、
+`data_fp`、`fit_fp` 与 release manifest 一起使用。
+
+**Verification.** 新增 `test_review_part_61.py` 14 项：策略/长度前缀
+摘要/非法 primitive；`aggregate_nll_by_document` 在 id 出现顺序
+30→10→20 时仍返回 sorted-id 向量但 `permutation=[2,0,1]`、
+`first_positions=[0,2,4]`，摘要只匹配 first-occurrence；文章包装保留
+同一摘要并标 `unit_kind='article'`；短前缀按切片内首次出现重算；
+两个顺序函数接受匹配 attestation 并输出 `verified`，拒绝 sorted
+向量/错误 basis/错误摘要；`_doc_level_analysis` 真实路径使用反向置换，
+逐项等于手工置换后的 `ordered_unit_inference`，且 batch-means/设计效应
+与 sorted-id 读数不同；legacy 无 attestation 时不再生成顺序读数；篡改
+attestation 时 `unit_order.status='fail'` 且读数缺席；`eval_length_gen`
+端到端在非排序 doc id 上生成 `permutation=[2,0,1]`、
+`first_positions=[0,11,23]`；审计对干净 summary/stats artifact `ok`、
+legacy `not_verifiable_locally`、混合 cell `fail`、逐项篡改摘要/置换/
+位置/n_tokens/unit_kind/basis/n_units 判 `fail`、有读数但无 cell
+attestation 判 `fail`、目录输入可用、`load_wikitest` 被 monkeypatch
+抛错时审计仍完成；row-level 面板按 evaluation-panel 顺序的 `unverified`
+读数被允许（warning，不冒充 attested 语料顺序）；报告 markdown 出现
+first-occurrence 口径并在 legacy 比较上写「未核验」；CLI/report 接线。
+相关既有
+`test_review_part_09/23/24/59/60` 通过；完整 CPU 套件在本轮最终树通过
+（新增 14 项）。

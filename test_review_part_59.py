@@ -64,6 +64,14 @@ def _audit(obj):
 def _fixture_records(n=16, seeds=(0, 1, 2), seed=41):
     rng = np.random.default_rng(seed)
     tokens = rng.integers(150, 650, size=n).tolist()
+    ids = [f'd{i}' for i in range(n)]
+    # A nontrivial corpus order relative to the canonical sorted-id layout.
+    perm = list(range(0, n, 2)) + list(range(1, n, 2))
+    positions = np.cumsum(
+        [0] + [tokens[i] for i in perm][:-1]).astype(int).tolist()
+    order = L.unit_order_attestation(
+        [ids[i] for i in perm], unit_kind='document', permutation=perm,
+        first_positions=positions, n_tokens=int(sum(tokens)))
     recs_a, recs_b = {}, {}
     for s in seeds:
         base = rng.normal(70.0, 4.0, size=n)
@@ -76,7 +84,7 @@ def _fixture_records(n=16, seeds=(0, 1, 2), seed=41):
                 'nll_sum': float(nll.sum()), 'n_tok': int(sum(tokens)),
                 'ppl_per_doc': ppl, 'nll_per_doc': nll.tolist(),
                 'n_tokens_per_doc': tokens,
-                'doc_ids': [f'd{i}' for i in range(n)],
+                'doc_ids': ids, 'unit_order': dict(order),
                 'n_seq': n}}}
     return recs_a, recs_b, list(seeds)
 

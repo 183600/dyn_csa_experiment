@@ -42,9 +42,10 @@ Boundaries are deliberate and part of the output:
   widest across the declared lengths, not the one that looks best.  The
   batch-means and block estimates are noisy at n of a few dozen and are
   reported with their n and block size;
-* the input order must be the corpus/evaluation order.  Sorting or shuffling
-  the values before the call changes the question and is not detectable from
-  the values alone.
+* the input order must be the corpus/evaluation order.  Pass the evaluation
+  cell's first-occurrence ``unit_order`` attestation to verify it; sorting or
+  shuffling is then refused.  Without an attestation the values alone cannot
+  reveal a reorder, and the readout is explicitly marked ``unverified``.
 """
 
 import math as _od_math
@@ -92,9 +93,11 @@ ORDER_DEPENDENCE_POLICY = {
         'proof that units are independent or exchangeable. Block and batch '
         'estimates are noisy at n of a few dozen; the widest declared '
         'interval is reported so the block length cannot be chosen after '
-        'looking. The permutation p-value is a diagnostic and never enters '
-        'the frozen Holm family, p_exact_signflip, p_holm, verified or any '
-        'confirmed verdict.'),
+        'looking. The input order is caller-asserted unless a first-occurrence '
+        'unit_order attestation is supplied and verified; a sorted/shuffled '
+        'id vector without one is not corpus order. The permutation p-value '
+        'is a diagnostic and never enters the frozen Holm family, '
+        'p_exact_signflip, p_holm, verified or any confirmed verdict.'),
 }
 
 ORDER_DEPENDENCE_STATUSES = ('ok', 'not_estimable')
@@ -404,11 +407,38 @@ def _od_permutation(values, *, primary_batches, n_perm, seed, alpha):
                        'values are permuted, never resampled with replacement')}
 
 
+def _od_order_block(ids, attestation):
+    """Verified/unverified order provenance for one ordered-unit readout."""
+    if attestation is None:
+        return {
+            'status': 'unverified',
+            'basis': None, 'sha256': None,
+            'n_units': (len(ids) if ids is not None else None),
+            'reason': ('no unit-order attestation was supplied; the input '
+                       'order is caller-asserted, not verified'),
+        }
+    if ids is None:
+        raise ValueError(
+            'ordered_unit_inference: order_attestation requires unit_ids so '
+            'the stored order fingerprint can be recomputed')
+    problems = unit_order_problems(attestation, ids)
+    if problems:
+        raise ValueError('ordered_unit_inference: ' + '; '.join(problems))
+    return {
+        'status': 'verified',
+        'basis': attestation.get('basis'),
+        'sha256': attestation.get('sha256'),
+        'unit_kind': attestation.get('unit_kind'),
+        'n_units': len(ids),
+    }
+
+
 def ordered_unit_inference(values, *, unit_ids=None, block_lengths=None,
                            n_batches=None, n_boot=None, n_perm=None,
                            conf=None, alpha=None, seed=None,
                            design_effect_tolerance=None,
-                           material_ci_inflation=None):
+                           material_ci_inflation=None,
+                           order_attestation=None):
     """Order dependence and effective-n readout for one paired unit panel.
 
     ``values`` is the **already ordered** equal-unit per-unit effect vector
@@ -420,6 +450,12 @@ def ordered_unit_inference(values, *, unit_ids=None, block_lengths=None,
     ``status='ok'``, or ``status='not_estimable'`` with a reason when the
     panel is too small or a statistic is not representable.  Malformed inputs
     raise ``ValueError``; a valid but unavailable readout is not faked.
+
+    ``order_attestation`` is the cell's first-occurrence attestation.  When
+    supplied, the function recomputes the ordered-id digest and refuses a
+    sorted/shuffled vector; the returned ``unit_order`` block then says
+    ``verified``.  Without it the order is caller-asserted (``unverified``)
+    and a report must not call the result corpus-ordered.
     """
     vals = _od_values(values)
     n = len(vals)
@@ -470,9 +506,12 @@ def ordered_unit_inference(values, *, unit_ids=None, block_lengths=None,
             'n_units': n, 'conf': conf, 'alpha': alpha, 'seed': seed,
             'role': ORDER_DEPENDENCE_POLICY['role'],
             'boundary': ORDER_DEPENDENCE_POLICY['boundary'],
+            'unit_order': _od_order_block(ids, order_attestation),
             'sufficient_statistics': {
                 'values': [float(v) for v in vals],
                 'unit_ids': ids,
+                'unit_order': _od_order_block(ids, order_attestation),
+                'unit_order_attestation': order_attestation,
                 'block_lengths': None,
                 'n_batches': None,
                 'raw_n_batches': None,
@@ -749,8 +788,11 @@ def ordered_unit_inference(values, *, unit_ids=None, block_lengths=None,
         'block_zero_exclusion': block_zero,
         'wording': wording,
         'notes': [
-            'The input order is treated as the corpus/evaluation order; the '
-            'function does not sort or shuffle it.',
+            ('The input order is treated as the corpus/evaluation order; the '
+             'function does not sort or shuffle it.  The returned unit_order '
+             'block records whether that order was verified against a stored '
+             'first-occurrence attestation (verified) or merely asserted '
+             '(unverified).'),
             'A permutation p is a diagnostic of order exchangeability, not a '
             'confirmatory test; it does not enter the frozen Holm family.',
             'The widest declared interval is reported as the order-robust '

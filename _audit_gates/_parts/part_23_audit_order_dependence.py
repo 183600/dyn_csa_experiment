@@ -200,6 +200,38 @@ def audit_order_dependence(path=None):
             out['n_not_replayable'] += 1
             out['problems'].extend(f'{name}: {x}' for x in row['problems'])
             continue
+        _order_att = stats.get('unit_order_attestation')
+        if _order_att is not None:
+            try:
+                _order_ids = ([str(x) for x in ids]
+                              if isinstance(ids, list) else None)
+                if _order_ids is None:
+                    row['problems'].append(
+                        'unit_order_attestation is stored without unit_ids; '
+                        'the order cannot be replayed')
+                else:
+                    _order_problems = L.unit_order_problems(
+                        _order_att, _order_ids)
+                    row['problems'].extend(
+                        f'unit_order: {x}' for x in _order_problems)
+                    if (not _order_problems
+                            and (oi.get('unit_order') or {}).get(
+                                'status') != 'verified'):
+                        row['problems'].append(
+                            'unit_order_attestation is replayable but '
+                            'order_inference.unit_order.status is not verified')
+            except Exception as exc:
+                row['problems'].append(
+                    f'unit_order_attestation is malformed: '
+                    f'{type(exc).__name__}: {exc}')
+        elif (oi.get('unit_order') or {}).get('status') == 'verified':
+            row['problems'].append(
+                'order_inference claims a verified unit order but stores no '
+                'unit_order_attestation')
+        if row['problems']:
+            out['n_not_replayable'] += 1
+            out['problems'].extend(f'{name}: {x}' for x in row['problems'])
+            continue
         try:
             replay = L.ordered_unit_inference(
                 values, unit_ids=ids,
@@ -212,7 +244,8 @@ def audit_order_dependence(path=None):
                 conf=stats.get('conf'), alpha=stats.get('alpha'),
                 seed=stats.get('seed'),
                 design_effect_tolerance=stats.get('design_effect_tolerance'),
-                material_ci_inflation=stats.get('material_ci_inflation'))
+                material_ci_inflation=stats.get('material_ci_inflation'),
+                order_attestation=_order_att)
         except Exception as exc:
             row['problems'].append(
                 f'replay raised {type(exc).__name__}: {exc}')

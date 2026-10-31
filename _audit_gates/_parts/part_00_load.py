@@ -282,6 +282,14 @@
                记录里的 tokens_seen/steps_completed/world/rank-0 seed；缺
                块报 not_verifiable，篡改判 fail；不读语料/test、不改 PPL
                （别名 exposure / token_coverage / coverage / tokens_seen）
+  unit_order   逐单位顺序证明：评测聚合把逐单位向量存成 sorted-id 布局，
+               另以 first-occurrence permutation + 有序 id 摘要记录语料顺序；
+               核对 permutation/sha256/first_positions/n_tokens 与 doc_ids/
+               article_ids 一致，并确认 order_inference / pooled_order_
+               inference 真的用了该顺序（readout 的 unit_order 必须 verified
+               且携带可重放 attestation）。缺 attestation 但有 order 读数判
+               fail，纯 legacy 报 not_verifiable；不读 test、不改冻结判定
+               （别名 order_attestation / corpus_order；可传 artifact 路径）
   sample_design  抽样设计：缓存声明的是 source-order prefix 还是可复核的
                document-stratified 概率样本；prefix 明确标记为不可外推，
                raw train/valid 可用时量化文章覆盖率、文章长度 KS 与分层覆盖；

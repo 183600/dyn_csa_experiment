@@ -1,5 +1,140 @@
 
 
+def _doc_unit_order(rows, ref_ids, n_docs, ref_tok, granularity, ids_key):
+    """Validate the first-occurrence order attestation for one comparison.
+
+    The evaluation aggregator stores its per-unit vectors in the canonical
+    sorted-id layout (``np.unique``) and records corpus/first-occurrence order
+    separately in ``unit_order``.  This helper reconstructs the analyzed order
+    from that permutation, recomputes the ordered-id digest, and refuses a
+    sorted/shuffled sequence.  A legacy cell without the attestation returns
+    ``not_verifiable_locally``; the order-dependent readout must then be
+    withheld rather than silently computed on sorted ids.
+    """
+    out = {
+        'status': 'not_verifiable_locally',
+        'source': ids_key,
+        'unit_kind': granularity,
+        'permutation': None,
+        'attestation': None,
+        'sha256': None,
+        'basis': None,
+        'n_units': (int(n_docs) if isinstance(n_docs, int) else None),
+        'problems': [],
+        'reason': None,
+    }
+    if granularity == 'row':
+        out['status'] = 'not_applicable'
+        out['reason'] = (
+            'row-level cells carry no document/article identity; ppl_per_seq '
+            'is already in evaluation-panel row order, so no id sort is '
+            'involved and no attestation is required')
+        return out
+    if not isinstance(ref_ids, (list, tuple)) or len(ref_ids) != int(n_docs):
+        out['reason'] = ('the cell has no complete document/article id vector, '
+                         'so its order cannot be attested')
+        return out
+    try:
+        ids = [str(x) for x in ref_ids]
+    except (TypeError, ValueError):
+        out['reason'] = 'the stored unit ids are not renderable strings'
+        return out
+    if len(set(ids)) != int(n_docs):
+        out['reason'] = 'the stored unit ids are not unique'
+        return out
+    atts = [r.get('unit_order') if isinstance(r, dict) else None for r in rows]
+    if not any(a is not None for a in atts):
+        out['reason'] = (
+            'legacy artifact: the cell carries no first-occurrence unit_order '
+            'attestation, so the order used by an older order readout cannot '
+            'be verified')
+        return out
+    if any(a is None for a in atts):
+        out['status'] = 'fail'
+        out['problems'].append(
+            'some arm/seed cells carry unit_order and others do not; the '
+            'paired unit sequence is not verifiable')
+        return out
+    att = atts[0]
+    if any(a != att for a in atts[1:]):
+        out['status'] = 'fail'
+        out['problems'].append(
+            'unit_order differs across arm/seed cells; the paired unit '
+            'sequence is not the same')
+        return out
+    if not isinstance(att, dict):
+        out['status'] = 'fail'
+        out['problems'].append(
+            f'unit_order is a {type(att).__name__}, not an object')
+        return out
+    perm = att.get('permutation')
+    if not isinstance(perm, list) or len(perm) != int(n_docs):
+        out['status'] = 'fail'
+        out['problems'].append(
+            'unit_order.permutation is not a list aligned with n_units')
+        return out
+    if any(isinstance(x, (bool, np.bool_)) for x in perm):
+        out['status'] = 'fail'
+        out['problems'].append('unit_order.permutation contains a boolean')
+        return out
+    try:
+        perm = [int(x) for x in perm]
+    except (TypeError, ValueError, OverflowError):
+        out['status'] = 'fail'
+        out['problems'].append('unit_order.permutation contains a non-integer')
+        return out
+    if sorted(perm) != list(range(int(n_docs))):
+        out['status'] = 'fail'
+        out['problems'].append(
+            f'unit_order.permutation is not a permutation of range({n_docs})')
+        return out
+    ordered = [ids[i] for i in perm]
+    problems = list(L.unit_order_problems(
+        att, ordered, unit_kind=granularity))
+    try:
+        total_tok = int(sum(int(x) for x in ref_tok))
+    except (TypeError, ValueError, OverflowError):
+        total_tok = None
+    if att.get('n_tokens') is None:
+        problems.append('unit_order.n_tokens is missing')
+    else:
+        try:
+            _att_tokens = int(att.get('n_tokens'))
+        except (TypeError, ValueError, OverflowError):
+            problems.append('unit_order.n_tokens is not an integer')
+        else:
+            if total_tok is not None and _att_tokens != total_tok:
+                problems.append(
+                    f'unit_order.n_tokens={att.get("n_tokens")!r} != the '
+                    f'cell token total {total_tok}')
+    pos = att.get('first_positions')
+    if not isinstance(pos, list) or len(pos) != int(n_docs):
+        problems.append('unit_order.first_positions is not aligned with '
+                        'n_units')
+    elif total_tok is not None:
+        try:
+            if any(int(x) >= total_tok for x in pos):
+                problems.append(
+                    'unit_order.first_positions contains a position outside '
+                    'the scored token stream')
+        except (TypeError, ValueError, OverflowError):
+            problems.append('unit_order.first_positions contains a '
+                            'non-integer')
+    if problems:
+        out['status'] = 'fail'
+        out['problems'] = [str(p) for p in problems]
+        return out
+    out.update({
+        'status': 'ok',
+        'permutation': perm,
+        'attestation': att,
+        'sha256': att.get('sha256'),
+        'basis': att.get('basis'),
+        'n_units': int(n_docs),
+    })
+    return out
+
+
 def _doc_level_analysis(recs_a, recs_b, common, Ln, primary_deltas=None):
     """Document-sampling readout for one comparison.
 
@@ -126,6 +261,32 @@ def _doc_level_analysis(recs_a, recs_b, common, Ln, primary_deltas=None):
                 _unit_ids = _ids_cand
         except (TypeError, ValueError):
             _unit_ids = None
+    # Corpus order is a separate, attested measurement.  The vectors above are
+    # in the canonical sorted-id layout; applying `permutation` is the only
+    # way to obtain the first-occurrence order the order-dependent readouts
+    # claim to analyze.  Without a valid attestation those readouts are
+    # withheld (a sorted-id sequence is not corpus order).
+    _unit_order_probe = _doc_unit_order(
+        rows_a + rows_b, _ref_ids, n_docs,
+        (_ref_tok if _granularity in ('document', 'article') else []),
+        (_granularity if _granularity in ('document', 'article') else 'row'),
+        (_ids_key if _granularity in ('document', 'article') else 'doc_ids'))
+    _uo_att = _unit_order_probe.get('attestation') or {}
+    _unit_order_block = {
+        'status': _unit_order_probe['status'],
+        'source': _unit_order_probe['source'],
+        'unit_kind': _unit_order_probe['unit_kind'],
+        'basis': _unit_order_probe['basis'],
+        'sha256': _unit_order_probe['sha256'],
+        'n_units': _unit_order_probe['n_units'],
+        'n_tokens': _uo_att.get('n_tokens'),
+        'algorithm': _uo_att.get('algorithm'),
+        'permutation': _uo_att.get('permutation'),
+        'first_positions': _uo_att.get('first_positions'),
+        'permutation_verified': (_unit_order_probe['status'] == 'ok'),
+        'problems': list(_unit_order_probe['problems']),
+        'reason': _unit_order_probe['reason'],
+    }
     doc_deltas = []
     doc_log_ratios = []
     within = []
@@ -271,17 +432,37 @@ def _doc_level_analysis(recs_a, recs_b, common, Ln, primary_deltas=None):
                         # Order dependence of the TOKEN-POOLED estimator: the
                         # equal-unit readout below cannot be copied onto the
                         # weighted cluster interval.  Build the estimator's
-                        # own cluster influence and check its corpus order,
-                        # closing the gap left open by design_notes 117.
-                        try:
-                            _pooled_order = L.pooled_order_inference(
-                                _nll_a, _nll_b, _ref_tok,
-                                unit_ids=_unit_ids, seeds=common)
-                        except (ValueError, TypeError, FloatingPointError,
-                                OverflowError) as _poe:
+                        # own cluster influence and check its attested
+                        # first-occurrence order, closing the gap left open by
+                        # design_notes 117/118.
+                        if (_unit_order_probe['status'] != 'ok'
+                                or _unit_ids is None):
                             _pooled_order = None
                             _pooled_order_reason = (
-                                f'{type(_poe).__name__}: {_poe}')
+                                _unit_order_probe['reason']
+                                or '; '.join(_unit_order_probe['problems'])
+                                or ('the unit-order attestation cannot be '
+                                    'verified, so a corpus-order readout is '
+                                    'withheld'))
+                        else:
+                            _perm = _unit_order_probe['permutation']
+                            _order_nll_a = np.asarray(
+                                _nll_a, dtype=float)[:, _perm]
+                            _order_nll_b = np.asarray(
+                                _nll_b, dtype=float)[:, _perm]
+                            _order_tok = [_ref_tok[i] for i in _perm]
+                            _order_ids = [_unit_ids[i] for i in _perm]
+                            try:
+                                _pooled_order = L.pooled_order_inference(
+                                    _order_nll_a, _order_nll_b, _order_tok,
+                                    unit_ids=_order_ids, seeds=common,
+                                    order_attestation=(
+                                        _unit_order_probe['attestation']))
+                            except (ValueError, TypeError,
+                                    FloatingPointError, OverflowError) as _poe:
+                                _pooled_order = None
+                                _pooled_order_reason = (
+                                    f'{type(_poe).__name__}: {_poe}')
                         # Total uncertainty: the cluster CI above conditions on
                         # the trained seeds, so it can be much narrower than the
                         # uncertainty of a result that also samples seeds.  The
@@ -330,15 +511,22 @@ def _doc_level_analysis(recs_a, recs_b, common, Ln, primary_deltas=None):
     # within-document correlation.
     _ci_ppl = L.bootstrap_mean_ci(arr, seed=20261018)
     _ci_log = L.bootstrap_mean_ci(lr, seed=20261018)
-    # Order dependence: the unit vector above is kept in corpus order, so an
-    # i.i.d. resample assumes away serial/topic dependence in a contiguous
-    # source-order slice.  The readout is only defined when the sequence is
-    # contiguous (no dropped unit) and every unit has the same seed set; a
-    # gap would silently join non-adjacent units, and an unbalanced mean
-    # would compare different seed sets along one sequence.
+    # Order dependence: the unit vectors above are in the canonical sorted-id
+    # layout, NOT corpus order.  Apply the attested first-occurrence
+    # permutation before the readout.  The readout is only defined when the
+    # sequence is contiguous (no dropped unit) and every unit has the same
+    # seed set; a gap would silently join non-adjacent units, and an
+    # unbalanced mean would compare different seed sets along one sequence.
     _order_inference = None
     _order_reason = None
-    if len(doc_deltas) != n_docs or len(cell_counts) != n_docs:
+    if (_unit_order_probe['status'] not in ('ok', 'not_applicable')
+            or (_unit_order_probe['status'] == 'ok' and _unit_ids is None)):
+        _order_reason = (
+            _unit_order_probe['reason']
+            or '; '.join(_unit_order_probe['problems'])
+            or ('the unit-order attestation cannot be verified, so a '
+                'corpus-order readout is withheld'))
+    elif len(doc_deltas) != n_docs or len(cell_counts) != n_docs:
         _order_reason = (
             f'{n_docs - len(doc_deltas)} unit(s) have no complete paired cell; '
             'dropping them breaks the contiguous corpus order, so the '
@@ -348,9 +536,19 @@ def _doc_level_analysis(recs_a, recs_b, common, Ln, primary_deltas=None):
             'per-unit seed counts differ; the seed-mean sequence would mix '
             'different seed sets, so the order-dependence readout is refused')
     else:
+        if _unit_order_probe['status'] == 'not_applicable':
+            _order_values = list(doc_deltas)
+            _order_ids = None
+            _order_att = None
+        else:
+            _perm = _unit_order_probe['permutation']
+            _order_values = [doc_deltas[i] for i in _perm]
+            _order_ids = [_unit_ids[i] for i in _perm]
+            _order_att = _unit_order_probe['attestation']
         try:
             _order_inference = L.ordered_unit_inference(
-                arr, unit_ids=_unit_ids)
+                _order_values, unit_ids=_order_ids,
+                order_attestation=_order_att)
         except (ValueError, TypeError, FloatingPointError,
                 OverflowError) as _oee:
             _order_inference = None
@@ -414,6 +612,12 @@ def _doc_level_analysis(recs_a, recs_b, common, Ln, primary_deltas=None):
                             'mean is outlier-sensitive).  Both are descriptive: units are not an arm randomisation.'),
            'article_fallback_reason': _article_fallback,
            'note': _unit_notes[_granularity]}
+    out['unit_order'] = dict(_unit_order_block)
+    if _granularity in ('document', 'article'):
+        out['unit_order']['readout_role'] = (
+            'the per-unit vectors are stored in canonical sorted-id order; '
+            'permutation reconstructs the attested first-occurrence order for '
+            'the order-dependent readouts')
     if _order_inference is not None:
         out['order_inference'] = _order_inference
     else:
@@ -1330,10 +1534,18 @@ def _order_inference_markdown(ft):
     missing = []
     not_estimable = []
     inflated = []
+    unverified = []
     for name, comp in comps.items():
         if not isinstance(comp, dict):
             continue
         dsm = comp.get('doc_sampling') or {}
+        _uo = dsm.get('unit_order') if isinstance(dsm, dict) else None
+        if (isinstance(dsm, dict)
+                and (dsm.get('order_inference') is not None
+                     or _uo is not None)
+                and not (isinstance(_uo, dict)
+                         and _uo.get('status') == 'ok')):
+            unverified.append(name)
         oi = dsm.get('order_inference') if isinstance(dsm, dict) else None
         if not isinstance(oi, dict):
             if (isinstance(dsm, dict)
@@ -1385,7 +1597,8 @@ def _order_inference_markdown(ft):
                 '|---|---|---|---|---|---|---|---|---|']
         out.extend(rows)
         out += ['',
-                '> 定义：输入是**按语料/评测顺序排列**的逐单位种子均值效应；函数不排序、不洗牌。'
+                '> 定义：输入是**由落盘 `unit_order`（first-occurrence permutation + 有序 id 摘要）证明的语料/评测顺序**的逐单位种子均值效应；'
+                '只有 `unit_order.status=verified` 的读数进入本表，sorted-id 布局或旧产物不会被当作语料顺序。'
                 '`设计效应 = Var(块均值) / Var(i.i.d. 均值)`，>1 表示同一批数值在观测顺序下'
                 '比独立抽样更不稳定；`n_eff = n / 设计效应`。batch 列是非重叠 batch-means，'
                 'block 列是循环 moving-block bootstrap（块长在策略中预先声明，表中给声明块长的'
@@ -1405,6 +1618,10 @@ def _order_inference_markdown(ft):
     if missing:
         out += ['> 以下比较有逐单位区间但没有顺序依赖块（旧产物或未重新生成分析），'
                 '顺序依赖**未验证**：' + '；'.join(missing) + '。', '']
+    if unverified:
+        out += ['> 以下比较的 unit_order 未核验（旧产物、排序后向量或 attestation '
+                '不一致），其顺序读数被拒绝，不能读作语料顺序：'
+                + '；'.join(sorted(set(unverified))) + '。', '']
     return out
 
 
@@ -1444,10 +1661,18 @@ def _pooled_order_markdown(ft):
     missing = []
     not_estimable = []
     inflated = []
+    unverified = []
     for name, comp in comps.items():
         if not isinstance(comp, dict):
             continue
         dsm = comp.get('doc_sampling') or {}
+        _uo = dsm.get('unit_order') if isinstance(dsm, dict) else None
+        if (isinstance(dsm, dict)
+                and (dsm.get('pooled_order_inference') is not None
+                     or _uo is not None)
+                and not (isinstance(_uo, dict)
+                         and _uo.get('status') == 'ok')):
+            unverified.append(name)
         po = dsm.get('pooled_order_inference') if isinstance(dsm, dict) else None
         if not isinstance(po, dict):
             if (isinstance(dsm, dict)
@@ -1490,7 +1715,8 @@ def _pooled_order_markdown(ft):
                 '|---|---|---|---|---|---|---|---|---|']
         out.extend(rows)
         out += ['',
-                '> 定义：输入是**按语料/评测顺序排列**的逐单位 cluster influence。'
+                '> 定义：输入是**由落盘 `unit_order`（first-occurrence permutation + 有序 id 摘要）证明的语料/评测顺序**的逐单位 cluster influence；'
+                '只有 `unit_order.status=verified` 的读数进入本表，sorted-id 布局或旧产物不会被当作语料顺序。'
                 'token 池化 ΔPPL 是非线性估计量，不能把等权逐单位表的设计效应直接搬过来；'
                 '本表用该估计量自己的 delta-method influence（PPL 尺度与 log 尺度各一套）。'
                 '`设计效应 = Var(块均值) / Var(i.i.d. 均值)`，>1 表示同一批单位在观测顺序下'
@@ -1512,6 +1738,10 @@ def _pooled_order_markdown(ft):
     if missing:
         out += ['> 以下比较有 token 池化区间但没有顺序依赖块（旧产物或未重新生成分析），'
                 'token 池化顺序依赖**未验证**：' + '；'.join(missing) + '。', '']
+    if unverified:
+        out += ['> 以下比较的 unit_order 未核验（旧产物、排序后向量或 attestation '
+                '不一致），其顺序读数被拒绝，不能读作语料顺序：'
+                + '；'.join(sorted(set(unverified))) + '。', '']
     return out
 
 

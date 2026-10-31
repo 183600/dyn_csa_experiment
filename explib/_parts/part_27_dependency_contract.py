@@ -1530,13 +1530,308 @@ def _det_segment_sum(n_rows, indices, values, dtype=None, sorted_indices=False):
     return out
 
 
+UNIT_ORDER_POLICY = {
+    'version': 'unit-order-1',
+    'schema': 'unit_order_v1',
+    'basis': 'first_occurrence_in_scored_targets',
+    'unit_kinds': ('document', 'article'),
+    'algorithm': (
+        'sha256 over the analyzed sequence: for each unit id, the ASCII '
+        'decimal UTF-8 byte length, a colon, the UTF-8 bytes, and a newline'),
+    'role': (
+        'record the order actually used by an order-dependent readout, '
+        'together with the permutation from the stored per-unit vectors to '
+        'that order'),
+    'boundary': (
+        'The attestation proves which order the evaluator observed and that '
+        'the analysis used it.  It does not prove that the upstream extractor '
+        'itself preserved corpus order, nor that first occurrence is a '
+        'probability sample.  A sorted/shuffled vector without a matching '
+        'attestation is refused rather than silently analyzed.'),
+}
+
+
+def _uo_unit_ids(unit_ids, name='unit_ids'):
+    """Normalise one ordered unit-id sequence, refusing ambiguous inputs."""
+    if isinstance(unit_ids, (str, bytes, bytearray)):
+        raise ValueError(f'{name} must be an iterable of ids, not a string')
+    try:
+        raw = list(unit_ids)
+    except TypeError:
+        raise ValueError(f'{name} must be an iterable') from None
+    if not raw:
+        raise ValueError(f'{name} must not be empty')
+    out = []
+    for value in raw:
+        if isinstance(value, (bool, np.bool_)):
+            raise ValueError(f'{name} contains a boolean; a unit id is a '
+                             'string or an integer-like value')
+        try:
+            text = str(value)
+        except Exception:
+            raise ValueError(f'{name} contains an unrenderable id') from None
+        if text == '':
+            raise ValueError(f'{name} contains an empty id')
+        out.append(text)
+    if len(set(out)) != len(out):
+        raise ValueError(f'{name} must be unique; a duplicated unit cannot be '
+                         'ordered unambiguously')
+    return out
+
+
+def unit_order_sha256(unit_ids):
+    """Stable digest of an ORDERED unit-id sequence.
+
+    Length-prefixing prevents ``['a', 'bc']`` and ``['ab', 'c']`` from sharing
+    a digest.  The function deliberately does not sort: the order is the
+    measurement.
+    """
+    import hashlib as _uo_hashlib
+
+    ids = _uo_unit_ids(unit_ids)
+    h = _uo_hashlib.sha256()
+    for text in ids:
+        raw = text.encode('utf-8')
+        h.update(str(len(raw)).encode('ascii'))
+        h.update(b':')
+        h.update(raw)
+        h.update(b'\n')
+    return h.hexdigest()
+
+
+def unit_order_attestation(unit_ids, *, unit_kind, permutation=None,
+                           first_positions=None, n_tokens=None):
+    """Attest that ``unit_ids`` is the order an order-dependent readout used.
+
+    ``unit_ids`` is in the analyzed (first-occurrence/corpus) order.
+    ``permutation`` maps the canonical stored per-unit vectors (the sorted
+    ``doc_ids``/``article_ids`` vectors) to this order, so an auditor can
+    reconstruct the exact sequence from the stored cell.  ``first_positions``
+    are the flattened target positions where each ordered unit first appears;
+    they must be strictly increasing.
+    """
+    ids = _uo_unit_ids(unit_ids)
+    kind = str(unit_kind)
+    if kind not in UNIT_ORDER_POLICY['unit_kinds']:
+        raise ValueError(f'unit_kind must be one of '
+                         f'{UNIT_ORDER_POLICY["unit_kinds"]}, got {unit_kind!r}')
+    n_units = len(ids)
+    perm = None
+    if permutation is not None:
+        if isinstance(permutation, (str, bytes, bytearray)):
+            raise ValueError('permutation must be an iterable of integers')
+        try:
+            raw_perm = list(permutation)
+        except TypeError:
+            raise ValueError('permutation must be an iterable of integers') from None
+        if len(raw_perm) != n_units:
+            raise ValueError(f'permutation has {len(raw_perm)} entries for '
+                             f'{n_units} units')
+        perm = []
+        for value in raw_perm:
+            if isinstance(value, (bool, np.bool_)):
+                raise ValueError('permutation contains a boolean')
+            if not isinstance(value, (int, np.integer)):
+                raise ValueError('permutation must contain exact integers')
+            perm.append(int(value))
+        if sorted(perm) != list(range(n_units)):
+            raise ValueError('permutation must be a permutation of '
+                             f'range({n_units})')
+    positions = None
+    if first_positions is not None:
+        if isinstance(first_positions, (str, bytes, bytearray)):
+            raise ValueError('first_positions must be an iterable of integers')
+        try:
+            raw_pos = list(first_positions)
+        except TypeError:
+            raise ValueError('first_positions must be an iterable of integers') from None
+        if len(raw_pos) != n_units:
+            raise ValueError(f'first_positions has {len(raw_pos)} entries '
+                             f'for {n_units} units')
+        positions = []
+        for value in raw_pos:
+            if isinstance(value, (bool, np.bool_)):
+                raise ValueError('first_positions contains a boolean')
+            if not isinstance(value, (int, np.integer)):
+                raise ValueError('first_positions must contain exact integers')
+            ivalue = int(value)
+            if ivalue < 0:
+                raise ValueError('first_positions must be non-negative')
+            positions.append(ivalue)
+        if any(b <= a for a, b in zip(positions, positions[1:])):
+            raise ValueError('first_positions must be strictly increasing '
+                             'under the analyzed order')
+    if n_tokens is not None:
+        if isinstance(n_tokens, (bool, np.bool_)):
+            raise ValueError('n_tokens must be a positive integer, not a boolean')
+        if not isinstance(n_tokens, (int, np.integer)):
+            raise ValueError('n_tokens must be a positive integer')
+        n_tokens = int(n_tokens)
+        if n_tokens <= 0:
+            raise ValueError('n_tokens must be a positive integer')
+    return {
+        'schema': UNIT_ORDER_POLICY['schema'],
+        'policy_version': UNIT_ORDER_POLICY['version'],
+        'basis': UNIT_ORDER_POLICY['basis'],
+        'algorithm': UNIT_ORDER_POLICY['algorithm'],
+        'unit_kind': kind,
+        'n_units': n_units,
+        'sha256': unit_order_sha256(ids),
+        'permutation': perm,
+        'first_positions': positions,
+        'n_tokens': n_tokens,
+        'note': UNIT_ORDER_POLICY['boundary'],
+    }
+
+
+def unit_order_problems(attestation, unit_ids, *, unit_kind=None,
+                        expected_sha256=None):
+    """Return a list of reasons an attestation does not describe ``unit_ids``.
+
+    ``unit_ids`` must be the analyzed order.  An empty list means the digest,
+    basis, declared size and (when present) permutation/positions are
+    internally consistent with that sequence.  The caller still owns the
+    question of whether the upstream evaluation preserved corpus order.
+    """
+    problems = []
+    if not isinstance(attestation, dict):
+        return [f'unit_order is a {type(attestation).__name__}, not an object']
+    try:
+        ids = _uo_unit_ids(unit_ids)
+    except ValueError as exc:
+        return [str(exc)]
+    if attestation.get('schema') != UNIT_ORDER_POLICY['schema']:
+        problems.append('unit_order.schema is not '
+                        f'{UNIT_ORDER_POLICY["schema"]!r}')
+    if attestation.get('basis') != UNIT_ORDER_POLICY['basis']:
+        problems.append('unit_order.basis is not '
+                        f'{UNIT_ORDER_POLICY["basis"]!r} (got '
+                        f'{attestation.get("basis")!r}); a sorted id vector is '
+                        'not a corpus-order attestation')
+    if attestation.get('algorithm') != UNIT_ORDER_POLICY['algorithm']:
+        problems.append('unit_order.algorithm is not the documented '
+                        'length-prefixed SHA-256')
+    if unit_kind is not None and attestation.get('unit_kind') != str(unit_kind):
+        problems.append('unit_order.unit_kind '
+                        f'{attestation.get("unit_kind")!r} != {unit_kind!r}')
+    n_units = attestation.get('n_units')
+    if isinstance(n_units, bool) or not isinstance(n_units, (int, np.integer)):
+        problems.append('unit_order.n_units is not an integer')
+    elif int(n_units) != len(ids):
+        problems.append(f'unit_order.n_units={n_units!r} != {len(ids)} ids')
+    stored_sha = attestation.get('sha256')
+    if not isinstance(stored_sha, str) or len(stored_sha) != 64:
+        problems.append('unit_order.sha256 is not a 64-character digest')
+    else:
+        try:
+            recomputed = unit_order_sha256(ids)
+        except ValueError as exc:
+            problems.append(str(exc))
+        else:
+            if stored_sha.lower() != recomputed:
+                problems.append('unit_order.sha256 does not recompute from the '
+                                'analyzed id sequence')
+    if expected_sha256 is not None:
+        if not isinstance(stored_sha, str) or stored_sha.lower() != str(
+                expected_sha256).lower():
+            problems.append('unit_order.sha256 disagrees with the expected '
+                            'order fingerprint')
+    if 'permutation' in attestation:
+        perm = attestation.get('permutation')
+        if perm is not None:
+            if not isinstance(perm, list) or len(perm) != len(ids):
+                problems.append('unit_order.permutation is not a list aligned '
+                                'with n_units')
+            else:
+                norm = []
+                for value in perm:
+                    if isinstance(value, bool) or not isinstance(
+                            value, (int, np.integer)):
+                        norm = None
+                        break
+                    norm.append(int(value))
+                if norm is None or sorted(norm) != list(range(len(ids))):
+                    problems.append('unit_order.permutation is not a '
+                                    f'permutation of range({len(ids)})')
+    if 'first_positions' in attestation:
+        pos = attestation.get('first_positions')
+        if pos is not None:
+            if not isinstance(pos, list) or len(pos) != len(ids):
+                problems.append('unit_order.first_positions is not a list '
+                                'aligned with n_units')
+            else:
+                norm = []
+                for value in pos:
+                    if isinstance(value, bool) or not isinstance(
+                            value, (int, np.integer)) or int(value) < 0:
+                        norm = None
+                        break
+                    norm.append(int(value))
+                if norm is None:
+                    problems.append('unit_order.first_positions contains a '
+                                    'non-integer or negative value')
+                elif any(b <= a for a, b in zip(norm, norm[1:])):
+                    problems.append('unit_order.first_positions is not '
+                                    'strictly increasing')
+    if 'n_tokens' in attestation and attestation.get('n_tokens') is not None:
+        ntok = attestation.get('n_tokens')
+        if isinstance(ntok, bool) or not isinstance(ntok, (int, np.integer)) \
+                or int(ntok) <= 0:
+            problems.append('unit_order.n_tokens is not a positive integer')
+    return problems
+
+
+def _unit_order_from_index(keys, present, inv, n_tokens_total, unit_kind):
+    """Build the first-occurrence attestation for the RETURNED vectors.
+
+    ``keys`` is the full sorted unique id array, ``present`` are the indices
+    into it that the caller actually returned, and ``inv`` maps every scored
+    target to its index in ``keys``.  The returned vectors are
+    ``keys[present]`` in ascending-index (sorted-id) order, so ``permutation``
+    indexes into those vectors.  First-occurrence order is computed from the
+    target stream, never from the id values.
+    """
+    arr = np.asarray(inv).reshape(-1)
+    if arr.size == 0:
+        raise ValueError('_unit_order_from_index: empty target map')
+    present = [int(x) for x in present]
+    present_set = set(present)
+    if len(present_set) != len(present):
+        raise ValueError('_unit_order_from_index: duplicate present indices')
+    pos_in_present = {full_idx: pos for pos, full_idx in enumerate(present)}
+    present_units, first_idx = np.unique(arr, return_index=True)
+    if any(int(u) not in present_set for u in present_units):
+        raise ValueError('_unit_order_from_index: a scored unit is absent from '
+                         'the returned vectors')
+    first_for_present = [0] * len(present)
+    seen = [False] * len(present)
+    for unit, pos in zip(present_units.tolist(), first_idx.tolist()):
+        idx = pos_in_present[int(unit)]
+        first_for_present[idx] = int(pos)
+        seen[idx] = True
+    if not all(seen):
+        raise ValueError('_unit_order_from_index: a returned unit has no '
+                         'scored target')
+    order = sorted(range(len(present)),
+                   key=lambda i: (first_for_present[i], i))
+    keys = np.asarray(keys)
+    ordered_ids = [format(int(keys[present[i]]), '016x') for i in order]
+    positions = [int(first_for_present[i]) for i in order]
+    return unit_order_attestation(
+        ordered_ids, unit_kind=unit_kind, permutation=order,
+        first_positions=positions, n_tokens=int(n_tokens_total))
+
+
 def document_index(doc_ids):
     """Compact, deterministic index for an arbitrary per-token document-id array.
 
     Returns ``(keys, inverse)`` where ``keys`` is the sorted unique document
     id array and ``inverse`` maps every element back to its position in
     ``keys``.  The same ``(keys, inverse)`` pair can be sliced for several
-    evaluation lengths/chunks, so document order cannot change between them.
+    evaluation lengths/chunks, so the index cannot change between them.  The
+    sorted order is a canonical vector layout, NOT corpus order; the
+    first-occurrence order is recorded separately in the cell's ``unit_order``
+    attestation.
 
     Document ids are uint64 hashes; converting them to a dense index avoids
     materialising a huge [n_docs] tensor indexed by the raw hash value.  The
@@ -1658,6 +1953,14 @@ def aggregate_nll_by_document(nll, doc_ids, *, document_index_map=None):
         'doc_ids_fp': _ids_fp(keys_present),
         'nll_per_doc_total': float(sum(nll_values)),
         'n_tokens_total': int(sum(n_tokens)),
+        # The per-document vectors above stay in the canonical sorted-id
+        # layout (backward compatible).  Corpus/first-occurrence order is a
+        # SEPARATE measurement: `permutation` maps those vectors to it, and
+        # `sha256` binds the ordered id sequence.  Order-dependent readouts
+        # must use this permutation or refuse; `np.unique` sorting is not
+        # corpus order.
+        'unit_order': _unit_order_from_index(
+            np.asarray(keys), _present, inv, int(sum(n_tokens)), 'document'),
     }
 
 
@@ -1691,6 +1994,7 @@ def aggregate_nll_by_article(nll, article_ids, *, document_index_map=None):
         'nll_per_article_total': float(doc['nll_per_doc_total']),
         'n_tokens_article_total': int(doc['n_tokens_total']),
         'article_source': 'per_token_article_map',
+        'unit_order': dict(doc['unit_order'], unit_kind='article'),
     }
 
 

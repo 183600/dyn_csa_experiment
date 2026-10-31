@@ -18,10 +18,13 @@ This fragment closes that gap using the estimator's own cluster influence:
   ``sum_i psi_i`` is that difference (up to floating-point round-off).
 * ``q_i`` is the analogous influence on the token-pooled **log** PPL ratio
   ``mean_s[mean_a_s - mean_b_s]``; ``sum_i q_i`` is that ratio.
-* both influence series are kept in corpus order.  Batch means and a circular
-  moving-block bootstrap estimate a design effect and ``n_eff`` relative to
-  the i.i.d. cluster variance; an order-exchangeability permutation test asks
-  whether the observed order carries serial structure.
+* both influence series are kept in corpus order.  Pass the evaluation cell's
+  first-occurrence ``unit_order`` attestation to verify that order; a
+  sorted/shuffled id vector is then refused, while an un-attested call is
+  marked ``unverified``.  Batch means and a circular moving-block bootstrap
+  estimate a design effect and ``n_eff`` relative to the i.i.d. cluster
+  variance; an order-exchangeability permutation test asks whether the
+  observed order carries serial structure.
 * the order-robust interval is the widest of the i.i.d. cluster interval and
   all declared block-length intervals, so the block length cannot be chosen
   after looking at the result.
@@ -84,9 +87,11 @@ POOLED_ORDER_POLICY = {
         'contrast, not the exact finite-sample distribution. Block and batch '
         'estimates are noisy at n of a few dozen; the widest declared '
         'interval is reported so the block length cannot be chosen after '
-        'looking. The permutation p-value is a diagnostic and never enters '
-        'the frozen Holm family, p_exact_signflip, p_holm, verified or any '
-        'confirmed verdict.'),
+        'looking. The input order is caller-asserted unless a first-occurrence '
+        'unit_order attestation is supplied and verified; a sorted/shuffled '
+        'id vector without one is not corpus order. The permutation p-value '
+        'is a diagnostic and never enters the frozen Holm family, '
+        'p_exact_signflip, p_holm, verified or any confirmed verdict.'),
 }
 
 POOLED_ORDER_STATUSES = ('ok', 'not_estimable')
@@ -503,12 +508,39 @@ def _po_endpoint(series, point, *, name, policy, n_units):
     }
 
 
+def _po_order_block(ids, attestation):
+    """Verified/unverified order provenance for one pooled readout."""
+    if attestation is None:
+        return {
+            'status': 'unverified',
+            'basis': None, 'sha256': None,
+            'n_units': (len(ids) if ids is not None else None),
+            'reason': ('no unit-order attestation was supplied; the input '
+                       'order is caller-asserted, not verified'),
+        }
+    if ids is None:
+        raise ValueError(
+            'pooled_order_inference_from_influence: order_attestation '
+            'requires unit_ids so the stored order fingerprint can be '
+            'recomputed')
+    problems = unit_order_problems(attestation, ids)
+    if problems:
+        raise ValueError('pooled_order_inference: ' + '; '.join(problems))
+    return {
+        'status': 'verified',
+        'basis': attestation.get('basis'),
+        'sha256': attestation.get('sha256'),
+        'unit_kind': attestation.get('unit_kind'),
+        'n_units': len(ids),
+    }
+
+
 def pooled_order_inference_from_influence(
         ppl_influence, log_ratio_influence, *, delta_ppl, delta_log_ratio,
         unit_ids=None, seeds=None, n_seeds=None, block_lengths=None,
         n_batches=None, n_boot=None, n_perm=None, conf=None, alpha=None,
         seed=None, design_effect_tolerance=None,
-        material_ci_inflation=None):
+        material_ci_inflation=None, order_attestation=None):
     """Replay the pooled design-effect readout from stored influence series.
 
     This is the audit entry point as well as the core of
@@ -581,12 +613,15 @@ def pooled_order_inference_from_influence(
         'n_units': D,
         'n_seeds': n_seeds,
         'conf': None, 'alpha': None, 'seed': None,
+        'unit_order': _po_order_block(ids, order_attestation),
         'sufficient_statistics': {
             'ppl_influence': [float(v) for v in psi],
             'log_ratio_influence': [float(v) for v in q],
             'delta_ppl': delta_ppl,
             'delta_log_ratio': delta_log,
             'unit_ids': ids,
+            'unit_order': _po_order_block(ids, order_attestation),
+            'unit_order_attestation': order_attestation,
             'seeds': seed_list,
             'n_seeds': n_seeds,
         },
@@ -750,7 +785,7 @@ def pooled_order_inference(nll_a, nll_b, n_tokens, *, unit_ids=None,
                            seeds=None, block_lengths=None, n_batches=None,
                            n_boot=None, n_perm=None, conf=None, alpha=None,
                            seed=None, design_effect_tolerance=None,
-                           material_ci_inflation=None):
+                           material_ci_inflation=None, order_attestation=None):
     """Order-dependence readout for the token-pooled PPL contrast.
 
     ``nll_a`` / ``nll_b`` are ``[n_seeds, n_units]`` summed-NLL matrices on
@@ -762,6 +797,11 @@ def pooled_order_inference(nll_a, nll_b, n_tokens, *, unit_ids=None,
     A valid but too-small or degenerate panel returns
     ``status='not_estimable'`` with a reason; malformed inputs raise
     ``ValueError``.  No p-value, Holm member or frozen field is produced.
+
+    ``order_attestation`` is the cell's first-occurrence attestation.  When
+    supplied, the ordered-id digest is recomputed and a sorted/shuffled
+    vector is refused; the returned ``unit_order`` block then says
+    ``verified``.  Without it the order is caller-asserted (``unverified``).
     """
     A = _as_nll_matrix(nll_a, 'pooled_order_inference(nll_a)',
                        axis_label='n_units', value_label='per-unit')
@@ -811,7 +851,8 @@ def pooled_order_inference(nll_a, nll_b, n_tokens, *, unit_ids=None,
             block_lengths=block_lengths, n_batches=n_batches,
             n_boot=n_boot, n_perm=n_perm, conf=conf, alpha=alpha,
             seed=seed, design_effect_tolerance=design_effect_tolerance,
-            material_ci_inflation=material_ci_inflation)
+            material_ci_inflation=material_ci_inflation,
+            order_attestation=order_attestation)
         _out['upstream'] = (
             'pooled_order_inference: exact-rational per-seed token-pooled '
             'NLL influence for a token total beyond float64; same estimand '
@@ -882,7 +923,8 @@ def pooled_order_inference(nll_a, nll_b, n_tokens, *, unit_ids=None,
         block_lengths=block_lengths, n_batches=n_batches, n_boot=n_boot,
         n_perm=n_perm, conf=conf, alpha=alpha, seed=seed,
         design_effect_tolerance=design_effect_tolerance,
-        material_ci_inflation=material_ci_inflation)
+        material_ci_inflation=material_ci_inflation,
+        order_attestation=order_attestation)
     out['upstream'] = ('pooled_order_inference: per-seed token-pooled NLL '
                        'matrices; influence is the delta-method cluster '
                        'influence of the same estimand as the primary '
