@@ -1113,7 +1113,7 @@ class _DocDeduplicator:
 
 
 def _filter_test_documents(train_rows, val_index, test_rows, *, label='test',
-                          protocol=None):
+                          protocol=None, verbose=True):
     """Remove test documents that duplicate an earlier split or each other.
 
     ``train_rows`` are the raw training documents and ``val_index`` is the
@@ -1164,13 +1164,14 @@ def _filter_test_documents(train_rows, val_index, test_rows, *, label='test',
             excluded[f'test_{_self_kind}'] += 1
             continue
         kept.append(_r)
-    print(f'[data] {label} duplicate cleanup: excluded '
-          f'{excluded["train_exact"]} exact and {excluded["train_near"]} '
-          f'near-duplicate documents from train, '
-          f'{excluded["validation_exact"]} exact and '
-          f'{excluded["validation_near"]} near-duplicate documents from '
-          f'validation, and {excluded["test_exact"]} exact / '
-          f'{excluded["test_near"]} near-duplicate {label} documents')
+    if verbose:
+        print(f'[data] {label} duplicate cleanup: excluded '
+            f'{excluded["train_exact"]} exact and {excluded["train_near"]} '
+            f'near-duplicate documents from train, '
+            f'{excluded["validation_exact"]} exact and '
+            f'{excluded["validation_near"]} near-duplicate documents from '
+            f'validation, and {excluded["test_exact"]} exact / '
+            f'{excluded["test_near"]} near-duplicate {label} documents')
     return kept, excluded, test_index
 
 

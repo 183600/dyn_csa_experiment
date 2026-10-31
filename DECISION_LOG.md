@@ -5659,3 +5659,63 @@ factorial 门与它们对「单因素」的定义不一致。
 `full_sink` 的自定义 2x2 被拒绝，`attention_sink` 准确报告为 False。
 `test_review_part_08/16/25/32/50/52/53` 与 `audit_gates.py
 single_factor` / `factorial` 在当前树通过。
+
+## 2026-10-31 — 清洗计数不是服务成员：从 raw rows 重放 dedup 决定（本轮数据方法硬化，no new runs）
+
+零 GPU；不新增训练、默认不读取 test split、不修改
+`confirmation_frozen*.json` 的字节/种子/端点/α/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未删除、未修改、未移动。
+
+**Problem.** §82 与 `audit_gates.py data_processing` 把 exact/SimHash
+清理的几何、`protocol_fp` 与 source→served 台账纳入缓存身份，并核对
+「scanned − served = exact + near」、sidecar 长度与跨 split 协议一致。
+但这些都只证明台账**自洽**：同一协议下改掉 fit 前缀行数、扫描行数或
+索引顺序，计数仍可闭合而 served 文档集合已经不同；缓存也可以记录一个
+协议却用另一套几何实际执行。现有泄漏/切分审计检查的是**已服务**集合
+之间的重叠，无法判断 served 集合本身是不是「该协议在这批 raw rows 上
+的输出」。
+
+**Fix.** 新增 `explib/_parts/part_62_cleaning_replay.py`：
+
+- `replay_train_validation_cleanup` 按 `load_wikitext.stream_tokenise`
+  的真实顺序重放：前 `tokenizer_fit_rows` 个非空 train row 播种索引；
+  处理恰好 `sampling.train.nonempty_rows_scanned` 个非空 train row
+  （前 fit 行 force-keep、不查重，其余 mutating `is_duplicate`）；在
+  同一索引上处理恰好 `sampling.validation.nonempty_rows_scanned` 个
+  非空 val row。kept row 的内容哈希必须与 `train_doc_ids` / `val_doc_ids`
+  的 served 前缀逐位相等；loader 按 10k chunk 先整块去重、再在 token cap
+  处停止 tokenise，且 validation 会额外 tokenise 一个 sequence 再裁掉，
+  故只允许尾部多出的 replayed kept row（warning），前缀不容错。exact/near
+  删除数取 `stats()` 差分后与台账比较。
+- `replay_heldout_cleanup` 复用生产者的 `_filter_test_documents`，
+  重放 train/validation/self 三类归属，核对 test served 前缀、
+  `source_documents(_nonempty)`、`kept_documents`、三个删除类别与
+  `validation_cleanup` 的 source/kept/indexed/removed 台账。
+- `replay_wikitext_cleaning` 负责 cache/raw 解析、按 `(vocab, fit_fp)`
+  配对 test meta、`source_rows` raw 行数预检与显式 `include_test`。
+- `audit_gates.py cleaning_replay`（别名 `cleanup_replay` /
+  `dedup_replay` / `replay_cleaning`）；`include_test` 由
+  `CSA_REPLAY_INCLUDE_TEST=1` 显式开启，`CSA_REPLAY_MAX_ROWS` 放宽
+  行数门；`CSA_REPLAY_IN_REPORT=1` 时才并入 `report` 顶层（完整重放
+  要哈希 served train 的每一行，不应成为每次汇总的隐式成本）。
+- `_filter_test_documents` 增加 `verbose=True` 参数，审计重放时可静默；
+  默认行为与输出不变。
+
+**Boundary.** 证明「served membership = 记录协议 + 这批 raw rows 的
+确定性输出」，不证明 raw rows 一定是上游 split（仍由
+`dataset_source`、row-count 预检、`src_fp`/`fit_fp`/`val_fp` 与 release
+manifest 承担），也不重放 tokenization（由 `tokenizer_*` 与 `src_fp`
+负责）。near 删除是否「应该」发生仍是研究设计判断，本门只证明生产者
+按记录几何实际删除了这些行。默认不读 `wiki.test.raw`；显式
+`include_test` 时 artifact 记录 `test_raw_read=true`，该读取仍应计入
+test access 预算。缺完整协议/fit 行数/sidecar 的旧缓存报
+`not_verifiable`，不回填、不重跑、不改任何冻结判定或测量值。
+
+**Verification.** 新增 `test_review_part_62.py` 15 项：train/val 逐位
+重放（fit force-keep、exact/near 计数、train chunk / val 尾 trim）；篡改
+served id、协议几何、fit 行数、删协议/删 fit 行数、非字符串行、畸形
+计数、`max_rows` 门（含读取前拦截）；test
+train/validation/self 归属、kept 前缀、`validation_cleanup` 台账与
+计数/成员篡改；文件级 raw/侧车缺失语义；显式 `include_test` 才读
+`wiki.test.raw`，删掉该文件只让显式请求变为 `not_verifiable`；CLI 与
+wrapper 接线。完整 CPU 套件（1235 项）在本轮最终树通过。

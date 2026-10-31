@@ -37,6 +37,7 @@ _PARTS = [
 'part_24_audit_pooled_order.py',
 'part_25_audit_data_exposure.py',
 'part_26_audit_unit_order.py',
+'part_27_audit_cleaning_replay.py',
 ]
 
 load_root_package(globals(), __file__, _PARTS,

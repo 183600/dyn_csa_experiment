@@ -10909,3 +10909,118 @@ content_mode、use_sink、sink_mode）全部通过。
 既有 `test_review_part_08/16/25/32/50/52/53` 通过；`audit_gates.py
 single_factor` 与 `audit_gates.py factorial` 在当前树为 `ok`。
 
+
+## 122. 清洗计数不是服务成员：从 raw rows 重放 exact/SimHash 决定（本轮数据方法硬化，no new runs）
+
+零 GPU；不新增训练、不读取 test split（`include_test` 显式 opt-in 时除外）、
+不修改 `confirmation_frozen*.json` 的字节/种子/端点/α/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未删除、未修改、未移动。
+
+### 122.1 问题：自洽的台账仍可能描述另一个数据集
+
+§82 把近重复清理的 shingle 宽度、LSH band/Hamming 阈值、exact hash 和
+`protocol_fp` 纳入缓存身份，`audit_data_processing` 再核对
+`nonempty_rows_scanned - rows_served = exact + near`、sidecar 长度与
+跨 split 协议一致。但这些检查都只回答「台账是否自洽」：
+
+- 同一份 raw split、同一个协议，若 `fit` 前缀行数、扫描行数或索引顺序
+  被改过，台账仍可闭合，served document ids 却已经是另一个集合；
+- 一个把 near 阈值/band 几何写进 meta 但实际用另一套几何构建的缓存，
+  `protocol_fp` 只证明「记录的这个协议」被哈希，不证明「实际执行的是
+  这个协议」；
+- 现有 `audit_leakage` / `audit_split_discipline` 能发现 served 集合之间
+  的文档重叠，却无法发现「served 集合本身不是该协议在 raw rows 上的
+  输出」——例如错误地保留了本应被 exact 副本过滤掉的行。
+
+这正是 §82 没有解决的那一层：计数与参数是 cleaning **identity** 的必要
+条件，不是 **membership** 的证据。若不同 arm 的 cache 在相同计数下服务了
+不同文档，PPL 比较就不只是模型差异，而是把数据差异混进了效应估计；这是
+数据口径问题，不能靠增加种子或换统计检验修补。
+
+### 122.2 方法：用 raw rows 重放生产者的逐行决定
+
+新增 `replay_train_validation_cleanup` / `replay_heldout_cleanup` /
+`replay_wikitext_cleaning`（`explib/_parts/part_62_cleaning_replay.py`）：
+
+1. 从 cache meta 读取完整 `dedup.protocol`、`tokenizer_fit_rows`、
+   `sampling.{train,validation}.nonempty_rows_scanned`、`source_rows` 与
+   `dedup.splits` 计数；缺协议/缺 fit 行数/缺扫描行数一律
+   `not_verifiable`。
+2. 按 `load_wikitext` 的真实顺序重放：
+   - 用前 `tokenizer_fit_rows` 个非空 train row 播种 dedup 索引（与
+     `_fit_doc_prefix` 相同，包含 fit 行之间的重复）；
+   - 处理恰好 `sampling.train.nonempty_rows_scanned` 个非空 train row；
+     前 `tokenizer_fit_rows` 行 force-keep、不查重（与
+     `stream_tokenise` 的 skip 条件相同），其余行走 mutating
+     `is_duplicate`；
+   - 在**同一个**索引上处理恰好
+     `sampling.validation.nonempty_rows_scanned` 个非空 val row。
+3. 把重放得到的 kept row 转成 `_doc_id_u64(_doc_exact_fp(row))`，与
+   `train_doc_ids_*.npy` / `val_doc_ids_*.npy` 比较**served 前缀**：loader
+   按 10k row chunk 先完成整块去重、再在 token cap 处停止 tokenise，因此
+   最后的 chunk 里可能有已去重但未进入 token 流的 row；validation 还会
+   额外 tokenise 一个 sequence 再裁掉。两者都只允许尾部多出的 replayed
+   kept row（单独 warning），前缀本身必须逐位相等。报告同时给出
+   replayed/expected kept 的 `_ids_fp` 摘要，便于跨机器/跨时间比较同一
+   清洗决定，而不必落盘整条 id 向量。
+4. exact/near 删除数取重放前后 `stats()` 的差，再与
+   `sampling.*.duplicate_documents_skipped`（或 `dedup.splits.*`）比较。
+5. `include_test=True` 时，直接调用生产者的
+   `_filter_test_documents` 重放 train/validation/self 三类归属，比较
+   test served 前缀、`source_documents(_nonempty)`、`kept_documents`、
+   三个删除类别以及 `validation_cleanup` 的 source/kept/indexed/removed
+   台账。
+
+`source_rows` 先核对 raw 行数，避免把「另一个 dump」误报成 cleaning
+mismatch；kept ids 是 raw 行内容的哈希，因此逐位相等同时把 served 文档
+内容绑定到这批 raw rows。`max_rows` 默认 1,000,000，超过时明确
+`not_verifiable` 并提示显式放宽，而不是静默抽样或把大语料跑成「通过」。
+
+### 122.3 接线与入口
+
+- `audit_gates.py cleaning_replay`（别名 `cleanup_replay` /
+  `dedup_replay` / `replay_cleaning`）：可传 `cache_dir raw_dir`；
+  `include_test` 由 `CSA_REPLAY_INCLUDE_TEST=1` 显式开启，
+  `CSA_REPLAY_MAX_ROWS` 放宽行数门（held-out 重放需要完整 raw train，
+  WikiText-103 上通常要设为 `0` 才不被默认 1M 门挡住），
+  `CSA_REPLAY_TRAIN_SEQ_LEN` 在同一 cache 目录存在多个 train meta 时
+  指定序列长度。
+- `audit_gates.py report` 默认**不**包含该门：完整重放需要哈希 served
+  train 的每一行，属于显式审计而非每次汇总；`CSA_REPLAY_IN_REPORT=1`
+  时才并入顶层 `cleaning_replay`。
+- 文档改动只在本节与 `DECISION_LOG.md` 条目，以及 `audit_gates.py
+  --help` 的子命令说明；不修改 README。
+
+### 122.4 边界
+
+- 证明的是「served membership = 记录协议 + 这批 raw rows 的确定性输出」，
+  不是「raw rows 一定是上游 split」；后者由 `dataset_source`、row-count
+  预检、`src_fp`/`fit_fp`/`val_fp` 与 release manifest 共同承担。
+- 不重放 tokenization：词表/merge/字节身份由 `tokenizer_*` 与 `src_fp`
+  负责；本门只核对文档级决定。
+- 不证明 near 删除的每一条都「应该」删除；它证明生产者按记录的几何
+  实际删除了这些行，并且 kept 集合逐位可复现。协议本身是否合理仍是
+  研究设计判断。
+- `wiki.test.raw` 是 held-out 数据；默认不读。显式 `include_test` 时
+  artifact 记录 `test_raw_read=true`，且该次读取应计入 test access
+  预算；`test_access` 审计仍按原规则工作。
+- 旧缓存缺 `tokenizer_fit_rows`/完整协议/sidecar 时是
+  `not_verifiable`，不是 pass；不回填、不重跑、不改冻结判定。
+
+### 122.5 验证
+
+```bash
+python audit_gates.py cleaning_replay            # 默认 cache/raw 搜索路径
+python audit_gates.py cleanup_replay CACHE RAW
+CSA_REPLAY_INCLUDE_TEST=1 python audit_gates.py cleaning_replay CACHE RAW
+python -m pytest -q test_review_part_62.py
+```
+
+`test_review_part_62.py` 15 项覆盖：train/val 逐位重放（含 fit 前缀
+force-keep、exact/near 计数、train chunk / validation 尾部 trim）；篡改
+served id、篡改协议几何、篡改 fit 行数、删协议/删 fit 行数、非字符串行、
+畸形计数、`max_rows` 门（含读取前拦截）；test
+train/validation/self 归属、kept 前缀、`validation_cleanup` 台账及
+计数/成员篡改；文件级 wrapper 的 raw 缺失/侧车缺失语义；显式
+`include_test` 才读 `wiki.test.raw` 且删掉该文件只让显式请求变为
+`not_verifiable`；CLI/wrapper 接线。完整 CPU 套件在最终树通过。

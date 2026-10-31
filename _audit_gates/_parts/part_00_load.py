@@ -299,6 +299,14 @@
                身份；同 vocab/fit_fp 的 train/val/test 必须共享同一协议；
                核对 source→served 行/文档/token 台账及 .npy 侧边长度；
                legacy 缓存明确降级，缺缓存报 not_verifiable
+  cleaning_replay  清洗决定重放：由 raw rows + 记录的清理协议、tokenizer
+               拟合行数与非空扫描行数，重放 fit-prefix 播种、train/val 逐行
+               exact/SimHash 判定，核对 served document ids 逐位一致；只有
+               计数和 protocol_fp 自洽不算证据。raw train/valid 是必需的，
+               缺任何输入报 not_verifiable；wiki.test.raw 仅在显式
+               include_test / CSA_REPLAY_INCLUDE_TEST=1 时读取并单独标记
+               （别名 cleanup_replay / dedup_replay / replay_cleaning；
+               可传 cache_dir raw_dir；大语料用 CSA_REPLAY_MAX_ROWS 限制）
   practical_significance  结果分析：重放确认主对照的 SESOI/TOST 块——从逐种子
                两臂 PPL 重建 log ratio、配对 t 区间、TOST 等价判定与
                「超越 margin」单侧 p，并核对两个独立 Holm 族与汇总；
