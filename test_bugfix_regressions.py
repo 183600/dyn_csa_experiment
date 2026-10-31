@@ -556,3 +556,47 @@ def test_paired_doc_ci_supports_token_totals_beyond_float64():
                         rel_tol=1e-12, abs_tol=0.0)
     assert got['delta_ppl_ci95'] is not None
     json.dumps(got, allow_nan=False)
+
+
+def test_endpoint_sensitivity_withholds_unrepresentable_scale_statistics():
+    # A finite repeat panel can have a representable mean/range/SD even when
+    # the naive NumPy reductions overflow, and an actually unrepresentable
+    # envelope must be unavailable rather than infinite (reports are strict
+    # JSON).
+    res = L.endpoint_measurement_resolution([1e308, 1.7e308])
+    assert res['status'] == 'ok', res
+    assert math.isfinite(res['mean']) and math.isfinite(res['sd'])
+    assert math.isfinite(res['range']) and math.isfinite(res['resolution'])
+    json.dumps(res, allow_nan=False)
+
+    span = L.endpoint_measurement_resolution([-1.7e308, 1.7e308])
+    assert span['status'] == 'not_verifiable', span
+    assert span['range'] is None and span['sd'] is None
+    assert span['resolution'] is None and span['resolves_mee'] is None
+    json.dumps(span, allow_nan=False)
+
+    # Bounds whose span/hole exceeds float64 stay structurally classifiable
+    # but never serialise an infinity.
+    head = L.endpoint_headroom('custom', control_level=-1e308,
+                               metric='custom', direction='higher_is_better',
+                               bounds=[-1e308, 1e308],
+                               minimum_meaningful_effect=0.05)
+    assert head['status'] == 'ok', head
+    assert head['span'] is None and head['headroom'] is None
+    assert head['headroom_covers_mee'] is True
+    json.dumps(head, allow_nan=False)
+
+    # A huge planned unit count must not raise from float(n) and an MDE that
+    # overflows is withheld, not reported as an infinity.
+    huge = L.endpoint_sensitivity(
+        'accuracy', control_level=0.5, minimum_meaningful_effect=1e-6,
+        repeat_values=[0.5, 0.5], paired_sd=1e308, n_units=10 ** 400)
+    assert huge['status'] == 'not_verifiable', huge
+    assert huge['mde']['mde'] is None, huge['mde']
+    json.dumps(huge, allow_nan=False)
+
+    # A numeric string is a provenance/serialisation artefact, not a level or
+    # repeat measurement.  It must not be silently promoted by float().
+    assert L.endpoint_headroom('accuracy', '0.9')['status'] == 'invalid'
+    assert L.endpoint_measurement_resolution(
+        ['0.9', '0.91'])['n_repeats'] == 0

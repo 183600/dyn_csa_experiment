@@ -92,14 +92,105 @@ _DEFAULT_MIN_RELATIVE_HEADROOM = 0.05
 
 
 def _es_float(value):
-    """Finite float or ``None`` (booleans are not numbers here)."""
-    if isinstance(value, (bool, np.bool_)):
+    """Finite float or ``None`` (booleans and numeric strings are not numbers)."""
+    if isinstance(value, (bool, np.bool_, str, bytes, bytearray)):
+        # A JSON/serialisation string such as "0.9" is not a measurement;
+        # accepting it here would let a provenance label become a level.
         return None
     try:
         out = float(value)
     except (TypeError, ValueError, OverflowError):
         return None
     return out if math.isfinite(out) else None
+
+
+def _es_diff(a, b):
+    """``a - b`` as a finite float, or ``None`` when the result overflows."""
+    try:
+        out = float(a) - float(b)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return out if math.isfinite(out) else None
+
+
+def _es_mean_sd(values):
+    """Overflow-safe sample mean and SD (``ddof=1``) of finite floats.
+
+    The ordinary NumPy expression is kept bit-for-bit.  Only when it produces
+    a non-finite statistic does the fallback scale by the largest magnitude
+    before summing, which recovers a representable mean/SD from a panel whose
+    naive sum or squares overflowed.  A statistic genuinely beyond float64 is
+    returned as ``None``; it is never represented as an infinity.
+    """
+    vals = [float(v) for v in values]
+    n = len(vals)
+    if n == 0:
+        return None, None
+    arr = np.asarray(vals, dtype=float)
+    with np.errstate(over='ignore', invalid='ignore'):
+        try:
+            mean = float(np.mean(arr))
+            sd = float(np.std(arr, ddof=1)) if n > 1 else 0.0
+        except (OverflowError, ValueError, TypeError):
+            mean, sd = None, None
+    mean_ok = mean is not None and math.isfinite(mean)
+    sd_ok = sd is not None and math.isfinite(sd)
+    if mean_ok and (n < 2 or sd_ok):
+        return mean, sd
+    scale = max(abs(v) for v in vals)
+    if scale == 0.0:
+        return 0.0, 0.0
+    z = [v / scale for v in vals]
+    try:
+        mz = math.fsum(z) / n
+        scaled_mean = scale * mz
+    except (OverflowError, ValueError):
+        scaled_mean, scaled_sd = None, None
+    else:
+        scaled_mean = (scaled_mean if math.isfinite(scaled_mean) else None)
+        scaled_sd = 0.0 if n < 2 else None
+        if n >= 2 and scaled_mean is not None:
+            try:
+                ss = math.fsum((x - mz) ** 2 for x in z)
+                scaled_sd = scale * math.sqrt(ss / (n - 1))
+            except (OverflowError, ValueError):
+                scaled_sd = None
+            if scaled_sd is not None and not math.isfinite(scaled_sd):
+                scaled_sd = None
+    out_mean = mean if mean_ok else scaled_mean
+    out_sd = sd if sd_ok else scaled_sd
+    return out_mean, out_sd
+
+
+def _es_ratio_gap(a, b, hi, lo):
+    """``(a - b) / (hi - lo)`` in exact rationals, rounded once.
+
+    Used only when the float subtraction overflows but the ratio itself may
+    still be representable (for example one half of a 2e308-wide span).
+    """
+    from fractions import Fraction
+    try:
+        q = (Fraction(a) - Fraction(b)) / (Fraction(hi) - Fraction(lo))
+        out = float(q)
+    except (TypeError, ValueError, OverflowError, ZeroDivisionError):
+        return None
+    if out == 0.0 and q != 0:
+        return None
+    return out if math.isfinite(out) else None
+
+
+def _es_gap_covers(a, b, threshold):
+    """Exact ``a - b >= threshold`` for finite floats, without subtracting.
+
+    Only used when ``a - b`` itself overflows; comparing the exact rational
+    values keeps the structural verdict available instead of treating an
+    unrepresentable gap as unknown or infinite.
+    """
+    from fractions import Fraction
+    try:
+        return bool(Fraction(a) - Fraction(b) >= Fraction(threshold))
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 def _es_int(value, *, minimum=None):
@@ -331,8 +422,8 @@ def endpoint_headroom(endpoint=None, control_level=None, *, arm_levels=None,
             'cannot be classified')
         return out
     lo, hi = bounds_pair
-    out['span'] = (float(hi - lo) if (lo is not None and hi is not None)
-                   else None)
+    out['span'] = (_es_diff(hi, lo)
+                   if (lo is not None and hi is not None) else None)
     if not levels:
         out['status'] = 'not_verifiable'
         out['warnings'].append(
@@ -375,8 +466,7 @@ def endpoint_headroom(endpoint=None, control_level=None, *, arm_levels=None,
     opposite = lo if higher else hi
     out['bounded_beneficial'] = beneficial is not None
     if opposite is not None:
-        out['opposite_headroom'] = float((ref - opposite) if higher
-                                         else (opposite - ref))
+        out['opposite_headroom'] = _es_diff(ref, opposite)
     if beneficial is None:
         out['status'] = 'ok'
         out['structurally_possible'] = True
@@ -388,11 +478,28 @@ def endpoint_headroom(endpoint=None, control_level=None, *, arm_levels=None,
             'does)')
         return out
 
-    headroom = float(max(0.0, (beneficial - ref) if higher else (ref - beneficial)))
+    _raw_headroom = ((beneficial - ref) if higher else (ref - beneficial))
+    headroom = (float(max(0.0, _raw_headroom))
+                if math.isfinite(_raw_headroom) else None)
     out['headroom'] = headroom
-    if out['span'] and out['span'] > 0:
-        out['headroom_relative'] = float(headroom / out['span'])
-    out['exhausted'] = bool(headroom <= 1e-12)
+    if out['span'] is not None and out['span'] > 0 and headroom is not None:
+        _rel = float(headroom / out['span'])
+        # A positive headroom that rounds to a zero share is not evidence
+        # that the endpoint is at its bound; withhold the underflowed value.
+        out['headroom_relative'] = (
+            None if (_rel == 0.0 and headroom != 0.0) else _rel)
+    elif out['span'] is None and lo is not None and hi is not None:
+        # The span itself is beyond float64, but the normalised headroom can
+        # still be representable (e.g. half of a [-1e308, 1e308] range).
+        # Compute the ratio exactly, without materialising either difference.
+        out['headroom_relative'] = (
+            _es_ratio_gap(beneficial, ref, hi, lo) if higher
+            else _es_ratio_gap(ref, beneficial, hi, lo))
+    # An overflowed finite difference means the true gap is larger than every
+    # representable float: it cannot be exhausted or near the bound, and it
+    # covers every finite declared margin.  The exact comparison below keeps
+    # the structural verdict useful without serialising an infinity.
+    out['exhausted'] = bool(headroom is not None and headroom <= 1e-12)
     out['near_bound'] = bool(
         out['exhausted'] or (out['headroom_relative'] is not None
                              and out['headroom_relative'] <= near_tol))
@@ -401,7 +508,19 @@ def endpoint_headroom(endpoint=None, control_level=None, *, arm_levels=None,
         and out['headroom_relative'] <= min_rel)
     out['structurally_possible'] = (not out['exhausted'])
     if mee is not None:
-        out['headroom_covers_mee'] = bool(headroom + 1e-12 >= mee)
+        if headroom is not None:
+            out['headroom_covers_mee'] = bool(headroom + 1e-12 >= mee)
+        else:
+            out['headroom_covers_mee'] = _es_gap_covers(
+                beneficial, ref, mee) if higher else _es_gap_covers(
+                    ref, beneficial, mee)
+            if out['headroom_covers_mee'] is None:
+                out['headroom_covers_mee'] = True
+    if headroom is None:
+        out['warnings'].append(
+            'the headroom exceeds the representable float64 range; the '
+            'structural verdict uses the exact gap instead of reporting an '
+            'infinity')
     if out['exhausted']:
         out['status'] = 'saturated'
         out['warnings'].append(
@@ -409,14 +528,18 @@ def endpoint_headroom(endpoint=None, control_level=None, *, arm_levels=None,
             f'{beneficial!r}; no improvement can be measured on this endpoint')
     elif mee is not None and not out['headroom_covers_mee']:
         out['status'] = 'uninformative'
+        _head_text = ('unavailable' if headroom is None
+                      else f'{headroom:.6g}')
         out['warnings'].append(
-            f'available headroom {headroom:.6g} is smaller than the declared '
+            f'available headroom {_head_text} is smaller than the declared '
             f'minimum meaningful effect {mee:.6g}; the endpoint cannot show a '
             'worthwhile improvement even with unlimited seeds')
     elif low_headroom:
         out['status'] = 'low_headroom'
+        _head_text = ('unavailable' if headroom is None
+                      else f'{headroom:.6g}')
         out['warnings'].append(
-            f'headroom {headroom:.6g} is at most {min_rel:.3g} of the bounded '
+            f'headroom {_head_text} is at most {min_rel:.3g} of the bounded '
             'span; a ceiling/floor effect may hide a real difference')
     else:
         out['status'] = 'ok'
@@ -490,14 +613,32 @@ def endpoint_measurement_resolution(repeat_values=None, *, endpoint=None,
             'fewer than two finite repeat values; the measurement resolution '
             'cannot be estimated')
         return out
-    mean = float(np.mean(np.asarray(values, dtype=float)))
-    sd = float(np.std(np.asarray(values, dtype=float), ddof=1))
-    value_range = float(max(values) - min(values))
-    resolution = float(max(value_range, sd))
+    mean, sd = _es_mean_sd(values)
+    value_range = _es_diff(max(values), min(values))
+    # The envelope is the larger of range and SD.  If either true statistic
+    # is beyond float64 the envelope is unavailable, not infinite: using the
+    # one representable component would silently understate the resolution.
+    resolution = (max(value_range, sd)
+                  if (value_range is not None and sd is not None) else None)
+    relative = None
+    if resolution is not None and mean not in (None, 0.0):
+        try:
+            relative = float(resolution / abs(mean))
+        except (OverflowError, ZeroDivisionError):
+            relative = None
+        if relative is not None and (not math.isfinite(relative)
+                                     or (relative == 0.0
+                                         and resolution != 0.0)):
+            relative = None
     out.update({'mean': mean, 'sd': sd, 'range': value_range,
                 'resolution': resolution,
-                'relative_resolution': (float(resolution / abs(mean))
-                                        if mean != 0.0 else None)})
+                'relative_resolution': relative})
+    if resolution is None:
+        out['warnings'].append(
+            'the repeat range or sample SD exceeds the representable float64 '
+            'range; the measurement resolution cannot be reported as a finite '
+            'envelope')
+        return out
     if mee is not None:
         out['resolves_mee'] = bool(resolution + 1e-12 < mee)
     if mee is not None and not out['resolves_mee']:
@@ -576,21 +717,53 @@ def endpoint_sensitivity(endpoint=None, *, control_level=None, arm_levels=None,
         mde['warnings'].append(
             'both paired_sd and n_units are required to compute an MDE')
     elif not mde['problems'] and a is not None and tp is not None:
-        tc = _t_critical(1.0 - a, float(nu - 1))
+        try:
+            nu_f = float(nu)
+        except (OverflowError, ValueError):
+            nu_f = None
+        if nu_f is None or not math.isfinite(nu_f):
+            mde['warnings'].append(
+                'n_units exceeds the representable float64 range; the MDE '
+                'cannot be evaluated at this scale')
+            nu_f = None
+        tc = (_t_critical(1.0 - a, nu_f - 1.0)
+              if nu_f is not None else float('nan'))
         z = _normal_quantile(tp)
         if (math.isfinite(tc) and math.isfinite(z) and z > 0.0):
-            value = float((tc + z) * sd / math.sqrt(float(nu)))
-            mde.update({'status': 'ok', 'mde': value, 'paired_sd': sd,
-                        'n_units': int(nu), 'alpha': a,
-                        'target_power': tp})
-            if mee is not None:
-                mde['mde_covers_mee'] = bool(value + 1e-12 <= mee)
-                if not mde['mde_covers_mee']:
-                    mde['status'] = 'underpowered'
-                    mde['warnings'].append(
-                        f'MDE {value:.6g} exceeds the declared minimum '
-                        f'meaningful effect {mee:.6g}; the planned n cannot '
-                        'resolve a worthwhile difference')
+            # Keep the historical expression bit-for-bit for ordinary
+            # inputs.  If its intermediate product overflows, retry with the
+            # SD divided first: a representable MDE must not be withheld only
+            # because the grouping was unlucky.
+            try:
+                value = float((tc + z) * sd / math.sqrt(nu_f))
+            except (OverflowError, ValueError, ZeroDivisionError):
+                value = None
+            if value is None or not math.isfinite(value):
+                try:
+                    value = float(sd * ((tc + z) / math.sqrt(nu_f)))
+                except (OverflowError, ValueError, ZeroDivisionError):
+                    value = None
+            if value is not None and (not math.isfinite(value)
+                                      or value < 0.0
+                                      or (value == 0.0 and sd != 0.0)):
+                value = None
+            if value is not None:
+                mde.update({'status': 'ok', 'mde': value, 'paired_sd': sd,
+                            'n_units': int(nu), 'alpha': a,
+                            'target_power': tp})
+                if mee is not None:
+                    mde['mde_covers_mee'] = bool(value + 1e-12 <= mee)
+                    if not mde['mde_covers_mee']:
+                        mde['status'] = 'underpowered'
+                        mde['warnings'].append(
+                            f'MDE {value:.6g} exceeds the declared minimum '
+                            f'meaningful effect {mee:.6g}; the planned n cannot '
+                            'resolve a worthwhile difference')
+            else:
+                mde['warnings'].append(
+                    'the MDE is not representable as a finite positive '
+                    'float64 value; it is reported as unavailable rather '
+                    'than an infinity')
         else:
             mde['warnings'].append(
                 'the t critical value or target-power quantile is not finite '
@@ -641,7 +814,9 @@ def endpoint_sensitivity(endpoint=None, *, control_level=None, arm_levels=None,
     claim_allowed = (None if (mee is None or informative is None)
                      else bool(informative))
     status = 'ok'
-    if head.get('status') == 'invalid' or res.get('status') == 'invalid':
+    if (head.get('status') == 'invalid'
+            or res.get('status') == 'invalid'
+            or mde.get('status') == 'invalid'):
         status = 'invalid'
     elif head.get('status') == 'not_estimable':
         status = 'not_estimable'
@@ -842,7 +1017,8 @@ def endpoint_sensitivity_audit(manifest=None, pilot=None, *, config=None,
             f'endpoint_sensitivity.endpoints must be an object, got '
             f'{type(decl_eps).__name__}')
         decl_eps = {}
-    decl_eps = decl_eps or {}
+    decl_eps = ({str(k): v for k, v in decl_eps.items()}
+                if isinstance(decl_eps, dict) else {})
     pilot_eps = {}
     if p is not None:
         pilot_eps = p.get('endpoints')
@@ -852,7 +1028,8 @@ def endpoint_sensitivity_audit(manifest=None, pilot=None, *, config=None,
                 f'pilot.endpoints must be an object, got '
                 f'{type(pilot_eps).__name__}')
             pilot_eps = {}
-        pilot_eps = pilot_eps or {}
+        pilot_eps = ({str(k): v for k, v in pilot_eps.items()}
+                     if isinstance(pilot_eps, dict) else {})
 
     comps = m.get('primary_comparisons')
     comps = comps if isinstance(comps, list) else []
@@ -860,7 +1037,12 @@ def endpoint_sensitivity_audit(manifest=None, pilot=None, *, config=None,
     for comp in comps:
         if isinstance(comp, dict) and isinstance(comp.get('endpoint'), str):
             comp_eps.append(comp['endpoint'])
-    endpoints = sorted(set(comp_eps) | set(decl_eps) | set(pilot_eps))
+    # JSON object keys are strings, but a Python caller can supply a mixed
+    # mapping.  Endpoint keys were normalised to text above (and sorting is
+    # by text as well) so a malformed key cannot turn the audit into a raw
+    # TypeError or an unserialisable report key.
+    endpoints = sorted(set(comp_eps) | set(decl_eps) | set(pilot_eps),
+                       key=str)
     out['n_endpoints'] = len(endpoints)
 
     # ---- per-endpoint design ------------------------------------------
