@@ -55,25 +55,10 @@ RUN_CAP_V9 = dict(L.RUN_CAP)
 RUN_CAP_V9.update(total_hours=float(os.environ.get('V9_CAP_HOURS', 10.416666666666668)), state_path='run_time_state_v9.json', already_hours=0.0)
 
 def make_guard():
-    g = L.TimeGuard(RUN_CAP_V9)
-    if not g.state.get('sps_by_class'):
-        for src in ('run_time_state_v8.json', 'run_time_state_v7.json'):
-            if os.path.exists(src):
-                try:
-                    st = json.load(open(src, encoding='utf-8'))
-                    sbc = st.get('sps_by_class') or {}
-                    norm = st.get('norm_sps')
-                    if not sbc and norm is None:
-                        print(f'[v9] NOTE: {src} holds no calibration data — leaving the guard uncalibrated rather than recording an empty calibration')
-                        continue
-                    g.state['sps_by_class'] = sbc
-                    g.state['norm_sps'] = norm
-                    g._save()
-                    print(f'[v9] TimeGuard calibrated from {src}')
-                    break
-                except Exception as e:
-                    print(f'[v9] WARNING: cannot read {src} ({type(e).__name__}: {e}) — this run starts UNCALIBRATED (the first admission uses the conservative default)')
-    return g
+    return L._calibrate_time_guard(
+        L.TimeGuard(RUN_CAP_V9),
+        label='v9',
+        sources=('run_time_state_v8.json', 'run_time_state_v7.json'))
 P2T_CFG = dict(L.RUN, outdir='results_lm_v9_seq2k', seq_len=2048, batch_size=1, steps=1500, variants=['csa_fixed_topk8', 'csa_fixed_topk32', 'csa_fixed_topk128', 'csa_fixed_topk512', 'csa_fix_m1'])
 P2S3_CFG = dict(V8.P2R_CFG)
 # Key panels start at the 3-seed reporting floor.  Later drivers add seeds
@@ -151,24 +136,12 @@ def _arm_param_control(panel, a, b):
     """Capacity readout for a driver-level paired contrast.
 
     `pair_reason` pins the optimizer / LR schedule / step and token budget, but
-    it deliberately says nothing about CAPACITY.  An ad-hoc comparison such as
-    `csa_fixed - full` (13% fewer parameters in `full`) therefore used to look
-    as controlled as the parameter-matched baseline while quoting a p-value.
-    Reuse the methodology-audit implementation so the driver and the audit
-    cannot drift: every seed record of an arm must expose the same total, and
-    the recorded breakdown must not disagree.
+    it deliberately says nothing about CAPACITY.  Delegate to the shared
+    methodology-audit implementation so the driver and the audit cannot drift:
+    every seed record of an arm must expose the same total, and the recorded
+    breakdown must not disagree.
     """
-    _recs = {(v, '', s): r for v, by_seed in (panel or {}).items()
-             for s, r in (by_seed or {}).items() if isinstance(r, dict)}
-    _pa, _pb = L._params_of_arm(_recs, a), L._params_of_arm(_recs, b)
-    _rel = L._param_control(_recs, a, b)[0]
-    _detail = L._param_control_detail(_recs, a, b)
-    _cap = L._param_capacity_controlled(_detail)
-    return {'params_a': _pa, 'params_b': _pb,
-            'param_relative_diff': _rel,
-            'param_controlled': _cap,
-            'param_capacity_controlled': _cap,
-            'param_breakdown': _detail}
+    return L._capacity_readout(panel, a, b)
 
 def add_paired(comparisons, name, panel, a, b, *, who='', outdir=None, factors=None,
                require_param_match=False):

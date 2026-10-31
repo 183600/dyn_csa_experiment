@@ -999,6 +999,30 @@ def _param_capacity_controlled(detail):
             return False
     return True
 
+def _capacity_readout(panel, a, b):
+    """Capacity readout for a driver-level paired contrast.
+
+    The v8/v9 drivers each used to build this dictionary themselves.  Keeping
+    one implementation next to the capacity helpers means a driver contrast
+    and the methodology audit cannot drift apart, and newer drivers get a
+    single entry point instead of another copy.
+
+    ``panel`` maps each variant to its per-seed records.  The result reports
+    the total counts, the relative difference and the tri-state capacity
+    verdict; it is descriptive and never changes a measured delta.
+    """
+    recs = {(v, '', s): r for v, by_seed in (panel or {}).items()
+            for s, r in (by_seed or {}).items() if isinstance(r, dict)}
+    pa, pb = _params_of_arm(recs, a), _params_of_arm(recs, b)
+    relative_diff = _param_control(recs, a, b)[0]
+    detail = _param_control_detail(recs, a, b)
+    capacity_controlled = _param_capacity_controlled(detail)
+    return {'params_a': pa, 'params_b': pb,
+            'param_relative_diff': relative_diff,
+            'param_controlled': capacity_controlled,
+            'param_capacity_controlled': capacity_controlled,
+            'param_breakdown': detail}
+
 def _compute_control_detail(recs, a, b, *, tolerance=0.25):
     """Measured compute budget of a pair, not just its step count.
 

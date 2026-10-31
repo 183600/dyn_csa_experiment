@@ -60,20 +60,13 @@ def _paired_records(outdir):
     return L.ppl_by_seed(outdir, full=True)
 
 def _arm_param_control(panel, a, b):
-    """Capacity readout for a driver-level paired contrast (same definitions
-    as the methodology audit; driver stats must not quote a missing-capacity
-    comparison as a method advantage)."""
-    _recs = {(v, '', s): r for v, by_seed in (panel or {}).items()
-             for s, r in (by_seed or {}).items() if isinstance(r, dict)}
-    _pa, _pb = L._params_of_arm(_recs, a), L._params_of_arm(_recs, b)
-    _rel = L._param_control(_recs, a, b)[0]
-    _detail = L._param_control_detail(_recs, a, b)
-    _cap = L._param_capacity_controlled(_detail)
-    return {'params_a': _pa, 'params_b': _pb,
-            'param_relative_diff': _rel,
-            'param_controlled': _cap,
-            'param_capacity_controlled': _cap,
-            'param_breakdown': _detail}
+    """Attach the shared capacity readout to a driver-level paired contrast.
+
+    Driver stats must not quote a missing-capacity comparison as a method
+    advantage; ``L._capacity_readout`` is the same implementation the
+    methodology audit uses.
+    """
+    return L._capacity_readout(panel, a, b)
 
 def _add_paired(comparisons, name, panel, a, b, who='', outdir=None,
                 require_param_match=False):

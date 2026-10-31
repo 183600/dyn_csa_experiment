@@ -1,4 +1,12 @@
-"""Experiment driver moved from v12_supp.py into the measurement package."""
+"""v12 confirmation driver (``python -m explib.confirmation``).
+
+Separates the pre-registered final evaluation from the exploratory panels.
+Modes: ``smoke``, ``plan``, ``dynamic-plan``, ``power``, ``phase <name>``
+(P5C / P5H / P5PW / P5T / P5MP / P5S2 / P5S3), ``analysis``, ``report``,
+``full`` and ``auto``.  Only P5T reads the held-out test split; the other
+modes validate the plan, train the frozen arms, or rebuild statistics from
+local artifacts.
+"""
 
 from _split_loader import load_driver_package
 

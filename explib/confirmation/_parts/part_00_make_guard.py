@@ -87,25 +87,12 @@ RUN_CAP_V12 = dict(L.RUN_CAP)
 RUN_CAP_V12.update(total_hours=float(os.environ.get('V12_CAP_HOURS', 30.0)), state_path='run_time_state_v12.json', already_hours=0.0)
 
 def make_guard():
-    g = L.TimeGuard(RUN_CAP_V12)
-    if not g.state.get('sps_by_class'):
-        for src in ('run_time_state_v11.json', 'run_time_state_v10.json', 'run_time_state_v9.json', 'run_time_state_v8.json', 'run_time_state_v7.json'):
-            if os.path.exists(src):
-                try:
-                    st = json.load(open(src, encoding='utf-8'))
-                    sbc = st.get('sps_by_class') or {}
-                    norm = st.get('norm_sps')
-                    if not sbc and norm is None:
-                        print(f'[v12] NOTE: {src} holds no calibration data — leaving the guard uncalibrated rather than recording an empty calibration')
-                        continue
-                    g.state['sps_by_class'] = sbc
-                    g.state['norm_sps'] = norm
-                    g._save()
-                    print(f'[v12] TimeGuard calibrated from {src}')
-                    break
-                except Exception as e:
-                    print(f'[v12] WARNING: cannot read {src} ({type(e).__name__}: {e}) — this run starts UNCALIBRATED (the first admission uses the conservative default)')
-    return g
+    return L._calibrate_time_guard(
+        L.TimeGuard(RUN_CAP_V12),
+        label='v12',
+        sources=('run_time_state_v11.json', 'run_time_state_v10.json',
+                 'run_time_state_v9.json', 'run_time_state_v8.json',
+                 'run_time_state_v7.json'))
 
 # ---- 阶段配置 -------------------------------------------------------------
 # 冻结清单把种子数从 6 修订为 12（修订发生在任何

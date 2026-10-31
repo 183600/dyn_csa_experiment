@@ -28,25 +28,11 @@ RUN_CAP_V10 = dict(L.RUN_CAP)
 RUN_CAP_V10.update(total_hours=float(os.environ.get('V10_CAP_HOURS', 25.0)), state_path='run_time_state_v10.json', already_hours=0.0)
 
 def make_guard():
-    g = L.TimeGuard(RUN_CAP_V10)
-    if not g.state.get('sps_by_class'):
-        for src in ('run_time_state_v9.json', 'run_time_state_v8.json', 'run_time_state_v7.json'):
-            if os.path.exists(src):
-                try:
-                    st = json.load(open(src, encoding='utf-8'))
-                    sbc = st.get('sps_by_class') or {}
-                    norm = st.get('norm_sps')
-                    if not sbc and norm is None:
-                        print(f'[v10] NOTE: {src} holds no calibration data — leaving the guard uncalibrated rather than recording an empty calibration')
-                        continue
-                    g.state['sps_by_class'] = sbc
-                    g.state['norm_sps'] = norm
-                    g._save()
-                    print(f'[v10] TimeGuard calibrated from {src}')
-                    break
-                except Exception as e:
-                    print(f'[v10] WARNING: cannot read {src} ({type(e).__name__}: {e}) — this run starts UNCALIBRATED (the first admission uses the conservative default)')
-    return g
+    return L._calibrate_time_guard(
+        L.TimeGuard(RUN_CAP_V10),
+        label='v10',
+        sources=('run_time_state_v9.json', 'run_time_state_v8.json',
+                 'run_time_state_v7.json'))
 P3MT_PAYLOAD = dict(outdir='results_v10_mech', variants=['csa_fixed_rope', 'full_rope'], eval_lens=[512, 1024, 2048, 4096], steps=3000, train_len=512, vocab=8192)
 # 从头训练的选择器对照：与 csa_fixed_rope / full_rope 完全同一配方
 # （3000 步、同数据、同种子）训练，唯一差异是选择方式本身。P3MT 的 variants

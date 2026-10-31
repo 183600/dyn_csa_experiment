@@ -2,23 +2,24 @@
 
 [English](README.md) | **中文说明**
 
-本仓库包含实验代码，以及在自己机器上**重跑**一项受控研究所需的协议。该研究
-在小型从零训练语言模型（BPE-8k，WikiText-103）中，对比**压缩块稀疏注意力**
-（CSA / HCA，固定分块与动态分块）与稠密注意力。
+本仓库包含**重跑**下列受控研究所需的代码与协议：在小型从零训练语言模型
+（BPE-8k，WikiText-103）中，对比**压缩块稀疏注意力**（CSA / HCA，固定分块
+与动态分块）与稠密注意力。
 
-这是一个**只承载源码**的仓库：没有随仓库发布数值证据归档（见
-`RELEASES.md`）。因此，任何你没有用自己产物重建过的报告 PPL 数值，仅凭
-Git 树无法独立复核。仓库中的主张仅限 `confirmation_frozen.json` 冻结的
-范围；其余均为探索性。
+这是一个**只存放源码**的仓库：没有随仓库发布数值证据归档（见
+`RELEASES.md`）。因此，任何没有用自己产物重建过的报告 PPL 数值，仅凭 Git
+树无法独立复核。只有 `confirmation_frozen.json` 冻结的比较属于确认性证据；
+其余均为探索性。
 
-常见有三种使用方式：
+常见的使用方式有三种：
 
-- **检查检出**：安装已验证的 CPU 环境并运行 `make test`，不需要 GPU。
+- **检查代码检出**：安装已验证的 CPU 环境并运行 `make test`，不需要 GPU。
 - **运行或续跑研究面板**：在[研究一览](#研究一览)中选择代次，再按
   [复现方法（任意机器）](#复现方法任意机器)中的对应小节执行。
 - **从已有产物重建结果**：使用驱动的零 GPU `analysis` / `report` 模式，
   或用 `python build_report.py` 重建 v7 报告。
 
+无论选择哪种方式，都请在仓库根目录执行命令：驱动按检出路径解析产物与清单。
 生成的报告描述的是**你自己这轮运行**，不是已发布证据；只有归档发布并通过
 `archive_release.py verify` 后，相应结果才可独立复核。
 
@@ -36,8 +37,22 @@ Git 树无法独立复核。仓库中的主张仅限 `confirmation_frozen.json` 
 > 的报告数值无法独立复核。只有当 `release_<tag>.tar.gz` 与清单发布到只读
 > 位置，并通过 `archive_release.py verify` 时，相应主张才可审计。
 
+## 范围与状态
+
+仓库区分三个证据层级。判断结果能支持什么，应看层级而不是只看版本号。
+
+| 层级 | 覆盖内容 | 权威记录 |
+|---|---|---|
+| 确认性 | 冻结清单列出的固定分块 CSA 比较 | `confirmation_frozen.json`、`DECISION_LOG.md` |
+| 探索性 | v6–v11 面板，以及动态/HCA 草案清单 | `DECISION_LOG.md`、`docs/design_notes.md` |
+| 已发布证据 | 本 Git 树未随附 | `RELEASES.md` |
+
+`confirmation_frozen_dynamic.json` 是独立的**草案**，不属于冻结的确认范围。
+`dynamic-plan` 命令与审计门仍会读取它，以便持续检查草案自身是否自洽。
+
 ## 目录
 
+- [范围与状态](#范围与状态)
 - [研究一览](#研究一览)
 - [从这里开始](#从这里开始)
 - [快速开始](#快速开始)
@@ -135,6 +150,10 @@ make plan                              # 冻结清单预检；不读取 test spl
 python -m explib.confirmation --help   # 查看驱动说明，不启动实验
 ```
 
+`make test` 会对整个仓库调用 pytest，与 CI 使用同一套全量检查；
+编辑时运行 `pytest path::test` 只覆盖相应子集。`make plan` 在冻结计划
+未通过预检时以非零状态退出，并且不会读取 test split。
+
 以上命令都不会启动训练。训练需要显式选择模式，例外是 `python
 run_gapfill.py`（默认 `full`）：要跑正式面板时调用驱动的 `full`、
 `phase <name>` 或 `auto`；修改流水线后，先用该驱动的 `smoke` 模式验证。
@@ -188,8 +207,10 @@ python -m explib.reproduce compare results_lm_v3_1500 results_lm_v3_1500_rerun
 | 实验如何运行或重跑？ | 本 README，从[复现方法（任意机器）](#复现方法任意机器)开始 |
 | 该用哪个命令和子命令？ | [研究一览](#研究一览)与下文各驱动小节 |
 | 某个测量或比较为什么这样定义？ | [`docs/design_notes.md`](docs/design_notes.md) |
-| 到底冻结了什么、允许主张什么？ | `confirmation_frozen.json` 与 `docs/design_notes.md` §17/§20 |
+| 到底冻结了什么、允许主张什么？ | `confirmation_frozen.json` 与 [`docs/design_notes.md`](docs/design_notes.md) §17/§20 |
 | 如何理解某个判定或审计状态？ | [测量护栏](#测量护栏) |
+| 源码如何拆成便于审查的文件？ | [核心代码](#核心代码) 与 `_split_loader.py` |
+| 如何比较两份已生成的报告？ | [重新生成实验产物](#重新生成实验产物) |
 | 做过哪些决定，顺序如何？ | [`DECISION_LOG.md`](DECISION_LOG.md) |
 | 已发布的证据在哪里？ | [`RELEASES.md`](RELEASES.md) |
 | 评审问题是如何处理的？ | [`REVIEW_4_RESPONSE.md`](REVIEW_4_RESPONSE.md) |
@@ -312,6 +333,15 @@ python -m explib.reproduce compare results_lm_v3_1500 results_lm_v3_1500_rerun
 该检查逐维报告，因此 `environment_changed` / `data_changed` /
 `code_changed` / `numerical_drift` 不会被压成一句「没复现」；缺指纹是
 `provenance_incomplete`，不会被当成通过。
+
+也可以不重跑实验，直接比较两份已生成的报告：
+
+```bash
+python -m explib.reproduce report OLD.json NEW.json --ignore-ledger
+```
+
+这是对带戳报告的结构化 diff，不是新的统计检验；用于确认从同一批产物重建
+报告没有改变其内容。
 
 ## 复现方法（任意机器）
 
@@ -684,6 +714,8 @@ python build_report.py            # 从产物重建 REPORT_v7.md（零 GPU）
   说明，模式列表见[研究一览](#研究一览)。注意
   `python -m explib.<driver> smoke --help` 不是帮助命令——位置式驱动会忽略
   第二个 token，直接开始 smoke 运行。
+- **定向 pytest 不等于全量套件。** `make test` 会收集所有 `test_*.py`
+  模块；`pytest path::test` 只检查对应用例。
 - **test split 是一次性的。** 只有 P5T 读 `wiki.test.raw`；不要在其外围
   再写读 test 的脚本。
 - **陈旧缓存不会静默重建。** 更换 train 语料后先删除 `wt103_cache/` 再

@@ -34,25 +34,11 @@ RUN_CAP_V11 = dict(L.RUN_CAP)
 RUN_CAP_V11.update(total_hours=float(os.environ.get('V11_CAP_HOURS', 12.5)), state_path='run_time_state_v11.json', already_hours=0.0)
 
 def make_guard():
-    g = L.TimeGuard(RUN_CAP_V11)
-    if not g.state.get('sps_by_class'):
-        for src in ('run_time_state_v10.json', 'run_time_state_v9.json', 'run_time_state_v8.json', 'run_time_state_v7.json'):
-            if os.path.exists(src):
-                try:
-                    st = json.load(open(src, encoding='utf-8'))
-                    sbc = st.get('sps_by_class') or {}
-                    norm = st.get('norm_sps')
-                    if not sbc and norm is None:
-                        print(f'[v11] NOTE: {src} holds no calibration data — leaving the guard uncalibrated rather than recording an empty calibration')
-                        continue
-                    g.state['sps_by_class'] = sbc
-                    g.state['norm_sps'] = norm
-                    g._save()
-                    print(f'[v11] TimeGuard calibrated from {src}')
-                    break
-                except Exception as e:
-                    print(f'[v11] WARNING: cannot read {src} ({type(e).__name__}: {e}) — this run starts UNCALIBRATED (the first admission uses the conservative default)')
-    return g
+    return L._calibrate_time_guard(
+        L.TimeGuard(RUN_CAP_V11),
+        label='v11',
+        sources=('run_time_state_v10.json', 'run_time_state_v9.json',
+                 'run_time_state_v8.json', 'run_time_state_v7.json'))
 
 def P4MT_CFG(seeds=(0, 1, 2, 3, 4, 5)):
     # P4MT 的语义是「既有 RoPE 双臂的种子补齐」——显式钉死这两臂，

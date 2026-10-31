@@ -2,16 +2,16 @@
 
 **English** | [中文说明](README_zh.md)
 
-This repository contains the experiment code and the protocols needed to
-**re-run** a controlled study of compressed-block sparse attention (CSA / HCA,
-fixed and dynamic blocking) against dense attention in a small from-scratch
-language model (BPE-8k, WikiText-103).
+This repository contains the code and protocols for **re-running** a controlled
+study of compressed-block sparse attention (CSA / HCA, fixed and dynamic
+blocking) against dense attention in a small from-scratch language model
+(BPE-8k, WikiText-103).
 
 It is a **source-only** repository: no numeric evidence release is bundled (see
-`RELEASES.md`). A PPL number in a report you have not regenerated from your own
-artifacts is therefore not independently auditable from this Git tree alone.
-Claims are limited to the frozen scope in `confirmation_frozen.json`; everything
-else is exploratory.
+`RELEASES.md`). A PPL number in a report that you have not regenerated from your
+own artifacts cannot be independently audited from this Git tree alone. Only
+the comparisons frozen in `confirmation_frozen.json` are confirmatory;
+everything else is exploratory.
 
 There are three common ways to use this tree:
 
@@ -23,9 +23,10 @@ There are three common ways to use this tree:
 - **Rebuild results from artifacts you already have.** Use a driver's zero-GPU
   `analysis` / `report` mode, or `python build_report.py` for the v7 report.
 
-A generated report describes *your* run, not released evidence. Treat it as
-independently auditable only after its archive is published and
-`archive_release.py verify` passes.
+Whichever path you take, run commands from the repository root: drivers resolve
+artifacts and manifests relative to the checkout. A generated report describes
+*your* run, not released evidence; treat it as independently auditable only
+after its archive is published and `archive_release.py verify` passes.
 
 > **Version naming.** `v12` is the driver/study generation. `CODE_SEMANTICS =
 > v11.128` is the library measurement-semantics stamp bound by the frozen plan.
@@ -44,8 +45,24 @@ independently auditable only after its archive is published and
 > auditable only when its `release_<tag>.tar.gz` plus manifest is published and
 > `archive_release.py verify` passes.
 
+## Scope and status
+
+The repository distinguishes three levels of evidence. Use the level, not the
+version number alone, to decide what a result may support.
+
+| level | covers | authoritative record |
+|---|---|---|
+| confirmatory | the fixed-chunk CSA comparisons listed in the frozen plan | `confirmation_frozen.json`, `DECISION_LOG.md` |
+| exploratory | the v6–v11 panels, and the dynamic/HCA draft plan | `DECISION_LOG.md`, `docs/design_notes.md` |
+| released evidence | none is bundled in this Git tree | `RELEASES.md` |
+
+`confirmation_frozen_dynamic.json` is a separate **draft**, not part of the
+frozen confirmatory scope. The `dynamic-plan` command and the audit gates still
+read it so the draft stays internally checkable.
+
 ## Contents
 
+- [Scope and status](#scope-and-status)
 - [Study at a glance](#study-at-a-glance)
 - [Start here](#start-here)
 - [Quick start](#quick-start)
@@ -148,6 +165,11 @@ make plan                              # frozen-manifest preflight; no test-spli
 python -m explib.confirmation --help   # driver help; no run starts
 ```
 
+`make test` invokes pytest over the repository, so it is the same whole-suite
+check used by CI; a targeted `pytest path::test` call is only a subset. `make
+plan` exits non-zero when the frozen plan fails its preflight and never reads
+the test split.
+
 None of these commands starts a training run. Training is explicit except for
 `python run_gapfill.py`, whose default mode is `full`: invoke a driver's
 `full`, `phase <name>`, or `auto` mode when you intend to run it, and start
@@ -207,8 +229,10 @@ maps a question to its authoritative source when you need more detail.
 | How do I run or re-run an experiment? | this README, starting at [Running the experiments](#running-the-experiments) |
 | Which command and subcommand should I use? | [Study at a glance](#study-at-a-glance) and the per-driver sections below |
 | Why is a measurement or comparison defined this way? | [`docs/design_notes.md`](docs/design_notes.md) |
-| What exactly is frozen, and what may be claimed? | `confirmation_frozen.json` and `docs/design_notes.md` §17/§20 |
+| What exactly is frozen, and what may be claimed? | `confirmation_frozen.json` and [`docs/design_notes.md`](docs/design_notes.md) §17/§20 |
 | How should I read a verdict or an audit status? | [Measurement guardrails](#measurement-guardrails) |
+| Where is the source split into reviewable files? | [Core code](#core-code) and `_split_loader.py` |
+| How do I compare two generated reports? | [Regenerating the experiment artifacts](#regenerating-the-experiment-artifacts) |
 | What was decided, and in what order? | [`DECISION_LOG.md`](DECISION_LOG.md) |
 | Where is the released evidence? | [`RELEASES.md`](RELEASES.md) |
 | How were the review issues resolved? | [`REVIEW_4_RESPONSE.md`](REVIEW_4_RESPONSE.md) |
@@ -339,6 +363,15 @@ The verifier reports each dimension separately, so `environment_changed`,
 `data_changed`, `code_changed` and `numerical_drift` are not collapsed into one
 "did not reproduce" message. A missing fingerprint is
 `provenance_incomplete` (never a pass).
+
+Two already-built report files can be compared without re-running anything:
+
+```bash
+python -m explib.reproduce report OLD.json NEW.json --ignore-ledger
+```
+
+This is a structural diff of stamped reports, not a new statistical test; use it
+to confirm that rebuilding a report from the same artifacts did not change it.
 
 ## Running the experiments
 
@@ -756,6 +789,8 @@ above belong to the v6 driver; `explib` drivers leave the instance running.
   driver description; the mode list is in [Study at a glance](#study-at-a-glance).
   `python -m explib.<driver> smoke --help` is not a help command — the second
   token is ignored by the positional-mode drivers, so it starts a smoke run.
+- **A targeted pytest is not the full suite.** `make test` discovers every
+  `test_*.py` module; `pytest path::test` checks only that case.
 - **The test split is one-shot.** Only P5T reads `wiki.test.raw`; do not add a
   test-reading script around it.
 - **A stale cache is not rebuilt silently.** Delete `wt103_cache/` after

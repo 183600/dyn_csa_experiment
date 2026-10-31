@@ -1325,6 +1325,43 @@ class TimeGuard:
         if self.state.get('norm_sps'):
             print(f'  normalised rate : {self.state['norm_sps']:.3f} s/step (base class d=256 / 6L / seq512 / batch12)')
         print('======================================================')
+
+def _calibrate_time_guard(guard, *, label, sources):
+    """Reuse another panel's rate calibration when ``guard`` has none.
+
+    A fresh guard has no ``sps_by_class`` entry, so its first admission would
+    use the conservative built-in estimate even when an earlier driver already
+    measured throughput on the same machine.  The later drivers all scan their
+    predecessors' state files for this reason; keeping the scan here avoids a
+    per-driver copy of the same load-check-save sequence.
+
+    ``sources`` is ordered newest to oldest.  A file without calibration data
+    is skipped rather than saved as an empty calibration, and an unreadable
+    file is reported without aborting the run.  The guard is returned for
+    convenient chaining.
+    """
+    if guard.state.get('sps_by_class'):
+        return guard
+    for src in sources:
+        if not os.path.exists(src):
+            continue
+        try:
+            with open(src, encoding='utf-8') as fh:
+                state = json.load(fh)
+            sps_by_class = state.get('sps_by_class') or {}
+            norm_sps = state.get('norm_sps')
+            if not sps_by_class and norm_sps is None:
+                print(f'[{label}] NOTE: {src} holds no calibration data — leaving the guard uncalibrated rather than recording an empty calibration')
+                continue
+            guard.state['sps_by_class'] = sps_by_class
+            guard.state['norm_sps'] = norm_sps
+            guard._save()
+            print(f'[{label}] TimeGuard calibrated from {src}')
+            break
+        except Exception as exc:
+            print(f'[{label}] WARNING: cannot read {src} ({type(exc).__name__}: {exc}) — this run starts UNCALIBRATED (the first admission uses the conservative default)')
+    return guard
+
 PARAM_MATCHED = {'full_matched', 'full_sw128_matched'}
 PARAM_MATCHED_V7 = {'full_rope', 'full_sw128_matched_rope'}
 
