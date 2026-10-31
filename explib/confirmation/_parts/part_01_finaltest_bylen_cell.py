@@ -736,12 +736,11 @@ def _by_len_shape_reason(rec, n_seq):
             return f'by_len[{_ln!r}] is not a cell object'
         if isinstance(_ln, (bool, np.bool_)):
             return f'by_len key {_ln!r} is not an integer length'
-        try:
-            _ln_f = float(_ln)
-            if not math.isfinite(_ln_f) or _ln_f != math.floor(_ln_f):
-                raise ValueError
-            _ln_i = int(_ln_f)
-        except (TypeError, ValueError, OverflowError):
+        # JSON object keys arrive as strings; parse the numeric spelling
+        # exactly instead of casting through float64 (which rounds lengths
+        # above 2**53 and could validate a different requested length).
+        _ln_i = _record_int(_ln)
+        if _ln_i is None:
             return f'by_len key {_ln!r} is not an integer length'
         if _ln_i < 2:
             return f'by_len length {_ln_i} has no next-token prediction (needs Ln>=2); an empty cell is not admissible'
@@ -750,11 +749,8 @@ def _by_len_shape_reason(rec, n_seq):
         if (isinstance(_ntok, (bool, np.bool_))
                 or not isinstance(_ntok, (int, float, np.integer, np.floating))):
             return f'by_len[{_ln_i}].n_tok={_ntok!r} != the frozen {_want} (= {n_seq} rows x {_ln_i - 1} predictions) — truncated/empty cells are not admissible'
-        try:
-            _ntok_f = float(_ntok)
-        except (TypeError, ValueError, OverflowError):
-            _ntok_f = float('nan')
-        if not math.isfinite(_ntok_f) or _ntok_f != math.floor(_ntok_f) or int(_ntok_f) != _want:
+        _ntok_i = _count_int(_ntok)
+        if _ntok_i is None or _ntok_i != _want:
             return f'by_len[{_ln_i}].n_tok={_ntok!r} != the frozen {_want} (= {n_seq} rows x {_ln_i - 1} predictions) — truncated/empty cells are not admissible'
         # A cell that does not explicitly certify full length is unverifiable.
         # Matching n_tok alone cannot distinguish a full cell from a record
@@ -799,27 +795,23 @@ def _by_len_shape_reason(rec, n_seq):
                 if (isinstance(_x, (bool, np.bool_))
                         or not isinstance(_x, (int, float, np.integer, np.floating))):
                     return f'by_len[{_ln_i}].n_tokens_per_doc contains {_x!r}'
-                _xf = float(_x)
-                if not math.isfinite(_xf) or _xf != math.floor(_xf) or _xf <= 0:
+                _xi = _count_int(_x)
+                if _xi is None or _xi <= 0:
                     return (f'by_len[{_ln_i}].n_tokens_per_doc contains {_x!r}; '
                             'every retained document needs at least one scored '
                             'target (zero-target documents are dropped, not '
                             'reported as evaluation units)')
-                _dsum += int(_xf)
-            if _dsum != int(_ntok_f):
+                _dsum += _xi
+            if _dsum != _ntok_i:
                 return (f'by_len[{_ln_i}].n_tokens_per_doc sums to {_dsum}, '
-                        f'not the scored n_tok={int(_ntok_f)}')
+                        f'not the scored n_tok={_ntok_i}')
             if _c.get('n_docs') is not None:
                 _nd = _c.get('n_docs')
                 if (isinstance(_nd, (bool, np.bool_))
                         or not isinstance(_nd, (int, float, np.integer, np.floating))):
                     return f'by_len[{_ln_i}].n_docs={_nd!r} is not an integer'
-                try:
-                    _ndf = float(_nd)
-                except (TypeError, ValueError, OverflowError):
-                    _ndf = float('nan')
-                if (not math.isfinite(_ndf) or _ndf != math.floor(_ndf)
-                        or int(_ndf) != len(_dnt)):
+                _nd_i = _count_int(_nd)
+                if _nd_i is None or _nd_i != len(_dnt):
                     return (f'by_len[{_ln_i}].n_docs={_nd!r} != the '
                             f'{len(_dnt)} per-document entries')
             # A document-level NLL vector must actually reconstruct the cell's
@@ -881,26 +873,22 @@ def _by_len_shape_reason(rec, n_seq):
                 if (isinstance(_x, (bool, np.bool_))
                         or not isinstance(_x, (int, float, np.integer, np.floating))):
                     return f'by_len[{_ln_i}].n_tokens_per_article contains {_x!r}'
-                _xf = float(_x)
-                if not math.isfinite(_xf) or _xf != math.floor(_xf) or _xf <= 0:
+                _xi = _count_int(_x)
+                if _xi is None or _xi <= 0:
                     return (f'by_len[{_ln_i}].n_tokens_per_article contains '
                             f'{_x!r}; every retained article needs at least '
                             'one scored target')
-                _asum += int(_xf)
-            if _asum != int(_ntok_f):
+                _asum += _xi
+            if _asum != _ntok_i:
                 return (f'by_len[{_ln_i}].n_tokens_per_article sums to '
-                        f'{_asum}, not the scored n_tok={int(_ntok_f)}')
+                        f'{_asum}, not the scored n_tok={_ntok_i}')
             if _c.get('n_articles') is not None:
                 _na = _c.get('n_articles')
                 if (isinstance(_na, (bool, np.bool_))
                         or not isinstance(_na, (int, float, np.integer, np.floating))):
                     return f'by_len[{_ln_i}].n_articles={_na!r} is not an integer'
-                try:
-                    _naf = float(_na)
-                except (TypeError, ValueError, OverflowError):
-                    _naf = float('nan')
-                if (not math.isfinite(_naf) or _naf != math.floor(_naf)
-                        or int(_naf) != len(_ant)):
+                _na_i = _count_int(_na)
+                if _na_i is None or _na_i != len(_ant):
                     return (f'by_len[{_ln_i}].n_articles={_na!r} != the '
                             f'{len(_ant)} per-article entries')
             _aids = _c.get('article_ids')
@@ -964,18 +952,53 @@ def _by_len_shape_reason(rec, n_seq):
 
 
 def _record_int(value):
-    """Exact integer view of a recorded count, or None for anything else."""
+    """Exact integer view of a recorded count, or None for anything else.
+
+    Do not round-trip an already-integral value through float64: for counts
+    above ``2**53`` that silently changes the integer (``2**53 + 1`` becomes
+    ``2**53``).  ``numbers.Integral`` is exact, and for other real values
+    ``int(v)`` plus an equality check keeps the original domain (a large
+    ``Fraction``/``Decimal`` stays exact, while 1.5/NaN/Inf are rejected).
+    Numeric strings are accepted, but only in integer spelling: the legacy
+    ``"1.0"`` float cast silently treated a non-integer textual seed/count as
+    an integer, which is the same class of provenance bug.
+    """
     if value is None or isinstance(value, (bool, np.bool_)):
         return None
     if isinstance(value, numbers.Integral):
         return int(value)
+    if isinstance(value, (str, bytes, bytearray)):
+        if isinstance(value, (bytes, bytearray)):
+            try:
+                value = value.decode('ascii')
+            except (UnicodeDecodeError, ValueError):
+                return None
+        try:
+            return int(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
     try:
-        f = float(value)
+        out = int(value)
     except (TypeError, ValueError, OverflowError):
         return None
-    if not math.isfinite(f) or f != math.floor(f):
+    try:
+        if value != out:
+            return None
+    except (TypeError, ValueError, OverflowError):
         return None
-    return int(f)
+    return out
+
+
+def _count_int(value):
+    """Exact count from a numeric record field, or None.
+
+    Unlike :func:`_record_int`, a numeric string is not a count: JSON keys are
+    strings, but a recorded ``n_tok``/``n_docs`` must be a real number.  The
+    conversion itself is exact for integers beyond ``2**53``.
+    """
+    if isinstance(value, (bool, np.bool_, str, bytes, bytearray)):
+        return None
+    return _record_int(value)
 
 
 def _valid_sha256(value):
