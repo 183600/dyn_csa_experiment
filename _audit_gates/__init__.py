@@ -34,6 +34,7 @@ _PARTS = [
 'part_21_audit_unit_quantiles.py',
 'part_22_audit_endpoint_sensitivity.py',
 'part_23_audit_order_dependence.py',
+'part_24_audit_pooled_order.py',
 ]
 
 load_root_package(globals(), __file__, _PARTS,

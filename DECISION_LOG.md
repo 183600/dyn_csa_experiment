@@ -5425,3 +5425,64 @@ AR(1) 序列检出、设计效应 >1、`n_eff<n`、顺序稳健区间不窄于 i
 `not_verifiable_locally`、坏 JSON `fail`、默认/显式 batch 布局重放一致、monkeypatch `load_wikitest`
 抛错时审计仍完成；报告与 CLI/`run_report`/`build_report` 接线。相关既有
 套件通过；完整 CPU 套件在本轮最终树通过（新增 11 项）。
+
+## 2026-10-31 — token 池化 PPL 的顺序依赖单独计算：cluster influence、设计效应与有效样本量（本轮结果分析硬化，no new runs）
+
+零 GPU；不新增训练、不读取 test split、不修改
+`confirmation_frozen*.json` 的字节/种子/端点/α/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未删除、未修改、未移动。
+
+**Problem.** §117 给逐评测单位的等权均值效应加了顺序依赖读数，并明确
+留下缺口：token 池化 PPL 的 cluster 区间是另一个估计量，影响函数不同，
+不能把等权设计效应直接搬过去。主表 CI 正是 token 池化区间：它按文章
+（无文章映射时按行级文档）聚类，却把聚类当成 i.i.d.；冻结 test 切片是
+source-order prefix（§55），相邻单位共享主题/文体/局部写作习惯。序列
+相关存在时主表 cluster 区间会偏窄，`n_units` 也不是独立信息量。此前
+没有读数回答「主终点的 cluster 区间在观测顺序下是否低估」。
+
+**Fix.** 新增 `POOLED_ORDER_POLICY` 与
+`pooled_order_inference(nll_a, nll_b, n_tokens, ...)`：从逐种子
+token 池化 NLL 矩阵构造两个估计量各自的 delta-method cluster influence
+（PPL 差 `psi_i` 与 log 比 `q_i`），保持语料顺序，输出 i.i.d. cluster
+t 区间（与既有 `_paired_nll_doc_ci` 逐位一致）；非重叠 batch-means 与
+循环 moving-block bootstrap 的设计效应、`n_eff`；打乱影响值的单侧
+batch 设计效应置换 p 与双侧 |lag-1| p；**顺序稳健区间取 i.i.d. 与所有
+声明块长区间中最宽者**；只有置换显著且 `DE_max>1.10`、区间加宽 >10%、
+或 i.i.d. 排除零而某块区间不再排除零时置
+`inflation_detected`/`iid_understates`。另提供
+`pooled_order_inference_from_influence` 作为审计重放入口。
+
+接线：`explib/__init__.py` 追加
+`part_60_pooled_order_inference.py`；
+`_doc_level_analysis` 在 `_paired_nll_doc_ci` 通过同一性检查后用同一组
+`_nll_a/_nll_b/_ref_tok/_unit_ids` 落盘
+`doc_sampling.pooled_order_inference`（不可用写原因）；
+`build_report` 在等权顺序表后新增「token 池化估计量的顺序依赖 / 有效
+样本量」表；`audit_gates.py pooled_order`（别名 `pooled_dependence` /
+`pooled_design_effect` / `pooled_effective_n`）从充分统计量整块重放，并入
+`audit_gates.py report` 顶层 `pooled_order`。
+
+**Boundary.** 这是描述性顺序诊断，不是新的确认性检验：置换 p 不进入
+冻结 Holm 族、不改变 `p_exact_signflip`/`p_holm`/`verified`/`confirmed`；
+不显著不是「单位独立/可交换」，显著也不是「效应不存在」。影响序列是
+PPL 非线性对比的 delta 方法线性化，不是精确有限样本分布；点估计与影响
+和不相等是正常的（影响在中点处求和为零）。块重采样只处理观测切片内的
+序列相关，不能把 source-order prefix 变成概率样本，也不能替代 §55 的
+抽样边界、§54 的总体主张门槛或 §81 的种子×单位两层不确定性。块长与
+batch 数是声明式选择，顺序稳健区间取最宽者（保守）；n 只有几十时
+batch/block 估计本身有噪声。输入顺序必须是真的语料顺序，函数无法发现
+调用者先排序/洗牌；行级仍受 §54 伪重复边界约束。旧产物缺块报
+`not_verifiable_locally`，不回填、不猜。
+
+**Verification.** 新增 `test_review_part_59.py` 11 项：策略/状态/边界；
+i.i.d. 区间与既有 `_paired_nll_doc_ci` 的 point/SE/CI 逐位一致；AR(1)
+单位面板在 PPL/log 两端点均检出设计效应 >1、`n_eff<n`、顺序稳健区间
+不窄于 i.i.d.；独立面板不误报；batch/block 表与最宽区间精确选取；同
+seed 可复现；形状/NaN/布尔 token/零 token/重复 unit id/重复 seed/非法
+块长/批数/`n_boot`/`n_perm`/conf/α/seed/阈值 fail-closed；`1e308` 交替
+与常数面板严格 JSON；`_doc_level_analysis` 落盘 token 池化块；审计合法
+块 `ok`、篡改区间/设计效应/稳健区间/`n_units`/影响/点估计/置换 p/夹带
+`confirmed` 判 `fail`、bare `not_estimable` `not_applicable`、缺块
+`not_verifiable_locally`、坏 JSON `fail`、monkeypatch `load_wikitest`
+抛错时审计仍完成；报告与 CLI/`run_report`/`build_report` 接线。相关既有
+套件通过；完整 CPU 套件在本轮最终树通过（新增 11 项）。

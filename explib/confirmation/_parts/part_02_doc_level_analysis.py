@@ -160,6 +160,10 @@ def _doc_level_analysis(recs_a, recs_b, common, Ln, primary_deltas=None):
     # with their token counts, not give every document equal weight.
     _pooled_ci = None
     _pooled_ci_reason = None
+    _nll_a = None
+    _nll_b = None
+    _pooled_order = None
+    _pooled_order_reason = None
     _unit_influence = None
     _unit_influence_reason = None
     _length_strata = None
@@ -264,6 +268,20 @@ def _doc_level_analysis(recs_a, recs_b, common, Ln, primary_deltas=None):
                             _unit_quantiles = None
                             _unit_quantiles_reason = (
                                 f'{type(_uqe).__name__}: {_uqe}')
+                        # Order dependence of the TOKEN-POOLED estimator: the
+                        # equal-unit readout below cannot be copied onto the
+                        # weighted cluster interval.  Build the estimator's
+                        # own cluster influence and check its corpus order,
+                        # closing the gap left open by design_notes 117.
+                        try:
+                            _pooled_order = L.pooled_order_inference(
+                                _nll_a, _nll_b, _ref_tok,
+                                unit_ids=_unit_ids, seeds=common)
+                        except (ValueError, TypeError, FloatingPointError,
+                                OverflowError) as _poe:
+                            _pooled_order = None
+                            _pooled_order_reason = (
+                                f'{type(_poe).__name__}: {_poe}')
                         # Total uncertainty: the cluster CI above conditions on
                         # the trained seeds, so it can be much narrower than the
                         # uncertainty of a result that also samples seeds.  The
@@ -485,6 +503,12 @@ def _doc_level_analysis(recs_a, recs_b, common, Ln, primary_deltas=None):
             out['pooled_two_level_ci_unavailable_reason'] = (
                 _two_level_ci_reason
                 or 'two-level bootstrap not available for this cell')
+        if _pooled_order is not None:
+            out['pooled_order_inference'] = _pooled_order
+        else:
+            out['pooled_order_inference_unavailable_reason'] = (
+                _pooled_order_reason
+                or 'pooled order-dependence readout not available for this cell')
     elif _granularity in ('document', 'article'):
         out['pooled_ci_unavailable_reason'] = (
             _pooled_ci_reason or
@@ -1381,6 +1405,113 @@ def _order_inference_markdown(ft):
     if missing:
         out += ['> 以下比较有逐单位区间但没有顺序依赖块（旧产物或未重新生成分析），'
                 '顺序依赖**未验证**：' + '；'.join(missing) + '。', '']
+    return out
+
+
+def _pooled_order_markdown(ft):
+    """Render the token-pooled order-dependence / effective-n readout.
+
+    The equal-unit table above cannot be copied onto the weighted estimator:
+    its influence function is different.  This table reports the cluster
+    influence's own batch/block design effect and the widest declared
+    interval for BOTH the PPL-difference and log-ratio endpoints.  It is
+    descriptive and never a second confirmatory test.
+    """
+    comps = (ft or {}).get('comparisons') if isinstance(ft, dict) else None
+    if not isinstance(comps, dict):
+        return []
+
+    def _num(value, fmt='{:.4g}'):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return '—'
+        try:
+            f = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return '—'
+        return fmt.format(f) if math.isfinite(f) else '—'
+
+    def _ci(pair):
+        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+            return '—'
+        return f'[{_num(pair[0], "{:+.4f}")}, {_num(pair[1], "{:+.4f}")}]'
+
+    def _range(rows):
+        vals = [r.get('design_effect') for r in rows
+                if isinstance(r, dict) and r.get('design_effect') is not None]
+        return f'{min(vals):.2f}–{max(vals):.2f}' if vals else '—'
+
+    rows = []
+    missing = []
+    not_estimable = []
+    inflated = []
+    for name, comp in comps.items():
+        if not isinstance(comp, dict):
+            continue
+        dsm = comp.get('doc_sampling') or {}
+        po = dsm.get('pooled_order_inference') if isinstance(dsm, dict) else None
+        if not isinstance(po, dict):
+            if (isinstance(dsm, dict)
+                    and dsm.get('pooled_delta_ppl_ci95') is not None):
+                missing.append(name)
+            continue
+        if po.get('status') == 'not_estimable':
+            not_estimable.append(
+                f'{name}（{po.get("reason") or "不可估计"}）')
+            continue
+        if po.get('status') != 'ok':
+            missing.append(name)
+            continue
+        for key, label in (('ppl', 'Δ PPL'), ('log_ratio', 'Δ log PPL')):
+            ep = po.get(key) or {}
+            if not isinstance(ep, dict) or ep.get('status') != 'ok':
+                continue
+            flag = []
+            if ep.get('inflation_detected') is True:
+                flag.append('⚠ i.i.d. 区间低估')
+                inflated.append(f'{name}/{label}')
+            elif ep.get('order_dependence_detected') is True:
+                flag.append('顺序结构可检出但未显著加宽')
+            if ep.get('zero_exclusion_lost') is True:
+                flag.append('⚠ 顺序稳健区间不再排除零')
+            rows.append('| %s | %s | %s | %s | %s / %s | %s | %s | %s | %s |'
+                        % (name, label, po.get('n_units', '—'),
+                           _ci(ep.get('iid_ci')),
+                           _range(ep.get('batch_means') or []),
+                           _range(ep.get('block_bootstrap') or []),
+                           _num(ep.get('n_effective_min'), '{:.1f}'),
+                           _ci(ep.get('robust_ci')),
+                           _num(ep.get('order_dependence_p'), '{:.4f}'),
+                           '；'.join(flag) if flag else '—'))
+    if not rows and not missing and not not_estimable:
+        return []
+    out = ['### token 池化估计量的顺序依赖 / 有效样本量（post-hoc；不改变上面的冻结判定）', '']
+    if rows:
+        out += ['| 比较 | 端点 | 单位 n | i.i.d. cluster 95% CI | 设计效应（batch / block） | n_eff 下限 | 顺序稳健 95% CI | 顺序置换 p | 标记 |',
+                '|---|---|---|---|---|---|---|---|---|']
+        out.extend(rows)
+        out += ['',
+                '> 定义：输入是**按语料/评测顺序排列**的逐单位 cluster influence。'
+                'token 池化 ΔPPL 是非线性估计量，不能把等权逐单位表的设计效应直接搬过来；'
+                '本表用该估计量自己的 delta-method influence（PPL 尺度与 log 尺度各一套）。'
+                '`设计效应 = Var(块均值) / Var(i.i.d. 均值)`，>1 表示同一批单位在观测顺序下'
+                '比独立抽样更不稳定；`n_eff = n / 设计效应`。batch 列是非重叠 batch-means，'
+                'block 列是循环 moving-block bootstrap（块长在策略中预先声明，表中给范围）。'
+                '`顺序稳健 95% CI` 取 i.i.d. cluster 区间与所有声明块长区间中**最宽**的一个，'
+                '避免看结果再挑块长。`顺序置换 p` 是「打乱顺序后 batch-means 设计效应不小于'
+                '观测值」的单侧随机化 p（|lag-1| 双侧 p 见 JSON）。'
+                '该诊断条件在已训练种子上，描述的是冻结切片的顺序结构，不能把 source-order '
+                'prefix 变成概率样本；p 不显著也不证明单位独立或可交换。它是描述性读数：'
+                '不新增冻结族成员，不改变 `p_exact_signflip`/`p_holm`/`verified`/`confirmed`。', '']
+    if inflated:
+        out += ['**token 池化顺序依赖提示**：' + '、'.join(sorted(set(inflated))) +
+                ' 的 i.i.d. cluster 区间在观测顺序下低估不确定性；引用时必须同时报告'
+                '顺序稳健区间与 n_eff，或改用块重采样，不能把 n_units 当作独立信息量。', '']
+    if not_estimable:
+        out += ['> 以下比较的 token 池化顺序依赖读数不可估计（不伪造设计效应）：'
+                + '；'.join(not_estimable) + '。', '']
+    if missing:
+        out += ['> 以下比较有 token 池化区间但没有顺序依赖块（旧产物或未重新生成分析），'
+                'token 池化顺序依赖**未验证**：' + '；'.join(missing) + '。', '']
     return out
 
 

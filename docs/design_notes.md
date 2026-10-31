@@ -10503,3 +10503,120 @@ python -m explib.confirmation report        # 报告新增顺序依赖表
 `fail`、默认与显式 batch 布局的重放一致；`load_wikitest` 被 monkeypatch 成抛错时审计仍完成（证明不读
 test）；报告表与 CLI/`run_report`/`build_report` 接线。完整 CPU 套件在
 本轮最终树通过（新增 11 项）。
+
+## 118. token 池化 PPL 的顺序依赖要单独算：cluster influence、设计效应与有效样本量（本轮结果分析硬化，no new runs）
+
+零 GPU；不新增训练、不读取 test split、不修改
+`confirmation_frozen*.json` 的字节/种子/终点/α/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未删除、未修改、未移动。
+
+### 118.1 问题：§117 的等权设计效应不能搬到主终点上
+
+§117 给逐评测单位的**等权**均值效应加了顺序依赖读数，并在边界里明确
+留下一个缺口：token 池化 PPL 的 cluster 区间是另一个估计量，影响函数
+不同，不能把等权向量的设计效应直接套上去。主表 CI 恰恰是 token 池化
+区间：它按文章（没有文章映射时按行级文档）聚类，但把聚类当成 i.i.d.；
+冻结 test 切片又是 source-order prefix（§55），相邻文章共享主题、文体
+和局部写作习惯。若存在序列相关，主表 cluster 区间会系统性偏窄，而
+`n_units` 被读者当成独立信息量。§117 之后，这个缺口仍然没有可执行读数。
+
+### 118.2 方法：用估计量自己的 cluster influence 做顺序诊断
+
+对每个种子 `s`，token 池化 CE 为 `ce_a,s = Σ_i a_si / T`，PPL 差为
+`Δ_s = exp(ce_a,s) - exp(ce_b,s)`；主终点是 `mean_s Δ_s`。其 delta-method
+cluster influence 为
+
+```
+psi_si = exp(ce_a,s) * (a_si - ce_a,s * t_i) / T
+       - exp(ce_b,s) * (b_si - ce_b,s * t_i) / T
+```
+
+对种子取平均得到 `psi_i`；同样对 log 比 `mean_s(ce_a,s - ce_b,s)` 构造
+`q_si = ((a_si-b_si) - (ce_a,s-ce_b,s) t_i) / T`。两条影响序列都保持
+语料顺序，函数不排序、不洗牌。因为端点是**对单位的求和**而不是单位
+均值，cluster 方差用 `D/(D-1) * Σ psi_i²`；这与既有的
+`_paired_nll_doc_ci` 逐位一致（新增测试直接对拍）。
+
+在每条影响序列上：
+
+- 非重叠 batch-means（声明 `g∈{4,6,8}`；置换用
+  `g=round(sqrt(D))` 夹在 `[4,10]` 且 `<=D//2`）给设计效应与 `n_eff`；
+- 循环 moving-block bootstrap 对每个声明块长（默认 2/4/8）给区间、SE、
+  设计效应与 `n_eff`；块长在策略中预先声明；
+- 打乱影响值顺序的单侧置换 p 检验 batch-means 设计效应，双侧 |lag-1| p
+  作为伴随读数；
+- **顺序稳健区间取 i.i.d. cluster 区间与所有声明块长区间中最宽者**，避免
+  看结果挑块长；
+- 只有置换显著且 `DE_max>1.10`、区间加宽 >10%、或 i.i.d. 区间排除零而
+  某个块区间不再排除零时，才置 `inflation_detected`/`iid_understates`，
+  报告必须引用顺序稳健区间与 `n_eff`。
+
+PPL 尺度与 log 尺度各算一套，因为 `exp` 是非线性的；PPL 点估计是精确的
+池化对比，不是影响序列的浮点求和（影响在中点处求和为零，这是 delta
+方法的性质，不是错误）。
+
+接线：`explib/__init__.py` 追加
+`part_60_pooled_order_inference.py`；
+`_doc_level_analysis` 在既有 `_paired_nll_doc_ci` 通过同一性检查后，用
+同一组 `_nll_a/_nll_b/_ref_tok/_unit_ids` 落盘
+`doc_sampling.pooled_order_inference`（不可用时写
+`pooled_order_inference_unavailable_reason`）；
+`build_report` 在等权顺序表之后新增「token 池化估计量的顺序依赖 /
+有效样本量」表；`audit_gates.py pooled_order`（别名 `pooled_dependence` /
+`pooled_design_effect` / `pooled_effective_n`）从充分统计量整块重放，并入
+`audit_gates.py report` 顶层 `pooled_order`。
+
+### 118.3 边界
+
+这是描述性顺序诊断，不是新的确认性检验：置换 p 不进入冻结 Holm 族、
+不改变 `p_exact_signflip`/`p_holm`/`verified`/`confirmed`；不显著不是
+「单位独立/可交换」，显著也不是「效应不存在」。影响序列是 PPL 非线性
+对比的 delta 方法线性化，不是精确有限样本分布；点估计与影响和不相等是
+正常的。块重采样只处理观测切片内的序列相关，不能把 source-order prefix
+变成概率样本，也不能替代 §55 的抽样边界、§54 的总体主张门槛或 §81 的
+种子×单位两层不确定性。块长与 batch 数是声明式选择，顺序稳健区间取最
+宽者（保守）；n 只有几十时 batch/block 估计本身有噪声。输入顺序必须是
+真的语料顺序，函数无法发现调用者先排序/洗牌；文章/行是调用者选定的
+单位，行级仍受 §54 伪重复边界约束。旧产物缺块报
+`not_verifiable_locally`，不回填、不猜。
+
+### 118.4 落盘、报告与审计
+
+`analysis_v12/test_stats.json` 的每个比较新增
+`doc_sampling.pooled_order_inference`：
+
+- `ppl` / `log_ratio`：两个端点的 point、i.i.d. cluster CI/SE、batch/block
+  表、设计效应范围、`n_eff` 范围、顺序置换 p、顺序稳健区间与来源、标记；
+- `design_effect_max` / `n_effective_min` / `inflation_detected` /
+  `zero_exclusion_lost` 等顶层汇总；
+- `sufficient_statistics`：两条中心化影响序列、两个点估计、单位 id、
+  种子、块长/batch 声明、bootstrap/permutation 次数、conf/α/seed 与阈值。
+
+审计从这些充分统计量重放同一个
+`pooled_order_inference_from_influence`，逐项比较；缺块
+`not_verifiable_locally`、bare `not_estimable` `not_applicable`、篡改
+区间/设计效应/`n_eff`/点估计/影响序列/置换 p/夹带确认字段判 `fail`。
+
+### 118.5 入口与验证
+
+```bash
+python -m pytest -q test_review_part_59.py
+python audit_gates.py pooled_order          # 重放 analysis_v12/test_stats.json
+python audit_gates.py pooled_effective_n    # 别名
+python -m explib.confirmation report        # 报告新增 token 池化顺序表
+```
+
+`test_review_part_59.py` 11 项覆盖：策略/状态/边界声明；i.i.d. 区间与
+既有 `_paired_nll_doc_ci` 的 point/SE/CI 逐位一致；AR(1) 单位面板被
+检出且 PPL/log 两端点均设计效应 >1、`n_eff<n`、顺序稳健区间不窄于
+i.i.d.；独立面板不误报；batch/block 表与「最宽区间」精确选取；同 seed
+完全可复现；形状/NaN/布尔 token/零 token/重复 unit id/重复 seed/非法
+块长/批数/`n_boot`/`n_perm`/conf/α/seed/阈值全部 fail-closed；
+`1e308` 交替与常数面板严格 JSON、不泄漏 inf/nan；
+`_doc_level_analysis` 在 3 种子 × 16 文档面板上落盘 token 池化块；
+审计对合法块 `ok`、篡改区间/设计效应/稳健区间/`n_units`/影响/点估计/
+置换 p/夹带 `confirmed` 判 `fail`、bare `not_estimable`
+`not_applicable`、缺块 `not_verifiable_locally`、坏 JSON `fail`、
+`load_wikitest` 被 monkeypatch 抛错时审计仍完成（证明不读 test）；报告
+表与 CLI/`run_report`/`build_report` 接线。相关既有套件通过；完整 CPU
+套件在本轮最终树通过（新增 11 项）。
