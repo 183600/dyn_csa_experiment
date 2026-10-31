@@ -1416,6 +1416,15 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
     p-value, Holm family, ``verified`` verdict or the frozen plan; without a
     plan the audit says so instead of inventing one.
 
+    The report also carries ``contrast_network`` (see
+    :func:`contrast_network_audit`): a multi-arm graph that checks whether the
+    same arm label is one measurement across every pair, whether all declared
+    components share a connected common reference, and whether cycles close.
+    An individually controlled pair can still splice a different run of the
+    shared arm; that block names the conflict and withholds a cross-component
+    ranking.  It adds no p-value to a declared family and never changes
+    ``p_holm`` / ``verified`` / a frozen decision.
+
     This report is single-panel evidence.  Project-level replication and
     cross-panel contradictions are computed by
     :func:`ablation_coverage_across_panels`; do not read one panel's

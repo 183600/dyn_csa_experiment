@@ -5966,3 +5966,71 @@ JSON 与同输入重放；审计重放 ok、篡改 log 均值/一致性/输入�
 缺块不可验证、裸 synthesis 可审计；伪造 `claim_allowed`/状态判 fail；
 `confirmed` 夹带判 fail；CLI 别名可达。`test_review_part_64.py` 11 项
 与完整 CPU 套件在本轮最终树通过。
+
+## 2026-10-31 — 多臂对比的可组合性：共同参照、臂同一性与间接对照门（本轮对比/消融方法硬化，no new runs）
+
+零 GPU；不新增训练、不读取 test split、不修改
+`confirmation_frozen*.json` 的字节/种子/端点/α/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未删除、未修改、未移动。
+
+**Problem.** §19/§121 的 `methodology_audit` 对每条留一对照逐对执行
+`pair_reason`，但逐对受控不等于整张多臂表可组合。两个真实缺口：
+
+1. **同一臂被两次测量后拼接**。`(A,B)` 的 B 与 `(B,C)` 的 B 可能来自
+   不同 run / 评测切片 / recipe；每对内部都通过，但 `A > B > C` 是两次
+   实验的拼接，`A > C` 没有共同测量。逐对审计没有入口发现这件事。
+2. **没有共同参照的跨组件排序**。组件 X 只对 `csa_fixed`、组件 Y 只对
+   `csa_dynamic` 时，两条各自验证的对照不能推出「X 比 Y 更有用」，除非
+   两个参照臂在同一张连通图上。报告中的路径间接对照也没有统一的方向、
+   种子交集与「非实测」标签。
+
+**Fix.** 新增 `explib/_parts/part_65_contrast_network.py`：
+
+- `contrast_network_audit(entries, reference_arm=None, alpha, min_n)` 以
+  `(arm, protocol tag)` 为节点、`without -> with` 的配对 log PPL 比为边。
+  只有 `controlled`、`fully_paired`、带逐种子两臂 PPL、至少 2 个共享
+  种子、且记录的 `deltas` 与 `with-without` 一致的对照才成为干净边；
+  陈旧 `deltas` 具名排除并降 warn。
+- 同一 `(arm, tag, seed)` 在两条边中 PPL 不同即记 `node_conflicts`，
+  列出每个种子的边与数值；所有触及该节点的边从可组合图排除，绝不把
+  两次 run 平均成一个臂。
+- 在干净边上求连通分量、逐分量局部参照；默认共同参照取度数最大的
+  节点，也接受显式 `reference_arm`。只有 ≥2 个声明组件、所有干净边
+  同属一个分量、共同参照覆盖全部声明组件、无节点/重复边冲突、闭环
+  不矛盾，且每个声明组件沿参照路径共享至少 2 个种子时
+  `cross_component_ranking_allowed=True`；否则给出具名原因。连通但两侧
+  种子不相交（A−B 用 0,1,2、B−C 用 3,4,5）时只允许分别报告，不允许配对
+  排序。
+- 在生成树上为每条非树边构造基本环，用记录的逐边比值算逐种子环和。
+  节点一致时这是恒等式；非零残差只说明某条边不是同一测量，明确不把它
+  当成交互检验（交互仍走 §59/§67 的 2×2）。
+- 只对声明组件的节点对在干净图上求最短路，要求路径边共享种子，输出
+  `log(PPL_from/PPL_to)` 与描述性精确符号翻转 p；每行标记
+  `source='derived_path'`、`claim_allowed=False`，不进入任何 Holm 族，
+  路径对上限 128。
+- `methodology_audit` 在既有统计后附加 `report['contrast_network']`；
+  `audit_methodology` 逐 panel 输出该块并把 warn 传播为 panel warn。
+- 新增 `_audit_gates/_parts/part_31_audit_contrast_network.py`：
+  `audit_contrast_network(path=None)` 从保存报告的 component/baseline
+  条目重算整块，对账 status/边集合/参照/闭环/排序门/节点冲突；篡改、
+  夹带 `confirmed`/`p_holm`/`verdict`/`decision` 判 fail；缺块
+  `not_verifiable_locally`。CLI 别名 `contrast_network` /
+  `contrast_graph` / `comparison_graph` / `multi_arm` / `network`。
+
+**Boundary.** 闭环是同一性检查，不是交互估计，也不是第二个 p 值来源；
+节点冲突可能来自合法的重训/换评测切片，本块只拒绝拼接，不替调用者
+选择「正确」的 run。间接对照是路径推导而非随机化实测，不改变
+`verified`/Holm/SESOI/冻结判定；共同参照门只说明能否在同一张图上谈
+排序，不说明哪个组件最重要，也不把排序变成因果量。缺逐种子两臂 PPL
+的旧报告返回 `not_estimable`，不从聚合 `deltas` 反造节点值。不读 test
+split，不新增训练，不改冻结清单、种子、α、Holm 规则或
+`CODE_SEMANTICS`。
+
+**Verification.** 新增 `test_review_part_66.py` 12 项：三臂链单连通/
+共同参照/闭环；split node 被具名且排序门关闭；不相连分量被拒；陈旧
+`deltas` 排除并 warn；缺逐种子 PPL 时 `not_estimable`；重复边数值冲突；
+三角环闭合且注明是同一性而非交互；路径间接对照的方向/数值/标签；
+不修改输入、不产生 `p_holm`/`verified`；`methodology_audit` 附加该块
+且不改变 Holm 族大小；连通但两侧种子不相交时排序门关闭；gate 重放
+ok、篡改/夹带/缺块分别 fail/`not_verifiable_locally`。完整 CPU 套件在
+本轮最终树通过。

@@ -75,6 +75,7 @@ _PARTS = [
 'part_62_cleaning_replay.py',
 'part_63_cross_panel_synthesis.py',
 'part_64_cross_panel_scale_sensitivity.py',
+'part_65_contrast_network.py',
 ]
 
 load_root_package(globals(), __file__, _PARTS,

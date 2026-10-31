@@ -91,10 +91,13 @@ def audit_methodology(outdirs=None, design=None, alpha=0.05, min_n=3, write=True
                 (rep.get('missingness') or {}).get('sign_not_robust_contrasts')),
             'maxt_only_contrasts': rep.get('maxt_only_contrasts'),
             'holm_only_contrasts': rep.get('holm_only_contrasts'),
+            'contrast_network': rep.get('contrast_network'),
             'warnings': rep.get('warnings'),
         }
         out['panels'][d] = _panel
         if _panel['arms_below_min_seeds'] or _panel['warnings']:
+            out['status'] = 'warn'
+        if (_panel.get('contrast_network') or {}).get('status') == 'warn':
             out['status'] = 'warn'
     if not out['panels']:
         out['status'] = 'not_verifiable_locally'
