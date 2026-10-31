@@ -303,6 +303,11 @@
   source       源码树身份：把当前源码字节与 plan_snapshot / summary 记录的
                source_tree 比对（逐文件 added/removed/changed；无记录时明确
                报 not_verifiable_locally，不把 git commit 当成源码哈希）
+  split_registry  已执行模块的注册身份：核对每个 _parts/ 包的字面
+               _PARTS（顺序/成员/逐片哈希/historical_path）与磁盘是否
+               一致；漏登记、重复、缺失或仅换序都改变摘要。可选读
+               产物的 source_tree.split_registry 并逐项对账；缺字段报
+               not_verifiable，不把「文件都在」当成「按此顺序执行」
   dependencies 依赖锁契约：requirements.lock 的每条 pin 与已安装版本比对；
                mismatch/missing/invalid 判 fail，partial 给出覆盖率警告
   environment_identity  声明环境身份：把本地 env_fp_v2（全部 lock pin +

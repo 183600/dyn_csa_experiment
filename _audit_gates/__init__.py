@@ -21,6 +21,7 @@ _PARTS = [
 'part_30_audit_panel_scale_sensitivity.py',
 'part_31_audit_contrast_network.py',
 'part_32_audit_design_protocol.py',
+'part_33_split_registry.py',
 'part_05_audit_confirmation_verdicts.py',
 'part_08_audit_missingness.py',
 'part_09_audit_trajectory.py',

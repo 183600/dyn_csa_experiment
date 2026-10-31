@@ -6116,3 +6116,45 @@ gate/CLI/`report`/`design_preflight` 接线存在且不新增 p/Holm/verdict
 字段；以及 planned cell 的 arm/seed 必须属于声明的网格（未声明臂或
 未声明种子判 fail），未知方向标签不会被静默当成 non_directional。
 完整 CPU 套件在本轮最终树通过。
+
+## 2026-10-31 — 文件树摘要不等于执行注册：split `_PARTS` 的顺序/成员/树内约束（本轮可复现性/工程规范硬化，no new runs）
+
+零 GPU；没有新训练、没有读取 test split、没有修改 `confirmation_frozen*.json`
+的臂/种子/端点/α/Holm 规则、没有改 `CODE_SEMANTICS`、没有改 `.github/`
+或任何 README。仓库的测量模块由 `_split_loader` 按 `_PARTS` 字面顺序
+`exec` 片段组装；本轮把「哪些片段被执行、按什么顺序、是否在仓库内」
+从文件树摘要中独立出来，避免把「文件都在」当成「按此执行」。
+
+- **问题。** `source_tree_manifest()` 逐文件哈希能发现字节变化，但不记录
+  执行顺序/成员；`_PARTS` 里的绝对路径、`..` 或树外符号链接会被 loader
+  执行，却不在源码摘要范围内。孤立片段则相反：从未执行，却进入摘要并
+  让 provenance 变噪。顺序变更通常会改 `__init__.py` 字节从而也被文件树
+  发现，但摘要把「执行注册变了」与「声明文件多了注释」混为一谈。
+- **方法。** 新增 `exp_lib.split_registry_manifest()`：AST 读取每个
+  `_parts/` 包的 `_PARTS` 与 `historical_path` 字面量；校验纯 basename、
+  存在性、realpath 树内、逐片段 sha256、孤立/重复/缺失；摘要覆盖
+  `package + historical + order + name + sha256`，全局再按包排序。作为
+  `source_tree.split_registry` 附加到完整清单与 `source_tree_summary`，
+  **不改变历史文件树 sha256 算法**；局部 `include=` 扫瞄该字段为 `None`。
+- **接线。** v12 冻结锁要求 present 的注册 `status=ok` 且摘要非空；锁中
+  有注册而当前缺失或改变时按 `measurement source changed` 拒绝，并在
+  错误里点明 split registration。`reproduction_diagnosis` 的 code 维度在
+  任一侧有注册时比较 `status:sha256`；单侧/malformed/invalid 判
+  `provenance_incomplete`，双侧缺失只加「predate split_registry」note。
+  新增 `audit_gates.py split_registry`（别名 `split_parts`/
+  `parts_registry`/`registration_integrity`）及 `make registry`，并接入
+  `run_report` 顶层；可选扫描产物里的 `source_tree.split_registry`，缺失
+  报 `not_verifiable`，不符判 fail。`archive_release.py verify` 不 import
+  `exp_lib`，从归档内的 `__init__.py` 字节用标准库 AST 重读注册，并用
+  manifest 的逐片段哈希重建摘要与 identity 对账；缺该块的旧归档照常
+  验证，present 但不重算/计数不符判 fail。
+- **边界。** 文件树摘要仍是主身份；注册摘要只补顺序/成员/树内这一维。
+  不产生 p 值、不进入 Holm、不改变 `verified`/`confirmed`、不重算 PPL、
+  不进入训练/resume/RNG。不是签名，不抗同时改写源码并重算摘要的恶意；
+  旧记录没有该字段时不追溯性拒绝，只明确 note。
+- **验证。** `test_review_part_70.py` 8 项覆盖：真实仓库 13 包/全部片段
+  登记一致；换序、注释编辑、孤立/缺失/重复/越界条目与树外符号链接；
+  局部扫瞄不冒充完整注册；provenance/summary 携带；复现比较的
+  code_changed/unverified/legacy 三态；冻结锁在注册摘要改变而文件摘要
+  仍相同时拒绝；审计门的 ok/fail/not_verifiable 与 CLI；归档 verify 从打包字节
+  独立重算并拒绝篡改摘要/片段计数。完整 CPU 套件在本轮最终树通过。

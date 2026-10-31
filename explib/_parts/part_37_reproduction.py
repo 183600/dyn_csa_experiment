@@ -208,6 +208,31 @@ def _repro_dimension(name, fields, *, notes=None):
     return out
 
 
+def _repro_registry_identity(value):
+    """Comparable identity for a recorded split-registry block.
+
+    The digest is the scientific identity; the status is included so a
+    present-but-invalid registry (or a malformed object) cannot compare equal
+    to a healthy one with an accidentally equal digest.  A bare string is
+    accepted for forward compatibility, while every other shape becomes a
+    ``malformed:`` token that ``_repro_field`` reports as unverified.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        return text or None
+    if isinstance(value, dict):
+        digest = value.get('sha256')
+        if isinstance(digest, str) and digest.strip():
+            status = value.get('status')
+            status = status.strip().lower() if isinstance(status, str) else ''
+            if status != 'ok':
+                return f'invalid:{status or "missing"}:{digest.strip()}'
+            return f'ok:{digest.strip()}'
+    return 'malformed:' + _repro_canonical(value)
+
+
 def _repro_code_dimension(original, rerun):
     def _ident(rec):
         prov = rec.get('provenance') if isinstance(rec.get('provenance'), dict) else {}
@@ -224,6 +249,7 @@ def _repro_code_dimension(original, rerun):
             'source_sha256': tree.get('sha256'),
             'code_semantics': code.get('code_semantics'),
             'code_stamp': _stamp,
+            'split_registry': tree.get('split_registry'),
         }
 
     a, b = _ident(original), _ident(rerun)
@@ -238,7 +264,32 @@ def _repro_code_dimension(original, rerun):
     if a['code_stamp'] is not None or b['code_stamp'] is not None:
         fields.append(_repro_field('code_stamp', a['code_stamp'],
                                    b['code_stamp']))
+    # The source digest binds the bytes present, not the ordered fragment
+    # registration that the split loader actually executed.  When either side
+    # carries the derived registry identity, compare it: it names order and
+    # membership explicitly (and rejects entries outside the tree, whose
+    # bytes the source digest never saw).  Both absent is a legacy record,
+    # named as such rather than silently promoted to a match.
+    registry_a, registry_b = a['split_registry'], b['split_registry']
+    if registry_a is not None or registry_b is not None:
+        _ra = _repro_registry_identity(registry_a)
+        _rb = _repro_registry_identity(registry_b)
+        _registry_field = _repro_field('split_registry', _ra, _rb,
+                                       required=True)
+        # A present but malformed/invalid registry is not a comparable
+        # identity even when both sides carry the same bad value.
+        if (str(_ra or '').startswith(('malformed:', 'invalid:'))
+                or str(_rb or '').startswith(('malformed:', 'invalid:'))):
+            _registry_field['status'] = 'unverified'
+            _registry_field['detail'] = (
+                'a present split registry is malformed or not status=ok; '
+                'the executed registration cannot be attested')
+        fields.append(_registry_field)
     notes = []
+    if registry_a is None and registry_b is None:
+        notes.append('both records predate split_registry; the executed '
+                     'fragment order/membership is not bound by this '
+                     'comparison (the plain source digest is still checked)')
     if a['source_sha256'] is None and b['source_sha256'] is None:
         notes.append('only the CODE_SEMANTICS stamp is recorded; the git commit '
                      'and stamp cannot prove which source bytes produced the '

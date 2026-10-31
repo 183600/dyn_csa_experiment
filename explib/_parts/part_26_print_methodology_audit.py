@@ -1434,6 +1434,14 @@ def source_tree_manifest(root=None, include=None):
     blob = ''.join(f'{rel}\0{files[rel]["bytes"]}\0{files[rel]["sha256"]}\n'
                    for rel in sorted(files))
     digest = hashlib.sha256(blob.encode('utf-8')).hexdigest()
+    # The file digest answers "which bytes are present".  It cannot answer
+    # "which fragments were executed, in what order, and did every entry stay
+    # inside the tree": an unregistered fragment is still on disk, and a
+    # path-like/out-of-tree entry would execute bytes this digest never saw.
+    # A derived registry identity is therefore attached without changing the
+    # historical digest (old archives stay verifiable).  A partial `include`
+    # scan did not inspect package declarations, so it must not claim one.
+    registry = split_registry_summary(root=root) if include is None else None
     return {
         'schema': 1,
         'algorithm': 'sha256(sorted relpath NUL bytes NUL sha256 LF)',
@@ -1442,10 +1450,13 @@ def source_tree_manifest(root=None, include=None):
         'bytes': int(total),
         'files': files,
         'unreadable': unreadable,
+        'split_registry': registry,
         'scope': ('all non-generated, non-test *.py under the repo root plus '
                   'pyproject/setup/requirements.txt and both frozen manifests; '
                   'requirements.lock (machine-specific environment), README*.md, '
-                  'docs, tests and CI configuration are excluded'),
+                  'docs, tests and CI configuration are excluded.  '
+                  'split_registry separately binds the ordered _PARTS '
+                  'membership of every split package'),
     }
 
 
@@ -1456,6 +1467,8 @@ def source_tree_summary(root=None):
                             'bytes', 'scope')}
     if m.get('unreadable'):
         out['unreadable'] = m['unreadable']
+    if m.get('split_registry') is not None:
+        out['split_registry'] = m['split_registry']
     return out
 
 

@@ -11782,3 +11782,112 @@ manifest mismatch；gate/CLI/`report`/`design_preflight` 接线存在且不
 新增任何 p/Holm/verdict 字段；以及 planned cell 的 arm/seed 必须属于
 声明的网格（未声明臂或未声明种子判 fail），以及未知方向标签不会被
 静默当成 non_directional。完整 CPU 套件在本轮最终树通过。
+
+## 128. 源码摘要说的是「文件在」，不是「哪些片段被执行」：split registry（本轮可复现性/工程规范硬化，no new runs）
+
+零 GPU；不新增训练、不读取 test split、不修改
+`confirmation_frozen*.json` 的字节/种子/端点/α/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未删除、未修改、未移动。
+
+### 128.1 问题：文件树摘要回答不了「执行了什么」
+
+`explib`、各驱动与审计包都不是普通单文件模块：它们由 `_split_loader`
+按 `_PARTS` 的字面顺序 `exec` `_parts/*.py` 组装。`source_tree_manifest()`
+逐文件哈希整个测量源码范围，能发现「字节被改」，但不能直接回答：
+
+- 某个 `_parts/*.py` 是否真的在 `_PARTS` 里（孤立片段仍在磁盘上、仍进入
+  源码摘要，但从未执行）；
+- 片段以什么顺序执行（后执行的片段可以覆盖先执行的同名定义）；
+- `_PARTS` 的条目是否解析到仓库之外（`/tmp/x.py`、`../x.py`、指向树外的
+  符号链接）。这类条目会被 loader 执行，却不在源码摘要里，provenance
+  对实际执行的字节完全没有绑定。
+
+前两种通常也会改变 `__init__.py` 的字节，从而改变文件树摘要；但摘要把
+「执行注册变了」和「声明文件里多了一行注释」混成同一个 `code_changed`。
+第三种则是真正的漏洞：源码摘要**看不到**树外片段。已有的
+`source_tree.scope`、pre-freeze 锁和 `reproduce compare` 都只比较文件树，
+没有独立的执行注册身份。
+
+### 128.2 方法：从字面 `_PARTS` 派生注册摘要
+
+新增 `exp_lib.split_registry_manifest(root=None)`。它不 import 驱动
+（驱动可能要求 CUDA/训练状态），而是用 `ast.literal_eval` 读取每个 split
+包 `__init__.py` 里的：
+
+- `_PARTS` 字面列表（必须是 list/tuple；非字面量、重复声明、重复条目都
+  判 invalid）；
+- `load_*_package(..., historical_path=...)` 的字面字符串。
+
+对每个包逐个校验并记录：
+
+| 检查 | 失败行为 |
+|---|---|
+| 条目是纯 `*.py` basename | 路径分隔、绝对路径、`..`、非 `.py` 判 invalid |
+| 每个登记片段存在且在仓库内（含 realpath） | 缺失/树外/树外符号链接判 invalid |
+| `_parts/` 下每个 `*.py` 都已登记 | 孤立片段判 invalid 并点名 |
+| `historical_path` 是仓库相对路径 | 绝对/越界判 invalid（文件本身可以已不存在） |
+
+每个片段记录 `{name, order, sha256, bytes}`；包摘要覆盖
+`package + historical_path + order + name + sha256`，全局摘要再按包名
+排序覆盖各包摘要。因此**顺序与成员**是身份的一部分；只改 `__init__.py`
+注释不会改变它。
+
+该块作为 `source_tree.split_registry` 附加到完整源码清单中，但
+**不改变历史文件树 `sha256` 的算法**：旧归档仍可按原算法重算，新记录则
+多一层执行身份。显式 `include=` 的局部扫瞄没有检查包声明，因此该字段为
+`None`，不冒充完整注册。
+
+### 128.3 接线：冻结锁、逐记录 provenance、复现比较与审计
+
+- `code_provenance()['code']['source_tree']` 经
+  `source_tree_summary()` 自动携带紧凑注册块（`sha256/status/n_packages/
+  n_parts`）；训练记录、分析戳与发布 identity 无需各自实现。
+- v12 冻结锁在 `_source_tree_for_lock()` 中要求：**present 的注册必须
+  `status=ok` 且摘要非空**；锁里已有注册而当前缺失/改变时，按
+  `measurement source changed` 拒绝（错误信息点明 split registration）。
+  旧的手工注入 manifest 没有该字段时保持兼容，不追溯性拒绝历史锁。
+- `reproduction_diagnosis` 的 `code` 维度在任一侧有注册时比较
+  `status:sha256`；一侧缺失或 malformed/invalid 报 `unverified`
+  （最终 `provenance_incomplete`），绝不当成 match。两侧都缺失的旧记录
+  明确写 note「predate split_registry」，不静默升级为 match。
+- 新增 `audit_gates.py split_registry`（别名 `split_parts`/
+  `parts_registry`/`registration_integrity`）：本地重算完整注册；可选传入
+  产物路径/目录，递归找 `source_tree.split_registry` 并逐项对账。找不到
+  字段报 `not_verifiable`，摘要不符/坏 JSON 判 fail；不读 test、不产生
+  p 值、不改 Holm/verified/confirmed。`run_report` 顶层也直接调用，
+  `make registry` 是零 GPU 单命令入口。
+- `archive_release.py verify` 新增独立重算：不 import `exp_lib`，直接从
+  归档里的 `__init__.py` 字节用标准库 AST 重读 `_PARTS`/
+  `historical_path`，并用 manifest 的逐片段哈希重建包摘要与全局摘要，
+  与 identity 里的 `split_registry` 对账。没有该块的旧归档照常验证；
+  present 但不重算/计数不符判 fail。
+
+### 128.4 边界
+
+- **不是第二个源码摘要。** 文件树摘要仍是主身份；注册摘要只补
+  「顺序/成员/是否在树内」这一维。两者都通过才说明记录绑定的是同一份
+  可复核执行体。
+- **顺序变更通常也会改变文件树摘要。** 因为 `_PARTS` 字面量本身在
+  `__init__.py` 里。注册摘要的价值是把「执行语义」与「声明文件的注释/
+  换行」分开，并拒绝树外片段；它不是声称能发现所有「文件树摘要看不见」
+  的代码改动。
+- **不是签名。** 能同时改写 `_PARTS`、片段与重新计算摘要的人仍可伪造；
+  它让无意漂移、孤立片段和树外加载可见，不抗恶意。
+- **不回溯。** 旧记录没有该字段时，`reproduce` 只加 note；新的冻结锁/
+  记录才携带它。没有该块的旧归档仍按文件树摘要验证。独立 `verify` 会从
+  打包字节重算 present 的注册，但它仍是派生内容，不是外部时间戳/签名。
+- **不改变测量。** 注册摘要只读源码；不进入 `run_cfg`、RNG、训练、评估、
+  resume 或任何统计量。
+
+### 128.5 验证
+
+新增 `test_review_part_70.py` 8 项：真实仓库 13 个 split 包/全部片段
+登记一致且计数等于磁盘；换序/注释编辑/孤立片段/缺失条目/重复条目/
+越界路径分别改变或拒绝注册摘要，树外符号链接被拒而文件树摘要不会
+跟随；局部 `include` 不冒充完整注册；`code_provenance` 与
+`source_tree_summary` 携带注册；`reproduction_diagnosis` 把注册改变判
+`code_changed`、单侧/malformed/invalid 判 `provenance_incomplete`、双侧
+缺失保持旧行为并写 note；冻结锁在注册摘要改变而文件摘要仍相同（注入/
+派生 manifest 的情形）时拒绝、并拒绝本地 invalid 注册；审计门对匹配/不符/缺失分别给 `ok`/`fail`/
+`not_verifiable`，且 CLI 可执行；归档 `verify` 从打包字节独立重算注册，
+篡改摘要或片段计数判 fail。完整 CPU 套件在本轮最终树通过。

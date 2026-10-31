@@ -7,7 +7,7 @@ PYTHON ?= python
 BUILD_DIR := .build
 INSTALL_DIR := $(BUILD_DIR)/install-check
 
-.PHONY: help test plan protocol audit manipulation integrity env-check reproduce report-diff install-check build clean
+.PHONY: help test plan protocol audit manipulation integrity env-check registry reproduce report-diff install-check build clean
 
 help:
 	@echo "make test          # CPU unit/reproducibility suite (zero GPU)"
@@ -17,6 +17,7 @@ help:
 	@echo "make manipulation  # functional manipulation check for every declared ablation (zero GPU)"
 	@echo "make integrity     # verify stamped analysis bodies/inputs (zero GPU)"
 	@echo "make env-check     # local lock/OS stack vs recorded env_fp_v2 (zero GPU)"
+	@echo "make registry      # split-package _PARTS registration integrity (zero GPU)"
 	@echo "make reproduce A=<dir> B=<dir>  # compare two independent runs (zero GPU)"
 	@echo "make report-diff A=<json> B=<json>  # compare two stamped reports (zero GPU)"
 	@echo "make install-check # verify the project builds/installs as a wheel"
@@ -43,6 +44,9 @@ integrity:
 
 env-check:
 	$(PYTHON) audit_gates.py environment_identity
+
+registry:
+	$(PYTHON) audit_gates.py split_registry
 
 reproduce:
 	@test -n "$(A)" -a -n "$(B)" || { \

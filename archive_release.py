@@ -13,7 +13,8 @@ SHA-256 清单的固定归档**，可发布到任何只读位置（release 附�
   - **测量源码**：`exp_lib.source_tree_manifest()` 范围内的全部文件，
     以仓库相对路径入包；归档因此不依赖 Git 历史仍然自洽
   - **identity 块**：CODE_SEMANTICS、完整源码树摘要、依赖锁契约、
-    执行环境指纹；`verify` 只凭归档即可重算源码树摘要
+    执行环境指纹，以及 split 包的 ordered `_PARTS` 注册；`verify` 只凭
+    归档即可重算源码树摘要与注册摘要
   - confirmation_frozen.json（+ 冻结锁 .freeze_lock.json 与 ckpt 哈希表）
   - run_time_state*.json（TimeGuard 账本）
   - 环境：python/pip/torch/CUDA 版本、requirements 快照
@@ -34,6 +35,7 @@ SHA-256 清单的固定归档**，可发布到任何只读位置（release 附�
 verify 独立于 make：任何拿到归档的人都能校验完整性。
 """
 import argparse
+import ast
 import contextlib
 import glob
 import gzip
@@ -533,6 +535,162 @@ def _bad_file_entry(meta, *, require_bytes=False):
     if size is None:
         return bool(require_bytes)
     return (isinstance(size, bool) or not isinstance(size, int) or size < 0)
+
+
+_SPLIT_REGISTRY_ALGORITHM = (
+    'sha256(sorted package NUL historical NUL order NUL part NUL sha256 LF)')
+
+
+def _packed_split_registry_problems(man, tf):
+    """Recompute the executed split registration from packed bytes.
+
+    `verify` must not trust `exp_lib` (the code it is checking) for this
+    identity.  The declaration is therefore parsed again from the packed
+    `__init__.py` bytes with the standard-library AST, and the digest is
+    rebuilt from the manifest's own per-fragment hashes.  A legacy archive
+    without the block is accepted (nothing to verify), but a present block
+    that disagrees with its packed source is a hard failure.
+    """
+    ident = man.get('identity') if isinstance(man, dict) else None
+    st = ident.get('source_tree') if isinstance(ident, dict) else None
+    rec = st.get('split_registry') if isinstance(st, dict) else None
+    if rec is None:
+        return []
+    problems = []
+    if not isinstance(rec, dict):
+        return ['split_registry block is not an object']
+    if rec.get('status') != 'ok':
+        problems.append(f'split_registry status is {rec.get("status")!r}, not ok')
+    if rec.get('algorithm') != _SPLIT_REGISTRY_ALGORITHM:
+        problems.append('split_registry algorithm is not the documented one')
+    if rec.get('schema') != 1:
+        problems.append(f'split_registry schema is {rec.get("schema")!r}, expected 1')
+    files = st.get('files') if isinstance(st, dict) else {}
+    if not isinstance(files, dict):
+        return problems + ['source_tree.files is missing while split_registry is present']
+
+    groups = {}
+    for rel in files:
+        if not isinstance(rel, str):
+            continue
+        idx = rel.find('/_parts/')
+        if idx < 0:
+            continue
+        pkg, name = rel[:idx], rel[idx + len('/_parts/'):]
+        if not pkg or '/' in name or not name.endswith('.py'):
+            continue
+        groups.setdefault(pkg, []).append(name)
+    if not groups:
+        problems.append('split_registry is present but no _parts/ source was packed')
+
+    names = set(tf.getnames())
+
+    def _read(rel):
+        if rel not in names:
+            raise KeyError(rel)
+        member = tf.extractfile(rel)
+        if member is None:
+            raise KeyError(rel)
+        return member.read()
+
+    def _decl(rel):
+        raw = _read(rel)
+        tree = ast.parse(raw, filename=rel)
+        values = []
+        for node in tree.body:
+            if isinstance(node, ast.Assign):
+                targets, value = node.targets, node.value
+            elif isinstance(node, ast.AnnAssign) and node.value is not None:
+                targets, value = [node.target], node.value
+            else:
+                continue
+            if any(isinstance(t, ast.Name) and t.id == '_PARTS'
+                   for t in targets):
+                values.append(value)
+        if len(values) != 1:
+            raise ValueError('expected exactly one _PARTS declaration')
+        parts = ast.literal_eval(values[0])
+        if not isinstance(parts, (list, tuple)):
+            raise ValueError('_PARTS is not a list/tuple')
+        hist = None
+        for node in tree.body:
+            if not isinstance(node, ast.Expr) or not isinstance(node.value, ast.Call):
+                continue
+            call = node.value
+            fname = (call.func.id if isinstance(call.func, ast.Name)
+                     else call.func.attr if isinstance(call.func, ast.Attribute)
+                     else '')
+            if not fname.startswith('load_'):
+                continue
+            for kw in call.keywords:
+                if kw.arg == 'historical_path':
+                    hist = ast.literal_eval(kw.value)
+            break
+        if not isinstance(hist, str) or not hist.strip():
+            raise ValueError('historical_path is missing or not a literal string')
+        return list(parts), hist.strip()
+
+    parsed = {}
+    total_parts = 0
+    for pkg in sorted(groups):
+        try:
+            parts, hist = _decl(pkg + '/__init__.py')
+        except Exception as e:
+            problems.append(f'{pkg}: cannot parse packed __init__.py '
+                            f'({type(e).__name__}: {e})')
+            continue
+        pkg_problems = []
+        hist_posix = hist.replace('\\', '/')
+        if (os.path.isabs(hist) or hist_posix.startswith('../')
+                or '/../' in hist_posix or hist_posix in ('..', '.')):
+            pkg_problems.append(f'historical_path is not repo-relative: {hist!r}')
+        on_disk = sorted(groups.get(pkg) or [])
+        seen = set()
+        entries = []
+        for order, name in enumerate(parts):
+            if not isinstance(name, str) or not name:
+                pkg_problems.append(f'_PARTS[{order}] is not a non-empty string')
+                continue
+            if (name.startswith(('.', '/', '\\')) or '/' in name
+                    or '\\' in name or not name.endswith('.py')):
+                pkg_problems.append(f'_PARTS[{order}]={name!r} is not a plain basename')
+                continue
+            if name in seen:
+                pkg_problems.append(f'duplicate fragment registration: {name}')
+                continue
+            seen.add(name)
+            rel = pkg + '/_parts/' + name
+            meta = files.get(rel)
+            if not isinstance(meta, dict) or not meta.get('sha256'):
+                pkg_problems.append(f'registered fragment was not packed: {rel}')
+                continue
+            entries.append((order, name, str(meta['sha256'])))
+        for name in on_disk:
+            if name not in seen:
+                pkg_problems.append(f'fragment exists but is unregistered: {name}')
+        problems.extend(f'{pkg}: {p}' for p in pkg_problems)
+        parsed[pkg] = (hist, entries)
+        total_parts += len(entries)
+
+    global_blob = ''
+    for pkg in sorted(parsed):
+        hist, entries = parsed[pkg]
+        pkg_blob = ''.join(f'{pkg}\0{hist}\0{o}\0{n}\0{s}\n'
+                           for o, n, s in entries)
+        global_blob += (f'{pkg}\0'
+                        f'{hashlib.sha256(pkg_blob.encode("utf-8")).hexdigest()}\n')
+    digest = hashlib.sha256(global_blob.encode('utf-8')).hexdigest()
+    if str(rec.get('sha256', '')).lower() != digest:
+        problems.append(
+            f'split_registry.sha256 {str(rec.get("sha256"))[:12]}… does not '
+            f'recompute from packed source ({digest[:12]}…)')
+    if rec.get('n_parts') != total_parts:
+        problems.append(
+            f'split_registry.n_parts {rec.get("n_parts")!r} != recomputed {total_parts}')
+    if rec.get('n_packages') != len(groups):
+        problems.append(
+            f'split_registry.n_packages {rec.get("n_packages")!r} != recomputed {len(groups)}')
+    return problems
 
 
 def _release_identity_problems(man, *, identity=None):
@@ -1067,6 +1225,8 @@ def cmd_verify(tar_path):
             _ident_bad = _release_identity_problems(man, identity=_ident)
             if _ident_bad:
                 bad.extend(f'identity: {p}' for p in _ident_bad[:20])
+            for _p in _packed_split_registry_problems(man, tf)[:20]:
+                bad.append(f'identity: {_p}')
         for _problem in _payload_problems(man):
             bad.append(f'payload: {_problem}')
         for _problem in _reproducibility_problems(

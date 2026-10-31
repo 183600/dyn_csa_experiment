@@ -77,6 +77,7 @@ _PARTS = [
 'part_64_cross_panel_scale_sensitivity.py',
 'part_65_contrast_network.py',
 'part_66_design_protocol.py',
+'part_67_split_registry.py',
 ]
 
 load_root_package(globals(), __file__, _PARTS,

@@ -834,6 +834,23 @@ def _source_tree_for_lock(source_tree=None):
         raise SystemExit('[v12] REFUSE: cannot compute a source-tree digest for the freeze lock — the code that produced the test measurement would be unattested')
     if st.get('unreadable'):
         raise SystemExit(f'[v12] REFUSE: the source tree contains unreadable files ({st["unreadable"][:3]}) — fix the permissions or exclude the path explicitly before freezing; an incomplete source digest cannot attest the measurement code')
+    # A present registry must be internally valid: an unlisted/orphan fragment
+    # means the executed module is not the reviewed source tree.  A legacy
+    # injected manifest without the field stays accepted for compatibility;
+    # every manifest computed by the current code carries it.
+    reg = st.get('split_registry')
+    if reg is not None:
+        if (not isinstance(reg, dict) or reg.get('status') != 'ok'
+                or not isinstance(reg.get('sha256'), str)
+                or not reg.get('sha256')):
+            _reg_problems = (reg.get('problems') if isinstance(reg, dict)
+                             else 'no usable registry')
+            raise SystemExit(
+                '[v12] REFUSE: the split-package registration is invalid '
+                f'({_reg_problems!r}) — '
+                'a fragment that is unlisted, missing or resolves outside '
+                'the tree means the executed module is not the reviewed '
+                'source tree; fix the _PARTS declaration before freezing')
     return st
 
 
@@ -927,8 +944,27 @@ def _check_or_write_freeze_lock_locked(outdir, manifest, test_ids_fp, stage='acc
         _locked_src = lock.get('source_tree')
         _locked_src_sha = (_locked_src.get('sha256')
                            if isinstance(_locked_src, dict) else None)
+        # A reordered `_PARTS` changes the declaration file and therefore the
+        # plain source digest too, but that digest does not name WHAT changed
+        # and cannot see an entry that resolved outside the tree.  The
+        # registry is carried as a second, explicit source-identity field: a
+        # lock that has one cannot be downgraded by dropping it, and a
+        # registry that disagrees is a refusal even when the file digest is
+        # unchanged in an injected/derived manifest.
+        _locked_reg = (_locked_src.get('split_registry')
+                       if isinstance(_locked_src, dict) else None)
+        _cur_reg = _src.get('split_registry')
+        _registry_changed = False
+        if isinstance(_locked_reg, dict) and _locked_reg.get('sha256'):
+            if not isinstance(_cur_reg, dict) or not _cur_reg.get('sha256'):
+                _registry_changed = True
+            elif (_locked_reg.get('sha256') != _cur_reg.get('sha256')
+                  or str(_locked_reg.get('status')) != str(_cur_reg.get('status'))):
+                _registry_changed = True
         _source_legacy = _locked_src_sha is None
-        _source_changed = bool(_locked_src_sha and _locked_src_sha != _src_sha)
+        _source_changed = bool(
+            _locked_src_sha
+            and (_locked_src_sha != _src_sha or _registry_changed))
         # Initialize the write flag here, BEFORE the disclosed-drift branch
         # can set it.  It used to be reset unconditionally after that branch,
         # which discarded the event just recorded and left the on-disk lock
@@ -992,7 +1028,10 @@ def _check_or_write_freeze_lock_locked(outdir, manifest, test_ids_fp, stage='acc
                     f'{_delta["removed"]}).  The frozen manifest binds the plan '
                     'and CODE_SEMANTICS stamps the semantics constant, but '
                     'neither hashes the code bytes; a dirty edit can therefore '
-                    'change a measurement while both still match.  ' + _hint)
+                    'change a measurement while both still match.  '
+                    + ('The split-package registration identity changed '
+                       '(fragment order/membership).  '
+                       if _registry_changed else '') + _hint)
         if (_manifest_changed or _test_changed or _train_changed) and not _refreeze:
             if _manifest_changed:
                 raise SystemExit(f'[v12] REFUSE: the test split was already accessed under a DIFFERENT frozen manifest (lock {lp}: {lock.get("manifest_sha256")} != current {_sha}, locked_at={lock.get("locked_at")}). Changing the plan after seeing test data is selection bias by construction. To consciously re-freeze, set V12_REFREEZE=1 — the earlier round must then be reported as exploratory in the plan history.')

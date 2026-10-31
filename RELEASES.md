@@ -28,9 +28,12 @@ every `run_*.log` at the repo root (if present), the freeze lock, the measuremen
 SHA-256 manifest. The manifest also carries an `identity` block (the source
 tree digest, `CODE_SEMANTICS`, dependency contract and execution fingerprint);
 `verify` recomputes every file hash and the source-tree digest from the packed
-bytes, independently of Git and the current worktree. Archives without
-`identity` are legacy: their file hashes still verify, but their source
-binding is explicitly reported as unverifiable.
+bytes, independently of Git and the current worktree. The same block records
+`source_tree.split_registry` — the ordered `_PARTS` membership of every split
+package — and `verify` reparses the packed `__init__.py` bytes to recompute it.
+Archives without `identity` (or without the registry sub-block) are legacy:
+their file hashes still verify, but the missing binding is explicitly reported
+as unverifiable.
 
 A release without a verifier URL or without the `verify` output should be
 treated as **not auditable**, regardless of the numbers in its report.
