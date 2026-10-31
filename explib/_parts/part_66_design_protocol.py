@@ -95,6 +95,31 @@ def _dp_number(value):
     return out if math.isfinite(out) else None
 
 
+def _dp_resolution_floor(family_size, n):
+    """Exact family-wise sign-flip floor ``m * 2 / 2**n`` without overflow.
+
+    ``2.0 ** n`` overflows for a few thousand seeds even though the true
+    floor is simply zero at that resolution.  ``math.ldexp`` handles the
+    exponent without building an enormous power and does not raise for the
+    non-positive exponents used here; a family size too large for a float is
+    reported as infinite, which still fails the alpha comparison.
+    """
+    try:
+        m = float(family_size)
+        n = int(n)
+    except (TypeError, ValueError, OverflowError):
+        return float('inf')
+    # Anything past the smallest subnormal underflows to exactly zero; this
+    # also avoids ``math.ldexp`` rejecting an exponent too large for a C int
+    # (n itself may be an arbitrary-precision JSON integer).
+    if n > 1075:
+        return 0.0
+    try:
+        return math.ldexp(m, 1 - n)
+    except OverflowError:
+        return float('inf')
+
+
 def _dp_int(value, *, minimum=None, allow_none=False):
     if value is None and allow_none:
         return None
@@ -240,35 +265,52 @@ def _dp_recipe(manifest):
 
 
 def _dp_normalise_test_access(manifest, test_access=None):
-    """Extract the held-out access budget without inventing a declaration."""
-    if test_access is not None:
-        if not isinstance(test_access, dict):
-            return {'invalid': True,
-                    'error': f'test_access must be an object, got {type(test_access).__name__}'}
-        raw = test_access
-    else:
-        raw = None
-        stat = (manifest or {}).get('statistics')
-        for source, block in (('statistics.test_access_policy', stat),
-                              ('test_access_policy', manifest)):
-            if isinstance(block, dict) and 'test_access_policy' in block:
-                value = block.get('test_access_policy')
-                if not isinstance(value, dict):
-                    return {'invalid': True,
-                            'error': f'{source} must be an object, got {type(value).__name__}'}
-                raw = value
-                break
-    if raw is None:
-        policy = test_access_policy(manifest)  # noqa: F821 - same module
-        raw = policy
-    max_looks = _dp_int(raw.get('max_looks'), minimum=1)
-    method = _dp_text(raw.get('method')) or 'single_look'
-    out = {'method': method, 'max_looks': max_looks,
-           'declared': raw.get('declared') is True,
-           'require_reason_for_reread':
-               raw.get('require_reason_for_reread') is not False,
-           'source': _dp_text(raw.get('source'))}
-    return out
+    """Extract and validate the held-out access budget.
+
+    The shared ``test_access_policy`` validator is the single source of truth
+    for the policy schema (unknown keys, method/max_looks agreement, boolean
+    flags).  Reusing it here means a typo such as ``max_look`` cannot enter a
+    protocol as a valid-looking declaration, and a malformed declaration is
+    returned as ``invalid`` instead of escaping as an exception from
+    ``build_design_protocol``.  The ``declared``/``role`` keys are protocol
+    provenance, not policy fields, and are stripped before validation.
+    """
+    explicit = test_access is not None
+    try:
+        if explicit:
+            if not isinstance(test_access, dict):
+                return {'invalid': True,
+                        'error': f'test_access must be an object, got {type(test_access).__name__}'}
+            raw = test_access
+            candidate = {k: v for k, v in raw.items()
+                         if k not in ('declared', 'role')}
+            policy = test_access_policy({'test_access_policy': candidate})  # noqa: F821
+            declared = raw.get('declared', True) is True
+        else:
+            raw = None
+            stat = (manifest or {}).get('statistics')
+            for _source, block in (('statistics.test_access_policy', stat),
+                                   ('test_access_policy', manifest)):
+                if isinstance(block, dict) and 'test_access_policy' in block:
+                    value = block.get('test_access_policy')
+                    if not isinstance(value, dict):
+                        return {'invalid': True,
+                                'error': f'{_source} must be an object, got {type(value).__name__}'}
+                    raw = value
+                    break
+            policy = test_access_policy(manifest)  # noqa: F821 - same module
+            declared = policy.get('declared') is True
+    except Exception as exc:
+        return {'invalid': True, 'error': f'{type(exc).__name__}: {exc}'}
+    raw = raw if isinstance(raw, dict) else {}
+    return {
+        'method': _dp_text(policy.get('method')) or 'single_look',
+        'max_looks': _dp_int(policy.get('max_looks'), minimum=1),
+        'declared': declared,
+        'require_reason_for_reread':
+            policy.get('require_reason_for_reread') is not False,
+        'source': _dp_text(raw.get('source')),
+    }
 
 
 def _dp_normalise_disposition(manifest, disposition=None):
@@ -314,13 +356,19 @@ def _dp_comparison(c):
         return None
     raw_sign = c.get('expected_sign')
     sign = _dp_sign(raw_sign)
+    # An explicit JSON null (as used for the sink-matched readout) is a
+    # declaration of no direction.  An absent key is not: treating it as
+    # non-directional would let an omitted expected_sign pass as if the
+    # direction had been pre-registered.
+    non_directional = (bool(_dp_non_directional(raw_sign))
+                       if 'expected_sign' in c else False)
     return {
         'name': name,
         'a': a,
         'b': b,
         'endpoint': _dp_text(c.get('endpoint')),
         'predicted_sign': sign,
-        'non_directional': bool(_dp_non_directional(raw_sign)),
+        'non_directional': non_directional,
         'mechanism_claim_allowed': c.get('mechanism_claim_allowed') is True,
         'hypothesis_direction': _dp_text(c.get('hypothesis_direction')),
         'caveat': _dp_text(c.get('interpretation_caveat')),
@@ -337,12 +385,14 @@ def _dp_hypotheses(manifest, comparisons):
                 continue
             raw_sign = spec.get('predicted_sign')
             sign = _dp_sign(raw_sign)
+            non_directional = (bool(_dp_non_directional(raw_sign))
+                               if 'predicted_sign' in spec else False)
             out.append({
                 'id': str(name),
                 'statement': _dp_text(spec.get('statement')),
                 'endpoint': _dp_text(spec.get('endpoint')),
                 'predicted_sign': sign,
-                'non_directional': bool(_dp_non_directional(raw_sign)),
+                'non_directional': non_directional,
                 'falsifier': _dp_text(spec.get('falsifier')),
                 'mechanism': _dp_text(spec.get('mechanism')),
                 'requires_param_match': spec.get('requires_param_match') is True,
@@ -401,9 +451,10 @@ def build_design_protocol(
             if text is not None and text not in arms:
                 arms.append(text)
     seeds = manifest.get('seeds')
-    n_seeds = (_dp_int(stats.get('n_seeds'), minimum=1)
-               if _dp_int(stats.get('n_seeds'), minimum=1) is not None
-               else (len(seeds) if isinstance(seeds, (list, tuple)) else None))
+    # Do not infer the planned n from the length of the seed list: the
+    # protocol records declarations, and a missing ``n_seeds`` is a missing
+    # design decision that the validator must report rather than fill in.
+    n_seeds = _dp_int(stats.get('n_seeds'), minimum=1)
     min_n = _dp_int(stats.get('min_seeds_for_confirmation'), minimum=1)
     alpha = _dp_number(stats.get('alpha', manifest.get('alpha')))
     family_size = len(comps) or None
@@ -745,6 +796,24 @@ def validate_design_protocol(protocol, *, require_complete=None):
         _dp_problem(out, f'sample_size.min_n={min_n} exceeds planned_seeds={planned}')
     if family and fam_n is not None and fam_n != len(family):
         _dp_problem(out, f'sample_size.family_size={fam_n} != primary family size {len(family)}')
+    raw_seeds = ss.get('seeds')
+    if raw_seeds is not None:
+        if not isinstance(raw_seeds, list):
+            _dp_problem(out, 'sample_size.seeds must be a list of integer seed identities')
+        else:
+            seed_values = []
+            for i, raw_seed in enumerate(raw_seeds):
+                seed_value = _dp_int(raw_seed, minimum=0)
+                if seed_value is None:
+                    _dp_problem(out, f'sample_size.seeds[{i}] must be a non-negative integer')
+                else:
+                    seed_values.append(seed_value)
+            if len(set(seed_values)) != len(seed_values):
+                _dp_problem(out, 'sample_size.seeds contains duplicate seed identities; '
+                                 'the same seed cannot count as two independent units')
+            if planned is not None and len(seed_values) != planned:
+                _dp_problem(out, f'sample_size.planned_seeds={planned} != '
+                                 f'len(sample_size.seeds)={len(seed_values)}')
     target_power = _dp_number(ss.get('target_power'))
     if target_power is None:
         need(False, 'sample_size.target_power is missing',
@@ -757,11 +826,11 @@ def validate_design_protocol(protocol, *, require_complete=None):
     if method is not None and ss.get('power_simulated') is not True:
         _dp_warn(out, 'sample_size.power_method is a projection, not a simulation on this panel\'s validation deltas; treat it as a design aid')
     if min_n is not None and fam_n is not None and alpha is not None:
-        floor_at_min = fam_n * 2.0 / (2.0 ** min_n)
+        floor_at_min = _dp_resolution_floor(fam_n, min_n)
         out['checks']['resolution_floor_at_min_n'] = floor_at_min
         if floor_at_min >= alpha:
             _dp_problem(out, f'the declared min_n={min_n}/family={fam_n} has exact Holm resolution floor {floor_at_min:.6g} >= alpha={alpha:.6g}; no effect size can be significant')
-        floor_at_planned = (fam_n * 2.0 / (2.0 ** planned)
+        floor_at_planned = (_dp_resolution_floor(fam_n, planned)
                             if planned is not None else None)
         if floor_at_planned is not None:
             out['checks']['resolution_floor_at_planned_n'] = floor_at_planned
@@ -890,8 +959,26 @@ def validate_design_protocol(protocol, *, require_complete=None):
     if ta_looks is None:
         need(False, 'data.test_access.max_looks must be an integer >= 1',
              missing='data.test_access.max_looks')
+    elif ta_looks > int(TEST_ACCESS_POLICY['max_looks_limit']):  # noqa: F821
+        _dp_problem(out, f'data.test_access.max_looks={ta_looks} exceeds the '
+                         f'supported limit {TEST_ACCESS_POLICY["max_looks_limit"]}')  # noqa: F821
+    ta_method = _dp_text(ta.get('method'))
+    if ta_method is None:
+        need(False, 'data.test_access.method is missing',
+             missing='data.test_access.method')
+    elif ta_method not in ('single_look', 'bonferroni'):
+        _dp_problem(out, f'data.test_access.method={ta_method!r} is not one of '
+                         "('single_look', 'bonferroni')")
+    elif ta_method == 'single_look' and ta_looks is not None and ta_looks != 1:
+        _dp_problem(out, 'data.test_access.method=single_look requires max_looks=1; '
+                         'declare method=bonferroni for a repeated-look budget')
+    if ta and not isinstance(ta.get('require_reason_for_reread'), bool):
+        need(False, 'data.test_access.require_reason_for_reread must be boolean',
+             missing='data.test_access.require_reason_for_reread')
     if ta.get('declared') is not True:
-        _dp_warn(out, 'the held-out access budget is the historical single-look default, not an explicit statistics.test_access_policy declaration')
+        need(False, 'the held-out access budget is the historical single-look '
+                    'default, not an explicit statistics.test_access_policy '
+                    'declaration', missing='data.test_access.declared')
     if ta_looks is not None and tl is not None and ta_looks != tl:
         _dp_problem(out, f'stopping.test_looks={tl} != data.test_access.max_looks={ta_looks}')
     if data.get('disjoint_declared') is False:
@@ -933,10 +1020,18 @@ def validate_design_protocol(protocol, *, require_complete=None):
             if recorded != want:
                 _dp_problem(out, 'content_sha256 does not reproduce from the protocol body; the registered design was edited')
     commitments = protocol.get('commitments')
-    if isinstance(commitments, dict):
+    if not isinstance(commitments, dict) or not commitments:
+        need(False, 'commitments must be an object with one hash per section',
+             missing='commitments')
+    else:
         for section in DESIGN_PROTOCOL_SECTIONS:
             got = _dp_text(commitments.get(section))
-            want = _dp_sha_obj(protocol.get(section))
+            try:
+                want = _dp_sha_obj(protocol.get(section))
+            except (TypeError, ValueError, RecursionError) as exc:
+                _dp_problem(out, f'commitments.{section} is not canonical JSON: '
+                                 f'{type(exc).__name__}: {exc}')
+                continue
             if got is None or got != want:
                 _dp_problem(out, f'commitments.{section} does not match the section body')
     rev = _dp_int(protocol.get('revision'), minimum=0, allow_none=True)
@@ -1060,6 +1155,10 @@ def design_protocol_conformance(protocol, manifest):
         m_disp = stats.get('disposition_policy')
     elif isinstance(manifest.get('disposition_policy'), dict):
         m_disp = manifest.get('disposition_policy')
+    if isinstance(m_disp, dict) and m_disp.get('kind') == 'run_disposition':
+        # A manifest may embed the complete precommitment plan rather than
+        # only its policy block; compare the policy, not the wrapper keys.
+        m_disp = m_disp.get('policy')
     ops = protocol.get('operations') if isinstance(protocol.get('operations'), dict) else {}
     p_disp = ops.get('disposition') if isinstance(ops.get('disposition'), dict) else {}
     if m_disp is not None and not p_disp.get('invalid'):
@@ -1094,9 +1193,16 @@ def design_protocol_timing(protocol, events):
     if created is None:
         out['warnings'].append('protocol.created_at is missing or unparseable; timing cannot be verified')
         return out
-    if not isinstance(events, (list, tuple)) or not events:
-        out['warnings'].append('no recorded events; the protocol could not be ordered against execution')
-        return out
+    if events is None:
+        events_iter = iter(())
+    elif isinstance(events, str):
+        # A path is a convenience for callers that already have a ledger.
+        events_iter = _dp_iter_events(events=events, panel_dirs=[])
+    else:
+        try:
+            events_iter = iter(events)
+        except TypeError:
+            events_iter = iter(())
     first = None
     first_kind = None
     n = 0
@@ -1105,7 +1211,7 @@ def design_protocol_timing(protocol, events):
     # analysis happened before the confirmatory registration was compiled.
     _post_run = {'analysis', 'report', 'audit', 'aggregate', 'look',
                  'synthesis', 'reproduction'}
-    for ev in events:
+    for ev in events_iter:
         if not isinstance(ev, dict):
             continue
         if str(ev.get('kind') or '').lower() in _post_run:
@@ -1120,7 +1226,10 @@ def design_protocol_timing(protocol, events):
             first_kind = ev.get('kind')
     out['n_events'] = n
     if first is None:
-        out['warnings'].append('no event carried a comparable timestamp; timing cannot be verified')
+        if n == 0:
+            out['warnings'].append('no recorded events; the protocol could not be ordered against execution')
+        else:
+            out['warnings'].append('no event carried a comparable timestamp; timing cannot be verified')
         return out
     out['first_event_at'] = first.isoformat()
     out['first_event_kind'] = first_kind
@@ -1137,59 +1246,81 @@ def design_protocol_timing(protocol, events):
     return out
 
 
+def _dp_reject_json_constant(value):
+    """Reject NaN/Infinity: a protocol is canonical JSON, not lenient JSON."""
+    raise ValueError(f'non-finite JSON number {value!r} is not allowed')
+
+
 def _dp_load_json(path):
     with open(path, encoding='utf-8') as fh:
-        return json.load(fh)
+        return json.load(fh, parse_constant=_dp_reject_json_constant)
 
 
-def _dp_read_events(events=None, panel_dirs=None):
-    out = []
-    if isinstance(events, list):
-        out.extend(events)
-    elif isinstance(events, str):
+def _dp_iter_jsonl(path):
+    """Yield object records from one JSONL file, skipping malformed lines.
+
+    Streaming keeps the first-event check usable on a long experiment ledger:
+    the audit only needs the earliest timestamp, not every record in memory.
+    """
+    try:
+        fh = open(path, encoding='utf-8')
+    except OSError:
+        return
+    with fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(rec, dict):
+                yield rec
+
+
+def _dp_iter_events(events=None, panel_dirs=None):
+    """Yield event records from an in-memory stream/path plus panel ledgers.
+
+    An explicit ``panel_dirs=[]`` means "do not discover any panels"; only
+    ``None`` (the default) triggers the ``results_*`` scan.  Treating an empty
+    list as "unspecified" silently mixed repository history into a caller's
+    deterministic event fixture and made the timing check depend on which
+    result directories happened to exist at scale.
+    """
+    if isinstance(events, str):
+        yield from _dp_iter_jsonl(events)
+    elif events is not None:
         try:
-            with open(events, encoding='utf-8') as fh:
-                for line in fh:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        rec = json.loads(line)
-                    except (TypeError, ValueError):
-                        continue
-                    if isinstance(rec, dict):
-                        out.append(rec)
-        except OSError:
-            pass
-    dirs = []
-    if isinstance(panel_dirs, (list, tuple)):
-        dirs.extend(str(x) for x in panel_dirs)
-    if not dirs:
+            iterator = iter(events)
+        except TypeError:
+            iterator = iter(())
+        for rec in iterator:
+            if isinstance(rec, dict):
+                yield rec
+    if panel_dirs is None:
         root = globals().get('_REPO') or os.getcwd()
         try:
             import glob as _glob
-            dirs.extend(sorted(_glob.glob(os.path.join(root, 'results_*'))))
+            dirs = sorted(_glob.glob(os.path.join(root, 'results_*')))
         except Exception:
-            pass
+            dirs = []
+    elif isinstance(panel_dirs, str):
+        dirs = [panel_dirs]
+    elif isinstance(panel_dirs, (list, tuple)):
+        dirs = [str(x) for x in panel_dirs]
+    else:
+        dirs = []
     for d in dirs:
         path = os.path.join(str(d), 'experiments.jsonl')
-        if not os.path.isfile(path):
-            continue
-        try:
-            with open(path, encoding='utf-8') as fh:
-                for line in fh:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        rec = json.loads(line)
-                    except (TypeError, ValueError):
-                        continue
-                    if isinstance(rec, dict):
-                        out.append(rec)
-        except OSError:
-            continue
-    return out
+        if os.path.isfile(path):
+            yield from _dp_iter_jsonl(path)
+
+
+def _dp_read_events(events=None, panel_dirs=None):
+    """Materialised compatibility wrapper; audits should stream instead."""
+    return list(_dp_iter_events(events=events, panel_dirs=panel_dirs))
+
 
 
 def design_protocol_audit(path=None, manifest_path=None, events=None,
@@ -1266,7 +1397,7 @@ def design_protocol_audit(path=None, manifest_path=None, events=None,
             out['warnings'].extend(f'conformance: {x}' for x in conf['warnings'])
     else:
         out['warnings'].append(f'no readable manifest at {mp}; conformance not checked')
-    evs = _dp_read_events(events=events, panel_dirs=panel_dirs)
+    evs = _dp_iter_events(events=events, panel_dirs=panel_dirs)
     timing = design_protocol_timing(protocol, evs)
     out['timing'] = timing
     if timing['status'] == 'fail':
