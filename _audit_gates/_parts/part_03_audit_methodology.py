@@ -97,7 +97,8 @@ def audit_methodology(outdirs=None, design=None, alpha=0.05, min_n=3, write=True
         out['panels'][d] = _panel
         if _panel['arms_below_min_seeds'] or _panel['warnings']:
             out['status'] = 'warn'
-        if (_panel.get('contrast_network') or {}).get('status') == 'warn':
+        _cn_block = _panel.get('contrast_network')
+        if isinstance(_cn_block, dict) and _cn_block.get('status') == 'warn':
             out['status'] = 'warn'
     if not out['panels']:
         out['status'] = 'not_verifiable_locally'

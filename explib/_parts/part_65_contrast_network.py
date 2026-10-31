@@ -76,6 +76,25 @@ def _cn_same(a, b, tol):
     return abs(a - b) <= float(tol) * max(1.0, abs(a), abs(b))
 
 
+def _cn_json_safe(value):
+    """A malformed descriptor must not make the audit block invalid JSON.
+
+    Entry labels are normally strings/None, but ``contrast_network_audit`` is a
+    public reader over stored artifacts.  A hand-edited ``component: inf`` or
+    ``with: {}`` is rejected by name; keeping it verbatim in the diagnostic
+    output would then make ``json.dumps(..., allow_nan=False)`` fail after the
+    audit had already produced a verdict.
+    """
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else repr(value)
+    try:
+        return str(value)
+    except Exception:  # pragma: no cover - __str__ on an exotic object
+        return repr(type(value))
+
+
 def _cn_entries(entries):
     """Flatten a methodology report / grouped entries into a list of entries."""
     if isinstance(entries, dict):
@@ -151,20 +170,26 @@ def _cn_normalise_entry(entry):
             if _df is None or not _cn_same(_df, _w - _wo,
                                            CONTRAST_NETWORK_POLICY['ppl_relative_tolerance']):
                 return None, 'stored delta disagrees with per-seed arm PPL at seed %s' % _s
-    lr = {s: math.log(w / wo) for s, w, wo in zip(seeds, with_vals, without_vals)}
     nid_a = _cn_node_id(a.strip(), _cn_tag(entry, 'with'))
     nid_b = _cn_node_id(b.strip(), _cn_tag(entry, 'without'))
+    if nid_a == nid_b:
+        # A self-contrast is not a controlled pair: its stored delta is
+        # identically zero and it would add a self-loop to the arm graph,
+        # inflating the degree of that node and corrupting the reference.
+        return None, ('with and without resolve to the same arm/protocol node '
+                      '(%s); a self-contrast is not a controlled pair' % nid_a)
+    lr = {s: math.log(w / wo) for s, w, wo in zip(seeds, with_vals, without_vals)}
     return {
         'with': a.strip(), 'without': b.strip(),
         'tag_with': _cn_tag(entry, 'with'), 'tag_without': _cn_tag(entry, 'without'),
         'node_with': nid_a, 'node_without': nid_b,
-        'component': entry.get('component'),
-        'kind': entry.get('kind'),
+        'component': _cn_json_safe(entry.get('component')),
+        'kind': _cn_json_safe(entry.get('kind')),
         'seeds': sorted(seeds),
         'with_values': {s: w for s, w in zip(seeds, with_vals)},
         'without_values': {s: wo for s, wo in zip(seeds, without_vals)},
         'log_ratio': lr,
-        'note': entry.get('note'),
+        'note': _cn_json_safe(entry.get('note')),
     }, None
 
 
@@ -216,6 +241,61 @@ def _cn_shortest_path(start, goal, adj):
                 return steps
             queue.append(nxt)
     return None
+
+
+def _cn_tree_steps(start, goal, parent, parent_edge, up_sign, depth):
+    """Path in a rooted tree as [(node, edge_id, sign)], without a BFS.
+
+    The closure loop only needs the unique tree path between the two endpoints
+    of a non-tree edge.  Walking parent pointers is O(depth) instead of
+    O(nodes + edges); a dense graph would otherwise rebuild the same BFS for
+    every chord and become quadratic in the edge count.
+    """
+    if start == goal:
+        return []
+    left, right = [], []
+    a, b = start, goal
+    while depth.get(a, 0) > depth.get(b, 0):
+        eid = parent_edge.get(a)
+        if eid is None:
+            return None
+        left.append((a, eid, up_sign.get(a, 1.0)))
+        a = parent.get(a)
+        if a is None:
+            return None
+    while depth.get(b, 0) > depth.get(a, 0):
+        eid = parent_edge.get(b)
+        if eid is None:
+            return None
+        right.append((b, eid, up_sign.get(b, 1.0)))
+        b = parent.get(b)
+        if b is None:
+            return None
+    while a != b:
+        eid = parent_edge.get(a)
+        if eid is None:
+            return None
+        left.append((a, eid, up_sign.get(a, 1.0)))
+        a = parent.get(a)
+        if a is None:
+            return None
+        eid = parent_edge.get(b)
+        if eid is None:
+            return None
+        right.append((b, eid, up_sign.get(b, 1.0)))
+        b = parent.get(b)
+        if b is None:
+            return None
+    # `left` runs start -> LCA.  `right` runs goal -> LCA; reverse it and
+    # flip each sign so each step is expressed from the parent down to the
+    # child, continuing the traversal from the LCA towards goal.
+    steps = list(left)
+    for node, eid, sign in reversed(right):
+        up = parent.get(node)
+        if up is None:
+            return None
+        steps.append((up, eid, -sign))
+    return steps
 
 
 def _cn_path_values(steps, edges, seeds):
@@ -288,9 +368,12 @@ def contrast_network_audit(entries, *, reference_arm=None, alpha=0.05, min_n=3):
         if edge is None:
             out['ignored_entries'].append({
                 'index': i,
-                'with': entry.get('with') if isinstance(entry, dict) else None,
-                'without': entry.get('without') if isinstance(entry, dict) else None,
-                'component': entry.get('component') if isinstance(entry, dict) else None,
+                'with': (_cn_json_safe(entry.get('with'))
+                         if isinstance(entry, dict) else None),
+                'without': (_cn_json_safe(entry.get('without'))
+                            if isinstance(entry, dict) else None),
+                'component': (_cn_json_safe(entry.get('component'))
+                              if isinstance(entry, dict) else None),
                 'reason': reason,
             })
             if reason and str(reason).startswith('stored delta disagrees'):
@@ -307,16 +390,40 @@ def contrast_network_audit(entries, *, reference_arm=None, alpha=0.05, min_n=3):
     # components.  Identical values are deduplicated; contradictory values are
     # a hard identity conflict, because either number could be quoted.
     by_id = {}
+    conflicted_edge_ids = set()
+    conflict_index = {}
     for edge in normalised:
         eid = _cn_edge_id(edge)
+        if eid in conflicted_edge_ids:
+            # Once one duplicate disagrees, every record for that identity is
+            # excluded.  Re-adding the third/fourth copy after popping the id
+            # would put one of the contradictory values back into the graph.
+            # Still name its component so the conflict report covers every
+            # place the identity was quoted.
+            comp = str(edge.get('component'))
+            row = out['conflicting_edges'][conflict_index[eid]]
+            if comp not in row['components']:
+                row['components'].append(comp)
+                row['components'].sort()
+            continue
         if eid not in by_id:
             by_id[eid] = edge
             continue
         old = by_id[eid]
+        # "Identical" is a statement about the measurements, not only about
+        # their ratio.  Two records with the same log ratio but different arm
+        # PPLs (e.g. 1/2 and 2/4) still describe different node measurements;
+        # the node-identity pass below must see both, so this is a conflict.
         same = (old['seeds'] == edge['seeds']
-                and all(_cn_same(old['log_ratio'][s], edge['log_ratio'][s],
+                and all(
+                    _cn_same(old['with_values'][s], edge['with_values'][s],
+                             CONTRAST_NETWORK_POLICY['ppl_relative_tolerance'])
+                    and _cn_same(old['without_values'][s],
+                                 edge['without_values'][s],
+                                 CONTRAST_NETWORK_POLICY['ppl_relative_tolerance'])
+                    and _cn_same(old['log_ratio'][s], edge['log_ratio'][s],
                                  CONTRAST_NETWORK_POLICY['log_tolerance'])
-                        for s in old['seeds']))
+                    for s in old['seeds']))
         if same:
             continue
         out['conflicting_edges'].append({
@@ -324,6 +431,8 @@ def contrast_network_audit(entries, *, reference_arm=None, alpha=0.05, min_n=3):
             'reason': 'the same arm pair/tag is recorded with different per-seed values',
             'components': sorted({str(old.get('component')), str(edge.get('component'))}),
         })
+        conflicted_edge_ids.add(eid)
+        conflict_index[eid] = len(out['conflicting_edges']) - 1
         by_id.pop(eid, None)
     # Node identity: one arm+tag must have one PPL per seed across every edge
     # that mentions it.  A difference means the label refers to two runs or two
@@ -541,21 +650,34 @@ def contrast_network_audit(entries, *, reference_arm=None, alpha=0.05, min_n=3):
     # sides were run on disjoint seeds (e.g. A-B on 0,1,2 and B-C on 3,4,5).
     # Those component effects can be reported separately, but their difference
     # is not a paired contrast.
+    # One BFS from the reference gives the shortest-path seed intersection
+    # for every reachable node.  Re-running BFS per declared node made this
+    # block O(nodes * (nodes + edges)) on a large arm table.
+    ref_path_seeds = {}
+    _ref_seen = {ref_node}
+    _ref_queue = [ref_node]
+    _ref_head = 0
+    while _ref_head < len(_ref_queue):
+        cur = _ref_queue[_ref_head]
+        _ref_head += 1
+        _base = ref_path_seeds.get(cur) if cur != ref_node else None
+        for nxt, eid, _sg in adj.get(cur, ()):
+            if nxt in _ref_seen:
+                continue
+            _ref_seen.add(nxt)
+            edge_seeds = set(clean[eid]['seeds'])
+            ref_path_seeds[nxt] = (edge_seeds if _base is None
+                                   else _base & edge_seeds)
+            _ref_queue.append(nxt)
     component_support = {}
     for comp, info in out['declared_components'].items():
         supports = []
         for node in info['clean_nodes']:
             if node == ref_node:
                 continue
-            steps = _cn_shortest_path(ref_node, node, adj)
-            if steps is None:
-                supports.append(set())
-                continue
-            common = None
-            for _p, eid, _sg in steps:
-                edge_seeds = set(clean[eid]['seeds'])
-                common = edge_seeds if common is None else common & edge_seeds
-            supports.append(common if common is not None else set())
+            # Empty when the node is outside the reference component; such a
+            # component is already named by the common-reference check.
+            supports.append(set(ref_path_seeds.get(node, ())))
         if supports:
             support = set(supports[0])
             for extra in supports[1:]:
@@ -575,20 +697,32 @@ def contrast_network_audit(entries, *, reference_arm=None, alpha=0.05, min_n=3):
     # node values, so a stale/duplicated edge can actually show up.
     tree_edges = set()
     visited = set()
+    tree_parent = {}
+    tree_parent_edge = {}
+    tree_up_sign = {}
+    tree_depth = {}
     for root in sorted(adj):
         if root in visited:
             continue
         visited.add(root)
+        tree_parent[root] = None
+        tree_depth[root] = 0
         queue = [root]
         head = 0
         while head < len(queue):
             cur = queue[head]
             head += 1
-            for nxt, eid, _sign in adj.get(cur, ()):
+            for nxt, eid, sign in adj.get(cur, ()):
                 if nxt in visited:
                     continue
                 visited.add(nxt)
                 tree_edges.add(eid)
+                tree_parent[nxt] = cur
+                tree_parent_edge[nxt] = eid
+                # `adj` gives the direction from cur to nxt; the parent walk
+                # needs the opposite direction (child -> parent).
+                tree_up_sign[nxt] = -sign
+                tree_depth[nxt] = tree_depth[cur] + 1
                 queue.append(nxt)
     tree_adj = {}
     for eid in tree_edges:
@@ -605,7 +739,12 @@ def contrast_network_audit(entries, *, reference_arm=None, alpha=0.05, min_n=3):
             continue
         edge = clean[eid]
         u, v = edge['node_without'], edge['node_with']
-        steps = _cn_shortest_path(v, u, tree_adj)
+        steps = _cn_tree_steps(v, u, tree_parent, tree_parent_edge,
+                               tree_up_sign, tree_depth)
+        if steps is None:
+            # Defensive fallback: a corrupted tree map should not silently
+            # drop closure.  The parent walk is the exact same unique path.
+            steps = _cn_shortest_path(v, u, tree_adj)
         if steps is None:
             out['closure']['warnings'].append(
                 'non-tree edge %s has no tree path; closure not formed' % eid)
@@ -680,25 +819,63 @@ def contrast_network_audit(entries, *, reference_arm=None, alpha=0.05, min_n=3):
     declared_nodes = set()
     for info in out['declared_components'].values():
         declared_nodes.update(info['clean_nodes'])
-    candidates = []
-    nodes_sorted = sorted(declared_nodes)
-    for i, a in enumerate(nodes_sorted):
-        for b in nodes_sorted[i + 1:]:
-            direct = any(
-                (e['node_without'] == a and e['node_with'] == b)
-                or (e['node_without'] == b and e['node_with'] == a)
-                for e in clean.values())
-            if direct:
-                continue
-            # Report log(PPL_from / PPL_to): traverse from the comparison
-            # endpoint back to `from`, so a negative value means `from` has
-            # the lower PPL.  This matches the without -> with edge direction.
-            steps = _cn_shortest_path(b, a, adj)
-            if steps is None:
-                continue
-            candidates.append((a, b, steps))
-    candidates.sort(key=lambda t: (t[0], t[1]))
     cap = int(CONTRAST_NETWORK_POLICY['max_indirect_pairs'])
+    # Direct pairs are looked up, not re-derived by scanning every edge for
+    # every candidate pair.  The old O(nodes^2 * edges) scan made the capped
+    # path table itself the expensive part of the audit on a large arm table.
+    direct_pairs = set()
+    for edge in clean.values():
+        a, b = edge['node_without'], edge['node_with']
+        if a == b:
+            continue
+        direct_pairs.add((a, b) if a <= b else (b, a))
+    direct_declared = {
+        pair for pair in direct_pairs
+        if pair[0] in declared_nodes and pair[1] in declared_nodes
+    }
+    nodes_by_comp = {}
+    for node in sorted(declared_nodes):
+        cid = comp_index.get(node)
+        if cid is not None:
+            nodes_by_comp.setdefault(cid, []).append(node)
+    direct_by_comp = {}
+    for a, b in direct_declared:
+        cid = comp_index.get(a)
+        if cid is not None and comp_index.get(b) == cid:
+            direct_by_comp[cid] = direct_by_comp.get(cid, 0) + 1
+    total_candidates = 0
+    for cid, nodes in nodes_by_comp.items():
+        pairs = len(nodes) * (len(nodes) - 1) // 2
+        total_candidates += pairs - direct_by_comp.get(cid, 0)
+    candidates = []
+    # Keep at most `cap` lexicographically first pairs per component.  The
+    # global first `cap` can contain no more than `cap` from any one
+    # component, so the merge below is exact while avoiding an all-pairs path
+    # search in a large component.
+    for cid in sorted(nodes_by_comp):
+        nodes = nodes_by_comp[cid]
+        if len(nodes) < 2:
+            continue
+        local = []
+        for i, a in enumerate(nodes):
+            for b in nodes[i + 1:]:
+                if (a, b) in direct_declared:
+                    continue
+                # Report log(PPL_from / PPL_to): traverse from the comparison
+                # endpoint back to `from`, so a negative value means `from`
+                # has the lower PPL.  This matches the without -> with edge
+                # direction.
+                steps = _cn_shortest_path(b, a, adj)
+                if steps is None:
+                    continue
+                local.append((a, b, steps))
+                if len(local) >= cap:
+                    break
+            if len(local) >= cap:
+                break
+        candidates.extend(local)
+    candidates.sort(key=lambda t: (t[0], t[1]))
+    candidates = candidates[:cap]
     for a, b, steps in candidates[:cap]:
         vals = _cn_path_values(steps, clean, set().union(
             *[set(clean[e]['seeds']) for _p, e, _s in steps]))
@@ -729,10 +906,10 @@ def contrast_network_audit(entries, *, reference_arm=None, alpha=0.05, min_n=3):
                      'pair, adds no p-value to a declared family, and cannot '
                      'become verified here'),
         }
-    if len(candidates) > cap:
+    if total_candidates > cap:
         out['warnings'].append(
             'indirect contrasts are capped at %d; %d further connected pairs were '
-            'not derived' % (cap, len(candidates) - cap))
+            'not derived' % (cap, total_candidates - cap))
     # ---- ranking gate ------------------------------------------------------
     reasons = []
     applicable = len(out['declared_components']) >= 2
