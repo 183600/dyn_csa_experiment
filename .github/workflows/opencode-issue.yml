@@ -487,15 +487,127 @@ jobs:
           if [ "$USED_HARNESS" = "dsh" ]; then
             # 主 harness：DeepSeek Harness + DeepSeek 官方 API（deepseek-flash）
             echo "[run] harness=dsh | model=$MODEL | issue=#$ISSUE_NUMBER"
-            timeout --kill-after=120 16800 dsh --profile headless "$PROMPT" 2>&1 | tee "$LOG"
-            EC=${PIPESTATUS[0]}
+            # ⭐ 停滞看门狗阈值：opencode 输出（$LOG）连续无增长的容忍秒数。
+            # 实测 agent 正常最长静默 ≈ 9 分钟；免费网关流式挂死则一动辄 2 小时+
+            # （16800s 预算内可损失近 4.5 小时机时且零产出）。
+            STALL_TIMEOUT=1200
+            # ⭐ 停滞看门狗：后台执行 timeout+opencode+tee（stdout 仍直通步骤日志），
+            #    前台每 20s 检查 $LOG 大小；超过 STALL_TIMEOUT 秒无增长 → 判定网关
+            #    停滞，终止本次调用并返回 75：已完成的改动由后续 publish 步骤
+            #    提交推送（停滞也推送，不丢进度）。
+            echo "[watchdog] 停滞看门狗已启用（输出 ${STALL_TIMEOUT}s 无增长即终止本次调用）"
+            rm -f /tmp/.oc_exit_code
+            # setsid：独立进程组（包装/timeout/tee 一个组），与主脚本隔离，
+            # 停滞时可整组终止；timeout 的子进程组在下方 kill 时单独覆盖
+            setsid bash -c '
+              timeout --kill-after=120 "$1" dsh --profile headless "$2" 2>&1 | tee "$3"
+              echo "${PIPESTATUS[0]}" > /tmp/.oc_exit_code
+            ' _ 16800 "$PROMPT" "$LOG" &
+            OC_BG=$!
+            _sz=-1; _ts=$(date +%s); _stalled=0
+            while kill -0 "$OC_BG" 2>/dev/null; do
+              sleep 20
+              _nsz=$(stat -c %s "$LOG" 2>/dev/null || echo 0)
+              if [ "$_nsz" != "$_sz" ]; then
+                _sz="$_nsz"; _ts=$(date +%s)
+              elif [ $(( $(date +%s) - _ts )) -ge "$STALL_TIMEOUT" ]; then
+                _stalled=1; break
+              fi
+            done
+            if [ "$_stalled" -eq 1 ]; then
+              echo "[watchdog] 输出已 ${STALL_TIMEOUT}s 无增长（$LOG 停在 ${_sz}B）→ 判定网关停滞，终止本次调用；已完成的修改将由 publish 步骤提交推送"
+                # 先 TERM 优雅退出，60s 后升级 KILL。注意 GNU timeout 默认把子进程
+                # 放进独立进程组（其子进程都在该组），包装进程的组信号够不到它；
+                # 因此对每个 cmdline 匹配的进程，向其所在进程组逐一发信号，
+                # 包装组 + timeout 子组全覆盖，不留仍持有输出管道的孤儿进程。
+                for _pid in $(pgrep -f "dsh --profile|opencode run" 2>/dev/null); do
+                  _pgid="$(ps -o pgid= -p "$_pid" 2>/dev/null | tr -d '[:space:]')"
+                  [ -n "$_pgid" ] && kill -TERM -- "-$_pgid" 2>/dev/null
+                done
+                kill -TERM -- "-$OC_BG" 2>/dev/null
+                pkill -TERM -f "dsh --profile|opencode run" 2>/dev/null
+                kill -TERM "$OC_BG" 2>/dev/null
+                for _w in 1 2 3; do
+                  sleep 20
+                  kill -0 "$OC_BG" 2>/dev/null || break
+                done
+                for _pid in $(pgrep -f "dsh --profile|opencode run" 2>/dev/null); do
+                  _pgid="$(ps -o pgid= -p "$_pid" 2>/dev/null | tr -d '[:space:]')"
+                  [ -n "$_pgid" ] && kill -KILL -- "-$_pgid" 2>/dev/null
+                done
+                kill -KILL -- "-$OC_BG" 2>/dev/null
+                pkill -KILL -f "dsh --profile|opencode run" 2>/dev/null
+                kill -KILL "$OC_BG" 2>/dev/null
+                wait "$OC_BG" 2>/dev/null
+              EC=75
+            else
+              wait "$OC_BG" 2>/dev/null
+              EC=124
+              [ -s /tmp/.oc_exit_code ] && EC=$(cat /tmp/.oc_exit_code)
+            fi
             # dsh 失败（非超时）且剩余时间充足 → 自动改用 opencode 免费模型兜底重跑
             if [ "$EC" -ne 0 ] && [ "$EC" -ne 124 ] && [ "$EC" -ne 137 ] && [ "$EC" -ne 143 ]; then
               OC_BUDGET=$(( 16800 - SECONDS - 600 ))
               if [ -n "${FALLBACK_MODEL:-}" ] && [ "$OC_BUDGET" -gt 600 ]; then
                 echo "[run][warn] dsh 失败 (exit=$EC)，剩余 ${OC_BUDGET}s，改用 opencode 兜底重跑（model=$FALLBACK_MODEL）"
-                timeout --kill-after=120 "$OC_BUDGET" opencode run --auto -m "$FALLBACK_MODEL" "$PROMPT" 2>&1 | tee -a "$LOG"
-                EC2=${PIPESTATUS[0]}
+                # ⭐ 停滞看门狗阈值：opencode 输出（$LOG）连续无增长的容忍秒数。
+                # 实测 agent 正常最长静默 ≈ 9 分钟；免费网关流式挂死则一动辄 2 小时+
+                # （16800s 预算内可损失近 4.5 小时机时且零产出）。
+                STALL_TIMEOUT=1200
+                # ⭐ 停滞看门狗：后台执行 timeout+opencode+tee（stdout 仍直通步骤日志），
+                #    前台每 20s 检查 $LOG 大小；超过 STALL_TIMEOUT 秒无增长 → 判定网关
+                #    停滞，终止本次调用并返回 75：已完成的改动由后续 publish 步骤
+                #    提交推送（停滞也推送，不丢进度）。
+                echo "[watchdog] 停滞看门狗已启用（输出 ${STALL_TIMEOUT}s 无增长即终止本次调用）"
+                rm -f /tmp/.oc_exit_code
+                # setsid：独立进程组（包装/timeout/tee 一个组），与主脚本隔离，
+                # 停滞时可整组终止；timeout 的子进程组在下方 kill 时单独覆盖
+                setsid bash -c '
+                  timeout --kill-after=120 "$1" opencode run --auto -m "$2" "$3" < /dev/null 2>&1 | tee -a "$4"
+                  echo "${PIPESTATUS[0]}" > /tmp/.oc_exit_code
+                ' _ "$OC_BUDGET" "$FALLBACK_MODEL" "$PROMPT" "$LOG" &
+                OC_BG=$!
+                _sz=-1; _ts=$(date +%s); _stalled=0
+                while kill -0 "$OC_BG" 2>/dev/null; do
+                  sleep 20
+                  _nsz=$(stat -c %s "$LOG" 2>/dev/null || echo 0)
+                  if [ "$_nsz" != "$_sz" ]; then
+                    _sz="$_nsz"; _ts=$(date +%s)
+                  elif [ $(( $(date +%s) - _ts )) -ge "$STALL_TIMEOUT" ]; then
+                    _stalled=1; break
+                  fi
+                done
+                if [ "$_stalled" -eq 1 ]; then
+                  echo "[watchdog] 兜底调用输出已 ${STALL_TIMEOUT}s 无增长 → 判定网关停滞，终止该次兜底"
+                    # 先 TERM 优雅退出，60s 后升级 KILL。注意 GNU timeout 默认把子进程
+                    # 放进独立进程组（其子进程都在该组），包装进程的组信号够不到它；
+                    # 因此对每个 cmdline 匹配的进程，向其所在进程组逐一发信号，
+                    # 包装组 + timeout 子组全覆盖，不留仍持有输出管道的孤儿进程。
+                    for _pid in $(pgrep -f "dsh --profile|opencode run" 2>/dev/null); do
+                      _pgid="$(ps -o pgid= -p "$_pid" 2>/dev/null | tr -d '[:space:]')"
+                      [ -n "$_pgid" ] && kill -TERM -- "-$_pgid" 2>/dev/null
+                    done
+                    kill -TERM -- "-$OC_BG" 2>/dev/null
+                    pkill -TERM -f "dsh --profile|opencode run" 2>/dev/null
+                    kill -TERM "$OC_BG" 2>/dev/null
+                    for _w in 1 2 3; do
+                      sleep 20
+                      kill -0 "$OC_BG" 2>/dev/null || break
+                    done
+                    for _pid in $(pgrep -f "dsh --profile|opencode run" 2>/dev/null); do
+                      _pgid="$(ps -o pgid= -p "$_pid" 2>/dev/null | tr -d '[:space:]')"
+                      [ -n "$_pgid" ] && kill -KILL -- "-$_pgid" 2>/dev/null
+                    done
+                    kill -KILL -- "-$OC_BG" 2>/dev/null
+                    pkill -KILL -f "dsh --profile|opencode run" 2>/dev/null
+                    kill -KILL "$OC_BG" 2>/dev/null
+                    wait "$OC_BG" 2>/dev/null
+                  EC2=75
+                else
+                  wait "$OC_BG" 2>/dev/null
+                  EC2=124
+                  [ -s /tmp/.oc_exit_code ] && EC2=$(cat /tmp/.oc_exit_code)
+                fi
                 if [ "$EC2" -eq 0 ]; then
                   EC=0
                   USED_HARNESS="opencode"
@@ -509,8 +621,64 @@ jobs:
           else
             # 兜底 harness：opencode（Zen 免费模型池）
             echo "[opencode] model=$MODEL issue=#$ISSUE_NUMBER"
-            timeout --kill-after=120 16800 opencode run --auto -m "$MODEL" "$PROMPT" 2>&1 | tee "$LOG"
-            EC=${PIPESTATUS[0]}
+            # ⭐ 停滞看门狗阈值：opencode 输出（$LOG）连续无增长的容忍秒数。
+            # 实测 agent 正常最长静默 ≈ 9 分钟；免费网关流式挂死则一动辄 2 小时+
+            # （16800s 预算内可损失近 4.5 小时机时且零产出）。
+            STALL_TIMEOUT=1200
+            # ⭐ 停滞看门狗：后台执行 timeout+opencode+tee（stdout 仍直通步骤日志），
+            #    前台每 20s 检查 $LOG 大小；超过 STALL_TIMEOUT 秒无增长 → 判定网关
+            #    停滞，终止本次调用并返回 75：已完成的改动由后续 publish 步骤
+            #    提交推送（停滞也推送，不丢进度）。
+            echo "[watchdog] 停滞看门狗已启用（输出 ${STALL_TIMEOUT}s 无增长即终止本次调用）"
+            rm -f /tmp/.oc_exit_code
+            # setsid：独立进程组（包装/timeout/tee 一个组），与主脚本隔离，
+            # 停滞时可整组终止；timeout 的子进程组在下方 kill 时单独覆盖
+            setsid bash -c '
+              timeout --kill-after=120 "$1" opencode run --auto -m "$2" "$3" < /dev/null 2>&1 | tee "$4"
+              echo "${PIPESTATUS[0]}" > /tmp/.oc_exit_code
+            ' _ 16800 "$MODEL" "$PROMPT" "$LOG" &
+            OC_BG=$!
+            _sz=-1; _ts=$(date +%s); _stalled=0
+            while kill -0 "$OC_BG" 2>/dev/null; do
+              sleep 20
+              _nsz=$(stat -c %s "$LOG" 2>/dev/null || echo 0)
+              if [ "$_nsz" != "$_sz" ]; then
+                _sz="$_nsz"; _ts=$(date +%s)
+              elif [ $(( $(date +%s) - _ts )) -ge "$STALL_TIMEOUT" ]; then
+                _stalled=1; break
+              fi
+            done
+            if [ "$_stalled" -eq 1 ]; then
+              echo "[watchdog] opencode 输出已 ${STALL_TIMEOUT}s 无增长（$LOG 停在 ${_sz}B）→ 判定网关停滞，终止本次调用；已完成的修改将由 publish 步骤提交推送"
+                # 先 TERM 优雅退出，60s 后升级 KILL。注意 GNU timeout 默认把子进程
+                # 放进独立进程组（其子进程都在该组），包装进程的组信号够不到它；
+                # 因此对每个 cmdline 匹配的进程，向其所在进程组逐一发信号，
+                # 包装组 + timeout 子组全覆盖，不留仍持有输出管道的孤儿进程。
+                for _pid in $(pgrep -f "dsh --profile|opencode run" 2>/dev/null); do
+                  _pgid="$(ps -o pgid= -p "$_pid" 2>/dev/null | tr -d '[:space:]')"
+                  [ -n "$_pgid" ] && kill -TERM -- "-$_pgid" 2>/dev/null
+                done
+                kill -TERM -- "-$OC_BG" 2>/dev/null
+                pkill -TERM -f "dsh --profile|opencode run" 2>/dev/null
+                kill -TERM "$OC_BG" 2>/dev/null
+                for _w in 1 2 3; do
+                  sleep 20
+                  kill -0 "$OC_BG" 2>/dev/null || break
+                done
+                for _pid in $(pgrep -f "dsh --profile|opencode run" 2>/dev/null); do
+                  _pgid="$(ps -o pgid= -p "$_pid" 2>/dev/null | tr -d '[:space:]')"
+                  [ -n "$_pgid" ] && kill -KILL -- "-$_pgid" 2>/dev/null
+                done
+                kill -KILL -- "-$OC_BG" 2>/dev/null
+                pkill -KILL -f "dsh --profile|opencode run" 2>/dev/null
+                kill -KILL "$OC_BG" 2>/dev/null
+                wait "$OC_BG" 2>/dev/null
+              EC=75
+            else
+              wait "$OC_BG" 2>/dev/null
+              EC=124
+              [ -s /tmp/.oc_exit_code ] && EC=$(cat /tmp/.oc_exit_code)
+            fi
           fi
           echo "used_harness=$USED_HARNESS" >> "$GITHUB_OUTPUT"
           echo "exit_code=$EC" >> "$GITHUB_OUTPUT"
@@ -519,7 +687,7 @@ jobs:
 
       - name: Commit and push to default branch
         id: publish
-        if: steps.run.outputs.exit_code == '0'
+        if: steps.run.outputs.exit_code == '0' || steps.run.outputs.exit_code == '75'
         shell: bash
         timeout-minutes: 15
         env:
