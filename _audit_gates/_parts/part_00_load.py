@@ -14,8 +14,11 @@
   document_unit  分析单元：WikiText 的 row 是原始**行**（标题/段落），不是
                文章；解码 per-token 映射后按顶层 " = Title = " 标题重分组，
                报告 line/article 单元、伪重复倍数与冻结前缀的真实文章数，
-               并在 raw train/valid 可用时检查行级去重看不见的文章级泄漏
-               （不读 wiki.test.raw）
+               并在 raw train/valid 可用时检查行级去重看不见的文章级泄漏；
+               同时从 **served test cache** 重建 test 文章，检查行索引不可
+               见但整篇 exact/SimHash 近同的 held-out 文章（不读
+               wiki.test.raw）。文章扫描默认全量；max_articles 是显式样本，
+               截断会记录 coverage 并降为 not_verifiable
   causality    自回归正确性：纯 CPU 微型模型上的前缀不变性、标签移位、
                池化/选择器因果性、逐 token 解码 vs 整段前向一致性
   attribution  动态/固定分块归因：从落盘 summary 重算每臂块数、压缩率、

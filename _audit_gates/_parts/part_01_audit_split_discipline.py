@@ -768,8 +768,259 @@ def _unit_group_lines(runs, L):
             'article_ids': art_ids, 'token_article_ids': token_art}, None
 
 
+def _article_word_count(text):
+    """Whitespace/punctuation-delimited word count used by the article scan."""
+    import re
+    return int(len(re.findall(r"[\w']+", str(text).lower())))
+
+
+def _sample_articles(items, cap):
+    """Deterministically scan all or an evenly spaced subset of articles.
+
+    A clean prefix is not a clean split: it can miss an article-level copy
+    that occurs later in the corpus.  When a caller imposes a cap, sample
+    evenly spaced positions across the **whole** list (not the first N) and
+    return coverage metadata, so a truncated scan can be reported honestly
+    instead of being certified as clean.
+    """
+    import numpy as np
+    if cap is not None:
+        cap = _audit_positive_int('max_articles', cap)
+    total = len(items)
+    if cap is None or total <= int(cap):
+        return list(items), {
+            'design': 'full', 'n_total': int(total), 'n_scanned': int(total),
+            'truncated': False, 'coverage': 1.0,
+        }
+    idx = np.unique(np.linspace(0, total - 1, int(cap), dtype=np.int64))
+    return [items[int(i)] for i in idx], {
+        'design': 'deterministic_even_spacing',
+        'n_total': int(total), 'n_scanned': int(idx.size),
+        'truncated': True,
+        'coverage': round(float(idx.size) / float(total), 6),
+        'note': ('a clean subset is not a clean split; the audit is not a '
+                 'full-corpus proof when truncated'),
+    }
+
+
+def _article_units_from_runs(runs, grouped=None, *, truncated_last=False):
+    """Turn decoded line runs into article units for leakage comparison.
+
+    ``runs`` is ``[((start, stop, id), text), ...]``.  ``grouped`` is the
+    result of :func:`_unit_group_lines` for a line-unit cache (so served lines
+    are regrouped by top-level heading); ``None`` means every run is already
+    one whole-article run (article-unit cache).  Only served runs enter a
+    unit, which is exactly the text the model or evaluator saw.
+    """
+    units = []
+    if grouped is None:
+        seqs = [[i] for i in range(len(runs))]
+        has_heading = [True] * len(runs)
+    else:
+        seqs = grouped['groups']['groups']
+        has_heading = list(grouped['groups']['group_has_heading'])
+    for _gi, _g in enumerate(seqs):
+        _lines = []
+        _ids = []
+        for _pos in _g:
+            _pos = int(_pos)
+            _text = runs[_pos][1]
+            if _text is None:
+                continue
+            _lines.append(str(_text).rstrip('\r\n'))
+            _ids.append(int(runs[_pos][0][2]))
+        if not _lines:
+            continue
+        _text = '\n'.join(_lines)
+        _is_last = bool(_g and int(_g[-1]) == len(runs) - 1)
+        units.append({
+            'title': _lines[0].strip(),
+            'text': _text,
+            'line_ids': _ids,
+            'n_lines': int(len(_lines)),
+            'n_words': _article_word_count(_text),
+            'has_heading': bool(has_heading[_gi]),
+            'truncated': bool(truncated_last and _is_last),
+        })
+    return units
+
+
+def _article_leakage_scan(reference_articles, test_articles, *,
+                          reference_line_hashes=None,
+                          near_threshold=None, min_words=20):
+    """Find article-level test contamination the line index cannot see.
+
+    ``reference_articles`` maps ``train``/``validation`` to
+    ``[(title, served_article_text), ...]``: the text actually served to the
+    model/selection stage.  ``test_articles`` are units reconstructed from the
+    **served test cache** (never from ``wiki.test.raw``).  A test unit whose
+    served lines are all absent from the raw train/validation line indexes but
+    whose whole article is an exact/near copy of a reference article is the
+    case line-level dedup cannot see; it is a hard failure.  A unit with an
+    exact line hit is counted as ``line_visible`` and left to the line-index
+    audits instead of being double-counted here.
+
+    Short units below ``min_words`` are not comparable by whole-article
+    SimHash; they are reported as uncovered, not silently certified.  Title
+    collisions alone are a warning, because a heading is not content proof.
+    """
+    L = _import_exp_lib()
+    if reference_line_hashes is None:
+        reference_line_hashes = {}
+    threshold = (int(L.DEDUP_PROTOCOL_DEFAULTS['near_hamming_threshold'])
+                 if near_threshold is None else int(near_threshold))
+    if isinstance(min_words, bool) or not isinstance(min_words, int) or min_words < 1:
+        raise ValueError(f'min_words must be a positive integer, got {min_words!r}')
+    out = {
+        'status': 'ok',
+        'test_raw_read': False,
+        'reference_scope': 'served_train_validation_articles',
+        'line_index_scope': 'all_raw_train_validation_lines',
+        'near_hamming_threshold': threshold,
+        'min_article_words': int(min_words),
+        'test_articles_scanned': 0,
+        'test_articles_line_visible': 0,
+        'test_articles_too_short': 0,
+        'test_articles_without_heading': 0,
+        'test_articles_truncated': 0,
+        'matches': [],
+        'title_collisions': [],
+        'references': {},
+        'problems': [],
+        'warnings': [],
+    }
+    refs = {}
+    ref_titles = {}
+    for _split, _items in reference_articles.items():
+        _entries = []
+        _titles = set()
+        for _title, _text in _items:
+            if not _text:
+                continue
+            _titles.add(str(_title))
+            _nw = _article_word_count(_text)
+            if _nw < int(min_words):
+                continue
+            _entries.append({
+                'title': str(_title),
+                'text_hash': L._doc_exact_fp(_text),
+                'simhash': int(L._doc_simhash(_text)),
+                'n_words': int(_nw),
+            })
+        refs[_split] = _entries
+        ref_titles[_split] = _titles
+        out['references'][_split] = {
+            'n_articles': int(len(_items)),
+            'n_comparable': int(len(_entries)),
+            'n_titles': int(len(_titles)),
+        }
+    if not any(refs.values()):
+        out['status'] = 'not_verifiable'
+        out['problems'].append(
+            'no reference article has at least the minimum word count; '
+            'whole-article test contamination cannot be compared')
+        return out
+    for _art in test_articles:
+        if _art.get('truncated'):
+            out['test_articles_truncated'] += 1
+            continue
+        if not _art.get('has_heading'):
+            out['test_articles_without_heading'] += 1
+            continue
+        if int(_art.get('n_words') or 0) < int(min_words):
+            out['test_articles_too_short'] += 1
+            continue
+        _visible = False
+        for _split, _hashes in reference_line_hashes.items():
+            if any(int(_h) in _hashes for _h in _art.get('line_ids') or ()):
+                _visible = True
+                break
+        if _visible:
+            out['test_articles_line_visible'] += 1
+            continue
+        out['test_articles_scanned'] += 1
+        _text = _art.get('text') or ''
+        _h = int(L._doc_simhash(_text))
+        _text_hash = L._doc_exact_fp(_text)
+        _found = False
+        for _split, _entries in refs.items():
+            for _e in _entries:
+                if _e['text_hash'] == _text_hash:
+                    out['matches'].append({
+                        'kind': 'exact', 'reference_split': _split,
+                        'test_title': _art.get('title'),
+                        'reference_title': _e['title'],
+                        'test_line_ids': list(_art.get('line_ids') or ()),
+                        'hamming': 0,
+                    })
+                    _found = True
+                    break
+            if _found:
+                break
+            _best = None
+            for _e in _entries:
+                _dist = int((_h ^ int(_e['simhash'])).bit_count())
+                if _best is None or _dist < _best[0]:
+                    _best = (_dist, _e)
+            if _best is not None and _best[0] <= threshold:
+                out['matches'].append({
+                    'kind': 'near', 'reference_split': _split,
+                    'test_title': _art.get('title'),
+                    'reference_title': _best[1]['title'],
+                    'test_line_ids': list(_art.get('line_ids') or ()),
+                    'hamming': int(_best[0]),
+                })
+                _found = True
+                break
+        if not _found:
+            for _split, _titles in ref_titles.items():
+                if str(_art.get('title')) in _titles:
+                    out['title_collisions'].append({
+                        'reference_split': _split,
+                        'test_title': _art.get('title'),
+                    })
+    if out['matches']:
+        out['status'] = 'fail'
+        out['problems'].append(
+            f'{len(out["matches"])} test article(s) are exact/near duplicates '
+            'of a served train/validation article although none of their '
+            'served lines is an exact line-index hit; line-level dedup cannot '
+            'see this')
+        out['problems'].append(
+            'examples: ' + ', '.join(
+                f'{m["kind"]}({m["test_title"]!r}->{m["reference_title"]!r}, '
+                f'{m["reference_split"]}, hamming={m["hamming"]})'
+                for m in out['matches'][:5]))
+    if out['title_collisions']:
+        if out['status'] == 'ok':
+            out['status'] = 'warnings'
+        out['warnings'].append(
+            f'{len(out["title_collisions"])} test article title(s) also occur '
+            'in a served reference article, but no line-invisible article copy '
+            'was found; a title is not content proof')
+    if out['test_articles_scanned'] == 0:
+        out['status'] = 'not_verifiable'
+        out['problems'].append(
+            'no test article was eligible for whole-article comparison '
+            f'(line_visible={out["test_articles_line_visible"]}, '
+            f'too_short={out["test_articles_too_short"]}, '
+            f'without_heading={out["test_articles_without_heading"]}, '
+            f'truncated={out["test_articles_truncated"]})')
+    elif (out['test_articles_too_short'] or out['test_articles_truncated']
+          or out['test_articles_without_heading']):
+        if out['status'] == 'ok':
+            out['status'] = 'warnings'
+        out['warnings'].append(
+            'the whole-article scan did not cover every test article '
+            f'(too_short={out["test_articles_too_short"]}, '
+            f'truncated={out["test_articles_truncated"]}, '
+            f'without_heading={out["test_articles_without_heading"]}); a clean '
+            'scanned subset is not a clean split')
+    return out
+
+
 def audit_document_unit(cache_dir=None, *, seq_len=None, raw_dir=None,
-                        max_articles=4000):
+                        max_articles=None):
     """Audit the *unit of analysis* of the cached WikiText splits.
 
     The HF ``wikitext-103-raw-v1`` builder yields one row per raw **line**:
@@ -792,8 +1043,19 @@ def audit_document_unit(cache_dir=None, *, seq_len=None, raw_dir=None,
       * when the raw train/validation dumps are locally available it checks
         **article-level** leakage the line index cannot see: an article whose
         lines straddle train and validation, and near-duplicate articles whose
-        individual lines were all reworded.  It never reads ``wiki.test.raw``
-        (that would consume the one-shot held-out access).
+        individual lines were all reworded;
+      * it reconstructs the served **test** articles from the decoded cache
+        (never from ``wiki.test.raw``) and checks them against the served
+        train/validation articles.  A test article whose served lines all miss
+        the raw line index but whose whole text is an exact/near copy is the
+        leak that line-level dedup cannot see; it is a hard failure.  Test
+        articles with an exact line hit are counted as ``line_visible`` and
+        left to the line-index audits, so the two checks are not
+        double-counted;
+      * an article scan is full by default.  When ``max_articles`` caps it,
+        the sample is evenly spaced over the whole list (not a prefix), and
+        the coverage/truncation is recorded.  A clean truncated scan is
+        ``not_verifiable_locally``, never a clean-split proof.
 
     A line-unit cache is reported as ``warnings`` with
     ``document_level_claims_allowed=False``; it is not silently relabelled.
@@ -805,6 +1067,8 @@ def audit_document_unit(cache_dir=None, *, seq_len=None, raw_dir=None,
     ``seq_len``); without it, an ambiguous train/test pairing is refused rather
     than guessed.  ``raw_dir`` overrides the ``WT103_RAW_TXT`` / ``./wt103_raw``
     discovery used only for the train/validation article-leakage section.
+    ``max_articles=None`` (the default) scans every served article; a finite
+    cap is an explicit audit sample and is reported as such.
     """
     L = _import_exp_lib()
     import glob
@@ -901,6 +1165,7 @@ def audit_document_unit(cache_dir=None, *, seq_len=None, raw_dir=None,
         _tok_path = os.path.join(cache_dir, f'tok_{_train_tag}.json')
     trec = {'status': 'ok', 'problems': []}
     rec['test'] = trec
+    _test_article_units = None
     if not (os.path.exists(_te_path) and os.path.exists(_ttd_path)
             and os.path.exists(_tok_path)):
         trec['status'] = 'not_verifiable_locally'
@@ -942,6 +1207,9 @@ def audit_document_unit(cache_dir=None, *, seq_len=None, raw_dir=None,
                                    dtype=np.uint64),
                         np.asarray([int(r[0][1]) - int(r[0][0])
                                     for r in _runs], dtype=np.int64))
+                    _test_article_units = _article_units_from_runs(
+                        _runs, None,
+                        truncated_last=bool(_cls.get('truncated_final_run')))
                 elif _cls.get('unit') == 'line':
                     _grp, _gerr = _unit_group_lines(_runs, L)
                     if _grp is None:
@@ -960,6 +1228,10 @@ def audit_document_unit(cache_dir=None, *, seq_len=None, raw_dir=None,
                             'mean_lines_per_article': round(
                                 float(_grp['groups']['mean_group_rows']), 3),
                         }
+                        _test_article_units = _article_units_from_runs(
+                            _runs, _grp,
+                            truncated_last=bool(
+                                _cls.get('truncated_final_run')))
                 else:
                     trec['status'] = 'fail'
                     _fail('test: ' + (_cls.get('reason') or 'unknown unit'))
@@ -1083,19 +1355,38 @@ def audit_document_unit(cache_dir=None, *, seq_len=None, raw_dir=None,
         raw_dir = os.environ.get('WT103_RAW_TXT') or './wt103_raw'
     _raw_tr = os.path.join(raw_dir, 'wiki.train.raw')
     _raw_va = os.path.join(raw_dir, 'wiki.valid.raw')
-    rawrec = {'status': 'ok', 'problems': []}
+    rawrec = {'status': 'ok', 'problems': [], 'test_raw_read': False}
     rec['article_leakage'] = rawrec
+    terec = None
     if not (os.path.exists(_raw_tr) and os.path.exists(_raw_va)):
         rawrec['status'] = 'not_verifiable_locally'
         rawrec['problems'].append(
             f'raw train/validation dumps not found under {raw_dir!r}; '
             'article-level leakage cannot be tested (test raw is never read)')
         out.setdefault('notes', []).append(rawrec['problems'][-1])
+        terec = {
+            'status': 'not_verifiable_locally',
+            'problems': [
+                'raw train/validation dumps are unavailable, so the served '
+                'test articles have no line-index reference to compare against'
+            ],
+            'warnings': [],
+        }
+        rec['test_article_leakage'] = terec
     elif _served_train is None or _served_val is None:
         rawrec['status'] = 'not_verifiable_locally'
         rawrec['problems'].append(
             'served train/validation line ids are unavailable; cannot map raw '
             'articles to the served streams')
+        terec = {
+            'status': 'not_verifiable_locally',
+            'problems': [
+                'served train/validation document ids are unavailable, so the '
+                'served test articles have no reference set to compare against'
+            ],
+            'warnings': [],
+        }
+        rec['test_article_leakage'] = terec
     else:
         try:
             _tr_rows = L._read_raw_rows(_raw_tr)
@@ -1143,13 +1434,28 @@ def audit_document_unit(cache_dir=None, *, seq_len=None, raw_dir=None,
                             _out.append((_title, '\n'.join(_kept)))
                     return _out
 
-                _tr_served = _served_articles(_tr_rows, _tr_g, _served_train)
-                _va_served = _served_articles(_va_rows, _va_g, _served_val)
-                if max_articles is not None:
-                    _tr_served = _tr_served[:int(max_articles)]
-                    _va_served = _va_served[:int(max_articles)]
-                rawrec['served_train_articles'] = int(len(_tr_served))
-                rawrec['served_validation_articles'] = int(len(_va_served))
+                _tr_served_all = _served_articles(
+                    _tr_rows, _tr_g, _served_train)
+                _va_served_all = _served_articles(
+                    _va_rows, _va_g, _served_val)
+                _tr_served, _tr_scan = _sample_articles(
+                    _tr_served_all, max_articles)
+                _va_served, _va_scan = _sample_articles(
+                    _va_served_all, max_articles)
+                rawrec['served_train_articles'] = int(len(_tr_served_all))
+                rawrec['served_validation_articles'] = int(len(_va_served_all))
+                rawrec['article_scan'] = {
+                    'train': _tr_scan, 'validation': _va_scan,
+                }
+                if _tr_scan.get('truncated') or _va_scan.get('truncated'):
+                    rawrec['status'] = 'not_verifiable_locally'
+                    rawrec['problems'].append(
+                        'the article-level scan is truncated '
+                        f'(train {_tr_scan.get("n_scanned")}/'
+                        f'{_tr_scan.get("n_total")}, validation '
+                        f'{_va_scan.get("n_scanned")}/'
+                        f'{_va_scan.get("n_total")}); a clean subset is not a '
+                        'clean split — pass max_articles=None for a full scan')
                 # Same title on both sides with different served lines is an
                 # article split; identical line hashes would already have been
                 # an exact-row failure, so the title is the cross-line identity.
@@ -1194,7 +1500,8 @@ def audit_document_unit(cache_dir=None, *, seq_len=None, raw_dir=None,
                     rawrec['near_hamming_threshold'] = int(_ded.near_threshold)
                     rawrec['train_articles_indexed'] = int(_n_tr_seen)
                     if _near or _exact:
-                        rawrec['status'] = 'warnings'
+                        if rawrec['status'] != 'fail':
+                            rawrec['status'] = 'warnings'
                         _warn(
                             'article-level duplicates missed by the line index: '
                             f'{_exact} exact / {_near} near-duplicate '
@@ -1205,15 +1512,83 @@ def audit_document_unit(cache_dir=None, *, seq_len=None, raw_dir=None,
                     rawrec['problems'].append(
                         f'article near-duplicate scan failed ({type(e).__name__}: {e})')
                     rawrec['status'] = 'not_verifiable_locally'
+                # Held-out article contamination that the line index cannot
+                # see.  The test slice is reconstructed from the SERVED cache
+                # (its decoded line runs), so this does not read
+                # ``wiki.test.raw``; it compares the served test articles with
+                # the train/validation articles the model and selector saw.
+                # A unit whose lines all miss the raw line index but whose
+                # whole article matches is exactly the leak that line-level
+                # dedup cannot detect.
+                _tr_line_hashes = {
+                    int(L._doc_id_u64(L._doc_exact_fp(_r)))
+                    for _r in _tr_rows
+                    if isinstance(_r, str) and _r.strip()
+                }
+                _va_line_hashes = {
+                    int(L._doc_id_u64(L._doc_exact_fp(_r)))
+                    for _r in _va_rows
+                    if isinstance(_r, str) and _r.strip()
+                }
+                terec = {'status': 'ok', 'problems': [], 'warnings': []}
+                rec['test_article_leakage'] = terec
+                if _test_article_units is None:
+                    terec['status'] = 'not_verifiable_locally'
+                    terec['problems'].append(
+                        'served test article units could not be reconstructed '
+                        'from the cache (missing/misaligned test sidecar or '
+                        'no top-level heading), so test/article-line-index '
+                        'contamination cannot be tested without reading '
+                        'wiki.test.raw')
+                    _warn('test article leakage: ' + terec['problems'][-1])
+                else:
+                    try:
+                        _test_scan = _article_leakage_scan(
+                            {'train': _tr_served,
+                             'validation': _va_served},
+                            _test_article_units,
+                            reference_line_hashes={
+                                'train': _tr_line_hashes,
+                                'validation': _va_line_hashes,
+                            },
+                            near_threshold=L.DEDUP_PROTOCOL_DEFAULTS[
+                                'near_hamming_threshold'])
+                    except Exception as _tse:
+                        terec['status'] = 'not_verifiable_locally'
+                        terec['problems'].append(
+                            'test article leakage scan failed '
+                            f'({type(_tse).__name__}: {_tse})')
+                        _warn('test article leakage: ' + terec['problems'][-1])
+                    else:
+                        terec.update(_test_scan)
+                        if _test_scan.get('status') == 'fail':
+                            _fail('test article leakage: ' + '; '.join(
+                                _test_scan.get('problems') or []))
+                        elif _test_scan.get('status') == 'warnings':
+                            _warn('test article leakage: ' + '; '.join(
+                                _test_scan.get('warnings') or []))
+                        elif _test_scan.get('status') == 'not_verifiable':
+                            terec['status'] = 'not_verifiable_locally'
+                            _warn('test article leakage: ' + '; '.join(
+                                _test_scan.get('problems') or []))
                 if rawrec['problems']:
-                    rawrec['status'] = 'warnings'
+                    # A truncated scan is not the same claim as a clean sample:
+                    # keep the explicit not_verifiable status instead of
+                    # downgrading it to an ordinary warning.
+                    if rawrec['status'] != 'not_verifiable_locally':
+                        rawrec['status'] = 'warnings'
                     _warn('article leakage: ' + '; '.join(rawrec['problems']))
+                if (_tr_scan.get('truncated') or _va_scan.get('truncated')
+                        or terec.get('status') == 'not_verifiable_locally'):
+                    if out['status'] == 'ok':
+                        out['status'] = 'not_verifiable_locally'
 
     # --- aggregate verdict -------------------------------------------------
     _test_unit = trec.get('unit')
     rec['unit'] = _test_unit
     rec['document_level_claims_allowed'] = bool(
-        _test_unit == 'article' and rawrec.get('status') != 'fail')
+        _test_unit == 'article' and rawrec.get('status') != 'fail'
+        and (rec.get('test_article_leakage') or {}).get('status') != 'fail')
     rec['line_unit_warning'] = bool(_test_unit == 'line')
     if _test_unit == 'line':
         _warn('the served evaluation unit is a raw LINE, not an article; '
@@ -1225,8 +1600,8 @@ def audit_document_unit(cache_dir=None, *, seq_len=None, raw_dir=None,
         _warn('the frozen prefix contains fewer than the 64 independent '
               'articles the repo requires for a population claim')
     if out['status'] == 'ok' and any(
-            r.get('status') == 'not_verifiable_locally'
-            for r in (trec, vrec, trrec, rawrec)):
+            r is not None and r.get('status') == 'not_verifiable_locally'
+            for r in (trec, vrec, trrec, rawrec, terec)):
         out['status'] = 'not_verifiable_locally'
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return out

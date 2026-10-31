@@ -11024,3 +11024,105 @@ train/validation/self 归属、kept 前缀、`validation_cleanup` 台账及
 计数/成员篡改；文件级 wrapper 的 raw 缺失/侧车缺失语义；显式
 `include_test` 才读 `wiki.test.raw` 且删掉该文件只让显式请求变为
 `not_verifiable`；CLI/wrapper 接线。完整 CPU 套件在最终树通过。
+
+## 123. held-out 文章泄漏也要按文章检查：从 served test cache 重建文章，并让截断扫描说出覆盖（本轮数据方法硬化，no new runs）
+
+### 123.1 问题：行级去重看不到「整篇文章换一种写法」
+
+§53/§54 已确认 WikiText 的缓存单元是原始**行**（标题、段落、空行），
+`_DocDeduplicator` 的 `scope='raw_line'` 因此只能删除逐行完全相同或
+逐行 SimHash 相近的副本。一篇文章若每行都被改写/重排/改格式，行级
+索引看不到它，但文章整体仍然可能是训练集的副本。§66 对 train/validation
+补了 32-token passage 扫描；§122 又补了从 raw rows 重放 exact/SimHash
+决定。但**确认性的 test 切片**仍只被行级索引和 `audit_leakage` 的
+13-token 扫描覆盖：
+
+- 行级 exact/SimHash 去重在 test 构建时只按 raw line 操作；
+- `audit_document_unit` 的 article-level 检查只读 raw train/validation，
+  因为读 `wiki.test.raw` 会消耗一次性 held-out 访问；
+- 于是「test 文章 A 的每一行都不与 train 行完全相等，但 A 整体是 train
+  文章 B 的改写/改格式副本」既不在行级去重里，也不在现有文章级检查里。
+
+另有一个覆盖诚实问题：`audit_document_unit(max_articles=4000)` 默认只
+扫描 **前 4000 篇**文章，且旧实现直接 `[:max_articles]` 截断，没有记录
+覆盖率。WikiText-103 的 train 文章数明显超过 4000；一个干净的前缀样本
+不是「切分干净」的证明，这与 §66 的 coverage 纪律不一致。
+
+### 123.2 方法：用 served cache 重建 test 文章，而不是读 test raw
+
+新增三个纯函数（`_audit_gates/_parts/part_01_audit_split_discipline.py`）：
+
+1. `_article_units_from_runs(runs, grouped=None, truncated_last=False)`：
+   把 `_unit_decode_runs` 得到的 served line runs（`(span, doc_id) ->
+   text`）按 `wikitext_article_groups` 的顶层标题重新组装为文章单元。
+   article-unit cache 的 run 本身就是整篇文章，直接成单元。每个单元只
+   包含**实际 served** 的行，记录 `title` / `text` / `line_ids` /
+   `n_words` / `has_heading` / `truncated`。
+2. `_sample_articles(items, cap)`：默认全扫；`cap` 给定时用
+   `numpy.linspace(0, n-1, cap)` 在整个列表上等距取样（不是前缀），并
+   返回 `design` / `n_total` / `n_scanned` / `truncated` / `coverage`。
+3. `_article_leakage_scan(...)`：
+   - 参照集是 served train/validation 文章（模型/选型实际看到的文本）；
+   - 行可见性用 **raw train/validation 的全部行哈希**判断：一个 test
+     文章只要有一行命中行索引，就计入 `line_visible`，交给行级审计，
+     不在这里重复计为文章级失败；
+   - 仅对「行不可见」且至少 20 词的 test 文章，计算整篇 exact 哈希与
+     64-bit SimHash；与参照文章 Hamming ≤ 记录协议的阈值（默认 3）即
+     判 `near`，整篇 exact 即判 `exact`，二者都是硬失败；
+   - 标题相同但整篇内容不近的只 warn（标题不是内容证明）；
+   - 少于 20 词、final run 被 cap 截断、没有顶层标题的单元计入
+     `too_short` / `truncated` / `without_heading`，并让 clean 结果降为
+     `not_verifiable`，绝不用「未比较」冒充「未发现」。
+
+`audit_document_unit` 在 test 解码成功后保留 `_test_article_units`，在
+raw train/validation 可读时运行该扫描，写入
+`rec['test_article_leakage']`；硬失败进入顶层 `problems` 并使
+`document_level_claims_allowed=False`。test raw 始终不读。
+
+同时把 train/validation 的 article-level 扫描改为**默认全量**；有限
+`max_articles` 只作为显式审计样本，采用上述 `_sample_articles` 的等距
+设计，并把 `article_scan.{train,validation}` 的覆盖率写进报告。截断时
+状态为 `not_verifiable_locally`，不再把干净的前缀样本当 clean。
+
+### 123.3 接线与入口
+
+```bash
+python audit_gates.py document_unit            # 新增 test_article_leakage / article_scan
+python audit_gates.py unit                    # 别名
+python audit_gates.py report                  # 汇总里原 document_unit 块自动带上
+```
+
+`audit_document_unit(..., max_articles=N)` 仍是显式审计样本；默认
+`None` 表示全量。没有新增训练、缓存重建或 GPU 读取。
+
+### 123.4 边界
+
+- 证明的是「served test cache 重建出的文章，在行索引不可见时，是否与
+  served train/validation 文章整体相同/近同」，不是「test raw 一定
+  干净」。test raw 不读，构建期去重仍由 §82/§122 的生产者重放负责。
+- 只检测整篇 exact/SimHash 近同；同义改写、翻译回译、摘要复用仍可能
+  逃过 64-bit SimHash 与 20 词下限。短文章被明确标为未覆盖，不是 clean。
+- final run 被 token cap 截断的文章整体不比较；这是 cap 伪影，不是漏报。
+  行可见性仍按原始 line id 判断，因此截断尾行不会把「行可见」误判成
+  「文章不可见」。
+- 不改变 tokenization、split、cap、去重产物、checkpoint、PPL、种子、alpha、
+  Holm family、冻结判定或 `CODE_SEMANTICS`；旧 artifact 没有新字段时
+  只是缺这个读数，不回填、不重跑。
+- `.github/` 与所有 README 未删除、未修改、未移动。
+
+### 123.5 验证
+
+```bash
+python -m pytest -q test_review_part_63.py
+python -m pytest -q                          # 完整 CPU 套件
+```
+
+`test_review_part_63.py` 6 项覆盖：等距取样跨整个列表且记录 coverage；
+行不可见的改格式整篇副本被判 `fail` 并给出 train 参照；行可见副本只计入
+`line_visible` 而不重复判文章级失败；短文章/截断文章为 `not_verifiable`；
+端到端测试在 fixture cache 上追加 served train 长文章、重建 served test
+cache（仅空白改动，所有行 hash 不同）后，审计报
+`test_article_leakage.status='fail'`、`document_level_claims_allowed=False`；
+有限 `max_articles=1` 时记录 `deterministic_even_spacing`、`truncated=True`、
+`coverage=0.5` 且状态为 `not_verifiable_locally`。完整套件在本轮最终树
+通过（1246 passed, 3 skipped）。

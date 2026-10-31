@@ -5719,3 +5719,47 @@ train/validation/self 归属、kept 前缀、`validation_cleanup` 台账与
 计数/成员篡改；文件级 raw/侧车缺失语义；显式 `include_test` 才读
 `wiki.test.raw`，删掉该文件只让显式请求变为 `not_verifiable`；CLI 与
 wrapper 接线。完整 CPU 套件（1235 项）在本轮最终树通过。
+
+## 2026-10-31 — held-out 文章泄漏按文章检查：served test cache 重建 + 覆盖诚实（本轮数据方法硬化，no new runs）
+
+**Problem.** §53/§54 的缓存单元是 raw line，行级 exact/SimHash 去重
+看不到「每行都被改写/改格式、但整篇仍是训练文章副本」的 held-out
+文章。§66/§122 已覆盖 train/validation 的 passage 与 cleaning replay，
+但 test 的 article-level 检查仍缺失：`audit_document_unit` 只读 raw
+train/validation，因为读 `wiki.test.raw` 会消耗一次性 held-out 访问。
+同时旧实现 `max_articles=4000` 直接取前 4000 篇，未记录覆盖率；一个
+干净前缀样本被当成了 clean split。
+
+**Fix.** 在 `_audit_gates/_parts/part_01_audit_split_discipline.py` 增加：
+
+- `_article_units_from_runs`：从 served test cache 的 token-doc sidecar
+  和持久 tokenizer 解码出 line runs，再按顶层 ` = Title = ` 重组成
+  文章单元；article-unit cache 的 run 直接成单元。不读 test raw。
+- `_sample_articles`：默认全扫；`max_articles` 给定时在整个列表上
+  `linspace` 等距取样，记录 `design/n_total/n_scanned/truncated/coverage`。
+- `_article_leakage_scan`：以 served train/validation 文章为参照；先用
+  raw line 哈希判定 `line_visible`，只对行不可见的 ≥20 词文章比较整篇
+  exact 与 64-bit SimHash（阈值取 dedup 协议默认 3）。行不可见但整篇
+  exact/near 为硬失败；标题相同只 warn；短文章/截断/无标题计入未覆盖，
+  clean 结果降为 `not_verifiable`。
+- `audit_document_unit` 新增 `rec['test_article_leakage']` 与
+  `article_leakage.article_scan`；train/validation 文章扫描默认改为全量，
+  有限 cap 为显式样本，截断时 `not_verifiable_locally`。硬失败同时把
+  `document_level_claims_allowed` 置 false。CLI 入口仍是
+  `audit_gates.py document_unit`（别名 `unit`），`report` 自动包含。
+
+**Boundary.** 证明的是 served test cache 重建文章在行索引不可见时是否与
+served train/validation 文章整体 exact/近同，不证明 test raw 一定干净
+（raw test 不读）；同义改写/翻译/摘要复用仍可能逃过 64-bit SimHash 与
+20 词下限，短文章明确标未覆盖。final run 被 cap 截断的文章不做整篇比较。
+不改 tokenization、split、cap、去重产物、checkpoint、PPL、种子、alpha、
+Holm family、冻结判定或 `CODE_SEMANTICS`；不新增训练、不重建缓存、不回填
+旧 artifact。`.github/` 与所有 README 未删除、未修改、未移动。
+
+**Verification.** 新增 `test_review_part_63.py` 6 项：等距取样覆盖整个
+列表；行不可见的空白改写整篇副本判 fail；行可见副本只计 line_visible；
+短文章/截断文章 not_verifiable；fixture 上追加 served train 长文章并重建
+served test cache 后端到端 fail，`max_articles=1` 记录
+`deterministic_even_spacing` / `truncated` / `coverage=0.5` 且
+`not_verifiable_locally`。干净文章不误报；完整 CPU 套件在本轮最终树通过（1246 passed,
+3 skipped）。
