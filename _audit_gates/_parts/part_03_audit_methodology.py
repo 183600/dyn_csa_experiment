@@ -1092,6 +1092,47 @@ def audit_design_preflight(manifest_path=None, dynamic_path=None):
         out['violations'].append(
             f'interaction_power: the design-time interaction gate could not '
             f'run ({type(_e).__name__}: {_e})')
+    # Endpoint dynamic range is a separate design axis from power/MDE: a
+    # bounded endpoint already at its beneficial bound cannot show an
+    # improvement even with unlimited seeds.  The gate reads a validation
+    # pilot when present and only fails on requirements the manifest declares.
+    try:
+        _es = audit_endpoint_sensitivity(manifest_path=mp, verbose=False)
+        out['endpoint_sensitivity'] = {
+            'status': _es.get('status'),
+            'n_endpoints': _es.get('n_endpoints'),
+            'requirements': _es.get('requirements'),
+            'endpoints': {k: {
+                'status': v.get('status'),
+                'metric': v.get('metric'),
+                'direction': v.get('direction'),
+                'bounds': v.get('bounds'),
+                'minimum_meaningful_effect': v.get(
+                    'minimum_meaningful_effect'),
+                'structurally_possible': (v.get('headroom') or {}).get(
+                    'structurally_possible'),
+                'headroom': (v.get('headroom') or {}).get('headroom'),
+                'claim_allowed': v.get('claim_allowed'),
+            } for k, v in (_es.get('endpoint_sensitivity') or {}).items()},
+            'problems': list(_es.get('problems') or []),
+            'warnings': list(_es.get('warnings') or []),
+        }
+        if _es.get('status') == 'fail':
+            out['violations'].extend(
+                f'endpoint sensitivity: {p}'
+                for p in (_es.get('problems') or []))
+        else:
+            out['warnings'].extend(
+                f'endpoint sensitivity: {w}'
+                for w in (_es.get('warnings') or []))
+    except Exception as _e:
+        out['endpoint_sensitivity'] = {
+            'status': 'not_verifiable_locally',
+            'problems': [f'{type(_e).__name__}: {_e}'],
+        }
+        out['warnings'].append(
+            f'endpoint sensitivity: the design-time endpoint gate could not '
+            f'run ({type(_e).__name__}: {_e})')
     # A recorded violation is a hard design defect, including the case where
     # the frozen manifest is missing/unreadable.  Previously that branch only
     # appended to `violations` while `status` stayed 'ok', so the CLI exited 0

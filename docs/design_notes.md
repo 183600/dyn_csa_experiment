@@ -10209,3 +10209,149 @@ make audit
 `not_applicable`、非对象工件 `fail`；报告渲染新表、别名标记与边界段，
 且损坏块不崩溃。完整 CPU 套件 1126 passed / 3 skipped
 （本机 DataLoader 环境跳过）在本轮最终树通过。
+
+## 116. 端点要有可测的动态范围：有界指标的天花板/地板余量、测量分辨率与最小可测效应（本轮实验设计与准备硬化，no new runs）
+
+### 116.1 问题：功效回答「能不能分辨」，余量回答「有没有东西可分辨」
+
+§68/§69/§74 已把设计期功效、MDE、评测单位精度与 attrition 做成可执行
+读数，§38/§19 也为 NIAH、PR-AUC 等指标加了**平凡地板**（chance /
+majority）。但这些检查都默认「端点本身能随处理变化」。对有界指标
+（accuracy、macro recall、F1、boundary F1 等，取值 0..1）还有一个更
+基本的设计问题：**对照/基线臂是否已经贴着获益方向的边界？** 若基线
+accuracy 已是 0.99，即使无限种子也不可能测出 5 个百分点的改善；此时
+一个不显著结果不是「没有收益」，而是**端点没有动态范围**。反向的
+地板效应同理。PPL/NLL 虽然向上无界，但同一个 checkpoint 的重复评测
+本身有测量噪声；若该噪声大于最小实际效应，端点同样分辨不出值得关心的
+差异。
+
+这是一个**跑之前**就能回答的问题，却既不属于「p 值重放」，也不属于
+「功效」。把「显著/不显著」直接读成机制结论，会把 ceiling/floor 效应
+误写成零效应。
+
+### 116.2 方法：三件互相独立的设计检查
+
+新增 `ENDPOINT_SENSITIVITY_POLICY` 与四个原语：
+
+- `endpoint_metric(endpoint)`：从 `by_len.ppl@4096`、
+  `niah.top1_accuracy@L4096`、`boundary_f1.tol1@4096` 这类端点串解析
+  指标名、刻度（bounds）与获益方向。指标 token 必须由非标识符字符分隔，
+  且最长匹配优先，因此 `boundary_f1` 不会被读成 `f1`、
+  `niah.top1_accuracy` 不会被读成 `accuracy`。未知端点返回
+  `not_estimable`，绝不默认「无界」。
+- `endpoint_headroom(endpoint, control_level | arm_levels, ...)`：
+  - 参考水平：显式 `control_level`（基线）优先；只给 `arm_levels` 时取
+    **更好的臂**作为保守参考（比较还能额外测出的最大改善，是从已经更好
+    的臂到边界的距离）。
+  - `headroom` = 参考水平到获益方向边界的距离；有界刻度同时报
+    `headroom_relative = headroom / span`。零余量是 `saturated`；余量小于
+    声明的 `minimum_meaningful_effect`（MEE/SESOI）是 `uninformative`；
+    没有 MEE 时，相对余量 ≤ `min_relative_headroom` 只报 `low_headroom`。
+  - 边界外的观测水平是硬错误（`invalid`），不做静默夹取。
+- `endpoint_measurement_resolution(repeat_values, ...)`：用**同一
+  checkpoint、同一数据、同一解码配置**的重复评测估计测量分辨率
+  `max(观测极差, 样本 SD)`；少于两个有限重复值报 `not_verifiable`。该
+  分辨率小于 MEE 才 `resolves_mee=True`。
+- `endpoint_sensitivity(...)`：把三条检查合成一个设计判定。MDE 用
+  单位级双侧 t 近似 `(t_{1-α/2,n-1} + z_{power}) * paired_sd / sqrt(n)`
+  （显式标注为近似，不是精确 sign-flip MDE）。`claim_allowed` 只有在
+  **headroom、测量分辨率、MDE 三者都验证通过且 MEE 已声明**时才为
+  `True`；任一项失败为 `False`；缺证据为 `None`（未验证），绝不把
+  「没测」当作通过。
+
+`endpoint_sensitivity_audit(manifest, pilot)` 是设计门。`manifest` 可在
+`endpoint_sensitivity` 块里声明：
+
+```json
+{
+  "require_headroom": true,
+  "require_measurement_resolution": true,
+  "require_mde_within_headroom": false,
+  "require_declared_mee": false,
+  "near_bound_tolerance": 0.02,
+  "min_relative_headroom": 0.05,
+  "endpoints": {
+    "niah.top1_accuracy@L4096": {"minimum_meaningful_effect": 0.05}
+  }
+}
+```
+
+`pilot` 记录 validation 观测（不读 test）：
+
+```json
+{
+  "split": "validation",
+  "endpoints": {
+    "niah.top1_accuracy@L4096": {
+      "control_level": 0.90,
+      "repeat_values": [0.900, 0.901, 0.899],
+      "paired_sd": 0.01,
+      "n_units": 48
+    }
+  }
+}
+```
+
+审计对每个端点输出 bounds/direction、参考水平、headroom、测量分辨率、
+MDE、`claim_allowed` 与 blockers；对每条主对照输出同一读数。缺少
+manifest 是 `not_verifiable_locally`；缺少 pilot 是 warning，但若清单
+声明了 `require_headroom` / `require_measurement_resolution` /
+`require_mde_within_headroom` / `require_declared_mee`，缺证据就是
+`fail`。manifest 与 pilot 对同一端点的 MEE 不一致也是 `fail`——margin
+必须在跑之前唯一确定，不能看结果后挑。pilot 必须声明
+`split="validation"`；声明成 test/held-out 直接 `fail`，未声明则告警。
+
+### 116.3 接线
+
+- 新增 `explib/_parts/part_58_endpoint_sensitivity.py`（追加到
+  `explib/__init__.py` 的 `_PARTS`）。
+- `explib.confirmation.plan_check` 的 `design_preflight` 增加
+  `endpoint_sensitivity` 块；声明了硬要求且不满足时，`plan` 在首次 test
+  访问前拒绝。
+- `audit_gates.py endpoint_sensitivity`（别名 `endpoint_headroom` /
+  `headroom` / `dynamic_range` / `instrument_sensitivity` /
+  `ceiling_floor`）读取冻结/草稿清单与可选的
+  `analysis_v12/endpoint_sensitivity_pilot.json`；`audit_gates.py design`
+  与 `audit_gates.py report` 都包含该块。
+- 运行示例：
+
+```bash
+python audit_gates.py endpoint_sensitivity
+python audit_gates.py endpoint_sensitivity confirmation_frozen.json analysis_v12/endpoint_sensitivity_pilot.json
+python -m explib.confirmation plan        # 清单声明硬要求时执行同一道门
+```
+
+### 116.4 边界
+
+- **这是设计期检查，不是第二个确认性检验。** 它不产生 p 值、不进入
+  Holm/max-T 族、不改变 `p_exact_signflip` / `p_holm` / `verified` /
+  `confirmed` / 种子 / 终点 / α，也不改任何冻结清单的字节。
+- **bounds/direction 是刻度约定，不是从数据估计的。** 未知指标必须显式
+  提供 `metric`/`bounds`/`direction`，否则 `not_estimable`；`not_estimable`
+  不是通过。
+- **参考臂的选择会改变读数。** 显式 `control_level` 用基线；只给两臂
+  水平时用更好的臂，这是一个保守的「额外改善」口径，不是「两臂最大
+  可能差」。必须在报告里写明用的是哪一个参考，不能看到方向后切换。
+- **重复评测必须真的只重复测量。** 改 checkpoint、数据、解码或评测行
+  都是新测量，不是分辨率探针；函数无法替调用方验证这一点。
+- **MDE 是 t/正态近似。** 它不替代 `paired_design_sensitivity` 的
+  exact sign-flip 规划，也不替代 `attrition_power_audit` 的完整覆盖
+  概率。
+- **当前冻结清单没有该块，也没有 pilot。** 因此审计如实报
+  `warnings` / `not_verifiable`，这是暴露既有设计边界，不是追溯性失败；
+  下一次冻结可以在首次 test 访问前声明 MEE 与硬要求。
+- **不读 test split。** 审计只读 manifest 与 validation pilot；不调用
+  `load_wikitest`。
+
+### 116.5 验证
+
+`test_review_part_57.py` 14 项覆盖：指标名最长分隔匹配与未知端点；
+有界/无界余量、显式基线 vs 更好臂参考、`saturated` / `low_headroom` /
+`uninformative` 的区分；非法 bounds/level/MEE fail-closed；重复评测的
+极差/SD 分辨率与 `resolves_mee`；MDE 与三者联合的 `claim_allowed`
+（True/False/None 三态）；审计在干净 pilot 下 `ok`、饱和/缺 pilot 且
+声明硬要求时 `fail`、MEE 冲突与非法布尔声明 `fail`、未声明块只
+`warnings`、不可读 manifest/pilot 的 fail-closed；`load_wikitest` 被
+monkeypatch 成抛错时审计仍完成（证明不读 test）；CLI 别名、
+`audit_design_preflight` 与 `confirmation.plan_check` 接线，以及严格
+JSON。完整 CPU 套件在本轮最终树通过。

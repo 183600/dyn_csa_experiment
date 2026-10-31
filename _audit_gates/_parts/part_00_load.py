@@ -135,6 +135,18 @@
                不改变 p/Holm/verified/confirmed（从 test_stats.json 的逐种子
                NLL 差与 token 数重放，篡改判 fail；零 GPU；别名
                unit_quantile / unit_distribution / effect_distribution / qte）
+  endpoint_sensitivity  设计前馈：端点的**动态范围**——按指标刻度识别有界
+               （accuracy/F1/recall 等 0..1）与无界（PPL/NLL）端点，用
+               validation pilot 的最佳臂水平计算到获益方向的剩余 headroom，
+               与声明的 minimum meaningful effect（MEE/SESOI）比较；用同一
+               checkpoint 的重复评测估计测量分辨率，用 paired SD 与冻结单位
+               数给出 MDE；有界端点已在获益边界或 headroom < MEE 时，哪怕
+               无限种子也不能测出改善。只对清单显式声明的 require_headroom /
+               require_measurement_resolution / require_mde_within_headroom /
+               require_declared_mee 判 fail，缺 pilot 只告警、绝不当作通过；
+               不读 wiki.test.raw，不改 p/Holm/verified/confirmed（零 GPU；
+               别名 endpoint_headroom / headroom / dynamic_range /
+               instrument_sensitivity / ceiling_floor）
   family_correction  结果分析：重放确认主族的**依赖感知联合校正**——从逐种子
                配对差重建 sign-invariant score 的精确 Westfall-Young
                step-down max-T、同统计量 Holm、可用时的 studentised t

@@ -5302,3 +5302,66 @@ NLL 差溢出 `not_estimable` 且严格 JSON；`_doc_level_analysis` 落盘；
 `not_estimable` `not_applicable`、非对象工件 `fail`；报告渲染与损坏块
 容错。相关既有套件通过；完整 CPU 套件 1126 passed / 3 skipped
 （本机 DataLoader 环境跳过）。
+
+## 2026-10-31 — 端点动态范围是设计前提：有界指标余量、重复评测分辨率与最小可测效应（本轮实验设计与准备硬化，no new runs）
+
+零 GPU；不新增训练、不读取 test split、不修改
+`confirmation_frozen*.json` 的字节/种子/端点/α/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未删除、未修改、未移动。
+
+**Problem.** 现有设计期读数是「n 个种子/M 个评测单位能否分辨某个效应」
+（`paired_design_sensitivity`、`unit_precision_design`、
+`attrition_power_audit`）。它们默认端点本身会随处理变化。但对有界指标
+（accuracy / macro recall / F1 / boundary F1，0..1），如果基线/对照臂
+已经贴着获益边界，**无限种子也测不出改善**；此时不显著不是「无收益」，
+而是端点没有动态范围。NIAH 等指标已有平凡地板（chance/majority），却
+没有天花板/余量检查；PPL/NLL 虽无上界，但同一 checkpoint 的重复评测
+噪声若大于最小实际效应，端点同样不可分辨。把这类结构性不可分辨写成
+零效应，是设计层而非统计层的过度概括。
+
+**Fix.** 新增 `ENDPOINT_SENSITIVITY_POLICY` 与
+`endpoint_metric`、`endpoint_headroom`、
+`endpoint_measurement_resolution`、`endpoint_sensitivity`：
+
+- 端点串按最长、分隔符约束的指标 token 解析；未知指标是
+  `not_estimable`，不默认无界。
+- headroom 用显式基线 `control_level`，或两臂中更好的臂作保守参考；
+  报绝对/相对余量、`saturated`（零余量）、`low_headroom`（相对余量
+  ≤ 5%）与 `uninformative`（余量 < 声明的 MEE）。边界外水平判
+  `invalid`，不静默夹取。
+- 测量分辨率由同一 checkpoint/数据/解码的重复评测给出
+  `max(极差, SD)`；少于两个重复值报 `not_verifiable`，不补猜。
+- 单位级 MDE 用 `(t_{1-α/2,n-1} + z_power) * paired_sd / sqrt(n)` 的
+  t/正态近似；`claim_allowed` 仅在 headroom、分辨率、MDE 三者都通过且
+  MEE 已声明时为 `True`，任一项失败为 `False`，缺证据为 `None`。
+- `endpoint_sensitivity_audit(manifest, pilot)` 把上述读数按端点和主对照
+  汇总；只在清单显式声明 `require_headroom` /
+  `require_measurement_resolution` / `require_mde_within_headroom` /
+  `require_declared_mee` 时 fail-closed。缺 pilot 是 warning；声明硬
+  要求时缺证据是 fail。manifest 与 pilot 的 MEE 冲突判 fail；pilot 必须
+  声明 `split="validation"`，声明成 test/held-out 直接 fail。
+
+接线：`explib/__init__.py` 追加 `part_58_endpoint_sensitivity.py`；
+`explib.confirmation.plan_check` 的 `design_preflight` 增加
+`endpoint_sensitivity` 块；`audit_gates.py endpoint_sensitivity`（别名
+`endpoint_headroom` / `headroom` / `dynamic_range` /
+`instrument_sensitivity` / `ceiling_floor`）、`audit_gates.py design` 与
+`audit_gates.py report` 均接入。当前冻结清单没有该块、也没有 pilot，
+因此审计如实报 `warnings` / `not_verifiable`，不是追溯性失败。
+
+**Boundary.** 这是设计期检查，不产生 p 值、不进入 Holm/max-T 族、
+不改变 `p_exact_signflip`/`p_holm`/`verified`/`confirmed`/种子/终点/α。
+bounds/direction 是刻度约定，不是数据估计；参考臂选择会改变读数，必须
+在报告中写明；重复评测必须真的只重复测量；MDE 是近似，不替代
+`paired_design_sensitivity` 或 attrition 概率。审计不读
+`wiki.test.raw`。
+
+**Verification.** 新增 `test_review_part_57.py` 14 项：指标最长匹配与
+未知端点；有界/无界余量、基线 vs 更好臂参考、`saturated` /
+`low_headroom` / `uninformative`；非法 bounds/level/MEE fail-closed；
+重复评测极差/SD 与 `resolves_mee`；MDE 与三者联合的 True/False/None；
+干净 pilot 的 `ok`、饱和/缺 pilot 且声明硬要求时 `fail`、MEE 冲突与
+非法布尔声明 `fail`、未声明块只 `warnings`、不可读 manifest/pilot
+fail-closed；`load_wikitest` 被 monkeypatch 抛错时审计仍完成；CLI
+别名、`audit_design_preflight` 与 `confirmation.plan_check` 接线；严格
+JSON。完整 CPU 套件在本轮最终树通过（新增 14 项）。

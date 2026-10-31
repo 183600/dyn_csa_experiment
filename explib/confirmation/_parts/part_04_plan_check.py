@@ -215,8 +215,10 @@ def plan_check(manifest_path=FREEZE_MANIFEST):
         _ledger = L.comparison_budget_ledger(m)
         _ev = L.evidence_level_audit(m, manifest_path=manifest_path, panel_paths=[])
         _evd = L.evaluation_design_audit(m)
+        _esd = L.endpoint_sensitivity_audit(m, verbose=False)
         _design = {'budget_ledger': _ledger, 'evidence_level': _ev,
-                   'evaluation_design': _evd}
+                   'evaluation_design': _evd,
+                   'endpoint_sensitivity': _esd}
         if _ledger.get('status') == 'fail':
             errs.extend(f'budget ledger: {v}' for v in (_ledger.get('violations') or []))
         if _ev.get('status') == 'fail':
@@ -224,6 +226,12 @@ def plan_check(manifest_path=FREEZE_MANIFEST):
         if _evd.get('status') == 'fail':
             errs.extend(f'evaluation design: {v}'
                         for v in (_evd.get('violations') or []))
+        if _esd.get('status') == 'fail':
+            errs.extend(f'endpoint sensitivity: {v}'
+                        for v in (_esd.get('problems') or []))
+        else:
+            notes.extend(f'endpoint sensitivity: {w}'
+                         for w in (_esd.get('warnings') or []))
         notes.extend(f'budget ledger: {w}' for w in (_ledger.get('warnings') or []))
         notes.extend(f'evidence level: {w}' for w in (_ev.get('warnings') or []))
     except Exception as _e:

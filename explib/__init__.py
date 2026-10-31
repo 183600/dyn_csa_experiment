@@ -72,6 +72,7 @@ _PARTS = [
 'part_55_ablation_manipulation.py',
 'part_56_length_strata.py',
 'part_57_unit_quantiles.py',
+'part_58_endpoint_sensitivity.py',
 ]
 
 load_split_package(globals(), _HERE, _PARTS, repo_depth=1,
