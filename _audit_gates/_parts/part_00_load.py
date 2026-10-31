@@ -68,6 +68,15 @@
                为 warning；不重算 p、不改变冻结判定（零 GPU；别名
                confirmation_plan / plan_match / preregistration / prereg；
                可传 artifact 路径与可选的 manifest 路径）
+   panel_synthesis  跨 panel 效应合成重放：从 synthesis 块记录的逐种子
+               `with - without` 相对效应（占 without 臂 PPL 的百分比）重算
+               DerSimonian–Laird 合并、Cochran Q/I²/tau²、固定/随机效应区间、
+               预测区间、panel 依赖分层与 verified-only 选择偏差读数；逐项
+               核对 `claim_allowed`/`status`，拒绝把「只合并显著 panel」当作
+               合并估计。缺块报 not_verifiable，篡改输入点/合并值/claim/
+               selection 读数判 fail；不改变任何 panel 的 p/Holm/verified 或
+               冻结判定（零 GPU；别名 synthesis / cross_panel / poolability /
+               evidence_synthesis）
   missingness   缺失数据敏感性：按 run_manifest 的计划单元重算每个对照的
                观测/缺失/被控制门排除计数、声明范围内总体均值的 sharp
                bounds 与「抹掉符号/SESOI」的 tipping value；缺计划或旧

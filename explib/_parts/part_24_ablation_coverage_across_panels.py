@@ -302,6 +302,31 @@ def ablation_coverage_across_panels(reports, design=None, *, verbose=False):
     out['all_components_useful_allowed'] = bool(_needed) and not _reasons
     out['all_components_useful_reasons'] = _reasons
     out['unverified_components'] = _unverified
+    # Quantitative companion to the label-counting above.  It is deliberately
+    # separate: this gate counts verified panels, while the synthesis pools
+    # EVERY estimable panel (conditioning on significance would bias the
+    # common effect) and refuses poolability when the panels are not
+    # commensurable or their draws are dependent.  A synthesis failure is not
+    # allowed to crash or silently disappear from the project-level report.
+    try:
+        _syn_mins = [r.get('min_n') for r in reports.values()
+                     if isinstance(r, dict)]
+        _syn_mins = [int(x) for x in _syn_mins
+                     if isinstance(x, int) and not isinstance(x, bool) and x >= 0]
+        _syn_alphas = [r.get('alpha') for r in reports.values()
+                       if isinstance(r, dict)
+                       and isinstance(r.get('alpha'), (int, float))
+                       and not isinstance(r.get('alpha'), bool)]
+        out['synthesis'] = cross_panel_synthesis(
+            reports, design=design,
+            alpha=(float(_syn_alphas[0]) if _syn_alphas else 0.05),
+            min_n=(max(_syn_mins) if _syn_mins else 3))
+    except Exception as _syn_exc:
+        out['synthesis'] = {
+            'kind': 'cross_panel_synthesis', 'status': 'not_estimable',
+            'reason': (f'{type(_syn_exc).__name__}: {_syn_exc}'),
+            'note': ('the cross-panel synthesis failed; no pooled estimate is '
+                     'reported (the per-panel verdicts above are unchanged)')}
     out['status'] = 'warn' if out['warnings'] else 'ok'
     if verbose:
         print('[ablation-coverage] complete in >=1 panel: %s; missing everywhere: %s'

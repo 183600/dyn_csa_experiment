@@ -11126,3 +11126,159 @@ cache（仅空白改动，所有行 hash 不同）后，审计报
 有限 `max_articles=1` 时记录 `deterministic_even_spacing`、`truncated=True`、
 `coverage=0.5` 且状态为 `not_verifiable_locally`。完整套件在本轮最终树
 通过（1246 passed, 3 skipped）。
+
+## 124. 跨 panel 证据不能只数「通过了几次」：可合并性门 + 不按显著性选 panel 的随机效应合成（本轮结果分析硬化，no new runs）
+
+零 GPU 的结果分析硬化；不新增训练、不读取 test split、不修改
+`confirmation_frozen*.json` 的字节/种子/端点/α/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未删除、未修改、未移动。
+
+### 124.1 问题：`replicated` 是标签，不是合并估计
+
+§65/§71 把跨 panel 读数从「某组件在任意 panel 通过」细化为独立 draws、
+新 seeds/同评测、共享 seeds、未核验等档位，并让反证优先。但这些读数仍然
+只回答「有几个 panel 通过」：它们不给出跨 panel 的共同效应、异质性
+（`I²`/`tau²`）或对**下一个 panel** 的预测区间。§65.3 明确把「不做
+meta-analysis」列为边界。于是同一批 panel 上可以出现：
+
+- 三个 panel 的效应分别是 -2%、-2.1%、-1.9%，另一个未通过的 panel 是
+  0%；只报 verified 的读数会把 -2% 当成「跨 panel 的共同效应」，而
+  纳入全部可估计 panel 的合并均值约 -1.5%。前者条件在 p<alpha 上，
+  是跨 panel 版本的 winner's curse；
+- 两个 panel 都显著，但一个效应是 -8%、另一个是 -1%；标签都叫
+  `verified`/`replicated`，读者看不到它们不是同一个总体参数；
+- 两个 panel 共享训练 seeds 或共享评测切片；把它们的标准误当成独立
+  研究的标准误做 inverse-variance 合并，会系统性低估不确定性；
+- 两个 panel 的臂对不同、语料指纹不同、方向声明相反，或一个 panel
+  的逐种子配对缺了一个 seed；这些读数根本不在同一估计量上，不能合并。
+
+已有 `meta_analyze_effects` 只被规模阶梯显式调用，且要求调用者先证明
+可合并性；跨 panel 路径没有这一步。
+
+### 124.2 方法：先证明可合并，再合成；合成纳入全部可估计 panel
+
+新增 `explib/_parts/part_63_cross_panel_synthesis.py`：
+
+1. **输入与尺度。** `cross_panel_synthesis(reports, design, alpha, min_n)`
+   从每个 `methodology_audit` report 的逐组件条目中取同一
+   `(with, without)` 臂对的受控逐种子 `deltas`，重算
+   `effect_i = 100 * (with_i - without_i) / without_mean`。这是相对
+   without 臂 PPL 的百分比，因此不同 PPL 量级的 panel 在同一尺度上；
+   `relative_effect_pct` 只用于对账，若与 `deltas/without_mean` 不一致，
+   该 panel 以 `stale aggregate` 具名排除，绝不静默采用旧汇总值。
+2. **逐 panel 排除必须具名。** 缺少 `deltas`/`seeds`、`n<min_n`、
+   `fully_paired` 不为真、seed 重复/非法、没有 `without_mean`、同一 panel
+   对同一臂对有重复条目、一个 panel 的对比跨多个 `corpus_fps`，都写入
+   `excluded[panel]`；被排除的 panel 不会消失，也不会被计成「通过」。
+3. **方向与语料是同一次合并的前提。** 所有纳入 panel 必须声明同一个
+   `predicted_sign ∈ {-1, +1}`；方向缺失/为 0/互相矛盾时状态为
+   `refused_direction_mismatch`，不发布合并值。`component_draws` 的
+   `corpus_fps` 必须每 panel 唯一且所有 panel 相同；不同分词/语料下
+   PPL 相对效应不可合并（与 `meta_analyze_effects` 的 corpus 门一致）。
+4. **统计核心复用 `meta_analyze_effects`。** points 携带
+   `label/effects/seeds/corpus_fp/complete_pairs`，得到 Cochran Q、
+   DerSimonian–Laird `tau²`/`I²`、固定与随机效应区间、预测区间，以及
+   共享种子诊断（`disjoint_seed_sets` / `shared_seeds_paired` /
+   `shared_seeds_unpaired` / `unattested`）。不实现第二套元分析。
+5. **依赖不是独立。** 再用 `replication_independence_audit` 对
+   `(panel -> draws)` 分类；`evidence_tier` 区分
+   `independent_replication`、`paired_same_seeds`、
+   `new_seeds_shared_evaluation`、`unattested_evaluation`。只有独立
+   评测切片的 disjoint-seed 家族才允许 `claim_allowed=True`；共享
+   seeds 的家族保留 `paired_common_effect` 作为依赖感知读数，但不写成
+   独立复现。缺 `component_draws` 一律 `unattested`，不默认独立。
+6. **合并主张是多项门的合取。** `claim_allowed` 需要：meta `poolable`
+   （≥3 个可用 panel、每 panel n≥min_n、完整配对、非零 within-panel
+   方差、`I²≤50%` 且 Q 的 p≥α）、方向一致、语料共享、依赖档位可支持，
+   且纳入 panel 中没有 `direction_conflict`/`practically_harmful`。
+   不满足时仍发布每 panel 效应和描述性合并值，同时写明原因。
+7. **不按显著性选 panel。** 主合成纳入所有可估计 panel（verified 与
+   unverified 一视同仁）；`verified_only_sensitivity` 另行给出
+   「只合并 verified」的描述性读数，并计算
+   `benefit_verified_only - benefit_all_panels`（按声明方向取正）。
+   正数表示只报显著 panel 会夸大收益。该读数明确标注
+   `selection_on_significance=True`，不是第二个可选估计。
+8. **稳健性。** 逐 panel 留一重算合并均值与符号；`I²>50%` 或 Q 显著时
+   状态为 `heterogeneous`，只允许逐 panel 报告，不允许共同效应。
+   `comp` 级状态汇总为 `poolable` / `measured_not_poolable` /
+   `not_measured` / `not_estimable`。
+
+`ablation_coverage_across_panels` 在末尾调用它并写入
+`out['synthesis']`；合成失败被捕获为 `not_estimable` 记录，不会让覆盖率
+报告崩溃，也不会改变 `verified_anywhere`、`all_components_useful_allowed`
+或任何 panel 的 p/Holm/`verified`。
+
+### 124.3 落盘、报告与审计
+
+```bash
+python audit_gates.py panel_synthesis     # 重放 synthesis 块
+python audit_gates.py synthesis           # 别名
+python audit_gates.py cross_panel
+python audit_gates.py poolability
+python audit_gates.py evidence_synthesis
+make audit                                # audit_report.json 的
+                                          # methodology.ablation_coverage.synthesis
+```
+
+`audit_panel_synthesis` 从 synthesis 块自身记录的 `meta_input.points`
+重算 meta（固定/随机效应、Q/I²/tau²、预测区间、seed dependence、
+corpus binding）、`claim_allowed`/`evidence_tier`、留一符号稳定性与
+verified-only 选择偏差读数；并核对 points 与 `panels` 的 effects/seeds
+一致。缺块报 `not_verifiable_locally`；篡改任一合并值、claim/status、
+输入点或 selection 读数判 `fail`；块内夹带
+`confirmed`/`p_holm`/`verdict`/`decision` 也判 `fail`。它是**内部重放**：
+能证明「这组合并值由这些逐种子效应算出」，不能证明这些效应来自某次
+原始 run——后者仍由 stamped artifact 与冻结锁负责。
+
+### 124.4 边界
+
+- **相对百分比不是 log ratio。** 每个 panel 的分母是自己的
+  `without_mean`，因此跨 panel 的百分比差异仍可能混入基线水平差异；
+  本块只把「同一臂对的相对效应」放在一起，不宣称它是无量纲的因果量。
+- **合并不是第二个确认性检验，也不进入 Holm。** 它不产生新 p 值，
+  不改变任何 panel 的 `verified`/`confirmed`、冻结清单、种子、alpha 或
+  `CODE_SEMANTICS`。
+- **`poolable` 不是「效应真实/可迁移」。** 它只表示在这批 panel 的
+  可合并性、异质性与依赖门都通过；2 个 panel 时 `meta_analyze_effects`
+  的 `poolable` 仍为 False（随机效应方差不可估），只显示固定/随机效应
+  的描述值。
+- **verified-only 读数不是有效估计。** 它条件在 p<α 上，只用于展示
+  选择偏差的符号和量级；读者不应在 `all_panels` 与 `verified_only`
+  之间挑选更有利的一个。
+- **共享 seeds 的 `paired_common_effect` 是另一种主张。** 它回答
+  「同一批 draws 上跨 panel 的平均效应」，不回答「换一批 seeds 会怎样」；
+  本块因此不把 `paired_same_seeds` 写成独立复现。
+- **不重判 panel 身份。** 依赖分类直接复用 §71 的
+  `replication_independence_audit`；本块不重新定义 seed/eval 指纹，
+  也不回填旧 report 缺失的 `component_draws`。
+- **评测切片差异也进入 τ²。** 独立复现允许不同评测文档/长度切片；此时
+  共同效应是这些 panel 总体的描述，不是某一个固定切片的效应。切片
+  完全相同则只算新 seeds 的重复测量（`new_seeds_shared_evaluation`），
+  不升级为独立评测。
+- **模型规模/配方差异只作为异质性处理。** 不同 panel 的 d/L/训练预算
+  可能不同，本块没有把规模当成分层变量，只用 `I²`/Q 与臂对/语料门间接
+  约束；跨规模合并出的共同效应不是 scaling law，也不能替代按规模分层的
+  读数。规模本身是未枚举的合并自由度。
+- **不覆盖所有分析自由度。** 效应尺度（raw/log/百分比）、截尾、加权、
+  文档过滤等仍是未枚举的选择；本块只把「跨 panel 合并」这一自由度
+  显式化并设门。
+
+### 124.5 验证
+
+```bash
+python -m pytest -q test_review_part_64.py
+python -m pytest -q
+python audit_gates.py panel_synthesis
+```
+
+`test_review_part_64.py` 11 项覆盖：三个独立 panel 的一致效应被合并
+（I²=0、预测区间存在、留一符号稳定、claim 通过）；异质 panel 被判
+`heterogeneous` 且 claim 关闭；方向矛盾被拒绝且不产生合并输入；混合
+语料被 `meta_analyze_effects` 拒绝；未 verified 的零效应 panel 仍进入
+主合并，verified-only 读数更大且被标为选择敏感；共享 seeds 显示
+`paired_same_seeds` 且不冒充独立复现；disjoint seeds + 共享评测切片与
+缺身份分别降级；`n<min_n`、缺 seed、陈旧汇总、重复条目均具名排除；
+单 panel / 空输入 / 无受控条目的状态诚实；严格 JSON 与确定性；覆盖率
+报告嵌入 synthesis 且不改变 `verified_anywhere`；审计重放 ok、篡改
+合并值/claim/输入点/selection 均 fail、缺块不可验证、裸 synthesis 报告
+可审计、CLI 别名可达。完整 CPU 套件在本轮最终树通过。

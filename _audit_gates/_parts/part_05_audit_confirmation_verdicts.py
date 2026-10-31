@@ -2074,6 +2074,11 @@ def _run_cli():
                   'plan_match': audit_plan_conformance,
                   'preregistration': audit_plan_conformance,
                   'prereg': audit_plan_conformance})
+    _cmds.update({'panel_synthesis': audit_panel_synthesis,
+                  'synthesis': audit_panel_synthesis,
+                  'cross_panel': audit_panel_synthesis,
+                  'poolability': audit_panel_synthesis,
+                  'evidence_synthesis': audit_panel_synthesis})
     _arg = sys.argv[1] if len(sys.argv) > 1 else 'report'
     if _arg in ('-h', '--help'):
         print(__doc__)
@@ -2120,6 +2125,9 @@ def _run_cli():
         _r = _cmds[_arg](list(_pos) or None)
     elif _arg in ('joint_correction', 'joint', 'maxt', 'max_t'):
         _r = _cmds[_arg](list(_pos) or None)
+    elif _arg in ('panel_synthesis', 'synthesis', 'cross_panel', 'poolability',
+                  'evidence_synthesis'):
+        _r = _cmds[_arg](*_pos)
     else:
         _r = _cmds[_arg]()
     if isinstance(_r, dict) and _r.get('status') == 'fail':
