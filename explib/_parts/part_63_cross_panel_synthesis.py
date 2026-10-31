@@ -375,9 +375,18 @@ def _cps_leave_one_out(points, *, alpha, min_n, full_mean):
         return out
     # Validate the family once and reuse each point's mean/SD/SE row across
     # the k subsets.  Re-running full validation and per-point NumPy reductions
-    # for every omission made this O(k^2) in a large per-seed payload.  The
-    # row cache is only valid without work-scale normalisation (ordinary
-    # magnitudes), because an omitted extreme point can change the scale.
+    # for every omission made this O(k^2) in a large per-seed payload.
+    #
+    # The row cache is only valid while no subset can trigger work-scale
+    # normalisation.  That condition is NOT monotone under omission: dropping
+    # the only large point can leave a subset below ``_EFFECT_SCALE_FLOOR``,
+    # and dropping the only ordinary-magnitude point can leave a subset above
+    # 1e100.  Either flip changes whether ``_mean_work``/``_se_work`` are raw
+    # or divided by the family scale, so reusing a raw row in a scaled subset
+    # (or vice versa) silently pools the wrong numbers.  Reuse rows only when
+    # every non-zero effect already lies in the no-normalisation band
+    # ``[floor, 1e100]``; exact zeros do not affect the min/max rule, and an
+    # all-zero subset also stays unscaled.
     _work_points = points
     _row_cache = {}
     _prevalidated = False
@@ -385,14 +394,12 @@ def _cps_leave_one_out(points, *, alpha, min_n, full_mean):
         _validated = _scale_points(points)
         _effect_abs = [abs(float(e)) for _p in _validated
                        for e in _p['effects']]
-        _effect_max = max(_effect_abs, default=0.0)
-        _effect_min = min((a for a in _effect_abs if a > 0.0), default=0.0)
-        _needs_scale = bool(math.isfinite(_effect_max) and _effect_max > 0.0
-                            and (_effect_max < _EFFECT_SCALE_FLOOR
-                                 or _effect_min > 1e100))
+        _cache_safe = all(
+            (a == 0.0) or (_EFFECT_SCALE_FLOOR <= a <= 1e100)
+            for a in _effect_abs)
         _work_points = _validated
         _prevalidated = True
-        if not _needs_scale:
+        if _cache_safe:
             _full = _cps_pool(_validated, alpha=alpha, min_n=min_n,
                               pair_detail_limit=0, _prevalidated_points=True)
             if isinstance(_full.get('per_point'), list):

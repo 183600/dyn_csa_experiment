@@ -343,3 +343,82 @@ def test_pooled_ppl_survives_totals_beyond_float64():
 
 
 
+
+
+def test_cross_panel_leave_one_out_rescales_each_subset():
+    # The LOO row cache is only valid while every subset stays on the unscaled
+    # meta-analysis branch.  Dropping the only ordinary-magnitude panel can
+    # leave only sub-floor effects, and dropping the only tiny panel can leave
+    # only >1e100 effects; either flip changes whether mean/SE are raw or
+    # divided by the family scale.  Reusing the old rows then double-scales the
+    # pooled estimate (the first case below was 3.255e202 instead of 1.55e101).
+    cases = [
+        [
+            {'label': 'small', 'scale': 1.0, 'seeds': [0, 1],
+             'effects': [1.0, 1.0]},
+            {'label': 'big1', 'scale': 2.0, 'seeds': [0, 1],
+             'effects': [1e101, 1.1e101]},
+            {'label': 'big2', 'scale': 3.0, 'seeds': [0, 1],
+             'effects': [2e101, 2.1e101]},
+        ],
+        [
+            {'label': 'tiny1', 'scale': 1.0, 'seeds': [0, 1],
+             'effects': [1e-90, 1.1e-90]},
+            {'label': 'tiny2', 'scale': 2.0, 'seeds': [0, 1],
+             'effects': [1.2e-90, 1.3e-90]},
+            {'label': 'ordinary', 'scale': 3.0, 'seeds': [0, 1],
+             'effects': [1.0, 1.1]},
+        ],
+    ]
+    for points in cases:
+        loo = L._cps_leave_one_out(points, alpha=0.05, min_n=2,
+                                   full_mean=0.0)
+        for i, point in enumerate(points):
+            rest = points[:i] + points[i + 1:]
+            meta = L._cps_pool(rest, alpha=0.05, min_n=2,
+                               pair_detail_limit=0)
+            re_block = meta.get('random_effects') or {}
+            fe_block = meta.get('fixed_effect') or {}
+            expected = re_block.get('mean')
+            if expected is None:
+                expected = fe_block.get('mean')
+            got = loo[point['label']]['pooled_mean']
+            assert got is not None and expected is not None, (point, meta)
+            assert math.isclose(got, expected, rel_tol=1e-12), (
+                point['label'], got, expected)
+
+
+def test_exact_json_key_integer_does_not_round_through_float64():
+    # JSON object keys are strings.  A large exact key must remain the same
+    # integer identity, not the nearest float64 (2**53 + 1 used to become
+    # 2**53), and a key beyond the float exponent range must still parse.
+    assert A._exact_int(str(2 ** 53 + 1)) == 2 ** 53 + 1
+    assert A._exact_int(str(10 ** 400)) == 10 ** 400
+    # Integer-valued decimal spellings keep the historical acceptance;
+    # fractional / non-finite / boolean values are still not counts.
+    assert A._exact_int('1.0') == 1
+    assert A._exact_int('1e3') == 1000
+    for bad in ('1.5', 'nan', 'inf', None, True):
+        assert A._exact_int(bad) is None, bad
+
+
+def test_meta_analysis_mixed_subfloor_and_ordinary_effects_share_a_scale():
+    # A legitimate effect at 1e-200 must not be excluded merely because a
+    # sibling scale point has an ordinary magnitude.  Max-only normalisation
+    # left 1/se**2 over float64, so the tiny point became "non-estimable" and
+    # the pooled mean silently became the ordinary point.  Both points now
+    # enter the inverse-variance pool on one common work scale.
+    points = [
+        {'label': 'tiny', 'scale': 1.0, 'seeds': [0, 1],
+         'effects': [1e-200, 1.1e-200]},
+        {'label': 'ordinary', 'scale': 2.0, 'seeds': [0, 1],
+         'effects': [1.0, 1.1]},
+    ]
+    meta = L.meta_analyze_effects(points, min_seeds=2)
+    assert meta['n_usable'] == 2, meta
+    assert meta['non_estimable_points'] == [], meta
+    assert meta['zero_variance_points'] == [], meta
+    assert math.isclose(meta['fixed_effect']['mean'], 1.05e-200,
+                        rel_tol=1e-12), meta['fixed_effect']
+    assert math.isfinite(meta['fixed_effect']['se']), meta['fixed_effect']
+    json.dumps(meta, allow_nan=False)

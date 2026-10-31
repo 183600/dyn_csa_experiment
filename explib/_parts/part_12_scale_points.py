@@ -6,6 +6,14 @@
 # weights; 1e-75 keeps a safe margin while leaving ordinary inputs on the
 # established path.
 _EFFECT_SCALE_FLOOR = 1e-75
+# When a family mixes sub-floor effects with ordinary ones, normalising by the
+# maximum leaves the small point's SE below the weight domain (1/se**2 becomes
+# inf and the point is silently excluded from the pool).  Normalise that mixed
+# family so the largest WORK-scale effect is 1e150: then the smallest/largest
+# inverse-variance weight and their squares still fit float64 for the dynamic
+# range this helper is designed to admit (up to ~1e200), instead of dropping a
+# legitimate point for a units-only reason.
+_EFFECT_WORK_MAX = 1e150
 
 
 def _scale_points(points):
@@ -296,9 +304,27 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3,
     _effect_abs = [abs(float(e)) for p in pts for e in p['effects']]
     _effect_scale = max(_effect_abs, default=0.0)
     _effect_min_abs = min((a for a in _effect_abs if a > 0.0), default=0.0)
+    # Three regimes need a work scale: every effect below the floor, every
+    # effect above 1e100, and -- the case the first two miss -- a family that
+    # mixes sub-floor effects with ordinary/huge ones.  In the mixed regime a
+    # max-only scale still leaves the small SE below 1e-154, so 1/se**2
+    # overflows and the point is reported non-estimable even though both
+    # effects are legitimate.  Scale by max/1e150 instead, which centres the
+    # work range without changing any ordinary family's historical path.
+    _mixed_underflow = bool(
+        math.isfinite(_effect_scale) and _effect_scale > 0.0
+        and _effect_scale >= _EFFECT_SCALE_FLOOR
+        and 0.0 < _effect_min_abs < _EFFECT_SCALE_FLOOR)
     _scale_effects = bool(math.isfinite(_effect_scale) and _effect_scale > 0.0
                           and (_effect_scale < _EFFECT_SCALE_FLOOR
-                               or _effect_min_abs > 1e100))
+                               or _effect_min_abs > 1e100
+                               or _mixed_underflow))
+    if _mixed_underflow:
+        _effect_scale = float(_effect_scale / _EFFECT_WORK_MAX)
+        if not (math.isfinite(_effect_scale) and _effect_scale > 0.0):
+            # Only an extreme max could make the quotient unrepresentable;
+            # fall back to the historical max scale rather than divide by 0.
+            _effect_scale = max(_effect_abs, default=0.0)
 
     def _finite_or_none(value):
         try:
@@ -310,10 +336,14 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3,
     per = []
     for p in pts:
         _cached = _row_cache.get(p['label'])
-        if isinstance(_cached, dict):
+        if isinstance(_cached, dict) and not _scale_effects:
             # Per-point mean/SD/SE/CI depend only on this point and on
             # (alpha, min_seeds), not on which sibling points are in the
-            # current leave-one-out subset.
+            # current leave-one-out subset -- but ONLY while the family still
+            # uses the unscaled branch.  A cache built before an omission
+            # changed the family's work scale stores raw mean/SE values; this
+            # subset needs work-scale values, so the cached row would be
+            # rescaled a second time.  Recompute in that case.
             per.append(dict(_cached))
             continue
         d = np.asarray(p['effects'], dtype=float)

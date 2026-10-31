@@ -450,11 +450,49 @@ def _exact_int(value):
     Numeric strings are accepted here because JSON object *keys* are strings;
     a count read from a measurement field goes through :func:`_exact_count`,
     which rejects them.
+
+    String/key parsing must not round-trip through float64: a JSON key such as
+    ``"9007199254740993"`` (or a seed label with hundreds of digits) is an
+    exact integer identity, while ``float`` would return a different number or
+    raise for values beyond the exponent range.  Decimal parses the decimal
+    text exactly; integer-valued decimal spellings such as ``"1.0"`` keep the
+    historical acceptance, and fractional/NaN/Inf spellings stay rejected.
     """
     if value is None or isinstance(value, (bool, np.bool_)):
         return None
     if isinstance(value, numbers.Integral):
         return int(value)
+    import decimal as _decimal
+    if isinstance(value, (str, bytes, bytearray)):
+        try:
+            text = (value.decode('utf-8')
+                    if isinstance(value, (bytes, bytearray)) else value)
+            dec = _decimal.Decimal(text.strip())
+        except (_decimal.InvalidOperation, ValueError, UnicodeDecodeError):
+            return None
+        if not dec.is_finite():
+            return None
+        try:
+            integral = dec.to_integral_value()
+        except (_decimal.InvalidOperation, ValueError, OverflowError):
+            return None
+        return int(integral) if dec == integral else None
+    if not isinstance(value, numbers.Real):
+        # Decimal (and other exact numeric types outside numbers.Real) can be
+        # integral far beyond float64.  Parse their text exactly before the
+        # float fallback, which remains for ordinary Real values.
+        try:
+            dec = _decimal.Decimal(str(value))
+        except (_decimal.InvalidOperation, ValueError, TypeError):
+            dec = None
+        if dec is not None:
+            if not dec.is_finite():
+                return None
+            try:
+                integral = dec.to_integral_value()
+            except (_decimal.InvalidOperation, ValueError, OverflowError):
+                return None
+            return int(integral) if dec == integral else None
     try:
         number = float(value)
     except (TypeError, ValueError, OverflowError):
