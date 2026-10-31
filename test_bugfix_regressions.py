@@ -784,3 +784,57 @@ def test_pooled_order_rejects_seed_count_mismatch():
         L.pooled_order_inference_from_influence(
             [1.0, -1.0], [1.0, -1.0], delta_ppl=0.0,
             delta_log_ratio=0.0, seeds=[0, 1], n_seeds=3)
+
+
+def test_training_exposure_stays_total_and_json_safe_beyond_float64():
+    # A caller-supplied exact threshold must not disable the allocation guard:
+    # astronomically many draws must fall back to the explicit estimate rather
+    # than materialising a per-draw array.  A corpus beyond int64 cannot be
+    # replayed, and huge exact counts must not overflow the ratio conversions.
+    huge = L.training_window_exposure(
+        10 ** 400, 16, 1, 1, max_exact_draws=10 ** 18)
+    assert huge['exact'] is False
+    assert huge['coverage_quality'] == 'estimated'
+    assert 0 <= huge['unique_tokens'] <= huge['target_positions']
+    assert huge['start_coverage'] == 0.0
+    json.dumps(huge, allow_nan=False)
+
+    many = L.training_window_exposure(
+        10 ** 12, 4096, 1024, 10 ** 6, seed=2, max_exact_draws=10 ** 18)
+    assert many['exact'] is False
+    assert many['draws'] > L.TRAINING_EXPOSURE_HARD_MAX_DRAWS
+    assert many['unique_tokens'] <= many['target_positions']
+    json.dumps(many, allow_nan=False)
+
+    plan = L.training_coverage_budget(
+        10 ** 400, 4096, 1024, target_coverage=0.9, max_steps=10 ** 400)
+    assert plan['status'] == 'ok', plan
+    assert plan['expected_unique_fraction'] is not None
+    assert 0.0 <= plan['expected_unique_fraction'] <= 1.0
+    json.dumps(plan, allow_nan=False)
+
+
+def test_data_exposure_audit_replays_huge_exact_counts_and_run_seed():
+    block = L.training_window_exposure(
+        10 ** 400, 16, 1, 1, max_exact_draws=10 ** 18)
+    rec = {'variant': 'csa', 'seed': 0, 'steps': 1, 'steps_completed': 1,
+           'tokens_seen': block['processed_tokens'], 'data_seed': 0,
+           'distributed_world_size': 1, 'data_exposure': block}
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, 'summary.json')
+        with open(path, 'w', encoding='utf-8') as fh:
+            json.dump({'runs': [rec]}, fh)
+        with contextlib.redirect_stdout(io.StringIO()):
+            got = A.audit_data_exposure(path)
+    assert got['status'] == 'ok', got
+    assert got['n_replayed'] == 1
+
+    bad = dict(rec, seed=1)
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, 'summary.json')
+        with open(path, 'w', encoding='utf-8') as fh:
+            json.dump({'runs': [bad]}, fh)
+        with contextlib.redirect_stdout(io.StringIO()):
+            got = A.audit_data_exposure(path)
+    assert got['status'] == 'fail', got
+    assert any('record seed' in p for p in got['problems']), got['problems']

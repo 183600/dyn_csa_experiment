@@ -32,6 +32,12 @@ def _txa_int(value):
 def _txa_close(a, b):
     if isinstance(a, (bool, np.bool_)) or isinstance(b, (bool, np.bool_)):
         return False
+    # Counts such as draws/processed_tokens can legitimately exceed float64.
+    # Comparing two exact integers through float() would raise OverflowError
+    # (and make a self-consistent record fail); compare those exactly.
+    if (isinstance(a, (int, np.integer))
+            and isinstance(b, (int, np.integer))):
+        return int(a) == int(b)
     try:
         fa, fb = float(a), float(b)
     except (TypeError, ValueError, OverflowError):
@@ -214,10 +220,12 @@ def audit_data_exposure(path=None):
                             f'value {v!r}')
                         break
             max_exact = _txa_int(inputs.get('max_exact_draws'))
-            if max_exact is not None and not (0 <= max_exact <= 20_000_000):
+            # Any non-negative threshold is replayable: the core helper
+            # clamps a caller-supplied threshold at its own absolute hard cap
+            # before allocating the start array.
+            if max_exact is not None and max_exact < 0:
                 row['problems'].append(
-                    'inputs.max_exact_draws is outside the replayable range '
-                    '[0, 20000000]')
+                    'inputs.max_exact_draws must be non-negative')
         if row['problems']:
             out['problems'].extend(f'{name}: {x}' for x in row['problems'])
             continue
@@ -269,6 +277,13 @@ def audit_data_exposure(path=None):
                 row['problems'].append(
                     f'record distributed_world_size={stored_world} != exposure '
                     f'inputs.world_size={inputs["world_size"]}')
+        if rec.get('seed') is not None:
+            stored_run_seed = _txa_int(rec.get('seed'))
+            if (stored_run_seed is not None
+                    and stored_run_seed != inputs['seed']):
+                row['problems'].append(
+                    f'record seed={stored_run_seed} != exposure '
+                    f'inputs.seed={inputs["seed"]}')
         if rec.get('data_seed') is not None:
             stored_seed = _txa_int(rec.get('data_seed'))
             if (stored_seed is not None and inputs['data_seeds']

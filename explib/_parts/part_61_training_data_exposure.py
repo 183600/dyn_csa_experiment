@@ -27,6 +27,7 @@
 # the split loader executes fragments in the package globals, so one would
 # overwrite exp_lib.__doc__.
 
+import decimal as _tx_decimal
 import hashlib as _tx_hashlib
 import math as _tx_math
 
@@ -61,6 +62,13 @@ TRAINING_EXPOSURE_POLICY = {
 }
 
 TRAINING_EXPOSURE_STATUSES = ('ok', 'not_estimable')
+
+# A caller-supplied ``max_exact_draws`` is a policy threshold, not permission
+# to allocate an unbounded array.  The exact path materialises one start per
+# draw; the hard cap is therefore also an absolute memory guard for future
+# scale (20M int64 starts is already ~160 MB before ``unique``/``counts``).
+TRAINING_EXPOSURE_HARD_MAX_DRAWS = 20_000_000
+_TX_INT64_MAX = 2 ** 63 - 1
 
 
 def _tx_exact_pos_int(name, value, *, minimum=1):
@@ -99,6 +107,110 @@ def _tx_finite_fraction(name, value):
     return out
 
 
+def _tx_seed_int(name, value):
+    """One seed in the same domain ``batch_iter`` accepts.
+
+    The assembled module provides ``_seed_value`` (NumPy/PyTorch common seed
+    range).  The fallback keeps this fragment importable on its own without
+    silently widening the domain.
+    """
+    try:
+        return _seed_value(value, where=name)  # noqa: F821
+    except NameError:
+        return _tx_nonneg_int(name, value, maximum=2 ** 63 - 1)
+
+
+def _tx_ratio(num, den):
+    """``num/den`` as a float, or ``None`` when it is not representable.
+
+    Python's int/int true division scales operands first, so it does not
+    overflow merely because one side is a huge exact count.  A quotient that
+    genuinely exceeds float64 returns ``None`` instead of raising (or leaking
+    ``inf`` into a strict-JSON block).
+    """
+    try:
+        n, d = int(num), int(den)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if d <= 0 or n < 0:
+        return None
+    try:
+        return n / d
+    except OverflowError:
+        return None
+
+
+def _tx_scaled_int(count, fraction, *, rounding):
+    """``count * fraction`` rounded to an exact int, without float overflow.
+
+    The ordinary small-count path preserves the historical round/ceil result.
+    Huge exact counts are multiplied in ``Decimal`` so a 10**400-token corpus
+    yields an integer coverage estimate instead of raising in ``float()``.
+    """
+    count = int(count)
+    try:
+        fraction = float(fraction)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if count <= 0 or not _tx_math.isfinite(fraction) or fraction <= 0.0:
+        return 0
+    if fraction >= 1.0:
+        return count
+    if count <= 2 ** 53:
+        product = count * fraction
+        if rounding == _tx_decimal.ROUND_CEILING:
+            return int(_tx_math.ceil(product))
+        return int(round(product))
+    try:
+        with _tx_decimal.localcontext() as ctx:
+            ctx.prec = 60
+            product = _tx_decimal.Decimal(count) * _tx_decimal.Decimal(fraction)
+            return int(product.to_integral_value(rounding=rounding))
+    except (_tx_decimal.DecimalException, OverflowError, ValueError):
+        return None
+
+
+def _tx_ratio_fraction(num, den):
+    """``1 - exp(-num/den)`` for non-negative exact counts."""
+    try:
+        n, d = int(num), int(den)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if d <= 0 or n < 0:
+        return None
+    try:
+        ratio = n / d
+    except OverflowError:
+        return 1.0
+    if ratio <= 0.0:
+        return 0.0
+    # exp(-745) is below the smallest positive float64; for a larger ratio the
+    # coverage is exactly one at this precision.
+    if ratio > 745.0:
+        return 1.0
+    return -_tx_math.expm1(-ratio)
+
+
+def _tx_ceil_neglog_scaled(q, num, den):
+    """``ceil(-log1p(-q) * num / den)`` without float overflow."""
+    try:
+        return int(_tx_math.ceil(-_tx_math.log1p(-float(q))
+                                * float(num) / float(den)))
+    except (OverflowError, ValueError, ZeroDivisionError):
+        try:
+            with _tx_decimal.localcontext() as ctx:
+                ctx.prec = 60
+                factor = -(_tx_decimal.Decimal(1)
+                           - _tx_decimal.Decimal(float(q))).ln()
+                value = (factor * _tx_decimal.Decimal(int(num))
+                         / _tx_decimal.Decimal(int(den)))
+                return int(value.to_integral_value(
+                    rounding=_tx_decimal.ROUND_CEILING))
+        except (_tx_decimal.DecimalException, OverflowError, ValueError,
+                ZeroDivisionError):
+            return None
+
+
 def _tx_rank_seeds(seed, world_size, data_seeds=None):
     """Per-rank data seeds, exactly as the training loop derives them.
 
@@ -121,8 +233,7 @@ def _tx_rank_seeds(seed, world_size, data_seeds=None):
         if len(vals) != world_size:
             raise ValueError(
                 f'data_seeds has {len(vals)} entries but world_size={world_size}')
-        seeds = [_tx_nonneg_int('data_seeds[]', v, maximum=2 ** 63 - 1)
-                 for v in vals]
+        seeds = [_tx_seed_int('data_seeds[]', v) for v in vals]
         # Rank 0 is the run seed by construction; keeping the two echoes in
         # sync stops a hand edit from changing ``inputs.seed`` while leaving
         # the replayed stream bound to a different rank-0 seed.
@@ -138,8 +249,7 @@ def _tx_rank_seeds(seed, world_size, data_seeds=None):
     except NameError:
         fn = None
     if fn is not None:
-        return [_tx_nonneg_int('data_seed_for_rank', fn(seed, rank),
-                               maximum=2 ** 63 - 1)
+        return [_tx_seed_int('data_seed_for_rank', fn(seed, rank))
                 for rank in range(world_size)]
     # The canonical helper is always present in the assembled module; this
     # fallback keeps the primitive usable when the fragment is imported alone.
@@ -210,7 +320,24 @@ def training_window_exposure(n_tokens, seq_len, batch_size, steps, seed=0, *,
                  if (n_last_start + seq_len + 1) < 2 ** 31
                  else _tx_np.int64)
 
-    exact = int(draws) <= int(max_exact_draws)
+    # A caller-controlled threshold cannot disable the allocation guard, and
+    # an int64 replay cannot represent a corpus beyond 2**63.  Both are
+    # explicit estimate fallbacks: the block stays total and strict JSON
+    # instead of attempting an unbounded materialisation or raising deep in
+    # NumPy.
+    fallback_reasons = []
+    if int(draws) > int(max_exact_draws):
+        fallback_reasons.append(
+            f'draws={draws} exceeds max_exact_draws={int(max_exact_draws)}')
+    if int(draws) > TRAINING_EXPOSURE_HARD_MAX_DRAWS:
+        fallback_reasons.append(
+            f'draws={draws} exceeds the absolute exact-replay hard cap '
+            f'{TRAINING_EXPOSURE_HARD_MAX_DRAWS}')
+    if int(n_tokens) > _TX_INT64_MAX:
+        fallback_reasons.append(
+            f'n_tokens={n_tokens} exceeds the int64 window-start domain '
+            f'({_TX_INT64_MAX})')
+    exact = not fallback_reasons
     if exact:
         starts = _tx_draw_starts(n_last_start, steps, batch_size, seeds,
                                  idx_dtype).astype(_tx_np.int64, copy=False)
@@ -230,50 +357,59 @@ def training_window_exposure(n_tokens, seq_len, batch_size, steps, seed=0, *,
         # The exact union over millions of starts is still cheap, but an
         # unbounded array is not: mark the fallback explicitly rather than
         # silently returning a different estimand.
-        p_token = min(float(seq_len) / float(target_positions), 1.0)
-        frac_token = (1.0 if p_token >= 1.0
-                      else 1.0 - _tx_math.exp(draws * _tx_math.log1p(-p_token)))
-        unique_tokens = int(round(float(target_positions) * frac_token))
-        unique_tokens = max(0, min(unique_tokens, int(target_positions)))
-        p_start = min(1.0 / float(window_positions), 1.0)
-        frac_start = (1.0 if p_start >= 1.0
-                      else 1.0 - _tx_math.exp(draws * _tx_math.log1p(-p_start)))
-        unique_starts = int(round(float(window_positions) * frac_start))
-        unique_starts = max(0, min(unique_starts, int(window_positions), int(draws)))
+        if int(window_positions) == 1:
+            # Only one start exists, so every draw is that window; the exact
+            # answer is known even when the general Poisson fallback would
+            # understate a one-window (n_tokens=seq_len+1) corpus.
+            unique_starts = 1
+            unique_tokens = int(target_positions)
+        else:
+            frac_token = _tx_ratio_fraction(
+                int(draws) * int(seq_len), int(target_positions))
+            unique_tokens = _tx_scaled_int(
+                int(target_positions), frac_token,
+                rounding=_tx_decimal.ROUND_HALF_EVEN)
+            if unique_tokens is None:
+                unique_tokens = 0
+            unique_tokens = max(0, min(int(unique_tokens), int(target_positions)))
+            frac_start = _tx_ratio_fraction(int(draws), int(window_positions))
+            unique_starts = _tx_scaled_int(
+                int(window_positions), frac_start,
+                rounding=_tx_decimal.ROUND_HALF_EVEN)
+            if unique_starts is None:
+                unique_starts = 0
+            unique_starts = max(0, min(int(unique_starts), int(window_positions), int(draws)))
         # Rounding must not create a block where more distinct targets were
         # visited than target positions were drawn.
         unique_tokens = min(int(unique_tokens), int(processed_tokens))
         max_start_multiplicity = None
         coverage_quality = 'estimated'
         estimate_reason = (
-            f'draws={draws} exceeds max_exact_draws={int(max_exact_draws)}; '
-            'values use the Poisson independent-window approximation')
+            '; '.join(fallback_reasons)
+            + '; values use the Poisson independent-window approximation')
 
-    start_coverage = (float(unique_starts) / float(window_positions)
-                      if window_positions else 0.0)
-    token_coverage = (float(unique_tokens) / float(target_positions)
-                      if target_positions else 0.0)
-    unique_epochs = (float(unique_tokens) / float(target_positions)
-                     if target_positions else 0.0)
-    effective_epochs = (float(processed_tokens) / float(target_positions)
-                        if target_positions else 0.0)
-    reuse_factor = (float(processed_tokens) / float(unique_tokens)
+    start_coverage = _tx_ratio(unique_starts, window_positions)
+    token_coverage = _tx_ratio(unique_tokens, target_positions)
+    unique_epochs = _tx_ratio(unique_tokens, target_positions)
+    effective_epochs = _tx_ratio(processed_tokens, target_positions)
+    reuse_factor = (_tx_ratio(processed_tokens, unique_tokens)
                     if unique_tokens else None)
-    duplicate_token_fraction = (1.0 - float(unique_tokens) / float(processed_tokens)
-                                if processed_tokens else 0.0)
+    _duplicate = _tx_ratio(unique_tokens, processed_tokens)
+    duplicate_token_fraction = (1.0 - _duplicate
+                                if _duplicate is not None else 0.0)
     duplicate_token_fraction = max(0.0, min(1.0, duplicate_token_fraction))
-    start_collision_fraction = (1.0 - float(unique_starts) / float(draws)
-                                if draws else 0.0)
+    _collision = _tx_ratio(unique_starts, draws)
+    start_collision_fraction = (1.0 - _collision
+                                if _collision is not None else 0.0)
     start_collision_fraction = max(0.0, min(1.0, start_collision_fraction))
-    expected_draws_per_start = (float(draws) / float(window_positions)
-                                if window_positions else None)
+    expected_draws_per_start = _tx_ratio(draws, window_positions)
 
     warnings = []
-    if unique_epochs < 1.0:
+    if unique_epochs is not None and unique_epochs < 1.0:
         warnings.append(
             'fewer than one full corpus pass in unique prediction targets; '
             'tokens_seen counts repeated draws, not distinct data')
-    if token_coverage < 0.5:
+    if token_coverage is not None and token_coverage < 0.5:
         warnings.append(
             'less than half of the predictable token positions were visited '
             'at least once; the run is a partial-corpus exposure, not an epoch')
@@ -304,10 +440,14 @@ def training_window_exposure(n_tokens, seq_len, batch_size, steps, seed=0, *,
         'target_positions': int(target_positions),
         'unique_starts': int(unique_starts),
         'unique_tokens': int(unique_tokens),
-        'start_coverage': float(start_coverage),
-        'token_coverage': float(token_coverage),
-        'unique_epochs': float(unique_epochs),
-        'effective_epochs': float(effective_epochs),
+        'start_coverage': (0.0 if start_coverage is None
+                           else float(start_coverage)),
+        'token_coverage': (0.0 if token_coverage is None
+                           else float(token_coverage)),
+        'unique_epochs': (0.0 if unique_epochs is None
+                          else float(unique_epochs)),
+        'effective_epochs': (None if effective_epochs is None
+                             else float(effective_epochs)),
         'reuse_factor': (None if reuse_factor is None else float(reuse_factor)),
         'duplicate_token_fraction': float(duplicate_token_fraction),
         'start_collision_fraction': float(start_collision_fraction),
@@ -352,16 +492,50 @@ def training_coverage_budget(n_tokens, seq_len, batch_size, *, target_coverage,
             f'causal window, got n_tokens={n_tokens} seq_len={seq_len}')
     target_positions = n_tokens - 1
     window = min(int(seq_len), int(target_positions))
-    draws_needed = int(_tx_math.ceil(
-        -_tx_math.log1p(-q) * float(target_positions) / float(window)))
-    draws_needed = max(1, draws_needed)
-    steps_needed = int(_tx_math.ceil(
-        float(draws_needed) / float(int(batch_size) * int(world_size))))
-    expected_processed = int(steps_needed) * int(batch_size) * int(world_size) * int(seq_len)
-    expected_unique = int(_tx_math.ceil(float(target_positions) * (
-        1.0 - _tx_math.exp(-float(steps_needed * batch_size * world_size)
-                           * float(window) / float(target_positions)))))
-    expected_unique = max(0, min(expected_unique, int(target_positions)))
+    draws_needed = _tx_ceil_neglog_scaled(q, target_positions, window)
+    if draws_needed is None:
+        # The inverse is outside float64 and cannot even be expressed with
+        # the exact Decimal path (an astronomically large corpus).  Report the
+        # design as not achievable rather than raising or fabricating a plan.
+        return {
+            'kind': 'training_coverage_budget',
+            'schema': TRAINING_EXPOSURE_POLICY['schema'],
+            'status': 'not_estimable',
+            'reason': ('the required draw budget is not representable for this '
+                       'corpus size and target coverage'),
+            'target_coverage': float(q),
+            'n_tokens': int(n_tokens),
+            'seq_len': int(seq_len),
+            'batch_size': int(batch_size),
+            'world_size': int(world_size),
+            'target_positions': int(target_positions),
+            'expected_draws': None,
+            'expected_steps': None,
+            'expected_processed_tokens': None,
+            'expected_unique_tokens': None,
+            'expected_unique_fraction': None,
+            'achievable': False,
+            'method': 'poisson_independent_windows',
+            'exact': False,
+            'policy': TRAINING_EXPOSURE_POLICY['version'],
+            'boundary': (
+                'design estimate under with-replacement sampling; the budget '
+                'is beyond the representable range, so no plan is claimed'),
+        }
+    draws_needed = max(1, int(draws_needed))
+    per_step = int(batch_size) * int(world_size)
+    # Integer ceiling division: never route an exact step count through a
+    # float, which would overflow for a very large planned panel.
+    steps_needed = max(1, (int(draws_needed) + per_step - 1) // per_step)
+    expected_processed = int(steps_needed) * per_step * int(seq_len)
+    _frac = _tx_ratio_fraction(
+        int(steps_needed) * per_step * int(window), int(target_positions))
+    expected_unique = _tx_scaled_int(
+        int(target_positions), _frac,
+        rounding=_tx_decimal.ROUND_CEILING)
+    if expected_unique is None:
+        expected_unique = int(target_positions)
+    expected_unique = max(0, min(int(expected_unique), int(target_positions)))
     return {
         'kind': 'training_coverage_budget',
         'schema': TRAINING_EXPOSURE_POLICY['schema'],
@@ -376,7 +550,9 @@ def training_coverage_budget(n_tokens, seq_len, batch_size, *, target_coverage,
         'expected_steps': int(steps_needed),
         'expected_processed_tokens': int(expected_processed),
         'expected_unique_tokens': int(expected_unique),
-        'expected_unique_fraction': (float(expected_unique) / float(target_positions)),
+        'expected_unique_fraction': (0.0 if not target_positions
+                                     else _tx_ratio(expected_unique,
+                                                    target_positions)),
         'achievable': bool(steps_needed <= int(max_steps)),
         'method': 'poisson_independent_windows',
         'exact': False,
