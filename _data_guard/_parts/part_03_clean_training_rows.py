@@ -602,6 +602,28 @@ def _hash_row_block(width, cap):
     return max(1, min(int(cap), _HASH_BLOCK_BYTES // max(1, 8 * int(width))))
 
 
+def _canonical_nan_block(block_f):
+    """Collapse every NaN payload in a float64 block to one identity.
+
+    IEEE-754 permits many NaN bit patterns.  They are all the same
+    missing-like value in :func:`_row_keys` and :func:`duplicate_mask`, so the
+    content digest must not depend on which payload a producer happened to
+    write.  Without this step a native float array hashes its raw NaN bits
+    while the object path hashes the scalar's canonical float image, making the
+    same table fingerprint differently by storage dtype (and making two
+    all-NaN tables differ only by payload).  ``block_f`` can be a view of the
+    caller's array, so copy before writing.
+    """
+    if block_f.size == 0:
+        return block_f
+    nan = np.isnan(block_f)
+    if not nan.any():
+        return block_f
+    out = block_f.copy()
+    out[nan] = np.nan
+    return out
+
+
 def _matrix_fingerprint(X):
     """Content fingerprint of a 1-D/2-D table, preserving integer precision.
 
@@ -737,6 +759,7 @@ def _matrix_fingerprint(X):
             _rows = block.tolist()
             parsed = [_row_float_exact(row) for row in _rows]
             block_f = np.asarray([p[0] for p in parsed], dtype=np.float64)
+            block_f = _canonical_nan_block(block_f)
             if np.any(block_f == 0.0):
                 block_f = block_f.copy()
                 block_f[block_f == 0.0] = 0.0
@@ -786,6 +809,11 @@ def _matrix_fingerprint(X):
             # native temporal dtype and in an object column would fingerprint
             # differently even though `_row_keys` says they are one identity.
             block_f = np.full(block_f.shape, np.nan, dtype=np.float64)
+        elif arr.dtype.kind == 'f':
+            # Integer/bool blocks cannot contain a NaN, and the temporal block
+            # above is already the canonical NaN image; only native floats
+            # need the payload normalisation (and the extra O(block) scan).
+            block_f = _canonical_nan_block(block_f)
         if np.any(block_f == 0.0):
             block_f = block_f.copy()
             block_f[block_f == 0.0] = 0.0

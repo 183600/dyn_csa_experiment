@@ -30,7 +30,14 @@ Each test pins one concrete defect found by inspection:
   lengths/rates differ;
 * event counters, metadata counts, compute-control medians and reproduction
   counts were still round-tripped through float64, and an exact ``Fraction``
-  count beyond float64 could raise ``OverflowError`` instead of comparing.
+  count beyond float64 could raise ``OverflowError`` instead of comparing;
+* the content fingerprint hashed the raw NaN payload bits of native float
+  arrays, while duplicate detection (and the object/string paths) treat every
+  NaN spelling as one missing-like value, so the same table could fingerprint
+  differently by storage dtype and payload alone;
+* the exact training-exposure replay buffered one array per step before
+  concatenating, so with ``batch_size=1`` the draw cap did not bound memory
+  (a permitted 20M-draw replay could hold 20M tiny ndarrays).
 
 These are CPU-only, zero-experiment checks.
 """
@@ -814,6 +821,42 @@ def test_training_exposure_stays_total_and_json_safe_beyond_float64():
     json.dumps(plan, allow_nan=False)
 
 
+def test_training_exposure_replays_multirank_stream_without_step_buffering(
+        monkeypatch):
+    # The replay must preserve the per-step RNG stream and rank concatenation
+    # order, but must not buffer one array per step: with batch_size=1 that
+    # makes the draw cap a poor memory bound (20M tiny arrays).  Fill one
+    # output array instead, as verified here by forbidding concatenate.
+    seeds = [0, L.data_seed_for_rank(0, 1), L.data_seed_for_rank(0, 2)]
+    got = L._tx_draw_starts(99, 7, 3, seeds, np.int32)
+    expected = []
+    for s in seeds:
+        rng = np.random.default_rng(int(s))
+        for _ in range(7):
+            expected.extend(rng.integers(0, 100, size=3,
+                                         dtype=np.int32).tolist())
+    assert got.dtype == np.int32
+    assert got.tolist() == expected
+
+    class _NoConcatNumpy:
+        # Patch only the replay's module-level numpy reference.  Patching
+        # numpy.concatenate globally would also break NumPy's own RNG seeding.
+        def __getattr__(self, name):
+            if name == 'concatenate':
+                raise AssertionError(
+                    'exact replay must not buffer step arrays')
+            return getattr(np, name)
+
+    monkeypatch.setattr(L, '_tx_np', _NoConcatNumpy())
+    again = L._tx_draw_starts(99, 7, 3, seeds, np.int32)
+    assert again.tolist() == expected
+
+    # A single draw still yields the one-element stream (the empty guard is
+    # not allowed to drop a valid step).
+    one = L._tx_draw_starts(0, 1, 1, [0], np.int32)
+    assert one.tolist() == [0]
+
+
 def test_data_exposure_audit_replays_huge_exact_counts_and_run_seed():
     block = L.training_window_exposure(
         10 ** 400, 16, 1, 1, max_exact_draws=10 ** 18)
@@ -864,6 +907,40 @@ def test_native_and_object_temporal_matrices_share_a_content_fingerprint():
     ns_obj = np.array([[np.datetime64('2020-01-01T00:00:00.000000001',
                                       'ns')]], dtype=object)
     assert DG._matrix_fingerprint(ns) == DG._matrix_fingerprint(ns_obj)
+
+
+def test_nan_payloads_do_not_change_the_content_fingerprint():
+    # IEEE-754 has many NaN bit patterns.  _row_keys/duplicate_mask already
+    # treat them as one missing-like identity, so the content digest must too;
+    # otherwise ``np.array([[nan]])`` and ``np.array([[nan]], dtype=object)``
+    # fingerprint differently and two all-NaN tables differ only by payload.
+    def _nan64(bits):
+        return np.array([bits], dtype=np.uint64).view(np.float64)[0]
+
+    def _nan32(bits):
+        return np.array([bits], dtype=np.uint32).view(np.float32)[0]
+
+    nan_a = _nan64(0x7FF8000000000001)
+    nan_b = _nan64(0x7FF8000000000002)
+    assert math.isnan(nan_a) and math.isnan(nan_b)
+    assert DG._row_keys(np.array([[nan_a]]))[0] == \
+        DG._row_keys(np.array([[nan_b]]))[0]
+    assert DG.duplicate_mask(np.array([[nan_a], [nan_b]])).tolist() == \
+        [False, True]
+    fp_a = DG._matrix_fingerprint(np.array([[nan_a]]))
+    assert fp_a == DG._matrix_fingerprint(np.array([[nan_b]]))
+    assert fp_a == DG._matrix_fingerprint(np.array([[nan_a]], dtype=object))
+    assert fp_a == DG._matrix_fingerprint(np.array([[None]], dtype=object))
+    # The same payload concern exists for the narrower native dtypes (the
+    # float64 conversion preserves a payload that the object path canonicalises).
+    nan32_a = _nan32(0x7FC00001)
+    nan32_b = _nan32(0x7FC00002)
+    assert DG._matrix_fingerprint(np.array([[nan32_a]])) == \
+        DG._matrix_fingerprint(np.array([[nan32_b]]))
+    assert DG._matrix_fingerprint(np.array([[nan32_a]])) == \
+        DG._matrix_fingerprint(np.array([[nan32_a]], dtype=object))
+    # Missing is still distinct from an ordinary finite value.
+    assert fp_a != DG._matrix_fingerprint(np.array([[1.0]]))
 
 
 def test_paired_effect_stats_does_not_claim_an_overflowing_sd_is_noise():

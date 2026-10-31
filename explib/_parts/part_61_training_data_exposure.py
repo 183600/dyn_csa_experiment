@@ -269,18 +269,26 @@ def _tx_draw_starts(n_windows_minus_one, steps, batch_size, data_seeds,
     int64 are not interchangeable in NumPy, so the dtype rule is copied too.
     """
     high = int(n_windows_minus_one) + 1
-    chunks = []
+    batch_size = int(batch_size)
+    steps = int(steps)
+    total = int(len(data_seeds)) * steps * batch_size
+    if total <= 0:
+        return _tx_np.empty(0, dtype=idx_dtype)
+    # Allocate the final array once and fill it in draw order.  Buffering one
+    # array per step (the obvious list+concatenate form) makes the declared
+    # draw cap a poor memory bound: with batch_size=1, 20M allowed draws would
+    # put 20M tiny ndarrays in a Python list before the final 160MB array.
+    # The RNG call sequence (one ``integers`` per step, same high/dtype) and
+    # the concatenated order are unchanged.
+    out = _tx_np.empty(total, dtype=idx_dtype)
+    offset = 0
     for seed in data_seeds:
         rng = _tx_np.random.default_rng(int(seed))
-        parts = []
-        for _ in range(int(steps)):
-            parts.append(rng.integers(0, high, size=int(batch_size),
-                                      dtype=idx_dtype))
-        if parts:
-            chunks.append(_tx_np.concatenate(parts))
-    if not chunks:
-        return _tx_np.empty(0, dtype=idx_dtype)
-    return (chunks[0] if len(chunks) == 1 else _tx_np.concatenate(chunks))
+        for _ in range(steps):
+            out[offset:offset + batch_size] = rng.integers(
+                0, high, size=batch_size, dtype=idx_dtype)
+            offset += batch_size
+    return out
 
 
 def training_window_exposure(n_tokens, seq_len, batch_size, steps, seed=0, *,
