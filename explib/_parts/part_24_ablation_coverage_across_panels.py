@@ -1,5 +1,6 @@
 
-def ablation_coverage_across_panels(reports, design=None, *, verbose=False):
+def ablation_coverage_across_panels(reports, design=None, *, verbose=False,
+                                   pair_detail_limit=1024):
     """Project-level view of ablation completeness.
 
     A single-panel audit answers "is this innovation complete HERE?".  The
@@ -45,7 +46,9 @@ def ablation_coverage_across_panels(reports, design=None, *, verbose=False):
     These labels never change the p values or the project-level usefulness
     gate; they only stop repeated draws from being reported as independent
     replication.  A powered but non-significant opposite mean is reported as a
-    warning, not counted as a corrected contradiction."""
+    warning, not counted as a corrected contradiction.  ``pair_detail_limit``
+    bounds the quadratic per-pair replication detail while keeping the
+    aggregate label identical (``None`` restores the complete map)."""
     design = ABLATION_DESIGN if design is None else design
     out = {'status': 'ok', 'components': {}, 'complete_anywhere': [],
            'usable_anywhere': [], 'verified_anywhere': [], 'measured_anywhere': [],
@@ -62,6 +65,16 @@ def ablation_coverage_across_panels(reports, design=None, *, verbose=False):
         out['status'] = 'warn'
         out['warnings'].append('reports must be a {panel: methodology_audit} mapping')
         return out
+    # A mixed int/str panel mapping made `sorted(reports)` raise during the
+    # project-level roll-up.  JSON labels are strings; normalise once so the
+    # per-component rows and the synthesis block use the same names.
+    reports = {str(k): _normalise_component_report(v)
+               for k, v in reports.items()}
+    if not isinstance(design, dict):
+        out['status'] = 'warn'
+        out['warnings'].append('design must be a mapping of component -> contrasts')
+        return out
+    design = {str(k): v for k, v in design.items()}
     for comp in design:
         row = {'panels_complete': [], 'panels_measured': [],
                'panels_verified': [], 'panels_verified_raw': [],
@@ -163,7 +176,8 @@ def ablation_coverage_across_panels(reports, design=None, *, verbose=False):
                 _draws_present = True
             else:
                 _draws[_name] = {}
-        _ind = replication_independence_audit(_draws)
+        _ind = replication_independence_audit(
+            _draws, pair_detail_limit=pair_detail_limit)
         row['replication_independence'] = _ind
         if _ind.get('status') == 'independent_replication':
             row['panels_independently_replicated'] = list(
@@ -334,6 +348,56 @@ def ablation_coverage_across_panels(reports, design=None, *, verbose=False):
                  ', '.join(out['missing_everywhere']) or 'none'))
     return out
 
+
+def _normalise_component_report(rep):
+    """Return a report whose component-keyed fields use string labels.
+
+    JSON object keys are strings, but an in-memory report may still use an
+    integer/other key for a component.  Returning the original object when
+    every key is already a string keeps ordinary reports allocation-free.
+    """
+    if not isinstance(rep, dict):
+        return rep
+    out = dict(rep)
+    changed = False
+
+    def _mapping(value):
+        nonlocal changed
+        if isinstance(value, dict) and any(not isinstance(k, str) for k in value):
+            changed = True
+            return {str(k): v for k, v in value.items()}
+        return value
+
+    def _sequence(value):
+        nonlocal changed
+        if isinstance(value, (list, tuple, set)) and any(
+                not isinstance(x, str) for x in value):
+            changed = True
+            return [str(x) for x in value]
+        return value
+
+    if 'components' in rep:
+        out['components'] = _mapping(rep.get('components'))
+    for _field in ('verified_components', 'unverified_components',
+                   'measured_components', 'direction_conflict_components',
+                   'practically_harmful_components'):
+        if _field in rep:
+            out[_field] = _sequence(rep.get(_field))
+    _abl = rep.get('ablation_completeness')
+    if isinstance(_abl, dict):
+        _abl_out = dict(_abl)
+        for _field in ('components', 'missing_arms'):
+            if _field in _abl:
+                _abl_out[_field] = _mapping(_abl.get(_field))
+        for _field in ('complete_components', 'incomplete_components'):
+            if _field in _abl:
+                _abl_out[_field] = _sequence(_abl.get(_field))
+        out['ablation_completeness'] = _abl_out
+    if 'component_draws' in rep:
+        out['component_draws'] = _mapping(rep.get('component_draws'))
+    return out if changed else rep
+
+
 _COMPONENT_DRAW_FP_FIELDS = ('val_fp', 'eval_fp', 'holdout_row_fp',
                              'data_fp', 'corpus_fp')
 
@@ -427,7 +491,7 @@ def _draws_overlap(a, b):
     return bool(set(a) & set(b))
 
 
-def replication_independence_audit(panels):
+def replication_independence_audit(panels, *, pair_detail_limit=None):
     """Classify whether verified panels are independent replications.
 
     ``panels`` maps panel name -> a :func:`component_draw_identity` dict (or a
@@ -444,7 +508,19 @@ def replication_independence_audit(panels):
     ``new_seeds_same_evaluation``, ``new_seeds_unverified_evaluation``,
     ``shared_training_draws``, ``unattested`` or ``insufficient_panels``.
     This is a labelling/diagnostic gate, not a new hypothesis test.
+
+    ``pair_detail_limit`` bounds the quadratic per-pair detail (``pairs`` and
+    the four pair-name lists) for a large panel family.  The status,
+    ``n_pairs`` and ``panels_*`` membership are still computed over every
+    pair; ``None`` keeps the historical complete output.
     """
+    _detail_limit = (None if pair_detail_limit is None
+                     else _as_seed_int(pair_detail_limit))
+    if pair_detail_limit is not None and (
+            _detail_limit is None or _detail_limit < 0):
+        raise ValueError(
+            'pair_detail_limit must be None or a non-negative integer, got '
+            f'{pair_detail_limit!r}')
     if not isinstance(panels, dict):
         return {'status': 'unattested', 'n_panels': 0, 'n_pairs': 0,
                 'pairs': {}, 'independent_pairs': [], 'new_seed_pairs': [],
@@ -475,10 +551,17 @@ def replication_independence_audit(panels):
                            'bad_seed': _bad_seed, 'fps': fps,
                            'code_values': _codes,
                            'train_knobs_values': _knobs}
-    pairs, independent, new_seed, shared, unattested = {}, [], [], [], []
+    pairs = {}
+    independent_names, new_seed_names = [], []
+    shared_names, unattested_names = [], []
+    panels_ind, panels_new, panels_shared = set(), set(), set()
+    shared_seed_values = set()
+    has_independent = has_new_seed = has_shared = has_unattested = False
+    n_pairs = 0
     names = sorted(norm)
     for i, a in enumerate(names):
         for b in names[i + 1:]:
+            n_pairs += 1
             A, B = norm[a], norm[b]
             sa, sb = A['seeds'], B['seeds']
             seed_overlap = (sorted(set(sa) & set(sb))
@@ -509,7 +592,27 @@ def replication_independence_audit(panels):
                 tier = 'independent_replication'
             else:
                 tier = 'new_seeds_unverified_evaluation'
-            pairs[f'{a}|{b}'] = {
+            # Aggregate state is always computed over every pair; only the
+            # quadratic detail is bounded.  This keeps the status/panels_*
+            # verdict identical while a large panel family does not allocate
+            # one full record per pair.
+            if tier == 'independent_replication':
+                has_independent = True
+                panels_ind.update((a, b))
+            elif tier in ('new_seeds_same_evaluation',
+                          'new_seeds_unverified_evaluation'):
+                has_new_seed = True
+                panels_new.update((a, b))
+            elif tier == 'shared_training_draws':
+                has_shared = True
+                panels_shared.update((a, b))
+                shared_seed_values.update(seed_overlap or ())
+            else:
+                has_unattested = True
+            if _detail_limit is not None and len(pairs) >= _detail_limit:
+                continue
+            key = f'{a}|{b}'
+            pairs[key] = {
                 'panel_a': a, 'panel_b': b, 'tier': tier,
                 'seed_overlap': seed_overlap,
                 'seed_disjoint': bool(seed_disjoint),
@@ -523,19 +626,19 @@ def replication_independence_audit(panels):
                                                  B['train_knobs_values']),
             }
             if tier == 'independent_replication':
-                independent.append(pairs[f'{a}|{b}'])
+                independent_names.append(key)
             elif tier in ('new_seeds_same_evaluation',
                           'new_seeds_unverified_evaluation'):
-                new_seed.append(pairs[f'{a}|{b}'])
+                new_seed_names.append(key)
             elif tier == 'shared_training_draws':
-                shared.append(pairs[f'{a}|{b}'])
+                shared_names.append(key)
             else:
-                unattested.append(pairs[f'{a}|{b}'])
-    if independent:
+                unattested_names.append(key)
+    if has_independent:
         status = 'independent_replication'
-    elif new_seed:
+    elif has_new_seed:
         status = 'new_seeds_only'
-    elif shared:
+    elif has_shared:
         status = 'shared_training_draws'
     elif len(norm) < 2:
         status = 'insufficient_panels'
@@ -546,7 +649,7 @@ def replication_independence_audit(panels):
         warnings.append(
             'verified panels share training seeds (%s); this is repeated '
             'measurement of the same draws, not independent replication'
-            % ', '.join(map(str, sorted({s for p in shared for s in (p['seed_overlap'] or [])}))))
+            % ', '.join(map(str, sorted(shared_seed_values))))
     elif status == 'new_seeds_only':
         warnings.append(
             'verified panels use disjoint training seeds but share or do not '
@@ -555,21 +658,25 @@ def replication_independence_audit(panels):
     elif status == 'unattested':
         warnings.append('panel draw identities are missing or incomplete; '
                         'replication independence is unattested')
-    return {
-        'status': status, 'n_panels': len(norm), 'n_pairs': len(pairs),
+    out = {
+        'status': status, 'n_panels': len(norm), 'n_pairs': int(n_pairs),
         'pairs': pairs,
-        'independent_pairs': [f'{p["panel_a"]}|{p["panel_b"]}' for p in independent],
-        'new_seed_pairs': [f'{p["panel_a"]}|{p["panel_b"]}' for p in new_seed],
-        'shared_seed_pairs': [f'{p["panel_a"]}|{p["panel_b"]}' for p in shared],
-        'unattested_pairs': [f'{p["panel_a"]}|{p["panel_b"]}' for p in unattested],
-        'panels_independent': sorted({p['panel_a'] for p in independent}
-                                     | {p['panel_b'] for p in independent}),
-        'panels_new_seeds': sorted({p['panel_a'] for p in new_seed}
-                                   | {p['panel_b'] for p in new_seed}),
-        'panels_shared_seeds': sorted({p['panel_a'] for p in shared}
-                                      | {p['panel_b'] for p in shared}),
+        'independent_pairs': independent_names,
+        'new_seed_pairs': new_seed_names,
+        'shared_seed_pairs': shared_names,
+        'unattested_pairs': unattested_names,
+        'panels_independent': sorted(panels_ind),
+        'panels_new_seeds': sorted(panels_new),
+        'panels_shared_seeds': sorted(panels_shared),
         'warnings': warnings,
     }
+    if _detail_limit is not None and n_pairs > len(pairs):
+        out.update({
+            'pair_details_truncated': True,
+            'pair_detail_limit': int(_detail_limit),
+            'pair_detail_note': ('per-pair detail is capped for a large panel '
+                                 'family; status and panels_* use every pair')})
+    return out
 
 
 def _baseline_artifact_path(name, outdir=None):

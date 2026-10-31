@@ -245,7 +245,10 @@ def _scale_corpus_binding(pts):
     return out
 
 
-def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
+def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3,
+                         _seed_pair_detail_limit=None,
+                         _prevalidated_points=False,
+                         _point_row_cache=None):
     """跨规模的随机效应元分析（DerSimonian-Laird）+ 异质性诊断。
 
     输入是**已经无量纲化**的逐种子效应（通常来自
@@ -255,13 +258,35 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
     关键口径：不同规模估计的不是同一个总体参数。只有异质性不显著
     （I² 低、Q 的 p>=alpha）且点数足够时才把 pooled 当作「共同效应」；
     否则 `poolable=False`，pooled 只作描述性摘要，结论必须按规模分开报。
+
+    ``_seed_pair_detail_limit`` is an internal scale guard for callers that
+    replay this analysis once per omitted panel: the per-pair common-seed map
+    is quadratic in the number of points, while the pooled estimate and the
+    dependence classification only need the aggregate overlap.  ``0`` skips
+    the pair map, ``None`` keeps the historical complete map, and a positive
+    integer reports the first N pairs (with explicit truncation metadata).
+
+    ``_prevalidated_points``/``_point_row_cache`` are an internal fast path for
+    leave-one-out replay: the caller validates the full family once and reuses
+    the per-point mean/SD/SE rows for each subset.  The cache is only used
+    when the effects are ordinary magnitudes (no work-scale normalisation), so
+    an omitted extreme point cannot change the scale of the cached rows.
     """
     alpha = _validated_alpha(alpha, context='meta_analyze_effects alpha')
     _min_seeds = _as_seed_int(min_seeds)
     if _min_seeds is None or _min_seeds < 0:
         raise ValueError(f'min_seeds must be a non-negative integer, got {min_seeds!r}')
     min_seeds = _min_seeds
-    pts = _scale_points(points)
+    _pair_limit = (None if _seed_pair_detail_limit is None
+                   else _as_seed_int(_seed_pair_detail_limit))
+    if _seed_pair_detail_limit is not None and (
+            _pair_limit is None or _pair_limit < 0):
+        raise ValueError(
+            'seed_pair_detail_limit must be None or a non-negative integer, '
+            f'got {_seed_pair_detail_limit!r}')
+    pts = list(points) if _prevalidated_points else _scale_points(points)
+    _row_cache = (_point_row_cache if isinstance(_point_row_cache, dict)
+                  else {})
     labels = [p['label'] for p in pts]
     if len(set(labels)) != len(labels):
         # Two rows with the same label are two estimates of the SAME scale
@@ -284,6 +309,13 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
 
     per = []
     for p in pts:
+        _cached = _row_cache.get(p['label'])
+        if isinstance(_cached, dict):
+            # Per-point mean/SD/SE/CI depend only on this point and on
+            # (alpha, min_seeds), not on which sibling points are in the
+            # current leave-one-out subset.
+            per.append(dict(_cached))
+            continue
         d = np.asarray(p['effects'], dtype=float)
         n = int(d.size)
         row = {'label': p['label'], 'scale': p['scale'], 'n': n,
@@ -554,20 +586,40 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
     if _all_seed_declared and len(_measured_pts) >= 2:
         _seed_sets = [(p['label'], set(p['seeds'])) for p in _measured_pts]
         _common_all = sorted(set.intersection(*(s for _l, s in _seed_sets)), key=str)
+        # A seed appearing in >=2 points proves that at least one pair shares
+        # a training draw; counting is linear in the total seed list and does
+        # not need the quadratic pair map.  `per_pair_common_seeds` is kept
+        # only as display detail (and capped for large families).
+        _seed_use = {}
+        for _l, _s in _seed_sets:
+            for _x in _s:
+                _seed_use[_x] = int(_seed_use.get(_x, 0)) + 1
+        _any_pair_overlap = any(_c > 1 for _c in _seed_use.values())
         _pairs = {}
-        _any_pair_overlap = False
-        for _i in range(len(_seed_sets)):
-            for _j in range(_i + 1, len(_seed_sets)):
-                _li, _si = _seed_sets[_i]
-                _lj, _sj = _seed_sets[_j]
-                _n_ov = len(_si & _sj)
-                _pairs[f'{_li}|{_lj}'] = _n_ov
-                _any_pair_overlap = _any_pair_overlap or bool(_n_ov)
+        _n_pairs = len(_seed_sets) * (len(_seed_sets) - 1) // 2
+        if _pair_limit != 0:
+            for _i in range(len(_seed_sets)):
+                if _pair_limit is not None and len(_pairs) >= _pair_limit:
+                    break
+                for _j in range(_i + 1, len(_seed_sets)):
+                    _li, _si = _seed_sets[_i]
+                    _lj, _sj = _seed_sets[_j]
+                    _pairs[f'{_li}|{_lj}'] = len(_si & _sj)
+                    if _pair_limit is not None and len(_pairs) >= _pair_limit:
+                        break
         _seed_overlap.update({
             'per_pair_common_seeds': _pairs,
             'common_seeds_all_points': _common_all,
             'n_common_seeds_all_points': len(_common_all),
             'any_pair_overlap': bool(_any_pair_overlap)})
+        if _pair_limit is not None and _n_pairs > len(_pairs):
+            _seed_overlap.update({
+                'per_pair_common_seeds_truncated': True,
+                'n_pairs': int(_n_pairs),
+                'pair_detail_limit': int(_pair_limit),
+                'pair_detail_note': ('per-pair common-seed detail is capped; '
+                                     'the pooled estimate and dependence '
+                                     'classification use the aggregate overlap')})
         if _paired_common and _paired_common.get('status') == 'ok':
             out['seed_dependence'] = 'shared_seeds_paired'
             _dependence_note = ('the inverse-variance pooled CI assumes the scale '

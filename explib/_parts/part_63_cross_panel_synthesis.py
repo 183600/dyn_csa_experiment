@@ -42,6 +42,13 @@ class _CrossPanelSynthesisError(ValueError):
     """A contrast cannot enter the synthesis; the message is the reason."""
 
 
+# Per-pair detail is quadratic in the number of panels.  The claim/status
+# computation still uses every pair; only the rendered detail is capped.
+# A caller may override it with policy['max_pair_details'] without changing
+# the declared synthesis policy itself.
+CROSS_PANEL_SYNTHESIS_MAX_PAIR_DETAILS = 1024
+
+
 def _cps_number(value, name, *, positive=False):
     """Finite float for a synthesis input; bool/str are not measurements."""
     if isinstance(value, (bool, np.bool_, str, bytes, bytearray)) or value is None:
@@ -57,6 +64,38 @@ def _cps_number(value, name, *, positive=False):
     return out
 
 
+def _cps_finite_or_none(value):
+    """Finite float for display, else None (strict-JSON safe)."""
+    if isinstance(value, (bool, np.bool_, str, bytes, bytearray)) or value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _cps_in_names(value, name):
+    """Whether ``name`` is listed in a report's component-name sequence."""
+    if not isinstance(value, (list, tuple, set, frozenset)):
+        return False
+    try:
+        return str(name) in {str(x) for x in value}
+    except (TypeError, ValueError):
+        return False
+
+
+def _cps_sign_or_none(value):
+    """-1/0/1 declaration only; booleans/strings are not measurements."""
+    if isinstance(value, (bool, np.bool_, str, bytes, bytearray)) or value is None:
+        return None
+    try:
+        number = _as_seed_int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return int(number) if number in (-1, 0, 1) else None
+
+
 def _cps_entry_effect(entry):
     """Per-seed relative effect for one controlled contrast entry.
 
@@ -65,6 +104,11 @@ def _cps_entry_effect(entry):
     from the recorded deltas, and the recorded aggregate is cross-checked
     instead of trusted: a stale `relative_effect_pct` would silently change
     the synthesis input while every derived number stayed self-consistent.
+
+    Every reported number is a finite measurement (or ``None`` when the
+    original-unit SD/SE is not representable).  A relative effect that
+    overflows float64 is not a measurement either: the panel is excluded with
+    a named reason instead of leaking ``inf`` into a strict-JSON report.
     """
     if not isinstance(entry, dict):
         raise _CrossPanelSynthesisError('contrast entry is not an object')
@@ -96,11 +140,37 @@ def _cps_entry_effect(entry):
             'subset, not a full panel)')
     without_mean = _cps_number(entry.get('without_mean'), 'without_mean',
                                positive=True)
-    effects = [100.0 * v / without_mean for v in vals]
+    effects = []
+    for i, v in enumerate(vals):
+        # Divide before multiplying by 100: 100*1e308 overflows even when the
+        # final relative effect (1e308/1e10*100) is representable.
+        effect = (v / without_mean) * 100.0
+        if not math.isfinite(effect):
+            raise _CrossPanelSynthesisError(
+                f'deltas[{i}]/without_mean is not representable as a finite '
+                'relative effect')
+        effects.append(float(effect))
     n = len(effects)
-    mean = float(np.mean(effects))
-    sd = float(np.std(effects, ddof=1)) if n > 1 else None
-    se = float(sd / math.sqrt(n)) if sd is not None and math.isfinite(sd) else None
+    # `np.mean`/`np.std` square deviations and sum the vector.  Finite inputs
+    # near the float limit (or far below sqrt(tiny)) can therefore report
+    # inf/zero for a real spread.  Reuse the repository's scaled helper; an
+    # SD/SE that still cannot be represented in the input unit is withheld as
+    # None, not emitted as Infinity.
+    _arr = np.asarray(effects, dtype=float)
+    _ms = _scaled_mean_std_if_extreme(_arr, ddof=1) if n > 1 else None
+    if _ms is not None:
+        mean, sd = float(_ms[0]), float(_ms[1])
+    else:
+        mean = float(np.mean(_arr))
+        sd = float(np.std(_arr, ddof=1)) if n > 1 else None
+    mean = _cps_finite_or_none(mean)
+    if mean is None:
+        raise _CrossPanelSynthesisError(
+            'relative effect mean is not representable as a finite number')
+    sd = _cps_finite_or_none(sd)
+    se = (float(sd / math.sqrt(n))
+          if sd is not None and n > 1 else None)
+    se = _cps_finite_or_none(se)
     recorded = entry.get('relative_effect_pct')
     if recorded is not None:
         rec = _cps_number(recorded, 'relative_effect_pct')
@@ -111,19 +181,36 @@ def _cps_entry_effect(entry):
     out = {'effects': [float(x) for x in effects], 'seeds': [int(s) for s in seeds],
            'n': int(n), 'mean': mean, 'sd': sd, 'se': se,
            'without_mean': without_mean, 'complete_pairs': True}
-    for key in ('with', 'without', 'kind', 'predicted_sign', 'observed_sign',
-                'direction_consistent', 'capacity_confounded', 'param_controlled',
-                'param_capacity_controlled', 'p_exact_signflip', 'seed_driven',
-                'practical_decision'):
+    for key in ('with', 'without', 'kind'):
         if key in entry:
             out[key] = entry.get(key)
+    if 'practical_decision' in entry and entry.get('practical_decision') is not None:
+        _pd = entry.get('practical_decision')
+        out['practical_decision'] = _pd if isinstance(_pd, str) else str(_pd)
+    if 'predicted_sign' in entry:
+        out['predicted_sign'] = _cps_sign_or_none(entry.get('predicted_sign'))
+    if 'observed_sign' in entry:
+        out['observed_sign'] = _cps_sign_or_none(entry.get('observed_sign'))
+    for key in ('direction_consistent', 'capacity_confounded',
+                'param_controlled', 'param_capacity_controlled', 'seed_driven'):
+        if key in entry:
+            out[key] = (None if entry.get(key) is None
+                        else bool(entry.get(key)))
+    if 'p_exact_signflip' in entry:
+        out['p_exact_signflip'] = _cps_finite_or_none(
+            entry.get('p_exact_signflip'))
     return out
 
 
-def _cps_pool(points, *, alpha, min_n):
+def _cps_pool(points, *, alpha, min_n, pair_detail_limit=None,
+              _prevalidated_points=False, _point_row_cache=None):
     """Run the shared meta-analysis, returning a status instead of raising."""
     try:
-        meta = meta_analyze_effects(points, alpha=alpha, min_seeds=min_n)
+        meta = meta_analyze_effects(
+            points, alpha=alpha, min_seeds=min_n,
+            _seed_pair_detail_limit=pair_detail_limit,
+            _prevalidated_points=_prevalidated_points,
+            _point_row_cache=_point_row_cache)
     except (TypeError, ValueError, OverflowError) as exc:
         return {'status': 'not_estimable', 'poolable': False,
                 'reason': f'{type(exc).__name__}: {exc}'}
@@ -132,7 +219,9 @@ def _cps_pool(points, *, alpha, min_n):
     return meta
 
 
-def _cps_claim(meta, *, direction_ok, independence_status, corpus_ok):
+def _cps_claim(meta, *, direction_ok, independence_status, corpus_ok,
+               n_panels=None, min_panels=3,
+               i2_ceiling_percent=50.0, q_alpha=0.10):
     """Decide whether a cross-panel common effect may be claimed.
 
     Separate from `meta.poolable` because the latter is about heterogeneity
@@ -151,6 +240,39 @@ def _cps_claim(meta, *, direction_ok, independence_status, corpus_ok):
         reasons.append('the declared direction is not uniform across panels')
     if corpus_ok is not True:
         reasons.append('corpus/tokenizer identity is not shared')
+    _n_ok = True
+    if n_panels is not None:
+        _n = _as_seed_int(n_panels)
+        if _n is None or _n < int(min_panels):
+            _n_ok = False
+            reasons.append(
+                f'fewer than {int(min_panels)} pooled panels '
+                f'({n_panels!r})')
+    # `meta.poolable` is the historical default gate (I2<=50, Q p>=alpha).
+    # A caller may declare a stricter synthesis policy; the claim must obey
+    # that policy too, otherwise a contrast labelled `heterogeneous` could
+    # still carry `claim_allowed=True`.
+    _het_ok = True
+    _het = meta.get('heterogeneity') or {}
+    if meta.get('status') == 'ok':
+        _i2 = _cps_finite_or_none(_het.get('I2_percent'))
+        if _i2 is None and _het.get('I2_percent') is not None:
+            _het_ok = False
+            reasons.append('I2 is not a finite heterogeneity measurement')
+        elif _i2 is not None and _i2 > float(i2_ceiling_percent):
+            _het_ok = False
+            reasons.append(
+                f'I2={_i2:.6g}% exceeds the synthesis ceiling '
+                f'{float(i2_ceiling_percent):.6g}%')
+        _qp = _cps_finite_or_none(_het.get('p'))
+        if _qp is None and _het.get('p') is not None:
+            _het_ok = False
+            reasons.append('Q p-value is not a finite heterogeneity measurement')
+        elif _qp is not None and _qp < float(q_alpha):
+            _het_ok = False
+            reasons.append(
+                f'Q p={_qp:.6g} is below the synthesis heterogeneity floor '
+                f'{float(q_alpha):.6g}')
     dep = meta.get('seed_dependence')
     if dep == 'disjoint_seed_sets':
         if independence_status == 'independent_replication':
@@ -183,6 +305,8 @@ def _cps_claim(meta, *, direction_ok, independence_status, corpus_ok):
     allowed = (meta.get('poolable') is True
                and direction_ok is True
                and corpus_ok is True
+               and _n_ok is True
+               and _het_ok is True
                and dep in ('disjoint_seed_sets', 'shared_seeds_paired')
                and (dep != 'disjoint_seed_sets'
                     or independence_status in ('independent_replication',
@@ -198,12 +322,44 @@ def _cps_leave_one_out(points, *, alpha, min_n, full_mean):
     out = {}
     if len(points) < 2:
         return out
-    for i, p in enumerate(points):
-        rest = points[:i] + points[i + 1:]
+    # Validate the family once and reuse each point's mean/SD/SE row across
+    # the k subsets.  Re-running full validation and per-point NumPy reductions
+    # for every omission made this O(k^2) in a large per-seed payload.  The
+    # row cache is only valid without work-scale normalisation (ordinary
+    # magnitudes), because an omitted extreme point can change the scale.
+    _work_points = points
+    _row_cache = {}
+    _prevalidated = False
+    try:
+        _validated = _scale_points(points)
+        _effect_abs = [abs(float(e)) for _p in _validated
+                       for e in _p['effects']]
+        _effect_max = max(_effect_abs, default=0.0)
+        _effect_min = min((a for a in _effect_abs if a > 0.0), default=0.0)
+        _needs_scale = bool(math.isfinite(_effect_max) and _effect_max > 0.0
+                            and (_effect_max < _EFFECT_SCALE_FLOOR
+                                 or _effect_min > 1e100))
+        _work_points = _validated
+        _prevalidated = True
+        if not _needs_scale:
+            _full = _cps_pool(_validated, alpha=alpha, min_n=min_n,
+                              pair_detail_limit=0, _prevalidated_points=True)
+            if isinstance(_full.get('per_point'), list):
+                _row_cache = {r['label']: r for r in _full['per_point']
+                              if isinstance(r, dict) and 'label' in r}
+    except Exception:
+        _work_points = points
+        _row_cache = {}
+        _prevalidated = False
+    for i, p in enumerate(_work_points):
+        rest = _work_points[:i] + _work_points[i + 1:]
         if len(rest) < 2:
             out[str(p.get('label'))] = {'status': 'insufficient_panels'}
             continue
-        meta = _cps_pool(rest, alpha=alpha, min_n=min_n)
+        meta = _cps_pool(rest, alpha=alpha, min_n=min_n,
+                         pair_detail_limit=0,
+                         _prevalidated_points=_prevalidated,
+                         _point_row_cache=_row_cache)
         mean = None
         if meta.get('status') == 'ok':
             re_block = meta.get('random_effects') or {}
@@ -211,10 +367,12 @@ def _cps_leave_one_out(points, *, alpha, min_n, full_mean):
             mean = re_block.get('mean')
             if mean is None:
                 mean = fe_block.get('mean')
+            mean = _cps_finite_or_none(mean)
         out[str(p.get('label'))] = {
             'status': meta.get('status'),
             'pooled_mean': mean,
-            'same_sign_as_full': (None if mean is None or full_mean in (None, 0.0)
+            'same_sign_as_full': (None if mean is None
+                                  or _cps_finite_or_none(full_mean) in (None, 0.0)
                                   else bool(float(mean) * float(full_mean) > 0.0)),
             'poolable': meta.get('poolable'),
         }
@@ -238,7 +396,8 @@ def _cps_selection_readout(points, rows, *, alpha, min_n, predicted_sign):
         out['status'] = 'not_estimable'
         out['reason'] = 'fewer than two verified panels'
         return out
-    meta = _cps_pool(verified, alpha=alpha, min_n=min_n)
+    meta = _cps_pool(verified, alpha=alpha, min_n=min_n,
+                     pair_detail_limit=0)
     out['status'] = meta.get('status')
     out['poolable'] = meta.get('poolable')
     out['heterogeneity'] = meta.get('heterogeneity')
@@ -246,28 +405,33 @@ def _cps_selection_readout(points, rows, *, alpha, min_n, predicted_sign):
     fe_block = meta.get('fixed_effect') or {}
     out['random_effects'] = re_block
     out['fixed_effect'] = fe_block
-    verified_mean = re_block.get('mean')
+    verified_mean = _cps_finite_or_none(re_block.get('mean'))
     if verified_mean is None:
-        verified_mean = fe_block.get('mean')
-    all_meta = _cps_pool(points, alpha=alpha, min_n=min_n)
-    all_mean = ((all_meta.get('random_effects') or {}).get('mean')
+        verified_mean = _cps_finite_or_none(fe_block.get('mean'))
+    all_meta = _cps_pool(points, alpha=alpha, min_n=min_n,
+                         pair_detail_limit=0)
+    all_mean = (_cps_finite_or_none(
+                    (all_meta.get('random_effects') or {}).get('mean'))
                 if all_meta.get('status') == 'ok' else None)
     if all_mean is None and all_meta.get('status') == 'ok':
-        all_mean = (all_meta.get('fixed_effect') or {}).get('mean')
+        all_mean = _cps_finite_or_none(
+            (all_meta.get('fixed_effect') or {}).get('mean'))
     if verified_mean is not None and all_mean is not None:
         # A "benefit" is positive when the effect has the declared sign; the
         # reported effect is signed with-without, so multiply by the sign.
-        sign = predicted_sign if predicted_sign in (-1, 1) else None
-        if sign is not None:
+        sign = _cps_sign_or_none(predicted_sign)
+        if sign in (-1, 1):
             benefit_all = sign * float(all_mean)
             benefit_verified = sign * float(verified_mean)
             out['benefit_all_panels'] = benefit_all
             out['benefit_verified_only'] = benefit_verified
-            out['verified_minus_all_benefit'] = benefit_verified - benefit_all
+            difference = _cps_finite_or_none(benefit_verified - benefit_all)
+            out['verified_minus_all_benefit'] = difference
             out['verified_only_more_favourable'] = bool(
                 benefit_verified > benefit_all)
         else:
-            out['verified_minus_all_effect'] = float(verified_mean) - float(all_mean)
+            out['verified_minus_all_effect'] = _cps_finite_or_none(
+                float(verified_mean) - float(all_mean))
     return out
 
 
@@ -318,13 +482,39 @@ def cross_panel_synthesis(reports, design=None, *, alpha=0.05, min_n=3,
         raise ValueError('policy.i2_ceiling_percent must be >= 0')
     if not (0.0 < _q_alpha < 1.0):
         raise ValueError('policy.q_alpha must be in (0, 1)')
+    _raw_max_pair_details = policy.get(
+        'max_pair_details', CROSS_PANEL_SYNTHESIS_MAX_PAIR_DETAILS)
+    if _raw_max_pair_details is None:
+        _max_pair_details = None
+    else:
+        _max_pair_details = _as_seed_int(_raw_max_pair_details)
+        if _max_pair_details is None or _max_pair_details < 0:
+            raise ValueError(
+                'policy.max_pair_details must be None or a non-negative integer')
     if design is None:
         design = ABLATION_DESIGN
     if not isinstance(design, dict):
         raise ValueError('design must be a mapping of component -> contrast list')
+    # JSON object keys are strings, and a mixed int/str panel mapping made
+    # `sorted(reports)` raise before any analysis.  Normalise the public
+    # boundary once so every downstream label/audit lookup uses the same key.
+    design = {str(k): v for k, v in design.items()}
     if not isinstance(reports, dict):
         reports = {}
-    wanted = set(components) if components is not None else set(design)
+    else:
+        reports = {str(k): _normalise_component_report(v)
+                   for k, v in reports.items()}
+    if components is None:
+        wanted = set(design)
+    elif isinstance(components, (str, bytes, bytearray)):
+        wanted = {str(components)}
+    else:
+        try:
+            wanted = {str(c) for c in components}
+        except TypeError:
+            raise ValueError(
+                'components must be an iterable of names or a single name, '
+                f'got {type(components).__name__}') from None
     out = {'kind': 'cross_panel_synthesis',
            'status': 'not_verifiable_locally',
            'policy': policy, 'alpha': float(alpha), 'min_n': int(min_n),
@@ -339,7 +529,9 @@ def cross_panel_synthesis(reports, design=None, *, alpha=0.05, min_n=3,
         out['reason'] = 'no panel reports were supplied'
         return out
     any_measured = False
-    for comp in sorted(str(c) for c in design if c in wanted):
+    for comp in sorted(design):
+        if comp not in wanted:
+            continue
         contrasts = design.get(comp) or []
         comp_block = {'contrasts': {}, 'status': 'not_measured'}
         # (with, without) -> list of (panel, entry)
@@ -348,7 +540,10 @@ def cross_panel_synthesis(reports, design=None, *, alpha=0.05, min_n=3,
             rep = reports.get(panel)
             if not isinstance(rep, dict):
                 continue
-            entries = (rep.get('components') or {}).get(comp)
+            _comp_map = rep.get('components')
+            if not isinstance(_comp_map, dict):
+                continue
+            entries = _comp_map.get(comp)
             if not isinstance(entries, (list, tuple)):
                 continue
             for entry in entries:
@@ -380,9 +575,11 @@ def cross_panel_synthesis(reports, design=None, *, alpha=0.05, min_n=3,
                 continue
             any_measured = True
             entries = []
+            _panel_counts = {}
+            for panel, _entry in rows:
+                _panel_counts[panel] = int(_panel_counts.get(panel, 0)) + 1
             for panel, entry in rows:
-                same = [x for x in rows if x[0] == panel]
-                if len(same) > 1:
+                if _panel_counts.get(panel, 0) > 1:
                     block['excluded'][panel] = (
                         'duplicate contrast entries for the same arm pair in '
                         'one panel')
@@ -398,24 +595,28 @@ def cross_panel_synthesis(reports, design=None, *, alpha=0.05, min_n=3,
                     continue
                 eff['panel'] = panel
                 rep = reports.get(panel) or {}
-                eff['verified'] = bool(comp in (rep.get('verified_components') or []))
+                eff['verified'] = _cps_in_names(
+                    rep.get('verified_components'), comp)
+                _abl = rep.get('ablation_completeness')
                 eff['incomplete_ablation'] = bool(
-                    comp in ((rep.get('ablation_completeness') or {})
-                             .get('incomplete_components') or []))
-                eff['direction_conflict'] = bool(
-                    comp in (rep.get('direction_conflict_components') or []))
-                eff['practically_harmful'] = bool(
-                    comp in (rep.get('practically_harmful_components') or []))
-                draws = (rep.get('component_draws') or {}).get(comp)
+                    isinstance(_abl, dict) and _cps_in_names(
+                        _abl.get('incomplete_components'), comp))
+                eff['direction_conflict'] = _cps_in_names(
+                    rep.get('direction_conflict_components'), comp)
+                eff['practically_harmful'] = _cps_in_names(
+                    rep.get('practically_harmful_components'), comp)
+                _draw_map = rep.get('component_draws')
+                draws = (_draw_map.get(comp)
+                         if isinstance(_draw_map, dict) else None)
                 if isinstance(draws, dict):
                     # Only the identity fields the independence audit consumes
                     # are retained; a verbatim copy would bloat every report
                     # with the full per-panel record.
-                    eff['draws'] = {
+                    eff['draws'] = _json_clean({
                         k: draws.get(k) for k in
                         ('seeds', 'val_fps', 'eval_fps', 'holdout_row_fps',
                          'code_values', 'train_knobs_values', 'corpus_fps')
-                        if k in draws}
+                        if k in draws})
                 else:
                     eff['draws'] = {}
                 entries.append(eff)
@@ -436,15 +637,38 @@ def cross_panel_synthesis(reports, design=None, *, alpha=0.05, min_n=3,
             if len(entries) < 2:
                 block['status'] = 'insufficient_panels'
                 block['reasons'].append('a cross-panel synthesis needs >=2 panels')
-            # Direction: pooling signed effects across opposite declarations
-            # would average two different hypotheses.
+            # Corpus identity: one corpus_fp per included panel, shared across
+            # panels.  A panel with several corpora inside one contrast is not
+            # a single study and is excluded rather than averaged.
+            corpus_fps = []
+            _kept_entries = []
+            for e in entries:
+                fps = sorted({_draw_value(x) for x in
+                              _identity_values(e['draws'].get('corpus_fps'))
+                              if isinstance(x, str) and x.strip()})
+                if len(fps) > 1:
+                    block['excluded'][e['panel']] = (
+                        'panel contrast spans multiple corpus fingerprints')
+                    block['panels'].pop(e['panel'], None)
+                    continue
+                _kept_entries.append(e)
+                corpus_fps.append(fps[0] if fps else None)
+            # `list.remove` compares by value: two panels can have identical
+            # contrast entries but different draw identities, and removing
+            # one would silently delete the other panel.  Keep the filter
+            # index-aligned with the entries it actually retains.
+            entries = _kept_entries
+            # Direction is a property of the panels that actually enter the
+            # pool.  Recompute it after corpus exclusions: an excluded panel
+            # with a missing/opposite declaration must not veto (or supply)
+            # the direction of the surviving family.
             preds = sorted({e.get('predicted_sign') for e in entries
                             if e.get('predicted_sign') in (-1, 0, 1)},
                            key=str)
             pred_missing = any(e.get('predicted_sign') not in (-1, 0, 1)
                                for e in entries)
-            direction_ok = (not pred_missing and len(preds) == 1
-                            and preds[0] in (-1, 1))
+            direction_ok = (bool(entries) and not pred_missing
+                            and len(preds) == 1 and preds[0] in (-1, 1))
             block['direction'] = {
                 'predicted_signs': preds,
                 'missing_or_invalid': bool(pred_missing),
@@ -452,21 +676,6 @@ def cross_panel_synthesis(reports, design=None, *, alpha=0.05, min_n=3,
                 'note': ('one declared direction is required; 0/None means the '
                          'hypothesis did not declare one'),
             }
-            # Corpus identity: one corpus_fp per included panel, shared across
-            # panels.  A panel with several corpora inside one contrast is not
-            # a single study and is excluded rather than averaged.
-            corpus_fps = []
-            for e in list(entries):
-                fps = sorted({_draw_value(x) for x in
-                              _identity_values(e['draws'].get('corpus_fps'))
-                              if isinstance(x, str) and x.strip()})
-                if len(fps) > 1:
-                    block['excluded'][e['panel']] = (
-                        'panel contrast spans multiple corpus fingerprints')
-                    entries.remove(e)
-                    block['panels'].pop(e['panel'], None)
-                    continue
-                corpus_fps.append(fps[0] if fps else None)
             if entries:
                 corpus_ok = (all(x is not None for x in corpus_fps)
                              and len(set(corpus_fps)) == 1)
@@ -489,7 +698,8 @@ def cross_panel_synthesis(reports, design=None, *, alpha=0.05, min_n=3,
                        'complete_pairs': True}
                       for i, e in enumerate(entries)]
             block['meta_input'] = {'points': points}
-            meta = _cps_pool(points, alpha=alpha, min_n=min_n)
+            meta = _cps_pool(points, alpha=alpha, min_n=min_n,
+                             pair_detail_limit=_max_pair_details)
             block['meta'] = {
                 'status': meta.get('status'),
                 'fixed_effect': meta.get('fixed_effect'),
@@ -515,11 +725,16 @@ def cross_panel_synthesis(reports, design=None, *, alpha=0.05, min_n=3,
             # Panel dependence: component_draws are optional; missing identity
             # is unattested, never independent.
             draws = {e['panel']: e['draws'] for e in entries}
-            ind = replication_independence_audit(draws)
+            ind = replication_independence_audit(
+                draws, pair_detail_limit=_max_pair_details)
             block['independence'] = ind
             claim = _cps_claim(meta, direction_ok=direction_ok,
                                independence_status=ind.get('status'),
-                               corpus_ok=corpus_ok)
+                               corpus_ok=corpus_ok,
+                               n_panels=len(entries),
+                               min_panels=_min_panels,
+                               i2_ceiling_percent=_i2_cap,
+                               q_alpha=_q_alpha)
             block['claim_allowed'] = claim['claim_allowed']
             block['evidence_tier'] = claim['evidence_tier']
             block['reasons'].extend(claim['reasons'])
@@ -539,10 +754,12 @@ def cross_panel_synthesis(reports, design=None, *, alpha=0.05, min_n=3,
                 block['reasons'].append(
                     'at least one panel is capacity-confounded; the synthesis is '
                     'a system-level effect, not a matched-capacity mechanism effect')
-            full_mean = ((meta.get('random_effects') or {}).get('mean')
-                         if meta.get('random_effects') else None)
+            full_mean = _cps_finite_or_none(
+                (meta.get('random_effects') or {}).get('mean')
+                if meta.get('random_effects') else None)
             if full_mean is None:
-                full_mean = (meta.get('fixed_effect') or {}).get('mean')
+                full_mean = _cps_finite_or_none(
+                    (meta.get('fixed_effect') or {}).get('mean'))
             block['leave_one_panel_out'] = _cps_leave_one_out(
                 points, alpha=alpha, min_n=min_n, full_mean=full_mean)
             if block['leave_one_panel_out']:

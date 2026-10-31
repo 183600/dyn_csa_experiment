@@ -1399,6 +1399,9 @@ def student_t_two_sided_p(t, df):
     return float(min(1.0, 2.0 * sf))
 
 
+import functools
+
+
 def _t_critical(conf, df):
     """双侧置信区间的 t 临界值；用二分求解，避免依赖 scipy。
 
@@ -1407,9 +1410,19 @@ def _t_critical(conf, df):
     high confidence or small/fractional df (e.g. df=0.5, conf=0.99), which
     made the reported CI too narrow and could flip a TOST equivalence or a
     coverage decision.
+
+    The bisection is pure and repeat calls dominate leave-one-out/replay
+    analyses (the same ``df`` is evaluated once per omitted panel).  Cache it
+    by the validated float arguments so a large panel family does not spend
+    its time recomputing the same critical value.
     """
     if not (0.0 < conf < 1.0) or not (df > 0.0):
         return float('nan')
+    return _t_critical_cached(float(conf), float(df))
+
+
+@functools.lru_cache(maxsize=8192)
+def _t_critical_cached(conf, df):
     target = (1.0 - conf) / 2.0
     lo, hi = 0.0, 1.0
     for _ in range(1100):

@@ -123,9 +123,24 @@ def audit_panel_synthesis(path=None):
     try:
         alpha = float(alpha)
         min_n = int(min_n)
+        _min_panels = int(policy.get('min_panels_for_pooled_claim', 3))
+        _i2_cap = float(policy.get('i2_ceiling_percent', 50.0))
+        _q_alpha = float(policy.get('q_alpha', 0.10))
+        _raw_max_pair_details = policy.get(
+            'max_pair_details',
+            getattr(L, 'CROSS_PANEL_SYNTHESIS_MAX_PAIR_DETAILS', 1024))
+        _max_pair_details = (None if _raw_max_pair_details is None
+                             else int(_raw_max_pair_details))
     except (TypeError, ValueError, OverflowError):
         out['status'] = 'fail'
         out['problems'].append('the synthesis policy alpha/min_n is malformed')
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return out
+    if (_min_panels < 1
+            or (_max_pair_details is not None and _max_pair_details < 0)
+            or not (0.0 < _q_alpha < 1.0) or _i2_cap < 0.0):
+        out['status'] = 'fail'
+        out['problems'].append('the synthesis policy bounds are malformed')
         print(json.dumps(out, ensure_ascii=False, indent=2))
         return out
     forbidden = {'confirmed', 'p_holm', 'verdict', 'decision'}
@@ -142,6 +157,8 @@ def audit_panel_synthesis(path=None):
         return out
     poolable_declared = set(block.get('poolable_components') or [])
     poolable_actual = set()
+    status_by_comp = {}
+    selection_by_comp = set()
     for comp, cb in comps.items():
         if not isinstance(cb, dict):
             continue
@@ -156,6 +173,7 @@ def audit_panel_synthesis(path=None):
                 out['n_fail'] += 1
                 continue
             status = b.get('status')
+            status_by_comp.setdefault(str(comp), []).append(status)
             if status in ('not_measured', 'not_estimable',
                           'refused_direction_mismatch'):
                 # Nothing was pooled; only check that no fabricated pooled
@@ -163,6 +181,39 @@ def audit_panel_synthesis(path=None):
                 if b.get('claim_allowed') is True:
                     out['problems'].append(
                         f'{label}: a non-poolable contrast claims a common effect')
+                if status == 'not_measured' and (
+                        b.get('meta_input') or b.get('panels')
+                        or b.get('leave_one_panel_out')):
+                    out['problems'].append(
+                        f'{label}: status=not_measured while pooled evidence is '
+                        'present')
+                if status == 'not_estimable' and isinstance(b.get('meta'), dict) \
+                        and b['meta'].get('status') == 'ok':
+                    out['problems'].append(
+                        f'{label}: status=not_estimable while the stored meta '
+                        'block is estimable')
+                if status == 'not_estimable' and not isinstance(b.get('meta'), dict):
+                    # A deleted meta block must not turn a replayable pool into
+                    # an unverifiable skip.  If the input points are present,
+                    # replay them; an estimable replay contradicts the status.
+                    _skip_points = ((b.get('meta_input') or {}).get('points')
+                                    if isinstance(b.get('meta_input'), dict)
+                                    else None)
+                    if isinstance(_skip_points, list) and _skip_points:
+                        try:
+                            _skip_meta = L.meta_analyze_effects(
+                                _skip_points, alpha=alpha, min_seeds=min_n,
+                                _seed_pair_detail_limit=_max_pair_details)
+                        except Exception as exc:
+                            out['problems'].append(
+                                f'{label}: skipped meta replay failed '
+                                f'({type(exc).__name__}: {exc})')
+                        else:
+                            if _skip_meta.get('status') == 'ok':
+                                out['problems'].append(
+                                    f'{label}: status=not_estimable but the '
+                                    'recorded points replay to an estimable '
+                                    'meta-analysis')
                 if status == 'refused_direction_mismatch' and not (
                         isinstance(b.get('direction'), dict)
                         and b['direction'].get('consistent') is False):
@@ -216,8 +267,9 @@ def audit_panel_synthesis(path=None):
                 out['n_fail'] += 1
                 continue
             try:
-                meta = L.meta_analyze_effects(points, alpha=alpha,
-                                              min_seeds=min_n)
+                meta = L.meta_analyze_effects(
+                    points, alpha=alpha, min_seeds=min_n,
+                    _seed_pair_detail_limit=_max_pair_details)
             except Exception as exc:
                 out['problems'].append(
                     f'{label}: meta-analysis replay failed '
@@ -257,7 +309,8 @@ def audit_panel_synthesis(path=None):
             draws = {str(pt.get('label')): (panels.get(str(pt.get('label'))) or {}).get('draws')
                      for pt in points}
             try:
-                ind2 = L.replication_independence_audit(draws)
+                ind2 = L.replication_independence_audit(
+                    draws, pair_detail_limit=_max_pair_details)
             except Exception as exc:
                 out['problems'].append(
                     f'{label}: independence replay failed '
@@ -268,32 +321,114 @@ def audit_panel_synthesis(path=None):
                 out['problems'].extend(
                     f'{label}/independence: {x}' for x in
                     _ps_compare(ind, ind2, path=f'{label}/independence'))
-            claim = L._cps_claim(meta,
-                                 direction_ok=direction.get('consistent') is True,
-                                 independence_status=ind2.get('status'),
-                                 corpus_ok=corpus.get('shared') is True)
-            if bool(b.get('claim_allowed')) != bool(claim.get('claim_allowed')):
+            # Recompute the direction/corpus gates from the recorded panel
+            # rows/points instead of trusting the booleans the claim reads.
+            _preds = sorted({row.get('predicted_sign')
+                             for row in panels.values()
+                             if isinstance(row, dict)
+                             and row.get('predicted_sign') in (-1, 0, 1)},
+                            key=str)
+            _pred_missing = any(
+                row.get('predicted_sign') not in (-1, 0, 1)
+                for row in panels.values() if isinstance(row, dict))
+            _direction_ok = (not _pred_missing and len(_preds) == 1
+                             and _preds[0] in (-1, 1))
+            _corpus_fps = [pt.get('corpus_fp') for pt in points]
+            _corpus_ok = (bool(_corpus_fps)
+                          and all(isinstance(x, str) and x.strip()
+                                  for x in _corpus_fps)
+                          and len(set(_corpus_fps)) == 1)
+            if isinstance(b.get('direction'), dict):
+                _dir_problems = []
+                _stored_preds = direction.get('predicted_signs')
+                if not isinstance(_stored_preds, (list, tuple, set)):
+                    _dir_problems.append('predicted_signs (not a list)')
+                elif sorted(_stored_preds, key=str) != _preds:
+                    _dir_problems.append('predicted_signs')
+                if bool(direction.get('missing_or_invalid')) != bool(_pred_missing):
+                    _dir_problems.append('missing_or_invalid')
+                if bool(direction.get('consistent')) != bool(_direction_ok):
+                    _dir_problems.append('consistent')
+                if _dir_problems:
+                    out['problems'].append(
+                        f'{label}: direction record does not match the panel '
+                        f'predicted signs ({_dir_problems})')
+            if isinstance(b.get('corpus'), dict):
+                _corpus_problems = []
+                if bool(corpus.get('shared')) != bool(_corpus_ok):
+                    _corpus_problems.append('shared')
+                _stored_fps = corpus.get('fps')
+                if not isinstance(_stored_fps, (list, tuple)):
+                    _corpus_problems.append('fps (not a list)')
+                elif len(_stored_fps) != len(_corpus_fps):
+                    _corpus_problems.append('fps length')
+                elif list(_stored_fps) != _corpus_fps:
+                    _corpus_problems.append('fps values')
+                if _corpus_problems:
+                    out['problems'].append(
+                        f'{label}: corpus record does not match the point '
+                        f'fingerprints ({_corpus_problems})')
+            claim = L._cps_claim(
+                meta,
+                direction_ok=_direction_ok,
+                independence_status=ind2.get('status'),
+                corpus_ok=_corpus_ok,
+                n_panels=len(points),
+                min_panels=_min_panels,
+                i2_ceiling_percent=_i2_cap,
+                q_alpha=_q_alpha)
+            # Conflict/harmful flags also veto the claim in the producer.
+            _conflict = any(bool((panels.get(str(pt.get('label'))) or {})
+                                 .get('direction_conflict'))
+                            for pt in points)
+            _harmful = any(bool((panels.get(str(pt.get('label'))) or {})
+                                .get('practically_harmful'))
+                           for pt in points)
+            _claim_final = bool(claim.get('claim_allowed')) and not (
+                _conflict or _harmful)
+            if bool(b.get('claim_allowed')) != _claim_final:
                 out['problems'].append(
                     f'{label}: claim_allowed {b.get("claim_allowed")!r} != '
-                    f'recomputed {claim.get("claim_allowed")!r}')
+                    f'recomputed {_claim_final!r}')
             if b.get('evidence_tier') != claim.get('evidence_tier'):
                 out['problems'].append(
                     f'{label}: evidence_tier {b.get("evidence_tier")!r} != '
                     f'recomputed {claim.get("evidence_tier")!r}')
-            # The status is a function of heterogeneity + claim; do not let a
-            # failed claim be relabelled `poolable`.
-            if b.get('status') == 'poolable':
-                poolable_actual.add(str(comp))
-                if not claim.get('claim_allowed'):
-                    out['problems'].append(
-                        f'{label}: status=poolable while the claim gate refuses')
-            if b.get('status') == 'poolable' and not meta.get('poolable'):
+            # The status is a function of heterogeneity + claim; replay that
+            # function instead of accepting the stored label.
+            _het = meta.get('heterogeneity') or {}
+            _i2 = _finite_number(_het.get('I2_percent'))
+            _qp = _finite_number(_het.get('p'))
+            _het_fires = (
+                (_i2 is not None and _i2 > _i2_cap)
+                or (_qp is not None and _qp < _q_alpha))
+            if _het_fires:
+                _expected_status = 'heterogeneous'
+            elif _claim_final:
+                _expected_status = 'poolable'
+            elif len(points) < _min_panels:
+                _expected_status = 'insufficient_panels'
+            elif claim.get('evidence_tier') in (
+                    'paired_same_seeds', 'shared_seeds_unpaired',
+                    'new_seeds_shared_evaluation', 'unattested_evaluation',
+                    'unattested'):
+                _expected_status = 'dependent_draws'
+            else:
+                _expected_status = 'not_poolable'
+            if status != _expected_status:
                 out['problems'].append(
-                    f'{label}: status=poolable while meta poolable is false')
+                    f'{label}: status {status!r} != replayed '
+                    f'{_expected_status!r}')
+            if status == 'poolable':
+                poolable_actual.add(str(comp))
             # Leave-one-panel-out is a stated robustness readout; replay it so
             # a deleted/edited panel cannot be hidden behind an unchanged
             # headline pool.
             loo = b.get('leave_one_panel_out')
+            if not isinstance(loo, dict):
+                out['problems'].append(
+                    f'{label}: pooled contrast has no leave-one-panel-out '
+                    'robustness readout')
             if isinstance(loo, dict):
                 _full_mean = ((meta.get('random_effects') or {}).get('mean')
                               if meta.get('random_effects') else None)
@@ -321,26 +456,12 @@ def audit_panel_synthesis(path=None):
                             f'{label}: sign_stable_leave_one_out '
                             f'{b.get("sign_stable_leave_one_out")!r} != '
                             f'recomputed {_stable!r}')
-            if b.get('status') == 'heterogeneous':
-                _het = meta.get('heterogeneity') or {}
-                _i2 = _het.get('I2_percent')
-                _qp = _het.get('p')
-                try:
-                    _cap = float(policy.get('i2_ceiling_percent', 50.0))
-                    _q_alpha = float(policy.get('q_alpha', 0.10))
-                except (TypeError, ValueError, OverflowError):
-                    out['problems'].append(
-                        f'{label}: synthesis policy I2/Q thresholds are malformed')
-                    _cap, _q_alpha = 50.0, 0.10
-                _het_ok = ((_i2 is not None and float(_i2) > _cap)
-                           or (_qp is not None and math.isfinite(float(_qp))
-                               and float(_qp) < _q_alpha))
-                if not _het_ok:
-                    out['problems'].append(
-                        f'{label}: status=heterogeneous but the heterogeneity '
-                        'gate does not fire')
             # Selection-bias replay, when present.
             sel = b.get('verified_only_sensitivity')
+            if not isinstance(sel, dict) and policy.get('selection_bias_readout'):
+                out['problems'].append(
+                    f'{label}: selection-bias readout is enabled by the policy '
+                    'but absent from the contrast')
             if isinstance(sel, dict):
                 rows = [panels.get(str(pt.get('label'))) or {} for pt in points]
                 predicted = (b.get('direction') or {}).get('predicted_signs') or []
@@ -364,9 +485,56 @@ def audit_panel_synthesis(path=None):
                                 f'{label}/selection: {x}' for x in
                                 _ps_compare(sel.get(key), sel2.get(key),
                                             path=f'{label}/selection/{key}'))
+                    if sel2.get('verified_only_more_favourable') is True:
+                        selection_by_comp.add(str(comp))
             out['contrasts'][label] = {'status': b.get('status'),
                                        'audit': 'replayed'}
             out['n_ok'] += 1
+    # Replay component-level labels and the aggregate category lists.  A
+    # changed category list is still a changed result even if every contrast
+    # block was left intact.
+    _expected_het = set()
+    _expected_dep = set()
+    for _comp, _statuses in status_by_comp.items():
+        _cb = comps.get(_comp)
+        if isinstance(_cb, dict):
+            if 'poolable' in _statuses:
+                _expected_comp = 'poolable'
+            elif any(s not in (None, 'not_measured', 'not_estimable')
+                     for s in _statuses):
+                _expected_comp = 'measured_not_poolable'
+            elif 'not_estimable' in _statuses:
+                _expected_comp = 'not_estimable'
+            else:
+                _expected_comp = 'not_measured'
+            if _cb.get('status') != _expected_comp:
+                out['problems'].append(
+                    f'{_comp}: component status {_cb.get("status")!r} != '
+                    f'replayed {_expected_comp!r}')
+        if 'heterogeneous' in _statuses:
+            _expected_het.add(_comp)
+        if 'dependent_draws' in _statuses:
+            _expected_dep.add(_comp)
+    for _key, _expected in (
+            ('heterogeneous_components', _expected_het),
+            ('dependent_components', _expected_dep),
+            ('selection_sensitive_components', selection_by_comp)):
+        _stored = set(block.get(_key) or [])
+        if _stored != _expected:
+            out['problems'].append(
+                f'{_key} does not match the replayed contrasts: '
+                f'declared={sorted(_stored)}, replayed={sorted(_expected)}')
+    if block.get('n_components') != len(comps):
+        out['problems'].append(
+            f'n_components {block.get("n_components")!r} != {len(comps)}')
+    if block.get('n_contrasts') != out['n_contrasts']:
+        out['problems'].append(
+            f'n_contrasts {block.get("n_contrasts")!r} != '
+            f'{out["n_contrasts"]}')
+    if block.get('n_poolable_components') != len(poolable_actual):
+        out['problems'].append(
+            f'n_poolable_components {block.get("n_poolable_components")!r} '
+            f'!= {len(poolable_actual)}')
     if poolable_declared != poolable_actual:
         out['problems'].append(
             'poolable_components does not match the contrast statuses: '
