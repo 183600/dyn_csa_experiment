@@ -1134,9 +1134,11 @@ def factorial_design_audit(design=None, present=None, factory=None, n_layers=6):
                           norm_cells[('active', 'control')]))
             keys = []
             signatures = []
+            _factor_construct_ok = True
             for a, b in pairs:
                 _k, _per = _design_pair_cfg_keys(a, b, factory, report['n_layers'])
                 if isinstance(_k, Exception):
+                    _factor_construct_ok = False
                     _bad(f'{factor}: cannot construct the {a} vs {b} contrast '
                          f'({type(_k).__name__}: {_k})')
                     keys.append(())
@@ -1177,6 +1179,23 @@ def factorial_design_audit(design=None, present=None, factory=None, n_layers=6):
             if extra_keys:
                 _bad(f'{factor}: undeclared AttnCfg key(s) move with the factor: '
                      + ', '.join(extra_keys))
+            # A 2x2 simple effect is itself a single-factor contrast: its two
+            # levels must move ONE declared intervention family, not merely a
+            # subset of every key ever declared for this component.  The union
+            # guard above accepts a bundle that happens to use keys from two
+            # different declared pairs (e.g. `use_sink` and `full_sink`), and
+            # the interaction would then read a two-knob manipulation as one
+            # factor.  `cfg_keys_single_factor` is the same family test used by
+            # the leave-one-out / sweep / frozen-plan gates, so the layered
+            # audit cannot disagree about what "single-factor" means.
+            _sf_axis = (bool(_factor_construct_ok) and bool(union)
+                        and bool(cfg_keys_single_factor(union)))
+            rec.setdefault('factor_single_factor', {})[factor] = _sf_axis
+            if union and not _sf_axis:
+                _bad(f'{factor}: the factor moves AttnCfg keys {sorted(union)}, '
+                     'which span more than one declared single-factor family; '
+                     'each 2x2 simple effect must isolate one factor, not a '
+                     'multi-factor bundle')
 
         hname = str(spec.get('hypothesis') or name)
         rec['hypothesis'] = hname

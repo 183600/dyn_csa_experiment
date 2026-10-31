@@ -5623,3 +5623,39 @@ first-occurrence 口径并在 legacy 比较上写「未核验」；CLI/report �
 相关既有
 `test_review_part_09/23/24/59/60` 通过；完整 CPU 套件在本轮最终树通过
 （新增 14 项）。
+
+## 2026-10-31 — 2x2 简单效应也必须单因素：factorial 轴接入族判据（本轮单因素实验检查，no new runs）
+
+零 GPU；不新增训练、不读取 test split、不修改
+`confirmation_frozen*.json` 的字节/种子/端点/α/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未删除、未修改、未移动。
+
+**Problem.** `factorial_design_audit` 只检查每个因子的
+`control -> active` 差集在两个水平上 parallel、不含 `kind`、且是
+`ABLATION_INTERVENTION_KEYS[factor]` 全部声明键并集的子集。并集会把两个
+不同声明族的键拼在一起仍判通过：`attention_sink` 同时声明 `use_sink`
+（csa/hca）与 `full_sink`（dense），一个同时移动两者的自定义 2x2 轴因此
+仍被当作单因素简单效应，交互统计会读成两因素束。leave-one-out / sweep /
+probe / frozen-plan 都使用 `cfg_keys_single_factor` 的「一个族」判据，
+factorial 门与它们对「单因素」的定义不一致。
+
+**Fix.** `factorial_design_audit` 对每个因子加入
+`cfg_keys_single_factor(union)`：实际差集必须落在一个已声明干预族内，
+不能只是该组件所有声明键的子集。报告新增逐因子
+`factor_single_factor`，族判据失败写入明确 violation
+（“span more than one declared single-factor family”）。既有 parallel /
+`kind` / 声明键并集检查全部保留；shipped 的五个 factorial 轴
+（dynamic bundle、indexer_mode、content_mode、use_sink、sink_mode）通过。
+不改变 `FACTORIAL_DESIGN`、臂定义、`INTERACTION_SESOI` 或统计族。
+
+**Boundary.** 这是定义点审计，不是结果检验；它不改变任何已测结果、
+种子、端点、α/Holm 或冻结判定，也不把自定义/未来 factorial 的因子自动
+纳入 `ABLATION_DESIGN`。单因素判据仍只回答「差集是否落在一个声明族」，
+不替代 parallel / capacity / objective / SESOI 门。
+
+**Verification.** 新增 `test_factorial_single_factor_axes.py` 2 项：shipped
+五个 factorial 的每个轴 `factor_single_factor=True`；一个 parallel、无
+`kind`、全部键都在 `attention_sink` 声明并集内但同时移动 `use_sink` 与
+`full_sink` 的自定义 2x2 被拒绝，`attention_sink` 准确报告为 False。
+`test_review_part_08/16/25/32/50/52/53` 与 `audit_gates.py
+single_factor` / `factorial` 在当前树通过。
