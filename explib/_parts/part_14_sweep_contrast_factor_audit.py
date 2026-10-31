@@ -1521,11 +1521,22 @@ def attrition_power_audit(n_seeds, m_comparisons, *, q,
     out['require_attrition_power'] = require_attr
     search_max = n_max_i
     out['n_max'] = search_max
-    if not require_cov and n is not None and n > 10000:
+    # The 10,000-seed budget applies to BOTH coverage modes: the default
+    # complete-coverage branch also evaluates ``signflip_power(n, ...)`` and
+    # the attrition binomial, so letting n through only there reintroduced the
+    # unbounded float conversion the partial branch already refused.
+    if n is not None and n > 10000:
+        # Do not format n itself: an arbitrary-precision plan can exceed
+        # CPython's decimal-conversion limit and turn a fail-closed refusal
+        # into a ValueError.
         out['violations'].append(
-            f'planned n_seeds={n} exceeds the partial-coverage scan cap '
-            '10000; the attrition audit cannot verify a joint power for '
-            'this design')
+            f'planned n_seeds (bit_length={n.bit_length()}) exceeds the '
+            'attrition scan cap 10000; the audit cannot verify a joint power '
+            'for this design')
+        # The raw declared count is not JSON-serialisable above CPython's
+        # decimal-conversion limit; keep its exact bit length instead.
+        out['n_seeds'] = None
+        out['n_seeds_bit_length'] = int(n.bit_length())
         out['failure_reason'] = 'scan_cap'
         out['status'] = 'fail'
         return out

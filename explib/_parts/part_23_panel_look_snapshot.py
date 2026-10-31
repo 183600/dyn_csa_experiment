@@ -93,6 +93,14 @@ def load_look_history(outdir):
     return obj
 
 
+def _look_number(value):
+    """Positive exact look number, or ``None`` for malformed/corrupt input."""
+    if isinstance(value, bool) or not isinstance(value, numbers.Integral):
+        return None
+    value = int(value)
+    return value if value >= 1 else None
+
+
 LOOK_ATTESTATION_SCHEMA = 1
 LOOK_ATTESTATION_KIND = 'look_history_attestation'
 LOOK_LEDGER_EVENT_KIND = 'panel_look'
@@ -411,7 +419,19 @@ def record_panel_look(outdir, recs, *, design=None, baselines=None,
             if isinstance(hist.get('attestation'), dict):
                 _attest_look_events(outdir, looks)
             return hist
-    look_no = int(last.get('look') or len(looks)) + 1 if looks else 1
+    # Never trust the stored last look number.  A corrupt entry used to raise a
+    # raw TypeError/ValueError here (the aggregate caller then silently failed
+    # to record the look, losing the sequential correction), and a negative
+    # number could be written even though the ledger attestation refuses to
+    # sign it.  Derive the next number from the valid entries only.
+    _valid_look_numbers = [n for n in
+                           (_look_number(ent.get('look'))
+                            for ent in looks if isinstance(ent, dict))
+                           if n is not None]
+    if last and _look_number(last.get('look')) is None:
+        hist['look_number_recovered'] = True
+    look_no = (max(_valid_look_numbers) + 1
+               if _valid_look_numbers else 1)
     entry = {'look': look_no,
              'recorded_at': now or time.strftime('%Y-%m-%dT%H:%M:%S'),
              'n_contrasts': len(snapshot),

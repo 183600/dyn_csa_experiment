@@ -705,9 +705,14 @@ def validate_analysis_rehearsal(rehearsal, *, manifest=None):
         out['problems'].append(
             'rehearsal.n_failures does not match the failures list')
     n_checks = _ar_int(rehearsal.get('n_checks'), minimum=0)
+    # ``checks`` is untrusted JSON.  Only a list has a length; an int/string/
+    # mapping is a malformed scenario, already reported in the loop above, and
+    # must not abort the validator with TypeError.
     computed_checks = sum(
-        len(s.get('checks') or []) for s in scenarios.values()
-        if isinstance(s, dict))
+        len(checks) for checks in
+        ((s.get('checks') if isinstance(s, dict) else None)
+         for s in scenarios.values())
+        if isinstance(checks, list))
     if n_checks is not None and n_checks != computed_checks:
         out['status'] = 'fail'
         out['problems'].append(

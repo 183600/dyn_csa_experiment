@@ -26,6 +26,10 @@
 
 CLEANING_SENSITIVITY_SCHEMA = 'wikitext_cleaning_sensitivity_v1'
 CLEANING_SENSITIVITY_MAX_ROWS = 1_000_000
+# Each declared order permutation is a full cleaning replay over the supplied
+# rows.  A caller-controlled count must not turn the sensitivity curve into an
+# unbounded loop; this is an absolute work guard, not a statistical threshold.
+CLEANING_SENSITIVITY_MAX_ORDER_PERMUTATIONS = 100
 # A variant is called materially different when it changes at least 5% of the
 # kept-set members, or more than 1% of the kept-document count.  These are
 # reporting thresholds, not a statistical test and not a cache verdict.
@@ -56,13 +60,17 @@ CLEANING_SENSITIVITY_POLICY = {
 }
 
 
-def _cs_int(value, name, *, minimum=0):
+def _cs_int(value, name, *, minimum=0, maximum=None):
     """Exact integer argument; booleans and fractions are not counts."""
     if isinstance(value, (bool, np.bool_)) or not isinstance(value, numbers.Integral):
         raise ValueError(f'{name} must be an integer, got {value!r}')
     value = int(value)
     if value < int(minimum):
         raise ValueError(f'{name} must be >= {int(minimum)}, got {value}')
+    if maximum is not None and value > int(maximum):
+        raise ValueError(
+            f'{name} must be <= {int(maximum)}; the declared work budget is '
+            'an absolute bound, not a request to loop unboundedly')
     return value
 
 
@@ -373,7 +381,9 @@ def cleaning_sensitivity(train_rows, validation_rows=(), *, protocol,
     if proto_problems:
         raise ValueError('invalid dedup protocol: ' + '; '.join(proto_problems))
     fit_rows = _cs_int(fit_rows, 'fit_rows')
-    n_order_permutations = _cs_int(n_order_permutations, 'n_order_permutations')
+    n_order_permutations = _cs_int(
+        n_order_permutations, 'n_order_permutations',
+        maximum=CLEANING_SENSITIVITY_MAX_ORDER_PERMUTATIONS)
     if isinstance(seed, (bool, np.bool_)) or not isinstance(seed, numbers.Integral):
         raise ValueError(f'seed must be an integer, got {seed!r}')
     seed = int(seed)
@@ -651,7 +661,14 @@ def cleaning_sensitivity(train_rows, validation_rows=(), *, protocol,
             'the kept membership beyond the declared stability floors; report '
             'the data-cleaning specification curve together with the frozen '
             'split and do not describe the served set as protocol-neutral')
-    if out['baseline_match']['train'].get('match') is None and out['status'] == 'ok':
+    # A missing sidecar on EITHER split means that baseline is not
+    # independently tied to the frozen cache.  Checking only train let a
+    # matching train sidecar certify a warning-laden, unverified validation
+    # baseline as ``ok`` (the audit wrapper already maps the same condition to
+    # ``not_verifiable_locally``).
+    if out['status'] == 'ok' and any(
+            out['baseline_match'][split].get('match') is None
+            for split in ('train', 'validation')):
         out['status'] = 'warnings'
     out['problems'] = problems
     out['warnings'] = warnings

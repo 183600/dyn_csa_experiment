@@ -167,10 +167,20 @@ def _ta_same(a, b):
         return (isinstance(a, (bool, np.bool_))
                 and isinstance(b, (bool, np.bool_))
                 and bool(a) == bool(b))
+    if isinstance(a, (int, np.integer)) and isinstance(b, (int, np.integer)):
+        # Exact integer comparison.  Converting an arbitrarily large JSON
+        # integer to float raises OverflowError and would abort the replay
+        # instead of reporting a mismatch.
+        return int(a) == int(b)
     if isinstance(a, (int, float, np.integer, np.floating)) and isinstance(
             b, (int, float, np.integer, np.floating)):
-        return abs(float(a) - float(b)) <= 1e-12 * max(1.0, abs(float(a)),
-                                                       abs(float(b)))
+        try:
+            return abs(float(a) - float(b)) <= 1e-12 * max(
+                1.0, abs(float(a)), abs(float(b)))
+        except (OverflowError, ValueError):
+            # An int/float mixed pair at an unrepresentable scale: Python's
+            # exact equality is the only safe comparison left.
+            return a == b
     if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
         return len(a) == len(b) and all(_ta_same(x, y) for x, y in zip(a, b))
     return a == b
@@ -298,9 +308,28 @@ def confirmatory_access_audit(lock, *, stats=None, manifest=None, alpha=None,
             n_reads = None
         else:
             n_reads = int(raw_reads)
-            if n_reads < 0:
+            # Preserve the exact reported value for the replay, but do not
+            # let an implausible counter enter the arithmetic below.  A lock
+            # is untrusted JSON: ``10**400`` is a representable Python int
+            # yet not a usable float/read count, and used to raise
+            # OverflowError at the Bonferroni display multiplication.
+            out['n_test_reads'] = n_reads
+            if abs(n_reads) > TEST_ACCESS_POLICY['max_looks_limit']:
+                # Do not echo/format the arbitrary-precision counter: a value
+                # above CPython's 4,300-digit conversion limit cannot even be
+                # turned into the problem string (or JSON) without raising.
+                out['problems'].append(
+                    'test_reads (bit_length='
+                    f'{n_reads.bit_length()}) is outside the declared maximum '
+                    f'{TEST_ACCESS_POLICY["max_looks_limit"]}; the access '
+                    'counter is not plausible')
+                out['n_test_reads'] = None
+                out['n_test_reads_bit_length'] = int(n_reads.bit_length())
+                n_reads = None
+            elif n_reads < 0:
                 out['problems'].append(f'test_reads must be >= 0, got {n_reads}')
-    out['n_test_reads'] = n_reads
+    if 'n_test_reads' not in out:
+        out['n_test_reads'] = n_reads
 
     if test_fp is not None and n_reads is not None and n_reads < 1:
         out['problems'].append(

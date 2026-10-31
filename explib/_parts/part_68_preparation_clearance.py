@@ -707,39 +707,56 @@ def _prep_test_read_from_path(path):
 def _prep_test_access_check(protocol, state):
     out = _prep_check('test_access', required=True)
     level = _prep_study_level(protocol)
-    read = None
+    # Every available signal is evidence.  They are AND-ed for the purpose of
+    # "unread": a positive read flag, an existing lock path, or a positive
+    # counter all mean the held-out split was consumed.  The historical code
+    # let the last field win, so ``{'test_read': True, 'test_reads': 0}`` --
+    # or a lock path plus a reset counter -- certified a read split as unread.
+    signals = []
     evidence = None
     if isinstance(state, bool):
-        read = state
+        signals.append(('boolean', bool(state)))
         evidence = 'boolean'
     elif isinstance(state, str):
         evidence = state
-        read = _prep_test_read_from_path(state)
+        _path_read = _prep_test_read_from_path(state)
+        if _path_read is not None:
+            signals.append(('path', bool(_path_read)))
     elif isinstance(state, dict):
         evidence = state.get('evidence') or state.get('path') or 'object'
         path = state.get('path')
         if isinstance(path, str) and path:
-            read = _prep_test_read_from_path(path)
+            _path_read = _prep_test_read_from_path(path)
+            if _path_read is not None:
+                signals.append(('path', bool(_path_read)))
         for key in ('test_read', 'read', 'accessed', 'test_accessed'):
             if isinstance(state.get(key), bool):
-                read = state[key]
+                signals.append((key, bool(state[key])))
                 break
-        if read is None:
-            for key in ('lock_present', 'freeze_lock_present'):
-                if isinstance(state.get(key), bool):
-                    read = state[key]
-                    break
+        for key in ('lock_present', 'freeze_lock_present'):
+            if isinstance(state.get(key), bool):
+                signals.append((key, bool(state[key])))
+                break
         reads = _prep_int(state.get('test_reads'), minimum=0)
         if reads is not None:
-            read = reads > 0
+            signals.append(('test_reads', reads > 0))
     elif state is None:
         if level == 'confirmatory':
             return _prep_fail(out, 'held-out access state was not declared; a '
                                    'launch gate must show the test split is unread')
         return _prep_warn(out, 'held-out access state is not declared',
                           unverifiable=True)
+    read = (any(value for _key, value in signals) if signals else None)
     out['read'] = read
     out['evidence'] = evidence
+    if signals:
+        out['read_signals'] = {key: bool(value) for key, value in signals}
+        if any(value for _key, value in signals) and any(
+                not value for _key, value in signals):
+            out['conflicting_read_evidence'] = True
+            out['warnings'].append(
+                'held-out access evidence disagrees; the conservative '
+                '(already read) reading is used')
     if read is None:
         return _prep_warn(out, 'held-out access state is not interpretable',
                           unverifiable=True)

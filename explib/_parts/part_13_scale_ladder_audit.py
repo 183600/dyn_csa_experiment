@@ -31,6 +31,13 @@ def _finite_int_ratio(numerator, denominator):
     return float(value)
 
 
+# CPython refuses decimal conversion of a 4,301+ digit integer by default, so
+# such a value cannot be written to a JSON report at all (``json.dumps`` raises
+# ``ValueError``).  Keep a deliberate, documented reportable bound: a declared
+# plan beyond it is refused as unverifiable rather than crashing serialisation.
+SCALE_LADDER_MAX_REPORTABLE_INT = 10 ** 4000
+
+
 def _finite_float_ratio(numerator, denominator):
     """Finite quotient of two finite positive measurements, or ``None``.
 
@@ -102,6 +109,8 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
         family_m = _as_int(policy.get('family_m', 4), 'family_m')
         if family_m <= 0:
             raise ValueError('family_m must be positive')
+        if family_m > SCALE_LADDER_MAX_REPORTABLE_INT:
+            raise ValueError('family_m exceeds the reportable bound 10**4000')
     except (TypeError, ValueError, OverflowError) as e:
         family_m = None
         problems.append(f'policy.family_m is invalid ({e}); the family-resolution floor cannot be planned')
@@ -182,6 +191,14 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
         except (KeyError, TypeError, ValueError, OverflowError) as e:
             problems.append(f'{name}: incomplete scale cfg ({type(e).__name__}: {e})')
             continue
+        _oversized_seeds = sorted(
+            {s for s in seeds
+             if abs(int(s)) > SCALE_LADDER_MAX_REPORTABLE_INT})
+        if _oversized_seeds:
+            problems.append(
+                f'{name}: seed id(s) exceed the reportable integer bound '
+                '10**4000; the audit cannot serialise this plan as exact JSON')
+            continue
         _neg_seeds = sorted({s for s in seeds if s < 0})
         if _neg_seeds:
             problems.append(f'{name}: seed(s) {_neg_seeds[:5]} are negative; a seed id '
@@ -202,6 +219,20 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
         if lr is None or not (math.isfinite(lr) and lr > 0):
             problems.append(f'{name}: lr={cfg.get("lr")!r} is not a positive finite number')
         effective_tokens = steps * batch * seq
+        _overflowing = [
+            (label, value) for label, value in (
+                ('steps', steps), ('batch_size', batch), ('seq_len', seq),
+                ('n_train_tokens', declared_tokens),
+                ('effective_tokens', effective_tokens),
+                ('warmup', warmup))
+            if abs(int(value)) > SCALE_LADDER_MAX_REPORTABLE_INT]
+        if _overflowing:
+            problems.append(
+                f'{name}: exact budget field(s) '
+                + ', '.join(label for label, _value in _overflowing)
+                + ' exceed the reportable integer bound 10**4000; the audit '
+                  'cannot serialise this plan as exact JSON')
+            continue
         # Compare the integer difference to the exact 1% bound.  Multiplying a
         # large declared token budget by 0.01 converts it to float and can
         # overflow even though the integer comparison is well defined.
@@ -220,6 +251,12 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
         if params is not None and params <= 0:
             problems.append(f'{name}: params must be positive')
             params = None
+        if (params is not None
+                and abs(int(params)) > SCALE_LADDER_MAX_REPORTABLE_INT):
+            problems.append(
+                f'{name}: params exceeds the reportable integer bound '
+                '10**4000; the audit cannot serialise this plan as exact JSON')
+            continue
         _tokens_per_param = (_finite_int_ratio(effective_tokens, params)
                              if params else None)
         if params is not None and _tokens_per_param is None:

@@ -592,13 +592,27 @@ def confirmation_family_correction(comparisons, *, family_names, frozen_holm=Non
         correction_effect = 'maxt_rejects_fewer'
     else:
         correction_effect = 'crossed'
-    score_vs_mean = sorted(n for n in names
-                           if rows_out[n]['reject_frozen_holm']
-                           != rows_out[n]['reject_holm_score'])
-    score_vs_t = (sorted(n for n in names
-                         if rows_out[n]['reject_maxt_score']
-                         != rows_out[n]['reject_maxt_t'])
-                  if maxt_t is not None else [])
+    # A missing frozen mean p is not a rejection disagreement.  The historical
+    # ``None != bool`` comparison labelled every contrast as changed and
+    # reported ``statistic_effect='differ'`` even though the mean statistic
+    # was never computed.  Compare only rows where BOTH verdicts exist.
+    _mean_available = all(
+        rows_out[n]['reject_frozen_holm'] is not None for n in names)
+    score_vs_mean = sorted(
+        n for n in names
+        if rows_out[n]['reject_frozen_holm'] is not None
+        and rows_out[n]['reject_holm_score'] is not None
+        and rows_out[n]['reject_frozen_holm']
+        != rows_out[n]['reject_holm_score'])
+    _t_available = maxt_t is not None and all(
+        rows_out[n]['reject_maxt_t'] is not None for n in names)
+    score_vs_t = (sorted(
+        n for n in names
+        if rows_out[n]['reject_maxt_score'] is not None
+        and rows_out[n]['reject_maxt_t'] is not None
+        and rows_out[n]['reject_maxt_score']
+        != rows_out[n]['reject_maxt_t'])
+        if _t_available else [])
     score_raw_match = (all(abs(raw_score[n] - raw_t[n]) <= 1e-12 for n in names)
                        if raw_t is not None else None)
     score_maxt_match = (all(abs(maxt_score[n] - maxt_t[n]) <= 1e-12 for n in names)
@@ -691,7 +705,10 @@ def confirmation_family_correction(comparisons, *, family_names, frozen_holm=Non
             'n_maxt_score': len(maxt_score_set),
             'n_maxt_t': (len(maxt_t_set) if maxt_t is not None else None),
             'correction_effect': correction_effect,
-            'statistic_effect': ('same' if not score_vs_mean else 'differ'),
+            'statistic_effect': (
+                ('same' if not score_vs_mean else 'differ')
+                if _mean_available else None),
+            'mean_rejections_available': bool(_mean_available),
             'n_mde_ratio': len(ratios),
             'mean_mde_ratio': (float(sum(ratios) / len(ratios))
                                if ratios else None),

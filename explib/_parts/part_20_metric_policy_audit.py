@@ -661,7 +661,17 @@ def metric_policy_audit(summary=None, policy=None):
                             _ap = _finite_scalar(_v.get('pr_auc'))
                             if _sup is None:
                                 continue
-                            _chance = float(_sup) / float(_n_pc)
+                            # Supports are exact integers and may exceed the
+                            # float range; dividing them through float()
+                            # aborted the whole panel.  A ratio that cannot be
+                            # represented is itself a named record issue.
+                            _chance = _finite_int_ratio(_sup, _n_pc)
+                            if _chance is None:
+                                _class_issues.append(
+                                    f'{_label}: per-class PR-AUC chance for '
+                                    f'{_k} is not representable from support='
+                                    f'{_sup} / n={_n_pc}')
+                                continue
                             _got_c = _finite_scalar(_v.get('pr_auc_chance'))
                             if _got_c is not None and abs(_got_c - _chance) > 1e-12:
                                 _class_issues.append(
@@ -705,9 +715,22 @@ def metric_policy_audit(summary=None, policy=None):
                             f'{_label}: roc_auc_macro={_rm} is not the mean of its '
                             f'per-class one-vs-rest ROC-AUC values ({float(np.mean(_ra))})')
                     if _pa and sum(_rw) > 0:
-                        _pw = float(np.average(_pa, weights=_ww))
+                        # Supports are exact integers and can exceed float64.
+                        # Normalise by the largest weight before forming the
+                        # weighted mean: np.average()/float(weight) used to
+                        # raise OverflowError on such a valid record.
+                        _wmax = max(_ww)
+                        _wn = ([_finite_int_ratio(w, _wmax) for w in _ww]
+                               if _wmax > 0 else [])
+                        _pw = None
+                        if _wn and all(x is not None for x in _wn):
+                            _wden = math.fsum(_wn)
+                            if _wden > 0.0:
+                                _pw = float(math.fsum(
+                                    v * w for v, w in zip(_pa, _wn)) / _wden)
                         _rpw = _finite_scalar(r.get('pr_auc_weighted'))
-                        if _rpw is not None and abs(_rpw - _pw) > 1e-9:
+                        if (_pw is not None and _rpw is not None
+                                and abs(_rpw - _pw) > 1e-9):
                             _class_issues.append(
                                 f'{_label}: pr_auc_weighted={_rpw} is not the support-weighted '
                                 f'mean of its per-class PR-AUC values ({_pw})')
@@ -715,14 +738,26 @@ def metric_policy_audit(summary=None, policy=None):
                         if _n_tb is None:
                             _n_tb = sum(_rw)
                         if _n_tb and _n_tb > 0:
-                            _chance_macro = float(np.mean([s / _n_tb for s in _rw]))
-                            _chance_weighted = float(
-                                sum(w * (s / _n_tb) for w, s in zip(_ww, _rw)) / sum(_ww))
+                            _prev = [_finite_int_ratio(s, _n_tb) for s in _rw]
+                            _chance_macro = (
+                                float(np.mean(_prev))
+                                if _prev and all(v is not None for v in _prev)
+                                else None)
+                            _chance_weighted = None
+                            if (_prev and _wn
+                                    and all(v is not None for v in _prev)
+                                    and all(x is not None for x in _wn)):
+                                _wd = math.fsum(_wn)
+                                if _wd > 0.0:
+                                    _chance_weighted = float(math.fsum(
+                                        w * v for w, v in
+                                        zip(_wn, _prev)) / _wd)
                             for _key, _want in (
                                     ('pr_auc_macro_chance', _chance_macro),
                                     ('pr_auc_weighted_chance', _chance_weighted)):
                                 _got_c = _finite_scalar(r.get(_key))
-                                if _got_c is not None and abs(_got_c - _want) > 1e-9:
+                                if (_want is not None and _got_c is not None
+                                        and abs(_got_c - _want) > 1e-9):
                                     _class_issues.append(
                                         f'{_label}: {_key}={_got_c} is not the one-vs-rest '
                                         f'prevalence floor ({_want})')
@@ -731,7 +766,8 @@ def metric_policy_audit(summary=None, policy=None):
                                     ('pr_auc_weighted_lift_over_chance', 'pr_auc_weighted', _chance_weighted)):
                                 _got_l = _finite_scalar(r.get(_key))
                                 _base = _finite_scalar(r.get(_base_key))
-                                if (_got_l is not None and _base is not None
+                                if (_chance is not None and _got_l is not None
+                                        and _base is not None
                                         and abs(_got_l - (_base - _chance)) > 1e-9):
                                     _class_issues.append(
                                         f'{_label}: {_key}={_got_l} is not '
@@ -901,8 +937,13 @@ def metric_policy_audit(summary=None, policy=None):
                     _fp = _exact_count(_pe.get('fp'), minimum=0)
                     _n_pp = _exact_count(r.get('n'), minimum=1)
                     if None not in (_tp, _fp, _n_pp) and _n_pp:
-                        _want_ppr = float(_tp + _fp) / float(_n_pp)
-                        if abs(_ppr - _want_ppr) > 1e-12:
+                        _want_ppr = _finite_int_ratio(_tp + _fp, _n_pp)
+                        if _want_ppr is None:
+                            _class_issues.append(
+                                f'{_label}: predicted-positive rate is not '
+                                f'representable from (tp+fp)={_tp + _fp} / '
+                                f'n={_n_pp}')
+                        elif abs(_ppr - _want_ppr) > 1e-12:
                             _class_issues.append(
                                 f'{_label}: predicted_positive_rate={_ppr} is not '
                                 f'(tp+fp)/n ({_want_ppr})')
@@ -982,7 +1023,8 @@ def metric_policy_audit(summary=None, policy=None):
                                 _sup_pos = _exact_count(_pe_pos.get('support'), minimum=0)
                                 _n_pos_rec = _exact_count(r.get('n'), minimum=1)
                                 if _sup_pos is not None and _n_pos_rec:
-                                    _pos_prev = float(_sup_pos) / float(_n_pos_rec)
+                                    _pos_prev = _finite_int_ratio(
+                                        _sup_pos, _n_pos_rec)
                 _floor = _pos_prev if _pos_prev is not None else prevalence
                 if _pos_prev is not None:
                     _cond_prev = _pos_prev

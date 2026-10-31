@@ -588,10 +588,21 @@ def ablation_practical_decision(deltas, *, margin=None, sesoi=None, baseline_ppl
     out = _practical_decision_from_stats(
         stats, tost, margin=margin, direction=direction, alpha=alpha,
         min_n=min_n, p_holm_tost=p_holm_tost)
+    _base = _finite_scalar(baseline_ppl)
+    _relative_margin_pct = None
+    if _base not in (None, 0.0):
+        try:
+            _relative_margin_pct = 100.0 * margin / float(_base)
+        except (TypeError, ValueError, OverflowError, ZeroDivisionError):
+            _relative_margin_pct = None
+        if (_relative_margin_pct is not None
+                and not math.isfinite(_relative_margin_pct)):
+            # A huge margin over a tiny but finite baseline can overflow even
+            # though both inputs are finite.  An infinite percentage is not a
+            # measurement and would make a strict-JSON report unserialisable.
+            _relative_margin_pct = None
     out.update({'label': str(label), 'baseline_ppl': baseline_ppl,
-                'relative_margin_pct': (100.0 * margin / float(baseline_ppl)
-                                        if _finite_scalar(baseline_ppl) not in (None, 0.0)
-                                        else None)})
+                'relative_margin_pct': _relative_margin_pct})
     return out
 
 

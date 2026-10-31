@@ -14,6 +14,10 @@ _EFFECT_SCALE_FLOOR = 1e-75
 # range this helper is designed to admit (up to ~1e200), instead of dropping a
 # legitimate point for a units-only reason.
 _EFFECT_WORK_MAX = 1e150
+# The per-pair common-seed map is quadratic in the number of scale points,
+# while the dependence verdict only needs the aggregate seed-use counts.  Bound
+# the display detail with the same convention as the panel-replication audits.
+SCALING_TREND_PAIR_DETAIL_LIMIT = 1024
 
 
 def _scale_points(points):
@@ -475,7 +479,24 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3,
                                'n_missing': r.get('n_missing'),
                                'n_unexpected': r.get('n_unexpected')}
                   for r in per if r.get('complete_pairs') is False}
-    out = {'alpha': float(alpha), 'min_seeds': int(min_seeds), 'per_point': per,
+    # NaN is an internal sentinel for an invalid declared scale, never a JSON
+    # value.  Keep the row (it must remain visible in the family) but expose
+    # the scale as null so a strict-JSON report cannot fail on it.
+    _per_output = []
+    for _row in per:
+        _row_out = dict(_row)
+        _scale_value = _row_out.get('scale')
+        _bad_scale = (isinstance(_scale_value, bool)
+                      or not isinstance(_scale_value, (int, float)))
+        if not _bad_scale:
+            try:
+                _bad_scale = not math.isfinite(float(_scale_value))
+            except (OverflowError, ValueError):
+                _bad_scale = True
+        if _bad_scale:
+            _row_out['scale'] = None
+        _per_output.append(_row_out)
+    out = {'alpha': float(alpha), 'min_seeds': int(min_seeds), 'per_point': _per_output,
            'n_points': len(per), 'n_usable': len(usable),
            'incomplete_points': _incomplete,
            'empty_points': _empty_points,
@@ -1217,7 +1238,8 @@ def effect_modification(effects_by_condition, *, reference=None, condition_value
     return out
 
 
-def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=True):
+def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3,
+                  log_scale=True, pair_detail_limit=None):
     """尺度阶梯上的效应趋势：相对效应 ~ log(scale) 的加权回归 + 精确配对检验。
 
     `points` 每项为 {label, scale, effects, seeds}（或 (scale, effects, seeds)）。
@@ -1232,7 +1254,12 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
       2. 没有完整种子时，退化为规模点均值的加权回归，用 t 区间与 t 检验，
          并明确标注 `paired=False`（点间独立、不能利用配对降噪）。
     同时报告两点交互（最小 vs 最大规模）和异质性；异质性高时不得用单一
-    斜率概括整个阶梯。"""
+    斜率概括整个阶梯。
+
+    ``pair_detail_limit`` bounds the quadratic ``per_pair_common_seeds``
+    detail (default 1024, ``0`` skips it).  The dependence classification and
+    every estimate still use the full family; only the display map is bounded.
+    """
     alpha = _validated_alpha(alpha, context='scaling_trend alpha')
     _min_seeds = _as_seed_int(min_seeds)
     _min_points = _as_seed_int(min_points)
@@ -1241,6 +1268,14 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
     if _min_points is None or _min_points < 1:
         raise ValueError(f'min_points must be a positive integer, got {min_points!r}')
     min_seeds, min_points = _min_seeds, _min_points
+    _pair_limit = (SCALING_TREND_PAIR_DETAIL_LIMIT
+                   if pair_detail_limit is None
+                   else _as_seed_int(pair_detail_limit))
+    if pair_detail_limit is not None and (_pair_limit is None
+                                          or _pair_limit < 0):
+        raise ValueError(
+            'pair_detail_limit must be a non-negative integer, got '
+            f'{pair_detail_limit!r}')
     _parsed_pts = _scale_points(points)
     # A declared tier with an invalid/non-positive scale cannot enter the
     # regression, but it must remain VISIBLE in the declared family: silently
@@ -1275,7 +1310,10 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
            'n_points': len(pts), 'labels': [p['label'] for p in pts],
            'scales': [p['scale'] for p in pts],
            'declared_labels': [p['label'] for p in _pts_binding],
-           'declared_scales': [p['scale'] for p in _pts_binding],
+           # Invalid declared scales are kept as visible tiers but must not
+           # leak the internal NaN sentinel into a strict-JSON report.
+           'declared_scales': [
+               _finite_scalar(p.get('scale')) for p in _pts_binding],
            'incomplete_points': _incomplete_points,
            'empty_points': _empty_points,
            'invalid_scale_points': _invalid_scale_points,
@@ -1446,19 +1484,39 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
     if _seed_identity_attested and len(pts) >= 2:
         _seed_sets = [(p['label'], set(p['seeds'])) for p in pts]
         _common_all = sorted(set.intersection(*(s for _l, s in _seed_sets)), key=str)
+        # One linear seed-use pass decides whether ANY pair shares a draw; the
+        # pair map is only display detail.  Building every pair eagerly made a
+        # large ladder O(points**2 * seeds) in time and memory.
+        _seed_use = {}
+        for _l, _s in _seed_sets:
+            for _x in _s:
+                _seed_use[_x] = int(_seed_use.get(_x, 0)) + 1
+        _any_pair_overlap = any(_c > 1 for _c in _seed_use.values())
         _pairs = {}
-        for _i in range(len(_seed_sets)):
-            for _j in range(_i + 1, len(_seed_sets)):
-                _li, _si = _seed_sets[_i]
-                _lj, _sj = _seed_sets[_j]
-                _n_ov = len(_si & _sj)
-                _pairs[f'{_li}|{_lj}'] = _n_ov
-                _any_pair_overlap = _any_pair_overlap or bool(_n_ov)
+        _n_pairs = len(_seed_sets) * (len(_seed_sets) - 1) // 2
+        if _pair_limit != 0:
+            for _i in range(len(_seed_sets)):
+                if len(_pairs) >= _pair_limit:
+                    break
+                for _j in range(_i + 1, len(_seed_sets)):
+                    _li, _si = _seed_sets[_i]
+                    _lj, _sj = _seed_sets[_j]
+                    _pairs[f'{_li}|{_lj}'] = len(_si & _sj)
+                    if len(_pairs) >= _pair_limit:
+                        break
         _seed_overlap.update({
             'per_pair_common_seeds': _pairs,
             'common_seeds_all_points': _common_all,
             'n_common_seeds_all_points': len(_common_all),
             'any_pair_overlap': bool(_any_pair_overlap)})
+        if len(_pairs) < _n_pairs:
+            _seed_overlap.update({
+                'per_pair_common_seeds_truncated': True,
+                'n_pairs': int(_n_pairs),
+                'pair_detail_limit': int(_pair_limit),
+                'pair_detail_note': (
+                    'per-pair common-seed detail is capped; the trend and '
+                    'dependence classification use the full family')})
         if paired_primary:
             _seed_dependence = 'shared_seeds_paired'
         elif _any_pair_overlap:

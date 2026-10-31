@@ -98,6 +98,12 @@ def _pooled_ppl_from_records(recs, *, estimand=None):
     # representable pooled ratio.
     components = []
     for r in recs:
+        if not isinstance(r, dict):
+            # The declared-estimand scan above skips non-objects, so a list
+            # containing one used to reach ``r.get`` and abort with
+            # AttributeError.  A record set with a non-record member has no
+            # well-defined pooled estimator.
+            return None, None, None
         # When the primary estimate is the nested holdout, the matching
         # accounting is nll_sum_holdout/n_tokens_holdout.  A missing halfword
         # cannot fall back to the full-validation totals: the pooled value and
@@ -1224,7 +1230,15 @@ def aggregate(summary):
         key = _agg_key(v, tag, _fp_idx)
         def _seed_sort_key(r):
             s = r.get('seed')
-            if isinstance(s, (int, float)) and (not isinstance(s, bool)) and math.isfinite(float(s)):
+            if isinstance(s, (bool, np.bool_)):
+                return (1, 0.0, str(s))
+            if isinstance(s, (int, np.integer)):
+                # Exact integer labels can exceed float64 (the seed planner
+                # accepts arbitrary IDs); converting them to float raised
+                # OverflowError while sorting.  Python compares int/float
+                # tuples exactly, so keep the large integer as an integer.
+                return (0, int(s), '')
+            if isinstance(s, (float, np.floating)) and math.isfinite(float(s)):
                 return (0, float(s), '')
             return (1, 0.0, str(s))
         _recs_sorted = sorted(recs, key=_seed_sort_key)

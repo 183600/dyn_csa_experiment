@@ -178,7 +178,12 @@ def _cn_normalise_entry(entry):
         # inflating the degree of that node and corrupting the reference.
         return None, ('with and without resolve to the same arm/protocol node '
                       '(%s); a self-contrast is not a controlled pair' % nid_a)
-    lr = {s: math.log(w / wo) for s, w, wo in zip(seeds, with_vals, without_vals)}
+    # Compute the log ratio as a difference of logs.  ``w / wo`` can underflow
+    # to 0.0 for a finite positive pair (e.g. 1e-308 / 1e308) and overflow to
+    # inf in the other direction, even though both individual logs are finite.
+    # The difference stays finite for every accepted (positive, finite) PPL.
+    lr = {s: math.log(w) - math.log(wo)
+          for s, w, wo in zip(seeds, with_vals, without_vals)}
     return {
         'with': a.strip(), 'without': b.strip(),
         'tag_with': _cn_tag(entry, 'with'), 'tag_without': _cn_tag(entry, 'without'),

@@ -119,12 +119,14 @@ def _dispo_str_tuple(name, value, *, allow_empty=False):
     if isinstance(value, (str, bytes, bytearray)) or not isinstance(value, (list, tuple)):
         raise ValueError(f'{name} must be a list/tuple of strings, got {value!r}')
     out = []
+    seen = set()
     for item in value:
         if not isinstance(item, str) or not item.strip():
             raise ValueError(f'{name} entries must be non-empty strings, got {item!r}')
         text = item.strip()
-        if text in out:
+        if text in seen:
             raise ValueError(f'{name} contains a duplicate entry {text!r}')
+        seen.add(text)
         out.append(text)
     if not out and not allow_empty:
         raise ValueError(f'{name} must not be empty')
@@ -136,6 +138,7 @@ def _dispo_cells(cells, *, where='planned_cells'):
     if isinstance(cells, (str, bytes, bytearray)) or not isinstance(cells, (list, tuple)):
         raise ValueError(f'{where} must be a list/tuple of cell labels, got {cells!r}')
     out = []
+    seen = set()
     for cell in cells:
         if not isinstance(cell, str) or not cell.strip():
             raise ValueError(f'{where} entries must be non-empty strings, got {cell!r}')
@@ -149,8 +152,9 @@ def _dispo_cells(cells, *, where='planned_cells'):
             raise ValueError(f'{where} entry {text!r} has a non-integer seed')
         if str(seed) != seed_text or seed < 0:
             raise ValueError(f'{where} entry {text!r} has an invalid non-negative seed')
-        if text in out:
+        if text in seen:
             raise ValueError(f'{where} contains a duplicate cell {text!r}')
+        seen.add(text)
         out.append(text)
     if not out:
         raise ValueError(f'{where} must not be empty')
