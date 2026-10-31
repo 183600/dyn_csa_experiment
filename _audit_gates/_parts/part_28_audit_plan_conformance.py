@@ -21,6 +21,9 @@
 # calls primary.  It never recomputes a p or changes a frozen verdict.
 # ---------------------------------------------------------------------------
 
+import hashlib
+import re
+
 _PLAN_CONFORMANCE_SCHEMA = 'confirmation_plan_conformance_v1'
 _PC_INVALID = object()
 
@@ -87,6 +90,32 @@ def _pc_endpoint_length(endpoint):
     if match is None:
         return None
     return int(match.group(1))
+
+
+def _pc_length_key(value):
+    """The integer key of a by-length cell, or None.
+
+    JSON object keys are always strings, so a real artifact stores the
+    primary cell under ``"4096"``; the validator must parse that canonical
+    form instead of rejecting every actual by-length curve.  Non-canonical
+    spellings (sign, whitespace, float) stay invalid rather than being
+    silently coerced into a different endpoint.
+    """
+    if isinstance(value, str):
+        text = value.strip()
+        if re.fullmatch(r'[0-9]+', text):
+            return int(text)
+        return None
+    return _pc_int(value)
+
+
+def _pc_plan_problem(out, strict, message):
+    """Route a plan-dependent discrepancy by manifest-match strictness.
+
+    Inside a per-comparison replay the same routing is also copied onto that
+    row so the row status cannot stay ``ok`` while the gate fails.
+    """
+    (out['problems'] if strict else out['warnings']).append(message)
 
 
 def _pc_manifest(manifest_path, problems, warnings):
@@ -183,7 +212,11 @@ def _pc_manifest(manifest_path, problems, warnings):
         if isinstance(manifest.get('binding'), dict) else None
     if family_size is not None:
         fs = _pc_int(family_size)
-        if fs is not None and fs != out['n_comparisons']:
+        if fs is None:
+            problems.append(
+                'frozen manifest binding.family_size='
+                f'{family_size!r} is not an exact integer')
+        elif fs != out['n_comparisons']:
             warnings.append(
                 f'frozen manifest binding.family_size={family_size!r} does not '
                 f'equal its {out["n_comparisons"]} primary comparisons')
@@ -198,7 +231,7 @@ def _pc_primary_cells(record):
         return out
     for key, cell in curve.items():
         if isinstance(cell, dict) and cell.get('role') == 'primary':
-            out.append((_pc_int(key), cell))
+            out.append((_pc_length_key(key), cell))
     return out
 
 
@@ -212,19 +245,36 @@ def _pc_compare_record(name, record, plan_comp, out, strict):
     inconsistencies (headline p/mean vs the cell it calls primary, missing
     role, bad direction flag) are always failures.
     """
+    _problems_before = len(out['problems'])
+    _warnings_before = len(out['warnings'])
 
     def _plan_problem(message):
-        (out['problems'] if strict else out['warnings']).append(message)
+        _pc_plan_problem(out, strict, message)
 
     row = {'name': name, 'status': 'ok', 'strict': bool(strict),
            'endpoint': None, 'expected_sign': plan_comp.get('expected_sign'),
            'mechanism_claim_allowed': plan_comp.get('mechanism_claim_allowed'),
            'problems': [], 'warnings': []}
     out['comparisons'][name] = row
+
+    def _sync_row():
+        """Attach this record's new top-level issues to the row itself.
+
+        The row status must not stay ``ok`` when the gate has just failed (or
+        warned) on this comparison.  Only messages added during this call are
+        copied, so an earlier comparison's problem cannot poison the row.
+        """
+        row['problems'].extend(out['problems'][_problems_before:])
+        row['warnings'].extend(out['warnings'][_warnings_before:])
+        if row['problems']:
+            row['status'] = 'fail'
+        elif row['warnings'] and row['status'] == 'ok':
+            row['status'] = 'warnings'
+
     if not isinstance(record, dict):
         out['problems'].append(
             f'comparison {name!r}: record is a {type(record).__name__}, not an object')
-        row['status'] = 'fail'
+        _sync_row()
         return
     if 'omitted' in record:
         row['status'] = 'omitted'
@@ -239,6 +289,7 @@ def _pc_compare_record(name, record, plan_comp, out, strict):
         if _pc_int(record.get('n')) not in (None, 0):
             out['problems'].append(
                 f'comparison {name!r}: omitted record carries n={record.get("n")!r}')
+        _sync_row()
         return
 
     # Expected direction: a frozen directional claim and the artifact's
@@ -279,10 +330,12 @@ def _pc_compare_record(name, record, plan_comp, out, strict):
             _plan_problem(
                 f'comparison {name!r}: primary endpoint L{length} does not '
                 f'match the frozen endpoint L{plan_comp.get("length")}')
-        if cell.get('descriptive_only') is not False:
+        _descriptive = cell.get('descriptive_only')
+        if (not isinstance(_descriptive, (bool, np.bool_))
+                or bool(_descriptive)):
             out['problems'].append(
                 f'comparison {name!r}: the primary cell carries '
-                f'descriptive_only={cell.get("descriptive_only")!r}')
+                f'descriptive_only={_descriptive!r}')
         cell_p = _pc_num(cell.get('p_exact_signflip'))
         cell_mean = _pc_num(cell.get('mean'))
         if cell_p is None:
@@ -320,7 +373,9 @@ def _pc_compare_record(name, record, plan_comp, out, strict):
                             f'per_seed[{index}] disagree')
                         break
         cell_n = _pc_int(cell.get('n'))
-        headline_n = _pc_int(record.get('n_effective', record.get('n')))
+        headline_n = _pc_int(record.get('n_effective'))
+        if headline_n is None:
+            headline_n = _pc_int(record.get('n'))
         if cell_n is not None and headline_n is not None and cell_n != headline_n:
             out['problems'].append(
                 f'comparison {name!r}: headline n={headline_n} differs from '
@@ -376,8 +431,7 @@ def _pc_compare_record(name, record, plan_comp, out, strict):
             _plan_problem(
                 f'comparison {name!r}: delta_definition={delta_definition!r} '
                 f'does not start with the frozen {expected_prefix!r}')
-    if row['problems'] or out['problems'] and not strict:
-        row['status'] = 'fail'
+    _sync_row()
 
 
 def audit_plan_conformance(path=None, manifest_path=None):
@@ -477,20 +531,20 @@ def audit_plan_conformance(path=None, manifest_path=None):
             out['problems'].append(
                 'artifact manifest.primary_comparison_names contains duplicates')
         if set(_art_names) != set(plan['names']):
-            _plan_problem(
+            _pc_plan_problem(out, strict,
                 'artifact manifest family does not equal the tracked plan: '
                 f'missing={sorted(set(plan["names"]) - set(_art_names))} '
                 f'extra={sorted(set(_art_names) - set(plan["names"]))}')
     else:
-        _plan_problem(
+        _pc_plan_problem(out, strict,
             'artifact manifest.primary_comparison_names is missing; a deleted '
             'comparison cannot be ruled out')
     _extra = sorted(set(map(str, comps)) - set(plan['names']))
     _missing = sorted(set(plan['names']) - set(map(str, comps)))
     if _missing:
-        _plan_problem(f'artifact is missing frozen comparisons: {_missing}')
+        _pc_plan_problem(out, strict, f'artifact is missing frozen comparisons: {_missing}')
     if _extra:
-        _plan_problem(f'artifact carries undeclared comparisons: {_extra}')
+        _pc_plan_problem(out, strict, f'artifact carries undeclared comparisons: {_extra}')
 
     holm = ft.get('holm')
     if not isinstance(holm, dict):
@@ -500,9 +554,9 @@ def audit_plan_conformance(path=None, manifest_path=None):
         _h_missing = sorted(set(plan['names']) - set(map(str, holm)))
         _h_extra = sorted(set(map(str, holm)) - set(plan['names']))
         if _h_missing:
-            _plan_problem(f'artifact holm block is missing slots: {_h_missing}')
+            _pc_plan_problem(out, strict, f'artifact holm block is missing slots: {_h_missing}')
         if _h_extra:
-            _plan_problem(f'artifact holm block has undeclared slots: {_h_extra}')
+            _pc_plan_problem(out, strict, f'artifact holm block has undeclared slots: {_h_extra}')
 
     # Alpha and the correction family are part of the pre-registered decision
     # rule; a silently changed alpha changes every reject/accept boundary.
@@ -513,7 +567,7 @@ def audit_plan_conformance(path=None, manifest_path=None):
     else:
         out['alpha'] = art_alpha
         if plan['alpha'] is not None and abs(art_alpha - plan['alpha']) > 1e-12:
-            _plan_problem(
+            _pc_plan_problem(out, strict,
                 f'artifact alpha={art_alpha!r} does not match the frozen '
                 f'{plan["alpha"]!r}')
     art_stats = artifact_manifest.get('statistics')
@@ -521,14 +575,14 @@ def audit_plan_conformance(path=None, manifest_path=None):
         art_corr = _pc_text(art_stats.get('correction'))
         if art_corr is not None and plan['correction'] is not None \
                 and art_corr != plan['correction']:
-            _plan_problem(
+            _pc_plan_problem(out, strict,
                 f'artifact statistics.correction={art_corr!r} does not match '
                 f'the frozen {plan["correction"]!r}')
         if 'min_seeds_for_confirmation' in art_stats \
                 and plan['min_seeds_for_confirmation'] is not None:
             art_min = _pc_int(art_stats.get('min_seeds_for_confirmation'))
             if art_min != plan['min_seeds_for_confirmation']:
-                _plan_problem(
+                _pc_plan_problem(out, strict,
                     'artifact statistics.min_seeds_for_confirmation='
                     f'{art_stats.get("min_seeds_for_confirmation")!r} does not '
                     f'match the frozen {plan["min_seeds_for_confirmation"]!r}')
@@ -536,11 +590,13 @@ def audit_plan_conformance(path=None, manifest_path=None):
     for name in plan['names']:
         record = comps.get(name)
         if record is None:
-            _plan_problem(f'artifact is missing comparison {name!r}')
+            _pc_plan_problem(out, strict, f'artifact is missing comparison {name!r}')
             continue
         _pc_compare_record(name, record, plan['comparisons'][name], out, strict)
         row = out['comparisons'].get(name) or {}
-        if row.get('status') == 'omitted':
+        # Count by the artifact record, not the final row status: an omitted
+        # record that also carries a non-fatal warning is still omitted.
+        if isinstance(record, dict) and 'omitted' in record:
             out['n_omitted'] += 1
         elif row.get('endpoint') is not None:
             out['n_primary'] += 1

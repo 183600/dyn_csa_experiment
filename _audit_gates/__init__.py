@@ -38,6 +38,7 @@ _PARTS = [
 'part_25_audit_data_exposure.py',
 'part_26_audit_unit_order.py',
 'part_27_audit_cleaning_replay.py',
+'part_28_audit_plan_conformance.py',
 ]
 
 load_root_package(globals(), __file__, _PARTS,

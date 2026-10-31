@@ -336,9 +336,15 @@ def replay_train_validation_cleanup(train_rows, validation_rows, *, train_meta,
         return out
     out['fit_rows'] = int(fit_rows)
     if max_rows:
+        # The fit prefix is seeded (and hashed) independently of the train
+        # scan: the loader can stop the training stream before it reaches the
+        # end of the tokenizer-fit rows.  A small recorded ``train_scanned``
+        # must therefore not let an arbitrarily large fit prefix bypass the
+        # row budget.
         over_guard = [
             (label, count) for label, count in
-            (('train', train_scanned), ('validation', val_scanned))
+            (('train', train_scanned), ('train fit prefix', fit_rows),
+             ('validation', val_scanned))
             if int(count) > int(max_rows)]
         if over_guard:
             problems.extend(
@@ -857,10 +863,14 @@ def replay_wikitext_cleaning(cache_dir=None, raw_dir=None, *,
         _val_probe.get('nonempty_rows_scanned'),
         name='sampling.validation.nonempty_rows_scanned',
         problems=_scan_problems, allow_none=True)
+    _fit_probe = _replay_count(
+        meta.get('tokenizer_fit_rows'), name='tokenizer_fit_rows',
+        problems=_scan_problems, allow_none=True, minimum=1)
     if max_rows:
         _over_guard = [
             (label, count) for label, count in
-            (('train', _train_scanned_probe), ('validation', _val_scanned_probe))
+            (('train', _train_scanned_probe), ('train fit prefix', _fit_probe),
+             ('validation', _val_scanned_probe))
             if count is not None and int(count) > int(max_rows)]
         if _over_guard:
             problems.extend(

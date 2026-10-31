@@ -57,6 +57,14 @@
                by-length 曲线逐项重放；缺 per_seed 报 not_verifiable，
                存值与重算不一致判 fail（零 GPU，只读，不改 p/Holm）
                别名：pvalue_replay / recompute_p；可传一个 artifact 路径
+  plan_conformance  预注册一致性：把 test_stats.json 的每个比较绑定回
+               confirmation_frozen.json 的同一问题——族、主端点、期望方向、
+               mechanism 声明、alpha/Holm 槽位，以及 headline p/mean 与标为
+               primary 的 by-length cell 的内部一致性。artifact 记录的
+               manifest 摘要与当前清单相同才把 plan 差异判 fail，否则降级
+               为 warning；不重算 p、不改变冻结判定（零 GPU；别名
+               confirmation_plan / plan_match / preregistration / prereg；
+               可传 artifact 路径与可选的 manifest 路径）
   missingness   缺失数据敏感性：按 run_manifest 的计划单元重算每个对照的
                观测/缺失/被控制门排除计数、声明范围内总体均值的 sharp
                bounds 与「抹掉符号/SESOI」的 tipping value；缺计划或旧
