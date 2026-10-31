@@ -178,9 +178,60 @@ def _cps_entry_effect(entry):
             raise _CrossPanelSynthesisError(
                 'recorded relative_effect_pct is inconsistent with the '
                 'per-seed deltas/without_mean')
+    # Optional per-seed arm PPLs.  When every panel records them, the true
+    # paired log ratio is `log(with_i) - log(without_i)`.  Without them the
+    # only exact transform of the recorded percent effect is
+    # `log1p(percent/100) = log(with_i / without_mean)`, which uses the
+    # panel's mean baseline; the two are NOT interchangeable and the scale
+    # readout names which one it used.  Supplying only one of the two vectors
+    # is a malformed panel, not a silent fallback.
+    _log_effects = None
+    _per_seed_with = None
+    _per_seed_without = None
+    _raw_with = entry.get('per_seed_with')
+    _raw_without = entry.get('per_seed_without')
+    if _raw_with is not None or _raw_without is not None:
+        if _raw_with is None or _raw_without is None:
+            raise _CrossPanelSynthesisError(
+                'per_seed_with/per_seed_without must be supplied together')
+        for name, raw in (('per_seed_with', _raw_with),
+                          ('per_seed_without', _raw_without)):
+            if not isinstance(raw, (list, tuple)) or len(raw) != n:
+                raise _CrossPanelSynthesisError(
+                    f'{name} length does not match the per-seed deltas')
+        _wv, _wov = [], []
+        for i, (raw_a, raw_b) in enumerate(zip(_raw_with, _raw_without)):
+            fa = _cps_number(raw_a, f'per_seed_with[{i}]', positive=True)
+            fb = _cps_number(raw_b, f'per_seed_without[{i}]', positive=True)
+            _tol = 1e-9 * max(1.0, abs(float(vals[i])))
+            if not math.isclose(fa - fb, float(vals[i]),
+                                rel_tol=1e-9, abs_tol=_tol):
+                raise _CrossPanelSynthesisError(
+                    f'per_seed_with[{i}] - per_seed_without[{i}] does not '
+                    'match deltas[{i}]')
+            _wv.append(fa)
+            _wov.append(fb)
+        # Same guarded mean the producer used for `without_mean`, so an
+        # extreme-but-finite PPL panel is not rejected by an overflow in the
+        # cross-check itself.
+        _bmean = _scaled_mean_or_raw(_wov)
+        if not math.isclose(_bmean, without_mean, rel_tol=1e-9, abs_tol=1e-12):
+            raise _CrossPanelSynthesisError(
+                'mean(per_seed_without) does not match without_mean')
+        _log_effects = [float(math.log(a) - math.log(b))
+                        for a, b in zip(_wv, _wov)]
+        _per_seed_with = [float(x) for x in _wv]
+        _per_seed_without = [float(x) for x in _wov]
     out = {'effects': [float(x) for x in effects], 'seeds': [int(s) for s in seeds],
            'n': int(n), 'mean': mean, 'sd': sd, 'se': se,
            'without_mean': without_mean, 'complete_pairs': True}
+    if _log_effects is not None:
+        out['log_effects'] = _log_effects
+        out['log_ratio_basis'] = 'paired_per_seed'
+        out['per_seed_with'] = _per_seed_with
+        out['per_seed_without'] = _per_seed_without
+    else:
+        out['log_ratio_basis'] = None
     for key in ('with', 'without', 'kind'):
         if key in entry:
             out[key] = entry.get(key)
@@ -521,6 +572,7 @@ def cross_panel_synthesis(reports, design=None, *, alpha=0.05, min_n=3,
            'components': {}, 'warnings': [],
            'poolable_components': [], 'heterogeneous_components': [],
            'dependent_components': [], 'selection_sensitive_components': [],
+           'scale_sensitive_components': [],
            'note': ('cross-panel synthesis includes every estimable panel, '
                     'regardless of significance; verified-only pooling is '
                     'reported only as a selection-bias sensitivity.  It does '
@@ -623,6 +675,8 @@ def cross_panel_synthesis(reports, design=None, *, alpha=0.05, min_n=3,
             block['panels'] = {
                 e['panel']: {k: e.get(k) for k in
                              ('n', 'seeds', 'effects', 'mean', 'sd', 'se',
+                              'log_effects', 'log_ratio_basis',
+                              'per_seed_with', 'per_seed_without',
                               'verified', 'incomplete_ablation',
                               'direction_conflict', 'practically_harmful',
                               'predicted_sign', 'observed_sign',
@@ -722,6 +776,24 @@ def cross_panel_synthesis(reports, design=None, *, alpha=0.05, min_n=3,
                                         or 'meta-analysis is not estimable')
                 comp_block['contrasts'][key] = block
                 continue
+            # Effect-scale sensitivity: the shared meta core documents log
+            # PPL ratios, while the historical synthesis input is the
+            # percent-of-without effect.  Report both and require them to
+            # agree before the pooled effect is called scale-robust.  The
+            # helper is defined by the next fragment; it is resolved at call
+            # time (the package always loads every fragment before a driver
+            # calls this function).
+            _scale_contrast = globals().get('cross_panel_scale_contrast')
+            _scale = None
+            if _scale_contrast is not None:
+                try:
+                    _scale = _scale_contrast(block, alpha=alpha, min_n=min_n)
+                except (TypeError, ValueError, OverflowError) as _scale_exc:
+                    _scale = {
+                        'kind': 'cross_panel_scale_contrast',
+                        'status': 'not_estimable',
+                        'reasons': [f'{type(_scale_exc).__name__}: {_scale_exc}']}
+                block['scale_sensitivity'] = _scale
             # Panel dependence: component_draws are optional; missing identity
             # is unattested, never independent.
             draws = {e['panel']: e['draws'] for e in entries}
@@ -738,6 +810,22 @@ def cross_panel_synthesis(reports, design=None, *, alpha=0.05, min_n=3,
             block['claim_allowed'] = claim['claim_allowed']
             block['evidence_tier'] = claim['evidence_tier']
             block['reasons'].extend(claim['reasons'])
+            _scale_discordant = bool(
+                isinstance(_scale, dict)
+                and _scale.get('status') in ('direction_discordant',
+                                             'precision_discordant',
+                                             'poolability_discordant'))
+            if _scale_discordant:
+                block['claim_allowed'] = False
+                block['reasons'].append(
+                    'the pooled effect is not robust to the effect scale '
+                    f'({_scale.get("status")}); the log-ratio and percent '
+                    'estimands disagree')
+            elif isinstance(_scale, dict) and _scale.get('status') == 'not_estimable':
+                block['reasons'].append(
+                    'the log-ratio scale could not be estimated from the '
+                    'recorded pairs; the pooled claim is percent-only and is '
+                    'not scale-robust')
             if any(e.get('direction_conflict') for e in entries):
                 block['claim_allowed'] = False
                 block['reasons'].append(
@@ -800,6 +888,9 @@ def cross_panel_synthesis(reports, design=None, *, alpha=0.05, min_n=3,
                     'unattested'):
                 block['status'] = 'dependent_draws'
                 out['dependent_components'].append(comp)
+            elif _scale_discordant:
+                block['status'] = 'scale_sensitive'
+                out['scale_sensitive_components'].append(comp)
             else:
                 block['status'] = 'not_poolable'
             comp_block['contrasts'][key] = block
@@ -823,8 +914,24 @@ def cross_panel_synthesis(reports, design=None, *, alpha=0.05, min_n=3,
     out['n_contrasts'] = sum(len(c.get('contrasts') or {})
                              for c in out['components'].values())
     for list_key in ('poolable_components', 'heterogeneous_components',
-                     'dependent_components', 'selection_sensitive_components'):
+                     'dependent_components', 'selection_sensitive_components',
+                     'scale_sensitive_components'):
         out[list_key] = sorted(set(out[list_key]))
+    # Aggregate the per-contrast effect-scale readout.  Kept as a nested
+    # block so the synthesis report carries one place that says whether the
+    # common effect survives the percent -> log-ratio scale choice.
+    _scale_summary = globals().get('cross_panel_scale_sensitivity')
+    if _scale_summary is not None:
+        try:
+            out['scale_sensitivity'] = _scale_summary(
+                out, alpha=alpha, min_n=min_n)
+        except (TypeError, ValueError, OverflowError) as _scale_exc:
+            out['scale_sensitivity'] = {
+                'kind': 'cross_panel_scale_sensitivity',
+                'status': 'not_estimable',
+                'reason': f'{type(_scale_exc).__name__}: {_scale_exc}',
+                'note': ('the effect-scale sensitivity could not be computed; '
+                         'no scale-robust claim is supported')}
     if any_measured:
         out['status'] = 'warn' if out['warnings'] else 'ok'
     else:

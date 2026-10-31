@@ -384,8 +384,25 @@ def audit_panel_synthesis(path=None):
             _harmful = any(bool((panels.get(str(pt.get('label'))) or {})
                                 .get('practically_harmful'))
                            for pt in points)
+            # Effect-scale gate: a pooled claim may not survive when the
+            # percent and log-ratio estimands disagree.  Recompute it from the
+            # recorded per-seed effects instead of trusting the stored block.
+            _scale_discordant = False
+            _scale_stored = b.get('scale_sensitivity')
+            if isinstance(_scale_stored, dict):
+                try:
+                    _scale_replay = L.cross_panel_scale_contrast(
+                        dict(b, meta=meta), alpha=alpha, min_n=min_n)
+                except (TypeError, ValueError, OverflowError) as exc:
+                    out['problems'].append(
+                        f'{label}: scale-sensitivity replay failed '
+                        f'({type(exc).__name__}: {exc})')
+                else:
+                    _scale_discordant = _scale_replay.get('status') in (
+                        'direction_discordant', 'precision_discordant',
+                        'poolability_discordant')
             _claim_final = bool(claim.get('claim_allowed')) and not (
-                _conflict or _harmful)
+                _conflict or _harmful or _scale_discordant)
             if bool(b.get('claim_allowed')) != _claim_final:
                 out['problems'].append(
                     f'{label}: claim_allowed {b.get("claim_allowed")!r} != '
@@ -413,6 +430,8 @@ def audit_panel_synthesis(path=None):
                     'new_seeds_shared_evaluation', 'unattested_evaluation',
                     'unattested'):
                 _expected_status = 'dependent_draws'
+            elif _scale_discordant:
+                _expected_status = 'scale_sensitive'
             else:
                 _expected_status = 'not_poolable'
             if status != _expected_status:

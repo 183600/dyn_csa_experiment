@@ -2079,6 +2079,12 @@ def _run_cli():
                   'cross_panel': audit_panel_synthesis,
                   'poolability': audit_panel_synthesis,
                   'evidence_synthesis': audit_panel_synthesis})
+    _cmds.update({'panel_scale_sensitivity': audit_panel_scale_sensitivity,
+                  'scale_sensitivity': audit_panel_scale_sensitivity,
+                  'panel_scale': audit_panel_scale_sensitivity,
+                  'synthesis_scale': audit_panel_scale_sensitivity,
+                  'cross_panel_scale': audit_panel_scale_sensitivity,
+                  'scale_robustness': audit_panel_scale_sensitivity})
     _arg = sys.argv[1] if len(sys.argv) > 1 else 'report'
     if _arg in ('-h', '--help'):
         print(__doc__)
@@ -2126,7 +2132,9 @@ def _run_cli():
     elif _arg in ('joint_correction', 'joint', 'maxt', 'max_t'):
         _r = _cmds[_arg](list(_pos) or None)
     elif _arg in ('panel_synthesis', 'synthesis', 'cross_panel', 'poolability',
-                  'evidence_synthesis'):
+                  'evidence_synthesis', 'panel_scale_sensitivity',
+                  'scale_sensitivity', 'panel_scale', 'synthesis_scale',
+                  'cross_panel_scale', 'scale_robustness'):
         _r = _cmds[_arg](*_pos)
     else:
         _r = _cmds[_arg]()

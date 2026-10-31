@@ -77,6 +77,15 @@
                selection 读数判 fail；不改变任何 panel 的 p/Holm/verified 或
                冻结判定（零 GPU；别名 synthesis / cross_panel / poolability /
                evidence_synthesis）
+   panel_scale_sensitivity  跨 panel 合成重放：从 synthesis 块记录的逐 panel
+               逐种子百分比效应重算 log1p(e/100) 的 log-ratio 元分析、
+               反变换百分比、Jensen 差、方向/零排除一致性与
+               `claim_allowed_on_both_scales`；两尺度分歧时要求主 claim 已
+               收回且状态为 scale_sensitive。缺块报 not_verifiable，篡改
+               log 输入点/派生读数/汇总或夹带 confirmed 等判 fail；不产生
+               新 p 值、不进入 Holm、不改变冻结判定（零 GPU；别名
+               scale_sensitivity / panel_scale / synthesis_scale /
+               cross_panel_scale / scale_robustness）
   missingness   缺失数据敏感性：按 run_manifest 的计划单元重算每个对照的
                观测/缺失/被控制门排除计数、声明范围内总体均值的 sharp
                bounds 与「抹掉符号/SESOI」的 tipping value；缺计划或旧

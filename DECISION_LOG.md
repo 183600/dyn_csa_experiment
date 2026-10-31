@@ -5879,3 +5879,90 @@ scaling law，也不能替代按规模分层的读数。
 selection/依赖/留一等多类篡改 fail、缺块不可验证、裸 synthesis 报告可审计、CLI 别名可达。
 `test_review_part_01/07`（覆盖率/复现相关）与完整 CPU 套件在本轮最终
 树通过。
+
+## 2026-10-31 — 跨 panel 合成的尺度稳健性：百分比与 log ratio 并列，尺度分歧时收回共同效应（本轮结果分析硬化，no new runs）
+
+零 GPU；不新增训练、不读取 test split、不修改
+`confirmation_frozen*.json` 的字节/种子/端点/α/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未删除、未修改、未移动。
+
+**Problem.** §124 的跨 panel 合成把逐 panel 效应写成 without 臂 PPL 的
+百分比（`100*(with-without)/without_mean`），再交给
+`meta_analyze_effects`；但该核心的文档化输入是
+`paired_log_ratio` 产生的 log PPL 比。§124.4 已承认「相对百分比不是
+log ratio」，却把效应尺度留作未枚举选择。后果可测：(1) 两个尺度的
+within-panel 方差不同，inverse-variance 权重不同，合并均值不同；
+(2) 逐 panel 百分比的均值不等于合并 log 效应反变换后的百分比
+（Jensen 偏差）——-10%/-50%/-50% 三个 panel 的算术百分比均值是
+-36.613%，均值基线 log 反变换是 -39.167%；(3) 零排除结论可以随尺度翻转——
+三 panel 例子（约 -6.5/-6.0/-1.8、-10.5/-2.0/-8.8、-8.0/+1.9/-11.6）
+两尺度都 poolable（I²=0、Q p=0.732），百分比区间
+[-10.720,-0.0497] 排除 0，均值基线 log 区间 [-0.11164,+0.000158] 包含 0。
+§105 只在单个确认对比上并列 raw/log；`analysis_choice_concordance`
+只比较聚合口径；跨 panel 层没有尺度检查。
+
+**Fix.** 新增 `explib/_parts/part_64_cross_panel_scale_sensitivity.py`：
+
+- `cross_panel_scale_contrast(block)` 优先使用 panel 行里的逐种子
+  `per_seed_with`/`per_seed_without`，算真正的
+  `log(with_i)-log(without_i)`（`paired_per_seed`）；任一纳入 panel
+  缺这组向量时，整族退回
+  `log1p(percent/100) = log(with_i/without_mean)`
+  （`panel_mean_without`，是相对 panel 均值基线的 log 比，不是配对 log
+  比），并在 `log_ratio_basis`/`per_seed_ppl_panels` 说明。两种基座不
+  混用；均值基线基座下 `<= -100%`（with 臂 PPL 非正）报
+  `not_estimable`，不伪造 log 值。`step_00.py` 在逐种子两臂 PPL 都
+  可用且与 `seeds`/`deltas` 同长时写入这两个可选字段。
+- 百分比侧复用块内 `meta`，log 侧用同一批 points 调 `_cps_pool`
+  （内部仍是 `meta_analyze_effects`）；并列给出 mean/SE/CI/poolable、
+  反变换 `100*(exp(mean)-1)`、区间端点反变换与
+  `jensen_gap_pct`。不实现第二套元分析、不产生新 p 值。
+- `direction_agree` / `zero_exclusion_agree` / `poolable` 一致是显式
+  判据；缺一侧估计写 `None`，不把「没算出来」当通过。状态为
+  `concordant`/`direction_discordant`/`precision_discordant`/
+  `poolability_discordant`/`not_estimable`；
+  `claim_allowed_on_both_scales` 需要两侧都 poolable、同方向、同零排除。
+  可构造的 poolability 分歧例：百分比 I²=48.8%（poolable）而 log 侧
+  I²=56.4%（not poolable）。
+- `cross_panel_synthesis` 在算出主 claim 后调用它：任一分歧
+  （方向/零排除/可合并性）时 `claim_allowed=False`、写具名 reason、
+  状态改 `scale_sensitive`、
+  组件记入 `scale_sensitive_components`；块末尾写
+  `out['scale_sensitivity']` 汇总。百分比 `meta` 语义与值不变。
+- 新增 `_audit_gates/_parts/part_30_audit_panel_scale_sensitivity.py`：
+  从 `meta_input.points` 重算百分比元分析、按 panel 行实际保留的输入
+  （`per_seed_with/without` 或逐 panel `effects`，并核对
+  `log_ratio_basis`）重算 log 值、log 元分析与所有派生读数、一致性与
+  尺度稳健 claim；分歧时
+  要求主 claim 已收回且状态为 `scale_sensitive`（方向/零排除/可合并性
+  任一分歧）；缺块
+  `not_verifiable_locally`，篡改/夹带 `confirmed`/`p_holm`/`verdict`/
+  `decision` 判 fail；裸 synthesis 可审计。CLI 别名
+  `panel_scale_sensitivity`/`scale_sensitivity`/`panel_scale`/
+  `synthesis_scale`/`cross_panel_scale`/`scale_robustness`。
+- `audit_panel_synthesis` 的 claim/status 重放接入同一尺度门，把
+  `scale_sensitive` 纳入预期状态，旧审计不会误判新合成。
+
+**Boundary.** 不把 log 追认为唯一正确尺度：两值并列，`concordant`
+只表示尺度选择不改变方向/零排除，不表示效应真实或可迁移；不是第二个
+可选估计。不产生新 p 值、不进入 Holm、不改变任何 panel 的
+`verified`/`confirmed`、冻结清单、种子、α 或 `CODE_SEMANTICS`；
+`jensen_gap_pct` 不是偏差校正。尺度门在 §124 的 panel 排除、方向/
+语料、依赖分类之后运行，`poolable=False` 时只发布描述值；非正 PPL
+不被修复、不回填、不改百分比 meta；log 比仍只在同一 tokenization 下
+定义。
+
+**Verification.** 新增 `test_review_part_65.py` 11 项：一致 panel 两尺度
+都 poolable、反变换/Jensen 差、尺度稳健 claim 通过；异质 panel 报
+Jensen 差但不重开 claim；找到的三 panel 例子判 `precision_discordant`、
+主 claim 收回、状态 `scale_sensitive`、汇总 warn；百分比 poolable
+而 log 侧不 poolable 时判 `poolability_discordant` 并收回 claim；
+逐种子两臂 PPL 可用时用真正的 `paired_per_seed` log 比（与 `log1p`
+近似不同），缺一个 panel 时整族退回 `panel_mean_without` 且不混用基座；
+-100% 效应
+`not_estimable`；尺度块不改变原百分比 meta 与 `verified_anywhere`，
+关掉尺度函数后同一输入回到历史 claim（证明门确实由本块触发）；严格
+JSON 与同输入重放；审计重放 ok、篡改 log 均值/一致性/输入点判 fail、
+缺块不可验证、裸 synthesis 可审计；伪造 `claim_allowed`/状态判 fail；
+`confirmed` 夹带判 fail；CLI 别名可达。`test_review_part_64.py` 11 项
+与完整 CPU 套件在本轮最终树通过。
