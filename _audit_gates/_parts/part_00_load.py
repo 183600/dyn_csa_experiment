@@ -297,6 +297,15 @@
                被改判 fail，缺文件报 not_verifiable。它不新增检验/p 值/Holm
                槽位，也不改冻结判定（零 GPU；别名 protocol / protocol_gate /
                design_registration / analysis_binding）
+  preparation_clearance  发射前准备放行：一份 content-hash 绑定的
+               preparation_clearance.json，把同一 design_protocol 哈希与
+               完整区组随机化、失败处置计划、test 前功效产物、分析闭包、
+               预演（confirmation plan）、未读 test 状态和依赖锁绑在一起，
+               并要求 protocol.created_at <= clearance.created_at <= 首条
+               cell 事件。confirmatory 缺任一必需项判 fail（不是 warning），
+               记录晚于执行判 reconstruction；缺文件报 not_verifiable。
+               不新增检验/p 值/Holm 槽位，也不改冻结判定（零 GPU；别名
+               preparation / clearance / launch_clearance / readiness）
   evaluation_order  最终测试评估顺序 / 测量时间混杂：检查 P5T 在读取 test
                前写下的 clean_by_length_order.json / distractor_probe_order.json
                是否为完整区组、位置平衡、覆盖全部 (arm, seed)，并复核

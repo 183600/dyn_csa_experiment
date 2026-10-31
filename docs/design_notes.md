@@ -12051,3 +12051,141 @@ warning；实现里的 `code_semantics` 必须与分析 section 一致；非法�
 输出 `implementation`，且不产生任何 test/p/Holm/verdict 字段；
 `design_protocol_preflight_summary` 带 implementation 状态。完整 CPU
 套件在本轮最终树通过。
+
+## 130. 登记了设计不等于可以开跑：发射前 `preparation_clearance`（本轮实验设计与准备硬化）
+
+零 GPU；不新增训练、不读取 test split、不修改
+`confirmation_frozen*.json` 的字节/种子/端点/α/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未删除、未修改、未移动。
+
+### 130.1 问题：设计协议回答「要做什么」，不回答「能不能开跑」
+
+§127/§129 的 `design_protocol` 已经把问题、端点、臂、种子、随机化、
+停止规则、分析族、数据切分、失败处置和分析闭包绑成一份事前登记。
+但登记只证明**意图**在首条 cell 之前写成；它不要求执行所需的条件在
+同一时刻真的成立。仓库里每一项准备条件都另有对象、另有命令：
+
+- `run_order.json` 是否是注册 cell 的完整、位置平衡随机化；
+- `run_disposition.json` 是否覆盖同一批 cell、策略是否就是注册的那份；
+- `power_validation.json` 是否在 test 之前按注册 q/α/n 真正跑过并通过；
+- 依赖锁与当前测量栈是否一致；
+- `python -m explib.confirmation plan` 的预演是否真的通过；
+- held-out split 是否**尚未**被读取。
+
+这些检查各自有效，却没有一个对象要求它们**同时**成立，也没有一个对象
+把它们的失败与「首条 cell 之后补做」区分开。实际后果是：一份完整的
+protocol、一个合法的 run order、一个已存在的 power 文件，可以分别来自
+三次不同的准备，仍然看起来像一次已就绪的发射；只要没有人手动把六个
+命令都跑一遍，缺一项也不会阻止开跑。
+
+### 130.2 方法：一份 `content_sha256` 绑定的发射放行证
+
+新增 `explib/_parts/part_68_preparation_clearance.py`：
+
+- `build_preparation_clearance(protocol, run_order=..., disposition=...,
+  power=..., source_tree=..., rehearsal=..., test_access_state=...,
+  dependency_contract=..., environment=..., created_at=...)` 只**誊写**
+  已有证据，不补默认值、不虚构通过。输出固定 `checks`：
+  `protocol`、`source_tree`、`run_order`、`disposition`、`power`、
+  `rehearsal`、`test_access`、`dependency`、`environment`、
+  `temporal_order`。
+- `content_sha256` 只排除 `created_at`/`revision`/`supersedes`/`reason`/
+  `notes`；十项检查、`required_checks`、协议哈希与 `launch_allowed`
+  都在哈希内。改一项检查状态而不重算哈希，审计立即拒绝。
+- `study.design_protocol_sha256` 绑定被登记协议的 `content_sha256`；
+  协议后来被改写（即使 clearance 自身哈希正确）也会在
+  `validate_preparation_clearance(protocol=...)` 中 fail。
+- `required_checks` 是**声明**而不是从当前文件推断：confirmatory 的
+  必需项是 `protocol/source_tree/run_order/disposition/power/rehearsal/
+  test_access/dependency`；只有协议明确没有 power gate 时 `power` 才
+  从必需项中移除。exploratory/draft 的缺项降为 warning，但
+  `launch_allowed` 仍为 false——草稿可以准备，不能被当成已放行。
+
+### 130.3 判据：每项检查只认「同一场实验」的证据
+
+| 检查 | 通过条件 |
+|---|---|
+| `protocol` | kind/schema 正确，`content_sha256` 可从正文重算，`validate_design_protocol` 无 problem；协议正文里的 power 投影 warning 只在提供了匹配的 power 产物时才被该项消除 |
+| `source_tree` | 当前分析闭包摘要、文件数、`code_semantics` 与协议 `analysis.implementation` 一致；注册时为 `ok` 的 split registry 不得退化为非 ok |
+| `run_order` | `run_order_balance.design_ok=true`；`planned_cells` 与协议注册的**顺序完全一致**；design name/seed/block/position-balance 一致；声明了 environment slots 时 `environment_plan_audit` 必须 ok |
+| `disposition` | `run_disposition` 正文哈希可重算；policy 与协议 `operations.disposition` 完全一致；cell 集合覆盖注册 cell |
+| `power` | 协议要求 gate 时，必须提供 `status=pass`/`all_pass=true` 的产物；α、family size、q、target power 与协议一致；每个方向性对照的 `power_ok=true`（或 power 表在注册 q 处 ≥ target）；校准 n ≥ `min_n` |
+| `rehearsal` | confirmatory 必须提供 `confirmation plan` 预演结果且 `ok=true`；预演声明的分析闭包若存在必须与注册一致 |
+| `test_access` | 必须显式记录 held-out 未读；`true` 表示 clearance 已不再前瞻，判 fail |
+| `dependency` | `dependency_contract.status=ok`；缺锁或 mismatch 判 fail（confirmatory） |
+| `environment` | 可选；提供时必须能解析出 environment identity，只记录摘要，不冒充平衡性证据 |
+| `temporal_order` | `protocol.created_at <= clearance.created_at` |
+
+`preparation_clearance_timing(clearance, events)` 再要求
+`clearance.created_at <= 首条非 analysis/report 事件`；晚于首条事件判
+`reconstruction`，缺事件/不可比报 `not_verifiable`，不是通过。
+
+### 130.4 接线与使用
+
+```bash
+python audit_gates.py preparation_clearance [path] [protocol_path]
+python audit_gates.py preparation           # 别名
+python audit_gates.py clearance             # 别名
+python audit_gates.py launch_clearance      # 别名
+python audit_gates.py readiness             # 别名
+make preparation
+```
+
+编译（在首条 cell 之前）：
+
+```python
+import json
+import exp_lib as L
+
+manifest = json.load(open('confirmation_frozen.json', encoding='utf-8'))
+protocol = json.load(open('design_protocol.json', encoding='utf-8'))
+clearance = L.build_preparation_clearance(
+    protocol,
+    run_order=json.load(open('run_order.json', encoding='utf-8')),
+    disposition=json.load(open('run_disposition.json', encoding='utf-8')),
+    power=json.load(open('analysis_v12/power_validation.json',
+                         encoding='utf-8')),
+    source_tree=L.source_tree_manifest(),
+    rehearsal=json.load(open('analysis_v12/plan_snapshot.json',
+                             encoding='utf-8'))['plan'],
+    test_access_state={'test_read': False,
+                       'evidence': 'results_lm_test/.freeze_lock.json absent'},
+    dependency_contract=L.dependency_contract(),
+    created_at='2026-10-31T00:01:00')
+print(L.write_preparation_clearance('.', clearance))
+```
+
+`audit_gates.py report` 顶层新增 `preparation_clearance` 块；
+`audit_design_preflight` 末尾也附加摘要：缺 clearance 只 warning，已有但
+不合格则并入 `violations` 并让 preflight fail。`archive_release.py`
+的 `ENV_FILES` 在文件存在时把 `preparation_clearance.json` 一并打包，
+使发布归档同时携带「设计登记」与「发射前准备放行」。
+
+### 130.5 边界
+
+- **不是新的显著性检验**。不产生 p 值、不进入 Holm、不改变
+  `verified`/`confirmed`、不重算 PPL、不读取任何测量数据。
+- **不是签名，也不是可信时间戳。** 能同时改写全部输入并重算 clearance
+  的人仍可伪造；它让「协议完整但准备不全」「六项证据来自不同实验」
+  「首条 cell 之后补 clearance」可见，不抗恶意。
+- **不是执行证明。** 通过 clearance 只说明开跑前证据齐全；训练是否
+  真的按计划执行仍由 `run_allocation`、`disposition`、`looks`、
+  `test_access` 与结果层审计回答。
+- **不追溯旧面板。** 没有 clearance 的 v6–v11 仍是
+  `not_verifiable_locally`，不会被本门追溯判 fail；v12 若在首条 cell
+  之后补 clearance，timing 会判 reconstruction。
+- **不把缺省当通过。** confirmatory 缺 power/rehearsal/held-out 状态/
+  依赖锁一律 fail，而不是「先跑起来再补」。
+
+### 130.6 验证
+
+新增 `test_review_part_72.py` 10 项：完整 clearance 的必需项/哈希/
+`launch_allowed` 与「时间戳不改变身份」；confirmatory 缺 run order/
+disposition/power/rehearsal/test-access/dependency 分别 fail 且具名，
+draft 只 warning 且不允许 launch；run order 缺 cell、换序、错 seed、
+arm-major 分别 fail；disposition 换 policy/缺 cell 分别 fail；power
+缺文件/失败态/错 q/低于 target/n<min_n 分别 fail 而匹配产物通过；
+分析闭包漂移 fail；clearance 晚于首条事件判 reconstruction；审计重放
+ok、磁盘 plan 漂移与正文篡改分别 fail、缺文件 not_verifiable；writer
+同内容 no-op、冲突不覆盖、带 supersedes 的 revision 才可替换。
+完整 CPU 套件在本轮最终树通过。

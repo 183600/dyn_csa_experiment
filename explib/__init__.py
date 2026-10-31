@@ -78,6 +78,7 @@ _PARTS = [
 'part_65_contrast_network.py',
 'part_66_design_protocol.py',
 'part_67_split_registry.py',
+'part_68_preparation_clearance.py',
 ]
 
 load_root_package(globals(), __file__, _PARTS,

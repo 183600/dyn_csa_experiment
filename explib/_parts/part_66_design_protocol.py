@@ -835,6 +835,11 @@ def build_design_protocol(
             'power_q': _dp_number(stats.get('power_q_for_test')),
             'power_method': _dp_text(stats.get('power_note')),
             'power_simulated': bool(stats.get('power_simulation_required')),
+            'power_gate_required': bool(
+                stats.get('require_power_gate')
+                or stats.get('power_simulation_required')),
+            'power_simulation_required': bool(
+                stats.get('power_simulation_required')),
             'resolution_floor': _dp_number(stats.get('min_attainable_p_holm')),
             'min_consistency': _dp_int(
                 stats.get('min_consistency_for_first_gate'), minimum=1,
@@ -1131,6 +1136,10 @@ def validate_design_protocol(protocol, *, require_complete=None):
          missing='sample_size.power_method')
     if method is not None and ss.get('power_simulated') is not True:
         _dp_warn(out, 'sample_size.power_method is a projection, not a simulation on this panel\'s validation deltas; treat it as a design aid')
+    for _flag in ('power_gate_required', 'power_simulation_required'):
+        if _flag in ss and not isinstance(ss.get(_flag), bool):
+            _dp_problem(out, f'sample_size.{_flag} must be boolean, got '
+                             f'{ss.get(_flag)!r}')
     if min_n is not None and fam_n is not None and alpha is not None:
         floor_at_min = _dp_resolution_floor(fam_n, min_n)
         out['checks']['resolution_floor_at_min_n'] = floor_at_min

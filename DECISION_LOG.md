@@ -6208,3 +6208,54 @@ analysis section 一致；非法摘要/零文件数/不可读文件 fail；身�
 覆盖 implementation 而不覆盖 `created_at`；audit 注入闭包漂移时 fail
 且输出 implementation，不产生 p/Holm/verdict 字段；preflight summary
 带 implementation 状态。完整 CPU 套件在本轮最终树通过。
+
+## 2026-10-31 — 设计已登记不等于可以开跑：发射前 `preparation_clearance`（本轮实验设计与准备硬化，no new runs）
+
+零 GPU；不新增训练、不读取 test split、不修改
+`confirmation_frozen*.json` 的字节/种子/端点/α/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未删除、未修改、未移动。
+
+**Problem.** §127/§129 的 `design_protocol` 证明设计意图在首条 cell 之前
+写成，但不证明执行所需的准备在同一时刻成立。run order 的完整区组/
+位置平衡、disposition 的 cell 覆盖与 policy 一致、test 前 power gate
+的真实产物、依赖锁、`confirmation plan` 预演、held-out 未读状态，各自
+是独立文件、独立命令；没有一个对象要求它们同时成立，也没有一个对象
+区分「开跑前」与「首条 cell 之后补做」。
+
+**Fix.** 新增 `explib/_parts/part_68_preparation_clearance.py`：
+`build_preparation_clearance(protocol, run_order=..., disposition=...,
+power=..., source_tree=..., rehearsal=..., test_access_state=...,
+dependency_contract=..., environment=...)` 把已有证据誊写进一份
+`content_sha256` 绑定的 `preparation_clearance`，固定十项检查：
+protocol/source_tree/run_order/disposition/power/rehearsal/test_access/
+dependency/environment/temporal_order。confirmatory 的必需项缺一即
+fail：run order 必须与注册 cell 序列逐项相同且 `design_ok`、disposition
+policy 必须与注册一致且覆盖同一 cell 集、power 产物的 α/m/q/target 必须
+匹配且各方向性对照 `power_ok`、校准 n ≥ min_n、必须提供通过的分阶段
+预演、必须显式记录 held-out 未读、必须提供 `status=ok` 的依赖锁。
+exploratory/draft 的缺项降为具名 warning，但 `launch_allowed=false`。
+`preparation_clearance_timing` 还要求
+`protocol.created_at <= clearance.created_at <= 首条非 analysis/report
+事件`；晚于首条事件判 reconstruction。`write_preparation_clearance`
+同内容 no-op、冲突不覆盖、只有带 `supersedes` 的 revision 才能替换。
+新增 `audit_gates.py preparation_clearance`（别名 preparation / clearance /
+launch_clearance / readiness）与 `make preparation`，`run_report` 顶层
+和 `audit_design_preflight` 都读取该块（缺文件只 warning，已有但不合格
+并入 violations）；`archive_release.ENV_FILES` 在文件存在时把
+`preparation_clearance.json` 一起打包。
+
+**Boundary.** 不是新的显著性检验：不产生 p/Holm、不改
+`verified`/`confirmed`、不重算 PPL、不读 test。不是签名/可信时间戳，
+不抗同时改写全部输入并重算摘要的恶意；不是执行证明，真正的执行一致性
+仍由 `run_allocation`、`disposition`、`looks`、`test_access` 与结果层
+审计分别回答。不追溯旧面板：没有 clearance 的 v6–v11 仍是
+`not_verifiable_locally`，不会被追溯判 fail；v12 在首条 cell 之后补
+clearance 会被 timing 判 reconstruction。
+
+**Verification.** 新增 `test_review_part_72.py` 10 项：完整 clearance 的
+必需项/哈希/launch 判定；confirmatory 六类缺项分别 fail、draft 只
+warning；run order 缺 cell/换序/错 seed/arm-major；disposition 换 policy/
+缺 cell；power 缺文件/失败态/错 q/低于 target/n<min_n；分析闭包漂移；
+clearance 晚于首条事件；审计重放 ok、磁盘 plan 漂移与正文篡改、缺文件
+not_verifiable；writer 的 no-op/conflict/revision。完整 CPU 套件在本轮
+最终树通过。

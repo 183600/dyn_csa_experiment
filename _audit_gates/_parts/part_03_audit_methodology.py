@@ -1163,6 +1163,31 @@ def audit_design_preflight(manifest_path=None, dynamic_path=None):
         out['warnings'].append(
             f'design protocol: the registration gate could not run '
             f'({type(_dpe).__name__}: {_dpe})')
+    # A protocol is a statement of intent; a clearance is the evidence that
+    # the machinery needed to execute it was ready before the first cell.
+    # Re-check the stored clearance too, but an absent clearance only warns:
+    # legacy panels must not become retroactively invalid.
+    try:
+        _pc = L.preparation_clearance_preflight_summary()
+        out['preparation_clearance'] = _pc
+        if _pc.get('status') == 'fail':
+            out['violations'].extend(
+                f'preparation clearance: {x}'
+                for x in (_pc.get('problems') or [])[:12])
+        elif _pc.get('status') in ('warnings', 'not_verifiable_locally'):
+            out['warnings'].append(
+                'preparation clearance: %s%s' % (
+                    _pc.get('status'),
+                    ('; ' + '; '.join((_pc.get('problems') or [])[:3]))
+                    if _pc.get('problems') else ''))
+    except Exception as _pce:
+        out['preparation_clearance'] = {
+            'status': 'not_verifiable_locally',
+            'problems': [f'{type(_pce).__name__}: {_pce}'],
+        }
+        out['warnings'].append(
+            f'preparation clearance: the launch gate could not run '
+            f'({type(_pce).__name__}: {_pce})')
     # A recorded violation is a hard design defect, including the case where
     # the frozen manifest is missing/unreadable.  Previously that branch only
     # appended to `violations` while `status` stayed 'ok', so the CLI exited 0
