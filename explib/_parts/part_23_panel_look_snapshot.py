@@ -1670,6 +1670,12 @@ def _scope_design(design, present):
             out[comp] = _items
     return out
 
+# Exact full-factorial enumeration is 2**k.  Above this many cells the audit
+# derives the same completeness verdict/count without materialising the table;
+# a missing list would be exponentially large, so it is reported as truncated.
+_ABLATION_FACTORIAL_ENUM_MAX_COMBOS = 1 << 16
+
+
 def ablation_completeness_audit(design=None, present=None, *, arms_by_combo=None,
                                 verbose=False):
     """Zero-GPU completeness check for a leave-one-out OR full-factorial design.
@@ -1691,20 +1697,48 @@ def ablation_completeness_audit(design=None, present=None, *, arms_by_combo=None
         panel is reported with its exact missing combination (e.g. C alone)
         rather than being described as a full factorial.  This is the
         larger design the task brief allows as an alternative to
-        leave-one-out.
+        leave-one-out.  For a family above
+        ``_ABLATION_FACTORIAL_ENUM_MAX_COMBOS`` expected cells, the verdict and
+        exact missing count are derived without materialising the table and
+        ``missing_combos`` is explicitly marked truncated, so a large design
+        cannot exhaust memory merely by being audited.
 
     Returns a machine-readable dict; never raises on a partial panel.
     """
     out = {'mode': 'leave-one-out', 'complete': False,
            'complete_components': [], 'incomplete_components': [],
            'components': {}, 'missing_arms': {}, 'structural_errors': []}
-    present_set = None if present is None else set(present)
+    try:
+        present_set = None if present is None else set(present)
+    except TypeError:
+        # `present` is an arm collection; an unhashable element is a malformed
+        # declaration, not a reason to crash an audit that must fail closed.
+        out['structural_errors'].append(
+            'present must be a collection of hashable arm ids, got '
+            f'{type(present).__name__} containing an unhashable element')
+        if verbose:
+            print('[ablation] present arm collection contains an unhashable id')
+        return out
 
     if arms_by_combo is not None:
         out.update({'mode': 'full-factorial', 'components': [],
                     'n_required': 0, 'n_mapped': 0,
                     'missing_combos': [], 'duplicate_combos': [],
                     'reused_arms': {}, 'missing_arms': [], 'arms': {}})
+        if not isinstance(arms_by_combo, dict):
+            # `arms_by_combo` is an explicit full-factorial declaration, not
+            # the leave-one-out sentinel (None).  A list/string here is a
+            # malformed artifact: fail closed like every other structural
+            # error rather than crashing on `.items()`.
+            out['structural_errors'].append(
+                'arms_by_combo must be a mapping of component-combination -> '
+                f'arm id(s), got {type(arms_by_combo).__name__}')
+            out['complete'] = False
+            out['complete_components'] = []
+            out['incomplete_components'] = []
+            if verbose:
+                print('[ablation] full-factorial declaration is not a mapping')
+            return out
         combos = {}
         components = set()
         _empty = ('none', 'empty', 'baseline', '0')
@@ -1748,13 +1782,32 @@ def ablation_completeness_audit(design=None, present=None, *, arms_by_combo=None
                 continue
             components.update(combo)
         components = sorted(components)
-        required = []
-        for r in range(len(components) + 1):
-            required.extend(tuple(c) for c in itertools.combinations(components, r))
-        required_set = set(required)
+        # Enumerating the expected cells is 2**k for k components.  A
+        # hand-written/imported declaration (or a large factorial design) can
+        # make k large enough that materialising every combination exhausts
+        # memory before the completeness verdict is printed.  Keep the exact
+        # enumeration for ordinary panels, but for a large family derive the
+        # same counts structurally and report the missing cells as truncated
+        # rather than silently claiming the unenumerated remainder is absent.
+        _n_possible = 1 << len(components)
+        _enumerate = _n_possible <= _ABLATION_FACTORIAL_ENUM_MAX_COMBOS
         mapped_set = set(combos)
-        missing = sorted(required_set - mapped_set)
-        extra = sorted(mapped_set - required_set)
+        if _enumerate:
+            required = []
+            for r in range(len(components) + 1):
+                required.extend(tuple(c) for c in itertools.combinations(components, r))
+            required_set = set(required)
+            missing = sorted(required_set - mapped_set)
+            extra = sorted(mapped_set - required_set)
+        else:
+            required = None
+            # Every mapped combination with distinct declared components is a
+            # valid expected cell by construction; a repeated component (for
+            # example ``"A+A"``) is not a subset and was an "extra" before.
+            extra = sorted(c for c in mapped_set if len(set(c)) != len(c))
+            _valid_mapped = mapped_set - set(extra)
+            _n_missing = _n_possible - len(_valid_mapped)
+            missing = []
         duplicate = sorted(c for c, arms in combos.items() if len(arms) > 1)
         absent = []
         # In a full factorial every combination must be its OWN arm.  Reusing
@@ -1772,27 +1825,39 @@ def ablation_completeness_audit(design=None, present=None, *, arms_by_combo=None
                     absent.append({'combo': list(combo), 'arm': arm})
         out.update({
             'components': components,
-            'n_required': len(required),
+            'n_required': (len(required) if required is not None
+                           else int(_n_possible)),
             'n_mapped': len(combos),
             'missing_combos': [list(c) for c in missing],
+            # A bounded scan cannot name an exponentially large missing set.
+            # Keep the count exact; the list is explicitly marked truncated so
+            # the caller cannot read [] as "nothing is missing".
+            'missing_combos_count': (len(missing) if required is not None
+                                     else int(_n_missing)),
+            'missing_combos_truncated': bool(required is None),
             'extra_combos': [list(c) for c in extra],
             'duplicate_combos': [list(c) for c in duplicate],
             'reused_arms': {str(a): [list(c) for c in cs] for a, cs in reused.items()},
             'missing_arms': absent,
             'arms': {('+'.join(c) if c else 'none'): sorted(set(a)) for c, a in combos.items()},
         })
-        out['complete'] = bool(len(components) >= 1 and not missing and not extra
-                               and not duplicate and not absent and not reused
-                               and not out['structural_errors'])
+        _missing_any = bool(_n_missing) if required is None else bool(missing)
+        out['complete'] = bool(len(components) >= 1 and not _missing_any
+                               and not extra and not duplicate and not absent
+                               and not reused and not out['structural_errors'])
         # Project-level coverage reads the same component lists in both modes.
         # A factorial is only a usable ablation as a whole: one missing cell
         # means no component's effect is separately identified.
         out['complete_components'] = list(components) if out['complete'] else []
         out['incomplete_components'] = [] if out['complete'] else list(components)
         if verbose:
+            _missing_text = (['+'.join(c) or 'none' for c in missing]
+                             if required is not None else
+                             [f'{int(_n_missing)} combination(s) not enumerated'])
             print('[ablation] full-factorial components=%s mapped=%d/%d missing=%s%s'
-                  % (components, len(combos), len(required),
-                     ['+'.join(c) or 'none' for c in missing] or 'none',
+                  % (components, len(combos),
+                     len(required) if required is not None else int(_n_possible),
+                     _missing_text or 'none',
                      (' reused_arms=%s' % (sorted(reused) or 'none')) if reused else ''))
         return out
 

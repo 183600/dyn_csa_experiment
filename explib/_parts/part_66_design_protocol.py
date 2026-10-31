@@ -329,6 +329,28 @@ def _dp_implementation_audit(protocol, *, source_tree=None):
             'analysis-closure digest no longer matches.  A code change is a '
             'design change; register a revision with a reason instead of '
             'editing the implementation under the old protocol')
+    # The digest is the hard identity, but the recorded closure size and
+    # declared scope are part of the same registration.  A same-digest tree
+    # with a different count means the block was edited after registration
+    # (or constructed inconsistently); do not let that read as verified.
+    _reg_n = _dp_int(registered.get('analysis_n_files'), minimum=1)
+    if (_reg_n is not None and current_relpaths
+            and _reg_n != len(current_relpaths)):
+        out['problems'].append(
+            f'analysis.implementation.analysis_n_files={_reg_n} != the '
+            f'current closure size {len(current_relpaths)}')
+    for _key, _want in (
+            ('analysis_prefixes', list(DESIGN_PROTOCOL_ANALYSIS_PREFIXES)),
+            ('analysis_files', list(DESIGN_PROTOCOL_ANALYSIS_FILES))):
+        _got = registered.get(_key)
+        if _got is None:
+            continue
+        if (not isinstance(_got, list)
+                or [str(x) for x in _got] != _want):
+            out['problems'].append(
+                f'analysis.implementation.{_key} does not match the declared '
+                'analysis-closure scope; the registration describes a '
+                'different closure than the one being checked')
     registered_full = _dp_sha256_text(
         registered.get('full_source_tree_sha256'))
     current_full = _dp_sha256_text(source_tree.get('sha256'))

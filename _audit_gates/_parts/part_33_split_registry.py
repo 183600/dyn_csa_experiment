@@ -25,8 +25,7 @@ def _split_registry_find(value, path='', out=None, depth=0, meta=None):
         out = []
     if meta is None:
         meta = {}
-    if len(out) >= 200:
-        meta['records_truncated'] = True
+    if meta.get('records_truncated'):
         return out
     if depth > 10:
         meta['depth_truncated'] = True
@@ -36,7 +35,11 @@ def _split_registry_find(value, path='', out=None, depth=0, meta=None):
         if isinstance(source_tree, dict) and 'split_registry' in source_tree:
             out.append({'pointer': path or '/',
                         'registry': source_tree.get('split_registry')})
-            if len(out) >= 200:
+            if len(out) > 200:
+                # The 201st record proves the tree continues.  Keep the
+                # historical 200-record bound while not labelling a tree that
+                # holds exactly 200 records as truncated.
+                out.pop()
                 meta['records_truncated'] = True
                 return out
         for key in sorted(value):
@@ -56,9 +59,16 @@ def _split_registry_artifact_paths(panel_dirs, meta=None):
 
     def _add(path):
         path = os.path.abspath(path)
-        if path not in seen:
-            seen.add(path)
-            paths.append(path)
+        if path in seen:
+            return
+        if len(paths) >= _SPLIT_REGISTRY_MAX_FILES:
+            # An explicit list of artifact paths is caller input too; the bound
+            # must not apply only to directory scans, or a huge list would walk
+            # every file while the caller still believes the scan was complete.
+            meta['files_truncated'] = True
+            return
+        seen.add(path)
+        paths.append(path)
 
     for item in panel_dirs:
         if isinstance(item, bytes):
