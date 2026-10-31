@@ -12500,3 +12500,102 @@ scenario 被拒绝；把 `holm_adjust` 改成不校正时 family scenario 与
 以及 snapshot 内嵌 artifact 的 ok/tamper/missing 状态；clearance 只复制
 rehearsal 身份而不复制 p 值、失败 rehearsal 与错清单 fail、legacy payload
 记 missing；`run_report` 顶层接线存在。完整 CPU 套件在本轮最终树通过。
+
+## 134. 确认方向来自 validation，就必须报告它到 test 的迁移：逐种子 log-ratio 的收缩读数
+
+### 134.1 问题
+
+冻结决策规则要求 test 效应方向与 validation 估计一致（`direction_ok`）。
+但报告只给了 test 的绝对效应、置信区间和 p 值，没有回答：**同一个
+checkpoint 上，validation 的效应有多大比例真正迁移到了 held-out 语料？**
+当 validation 的 Δlog PPL 是 −0.05、test 只有 −0.005 时，两个比较都
+可能「方向正确且 Holm 显著」，但它们的科学含义完全不同。仅比较
+validation 和 test 各自的显著性也不是答案：两个显著性的差异本身没有
+检验，而且 validation 与 test 是不同语料，不能把两个边际区间直接相减。
+
+`cross_panel_synthesis` 合并的是若干探索性 panel；`analysis_choice_concordance`
+重述的是同一个 test panel；`winner_curse` 处理的是在多个臂中选最优的
+乐观偏差。三者都没有给出「冻结方向所依赖的 validation 估计在 test 上
+收缩/反向了多少」这一读数。
+
+### 134.2 方法
+
+新增 `explib/_parts/part_71_validation_transfer.py`。对每个冻结比较，在
+同一种子（同一 checkpoint）上定义
+
+```
+v_s = log(PPL_a[validation]) - log(PPL_b[validation])
+t_s = log(PPL_a[test])       - log(PPL_b[test])
+d_s = t_s - v_s
+```
+
+- 用 log ratio 而不是 raw ΔPPL，因为 validation 与 test 的基线 PPL
+  不同；raw 差值的尺度不可跨语料直接比较。
+- 配对差 `d_s` 是**同一种子内的切分效应**，不是两个独立样本的均值差。
+  对 `d_s` 运行 exact sign-flip，给出 t 区间；族内再对六个比较做
+  Holm（缺失比较保留槽位，p=1）。
+- 报告 `validation mean` / `test mean` / `test/validation` /
+  `shrinkage_pct` / 差值区间 / p / Holm p，并给出分类：
+  `same_sign_not_distinguishable`（差值区间含 0，或 exact p 未过 α）、
+  `same_sign_attenuated`（同向且 |test| 更小、差值区间排除 0 **且**
+  逐比较 exact p<α，未乘 Holm）、`same_sign_amplified`、`same_sign_shifted`、
+  `opposite_sign`、`test_zero`、`no_validation_effect`。要求区间和
+  exact p 同时过门，避免仅凭 t 区间给一个 12 种子面板贴「衰减」标签。
+- validation 与 test 的种子集合不一致时，在两侧交集上计算并点名
+  `missing_validation_seeds` / `missing_test_seeds`，`coverage_ok=false`；
+  少于 `min_pairs=6` 才判 `not_estimable`。族状态 `ok/partial/
+  not_estimable` 只描述可估计性，不把交集读数冒充完整面板。
+- 真正的源数据只来自两个已落盘产物：`analysis_v12/power_validation.json`
+  的 `pilot_seeds` / `pilot_ppl_a` / `pilot_ppl_b`（由 `run_power` 新增
+  保存）和 `analysis_v12/stats.json` 的
+  `finaltest.by_length[arm][L].ppl_by_seed`。构造时逐项核对
+  `per_seed == ppl_a - ppl_b`（validation 侧还核对 `pilot_deltas`），
+  防止用两批不同记录拼出一个「迁移」向量。不打开 `wiki.test.raw`。
+
+### 134.3 边界
+
+- 这是**描述性**读数：不新增确认检验、不进入冻结 Holm 族、不改变
+  `p_exact_signflip` / `p_holm` / `verified` / `confirmed`。`block` 内
+  的 `difference_p_holm` 只校正这组描述性差值，不能与冻结族混读。
+- validation 与 test 是不同语料，差值首先是**迁移/切分效应**，不是同一
+  固定效应的测量误差；不能写成「validation 有偏」或「方法无效」。
+- validation 估计参与了冻结方向的选择，出现收缩是预期现象之一
+  （winner's curse + 语料差异），不等于实现缺陷；反向也不自动构成
+  对机制的否证。
+- 交集读数只描述这些冻结算子，不支持对未见种子/语料/规模的总体主张；
+  `test/validation` 在 validation 均值接近 0 时不稳定，应直接读差值与
+  区间。
+- 旧 `power_validation.json` 没有逐种子 PPL 时，该块是
+  `not_estimable`，不从 ΔPPL 反造 log ratio，也不回填旧产物。
+
+### 134.4 接线与判据
+
+```bash
+make transfer
+python audit_gates.py validation_transfer
+python -m explib.confirmation analysis   # stats.json 内生成 validation_transfer
+python -m explib.confirmation report     # 报告新增「验证集→test 效应迁移」节
+```
+
+- `v12_analysis` 在 `finaltest_stats` 之后读取 `power_validation.json`；
+  缺文件/读失败/构造成本异常时写入带 `reason` 的 `not_estimable` 块，
+  报告明确显示不可估计。
+- `audit_gates.py validation_transfer`（别名 `transfer` /
+  `validation_transfer_audit`）只读 `analysis_v12/stats.json` 的
+  sufficient statistics（seeds、两列 log ratio、差值列），重算均值、
+  CI、exact p、Holm、比值、分类与 `coverage_ok`；任一不符判 `fail`，
+  无块/无文件判 `not_verifiable_locally`，交集覆盖只判 `warn`。
+- `make transfer` 是零 GPU 入口，不训练、不读 split。
+
+### 134.5 验证
+
+新增 `test_review_part_76.py` 13 项：真实冻结族上已知衰减（六比较全部
+`same_sign_attenuated`、比值约 0.5）与反向（六比较全部
+`opposite_sign`）各自构造并 replay ok；validation 缺一个种子时在交集
+上算 11 对、点名 `missing_validation_seeds=[0]`、`coverage_ok=false`，
+gate 为 `warn`；validation `pilot_deltas` 与 PPL 差、test `per_seed` 与
+`by_length` PPL 差不一致分别判 `not_estimable`；缺 `pilot_ppl_a` 判
+`not_estimable`；validation 清单哈希与冻结清单不符时整块
+`not_estimable`；篡改均值/分类/p/比值/Holm/status/family 后 replay 均
+`fail`；gate 对空块、缺 power 的占位块与不存在文件
+`not_verifiable_locally`、对篡改块 `fail`；报告/CLI/`Makefile` 接线存在。完整 CPU 套件在本轮最终树通过。

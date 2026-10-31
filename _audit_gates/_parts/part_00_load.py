@@ -314,6 +314,14 @@
                synthetic=true / test_split_read=false，不新增真实检验、
                不读 test、不改冻结 p/Holm/判定（零 GPU；别名
                decision_rehearsal / known_truth_rehearsal / rehearsal）
+  validation_transfer  验证集→test 的效应迁移 / 收缩：对每个冻结比较，用同一种子
+               的 checkpoint 计算 validation 与 test 的 log PPL ratio，配对差
+               （test − validation）给均值、t 区间、exact sign-flip 与声明族
+               Holm，并报告 test/validation 比与分类（同向不可区分 / 衰减 /
+               放大 / 反向）。它只读已算好的逐种子 PPL 单元，不读原始 split、
+               不新增确认检验、不改冻结 p/Holm/verified/confirmed；缺
+               validation 或 test 逐种子格时报 not_verifiable（零 GPU；
+               别名 transfer / validation_transfer_audit）
   evaluation_order  最终测试评估顺序 / 测量时间混杂：检查 P5T 在读取 test
                前写下的 clean_by_length_order.json / distractor_probe_order.json
                是否为完整区组、位置平衡、覆盖全部 (arm, seed)，并复核

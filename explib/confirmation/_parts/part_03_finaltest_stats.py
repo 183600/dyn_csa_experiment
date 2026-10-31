@@ -1196,6 +1196,36 @@ def run_power(manifest_path=FREEZE_MANIFEST, summary='results_v10_mech/summary.j
         dl, used = _paired_len_deltas(recs_a, recs_b, common, Ln)
         cell = {'endpoint': f'by_len.ppl@{Ln}', 'n': len(dl), 'seeds': used,
                 'skipped_stale_records': skipped}
+        # Persist the per-seed PPL cells behind the validation deltas, not
+        # only the deltas themselves.  The validation-to-test transfer audit
+        # needs the log-ratio scale (log(PPL_a) - log(PPL_b)); deriving it
+        # from a raw PPL difference would silently assume a baseline PPL and
+        # mix two different estimands.  Older artifacts lack these fields and
+        # the transfer block names them as not_estimable instead of guessing.
+        _pilot_pa = [_ppl_at_len(recs_a.get(s), Ln) for s in used]
+        _pilot_pb = [_ppl_at_len(recs_b.get(s), Ln) for s in used]
+        _pilot_ok = (
+            len(used) == len(dl) == len(_pilot_pa) == len(_pilot_pb)
+            and all(_pilot_pa) and all(_pilot_pb)
+            and all(isinstance(x, (int, float)) and math.isfinite(float(x)) and float(x) > 0.0
+                    for x in list(_pilot_pa) + list(_pilot_pb)))
+        cell['pilot_seeds'] = [int(s) for s in used]
+        cell['pilot_deltas'] = [float(x) for x in dl]
+        if _pilot_ok:
+            _pilot_log = [float(math.log(_pilot_pa[i]) - math.log(_pilot_pb[i]))
+                          for i in range(len(used))]
+            if all(math.isfinite(x) for x in _pilot_log):
+                cell['pilot_ppl_a'] = [float(x) for x in _pilot_pa]
+                cell['pilot_ppl_b'] = [float(x) for x in _pilot_pb]
+                cell['pilot_log_ratio'] = _pilot_log
+            else:
+                cell['pilot_ppl_a'] = None
+                cell['pilot_ppl_b'] = None
+                cell['pilot_log_ratio'] = None
+        else:
+            cell['pilot_ppl_a'] = None
+            cell['pilot_ppl_b'] = None
+            cell['pilot_log_ratio'] = None
         _sesoi = comp.get('sesoi')
         if _sesoi is None:
             _sesoi = stat.get('sesoi')
@@ -1351,6 +1381,35 @@ def v12_analysis(out='analysis_v12/stats.json'):
     st = json.load(open(out, encoding='utf-8'))
     if os.path.exists(os.path.join(TEST_OUTDIR, 'bylen.json')):
         st['finaltest'] = finaltest_stats()
+        # Validation -> test transfer: the frozen direction gate consumes a
+        # validation estimate, so the report must say how that estimate
+        # transported to the held-out corpus.  This is descriptive and reads
+        # only already-computed per-seed PPL cells; no split is re-opened.
+        _vt_dir = os.path.dirname(out) or '.'
+        _pv_path = os.path.join(_vt_dir, 'power_validation.json')
+        try:
+            if not os.path.exists(_pv_path):
+                st['validation_transfer'] = {
+                    'kind': 'validation_transfer',
+                    'status': 'not_estimable',
+                    'reason': (f'{_pv_path} does not exist; run the pre-test '
+                               'power calibration before interpreting the '
+                               'validation-to-test transfer'),
+                    'frozen_decision_changed': False,
+                }
+            else:
+                with open(_pv_path, encoding='utf-8') as _pvf:
+                    _pv = json.load(_pvf)
+                _vt_manifest = _load_manifest(FREEZE_MANIFEST)
+                st['validation_transfer'] = L.validation_transfer(
+                    _pv, st, _vt_manifest)
+        except Exception as _vte:
+            st['validation_transfer'] = {
+                'kind': 'validation_transfer',
+                'status': 'not_estimable',
+                'reason': f'{type(_vte).__name__}: {_vte}',
+                'frozen_decision_changed': False,
+            }
         # this file's LAST writer is v12_analysis: re-stamp so the trace names
         # the code that produced the final content, not the earlier v10 pass
         st = L.stamped_analysis('v12_analysis', st, outdir=(os.path.dirname(out) or '.'), name=os.path.basename(out))
@@ -1425,6 +1484,97 @@ def _refutation_markdown(ft, alpha=0.05):
         A(f'**方向相反但未达显著**：{"; ".join(_detail(k) for k in opposite)} 的点估计与预注册方向相反，'
           '但 Holm 校正后不显著；这只是不确定（inconclusive），既不是支持也不是反证。')
         A('')
+    return out
+
+
+def _validation_transfer_markdown(block):
+    """Render the validation-to-test transfer readout as a descriptive table.
+
+    Pure formatting: the block is built by ``validation_transfer`` and the
+    gate replays every number.  The wording boundary is the point of the
+    section: validation and test are different corpora, so the paired
+    difference is a transport/split effect, not a bias estimate, and the
+    classification labels never enter the frozen decision.
+    """
+    if not isinstance(block, dict):
+        return []
+    status = block.get('status')
+    out = []
+    A = out.append
+    A('### 验证集→test 的效应迁移 / 收缩（描述性，不属于冻结族）')
+    A('')
+    if status not in ('ok', 'partial'):
+        A(f'- 不可估计：{block.get("reason") or "no complete validation/test cells"}。'
+          '缺少 `analysis_v12/power_validation.json` 的逐种子 PPL、或 test 端逐种子格时，'
+          '本节不给出数字，也不从 ΔPPL 反造 log ratio。')
+        A('')
+        return out
+    rows = block.get('comparisons') or {}
+    fam = block.get('family') or list(rows)
+    A('| 比较 | n | 验证 mean log ratio | test mean log ratio | test/验证 | 差值 (test−验证) [95% CI] | p (exact) | Holm p | 分类 |')
+    A('|---|---|---|---|---|---|---|---|---|')
+
+    def _num(x, fmt):
+        if isinstance(x, (bool, np.bool_)) or not isinstance(x, (int, float)):
+            return '—'
+        x = float(x)
+        return format(x, fmt) if math.isfinite(x) else '—'
+
+    _cls = {
+        'same_sign_not_distinguishable': '同向，差值不可区分',
+        'same_sign_attenuated': '同向，test 衰减',
+        'same_sign_amplified': '同向，test 放大',
+        'same_sign_shifted': '同向，量级改变',
+        'opposite_sign': '反向',
+        'test_zero': 'test 点估计为零',
+        'no_validation_effect': '验证点估计为零',
+        'not_estimable': '不可估计',
+    }
+    for name in fam:
+        r = rows.get(name) or {}
+        if r.get('status') != 'ok':
+            A(f'| {name} | 0 | — | — | — | —（{r.get("reason") or "not_estimable"}） | — | — | 不可估计 |')
+            continue
+        ci = r.get('difference_ci95')
+        ci_t = ('—' if not isinstance(ci, (list, tuple)) or len(ci) < 2
+                else f'[{_num(ci[0], "+.4f")}, {_num(ci[1], "+.4f")}]')
+        A(f'| {name} | {r.get("n", "—")} | '
+          f'{_num(r.get("validation_mean_log_ratio"), "+.4f")} | '
+          f'{_num(r.get("test_mean_log_ratio"), "+.4f")} | '
+          f'{_num(r.get("test_over_validation_ratio"), ".3f")} | '
+          f'{_num(r.get("difference_mean"), "+.4f")} {ci_t} | '
+          f'{_num(r.get("difference_p_exact_signflip"), ".4f")} | '
+          f'{_num(r.get("difference_p_holm"), ".4f")} | '
+          f'{_cls.get(r.get("classification"), r.get("classification") or "—")} |')
+    A('')
+    sm = block.get('summary') or {}
+    A(f'- 分类计数：{sm.get("class_counts") or {}}；'
+      f'声明族 Holm 拒绝（差值检验）：{sm.get("family_holm_rejections") or []}。')
+    if sm.get('n_opposite_sign'):
+        A(f'- **迁移提醒**：{sm.get("n_opposite_sign")} 个比较的 test 点估计与 '
+          'validation 反号。冻结 `direction_ok` 本来就会拦下这些比较；'
+          '这里把它作为 out-of-sample 读数显式列出，不能读成支持。')
+    if sm.get('n_attenuated'):
+        A(f'- **收缩提醒**：{sm.get("n_attenuated")} 个比较的 test 效应在同向的'
+          '前提下显著小于 validation 效应。即使冻结判定仍满足，'
+          '效应量也不能按 validation 的大小外推。')
+    A(f'- 口径：log ratio = `log(PPL_a) − log(PPL_b)`（正值表示 a 更差）；'
+      '差值 = test − validation，逐种子配对；区间是同一批种子的 t 区间，'
+      'p 是 exact sign-flip，Holm 只在这组描述性差值族内校正；'
+      '衰减/放大标签要求差值区间排除 0 且逐比较 exact p<α，'
+      '否则只写「同向，差值不可区分」；同表 Holm p 是族级读数，'
+      '两者不一致时以 Holm p 为准，不把标签当作族级显著。'
+      '`test/验证` 与 `shrinkage_pct` 只有在验证均值非零时才给出，'
+      '接近零的验证效应会使比值不稳定，应直接读差值与区间。')
+    A('')
+    A('> 边界：validation 与 test 是不同语料，差值是**迁移/切分效应**，'
+      '不是同一固定效应的测量误差；validation 估计本身参与了冻结方向的'
+      '选择，因此出现收缩并不等于实现有缺陷。分类标签不新增假设检验、'
+      '不进入冻结 Holm 族、不改变 `p_exact_signflip`、`p_holm`、`verified`'
+      ' 或 `confirmed`；它也不证明「效应可迁移到其他语料/规模」。'
+      '缺某个比较的逐种子格时该比较保留族槽位并显示为不可估计，'
+      '不会悄悄缩小校正族。')
+    A('')
     return out
 
 
@@ -2014,6 +2164,10 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
         _ps_md = _practical_significance_markdown(ft.get('practical_significance'))
         if _ps_md:
             for _line in _ps_md:
+                A(_line)
+        _vt_md = _validation_transfer_markdown(st.get('validation_transfer'))
+        if _vt_md:
+            for _line in _vt_md:
                 A(_line)
         if any(isinstance((_v.get('doc_sampling') or {}).get('pooled_delta_ppl_ci95'),
                           (list, tuple))
