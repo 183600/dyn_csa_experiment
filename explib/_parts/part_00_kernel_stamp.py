@@ -1124,6 +1124,57 @@ def _safe_exp_ppl(x):
         return float('inf')
 
 
+def _ppl_difference(log_a, log_b):
+    """``exp(log_a) - exp(log_b)`` without flattening a tiny log difference.
+
+    For a token-pooled log ratio far below 1, both exponentials round to the
+    same float and the direct subtraction reports a fake zero.  When the two
+    logs are close, factor out the smaller exponential and use ``expm1``; the
+    ordinary path keeps the historical two-exponential expression.
+    """
+    try:
+        a = float(log_a)
+        b = float(log_b)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not (math.isfinite(a) and math.isfinite(b)):
+        return None
+    diff = a - b
+    if not math.isfinite(diff):
+        return None
+    try:
+        if abs(diff) < 1e-6:
+            out = math.exp(b) * math.expm1(diff)
+        else:
+            out = math.exp(a) - math.exp(b)
+    except (OverflowError, ValueError):
+        return None
+    return float(out) if math.isfinite(out) else None
+
+
+def _safe_float_ratio(num, den):
+    """``num / den`` with an exact integer denominator, or ``None``.
+
+    A token total beyond float64 makes the naive float division raise
+    ``OverflowError`` even when the quotient is representable.  The fallback
+    divides in the exact rational domain and rounds once; an underflowing
+    nonzero quotient is reported as unavailable instead of a fake zero.
+    """
+    try:
+        out = float(num) / int(den)
+    except (OverflowError, ValueError, ZeroDivisionError):
+        from fractions import Fraction as _Fraction
+        try:
+            out = float(_Fraction(num) / int(den))
+        except (OverflowError, ValueError, ZeroDivisionError):
+            return None
+    if not math.isfinite(out):
+        return None
+    if out == 0.0 and num != 0:
+        return None
+    return float(out)
+
+
 def _finite_scalar(v):
     """Finite float for a real numeric scalar, including NumPy scalars.
 
@@ -1334,12 +1385,38 @@ def _nll_doc_ci(nll_per_row, n_tokens_per_row):
         pair = _parse_pair(nll, ntok)
         if pair is None:
             continue
+        ratio = _safe_float_ratio(pair[0], pair[1])
+        if ratio is None:
+            # An exact ratio that underflows float64 is not a measurement of
+            # zero; drop the row rather than manufacture an all-zero CE.
+            continue
         pairs.append(pair)
         total_nll += pair[0]
         total_tok += pair[1]
-        doc_ce.append(pair[0] / pair[1])
-    if len(doc_ce) < 2 or total_tok <= 0:
-        return {'ppl': (_safe_exp_ppl(total_nll / total_tok) if total_tok else None),
+        doc_ce.append(ratio)
+    if not pairs or total_tok <= 0:
+        return {'ppl': None,
+                'doc_ce_mean': None, 'doc_ce_sem': None,
+                'ppl_ci95_low': None, 'ppl_ci95_high': None, 'n_docs': len(doc_ce)}
+    if not math.isfinite(total_nll):
+        try:
+            total_nll = math.fsum(p[0] for p in pairs)
+        except (OverflowError, ValueError):
+            total_nll = None
+    ce = (_safe_float_ratio(total_nll, total_tok)
+          if total_nll is not None else None)
+    if ce is None:
+        from fractions import Fraction as _Fraction
+        try:
+            ce_q = (sum((_Fraction(p[0]) for p in pairs), _Fraction(0, 1))
+                    / total_tok)
+            ce = float(ce_q)
+            if ce == 0.0 and ce_q != 0:
+                ce = None
+        except (OverflowError, ValueError, ZeroDivisionError):
+            ce = None
+    if len(doc_ce) < 2 or ce is None:
+        return {'ppl': (_safe_exp_ppl(ce) if ce is not None else None),
                 'doc_ce_mean': None, 'doc_ce_sem': None,
                 'ppl_ci95_low': None, 'ppl_ci95_high': None, 'n_docs': len(doc_ce)}
     mean = sum(doc_ce) / len(doc_ce)
@@ -1347,7 +1424,6 @@ def _nll_doc_ci(nll_per_row, n_tokens_per_row):
         [x - mean for x in doc_ce], 1.0 / (len(doc_ce) - 1))
     sem = (math.sqrt(max(_doc_var, 0.0) / len(doc_ce))
            if _doc_var is not None else None)
-    ce = total_nll / total_tok
     # The point estimate is token-pooled, so the interval must be for that
     # same estimand.  Resampling/weighting per-document CEs as if the pooled
     # CE were their unweighted mean mixes two different estimators and is
@@ -1356,12 +1432,34 @@ def _nll_doc_ci(nll_per_row, n_tokens_per_row):
     #   Var(CE) ~= N/(N-1) * sum_i (nll_i - CE*n_tok_i)^2 / (sum_i n_tok_i)^2.
     # A t critical value (df=N-1), not 1.96, keeps small document panels from
     # claiming a normal-theory interval.
-    _resid = [nll - ce * ntok for nll, ntok in pairs]
+    _resid = []
+    for nll, ntok in pairs:
+        try:
+            r = float(nll) - ce * ntok
+            if not math.isfinite(r):
+                raise OverflowError
+        except (OverflowError, ValueError):
+            from fractions import Fraction as _Fraction
+            try:
+                r = float(_Fraction(nll) - _Fraction(ce) * ntok)
+            except (OverflowError, ValueError):
+                r = None
+        _resid.append(r)
     n_docs = len(_resid)
     # Scale each residual by the total before squaring: r**2 and
     # total_tok**2 can each overflow while their ratio is representable.
-    _var = _scaled_sum_of_squares(
-        [r / total_tok for r in _resid], n_docs / (n_docs - 1.0))
+    _scaled = []
+    if all(r is not None for r in _resid):
+        for r in _resid:
+            term = _safe_float_ratio(r, total_tok)
+            if term is None:
+                _scaled = None
+                break
+            _scaled.append(term)
+    else:
+        _scaled = None
+    _var = (_scaled_sum_of_squares(_scaled, n_docs / (n_docs - 1.0))
+            if _scaled is not None else None)
     _sem_ce = (math.sqrt(max(_var, 0.0)) if _var is not None else None)
     _tc = _t_critical(0.95, n_docs - 1)
     if not math.isfinite(_tc):
@@ -1384,6 +1482,108 @@ def _nll_doc_ci(nll_per_row, n_tokens_per_row):
             'ppl_ci95_low': _safe_exp_ppl(_ce_lo),
             'ppl_ci95_high': _safe_exp_ppl(ce + _tc * _sem_ce),
             'n_docs': n_docs}
+
+def _paired_nll_doc_ci_extreme(A, B, counts, conf):
+    """Exact-ratio fallback for token totals beyond float64.
+
+    ``A``/``B`` are the validated ``[n_seeds, n_docs]`` matrices and
+    ``counts`` are exact positive Python integers.  The pooled CE, the
+    cluster influence and the log-ratio influence are formed as exact
+    rationals and rounded once per reported value, so a representable result
+    survives a token total such as ``10**400`` that cannot itself be a float.
+    """
+    from fractions import Fraction as _Fraction
+    S, D = A.shape
+    T = [int(x) for x in counts]
+    total = int(sum(T))
+    if total <= 0:
+        raise ValueError('_paired_nll_doc_ci: the total token count must be positive')
+    try:
+        ce_a_q = [sum((_Fraction(float(A[s, i])) for i in range(D)),
+                      _Fraction(0, 1)) / total for s in range(S)]
+        ce_b_q = [sum((_Fraction(float(B[s, i])) for i in range(D)),
+                      _Fraction(0, 1)) / total for s in range(S)]
+        ce_a = [float(q) for q in ce_a_q]
+        ce_b = [float(q) for q in ce_b_q]
+    except (OverflowError, ValueError, ZeroDivisionError):
+        return None
+    if any((x == 0.0 and q != 0) for x, q in zip(ce_a, ce_a_q)):
+        return None
+    if any((x == 0.0 and q != 0) for x, q in zip(ce_b, ce_b_q)):
+        return None
+    if not all(math.isfinite(x) for x in ce_a + ce_b):
+        return None
+    ea = np.asarray([_safe_exp_ppl(x) for x in ce_a], dtype=float)
+    eb = np.asarray([_safe_exp_ppl(x) for x in ce_b], dtype=float)
+    if not (np.all(np.isfinite(ea)) and np.all(np.isfinite(eb))):
+        return None
+    _diff_ppl = [_ppl_difference(ce_a[s], ce_b[s]) for s in range(S)]
+    if any(v is None for v in _diff_ppl):
+        return None
+    delta_ppl = float(np.mean(np.asarray(_diff_ppl, dtype=float)))
+    lr = float(np.mean(np.asarray(ce_a) - np.asarray(ce_b)))
+    if not (math.isfinite(delta_ppl) and math.isfinite(lr)):
+        return None
+    out = {'n_docs': int(D), 'n_seeds': int(S), 'conf': float(conf),
+           'delta_ppl': delta_ppl, 'delta_log_ratio': lr,
+           'delta_ppl_ci95': None, 'delta_log_ratio_ci95': None,
+           'ratio_ci95': None, 'se_ppl': None, 'se_log_ratio': None,
+           'df': (int(D - 1) if D > 1 else None),
+           'method': ('cluster-robust documents (delta method, t df=n_docs-1; '
+                      'token-pooled per seed then averaged over seeds; '
+                      'exact-ratio fallback for a token total beyond float64)')}
+    if D < 2:
+        out['method'] = ('point estimate only: a cluster-robust interval needs '
+                         'at least two documents')
+        return out
+    try:
+        psi = []
+        psi_lr = []
+        for s in range(S):
+            ra = [(_Fraction(float(A[s, i])) - ce_a_q[s] * T[i]) / total
+                  for i in range(D)]
+            rb = [(_Fraction(float(B[s, i])) - ce_b_q[s] * T[i]) / total
+                  for i in range(D)]
+            psi.append([float(_Fraction(ea[s]) * ra[i]
+                              - _Fraction(eb[s]) * rb[i])
+                        for i in range(D)])
+            psi_lr.append([float(ra[i] - rb[i]) for i in range(D)])
+        psi = np.asarray(psi, dtype=float)
+        psi_lr = np.asarray(psi_lr, dtype=float)
+    except (OverflowError, ValueError, ZeroDivisionError):
+        return None
+    if not (np.all(np.isfinite(psi)) and np.all(np.isfinite(psi_lr))):
+        return None
+    bar = psi.mean(axis=0)
+    var = _scaled_sum_of_squares(bar, D / (D - 1.0))
+    se = (math.sqrt(max(var, 0.0)) if var is not None else None)
+    bar_lr = psi_lr.mean(axis=0)
+    var_lr = _scaled_sum_of_squares(bar_lr, D / (D - 1.0))
+    se_lr = (math.sqrt(max(var_lr, 0.0)) if var_lr is not None else None)
+    if se is None or se_lr is None:
+        out['method'] = ('point estimate only: the cluster-robust variance '
+                         'exceeds the representable float range')
+        return out
+    tc = _t_critical(conf, D - 1)
+    if not math.isfinite(tc):
+        return out
+    _lo, _hi = delta_ppl - tc * se, delta_ppl + tc * se
+    _lrl, _lrh = lr - tc * se_lr, lr + tc * se_lr
+    out.update({
+        'se_ppl': float(se),
+        'se_log_ratio': float(se_lr),
+        'delta_ppl_ci95': ([_lo, _hi]
+                           if math.isfinite(_lo) and math.isfinite(_hi)
+                           else None),
+        'delta_log_ratio_ci95': ([_lrl, _lrh]
+                                 if math.isfinite(_lrl) and math.isfinite(_lrh)
+                                 else None),
+        'ratio_ci95': ([_safe_exp_ppl(_lrl), _safe_exp_ppl(_lrh)]
+                       if math.isfinite(_lrl) and math.isfinite(_lrh)
+                       else None),
+    })
+    return out
+
 
 def _paired_nll_doc_ci(nll_a, nll_b, n_tokens, *, conf=0.95):
     """Cluster-robust CI for a PAIRED token-pooled PPL difference.
@@ -1437,10 +1637,10 @@ def _paired_nll_doc_ci(nll_a, nll_b, n_tokens, *, conf=0.95):
     _counts = [_exact_count(v, minimum=1) for v in _raw_t.tolist()]
     if any(c is None for c in _counts):
         raise ValueError('_paired_nll_doc_ci: every document needs a finite positive integer token count')
-    T = np.asarray(_counts, dtype=float)
-    if T.size != A.shape[1]:
+    if len(_counts) != A.shape[1]:
         raise ValueError(
-            f'_paired_nll_doc_ci: {T.size} token counts for {A.shape[1]} documents')
+            f'_paired_nll_doc_ci: {len(_counts)} token counts for '
+            f'{A.shape[1]} documents')
     if isinstance(conf, (bool, np.bool_)):
         raise ValueError('_paired_nll_doc_ci: conf must be a probability in (0, 1)')
     try:
@@ -1451,16 +1651,28 @@ def _paired_nll_doc_ci(nll_a, nll_b, n_tokens, *, conf=0.95):
         raise ValueError('_paired_nll_doc_ci: conf must be a probability in (0, 1)')
 
     S, D = A.shape
-    total_tok = float(T.sum())
-    if not math.isfinite(total_tok) or total_tok <= 0.0:
-        raise ValueError('_paired_nll_doc_ci: the total token count must be positive')
+    _extreme_tokens = False
+    try:
+        T = np.asarray(_counts, dtype=float)
+        total_tok = float(T.sum())
+        if not math.isfinite(total_tok) or total_tok <= 0.0:
+            raise OverflowError
+    except (OverflowError, ValueError):
+        # A token total beyond float64 (or a single count beyond it) is not a
+        # reason to lose a representable ratio: run the exact-rational path.
+        _extreme_tokens = True
+    if _extreme_tokens:
+        return _paired_nll_doc_ci_extreme(A, B, _counts, conf)
     ce_a = A.sum(axis=1) / total_tok
     ce_b = B.sum(axis=1) / total_tok
     ea = np.asarray([_safe_exp_ppl(x) for x in ce_a], dtype=float)
     eb = np.asarray([_safe_exp_ppl(x) for x in ce_b], dtype=float)
     if not (np.all(np.isfinite(ea)) and np.all(np.isfinite(eb))):
         return None
-    delta_ppl = float(np.mean(ea - eb))
+    _diff_ppl = [_ppl_difference(ce_a[s], ce_b[s]) for s in range(S)]
+    if any(v is None for v in _diff_ppl):
+        return None
+    delta_ppl = float(np.mean(np.asarray(_diff_ppl, dtype=float)))
     lr = float(np.mean(ce_a - ce_b))
     out = {'n_docs': int(D), 'n_seeds': int(S), 'conf': float(conf),
            'delta_ppl': delta_ppl, 'delta_log_ratio': lr,

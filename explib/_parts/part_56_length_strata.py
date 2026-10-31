@@ -229,8 +229,16 @@ def _ls_reference_weights(reference, strata, total_tokens):
             # each count through float64 first.  Besides avoiding a rounding
             # step, this keeps a token total beyond the float64 exponent range
             # from raising OverflowError even though every normalised weight
-            # is representable.
-            return 'token', [s['n_tokens'] / total_tokens for s in strata]
+            # is representable.  A genuinely unrepresentable share must not be
+            # rounded to 0.0: that would silently drop the stratum from the
+            # standardised estimate, so report the reference as unavailable.
+            weights = []
+            for s in strata:
+                w = _ls_div(s['n_tokens'], total_tokens)
+                if (w is None or not _ls_math.isfinite(w) or w <= 0.0):
+                    return 'token', None
+                weights.append(float(w))
+            return 'token', weights
         raise ValueError(
             "reference must be 'equal_strata', 'token', or a numeric sequence "
             f"of {g} weights, got {reference!r}")
@@ -421,7 +429,9 @@ def length_stratified_effect(nll_a, nll_b, n_tokens, *, n_strata=None,
         for a_s, b_s in zip(a_sum, b_sum):
             nll_a_g = _ls_div(a_s, n_tok_g)
             nll_b_g = _ls_div(b_s, n_tok_g)
-            if nll_a_g is None or nll_b_g is None:
+            if (nll_a_g is None or nll_b_g is None
+                    or (nll_a_g == 0.0 and a_s != 0.0)
+                    or (nll_b_g == 0.0 and b_s != 0.0)):
                 return _ls_not_estimable(
                     f'length stratum {gi} pooled NLL is not representable',
                     n_units=d_count, n_seeds=s_count, n_strata=len(groups))
@@ -431,14 +441,10 @@ def length_stratified_effect(nll_a, nll_b, n_tokens, *, n_strata=None,
                     f'length stratum {gi} log ratio is not representable',
                     n_units=d_count, n_seeds=s_count, n_strata=len(groups))
             lr.append(float(one_lr))
-            pa = _safe_exp_ppl(nll_a_g)
-            pb = _safe_exp_ppl(nll_b_g)
-            if pa is None or pb is None or not (
-                    _ls_math.isfinite(pa) and _ls_math.isfinite(pb)):
-                dp.append(None)
-            else:
-                val = pa - pb
-                dp.append(float(val) if _ls_math.isfinite(val) else None)
+            # exp(a)-exp(b) loses a tiny log difference to rounding; use the
+            # same expm1 fallback as the pooled document CI so a representable
+            # small ΔPPL is not reported as a fake zero.
+            dp.append(_ppl_difference(nll_a_g, nll_b_g))
         lr_vals.append(lr)
         dp_vals.append(dp)
         lo_tok = int(min(tg))
@@ -476,15 +482,26 @@ def length_stratified_effect(nll_a, nll_b, n_tokens, *, n_strata=None,
     overall_lr = []
     overall_dp = []
     for si in range(s_count):
-        a_tot = _ls_math.fsum(float(A[si, i]) for i in range(d_count))
-        b_tot = _ls_math.fsum(float(B[si, i]) for i in range(d_count))
+        # A finite panel can still have an unrepresentable total: `fsum`
+        # raises once the exact sum exceeds float64, and that is not a raw
+        # exception the caller should see.  Report the readout as unavailable
+        # and keep the report strict-JSON safe.
+        try:
+            a_tot = _ls_math.fsum(float(A[si, i]) for i in range(d_count))
+            b_tot = _ls_math.fsum(float(B[si, i]) for i in range(d_count))
+        except (OverflowError, ValueError):
+            return _ls_not_estimable(
+                'overall summed NLL is not representable',
+                n_units=d_count, n_seeds=s_count, n_strata=len(groups))
         if not (_ls_math.isfinite(a_tot) and _ls_math.isfinite(b_tot)):
             return _ls_not_estimable(
                 'overall summed NLL is not representable',
                 n_units=d_count, n_seeds=s_count, n_strata=len(groups))
         _a_pooled = _ls_div(a_tot, total_tokens)
         _b_pooled = _ls_div(b_tot, total_tokens)
-        if _a_pooled is None or _b_pooled is None:
+        if (_a_pooled is None or _b_pooled is None
+                or (_a_pooled == 0.0 and a_tot != 0.0)
+                or (_b_pooled == 0.0 and b_tot != 0.0)):
             return _ls_not_estimable(
                 'overall pooled NLL is not representable',
                 n_units=d_count, n_seeds=s_count, n_strata=len(groups))
@@ -493,13 +510,7 @@ def length_stratified_effect(nll_a, nll_b, n_tokens, *, n_strata=None,
             return _ls_not_estimable(
                 'overall log ratio is not representable',
                 n_units=d_count, n_seeds=s_count, n_strata=len(groups))
-        pa = _safe_exp_ppl(_a_pooled)
-        pb = _safe_exp_ppl(_b_pooled)
-        one_dp = None
-        if pa is not None and pb is not None and _ls_math.isfinite(pa) and _ls_math.isfinite(pb):
-            val = pa - pb
-            if _ls_math.isfinite(val):
-                one_dp = float(val)
+        one_dp = _ppl_difference(_a_pooled, _b_pooled)
         overall_lr.append(float(one_lr))
         overall_dp.append(one_dp)
         per_seed.append({
@@ -520,17 +531,32 @@ def length_stratified_effect(nll_a, nll_b, n_tokens, *, n_strata=None,
         overall_ratio = None
 
     ref_name, ref_weights = _ls_reference_weights(reference, strata, total_tokens)
+    if ref_weights is None:
+        return _ls_not_estimable(
+            'the token reference weights are not representable as positive '
+            'float64 values',
+            n_units=d_count, n_seeds=s_count, n_strata=len(groups))
     std_lr = []
     std_dp = []
     for si in range(s_count):
-        std_lr.append(float(_ls_math.fsum(
-            ref_weights[g] * lr_vals[g][si] for g in range(len(groups)))))
+        try:
+            std_lr.append(float(_ls_math.fsum(
+                ref_weights[g] * lr_vals[g][si] for g in range(len(groups)))))
+        except (OverflowError, ValueError):
+            return _ls_not_estimable(
+                'a standardised per-seed log ratio is not representable',
+                n_units=d_count, n_seeds=s_count, n_strata=len(groups))
         vals = [dp_vals[g][si] for g in range(len(groups))]
         if any(v is None for v in vals):
             std_dp.append(None)
         else:
-            std_dp.append(float(_ls_math.fsum(
-                ref_weights[g] * vals[g] for g in range(len(groups)))))
+            try:
+                std_dp.append(float(_ls_math.fsum(
+                    ref_weights[g] * vals[g] for g in range(len(groups)))))
+            except (OverflowError, ValueError):
+                return _ls_not_estimable(
+                    'a standardised per-seed PPL difference is not representable',
+                    n_units=d_count, n_seeds=s_count, n_strata=len(groups))
     std_lr_summary = _ls_summary(std_lr, conf)
     std_dp_finite = [v for v in std_dp if v is not None]
     std_dp_summary = _ls_summary(std_dp_finite, conf) if len(std_dp_finite) == s_count else (
@@ -739,17 +765,31 @@ def length_stratified_effect(nll_a, nll_b, n_tokens, *, n_strata=None,
     # concentration.
     contributions = []
     for s in strata:
-        if s['log_ratio'] is None:
+        if s['log_ratio'] is None or s['token_share'] is None:
             contributions.append(None)
         else:
-            contributions.append(float(s['token_share'] * s['log_ratio']))
+            try:
+                c = float(s['token_share'] * s['log_ratio'])
+            except (OverflowError, ValueError):
+                c = None
+            contributions.append(c if (c is not None
+                                       and _ls_math.isfinite(c)) else None)
     if any(c is None for c in contributions):
         concentration = {'available': False,
-                         'reason': 'a stratum log ratio is unavailable'}
+                         'reason': 'a stratum contribution is not representable'}
     else:
-        abs_sum = _ls_math.fsum(abs(c) for c in contributions)
-        total_contrib = _ls_math.fsum(contributions)
-        if abs_sum > 0.0:
+        # Contributions are finite individually but their absolute sum can
+        # exceed float64 on a very large panel; that must not abort the whole
+        # block with a raw `fsum` OverflowError.
+        abs_sum = total_contrib = None
+        try:
+            abs_sum = _ls_math.fsum(abs(c) for c in contributions)
+            total_contrib = _ls_math.fsum(contributions)
+        except (OverflowError, ValueError):
+            pass
+        if (abs_sum is not None and total_contrib is not None
+                and _ls_math.isfinite(abs_sum)
+                and _ls_math.isfinite(total_contrib) and abs_sum > 0.0):
             shares = [abs(c) / abs_sum for c in contributions]
             dom = int(max(range(len(groups)), key=lambda i: shares[i]))
             concentration = {
@@ -762,9 +802,14 @@ def length_stratified_effect(nll_a, nll_b, n_tokens, *, n_strata=None,
                 'cancellation': bool(total_contrib != 0.0 and abs_sum > 0.0
                                      and abs(total_contrib) / abs_sum < 0.5),
             }
-        else:
+        elif abs_sum == 0.0 and total_contrib == 0.0:
             concentration = {'available': False,
                              'reason': 'every stratum contribution is zero'}
+        else:
+            concentration = {
+                'available': False,
+                'reason': ('the stratum contributions or their absolute sum '
+                           'are not representable in float64')}
 
     out = {
         'kind': 'length_stratification',

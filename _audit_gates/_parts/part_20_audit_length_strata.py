@@ -316,13 +316,7 @@ def audit_length_strata(path=None):
                         row['problems'].append(
                             f'strata[{gi}].per_seed_log_ratio[{si}] does not '
                             'replay from the stored NLL sums')
-                    pa = L._safe_exp_ppl(_a_pooled)
-                    pb = L._safe_exp_ppl(_b_pooled)
-                    want_dp = None
-                    if (pa is not None and pb is not None
-                            and math.isfinite(pa) and math.isfinite(pb)
-                            and math.isfinite(pa - pb)):
-                        want_dp = float(pa - pb)
+                    want_dp = L._ppl_difference(_a_pooled, _b_pooled)
                     if not _lsa_close(dp[si], want_dp):
                         row['problems'].append(
                             f'strata[{gi}].per_seed_delta_ppl[{si}] does not '
@@ -391,12 +385,7 @@ def audit_length_strata(path=None):
                         f'per_seed[{si}].log_ratio != token-pooled total')
                 want_dp = None
                 if (_a_pooled is not None and _b_pooled is not None):
-                    _pa = L._safe_exp_ppl(_a_pooled)
-                    _pb = L._safe_exp_ppl(_b_pooled)
-                    if (_pa is not None and _pb is not None
-                            and math.isfinite(_pa) and math.isfinite(_pb)
-                            and math.isfinite(_pa - _pb)):
-                        want_dp = float(_pa - _pb)
+                    want_dp = L._ppl_difference(_a_pooled, _b_pooled)
                 if not _lsa_close(rec.get('delta_ppl'), want_dp):
                     row['problems'].append(
                         f'per_seed[{si}].delta_ppl != token-pooled total')

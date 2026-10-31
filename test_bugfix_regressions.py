@@ -449,3 +449,110 @@ def test_length_strata_audit_rejects_non_quantile_membership():
     assert got['status'] == 'fail', got
     assert any('declared equal-count length bins' in p
                for p in got['problems']), got['problems']
+
+
+def test_length_strata_overall_sum_overflow_is_not_a_raw_exception():
+    # Each stratum sum is finite (8 * 2e307 = 1.6e308), but their overall sum
+    # (3.2e308) exceeds float64.  `math.fsum` raises OverflowError for that
+    # exact sum; the descriptive block must report `not_estimable` instead of
+    # aborting the whole final-test analysis.
+    a = np.full((2, 16), 2e307)
+    b = np.zeros((2, 16))
+    block = L.length_stratified_effect(
+        a, b, [1] * 16, n_strata=2, min_units_per_stratum=2)
+    assert block['status'] == 'not_estimable', block
+    assert 'overall summed NLL' in (block.get('reason') or ''), block
+    json.dumps(block, allow_nan=False)
+
+
+def test_length_strata_unrepresentable_token_weight_is_not_silently_zero():
+    # The huge stratum has a representable pooled NLL (1e300 / 2e400 = 5e-101)
+    # and its token share is 1.0 to float64.  The short stratum's share is
+    # ~1e-400, which underflows to 0.0.  Replacing that weight with zero would
+    # silently remove a whole stratum from the standardised estimate.
+    tok = [1, 1, 10 ** 400, 10 ** 400]
+    a = np.array([[2.0, 2.0, 1e300, 1e300]])
+    b = np.zeros_like(a)
+    block = L.length_stratified_effect(
+        a, b, tok, n_strata=2, min_units_per_stratum=2, reference='token')
+    assert block['status'] == 'not_estimable', block
+    assert 'token reference weights' in (block.get('reason') or ''), block
+    json.dumps(block, allow_nan=False)
+
+
+def test_length_strata_tiny_log_effect_keeps_a_real_delta_ppl():
+    # The per-token log effect is 1e-100, so exp(a) and exp(b) both round to
+    # 1.0.  The raw ΔPPL is still representable and must not be reported as a
+    # fake zero; the audit replay uses the same expm1 path.
+    tok = [10 ** 400] * 4
+    a = np.array([[1e300] * 4])
+    b = np.zeros_like(a)
+    block = L.length_stratified_effect(
+        a, b, tok, n_strata=2, min_units_per_stratum=2)
+    assert block['status'] == 'ok', block
+    assert block['overall']['delta_ppl'] == 1e-100, block['overall']
+    got = _run_length_strata_audit(
+        _length_strata_stats(block, [0], len(tok)))
+    assert got['status'] == 'ok', got['problems']
+
+
+def test_unit_quantiles_support_token_totals_beyond_float64():
+    # Every count is beyond float64, but each per-token effect is 1e-100 and
+    # therefore representable.  Rejecting the panel during an unnecessary
+    # float conversion lost a valid distribution; the exact-ratio fallback must
+    # keep it and still produce a strict-JSON block.
+    tok = [10 ** 400 * (i + 1) for i in range(8)]
+    diff = np.array([[1e300 * (i + 1) for i in range(8)]])
+    block = L.unit_quantile_profile(diff, tok, seeds=[7])
+    assert block['status'] == 'ok', block
+    assert block['n_tokens'] == sum(tok)
+    assert math.isclose(block['mean']['token_pooled_log_ratio'], 1e-100,
+                        rel_tol=1e-12, abs_tol=0.0)
+    for row in block['quantiles']:
+        assert math.isclose(row['log_ratio'], 1e-100,
+                            rel_tol=1e-12, abs_tol=0.0)
+    json.dumps(block, allow_nan=False)
+
+
+def test_unit_quantiles_underflowing_per_token_effect_is_withheld():
+    # 1e-300 / 1e400 is below the smallest subnormal float.  Reporting the
+    # unit as a 0.0 effect would turn an unrepresentable measurement into a
+    # fake no-effect observation.
+    tok = [1] * 7 + [10 ** 400]
+    diff = np.array([[1.0] * 7 + [1e-300]])
+    block = L.unit_quantile_profile(diff, tok, seeds=[7])
+    assert block['status'] == 'not_estimable', block
+    assert 'per-token' in (block.get('reason') or ''), block
+    json.dumps(block, allow_nan=False)
+
+
+def test_unpaired_doc_ci_supports_token_totals_beyond_float64():
+    # The naive `nll / n_tokens` and `ce * n_tokens` paths raise OverflowError
+    # with a 1e400 token count even though the pooled CE (1e-100) is
+    # representable.  The exact-ratio path keeps the point estimate.
+    got = L._nll_doc_ci([1e300, 2e300], [10 ** 400, 2 * 10 ** 400])
+    assert got is not None, got
+    assert got['n_docs'] == 2, got
+    assert math.isclose(got['doc_ce_mean'], 1e-100,
+                        rel_tol=1e-12, abs_tol=0.0), got
+    assert got['ppl'] == 1.0, got
+    json.dumps(got, allow_nan=False)
+
+
+def test_paired_doc_ci_supports_token_totals_beyond_float64():
+    # The token total (3e400) is not representable, but the pooled log ratio
+    # (1e300 / 1e400 = 1e-100) is.  The exact-rational fallback must keep the
+    # point estimate instead of raising "int too large to convert to float";
+    # exp(a)-exp(b) also needs expm1 here, or a 5e-101 PPL difference rounds
+    # to a fake zero.
+    tok = [10 ** 400, 2 * 10 ** 400]
+    a = [[1e300, 2e300]]
+    b = [[0.5e300, 1e300]]
+    got = L._paired_nll_doc_ci(a, b, tok)
+    assert got is not None, got
+    assert math.isclose(got['delta_log_ratio'], 5e-101,
+                        rel_tol=1e-12, abs_tol=0.0)
+    assert math.isclose(got['delta_ppl'], 5e-101,
+                        rel_tol=1e-12, abs_tol=0.0)
+    assert got['delta_ppl_ci95'] is not None
+    json.dumps(got, allow_nan=False)

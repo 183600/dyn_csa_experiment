@@ -311,6 +311,43 @@ def _uq_clopper_pearson(k, n, conf):
     return [float(low), float(high)]
 
 
+def _uq_pooled_row(row, total_tokens):
+    """Token-pooled log ratio for one seed row, without a float64 detour.
+
+    ``sum_i x_i / T`` is the same per-token ratio as
+    ``sum_i (T_i/T) * (x_i/T_i)``, but forming the normalised weights first
+    underflows when a unit is tiny relative to a token total beyond float64
+    (e.g. ``1 / 10**400 == 0.0``).  The fast path keeps the historical
+    term-by-term sum; only an unrepresentable term falls back to an exact
+    rational accumulation, so a representable pooled ratio survives.
+    """
+    vals = [float(v) for v in row]
+    terms = []
+    need_exact = False
+    for v in vals:
+        term = _uq_div(v, total_tokens)
+        if term is None or (term == 0.0 and v != 0.0):
+            need_exact = True
+            break
+        terms.append(term)
+    if not need_exact:
+        try:
+            out = float(_uq_math.fsum(terms))
+        except (OverflowError, ValueError):
+            return None
+        return out if _uq_math.isfinite(out) else None
+    from fractions import Fraction as _Fraction
+    try:
+        exact = _Fraction(0, 1)
+        den = int(total_tokens)
+        for v in vals:
+            exact += _Fraction(v) / den
+        out = float(exact)
+    except (OverflowError, ValueError, ZeroDivisionError):
+        return None
+    return out if _uq_math.isfinite(out) else None
+
+
 def _uq_exp_ratio(value):
     try:
         out = _uq_math.exp(float(value))
@@ -460,37 +497,51 @@ def unit_quantile_profile(per_seed_nll_diff, n_tokens, *, unit_ids=None,
             f'training seed(s), got {S}',
             n_units=D, n_seeds=S, n_tokens=total_tokens,
             quantiles=qs, conf=conf)
+    # A token denominator beyond float64 must not hide a representable
+    # per-token value (the same failure mode `_ls_div` fixes for the length
+    # strata).  Use the vectorised path while every count is representable and
+    # all divisions are exact enough; otherwise evaluate each cell through the
+    # exact-ratio helper and keep the result only when it is representable.
     try:
         Tf = _uq_np.asarray(T, dtype=float)
     except (OverflowError, ValueError):
-        return _uq_not_estimable(
-            'the token counts exceed the representable float64 range',
-            n_units=D, n_seeds=S, n_tokens=total_tokens,
-            quantiles=qs, conf=conf)
-    with _uq_np.errstate(over='ignore', invalid='ignore', divide='ignore'):
-        d = A / Tf[None, :]
+        Tf = None
+    if Tf is not None and Tf.shape == (D,) and _uq_np.all(_uq_np.isfinite(Tf)):
+        with _uq_np.errstate(over='ignore', invalid='ignore', divide='ignore'):
+            d = A / Tf[None, :]
+        if _uq_np.any((d == 0.0) & (A != 0.0)):
+            return _uq_not_estimable(
+                'at least one per-token NLL difference underflows the '
+                'representable float64 range',
+                n_units=D, n_seeds=S, n_tokens=total_tokens,
+                quantiles=qs, conf=conf)
+    else:
+        d = _uq_np.empty_like(A)
+        for si in range(S):
+            for ui in range(D):
+                value = _uq_div(A[si, ui], T[ui])
+                if value is None or (value == 0.0 and A[si, ui] != 0.0):
+                    return _uq_not_estimable(
+                        'at least one per-unit NLL difference is not '
+                        'representable as a finite per-token value',
+                        n_units=D, n_seeds=S, n_tokens=total_tokens,
+                        quantiles=qs, conf=conf)
+                d[si, ui] = value
     if not _uq_np.all(_uq_np.isfinite(d)):
         return _uq_not_estimable(
             'at least one per-unit NLL difference is not representable as a '
             'finite per-token value',
             n_units=D, n_seeds=S, n_tokens=total_tokens,
             quantiles=qs, conf=conf)
-    weights = [_uq_div(t, total_tokens) for t in T]
-    if any(w is None or not _uq_math.isfinite(w) for w in weights):
-        return _uq_not_estimable(
-            'the token weights are not representable',
-            n_units=D, n_seeds=S, n_tokens=total_tokens,
-            quantiles=qs, conf=conf)
     pooled_per_seed = []
     for si in range(S):
-        try:
-            pooled_per_seed.append(float(_uq_math.fsum(
-                weights[i] * float(d[si, i]) for i in range(D))))
-        except (OverflowError, ValueError):
+        value = _uq_pooled_row(A[si, :], total_tokens)
+        if value is None:
             return _uq_not_estimable(
                 'a token-pooled per-seed log ratio is not representable',
                 n_units=D, n_seeds=S, n_tokens=total_tokens,
                 quantiles=qs, conf=conf)
+        pooled_per_seed.append(float(value))
     if any(not _uq_math.isfinite(v) for v in pooled_per_seed):
         return _uq_not_estimable(
             'a token-pooled per-seed log ratio is not finite',
