@@ -582,7 +582,14 @@ def run_order_balance(plan, actual_order=None):
         out['problems'].append('plan.variants contains duplicates')
     out['n_variants'] = len(variants)
     variant_set = set(variants)
-    position_counts = {v: [0] * max(1, len(variants)) for v in variants}
+    # Sparse position counters.  A full list per variant would make the audit
+    # O(n_variants**2) in memory; a large arm grid (e.g. a sweep/ablation
+    # family with thousands of arms) would exhaust memory before reporting a
+    # verdict.  Only observed positions are stored and missing positions are
+    # read as zero when computing the balance range, so the result is
+    # identical to the old dense table.
+    position_counts = {v: {} for v in variants}
+    _n_positions = max(1, len(variants))
     # When the design was inferred from events, an incomplete block is just a
     # partial observation, not proof of a bad plan; only arm-major is a hard
     # failure there.  A recorded plan is held to the full complete-block
@@ -603,8 +610,9 @@ def run_order_balance(plan, actual_order=None):
                 f'block {b!r} is not a complete block: got {vs!r}, '
                 f'expected each of {variants!r} exactly once')
         for i, v in enumerate(vs):
-            if v in position_counts and i < len(position_counts[v]):
-                position_counts[v][i] += 1
+            if v in position_counts and i < _n_positions:
+                _pc = position_counts[v]
+                _pc[i] = _pc.get(i, 0) + 1
     out['n_blocks'] = len(blocks)
     out['complete_blocks'] = complete
     out['n_cells'] = sum(len(vs) for vs in blocks.values() if isinstance(vs, list))
@@ -616,8 +624,17 @@ def run_order_balance(plan, actual_order=None):
             'panel can still be described, but it is not a complete-block design')
     balances = []
     for v, counts in position_counts.items():
-        if counts:
-            balances.append(max(counts) - min(counts))
+        if not counts:
+            # The historical dense table was a zero vector for a declared arm
+            # with no observed position; its balance range is exactly zero.
+            balances.append(0)
+            continue
+        # Missing positions are genuine zero counts.  The minimum is zero
+        # unless the variant was observed at every declared position, so we
+        # never materialise a dense vector just to find it.
+        _hi = max(counts.values())
+        _lo = 0 if len(counts) < _n_positions else min(counts.values())
+        balances.append(_hi - _lo)
     out['position_balanced'] = (max(balances) <= 1) if balances else None
     _pos_policy = design.get('position_balance')
     if out['position_balanced'] is False and _pos_policy != 'independent_block_shuffle':

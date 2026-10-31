@@ -77,6 +77,12 @@ def _prep_text(value):
     return None
 
 
+def _prep_study_level(protocol):
+    """Read ``protocol.study.level`` without assuming the study block exists."""
+    study = protocol.get('study') if isinstance(protocol, dict) else None
+    return _prep_text(study.get('level')) if isinstance(study, dict) else None
+
+
 def _prep_int(value, *, minimum=None):
     """Exact integer (booleans rejected), or None."""
     if isinstance(value, bool):
@@ -93,8 +99,8 @@ def _prep_int(value, *, minimum=None):
 
 
 def _prep_number(value):
-    """Finite float, or None; booleans are not measurements."""
-    if value is None or isinstance(value, bool):
+    """Finite float, or None; booleans/strings are not measurements."""
+    if value is None or isinstance(value, (bool, str, bytes, bytearray)):
         return None
     try:
         out = float(value)
@@ -276,9 +282,11 @@ def _prep_source_tree_check(protocol, source_tree, *, strict=True):
         _prep_fail(out, 'code semantics changed after registration')
     current_reg = _prep_text(current.get('split_registry_status'))
     registered_reg = _prep_text(impl.get('split_registry_status'))
-    if registered_reg == 'ok' and current_reg not in (None, 'ok'):
-        _prep_fail(out, f'executed split registry is no longer ok '
-                        f'({current_reg!r})')
+    if registered_reg == 'ok' and current_reg != 'ok':
+        # `None` means the supplied tree did not carry a registry at all; that
+        # is not evidence that the previously registered order is intact.
+        _prep_fail(out, 'executed split registry cannot be verified as ok '
+                        f'(current status={current_reg!r})')
     return out
 
 
@@ -422,11 +430,15 @@ def _prep_power_check(protocol, power, *, strict=True):
     _prep_hash_into(out, 'power_sha256', power)
     verdict = report.get('status')
     all_pass = report.get('all_pass')
-    if verdict not in ('pass', 'passed', 'ok') and all_pass is not True:
+    # Both the status label and the aggregate flag are evidence.  A `fail`
+    # status with `all_pass=True` (or a passing status with `all_pass=False`)
+    # is internally inconsistent and must not pass merely because one of the
+    # two fields happens to look green.  An absent flag is not a contradiction
+    # when the explicit status already passes.
+    if (verdict not in ('pass', 'passed', 'ok')
+            or all_pass is False):
         _prep_fail(out, f'power-validation artifact did not pass '
                         f'(status={verdict!r}, all_pass={all_pass!r})')
-    if all_pass is False:
-        _prep_fail(out, 'power-validation artifact reports all_pass=False')
     for key, want, label in (
             ('alpha', out['alpha'], 'alpha'),
             ('m_family', out['family_size'], 'family size'),
@@ -499,14 +511,19 @@ def _prep_power_check(protocol, power, *, strict=True):
     return out
 
 
-def _prep_rehearsal_verdict(rehearsal):
+def _prep_rehearsal_verdict(rehearsal, *, _depth=0):
     """Return ``(ok, detail, payload)`` for the supported rehearsal shapes."""
+    if _depth > 32:
+        # A self-referential/deeply nested object is a malformed artifact, not
+        # a verdict; refuse it instead of exhausting the interpreter stack.
+        return None, 'rehearsal nesting exceeds 32 levels', {}
     if isinstance(rehearsal, bool):
         return rehearsal, None, {}
     if not isinstance(rehearsal, dict):
         return None, f'unsupported rehearsal object {type(rehearsal).__name__}', {}
     if isinstance(rehearsal.get('plan'), dict):
-        return _prep_rehearsal_verdict(rehearsal.get('plan'))
+        return _prep_rehearsal_verdict(rehearsal.get('plan'),
+                                       _depth=_depth + 1)
     if isinstance(rehearsal.get('ok'), bool):
         errors = rehearsal.get('errors')
         if rehearsal.get('ok') is False and isinstance(errors, list) and errors:
@@ -523,7 +540,11 @@ def _prep_rehearsal_verdict(rehearsal):
 
 def _prep_rehearsal_check(protocol, rehearsal):
     out = _prep_check('rehearsal', required=True)
-    level = _prep_text((protocol.get('study') or {}).get('level'))
+    # A malformed/absent study block is a protocol problem that the protocol
+    # check already reports; reading its level must not raise here and abort
+    # the whole launch gate with an AttributeError.
+    _study = protocol.get('study')
+    level = _prep_text(_study.get('level')) if isinstance(_study, dict) else None
     if rehearsal is None:
         if level == 'confirmatory':
             return _prep_fail(out, 'no pre-run rehearsal of the frozen '
@@ -564,7 +585,7 @@ def _prep_test_read_from_path(path):
 
 def _prep_test_access_check(protocol, state):
     out = _prep_check('test_access', required=True)
-    level = _prep_text((protocol.get('study') or {}).get('level'))
+    level = _prep_study_level(protocol)
     read = None
     evidence = None
     if isinstance(state, bool):
@@ -616,13 +637,28 @@ def _prep_dependency_check(dependency_contract, *, strict=True):
     if not isinstance(dependency_contract, dict):
         return _prep_fail(out, 'dependency contract must be an object')
     out['dependency_status'] = _prep_text(dependency_contract.get('status'))
-    out['lock_sha256'] = _prep_text(dependency_contract.get('lock_sha256'))
+    out['lock_sha256'] = _prep_sha256_text(
+        dependency_contract.get('lock_sha256'))
     if out['dependency_status'] != 'ok':
         detail = (dependency_contract.get('mismatches')
                   or dependency_contract.get('missing')
                   or dependency_contract.get('problems') or [])
         return _prep_fail(out, 'dependency contract is not ok'
                                + (f': {detail[:5]}' if detail else ''))
+    # `status=ok` alone is a label; the contract must also identify the lock
+    # bytes it actually compared.  A missing/malformed digest or a listed
+    # mismatch means the environment is not pinned to the registration, even
+    # if a hand-edited status says otherwise.
+    detail = (dependency_contract.get('mismatches')
+              or dependency_contract.get('missing')
+              or dependency_contract.get('invalid')
+              or dependency_contract.get('problems') or [])
+    if detail:
+        return _prep_fail(out, 'dependency contract lists unresolved '
+                               f'problem(s): {detail[:5]}')
+    if out['lock_sha256'] is None:
+        return _prep_fail(out, 'dependency contract does not record the lock '
+                               'bytes it compared')
     return out
 
 
@@ -809,7 +845,7 @@ def validate_preparation_clearance(clearance, *, protocol=None):
             if current != study.get('design_protocol_sha256'):
                 out['problems'].append(
                     'clearance is bound to a different design protocol hash')
-            proto_level = _prep_text((protocol.get('study') or {}).get('level'))
+            proto_level = _prep_study_level(protocol)
             if proto_level != level:
                 out['problems'].append(
                     'clearance level does not equal the protocol level')
@@ -829,6 +865,13 @@ def validate_preparation_clearance(clearance, *, protocol=None):
             f'required_checks names unknown checks: {unknown_required}')
     if len(set(recorded_required)) != len(recorded_required):
         out['problems'].append('required_checks contains duplicates')
+    # The check vocabulary is fixed.  An extra entry is not harmless metadata:
+    # it would let a caller believe a check was recorded while the audit only
+    # replays the ten known names (and it is part of the content hash).
+    unknown_checks = sorted(set(checks) - set(PREPARATION_CLEARANCE_CHECK_ORDER))
+    if unknown_checks:
+        out['problems'].append(
+            f'checks names unknown checks: {unknown_checks}')
     for name in PREPARATION_CLEARANCE_CHECK_ORDER:
         check = checks.get(name)
         if not isinstance(check, dict):
@@ -842,6 +885,14 @@ def validate_preparation_clearance(clearance, *, protocol=None):
                           'not_applicable', 'fail'):
             out['problems'].append(f'checks.{name}.status={status!r} is not '
                                    'a recognised status')
+        if (check.get('name') is not None
+                and _prep_text(check.get('name')) != name):
+            out['problems'].append(
+                f'checks.{name}.name={check.get("name")!r} does not match its '
+                'key')
+        if 'required' in check and not isinstance(check.get('required'), bool):
+            out['problems'].append(
+                f'checks.{name}.required must be boolean')
         out['checks'][name] = status
         if status == 'fail':
             out['problems'].append(f'checks.{name} failed: '
@@ -849,10 +900,20 @@ def validate_preparation_clearance(clearance, *, protocol=None):
         elif status in ('warnings', 'not_verifiable'):
             out['warnings'].append(f'checks.{name} is {status}')
     required = set(recorded_required)
+    for name in PREPARATION_CLEARANCE_CHECK_ORDER:
+        check = checks.get(name)
+        if isinstance(check, dict) and 'required' in check:
+            if check.get('required') is not (name in required):
+                out['problems'].append(
+                    f'checks.{name}.required={check.get("required")!r} does '
+                    f'not match required_checks (name present: '
+                    f'{name in required})')
     if strict:
         expected_required = set(
             PREPARATION_CLEARANCE_POLICY['required_confirmatory'])
-        if checks.get('power', {}).get('status') == 'not_applicable':
+        _power_entry = checks.get('power')
+        if (isinstance(_power_entry, dict)
+                and _power_entry.get('status') == 'not_applicable'):
             expected_required.discard('power')
         missing = sorted(expected_required - required)
         if missing:
@@ -864,7 +925,9 @@ def validate_preparation_clearance(clearance, *, protocol=None):
                 f'confirmatory clearance marks non-required checks as '
                 f'mandatory: {extra}')
         for name in sorted(expected_required):
-            if checks.get(name, {}).get('status') != 'ok':
+            _entry = checks.get(name)
+            if (not isinstance(_entry, dict)
+                    or _entry.get('status') != 'ok'):
                 out['problems'].append(
                     f'confirmatory check {name!r} is not ok')
     for name in required:
@@ -991,7 +1054,12 @@ def _prep_load_json(path):
 
 def _prep_find_named(name, explicit=None):
     if explicit is not None:
-        return os.path.abspath(os.fspath(explicit))
+        try:
+            return os.path.abspath(os.fsdecode(os.fspath(explicit)))
+        except (TypeError, ValueError, OSError):
+            # A non-path object is not a stored artifact; report it as not
+            # found instead of crashing the gate before it can explain why.
+            return None
     root = globals().get('_REPO') or os.getcwd()
     candidates = [os.path.join(root, name)]
     try:
@@ -1063,6 +1131,10 @@ def preparation_clearance_audit(
     out['validation'] = validation
     out['problems'].extend(validation.get('problems') or [])
     out['warnings'].extend(validation.get('warnings') or [])
+    if validation.get('status') == 'fail':
+        # A structurally invalid/tampered clearance is a hard failure even when
+        # no replay artifact happens to be present to expose it a second time.
+        out['status'] = 'fail'
     # Build the event stream once.  A path is passed straight to the timing
     # helper; otherwise scan the explicit panel dirs (never the whole tree when
     # the caller supplied an empty list).
@@ -1085,11 +1157,26 @@ def preparation_clearance_audit(
     # single test read.
     near = os.path.dirname(clearance_path)
 
+    # Replay artifacts belong to the clearance being audited.  Searching the
+    # repository root even when the clearance lives in an unrelated temporary
+    # directory would import another panel's plan (and report a false hash
+    # drift against a perfectly valid clearance).  Only include the repository
+    # fallback when the audited clearance is actually inside it.
+    _base_dirs = [near, os.path.dirname(proto_path)]
+    _repo_base = globals().get('_REPO') or os.getcwd()
+    try:
+        _in_repo = (os.path.commonpath(
+            [os.path.realpath(_repo_base), os.path.realpath(near)])
+            == os.path.realpath(_repo_base))
+    except (OSError, ValueError):
+        _in_repo = False
+    if _in_repo and _repo_base not in _base_dirs:
+        _base_dirs.append(_repo_base)
+
     def _artifact(name, explicit):
         if explicit is not None:
             return explicit
-        for base in (near, os.path.dirname(proto_path),
-                     (globals().get('_REPO') or os.getcwd())):
+        for base in _base_dirs:
             for candidate in (os.path.join(base, name),
                               os.path.join(base, 'analysis_v12', name)):
                 if os.path.isfile(candidate):
@@ -1131,7 +1218,7 @@ def preparation_clearance_audit(
                                  'evidence': recorded_access.get('evidence')}
 
     def _load_if_path(value):
-        if isinstance(value, str) and os.path.isfile(value):
+        if isinstance(value, (str, os.PathLike)) and os.path.isfile(value):
             try:
                 return _prep_load_json(value)
             except Exception:
@@ -1141,9 +1228,21 @@ def preparation_clearance_audit(
     run_order = _load_if_path(run_order)
     disposition = _load_if_path(disposition)
     power = _load_if_path(power)
-    strict = _prep_text((protocol.get('study') or {}).get('level')) == 'confirmatory'
+    strict = _prep_study_level(protocol) == 'confirmatory'
+    # The protocol check resolves one warning only when a power artifact was
+    # supplied.  On replay the artifact may have been archived/moved while the
+    # clearance still records that it was checked.  In that case use the
+    # recorded (hash-bound) power check as the evidence for the resolved
+    # warning; otherwise a valid clearance would fail merely because replay
+    # could not find the file it was originally built with.  A malformed
+    # recorded power check is still caught by validation above.
+    _recorded_power = recorded_checks.get('power')
+    _power_supplied = isinstance(power, dict) and bool(power)
+    if (not _power_supplied and isinstance(_recorded_power, dict)
+            and _recorded_power.get('status') in ('ok', 'warnings')):
+        _power_supplied = True
     checks = {'protocol': _prep_protocol_check(
-        protocol, power_supplied=isinstance(power, dict) and bool(power))}
+        protocol, power_supplied=_power_supplied)}
     if source_tree is not None:
         checks['source_tree'] = _prep_source_tree_check(
             protocol, source_tree, strict=strict)
@@ -1166,6 +1265,10 @@ def preparation_clearance_audit(
     out['replay']['checks'] = {
         name: check.get('status') for name, check in checks.items()}
     out['replay']['replayed'] = sorted(checks)
+    # Keep the recorded launch decision in the replay block.  It is part of the
+    # clearance identity and lets the compact preflight summary state it
+    # without re-deriving `status == ok` from a partial replay.
+    out['replay']['launch_allowed'] = clearance.get('launch_allowed')
     for name, current in checks.items():
         recorded = recorded_checks.get(name)
         if not isinstance(recorded, dict):
@@ -1178,8 +1281,8 @@ def preparation_clearance_audit(
                 f'not reproduce ({current.get("status")!r})')
             out['status'] = 'fail'
         for key in ('design_protocol_sha256', 'run_order_sha256',
-                    'disposition_sha256', 'power_sha256',
-                    'current_analysis_source_sha256'):
+                    'disposition_sha256', 'power_sha256', 'rehearsal_sha256',
+                    'lock_sha256', 'current_analysis_source_sha256'):
             if key in recorded and key in current \
                     and recorded.get(key) != current.get(key):
                 out['problems'].append(
@@ -1246,12 +1349,17 @@ def preparation_clearance_preflight_summary(path=None, protocol_path=None):
     rep = preparation_clearance_audit(
         path=path, protocol_path=protocol_path, events=[], panel_dirs=[])
     validation = rep.get('validation') or {}
+    _launch = (rep.get('replay') or {}).get('launch_allowed')
+    if rep.get('status') == 'fail':
+        # The recorded bit is part of the (possibly tampered) body.  A failed
+        # replay must never be summarised as launchable.
+        _launch = False
     return {
         'status': rep.get('status'),
         'path': rep.get('path'),
         'protocol_path': rep.get('protocol_path'),
         'level': validation.get('level'),
-        'launch_allowed': (rep.get('replay') or {}).get('launch_allowed'),
+        'launch_allowed': _launch,
         'timing': (rep.get('timing') or {}).get('status'),
         'n_problems': len(rep.get('problems') or []),
         'n_warnings': len(rep.get('warnings') or []),
