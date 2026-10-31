@@ -135,7 +135,13 @@ def _es_mean_sd(values):
             mean, sd = None, None
     mean_ok = mean is not None and math.isfinite(mean)
     sd_ok = sd is not None and math.isfinite(sd)
-    if mean_ok and (n < 2 or sd_ok):
+    # Squaring subnormal values underflows to zero, so the naive SD can report
+    # ``0.0`` for a genuinely varying panel.  Only trust a zero SD when every
+    # value is identical; otherwise take the scaled path below, which recovers
+    # the representable spread.
+    naive_sd_trusted = (n < 2 or sd != 0.0
+                        or all(v == vals[0] for v in vals))
+    if mean_ok and (n < 2 or sd_ok) and naive_sd_trusted:
         return mean, sd
     scale = max(abs(v) for v in vals)
     if scale == 0.0:
@@ -148,6 +154,11 @@ def _es_mean_sd(values):
         scaled_mean, scaled_sd = None, None
     else:
         scaled_mean = (scaled_mean if math.isfinite(scaled_mean) else None)
+        if scaled_mean == 0.0 and mz != 0.0:
+            # The true mean is below the smallest representable float; a
+            # fabricated zero would turn a tiny measurable level into an
+            # exact no-effect/zero level.
+            scaled_mean = None
         scaled_sd = 0.0 if n < 2 else None
         if n >= 2 and scaled_mean is not None:
             try:
@@ -157,8 +168,13 @@ def _es_mean_sd(values):
                 scaled_sd = None
             if scaled_sd is not None and not math.isfinite(scaled_sd):
                 scaled_sd = None
-    out_mean = mean if mean_ok else scaled_mean
-    out_sd = sd if sd_ok else scaled_sd
+            if (scaled_sd == 0.0
+                    and any(x != z[0] for x in z)):
+                # The spread is real but below the smallest representable
+                # float; withhold it instead of claiming zero variance.
+                scaled_sd = None
+    out_mean = mean if (mean_ok and scaled_mean is not None) else scaled_mean
+    out_sd = sd if (sd_ok and naive_sd_trusted) else scaled_sd
     return out_mean, out_sd
 
 
@@ -191,6 +207,30 @@ def _es_gap_covers(a, b, threshold):
         return bool(Fraction(a) - Fraction(b) >= Fraction(threshold))
     except (TypeError, ValueError, OverflowError):
         return None
+
+
+def _es_close(a, b):
+    """Relative-only float equality for scale-free threshold comparisons.
+
+    An absolute epsilon such as ``1e-12`` is harmless for accuracy-like
+    endpoints but can make a genuinely positive tiny headroom look exhausted
+    or make a resolution below a tiny MEE look unresolved.  Using a relative
+    tolerance keeps the ordinary accuracy-scale behaviour and degrades to the
+    exact comparison at (sub)normal scales.
+    """
+    return math.isclose(a, b, rel_tol=1e-12, abs_tol=0.0)
+
+
+def _es_ge(a, b):
+    return bool(a >= b or _es_close(a, b))
+
+
+def _es_le(a, b):
+    return bool(a <= b or _es_close(a, b))
+
+
+def _es_lt(a, b):
+    return bool(a < b and not _es_close(a, b))
 
 
 def _es_int(value, *, minimum=None):
@@ -499,7 +539,10 @@ def endpoint_headroom(endpoint=None, control_level=None, *, arm_levels=None,
     # representable float: it cannot be exhausted or near the bound, and it
     # covers every finite declared margin.  The exact comparison below keeps
     # the structural verdict useful without serialising an infinity.
-    out['exhausted'] = bool(headroom is not None and headroom <= 1e-12)
+    _exhaust_scale = max(abs(beneficial), abs(ref))
+    _exhaust_eps = 1e-12 * _exhaust_scale
+    out['exhausted'] = bool(headroom is not None
+                           and headroom <= _exhaust_eps)
     out['near_bound'] = bool(
         out['exhausted'] or (out['headroom_relative'] is not None
                              and out['headroom_relative'] <= near_tol))
@@ -509,7 +552,7 @@ def endpoint_headroom(endpoint=None, control_level=None, *, arm_levels=None,
     out['structurally_possible'] = (not out['exhausted'])
     if mee is not None:
         if headroom is not None:
-            out['headroom_covers_mee'] = bool(headroom + 1e-12 >= mee)
+            out['headroom_covers_mee'] = _es_ge(headroom, mee)
         else:
             out['headroom_covers_mee'] = _es_gap_covers(
                 beneficial, ref, mee) if higher else _es_gap_covers(
@@ -640,20 +683,28 @@ def endpoint_measurement_resolution(repeat_values=None, *, endpoint=None,
             'envelope')
         return out
     if mee is not None:
-        out['resolves_mee'] = bool(resolution + 1e-12 < mee)
+        out['resolves_mee'] = _es_lt(resolution, mee)
     if mee is not None and not out['resolves_mee']:
         out['status'] = 'resolution_limited'
         out['warnings'].append(
             f'repeated identical evaluations move by {resolution:.6g}, which '
             f'is not smaller than the declared minimum meaningful effect '
             f'{mee:.6g}; the endpoint cannot resolve a worthwhile difference')
-    elif (mee is None and max_rel is not None
-          and out['relative_resolution'] is not None
-          and out['relative_resolution'] > max_rel):
-        out['status'] = 'coarse_resolution'
-        out['warnings'].append(
-            f'relative measurement resolution {out["relative_resolution"]:.6g} '
-            f'exceeds the declared maximum {max_rel:.6g}')
+    elif mee is None and max_rel is not None:
+        if out['relative_resolution'] is None:
+            out['status'] = 'not_verifiable'
+            out['warnings'].append(
+                'max_relative_resolution is declared but the relative '
+                'resolution is undefined (the repeat mean is zero or not '
+                'representable); the target cannot be judged')
+        elif out['relative_resolution'] > max_rel:
+            out['status'] = 'coarse_resolution'
+            out['warnings'].append(
+                f'relative measurement resolution '
+                f'{out["relative_resolution"]:.6g} exceeds the declared '
+                f'maximum {max_rel:.6g}')
+        else:
+            out['status'] = 'ok'
     else:
         out['status'] = 'ok'
     return out
@@ -752,7 +803,7 @@ def endpoint_sensitivity(endpoint=None, *, control_level=None, arm_levels=None,
                             'n_units': int(nu), 'alpha': a,
                             'target_power': tp})
                 if mee is not None:
-                    mde['mde_covers_mee'] = bool(value + 1e-12 <= mee)
+                    mde['mde_covers_mee'] = _es_le(value, mee)
                     if not mde['mde_covers_mee']:
                         mde['status'] = 'underpowered'
                         mde['warnings'].append(
@@ -888,12 +939,14 @@ def _es_merge_mee(declared, observed, *, endpoint, problems):
         problems.append(
             f'{endpoint}: pilot minimum_meaningful_effect={observed!r} must '
             'be a finite positive number')
-    if d is not None and o is not None and abs(d - o) > 1e-12 * max(1.0, abs(d), abs(o)):
-        problems.append(
-            f'{endpoint}: the manifest and the pilot declare different '
-            f'minimum meaningful effects ({d!r} vs {o!r}); a margin must be '
-            'fixed before the run')
-        return d
+    if d is not None and o is not None:
+        _mee_tol = 1e-12 * max(abs(d), abs(o))
+        if abs(d - o) > _mee_tol:
+            problems.append(
+                f'{endpoint}: the manifest and the pilot declare different '
+                f'minimum meaningful effects ({d!r} vs {o!r}); a margin must be '
+                'fixed before the run')
+            return d
     return d if d is not None else o
 
 
@@ -1170,10 +1223,12 @@ def endpoint_sensitivity_audit(manifest=None, pilot=None, *, config=None,
                     'headroom is smaller than the declared minimum '
                     'meaningful effect')
         if req['require_measurement_resolution']:
+            # Use this endpoint's own resolution block.  ``cfg``/``pcfg`` are
+            # loop variables from the setup pass above; reusing them here made
+            # the target check depend on whichever endpoint happened to be
+            # processed last (a fail-open for other endpoints).
             if (block.get('minimum_meaningful_effect') is None
-                    and decl.get('max_relative_resolution') is None
-                    and cfg.get('max_relative_resolution') is None
-                    and pcfg.get('max_relative_resolution') is None):
+                    and res.get('max_relative_resolution') is None):
                 problems.append(
                     f'{ep}: require_measurement_resolution is set but no '
                     'MEE or max_relative_resolution is declared; the '

@@ -190,7 +190,13 @@ def _od_mean_sd(values):
             mean, sd = None, None
     mean_ok = mean is not None and _od_math.isfinite(mean)
     sd_ok = sd is not None and _od_math.isfinite(sd)
-    if mean_ok and (n < 2 or sd_ok):
+    # Squaring subnormal values underflows to zero, so the naive SD can report
+    # ``0.0`` for a genuinely varying panel.  Only trust a zero SD when every
+    # value is identical; otherwise use the scaled path, which retains the
+    # representable spread.
+    naive_sd_trusted = (n < 2 or sd != 0.0
+                        or all(v == values[0] for v in values))
+    if mean_ok and (n < 2 or sd_ok) and naive_sd_trusted:
         return mean, sd
     scale = _od_scale(values)
     if scale == 0.0:
@@ -203,6 +209,10 @@ def _od_mean_sd(values):
         scaled_mean = None
     if scaled_mean is not None and not _od_math.isfinite(scaled_mean):
         scaled_mean = None
+    if scaled_mean == 0.0 and mz != 0.0:
+        # The true mean is below the smallest representable float; a fake zero
+        # would make a tiny effect indistinguishable from an exact no-effect.
+        scaled_mean = None
     scaled_sd = 0.0 if n < 2 else None
     if n >= 2 and scaled_mean is not None:
         try:
@@ -212,8 +222,12 @@ def _od_mean_sd(values):
             scaled_sd = None
         if scaled_sd is not None and not _od_math.isfinite(scaled_sd):
             scaled_sd = None
-    out_mean = mean if mean_ok else scaled_mean
-    out_sd = sd if sd_ok else scaled_sd
+        if scaled_sd == 0.0 and any(x != z[0] for x in z):
+            # Real spread below the smallest representable float: withhold it
+            # rather than reporting a fake zero-variance panel.
+            scaled_sd = None
+    out_mean = mean if (mean_ok and scaled_mean is not None) else scaled_mean
+    out_sd = sd if (sd_ok and naive_sd_trusted) else scaled_sd
     return out_mean, out_sd
 
 
@@ -482,6 +496,14 @@ def ordered_unit_inference(values, *, unit_ids=None, block_lengths=None,
                      'reason': 'the mean/sample SD is not representable'})
         return base
     se = sd / _od_math.sqrt(n)
+    if sd > 0.0 and (not _od_math.isfinite(se) or se == 0.0):
+        # sb -> 0 would make the i.i.d. interval a fake [mean, mean].  The
+        # sample spread is representable but its standard error is not; refuse
+        # the readout instead of reporting certainty.
+        base.update({'status': 'not_estimable',
+                     'reason': ('the sample SD is representable but the '
+                                'standard error under/overflows float64')})
+        return base
     tcrit = _t_critical(conf, float(n - 1))
     if not _od_math.isfinite(tcrit):
         base.update({'status': 'not_estimable',
@@ -491,6 +513,11 @@ def ordered_unit_inference(values, *, unit_ids=None, block_lengths=None,
     if not all(_od_math.isfinite(x) for x in iid_ci):
         base.update({'status': 'not_estimable',
                      'reason': 'the i.i.d. interval is not representable'})
+        return base
+    if sd > 0.0 and iid_ci[0] == iid_ci[1]:
+        base.update({'status': 'not_estimable',
+                     'reason': ('the sample SD is positive but the i.i.d. '
+                                'interval width underflows to zero')})
         return base
 
     work, scale = _od_centre(vals)

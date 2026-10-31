@@ -145,7 +145,14 @@ def audit_order_dependence(path=None):
                     row['problems'].append(
                         'sufficient_statistics.values contains a non-numeric value')
                     break
-                if not math.isfinite(float(v)):
+                try:
+                    finite = math.isfinite(float(v))
+                except (TypeError, ValueError, OverflowError):
+                    # An exact integer beyond float64 cannot be converted to a
+                    # float; a stored measurement that large is malformed, not
+                    # a reason to let the audit raise and abort the report.
+                    finite = False
+                if not finite:
                     row['problems'].append(
                         'sufficient_statistics.values contains a non-finite value')
                     break

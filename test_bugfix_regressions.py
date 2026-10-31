@@ -600,3 +600,88 @@ def test_endpoint_sensitivity_withholds_unrepresentable_scale_statistics():
     assert L.endpoint_headroom('accuracy', '0.9')['status'] == 'invalid'
     assert L.endpoint_measurement_resolution(
         ['0.9', '0.91'])['n_repeats'] == 0
+
+
+def test_endpoint_resolution_target_is_checked_per_endpoint():
+    # The requirement check used to read `cfg`/`pcfg` left over from the last
+    # endpoint of the setup loop.  A target on the alphabetically-last endpoint
+    # therefore masked a missing target on every other endpoint.
+    manifest = {
+        'primary_comparisons': [],
+        'endpoint_sensitivity': {
+            'require_measurement_resolution': True,
+            'endpoints': {
+                'accuracy': {},
+                'ppl': {'max_relative_resolution': 1.0},
+            },
+        },
+    }
+    pilot = {'split': 'validation', 'endpoints': {
+        'accuracy': {'control_level': 0.9, 'repeat_values': [0.9, 0.91]},
+        'ppl': {'control_level': 30.0, 'repeat_values': [30.0, 30.01]},
+    }}
+    got = L.endpoint_sensitivity_audit(manifest, pilot, verbose=False)
+    assert got['status'] == 'fail', got
+    assert any('accuracy' in p and 'no MEE or max_relative_resolution' in p
+               for p in got['problems']), got['problems']
+    # A declared relative target that cannot be normalised (zero repeat mean)
+    # is not silently a pass either.
+    rel = L.endpoint_measurement_resolution(
+        [-1e-3, 1e-3], max_relative_resolution=0.1)
+    assert rel['status'] == 'not_verifiable', rel
+
+
+def test_subnormal_panels_do_not_fabricate_zero_spread_or_certainty():
+    # np.std squares subnormal values, underflowing to 0.  Both the endpoint
+    # and ordered-unit helpers must retain a representable positive SD, and
+    # withhold a spread/mean that is below the smallest float instead of
+    # reporting a fake zero.
+    tiny = [1e-300, -1e-300] * 6
+    block = L.ordered_unit_inference(tiny, n_boot=50, n_perm=20)
+    assert block['status'] == 'ok', block
+    assert block['sd'] > 0.0 and block['iid_ci_width'] > 0.0, block
+    json.dumps(block, allow_nan=False)
+    res = L.endpoint_measurement_resolution(tiny)
+    assert res['sd'] > 0.0 and res['resolution'] > 0.0, res
+
+    subnormal = [0.0, 0.0, 0.0, 5e-324, 0.0, 0.0, 0.0, 5e-324]
+    assert L._es_mean_sd(subnormal) == (None, None)
+    assert L._od_mean_sd(subnormal) == (None, None)
+    withheld = L.ordered_unit_inference(subnormal, n_boot=20, n_perm=10)
+    assert withheld['status'] == 'not_estimable', withheld
+    json.dumps(withheld, allow_nan=False)
+
+
+def test_order_audit_rejects_unrepresentable_value_without_crashing():
+    block = L.ordered_unit_inference(
+        [0.1 * i for i in range(12)], n_boot=20, n_perm=10)
+    obj = {'finaltest': {'comparisons': {'c1': {'doc_sampling': {
+        'order_inference': block,
+        'n_docs': 12, 'pooled_ci_n_units': 12}}}}}
+    obj['finaltest']['comparisons']['c1']['doc_sampling'][
+        'order_inference']['sufficient_statistics']['values'][0] = 10 ** 400
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, 'test_stats.json')
+        with open(path, 'w', encoding='utf-8') as fh:
+            json.dump(obj, fh)
+        with contextlib.redirect_stdout(io.StringIO()):
+            got = A.audit_order_dependence(path)
+    assert got['status'] == 'fail', got
+    assert any('non-finite value' in p for p in got['problems']), got
+
+
+def test_tiny_positive_headroom_and_mee_are_not_absolute_epsilon_events():
+    # A 1e-13 headroom on a 1e-3-wide endpoint is small relative to that
+    # endpoint but is not zero; an absolute 1e-12 epsilon used to call it
+    # saturated.  Likewise an exact-zero resolution must resolve a tiny MEE.
+    head = L.endpoint_headroom(
+        'custom', control_level=0.0, metric='custom',
+        bounds=[0.0, 1e-3], direction='higher_is_better',
+        minimum_meaningful_effect=1e-13)
+    assert head['exhausted'] is False and head['status'] != 'saturated', head
+    exact = L.endpoint_measurement_resolution(
+        [1e-13, 1e-13], minimum_meaningful_effect=1e-12)
+    assert exact['resolves_mee'] is True and exact['status'] == 'ok', exact
+    coarse = L.endpoint_measurement_resolution(
+        [1e-13, 2e-13], minimum_meaningful_effect=1e-14)
+    assert coarse['resolves_mee'] is False, coarse
