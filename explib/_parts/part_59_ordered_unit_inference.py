@@ -591,6 +591,9 @@ def ordered_unit_inference(values, *, unit_ids=None, block_lengths=None,
         if gi not in batch_counts:
             batch_counts.append(gi)
     if not batch_counts:
+        if n_batches is not None:
+            raise ValueError('n_batches must contain at least one feasible '
+                             'batch layout')
         gi = _od_primary_batches(n)
         if gi is None:
             base.update({'status': 'not_estimable',
@@ -651,6 +654,9 @@ def ordered_unit_inference(values, *, unit_ids=None, block_lengths=None,
         if bi not in block_lengths_out:
             block_lengths_out.append(bi)
     if not block_lengths_out:
+        if block_lengths is not None:
+            raise ValueError('block_lengths must contain at least one '
+                             'feasible length')
         block_lengths_out = [max(2, min(8, n // 2))]
 
     block_rows = []

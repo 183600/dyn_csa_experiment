@@ -204,6 +204,9 @@ def _po_policy(block_lengths, n_batches, n_boot, n_perm, conf, alpha, seed,
         if gi not in batch_counts:
             batch_counts.append(gi)
     if not batch_counts:
+        if n_batches is not None:
+            raise ValueError('n_batches must contain at least one feasible '
+                             'batch layout')
         gi = _po_primary_batches(n_units)
         if gi is None:
             raise ValueError('no feasible non-overlapping batch layout')
@@ -241,6 +244,9 @@ def _po_policy(block_lengths, n_batches, n_boot, n_perm, conf, alpha, seed,
         if bi not in block_lengths_out:
             block_lengths_out.append(bi)
     if not block_lengths_out:
+        if block_lengths is not None:
+            raise ValueError('block_lengths must contain at least one '
+                             'feasible length')
         block_lengths_out = [max(2, min(8, n_units // 2))]
     return {
         'conf': conf, 'alpha': alpha, 'seed': seed,
@@ -560,17 +566,39 @@ def pooled_order_inference_from_influence(
         # A delta-method influence vector is centred: Sum(psi)=0.  The point
         # estimate is a separate number; requiring Sum(psi)==point would
         # reject every valid influence series.
-        _sum = _po_math.fsum(series) if series else 0.0
-        _abs = _po_math.fsum(abs(v) for v in series) if series else 0.0
+        if not series:
+            _sum_scaled = _abs_scaled = 0.0
+            _scale = 0.0
+        else:
+            _scale = max(abs(v) for v in series)
+            if _scale == 0.0:
+                _sum_scaled = _abs_scaled = 0.0
+            else:
+                # Scale before fsum: a finite centered series such as
+                # [1.7e308, -1.7e308, ...] has an intermediate |sum| above
+                # float64 even though its signed sum is zero, and math.fsum
+                # raises OverflowError on the abs() accumulator.
+                _z = [v / _scale for v in series]
+                _sum_scaled = _po_math.fsum(_z)
+                _abs_scaled = _po_math.fsum(abs(v) for v in _z)
         # Keep the historical practical tolerance: a computed influence can
         # carry a non-zero sum from cancellation in ``ce * n_tokens`` even
-        # though the exact series is centred.  Tightening this to a purely
-        # relative bound would reject previously stored artifact series whose
-        # values are themselves numerical residuals.
-        if abs(_sum) > 1e-8 * max(1.0, _abs):
+        # though the exact series is centred.  Divide both sides by the common
+        # scale so the check is exact and cannot overflow; for ordinary
+        # panels this is algebraically the same bound as before.
+        if _scale == 0.0:
+            _bad = False
+        else:
+            try:
+                _inv_scale = 1.0 / _scale
+            except OverflowError:
+                _inv_scale = float('inf')
+            _bad = abs(_sum_scaled) > 1e-8 * max(_inv_scale, _abs_scaled)
+        if _bad:
             raise ValueError(
-                f'{name} has non-zero sum {_sum!r}; a delta-method influence '
-                'series must be centred (Sum(psi)=0)')
+                f'{name} has non-zero (scaled) sum {_sum_scaled!r} '
+                f'(scale={_scale!r}); a delta-method influence series must be '
+                'centred (Sum(psi)=0)')
     if unit_ids is not None:
         if isinstance(unit_ids, (str, bytes, bytearray)):
             raise ValueError('unit_ids must be an iterable, not a string')

@@ -228,6 +228,12 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=None, cache_dir=None,
         for _pat in ('train_doc_ids_v5_*.npy', 'val_doc_ids_*.npy'):
             for _p in sorted(_glob_memo.glob(os.path.join(cache_dir, _pat))):
                 _sig_paths['paired_docs:' + os.path.basename(_p)] = _p
+        # Legacy test caches compare the test tokenizer VOCABULARY against the
+        # first train tokenizer on every verification.  Without those files in
+        # the memo key, replacing the train tokenizer after one successful load
+        # served the already-memoised tuple without re-running that comparison.
+        for _p in sorted(_glob_memo.glob(os.path.join(cache_dir, 'tok_v5_*.json'))):
+            _sig_paths['paired_tokenizer:' + os.path.basename(_p)] = _p
         _sig = _memo_file_sig(_sig_paths)
         _src_key = json.dumps(wikitext_dataset_source(), sort_keys=True,
                               default=str)

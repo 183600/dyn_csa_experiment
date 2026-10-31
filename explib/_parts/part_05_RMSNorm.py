@@ -1020,6 +1020,13 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=None, val_seqs=512,
                                            meta.get('vocab'), seq_len=seq_len,
                                            fingerprints_trusted=False,
                                            ranges_trusted=_fast)
+        if meta.get('vocab') is not None:
+            _meta_vocab = _as_seed_int(meta.get('vocab'))
+            if _meta_vocab is None or _meta_vocab != int(vocab_size):
+                _problems.append(
+                    f'cached vocab {meta.get("vocab")!r} != requested '
+                    f'{int(vocab_size)}; the cache tag and its content '
+                    'disagree')
         # The persisted tokenizer is part of the split identity: the test
         # loader compares its id space to this file on every hit, so a swapped
         # train tokenizer must invalidate this cache rather than silently

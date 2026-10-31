@@ -661,6 +661,14 @@ def _matrix_fingerprint(X):
                         'matrix fingerprint needs real-valued rows; casting '
                         'complex rows to float64 would silently discard the '
                         'imaginary part')
+                if isinstance(v, (np.datetime64, np.timedelta64)):
+                    # Temporal values have no dtype-independent float image:
+                    # some units raise, others round.  Use the same NaN block
+                    # plus canonical temporal key for every spelling so the
+                    # digest cannot depend on the storage dtype/unit.
+                    vals.append(float('nan'))
+                    exact = False
+                    continue
                 try:
                     f = float(v)
                 except (TypeError, ValueError, OverflowError):
@@ -758,9 +766,10 @@ def _matrix_fingerprint(X):
         return h.hexdigest()
     _w = int(arr.shape[1]) if arr.ndim > 1 else 1
     _step = _hash_row_block(_w, 1 << 20)
+    _is_temporal_dtype = (np.issubdtype(arr.dtype, np.datetime64)
+                          or np.issubdtype(arr.dtype, np.timedelta64))
     _is_int = (np.issubdtype(arr.dtype, np.integer) or arr.dtype == np.bool_
-               or np.issubdtype(arr.dtype, np.datetime64)
-               or np.issubdtype(arr.dtype, np.timedelta64))
+               or _is_temporal_dtype)
     # As in the object path, exact-row tails go into a separate running hash
     # that is folded in after all block float images.  Otherwise the same
     # table fingerprints differently when the memory cap changes how rows are
@@ -770,6 +779,13 @@ def _matrix_fingerprint(X):
         block = arr[start:start + _step]
         with np.errstate(invalid='ignore', over='ignore'):
             block_f = np.asarray(block, dtype=np.float64)
+        if _is_temporal_dtype:
+            # The object path cannot float() a datetime/timedelta scalar, so
+            # it hashes a NaN float image plus the canonical temporal key.
+            # Use the same image here; otherwise the same instant held in a
+            # native temporal dtype and in an object column would fingerprint
+            # differently even though `_row_keys` says they are one identity.
+            block_f = np.full(block_f.shape, np.nan, dtype=np.float64)
         if np.any(block_f == 0.0):
             block_f = block_f.copy()
             block_f[block_f == 0.0] = 0.0
@@ -842,8 +858,22 @@ def _matrix_fingerprint(X):
                 _back[_castable] = block_f[_castable].astype(np.int64)
             _exact = _castable & (_back == _raw)
         _bad_rows = ~_exact.all(axis=-1) if _exact.ndim > 1 else ~_exact
+        if _is_temporal_dtype:
+            # Every temporal row needs the canonical key tail (the object path
+            # cannot represent these values in its float64 block either).
+            _bad_rows = np.ones(_bad_rows.shape, dtype=bool) if hasattr(
+                _bad_rows, 'shape') else np.ones(1, dtype=bool)
         if np.any(_bad_rows):
-            _bad = _raw[_bad_rows]
+            if _is_temporal_dtype:
+                # Keep the temporal scalar (not the integer view of its
+                # declared unit) so the exact-tail identity is the same
+                # canonical instant as `_row_keys` uses for the native and
+                # object storage paths.  Casting the int view to object would
+                # key, say, datetime64[D] as a plain integer and make the same
+                # table fingerprint differently by storage dtype.
+                _bad = block[_bad_rows]
+            else:
+                _bad = np.asarray(_raw[_bad_rows], dtype=object)
             if _bad.ndim == 1:
                 _bad = _bad.reshape(-1, 1)
             # Canonical object keys (not raw dtype bytes) so a native int64
@@ -853,8 +883,7 @@ def _matrix_fingerprint(X):
             # large integer next to its exactly representable neighbour), so
             # without a position a permutation would fingerprint identically.
             _bad_pos = np.nonzero(np.reshape(_bad_rows, -1))[0] + start
-            for pos, key in zip(_bad_pos.tolist(),
-                                _row_keys(np.asarray(_bad, dtype=object))):
+            for pos, key in zip(_bad_pos.tolist(), _row_keys(_bad)):
                 _tail.update(b'|R')
                 _tail.update(str(int(pos)).encode('ascii'))
                 _tail.update(b'|')

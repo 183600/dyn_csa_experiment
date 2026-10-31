@@ -838,3 +838,65 @@ def test_data_exposure_audit_replays_huge_exact_counts_and_run_seed():
             got = A.audit_data_exposure(path)
     assert got['status'] == 'fail', got
     assert any('record seed' in p for p in got['problems']), got['problems']
+
+
+def test_ledger_append_refuses_a_deleted_middle_line_even_when_tail_is_intact():
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, 'experiments.jsonl')
+        for i in range(3):
+            L.append_jsonl(path, {'kind': 'event', 'i': i})
+        with open(path, encoding='utf-8') as fh:
+            lines = fh.readlines()
+        with open(path, 'w', encoding='utf-8') as fh:
+            fh.writelines([lines[0], lines[2]])
+        assert L.verify_experiment_ledger(path)['status'] == 'fail'
+        with np.testing.assert_raises(RuntimeError):
+            L.append_jsonl(path, {'kind': 'after'})
+
+
+def test_native_and_object_temporal_matrices_share_a_content_fingerprint():
+    native = np.array([['2020-01-01']], dtype='datetime64[D]')
+    obj = np.array([[np.datetime64('2020-01-01')]], dtype=object)
+    assert DG._row_keys(native)[0] == DG._row_keys(obj)[0]
+    assert DG._matrix_fingerprint(native) == DG._matrix_fingerprint(obj)
+    ns = np.array([['2020-01-01T00:00:00.000000001']],
+                  dtype='datetime64[ns]')
+    ns_obj = np.array([[np.datetime64('2020-01-01T00:00:00.000000001',
+                                      'ns')]], dtype=object)
+    assert DG._matrix_fingerprint(ns) == DG._matrix_fingerprint(ns_obj)
+
+
+def test_paired_effect_stats_does_not_claim_an_overflowing_sd_is_noise():
+    rep = L.paired_effect_stats([1.7e308, 1.7e308, -1.7e308])
+    assert rep['std_available'] is False
+    assert rep['within_seed_noise'] is False, rep
+
+
+def test_pooled_influence_centeredness_does_not_overflow_fsum():
+    huge = [1.7e308, -1.7e308] * 8
+    got = L.pooled_order_inference_from_influence(
+        huge, huge, delta_ppl=0.0, delta_log_ratio=0.0,
+        seeds=[0, 1], n_seeds=2, n_boot=20, n_perm=5)
+    assert got['status'] in ('ok', 'not_estimable'), got
+    json.dumps(got, allow_nan=False)
+
+
+def test_explicit_empty_order_layouts_and_unsorted_maps_fail_closed():
+    vals = [0.1 * i for i in range(12)]
+    with np.testing.assert_raises(ValueError):
+        L.ordered_unit_inference(vals, block_lengths=[])
+    with np.testing.assert_raises(ValueError):
+        L.ordered_unit_inference(vals, n_batches=[])
+    ids = np.asarray([[30, 30, 10, 10, 20, 20]], dtype=np.uint64)
+    keys, inv = L.document_index(ids)
+    with np.testing.assert_raises(ValueError):
+        L.aggregate_nll_by_document(
+            L.torch.arange(6, dtype=L.torch.float32).reshape(1, 6), ids,
+            document_index_map=(keys[::-1], inv))
+
+
+def test_plot_tolerates_a_sparse_aggregate(tmp_path):
+    agg = {'full': {'ppl_primary': 1.0, 'ppl_std': 0.1,
+                    'params': None, '_group_records': []}}
+    L._plot({}, agg, str(tmp_path))
+    assert os.path.exists(os.path.join(str(tmp_path), 'summary.png'))

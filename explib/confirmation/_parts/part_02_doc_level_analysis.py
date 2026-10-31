@@ -1559,6 +1559,16 @@ def _order_inference_markdown(ft):
         if oi.get('status') != 'ok':
             missing.append(name)
             continue
+        # A cell that CLAIMS a valid unit_order must also carry a verified
+        # readout; otherwise the table would render a sorted/legacy readout
+        # as corpus order.  A genuinely legacy artifact with no cell-level
+        # attestation at all keeps its historical row (with the explicit
+        # "未核验" warning below) for backward-compatible report rendering.
+        if (isinstance(_uo, dict) and _uo.get('status') == 'ok'
+                and (not isinstance(oi.get('unit_order'), dict)
+                     or oi['unit_order'].get('status') != 'verified')):
+            unverified.append(name)
+            continue
         de = oi.get('design_effect_max')
         batch = oi.get('batch_means') or []
         blocks = oi.get('block_bootstrap') or []
@@ -1589,7 +1599,7 @@ def _order_inference_markdown(ft):
                        _ci(oi.get('robust_ci')),
                        _num(oi.get('order_dependence_p'), '{:.4f}'),
                        '；'.join(flag) if flag else '—'))
-    if not rows and not missing and not not_estimable:
+    if not rows and not missing and not not_estimable and not unverified:
         return []
     out = ['### 顺序依赖 / 有效样本量（post-hoc；不改变上面的冻结判定）', '']
     if rows:
@@ -1686,6 +1696,11 @@ def _pooled_order_markdown(ft):
         if po.get('status') != 'ok':
             missing.append(name)
             continue
+        if (isinstance(_uo, dict) and _uo.get('status') == 'ok'
+                and (not isinstance(po.get('unit_order'), dict)
+                     or po['unit_order'].get('status') != 'verified')):
+            unverified.append(name)
+            continue
         for key, label in (('ppl', 'Δ PPL'), ('log_ratio', 'Δ log PPL')):
             ep = po.get(key) or {}
             if not isinstance(ep, dict) or ep.get('status') != 'ok':
@@ -1707,7 +1722,7 @@ def _pooled_order_markdown(ft):
                            _ci(ep.get('robust_ci')),
                            _num(ep.get('order_dependence_p'), '{:.4f}'),
                            '；'.join(flag) if flag else '—'))
-    if not rows and not missing and not not_estimable:
+    if not rows and not missing and not not_estimable and not unverified:
         return []
     out = ['### token 池化估计量的顺序依赖 / 有效样本量（post-hoc；不改变上面的冻结判定）', '']
     if rows:

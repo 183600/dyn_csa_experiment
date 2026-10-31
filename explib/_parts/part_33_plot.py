@@ -8,8 +8,9 @@ def _plot(summary, agg, outdir):
     order = ['full', 'full_matched', 'full_cos', 'full_sink', 'full_sw128', 'full_sw128_matched', 'csa_fixed', 'csa_dynamic', 'csa_dyn_fuse', 'csa_dyn_nocomp', 'csa_fix_randidx', 'csa_fix_zerocont', 'csa_fix_shiftcont', 'csa_fix_nosink', 'csa_fix_topk8', 'csa_fix_topk64', 'hybrid_fixed', 'hybrid_dynamic', 'hybrid_csa_dyn', 'hybrid_hca_dyn', 'hybrid_csa_dyn_fuse']
     vs = [v for v in order if v in agg] + [v for v in agg if v not in order]
     fig, ax = plt.subplots(1, 5, figsize=(27, 4.5))
-    ps = [agg[v].get('ppl_primary', agg[v]['ppl_mean']) for v in vs]
-    es = [agg[v]['ppl_std'] for v in vs]
+    ps = [agg[v].get('ppl_primary', agg[v].get('ppl_mean', 0.0))
+          for v in vs]
+    es = [agg[v].get('ppl_std') or 0.0 for v in vs]
     ax[0].bar(range(len(vs)), ps, yerr=es, capsize=3, color='steelblue')
     ax[0].set_xticks(range(len(vs)))
     ax[0].set_xticklabels(vs, rotation=30, ha='right')
@@ -19,7 +20,7 @@ def _plot(summary, agg, outdir):
     _unknown = [v for v in vs if agg[v].get('params') is None]
     if _unknown:
         print(f'[plot] {len(_unknown)} variant(s) report no `params` ({', '.join(_unknown)}) — their size bar is left at 0 and the size panel cannot be read for them')
-    params_m = [(agg[v]['params'] or 0) / 1000000.0 for v in vs]
+    params_m = [(agg[v].get('params') or 0) / 1000000.0 for v in vs]
     ax[1].bar(range(len(vs)), params_m, color='orange')
     ax[1].set_xticks(range(len(vs)))
     ax[1].set_xticklabels(vs, rotation=30, ha='right')

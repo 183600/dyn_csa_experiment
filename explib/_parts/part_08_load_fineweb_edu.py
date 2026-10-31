@@ -86,6 +86,13 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=None, val_seqs=512,
                                                meta.get('vocab'), seq_len=seq_len,
                                                fingerprints_trusted=False,
                                                ranges_trusted=_fast)
+            if meta.get('vocab') is not None:
+                _meta_vocab = _as_seed_int(meta.get('vocab'))
+                if _meta_vocab is None or _meta_vocab != int(vocab_size):
+                    _problems.append(
+                        f'cached vocab {meta.get("vocab")!r} != requested '
+                        f'{int(vocab_size)}; the cache tag and its content '
+                        'disagree')
             _problems.extend(_tokenizer_file_problems(
                 meta, tk_path, 'FineWeb train/validation tokenizer'))
             _src_problems, _src_warnings = _dataset_source_problems(
@@ -1342,7 +1349,12 @@ def _ledger_next_state(path):
             if not _ledger_meta_problems(meta):
                 seq = int(meta['seq'])
                 link = str(meta['sha256']).lower()
-                if (isinstance(anchor, dict)
+                _anchor_bytes = (anchor.get('bytes')
+                                 if isinstance(anchor, dict) else None)
+                _size_ok = (isinstance(_anchor_bytes, numbers.Integral)
+                            and not isinstance(_anchor_bytes, bool)
+                            and int(_anchor_bytes) == os.path.getsize(path))
+                if (isinstance(anchor, dict) and _size_ok
                         and _ledger_anchor_count(anchor) == seq + 1
                         and str(anchor.get('last_sha256') or '').lower() == link):
                     return seq + 1, link, False

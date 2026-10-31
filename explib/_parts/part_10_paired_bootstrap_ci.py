@@ -435,7 +435,10 @@ def paired_effect_stats(deltas, alpha=0.05, min_n=3, with_values=None, without_v
     p_floor = _sf.get('p_floor', signflip_p_floor(n))
     underpowered = n < min_n
     resolution_limited = bool(math.isfinite(p_floor) and p_floor > alpha)
-    within_seed_noise = abs(mean) <= std
+    # An unrepresentable spread is not evidence that the effect is inside
+    # seed noise.  When the SD is unavailable the comparison is undecidable,
+    # so do not set the flag that suppresses a significant verdict.
+    within_seed_noise = bool(_std_available and abs(mean) <= std)
     # The n floor, the exact-test resolution AND complete paired coverage are
     # preconditions, not side-notes: a loose alpha (or an unusually permissive
     # caller) must not promote an underpowered/resolution-limited panel, nor a
@@ -456,8 +459,9 @@ def paired_effect_stats(deltas, alpha=0.05, min_n=3, with_values=None, without_v
         if math.isfinite(tc):
             ci_lo, ci_hi = mean - tc * sem, mean + tc * sem
             if not (math.isfinite(ci_lo) and math.isfinite(ci_hi)):
-                # The endpoint is mathematically beyond float64; report it as
-                # unavailable (NaN) rather than an infinite interval.
+                # The endpoint is mathematically beyond float64; the historical
+                # paired_effect_stats contract marks the interval unavailable
+                # with NaN (strict-JSON writers must filter it explicitly).
                 ci_lo = ci_hi = float('nan')
     # Leave-one-seed-out stability: does any single seed own the direction?
     loo_means = []

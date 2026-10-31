@@ -1703,6 +1703,10 @@ def unit_order_problems(attestation, unit_ids, *, unit_kind=None,
     if attestation.get('schema') != UNIT_ORDER_POLICY['schema']:
         problems.append('unit_order.schema is not '
                         f'{UNIT_ORDER_POLICY["schema"]!r}')
+    if attestation.get('policy_version') != UNIT_ORDER_POLICY['version']:
+        problems.append('unit_order.policy_version is not '
+                        f'{UNIT_ORDER_POLICY["version"]!r} (got '
+                        f'{attestation.get("policy_version")!r})')
     if attestation.get('basis') != UNIT_ORDER_POLICY['basis']:
         problems.append('unit_order.basis is not '
                         f'{UNIT_ORDER_POLICY["basis"]!r} (got '
@@ -1898,6 +1902,14 @@ def aggregate_nll_by_document(nll, doc_ids, *, document_index_map=None):
             raise ValueError(
                 'aggregate_nll_by_document: document_index_map keys must be '
                 'non-negative')
+        if keys.size > 1 and not bool(np.all(keys[1:] > keys[:-1])):
+            # `document_index` returns a sorted unique key array; the stored
+            # per-unit vectors are documented as that canonical layout.  An
+            # unsorted/duplicated map would make the returned layout depend on
+            # caller order and break the permutation contract.
+            raise ValueError(
+                'aggregate_nll_by_document: document_index_map keys must be '
+                'strictly increasing (the canonical sorted-id layout)')
         if inv.dtype.kind not in 'iu':
             raise ValueError(
                 'aggregate_nll_by_document: document_index_map inverse must be '

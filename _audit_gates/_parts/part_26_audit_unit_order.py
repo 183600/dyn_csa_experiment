@@ -18,6 +18,52 @@ def _uo_problems_from_attestation(att, ids, *, unit_kind=None):
         return [f'{type(exc).__name__}: {exc}']
 
 
+def _uo_required_problems(att, *, require_version=True):
+    """Check the fields an order readout needs in order to be replayable.
+
+    ``unit_order_problems`` treats ``permutation``/``first_positions``/
+    ``n_tokens`` as optional because the low-level attestation constructor
+    allows a caller that already has the ordered ids to omit them.  A stored
+    evaluation cell and a replayable readout are different contracts: without
+    all three, an auditor cannot reconstruct the order or check the token
+    stream.  Deleting one of them must therefore fail closed instead of
+    silently skipping the check.
+    """
+    problems = []
+    if not isinstance(att, dict):
+        return ['unit_order is not an object']
+    try:
+        policy = _import_exp_lib().UNIT_ORDER_POLICY
+        version = policy['version']
+    except Exception:
+        policy = None
+        version = None
+    if (require_version and version is not None
+            and att.get('policy_version') != version):
+        problems.append(
+            f'unit_order.policy_version is not {version!r}')
+    if policy is not None:
+        kinds = policy.get('unit_kinds')
+        if att.get('unit_kind') not in kinds:
+            problems.append(
+                f'unit_order.unit_kind={att.get("unit_kind")!r} is not one '
+                f'of {kinds}')
+    for key in ('permutation', 'first_positions', 'n_tokens', 'n_units',
+                'algorithm'):
+        if key not in att or att.get(key) is None:
+            problems.append(f'unit_order.{key} is missing; the order cannot '
+                            'be replayed')
+    if att.get('n_tokens') is not None:
+        ntok = _uo_int(att.get('n_tokens'))
+        if ntok is None or ntok <= 0:
+            problems.append('unit_order.n_tokens is not a positive integer')
+    if att.get('n_units') is not None:
+        nunits = _uo_int(att.get('n_units'))
+        if nunits is None or nunits <= 0:
+            problems.append('unit_order.n_units is not a positive integer')
+    return problems
+
+
 def _uo_check_cell(cell):
     """Validate one evaluation cell's ``unit_order`` block.
 
@@ -47,7 +93,7 @@ def _uo_check_cell(cell):
     if not isinstance(att, dict):
         return 'fail', kind, ['unit_order is not an object'], False
     perm = att.get('permutation')
-    problems = []
+    problems = _uo_required_problems(att)
     ordered_ids = None
     if not isinstance(perm, list) or len(perm) != len(ids):
         problems.append('unit_order.permutation is not aligned with the ids')
@@ -61,24 +107,29 @@ def _uo_check_cell(cell):
     n_units = _uo_int(att.get('n_units'))
     if n_units is not None and n_units != len(ids):
         problems.append(f'unit_order.n_units={n_units} != {len(ids)} ids')
-    if expected is not None and _uo_int(expected) != len(ids):
+    expected_n = _uo_int(expected)
+    if expected_n is None:
+        problems.append(f'{kind} count is missing or not an exact integer')
+    elif expected_n != len(ids):
         problems.append(f'{kind} count {expected!r} != {len(ids)} ids')
     toks = cell.get(tok_key)
-    if isinstance(toks, list) and toks:
-        try:
-            total = int(sum(int(x) for x in toks))
-        except (TypeError, ValueError, OverflowError):
-            total = None
-        if total is not None:
-            if att.get('n_tokens') is not None and _uo_int(
-                    att.get('n_tokens')) != total:
+    if not isinstance(toks, list) or not toks:
+        problems.append(f'{tok_key} is missing or empty; the attested token '
+                        'total cannot be checked')
+    else:
+        counts = [_uo_int(x) for x in toks]
+        if any(x is None or x <= 0 for x in counts):
+            problems.append(f'{tok_key} must contain positive exact integers')
+        else:
+            total = int(sum(counts))
+            if _uo_int(att.get('n_tokens')) != total:
                 problems.append(
                     f'unit_order.n_tokens={att.get("n_tokens")!r} != the '
                     f'cell token total {total}')
             n_tok = _uo_int(cell.get('n_tok'))
-            if n_tok is not None and n_tok != total:
-                problems.append(f'cell n_tok={n_tok} != unit token total '
-                                f'{total}')
+            if n_tok is None or n_tok != total:
+                problems.append(f'cell n_tok={cell.get("n_tok")!r} != unit '
+                                f'token total {total}')
             pos = att.get('first_positions')
             if isinstance(pos, list):
                 if any(_uo_int(x) is None or _uo_int(x) >= total
@@ -120,6 +171,27 @@ def _uo_attestation_matches(uo, readout, *, path, problems):
         if key in uo and full.get(key) != uo.get(key):
             problems.append(f'{path}: stored unit_order_attestation.{key} '
                             'disagrees with the cell attestation')
+    # Replay the full attestation against the ordered ids stored with the
+    # readout.  Comparing fields to the cell summary is not enough: a tampered
+    # cell summary and a matching tampered digest would otherwise agree with
+    # each other while no longer describing the analyzed sequence.
+    stats_ids = stats.get('unit_ids') if isinstance(stats, dict) else None
+    if not isinstance(stats_ids, list) or not stats_ids:
+        problems.append(f'{path}: sufficient_statistics.unit_ids is missing; '
+                        'the stored order attestation cannot be replayed')
+    else:
+        try:
+            replay_ids = [str(x) for x in stats_ids]
+        except (TypeError, ValueError):
+            replay_ids = None
+        if replay_ids is None:
+            problems.append(f'{path}: sufficient_statistics.unit_ids is not '
+                            'renderable; the stored order cannot be replayed')
+        else:
+            replay_problems = _uo_problems_from_attestation(
+                full, replay_ids, unit_kind=uo.get('unit_kind'))
+            problems.extend(f'{path}: stored unit_order_attestation: {x}'
+                            for x in replay_problems)
     perm = full.get('permutation')
     if not isinstance(perm, list):
         problems.append(f'{path}: stored unit_order_attestation.permutation '
@@ -232,6 +304,9 @@ def _uo_audit_stats(data):
                     f'{uo.get("reason") or "no reason recorded"}')
                 out['n_not_verifiable'] += 1
         else:
+            row['problems'].extend(
+                f'doc_sampling.{p}' for p in
+                _uo_required_problems(uo, require_version=False))
             for key, block in readouts:
                 _uo_attestation_matches(
                     uo, block, path=f'{name}.{key}',

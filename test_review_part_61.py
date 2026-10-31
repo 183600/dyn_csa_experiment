@@ -432,3 +432,55 @@ def test_cli_and_report_wiring_is_present():
     assert "'order_attestation': audit_unit_order" in src
     report_src = inspect.getsource(A.run_report)
     assert "'unit_order': audit_unit_order()" in report_src
+
+
+def test_audit_rejects_deleted_attestation_fields():
+    # An optional low-level field is not optional in a stored cell: deleting
+    # permutation/first_positions/n_tokens/policy_version must not silently
+    # skip the corresponding check.
+    ids = np.asarray([[30, 30, 10, 10, 20, 20]], dtype=np.uint64)
+    cell = L.aggregate_nll_by_document(
+        torch.arange(6, dtype=torch.float32).reshape(1, 6), ids)
+    cell.update({'ppl': 100.0, 'nll_sum': 15.0, 'n_tok': 6, 'n_seq': 1})
+    for key in ('policy_version', 'first_positions', 'n_tokens',
+                'n_units', 'algorithm', 'permutation'):
+        bad = copy.deepcopy(cell)
+        del bad['unit_order'][key]
+        out = _audit({'runs': [{'variant': 'a', 'seed': 0,
+                                'by_len': {'512': bad}}]})
+        assert out['status'] == 'fail', (key, out)
+    for key in ('n_docs', 'n_tok', 'n_tokens_per_doc'):
+        bad = copy.deepcopy(cell)
+        del bad[key]
+        out = _audit({'runs': [{'variant': 'a', 'seed': 0,
+                                'by_len': {'512': bad}}]})
+        assert out['status'] == 'fail', (key, out)
+
+
+def test_audit_stats_replays_the_full_attestation_and_reports_only_verified():
+    art = _analysis_artifact()
+    for key in ('n_units', 'n_tokens', 'permutation', 'first_positions'):
+        bad = copy.deepcopy(art)
+        del bad['finaltest']['comparisons']['c1']['doc_sampling'][
+            'unit_order'][key]
+        out = _audit(bad)
+        assert out['status'] == 'fail', (key, out)
+    for key, value in (('policy_version', 'old'), ('sha256', '0' * 64),
+                       ('algorithm', 'md5'), ('unit_kind', 'row')):
+        bad = copy.deepcopy(art)
+        for rk in ('order_inference', 'pooled_order_inference'):
+            block = bad['finaltest']['comparisons']['c1']['doc_sampling'][rk]
+            block['sufficient_statistics']['unit_order_attestation'][key] = value
+        out = _audit(bad)
+        assert out['status'] == 'fail', (key, out)
+    # A readout that bypassed the attestation is not rendered as corpus order,
+    # even when the comparison-level summary still says ok.
+    bad = copy.deepcopy(art)
+    dsm = bad['finaltest']['comparisons']['c1']['doc_sampling']
+    for rk in ('order_inference', 'pooled_order_inference'):
+        dsm[rk]['unit_order'] = {'status': 'unverified'}
+    ft = bad['finaltest']
+    order_md = '\n'.join(V12._order_inference_markdown(ft))
+    pooled_md = '\n'.join(V12._pooled_order_markdown(ft))
+    assert '未核验' in order_md and '\n|' not in order_md, order_md
+    assert '未核验' in pooled_md and '\n|' not in pooled_md, pooled_md
