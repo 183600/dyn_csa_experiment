@@ -174,7 +174,11 @@ def audit_single_factor(manifest_path=None):
         是一个惰性开关（选择器的 top-k 覆盖全部块、内容表从未被读、frozen 参数
         仍有第二条梯度路径）。本块用真实工厂建 tiny 臂，在一次固定前向/反向
         上核验声明的 `forward` 或 `training` 干预确实改变 logits / 参数可训练性
-        / 梯度 / 目标；惰性干预 fail-closed。
+        / 梯度 / 目标；惰性干预 fail-closed；
+      * 推理期 lesion（`lesion`）：每个声明的组件 lesion 只应移除一个组件，
+         实际生效的 AttnCfg diff 必须落在 `mechanism_keys` 内、并属于一个
+         已声明单因素族。对该层 kind 惰性的另一个 sink 开关只记为 inert，
+         不当作第二因素；任何真实额外键判 fail。
     """
     L = _import_exp_lib()
     out = {'status': 'ok', 'design': {}, 'initialization': {},
@@ -183,13 +187,20 @@ def audit_single_factor(manifest_path=None):
            'frozen_manifest': {}, 'factorial_design': {},
            'content_controls': {}, 'sink_controls': {},
            'fusion_controls': {}, 'gate_controls': {},
-           'manipulation': {}}
+           'lesion': {}, 'manipulation': {}}
     design_rep = L.single_factor_design_audit(verbose=False)
     out['design'] = design_rep
     init_rep = L.single_factor_initialization_audit()
     out['initialization'] = init_rep
     manip_rep = L.ablation_manipulation_audit()
     out['manipulation'] = manip_rep
+    # Within-checkpoint lesions are single-component interventions too.  The
+    # lesion design gate now applies the same cfg-diff family test as the
+    # between-arm gates; only its zero-model layer is needed here (the full
+    # lesion gate also builds tiny models to prove the component is present
+    # and actually applied).
+    lesion_rep = L.lesion_design_audit(build_models=False)
+    out['lesion'] = lesion_rep
     ob_rep = L.open_block_matrix_audit(verbose=False)
     out['open_block_matrix'] = ob_rep
     fact_rep = L.factorial_design_audit()
@@ -209,6 +220,7 @@ def audit_single_factor(manifest_path=None):
             or sink_rep.get('status') != 'ok'
             or fusion_rep.get('status') != 'ok'
             or gate_rep.get('status') != 'ok'
+            or lesion_rep.get('status') != 'ok'
             or manip_rep.get('status') != 'ok'):
         out['status'] = 'fail'
     # v9/v10 attach a `single_factor`/`factors` label to each seq2k paired
@@ -532,8 +544,9 @@ def audit_lesion(path=None, *, verbose=True):
     Two layers are reported together because neither is sufficient alone:
 
     * `design`: every declared component can be constructed on the shipped
-      arms, the lesion applies to at least one layer, and the mechanism key is
-      covered by the declared single-factor intervention set;
+      arms, the lesion applies to at least one layer, and the effective
+      AttnCfg diff is inside one declared single-factor family (the inactive
+      sink switch for the arm's kind is recorded as inert, not as a factor);
     * `panels`: saved `lesion.json` artifacts are replayed from their paired
       per-seed intact/lesion PPL values.  A record without a passed forward
       manipulation check (`changed=True` and `weights_unchanged=True`) is a

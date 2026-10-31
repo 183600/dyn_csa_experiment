@@ -12189,3 +12189,71 @@ arm-major 分别 fail；disposition 换 policy/缺 cell 分别 fail；power
 ok、磁盘 plan 漂移与正文篡改分别 fail、缺文件 not_verifiable；writer
 同内容 no-op、冲突不覆盖、带 supersedes 的 revision 才可替换。
 完整 CPU 套件在本轮最终树通过。
+
+## 131. 单组件 lesion 也必须是单因素：实际 cfg diff 接入族判据（本轮单因素实验检查，no new runs）
+
+零 GPU；不新增训练、不读取 test split、不修改
+`confirmation_frozen*.json` 的字节/种子/端点/α/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未删除、未修改、未移动。
+
+### 131.1 问题：mechanism_keys 是声明，不是实际差集
+
+`lesion_design_audit` 之前只检查每个 lesion 的 `mechanism_keys` 是否为
+`ABLATION_INTERVENTION_KEYS[source_component]` **所有对照键并集**的子集，
+并用真实模型验证组件存在、lesion 已应用。并集检查回答的是「这个键在这个
+组件的历史对照里出现过」，不是「这条 lesion 实际只动了一个因素」：
+
+- 一个声明的 lesion 可以在 `cfg_overrides` 里多改一个真实字段（例如
+  `content_mode` 之外再改 `index_topk`），只要 `mechanism_keys` 仍写着
+  `content_mode`，原门不会看实际 diff；
+- `attention_sink` 的 `mechanism_keys` 同时包含 `use_sink`（csa/hca）与
+  `full_sink`（dense），一个同时移动两者的自定义 lesion 可以穿过并集门；
+- 反过来，shipped sink lesion 为了让同一组件适用于所有臂，会同时把两个
+  sink 开关置 false。`kind='full'` 的层只读 `full_sink`，`use_sink` 是
+  inert 字段；若直接对原始 diff 套族判据，会把这条正确的单组件 lesion
+  误判成两因素。
+
+这与 §121 的 factorial 缺口是同一类：**枚举/并集不等于一个干预族**。
+
+### 131.2 Fix：实际、按 kind 生效的 cfg diff + 族判据
+
+`lesion_design_audit` 现在对每条声明臂：
+
+1. 用与运行时相同的 `_lesion_cfg` 从 intact cfg 构造 lesioned cfg；
+2. 逐层 `layer_cfg_diff`，并移除该层 kind 下惰性的另一个 sink 开关
+   （`kind='full'` 去掉 `use_sink`，csa/hca 去掉 `full_sink`），把被移除
+   的键记录为 `inert_cfg_keys`；
+3. 实际生效键必须被 `mechanism_keys` 覆盖；额外真实键 fail；
+4. 生效键必须通过 `cfg_keys_single_factor` 的「一个声明族」判据；
+5. 声明的 cfg 干预必须真的出现（该 kind 的 active 键缺失/生效差集为空
+   fail）；只有 module override、没有 cfg diff 的干预（移除 `fuse_conv`）
+   记为 `level='module'`，仍由原模型门验证替换确实发生；
+6. 报告逐臂新增 `effective_cfg_keys` / `inert_cfg_keys` /
+   `single_factor_family` / `level`，并在 `build_models=False` 时只跑这层
+   零模型检查。
+
+`audit_gates.py single_factor` 新增 `lesion` 块，调用
+`lesion_design_audit(build_models=False)` 并把其 `status` 并入总状态；
+`audit_gates.py lesion` 仍跑完整设计门（含 tiny model 的 present/applied
+检查）。
+
+### 131.3 边界
+
+- 这是定义点审计，不是结果检验：不产生 p 值、不进入 Holm、不改变
+  `verified`/`confirmed`、不重算 PPL、不读取 test split。
+- 不把「同一组件在所有臂上关闭 sink」误读成两个因素：只剔除该层 kind
+  下惰性的开关，真实第二字段仍 fail。
+- 不替代 `lesion_panel_audit` 的 forward manipulation check、capacity
+  或 between-model 消融门；它只回答「声明的 lesion 是否只动一个因素」。
+- `build_models=False` 只跳过模型构造，仍验证臂已排程、属于声明留一法族、
+  `mechanism_keys` 有声明、实际 cfg diff 单因素；完整 `lesion` 门不变。
+
+### 131.4 验证
+
+新增 `test_lesion_single_factor.py` 7 项：shipped 三类 lesion 的逐臂
+`effective_cfg_keys`/族判据全为真且 dense sink 的 `use_sink` 记为 inert；
+同时多改 `index_topk` 的第二因素被拒绝；`sink_mode` 让差集跨两个声明族
+被拒绝；只关 `use_sink` 而漏掉 dense 的 active `full_sink` 被拒绝；
+`audit_gates.py single_factor` 的 `lesion` 块为 ok；`build_models=False`
+不构造模型；把 `LESION_DESIGN` 换成带第二因素的声明后总门与 `lesion`
+块同时 fail。完整 CPU 套件在本轮最终树通过。

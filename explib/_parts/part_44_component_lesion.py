@@ -106,6 +106,35 @@ def _lesion_cfg(cfg, overrides):
     return new
 
 
+def _lesion_effective_cfg_diff(cfgs_intact, cfgs_lesion):
+    """Actual, kind-effective AttnCfg diff of one declared lesion.
+
+    The declared ``cfg_overrides`` may turn off both sink switches so the same
+    component can be lesioned on every arm.  Only one switch is live on a
+    layer: ``full_sink`` for ``kind='full'`` and ``use_sink`` for csa/hca (see
+    ``attn._make_sink``).  Comparing the raw diff would therefore
+    report a two-key bundle for the dense sink arm even though the second key
+    is inert, which is exactly the family-test false positive this helper
+    removes.  An actual second knob (a real config field that is not the
+    inactive sink switch for that layer kind) is kept and still fails the
+    family gate.
+
+    Returns ``(effective_keys, per_layer, inert_keys)``.
+    """
+    effective, per_layer, inert = set(), {}, set()
+    for i, (a, b) in enumerate(zip(cfgs_intact, cfgs_lesion)):
+        diff = layer_cfg_diff(a, b)
+        kind = getattr(a, 'kind', None)
+        inactive = 'use_sink' if kind == 'full' else 'full_sink'
+        if inactive in diff:
+            inert.add(inactive)
+            diff.pop(inactive)
+        if diff:
+            per_layer[i] = diff
+            effective.update(diff)
+    return sorted(effective), per_layer, sorted(inert)
+
+
 def _lesion_layers(model, component):
     """Return (index, attention_module, cfg) for layers the lesion applies to.
 
@@ -769,7 +798,7 @@ def lesion_panel_audit(records, *, relative_pct=LESION_POLICY['relative_pct'],
 
 def lesion_design_audit(design=None, *, factory=None, n_layers=2,
                         vocab=64, d=32, n_heads=2, d_head=16, seq_len=16,
-                        present=None):
+                        present=None, build_models=True):
     """Design-time gate: every declared lesion is constructed and applies.
 
     It builds a tiny model for each declared arm through the real arm factory
@@ -778,6 +807,17 @@ def lesion_design_audit(design=None, *, factory=None, n_layers=2,
     belongs to a declared leave-one-out family, and (d) the mechanism key is
     covered by ``ABLATION_INTERVENTION_KEYS``.  A declaration that cannot be
     constructed is a failure, not an untested note.
+
+    The actual config diff of each declared lesion is also a single-factor
+    claim: a lesion may name one component but silently move a second AttnCfg
+    knob (the same failure mode the leave-one-out / factorial gates reject).
+    The effective diff is therefore checked against the declared
+    ``mechanism_keys`` and the ``cfg_keys_single_factor`` family test.  A
+    sink switch that is inert for the arm's layer kind (``use_sink`` on a
+    ``full`` layer, ``full_sink`` on csa/hca) is recorded as inert, not as a
+    second factor; every other extra key fails closed.  ``build_models=False``
+    runs only this zero-model config/declaration layer, which is what the
+    aggregate single-factor gate needs.
     """
     design = LESION_DESIGN if design is None else design
     factory = make_layer_cfgs if factory is None else factory
@@ -848,10 +888,31 @@ def lesion_design_audit(design=None, *, factory=None, n_layers=2,
                 f'are not declared in ABLATION_INTERVENTION_KEYS[{source!r}]')
         pair_arms = {a for a, _b, *_ in (ABLATION_DESIGN.get(source) or [])}
         pair_arms |= {b for _a, b, *_ in (ABLATION_DESIGN.get(source) or [])}
+        cfg_overrides = entry.get('cfg_overrides') or {}
+        module_overrides = entry.get('module_overrides') or ()
+        if not isinstance(cfg_overrides, dict):
+            rec['status'] = 'fail'
+            out['violations'].append(
+                f'{component}: cfg_overrides must be a mapping, got '
+                f'{type(cfg_overrides).__name__}')
+            cfg_overrides = {}
+        if not isinstance(module_overrides, (list, tuple)):
+            rec['status'] = 'fail'
+            out['violations'].append(
+                f'{component}: module_overrides must be a list/tuple, got '
+                f'{type(module_overrides).__name__}')
+            module_overrides = ()
+        if not cfg_overrides and not module_overrides:
+            rec['status'] = 'fail'
+            out['violations'].append(
+                f'{component}: the declaration changes no cfg field and no '
+                'submodule; the lesion would be a no-op')
         for arm in arms:
             arec = {'scheduled': arm in scheduled,
                     'in_leave_one_out_family': arm in pair_arms,
-                    'state': None, 'applied': False, 'changed_fields': []}
+                    'state': None, 'applied': False, 'changed_fields': [],
+                    'effective_cfg_keys': [], 'inert_cfg_keys': [],
+                    'single_factor_family': False, 'level': None}
             rec['arms'][arm] = arec
             if arm not in scheduled:
                 rec['status'] = 'fail'
@@ -871,6 +932,74 @@ def lesion_design_audit(design=None, *, factory=None, n_layers=2,
                 rec['status'] = 'fail'
                 out['violations'].append(
                     f'{component}/{arm}: factory returned {len(cfgs)} configs for {n_layers} layers')
+                continue
+            # ---- zero-model single-factor check --------------------------
+            # The lesion declaration is not evidence that only one factor
+            # moves in the actual arm: build the lesioned cfg from the same
+            # overrides the runtime applies and diff it against the intact
+            # arm.  A second real key is the same defect the leave-one-out
+            # and factorial gates reject; an inactive sink switch is inert
+            # and is recorded, not counted as a factor.
+            try:
+                lesioned = [_lesion_cfg(c, cfg_overrides) for c in cfgs]
+                effective, per_layer, inert = _lesion_effective_cfg_diff(
+                    cfgs, lesioned)
+            except Exception as exc:
+                rec['status'] = 'fail'
+                out['violations'].append(
+                    f'{component}/{arm}: cannot build the declared lesion cfg '
+                    f'({type(exc).__name__}: {exc})')
+                effective, per_layer, inert = [], {}, []
+            arec['effective_cfg_keys'] = list(effective)
+            arec['inert_cfg_keys'] = list(inert)
+            arec['per_layer'] = {str(i): sorted(d) for i, d in per_layer.items()}
+            _declared = set(keys)
+            _extra = sorted(set(effective) - _declared)
+            if _extra:
+                rec['status'] = 'fail'
+                out['violations'].append(
+                    f'{component}/{arm}: the declared lesion also moves '
+                    f'undeclared cfg key(s) {_extra}; mechanism_keys describes '
+                    f'only {sorted(_declared)}')
+            if cfg_overrides:
+                _kinds = {getattr(c, 'kind', None) for c in cfgs}
+                _active_declared = set(_declared)
+                if _kinds == {'full'}:
+                    _active_declared.discard('use_sink')
+                elif 'full' not in _kinds:
+                    _active_declared.discard('full_sink')
+                _missing = sorted(_active_declared - set(effective))
+                if _missing:
+                    rec['status'] = 'fail'
+                    out['violations'].append(
+                        f'{component}/{arm}: declared lesion key(s) {_missing} '
+                        'do not change the arm config; the applied intervention '
+                        'disappeared or is inert for this layer kind')
+                if not effective:
+                    rec['status'] = 'fail'
+                    out['violations'].append(
+                        f'{component}/{arm}: the declared lesion changes no '
+                        'effective AttnCfg key on this arm')
+            _family_ok = bool(cfg_keys_single_factor(set(effective)))
+            if not effective and module_overrides and not cfg_overrides:
+                # A module-only intervention (e.g. removing fuse_conv) is
+                # one mechanism even though it has no cfg diff; the module
+                # replacement itself is checked below by the full gate.
+                _family_ok = True
+                arec['level'] = 'module'
+            elif _family_ok:
+                arec['level'] = 'single_factor'
+            else:
+                arec['level'] = 'multi_factor'
+            arec['single_factor_family'] = bool(_family_ok)
+            if effective and not _family_ok:
+                rec['status'] = 'fail'
+                out['violations'].append(
+                    f'{component}/{arm}: the lesion moves AttnCfg keys '
+                    f'{sorted(effective)}, which span more than one declared '
+                    'single-factor family; a single-component lesion must not '
+                    'silently move a second factor')
+            if not build_models:
                 continue
             _rng = torch.get_rng_state()
             _cuda_rng = (torch.cuda.get_rng_state_all()

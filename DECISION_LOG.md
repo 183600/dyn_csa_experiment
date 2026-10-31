@@ -6259,3 +6259,39 @@ warning；run order 缺 cell/换序/错 seed/arm-major；disposition 换 policy/
 clearance 晚于首条事件；审计重放 ok、磁盘 plan 漂移与正文篡改、缺文件
 not_verifiable；writer 的 no-op/conflict/revision。完整 CPU 套件在本轮
 最终树通过。
+
+## 2026-10-31 — 单组件 lesion 也必须是单因素：实际 cfg diff 接入族判据（本轮单因素实验检查，no new runs）
+
+零 GPU；不新增训练、不读取 test split、不修改
+`confirmation_frozen*.json` 的字节/种子/端点/α/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未删除、未修改、未移动。
+
+**Problem.** `lesion_design_audit` 只检查 `mechanism_keys` 是否为
+`ABLATION_INTERVENTION_KEYS[source_component]` 所有对照键并集的子集，再
+用 tiny model 验证组件存在/lesion 已应用。并集不是「实际只动一个因素」：
+`cfg_overrides` 可以多改一个真实字段而 `mechanism_keys` 不写它；
+`attention_sink` 的并集同时含 `use_sink` 与 `full_sink`，一个同时移动两者
+的自定义 lesion 也能穿过。反过来，shipped sink lesion 为覆盖所有臂会同时
+关闭两个开关，但 `kind='full'` 只读 `full_sink`，直接套族判据会把正确的
+单组件干预误判成两因素。这是 §121 factorial 缺口的同型问题。
+
+**Fix.** `lesion_design_audit` 用与运行时相同的 `_lesion_cfg` 构造 lesioned
+cfg，逐层 diff 后移除该层 kind 下惰性的另一个 sink 开关（记为
+`inert_cfg_keys`），再要求：实际生效键被 `mechanism_keys` 覆盖（额外键
+fail）、通过 `cfg_keys_single_factor` 的「一个声明族」判据、该 kind 的
+active 键确实出现；module-only 干预（移除 `fuse_conv`）记为
+`level='module'`，仍由原模型门验证替换。逐臂新增
+`effective_cfg_keys`/`inert_cfg_keys`/`single_factor_family`/`level`；
+`build_models=False` 只跑零模型 cfg/声明层。`audit_gates.py single_factor`
+新增 `lesion` 块并并入总状态，`audit_gates.py lesion` 完整门不变。
+
+**Boundary.** 定义点审计，不产生 p/Holm、不改变 `verified`/`confirmed`、
+不重算 PPL、不读 test；不替代 `lesion_panel_audit` 的 manipulation check
+或容量/消融门；不把 kind 惰性开关当第二因素，真实第二字段仍 fail。
+
+**Verification.** 新增 `test_lesion_single_factor.py` 7 项：shipped 三类
+lesion 逐臂单因素且 dense sink 的 `use_sink` 记为 inert；多改 `index_topk`
+被拒绝；`sink_mode` 跨两个声明族被拒绝；只关 `use_sink` 漏掉 dense active
+`full_sink` 被拒绝；`audit_gates.py single_factor` 的 `lesion` 块 ok；
+`build_models=False` 不构造模型；替换 `LESION_DESIGN` 为带第二因素的声明
+后总门与 `lesion` 块同时 fail。完整 CPU 套件在本轮最终树通过。
