@@ -59,6 +59,44 @@ def _ps_compare(stored, actual, *, rel_tol=1e-9, abs_tol=1e-12, path=''):
     return problems
 
 
+def _ps_declared_names(block, key, out):
+    """Read one category-name list without trusting its JSON shape.
+
+    A synthesis block is a report artifact, so a hand-edited ``"A"`` (a string
+    is iterable character-by-character) or ``1``/``true`` must not crash the
+    audit with ``TypeError``; it is a named problem and the replay continues
+    with an empty declared set.
+    """
+    value = block.get(key)
+    if value is None:
+        return set()
+    if not isinstance(value, (list, tuple, set, frozenset)):
+        out['problems'].append(
+            f'{key} is not a list of component names ({type(value).__name__})')
+        return set()
+    names = set()
+    bad = []
+    for item in value:
+        if isinstance(item, str):
+            names.add(item)
+        else:
+            bad.append(item)
+    if bad:
+        out['problems'].append(
+            f'{key} contains non-string component name(s): {bad[:4]!r}')
+    return names
+
+
+def _ps_panel_row(panels, label):
+    """One rendered panel row, or ``{}`` for a malformed row.
+
+    Callers only need the row's optional flags; a JSON row that is a string
+    or number must not turn a replay into ``AttributeError``.
+    """
+    row = panels.get(str(label))
+    return row if isinstance(row, dict) else {}
+
+
 def _ps_find_block(rec):
     if not isinstance(rec, dict):
         return None, None
@@ -155,7 +193,7 @@ def audit_panel_synthesis(path=None):
         out['problems'].append('the synthesis block has no components mapping')
         print(json.dumps(out, ensure_ascii=False, indent=2))
         return out
-    poolable_declared = set(block.get('poolable_components') or [])
+    poolable_declared = _ps_declared_names(block, 'poolable_components', out)
     poolable_actual = set()
     status_by_comp = {}
     selection_by_comp = set()
@@ -254,13 +292,18 @@ def audit_panel_synthesis(path=None):
                 if not isinstance(row, dict):
                     input_bad.append(f"missing panel row {pt.get('label')!r}")
                     continue
+                _pt_effects = pt.get('effects')
+                if not isinstance(_pt_effects, (list, tuple)):
+                    input_bad.append(
+                        f"{pt.get('label')}: meta input effects is not a list")
+                    continue
                 input_bad.extend(
-                    _ps_compare(pt.get('effects'), row.get('effects'),
+                    _ps_compare(_pt_effects, row.get('effects'),
                                 path=f"{pt.get('label')}:effects"))
                 input_bad.extend(
                     _ps_compare(pt.get('seeds'), row.get('seeds'),
                                 path=f"{pt.get('label')}:seeds"))
-                if row.get('n') != len(pt.get('effects') or []):
+                if row.get('n') != len(_pt_effects):
                     input_bad.append(f"{pt.get('label')}: n does not match effects")
             if input_bad:
                 out['problems'].extend(f'{label}: {x}' for x in input_bad)
@@ -306,7 +349,8 @@ def audit_panel_synthesis(path=None):
             # trusted from the stored tier.
             direction = b.get('direction') if isinstance(b.get('direction'), dict) else {}
             corpus = b.get('corpus') if isinstance(b.get('corpus'), dict) else {}
-            draws = {str(pt.get('label')): (panels.get(str(pt.get('label'))) or {}).get('draws')
+            draws = {str(pt.get('label')):
+                     _ps_panel_row(panels, pt.get('label')).get('draws')
                      for pt in points}
             try:
                 ind2 = L.replication_independence_audit(
@@ -317,7 +361,10 @@ def audit_panel_synthesis(path=None):
                     f'({type(exc).__name__}: {exc})')
                 ind2 = {'status': None}
             ind = b.get('independence')
-            if isinstance(ind, dict):
+            if not isinstance(ind, dict):
+                out['problems'].append(
+                    f'{label}: independence record is missing or not an object')
+            else:
                 out['problems'].extend(
                     f'{label}/independence: {x}' for x in
                     _ps_compare(ind, ind2, path=f'{label}/independence'))
@@ -338,7 +385,10 @@ def audit_panel_synthesis(path=None):
                           and all(isinstance(x, str) and x.strip()
                                   for x in _corpus_fps)
                           and len(set(_corpus_fps)) == 1)
-            if isinstance(b.get('direction'), dict):
+            if not isinstance(b.get('direction'), dict):
+                out['problems'].append(
+                    f'{label}: direction record is missing or not an object')
+            else:
                 _dir_problems = []
                 _stored_preds = direction.get('predicted_signs')
                 if not isinstance(_stored_preds, (list, tuple, set)):
@@ -353,7 +403,10 @@ def audit_panel_synthesis(path=None):
                     out['problems'].append(
                         f'{label}: direction record does not match the panel '
                         f'predicted signs ({_dir_problems})')
-            if isinstance(b.get('corpus'), dict):
+            if not isinstance(b.get('corpus'), dict):
+                out['problems'].append(
+                    f'{label}: corpus record is missing or not an object')
+            else:
                 _corpus_problems = []
                 if bool(corpus.get('shared')) != bool(_corpus_ok):
                     _corpus_problems.append('shared')
@@ -378,10 +431,10 @@ def audit_panel_synthesis(path=None):
                 i2_ceiling_percent=_i2_cap,
                 q_alpha=_q_alpha)
             # Conflict/harmful flags also veto the claim in the producer.
-            _conflict = any(bool((panels.get(str(pt.get('label'))) or {})
+            _conflict = any(bool(_ps_panel_row(panels, pt.get('label'))
                                  .get('direction_conflict'))
                             for pt in points)
-            _harmful = any(bool((panels.get(str(pt.get('label'))) or {})
+            _harmful = any(bool(_ps_panel_row(panels, pt.get('label'))
                                 .get('practically_harmful'))
                            for pt in points)
             # Effect-scale gate: a pooled claim may not survive when the
@@ -482,8 +535,10 @@ def audit_panel_synthesis(path=None):
                     f'{label}: selection-bias readout is enabled by the policy '
                     'but absent from the contrast')
             if isinstance(sel, dict):
-                rows = [panels.get(str(pt.get('label'))) or {} for pt in points]
-                predicted = (b.get('direction') or {}).get('predicted_signs') or []
+                rows = [_ps_panel_row(panels, pt.get('label')) for pt in points]
+                _pred_block = b.get('direction')
+                predicted = ((_pred_block.get('predicted_signs')
+                              if isinstance(_pred_block, dict) else None) or [])
                 try:
                     sel2 = L._cps_selection_readout(
                         points, rows, alpha=alpha, min_n=min_n,
@@ -538,7 +593,7 @@ def audit_panel_synthesis(path=None):
             ('heterogeneous_components', _expected_het),
             ('dependent_components', _expected_dep),
             ('selection_sensitive_components', selection_by_comp)):
-        _stored = set(block.get(_key) or [])
+        _stored = _ps_declared_names(block, _key, out)
         if _stored != _expected:
             out['problems'].append(
                 f'{_key} does not match the replayed contrasts: '

@@ -311,6 +311,54 @@ def test_panel_synthesis_audit_replays_and_fails_closed():
         shutil.rmtree(td, ignore_errors=True)
 
 
+def test_panel_synthesis_audit_fails_closed_on_malformed_nested_fields():
+    """A hand-edited report must be a named failure, never a TypeError.
+
+    The audit reads several nested JSON objects/lists from an artifact.  A
+    string where a direction/corpus block belongs, a scalar category list or a
+    scalar per-seed effect vector is malformed evidence; the gate has to say so
+    (``fail``) instead of crashing before it can report anything.
+    """
+    import copy
+    td = tempfile.mkdtemp(prefix='synthesis_malformed_')
+    try:
+        cov = L.ablation_coverage_across_panels(_consistent_panels(), _DESIGN)
+        doc = {'methodology': {'ablation_coverage': cov}}
+        assert A.audit_panel_synthesis(_write_report(td, doc))['status'] == 'ok'
+
+        bad = copy.deepcopy(doc)
+        b = _block(bad['methodology']['ablation_coverage']['synthesis'])
+        b['direction'] = 'not-an-object'
+        rep = A.audit_panel_synthesis(_write_report(td, bad))
+        assert rep['status'] == 'fail', rep
+        assert any('direction' in x for x in rep['problems']), rep
+
+        bad = copy.deepcopy(doc)
+        b = _block(bad['methodology']['ablation_coverage']['synthesis'])
+        b['corpus'] = 1
+        rep = A.audit_panel_synthesis(_write_report(td, bad))
+        assert rep['status'] == 'fail', rep
+        assert any('corpus' in x for x in rep['problems']), rep
+
+        bad = copy.deepcopy(doc)
+        synth = bad['methodology']['ablation_coverage']['synthesis']
+        synth['poolable_components'] = 1
+        synth['heterogeneous_components'] = 'A'
+        rep = A.audit_panel_synthesis(_write_report(td, bad))
+        assert rep['status'] == 'fail', rep
+        assert any('poolable_components' in x for x in rep['problems']), rep
+        assert any('heterogeneous_components' in x for x in rep['problems']), rep
+
+        bad = copy.deepcopy(doc)
+        b = _block(bad['methodology']['ablation_coverage']['synthesis'])
+        b['meta_input']['points'][0]['effects'] = 1
+        rep = A.audit_panel_synthesis(_write_report(td, bad))
+        assert rep['status'] == 'fail', rep
+        assert any('effects' in x for x in rep['problems']), rep
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+
 def test_panel_synthesis_audit_is_reachable_from_the_cli_alias():
     assert A.audit_panel_synthesis is not None
     # The CLI dispatch table exposes the new gate under the documented aliases.

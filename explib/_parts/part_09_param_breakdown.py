@@ -1506,6 +1506,15 @@ def _percentile_ci(vals, lo=2.5, hi=97.5):
 # count would otherwise exceed this element budget.
 _BOOTSTRAP_CHUNK_DRAWS = 256
 _BOOTSTRAP_CHUNK_ELEMS = 1 << 20
+# A caller-supplied draw count is a precision choice, not permission to
+# allocate an unbounded result vector.  Every bootstrap helper materialises at
+# least one float per draw (and the studentized helper keeps two), so an
+# untrusted ``n_boot`` must fail closed before that allocation.  200k draws is
+# already far beyond what a seeded panel needs and matches the explicit cap in
+# the newer resampling readouts (arm-rank, ordered-unit, pooled-order); one
+# shared constant keeps the older helpers from silently accepting
+# ``n_boot=10**9`` while those refuse it.
+BOOTSTRAP_HARD_MAX_DRAWS = 200_000
 
 
 def _bootstrap_draw_chunk(n_units):
@@ -1533,6 +1542,18 @@ def _bootstrap_t_interval(values, *, n_boot, seed, conf):
     """
     v = np.asarray(values, dtype=float)
     n = int(v.size)
+    nb = _as_seed_int(n_boot)
+    if nb is None or nb < 2 or nb > BOOTSTRAP_HARD_MAX_DRAWS:
+        # Refuse before `np.empty(n_boot)` below: the draw count is supplied
+        # by callers (and by replayable records) and must not be able to turn
+        # an interval readout into an unbounded allocation.  The dict keeps the
+        # helper's total-function contract; public wrappers translate the
+        # missing endpoints to their own "interval unavailable" result.
+        return {'ci_low': None, 'ci_high': None,
+                'method': ('bootstrap interval unavailable: n_boot must be an '
+                           f'integer in [2, {BOOTSTRAP_HARD_MAX_DRAWS}] '
+                           f'(got {n_boot!r})'),
+                'n_boot_studentized': 0}
     # Square-based sd under/overflows for extreme but finite magnitudes.  The
     # studentized statistic is scale invariant, so run the whole bootstrap on
     # a unit-scaled copy and map the interval endpoints back afterwards.
@@ -1545,11 +1566,11 @@ def _bootstrap_t_interval(values, *, n_boot, seed, conf):
     sd = float(v.std(ddof=1)) if n > 1 else float('nan')
     se = sd / math.sqrt(n) if n > 1 and math.isfinite(sd) else float('nan')
     rng = np.random.default_rng(int(seed))
-    means = np.empty(int(n_boot), dtype=float)
-    tstats = np.empty(int(n_boot), dtype=float)
+    means = np.empty(nb, dtype=float)
+    tstats = np.empty(nb, dtype=float)
     chunk = _bootstrap_draw_chunk(n)
-    for off in range(0, int(n_boot), chunk):
-        m = min(chunk, int(n_boot) - off)
+    for off in range(0, nb, chunk):
+        m = min(chunk, nb - off)
         idx = rng.integers(0, n, size=(m, n))
         X = v[idx]
         bm = X.mean(axis=1)
@@ -1619,7 +1640,7 @@ def bootstrap_mean_ci(values, *, n_boot=4000, seed=20261018, conf=0.95):
     sd = _as_seed_int(seed)
     if nb is None or sd is None or isinstance(conf, (bool, np.bool_)):
         return None
-    if nb < 20 or not (0.0 < c < 1.0):
+    if nb < 20 or nb > BOOTSTRAP_HARD_MAX_DRAWS or not (0.0 < c < 1.0):
         return None
     _ci = _bootstrap_t_interval(v, n_boot=nb, seed=sd, conf=c)
     if _ci.get('ci_low') is None or _ci.get('ci_high') is None:

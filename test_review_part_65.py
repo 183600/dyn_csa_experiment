@@ -381,6 +381,26 @@ def test_scale_sensitivity_audit_rejects_an_unapplied_gate():
         shutil.rmtree(td, ignore_errors=True)
 
 
+def test_scale_sensitivity_audit_fails_closed_on_malformed_meta_input():
+    """A scalar/string ``meta_input`` is bad evidence, not an audit crash."""
+    td = tempfile.mkdtemp(prefix='panel_scale_malformed_')
+    try:
+        cov = L.ablation_coverage_across_panels(_consistent_panels(), _DESIGN)
+        doc = {'methodology': {'ablation_coverage': cov}}
+        assert A.audit_panel_scale_sensitivity(_write_report(td, doc))[
+            'status'] == 'ok'
+        import copy
+        for malformed in ('not-an-object', 1.5, True, [0]):
+            bad = copy.deepcopy(doc)
+            _block(bad['methodology']['ablation_coverage']['synthesis'])[
+                'meta_input'] = malformed
+            rep = A.audit_panel_scale_sensitivity(_write_report(td, bad))
+            assert rep['status'] == 'fail', (malformed, rep)
+            assert any('meta_input' in x for x in rep['problems']), (malformed, rep)
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+
 def test_scale_sensitivity_cli_aliases_are_reachable():
     assert A.audit_panel_scale_sensitivity is not None
     src = open(_os.path.join(REPO, '_audit_gates', '_parts',

@@ -128,3 +128,35 @@ def test_extreme_variance_panel_keeps_scale_free_readouts():
     assert rep['effective_n']['equivalent'] is not None, rep
     assert rep['total_variance'] is None, rep
     json.dumps(rep, allow_nan=False)
+
+
+def test_bootstrap_helpers_refuse_an_unbounded_draw_count():
+    """A caller-controlled n_boot must not become an unbounded allocation.
+
+    These legacy helpers materialise at least one float per draw.  The newer
+    resampling readouts already declare a 200k hard cap; the shared constant
+    keeps the older helpers from accepting ``n_boot=10**9`` and exhausting
+    memory before any interval is reported.
+    """
+    hard = int(L.BOOTSTRAP_HARD_MAX_DRAWS)
+    assert hard >= 1000
+    vals = [1.0, 2.0, 3.0, 4.0]
+    tint = L._bootstrap_t_interval(vals, n_boot=hard + 1, seed=7, conf=0.95)
+    assert tint['ci_low'] is None and tint['ci_high'] is None, tint
+    assert 'n_boot' in tint['method'], tint
+    assert L.paired_bootstrap_ci(vals, n_boot=hard + 1) is None
+    assert L.unpaired_bootstrap_ci(vals, vals, n_boot=hard + 1) is None
+    assert L.bootstrap_mean_ci(vals, n_boot=hard + 1) is None
+
+    recs = [{'variant': 'a', 'seed': s, 'ppl': 30.0,
+             'nll_per_row': [1.0, 1.2, 0.8, 1.1],
+             'n_tokens_per_row': [10, 10, 10, 10]}
+            for s in (0, 1)]
+    assert L._doc_bootstrap_ppl_ci(recs, n_boot=hard + 1) is None
+    combined = L._combined_seed_doc_ci(recs, n_boot=hard + 1)
+    assert combined['status'] == 'unverifiable', combined
+    assert 'n_boot' in combined['reason'], combined
+
+    # The ordinary path still returns the same seeded interval.
+    assert L.paired_bootstrap_ci(vals, n_boot=64, seed=7) is not None
+    assert L._combined_seed_doc_ci(recs, n_boot=40)['status'] == 'ok'

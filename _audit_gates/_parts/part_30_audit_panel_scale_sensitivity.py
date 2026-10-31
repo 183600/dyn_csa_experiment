@@ -187,7 +187,9 @@ def audit_panel_scale_sensitivity(path=None):
             out['n_checked'] += 1
             # Replay the percent side from meta_input as well, so a tampered
             # `meta` block cannot make the scale record self-consistent.
-            points = (block.get('meta_input') or {}).get('points')
+            _meta_input = block.get('meta_input')
+            points = (_meta_input.get('points')
+                      if isinstance(_meta_input, dict) else None)
             pct_meta_stored = block.get('meta') if isinstance(block.get('meta'), dict) else {}
             if not isinstance(points, (list, tuple)):
                 out['problems'].append(

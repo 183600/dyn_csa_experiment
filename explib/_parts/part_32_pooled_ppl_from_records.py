@@ -396,6 +396,12 @@ def _doc_bootstrap_ppl_ci(recs, *, n_boot=2000, seed=20261018):
     from the
     wrong unit.
     """
+    # Draws are held in one float vector; an untrusted n_boot must not turn
+    # this readout into an unbounded allocation.
+    _n_draws = _as_seed_int(n_boot)
+    if (_n_draws is None or _n_draws < 2
+            or _n_draws > BOOTSTRAP_HARD_MAX_DRAWS):
+        return None
     recs = list(recs)
     _nested_flags = {r.get('ppl_estimation_rows') == 'nested_validation_holdout'
                      for r in recs if isinstance(r, dict)}
@@ -428,14 +434,14 @@ def _doc_bootstrap_ppl_ci(recs, *, n_boot=2000, seed=20261018):
     rng = np.random.default_rng(int(seed))
     nll_col = nll_mat.sum(axis=0)
     ntok_col = ntok_mat.sum(axis=0)
-    vals = np.empty(int(n_boot), dtype=float)
+    vals = np.empty(_n_draws, dtype=float)
     # Multinomial bootstrap counts: a single [chunk, R] count matrix is reused
     # across draws.  Size the chunk so a very large document panel does not
     # allocate 256 * R counts at once.
     _chunk = _bootstrap_draw_chunk(R)
     _b = 0
-    while _b < int(n_boot):
-        _nb = min(_chunk, int(n_boot) - _b)
+    while _b < _n_draws:
+        _nb = min(_chunk, _n_draws - _b)
         counts = rng.multinomial(R, np.full(R, 1.0 / R, dtype=float), size=_nb)
         nt = counts @ ntok_col
         nn = counts @ nll_col
@@ -446,7 +452,7 @@ def _doc_bootstrap_ppl_ci(recs, *, n_boot=2000, seed=20261018):
         vals[_b:_b + _nb] = out
         _b += _nb
     vals = vals[np.isfinite(vals) & (vals > 0)]
-    if vals.size < max(20, int(0.5 * n_boot)):
+    if vals.size < max(20, int(0.5 * _n_draws)):
         return None
     lo, hi = np.percentile(vals, [2.5, 97.5])
     return [float(lo), float(hi)]
@@ -542,9 +548,11 @@ def _combined_seed_doc_ci(recs, *, n_boot=2000, seed=20261018, conf=0.95):
         out['reason'] = str(e)
         return out
     _nb = _as_seed_int(n_boot)
-    if _nb is None or _nb < 20:
-        out['reason'] = (f'n_boot={n_boot!r} must be an integer >= 20 for a '
-                         'percentile bootstrap')
+    if (_nb is None or _nb < 20
+            or _nb > BOOTSTRAP_HARD_MAX_DRAWS):
+        out['reason'] = (
+            f'n_boot={n_boot!r} must be an integer in '
+            f'[20, {BOOTSTRAP_HARD_MAX_DRAWS}] for a percentile bootstrap')
         return out
     _seed = _as_seed_int(seed)
     if _seed is None:
@@ -677,9 +685,11 @@ def paired_row_bootstrap_delta(pairs, *, n_boot=1000, seed=20261018, conf=0.95):
         out['reason'] = str(e)
         return out
     _nb = _as_seed_int(n_boot)
-    if _nb is None or _nb < 20:
-        out['reason'] = (f'n_boot={n_boot!r} must be an integer >= 20 for a '
-                         'percentile bootstrap')
+    if (_nb is None or _nb < 20
+            or _nb > BOOTSTRAP_HARD_MAX_DRAWS):
+        out['reason'] = (
+            f'n_boot={n_boot!r} must be an integer in '
+            f'[20, {BOOTSTRAP_HARD_MAX_DRAWS}] for a percentile bootstrap')
         return out
     _seed = _as_seed_int(seed)
     if _seed is None:
@@ -897,10 +907,12 @@ def paired_nll_two_way_bootstrap(nll_a, nll_b, n_tokens, *, n_boot=2000,
         raise ValueError(
             'paired_nll_two_way_bootstrap: conf must be a probability in (0, 1)')
     _nb = _as_seed_int(n_boot)
-    if _nb is None or _nb < 20:
+    if (_nb is None or _nb < 20
+            or _nb > BOOTSTRAP_HARD_MAX_DRAWS):
         raise ValueError(
             f'paired_nll_two_way_bootstrap: n_boot={n_boot!r} must be an '
-            'integer >= 20 for a percentile bootstrap')
+            f'integer in [20, {BOOTSTRAP_HARD_MAX_DRAWS}] for a percentile '
+            'bootstrap')
     _seed = _as_seed_int(seed)
     if _seed is None:
         raise ValueError(
