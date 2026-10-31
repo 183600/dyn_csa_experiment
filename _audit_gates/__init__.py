@@ -33,6 +33,7 @@ _PARTS = [
 'part_20_audit_length_strata.py',
 'part_21_audit_unit_quantiles.py',
 'part_22_audit_endpoint_sensitivity.py',
+'part_23_audit_order_dependence.py',
 ]
 
 load_root_package(globals(), __file__, _PARTS,

@@ -5365,3 +5365,63 @@ bounds/direction 是刻度约定，不是数据估计；参考臂选择会改变
 fail-closed；`load_wikitest` 被 monkeypatch 抛错时审计仍完成；CLI
 别名、`audit_design_preflight` 与 `confirmation.plan_check` 接线；严格
 JSON。完整 CPU 套件在本轮最终树通过（新增 14 项）。
+
+## 2026-10-31 — 评测单位不是独立抽样的：顺序依赖、设计效应与有效样本量（本轮结果分析硬化，no new runs）
+
+零 GPU；不新增训练、不读取 test split、不修改
+`confirmation_frozen*.json` 的字节/种子/端点/α/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未删除、未修改、未移动。
+
+**Problem.** 冻结主检验是逐种子的精确符号翻转；逐文章/文档的置信区间
+是它的描述性伴随读数，回答「换一批评测单位会怎样」。该读数一直用
+i.i.d. 重采样单位。但测试切片是 source-order prefix（§55），相邻单位
+共享主题、文体、实体和局部写作习惯；文章 cluster 只处理同一文章的多行，
+两层 bootstrap 仍 i.i.d. 抽单位，长度分层会打乱语料顺序。序列相关存在时，
+i.i.d. 区间系统性偏窄，`n_units=48` 也不是 48 份独立信息。此前没有
+读数检验「顺序无关」这个建模假设，也没有把设计效应/有效样本量写进报告。
+
+**Fix.** 新增 `ORDER_DEPENDENCE_POLICY` 与
+`ordered_unit_inference(values, ...)`：输入已经按语料顺序排列的逐单位
+种子均值效应，不排序、不洗牌。输出 i.i.d. t 参照；非重叠 batch-means
+设计效应与 `n_eff`（默认 `g∈{4,6,8}`，置换固定
+`g=round(sqrt(n))` 夹在 `[4,10]` 且 `<=n//2`）；每个声明块长（2/4/8）的
+循环 moving-block bootstrap 区间、SE、设计效应与 `n_eff`；打乱数值顺序的
+单侧置换 p（batch 设计效应）与双侧 |lag-1| p；**顺序稳健区间取 i.i.d.
+与所有声明块长区间中最宽者**，避免看结果挑块长；当置换显著且
+`DE_max>1.10`、区间加宽 >10% 或零排除结论改变时置
+`inflation_detected`/`iid_understates`，报告必须引用顺序稳健区间与
+`n_eff`。
+
+接线：`explib/__init__.py` 追加
+`part_59_ordered_unit_inference.py`；
+`_doc_level_analysis` 只在单位连续且每个单位种子集合相同时写入
+`doc_sampling.order_inference`（丢单位或失衡种子集合写
+`order_inference_unavailable_reason`，不把非相邻单位当成相邻）；
+`build_report` 在逐单位分布后新增「顺序依赖 / 有效样本量」表；
+`audit_gates.py order_dependence`（别名 `order` / `serial_dependence` /
+`design_effect` / `effective_n`）从有序 `values` 与全部策略输入整块重放，
+并入 `audit_gates.py report` 顶层。
+
+**Boundary.** 这是描述性顺序诊断，不是新的确认性检验：置换 p 不进入冻结
+Holm 族、不改变 `p_exact_signflip`/`p_holm`/`verified`/`confirmed`；不显著
+不是「单位独立/可交换」，显著也不是「效应不存在」。块重采样只处理观测
+切片内的序列相关，不能把 source-order prefix 变成概率样本，也不能替代
+§55 的抽样边界、§54 的总体主张门槛或 §81 的种子×单位两层不确定性。
+本读数作用于等权逐单位向量，不是 token 池化 cluster 区间（两者影响函数
+不同），不能把设计效应直接套到 token 池化区间上；后者需要以 cluster influence 为输入，明列为后续工作。块长
+与 batch 数是声明式选择，顺序稳健区间是最宽者（保守），n 只有几十时
+batch/block 估计本身有噪声；判定以置换 p 为门槛并要求实际后果同时成立。
+输入顺序必须是真的语料顺序，函数无法发现调用者先排序/洗牌；文章/行是
+调用者选定的单位，行级仍受 §54 伪重复边界约束。旧产物缺块报
+`not_verifiable_locally`，不回填、不猜。
+
+**Verification.** 新增 `test_review_part_58.py` 11 项：策略/状态/边界；
+AR(1) 序列检出、设计效应 >1、`n_eff<n`、顺序稳健区间不窄于 i.i.d.；打乱
+序列与 i.i.d. 序列不误报；batch/block 表与最宽区间精确选取；同 seed 可
+复现；布尔/字符串/非有限/二维/非法阈值/重复 `unit_ids` fail-closed；
+`1e308` 交替与常数面板严格 JSON；`_doc_level_analysis` 落盘有序块；审计
+合法块 `ok`、篡改区间/设计效应/稳健区间/`n_units`/充分统计量/夹带
+`confirmed` 判 `fail`、bare `not_estimable` `not_applicable`、缺块
+`not_verifiable_locally`、坏 JSON `fail`、默认/显式 batch 布局重放一致、monkeypatch `load_wikitest`
+抛错时审计仍完成；报告与 CLI/`run_report`/`build_report` 接线。相关既有
+套件通过；完整 CPU 套件在本轮最终树通过（新增 11 项）。

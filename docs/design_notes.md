@@ -10355,3 +10355,151 @@ python -m explib.confirmation plan        # 清单声明硬要求时执行同一
 monkeypatch 成抛错时审计仍完成（证明不读 test）；CLI 别名、
 `audit_design_preflight` 与 `confirmation.plan_check` 接线，以及严格
 JSON。完整 CPU 套件在本轮最终树通过。
+
+## 117. 评测单位不是独立抽样的：顺序依赖、设计效应与有效样本量（本轮结果分析硬化，no new runs）
+
+零 GPU 的结果分析硬化；不新增训练、不读取 test split、不修改
+`confirmation_frozen*.json` 的字节/种子/端点/α/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未删除、未修改、未移动。
+
+### 117.1 问题：逐单位区间默认了「顺序无关」，而切片是连续前缀
+
+冻结主检验是逐训练种子的精确符号翻转，条件是已训练种子；逐文章/文档的
+区间是它的**描述性伴随读数**，回答「换一批评测单位，平均效应会怎样」。
+这个伴随读数一直用 i.i.d. 重采样单位（§54 的文章 cluster、§81 的两层
+bootstrap、§114 的长度分层、§115 的逐单位分位都建立在这批单位上）。但
+测试切片不是从语料里随机抽的独立单位：它是 source-order prefix（§55），
+相邻文章/行共享主题、文体、实体和局部写作习惯。当这种序列相关存在时，
+i.i.d. 区间会系统性偏窄，`n_units=48` 也不是 48 份独立信息。
+
+已有读数没有覆盖这个假设：
+
+- 文章 cluster 区间只处理「同一文章的多行」；若每个单位已经是一篇文章，
+  文章之间的相邻相关仍在；
+- 两层 bootstrap 重采样的是种子和单位，但单位仍是 i.i.d. 抽取；
+- leave-one-unit-out 与逐单位分位描述的是「哪些单位」，不是「顺序是否
+  携带额外方差」；
+- 长度分层按长度重排，恰恰会打乱语料顺序，不能用来检验顺序。
+
+把 i.i.d. 区间的名义覆盖率当作事实，是把一个**建模假设**写成了测量结果；
+反过来，把「顺序检验不显著」写成「单位独立/可交换」也是过度概括。
+
+### 117.2 方法：设计效应、块重采样与顺序置换
+
+新增 `ORDER_DEPENDENCE_POLICY` 与
+`ordered_unit_inference(values, ...)`。输入是**已按语料/评测顺序排列**的
+逐单位种子均值效应 `d_1..d_n`（本仓库取 `doc_sampling` 里的等权逐单位
+向量）；函数不排序、不洗牌，顺序本身就是设计信息。
+
+1. **i.i.d. 参照**：`mean`、样本 SD（ddof=1）、`se = sd/sqrt(n)` 与
+   Student-t 双侧区间。它与既有逐单位 bootstrap 回答同一个估计量，便于
+   对照，不是新的检验。
+2. **非重叠 batch means**：把序列切成 `g` 个长度 `b=floor(n/g)` 的连续
+   batch，计算 batch 均值；对平稳序列
+   `Var(mean_n) ≈ b * Var(batch means) / n`，
+   `design_effect = Var_batch / Var_iid`，`n_eff = n / design_effect`。
+   默认报告 `g ∈ {4,6,8}` 中可行的布局（并把主 `g` 补进表）；置换检验固定使用
+   `g = round(sqrt(n))` 并夹在 `[4,10]`、`<= n//2`（策略中预先声明），
+   不按结果挑 `g`。
+3. **循环 moving-block bootstrap**：对每个声明块长 `b ∈ {2,4,8}`（必须
+   `< n`），每次有放回抽 `ceil(n/b)` 个循环块起点，拼接后取前 `n` 个值，
+   计算均值；给出百分位区间、bootstrap SE、
+   `design_effect = SE_boot² / Var_iid` 与 `n_eff`。块长是预先声明的，
+   表里给出全部块长的范围，**顺序稳健区间取 i.i.d. 与所有声明块长区间中
+   最宽的一个**，避免看结果再挑块长。
+4. **顺序置换诊断**：把同一批数值随机置换（不改变边际分布），重算
+   batch-means 设计效应；单侧
+   `p = (1 + #{permuted DE >= observed DE}) / (n_perm + 1)`。同时报告
+   |lag-1 自相关| 的双侧置换 p 作为描述性交叉读数。它检验的是「观测顺序
+   是否交换」，不是「单位是否独立」，也不检验总体抽样。
+5. **判定与措辞**：`order_dependence_detected = p_DE <= alpha`；
+   `inflation_detected` 还要求至少一个实际后果——`DE_max > 1.10`、
+   顺序稳健区间比 i.i.d. 宽 >10%，或某个声明块长的区间改变了「是否排除
+   零」。只有这时才把 `iid_understates` 置为 `True`，并在报告里要求引用
+   顺序稳健区间与 `n_eff`。`DE` 的 batch/block 范围、`n_eff` 范围、
+   `zero_exclusion_changed` 与逐块长的零排除表全部落盘。
+6. **可重放**：块内保存有序 `values`、`unit_ids`、块长、batch 数、主
+   batch 数、`n_boot`/`n_perm`/`conf`/`alpha`/`seed` 与两个判定阈值；
+   `audit_gates.py order_dependence` 用同一实现整块重放，改一个区间、
+   设计效应、`n_eff` 或充分统计量都会 `fail`。
+
+接线：`explib/__init__.py` 追加
+`part_59_ordered_unit_inference.py`；
+`explib.confirmation._doc_level_analysis` 只在**单位连续且每个单位的
+种子集合相同**时写入 `doc_sampling.order_inference`——丢一个单位会让
+相邻但不连续的单位被当成相邻，种子集合不同会让一个序列混用不同估计量，
+这两种情况都写 `order_inference_unavailable_reason`，不猜。
+`build_report` 在「逐单位分布」之后新增「顺序依赖 / 有效样本量」表；
+`audit_gates.py order_dependence`（别名 `order` / `serial_dependence` /
+`design_effect` / `effective_n`）并入 `audit_gates.py report` 顶层。
+
+### 117.3 边界：这是切片内的顺序诊断，不是总体抽样
+
+- **不新增确认性 p 值。** 顺序置换 p 是描述性诊断，不进入冻结 Holm 族，
+  不改变 `p_exact_signflip`/`p_holm`/`verified`/`confirmed`；它不能把
+  「不显著」改写成「独立」，也不能把「显著」改写成「效应不存在」。
+- **不能修复非概率样本。** source-order prefix 不是语料总体的概率样本；
+  块重采样只处理观测切片内的序列相关，不能给出总体区间，也不能替代
+  §55 的抽样设计边界与 §54 的「n<64 不做总体主张」。
+- **条件在已训练种子上。** 这里只描述评测单位抽样；种子不确定性仍由
+  精确符号翻转与 §81 的两层 bootstrap 负责，二者不能互相替代。
+- **块长与 batch 数是声明式选择。** 顺序稳健区间取最宽者，是保守读数，
+  不是「最优块长」；n 只有几十时 batch/block 估计本身有噪声，`DE>1`
+  可能来自偶然，因此判定以置换 p 为门槛，并要求实际后果同时成立。
+  `DE<1`（负序列相关）也可能出现，此时 `n_eff>n` 只是估计值，不是额外
+  的独立数据；报告用 `n_eff` 下限而不是上限做保守引用。
+- **输入顺序必须是真的语料/评测顺序。** 函数无法从数值本身发现调用者
+  先排序或洗牌；排序后调用会把问题换成另一个问题。`unit_ids` 只用于
+  标签与去重，不用于重排。
+- **文章/文档/行是调用者选定的单位。** 若传入的是文章级向量，顺序就是
+  文章顺序；行级向量仍受 §54 的伪重复边界约束，本模块不把行升级成文章。
+- **作用对象是等权逐单位向量，不是 token 池化 cluster 区间。** 本读数输入
+  的是 `doc_sampling` 的等权逐单位效应；token 池化 cluster 区间使用按 token
+  加权的影响函数，两者估计量不同。不能把本表的设计效应直接乘到 token 池化
+  区间上；若要对那个区间做块推断，应把 cluster influence 作为输入，这是明确
+  的后续工作，本轮不伪装成已完成。
+- **旧产物不回填。** 旧 `test_stats.json` 没有该块时报
+  `not_verifiable_locally`，不猜测、不重跑、不改写旧结论。
+
+### 117.4 落盘、审计与入口
+
+- `finaltest_stats` 的 `doc_sampling.order_inference`：
+  `kind='ordered_unit_inference'`、`status`、`n_units`、`mean`/`sd`/`se`、
+  `iid_ci`、`batch_means`、`block_bootstrap`、`permutation`、
+  `design_effect_min/max`、`n_effective_min/max`、
+  `order_dependence_detected`、`inflation_detected`、`iid_understates`、
+  `robust_ci`/`robust_ci_source`、`zero_exclusion_changed`、
+  `sufficient_statistics`、`boundary`、`wording`；不可估计时是
+  `status='not_estimable'` 加 `reason`，不伪造数字。
+- `audit_gates.py order_dependence`（别名 `order` /
+  `serial_dependence` / `design_effect` / `effective_n`）从存储块整块重放；
+  块内夹带 `confirmed`/`p_holm`/`verified`/`verdict`/`decision` 判
+  `fail`；缺块 `not_verifiable_locally`、bare `not_estimable`
+  `not_applicable`；非对象/字段篡改判 `fail`。该门并入
+  `audit_gates.py report` 顶层 `order_dependence`。
+- 报告新增表：比较、单位 n、i.i.d. 区间、batch/block 设计效应、`n_eff`
+  下限、顺序稳健区间、顺序置换 p、标记；并在表后给出提示，若 i.i.d.
+  低估则必须同时报告顺序稳健区间与 `n_eff`。
+
+```bash
+python -m pytest -q test_review_part_58.py
+python audit_gates.py order_dependence      # 重放 analysis_v12/test_stats.json
+python audit_gates.py design_effect         # 别名
+python -m explib.confirmation report        # 报告新增顺序依赖表
+```
+
+### 117.5 验证
+
+`test_review_part_58.py` 11 项覆盖：策略/状态/边界声明；AR(1) 顺序序列
+被检出、设计效应 >1、`n_eff < n`、顺序稳健区间不窄于 i.i.d.、i.i.d.
+低估标记；同一序列打乱后与 i.i.d. 序列不被误报；batch/block 表与
+「最宽区间」的精确选取；同 seed 完全可复现、不同 seed 只改变随机读数；
+布尔/字符串/非有限/二维/非法 conf/alpha/seed/`n_boot`/`n_perm`/
+块长/批数/阈值/重复 `unit_ids` 全部 fail-closed；`1e308` 交替与常数面板
+严格 JSON、不泄漏 inf/nan；`_doc_level_analysis` 在连续且平衡的 3 种子 ×
+12 行面板上落盘有序块并保持顺序；审计对合法块 `ok`、篡改区间/设计效应/
+稳健区间/`n_units`/充分统计量/夹带确认字段均 `fail`、bare
+`not_estimable` `not_applicable`、缺块 `not_verifiable_locally`、坏 JSON
+`fail`、默认与显式 batch 布局的重放一致；`load_wikitest` 被 monkeypatch 成抛错时审计仍完成（证明不读
+test）；报告表与 CLI/`run_report`/`build_report` 接线。完整 CPU 套件在
+本轮最终树通过（新增 11 项）。

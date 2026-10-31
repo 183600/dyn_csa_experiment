@@ -69,6 +69,7 @@ _PARTS = [
 'part_56_length_strata.py',
 'part_57_unit_quantiles.py',
 'part_58_endpoint_sensitivity.py',
+'part_59_ordered_unit_inference.py',
 ]
 
 load_root_package(globals(), __file__, _PARTS,

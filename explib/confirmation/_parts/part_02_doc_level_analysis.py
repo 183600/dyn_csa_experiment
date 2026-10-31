@@ -129,6 +129,7 @@ def _doc_level_analysis(recs_a, recs_b, common, Ln, primary_deltas=None):
     doc_deltas = []
     doc_log_ratios = []
     within = []
+    cell_counts = []
     incomplete = 0
     for i in range(n_docs):
         cell = []
@@ -149,6 +150,7 @@ def _doc_level_analysis(recs_a, recs_b, common, Ln, primary_deltas=None):
         doc_deltas.append(float(np.mean(cell)))
         doc_log_ratios.append(float(np.mean(logs)))
         within.append(float(np.std(cell, ddof=1)) if len(cell) > 1 else 0.0)
+        cell_counts.append(len(cell))
     if len(doc_deltas) < 2:
         return None
     # The equal-weighted per-document mean above answers "is the average
@@ -310,6 +312,31 @@ def _doc_level_analysis(recs_a, recs_b, common, Ln, primary_deltas=None):
     # within-document correlation.
     _ci_ppl = L.bootstrap_mean_ci(arr, seed=20261018)
     _ci_log = L.bootstrap_mean_ci(lr, seed=20261018)
+    # Order dependence: the unit vector above is kept in corpus order, so an
+    # i.i.d. resample assumes away serial/topic dependence in a contiguous
+    # source-order slice.  The readout is only defined when the sequence is
+    # contiguous (no dropped unit) and every unit has the same seed set; a
+    # gap would silently join non-adjacent units, and an unbalanced mean
+    # would compare different seed sets along one sequence.
+    _order_inference = None
+    _order_reason = None
+    if len(doc_deltas) != n_docs or len(cell_counts) != n_docs:
+        _order_reason = (
+            f'{n_docs - len(doc_deltas)} unit(s) have no complete paired cell; '
+            'dropping them breaks the contiguous corpus order, so the '
+            'order-dependence readout is not defined')
+    elif any(c != len(common) for c in cell_counts):
+        _order_reason = (
+            'per-unit seed counts differ; the seed-mean sequence would mix '
+            'different seed sets, so the order-dependence readout is refused')
+    else:
+        try:
+            _order_inference = L.ordered_unit_inference(
+                arr, unit_ids=_unit_ids)
+        except (ValueError, TypeError, FloatingPointError,
+                OverflowError) as _oee:
+            _order_inference = None
+            _order_reason = f'{type(_oee).__name__}: {_oee}'
     # Breadth diagnostics: a mean gain can be broad-based or carried by one
     # document.  Counts/fractions are descriptive (documents are not an
     # independent randomisation of the arm), but they expose an outlier-driven
@@ -369,6 +396,11 @@ def _doc_level_analysis(recs_a, recs_b, common, Ln, primary_deltas=None):
                             'mean is outlier-sensitive).  Both are descriptive: units are not an arm randomisation.'),
            'article_fallback_reason': _article_fallback,
            'note': _unit_notes[_granularity]}
+    if _order_inference is not None:
+        out['order_inference'] = _order_inference
+    else:
+        out['order_inference_unavailable_reason'] = (
+            _order_reason or 'ordered-unit inference not available for this cell')
     if _variance_components is not None:
         out['variance_components'] = _variance_components
     else:
@@ -1238,6 +1270,117 @@ def _unit_quantile_markdown(ft):
                 ' 的等权分布与 token 池化结论不一致、受损尾明显或分位区间跨零；'
                 '引用时必须同时报告本表，不能只用 token 池化均值概括逐单位效应，'
                 '也不能用等权分位替换冻结主估计。', '']
+    return out
+
+
+def _order_inference_markdown(ft):
+    """Render the order-dependence / effective-n readout.
+
+    Pure function of the final-test stats dict.  The table keeps the reported
+    i.i.d. unit interval next to the order-robust interval, the design effect
+    and the permutation diagnostic so a reader cannot quote the narrower
+    interval while ignoring serial dependence.  It is descriptive and never a
+    second confirmatory test.
+    """
+    comps = (ft or {}).get('comparisons') if isinstance(ft, dict) else None
+    if not isinstance(comps, dict):
+        return []
+
+    def _num(value, fmt='{:.4g}'):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return '—'
+        try:
+            f = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return '—'
+        return fmt.format(f) if math.isfinite(f) else '—'
+
+    def _ci(pair):
+        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+            return '—'
+        lo = _num(pair[0], '{:+.4f}')
+        hi = _num(pair[1], '{:+.4f}')
+        return f'[{lo}, {hi}]'
+
+    rows = []
+    missing = []
+    not_estimable = []
+    inflated = []
+    for name, comp in comps.items():
+        if not isinstance(comp, dict):
+            continue
+        dsm = comp.get('doc_sampling') or {}
+        oi = dsm.get('order_inference') if isinstance(dsm, dict) else None
+        if not isinstance(oi, dict):
+            if (isinstance(dsm, dict)
+                    and dsm.get('pooled_delta_ppl_ci95') is not None):
+                missing.append(name)
+            continue
+        if oi.get('status') == 'not_estimable':
+            not_estimable.append(
+                f'{name}（{oi.get("reason") or "不可估计"}）')
+            continue
+        if oi.get('status') != 'ok':
+            missing.append(name)
+            continue
+        de = oi.get('design_effect_max')
+        batch = oi.get('batch_means') or []
+        blocks = oi.get('block_bootstrap') or []
+        de_batch = '—'
+        de_block = '—'
+        if isinstance(batch, list) and batch:
+            vals = [r.get('design_effect') for r in batch
+                    if isinstance(r, dict) and r.get('design_effect') is not None]
+            if vals:
+                de_batch = f'{min(vals):.2f}–{max(vals):.2f}'
+        if isinstance(blocks, list) and blocks:
+            vals = [r.get('design_effect') for r in blocks
+                    if isinstance(r, dict) and r.get('design_effect') is not None]
+            if vals:
+                de_block = f'{min(vals):.2f}–{max(vals):.2f}'
+        flag = []
+        if oi.get('inflation_detected') is True:
+            flag.append('⚠ i.i.d. 区间低估')
+            inflated.append(name)
+        elif oi.get('order_dependence_detected') is True:
+            flag.append('顺序结构可检出但未显著加宽')
+        if oi.get('zero_exclusion_changed') is True:
+            flag.append('⚠ 零排除结论改变')
+        rows.append('| %s | %s | %s | %s | %s | %s | %s | %s | %s |'
+                    % (name, oi.get('n_units', '—'),
+                       _ci(oi.get('iid_ci')), de_batch, de_block,
+                       _num(oi.get('n_effective_min'), '{:.1f}'),
+                       _ci(oi.get('robust_ci')),
+                       _num(oi.get('order_dependence_p'), '{:.4f}'),
+                       '；'.join(flag) if flag else '—'))
+    if not rows and not missing and not not_estimable:
+        return []
+    out = ['### 顺序依赖 / 有效样本量（post-hoc；不改变上面的冻结判定）', '']
+    if rows:
+        out += ['| 比较 | 单位 n | i.i.d. 95% CI | 设计效应（batch） | 设计效应（block） | n_eff 下限 | 顺序稳健 95% CI | 顺序置换 p | 标记 |',
+                '|---|---|---|---|---|---|---|---|---|']
+        out.extend(rows)
+        out += ['',
+                '> 定义：输入是**按语料/评测顺序排列**的逐单位种子均值效应；函数不排序、不洗牌。'
+                '`设计效应 = Var(块均值) / Var(i.i.d. 均值)`，>1 表示同一批数值在观测顺序下'
+                '比独立抽样更不稳定；`n_eff = n / 设计效应`。batch 列是非重叠 batch-means，'
+                'block 列是循环 moving-block bootstrap（块长在策略中预先声明，表中给声明块长的'
+                '范围）。`顺序稳健 95% CI` 取 i.i.d. 与所有声明块长区间中**最宽**的一个，'
+                '避免看结果再挑块长；`顺序置换 p` 是「打乱顺序后 batch-means 设计效应不小于'
+                '观测值」的单侧随机化 p（同时报 |lag-1| 双侧 p，见 JSON）。'
+                '该诊断条件在已训练种子上，描述的是冻结切片的顺序结构，不能把 source-order '
+                'prefix 变成概率样本；p 不显著也不证明单位独立或可交换。它是描述性读数：'
+                '不新增冻结族成员，不改变 `p_exact_signflip`/`p_holm`/`verified`/`confirmed`。', '']
+    if inflated:
+        out += ['**顺序依赖提示**：' + '、'.join(sorted(set(inflated))) +
+                ' 的 i.i.d. 逐单位区间在观测顺序下低估不确定性；引用时必须同时报告'
+                '顺序稳健区间与 n_eff，或改用块重采样，不能把 n_units 当作独立信息量。', '']
+    if not_estimable:
+        out += ['> 以下比较的顺序依赖读数不可估计（不伪造设计效应）：'
+                + '；'.join(not_estimable) + '。', '']
+    if missing:
+        out += ['> 以下比较有逐单位区间但没有顺序依赖块（旧产物或未重新生成分析），'
+                '顺序依赖**未验证**：' + '；'.join(missing) + '。', '']
     return out
 
 

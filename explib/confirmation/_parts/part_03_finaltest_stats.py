@@ -2028,7 +2028,9 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
               '单元，是总不确定性的描述性读数（不是新的检验，不进入 p/Holm/confirmed，'
               '种子数很少时百分位区间可能偏窄）。等权逐单元 bootstrap 仍保存在 '
               '`analysis_v12/test_stats.json` 的 `per_doc_delta_ppl_ci95`，只作描述，'
-              '不再占据主表 CI 列。）')
+              '不再占据主表 CI 列。等权逐单元 bootstrap 的 i.i.d. 重采样假设由下方'
+              '「顺序依赖 / 有效样本量」表检验：若设计效应 >1，应引用顺序稳健区间与 '
+              'n_eff，而不是把 n_units 当作独立信息量。）')
             A('')
         _ta = (ft.get('test_access')
                if isinstance(ft.get('test_access'), dict) else {})
@@ -2114,6 +2116,9 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
         _unit_quant_lines = _unit_quantile_markdown(ft)
         if _unit_quant_lines:
             lines.extend(_unit_quant_lines)
+        _order_lines = _order_inference_markdown(ft)
+        if _order_lines:
+            lines.extend(_order_lines)
         _var_lines = _variance_components_markdown(ft)
         if _var_lines:
             lines.extend(_var_lines)
