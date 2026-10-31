@@ -1,4 +1,20 @@
 
+def _unique_int_set(values):
+    """Set of the distinct integer values, without a per-token Python list.
+
+    The document-id sidecars are indexed per TOKEN, not per document: a
+    100M-token corpus yields a 100M-element array that may hold only ~800k
+    distinct document ids.  ``arr.tolist()`` materialises one Python int per
+    token before the set discards the duplicates.  Collapsing to the unique
+    values first keeps the same set and only pays for the distinct ids.  An
+    object/mixed array falls back to the historical conversion so malformed
+    sidecars keep their existing error behaviour.
+    """
+    arr = np.asarray(values)
+    if arr.dtype.kind in 'iufb':
+        arr = np.unique(arr.reshape(-1))
+    return set(int(x) for x in arr.reshape(-1).tolist())
+
 
 def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                            js_fail=0.25, min_shift_tokens=5000,
@@ -1382,7 +1398,7 @@ def audit_document_unit(cache_dir=None, *, seq_len=None, raw_dir=None,
             trrec['served_units'] = int(np.asarray(_trd_arr).size)
             trrec['unit'] = _mmeta.get('document_unit') or (
                 vrec.get('unit') or trec.get('unit'))
-            _served_train = set(int(x) for x in np.asarray(_trd_arr).tolist())
+            _served_train = _unique_int_set(_trd_arr)
         except Exception as e:
             trrec['status'] = 'not_verifiable_locally'
             trrec['problems'].append(f'train document sidecar unreadable ({type(e).__name__}: {e})')
@@ -1391,8 +1407,8 @@ def audit_document_unit(cache_dir=None, *, seq_len=None, raw_dir=None,
         trrec['problems'].append('train document-id sidecar is missing')
     if os.path.exists(os.path.join(cache_dir, f'val_doc_ids_{_train_tag}.npy')):
         try:
-            _served_val = set(int(x) for x in np.load(
-                os.path.join(cache_dir, f'val_doc_ids_{_train_tag}.npy')).tolist())
+            _served_val = _unique_int_set(np.load(
+                os.path.join(cache_dir, f'val_doc_ids_{_train_tag}.npy')))
         except Exception:
             _served_val = None
 

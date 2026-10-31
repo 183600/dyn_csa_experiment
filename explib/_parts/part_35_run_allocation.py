@@ -249,12 +249,37 @@ def environment_balance_audit(records, *, min_records_per_arm=None):
             'record(s); a per-arm confound cannot be distinguished from a '
             'single observation')
         return out
-    for i, a in enumerate(measured):
-        for b in measured[i + 1:]:
-            ea = set(counts[a])
-            eb = set(counts[b])
-            if ea and eb and ea.isdisjoint(eb):
-                out['confounded_pairs'].append([a, b])
+    # A complete confound is a pair of arms whose environment sets are
+    # disjoint.  The naive form constructs/sets both sets for every arm pair,
+    # which is O(n_arms**2) work and allocations; a large arm grid spends all
+    # its time proving that the common case (every arm shares an environment)
+    # has no pair.  Group arms with the same environment set: arms inside one
+    # group always intersect, and only whole groups can be disjoint.  The
+    # number of distinct environment sets is normally tiny (one or two
+    # devices), so this is linear in the panel, and the emitted pair order is
+    # still the historical (first-arm, second-arm) order.
+    env_sets = {a: frozenset(counts[a]) for a in measured}
+    groups = collections.OrderedDict()
+    for a in measured:
+        groups.setdefault(env_sets[a], []).append(a)
+    _group_items = list(groups.items())
+    _measured_index = {a: i for i, a in enumerate(measured)}
+    _confounded = []
+    for gi, (sa, arms_a) in enumerate(_group_items):
+        if not sa:
+            continue
+        for sb, arms_b in _group_items[gi + 1:]:
+            if not sb or not sa.isdisjoint(sb):
+                continue
+            for a in arms_a:
+                ia = _measured_index[a]
+                for b in arms_b:
+                    ib = _measured_index[b]
+                    _confounded.append((min(ia, ib), max(ia, ib), a, b)
+                                       if ia < ib else
+                                       (ib, ia, b, a))
+    _confounded.sort(key=lambda row: (row[0], row[1]))
+    out['confounded_pairs'] = [[a, b] for _i, _j, a, b in _confounded]
     threshold = float(policy['dominant_share_warn'])
     for variant, share in out['arm_dominant_share'].items():
         if share is not None and share > threshold and len(counts[variant]) > 1:

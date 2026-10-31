@@ -1619,11 +1619,15 @@ def aggregate_with_exclusions(summary):
             # its measured records) survive; no dPPL is then claimed.
             sub_agg = {}
             _pairing_split = False
-            for vv in sorted({str(r.get('variant')) for r in sub.values()}):
-                _sub_v = {k: r for k, r in sub.items()
-                          if str(r.get('variant')) == vv}
-                if not _sub_v:
-                    continue
+            # Group once.  Re-filtering the whole sub-panel for every variant
+            # made the fallback O(n_variants * n_records) exactly when a large
+            # panel needed it; a single pass keeps the same variant order and
+            # the same per-variant key order.
+            _by_variant = {}
+            for _k, _r in sub.items():
+                _by_variant.setdefault(str(_r.get('variant')), {})[_k] = _r
+            for vv in sorted(_by_variant):
+                _sub_v = _by_variant[vv]
                 try:
                     _one = aggregate(_sub_v)
                 except Exception as exc2:

@@ -360,7 +360,7 @@ def audit_sample_design(cache_dir=None, *, raw_dir=None, max_raw_articles=None):
             _served_ids = None
             if _sidecar and os.path.exists(_sidecar):
                 try:
-                    _served_ids = set(int(x) for x in np.load(_sidecar).tolist())
+                    _served_ids = _unique_int_set(np.load(_sidecar))
                 except Exception as e:
                     _srec['warnings'].append(
                         f'{os.path.basename(_sidecar)} unreadable ({type(e).__name__}: {e})')

@@ -109,6 +109,43 @@ def _prep_number(value):
     return out if out == out and out not in (float('inf'), float('-inf')) else None
 
 
+def _prep_str_list(value):
+    """String-normalise a declared list field, or return None if malformed.
+
+    A protocol/plan is untrusted JSON: ``planned_cells`` is normally a list,
+    but a hand-edited artifact can put a scalar or mapping there.  Returning
+    None lets the caller record a named validation failure instead of raising
+    ``TypeError: 'int' object is not iterable`` and aborting the whole launch
+    gate before it can explain what is wrong.
+    """
+    if value is None:
+        return []
+    if not isinstance(value, (list, tuple)):
+        return None
+    return [str(x) for x in value]
+
+
+def _prep_detail_head(value, limit=5):
+    """Render the first few diagnostic items of a malformed evidence field.
+
+    Evidence objects are untrusted: ``mismatches``/``missing``/``problems``
+    are normally lists, but a hand-written or third-party contract may make
+    one a mapping, a bare string, or a scalar.  Slicing such a value directly
+    raised ``TypeError``/``KeyError`` inside a gate whose whole contract is
+    "fail closed, never crash"; this helper keeps the historical list/tuple
+    rendering and turns every other shape into a readable short list.
+    """
+    if value is None:
+        return []
+    if isinstance(value, dict):
+        return [f'{k}={v}' for k, v in list(value.items())[:limit]]
+    if isinstance(value, (list, tuple)):
+        return list(value[:limit])
+    if isinstance(value, (set, frozenset)):
+        return list(value)[:limit]
+    return [value][:limit]
+
+
 def _prep_canonical(obj):
     return json.dumps(obj, sort_keys=True, separators=(',', ':'),
                       ensure_ascii=True, allow_nan=False)
@@ -244,6 +281,8 @@ def _prep_protocol_check(protocol, *, power_supplied=False):
 
 
 def _prep_source_tree_check(protocol, source_tree, *, strict=True):
+    if not isinstance(protocol, dict):
+        protocol = {}
     out = _prep_check('source_tree', required=True)
     impl = ((protocol.get('analysis') or {}).get('implementation')
             if isinstance(protocol.get('analysis'), dict) else None)
@@ -291,6 +330,8 @@ def _prep_source_tree_check(protocol, source_tree, *, strict=True):
 
 
 def _prep_run_order_check(protocol, run_order, *, strict=True):
+    if not isinstance(protocol, dict):
+        protocol = {}
     out = _prep_check('run_order', required=True)
     if not isinstance(run_order, dict):
         return _prep_require(out, strict, 'run_order plan is missing')
@@ -314,8 +355,15 @@ def _prep_run_order_check(protocol, run_order, *, strict=True):
     if not rnd:
         _prep_fail(out, 'protocol does not record a randomization plan')
         return out
-    actual_cells = [str(x) for x in (run_order.get('planned_cells') or [])]
-    registered_cells = [str(x) for x in (rnd.get('planned_cells') or [])]
+    actual_cells = _prep_str_list(run_order.get('planned_cells'))
+    if actual_cells is None:
+        _prep_fail(out, 'run_order.planned_cells must be a list of cell labels')
+        actual_cells = []
+    registered_cells = _prep_str_list(rnd.get('planned_cells'))
+    if registered_cells is None:
+        _prep_fail(out, 'protocol randomization.planned_cells must be a list '
+                        'of cell labels')
+        registered_cells = []
     out['n_planned_cells'] = len(actual_cells)
     if actual_cells != registered_cells:
         first = next((i for i, (a, b) in enumerate(
@@ -354,6 +402,8 @@ def _prep_run_order_check(protocol, run_order, *, strict=True):
 
 
 def _prep_disposition_check(protocol, disposition, *, strict=True):
+    if not isinstance(protocol, dict):
+        protocol = {}
     out = _prep_check('disposition', required=True)
     if not isinstance(disposition, dict):
         return _prep_require(out, strict, 'run-disposition plan is missing')
@@ -382,8 +432,18 @@ def _prep_disposition_check(protocol, disposition, *, strict=True):
                         + ', '.join(pairs[:6]))
     rnd = protocol.get('randomization') if isinstance(
         protocol.get('randomization'), dict) else {}
-    want = {str(x) for x in (rnd.get('planned_cells') or [])}
-    got = {str(x) for x in (validated.get('planned_cells') or [])}
+    _want_list = _prep_str_list(rnd.get('planned_cells'))
+    if _want_list is None:
+        _prep_fail(out, 'protocol randomization.planned_cells must be a list '
+                        'of cell labels')
+        _want_list = []
+    _got_list = _prep_str_list(validated.get('planned_cells'))
+    if _got_list is None:
+        _prep_fail(out, 'disposition plan planned_cells must be a list of '
+                        'cell labels')
+        _got_list = []
+    want = set(_want_list)
+    got = set(_got_list)
     if got != want:
         missing = sorted(want - got)[:5]
         extra = sorted(got - want)[:5]
@@ -402,6 +462,8 @@ def _prep_power_report(power):
 
 
 def _prep_power_check(protocol, power, *, strict=True):
+    if not isinstance(protocol, dict):
+        protocol = {}
     out = _prep_check('power')
     ss = protocol.get('sample_size') if isinstance(
         protocol.get('sample_size'), dict) else {}
@@ -539,6 +601,8 @@ def _prep_rehearsal_verdict(rehearsal, *, _depth=0):
 
 
 def _prep_rehearsal_check(protocol, rehearsal):
+    if not isinstance(protocol, dict):
+        protocol = {}
     out = _prep_check('rehearsal', required=True)
     # A malformed/absent study block is a protocol problem that the protocol
     # check already reports; reading its level must not raise here and abort
@@ -644,7 +708,8 @@ def _prep_dependency_check(dependency_contract, *, strict=True):
                   or dependency_contract.get('missing')
                   or dependency_contract.get('problems') or [])
         return _prep_fail(out, 'dependency contract is not ok'
-                               + (f': {detail[:5]}' if detail else ''))
+                               + (f': {_prep_detail_head(detail)}'
+                                  if detail else ''))
     # `status=ok` alone is a label; the contract must also identify the lock
     # bytes it actually compared.  A missing/malformed digest or a listed
     # mismatch means the environment is not pinned to the registration, even
@@ -655,7 +720,7 @@ def _prep_dependency_check(dependency_contract, *, strict=True):
               or dependency_contract.get('problems') or [])
     if detail:
         return _prep_fail(out, 'dependency contract lists unresolved '
-                               f'problem(s): {detail[:5]}')
+                               f'problem(s): {_prep_detail_head(detail)}')
     if out['lock_sha256'] is None:
         return _prep_fail(out, 'dependency contract does not record the lock '
                                'bytes it compared')
@@ -678,6 +743,8 @@ def _prep_environment_check(environment):
 
 
 def _prep_temporal_check(protocol, created_at):
+    if not isinstance(protocol, dict):
+        protocol = {}
     out = _prep_check('temporal_order', required=True)
     proto = _prep_timestamp(protocol.get('created_at'))
     clear = _prep_timestamp(created_at)
@@ -1131,6 +1198,17 @@ def preparation_clearance_audit(
     out['validation'] = validation
     out['problems'].extend(validation.get('problems') or [])
     out['warnings'].extend(validation.get('warnings') or [])
+    # A stored artifact is untrusted JSON: a top-level list/scalar is a
+    # malformed clearance/protocol, not an object the replay helpers may call
+    # ``.get()`` on.  Validation already names the bad shape; stop before any
+    # replay helper can raise AttributeError and abort the gate.
+    if not isinstance(clearance, dict) or not isinstance(protocol, dict):
+        out['status'] = 'fail'
+        if not isinstance(protocol, dict):
+            out['problems'].append(
+                'design protocol must be a JSON object, got '
+                f'{type(protocol).__name__}')
+        return out
     if validation.get('status') == 'fail':
         # A structurally invalid/tampered clearance is a hard failure even when
         # no replay artifact happens to be present to expose it a second time.

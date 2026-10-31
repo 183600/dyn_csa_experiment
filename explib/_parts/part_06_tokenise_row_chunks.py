@@ -962,7 +962,10 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=None, cache_dir=None,
         if not os.path.exists(_vpath):
             continue
         try:
-            _cached_val_ids = set(int(x) for x in np.load(_vpath).tolist())
+            _vcached = np.asarray(np.load(_vpath))
+            if _vcached.dtype.kind in 'iufb':
+                _vcached = np.unique(_vcached.reshape(-1))
+            _cached_val_ids = set(int(x) for x in _vcached.reshape(-1).tolist())
         except Exception as _ve:
             raise RuntimeError(
                 f'load_wikitest: cached validation document-id sidecar {_vpath} '

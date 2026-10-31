@@ -1035,6 +1035,17 @@ def run_disposition_audit(events, *, planned_cells=None, plan=None,
                   if out['by_arm'][a]['n_retried_cells'] > 0]
     rates = [out['by_arm'][a]['retry_rate'] for a in arms_with_cells]
     spread = (max(rates) - min(rates)) if rates else 0.0
+    # One pass over the cell table.  Re-scanning every cell for every arm
+    # (``for a in arms: max(... for k, c in out['cells'].items() if ...)``)
+    # is O(n_arms * n_cells): a sweep/ablation grid with thousands of arms
+    # would spend minutes deriving a single descriptive map.  The per-arm
+    # maximum is accumulated once and the declared arm order is preserved.
+    _cell_max_by_arm = {}
+    for _key, _cell in out['cells'].items():
+        _arm = _key.rpartition('::seed')[0]
+        _n = _cell.get('n_attempts') or 0
+        if _n > _cell_max_by_arm.get(_arm, 0):
+            _cell_max_by_arm[_arm] = _n
     diff = {
         'status': ('no_retries' if not retry_arms else
                    'concentrated' if len(retry_arms) < len(arms_with_cells)
@@ -1044,9 +1055,7 @@ def run_disposition_audit(events, *, planned_cells=None, plan=None,
         'arms_with_retries': retry_arms,
         'retry_rate_spread': spread,
         'max_attempts_per_cell_by_arm': {
-            a: max([c['n_attempts'] for k, c in out['cells'].items()
-                    if k.rpartition('::seed')[0] == a] or [0])
-            for a in arms_with_cells},
+            a: _cell_max_by_arm.get(a, 0) for a in arms_with_cells},
         'role': ('descriptive concentration readout; with a few cells per arm '
                  'it is not a test of differential attrition and carries no '
                  'p-value'),

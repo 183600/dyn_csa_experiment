@@ -706,7 +706,13 @@ def controlled_variables_report(recs, arms):
         controlled = False
     return {
         'arms': arms,
-        'n_records': {a: sum(1 for (v, _t, _s) in recs if v == a) for a in arms},
+        # ``_setting_values`` already counted every record once per arm.  A
+        # fresh ``sum(1 for ... if v == a)`` for every arm rescanned the whole
+        # record table, making this panel summary O(n_arms * n_records) even
+        # though the counts were already available (the scale failure mode a
+        # large arm grid hits first).  Reuse the same counts in the same arm
+        # order.
+        'n_records': {a: int(run_cfg['n_records'].get(a, 0)) for a in arms},
         'run_cfg_equal': run_cfg['equal'],
         'train_knobs_equal': train_knobs['equal'],
         'train_knobs_defects': _knob_defects,
