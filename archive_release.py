@@ -36,6 +36,7 @@ verify 独立于 make：任何拿到归档的人都能校验完整性。
 """
 import argparse
 import ast
+import ntpath
 import contextlib
 import glob
 import gzip
@@ -541,6 +542,41 @@ _SPLIT_REGISTRY_ALGORITHM = (
     'sha256(sorted package NUL historical NUL order NUL part NUL sha256 LF)')
 
 
+def _packed_split_py_name(name):
+    """The verifier applies the same cross-platform basename rule as exp_lib."""
+    if not isinstance(name, str) or not name:
+        return False
+    if ('\x00' in name or name.startswith(('.', '/', '\\'))
+            or '/' in name or '\\' in name
+            or not name.endswith('.py')):
+        return False
+    try:
+        drive, _tail = ntpath.splitdrive(name)
+    except (TypeError, ValueError):
+        return False
+    return not drive and not ntpath.isabs(name)
+
+
+def _packed_split_hist_ok(hist):
+    """Repo-relative historical path, with Windows absolutes rejected on POSIX."""
+    if not isinstance(hist, str):
+        return False
+    text = hist.strip()
+    if not text or '\x00' in text:
+        return False
+    posix = text.replace('\\', '/')
+    if os.path.isabs(text) or ntpath.isabs(text):
+        return False
+    try:
+        drive, _tail = ntpath.splitdrive(text)
+    except (TypeError, ValueError):
+        return False
+    if drive:
+        return False
+    return not (posix.startswith('/') or posix.startswith('../')
+                or '/../' in posix or posix in ('..', '.'))
+
+
 def _packed_split_registry_problems(man, tf):
     """Recompute the executed split registration from packed bytes.
 
@@ -580,8 +616,6 @@ def _packed_split_registry_problems(man, tf):
         if not pkg or '/' in name or not name.endswith('.py'):
             continue
         groups.setdefault(pkg, []).append(name)
-    if not groups:
-        problems.append('split_registry is present but no _parts/ source was packed')
 
     names = set(tf.getnames())
 
@@ -592,6 +626,40 @@ def _packed_split_registry_problems(man, tf):
         if member is None:
             raise KeyError(rel)
         return member.read()
+
+    def _has_parts_decl(rel):
+        """True when a packed package init declares ``_PARTS`` at top level."""
+        try:
+            tree = ast.parse(_read(rel), filename=rel)
+        except Exception:
+            return False
+        for node in tree.body:
+            if isinstance(node, ast.Assign):
+                targets = node.targets
+            elif isinstance(node, ast.AnnAssign) and node.value is not None:
+                targets = [node.target]
+            else:
+                continue
+            if any(isinstance(t, ast.Name) and t.id == '_PARTS'
+                   for t in targets):
+                return True
+        return False
+
+    # A split package with an empty `_parts/` directory has no fragment file
+    # from which to infer its existence, but it is still part of the ordered
+    # registry.  Recover those packages from their packed `__init__.py`
+    # declaration; otherwise a valid empty panel would make every archive
+    # fail its `n_packages` check.
+    for rel in files:
+        if not (isinstance(rel, str) and rel.endswith('/__init__.py')):
+            continue
+        pkg = rel[:-len('/__init__.py')]
+        if pkg in groups:
+            continue
+        if _has_parts_decl(rel):
+            groups[pkg] = []
+    if not groups:
+        problems.append('split_registry is present but no _parts/ source was packed')
 
     def _decl(rel):
         raw = _read(rel)
@@ -640,9 +708,7 @@ def _packed_split_registry_problems(man, tf):
                             f'({type(e).__name__}: {e})')
             continue
         pkg_problems = []
-        hist_posix = hist.replace('\\', '/')
-        if (os.path.isabs(hist) or hist_posix.startswith('../')
-                or '/../' in hist_posix or hist_posix in ('..', '.')):
+        if not _packed_split_hist_ok(hist):
             pkg_problems.append(f'historical_path is not repo-relative: {hist!r}')
         on_disk = sorted(groups.get(pkg) or [])
         seen = set()
@@ -651,8 +717,7 @@ def _packed_split_registry_problems(man, tf):
             if not isinstance(name, str) or not name:
                 pkg_problems.append(f'_PARTS[{order}] is not a non-empty string')
                 continue
-            if (name.startswith(('.', '/', '\\')) or '/' in name
-                    or '\\' in name or not name.endswith('.py')):
+            if not _packed_split_py_name(name):
                 pkg_problems.append(f'_PARTS[{order}]={name!r} is not a plain basename')
                 continue
             if name in seen:

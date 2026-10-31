@@ -29,6 +29,7 @@
 # ---------------------------------------------------------------------------
 
 import ast as _split_ast
+import ntpath as _split_ntpath
 
 SPLIT_REGISTRY_SCHEMA = 1
 SPLIT_REGISTRY_ALGORITHM = (
@@ -44,6 +45,55 @@ _SPLIT_REGISTRY_SKIP_PREFIXES = _SOURCE_TREE_SKIP_PREFIXES
 
 def _split_rel(path, root):
     return os.path.relpath(path, root).replace(os.sep, '/')
+
+
+def _split_is_plain_py_name(name):
+    """A fragment entry is one basename, not a path on any platform.
+
+    ``os.path`` on POSIX treats ``C:outside.py`` as an ordinary filename, but
+    the same literal is drive-relative on Windows and would resolve outside
+    the package directory.  The registry is a cross-platform identity, so the
+    Windows drive/UNC rules are applied even when the audit runs on POSIX.
+    """
+    if not isinstance(name, str) or not name:
+        return False
+    if ('\x00' in name or name.startswith(('.', '/', '\\'))
+            or '/' in name or '\\' in name
+            or not name.endswith('.py')):
+        return False
+    try:
+        drive, _tail = _split_ntpath.splitdrive(name)
+    except (TypeError, ValueError):
+        return False
+    return not drive and not _split_ntpath.isabs(name)
+
+
+def _split_hist_is_repo_relative(hist):
+    """Whether ``historical_path`` is a plain repo-relative path.
+
+    The loader joins this literal to the repository root to publish
+    ``__file__``.  Absolute paths (including Windows drive/UNC spellings on a
+    POSIX host, where ``os.path.isabs`` alone would miss them) and ``..``
+    traversal would let fragments resolve resources outside the checkout.
+    A path may name a file that no longer exists (the historical single-file
+    script was split years ago); only its value is the identity.
+    """
+    if not isinstance(hist, str):
+        return False
+    text = hist.strip()
+    if not text or '\x00' in text:
+        return False
+    posix = text.replace('\\', '/')
+    if os.path.isabs(text) or _split_ntpath.isabs(text):
+        return False
+    try:
+        drive, _tail = _split_ntpath.splitdrive(text)
+    except (TypeError, ValueError):
+        return False
+    if drive:
+        return False
+    return not (posix.startswith('/') or posix.startswith('../')
+                or '/../' in posix or posix in ('..', '.'))
 
 
 def _split_registry_declaration(init_path):
@@ -136,18 +186,50 @@ def _split_registry_declaration(init_path):
 
 
 def _split_package_dirs(root):
-    """Split-package directories (the parents of every ``_parts/`` directory)."""
+    """Split-package directories (the parents of every ``_parts/`` directory).
+
+    ``os.walk(..., followlinks=False)`` deliberately does not descend into a
+    symlinked directory, but a symlinked package or ``_parts`` directory is
+    still importable/executable through its link path.  Such a candidate is
+    reported here (and then rejected by :func:`split_registry_manifest`)
+    instead of disappearing from the registry entirely.  A symlinked
+    directory is never traversed, so a link cycle cannot turn this scan into
+    an unbounded walk.
+    """
     out = []
+    seen = set()
+
+    def _add(pkg, parts):
+        key = (os.path.abspath(pkg), os.path.abspath(parts))
+        if key not in seen:
+            seen.add(key)
+            out.append((pkg, parts))
+
     for cur, dirs, _names in os.walk(root, followlinks=False):
-        dirs[:] = sorted(
-            d for d in dirs
-            if d not in _SPLIT_REGISTRY_SKIP_DIRS
-            and not any(d.endswith(sfx) for sfx in _SPLIT_REGISTRY_SKIP_SUFFIXES)
-            and not any(d.startswith(pref) for pref in _SPLIT_REGISTRY_SKIP_PREFIXES))
+        keep = []
+        for d in sorted(dirs):
+            if (d in _SPLIT_REGISTRY_SKIP_DIRS
+                    or any(d.endswith(sfx) for sfx in _SPLIT_REGISTRY_SKIP_SUFFIXES)
+                    or any(d.startswith(pref) for pref in _SPLIT_REGISTRY_SKIP_PREFIXES)):
+                continue
+            path = os.path.join(cur, d)
+            if os.path.islink(path):
+                # Do not follow the link.  Record a directly linked split
+                # package (or a linked `_parts`), so the manifest can fail
+                # closed rather than silently omitting it.
+                if d == '_parts':
+                    if os.path.isfile(os.path.join(cur, '__init__.py')):
+                        _add(cur, path)
+                elif (os.path.isfile(os.path.join(path, '__init__.py'))
+                      and os.path.isdir(os.path.join(path, '_parts'))):
+                    _add(path, os.path.join(path, '_parts'))
+                continue
+            keep.append(d)
+        dirs[:] = keep
         if os.path.basename(cur) == '_parts':
             pkg = os.path.dirname(cur)
             if os.path.isfile(os.path.join(pkg, '__init__.py')):
-                out.append((pkg, cur))
+                _add(pkg, cur)
             dirs[:] = []
     return sorted(out, key=lambda pair: _split_rel(pair[0], root))
 
@@ -188,8 +270,37 @@ def split_registry_manifest(root=None):
     for pkg_dir, parts_dir in _split_package_dirs(root):
         pkg_rel = _split_rel(pkg_dir, root)
         init_path = os.path.join(pkg_dir, '__init__.py')
-        decl = _split_registry_declaration(init_path)
-        pkg_problems = list(decl['problems'])
+        pkg_problems = []
+        pkg_is_link = os.path.islink(pkg_dir)
+        parts_is_link = os.path.islink(parts_dir)
+        parts_inside = _inside(parts_dir)
+        init_inside = _inside(init_path)
+        if pkg_is_link:
+            pkg_problems.append(
+                'package directory is a symlink; the source-tree digest does '
+                'not traverse linked directories, so the executed layout is '
+                'not the reviewed one')
+        if parts_is_link:
+            pkg_problems.append(
+                '_parts directory is a symlink; the source-tree digest does '
+                'not traverse linked directories, so fragment paths would '
+                'not be the reviewed ones')
+        if not parts_inside:
+            pkg_problems.append('_parts directory resolves outside the tree')
+        if not init_inside:
+            pkg_problems.append('package init resolves outside the tree')
+        if init_inside:
+            decl = _split_registry_declaration(init_path)
+        else:
+            decl = {'parts': None, 'historical_path': None, 'problems': []}
+        pkg_problems.extend(decl['problems'])
+        # Entries and the on-disk inventory are only meaningful when the
+        # declaration and the fragment directory are both regular, in-tree
+        # paths.  For a linked/outside layout the registry is invalid anyway;
+        # recording hashes through the link would imply an identity the source
+        # tree did not review.
+        can_read_parts = (parts_inside and init_inside
+                          and not pkg_is_link and not parts_is_link)
         entries = []
         declared = decl['parts']
         if declared is None:
@@ -199,8 +310,7 @@ def split_registry_manifest(root=None):
             if not isinstance(name, str) or not name:
                 pkg_problems.append(f'_PARTS[{order}] is not a non-empty string')
                 continue
-            if (name.startswith(('.', '/', '\\')) or '/' in name
-                    or '\\' in name or not name.endswith('.py')):
+            if not _split_is_plain_py_name(name):
                 pkg_problems.append(
                     f'_PARTS[{order}]={name!r} is not a plain *.py basename')
                 continue
@@ -208,6 +318,8 @@ def split_registry_manifest(root=None):
                 pkg_problems.append(f'duplicate fragment registration: {name}')
                 continue
             seen.add(name)
+            if not can_read_parts:
+                continue
             path = os.path.join(parts_dir, name)
             if not os.path.isfile(path) or not _inside(path):
                 pkg_problems.append(
@@ -225,14 +337,16 @@ def split_registry_manifest(root=None):
                             'bytes': len(data)})
             n_parts += 1
 
-        try:
-            on_disk = sorted(
-                n for n in os.listdir(parts_dir)
-                if n.endswith('.py') and os.path.isfile(os.path.join(parts_dir, n)))
-        except OSError as e:
-            on_disk = []
-            pkg_problems.append(
-                f'cannot list {pkg_rel}/_parts: {type(e).__name__}: {e}')
+        on_disk = []
+        if can_read_parts:
+            try:
+                on_disk = sorted(
+                    n for n in os.listdir(parts_dir)
+                    if n.endswith('.py')
+                    and os.path.isfile(os.path.join(parts_dir, n)))
+            except OSError as e:
+                pkg_problems.append(
+                    f'cannot list {pkg_rel}/_parts: {type(e).__name__}: {e}')
         # If the declaration itself is unparseable, every fragment would look
         # unregistered; one root-cause problem is enough.
         if decl['parts'] is not None:
@@ -245,19 +359,9 @@ def split_registry_manifest(root=None):
         if hist is None:
             if not any('historical_path' in p for p in pkg_problems):
                 pkg_problems.append('missing or non-literal historical_path')
-        else:
-            # The historical entry point may be absent from a reconstructed
-            # tree (the single-file script was split years ago); the loader
-            # only uses it as __file__, so its VALUE is the identity.  It must
-            # still be a repo-relative path: an absolute or ../ entry would
-            # let the executed module resolve resources outside the checkout.
-            hist_posix = hist.replace('\\', '/')
-            if (os.path.isabs(hist)
-                    or hist_posix.startswith('../')
-                    or '/../' in hist_posix
-                    or hist_posix in ('..', '.')):
-                pkg_problems.append(
-                    f'historical_path is not a repo-relative path: {hist!r}')
+        elif not _split_hist_is_repo_relative(hist):
+            pkg_problems.append(
+                f'historical_path is not a repo-relative path: {hist!r}')
 
         pkg_blob = ''.join(
             f'{pkg_rel}\0{hist or ""}\0{e["order"]}\0{e["name"]}\0{e["sha256"]}\n'

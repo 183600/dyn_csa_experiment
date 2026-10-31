@@ -955,16 +955,27 @@ def _check_or_write_freeze_lock_locked(outdir, manifest, test_ids_fp, stage='acc
                        if isinstance(_locked_src, dict) else None)
         _cur_reg = _src.get('split_registry')
         _registry_changed = False
-        if isinstance(_locked_reg, dict) and _locked_reg.get('sha256'):
-            if not isinstance(_cur_reg, dict) or not _cur_reg.get('sha256'):
+        if _locked_reg is not None:
+            # Any present registry (including a malformed one or an empty
+            # object) is an identity claim.  It must be compared even when
+            # the legacy source-tree digest is absent; otherwise a lock could
+            # carry a registry but silently ignore a disagreement when only
+            # `source_tree.sha256` is missing.  A truly legacy lock has no
+            # key at all, which is still accepted.
+            if (not isinstance(_locked_reg, dict)
+                    or not isinstance(_locked_reg.get('sha256'), str)
+                    or not _locked_reg.get('sha256')):
                 _registry_changed = True
-            elif (_locked_reg.get('sha256') != _cur_reg.get('sha256')
+            elif (not isinstance(_cur_reg, dict)
+                  or not isinstance(_cur_reg.get('sha256'), str)
+                  or not _cur_reg.get('sha256')
+                  or _locked_reg.get('sha256') != _cur_reg.get('sha256')
                   or str(_locked_reg.get('status')) != str(_cur_reg.get('status'))):
                 _registry_changed = True
         _source_legacy = _locked_src_sha is None
         _source_changed = bool(
-            _locked_src_sha
-            and (_locked_src_sha != _src_sha or _registry_changed))
+            (_locked_src_sha and _locked_src_sha != _src_sha)
+            or _registry_changed)
         # Initialize the write flag here, BEFORE the disclosed-drift branch
         # can set it.  It used to be reset unconditionally after that branch,
         # which discarded the event just recorded and left the on-disk lock

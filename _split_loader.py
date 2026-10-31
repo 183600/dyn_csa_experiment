@@ -19,8 +19,59 @@ packages exist.
 
 from __future__ import annotations
 
+import ntpath
 import os
 from typing import Any, Iterable
+
+
+def _safe_fragment_path(package_dir: str, part: Any) -> str:
+    """Resolve one ``_PARTS`` entry and keep it inside the package.
+
+    The loader's job is to execute reviewed fragments, not arbitrary paths
+    that happen to be spelled in a list.  An absolute path, ``..`` entry,
+    Windows drive/UNC name, or a symlink escaping the package would execute
+    bytes the package's source tree never reviewed.  Registry audits reject
+    such declarations; rejecting them at the execution point as well means a
+    caller cannot bypass that check by invoking the loader directly.
+    """
+    if isinstance(part, os.PathLike):
+        part = os.fspath(part)
+    if not isinstance(part, str) or not part:
+        raise ValueError(f'load_parts: fragment entry must be a non-empty '
+                         f'string, got {part!r}')
+    if ('\x00' in part or part.startswith(('.', '/', '\\'))
+            or '/' in part or '\\' in part or not part.endswith('.py')):
+        raise ValueError(
+            f'load_parts: {part!r} is not a plain *.py basename inside the package')
+    try:
+        drive, _tail = ntpath.splitdrive(part)
+    except (TypeError, ValueError):
+        drive = ''
+    if drive or ntpath.isabs(part):
+        raise ValueError(
+            f'load_parts: {part!r} is an absolute/drive path, not a package fragment')
+    package_base = os.path.realpath(package_dir)
+    fragment_dir = os.path.join(package_dir, '_parts')
+    base = os.path.realpath(fragment_dir)
+    try:
+        fragment_inside = (os.path.commonpath([package_base, base])
+                           == package_base)
+    except (OSError, ValueError):
+        fragment_inside = False
+    if not fragment_inside:
+        raise ValueError(
+            f'load_parts: {fragment_dir!r} resolves outside the package; '
+            'the loader only executes fragments inside the package')
+    path = os.path.join(fragment_dir, part)
+    try:
+        inside = os.path.commonpath([base, os.path.realpath(path)]) == base
+    except (OSError, ValueError):
+        inside = False
+    if not inside:
+        raise ValueError(
+            f'load_parts: {part!r} resolves outside {fragment_dir!r}; '
+            'the loader only executes fragments inside the package')
+    return path
 
 
 def load_parts(namespace: dict[str, Any], package_dir: str,
@@ -34,9 +85,8 @@ def load_parts(namespace: dict[str, Any], package_dir: str,
     which preserves cross-fragment name lookup exactly as the historical
     single-file module did.
     """
-    fragment_dir = os.path.join(package_dir, '_parts')
     for part in parts:
-        path = os.path.join(fragment_dir, part)
+        path = _safe_fragment_path(package_dir, part)
         with open(path, encoding='utf-8') as fh:
             source = fh.read()
         exec(compile(source, path, 'exec'), namespace)
