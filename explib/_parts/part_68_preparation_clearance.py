@@ -628,13 +628,70 @@ def _prep_rehearsal_check(protocol, rehearsal):
     if not verdict:
         return _prep_fail(out, 'pre-run rehearsal did not pass'
                                + (f': {detail}' if detail else ''))
-    impl = ((protocol.get('analysis') or {}).get('implementation')
-            if isinstance(protocol.get('analysis'), dict) else {})
+    _analysis = (protocol.get('analysis')
+                 if isinstance(protocol.get('analysis'), dict) else {})
+    impl = (_analysis.get('implementation')
+            if isinstance(_analysis.get('implementation'), dict) else {})
     registered = _prep_text(impl.get('analysis_source_sha256'))
     declared = _prep_text(payload.get('analysis_source_sha256')) if isinstance(
         payload, dict) else None
     if registered and declared and registered != declared:
         _prep_fail(out, 'rehearsal was run against a different analysis closure')
+    # The plan rehearsal may carry a known-truth rehearsal of the decision
+    # path.  Only its identity is copied into the clearance (status, hashes,
+    # counts); the synthetic p-values stay in the rehearsal artifact, so a
+    # clearance still cannot be read as containing a test result.
+    _ar = payload.get('analysis_rehearsal') if isinstance(payload, dict) else None
+    if isinstance(_ar, dict):
+        try:
+            _arv = validate_analysis_rehearsal(_ar)  # noqa: F821
+        except Exception as exc:
+            _arv = {'status': 'fail',
+                    'problems': [f'{type(exc).__name__}: {exc}']}
+        out['analysis_rehearsal'] = {
+            'status': _arv.get('status'),
+            'content_sha256': _ar.get('content_sha256'),
+            'manifest_sha256': _ar.get('manifest_sha256'),
+            'n_scenarios': _ar.get('n_scenarios'),
+            'n_failures': _ar.get('n_failures'),
+            'synthetic': _ar.get('synthetic'),
+            'test_split_read': _ar.get('test_split_read'),
+        }
+        if _arv.get('status') != 'ok':
+            _prep_fail(
+                out, 'known-truth analysis rehearsal did not pass: '
+                     + '; '.join(str(x) for x in
+                                 (_arv.get('problems') or [])[:5]))
+        else:
+            _study = protocol.get('study') if isinstance(
+                protocol.get('study'), dict) else {}
+            _want = _prep_text(_study.get('manifest_sha256'))
+            _candidates = {
+                _prep_text(_ar.get(k)) for k in (
+                    'manifest_sha256', 'manifest_canonical_sha256',
+                    'manifest_raw_canonical_sha256')
+            }
+            _candidates.discard(None)
+            if _want and not _candidates:
+                _prep_fail(
+                    out, 'known-truth analysis rehearsal carries no manifest '
+                         'identity, so it cannot be tied to the registered '
+                         'frozen plan')
+            elif _want and _candidates and _want not in _candidates:
+                _prep_fail(
+                    out, 'known-truth analysis rehearsal names a different '
+                         'frozen manifest')
+    else:
+        out['analysis_rehearsal'] = {
+            'status': 'missing',
+            'note': ('the rehearsal payload carries no known-truth analysis '
+                     'rehearsal; run `python -m explib.confirmation plan` with '
+                     'the current code to bind it'),
+        }
+        # Backward compatibility: a legacy plan snapshot or a bare
+        # ``{'ok': true}`` rehearsal cannot be upgraded into the known-truth
+        # control.  Record the gap without turning an otherwise complete
+        # clearance red; ``confirmation plan`` now always embeds the artifact.
     return _prep_hash_into(out, 'rehearsal_sha256', rehearsal)
 
 

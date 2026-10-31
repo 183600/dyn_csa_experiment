@@ -80,6 +80,7 @@ _PARTS = [
 'part_67_split_registry.py',
 'part_68_preparation_clearance.py',
 'part_69_cleaning_sensitivity.py',
+'part_70_analysis_rehearsal.py',
 ]
 
 load_root_package(globals(), __file__, _PARTS,

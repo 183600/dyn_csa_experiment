@@ -12364,3 +12364,139 @@ material；fit 前缀不参与行序置换；同 seed
 门均 fail-closed；端到端 fixture 记录 `test_raw_read=false`、raw 同行数
 篡改判 fail、缺 raw/缺协议判 `not_verifiable`、缺或空的 sidecar 不冒充
 verified。完整 CPU 套件在本轮最终树通过。
+
+## 133. 每个统计函数都校准，不等于决策路径正确：已知真值的决策演练（本轮实验设计与准备硬化，no new runs）
+
+零 GPU；不新增训练、不读取 test split、不修改
+`confirmation_frozen*.json` 的字节/种子/端点/α/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未删除、未修改、未移动。
+
+### 133.1 问题：单元校准与准入检查之间仍有一段没有被执行的路径
+
+仓库已经分别验证了两件事：
+
+- **统计原语**：`calibration` 用合成数据检查 exact sign-flip 的 type-I、
+  区间覆盖与功效；`pvalues` 从落盘逐种子差重放 p 与 Holm；
+- **计划准入**：`confirmation plan` 用真实 arms/seeds/recipe/参数量构造
+  合成记录，验证 `_admit_confirmation_records` 能把 72/72 个 cell 收进
+  冻结 schema，并检查预算、证据等级、SESOI 与单因素声明。
+
+但这两层都没有回答一个更接近执行的问题：**把一组已经准入的逐种子记录
+变成冻结判定时，edition 之间的连接是否正确？** 这段路径包含四个容易
+静默出错的接口：
+
+1. `finaltest_stats` 把声明的 frozen family 传给 `holm_adjust`；若某个
+   comparison 被省略时没有保留 p=1 的族槽位，m 会缩小，剩余比较的
+   Holm p 被系统性放大显著性；
+2. `expected_sign` 从 manifest 进入 verdict 记录；若丢失，同一显著结果
+   会被读成 `significant_nondirectional`，永远不能 `supported`，也不
+   会被当成方向性反证；
+3. `n_effective` / `coverage_ok` / `min_seeds_for_confirmation` 的
+   gate 决定「p 很小」能否变成确认；若 gate 被绕过，n=7 的面板会被读成
+   和 n=12 一样；
+4. 显著反向必须进入 `refuted`，而不是「未确认」；若方向判断与 p 的
+   接口接反，反证会被静默吞掉。
+
+这些都是**集成错误**，不是统计原语错误：每个函数单独看都通过自己的
+单元测试，组合起来仍可能给出一个自信但错误的 verdict。等到 P5T 之后
+才发现，一次性 held-out 访问已经消耗。
+
+### 133.2 方法：把已知真值种进真实 frozen family
+
+新增 `explib/_parts/part_70_analysis_rehearsal.py`：
+
+- `build_analysis_rehearsal(manifest=None, manifest_path=None, ...)` 读取
+  冻结清单的**真实** `primary_comparisons`、`seeds`、`alpha`、
+  `min_seeds_for_confirmation`、`require_complete_coverage`，不另造一个
+  toy family；
+- 每个 scenario 构造逐种子配对差向量，依次调用与 `finaltest_stats`
+  相同的公共路径：`exact_signflip_p` → `holm_adjust`（显式声明的完整
+  族）→ `directional_claim_verdicts`（方向、n floor、coverage、
+  parameter/init gate）；
+- 六个 scenario：
+
+| scenario | 种下的真值 | 期望 |
+|---|---|---|
+| `null_balanced` | 正负号严格平衡、均值为 0 | 全部 `inconclusive`，不得 supported/refuted |
+| `forward_effect` | 每个比较在预注册方向上同号 | 方向性比较 `supported`；无方向比较 `significant_nondirectional` |
+| `reverse_effect` | 与预注册方向完全相反 | 方向性比较 `refuted`，不得 `supported` |
+| `underpowered` | 效应存在，但 n 低于 `min_n` 且 coverage 不完整 | 全部 `inconclusive`，且必须点名 gate failure |
+| `family_correction` | 一个强效应 + 一个 raw p 显著但 Holm 不显著的中 rank 效应 | 只有强效应 `supported`；中 rank 效应 `inconclusive`；`m_effective` 不得缩小 |
+| `omitted_comparison` | 一个 frozen 比较被显式省略 | 该比较 `not_testable`，且仍占族槽位；其余为 `inconclusive` |
+
+- `family_correction` 的对照对不是写死的。`_ar_marginal_bad` 在离散的
+  exact sign-flip p 上搜索「raw p < α 且 `(m-1)*p >= α`」的少数派个数；
+  当当前 n/α/m 下不存在这样的构造时，该 scenario 明确不加入，而不是
+  伪造一个永远通过的检查。两槽族（m=2）没有「raw 显著、Holm 不显著」的
+  中 rank 成员，因此自动省略；
+- 每个 scenario 记录 `expected_verdicts`、`observed_verdicts`、
+  `records`（含 synthetic p）、`checks` 与 `ok`；`status=ok` 只有在
+  **每个 scenario 的每个 check 都通过**时才成立；
+- 产物固定 `synthetic=true`、`test_split_read=false`，并把 `content_sha256`
+  绑定到正文（排除 `created_at`/revision 元数据）；`validate_analysis_rehearsal`
+  重算哈希、拒绝 `synthetic!=true` / `test_split_read!=false`，并把
+  `manifest_canonical_sha256` 与当前清单对账（对 `_load_manifest` 附加的
+  `_path`/`manifest_sha256` 做归一化，避免把同一文件的加载形态差异误判为
+  不同清单）。
+
+这是一份**执行前控制**，不是新的统计检验：所有 p 都来自合成向量，
+没有一行真实测量；它不产生 PPL、不进入真实 Holm 族、不改变
+`verified`/`confirmed`。
+
+### 133.3 判据与边界
+
+- `status=ok` 只表示「在这份 frozen family 上，决策接线对六类已知真值
+  给出了预期答案」；`status=fail` 表示在 P5T 之前必须修代码/清单，不能
+  带着未验证的决策路径去消耗 held-out 访问。
+- 它**不能**证明分析一定正确：一个同时绕过所有 scenario 的实现仍可能
+  出错；它也不是功效计算、不是复现、不是对模型效应的证据。
+- 它不替代 `confirmation plan` 的准入（记录 schema、recipe、参数匹配、
+  预算/证据等级）、不替代 `calibration` 的 type-I/覆盖校准、不替代
+  `pvalues` 的落盘重放与结果层审计。它只补「原语 → 判定」这一段集成。
+- `manifest_sha256` 缺失/不可读时是 `not_verifiable`，不冒充通过；清单
+  被替换时 binding fail，即使 rehearsal 正文哈希仍然自洽。
+- 不读取 test、不新增训练；`content_sha256` 不是签名，能同时改写代码和
+  重算哈希的人仍可伪造。
+
+### 133.4 接线
+
+```bash
+make rehearsal
+python audit_gates.py analysis_rehearsal
+python audit_gates.py analysis_rehearsal analysis_v12/analysis_rehearsal.json
+python -m explib.confirmation plan     # plan_check 内嵌同一份 rehearsal
+```
+
+- `python -m explib.confirmation plan` 在准入检查之后、写
+  `plan_snapshot.json` 之前运行 `build_analysis_rehearsal`；非 ok 时把
+  `failures` 并入 `plan_check` 的 `errors`，`plan` 直接拒绝，snapshot 的
+  `plan.analysis_rehearsal` 因此是「计划批准时决策路径也通过」的持久记录。
+- `audit_gates.py analysis_rehearsal` 的别名包括
+  `decision_rehearsal` / `known_truth_rehearsal` / `rehearsal`；无参数时
+  优先审计 `analysis_v12/analysis_rehearsal.json` 或
+  `analysis_rehearsal.json`，没有落盘产物则对当前清单**现场运行**（零
+  GPU）。`audit_gates.py report` 顶层新增 `analysis_rehearsal` 块。
+- `preparation_clearance` 的 `rehearsal` 检查在 payload 带有
+  `analysis_rehearsal` 时，只把它的 `status`/`content_sha256`/
+  `manifest_sha256`/scenario 计数复制进 clearance（**不复制 synthetic
+  p 值**），并要求 `status=ok`、清单哈希与 `study.manifest_sha256` 一致；
+  旧式 `{'ok': true}` payload 仍按原行为通过，但会在
+  `checks.rehearsal.analysis_rehearsal.status` 记为 `missing`，不会被
+  静默升级成已演练。
+- `write_analysis_rehearsal` 原子写、同内容 no-op、不同内容默认
+  `conflict=true` 不覆盖；只有显式 `overwrite=True` 才替换（它是本地
+  演练产物，不是预注册，因此不复用 protocol/clearance 的 revision 链）。
+
+### 133.5 验证
+
+新增 `test_review_part_74.py` 9 项：真实冻结族的六个 scenario 全通过、
+校验器与 live gate 均为 ok；`confirmation plan` 的 report/snapshot 内嵌
+rehearsal 并出现在 notes；把 `exact_signflip_p` 改成永远 p=0 时 null
+scenario 被拒绝；把 `holm_adjust` 改成不校正时 family scenario 与
+`m_effective` 检查同时失败；`synthetic`/`test_split_read`/`status`/
+`n_failures`/scenario tamper 与 manifest mismatch 分别 fail；toy family
+在 m=2 或 α 过大时明确省略 family scenario 而其余通过，缺失清单为
+`not_verifiable`；writer 的同内容 no-op、冲突不覆盖、显式覆盖后才替换，
+以及 snapshot 内嵌 artifact 的 ok/tamper/missing 状态；clearance 只复制
+rehearsal 身份而不复制 p 值、失败 rehearsal 与错清单 fail、legacy payload
+记 missing；`run_report` 顶层接线存在。完整 CPU 套件在本轮最终树通过。

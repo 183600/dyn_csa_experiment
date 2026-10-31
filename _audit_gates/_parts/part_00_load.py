@@ -306,6 +306,14 @@
                记录晚于执行判 reconstruction；缺文件报 not_verifiable。
                不新增检验/p 值/Holm 槽位，也不改冻结判定（零 GPU；别名
                preparation / clearance / launch_clearance / readiness）
+  analysis_rehearsal  已知真值的决策演练：把 null、同向效应、反向效应、
+               低于 n floor、raw 显著但 Holm 不显著、显式省略六类合成
+               逐种子差种进真实冻结比较族，依次跑 exact sign-flip、
+               声明族 Holm 与三向 verdict/coverage/n-floor gate；每个
+               scenario 的期望 verdict 都由种下的真值事先给出。产物标记
+               synthetic=true / test_split_read=false，不新增真实检验、
+               不读 test、不改冻结 p/Holm/判定（零 GPU；别名
+               decision_rehearsal / known_truth_rehearsal / rehearsal）
   evaluation_order  最终测试评估顺序 / 测量时间混杂：检查 P5T 在读取 test
                前写下的 clean_by_length_order.json / distractor_probe_order.json
                是否为完整区组、位置平衡、覆盖全部 (arm, seed)，并复核

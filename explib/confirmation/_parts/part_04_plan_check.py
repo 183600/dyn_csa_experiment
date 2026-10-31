@@ -253,11 +253,36 @@ def plan_check(manifest_path=FREEZE_MANIFEST):
         _psd = {'kind': 'confirmation_sesoi_design_audit', 'status': 'not_estimable',
                 'problems': [f'{type(_pse).__name__}: {_pse}']}
         notes.append(f'practical significance: design audit unavailable ({_pse})')
+    # ---- known-truth rehearsal of the decision path ------------------------
+    # Admission proves the synthetic cells can enter the frozen schema; it
+    # does not prove that the code turning those cells into a verdict returns
+    # the right answer.  Plant known effects into the SAME declared family
+    # before any training or test access.
+    _ar = {}
+    try:
+        _ar = L.build_analysis_rehearsal(m, manifest_path=manifest_path)
+        if _ar.get('status') != 'ok':
+            _ar_fail = list(_ar.get('failures') or [])
+            if not _ar_fail:
+                _ar_fail = [f"analysis rehearsal status is {_ar.get('status')!r}"]
+            errs.extend(f'analysis rehearsal: {x}' for x in _ar_fail)
+        else:
+            notes.append(
+                f"analysis rehearsal: {_ar.get('n_scenarios')} known-truth "
+                f"scenarios / {_ar.get('n_checks')} checks passed")
+    except Exception as _are:
+        _ar = {'kind': 'analysis_rehearsal', 'status': 'not_verifiable',
+               'failures': [f'{type(_are).__name__}: {_are}']}
+        errs.append(
+            'analysis rehearsal could not run '
+            f'({type(_are).__name__}: {_are}); the decision path is not '
+            'verified for a confirmatory read')
     report = {'ok': not errs, 'manifest': manifest_path, 'manifest_sha256': m.get('manifest_sha256'),
               'code_semantics': L.CODE_SEMANTICS, 'n_arms': len(arms), 'n_seeds': len(seeds),
               'n_min_for_confirmation': _n_min, 'min_attainable_p_holm': _min_holm,
               'predicted': _pred, 'admitted': len(admitted), 'comparisons': _comp_report,
               'design_preflight': _design,
+              'analysis_rehearsal': _ar,
               'errors': errs, 'notes': notes,
               'practical_significance_design': _psd}
     if errs:
