@@ -78,15 +78,26 @@ def _replay_nonempty(rows, *, name):
 
 
 def _replay_check_rows(rows, *, name):
-    """Type-check every raw row without dropping blanks (order must be exact)."""
+    """Materialise and type-check the raw rows without dropping blanks.
+
+    A single string is one malformed row source, not an iterable of one-row
+    strings: accepting it would silently replay its characters as documents.
+    Returning the materialised list also keeps a one-shot iterator usable for
+    the later replay step instead of consuming it during validation.
+    """
     if isinstance(rows, (str, bytes)):
         raise TypeError(
             f'{name} must be an iterable of rows, not a single string')
-    for i, row in enumerate(rows):
+    try:
+        seq = list(rows)
+    except TypeError:
+        raise TypeError(
+            f'{name} must be an iterable of strings, got {type(rows).__name__}') from None
+    for i, row in enumerate(seq):
         if not isinstance(row, str):
             raise TypeError(
                 f'{name}[{i}] must be a string, got {type(row).__name__}')
-    return rows
+    return seq
 
 
 def _replay_id_array(values, *, name, problems):
@@ -122,6 +133,43 @@ def _replay_protocol(meta, *, name, problems):
     if bad:
         problems.append(f'{name} dedup protocol is invalid: ' + '; '.join(bad))
         return None
+    # `protocol_fp` and the flat geometry fields are redundant copies of the
+    # protocol object.  Cache validation compares them, but the replay used to
+    # hash the object and ignore the recorded copies, so a cache could claim
+    # one cleaning identity while its editable metadata pointed at another.
+    # Keep replaying the validated object (the membership check is still
+    # meaningful), but report the inconsistency as a hard failure.
+    block = None
+    if isinstance(meta, dict):
+        for key in ('dedup', 'near_duplicate_cleanup'):
+            candidate = meta.get(key)
+            if (isinstance(candidate, dict)
+                    and isinstance(candidate.get('protocol'), dict)):
+                block = candidate
+                break
+    computed = dedup_protocol_fp(protocol)
+    if block is not None:
+        recorded_fp = block.get('protocol_fp')
+        if recorded_fp is not None:
+            if not isinstance(recorded_fp, str) or recorded_fp != computed:
+                problems.append(
+                    f'{name} records protocol_fp={recorded_fp!r} but the stored '
+                    f'protocol hashes to {computed[:16]}…; the metadata is '
+                    'internally inconsistent')
+        for key in ('near_hamming_threshold', 'bands', 'shingle_words',
+                    'max_shingles'):
+            if key not in block:
+                continue
+            value = block.get(key)
+            if (isinstance(value, (bool, np.bool_))
+                    or not isinstance(value, numbers.Integral)):
+                problems.append(
+                    f'{name} {key}={value!r} is not an exact integer; the '
+                    'redundant protocol field is unverifiable')
+            elif int(value) != int(protocol[key]):
+                problems.append(
+                    f'{name} {key}={int(value)} disagrees with the stored '
+                    f'protocol ({int(protocol[key])})')
     return protocol
 
 
@@ -270,7 +318,8 @@ def replay_train_validation_cleanup(train_rows, validation_rows, *, train_meta,
         return out
     out['protocol_fp'] = dedup_protocol_fp(protocol)
     fit_rows = _replay_count(train_meta.get('tokenizer_fit_rows'),
-                             name='tokenizer_fit_rows', problems=problems)
+                             name='tokenizer_fit_rows', problems=problems,
+                             minimum=1)
     train_block = _replay_sampling_block(train_meta, split='train', problems=problems)
     val_block = _replay_sampling_block(train_meta, split='validation', problems=problems)
     if fit_rows is None or train_block is None or val_block is None:
@@ -286,13 +335,19 @@ def replay_train_validation_cleanup(train_rows, validation_rows, *, train_meta,
         out['status'] = 'not_verifiable'
         return out
     out['fit_rows'] = int(fit_rows)
-    if max_rows and int(train_scanned) > int(max_rows):
-        problems.append(
-            f'train replay would hash {train_scanned} rows, above the '
-            f'max_rows={int(max_rows)} guard; rerun explicitly with a larger '
-            'max_rows to certify this cache')
-        out['status'] = 'not_verifiable'
-        return out
+    if max_rows:
+        over_guard = [
+            (label, count) for label, count in
+            (('train', train_scanned), ('validation', val_scanned))
+            if int(count) > int(max_rows)]
+        if over_guard:
+            problems.extend(
+                f'{label} replay would hash {count} rows, above the '
+                f'max_rows={int(max_rows)} guard; rerun explicitly with a '
+                'larger max_rows to certify this cache'
+                for label, count in over_guard)
+            out['status'] = 'not_verifiable'
+            return out
     try:
         train_ne, train_total = _replay_nonempty(train_rows, name='train_rows')
         val_ne, val_total = _replay_nonempty(validation_rows, name='validation_rows')
@@ -317,6 +372,13 @@ def replay_train_validation_cleanup(train_rows, validation_rows, *, train_meta,
                 f'{_split}: raw source has {_total} rows but the cache records '
                 f'source_rows={expected_rows}; refusing to replay a different dump')
     if any('refusing to replay a different dump' in p for p in problems):
+        out['status'] = 'fail'
+        return out
+    if int(fit_rows) > len(train_ne):
+        problems.append(
+            f'train: tokenizer_fit_rows={fit_rows} exceeds the '
+            f'{len(train_ne)} non-empty rows in the raw source; the recorded '
+            'fit prefix cannot be the one this dump contains')
         out['status'] = 'fail'
         return out
     if len(train_ne) < int(train_scanned):
@@ -457,18 +519,28 @@ def replay_heldout_cleanup(train_rows, validation_rows, test_rows, *, test_meta,
     try:
         train_ne, _train_total = _replay_nonempty(train_rows, name='train_rows')
         val_ne, _val_total = _replay_nonempty(validation_rows, name='validation_rows')
-        test_seq = _replay_check_rows(list(test_rows), name='test_rows')
+        test_seq = _replay_check_rows(test_rows, name='test_rows')
     except TypeError as exc:
         problems.append(str(exc))
         out['status'] = 'fail'
         return out
-    if max_rows and len(train_ne) > int(max_rows):
-        problems.append(
-            f'test replay needs the full raw train split ({len(train_ne)} rows), '
-            f'above the max_rows={int(max_rows)} guard; rerun explicitly with a '
-            'larger max_rows to certify this cache')
-        out['status'] = 'not_verifiable'
-        return out
+    # The held-out replay indexes the full train and validation sources plus
+    # the full test source, so the row guard must cover all three.  Checking
+    # only the train split let a large validation/test dump bypass the budget.
+    if max_rows:
+        over_guard = [
+            (label, count) for label, count in
+            (('train', len(train_ne)), ('validation', len(val_ne)),
+             ('test', len(test_seq)))
+            if int(count) > int(max_rows)]
+        if over_guard:
+            problems.extend(
+                f'test replay would index {count} {label} rows, above the '
+                f'max_rows={int(max_rows)} guard; rerun explicitly with a '
+                'larger max_rows to certify this cache'
+                for label, count in over_guard)
+            out['status'] = 'not_verifiable'
+            return out
     expected_rows = _replay_count(sampling.get('source_rows'),
                                   name='sampling.test.source_rows',
                                   problems=problems, allow_none=True)
@@ -775,17 +847,28 @@ def replay_wikitext_cleaning(cache_dir=None, raw_dir=None, *,
                        if isinstance(meta.get('sampling'), dict) else {})
     _train_probe = (_sampling_probe.get('train')
                     if isinstance(_sampling_probe.get('train'), dict) else {})
+    _val_probe = (_sampling_probe.get('validation')
+                  if isinstance(_sampling_probe.get('validation'), dict) else {})
     _train_scanned_probe = _replay_count(
         _train_probe.get('nonempty_rows_scanned'),
         name='sampling.train.nonempty_rows_scanned',
         problems=_scan_problems, allow_none=True)
-    if (max_rows and _train_scanned_probe is not None
-            and int(_train_scanned_probe) > int(max_rows)):
-        problems.append(
-            f'train replay would hash {_train_scanned_probe} rows, above the '
-            f'max_rows={int(max_rows)} guard; set CSA_REPLAY_MAX_ROWS to a '
-            'larger value (0 disables the guard) to certify this cache')
-        return out
+    _val_scanned_probe = _replay_count(
+        _val_probe.get('nonempty_rows_scanned'),
+        name='sampling.validation.nonempty_rows_scanned',
+        problems=_scan_problems, allow_none=True)
+    if max_rows:
+        _over_guard = [
+            (label, count) for label, count in
+            (('train', _train_scanned_probe), ('validation', _val_scanned_probe))
+            if count is not None and int(count) > int(max_rows)]
+        if _over_guard:
+            problems.extend(
+                f'{label} replay would hash {count} rows, above the '
+                f'max_rows={int(max_rows)} guard; set CSA_REPLAY_MAX_ROWS to a '
+                'larger value (0 disables the guard) to certify this cache'
+                for label, count in _over_guard)
+            return out
     try:
         train_rows = _read_raw_rows(os.path.join(resolved_raw, 'wiki.train.raw'))
         val_rows = _read_raw_rows(os.path.join(resolved_raw, 'wiki.valid.raw'))

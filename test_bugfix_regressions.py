@@ -37,7 +37,14 @@ Each test pins one concrete defect found by inspection:
   differently by storage dtype and payload alone;
 * the exact training-exposure replay buffered one array per step before
   concatenating, so with ``batch_size=1`` the draw cap did not bound memory
-  (a permitted 20M-draw replay could hold 20M tiny ndarrays).
+  (a permitted 20M-draw replay could hold 20M tiny ndarrays);
+* the cleaning replay's ``max_rows`` guard checked only the train scan, so a
+  large validation/test source bypassed the budget;
+* the held-out cleaning replay accepted a single string as its test row
+  sequence and silently replayed its characters as documents;
+* the cleaning replay ignored a stale ``protocol_fp``/flat geometry field and
+  accepted a fit-prefix length larger than the raw train source, so internally
+  inconsistent cache metadata could still be certified.
 
 These are CPU-only, zero-experiment checks.
 """
@@ -977,3 +984,123 @@ def test_plot_tolerates_a_sparse_aggregate(tmp_path):
                     'params': None, '_group_records': []}}
     L._plot({}, agg, str(tmp_path))
     assert os.path.exists(os.path.join(str(tmp_path), 'summary.png'))
+
+
+def test_cleaning_replay_checks_the_row_guard_on_every_split():
+    from test_review_part_62 import _build_reference, _build_test_reference
+    train_rows = ['alpha beta gamma']
+    val_rows = [' '.join('v%d' % i for i in range(50)),
+                'q r s', 't u v']
+    meta, train_ids, val_ids = _build_reference(
+        train_rows, val_rows, fit_rows=1)
+    assert meta['sampling']['validation']['nonempty_rows_scanned'] == 3
+    rep = L.replay_train_validation_cleanup(
+        train_rows, val_rows, train_meta=meta,
+        train_doc_ids=train_ids, validation_doc_ids=val_ids, max_rows=1)
+    assert rep['status'] == 'not_verifiable', rep
+    assert any('validation replay would hash' in p for p in rep['problems']), rep
+
+    test_rows = [' '.join('t%d' % i for i in range(50)),
+                 'u v w', 'x y z']
+    test_meta, test_ids = _build_test_reference(
+        train_rows, val_rows, test_rows)
+    rep2 = L.replay_heldout_cleanup(
+        train_rows, val_rows, test_rows, test_meta=test_meta,
+        test_doc_ids=test_ids, max_rows=1)
+    assert rep2['status'] == 'not_verifiable', rep2
+    assert any('validation' in p and 'max_rows' in p
+               for p in rep2['problems']), rep2
+
+
+def test_cleaning_replay_rejects_a_single_string_test_source():
+    from test_review_part_62 import _build_test_reference
+    train_rows = ['a b c', 'd e f']
+    val_rows = ['g h i']
+    test_rows = ['x', 'y', 'z']
+    test_meta, test_ids = _build_test_reference(
+        train_rows, val_rows, test_rows)
+    rep = L.replay_heldout_cleanup(
+        train_rows, val_rows, 'xyz', test_meta=test_meta,
+        test_doc_ids=test_ids)
+    assert rep['status'] == 'fail', rep
+    assert any('single string' in p for p in rep['problems']), rep
+
+
+def test_cleaning_replay_rejects_a_stale_protocol_fingerprint():
+    from test_review_part_62 import _build_reference, _build_test_reference
+    train_rows = ['a b c', 'd e f', 'g h i']
+    val_rows = ['j k l']
+    meta, train_ids, val_ids = _build_reference(
+        train_rows, val_rows, fit_rows=1)
+    tampered = json.loads(json.dumps(meta))
+    tampered['dedup']['protocol_fp'] = '0' * 64
+    rep = L.replay_train_validation_cleanup(
+        train_rows, val_rows, train_meta=tampered,
+        train_doc_ids=train_ids, validation_doc_ids=val_ids)
+    assert rep['status'] == 'fail', rep
+    assert any('protocol_fp' in p for p in rep['problems']), rep
+
+    test_rows = ['m n o', 'p q r']
+    test_meta, test_ids = _build_test_reference(
+        train_rows, val_rows, test_rows)
+    bad_test = json.loads(json.dumps(test_meta))
+    bad_test['near_duplicate_cleanup']['protocol_fp'] = '1' * 64
+    rep2 = L.replay_heldout_cleanup(
+        train_rows, val_rows, test_rows, test_meta=bad_test,
+        test_doc_ids=test_ids)
+    assert rep2['status'] == 'fail', rep2
+    assert any('protocol_fp' in p for p in rep2['problems']), rep2
+
+
+def test_file_cleaning_replay_guards_validation_before_reading_raw():
+    from test_review_part_62 import _write_cache
+    with tempfile.TemporaryDirectory() as td:
+        cache = os.path.join(td, 'cache')
+        raw = os.path.join(td, 'raw')
+        os.makedirs(cache)
+        os.makedirs(raw)
+        _write_cache(cache, raw)
+        meta_path = os.path.join(cache, 'meta_v5_sl64.json')
+        with open(meta_path, encoding='utf-8') as fh:
+            meta = json.load(fh)
+        # Keep the train stream under the guard but make validation exceed it.
+        meta['sampling']['train']['nonempty_rows_scanned'] = 1
+        meta['sampling']['validation']['nonempty_rows_scanned'] = 2
+        with open(meta_path, 'w', encoding='utf-8') as fh:
+            json.dump(meta, fh)
+        original = L._read_raw_rows
+        def _boom(_path):
+            raise AssertionError('the validation guard must reject before reading')
+        L._read_raw_rows = _boom
+        try:
+            out = L.replay_wikitext_cleaning(
+                cache_dir=cache, raw_dir=raw, max_rows=1)
+        finally:
+            L._read_raw_rows = original
+        assert out['status'] == 'not_verifiable', out
+        assert any('validation replay would hash' in p
+                   for p in out['problems']), out
+
+
+def test_cleaning_replay_rejects_a_fit_prefix_larger_than_the_raw_source():
+    from test_review_part_62 import _build_reference
+    train_rows = ['a b c', 'd e f', 'g h i']
+    val_rows = ['j k l']
+    meta, train_ids, val_ids = _build_reference(
+        train_rows, val_rows, fit_rows=1)
+    tampered = json.loads(json.dumps(meta))
+    # Every row is force-kept with this count, so the kept-id prefix alone still
+    # matches.  Only the impossible fit length distinguishes the metadata.
+    tampered['tokenizer_fit_rows'] = 10
+    rep = L.replay_train_validation_cleanup(
+        train_rows, val_rows, train_meta=tampered,
+        train_doc_ids=train_ids, validation_doc_ids=val_ids)
+    assert rep['status'] == 'fail', rep
+    assert any('tokenizer_fit_rows' in p for p in rep['problems']), rep
+
+    zero = json.loads(json.dumps(meta))
+    zero['tokenizer_fit_rows'] = 0
+    rep2 = L.replay_train_validation_cleanup(
+        train_rows, val_rows, train_meta=zero,
+        train_doc_ids=train_ids, validation_doc_ids=val_ids)
+    assert rep2['status'] == 'not_verifiable', rep2
