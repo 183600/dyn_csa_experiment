@@ -132,10 +132,12 @@ def _al_components(value):
             value, (list, tuple)):
         raise ValueError('components must be a list/tuple of names')
     out = []
+    seen = set()
     for i, item in enumerate(value):
         name = _al_component(item, where=f'components[{i}]')
-        if name in out:
+        if name in seen:
             raise ValueError(f'components: duplicate component {name!r}')
+        seen.add(name)
         out.append(name)
     if not out:
         raise ValueError('components must not be empty')
@@ -851,8 +853,18 @@ def _al_equiv(a, b, *, tol=1e-9):
     if isinstance(a, bool) or isinstance(b, bool):
         return a is b
     if isinstance(a, (int, float)) and isinstance(b, (int, float)):
-        return abs(float(a) - float(b)) <= tol * max(
-            1.0, abs(float(a)), abs(float(b)))
+        try:
+            fa, fb = float(a), float(b)
+        except (OverflowError, ValueError):
+            # A hostile artifact can carry an integer with more than ~309
+            # decimal digits.  Converting it to float raises OverflowError;
+            # such a value cannot equal the finite replay result, but it also
+            # must not abort the validator.  Python's mixed int/float equality
+            # is exact and safe for operands outside the float range.
+            return a == b
+        if not (_al_math.isfinite(fa) and _al_math.isfinite(fb)):
+            return a == b
+        return abs(fa - fb) <= tol * max(1.0, abs(fa), abs(fb))
     if isinstance(a, dict) and isinstance(b, dict):
         if set(a) != set(b):
             return False
