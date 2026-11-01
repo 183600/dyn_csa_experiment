@@ -353,6 +353,57 @@ def plan_check(manifest_path=FREEZE_MANIFEST):
             'design estimability could not run '
             f'({type(_dee).__name__}: {_dee}); the declared contrast may not '
             'be identified by the planned cells')
+    # ---- Type S / Type M sign-and-magnitude risk --------------------------
+    # Power answers whether the panel can reject; it does not say how often a
+    # rejection would carry the wrong sign or how much the magnitude would be
+    # exaggerated.  A validation pilot makes the block computable; without
+    # one it is explicitly not-verifiable, not green.  A manifest that
+    # declares statistics.type_sm.require=true makes a missing/missed
+    # threshold a launch error.
+    _ts = {}
+    try:
+        _ts_pilot = None
+        _ts_path = os.path.join(REPO, 'analysis_v12', 'power_validation.json')
+        if os.path.exists(_ts_path):
+            try:
+                with open(_ts_path, encoding='utf-8') as _tsf:
+                    _ts_pilot = json.load(_tsf)
+            except Exception as _tse:
+                notes.append(
+                    'type S/M: the validation power pilot is unreadable '
+                    f'({type(_tse).__name__}: {_tse}); the sign/magnitude '
+                    'risk is not verifiable')
+        _ts = L.type_sm_from_manifest(m, _ts_pilot)
+        _ts_status = _ts.get('status')
+        if _ts_status == 'fail':
+            _ts_bad = list(_ts.get('violations') or [])
+            if not _ts_bad:
+                _ts_bad = list(_ts.get('problems') or [])
+            errs.extend(f'type S/M: {x}' for x in _ts_bad)
+        elif _ts_status == 'not_verifiable':
+            notes.append(
+                'type S/M: no validation pilot is available before launch; '
+                'the conditional wrong-sign and exaggeration risk is not '
+                'verifiable (this is a planning gap, not a null result)')
+        else:
+            _ts_ok = sum(1 for _c in (_ts.get('comparisons') or {}).values()
+                         if isinstance(_c, dict)
+                         and _c.get('status') == 'ok')
+            _ts_n = len(_ts.get('comparisons') or {})
+            notes.append(
+                f'type S/M: {_ts_ok}/{_ts_n} comparisons meet the declared '
+                f"sign/magnitude thresholds (Status={_ts_status}); Type S is "
+                'P(wrong sign | significant), Type M is E[|estimate| | '
+                'significant]/|assumed effect|')
+            notes.extend(f'type S/M: {w}'
+                         for w in (_ts.get('warnings') or []))
+    except Exception as _tse:
+        _ts = {'kind': 'type_sm_audit', 'status': 'not_verifiable',
+               'problems': [f'{type(_tse).__name__}: {_tse}']}
+        notes.append(
+            'type S/M could not run '
+            f'({type(_tse).__name__}: {_tse}); the conditional sign and '
+            'magnitude risk is unverified')
     report = {'ok': not errs, 'manifest': manifest_path, 'manifest_sha256': m.get('manifest_sha256'),
               'code_semantics': L.CODE_SEMANTICS, 'n_arms': len(arms), 'n_seeds': len(seeds),
               'n_min_for_confirmation': _n_min, 'min_attainable_p_holm': _min_holm,
@@ -361,6 +412,7 @@ def plan_check(manifest_path=FREEZE_MANIFEST):
               'analysis_rehearsal': _ar,
               'budget_truncation': _bt,
               'design_estimability': _de,
+              'type_sm': _ts,
               'errors': errs, 'notes': notes,
               'practical_significance_design': _psd}
     if errs:

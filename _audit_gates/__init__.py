@@ -30,6 +30,7 @@ _PARTS = [
 'part_39_ablation_lattice.py',
 'part_40_design_estimability.py',
 'part_41_audit_distribution_free.py',
+'part_42_audit_type_sm.py',
 'part_05_audit_confirmation_verdicts.py',
 'part_08_audit_missingness.py',
 'part_09_audit_trajectory.py',

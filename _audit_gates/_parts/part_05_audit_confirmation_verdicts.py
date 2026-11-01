@@ -1985,6 +1985,7 @@ def run_report(out='audit_report.json'):
     res['ablation_lattice'] = audit_ablation_lattice()
     res['design_estimability'] = audit_design_estimability(verbose=False)
     res['distribution_free_prediction'] = audit_distribution_free_prediction()
+    res['type_sm'] = audit_type_sm(verbose=False)
     res['data_exposure'] = audit_data_exposure()
     if str(os.environ.get('CSA_REPLAY_IN_REPORT', '')).strip().lower() in (
             '1', 'true', 'yes', 'on'):
@@ -2078,6 +2079,15 @@ def _run_cli():
                   'conformal': audit_distribution_free_prediction,
                   'conformal_prediction': audit_distribution_free_prediction,
                   'new_seed_prediction': audit_distribution_free_prediction})
+    _cmds.update({'type_sm': audit_type_sm,
+                  'type_sm_design': audit_type_sm,
+                  'sign_magnitude_error': audit_type_sm,
+                  'sign_magnitude': audit_type_sm,
+                  'design_type_sm': audit_type_sm,
+                  'exaggeration': audit_type_sm})
+    _cmds.update({'type_sm_artifact': audit_type_sm_artifact,
+                  'type_sm_replay': audit_type_sm_artifact,
+                  'type_sm_validation': audit_type_sm_artifact})
     _arg = sys.argv[1] if len(sys.argv) > 1 else 'report'
     if _arg in ('-h', '--help'):
         print(__doc__)
@@ -2139,7 +2149,10 @@ def _run_cli():
                 'design_estimability', 'estimability', 'design_rank',
                 'identifiability', 'contrast_estimability', 'design_matrix',
                 'distribution_free_prediction', 'distribution_free',
-                'conformal', 'conformal_prediction', 'new_seed_prediction'):
+                'conformal', 'conformal_prediction', 'new_seed_prediction',
+                'type_sm', 'type_sm_design', 'sign_magnitude_error',
+                'sign_magnitude', 'design_type_sm', 'exaggeration',
+                'type_sm_artifact', 'type_sm_replay', 'type_sm_validation'):
         _r = _cmds[_arg](*_pos)
     elif _arg in ('test_access', 'test_access_audit', 'heldout', 'test_looks',
                   'environment_identity', 'environment', 'env_drift',

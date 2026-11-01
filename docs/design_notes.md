@@ -13291,3 +13291,197 @@ n=39 的 `[min,max]` 恰好 95%；n=79 的 `j=2` 中心截尾；99% 需要 199�
 非有限输入拒绝；审计门对合法/篡改/夹带冻结字段/缺产物/不可用产物的
 `ok`/`fail`/`fail`/`not_verifiable_locally`/`not_applicable` 行为。
 完整 CPU 套件在本轮最终树通过。
+
+## 140. 显著不等于方向正确、幅度可信：设计期 Type S / Type M 读数（本轮实验设计与准备硬化，no new runs）
+
+零 GPU；不新增训练、不读取 test split、不修改
+`confirmation_frozen*.json` 的字节/臂/种子/端点/α/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未删除、未修改、未移动。
+
+### 140.1 问题：功效回答「能不能拒绝」，不回答「拒绝读成什么」
+
+仓库已有三层设计期读数：冻结族的精确分辨率下限（§21/§27）、
+`q` 处符号检验投影功效（§68）、以及 SESOI 处的 MDE/精度与
+attrition-adjusted power（§68/§74/§91）。它们都在回答同一个问题的不同
+侧面：**这个面板能不能在预注册方向上拒绝零假设？**
+
+但确认性结论不是只由「p 小」构成。最终报告要写「方法 A 比 B 低 x%」。
+当真实效应接近探测边缘、n 又只有 12 时，条件在一个显著结果上：
+
+- 估计量的**符号**可能和真实效应相反（Type S）；
+- 即使符号正确，估计量的**幅度**也会系统性地被放大（Type M /
+  winner's curse 的设计期版本）。
+
+这两个量不是事后从数据算出来的，而是**由设计参数 n、σ、α、族大小和
+假定的真实效应在开跑前决定**。仓库的 `winner_curse`（§104）是观测到
+最优臂之后的 bootstrap 校正，`effect_sensitivity`（§105）是同一批
+种子的尺度敏感性；它们都不能替代「在还没有数据时，这个 n 对
+SESOI 大小的效应会给出多可信的显著结果」这一准备判断。§68 的 MDE
+告诉我们「能分辨多大」，Type S/M 告诉我们「一旦分辨出来，读数有
+多偏」。
+
+### 140.2 方法：两样本正态位置模型下的 Gelman–Carlin 读数
+
+新增 `explib/_parts/part_76_type_sm_design.py`。对单条对照，令配对差
+`X ~ N(δ, σ²/n)`，`SE=σ/√n`，标准化 `Z=(X-0)/SE ~ N(λ,1)`，
+`λ=|δ|/SE`。双侧拒绝域是 `|Z|>z`，其中 `z` 默认取
+`Φ^{-1}(1-α/(2m))`（Bonferroni 族校正；也允许显式 `critical_value`）。
+记
+
+```text
+upper = 1 - Φ(z - λ)          # 正确方向且显著
+lower = Φ(-z - λ)             # 错误方向且显著
+power = upper + lower
+Type S = lower / power
+Type M = E[|Z| 1{reject}] / (λ * power)
+       = [λ(upper-lower) + φ(z-λ) + φ(-z-λ)] / (λ * power)
+```
+
+`Type M` 的分母是**假定的真实效应**，不是观测均值；`E[|estimate| |
+reject] = SE * E[|Z| 1{reject}]/power`。函数同时给出：
+
+- `power_correct_direction` / `power_wrong_direction`（把双侧功效拆开）；
+- `p_overstate_2x = P(|estimate|>2|δ| | reject)`，注意拒绝域已经要求
+  `|Z|>z`，所以条件事件是 `|Z| > max(z, 2λ)`；
+- `p_understate_half = P(|estimate|<0.5|δ| | reject)`，只有当
+  `0.5λ > z` 时才与拒绝域相交，否则严格为 0；
+- 在 `[2, n_max]` 内搜索满足 `power >= target_power` 且
+  `Type S <= max_type_s` / `Type M <= max_type_m` 的**最小 n**；搜索同时
+  要求功效门槛，避免推荐一个「Type S 很低但根本没有功效」的 n；
+- `design_ok` = 三个门槛同时满足；`status='warnings'` 表示可计算但不
+  满足，`status='invalid'` 表示输入非法且逐项点名。
+
+`type_sm_design_curve` 在锚点效应的倍数网格（默认
+`1, 0.75, 0.5, 0.25`）上重复上述计算。**更小的真实效应才是危险方向**：
+Type M 上升，Type S 最终趋近 0.5。`type_sm_design_from_deltas` 用
+validation 的逐种子配对差：样本 SD 作为 `σ`，默认把 `|pilot mean|` 作为
+锚点，也可用 `sesoi=` 显式指定；非有限差值按位置丢弃并具名，不插补；
+pilot 均值恰为 0 时返回 `not_applicable`，因为零真实效应没有有限的
+Type M，不能把「没有观测到散布」写成零风险。
+
+n=12、α=0.05、m=1、σ=1 的读数（与测试逐值对账）：
+
+| 假定 |δ| | power | Type S | Type M | P(>2×|δ| \| sig) |
+|---|---|---|---|---|
+| 0.05 | 0.053 | 0.308 | 13.55 | 1.00 |
+| 0.10 | 0.064 | 0.165 | 6.84 | 1.00 |
+| 0.20 | 0.107 | 0.038 | 3.51 | 1.00 |
+| 0.30 | 0.180 | 0.008 | 2.40 | 0.84 |
+| 0.50 | 0.410 | 0.0003 | 1.55 | 0.10 |
+| 0.80 | 0.791 | 0.0000 | 1.13 | 0.00 |
+
+换成冻结族的 m=6，临界值从 1.96 升到 2.638，同一效应更危险：
+
+| 假定 |δ| | power | Type S | Type M |
+|---|---|---|---|
+| 0.10 | 0.012 | 0.115 | 8.58 |
+| 0.20 | 0.026 | 0.017 | 4.35 |
+| 0.30 | 0.055 | 0.002 | 2.95 |
+| 0.50 | 0.182 | 0.0000 | 1.84 |
+
+这不是说 12 个种子的确认性检验「无效」：冻结检验仍是精确符号翻转 +
+Holm，p 的合法性不依赖本读数。它说明的是**报告措辞与规划**：在靠近
+探测边缘的效应上，一个显著的 12-seed 结果很可能把幅度夸大成数倍，且
+在功效接近 α 时符号本身也只有一半可信；若研究真正关心的是 SESOI
+大小的效应，就应在下一次冻结前用 `min_n_for_*` 规划足够种子，或明确
+把结论限定为「方向性、幅度不可信」。
+
+### 140.3 审计语义：声明式门槛，不冒充冻结判定
+
+`type_sm_from_manifest(manifest, pilot=None)` 对每条
+`primary_comparisons`：
+
+- 优先使用 pilot 的逐种子 `deltas`；没有 deltas 时接受 `mean` + `sd`；
+  两者都没有则 `not_verifiable` 并具名；
+- 默认锚点是 `|pilot mean|`，字段 `anchor='pilot_mean'`；若清单的
+  `practical_significance` 为该对照声明了 `absolute_ppl` margin，则用
+  该 margin，字段 `anchor='declared_sesoi'`。相对百分比/log-ratio margin
+  需要 baseline PPL 才能换算成绝对差值，本函数**不猜**，继续用 pilot
+  mean 并保留锚点标签；
+- 读取 `statistics.type_sm`（可选）：
+  `{require, target_power, max_type_s, max_type_m}`。缺省门槛是
+  `target_power=0.80, max_type_s=0.05, max_type_m=2.0`，只作**显示/
+  规划**门槛；只有 `require=true` 时，未达标或 pilot 缺失才进入
+  `violations` 并让审计 `fail`；
+- pilot 的 `alpha`、`m_family`、`manifest_sha256`（若两侧都有）与当前
+  清单不一致时 `fail`，不让另一个 freeze 的 pilot 静默锚定本清单；
+- 任一条 `not_verifiable`/`not_applicable` 且 `require=false` 只记
+  `warnings`；没有 pilot 时整体 `not_verifiable`，不是绿色通过。
+
+`audit_gates.py type_sm`（别名 `type_sm_design` / `sign_magnitude` /
+`sign_magnitude_error` / `design_type_sm` / `exaggeration`）读取
+`confirmation_frozen.json` 与可选的
+`analysis_v12/power_validation.json`；`type_sm_artifact`（别名
+`type_sm_replay` / `type_sm_validation`）重放
+`analysis_v12/type_sm_design.json`。`audit_gates.py report` 新增顶层
+`type_sm` 块；`python -m explib.confirmation plan` 在
+`design_estimability` 之后嵌入同一块：没有 pilot 时只写
+`not_verifiable` 的 note；清单声明 `require=true` 而门槛未过时，plan 在
+首条 cell 之前拒绝。新增 `make type-sm`。
+
+可重放产物由 `build_type_sm_design(...)` 生成：
+`{kind:'type_sm_design_artifact', schema:1, inputs, result,
+content_sha256}`。`content_sha256` 只排除 `created_at` 与自身；时间戳
+不改变身份。`validate_type_sm_design` 从 `inputs` 完整重算并逐字段
+对账；缺 hash、hash 不重放、派生字段被改、或夹带
+`confirmed`/`p_holm`/`verified`/`verdict`/`decision` 等冻结字段都判
+`fail`。
+
+### 140.4 边界：这是设计读数，不是新的确认性检验
+
+- **没有新 p 值、没有 Holm 成员、没有 FWER 控制。** 它不重算
+  `p_exact_signflip`/`p_holm`，不改变 `verified`/`confirmed` 或任何冻结
+  清单字段，不读 test split，不重算 PPL，不改 `CODE_SEMANTICS`。
+- **正态位置模型是近似。** 它假设已知 `σ`、配对差近似正态、单条对照
+  的效应固定；Bonferroni 临界值对正相关对照保守，且不是冻结的
+  Holm/精确符号翻转阈值。MDE、SESOI/TOST、精确符号翻转功效仍是各自
+  的设计读数，不能互相替代。
+- **Type M 不是后验偏差，也不是观测均值的置信区间。** 它是「在假定
+  真实效应 δ 下，条件于显著时估计量绝对值的期望 / |δ|」。δ 本身是
+  设计输入；用 pilot mean 作锚点是**乐观**的（pilot 也是估计值），
+  所以函数同时给出 0.25×/0.5×/0.75× 锚点的曲线；真正的规划应优先用
+  预先声明的 SESOI 作锚点。
+- **Type S 不是本项目方向性判定中的「假阳性」。** 冻结规则会把显著
+  反向结果读成 `refuted`，不会把它写成支持；Type S 描述的是「显著
+  估计的符号」这一读数，不是 `verified` 的第二套定义。
+- **不能修复选择偏差、checkpoint 选择、跨规模/跨语料外推或已发生的
+  缺失。** 它只回答「这个 n 对这条假定效应会给出多可信的显著读数」；
+  观测层面的 winner's curse、缺失、聚类与外部有效性仍由各自的门负责。
+- **不追溯旧面板。** 没有 pilot 的 v6–v11 仍是
+  `not_verifiable_locally`；当前冻结 v12 清单没有
+  `statistics.type_sm`，因此只报告读数与默认门槛，不会追溯判 fail。
+- **不是签名。** 能同时改写代码与重算 hash 的人仍可伪造；它让无意的
+  字段漂移和「事后补一个更漂亮的 Type S/M」可见。
+
+### 140.5 入口与验证
+
+```bash
+python audit_gates.py type_sm
+python audit_gates.py type_sm_artifact analysis_v12/type_sm_design.json
+python audit_gates.py report         # 顶层 type_sm
+make type-sm
+python -m explib.confirmation plan   # snapshot 内嵌 type_sm
+python -m pytest -q test_review_part_82.py
+```
+
+落盘一个可重放的单效应产物：
+
+```python
+import exp_lib as L
+artifact = L.build_type_sm_design(12, sigma=1.0, effect=0.1,
+                                  alpha=0.05, family_size=6)
+L.write_type_sm_design('analysis_v12/type_sm_design.json', artifact)
+print(L.validate_type_sm_design(artifact)['status'])
+```
+
+`test_review_part_82.py` 10 项覆盖：n=12、δ/σ=0.1 的解析 Type S/Type M
+与 40 万次正态 Monte Carlo 对账（含 overstate/understate 条件概率）；
+尺度不变、符号对称与效应单调；m=6 的 Bonferroni 临界值、功效下降与
+Type M 上升，以及显式 `critical_value`；非法 n/σ/δ/α/族大小/门槛/
+NaN/Inf/字符串/bool 的 fail-closed 与 builder 拒绝；Type S 和 Type M
+各自成为约束时的 `min_n_for_*` 精确命中（n 通过、n-1 不通过）；曲线
+的锚点倍数与单调性；pilot 锚点、SESOI 覆盖、零均值
+`not_applicable`、非有限值按位置丢弃、显式 SD 覆盖 warning；产物
+replay、篡改派生值、缺 hash、夹带冻结字段；清单审计的
+ok/warnings/required-fail/缺 pilot/alpha 与族大小错配/部分缺对照；gate
+的 manifest+pilot、缺 pilot、CLI/`report`/`plan`/Makefile 接线。

@@ -6767,3 +6767,66 @@ distribution-free 并列且 t 字段不变；`paired_effect_stats`/
 `reportable_claim` 回显与坏字段丢弃；严格 JSON 与确定性重放；builder
 的可重放产物与非有限输入拒绝；审计门的合法/篡改/夹带/缺产物/不可用
 分支。完整 CPU 套件在本轮最终树通过。
+
+## 2026-11-01 — 显著结果的符号与幅度也是设计问题：Type S / Type M 预跑读数（本轮实验设计与准备硬化，no new runs）
+
+零 GPU；不新增训练、不读取任何 split、不修改
+`confirmation_frozen*.json` 的字节/臂/种子/端点/α/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未删除、未修改、未移动。
+
+**Problem.** 冻结计划已经有分辨率下限、`q` 处符号检验功效、MDE/精度与
+attrition-adjusted power，也有观测层的 winner's-curse bootstrap。但它们
+都没有回答「条件在一个显著结果上，估计的符号有多大概率是反的、幅度有
+多大概率被放大」。当真实效应接近 12-seed 面板的探测边缘时，Type S 可
+达 16%–31%，Type M 可达 3.5–13.6 倍；在 m=6 的 Holm 族上更差。这不是
+p 值合法性问题，而是「显著之后能写什么」的设计准备问题。
+
+**Fix.** 新增 `explib/_parts/part_76_type_sm_design.py`：
+
+- `type_sm_design(n, sigma, effect, alpha, family_size, critical_value,
+  target_power, max_type_s, max_type_m)`：在双侧正态位置模型下用
+  `λ=|δ|√n/σ` 计算 `power`、`Type S = lower/power`、
+  `Type M = E[|Z| 1{reject}]/(λ·power)`、`p_overstate_2x`、
+  `p_understate_half`（后两者显式与拒绝域 `|Z|>z` 取交，避免把无条件
+  尾部质量误读成条件概率）；默认 `z=Φ^{-1}(1-α/(2m))`，也接受显式
+  `critical_value`；`min_n_for_power/type_s/type_m` 在 `[2,n_max]` 内
+  搜索，且同时要求达到目标功效；非法输入返回 `invalid` 并点名。
+- `type_sm_design_curve`：在锚点效应的 1/0.75/0.5/0.25 倍上重复，
+  暴露「真实效应越小，Type S/M 越差」的方向。
+- `type_sm_design_from_deltas`：用 validation 逐种子配对差的样本 SD 作
+  `σ`，`|pilot mean|` 或显式 `sesoi` 作锚点；非有限值按位置丢弃并
+  具名；零均值返回 `not_applicable`（零真实效应没有有限 Type M）。
+- `type_sm_from_manifest`：逐主对照读 pilot 的 `deltas` 或 `mean`+`sd`；
+  核对 pilot 的 alpha/族大小/manifest 哈希；读可选的
+  `statistics.type_sm` 声明（`require`/`target_power`/`max_type_s`/
+  `max_type_m`）；缺省门槛只作显示，`require=true` 时才把未达标或缺
+  pilot 变成 violations。
+- `build_type_sm_design` / `validate_type_sm_design`：content-hash 绑定
+  inputs+result，时间戳不改变身份；从 inputs 完整重放并逐字段对账；
+  缺 hash、派生值篡改、夹带冻结字段都 fail。`write_type_sm_design`
+  原子写。
+
+**Wiring.** `audit_gates.py type_sm`（别名 `type_sm_design` /
+`sign_magnitude` / `sign_magnitude_error` / `design_type_sm` /
+`exaggeration`）与 `type_sm_artifact` 重放入口；`report` 顶层
+`type_sm`；`python -m explib.confirmation plan` 在
+`design_estimability` 之后嵌入，缺 pilot 只 note，`require=true` 未过
+时拒绝计划；`make type-sm`。新增 `docs/design_notes.md` §140 与
+`test_review_part_82.py` 10 项（解析公式对 40 万次 Monte Carlo、尺度
+不变/符号对称/单调、m=6 临界值、非法输入、Type S/Type M 各自约束的
+required-n 命中、曲线、pilot 锚点/零效应/丢弃、产物 replay/篡改/
+冻结字段、清单审计状态、gate/plan/CLI/Makefile 接线）。
+
+**Boundary.** 没有新 p 值、不进入 Holm、不改变
+`p_exact_signflip`/`p_holm`/`verified`/`confirmed`、不重算 PPL、不读
+test split、不改 `CODE_SEMANTICS`。正态位置模型是近似；Bonferroni 临界
+值不是冻结的精确符号翻转阈值；pilot mean 作锚点偏乐观，曲线与
+`min_n_for_*` 只用于规划；Type S 不是本项目方向性判决中的「假阳性」
+（显著反向仍读 `refuted`）；不修复 winner's curse、checkpoint 选择、
+缺失、聚类或外部有效性，也不追溯旧面板。
+
+**Verification.** `python -m pytest -q test_review_part_82.py` 10 项通过；
+`python audit_gates.py type_sm` 在当前清单（无 pilot）报
+`not_verifiable` 并列出 6 条对照；`python -m explib.confirmation plan`
+仍在 72/72 合成记录、6 个比较上通过，并在 snapshot 中写入
+`type_sm` 块；`python audit_gates.py report` 顶层含 `type_sm`。
