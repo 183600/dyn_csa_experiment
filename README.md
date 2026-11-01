@@ -60,9 +60,25 @@ version number alone, to decide what a result may support.
 frozen confirmatory scope. The `dynamic-plan` command and the audit gates still
 read it so the draft stays internally checkable.
 
+### Terminology
+
+The tables and command comments below use a few terms in a specific sense.
+
+| term | meaning here |
+|---|---|
+| panel | one declared matrix of training runs (arms × seeds) analyzed together |
+| arm | one model/recipe variant in a panel |
+| cell | one `(arm, seed)` training run; the smallest resumable unit |
+| seed | the training seed that identifies a cell within an arm |
+| confirmatory | a comparison fixed in `confirmation_frozen.json` before the final test split was read |
+| exploratory | a comparison inspected while panels were still being extended; it can guide the next run, but it is not a frozen claim |
+| zero-GPU | the command runs on CPU only: tests, plan/analysis/report builders and audit gates |
+| PPL | perplexity, the primary language-modeling endpoint of the panels |
+
 ## Contents
 
 - [Scope and status](#scope-and-status)
+  - [Terminology](#terminology)
 - [Study at a glance](#study-at-a-glance)
 - [Start here](#start-here)
 - [Quick start](#quick-start)
@@ -74,6 +90,7 @@ read it so the draft stays internally checkable.
   - [Driver modules](#driver-modules)
   - [Tests and frozen inputs](#tests-and-frozen-inputs)
   - [Evidence and design records](#evidence-and-design-records)
+  - [Generated paths](#generated-paths)
   - [Tooling](#tooling)
   - [Regenerating the experiment artifacts](#regenerating-the-experiment-artifacts)
 - [Running the experiments](#running-the-experiments)
@@ -163,6 +180,7 @@ python -m pip install -r requirements.lock
 make test                              # complete CPU pytest suite
 make plan                              # frozen-manifest preflight; no test-split read
 python -m explib.confirmation --help   # driver help; no run starts
+make help                              # available zero-GPU targets
 ```
 
 `make test` invokes pytest over the repository, so it is the same whole-suite
@@ -181,12 +199,17 @@ with that driver's `smoke` mode when validating a change to the pipeline.
   resolved relative to the checkout.
 - `python -m explib.<driver>` is a package entry point. `python run_gapfill.py`
   is the historical v6 script and keeps its positional modes.
+- Angle-bracket text (`<driver>`, `<phase>`, `<name>`) is a placeholder, not
+  literal syntax; `--help` or the driver table names the accepted values. A
+  trailing `...` marks an abbreviated command.
 - `--help` is the safe way to inspect a driver. `smoke --help` is not a help
   command on the positional drivers: the second token is ignored and a smoke
   run starts.
 - Training drivers write into `results_*/` and `analysis_*/` (both are
   gitignored); `plan`, `analysis`, and `report` modes do not add a research
   measurement.
+- A successful check prints its own summary and exits 0; a failed check exits
+  non-zero. Read the exit status before reading the prose around a command.
 
 ### Example workflows
 
@@ -311,6 +334,20 @@ also needs the small `__main__.py` entry point that calls `_run_cli`.
 | `REVIEW_4_RESPONSE.md` | **review-4 per-issue audit** (tracked): the 21 methodological issues, what this repository already enforced, what this revision changed, and what still cannot be answered without new experiments/artifacts |
 | `docs/design_notes.md` | **design and implementation notes**: why the block-read gate is strict and must be synced across five sites, the dynamic segmenter's prefix-invariance requirement, the pairing/measurability rules, the reporting conventions, and the contracts that keep attention row-chunking equivalent to its unbatched form |
 
+### Generated paths
+
+Nothing in this table is tracked. Each path appears only after the command that
+writes it has run, and deleting a path only removes local artifacts.
+
+| path | written by | contains |
+|---|---|---|
+| `results_*/` | training drivers | per-cell records, `summary.json` and checkpoints |
+| `analysis_*/` | `analysis` / `report` modes | stamped JSON statistics and per-version reports |
+| `REPORT*.md` | report builders | human-readable reports rebuilt from analysis JSON |
+| `wt103_cache/` | the WikiText loaders | token ids, tokenizer bytes and split metadata |
+| `par_jobs/` | `par.py` | per-cell job/result/log files when parallelism is enabled |
+| `archive/` (or `--out`) | `archive_release.py` | a release tarball, manifest and SHA-256 record |
+
 ### Tooling
 
 | path | what |
@@ -321,7 +358,7 @@ also needs the small `__main__.py` entry point that calls `_run_cli`.
 | `fuse_analysis.py` | zero-GPU fuse-vs-no-fuse driver: recomputes per-layer boundary alignment (tol=1), block-length stats and PPL trajectories from a `results_*/summary.json` |
 | `baseline_tune.py` | equal-search baseline tuning driver: the same declared grid for every arm, validation-only selection, and a zero-GPU `plan`/`report` audit path |
 | `error_analysis.py` | zero-training bad-case analysis for a saved checkpoint: validation-only token/sequence summaries and heuristic cause triage |
-| `Makefile` | zero-GPU entry points: `make test`, `make plan`, `make audit`, `make manipulation`, `make integrity`, `make env-check`, `make reproduce`, `make report-diff`, `make install-check`, `make build`, `make clean` |
+| `Makefile` | zero-GPU entry points grouped by check type; `make help` is the authoritative list of targets |
 | `pyproject.toml` / `requirements.txt` / `requirements.lock` | Python ≥3.12 and dependency declarations; install explicitly (no import-time pip install). `requirements.lock` is the verified CPU environment |
 
 > **The measurement library lives in `explib/`; edit those modules directly.**
@@ -368,6 +405,7 @@ Two already-built report files can be compared without re-running anything:
 
 ```bash
 python -m explib.reproduce report OLD.json NEW.json --ignore-ledger
+# 0 = no differences; 1 = differences printed as JSON pointers; 2 = bad input
 ```
 
 This is a structural diff of stamped reports, not a new statistical test; use it
@@ -376,8 +414,8 @@ to confirm that rebuilding a report from the same artifacts did not change it.
 ## Running the experiments
 
 The commands below are grouped by side effect: environment, zero-GPU checks,
-then training. Run them from the repository root. Training panels need a GPU;
-tests, analysis, report builders and audit gates run on CPU.
+then training. Run them from the repository root. Training panels are designed
+for a GPU; tests, analysis, report builders and audit gates run on CPU.
 
 ### Environment
 
@@ -425,7 +463,8 @@ Python ≥3.12 is required (see `pyproject.toml`).
   `WT103_RAW_TXT` to a directory containing `wiki.train.raw` and
   `wiki.valid.raw`; the loader also checks `./wt103_raw` next to the repo and
   `/root/wt103_raw`.
-- Only those two files are read, and tokenising them reproduces the
+- For the train/validation split, only those two files are read, and
+  tokenising them reproduces the
   `wt103_cache/*.npy` cache token-for-token. The fallback is an availability
   path, not a different measurement.
 - Once `wt103_cache/` is populated, the corpus is served from the cache and no
@@ -550,7 +589,7 @@ python -m explib.m0 auto     # UNATTENDED: G0 gate (fail-closed) -> certificate 
                            #   panel chain starts by itself; default panel S1,
                            #   M0_AUTO_CHAIN=S1,S2 sequences both; CSA_KERNEL=1 after a
                            #   green gate (explicit setting wins); a failed gate starts no
-                           #   panel and leaves a diagnosis window
+                           #   panel and leaves a diagnosis window before shutdown
 ```
 
 - Corpus: FineWeb-Edu (default `sample-10BT` config), self-trained 32k BPE;
@@ -813,7 +852,17 @@ above belong to the v6 driver; `explib` drivers leave the instance running.
 
 The analysis path fails closed: absent, stale, or mismatched provenance is
 reported as `not_verifiable_locally` / `provenance_incomplete`, never as a
-pass. The main contracts are:
+pass. Status words mean:
+
+| status | meaning |
+|---|---|
+| `ok` | the check ran and every assertion held |
+| `fail` | the artifact exists but violates the contract it is checked against |
+| `not_verifiable_locally` | a required artifact or input is missing, unreadable or too old to replay |
+| `not_applicable` | the artifact itself declares the quantity not estimable |
+| `provenance_incomplete` | a source/identity fingerprint is absent; this is never a pass |
+
+The main contracts are:
 
 - **Claim wording** goes through `exp_lib.reportable_claim`: n≥6, raw p, Holm
   p, |mean|>std, and the family-resolution floor. `attach_holm` reports the

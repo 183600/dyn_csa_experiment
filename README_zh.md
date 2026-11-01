@@ -50,9 +50,25 @@
 `confirmation_frozen_dynamic.json` 是独立的**草案**，不属于冻结的确认范围。
 `dynamic-plan` 命令与审计门仍会读取它，以便持续检查草案自身是否自洽。
 
+### 术语
+
+下文的表格与命令注释按以下含义使用这些词。
+
+| 术语 | 含义 |
+|---|---|
+| 面板（panel） | 一起分析的一组已声明训练矩阵（臂 × 种子） |
+| 臂（arm） | 面板中的一个模型/配方变体 |
+| 单元（cell） | 一次 `(臂, 种子)` 训练，是续跑的最小单位 |
+| 种子（seed） | 同一臂内标识一个单元的训练随机种子 |
+| 确认性 | 在读取最终 test split 之前就已固定在 `confirmation_frozen.json` 中的比较 |
+| 探索性 | 在面板仍在扩展时查看过的比较；可指导下一轮运行，但不是冻结主张 |
+| 零 GPU | 命令只使用 CPU：测试、plan/analysis/report 构建器与审计门 |
+| PPL | 困惑度（perplexity），各面板的主要语言建模终点 |
+
 ## 目录
 
 - [范围与状态](#范围与状态)
+  - [术语](#术语)
 - [研究一览](#研究一览)
 - [从这里开始](#从这里开始)
 - [快速开始](#快速开始)
@@ -64,6 +80,7 @@
   - [驱动模块](#驱动模块)
   - [测试与冻结输入](#测试与冻结输入)
   - [证据与设计记录](#证据与设计记录)
+  - [生成的路径](#生成的路径)
   - [工具](#工具)
   - [重新生成实验产物](#重新生成实验产物)
 - [复现方法（任意机器）](#复现方法任意机器)
@@ -148,6 +165,7 @@ python -m pip install -r requirements.lock
 make test                              # 完整 CPU pytest 套件
 make plan                              # 冻结清单预检；不读取 test split
 python -m explib.confirmation --help   # 查看驱动说明，不启动实验
+make help                              # 可用的零 GPU 目标
 ```
 
 `make test` 会对整个仓库调用 pytest，与 CI 使用同一套全量检查；
@@ -163,10 +181,14 @@ run_gapfill.py`（默认 `full`）：要跑正式面板时调用驱动的 `full`
 - 所有命令都在仓库根目录执行；产物与清单按检出路径解析。
 - `python -m explib.<driver>` 是包入口；`python run_gapfill.py` 是历史 v6
   脚本，保留位置参数式模式。
+- 尖括号内容（`<driver>`、`<phase>`、`<name>`）是占位符而非字面语法；
+  可接受值见 `--help` 或驱动表。结尾的 `...` 表示命令已省略其余部分。
 - 用 `--help` 查看驱动说明最稳妥；对位置式驱动而言 `smoke --help` 不是
   帮助命令，第二个 token 会被忽略并直接开始 smoke 运行。
 - 训练驱动写入 `results_*/` 与 `analysis_*/`（两者均已 gitignore）；
   `plan`、`analysis`、`report` 模式不产生新的研究测量。
+- 检查通过时打印自己的摘要并以 0 退出；失败时以非零退出。先看退出状态，
+  再读命令周围的说明。
 
 ### 示例流程
 
@@ -286,6 +308,20 @@ archive_release.py          证据归档构建与校验
 | `REVIEW_4_RESPONSE.md` | **评审四逐条回应**（入库）：21 个方法学问题、仓库已强制执行的部分、本轮修订了什么，以及哪些仍需新实验/产物才能回答 |
 | `docs/design_notes.md` | **设计与实现笔记**：块读门为何必须严格、且五处位置必须同步；动态分段器的前缀不变性要求；配对/可测量规则；报告约定；保证注意力按行分块与不分批形式等价的契约 |
 
+### 生成的路径
+
+下表中的路径都不入库；只有写入它们的命令运行后才会出现。删除这些路径只
+会移除本地产物。
+
+| 路径 | 写入者 | 内容 |
+|---|---|---|
+| `results_*/` | 训练驱动 | 逐单元记录、`summary.json` 与 checkpoint |
+| `analysis_*/` | `analysis` / `report` 模式 | 带戳 JSON 统计与逐版报告 |
+| `REPORT*.md` | 报告构建器 | 从分析 JSON 重建的可读报告 |
+| `wt103_cache/` | WikiText 加载器 | token id、分词器字节与 split 元数据 |
+| `par_jobs/` | `par.py` | 并行开启时逐单元的 job/result/日志 |
+| `archive/`（或 `--out`） | `archive_release.py` | 发布包、清单与 SHA-256 记录 |
+
 ### 工具
 
 | 路径 | 说明 |
@@ -296,7 +332,7 @@ archive_release.py          证据归档构建与校验
 | `fuse_analysis.py` | 零 GPU fuse 对比驱动：从 `results_*/summary.json` 重算逐层边界对齐（tol=1）、块长统计与 PPL 曲线 |
 | `baseline_tune.py` | 等搜索量基线调参驱动：所有臂使用同一份声明网格、只在 validation 上选择，并提供零 GPU 的 `plan`/`report` 审计路径 |
 | `error_analysis.py` | 零训练坏例分析：对已保存 checkpoint 只在 validation split 上统计最差 token/序列并做启发式归因 |
-| `Makefile` | 零 GPU 入口：`make test`、`make plan`、`make audit`、`make manipulation`、`make integrity`、`make env-check`、`make reproduce`、`make report-diff`、`make install-check`、`make build`、`make clean` |
+| `Makefile` | 按检查类型分组的零 GPU 入口；`make help` 是目标的权威列表 |
 | `pyproject.toml` / `requirements.txt` / `requirements.lock` | Python ≥3.12 与依赖声明；需显式安装（无 import 时 pip install）。`requirements.lock` 是已验证的 CPU 环境 |
 
 > **测量库位于 `explib/`，直接编辑其中的模块。**
@@ -338,6 +374,7 @@ python -m explib.reproduce compare results_lm_v3_1500 results_lm_v3_1500_rerun
 
 ```bash
 python -m explib.reproduce report OLD.json NEW.json --ignore-ledger
+# 0 = 无差异；1 = 有差异，按 JSON 指针列出；2 = 输入错误
 ```
 
 这是对带戳报告的结构化 diff，不是新的统计检验；用于确认从同一批产物重建
@@ -346,7 +383,7 @@ python -m explib.reproduce report OLD.json NEW.json --ignore-ledger
 ## 复现方法（任意机器）
 
 以下命令按副作用分组：先准备环境，再跑零 GPU 校验，最后才启动训练。
-均在仓库根目录执行。训练面板需要 GPU；测试、分析、报告构建与审计门在
+均在仓库根目录执行。训练面板面向 GPU；测试、分析、报告构建与审计门在
 CPU 上运行。
 
 ### 环境
@@ -390,7 +427,7 @@ CPU 上运行。
 - `load_wikitext` 先尝试 Hub。若 Hub 不可达，将 `WT103_RAW_TXT` 指向包含
   `wiki.train.raw` 与 `wiki.valid.raw` 的目录；加载器还会检查仓库旁的
   `./wt103_raw` 和 `/root/wt103_raw`。
-- 只读这两个文件；对其分词可逐 token 复现 `wt103_cache/*.npy` 缓存。
+- train/validation 只用这两个文件；对其分词可逐 token 复现 `wt103_cache/*.npy` 缓存。
   该回退是纯可用性路径，不会改变测量结果。
 - 若 `wt103_cache/` 已有缓存，语料直接由缓存提供，无需下载或原始文本。
   `WT103_CACHE_DIR` 可迁移缓存位置；加载器、`audit_leakage` 与 P5T
@@ -735,7 +772,18 @@ python build_report.py            # 从产物重建 REPORT_v7.md（零 GPU）
 ## 测量护栏
 
 分析路径采用 fail-closed：缺失、陈旧或不匹配的来源信息一律报为
-`not_verifiable_locally` / `provenance_incomplete`，绝不当作通过。主要契约：
+`not_verifiable_locally` / `provenance_incomplete`，绝不当作通过。状态词
+含义如下：
+
+| 状态 | 含义 |
+|---|---|
+| `ok` | 检查已运行，且全部断言成立 |
+| `fail` | 产物存在，但违反了它所对照的契约 |
+| `not_verifiable_locally` | 缺少必需的产物/输入、不可读，或旧到无法重放 |
+| `not_applicable` | 产物自身声明该量不可估计 |
+| `provenance_incomplete` | 缺少来源/身份指纹；这绝不等于通过 |
+
+主要契约：
 
 - **报告措辞**统一走 `exp_lib.reportable_claim`（n≥6、原始 p、Holm p、
   `|mean|>std`、族级分辨率下限）。`attach_holm` 同时给出族级最小可达 p，

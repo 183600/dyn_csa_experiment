@@ -70,18 +70,9 @@ def audit_length_position(path=None):
                     'per-seed by-length NLL/token totals; a missing block is '
                     'not a pass and a disagreement is a fail; no frozen '
                     'p/Holm/verdict is changed')}
-    if not os.path.exists(p):
-        out['status'] = 'not_verifiable_locally'
-        out['reason'] = 'no final-test stats artifact on disk'
-        print(json.dumps(out, ensure_ascii=False, indent=2))
+    ft = _load_finaltest_stats(out, p)
+    if ft is None:
         return out
-    data = _load(p)
-    if data is None:
-        out['status'] = 'fail'
-        out['problems'].append(f'{p} exists but is not a readable JSON object')
-        print(json.dumps(out, ensure_ascii=False, indent=2))
-        return out
-    ft = data.get('finaltest') if isinstance(data.get('finaltest'), dict) else data
     lp = ft.get('length_position') if isinstance(ft, dict) else None
     bl = ft.get('by_length') if isinstance(ft, dict) else None
     if lp is None:

@@ -1183,23 +1183,11 @@ def audit_unit_influence(path=None):
            'note': ('post-hoc descriptive robustness; a fragile comparison must '
                     'carry the single-unit caveat, but this audit never changes '
                     'a frozen p/Holm/confirmed verdict')}
-    if not os.path.exists(p):
-        out['status'] = 'not_verifiable_locally'
-        out['reason'] = 'no final-test stats artifact on disk'
-        print(json.dumps(out, ensure_ascii=False, indent=2))
+    ft = _load_finaltest_stats(out, p)
+    if ft is None:
         return out
-    data = _load(p)
-    if data is None:
-        out['status'] = 'fail'
-        out['problems'].append(f'{p} exists but is not a readable JSON object')
-        print(json.dumps(out, ensure_ascii=False, indent=2))
-        return out
-    ft = data.get('finaltest') if isinstance(data.get('finaltest'), dict) else data
-    comps = ft.get('comparisons') if isinstance(ft, dict) else None
-    if not isinstance(comps, dict) or not comps:
-        out['status'] = 'not_verifiable_locally'
-        out['reason'] = 'the stats artifact carries no comparisons'
-        print(json.dumps(out, ensure_ascii=False, indent=2))
+    comps = _finaltest_comparisons(out, ft)
+    if comps is None:
         return out
 
     for name, comp in comps.items():
@@ -1339,23 +1327,11 @@ def audit_two_level_ci(path=None):
            'note': ('descriptive total-uncertainty interval; a missing block '
                     'leaves seed-to-seed uncertainty unverified and never '
                     'changes the frozen p/Holm/confirmed verdict')}
-    if not os.path.exists(p):
-        out['status'] = 'not_verifiable_locally'
-        out['reason'] = 'no final-test stats artifact on disk'
-        print(json.dumps(out, ensure_ascii=False, indent=2))
+    ft = _load_finaltest_stats(out, p)
+    if ft is None:
         return out
-    data = _load(p)
-    if data is None:
-        out['status'] = 'fail'
-        out['problems'].append(f'{p} exists but is not a readable JSON object')
-        print(json.dumps(out, ensure_ascii=False, indent=2))
-        return out
-    ft = data.get('finaltest') if isinstance(data.get('finaltest'), dict) else data
-    comps = ft.get('comparisons') if isinstance(ft, dict) else None
-    if not isinstance(comps, dict) or not comps:
-        out['status'] = 'not_verifiable_locally'
-        out['reason'] = 'the stats artifact carries no comparisons'
-        print(json.dumps(out, ensure_ascii=False, indent=2))
+    comps = _finaltest_comparisons(out, ft)
+    if comps is None:
         return out
 
     def _count(x):
@@ -1472,23 +1448,11 @@ def audit_analysis_choices(path=None):
            'note': ('post-hoc specification concordance; divergent directions or '
                     'zero-exclusion are reporting caveats, never changes to a '
                     'frozen p/Holm/confirmed verdict')}
-    if not os.path.exists(p):
-        out['status'] = 'not_verifiable_locally'
-        out['reason'] = 'no final-test stats artifact on disk'
-        print(json.dumps(out, ensure_ascii=False, indent=2))
+    ft = _load_finaltest_stats(out, p)
+    if ft is None:
         return out
-    data = _load(p)
-    if data is None:
-        out['status'] = 'fail'
-        out['problems'].append(f'{p} exists but is not a readable JSON object')
-        print(json.dumps(out, ensure_ascii=False, indent=2))
-        return out
-    ft = data.get('finaltest') if isinstance(data.get('finaltest'), dict) else data
-    comps = ft.get('comparisons') if isinstance(ft, dict) else None
-    if not isinstance(comps, dict) or not comps:
-        out['status'] = 'not_verifiable_locally'
-        out['reason'] = 'the stats artifact carries no comparisons'
-        print(json.dumps(out, ensure_ascii=False, indent=2))
+    comps = _finaltest_comparisons(out, ft)
+    if comps is None:
         return out
 
     def _same_choice_value(a, b):

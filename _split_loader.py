@@ -24,6 +24,18 @@ import os
 from typing import Any, Iterable
 
 
+def _is_within(base: str, path: str) -> bool:
+    """Whether ``path`` resolves inside ``base`` (both real paths).
+
+    ``commonpath`` raises on mixed drives or an empty path, so containment is
+    reported as false there instead of leaking a platform-specific exception.
+    """
+    try:
+        return os.path.commonpath([base, os.path.realpath(path)]) == base
+    except (OSError, ValueError):
+        return False
+
+
 def _safe_fragment_path(package_dir: str, part: Any) -> str:
     """Resolve one ``_PARTS`` entry and keep it inside the package.
 
@@ -53,21 +65,12 @@ def _safe_fragment_path(package_dir: str, part: Any) -> str:
     package_base = os.path.realpath(package_dir)
     fragment_dir = os.path.join(package_dir, '_parts')
     base = os.path.realpath(fragment_dir)
-    try:
-        fragment_inside = (os.path.commonpath([package_base, base])
-                           == package_base)
-    except (OSError, ValueError):
-        fragment_inside = False
-    if not fragment_inside:
+    if not _is_within(package_base, base):
         raise ValueError(
             f'load_parts: {fragment_dir!r} resolves outside the package; '
             'the loader only executes fragments inside the package')
     path = os.path.join(fragment_dir, part)
-    try:
-        inside = os.path.commonpath([base, os.path.realpath(path)]) == base
-    except (OSError, ValueError):
-        inside = False
-    if not inside:
+    if not _is_within(base, path):
         raise ValueError(
             f'load_parts: {part!r} resolves outside {fragment_dir!r}; '
             'the loader only executes fragments inside the package')
@@ -119,6 +122,20 @@ def load_split_package(namespace: dict[str, Any], package_dir: str,
     load_parts(namespace, package_dir, parts)
 
 
+def _load_package_from_file(namespace: dict[str, Any], module_file: str,
+                            parts: Iterable[str], *, repo_depth: int,
+                            historical_path: str) -> None:
+    """Shared body of the two ``module_file`` bootstraps.
+
+    Both shortcuts differ only in how many directories sit between the
+    package and the repository root, so the depth is the one parameter they
+    pass in; the path derivation and delegation stay here.
+    """
+    package_dir = os.path.dirname(os.path.abspath(module_file))
+    load_split_package(namespace, package_dir, parts, repo_depth=repo_depth,
+                       historical_path=historical_path)
+
+
 def load_root_package(namespace: dict[str, Any], module_file: str,
                       parts: Iterable[str], *,
                       historical_path: str) -> None:
@@ -128,9 +145,8 @@ def load_root_package(namespace: dict[str, Any], module_file: str,
     The package directory is derived from ``module_file`` (pass ``__file__``),
     so each package declares only its fragment order and historical script.
     """
-    package_dir = os.path.dirname(os.path.abspath(module_file))
-    load_split_package(namespace, package_dir, parts, repo_depth=1,
-                       historical_path=historical_path)
+    _load_package_from_file(namespace, module_file, parts, repo_depth=1,
+                            historical_path=historical_path)
 
 
 def load_driver_package(namespace: dict[str, Any], module_file: str,
@@ -149,6 +165,5 @@ def load_driver_package(namespace: dict[str, Any], module_file: str,
     directory, ``_REPO`` is the repository root and ``__file__`` is the
     historical script path.
     """
-    package_dir = os.path.dirname(os.path.abspath(module_file))
-    load_split_package(namespace, package_dir, parts, repo_depth=2,
-                       historical_path=historical_path)
+    _load_package_from_file(namespace, module_file, parts, repo_depth=2,
+                            historical_path=historical_path)

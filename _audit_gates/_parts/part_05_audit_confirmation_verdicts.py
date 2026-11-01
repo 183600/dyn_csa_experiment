@@ -23,23 +23,11 @@ def audit_confirmation_verdicts(path=None):
            'note': ('replays the three-way directional partition on the SAME '
                     'Holm family; it adds no test and never changes a frozen '
                     'p/Holm/confirmed verdict')}
-    if not os.path.exists(p):
-        out['status'] = 'not_verifiable_locally'
-        out['reason'] = 'no final-test stats artifact on disk'
-        print(json.dumps(out, ensure_ascii=False, indent=2))
+    ft = _load_finaltest_stats(out, p)
+    if ft is None:
         return out
-    data = _load(p)
-    if data is None:
-        out['status'] = 'fail'
-        out['problems'].append(f'{p} exists but is not a readable JSON object')
-        print(json.dumps(out, ensure_ascii=False, indent=2))
-        return out
-    ft = data.get('finaltest') if isinstance(data.get('finaltest'), dict) else data
-    comps = ft.get('comparisons') if isinstance(ft, dict) else None
-    if not isinstance(comps, dict) or not comps:
-        out['status'] = 'not_verifiable_locally'
-        out['reason'] = 'the stats artifact carries no comparisons'
-        print(json.dumps(out, ensure_ascii=False, indent=2))
+    comps = _finaltest_comparisons(out, ft)
+    if comps is None:
         return out
     stored = ft.get('verdicts')
     if not isinstance(stored, dict) or not stored:
@@ -396,23 +384,11 @@ def audit_confirmation_pvalues(path=None):
            'note': ('recomputes the exact two-sided sign-flip p and the Holm '
                     'family from the stored per-seed deltas; a missing vector '
                     'is not a pass and a disagreement is a fail')}
-    if not os.path.exists(p):
-        out['status'] = 'not_verifiable_locally'
-        out['reason'] = 'no final-test stats artifact on disk'
-        print(json.dumps(out, ensure_ascii=False, indent=2))
+    ft = _load_finaltest_stats(out, p)
+    if ft is None:
         return out
-    data = _load(p)
-    if data is None:
-        out['status'] = 'fail'
-        out['problems'].append(f'{p} exists but is not a readable JSON object')
-        print(json.dumps(out, ensure_ascii=False, indent=2))
-        return out
-    ft = data.get('finaltest') if isinstance(data.get('finaltest'), dict) else data
-    comps = ft.get('comparisons') if isinstance(ft, dict) else None
-    if not isinstance(comps, dict) or not comps:
-        out['status'] = 'not_verifiable_locally'
-        out['reason'] = 'the stats artifact carries no comparisons'
-        print(json.dumps(out, ensure_ascii=False, indent=2))
+    comps = _finaltest_comparisons(out, ft)
+    if comps is None:
         return out
     _alpha = _pvr_finite(ft.get('alpha', 0.05))
     if _alpha is None or not (0.0 < _alpha < 1.0):
@@ -1504,23 +1480,13 @@ def audit_variance_components(path=None):
            'problems': [], 'warnings': [],
            'note': ('replays the descriptive crossed seed x unit decomposition; '
                     'it adds no test and never changes a frozen p/Holm/verdict')}
-    if not os.path.exists(p):
-        out['status'] = 'not_verifiable_locally'
-        out['reason'] = 'no final-test stats artifact on disk'
-        print(json.dumps(out, ensure_ascii=False, indent=2))
+    ft = _load_finaltest_stats(out, p)
+    if ft is None:
         return out
-    data = _load(p)
-    if not isinstance(data, dict):
-        out['status'] = 'fail'
-        out['problems'].append(f'{p} exists but is not a readable JSON object')
-        print(json.dumps(out, ensure_ascii=False, indent=2))
-        return out
-    ft = data.get('finaltest') if isinstance(data.get('finaltest'), dict) else data
-    comps = ft.get('comparisons') if isinstance(ft, dict) else None
-    if not isinstance(comps, dict) or not comps:
-        out['status'] = 'not_verifiable_locally'
-        out['reason'] = 'no per-comparison block in the final-test stats artifact'
-        print(json.dumps(out, ensure_ascii=False, indent=2))
+    comps = _finaltest_comparisons(
+        out, ft,
+        reason='no per-comparison block in the final-test stats artifact')
+    if comps is None:
         return out
 
     def _check(name, vc, dsm):

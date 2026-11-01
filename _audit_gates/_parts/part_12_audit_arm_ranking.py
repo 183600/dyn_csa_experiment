@@ -65,18 +65,9 @@ def audit_arm_ranking(path=None):
                     'control, no change to frozen p/Holm/confirmed; this is an '
                     'internal replay of per_arm_seed_values, not a binding of '
                     'those values to the original test slice')}
-    if not os.path.exists(p):
-        out['status'] = 'not_verifiable_locally'
-        out['reason'] = 'no final-test stats artifact on disk'
-        print(json.dumps(out, ensure_ascii=False, indent=2))
+    ft = _load_finaltest_stats(out, p)
+    if ft is None:
         return out
-    data = _load(p)
-    if data is None:
-        out['status'] = 'fail'
-        out['problems'].append(f'{p} exists but is not a readable JSON object')
-        print(json.dumps(out, ensure_ascii=False, indent=2))
-        return out
-    ft = data.get('finaltest') if isinstance(data.get('finaltest'), dict) else data
     rk = ft.get('arm_ranking') if isinstance(ft, dict) else None
     if rk is None:
         out['status'] = 'not_verifiable_locally'

@@ -442,6 +442,41 @@ def _load(path):
     return obj
 
 
+def _load_finaltest_stats(out, path):
+    """Return a final-test stats object, or ``None`` after recording why not.
+
+    Every replay audit distinguishes the same three states, so they live in
+    one place: no artifact on disk is ``not_verifiable_locally``, an artifact
+    that cannot be read as a JSON object is ``fail``, and a readable artifact
+    yields the ``finaltest`` block (or the top-level object for artifacts
+    written before that wrapper existed).  ``out`` is updated and printed on
+    the error paths, leaving the caller only an early ``return out``.
+    """
+    if not os.path.exists(path):
+        out['status'] = 'not_verifiable_locally'
+        out['reason'] = 'no final-test stats artifact on disk'
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return None
+    data = _load(path)
+    if data is None:
+        out['status'] = 'fail'
+        out['problems'].append(f'{path} exists but is not a readable JSON object')
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return None
+    return data.get('finaltest') if isinstance(data.get('finaltest'), dict) else data
+
+
+def _finaltest_comparisons(out, ft, reason='the stats artifact carries no comparisons'):
+    """Return the non-empty comparison map, or ``None`` after a diagnostic."""
+    comps = ft.get('comparisons') if isinstance(ft, dict) else None
+    if not isinstance(comps, dict) or not comps:
+        out['status'] = 'not_verifiable_locally'
+        out['reason'] = reason
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return None
+    return comps
+
+
 def _iter_result_dirs():
     for name in sorted(os.listdir(REPO)):
         if name.startswith('results_') and os.path.isdir(os.path.join(REPO, name)):

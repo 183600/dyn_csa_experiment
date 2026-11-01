@@ -86,23 +86,11 @@ def audit_length_strata(path=None):
                     'per-seed summed NLLs; a missing block is not a pass and '
                     'a disagreement is a fail; no frozen p/Holm/verdict is '
                     'changed')}
-    if not os.path.exists(p):
-        out['status'] = 'not_verifiable_locally'
-        out['reason'] = 'no final-test stats artifact on disk'
-        print(json.dumps(out, ensure_ascii=False, indent=2))
+    ft = _load_finaltest_stats(out, p)
+    if ft is None:
         return out
-    data = _load(p)
-    if data is None:
-        out['status'] = 'fail'
-        out['problems'].append(f'{p} exists but is not a readable JSON object')
-        print(json.dumps(out, ensure_ascii=False, indent=2))
-        return out
-    ft = data.get('finaltest') if isinstance(data.get('finaltest'), dict) else data
-    comps = ft.get('comparisons') if isinstance(ft, dict) else None
-    if not isinstance(comps, dict) or not comps:
-        out['status'] = 'not_verifiable_locally'
-        out['reason'] = 'the stats artifact carries no comparisons'
-        print(json.dumps(out, ensure_ascii=False, indent=2))
+    comps = _finaltest_comparisons(out, ft)
+    if comps is None:
         return out
     out['n_comparisons'] = len(comps)
     confirm_fields = ('confirmed', 'p_holm', 'verified', 'verdict', 'decision')
