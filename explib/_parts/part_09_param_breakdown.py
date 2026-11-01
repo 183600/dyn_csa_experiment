@@ -961,6 +961,14 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
     _ps = _finite_scalar(stats.get('prob_new_seed_same_sign'))
     if _ps is not None and 0.0 <= _ps <= 1.0:
         out['prob_new_seed_same_sign'] = float(_ps)
+    _dfi = stats.get('distribution_free_prediction_95')
+    if isinstance(_dfi, (list, tuple)) and len(_dfi) == 2:
+        _lo_df, _hi_df = _finite_scalar(_dfi[0]), _finite_scalar(_dfi[1])
+        if (_lo_df is not None and _hi_df is not None and _lo_df <= _hi_df):
+            out['distribution_free_prediction_95'] = [float(_lo_df), float(_hi_df)]
+    _dfa = _finite_scalar(stats.get('distribution_free_attained_conf'))
+    if _dfa is not None and 0.0 <= _dfa <= 1.0:
+        out['distribution_free_attained_conf'] = float(_dfa)
     out['allowed'] = not out['reasons']
     if out['allowed']:
         out['level'] = 'confirmatory' if str(evidence_level).lower() == 'confirmatory' else 'exploratory_significant'

@@ -5887,6 +5887,9 @@ d_new | sample ~ mean + t_{n-1} * sd * sqrt(1 + 1/n)
 - **相关种子会使它偏乐观。** 若两个种子共享超出 `init_core_fp` 所覆盖范围
   的状态，iid 假设变弱；应结合 `pair_reason`、`same_init_core_fp` 和
   LOO/脆弱性读数一起解释。
+- **模型 95% 不是分布无关 95%。** 同一个调用现在并列给出
+  `distribution_free` order-statistic 区间；n=12 的实际可达覆盖是 11/13，
+  95% 需要 39 个可交换种子（§139）。
 
 ### 80.5 入口与验证
 
@@ -13134,3 +13137,157 @@ legacy cache 显式 `legacy_absent`；test 侧车篡改在 cache hit 被拒；
 `_PARTS` 注册与 `document_unit='line'` 契约不变。现有
 `test_review_part_10.py` / `test_review_part_62.py` /
 `test_review_part_63.py` / `test_review_part_22.py` 仍全部通过。
+
+## 139. 12 个种子给不出分布无关的 95% 预测区间：保形预测的有限样本覆盖与最小 n（本轮结果分析硬化，no new runs）
+
+零 GPU 的结果分析硬化；不新增训练、不读取任何 split、不修改
+`confirmation_frozen*.json` 的字节/臂/种子/端点/α/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未删除、未修改、未移动。
+
+### 139.1 问题：`prediction_interval_95` 的「95%」是一个模型标签
+
+§80 的 `new_seed_replication` 用 Student-t 预测律
+
+```
+d_new | sample ~ mean + t_{n-1} * sd * sqrt(1 + 1/n)
+```
+
+回答「再训一个种子，效应可能落在哪」。它比均值 CI 宽，已经把
+「均值估得多准」与「下一个种子在哪」分开；但它的 95% 是**在
+iid 正态、共同方差、种子可交换的显式模型下**的 95%，不是分布无关的
+有限样本保证。报告若把它简写成「95% 预测区间」，读者会以为换一个
+非正态、异方差或重尾的种子分布仍然覆盖 95%。
+
+小 n 下这个差别不是小数：n=12 时，仅靠可交换性、不假设正态，双侧
+95% 的 order-statistic 区间只能达到 **11/13 = 84.6%** 的覆盖；要真正
+达到 95%，需要 **39 个可交换种子**。旧读数没有把「模型 95%」与
+「分布无关可达到的覆盖」并列，也没有告诉读者再补多少 seed 才能把
+预测区间从模型外推变成有限样本保证。
+
+### 139.2 方法：order-statistic 保形区间
+
+新增 `exp_lib.DISTRIBUTION_FREE_PREDICTION_POLICY` 与
+`exp_lib.distribution_free_prediction_interval(deltas, *, conf=0.95,
+direction=None)`。
+
+设 `n` 个已观测的逐种子效应 `x_1..x_n` 和一个未来效应 `x_new`
+可交换。则 `x_new` 在 `n+1` 个值中的秩在 `1..n+1` 上均匀。对
+`j = max(1, floor((n+1)(1-conf)/2))`，区间
+
+```
+[x_(j), x_(n+1-j)]
+```
+
+的有限样本边际覆盖**至少** `1 - 2j/(n+1)`；当 `j=1` 时就是
+`[min, max]`，覆盖 `(n-1)/(n+1)`。函数报告：
+
+- `interval`、`order_statistic_j`、`attained_conf`；
+- `conf_achievable`、`coverage_shortfall`（请求覆盖与实际可达覆盖之差）；
+- `n_needed_for_conf = ceil((1+conf)/(1-conf))` 与 `n_shortfall`；
+- `interval_side`（`below_zero` / `above_zero` / `spans_zero`）与
+  `favourable_side`（仅当方向已声明且整个区间在受益侧时为 true）；
+- 正/负/零计数、`n_input`/`n_dropped`/`dropped_positions`；
+- `method`、`assumption`、`role`、`boundary` 与完整 `policy`。
+
+数值例子（全部写进测试）：
+
+| n | conf | j | interval | attained_conf | n_needed |
+|---|---|---|---|---|---|
+| 12 | 0.95 | 1 | `[x_(1), x_(12)]` | 11/13 = 0.84615 | 39 |
+| 39 | 0.95 | 1 | `[x_(1), x_(39)]` | 38/40 = 0.95 | 39 |
+| 79 | 0.95 | 2 | `[x_(2), x_(78)]` | 76/80 = 0.95 | 39 |
+| 12 | 0.99 | 1 | `[x_(1), x_(12)]` | 11/13 = 0.84615 | 199 |
+
+**退化拒绝。** 少于 2 个有限值、全常数样本（order-statistic 区间退化为
+零宽）、非有限端点都返回 `available=false` 并写原因；全常数面板不能把
+「没有观测到 seed 间散布」包装成零宽 certainty。`conf` 必须是
+`(0,1)` 内的实数（布尔/字符串/NaN/Inf 拒绝），`direction` 只接受
+`-1/0/+1`（0 等价于未声明）。非有限 delta 被丢弃并具名，不插补。
+
+### 139.3 接线：与 t 区间并列，不改 t 区间与任何判定
+
+- `new_seed_replication` 在原有 t 字段之外追加
+  `distribution_free` 完整块，以及
+  `distribution_free_interval`、`distribution_free_attained_conf`、
+  `distribution_free_conf_achievable`、`distribution_free_n_needed`
+  四个扁平字段。原有 `prediction_interval`、`prediction_scale`、
+  `prob_new_positive`、`prob_same_sign`、`prob_improvement` 逐值不变。
+- `paired_effect_stats` 追加
+  `distribution_free_prediction_95`、`distribution_free_attained_conf`、
+  `distribution_free_conf_achievable`、`distribution_free_n_needed`，
+  并把完整块留在 `new_seed_replication.distribution_free`。
+- `reportable_claim` 原样回显合法的新字段；格式错误的预测区间被丢弃为
+  `None`，绝不升级成新的拒绝理由或显著性门。
+- `methodology_audit` 的逐对照打印在 t 预测区间之后追加一行
+  distribution-free 区间、实际覆盖与「95% 需要 39 个可交换种子」的
+  规划数字；没有可用区间时不打印假行。
+- `build_distribution_free_prediction(deltas, conf=, direction=)` 生成
+  可直接落盘的审计产物
+  `{kind, schema, inputs:{deltas, conf, direction}, result:{...}}`。
+  审计产物要求输入完整有限（非有限值会破坏 `n_input`/`n_dropped` 的
+  重放一致性），因此 builder 对非有限输入直接拒绝；只想描述过滤样本时
+  用 `distribution_free_prediction_interval`，后者会具名记录丢弃位置。
+- `step_00` 已透传 `new_seed_replication`，所以对比记录无需改 schema
+  就携带新块。
+- `audit_gates.py distribution_free_prediction`（别名 `distribution_free` /
+  `conformal` / `conformal_prediction` / `new_seed_prediction`）读取
+  `analysis_v12/distribution_free_prediction.json`（或根目录同名产物）的
+  `inputs.deltas`/`conf`/`direction`，独立重算区间、可达覆盖与最小 n，
+  逐字段对账；缺产物 `not_verifiable_locally`，篡改派生值或夹带
+  `confirmed`/`p_holm`/`verified`/`verdict`/`decision` 判 `fail`，
+  结构自洽但 `available=false` 的产物报 `not_applicable`。该门并入
+  `audit_gates.py report` 顶层 `distribution_free_prediction`，并新增
+  `make conformal`。
+
+### 139.4 边界：这是预测读数，不是新的确认性检验
+
+- **没有新 p 值、没有 Holm 成员、没有 FWER 控制。** 它不重算
+  `p_exact_signflip`、`p_holm`、`verified` 或任何冻结 `confirmed`，
+  不改变冻结清单、种子、端点、α 或 `CODE_SEMANTICS`。
+- **可交换性不是免费假设。** 它比 iid 正态弱，但仍要求校准种子与未来
+  种子来自同一个可交换分布；共享 `init_core_fp` 的配对种子、按
+  `pair_reason` 分层的面板、或按 seed 顺序变化的训练预算都可能破坏
+  可交换性。此时区间不是「对所有 seed 都 95%」。
+- **它不估计均值，也不是后验概率。** `[min,max]` 是预测一个未来观测的
+  区间，不是 mean 的 CI；`attained_conf` 是有限样本下界，不是对真实
+  覆盖的估计。`n_needed=39` 是双侧 95% 的规划数，不是「已经证明 39 个
+  种子一定够」。
+- **区间可以比 t 区间宽，也可以更窄。** 两者回答同一个预测问题但假设
+  不同；不能按宽度挑一个更有利的。报告并列显示，不把 t 区间删掉，也
+  不把 order-statistic 区间追认成唯一正确。
+- **不是对语言总体的推断。** 它只描述 seed/unit 的可交换抽样；评测
+  文章/行仍由 `doc_sampling`、two-level bootstrap 与 §81 负责。把
+  n=48 篇文章套进同一公式得到约 95.9% 的覆盖，不等于 48 篇文章就是
+  语言总体的概率样本（§54/§55 的 64-unit 门槛仍然有效）。
+- **不修复选择偏差。** 它不处理 winner's curse、checkpoint 选择、跨规模
+  外推或已发生的缺失；这些仍由各自的门负责。
+
+### 139.5 入口与验证
+
+```bash
+python -m pytest -q test_review_part_81.py
+python -m pytest -q            # 完整 CPU 套件
+python audit_gates.py distribution_free_prediction   # 有产物时重放
+make conformal                                       # 同一入口
+```
+
+落盘一个可重放产物：
+
+```python
+import exp_lib as L
+artifact = L.build_distribution_free_prediction(deltas, conf=0.95)
+L.atomic_write_json('analysis_v12/distribution_free_prediction.json',
+                    artifact, indent=2)
+```
+
+`test_review_part_81.py` 12 项覆盖：n=12 的 11/13 覆盖与 39-seed 规划数；
+n=39 的 `[min,max]` 恰好 95%；n=79 的 `j=2` 中心截尾；99% 需要 199；
+尺度不变与方向判断；30k 次重尾模拟的覆盖与 11/13 在 Monte Carlo 误差内
+一致；非有限值丢弃计数；单值/空/常数面板拒绝而不产生零宽区间；非法
+`conf`/`direction`/字符串载荷 fail-closed；`new_seed_replication` 同时
+暴露 t 与 distribution-free 两条读数且 t 字段逐值不变；
+`paired_effect_stats`/`reportable_claim` 的回显与坏字段丢弃；严格 JSON
+与同输入重放；`build_distribution_free_prediction` 的可重放产物与
+非有限输入拒绝；审计门对合法/篡改/夹带冻结字段/缺产物/不可用产物的
+`ok`/`fail`/`fail`/`not_verifiable_locally`/`not_applicable` 行为。
+完整 CPU 套件在本轮最终树通过。

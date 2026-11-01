@@ -6706,3 +6706,64 @@ attestation fail-closed、无标题 unavailable、legacy 显式回退、test 侧
 缺缓存诊断、`_PARTS` 注册与 `document_unit='line'` 不变。相关既有
 `test_review_part_10/22/62/63.py` 共 73 项仍通过；完整 CPU 套件在最终树
 上通过。
+
+## 2026-11-01 — 12 个种子给不出分布无关的 95% 预测区间：保形预测的有限样本覆盖与最小 n（本轮结果分析硬化，no new runs）
+
+零 GPU；不新增训练、不读取任何 split、不修改
+`confirmation_frozen*.json` 的字节/臂/种子/端点/α/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未删除、未修改、未移动。
+
+**Problem.** §80 的 `prediction_interval_95` 是 Student-t 预测律下的
+模型区间，依赖 iid 正态、共同方差、种子可交换。报告若把它简写成
+「95% 预测区间」，读者会把模型假设读成分布无关的有限样本保证。n=12
+时，仅靠可交换性的 order-statistic 区间只能达到 11/13 = 84.6% 的双侧
+覆盖；真正 95% 需要 39 个可交换种子。旧读数既没有并列这个下界，也没有
+给出「再补多少 seed」的规划数。
+
+**Fix.** 新增 `explib/_parts/part_10_paired_bootstrap_ci.py` 中的
+`DISTRIBUTION_FREE_PREDICTION_POLICY` 与
+`distribution_free_prediction_interval`：
+
+- 对可交换的 n 个校准效应和一个未来效应，取
+  `j = max(1, floor((n+1)(1-conf)/2))`，区间 `[x_(j), x_(n+1-j)]`，
+  有限样本边际覆盖至少 `1 - 2j/(n+1)`；n=12/95% 为 `[min,max]`、11/13。
+- 报告 `attained_conf`、`coverage_shortfall`、`conf_achievable`、
+  `n_needed_for_conf = ceil((1+conf)/(1-conf))`、`n_shortfall`、
+  `interval_side`、`favourable_side`、正/负/零计数与丢弃位置。
+- 少于 2 个有限值、全常数面板（零宽）、非有限端点均返回
+  `available=false` 并写原因；`conf` 拒绝布尔/字符串/NaN/Inf，
+  `direction` 只接受 -1/0/+1；非有限 delta 具名丢弃，不插补。
+- `new_seed_replication` 在原有 t 字段之外追加 `distribution_free` 块和
+  四个扁平字段，t 的 `prediction_interval`/`prediction_scale`/
+  `prob_*` 逐值不变；`paired_effect_stats` 与 `reportable_claim` 透传
+  新字段；`methodology_audit` 在 t 预测区间之后打印
+  distribution-free 区间、实际覆盖与 39-seed 规划数。
+- `build_distribution_free_prediction(deltas, conf=, direction=)` 生成
+  `{kind, schema, inputs:{deltas, conf, direction}, result:{...}}` 审计产物；
+  产物要求输入完整有限，非有限输入直接拒绝（只描述过滤样本时用区间函数
+  本身，它具名记录丢弃位置）。
+- 新增 `audit_gates.py distribution_free_prediction`（别名
+  `distribution_free` / `conformal` / `conformal_prediction` /
+  `new_seed_prediction`）与 `make conformal`：从
+  `analysis_v12/distribution_free_prediction.json` 的
+  `inputs.deltas/conf/direction` 重放区间、覆盖与最小 n；缺产物
+  `not_verifiable_locally`，篡改/夹带冻结字段 `fail`，合法但不可用的
+  产物 `not_applicable`。该门并入 `audit_gates.py report` 顶层。
+
+**Boundary.** 这是预测读数，不是新检验：没有新 p 值、不进入 Holm、
+不改 `verified`/`confirmed`、不重算 PPL、不读 test split、不改
+`CODE_SEMANTICS`。可交换性仍可能被配对初始化、共享数据顺序或 seed
+相关预算破坏；`n_needed=39` 是规划数，不是「39 个种子一定够」的证明。
+区间可以比 t 区间宽或窄，两者并列而不是二选一；`attained_conf` 是
+有限样本下界，不是对真实覆盖的估计。它不修复 winner's curse、
+checkpoint 选择、跨规模外推或缺失；文章级 n=48 的约 95.9% 覆盖也不
+绕过 §54/§55 的 64-unit 总体门槛。
+
+**Verification.** 新增 `test_review_part_81.py` 12 项：n=12 的 11/13
+与 39-seed；n=39 恰好 95%；n=79 的 `j=2`；99% 需要 199；尺度不变与
+方向；30k 次 t3 模拟覆盖与 11/13 在 Monte Carlo 误差内一致；非有限值
+丢弃；单值/空/常数拒绝；非法 conf/direction/字符串 fail-closed；t 与
+distribution-free 并列且 t 字段不变；`paired_effect_stats`/
+`reportable_claim` 回显与坏字段丢弃；严格 JSON 与确定性重放；builder
+的可重放产物与非有限输入拒绝；审计门的合法/篡改/夹带/缺产物/不可用
+分支。完整 CPU 套件在本轮最终树通过。

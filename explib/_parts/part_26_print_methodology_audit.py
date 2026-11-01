@@ -198,6 +198,28 @@ def _print_methodology_audit(report):
                 print('        predictive 95%% interval for ONE new seed: [%+.4f, %+.4f]%s '
                       '(model-based; not a CI for the mean and not a posterior)'
                       % (float(_pi[0]), float(_pi[1]), _tail))
+            _pred = e.get('new_seed_replication') or {}
+            _df = _pred.get('distribution_free') if isinstance(_pred, dict) else None
+            if isinstance(_df, dict) and _df.get('available'):
+                _di = _df.get('interval')
+                if (isinstance(_di, (list, tuple)) and len(_di) == 2
+                        and all(isinstance(v, (int, float)) and math.isfinite(v)
+                                for v in _di)):
+                    _dconf = _df.get('attained_conf')
+                    _dneed = _df.get('n_needed_for_conf')
+                    _dok = _df.get('conf_achievable')
+                    _dreq = _df.get('conf')
+                    _dreq = (float(_dreq) if isinstance(_dreq, (int, float))
+                             and math.isfinite(float(_dreq)) else 0.95)
+                    print('        distribution-free (conformal) interval for ONE new seed: '
+                          '[%+.4f, %+.4f]; attained coverage %.3f%s; %s'
+                          % (float(_di[0]), float(_di[1]),
+                             float(_dconf) if isinstance(_dconf, (int, float)) else float('nan'),
+                             ('' if _dok else ' (requested coverage NOT achievable at this n)'),
+                             ('a %.0f%% interval needs %d exchangeable seeds'
+                              % (100.0 * _dreq, int(_dneed)))
+                             if isinstance(_dneed, (int, float)) and _dneed
+                             else 'exchangeability, not normality, is the assumption'))
             _rb = e.get('paired_row_bootstrap_delta') or {}
             if _rb.get('status') == 'ok' and _rb.get('ci95_delta_ppl'):
                 print('        evaluation-row bootstrap 95%% CI for Δ: [%+.4f, %+.4f] (%d rows; row uncertainty only)' % (

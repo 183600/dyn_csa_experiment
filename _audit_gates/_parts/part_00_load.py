@@ -337,6 +337,14 @@
                检验/p 值/Holm、不改冻结判定（零 GPU；别名 lattice /
                shapley / ablation_attribution / component_attribution /
                attribution_lattice）
+  distribution_free_prediction  分布无关预测区间重放：从
+               analysis_v12/distribution_free_prediction.json（或根目录同名
+               产物）的 inputs.deltas/conf/direction 重算 order-statistic
+               区间、可达覆盖与最小 n，逐字段对账；缺产物报
+               not_verifiable_locally，篡改派生值/夹带冻结判决判 fail。
+               不读 split、不产生 p 值/Holm、不改冻结判定（零 GPU；别名
+               distribution_free / conformal / conformal_prediction /
+               new_seed_prediction）
   budget       规模核算：6ND 估算 + TimeGuard 记录对账（零 GPU）
   source       源码树身份：把当前源码字节与 plan_snapshot / summary 记录的
                source_tree 比对（逐文件 added/removed/changed；无记录时明确

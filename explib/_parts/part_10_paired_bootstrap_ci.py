@@ -139,6 +139,267 @@ def wilcoxon_signed_rank_p(deltas):
     return {'p': float(p), 'method': 'normal', 'n_nonzero': n, 'w_plus': w_plus, 'w_min': w,
             'note': f'normal approximation; exact DP is used for n<={_WILCOXON_EXACT_MAX_N}'}
 
+DISTRIBUTION_FREE_PREDICTION_POLICY = {
+    'version': 'distribution-free-prediction-1',
+    'method': 'two-sided conformal order-statistic interval',
+    'assumption': (
+        'the n calibration effects and one future effect are exchangeable; '
+        'no normal law and no common variance are assumed.  Exchangeability '
+        'is stronger than "same code, same data" but weaker than iid '
+        'normality; paired-init cores or shared data order can violate it.'
+    ),
+    'coverage': (
+        'finite-sample marginal coverage is at least 1 - 2*j/(n+1), where '
+        'j = max(1, floor((n+1)*(1-conf)/2)) and the interval is '
+        '[x_(j), x_(n+1-j)]; ties/discrete effects can only make the bound '
+        'conservative, not exact'
+    ),
+    'minimum_n': (
+        'a two-sided distribution-free interval at nominal conf requires '
+        'n >= ceil((1+conf)/(1-conf)); for 95% that is 39 exchangeable '
+        'seeds, not 12'
+    ),
+    'role': (
+        'assumption-light predictive readout for one future seed or '
+        'evaluation unit; it never changes a p-value, Holm family, frozen '
+        'verdict or confirmation decision'
+    ),
+    'boundary': (
+        'the interval is marginal over exchangeable units, not conditional '
+        'on the observed mean; it does not estimate the mean, does not '
+        'become a posterior probability, and cannot repair selection, '
+        'winner\'s curse, heterogeneous seed variance or a non-exchangeable '
+        'panel.  With n=12 the attainable two-sided coverage is 11/13 '
+        '(84.6%), so a 95% label would be a model-based extrapolation.'
+    ),
+}
+
+
+def _df_prediction_conf(value):
+    if isinstance(value, (bool, np.bool_, str, bytes, bytearray)):
+        raise ValueError(
+            'distribution_free_prediction_interval: conf must be a probability in (0, 1)')
+    try:
+        out = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(
+            'distribution_free_prediction_interval: conf must be a probability in (0, 1)') from None
+    if not (math.isfinite(out) and 0.0 < out < 1.0):
+        raise ValueError(
+            'distribution_free_prediction_interval: conf must be a probability in (0, 1)')
+    return out
+
+
+def _df_prediction_direction(value):
+    if value is None:
+        return None
+    if isinstance(value, (bool, np.bool_)):
+        raise ValueError(
+            'distribution_free_prediction_interval: direction must be -1, 0, +1 or None')
+    try:
+        out = int(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(
+            'distribution_free_prediction_interval: direction must be -1, 0, +1 or None') from None
+    try:
+        if value != out:
+            raise ValueError
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(
+            'distribution_free_prediction_interval: direction must be -1, 0, +1 or None') from None
+    if out not in (-1, 0, 1):
+        raise ValueError(
+            'distribution_free_prediction_interval: direction must be -1, 0, +1 or None')
+    return None if out == 0 else out
+
+
+def distribution_free_prediction_interval(deltas, *, conf=0.95, direction=None):
+    """Distribution-free predictive interval for ONE future exchangeable unit.
+
+    A Student-t prediction interval (``new_seed_replication``) needs an
+    explicit normal, common-variance model.  This helper uses only
+    exchangeability.  If the n observed effects and one future effect are
+    exchangeable, the rank of the future effect among the n+1 values is
+    uniform, so the order-statistic interval
+
+        [x_(j), x_(n+1-j)],  j = max(1, floor((n+1)*(1-conf)/2))
+
+    has finite-sample marginal coverage **at least** ``1 - 2*j/(n+1)``.
+    With n=12 and a nominal 95% request, j=1 and the attainable coverage is
+    only 11/13 = 84.6%: a 95% distribution-free interval would need
+    ``ceil((1+conf)/(1-conf)) = 39`` exchangeable seeds.  The function returns
+    that planning number instead of relabelling the 12-seed interval as 95%.
+
+    A constant calibration sample is refused: the order-statistic interval
+    collapses to zero width, and a zero-width interval would convert missing
+    spread information into certainty.  Non-finite inputs are dropped and
+    counted, never imputed.  The readout adds no p-value, Holm member or
+    frozen decision, and it is not a CI for the mean.
+    """
+    conf = _df_prediction_conf(conf)
+    direction = _df_prediction_direction(direction)
+    if isinstance(deltas, (str, bytes, bytearray)):
+        raise ValueError(
+            'distribution_free_prediction_interval: deltas must be an '
+            f'iterable of numbers, not a {type(deltas).__name__}')
+    try:
+        raw = list(deltas if deltas is not None else [])
+    except TypeError:
+        raise ValueError(
+            'distribution_free_prediction_interval: deltas must be an iterable') from None
+    vals, dropped = [], []
+    for i, x in enumerate(raw):
+        f = _finite_scalar(x)
+        if f is None:
+            dropped.append(i)
+        else:
+            vals.append(f)
+    n = len(vals)
+    out = {
+        'kind': 'distribution_free_prediction_interval',
+        'version': DISTRIBUTION_FREE_PREDICTION_POLICY['version'],
+        'available': False,
+        'n': n,
+        'n_input': len(raw),
+        'n_dropped': len(dropped),
+        'dropped_positions': dropped,
+        'conf': float(conf),
+        'direction': direction,
+        'interval': None,
+        'attained_conf': None,
+        'conf_achievable': None,
+        'coverage_shortfall': None,
+        'n_needed_for_conf': None,
+        'n_shortfall': None,
+        'order_statistic_j': None,
+        'interval_width': None,
+        'interval_side': None,
+        'favourable_side': None,
+        'n_positive': sum(1 for x in vals if x > 0.0),
+        'n_negative': sum(1 for x in vals if x < 0.0),
+        'n_zero': sum(1 for x in vals if x == 0.0),
+        'method': DISTRIBUTION_FREE_PREDICTION_POLICY['method'],
+        'assumption': DISTRIBUTION_FREE_PREDICTION_POLICY['assumption'],
+        'policy': dict(DISTRIBUTION_FREE_PREDICTION_POLICY),
+        'role': DISTRIBUTION_FREE_PREDICTION_POLICY['role'],
+        'reason': None,
+    }
+    if n < 2:
+        out['reason'] = ('a distribution-free predictive interval needs at '
+                         'least 2 exchangeable calibration units; one value '
+                         'carries no rank information')
+        return out
+    d = np.sort(np.asarray(vals, dtype=float))
+    if not bool(np.all(np.isfinite(d))):
+        out['reason'] = 'at least one calibration effect is not finite'
+        return out
+    # Largest two-sided order-statistic interval whose coverage is at least
+    # the request.  j is a count of trimmed observations per side; j >= 1, so
+    # the interval is never empty and always uses observed order statistics.
+    alpha = 1.0 - conf
+    j = int(math.floor((n + 1) * alpha / 2.0))
+    if j < 1:
+        j = 1
+    if j > n // 2:
+        # Only reachable for very small nominal coverage; use the narrowest
+        # non-empty central interval rather than an invalid pair of indices.
+        j = n // 2
+    if j < 1 or j > n // 2:
+        out['reason'] = 'no non-empty order-statistic interval exists at this n/conf'
+        return out
+    lo_idx, hi_idx = j - 1, n - j
+    lo_v, hi_v = float(d[lo_idx]), float(d[hi_idx])
+    if not (math.isfinite(lo_v) and math.isfinite(hi_v)):
+        out['reason'] = 'the order-statistic endpoints are not finite'
+        return out
+    if hi_v == lo_v:
+        out['reason'] = ('all calibration effects are equal; the '
+                         'order-statistic interval collapses to zero width '
+                         'and cannot represent a future unit\'s spread')
+        return out
+    attained = 1.0 - 2.0 * j / (n + 1.0)
+    _ratio = (1.0 + conf) / (1.0 - conf)
+    n_needed = (int(math.ceil(_ratio - 1e-12))
+                if math.isfinite(_ratio) else None)
+    width = hi_v - lo_v
+    if not math.isfinite(width):
+        width = None
+    if hi_v < 0.0:
+        side = 'below_zero'
+    elif lo_v > 0.0:
+        side = 'above_zero'
+    else:
+        side = 'spans_zero'
+    favourable = None
+    if direction == -1:
+        favourable = True if hi_v < 0.0 else (False if lo_v > 0.0 else None)
+    elif direction == 1:
+        favourable = True if lo_v > 0.0 else (False if hi_v < 0.0 else None)
+    out.update({
+        'available': True,
+        'interval': [lo_v, hi_v],
+        'attained_conf': float(attained),
+        'conf_achievable': bool(attained + 1e-12 >= conf),
+        'coverage_shortfall': float(max(0.0, conf - attained)),
+        'n_needed_for_conf': n_needed,
+        'n_shortfall': (int(max(0, n_needed - n))
+                        if n_needed is not None else None),
+        'order_statistic_j': int(j),
+        'interval_width': width,
+        'interval_side': side,
+        'favourable_side': favourable,
+    })
+    return out
+
+
+def build_distribution_free_prediction(deltas, *, conf=0.95, direction=None):
+    """Build the replayable artifact consumed by the audit gate.
+
+    The artifact is a replay input, so it requires a finite, complete
+    calibration vector: a JSON artifact must not carry NaN/Inf, and dropping
+    a value would make the stored ``n_input``/``n_dropped`` disagree with a
+    replay from the remaining values.  Direct callers that need to *describe*
+    a filtered sample should use :func:`distribution_free_prediction_interval`,
+    which reports the dropped positions without pretending the input was
+    complete.
+    """
+    if isinstance(deltas, (str, bytes, bytearray)):
+        raise ValueError(
+            'build_distribution_free_prediction: deltas must be an iterable '
+            f'of numbers, not a {type(deltas).__name__}')
+    try:
+        raw = list(deltas if deltas is not None else [])
+    except TypeError:
+        raise ValueError(
+            'build_distribution_free_prediction: deltas must be an iterable') from None
+    result = distribution_free_prediction_interval(
+        raw, conf=conf, direction=direction)
+    finite, dropped = [], []
+    for i, x in enumerate(raw):
+        f = _finite_scalar(x)
+        if f is None:
+            dropped.append(i)
+        else:
+            finite.append(f)
+    if dropped:
+        raise ValueError(
+            'build_distribution_free_prediction: artifact inputs must be '
+            f'finite; non-finite position(s) {dropped} cannot be replayed '
+            'from a strict-JSON artifact (use '
+            'distribution_free_prediction_interval for a filtered descriptive '
+            'readout instead)')
+    return {
+        'kind': 'distribution_free_prediction_artifact',
+        'schema': 1,
+        'inputs': {
+            'deltas': finite,
+            'conf': result['conf'],
+            'direction': result['direction'],
+        },
+        'result': result,
+    }
+
+
 _NEW_SEED_ASSUMPTION = (
     'exchangeable iid normal seed effects with a common mean and variance; '
     'the Student-t predictive law is a model-based summary, not a posterior '
@@ -171,6 +432,14 @@ def new_seed_replication(deltas, *, conf=0.95, direction=None):
       * ``prob_improvement``: when ``direction`` is +1 (larger is better) or
         -1 (smaller is better), the model-based probability that a new seed
         is better than zero.  ``direction=None`` leaves it undefined.
+
+    The same call also attaches a **distribution-free** order-statistic
+    (conformal) interval from :func:`distribution_free_prediction_interval`.
+    That block needs only exchangeability, reports the coverage actually
+    attainable at this n, and states how many seeds a nominal interval would
+    require (39 for 95% two-sided).  With n=12 the attainable coverage is
+    11/13, so the t interval must not be quoted as a 95% distribution-free
+    guarantee.
 
     A zero sample SD (a degenerate, constant panel) is refused rather than
     turned into a zero-width prediction interval: it carries no estimate of
@@ -232,8 +501,20 @@ def new_seed_replication(deltas, *, conf=0.95, direction=None):
         'assumption': _NEW_SEED_ASSUMPTION,
         'role': ('prospective descriptive readout; it is not used to change any '
                  'p-value, Holm family, confirmation verdict or frozen decision'),
+        'distribution_free': None,
+        'distribution_free_interval': None,
+        'distribution_free_attained_conf': None,
+        'distribution_free_conf_achievable': None,
+        'distribution_free_n_needed': None,
         'reason': None,
     }
+    _df = distribution_free_prediction_interval(
+        raw, conf=conf, direction=direction)
+    out['distribution_free'] = _df
+    out['distribution_free_interval'] = _df.get('interval')
+    out['distribution_free_attained_conf'] = _df.get('attained_conf')
+    out['distribution_free_conf_achievable'] = _df.get('conf_achievable')
+    out['distribution_free_n_needed'] = _df.get('n_needed_for_conf')
     if n < 2:
         out['reason'] = ('a one-seed panel gives no estimate of between-seed '
                          'spread; the predictive interval is undefined')
@@ -390,7 +671,7 @@ def paired_effect_stats(deltas, alpha=0.05, min_n=3, with_values=None, without_v
                     'complete_pairs': complete_pairs,
                     'seeds': seed_labels}
     if n == 0:
-        return {'n': 0, 'mean': float('nan'), 'std': float('nan'), 'std_defined': False, 'sem': float('nan'), 'cohens_dz': float('nan'), 'ci95_low': float('nan'), 'ci95_high': float('nan'), 'loo_means': [], 'seed_driven': None, 'seed_robust': None, 'p_exact_signflip': float('nan'), 'p_floor': float('nan'), 'min_reachable_p': float('nan'), 'underpowered': True, 'resolution_limited': True, 'within_seed_noise': True, 'significant': False, 'effect_vs_noise': 'no data', 'unit': 'seed', 'assumption': 'none (no data)', 'sign_counts': {'positive': 0, 'negative': 0, 'zero': 0}, 'p_wilcoxon': None, 'p_wilcoxon_method': None, 'ci95_paired_bootstrap': None, 'ci95_unpaired_bootstrap': None, 'prediction_interval_95': None, 'prob_new_seed_same_sign': None, 'new_seed_replication': new_seed_replication(d), **_pair_fields}
+        return {'n': 0, 'mean': float('nan'), 'std': float('nan'), 'std_defined': False, 'sem': float('nan'), 'cohens_dz': float('nan'), 'ci95_low': float('nan'), 'ci95_high': float('nan'), 'loo_means': [], 'seed_driven': None, 'seed_robust': None, 'p_exact_signflip': float('nan'), 'p_floor': float('nan'), 'min_reachable_p': float('nan'), 'underpowered': True, 'resolution_limited': True, 'within_seed_noise': True, 'significant': False, 'effect_vs_noise': 'no data', 'unit': 'seed', 'assumption': 'none (no data)', 'sign_counts': {'positive': 0, 'negative': 0, 'zero': 0}, 'p_wilcoxon': None, 'p_wilcoxon_method': None, 'ci95_paired_bootstrap': None, 'ci95_unpaired_bootstrap': None, 'prediction_interval_95': None, 'prob_new_seed_same_sign': None, 'distribution_free_prediction_95': None, 'distribution_free_attained_conf': None, 'distribution_free_conf_achievable': None, 'distribution_free_n_needed': None, 'new_seed_replication': new_seed_replication(d), **_pair_fields}
     # A single seed has no sample spread.  Keep the historical numeric 0.0 for
     # backward-compatible consumers, but mark it explicitly so a report cannot
     # quote it as a measured zero-variance result.
@@ -535,6 +816,10 @@ def paired_effect_stats(deltas, alpha=0.05, min_n=3, with_values=None, without_v
             'ci95_paired_bootstrap': _paired_ci, 'ci95_unpaired_bootstrap': _unpaired_ci,
             'prediction_interval_95': _pred.get('prediction_interval'),
             'prob_new_seed_same_sign': _pred.get('prob_same_sign'),
+            'distribution_free_prediction_95': _pred.get('distribution_free_interval'),
+            'distribution_free_attained_conf': _pred.get('distribution_free_attained_conf'),
+            'distribution_free_conf_achievable': _pred.get('distribution_free_conf_achievable'),
+            'distribution_free_n_needed': _pred.get('distribution_free_n_needed'),
             'new_seed_replication': _pred,
             **_pair_fields}
 
