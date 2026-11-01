@@ -142,6 +142,38 @@ def signflip_power(n_seeds, m_comparisons, q, alpha=0.05):
     return float(min(1.0, max(0.0, tail)))
 
 
+def _attach_exact_tost_companion(out, deltas, margin, conf):
+    """Attach the distribution-free TOST companion without moving t fields.
+
+    The t-based ``equivalent``/``p_tost``/``ci`` remain the historical
+    decision.  The nested ``distribution_free`` block is a descriptive
+    robustness readout: it reports the exact sign-flip one-sided p-values,
+    their discrete floor, and whether the exact test agrees with the t
+    decision.  No key of the t readout is rewritten.
+    """
+    helper = globals().get('_exact_tost_companion')
+    if helper is None:
+        return out
+    try:
+        block = helper(deltas, margin=margin, conf=conf)
+    except Exception as e:  # defensive: a report must not die on one margin
+        block = {
+            'kind': 'exact_signflip_tost', 'schema': 1,
+            'status': 'not_estimable',
+            'reason': f'{type(e).__name__}: {e}',
+            'equivalent': None,
+        }
+    block = dict(block)
+    block['t_equivalent'] = out.get('equivalent')
+    if (block.get('equivalent') is not None
+            and out.get('equivalent') is not None):
+        block['agreement'] = bool(block['equivalent'] == out['equivalent'])
+    else:
+        block['agreement'] = None
+    out['distribution_free'] = block
+    return out
+
+
 def tost_paired(deltas, margin, conf=0.90):
     """配对 TOST 等价性检验（G0 训练级等价门槛的统计件）。
 
@@ -151,7 +183,9 @@ def tost_paired(deltas, margin, conf=0.90):
     t 临界值比 z 宽约 20%，用 z 会把「未判等价」误判成等价。返回两侧
     单边 p、conf 水平 CI 与 `equivalent` 判定。margin 必须由计划预先注册
     （如 kernel/eager 面板平均 PPL 相对差 <1%）；本函数不替调用方选择
-    margin。n<2 或 margin<=0 时不判定。"""
+    margin。n<2 或 margin<=0 时不判定。结果在 t 字段之后附带
+    `distribution_free` 精确符号翻转 TOST 伴随块；它只作分布无关的
+    稳健性读数，不改变这里的 t 判定。"""
     if isinstance(deltas, (str, bytes, bytearray, dict)):
         raise ValueError('tost_paired: deltas must be an iterable of numbers, '
                          f'not a {type(deltas).__name__}')
@@ -176,7 +210,7 @@ def tost_paired(deltas, margin, conf=0.90):
             or not math.isfinite(conf) or not (0.0 < conf < 1.0)):
         out['note'] = ('not decidable (n<2, non-positive/non-finite margin, '
                        'or conf outside (0,1))')
-        return out
+        return _attach_exact_tost_companion(out, d, margin, conf)
     # A finite but extreme panel can overflow ``mean +/- t*se`` even when the
     # interval is representable, and ``margin - mean`` can overflow before the
     # t statistic is formed.  Both are scale-invariant quantities: compute them
@@ -265,7 +299,7 @@ def tost_paired(deltas, margin, conf=0.90):
     # input units even though this containment question is still decidable.
     out['ci_within_margin'] = bool(ci_lo_work > -margin_work
                                    and ci_hi_work < margin_work)
-    return out
+    return _attach_exact_tost_companion(out, d, margin, conf)
 
 
 # ---- 消融的实际显著性：预注册 SESOI + 配对 TOST ---------------------------

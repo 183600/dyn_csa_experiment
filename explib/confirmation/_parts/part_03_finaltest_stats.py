@@ -1646,6 +1646,62 @@ def _practical_significance_markdown(block):
           f"{_n(r.get('p_tost'), '.4g')} | {_n(r.get('p_tost_holm'), '.4g')} | "
           f"{_n(r.get('p_beyond_holm'), '.4g')} | {r.get('status') or '—'} |")
     A('')
+    exact_rows = []
+    for name in (block.get('family_names') or list(rows)):
+        r = rows.get(name) or {}
+        df = r.get('distribution_free')
+        if isinstance(df, dict) and df.get('status') == 'ok':
+            exact_rows.append((name, r, df))
+    if exact_rows:
+        A('#### 精确符号翻转 TOST 伴随读数（分布无关）')
+        A('')
+        A('| 比较 | n | p_low | p_high | p_tost | 单侧分辨率下限 | 精确等价 | t-TOST 判定 | 分辨率最小 n |')
+        A('|---|---|---|---|---|---|---|---|---|')
+        for name, r, df in exact_rows:
+            agree = df.get('agreement')
+            if agree is True:
+                agree_t = '一致'
+            elif agree is False:
+                agree_t = '不一致'
+            else:
+                agree_t = '—'
+            if df.get('resolution_limited') is True:
+                eq_t = '分辨率不足'
+            elif df.get('equivalent') is True:
+                eq_t = '是'
+            elif df.get('equivalent') is False:
+                eq_t = '否'
+            else:
+                eq_t = '—'
+            A(f"| {name} | {df.get('n', '—')} | "
+              f"{_n(df.get('p_low'), '.4g')} | {_n(df.get('p_high'), '.4g')} | "
+              f"{_n(df.get('p_tost'), '.4g')} | "
+              f"{_n(df.get('p_floor_by_n'), '.4g')} | {eq_t} | {agree_t} | "
+              f"{df.get('min_n_for_alpha', '—')} |")
+        A('')
+        A('> **精确伴随读数**：p_low 检验 `mean <= -margin`，p_high 检验 '
+          '`mean >= margin`；p_tost 取两者较大值。单侧符号翻转 p 的最小可达值'
+          '是 `1/2**n`，所以在 `1/2**n >= alpha` 时，即使所有配对差都为零也'
+          '不可能判等价；此时「不显著」是分辨率不足，不是等价证据。精确检验'
+          '只要求平移后的配对差关于零对称，比配对 t 的正态假设弱，但在正态'
+          '成立时通常不会更高；它与 t-TOST 并列报告，不替换预注册的 t 判定，也'
+          '不进入冻结 Holm 族。')
+        A('')
+        disagree = [name for name, _r, df in exact_rows
+                    if df.get('agreement') is False]
+        limited = [name for name, _r, df in exact_rows
+                   if df.get('resolution_limited') is True]
+        if disagree:
+            A('**精确 TOST 提醒**：' + '；'.join(f'`{k}`' for k in disagree)
+              + ' 的 t-TOST 判等价，但精确符号翻转不判等价。引用时必须同时'
+                '给出两者，不能把 t-only 的等价写成分布无关结论；最可能是'
+                '零方差/极小 n 的退化样本。')
+            A('')
+        if limited:
+            A('**分辨率提醒**：' + '；'.join(f'`{k}`' for k in limited)
+              + ' 的精确单侧 p 下限 `1/2**n >= alpha`，即使所有配对差都为零'
+                '也不可能判等价；这是分辨率不足，不是「未发现差异」。')
+            A('')
     if pol.get('source') == 'library_policy':
         A('> **口径提醒**：当前冻结清单没有声明主对照 SESOI。上表使用库级策略'
           f'（1% 相对 PPL，TOST {pol.get("tost_conf", 0.95):.2f}）作为'

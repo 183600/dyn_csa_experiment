@@ -400,6 +400,13 @@
                缺块报 not_verifiable，篡改读数/夹带冻结字段判 fail；
                不改变冻结 p/Holm/confirmed（零 GPU；别名 practical /
                sesoi_confirmation / equivalence）
+  exact_tost   结果分析：TOST 的分布无关伴随读数——对 d+margin 与 margin-d
+               分别做精确符号翻转单侧检验，报告 p_lo/p_hi/p_tost、
+               离散分辨率下限 1/2**n、所需最小 n 与 t-TOST 是否一致；
+               重放 analysis_v12/exact_tost.json 或 test_stats 内嵌块，
+               缺产物 not_verifiable、篡改判 fail；不改变 t-TOST 判定、
+               冻结 p/Holm/confirmed（零 GPU；别名 randomization_tost /
+               distribution_free_tost / exact_equivalence）
   calibration  统计机器的零假设校准：精确符号翻转 / MITM / n>40 鞍点 /
                max-over-looks 序列 p / 配对 TOST / Holm 的负控制（超发率）
                与正控制（灵敏度），以及 seed-t / paired bootstrap-t /

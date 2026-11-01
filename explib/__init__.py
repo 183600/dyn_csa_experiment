@@ -87,6 +87,7 @@ _PARTS = [
 'part_74_design_estimability.py',
 'part_75_article_sidecar.py',
 'part_76_type_sm_design.py',
+'part_77_exact_tost.py',
 ]
 
 load_root_package(globals(), __file__, _PARTS,

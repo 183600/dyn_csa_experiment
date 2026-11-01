@@ -6830,3 +6830,67 @@ test split、不改 `CODE_SEMANTICS`。正态位置模型是近似；Bonferroni 
 `not_verifiable` 并列出 6 条对照；`python -m explib.confirmation plan`
 仍在 72/72 合成记录、6 个比较上通过，并在 snapshot 中写入
 `type_sm` 块；`python audit_gates.py report` 顶层含 `type_sm`。
+
+## 2026-11-01 — 等价性不能只靠 t 近似：精确符号翻转 TOST 的离散分辨率（本轮结果分析硬化，no new runs）
+
+零 GPU；不新增训练、不读取任何 split、不修改
+`confirmation_frozen*.json` 的字节/臂/种子/端点/α/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未删除、未修改、未移动。
+
+**Problem.** 确认性优越性用逐种子精确符号翻转，但等价性一直用配对 t
+的 TOST。两者假设不同：t 还依赖近似正态与样本 SD；当 SD 恰为 0 时，
+旧路径把 `se -> 0` 的极限当成无限信息，`[0.001, 0.001]`、`margin=0.1`
+会返回 `p_tost=0`、`equivalent=True`——两个种子就能「证明等价」。更一般
+地，单侧符号翻转 p 的离散下限是 `1/2**n_nonzero`：`n=4` 时
+`1/16=0.0625>0.05`，即使四个差全为零也不能在 5% 水平判等价；旧 t-TOST
+不报这个下限，读者会把「等价」读成数据结论而不是分辨率事实。
+
+**Fix.** 新增 `explib/_parts/part_77_exact_tost.py`：
+
+- `exact_signflip_tost(deltas, margin, conf=0.90)` 对 `d+M` 和 `M-d`
+  分别做单侧精确符号翻转检验，TOST p 取 `max(p_low,p_high)`；
+  `alpha_one=(1-conf)/2`。`n<=20` 枚举、`20<n<=40` meet-in-the-middle、
+  `n>40` 确定性鞍点单侧尾；面板先按 `max(|d_i|,M)` 共同缩放，避免
+  `d_i+M` 在 `1e308` 附近溢出。报告 `p_low/p_high/p_tost`、
+  `p_floor`（本面板实际下限）、`p_floor_by_n=2**-n`、
+  `resolution_limited`、`min_n_for_alpha`、`method`。
+- `tost_paired` 在原有 t 字段之后追加嵌套 `distribution_free` 块，
+  并写 `t_equivalent` / `agreement`；t 的 `p_tost`/`ci`/`equivalent`/
+  `alpha_one_sided` 逐值不变。`confirmation_practical_significance`
+  同样追加该块，`status`/`p_tost`/`equivalent`/Holm 族不变；
+  `confirmation_practical_family` 把块透传到汇总行，
+  `_practical_significance_markdown` 增加精确伴随表。
+- `build_exact_tost` / `validate_exact_tost` / `write_exact_tost`：
+  `inputs={deltas,margin,conf}` + `result`，`content_sha256` 只排除
+  `created_at` 与自身；从 inputs 完整重算并逐字段对账；缺 hash、改派生
+  值、夹带 `confirmed`/`p_holm`/`verified`/`verdict`/`decision` 均 fail。
+  builder 拒绝非有限 delta、`n<2`、非法 margin/conf。
+- 新增 `audit_gates.py exact_tost`（别名 `exact_tost_audit` /
+  `randomization_tost` / `distribution_free_tost` /
+  `exact_equivalence`）：优先重放 `analysis_v12/exact_tost.json`，否则
+  扫描 `analysis_v12/test_stats.json`（或 `stats.json`）的
+  `practical_significance` 内嵌块；缺产物 `not_verifiable_locally`，
+  legacy 缺块 `warnings`，篡改 `fail`。`exact_tost_artifact` 是单产物
+  重放别名。`audit_gates.py report` 顶层新增 `exact_tost`；新增
+  `make exact-tost`。
+
+**Boundary.** 这是描述性伴随读数，不进入冻结 Holm 族，不改变
+`p_exact_signflip`/`p_holm`/`verified`/`confirmed`/`confirmed_effective`，
+不重算 PPL，不读 test split，不改 `CODE_SEMANTICS`。精确符号翻转只要求
+平移后的配对差关于零对称，比配对 t 的正态假设弱，但在正态成立时通常
+不会更有功效；p 是离散的，`p_tost=1/2**n` 不是效应大小的估计。若未来要把它
+作为主判定，必须在首次 test 读取前显式预注册假设、margin、`conf` 与族
+规则。它不修复缺失、winner's curse、checkpoint 选择、文章/文档聚类或
+跨语料外推；旧产物没有该块时只报 warnings/not_verifiable，不追溯判
+pass 或 fail。
+
+**Verification.** 新增 `test_review_part_83.py` 16 项：与独立 `2**n`
+枚举逐值对账；明确等价/不等价/边界；`n=4`/`n=5` 的离散下限与 95% 的
+`n=6`；退化 t 等价被点名为 `agreement=False`；已分辨面板 t 与精确一致；
+尺度不变与 `1e308`/`1e-200` 极端面板；非有限值丢弃、非法 margin/conf/
+`n<2`/字符串 fail-closed；产物 hash/round-trip/确定性、六类篡改拒绝；
+builder 拒绝不可重放输入；gate 对 artifact 的 ok/fail/缺失、对 stats
+内嵌块的 ok/篡改/legacy 与 zero_effect 行；practical significance 零效应与等价面板；歧义 t-TOST 被 gate
+降为 warnings；报告 Markdown 出现精确表与提醒；`_PARTS`/Makefile/CLI/report 接线与 `.github`/
+README 仍存在。`python audit_gates.py report` 顶层含 `exact_tost`；
+完整 CPU 套件在本轮最终树通过。

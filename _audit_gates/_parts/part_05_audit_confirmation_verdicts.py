@@ -1986,6 +1986,7 @@ def run_report(out='audit_report.json'):
     res['design_estimability'] = audit_design_estimability(verbose=False)
     res['distribution_free_prediction'] = audit_distribution_free_prediction()
     res['type_sm'] = audit_type_sm(verbose=False)
+    res['exact_tost'] = audit_exact_tost(verbose=False)
     res['data_exposure'] = audit_data_exposure()
     if str(os.environ.get('CSA_REPLAY_IN_REPORT', '')).strip().lower() in (
             '1', 'true', 'yes', 'on'):
@@ -2088,6 +2089,14 @@ def _run_cli():
     _cmds.update({'type_sm_artifact': audit_type_sm_artifact,
                   'type_sm_replay': audit_type_sm_artifact,
                   'type_sm_validation': audit_type_sm_artifact})
+    _cmds.update({'exact_tost': audit_exact_tost,
+                  'exact_tost_audit': audit_exact_tost,
+                  'randomization_tost': audit_exact_tost,
+                  'distribution_free_tost': audit_exact_tost,
+                  'exact_equivalence': audit_exact_tost})
+    _cmds.update({'exact_tost_artifact': audit_exact_tost_artifact,
+                  'exact_tost_replay': audit_exact_tost_artifact,
+                  'exact_tost_validation': audit_exact_tost_artifact})
     _arg = sys.argv[1] if len(sys.argv) > 1 else 'report'
     if _arg in ('-h', '--help'):
         print(__doc__)
@@ -2152,7 +2161,11 @@ def _run_cli():
                 'conformal', 'conformal_prediction', 'new_seed_prediction',
                 'type_sm', 'type_sm_design', 'sign_magnitude_error',
                 'sign_magnitude', 'design_type_sm', 'exaggeration',
-                'type_sm_artifact', 'type_sm_replay', 'type_sm_validation'):
+                'type_sm_artifact', 'type_sm_replay', 'type_sm_validation',
+                'exact_tost', 'exact_tost_audit', 'randomization_tost',
+                'distribution_free_tost', 'exact_equivalence',
+                'exact_tost_artifact', 'exact_tost_replay',
+                'exact_tost_validation'):
         _r = _cmds[_arg](*_pos)
     elif _arg in ('test_access', 'test_access_audit', 'heldout', 'test_looks',
                   'environment_identity', 'environment', 'env_drift',

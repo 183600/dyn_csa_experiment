@@ -260,7 +260,9 @@ def confirmation_practical_significance(deltas, *, margin=None, alpha=0.05,
 
     It never selects the margin from the data and never changes the frozen
     p/Holm/verdict.  A missing margin is ``not_declared`` rather than a
-    guessed threshold.
+    guessed threshold.  The returned row also carries a descriptive
+    ``distribution_free`` exact sign-flip TOST companion, whose p-values and
+    discrete resolution floor do not alter the t-based ``equivalent`` field.
     """
     a = _cp_number(alpha, 'alpha')
     if not (0.0 < a < 1.0):
@@ -527,6 +529,9 @@ def confirmation_practical_significance(deltas, *, margin=None, alpha=0.05,
                    'they are not added to the frozen Holm family and '
                    'never change `confirmed`.  `equivalent_within_sesoi` means '
                    'smaller than the practical margin, not exactly zero.')
+    _attach = globals().get('_attach_exact_tost_companion')
+    if _attach is not None:
+        out = _attach(out, arr, float(margin), float(conf))
     return out
 
 
@@ -632,6 +637,7 @@ def confirmation_practical_family(comparisons, *, confirmed=(), policy=None,
             'equivalent': blk.get('equivalent'),
             'beyond_sesoi': blk.get('beyond_sesoi'),
             'expected_sign': blk.get('expected_sign'),
+            'distribution_free': blk.get('distribution_free'),
         }
     # The beyond-margin family uses the declared superiority level.  The TOST
     # family must use the level implied by the policy's declared confidence
