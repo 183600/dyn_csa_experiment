@@ -13016,3 +13016,121 @@ missing 状态；`model=cell_means` 的 warning；非法 model/空输入/重复
 对照名/全零权重/因子缺臂 fail-closed；两种 factors 形状 round-trip；
 `_PARTS`/Makefile/CLI/report 接线且输出不含 p/Holm/verdict 字段。
 完整 CPU 套件在本轮最终树通过。
+
+## 138. 文章级评测单位必须写进缓存身份，而不是每次分析时重解码（本轮数据方法硬化，no new runs）
+
+### 138.1 问题
+
+§53/§54 已经把「一行 WikiText 不是一篇文章」变成审计诊断，并让
+`eval_length_gen` 接受 `article_ids=` 来按文章聚类。但文章映射一直是从
+**已落盘的逐 token 行映射**在分析时解码重建的：
+
+- 它不在缓存身份里。换了 tokenizer、解码器行为或代码后，同一批 token
+  可能得到不同的文章标签，而 `test_fp`/`val_fp`/`doc_ids` 都不会变；
+- legacy cache 没有 decoder 时只能回退行级，文章级区间不可用；
+- 冻结 test slice 读完后，文章聚类没有自己的长度/摘要绑定，审计只能
+  “重算一遍再相信”，不能先验证缓存自带的单位；
+- §54.6 明确写着「未来应在首次 test 读取前写 `test_token_article_ids_*`」。
+  本轮把这个未来入口落地。
+
+### 138.2 追加式侧车
+
+新构建的 WikiText validation / test cache 在原有 line 侧车之外写一个
+**逐 token 文章 id** 侧车：
+
+```text
+val_token_article_ids_{tag}.npy
+test_token_article_ids_{tag}.npy
+```
+
+数组与 served token 一一对齐；每个值是由
+
+```text
+article cluster id = u64(blake2b128(group_ordinal, normalized_title))
+```
+
+得到的聚类标签（与 §54 的 `_article_cluster_ids` 同一规则）。test 侧在
+tokenisation 后用 raw rows + 每行 token 长度构造，不重新读
+`wiki.test.raw`；validation 侧用已经落盘的 token + line 映射解码构造。
+两条路径都复用现有 `wikitext_token_article_ids_for_rows` /
+`wikitext_token_article_ids_from_line_map`，不产生新的 token 或切分。
+
+meta 增加：
+
+```text
+article_sidecars       = true / false
+article_unit.schema    = wikitext_article_sidecar_v1
+article_unit.split     = validation / test
+article_unit.unit      = article
+article_unit.available / valid_for_clustering
+article_unit.token_article_count / token_article_fp
+article_unit.n_lines / n_articles / pseudoreplication_factor
+article_unit.sidecar_file / sidecar_sha256
+article_unit.source    = raw_rows / decoded_line_map
+```
+
+`document_unit` 仍是 `line`，`document_unit_is_article` 仍是 false；文章
+侧车是**追加证据**，不替换冻结的行级契约。没有顶层 ` = Title = ` 标题
+时，meta 记录 `available=false` 并给出理由，不写一个把整个切片当成一篇
+文章的假侧车。
+
+### 138.3 读取与验证
+
+`load_cached_article_ids(cache_dir, split='test'|'validation', ...)` 是
+分析侧读取入口。它同时检查：
+
+- 侧车长度等于该 split 实际 served 的 token 数；
+- `sidecar_sha256`、`token_article_fp`、`token_article_count` 与文件一致；
+- 每个 served line 恰好映射到一个文章（文章可以跨多行，但一行不能
+  被拆到两篇文章）；
+- `n_lines` / `n_articles` 与向量一致；
+- 请求的形状能整除 token 数。
+
+声明了侧车但文件缺失/摘要不符/嵌套矛盾时，`strict=False` 返回
+`None` 并给出 `article_sidecar_invalid` + problems（分析保留显式行级
+回退）；`strict=True` 直接拒绝。legacy cache 返回
+`legacy_no_article_sidecar`，不是错误。cache-hit 路径对 test 侧车
+fail-closed（冻结切片不能静默降级），对 train/validation 沿既有策略
+重建并打印原因。
+
+P5T 的 `_resolve_test_article_ids` **优先读缓存侧车**；只有 legacy/
+unavailable 时才回退到解码行映射。两种路径返回的是同一文章聚类，但
+侧车路径不依赖分析时的解码。
+
+### 138.4 审计：比较分区，不比较标签哈希
+
+`audit_gates.audit_document_unit` 现在同时报告 test/validation 的
+`article_sidecar`：
+
+- `verified`：侧车结构自洽，且与解码重建的文章**分区**一致；
+- `legacy_absent`：旧 cache 没有侧车，保留显式行级回退；
+- `fail`：声明了却缺失、摘要/长度/嵌套不符，或分区与解码不一致。
+
+文章 id 是聚类**标签**。审计比较的是「哪些 served 行属于同一篇」这一
+分区，而不是要求两套实现产生完全相同的哈希：标题解码出现无害空白/字符
+差异不应被误报成聚类变化；真正的合并/拆分仍会破坏标签双射并判 fail。
+审计从不读 `wiki.test.raw`。
+
+### 138.5 边界
+
+- **不改**任何 token、split 成员、训练/评测切片、池化 PPL、种子、
+  alpha/Holm、`verified`/`confirmed`、`CODE_SEMANTICS` 或
+  `confirmation_frozen*.json`。`CODE_SEMANTICS` 不 bump。
+- 只为 validation/test 写逐 token 侧车；train 的逐 token 文章侧车会是
+  数十 GB 且没有消费者，不写。
+- 切片末尾被 cap 截断的文章仍是一个 cluster，但它的 id 只基于切片内
+  可见的标题/组序号，不声称与全文文章 id 相同。
+- 没有顶层标题时明确 `available=false`，不猜文章边界。
+- 旧 cache 不回填、不重跑；P5T 对旧 cache 继续走已记录的解码回退。
+- 文章级区间仍只描述冻结切片的文章抽样；`n<64` 时种群主张继续拒绝。
+
+### 138.6 验证
+
+新增 `test_review_part_80.py` 12 项：raw-row 与 decode 两条路径分区一致；
+文章 id 不是原始行 id；validation/test 侧车写入与读取；行被拆到两篇文章
+被拒；count/fp/缺失 attestation fail-closed；无标题只记录 unavailable；
+legacy cache 显式 `legacy_absent`；test 侧车篡改在 cache hit 被拒；
+自洽但分区不同的侧车被审计判 fail；P5T 优先侧车；形状不符/缺缓存诊断；
+`_PARTS` 注册与 `document_unit='line'` 契约不变。现有
+`test_review_part_10.py` / `test_review_part_62.py` /
+`test_review_part_63.py` / `test_review_part_22.py` 仍全部通过。

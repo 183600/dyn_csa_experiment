@@ -985,18 +985,22 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=None, val_seqs=512,
     # would be tens of GB and has no consumer.  Keep train document ids at the
     # document level.
     vad_tok_path = os.path.join(cache_dir, f'val_token_doc_ids_{tag}.npy')
+    # Additive article map for the selection split (one id per served token).
+    vta_path = os.path.join(cache_dir, f'val_token_article_ids_{tag}.npy')
     if all((os.path.exists(p) for p in (tr_path, va_path, vp_path, me_path))):
-        _sig = _memo_file_sig({'train': tr_path, 'val': va_path,
-                               'bnd': vp_path, 'meta': me_path,
-                               # Verification reads the document-id
-                               # sidecars too; omitting them let a replaced
-                               # sidecar be served from an already-verified
-                               # memo entry without re-running the
-                               # leakage/disjointness checks.
-                               'train_doc_ids': trd_path,
-                               'val_doc_ids': vad_path,
-                               'val_token_doc_ids': vad_tok_path,
-                               'tokenizer': os.path.join(cache_dir, f'tok_{tag}.json')})
+        _sig_paths = {'train': tr_path, 'val': va_path,
+                      'bnd': vp_path, 'meta': me_path,
+                      # Verification reads the document-id sidecars too;
+                      # omitting them let a replaced sidecar be served from an
+                      # already-verified memo entry without re-running the
+                      # leakage/disjointness checks.
+                      'train_doc_ids': trd_path,
+                      'val_doc_ids': vad_path,
+                      'val_token_doc_ids': vad_tok_path,
+                      'tokenizer': os.path.join(cache_dir, f'tok_{tag}.json')}
+        if os.path.exists(vta_path):
+            _sig_paths['val_token_article_ids'] = vta_path
+        _sig = _memo_file_sig(_sig_paths)
         _mkey = (os.path.abspath(cache_dir), tag, _sig)
         _hit = _WT103_MEMO.get(_mkey)
         if _hit is not None:
@@ -1168,6 +1172,72 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=None, val_seqs=512,
             _problems.append(
                 'cache has no document-id sidecars; whole-document group '
                 'isolation cannot be verified — rebuild the corpus cache')
+        # The additive article sidecar is part of the evaluation-unit identity
+        # when declared.  It is optional for legacy caches (which keep the
+        # explicit line-level fallback), but a declared file that is missing or
+        # inconsistent must not be served as article-level evidence.
+        _ablock = meta.get('article_unit')
+        _v_stale_article = bool(
+            os.path.exists(vta_path) and isinstance(_ablock, dict)
+            and _ablock.get('available') is False)
+        if _v_stale_article:
+            _problems.append(
+                'validation article-id sidecar exists although the metadata '
+                'records the article unit as unavailable; the cache is '
+                'internally inconsistent')
+        if os.path.exists(vta_path) and not _v_stale_article:
+            if meta.get('article_sidecars') is not True:
+                _problems.append(
+                    'validation article-id sidecar exists but the metadata '
+                    'does not declare article_sidecars=true; the file is not '
+                    'bound to this cache')
+            if (isinstance(_ablock, dict)
+                    and _ablock.get('sidecar_file') not in
+                    (None, os.path.basename(vta_path))):
+                _problems.append(
+                    'validation article_unit.sidecar_file does not name the '
+                    'persisted article-id sidecar')
+            try:
+                _vta = np.load(vta_path)
+            except Exception as _vae:
+                _problems.append(
+                    f'validation token article-id sidecar unreadable '
+                    f'({type(_vae).__name__}: {_vae})')
+            else:
+                if isinstance(_ablock, dict):
+                    _arec = _ablock.get('sidecar_sha256')
+                    if _arec:
+                        try:
+                            _asha = file_sha256(vta_path)
+                        except Exception as _vae:
+                            _problems.append(
+                                f'validation article-id sidecar hash '
+                                f'unreadable ({type(_vae).__name__}: {_vae})')
+                        else:
+                            if str(_asha) != str(_arec):
+                                _problems.append(
+                                    'validation article-id sidecar sha256 '
+                                    'does not match the cache metadata')
+                if not os.path.exists(vad_tok_path):
+                    _problems.append(
+                        'validation article-id sidecar is present but the '
+                        'per-token line map is missing; article nesting is '
+                        'unverifiable')
+                else:
+                    try:
+                        _vtokline = np.load(vad_tok_path)
+                    except Exception as _vae:
+                        _problems.append(
+                            f'validation per-token line map unreadable '
+                            f'({type(_vae).__name__}: {_vae})')
+                    else:
+                        _problems.extend(article_sidecar_problems(
+                            meta, _vta, _vtokline, split='validation',
+                            n_tokens=int(np.asarray(val_batch).size)))
+        elif meta.get('article_sidecars') is True:
+            _problems.append(
+                'cache declares a persisted validation article-id sidecar '
+                'that is missing')
         _src_problems, _src_warnings = _dataset_source_problems(
             meta, wikitext_dataset_source(), 'WikiText train/validation')
         _problems.extend(_src_problems)
@@ -1391,6 +1461,35 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=None, val_seqs=512,
     bnd_ids = sorted(boundary_token_ids(tok, eos_id))
     val_bnd = np.isin(val_batch, bnd_ids)
     print(f'[data] boundary tokens: {int(val_bnd.sum())} ({val_bnd.mean() * 100:.1f}% of val tokens)')
+    # Persist the additive ARTICLE clustering for the selection split.  The
+    # served line map is already frozen; decoding it with the SAME tokenizer
+    # yields the article clusters without reading any raw row again.  Tokens,
+    # line ids and the pooled validation PPL are unchanged.
+    _val_flat = np.ascontiguousarray(val_batch).reshape(-1)
+    _val_article_rep = build_article_sidecar(
+        _val_flat, val_token_doc_ids, tok, split='validation',
+        source='decoded_line_map')
+    val_token_article_ids = None
+    if _val_article_rep.get('available'):
+        val_token_article_ids = _as_sidecar_ids(
+            _val_article_rep['token_article_ids'],
+            'val_token_article_ids', expected=int(_val_flat.size))
+        _val_article_meta = dict(_val_article_rep['block'])
+        _val_article_meta['sidecar_file'] = os.path.basename(vta_path)
+    else:
+        _val_article_meta = {
+            'schema': ARTICLE_SIDECAR_SCHEMA,
+            'policy': ARTICLE_SIDECAR_POLICY['version'],
+            'split': 'validation',
+            'unit': 'article',
+            'boundary_rule': 'top_level_heading',
+            'source': 'decoded_line_map',
+            'available': False,
+            'valid_for_clustering': False,
+            'reason': str(_val_article_rep.get('reason') or
+                          _val_article_rep.get('status') or
+                          'article grouping did not complete'),
+        }
     for _p, _a in ((tr_path, train_ids), (va_path, val_batch), (vp_path, val_bnd),
                    (trd_path, train_doc_ids), (vad_path, val_doc_ids),
                    (vad_tok_path, val_token_doc_ids)):
@@ -1405,7 +1504,31 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=None, val_seqs=512,
             except OSError:
                 pass
             raise
+    if val_token_article_ids is not None:
+        _fd, _tmp = tempfile.mkstemp(
+            dir=os.path.dirname(os.path.abspath(vta_path)),
+            prefix=os.path.basename(vta_path) + '.', suffix='.tmp')
+        try:
+            with os.fdopen(_fd, 'wb') as _fh:
+                np.save(_fh, val_token_article_ids)
+            os.replace(_tmp, vta_path)
+        except BaseException:
+            try:
+                os.unlink(_tmp)
+            except OSError:
+                pass
+            raise
+        _val_article_meta['token_article_fp'] = _ids_fp(
+            val_token_article_ids)
+        _val_article_meta['token_article_count'] = int(
+            val_token_article_ids.size)
+        _val_article_meta['n_articles'] = int(
+            np.unique(val_token_article_ids).size)
+        _val_article_meta['sidecar_sha256'] = file_sha256(vta_path)
     _file_sigs = _cache_file_sigs({'train': tr_path, 'val': va_path, 'bnd': vp_path})
+    if val_token_article_ids is not None:
+        _file_sigs['val_token_article_ids'] = _cache_file_sigs(
+            {'article': vta_path})['article']
     # Persist the exact tokenizer BEFORE the metadata so the metadata can bind
     # its bytes.  The held-out test loader compares full vocab identity and the
     # file sha256 against this cache; a tokenizer swapped afterwards must not
@@ -1494,6 +1617,11 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=None, val_seqs=512,
             'one non-empty raw WikiText row (heading/paragraph line); an '
             'article spans multiple rows and is delimited by top-level '
             '" = Title = " headings'),
+        # Additive article clustering for the selection split.  document_unit
+        # stays 'line' (the frozen contract); this block says whether the cache
+        # also persists the independent article unit for analysis.
+        'article_sidecars': bool(val_token_article_ids is not None),
+        'article_unit': _val_article_meta,
         'split_fingerprints': {
             'fingerprint_algorithm': _IDS_FP_ALGO,
             'train': {'file': os.path.basename(tr_path), 'ids_fp': _ids_fp(train_ids),

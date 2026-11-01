@@ -6659,3 +6659,50 @@ round-trip；`_PARTS`/Makefile/CLI/report 接线且无 p/Holm/verdict 字段。
 `python audit_gates.py estimability` 在当前冻结清单上 72 cells / 6
 comparisons 全部可估计；`python audit_gates.py design` 仍退出 0。
 完整 CPU 套件在本轮最终树通过。
+
+## 2026-11-01 — 文章级评测单位写进冻结缓存身份（本轮数据方法硬化，no new runs）
+
+零 GPU；不新增训练、不读取真实 test split、不修改
+`confirmation_frozen*.json` 的字节/臂/种子/端点/α/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未删除、未修改、未移动。
+
+**Problem.** §53/§54 已经让分析按文章聚类，但文章映射是每次从已落盘的
+逐 token 行映射解码重建的，不在缓存身份里。tokenizer/decoder 行为变化
+或 legacy cache 缺 decoder 会改变/丢失文章单位，而
+`test_fp`/`val_fp`/`doc_ids` 都看不出；冻结 test slice 读完后也没有一个
+自带的文章侧车可供先验证再分析。§54.6 已把「未来在首次 test 读取前写
+`test_token_article_ids_*`」列为待办。
+
+**Fix.** 新增 `explib/_parts/part_75_article_sidecar.py`：
+
+- `build_article_sidecar_from_rows`（test 冷构建：raw rows + 每行 token
+  长度，不重读 raw）与 `build_article_sidecar`（decode 行映射）复用现有
+  文章聚类原语；新构建的 validation/test cache 在 line 侧车之外写逐 token
+  `val_token_article_ids_*` / `test_token_article_ids_*`。
+- meta 追加 `article_sidecars` 与 `article_unit`（schema、split、token
+  数/摘要、n_lines/n_articles、伪重复倍数、`sidecar_sha256`、source）。
+  `document_unit` 仍是 `line`；文章侧车是追加证据，不替换冻结行级契约。
+  无顶层标题时记录 `available=false`，不写假侧车。
+- `load_cached_article_ids` 校验长度、sha、fp、line→article 嵌套和计数；
+  旧 cache 返回 `legacy_no_article_sidecar` 并保留行级回退。
+- cache-hit：test 声明侧车但缺失/不符时 fail-closed；train/validation
+  沿既有重建策略并打印原因。P5T 的 `_resolve_test_article_ids` 优先读
+  侧车，legacy 才解码回退。
+- `audit_document_unit` 新增 test/validation `article_sidecar` 块：结构自洽
+  且与解码重建的**分区**一致为 `verified`，声明缺失或分区不同为 `fail`，
+  旧 cache 为 `legacy_absent`。比较分区而非标签哈希，避免无害的解码文本
+  差异被误报成聚类变化；真正的合并/拆分仍会被双射检查拒绝。审计仍不读
+  `wiki.test.raw`。
+
+**Boundary.** 不改 token/split/训练/PPL/种子/α/Holm/判定；
+`CODE_SEMANTICS` 不 bump。只为 validation/test 写逐 token 侧车（train
+侧车会是数十 GB 且无消费者）；cap 截断文章仍是切片内 cluster，不声称
+全文身份；旧 cache 不回填、不重跑；文章级区间仍受 n<64 的种群门槛限制。
+
+**Verification.** 新增 `test_review_part_80.py` 12 项：raw/decode 分区
+一致、文章 id 非行 id、validation/test 写读、行拆分拒绝、count/fp/
+attestation fail-closed、无标题 unavailable、legacy 显式回退、test 侧车
+篡改 cache-hit 拒绝、自洽但分区不同的侧车审计 fail、P5T 优先侧车、形状/
+缺缓存诊断、`_PARTS` 注册与 `document_unit='line'` 不变。相关既有
+`test_review_part_10/22/62/63.py` 共 73 项仍通过；完整 CPU 套件在最终树
+上通过。

@@ -779,12 +779,39 @@ def _unit_group_lines(runs, L):
         # indexing art_ids[-1] would silently attach it to the last article.
         return None, (f'{int((line_to_group < 0).sum())} decoded run(s) are '
                       'empty and cannot be assigned to an article')
-    art_ids = np.asarray(L.wikitext_article_ids(texts, g['groups']), dtype=np.uint64)
+    # Use the PERSISTED cluster-id rule (title + group ordinal), not the
+    # content-hash article identity used by the leakage scan.  The two answer
+    # different questions: content hash identifies an article's bytes, while
+    # the cluster id is the label the evaluation cache stores for resampling.
+    # Comparing a sidecar against a different id scheme would manufacture a
+    # mismatch on every cache.
+    art_ids = np.asarray(
+        L._article_cluster_ids(texts, g['groups']), dtype=np.uint64)
     lengths = np.asarray([int(r[0][1]) - int(r[0][0]) for r in runs],
                          dtype=np.int64)
     token_art = np.repeat(art_ids[line_to_group], lengths)
     return {'groups': g, 'line_to_group': line_to_group,
             'article_ids': art_ids, 'token_article_ids': token_art}, None
+
+
+def _same_partition(a, b):
+    """Whether two label vectors induce the same partition (up to relabeling).
+
+    Article ids are cluster LABELS.  The persisted sidecar and the decoded
+    reconstruction must agree on which served lines belong together; requiring
+    the same hash would also fail when a decoded heading differs cosmetically
+    (e.g. a legacy/very small tokenizer that loses a character).  A true
+    clustering change still fails: some label pair would no longer be a
+    bijection.
+    """
+    import numpy as np
+    aa = np.asarray(a).reshape(-1)
+    bb = np.asarray(b).reshape(-1)
+    if int(aa.size) != int(bb.size) or aa.size == 0:
+        return False
+    pairs = np.unique(np.stack([aa, bb], axis=1), axis=0)
+    return (int(pairs.shape[0]) == int(np.unique(aa).size)
+            == int(np.unique(bb).size))
 
 
 def _article_word_count(text):
@@ -1351,6 +1378,85 @@ def audit_document_unit(cache_dir=None, *, seq_len=None, raw_dir=None,
                         % (trec.get('n_lines'), trec.get('n_articles'),
                            (float(trec.get('n_lines') or 0)
                             / max(1.0, float(trec.get('n_articles') or 1)))))
+                # Persisted article sidecar: compare it with the clustering
+                # reconstructed above.  A legacy cache without one is an
+                # explicit fallback; a declared-but-missing/mismatched file is
+                # a hard failure because article-level uncertainty would then
+                # silently describe a different clustering.
+                _tas = os.path.join(
+                    cache_dir, f'test_token_article_ids_{_test_tag}.npy')
+                _t_declared = _tmeta.get('article_sidecars') is True
+                _t_ablock = _tmeta.get('article_unit')
+                _t_side = {'status': 'legacy_absent'}
+                _t_side_labels = True
+                if os.path.exists(_tas):
+                    try:
+                        _t_arr = np.load(_tas)
+                    except Exception as _tae:
+                        _t_side = {'status': 'fail', 'problems': [
+                            f'test article-id sidecar unreadable '
+                            f'({type(_tae).__name__}: {_tae})']}
+                        trec['status'] = 'fail'
+                        _fail('test: ' + _t_side['problems'][0])
+                    else:
+                        if (isinstance(_t_ablock, dict)
+                                and _t_ablock.get('available') is False):
+                            _t_side = {'status': 'fail', 'problems': [
+                                'test article-id sidecar exists although the '
+                                'metadata records the unit as unavailable']}
+                            trec['status'] = 'fail'
+                            _fail('test: ' + _t_side['problems'][0])
+                        else:
+                            _t_probs = L.article_sidecar_problems(
+                                _tmeta, _t_arr,
+                                np.asarray(_ttd).reshape(-1)[:_prefix_n],
+                                split='test', n_tokens=_prefix_n)
+                            if (_t_declared is not True
+                                    or not isinstance(_t_ablock, dict)):
+                                _t_probs.append(
+                                    'test article-id sidecar exists but the '
+                                    'metadata does not declare '
+                                    'article_sidecars=true; the file is not '
+                                    'bound to this cache')
+                            elif (_t_ablock.get('sidecar_file') not in
+                                  (None, os.path.basename(_tas))):
+                                _t_probs.append(
+                                    'test article_unit.sidecar_file does not '
+                                    'name the persisted article-id sidecar')
+                            if (_token_article is not None
+                                    and int(np.asarray(_t_arr).size)
+                                    == int(_prefix_n)):
+                                _ta_flat = np.asarray(
+                                    _t_arr).reshape(-1)[:_prefix_n]
+                                _recon_flat = np.asarray(
+                                    _token_article).reshape(-1)[:_prefix_n]
+                                if not _same_partition(_ta_flat, _recon_flat):
+                                    _t_probs.append(
+                                        'persisted article ids induce a '
+                                        'different clustering than the frozen '
+                                        'line runs')
+                                elif not np.array_equal(_ta_flat, _recon_flat):
+                                    _t_side_labels = False
+                            _t_side = {
+                                'status': 'fail' if _t_probs else 'verified',
+                                'n_tokens': int(np.asarray(_t_arr).size),
+                                'n_articles': int(np.unique(
+                                    np.asarray(_t_arr).reshape(-1)).size),
+                                'problems': _t_probs,
+                                'source': 'cache_sidecar',
+                            }
+                            if _t_side_labels is False:
+                                _t_side['labels_identical'] = False
+                            if _t_probs:
+                                trec['status'] = 'fail'
+                                _fail('test: ' + '; '.join(_t_probs[:3]))
+                elif _t_declared:
+                    _t_side = {'status': 'fail', 'problems': [
+                        'test metadata declares a persisted article-id '
+                        'sidecar that is missing']}
+                    trec['status'] = 'fail'
+                    _fail('test: ' + _t_side['problems'][0])
+                trec['article_sidecar'] = _t_side
                 _decl = _tmeta.get('document_unit')
                 if _decl is not None and trec.get('unit') not in (None, 'unknown', _decl):
                     trec['status'] = 'fail'
@@ -1392,6 +1498,81 @@ def audit_document_unit(cache_dir=None, *, seq_len=None, raw_dir=None,
                         vrec['problems'].append(_verr)
                 elif _vcls.get('unit') == 'article':
                     vrec['n_articles'] = int(len(_vruns))
+                # Persisted article sidecar for the selection split.  It is an
+                # additive clustering of the same served tokens; compare it
+                # with the decode-based reconstruction (legacy caches have no
+                # file and keep the explicit fallback).
+                _vtas = os.path.join(
+                    cache_dir, f'val_token_article_ids_{_train_tag}.npy')
+                _v_declared = _mmeta.get('article_sidecars') is True
+                _v_ablock = _mmeta.get('article_unit')
+                _v_side = {'status': 'legacy_absent'}
+                if os.path.exists(_vtas):
+                    try:
+                        _v_arr = np.load(_vtas)
+                    except Exception as _vae:
+                        _v_side = {'status': 'fail', 'problems': [
+                            f'validation article-id sidecar unreadable '
+                            f'({type(_vae).__name__}: {_vae})']}
+                        vrec['status'] = 'fail'
+                        _fail('validation: ' + _v_side['problems'][0])
+                    else:
+                        if (isinstance(_v_ablock, dict)
+                                and _v_ablock.get('available') is False):
+                            _v_side = {'status': 'fail', 'problems': [
+                                'validation article-id sidecar exists although '
+                                'the metadata records the unit as unavailable']}
+                            vrec['status'] = 'fail'
+                            _fail('validation: ' + _v_side['problems'][0])
+                        else:
+                            _v_probs = L.article_sidecar_problems(
+                                _mmeta, _v_arr,
+                                np.asarray(_vmap).reshape(-1),
+                                split='validation',
+                                n_tokens=int(np.asarray(_vids).size))
+                            if (_v_declared is not True
+                                    or not isinstance(_v_ablock, dict)):
+                                _v_probs.append(
+                                    'validation article-id sidecar exists but '
+                                    'the metadata does not declare '
+                                    'article_sidecars=true; the file is not '
+                                    'bound to this cache')
+                            elif (_v_ablock.get('sidecar_file') not in
+                                  (None, os.path.basename(_vtas))):
+                                _v_probs.append(
+                                    'validation article_unit.sidecar_file does '
+                                    'not name the persisted article-id sidecar')
+                            if (_vcls.get('unit') == 'line'
+                                    and _vg is not None
+                                    and int(np.asarray(_v_arr).size)
+                                    == int(np.asarray(_vids).size)):
+                                if not _same_partition(
+                                        np.asarray(_v_arr).reshape(-1),
+                                        np.asarray(
+                                            _vg['token_article_ids']
+                                        ).reshape(-1)):
+                                    _v_probs.append(
+                                        'persisted validation article ids '
+                                        'induce a different clustering than '
+                                        'the frozen line runs')
+                            _v_side = {
+                                'status': 'fail' if _v_probs else 'verified',
+                                'n_tokens': int(np.asarray(_v_arr).size),
+                                'n_articles': int(np.unique(
+                                    np.asarray(_v_arr).reshape(-1)).size),
+                                'problems': _v_probs,
+                                'source': 'cache_sidecar',
+                            }
+                            if _v_probs:
+                                vrec['status'] = 'fail'
+                                _fail('validation: ' + '; '.join(_v_probs[:3]))
+                elif _v_declared:
+                    _v_side = {'status': 'fail', 'problems': [
+                        'cache metadata declares a persisted validation '
+                        'article-id sidecar that is missing']}
+                    vrec['status'] = 'fail'
+                    _fail('validation: ' + _v_side['problems'][0])
+                vrec['article_sidecar'] = _v_side
             if vrec['problems']:
                 vrec['status'] = 'warnings'
                 _warn('validation: ' + '; '.join(vrec['problems']))

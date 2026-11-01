@@ -85,6 +85,7 @@ _PARTS = [
 'part_72_budget_truncation.py',
 'part_73_ablation_lattice.py',
 'part_74_design_estimability.py',
+'part_75_article_sidecar.py',
 ]
 
 load_root_package(globals(), __file__, _PARTS,

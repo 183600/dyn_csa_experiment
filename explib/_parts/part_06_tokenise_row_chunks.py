@@ -205,6 +205,10 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=None, cache_dir=None,
     tb_path = os.path.join(cache_dir, f'test_bnd_{tag}.npy')
     td_path = os.path.join(cache_dir, f'test_doc_ids_{tag}.npy')
     ttd_path = os.path.join(cache_dir, f'test_token_doc_ids_{tag}.npy')
+    # Additive ARTICLE-level map (one id per served token).  It is written only
+    # when the served slice has evidenced top-level headings; a legacy cache
+    # without it stays readable with the explicit line-level fallback.
+    ttad_path = os.path.join(cache_dir, f'test_token_article_ids_{tag}.npy')
     me_path = os.path.join(cache_dir, f'test_meta_{tag}.json')
     tk_path = os.path.join(cache_dir, f'test_tok_{tag}.json')
     if all((os.path.exists(p) for p in (te_path, tb_path, me_path))):
@@ -213,6 +217,8 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=None, cache_dir=None,
             _sig_paths['test_doc_ids'] = td_path
         if os.path.exists(ttd_path):
             _sig_paths['test_token_doc_ids'] = ttd_path
+        if os.path.exists(ttad_path):
+            _sig_paths['test_token_article_ids'] = ttad_path
         if os.path.exists(tk_path):
             _sig_paths['tokenizer'] = tk_path
         # The verification path also reads every paired train meta and the
@@ -278,11 +284,74 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=None, cache_dir=None,
         elif 'test_token_doc_ids' in (meta.get('file_sigs') or {}):
             _problems_ttd = ('test metadata binds a per-token document-id sidecar '
                             'that is missing')
+        # The additive article map is part of the evaluation-unit identity when
+        # the cache declares it.  A legacy cache without one keeps the explicit
+        # line-level fallback; a declared-but-missing/misaligned file is corrupt.
+        test_token_article_ids = None
+        _problems_tta = []
+        _article_block = meta.get('article_unit')
+        _article_declared = meta.get('article_sidecars') is True
+        _stale_article_file = bool(
+            os.path.exists(ttad_path)
+            and isinstance(_article_block, dict)
+            and _article_block.get('available') is False)
+        if _stale_article_file:
+            _problems_tta.append(
+                'test article-id sidecar exists although the metadata records '
+                'the article unit as unavailable; the cache is internally '
+                'inconsistent')
+        if os.path.exists(ttad_path) and not _stale_article_file:
+            if not _article_declared:
+                _problems_tta.append(
+                    'test article-id sidecar exists but the metadata does not '
+                    'declare article_sidecars=true; the file is not bound to '
+                    'this cache')
+            if (isinstance(_article_block, dict)
+                    and _article_block.get('sidecar_file') not in
+                    (None, os.path.basename(ttad_path))):
+                _problems_tta.append(
+                    'test article_unit.sidecar_file does not name the '
+                    'persisted article-id sidecar')
+            try:
+                test_token_article_ids = np.load(ttad_path)
+            except Exception as _tae:
+                _problems_tta.append(
+                    f'test token article-id sidecar unreadable '
+                    f'({type(_tae).__name__}: {_tae})')
+            else:
+                if isinstance(_article_block, dict):
+                    _rec_sha = _article_block.get('sidecar_sha256')
+                    if _rec_sha:
+                        try:
+                            _actual_sha = file_sha256(ttad_path)
+                        except Exception as _tae:
+                            _problems_tta.append(
+                                f'test article-id sidecar hash unreadable '
+                                f'({type(_tae).__name__}: {_tae})')
+                        else:
+                            if str(_actual_sha) != str(_rec_sha):
+                                _problems_tta.append(
+                                    'test article-id sidecar sha256 does not '
+                                    'match the cache metadata')
+                if test_token_doc_ids is None:
+                    _problems_tta.append(
+                        'test article-id sidecar is present but the per-token '
+                        'line map is missing; the article nesting cannot be '
+                        'verified')
+                else:
+                    _problems_tta.extend(article_sidecar_problems(
+                        meta, test_token_article_ids, test_token_doc_ids,
+                        split='test', n_tokens=int(np.asarray(test_ids).size)))
+        elif _article_declared:
+            _problems_tta.append(
+                'test metadata declares a persisted article-id sidecar that '
+                'is missing')
         _problems = []
         if _problems_td:
             _problems.append(_problems_td)
         if _problems_ttd:
             _problems.append(_problems_ttd)
+        _problems.extend(_problems_tta)
         # Upstream identity: a frozen test slice is only a snapshot if the
         # corpus commit is the pinned one (a local raw dump is content-bound by
         # the fingerprints and gets a warning, not a hard failure).  Compare it
@@ -1059,6 +1128,36 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=None, cache_dir=None,
             'load_wikitest: per-token and per-document test sidecars name '
             'different document sets; the document-level evaluation mapping '
             'would be inconsistent')
+    # Persist the ARTICLE clustering from the same served rows/lengths.  This
+    # is additive: the line map and every token stay byte-identical.  It makes
+    # the independent evaluation unit part of the cache identity, so a later
+    # analysis does not have to re-decode (and cannot silently get different
+    # clusters after the slice is bound).
+    _article_rows = _served_rows[:len(_test_lengths)]
+    _article_rep = build_article_sidecar_from_rows(
+        _article_rows, _test_lengths, _served_cap,
+        split='test', source='raw_rows')
+    test_token_article_ids = None
+    if _article_rep.get('available'):
+        test_token_article_ids = _as_sidecar_ids(
+            _article_rep['token_article_ids'], 'test_token_article_ids',
+            expected=int(_served_cap))
+        _article_meta = dict(_article_rep['block'])
+        _article_meta['sidecar_file'] = os.path.basename(ttad_path)
+    else:
+        _article_meta = {
+            'schema': ARTICLE_SIDECAR_SCHEMA,
+            'policy': ARTICLE_SIDECAR_POLICY['version'],
+            'split': 'test',
+            'unit': 'article',
+            'boundary_rule': 'top_level_heading',
+            'source': 'raw_rows',
+            'available': False,
+            'valid_for_clustering': False,
+            'reason': str(_article_rep.get('reason') or
+                          _article_rep.get('status') or
+                          'article grouping did not complete'),
+        }
     # Prove group isolation against every train/val cache sidecar present.  The
     # build-time dedup should already guarantee zero; this turns any silent
     # dedup/index mismatch into a hard refusal before the cache is written.
@@ -1098,9 +1197,32 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=None, cache_dir=None,
             except OSError:
                 pass
             raise
+    if test_token_article_ids is not None:
+        _fd, _tmp = tempfile.mkstemp(
+            dir=os.path.dirname(os.path.abspath(ttad_path)),
+            prefix=os.path.basename(ttad_path) + '.', suffix='.tmp')
+        try:
+            with os.fdopen(_fd, 'wb') as _fh:
+                np.save(_fh, test_token_article_ids)
+            os.replace(_tmp, ttad_path)
+        except BaseException:
+            try:
+                os.unlink(_tmp)
+            except OSError:
+                pass
+            raise
+        _article_meta['token_article_fp'] = _ids_fp(test_token_article_ids)
+        _article_meta['token_article_count'] = int(
+            test_token_article_ids.size)
+        _article_meta['n_articles'] = int(
+            np.unique(test_token_article_ids).size)
+        _article_meta['sidecar_sha256'] = file_sha256(ttad_path)
     _file_sigs = _cache_file_sigs({'test': te_path, 'bnd': tb_path,
                                    'test_doc_ids': td_path,
                                    'test_token_doc_ids': ttd_path})
+    if test_token_article_ids is not None:
+        _file_sigs['test_token_article_ids'] = _cache_file_sigs(
+            {'article': ttad_path})['article']
     # Persist the test tokenizer BEFORE writing the meta, so the meta can bind
     # its exact bytes.  The cache identity therefore includes the full-file
     # sha256 (not only a hash of the fit TEXT, which two different BPE merge
@@ -1188,6 +1310,12 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=None, cache_dir=None,
             'one non-empty raw WikiText row (heading/paragraph line); an '
             'article spans multiple rows and is delimited by top-level '
             '" = Title = " headings'),
+        # Additive: the frozen unit above is still the line.  This block says
+        # whether the cache ALSO persists the independent article clustering.
+        # Analysis prefers it for article-level uncertainty; the line-level
+        # fields and the frozen PPL remain byte-identical.
+        'article_sidecars': bool(test_token_article_ids is not None),
+        'article_unit': _article_meta,
         'split_fingerprints': {
             'fingerprint_algorithm': _IDS_FP_ALGO,
             'test': {'file': os.path.basename(te_path),

@@ -1255,6 +1255,32 @@ def _resolve_test_article_ids(test_ids, test_doc_ids, *, n_seqs, seq_len,
         diag.update(status='no_vocab_binding',
                     reason='the frozen test vocabulary width is unknown')
         return None, diag
+    # Prefer the persisted, fingerprinted article map written by the cache
+    # build.  It is the same clustering, but it is bound to the cache identity
+    # and does not depend on a later decode.  A legacy cache without it falls
+    # back to decoding the served line runs; a DECLARED-but-invalid sidecar is
+    # reported explicitly (the audit gate turns it into a hard failure) rather
+    # than being silently reconstructed around.
+    try:
+        _side, _side_diag = L.load_cached_article_ids(
+            split='test', seq_len=int(seq_len), vocab_size=int(vocab_size),
+            n_seqs=int(n_seqs), shape=(int(n_seqs), int(seq_len)),
+            strict=False)
+    except Exception as _se:
+        _side, _side_diag = None, {
+            'status': 'sidecar_error', 'unit': 'article',
+            'reason': f'{type(_se).__name__}: {_se}'}
+    if _side is not None:
+        _side_diag = dict(_side_diag)
+        _side_diag['source'] = 'cache_sidecar'
+        return _side, _side_diag
+    diag['sidecar_status'] = _side_diag.get('status')
+    if _side_diag.get('status') not in (None, 'legacy_no_article_sidecar',
+                                        'article_sidecar_unavailable',
+                                        'cache_absent'):
+        diag['sidecar_problems'] = list(_side_diag.get('problems') or [])
+        if _side_diag.get('reason'):
+            diag['sidecar_reason'] = _side_diag.get('reason')
     try:
         tok = L.load_wikitext_test_tokenizer(
             n_seqs=int(n_seqs), seq_len=int(seq_len),
