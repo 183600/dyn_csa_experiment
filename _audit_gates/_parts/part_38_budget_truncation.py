@@ -43,8 +43,23 @@ def _bt_gate_embedded(obj):
     return None
 
 
+def _bt_gate_dict(value):
+    return value if isinstance(value, dict) else {}
+
+
+def _bt_gate_list(value):
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [item if isinstance(item, str) else str(item) for item in value]
+
+
 def _bt_gate_manifest(manifest_path):
-    path = manifest_path or os.path.join(REPO, 'confirmation_frozen.json')  # noqa: F821
+    if manifest_path is None:
+        path = os.path.join(REPO, 'confirmation_frozen.json')  # noqa: F821
+    elif isinstance(manifest_path, (str, os.PathLike)):
+        path = os.fspath(manifest_path)
+    else:
+        return None, f'<invalid manifest_path {type(manifest_path).__name__}>'
     if not os.path.exists(path):
         return None, path
     data = _bt_gate_load(path)
@@ -72,33 +87,38 @@ def _bt_gate_validate(L, path, manifest):
             f'{path}: no budget_truncation object found')
         return item
     verdict = L.validate_budget_truncation(artifact, manifest=manifest)
-    item['warnings'].extend(verdict.get('warnings') or [])
+    item['warnings'].extend(_bt_gate_list(verdict.get('warnings')))
     item['content_sha256'] = artifact.get('content_sha256')
-    item['artifact_status'] = artifact.get('status')
-    if verdict.get('status') == 'fail' or artifact.get('status') == 'fail':
+    artifact_status = artifact.get('status')
+    item['artifact_status'] = artifact_status
+    if verdict.get('status') == 'fail' or artifact_status == 'fail':
         item['status'] = 'fail'
-        item['problems'].extend(verdict.get('problems') or [])
-    elif artifact.get('status') == 'not_verifiable':
+        item['problems'].extend(_bt_gate_list(verdict.get('problems')))
+    elif artifact_status == 'not_verifiable':
         # Internally consistent, but the budget question was not answered:
         # replaying it must not turn an undeclared budget into a green gate.
         item['status'] = 'not_verifiable'
-        item['problems'].extend(verdict.get('problems') or [])
+        item['problems'].extend(_bt_gate_list(verdict.get('problems')))
         item['reason'] = ('the stored analysis carries no declared budget; '
                           'its internal replay is consistent but the '
                           'feasibility question is unanswered')
+    elif artifact_status == 'warnings':
+        # Feasible only under a caveat (e.g. no failure model): the artifact
+        # is internally valid, but the gate must not label it green.
+        item['status'] = 'warnings'
+        item['problems'].extend(_bt_gate_list(verdict.get('problems')))
     else:
         item['status'] = 'ok'
-        item['problems'].extend(verdict.get('problems') or [])
-    item['required_prefix_cells'] = (
-        artifact.get('cost') or {}).get('required_prefix_cells')
-    item['budget_attempts'] = (
-        artifact.get('budget') or {}).get('declared_attempts')
-    item['required_attempts_for_risk'] = (
-        artifact.get('cost') or {}).get('required_attempts_for_risk')
-    item['effective_required_seeds'] = (
-        artifact.get('floor') or {}).get('effective_required_seeds')
-    item['declared_min_seeds'] = (
-        artifact.get('floor') or {}).get('declared_min_seeds')
+        item['problems'].extend(_bt_gate_list(verdict.get('problems')))
+    cost = _bt_gate_dict(artifact.get('cost'))
+    budget = _bt_gate_dict(artifact.get('budget'))
+    floor = _bt_gate_dict(artifact.get('floor'))
+    item['required_prefix_cells'] = cost.get('required_prefix_cells')
+    item['budget_attempts'] = budget.get('declared_attempts')
+    item['required_attempts_for_risk'] = cost.get(
+        'required_attempts_for_risk')
+    item['effective_required_seeds'] = floor.get('effective_required_seeds')
+    item['declared_min_seeds'] = floor.get('declared_min_seeds')
     return item
 
 
@@ -146,42 +166,59 @@ def audit_budget_truncation(paths=None, manifest_path=None):
             out['live'] = {
                 'status': live.get('status'),
                 'content_sha256': live.get('content_sha256'),
-                'n_cells': (live.get('design') or {}).get('n_cells'),
-                'required_prefix_cells': (
-                    live.get('cost') or {}).get('required_prefix_cells'),
-                'effective_required_seeds': (
-                    live.get('floor') or {}).get('effective_required_seeds'),
-                'declared_min_seeds': (
-                    live.get('floor') or {}).get('declared_min_seeds'),
-                'budget_attempts': (
-                    live.get('budget') or {}).get('declared_attempts'),
-                'required_attempts_for_risk': (
-                    live.get('cost') or {}).get('required_attempts_for_risk'),
-                'warnings': list(live.get('warnings') or []),
-                'problems': list(live.get('problems') or []),
+                'n_cells': _bt_gate_dict(live.get('design')).get('n_cells'),
+                'required_prefix_cells': _bt_gate_dict(
+                    live.get('cost')).get('required_prefix_cells'),
+                'effective_required_seeds': _bt_gate_dict(
+                    live.get('floor')).get('effective_required_seeds'),
+                'declared_min_seeds': _bt_gate_dict(
+                    live.get('floor')).get('declared_min_seeds'),
+                'budget_attempts': _bt_gate_dict(
+                    live.get('budget')).get('declared_attempts'),
+                'required_attempts_for_risk': _bt_gate_dict(
+                    live.get('cost')).get('required_attempts_for_risk'),
+                'warnings': _bt_gate_list(live.get('warnings')),
+                'problems': _bt_gate_list(live.get('problems')),
             }
             out['status'] = live.get('status')
-            out['warnings'].extend(live.get('warnings') or [])
+            out['warnings'].extend(_bt_gate_list(live.get('warnings')))
             if out['status'] == 'fail':
-                out['problems'].extend(live.get('problems') or [])
+                out['problems'].extend(_bt_gate_list(live.get('problems')))
             return out
         paths = found
-    if isinstance(paths, str):
+    if isinstance(paths, (str, os.PathLike)):
         paths = [paths]
+    else:
+        try:
+            paths = list(paths)
+        except TypeError:
+            out['status'] = 'fail'
+            out['problems'].append(
+                'paths must be a path or an iterable of paths, got '
+                f'{type(paths).__name__}')
+            return out
+    if not paths:
+        out['status'] = 'not_verifiable'
+        out['reason'] = 'no candidate artifact path was supplied or found'
+        out['warnings'].append(out['reason'])
+        return out
     statuses = []
     for raw_path in paths:
-        path = str(raw_path)
+        path = os.fspath(raw_path) if isinstance(
+            raw_path, os.PathLike) else str(raw_path)
         if os.path.isdir(path):
             path = os.path.join(path, 'budget_truncation.json')
         item = _bt_gate_validate(L, path, manifest)
         out['artifacts'][str(raw_path)] = item
         statuses.append(item.get('status'))
-        out['problems'].extend(item.get('problems') or [])
-        out['warnings'].extend(item.get('warnings') or [])
+        out['problems'].extend(_bt_gate_list(item.get('problems')))
+        out['warnings'].extend(_bt_gate_list(item.get('warnings')))
     if any(s == 'fail' for s in statuses):
         out['status'] = 'fail'
     elif any(s == 'ok' for s in statuses):
         out['status'] = 'warnings' if out['warnings'] else 'ok'
+    elif any(s == 'warnings' for s in statuses):
+        out['status'] = 'warnings'
     else:
         out['status'] = 'not_verifiable'
     return out

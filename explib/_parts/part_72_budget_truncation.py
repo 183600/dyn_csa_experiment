@@ -48,8 +48,11 @@ import collections
 import hashlib
 import json
 import math
+import numbers
 import os
 import time
+
+import numpy as np
 
 
 BUDGET_TRUNCATION_KIND = 'budget_truncation'
@@ -60,6 +63,11 @@ BUDGET_TRUNCATION_POLICY = {
     'max_frontier_points': 4096,
     'max_attempts_sanity': 100,
     'max_exact_dp_states': 5000000,
+    # The state cap alone bounds only the width of the DP table, not the
+    # work: the convolution visits every cell x state x attempt.  A panel
+    # just under the state cap could otherwise spend hours in Python before
+    # the size guard fires.  Bound the actual inner-loop count as well.
+    'max_exact_dp_operations': 10000000,
     'budget_unit': 'cell_attempt',
     'role': (
         'pre-run feasibility of the registered cell panel: relate the '
@@ -84,8 +92,13 @@ BUDGET_TRUNCATION_POLICY = {
 }
 
 
+def _bt_is_bool(value):
+    """True for Python and NumPy booleans (a flag is not a number/count)."""
+    return isinstance(value, (bool, np.bool_))
+
+
 def _bt_text(value):
-    if value is None or isinstance(value, bool):
+    if value is None or _bt_is_bool(value):
         return None
     if isinstance(value, str):
         text = value.strip()
@@ -94,12 +107,18 @@ def _bt_text(value):
 
 
 def _bt_int(value, *, minimum=None):
-    if isinstance(value, bool):
+    if _bt_is_bool(value):
         return None
-    if isinstance(value, int):
+    if isinstance(value, numbers.Integral):
         out = int(value)
-    elif isinstance(value, float) and value.is_integer():
-        out = int(value)
+    elif isinstance(value, (float, np.floating)):
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not math.isfinite(number) or not number.is_integer():
+            return None
+        out = int(number)
     else:
         return None
     if minimum is not None and out < minimum:
@@ -108,7 +127,9 @@ def _bt_int(value, *, minimum=None):
 
 
 def _bt_number(value, *, minimum=None, maximum=None):
-    if value is None or isinstance(value, (bool, str, bytes, bytearray)):
+    if value is None or _bt_is_bool(value):
+        return None
+    if isinstance(value, (str, bytes, bytearray)):
         return None
     try:
         out = float(value)
@@ -120,6 +141,76 @@ def _bt_number(value, *, minimum=None, maximum=None):
         return None
     if maximum is not None and out > maximum:
         return None
+    return out
+
+
+def _bt_dict(value):
+    """A JSON-object view that never raises on a malformed artifact."""
+    return value if isinstance(value, dict) else {}
+
+
+def _bt_message_list(value):
+    """A string list for problems/warnings, even if the artifact was edited.
+
+    ``list(5)``, ``list(True)`` and a tuple of dicts used to abort the replay
+    validator/audit gate instead of reporting the malformed artifact.
+    """
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [item if isinstance(item, str) else str(item) for item in value]
+
+
+def _bt_declared_list(values, label, problems):
+    """Normalise a declared arm/seed list without accepting ambiguous shapes.
+
+    ``None`` means "not declared" and is returned unchanged so the caller can
+    derive the list from the cells.  A mapping/string/set is a declaration
+    bug, not an iterable of names: iterating a string would silently turn
+    ``"abc"`` into three arms.  Duplicate tokens are reported because they
+    would double-count a planned block while the JSON keeps looking valid.
+    """
+    if values is None:
+        return None
+    if not isinstance(values, (list, tuple)):
+        problems.append(f'{label} must be a list of names/seeds, got '
+                        f'{type(values).__name__}')
+        return []
+    out = []
+    seen = set()
+    for index, value in enumerate(values):
+        if _bt_is_bool(value):
+            problems.append(
+                f'{label}[{index}]={value!r} is not a string/integer '
+                'identifier')
+            continue
+        if isinstance(value, numbers.Integral):
+            token = str(int(value))
+        elif isinstance(value, (float, np.floating)):
+            parsed = _bt_int(value, minimum=0)
+            if parsed is None:
+                problems.append(
+                    f'{label}[{index}]={value!r} is not a non-negative '
+                    'integer identifier')
+                continue
+            token = str(parsed)
+        elif isinstance(value, str):
+            token = value.strip()
+        else:
+            problems.append(
+                f'{label}[{index}]={value!r} is not a string/integer '
+                'identifier')
+            continue
+        if not token:
+            problems.append(f'{label}[{index}] is an empty identifier')
+            continue
+        if token in seen:
+            problems.append(f'{label} contains duplicate identifier '
+                            f'{token!r}')
+            continue
+        seen.add(token)
+        out.append(token)
+    if not out:
+        problems.append(f'{label} must declare at least one identifier')
     return out
 
 
@@ -203,6 +294,11 @@ def _bt_normalise_cells(cells):
                 continue
             raw.append({'label': label, 'variant': str(variant),
                         'block': str(block)})
+        labels = [c['label'] for c in raw]
+        if len(set(labels)) != len(labels):
+            dupes = sorted(label for label, count in
+                           collections.Counter(labels).items() if count > 1)
+            problems.append(f'cell labels are not unique: {dupes[:8]}')
         return raw, problems, warnings
     if not isinstance(cells, (list, tuple)):
         return [], [f'cells must be a list or a run-order plan, got '
@@ -226,7 +322,8 @@ def _bt_normalise_cells(cells):
         out.append({'label': label, 'variant': variant, 'block': block})
     labels = [c['label'] for c in out]
     if len(set(labels)) != len(labels):
-        dupes = sorted({x for x in labels if labels.count(x) > 1})
+        dupes = sorted(label for label, count in
+                       collections.Counter(labels).items() if count > 1)
         problems.append(f'cell labels are not unique: {dupes[:8]}')
     return out, problems, warnings
 
@@ -262,7 +359,7 @@ def _bt_normalise_comparisons(comparisons):
 
 
 def truncation_frontier(cells, comparisons, *, min_n, complete_coverage,
-                        max_points=None):
+                        max_points=None, required_blocks=None):
     """Deterministic per-prefix completeness of the registered cell panel.
 
     For every prefix of the execution order this records the number of
@@ -271,16 +368,42 @@ def truncation_frontier(cells, comparisons, *, min_n, complete_coverage,
     ``min_n`` / complete-coverage rule is satisfied.  Nothing here depends
     on a failure model: it is the deterministic map of "what would we have
     if the campaign stopped after k cells".
+
+    ``required_blocks`` is the declared seed grid (when the caller has one).
+    Without it the block set is inferred from the cells, which silently makes
+    a plan that forgot a frozen seed look complete.  With it, only a prefix
+    holding every declared block can satisfy complete coverage, and a missing
+    declared block keeps ``first_complete_cells`` at ``None``.
     """
     policy = BUDGET_TRUNCATION_POLICY
-    max_points = (_bt_int(max_points, minimum=1) if max_points is not None
-                  else int(policy['max_frontier_points']))
+    max_points_problem = None
+    if max_points is None:
+        max_points = int(policy['max_frontier_points'])
+    else:
+        parsed = _bt_int(max_points, minimum=1)
+        if parsed is None:
+            max_points_problem = (
+                f'max_points={max_points!r} must be an integer >= 1')
+            max_points = int(policy['max_frontier_points'])
+        else:
+            max_points = parsed
     norm_cells, cell_problems, cell_warnings = _bt_normalise_cells(cells)
     comps, comp_problems = _bt_normalise_comparisons(comparisons)
+    required = None
+    required_problems = []
+    if required_blocks is not None:
+        required = _bt_declared_list(required_blocks, 'required_blocks',
+                                     required_problems)
+        if not required:
+            required = None
+    initial_problems = (list(cell_problems) + list(comp_problems)
+                        + list(required_problems))
+    if max_points_problem is not None:
+        initial_problems.append(max_points_problem)
     out = {
         'kind': 'budget_truncation_frontier',
         'status': 'ok',
-        'problems': list(cell_problems) + list(comp_problems),
+        'problems': initial_problems,
         'warnings': list(cell_warnings),
         'n_cells': len(norm_cells),
         'n_seeds': 0,
@@ -296,14 +419,19 @@ def truncation_frontier(cells, comparisons, *, min_n, complete_coverage,
         out['status'] = 'fail'
         return out
     blocks = []
+    block_seen = set()
     for cell in norm_cells:
-        if cell['block'] not in blocks:
+        if cell['block'] not in block_seen:
+            block_seen.add(cell['block'])
             blocks.append(cell['block'])
     arms_needed = sorted({c['a'] for c in comps} | {c['b'] for c in comps})
-    out['n_seeds'] = len(blocks)
-    out['n_arms'] = len({c['variant'] for c in norm_cells})
+    required_set = set(required) if required is not None else None
+    seed_blocks = required if required is not None else blocks
     n_cells = len(norm_cells)
-    n_seeds = len(blocks)
+    n_seeds = len(seed_blocks)
+    out['n_seeds'] = n_seeds
+    observed_arm_set = {c['variant'] for c in norm_cells}
+    out['n_arms'] = len(observed_arm_set)
     if out['min_n'] is None or out['min_n'] > n_seeds:
         out['problems'].append(
             f'min_n={min_n!r} is not an integer in [2, {n_seeds}]')
@@ -313,7 +441,7 @@ def truncation_frontier(cells, comparisons, *, min_n, complete_coverage,
     # still belongs to a block; it simply never contributes a pair.  Record
     # that explicitly instead of silently dropping it from the counts.
     for arm in arms_needed:
-        if not any(c['variant'] == arm for c in norm_cells):
+        if arm not in observed_arm_set:
             out['problems'].append(
                 f'comparison arm {arm!r} never appears in the cell panel')
     if out['problems']:
@@ -327,8 +455,27 @@ def truncation_frontier(cells, comparisons, *, min_n, complete_coverage,
     pairs = {comp['name']: 0 for comp in comps}
     complete_seeds = 0
     sample_every = max(1, int(math.ceil(n_cells / float(max_points))))
-    if sample_every > 1:
-        out['sampled'] = True
+    # Select the rows once, before the scan.  Block boundaries are the most
+    # informative rows, but a panel with more blocks than the point cap must
+    # still respect the cap; downsampling keeps the thresholds exact because
+    # they are tracked on every prefix below.
+    emit = set()
+    if n_cells:
+        emit.update(range(sample_every, n_cells + 1, sample_every))
+        emit.add(n_cells)
+        for index, cell in enumerate(norm_cells, start=1):
+            if index == n_cells or norm_cells[index]['block'] != cell['block']:
+                emit.add(index)
+        if len(emit) > max_points:
+            ordered = sorted(emit)
+            if max_points <= 1:
+                emit = {n_cells}
+            else:
+                emit = {
+                    ordered[round(slot * (len(ordered) - 1)
+                                  / (max_points - 1))]
+                    for slot in range(max_points)}
+    out['sampled'] = len(emit) < n_cells
     last_block = None
     for index, cell in enumerate(norm_cells, start=1):
         arms = block_arms.setdefault(cell['block'], set())
@@ -336,7 +483,9 @@ def truncation_frontier(cells, comparisons, *, min_n, complete_coverage,
         arms.add(cell['variant'])
         arm_counts[cell['variant']] += 1
         last_block = cell['block']
-        if newly:
+        in_seed_grid = (required_set is None
+                        or cell['block'] in required_set)
+        if newly and in_seed_grid:
             # Incremental pair accounting: a comparison gains a block exactly
             # when the arm that completes its pair arrives.  Re-scanning every
             # block on every cell is O(N * blocks * comparisons) and would
@@ -351,8 +500,6 @@ def truncation_frontier(cells, comparisons, *, min_n, complete_coverage,
                     and all(arm in arms for arm in arms_needed)):
                 block_complete.add(cell['block'])
                 complete_seeds += 1
-        is_block_end = (index == n_cells
-                        or norm_cells[index]['block'] != cell['block'])
         min_n_met = all(v >= out['min_n'] for v in pairs.values())
         complete_met = all(v >= n_seeds for v in pairs.values())
         # Thresholds are tracked on every prefix, whether or not the row is
@@ -361,7 +508,7 @@ def truncation_frontier(cells, comparisons, *, min_n, complete_coverage,
             out['first_min_n_cells'] = index
         if complete_met and out['first_complete_cells'] is None:
             out['first_complete_cells'] = index
-        if (not out['sampled']) or is_block_end or index % sample_every == 0:
+        if index in emit:
             counts = {arm: int(arm_counts.get(arm, 0))
                       for arm in sorted(set(arm_counts) | set(arms_needed))}
             out['points'].append({
@@ -379,31 +526,66 @@ def truncation_frontier(cells, comparisons, *, min_n, complete_coverage,
 
 
 def truncation_frontier_point(cells, comparisons, k, *, min_n, n_seeds=None,
-                              arms_needed=None):
+                              arms_needed=None, required_blocks=None):
     """Compute one frontier row at prefix ``k`` (used for exact thresholds)."""
     norm_cells, cell_problems, _warnings = _bt_normalise_cells(cells)
     comps, comp_problems = _bt_normalise_comparisons(comparisons)
     if cell_problems or comp_problems:
         raise ValueError('; '.join(cell_problems + comp_problems))
+    raw_min_n = min_n
+    min_n = _bt_int(min_n, minimum=2)
+    if min_n is None:
+        raise ValueError(f'min_n={raw_min_n!r} must be an integer >= 2')
+    raw_k = k
     k = _bt_int(k, minimum=1)
     if k is None or k > len(norm_cells):
-        raise ValueError(f'prefix k={k!r} is outside [1, {len(norm_cells)}]')
+        raise ValueError(f'prefix k={raw_k!r} is outside [1, {len(norm_cells)}]')
+    required_set = None
+    if required_blocks is not None:
+        required_problems = []
+        required = _bt_declared_list(required_blocks, 'required_blocks',
+                                     required_problems)
+        if required_problems:
+            raise ValueError('; '.join(required_problems))
+        required_set = set(required)
+        if n_seeds is None:
+            n_seeds = len(required)
+        else:
+            parsed_seeds = _bt_int(n_seeds, minimum=1)
+            if parsed_seeds != len(required):
+                raise ValueError(
+                    f'n_seeds={n_seeds!r} disagrees with the '
+                    f'{len(required)} required block(s)')
+            n_seeds = parsed_seeds
     if n_seeds is None:
         n_seeds = len({c['block'] for c in norm_cells})
+    else:
+        n_seeds = _bt_int(n_seeds, minimum=1)
+        if n_seeds is None:
+            raise ValueError('n_seeds must be an integer >= 1 or None')
     if arms_needed is None:
         arms_needed = sorted({c['a'] for c in comps} | {c['b'] for c in comps})
+    elif not isinstance(arms_needed, (list, tuple)):
+        raise ValueError('arms_needed must be a list/tuple or None')
+    else:
+        arms_needed = [str(arm) for arm in arms_needed]
     block_arms = {}
     arm_counts = collections.Counter()
     for cell in norm_cells[:k]:
         block_arms.setdefault(cell['block'], set()).add(cell['variant'])
         arm_counts[cell['variant']] += 1
+
+    def _counts(block):
+        return required_set is None or block in required_set
+
     pairs = {}
     for comp in comps:
         pairs[comp['name']] = sum(
-            1 for arms in block_arms.values()
-            if comp['a'] in arms and comp['b'] in arms)
-    complete_seeds = sum(1 for arms in block_arms.values()
-                         if all(arm in arms for arm in arms_needed))
+            1 for block, arms in block_arms.items()
+            if _counts(block) and comp['a'] in arms and comp['b'] in arms)
+    complete_seeds = sum(1 for block, arms in block_arms.items()
+                         if _counts(block)
+                         and all(arm in arms for arm in arms_needed))
     counts = {arm: int(arm_counts.get(arm, 0))
               for arm in sorted(set(arm_counts) | set(arms_needed))}
     return {
@@ -446,6 +628,25 @@ def _bt_prefix_completion_distribution(prefix_len, max_attempts, retryable,
     prefix under any remaining budget.  The total attempt count therefore
     ranges over ``[prefix_len, prefix_len * max_attempts]``.
     """
+    try:
+        prefix_len = int(prefix_len)
+        max_attempts = int(max_attempts)
+        max_budget = int(max_budget)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError('DP arguments must be integers') from None
+    if prefix_len < 1 or max_attempts < 1 or max_budget < 0:
+        raise ValueError(
+            'DP arguments must satisfy prefix_len >= 1, max_attempts >= 1 '
+            'and max_budget >= 0')
+    work = _bt_dp_work(prefix_len, max_budget, max_attempts)
+    if (max_budget > int(BUDGET_TRUNCATION_POLICY['max_exact_dp_states'])
+            or work is None
+            or work > int(
+                BUDGET_TRUNCATION_POLICY['max_exact_dp_operations'])):
+        raise ValueError(
+            'exact completion-risk DP exceeds the absolute state/work cap; '
+            'the caller must report the panel as not_verifiable instead of '
+            'starting an unbounded convolution')
     pmf = _bt_cell_success_pmf(max_attempts, retryable, fatal)
     dist = [0.0] * (max_budget + 1)
     dist[0] = 1.0
@@ -477,12 +678,20 @@ def _bt_required_attempts(dist, risk_level, *, minimum):
     return None
 
 
+def _bt_dp_work(prefix_len, max_budget, attempts):
+    """Inner-loop iterations of the exact DP, or ``None`` if not an integer."""
+    try:
+        return int(prefix_len) * (int(max_budget) + 1) * int(attempts)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
 def _bt_round(value, digits=12):
     if value is None:
         return None
     try:
         return round(float(value), digits)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
@@ -512,9 +721,16 @@ def _bt_normalise_failure_model(failure_model, *, max_attempts):
             f'failure_model probabilities sum to {r + f} >= 1; every attempt '
             'would fail')
         return out
-    attempts = _bt_int(failure_model.get('max_attempts_per_cell'), minimum=1)
-    if attempts is None:
-        attempts = max_attempts
+    attempts = max_attempts
+    if ('max_attempts_per_cell' in failure_model
+            and failure_model.get('max_attempts_per_cell') is not None):
+        attempts = _bt_int(failure_model.get('max_attempts_per_cell'),
+                           minimum=1)
+        if attempts is None:
+            out['problems'].append(
+                'failure_model.max_attempts_per_cell must be an integer >= 1 '
+                '(omit it to use the registered disposition cap)')
+            return out
     out['model'] = {
         'replaceable_per_attempt': r,
         'non_replaceable_per_attempt': f,
@@ -525,6 +741,7 @@ def _bt_normalise_failure_model(failure_model, *, max_attempts):
 
 def build_budget_truncation(*, cells, comparisons, arms=None, seeds=None,
                             min_n, complete_coverage,
+                            declared_n_seeds=None,
                             max_attempts_per_cell=1,
                             max_attempts_source=None, budget=None,
                             failure_model=None, risk_level=None,
@@ -542,26 +759,75 @@ def build_budget_truncation(*, cells, comparisons, arms=None, seeds=None,
     comps, comp_problems = _bt_normalise_comparisons(comparisons)
     problems = list(cell_problems) + list(comp_problems)
     warnings = list(cell_warnings)
-    if arms is None:
-        arms = sorted({c['variant'] for c in norm_cells})
-    else:
-        arms = [str(a) for a in arms]
-    if len(set(arms)) != len(arms):
-        problems.append('arms contains duplicates')
-    if seeds is None:
-        seeds = list(dict.fromkeys(c['block'] for c in norm_cells))
-    else:
-        seeds = [str(s) for s in seeds]
-    n_seeds = len({c['block'] for c in norm_cells})
+    observed_arms = sorted({c['variant'] for c in norm_cells})
+    observed_blocks = list(dict.fromkeys(c['block'] for c in norm_cells))
+    declared_arms = _bt_declared_list(arms, 'arms', problems)
+    declared_seeds = _bt_declared_list(seeds, 'seeds', problems)
+    arms = observed_arms if declared_arms is None else declared_arms
+    seeds = observed_blocks if declared_seeds is None else declared_seeds
+    # The declared grid is the unit of "complete coverage": inferring the
+    # block set from the cells would let a plan that forgot a frozen seed
+    # look complete (66/72 cells reported as 11/11 complete seeds).
+    missing_arms = []
+    missing_seeds = []
+    if declared_arms is not None:
+        declared_arm_set = set(declared_arms)
+        observed_arm_set = set(observed_arms)
+        for arm in observed_arms:
+            if arm not in declared_arm_set:
+                problems.append(
+                    f'cell panel uses undeclared arm {arm!r}')
+        missing_arms = [arm for arm in declared_arms
+                        if arm not in observed_arm_set]
+    if declared_seeds is not None:
+        declared_seed_set = set(declared_seeds)
+        observed_seed_set = set(observed_blocks)
+        for block in observed_blocks:
+            if block not in declared_seed_set:
+                problems.append(
+                    f'cell panel uses undeclared seed/block {block!r}')
+        missing_seeds = [block for block in declared_seeds
+                         if block not in observed_seed_set]
+    n_seeds = len(seeds)
+    declared_seed_count = None
+    if declared_n_seeds is not None:
+        declared_seed_count = _bt_int(declared_n_seeds, minimum=1)
+        if declared_seed_count is None:
+            problems.append(
+                'declared n_seeds must be an integer >= 1')
+        elif declared_seed_count != n_seeds:
+            problems.append(
+                f'declared n_seeds={declared_seed_count} disagrees with the '
+                f'{n_seeds} declared seed(s); the resolution floor and the '
+                'planned grid must describe the same panel')
     min_n = _bt_int(min_n, minimum=2)
     if min_n is None:
         problems.append('min_n (min_seeds_for_confirmation) must be an '
                         'integer >= 2')
     elif min_n > n_seeds:
         problems.append(f'min_n={min_n} exceeds the {n_seeds} planned block(s)')
-    if not isinstance(complete_coverage, bool):
+    if _bt_is_bool(complete_coverage):
+        complete_coverage = bool(complete_coverage)
+    else:
         problems.append('complete_coverage must be boolean')
         complete_coverage = None
+    # A missing declared arm that is not part of any comparison consumes no
+    # pair and is therefore a grid warning; a comparison arm missing entirely
+    # is a structural problem and is reported by the family loop below.
+    for arm in missing_arms:
+        warnings.append(
+            f'declared arm {arm!r} has no cell in the panel; if it belongs '
+            'to the registered grid, the plan is incomplete')
+    # Under complete coverage every declared seed is mandatory (the point of
+    # this analysis); without it a shorter min-n panel can still answer the
+    # family, so the same gap is only a warning.
+    for block in missing_seeds:
+        message = (f'declared seed/block {block!r} has no cell in the panel; '
+                   'the registered arm x seed grid is incomplete')
+        if complete_coverage:
+            problems.append(message)
+        else:
+            warnings.append(message)
     max_attempts = _bt_int(max_attempts_per_cell, minimum=1)
     if max_attempts is None:
         problems.append('max_attempts_per_cell must be an integer >= 1')
@@ -583,21 +849,28 @@ def build_budget_truncation(*, cells, comparisons, arms=None, seeds=None,
 
     # Arms used by the family must exist in the panel at all; a missing arm is
     # a structural impossibility, not a budget question.
+    arms_set = set(arms)
+    observed_arm_set = set(observed_arms)
     for comp in comps:
         for key in ('a', 'b'):
-            if comp[key] not in arms:
+            if comp[key] not in arms_set:
                 problems.append(
                     f'comparison {comp["name"]!r} names undeclared arm '
                     f'{comp[key]!r}')
-            elif not any(c['variant'] == comp[key] for c in norm_cells):
+            elif comp[key] not in observed_arm_set:
                 problems.append(
                     f'comparison {comp["name"]!r} arm {comp[key]!r} never '
                     'appears in the cell panel')
 
     frontier = truncation_frontier(
         norm_cells, comps, min_n=min_n or 2,
-        complete_coverage=bool(complete_coverage))
-    problems.extend(p for p in frontier['problems'] if p not in problems)
+        complete_coverage=bool(complete_coverage),
+        required_blocks=seeds if declared_seeds is not None else None)
+    seen_problems = set(problems)
+    for problem in frontier['problems']:
+        if problem not in seen_problems:
+            problems.append(problem)
+            seen_problems.add(problem)
     warnings.extend(frontier['warnings'])
     required_cells = None
     if complete_coverage:
@@ -606,11 +879,13 @@ def build_budget_truncation(*, cells, comparisons, arms=None, seeds=None,
             problems.append(
                 'complete coverage is required but no prefix completes every '
                 'declared comparison; the panel cannot reach the frozen rule')
+            present_by_block = {}
+            for cell in norm_cells:
+                present_by_block.setdefault(cell['block'], set()).add(
+                    cell['variant'])
             missing = []
             for comp in comps:
-                for block in dict.fromkeys(c['block'] for c in norm_cells):
-                    present = {c['variant'] for c in norm_cells
-                               if c['block'] == block}
+                for block, present in present_by_block.items():
                     if not ({comp['a'], comp['b']} <= present):
                         missing.append(
                             f'{comp["name"]}@{block} needs '
@@ -623,10 +898,10 @@ def build_budget_truncation(*, cells, comparisons, arms=None, seeds=None,
             problems.append(
                 f'no prefix reaches min_n={min_n} pairs for every comparison')
 
+    family_arms = {comp['a'] for comp in comps} | {comp['b'] for comp in comps}
     single_cell_lethal = bool(
         complete_coverage and required_cells is not None
-        and any(c['variant'] in {comp['a'] for comp in comps}
-                | {comp['b'] for comp in comps} for c in norm_cells))
+        and any(c['variant'] in family_arms for c in norm_cells))
     floor = {
         'declared_min_seeds': min_n,
         'planned_seeds': n_seeds,
@@ -698,14 +973,20 @@ def build_budget_truncation(*, cells, comparisons, arms=None, seeds=None,
         cost['expected_attempts_required_prefix'] = _bt_round(
             required_cells * _bt_expected_attempts(a, r), 6)
         max_budget = required_cells * a
-        if max_budget > int(BUDGET_TRUNCATION_POLICY['max_exact_dp_states']):
+        dp_work = _bt_dp_work(required_cells, max_budget, a)
+        if (max_budget > int(BUDGET_TRUNCATION_POLICY['max_exact_dp_states'])
+                or dp_work is None
+                or dp_work > int(
+                    BUDGET_TRUNCATION_POLICY['max_exact_dp_operations'])):
             exact_dp = False
             cost['completion_risk_method'] = 'skipped_panel_too_large'
             warnings.append(
                 f'the exact completion-risk DP was skipped: '
-                f'{required_cells} required cells x {a} attempts exceeds the '
-                f'{BUDGET_TRUNCATION_POLICY["max_exact_dp_states"]}-state '
-                'cap; only the deterministic floor was checked')
+                f'{required_cells} required cells x {a} attempts x '
+                f'{max_budget + 1} states exceeds the '
+                f'{BUDGET_TRUNCATION_POLICY["max_exact_dp_states"]}-state / '
+                f'{BUDGET_TRUNCATION_POLICY["max_exact_dp_operations"]}-'
+                'operation cap; only the deterministic floor was checked')
         else:
             cost['completion_risk_method'] = 'exact_dp'
             dist = _bt_prefix_completion_distribution(
@@ -727,7 +1008,8 @@ def build_budget_truncation(*, cells, comparisons, arms=None, seeds=None,
     if budget_attempts is not None and required_cells is not None:
         affordable = min(budget_attempts, len(norm_cells))
         point = truncation_frontier_point(
-            norm_cells, comps, affordable, min_n=min_n or 2, n_seeds=n_seeds)
+            norm_cells, comps, affordable, min_n=min_n or 2, n_seeds=n_seeds,
+            required_blocks=seeds if declared_seeds is not None else None)
         budget_block['affordable_planned_cells'] = affordable
         budget_block['complete_seeds_at_budget'] = point['complete_seeds']
         budget_block['pairs_at_budget'] = dict(point['pairs'])
@@ -742,7 +1024,12 @@ def build_budget_truncation(*, cells, comparisons, arms=None, seeds=None,
             max_attempts is not None
             and budget_attempts >= len(norm_cells) * max_attempts)
         if model is not None and exact_dp:
-            max_budget = min(budget_attempts, required_cells * max_attempts + 1)
+            # The per-cell law has at most ``model`` attempts, so the total
+            # cannot exceed ``required_cells * model_attempts``.  Capping here
+            # (rather than at the registered disposition cap) keeps the
+            # budget row's DP no larger than the already-computed full DP.
+            max_budget = min(budget_attempts,
+                             required_cells * model['max_attempts_per_cell'])
             dist = _bt_prefix_completion_distribution(
                 required_cells, model['max_attempts_per_cell'],
                 model['replaceable_per_attempt'],
@@ -840,6 +1127,7 @@ def build_budget_truncation(*, cells, comparisons, arms=None, seeds=None,
             'seeds': list(seeds),
             'min_n': min_n,
             'complete_coverage': complete_coverage,
+            'declared_n_seeds': declared_seed_count,
             'max_attempts_per_cell': max_attempts,
             'max_attempts_source': max_attempts_source,
             'budget': budget_attempts,
@@ -876,12 +1164,18 @@ def budget_truncation_from_manifest(
     """
     if not isinstance(manifest, dict):
         raise TypeError('manifest must be an object')
-    arms = list(manifest.get('arms') or [])
-    seeds = list(manifest.get('seeds') or [])
+    raw_arms = manifest.get('arms')
+    raw_seeds = manifest.get('seeds')
+    arms = list(raw_arms) if isinstance(raw_arms, (list, tuple)) else raw_arms
+    seeds = list(raw_seeds) if isinstance(raw_seeds, (list, tuple)) \
+        else raw_seeds
     stats = manifest.get('statistics')
     stats = stats if isinstance(stats, dict) else {}
     comps = []
-    for raw in (manifest.get('primary_comparisons') or []):
+    raw_comparisons = manifest.get('primary_comparisons')
+    if not isinstance(raw_comparisons, (list, tuple)):
+        raw_comparisons = []
+    for raw in raw_comparisons:
         if not isinstance(raw, dict):
             continue
         comps.append({
@@ -892,42 +1186,66 @@ def budget_truncation_from_manifest(
         })
     if cells is None:
         if plan is None:
-            try:
-                raw_cells = [(str(arm), int(seed))
-                             for seed in seeds for arm in arms]
-                plan = build_run_order_plan(  # noqa: F821
-                    raw_cells, block_key=lambda c: c[1], seed=0,
-                    block_name='seed')
-            except Exception as exc:  # pragma: no cover - defensive
-                raise ValueError(
-                    'could not build the canonical run order: '
-                    f'{type(exc).__name__}: {exc}') from None
-            if plan_source is None:
-                plan_source = 'canonical_complete_block_seed0'
+            if not (isinstance(arms, (list, tuple))
+                    and isinstance(seeds, (list, tuple))):
+                # The declaration is malformed; let build_budget_truncation
+                # report the exact field instead of raising an opaque
+                # TypeError from list()/int().
+                cells = []
+                if plan_source is None:
+                    plan_source = 'canonical_complete_block_seed0'
+            else:
+                try:
+                    raw_cells = [(str(arm), int(seed))
+                                 for seed in seeds for arm in arms]
+                    plan = build_run_order_plan(  # noqa: F821
+                        raw_cells, block_key=lambda c: c[1], seed=0,
+                        block_name='seed')
+                except Exception as exc:  # pragma: no cover - defensive
+                    raise ValueError(
+                        'could not build the canonical run order: '
+                        f'{type(exc).__name__}: {exc}') from None
+                if plan_source is None:
+                    plan_source = 'canonical_complete_block_seed0'
+                cells = plan
         else:
             if plan_source is None:
                 plan_source = 'registered_run_order'
-        cells = plan
+            cells = plan
     if max_attempts_per_cell is None:
         policy = None
-        if isinstance(disposition, dict):
-            policy = disposition
-            if disposition.get('kind') == 'run_disposition':
-                policy = disposition.get('policy')
-        elif isinstance(stats.get('disposition_policy'), dict):
-            policy = stats.get('disposition_policy')
-        elif isinstance(manifest.get('disposition_policy'), dict):
-            policy = manifest.get('disposition_policy')
-        if policy is not None:
-            try:
-                norm = validate_run_disposition_policy(policy)  # noqa: F821
-            except Exception:
-                norm = None
-            if norm is not None:
-                max_attempts_per_cell = norm.get('max_attempts_per_cell')
-                max_attempts_source = 'disposition_policy'
+        explicit_policy = False
+        if disposition is not None:
+            # An explicitly supplied disposition is a declaration even when
+            # malformed: falling through to the default would hide a broken
+            # run_disposition artifact and silently re-open retries.
+            explicit_policy = True
+            if isinstance(disposition, dict):
+                policy = (disposition.get('policy')
+                          if disposition.get('kind') == 'run_disposition'
+                          else disposition)
             else:
+                policy = disposition
+        elif stats.get('disposition_policy') is not None:
+            explicit_policy = True
+            policy = stats.get('disposition_policy')
+        elif manifest.get('disposition_policy') is not None:
+            explicit_policy = True
+            policy = manifest.get('disposition_policy')
+        if explicit_policy:
+            if not isinstance(policy, dict):
                 max_attempts_source = 'disposition_policy_invalid'
+                max_attempts_per_cell = None
+            else:
+                try:
+                    norm = validate_run_disposition_policy(policy)  # noqa: F821
+                except Exception:
+                    norm = None
+                if norm is not None:
+                    max_attempts_per_cell = norm.get('max_attempts_per_cell')
+                    max_attempts_source = 'disposition_policy'
+                else:
+                    max_attempts_source = 'disposition_policy_invalid'
         else:
             max_attempts_per_cell = RUN_DISPOSITION_POLICY[  # noqa: F821
                 'max_attempts_per_cell']
@@ -949,7 +1267,12 @@ def budget_truncation_from_manifest(
     return build_budget_truncation(
         cells=cells, comparisons=comps, arms=arms, seeds=seeds,
         min_n=stats.get('min_seeds_for_confirmation'),
-        complete_coverage=stats.get('require_complete_coverage') is True,
+        # Pass the declaration through unchanged: ``is True`` would silently
+        # turn 1 / "true" into "complete coverage not required", and a
+        # missing field must be reported rather than read as a permissive
+        # False.  Both cases fail the malformed freeze closed.
+        complete_coverage=stats.get('require_complete_coverage'),
+        declared_n_seeds=stats.get('n_seeds'),
         max_attempts_per_cell=max_attempts_per_cell,
         max_attempts_source=max_attempts_source, budget=budget,
         failure_model=failure_model, risk_level=risk_level,
@@ -973,6 +1296,7 @@ def replay_budget_truncation(artifact):
         seeds=inputs.get('seeds'),
         min_n=inputs.get('min_n'),
         complete_coverage=inputs.get('complete_coverage'),
+        declared_n_seeds=inputs.get('declared_n_seeds'),
         max_attempts_per_cell=inputs.get('max_attempts_per_cell'),
         max_attempts_source=inputs.get('max_attempts_source'),
         budget=inputs.get('budget'),
@@ -1003,13 +1327,23 @@ def validate_budget_truncation(artifact, *, manifest=None):
                                       'fail'):
         out['problems'].append(
             f'artifact.status={artifact.get("status")!r} is not recognised')
+    for field in ('problems', 'warnings'):
+        value = artifact.get(field)
+        if value is not None and not isinstance(value, (list, tuple)):
+            out['problems'].append(
+                f'artifact.{field} must be a list, got '
+                f'{type(value).__name__}')
+    if artifact.get('policy') != BUDGET_TRUNCATION_POLICY:
+        out['problems'].append(
+            'artifact.policy does not match this implementation; the '
+            'artifact was produced by a different feasibility policy')
     recorded = _bt_sha256_text(artifact.get('content_sha256'))
     if recorded is None:
         out['problems'].append('content_sha256 is missing or not a digest')
     else:
         try:
             want = budget_truncation_content_sha(artifact)
-        except (TypeError, ValueError) as exc:
+        except (TypeError, ValueError, RecursionError) as exc:
             out['problems'].append(
                 f'artifact body is not canonical JSON: '
                 f'{type(exc).__name__}: {exc}')
@@ -1017,16 +1351,31 @@ def validate_budget_truncation(artifact, *, manifest=None):
             if recorded != want:
                 out['problems'].append(
                     'content_sha256 does not reproduce from the artifact body')
+    study = _bt_dict(artifact.get('study'))
     if manifest is not None:
         if not isinstance(manifest, dict):
             out['problems'].append('manifest argument must be an object')
         else:
             want = _bt_manifest_canonical_sha(manifest)
-            got = _bt_sha256_text((artifact.get('study') or {}).get(
-                'manifest_canonical_sha256'))
-            if want is not None and got is not None and want != got:
-                out['problems'].append(
-                    'artifact was built against a different manifest body')
+            got = _bt_sha256_text(study.get('manifest_canonical_sha256'))
+            if want is not None:
+                if got is None:
+                    out['problems'].append(
+                        'artifact carries no manifest body binding; a '
+                        'manifest-checked artifact must record its canonical '
+                        'hash')
+                elif got != want:
+                    out['problems'].append(
+                        'artifact was built against a different manifest body')
+            want_sha = _bt_sha256_text(manifest.get('manifest_sha256'))
+            got_sha = _bt_sha256_text(study.get('manifest_sha256'))
+            if want_sha is not None:
+                if got_sha is None:
+                    out['problems'].append(
+                        'artifact carries no manifest_sha256 binding')
+                elif got_sha != want_sha:
+                    out['problems'].append(
+                        'artifact manifest_sha256 does not match the manifest')
     # A full deterministic replay is the strongest tamper check: every count,
     # probability, threshold and verdict must reproduce from `inputs`.
     try:
@@ -1057,19 +1406,19 @@ def validate_budget_truncation(artifact, *, manifest=None):
     if artifact.get('status') != replayed.get('status'):
         out['problems'].append(
             'artifact.status does not reproduce from the inputs')
-    if list(artifact.get('problems') or []) != list(
-            replayed.get('problems') or []):
+    kept_problems = _bt_message_list(artifact.get('problems'))
+    kept_warnings = _bt_message_list(artifact.get('warnings'))
+    if kept_problems != _bt_message_list(replayed.get('problems')):
         out['problems'].append(
             'artifact.problems does not reproduce from the inputs')
-    if list(artifact.get('warnings') or []) != list(
-            replayed.get('warnings') or []):
+    if kept_warnings != _bt_message_list(replayed.get('warnings')):
         out['problems'].append(
             'artifact.warnings does not reproduce from the inputs')
     if artifact.get('status') == 'ok' and (
-            artifact.get('problems') or artifact.get('warnings')):
+            kept_problems or kept_warnings):
         out['problems'].append(
             'artifact is marked ok but carries problems/warnings')
-    out['warnings'].extend(artifact.get('warnings') or [])
+    out['warnings'].extend(kept_warnings)
     if out['problems']:
         out['status'] = 'fail'
     return out
@@ -1077,13 +1426,16 @@ def validate_budget_truncation(artifact, *, manifest=None):
 
 def write_budget_truncation(outdir, artifact, *, overwrite=False):
     """Atomically persist the artifact; refuse silent replacement."""
+    if isinstance(outdir, os.PathLike):
+        outdir = os.fspath(outdir)
     if not isinstance(outdir, str) or not outdir.strip():
         raise ValueError('outdir must be a non-empty path')
     verdict = validate_budget_truncation(artifact)
     path = os.path.join(outdir, 'budget_truncation.json')
     out = {'kind': 'write_budget_truncation', 'path': path, 'written': False,
            'unchanged': False, 'conflict': False, 'status': verdict['status'],
-           'artifact_status': artifact.get('status'),
+           'artifact_status': (artifact.get('status')
+                               if isinstance(artifact, dict) else None),
            'problems': list(verdict['problems'])}
     if verdict['status'] != 'ok':
         return out
@@ -1118,24 +1470,24 @@ def budget_truncation_summary(artifact):
     if not isinstance(artifact, dict):
         return {'kind': 'budget_truncation_summary', 'status': 'missing',
                 'ok': False}
+    study = _bt_dict(artifact.get('study'))
+    design = _bt_dict(artifact.get('design'))
+    cost = _bt_dict(artifact.get('cost'))
+    floor = _bt_dict(artifact.get('floor'))
+    budget = _bt_dict(artifact.get('budget'))
     return {
         'kind': 'budget_truncation_summary',
         'status': artifact.get('status'),
         'ok': artifact.get('status') == 'ok',
         'content_sha256': artifact.get('content_sha256'),
-        'manifest_canonical_sha256': (artifact.get('study') or {}).get(
+        'manifest_canonical_sha256': study.get(
             'manifest_canonical_sha256'),
-        'n_cells': (artifact.get('design') or {}).get('n_cells'),
-        'required_prefix_cells': (artifact.get('cost') or {}).get(
-            'required_prefix_cells'),
-        'effective_required_seeds': (artifact.get('floor') or {}).get(
-            'effective_required_seeds'),
-        'declared_min_seeds': (artifact.get('floor') or {}).get(
-            'declared_min_seeds'),
-        'budget_attempts': (artifact.get('budget') or {}).get(
-            'declared_attempts'),
-        'required_attempts_for_risk': (artifact.get('cost') or {}).get(
-            'required_attempts_for_risk'),
-        'p_required_prefix_within_budget': (artifact.get('budget') or {}).get(
+        'n_cells': design.get('n_cells'),
+        'required_prefix_cells': cost.get('required_prefix_cells'),
+        'effective_required_seeds': floor.get('effective_required_seeds'),
+        'declared_min_seeds': floor.get('declared_min_seeds'),
+        'budget_attempts': budget.get('declared_attempts'),
+        'required_attempts_for_risk': cost.get('required_attempts_for_risk'),
+        'p_required_prefix_within_budget': budget.get(
             'p_required_prefix_within_budget'),
     }
