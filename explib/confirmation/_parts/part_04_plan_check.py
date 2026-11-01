@@ -277,12 +277,54 @@ def plan_check(manifest_path=FREEZE_MANIFEST):
             'analysis rehearsal could not run '
             f'({type(_are).__name__}: {_are}); the decision path is not '
             'verified for a confirmatory read')
+    # ---- budget-truncation feasibility ------------------------------------
+    # Admission, power and the rehearsal all describe a panel that is assumed
+    # to finish.  This check asks whether a declared cell-attempt budget (and
+    # the disposition retry cap) can actually complete the shortest prefix
+    # that still answers the frozen family.  A missing budget is reported, not
+    # invented: the shipped freeze predates the declaration.
+    _bt = {}
+    try:
+        _bt = L.budget_truncation_from_manifest(
+            m, disposition=(m.get('statistics') or {}).get(
+                'disposition_policy'))
+        _bt_status = _bt.get('status')
+        if _bt_status == 'fail':
+            errs.extend(f"budget truncation: {x}"
+                        for x in (_bt.get('problems') or []))
+        elif _bt_status == 'not_verifiable':
+            notes.append(
+                'budget truncation: no cell-attempt budget is declared; the '
+                f"deterministic floor is "
+                f"{( _bt.get('cost') or {}).get('required_prefix_cells')} "
+                'attempt(s) and the declared floor is the resolution floor, '
+                'not the operational complete-coverage floor')
+        else:
+            _cost = _bt.get('cost') or {}
+            _budget = _bt.get('budget') or {}
+            notes.append(
+                'budget truncation: '
+                f"budget={( _budget.get('declared_attempts'))} attempts, "
+                f"risk-level requirement="
+                f"{( _cost.get('required_attempts_for_risk'))}, "
+                f"P(required prefix|budget)="
+                f"{( _budget.get('p_required_prefix_within_budget'))}")
+            notes.extend(f'budget truncation: {w}'
+                         for w in (_bt.get('warnings') or []))
+    except Exception as _bte:
+        _bt = {'kind': 'budget_truncation', 'status': 'not_verifiable',
+               'problems': [f'{type(_bte).__name__}: {_bte}']}
+        notes.append(
+            'budget truncation could not run '
+            f'({type(_bte).__name__}: {_bte}); the budget/retry-reserve '
+            'feasibility is unverified')
     report = {'ok': not errs, 'manifest': manifest_path, 'manifest_sha256': m.get('manifest_sha256'),
               'code_semantics': L.CODE_SEMANTICS, 'n_arms': len(arms), 'n_seeds': len(seeds),
               'n_min_for_confirmation': _n_min, 'min_attainable_p_holm': _min_holm,
               'predicted': _pred, 'admitted': len(admitted), 'comparisons': _comp_report,
               'design_preflight': _design,
               'analysis_rehearsal': _ar,
+              'budget_truncation': _bt,
               'errors': errs, 'notes': notes,
               'practical_significance_design': _psd}
     if errs:

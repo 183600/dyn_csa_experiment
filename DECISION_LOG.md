@@ -6445,3 +6445,63 @@ panel，`analysis_choice_concordance` 重述同一 test panel，`winner_curse`
 p/比值/Holm/status/family 后 replay 均 `fail`；gate 对空块、缺 power 的占位块与不存在文件
 `not_verifiable_locally`、对篡改块 `fail`；报告/CLI/`Makefile` 接线
 存在。完整 CPU 套件在本轮最终树通过。
+
+## 2026-10-31 — 设计能回答不等于预算能跑完：cell-attempt 预算、重试上限与截断前沿（本轮实验设计与准备硬化，no new runs）
+
+零 GPU；不新增训练、不读取 test split、不修改
+`confirmation_frozen*.json` 的字节/臂/种子/端点/α/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未删除、未修改、未移动。
+
+**Problem.** `design_protocol`、`preparation_clearance`、`run_disposition`
+各自都成立，但它们共同假设「面板会按计划跑完」。冻结清单同时声明
+`min_seeds_for_confirmation=8` 与 `require_complete_coverage=true`，有效
+门槛其实是 12 个完整种子 / 72 个单元；而重试上限 2 只有在最后一格之后
+仍有预算时才可用。现有准备门没有把「可用 cell-attempt 预算 → 重试储备
+→ 完整覆盖」连起来，因此一个在 protocol/分配/功效/演练上全绿的启动，
+仍可能在预算耗尽后得到**零个**可确认判定。
+
+**Fix.** 新增 `explib/_parts/part_72_budget_truncation.py`：
+
+- `truncation_frontier` 对执行顺序的每个前缀计算完整区组数、每个比较的
+  配对数、`min_n_met`/`complete_coverage_met` 与臂计数差；
+  `first_min_n_cells`/`first_complete_cells` 给出可回答族的最短前缀。
+  冻结面板为 6 臂 × 12 种子 = 72 单元，48 单元 = 8 个完整种子，
+  72 单元 = 12 个完整种子。
+- 失败模型按「每次尝试」声明可重试 `r`、不可重试 `f`、上限 `a`；
+  单元成功率 `P(k)=r^(k-1)(1-r-f)`，期望尝试 `(1-r^a)/(1-r)`。对要求
+  前缀做逐单元卷积，精确得到 `P(required prefix completes within B)`，
+  并求达到 `1-risk_level` 的最小 B。`r=0.02,f=0,a=2` 时 B=76、
+  期望 73.44、无上限完成概率 0.9716；`r=0.05,f=0.01,a=2` 时无上限仅
+  0.3898，判 fail（重试修不了 fatal failure）。
+- 判据：预算 < 有效前缀长度、模型使无上限完成概率低于 `1-δ`、或预算
+  低于 risk 所需尝试数，三者任一为 fail；无失败模型为 warning；无预算
+  为 `not_verifiable`，并报出确定性下限与风险所需尝试数。保留
+  `worst_case_covered`（是否覆盖 `N*a`）为读数而非额外降级。
+- 产物把 cells/comparisons/min_n/coverage/retry cap/budget/failure_model/
+  risk_level 写进 `inputs`；`validate_budget_truncation` 从 `inputs`
+  完整重放并逐项对账 frontier/cost/budget/floor/status。写入器同内容
+  no-op、不同内容默认 conflict，仅显式 `overwrite=True` 替换。
+- 接线：`python -m explib.confirmation plan` 在 rehearsal 后运行；
+  `fail` 拒绝计划，`not_verifiable` 只记 note（随附冻结清单未声明预算）。
+  新增 `audit_gates.py budget_truncation`（别名 `truncation` /
+  `campaign_budget` / `budget_feasibility` / `completion_risk`；既有
+  `budget` 6ND 门不变）、`make budget` 与 `run_report` 顶层块。gate 对
+  自洽但 `not_verifiable` 的产物仍报 `not_verifiable`。
+
+**Boundary.** 不产生 PPL/p/Holm，不改变 `verified`/`confirmed`，不进
+训练、不读 split。预算是 cell-attempt 单位；GPU-hours 是乘以实测单次
+成本的运行换算。失败模型是声明而非估计；当前只接受全局 per-attempt
+概率，按臂/按区不同失败率不适用。非完整覆盖设计的前缀全成功概率是
+充分条件下界，不是「至少 min_n 个区组成功」的精确概率。不替代真实
+调度器的预算熔断。
+
+**Verification.** 新增 `test_review_part_77.py` 16 项：冻结族 72 单元/
+12 区组与 48/72 两个门槛；前沿单调、`imbalance<=1`、8 完整种子时
+`complete_coverage_met=false`；resolution 8 vs operational 12 与
+`single_cell_lethal`；缺臂/区组缺臂 structural fail；预算 60 fail；
+无失败模型 warning；`r=0.02` 的 95% 门槛精确为 76（75 fail）、期望
+73.44、无上限 0.9716；`f=0.01` 任意预算 fail；干净 toy 设计 budget=8
+为 ok；篡改五类字段与未重算哈希 fail；清单 body 不符 fail；writer
+no-op/conflict/overwrite；gate 的 ok/embedded-ok/tamper-fail/
+missing-not_verifiable 与未声明预算 not_verifiable；plan snapshot 内嵌
+与 notes；report/CLI/Makefile 接线。完整 CPU 套件在本轮最终树通过。

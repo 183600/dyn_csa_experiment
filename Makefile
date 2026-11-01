@@ -7,7 +7,7 @@ PYTHON ?= python
 BUILD_DIR := .build
 INSTALL_DIR := $(BUILD_DIR)/install-check
 
-.PHONY: help test plan protocol preparation rehearsal transfer audit manipulation integrity env-check registry data-sensitivity reproduce report-diff install-check build clean
+.PHONY: help test plan protocol preparation rehearsal transfer budget audit manipulation integrity env-check registry data-sensitivity reproduce report-diff install-check build clean
 
 help:
 	@echo "make test          # CPU unit/reproducibility suite (zero GPU)"
@@ -16,6 +16,7 @@ help:
 	@echo "make preparation   # launch clearance: protocol + allocation + power + rehearsal (zero GPU)"
 	@echo "make rehearsal     # known-truth rehearsal of the frozen decision path (zero GPU)"
 	@echo "make transfer      # validation -> test effect transfer / shrinkage (zero GPU)"
+	@echo "make budget        # budget-truncation feasibility: cells, retries, completion risk (zero GPU)"
 	@echo "make audit         # local audit gates -> audit_report.json (non-zero on a failed gate)"
 	@echo "make manipulation  # functional manipulation check for every declared ablation (zero GPU)"
 	@echo "make integrity     # verify stamped analysis bodies/inputs (zero GPU)"
@@ -45,6 +46,9 @@ rehearsal:
 
 transfer:
 	$(PYTHON) audit_gates.py validation_transfer
+
+budget:
+	$(PYTHON) audit_gates.py budget_truncation
 
 audit:
 	$(PYTHON) audit_gates.py report

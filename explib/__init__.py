@@ -82,6 +82,7 @@ _PARTS = [
 'part_69_cleaning_sensitivity.py',
 'part_70_analysis_rehearsal.py',
 'part_71_validation_transfer.py',
+'part_72_budget_truncation.py',
 ]
 
 load_root_package(globals(), __file__, _PARTS,

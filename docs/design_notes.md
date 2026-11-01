@@ -12599,3 +12599,146 @@ gate 为 `warn`；validation `pilot_deltas` 与 PPL 差、test `per_seed` 与
 `not_estimable`；篡改均值/分类/p/比值/Holm/status/family 后 replay 均
 `fail`；gate 对空块、缺 power 的占位块与不存在文件
 `not_verifiable_locally`、对篡改块 `fail`；报告/CLI/`Makefile` 接线存在。完整 CPU 套件在本轮最终树通过。
+
+## 135. 设计能回答，不等于预算能跑完：单元尝试预算、重试上限与截断前沿（本轮实验设计与准备硬化，no new runs）
+
+### 135.1 问题：所有准备门都假设面板会跑完
+
+`design_protocol` 登记了臂/种子/端点/α/最小 n，`preparation_clearance`
+检查了分配、功效、演练与 held-out 锁，`run_disposition` 又允许失败单元
+重试。但它们都没有回答一个更早的问题：**声明的算力/时间预算，够不够
+把这套面板跑完？** 这里有三个彼此独立的缺口：
+
+1. 预算从没进入任何准备门。冻结清单的 `compute_budget_disclosure` 只有
+   参数匹配、FLOPs 比例和读取比例的文字，没有可核对的 cell-attempt 预算；
+   `resource_budget` 在 protocol 里只是调用方传进来的透传字段。
+2. 重试是有条件的：`max_attempts_per_cell=2` 只有在**最后一个计划单元
+   之后仍有预算**时才可用。预算恰好等于计划网格时，任何一个失败单元都
+   无法替换；而 `require_complete_coverage=true` 下，一个缺失单元就让
+   每个比较的完整配对集失效。
+3. 声明的 8 种子下限不是可执行下限。冻结清单同时声明
+   `min_seeds_for_confirmation=8` 与 `require_complete_coverage=true`，
+   因此**有效门槛是 12 个完整种子（72 个单元）**，不是 8 个（48 个）。
+   按 8 个种子做预算会系统性少算 24 个单元。
+
+已落盘产物里也没有这条读数：`audit_budget` 只做 6ND 的规模估算，
+`run_allocation` 只管「何时/在哪跑」，`missingness`/`disposition` 管
+「已经失败了怎么办」，`analysis_rehearsal` 管「判定路径对不对」。没有
+任何检查把「预算 → 重试 → 完整覆盖」连起来。
+
+### 135.2 方法：截断前沿 + 精确的截断几何完成概率
+
+新增 `explib/_parts/part_72_budget_truncation.py`。
+
+**(a) 确定性截断前沿。** 给定执行顺序（`run_order.json`；没有时用
+seed-major 的 canonical complete-block 顺序并明确标注来源）、冻结比较族、
+`min_n` 与 `complete_coverage`，对每个前缀 `k` 计算：
+
+- `complete_seeds`：包含该比较族所需全部臂的完整区组数；
+- `pairs[c]`：每个比较在多少个区组上同时具备 a、b 两臂；
+- `min_n_met` / `complete_coverage_met`；
+- `arm_counts` 与 `imbalance`（最大臂计数差）。
+
+`first_min_n_cells` 是仍能回答整个族的**最短**前缀，
+`first_complete_cells` 是达到完整覆盖的最短前缀。对冻结面板：
+`first_min_n_cells=48`（8 个完整种子）、`first_complete_cells=72`
+（12 个完整种子）；`complete_coverage=true` 使有效门槛取后者。
+63 个单元时是 10 个完整种子 + 3 个残缺单元，后 3 个单元不进入任何配对。
+
+**(b) 精确完成概率（不 Monte Carlo）。** 设单次尝试有可重试失败概率
+`r`、不可重试（fatal）失败概率 `f`、成功概率 `s=1-r-f`，每单元最多
+`a` 次尝试。一个单元在第 `k` 次尝试成功的概率是
+
+```
+P(success on k) = r^(k-1) * s,   k = 1..a
+```
+
+期望尝试次数 `E = (1 - r^a) / (1 - r)`。把「要求前缀的每个单元都成功」
+的尝试次数分布做逐单元卷积（状态 = 已用尝试数，只保留全部成功的路径），
+得到 `P(required prefix completes within B attempts)` 的**精确**值；
+`required_attempts_for_risk` 是使该概率首次达到 `1 - risk_level` 的最小
+`B`（默认 `risk_level=0.05`）。全部路径被裁剪到 `B` 以内，规模是
+`O(prefix * B * a)`，冻结面板上是 72 × 144 × 2 量级。
+
+对 `r=0.02, f=0, a=2, δ=0.05`：`P(无预算上限)=0.9975^72=0.9716`，
+期望 73.44 次，95% 完成所需 76 次。对 `r=0.05, f=0.01, a=2`
+（含不可重试失败）：`P(无预算上限)=0.3898 < 0.95`，**任何预算都无法
+达到目标**，因为重试修不了 fatal failure；判定为 fail，而不是「多给预算
+就行」。
+
+**(c) 判据。** 有声明预算时：
+
+- 预算 < 有效前缀长度 → fail（连一遍都跑不完）；
+- 有失败模型且 `P(required prefix | 无上限) < 1-δ` → fail（模型本身与
+  设计不兼容）；
+- 有失败模型且 `预算 < required_attempts_for_risk` → fail（完成概率
+  低于声明的风险水平）；
+- 预算覆盖前缀但不覆盖最坏情况（`N * a`）→ 仅记录
+  `worst_case_covered=false`，不额外降级；
+- 没有失败模型 → 只能检查「预算 ≥ 前缀长度」，其余记 warning；没有预算
+  → `not_verifiable`，并同时报出确定性下限与风险所需尝试数。
+
+产物把 `cells / comparisons / min_n / complete_coverage / retry cap /
+budget / failure_model / risk_level` 全部写入 `inputs`；
+`validate_budget_truncation` 从 `inputs` **完整重放**并与 frontier、cost、
+budget、floor、status、problems/warnings 逐项对账，任一不符判 fail。
+`content_sha256` 只覆盖正文（排除 `created_at`），`write_budget_truncation`
+同内容 no-op、不同内容默认 conflict，只有显式 `overwrite=True` 才替换。
+
+### 135.3 边界
+
+- 这不是新的显著性检验：不产生 PPL/p 值/Holm 槽位，不改变
+  `verified`/`confirmed`，不进训练、不读任何 split。
+- 预算是 **cell-attempt** 单位：一次 3000 step 训练单元算 1。GPU-hours
+  预算是该计数乘以实测单次成本，属于运行换算，不是设计决定；不同臂的
+  成本差异不改变「重试储备比例」，因此本块不做按臂加权。
+- 失败模型是**声明**，不是从数据估计的：没有声明就不猜，只报确定性下限
+  与 warning。全局 per-attempt 概率是一个简化；按臂/按区的失败率不同时
+  应分别声明（当前实现只接受全局模型，超出即不适用）。
+- 完整覆盖判定假设「每个区组都计划了比较族所需的臂」；不满足时判
+  structural fail，而不是把部分配对读成完整覆盖。非完整覆盖设计使用
+  `first_min_n_cells` 前缀的全成功概率，是**充分条件下界**，不是
+  「至少 min_n 个区组成功」的精确概率。
+- 不是签名，不抗同时改写预算、失败模型与产物并重算哈希；也不替代
+  真实调度器的预算熔断。
+
+### 135.4 接线
+
+```bash
+make budget
+python audit_gates.py budget_truncation
+python -m explib.confirmation plan      # snapshot 内嵌 budget_truncation
+```
+
+- `confirmation plan` 在 rehearsal 之后调用
+  `budget_truncation_from_manifest`；`fail` 进 `errors` 并拒绝计划，
+  `not_verifiable` 只作为 note 报出确定性下限（随附的冻结清单没有声明
+  预算），不会把「未声明」冒充成通过。
+- `audit_gates.py budget_truncation` 的别名包括 `truncation` /
+  `campaign_budget` / `budget_feasibility` / `completion_risk`（`budget`
+  仍是既有的 6ND 规模门，未被覆盖）。无参数时优先读取
+  `analysis_v12/budget_truncation.json`、根目录产物或
+  `analysis_v12/plan_snapshot.json` 内嵌块；没有落盘产物时对当前清单
+  现场运行。`run_report` 顶层新增 `budget_truncation` 块。
+- 存储产物的 gate 状态与产物状态分离：artifact 自洽但 `status` 为
+  `not_verifiable` 时，gate 仍报 `not_verifiable`，不会因为 replay 一致
+  就变绿。
+- 不改 `preparation_clearance` 的 check 词表/schema：已有存档 clearance
+  的 `checks` 是固定十项，新增一项会让旧产物在 strict 校验下失效。预算
+  证据改由 `design_protocol`/`confirmation plan` 的 snapshot 与独立 gate
+  绑定；未来若把 budget 列入 clearance，应同时升 schema 并提供迁移规则，
+  而不是把缺省预算静默当成通过。
+
+### 135.5 验证
+
+新增 `test_review_part_77.py` 16 项：冻结族上 72 单元/12 区组、
+`first_min_n=48`/`first_complete=72`、前沿单调且 `imbalance<=1`；8 vs 12
+的 resolution/operational floor 与 `single_cell_lethal`；缺臂、区组缺臂
+分别 structural fail；预算 60 判 fail 且 10 个完整种子；无失败模型时
+72 判 warnings；`r=0.02` 的 95% 门槛精确等于 76（75 fail、76 通过）、
+期望 73.44、`P(无上限)=0.9716`；`f=0.01` 时任何预算都不达标；干净 toy
+设计在 `budget=8` 下 ok；篡改 frontier/cost/p/status/floor 与未重算哈希
+分别 fail；清单 body 不同 fail；writer 的 no-op/conflict/overwrite；gate
+对存储产物 ok、内嵌 snapshot ok、篡改 fail、缺失或未声明预算
+`not_verifiable`；`confirmation plan` 的 report/notes 内嵌该块；report /
+CLI / `Makefile` 接线存在。完整 CPU 套件在本轮最终树通过。
