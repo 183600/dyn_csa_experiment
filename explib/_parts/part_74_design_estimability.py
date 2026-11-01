@@ -90,6 +90,12 @@ DESIGN_ESTIMABILITY_POLICY = {
         'attrition, budget and rehearsal gates.'),
 }
 
+# Rows x columns above which the exact rational elimination is replaced by the
+# equivalent closed-form rank for the same reference-coded design.  This is a
+# performance threshold, not part of the artifact policy/hash: the closed form
+# is the same integer for every design the policy admits.
+_DE_EXACT_RREF_WORK_BUDGET = 250000
+
 _RESERVED_CELL_KEYS = frozenset({
     'arm', 'variant', 'a', 'block', 'seed', 'b', 'factors', 'name',
     'label', 'id', 'cell',
@@ -245,8 +251,14 @@ def _de_rank(columns, n_rows):
     return len(pivots)
 
 
-def _de_in_column_space(columns, vector):
-    """Whether ``vector`` is in the span of ``columns`` (exact)."""
+def _de_in_column_space(columns, vector, *, base_rank=None):
+    """Whether ``vector`` is in the span of ``columns`` (exact).
+
+    ``base_rank`` lets a caller that already computed the rank of the same
+    design matrix reuse it.  A contrast check otherwise repeats that exact
+    elimination for every declared comparison, which is the dominant cost on
+    a large arm x seed grid.
+    """
     if not columns:
         return all(Fraction(x) == 0 for x in vector)
     n_rows = len(vector)
@@ -254,8 +266,10 @@ def _de_in_column_space(columns, vector):
     aug = [list(row) + [Fraction(vector[i])] for i, row in enumerate(rows)]
     _, p_aug = _de_rref(aug, len(columns) + 1)
     rank_aug = len(p_aug)
-    _, p_base = _de_rref(rows, len(columns))
-    return rank_aug == len(p_base)
+    if base_rank is None:
+        _, p_base = _de_rref(rows, len(columns))
+        base_rank = len(p_base)
+    return rank_aug == base_rank
 
 
 def _de_columns_rank(columns, n_rows):
@@ -325,12 +339,40 @@ def _de_cells_from_run_order(run_order):
     blocks = run_order.get('cell_blocks')
     if not isinstance(planned, (list, tuple)) or not planned:
         raise ValueError('run_order.planned_cells must be a non-empty list')
+    if len(planned) > DESIGN_ESTIMABILITY_POLICY['max_cells']:
+        # Guard before materialising a cell object per label: a malformed or
+        # hostile run order must be rejected in bounded memory.
+        raise ValueError(
+            f'run_order.planned_cells has {len(planned)} entries, above the '
+            f'max_cells guard {DESIGN_ESTIMABILITY_POLICY["max_cells"]}')
     if not isinstance(variants, dict) or not isinstance(blocks, dict):
         raise ValueError(
             'run_order.cell_variants/cell_blocks must be objects')
+
+    def _label_map(mapping, field):
+        # JSON object keys are strings, but a direct Python caller may pass
+        # integer labels in both ``planned_cells`` and the maps.  Normalise
+        # them through one representation and refuse a collision rather than
+        # silently letting one entry shadow another.
+        out = {}
+        for key, value in mapping.items():
+            text = _de_text(key)
+            if text is None:
+                raise ValueError(f'run_order.{field} has an empty label key')
+            if text in out:
+                raise ValueError(
+                    f'run_order.{field} repeats the label {text!r} after '
+                    'normalisation')
+            out[text] = value
+        return out
+
+    variants = _label_map(variants, 'cell_variants')
+    blocks = _label_map(blocks, 'cell_blocks')
     cells = []
     for label in planned:
-        label = str(label)
+        label = _de_text(label)
+        if label is None:
+            raise ValueError('run_order.planned_cells contains an empty label')
         if label not in variants:
             raise ValueError(
                 f'run_order.planned_cells contains {label!r} without a '
@@ -383,6 +425,9 @@ def _de_normalise_comparison(raw, index):
             raise ValueError(
                 f'comparison {index}: needs a and b, or an explicit weights '
                 'mapping')
+        if a == b:
+            raise ValueError(
+                f'comparison {index}: a and b must name two different arms')
         weights = {a: Fraction(1), b: Fraction(-1)}
         if name is None:
             name = f'{a} - {b}'
@@ -407,11 +452,29 @@ def _de_normalise_comparison(raw, index):
         if not parsed:
             raise ValueError(
                 f'comparison {index}: every weight is zero')
+        # ``a``/``b`` are the human-readable pair labels used for the
+        # component diagnostics.  A weighted multi-arm contrast may omit
+        # them, but a half-pair would make the artifact ambiguous.  If a label
+        # is not one of the nonzero weights, keep it at zero so the build's
+        # "arm not planned" check can name it instead of silently reporting an
+        # unrelated pair as estimable.
+        if (a is None) != (b is None):
+            raise ValueError(
+                f'comparison {index}: a and b must be given together, or '
+                'both omitted for an explicit multi-arm weights mapping')
+        if a is not None:
+            if a == b:
+                raise ValueError(
+                    f'comparison {index}: a and b must name two different '
+                    'arms')
+            for label in (a, b):
+                if label not in parsed:
+                    parsed[label] = Fraction(0)
         weights = parsed
         if name is None:
             name = ' + '.join(
                 f'{_de_fraction_text(w)}*{arm}'
-                for arm, w in sorted(weights.items()))
+                for arm, w in sorted(weights.items()) if w != 0)
     if name is None:
         raise ValueError(f'comparison {index}: name is missing/empty')
     total = sum(weights.values(), Fraction(0))
@@ -451,11 +514,18 @@ def _de_normalise_comparisons(comparisons):
 
 
 def _de_normalise_factors(factors, cells, shape='auto'):
-    """Return ``{arm: {factor: level}}`` plus a list of warnings."""
+    """Return ``(arm_factors, warnings, resolved_shape)`` for a declaration."""
     warnings = []
     arm_factors = {}
-    if factors == {}:
-        return {}, warnings
+    if shape not in ('auto', 'factor_to_arm', 'arm_to_factor'):
+        raise ValueError(
+            "factors_shape must be 'auto', 'factor_to_arm' or "
+            "'arm_to_factor'")
+    if isinstance(factors, dict) and not factors:
+        # An explicit empty declaration means "no factor terms"; it must still
+        # return the same three-field contract as every other path (the
+        # caller unpacks arm_factors, warnings and the resolved shape).
+        return {}, warnings, shape
     if factors is not None:
         if not isinstance(factors, dict):
             raise ValueError('factors must be an object mapping factor -> '
@@ -495,22 +565,45 @@ def _de_normalise_factors(factors, cells, shape='auto'):
                     'factors must be EITHER factor -> {arm: level} OR '
                     'arm -> {factor: level}, not a mixture')
         if shape == 'factor_to_arm':
+            declared_arms = {cell['arm'] for cell in cells}
             for factor, mapping in factors.items():
                 fname = _de_text(factor)
                 if fname is None:
                     raise ValueError('factor name is missing/empty')
+                if not isinstance(mapping, dict) or not mapping:
+                    raise ValueError(
+                        f'factor {fname!r}: mapping must be a non-empty '
+                        'object of arm -> level')
                 for arm, level in mapping.items():
                     arm_name = _de_text(arm)
                     lvl = _de_text(level)
                     if arm_name is None or lvl is None:
                         raise ValueError(
                             f'factor {fname!r}: arm/level must be non-empty')
-                    arm_factors.setdefault(arm_name, {})[fname] = lvl
+                    if arm_name not in declared_arms:
+                        raise ValueError(
+                            f'factor {fname!r}: arm {arm_name!r} is not a '
+                            'planned cell arm')
+                    prior = arm_factors.setdefault(arm_name, {}).get(fname)
+                    if prior is not None and prior != lvl:
+                        raise ValueError(
+                            f'factor {fname!r}: arm {arm_name!r} has '
+                            f'conflicting levels {prior!r} vs {lvl!r}')
+                    arm_factors[arm_name][fname] = lvl
         elif shape == 'arm_to_factor':
+            declared_arms = {cell['arm'] for cell in cells}
             for arm, mapping in factors.items():
                 arm_name = _de_text(arm)
                 if arm_name is None:
                     raise ValueError('factor mapping arm is missing/empty')
+                if arm_name not in declared_arms:
+                    raise ValueError(
+                        f'factor mapping arm {arm_name!r} is not a planned '
+                        'cell arm')
+                if not isinstance(mapping, dict) or not mapping:
+                    raise ValueError(
+                        f'factor mapping for {arm_name!r} must be a '
+                        'non-empty object of factor -> level')
                 for factor, level in mapping.items():
                     fname = _de_text(factor)
                     lvl = _de_text(level)
@@ -518,7 +611,13 @@ def _de_normalise_factors(factors, cells, shape='auto'):
                         raise ValueError(
                             f'factor mapping for {arm_name!r}: factor/level '
                             'must be non-empty')
-                    arm_factors.setdefault(arm_name, {})[fname] = lvl
+                    prior = arm_factors.setdefault(arm_name, {}).get(fname)
+                    if prior is not None and prior != lvl:
+                        raise ValueError(
+                            f'factor mapping for {arm_name!r}: factor '
+                            f'{fname!r} has conflicting levels {prior!r} vs '
+                            f'{lvl!r}')
+                    arm_factors[arm_name][fname] = lvl
         else:  # pragma: no cover - shape is validated above
             raise ValueError(
                 'factors must be EITHER factor -> {arm: level} OR '
@@ -790,7 +889,14 @@ def _de_analyse_factors(cells, arms, counts, columns, arm_factors, model):
             f'{DESIGN_ESTIMABILITY_POLICY["max_terms"]}')
     base_columns = _de_base_columns(cells, model)
     n_rows = len(cells)
-    rank_base = _de_columns_rank(base_columns, n_rows)
+    # The treatment model's base has a closed-form full rank: intercept plus
+    # one dummy per non-reference block (each block has a cell), or just the
+    # intercept for cell_means.  This avoids one exact elimination per run of
+    # the factor audit.
+    if model == 'cell_means':
+        rank_base = 1
+    else:
+        rank_base = len({cell['block'] for cell in cells})
     term_columns = {}
     term_df = {}
     for term in term_specs:
@@ -830,6 +936,7 @@ def _de_analyse_factors(cells, arms, counts, columns, arm_factors, model):
                 'rank': 0,
                 'estimable_columns': 0,
                 'estimable': False,
+                'separately_estimable': False,
                 'partial': False,
                 'status': 'degenerate',
                 'reason': 'a factor in this term has fewer than two levels',
@@ -951,17 +1058,46 @@ def build_design_estimability(cells, comparisons, *, factors=None,
         raise ValueError(
             f'{len(blocks)} blocks exceeds the max_blocks guard '
             f'{DESIGN_ESTIMABILITY_POLICY["max_blocks"]}')
-    columns, _, _ = _de_reference_columns(norm_cells)
-    if model == 'cell_means':
-        # Keep only the intercept and the arm dummies; drop block dummies.
-        n_blocks = len(blocks)
-        columns = [columns[0]] + columns[1 + (n_blocks - 1):]
-    rank = _de_columns_rank(columns, len(norm_cells))
     components = _de_components(norm_cells)
+    # Reference coding: intercept + (blocks-1) block dummies + (arms-1) arm
+    # dummies.  cell_means drops the block dummies.
+    n_columns = (len(arms) if model == 'cell_means'
+                 else len(arms) + len(blocks) - 1)
+    # Exact rational elimination is cubic in the column count and holds a
+    # dense Fraction row for every cell.  The reference coding has a
+    # closed-form rank, so a large but legal grid does not have to materialise
+    # that matrix or pay for the same rank twice (once here, once per
+    # comparison).  Small designs keep the matrix path, which also
+    # cross-checks the formula.
+    exact_budget = _DE_EXACT_RREF_WORK_BUDGET
+    exact_linear_algebra = (len(norm_cells) * max(1, n_columns)
+                            <= exact_budget)
+    columns = None
+    if exact_linear_algebra:
+        columns, _, _ = _de_reference_columns(norm_cells)
+        if model == 'cell_means':
+            # Keep only the intercept and the arm dummies; drop block dummies.
+            columns = [columns[0]] + columns[len(blocks):]
+        rank = _de_columns_rank(columns, len(norm_cells))
+    elif model == 'cell_means':
+        # intercept + all arm dummies, every arm observed
+        rank = len(arms)
+    else:
+        # Rank of the two-way additive incidence matrix: every arm and every
+        # block appears in a cell, and each disconnected component contributes
+        # exactly one linear dependency.
+        rank = len(arms) + len(blocks) - len(components)
     component_of = {}
     for index, component in enumerate(components):
         for arm in component:
             component_of[arm] = index
+    # One pass over the cells instead of rescanning the panel per comparison
+    # per block.  ``blocks_with_both`` is a diagnostic count, but computing it
+    # naively is O(comparisons * blocks * cells) and becomes the dominant cost
+    # for a large arm x seed grid.
+    arms_by_block = collections.defaultdict(set)
+    for cell in norm_cells:
+        arms_by_block[cell['block']].add(cell['arm'])
 
     problems = []
     warnings = []
@@ -1038,7 +1174,15 @@ def build_design_estimability(cells, comparisons, *, factors=None,
             # intercepts cancel (pure contrasts have total zero in each
             # component; a connected design has one component).
             graph_ok = (len(set(component_totals)) <= 1)
-        span_ok = _de_in_column_space(columns, cell_vector)
+        if exact_linear_algebra:
+            span_ok = _de_in_column_space(columns, cell_vector, base_rank=rank)
+        else:
+            # Every comparison is lifted as one constant per arm; intercept +
+            # block dummies + arm dummies spans all such vectors (and the
+            # cell_means model's intercept + arm dummies does too).  The
+            # component criterion above is what can fail on a disconnected
+            # design, so the closed-form path does not change any verdict.
+            span_ok = True
         estimable = bool(span_ok and graph_ok)
         if not graph_ok:
             if (comparison.get('a') and comparison.get('b')
@@ -1052,12 +1196,11 @@ def build_design_estimability(cells, comparisons, *, factors=None,
         else:
             reason = 'ok'
         blocks_with_both = 0
-        for block in blocks:
-            block_arms = {cell['arm'] for cell in norm_cells
-                          if cell['block'] == block}
-            if comparison.get('a') and comparison.get('b') and {
-                    comparison['a'], comparison['b']} <= block_arms:
-                blocks_with_both += 1
+        if comparison.get('a') and comparison.get('b'):
+            pair_arms = {comparison['a'], comparison['b']}
+            blocks_with_both = sum(
+                1 for block in blocks
+                if pair_arms <= arms_by_block.get(block, set()))
         if not estimable:
             if reason == 'disconnected_components':
                 problems.append(
@@ -1153,9 +1296,9 @@ def build_design_estimability(cells, comparisons, *, factors=None,
             'blocks': list(blocks),
             'cells_per_arm': counts,
             'complete_grid': bool(complete_grid),
-            'n_columns': len(columns),
+            'n_columns': int(n_columns),
             'rank': int(rank),
-            'deficiency': int(len(columns) - rank),
+            'deficiency': int(n_columns - rank),
             'components': [list(component) for component in components],
             'component_of': {arm: int(component_of[arm]) for arm in arms},
             'block_effects': model == 'block_effects',
@@ -1267,8 +1410,17 @@ def validate_design_estimability(artifact):
         return out
     out['replayed'] = True
     out['replayed_status'] = replayed.get('status')
-    want = design_estimability_content_sha(artifact)
     got = artifact.get('content_sha256')
+    try:
+        want = design_estimability_content_sha(artifact)
+    except (TypeError, ValueError, RecursionError) as exc:
+        # A non-canonical body (NaN/Inf/recursive value) is a failed artifact,
+        # not an exception for the caller/CLI to crash on.
+        out['status'] = 'fail'
+        out['problems'].append(
+            'artifact body is not canonical JSON: '
+            f'{type(exc).__name__}: {exc}')
+        return out
     if got != want:
         out['status'] = 'fail'
         out['problems'].append(
@@ -1279,8 +1431,16 @@ def validate_design_estimability(artifact):
             'empty_combinations', 'aliased_pairs', 'redundant_pairs',
             'status', 'problems', 'warnings', 'summary')
     for key in keys:
-        if _de_canonical(artifact.get(key)) != _de_canonical(
-                replayed.get(key)):
+        try:
+            same = (_de_canonical(artifact.get(key))
+                    == _de_canonical(replayed.get(key)))
+        except (TypeError, ValueError, RecursionError) as exc:
+            out['status'] = 'fail'
+            out['problems'].append(
+                f'artifact.{key} is not canonical JSON: '
+                f'{type(exc).__name__}: {exc}')
+            continue
+        if not same:
             out['status'] = 'fail'
             out['problems'].append(
                 f'artifact.{key} does not match a replay from inputs')
@@ -1310,15 +1470,19 @@ def design_estimability_from_manifest(
     raw_comparisons = manifest.get('primary_comparisons')
     if not isinstance(raw_comparisons, (list, tuple)):
         raw_comparisons = []
-    for raw in raw_comparisons:
+    for index, raw in enumerate(raw_comparisons):
         if not isinstance(raw, dict):
-            continue
+            raise ValueError(
+                f'primary_comparisons[{index}] must be an object, got '
+                f'{type(raw).__name__}')
         a = _de_text(raw.get('a'))
         b = _de_text(raw.get('b'))
         weights = raw.get('weights')
         if weights is not None:
             if not isinstance(weights, dict) or not weights:
-                continue
+                raise ValueError(
+                    f'primary_comparisons[{index}].weights must be a '
+                    'non-empty object')
             comparisons.append({
                 'name': _de_text(raw.get('name')) or 'weighted contrast',
                 'a': a,
@@ -1331,6 +1495,10 @@ def design_estimability_from_manifest(
                 'a': a,
                 'b': b,
             })
+        else:
+            raise ValueError(
+                f'primary_comparisons[{index}] needs a and b, or an explicit '
+                'weights mapping')
     if not comparisons:
         raise ValueError('the manifest declares no usable primary comparisons')
     source = 'explicit_cells'
@@ -1344,6 +1512,15 @@ def design_estimability_from_manifest(
             raise ValueError(
                 'no cells/run_order were supplied and the manifest does not '
                 'declare both arms and seeds')
+        n_canonical = len(arms) * len(seeds)
+        if n_canonical > DESIGN_ESTIMABILITY_POLICY['max_cells']:
+            # Check the cardinality before materialising the grid: a manifest
+            # with a huge seed list must not allocate one tuple per cell just
+            # to be rejected by the same guard a moment later.
+            raise ValueError(
+                f'the canonical arm x seed grid has {n_canonical} cells, '
+                f'above the max_cells guard '
+                f'{DESIGN_ESTIMABILITY_POLICY["max_cells"]}')
         resolved = [(arm, seed) for seed in seeds for arm in arms]
         source = 'canonical_complete_arm_x_seed_grid'
     artifact = build_design_estimability(

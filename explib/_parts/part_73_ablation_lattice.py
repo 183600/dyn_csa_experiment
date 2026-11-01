@@ -331,6 +331,15 @@ def _al_cells_to_records(cells, components):
 def _al_cells_from_records(records, components, *, scale):
     if not isinstance(records, (list, tuple)):
         raise ValueError('inputs.cells must be a list of records')
+    if (components is not None
+            and len(components) <= AL_LATTICE_MAX_COMPONENTS
+            and len(records) > (1 << len(components))):
+        # A lattice over k declared components has exactly 2**k subsets;
+        # refuse an oversized record list before building a dict for it.
+        raise ValueError(
+            f'inputs.cells has {len(records)} records for a '
+            f'{len(components)}-component lattice (at most '
+            f'{1 << len(components)} subsets)')
     cells = {}
     for i, rec in enumerate(records):
         if not isinstance(rec, dict):
@@ -391,7 +400,11 @@ def shapley_lattice_attribution(
     if not (0.0 < _alpha < 1.0):
         raise ValueError(f'alpha must be in (0, 1), got {alpha!r}')
     _min_n = _al_int(min_n, where='min_n', minimum=0)
-    _max_k = _al_int(max_components, where='max_components', minimum=1)
+    # ``max_components`` is a caller preview of the cap, not a way to disable
+    # it: the exact lattice materialises 2**k subsets, so a caller-supplied
+    # large value must not turn the analysis into an unbounded allocation.
+    _max_k = min(_al_int(max_components, where='max_components', minimum=1),
+                 AL_LATTICE_MAX_COMPONENTS)
     _tol = _al_finite(tol, where='tol')
     if _tol < 0.0:
         raise ValueError(f'tol must be non-negative, got {tol!r}')
@@ -1011,7 +1024,8 @@ def ablation_lattice_design(components=None, *, arms_by_subset=None,
       A design is allowed to be incomplete; the point is to price and name the
       gap instead of silently treating a star as attribution.
     """
-    _max_k = _al_int(max_components, where='max_components', minimum=1)
+    _max_k = min(_al_int(max_components, where='max_components', minimum=1),
+                 AL_LATTICE_MAX_COMPONENTS)
     _n_seeds = _al_int(n_seeds, where='n_seeds', minimum=1)
     out = {
         'kind': 'ablation_lattice_design',
@@ -1068,6 +1082,15 @@ def ablation_lattice_design(components=None, *, arms_by_subset=None,
             out['problems'].append('arms_by_subset must be a mapping')
             return out
         expected = _al_all_subsets(comps)
+        if len(arms_by_subset) > len(expected):
+            # The declared lattice has only 2**k cells; an oversized mapping
+            # is structurally invalid and must not be walked key by key.
+            out['status'] = 'fail'
+            out['problems'].append(
+                f'arms_by_subset has {len(arms_by_subset)} entries for a '
+                f'{len(comps)}-component lattice (at most {len(expected)} '
+                'subsets)')
+            return out
         normal = {}
         for key, arm in arms_by_subset.items():
             parts = _al_split_key(key)
