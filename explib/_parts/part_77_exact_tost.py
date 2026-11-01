@@ -60,6 +60,20 @@ _ETOST_FROZEN_FIELDS = ('confirmed', 'p_holm', 'verified', 'verdict',
                         'decision')
 
 
+def _etost_repr(value, limit=200):
+    """Bounded repr for an untrusted diagnostic value.
+
+    Python refuses to stringify integers above its digit limit, so a malformed
+    artifact/delta must not be able to crash the validator while it is merely
+    trying to report that value.
+    """
+    try:
+        text = repr(value)
+    except Exception:
+        return f'<{type(value).__name__}>'
+    return text if len(text) <= limit else text[:limit] + '...'
+
+
 def _etost_number(value, name, *, positive=False):
     """Finite float, or ``None`` for bool/str/NaN/inf (and non-positive)."""
     if isinstance(value, (bool, np.bool_)):
@@ -330,10 +344,10 @@ def exact_signflip_tost(deltas, margin, conf=0.90):
         out['reason'] = f'fewer than two finite paired seeds (n={d.size})'
         return out
     if m is None:
-        out['reason'] = f'margin={margin!r} must be finite and > 0'
+        out['reason'] = f'margin={_etost_repr(margin)} must be finite and > 0'
         return out
     if c is None or not (0.0 < c < 1.0):
-        out['reason'] = f'conf={conf!r} must be a finite probability in (0,1)'
+        out['reason'] = f'conf={_etost_repr(conf)} must be a finite probability in (0,1)'
         return out
     alpha = (1.0 - c) / 2.0
     out['alpha_one_sided'] = float(alpha)
@@ -375,11 +389,17 @@ def exact_signflip_tost(deltas, margin, conf=0.90):
         'p_floor_low': float(low['p_floor']),
         'p_floor_high': float(high['p_floor']),
         'p_floor': float(max(low['p_floor'], high['p_floor'])),
-        'p_floor_by_n': float(_etost_floor(d.size)),
         'method': _etost_method(low, high),
         'p_low_method': low['method'],
         'p_high_method': high['method'],
     })
+    # The TOST p-value is the maximum of the two one-sided p-values, so its
+    # own resolution floor is the MAXIMUM of the two shifted-vector floors.  A
+    # delta exactly on -margin (or +margin) turns one shifted vector entry
+    # into an exact zero and raises that arm's floor to 2**-(n-1); reporting
+    # the theoretical all-nonzero 2**-n here would understate the ceiling and
+    # could label a resolution-limited panel as resolvable.
+    out['p_floor_by_n'] = float(out['p_floor'])
     try:
         # Strict rejection (p < alpha) needs 2**-n < alpha, so an exact power
         # of two (e.g. alpha=0.25 at conf=0.5) needs the next n, not log2.
@@ -388,14 +408,14 @@ def exact_signflip_tost(deltas, margin, conf=0.90):
         min_n = None
     out['resolution_min_n'] = min_n
     out['min_n_for_alpha'] = min_n
-    out['resolution_limited'] = bool(out['p_floor_by_n'] >= alpha)
+    out['resolution_limited'] = bool(out['p_floor'] >= alpha)
     out['equivalent'] = bool((not out['resolution_limited'])
                              and out['p_tost'] < alpha)
     out['note'] = (
         'two one-sided exact sign-flip tests on d+margin (low) and margin-d '
-        '(high); p_floor is this panel\'s smallest attainable one-sided p and '
-        'p_floor_by_n=2**-n is the resolution limit for n nonzero seeds, so '
-        'p_floor_by_n >= alpha means equivalence is impossible at this n even '
+        '(high); p_floor is this panel\'s smallest attainable one-sided p '
+        '(after exact zeros in a shifted vector) and p_floor_by_n mirrors it, '
+        'so p_floor >= alpha means equivalence is impossible at this n even '
         'if every observed difference is zero.  It does not replace the '
         'pre-registered paired-t TOST decision.')
     return out
@@ -454,16 +474,16 @@ def build_exact_tost(deltas, margin, conf=0.90, created_at=None):
     for x in raw:
         f = _finite_scalar(x)  # noqa: F821
         if f is None:
-            raise ValueError(f'deltas contain a non-finite/non-numeric value: {x!r}')
+            raise ValueError(f'deltas contain a non-finite/non-numeric value: {_etost_repr(x)}')
         vals.append(float(f))
     if len(vals) < 2:
         raise ValueError(f'exact TOST needs at least two finite deltas, got {len(vals)}')
     m = _etost_number(margin, 'margin', positive=True)
     c = _etost_number(conf, 'conf')
     if m is None:
-        raise ValueError(f'margin={margin!r} must be finite and > 0')
+        raise ValueError(f'margin={_etost_repr(margin)} must be finite and > 0')
     if c is None or not (0.0 < c < 1.0):
-        raise ValueError(f'conf={conf!r} must be a finite probability in (0,1)')
+        raise ValueError(f'conf={_etost_repr(conf)} must be a finite probability in (0,1)')
     result = exact_signflip_tost(vals, margin=m, conf=c)
     if result.get('status') != 'ok':
         raise ValueError('exact TOST inputs are not computable: '
@@ -493,10 +513,10 @@ def validate_exact_tost(artifact):
     if artifact.get('kind') != 'exact_tost_artifact':
         out['problems'].append(
             f'artifact.kind must be "exact_tost_artifact", got '
-            f'{artifact.get("kind")!r}')
+            f'{_etost_repr(artifact.get("kind"))}')
     schema = artifact.get('schema')
     if isinstance(schema, bool) or not isinstance(schema, int) or schema != 1:
-        out['problems'].append(f'artifact.schema must be 1, got {schema!r}')
+        out['problems'].append(f'artifact.schema must be 1, got {_etost_repr(schema)}')
     stolen = _etost_frozen_fields(artifact)
     if stolen:
         out['problems'].append(
@@ -516,7 +536,9 @@ def validate_exact_tost(artifact):
             'artifact.inputs carries field(s) outside the replay schema: '
             + ', '.join(repr(k) for k in extra))
     recorded = artifact.get('content_sha256')
-    out['content_sha256'] = recorded
+    # Keep the verdict strict-JSON even when a hand-edited artifact replaces
+    # the digest with NaN/Inf/bytes; such a value still fails the checks below.
+    out['content_sha256'] = recorded if isinstance(recorded, str) else None
     body = {k: v for k, v in artifact.items()
             if k not in ('created_at', 'content_sha256')}
     try:
@@ -561,8 +583,8 @@ def validate_exact_tost(artifact):
     for key in sorted(set(stored) & set(replay)):
         if not _etost_json_equal(stored.get(key), replay.get(key)):
             out['problems'].append(
-                f'result.{key}: stored={stored.get(key)!r}, '
-                f'replay={replay.get(key)!r}')
+                f'result.{key}: stored={_etost_repr(stored.get(key))}, '
+                f'replay={_etost_repr(replay.get(key))}')
     if not out['problems']:
         out['status'] = 'ok'
     return out

@@ -23,10 +23,13 @@ _ETOST_STATS_DEFAULTS = (
     os.path.join('analysis_v12', 'test_stats.json'),
     os.path.join('analysis_v12', 'stats.json'),
 )
-_ETOST_COMPARE_FIELDS = (
-    'n', 'margin', 'conf', 'p_low', 'p_high', 'p_tost',
-    'p_floor', 'p_floor_by_n', 'resolution_limited', 'equivalent',
-    'n_nonzero_low', 'n_nonzero_high', 'method',
+# Fields the enclosing practical-significance row adds to the companion.  They
+# are checked separately because they are not part of the standalone test
+# result, but they may not be used to smuggle an arbitrary extra field.
+_ETOST_OPTIONAL_FIELDS = ('t_equivalent', 'agreement')
+_ETOST_FROZEN_FIELDS = (
+    'confirmed', 'p_holm', 'p_exact_signflip', 'p_value', 'verified',
+    'verdict', 'decision', 'significant', 'significance',
 )
 
 
@@ -40,6 +43,15 @@ def _etost_gate_resolve(path, defaults):
         if os.path.exists(candidate):
             return candidate
     return None
+
+
+def _etost_gate_repr(value, limit=200):
+    """Bounded repr for a malformed companion value in a diagnostic."""
+    try:
+        text = repr(value)
+    except Exception:
+        return f'<{type(value).__name__}>'
+    return text if len(text) <= limit else text[:limit] + '...'
 
 
 def _etost_gate_number(value):
@@ -89,19 +101,33 @@ def _etost_gate_compare(name, stored, replay, t_equivalent=None):
     if not isinstance(stored, dict):
         return problems, [f'{name}: no distribution_free companion block']
     if stored.get('status') not in (None, 'ok'):
-        return problems, [f'{name}: companion status is {stored.get("status")!r}']
-    for key in _ETOST_COMPARE_FIELDS:
+        return problems, [f'{name}: companion status is {_etost_gate_repr(stored.get("status"))}']
+    # Replay every derived field, not just the headline p-values.  The
+    # companion also carries the shifted-vector floors, drop counts, methods and
+    # prose; leaving any of them unchecked lets a hand-edited file keep a valid
+    # p_tost while claiming a different resolution or dropping a seed.
+    for key in sorted(replay):
         if key not in stored:
             problems.append(f'{name}.distribution_free.{key} is missing')
         elif not _etost_gate_equal(stored.get(key), replay.get(key)):
             problems.append(
-                f'{name}.distribution_free.{key}: stored={stored.get(key)!r}, '
-                f'replay={replay.get(key)!r}')
+                f'{name}.distribution_free.{key}: stored={_etost_gate_repr(stored.get(key))}, '
+                f'replay={_etost_gate_repr(replay.get(key))}')
+    extra = sorted(set(stored) - set(replay) - set(_ETOST_OPTIONAL_FIELDS))
+    if extra:
+        problems.append(
+            f'{name}.distribution_free carries field(s) outside the replay '
+            'schema: ' + ', '.join(repr(key) for key in extra))
+    stolen = sorted(set(stored) & set(_ETOST_FROZEN_FIELDS))
+    if stolen:
+        problems.append(
+            f'{name}.distribution_free carries frozen-decision field(s) that '
+            'a descriptive companion must not contain: ' + repr(stolen))
     if 't_equivalent' in stored and not _etost_gate_equal(
             stored.get('t_equivalent'), t_equivalent):
         problems.append(
             f'{name}.distribution_free.t_equivalent: '
-            f'stored={stored.get("t_equivalent")!r}, t-block={t_equivalent!r}')
+            f'stored={_etost_gate_repr(stored.get("t_equivalent"))}, t-block={_etost_gate_repr(t_equivalent)}')
     if 'agreement' in stored:
         expected = None
         if stored.get('equivalent') is not None and t_equivalent is not None:
@@ -109,7 +135,7 @@ def _etost_gate_compare(name, stored, replay, t_equivalent=None):
         if stored.get('agreement') is not expected:
             problems.append(
                 f'{name}.distribution_free.agreement: '
-                f'stored={stored.get("agreement")!r}, expected={expected!r}')
+                f'stored={_etost_gate_repr(stored.get("agreement"))}, expected={_etost_gate_repr(expected)}')
     if stored.get('agreement') is False:
         warnings.append(
             f'{name}: t-TOST concludes equivalence but the exact sign-flip '

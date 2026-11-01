@@ -64,11 +64,30 @@ TYPE_SM_POLICY = {
 
 _SQRT2 = math.sqrt(2.0)
 _SQRT2PI = math.sqrt(2.0 * math.pi)
+# A Bonferroni family larger than this cannot be represented as a finite
+# float64 (and no real study declares anywhere near that many tests).  Keeping
+# the bound explicit means an absurd integer fails closed instead of raising
+# inside ``float(family_size)``.
+_TSM_MAX_FAMILY_SIZE = 10 ** 308
 
 
 # ---------------------------------------------------------------------------
 # small numeric helpers
 # ---------------------------------------------------------------------------
+
+def _tsm_repr(value, limit=200):
+    """Bounded repr for an untrusted diagnostic value.
+
+    Formatting a Python integer with more than ~4300 digits raises, and a huge
+    container can make an error message enormous.  Diagnostics must never be
+    the reason a fail-closed readout crashes.
+    """
+    try:
+        text = repr(value)
+    except Exception:
+        return f'<{type(value).__name__}>'
+    return text if len(text) <= limit else text[:limit] + '...'
+
 
 def _tsm_number(value, name):
     """Return a finite float or ``None`` (bool/str/NaN/inf are not numbers)."""
@@ -115,20 +134,26 @@ def _tsm_z(alpha, family_size, critical_value):
         z = _tsm_number(critical_value, 'critical_value')
         if z is None or z <= 0.0:
             return None, None, 'explicit', (
-                f'critical_value={critical_value!r} must be finite and > 0')
+                f'critical_value={_tsm_repr(critical_value)} must be finite and > 0')
         return z, None, 'explicit', None
     a = _tsm_number(alpha, 'alpha')
     if a is None or not (0.0 < a < 1.0):
         return None, None, 'bonferroni', (
-            f'alpha={alpha!r} must be a finite probability in (0,1)')
-    m = _tsm_int(family_size, 'family_size', minimum=1)
+            f'alpha={_tsm_repr(alpha)} must be a finite probability in (0,1)')
+    m = _tsm_int(family_size, 'family_size', minimum=1,
+                 maximum=_TSM_MAX_FAMILY_SIZE)
     if m is None:
         return None, None, 'bonferroni', (
-            f'family_size={family_size!r} must be an integer >= 1')
-    adj = a / float(m)
+            'family_size must be an integer between 1 and '
+            f'{_TSM_MAX_FAMILY_SIZE}; got {_tsm_repr(family_size)}')
+    try:
+        adj = a / float(m)
+    except (OverflowError, ZeroDivisionError):
+        return None, None, 'bonferroni', (
+            'alpha/family_size is not representable')
     if not (0.0 < adj < 1.0):
         return None, None, 'bonferroni', (
-            f'alpha/family_size={adj!r} is not a probability in (0,1)')
+            f'alpha/family_size={_tsm_repr(adj)} is not a probability in (0,1)')
     try:
         z = _tsm_quantile(1.0 - adj / 2.0)
     except (ValueError, OverflowError):
@@ -284,43 +309,45 @@ def type_sm_design(n, sigma, effect, *, alpha=0.05, family_size=1,
 
     nn = _tsm_int(n, 'n', minimum=2, maximum=1000000)
     if nn is None:
-        problems.append(f'n={n!r} must be an integer >= 2')
+        problems.append(f'n={_tsm_repr(n)} must be an integer >= 2')
     sd = _tsm_number(sigma, 'sigma')
     if sd is None or sd <= 0.0:
-        problems.append(f'sigma={sigma!r} must be a finite number > 0')
+        problems.append(f'sigma={_tsm_repr(sigma)} must be a finite number > 0')
     eff = _tsm_number(effect, 'effect')
     if eff is None or eff == 0.0:
-        problems.append(f'effect={effect!r} must be a finite non-zero number')
+        problems.append(f'effect={_tsm_repr(effect)} must be a finite non-zero number')
 
     a = _tsm_number(alpha, 'alpha')
-    m = _tsm_int(family_size, 'family_size', minimum=1)
+    m = _tsm_int(family_size, 'family_size', minimum=1,
+                 maximum=_TSM_MAX_FAMILY_SIZE)
     if critical_value is not None:
         # An explicit critical value makes alpha/family_size optional, but a
         # supplied value must still be usable rather than recorded as 0/None.
         if a is not None and not (0.0 < a < 1.0):
             problems.append(
-                f'alpha={alpha!r} must be a finite probability in (0,1)')
-        if m is not None and m < 1:
+                f'alpha={_tsm_repr(alpha)} must be a finite probability in (0,1)')
+        if family_size is not None and m is None:
             problems.append(
-                f'family_size={family_size!r} must be an integer >= 1')
+                'family_size must be an integer between 1 and '
+                f'{_TSM_MAX_FAMILY_SIZE}; got {_tsm_repr(family_size)}')
     z, adj, rule, z_problem = _tsm_z(a, m, critical_value)
     if z_problem:
         problems.append(z_problem)
     tp = _tsm_number(target_power, 'target_power')
     if tp is None or not (0.0 < tp < 1.0):
         problems.append(
-            f'target_power={target_power!r} must be a finite probability in (0,1)')
+            f'target_power={_tsm_repr(target_power)} must be a finite probability in (0,1)')
     mts = _tsm_number(max_type_s, 'max_type_s')
     if mts is None or not (0.0 < mts <= 0.5):
         problems.append(
-            f'max_type_s={max_type_s!r} must be in (0, 0.5]')
+            f'max_type_s={_tsm_repr(max_type_s)} must be in (0, 0.5]')
     mtm = _tsm_number(max_type_m, 'max_type_m')
     if mtm is None or mtm < 1.0:
         problems.append(
-            f'max_type_m={max_type_m!r} must be a finite number >= 1')
+            f'max_type_m={_tsm_repr(max_type_m)} must be a finite number >= 1')
     nm = _tsm_int(n_max, 'n_max', minimum=2, maximum=100000)
     if nm is None:
-        problems.append(f'n_max={n_max!r} must be an integer in [2, 100000]')
+        problems.append(f'n_max={_tsm_repr(n_max)} must be an integer in [2, 100000]')
 
     out.update({
         'n': nn, 'sigma': sd, 'effect': eff,
@@ -431,13 +458,13 @@ def type_sm_design_curve(n, sigma, effect, *, factors=(1.0, 0.75, 0.5, 0.25),
            'policy': TYPE_SM_POLICY}
     nn = _tsm_int(n, 'n', minimum=2, maximum=1000000)
     if nn is None:
-        out['problems'].append(f'n={n!r} must be an integer >= 2')
+        out['problems'].append(f'n={_tsm_repr(n)} must be an integer >= 2')
     sd = _tsm_number(sigma, 'sigma')
     if sd is None or sd <= 0.0:
-        out['problems'].append(f'sigma={sigma!r} must be a finite number > 0')
+        out['problems'].append(f'sigma={_tsm_repr(sigma)} must be a finite number > 0')
     eff = _tsm_number(effect, 'effect')
     if eff is None or eff == 0.0:
-        out['problems'].append(f'effect={effect!r} must be finite and non-zero')
+        out['problems'].append(f'effect={_tsm_repr(effect)} must be finite and non-zero')
     if factors is None:
         factors = (1.0, 0.75, 0.5, 0.25)
     if isinstance(factors, (str, bytes)):
@@ -453,7 +480,7 @@ def type_sm_design_curve(n, sigma, effect, *, factors=(1.0, 0.75, 0.5, 0.25),
         f = _tsm_number(value, f'factors[{i}]')
         if f is None or f <= 0.0:
             out['problems'].append(
-                f'factors[{i}]={value!r} must be a finite number > 0')
+                f'factors[{i}]={_tsm_repr(value)} must be a finite number > 0')
         else:
             clean.append(f)
     if not clean:
@@ -535,7 +562,7 @@ def type_sm_design_from_deltas(n, deltas=None, *, pilot_sd=None, sesoi=None,
            'warnings': [], 'policy': TYPE_SM_POLICY}
     nn = _tsm_int(n, 'n', minimum=2, maximum=1000000)
     if nn is None:
-        out['problems'].append(f'n={n!r} must be an integer >= 2')
+        out['problems'].append(f'n={_tsm_repr(n)} must be an integer >= 2')
     raw = []
     dropped = []
     if deltas is not None:
@@ -562,7 +589,7 @@ def type_sm_design_from_deltas(n, deltas=None, *, pilot_sd=None, sesoi=None,
         explicit_sd = _tsm_number(pilot_sd, 'pilot_sd')
         if explicit_sd is None or explicit_sd <= 0.0:
             out['problems'].append(
-                f'pilot_sd={pilot_sd!r} must be a finite number > 0')
+                f'pilot_sd={_tsm_repr(pilot_sd)} must be a finite number > 0')
     if not raw and explicit_sd is None:
         out['problems'].append(
             'at least two finite deltas or an explicit pilot_sd are required')
@@ -594,7 +621,7 @@ def type_sm_design_from_deltas(n, deltas=None, *, pilot_sd=None, sesoi=None,
         margin = _tsm_number(sesoi, 'sesoi')
         if margin is None or margin <= 0.0:
             out['problems'].append(
-                f'sesoi={sesoi!r} must be a finite number > 0')
+                f'sesoi={_tsm_repr(sesoi)} must be a finite number > 0')
     out['pilot'] = {
         'n': len(raw) + len(dropped),
         'n_finite': len(raw),
@@ -737,6 +764,12 @@ def type_sm_from_manifest(manifest, pilot=None, *, max_type_s=None,
         out['status'] = 'fail'
         out['problems'].append('manifest must be a JSON object')
         return out
+    _raw_manifest_sha = manifest.get('manifest_sha256')
+    if _raw_manifest_sha is not None and not isinstance(_raw_manifest_sha, str):
+        out['problems'].append(
+            'manifest.manifest_sha256 must be a string when present')
+    out['manifest_sha256'] = (
+        _raw_manifest_sha if isinstance(_raw_manifest_sha, str) else None)
     stats = manifest.get('statistics')
     if not isinstance(stats, dict):
         stats = {}
@@ -755,7 +788,8 @@ def type_sm_from_manifest(manifest, pilot=None, *, max_type_s=None,
     a = _tsm_number(stats.get('alpha', 0.05), 'alpha')
     if a is None or not (0.0 < a < 1.0):
         out['problems'].append(
-            f'statistics.alpha={stats.get("alpha")!r} must be in (0,1)')
+            'statistics.alpha='
+            f'{_tsm_repr(stats.get("alpha"))} must be in (0,1)')
     out['alpha'] = a
     block = stats.get('type_sm')
     if block is None:
@@ -775,8 +809,11 @@ def type_sm_from_manifest(manifest, pilot=None, *, max_type_s=None,
         'max_type_s', 0.05)
     tm = max_type_m if max_type_m is not None else block.get(
         'max_type_m', 2.0)
-    out['thresholds'] = {'target_power': tp, 'max_type_s': ts,
-                         'max_type_m': tm}
+    out['thresholds'] = {
+        'target_power': _tsm_number(tp, 'target_power'),
+        'max_type_s': _tsm_number(ts, 'max_type_s'),
+        'max_type_m': _tsm_number(tm, 'max_type_m'),
+    }
     # Validate the thresholds once; a malformed declaration is a design
     # failure, not an invitation to use a default.
     _probe = type_sm_design(
@@ -790,23 +827,30 @@ def type_sm_from_manifest(manifest, pilot=None, *, max_type_s=None,
     if pilot is not None:
         if not isinstance(pilot, dict):
             out['problems'].append('pilot must be a JSON object')
+            pilot_status = 'invalid'
+            pilot = None
         else:
             pilot_status = 'available'
-            if pilot.get('alpha') is not None and a is not None:
-                pv_a = _tsm_number(pilot.get('alpha'), 'pilot.alpha')
+            _p_alpha_raw = pilot.get('alpha')
+            if _p_alpha_raw is not None and a is not None:
+                pv_a = _tsm_number(_p_alpha_raw, 'pilot.alpha')
                 if pv_a is None or not _tsm_close(pv_a, a, rel=1e-12):
                     out['problems'].append(
-                        f'pilot alpha {pilot.get("alpha")!r} does not match '
-                        f'manifest alpha {a!r}')
-            if pilot.get('m_family') is not None and m:
-                pv_m = _tsm_int(pilot.get('m_family'), 'pilot.m_family',
-                                minimum=1)
+                        f'pilot alpha {_tsm_repr(_p_alpha_raw)} does not match '
+                        f'manifest alpha {_tsm_repr(a)}')
+            _p_m_raw = pilot.get('m_family')
+            if _p_m_raw is not None and m:
+                pv_m = _tsm_int(_p_m_raw, 'pilot.m_family', minimum=1,
+                                maximum=_TSM_MAX_FAMILY_SIZE)
                 if pv_m != m:
                     out['problems'].append(
-                        f'pilot family size {pilot.get("m_family")!r} does not '
+                        f'pilot family size {_tsm_repr(_p_m_raw)} does not '
                         f'match manifest family size {m}')
-            _m_sha = manifest.get('manifest_sha256')
+            _m_sha = out['manifest_sha256']
             _p_sha = pilot.get('manifest_sha256')
+            if _p_sha is not None and not isinstance(_p_sha, str):
+                out['problems'].append(
+                    'pilot.manifest_sha256 must be a string when present')
             if (isinstance(_m_sha, str) and _m_sha
                     and isinstance(_p_sha, str) and _p_sha
                     and _m_sha != _p_sha):
@@ -817,21 +861,42 @@ def type_sm_from_manifest(manifest, pilot=None, *, max_type_s=None,
                 out['problems'].append(
                     'pilot.comparisons must be an object keyed by comparison '
                     'name')
+                pilot_status = 'invalid'
                 pilot = None
     out['pilot_status'] = pilot_status
-    out['manifest_sha256'] = manifest.get('manifest_sha256')
-    if isinstance(pilot, dict) and pilot.get('status') not in (None, 'pass'):
-        out['warnings'].append(
-            'the validation power pilot reports status='
-            f'{pilot.get("status")!r}; Type S/M is computed, but the pilot '
-            'itself failed its power/coverage gate and this is not a clean '
-            'pre-launch state')
-    out['pilot'] = (None if pilot is None else {
-        'status': pilot.get('status'),
-        'alpha': pilot.get('alpha'),
-        'm_family': pilot.get('m_family'),
-        'manifest_sha256': pilot.get('manifest_sha256'),
-    })
+    if isinstance(pilot, dict):
+        _p_status = pilot.get('status')
+        if _p_status is not None and not isinstance(_p_status, str):
+            out['problems'].append(
+                'pilot.status must be a string when present')
+            _p_status = None
+        if _p_status not in (None, 'pass'):
+            out['warnings'].append(
+                'the validation power pilot reports status='
+                f'{_tsm_repr(_p_status)}; Type S/M is computed, but the pilot '
+                'itself failed its power/coverage gate and this is not a clean '
+                'pre-launch state')
+        _p_alpha = (None if pilot.get('alpha') is None
+                    else _tsm_number(pilot.get('alpha'), 'pilot.alpha'))
+        if pilot.get('alpha') is not None and _p_alpha is None:
+            out['problems'].append(
+                'pilot.alpha must be a finite number when present')
+        _p_m = (None if pilot.get('m_family') is None
+                else _tsm_int(pilot.get('m_family'), 'pilot.m_family',
+                              minimum=1, maximum=_TSM_MAX_FAMILY_SIZE))
+        if pilot.get('m_family') is not None and _p_m is None:
+            out['problems'].append(
+                'pilot.m_family must be an integer >= 1 when present')
+        _p_sha_out = (pilot.get('manifest_sha256')
+                      if isinstance(pilot.get('manifest_sha256'), str) else None)
+        out['pilot'] = {
+            'status': _p_status,
+            'alpha': _p_alpha,
+            'm_family': _p_m,
+            'manifest_sha256': _p_sha_out,
+        }
+    else:
+        out['pilot'] = None
     pilot_comps = (pilot.get('comparisons')
                    if isinstance(pilot, dict) else None)
     for comp in comps:
@@ -998,15 +1063,16 @@ def build_type_sm_design(n, sigma, effect, *, alpha=0.05, family_size=1,
         if value is None:
             continue
         if isinstance(value, bool) or _tsm_number(value, label) is None:
-            raise ValueError(f'{label}={value!r} must be a finite number')
+            raise ValueError(f'{label}={_tsm_repr(value)} must be a finite number')
     if isinstance(n, bool) or _tsm_int(n, 'n', minimum=2) is None:
-        raise ValueError(f'n={n!r} must be an integer >= 2')
+        raise ValueError(f'n={_tsm_repr(n)} must be an integer >= 2')
     if family_size is not None and (
             isinstance(family_size, bool)
             or _tsm_int(family_size, 'family_size', minimum=1) is None):
-        raise ValueError(f'family_size={family_size!r} must be an integer >= 1')
+        raise ValueError('family_size must be an integer between 1 and '
+                             f'{_TSM_MAX_FAMILY_SIZE}; got {_tsm_repr(family_size)}')
     if isinstance(n_max, bool) or _tsm_int(n_max, 'n_max', minimum=2) is None:
-        raise ValueError(f'n_max={n_max!r} must be an integer >= 2')
+        raise ValueError(f'n_max={_tsm_repr(n_max)} must be an integer >= 2')
     result = type_sm_design(
         n, sigma, effect, alpha=alpha, family_size=family_size,
         critical_value=critical_value, n_max=n_max,
@@ -1058,12 +1124,12 @@ def validate_type_sm_design(artifact):
     if artifact.get('kind') != 'type_sm_design_artifact':
         out['problems'].append(
             f'artifact.kind must be "type_sm_design_artifact", got '
-            f'{artifact.get("kind")!r}')
+            f'{_tsm_repr(artifact.get("kind"))}')
     schema = artifact.get('schema')
     if (isinstance(schema, bool) or not isinstance(schema, int)
             or schema != 1):
         out['problems'].append(
-            f'artifact.schema must be 1, got {schema!r}')
+            f'artifact.schema must be 1, got {_tsm_repr(schema)}')
     stolen = sorted(set(_tsm_frozen_payload(artifact)))
     if stolen:
         out['problems'].append(
@@ -1083,7 +1149,10 @@ def validate_type_sm_design(artifact):
             'artifact.inputs carries field(s) outside the replay schema: '
             + ', '.join(repr(key) for key in extra_inputs))
     recorded = artifact.get('content_sha256')
-    out['content_sha256'] = recorded
+    # The verdict must stay strict JSON even when the artifact carries a
+    # hand-edited NaN/Inf/bytes in place of the digest.  Echo only a textual
+    # digest; the malformed value is still reported as a problem below.
+    out['content_sha256'] = recorded if isinstance(recorded, str) else None
     body = {k: v for k, v in artifact.items()
             if k not in ('created_at', 'content_sha256')}
     try:
@@ -1136,16 +1205,16 @@ def validate_type_sm_design(artifact):
             continue
         if not _tsm_close(stored.get(key), replay.get(key)):
             out['problems'].append(
-                f'result.{key}: stored={stored.get(key)!r}, '
-                f'replay={replay.get(key)!r}')
+                f'result.{key}: stored={_tsm_repr(stored.get(key))}, '
+                f'replay={_tsm_repr(replay.get(key))}')
     for key in _TSM_EXACT_FIELDS:
         if key not in stored:
             out['problems'].append(f'result.{key} is missing')
             continue
         if not _tsm_exact_equal(stored.get(key), replay.get(key)):
             out['problems'].append(
-                f'result.{key}: stored={stored.get(key)!r}, '
-                f'replay={replay.get(key)!r}')
+                f'result.{key}: stored={_tsm_repr(stored.get(key))}, '
+                f'replay={_tsm_repr(replay.get(key))}')
     # Fields not in the numeric/exact lists are still part of the replay
     # schema (policy prose, interpretation, warnings/problems).  Compare them
     # exactly so a hand-edited explanation cannot travel with valid numbers.
@@ -1153,8 +1222,8 @@ def validate_type_sm_design(artifact):
     for key in sorted(set(replay) - handled):
         if key in stored and not _tsm_exact_equal(stored[key], replay[key]):
             out['problems'].append(
-                f'result.{key}: stored={stored.get(key)!r}, '
-                f'replay={replay.get(key)!r}')
+                f'result.{key}: stored={_tsm_repr(stored.get(key))}, '
+                f'replay={_tsm_repr(replay.get(key))}')
     if not out['problems']:
         out['status'] = 'ok'
     return out
