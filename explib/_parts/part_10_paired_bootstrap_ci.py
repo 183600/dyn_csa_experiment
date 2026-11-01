@@ -139,6 +139,11 @@ def wilcoxon_signed_rank_p(deltas):
     return {'p': float(p), 'method': 'normal', 'n_nonzero': n, 'w_plus': w_plus, 'w_min': w,
             'note': f'normal approximation; exact DP is used for n<={_WILCOXON_EXACT_MAX_N}'}
 
+DISTRIBUTION_FREE_PREDICTION_ARTIFACT_KIND = (
+    'distribution_free_prediction_artifact')
+DISTRIBUTION_FREE_PREDICTION_ARTIFACT_SCHEMA = 1
+
+
 DISTRIBUTION_FREE_PREDICTION_POLICY = {
     'version': 'distribution-free-prediction-1',
     'method': 'two-sided conformal order-statistic interval',
@@ -313,9 +318,18 @@ def distribution_free_prediction_interval(deltas, *, conf=0.95, direction=None):
         out['reason'] = 'the order-statistic endpoints are not finite'
         return out
     if hi_v == lo_v:
-        out['reason'] = ('all calibration effects are equal; the '
-                         'order-statistic interval collapses to zero width '
-                         'and cannot represent a future unit\'s spread')
+        # The trimmed endpoints can coincide even when the sample is not
+        # constant (e.g. a repeated value at both selected ranks).  Name the
+        # actual condition instead of claiming every calibration effect is
+        # identical; keep the historical wording for a truly constant panel.
+        if float(d[0]) == float(d[-1]):
+            out['reason'] = ('all calibration effects are equal; the '
+                             'order-statistic interval collapses to zero width '
+                             'and cannot represent a future unit\'s spread')
+        else:
+            out['reason'] = ('the selected order-statistic endpoints are equal; '
+                             'the interval has zero width and cannot represent '
+                             'a future unit\'s spread')
         return out
     attained = 1.0 - 2.0 * j / (n + 1.0)
     _ratio = (1.0 + conf) / (1.0 - conf)
@@ -389,8 +403,8 @@ def build_distribution_free_prediction(deltas, *, conf=0.95, direction=None):
             'distribution_free_prediction_interval for a filtered descriptive '
             'readout instead)')
     return {
-        'kind': 'distribution_free_prediction_artifact',
-        'schema': 1,
+        'kind': DISTRIBUTION_FREE_PREDICTION_ARTIFACT_KIND,
+        'schema': DISTRIBUTION_FREE_PREDICTION_ARTIFACT_SCHEMA,
         'inputs': {
             'deltas': finite,
             'conf': result['conf'],

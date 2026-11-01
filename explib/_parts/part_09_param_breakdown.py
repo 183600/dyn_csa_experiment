@@ -969,6 +969,16 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
     _dfa = _finite_scalar(stats.get('distribution_free_attained_conf'))
     if _dfa is not None and 0.0 <= _dfa <= 1.0:
         out['distribution_free_attained_conf'] = float(_dfa)
+    # The interval's attainability is part of the same claim: without these
+    # two fields a report could quote a 12-seed [min,max] band as a 95%
+    # prediction interval.  Echo them together with the endpoints, and drop a
+    # malformed/absent value rather than inventing a planning number.
+    _dfc = stats.get('distribution_free_conf_achievable')
+    if isinstance(_dfc, (bool, np.bool_)):
+        out['distribution_free_conf_achievable'] = bool(_dfc)
+    _dfn = _as_seed_int(stats.get('distribution_free_n_needed'))
+    if _dfn is not None and _dfn >= 1:
+        out['distribution_free_n_needed'] = _dfn
     out['allowed'] = not out['reasons']
     if out['allowed']:
         out['level'] = 'confirmatory' if str(evidence_level).lower() == 'confirmatory' else 'exploratory_significant'

@@ -30,7 +30,25 @@ def _df_gate_resolve(path):
     return None
 
 
+def _df_gate_finite_number(value):
+    """Whether ``value`` is a finite JSON number representable as float64.
+
+    ``json`` can carry integers with more digits than a float64 can hold.
+    Converting one raises ``OverflowError``; that is a malformed calibration
+    value for this replay (the interval helper would drop it), not a reason to
+    abort the audit.  Booleans are flags and are never measurements.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
 def _df_gate_close(a, b, rel=1e-9, abs_=1e-12):
+    if isinstance(a, bool) or isinstance(b, bool):
+        return a is b
     try:
         fa, fb = float(a), float(b)
     except (TypeError, ValueError, OverflowError):
@@ -75,7 +93,10 @@ def _df_gate_result_diff(stored, replay):
             problems.append(f'{key}: stored={a!r}, replay={b!r}')
             continue
         for i, (x, y) in enumerate(zip(a, b)):
-            if isinstance(x, (int, float)) and isinstance(y, (int, float)):
+            if isinstance(x, bool) or isinstance(y, bool):
+                if x is not y:
+                    problems.append(f'{key}[{i}]: stored={x!r}, replay={y!r}')
+            elif isinstance(x, (int, float)) and isinstance(y, (int, float)):
                 if not _df_gate_close(x, y):
                     problems.append(f'{key}[{i}]: stored={x!r}, replay={y!r}')
             elif x != y:
@@ -83,9 +104,18 @@ def _df_gate_result_diff(stored, replay):
     if stored.get('policy') != replay.get('policy'):
         problems.append('policy block differs from the replay')
     for key in ('confirmed', 'p_holm', 'verified', 'verdict', 'decision',
-                'p_exact_signflip', 'p_value'):
+                'p_exact_signflip', 'p_value', 'p', 'alpha', 'holm',
+                'significant'):
         if key in stored:
             problems.append(f'result must not carry frozen-decision field {key!r}')
+    # This artifact's result schema is exactly the replay result.  Ignoring an
+    # extra key would let a hand-edited file smuggle an unchecked claim (for
+    # example ``significant: true``) next to a valid interval.
+    extra = sorted(set(stored) - set(replay))
+    if extra:
+        problems.append(
+            'result carries field(s) outside the replay schema: '
+            + ', '.join(repr(key) for key in extra))
     return problems
 
 
@@ -133,6 +163,27 @@ def audit_distribution_free_prediction(path=None):
         out['status'] = 'fail'
         out['problems'].append(f'{p}: not readable JSON object')
         return out
+    # The artifact type/schema is part of the evidence contract.  Without this
+    # check any JSON object that happens to carry ``inputs``/``result`` would
+    # replay as this artifact, so a renamed or version-mismatched file could
+    # be accepted as a conformal-prediction record.
+    expected_kind = getattr(
+        L, 'DISTRIBUTION_FREE_PREDICTION_ARTIFACT_KIND',
+        'distribution_free_prediction_artifact')
+    expected_schema = getattr(
+        L, 'DISTRIBUTION_FREE_PREDICTION_ARTIFACT_SCHEMA', 1)
+    if data.get('kind') != expected_kind:
+        out['status'] = 'fail'
+        out['problems'].append(
+            f'{p}: kind is {data.get("kind")!r}, not {expected_kind!r}')
+        return out
+    schema = data.get('schema')
+    if (isinstance(schema, bool) or not isinstance(schema, int)
+            or schema != expected_schema):
+        out['status'] = 'fail'
+        out['problems'].append(
+            f'{p}: schema is {schema!r}, not {expected_schema!r}')
+        return out
     inputs = data.get('inputs')
     stored = data.get('result')
     if not isinstance(inputs, dict):
@@ -148,10 +199,11 @@ def audit_distribution_free_prediction(path=None):
         out['status'] = 'fail'
         out['problems'].append('inputs.deltas is not a list')
         return out
-    if not all(isinstance(x, (int, float)) and not isinstance(x, bool)
-               and math.isfinite(float(x)) for x in deltas):
+    if not all(_df_gate_finite_number(x) for x in deltas):
         out['status'] = 'fail'
-        out['problems'].append('inputs.deltas must contain finite JSON numbers only')
+        out['problems'].append(
+            'inputs.deltas must contain finite JSON numbers representable as '
+            'float64 only')
         return out
     try:
         replay = L.distribution_free_prediction_interval(
