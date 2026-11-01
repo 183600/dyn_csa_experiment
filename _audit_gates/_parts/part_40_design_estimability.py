@@ -23,12 +23,8 @@ _RUN_ORDER_DEFAULTS = (
 )
 
 
-def _de_gate_load(path):
-    try:
-        with open(path, encoding='utf-8') as fh:
-            return json.load(fh)
-    except Exception:
-        return None
+# Shared replay loader (part_00): unreadable evidence is "no evidence".
+_de_gate_load = _gate_load
 
 
 def _de_gate_embedded(obj):

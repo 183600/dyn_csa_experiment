@@ -102,6 +102,27 @@ except Exception as _ck_err:
     _CK_ERR = _ck_err
 
 
+def _canonical_json(obj):
+    """Canonical JSON text used by every content-identity digest.
+
+    Stable key order and compact separators make a digest independent of writer
+    formatting; non-finite numbers are rejected instead of becoming the
+    non-standard ``NaN``/``Infinity`` tokens.
+    """
+    return json.dumps(obj, sort_keys=True, separators=(',', ':'),
+                      ensure_ascii=True, allow_nan=False)
+
+
+def _sha256_json(obj):
+    """SHA-256 of :func:`_canonical_json`, used to bind artifact contents."""
+    return hashlib.sha256(_canonical_json(obj).encode('utf-8')).hexdigest()
+
+
+def _repo_rel(path, root):
+    """Repository-relative path with forward slashes, for portable identities."""
+    return os.path.relpath(path, root).replace(os.sep, '/')
+
+
 def _kernel_stamp():
     """内核变体标识（进入 run_cfg 指纹与 `_code` 戳）。eager 模式返回空串，
     既有记录的指纹逐字节不变；内核模式下记录只与同模式记录配对（§3.1）。"""

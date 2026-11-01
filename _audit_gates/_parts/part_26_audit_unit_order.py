@@ -1,12 +1,5 @@
-def _uo_int(value):
-    """Exact integer from one stored count/label, or ``None``."""
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return int(value)
-    if isinstance(value, float) and value.is_integer():
-        return int(value)
-    return None
+# Shared exact-integer reader (part_00): booleans and fractions are not counts.
+_uo_int = _stored_int
 
 
 def _uo_problems_from_attestation(att, ids, *, unit_kind=None):

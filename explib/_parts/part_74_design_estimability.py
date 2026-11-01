@@ -162,13 +162,9 @@ def _de_fraction(value, *, field='value'):
     raise ValueError(f'{field} must be a finite number, got {value!r}')
 
 
-def _de_canonical(obj):
-    return json.dumps(obj, sort_keys=True, separators=(',', ':'),
-                      ensure_ascii=True, allow_nan=False)
-
-
-def _de_sha_obj(obj):
-    return hashlib.sha256(_de_canonical(obj).encode('utf-8')).hexdigest()
+# Content identities share the one canonicalisation contract in part_00.
+_de_canonical = _canonical_json
+_de_sha_obj = _sha256_json
 
 
 def _de_manifest_canonical_sha(manifest):

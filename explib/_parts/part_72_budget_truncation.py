@@ -214,13 +214,9 @@ def _bt_declared_list(values, label, problems):
     return out
 
 
-def _bt_canonical(obj):
-    return json.dumps(obj, sort_keys=True, separators=(',', ':'),
-                      ensure_ascii=True, allow_nan=False)
-
-
-def _bt_sha_obj(obj):
-    return hashlib.sha256(_bt_canonical(obj).encode('utf-8')).hexdigest()
+# Content identities share the one canonicalisation contract in part_00.
+_bt_canonical = _canonical_json
+_bt_sha_obj = _sha256_json
 
 
 def _bt_sha256_text(value):

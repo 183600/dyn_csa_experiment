@@ -85,13 +85,9 @@ def _ar_int(value, *, minimum=None):
     return out
 
 
-def _ar_canonical(obj):
-    return json.dumps(obj, sort_keys=True, separators=(',', ':'),
-                      ensure_ascii=True, allow_nan=False)
-
-
-def _ar_sha_obj(obj):
-    return hashlib.sha256(_ar_canonical(obj).encode('utf-8')).hexdigest()
+# Content identities share the one canonicalisation contract in part_00.
+_ar_canonical = _canonical_json
+_ar_sha_obj = _sha256_json
 
 
 def _ar_sha256_text(value):

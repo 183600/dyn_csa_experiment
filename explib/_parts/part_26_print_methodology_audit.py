@@ -1300,8 +1300,8 @@ _SOURCE_TREE_SKIP_SUFFIXES = ('.egg-info',)
 _SOURCE_TREE_SKIP_PREFIXES = ('results_', 'analysis_')
 
 
-def _source_tree_rel(path, root):
-    return os.path.relpath(path, root).replace(os.sep, '/')
+# Portable relative paths share the repository helper in part_00.
+_source_tree_rel = _repo_rel
 
 
 def _source_file_sha256(path, st=None):

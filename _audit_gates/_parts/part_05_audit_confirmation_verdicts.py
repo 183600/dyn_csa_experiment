@@ -1,5 +1,8 @@
 
 
+from _split_loader import path_is_within
+
+
 def audit_confirmation_verdicts(path=None):
     """Result-analysis audit: the three-way directional verdict is coherent.
 
@@ -1796,11 +1799,7 @@ def audit_evidence_inputs(root=None, *, max_file_bytes=_AUDIT_INPUT_MAX_BYTES,
     skipped = {'large': [], 'outside_root': [], 'unreadable': []}
 
     def _inside(path):
-        try:
-            return os.path.commonpath(
-                [root_real, os.path.realpath(path)]) == root_real
-        except (OSError, ValueError):
-            return False
+        return path_is_within(root_real, path)
 
     def _rel(path):
         try:

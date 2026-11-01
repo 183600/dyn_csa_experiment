@@ -146,13 +146,9 @@ def _prep_detail_head(value, limit=5):
     return [value][:limit]
 
 
-def _prep_canonical(obj):
-    return json.dumps(obj, sort_keys=True, separators=(',', ':'),
-                      ensure_ascii=True, allow_nan=False)
-
-
-def _prep_sha_obj(obj):
-    return hashlib.sha256(_prep_canonical(obj).encode('utf-8')).hexdigest()
+# Content identities share the one canonicalisation contract in part_00.
+_prep_canonical = _canonical_json
+_prep_sha_obj = _sha256_json
 
 
 def _prep_sha256_text(value):

@@ -11,12 +11,8 @@ import json
 import os
 
 
-def _vt_gate_load(path):
-    try:
-        with open(path, encoding='utf-8') as fh:
-            return json.load(fh)
-    except Exception:
-        return None
+# Shared replay loader (part_00): unreadable evidence is "no evidence".
+_vt_gate_load = _gate_load
 
 
 def audit_validation_transfer(path=None):

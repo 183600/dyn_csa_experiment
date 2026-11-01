@@ -1,5 +1,21 @@
 
 
+def _doc_number(value, fmt):
+    """Format one finite numeric table cell, or an em dash when it is absent.
+
+    The final-test report renders many small descriptive tables; they all use
+    this predicate so a boolean, a non-finite value or a missing block cannot
+    be mistaken for a measured zero.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return '—'
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return '—'
+    return fmt.format(number) if math.isfinite(number) else '—'
+
+
 def _doc_unit_order(rows, ref_ids, n_docs, ref_tok, granularity, ids_key):
     """Validate the first-occurrence order attestation for one comparison.
 
@@ -1173,19 +1189,10 @@ def _length_strata_markdown(ft):
     if not isinstance(comps, dict):
         return []
 
-    def _num(value, fmt='{:+.3f}'):
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            return '—'
-        try:
-            f = float(value)
-        except (TypeError, ValueError, OverflowError):
-            return '—'
-        return fmt.format(f) if math.isfinite(f) else '—'
-
     def _ci(pair):
         if not isinstance(pair, (list, tuple)) or len(pair) != 2:
             return '—'
-        lo, hi = _num(pair[0]), _num(pair[1])
+        lo, hi = _doc_number(pair[0], '{:+.3f}'), _doc_number(pair[1], '{:+.3f}')
         if lo == '—' or hi == '—':
             return '—'
         return f'[{lo}, {hi}]'
@@ -1237,18 +1244,18 @@ def _length_strata_markdown(ft):
         std = _obj(ls.get('standardized'))
         rows.append('| %s | 全体（token 池化） | %s | 100%% | %s %s | %s (%s) %s | — |'
                     % (name, ls.get('n_units', '—'),
-                       _num(overall.get('delta_ppl')),
+                       _doc_number(overall.get('delta_ppl'), '{:+.3f}'),
                        _ci(overall.get('delta_ppl_ci95')),
-                       _num(overall.get('log_ratio')),
+                       _doc_number(overall.get('log_ratio'), '{:+.3f}'),
                        _ratio(overall.get('ratio')),
                        _ci(overall.get('log_ratio_ci95'))))
         _ls_policy = ls.get('policy') if isinstance(ls.get('policy'), dict) else {}
         ref = std.get('reference') or _ls_policy.get('reference') or '—'
         rows.append('| %s | 标准化（%s） | %s | — | %s %s | %s (%s) %s | 参考口径 |'
                     % (name, ref, ls.get('n_units', '—'),
-                       _num(std.get('delta_ppl')),
+                       _doc_number(std.get('delta_ppl'), '{:+.3f}'),
                        _ci(std.get('delta_ppl_ci95')),
-                       _num(std.get('log_ratio')),
+                       _doc_number(std.get('log_ratio'), '{:+.3f}'),
                        _ratio(std.get('ratio')),
                        _ci(std.get('log_ratio_ci95'))))
         for s in strata:
@@ -1273,15 +1280,17 @@ def _length_strata_markdown(ft):
             rows.append('| %s | L%s（%s–%s tok） | %s | %s | %s %s | %s (%s) %s | %s |'
                         % (name, idx, s.get('lo_tokens', '—'),
                            s.get('hi_tokens', '—'), s.get('n_units', '—'),
-                           share_txt, _num(s.get('delta_ppl')),
+                           share_txt,
+                           _doc_number(s.get('delta_ppl'), '{:+.3f}'),
                            _ci(s.get('delta_ppl_ci95')),
-                           _num(s.get('log_ratio')), _ratio(s.get('ratio')),
+                           _doc_number(s.get('log_ratio'), '{:+.3f}'),
+                           _ratio(s.get('ratio')),
                            _ci(s.get('log_ratio_ci95')),
                            '；'.join(marker) if marker else '—'))
         het = _obj(ls.get('heterogeneity'))
-        q = _num(het.get('q'), '{:.3f}')
-        p = _num(het.get('p_chi2'), '{:.4g}')
-        i2 = _num(het.get('i2'), '{:.3f}')
+        q = _doc_number(het.get('q'), '{:.3f}')
+        p = _doc_number(het.get('p_chi2'), '{:.4g}')
+        i2 = _doc_number(het.get('i2'), '{:.3f}')
         ext = het.get('extreme_contrast') or {}
         extra = []
         if q != '—':
@@ -1290,7 +1299,8 @@ def _length_strata_markdown(ft):
             extra.append(
                 '极端层差 L%s−L%s = %s %s（PPL 比 %s）'
                 % (ext.get('high_stratum'), ext.get('low_stratum'),
-                   _num(ext.get('log_ratio_diff')), _ci(ext.get('ci95')),
+                   _doc_number(ext.get('log_ratio_diff'), '{:+.3f}'),
+                   _ci(ext.get('ci95')),
                    _ratio(ext.get('ratio'))))
             if ext.get('excludes_zero'):
                 fragile.append(name)
@@ -1354,20 +1364,11 @@ def _unit_quantile_markdown(ft):
     if not isinstance(comps, dict):
         return []
 
-    def _num(value, fmt='{:+.4f}'):
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            return '—'
-        try:
-            f = float(value)
-        except (TypeError, ValueError, OverflowError):
-            return '—'
-        return fmt.format(f) if math.isfinite(f) else '—'
-
     def _ci(pair):
         if not isinstance(pair, (list, tuple)) or len(pair) != 2:
             return '—'
-        lo = _num(pair[0]) if pair[0] is not None else '—'
-        hi = _num(pair[1]) if pair[1] is not None else '—'
+        lo = _doc_number(pair[0], '{:+.4f}') if pair[0] is not None else '—'
+        hi = _doc_number(pair[1], '{:+.4f}') if pair[1] is not None else '—'
         return f'[{lo}, {hi}]'
 
     def _pct(value):
@@ -1419,7 +1420,8 @@ def _unit_quantile_markdown(ft):
             row = by_q.get(q)
             if not isinstance(row, dict):
                 return '—'
-            return f'{_num(row.get("log_ratio"))} {_ci(row.get("ci95"))}'
+            return (f'{_doc_number(row.get("log_ratio"), "{:+.4f}")} '
+                    f'{_ci(row.get("ci95"))}')
 
         mean = _obj(uq.get('mean'))
         imp = _obj(uq.get('improvement'))
@@ -1458,13 +1460,13 @@ def _unit_quantile_markdown(ft):
             fragile.append(name)
         rows.append('| %s | %s / %s | %s | %s | %s | %s | %s | %s %s | %s | %s | %s |'
                     % (name, uq.get('n_units', '—'), uq.get('n_seeds', '—'),
-                       _num(mean.get('equal_unit_log_ratio')),
-                       _num(mean.get('token_pooled_log_ratio')),
+                       _doc_number(mean.get('equal_unit_log_ratio'), '{:+.4f}'),
+                       _doc_number(mean.get('token_pooled_log_ratio'), '{:+.4f}'),
                        _qcell(0.1), _qcell(0.5), _qcell(0.9),
                        _pct(imp.get('fraction_better')),
                        _pct_ci(imp.get('fraction_better_ci95')),
-                       _num(tails.get('worst_tail_mean_log')),
-                       _num(asym),
+                       _doc_number(tails.get('worst_tail_mean_log'), '{:+.4f}'),
+                       _doc_number(asym, '{:+.4f}'),
                        '；'.join(flags) if flags else '—'))
     if not rows and not missing and not corrupt and not not_estimable:
         return []
@@ -1514,20 +1516,11 @@ def _order_inference_markdown(ft):
     if not isinstance(comps, dict):
         return []
 
-    def _num(value, fmt='{:.4g}'):
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            return '—'
-        try:
-            f = float(value)
-        except (TypeError, ValueError, OverflowError):
-            return '—'
-        return fmt.format(f) if math.isfinite(f) else '—'
-
     def _ci(pair):
         if not isinstance(pair, (list, tuple)) or len(pair) != 2:
             return '—'
-        lo = _num(pair[0], '{:+.4f}')
-        hi = _num(pair[1], '{:+.4f}')
+        lo = _doc_number(pair[0], '{:+.4f}')
+        hi = _doc_number(pair[1], '{:+.4f}')
         return f'[{lo}, {hi}]'
 
     rows = []
@@ -1595,9 +1588,9 @@ def _order_inference_markdown(ft):
         rows.append('| %s | %s | %s | %s | %s | %s | %s | %s | %s |'
                     % (name, oi.get('n_units', '—'),
                        _ci(oi.get('iid_ci')), de_batch, de_block,
-                       _num(oi.get('n_effective_min'), '{:.1f}'),
+                       _doc_number(oi.get('n_effective_min'), '{:.1f}'),
                        _ci(oi.get('robust_ci')),
-                       _num(oi.get('order_dependence_p'), '{:.4f}'),
+                       _doc_number(oi.get('order_dependence_p'), '{:.4f}'),
                        '；'.join(flag) if flag else '—'))
     if not rows and not missing and not not_estimable and not unverified:
         return []
@@ -1648,19 +1641,11 @@ def _pooled_order_markdown(ft):
     if not isinstance(comps, dict):
         return []
 
-    def _num(value, fmt='{:.4g}'):
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            return '—'
-        try:
-            f = float(value)
-        except (TypeError, ValueError, OverflowError):
-            return '—'
-        return fmt.format(f) if math.isfinite(f) else '—'
-
     def _ci(pair):
         if not isinstance(pair, (list, tuple)) or len(pair) != 2:
             return '—'
-        return f'[{_num(pair[0], "{:+.4f}")}, {_num(pair[1], "{:+.4f}")}]'
+        return (f'[{_doc_number(pair[0], "{:+.4f}")}, '
+                f'{_doc_number(pair[1], "{:+.4f}")}]')
 
     def _range(rows):
         vals = [r.get('design_effect') for r in rows
@@ -1718,9 +1703,9 @@ def _pooled_order_markdown(ft):
                            _ci(ep.get('iid_ci')),
                            _range(ep.get('batch_means') or []),
                            _range(ep.get('block_bootstrap') or []),
-                           _num(ep.get('n_effective_min'), '{:.1f}'),
+                           _doc_number(ep.get('n_effective_min'), '{:.1f}'),
                            _ci(ep.get('robust_ci')),
-                           _num(ep.get('order_dependence_p'), '{:.4f}'),
+                           _doc_number(ep.get('order_dependence_p'), '{:.4f}'),
                            '；'.join(flag) if flag else '—'))
     if not rows and not missing and not not_estimable and not unverified:
         return []
@@ -1777,7 +1762,7 @@ def _variance_components_markdown(ft):
             return f'{100.0 * float(value):.0f}%'
         return '—'
 
-    def _num(value, fmt='{:.4g}'):
+    def _variance_number(value, fmt='{:.4g}'):
         if isinstance(value, (int, float)) and math.isfinite(float(value)):
             return fmt.format(float(value))
         return '—'
@@ -1820,8 +1805,8 @@ def _variance_components_markdown(ft):
                        _pct((c.get('seed') or {}).get('share')),
                        _pct((c.get('unit') or {}).get('share')),
                        _pct((c.get('residual') or {}).get('share')),
-                       _num(eff.get('equivalent'), '{:.1f}'),
-                       _num(eff.get('design_effect'), '{:.1f}'),
+                       _variance_number(eff.get('equivalent'), '{:.1f}'),
+                       _variance_number(eff.get('design_effect'), '{:.1f}'),
                        nxt_txt, ci_txt))
     if not rows and not missing:
         return []

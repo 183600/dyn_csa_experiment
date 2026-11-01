@@ -1,3 +1,5 @@
+from _split_loader import path_is_within
+
 # ---------------------------------------------------------------------------
 # 128. The executed module is more than the files on disk: bind split-package
 #      registration (order + membership) into the source identity
@@ -43,8 +45,8 @@ _SPLIT_REGISTRY_SKIP_SUFFIXES = _SOURCE_TREE_SKIP_SUFFIXES
 _SPLIT_REGISTRY_SKIP_PREFIXES = _SOURCE_TREE_SKIP_PREFIXES
 
 
-def _split_rel(path, root):
-    return os.path.relpath(path, root).replace(os.sep, '/')
+# Portable relative paths share the repository helper in part_00.
+_split_rel = _repo_rel
 
 
 def _split_is_plain_py_name(name):
@@ -261,11 +263,7 @@ def split_registry_manifest(root=None):
     n_parts = 0
 
     def _inside(path):
-        try:
-            return os.path.commonpath(
-                [root_real, os.path.realpath(path)]) == root_real
-        except (OSError, ValueError):
-            return False
+        return path_is_within(root_real, path)
 
     for pkg_dir, parts_dir in _split_package_dirs(root):
         pkg_rel = _split_rel(pkg_dir, root)

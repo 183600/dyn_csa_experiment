@@ -36,6 +36,16 @@ def _is_within(base: str, path: str) -> bool:
         return False
 
 
+def path_is_within(base: str, path: str) -> bool:
+    """Whether ``path`` resolves inside the already-real path ``base``.
+
+    Audit helpers that walk a checkout use this one containment rule so a
+    symlink cannot make two different reports disagree about what is "inside
+    the repository".
+    """
+    return _is_within(base, path)
+
+
 def _safe_fragment_path(package_dir: str, part: Any) -> str:
     """Resolve one ``_PARTS`` entry and keep it inside the package.
 

@@ -22,12 +22,8 @@ _AL_GATE_DEFAULTS = (
 )
 
 
-def _al_gate_load(path):
-    try:
-        with open(path, encoding='utf-8') as fh:
-            return json.load(fh)
-    except Exception:
-        return None
+# Shared replay loader (part_00): unreadable evidence is "no evidence".
+_al_gate_load = _gate_load
 
 
 def _al_gate_resolve(path):

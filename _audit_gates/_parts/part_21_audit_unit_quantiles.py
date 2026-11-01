@@ -1,12 +1,5 @@
-def _uqa_int(value):
-    """Exact integer for one stored count/label, or ``None``."""
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return int(value)
-    if isinstance(value, float) and value.is_integer():
-        return int(value)
-    return None
+# Shared exact-integer reader (part_00): booleans and fractions are not counts.
+_uqa_int = _stored_int
 
 
 def audit_unit_quantiles(path=None):

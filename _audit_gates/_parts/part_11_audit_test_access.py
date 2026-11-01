@@ -28,12 +28,8 @@ def _ta_display(path):
     return rel if not rel.startswith('..') else os.path.abspath(path)
 
 
-def _ta_load(path):
-    try:
-        with open(path, encoding='utf-8') as fh:
-            return json.load(fh)
-    except Exception:
-        return None
+# Shared replay loader (part_00): unreadable evidence is "no evidence".
+_ta_load = _gate_load
 
 
 def _ta_collect_paths(paths):

@@ -442,6 +442,34 @@ def _load(path):
     return obj
 
 
+def _gate_load(path):
+    """Read a gate replay artifact as JSON, or return ``None``.
+
+    A missing, unreadable or malformed artifact is "no evidence" for the
+    caller, which reports ``not_verifiable`` instead of crashing the audit.
+    """
+    try:
+        with open(path, encoding='utf-8') as fh:
+            return json.load(fh)
+    except Exception:
+        return None
+
+
+def _stored_int(value):
+    """Exact integer from one stored JSON count/label, or ``None``.
+
+    Booleans are flags (``int(True) == 1``) and fractional floats are not
+    counts, so both are rejected rather than silently truncated.
+    """
+    if isinstance(value, (bool, np.bool_)):
+        return None
+    if isinstance(value, int):
+        return int(value)
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return None
+
+
 def _load_finaltest_stats(out, path):
     """Return a final-test stats object, or ``None`` after recording why not.
 
