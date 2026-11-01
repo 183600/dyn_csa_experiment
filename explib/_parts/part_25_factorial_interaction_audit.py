@@ -369,6 +369,23 @@ def factorial_interaction_audit(summary=None, design=None, *, alpha=0.05,
         else:
             cell['mechanism_claim_allowed'] = True
         rec['interaction'] = cell
+        # The same four controlled cells are a complete two-component lattice,
+        # so the panel can also report the Shapley shares and the efficiency
+        # check.  This is a within-scope attribution, not a global component
+        # importance: scopes overlap and are never summed across factorials.
+        try:
+            rec['lattice'] = factorial_lattice_attribution(
+                rows, factors=list(factors), arms=list(norm_cells.values()),
+                alpha=alpha, min_n=min_n)
+        except Exception as _lat_exc:  # pragma: no cover - defensive
+            rec['lattice'] = {
+                'kind': 'ablation_lattice',
+                'status': 'not_estimable',
+                'problems': [f'{type(_lat_exc).__name__}: {_lat_exc}'],
+            }
+            out['warnings'].append(
+                f'{name}: the 2x2 Shapley block could not be built '
+                f'({type(_lat_exc).__name__}: {_lat_exc})')
         rec['status'] = 'ok'
         _vals = [float(r['interaction_log_ppl']) for r in rows]
         interaction_values[str(name)] = _vals

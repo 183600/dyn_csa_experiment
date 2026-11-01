@@ -6505,3 +6505,91 @@ p/比值/Holm/status/family 后 replay 均 `fail`；gate 对空块、缺 power �
 no-op/conflict/overwrite；gate 的 ok/embedded-ok/tamper-fail/
 missing-not_verifiable 与未声明预算 not_verifiable；plan snapshot 内嵌
 与 notes；report/CLI/Makefile 接线。完整 CPU 套件在本轮最终树通过。
+
+## 2026-10-31 — 留一法不是可相加的组件重要性：完整子集晶格上的精确 Shapley 与交互归因（本轮对比/消融方法硬化，no new runs）
+
+零 GPU；不新增训练、不读取任何 split、不修改 `confirmation_frozen*.json`
+的字节/臂/种子/端点/α/Holm 规则，也不改 `CODE_SEMANTICS`；`.github/`
+与所有 README 未删除、未修改、未移动。
+
+**Problem.** 现有消融方法有三层，但都回答不了「组件的平均边际贡献」：
+`ABLATION_DESIGN` 的 leave-one-out 只在**所有其他组件都已激活**的上下文
+里测「去掉 i」；`FACTORIAL_DESIGN` 的 2x2 只在**一个**上下文里测一对
+交互；`interaction_coverage` / `factorial_anchor` 只检查单因子与覆盖。
+当组件互相替代时，同一个组件在不同上下文里的边际可以变号：LOO 可能
+接近 0，而它在其他上下文里贡献很大；把 LOO 的 Δ 相加、或按 LOO 排序
+当作组件重要性，没有可加性保证。代码里已有「不要把 LOO 当可加」的
+注释，但没有给出替代读数。5 个已声明 2x2 scope 共享
+`dynamic_blocking` 等组件，并成一个 6 组件联合晶格需要 64 个 cell，
+当前面板没有测；因此「哪个组件贡献最大」在设计上仍不可识别。
+
+**Fix.** 新增 `explib/_parts/part_73_ablation_lattice.py`：
+
+- 在完整子集晶格上按种子计算精确 Shapley：
+  `φ_i = Σ_{S⊆C\{i}} |S|!(k−|S|−1)!/k!·(v(S∪{i})−v(S))`，
+  `v(S)=log PPL`（或 `scale='log_ppl'`）；负值 = 组件有益，与全项目
+  `active−inactive` 约定一致。同时报告 LOO `v(C)−v(C\{i})`、每个上下文
+  的边际、成对交互 `v(S∪{i,j})−v(S∪{i})−v(S∪{j})+v(S)`（负 = 协同，
+  正 = 冗余）、二阶以上余项，以及 efficiency / dummy / symmetry 恒等式。
+- **缺一格就拒绝**：`2^k` 个 cell 必须齐全；缺任何子集返回
+  `not_estimable` 并在 `missing_subsets` 点名，绝不回退到低阶对比、
+  绝不插补。种子取所有 cell 的完整案例交集；某个 cell 缺种子时在交集
+  上计算并置 `coverage_ok=false`，交集少于 `min_n` 时
+  `not_estimable`。`k > max_components`（默认 6，64 格）直接拒绝，
+  不用采样近似冒充精确 Shapley。
+- 每个组件的边际在所有上下文中的 min/max/range、是否变号
+  （`context_dependent` / `seed_sign_change`）逐项报告；Shapley 与 LOO
+  的 Spearman 相关和排序反转也报告。排序反转是上下文依赖的读数，不是
+  实现 bug。
+- 设计侧 `ablation_lattice_design`：把每个已声明 2x2 factorial 当作
+  两组件完整晶格，检查四臂互异且都在 run panel 中；当前 5 个 scope
+  全部可识别。并集 6 组件不是联合晶格（需要 64 格），所以
+  `global_attribution_licensed=false`；`licensed_claims` 仅含 scope 内
+  Shapley、成对交互、上下文 LOO，`unlicensed_claims` 点名「LOO 相加」
+  「跨 scope Shapley」「全局组件重要性」。若给 `components` +
+  `arms_by_subset`，则计算缺失子集、需新增的臂数与 `n_seeds` 下的额外
+  cell 成本。
+- 现有 `factorial_interaction_audit` 在每个已测 2x2 的
+  `rec['lattice']` 中加入同一四条受控 cell 的 Shapley/交互块：交互回答
+  「一个因子在另一个激活时是否仍有用」，Shapley 回答「联合效应由谁
+  承担」，两者都只在该 scope 内有效。
+- 产物 `build_ablation_lattice` 把 `scale/components/min_n/alpha/
+  max_components/cells` 写进 `inputs`，用 `content_sha256` 绑定正文；
+  `validate_ablation_lattice` 从 `inputs.cells` 重放全部派生字段；
+  `write_ablation_lattice` 同内容 no-op、不同内容默认 conflict，显式
+  `overwrite=True` 才替换。
+- 新增 `audit_gates.py ablation_lattice`（别名 `lattice` / `shapley` /
+  `ablation_attribution` / `component_attribution` /
+  `attribution_lattice`）与 `make attribution`；无参数时现场做设计审计，
+  存在 `analysis_v12/ablation_lattice.json` 或根目录同名产物时重放。
+  自洽但 `status=not_estimable` 的产物报 `not_verifiable_locally`，篡改
+  Shapley/LOO/交互/axiom/status 报 `fail`；`run_report` 顶层新增
+  `ablation_lattice` 块。
+
+**Boundary.** 这是声明值函数上的归因，不是因果识别：不消除训练随机性、
+数据、容量或调参混杂，也不改变任何冻结 p/Holm/`verified`/`confirmed`。
+只在 scope 内有效：5 个 2x2 scope 共享组件，不能把各 scope 的 Shapley
+相加，也不能把某个 scope 的份额当成全局份额；跨 scope 联合归因需要补测
+64 格联合晶格，当前明确不获许可。`φ` 与 LOO 是 log PPL 单位；
+`exp(φ)` 可作描述性乘性因子，但 `exp(φ_1)+exp(φ_2) ≠
+exp(φ_1+φ_2)`，份额只在 log 尺度相加。种子只做完整案例交集，不把不同
+种子集合的读数拼成一个 Shapley；交集不足 `min_n` 时明确不可估计，
+不把分辨率不足读成「零贡献」。精确枚举上限 6 个组件；更多组件需要
+分层 scope 或预先声明的采样近似，当前不提供后者。星形 LOO 仍然有效，
+只是它回答的是全上下文移除效应；交互存在时与平均重要性本来就可以有
+不同排序。
+
+**Verification.** 新增 `test_review_part_78.py` 17 项：2 组件可加晶格
+的精确 Shapley/交互/efficiency；冗余组件把联合效应各分一半；协同交互
+为负；3 组件 dummy 与 symmetry 恒等式；边际变号被
+`context_dependent` 与 warning 点名；缺 cell 直接 `not_estimable` 且不
+产生 Shapley；种子交集 `coverage_ok=false`、`min_n` 不足拒绝、完全
+不相交时拒绝；非法 PPL/重复种子/未知组件/alpha/min_n/scale/
+max_components fail-closed；单组件退化；`ppl` 与 `log_ppl` 尺度一致；
+factorial adapter 与直接晶格一致且非法 factors/arms 拒绝；canonical
+design 的 5 个完整 2x2 scope、`dynamic_blocking` 在 5 个 scope 中重叠、
+全局 Shapley 不获许可、星形族不是晶格；缺失臂与 proposed scope 的
+缺失子集/额外臂/cell 成本；产物 JSON round-trip、六类篡改 replay
+fail、writer no-op/conflict/overwrite；gate 的缺失/有效/篡改/
+`not_estimable` 行为；report/CLI/`Makefile`/`_PARTS` 接线；README 与
+`.github` 路径仍存在。完整 CPU 套件在本轮最终树通过。

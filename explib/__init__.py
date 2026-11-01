@@ -83,6 +83,7 @@ _PARTS = [
 'part_70_analysis_rehearsal.py',
 'part_71_validation_transfer.py',
 'part_72_budget_truncation.py',
+'part_73_ablation_lattice.py',
 ]
 
 load_root_package(globals(), __file__, _PARTS,

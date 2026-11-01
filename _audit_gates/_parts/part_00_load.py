@@ -327,6 +327,16 @@
                是否为完整区组、位置平衡、覆盖全部 (arm, seed)，并复核
                experiments.jsonl 的实际评估顺序；有测量但无预计划判 fail，
                arm-major 判 fail（零 GPU）
+  ablation_lattice  消融晶格归因：把每个已声明 2x2 factorial 当作两组件
+               完整子集晶格，检查四臂互异且都在 run panel 中；并集不是
+               联合晶格时明确不许可全局 Shapley。若存在
+               analysis_v12/ablation_lattice.json（或根目录同名产物），从
+               inputs.cells 重放 Shapley/LOO/交互/axiom/status；缺一格或
+               种子交集不足时产物为 not_estimable，gate 报
+               not_verifiable；篡改任一派生字段判 fail。不读 split、不新增
+               检验/p 值/Holm、不改冻结判定（零 GPU；别名 lattice /
+               shapley / ablation_attribution / component_attribution /
+               attribution_lattice）
   budget       规模核算：6ND 估算 + TimeGuard 记录对账（零 GPU）
   source       源码树身份：把当前源码字节与 plan_snapshot / summary 记录的
                source_tree 比对（逐文件 added/removed/changed；无记录时明确

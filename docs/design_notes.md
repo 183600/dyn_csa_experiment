@@ -12742,3 +12742,137 @@ python -m explib.confirmation plan      # snapshot 内嵌 budget_truncation
 对存储产物 ok、内嵌 snapshot ok、篡改 fail、缺失或未声明预算
 `not_verifiable`；`confirmation plan` 的 report/notes 内嵌该块；report /
 CLI / `Makefile` 接线存在。完整 CPU 套件在本轮最终树通过。
+
+## 136. 留一法不是可相加的组件重要性：完整子集晶格上的精确 Shapley 与交互归因（本轮对比/消融方法硬化，no new runs）
+
+### 136.1 问题：三种读数回答三个不同的问题
+
+现有对比/消融方法已经覆盖了三层：
+
+- `ABLATION_DESIGN` 的 leave-one-out（LOO）回答「在**所有其他组件都已
+  激活**的上下文里，去掉组件 i 会怎样」；
+- `FACTORIAL_DESIGN` 的 2x2 回答「在**一个**上下文里，第二个因子的
+  简单效应是否随第一个因子改变」；
+- `INTERACTION_SCOPE` / `interaction_coverage` 检查每条对照是否是单因子、
+  缺失的 factorial 是否保留 p=1 槽位。
+
+但三者都没有定义「组件的平均边际贡献」。LOO 是一个**依赖上下文**的
+读数：组件 A 在 B 缺席时可能很有用，在 B 存在时可能完全被替代。此时
+把每条 LOO 的 Δ 相加、或按 LOO 大小给组件排序，会得到不可加的「重要性」
+（代码里已经用注释警告「不要把 LOO 当可加」）。2x2 factorial 只给出
+**一个**上下文的一对交互；5 个声明的 2x2 scope 共享 `dynamic_blocking`
+等组件，把它们并成一个 6 组件联合晶格需要 64 个 cell，当前面板并没有
+测。于是「哪个组件贡献最大」这个问题在设计上仍是不可识别的。
+
+### 136.2 方法：完整晶格上的精确归因，缺一格就拒绝
+
+新增 `explib/_parts/part_73_ablation_lattice.py`。记组件集合
+`C={1..k}`，子集 `S⊆C` 的臂为 `a(S)`，`v(S)=log PPL(a(S))`（也可传
+已取对数的 `scale='log_ppl'`）。符号约定与全项目一致：
+`Δ = active − inactive`，负值 = PPL 更低 = 组件有益。
+
+对每个种子分别定义：
+
+- **边际效应** `Δ_i(S) = v(S∪{i}) − v(S)`；
+- **Shapley 值** `φ_i = Σ_{S⊆C\{i}} |S|!(k−|S|−1)!/k! · Δ_i(S)`，
+  即对所有加入顺序的平均边际；`Σ_i φ_i = v(C) − v(∅)`（efficiency）；
+- **LOO** `λ_i = v(C) − v(C\{i})`，这是 `S=C\{i}` 这一特定上下文里的
+  边际，不是 φ；
+- **成对交互** `I_ij(S) = v(S∪{i,j}) − v(S∪{i}) − v(S∪{j}) + v(S)`，
+  负值 = 协同（synergy），正值 = 次可加/冗余；函数报告 `S=∅`、
+  `S=C\{i,j}` 以及**每个**中间上下文的值和极差；
+- **二阶以上余项** `higher = total − Σ_i Δ_i(∅) − Σ_{i<j} I_ij(∅)`。
+
+归因只在**完整子集晶格**上有定义。函数强制：
+
+1. `2^k` 个 cell 必须全部存在；缺任何一个都返回 `not_estimable`，在
+   `missing_subsets` 里点名，绝不回退到低阶对比、绝不插补；
+2. 每个 cell 的种子必须取**完整案例交集**；某个 cell 少一个种子时在
+   交集上计算并置 `coverage_ok=false`，若交集少于 `min_n` 则
+   `not_estimable`；
+3. `k > max_components`（默认 6，即 64 个 cell）直接拒绝，不用采样
+   近似冒充精确 Shapley；
+4. 计算 efficiency / dummy / symmetry 三个恒等式；任一不成立就把
+   `status` 置为 `fail`（这是实现或数值错误，不是「意外的科学结果」）。
+
+除逐种子 Shapley/LOO 的均值、CI、exact sign-flip p、`min_n`/分辨率
+标记外，函数还报告：
+
+- 每个组件的边际在**所有上下文**中的最小值、最大值、极差、是否变号
+  （`context_dependent` / `seed_sign_change`）以及逐上下文均值；
+- Shapley 排序与 LOO 排序的 Spearman 相关、排序反转的组件对；排序
+  反转本身就是「上下文依赖」的读数，而不是 bug；
+- 每个 2x2 scope 的 Shapley 份额，使现有 factorial 同时回答「交互是否
+  显著」与「联合效应由谁承担」；两者都只在该 scope 内有效。
+
+**设计侧** `ablation_lattice_design` 不要求现在就补跑 64 个 cell。它对
+当前声明做两件事：
+
+- 把每个 2x2 factorial 当作一个**两组件完整晶格**，检查四个 cell 的臂
+  是否互异、是否都在 run panel 中；当前 5 个 scope 全部可识别；
+- 报告这些 scope 的并集（6 个组件）**不是**一个联合晶格（需要 64 格，
+  当前只测了 5 个 2x2），因此 `global_attribution_licensed=false`；
+  `licensed_claims` 只包含 scope 内 Shapley、成对交互与上下文 LOO，
+  `unlicensed_claims` 明确列出「LOO 相加」「跨 scope Shapley」「全局
+  组件重要性」。若调用方给出 `components` + `arms_by_subset`，函数按
+  `2^k` 计算缺失子集、需要新增的臂数和 `n_seeds` 下的额外 cell 成本。
+
+### 136.3 边界
+
+- **不是因果识别**：Shapley 是声明值函数上的归因，不消除训练随机性、
+  数据、容量或调参混杂；它只回答「在这个完整晶格和这些受控臂上，平均
+  边际是多少」。
+- **不新增训练、不读 split、不改冻结判定**：不产生新的 PPL、不改变
+  `confirmation_frozen*.json` 的臂/种子/端点/α/Holm，也不改
+  `verified`/`confirmed`。
+- **只在 scope 内有效**：5 个 2x2 scope 共享组件，不能把各 scope 的
+  Shapley 相加，也不能把 `dynamic_blocking` 在某个 scope 的份额当成
+  全局份额；跨 scope 的联合归因需要补测联合晶格（当前 64 格）。
+- **尺度**：`φ` 与 `λ` 是 log PPL 单位，可直接读「相对 PPL 的乘性
+  因子」`exp(φ)`；但 `exp(φ_1)+exp(φ_2) ≠ exp(φ_1+φ_2)`，所以份额
+  只在 log 尺度上相加，报告同时给出 ratio 仅作描述。
+- **完整案例**：某个 cell 缺种子时只使用所有 cell 共有的种子，绝不把
+  不同种子集合的读数拼成一个 Shapley；交集不足 `min_n` 时明确
+  `not_estimable`，不把分辨率不足读成「零贡献」。
+- **k 上限**：精确枚举限制在 6 个组件（64 格）；更多组件需要分层 scope
+  或预先声明的采样近似，当前实现不提供后者。
+- **星形设计仍然有用**：LOO 回答的是「全上下文下移除 i」，不是
+  「i 的平均重要性」；两者在交互存在时本来就可以给出不同排序。
+
+### 136.4 接线
+
+- `explib/__init__.py` 的 `_PARTS` 末尾追加 `part_73_ablation_lattice.py`；
+  `factorial_interaction_audit` 在每个已测 2x2 的 `rec['lattice']` 中
+  写入同一四条受控 cell 的 Shapley/交互块（scope 内归因，不跨 scope）。
+- `audit_gates.py ablation_lattice`（别名 `lattice` / `shapley` /
+  `ablation_attribution` / `component_attribution` /
+  `attribution_lattice`）：无参数时现场审计声明设计；若存在
+  `analysis_v12/ablation_lattice.json` 或根目录同名产物，则从
+  `inputs.cells` 重放全部派生字段。结构自洽但 `status=not_estimable`
+  的产物报 `not_verifiable_locally`，篡改任何 Shapley/LOO/交互/axiom/
+  status 报 `fail`；缺失产物仍跑设计审计并标 `measured=false`。
+- `make attribution` 是零 GPU 入口；`run_report` 顶层新增
+  `ablation_lattice` 块。
+- `build_ablation_lattice` / `validate_ablation_lattice` /
+  `write_ablation_lattice` 提供内容寻址产物：`inputs.cells` 以
+  `{subset, per_seed}` 记录保存，`content_sha256` 只覆盖正文（排除
+  `created_at`）；writer 同内容 no-op、不同内容默认 conflict，只有显式
+  `overwrite=True` 才替换。
+- `.github/` 与所有 README 本轮未删除、未修改、未移动。
+
+### 136.5 验证
+
+新增 `test_review_part_78.py` 17 项：2 组件可加晶格的精确 Shapley/
+交互/efficiency；冗余组件把联合效应各分一半；协同交互为负；3 组件
+dummy 与 symmetry 恒等式；边际变号被 `context_dependent` 与 warning
+点名；缺 cell 直接 `not_estimable` 且不产生 Shapley；种子交集
+`coverage_ok=false`、`min_n` 不足拒绝、完全不相交时拒绝；非法 PPL/
+重复种子/未知组件/alpha/min_n/scale/max_components fail-closed；单组件
+退化；`ppl` 与 `log_ppl` 尺度一致；factorial adapter 与直接晶格一致且
+非法 factors/arms 拒绝；canonical design 的 5 个完整 2x2 scope、
+`dynamic_blocking` 在 5 个 scope 中重叠、全局 Shapley 不获许可、星形
+族不是晶格；缺失臂与 proposed scope 的缺失子集/额外臂/cell 成本；产物
+JSON round-trip、六类篡改 replay fail、writer no-op/conflict/overwrite；
+gate 的缺失/有效/篡改/`not_estimable` 行为；report/CLI/`Makefile`/
+`_PARTS` 接线；README 与 `.github` 路径仍存在。完整 CPU 套件在本轮
+最终树通过。
