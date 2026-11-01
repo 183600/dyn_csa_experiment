@@ -1201,6 +1201,39 @@ def audit_design_preflight(manifest_path=None, dynamic_path=None):
         out['warnings'].append(
             f'preparation clearance: the launch gate could not run '
             f'({type(_pce).__name__}: {_pce})')
+    # Estimability is the design question that precedes power: a declared
+    # contrast can be perfectly powered and still not identified by the
+    # planned cells.  Surface the same gate here so `design` does not report
+    # a green budget/power plan while an arm contrast is confounded with the
+    # block factor.
+    try:
+        _de = audit_design_estimability(manifest_path=mp, verbose=False)
+        out['design_estimability'] = {
+            'status': _de.get('status'),
+            'summary': _de.get('summary'),
+            'artifact_path': _de.get('artifact_path'),
+            'live': bool(_de.get('live')),
+            'problems': list(_de.get('problems') or [])[:12],
+            'warnings': list(_de.get('warnings') or [])[:12],
+        }
+        if _de.get('status') == 'fail':
+            out['violations'].extend(
+                f'design estimability: {p}'
+                for p in (_de.get('problems') or [])[:12])
+        elif _de.get('status') in ('warnings', 'not_verifiable'):
+            out['warnings'].append(
+                'design estimability: %s%s' % (
+                    _de.get('status'),
+                    ('; ' + '; '.join((_de.get('problems') or [])[:3]))
+                    if _de.get('problems') else ''))
+    except Exception as _dee:
+        out['design_estimability'] = {
+            'status': 'not_verifiable',
+            'problems': [f'{type(_dee).__name__}: {_dee}'],
+        }
+        out['warnings'].append(
+            f'design estimability: the design-matrix gate could not run '
+            f'({type(_dee).__name__}: {_dee})')
     # A recorded violation is a hard design defect, including the case where
     # the frozen manifest is missing/unreadable.  Previously that branch only
     # appended to `violations` while `status` stayed 'ok', so the CLI exited 0

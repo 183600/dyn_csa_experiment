@@ -318,6 +318,41 @@ def plan_check(manifest_path=FREEZE_MANIFEST):
             'budget truncation could not run '
             f'({type(_bte).__name__}: {_bte}); the budget/retry-reserve '
             'feasibility is unverified')
+    # ---- contrast estimability -------------------------------------------
+    # Admission, power, rehearsal and budget all assume the declared
+    # comparison is estimable from the planned cells.  Check the exact
+    # block-arm incidence graph and design rank before any GPU run.
+    _de = {}
+    try:
+        _de = L.design_estimability_from_manifest(m)
+        _de_status = _de.get('status')
+        _de_summary = _de.get('summary') or {}
+        if _de_status == 'fail':
+            errs.extend(f"design estimability: {x}"
+                        for x in (_de.get('problems') or []))
+        elif _de_status == 'not_estimable':
+            errs.append(
+                'design estimability: the manifest declares no estimable '
+                'comparison')
+        elif _de_status == 'warnings':
+            notes.append(
+                'design estimability: warnings; '
+                + '; '.join((_de.get('warnings') or [])[:4]))
+        else:
+            notes.append(
+                'design estimability: '
+                f"{_de_summary.get('n_estimable')}/"
+                f"{_de_summary.get('n_comparisons')} declared comparisons "
+                f"estimable; design rank="
+                f"{( _de.get('design') or {}).get('rank')}/"
+                f"{( _de.get('design') or {}).get('n_columns')}")
+    except Exception as _dee:
+        _de = {'kind': 'design_estimability', 'status': 'not_verifiable',
+               'problems': [f'{type(_dee).__name__}: {_dee}']}
+        errs.append(
+            'design estimability could not run '
+            f'({type(_dee).__name__}: {_dee}); the declared contrast may not '
+            'be identified by the planned cells')
     report = {'ok': not errs, 'manifest': manifest_path, 'manifest_sha256': m.get('manifest_sha256'),
               'code_semantics': L.CODE_SEMANTICS, 'n_arms': len(arms), 'n_seeds': len(seeds),
               'n_min_for_confirmation': _n_min, 'min_attainable_p_holm': _min_holm,
@@ -325,6 +360,7 @@ def plan_check(manifest_path=FREEZE_MANIFEST):
               'design_preflight': _design,
               'analysis_rehearsal': _ar,
               'budget_truncation': _bt,
+              'design_estimability': _de,
               'errors': errs, 'notes': notes,
               'practical_significance_design': _psd}
     if errs:

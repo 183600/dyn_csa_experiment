@@ -6593,3 +6593,69 @@ design 的 5 个完整 2x2 scope、`dynamic_blocking` 在 5 个 scope 中重叠�
 fail、writer no-op/conflict/overwrite；gate 的缺失/有效/篡改/
 `not_estimable` 行为；report/CLI/`Makefile`/`_PARTS` 接线；README 与
 `.github` 路径仍存在。完整 CPU 套件在本轮最终树通过。
+
+## 2026-11-01 — 有臂/有种子/有随机化不等于对照可估计：设计矩阵秩、block-arm 分量与因子别名（本轮实验设计与准备硬化，no new runs）
+
+零 GPU；不新增训练、不读取任何 split、不修改
+`confirmation_frozen*.json` 的字节/臂/种子/端点/α/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未删除、未修改、未移动。
+
+**Problem.** 现有设计门回答「臂/种子是否存在、预算是否匹配、功效是否
+可达、运行顺序是否平衡」，但没有回答更基本的问题：**声明的线性对照
+是否在计划单元格的设计矩阵列空间里**。两个臂各自有 12 个种子、但从未
+出现在同一个 block，臂效应与 block 完全混杂；多臂组合只在每个
+block-arm 连通分量内权重相等时才可估计；2x2 缺一格会让因子项失去唯一
+自由度；两个因子诱导相同臂划分时主效应不可分离。这些情况下所有声明
+门仍可全绿，而报告会给出一个没有对应估计量的「对照」。
+
+**Fix.** 新增 `explib/_parts/part_74_design_estimability.py`：
+
+- 从显式 cells、`run_order.json` 或清单 arms × seeds 归一化
+  `(arm, block, factors)`；设计矩阵用 `Fraction` 精确构造
+  （intercept + block 参照哑变量 + arm 参照哑变量），输出精确
+  `rank`/`deficiency`/`n_columns`。
+- 用并查集把 block-arm 关联图分解为连通分量。对照权重均摊到该臂的
+  cell 后，同时核验：(a) 每个分量内权重和相等（纯对照即全 0）；
+  (b) cell 级向量在精确设计矩阵列空间内。两臂不同分量报
+  `disconnected_components`；分量和不等报 `unequal_component_totals`。
+  非零总权重可估计但标 `is_contrast=false` 并 warning。
+- `factors` 支持声明形状（factor → {arm: level}）与存储形状
+  （arm → {factor: level}），由 `inputs.factors_shape` 消歧。主效应与
+  两两交互用 sum-to-zero effect coding，在「intercept + block + 全部
+  声明项」模型中分别报告 `own_df`（单项可估计）与 `unique_df`（给定
+  其它项后可分离）；输出 `empty_combinations`、`aliased_pairs`、
+  `redundant_pairs`、`treatment_model` 与逐项 `estimable` /
+  `separately_estimable` / `status`。
+- 产物 `design_estimability.json` 的 `content_sha256` 覆盖 policy、
+  inputs 与全部派生字段，只排除 `created_at`/`content_sha256`；
+  `validate_design_estimability` 从 inputs 完整重放并逐字段对账；
+  writer 同内容 no-op、不同内容默认 conflict，显式
+  `keep_existing=False` 才替换。
+- 新增 `audit_gates.py design_estimability`（别名 `estimability` /
+  `design_rank` / `identifiability` / `contrast_estimability` /
+  `design_matrix`）：优先重放落盘/`plan_snapshot` 内嵌产物，缺产物时
+  从冻结清单 + 可选 run order 现场构造；缺清单 `not_verifiable`、
+  不可估计 `fail`。并入 `audit_gates.py report` 顶层、`audit_gates.py
+  design` 的 violations/warnings 与 `python -m explib.confirmation
+  plan`（非可估计/无对照拒绝计划，产物随 plan snapshot 落盘）；新增
+  `make estimability`。
+
+**Boundary.** 可估计只说明存在线性无偏估计量，不是功效、精度、SESOI
+或因果识别；不补 cell、不改 run order、不自动换对照。`model=cell_means`
+只适合明确声明 block 不进入模型的设计，并会 warning。没有产物的旧面板
+按清单完整网格现场检查；实际执行是否偏离计划仍由 run_order/
+disposition/aggregate 等既有门回答。不产生 p 值、不进入 Holm、不改变
+`verified`/`confirmed`、不重算 PPL、不读 test split、不改
+`CODE_SEMANTICS`。
+
+**Verification.** 新增 `test_review_part_79.py` 17 项：完整 block 的
+精确秩/分量/估计；disconnected 两臂 fail；多臂分量抵消 vs 不抵消；
+非零总权重 warning；缺臂/重复 cell/非法输入 fail-closed；完整 2x2 的
+主效应/交互可分离；缺 cell 使项 `aliased` 并点名组合；同划分因子别名
+与重叠 df；单水平因子 degenerate；分数权重 round-trip；产物
+hash/replay/篡改/writer；清单完整网格与 run order 两来源；gate
+live/artifact/tamper/missing；cell_means warning；两种 factors 形状
+round-trip；`_PARTS`/Makefile/CLI/report 接线且无 p/Holm/verdict 字段。
+`python audit_gates.py estimability` 在当前冻结清单上 72 cells / 6
+comparisons 全部可估计；`python audit_gates.py design` 仍退出 0。
+完整 CPU 套件在本轮最终树通过。

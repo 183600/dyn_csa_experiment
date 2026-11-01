@@ -12876,3 +12876,143 @@ JSON round-trip、六类篡改 replay fail、writer no-op/conflict/overwrite；
 gate 的缺失/有效/篡改/`not_estimable` 行为；report/CLI/`Makefile`/
 `_PARTS` 接线；README 与 `.github` 路径仍存在。完整 CPU 套件在本轮
 最终树通过。
+
+## 137. 对照必须可估计：设计矩阵秩、块-臂连通分量与因子别名（本轮实验设计与准备硬化，no new runs）
+
+零 GPU；不新增训练、不读取任何 split、不修改
+`confirmation_frozen*.json` 的字节/臂/种子/端点/α/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未删除、未修改、未移动。
+
+### 137.1 问题：有臂、有种子、有随机化，不等于对照可估计
+
+实验开始前，仓库已经能回答很多设计问题：臂和种子是否存在、预算是否
+匹配、功效是否可达、随机化是否位置平衡、设备是否与臂共线。但这些检查
+都默认了一件更基本的事：**声明的对照真的能由计划中的单元格估计出来**。
+
+- 两个臂各自都有很多种子，但从未出现在同一个 block（seed/device/order）
+  里，则臂效应与 block 效应完全混杂；再补种子也只会补在同一个
+  disconnected 分量里，contrast 仍然不可估计。
+- 一个多臂组合（例如 `A − B + C − D`）只有在**每个**连通分量内权重
+  抵消时才可估计。只看总权重为零不够：`A − C` 在两个分量里各留 +1/−1，
+  分量的整体水平又被 block 吸收，仍然不可估计。
+- 因子设计里，空单元格会让主效应/交互的 effect-coded 列线性相关。此
+  时每个因子单独都“在模型里”，但没有任何一个项拥有唯一的自由度；把
+  它们当成可分离的结论，等于把别名参数解释成独立效应。
+- 两个因子在臂集合上诱导相同的划分（例如“大模型”与“长训练”恰好是
+  同一组臂），它们的主效应无法分别估计；这不是“两个都显著”，而是同一
+  个对比被数了两次。
+
+现有的 `single_factor`、`factorial_design_audit`、`interaction_coverage`
+检查的是**声明结构**（键集、2x2 是否完整、覆盖了哪些组件），
+`environment_balance_audit` 检查的是**实测环境**与臂是否完全共线。它们
+都没有构造设计矩阵、没有分解 block-arm 图、也没有问“这个声明的线性
+组合是否在列空间里”。因此一份在所有声明门上全绿的设计，仍可能没有
+它声称要报告的那个估计量。
+
+### 137.2 方法：精确有理数设计矩阵 + block-arm 连通分量
+
+新增 `explib/_parts/part_74_design_estimability.py`：
+
+- `build_design_estimability(cells, comparisons, factors=None, ...)` 接受
+  三种单元格来源：显式 `(arm, block[, factors])` 列表、`run_order` 计划
+  （`planned_cells` + `cell_variants` + `cell_blocks`）、或由
+  `design_estimability_from_manifest` 从清单的 arms × seeds 构造完整网格。
+  重复单元格、未知臂、空 cells/comparisons 一律 fail-closed。
+- 设计矩阵用 `fractions.Fraction` 精确构造：intercept、block 哑变量
+  （第一个 block 为参照）、arm 哑变量（第一个 arm 为参照）。`rank` 与
+  `deficiency` 是精确秩，不依赖浮点 tolerance；`n_columns - rank` 就是
+  该设计在 cell-mean 模型下缺的自由度。
+- block-arm 关联图用并查集分解为连通分量；输出 `components` 与
+  `component_of`。两个臂只有在同一分量里才可能配对。
+- 每条对照先归一化为 arm 权重（`weights`，缺省 `a:+1, b:-1`）。把每个
+  臂的权重**均摊到该臂的单元格**得到 cell 级向量，再独立做两件事：
+  1. 分量判据：每个分量内的权重和必须相等（纯对照即全为 0）。不等时
+     具名 `unequal_component_totals`；两臂不在同一分量时具名
+     `disconnected_components`。
+  2. 列空间判据：cell 级向量必须落在设计矩阵的列空间里（精确
+     `_de_in_column_space`）。两者都过才算 `estimable`。
+- 非零总权重的组合（例如只取 `A` 的均值）仍是可估计的（它含 intercept），
+  但被标记 `is_contrast=false` 并 warning；不会把“不是对照”误判成
+  “不可估计”。
+
+### 137.3 因子项：可估计 ≠ 可分离
+
+`factors` 接受 `factor -> {arm: level}`（声明形状）或
+`arm -> {factor: level}`（存储形状），由 `factors_shape` 显式消歧；
+`inputs` 总是存后者，因此 replay 不依赖调用方形状。
+
+对每个因子构造 sum-to-zero 的 effect-coded 列，交互项取各因子列的
+elementwise 乘积。处理模型是 **intercept + block 哑变量 + 所有声明的
+主效应/两两交互**（不是饱和 arm 哑变量模型——后者会平凡地张成一切
+处理对比，无法回答“能否分离”）：
+
+- `own_df`：该项单独加入时带来的秩增量；`own_df == df` 说明该项在
+  设计张成内可估计。
+- `unique_df`：从**完整声明模型**中删掉该项后秩的下降量；
+  `unique_df == df` 才是 `separately_estimable`。
+- `status`：`estimable` / `aliased`（可估计但不能与其它项分离）/
+  `partial` / `not_estimable` / `degenerate`（某因子只有 1 个水平）。
+- 同时报告 `empty_combinations`（每对因子的缺失水平组合）、
+  `aliased_pairs`（诱导相同臂划分的因子对）、`redundant_pairs`
+  （两项 effect space 的重叠 df）与 `treatment_model.deficiency`。
+
+因此一个缺 cell 的 2x2 不会再被读成“主效应显著、交互不显著”；输出会
+明说该项 `aliased`、缺哪个组合、重叠多少 df。
+
+### 137.4 产物、重放与接线
+
+- 产物 `design_estimability.json` 的 `content_sha256` 覆盖 `policy`、
+  `inputs`（cells/comparisons/factors/model）与全部派生字段，只排除
+  `created_at`/`content_sha256`；`validate_design_estimability` 从
+  `inputs` 完整重放并逐字段对账。`write_design_estimability` 同内容
+  no-op、不同内容默认 conflict，只有显式 `keep_existing=False` 才替换。
+- `python audit_gates.py design_estimability [artifact]`（别名
+  `estimability` / `design_rank` / `identifiability` /
+  `contrast_estimability` / `design_matrix`）优先重放落盘产物；没有
+  产物时从冻结清单与（可选的）run order 现场构造。缺清单为
+  `not_verifiable`；不可估计为 `fail`；结构完整但没有任何对照为
+  `not_estimable`。
+- `make estimability` 是零 GPU 单命令入口；`audit_gates.py report`
+  顶层新增 `design_estimability` 块；`audit_gates.py design` 也把同一
+  读数并入 `violations`/`warnings`，使预算/功效全绿但对照不可估计的
+  设计不能通过统一设计门。
+- `python -m explib.confirmation plan` 也把它作为开跑前检查：非可估计
+  对照或没有可估计对照会进入 plan 的 `errors` 并拒绝计划，读到的产物
+  随 `analysis_v12/plan_snapshot.json` 落盘。它不改变冻结清单的
+  p/α/Holm/判定，也不要求旧面板补登记。
+
+### 137.5 边界
+
+- **不是功效/精度读数。** 可估计只说明存在一个线性无偏估计量；它不说明
+  方差多大、需要多少种子、效应是否超过 SESOI。功效、attrition、预算与
+  演练仍是独立门槛。
+- **不是因果识别。** 它只在线性 cell-mean 模型与声明的 block 结构下
+  回答“这个对比是否在列空间里”。未声明的混杂（数据顺序、调参来源、
+  实现差异）仍由 `pair_reason`、`run_allocation`、`single_factor` 等门
+  负责。
+- **不是设计优化器。** 它指出缺哪个 cell、哪个分量不连通、哪两项重叠，
+  不自动补 cell、不改 run order、不改预算，也不替研究选择另一个对照。
+- **模型选择是声明。** `model=block_effects` 把 seed/device/order 当
+  block；`model=cell_means` 忽略 block，只适合明确声明“block 不进入
+  模型”的设计，并会给出 warning。两种模型的结论不能混读。
+- **不回溯旧面板。** 没有 `design_estimability.json` 的旧面板仍可在
+  `design` 门中由清单+完整网格现场得到 `ok`；若实际执行偏离了完整
+  网格，仍由 `run_order`/`disposition`/`aggregate` 等既有审计回答，
+  本块不会把“计划可估计”写成“实际可估计”。
+- **不产生 p 值。** 不进入 Holm、不改变 `verified`/`confirmed`、不重算
+  PPL、不读 test split、不改 `CODE_SEMANTICS`。
+
+### 137.6 验证
+
+新增 `test_review_part_79.py` 17 项：完整 block 设计的精确秩/分量/
+估计；disconnected 两臂判 fail 并点名；多臂 `A−B+C−D` 在两分量内抵消
+可估计而 `A−C` 不可；非零总权重 warning 但可估计；缺臂/重复 cell
+fail-closed；完整 2x2 的主效应与交互 `separately_estimable`；缺一个
+2x2 cell 使全部项 `aliased` 且点名缺失组合；两个因子同划分被判别名并
+报重叠 df；单水平因子 `degenerate`；分数权重 round-trip 与精确秩/
+deficiency；产物 hash/重放/篡改拒绝/writer no-op/conflict/overwrite；
+清单完整网格与 run order 两条来源；gate 的 live/artifact/tamper/
+missing 状态；`model=cell_means` 的 warning；非法 model/空输入/重复
+对照名/全零权重/因子缺臂 fail-closed；两种 factors 形状 round-trip；
+`_PARTS`/Makefile/CLI/report 接线且输出不含 p/Holm/verdict 字段。
+完整 CPU 套件在本轮最终树通过。
