@@ -183,40 +183,40 @@ def _tsm_metrics(n, lam, z):
     }
 
 
-def _tsm_first_n(n_max, predicate):
-    for k in range(2, n_max + 1):
-        if predicate(k):
-            return k
-    return None
-
-
 def _tsm_search_requirements(n, sigma, abs_effect, z, *, target_power,
                              max_type_s, max_type_m, n_max):
-    """Find the smallest n meeting each planning requirement."""
-    def metrics(k):
+    """Find the smallest n meeting each planning requirement.
+
+    One pass over ``[2, n_max]`` evaluates the conditional readout once per
+    candidate n and fills the three first-hit slots.  The earlier version
+    walked the same grid three times and recomputed every erf/exp, which is
+    the dominant cost when a caller raises ``n_max`` for a scale design.  The
+    first n satisfying each predicate is unchanged, and the loop stops as soon
+    as all three are found; an impossible threshold still scans the full
+    search bound once.
+    """
+    min_power = None
+    min_type_s = None
+    min_type_m = None
+    for k in range(2, n_max + 1):
         try:
             lam = abs_effect * math.sqrt(k) / sigma
         except (OverflowError, ZeroDivisionError):
-            return None
-        return _tsm_metrics(k, lam, z)
-
-    def _power_ok(k):
-        met = metrics(k)
-        return met is not None and met['power'] >= target_power
-
-    def _type_s_ok(k):
-        met = metrics(k)
-        return (met is not None and met['type_s'] <= max_type_s
-                and met['power'] >= target_power)
-
-    def _type_m_ok(k):
-        met = metrics(k)
-        return (met is not None and met['type_m'] <= max_type_m
-                and met['power'] >= target_power)
-
-    min_power = _tsm_first_n(n_max, _power_ok)
-    min_type_s = _tsm_first_n(n_max, _type_s_ok)
-    min_type_m = _tsm_first_n(n_max, _type_m_ok)
+            continue
+        met = _tsm_metrics(k, lam, z)
+        if met is None:
+            continue
+        if min_power is None and met['power'] >= target_power:
+            min_power = k
+        if min_type_s is None:
+            if met['type_s'] <= max_type_s and met['power'] >= target_power:
+                min_type_s = k
+        if min_type_m is None:
+            if met['type_m'] <= max_type_m and met['power'] >= target_power:
+                min_type_m = k
+        if (min_power is not None and min_type_s is not None
+                and min_type_m is not None):
+            break
     return {
         'min_n_for_power': min_power,
         'min_n_for_type_s': min_type_s,
@@ -627,7 +627,8 @@ def type_sm_design_from_deltas(n, deltas=None, *, pilot_sd=None, sesoi=None,
         max_type_m=max_type_m, include_curve=include_curve,
         curve_factors=curve_factors)
     out.update({k: v for k, v in core.items()
-                if k not in ('problems', 'warnings', 'policy')})
+                if k not in ('kind', 'schema', 'problems', 'warnings',
+                             'policy')})
     out['problems'] = list(core.get('problems') or [])
     out['warnings'] = list(out.get('warnings') or []) + list(
         core.get('warnings') or [])
@@ -651,6 +652,37 @@ def _tsm_close(a, b, rel=1e-9, abs_=1e-12):
     if not (math.isfinite(fa) and math.isfinite(fb)):
         return False
     return abs(fa - fb) <= max(abs_, rel * max(1.0, abs(fa), abs(fb)))
+
+
+def _tsm_exact_equal(a, b):
+    """Type-aware equality for fields that must replay exactly.
+
+    Ordinary ``==`` treats ``True`` as ``1`` and ``False`` as ``0``, so a
+    hand-edited artifact could change a count or a flag into a boolean and
+    still compare equal.  Recursing into mappings/lists also prevents a
+    nested ``meets`` flag from being coerced.
+    """
+    if isinstance(a, bool) or isinstance(b, bool):
+        return isinstance(a, bool) and isinstance(b, bool) and a is b
+    if a is None or b is None:
+        return a is b
+    if isinstance(a, dict) or isinstance(b, dict):
+        if not (isinstance(a, dict) and isinstance(b, dict)):
+            return False
+        if set(a) != set(b):
+            return False
+        return all(_tsm_exact_equal(a[key], b[key]) for key in a)
+    if isinstance(a, (list, tuple)) or isinstance(b, (list, tuple)):
+        if not (isinstance(a, (list, tuple))
+                and isinstance(b, (list, tuple))):
+            return False
+        return (len(a) == len(b)
+                and all(_tsm_exact_equal(x, y) for x, y in zip(a, b)))
+    if isinstance(a, numbers.Integral) and isinstance(b, numbers.Integral):
+        return int(a) == int(b)
+    if isinstance(a, numbers.Real) and isinstance(b, numbers.Real):
+        return a == b
+    return type(a) is type(b) and a == b
 
 
 # ---------------------------------------------------------------------------
@@ -811,6 +843,14 @@ def type_sm_from_manifest(manifest, pilot=None, *, max_type_s=None,
             out['problems'].append(
                 'a primary_comparisons entry has no non-empty name')
             continue
+        if name in out['comparisons']:
+            # The manifest's primary family is keyed by name.  Overwriting a
+            # duplicate would hide one comparison and understate the family
+            # size used for the Bonferroni critical value.
+            out['problems'].append(
+                f'primary_comparisons contains duplicate name {name!r}; '
+                'a Type S/M family cannot have two indistinguishable slots')
+            continue
         cell = (pilot_comps.get(name)
                 if isinstance(pilot_comps, dict) else None)
         if not isinstance(cell, dict):
@@ -961,8 +1001,9 @@ def build_type_sm_design(n, sigma, effect, *, alpha=0.05, family_size=1,
             raise ValueError(f'{label}={value!r} must be a finite number')
     if isinstance(n, bool) or _tsm_int(n, 'n', minimum=2) is None:
         raise ValueError(f'n={n!r} must be an integer >= 2')
-    if isinstance(family_size, bool) or _tsm_int(
-            family_size, 'family_size', minimum=1) is None:
+    if family_size is not None and (
+            isinstance(family_size, bool)
+            or _tsm_int(family_size, 'family_size', minimum=1) is None):
         raise ValueError(f'family_size={family_size!r} must be an integer >= 1')
     if isinstance(n_max, bool) or _tsm_int(n_max, 'n_max', minimum=2) is None:
         raise ValueError(f'n_max={n_max!r} must be an integer >= 2')
@@ -971,9 +1012,16 @@ def build_type_sm_design(n, sigma, effect, *, alpha=0.05, family_size=1,
         critical_value=critical_value, n_max=n_max,
         target_power=target_power, max_type_s=max_type_s,
         max_type_m=max_type_m)
+    if result.get('status') == 'invalid':
+        # An artifact is evidence of a computable design, not a container for
+        # an invalid input.  Reject it here so a caller cannot write (and later
+        # "successfully" replay) a record whose result is not a readout.
+        detail = '; '.join(result.get('problems') or []) or 'invalid design'
+        raise ValueError(f'invalid Type S/M design: {detail}')
     inputs = {
         'n': int(n), 'sigma': float(sigma), 'effect': float(effect),
-        'alpha': float(alpha), 'family_size': int(family_size),
+        'alpha': None if alpha is None else float(alpha),
+        'family_size': None if family_size is None else int(family_size),
         'critical_value': (None if critical_value is None
                            else float(critical_value)),
         'n_max': int(n_max), 'target_power': float(target_power),
@@ -1011,9 +1059,11 @@ def validate_type_sm_design(artifact):
         out['problems'].append(
             f'artifact.kind must be "type_sm_design_artifact", got '
             f'{artifact.get("kind")!r}')
-    if artifact.get('schema') != 1:
+    schema = artifact.get('schema')
+    if (isinstance(schema, bool) or not isinstance(schema, int)
+            or schema != 1):
         out['problems'].append(
-            f'artifact.schema must be 1, got {artifact.get("schema")!r}')
+            f'artifact.schema must be 1, got {schema!r}')
     stolen = sorted(set(_tsm_frozen_payload(artifact)))
     if stolen:
         out['problems'].append(
@@ -1027,6 +1077,11 @@ def validate_type_sm_design(artifact):
     if missing:
         out['problems'].append(
             f'artifact.inputs is missing required key(s): {missing}')
+    extra_inputs = sorted(set(inputs) - set(_TSM_INPUT_KEYS))
+    if extra_inputs:
+        out['problems'].append(
+            'artifact.inputs carries field(s) outside the replay schema: '
+            + ', '.join(repr(key) for key in extra_inputs))
     recorded = artifact.get('content_sha256')
     out['content_sha256'] = recorded
     body = {k: v for k, v in artifact.items()
@@ -1057,10 +1112,24 @@ def validate_type_sm_design(artifact):
         out['problems'].append(f'replay raised {type(e).__name__}: {e}')
         return out
     out['result'] = replay
+    if replay.get('status') == 'invalid':
+        out['problems'].append(
+            'replayed inputs describe an invalid Type S/M design: '
+            + ('; '.join(replay.get('problems') or []) or 'no readout'))
+        return out
     stored = artifact.get('result')
     if not isinstance(stored, dict):
         out['problems'].append('artifact.result must be an object')
         return out
+    extra = sorted(set(stored) - set(replay))
+    if extra:
+        out['problems'].append(
+            'result carries field(s) outside the replay schema: '
+            + ', '.join(repr(key) for key in extra))
+    missing_result = sorted(set(replay) - set(stored))
+    if missing_result:
+        out['problems'].append(
+            f'result is missing replay field(s): {missing_result}')
     for key in _TSM_SCALAR_FIELDS:
         if key not in stored:
             out['problems'].append(f'result.{key} is missing')
@@ -1073,7 +1142,16 @@ def validate_type_sm_design(artifact):
         if key not in stored:
             out['problems'].append(f'result.{key} is missing')
             continue
-        if stored.get(key) != replay.get(key):
+        if not _tsm_exact_equal(stored.get(key), replay.get(key)):
+            out['problems'].append(
+                f'result.{key}: stored={stored.get(key)!r}, '
+                f'replay={replay.get(key)!r}')
+    # Fields not in the numeric/exact lists are still part of the replay
+    # schema (policy prose, interpretation, warnings/problems).  Compare them
+    # exactly so a hand-edited explanation cannot travel with valid numbers.
+    handled = set(_TSM_SCALAR_FIELDS) | set(_TSM_EXACT_FIELDS)
+    for key in sorted(set(replay) - handled):
+        if key in stored and not _tsm_exact_equal(stored[key], replay[key]):
             out['problems'].append(
                 f'result.{key}: stored={stored.get(key)!r}, '
                 f'replay={replay.get(key)!r}')

@@ -321,7 +321,15 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=None, cache_dir=None,
             else:
                 if isinstance(_article_block, dict):
                     _rec_sha = _article_block.get('sidecar_sha256')
-                    if _rec_sha:
+                    if not (isinstance(_rec_sha, str) and len(_rec_sha) == 64
+                            and all(ch in '0123456789abcdefABCDEF'
+                                    for ch in _rec_sha)):
+                        _problems_tta.append(
+                            'test article-id sidecar exists but '
+                            'article_unit.sidecar_sha256 is missing or not a '
+                            '64-character hex digest; the array is not '
+                            'attested by the cache metadata')
+                    else:
                         try:
                             _actual_sha = file_sha256(ttad_path)
                         except Exception as _tae:

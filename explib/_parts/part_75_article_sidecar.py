@@ -439,6 +439,14 @@ def load_cached_article_ids(cache_dir=None, *, split='test', seq_len,
         problems.append(f'article sidecar unreadable ({type(exc).__name__}: {exc})')
         art = None
     recorded_sha = block.get('sidecar_sha256')
+    if not (isinstance(recorded_sha, str) and len(recorded_sha) == 64
+            and all(ch in '0123456789abcdefABCDEF' for ch in recorded_sha)):
+        # A declared-but-unattested sidecar is not bound to the cache: without
+        # the digest an edited array would pass every structural check.
+        problems.append(
+            'article_unit.sidecar_sha256 is missing or not a 64-character '
+            'hex digest; the persisted article vector is not attested')
+        recorded_sha = None
     if art is not None and recorded_sha:
         try:
             actual_sha = file_sha256(path)
