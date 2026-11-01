@@ -1509,15 +1509,26 @@ def _validation_transfer_markdown(block):
           '本节不给出数字，也不从 ΔPPL 反造 log ratio。')
         A('')
         return out
-    rows = block.get('comparisons') or {}
-    fam = block.get('family') or list(rows)
+    rows = block.get('comparisons')
+    if not isinstance(rows, dict):
+        rows = {}
+    _raw_fam = block.get('family')
+    if isinstance(_raw_fam, (list, tuple)) and _raw_fam:
+        fam = [name for name in _raw_fam if isinstance(name, str)]
+    else:
+        fam = [name for name in rows if isinstance(name, str)]
     A('| 比较 | n | 验证 mean log ratio | test mean log ratio | test/验证 | 差值 (test−验证) [95% CI] | p (exact) | Holm p | 分类 |')
     A('|---|---|---|---|---|---|---|---|---|')
 
     def _num(x, fmt):
         if isinstance(x, (bool, np.bool_)) or not isinstance(x, (int, float)):
             return '—'
-        x = float(x)
+        try:
+            x = float(x)
+        except (TypeError, ValueError, OverflowError):
+            # A hand-edited JSON integer can exceed float64.  Formatting a
+            # report must not abort on it; the value is simply unavailable.
+            return '—'
         return format(x, fmt) if math.isfinite(x) else '—'
 
     _cls = {
@@ -1531,9 +1542,17 @@ def _validation_transfer_markdown(block):
         'not_estimable': '不可估计',
     }
     for name in fam:
-        r = rows.get(name) or {}
+        r = rows.get(name)
+        if not isinstance(r, dict):
+            r = {}
         if r.get('status') != 'ok':
             A(f'| {name} | 0 | — | — | — | —（{r.get("reason") or "not_estimable"}） | — | — | 不可估计 |')
+            continue
+        _classification = r.get('classification')
+        if not isinstance(_classification, str):
+            # A malformed label is not a category; never call ``dict.get`` with
+            # an unhashable value while formatting an untrusted report block.
+            A(f'| {name} | {r.get("n", "—")} | — | — | — | — | — | — | — |')
             continue
         ci = r.get('difference_ci95')
         ci_t = ('—' if not isinstance(ci, (list, tuple)) or len(ci) < 2
@@ -1545,9 +1564,11 @@ def _validation_transfer_markdown(block):
           f'{_num(r.get("difference_mean"), "+.4f")} {ci_t} | '
           f'{_num(r.get("difference_p_exact_signflip"), ".4f")} | '
           f'{_num(r.get("difference_p_holm"), ".4f")} | '
-          f'{_cls.get(r.get("classification"), r.get("classification") or "—")} |')
+          f'{_cls.get(_classification, _classification or "—")} |')
     A('')
-    sm = block.get('summary') or {}
+    sm = block.get('summary')
+    if not isinstance(sm, dict):
+        sm = {}
     A(f'- 分类计数：{sm.get("class_counts") or {}}；'
       f'声明族 Holm 拒绝（差值检验）：{sm.get("family_holm_rejections") or []}。')
     if sm.get('n_opposite_sign'):

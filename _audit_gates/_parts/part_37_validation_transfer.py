@@ -61,11 +61,15 @@ def audit_validation_transfer(path=None):
         out['reason'] = (block.get('reason')
                          or 'the transfer block has no comparison family')
         return out
-    out['n_comparisons'] = len(block.get('family') or [])
+    _family = block.get('family')
+    out['n_comparisons'] = (len(_family)
+                            if isinstance(_family, (list, tuple)) else 0)
     out['n_ok'] = block.get('n_ok')
     out['n_not_estimable'] = block.get('n_not_estimable')
     summary = block.get('summary') if isinstance(block.get('summary'), dict) else {}
-    out['class_counts'] = dict(summary.get('class_counts') or {})
+    _classes = summary.get('class_counts')
+    out['class_counts'] = (dict(_classes)
+                           if isinstance(_classes, dict) else {})
     out['n_opposite_sign'] = summary.get('n_opposite_sign', 0)
     out['n_attenuated'] = summary.get('n_attenuated', 0)
     out['n_amplified'] = summary.get('n_amplified', 0)
@@ -76,7 +80,10 @@ def audit_validation_transfer(path=None):
             f"{out['n_incomplete_coverage']} comparison(s) use only the seeds "
             'present on both validation and test; the missing seeds are named '
             'inside the block')
-    out['family_holm_rejections'] = list(summary.get('family_holm_rejections') or [])
+    _rejections = summary.get('family_holm_rejections')
+    out['family_holm_rejections'] = (list(_rejections)
+                                      if isinstance(_rejections, (list, tuple))
+                                      else [])
     manifest = None
     manifest_path = os.path.join(REPO, 'confirmation_frozen.json')  # noqa: F821
     if os.path.exists(manifest_path):

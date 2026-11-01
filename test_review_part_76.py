@@ -278,3 +278,79 @@ def test_transfer_gate_accepts_the_missing_power_placeholder_as_absent():
         gate = A.audit_validation_transfer(p)
     assert gate['status'] == 'not_verifiable_locally', gate
     assert 'power_validation.json' in gate['reason']
+
+
+def test_transfer_rejects_numeric_string_cells_and_fractional_min_pairs():
+    # A numeric-looking string is a serialisation artefact, not a PPL cell.
+    man, power, test_stats = _fixture()
+    name = man['primary_comparisons'][0]['name']
+    power['comparisons'][name]['pilot_ppl_a'][0] = '1.0'
+    block = L.validation_transfer(power, test_stats, man)
+    rec = block['comparisons'][name]
+    assert rec['status'] == 'not_estimable'
+    assert 'finite' in rec['reason'] or 'positive' in rec['reason']
+    for bad in ('6', 6.5, True):
+        try:
+            L.validation_transfer(power, test_stats, man, min_pairs=bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'fractional/string min_pairs accepted: {bad!r}')
+
+
+def test_transfer_replay_rejects_every_derived_field():
+    man, block = _block()
+    name = block['family'][0]
+    expected_reject = bool(block['holm'][name]['reject'])
+    for key, value in (
+            ('n', block['comparisons'][name]['n'] + 1),
+            ('shrinkage_pct', 999.0),
+            ('direction_agreement', not block['comparisons'][name]['direction_agreement']),
+            ('holm_reject', not expected_reject),
+            ('difference_p_holm', 0.75),
+            ('a', 'not-the-manifest-arm'),
+            ('validation_ppl_a', [1.0] * block['comparisons'][name]['n']),
+            ('test_ppl_a', [1.0] * block['comparisons'][name]['n'])):
+        bad = json.loads(json.dumps(block))
+        bad['comparisons'][name][key] = value
+        rep = L.replay_validation_transfer(bad, manifest=man)
+        assert rep['status'] == 'fail', (key, rep)
+
+
+def test_transfer_replay_and_report_fail_closed_on_malformed_shapes():
+    man, block = _block()
+    name = block['family'][0]
+    for mutate in (
+            lambda b: b.__setitem__('family', [['not', 'hashable'], 'x']),
+            lambda b: b.__setitem__('comparisons', []),
+            lambda b: b.__setitem__('policy', []),
+            lambda b: b['comparisons'].__setitem__(name, []),
+            lambda b: b['comparisons'][name].__setitem__('classification', []),
+            lambda b: b['comparisons'][name].__setitem__('seeds', [{}]),
+            lambda b: b['comparisons'][name].__setitem__('validation_ppl_a', 3),
+            lambda b: b.__setitem__('summary', [])):
+        bad = json.loads(json.dumps(block))
+        mutate(bad)
+        rep = L.replay_validation_transfer(bad, manifest=man)
+        assert rep['status'] == 'fail', rep
+    # Report formatting is also a pure formatter: malformed shapes must not
+    # raise, and an integer beyond float64 must render as unavailable.
+    text = '\n'.join(V12._validation_transfer_markdown({
+        'status': 'partial', 'family': [['bad'], name],
+        'comparisons': {name: {'status': 'ok', 'n': 10 ** 400,
+                               'classification': []}},
+        'summary': []}))
+    assert '验证集→test' in text
+    assert name in text
+
+
+def test_transfer_replay_requires_the_block_manifest_binding():
+    man, block = _block()
+    man['manifest_sha256'] = 'a' * 64
+    block['manifest_sha256'] = 'a' * 64
+    assert L.replay_validation_transfer(block, manifest=man)['status'] == 'ok'
+    for value in (None, '', 'b' * 64):
+        bad = json.loads(json.dumps(block))
+        bad['manifest_sha256'] = value
+        rep = L.replay_validation_transfer(bad, manifest=man)
+        assert rep['status'] == 'fail', (value, rep)

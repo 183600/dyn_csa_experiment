@@ -41,6 +41,11 @@ slot (p=1) rather than silently shrinking the correction family.
 import math
 
 VALIDATION_TRANSFER_KIND = 'validation_transfer'
+# CPython refuses decimal conversion of a 4,301+ digit integer by default, so
+# such a value cannot be written to the JSON report at all.  A declared seed or
+# count beyond this bound is refused as unverifiable instead of producing an
+# artifact that crashes the strict-JSON writer.
+_VT_MAX_REPORTABLE_INT = 10 ** 4000
 VALIDATION_TRANSFER_SCHEMA = 1
 VALIDATION_TRANSFER_POLICY = {
     'version': 'validation-transfer-1',
@@ -73,8 +78,14 @@ VALIDATION_TRANSFER_POLICY = {
 
 
 def _vt_num(value):
-    """Finite real scalar, or None (booleans/strings are not measurements)."""
-    if isinstance(value, bool):
+    """Finite real scalar, or None (booleans/strings are not measurements).
+
+    A stored JSON artifact may contain a numeric-looking string such as
+    ``"1.0"``; that is a serialisation artefact, not a measured PPL or log
+    ratio.  Accepting it here used to let a hand-edited vector replay as
+    data, so strings/bytes and booleans are refused before ``float``.
+    """
+    if isinstance(value, (bool, np.bool_, str, bytes, bytearray)):
         return None
     try:
         out = float(value)
@@ -95,7 +106,7 @@ def _vt_seed(value):
     here; a non-canonical spelling (``'01'``, ``'1.0'``) is not a second way
     to name the same seed.
     """
-    if isinstance(value, bool):
+    if isinstance(value, (bool, np.bool_, bytes, bytearray)):
         return None
     if isinstance(value, str):
         text = value.strip()
@@ -103,7 +114,9 @@ def _vt_seed(value):
             out = int(text)
         except (TypeError, ValueError, OverflowError):
             return None
-        return out if str(out) == text else None
+        if str(out) != text or abs(out) > _VT_MAX_REPORTABLE_INT:
+            return None
+        return out
     try:
         out = int(value)
     except (TypeError, ValueError, OverflowError):
@@ -112,6 +125,8 @@ def _vt_seed(value):
         if value != out:
             return None
     except (TypeError, ValueError):
+        return None
+    if abs(out) > _VT_MAX_REPORTABLE_INT:
         return None
     return out
 
@@ -132,6 +147,95 @@ def _vt_list(value):
         return list(value)
     except TypeError:
         return None
+
+
+def _vt_int_arg(value, name, *, minimum=None):
+    """Strict integer argument; strings and fractional numbers are refused.
+
+    ``int('6')`` and ``int(6.9)`` silently accept values a caller did not
+    mean to declare.  Only an exact integral value (including NumPy scalars
+    and an ordinary ``6.0`` spelling) is a count.
+    """
+    if isinstance(value, (bool, np.bool_, str, bytes, bytearray)):
+        raise ValueError(f'{name} must be an integer, got {value!r}')
+    try:
+        out = int(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f'{name} must be an integer, got {value!r}') from None
+    try:
+        exact = bool(value == out)
+    except (TypeError, ValueError):
+        exact = False
+    if not exact:
+        raise ValueError(f'{name} must be an integer, got {value!r}')
+    if minimum is not None and out < int(minimum):
+        raise ValueError(f'{name} must be >= {int(minimum)}, got {out}')
+    if abs(out) > _VT_MAX_REPORTABLE_INT:
+        raise ValueError(
+            f'{name} exceeds the reportable integer bound 10**4000; the '
+            'block cannot be serialised as exact JSON')
+    return out
+
+
+def _vt_names(values):
+    """Unique string family names, or ``None`` for a malformed list.
+
+    ``set(family)`` used to raise ``TypeError`` for a hand-edited block whose
+    entries were lists/objects.  Names are identities in this readout, so only
+    non-empty strings are accepted, and duplicates fail closed.
+    """
+    if not isinstance(values, (list, tuple)):
+        return None
+    out = []
+    for value in values:
+        if not isinstance(value, str) or not value:
+            return None
+        out.append(value)
+    return out if len(set(out)) == len(out) else None
+
+
+def _vt_same_number(a, b):
+    """Numeric agreement that also treats two unavailable values as equal."""
+    if a is None or b is None:
+        return a is None and b is None
+    return _vt_close(a, b)
+
+
+def _vt_ratio_and_shrinkage(validation_mean, test_mean):
+    """Derived ``test/validation`` ratio and percent shrinkage, JSON safe.
+
+    Both quantities are only defined for a nonzero validation mean.  A
+    representable ratio can still make ``(1 - ratio) * 100`` overflow; an
+    infinite percentage is not a measurement and must not enter a strict-JSON
+    report.
+    """
+    if (validation_mean is None or test_mean is None
+            or not (math.isfinite(validation_mean)
+                    and math.isfinite(test_mean))
+            or validation_mean == 0.0):
+        return None, None
+    try:
+        ratio = float(test_mean / validation_mean)
+    except (OverflowError, ZeroDivisionError, TypeError, ValueError):
+        return None, None
+    if not math.isfinite(ratio):
+        return None, None
+    try:
+        shrinkage = float((1.0 - ratio) * 100.0)
+    except (OverflowError, TypeError, ValueError):
+        shrinkage = None
+    if shrinkage is not None and not math.isfinite(shrinkage):
+        shrinkage = None
+    return ratio, shrinkage
+
+
+def _vt_direction_agreement(validation_mean, test_mean):
+    if (validation_mean is None or test_mean is None
+            or not (math.isfinite(validation_mean)
+                    and math.isfinite(test_mean))
+            or validation_mean == 0.0):
+        return None
+    return bool((validation_mean > 0.0) == (test_mean > 0.0))
 
 
 def _vt_endpoint_length(comp):
@@ -192,6 +296,21 @@ def _vt_power_pairs(power, name):
             if di is None or not _vt_close(di, a - b):
                 return None, (f'validation pilot_deltas[{i}] does not equal '
                               'pilot_ppl_a - pilot_ppl_b')
+    # ``run_power`` also stores the log-ratio vector that the transfer block
+    # actually consumes.  When present it is an independent redundancy check:
+    # a hand-edited PPL vector must not disagree with the recorded log ratio.
+    if 'pilot_log_ratio' in cell:
+        log_raw = _vt_list(cell.get('pilot_log_ratio'))
+        if log_raw is None:
+            return None, 'validation pilot_log_ratio is not an array'
+        if len(log_raw) != len(seeds):
+            return None, 'validation pilot_log_ratio length does not match seeds'
+        for i, (value, a, b) in enumerate(zip(log_raw, pa, pb)):
+            li = _vt_num(value)
+            want = math.log(a) - math.log(b)
+            if li is None or not _vt_close(li, want):
+                return None, (f'validation pilot_log_ratio[{i}] does not equal '
+                              'log(pilot_ppl_a) - log(pilot_ppl_b)')
     return {'seeds': seeds, 'ppl_a': pa, 'ppl_b': pb}, None
 
 
@@ -226,7 +345,12 @@ def _vt_test_pairs(finaltest, comp):
         return None, 'final-test stats carry no by_length cells'
     ppl = {}
     for arm in (a, b):
-        cell = ((by_len.get(arm) or {}).get(str(Ln)) or {})
+        arm_cell = by_len.get(arm)
+        if not isinstance(arm_cell, dict):
+            return None, f'arm {arm!r} has no by_length cells'
+        cell = arm_cell.get(str(Ln))
+        if not isinstance(cell, dict):
+            return None, f'arm {arm!r} has no per-seed PPL cell at L{Ln}'
         raw = cell.get('ppl_by_seed')
         if not isinstance(raw, dict):
             return None, f'arm {arm!r} has no per-seed PPL cell at L{Ln}'
@@ -306,21 +430,7 @@ def _vt_record(name, comp, validation_mean, test_mean, diff_stats, seeds,
         dz = _vt_num(diff_stats.get('cohens_dz'))
     else:
         ci_low = ci_high = p = mean = std = dz = None
-    ratio = None
-    if (validation_mean is not None and test_mean is not None
-            and validation_mean != 0.0):
-        try:
-            ratio = float(test_mean / validation_mean)
-        except (OverflowError, ZeroDivisionError):
-            ratio = None
-        if ratio is not None and not math.isfinite(ratio):
-            ratio = None
-    shrinkage_pct = None
-    if ratio is not None:
-        try:
-            shrinkage_pct = float((1.0 - ratio) * 100.0)
-        except OverflowError:
-            shrinkage_pct = None
+    ratio, shrinkage_pct = _vt_ratio_and_shrinkage(validation_mean, test_mean)
     rec = {
         'name': name,
         'a': comp.get('a'),
@@ -350,10 +460,8 @@ def _vt_record(name, comp, validation_mean, test_mean, diff_stats, seeds,
         'difference_p_holm': None,
         'classification': _vt_classify(validation_mean, test_mean,
                                        ci_low, ci_high, p, alpha),
-        'direction_agreement': (None if validation_mean is None
-                                or test_mean is None
-                                or validation_mean == 0.0
-                                else bool((validation_mean > 0.0) == (test_mean > 0.0))),
+        'direction_agreement': _vt_direction_agreement(validation_mean,
+                                                        test_mean),
         'role': ('descriptive validation-to-test transfer; not in the frozen '
                  'Holm family and never changes a frozen verdict'),
         'evidence_level': 'descriptive',
@@ -460,12 +568,8 @@ def validation_transfer(power, test_stats, manifest, *, alpha=None,
         raise ValueError(f'validation_transfer: alpha must be numeric, got {alpha!r}') from None
     if not (math.isfinite(alpha) and 0.0 < alpha < 1.0):
         raise ValueError(f'validation_transfer: alpha must be in (0,1), got {alpha!r}')
-    try:
-        min_pairs = int(min_pairs)
-    except (TypeError, ValueError, OverflowError):
-        raise ValueError('validation_transfer: min_pairs must be an integer') from None
-    if min_pairs < 2:
-        raise ValueError('validation_transfer: min_pairs must be >= 2')
+    min_pairs = _vt_int_arg(min_pairs, 'validation_transfer: min_pairs',
+                            minimum=2)
     if isinstance(power, dict) and power.get('kind') == VALIDATION_TRANSFER_KIND:
         # A stored transfer block is not a power artifact; accepting it here
         # would let a replayed block be re-analysed as if it were raw input.
@@ -508,6 +612,21 @@ def validation_transfer(power, test_stats, manifest, *, alpha=None,
     }
     if not isinstance(comps, dict) or not comps:
         out['reason'] = 'test stats carry no finaltest comparisons'
+        # Keep every declared family slot with its manifest arm/endpoint
+        # binding, even when no test cell can be read.  Otherwise the replay
+        # gate cannot tell an absent test panel from a block whose slots point
+        # at different arms.
+        for comp in raw_comps:
+            out['comparisons'][comp['name']] = {
+                'name': comp['name'], 'a': comp.get('a'), 'b': comp.get('b'),
+                'endpoint': comp.get('endpoint'), 'status': 'not_estimable',
+                'reason': out['reason'], 'n': 0, 'seeds': [],
+                'role': ('descriptive validation-to-test transfer; not in '
+                         'the frozen Holm family and never changes a frozen '
+                         'verdict'),
+                'evidence_level': 'descriptive',
+                'frozen_decision_changed': False,
+            }
         return _vt_finish(out, family, alpha)
     # The validation artifact is part of the frozen evidence chain.  A
     # power_validation file produced for a different manifest/alpha/family
@@ -517,24 +636,39 @@ def validation_transfer(power, test_stats, manifest, *, alpha=None,
     if isinstance(power, dict):
         _pv_sha = power.get('manifest_sha256')
         _mf_sha = manifest.get('manifest_sha256')
-        if (_pv_sha and _mf_sha and str(_pv_sha) != str(_mf_sha)):
-            _pv_problem = (
-                'power_validation manifest_sha256 does not match the frozen '
-                f'manifest ({str(_pv_sha)[:12]}… vs {str(_mf_sha)[:12]}…)')
+        if _mf_sha not in (None, ''):
+            # When the manifest declares a source identity, the power
+            # artifact must carry the same one.  A missing/empty claimed hash
+            # is not a match just because the comparison is falsy.
+            if _pv_sha in (None, ''):
+                _pv_problem = (
+                    'power_validation has no manifest_sha256; it cannot be '
+                    'bound to the frozen manifest')
+            elif str(_pv_sha) != str(_mf_sha):
+                _pv_problem = (
+                    'power_validation manifest_sha256 does not match the '
+                    f'frozen manifest ({str(_pv_sha)[:12]}… vs '
+                    f'{str(_mf_sha)[:12]}…)')
         _pv_m = power.get('m_family')
         if _pv_problem is None and _pv_m is not None:
             try:
-                _pv_m = int(_pv_m)
-            except (TypeError, ValueError, OverflowError):
-                _pv_m = None
-            if _pv_m is not None and _pv_m != len(family):
-                _pv_problem = (f'power_validation family size {_pv_m} does '
-                               f'not match {len(family)} frozen comparisons')
-        _pv_alpha = _vt_num(power.get('alpha'))
-        if (_pv_problem is None and _pv_alpha is not None
-                and not _vt_close(_pv_alpha, alpha)):
-            _pv_problem = (f'power_validation alpha {_pv_alpha!r} does not '
-                           f'match the frozen alpha {alpha!r}')
+                _pv_m = _vt_int_arg(_pv_m, 'power_validation m_family',
+                                    minimum=1)
+            except ValueError as _mexc:
+                _pv_problem = str(_mexc)
+            else:
+                if _pv_m != len(family):
+                    _pv_problem = (
+                        f'power_validation family size {_pv_m} does not match '
+                        f'{len(family)} frozen comparisons')
+        if _pv_problem is None and power.get('alpha') is not None:
+            _pv_alpha = _vt_num(power.get('alpha'))
+            if _pv_alpha is None:
+                _pv_problem = ('power_validation alpha is not a finite '
+                               f'number: {power.get("alpha")!r}')
+            elif not _vt_close(_pv_alpha, alpha):
+                _pv_problem = (f'power_validation alpha {_pv_alpha!r} does '
+                               f'not match the frozen alpha {alpha!r}')
     if _pv_problem is not None:
         out['status'] = 'not_estimable'
         out['reason'] = _pv_problem
@@ -631,10 +765,15 @@ def replay_validation_transfer(block, manifest=None):
     """Recompute a stored transfer block from its sufficient statistics.
 
     Used by the audit gate.  A mismatch in any stored mean, interval, exact
-    p, Holm value, classification or family slot is a ``fail``: the artifact
-    can no longer support the claim that the transfer readout was computed by
-    the registered analysis.  The function does not need the raw validation or
-    test artifacts.
+    p, Holm value, classification, count, shrinkage/ratio label, per-seed PPL
+    cell or family slot is a ``fail``: the artifact can no longer support the
+    claim that the transfer readout was computed by the registered analysis.
+    The function does not need the raw validation or test artifacts; it only
+    replays the values the block itself stores.
+
+    ``manifest`` is optional.  When supplied, the declared family order and
+    each comparison's arm/endpoint binding must match it.  The function never
+    raises on malformed JSON: every structural problem is a named failure.
     """
     problems = []
     warnings = []
@@ -651,31 +790,84 @@ def replay_validation_transfer(block, manifest=None):
         problems.append('frozen_decision_changed must be false')
     if block.get('evidence_level') != 'descriptive':
         problems.append('evidence_level must be "descriptive"')
-    family = _vt_list(block.get('family'))
-    if family is None or not family or len(set(family)) != len(family):
-        problems.append('family is missing, empty or has duplicate names')
+    # The policy/role/boundary strings are the declared interpretation of the
+    # block.  A replay that ignores them lets a tampered artifact relabel a
+    # transport readout as confirmatory evidence while every number still
+    # agrees.
+    if block.get('policy') != VALIDATION_TRANSFER_POLICY:
+        problems.append('policy does not match the registered transfer policy')
+    if block.get('role') != VALIDATION_TRANSFER_POLICY['role']:
+        problems.append('role does not match the declared descriptive role')
+    if block.get('boundary') != VALIDATION_TRANSFER_POLICY['boundary']:
+        problems.append('boundary does not match the declared boundary')
+
+    raw_family = block.get('family')
+    family = _vt_names(raw_family)
+    if family is None:
+        problems.append('family is missing, empty, non-string or has '
+                        'duplicate names')
         family = []
     if block.get('family_size') != len(family):
         problems.append(f'family_size={block.get("family_size")!r}, expected '
                         f'{len(family)}')
+    family_set = set(family)
+
+    # Manifest binding: names/order plus the arm/endpoint identity of every
+    # comparison.  A stored block could otherwise replay perfectly while
+    # pointing at different arms or a different length endpoint.
+    want_by_name = {}
+    if manifest is not None:
+        if not isinstance(manifest, dict):
+            problems.append('manifest is not a JSON object')
+        else:
+            _mf_sha = manifest.get('manifest_sha256')
+            _blk_sha = block.get('manifest_sha256')
+            if _mf_sha not in (None, ''):
+                if _blk_sha in (None, ''):
+                    problems.append('block has no manifest_sha256; it cannot '
+                                    'be bound to the frozen manifest')
+                elif str(_blk_sha) != str(_mf_sha):
+                    problems.append('manifest_sha256 does not match the frozen '
+                                    'manifest')
+            raw_want = manifest.get('primary_comparisons')
+            if raw_want is not None:
+                if not isinstance(raw_want, list):
+                    problems.append('manifest primary_comparisons is not a list')
+                else:
+                    want = []
+                    for comp in raw_want:
+                        if not isinstance(comp, dict) or not isinstance(
+                                comp.get('name'), str):
+                            problems.append('manifest has a malformed primary '
+                                            'comparison')
+                            continue
+                        want.append(comp['name'])
+                        want_by_name[comp['name']] = comp
+                    if family and list(family) != want:
+                        problems.append(f'family {family} does not match the '
+                                        f'manifest comparison names {want}')
+
     comps = block.get('comparisons')
     if not isinstance(comps, dict):
         problems.append('comparisons is not an object')
         comps = {}
+    else:
+        for key in comps:
+            if key not in family_set:
+                problems.append(f'comparisons carries undeclared slot {key!r}')
+
     alpha = _vt_num(block.get('alpha'))
     if alpha is None or not (0.0 < alpha < 1.0):
-        problems.append(f'alpha is not a probability in (0,1): {block.get("alpha")!r}')
+        problems.append(f'alpha is not a probability in (0,1): '
+                        f'{block.get("alpha")!r}')
         alpha = 0.05
-    min_pairs = _vt_seed(block.get('min_pairs'))
-    if min_pairs is None or min_pairs < 2:
-        problems.append(f'min_pairs is not an integer >= 2: {block.get("min_pairs")!r}')
+    try:
+        min_pairs = _vt_int_arg(block.get('min_pairs'), 'min_pairs',
+                                minimum=2)
+    except ValueError as exc:
+        problems.append(str(exc))
         min_pairs = 2
-    if manifest is not None:
-        want = [c.get('name') for c in (manifest.get('primary_comparisons') or [])
-                if isinstance(c, dict)]
-        if family and want and list(family) != list(want):
-            problems.append(f'family {family} does not match the manifest '
-                            f'comparison names {want}')
+
     n_ok = 0
     named_p = []
     for name in family:
@@ -684,6 +876,17 @@ def replay_validation_transfer(block, manifest=None):
             problems.append(f'{name}: comparison block is missing')
             named_p.append((name, 1.0))
             continue
+        if rec.get('name') != name:
+            problems.append(f'{name}: name={rec.get("name")!r} does not '
+                            'match its family slot')
+        want_comp = want_by_name.get(name)
+        if isinstance(want_comp, dict):
+            for key in ('a', 'b', 'endpoint'):
+                if (key in want_comp
+                        and rec.get(key) != want_comp.get(key)):
+                    problems.append(
+                        f'{name}: {key}={rec.get(key)!r} does not match the '
+                        f'manifest value {want_comp.get(key)!r}')
         status = rec.get('status')
         if status == 'not_estimable':
             if not rec.get('reason'):
@@ -708,8 +911,14 @@ def replay_validation_transfer(block, manifest=None):
             problems.append(f'{name}: vector lengths differ')
             named_p.append((name, 1.0))
             continue
+        if rec.get('n') != n:
+            problems.append(f'{name}: n={rec.get("n")!r}, expected {n}')
         si = [_vt_seed(s) for s in seeds]
-        if any(s is None for s in si) or len(set(si)) != n:
+        if any(s is None for s in si):
+            problems.append(f'{name}: seeds are not integral')
+            named_p.append((name, 1.0))
+            continue
+        if len(set(si)) != n:
             problems.append(f'{name}: seeds are not unique integers')
             named_p.append((name, 1.0))
             continue
@@ -724,6 +933,55 @@ def replay_validation_transfer(block, manifest=None):
             if not _vt_close(dd[i], tt[i] - vv[i]):
                 problems.append(f'{name}: difference_per_seed[{i}] does not '
                                 'equal test - validation')
+
+        # The block stores the input PPL cells as well as the derived log
+        # ratios.  They are not needed to replay the statistics, but when
+        # present they must agree with the log ratios; otherwise the artifact
+        # mixes two different record sets (and a tampered cell would other-
+        # wise pass the audit untouched).
+        _ppl_lens = {}
+        for side, vec, logs in (
+                ('validation', (rec.get('validation_ppl_a'),
+                                rec.get('validation_ppl_b')), vv),
+                ('test', (rec.get('test_ppl_a'), rec.get('test_ppl_b')), tt)):
+            if vec[0] is None and vec[1] is None:
+                continue
+            if vec[0] is None or vec[1] is None:
+                problems.append(f'{name}: {side} PPL cell has only one arm')
+                continue
+            _pa = _vt_list(vec[0])
+            _pb = _vt_list(vec[1])
+            if _pa is None or _pb is None or len(_pa) != len(_pb):
+                problems.append(f'{name}: {side} PPL cell is not two '
+                                'equal-length vectors')
+                continue
+            _ppl_lens[side] = len(_pa)
+            _pav = [_vt_positive(x) for x in _pa]
+            _pbv = [_vt_positive(x) for x in _pb]
+            if any(x is None for x in _pav + _pbv):
+                problems.append(f'{name}: {side} PPL cell has a non-finite or '
+                                'non-positive value')
+                continue
+            # The stored PPL cell is the full side vector, while the log-ratio
+            # vectors cover only the common seeds (a missing-seed comparison
+            # has fewer paired entries than either side's full cell).  Check
+            # set membership rather than positional alignment.
+            _side_logs = [math.log(a) - math.log(b)
+                          for a, b in zip(_pav, _pbv)]
+            # The stored log values are recomputed from the same binary floats
+            # and the same operation order, so they are normally bit-identical.
+            # The set membership keeps replay linear in the seed count; the
+            # tolerance fallback only runs for a value that is not exact.
+            _side_log_set = set(_side_logs)
+            for i, value in enumerate(logs):
+                if value in _side_log_set:
+                    continue
+                if not any(_vt_close(value, x) for x in _side_logs):
+                    problems.append(
+                        f'{name}: {side} PPL cell does not reproduce stored '
+                        f'log ratio {i}')
+                    break
+
         mv = _vt_list(rec.get('missing_validation_seeds'))
         mt = _vt_list(rec.get('missing_test_seeds'))
         if mv is None or mt is None:
@@ -740,6 +998,28 @@ def replay_validation_transfer(block, manifest=None):
                 if rec.get('coverage_ok') is not (not mvi and not mti):
                     problems.append(f'{name}: coverage_ok is inconsistent '
                                     'with the named missing seeds')
+                # The stored PPL cells are the full side vectors.  A
+                # validation cell longer than the paired n means validation
+                # carried a seed the test side did not (missing_test_seeds),
+                # and symmetrically for test.  A cell cannot be shorter than
+                # the intersection.
+                if 'validation' in _ppl_lens:
+                    if _ppl_lens['validation'] < n:
+                        problems.append(f'{name}: validation PPL cell is '
+                                        'shorter than the paired seeds')
+                    elif ((_ppl_lens['validation'] > n)
+                          != bool(mti)):
+                        problems.append(
+                            f'{name}: missing_test_seeds is inconsistent with '
+                            'the validation PPL cell length')
+                if 'test' in _ppl_lens:
+                    if _ppl_lens['test'] < n:
+                        problems.append(f'{name}: test PPL cell is shorter '
+                                        'than the paired seeds')
+                    elif ((_ppl_lens['test'] > n) != bool(mvi)):
+                        problems.append(
+                            f'{name}: missing_validation_seeds is inconsistent '
+                            'with the test PPL cell length')
         if n < min_pairs:
             problems.append(f'{name}: n={n} below min_pairs={min_pairs}')
         try:
@@ -759,17 +1039,17 @@ def replay_validation_transfer(block, manifest=None):
                 ('difference_std', dstats.get('std')),
                 ('difference_cohens_dz', dstats.get('cohens_dz')),
                 ('difference_p_exact_signflip', dstats.get('p_exact_signflip'))):
-            if not _vt_close(rec.get(key), got):
+            if not _vt_same_number(rec.get(key), got):
                 problems.append(f'{name}: {key}={rec.get(key)!r}, '
                                 f'recomputed {got!r}')
         ci = _vt_list(rec.get('difference_ci95'))
         if ci is None or len(ci) != 2:
             problems.append(f'{name}: difference_ci95 is not a two-element list')
         else:
-            if not _vt_close(ci[0], dstats.get('ci95_low')):
+            if not _vt_same_number(ci[0], dstats.get('ci95_low')):
                 problems.append(f'{name}: difference_ci95[0]={ci[0]!r}, '
                                 f'recomputed {dstats.get("ci95_low")!r}')
-            if not _vt_close(ci[1], dstats.get('ci95_high')):
+            if not _vt_same_number(ci[1], dstats.get('ci95_high')):
                 problems.append(f'{name}: difference_ci95[1]={ci[1]!r}, '
                                 f'recomputed {dstats.get("ci95_high")!r}')
         ci_low = dstats.get('ci95_low')
@@ -779,37 +1059,70 @@ def replay_validation_transfer(block, manifest=None):
         if rec.get('classification') != want_cls:
             problems.append(f'{name}: classification={rec.get("classification")!r}, '
                             f'recomputed {want_cls!r}')
-        ratio = None
-        if vmean != 0.0:
-            try:
-                ratio = float(tmean / vmean)
-            except (OverflowError, ZeroDivisionError):
-                ratio = None
-            if ratio is not None and not math.isfinite(ratio):
-                ratio = None
-        if not _vt_close(rec.get('test_over_validation_ratio'), ratio):
+        want_ratio, want_shrink = _vt_ratio_and_shrinkage(vmean, tmean)
+        if not _vt_same_number(rec.get('test_over_validation_ratio'), want_ratio):
             problems.append(f'{name}: test_over_validation_ratio='
                             f'{rec.get("test_over_validation_ratio")!r}, '
-                            f'recomputed {ratio!r}')
+                            f'recomputed {want_ratio!r}')
+        if not _vt_same_number(rec.get('shrinkage_pct'), want_shrink):
+            problems.append(f'{name}: shrinkage_pct='
+                            f'{rec.get("shrinkage_pct")!r}, recomputed '
+                            f'{want_shrink!r}')
+        want_dir = _vt_direction_agreement(vmean, tmean)
+        if rec.get('direction_agreement') is not want_dir:
+            problems.append(f'{name}: direction_agreement='
+                            f'{rec.get("direction_agreement")!r}, recomputed '
+                            f'{want_dir!r}')
         if rec.get('frozen_decision_changed') is not False:
             problems.append(f'{name}: frozen_decision_changed must be false')
         if rec.get('evidence_level') != 'descriptive':
             problems.append(f'{name}: evidence_level must be "descriptive"')
         named_p.append((name, dstats.get('p_exact_signflip')))
+
     holm = holm_adjust(named_p, alpha=alpha)
     stored = block.get('holm')
     if not isinstance(stored, dict):
         problems.append('holm block is missing')
     else:
         for name, _p in named_p:
-            got = (stored.get(name) or {}).get('p_holm')
-            want = (holm.get(name) or {}).get('p_holm')
-            if want is None:
+            got = stored.get(name)
+            want = holm.get(name) or {}
+            if not isinstance(got, dict):
+                problems.append(f'{name}: holm entry is missing')
                 continue
-            if got is None or not _vt_close(got, want):
-                problems.append(f'{name}: holm p={got!r}, recomputed {want!r}')
+            if want.get('p_holm') is None:
+                continue
+            if not _vt_same_number(got.get('p_holm'), want.get('p_holm')):
+                problems.append(f'{name}: holm p={got.get("p_holm")!r}, '
+                                f'recomputed {want.get("p_holm")!r}')
+            if bool(got.get('reject')) is not bool(want.get('reject')):
+                problems.append(f'{name}: holm reject={got.get("reject")!r}, '
+                                f'recomputed {want.get("reject")!r}')
+        for key in stored:
+            if key not in family_set:
+                problems.append(f'holm carries undeclared slot {key!r}')
+    # The per-comparison cached Holm fields must agree with the recomputed
+    # family block as well, not merely with themselves.
+    for name in family:
+        rec = comps.get(name)
+        if not isinstance(rec, dict) or rec.get('status') not in (
+                'ok', 'not_estimable'):
+            continue
+        want = holm.get(name) or {}
+        if not _vt_same_number(rec.get('difference_p_holm'), want.get('p_holm')):
+            problems.append(f'{name}: difference_p_holm='
+                            f'{rec.get("difference_p_holm")!r}, recomputed '
+                            f'{want.get("p_holm")!r}')
+        if bool(rec.get('holm_reject')) is not bool(want.get('reject')):
+            problems.append(f'{name}: holm_reject={rec.get("holm_reject")!r}, '
+                            f'recomputed {want.get("reject")!r}')
+
     if block.get('n_ok') != n_ok:
         problems.append(f'n_ok={block.get("n_ok")!r}, recomputed {n_ok}')
+    if block.get('n_not_estimable') != len(family) - n_ok:
+        problems.append('n_not_estimable='
+                        f'{block.get("n_not_estimable")!r}, recomputed '
+                        f'{len(family) - n_ok}')
     want_status = ('ok' if n_ok == len(family) and family
                    else 'not_estimable' if n_ok == 0 else 'partial')
     if family and block.get('status') != want_status:
@@ -820,6 +1133,10 @@ def replay_validation_transfer(block, manifest=None):
         rec = comps.get(name) or {}
         cls = (rec.get('classification')
                if rec.get('status') == 'ok' else 'not_estimable')
+        if not isinstance(cls, str):
+            # A malformed label cannot be a dictionary key; it is already a
+            # replay failure when compared with the recomputed classification.
+            cls = 'invalid_classification'
         classes[cls] = classes.get(cls, 0) + 1
         if rec.get('coverage_ok') is False:
             n_incomplete += 1
@@ -853,9 +1170,12 @@ def replay_validation_transfer(block, manifest=None):
             if summary.get(key) != want:
                 problems.append(f'summary.{key}={summary.get(key)!r}, '
                                 f'recomputed {want}')
-        if list(summary.get('family_holm_rejections') or []) != want_reject:
+        _stored_rejections = summary.get('family_holm_rejections')
+        if not isinstance(_stored_rejections, (list, tuple)):
+            problems.append('summary.family_holm_rejections is not an array')
+        elif list(_stored_rejections) != want_reject:
             problems.append('summary.family_holm_rejections='
-                            f'{summary.get("family_holm_rejections")!r}, '
+                            f'{_stored_rejections!r}, '
                             f'recomputed {want_reject!r}')
     if n_ok < len(family) and family:
         warnings.append(f'{len(family) - n_ok}/{len(family)} comparisons have '
