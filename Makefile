@@ -36,6 +36,9 @@ help:
 	@echo "make install-check # verify the project builds/installs as a wheel"
 	@echo "make build         # sdist + wheel via python -m build"
 	@echo "make clean         # remove packaging scratch space"
+	@echo ""
+	@echo "reproducibility targets:"
+	@echo "make part-hash       # print the _PARTS list SHA-256 hash"
 
 test:
 	$(PYTHON) test_review_fixes.py
@@ -123,3 +126,6 @@ build:
 
 clean:
 	rm -rf "$(BUILD_DIR)" *.egg-info
+
+part-hash:
+	@$(PYTHON) -c "from explib import part_list_hash; print(part_list_hash())"

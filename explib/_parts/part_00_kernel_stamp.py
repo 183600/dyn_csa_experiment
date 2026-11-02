@@ -133,7 +133,7 @@ def _kernel_stamp():
     except Exception:
         return ''
 
-def _eager_batch_active(device=None, batch_size=None):
+def _eager_batch_active(device=None, batch_size=None) -> bool:
     """True when the batched reference twin should be used.
 
     On CUDA with the kernel module available, the batched twin is the default
@@ -167,7 +167,7 @@ def _eager_batch_active(device=None, batch_size=None):
         return False
     return True
 
-def _uses_batched_eager(cfgs, device=None, batch_size=None):
+def _uses_batched_eager(cfgs, device=None, batch_size=None) -> bool:
     """Whether at least one layer in ``cfgs`` will take the batched twin.
 
     Mirrors the condition in ``HybridAttention.forward`` so a record can state
@@ -189,7 +189,7 @@ def _uses_batched_eager(cfgs, device=None, batch_size=None):
         for c in cfgs
     )
 
-def code_stamp():
+def code_stamp() -> str:
     """当前代码+内核模式写进每条记录的 `_code` 戳（eager = CODE_SEMANTICS
     本身；内核模式追加变体后缀）。一切「记录是否当前」
     的判定（result_is_current 的 code 实参、`_cs...` 后缀匹配）都必须以

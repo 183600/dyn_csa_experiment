@@ -5,9 +5,65 @@ which reproduces the historical single-file body while keeping each fragment
 reviewable.  Later fragments may use names defined by earlier ones, so append a
 new part (or insert a self-contained one) and keep the list in execution order.
 ``exp_lib.py`` re-exports this module for the historical import path.
+
+Provenance: the hash of this part list binds the exact fragment set used for
+every record.  Two runs with different part lists are different numerical
+stacks (per env_fp_v3 policy).
 """
 
 from _split_loader import load_root_package
+
+import hashlib
+import os
+import pathlib
+
+_PARTS_HASH = None
+_PARTS_VALIDATED = False
+
+
+def _validate_parts_parts():
+    """Validate that every part in _PARTS exists inside the package's _parts/.
+
+    Returns the canonical part-list hash, or raises ImportError on failure.
+    """
+    global _PARTS_HASH, _PARTS_VALIDATED
+    if _PARTS_VALIDATED:
+        return _PARTS_HASH
+
+    # Use __path__[0] because __file__ may point to the shim (exp_lib.py),
+    # not the explib/ package directory.
+    fragment_dir = pathlib.Path(__path__[0]) / '_parts'
+    if not fragment_dir.is_dir():
+        raise ImportError(f'_parts/ directory not found at {fragment_dir}')
+
+    part_set = set(_PARTS)
+    missing = []
+    for part in _PARTS:
+        p = fragment_dir / part
+        if not p.is_file():
+            missing.append(part)
+
+    if missing:
+        raise ImportError(
+            f'Missing _parts/ entries: {missing}.  '
+            'Add the new part to _PARTS in the correct order, or create the file.')
+
+    canonical = json.dumps(sorted(_PARTS), sort_keys=True, separators=(',', ':'))
+    _PARTS_HASH = hashlib.sha256(canonical.encode('utf-8')).hexdigest()
+    _PARTS_VALIDATED = True
+    return _PARTS_HASH
+
+
+def part_list_hash():
+    """Return the SHA-256 hash of the canonical _PARTS list.
+
+    This binds the exact fragment set used in every run.  Records that carry
+    a different part-list hash have been generated with a different measurement
+    library configuration and are not directly comparable.
+    """
+    _validate_parts_parts()
+    return _PARTS_HASH
+
 
 _PARTS = [
 'part_00_kernel_stamp.py',
