@@ -76,6 +76,44 @@ _AR_FORBIDDEN_KEYS = frozenset({
 })
 _AR_INPUT_KEYS = ('cells', 'components', 'alpha', 'min_n', 'primary_scale',
                   'scales', 'max_components')
+
+
+def _arb_repr(value, *, limit=120):
+    """Short, exception-safe repr for diagnostics on untrusted values.
+
+    Python 3.12 refuses to stringify an integer with more than ~4300 digits.
+    Formatting such an integer inside a validation error would replace the
+    intended ``ValueError``/failure record with a second
+    ``ValueError: Exceeds the limit ...``, turning a reported tamper into an
+    uncaught crash.
+    """
+    try:
+        text = repr(value)
+    except Exception:
+        return f'<unrepresentable {type(value).__name__}>'
+    return text if len(text) <= limit else text[:limit - 3] + '...'
+
+
+def _arb_p_floor(n_seeds):
+    """Exact two-sided sign-flip floor ``2 / 2**n`` without int->float blowup.
+
+    ``1 << n`` followed by true division raises ``OverflowError`` once n is
+    above the float exponent range (n > 1023), even though the mathematical
+    floor is simply 0.0.  The panel can legitimately grow to that many seeds
+    when the same complete lattice is replayed at a larger scale, so compute
+    the value directly in the float exponent domain.
+    """
+    n = int(n_seeds)
+    if n <= 0:
+        return None
+    try:
+        return _arb_math.ldexp(2.0, -n)
+    except OverflowError:
+        # ``len()`` cannot practically reach this, but an arbitrarily large
+        # exponent must still mean "below the smallest representable float".
+        return 0.0
+
+
 def _arb_number(value, *, where, positive=False):
     """Finite JSON number for an analysis input; bool/None/str fail closed."""
     if hasattr(value, 'item') and not isinstance(value, (int, float)):
@@ -84,41 +122,64 @@ def _arb_number(value, *, where, positive=False):
         except Exception:
             pass
     if isinstance(value, (bool, bytes, bytearray, str)) or value is None:
-        raise ValueError(f'{where}: expected a finite number, got {value!r}')
+        raise ValueError(
+            f'{where}: expected a finite number, got {_arb_repr(value)}')
     try:
         out = float(value)
     except (TypeError, ValueError, OverflowError):
         raise ValueError(
-            f'{where}: expected a finite number, got {value!r}') from None
+            f'{where}: expected a finite number, got {_arb_repr(value)}'
+        ) from None
     if not _arb_math.isfinite(out):
-        raise ValueError(f'{where}: expected a finite number, got {value!r}')
+        raise ValueError(
+            f'{where}: expected a finite number, got {_arb_repr(value)}')
     if positive and out <= 0.0:
-        raise ValueError(f'{where}: expected a positive value, got {value!r}')
+        raise ValueError(
+            f'{where}: expected a positive value, got {_arb_repr(value)}')
     return out
 
 
 def _arb_int(value, *, where, minimum=None, maximum=None):
     if isinstance(value, bool):
-        raise ValueError(f'{where}: expected an integer, got {value!r}')
+        raise ValueError(
+            f'{where}: expected an integer, got {_arb_repr(value)}')
     try:
         out = int(value)
     except (TypeError, ValueError, OverflowError):
-        raise ValueError(f'{where}: expected an integer, got {value!r}') from None
+        raise ValueError(
+            f'{where}: expected an integer, got {_arb_repr(value)}'
+        ) from None
     try:
         if value != out:
-            raise ValueError(f'{where}: expected an integer, got {value!r}')
+            raise ValueError(
+                f'{where}: expected an integer, got {_arb_repr(value)}')
     except (TypeError, ValueError, OverflowError):
-        raise ValueError(f'{where}: expected an integer, got {value!r}') from None
+        raise ValueError(
+            f'{where}: expected an integer, got {_arb_repr(value)}'
+        ) from None
+    try:
+        # An integer that Python 3.12 cannot stringify cannot be written as a
+        # JSON number (the writer uses ``allow_nan=False`` and the default
+        # digit limit).  Reject it at the input boundary with a clear error
+        # instead of failing later while hashing/writing the artifact.  A
+        # merely large but representable value (e.g. 10**400) stays valid.
+        str(out)
+    except (ValueError, MemoryError):
+        raise ValueError(
+            f'{where}: integer is too large to represent as JSON') from None
     if minimum is not None and out < minimum:
-        raise ValueError(f'{where}: expected >= {minimum}, got {value!r}')
+        raise ValueError(
+            f'{where}: expected >= {minimum}, got {_arb_repr(value)}')
     if maximum is not None and out > maximum:
-        raise ValueError(f'{where}: expected <= {maximum}, got {value!r}')
+        raise ValueError(
+            f'{where}: expected <= {maximum}, got {_arb_repr(value)}')
     return out
 
 
 def _arb_scale(value, *, where='scale'):
     if not isinstance(value, str) or value not in _AR_SCALES:
-        raise ValueError(f'{where} must be one of {_AR_SCALES}, got {value!r}')
+        raise ValueError(
+            f'{where} must be one of {_AR_SCALES}, got {_arb_repr(value)}')
     return value
 
 
@@ -142,15 +203,31 @@ def _arb_scales(value, *, primary):
 
 
 def _arb_forbidden_payload(obj):
+    """Collect forbidden decision fields anywhere in an untrusted payload.
+
+    Iterative (rather than recursive) so a deeply nested or self-referential
+    artifact is reported as a tamper instead of raising ``RecursionError``
+    before validation can return a failure object.  A ``seen`` set also keeps
+    a cyclic in-memory mapping from looping forever.
+    """
     found = []
-    if isinstance(obj, dict):
-        for key, value in obj.items():
-            if isinstance(key, str) and key in _AR_FORBIDDEN_KEYS:
-                found.append(key)
-            found.extend(_arb_forbidden_payload(value))
-    elif isinstance(obj, (list, tuple)):
-        for value in obj:
-            found.extend(_arb_forbidden_payload(value))
+    stack = [obj]
+    seen = set()
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, dict):
+            if id(cur) in seen:
+                continue
+            seen.add(id(cur))
+            for key, value in cur.items():
+                if isinstance(key, str) and key in _AR_FORBIDDEN_KEYS:
+                    found.append(key)
+                stack.append(value)
+        elif isinstance(cur, (list, tuple)):
+            if id(cur) in seen:
+                continue
+            seen.add(id(cur))
+            stack.extend(cur)
     return found
 
 
@@ -498,14 +575,15 @@ def ablation_ranking(cells, *, components=None, alpha=0.05, min_n=3,
     """
     alpha = _arb_number(alpha, where='alpha')
     if not (0.0 < alpha < 1.0):
-        raise ValueError(f'alpha must be in (0, 1), got {alpha!r}')
+        raise ValueError(f'alpha must be in (0, 1), got {_arb_repr(alpha)}')
     min_n = _arb_int(min_n, where='min_n', minimum=0)
     max_components = min(
         _arb_int(max_components, where='max_components', minimum=1),
         AR_MAX_COMPONENTS)
     tolerance = _arb_number(tolerance, where='tolerance')
     if tolerance < 0.0:
-        raise ValueError(f'tolerance must be non-negative, got {tolerance!r}')
+        raise ValueError(
+            f'tolerance must be non-negative, got {_arb_repr(tolerance)}')
     primary_scale = _arb_scale(primary_scale, where='primary_scale')
     scales = _arb_scales(scales, primary=primary_scale)
     lat = shapley_lattice_attribution(  # noqa: F821 (part_73)
@@ -526,7 +604,7 @@ def ablation_ranking(cells, *, components=None, alpha=0.05, min_n=3,
         'max_components': int(max_components),
         'primary_scale': primary_scale,
         'scales': list(scales),
-        'p_floor': (2.0 / (1 << len(seeds)) if len(seeds) > 0 else None),
+        'p_floor': _arb_p_floor(len(seeds)),
         'resolution_limited': None,
         'status': 'not_estimable',
         'warnings': list(lat.get('warnings') or []),
@@ -558,7 +636,7 @@ def ablation_ranking(cells, *, components=None, alpha=0.05, min_n=3,
         base['status'] = 'not_estimable'
         base['problems'].append(
             f'{len(seeds)} common seed(s) are below the ranking floor '
-            f'max(2, min_n)={max(2, int(min_n))}')
+            f'max(2, min_n)={_arb_repr(max(2, int(min_n)))}')
         return base
     # Rebuild the per-seed Shapley vectors from the same normalized cells.
     # Log and raw values are computed from the identical PPL measurements, so
@@ -596,7 +674,7 @@ def ablation_ranking(cells, *, components=None, alpha=0.05, min_n=3,
                     f'{c}: log Shapley vector disagrees with the canonical '
                     'lattice replay')
                 return base
-    p_floor = 2.0 / (1 << len(seeds))
+    p_floor = _arb_p_floor(len(seeds))
     base['p_floor'] = p_floor
     base['resolution_limited'] = bool(p_floor > alpha)
     if base['resolution_limited']:
@@ -682,7 +760,8 @@ def ablation_ranking_from_lattice(lattice, *, primary_scale='log_ppl',
     comps = list(inputs.get('components') or [])
     raw_scale = inputs.get('scale')
     if raw_scale not in ('ppl', 'log_ppl'):
-        raise ValueError(f'lattice inputs.scale={raw_scale!r} is not recognised')
+        raise ValueError(
+            f'lattice inputs.scale={_arb_repr(raw_scale)} is not recognised')
     cells = _al_cells_from_records(  # noqa: F821
         inputs.get('cells'), comps, scale=raw_scale)
     if raw_scale == 'log_ppl':
@@ -691,10 +770,18 @@ def ablation_ranking_from_lattice(lattice, *, primary_scale='log_ppl',
             converted[subset] = {}
             for seed, value in per.items():
                 try:
-                    converted[subset][seed] = _arb_math.exp(value)
+                    ppl = _arb_math.exp(value)
                 except OverflowError:
                     raise ValueError(
                         'lattice log-PPL cell overflows when converted to PPL')
+                if ppl == 0.0:
+                    # Underflow is a lost measurement, not a PPL of zero; the
+                    # downstream positive-PPL contract would reject it with a
+                    # less specific error.  Name the conversion failure.
+                    raise ValueError(
+                        'lattice log-PPL cell underflows when converted to '
+                        'PPL')
+                converted[subset][seed] = ppl
         cells = converted
     return ablation_ranking(
         cells, components=comps,
@@ -762,10 +849,12 @@ def validate_ablation_ranking(artifact):
         return out
     if artifact.get('kind') != AR_KIND:
         out['problems'].append(
-            f'artifact.kind must be {AR_KIND!r}, got {artifact.get("kind")!r}')
+            f'artifact.kind must be {AR_KIND!r}, got '
+            f'{_arb_repr(artifact.get("kind"))}')
     if artifact.get('schema') != AR_SCHEMA:
         out['problems'].append(
-            f'artifact.schema must be {AR_SCHEMA}, got {artifact.get("schema")!r}')
+            f'artifact.schema must be {AR_SCHEMA}, got '
+            f'{_arb_repr(artifact.get("schema"))}')
     if artifact.get('policy') != AR_POLICY:
         out['problems'].append(
             'artifact.policy does not match this implementation')
@@ -775,13 +864,18 @@ def validate_ablation_ranking(artifact):
             'artifact carries frozen-decision field(s): ' + ', '.join(stolen))
     allowed = {'kind', 'schema', 'policy', 'created_at', 'inputs', 'result',
                'content_sha256'}
-    extra = sorted(set(artifact) - allowed)
+    # An untrusted artifact can carry non-string keys.  Sorting mixed key
+    # types raises TypeError and repr(huge_int) raises on Python 3.12's
+    # digit limit; rank/format by the bounded repr instead.
+    extra = sorted(set(artifact) - allowed, key=_arb_repr)
     if extra:
         out['problems'].append(
             'artifact carries field(s) outside the replay schema: '
-            + ', '.join(str(k) for k in extra))
+            + ', '.join(_arb_repr(k) for k in extra))
     recorded = artifact.get('content_sha256')
-    out['content_sha256'] = recorded if isinstance(recorded, str) else None
+    out['content_sha256'] = (recorded
+                             if isinstance(recorded, str)
+                             and len(recorded) == 64 else None)
     if not isinstance(recorded, str) or len(recorded) != 64:
         out['problems'].append(
             'content_sha256 is missing or not a 64-character digest')
@@ -799,12 +893,12 @@ def validate_ablation_ranking(artifact):
     if not isinstance(inputs, dict):
         out['problems'].append('artifact.inputs must be an object')
         return out
-    extra_inputs = sorted(set(inputs) - set(_AR_INPUT_KEYS))
+    extra_inputs = sorted(set(inputs) - set(_AR_INPUT_KEYS), key=_arb_repr)
     missing_inputs = sorted(set(_AR_INPUT_KEYS) - set(inputs))
     if extra_inputs:
         out['problems'].append(
             'artifact.inputs carries field(s) outside the schema: '
-            + ', '.join(str(k) for k in extra_inputs))
+            + ', '.join(_arb_repr(k) for k in extra_inputs))
     if missing_inputs:
         out['problems'].append(
             f'artifact.inputs is missing required key(s): {missing_inputs}')
@@ -829,12 +923,23 @@ def validate_ablation_ranking(artifact):
     if not isinstance(stored, dict):
         out['problems'].append('artifact.result must be an object')
         return out
-    if not _al_equiv(stored, replay):  # noqa: F821 (part_73)
+    try:
+        same = _al_equiv(stored, replay)  # noqa: F821 (part_73)
+    except RecursionError:
+        out['problems'].append(
+            'artifact.result nesting is too deep to replay')
+        return out
+    if not same:
         out['problems'].append(
             'artifact.result does not replay from its recorded cells')
-        for key in sorted(set(stored) | set(replay)):
-            if not _al_equiv(stored.get(key), replay.get(key)):
-                out['problems'].append(f'result.{key} differs from the replay')
+        for key in sorted(set(stored) | set(replay), key=_arb_repr):
+            try:
+                same_key = _al_equiv(stored.get(key), replay.get(key))
+            except RecursionError:
+                same_key = False
+            if not same_key:
+                out['problems'].append(
+                    f'result.{_arb_repr(key)} differs from the replay')
     if out['problems']:
         out['status'] = 'fail'
     else:
@@ -878,10 +983,25 @@ def write_ablation_ranking(outdir, artifact, *, overwrite=False):
             return out
     _arb_os.makedirs(outdir, exist_ok=True)
     tmp = path + '.tmp'
-    with open(tmp, 'w', encoding='utf-8') as fh:
-        _arb_json.dump(artifact, fh, ensure_ascii=False, indent=1,
-                      allow_nan=False)
-        fh.write('\n')
+    try:
+        with open(tmp, 'w', encoding='utf-8') as fh:
+            _arb_json.dump(artifact, fh, ensure_ascii=False, indent=1,
+                           allow_nan=False)
+            fh.write('\n')
+    except Exception as exc:
+        # Provenance fields such as ``created_at`` are intentionally not part
+        # of the content hash, so a caller can hand in a value that survives
+        # validation but cannot be serialised (e.g. a huge integer).  Report
+        # that as a failed write instead of leaving a partial tmp file and
+        # raising after the validation step already said ``ok``.
+        try:
+            _arb_os.remove(tmp)
+        except OSError:
+            pass
+        out['status'] = 'fail'
+        out['problems'].append(
+            f'artifact cannot be serialised: {type(exc).__name__}: {exc}')
+        return out
     _arb_os.replace(tmp, path)
     out['written'] = True
     return out

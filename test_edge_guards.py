@@ -136,3 +136,83 @@ def test_frontier_cap_accepts_an_arbitrary_precision_max_points():
         max_points=10 ** 400)
     assert out['status'] == 'ok', out['problems']
     assert len(out['points']) <= len(cells)
+
+
+def _ablation_cells(seeds, comps=('a', 'b')):
+    import itertools
+    out = {}
+    effects = {'a': -0.6, 'b': -0.3}
+    for size in range(len(comps) + 1):
+        for combo in itertools.combinations(comps, size):
+            out[frozenset(combo)] = {
+                seed: math.exp(3.0 + sum(effects[c] for c in combo))
+                for seed in seeds}
+    return out
+
+
+def test_ablation_ranking_floor_does_not_overflow_at_scale():
+    # 2 / 2**1100 cannot be evaluated as 2.0 / (1 << n): converting the
+    # 1100-bit integer denominator to float raises OverflowError.  The floor
+    # is mathematically 0.0 at this scale and must not abort the ranking.
+    cells = _ablation_cells(range(1100))
+    out = L.ablation_ranking(cells, components=['a', 'b'],
+                             scales=('log_ppl',))
+    assert out['status'] in ('ok', 'warnings'), out['problems']
+    assert out['p_floor'] == 0.0
+    import json
+    json.dumps(out, allow_nan=False)
+
+
+def test_ablation_ranking_large_seed_label_replays():
+    import copy
+    huge = 10 ** 400
+    arts = L.build_ablation_ranking(
+        _ablation_cells([huge, 0, 1]), components=['a', 'b'])
+    assert L.validate_ablation_ranking(arts)['status'] == 'ok'
+    assert L.validate_ablation_ranking(copy.deepcopy(arts))['status'] == 'ok'
+
+
+def test_ablation_ranking_huge_tamper_is_reported_not_a_crash():
+    import copy
+    import json
+    art = L.build_ablation_ranking(_ablation_cells(range(4)),
+                                   components=['a', 'b'])
+    for path in (('kind',), ('schema',), ('inputs', 'min_n'),
+                 ('inputs', 'max_components'), ('result', 'n_seeds'),
+                 ('result', 'p_floor')):
+        bad = copy.deepcopy(art)
+        node = bad
+        for key in path[:-1]:
+            node = node[key]
+        node[path[-1]] = 10 ** 10000
+        verdict = L.validate_ablation_ranking(bad)
+        assert verdict['status'] == 'fail', (path, verdict)
+        assert verdict['problems'], (path, verdict)
+        # Formatting the diagnostic must not hit the integer-digit limit.
+        json.dumps(verdict, allow_nan=False)
+    # Mixed non-string keys must be sorted/formatted through a bounded repr,
+    # not by comparing int with str or by calling repr(10**10000).
+    for where in ('top', 'inputs', 'result'):
+        bad = copy.deepcopy(art)
+        if where == 'top':
+            bad[10 ** 10000] = 1
+        elif where == 'inputs':
+            bad['inputs'][10 ** 10000] = 1
+        else:
+            bad['result'][10 ** 10000] = 1
+        verdict = L.validate_ablation_ranking(bad)
+        assert verdict['status'] == 'fail', (where, verdict)
+        json.dumps(verdict, allow_nan=False)
+
+
+def test_ablation_lattice_huge_status_is_reported_not_a_crash():
+    import copy
+    import json
+    art = L.build_ablation_lattice(_ablation_cells(range(3)),
+                                   components=['a', 'b'], scale='ppl')
+    bad = copy.deepcopy(art)
+    bad['status'] = 10 ** 10000
+    verdict = L.validate_ablation_lattice(bad)
+    assert verdict['status'] == 'fail', verdict
+    assert verdict['problems'], verdict
+    json.dumps(verdict, allow_nan=False)

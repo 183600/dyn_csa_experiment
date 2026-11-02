@@ -64,46 +64,95 @@ AL_LATTICE_POLICY = {
 }
 
 
+def _al_repr(value, *, limit=120):
+    """Short, exception-safe repr for diagnostics on untrusted values.
+
+    ``repr(10**10000)`` raises on Python 3.12's integer-digit limit and would
+    replace a validation failure with an uncaught exception.
+    """
+    try:
+        text = repr(value)
+    except Exception:
+        return f'<unrepresentable {type(value).__name__}>'
+    return text if len(text) <= limit else text[:limit - 3] + '...'
+
+
 def _al_finite(value, *, where, positive=False):
     """Finite number for an analysis input; no strings/bools/NaN/Inf."""
     if isinstance(value, (bool,)):
-        raise ValueError(f'{where}: expected a finite number, got {value!r}')
+        raise ValueError(
+            f'{where}: expected a finite number, got {_al_repr(value)}')
     try:
         if hasattr(value, 'item') and not isinstance(value, (int, float)):
             value = value.item()
     except Exception:
         pass
     if isinstance(value, (str, bytes, bytearray)) or value is None:
-        raise ValueError(f'{where}: expected a finite number, got {value!r}')
+        raise ValueError(
+            f'{where}: expected a finite number, got {_al_repr(value)}')
     try:
         out = float(value)
     except (TypeError, ValueError, OverflowError):
         raise ValueError(
-            f'{where}: expected a finite number, got {value!r}') from None
+            f'{where}: expected a finite number, got {_al_repr(value)}'
+        ) from None
     if not _al_math.isfinite(out):
-        raise ValueError(f'{where}: expected a finite number, got {value!r}')
+        raise ValueError(
+            f'{where}: expected a finite number, got {_al_repr(value)}')
     if positive and out <= 0.0:
         raise ValueError(
-            f'{where}: expected a positive PPL, got {value!r}')
+            f'{where}: expected a positive PPL, got {_al_repr(value)}')
     return out
 
 
 def _al_int(value, *, where, minimum=None):
     if isinstance(value, bool):
-        raise ValueError(f'{where}: expected an integer, got {value!r}')
+        raise ValueError(
+            f'{where}: expected an integer, got {_al_repr(value)}')
     try:
         out = int(value)
     except (TypeError, ValueError, OverflowError):
-        raise ValueError(f'{where}: expected an integer, got {value!r}') from None
+        raise ValueError(
+            f'{where}: expected an integer, got {_al_repr(value)}') from None
     try:
         if value != out:
-            raise ValueError(f'{where}: expected an integer, got {value!r}')
+            raise ValueError(
+                f'{where}: expected an integer, got {_al_repr(value)}')
     except (TypeError, ValueError, OverflowError):
-        raise ValueError(f'{where}: expected an integer, got {value!r}') from None
+        raise ValueError(
+            f'{where}: expected an integer, got {_al_repr(value)}') from None
+    try:
+        # A count that cannot be stringified cannot be written as a JSON
+        # number.  Reject it at the input boundary; large representable
+        # values (e.g. 10**400) remain valid.
+        str(out)
+    except (ValueError, MemoryError):
+        raise ValueError(
+            f'{where}: integer is too large to represent as JSON') from None
     if minimum is not None and out < minimum:
         raise ValueError(
-            f'{where}: expected an integer >= {minimum}, got {value!r}')
+            f'{where}: expected an integer >= {minimum}, got {_al_repr(value)}')
     return out
+
+
+def _al_seed(value, *, where):
+    """Normalise a seed id that must survive an artifact JSON round-trip.
+
+    Seed ids are stored as JSON object keys (``str(seed)``).  A large exact
+    label such as ``10**400`` is valid; only an integer Python 3.12 refuses to
+    stringify (beyond the digit limit) is rejected here, before it can crash
+    the writer/replay path.
+    """
+    seed = _as_seed_int(value)  # noqa: F821 (part_13)
+    if seed is None:
+        raise ValueError(f'{where}: seed {_al_repr(value)} is not an integer')
+    try:
+        str(seed)
+    except (ValueError, MemoryError):
+        raise ValueError(
+            f'{where}: seed {_al_repr(value)} is too large to represent as '
+            'a JSON key') from None
+    return seed
 
 
 def _al_component(value, *, where):
@@ -187,15 +236,13 @@ def _al_normalise_cells(cells, components, *, scale):
                 f'{type(per_seed).__name__}')
         vals = {}
         for seed_key, val in per_seed.items():
-            seed = _as_seed_int(seed_key)  # noqa: F821 (part_13)
-            if seed is None:
-                raise ValueError(
-                    f'cells[{key!r}]: seed key {seed_key!r} is not an integer')
+            seed = _al_seed(seed_key, where=f'cells[{_al_repr(key)}]')
             if seed in vals:
                 raise ValueError(
-                    f'cells[{key!r}]: duplicate seed {seed!r} after normalisation')
+                    f'cells[{_al_repr(key)}]: duplicate seed '
+                    f'{_al_repr(seed)} after normalisation')
             vals[seed] = _al_finite(
-                val, where=f'cells[{key!r}][seed={seed}]',
+                val, where=f'cells[{_al_repr(key)}][seed={seed}]',
                 positive=(scale == 'ppl'))
         norm[subset] = vals
     return norm
@@ -362,13 +409,10 @@ def _al_cells_from_records(records, components, *, scale):
             raise ValueError(f'inputs.cells: duplicate subset {sorted(key)!r}')
         vals = {}
         for seed_key, val in per_seed.items():
-            seed = _as_seed_int(seed_key)  # noqa: F821 (part_13)
-            if seed is None:
-                raise ValueError(
-                    f'inputs.cells[{i}]: seed {seed_key!r} is not an integer')
+            seed = _al_seed(seed_key, where=f'inputs.cells[{i}]')
             if seed in vals:
                 raise ValueError(
-                    f'inputs.cells[{i}]: duplicate seed {seed!r}')
+                    f'inputs.cells[{i}]: duplicate seed {_al_repr(seed)}')
             vals[seed] = _al_finite(
                 val, where=f'inputs.cells[{i}][seed={seed}]',
                 positive=(scale == 'ppl'))
@@ -400,7 +444,8 @@ def shapley_lattice_attribution(
         raise ValueError("scale must be 'ppl' or 'log_ppl'")
     _alpha = _al_finite(alpha, where='alpha')
     if not (0.0 < _alpha < 1.0):
-        raise ValueError(f'alpha must be in (0, 1), got {alpha!r}')
+        raise ValueError(
+            f'alpha must be in (0, 1), got {_al_repr(alpha)}')
     _min_n = _al_int(min_n, where='min_n', minimum=0)
     # ``max_components`` is a caller preview of the cap, not a way to disable
     # it: the exact lattice materialises 2**k subsets, so a caller-supplied
@@ -409,7 +454,8 @@ def shapley_lattice_attribution(
                  AL_LATTICE_MAX_COMPONENTS)
     _tol = _al_finite(tol, where='tol')
     if _tol < 0.0:
-        raise ValueError(f'tol must be non-negative, got {tol!r}')
+        raise ValueError(
+            f'tol must be non-negative, got {_al_repr(tol)}')
     if isinstance(components, (list, tuple)) and len(components) == 0:
         # An empty component list is a degenerately small lattice, not a type
         # error: report not_estimable so a stored empty artifact can replay.
@@ -528,7 +574,7 @@ def shapley_lattice_attribution(
     elif len(common) < _min_n:
         base['problems'].append(
             f'only {len(common)} common seed(s) across all cells; '
-            f'min_n={_min_n} is required')
+            f'min_n={_al_repr(_min_n)} is required')
     if missing_by_cell and common:
         base['warnings'].append(
             'cell(s) are missing some seeds; the effects are computed on the '
@@ -900,7 +946,8 @@ def validate_ablation_lattice(artifact):
     if artifact.get('status') not in ('ok', 'warnings', 'not_estimable',
                                       'fail'):
         out['problems'].append(
-            f"artifact.status={artifact.get('status')!r} is not recognised")
+            'artifact.status='
+            f'{_al_repr(artifact.get("status"))} is not recognised')
     if artifact.get('policy') != AL_LATTICE_POLICY:
         out['problems'].append(
             'artifact.policy does not match this implementation')
@@ -962,8 +1009,9 @@ def validate_ablation_lattice(artifact):
                 f'artifact.{key} does not replay from its recorded cells')
     if artifact.get('status') != replay.get('status'):
         out['problems'].append(
-            f"artifact.status={artifact.get('status')!r} does not match "
-            f"the replayed status={replay.get('status')!r}")
+            'artifact.status='
+            f'{_al_repr(artifact.get("status"))} does not match '
+            f'the replayed status={_al_repr(replay.get("status"))}')
     if not _al_equiv(artifact.get('problems'), replay.get('problems'),
                      tol=0.0):
         out['problems'].append('artifact.problems does not replay')
@@ -1008,10 +1056,23 @@ def write_ablation_lattice(outdir, artifact, *, overwrite=False):
             return out
     _al_os.makedirs(outdir, exist_ok=True)
     tmp = path + '.tmp'
-    with open(tmp, 'w', encoding='utf-8') as fh:
-        _al_json.dump(artifact, fh, ensure_ascii=False, indent=1,
-                      allow_nan=False)
-        fh.write('\n')
+    try:
+        with open(tmp, 'w', encoding='utf-8') as fh:
+            _al_json.dump(artifact, fh, ensure_ascii=False, indent=1,
+                          allow_nan=False)
+            fh.write('\n')
+    except Exception as exc:
+        # ``created_at`` is provenance outside the content hash, so validation
+        # can say ok for a value that strict JSON cannot serialise.  Report a
+        # failed write and remove the partial tmp file instead of escaping.
+        try:
+            _al_os.remove(tmp)
+        except OSError:
+            pass
+        out['status'] = 'fail'
+        out['problems'].append(
+            f'artifact cannot be serialised: {type(exc).__name__}: {exc}')
+        return out
     _al_os.replace(tmp, path)
     out['written'] = True
     return out
