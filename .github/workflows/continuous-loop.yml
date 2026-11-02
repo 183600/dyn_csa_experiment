@@ -276,7 +276,7 @@ jobs:
       - name: Run AI harness for ~3 hours (phases per iteration)
         timeout-minutes: 180
         env:
-          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
           OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
         run: |
           set +e
@@ -455,33 +455,28 @@ jobs:
           smoke_test() {
             local m="$1" extra=""
             case "$m" in "$FREE_MODEL") [ -n "$VARIANT" ] && extra="--variant $VARIANT" ;; esac
+            # NVIDIA 重度推理模型给足冒烟时间；免费池快速失败（网关挂起时省时）
+            local st=90; case "$m" in nvidia/*) st=300 ;; esac
             # shellcheck disable=SC2086
-            timeout --kill-after=30 120 opencode run -m "$m" $extra "只回复两个字：OK" > /tmp/smoke_test.log 2>&1
+            timeout --kill-after=30 $st opencode run -m "$m" $extra "只回复两个字：OK" > /tmp/smoke_test.log 2>&1
           }
 
           detect_provider() {
             local pass cand model
             for pass in 1 2; do
-              # 兜底第一优先级：DeepSeek 官方 API（经 opencode 的 openai-compatible provider）
-              if ! is_broken deepseek && [ -n "${DEEPSEEK_API_KEY:-}" ] && probe_deepseek; then
-                switch_provider deepseek
-                if smoke_test "deepseek/$DEEPSEEK_MODEL"; then
-                  SELECTED_MODEL="deepseek/$DEEPSEEK_MODEL"
-                  SELECTED_PROVIDER="deepseek"
-                  SELECTED_VARIANT=""
-                  CURRENT_MODEL="$SELECTED_MODEL"
-                  CURRENT_PROVIDER="$SELECTED_PROVIDER"
-                  export SELECTED_MODEL SELECTED_PROVIDER SELECTED_VARIANT CURRENT_MODEL CURRENT_PROVIDER
-                  echo "[provider] 选定 $SELECTED_MODEL（DeepSeek 官方 API，opencode 兜底），本次 run 内固定使用，不再逐阶段探测"
-                  return 0
-                fi
-                echo "[warn] deepseek/$DEEPSEEK_MODEL 冒烟测试失败/超时，换下一个候选"
-                mark_broken deepseek
-              fi
-              # Zen 免费池：deepseek-v4.1-flash-free → big-pickle
-              for cand in free pickle; do
+              # 主力：NVIDIA NIM API（opencode 内置 provider，鉴权走 NVIDIA_API_KEY）。
+              # 模型链（指定顺序）：deepseek-v4.1-flash → glm-5.3-flash → glm-5.3
+              #   → minimax-m3.1-flash → step-5-preview；其后 Zen 免费池兜底
+              #   （免费池 2026-11-01 起对 runner 大面积挂起，恢复后仍可被选中）。
+              # 不再使用 DeepSeek 官方 API。
+              for cand in nv-ds nv-glm nv-glm2 nv-mmx nv-step free pickle; do
                 is_broken "$cand" && continue
                 case "$cand" in
+                  nv-ds)   model="nvidia/deepseek-ai/deepseek-v4.1-flash" ;;
+                  nv-glm)  model="nvidia/z-ai/glm-5.3-flash" ;;
+                  nv-glm2) model="nvidia/z-ai/glm-5.3" ;;
+                  nv-mmx)  model="nvidia/minimaxai/minimax-m3.1-flash" ;;
+                  nv-step) model="nvidia/stepfun-ai/step-5-preview" ;;
                   free)   model="$FREE_MODEL" ;;
                   pickle) model="$PICKLE_MODEL" ;;
                 esac
@@ -537,11 +532,16 @@ jobs:
             CURRENT_MODEL=""
             CURRENT_PROVIDER=""
             export HARNESS SELECTED_MODEL SELECTED_PROVIDER SELECTED_VARIANT CURRENT_MODEL CURRENT_PROVIDER
-            echo "[warn] dsh 不可用，切换到 opencode 兜底（官方 API → Zen 免费池）"
+            echo "[info] 使用 opencode（NVIDIA NIM 主力 → Zen 免费池兜底）"
             detect_provider
           }
 
           select_harness_model() {
+            # 已停用 DeepSeek 官方 API（dsh）：一律 opencode（NVIDIA NIM 主力 + 免费池兜底）
+            switch_to_opencode
+          }
+
+          select_harness_model_dsh_disabled() {
             # 已切换到 opencode 后，本 run 内不再回头尝试 dsh
             if [ "$HARNESS" = "opencode" ]; then
               detect_provider
