@@ -7,7 +7,7 @@ PYTHON ?= python
 BUILD_DIR := .build
 INSTALL_DIR := $(BUILD_DIR)/install-check
 
-.PHONY: help test plan protocol preparation rehearsal transfer budget attribution estimability conformal type-sm exact-tost global-fdr audit manipulation integrity env-check registry data-sensitivity reproduce report-diff install-check build clean
+.PHONY: help test plan protocol preparation rehearsal transfer budget attribution ablation-rank estimability conformal type-sm exact-tost global-fdr audit manipulation integrity env-check registry data-sensitivity reproduce report-diff install-check build clean
 
 help:
 	@echo "make test          # CPU unit/reproducibility suite (zero GPU)"
@@ -18,6 +18,7 @@ help:
 	@echo "make transfer      # validation -> test effect transfer / shrinkage (zero GPU)"
 	@echo "make budget        # budget-truncation feasibility: cells, retries, completion risk (zero GPU)"
 	@echo "make attribution   # ablation lattice: Shapley/interaction design licensing + replay (zero GPU)"
+	@echo "make ablation-rank # joint Shapley ranking: max-T intervals, pair order, scale sensitivity (zero GPU)"
 	@echo "make estimability  # design matrix rank / contrast estimability (zero GPU)"
 	@echo "make conformal    # distribution-free prediction interval replay (zero GPU)"
 	@echo "make type-sm       # design-stage Type S / Type M sign & magnitude risk (zero GPU)"
@@ -58,6 +59,9 @@ budget:
 
 attribution:
 	$(PYTHON) audit_gates.py ablation_lattice
+
+ablation-rank:
+	$(PYTHON) audit_gates.py ablation_ranking
 
 estimability:
 	$(PYTHON) audit_gates.py design_estimability

@@ -13790,3 +13790,186 @@ q 值并逐字段对账。artifact 的 `content_sha256` 不覆盖 `created_at`�
   的族；必须先过 §124 的可合并性检查。
 - **不追溯旧报告。** 旧产物没有 `global_fdr` 块时 gate 报
   `not_verifiable_locally`，不会把缺失当成通过，也不会回填历史 q 值。
+
+## 143. 每个分量各自一张 CI 不是排名：Shapley 归因的联合推断与尺度敏感性（本轮对比/消融方法硬化，no new runs）
+
+零 GPU；不新增训练、不读取任何 split、不修改
+`confirmation_frozen*.json` 的字节/臂/种子/端点/α/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未删除、未修改、未移动。
+
+### 143.1 问题：分量显著不等于分量之间有序
+
+§136 的 `shapley_lattice_attribution` 对每个分量分别报告精确符号翻转
+p、正态 CI 与点估计 rank。这解决了「分量 i 的 Shapley 是否为 0」的
+单分量问题，却没有解决归因表最常见的读法：**「分量 i 比 j 更重要」**。
+后者是一个分量之间的比较，而逐分量 CI 并排展示有两个独立问题：
+
+- **多重比较**：k 个分量有 k 个「非零」检验和 k(k-1)/2 个两两顺序；
+  每个都按 α 判读会让「挑最大的那个」重新获得选择自由度；
+- **相关性**：所有 Shapley 值来自同一批 lattice cell、同一批种子和同一
+  组 PPL 测量。独立 CI 既不是联合区间，也不能用「CI 重叠/不重叠」当作
+  两两检验；两个高度相关的分量可以各自远离 0，却完全无法分辨谁更大。
+
+§102/§103 的 arm ranking 处理的是**臂**的排序，§104 处理的是观测最优
+的 winner's curse，§92 的 max-T 处理的是**留一对比族**，§126 的
+contrast network 只回答多臂表能否拼接。它们都没有把「完整晶格上的
+Shapley 向量」送进一个联合族，也没有给出「排名是否被分辨」的机器读数。
+
+还有第二个容易被忽略的事实：**Shapley 值对值函数的单调变换不是不变
+的**。同一组 cell，在 log PPL 与 raw PPL 上可以给出不同的分量顺序。
+这不是实现错误，而是归因 estimand 依赖值函数尺度。§136 已把 log PPL
+作为主尺度，但没有报告「换到 raw PPL 会不会改排名」；把其中一个尺度
+的排名写成「组件重要性」会让尺度选择变成未披露的研究者自由度。
+
+### 143.2 方法：一个主族、两两顺序、排名界与尺度对照
+
+新增 `explib/_parts/part_79_ablation_ranking.py`。输入是完整晶格的
+`cells: subset -> {seed: positive PPL}`，或一个已通过 §136 校验的
+`ablation_lattice` artifact（`ablation_ranking_from_lattice` 会先从
+`inputs.cells` 重放，再在 PPL 上重新计算；log-PPL 形式的 lattice 会先
+指数化，绝不复用错误的单位）。
+
+对每个 seed 分别计算两个尺度的 Shapley 向量：
+
+```text
+phi_i^log(s) = Shapley_i( log PPL(s, .) )
+phi_i^ppl(s) = Shapley_i( PPL(s, .) )
+```
+
+两者使用**同一个**完整案例种子交集；缺失 cell、种子交集不足、k<2 或
+k 超过 §136 的枚举上限都明确返回 `not_estimable`/`not_applicable`，
+不插补、不换种子、不回退到低阶对比。
+
+**分量族。** 主尺度上把 k 个逐种子 Shapley 向量送入
+`maxt_signflip_adjust`，得到 Westfall-Young 精确 max-T 的族校正 p 与
+学生化同时区间。若某行方差为 0（例如合成晶格给出的常数 Shapley），
+或 n 超过精确枚举上限，精确 max-T 没有有限学生化零分布；此时**显式**
+退到同一族的 Holm，并在 `joint.fallback_reason` 与 warnings 中写明，
+绝不把失败伪装成 max-T。非主尺度只报告点归因与逐分量描述性 exact
+sign-flip p，不另开一个 max-T 族：两个尺度不是两次独立检验，不能让
+调用方按结果挑尺度。
+
+**顺序族。** 对每个分量对 `(i,j)` 构造逐种子差值
+`phi_i(s) - phi_j(s)`，做精确符号翻转检验；再用
+`maxt_signflip_adjust` 对全部 k(k-1)/2 个差值做一个顺序族（同一条
+max-T 失败路径退 Holm）。一个 pair 只有同时满足：
+
+1. 族校正双侧 `p <= alpha`；
+2. 均值差的方向与声明一致（负 = i 更优，正 = j 更优）；
+
+才记为 `separated`；否则是 `unresolved`，点估计的先后不写成结论。
+artifact 中 `point_better` 保留点估计方向，`better` 只在 pair 被分辨时
+给出；未分辨的 pair 不携带一个可被引用的「更好」字段。
+
+**排名界。** 只用 separated pair 建支配图 `winner -> loser`：
+
+```text
+rank_lower(i) = 1 + #{j : j 优于 i 且 pair 已分辨}
+rank_upper(i) = k - #{j : i 优于 j 且 pair 已分辨}
+```
+
+`rank_lower == rank_upper` 才是唯一名次，否则报告一个区间。另设：
+
+- `top1_licensed`：恰好一个分量与所有其他分量都被分辨且方向一致；
+- `full_ranking_licensed`：全部 k(k-1)/2 个 pair 都被分辨，且支配图
+  无环；
+- `ranking_consistency`：`total_order` / `partial_order` / `unresolved`
+  / `cyclic`。环是两两检验与均值不一致时的真实可能结果，明确降级为
+  `cyclic`，不强行拓扑排序成一个假全序。
+
+**分辨率。** exact sign-flip 双侧 p 的族级下界（best case）是
+`2/2**n`；若该下界大于 α，任何 pair 都不可能在当前种子数被分辨。
+`resolution_limited=True` 与「没有差异」严格分开；同时区间在 n 太小
+时可以为 `None`（`joint.ci_note` 说明），不会输出一个名义 95% 的假区间。
+
+**尺度敏感性。** 同时报告两个尺度的点 rank、rank shift、Spearman、
+sign flip、pair order flip、tie change 与各分量在总效应中的 share。
+`scale_sensitivity.status` 为：
+
+- `scale_robust`：符号与严格顺序都不变；
+- `scale_dependent`：至少一个符号或严格顺序翻转（tie 变化单列，不
+  冒充翻转）；
+- `not_comparable`：某一尺度没有有限均值（例如只请求了一个尺度）。
+
+`scale_dependent` 不会阻止主尺度排名，但会强制进入 warnings，并把
+「哪个尺度是主尺度」写进 artifact 的 `inputs.primary_scale`。两个尺度
+的 Shapley 值**从不**平均成一个「更真」的第三值。
+
+### 143.3 产物、重放与入口
+
+- `build_ablation_ranking` / `validate_ablation_ranking` /
+  `write_ablation_ranking`：`inputs={cells, components, alpha, min_n,
+  primary_scale, scales, max_components}` + `result`；`content_sha256`
+  只排除 `created_at` 与自身；从 `inputs.cells` 完整重放并逐字段对账。
+  缺 hash、改 Shapley/CI/rank/pair order/top1/full/status、增删 cell、
+  超 schema、夹带 `confirmed`/`verified`/`verdict`/`frozen_decision`
+  均 fail。`write` 同内容 no-op、不同内容默认 conflict，显式
+  `overwrite=True` 才替换。
+- `audit_gates.py ablation_ranking`（别名 `ablation_inference` /
+  `shapley_ranking` / `component_ranking` / `attribution_ranking` /
+  `rank_lattice`）优先重放 `analysis_v12/ablation_ranking.json`（或根
+  目录同名产物）；缺产物、结构自洽但 `not_estimable`/`not_applicable`
+  报 `not_verifiable_locally`，篡改判 fail。`ablation_ranking_artifact`
+  是单产物重放别名。
+- `audit_gates.py report` 顶层新增 `ablation_ranking`；新增
+  `make ablation-rank`。
+- `.github/` 与所有 README 本轮未删除、未修改、未移动。
+
+### 143.4 边界：它不修复什么
+
+- **不是确认性检验。** 不产生冻结 p 值、不进入确认 Holm 族、不改变
+  `p_exact_signflip`/`p_holm`/`verified`/`confirmed`；所有 p 都是探索性
+  归因读数。确认性结论仍只能来自冻结计划的一次 test 读取。
+- **不是因果识别。** 联合区间只消除「排序比较」的多重性与相关性，
+  不消除训练随机性、数据、容量、调参或实现混杂；Shapley 仍是声明
+  值函数上的归因，不是结构因果效应。
+- **不是跨 scope 的全局重要性。** 只在一个完整晶格内有效；§136 的
+  5 个 2×2 scope 共享组件，不能把各 scope 的 Shapley 拼成一个全局
+  排名。跨 scope 仍需补测联合晶格。
+- **不把尺度选择变成结论。** log PPL 是主尺度（相对/比值尺度），
+  raw PPL 是敏感性读数；两者给出不同排名时，正确结论是「排名依赖
+  值函数尺度」，不是选一个更显著/更顺眼的尺度。Shapley 的尺度不变性
+  只在仿射变换下成立，单调非线性变换本来就会改变归因。
+- **不修复 winner's curse、checkpoint 选择、缺失或聚类。** 这些仍由
+  §104/§98/§93/§117-118 各自的门负责。完整案例交集不足时本块直接
+  `not_estimable`，不会用幸存种子制造一个更窄的联合区间。
+- **不把 max-T 当成无假设万能药。** 精确符号翻转仍要求逐种子差值在
+  零假设下关于 0 对称；种子之间的独立性、评测单元聚类与训练随机性
+  不由本块修复。max-T 的 p 也有 `2/2**n` 分辨率下限，无法分辨时必须
+  说「分辨率不足」，不能写成「无差异」。
+- **不追溯旧产物。** 旧 lattice artifact 没有 ranking 块时 gate 报
+  `not_verifiable_locally`，不会回填历史排名或把缺失当通过。
+
+### 143.5 入口与验证
+
+```bash
+python -m pytest -q test_review_part_86.py
+python audit_gates.py ablation_ranking          # analysis_v12/ablation_ranking.json
+python audit_gates.py ablation_ranking PATH     # 显式 artifact 路径
+python audit_gates.py ablation_ranking_artifact PATH
+python audit_gates.py report                    # 顶层 ablation_ranking
+make ablation-rank
+```
+
+落盘一个可重放产物：
+
+```python
+import exp_lib as L
+artifact = L.build_ablation_ranking(
+    cells, components=['a', 'b', 'c'],
+    primary_scale='log_ppl', scales=('log_ppl', 'ppl'))
+L.write_ablation_ranking('analysis_v12', artifact)
+print(L.validate_ablation_ranking(artifact)['status'])
+```
+
+`test_review_part_86.py` 15 项覆盖：log/raw 顺序翻转的具名报告；可加
+晶格的联合同时区间、精确 max-T 与全序许可；常数向量的具名 Holm 回退；
+未分辨 pair 阻止全序但保留 top-1；n=4 的 `2/2**n` 分辨率下限；不完整
+晶格与单分量的 `not_estimable`/`not_applicable` 及 gate 映射；非法
+alpha/min_n/scale/scales/PPL/组件/cell 的 fail-closed；产物 hash/
+round-trip/`created_at` 不影响内容身份/六类篡改拒绝；writer 的
+no-op/conflict/overwrite；gate 的 missing/ok/fail 分支；主尺度切换
+只改变联合族、不把两个尺度合并；`ablation_ranking_from_lattice` 与
+直接分析一致（含 log-PPL lattice 的指数化路径）；`_PARTS`/Makefile/
+CLI/report 接线；README 与 `.github` 路径仍存在。完整 CPU 套件在本轮
+最终树通过。

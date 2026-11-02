@@ -415,6 +415,17 @@
                不产生确认 p 值、不进入冻结 Holm 族、不改任何判定
                （零 GPU；别名 global_fdr_audit / cross_panel_fdr /
                exploratory_fdr / fdr）
+  ablation_ranking  对比/消融：完整晶格上 Shapley 的联合推断——从逐种子
+               Shapley 向量出发，用精确 sign-flip max-T 给出分量的同时
+               区间/族校正 p，并对所有分量对做成对顺序检验；只有全序被
+               分辨才许可完整排名，只有 top-1 与所有其他分量都被分辨才
+               许可「最重要分量」。同时并列 log PPL 与 raw PPL 两种尺度，
+               显式报告顺序翻转（Shapley 对单调变换不不变）；重放
+               analysis_v12/ablation_ranking.json，缺产物/not_estimable 报
+               not_verifiable_locally，篡改/夹带冻结字段判 fail；不新增
+               训练、不读 split、不改冻结 p/Holm/confirmed
+               （零 GPU；别名 ablation_inference / shapley_ranking /
+               component_ranking / attribution_ranking / rank_lattice）
   calibration  统计机器的零假设校准：精确符号翻转 / MITM / n>40 鞍点 /
                max-over-looks 序列 p / 配对 TOST / Holm 的负控制（超发率）
                与正控制（灵敏度），以及 seed-t / paired bootstrap-t /

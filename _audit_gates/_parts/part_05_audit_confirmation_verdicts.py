@@ -1988,6 +1988,7 @@ def run_report(out='audit_report.json'):
     res['type_sm'] = audit_type_sm(verbose=False)
     res['exact_tost'] = audit_exact_tost(verbose=False)
     res['global_fdr'] = audit_global_fdr(verbose=False)
+    res['ablation_ranking'] = audit_ablation_ranking(verbose=False)
     res['data_exposure'] = audit_data_exposure()
     if str(os.environ.get('CSA_REPLAY_IN_REPORT', '')).strip().lower() in (
             '1', 'true', 'yes', 'on'):
@@ -2070,6 +2071,15 @@ def _run_cli():
                   'ablation_attribution': audit_ablation_lattice,
                   'component_attribution': audit_ablation_lattice,
                   'shapley': audit_ablation_lattice})
+    _cmds.update({'ablation_ranking': audit_ablation_ranking,
+                  'ablation_inference': audit_ablation_ranking,
+                  'shapley_ranking': audit_ablation_ranking,
+                  'component_ranking': audit_ablation_ranking,
+                  'attribution_ranking': audit_ablation_ranking,
+                  'rank_lattice': audit_ablation_ranking,
+                  'ablation_ranking_artifact': audit_ablation_ranking_artifact,
+                  'ablation_ranking_replay': audit_ablation_ranking_artifact,
+                  'ablation_ranking_validation': audit_ablation_ranking_artifact})
     _cmds.update({'design_estimability': audit_design_estimability,
                   'estimability': audit_design_estimability,
                   'design_rank': audit_design_estimability,
@@ -2164,6 +2174,10 @@ def _run_cli():
                 'registration_integrity',
                 'ablation_lattice', 'lattice', 'attribution_lattice',
                 'ablation_attribution', 'component_attribution', 'shapley',
+                'ablation_ranking', 'ablation_inference', 'shapley_ranking',
+                'component_ranking', 'attribution_ranking', 'rank_lattice',
+                'ablation_ranking_artifact', 'ablation_ranking_replay',
+                'ablation_ranking_validation',
                 'design_estimability', 'estimability', 'design_rank',
                 'identifiability', 'contrast_estimability', 'design_matrix',
                 'distribution_free_prediction', 'distribution_free',

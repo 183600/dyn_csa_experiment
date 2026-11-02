@@ -6963,3 +6963,99 @@ q_floor 被扣留；artifact hash 与 `created_at` 无关、JSON round-trip、
 gate 的 missing/ok/fail/not_applicable 分支；`_PARTS`/Makefile/CLI/
 report 接线与 `.github`/README 仍存在。`python audit_gates.py report`
 顶层含 `global_fdr`；完整 CPU 套件在本轮最终树通过。
+
+## 2026-11-02 — 逐分量 CI 不是分量排名：Shapley 归因的联合 max-T 与尺度敏感性（本轮对比/消融方法硬化，no new runs）
+
+零 GPU；不新增训练、不读取任何 split、不修改
+`confirmation_frozen*.json` 的字节/臂/种子/端点/α/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未删除、未修改、未移动。
+
+**Problem.** §136 给出了完整子集晶格上的精确 Shapley/LOO/交互归因，
+但每个分量仍各自报告 exact sign-flip p 与正态 CI。归因表最常见的结论
+是「分量 i 比 j 更重要」，这是一个分量之间的比较：k 个分量有 k 个
+「非零」检验和 k(k-1)/2 个两两顺序，逐分量按 α 判读既没有控制多重
+比较，也没有利用所有 Shapley 值来自同一批 cell/种子/评测的相关性；
+「CI 重叠与否」不是两两检验。§102/§103 的排序是**臂**的排序，§92 的
+max-T 是**留一对比族**，§126 只回答多臂表能否拼接，都没有把 Shapley
+向量送进一个联合族。另一个缺口是尺度：Shapley 对值函数的单调变换
+不是不变的，log PPL 与 raw PPL 可以给出不同分量顺序，而 §136 只把
+log 尺度写成主尺度，没有报告换尺度会不会改排名。
+
+**Fix.** 新增 `explib/_parts/part_79_ablation_ranking.py`：
+
+- `ablation_ranking(cells, components=, alpha=, min_n=,
+  primary_scale=, scales=, max_components=, tolerance=)`：输入完整晶格
+  `subset -> {seed: positive PPL}`，先由 §136 的
+  `shapley_lattice_attribution(scale='ppl')` 校验完整性/种子交集/枚举
+  上限；再从同一组规范化 cell 逐种子计算 log-PPL 与 raw-PPL 两套
+  Shapley 向量。主尺度上的 k 个分量向量送入
+  `maxt_signflip_adjust`（Westfall-Young 精确 max-T），给出族校正 p
+  与学生化同时区间；某行常数非零或 n 超过精确枚举上限时**具名**退到
+  同一族的 Holm（`joint.method='holm_fallback'` +
+  `fallback_reason` + warnings），绝不静默伪装 max-T。非主尺度只报
+  点归因与逐分量描述性 exact p，不另开联合族——两个尺度不是两次独立
+  检验。
+- 顺序族：对每个无序分量对构造逐种子 `phi_i - phi_j`，精确符号翻转
+  p，再对 k(k-1)/2 个差值做同一个 max-T（失败退 Holm）。pair 只有在
+  族校正 `p<=alpha` 且均值差方向一致时才 `separated`；否则
+  `unresolved`，点估计先后不写成结论。
+- 排名界：只用 separated pair 建支配图；`rank_lower(i)=1+#{j 优于 i}`、
+  `rank_upper(i)=k-#{i 优于 j}`，两者相等才是唯一名次。
+  `top1_licensed` 要求一个分量与所有其他分量都被分辨；
+  `full_ranking_licensed` 要求全部 pair 分辨且支配图无环；
+  `ranking_consistency` 为 `total_order`/`partial_order`/`unresolved`/
+  `cyclic`，环明确降级而不是强行拓扑排序。
+- 分辨率：精确双侧 sign-flip 族级下界 `2/2**n`；`p_floor>alpha` 时
+  `resolution_limited=True`，同时区间可为 `None`（`ci_note` 说明），
+  不输出名义 95% 的假区间。
+- 尺度敏感性：报告两尺度的点 rank、rank shift、Spearman、sign flip、
+  严格 pair order flip、tie change、各分量 share 与总效应；
+  `scale_sensitivity.status` 为 `scale_robust`/`scale_dependent`/
+  `not_comparable`。两尺度 Shapley 从不平均成一个「更真」的第三值；
+  `scale_dependent` 进入 warnings，主尺度写进 `inputs.primary_scale`。
+- `build_ablation_ranking`/`validate_ablation_ranking`/
+  `write_ablation_ranking`：`inputs={cells,components,alpha,min_n,
+  primary_scale,scales,max_components}` + `result`，`content_sha256`
+  只排除 `created_at` 与自身；从 `inputs.cells` 完整重放并逐字段对账；
+  缺 hash、改 Shapley/CI/rank/pair order/top1/full/status、增删 cell、
+  超 schema、夹带 `confirmed`/`verified`/`verdict`/`frozen_decision`
+  均 fail。writer 同内容 no-op、不同内容默认 conflict，显式
+  `overwrite=True` 才替换。
+- `ablation_ranking_from_lattice`：从已校验的 §136 artifact 重放
+  `inputs.cells`；`scale='ppl'` 直接使用，`scale='log_ppl'` 先指数化，
+  不复用错误单位。
+- 新增 `audit_gates.py ablation_ranking`（别名
+  `ablation_inference`/`shapley_ranking`/`component_ranking`/
+  `attribution_ranking`/`rank_lattice`）与
+  `ablation_ranking_artifact` 单产物重放；缺
+  `analysis_v12/ablation_ranking.json` 为 `not_verifiable_locally`，
+  结构自洽但 `not_estimable`/`not_applicable` 也是
+  `not_verifiable_locally`，篡改为 `fail`。`audit_gates.py report`
+  顶层新增 `ablation_ranking`；新增 `make ablation-rank`。
+
+**Boundary.** 这是**探索性归因读数**：不产生冻结确认 p 值、不进入
+确认 Holm 族、不改变 `p_exact_signflip`/`p_holm`/`verified`/
+`confirmed`/`confirmed_effective`，不重算 PPL、不读 test split、不改
+`CODE_SEMANTICS`。联合区间只消除「排序比较」的多重性与相关性，不消除
+训练随机性、数据、容量、调参或实现混杂；Shapley 仍是声明值函数上的
+归因，不是结构因果效应，也不能跨 scope 拼接。log PPL 是主尺度，
+raw PPL 是敏感性读数；两者排名冲突时正确结论是「排名依赖值函数
+尺度」，不是按结果挑尺度。精确符号翻转仍要求零假设下逐种子差值关于
+0 对称；max-T 的 p 仍有 `2/2**n` 分辨率下限；这些假设与
+winner's curse/checkpoint/缺失/聚类问题不由本块修复。旧 lattice
+artifact 没有 ranking 块时 gate 报 `not_verifiable_locally`，不回填
+历史排名。
+
+**Verification.** 新增 `test_review_part_86.py` 15 项：log/raw 顺序翻转
+的具名报告；可加晶格的联合同时区间、精确 max-T 与全序许可；常数向量
+的具名 Holm 回退；未分辨 pair 阻止全序但保留 top-1；n=4 的
+`2/2**n` 分辨率下限；不完整晶格与单分量的
+`not_estimable`/`not_applicable` 及 gate 映射；非法 alpha/min_n/scale/
+scales/PPL/组件/cell 的 fail-closed；产物 hash/round-trip/`created_at`
+不影响内容身份/六类篡改拒绝；writer 的 no-op/conflict/overwrite；
+gate 的 missing/ok/fail 分支；主尺度切换只改变联合族、不把两个尺度
+合并；`ablation_ranking_from_lattice` 与直接分析一致（含 log-PPL
+lattice 的指数化路径）；`_PARTS`/Makefile/CLI/report 接线；README 与
+`.github` 路径仍存在。`python audit_gates.py report` 顶层含
+`ablation_ranking`；`python -m explib.confirmation plan` 仍通过；
+完整 CPU 套件在本轮最终树通过。

@@ -89,6 +89,7 @@ _PARTS = [
 'part_76_type_sm_design.py',
 'part_77_exact_tost.py',
 'part_78_global_fdr.py',
+'part_79_ablation_ranking.py',
 ]
 
 load_root_package(globals(), __file__, _PARTS,
