@@ -47,7 +47,7 @@ env:
   PYTHONIOENCODING: utf-8
   PYTHONUTF8: '1'
   OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
-  DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+  NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
 
 jobs:
   opencode:
@@ -229,7 +229,7 @@ jobs:
           PREFERRED_PICKLE="opencode/big-pickle"
 
           # ---------- 阶段 0：优先 DeepSeek Harness（dsh + DeepSeek 官方 API + deepseek-flash） ----------
-          if command -v dsh >/dev/null 2>&1 && [ -n "${DEEPSEEK_API_KEY:-}" ]; then
+          if false; then  # dsh（DeepSeek 官方 API）已停用：改用 opencode + NVIDIA NIM
             echo "[harness] dsh 已安装且 DEEPSEEK_API_KEY 已配置，冒烟测试 dsh ..."
             if timeout --kill-after=30 180 dsh --profile headless "只回复两个字：OK" > /tmp/dsh_smoke_test.log 2>&1; then
               echo "[harness] dsh 冒烟通过：harness=dsh | provider=deepseek-official | model=deepseek-flash"
@@ -326,6 +326,11 @@ jobs:
           CANDIDATES=()
           RANDOM_POOL=()
 
+          # 主力：NVIDIA NIM 模型链（指定顺序），优先于免费池
+          for m in "nvidia/deepseek-ai/deepseek-v4.1-flash" "nvidia/z-ai/glm-5.3-flash" "nvidia/z-ai/glm-5.3" "nvidia/minimaxai/minimax-m3.1-flash" "nvidia/stepfun-ai/step-5-preview"; do
+            add_candidate "$m"
+          done
+
           if [ "$DEEPSEEK_FOUND" -eq 1 ]; then
             # 首选模型在列表中：deepseek 排第一，其余免费模型仅作冒烟后备。
             add_candidate "$PREFERRED_DEEPSEEK"
@@ -385,7 +390,8 @@ jobs:
           for m in "${CANDIDATES[@]}"; do
             echo "[model] 测试 $m ..."
             # 每个候选都做一次真实冒烟调用，避免选中目录里存在但实际不可用的模型。
-            if ( cd "$SMOKE_DIR" && timeout --kill-after=30 180 opencode run --auto -m "$m" "只回复两个字：OK" ) > "$SMOKE_DIR/smoke.log" 2>&1; then
+            SMK_T=180; case "$m" in nvidia/*) SMK_T=300 ;; esac
+            if ( cd "$SMOKE_DIR" && timeout --kill-after=30 $SMK_T opencode run --auto -m "$m" "只回复两个字：OK" ) > "$SMOKE_DIR/smoke.log" 2>&1; then
               echo "[model] 可用：$m"
               SELECTED="$m"
               break
