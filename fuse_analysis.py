@@ -378,24 +378,38 @@ def main(argv=None):
         d_ppl = (pa - pb)[_keep]
         d_ppl = d_ppl[np.isfinite(d_ppl)]
         if len(d_f1) and len(d_ppl):
-            _rf1 = L.exact_signflip_p([float(x) for x in np.asarray(d_f1, dtype=float).reshape(-1)])
-            _rppl = L.exact_signflip_p([float(x) for x in np.asarray(d_ppl, dtype=float).reshape(-1)])
-            p_f1 = _rf1['p']
-            p_ppl = _rppl['p']
-            _n_f1 = len(d_f1)
+            if not np.isfinite(d_f1).any() or d_f1.size == 0:
+                p_f1 = None
+                _rf1_method = 'none'
+                _n_f1 = 0
+            else:
+                _rf1 = L.exact_signflip_p([float(x) for x in np.asarray(d_f1, dtype=float).reshape(-1)])
+                p_f1 = _rf1['p']
+                _rf1_method = _rf1['method']
+                _n_f1 = len(d_f1)
+            if not np.isfinite(d_ppl).any() or d_ppl.size == 0:
+                p_ppl = None
+                _rppl_method = 'none'
+            else:
+                _rppl = L.exact_signflip_p([float(x) for x in np.asarray(d_ppl, dtype=float).reshape(-1)])
+                p_ppl = _rppl['p']
+                _rppl_method = _rppl['method']
             lines.append(f'\n**配对精确符号翻转检验（n={_n_f1}，按 seed 配对）**：')
             if not _gate_ok:
                 lines.append(f'> 注：{len(SEEDS) - len(_ok_seeds)} 个 seed 未通过配置/训练量配对门禁（{_why}），已按本仓库惯例排除——Δ 与 p 值只在可配对的 {_ok_seeds} 上计算，跨配置的种子差不进入检验。')
             _d_f1m = d_f1.mean()
             _n_same = int(((d_f1 != 0) & ((d_f1 > 0) == (_d_f1m > 0))).sum())
-            lines.append(f'- 层均边界 F1：Δ = {_d_f1m:+.4f} ± {_fmt_sd(sample_std(d_f1))}，{_n_same}/{_n_f1} 同向，p({_rf1["method"]}) = {p_f1:.3f}')
+            lines.append(f'- 层均边界 F1：Δ = {_d_f1m:+.4f} ± {_fmt_sd(sample_std(d_f1))}，{_n_same}/{_n_f1} 同向，p({_rf1_method}) = {p_f1:.3f}')
             _n_ppl = len(d_ppl)
             # Two-sided floor is 2/2**n for exact, MITM and saddlepoint alike.
-            _ppl_floor0 = L.signflip_p_floor(_n_ppl)
+            if _n_ppl > 0:
+                _ppl_floor0 = L.signflip_p_floor(_n_ppl)
+            else:
+                _ppl_floor0 = float('nan')
             _floor_txt = (f'（n={_n_ppl} 时 p 分辨率下限 {_ppl_floor0:.3g}）'
                           if math.isfinite(_ppl_floor0)
                           else f'（n={_n_ppl} 的 p 分辨率不可计算）')
-            lines.append(f'- 最终 PPL：Δ = {d_ppl.mean():+.2f} ± {_fmt_sd(sample_std(d_ppl), ".2f")}，p({_rppl["method"]}) = {p_ppl:.3f}{_floor_txt}\n')
+            lines.append(f'- 最终 PPL：Δ = {d_ppl.mean():+.2f} ± {_fmt_sd(sample_std(d_ppl), ".2f")}，p({_rppl_method}) = {p_ppl:.3f}{_floor_txt}\n')
         elif not _ok_seeds:
             p_f1 = p_ppl = None
             lines.append(f'\n**配对检验：未执行。** 上述两臂不满足本仓库的可配对条件（{_why}）——它们的训练配置无法证明相同，**不给出 p 值**、不进入任何显著性主张。\n')

@@ -540,7 +540,8 @@ def run_overfit(cfg=None, variants=None, steps=None):
     # loaders are deterministic today, but the seeding contract (every
     # corpus-construction path runs after a seed) must hold for this entry
     # point too, exactly like it does inside L.run().
-    L.set_seed(int((cfg.get('seeds') or [0])[0]))
+    seeds = cfg.get('seeds') or []
+    L.set_seed(int(seeds[0]) if seeds else 0)
     train_ids, val_batch, vocab, _, _ = L.load_run_corpus(cfg)
     d = int(cfg.get('d', 256))
     n_layers = int(cfg.get('n_layers', 6))

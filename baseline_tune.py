@@ -421,7 +421,10 @@ def run_tuning(base_cfg=None, outdir='results_baseline_tuning', protocol=None,
                     # the same estimator as the panel's primary PPL.
                     _nll_tot = float(sum(selection_stats[s]['nll_sum'] for s in selection_stats))
                     _tok_tot = int(sum(selection_stats[s]['n_tokens'] for s in selection_stats))
-                    mean = float(L._safe_exp_ppl(_nll_tot / _tok_tot))
+                    if _tok_tot == 0:
+                        mean = float('nan')
+                    else:
+                        mean = float(L._safe_exp_ppl(_nll_tot / _tok_tot))
                     std = _mean_std(list(selection_ppls.values()))[1]
                     _metric_ppls = selection_ppls
                     _seed_nll = {str(s): float(selection_stats[s]['nll_sum']) for s in sorted(selection_stats)}
@@ -435,11 +438,14 @@ def run_tuning(base_cfg=None, outdir='results_baseline_tuning', protocol=None,
                     _agg = 'arithmetic_seed_mean_fallback'
                     if _row_spec is not None:
                         print(f'[tune] WARNING: {arm} trial {ti}: nested selection rows unavailable ({_split_reason or "per-row NLL missing"}); falling back to full-validation means')
+                if not full_seed_ppls:
+                    mean_full = float('nan')
+                else:
+                    mean_full = _mean_std(list(full_seed_ppls.values()))[0]
                 _steps = {int(records[s]['steps']) for s in records if records[s].get('steps') is not None}
                 _tokens = {int(records[s]['tokens_seen']) for s in records if records[s].get('tokens_seen') is not None}
                 per_arm[arm].append({
                     'config': dict(knobs), 'ppl': mean, 'ppl_std': std,
-                    'ppl_aggregation': _agg,
                     'nll_sum': (float(sum(selection_stats[s]['nll_sum'] for s in selection_stats))
                                 if selection_ppls is not None else None),
                     'n_tokens': (int(sum(selection_stats[s]['n_tokens'] for s in selection_stats))
@@ -447,7 +453,7 @@ def run_tuning(base_cfg=None, outdir='results_baseline_tuning', protocol=None,
                     'seed_nll_sum': _seed_nll, 'seed_n_tokens': _seed_ntok,
                     'n_seeds': len(records), 'seeds': sorted(records),
                     'seed_ppls': {str(s): float(_metric_ppls[s]) for s in sorted(records)},
-                    'ppl_full_validation': _mean_std(list(full_seed_ppls.values()))[0],
+                    'ppl_full_validation': mean_full,
                     'seed_ppls_full_validation': {str(s): float(full_seed_ppls[s]) for s in sorted(records)},
                     'selection_row_split_applied': bool(selection_ppls is not None),
                     'selection_row_fp': ((_row_state['meta'] or {}).get('selection_row_fp')
@@ -455,10 +461,10 @@ def run_tuning(base_cfg=None, outdir='results_baseline_tuning', protocol=None,
                     'evaluation_row_fp': ((_row_state['meta'] or {}).get('evaluation_row_fp')
                                           if selection_ppls is not None else None),
                     'params': records[sorted(records)[0]].get('params'),
-                    'steps': (next(iter(_steps)) if len(_steps) == 1 else None),
-                    'tokens_seen': (next(iter(_tokens)) if len(_tokens) == 1 else None),
-                    'budget_by_seed': {str(s): [records[s].get('steps'), records[s].get('tokens_seen')]
-                                       for s in sorted(records)},
+                    'steps': next(iter(_steps), None),
+                    'tokens_seen': next(iter(_tokens), None),
+'budget_by_seed': {str(s): [records[s].get('steps', None), records[s].get('tokens_seen', None)]
+                                   for s in sorted(records)},
                     'run_cfg': records[sorted(records)[0]].get('run_cfg'), 'outdir': tdir,
                     # The selected hyperparameters are only tuned for the data
                     # they were searched on.  Persist the corpus/validation
