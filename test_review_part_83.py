@@ -79,11 +79,19 @@ def test_exact_tost_clear_equivalence_and_non_equivalence():
 
 
 def test_exact_tost_boundary_is_never_equivalent():
+    # A delta exactly on the margin makes one shifted arm fully degenerate
+    # (all entries zero): every sign flip ties, so that arm's one-sided p is
+    # identically 1.0 and its attainable floor is 1.0 (the zero-aware floor
+    # of test_review_part_84, taken to its n_nonzero=0 limit).  The panel is
+    # therefore resolution-limited, and equivalence is never declared at the
+    # exact boundary.
     for d in ([0.1] * 6, [-0.1] * 6):
         r = L.exact_signflip_tost(d, margin=0.1)
         assert r['p_tost'] == pytest.approx(1.0), r
         assert r['equivalent'] is False, r
-        assert r['resolution_limited'] is False, r
+        assert r['resolution_limited'] is True, r
+        assert r['p_floor'] == pytest.approx(1.0), r
+        assert sorted((r['n_nonzero_low'], r['n_nonzero_high'])) == [0, 6], r
 
 
 def test_exact_tost_discrete_resolution_floor():
