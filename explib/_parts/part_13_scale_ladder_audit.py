@@ -1057,6 +1057,42 @@ ABLATION_DESIGN = {
     ],
     'hybrid_hierarchy': [
         ('hybrid_csa_dyn', 'csa_dynamic', 'CSA+HCA hybrid vs CSA-only (dynamic blocking)'),
+        ('hybrid_hca_dyn', 'hybrid_fixed', 'dynamic HCA vs fixed HCA inside hybrid (CSA fixed)'),
+    ],
+    # NEW 2x2 factorial extensions — each lattice measures higher-order interactions
+    # between core blocking/selection/sink factors.  These use arms that RUN_ABL
+    # already schedules, so the interaction is measured on the same seeds/data/recipe
+    # without a new training run.  Cell keys are (factor1 level, factor2 level), both
+    # oriented control -> active:
+    #
+    #   interaction = (log PPL_11 - log PPL_10)
+    #               - (log PPL_01 - log PPL_00)
+    #
+    # i.e. the effect of factor2 when factor1 is active minus its effect when
+    # factor1 is at the control level.  Both simple effects are expected to be
+    # negative (the active level lowers PPL), so a POSITIVE interaction means the
+    # two interventions are sub-additive / redundant and a NEGATIVE one means
+    # synergy.  The log scale makes the contrast a ratio of ratios and prevents a
+    # higher baseline PPL from mechanically producing a larger absolute effect.
+    # Interactions are exploratory: they get their own declared Holm family and
+    # never enter the frozen confirmatory or the leave-one-out correction family.
+    'hybrid_blocking_factorisation': [
+        ('hybrid_csa_dyn', 'hybrid_fixed', 'dynamic CSA vs fixed CSA inside hybrid'),
+        ('hybrid_hca_dyn', 'hybrid_fixed', 'dynamic HCA vs fixed HCA inside hybrid'),
+    ],
+    'selection_sink_interaction': [
+        ('csa_fixed', 'csa_fix_nosink', 'learned selection vs no-sink (fixed blocking)'),
+        ('csa_fixed', 'csa_fix_randomsink', 'learned selection vs frozen random sink (fixed blocking); parameter-matched placebo'),
+    ],
+    'content_alignment_interaction': [
+        ('csa_fixed', 'csa_fix_zerocont', 'pooled content vs zero content (fixed blocking)'),
+        ('csa_fixed', 'csa_fix_shiftcont', 'block-aligned vs shifted content (fixed blocking); norm-matched misalignment control'),
+    ],
+'fusion_sink_interaction': [
+        ('csa_dyn_fuse', 'csa_dyn_nosink', 'learned fusion vs no-sink (dynamic blocking)'),
+],
+    'dynamic_comp_interaction': [
+        ('csa_dynamic', 'csa_dyn_nocomp', 'dynamic vs dynamic no-comp (dynamic blocking)'),
     ],
 }
 

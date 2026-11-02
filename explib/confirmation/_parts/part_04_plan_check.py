@@ -47,6 +47,22 @@ def plan_check(manifest_path=FREEZE_MANIFEST):
     _min_holm = L.holm_min_attainable_p(_n_min, len(m['primary_comparisons']), _alpha) if _n_min >= 2 else float('inf')
     if not math.isfinite(_min_holm) or _min_holm > _alpha:
         errs.append(f'the pre-registered minimum n={_n_min} cannot attain Holm significance (min attainable Holm p={_min_holm:.4g} > alpha={_alpha})')
+    # Pre-test power gate: compute exact conditional power from the P5C validation
+    # deltas (which are available without reading the test split).  If power at
+    # q=0.95 is below min_power_for_test=0.8, refuse P5T until seeds are added
+    # and a revision is recorded before touching test data.
+    from explib.methodology_steps.step_00 import signflip_power
+    _q_for_gate = 0.95
+    _power_q95 = signflip_power(_n_min, len(m['primary_comparisons']), _q_for_gate, _alpha)
+    _min_power_for_test = 0.8
+    if _power_q95 < _min_power_for_test:
+        errs.append(
+            f'pre-test power gate FAILED: conditional power at q={_q_for_gate} is '
+            f'{_power_q95:.3f} < {_min_power_for_test} (min required).  P5T would '
+            f'refuse.  Add seeds and record a revision in confirmation_frozen.json '
+            f'BEFORE touching the test split (V12_ALLOW_LOW_POWER=1 is the explicit '
+            f'override).  q=0.90 sensitivity is reported at {signflip_power(_n_min, len(m["primary_comparisions"]), 0.90, _alpha):.3f}'
+        )
     # Predict the implementation descriptor exactly as the trainer will.
     _dev = type('_PlanCuda', (), {'type': 'cuda'})()
     _bs = int(sig.get('bs', 12))
