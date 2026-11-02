@@ -407,6 +407,14 @@
                缺产物 not_verifiable、篡改判 fail；不改变 t-TOST 判定、
                冻结 p/Holm/confirmed（零 GPU；别名 randomization_tost /
                distribution_free_tost / exact_equivalence）
+  global_fdr   结果分析：跨 panel 探索性主张的全局错误发现率——对显式声明
+               的 claim 族重放 BH/BY q 值（默认 BY，任意依赖），保留无效
+               p 的声明槽位、报告离散 p 下限下的最小可达 q 与分辨率不足；
+               重放 analysis_v12/global_fdr.json，缺产物
+               not_verifiable_locally、篡改/超 schema/夹带冻结字段判 fail；
+               不产生确认 p 值、不进入冻结 Holm 族、不改任何判定
+               （零 GPU；别名 global_fdr_audit / cross_panel_fdr /
+               exploratory_fdr / fdr）
   calibration  统计机器的零假设校准：精确符号翻转 / MITM / n>40 鞍点 /
                max-over-looks 序列 p / 配对 TOST / Holm 的负控制（超发率）
                与正控制（灵敏度），以及 seed-t / paired bootstrap-t /

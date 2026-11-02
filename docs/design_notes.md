@@ -13678,3 +13678,115 @@ significance 的零效应与等价面板；歧义 t-TOST 被 gate 降为
 warnings；报告 Markdown 出现精确表与提醒；以及
 `_PARTS`/Makefile/CLI/report 接线和 `.github`/README 仍存在。完整 CPU
 套件在本轮最终树通过。
+
+## 142. 每个 panel 各自 Holm 不等于全局控制：跨 panel 探索性主张的 BH/BY FDR
+
+### 142.1 问题：族被 panel 切开，搜索量却不在任何一家里
+
+冻结确认族用 exact sign-flip + Holm，这是 §4/§17 的既定口径。但 v6-v12
+的探索性比较分布在多个 panel：同一条「某组件有用」的主张，可能在
+capacity、length、corruption、NIAH 等 panel 里各报一次；每个 panel 内部
+的 Holm 只把它自己那几条比较放进族。于是出现两个都不诚实的极端：
+
+- 逐 panel 报「Holm 后显著」，会让读者以为整个探索性主张集合已经被
+  校正；实际上跨 panel 的搜索量没有进入任何族。
+- 完全不校正跨 panel，则「看了很多面板后挑一个显著」没有错误率上限。
+
+§124/§125 的跨 panel 随机效应合成解决的是「可合并性」与「不按显著性
+选 panel」，不是多重比较：它给出一个 pooled 区间，但不控制整个探索性
+主张集合的 FDR。§108 的 max-T 也只在**一个显式声明的族**内利用相关性。
+本块补的是另一层：**跨 panel 的全局错误发现率**。
+
+### 142.2 为什么默认 BY 而不是 BH
+
+Benjamini-Hochberg (1995) 在独立或正相依下控制 FDR；本仓库的 panel
+共享训练种子、数据顺序、评测切片，甚至同一批 validation 记录，不能把
+它们当作独立研究。Benjamini-Yekutieli (2001) 对任意依赖结构成立，代价是
+乘以调和数 `H_m = sum_{i=1..m} 1/i`。因此：
+
+- `method='by'` 是默认与 headline；
+- `method='bh'` 只有在调用方**显式声明**独立性/正相依时才使用；
+- 两者始终并列返回（`q_bh`、`q_by`），防止「换一种校正让结果显著」的
+  事后选择；报告必须写明用的是哪一种。
+
+### 142.3 无效 p 与离散分辨率
+
+`holm_adjust` 的既有约定是：NaN、越界、布尔/字符串 p 仍占一个声明族
+槽位，但永不拒绝。本块沿用同一 fail-closed 约定：
+
+- `m_declared = m_valid + m_invalid`；有效 q 用**声明**的 m，而不是
+  「恰好可测」的子集；
+- 无效 p 的 `q=None`、`reject=False`，并列入 `invalid_claims`；
+- 精确符号翻转的 p 有下限。若 claim 带 `p_floor`（或给出
+  `n_nonzero`，由 `2/2**n_nonzero` 推导），本块同时计算
+  `q_floor`：在当前 rank 下，由各 claim 的 p 下限推出的 q 下界（保守；
+  不是对所有可能排序的精确最小值）。`resolution_limited=True` 表示
+  「这个 claim 在当前族与 alpha 下不可能拒绝」，必须与「没有效应」区分；
+- 缺 floor 时 `q_floor=None`，绝不把缺失当成 1.0 来伪造一个更细的
+  分辨率；`resolution_complete` 明确说明这一族是否每个 claim 都有 floor。
+
+### 142.4 与确认性 Holm 的关系
+
+- **不生成新的确认 p 值，不进入冻结 Holm 族。** `global_fdr` 只接受
+  `tier='exploratory'` 的 claim；显式声明 `tier='confirmatory'` 会
+  `ValueError`，确认性主张仍走 `confirmation_frozen.json` 的
+  exact sign-flip + Holm。
+- **不改变任何 panel 的 `verified`/`confirmed`。** 它输出 `reject`/
+  `q` 作为探索性读数；`confirmed_effective`、`p_holm`、`verdict` 均不在
+  结果 schema 内，artifact 校验会拒绝这些字段。
+- **FDR 不是 FWER。** `q<=alpha` 允许整个族中约 `alpha` 比例的假发现；
+  `false_discovery_budget = alpha * n_reject` 只是名义预算（nominal
+  budget），不是给定观测拒绝数后的条件期望，也不是逐条错误的保证。
+  需要逐条强控制时仍用 Holm/max-T。
+- **族必须事前声明。** 本块不自动扫描报告里的所有 p 值；调用方必须把
+  「哪些 claim 属于这个探索性族」显式写进 `inputs.claims`。事后按结果
+  增删族成员仍然是一次研究者自由度，§127/§129 的 protocol/implementation
+  绑定负责记录它，不能由本块修复。
+
+### 142.5 入口与验证
+
+```bash
+python -m pytest -q test_review_part_85.py
+python audit_gates.py global_fdr                 # analysis_v12/global_fdr.json
+python audit_gates.py global_fdr PATH            # 显式 artifact 路径
+python audit_gates.py global_fdr_artifact PATH   # 单 artifact 重放
+python audit_gates.py report                     # 顶层 global_fdr
+make global-fdr
+```
+
+落盘一个可重放产物：
+
+```python
+import exp_lib as L
+claims = [
+    {'name': 'capacity/csa_dynamic', 'p': 0.004, 'panel': 'capacity',
+     'contrast': 'csa_dynamic - dense', 'n': 12, 'n_nonzero': 12},
+    {'name': 'length/4096/csa_dynamic', 'p': 0.031, 'panel': 'length',
+     'contrast': 'csa_dynamic - dense', 'n': 12, 'n_nonzero': 12},
+]
+artifact = L.build_global_fdr(claims, alpha=0.05, method='by',
+                              family='exploratory v6-v12 primary contrasts')
+L.write_global_fdr('analysis_v12/global_fdr.json', artifact)
+print(L.validate_global_fdr(artifact)['status'])
+```
+
+结果为 `{'status': 'ok', ...}` 时，gate 会从 `inputs` 完整重放 BH/BY
+q 值并逐字段对账。artifact 的 `content_sha256` 不覆盖 `created_at`，
+因此同一输入在不同时间写出的文件具有同一内容身份；改 q、改 rank、
+增删 claim、夹带冻结字段、缺 hash 或 hash 不重算都会 `fail`。缺产物
+是 `not_verifiable_locally`，不是通过；结构自洽但整个族没有有效 p 时
+是 `not_applicable`。
+
+### 142.6 边界：它不修复什么
+
+- **不修复 winner's curse、checkpoint 选择、缺失或聚类。** 这些仍由
+  §104/§45/§41/§117-118 各自的门负责；FDR 只调整「在一个已声明族里
+  选谁」的错误率。
+- **不把探索性变成确认性。** 即使 BY q 很小，这些 claim 仍是
+  validation 上选出来的探索性读数；确认性只能来自冻结计划的 test
+  一次性读取。
+- **不替代跨 panel 合成的可合并性门。** 若 panel 不可合并（语料/尺度/
+  方向不同），把它们放进同一个 FDR 族只会制造一个没有共同 estimand
+  的族；必须先过 §124 的可合并性检查。
+- **不追溯旧报告。** 旧产物没有 `global_fdr` 块时 gate 报
+  `not_verifiable_locally`，不会把缺失当成通过，也不会回填历史 q 值。

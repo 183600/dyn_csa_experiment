@@ -6894,3 +6894,72 @@ builder 拒绝不可重放输入；gate 对 artifact 的 ok/fail/缺失、对 st
 降为 warnings；报告 Markdown 出现精确表与提醒；`_PARTS`/Makefile/CLI/report 接线与 `.github`/
 README 仍存在。`python audit_gates.py report` 顶层含 `exact_tost`；
 完整 CPU 套件在本轮最终树通过。
+
+## 2026-11-02 — 每个 panel 各自 Holm 不等于全局控制：跨 panel 探索性主张的 BH/BY FDR（本轮结果分析硬化，no new runs）
+
+零 GPU；不新增训练、不读取任何 split、不修改
+`confirmation_frozen*.json` 的字节/臂/种子/端点/α/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未删除、未修改、未移动。
+
+**Problem.** 冻结确认族用 exact sign-flip + Holm 是正确的，但 v6-v12 的
+探索性比较横跨多个 panel。每个 panel 各自做 Holm 只把该 panel 内部的
+比较放进族；跨 panel 的搜索量没有进入任何族。于是「逐 panel Holm 后
+显著」会被读成整个探索性主张集合已被校正，而完全不校正跨 panel 又让
+「看了很多 panel 后挑一个显著」没有错误率上限。REVIEW_4_RESPONSE #5
+明确记录了这一缺口（「没有跨面板的全局 FDR；探索性比较族仍很大」）。
+§124/§125 的跨 panel 随机效应合成解决可合并性与按显著性选 panel，
+§108 的 max-T 只在一个显式族内利用相关性，都不是全局 FDR。
+
+**Fix.** 新增 `explib/_parts/part_78_global_fdr.py`：
+
+- `global_fdr(claims, alpha=, method=, family=)`：对显式声明的探索性
+  claim 族计算 BH 与 BY q 值。默认 `method='by'`（任意依赖），因为 panel
+  共享训练种子/数据顺序/评测切片；BH 只在调用方显式声明独立或正相依时
+  使用。两者始终并列输出 `q_bh`/`q_by`，防止按结果换校正方法。
+  `q_i = min_{j>=i} m p_(j)/j * H_m`，`H_m=sum 1/i`（BH 时 H=1），
+  向后 running min 保证单调并截到 1；`reject = q <= alpha`。
+- fail-closed 族计数沿用 `holm_adjust`：NaN/越界/布尔/字符串 p 仍占一个
+  **声明**槽位，`m_declared=m_valid+m_invalid`，但 `q=None`、
+  `reject=False`，并列入 `invalid_claims`；有效 q 用完整 m，绝不因缺失
+  缩小族。重复 claim 名、非探索性 `tier`、非法 alpha/method/floor 均
+  硬拒绝。
+- 离散分辨率：claim 可带 `p_floor`，或给 `n_nonzero` 由
+  `2/2**n_nonzero` 推导。`q_floor` 是「即使 p 到达自身离散下限，校正后
+  仍能达到的最小 q」的下界；`resolution_limited=True` 与「无效应」分开。
+  缺 floor 时 `q_floor=None`（不把缺失当 1.0 伪造分辨率），
+  `resolution_complete` 显式说明整族是否都有 floor。
+- `build_global_fdr`/`validate_global_fdr`/`write_global_fdr`：
+  `inputs={claims,alpha,method,family}` + `result`，`content_sha256` 只
+  排除 `created_at` 与自身；从 inputs 完整重放并逐字段对账；缺 hash、
+  改 q/rank/n_reject、改 input p、增删 claim、超 schema、夹带
+  `confirmed`/`p_holm`/`verified`/`verdict`/`decision` 均 fail。
+- 新增 `audit_gates.py global_fdr`（别名 `global_fdr_audit` /
+  `cross_panel_fdr` / `exploratory_fdr` / `fdr`）与
+  `global_fdr_artifact` 单产物重放；缺
+  `analysis_v12/global_fdr.json` 为 `not_verifiable_locally`，结构自洽
+  但整族无有效 p 为 `not_applicable`，篡改为 `fail`。`audit_gates.py
+  report` 顶层新增 `global_fdr`；新增 `make global-fdr`。
+
+**Boundary.** 这是**探索性次级读数**：不生成新的确认 p 值，不进入冻结
+Holm 族，不改变 `p_exact_signflip`/`p_holm`/`verified`/`confirmed`/
+`confirmed_effective`，不重算 PPL，不读 test split，不改
+`CODE_SEMANTICS`。FDR 不是 FWER：`q<=alpha` 允许族内约 alpha 比例的
+假发现；`false_discovery_budget=alpha*n_reject` 只是名义预算，不是给定
+拒绝数后的条件期望，也不是逐条错误的保证。族成员必须事前声明；本块不
+自动扫描报告中的所有 p 值，
+事后按结果增删族仍是一次研究者自由度，由 §127/§129 的
+protocol/implementation 绑定记录。它不修复 winner's curse、checkpoint
+选择、缺失、聚类或外部有效性；也不把不可合并的 panel 硬放进一个没有
+共同 estimand 的族。旧产物无该块时只报 `not_verifiable_locally`，不回填
+历史 q 值。
+
+**Verification.** 新增 `test_review_part_85.py` 16 项：与独立 BH/BY
+参考实现逐值对账；BY = H_m × BH（未截断区）；tie 同 q 且单调；无效 p
+占声明槽位但永不拒绝；整族无有效 p 为 not_applicable；confirmatory tier
+与重复名被拒；非法 alpha/method/别名 fail-closed；`n_nonzero` 离散下限
+与 `resolution_limited`；floor > p 的 clamp 与 warning；尾部缺 floor 时
+q_floor 被扣留；artifact hash 与 `created_at` 无关、JSON round-trip、
+同输入确定性；十类篡改/超 schema/缺 hash 拒绝；三层夹带冻结字段拒绝；
+gate 的 missing/ok/fail/not_applicable 分支；`_PARTS`/Makefile/CLI/
+report 接线与 `.github`/README 仍存在。`python audit_gates.py report`
+顶层含 `global_fdr`；完整 CPU 套件在本轮最终树通过。

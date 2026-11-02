@@ -32,6 +32,7 @@ _PARTS = [
 'part_41_audit_distribution_free.py',
 'part_42_audit_type_sm.py',
 'part_43_audit_exact_tost.py',
+'part_44_audit_global_fdr.py',
 'part_05_audit_confirmation_verdicts.py',
 'part_08_audit_missingness.py',
 'part_09_audit_trajectory.py',

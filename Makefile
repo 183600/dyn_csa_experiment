@@ -7,7 +7,7 @@ PYTHON ?= python
 BUILD_DIR := .build
 INSTALL_DIR := $(BUILD_DIR)/install-check
 
-.PHONY: help test plan protocol preparation rehearsal transfer budget attribution estimability conformal type-sm exact-tost audit manipulation integrity env-check registry data-sensitivity reproduce report-diff install-check build clean
+.PHONY: help test plan protocol preparation rehearsal transfer budget attribution estimability conformal type-sm exact-tost global-fdr audit manipulation integrity env-check registry data-sensitivity reproduce report-diff install-check build clean
 
 help:
 	@echo "make test          # CPU unit/reproducibility suite (zero GPU)"
@@ -22,6 +22,7 @@ help:
 	@echo "make conformal    # distribution-free prediction interval replay (zero GPU)"
 	@echo "make type-sm       # design-stage Type S / Type M sign & magnitude risk (zero GPU)"
 	@echo "make exact-tost    # distribution-free exact sign-flip TOST companion (zero GPU)"
+	@echo "make global-fdr    # cross-panel exploratory BH/BY false-discovery-rate replay (zero GPU)"
 	@echo "make audit         # local audit gates -> audit_report.json (non-zero on a failed gate)"
 	@echo "make manipulation  # functional manipulation check for every declared ablation (zero GPU)"
 	@echo "make integrity     # verify stamped analysis bodies/inputs (zero GPU)"
@@ -69,6 +70,9 @@ type-sm:
 
 exact-tost:
 	$(PYTHON) audit_gates.py exact_tost
+
+global-fdr:
+	$(PYTHON) audit_gates.py global_fdr
 
 audit:
 	$(PYTHON) audit_gates.py report
