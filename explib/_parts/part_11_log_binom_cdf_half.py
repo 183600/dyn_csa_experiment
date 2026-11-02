@@ -1379,6 +1379,29 @@ def _betai(a, b, x):
     return _betai_nr(a, b, x)
 
 
+def _dist_real(value):
+    """Finite-or-infinite real scalar for a distribution argument.
+
+    An arbitrary-precision integer has no exact float64 value, but its limit
+    (``+/-inf``) is the mathematically meaningful argument for a tail
+    function: ``t=10**400`` is an infinite t statistic and ``df=10**400`` is
+    an infinite degrees-of-freedom limit.  Booleans, strings and other
+    non-measurements return ``None``.  ``OverflowError`` from ``float(value)``
+    is therefore converted to the signed infinity instead of escaping.
+    """
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, numbers.Real):
+        return None
+    try:
+        return float(value)
+    except OverflowError:
+        try:
+            return math.inf if value > 0 else -math.inf
+        except (TypeError, ValueError):
+            return None
+    except (TypeError, ValueError):
+        return None
+
+
 def _student_t_sf_large_df(z, df):
     """Student t 上尾的正态极限展开（z>=0，df 大）。
 
@@ -1386,11 +1409,15 @@ def _student_t_sf_large_df(z, df):
     lgamma 值，尾概率会丢失约 1e-5（df=1e12）。这里把 t 密度按 1/df 展开
     并在高斯尾上积分；三阶项的绝对误差在 df>=1e4 时已低于 1e-15。
     """
+    z = _dist_real(z)
+    df = _dist_real(df)
+    if z is None or df is None or math.isnan(z) or not (df > 0.0):
+        return float('nan')
     if z == 0.0:
         return 0.5
     if z > 40.0:
         return 0.0
-    inv = 1.0 / df
+    inv = (1.0 / df) if math.isfinite(df) else 0.0
     inv2 = inv * inv
     inv3 = inv2 * inv
     z2 = z * z
@@ -1412,7 +1439,9 @@ def _student_t_sf_large_df(z, df):
 
 def _student_t_sf(t, df):
     """Student t 的上尾概率 P(T >= t)。"""
-    if not (df > 0.0) or math.isnan(t):
+    t = _dist_real(t)
+    df = _dist_real(df)
+    if t is None or df is None or not (df > 0.0) or math.isnan(t):
         return float('nan')
     if t == float('inf'):
         return 0.0
@@ -1438,7 +1467,11 @@ def _student_t_sf(t, df):
 
 def student_t_two_sided_p(t, df):
     """双侧 Student t 检验 p 值（小样本斜率/交互推断用）。"""
-    sf = _student_t_sf(abs(float(t)), float(df))
+    t = _dist_real(t)
+    df = _dist_real(df)
+    if t is None or df is None:
+        return float('nan')
+    sf = _student_t_sf(abs(t), df)
     if not math.isfinite(sf):
         return float('nan')
     return float(min(1.0, 2.0 * sf))
@@ -1461,9 +1494,11 @@ def _t_critical(conf, df):
     by the validated float arguments so a large panel family does not spend
     its time recomputing the same critical value.
     """
-    if not (0.0 < conf < 1.0) or not (df > 0.0):
+    conf = _dist_real(conf)
+    df = _dist_real(df)
+    if conf is None or df is None or not (0.0 < conf < 1.0) or not (df > 0.0):
         return float('nan')
-    return _t_critical_cached(float(conf), float(df))
+    return _t_critical_cached(conf, df)
 
 
 @functools.lru_cache(maxsize=8192)
@@ -1491,13 +1526,20 @@ def _t_critical_cached(conf, df):
 
 def chi2_sf(x, df):
     """卡方分布上尾概率 P(chi2_df >= x)（Cochran Q 用）。"""
-    if not (df > 0.0) or math.isnan(x):
+    x = _dist_real(x)
+    df = _dist_real(df)
+    if x is None or df is None or not (df > 0.0) or math.isnan(x):
         return float('nan')
     if x == float('inf'):
         return 0.0
+    if x <= 0.0:
+        # Includes a huge negative x mapped to -inf: the upper tail at a
+        # non-positive statistic is the whole mass.
+        return 1.0
     if not math.isfinite(x):
         return float('nan')
-    if x <= 0.0:
+    if not math.isfinite(df):
+        # A finite x is far below the mean of an infinite-df chi-square.
         return 1.0
     return _gammaincc(df / 2.0, x / 2.0)
 

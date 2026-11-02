@@ -176,7 +176,9 @@ def _gfdr_int_or_none(value, *, minimum=0, maximum=None):
 
 def _gfdr_p(value):
     """A valid p is a finite real in [0,1]; bool/NaN/Inf/non-numeric are not."""
-    if isinstance(value, (bool, bytes, bytearray)):
+    if isinstance(value, (bool, bytes, bytearray, str)):
+        # Numeric strings are serialisations, not measurements: accepting
+        # float('0.01') would let a malformed artifact enter the FDR family.
         return None
     try:
         p = float(value)
@@ -202,7 +204,8 @@ def _gfdr_floor(value, *, p=None, n_nonzero=None, where='p_floor'):
         return 1.0 if nn == 0 else min(1.0, math.ldexp(2.0, -nn + 1))
     if value is None:
         return None
-    if isinstance(value, (bool, bytes, bytearray)):
+    if isinstance(value, (bool, bytes, bytearray, str)):
+        # A numeric string is a serialisation artefact, not a measurement.
         raise ValueError(f'{where}: p_floor must be a finite number in (0,1]')
     try:
         floor = float(value)
@@ -269,7 +272,8 @@ def _gfdr_normalise(claims):
             tier_declared = tier_flag
         else:
             raise ValueError(
-                f'global_fdr claim {name!r} tier_declared must be a boolean')
+                f'global_fdr claim {name!r} tier_declared must be a boolean, '
+                f'got {_gfdr_repr(tier_flag)}')
         if tier_raw is None:
             tier = 'exploratory'
         else:
@@ -280,9 +284,9 @@ def _gfdr_normalise(claims):
             if tier is None:
                 raise ValueError(
                     f'global_fdr claim {name!r} declares tier '
-                    f'{tier_raw!r}; only exploratory claims belong in this '
-                    'readout (confirmatory claims stay in the frozen Holm '
-                    'family)')
+                    f'{_gfdr_repr(tier_raw)}; only exploratory claims belong '
+                    'in this readout (confirmatory claims stay in the frozen '
+                    'Holm family)')
         if not tier_declared:
             # An artifact records the canonical tier plus whether the caller
             # actually declared it.  On replay the canonical string alone
@@ -610,24 +614,31 @@ def _gfdr_forbidden_payload(obj):
 
 
 def _gfdr_compare_claim(stored, replay, name, problems):
+    # Every value in this comparison comes from an untrusted artifact.  Use
+    # the bounded repr for all diagnostics: ``repr(10**10000)`` raises on
+    # Python 3.12's integer-digit limit and would abort replay instead of
+    # reporting the tamper.
+    name_text = _gfdr_repr(name)
     if not isinstance(stored, dict):
-        problems.append(f'claims[{name!r}] is not an object')
+        problems.append(f'claims[{name_text}] is not an object')
         return
-    extra = sorted(set(stored) - set(_GLOBAL_FDR_CLAIM_FIELDS))
+    extra = sorted(set(stored) - set(_GLOBAL_FDR_CLAIM_FIELDS),
+                   key=_gfdr_repr)
     if extra:
         problems.append(
-            f'claims[{name!r}] carries field(s) outside the replay schema: '
-            + ', '.join(repr(key) for key in extra))
+            f'claims[{name_text}] carries field(s) outside the replay schema: '
+            + ', '.join(_gfdr_repr(key) for key in extra))
     missing = sorted(set(_GLOBAL_FDR_CLAIM_FIELDS) - set(stored))
     if missing:
-        problems.append(f'claims[{name!r}] is missing field(s): {missing}')
+        problems.append(f'claims[{name_text}] is missing field(s): {missing}')
     for key in _GLOBAL_FDR_CLAIM_FIELDS:
         if key not in stored:
             continue
         a, b = stored.get(key), replay.get(key)
         if not _gfdr_exact(a, b):
             problems.append(
-                f'claims[{name!r}].{key}: stored={a!r}, replay={b!r}')
+                f'claims[{name_text}].{key}: stored={_gfdr_repr(a)}, '
+                f'replay={_gfdr_repr(b)}')
 
 
 def validate_global_fdr(artifact):
@@ -647,13 +658,13 @@ def validate_global_fdr(artifact):
     if artifact.get('kind') != GLOBAL_FDR_ARTIFACT_KIND:
         out['problems'].append(
             f'artifact.kind must be {GLOBAL_FDR_ARTIFACT_KIND!r}, got '
-            f'{artifact.get("kind")!r}')
+            f'{_gfdr_repr(artifact.get("kind"))}')
     schema = artifact.get('schema')
     if (isinstance(schema, bool) or not isinstance(schema, int)
             or schema != GLOBAL_FDR_ARTIFACT_SCHEMA):
         out['problems'].append(
             f'artifact.schema must be {GLOBAL_FDR_ARTIFACT_SCHEMA}, got '
-            f'{schema!r}')
+            f'{_gfdr_repr(schema)}')
     stolen = sorted(set(_gfdr_forbidden_payload(artifact)))
     if stolen:
         out['problems'].append(
@@ -675,11 +686,12 @@ def validate_global_fdr(artifact):
     if missing:
         out['problems'].append(
             f'artifact.inputs is missing required key(s): {missing}')
-    extra_inputs = sorted(set(inputs) - set(_GLOBAL_FDR_INPUT_KEYS))
+    extra_inputs = sorted(set(inputs) - set(_GLOBAL_FDR_INPUT_KEYS),
+                          key=_gfdr_repr)
     if extra_inputs:
         out['problems'].append(
             'artifact.inputs carries field(s) outside the replay schema: '
-            + ', '.join(repr(key) for key in extra_inputs))
+            + ', '.join(_gfdr_repr(key) for key in extra_inputs))
     recorded = artifact.get('content_sha256')
     out['content_sha256'] = recorded if isinstance(recorded, str) else None
     body = {k: v for k, v in artifact.items()
@@ -704,11 +716,12 @@ def validate_global_fdr(artifact):
             out['problems'].append(
                 f'artifact.inputs.claims[{i}] is not an object')
             continue
-        extra = sorted(set(row) - set(_GLOBAL_FDR_CLAIM_INPUT_KEYS))
+        extra = sorted(set(row) - set(_GLOBAL_FDR_CLAIM_INPUT_KEYS),
+                       key=_gfdr_repr)
         if extra:
             out['problems'].append(
                 f'artifact.inputs.claims[{i}] carries field(s) outside the '
-                'replay schema: ' + ', '.join(repr(key) for key in extra))
+                'replay schema: ' + ', '.join(_gfdr_repr(key) for key in extra))
         miss = sorted(set(_GLOBAL_FDR_CLAIM_INPUT_KEYS) - set(row))
         if miss:
             out['problems'].append(
@@ -728,27 +741,27 @@ def validate_global_fdr(artifact):
     if not isinstance(stored, dict):
         out['problems'].append('artifact.result must be an object')
         return out
-    extra = sorted(set(stored) - set(replay))
+    extra = sorted(set(stored) - set(replay), key=_gfdr_repr)
     if extra:
         out['problems'].append(
             'result carries field(s) outside the replay schema: '
-            + ', '.join(repr(key) for key in extra))
+            + ', '.join(_gfdr_repr(key) for key in extra))
     for key in _GLOBAL_FDR_SCALAR_FIELDS:
         if key not in stored:
             out['problems'].append(f'result.{key} is missing')
             continue
         if not _gfdr_exact(stored.get(key), replay.get(key)):
             out['problems'].append(
-                f'result.{key}: stored={stored.get(key)!r}, '
-                f'replay={replay.get(key)!r}')
+                f'result.{key}: stored={_gfdr_repr(stored.get(key))}, '
+                f'replay={_gfdr_repr(replay.get(key))}')
     for key in _GLOBAL_FDR_LIST_FIELDS:
         if key not in stored:
             out['problems'].append(f'result.{key} is missing')
             continue
         if stored.get(key) != replay.get(key):
             out['problems'].append(
-                f'result.{key}: stored={stored.get(key)!r}, '
-                f'replay={replay.get(key)!r}')
+                f'result.{key}: stored={_gfdr_repr(stored.get(key))}, '
+                f'replay={_gfdr_repr(replay.get(key))}')
     if stored.get('policy') != replay.get('policy'):
         out['problems'].append('result.policy differs from the replay')
     stored_claims = stored.get('claims')
@@ -756,17 +769,20 @@ def validate_global_fdr(artifact):
     if not isinstance(stored_claims, dict):
         out['problems'].append('result.claims must be an object')
     else:
-        extra_claims = sorted(set(stored_claims) - set(replay_claims))
-        missing_claims = sorted(set(replay_claims) - set(stored_claims))
+        extra_claims = sorted(set(stored_claims) - set(replay_claims),
+                             key=_gfdr_repr)
+        missing_claims = sorted(set(replay_claims) - set(stored_claims),
+                                key=_gfdr_repr)
         if extra_claims:
             out['problems'].append(
                 'result.claims carries undeclared claim(s): '
-                + ', '.join(repr(name) for name in extra_claims))
+                + ', '.join(_gfdr_repr(name) for name in extra_claims))
         if missing_claims:
             out['problems'].append(
                 'result.claims is missing claim(s): '
-                + ', '.join(repr(name) for name in missing_claims))
-        for name in sorted(set(stored_claims) & set(replay_claims)):
+                + ', '.join(_gfdr_repr(name) for name in missing_claims))
+        for name in sorted(set(stored_claims) & set(replay_claims),
+                           key=_gfdr_repr):
             _gfdr_compare_claim(stored_claims[name], replay_claims[name],
                                 name, out['problems'])
     if not out['problems']:

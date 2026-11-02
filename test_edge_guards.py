@@ -72,3 +72,67 @@ def test_normal_quantile_does_not_clamp_at_the_old_bracket_edge():
         -37.0470962993612, abs=1e-10)
     assert L._normal_quantile(1.0 - 1e-16) > 8.0
     assert L._normal_quantile(0.0) != L._normal_quantile(0.0)  # NaN
+
+
+def test_distribution_tails_reject_absurd_arguments_without_raising():
+    # ``float(10**400)`` raises OverflowError.  The distribution helpers must
+    # map that valid integer to its mathematical limit (an infinite statistic
+    # or infinite df), or return NaN for a non-measurement, never escape.
+    assert L.student_t_two_sided_p(10 ** 400, 10) == 0.0
+    assert L.student_t_two_sided_p(1.0, 10 ** 400) == pytest.approx(
+        math.erfc(1.0 / math.sqrt(2.0)), rel=1e-14)
+    assert L.chi2_sf(10 ** 400, 10) == 0.0
+    assert L.chi2_sf(-(10 ** 400), 10) == 1.0
+    assert L.chi2_sf(1.0, 10 ** 400) == 1.0
+    assert L._t_critical(0.95, 10 ** 400) == pytest.approx(
+        1.959963984540054, rel=1e-14)
+    for bad in (True, '1', b'1', None):
+        assert math.isnan(L.student_t_two_sided_p(bad, 10))
+        assert math.isnan(L.chi2_sf(1.0, bad))
+        assert math.isnan(L._t_critical(0.95, bad))
+    # Ordinary values are unchanged.
+    assert L.student_t_two_sided_p(0.0, 10) == 1.0
+    assert L.chi2_sf(3.841458820694124, 1.0) == pytest.approx(0.05, abs=1e-12)
+
+
+def test_global_fdr_huge_tamper_is_a_reported_failure_not_a_crash():
+    import copy
+    import json
+
+    art = L.build_global_fdr([{'name': 'a', 'p': 0.01, 'n_nonzero': 12}])
+    for path in (('result', 'n_reject'), ('result', 'm_declared'),
+                 ('result', 'alpha'), ('result', 'claims', 'a', 'q'),
+                 ('schema',), ('kind',), ('result', 'warnings')):
+        bad = copy.deepcopy(art)
+        node = bad
+        for key in path[:-1]:
+            node = node[key]
+        node[path[-1]] = [10 ** 10000] if path[-1] == 'warnings' else 10 ** 10000
+        verdict = L.validate_global_fdr(bad)
+        assert verdict['status'] == 'fail', (path, verdict)
+        assert verdict['problems'], (path, verdict)
+        # Formatting the diagnostic must not hit Python's integer-digit limit.
+        json.dumps(verdict, allow_nan=False)
+
+
+def test_global_fdr_treats_numeric_strings_as_non_measurements():
+    got = L.global_fdr({'a': '0.01', 'b': b'0.02'})
+    assert got['status'] == 'not_applicable', got
+    assert got['claims']['a']['p'] is None
+    assert got['claims']['b']['p'] is None
+    with pytest.raises(ValueError, match='p_floor'):
+        L.global_fdr({'a': {'p': 0.2, 'p_floor': '0.1'}})
+
+
+def test_frontier_cap_accepts_an_arbitrary_precision_max_points():
+    cells = []
+    for i in range(20):
+        cells.append({'label': f'a::seed{i}', 'variant': 'a', 'block': str(i)})
+        cells.append({'label': f'b::seed{i}', 'variant': 'b', 'block': str(i)})
+    comps = [{'name': 'a-b', 'a': 'a', 'b': 'b'}]
+    out = L.truncation_frontier(
+        cells, comps, min_n=2, complete_coverage=False,
+        required_blocks=[str(i) for i in range(20)],
+        max_points=10 ** 400)
+    assert out['status'] == 'ok', out['problems']
+    assert len(out['points']) <= len(cells)

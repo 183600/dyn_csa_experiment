@@ -450,7 +450,13 @@ def truncation_frontier(cells, comparisons, *, min_n, complete_coverage,
     arm_counts = collections.Counter()
     pairs = {comp['name']: 0 for comp in comps}
     complete_seeds = 0
-    sample_every = max(1, int(math.ceil(n_cells / float(max_points))))
+    # Integer ceiling division: ``n_cells / float(max_points)`` overflows
+    # when a caller supplies an arbitrary-precision ``max_points`` (valid as
+    # an integer but far outside float64's exponent range).  The requested
+    # cap only needs a ratio no larger than one for n_cells <= max_points, so
+    # exact integer arithmetic has the same sampling behaviour without a
+    # float conversion.
+    sample_every = max(1, -(-n_cells // int(max_points)))
     # Select the rows once, before the scan.  Block boundaries are the most
     # informative rows, but a panel with more blocks than the point cap must
     # still respect the cap; downsampling keeps the thresholds exact because
