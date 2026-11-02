@@ -1989,6 +1989,7 @@ def run_report(out='audit_report.json'):
     res['exact_tost'] = audit_exact_tost(verbose=False)
     res['global_fdr'] = audit_global_fdr(verbose=False)
     res['ablation_ranking'] = audit_ablation_ranking(verbose=False)
+    res['analysis_multiverse'] = audit_analysis_multiverse(verbose=False)
     res['data_exposure'] = audit_data_exposure()
     if str(os.environ.get('CSA_REPLAY_IN_REPORT', '')).strip().lower() in (
             '1', 'true', 'yes', 'on'):
@@ -2080,6 +2081,13 @@ def _run_cli():
                   'ablation_ranking_artifact': audit_ablation_ranking_artifact,
                   'ablation_ranking_replay': audit_ablation_ranking_artifact,
                   'ablation_ranking_validation': audit_ablation_ranking_artifact})
+    _cmds.update({'analysis_multiverse': audit_analysis_multiverse,
+                  'multiverse': audit_analysis_multiverse,
+                  'pipeline_multiverse': audit_analysis_multiverse,
+                  'analytic_multiverse': audit_analysis_multiverse,
+                  'multiverse_artifact': audit_analysis_multiverse_artifact,
+                  'multiverse_replay': audit_analysis_multiverse_artifact,
+                  'multiverse_validation': audit_analysis_multiverse_artifact})
     _cmds.update({'design_estimability': audit_design_estimability,
                   'estimability': audit_design_estimability,
                   'design_rank': audit_design_estimability,
@@ -2178,6 +2186,9 @@ def _run_cli():
                 'component_ranking', 'attribution_ranking', 'rank_lattice',
                 'ablation_ranking_artifact', 'ablation_ranking_replay',
                 'ablation_ranking_validation',
+                'analysis_multiverse', 'multiverse', 'pipeline_multiverse',
+                'analytic_multiverse', 'multiverse_artifact',
+                'multiverse_replay', 'multiverse_validation',
                 'design_estimability', 'estimability', 'design_rank',
                 'identifiability', 'contrast_estimability', 'design_matrix',
                 'distribution_free_prediction', 'distribution_free',

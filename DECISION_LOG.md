@@ -7059,3 +7059,93 @@ lattice 的指数化路径）；`_PARTS`/Makefile/CLI/report 接线；README 与
 `.github` 路径仍存在。`python audit_gates.py report` 顶层含
 `ablation_ranking`；`python -m explib.confirmation plan` 仍通过；
 完整 CPU 套件在本轮最终树通过。
+
+## 2026-11-02 — 「换个口径也显著」不是稳健性：声明式分析多重宇宙的 IUT 与族内 max-T（本轮结果分析硬化，no new runs）
+
+零 GPU；不新增训练、不读取任何 split、不修改
+`confirmation_frozen*.json` 的字节/臂/种子/端点/α/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未删除、未修改、未移动。
+
+**Problem.** §63 的 `analysis_choice_concordance` 明确只做描述：它把 8 条
+聚合口径并排，但不产生 p 值、不做多重校正，因此不能回答「换一种同样合法
+的口径，效应是否仍然同向且排除零」。§124 也把效应尺度、截尾、加权、文档
+过滤列为未枚举的自由度。实际报告仍可只展示最有利的口径；而把「k 个口径
+里 s 个显著」当成稳健证据会同时违反两件事：逐条 95% 区间并排不是联合
+95% 覆盖；「存在某个口径显著」若作为结论，必须控制整个口径族的 FWER。
+把这两种问题混成一个 p 值，正是 specification curve 最常见的误读。
+
+**Fix.** 新增 `explib/_parts/part_80_analysis_multiverse.py`：
+
+- `analysis_multiverse(specs, primary=, alpha=, min_specs=, min_seeds=)`：
+  每条规格声明唯一 `name`、`family`（同一估计量/尺度）、逐种子配对差
+  `deltas` 与可选 `features`。`primary` 必须事前声明，数据不选择主规格。
+  同一 family 要求完全相同的种子集合才能形成联合符号翻转零分布；不同
+  family 只比较符号与是否拒绝零，绝不把 log ratio、raw Δ、百分比变化、
+  win-balance 塞进同一个 p 值族。
+- **稳健性 = IUT。** 设 `H0_i: θ_i=0`，全部规格的联合零假设是
+  `H0=∪H0_i`，备择是 `H1=∩H1_i`。只要每个规格各自在 α 拒绝，就拒绝
+  H0；IUT 不需要再乘 m，因为「全部拒绝」比任何单个拒绝都难发生。
+  报告 `p_iut=max_i p_i`（保守的合法合并 p）、`all_specs_reject`，再叠加
+  「方向与主规格一致」得到 `robust_across_specs`。把 IUT 当 union 再乘
+  m、或按显著规格数投票，都是错的。
+- **at-least-one = 族内 max-T。** 只在同 family、同尺度、同种子上调用
+  `maxt_signflip_adjust`，给出精确 `p_maxt`/`p_maxt_single`、族临界值与
+  同时区间；`p_maxt` 不能反过来证明「每个规格都非零」。逐条 `ci95` 只
+  作描述，只有 family 的 `ci_simultaneous` 是同时读数，实际尾水平写在
+  `ci_tail_level`。
+- **分辨率。** 每条精确符号翻转 p 的下限是 `2/2**n_nonzero`；IUT 下限是
+  各规格下限的最大值。若大于 α，`pattern='resolution_limited'`，必须说
+  「当前种子数不可分辨」，不能写成「无效应」或「稳健」。
+- **选择影响。** 同 family 内按 `features` 计算描述性边际
+  `feature_influence`：每 level 的规格数/均值/范围/符号集合，跨 level 的
+  `spread`、`relative_to_primary`、`sign_flip`，以及
+  `most_influential_feature`。它回答「哪个声明选择与最大点估计移动
+  相关」，不是方差分解；features 通常交叉且不平衡。
+- `pattern` 为 `stable`/`direction_unstable`/`precision_unstable`/
+  `resolution_limited`/`zero_effect`/`insufficient_specs`；`status` 为
+  `ok`/`warnings`/`not_estimable`。`build_analysis_multiverse` 拒绝
+  `insufficient_specs`（空族不是证据），但方向翻转、精度不足、分辨率
+  不足是实测结果，照常落盘并由 gate 报 warning。
+- `build_/validate_/write_analysis_multiverse`：`inputs={specs,primary,
+  alpha,min_specs,min_seeds}` + `result`，`content_sha256` 只排除
+  `created_at` 与自身；从 `inputs` 完整重放并逐字段对账；缺 hash、改
+  estimate/p/family/influence/pattern、增删规格、非规范输入、超 schema、
+  夹带 `confirmed`/`verified`/`verdict`/`p_holm` 等冻结字段均 fail。
+  writer 同内容 no-op、不同内容默认 conflict，显式 `overwrite=True` 才
+  替换。
+- 新增 `audit_gates.py analysis_multiverse`（别名 `multiverse` /
+  `pipeline_multiverse` / `analytic_multiverse` /
+  `multiverse_artifact`）：缺 `analysis_v12/analysis_multiverse.json` 或
+  `not_estimable` 报 `not_verifiable_locally`，`stable` 报 `ok`，非稳健
+  模式报 `warnings`，篡改报 `fail`。`audit_gates.py report` 顶层新增
+  `analysis_multiverse`；新增 `make multiverse`；
+  `analysis_multiverse_markdown(result)` 渲染规格表。
+
+**Boundary.** 这是**探索性稳健性读数**：不产生新的确认 p 值、不进入冻结
+Holm 族、不改变 `p_exact_signflip`/`p_holm`/`verified`/`confirmed`/
+`confirmed_effective`，不重算 PPL、不读 test split、不改
+`CODE_SEMANTICS`。它不能证明规格集合完备；未声明的口径仍是研究者自由
+度，事后按结果增删规格也会破坏 IUT 的解释。IUT 只支持「全部非零」，
+union max-T 只支持「至少一个非零」，两者不可互换；并排的逐条 CI 不是
+联合区间。跨 family 不比较大小、不合成「平均效应」。`deltas` 是声明
+输入；本块不重算原始 PPL，也不证明逐种子差由某个 pipeline 从 raw cells
+算出——那仍由 stamped artifact、`reproduce` 与冻结锁负责。它不修复训练
+随机性、文档聚类、缺失种子、winner's curse、checkpoint 选择或跨语料
+外推；旧报告没有该 artifact 时 gate 报 `not_verifiable_locally`，不回填
+历史稳健性结论。
+
+**Verification.** 新增 `test_review_part_87.py` 19 项：稳定族的
+`p_iut=max p_i`、`2/2**n` 下限、逐 spec CI 与族内同时区间；一个反向
+规格关闭 `robust_across_specs` 但保留可计算的 union/max-T；同向但一个
+规格不拒绝的 `precision_unstable`；n=4 的 `resolution_limited`（分辨率
+不足 ≠ 无效应）；主规格零效应的 `zero_effect`；规格数不足的
+`not_estimable` 与 build 拒绝；同 family 不同种子集的 `not_comparable`
+（IUT 仍可做）；多 family 不合并大小；feature influence 点名翻号的
+选择；estimate/sd/sem/CI/p 与独立 `statistics`/`_t_critical`/
+`exact_signflip_p` 对账；artifact hash 与 `created_at` 无关、JSON
+round-trip、同输入确定性；八类篡改/缺 hash/超 schema/夹带冻结字段拒绝；
+writer 的 no-op/conflict/overwrite；gate 的 missing/stable/warnings/
+fail/not_estimable 分支；非法 spec/seed/delta/alpha/min_specs/min_seeds/
+primary 的 fail-closed；Markdown、`_PARTS`/Makefile/CLI/report 接线；
+README 与 `.github` 路径仍存在。`python audit_gates.py report` 顶层含
+`analysis_multiverse`；完整 CPU 套件在本轮最终树通过。

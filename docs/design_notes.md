@@ -13973,3 +13973,168 @@ no-op/conflict/overwrite；gate 的 missing/ok/fail 分支；主尺度切换
 直接分析一致（含 log-PPL lattice 的指数化路径）；`_PARTS`/Makefile/
 CLI/report 接线；README 与 `.github` 路径仍存在。完整 CPU 套件在本轮
 最终树通过。
+
+## 144. 换一个口径也显著不是稳健性：声明式分析多重宇宙的交集-并集与族内 max-T（本轮结果分析硬化，no new runs）
+
+零 GPU；不新增训练、不读取任何 split、不修改
+`confirmation_frozen*.json` 的字节/臂/种子/端点/α/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未删除、未修改、未移动。
+
+### 144.1 问题：口径一致性是描述，不是推断
+
+§63 的 `analysis_choice_concordance` 把报告实际使用的 8 条聚合口径并排
+展示，并明确说它「不计算 p 值、不做多重校正、不新增检验」。§124 的跨
+panel 合成也把效应尺度、截尾、加权、文档过滤列为未枚举的自由度。于是
+报告仍可以只展示最有利的一个口径，而读者无法区分两种完全不同的情形：
+
+- **稳健**：在一组事前都说得通的口径下，效应都同向且都排除零；
+- **脆弱**：换一个同样合法的口径，效应缩到零、甚至换号。
+
+把「k 个口径里有 s 个显著」当成证据会同时犯两个错误。第一，逐条 95%
+区间并排不是联合 95% 覆盖；第二，若把「存在某个口径显著」当作结论，就必须
+控制整个口径族的 FWER，而按显著口径数投票既不是 IUT 也不是 FDR。
+
+本片段把「分析口径」变成一个**事前声明、可重放、可审计**的对象，并把
+两个推断问题分开：
+
+1. **所有规格都显示同向效应**——交集-并集检验（intersection-union
+   test, IUT）；
+2. **是否存在某个规格显示效应**——族内 max-T（at-least-one / union）。
+
+两者回答不同问题，不能互相替代，也不能把后者的 p 写成前者的证据。
+
+### 144.2 定义：规格、family 与两个零假设
+
+输入是 `specs`：每条规格有唯一 `name`、`family`（同一估计量/尺度）、
+`deltas`（`seed -> 配对差`，正号表示不利方向）以及可选的 `features`
+（`choice -> level`，例如 `scale=log`、`estimator=trimmed`）。`primary`
+必须显式给出，且必须已声明；数据不选择主规格。
+
+**IUT。** 设规格 i 的零假设为 `H0_i: θ_i = 0`，双侧 p 为 `p_i`。
+要主张「每个规格都非零」，零假设是 `H0 = ∪ H0_i`（至少一个为零），
+备择是 `H1 = ∩ H1_i`（全部非零）。只要每个规格各自在 α 水平拒绝，
+就拒绝 `H0`；IUT 的水平由每个分量检验的水平保证，**不需要**再乘 m。
+本片段报告 `p_iut = max_i p_i`（保守的合法合并 p）与
+`all_specs_reject`。再叠加「方向与主规格一致」，得到
+`robust_across_specs`。
+
+**Union / max-T。** 要主张「至少一个规格显示效应」，零假设是
+`∩ H0_i`，必须控制族 FWER。只在**同一 family、同一尺度、同一批种子**
+内调用 `maxt_signflip_adjust`：精确枚举符号翻转，给出 `p_maxt`、
+`p_maxt_single`、族临界值与同时区间。不同 family（例如 log ratio 与
+百分比变化）不进入同一个 p 值族；它们只在符号/是否拒绝零的层面做
+描述性对账。
+
+**区间。** 每条规格的 `ci95` 是逐条 t 区间，只作描述；只有 family 的
+`ci_simultaneous` 是同时区间，且其 `ci_tail_level` 是精确零分布在该
+临界值处的实际尾水平，不能把 `1-alpha` 当成覆盖率的证明。
+
+**分辨率。** 每条精确符号翻转 p 的下限是 `2/2**n_nonzero`；IUT 的下限
+是各规格下限的最大值。若该值大于 α，"所有规格都非零"在当前种子数下
+不可分辨，必须报 `resolution_limited`，不能写成「没有效应」。
+
+**选择影响。** 对同一 family 的 `features` 做**描述性边际**
+`feature_influence`：每个 level 的规格数、均值、范围、符号集合，以及
+跨 level 的 `spread` / `relative_to_primary` / `sign_flip`。它回答
+「哪个声明选择与最大点估计移动相关」，不是方差分解：features 通常
+交叉且不平衡，level 均值仍混有其他选择。
+
+### 144.3 判据与状态
+
+`pattern` 六态：
+
+| pattern | 含义 | 是否支持稳健声明 |
+|---|---|---|
+| `stable` | 全部规格同向、各自 `p<=α`、IUT 下限可分辨 | 是 |
+| `direction_unstable` | 至少一个规格与主规格异号 | 否 |
+| `precision_unstable` | 同向，但至少一个规格不拒绝自己的零 | 否 |
+| `resolution_limited` | IUT 的 `2/2**n` 下限 > α | 否（不是「无效应」） |
+| `zero_effect` | 主规格点估计恰为 0，无方向 | 否 |
+| `insufficient_specs` | 声明数 < `min_specs` | 否（`not_estimable`） |
+
+`status` 为 `ok` / `warnings` / `not_estimable`。`build_analysis_multiverse`
+拒绝 `insufficient_specs`，因为一个空族不是证据；方向翻转、精度不足与
+分辨率不足是**实测结果**，照常落盘并由 gate 报 warning，而不是篡改。
+
+### 144.4 产物、重放与接线
+
+`build_analysis_multiverse` 把规范化后的 `specs`（按 name 排序、
+`[seed, delta]` 对）写进 `inputs`，把 IUT、逐 spec 统计、逐 family
+max-T 与描述性影响写进 `result`；`content_sha256` 只排除 `created_at`
+与自身。`validate_analysis_multiverse` 从 `inputs` 完整重放并逐字段
+对账：缺 hash、改 estimate/p/family/influence/pattern、增删规格、非规范
+输入、超 schema、夹带 `confirmed`/`verified`/`verdict`/`p_holm` 等冻结
+字段均 fail。`write_analysis_multiverse` 同内容 no-op、不同内容默认
+conflict，显式 `overwrite=True` 才替换。
+
+新增 `audit_gates.py analysis_multiverse`：
+缺 `analysis_v12/analysis_multiverse.json` 或 `not_estimable` 为
+`not_verifiable_locally`，`stable` 为 `ok`，`direction_unstable`/
+`precision_unstable`/`resolution_limited`/`zero_effect` 为 `warnings`，
+篡改为 `fail`。`audit_gates.py report` 顶层新增 `analysis_multiverse`；
+新增 `make multiverse`。报告附录可用
+`analysis_multiverse_markdown(result)` 渲染规格表。
+
+### 144.5 边界：它不修复什么
+
+- **不是第二个确认性检验。** 它不产生新的确认 p 值、不进入冻结 Holm
+  族、不改变任何 panel 的 `verified`/`confirmed`、冻结清单、种子、α 或
+  `CODE_SEMANTICS`。
+- **不证明规格集合完备。** 它只能证明「在这组声明过的口径下结果如何」；
+  未声明的口径仍是研究者自由度。规格必须事前声明，事后按结果增删规格
+  仍会破坏 IUT 的「全部拒绝」解释。
+- **不把 IUT 当 union。** `p_iut=max p_i` 只支持「全部非零」；不能拿它
+  说「至少一个显著」。反过来，family max-T 的 `p_maxt` 也不能证明每个
+  规格都非零。
+- **不把逐条 CI 当联合区间。** 并排的 95% 区间不是 95% 同时覆盖；只有
+  family 的 `ci_simultaneous` 是同时读数，且其精确尾水平以
+  `ci_tail_level` 为准。
+- **不合并不同估计量。** log ratio、raw Δ、百分比变化、win-balance 的
+  数值不在同一尺度；跨 family 只比较符号与是否拒绝零，不比较大小，更
+  不合成一个「平均效应」。
+- **不重算每条规格的原始 PPL。** `deltas` 是声明输入；本块校验的是
+  这些逐种子差的内部推断（IUT、family max-T、分辨率、影响读数），不
+  证明它们由某个 pipeline 从 raw cells 算出。provenance 仍由 stamped
+  artifact、`reproduce` 与冻结锁负责，不能把「artifact 重放 ok」当成
+  「原始运行无误」。
+- **不修复设计/数据问题。** 训练随机性、文档聚类、缺失种子、
+  winner's curse、checkpoint 选择、跨语料外推仍由各自的块负责；本块只
+  把「分析口径的选择」显式化并校准其推断。
+- **不追溯旧产物。** 旧报告没有该 artifact 时 gate 报
+  `not_verifiable_locally`，不回填历史稳健性结论。
+
+### 144.6 入口与验证
+
+```bash
+python -m pytest -q test_review_part_87.py
+python audit_gates.py analysis_multiverse          # analysis_v12/analysis_multiverse.json
+python audit_gates.py multiverse PATH              # 显式 artifact 路径
+python audit_gates.py multiverse_artifact PATH
+python audit_gates.py report                       # 顶层 analysis_multiverse
+make multiverse
+```
+
+```python
+import exp_lib as L
+artifact = L.build_analysis_multiverse(
+    specs, primary='primary', alpha=0.05, min_specs=3, min_seeds=2)
+L.write_analysis_multiverse('analysis_v12', artifact)
+print(L.validate_analysis_multiverse(artifact)['status'])
+```
+
+`test_review_part_87.py` 19 项覆盖：稳定族的 IUT `p=max p_i`、`2/2**n`
+下限、逐 spec CI 与族内同时区间；一个反向规格把
+`robust_across_specs` 关掉但保留可计算的 union/max-T；同向但一个规格
+不拒绝时的 `precision_unstable`（不是「多数显著即可」）；n=4 的
+`resolution_limited` 与「分辨率不足 ≠ 无效应」；主规格零效应的
+`zero_effect`；规格数不足的 `not_estimable` 与 build 拒绝；同 family
+不同种子集的 `not_comparable`（IUT 仍可做）；多 family 不合并大小、
+不冒充单一尺度；feature influence 点名翻号的选择；estimate/sd/sem/CI/
+p 与独立 `statistics`/`_t_critical`/`exact_signflip_p` 对账；`1e308`/
+`1e-200` 面板不溢出且精确 p 尺度不变；artifact
+hash 与 `created_at` 无关、JSON round-trip、同输入确定性；八类篡改/
+缺 hash/超 schema/夹带冻结字段拒绝；writer 的 no-op/conflict/overwrite；
+gate 的 missing/stable/warnings/fail/not_estimable 分支；非法
+spec/seed/delta/alpha/min_specs/min_seeds/primary 的 fail-closed；
+Markdown、`_PARTS`/Makefile/CLI/report 接线；README 与 `.github` 路径
+仍存在。完整 CPU 套件在本轮最终树通过。

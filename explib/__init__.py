@@ -90,6 +90,7 @@ _PARTS = [
 'part_77_exact_tost.py',
 'part_78_global_fdr.py',
 'part_79_ablation_ranking.py',
+'part_80_analysis_multiverse.py',
 ]
 
 load_root_package(globals(), __file__, _PARTS,

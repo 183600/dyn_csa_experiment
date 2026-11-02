@@ -426,6 +426,17 @@
                训练、不读 split、不改冻结 p/Holm/confirmed
                （零 GPU；别名 ablation_inference / shapley_ranking /
                component_ranking / attribution_ranking / rank_lattice）
+  analysis_multiverse  结果分析：分析口径的多重宇宙——从逐种子配对差重放
+               一组事前声明的分析规格；所有规格同向且各自拒绝时报告
+               交集-并集（IUT）稳健性（无需多重校正），族内再给精确
+               sign-flip max-T 的 at-least-one 读数与同时区间；逐条 CI
+               只作描述，非同时覆盖。跨估计量 family 不合并 p 值；
+               重放 analysis_v12/analysis_multiverse.json，缺产物/
+               insufficient 报 not_verifiable_locally，non-robust 模式报
+               warnings，篡改/夹带冻结字段判 fail；不新增训练、不读
+               split、不改冻结 p/Holm/confirmed（零 GPU；别名 multiverse /
+               pipeline_multiverse / analytic_multiverse /
+               multiverse_artifact）
   calibration  统计机器的零假设校准：精确符号翻转 / MITM / n>40 鞍点 /
                max-over-looks 序列 p / 配对 TOST / Holm 的负控制（超发率）
                与正控制（灵敏度），以及 seed-t / paired bootstrap-t /
