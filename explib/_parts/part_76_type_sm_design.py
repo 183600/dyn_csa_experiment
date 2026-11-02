@@ -118,8 +118,18 @@ def _tsm_pdf(x):
 
 
 def _tsm_cdf(x):
-    # sqrt-free stable form; for very negative x erf returns -1 and this is 0.
-    return 0.5 * (1.0 + math.erf(x / _SQRT2))
+    # erfc is accurate in the lower tail; the old 0.5*(1+erf(x)) form rounded
+    # every x below about -8.3 to exactly 0, turning a small but real power
+    # into "not computable".  It also cancels for large positive x, which is
+    # why the upper tail is evaluated through _tsm_sf below.
+    x = float(x)
+    return 0.5 * math.erfc(-x / _SQRT2)
+
+
+def _tsm_sf(x):
+    # Upper tail P(Z > x); erfc keeps the far upper tail representable and
+    # avoids 1 - cdf cancellation.
+    return 0.5 * math.erfc(float(x) / _SQRT2)
 
 
 def _tsm_quantile(p):
@@ -168,7 +178,7 @@ def _tsm_metrics(n, lam, z):
         return None
     if not (isinstance(z, (int, float)) and math.isfinite(z) and z > 0.0):
         return None
-    upper = 1.0 - _tsm_cdf(z - lam)
+    upper = _tsm_sf(z - lam)
     lower = _tsm_cdf(-z - lam)
     power = upper + lower
     if power <= 0.0:
@@ -184,7 +194,7 @@ def _tsm_metrics(n, lam, z):
     # conditional event is |Z| > max(z, 2*lam); a naive P(|Z| > 2*lam) can
     # exceed the rejection probability when 2*lam < z.
     _cut = max(z, 2.0 * lam)
-    p_over_2 = ((1.0 - _tsm_cdf(_cut - lam))
+    p_over_2 = ((_tsm_sf(_cut - lam))
                 + _tsm_cdf(-_cut - lam)) / power
     # P(|Z| < lam/2 | reject).  This is empty unless the understatement band
     # overlaps the rejection region; otherwise the earlier formula divided the
@@ -193,8 +203,8 @@ def _tsm_metrics(n, lam, z):
     if 0.5 * lam <= z:
         p_under_half = 0.0
     else:
-        p_under_half = ((_tsm_cdf(0.5 * lam - lam)
-                         - _tsm_cdf(z - lam))
+        p_under_half = ((_tsm_sf(z - lam)
+                         - _tsm_sf(0.5 * lam - lam))
                         + (_tsm_cdf(-z - lam)
                            - _tsm_cdf(-0.5 * lam - lam))) / power
     return {

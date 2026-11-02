@@ -439,6 +439,9 @@ def _doc_bootstrap_ppl_ci(recs, *, n_boot=2000, seed=20261018):
     if (_n_draws is None or _n_draws < 2
             or _n_draws > BOOTSTRAP_HARD_MAX_DRAWS):
         return None
+    _seed = _as_seed_int(seed)
+    if _seed is None or _seed < 0:
+        return None
     recs = list(recs)
     _nested_flags = {r.get('ppl_estimation_rows') == 'nested_validation_holdout'
                      for r in recs if isinstance(r, dict)}
@@ -471,7 +474,7 @@ def _doc_bootstrap_ppl_ci(recs, *, n_boot=2000, seed=20261018):
         return None
     nll_mat = np.stack([a for a, _ in rows], axis=0)          # [S, R]
     ntok_mat = np.stack([b for _, b in rows], axis=0)         # [S, R]
-    rng = np.random.default_rng(int(seed))
+    rng = np.random.default_rng(_seed)
     nll_col = nll_mat.sum(axis=0)
     ntok_col = ntok_mat.sum(axis=0)
     vals = np.empty(_n_draws, dtype=float)
@@ -599,8 +602,9 @@ def _combined_seed_doc_ci(recs, *, n_boot=2000, seed=20261018, conf=0.95):
             f'[20, {BOOTSTRAP_HARD_MAX_DRAWS}] for a percentile bootstrap')
         return out
     _seed = _as_seed_int(seed)
-    if _seed is None:
-        out['reason'] = f'seed={seed!r} is not an integer; draws are not reproducible'
+    if _seed is None or _seed < 0:
+        out['reason'] = (f'seed={seed!r} must be a non-negative integer; '
+                         'draws are not reproducible')
         return out
     out['conf'] = float(_conf)
     S = len(recs)
@@ -736,8 +740,9 @@ def paired_row_bootstrap_delta(pairs, *, n_boot=1000, seed=20261018, conf=0.95):
             f'[20, {BOOTSTRAP_HARD_MAX_DRAWS}] for a percentile bootstrap')
         return out
     _seed = _as_seed_int(seed)
-    if _seed is None:
-        out['reason'] = f'seed={seed!r} is not an integer; draws are not reproducible'
+    if _seed is None or _seed < 0:
+        out['reason'] = (f'seed={seed!r} must be a non-negative integer; '
+                         'draws are not reproducible')
         return out
     out['n_boot'] = int(_nb)
     out['conf'] = float(_conf)
@@ -961,10 +966,10 @@ def paired_nll_two_way_bootstrap(nll_a, nll_b, n_tokens, *, n_boot=2000,
             f'integer in [20, {BOOTSTRAP_HARD_MAX_DRAWS}] for a percentile '
             'bootstrap')
     _seed = _as_seed_int(seed)
-    if _seed is None:
+    if _seed is None or _seed < 0:
         raise ValueError(
-            f'paired_nll_two_way_bootstrap: seed={seed!r} is not an integer; '
-            'draws are not reproducible')
+            f'paired_nll_two_way_bootstrap: seed={seed!r} must be a '
+            'non-negative integer; draws are not reproducible')
     S, D = A.shape
     out.update({'n_seeds': int(S), 'n_units': int(D),
                 'n_boot': int(_nb), 'conf': float(conf)})

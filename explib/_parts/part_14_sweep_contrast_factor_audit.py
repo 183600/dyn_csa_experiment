@@ -934,21 +934,29 @@ def planned_power_audit(manifest, *, require_projection=False):
 
 
 def _normal_cdf(x):
-    return 0.5 * (1.0 + math.erf(float(x) / math.sqrt(2.0)))
+    # erfc is accurate in both tails.  The previous 0.5*(1+erf(x)) form lost
+    # every probability below about 1e-19 and could not serve as a bracketing
+    # function for the quantile helper.
+    return 0.5 * math.erfc(-float(x) / math.sqrt(2.0))
 
 
 def _normal_quantile(p):
-    p = float(p)
+    # A fixed [-9, 9] bisection silently returned the bracket edge for
+    # p < Phi(-9) (or p > Phi(9)), so an extreme target power produced a
+    # wrong (too small) minimum detectable effect.  NormalDist::inv_cdf is
+    # accurate across the representable probability range and returns a
+    # finite value for every 0 < p < 1 here.
+    from statistics import NormalDist
+    try:
+        p = float(p)
+    except (TypeError, ValueError, OverflowError):
+        return float('nan')
     if not (0.0 < p < 1.0):
         return float('nan')
-    lo, hi = -9.0, 9.0
-    for _ in range(100):
-        mid = 0.5 * (lo + hi)
-        if _normal_cdf(mid) < p:
-            lo = mid
-        else:
-            hi = mid
-    return 0.5 * (lo + hi)
+    try:
+        return float(NormalDist().inv_cdf(p))
+    except (ValueError, OverflowError):
+        return float('nan')
 
 
 def _design_direction(value):

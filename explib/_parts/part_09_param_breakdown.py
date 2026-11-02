@@ -1572,6 +1572,16 @@ def _bootstrap_t_interval(values, *, n_boot, seed, conf):
                            f'integer in [2, {BOOTSTRAP_HARD_MAX_DRAWS}] '
                            f'(got {n_boot!r})'),
                 'n_boot_studentized': 0}
+    # numpy's Generator rejects a negative seed.  Validate it here (rather than
+    # letting it escape as ValueError) because this helper is called by every
+    # report builder and by replay code: a malformed artifact field must yield
+    # an unavailable interval, not crash the report.
+    _seed = _as_seed_int(seed)
+    if _seed is None or _seed < 0:
+        return {'ci_low': None, 'ci_high': None,
+                'method': ('bootstrap interval unavailable: seed must be a '
+                           f'non-negative integer (got {seed!r})'),
+                'n_boot_studentized': 0}
     # Square-based sd under/overflows for extreme but finite magnitudes.  The
     # studentized statistic is scale invariant, so run the whole bootstrap on
     # a unit-scaled copy and map the interval endpoints back afterwards.
@@ -1583,7 +1593,7 @@ def _bootstrap_t_interval(values, *, n_boot, seed, conf):
     mean = float(v.mean())
     sd = float(v.std(ddof=1)) if n > 1 else float('nan')
     se = sd / math.sqrt(n) if n > 1 and math.isfinite(sd) else float('nan')
-    rng = np.random.default_rng(int(seed))
+    rng = np.random.default_rng(_seed)
     means = np.empty(nb, dtype=float)
     tstats = np.empty(nb, dtype=float)
     chunk = _bootstrap_draw_chunk(n)
@@ -1656,7 +1666,8 @@ def bootstrap_mean_ci(values, *, n_boot=4000, seed=20261018, conf=0.95):
         return None
     nb = _as_seed_int(n_boot)
     sd = _as_seed_int(seed)
-    if nb is None or sd is None or isinstance(conf, (bool, np.bool_)):
+    if (nb is None or sd is None or sd < 0
+            or isinstance(conf, (bool, np.bool_))):
         return None
     if nb < 20 or nb > BOOTSTRAP_HARD_MAX_DRAWS or not (0.0 < c < 1.0):
         return None

@@ -18,7 +18,7 @@ def paired_bootstrap_ci(deltas, *, n_boot=4000, seed=20261018):
     # for every displayed contrast.
     nb = _as_seed_int(n_boot)
     sd = _as_seed_int(seed)
-    if (nb is None or sd is None or nb < 2
+    if (nb is None or sd is None or sd < 0 or nb < 2
             or nb > BOOTSTRAP_HARD_MAX_DRAWS):
         return None
     _ci = _bootstrap_t_interval(d, n_boot=nb, seed=sd, conf=0.95)
@@ -35,7 +35,7 @@ def unpaired_bootstrap_ci(with_values, without_values, *, n_boot=4000, seed=2026
         return None
     nb = _as_seed_int(n_boot)
     sd = _as_seed_int(seed)
-    if (nb is None or sd is None or nb < 2
+    if (nb is None or sd is None or sd < 0 or nb < 2
             or nb > BOOTSTRAP_HARD_MAX_DRAWS):
         return None
     # The bootstrap is a mean-difference, so its unit is arbitrary.  For a
