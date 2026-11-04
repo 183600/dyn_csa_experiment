@@ -137,6 +137,44 @@ ABLATION_MANIPULATION_DESIGN = {
         'note': ('a CSA->HCA layer swap changes the attention operator itself, '
                  'so the initial logits must differ'),
     },
+    # 2x2 factorial interaction components: each crossed contrast reuses a
+    # pair of arms that the leave-one-out family already manipulates, so the
+    # declared mode mirrors the underlying factor.  `dynamic_comp_interaction`
+    # is `training` because the compression regularizer is a loss-term-only
+    # intervention (same forward at initialization, like
+    # `compression_regularizer`); the other four cross architectural factors
+    # whose presence/values change the initial forward.
+    'hybrid_blocking_factorisation': {
+        'mode': 'forward',
+        'note': ('dynamic vs fixed cuts inside the hybrid change the block '
+                 'geometry at initialization, exactly like the standalone '
+                 'dynamic_blocking contrast; identical logits would mean the '
+                 'cut policy never fired on the probe'),
+    },
+    'selection_sink_interaction': {
+        'mode': 'forward',
+        'note': ('selection crossed with the sink: removing the sink or '
+                 'freezing it at random values changes the softmax denominator '
+                 'on the fixed probe, so the initial read must differ'),
+    },
+    'content_alignment_interaction': {
+        'mode': 'forward',
+        'note': ('selection crossed with content: zeroed or shifted block '
+                 'content changes the read at initialization; identical '
+                 'outputs would mean the content path is unused'),
+    },
+    'fusion_sink_interaction': {
+        'mode': 'forward',
+        'note': ('the fusion kernel is identity at initialization, but the '
+                 'no-sink arm still changes the softmax denominator, so the '
+                 'crossed contrast must differ in the initial forward'),
+    },
+    'dynamic_comp_interaction': {
+        'mode': 'training',
+        'note': ('the compression-regularizer ablation is the same forward '
+                 'function at initialization; only the comp_reg objective and '
+                 'the gate gradient path may differ'),
+    },
 }
 
 

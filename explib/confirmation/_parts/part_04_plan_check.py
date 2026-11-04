@@ -47,21 +47,27 @@ def plan_check(manifest_path=FREEZE_MANIFEST):
     _min_holm = L.holm_min_attainable_p(_n_min, len(m['primary_comparisons']), _alpha) if _n_min >= 2 else float('inf')
     if not math.isfinite(_min_holm) or _min_holm > _alpha:
         errs.append(f'the pre-registered minimum n={_n_min} cannot attain Holm significance (min attainable Holm p={_min_holm:.4g} > alpha={_alpha})')
-    # Pre-test power gate: compute exact conditional power from the P5C validation
-    # deltas (which are available without reading the test split).  If power at
-    # q=0.95 is below min_power_for_test=0.8, refuse P5T until seeds are added
-    # and a revision is recorded before touching test data.
-    from explib.methodology_steps.step_00 import signflip_power
-    _q_for_gate = 0.95
-    _power_q95 = signflip_power(_n_min, len(m['primary_comparisons']), _q_for_gate, _alpha)
-    _min_power_for_test = 0.8
-    if _power_q95 < _min_power_for_test:
+    # Pre-test power gate (symbol-test projection at the frozen design point).
+    # The manifest's own `power_first_holm_gate` table is evaluated at the FULL
+    # declared seed panel -- with require_complete_coverage=true every frozen
+    # seed must enter a confirmed verdict, so the plan-level projection uses
+    # len(seeds), not the resolution floor min_seeds_for_confirmation.  The
+    # exact conditional power from the P5C validation deltas stays in the
+    # `power` phase (run_power), which is the gate that actually refuses P5T;
+    # this block only refuses a plan whose frozen panel cannot even reach the
+    # declared symbol-test design point.
+    _q_for_gate = float(_stat.get('power_q_for_test', 0.95))
+    _min_power_for_test = float(_stat.get('min_power_for_test', 0.80))
+    _n_panel = len(seeds)
+    _power_q = L.signflip_power(_n_panel, len(m['primary_comparisons']), _q_for_gate, _alpha)
+    if _power_q < _min_power_for_test:
         errs.append(
-            f'pre-test power gate FAILED: conditional power at q={_q_for_gate} is '
-            f'{_power_q95:.3f} < {_min_power_for_test} (min required).  P5T would '
-            f'refuse.  Add seeds and record a revision in confirmation_frozen.json '
-            f'BEFORE touching the test split (V12_ALLOW_LOW_POWER=1 is the explicit '
-            f'override).  q=0.90 sensitivity is reported at {signflip_power(_n_min, len(m["primary_comparisions"]), 0.90, _alpha):.3f}'
+            f'pre-test power gate FAILED: symbol-test power at q={_q_for_gate:.2f} is '
+            f'{_power_q:.3f} < {_min_power_for_test:.3f} (min required) on the full '
+            f'frozen panel (n={_n_panel}).  P5T would refuse.  Add seeds and record '
+            f'a revision in confirmation_frozen.json BEFORE touching the test split '
+            f'(V12_ALLOW_LOW_POWER=1 is the explicit override).  q=0.90 sensitivity '
+            f'is {L.signflip_power(_n_panel, len(m["primary_comparisons"]), 0.90, _alpha):.3f}'
         )
     # Predict the implementation descriptor exactly as the trainer will.
     _dev = type('_PlanCuda', (), {'type': 'cuda'})()

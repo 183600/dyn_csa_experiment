@@ -50,7 +50,10 @@ try:
                 }
                 _joint_entries[_jk_key] = _jk_e
     if _m_declared > 0:
-        from explib.methodology_steps.step_00 import maxt_joint_correction, signflip_min_n_for_holm
+        # maxt_joint_correction / signflip_min_n_for_holm live in the explib
+        # globals that methodology_audit already injects via _step_env; the
+        # step fragments are NOT importable modules (they execute inside the
+        # audit's namespace), so no import is needed or possible here.
         _joint = maxt_joint_correction(_joint_records, alpha=_alpha, family_size=_m_declared)
     else:
         _joint = {
@@ -99,7 +102,11 @@ try:
         'family_size': _joint.get('family_size'),
         'n_groups': _joint.get('n_groups'),
         'alpha': float(_alpha),
-        'best_case': signflip_min_n_for_holm(_alpha),
+        # NOTE: maxt_min_n_for_alpha(alpha) is the best-case design-floor
+        # helper (dict with min_n/p_floor, part_40); signflip_min_n_for_holm
+        # is a DIFFERENT function taking (m_comparisons, alpha) and returning
+        # a bare int/None — passing alpha as m returns None.
+        'best_case': maxt_min_n_for_alpha(_alpha),
         'role': _joint.get('role'),
         'n_maxt_reject': sum(1 for _r in (_joint.get('by_key') or {}).values()
                              if _r.get('reject_maxt')),
@@ -166,16 +173,16 @@ try:
             'Adding seeds after seeing a non-significant result is one of the looks, '
             'not a free rerun.' % (len(_downgraded), ', '.join(_downgraded[:5])))
 
-    # --- cross-panel comparability ---
-    # Checks whether the same arm label is measured under the same protocol/provenance
-    # across different panels.  Contrasts that splice different runs of the same arm
-    # or compare components in disconnected graphs are flagged.
-    from explib._parts.part_63_cross_panel_synthesis import cross_panel_synthesis_audit
-    _cross_panel = cross_panel_synthesis_audit(
-        all_entries, alpha=_alpha, min_n=_min_n)
-    report['cross_panel'] = _cross_panel
-    for _cp_w in _cross_panel.get('warnings') or []:
-        report['warnings'].append('cross-panel: ' + str(_cp_w))
+    # --- cross-panel comparability: NOT available here ---
+    # cross_panel_synthesis (part_63) synthesizes MULTIPLE panel reports and
+    # has no single-panel entry-point form; it runs at the report level, not
+    # inside one methodology_audit.  A per-panel cross-reference block was
+    # drafted here against a function that does not exist
+    # (cross_panel_synthesis_audit) and was unreachable dead code until the
+    # namespace bug above was fixed, so it is removed rather than wired to a
+    # wrong signature.  The real cross-panel gates remain
+    # cross_panel_synthesis / ablation_coverage_across_panels at the report
+    # layer.
 
 except Exception as _e:
     report['warnings'].append(

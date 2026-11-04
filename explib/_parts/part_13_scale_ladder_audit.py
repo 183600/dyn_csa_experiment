@@ -1271,6 +1271,45 @@ ABLATION_SESOI = {
         'relative_pct': 1.0,
         'rationale': 'The CSA+HCA hierarchy must beat CSA-only by >=1% PPL to support a complementary-layer claim.',
     },
+    # 2x2 factorial interaction families: every simple-effect edge reuses a
+    # pair of arms that its leave-one-out component already schedules, so the
+    # margin mirrors the underlying factor's own 1% rule.  A non-significant
+    # crossed edge can then be read as 'practically additive / removable' at
+    # the same threshold as the knob-level factors, keeping the exploratory
+    # interaction readout on the same SESOI scale as the confirmatory one.
+    'hybrid_blocking_factorisation': {
+        'relative_pct': 1.0,
+        'rationale': ('A dynamic-vs-fixed edge inside the hybrid must move PPL '
+                      'by >=1% on an attention axis to support a factorised '
+                      'dynamic-blocking claim; smaller crossed shifts are '
+                      'within recipe variation.'),
+    },
+    'selection_sink_interaction': {
+        'relative_pct': 1.0,
+        'rationale': ('A sink edge (learned vs absent, or learned vs frozen '
+                      'random) must move PPL by >=1% at fixed blocking to keep '
+                      'the selection_x_sink ladder interpretable; smaller '
+                      'shifts cannot distinguish the sink from noise.'),
+    },
+    'content_alignment_interaction': {
+        'relative_pct': 1.0,
+        'rationale': ('A content edge (pooled vs zero, or aligned vs shifted) '
+                      'must move PPL by >=1% at fixed blocking; smaller shifts '
+                      'are treated as no practical content contribution.'),
+    },
+    'fusion_sink_interaction': {
+        'relative_pct': 1.0,
+        'rationale': ('The exploratory fusion_x_sink crossed edge must move '
+                      'PPL by >=1% to be reported as a practically relevant '
+                      'interaction; smaller shifts are read as additive.'),
+    },
+    'dynamic_comp_interaction': {
+        'relative_pct': 1.0,
+        'rationale': ('Removing the compression regularizer must change PPL '
+                      'by >=1% under dynamic blocking to count as a practical '
+                      'comp effect; smaller shifts are read as an inert '
+                      'regularizer.'),
+    },
 }
 
 # ---- 2x2 交互的预注册 SESOI ------------------------------------------------
@@ -1490,6 +1529,34 @@ ABLATION_INTERVENTION_KEYS = {
         # kind 互换（部分层 csa→hca）= 换算子，architecture_level。
         ('hybrid_csa_dyn', 'csa_dynamic'): frozenset({'kind', 'chunking', 'dynamic',
                                                      'block_size', 'target_block_tokens'}),
+        # hybrid 内的动态 HCA 简单效应：与 dynamic_blocking 的 HCA 对同一
+        # 系统级分块束（含 block_size 惰性差与 comp_lambda_mult 训练权重），
+        # 由 CONTRAST_SYSTEM_LEVEL_DECLARATIONS 按 pair 归为 system_level。
+        ('hybrid_hca_dyn', 'hybrid_fixed'): frozenset({'dynamic', 'chunking', 'target_block_tokens',
+                                                       'block_size', 'comp_lambda_mult'}),
+    },
+    # 2x2 factorial 交互组件的简单效应边：每条 pair 复用 leave-one-out 家族
+    # 已调度的臂，键集与该 pair 在既有组件里的实际 diff 完全一致；跨两个
+    # family 的边（fusion×sink）在 CONTRAST_SYSTEM_LEVEL_DECLARATIONS 里
+    # 显式声明为交互简单效应，绝不冒充 knob 级单因素。
+    'hybrid_blocking_factorisation': {
+        ('hybrid_csa_dyn', 'hybrid_fixed'): frozenset({'dynamic', 'chunking', 'target_block_tokens'}),
+        ('hybrid_hca_dyn', 'hybrid_fixed'): frozenset({'dynamic', 'chunking', 'target_block_tokens',
+                                                       'block_size', 'comp_lambda_mult'}),
+    },
+    'selection_sink_interaction': {
+        ('csa_fixed', 'csa_fix_nosink'): frozenset({'use_sink'}),
+        ('csa_fixed', 'csa_fix_randomsink'): frozenset({'sink_mode'}),
+    },
+    'content_alignment_interaction': {
+        ('csa_fixed', 'csa_fix_zerocont'): frozenset({'content_mode'}),
+        ('csa_fixed', 'csa_fix_shiftcont'): frozenset({'content_mode'}),
+    },
+    'fusion_sink_interaction': {
+        ('csa_dyn_fuse', 'csa_dyn_nosink'): frozenset({'fuse_mode', 'use_sink'}),
+    },
+    'dynamic_comp_interaction': {
+        ('csa_dynamic', 'csa_dyn_nocomp'): frozenset({'comp_lambda_mult'}),
     },
 }
 BASELINE_INTERVENTION_KEYS = {
@@ -1527,6 +1594,14 @@ CONTRAST_SYSTEM_LEVEL_DECLARATIONS = {
         'dynamic segmentation bundle + HCA boundary-gate comp_lambda_mult=4 '
         '(and the inert block_size field): a system-level dynamic-vs-fixed '
         'readout, not a knob-level single factor',
+    # fusion×sink 交互简单效应：按构造同时跨 fuse_mode 与 use_sink 两个
+    # family（csa_dyn_fuse 有融合、有 sink；csa_dyn_nosink 无融合、无 sink），
+    # 是 2x2 交互格的边，只作 exploratory 交互读数，不是 knob 级单因素。
+    ('csa_dyn_fuse', 'csa_dyn_nosink'):
+        'the fusion_x_sink interaction edge crosses two declared families '
+        '(fuse_mode + use_sink) by construction; it is read as an exploratory '
+        '2x2 factorial interaction simple effect, never as a knob-level '
+        'single factor',
 }
 
 # Declared single-factor intervention families over the attention cfg: a diff

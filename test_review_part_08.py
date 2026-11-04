@@ -669,7 +669,13 @@ def test_single_factor_design_gate_passes_and_fails_closed():
     import dataclasses as _dc
     rep = L.single_factor_design_audit(verbose=False)
     assert rep['status'] == 'ok', rep['violations'] + rep['undeclared']
-    assert rep['checked_pairs'] == len(L.declared_ablation_pairs()) + sum(
+    # The 2x2 factorial interaction families deliberately reuse arms that
+    # RUN_ABL already schedules, so one arm pair can be declared under more
+    # than one component and EVERY declaration is audited: the count is the
+    # total declared (component, pair) entries, not the deduplicated pair
+    # list (declared_ablation_pairs).
+    assert rep['checked_pairs'] == sum(
+        len(c) for c in L.ABLATION_DESIGN.values()) + sum(
         len(c) for c in L.BASELINE_DESIGN.values()), rep['checked_pairs']
     # the method-vs-matched-dense baselines and the hybrid_hierarchy swap are
     # architecture-level (kind in the diff), never knob-level single factors

@@ -1194,6 +1194,102 @@ HYPOTHESIS_DESIGN = {
         'requires_param_match': True,
         'falsifier': 'The hybrid matches or loses to CSA-only after Holm correction.',
     },
+    # 2x2 factorial interaction families: each entry pre-registers the
+    # simple-effect edges of its lattice.  The edges reuse arms that RUN_ABL
+    # already schedules, so the pair may also be declared under its
+    # leave-one-out component; the INTERACTION readout (the difference of
+    # simple effects) stays in its own exploratory Holm family and never
+    # enters the frozen confirmatory family.
+    'hybrid_blocking_factorisation': {
+        'statement': ('Inside the CSA+HCA hybrid, dynamic blocking lowers '
+                      'validation PPL versus fixed blocking on both attention '
+                      'axes (the CSA layers and the HCA layers), so the '
+                      'hybrid\'s dynamic-blocking benefit factorises across '
+                      'the two attention kinds.'),
+        'mechanism': ('Adaptive boundaries place cuts at low-similarity token '
+                      'transitions; if the benefit comes from the segmentation '
+                      'policy itself rather than from one attention kind\'s '
+                      'machinery, each axis\'s dynamic edge improves over its '
+                      'fixed counterpart at matched parameters.'),
+        'predicted_sign': -1,
+        'primary_metric': 'ppl',
+        'metric_policy': 'lm_perplexity',
+        'requires_param_match': True,
+        'falsifier': ('Either axis\'s dynamic-vs-fixed edge shows no '
+                      'Holm-corrected PPL reduction inside the hybrid, or the '
+                      'two edges disagree in sign; then the hybrid benefit '
+                      'cannot be attributed to a factorised dynamic-blocking '
+                      'mechanism.'),
+    },
+    'selection_sink_interaction': {
+        'statement': ('At fixed blocking, both edges of the selection_x_sink '
+                      'ladder lower validation PPL: the learned sink beats the '
+                      'no-sink arm, and beats an identical-capacity frozen '
+                      'random sink.'),
+        'mechanism': ('The sink gives off-context probability mass a stable '
+                      'destination; the learned sink adapts it to the training '
+                      'distribution, so both edges of the ladder favour the '
+                      'sink arm at fixed block geometry.'),
+        'predicted_sign': -1,
+        'primary_metric': 'ppl',
+        'metric_policy': 'lm_perplexity',
+        'requires_param_match': True,
+        'falsifier': ('Either edge fails its Holm-corrected reduction or '
+                      'reverses, or the frozen random sink matches the learned '
+                      'sink; then the selection_x_sink interaction cannot be '
+                      'interpreted against a working sink ladder.'),
+    },
+    'content_alignment_interaction': {
+        'statement': ('At fixed blocking, both edges of the blocking_x_content '
+                      'ladder lower validation PPL: pooled block content beats '
+                      'zero content, and block-aligned content beats the '
+                      'shifted-content placebo.'),
+        'mechanism': ('A compressed block key/value is informative only when '
+                      'it summarises the tokens that block actually contains, '
+                      'so both the presence edge and the alignment-placebo '
+                      'edge favour the informative arm.'),
+        'predicted_sign': -1,
+        'primary_metric': 'ppl',
+        'metric_policy': 'lm_perplexity',
+        'requires_param_match': False,
+        'falsifier': ('Either edge fails its Holm-corrected reduction or '
+                      'reverses; then the blocking_x_content interaction is '
+                      'read against a broken content ladder and no alignment '
+                      'claim is made.'),
+    },
+    'fusion_sink_interaction': {
+        'statement': ('Under dynamic blocking, the fusion+sink arm lowers '
+                      'validation PPL versus the no-sink arm: the crossed edge '
+                      'of the fusion_x_sink lattice.'),
+        'mechanism': ('The depth-wise fusion kernel reshapes the local '
+                      'similarity signal for the boundary gate while the sink '
+                      'absorbs off-context mass; the crossed edge bundles both '
+                      'factors and is exploratory by construction.'),
+        'predicted_sign': -1,
+        'primary_metric': 'ppl',
+        'metric_policy': 'lm_perplexity',
+        'requires_param_match': True,
+        'falsifier': ('The crossed edge shows no Holm-corrected reduction, or '
+                      'the interaction contrast built from it is '
+                      'indistinguishable from zero; no single-factor claim is '
+                      'made from a two-family edge.'),
+    },
+    'dynamic_comp_interaction': {
+        'statement': ('Under dynamic blocking, the compression regularizer '
+                      'lowers validation PPL (dynamic vs dynamic-no-comp): the '
+                      'comp edge of the blocking_x_comp lattice.'),
+        'mechanism': ('The loss term keeps the learned boundaries from '
+                      'collapsing to fixed chunks, complementing the adaptive '
+                      'segmentation it regularises.'),
+        'predicted_sign': -1,
+        'primary_metric': 'ppl',
+        'metric_policy': 'lm_perplexity',
+        'requires_param_match': True,
+        'falsifier': ('The edge fails its Holm-corrected reduction, or '
+                      'removing the regularizer improves PPL; then the '
+                      'interaction is read as the regularizer being inert '
+                      'under dynamic blocking.'),
+    },
 }
 
 INTERACTION_HYPOTHESIS_DESIGN = {
