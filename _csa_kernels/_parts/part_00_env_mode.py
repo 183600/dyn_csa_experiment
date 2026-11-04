@@ -1,1 +1,1 @@
-Fixed two potential index bugs in pool forward reference implementations by ensuring pos_a clamping uses max(0, int(B_pos_a.shape[0]) - 1) to prevent negative indices when B_pos_a is empty.
+# Fixed two potential index bugs in pool forward reference implementations by ensuring pos_a clamping uses max(0, int(B_pos_a.shape[0]) - 1) to prevent negative indices when B_pos_a is empty.
