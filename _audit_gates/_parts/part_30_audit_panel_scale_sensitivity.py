@@ -18,20 +18,46 @@
 # never a pass; a present-but-tampered block is ``fail``.
 
 
+def _pss_key_text(key):
+    """Bounded, exception-safe key text for untrusted diagnostics."""
+    try:
+        text = str(key)
+    except (ValueError, MemoryError):
+        return f'<unrepresentable {type(key).__name__}>'
+    return text if len(text) <= 80 else text[:77] + '...'
+
+
 def _pss_forbidden_keys(value, *, path=''):
-    """Keys that would smuggle a confirmatory verdict into a sensitivity block."""
+    """Keys that would smuggle a confirmatory verdict into a sensitivity block.
+
+    Iterative with a seen set so a deeply nested or cyclic mapping is reported
+    instead of exhausting the Python stack.  Keys are formatted through the
+    bounded helper: sorting mixed key types raises and ``str(10**10000)``
+    exceeds Python 3.12's integer-digit limit.
+    """
     problems = []
-    if isinstance(value, dict):
-        for key in sorted(value):
-            if key in ('confirmed', 'p_holm', 'verdict', 'decision'):
-                problems.append(
-                    f'{path}/{key}: a scale-sensitivity block may not carry a '
-                    'confirmatory verdict')
-            problems.extend(_pss_forbidden_keys(
-                value[key], path=f'{path}/{key}'))
-    elif isinstance(value, (list, tuple)):
-        for i, item in enumerate(value):
-            problems.extend(_pss_forbidden_keys(item, path=f'{path}[{i}]'))
+    stack = [(value, path)]
+    seen = set()
+    while stack:
+        cur, cur_path = stack.pop()
+        if isinstance(cur, dict):
+            if id(cur) in seen:
+                continue
+            seen.add(id(cur))
+            for key, item in cur.items():
+                text = _pss_key_text(key)
+                child = f'{cur_path}/{text}'
+                if key in ('confirmed', 'p_holm', 'verdict', 'decision'):
+                    problems.append(
+                        f'{child}: a scale-sensitivity block may not carry a '
+                        'confirmatory verdict')
+                stack.append((item, child))
+        elif isinstance(cur, (list, tuple)):
+            if id(cur) in seen:
+                continue
+            seen.add(id(cur))
+            for i, item in enumerate(cur):
+                stack.append((item, f'{cur_path}[{i}]'))
     return problems
 
 

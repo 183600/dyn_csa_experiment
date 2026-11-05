@@ -528,13 +528,40 @@ def _arb_scale_sensitivity(log_stats, raw_stats, comps, *, tol):
                     order_flips.append([a, b])
     total_log = sum(log_means)
     total_raw = sum(raw_means)
+
+    def _total_parts(values, total):
+        """Return (finite_total, common_scale, scaled_total).
+
+        A finite component panel near float64's limit can have an
+        unrepresentable total (``1e308 + 1e308``).  The shares are still
+        well-defined, so compute them from a common scale rather than
+        returning zeros from ``x / inf``; the reported total itself is
+        withheld as ``None``.
+        """
+        finite_total = total if _arb_math.isfinite(total) else None
+        scale = max((abs(v) for v in values), default=0.0)
+        scaled_total = (sum(v / scale for v in values) if scale > 0.0
+                        else 0.0)
+        return finite_total, scale, scaled_total
+    # Compute one share per component.  The ordinary finite-total branch is
+    # byte-identical to the historical x / total; the overflow branch uses
+    # the same values divided by their common maximum.
+    def _share(value, total, scale, scaled_total):
+        if _arb_math.isfinite(total):
+            return (value / total) if abs(total) > tol else None
+        if (scale <= 0.0 or not _arb_math.isfinite(scaled_total)
+                or scaled_total == 0.0):
+            return None
+        return (value / scale) / scaled_total
+    fin_log, scale_log, scaled_log = _total_parts(log_means, total_log)
+    fin_raw, scale_raw, scaled_raw = _total_parts(raw_means, total_raw)
     shares = {}
     for c in comps:
         shares[c] = {
-            'log_ppl': (log_stats[c]['mean'] / total_log
-                        if abs(total_log) > tol else None),
-            'ppl': (raw_stats[c]['mean'] / total_raw
-                    if abs(total_raw) > tol else None),
+            'log_ppl': _share(log_stats[c]['mean'], total_log,
+                              scale_log, scaled_log),
+            'ppl': _share(raw_stats[c]['mean'], total_raw,
+                          scale_raw, scaled_raw),
         }
     dependent = bool(sign_flips or order_flips)
     status = 'scale_dependent' if dependent else 'scale_robust'
@@ -552,7 +579,7 @@ def _arb_scale_sensitivity(log_stats, raw_stats, comps, *, tol):
         'pair_order_flips': order_flips,
         'tie_changes': tie_changes,
         'shares': shares,
-        'total_effect': {'log_ppl': total_log, 'ppl': total_raw},
+        'total_effect': {'log_ppl': fin_log, 'ppl': fin_raw},
         'note': note,
     }
 

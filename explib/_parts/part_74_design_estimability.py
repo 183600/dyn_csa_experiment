@@ -106,6 +106,20 @@ def _de_is_bool(value):
     return isinstance(value, bool)
 
 
+def _de_repr(value, limit=120):
+    """Bounded, exception-safe repr for untrusted diagnostics.
+
+    ``repr(10**10000)`` raises on Python 3.12's integer-digit limit; a
+    malformed artifact must become a failed validation, not a formatting
+    exception.
+    """
+    try:
+        text = repr(value)
+    except Exception:
+        return f'<unrepresentable {type(value).__name__}>'
+    return text if len(text) <= limit else text[:limit - 3] + '...'
+
+
 def _de_text(value):
     if value is None or _de_is_bool(value):
         return None
@@ -1386,7 +1400,8 @@ def validate_design_estimability(artifact):
     if artifact.get('status') not in ('ok', 'warnings', 'not_estimable',
                                       'fail'):
         out['problems'].append(
-            f'artifact.status={artifact.get("status")!r} is not recognised')
+            f'artifact.status={_de_repr(artifact.get("status"))} is not '
+            'recognised')
     for field in ('problems', 'warnings'):
         value = artifact.get(field)
         if value is not None and not isinstance(value, (list, tuple)):

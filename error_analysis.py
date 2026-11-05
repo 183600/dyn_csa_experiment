@@ -338,6 +338,18 @@ def main(argv=None):
     train_ids, val_batch, vocab, tok, val_bnd = L.load_run_corpus(cfg)
     if args.dataset != 'wikitext':
         tok = None
+    # A requested evaluation length can exceed the rows the corpus loader was
+    # able to build (a short split, or --seq-len larger than the available
+    # text).  Slicing alone would silently score fewer positions than the
+    # report claims, so clamp the advertised length to the materialised width.
+    _avail_seq = int(np.asarray(val_batch).shape[1])
+    if seq_len > _avail_seq:
+        print(f'[errors] WARNING: requested seq_len={seq_len} exceeds the '
+              f'available validation width {_avail_seq}; scoring {_avail_seq} '
+              'token(s) per row and recording that length')
+        seq_len = _avail_seq
+    if seq_len < 1:
+        raise SystemExit('validation corpus has no token positions to score')
     n_rows = int(args.max_rows)
     if n_rows < 1:
         raise SystemExit(f'--max-rows must be a positive integer, got {n_rows}')

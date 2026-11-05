@@ -446,6 +446,10 @@ def run_tuning(base_cfg=None, outdir='results_baseline_tuning', protocol=None,
                 _tokens = {int(records[s]['tokens_seen']) for s in records if records[s].get('tokens_seen') is not None}
                 per_arm[arm].append({
                     'config': dict(knobs), 'ppl': mean, 'ppl_std': std,
+                    # Which estimator produced `ppl`: audit reads this field
+                    # to check that a pooled claim is backed by nll_sum /
+                    # n_tokens instead of having to infer it from nullability.
+                    'ppl_aggregation': _agg,
                     'nll_sum': (float(sum(selection_stats[s]['nll_sum'] for s in selection_stats))
                                 if selection_ppls is not None else None),
                     'n_tokens': (int(sum(selection_stats[s]['n_tokens'] for s in selection_stats))
@@ -463,8 +467,9 @@ def run_tuning(base_cfg=None, outdir='results_baseline_tuning', protocol=None,
                     'params': records[sorted(records)[0]].get('params'),
                     'steps': next(iter(_steps), None),
                     'tokens_seen': next(iter(_tokens), None),
-'budget_by_seed': {str(s): [records[s].get('steps', None), records[s].get('tokens_seen', None)]
-                                   for s in sorted(records)},
+                    'budget_by_seed': {str(s): [records[s].get('steps', None),
+                                                records[s].get('tokens_seen', None)]
+                                       for s in sorted(records)},
                     'run_cfg': records[sorted(records)[0]].get('run_cfg'), 'outdir': tdir,
                     # The selected hyperparameters are only tuned for the data
                     # they were searched on.  Persist the corpus/validation

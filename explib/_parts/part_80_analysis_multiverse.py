@@ -130,10 +130,21 @@ def _am_int(value, *, where, minimum=None, maximum=None):
         raise ValueError(f'{where} must be an integer, got '
                          f'{_am_repr(value)}')
     out = int(value)
+    try:
+        # A count that Python 3.12 cannot stringify cannot be written as a
+        # JSON number; reject it here rather than failing later while
+        # hashing/writing the artifact.  Large but representable values
+        # (e.g. 10**400) stay valid.
+        str(out)
+    except (ValueError, MemoryError):
+        raise ValueError(
+            f'{where}: integer is too large to represent as JSON') from None
     if minimum is not None and out < minimum:
-        raise ValueError(f'{where} must be >= {minimum}, got {out}')
+        raise ValueError(f'{where} must be >= {minimum}, got '
+                         f'{_am_repr(value)}')
     if maximum is not None and out > maximum:
-        raise ValueError(f'{where} must be <= {maximum}, got {out}')
+        raise ValueError(f'{where} must be <= {maximum}, got '
+                         f'{_am_repr(value)}')
     return out
 
 
@@ -143,12 +154,22 @@ def _am_seed(value, *, where):
         if not value.isdigit():
             raise ValueError(f'{where} must be an integer seed label, got '
                              f'{_am_repr(value)}')
-        value = int(value)
+        try:
+            value = int(value)
+        except (ValueError, MemoryError):
+            raise ValueError(
+                f'{where}: seed is too large to represent as a JSON key'
+            ) from None
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(f'{where} must be an integer seed label, got '
                          f'{_am_repr(value)}')
     if value < 0:
-        raise ValueError(f'{where} must be >= 0, got {value}')
+        raise ValueError(f'{where} must be >= 0, got {_am_repr(value)}')
+    try:
+        str(value)
+    except (ValueError, MemoryError):
+        raise ValueError(
+            f'{where}: seed is too large to represent as a JSON key') from None
     return int(value)
 
 
@@ -325,6 +346,22 @@ def _am_sign(value):
     return 0
 
 
+def _am_span(values):
+    """Representable ``max - min`` span, or ``None`` beyond float64.
+
+    A finite panel can still have a span larger than the float range (for
+    example ``[+1e308, -1e308]``).  Reports are strict JSON, so an infinite
+    descriptive spread is withheld instead of poisoning the artifact.
+    """
+    lo = min(values)
+    hi = max(values)
+    try:
+        out = hi - lo
+    except OverflowError:
+        return None
+    return out if _am_math.isfinite(out) else None
+
+
 def _am_median(values):
     ordered = sorted(float(x) for x in values)
     n = len(ordered)
@@ -333,7 +370,17 @@ def _am_median(values):
     mid = n // 2
     if n % 2:
         return ordered[mid]
-    return 0.5 * (ordered[mid - 1] + ordered[mid])
+    lo, hi = ordered[mid - 1], ordered[mid]
+    # Keep the historical (lo + hi) / 2 bit-for-bit whenever it is finite;
+    # only an overflow needs the half-gap form.  For same-sign values the
+    # half-gap cannot overflow; opposite-sign values always have a finite
+    # sum, so their ordinary midpoint is already safe.
+    out = 0.5 * (lo + hi)
+    if _am_math.isfinite(out):
+        return out
+    if (lo > 0.0) == (hi > 0.0):
+        return lo + (hi - lo) / 2.0
+    return out
 
 
 def _am_mean(vals):
@@ -472,17 +519,22 @@ def _am_feature_influence(names, specs, stats, *, primary):
                 'signs': sorted(set(int(x) for x in bucket['signs'])),
             }
         level_means = [row['mean'] for row in level_rows.values()]
-        spread = (max(level_means) - min(level_means)
-                  if len(level_means) >= 2 else 0.0)
+        spread = _am_span(level_means) if len(level_means) >= 2 else 0.0
         sign_flip = (len({sign for row in level_rows.values()
                           for sign in row['signs']}) > 1)
-        relative = (spread / abs(primary_mean)
-                    if primary_mean != 0.0 else None)
+        relative = None
+        if spread is not None and primary_mean != 0.0:
+            try:
+                relative = spread / abs(primary_mean)
+            except (ArithmeticError, OverflowError):
+                relative = None
+            if relative is not None and not _am_math.isfinite(relative):
+                relative = None
         out[key] = {
             'n_levels': len(level_rows),
             'levels': level_rows,
             'specs_missing_feature': sorted(missing),
-            'spread': float(spread),
+            'spread': (float(spread) if spread is not None else None),
             'relative_to_primary': (float(relative)
                                     if relative is not None else None),
             'sign_flip': bool(sign_flip),
@@ -490,7 +542,7 @@ def _am_feature_influence(names, specs, stats, *, primary):
                      'other declared choices are not held fixed'),
         }
     candidates = [(key, row['spread']) for key, row in out.items()
-                  if row['n_levels'] >= 2]
+                  if row['n_levels'] >= 2 and row['spread'] is not None]
     most = None
     if candidates:
         key, spread = sorted(candidates, key=lambda kv: (-kv[1], kv[0]))[0]
@@ -533,17 +585,25 @@ def _am_family_block(family, names, specs, stats, *, alpha, primary):
             rec['joint'] = joint
     means = [stats[name]['mean'] for name in names]
     signs = {stats[name]['sign'] for name in names}
+    _span = _am_span(means)
+    _relative_range = None
+    if _span is not None and primary in names and stats[primary]['mean'] != 0.0:
+        try:
+            _relative_range = _span / abs(stats[primary]['mean'])
+        except (ArithmeticError, OverflowError):
+            _relative_range = None
+        if (_relative_range is not None
+                and not _am_math.isfinite(_relative_range)):
+            _relative_range = None
     rec['effects'] = {
         'min': float(min(means)),
         'median': float(_am_median(means)),
         'max': float(max(means)),
-        'range': float(max(means) - min(means)),
+        'range': (float(_span) if _span is not None else None),
         'primary': (float(stats[primary]['mean'])
                     if primary in names else None),
-        'relative_range': (
-            float((max(means) - min(means)) / abs(stats[primary]['mean']))
-            if (primary in names and stats[primary]['mean'] != 0.0)
-            else None),
+        'relative_range': (float(_relative_range)
+                           if _relative_range is not None else None),
     }
     rec['sign_stable'] = bool(len(signs) == 1 and 0 not in signs)
     influence, most = _am_feature_influence(
@@ -598,9 +658,9 @@ def analysis_multiverse(specs, *, primary, alpha=0.05,
              if len(rec['deltas']) < min_seeds]
     if short:
         raise ValueError(
-            f'specification(s) {short!r} have fewer than min_seeds='
-            f'{min_seeds} paired seeds; a declared design minimum must be '
-            'met, not silently lowered')
+            f'specification(s) {_am_repr(short)} have fewer than min_seeds='
+            f'{_am_repr(min_seeds)} paired seeds; a declared design minimum '
+            'must be met, not silently lowered')
     primary_name = _am_text(primary, where='primary')
     lookup = {rec['name']: rec for rec in normalised}
     if primary_name not in lookup:
@@ -819,20 +879,42 @@ def build_analysis_multiverse(specs, *, primary, alpha=0.05,
 
 
 def _am_forbidden_payload(obj):
+    """Collect forbidden decision fields anywhere in an untrusted payload.
+
+    Iterative with a seen set: a deeply nested or self-referential artifact
+    must be reported as a tamper instead of raising ``RecursionError`` before
+    validation can return a failure object.
+    """
     found = []
-    if isinstance(obj, dict):
-        for key, value in obj.items():
-            if isinstance(key, str) and key in AM_FORBIDDEN_KEYS:
-                found.append(key)
-            found.extend(_am_forbidden_payload(value))
-    elif isinstance(obj, (list, tuple)):
-        for value in obj:
-            found.extend(_am_forbidden_payload(value))
+    stack = [obj]
+    seen = set()
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, dict):
+            if id(cur) in seen:
+                continue
+            seen.add(id(cur))
+            for key, value in cur.items():
+                if isinstance(key, str) and key in AM_FORBIDDEN_KEYS:
+                    found.append(key)
+                stack.append(value)
+        elif isinstance(cur, (list, tuple)):
+            if id(cur) in seen:
+                continue
+            seen.add(id(cur))
+            stack.extend(cur)
     return found
 
 
 def _am_json_equal(a, b):
-    """Exact JSON-value equality that distinguishes ``True`` from ``1``."""
+    """Exact JSON-value equality that distinguishes ``True`` from ``1``.
+
+    Numeric comparison is done directly: converting a finite-but-huge JSON
+    integer (``10**400``) to float raises ``OverflowError``, and a tampered
+    artifact must produce a failed validation, not an exception.  Python's
+    int/float comparison is exact for arbitrarily large integers and never
+    overflows.
+    """
     if isinstance(a, bool) or isinstance(b, bool):
         return isinstance(a, bool) and isinstance(b, bool) and a == b
     if isinstance(a, dict) or isinstance(b, dict):
@@ -847,10 +929,9 @@ def _am_json_equal(a, b):
             return False
         return (len(a) == len(b)
                 and all(_am_json_equal(x, y) for x, y in zip(a, b)))
-    if isinstance(a, float) or isinstance(b, float):
-        return (isinstance(a, (int, float)) and not isinstance(a, bool)
-                and isinstance(b, (int, float)) and not isinstance(b, bool)
-                and float(a) == float(b))
+    if (isinstance(a, (int, float)) and not isinstance(a, bool)
+            and isinstance(b, (int, float)) and not isinstance(b, bool)):
+        return a == b
     return a == b
 
 
@@ -1035,7 +1116,12 @@ def validate_analysis_multiverse(artifact):
                     f'{missing}')
     elif stored_families is not None:
         out['problems'].append('artifact.result.families must be an object')
-    diffs = _am_diff_paths(stored_result, replay)
+    try:
+        diffs = _am_diff_paths(stored_result, replay)
+    except RecursionError:
+        out['problems'].append(
+            'artifact.result nesting is too deep to replay')
+        diffs = []
     if diffs:
         out['problems'].append(
             'artifact.result does not replay from its declared inputs: '

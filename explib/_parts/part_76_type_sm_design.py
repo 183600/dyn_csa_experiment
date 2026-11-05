@@ -1042,15 +1042,25 @@ _TSM_FORBIDDEN_KEYS = frozenset({
 
 
 def _tsm_frozen_payload(obj):
+    """Iterative scan for smuggled decision fields (deep/cyclic safe)."""
     found = []
-    if isinstance(obj, dict):
-        for key, value in obj.items():
-            if isinstance(key, str) and key in _TSM_FORBIDDEN_KEYS:
-                found.append(key)
-            found.extend(_tsm_frozen_payload(value))
-    elif isinstance(obj, (list, tuple)):
-        for value in obj:
-            found.extend(_tsm_frozen_payload(value))
+    stack = [obj]
+    seen = set()
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, dict):
+            if id(cur) in seen:
+                continue
+            seen.add(id(cur))
+            for key, value in cur.items():
+                if isinstance(key, str) and key in _TSM_FORBIDDEN_KEYS:
+                    found.append(key)
+                stack.append(value)
+        elif isinstance(cur, (list, tuple)):
+            if id(cur) in seen:
+                continue
+            seen.add(id(cur))
+            stack.extend(cur)
     return found
 
 
@@ -1153,11 +1163,12 @@ def validate_type_sm_design(artifact):
     if missing:
         out['problems'].append(
             f'artifact.inputs is missing required key(s): {missing}')
-    extra_inputs = sorted(set(inputs) - set(_TSM_INPUT_KEYS))
+    extra_inputs = sorted(set(inputs) - set(_TSM_INPUT_KEYS),
+                         key=_tsm_repr)
     if extra_inputs:
         out['problems'].append(
             'artifact.inputs carries field(s) outside the replay schema: '
-            + ', '.join(repr(key) for key in extra_inputs))
+            + ', '.join(_tsm_repr(key) for key in extra_inputs))
     recorded = artifact.get('content_sha256')
     # The verdict must stay strict JSON even when the artifact carries a
     # hand-edited NaN/Inf/bytes in place of the digest.  Echo only a textual
@@ -1200,12 +1211,12 @@ def validate_type_sm_design(artifact):
     if not isinstance(stored, dict):
         out['problems'].append('artifact.result must be an object')
         return out
-    extra = sorted(set(stored) - set(replay))
+    extra = sorted(set(stored) - set(replay), key=_tsm_repr)
     if extra:
         out['problems'].append(
             'result carries field(s) outside the replay schema: '
-            + ', '.join(repr(key) for key in extra))
-    missing_result = sorted(set(replay) - set(stored))
+            + ', '.join(_tsm_repr(key) for key in extra))
+    missing_result = sorted(set(replay) - set(stored), key=_tsm_repr)
     if missing_result:
         out['problems'].append(
             f'result is missing replay field(s): {missing_result}')

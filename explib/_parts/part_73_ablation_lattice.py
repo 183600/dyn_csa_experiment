@@ -271,6 +271,38 @@ def _al_num(value):
     return out if _al_math.isfinite(out) else None
 
 
+def _raw_mean_or_scaled(values):
+    """Historical mean for ordinary panels; guarded mean only if it overflows.
+
+    The bit-for-bit ordinary path matters for stored artifacts; the scaled
+    fallback recovers a representable mean from finite effects near the float
+    limit instead of propagating ``inf``.
+    """
+    if not values:
+        return None
+    raw = sum(values) / len(values)
+    if _al_math.isfinite(raw):
+        return raw
+    return _scaled_mean_or_raw(values)
+
+
+def _al_span(lo, hi):
+    """Representable ``hi - lo`` span, or ``None`` beyond float64.
+
+    Finite effects at opposite ends of the float range can have an
+    unrepresentable descriptive range even though each endpoint is a valid
+    JSON number; an artifact writer with ``allow_nan=False`` must not see
+    the resulting ``inf``.
+    """
+    if lo is None or hi is None:
+        return None
+    try:
+        out = hi - lo
+    except OverflowError:
+        return None
+    return out if _al_math.isfinite(out) else None
+
+
 def _al_direction(mean):
     if mean is None:
         return None
@@ -555,7 +587,7 @@ def shapley_lattice_attribution(
             vals = [(_al_math.log(norm[subset][s]) if scale == 'ppl'
                      else norm[subset][s]) for s in common]
             base['cell_means'][_al_name(subset, comps)] = {
-                'mean': _al_num(sum(vals) / len(vals)),
+                'mean': _al_num(_raw_mean_or_scaled(vals)),
                 'n': len(vals),
                 'seeds': common,
             }
@@ -634,7 +666,8 @@ def shapley_lattice_attribution(
                 vals.append(seed_values[seed][ctx | {comp}]
                             - seed_values[seed][ctx])
                 seed_means[seed].append(vals[-1])
-            mean = _al_num(sum(vals) / len(vals)) if vals else None
+            mean = (_al_num(_raw_mean_or_scaled(vals))
+                    if vals else None)
             by_context.append({
                 'context': [c for c in comps if c in ctx],
                 'mean': mean,
@@ -654,7 +687,7 @@ def shapley_lattice_attribution(
             'n_contexts': len(contexts),
             'min': lo,
             'max': hi,
-            'range': (hi - lo) if (lo is not None and hi is not None) else None,
+            'range': _al_span(lo, hi),
             'context_dependent': bool(
                 (lo is not None and hi is not None
                  and lo < -_tol and hi > _tol) or seed_sign_change),
@@ -680,7 +713,8 @@ def shapley_lattice_attribution(
                     seed_vals[seed].append(vals[-1])
                 by_context.append({
                     'context': [c for c in comps if c in ctx],
-                    'value': _al_num(sum(vals) / len(vals)) if vals else None,
+                    'value': (_al_num(_raw_mean_or_scaled(vals))
+                              if vals else None),
                     'n': len(vals),
                 })
             means = [row['value'] for row in by_context
@@ -710,7 +744,8 @@ def shapley_lattice_attribution(
                                       min_n=_min_n),
                 'at_full_minus_pair': _al_stats(at_full_vec, common,
                                                 alpha=_alpha, min_n=_min_n),
-                'range': (max(means) - min(means)) if means else None,
+                'range': (_al_span(min(means), max(means))
+                          if means else None),
                 'sign_consistent': sign_consistent,
                 'seed_sign_consistent': seed_sign_consistent,
                 'by_context': by_context,

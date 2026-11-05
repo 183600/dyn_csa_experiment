@@ -443,16 +443,29 @@ def _etost_json_equal(a, b):
 
 
 def _etost_frozen_fields(obj, *, top=True):
-    """Names of frozen-decision fields smuggled into an artifact."""
+    """Names of frozen-decision fields smuggled into an artifact.
+
+    Iterative with a seen set: a deeply nested or cyclic artifact is a
+    tamper report, not a ``RecursionError`` that aborts validation.
+    """
     found = set()
-    if isinstance(obj, dict):
-        for key, value in obj.items():
-            if key in _ETOST_FROZEN_FIELDS:
-                found.add(key)
-            found.update(_etost_frozen_fields(value, top=False))
-    elif isinstance(obj, (list, tuple)):
-        for value in obj:
-            found.update(_etost_frozen_fields(value, top=False))
+    stack = [obj]
+    seen = set()
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, dict):
+            if id(cur) in seen:
+                continue
+            seen.add(id(cur))
+            for key, value in cur.items():
+                if key in _ETOST_FROZEN_FIELDS:
+                    found.add(key)
+                stack.append(value)
+        elif isinstance(cur, (list, tuple)):
+            if id(cur) in seen:
+                continue
+            seen.add(id(cur))
+            stack.extend(cur)
     return sorted(found)
 
 
@@ -530,11 +543,12 @@ def validate_exact_tost(artifact):
     if missing:
         out['problems'].append(
             f'artifact.inputs is missing required key(s): {missing}')
-    extra = sorted(set(inputs) - set(_ETOST_INPUT_KEYS))
+    extra = sorted(set(inputs) - set(_ETOST_INPUT_KEYS),
+                   key=_etost_repr)
     if extra:
         out['problems'].append(
             'artifact.inputs carries field(s) outside the replay schema: '
-            + ', '.join(repr(k) for k in extra))
+            + ', '.join(_etost_repr(k) for k in extra))
     recorded = artifact.get('content_sha256')
     # Keep the verdict strict-JSON even when a hand-edited artifact replaces
     # the digest with NaN/Inf/bytes; such a value still fails the checks below.
@@ -571,12 +585,12 @@ def validate_exact_tost(artifact):
     if not isinstance(stored, dict):
         out['problems'].append('artifact.result must be an object')
         return out
-    extra_result = sorted(set(stored) - set(replay))
+    extra_result = sorted(set(stored) - set(replay), key=_etost_repr)
     if extra_result:
         out['problems'].append(
             'result carries field(s) outside the replay schema: '
-            + ', '.join(repr(k) for k in extra_result))
-    missing_result = sorted(set(replay) - set(stored))
+            + ', '.join(_etost_repr(k) for k in extra_result))
+    missing_result = sorted(set(replay) - set(stored), key=_etost_repr)
     if missing_result:
         out['problems'].append(
             f'result is missing replay field(s): {missing_result}')

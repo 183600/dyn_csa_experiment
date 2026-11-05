@@ -149,15 +149,27 @@ def _bt_dict(value):
     return value if isinstance(value, dict) else {}
 
 
+def _bt_repr(value, limit=120):
+    """Bounded, exception-safe text for untrusted diagnostics."""
+    try:
+        text = repr(value)
+    except Exception:
+        return f'<unrepresentable {type(value).__name__}>'
+    return text if len(text) <= limit else text[:limit - 3] + '...'
+
+
 def _bt_message_list(value):
     """A string list for problems/warnings, even if the artifact was edited.
 
     ``list(5)``, ``list(True)`` and a tuple of dicts used to abort the replay
-    validator/audit gate instead of reporting the malformed artifact.
+    validator/audit gate instead of reporting the malformed artifact; a
+    message that is itself a huge integer also must not hit Python 3.12's
+    integer-digit limit while being stringified.
     """
     if not isinstance(value, (list, tuple)):
         return []
-    return [item if isinstance(item, str) else str(item) for item in value]
+    return [item if isinstance(item, str) else _bt_repr(item)
+            for item in value]
 
 
 def _bt_declared_list(values, label, problems):
@@ -1328,7 +1340,8 @@ def validate_budget_truncation(artifact, *, manifest=None):
     if artifact.get('status') not in ('ok', 'warnings', 'not_verifiable',
                                       'fail'):
         out['problems'].append(
-            f'artifact.status={artifact.get("status")!r} is not recognised')
+            f'artifact.status={_bt_repr(artifact.get("status"))} is not '
+            'recognised')
     for field in ('problems', 'warnings'):
         value = artifact.get(field)
         if value is not None and not isinstance(value, (list, tuple)):

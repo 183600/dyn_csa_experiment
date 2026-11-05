@@ -9,27 +9,46 @@ _CONTRAST_NETWORK_FORBIDDEN = frozenset({
 })
 
 
+def _cn_gate_key_text(key):
+    """Bounded, exception-safe key text for untrusted diagnostics."""
+    try:
+        text = str(key)
+    except (ValueError, MemoryError):
+        return f'<unrepresentable {type(key).__name__}>'
+    return text if len(text) <= 80 else text[:77] + '...'
+
+
 def _cn_gate_forbidden(obj, path='', depth=0):
     """Recursively name forbidden decision keys smuggled into the block.
 
     Iterative traversal, so an adversarially deep JSON object cannot put a
     ``verdict``/``p_holm`` key beyond the former depth-12 cutoff and still
     pass.  Exceeding the safety depth is itself reported (fail closed).
+    A seen set makes a self-referential in-memory payload terminate, and key
+    text is bounded because ``str(10**10000)`` raises on Python 3.12.
     """
     found = []
     stack = [(obj, path, int(depth))]
+    seen = set()
     while stack:
         node, p, d = stack.pop()
         if d > 512:
             found.append(f'{p or "<root>"}.<nesting-depth>')
             continue
         if isinstance(node, dict):
+            if id(node) in seen:
+                continue
+            seen.add(id(node))
             for k, v in node.items():
-                sub = '%s.%s' % (p, k) if p else str(k)
-                if str(k) in _CONTRAST_NETWORK_FORBIDDEN:
+                text = _cn_gate_key_text(k)
+                sub = '%s.%s' % (p, text) if p else text
+                if text in _CONTRAST_NETWORK_FORBIDDEN:
                     found.append(sub)
                 stack.append((v, sub, d + 1))
         elif isinstance(node, (list, tuple)):
+            if id(node) in seen:
+                continue
+            seen.add(id(node))
             for i, v in enumerate(node):
                 stack.append((v, '%s[%d]' % (p, i), d + 1))
     return found

@@ -38,6 +38,10 @@ def _num_or_none(v):
     # silently turn a flag into seed 1 (or a budget of one token).
     if v is None or isinstance(v, (bool, np.bool_)):
         return None
+    # Keep Python/NumPy integers exact; float() would round a seed label
+    # above 2**53 onto a different identity.
+    if isinstance(v, (int, np.integer)):
+        return int(v)
     if isinstance(v, float):
         return int(v) if math.isfinite(v) and v.is_integer() else None
     try:
@@ -165,8 +169,14 @@ def _fold_backup_into_aggregate(adir):
         lentry['seeds'] = seeds_sorted
         lentry['ppls'] = vals
         lentry['n_seeds'] = len(vals)
-        lentry['ppl_mean'] = sum(vals) / len(vals)
-        lentry['ppl_std'] = statistics.stdev(vals) if len(vals) > 1 else 0.0
+        _m = sum(vals) / len(vals)
+        if not math.isfinite(_m):
+            _m = L._scaled_mean_or_raw(vals)
+        _s = statistics.stdev(vals) if len(vals) > 1 else 0.0
+        if not math.isfinite(_s):
+            _s = L._scaled_std_or_raw(vals)
+        lentry['ppl_mean'] = _m
+        lentry['ppl_std'] = _s
         # Every other aggregate was computed over the pre-recovery seed subset.
         # It is not safe to keep those values next to a larger `seeds` list, so
         # invalidate them explicitly instead of mixing a 1-seed mean with a
@@ -405,8 +415,14 @@ def merge_long_aggregate(adir, snapshot_agg):
         sentry['seeds'] = seeds_sorted
         sentry['ppls'] = vals
         sentry['n_seeds'] = len(vals)
-        sentry['ppl_mean'] = sum(vals) / len(vals)
-        sentry['ppl_std'] = statistics.stdev(vals) if len(vals) > 1 else 0.0
+        _m = sum(vals) / len(vals)
+        if not math.isfinite(_m):
+            _m = L._scaled_mean_or_raw(vals)
+        _s = statistics.stdev(vals) if len(vals) > 1 else 0.0
+        if not math.isfinite(_s):
+            _s = L._scaled_std_or_raw(vals)
+        sentry['ppl_mean'] = _m
+        sentry['ppl_std'] = _s
         # Every field below was computed over the snapshot's seed subset.
         # Keeping it next to the enlarged seeds/ppls/ppl_mean would mix a
         # 1-seed primary/CI/pooled value with a 3-seed mean.  The curve,
@@ -489,8 +505,14 @@ def merge_long_aggregate(adir, snapshot_agg):
             if not common:
                 return
             ds = [vm[_s] - base_map[_s] for _s in common]
-            entry[mean_f] = sum(ds) / len(ds)
-            entry[std_f] = statistics.stdev(ds) if len(ds) > 1 else 0.0
+            _mean = sum(ds) / len(ds)
+            if not math.isfinite(_mean):
+                _mean = L._scaled_mean_or_raw(ds)
+            _std = statistics.stdev(ds) if len(ds) > 1 else 0.0
+            if not math.isfinite(_std):
+                _std = L._scaled_std_or_raw(ds)
+            entry[mean_f] = _mean
+            entry[std_f] = _std
             entry[n_f] = len(ds)
         for key in _folded_keys:
             entry = merged.get(key)

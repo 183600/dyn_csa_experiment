@@ -38,11 +38,30 @@ _OFF = ("", "0", "no", "off", "false", "none", "serial")
 
 
 def _num_or_none(value):
+    """Positive integer payload value, or None when it is not an exact one.
+
+    Match ``run_gapfill._num_or_none``'s exact-integer parsing (an integral
+    float or numeric string such as ``3``, ``3.0`` or ``" 3 "`` is the same
+    count), while preserving this helper's positive-count contract: a
+    boolean flag, a fractional/non-finite value, a non-numeric string and a
+    non-positive number are not a count.  Parsing via ``int(str(value))``
+    used to accept ``"3"`` but reject the equally exact ``"3.0"``.
+    """
+    if value is None or isinstance(value, (bool, np.bool_)):
+        return None
+    # Keep Python/NumPy integers exact.  Going through float() first rounds
+    # identities above 2**53 (e.g. 2**53 + 1) onto a different seed/count.
+    if isinstance(value, (int, np.integer)):
+        return int(value) if int(value) > 0 else None
+    if isinstance(value, float):
+        return (int(value) if math.isfinite(value) and value.is_integer()
+                and value > 0 else None)
     try:
-        number = int(str(value).strip())
+        number = float(value)
     except (TypeError, ValueError, OverflowError):
         return None
-    return number if number > 0 else None
+    return (int(number) if math.isfinite(number) and number.is_integer()
+            and number > 0 else None)
 
 
 def _torch():

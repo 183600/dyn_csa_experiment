@@ -601,15 +601,30 @@ def build_global_fdr(claims, *, alpha=0.05, method='by', family=None,
 
 
 def _gfdr_forbidden_payload(obj):
+    """Collect forbidden decision fields anywhere in an untrusted payload.
+
+    Iterative with a seen set: a deeply nested or cyclic artifact must be
+    reported as a tamper instead of raising ``RecursionError`` before the
+    validator can return a failure object.
+    """
     found = []
-    if isinstance(obj, dict):
-        for key, value in obj.items():
-            if isinstance(key, str) and key in _GLOBAL_FDR_FORBIDDEN_KEYS:
-                found.append(key)
-            found.extend(_gfdr_forbidden_payload(value))
-    elif isinstance(obj, (list, tuple)):
-        for value in obj:
-            found.extend(_gfdr_forbidden_payload(value))
+    stack = [obj]
+    seen = set()
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, dict):
+            if id(cur) in seen:
+                continue
+            seen.add(id(cur))
+            for key, value in cur.items():
+                if isinstance(key, str) and key in _GLOBAL_FDR_FORBIDDEN_KEYS:
+                    found.append(key)
+                stack.append(value)
+        elif isinstance(cur, (list, tuple)):
+            if id(cur) in seen:
+                continue
+            seen.add(id(cur))
+            stack.extend(cur)
     return found
 
 
