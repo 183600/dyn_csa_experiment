@@ -1012,7 +1012,13 @@ def signflip_p_floor(n):
     if n is None or n <= 0:
         return float('nan')
     # same value as 2.0 / 2**n, evaluated in the float exponent range.
-    return math.ldexp(2.0, -n)
+    # ldexp accepts an arbitrary-precision exponent in CPython and underflows
+    # to 0.0, but keep the explicit guard so an unusual platform/backport still
+    # turns an unrepresentable resolution into 0.0 rather than an exception.
+    try:
+        return math.ldexp(2.0, -n)
+    except (OverflowError, ValueError):
+        return 0.0
 
 def finite_range(named_values):
     vals, dropped = ([], [])

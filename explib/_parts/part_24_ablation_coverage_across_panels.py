@@ -68,13 +68,13 @@ def ablation_coverage_across_panels(reports, design=None, *, verbose=False,
     # A mixed int/str panel mapping made `sorted(reports)` raise during the
     # project-level roll-up.  JSON labels are strings; normalise once so the
     # per-component rows and the synthesis block use the same names.
-    reports = {str(k): _normalise_component_report(v)
+    reports = {_safe_text(k): _normalise_component_report(v)
                for k, v in reports.items()}
     if not isinstance(design, dict):
         out['status'] = 'warn'
         out['warnings'].append('design must be a mapping of component -> contrasts')
         return out
-    design = {str(k): v for k, v in design.items()}
+    design = {_safe_text(k): v for k, v in design.items()}
     for comp in design:
         row = {'panels_complete': [], 'panels_measured': [],
                'panels_verified': [], 'panels_verified_raw': [],
@@ -105,7 +105,7 @@ def ablation_coverage_across_panels(reports, design=None, *, verbose=False,
                     # per-component arm list.  Attribute each missing cell to
                     # every component it contains.
                     _miss = [f"{'+'.join(_m.get('combo') or []) or 'none'}:"
-                             f"{_m.get('arm')!r}"
+                             f"{_safe_repr(_m.get('arm'))}"
                              for _m in _miss_all if isinstance(_m, dict)
                              and comp in (_m.get('combo') or [])]
                 if not _miss:
@@ -365,7 +365,7 @@ def _normalise_component_report(rep):
         nonlocal changed
         if isinstance(value, dict) and any(not isinstance(k, str) for k in value):
             changed = True
-            return {str(k): v for k, v in value.items()}
+            return {_safe_text(k): v for k, v in value.items()}
         return value
 
     def _sequence(value):
@@ -520,7 +520,7 @@ def replication_independence_audit(panels, *, pair_detail_limit=None):
             _detail_limit is None or _detail_limit < 0):
         raise ValueError(
             'pair_detail_limit must be None or a non-negative integer, got '
-            f'{pair_detail_limit!r}')
+            f'{_safe_repr(pair_detail_limit)}')
     if not isinstance(panels, dict):
         return {'status': 'unattested', 'n_panels': 0, 'n_pairs': 0,
                 'pairs': {}, 'independent_pairs': [], 'new_seed_pairs': [],
@@ -547,7 +547,7 @@ def replication_independence_audit(panels, *, pair_detail_limit=None):
                   if x is not None and not (isinstance(x, str) and not x.strip())}
         _knobs = {_draw_value(x) for x in _identity_values(ident.get('train_knobs_values'))
                   if x is not None}
-        norm[str(name)] = {'seeds': sorted(seeds) if seeds else None,
+        norm[_safe_text(name)] = {'seeds': sorted(seeds) if seeds else None,
                            'bad_seed': _bad_seed, 'fps': fps,
                            'code_values': _codes,
                            'train_knobs_values': _knobs}
@@ -796,20 +796,20 @@ def _scope_pairs(scope, components):
         elif isinstance(spec, dict):
             factors = spec.get('factors')
         else:
-            raise ValueError(f'interaction scope {name!r} must be a list or mapping')
+            raise ValueError(f'interaction scope {_safe_repr(name)} must be a list or mapping')
         if not isinstance(factors, (list, tuple)) or not factors:
-            raise ValueError(f'interaction scope {name!r} has no factor list')
+            raise ValueError(f'interaction scope {_safe_repr(name)} has no factor list')
         clean = []
         for f in factors:
             if not isinstance(f, str) or not f.strip():
-                raise ValueError(f'interaction scope {name!r} has an invalid factor {f!r}')
+                raise ValueError(f'interaction scope {_safe_repr(name)} has an invalid factor {_safe_repr(f)}')
             clean.append(f.strip())
         unique = sorted(set(clean))
         if len(unique) < 2:
-            raise ValueError(f'interaction scope {name!r} needs at least two distinct factors')
+            raise ValueError(f'interaction scope {_safe_repr(name)} needs at least two distinct factors')
         unknown = sorted(set(unique) - set(components))
         if unknown:
-            raise ValueError(f'interaction scope {name!r} names undeclared component(s): '
+            raise ValueError(f'interaction scope {_safe_repr(name)} names undeclared component(s): '
                              + ', '.join(unknown))
         for a, b in itertools.combinations(unique, 2):
             pairs.add((a, b))
@@ -832,18 +832,18 @@ def _normalise_interaction_waivers(waivers, components):
         raise ValueError(f'interaction waivers must be a mapping, got {type(waivers).__name__}')
     for key, reason in waivers.items():
         if not isinstance(key, (tuple, list)) or len(key) != 2:
-            raise ValueError(f'interaction waiver key {key!r} must be a component pair')
+            raise ValueError(f'interaction waiver key {_safe_repr(key)} must be a component pair')
         pair = _interaction_pair(key[0], key[1])
         if pair is None:
-            raise ValueError(f'interaction waiver key {key!r} is not a distinct component pair')
+            raise ValueError(f'interaction waiver key {_safe_repr(key)} is not a distinct component pair')
         unknown = sorted(set(pair) - set(components))
         if unknown:
-            raise ValueError(f'interaction waiver {key!r} names undeclared component(s): '
+            raise ValueError(f'interaction waiver {_safe_repr(key)} names undeclared component(s): '
                              + ', '.join(unknown))
         if not isinstance(reason, str) or not reason.strip():
-            raise ValueError(f'interaction waiver {key!r} needs a non-empty reason')
+            raise ValueError(f'interaction waiver {_safe_repr(key)} needs a non-empty reason')
         if pair in out:
-            raise ValueError(f'interaction waiver {key!r} duplicates pair {pair!r}')
+            raise ValueError(f'interaction waiver {_safe_repr(key)} duplicates pair {_safe_repr(pair)}')
         out[pair] = reason.strip()
     return out
 
@@ -904,7 +904,7 @@ def interaction_coverage_audit(design=None, factorials=None, scope=None,
         out['problems'].append(
             f'ablation design must be a non-empty mapping, got {type(design).__name__}')
         return out
-    components = sorted(str(k) for k in design)
+    components = sorted(_safe_text(k) for k in design)
     out['components'] = components
     if not isinstance(factorials, dict):
         out['status'] = 'fail'
@@ -925,7 +925,7 @@ def interaction_coverage_audit(design=None, factorials=None, scope=None,
     }
     tested = {}
     for name, spec in factorials.items():
-        sname = str(name)
+        sname = _safe_text(name)
         factors = _factorial_factor_names(spec)
         rec = {'factors': list(factors) if factors else None,
                'pair': None, 'status': 'invalid'}
@@ -950,7 +950,7 @@ def interaction_coverage_audit(design=None, factorials=None, scope=None,
             # first one.  Appending `tested[pair]` on every duplicate used to
             # repeat the original name and lose the declaration order.
             names = out['duplicate_pairs'].setdefault(
-                str(list(pair)), [tested[pair]])
+                _safe_repr(list(pair)), [tested[pair]])
             if sname not in names:
                 names.append(sname)
             out['warnings'].append(
@@ -1044,9 +1044,9 @@ def ablation_factorial_anchor_audit(design=None, factorials=None):
                     p = _interaction_pair(item[0], item[1])
                     if p is not None:
                         pairs.add(p)
-        declared[str(comp)] = pairs
+        declared[_safe_text(comp)] = pairs
     for name, spec in factorials.items():
-        sname = str(name)
+        sname = _safe_text(name)
         rec = {'factors': None, 'levels': {}, 'component_anchored': None,
                'fully_anchored': None}
         out['factorials'][sname] = rec
@@ -1093,7 +1093,7 @@ def ablation_factorial_anchor_audit(design=None, factorials=None):
         for factor, pairs in level_pairs.items():
             if factor not in declared:
                 out['warnings'].append(
-                    f'{sname}: factor {factor!r} is not a declared ablation '
+                    f'{sname}: factor {_safe_repr(factor)} is not a declared ablation '
                     'component; anchoring is unverifiable')
                 rec['levels'][factor] = {'declared_matches': None,
                                          'status': 'unverifiable'}
@@ -1111,7 +1111,7 @@ def ablation_factorial_anchor_audit(design=None, factorials=None):
                            'unanchored')}
             if n_match == 0:
                 out['violations'].append(
-                    f'{sname}: factor {factor!r} uses no declared leave-one-out '
+                    f'{sname}: factor {_safe_repr(factor)} uses no declared leave-one-out '
                     'contrast; the interaction is between ad hoc arms, not the '
                     'declared component')
         _levels = list(rec['levels'].values())
@@ -1152,7 +1152,7 @@ def factorial_design_audit(design=None, present=None, factory=None, n_layers=6):
     _nl = _as_seed_int(n_layers)
     if _nl is None or _nl < 1:
         raise ValueError(
-            f'factorial_design_audit: n_layers must be a positive integer, got {n_layers!r}')
+            f'factorial_design_audit: n_layers must be a positive integer, got {_safe_repr(n_layers)}')
     n_layers = int(_nl)
     report = {'kind': 'factorial_design', 'status': 'ok', 'n_layers': n_layers,
               'factorials': {}, 'violations': [], 'warnings': []}
@@ -1171,12 +1171,13 @@ def factorial_design_audit(design=None, present=None, factory=None, n_layers=6):
         report['status'] = 'fail'
         return report
     for name, spec in design.items():
+        name = _safe_text(name)
         rec = {'factors': None, 'cells': {}, 'complete': False,
                'missing_cells': [], 'extra_cells': [], 'missing_arms': [],
                'factor_diffs': {}, 'factor_diff_signatures': {},
                'hypothesis': None, 'hypothesis_audit': None,
                'full_factorial': None}
-        report['factorials'][str(name)] = rec
+        report['factorials'][_safe_text(name)] = rec
         _ok = True
 
         def _bad(msg):
@@ -1203,14 +1204,14 @@ def factorial_design_audit(design=None, present=None, factory=None, n_layers=6):
         for key, arm in cells.items():
             if (not isinstance(key, (tuple, list)) or len(key) != 2
                     or any(k not in ('control', 'active') for k in key)):
-                _bad(f'cell key {key!r} must be (control|active, control|active)')
+                _bad(f'cell key {_safe_repr(key)} must be (control|active, control|active)')
                 continue
             if not isinstance(arm, str) or not arm.strip():
-                _bad(f'cell {tuple(key)!r} has an invalid arm id {arm!r}')
+                _bad(f'cell {_safe_repr(tuple(key))} has an invalid arm id {_safe_repr(arm)}')
                 continue
             _nkey = tuple(key)
             if _nkey in norm_cells:
-                _bad(f'cell key {key!r} duplicates normalized cell {_nkey!r}; '
+                _bad(f'cell key {_safe_repr(key)} duplicates normalized cell {_safe_repr(_nkey)}; '
                      'the declaration is ambiguous')
                 continue
             norm_cells[_nkey] = arm.strip()
@@ -1329,11 +1330,11 @@ def factorial_design_audit(design=None, present=None, factory=None, n_layers=6):
                      'each 2x2 simple effect must isolate one factor, not a '
                      'multi-factor bundle')
 
-        hname = str(spec.get('hypothesis') or name)
+        hname = _safe_text(spec.get('hypothesis') or name)
         rec['hypothesis'] = hname
         hyp = INTERACTION_HYPOTHESIS_DESIGN.get(hname)
         if not isinstance(hyp, dict):
-            _bad(f'no pre-registered interaction hypothesis named {hname!r}')
+            _bad(f'no pre-registered interaction hypothesis named {_safe_repr(hname)}')
         else:
             ha = hypothesis_audit({hname: hyp}, 'interaction', names=[hname])
             rec['hypothesis_audit'] = ha
@@ -1459,7 +1460,7 @@ def interaction_sesoi_audit(design=None, sesoi=None):
             f'{type(e).__name__}: {e}')
         return out
     for name, decl in design.items():
-        sname = str(name)
+        sname = _safe_text(name)
         rec = {'declared': sname in norm}
         out['factorials'][sname] = rec
         if not isinstance(decl, dict):
@@ -1485,21 +1486,21 @@ def interaction_sesoi_audit(design=None, sesoi=None):
             out['warnings'].append(
                 f'{sname}: relative interaction SESOI is >50% of the '
                 'ratio-of-ratios; verify this is intentional')
-        hname = str(decl.get('hypothesis') or sname)
+        hname = _safe_text(decl.get('hypothesis') or sname)
         hyp = INTERACTION_HYPOTHESIS_DESIGN.get(hname)
         if not isinstance(hyp, dict):
             out['problems'].append(
                 f'{sname}: no pre-registered interaction hypothesis named '
-                f'{hname!r}')
+                f'{_safe_repr(hname)}')
             continue
         pred = hyp.get('predicted_sign')
         if isinstance(pred, bool) or pred not in (-1, 0, 1):
             out['problems'].append(
-                f'{sname}: interaction hypothesis {hname!r} has no valid '
-                f'predicted_sign (got {pred!r})')
+                f'{sname}: interaction hypothesis {_safe_repr(hname)} has no valid '
+                f'predicted_sign (got {_safe_repr(pred)})')
         rec['hypothesis'] = hname
         rec['predicted_sign'] = pred
-    extras = sorted(set(norm) - {str(k) for k in design})
+    extras = sorted(set(norm) - {_safe_text(k) for k in design})
     if extras:
         out['warnings'].append(
             'interaction SESOI declares factorial(s) not present in the '
@@ -1553,7 +1554,7 @@ def _factorial_condition_rows(recs, cells, *, strict_hyper=True):
             elif '' in ts:
                 chosen[a] = by_arm[a][s]['']
             else:
-                bad = f'arm {a} has no record for protocol tag {tag!r}'
+                bad = f'arm {a} has no record for protocol tag {_safe_repr(tag)}'
                 break
         if bad is not None:
             skipped.append({'seed': s, 'reason': bad})
@@ -1650,9 +1651,9 @@ def factorial_look_snapshot(recs, *, design=None):
         seeds = [int(r['seed']) for r in rows]
         deltas = [float(r['interaction_log_ppl']) for r in rows]
         sf = exact_signflip_p(deltas)
-        out[_interaction_look_key(str(name))] = {
+        out[_interaction_look_key(_safe_text(name))] = {
             'kind': 'interaction',
-            'factorial': str(name),
+            'factorial': _safe_text(name),
             'cells': {f'{k[0]}|{k[1]}': norm_cells[k]
                       for k in _FACTORIAL_CELL_KEYS},
             'tags': {str(r['seed']): str(r.get('tag') or '') for r in rows},
@@ -1696,7 +1697,7 @@ def _interaction_look_analysis(look_series, key, final_seeds, final_deltas,
                 cur_tags[si] = str(t or '')
     cur_cells = None
     if isinstance(final_cells, dict) and final_cells:
-        cur_cells = {str(k): str(v) for k, v in final_cells.items()}
+        cur_cells = {_safe_text(k): _safe_text(v) for k, v in final_cells.items()}
 
     def _rows(rec):
         raw_seeds, raw_deltas = rec.get('seeds'), rec.get('deltas')
@@ -1752,7 +1753,7 @@ def _interaction_look_analysis(look_series, key, final_seeds, final_deltas,
         look_cells = lk.get('cells')
         if (cur_cells is not None and isinstance(look_cells, dict)
                 and look_cells):
-            norm_cells = {str(k): str(v) for k, v in look_cells.items()}
+            norm_cells = {_safe_text(k): _safe_text(v) for k, v in look_cells.items()}
             if norm_cells != cur_cells:
                 stale.append({'look': lk.get('look'),
                               'reason': 'cell arms changed across looks'})

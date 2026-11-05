@@ -249,15 +249,19 @@ def maxt_min_n_for_alpha(alpha=0.05):
     """
     where = 'maxt_min_n_for_alpha'
     alpha = _joint_alpha(alpha, where=where)
-    # Integer doubling avoids log2 round-off at exact boundaries (e.g.
-    # alpha=0.25 must give n=3, not ceil(2.9999999999999996)=3 vs 4).
+    # Evaluate 2**-n in the float exponent domain instead of building
+    # ``2**n`` as an integer and converting it to float.  The integer form
+    # overflows for n >= 1024, so a legitimately tiny alpha (e.g. 1e-320)
+    # crashed the planner instead of returning the seed count at which the
+    # exact sign-flip floor reaches it.  ldexp also underflows to 0.0, which
+    # is the correct representable floor beyond n=1075.
     n = 2
-    while 2.0 / (1 << n) > alpha:
+    while math.ldexp(1.0, 1 - n) > alpha:
         n += 1
     return {
         'alpha': float(alpha),
         'min_n': int(n),
-        'p_floor': float(2.0 / (1 << n)),
+        'p_floor': float(math.ldexp(1.0, 1 - n)),
         'beyond_enumeration_cap': bool(n > JOINT_SIGNFLIP_MAX_N),
         'enumeration_cap': int(JOINT_SIGNFLIP_MAX_N),
         'scope': ('best case (perfectly dependent contrasts); independent '

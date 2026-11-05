@@ -1,4 +1,7 @@
 
+_SCF_COUNT_BITS_MAX = 64
+
+
 def _scf_text(value, limit=120):
     """Bounded text for a declaration name/key."""
     try:
@@ -6,6 +9,35 @@ def _scf_text(value, limit=120):
     except Exception:
         return f'<unrepresentable {type(value).__name__}>'
     return text if len(text) <= limit else text[:limit - 3] + '...'
+
+
+def _scf_json_safe(value, _depth=0):
+    """Return a strict-JSON-safe copy of a diagnostic value.
+
+    Declared power fields are untrusted JSON.  A finite Python integer can
+    still exceed CPython's decimal-conversion limit, and a nested object may
+    carry one, so recursively replace only the unrepresentable leaves.  The
+    returned report stays serialisable without changing ordinary values.
+    """
+    if _depth > 32:
+        return '<nesting-too-deep>'
+    if value is None or isinstance(value, (bool, str)):
+        return value
+    if isinstance(value, int):
+        try:
+            if value.bit_length() <= _SCF_COUNT_BITS_MAX:
+                return value
+        except (AttributeError, TypeError):
+            pass
+        return _scf_repr(value)
+    if isinstance(value, float):
+        return value if math.isfinite(value) else _scf_repr(value)
+    if isinstance(value, dict):
+        return {_scf_json_safe(k, _depth + 1): _scf_json_safe(v, _depth + 1)
+                for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_scf_json_safe(v, _depth + 1) for v in value]
+    return _scf_repr(value)
 
 
 def _scf_repr(value, limit=120):
@@ -233,7 +265,7 @@ def niah_contrast_factor_audit(declarations=None, *, overrides=None,
         return report
     missing_factory = False
     for name, spec in declarations.items():
-        label = str(name)
+        label = _scf_text(name)
         if not isinstance(spec, dict):
             report['violations'].append(f'{label}: declaration is not an object')
             continue
@@ -259,14 +291,14 @@ def niah_contrast_factor_audit(declarations=None, *, overrides=None,
         if override_tag is not None:
             if not isinstance(override_tag, str) or override_tag not in overrides:
                 report['violations'].append(
-                    f'{label}: override {override_tag!r} is not in the shared NIAH override map')
+                    f'{label}: override {_scf_repr(override_tag)} is not in the shared NIAH override map')
                 continue
             _override_spec = overrides.get(override_tag)
             if not isinstance(_override_spec, dict):
                 report['violations'].append(
-                    f'{label}: override {override_tag!r} must be an object')
+                    f'{label}: override {_scf_repr(override_tag)} must be an object')
                 continue
-            actual_set = {str(k) for k in _override_spec}
+            actual_set = {_scf_text(k) for k in _override_spec}
             entry = {'mode': 'inference_override', 'override': override_tag,
                      'a': 'csa_fixed_rope', 'b': 'csa_fixed_rope'}
         else:
@@ -382,7 +414,7 @@ def probe_contrast_factor_audit(declarations=None, *, overrides=None,
         return report
     missing_factory = False
     for name, spec in declarations.items():
-        label = str(name)
+        label = _scf_text(name)
         if not isinstance(spec, dict):
             report['violations'].append(f'{label}: declaration is not an object')
             continue
@@ -408,15 +440,15 @@ def probe_contrast_factor_audit(declarations=None, *, overrides=None,
         if override_tag is not None:
             if not isinstance(override_tag, str) or override_tag not in overrides:
                 report['violations'].append(
-                    f'{label}: override {override_tag!r} is not in the shared '
+                    f'{label}: override {_scf_repr(override_tag)} is not in the shared '
                     'inference override map')
                 continue
             _override_spec = overrides.get(override_tag)
             if not isinstance(_override_spec, dict):
                 report['violations'].append(
-                    f'{label}: override {override_tag!r} must be an object')
+                    f'{label}: override {_scf_repr(override_tag)} must be an object')
                 continue
-            actual_set = {str(k) for k in _override_spec}
+            actual_set = {_scf_text(k) for k in _override_spec}
             entry = {'mode': 'inference_override', 'override': override_tag,
                      'a': 'csa_fixed_rope', 'b': 'csa_fixed_rope'}
         else:
@@ -488,18 +520,19 @@ def probe_contrast_factor_audit(declarations=None, *, overrides=None,
             _observed = []
         _seen = []
         for _tag in _observed:
-            _tag = str(_tag)
+            _tag = _scf_text(_tag)
             if _tag in _seen:
                 continue
             _seen.append(_tag)
             if _tag not in declarations:
                 report['undeclared_observed_tags'].append(_tag)
                 report['violations'].append(
-                    f'probe contrast {_tag!r} was emitted without a factor '
+                    f'probe contrast {_scf_repr(_tag)} was emitted without a factor '
                     'declaration; add it to PROBE_CONTRAST_FACTORS before it can '
                     'be read as mechanism evidence')
         report['observed_tags'] = _seen
-        _unobserved = [str(k) for k in declarations if str(k) not in _seen]
+        _unobserved = [_scf_text(k) for k in declarations
+                      if _scf_text(k) not in _seen]
         if _seen and _unobserved:
             report['warnings'].append(
                 f'declared probe contrast(s) not observed in this panel: '
@@ -553,7 +586,7 @@ def attach_probe_factor_metadata(record, tag, factor_report, *, declarations=Non
         record['single_factor'] = False
         record['factor_declaration_verified'] = False
         record['factors_note'] = (
-            f'no probe factor declaration for {tag!r}; the contrast cannot '
+            f'no probe factor declaration for {_scf_repr(tag)}; the contrast cannot '
             'be read as single-factor mechanism evidence')
         record['contrast_level'] = 'undeclared'
         return record
@@ -837,7 +870,7 @@ def planned_power_audit(manifest, *, require_projection=False):
             v = _design_int(s)
             if v is None or v < 0:
                 out['violations'].append(
-                    f'seeds[{i}]={s!r} is not a non-negative integer seed')
+                    f'seeds[{i}]={_scf_repr(s)} is not a non-negative integer seed')
             else:
                 seeds.append(v)
         if len(set(seeds)) != len(seeds):
@@ -847,13 +880,32 @@ def planned_power_audit(manifest, *, require_projection=False):
     n_stat = _design_int(stat.get('n_seeds'))
     if 'n_seeds' in stat and n_stat is None:
         out['violations'].append(
-            f'statistics.n_seeds={stat.get("n_seeds")!r} is not an integer')
+            f'statistics.n_seeds={_scf_repr(stat.get("n_seeds"))} is not an integer')
     n = len(seeds) if seeds else n_stat
     m = len(comps)
     out['n_seeds'], out['family_m'] = n, m
+    # A declared count is untrusted JSON.  Beyond this guard the exact sign-flip
+    # helpers (and Python's integer->decimal diagnostic limit) cannot represent
+    # the plan; refuse it explicitly instead of crashing while reporting it.
+    if isinstance(n, int) and n.bit_length() > _SCF_COUNT_BITS_MAX:
+        out['violations'].append(
+            'statistics.n_seeds declares an integer with '
+            f'bit_length={n.bit_length()}, above the supported planning cap')
+        out['n_seeds'] = None
+        out['n_seeds_bit_length'] = int(n.bit_length())
+        out['status'] = 'fail'
+        return out
+    if isinstance(m, int) and m.bit_length() > _SCF_COUNT_BITS_MAX:
+        out['violations'].append(
+            'primary_comparisons declares a family with '
+            f'bit_length={m.bit_length()}, above the supported planning cap')
+        out['family_m'] = None
+        out['family_m_bit_length'] = int(m.bit_length())
+        out['status'] = 'fail'
+        return out
     if n_stat is not None and seeds and n_stat != len(seeds):
         out['violations'].append(
-            f'statistics.n_seeds={n_stat} does not equal len(seeds)={len(seeds)}')
+            f'statistics.n_seeds={_scf_repr(n_stat)} does not equal len(seeds)={len(seeds)}')
     if not n or n <= 0:
         out['violations'].append('no positive seed count; the power floor is unverifiable')
         n = None
@@ -863,14 +915,14 @@ def planned_power_audit(manifest, *, require_projection=False):
     alpha = _design_probability(alpha_raw, name='alpha', lo_open=True, hi_open=True)
     if alpha is None:
         out['violations'].append(
-            f'statistics.alpha={alpha_raw!r} is not a finite number in (0,1)')
+            f'statistics.alpha={_scf_repr(alpha_raw)} is not a finite number in (0,1)')
         alpha = 0.05
     out['alpha'] = alpha
     min_n = _design_int(stat.get('min_seeds_for_confirmation'))
     out['min_seeds_for_confirmation'] = min_n
     if min_n is None or min_n < 2 or (n and min_n > n):
         out['violations'].append(
-            f'statistics.min_seeds_for_confirmation={min_n!r} is outside '
+            f'statistics.min_seeds_for_confirmation={_scf_repr(min_n)} is outside '
             f'[2, {n if n else "n"}]')
         min_n = None
     if n and m:
@@ -878,27 +930,27 @@ def planned_power_audit(manifest, *, require_projection=False):
         out['p_floor'] = float(floor)
         declared_floor = stat.get('p_floor')
         if declared_floor is not None:
-            out['declared']['p_floor'] = declared_floor
+            out['declared']['p_floor'] = _scf_json_safe(declared_floor)
             if not _design_close(declared_floor, floor):
                 out['violations'].append(
-                    f'statistics.p_floor={declared_floor!r} is not the exact '
-                    f'two-sided floor 2/2**n={floor!r} for n={n}')
+                    f'statistics.p_floor={_scf_repr(declared_floor)} is not the exact '
+                    f'two-sided floor 2/2**n={_scf_repr(floor)} for n={n}')
         family_floor = holm_min_attainable_p(n, m, alpha)
         out['min_attainable_p_holm'] = float(family_floor)
         declared_family = stat.get('min_attainable_p_holm')
         if declared_family is not None:
-            out['declared']['min_attainable_p_holm'] = declared_family
+            out['declared']['min_attainable_p_holm'] = _scf_json_safe(declared_family)
             if not _design_close(declared_family, family_floor):
                 out['violations'].append(
-                    f'statistics.min_attainable_p_holm={declared_family!r} is '
-                    f'not m*2/2**n={family_floor!r} for n={n}, m={m}')
+                    f'statistics.min_attainable_p_holm={_scf_repr(declared_family)} is '
+                    f'not m*2/2**n={_scf_repr(family_floor)} for n={n}, m={m}')
         if min_n:
             min_floor = holm_min_attainable_p(min_n, m, alpha)
             out['min_seed_attainable_p_holm'] = float(min_floor)
             if not math.isfinite(min_floor) or min_floor > alpha:
                 out['violations'].append(
                     f'the minimum seed floor n={min_n} cannot attain Holm '
-                    f'p<={alpha} (floor={min_floor!r})')
+                    f'p<={alpha} (floor={_scf_repr(min_floor)})')
     q_raw = stat.get('power_q_for_test')
     mp_raw = stat.get('min_power_for_test')
     q = _design_probability(q_raw, name='power_q_for_test',
@@ -910,11 +962,11 @@ def planned_power_audit(manifest, *, require_projection=False):
     if need_projection:
         if q is None:
             out['violations'].append(
-                f'statistics.power_q_for_test={q_raw!r} is not a finite '
+                f'statistics.power_q_for_test={_scf_repr(q_raw)} is not a finite '
                 'probability in (0,1)')
         if mp is None:
             out['violations'].append(
-                f'statistics.min_power_for_test={mp_raw!r} is not a finite '
+                f'statistics.min_power_for_test={_scf_repr(mp_raw)} is not a finite '
                 'probability in [0,1]')
         if n and m and q is not None:
             projected = float(signflip_power(n, m, q, alpha))
@@ -930,7 +982,7 @@ def planned_power_audit(manifest, *, require_projection=False):
                     'underpowered and cannot confirm even if it runs')
     proj = stat.get('power_projection')
     if isinstance(proj, dict):
-        out['declared']['power_projection'] = proj
+        out['declared']['power_projection'] = _scf_json_safe(proj)
         pq = _design_probability(proj.get('q'), name='power_projection.q',
                                  lo_open=True, hi_open=True)
         pn = _design_int(proj.get('n_seeds'))
@@ -943,41 +995,42 @@ def planned_power_audit(manifest, *, require_projection=False):
         else:
             if n and pn != n:
                 out['violations'].append(
-                    f'power_projection.n_seeds={pn} != frozen seed count {n}')
+                    f'power_projection.n_seeds={_scf_repr(pn)} != frozen seed count {n}')
             if m and pm != m:
                 out['violations'].append(
-                    f'power_projection.family_m={pm} != primary comparison count {m}')
+                    f'power_projection.family_m={_scf_repr(pm)} != primary comparison count {m}')
             if q is not None and not _design_close(pq, q):
                 out['violations'].append(
                     f'power_projection.q={pq} != statistics.power_q_for_test={q}')
-            if n and m:
+            if (n and m and pn.bit_length() <= _SCF_COUNT_BITS_MAX
+                    and pm.bit_length() <= _SCF_COUNT_BITS_MAX):
                 want = float(signflip_power(pn, pm, pq, alpha))
                 if not _design_close(pp, want, tol=1e-9):
                     out['violations'].append(
-                        f'power_projection.power={pp!r} != recomputed '
-                        f'signflip_power({pn},{pm},{pq})={want!r}')
+                        f'power_projection.power={_scf_repr(pp)} != recomputed '
+                        f'signflip_power({_scf_repr(pn)},{_scf_repr(pm)},{pq})={_scf_repr(want)}')
     # The frozen v1/v2 power table is a design record too.  Each declared
     # q -> power cell must still equal the current sign-flip projection;
     # a stale table after changing n/m/alpha would misstate the plan.
     _table = stat.get('power_first_holm_gate')
     if isinstance(_table, dict) and n and m:
         for _key, _val in _table.items():
-            _txt = str(_key).strip()
+            _txt = _scf_text(_key).strip()
             if '=' not in _txt:
                 out['warnings'].append(
-                    f'power_first_holm_gate key {_key!r} has no q=... form; skipped')
+                    f'power_first_holm_gate key {_scf_repr(_key)} has no q=... form; skipped')
                 continue
             _q = _design_probability(_txt.split('=', 1)[1], name='power q',
                                      lo_open=True, hi_open=True)
             if _q is None:
                 out['violations'].append(
-                    f'power_first_holm_gate key {_key!r} has an invalid q')
+                    f'power_first_holm_gate key {_scf_repr(_key)} has an invalid q')
                 continue
             _want = float(signflip_power(n, m, _q, alpha))
             if not _design_close(_val, _want, tol=5e-4):
                 out['violations'].append(
-                    f'power_first_holm_gate[{_key!r}]={_val!r} != recomputed '
-                    f'signflip_power({n},{m},{_q})={_want!r}')
+                    f'power_first_holm_gate[{_scf_repr(_key)}]={_scf_repr(_val)} != recomputed '
+                    f'signflip_power({n},{m},{_q})={_scf_repr(_want)}')
     pre = manifest.get('precondition') if isinstance(manifest.get('precondition'), dict) else {}
     gate = pre.get('power_gate') if isinstance(pre.get('power_gate'), dict) else {}
     if gate.get('status') == 'passed':
@@ -992,7 +1045,7 @@ def planned_power_audit(manifest, *, require_projection=False):
                     f'precondition.power_gate.power={gp} < min_power_for_test={mp}')
             if q is not None and gate.get('q') is not None and not _design_close(gate.get('q'), q):
                 out['violations'].append(
-                    f'precondition.power_gate.q={gate.get("q")!r} != '
+                    f'precondition.power_gate.q={_scf_repr(gate.get("q"))} != '
                     f'statistics.power_q_for_test={q}')
     if out['violations']:
         out['status'] = 'fail'
@@ -1029,18 +1082,18 @@ def _design_direction(value):
     if value is None:
         return None, None
     if isinstance(value, (bool, np.bool_)):
-        return None, f'expected_sign={value!r} must not be a boolean'
+        return None, f'expected_sign={_scf_repr(value)} must not be a boolean'
     if isinstance(value, numbers.Real) and not isinstance(value, complex):
         f = _finite_scalar(value)
         if f in (-1.0, 1.0):
             return int(f), None
-        return None, f'expected_sign={value!r} must be -1 or +1'
-    text = str(value).strip().lower()
+        return None, f'expected_sign={_scf_repr(value)} must be -1 or +1'
+    text = _scf_text(value).strip().lower()
     if text in ('positive', '+', '+1', '1'):
         return 1, None
     if text in ('negative', '-', '-1'):
         return -1, None
-    return None, f'expected_sign={value!r} must be positive, negative, -1, +1, or null'
+    return None, f'expected_sign={_scf_repr(value)} must be positive, negative, -1, +1, or null'
 
 
 def _q_for_target_power(n_seeds, m_comparisons, target_power, alpha):
@@ -1155,32 +1208,48 @@ def paired_design_sensitivity(n_seeds, m_comparisons, *, alpha=0.05,
     m = _design_int(m_comparisons)
     n_max_i = _design_int(n_max)
     out['n_seeds'], out['m_family'] = n, m
+    if isinstance(n, int) and n.bit_length() > _SCF_COUNT_BITS_MAX:
+        out['violations'].append(
+            'n_seeds declares an integer with '
+            f'bit_length={n.bit_length()}, above the supported planning cap')
+        out['n_seeds'] = None
+        out['n_seeds_bit_length'] = int(n.bit_length())
+        out['status'] = 'fail'
+        return out
+    if isinstance(m, int) and m.bit_length() > _SCF_COUNT_BITS_MAX:
+        out['violations'].append(
+            'm_comparisons declares an integer with '
+            f'bit_length={m.bit_length()}, above the supported planning cap')
+        out['m_family'] = None
+        out['m_family_bit_length'] = int(m.bit_length())
+        out['status'] = 'fail'
+        return out
     if n is None or n < 2:
         out['violations'].append(
-            f'n_seeds={n_seeds!r} must be an integer >= 2')
+            f'n_seeds={_scf_repr(n_seeds)} must be an integer >= 2')
         n = None
     if m is None or m < 1:
         out['violations'].append(
-            f'm_comparisons={m_comparisons!r} must be a positive integer')
+            f'm_comparisons={_scf_repr(m_comparisons)} must be a positive integer')
         m = None
     if n_max_i is None or n_max_i < 2 or n_max_i > 10000:
         out['violations'].append(
-            f'n_max={n_max!r} must be an integer in [2, 10000]')
+            f'n_max={_scf_repr(n_max)} must be an integer in [2, 10000]')
         n_max_i = 512
     a = _design_probability(alpha, name='alpha', lo_open=True, hi_open=True)
     if a is None:
         out['violations'].append(
-            f'alpha={alpha!r} must be a finite probability in (0,1)')
+            f'alpha={_scf_repr(alpha)} must be a finite probability in (0,1)')
     out['alpha'] = a
     tp = _design_probability(target_power, name='target_power',
                              lo_open=True, hi_open=True)
     if tp is None:
         out['violations'].append(
-            f'target_power={target_power!r} must be a finite probability in (0,1)')
+            f'target_power={_scf_repr(target_power)} must be a finite probability in (0,1)')
     out['target_power'] = tp
     if not isinstance(require_sesoi_power, (bool, np.bool_)):
         out['violations'].append(
-            f'require_sesoi_power={require_sesoi_power!r} must be a boolean')
+            f'require_sesoi_power={_scf_repr(require_sesoi_power)} must be a boolean')
         require_sesoi_power = False
     require_sesoi_power = bool(require_sesoi_power)
     out['require_sesoi_power'] = require_sesoi_power
@@ -1189,7 +1258,7 @@ def paired_design_sensitivity(n_seeds, m_comparisons, *, alpha=0.05,
         target_halfwidth_value = _finite_scalar(target_halfwidth)
         if target_halfwidth_value is None or target_halfwidth_value <= 0.0:
             out['violations'].append(
-                f'target_halfwidth={target_halfwidth!r} must be a finite positive number')
+                f'target_halfwidth={_scf_repr(target_halfwidth)} must be a finite positive number')
             target_halfwidth_value = None
     out['target_halfwidth'] = target_halfwidth_value
     direction, direction_error = _design_direction(expected_sign)
@@ -1233,7 +1302,7 @@ def paired_design_sensitivity(n_seeds, m_comparisons, *, alpha=0.05,
         explicit_sd = _finite_scalar(pilot_sd)
         if explicit_sd is None or explicit_sd <= 0.0:
             out['violations'].append(
-                f'pilot_sd={pilot_sd!r} must be a finite positive number')
+                f'pilot_sd={_scf_repr(pilot_sd)} must be a finite positive number')
             explicit_sd = None
     sd = None
     if explicit_sd is not None:
@@ -1322,7 +1391,7 @@ def paired_design_sensitivity(n_seeds, m_comparisons, *, alpha=0.05,
         if half is not None and out['precision'].get('meets_target') is False:
             out['warnings'].append(
                 'the expected paired 95% CI half-width at the planned n '
-                f'({half:.6g}) exceeds target_halfwidth={target_halfwidth!r}')
+                f'({half:.6g}) exceeds target_halfwidth={_scf_repr(target_halfwidth)}')
     if q_sign_rate is not None and tp is not None and n is not None and m is not None and a is not None:
         needed = _n_for_target_power(n, m, q_sign_rate, tp, a, n_max_i)
         out['pilot']['required_n_for_target_power'] = needed
@@ -1361,7 +1430,7 @@ def paired_design_sensitivity(n_seeds, m_comparisons, *, alpha=0.05,
         sesoi_value = _finite_scalar(sesoi)
         if sesoi_value is None or sesoi_value <= 0.0:
             out['violations'].append(
-                f'sesoi={sesoi!r} must be a finite positive margin in the '
+                f'sesoi={_scf_repr(sesoi)} must be a finite positive margin in the '
                 'same units as the paired deltas')
             sesoi_value = None
     out['sesoi'] = {
@@ -1528,38 +1597,46 @@ def attrition_power_audit(n_seeds, m_comparisons, *, q,
     n = _design_int(n_seeds)
     m = _design_int(m_comparisons)
     n_max_i = _design_int(n_max)
+    if isinstance(m, int) and m.bit_length() > _SCF_COUNT_BITS_MAX:
+        out['violations'].append(
+            'm_comparisons declares an integer with '
+            f'bit_length={m.bit_length()}, above the supported planning cap')
+        out['m_family'] = None
+        out['m_family_bit_length'] = int(m.bit_length())
+        out['status'] = 'fail'
+        return out
     if n is None or n < 2:
-        out['violations'].append(f'n_seeds={n_seeds!r} must be an integer >= 2')
+        out['violations'].append(f'n_seeds={_scf_repr(n_seeds)} must be an integer >= 2')
         n = None
     if m is None or m < 1:
         out['violations'].append(
-            f'm_comparisons={m_comparisons!r} must be a positive integer')
+            f'm_comparisons={_scf_repr(m_comparisons)} must be a positive integer')
         m = None
     if n_max_i is None or n_max_i < 2 or n_max_i > 10000:
         out['violations'].append(
-            f'n_max={n_max!r} must be an integer in [2, 10000]')
+            f'n_max={_scf_repr(n_max)} must be an integer in [2, 10000]')
         n_max_i = 512
     a = _design_probability(alpha, name='alpha', lo_open=True, hi_open=True)
     if a is None:
         out['violations'].append(
-            f'alpha={alpha!r} must be a finite probability in (0,1)')
+            f'alpha={_scf_repr(alpha)} must be a finite probability in (0,1)')
     tp = _design_probability(target_power, name='target_power',
                              lo_open=True, hi_open=True)
     if tp is None:
         out['violations'].append(
-            f'target_power={target_power!r} must be a finite probability in (0,1)')
+            f'target_power={_scf_repr(target_power)} must be a finite probability in (0,1)')
     qv = _design_probability(q, name='q')
     if qv is None:
         out['violations'].append(
-            f'q={q!r} must be a finite probability in [0,1]')
+            f'q={_scf_repr(q)} must be a finite probability in [0,1]')
     if not isinstance(require_complete_coverage, (bool, np.bool_)):
         out['violations'].append(
-            f'require_complete_coverage={require_complete_coverage!r} must be a boolean')
+            f'require_complete_coverage={_scf_repr(require_complete_coverage)} must be a boolean')
         require_complete_coverage = True
     require_cov = bool(require_complete_coverage)
     if not isinstance(require_attrition_power, (bool, np.bool_)):
         out['violations'].append(
-            f'require_attrition_power={require_attrition_power!r} must be a boolean')
+            f'require_attrition_power={_scf_repr(require_attrition_power)} must be a boolean')
         require_attrition_power = False
     require_attr = bool(require_attrition_power)
     min_pairs = None
@@ -1567,15 +1644,25 @@ def attrition_power_audit(n_seeds, m_comparisons, *, q,
         min_pairs = _design_int(min_complete_pairs)
         if min_pairs is None or min_pairs < 0:
             out['violations'].append(
-                f'min_complete_pairs={min_complete_pairs!r} must be a '
+                f'min_complete_pairs={_scf_repr(min_complete_pairs)} must be a '
                 'non-negative integer')
+            min_pairs = None
+        elif min_pairs.bit_length() > _SCF_COUNT_BITS_MAX:
+            # The normalized count is stored in the report; a value beyond the
+            # guard cannot be rendered as strict JSON.  Keep its exact bit
+            # length as provenance and refuse the plan.
+            out['violations'].append(
+                'min_complete_pairs declares an integer with '
+                f'bit_length={min_pairs.bit_length()}, above the supported '
+                'planning cap')
+            out['min_complete_pairs_bit_length'] = int(min_pairs.bit_length())
             min_pairs = None
     p = None
     if pair_retention is not None:
         p = _design_probability(pair_retention, name='pair_retention')
         if p is None:
             out['violations'].append(
-                f'pair_retention={pair_retention!r} must be a finite '
+                f'pair_retention={_scf_repr(pair_retention)} must be a finite '
                 'probability in [0,1]')
     avail_t = None
     if availability_target is not None:
@@ -1584,7 +1671,7 @@ def attrition_power_audit(n_seeds, m_comparisons, *, q,
                                       lo_open=True)
         if avail_t is None:
             out['violations'].append(
-                f'availability_target={availability_target!r} must be a '
+                f'availability_target={_scf_repr(availability_target)} must be a '
                 'finite probability in (0,1]')
     out['n_seeds'], out['m_family'] = n, m
     out['alpha'], out['target_power'] = a, tp
@@ -1618,11 +1705,11 @@ def attrition_power_audit(n_seeds, m_comparisons, *, q,
     if (not require_cov and min_pairs is not None and n is not None
             and min_pairs > n):
         out['warnings'].append(
-            f'min_complete_pairs={min_pairs} exceeds the planned n={n}; '
+            f'min_complete_pairs={_scf_repr(min_pairs)} exceeds the planned n={n}; '
             'the current panel cannot satisfy its own floor')
     if not require_cov and min_pairs is not None and min_pairs > search_max:
         out['warnings'].append(
-            f'min_complete_pairs={min_pairs} exceeds the search cap '
+            f'min_complete_pairs={_scf_repr(min_pairs)} exceeds the search cap '
             f'n_max={search_max}; runnable is impossible within this scan')
     if n is None or m is None or a is None or qv is None or tp is None:
         if out['violations']:
@@ -1633,7 +1720,7 @@ def attrition_power_audit(n_seeds, m_comparisons, *, q,
     out['family_floor'] = family_floor
     if family_floor is None:
         out['violations'].append(
-            f'no n <= {floor_max} reaches the Holm floor for m={m} at '
+            f'no n <= {floor_max} reaches the Holm floor for m={_scf_repr(m)} at '
             f'alpha={a}; the family is resolution-limited')
 
     def _runnable_threshold(nn):
@@ -1648,7 +1735,7 @@ def attrition_power_audit(n_seeds, m_comparisons, *, q,
     if (not require_cov and family_floor is not None and min_pairs is not None
             and min_pairs < family_floor):
         out['warnings'].append(
-            f'min_complete_pairs={min_pairs} is below the Holm resolution '
+            f'min_complete_pairs={_scf_repr(min_pairs)} is below the Holm resolution '
             f'floor {family_floor}; the floor governs runnability')
     power_by_k = [0.0] * (array_max + 1)
     for k in range(2, array_max + 1):
@@ -1742,7 +1829,7 @@ def attrition_power_audit(n_seeds, m_comparisons, *, q,
         spv = _design_probability(sp, name=f'retention_scenarios[{idx}]')
         if spv is None:
             out['violations'].append(
-                f'retention_scenarios[{idx}]={sp!r} must be a probability in [0,1]')
+                f'retention_scenarios[{idx}]={_scf_repr(sp)} must be a probability in [0,1]')
             continue
         if any(abs(spv - x) <= 1e-15 for x in
                [s['pair_retention'] for s in out['scenarios']]):

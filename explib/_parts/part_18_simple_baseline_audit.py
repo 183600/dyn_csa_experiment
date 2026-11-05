@@ -958,6 +958,10 @@ def hypothesis_coverage_audit(design=None, baselines=None,
                        else component_table)
     baseline_table = (BASELINE_HYPOTHESIS_DESIGN if baseline_table is None
                       else baseline_table)
+    if isinstance(design, dict):
+        design = {_safe_text(k): v for k, v in design.items()}
+    if isinstance(baselines, dict):
+        baselines = {_safe_text(k): v for k, v in baselines.items()}
     if not isinstance(design, dict) or not isinstance(baselines, dict):
         return {'kind': 'hypothesis_coverage', 'status': 'fail',
                 'problems': ['design and baselines must be mappings'],
@@ -984,17 +988,17 @@ def hypothesis_coverage_audit(design=None, baselines=None,
                       'complete': not (missing or orphan or empty)}
         if missing:
             out['warnings'].append(
-                f'{label}: declared contrast family/families {missing} have no '
+                f'{label}: declared contrast family/families {_safe_repr(missing)} have no '
                 'pre-registered hypothesis — a result from them cannot be '
                 'interpreted against an expected mechanism or direction')
         if orphan:
             out['warnings'].append(
-                f'{label}: hypothesis entry/entries {orphan} do not correspond '
+                f'{label}: hypothesis entry/entries {_safe_repr(orphan)} do not correspond '
                 'to a declared contrast family — the declaration has drifted '
                 'from the experiment design')
         if empty:
             out['warnings'].append(
-                f'{label}: declared family/families {empty} are empty — there '
+                f'{label}: declared family/families {_safe_repr(empty)} are empty — there '
                 'is nothing for the hypothesis to be tested on')
 
     _cover('component', design, component_table)

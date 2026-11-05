@@ -63,7 +63,7 @@ def _fp_positive(name, value):
     except (TypeError, ValueError, OverflowError):
         raise TypeError(f'{name} must be a finite positive number, got {type(value).__name__}') from None
     if not math.isfinite(out) or out <= 0.0:
-        raise ValueError(f'{name} must be a finite positive number, got {value!r}')
+        raise ValueError(f'{name} must be a finite positive number, got {_safe_repr(value)}')
     return out
 
 
@@ -88,7 +88,7 @@ def _fp_probability(name, value, *, lo_open=False, hi_open=False):
     out = _design_probability(value, name=name,
                               lo_open=lo_open, hi_open=hi_open)
     if out is None:
-        raise ValueError(f'{name}={value!r} must be a finite probability')
+        raise ValueError(f'{name}={_safe_repr(value)} must be a finite probability')
     return out
 
 
@@ -105,19 +105,19 @@ def _fp_cell_vectors(cells):
     normalised = {}
     for key, value in cells.items():
         if not isinstance(key, str):
-            raise TypeError(f'cell key {key!r} is not a string')
+            raise TypeError(f'cell key {_safe_repr(key)} is not a string')
         if key not in FACTORIAL_POWER_CELL_KEYS:
-            raise ValueError(f'unknown cell key {key!r}; expected {FACTORIAL_POWER_CELL_KEYS}')
+            raise ValueError(f'unknown cell key {_safe_repr(key)}; expected {FACTORIAL_POWER_CELL_KEYS}')
         if key in normalised:
-            raise ValueError(f'duplicate cell key {key!r}')
+            raise ValueError(f'duplicate cell key {_safe_repr(key)}')
         if (isinstance(value, (str, bytes, bytearray, dict, set, frozenset))
                 or not hasattr(value, '__iter__')):
-            raise TypeError(f'cells[{key!r}] must be an ordered sequence of PPL values')
+            raise TypeError(f'cells[{_safe_repr(key)}] must be an ordered sequence of PPL values')
         vals = []
         for i, x in enumerate(value):
-            vals.append(_fp_positive(f'cells[{key!r}][{i}]', x))
+            vals.append(_fp_positive(f'cells[{_safe_repr(key)}][{i}]', x))
         if len(vals) < 2:
-            raise ValueError(f'cells[{key!r}] has {len(vals)} value(s); at least two paired seeds are required')
+            raise ValueError(f'cells[{_safe_repr(key)}] has {len(vals)} value(s); at least two paired seeds are required')
         normalised[key] = np.asarray(vals, dtype=float)
     missing = [k for k in FACTORIAL_POWER_CELL_KEYS if k not in normalised]
     if missing:
@@ -139,7 +139,7 @@ def _min_n_for_holm_family(m_family, alpha, n_max=10000):
     m = _fp_int('m_family', m_family, minimum=1)
     a = _design_probability(alpha, name='alpha', lo_open=True, hi_open=True)
     if a is None:
-        raise ValueError(f'alpha={alpha!r} must be a finite probability in (0,1)')
+        raise ValueError(f'alpha={_safe_repr(alpha)} must be a finite probability in (0,1)')
     n_max = _fp_int('n_max', n_max, minimum=2, maximum=10000)
     for n in range(2, n_max + 1):
         if holm_min_attainable_p(n, m, a) <= a:
@@ -340,7 +340,7 @@ def factorial_interaction_power(cells, *, n_seeds=None, m_family=1,
             # an unknown branch visible rather than silently passing it.
             out['status'] = 'not_verifiable'
             out['warnings'].append(
-                f'unknown SESOI status {ses.get("status")!r}')
+                f'unknown SESOI status {_safe_repr(ses.get("status"))}')
     mde = (base.get('mde') or {}).get('absolute')
     if mde is not None and math.isfinite(float(mde)):
         try:
@@ -373,7 +373,7 @@ def factorial_interaction_power(cells, *, n_seeds=None, m_family=1,
                     f'attrition: {v}' for v in (att.get('violations') or []))
             elif att.get('status') not in ('ok', 'not_declared'):
                 out['warnings'].append(
-                    f'attrition status={att.get("status")!r}; the joint '
+                    f'attrition status={_safe_repr(att.get("status"))}; the joint '
                     'run-and-reject probability is below the declared target')
     out['warnings'] = list(dict.fromkeys(out['warnings']))
     out['violations'] = list(dict.fromkeys(out['violations']))
@@ -481,11 +481,11 @@ def factorial_power_audit(pilot=None, *, design=None, sesoi=None,
             for name, value in n_seeds.items():
                 if not isinstance(name, str):
                     out['violations'].append(
-                        f'n_seeds key {name!r} is not a string')
+                        f'n_seeds key {_safe_repr(name)} is not a string')
                     continue
                 try:
                     n_map[name] = _fp_int(
-                        f'n_seeds[{name!r}]', value, minimum=2)
+                        f'n_seeds[{_safe_repr(name)}]', value, minimum=2)
                 except (TypeError, ValueError) as exc:
                     out['violations'].append(str(exc))
             extra = sorted(set(n_map) - set(design), key=str)
@@ -524,15 +524,15 @@ def factorial_power_audit(pilot=None, *, design=None, sesoi=None,
     for _key, _value in p_map.items():
         if not isinstance(_key, str):
             out['violations'].append(
-                f'pilot factorial key {_key!r} is not a string')
+                f'pilot factorial key {_safe_repr(_key)} is not a string')
             continue
         p_map_clean[_key] = _value
     p_map = p_map_clean
-    extra_p = sorted(set(p_map) - set(design), key=str)
+    extra_p = sorted(set(p_map) - set(design), key=_safe_text)
     if extra_p:
         out['warnings'].append(
             'pilot contains factorial(s) not present in the design: '
-            + ', '.join(str(x) for x in extra_p))
+            + ', '.join(_safe_text(x) for x in extra_p))
     for name, spec in design.items():
         rec = {'name': name, 'status': 'not_verifiable', 'n_seeds': None,
                'resolution': {}, 'power': None, 'warnings': []}
@@ -574,7 +574,7 @@ def factorial_power_audit(pilot=None, *, design=None, sesoi=None,
                     f'n={n_for_rec} is below min_n={min_n}')
         elif n_for_rec is not None:
             out['violations'].append(
-                f'{name}: planned n_seeds={n_for_rec!r} must be an integer >= 2')
+                f'{name}: planned n_seeds={_safe_repr(n_for_rec)} must be an integer >= 2')
             rec['status'] = 'fail'
         if p_spec is not None:
             if rec['status'] == 'fail':

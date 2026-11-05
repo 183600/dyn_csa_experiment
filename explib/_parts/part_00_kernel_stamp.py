@@ -102,6 +102,33 @@ except Exception as _ck_err:
     _CK_ERR = _ck_err
 
 
+def _safe_text(value):
+    """Exception-safe ``str`` for untrusted artifact/config names.
+
+    Unlike a diagnostic repr this must not truncate: callers use it to build
+    identity keys (arm names, component names, seed labels).  Only an object
+    whose ``__str__`` itself raises falls back to a typed placeholder.
+    """
+    try:
+        return str(value)
+    except Exception:
+        return f'<unrepresentable {type(value).__name__}>'
+
+
+def _safe_repr(value, limit=240):
+    """Bounded, exception-safe ``repr`` for untrusted diagnostics.
+
+    CPython 3.12 refuses to decimalise an integer with more than ~4300
+    digits, so ``repr(10**10000)`` raises.  A validator must report a
+    malformed value as a failure, never abort while formatting it.
+    """
+    try:
+        text = repr(value)
+    except Exception:
+        return f'<unrepresentable {type(value).__name__}>'
+    return text if len(text) <= limit else text[:limit - 3] + '...'
+
+
 def _canonical_json(obj):
     """Canonical JSON text used by every content-identity digest.
 

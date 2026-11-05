@@ -35,7 +35,7 @@ def factorial_interaction_audit(summary=None, design=None, *, alpha=0.05,
     _min_n = _as_seed_int(min_n)
     if _min_n is None or _min_n < 0:
         raise ValueError(
-            f'factorial_interaction_audit: min_n must be a non-negative integer, got {min_n!r}')
+            f'factorial_interaction_audit: min_n must be a non-negative integer, got {_safe_repr(min_n)}')
     min_n = int(_min_n)
     design = FACTORIAL_DESIGN if design is None else design
     hypotheses = (INTERACTION_HYPOTHESIS_DESIGN
@@ -83,13 +83,13 @@ def factorial_interaction_audit(summary=None, design=None, *, alpha=0.05,
     for _key in recs:
         if not (isinstance(_key, tuple) and len(_key) == 3):
             startup_warnings.append(
-                f'record key {_key!r} is not a (variant, protocol, seed) triple; ignored')
+                f'record key {_safe_repr(_key)} is not a (variant, protocol, seed) triple; ignored')
             continue
         try:
             present.add(_key[0])
         except TypeError:
             startup_warnings.append(
-                f'record key {_key!r} has an unhashable arm id; ignored')
+                f'record key {_safe_repr(_key)} has an unhashable arm id; ignored')
     arm_sets = []
     for _name, _spec in design.items():
         if not isinstance(_spec, dict):
@@ -174,7 +174,7 @@ def factorial_interaction_audit(summary=None, design=None, *, alpha=0.05,
     interaction_values = {}
 
     def _unusable_factorial(name, reason):
-        sname = str(name)
+        sname = _safe_text(name)
         rec = {'factors': None, 'cells': None, 'n_present_cells': 0,
                'status': 'incomplete',
                'interaction': {'available': False, 'reason': reason}}
@@ -221,7 +221,7 @@ def factorial_interaction_audit(summary=None, design=None, *, alpha=0.05,
                 name, 'the four cells must map to non-empty, hashable arm ids')
             continue
         arms = [a.strip() for a in raw_arms]
-        extra_cells = sorted(str(k) for k in cells if k not in _FACTORIAL_CELL_KEYS)
+        extra_cells = sorted(_safe_text(k) for k in cells if k not in _FACTORIAL_CELL_KEYS)
         if extra_cells:
             out['warnings'].append(
                 f'{name}: cell declaration has extra key(s): '
@@ -250,8 +250,8 @@ def factorial_interaction_audit(summary=None, design=None, *, alpha=0.05,
                          for k in _FACTORIAL_CELL_KEYS},
                'n_present_cells': len(present_arms), 'status': 'incomplete',
                'interaction': {'available': False}}
-        out['factorials'][str(name)] = rec
-        _sesoi_spec = sesoi_specs.get(str(name))
+        out['factorials'][_safe_text(name)] = rec
+        _sesoi_spec = sesoi_specs.get(_safe_text(name))
         _margin = (_sesoi_spec.get('margin_log_ratio')
                    if isinstance(_sesoi_spec, dict) else None)
         if len(present_arms) < 4:
@@ -261,8 +261,8 @@ def factorial_interaction_audit(summary=None, design=None, *, alpha=0.05,
             out['warnings'].append(
                 f'{name}: 2x2 interaction is incomplete (missing '
                 + ', '.join(missing) + '); its family slot is kept at p=1')
-            family.append((str(name), 1.0))
-            family_naive.append((str(name), 1.0))
+            family.append((_safe_text(name), 1.0))
+            family_naive.append((_safe_text(name), 1.0))
             if _margin is None:
                 rec['practical_decision'] = 'not_declared'
                 rec['sesoi'] = {
@@ -271,7 +271,7 @@ def factorial_interaction_audit(summary=None, design=None, *, alpha=0.05,
                     'reason': 'no pre-registered interaction SESOI was supplied',
                 }
                 if sesoi_specs:
-                    tost_family.append((str(name), 1.0))
+                    tost_family.append((_safe_text(name), 1.0))
             else:
                 rec['practical_decision'] = 'not_measured'
                 rec['sesoi'] = {
@@ -280,7 +280,7 @@ def factorial_interaction_audit(summary=None, design=None, *, alpha=0.05,
                     'decision': 'not_measured', 'claim': 'not_measured',
                     'reason': 'missing 2x2 cell(s); additivity cannot be certified',
                 }
-                tost_family.append((str(name), 1.0))
+                tost_family.append((_safe_text(name), 1.0))
             continue
         rows, skipped, param = _factorial_condition_rows(recs, norm_cells)
         rec['n_complete'] = len(rows)
@@ -293,8 +293,8 @@ def factorial_interaction_audit(summary=None, design=None, *, alpha=0.05,
                 'no seed has four controlled cells with a usable primary PPL')
             out['warnings'].append(f'{name}: no complete 2x2 seed remains; '
                                    'its family slot is kept at p=1')
-            family.append((str(name), 1.0))
-            family_naive.append((str(name), 1.0))
+            family.append((_safe_text(name), 1.0))
+            family_naive.append((_safe_text(name), 1.0))
             if _margin is None:
                 rec['practical_decision'] = 'not_declared'
                 rec['sesoi'] = {
@@ -303,7 +303,7 @@ def factorial_interaction_audit(summary=None, design=None, *, alpha=0.05,
                     'reason': 'no pre-registered interaction SESOI was supplied',
                 }
                 if sesoi_specs:
-                    tost_family.append((str(name), 1.0))
+                    tost_family.append((_safe_text(name), 1.0))
             else:
                 rec['practical_decision'] = 'not_measured'
                 rec['sesoi'] = {
@@ -312,7 +312,7 @@ def factorial_interaction_audit(summary=None, design=None, *, alpha=0.05,
                     'decision': 'not_measured', 'claim': 'not_measured',
                     'reason': 'no controlled 2x2 seed; additivity cannot be certified',
                 }
-                tost_family.append((str(name), 1.0))
+                tost_family.append((_safe_text(name), 1.0))
             continue
         st = paired_effect_stats([r['interaction_log_ppl'] for r in rows],
                                  alpha=alpha, min_n=min_n,
@@ -339,7 +339,7 @@ def factorial_interaction_audit(summary=None, design=None, *, alpha=0.05,
                            'n': len(vals),
                            'role': 'descriptive simple effect (not tested here)'}
         rec['simple_effects'] = simple
-        hyp = hypotheses.get(str(name)) if isinstance(hypotheses, dict) else None
+        hyp = hypotheses.get(_safe_text(name)) if isinstance(hypotheses, dict) else None
         pred = hyp.get('predicted_sign') if isinstance(hyp, dict) else None
         obs = _sign_of(st.get('mean')) if st.get('n') else None
         cell.update({
@@ -388,8 +388,8 @@ def factorial_interaction_audit(summary=None, design=None, *, alpha=0.05,
                 f'({type(_lat_exc).__name__}: {_lat_exc})')
         rec['status'] = 'ok'
         _vals = [float(r['interaction_log_ppl']) for r in rows]
-        interaction_values[str(name)] = _vals
-        _look_key = _interaction_look_key(str(name))
+        interaction_values[_safe_text(name)] = _vals
+        _look_key = _interaction_look_key(_safe_text(name))
         _cur_cells = {f'{k[0]}|{k[1]}': norm_cells[k]
                       for k in _FACTORIAL_CELL_KEYS}
         _cur_tags = {str(r['seed']): str(r.get('tag') or '') for r in rows}
@@ -416,12 +416,12 @@ def factorial_interaction_audit(summary=None, design=None, *, alpha=0.05,
                 're-running); they were excluded from the sequential test, so '
                 'the correction covers only the remaining '
                 f'{int((_seq or {}).get("n_looks") or 1)} look(s)')
-        family.append((str(name), float(_adj_p)))
-        family_naive.append((str(name), _raw_p))
+        family.append((_safe_text(name), float(_adj_p)))
+        family_naive.append((_safe_text(name), _raw_p))
         if cell['look_adjusted']:
-            out['look_adjusted_interactions'].append(str(name))
+            out['look_adjusted_interactions'].append(_safe_text(name))
             if _raw_p < alpha <= float(_adj_p):
-                out['downgraded_interactions'].append(str(name))
+                out['downgraded_interactions'].append(_safe_text(name))
                 out['warnings'].append(
                     f'{name}: the naive final-look interaction p={_raw_p:.4g} '
                     f'would be significant, but the exact max-over-looks p '
@@ -437,12 +437,12 @@ def factorial_interaction_audit(summary=None, design=None, *, alpha=0.05,
                 'reason': 'no pre-registered interaction SESOI was supplied',
             }
             if sesoi_specs:
-                tost_family.append((str(name), 1.0))
+                tost_family.append((_safe_text(name), 1.0))
         else:
             _dir = pred if pred in (-1, 0, 1) else 0
             _pd = interaction_practical_decision(
                 _vals, margin=float(_margin), alpha=alpha, min_n=min_n,
-                direction=_dir, label=str(name))
+                direction=_dir, label=_safe_text(name))
             _pt = _pd.get('tost_p_tost')
             _pt_adj = (float(_pt) if (isinstance(_pt, (int, float))
                                       and math.isfinite(float(_pt)))
@@ -458,7 +458,7 @@ def factorial_interaction_audit(summary=None, design=None, *, alpha=0.05,
             rec['practical_decision'] = _pd['decision']
             cell['sesoi'] = _pd
             cell['practical_decision'] = _pd['decision']
-            tost_family.append((str(name), _pt_adj))
+            tost_family.append((_safe_text(name), _pt_adj))
     if not out['factorials']:
         if out['status'] != 'fail':
             out['status'] = 'incomplete' if out['warnings'] else 'not_applicable'
@@ -586,21 +586,21 @@ def _dose_direction_sign(direction, *, context='dose direction'):
     direction is part of the design, not a choice made after seeing the trend.
     """
     if not isinstance(direction, str):
-        raise ValueError(f'{context} must be "increasing" or "decreasing", got {direction!r}')
+        raise ValueError(f'{context} must be "increasing" or "decreasing", got {_safe_repr(direction)}')
     key = direction.strip().lower()
     if key not in _DOSE_DIRECTION_SIGNS:
         raise ValueError(
-            f'{context} must be "increasing" or "decreasing", got {direction!r}')
+            f'{context} must be "increasing" or "decreasing", got {_safe_repr(direction)}')
     return _DOSE_DIRECTION_SIGNS[key]
 
 
 def _dose_shape(shape, *, context='dose-response shape'):
     if not isinstance(shape, str):
-        raise ValueError(f'{context} must be one of {list(_DOSE_RESPONSE_SHAPES)}, got {shape!r}')
+        raise ValueError(f'{context} must be one of {list(_DOSE_RESPONSE_SHAPES)}, got {_safe_repr(shape)}')
     key = shape.strip().lower()
     if key not in _DOSE_RESPONSE_SHAPES:
         raise ValueError(
-            f'{context} must be one of {list(_DOSE_RESPONSE_SHAPES)}, got {shape!r}')
+            f'{context} must be one of {list(_DOSE_RESPONSE_SHAPES)}, got {_safe_repr(shape)}')
     return key
 
 
@@ -616,9 +616,9 @@ def _dose_seed_list(raw, *, context):
     for x in items:
         s = _as_seed_int(x)
         if s is None:
-            raise ValueError(f'{context} contains a non-integer seed {x!r}')
+            raise ValueError(f'{context} contains a non-integer seed {_safe_repr(x)}')
         if s in seen:
-            raise ValueError(f'{context} contains duplicate seed {s!r}')
+            raise ValueError(f'{context} contains duplicate seed {_safe_repr(s)}')
         seen.add(s)
         out.append(s)
     return sorted(out)
@@ -639,7 +639,7 @@ def _normalise_dose_levels(levels, *, require_arm, context='dose_response'):
         items = list(levels.items())
         for label, spec in items:
             if not isinstance(spec, dict):
-                raise ValueError(f'{context}: level {label!r} must be an object, '
+                raise ValueError(f'{context}: level {_safe_repr(label)} must be an object, '
                                  f'got {type(spec).__name__}')
             rec = dict(spec)
             rec.setdefault('label', label)
@@ -662,14 +662,14 @@ def _normalise_dose_levels(levels, *, require_arm, context='dose_response'):
             raise ValueError(f'{context}: level #{i} needs a non-empty string label')
         label = label.strip()
         if label in seen_labels:
-            raise ValueError(f'{context}: duplicate level label {label!r}')
+            raise ValueError(f'{context}: duplicate level label {_safe_repr(label)}')
         seen_labels.add(label)
         dose = _finite_scalar(rec.get('dose'))
         if dose is None:
             raise ValueError(f'{context}[{label}]: dose must be a finite number, '
-                             f'got {rec.get("dose")!r}')
+                             f'got {_safe_repr(rec.get("dose"))}')
         if dose in seen_doses:
-            raise ValueError(f'{context}: duplicate dose {dose!r}')
+            raise ValueError(f'{context}: duplicate dose {_safe_repr(dose)}')
         seen_doses.add(dose)
         arm = rec.get('arm')
         if require_arm:
@@ -717,15 +717,15 @@ def _dose_arm_value(arm, factory, n_layers, dose_key):
             else:
                 val = getattr(cfg, dose_key, None)
         except Exception as e:
-            return None, f'cannot read {dose_key!r} on layer {i} ({type(e).__name__}: {e})'
+            return None, f'cannot read {_safe_repr(dose_key)} on layer {i} ({type(e).__name__}: {e})'
         f = _finite_scalar(val)
         if f is None:
-            return None, f'{dose_key!r} is missing/non-numeric on layer {i}'
+            return None, f'{_safe_repr(dose_key)} is missing/non-numeric on layer {i}'
         vals.append(f)
     if not vals:
         return None, 'factory returned no layers'
     if len(set(vals)) != 1:
-        return None, f'{dose_key!r} varies across layers ({vals!r})'
+        return None, f'{_safe_repr(dose_key)} varies across layers ({_safe_repr(vals)})'
     return vals[0], None
 
 
@@ -815,7 +815,7 @@ def dose_response_design_audit(levels, *, direction, dose_key, factory=None,
     if not isinstance(dose_key, str) or not dose_key.strip():
         out['status'] = 'fail'
         out['violations'].append(
-            f'dose_key must be a non-empty AttnCfg key name, got {dose_key!r}')
+            f'dose_key must be a non-empty AttnCfg key name, got {_safe_repr(dose_key)}')
         dose_key = None
     else:
         dose_key = dose_key.strip()
@@ -823,7 +823,7 @@ def dose_response_design_audit(levels, *, direction, dose_key, factory=None,
     _nl = _as_seed_int(n_layers)
     if _nl is None or _nl < 1:
         out['status'] = 'fail'
-        out['violations'].append(f'n_layers must be a positive integer, got {n_layers!r}')
+        out['violations'].append(f'n_layers must be a positive integer, got {_safe_repr(n_layers)}')
         n_layers = None
     else:
         n_layers = _nl
@@ -832,14 +832,14 @@ def dose_response_design_audit(levels, *, direction, dose_key, factory=None,
         out['status'] = 'fail'
         out['violations'].append(
             f'min_levels must be an integer >= 3 (two points are an endpoint '
-            f'contrast, not a dose-response), got {min_levels!r}')
+            f'contrast, not a dose-response), got {_safe_repr(min_levels)}')
         min_levels = 3
     else:
         min_levels = _ml
     _ms = _as_seed_int(min_seeds)
     if _ms is None or _ms < 1:
         out['status'] = 'fail'
-        out['violations'].append(f'min_seeds must be a positive integer, got {min_seeds!r}')
+        out['violations'].append(f'min_seeds must be a positive integer, got {_safe_repr(min_seeds)}')
         min_seeds = 1
     else:
         min_seeds = _ms
@@ -887,8 +887,8 @@ def dose_response_design_audit(levels, *, direction, dose_key, factory=None,
             if set(s) != first:
                 out['status'] = 'fail'
                 out['violations'].append(
-                    f'{r["label"]}: seed set {s!r} differs from '
-                    f'{rows[0]["label"]} {sorted(first)!r}; the ladder must be '
+                    f'{r["label"]}: seed set {_safe_repr(s)} differs from '
+                    f'{rows[0]["label"]} {_safe_repr(sorted(first))}; the ladder must be '
                     'paired within seed')
         out['seed_identity'] = 'declared'
         out['seeds'] = sorted(first)
@@ -917,8 +917,8 @@ def dose_response_design_audit(levels, *, direction, dose_key, factory=None,
             if p != first_p:
                 out['status'] = 'fail'
                 out['violations'].append(
-                    f'{r["label"]}: protocol identity {p!r} differs from '
-                    f'{rows[0]["label"]} {first_p!r}; the trend would mix '
+                    f'{r["label"]}: protocol identity {_safe_repr(p)} differs from '
+                    f'{rows[0]["label"]} {_safe_repr(first_p)}; the trend would mix '
                     'different measurements')
         out['protocol_identity'] = 'declared'
         out['protocols'] = protocols
@@ -954,7 +954,7 @@ def dose_response_design_audit(levels, *, direction, dose_key, factory=None,
             out['dose_key_values'][r['label']] = value if value is not None else None
             if value is None:
                 out['violations'].append(
-                    f'{r["label"]}: cannot extract a scalar {dose_key!r} '
+                    f'{r["label"]}: cannot extract a scalar {_safe_repr(dose_key)} '
                     f'({why}); an ordered ladder needs a numeric dose axis')
             else:
                 numeric_values.append((r, value))
@@ -975,10 +975,10 @@ def dose_response_design_audit(levels, *, direction, dose_key, factory=None,
                 if extra:
                     detail.append(f'extra key(s) {extra}')
                 if missing:
-                    detail.append(f'{dose_key!r} does not differ')
+                    detail.append(f'{_safe_repr(dose_key)} does not differ')
                 out['violations'].append(
                     f'{r["label"]}: the declared dose axis is not isolated '
-                    f'(actual AttnCfg diff {sorted(actual)!r}; '
+                    f'(actual AttnCfg diff {_safe_repr(sorted(actual))}; '
                     + '; '.join(detail) + ')')
             sig = _canon_setting(per_layer)
             if sig in seen_signatures:
@@ -995,19 +995,19 @@ def dose_response_design_audit(levels, *, direction, dose_key, factory=None,
             if len({v for _r, v in numeric_values}) != len(numeric_values):
                 out['status'] = 'fail'
                 out['violations'].append(
-                    f'{dose_key!r} has duplicate values across declared doses: '
-                    f'{[(r["label"], v) for r, v in numeric_values]!r}')
+                    f'{_safe_repr(dose_key)} has duplicate values across declared doses: '
+                    f'{_safe_repr([(r["label"], v) for r, v in numeric_values])}')
             else:
                 diffs = [numeric_values[i + 1][1] - numeric_values[i][1]
                          for i in range(len(numeric_values) - 1)]
                 if not (all(d > 0 for d in diffs) or all(d < 0 for d in diffs)):
                     out['status'] = 'fail'
                     out['violations'].append(
-                        f'{dose_key!r} values are not monotonic in the declared '
-                        f'dose order: {[(r["label"], v) for r, v in numeric_values]!r}')
+                        f'{_safe_repr(dose_key)} values are not monotonic in the declared '
+                        f'dose order: {_safe_repr([(r["label"], v) for r, v in numeric_values])}')
         elif numeric_values:
             out['violations'].append(
-                f'{dose_key!r} could not be read as one finite scalar for every '
+                f'{_safe_repr(dose_key)} could not be read as one finite scalar for every '
                 'level; its order was not verified')
     if out['violations']:
         out['status'] = 'fail'
@@ -1038,7 +1038,7 @@ def dose_response_trend(levels, *, direction, alpha=0.05, min_n=3,
     shape = _dose_shape(shape, context='dose_response_trend shape')
     _mn = _as_seed_int(min_n)
     if _mn is None or _mn < 0:
-        raise ValueError(f'dose_response_trend: min_n must be a non-negative integer, got {min_n!r}')
+        raise ValueError(f'dose_response_trend: min_n must be a non-negative integer, got {_safe_repr(min_n)}')
     min_n = _mn
     out = {'kind': 'dose_response_trend', 'status': 'ok', 'direction': direction,
            'direction_sign': int(sign), 'shape_hypothesis': shape, 'alpha': alpha,
@@ -1122,10 +1122,10 @@ def dose_response_trend(levels, *, direction, alpha=0.05, min_n=3,
         for raw_seed, raw_val in raw.items():
             s = _as_seed_int(raw_seed)
             if s is None:
-                bad.append(f'non-integer seed {raw_seed!r}')
+                bad.append(f'non-integer seed {_safe_repr(raw_seed)}')
                 continue
             if s in vals or s in nonfinite:
-                bad.append(f'duplicate seed {s!r} after normalisation')
+                bad.append(f'duplicate seed {_safe_repr(s)} after normalisation')
                 continue
             f = _finite_scalar(raw_val)
             if f is None:
@@ -1140,18 +1140,18 @@ def dose_response_trend(levels, *, direction, alpha=0.05, min_n=3,
             return out
         if nonfinite:
             out['warnings'].append(
-                f'{r["label"]}: non-finite metric for seed(s) {sorted(nonfinite)!r}; '
+                f'{r["label"]}: non-finite metric for seed(s) {_safe_repr(sorted(nonfinite))}; '
                 'they are excluded as named incomplete cases')
         if anchor is not None:
             extra = sorted(set(vals) - anchor)
             if extra:
                 out['warnings'].append(
                     f'{r["label"]}: values contain seed(s) outside the declared '
-                    f'set: {extra!r}; they are not used')
+                    f'set: {_safe_repr(extra)}; they are not used')
             missing = sorted(anchor - set(vals))
             if missing:
                 out['warnings'].append(
-                    f'{r["label"]}: declared seed(s) without a finite value: {missing!r}')
+                    f'{r["label"]}: declared seed(s) without a finite value: {_safe_repr(missing)}')
         vals_by_level[r['label']] = vals
     if anchor is not None:
         universe = set(anchor)

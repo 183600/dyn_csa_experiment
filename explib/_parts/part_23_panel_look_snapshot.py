@@ -885,13 +885,13 @@ def param_pair_reason(ra, rb, *, tolerance=0.01, require_breakdown=False):
     # A tolerance is a gate parameter: True -> 1.0 (100%) or a negative/NaN
     # value would silently disable the capacity check.
     if isinstance(tolerance, (bool, np.bool_)):
-        raise ValueError(f'tolerance must be a finite non-negative number, got {tolerance!r}')
+        raise ValueError(f'tolerance must be a finite non-negative number, got {_safe_repr(tolerance)}')
     try:
         tol = float(tolerance)
     except (TypeError, ValueError, OverflowError):
-        raise ValueError(f'tolerance must be a finite non-negative number, got {tolerance!r}') from None
+        raise ValueError(f'tolerance must be a finite non-negative number, got {_safe_repr(tolerance)}') from None
     if not math.isfinite(tol) or tol < 0.0:
-        raise ValueError(f'tolerance must be a finite non-negative number, got {tolerance!r}')
+        raise ValueError(f'tolerance must be a finite non-negative number, got {_safe_repr(tolerance)}')
     pa, pb = _as_seed_int(ra.get('params')), _as_seed_int(rb.get('params'))
     if pa is None or pb is None or pa <= 0 or pb <= 0:
         return 'unverifiable params (at least one record omits a usable parameter count)'
@@ -926,7 +926,7 @@ def param_pair_reason(ra, rb, *, tolerance=0.01, require_breakdown=False):
                 _shown = (f'{100.0 * _rel:.2f}%' if _rel is not None
                           else 'a relative difference above')
                 return (f'parameter breakdown mismatch ({label}: '
-                        f'{ba.get(key)!r} vs {bb.get(key)!r}, {_shown} the '
+                        f'{_safe_repr(ba.get(key))} vs {_safe_repr(bb.get(key))}, {_shown} the '
                         f'{100.0 * tol:.2f}% tolerance)')
     elif require_breakdown:
         return 'unverifiable param_breakdown (at least one record omits it)'
@@ -1149,13 +1149,13 @@ def _compute_control_detail(recs, a, b, *, tolerance=0.25):
 
     # Same gate-parameter contract as param_pair_reason.
     if isinstance(tolerance, (bool, np.bool_)):
-        raise ValueError(f'tolerance must be a finite non-negative number, got {tolerance!r}')
+        raise ValueError(f'tolerance must be a finite non-negative number, got {_safe_repr(tolerance)}')
     try:
         tolerance = float(tolerance)
     except (TypeError, ValueError, OverflowError):
-        raise ValueError(f'tolerance must be a finite non-negative number, got {tolerance!r}') from None
+        raise ValueError(f'tolerance must be a finite non-negative number, got {_safe_repr(tolerance)}') from None
     if not math.isfinite(tolerance) or tolerance < 0.0:
-        raise ValueError(f'tolerance must be a finite non-negative number, got {tolerance!r}')
+        raise ValueError(f'tolerance must be a finite non-negative number, got {_safe_repr(tolerance)}')
     ta, pa, xa = _series(a)
     tb, pb, xb = _series(b)
     out = {'arm_a': a, 'arm_b': b, 'tolerance': float(tolerance),
@@ -1222,7 +1222,7 @@ def _compute_control_detail(recs, a, b, *, tolerance=0.25):
             out['more_compute_arm'] = _time_direction
             out['note'] = (
                 'the measured wall-clock-per-token ratio is outside float64 '
-                f'range; {_time_direction!r} consumed more compute per token, '
+                f'range; {_safe_repr(_time_direction)} consumed more compute per token, '
                 'so this is NOT an equal-compute comparison')
             return out
         if _proxy_within is not None:
@@ -1382,7 +1382,7 @@ def _classify_group_status(entries, *, min_n, alpha, m_family, require_param_mat
     """
     _min_n = _as_seed_int(min_n)
     if _min_n is None or _min_n < 0:
-        raise ValueError(f'min_n must be a non-negative integer, got {min_n!r}')
+        raise ValueError(f'min_n must be a non-negative integer, got {_safe_repr(min_n)}')
     min_n = _min_n
 
     def _capacity_ok(e):
@@ -1785,14 +1785,14 @@ def ablation_completeness_audit(design=None, present=None, *, arms_by_combo=None
                 if isinstance(key, str):
                     _raw = [x.strip() for x in re.split(r'[+,|]', key) if x.strip()]
                 elif isinstance(key, (tuple, list, set, frozenset)):
-                    _raw = [str(x).strip() for x in key if str(x).strip()]
+                    _raw = [_safe_text(x).strip() for x in key if _safe_text(x).strip()]
                 elif key is None:
                     _raw = []
                 else:
-                    raise TypeError(f'unsupported combination key {key!r}')
+                    raise TypeError(f'unsupported combination key {_safe_repr(key)}')
                 combo = tuple(sorted(x for x in _raw if x.lower() not in _empty))
             except (TypeError, ValueError) as e:
-                out['structural_errors'].append(f'malformed combination key {key!r}: {e}')
+                out['structural_errors'].append(f'malformed combination key {_safe_repr(key)}: {e}')
                 continue
             # One cell = one arm id.  An iterable is accepted only as a list
             # of ids; every id must be a non-empty string.  Two ids for one
@@ -1807,7 +1807,7 @@ def ablation_completeness_audit(design=None, present=None, *, arms_by_combo=None
             for _a in _arms_raw:
                 if not isinstance(_a, str) or not _a.strip():
                     out['structural_errors'].append(
-                        f'combination {combo or "(none)"} has an invalid arm id {_a!r}')
+                        f'combination {combo or "(none)"} has an invalid arm id {_safe_repr(_a)}')
                     _ok_arms = False
                     break
                 combos.setdefault(combo, []).append(_a.strip())
@@ -1901,18 +1901,19 @@ def ablation_completeness_audit(design=None, present=None, *, arms_by_combo=None
         out['structural_errors'].append(f'design must be a mapping, got {type(design).__name__}')
         design = {}
     for comp, contrasts in design.items():
+        comp = _safe_text(comp)
         rows, missing = [], set()
         if not isinstance(contrasts, (tuple, list)):
             out['structural_errors'].append(
-                '%s: contrasts must be a list of (with, without, note) tuples, got %r'
-                % (comp, contrasts))
+                '%s: contrasts must be a list of (with, without, note) tuples, got %s'
+                % (comp, _safe_repr(contrasts)))
             out['components'][comp] = {'declared': 0, 'complete': False,
                                        'contrasts': [], 'missing_arms': []}
             out['incomplete_components'].append(comp)
             continue
         for item in contrasts:
             if not isinstance(item, (tuple, list)) or len(item) < 2:
-                out['structural_errors'].append('%s: malformed contrast %r' % (comp, item))
+                out['structural_errors'].append('%s: malformed contrast %s' % (comp, _safe_repr(item)))
                 continue
             a, b = item[0], item[1]
             # Arm ids are non-empty strings; a contrast of an arm with itself
@@ -1922,11 +1923,11 @@ def ablation_completeness_audit(design=None, present=None, *, arms_by_combo=None
                         if not isinstance(x, str) or not x.strip()]
             if _bad_arm:
                 out['structural_errors'].append(
-                    '%s: invalid arm id in contrast %r' % (comp, item))
+                    '%s: invalid arm id in contrast %s' % (comp, _safe_repr(item)))
                 continue
             if a == b:
                 out['structural_errors'].append(
-                    '%s: contrast %r compares an arm with itself' % (comp, item))
+                    '%s: contrast %s compares an arm with itself' % (comp, _safe_repr(item)))
                 continue
             ap = present_set is None or a in present_set
             bp = present_set is None or b in present_set

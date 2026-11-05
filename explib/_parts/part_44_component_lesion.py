@@ -108,7 +108,7 @@ LESION_POLICY = {
 def _lesion_design_entry(component):
     if not isinstance(component, str) or component not in LESION_DESIGN:
         raise ValueError(
-            f'unknown lesion component {component!r}; expected one of '
+            f'unknown lesion component {_safe_repr(component)}; expected one of '
             f'{sorted(LESION_DESIGN)}')
     return LESION_DESIGN[component]
 
@@ -119,7 +119,7 @@ def _lesion_cfg(cfg, overrides):
     for key, value in overrides.items():
         if not hasattr(new, key):
             raise ValueError(
-                f'lesion override {key!r} is not an AttnCfg field')
+                f'lesion override {_safe_repr(key)} is not an AttnCfg field')
         setattr(new, key, value)
     return new
 
@@ -198,10 +198,10 @@ def _lesion_layers(model, component):
                     and str(getattr(cfg, 'open_block_mode', 'closed')) == 'closed'):
                 out.append((i, attn, cfg))
         else:  # pragma: no cover - guarded by _lesion_design_entry
-            raise ValueError(f'unsupported lesion component {component!r}')
+            raise ValueError(f'unsupported lesion component {_safe_repr(component)}')
     if not out:
         raise ValueError(
-            f'component_lesion({component!r}) found no applicable layer in '
+            f'component_lesion({_safe_repr(component)}) found no applicable layer in '
             f'{type(model).__name__}; the component is already absent')
     return out
 
@@ -228,8 +228,8 @@ def component_lesion(model, component):
             for name, value in entry.get('module_overrides') or ():
                 if not hasattr(attn, name):
                     raise ValueError(
-                        f'component_lesion({component!r}): attention module '
-                        f'has no attribute {name!r}')
+                        f'component_lesion({_safe_repr(component)}): attention module '
+                        f'has no attribute {_safe_repr(name)}')
                 snap['modules'][name] = getattr(attn, name)
                 setattr(attn, name, value)
         yield {
@@ -258,7 +258,7 @@ def _lesion_parameter_tensors(model, component):
                 if n.endswith('.fuse_conv.weight') or n == 'fuse_conv.weight']
     if component in ('content_pooling', 'content_alignment'):
         return []
-    raise ValueError(f'unknown lesion component {component!r}')
+    raise ValueError(f'unknown lesion component {_safe_repr(component)}')
 
 
 def _fuse_identity_kernel(weight):
@@ -279,10 +279,10 @@ def component_lesion_state(model, component, *, atol=1e-8):
     """
     entry = _lesion_design_entry(component)
     if isinstance(atol, (bool, np.bool_)):
-        raise ValueError(f'atol must be a finite non-negative number, got {atol!r}')
+        raise ValueError(f'atol must be a finite non-negative number, got {_safe_repr(atol)}')
     atol = float(atol)
     if not math.isfinite(atol) or atol < 0.0:
-        raise ValueError(f'atol must be a finite non-negative number, got {atol!r}')
+        raise ValueError(f'atol must be a finite non-negative number, got {_safe_repr(atol)}')
     kind = entry.get('state_kind')
     tensors = _lesion_parameter_tensors(model, component)
     out = {'kind': 'component_lesion_state', 'component': component,
@@ -323,7 +323,7 @@ def component_lesion_state(model, component, *, atol=1e-8):
         out['distance_from_identity'] = distance
         out['trivial'] = bool(distance <= atol)
     else:  # pragma: no cover - declaration guard
-        raise ValueError(f'unknown lesion state kind {kind!r}')
+        raise ValueError(f'unknown lesion state kind {_safe_repr(kind)}')
     out['status'] = 'trivial' if out['trivial'] else 'present'
     if kind == 'sink' and out.get('zero_valued'):
         out['note'] = (
@@ -357,10 +357,10 @@ def lesion_sensitivity(model, ids, component, *, atol=LESION_POLICY['atol'],
     _lesion_design_entry(component)
     for _name, _value in (('atol', atol), ('rtol', rtol)):
         if isinstance(_value, (bool, np.bool_)):
-            raise ValueError(f'{_name} must be a finite non-negative number, got {_value!r}')
+            raise ValueError(f'{_name} must be a finite non-negative number, got {_safe_repr(_value)}')
         _f = float(_value)
         if not math.isfinite(_f) or _f < 0.0:
-            raise ValueError(f'{_name} must be a finite non-negative number, got {_value!r}')
+            raise ValueError(f'{_name} must be a finite non-negative number, got {_safe_repr(_value)}')
     atol, rtol = float(atol), float(rtol)
     was_training = bool(getattr(model, 'training', False))
     weights_before = state_dict_sha256(model.state_dict()) if check_weights else None
@@ -428,10 +428,10 @@ def _lesion_ppl_values(values, name):
     out = []
     for i, value in enumerate(values):
         if isinstance(value, (bool, np.bool_)):
-            raise ValueError(f'{name}[{i}] must be a positive finite PPL, got {value!r}')
+            raise ValueError(f'{name}[{i}] must be a positive finite PPL, got {_safe_repr(value)}')
         f = _finite_scalar(value)
         if f is None or f <= 0.0:
-            raise ValueError(f'{name}[{i}] must be a positive finite PPL, got {value!r}')
+            raise ValueError(f'{name}[{i}] must be a positive finite PPL, got {_safe_repr(value)}')
         out.append(float(f))
     return out
 
@@ -461,19 +461,19 @@ def lesion_effect(intact_ppl, lesion_ppl, *, seeds=None, component=None,
                           ('alpha', alpha), ('min_n', min_n),
                           ('tost_conf', tost_conf)):
         if isinstance(_value, (bool, np.bool_)):
-            raise ValueError(f'{_name} must be a number, got {_value!r}')
+            raise ValueError(f'{_name} must be a number, got {_safe_repr(_value)}')
     relative_pct = float(relative_pct)
     alpha = _validated_alpha(alpha, context='lesion_effect alpha')
     _min_n = _as_seed_int(min_n)
     if _min_n is None or _min_n < 0:
-        raise ValueError(f'min_n must be a non-negative integer, got {min_n!r}')
+        raise ValueError(f'min_n must be a non-negative integer, got {_safe_repr(min_n)}')
     min_n = int(_min_n)
     tost_conf = float(tost_conf)
     if not math.isfinite(relative_pct) or relative_pct <= 0.0:
         raise ValueError(
-            f'relative_pct must be a finite positive number, got {relative_pct!r}')
+            f'relative_pct must be a finite positive number, got {_safe_repr(relative_pct)}')
     if not math.isfinite(tost_conf) or not (0.0 < tost_conf < 1.0):
-        raise ValueError(f'tost_conf must be in (0,1), got {tost_conf!r}')
+        raise ValueError(f'tost_conf must be in (0,1), got {_safe_repr(tost_conf)}')
     intact = _lesion_ppl_values(intact_ppl, 'intact_ppl')
     lesion = _lesion_ppl_values(lesion_ppl, 'lesion_ppl')
     if len(intact) != len(lesion):
@@ -650,18 +650,18 @@ def lesion_panel_audit(records, *, relative_pct=LESION_POLICY['relative_pct'],
     if isinstance(records, (str, bytes)) or not hasattr(records, '__iter__'):
         raise ValueError('lesion_panel_audit: records must be an iterable of mappings')
     if isinstance(relative_pct, (bool, np.bool_)):
-        raise ValueError(f'relative_pct must be a finite positive number, got {relative_pct!r}')
+        raise ValueError(f'relative_pct must be a finite positive number, got {_safe_repr(relative_pct)}')
     relative_pct = float(relative_pct)
     if not math.isfinite(relative_pct) or relative_pct <= 0.0:
-        raise ValueError(f'relative_pct must be a finite positive number, got {relative_pct!r}')
+        raise ValueError(f'relative_pct must be a finite positive number, got {_safe_repr(relative_pct)}')
     alpha = _validated_alpha(alpha, context='lesion_panel_audit alpha')
     _min_n = _as_seed_int(min_n)
     if _min_n is None or _min_n < 0:
-        raise ValueError(f'min_n must be a non-negative integer, got {min_n!r}')
+        raise ValueError(f'min_n must be a non-negative integer, got {_safe_repr(min_n)}')
     min_n = int(_min_n)
     if not isinstance(require_manipulation, bool):
         raise ValueError(
-            f'require_manipulation must be boolean, got {require_manipulation!r}')
+            f'require_manipulation must be boolean, got {_safe_repr(require_manipulation)}')
     groups = {}
     problems = []
     warnings = []
@@ -674,7 +674,7 @@ def lesion_panel_audit(records, *, relative_pct=LESION_POLICY['relative_pct'],
             continue
         component = rec.get('component')
         if not isinstance(component, str) or component not in LESION_DESIGN:
-            problems.append(f'{where}: unknown component {component!r}')
+            problems.append(f'{where}: unknown component {_safe_repr(component)}')
             continue
         arm = rec.get('arm')
         if not isinstance(arm, str) or not arm.strip():
@@ -682,12 +682,12 @@ def lesion_panel_audit(records, *, relative_pct=LESION_POLICY['relative_pct'],
             continue
         if arm not in LESION_DESIGN[component]['arms']:
             problems.append(
-                f'{where}: arm {arm!r} is not declared for lesion component '
-                f'{component!r}')
+                f'{where}: arm {_safe_repr(arm)} is not declared for lesion component '
+                f'{_safe_repr(component)}')
             continue
         seed = _as_seed_int(rec.get('seed'))
         if seed is None:
-            problems.append(f'{where}: seed must be an integer, got {rec.get("seed")!r}')
+            problems.append(f'{where}: seed must be an integer, got {_safe_repr(rec.get("seed"))}')
             continue
         ckpt = rec.get('checkpoint_sha256')
         if not isinstance(ckpt, str) or not ckpt.strip():
@@ -886,6 +886,8 @@ def lesion_coverage(design=None, *, ablation_design=None):
     "no inference-time effect".
     """
     design = LESION_DESIGN if design is None else design
+    if isinstance(design, dict):
+        design = {_safe_text(k): v for k, v in design.items()}
     abl = (globals().get('ABLATION_DESIGN')
            if ablation_design is None else ablation_design)
     if not isinstance(abl, dict):
@@ -977,13 +979,15 @@ def lesion_design_audit(design=None, *, factory=None, n_layers=2,
     factory = make_layer_cfgs if factory is None else factory
     _nl = _as_seed_int(n_layers)
     if _nl is None or _nl < 1:
-        raise ValueError(f'n_layers must be a positive integer, got {n_layers!r}')
+        raise ValueError(f'n_layers must be a positive integer, got {_safe_repr(n_layers)}')
     n_layers = int(_nl)
     for _name, _value in (('vocab', vocab), ('d', d), ('n_heads', n_heads),
                           ('d_head', d_head), ('seq_len', seq_len)):
         _v = _as_seed_int(_value)
         if _v is None or _v < 1:
-            raise ValueError(f'{_name} must be a positive integer, got {_value!r}')
+            raise ValueError(f'{_name} must be a positive integer, got {_safe_repr(_value)}')
+    if isinstance(design, dict):
+        design = {_safe_text(k): v for k, v in design.items()}
     out = {'kind': 'lesion_design', 'status': 'ok', 'components': {},
            'coverage': lesion_coverage(design=design),
            'violations': [], 'warnings': [],
@@ -1015,7 +1019,7 @@ def lesion_design_audit(design=None, *, factory=None, n_layers=2,
         if not isinstance(source, str) or source not in ABLATION_DESIGN:
             rec['status'] = 'fail'
             out['violations'].append(
-                f'{component}: source_component {source!r} is not in ABLATION_DESIGN')
+                f'{component}: source_component {_safe_repr(source)} is not in ABLATION_DESIGN')
             # A list/dict source is unhashable: the later
             # ABLATION_INTERVENTION_KEYS.get(source) lookup would raise
             # TypeError instead of reporting a failed declaration.  Stop this
@@ -1040,7 +1044,7 @@ def lesion_design_audit(design=None, *, factory=None, n_layers=2,
             rec['status'] = 'fail'
             out['violations'].append(
                 f'{component}: mechanism key(s) {sorted(set(keys) - declared_keys)} '
-                f'are not declared in ABLATION_INTERVENTION_KEYS[{source!r}]')
+                f'are not declared in ABLATION_INTERVENTION_KEYS[{_safe_repr(source)}]')
         pair_arms = {a for a, _b, *_ in (ABLATION_DESIGN.get(source) or [])}
         pair_arms |= {b for _a, b, *_ in (ABLATION_DESIGN.get(source) or [])}
         cfg_overrides = entry.get('cfg_overrides') or {}
@@ -1075,7 +1079,7 @@ def lesion_design_audit(design=None, *, factory=None, n_layers=2,
             if arm not in pair_arms:
                 rec['status'] = 'fail'
                 out['violations'].append(
-                    f'{component}/{arm}: arm is not in a declared {source!r} contrast')
+                    f'{component}/{arm}: arm is not in a declared {_safe_repr(source)} contrast')
             try:
                 cfgs = list(factory(n_layers, arm))
             except Exception as exc:
@@ -1192,14 +1196,14 @@ def lesion_design_audit(design=None, *, factory=None, n_layers=2,
                                 rec['status'] = 'fail'
                                 out['violations'].append(
                                     f'{component}/{arm}: layer {_i} cfg.{_key} '
-                                    f'is {getattr(_attn.cfg, _key, None)!r}, '
-                                    f'expected {_want!r}')
+                                    f'is {_safe_repr(getattr(_attn.cfg, _key, None))}, '
+                                    f'expected {_safe_repr(_want)}')
                         for _name, _want in (entry.get('module_overrides') or ()):
                             if getattr(_attn, _name, object()) is not _want:
                                 rec['status'] = 'fail'
                                 out['violations'].append(
                                     f'{component}/{arm}: layer {_i} module '
-                                    f'{_name!r} was not replaced by the declared value')
+                                    f'{_safe_repr(_name)} was not replaced by the declared value')
             except Exception as exc:
                 rec['status'] = 'fail'
                 out['violations'].append(
