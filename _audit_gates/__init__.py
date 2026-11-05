@@ -36,6 +36,7 @@ _PARTS = [
 'part_45_audit_ablation_ranking.py',
 'part_46_audit_analysis_multiverse.py',
 'part_47_audit_ablation_screening.py',
+'part_48_audit_numerical_canary.py',
 'part_05_audit_confirmation_verdicts.py',
 'part_08_audit_missingness.py',
 'part_09_audit_trajectory.py',

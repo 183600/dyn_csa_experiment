@@ -148,6 +148,7 @@ _PARTS = [
 'part_79_ablation_ranking.py',
 'part_80_analysis_multiverse.py',
 'part_81_ablation_screening.py',
+'part_82_numerical_canary.py',
 ]
 
 load_root_package(globals(), __file__, _PARTS,

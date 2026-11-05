@@ -14520,3 +14520,137 @@ OLS 恢复声明主效应与 max-T 族校正；resolution III 的
 overwrite；gate 的 missing/ok/warnings/not_estimable/fail 分支；
 Markdown、`_PARTS`/Makefile/CLI/report 接线；README 与 `.github` 路径
 仍存在。完整 CPU 套件在本轮最终树通过。
+
+## 148. 同一份声明环境不等于同一套算术：可重放的数值 canary（本轮可复现性/工程规范硬化，no new runs）
+
+零 GPU；不新增训练、不读取任何 split、不修改
+`confirmation_frozen*.json` 的字节/臂/种子/端点/α/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未删除、未修改、未移动。
+
+### 148.1 问题：环境摘要、锁和同一进程重跑都没有观测「实际算术」
+
+仓库已有三层与「环境相同」有关的证据：
+
+- `env_fp_v2`（§110）把 `requirements.lock` 的完整传递闭包、解释器/平台
+  条款、OS/kernel/libc/驱动和全部 pin 的已安装版本哈希成一个摘要；
+- `env_fp_v3`（§113）再纳入未 pin 的运行时分布、NumPy 的 BLAS/LAPACK/
+  SIMD 构建和 PyTorch 的 MKL/oneDNN/OpenMP/CPU capability；
+- `reproducibility_check` 在同一进程里用同一 seed 重跑一小段训练，证明
+  这段代码在该进程内可重复。
+
+这三层仍然回答不了跨进程/跨机器的关键问题：**声明的包、锁和构建身份
+相同，实际执行的浮点路径是否相同？** 同一个 wheel 在两种 CPU dispatch、
+不同线程数、不同内核/驱动或同型号 GPU 的不同 SM 上，可能给出不同的低位
+结果。`reproduce compare` 会先比较 `env_fp_v3`；当它相同而 PPL 只差一点
+时，读者很容易把「声明环境相同」当成「算术相同」，把残余差异归给 seed
+或数据，而不是浮点路径。审计一条 PPL 差异时，这个混淆会污染后续所有
+配对推断。
+
+现有 `env_fp_*` 是**身份**，不是**观测**。`reproducibility_check` 是本进程
+内的重复性检查，不是另一个进程/另一台机器的算术对拍。缺的是一份很小、
+可归档、可重放的「实际算术指纹」。
+
+### 148.2 方法：固定输入上的算子级 canary
+
+新增 `explib/_parts/part_82_numerical_canary.py`。`numerical_canary()`
+在一组与 seed 无关的固定输入上执行九个算子，覆盖本项目数值路径的关键
+环节：
+
+| op | 覆盖 |
+|---|---|
+| `matmul` | GEMM/线性层的最低位 |
+| `softmax` | 行归一化的归约顺序 |
+| `rmsnorm` | square/mean/rsqrt 的归约 |
+| `attention` | softmax(QKᵀ/√d)V 的组合路径 |
+| `cross_entropy` | log-softmax/NLL 的实现 |
+| `reduction` | sum/mean/std 的归约 |
+| `rng` | 当前 torch 的 CPU/GPU RNG 流（唯一使用 seed 的算子） |
+| `topk` | 排序/并列时的索引顺序 |
+| `solve` | LAPACK/线性代数后端 |
+
+每个输出按 dtype 的原始字节取 SHA-256，记录 shape/dtype/finite；
+`input_fingerprint` 绑定固定输入和 seed，`arithmetic_fingerprint` 绑定
+`size`、`dtype`、`device_class`、输入摘要与九个算子的摘要。矩阵输入先用
+float64 从整数构造再 cast，避免依赖平台 RNG；seed 只进入 `rng` 算子。
+
+`numerical_canary()` 同时记录进程的 `torch`/`numpy` 版本、torch build
+commit、GPU 名与 capability、torch/interop 线程数、determinism 设置和
+float32 matmul precision。`numerical_canary_provenance()` 另存
+`CODE_SEMANTICS`、`code_stamp()`、当前 `source_tree` 摘要、`env_fp_v2`/
+`env_fp_v3` 与 `lock_sha256`。
+
+`build_numerical_canary_artifact()` 把 `inputs`（重放参数）、`result`
+（算术块与环境块）、`provenance` 和 `content_sha256` 落成一个 JSON 产物；
+`created_at` 与自身摘要不进入内容哈希，所以同一台机器重建同一份算术会
+被识别为同一产物：
+
+- `validate_numerical_canary_artifact()` 先校验 schema、参数一致性、
+  `content_sha256`，并要求 `arithmetic_fingerprint` 能从记录下来的
+  `params`/`input_fingerprint`/`ops` **重算**——改了任一算子摘要却保留旧
+  指纹会直接判 `fail`，不会等到重放才暴露；
+- 再按记录的 device/dtype/size/seed 重放 canary。算子摘要变化判
+  `drift`，并给出具体 drift 的算子名；记录 device 在本机不可用（例如
+  CUDA 产物在 CPU 机器上）判 `not_verifiable_locally`，不是 pass；
+- 算术一致、但线程数/驱动/build 等元数据变化只记为
+  `environment_changes` warning；源码/provenance 变化记为
+  `provenance_changes` warning。这样「算术没变、环境描述变了」与
+  「算术变了」不会混成一个结论。
+
+`compare_numerical_canaries()` 供两份独立产物对拍：device class/dtype/
+size 不同判 `not_comparable`（不是 mismatch），算术相同判 `match`，并
+列出不同的算子与环境字段。
+
+### 148.3 入口、产物与状态语义
+
+```bash
+make canary          # 写 analysis_v12/numerical_canary.json
+make canary-check    # 在当前进程重放该产物
+python -m explib.reproduce canary                 # 只打印当前算术记录
+python -m explib.reproduce canary --write          # 显式写产物
+python -m explib.reproduce canary --verify PATH    # 0 ok / 1 drift|fail / 2 n/a
+python audit_gates.py numerical_canary             # 与 make canary-check 相同
+```
+
+- `make canary` 默认写 `analysis_v12/numerical_canary.json`；若已存在不同
+  内容则返回 conflict，必须显式 `--overwrite`，避免一次偶发漂移被静默
+  覆盖成新基线。
+- 审计门状态：`ok`（摘要完整且算术重放一致）、`warnings`（算术一致但
+  环境/来源元数据变了）、`not_verifiable_locally`（无产物或记录的 device
+  在本机不可用）、`fail`（结构/摘要被改，或观测到算术 drift）。
+- `audit_gates.py report` 顶层新增 `numerical_canary` 块；有产物时它参与
+  顶层 `audit_status`，无产物时按既有规则记 `not_verifiable_locally`。
+  它不产生 p 值、区间、Holm 成员或 confirmed 字段，也不改变任何冻结判定。
+- 产物可随 `analysis_v12/` 一起进入 `archive_release.py` 的发布包；它是
+  一次测量的证据，不是 Git 跟踪的源码。
+
+### 148.4 边界：它证明什么，不证明什么
+
+- **不是训练逐位确定的证明。** canary 只覆盖九个固定算子和一组固定
+  输入；训练还会经过优化器、数据加载、随机增强、并行归约等路径。
+  canary 一致时训练仍可能因未覆盖的路径而不同；canary drift 时则已经
+  足以说明「不能声称同一算术栈复现」。
+- **不是统计检验。** 没有 p 值，没有置信区间，不进入任何 Holm 族。
+  它只回答「当前进程的实际算术是否仍是记录的那一套」。
+- **device 必须显式。** 默认 CPU，绝不因为机器有 GPU 就自动切到 CUDA；
+  CPU 产物与 CUDA 产物不互相替代。CUDA canary 在未启用
+  deterministic-algorithms/cudnn.deterministic 时带 warning，因为重复
+  调用本身可能受未声明的 kernel 调度影响。
+- **元数据 warning 不是 drift。** 线程数、驱动或源码变化而算子摘要一致，
+  说明「这份算术仍可重放」，但不能反过来证明环境没有变；读者应同时看
+  `env_fp_v3` 与 `provenance_changes`。
+- **不能替代修复。** 发现 drift 时应定位环境差异、固定构建或在同型号
+  机器上重跑；把 canary 重录成新基线只记录「现在是什么」，不证明两次
+  运行可比。旧产物缺少 canary 时保持 `not_verifiable_locally`，不回填、
+  不把它当成通过。
+
+### 148.5 验证
+
+`test_numerical_canary.py` 9 项覆盖：同参数跨调用逐字节一致且严格 JSON
+可写；seed 只改变 RNG、size/dtype 改变算术；非法 seed/size/dtype/device
+（含 CPU 机器上的 `cuda`）fail closed；比较器的 match/mismatch/
+environment-only/not_comparable/unverified 分支；`created_at` 不影响内容
+身份、算子摘要/指纹/顶层字段/缺 provenance 的篡改拒绝；最强的一致篡改
+只能由重放判 `drift`；writer 的 no-op/conflict/overwrite；审计门的
+missing/ok/drift/坏 JSON/裸 result 分支；CLI 的 write/verify/conflict/
+overwrite；以及 `_PARTS`、report、CLI、Makefile 接线与 README/.github
+未被移动。完整 CPU 套件在本轮最终树通过。

@@ -7,7 +7,7 @@ PYTHON ?= python
 BUILD_DIR := .build
 INSTALL_DIR := $(BUILD_DIR)/install-check
 
-.PHONY: help test plan protocol preparation rehearsal transfer budget attribution ablation-rank ablation-screen estimability conformal type-sm exact-tost global-fdr multiverse audit manipulation integrity env-check registry data-sensitivity reproduce report-diff install-check build clean
+.PHONY: help test plan protocol preparation rehearsal transfer budget attribution ablation-rank ablation-screen estimability conformal type-sm exact-tost global-fdr multiverse audit manipulation integrity env-check canary canary-check registry data-sensitivity reproduce report-diff install-check build clean
 
 help:
 	@echo "make test          # CPU unit/reproducibility suite (zero GPU)"
@@ -30,6 +30,8 @@ help:
 	@echo "make manipulation  # functional manipulation check for every declared ablation (zero GPU)"
 	@echo "make integrity     # verify stamped analysis bodies/inputs (zero GPU)"
 	@echo "make env-check     # local lock/OS stack vs recorded env_fp_v2 (zero GPU)"
+	@echo "make canary        # record this process's arithmetic canary (zero GPU)"
+	@echo "make canary-check  # replay analysis_v12/numerical_canary.json (zero GPU)"
 	@echo "make registry      # split-package _PARTS registration integrity (zero GPU)"
 	@echo "make data-sensitivity # cleaning-choice/order sensitivity of the cached corpus (zero GPU)"
 	@echo "make reproduce A=<dir> B=<dir>  # compare two independent runs (zero GPU)"
@@ -100,6 +102,12 @@ integrity:
 
 env-check:
 	$(PYTHON) audit_gates.py environment_identity
+
+canary:
+	$(PYTHON) -m explib.reproduce canary --write
+
+canary-check:
+	$(PYTHON) audit_gates.py numerical_canary
 
 registry:
 	$(PYTHON) audit_gates.py split_registry

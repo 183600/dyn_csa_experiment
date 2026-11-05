@@ -745,6 +745,7 @@ def compare_reproductions(original, rerun, *, rtol=1e-6, atol=0.0):
 _REPRODUCTION_USAGE = """usage:
   python -m explib.reproduce compare ORIGINAL RERUN [options]
   python -m explib.reproduce report ORIGINAL.json RERUN.json [options]
+  python -m explib.reproduce canary [--write] [--verify PATH] [options]
 
 compare: two independent executions of the same cells (result directories or
 summary.json paths).  Exit status: 0 reproduced, 1 not reproduced, 2 usage or
@@ -766,6 +767,16 @@ report options:
   --ignore-ledger        shorthand for --ignore /experiment_ledger
   --max-differences N    stop after N reported pointers (default 200)
   --json PATH            also write the machine-readable report
+
+canary: record or replay the observed arithmetic identity of this process.
+  The probe hashes fixed operator outputs; it is not a statistical test and
+  does not prove that training is bitwise deterministic.
+  --write                write analysis_v12/numerical_canary.json
+  --out DIR              artifact directory for --write (default analysis_v12)
+  --overwrite            replace a different existing artifact after review
+  --verify PATH          replay a stored artifact (0 ok, 1 drift/fail, 2 n/a)
+  --seed/--size/--dtype  probe parameters (defaults 0/8/float32)
+  --device               cpu or cuda[:N] (default cpu; never guessed)
 """
 
 
@@ -779,6 +790,9 @@ def _reproduction_cli(argv=None):
         print(_REPRODUCTION_USAGE)
         return 0
     command = args.pop(0)
+    if command in ('canary', 'numerical_canary', 'numeric_canary',
+                   'arithmetic_canary'):
+        return _nc_cli(args)
     if command in ('report', 'artifact', 'analysis_report', 'analysis'):
         return _report_diff_cli(args)
     if command not in ('compare', 'check', 'reproduce'):

@@ -363,6 +363,13 @@
                results_* 中记录的逐 cell 摘要比对；跨机器差异只 warning，
                缺记录/旧记录报 not_verifiable_locally，绝不把六包 exec_fp
                的粗匹配当成同一数值栈（别名 environment / env_drift）
+  numerical_canary  实际算术身份：把记录的一组固定 torch 算子输出逐字节
+               摘要（GEMM/softmax/RMSNorm/attention/CE/reduction/RNG/
+               top-k/LAPACK solve）在当前进程重放；算子摘要变了判 fail
+               （drift），只有环境/源码元数据变化判 warnings，缺产物报
+               not_verifiable_locally。它证明的是「当前算术是否仍是记录
+               的那一套」，不是训练逐位确定，也不产生 p 值或改变冻结判定
+               （零 GPU；别名 canary / numeric_canary / arithmetic_canary）
   data_source  上游语料版本：每个 cache meta 是否记录并匹配固定的 Hub commit
                （WikiText-103 / FineWeb-Edu）；train/validation/test 必须同一
                快照；legacy/local 缓存明确报不可验证而非算作干净

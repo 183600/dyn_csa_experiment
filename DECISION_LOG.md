@@ -7367,3 +7367,51 @@ artifact hash/round-trip/`created_at` 不影响内容身份/多类篡改拒绝�
 writer 的 no-op/conflict/overwrite；gate 的 missing/ok/warnings/
 not_estimable/fail 分支；Markdown、`_PARTS`/Makefile/CLI/report 接线；
 README 与 `.github` 路径仍存在。完整 CPU 套件在本轮最终树通过。
+
+## 2026-11-05 — 声明环境相同不等于实际算术相同：数值 canary 与可重放算术指纹（本轮可复现性/工程规范硬化，no new runs）
+
+零 GPU；不新增训练、不读取任何 split、不修改
+`confirmation_frozen*.json` 的字节/臂/种子/端点/α/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未删除、未修改、未移动。
+
+**Problem.** §110/§113 把 `env_fp_v2`/`env_fp_v3` 做到 lock 闭包、解释器/
+OS 与 BLAS/LAPACK/SIMD 构建层，`reproducibility_check` 又证明同一进程内
+同一 seed 的小段训练可重复。但两者都没有**观测**另一个进程/另一台机器
+的实际浮点路径：同一个 wheel、同一份 lock 仍可能因 CPU dispatch、线程数、
+内核/驱动或 GPU 型号给出不同低位结果。跨运行比较若只看 `env_fp_v3` 和
+「PPL 差不多」，就会把算术差异误读成复现成功或 seed 噪声。
+
+**Fix.** 新增 `explib/_parts/part_82_numerical_canary.py`：在固定输入上
+执行 matmul/softmax/RMSNorm/attention/cross-entropy/reduction/RNG/top-k/
+LAPACK solve 九个算子，按输出原始字节生成逐算子 SHA-256，并绑定
+`input_fingerprint`、`arithmetic_fingerprint`、dtype/device class/size、
+线程数、determinism 设置与 torch/numpy build 身份；seed 只进入显式 RNG
+算子。新增内容寻址产物
+`analysis_v12/numerical_canary.json`（`created_at` 不进入哈希），
+`validate_numerical_canary_artifact()` 先校验指纹必须能从 params/ops 重算，
+再按记录参数重放；算术变了判 `drift` 并列出算子，device 在本机不可用判
+`not_verifiable_locally`，只有环境/来源元数据变化时判 `warnings`。
+`compare_numerical_canaries()` 对两份产物做 device class/dtype/size 的
+可比较性门；`write_numerical_canary_artifact()` 默认 no-op/conflict，
+显式 `--overwrite` 才替换。新增 `make canary` / `make canary-check`、
+`python -m explib.reproduce canary [--write|--verify]`、
+`audit_gates.py numerical_canary`（别名 canary / numeric_canary /
+arithmetic_canary），并接入 `audit_gates.py report` 顶层。
+
+**Boundary.** 这是**观测到的算术身份**，不是训练逐位确定的证明，也不是
+新统计检验：没有 p 值/区间/Holm 成员，不改变 frozen 计划、verified/
+confirmed 或任何冻结判定；九个算子不覆盖优化器、数据加载、并行归约等
+全部训练路径。默认 device=cpu，绝不自动猜 CUDA；CPU 与 CUDA 产物不可
+互替，CUDA 非确定设置只给 warning。canary drift 是「不能声称同算术栈
+复现」的证据，重录只记录新基线，不能替代定位环境差异或修复。旧产物
+缺少 canary 时报 `not_verifiable_locally`，不回填、不重跑、不当作通过。
+
+**Verification.** 新增 `test_numerical_canary.py` 9 项：同参数跨调用逐
+字节一致且严格 JSON 可写；seed 只改 RNG、size/dtype 改变算术；非法
+seed/size/dtype/device fail closed（含 CPU 机器拒绝 `cuda`）；比较器的
+match/mismatch/environment-only/not_comparable/unverified 分支；
+`created_at` 不影响内容身份；算子摘要/指纹/顶层字段/缺 provenance 的
+篡改拒绝；最强一致篡改只能由重放判 drift；writer no-op/conflict/
+overwrite；审计门 missing/ok/drift/坏 JSON/裸 result；CLI write/verify/
+conflict/overwrite；`_PARTS`、report、CLI、Makefile 接线与
+README/.github 仍在。完整 CPU 套件在本轮最终树通过。
