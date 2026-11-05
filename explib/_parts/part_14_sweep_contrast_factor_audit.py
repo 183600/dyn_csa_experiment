@@ -1,4 +1,39 @@
 
+def _scf_text(value, limit=120):
+    """Bounded text for a declaration name/key."""
+    try:
+        text = str(value)
+    except Exception:
+        return f'<unrepresentable {type(value).__name__}>'
+    return text if len(text) <= limit else text[:limit - 3] + '...'
+
+
+def _scf_repr(value, limit=120):
+    """Bounded repr for untrusted declaration diagnostics.
+
+    ``repr(10**10000)`` raises on Python 3.12's integer-digit limit; a
+    malformed declaration must produce a ``fail`` verdict, not a formatting
+    exception.  The same bound keeps adversarial strings/lists from turning a
+    diagnostic into an unbounded allocation.
+    """
+    try:
+        text = repr(value)
+    except Exception:
+        return f'<unrepresentable {type(value).__name__}>'
+    return text if len(text) <= limit else text[:limit - 3] + '...'
+
+
+def _scf_json_int_ok(value):
+    """Whether an integer can be written as a strict-JSON number."""
+    if value is None:
+        return True
+    try:
+        str(value)
+    except (ValueError, MemoryError):
+        return False
+    return True
+
+
 def sweep_contrast_factor_audit(declarations, *, factory=None, n_layers=6,
                                 verbose=True):
     """Verify declared sweep/sensitivity contrasts against the real arm configs.
@@ -42,7 +77,7 @@ def sweep_contrast_factor_audit(declarations, *, factory=None, n_layers=6,
             print('[sweep-factor] REFUSED: no declarations to verify')
         return report
     for name, spec in declarations.items():
-        label = str(name)
+        label = _scf_text(name)
         if not isinstance(spec, dict):
             report['violations'].append(f'{label}: declaration is not an object')
             continue
@@ -70,33 +105,54 @@ def sweep_contrast_factor_audit(declarations, *, factory=None, n_layers=6,
             # protocol/run difference.
             a_level = _as_seed_int(spec.get('a_level'))
             b_level = _as_seed_int(spec.get('b_level'))
+            _pf_is_warm = (isinstance(protocol_factor, str)
+                           and protocol_factor == 'warm_steps')
             ok = True
             if a is not None or b is not None:
                 ok = False
                 report['violations'].append(
                     f'{label}: a protocol-factor declaration must not also name '
                     'AttnCfg arms (a/b)')
-            if protocol_factor != 'warm_steps':
+            if not _pf_is_warm:
                 ok = False
                 report['violations'].append(
-                    f'{label}: unsupported protocol factor {protocol_factor!r} '
+                    f'{label}: unsupported protocol factor '
+                    f'{_scf_repr(protocol_factor)} '
                     '(the only supported axis is warm_steps)')
-            if declared_set != {str(protocol_factor)}:
+            if _pf_is_warm and declared_set != {protocol_factor}:
                 ok = False
                 report['violations'].append(
                     f'{label}: protocol factors {sorted(declared_set)} must be '
-                    f'exactly {{{protocol_factor!r}}}')
+                    f'exactly {{' + repr(protocol_factor) + '}}')
             if declared_sf is not True:
                 ok = False
                 report['violations'].append(
                     f'{label}: a declared protocol contrast must be '
                     'single_factor=True')
-            if a_level is None or b_level is None or a_level == b_level:
+            if not _scf_json_int_ok(a_level):
+                ok = False
+                report['violations'].append(
+                    f'{label}: a_level is too large to represent as a JSON '
+                    'integer')
+                a_level = None
+            if not _scf_json_int_ok(b_level):
+                ok = False
+                report['violations'].append(
+                    f'{label}: b_level is too large to represent as a JSON '
+                    'integer')
+                b_level = None
+            if (a_level is None or b_level is None or a_level == b_level
+                    or a_level < 0 or b_level < 0):
                 ok = False
                 report['violations'].append(
                     f'{label}: a_level/b_level must be distinct integer warmup '
-                    'cut points')
-            entry = {'mode': 'protocol', 'protocol_factor': protocol_factor,
+                    'cut points (and non-negative)')
+            entry = {'mode': 'protocol',
+                     # Keep the report strict-JSON safe even for a malformed
+                     # huge integer / arbitrary object declaration.
+                     'protocol_factor': (protocol_factor
+                                         if isinstance(protocol_factor, str)
+                                         else _scf_text(protocol_factor)),
                      'a_level': a_level, 'b_level': b_level,
                      'declared_factors': sorted(declared_set),
                      'actual_keys': sorted(declared_set),
@@ -485,7 +541,12 @@ def attach_probe_factor_metadata(record, tag, factor_report, *, declarations=Non
                     else declarations)
     if not isinstance(record, dict):
         return record
-    _decl = declarations.get(tag) if isinstance(declarations, dict) else None
+    _decl = None
+    if isinstance(declarations, dict):
+        try:
+            _decl = declarations.get(tag)
+        except TypeError:
+            _decl = None
     if not isinstance(_decl, dict):
         if record.get('single_factor') is True:
             record['declared_single_factor'] = True
@@ -499,7 +560,12 @@ def attach_probe_factor_metadata(record, tag, factor_report, *, declarations=Non
     for _key in ('single_factor', 'factors', 'factors_note'):
         if _key in _decl:
             record[_key] = _decl[_key]
-    _pair = (factor_report.get('pairs') or {}).get(tag) if isinstance(factor_report, dict) else None
+    _pairs = factor_report.get('pairs') if isinstance(factor_report, dict) else None
+    _pairs = _pairs if isinstance(_pairs, dict) else {}
+    try:
+        _pair = _pairs.get(tag)
+    except TypeError:
+        _pair = None
     _verified = isinstance(_pair, dict) and _pair.get('verified') is True
     record['factor_declaration_verified'] = _verified
     if isinstance(_pair, dict):

@@ -375,6 +375,15 @@ def pair_reason(ra, rb):
         return f'disagreeing {sorted(bad)}'
     return None
 
+def _pcr_safe_repr(value, limit=100):
+    """Bounded repr for a malformed protocol declaration diagnostic."""
+    try:
+        text = repr(value)
+    except Exception:
+        return f'<unrepresentable {type(value).__name__}>'
+    return text if len(text) <= limit else text[:limit - 3] + '...'
+
+
 def protocol_contrast_reason(ra, rb, declaration=None, *, factor=None):
     """Pair gate for a contrast whose ONLY permitted protocol difference is a
     declared protocol-level factor (currently ``warm_steps``).
@@ -391,10 +400,14 @@ def protocol_contrast_reason(ra, rb, declaration=None, *, factor=None):
     ``a_level``/``b_level`` (the same object used by the design audit), so an
     ad-hoc pair cannot opt into a different warmup schedule.
     """
-    declaration = declaration or {}
+    if declaration is None:
+        declaration = {}
+    if not isinstance(declaration, dict):
+        return 'unverifiable protocol declaration (must be an object)'
     factor = factor if factor is not None else declaration.get('protocol_factor')
     if factor != 'warm_steps':
-        return f'unsupported protocol contrast factor {factor!r}'
+        return ('unsupported protocol contrast factor '
+                f'{_pcr_safe_repr(factor)}')
     if not isinstance(ra, dict) or not isinstance(rb, dict):
         return 'a record is not a dict'
     a_level = _as_seed_int(declaration.get('a_level'))

@@ -544,7 +544,14 @@ def contrast_pair_reason(name, ra, rb, declarations=None):
     refusing it because ``pair_reason`` sees two protocol tags.
     """
     decls = ROPE_CONTRAST_FACTORS if declarations is None else declarations
-    _decl = (decls or {}).get(name) if isinstance(decls, dict) else None
+    _decl = None
+    if isinstance(decls, dict):
+        try:
+            _decl = decls.get(name)
+        except TypeError:
+            # An unhashable pair name cannot match a declaration; fall back to
+            # the ordinary gate instead of raising from the report loop.
+            _decl = None
     if isinstance(_decl, dict) and _decl.get('protocol_factor') is not None:
         return L.protocol_contrast_reason(ra, rb, _decl)
     return L.pair_reason(ra, rb)

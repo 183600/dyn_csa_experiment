@@ -1420,9 +1420,16 @@ def declared_ablation_pairs(design=None):
             if not isinstance(item, (list, tuple)) or len(item) < 2:
                 continue
             pair = (item[0], item[1])
-            if pair not in seen:
+            try:
+                if pair in seen:
+                    continue
                 seen.add(pair)
-                out.append(pair)
+            except TypeError:
+                # A malformed declaration with an unhashable arm label is not
+                # a pair the report can display; skip it instead of aborting
+                # the whole list construction.
+                continue
+            out.append(pair)
     return out
 
 BASELINE_DESIGN = {
@@ -1469,9 +1476,10 @@ def declared_topk_budget_pairs():
         if not isinstance(spec, dict):
             continue
         a, b = spec.get('a'), spec.get('b')
-        if not isinstance(a, str) or not isinstance(b, str):
+        if (not isinstance(a, str) or not a.strip()
+                or not isinstance(b, str) or not b.strip()):
             continue
-        pair = (a, b)
+        pair = (a.strip(), b.strip())
         if pair not in seen:
             seen.add(pair)
             out.append(pair)

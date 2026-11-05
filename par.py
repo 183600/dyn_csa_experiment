@@ -35,6 +35,28 @@ REPO = os.path.dirname(os.path.abspath(__file__))
 JOBS_DIR = os.path.join(REPO, "par_jobs")
 _KILL = {"on": False}
 _OFF = ("", "0", "no", "off", "false", "none", "serial")
+# A caller-supplied CPU worker count materialises one slot per worker.  An
+# accidental huge value (typo, parsed counter, or an adversarial config)
+# must be a clean refusal, not a memory allocation that kills the driver.
+_MAX_CPU_WORKERS = 4096
+
+
+def _safe_text(value, limit=80):
+    """Bounded text for untrusted diagnostics/config values."""
+    try:
+        text = str(value)
+    except Exception:
+        return f'<unrepresentable {type(value).__name__}>'
+    return text if len(text) <= limit else text[:limit - 3] + '...'
+
+
+def _safe_repr(value, limit=120):
+    """Bounded repr that also survives Python 3.12's huge-int limit."""
+    try:
+        text = repr(value)
+    except Exception:
+        return f'<unrepresentable {type(value).__name__}>'
+    return text if len(text) <= limit else text[:limit - 3] + '...'
 
 
 def _num_or_none(value):
@@ -56,6 +78,17 @@ def _num_or_none(value):
     if isinstance(value, float):
         return (int(value) if math.isfinite(value) and value.is_integer()
                 and value > 0 else None)
+    if isinstance(value, str):
+        # Exact integer strings must not be routed through float(): a
+        # 400-digit count would become ``inf`` and be discarded.  Integral
+        # float spellings such as ``"3.0"`` still fall through below.
+        text = value.strip()
+        try:
+            exact = int(text)
+        except (TypeError, ValueError, OverflowError):
+            pass
+        else:
+            return exact if exact > 0 else None
     try:
         number = float(value)
     except (TypeError, ValueError, OverflowError):
@@ -90,7 +123,7 @@ def gpu_slots(want_gpus=None):
             ) from exc
 
     if count <= 0:
-        if want_gpus is not None and str(want_gpus).strip():
+        if want_gpus is not None and _safe_text(want_gpus).strip():
             raise ValueError(
                 "CSA_PAR_GPUS was specified, but no CUDA device is visible."
             )
@@ -112,15 +145,15 @@ def gpu_slots(want_gpus=None):
                 "Use a valid explicit device list."
             )
 
-    if want_gpus is None or not str(want_gpus).strip():
+    if want_gpus is None or not _safe_text(want_gpus, limit=100000).strip():
         return tokens, True
 
     selected = []
-    for item in str(want_gpus).split(","):
+    for item in _safe_text(want_gpus, limit=100000).split(","):
         item = item.strip()
         if not re.fullmatch(r"[0-9]+", item):
             raise ValueError(
-                f"Invalid CSA_PAR_GPUS entry {item!r}; "
+                f"Invalid CSA_PAR_GPUS entry {_safe_repr(item)}; "
                 "use parent-logical integer GPU indices."
             )
         index = int(item)
@@ -147,7 +180,8 @@ def resolve_ctx(par=None, label=""):
     if par is None or par is False:
         return None
 
-    value = "auto" if par is True else str(par).strip().lower()
+    value = ("auto" if par is True
+             else _safe_text(par, limit=100000).strip().lower())
     if value in _OFF:
         return None
 
@@ -159,7 +193,7 @@ def resolve_ctx(par=None, label=""):
             return None
     else:
         raise ValueError(
-            f"Invalid CSA_PAR value {par!r}; use auto, N, or off."
+            f"Invalid CSA_PAR value {_safe_repr(par)}; use auto, N, or off."
         )
 
     slots, on_cuda = gpu_slots(os.environ.get("CSA_PAR_GPUS"))
@@ -167,13 +201,19 @@ def resolve_ctx(par=None, label=""):
         workers = len(slots) if wanted is None else min(wanted, len(slots))
         if wanted is not None and wanted > len(slots):
             print(
-                f"[par] Requested {wanted} workers; "
+                f"[par] Requested {_safe_text(wanted)} workers; "
                 f"capping at {len(slots)} GPU slot(s).",
                 flush=True,
             )
         slots = slots[:workers]
     else:
         workers = 1 if wanted is None else wanted
+        if workers > _MAX_CPU_WORKERS:
+            raise ValueError(
+                f"CSA_PAR requested {_safe_text(workers)} CPU workers; the "
+                f"safety limit is {_MAX_CPU_WORKERS} (one slot per worker is "
+                "materialised). Use a smaller count or serial execution."
+            )
         slots = [""] * workers
         print(
             f"[par] No visible CUDA device: using {workers} CPU worker(s).",
@@ -195,49 +235,112 @@ def resolve_ctx(par=None, label=""):
 
 
 def ctx_active(ctx, n_cells=1):
-    return (
-        bool(ctx)
-        and int(ctx.get("workers", 0)) > 1
-        and n_cells > 1
-    )
+    """Whether a resolved context can actually run cells concurrently.
+
+    Malformed metadata is a serial fallback, not an exception in a driver
+    setup path: ``ctx`` may come from a hand-edited environment/config and
+    must not crash before any cell is dispatched.
+    """
+    if not isinstance(ctx, dict) or not ctx:
+        return False
+    try:
+        workers = int(ctx.get("workers", 0))
+        cells = int(n_cells)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return workers > 1 and cells > 1
 
 
-def _norm(obj):
-    """Convert driver payloads to JSON-compatible values."""
+def _norm(obj, _seen=None, _depth=0):
+    """Convert driver payloads to JSON-compatible values.
+
+    A cyclic or pathologically deep payload is refused with a normal
+    ``ValueError`` instead of escaping as a ``RecursionError`` while the
+    dispatcher is preparing child job files.
+    """
+    if _depth > 512:
+        raise ValueError('job payload nesting exceeds the 512-level limit')
     if isinstance(obj, dict):
-        return {str(key): _norm(value) for key, value in obj.items()}
+        if _seen is None:
+            _seen = set()
+        if id(obj) in _seen:
+            raise ValueError('job payload contains a cyclic mapping')
+        _seen.add(id(obj))
+        try:
+            return {_safe_text(key): _norm(value, _seen, _depth + 1)
+                    for key, value in obj.items()}
+        finally:
+            _seen.discard(id(obj))
     if isinstance(obj, (list, tuple)):
-        return [_norm(value) for value in obj]
+        if _seen is None:
+            _seen = set()
+        if id(obj) in _seen:
+            raise ValueError('job payload contains a cyclic sequence')
+        _seen.add(id(obj))
+        try:
+            return [_norm(value, _seen, _depth + 1) for value in obj]
+        finally:
+            _seen.discard(id(obj))
     if isinstance(obj, (set, frozenset)):
-        return sorted(
-            (_norm(value) for value in obj),
-            key=lambda value: json.dumps(
-                value, sort_keys=True, default=str
-            ),
-        )
+        if _seen is None:
+            _seen = set()
+        if id(obj) in _seen:
+            raise ValueError('job payload contains a cyclic set')
+        _seen.add(id(obj))
+        try:
+            normalised = [_norm(value, _seen, _depth + 1) for value in obj]
+
+            def _sort_key(value):
+                try:
+                    return json.dumps(value, sort_keys=True, default=str)
+                except Exception:
+                    return _safe_repr(value)
+
+            return sorted(normalised, key=_sort_key)
+        finally:
+            _seen.discard(id(obj))
     # NumPy scalars are not instances of the builtin int/float classes, but
     # they are ordinary JSON numbers; converting them to str would silently
     # turn a seed/count into a string in the child job file.  The same applies
     # to a 0-d array (and to small arrays used as job payloads).
     if isinstance(obj, np.generic):
-        return _norm(obj.item())
+        return _norm(obj.item(), _seen, _depth + 1)
     if isinstance(obj, np.ndarray):
-        return _norm(obj.tolist())
+        return _norm(obj.tolist(), _seen, _depth + 1)
     if isinstance(obj, (str, int, float, bool)) or obj is None:
         return obj
-    return str(obj)
+    return _safe_text(obj, limit=100000)
 
 
-def _denorm(obj):
+def _denorm(obj, _seen=None, _depth=0):
+    if _depth > 512:
+        raise ValueError('job payload nesting exceeds the 512-level limit')
     if isinstance(obj, dict):
-        return {str(key): _denorm(value) for key, value in obj.items()}
+        if _seen is None:
+            _seen = set()
+        if id(obj) in _seen:
+            raise ValueError('job payload contains a cyclic mapping')
+        _seen.add(id(obj))
+        try:
+            return {_safe_text(key): _denorm(value, _seen, _depth + 1)
+                    for key, value in obj.items()}
+        finally:
+            _seen.discard(id(obj))
     if isinstance(obj, list):
-        return [_denorm(value) for value in obj]
+        if _seen is None:
+            _seen = set()
+        if id(obj) in _seen:
+            raise ValueError('job payload contains a cyclic sequence')
+        _seen.add(id(obj))
+        try:
+            return [_denorm(value, _seen, _depth + 1) for value in obj]
+        finally:
+            _seen.discard(id(obj))
     return obj
 
 
 def _slug(value):
-    return re.sub(r"[^A-Za-z0-9._-]+", "_", str(value))[:80]
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", _safe_text(value))[:80]
 
 
 def _child_env(slot, seed=None):
@@ -366,18 +469,18 @@ def _job_watchdog_seconds(job, ctx):
         # A boolean flag is not a duration: True would silently become a
         # one-second watchdog that kills every healthy cell immediately.
         raise ValueError(
-            f"watchdog_seconds must be a positive finite number, got {v!r}"
+            f"watchdog_seconds must be a positive finite number, got {_safe_repr(v)}"
         )
     if v is not None and v != 0:
         try:
             fv = float(v)
         except (TypeError, ValueError, OverflowError):
             raise ValueError(
-                f"watchdog_seconds must be a positive finite number, got {v!r}"
+                f"watchdog_seconds must be a positive finite number, got {_safe_repr(v)}"
             ) from None
         if not math.isfinite(fv) or fv <= 0.0:
             raise ValueError(
-                f"watchdog_seconds must be a positive finite number, got {v!r}"
+                f"watchdog_seconds must be a positive finite number, got {_safe_repr(v)}"
             )
         return fv
     try:

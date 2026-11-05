@@ -972,10 +972,15 @@ ROPE_REPORT_PAIRS = (
 
 
 def attach_contrast_factor_metadata(comparisons, declarations, factor_report):
+    if not isinstance(comparisons, dict):
+        # A malformed report container cannot carry verified metadata.  Return
+        # it unchanged instead of raising from an audit post-processing hook.
+        return comparisons
     _pairs = factor_report.get('pairs') if isinstance(factor_report, dict) else None
     _pairs = _pairs if isinstance(_pairs, dict) else {}
-    for _name, _rec in (comparisons or {}).items():
-        _decl = (declarations or {}).get(_name)
+    _decls = declarations if isinstance(declarations, dict) else {}
+    for _name, _rec in comparisons.items():
+        _decl = _decls.get(_name)
         if not isinstance(_decl, dict) or not isinstance(_rec, dict):
             continue
         _rec.update(_decl)

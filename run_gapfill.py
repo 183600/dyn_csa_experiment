@@ -44,11 +44,68 @@ def _num_or_none(v):
         return int(v)
     if isinstance(v, float):
         return int(v) if math.isfinite(v) and v.is_integer() else None
+    if isinstance(v, str):
+        # Parse an integral string in the integer domain first.  Going
+        # through float() silently maps a 400-digit seed/count to ``inf``
+        # and returns None, even though the label is an exact integer.
+        text = v.strip()
+        try:
+            return int(text)
+        except (TypeError, ValueError, OverflowError):
+            pass
     try:
         f = float(v)
     except (TypeError, ValueError, OverflowError):
         return None
     return int(f) if math.isfinite(f) and f.is_integer() else None
+
+
+def _safe_mean(values):
+    """Arithmetic mean that survives an unrepresentable finite panel.
+
+    ``run_gapfill`` aggregates PPLs read back from existing artifacts, not
+    freshly measured float64 values.  A huge exact integer (or a pair with
+    opposite extreme signs) can overflow the direct ``sum(vals) / len(vals)``
+    expression before the guarded fallback runs.  The ordinary path is kept
+    byte-identical; only an arithmetic overflow is routed through the
+    guarded helper, and an unrepresentable result is withheld as ``None``.
+    """
+    if not values:
+        return None
+    try:
+        out = sum(values) / len(values)
+    except (OverflowError, TypeError, ValueError, ZeroDivisionError):
+        out = None
+    if out is not None and math.isfinite(out):
+        return out
+    try:
+        out = L._scaled_mean_or_raw(values)
+    except (OverflowError, TypeError, ValueError):
+        return None
+    return out if out is not None and math.isfinite(out) else None
+
+
+def _safe_stdev(values):
+    """Sample SD with a guarded fallback for extreme finite values.
+
+    ``statistics.stdev([1.7e308, -1.7e308])`` raises ``OverflowError``
+    instead of returning ``inf``, so the old post-hoc finite check never
+    reached the guarded helper.  The historical value is preserved for
+    ordinary panels; an unrepresentable spread is withheld as ``None``.
+    """
+    if len(values) < 2:
+        return 0.0
+    try:
+        out = statistics.stdev(values)
+    except (OverflowError, TypeError, ValueError, ZeroDivisionError):
+        out = None
+    if out is not None and math.isfinite(out):
+        return out
+    try:
+        out = L._scaled_std_or_raw(values)
+    except (OverflowError, TypeError, ValueError):
+        return None
+    return out if out is not None and math.isfinite(out) else None
 
 def _announce_seed_plan(label, cfg, seeds):
     """Print the prospective family-corrected seed requirement for a phase.
@@ -169,12 +226,8 @@ def _fold_backup_into_aggregate(adir):
         lentry['seeds'] = seeds_sorted
         lentry['ppls'] = vals
         lentry['n_seeds'] = len(vals)
-        _m = sum(vals) / len(vals)
-        if not math.isfinite(_m):
-            _m = L._scaled_mean_or_raw(vals)
-        _s = statistics.stdev(vals) if len(vals) > 1 else 0.0
-        if not math.isfinite(_s):
-            _s = L._scaled_std_or_raw(vals)
+        _m = _safe_mean(vals)
+        _s = _safe_stdev(vals)
         lentry['ppl_mean'] = _m
         lentry['ppl_std'] = _s
         # Every other aggregate was computed over the pre-recovery seed subset.
@@ -415,12 +468,8 @@ def merge_long_aggregate(adir, snapshot_agg):
         sentry['seeds'] = seeds_sorted
         sentry['ppls'] = vals
         sentry['n_seeds'] = len(vals)
-        _m = sum(vals) / len(vals)
-        if not math.isfinite(_m):
-            _m = L._scaled_mean_or_raw(vals)
-        _s = statistics.stdev(vals) if len(vals) > 1 else 0.0
-        if not math.isfinite(_s):
-            _s = L._scaled_std_or_raw(vals)
+        _m = _safe_mean(vals)
+        _s = _safe_stdev(vals)
         sentry['ppl_mean'] = _m
         sentry['ppl_std'] = _s
         # Every field below was computed over the snapshot's seed subset.
@@ -505,12 +554,8 @@ def merge_long_aggregate(adir, snapshot_agg):
             if not common:
                 return
             ds = [vm[_s] - base_map[_s] for _s in common]
-            _mean = sum(ds) / len(ds)
-            if not math.isfinite(_mean):
-                _mean = L._scaled_mean_or_raw(ds)
-            _std = statistics.stdev(ds) if len(ds) > 1 else 0.0
-            if not math.isfinite(_std):
-                _std = L._scaled_std_or_raw(ds)
+            _mean = _safe_mean(ds)
+            _std = _safe_stdev(ds)
             entry[mean_f] = _mean
             entry[std_f] = _std
             entry[n_f] = len(ds)
