@@ -276,6 +276,7 @@ jobs:
       - name: Run AI harness for ~3 hours (phases per iteration)
         timeout-minutes: 180
         env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
           OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
         run: |
@@ -325,7 +326,8 @@ jobs:
           #   - dsh 无法安装 / key 未配置 / 冒烟失败 / 阶段调用失败时，自动切换 opencode；
           #   - opencode 兜底级联：DeepSeek 官方 API（openai-compatible，复用
           #     DEEPSEEK_API_KEY，模型探测自动校准，优先 deepseek-flash）
-          #     → Zen 免费 deepseek-v4.1-flash-free → big-pickle；
+          #     → NVIDIA NIM（glm-5.3-flash 优先 + 验证池随机轮换）
+          #     → Zen 免费 deepseek-v4.1-flash-free / glm-5.3-flash-free / big-pickle；
           #   - dsh 路径一律 `dsh --profile headless "$prompt"`（key 从环境变量读取）；
           #     opencode 路径一律 `opencode run -m <model> [--variant ...] "$prompt"`。
           # 一旦切换到 opencode，本 run 内不再回头尝试 dsh。
@@ -479,7 +481,9 @@ jobs:
 
           }
 
-          # ⭐ 模型策略（2026-11-02 diag v7b 对 NVIDIA 85 模型 + opencode 免费 130 模型全量实测）：
+          # ⭐ 模型策略（2026-11-05 恢复 DeepSeek 官方 API 优先：dsh 为主 harness，
+          #    opencode 兜底链里 DeepSeek 官方 API 也排在 NVIDIA 之前）。
+          #    NVIDIA 链实测（2026-11-02 diag v7b 对 NVIDIA 85 模型 + opencode 免费 130 模型全量实测）：
           #   1) 优先 z-ai/glm-5.3-flash（实测可用：冒烟 43s/工具 136s，波动大偶尔慢，由看门狗兜底）；
           #   2) 8 个验证池模型（60s 冒烟+工具调用双通过）每次 run 随机轮换（"所有模型随机"策略）；
           #   3) opencode 免费网关 130 个模型已全部实测失败，仅留 deepseek/glm/pickle 三席兜底（若复活自动可用）。
@@ -499,23 +503,33 @@ jobs:
           detect_provider() {
             local pass cand model
             for pass in 1 2; do
-              # 主力：NVIDIA NIM API（opencode 内置 provider，鉴权走 NVIDIA_API_KEY）。
-              # 模型链（指定顺序）：deepseek-v4.1-flash → glm-5.3-flash → glm-5.3
-              #   → minimax-m3.1-flash → step-5-preview；其后 Zen 免费池兜底
-              #   （免费池 2026-11-01 起对 runner 大面积挂起，恢复后仍可被选中）。
-              # 不再使用 DeepSeek 官方 API。
-                            # ⭐ glm 优先 + 验证池随机轮换（每次 run 打乱，实现所有可用模型随机）
+              # ⭐ opencode 兜底级联（DeepSeek 官方 API 优先）：
+              #   1) DeepSeek 官方 API（openai-compatible provider，复用 DEEPSEEK_API_KEY，
+              #      GET /models 探测 + 模型自动校准，优先 deepseek-flash）；
+              #   2) NVIDIA NIM API（opencode 内置 provider，鉴权走 NVIDIA_API_KEY）：
+              #      glm-5.3-flash 优先 + 8 个验证池模型每次 run 随机轮换；
+              #   3) Zen 免费池兜底：deepseek-v4.1-flash-free → glm-5.3-flash-free → big-pickle
+              #      （免费池 2026-11-01 起对 runner 大面积挂起，恢复后仍可被选中）。
               mapfile -t NV_SHUF < <(printf '%s\n' "${NV_POOL[@]}" | shuf)
-              NV_CANDS=(nv-first)
+              NV_CANDS=(deepseek nv-first)
               _i=0
               for _m in "${NV_SHUF[@]}"; do _i=$((_i+1)); NV_CANDS+=("nv-r${_i}"); done
               NV_CANDS+=(free glm pickle)
               for cand in "${NV_CANDS[@]}"; do
                 is_broken "$cand" && continue
                 case "$cand" in
+                  deepseek)
+                    # DeepSeek 官方 API：key 未配置或 /models 探测失败时跳过本轮（可能是瞬时故障）
+                    if [ -z "${DEEPSEEK_API_KEY:-}" ] || ! probe_deepseek; then
+                      echo "[warn] DeepSeek 官方 API 不可用（key 未配置 / 探测失败），跳过"
+                      mark_broken deepseek
+                      continue
+                    fi
+                    model="deepseek/$DEEPSEEK_MODEL" ;;
                   nv-first) model="$NV_FIRST" ;;
                   nv-r*)    _i="${cand#nv-r}"; model="${NV_SHUF[$((_i-1))]}" ;;
                   free)   model="$FREE_MODEL" ;;
+                  glm)    model="opencode/glm-5.3-flash-free" ;;
                   pickle) model="$PICKLE_MODEL" ;;
                 esac
                 switch_provider "$cand"
@@ -554,8 +568,23 @@ jobs:
           }
 
           # ---------- dsh 主用 / opencode 兜底的 harness 选择 ----------
+          # ⭐ 429/限流不换 harness：dsh 冒烟撞限流时退避重试（45/90/135/180s，共 4 次）；
+          #    4 次仍限流 → 返回 2（调用方中止本轮选择，交由后继 run 重试，绝不因 429 弃用官方 API）
           dsh_smoke() {
-            timeout --kill-after=30 180 dsh --profile headless "只回复两个字：OK" > /tmp/dsh_smoke_test.log 2>&1
+            local _try=0
+            while ! timeout --kill-after=30 180 dsh --profile headless "只回复两个字：OK" > /tmp/dsh_smoke_test.log 2>&1; do
+              if ! grep -qiE "too many requests|rate.?limit|status.{0,3}429" /tmp/dsh_smoke_test.log 2>/dev/null; then
+                return 1
+              fi
+              if [ "$_try" -ge 4 ]; then
+                echo "[smoke] dsh 持续 429/限流（已退避重试 4 次）：不换 harness，返回限流信号"
+                return 2
+              fi
+              _try=$((_try+1))
+              echo "[smoke] dsh 撞 429/限流（第 ${_try}/4 次）：不换 harness，$((45*_try))s 后重试"
+              sleep $((45*_try))
+            done
+            return 0
           }
 
           use_dsh() {
@@ -577,16 +606,13 @@ jobs:
             CURRENT_MODEL=""
             CURRENT_PROVIDER=""
             export HARNESS SELECTED_MODEL SELECTED_PROVIDER SELECTED_VARIANT CURRENT_MODEL CURRENT_PROVIDER
-            echo "[info] 使用 opencode（NVIDIA NIM 主力 → Zen 免费池兜底）"
+            echo "[info] 使用 opencode（DeepSeek 官方 API → NVIDIA NIM → Zen 免费池兜底）"
             detect_provider
           }
 
           select_harness_model() {
-            # 已停用 DeepSeek 官方 API（dsh）：一律 opencode（NVIDIA NIM 主力 + 免费池兜底）
-            switch_to_opencode
-          }
-
-          select_harness_model_dsh_disabled() {
+            # ⭐ 优先 DeepSeek 官方 API（2026-11-05 恢复）：dsh（DeepSeek Harness
+            #    + deepseek-flash）主用；不可用时 opencode 兜底（官方 API → NVIDIA → 免费池）。
             # 已切换到 opencode 后，本 run 内不再回头尝试 dsh
             if [ "$HARNESS" = "opencode" ]; then
               detect_provider
@@ -598,7 +624,14 @@ jobs:
                 echo "[warn] DEEPSEEK_API_KEY 未配置，dsh 无法调用官方 API，跳过 dsh"
               else
                 use_dsh
-                if dsh_smoke; then
+                dsh_smoke; __rc=$?
+                if [ "$__rc" -eq 2 ]; then
+                  echo "[provider] dsh 持续 429/限流：不换 harness、不标记失效，中止本轮模型选择，交由后继 run 重试"
+                  SELECTED_MODEL=""; SELECTED_PROVIDER=""; SELECTED_VARIANT=""
+                  export SELECTED_MODEL SELECTED_PROVIDER SELECTED_VARIANT
+                  return 1
+                fi
+                if [ "$__rc" -eq 0 ]; then
                   return 0
                 fi
                 echo "[warn] dsh 冒烟测试失败（API key / 网络 / 配额 / 安装），切换 opencode 兜底"
