@@ -85,6 +85,20 @@ def _ar_int(value, *, minimum=None):
     return out
 
 
+def _ar_repr(value, limit=120):
+    """Bounded, exception-safe repr for untrusted artifact diagnostics.
+
+    A hand-edited rehearsal may carry an integer too large for Python 3.12
+    to stringify.  The validator must report that as a failed check instead
+    of raising while formatting the message.
+    """
+    try:
+        text = repr(value)
+    except Exception:
+        return f'<unrepresentable {type(value).__name__}>'
+    return text if len(text) <= limit else text[:limit - 3] + '...'
+
+
 # Content identities share the one canonicalisation contract in part_00.
 _ar_canonical = _canonical_json
 _ar_sha_obj = _sha256_json
@@ -617,12 +631,12 @@ def validate_analysis_rehearsal(rehearsal, *, manifest=None):
     if rehearsal.get('kind') != ANALYSIS_REHEARSAL_KIND:
         out['status'] = 'fail'
         out['problems'].append(
-            f"rehearsal.kind={rehearsal.get('kind')!r} is not "
+            f"rehearsal.kind={_ar_repr(rehearsal.get('kind'))} is not "
             f"{ANALYSIS_REHEARSAL_KIND!r}")
     if rehearsal.get('schema') != ANALYSIS_REHEARSAL_SCHEMA:
         out['status'] = 'fail'
         out['problems'].append(
-            f"rehearsal.schema={rehearsal.get('schema')!r} != "
+            f"rehearsal.schema={_ar_repr(rehearsal.get('schema'))} != "
             f'{ANALYSIS_REHEARSAL_SCHEMA}')
     recorded = _ar_sha256_text(rehearsal.get('content_sha256'))
     body = {k: v for k, v in rehearsal.items()
@@ -656,7 +670,7 @@ def validate_analysis_rehearsal(rehearsal, *, manifest=None):
     if rehearsal.get('status') != 'ok':
         out['status'] = 'fail'
         out['problems'].append(
-            f"rehearsal.status={rehearsal.get('status')!r} is not 'ok'")
+            f"rehearsal.status={_ar_repr(rehearsal.get('status'))} is not 'ok'")
     if not any(_ar_sha256_text(rehearsal.get(k)) for k in (
             'manifest_sha256', 'manifest_canonical_sha256',
             'manifest_raw_canonical_sha256')):
@@ -672,27 +686,27 @@ def validate_analysis_rehearsal(rehearsal, *, manifest=None):
     for name, scen in scenarios.items():
         if not isinstance(scen, dict):
             out['status'] = 'fail'
-            out['problems'].append(f'scenario {name!r} is not an object')
+            out['problems'].append(f'scenario {_ar_repr(name)} is not an object')
             continue
         if scen.get('ok') is not True:
             out['status'] = 'fail'
-            out['problems'].append(f'scenario {name!r} did not pass')
+            out['problems'].append(f'scenario {_ar_repr(name)} did not pass')
         checks = scen.get('checks')
         if not isinstance(checks, list) or not checks:
             out['status'] = 'fail'
-            out['problems'].append(f'scenario {name!r} has no checks')
+            out['problems'].append(f'scenario {_ar_repr(name)} has no checks')
             continue
         for chk in checks:
             if not isinstance(chk, dict) or chk.get('ok') is not True:
                 out['status'] = 'fail'
                 out['problems'].append(
-                    f'scenario {name!r} has a failed/malformed check')
+                    f'scenario {_ar_repr(name)} has a failed/malformed check')
     failures = rehearsal.get('failures')
     n_fail = _ar_int(rehearsal.get('n_failures'), minimum=0)
     if n_fail != 0:
         out['status'] = 'fail'
         out['problems'].append(
-            f"rehearsal.n_failures={rehearsal.get('n_failures')!r} is not zero")
+            f"rehearsal.n_failures={_ar_repr(rehearsal.get('n_failures'))} is not zero")
     if not isinstance(failures, list):
         out['status'] = 'fail'
         out['problems'].append('rehearsal.failures must be a list')

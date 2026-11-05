@@ -113,6 +113,29 @@ def _dp_sha_text(text):
     return hashlib.sha256(str(text).encode('utf-8')).hexdigest()
 
 
+def _dp_repr(value, limit=120):
+    """Bounded, exception-safe repr for untrusted diagnostics.
+
+    ``repr(10**10000)`` raises on Python 3.12's integer-digit limit.  A
+    tampered protocol must become a failed validation, not a formatting
+    exception that escapes before the gate can report the failure.
+    """
+    try:
+        text = repr(value)
+    except Exception:
+        return f'<unrepresentable {type(value).__name__}>'
+    return text if len(text) <= limit else text[:limit - 3] + '...'
+
+
+def _dp_str(value, limit=200):
+    """Bounded ``str`` preserving the ordinary text of a value."""
+    try:
+        text = str(value)
+    except Exception:
+        return f'<unrepresentable {type(value).__name__}>'
+    return text if len(text) <= limit else text[:limit - 3] + '...'
+
+
 def _dp_canonical(obj):
     """Canonical JSON used for every design hash (sorted, compact, strict)."""
     return json.dumps(obj, sort_keys=True, separators=(',', ':'),
@@ -281,7 +304,7 @@ def _dp_implementation_audit(protocol, *, source_tree=None):
             'status; executed-fragment order cannot be checked')
     elif status != 'ok':
         out['warnings'].append(
-            f'analysis.implementation.split_registry_status={status!r}; '
+            f'analysis.implementation.split_registry_status={_dp_repr(status)}; '
             'the executed analysis fragments were not fully registered')
     unreadable = registered.get('source_unreadable')
     if isinstance(unreadable, list) and unreadable:
@@ -346,7 +369,7 @@ def _dp_implementation_audit(protocol, *, source_tree=None):
         if _got is None:
             continue
         if (not isinstance(_got, list)
-                or [str(x) for x in _got] != _want):
+                or [_dp_str(x) for x in _got] != _want):
             out['problems'].append(
                 f'analysis.implementation.{_key} does not match the declared '
                 'analysis-closure scope; the registration describes a '
@@ -536,7 +559,7 @@ def _dp_level(manifest, explicit=None):
         level = _dp_text(explicit)
         if level in DESIGN_PROTOCOL_POLICY['levels']:
             return level
-        raise ValueError(f'unknown design level {explicit!r}')
+        raise ValueError(f'unknown design level {_dp_repr(explicit)}')
     status = _dp_text((manifest or {}).get('status'))
     if status and status.lower() == 'draft':
         return 'draft'
@@ -949,7 +972,7 @@ def validate_design_protocol(protocol, *, require_complete=None):
     study = study if isinstance(study, dict) else {}
     level = _dp_text(study.get('level'))
     if level not in DESIGN_PROTOCOL_POLICY['levels']:
-        _dp_problem(out, f"study.level must be one of {DESIGN_PROTOCOL_POLICY['levels']}, got {level!r}")
+        _dp_problem(out, f"study.level must be one of {DESIGN_PROTOCOL_POLICY['levels']}, got {_dp_repr(level)}")
         level = None
     strict = (level in DESIGN_PROTOCOL_POLICY['strict_levels']
               if require_complete is None else bool(require_complete))
@@ -968,9 +991,11 @@ def validate_design_protocol(protocol, *, require_complete=None):
         return False
 
     if protocol.get('kind') != DESIGN_PROTOCOL_KIND:
-        _dp_problem(out, f"protocol.kind must be {DESIGN_PROTOCOL_KIND!r}, got {protocol.get('kind')!r}")
+        _dp_problem(out, f"protocol.kind must be {DESIGN_PROTOCOL_KIND!r}, "
+                        f"got {_dp_repr(protocol.get('kind'))}")
     if protocol.get('schema') != DESIGN_PROTOCOL_SCHEMA:
-        _dp_problem(out, f'protocol.schema must be {DESIGN_PROTOCOL_SCHEMA}, got {protocol.get("schema")!r}')
+        _dp_problem(out, f'protocol.schema must be {DESIGN_PROTOCOL_SCHEMA}, '
+                        f'got {_dp_repr(protocol.get("schema"))}')
 
     name = _dp_text(study.get('name'))
     need(name is not None, 'study.name is missing', missing='study.name')
@@ -979,7 +1004,8 @@ def validate_design_protocol(protocol, *, require_complete=None):
         _dp_problem(out, 'study.manifest_sha256 must be a 64-character SHA-256 hex digest')
     alpha = _dp_number(study.get('alpha'))
     if alpha is None or not (0.0 < alpha < 1.0):
-        _dp_problem(out, f'study.alpha must be a finite probability in (0,1), got {study.get("alpha")!r}')
+        _dp_problem(out, f'study.alpha must be a finite probability in (0,1), '
+                        f'got {_dp_repr(study.get("alpha"))}')
     need(_dp_text(study.get('code_semantics')) is not None,
          'study.code_semantics is missing', missing='study.code_semantics')
 
@@ -1001,7 +1027,7 @@ def validate_design_protocol(protocol, *, require_complete=None):
         if hid is None:
             _dp_problem(out, f'{tag}.id is missing')
         elif hid in hyp_ids:
-            _dp_problem(out, f'{tag}.id {hid!r} is duplicated')
+            _dp_problem(out, f'{tag}.id {_dp_repr(hid)} is duplicated')
         else:
             hyp_ids.append(hid)
         need(_dp_text(h.get('statement')) is not None,
@@ -1033,7 +1059,7 @@ def validate_design_protocol(protocol, *, require_complete=None):
         if cname is None:
             _dp_problem(out, f'{tag}.name is missing')
         elif cname in by_name:
-            _dp_problem(out, f'{tag}.name {cname!r} is duplicated')
+            _dp_problem(out, f'{tag}.name {_dp_repr(cname)} is duplicated')
         else:
             comp_names.append(cname)
             by_name[cname] = c
@@ -1057,7 +1083,7 @@ def validate_design_protocol(protocol, *, require_complete=None):
              missing='research_question.primary_family')
         family = []
     else:
-        family = [str(x) for x in family]
+        family = [_dp_str(x) for x in family]
         if len(set(family)) != len(family):
             _dp_problem(out, 'research_question.primary_family contains duplicates')
         if set(family) != set(comp_names):
@@ -1073,7 +1099,7 @@ def validate_design_protocol(protocol, *, require_complete=None):
     else:
         if not all(isinstance(x, str) for x in arms):
             _dp_problem(out, 'arms must contain only strings')
-        arms = [str(x) for x in arms]
+        arms = [_dp_str(x) for x in arms]
         if len(set(arms)) != len(arms):
             _dp_problem(out, 'arms contains duplicate names')
     arm_set = set(arms)
@@ -1083,7 +1109,7 @@ def validate_design_protocol(protocol, *, require_complete=None):
         for key in ('a', 'b'):
             arm = _dp_text(c.get(key))
             if arm is not None and arm not in arm_set:
-                _dp_problem(out, f'comparison {c.get("name")!r} names undeclared {key} arm {arm!r}')
+                _dp_problem(out, f'comparison {_dp_repr(cname)} names undeclared {key} arm {_dp_repr(arm)}')
     out['checks']['n_arms'] = len(arms)
 
     # ---- sample size / power ----------------------------------------------
@@ -1139,7 +1165,7 @@ def validate_design_protocol(protocol, *, require_complete=None):
     for _flag in ('power_gate_required', 'power_simulation_required'):
         if _flag in ss and not isinstance(ss.get(_flag), bool):
             _dp_problem(out, f'sample_size.{_flag} must be boolean, got '
-                             f'{ss.get(_flag)!r}')
+                             f'{_dp_repr(ss.get(_flag))}')
     if min_n is not None and fam_n is not None and alpha is not None:
         floor_at_min = _dp_resolution_floor(fam_n, min_n)
         out['checks']['resolution_floor_at_min_n'] = floor_at_min
@@ -1153,7 +1179,7 @@ def validate_design_protocol(protocol, *, require_complete=None):
         if recorded_floor is not None and floor_at_planned is not None:
             if not math.isclose(recorded_floor, floor_at_planned,
                                 rel_tol=1e-12, abs_tol=0.0):
-                _dp_warn(out, f'sample_size.resolution_floor={recorded_floor!r} != '
+                _dp_warn(out, f'sample_size.resolution_floor={_dp_repr(recorded_floor)} != '
                               f'recomputed at planned n {floor_at_planned:.6g}')
     n_units = _dp_int(ss.get('n_eval_units'), minimum=1, allow_none=True)
     if n_units is not None:
@@ -1181,7 +1207,7 @@ def validate_design_protocol(protocol, *, require_complete=None):
     else:
         if not all(isinstance(x, str) for x in cells):
             _dp_problem(out, 'randomization.planned_cells must contain only strings')
-        text_cells = [str(x) for x in cells]
+        text_cells = [_dp_str(x) for x in cells]
         if len(set(text_cells)) != len(text_cells):
             _dp_problem(out, 'randomization.planned_cells contains duplicates')
         if planned and arms:
@@ -1194,11 +1220,11 @@ def validate_design_protocol(protocol, *, require_complete=None):
                           if isinstance(declared_seeds, list) else set())
         for lab in text_cells:
             if '::seed' not in lab:
-                _dp_warn(out, f'planned cell {lab!r} does not use the arm::seedN identity; its arm/seed membership cannot be checked here')
+                _dp_warn(out, f'planned cell {_dp_repr(lab)} does not use the arm::seedN identity; its arm/seed membership cannot be checked here')
                 continue
             arm, seed_text = lab.rsplit('::seed', 1)
             if arm_set and arm not in arm_set:
-                _dp_problem(out, f'planned cell {lab!r} names undeclared arm {arm!r}')
+                _dp_problem(out, f'planned cell {_dp_repr(lab)} names undeclared arm {_dp_repr(arm)}')
             seed_value = _dp_int(seed_text, minimum=0)
             if seed_value is None and seed_text.isascii() and seed_text.isdigit():
                 # ``str.isdigit()`` also accepts non-ASCII digits (e.g. '²')
@@ -1210,9 +1236,9 @@ def validate_design_protocol(protocol, *, require_complete=None):
                 except (ValueError, OverflowError):
                     seed_value = None
             if seed_value is None:
-                _dp_problem(out, f'planned cell {lab!r} has a non-integer seed')
+                _dp_problem(out, f'planned cell {_dp_repr(lab)} has a non-integer seed')
             elif declared_seeds and seed_value not in declared_seeds:
-                _dp_problem(out, f'planned cell {lab!r} uses seed {seed_value}, which is not in sample_size.seeds')
+                _dp_problem(out, f'planned cell {_dp_repr(lab)} uses seed {_dp_repr(seed_value)}, which is not in sample_size.seeds')
     if not isinstance(rnd.get('position_balance'), bool):
         _dp_warn(out, 'randomization.position_balance is not declared as a boolean')
     out['checks']['n_planned_cells'] = len(cells)
@@ -1251,7 +1277,7 @@ def validate_design_protocol(protocol, *, require_complete=None):
     if corr is None:
         need(False, 'analysis.correction is missing', missing='analysis.correction')
     elif strict and corr not in ('holm', 'max-t', 'bonferroni'):
-        _dp_problem(out, f'analysis.correction={corr!r} is not a recognised family-wise correction')
+        _dp_problem(out, f'analysis.correction={_dp_repr(corr)} is not a recognised family-wise correction')
     a_alpha = _dp_number(an.get('alpha'))
     if a_alpha is None or (alpha is not None and not math.isclose(a_alpha, alpha, rel_tol=0.0, abs_tol=1e-12)):
         _dp_problem(out, 'analysis.alpha must equal study.alpha')
@@ -1299,7 +1325,7 @@ def validate_design_protocol(protocol, *, require_complete=None):
                           'cannot be checked')
         elif _reg_status != 'ok':
             _dp_warn(out, f'analysis.implementation.split_registry_status='
-                          f'{_reg_status!r}; the executed analysis fragments '
+                          f'{_dp_repr(_reg_status)}; the executed analysis fragments '
                           'were not fully registered')
         _impl_unreadable = impl.get('source_unreadable')
         if isinstance(_impl_unreadable, list) and _impl_unreadable:
@@ -1339,7 +1365,7 @@ def validate_design_protocol(protocol, *, require_complete=None):
         need(False, 'data.test_access.method is missing',
              missing='data.test_access.method')
     elif ta_method not in ('single_look', 'bonferroni'):
-        _dp_problem(out, f'data.test_access.method={ta_method!r} is not one of '
+        _dp_problem(out, f'data.test_access.method={_dp_repr(ta_method)} is not one of '
                          "('single_look', 'bonferroni')")
     elif ta_method == 'single_look' and ta_looks is not None and ta_looks != 1:
         _dp_problem(out, 'data.test_access.method=single_look requires max_looks=1; '
@@ -1473,7 +1499,7 @@ def design_protocol_conformance(protocol, manifest, source_tree=None):
     rq = (protocol.get('research_question')
           if isinstance(protocol.get('research_question'), dict) else {})
     p_hyps = rq.get('hypotheses') if isinstance(rq.get('hypotheses'), list) else []
-    p_hids = [str(h.get('id')) for h in p_hyps
+    p_hids = [_dp_str(h.get('id')) for h in p_hyps
               if isinstance(h, dict) and h.get('id') is not None]
     raw_hyps = manifest.get('hypotheses')
     if isinstance(raw_hyps, dict) and raw_hyps:
@@ -1506,11 +1532,11 @@ def design_protocol_conformance(protocol, manifest, source_tree=None):
     p_corr = _dp_normal_correction(an.get('correction'))
     m_corr = _dp_normal_correction(stats.get('correction'))
     if p_corr is not None and m_corr is not None and p_corr != m_corr:
-        out['problems'].append(f'analysis.correction={p_corr!r} != manifest correction={m_corr!r}')
+        out['problems'].append(f'analysis.correction={_dp_repr(p_corr)} != manifest correction={_dp_repr(m_corr)}')
     p_code = _dp_text(study.get('code_semantics'))
     m_code = _dp_text(manifest.get('code_semantics_expected'))
     if p_code is not None and m_code is not None and p_code != m_code:
-        out['problems'].append(f'study.code_semantics={p_code!r} != manifest code_semantics_expected={m_code!r}')
+        out['problems'].append(f'study.code_semantics={_dp_repr(p_code)} != manifest code_semantics_expected={_dp_repr(m_code)}')
     # If the manifest explicitly declares a held-out budget or disposition
     # policy, the protocol must carry the same declaration.
     ta_manifest = None
@@ -1528,7 +1554,7 @@ def design_protocol_conformance(protocol, manifest, source_tree=None):
         m_method = _dp_text(ta_manifest.get('method'))
         p_method = _dp_text(p_ta.get('method'))
         if m_method is not None and p_method is not None and m_method != p_method:
-            out['problems'].append(f'data.test_access.method={p_method!r} != manifest method {m_method!r}')
+            out['problems'].append(f'data.test_access.method={_dp_repr(p_method)} != manifest method {_dp_repr(m_method)}')
     m_disp = None
     if isinstance(stats.get('disposition_policy'), dict):
         m_disp = stats.get('disposition_policy')
@@ -1549,7 +1575,8 @@ def design_protocol_conformance(protocol, manifest, source_tree=None):
             for key in ('retention', 'replacement', 'allow_supersede'):
                 if p_disp.get(key) != m_pol.get(key):
                     out['problems'].append(
-                        f'operations.disposition.{key}={p_disp.get(key)!r} != manifest {m_pol.get(key)!r}')
+                        f'operations.disposition.{key}={_dp_repr(p_disp.get(key))} != '
+                        f'manifest {_dp_repr(m_pol.get(key))}')
     # The design is only pre-registered if the implementation that computes
     # the declared endpoint is part of the registration.  A manifest match
     # with a changed analysis closure is exactly the post-registration drift
@@ -1635,7 +1662,7 @@ def design_protocol_timing(protocol, events):
         out['status'] = 'fail'
         out['reconstruction'] = True
         out['problems'].append(
-            f'protocol.created_at={protocol.get("created_at")!r} is later than '
+            f'protocol.created_at={_dp_repr(protocol.get("created_at"))} is later than '
             f'the first recorded {first_kind or "event"} at {first.isoformat()}; '
             'this is a reconstruction, not a pre-registration')
         return out
@@ -1646,7 +1673,7 @@ def design_protocol_timing(protocol, events):
 
 def _dp_reject_json_constant(value):
     """Reject NaN/Infinity: a protocol is canonical JSON, not lenient JSON."""
-    raise ValueError(f'non-finite JSON number {value!r} is not allowed')
+    raise ValueError(f'non-finite JSON number {_dp_repr(value)} is not allowed')
 
 
 def _dp_load_json(path):
@@ -1706,7 +1733,7 @@ def _dp_iter_events(events=None, panel_dirs=None):
     elif isinstance(panel_dirs, str):
         dirs = [panel_dirs]
     elif isinstance(panel_dirs, (list, tuple)):
-        dirs = [str(x) for x in panel_dirs]
+        dirs = [_dp_str(x) for x in panel_dirs]
     else:
         dirs = []
     for d in dirs:

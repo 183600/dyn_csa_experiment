@@ -14,6 +14,7 @@ stacks (per env_fp_v3 policy).
 from _split_loader import load_root_package
 
 import hashlib
+import json
 import os
 import pathlib
 
@@ -36,7 +37,6 @@ def _validate_parts_parts():
     if not fragment_dir.is_dir():
         raise ImportError(f'_parts/ directory not found at {fragment_dir}')
 
-    part_set = set(_PARTS)
     missing = []
     for part in _PARTS:
         p = fragment_dir / part

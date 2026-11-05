@@ -77,6 +77,29 @@ def _prep_text(value):
     return None
 
 
+def _prep_repr(value, limit=120):
+    """Bounded, exception-safe repr for untrusted diagnostics.
+
+    ``repr(10**10000)`` raises on Python 3.12's integer-digit limit.  A
+    malformed clearance must return a failed validation, not abort the launch
+    gate while formatting its own failure message.
+    """
+    try:
+        text = repr(value)
+    except Exception:
+        return f'<unrepresentable {type(value).__name__}>'
+    return text if len(text) <= limit else text[:limit - 3] + '...'
+
+
+def _prep_str(value, limit=200):
+    """Bounded ``str`` preserving the ordinary text of a value."""
+    try:
+        text = str(value)
+    except Exception:
+        return f'<unrepresentable {type(value).__name__}>'
+    return text if len(text) <= limit else text[:limit - 3] + '...'
+
+
 def _prep_study_level(protocol):
     """Read ``protocol.study.level`` without assuming the study block exists."""
     study = protocol.get('study') if isinstance(protocol, dict) else None
@@ -122,7 +145,7 @@ def _prep_str_list(value):
         return []
     if not isinstance(value, (list, tuple)):
         return None
-    return [str(x) for x in value]
+    return [_prep_str(x) for x in value]
 
 
 def _prep_detail_head(value, limit=5):
@@ -138,12 +161,13 @@ def _prep_detail_head(value, limit=5):
     if value is None:
         return []
     if isinstance(value, dict):
-        return [f'{k}={v}' for k, v in list(value.items())[:limit]]
+        return [f'{_prep_str(k)}={_prep_str(v)}'
+                for k, v in list(value.items())[:limit]]
     if isinstance(value, (list, tuple)):
-        return list(value[:limit])
+        return [_prep_str(x) for x in value[:limit]]
     if isinstance(value, (set, frozenset)):
-        return list(value)[:limit]
-    return [value][:limit]
+        return [_prep_str(x) for x in list(value)[:limit]]
+    return [_prep_str(value)][:limit]
 
 
 # Content identities share the one canonicalisation contract in part_00.
@@ -194,13 +218,13 @@ def _prep_check(name, *, required=False):
 
 
 def _prep_fail(check, message):
-    check['problems'].append(str(message))
+    check['problems'].append(_prep_str(message))
     check['status'] = 'fail'
     return check
 
 
 def _prep_warn(check, message, *, unverifiable=False):
-    check['warnings'].append(str(message))
+    check['warnings'].append(_prep_str(message))
     if check['status'] == 'ok':
         check['status'] = ('not_verifiable' if unverifiable else 'warnings')
     return check
@@ -208,7 +232,7 @@ def _prep_warn(check, message, *, unverifiable=False):
 
 def _prep_not_applicable(check, reason):
     check['status'] = 'not_applicable'
-    check['reason'] = str(reason)
+    check['reason'] = _prep_str(reason)
     return check
 
 
@@ -267,10 +291,10 @@ def _prep_protocol_check(protocol, *, power_supplied=False):
         _prep_fail(out, 'design protocol is invalid: '
                         + '; '.join((validation.get('problems') or [])[:5]))
     for warning in (validation.get('warnings') or [])[:12]:
-        if power_supplied and 'power_method is a projection' in str(warning):
+        if power_supplied and 'power_method is a projection' in _prep_str(warning):
             # The protocol was compiled before the power artifact existed; a
             # supplied, matching artifact resolves exactly this warning.
-            out.setdefault('resolved_warnings', []).append(str(warning))
+            out.setdefault('resolved_warnings', []).append(_prep_str(warning))
             continue
         _prep_warn(out, f'design protocol warning: {warning}')
     return out
@@ -321,7 +345,7 @@ def _prep_source_tree_check(protocol, source_tree, *, strict=True):
         # `None` means the supplied tree did not carry a registry at all; that
         # is not evidence that the previously registered order is intact.
         _prep_fail(out, 'executed split registry cannot be verified as ok '
-                        f'(current status={current_reg!r})')
+                        f'(current status={_prep_repr(current_reg)})')
     return out
 
 
@@ -343,7 +367,7 @@ def _prep_run_order_check(protocol, run_order, *, strict=True):
     if balance.get('status') != 'ok' or balance.get('design_ok') is not True:
         _prep_fail(out, 'run-order design is not a complete, position-balanced '
                         'randomization: '
-                        + '; '.join((balance.get('problems') or [])[:5]))
+                        + '; '.join(_prep_detail_head(balance.get('problems'), limit=5)))
     design = run_order.get('design') if isinstance(
         run_order.get('design'), dict) else {}
     rnd = protocol.get('randomization') if isinstance(
@@ -370,8 +394,8 @@ def _prep_run_order_check(protocol, run_order, *, strict=True):
         _prep_fail(out, 'run_order.planned_cells is not the registered cell '
                         'sequence' + detail)
     if design.get('name') != rnd.get('design'):
-        _prep_fail(out, f'run order design {design.get("name")!r} != '
-                        f'registered design {rnd.get("design")!r}')
+        _prep_fail(out, f'run order design {_prep_repr(design.get("name"))} != '
+                        f'registered design {_prep_repr(rnd.get("design"))}')
     if _prep_int(design.get('design_seed'), minimum=0) != _prep_int(
             rnd.get('design_seed'), minimum=0):
         _prep_fail(out, 'run-order design_seed differs from the registration')
@@ -390,7 +414,7 @@ def _prep_run_order_check(protocol, run_order, *, strict=True):
         else:
             if env_plan.get('status') == 'fail':
                 _prep_fail(out, 'declared environment slots are not balanced: '
-                                + '; '.join((env_plan.get('problems') or [])[:3]))
+                                + '; '.join(_prep_detail_head(env_plan.get('problems'), limit=3)))
             elif env_plan.get('status') != 'ok':
                 _prep_warn(out, f'environment slots could not be verified '
                                 f'({env_plan.get("status")})')
@@ -421,11 +445,12 @@ def _prep_disposition_check(protocol, disposition, *, strict=True):
         return _prep_fail(out, f'disposition policy could not be normalised: '
                                f'{type(exc).__name__}: {exc}')
     if current != registered:
-        different = sorted(set(current or {}) | set(registered or {}))
+        different = sorted(set(current or {}) | set(registered or {}),
+                           key=_prep_repr)
         pairs = [k for k in different if (current or {}).get(k) !=
                  (registered or {}).get(k)]
         _prep_fail(out, 'disposition policy differs from the registration: '
-                        + ', '.join(pairs[:6]))
+                        + ', '.join(_prep_str(x) for x in pairs[:6]))
     rnd = protocol.get('randomization') if isinstance(
         protocol.get('randomization'), dict) else {}
     _want_list = _prep_str_list(rnd.get('planned_cells'))
@@ -496,7 +521,7 @@ def _prep_power_check(protocol, power, *, strict=True):
     if (verdict not in ('pass', 'passed', 'ok')
             or all_pass is False):
         _prep_fail(out, f'power-validation artifact did not pass '
-                        f'(status={verdict!r}, all_pass={all_pass!r})')
+                        f'(status={_prep_repr(verdict)}, all_pass={_prep_repr(all_pass)})')
     for key, want, label in (
             ('alpha', out['alpha'], 'alpha'),
             ('m_family', out['family_size'], 'family size'),
@@ -511,7 +536,7 @@ def _prep_power_check(protocol, power, *, strict=True):
         protocol.get('comparisons'), list) else []
     cells = report.get('comparisons') if isinstance(
         report.get('comparisons'), dict) else {}
-    names = {str(c.get('name')) for c in comps if isinstance(c, dict)
+    names = {_prep_str(c.get('name')) for c in comps if isinstance(c, dict)
              and c.get('name') is not None}
     if not cells:
         _prep_fail(out, 'power artifact carries no per-comparison cells')
@@ -527,7 +552,7 @@ def _prep_power_check(protocol, power, *, strict=True):
     for comp in comps:
         if not isinstance(comp, dict) or comp.get('name') is None:
             continue
-        name = str(comp['name'])
+        name = _prep_str(comp['name'])
         cell = cells.get(name)
         if not isinstance(cell, dict):
             continue
@@ -585,14 +610,14 @@ def _prep_rehearsal_verdict(rehearsal, *, _depth=0):
     if isinstance(rehearsal.get('ok'), bool):
         errors = rehearsal.get('errors')
         if rehearsal.get('ok') is False and isinstance(errors, list) and errors:
-            return False, '; '.join(str(x) for x in errors[:5]), rehearsal
+            return False, '; '.join(_prep_str(x) for x in errors[:5]), rehearsal
         return rehearsal.get('ok'), None, rehearsal
     status = _prep_text(rehearsal.get('status'))
     if status is not None:
         return status.lower() in ('ok', 'pass', 'passed'), None, rehearsal
     errors = rehearsal.get('errors')
     if isinstance(errors, list):
-        return (not errors), ('; '.join(str(x) for x in errors[:5]) or None), rehearsal
+        return (not errors), ('; '.join(_prep_str(x) for x in errors[:5]) or None), rehearsal
     return None, 'rehearsal object has no ok/status/errors verdict', rehearsal
 
 
@@ -656,8 +681,8 @@ def _prep_rehearsal_check(protocol, rehearsal):
         if _arv.get('status') != 'ok':
             _prep_fail(
                 out, 'known-truth analysis rehearsal did not pass: '
-                     + '; '.join(str(x) for x in
-                                 (_arv.get('problems') or [])[:5]))
+                     + '; '.join(_prep_detail_head(
+                         _arv.get('problems'), limit=5)))
         else:
             _study = protocol.get('study') if isinstance(
                 protocol.get('study'), dict) else {}
@@ -927,7 +952,7 @@ def build_preparation_clearance(
         'policy': dict(PREPARATION_CLEARANCE_POLICY),
         'created_at': created_at,
         'revision': _prep_int(revision, minimum=0) or 0,
-        'supersedes': [str(x) for x in (supersedes or [])],
+        'supersedes': [_prep_str(x) for x in (supersedes or [])],
         'reason': _prep_text(reason),
         'notes': _prep_text(notes),
     }
@@ -996,19 +1021,23 @@ def validate_preparation_clearance(clearance, *, protocol=None):
         out['problems'].append('required_checks must be a list of check names')
         recorded_required = []
     unknown_required = sorted(set(recorded_required)
-                              - set(PREPARATION_CLEARANCE_CHECK_ORDER))
+                              - set(PREPARATION_CLEARANCE_CHECK_ORDER),
+                              key=_prep_repr)
     if unknown_required:
         out['problems'].append(
-            f'required_checks names unknown checks: {unknown_required}')
+            'required_checks names unknown checks: '
+            + ', '.join(_prep_repr(x) for x in unknown_required))
     if len(set(recorded_required)) != len(recorded_required):
         out['problems'].append('required_checks contains duplicates')
     # The check vocabulary is fixed.  An extra entry is not harmless metadata:
     # it would let a caller believe a check was recorded while the audit only
     # replays the ten known names (and it is part of the content hash).
-    unknown_checks = sorted(set(checks) - set(PREPARATION_CLEARANCE_CHECK_ORDER))
+    unknown_checks = sorted(set(checks) - set(PREPARATION_CLEARANCE_CHECK_ORDER),
+                            key=_prep_repr)
     if unknown_checks:
         out['problems'].append(
-            f'checks names unknown checks: {unknown_checks}')
+            'checks names unknown checks: '
+            + ', '.join(_prep_repr(x) for x in unknown_checks))
     for name in PREPARATION_CLEARANCE_CHECK_ORDER:
         check = checks.get(name)
         if not isinstance(check, dict):
@@ -1020,12 +1049,12 @@ def validate_preparation_clearance(clearance, *, protocol=None):
         status = _prep_text(check.get('status'))
         if status not in ('ok', 'warnings', 'not_verifiable',
                           'not_applicable', 'fail'):
-            out['problems'].append(f'checks.{name}.status={status!r} is not '
+            out['problems'].append(f'checks.{name}.status={_prep_repr(status)} is not '
                                    'a recognised status')
         if (check.get('name') is not None
                 and _prep_text(check.get('name')) != name):
             out['problems'].append(
-                f'checks.{name}.name={check.get("name")!r} does not match its '
+                f'checks.{name}.name={_prep_repr(check.get("name"))} does not match its '
                 'key')
         if 'required' in check and not isinstance(check.get('required'), bool):
             out['problems'].append(
@@ -1038,7 +1067,7 @@ def validate_preparation_clearance(clearance, *, protocol=None):
             _detail = _prep_detail_head(check.get('problems'), limit=3)
             out['problems'].append(
                 f'checks.{name} failed: '
-                + '; '.join(str(x) for x in _detail))
+                + '; '.join(_prep_str(x) for x in _detail))
         elif status in ('warnings', 'not_verifiable'):
             out['warnings'].append(f'checks.{name} is {status}')
     required = set(recorded_required)
@@ -1047,7 +1076,7 @@ def validate_preparation_clearance(clearance, *, protocol=None):
         if isinstance(check, dict) and 'required' in check:
             if check.get('required') is not (name in required):
                 out['problems'].append(
-                    f'checks.{name}.required={check.get("required")!r} does '
+                    f'checks.{name}.required={_prep_repr(check.get("required"))} does '
                     f'not match required_checks (name present: '
                     f'{name in required})')
     if strict:
@@ -1057,30 +1086,30 @@ def validate_preparation_clearance(clearance, *, protocol=None):
         if (isinstance(_power_entry, dict)
                 and _power_entry.get('status') == 'not_applicable'):
             expected_required.discard('power')
-        missing = sorted(expected_required - required)
+        missing = sorted(expected_required - required, key=_prep_repr)
         if missing:
             out['problems'].append(
                 f'confirmatory clearance omits required checks: {missing}')
-        extra = sorted(required - expected_required)
+        extra = sorted(required - expected_required, key=_prep_repr)
         if extra:
             out['problems'].append(
                 f'confirmatory clearance marks non-required checks as '
                 f'mandatory: {extra}')
-        for name in sorted(expected_required):
+        for name in sorted(expected_required, key=_prep_repr):
             _entry = checks.get(name)
             if (not isinstance(_entry, dict)
                     or _entry.get('status') != 'ok'):
                 out['problems'].append(
-                    f'confirmatory check {name!r} is not ok')
+                    f'confirmatory check {_prep_repr(name)} is not ok')
     for name in required:
         if name not in checks:
-            out['problems'].append(f'required check {name!r} is absent')
+            out['problems'].append(f'required check {_prep_repr(name)} is absent')
     if clearance.get('launch_allowed') is not (clearance.get('status') == 'ok'):
         out['problems'].append(
             'launch_allowed must equal (status == "ok")')
     if clearance.get('status') not in ('ok', 'warnings', 'fail'):
         out['problems'].append(
-            f'clearance.status={clearance.get("status")!r} is not recognised')
+            f'clearance.status={_prep_repr(clearance.get("status"))} is not recognised')
     if clearance.get('status') == 'ok' and (out['problems'] or out['warnings']):
         out['problems'].append(
             'clearance is marked ok but its checks are not all clean')
@@ -1180,7 +1209,7 @@ def preparation_clearance_timing(clearance, events):
         out['status'] = 'fail'
         out['reconstruction'] = True
         out['problems'].append(
-            f'clearance.created_at={clearance.get("created_at")!r} is later '
+            f'clearance.created_at={_prep_repr(clearance.get("created_at"))} is later '
             f'than the first recorded {first_kind or "event"} at '
             f'{first.isoformat()}; this is a reconstruction')
         return out
@@ -1439,8 +1468,8 @@ def preparation_clearance_audit(
             continue
         if current.get('status') != recorded.get('status'):
             out['problems'].append(
-                f'{name}: recorded status {recorded.get("status")!r} does '
-                f'not reproduce ({current.get("status")!r})')
+                f'{name}: recorded status {_prep_repr(recorded.get("status"))} does '
+                f'not reproduce ({_prep_repr(current.get("status"))})')
             out['status'] = 'fail'
         for key in ('design_protocol_sha256', 'run_order_sha256',
                     'disposition_sha256', 'power_sha256', 'rehearsal_sha256',
