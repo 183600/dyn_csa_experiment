@@ -579,6 +579,12 @@ def audit_lesion(path=None, *, verbose=True):
       per-seed intact/lesion PPL values.  A record without a passed forward
       manipulation check (`changed=True` and `weights_unchanged=True`) is a
       warning, not a pass: a no-op lesion cannot establish inference-time use.
+      Each artifact also gets a family-level Holm correction over its
+      `(component, arm)` panels (`family`), and when more than one artifact is
+      present a second correction pools every panel across artifacts
+      (`family_across_artifacts`).  A single-panel `necessary`/`redundant`
+      verdict that does not survive the family correction is reported as
+      `single_panel_only`, never as a family-level claim.
 
     Missing artifacts return `not_verifiable_locally`; they never fabricate a
     pass.  This gate does not retrain, does not read the test split and does
@@ -626,16 +632,46 @@ def audit_lesion(path=None, *, verbose=True):
         warnings.extend(f'{label}: {w}' for w in (rep.get('warnings') or []))
         if rep.get('status') == 'fail':
             problems.append(f'{label}: lesion panel status=fail')
+    # One scan can collect several artifacts.  Each artifact corrects its own
+    # panels, but a reader who quotes the best panel across artifacts is
+    # running a second (larger) family.  Pool every panel and correct again;
+    # the per-artifact blocks remain visible.  With one artifact the pooled
+    # family is the same calculation, so it is not duplicated.
+    family_across_artifacts = None
+    if len(panels) > 1:
+        flat = {}
+        for label, rep in panels.items():
+            for pname, prow in (rep.get('panels') or {}).items():
+                flat[f'{label}::{pname}'] = prow
+        family_across_artifacts = L.lesion_family_audit(
+            flat, family_source='observed panels across artifacts')
+        if family_across_artifacts.get('status') == 'fail':
+            problems.extend(
+                f'cross-artifact lesion family: {p}'
+                for p in (family_across_artifacts.get('problems') or []))
+        else:
+            warnings.extend(
+                f'cross-artifact lesion family: {w}'
+                for w in (family_across_artifacts.get('warnings') or []))
+            if family_across_artifacts.get('status') == 'warn':
+                warnings.append(
+                    'cross-artifact lesion family: '
+                    f'{len(family_across_artifacts.get("single_panel_only_panels") or [])} '
+                    'single-panel claim(s) do not survive the pooled '
+                    f'{family_across_artifacts.get("family", {}).get("m")}-panel correction')
     if problems:
         status = 'fail'
     elif not panels:
         status = 'not_verifiable_locally'
-    elif any(p.get('status') == 'warn' for p in panels.values()):
+    elif (any(p.get('status') == 'warn' for p in panels.values())
+          or (family_across_artifacts is not None
+              and family_across_artifacts.get('status') == 'warn')):
         status = 'warn'
     else:
         status = 'ok'
     out = {'kind': 'lesion_audit', 'status': status,
            'design': design, 'panels': panels,
+           'family_across_artifacts': family_across_artifacts,
            'artifacts': [os.path.relpath(p, REPO) for p in candidates],
            'problems': problems, 'warnings': warnings,
            'note': ('within-checkpoint lesion only; a between-model on/off '

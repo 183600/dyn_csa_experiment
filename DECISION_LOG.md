@@ -7238,3 +7238,47 @@ necessary 记录。更新 `test_lesion_single_factor.py` 的 shipped 期望表�
 `test_review_part_35.py`、`test_lesion_single_factor.py`、
 `test_lesion_alignment_control.py` 共 22 项通过；`audit_gates.py lesion`
 在无产物时仍返回 `not_verifiable_locally` 且设计门 `status='ok'`。
+
+## 2026-11-05 — 同 checkpoint lesion 是多臂比较：族级 Holm 与单面板/族级判定分家（本轮对比/消融方法硬化，no new runs）
+
+零 GPU；不新增训练、不读取任何 split、不修改
+`confirmation_frozen*.json` 的字节/臂/种子/端点/α/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未删除、未修改、未移动。
+
+**Problem.** `lesion_effect` 对单个 `(component, arm)` 面板做 exact
+sign-flip 与配对 TOST；`lesion_panel_audit` 把一个 artifact 的多个面板
+分别以 α=0.05 判定；`audit_lesion` 又逐个 artifact 报告。于是多面板/
+多 artifact 的 `necessary`/`harmful` 族错误率不受控，而 `redundant` 是
+由 TOST 支持的正向等价性主张，挑一个面板报告会把「组件可删」的错误率
+抬高。n=6 时单面板最小 exact p=0.03125，两个面板的 Holm 下限即 0.0625；
+此前没有任何一层把「单面板可判」与「族级可判」分开。缺 p 的
+underpowered 面板若被静默丢弃，还会把其余面板的 Holm 乘数从 m 缩到 m-1。
+
+**Fix.** 新增 `exp_lib.lesion_family_audit()` 与
+`LESION_FAMILY_POLICY`：对 panel 的 exact sign-flip p 做 superiority
+Holm，对 paired-TOST p 做 equivalence Holm（阈值取
+`tost.alpha_one_sided=(1-conf)/2`，同族不一致时取最保守值并 warning）。
+无可用 p 的面板仍占一个 p=1 槽位；`inert` 只走操作频道，不强行进
+outcome 族。新增 `family_verdict`/`family_claim_allowed`/
+`family_claim`/`p_holm_superiority`/`p_holm_equivalence` 与每面板
+`resolution_limited=m*p_floor>alpha`；单面板显著但族级不过门时降为
+`single_panel_only`，`status='warn'`，不改写原 `verdict`/
+`claim_allowed`。artifact 可用 `family: [panel ids]` 声明族；声明外
+面板标 `not_in_declared_family`，未知/重复/空/错误类型 fail-closed；
+未声明时用观察到的面板并记 `declared=false`。`lesion_panel_audit` 自动
+附带 artifact 内族；`audit_lesion` 在多于一个 artifact 时再算
+`family_across_artifacts`，避免跨文件挑选绕过校正。
+
+**Boundary.** 只重放已落盘逐种子配对差，不新增 p 值、不进入冻结
+Holm 族、不改变 `verified`/`confirmed`/max-T、不改变 between-model
+消融判定，也不重算旧面板或合并不同 checkpoint。没有 `family` 声明时
+的族是事后族，不能写成预注册；`single_panel_only` 是分辨率/校正结论，
+不是「组件不重要」。
+
+**Verification.** 新增 `test_lesion_family_correction.py` 10 项：两个
+n=6 面板 p=0.03125 → 族 Holm 0.0625、均 single_panel_only；n=8 族
+claim 通过；redundant 走 TOST 族；两个族不互相替代；声明族排除项；
+未知/重复/空/错误类型 fail-closed；underpowered 占槽；单面板族；
+非 mapping/空族；跨两 artifact 的 m=2 族降级。现有 lesion/单因素/
+alignment 测试 22 项通过，`audit_gates.py lesion` 无产物时仍返回
+`not_verifiable_locally` 且设计门 `status='ok'`。

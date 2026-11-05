@@ -14264,3 +14264,115 @@ warmup 协议声明只差 `warm_steps`、第二协议轴 refuse；
 且带 `single_factor=True`/`factor_declaration_verified=True`；聚合
 `audit_single_factor` 的 `topk_budget_contrasts`/`warmup_contrasts`/
 `v7_contrasts` 均为 ok。完整 CPU 套件在本轮最终树通过。
+
+## 146. 同 checkpoint lesion 是多臂比较：族级 Holm 与单面板/族级判定分家（本轮对比/消融方法硬化，no new runs）
+
+零 GPU；不新增训练、不读取任何 split、不修改
+`confirmation_frozen*.json` 的字节/臂/种子/端点/α/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未删除、未修改、未移动。
+
+### 146.1 问题：lesion 阶梯没有被当作一个比较族
+
+§97 把「训练时去掉模块」和「同一 checkpoint 推理时 lesion」分成两条证据
+频道。`lesion_effect()` 对**一个** `(component, arm)` 面板给出 exact
+sign-flip p 与配对 TOST：前者支持 necessary/harmful，后者支持
+redundant（在 SESOI 内等价）。但一个 `lesion.json` 可以同时包含
+`attention_sink/csa_fixed`、`attention_sink/csa_dynamic`、
+`content_pooling/...` 等多个面板；`audit_gates.py lesion` 还会扫描多个
+`results_*/lesion.json`。此前每个面板都在名义 α=0.05 上独立判定，于是：
+
+1. **`necessary` / `harmful` 的族错误率不受控。** 看 4 个面板、只引用最
+   显著的一个，和事先只测一个面板不是同一个实验；n=6 时单面板最小
+   exact p 已经是 0.03125，两个面板的 Holm 下限就是 0.0625，必须把
+   「单面板可判」和「族级可判」分开。
+2. **`redundant` 是正向的等价性主张，更需要校正。** 「未拒绝零」不是
+   等价；`redundant` 由 TOST 支持。多面板各自做 TOST 再挑一个报告，会
+   把等价性主张的错误率抬高到 1-(1-α)^m 量级，而这类错误会直接支持
+   「组件可以删」。
+3. **跨 artifact 扫描绕过了单 artifact 内的校正。** `audit_lesion` 逐个
+   文件报告，两个文件各有一个 `necessary` 面板时，此前没有任何一层把
+   它们放进同一个族。
+4. **缺 p 的面板不能缩小校正族。** 一个 underpowered 或没有 TOST 的
+   面板如果被静默丢弃，其余面板的 Holm 乘数会从 m 变成 m-1，正好把
+   「没测到」变成「更容易显著」。
+
+这和 §136/§143 的消融归因、§142 的跨 panel FDR 是同一类问题：**单个
+对比的定义正确，不等于多面板主张的族水平正确**。
+
+### 146.2 方法：superiority 与 equivalence 两个族，单面板与族级并列
+
+新增 `exp_lib.lesion_family_audit(panels, *, alpha, family, family_source)`：
+
+- **superiority 族**：对每个面板的二维 exact sign-flip p 做
+  `holm_adjust`。只有 `p_holm <= alpha` 的
+  `necessary` / `harmful` / `engaged_below_sesoi` 才保留为族级判定。
+- **equivalence 族**：对每个面板的 paired-TOST p 做 `holm_adjust`。
+  阈值不是写死的 0.05，而是面板 `tost.alpha_one_sided = (1-conf)/2`；
+  若同族面板的 TOST 置信水平不一致，取**最保守**的一个并写 warning。
+  只有族级 TOST p 小于该阈值的 `redundant` 才保留。
+- **缺失占槽**：没有可用 p 的面板仍然传给 `holm_adjust`（按 p=1 处理），
+  所以 underpowered/not_checked 面板也会让其余面板的乘数保持 m。
+- **`inert` 不进 outcome 族**：它是「lesion 没有改变前向」的操作频道
+  判定，不是 PPL 的 p 值主张。`invalid` / `not_checked` /
+  `underpowered` / `inconclusive` 本来就不允许 claim。
+- **声明族**：artifact 可带 `family: [panel ids]`。声明之外的 panel 被
+  标为 `not_in_declared_family`，不能获得族级 claim；未知/重复/空族
+  fail-closed（拼写错误不能悄悄缩小 m）。没有声明时，把**观察到的**
+  面板当作族，并显式记 `declared=false`、`source='observed panels'`。
+- **不改写单面板字段**：`verdict`/`claim_allowed` 保持原样；新增
+  `family_verdict`、`family_claim_allowed`、`family_claim`、
+  `p_holm_superiority`、`p_holm_equivalence`。单面板显著但族级不显著时，
+  `family_verdict='single_panel_only'`，`status='warn'`，而不是假装没有
+  这个读数。
+
+`lesion_panel_audit()` 在返回前自动附带 artifact 内族块；`audit_lesion()`
+在扫描到多于一个 artifact 时，把所有 `label::panel` 再放进一个
+`family_across_artifacts` 族。两个族都只是重放已落盘的逐种子配对差，不
+新增 p 值、不进入冻结 Holm 族、不改变任何 between-model 消融判定。
+
+### 146.3 分辨率：族下限要显式写出来
+
+族块对每个面板给出 `p_floor` 与
+`resolution_limited = (m * p_floor > alpha)`。这正是 §136 的
+`holm_min_attainable_p` 在 lesion 上的读数：n=6、m=2 时任何效应量都
+无法过族门（0.0625 > 0.05），报告必须说「分辨率不足」，而不是把
+`single_panel_only` 读成「组件不重要」。族块同时给出
+`min_n_for_alpha`：m=2、α=0.05 时为 n=7（2×2/2^7=0.03125）；n=8 当然
+也可过。
+这与 2x2 功效门、冻结族 min-n 门使用同一套离散分辨率语言。
+
+### 146.4 边界
+
+- 它不产生新的确认性检验，不进入 `confirmation_frozen*.json` 的 Holm
+  族，不改变 `verified`/`confirmed`/max-T 或任何冻结判定。
+- 它不重算旧面板、不回填缺失记录、不把跨 artifact 的不同 checkpoint
+  合并成更多独立样本；族只控制「同时读了多少个面板」。
+- 族成员资格仍然受选择问题影响。没有 `family` 声明时，
+  `declared=false` 只是把「观察到的面板」作为事后族，不能等同于预注册；
+  报告不能把 `declared=false` 的族级 claim 说成预注册结论。
+- 它不替代 §97 的 operation check，也不替代 §131 的单因素设计门；一个
+  面板仍要先有 passed manipulation check 才有 outcome claim。
+
+### 146.5 入口与验证
+
+```bash
+python -m pytest -q test_lesion_family_correction.py
+python -m pytest -q test_lesion_single_factor.py test_lesion_alignment_control.py test_review_part_35.py
+python audit_gates.py lesion                 # 无产物时仍 not_verifiable_locally
+python audit_gates.py lesion PANEL/lesion.json
+```
+
+新增 `test_lesion_family_correction.py` 10 项：两个 n=6 面板各自
+p=0.03125、族 Holm 0.0625，二者都降为 `single_panel_only` 且不谎报；
+n=8 时族 claim 通过；redundant 走 TOST 族；superiority 与 equivalence
+两个族互不替代；声明族排除的面板标 `not_in_declared_family`；未知/
+重复/空/错误类型的族声明 fail-closed；underpowered 面板仍占槽；
+单面板族不被自身惩罚；非 mapping/空族；跨两个 artifact 的扫描把两个
+单面板 claim 合并成一个 m=2 族并降为 `single_panel_only`。
+现有 lesion/单因素/alignment 测试 22 项与完整 CPU 套件在本轮最终树通过。
+
+补充：superiority 与 equivalence 是**两个分别以 α 控制的族**，不是把两类
+claim 合并后的单一族。因此本块不声称「一轮 lesion 中至少一个
+necessary/redundant 主张」的联合 FWER ≤ α；要支持这种更强的联合主张，
+需要在看结果前把 α 拆到两个族（例如各 α/2）或另做联合 max-T。这里只
+把「每个族内部」的多重性说清楚，避免把两个 α 当成一个 α。

@@ -252,10 +252,12 @@
                functional_ablation（零 GPU，不读 results_*）
   lesion       同 checkpoint 的推理期 lesion：声明组件可构造/可干预、
                权重不变的操作检查，以及逐种子 intact/lesion PPL 的
-               necessary/harmful/redundant/inert 判定；缺 checkpoint 或
-               操作检查不进 pass，缺产物报 not_verifiable（零 GPU，
-               不重训、不读 test split）；别名 inference_lesion /
-               lesion_panel / component_lesion
+               necessary/harmful/redundant/inert 判定；多面板/多 artifact
+               再套一层 Holm（superiority 与 TOST 两个族），未过族校正的
+               单面板判定降为 single_panel_only；缺 checkpoint 或操作检查
+               不进 pass，缺产物报 not_verifiable（零 GPU，不重训、不读
+               test split）；别名 inference_lesion / lesion_panel /
+               component_lesion
   endpoint_selection  端点来源：逐记录核验引用的是固定最终步、验证集最佳步、
                早停步还是截断步；跨臂规则不一致/同臂内混规则/选点与评测同一
                split/checkpoint 步不符判 fail，数据依赖选点但独立 split 已声明
