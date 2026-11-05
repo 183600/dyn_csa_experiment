@@ -102,3 +102,19 @@ def test_unhashable_present_arm_collection_fails_closed():
     assert rep['complete'] is False, rep
     assert rep['structural_errors'], rep
     json.dumps(rep, allow_nan=False)
+
+
+def test_unreportable_factorial_count_is_withheld_not_serialised():
+    # 2**20000 has more digits than CPython will convert to decimal.  The
+    # audit must still return a strict-JSON verdict: the count is unavailable,
+    # its bit length is recorded, and completeness is not claimed.
+    comps = _components(20000)
+    arms = {(): 'none'}
+    arms.update({(c,): 'only-' + c for c in comps})
+    rep = L.ablation_completeness_audit(arms_by_combo=arms)
+    assert rep['n_required'] is None, rep
+    assert rep['n_required_available'] is False, rep
+    assert rep['n_required_bits'] == 20001, rep
+    assert rep['missing_combos_count'] is None, rep
+    assert rep['complete'] is False, rep
+    json.dumps(rep, allow_nan=False)

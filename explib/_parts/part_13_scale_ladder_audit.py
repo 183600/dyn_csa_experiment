@@ -82,27 +82,27 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
     _tol_raw = (policy.get('tokens_per_param_tolerance', 0.25)
                 if tolerance is None else tolerance)
     if isinstance(_tol_raw, (bool, np.bool_)):
-        raise ValueError(f'tokens_per_param_tolerance must be a non-negative real number, got {_tol_raw!r}')
+        raise ValueError(f'tokens_per_param_tolerance must be a non-negative real number, got {_safe_repr(_tol_raw)}')
     try:
         tol = float(_tol_raw)
     except (TypeError, ValueError, OverflowError):
-        raise ValueError(f'tokens_per_param_tolerance must be a non-negative real number, got {_tol_raw!r}') from None
+        raise ValueError(f'tokens_per_param_tolerance must be a non-negative real number, got {_safe_repr(_tol_raw)}') from None
     if not math.isfinite(tol) or tol < 0.0:
-        raise ValueError(f'tokens_per_param_tolerance must be a finite non-negative number, got {_tol_raw!r}')
+        raise ValueError(f'tokens_per_param_tolerance must be a finite non-negative number, got {_safe_repr(_tol_raw)}')
 
     def _as_int(value, label, *, allow_none=False):
         if value is None and allow_none:
             return None
         if isinstance(value, (bool, np.bool_)):
-            raise ValueError(f'{label} must be an integer, got {value!r}')
+            raise ValueError(f'{label} must be an integer, got {_safe_repr(value)}')
         if isinstance(value, numbers.Integral):
             return int(value)
         if isinstance(value, numbers.Real):
             as_float = float(value)
             if not math.isfinite(as_float) or as_float != math.floor(as_float):
-                raise ValueError(f'{label} must be an integer, got {value!r}')
+                raise ValueError(f'{label} must be an integer, got {_safe_repr(value)}')
             return int(as_float)
-        raise ValueError(f'{label} must be an integer, got {value!r}')
+        raise ValueError(f'{label} must be an integer, got {_safe_repr(value)}')
 
     problems, warnings, rows = [], [], []
     try:
@@ -145,11 +145,23 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
                 try:
                     _v = _as_int(_v, f'{name}.vocab')
                 except (TypeError, ValueError, OverflowError):
-                    problems.append(f'{name}: vocab={_v!r} is not an integer')
+                    problems.append(f'{name}: vocab={_safe_repr(_v)} is not an integer')
                     continue
                 if _v <= 0:
-                    problems.append(f'{name}: vocab={_v!r} must be positive')
+                    problems.append(f'{name}: vocab={_safe_repr(_v)} must be positive')
                     continue
+            if (isinstance(_v, numbers.Integral)
+                    and not isinstance(_v, (bool, np.bool_))
+                    and abs(int(_v)) > SCALE_LADDER_MAX_REPORTABLE_INT):
+                # An exact identity is still untrusted JSON.  Beyond the
+                # reportable integer bound the audit could not serialise its
+                # own declaration, so name the field and keep the tier's other
+                # fields auditable instead of emitting an unprintable int.
+                problems.append(
+                    f'{name}: {_fpk} exceeds the reportable integer bound '
+                    '10**4000; the audit cannot serialise this plan as exact '
+                    'JSON')
+                continue
             row[_fpk] = _v
         try:
             steps = _as_int(cfg['steps'], 'steps')
@@ -217,7 +229,7 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
         if warmup < 0:
             problems.append(f'{name}: warmup={warmup} must be non-negative')
         if lr is None or not (math.isfinite(lr) and lr > 0):
-            problems.append(f'{name}: lr={cfg.get("lr")!r} is not a positive finite number')
+            problems.append(f'{name}: lr={_safe_repr(cfg.get("lr"))} is not a positive finite number')
         effective_tokens = steps * batch * seq
         _overflowing = [
             (label, value) for label, value in (
@@ -246,7 +258,7 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
         try:
             params = _as_int(params, 'params', allow_none=True)
         except (TypeError, ValueError, OverflowError):
-            problems.append(f'{name}: params={params!r} is not an integer')
+            problems.append(f'{name}: params={_safe_repr(params)} is not an integer')
             params = None
         if params is not None and params <= 0:
             problems.append(f'{name}: params must be positive')
@@ -406,7 +418,7 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
             if len(_vals) >= 2 and len(set(map(str, _vals))) > 1:
                 problems.append(
                     f'tiers do not share one {_what}: '
-                    + ', '.join(f'{r["name"]}={r[_fpk]!r}' for r in rows if r.get(_fpk) is not None)
+                    + ', '.join(f'{r["name"]}={_safe_repr(r[_fpk])}' for r in rows if r.get(_fpk) is not None)
                     + ' — cross-tier PPL/log-ratio contrasts are not defined across '
                       'different tokenisations/corpora; run each tier on the same '
                       'corpus/tokenizer or report the tiers separately')
@@ -628,19 +640,19 @@ def crossover_scaling_fit(entries, *, min_points=4, volume_tol=0.25,
     # silently change which fits are allowed.  Refuse instead of coercing.
     _min_pts = _as_seed_int(min_points)
     if _min_pts is None or _min_pts < 2:
-        raise ValueError(f'min_points must be an integer >= 2, got {min_points!r}')
+        raise ValueError(f'min_points must be an integer >= 2, got {_safe_repr(min_points)}')
     min_points = _min_pts
     for _name, _value, _check in (
             ('volume_tol', volume_tol, lambda v: math.isfinite(v) and v >= 0.0),
             ('d_spread_min', d_spread_min, lambda v: math.isfinite(v) and v > 1.0)):
         if isinstance(_value, (bool, np.bool_)):
-            raise ValueError(f'{_name} must be a real number, got {_value!r}')
+            raise ValueError(f'{_name} must be a real number, got {_safe_repr(_value)}')
         try:
             _fv = float(_value)
         except (TypeError, ValueError, OverflowError):
-            raise ValueError(f'{_name} must be a real number, got {_value!r}') from None
+            raise ValueError(f'{_name} must be a real number, got {_safe_repr(_value)}') from None
         if not _check(_fv):
-            raise ValueError(f'{_name} has an invalid value {_value!r}')
+            raise ValueError(f'{_name} has an invalid value {_safe_repr(_value)}')
     volume_tol = float(volume_tol)
     d_spread_min = float(d_spread_min)
     rows = []
@@ -918,11 +930,11 @@ def _seed_value(v, *, where='seed'):
     """
     s = _as_seed_int(v)
     if s is None:
-        raise ValueError(f'{where} must be an integer, got {v!r}')
+        raise ValueError(f'{where} must be an integer, got {_safe_repr(v)}')
     if s < 0 or s > MAX_SEED:
         raise ValueError(
             f'{where} must be in [0, {MAX_SEED}] (the NumPy/PyTorch/DataLoader '
-            f'common seed domain), got {s}')
+            f'common seed domain), got {_safe_repr(s)}')
     return s
 
 
@@ -1971,13 +1983,13 @@ def single_factor_initialization_audit(design=None, *, factory=None,
     if _nl is None or _nl < 1:
         raise ValueError(
             f'single_factor_initialization_audit: n_layers must be a positive '
-            f'integer, got {n_layers!r}')
+            f'integer, got {_safe_repr(n_layers)}')
     n_layers = int(_nl)
     _seed = _as_seed_int(seed)
     if _seed is None or _seed < 0:
         raise ValueError(
             f'single_factor_initialization_audit: seed must be a non-negative '
-            f'integer, got {seed!r}')
+            f'integer, got {_safe_repr(seed)}')
     seed = int(_seed)
     cfg_rep = single_factor_design_audit(
         design, baseline_design=baseline_design, factory=factory,

@@ -128,3 +128,16 @@ def test_protocol_gate_and_metadata_attach_survive_malformed_containers():
     record = {'single_factor': True}
     L.attach_probe_factor_metadata(record, 'x', {'pairs': ['bad']})
     assert record['single_factor'] is False
+
+
+def test_scale_ladder_unprintable_identity_counts_stay_json_safe():
+    huge = 10 ** 10000
+    base = {'steps': 1, 'batch_size': 1, 'seq_len': 1,
+            'n_train_tokens': 1, 'lr': 1e-3, 'warmup': 0, 'seeds': [0]}
+    for field in ('vocab', 'corpus_fp', 'fit_fp'):
+        cfg = dict(base, **{field: huge})
+        out = L.scale_ladder_audit([{'name': 'a', 'cfg': cfg, 'params': 1}])
+        assert out['status'] == 'fail', (field, out)
+        assert any(field in p and 'reportable integer bound' in p
+                   for p in out['problems']), (field, out['problems'])
+        json.dumps(out, allow_nan=False)

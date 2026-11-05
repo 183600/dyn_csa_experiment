@@ -112,8 +112,8 @@ def _scale_points(points):
             # mis-pairing scale points.
             _norm_seeds = [_as_seed_int(s) for s in seeds]
             if any(s is None for s in _norm_seeds):
-                raise ValueError('scale point %r: seeds must be integers, got %r'
-                                 % (label, seeds))
+                raise ValueError('scale point %s: seeds must be integers, got %s'
+                                 % (_safe_repr(label), _safe_repr(seeds)))
             seeds = _norm_seeds
             keep = [(s, f) for s, f in ((s, _finite_scalar(v)) for s, v in zip(seeds, vals))
                     if f is not None]
@@ -123,7 +123,8 @@ def _scale_points(points):
             # A repeated seed would be counted as two independent observations
             # and shrink every within-scale SE in meta_analyze_effects; this
             # must be a hard error, not silently "n looks larger".
-            raise ValueError('scale point %r: duplicate seeds %r' % (label, seeds_kept))
+            raise ValueError('scale point %s: duplicate seeds %s'
+                             % (_safe_repr(label), _safe_repr(seeds_kept)))
         # Attrition is part of the estimate's identity.  A point built from a
         # complete-case subset must say so; otherwise the random-effects
         # weights and the trend treat a selectively missing seed as if it
@@ -142,12 +143,12 @@ def _scale_points(points):
                 raise ValueError('scale point %r: planned_seeds must be an '
                                  'iterable, got %r' % (label, planned_seeds)) from None
             if any(v is None for v in _ps):
-                raise ValueError('scale point %r: planned_seeds must be integers, got %r'
-                                 % (label, planned_seeds))
+                raise ValueError('scale point %s: planned_seeds must be integers, got %s'
+                                 % (_safe_repr(label), _safe_repr(planned_seeds)))
             _planned_set = set(_ps)
             if len(_planned_set) != len(_ps):
-                raise ValueError('scale point %r: duplicate planned_seeds %r'
-                                 % (label, planned_seeds))
+                raise ValueError('scale point %s: duplicate planned_seeds %s'
+                                 % (_safe_repr(label), _safe_repr(planned_seeds)))
             if n_planned is not None and _as_seed_int(n_planned) != len(_planned_set):
                 raise ValueError('scale point %r: n_planned=%r disagrees with '
                                  'planned_seeds length %d'
@@ -287,7 +288,7 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3,
     alpha = _validated_alpha(alpha, context='meta_analyze_effects alpha')
     _min_seeds = _as_seed_int(min_seeds)
     if _min_seeds is None or _min_seeds < 0:
-        raise ValueError(f'min_seeds must be a non-negative integer, got {min_seeds!r}')
+        raise ValueError(f'min_seeds must be a non-negative integer, got {_safe_repr(min_seeds)}')
     min_seeds = _min_seeds
     _pair_limit = (None if _seed_pair_detail_limit is None
                    else _as_seed_int(_seed_pair_detail_limit))
@@ -869,12 +870,14 @@ def scale_interaction(low_effects, high_effects, *, low_label='low', high_label=
         raise ValueError('scale_interaction seeds length does not match effects')
     _norm_ss = [_as_seed_int(s) for s in ss]
     if any(s is None for s in _norm_ss):
-        raise ValueError('scale_interaction seeds must be integers, got %r' % (ss,))
+        raise ValueError('scale_interaction seeds must be integers, got %s'
+                         % (_safe_repr(ss),))
     ss = _norm_ss
     if len(set(ss)) != len(ss):
         # A repeated seed would enter paired_effect_stats as two independent
         # observations and shrink the interaction SE.
-        raise ValueError('scale_interaction got duplicate seeds %r' % (ss,))
+        raise ValueError('scale_interaction got duplicate seeds %s'
+                         % (_safe_repr(ss),))
     diff, kept = [], []
     for s, x, y in zip(ss, a, b):
         # Use the repository-wide measurement contract: booleans, complex
@@ -1264,9 +1267,9 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3,
     _min_seeds = _as_seed_int(min_seeds)
     _min_points = _as_seed_int(min_points)
     if _min_seeds is None or _min_seeds < 0:
-        raise ValueError(f'min_seeds must be a non-negative integer, got {min_seeds!r}')
+        raise ValueError(f'min_seeds must be a non-negative integer, got {_safe_repr(min_seeds)}')
     if _min_points is None or _min_points < 1:
-        raise ValueError(f'min_points must be a positive integer, got {min_points!r}')
+        raise ValueError(f'min_points must be a positive integer, got {_safe_repr(min_points)}')
     min_seeds, min_points = _min_seeds, _min_points
     _pair_limit = (SCALING_TREND_PAIR_DETAIL_LIMIT
                    if pair_detail_limit is None
@@ -1287,10 +1290,12 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3,
     pts.sort(key=lambda p: p['scale'])
     _all_labels = [p['label'] for p in _parsed_pts]
     if len(set(_all_labels)) != len(_all_labels):
-        raise ValueError('scaling_trend needs unique scale labels; got %r' % (_all_labels,))
+        raise ValueError('scaling_trend needs unique scale labels; got %s'
+                         % (_safe_repr(_all_labels),))
     for p in pts:
         if len(set(p['seeds'])) != len(p['seeds']):
-            raise ValueError('scale point %r has duplicate seeds %r' % (p['label'], p['seeds']))
+            raise ValueError('scale point %s has duplicate seeds %s'
+                             % (_safe_repr(p['label']), _safe_repr(p['seeds'])))
     _empty_points = [p['label'] for p in pts if not p['effects']]
     _incomplete_points = [p['label'] for p in pts if p.get('complete_pairs') is False]
     _attrition = {p['label']: {'n_dropped': p.get('n_dropped'),

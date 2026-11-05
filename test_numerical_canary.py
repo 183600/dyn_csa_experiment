@@ -303,3 +303,63 @@ def test_wiring_and_no_forbidden_mutation():
         assert 'part_48_audit_numerical_canary.py' in handle.read()
     for name in ('README.md', 'README_zh.md', '.github'):
         assert os.path.exists(os.path.join(REPO, name)), name
+
+
+def test_canary_malformed_fields_fail_closed_and_stay_strict_json():
+    """A hand-edited canary is untrusted JSON.
+
+    Python integers can exceed CPython's decimal-conversion limit and dtype
+    fields can be unhashable.  Validation must report these as ordinary
+    problems instead of raising while formatting the diagnostic.
+    """
+    huge = 10 ** 10000
+    art = L.build_numerical_canary_artifact(seed=2, size=5,
+                                            created_at='2026-01-01T00:00:00')
+    cases = []
+    for path, value in (
+            (('kind',), huge),
+            (('schema',), huge),
+            (('result', 'kind'), huge),
+            (('result', 'status'), huge),
+            (('result', 'schema'), True),
+            (('result', 'params', 'seed'), huge),
+            (('result', 'params', 'size'), huge),
+            (('result', 'params', 'dtype'), [huge]),
+            (('result', 'params', 'device'), 'cpufoo'),
+            (('result', 'arithmetic', 'schema'), True),
+            (('result', 'arithmetic', 'ops'), {huge: {'sha256': 'x'}}),
+            (('result', 'environment',), {huge: huge})):
+        bad = copy.deepcopy(art)
+        node = bad
+        for key in path[:-1]:
+            node = node[key]
+        node[path[-1]] = value
+        cases.append((path, bad))
+    for path, bad in cases:
+        verdict = L.validate_numerical_canary_artifact(bad, replay=False)
+        assert verdict['status'] == 'fail', (path, verdict)
+        assert verdict['problems'], (path, verdict)
+        json.dumps(verdict, allow_nan=False)
+
+    # A comparison over a malformed (but not hashed) result must also stay
+    # serialisable when its environment keys are unprintable integers.
+    base = L.numerical_canary(seed=2, size=5)
+    broken = copy.deepcopy(base)
+    broken['environment'] = {huge: huge}
+    compared = L.compare_numerical_canaries(broken, base)
+    json.dumps(compared, allow_nan=False)
+
+
+def test_canary_builder_and_cli_reject_malformed_inputs_cleanly():
+    base = L.numerical_canary(seed=2, size=5)
+    bad = copy.deepcopy(base)
+    bad['params']['size'] = 10 ** 10000
+    try:
+        L.build_numerical_canary_artifact(result=bad)
+    except ValueError as exc:
+        assert 'malformed result' in str(exc), exc
+    else:
+        raise AssertionError('builder accepted a malformed result')
+    with tempfile.TemporaryDirectory() as td:
+        with contextlib.redirect_stdout(io.StringIO()):
+            assert L._nc_cli(['--write', '--out', '']) == 2

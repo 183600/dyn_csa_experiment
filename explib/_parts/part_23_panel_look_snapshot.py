@@ -1708,6 +1708,12 @@ def _scope_design(design, present):
 # derives the same completeness verdict/count without materialising the table;
 # a missing list would be exponentially large, so it is reported as truncated.
 _ABLATION_FACTORIAL_ENUM_MAX_COMBOS = 1 << 16
+# CPython refuses to decimalise an integer with more than ~4300 digits, so a
+# report carrying ``2**k`` for thousands of components cannot even be written
+# as JSON.  Keep the exact count for every ordinary (and moderately oversized)
+# factorial; above this bit width report the count as unavailable plus its
+# bit length instead of emitting an unprintable integer.
+_ABLATION_FACTORIAL_MAX_REPORTABLE_BITS = 14000
 
 
 def ablation_completeness_audit(design=None, present=None, *, arms_by_combo=None,
@@ -1823,8 +1829,13 @@ def ablation_completeness_audit(design=None, present=None, *, arms_by_combo=None
         # enumeration for ordinary panels, but for a large family derive the
         # same counts structurally and report the missing cells as truncated
         # rather than silently claiming the unenumerated remainder is absent.
-        _n_possible = 1 << len(components)
-        _enumerate = _n_possible <= _ABLATION_FACTORIAL_ENUM_MAX_COMBOS
+        _k_components = len(components)
+        _count_reportable = (_k_components
+                             <= _ABLATION_FACTORIAL_MAX_REPORTABLE_BITS)
+        _n_possible = ((1 << _k_components) if _count_reportable else None)
+        _enumerate = bool(
+            _count_reportable
+            and _n_possible <= _ABLATION_FACTORIAL_ENUM_MAX_COMBOS)
         mapped_set = set(combos)
         if _enumerate:
             required = []
@@ -1840,7 +1851,8 @@ def ablation_completeness_audit(design=None, present=None, *, arms_by_combo=None
             # example ``"A+A"``) is not a subset and was an "extra" before.
             extra = sorted(c for c in mapped_set if len(set(c)) != len(c))
             _valid_mapped = mapped_set - set(extra)
-            _n_missing = _n_possible - len(_valid_mapped)
+            _n_missing = (_n_possible - len(_valid_mapped)
+                          if _count_reportable else None)
             missing = []
         duplicate = sorted(c for c, arms in combos.items() if len(arms) > 1)
         absent = []
@@ -1860,14 +1872,21 @@ def ablation_completeness_audit(design=None, present=None, *, arms_by_combo=None
         out.update({
             'components': components,
             'n_required': (len(required) if required is not None
-                           else int(_n_possible)),
+                           else (int(_n_possible)
+                                 if _n_possible is not None else None)),
+            'n_required_bits': (int(_k_components + 1)
+                                if _k_components > 0 else 0),
+            'n_required_available': bool(
+                required is not None or _n_possible is not None),
             'n_mapped': len(combos),
             'missing_combos': [list(c) for c in missing],
             # A bounded scan cannot name an exponentially large missing set.
-            # Keep the count exact; the list is explicitly marked truncated so
-            # the caller cannot read [] as "nothing is missing".
+            # Keep the count exact when it is representable; the list is
+            # explicitly marked truncated so the caller cannot read [] as
+            # "nothing is missing".
             'missing_combos_count': (len(missing) if required is not None
-                                     else int(_n_missing)),
+                                     else (int(_n_missing)
+                                           if _n_missing is not None else None)),
             'missing_combos_truncated': bool(required is None),
             'extra_combos': [list(c) for c in extra],
             'duplicate_combos': [list(c) for c in duplicate],
@@ -1875,7 +1894,8 @@ def ablation_completeness_audit(design=None, present=None, *, arms_by_combo=None
             'missing_arms': absent,
             'arms': {('+'.join(c) if c else 'none'): sorted(set(a)) for c, a in combos.items()},
         })
-        _missing_any = bool(_n_missing) if required is None else bool(missing)
+        _missing_any = ((bool(_n_missing) if _n_missing is not None else True)
+                        if required is None else bool(missing))
         out['complete'] = bool(len(components) >= 1 and not _missing_any
                                and not extra and not duplicate and not absent
                                and not reused and not out['structural_errors'])
@@ -1887,10 +1907,15 @@ def ablation_completeness_audit(design=None, present=None, *, arms_by_combo=None
         if verbose:
             _missing_text = (['+'.join(c) or 'none' for c in missing]
                              if required is not None else
-                             [f'{int(_n_missing)} combination(s) not enumerated'])
+                             [(f'{int(_n_missing)} combination(s) not enumerated'
+                               if _n_missing is not None else
+                               'an unrepresentably large number of combination(s) '
+                               'not enumerated')])
             print('[ablation] full-factorial components=%s mapped=%d/%d missing=%s%s'
                   % (components, len(combos),
-                     len(required) if required is not None else int(_n_possible),
+                     (len(required) if required is not None
+                      else (_n_possible if _n_possible is not None
+                            else _safe_text(_k_components))),
                      _missing_text or 'none',
                      (' reused_arms=%s' % (sorted(reused) or 'none')) if reused else ''))
         return out

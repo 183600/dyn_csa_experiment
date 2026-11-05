@@ -77,3 +77,17 @@ def test_huge_numeric_tamper_does_not_abort_replay():
     assert verdict['status'] == 'fail'
     # The verdict itself must stay serialisable.
     json.dumps(verdict, allow_nan=False)
+
+
+def test_unreportable_lattice_cell_count_is_withheld_not_serialised():
+    comps = [f'c{i}' for i in range(20000)]
+    out = L.ablation_lattice_design(components=comps, arms_by_subset={})
+    assert out['status'] == 'not_estimable', out
+    assert out['global']['full_lattice_cells'] is None, out
+    assert out['global']['full_lattice_cells_bits'] == 20001, out
+    assert out['global']['full_lattice_cells_available'] is False, out
+    json.dumps(out, allow_nan=False)
+
+    shapley = L.shapley_lattice_attribution({}, components=comps, min_n=1)
+    assert shapley['status'] == 'not_estimable', shapley
+    json.dumps(shapley, allow_nan=False)

@@ -43,6 +43,28 @@ AL_LATTICE_KIND = 'ablation_lattice'
 AL_LATTICE_SCHEMA = 1
 AL_LATTICE_MAX_COMPONENTS = 6
 AL_LATTICE_TOL = 1e-9
+# CPython cannot decimalise an integer above ~4300 digits.  A malformed
+# declaration can name thousands of components; reporting ``2**k`` for it
+# would make the audit verdict itself unserialisable.  Above this width the
+# exact cell count is withheld (with its bit length recorded) rather than
+# emitted as an unprintable integer.
+AL_LATTICE_MAX_REPORTABLE_BITS = 14000
+
+
+def _al_lattice_cells(k):
+    """Exact ``2**k`` cells, or None when the integer is not reportable."""
+    k = int(k)
+    if k <= AL_LATTICE_MAX_REPORTABLE_BITS:
+        return 1 << k
+    return None
+
+
+def _al_lattice_cells_text(k):
+    """Human-readable cell count without materialising an unprintable int."""
+    cells = _al_lattice_cells(k)
+    if cells is not None:
+        return str(cells)
+    return f'2**{int(k)} (beyond the reportable integer representation)'
 
 AL_LATTICE_POLICY = {
     'estimand': ('exact Shapley value on the complete subset lattice of the '
@@ -540,7 +562,7 @@ def shapley_lattice_attribution(
     if k > _max_k:
         base['problems'].append(
             f'{k} components exceed max_components={_max_k}; the full lattice '
-            f'would need {2 ** k} cells')
+            f'would need {_al_lattice_cells_text(k)} cells')
         base['status'] = 'not_estimable'
         return base
     expected = _al_all_subsets(comps)
@@ -1181,9 +1203,13 @@ def ablation_lattice_design(components=None, *, arms_by_subset=None,
             out['status'] = 'not_estimable'
             out['problems'].append(
                 f'{len(comps)} components exceed max_components={_max_k}')
-            out['global'] = {'components': comps, 'n_components': len(comps),
-                             'full_lattice_cells': 2 ** len(comps),
-                             'shapley_identifiable': False}
+            out['global'] = {
+                'components': comps, 'n_components': len(comps),
+                'full_lattice_cells': _al_lattice_cells(len(comps)),
+                'full_lattice_cells_bits': int(len(comps) + 1),
+                'full_lattice_cells_available': bool(
+                    len(comps) <= AL_LATTICE_MAX_REPORTABLE_BITS),
+                'shapley_identifiable': False}
             return out
         if not isinstance(arms_by_subset, dict):
             out['status'] = 'fail'

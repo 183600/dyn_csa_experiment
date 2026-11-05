@@ -34,6 +34,58 @@ NC_PROVENANCE_KEYS = ('code_semantics', 'code_stamp', 'source_tree',
                       'env_fp_v2', 'env_fp_v3', 'lock_sha256')
 
 
+def _nc_repr(value, limit=240):
+    """Bounded, exception-safe repr for untrusted artifact fields.
+
+    A malformed canary can carry a Python integer beyond CPython 3.12's
+    decimal-conversion limit.  Formatting it with ``!r`` while trying to
+    *report* the defect raises instead of returning a verdict.  Use the
+    repository-wide bounded repr for every untrusted diagnostic value and key.
+    """
+    return _safe_repr(value, limit=limit)  # noqa: F821 (part_00)
+
+
+def _nc_text(value, limit=240):
+    """Bounded, exception-safe ``str`` for diagnostic key/value lists.
+
+    Keeps the historical unquoted rendering of ordinary keys while refusing to
+    run into CPython's integer-to-decimal limit for a malformed huge integer.
+    """
+    try:
+        text = str(value)
+    except Exception:
+        return _safe_repr(value, limit=limit)  # noqa: F821 (part_00)
+    return text if len(text) <= limit else text[:limit - 3] + '...'
+
+
+def _nc_sorted(values):
+    """Sort mixed-type/untrusted keys without comparing int with str or
+    invoking an unbounded ``str``/``repr`` during the comparison."""
+    return sorted(values, key=_nc_text)
+
+
+def _nc_schema_ok(value):
+    """A schema number is the exact integer 1, not ``True``/``1.0``/1."""
+    return isinstance(value, numbers.Integral) and not isinstance(
+        value, (bool, np.bool_)) and int(value) == NC_SCHEMA
+
+
+def _nc_device_problem(value):
+    """Why a recorded ``params.device`` string is not a cpu/cuda device."""
+    if not isinstance(value, str):
+        return ('result.params.device must be a cpu/cuda string, got '
+                + _nc_repr(value))
+    try:
+        dev = torch.device(value)
+    except (TypeError, RuntimeError, ValueError):
+        return ('result.params.device must be a cpu/cuda device, got '
+                + _nc_repr(value))
+    if dev.type not in ('cpu', 'cuda'):
+        return ('result.params.device must be a cpu/cuda device, got '
+                + _nc_repr(value))
+    return None
+
+
 def _nc_sha_json(obj):
     """Canonical JSON digest; never emits NaN/Infinity."""
     return _sha256_json(obj)  # noqa: F821 (part_00)
@@ -58,12 +110,13 @@ def _nc_device(value):
     if isinstance(value, (bool, np.bool_)) or not isinstance(
             value, (str, torch.device)):
         raise ValueError(
-            f'numerical_canary: device must be "cpu" or "cuda[:N]", got {value!r}')
+            f'numerical_canary: device must be "cpu" or "cuda[:N]", got '
+            f'{_nc_repr(value)}')
     try:
         device = torch.device(value)
     except (TypeError, RuntimeError, ValueError):
         raise ValueError(
-            f'numerical_canary: invalid device {value!r}') from None
+            f'numerical_canary: invalid device {_nc_repr(value)}') from None
     if device.type not in ('cpu', 'cuda'):
         raise ValueError(
             f'numerical_canary: only cpu/cuda devices are supported, got '
@@ -78,8 +131,9 @@ def _nc_device(value):
             index = int(torch.cuda.current_device())
         if index < 0 or index >= int(torch.cuda.device_count()):
             raise ValueError(
-                f'numerical_canary: cuda device index {index} is outside the '
-                f'visible device count {torch.cuda.device_count()}')
+                f'numerical_canary: cuda device index {_nc_repr(index)} is '
+                f'outside the visible device count '
+                f'{torch.cuda.device_count()}')
         device = torch.device('cuda', index)
     return device
 
@@ -95,7 +149,7 @@ def _nc_dtype(value):
     if not isinstance(value, str) or value not in NC_DTYPES:
         raise ValueError(
             f'numerical_canary: dtype must be one of {sorted(NC_DTYPES)}, '
-            f'got {value!r}')
+            f'got {_nc_repr(value)}')
     return value, NC_DTYPES[value]
 
 
@@ -104,7 +158,7 @@ def _nc_size(value):
             value, numbers.Integral):
         raise ValueError(
             f'numerical_canary: size must be an integer in [2, {NC_MAX_SIZE}], '
-            f'got {value!r}')
+            f'got {_nc_repr(value)}')
     size = int(value)
     if size < 2 or size > NC_MAX_SIZE:
         raise ValueError(
@@ -333,6 +387,19 @@ def build_numerical_canary_artifact(*, seed=0, size=NC_DEFAULT_SIZE,
     if not isinstance(params, dict):
         raise ValueError('build_numerical_canary_artifact: result.params is '
                          'missing')
+    problems = _nc_validate_result(result)
+    if problems:
+        raise ValueError('build_numerical_canary_artifact: malformed result: '
+                         + '; '.join(problems))
+    try:
+        _nc_sha_json(result)
+    except Exception as exc:
+        raise ValueError(
+            'build_numerical_canary_artifact: result is not strict-JSON '
+            f'serialisable: {type(exc).__name__}: {exc}') from None
+    if provenance is not None and not isinstance(provenance, dict):
+        raise TypeError('build_numerical_canary_artifact: provenance must be '
+                        'an object or None')
     inputs = {key: params.get(key) for key in NC_PARAM_KEYS}
     artifact = {
         'kind': NC_ARTIFACT_KIND,
@@ -355,26 +422,29 @@ def _nc_validate_result(result):
         return ['result must be a JSON object']
     if result.get('kind') != 'numerical_canary':
         problems.append(
-            f"result.kind must be 'numerical_canary', got {result.get('kind')!r}")
-    if result.get('schema') != NC_SCHEMA:
+            f"result.kind must be 'numerical_canary', got "
+            f'{_nc_repr(result.get("kind"))}')
+    if not _nc_schema_ok(result.get('schema')):
         problems.append(
-            f'result.schema must be {NC_SCHEMA}, got {result.get("schema")!r}')
+            f'result.schema must be {NC_SCHEMA}, got '
+            f'{_nc_repr(result.get("schema"))}')
     if result.get('status') != 'ok':
         problems.append(
-            f'result.status must be "ok", got {result.get("status")!r}')
-    extra = sorted(set(result) - set(NC_RESULT_KEYS))
+            f'result.status must be "ok", got '
+            f'{_nc_repr(result.get("status"))}')
+    extra = _nc_sorted(set(result) - set(NC_RESULT_KEYS))
     if extra:
         problems.append('result carries field(s) outside the schema: '
-                        + ', '.join(map(str, extra)))
+                        + ', '.join(map(_nc_text, extra)))
     params = result.get('params')
     if not isinstance(params, dict):
         problems.append('result.params must be an object')
     else:
-        extra = sorted(set(params) - set(NC_PARAM_KEYS))
+        extra = _nc_sorted(set(params) - set(NC_PARAM_KEYS))
         missing = [k for k in NC_PARAM_KEYS if k not in params]
         if extra:
             problems.append('result.params carries field(s) outside the '
-                            'schema: ' + ', '.join(map(str, extra)))
+                            'schema: ' + ', '.join(map(_nc_text, extra)))
         if missing:
             problems.append(f'result.params is missing {missing}')
         if 'seed' in params:
@@ -387,26 +457,31 @@ def _nc_validate_result(result):
                 _nc_size(params['size'])
             except (TypeError, ValueError) as exc:
                 problems.append(str(exc))
-        if 'dtype' in params and params['dtype'] not in NC_DTYPES:
+        if 'dtype' in params and (
+                not isinstance(params['dtype'], str)
+                or params['dtype'] not in NC_DTYPES):
             problems.append(
                 f'result.params.dtype must be one of {sorted(NC_DTYPES)}, '
-                f'got {params["dtype"]!r}')
+                f'got {_nc_repr(params["dtype"])}')
         if 'device' in params:
-            dev = params['device']
-            if not isinstance(dev, str) or not dev.startswith(('cpu', 'cuda')):
-                problems.append(
-                    f'result.params.device must be a cpu/cuda string, got {dev!r}')
+            dev_problem = _nc_device_problem(params['device'])
+            if dev_problem is not None:
+                problems.append(dev_problem)
     arithmetic = result.get('arithmetic')
     if not isinstance(arithmetic, dict):
         problems.append('result.arithmetic must be an object')
     else:
-        extra = sorted(set(arithmetic) - set(NC_ARITHMETIC_KEYS))
+        extra = _nc_sorted(set(arithmetic) - set(NC_ARITHMETIC_KEYS))
         missing = [k for k in NC_ARITHMETIC_KEYS if k not in arithmetic]
         if extra:
             problems.append('result.arithmetic carries field(s) outside the '
-                            'schema: ' + ', '.join(map(str, extra)))
+                            'schema: ' + ', '.join(map(_nc_text, extra)))
         if missing:
             problems.append(f'result.arithmetic is missing {missing}')
+        if not _nc_schema_ok(arithmetic.get('schema')):
+            problems.append(
+                f'result.arithmetic.schema must be {NC_SCHEMA}, got '
+                + _nc_repr(arithmetic.get('schema')))
         fp = arithmetic.get('fingerprint')
         if not isinstance(fp, str) or not re.fullmatch(r'[0-9a-f]{64}', fp):
             problems.append(
@@ -421,44 +496,47 @@ def _nc_validate_result(result):
         else:
             for name in NC_OP_NAMES:
                 if name not in ops:
-                    problems.append(f'result.arithmetic.ops is missing {name!r}')
-            extra_ops = sorted(set(ops) - set(NC_OP_NAMES))
+                    problems.append(
+                        f'result.arithmetic.ops is missing {name!r}')
+            extra_ops = _nc_sorted(set(ops) - set(NC_OP_NAMES))
             if extra_ops:
                 problems.append(
                     'result.arithmetic.ops carries op(s) outside the schema: '
-                    + ', '.join(map(str, extra_ops)))
-            for name, row in sorted(ops.items(), key=lambda kv: str(kv[0])):
+                    + ', '.join(map(_nc_text, extra_ops)))
+            for name, row in sorted(
+                    ops.items(), key=lambda kv: _nc_text(kv[0])):
+                label = _nc_repr(name)
                 if not isinstance(row, dict):
-                    problems.append(f'result.arithmetic.ops[{name!r}] must be '
-                                    'an object')
+                    problems.append(
+                        f'result.arithmetic.ops[{label}] must be an object')
                     continue
-                extra = sorted(set(row) - set(NC_OP_KEYS))
+                extra = _nc_sorted(set(row) - set(NC_OP_KEYS))
                 missing = [k for k in NC_OP_KEYS if k not in row]
                 if extra:
                     problems.append(
-                        f'result.arithmetic.ops[{name!r}] carries field(s) '
-                        'outside the schema: ' + ', '.join(map(str, extra)))
+                        f'result.arithmetic.ops[{label}] carries field(s) '
+                        'outside the schema: ' + ', '.join(map(_nc_text, extra)))
                 if missing:
                     problems.append(
-                        f'result.arithmetic.ops[{name!r}] is missing {missing}')
+                        f'result.arithmetic.ops[{label}] is missing {missing}')
                 sha = row.get('sha256')
                 if not isinstance(sha, str) or not re.fullmatch(r'[0-9a-f]{64}', sha):
                     problems.append(
-                        f'result.arithmetic.ops[{name!r}].sha256 must be 64-hex')
+                        f'result.arithmetic.ops[{label}].sha256 must be 64-hex')
                 shape = row.get('shape')
                 if (not isinstance(shape, list)
                         or any(isinstance(x, (bool, np.bool_))
                                or not isinstance(x, numbers.Integral)
                                or int(x) < 0 for x in shape)):
                     problems.append(
-                        f'result.arithmetic.ops[{name!r}].shape must be a '
+                        f'result.arithmetic.ops[{label}].shape must be a '
                         'list of non-negative integers')
                 if not isinstance(row.get('dtype'), str):
                     problems.append(
-                        f'result.arithmetic.ops[{name!r}].dtype must be a string')
+                        f'result.arithmetic.ops[{label}].dtype must be a string')
                 if not isinstance(row.get('finite'), bool):
                     problems.append(
-                        f'result.arithmetic.ops[{name!r}].finite must be a boolean')
+                        f'result.arithmetic.ops[{label}].finite must be a boolean')
         # The fingerprint must be a *function* of the recorded arithmetic, not
         # an independently editable label.  Without this check, changing one
         # op digest while keeping the old fingerprint made both the artifact
@@ -471,7 +549,8 @@ def _nc_validate_result(result):
                     'schema': 1,
                     'size': params.get('size'),
                     'dtype': params.get('dtype'),
-                    'device_class': str(params.get('device')).split(':')[0],
+                    'device_class': _safe_text(  # noqa: F821 (part_00)
+                        params.get('device')).split(':')[0],
                     'input_fingerprint': ifp,
                     'ops': ops,
                 })
@@ -564,17 +643,17 @@ def compare_numerical_canaries(original, rerun):
         out['arithmetic_match'] = True
     else:
         out['status'] = 'mismatch'
-        names = sorted(set(ia['ops']) | set(ib['ops']))
+        names = _nc_sorted(set(ia['ops']) | set(ib['ops']))
         for name in names:
             ra, rb = ia['ops'].get(name), ib['ops'].get(name)
             if ra != rb:
-                out['differing_ops'].append(name)
+                out['differing_ops'].append(_safe_text(name))  # noqa: F821
     ea, eb = a.get('environment'), b.get('environment')
     ea = ea if isinstance(ea, dict) else {}
     eb = eb if isinstance(eb, dict) else {}
-    for key in sorted(set(ea) | set(eb)):
+    for key in _nc_sorted(set(ea) | set(eb)):
         if ea.get(key) != eb.get(key):
-            out['environment_changes'].append(key)
+            out['environment_changes'].append(_safe_text(key))  # noqa: F821
     return out
 
 
@@ -608,16 +687,16 @@ def validate_numerical_canary_artifact(artifact, *, replay=True):
     if artifact.get('kind') != NC_ARTIFACT_KIND:
         out['problems'].append(
             f'artifact.kind must be {NC_ARTIFACT_KIND!r}, got '
-            f'{artifact.get("kind")!r}')
-    if artifact.get('schema') != NC_SCHEMA:
+            f'{_nc_repr(artifact.get("kind"))}')
+    if not _nc_schema_ok(artifact.get('schema')):
         out['problems'].append(
             f'artifact.schema must be {NC_SCHEMA}, got '
-            f'{artifact.get("schema")!r}')
-    extra = sorted(set(artifact) - set(NC_ARTIFACT_KEYS))
+            f'{_nc_repr(artifact.get("schema"))}')
+    extra = _nc_sorted(set(artifact) - set(NC_ARTIFACT_KEYS))
     missing = [k for k in NC_ARTIFACT_KEYS if k not in artifact]
     if extra:
         out['problems'].append('artifact carries field(s) outside the '
-                               'schema: ' + ', '.join(map(str, extra)))
+                               'schema: ' + ', '.join(map(_nc_text, extra)))
     if missing:
         out['problems'].append(f'artifact is missing {missing}')
     inputs = artifact.get('inputs')
@@ -625,11 +704,11 @@ def validate_numerical_canary_artifact(artifact, *, replay=True):
         out['problems'].append('artifact.inputs must be an object')
         inputs = {}
     else:
-        extra = sorted(set(inputs) - set(NC_PARAM_KEYS))
+        extra = _nc_sorted(set(inputs) - set(NC_PARAM_KEYS))
         missing_in = [k for k in NC_PARAM_KEYS if k not in inputs]
         if extra:
             out['problems'].append('artifact.inputs carries field(s) outside '
-                                   'the schema: ' + ', '.join(map(str, extra)))
+                                   'the schema: ' + ', '.join(map(_nc_text, extra)))
         if missing_in:
             out['problems'].append(f'artifact.inputs is missing {missing_in}')
     if not isinstance(artifact.get('created_at'), str):
@@ -644,11 +723,11 @@ def validate_numerical_canary_artifact(artifact, *, replay=True):
         if missing_pv:
             out['problems'].append(
                 f'artifact.provenance is missing {missing_pv}')
-        extra_pv = sorted(set(provenance) - set(NC_PROVENANCE_KEYS))
+        extra_pv = _nc_sorted(set(provenance) - set(NC_PROVENANCE_KEYS))
         if extra_pv:
             out['problems'].append(
                 'artifact.provenance carries field(s) outside the schema: '
-                + ', '.join(map(str, extra_pv)))
+                + ', '.join(map(_nc_text, extra_pv)))
     recorded = artifact.get('content_sha256')
     out['content_sha256'] = recorded if isinstance(recorded, str) else None
     if not isinstance(recorded, str) or not re.fullmatch(r'[0-9a-f]{64}', recorded):
@@ -670,6 +749,17 @@ def validate_numerical_canary_artifact(artifact, *, replay=True):
     result_problems = _nc_validate_result(result)
     if result_problems:
         out['problems'].extend(result_problems)
+        return out
+    # The verdict embeds ``result`` for the caller.  A structurally valid but
+    # non-strict-JSON environment (for example a hand-edited huge integer or
+    # NaN) must be reported as a failure here, not copied into a verdict that
+    # then cannot be serialised or archived.
+    try:
+        _nc_sha_json(result)
+    except Exception as exc:
+        out['problems'].append(
+            'artifact.result is not strict-JSON serialisable: '
+            f'{type(exc).__name__}: {exc}')
         return out
     out['result'] = result
     params = result.get('params')
@@ -702,7 +792,7 @@ def validate_numerical_canary_artifact(artifact, *, replay=True):
         and stored_id['input_fingerprint'] == replay_id['input_fingerprint'])
     if not out['arithmetic_match']:
         out['status'] = 'drift'
-        names = sorted(set(stored_id['ops']) | set(replay_id['ops']))
+        names = _nc_sorted(set(stored_id['ops']) | set(replay_id['ops']))
         for name in names:
             if stored_id['ops'].get(name) != replay_id['ops'].get(name):
                 out['drifted_ops'].append(name)
@@ -714,9 +804,9 @@ def validate_numerical_canary_artifact(artifact, *, replay=True):
     replay_env = replay_result.get('environment')
     stored_env = stored_env if isinstance(stored_env, dict) else {}
     replay_env = replay_env if isinstance(replay_env, dict) else {}
-    for key in sorted(set(stored_env) | set(replay_env)):
+    for key in _nc_sorted(set(stored_env) | set(replay_env)):
         if stored_env.get(key) != replay_env.get(key):
-            out['environment_changes'].append(key)
+            out['environment_changes'].append(_safe_text(key))  # noqa: F821
     if out['environment_changes']:
         out['warnings'].append(
             'the recorded environment metadata differs on: '
@@ -822,9 +912,18 @@ def _nc_cli(args):
         print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True,
                          allow_nan=False, default=float))
         return 0
-    artifact = build_numerical_canary_artifact(result=result)
-    writer = write_numerical_canary_artifact(ns.out, artifact,
-                                             overwrite=ns.overwrite)
+    try:
+        artifact = build_numerical_canary_artifact(result=result)
+        writer = write_numerical_canary_artifact(ns.out, artifact,
+                                                 overwrite=ns.overwrite)
+    except (TypeError, ValueError, RuntimeError, OSError) as exc:
+        # An invalid --out path (empty string, a file where a directory is
+        # needed, a permission error) is a CLI input error, not a traceback.
+        print(json.dumps({'kind': 'write_numerical_canary',
+                          'status': 'fail', 'written': False,
+                          'error': f'{type(exc).__name__}: {exc}'},
+                         ensure_ascii=False, indent=2))
+        return 2
     print(json.dumps(writer, ensure_ascii=False, indent=2, sort_keys=True,
                      allow_nan=False, default=float))
     return 0 if writer['status'] == 'ok' and not writer['conflict'] else 1
