@@ -7195,3 +7195,46 @@ refuse；`ROPE_REPORT_PAIRS`/声明表同步；临时 summary 端到端跑
 `factor_declaration_verified=True`；聚合门的
 `topk_budget_contrasts` / `warmup_contrasts` / `v7_contrasts` 均为 ok。
 完整 CPU 套件在本轮最终树通过。
+
+## 2026-11-05 — 内容消融的“存在”与“对齐”在同 checkpoint 上分开：alignment lesion 与证据频道表（本轮对比/消融方法硬化，no new runs）
+
+零 GPU；不新增训练、不读取任何 split、不修改
+`confirmation_frozen*.json` 的字节/臂/种子/端点/α/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未删除、未修改、未移动。
+
+**Problem.** `content_pooling` 的 within-checkpoint lesion 只把块内容置零，
+回答的是“模型是否使用块内容”。`content_alignment` 的 shift 臂则是
+between-model 对照：它训练时就使用错位内容，因此只能说明“训练时对齐是否
+改变模型”，不能说明“训练好的 checkpoint 在推理时是否读取本块的对齐内容”。
+这两条主张在现有 lesion 阶梯里没有对应的推理期读数。更一般地，读者无法
+从 `LESION_DESIGN` 看出哪些消融组件有 within-checkpoint 频道、哪些只有
+between-model 频道，容易把“缺 lesion”误读成“推理期无效”。
+
+**Fix.** `LESION_DESIGN` 新增 `content_alignment`：
+`csa_fixed`/`csa_dynamic` 上把 `cfg.content_mode` 从 `pooled` 临时改为
+`shift`，内容表与全部权重逐字节不变；只对本来持有 aligned/pooled 内容的
+臂生效，对 `zero`/`shift` 臂 fail closed（否则“零值平移”会被当成一次干净
+干预）。新增 `lesion_coverage()`：把 `ABLATION_DESIGN` 的每个组件映射到
+是否有 inference lesion，并对未覆盖组件写出原因（训练期损失项、架构级
+交换、值级 placebo、已由 v10/v11 推理期 probe 覆盖等）。该表是**证据频道
+表，不是完整性门**：缺 lesion 只把措辞限制为“训练期效应”，不证明推理期
+无效；每个组件另带 `claim_channels` / `claim_limit`，顶层
+`inference_use_claim_allowed` 只收有 lesion 的组件。
+`lesion_design_audit()` 输出 `coverage` 块；`audit_gates.py lesion`
+与 `report` 自动带上它，无需新子命令。
+
+**Boundary.** 只新增 one-checkpoint 读数，不新增确认性 p 值、不进入冻结
+Holm 族、不改变 `verified`/`confirmed`/max-T，也不改变 `methodology_audit`
+的消融完整性。alignment lesion 仍需要已保存 checkpoint 才能产生数值；本
+快照没有 `results_*/`，因此把“下次跑完后怎么读”做成可执行工具与设计门，
+而不是声称已有证据。`coverage` 不声称组件集合完备，也不把“没有 lesion”
+升级成“组件可删”。
+
+**Verification.** 新增 `test_lesion_alignment_control.py` 5 项：alignment
+lesion 在同一 checkpoint 上改变前向且权重指纹不变、cfg 对象在退出后恢复；
+非 pooled 臂 fail closed；设计门把 `content_mode` 记为唯一有效键；coverage
+表把已覆盖/未覆盖组件与原因逐项写出；面板门接受新组件的 6-seed
+necessary 记录。更新 `test_lesion_single_factor.py` 的 shipped 期望表。
+`test_review_part_35.py`、`test_lesion_single_factor.py`、
+`test_lesion_alignment_control.py` 共 22 项通过；`audit_gates.py lesion`
+在无产物时仍返回 `not_verifiable_locally` 且设计门 `status='ok'`。

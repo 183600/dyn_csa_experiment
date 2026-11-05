@@ -28,7 +28,8 @@ import contextlib as _lesion_contextlib
 # Components that can be disabled at inference without changing the parameter
 # count or re-instantiating the model.  The declaration is intentionally a
 # whitelist: an undeclared component is an error, not a silent no-op.
-LESION_COMPONENTS = ('attention_sink', 'local_fusion', 'content_pooling')
+LESION_COMPONENTS = ('attention_sink', 'local_fusion', 'content_pooling',
+                     'content_alignment')
 
 # `cfg_overrides` are applied to a *copy* of each layer's AttnCfg; the
 # `module_overrides` replace a live submodule attribute and are restored to
@@ -69,6 +70,23 @@ LESION_DESIGN = {
         'note': ('the compressed block content is replaced by zeros; this is '
                  'the content-presence lesion, not the content-alignment '
                  'placebo'),
+    },
+    # Presence and alignment are two different claims.  The between-model
+    # shift arm trains on misaligned content; this lesion keeps the trained
+    # pooled content table BYTE-IDENTICAL and moves it one block back only
+    # for the forward pass.  It therefore asks the complementary question:
+    # does this checkpoint's forward read the content of its own block, or
+    # would the previous block's content do just as well?
+    'content_alignment': {
+        'source_component': 'content_alignment',
+        'arms': ('csa_fixed', 'csa_dynamic'),
+        'cfg_overrides': {'content_mode': 'shift'},
+        'module_overrides': (),
+        'mechanism_keys': frozenset({'content_mode'}),
+        'state_kind': None,
+        'note': ('the same pooled content table is read one block back; this '
+                 'is the within-checkpoint alignment lesion, not the '
+                 'content-presence (zero) lesion'),
     },
 }
 
@@ -166,6 +184,19 @@ def _lesion_layers(model, component):
         elif component == 'content_pooling':
             if getattr(cfg, 'kind', None) in ('csa', 'hca'):
                 out.append((i, attn, cfg))
+        elif component == 'content_alignment':
+            # Only a checkpoint that was trained (and is evaluated) with the
+            # aligned/pooled table has an alignment component to lesion.
+            # A zero-content or already-shifted arm fails closed: replacing
+            # zeros by shifted zeros (or shift by shift) would be a no-op
+            # masquerading as a clean lesion.
+            if (getattr(cfg, 'kind', None) in ('csa', 'hca')
+                    and str(getattr(cfg, 'content_mode', 'pooled')) == 'pooled'
+                    # `content_mode='shift'` is defined only for closed
+                    # blocks; an open-block arm would raise halfway through
+                    # the forward instead of failing closed at the lesion.
+                    and str(getattr(cfg, 'open_block_mode', 'closed')) == 'closed'):
+                out.append((i, attn, cfg))
         else:  # pragma: no cover - guarded by _lesion_design_entry
             raise ValueError(f'unsupported lesion component {component!r}')
     if not out:
@@ -225,7 +256,7 @@ def _lesion_parameter_tensors(model, component):
     if component == 'local_fusion':
         return [(n, p) for n, p in named
                 if n.endswith('.fuse_conv.weight') or n == 'fuse_conv.weight']
-    if component == 'content_pooling':
+    if component in ('content_pooling', 'content_alignment'):
         return []
     raise ValueError(f'unknown lesion component {component!r}')
 
@@ -796,6 +827,129 @@ def lesion_panel_audit(records, *, relative_pct=LESION_POLICY['relative_pct'],
     }
 
 
+# Components whose between-model ablation exists but whose within-checkpoint
+# lesion is deliberately NOT in the ladder.  The reasons are part of the
+# methodology: an absent lesion is not evidence that the mechanism is absent;
+# it is a claim channel that has not been measured.  These notes keep the
+# coverage table honest instead of letting a reader infer completeness from
+# the presence of a between-model arm.
+LESION_COVERAGE_NOT_APPLICABLE = {
+    'dynamic_blocking': (
+        'the intervention changes the segmentation table itself; a cfg-only '
+        'forward lesion would evaluate the model under a different block '
+        'geometry, not remove one component. Use the between-model contrast '
+        'and the block-stat attribution.'),
+    'dynamic_blocking_learning': (
+        'the learned scalar offset is a trained parameter, not a forward '
+        'switch; a value-level offset lesion (e.g. reset to its initial '
+        'value) is a separate extension, not this cfg-only ladder.'),
+    'learned_selection': (
+        'already measured as an inference-time randidx/allblocks override on '
+        'the same checkpoint in the v10/v11 mechanism probes; this ladder '
+        'does not duplicate that reader.'),
+    'attention_sink_learning': (
+        'on/off removes the whole sink; isolating the learned value needs a '
+        'value-level (frozen-random) forward lesion, which this ladder does '
+        'not implement. The between-model random-sink placebo remains the '
+        'available control.'),
+    'local_fusion_learning': (
+        'on/off removes the convolution; isolating the learned kernel needs '
+        'an identity-kernel forward lesion (value-level), which this ladder '
+        'does not implement. The between-model random-kernel placebo remains '
+        'the available control.'),
+    'compression_regularizer': (
+        'a training-time loss term; it has no inference-time counterpart to '
+        'remove. The no-comp arm is the only valid contrast.'),
+    'task_learned_boundary': (
+        'a training-time cut policy; removing it at inference is the same '
+        'cfg change as dynamic_blocking, not a separate component.'),
+    'hybrid_hierarchy': (
+        'an architecture-level kind swap; removing a hierarchy at inference '
+        'would change the layer stack, so it is not a single-component '
+        'forward lesion.'),
+}
+
+LESION_COVERAGE_INTERACTION_NOTE = (
+    'an interaction component is not a single component; its simple effects '
+    'are covered by the factorial arms and its interaction by the factorial '
+    'test, not by this lesion ladder')
+
+
+def lesion_coverage(design=None, *, ablation_design=None):
+    """Which ablation components have a within-checkpoint lesion channel.
+
+    Coverage is descriptive, not a pass/fail gate.  A component with only a
+    between-model on/off contrast can support "training with X changed the
+    model"; it cannot support "the trained checkpoint uses X at inference".
+    The table makes that limit explicit, including the reasons a lesion is
+    not applicable, so a missing component is never silently read as
+    "no inference-time effect".
+    """
+    design = LESION_DESIGN if design is None else design
+    abl = (globals().get('ABLATION_DESIGN')
+           if ablation_design is None else ablation_design)
+    if not isinstance(abl, dict):
+        abl = {}
+    covered = {}
+    if isinstance(design, dict):
+        for comp, entry in design.items():
+            if not isinstance(entry, dict):
+                continue
+            source = entry.get('source_component')
+            if isinstance(source, str) and source:
+                covered.setdefault(source, []).append(comp)
+    rows = {}
+    for source in sorted(abl):
+        les = sorted(covered.get(source, []))
+        if les:
+            note = ('within-checkpoint lesion component(s): '
+                    + ', '.join(les))
+        elif source in LESION_COVERAGE_NOT_APPLICABLE:
+            note = LESION_COVERAGE_NOT_APPLICABLE[source]
+        elif source.endswith('_interaction') or source in (
+                'hybrid_blocking_factorisation'):
+            note = LESION_COVERAGE_INTERACTION_NOTE
+        else:
+            note = ('no inference-time lesion is declared for this component; '
+                    'only the between-model ablation is available')
+        rows[source] = {
+            'source_component': source,
+            'inference_lesion': bool(les),
+            'lesion_components': les,
+            # A between-model contrast licenses a training-effect claim.  An
+            # inference-use claim additionally needs a within-checkpoint
+            # lesion; without one the table records the limit, not a verdict
+            # that the component is unused.
+            'claim_channels': {
+                'training_effect': True,
+                'inference_use': bool(les),
+            },
+            'claim_limit': (
+                None if les else
+                'training-effect only; no within-checkpoint lesion is '
+                'available for an inference-use claim'),
+            'note': note,
+        }
+    out = {
+        'kind': 'lesion_coverage',
+        'status': 'ok',
+        'role': ('map a between-model ablation to a within-checkpoint lesion '
+                 'channel; missing coverage limits the claim, it does not '
+                 'prove the component is unused'),
+        'components': rows,
+        'n_ablation_components': len(rows),
+        'n_with_inference_lesion': sum(1 for r in rows.values()
+                                       if r['inference_lesion']),
+        'with_inference_lesion': sorted(
+            k for k, r in rows.items() if r['inference_lesion']),
+        'without_inference_lesion': sorted(
+            k for k, r in rows.items() if not r['inference_lesion']),
+        'inference_use_claim_allowed': sorted(
+            k for k, r in rows.items() if r['inference_lesion']),
+    }
+    return out
+
+
 def lesion_design_audit(design=None, *, factory=None, n_layers=2,
                         vocab=64, d=32, n_heads=2, d_head=16, seq_len=16,
                         present=None, build_models=True):
@@ -831,6 +985,7 @@ def lesion_design_audit(design=None, *, factory=None, n_layers=2,
         if _v is None or _v < 1:
             raise ValueError(f'{_name} must be a positive integer, got {_value!r}')
     out = {'kind': 'lesion_design', 'status': 'ok', 'components': {},
+           'coverage': lesion_coverage(design=design),
            'violations': [], 'warnings': [],
            'policy': dict(LESION_POLICY)}
     if not isinstance(design, dict) or not design:

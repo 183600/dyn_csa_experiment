@@ -7706,15 +7706,29 @@ seed，不是 token。判定分两步，顺序不能反：
 
 ### 97.3 接线：声明、设计门、面板重放
 
-`LESION_DESIGN` 白名单声明三类组件及其适用臂、cfg/module 干预和机制键：
+`LESION_DESIGN` 白名单声明四类组件及其适用臂、cfg/module 干预和机制键：
 `attention_sink`（`use_sink`/`full_sink`）、`local_fusion`
-（`fuse_conv`）、`content_pooling`（`content_mode='zero'`）。未声明组件
-直接报错，不静默退化成空 context。
+（`fuse_conv`）、`content_pooling`（`content_mode='zero'`）与
+`content_alignment`（`content_mode='shift'`）。**presence 与 alignment 是
+两条不同的主张**：zero lesion 回答「模型是否使用块内容」，alignment lesion
+保留同一张已训练的内容表、只把读取位置向后退一块，回答「模型是否使用
+*本块*内容的对齐关系」。后者与 between-model 的 `csa_*_shiftcont` 臂互补：
+shift 臂测训练时错位的影响，lesion 测同一 checkpoint 在推理时是否依赖对齐。
+未声明组件直接报错，不静默退化成空 context；对一个本来就没有对齐内容可
+移除的臂（`content_mode` 已是 `zero`/`shift`），alignment lesion 也 fail
+closed，而不是把零值平移当成一次干净的干预。
 
 - `lesion_design_audit()` 用真实 `make_layer_cfgs` 建 tiny `SmallGPT`，逐臂
   检查：组件存在、lesion 至少作用一层、臂已排程、属于声明的留一法族、
   机制键被 `ABLATION_INTERVENTION_KEYS` 覆盖。fusion 的 identity 初值只
   warning（提示必须到训练后的 checkpoint 再做操作检查），不是 pass。
+- 设计门同时输出 `coverage`（`lesion_coverage()`）：把 `ABLATION_DESIGN`
+  的每个组件映射到「是否有 within-checkpoint lesion」频道，并对没有该
+  频道的组件写出原因（训练期损失项、架构级交换、值级安慰剂、已由
+  v10/v11 推理期 probe 覆盖等）。这是一张**证据频道表，不是完整性门**：
+  缺 lesion 只限制措辞为「训练期效应」，不会被误读成「推理期无效」。
+  每个组件另带 `claim_channels`（`training_effect` / `inference_use`）与
+  `claim_limit`，顶层 `inference_use_claim_allowed` 只收有 lesion 的组件。
 - `lesion_panel_audit(records)` 重放落盘的面板：每条记录是
   `{component, arm, seed, checkpoint_sha256, intact_ppl, lesion_ppl,
   sensitivity, eval_fp}`。同一组内 seed 必须唯一、`eval_fp` 必须一致、
@@ -7767,8 +7781,10 @@ python audit_gates.py inference_lesion          # 别名
 python audit_gates.py report                    # 顶层 lesion
 ```
 
-`test_review_part_35.py` 8 项覆盖：设计门接受 shipped 三类组件且每个臂可
-构造/可干预；context 在异常时恢复原 cfg 对象与 `fuse_conv` 对象、权重指纹
+`test_review_part_35.py` 8 项覆盖：设计门接受 shipped 组件且每个臂可
+构造/可干预；`test_lesion_alignment_control.py` 另覆 alignment lesion 的
+前向改变/权重不变/对象恢复、非 pooled 臂 fail-closed、设计门与 coverage
+表、面板重放；context 在异常时恢复原 cfg 对象与 `fuse_conv` 对象、权重指纹
 不变、未知/已缺席组件 fail-closed；零值 sink 仍是有效干预（`present`/
 `zero_valued`），非零 sink 的 lesion 改变输出且 lesion 内改 sink 不再影响
 输出；identity fusion 初值是 `trivial`/`unchanged`，非 identity kernel 的
@@ -7778,7 +7794,7 @@ inert/not_checked/invalid/underpowered 判定与长度/布尔/非正 PPL/重复�
 非法 alpha 的 fail-closed；面板门对 `eval_fp` 混杂、重复 seed、缺
 checkpoint、权重变化、未声明臂、NaN PPL 的 fail-closed 与无记录
 `not_verifiable`；以及 `audit_gates lesion PATH` 的干净重放和篡改判 fail。
-完整 CPU 套件在本轮最终树通过（新增 8 项）。
+完整 CPU 套件在本轮最终树通过（新增 8 项 + alignment 5 项）。
 
 ## 98. 报的是哪一个 checkpoint：端点选择必须可追溯，跨臂规则必须一致（本轮结果分析/实验设计硬化）
 

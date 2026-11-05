@@ -32,6 +32,8 @@ def test_shipped_lesions_are_single_factor():
         ('attention_sink', 'full_sink'): {'full_sink'},
         ('content_pooling', 'csa_fixed'): {'content_mode'},
         ('content_pooling', 'csa_dynamic'): {'content_mode'},
+        ('content_alignment', 'csa_fixed'): {'content_mode'},
+        ('content_alignment', 'csa_dynamic'): {'content_mode'},
         ('local_fusion', 'csa_dyn_fuse'): set(),
         ('local_fusion', 'hybrid_csa_dyn_fuse'): set(),
     }
