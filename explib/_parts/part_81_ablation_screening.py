@@ -108,7 +108,7 @@ def _asc_repr(value, *, limit=160):
 
 
 def _asc_finite(value, *, where, positive=False):
-    if isinstance(value, (bool,)):
+    if isinstance(value, (bool, np.bool_)):
         raise ValueError(
             f'{where}: expected a finite number, got {_asc_repr(value)}')
     if isinstance(value, (str, bytes, bytearray)) or value is None:
@@ -130,7 +130,7 @@ def _asc_finite(value, *, where, positive=False):
 
 
 def _asc_int(value, *, where, minimum=None, maximum=None):
-    if isinstance(value, bool):
+    if isinstance(value, (bool, np.bool_)):
         raise ValueError(
             f'{where}: expected an integer, got {_asc_repr(value)}')
     try:
@@ -502,6 +502,17 @@ def fractional_factorial_design(components, *, defining_relations=None,
             'may still be more powerful)')
     if status == 'ok' and not seed_budget_sufficient:
         status = 'warnings'
+    # A design that cannot fit an intercept plus every main effect (or whose
+    # main effects share an alias class) licenses nothing, even when the
+    # alias algebra alone would look separable.  Keep the claim flags derived
+    # from the same condition as the top-level flags so an artifact cannot
+    # simultaneously say ``status='not_estimable'`` and
+    # ``claim.main_effects_licensed=True``.
+    main_effects_licensed = bool(
+        main_effects_separable and len(rows) >= k + 1
+        and status != 'not_estimable')
+    interactions_licensed = bool(
+        interactions_clear and status != 'not_estimable')
     n_full = 1 << k
     n_cells = len(rows)
     out = {
@@ -550,15 +561,14 @@ def fractional_factorial_design(components, *, defining_relations=None,
         'family': {},
         'main_effects_separable': bool(main_effects_separable),
         'main_effects_clear': bool(main_effects_clear),
-        'main_effects_licensed': bool(
-            main_effects_separable and len(rows) >= k + 1),
-        'interactions_licensed': bool(interactions_clear),
+        'main_effects_licensed': main_effects_licensed,
+        'interactions_licensed': interactions_licensed,
         'requires_sparsity_assumption': bool(resolution < 4),
         'n_significant': 0,
         'n_significant_main': 0,
         'claim': {
-            'main_effects_licensed': bool(main_effects_separable),
-            'interactions_licensed': bool(interactions_clear),
+            'main_effects_licensed': main_effects_licensed,
+            'interactions_licensed': interactions_licensed,
             'screening_only': True,
             'requires_sparsity_assumption': bool(resolution < 4),
             'higher_order_aliases_assumed_negligible': True,
@@ -725,7 +735,7 @@ def _asc_effect_stats(effects, *, alpha, min_n, seeds):
     stats = paired_effect_stats(  # noqa: F821 (part_10)
         effects, alpha=alpha, min_n=min_n, seeds=seeds)
     def _num(value):
-        if isinstance(value, bool) or value is None:
+        if isinstance(value, (bool, np.bool_)) or value is None:
             return None
         try:
             out = float(value)
@@ -801,9 +811,15 @@ def ablation_screening_analysis(cells, *, components=None,
         raise ValueError(
             f'max_order={_max_order} exceeds the number of components {k}')
     norm = _asc_normalise_cells(cells, comps)
+    # Every cell may be present but carry an empty per-seed map (for example a
+    # pending run).  The design's planning seed count is only used for its
+    # resolution warning, so floor it at one and let the complete-case
+    # intersection below report the real n=0 as not_estimable.  Passing 0 to
+    # ``fractional_factorial_design`` would raise before that verdict is built.
     design = fractional_factorial_design(
         comps, defining_relations=defining_relations, max_order=_max_order,
-        n_seeds=max((len(v) for v in norm.values()), default=1), alpha=alpha)
+        n_seeds=max(1, max((len(v) for v in norm.values()), default=0)),
+        alpha=alpha)
     expected = {frozenset(row) for row in design['cells']}
     measured = set(norm)
     missing = sorted(expected - measured, key=lambda s: (len(s), sorted(s)))
@@ -838,6 +854,17 @@ def ablation_screening_analysis(cells, *, components=None,
     result['seeds'] = common
     result['n_seeds'] = len(common)
     result['missing_seeds'] = missing_seeds
+    if design['status'] == 'not_estimable':
+        # The design itself (rank deficiency, aliased main effects, or a
+        # fraction smaller than the intercept-plus-mains model) cannot be
+        # fitted.  Report that as the named not_estimable result instead of
+        # falling through to the model-term check, which would raise on the
+        # design's own aliased default model terms.
+        reason = '; '.join(str(x) for x in (design.get('problems') or []))
+        return _asc_mark_not_estimable(
+            result,
+            'declared screening design is not estimable'
+            + (f': {reason}' if reason else ''))
     if len(common) < _min_n:
         return _asc_mark_not_estimable(
             result,
@@ -1078,7 +1105,14 @@ def _asc_forbidden_paths(value, path='', out=None, limit=50):
         return out
     if isinstance(value, dict):
         for key, item in value.items():
-            name = str(key)
+            # The artifact is untrusted (possibly hand-written) JSON.  A huge
+            # integer key can exceed CPython's integer->decimal limit while
+            # this validator is constructing the diagnostic path, so fall back
+            # to the bounded repr instead of aborting the report.
+            try:
+                name = str(key)
+            except Exception:
+                name = _asc_repr(key)
             if name in ASC_FORBIDDEN:
                 out.append(f'{path}.{name}' if path else name)
                 if len(out) >= limit:

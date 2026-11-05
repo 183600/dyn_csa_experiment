@@ -6,6 +6,24 @@
 _AFC_MAX_ENUM_SEEDS = 64
 
 
+def _afc_repr(value, limit=160):
+    """Bounded repr for untrusted artifact diagnostics.
+
+    A finite JSON integer can have more digits than CPython's conversion
+    limit, so ``repr`` itself raises while a validator is trying to report a
+    malformed field.  Never let a diagnostic stringify an unbounded value.
+    """
+    try:
+        if isinstance(value, int) and not isinstance(value, bool):
+            bits = int(value.bit_length())
+            if bits > 512:
+                return f'<unrepresentable int bit_length={bits}>'
+        text = repr(value)
+    except Exception:
+        return f'<unrepresentable {type(value).__name__}>'
+    return text if len(text) <= limit else text[:limit - 3] + '...'
+
+
 def audit_family_correction(path=None):
     """Result-analysis gate: replay the dependence-aware family correction.
 
@@ -37,7 +55,7 @@ def audit_family_correction(path=None):
         return out
     if block.get('kind') != 'confirmation_family_correction':
         out['problems'].append(
-            f"family_correction.kind={block.get('kind')!r} is not "
+            f"family_correction.kind={_afc_repr(block.get('kind'))} is not "
             "'confirmation_family_correction'")
     forbidden = {'confirmed', 'p_holm', 'verified', 'verdict', 'decision'}
     bad_keys = sorted(k for k in block if k in forbidden)
@@ -48,11 +66,11 @@ def audit_family_correction(path=None):
     status = block.get('status')
     if status not in ('ok', 'degenerate', 'not_estimable'):
         out['problems'].append(
-            f'family_correction.status {status!r} is not a declared status')
+            f'family_correction.status {_afc_repr(status)} is not a declared status')
     rows = block.get('comparisons')
     if status in ('not_estimable', 'degenerate') and not rows:
         out['status'] = 'not_applicable'
-        out['reason'] = (f'family_correction.status={status!r} with no '
+        out['reason'] = (f'family_correction.status={_afc_repr(status)} with no '
                          'comparison rows')
         print(json.dumps(out, ensure_ascii=False, indent=2))
         return out
@@ -131,9 +149,11 @@ def audit_family_correction(path=None):
             sk, rk = set(stored), set(replayed)
             if sk != rk:
                 out['problems'].append(
-                    f'{path}: keys {sorted(sk)!r} != replayed {sorted(rk)!r}')
+                    f'{path}: keys {_afc_repr(sorted(sk))} != replayed '
+                    f'{_afc_repr(sorted(rk))}')
             for k in sorted(sk & rk):
-                _diff(f'{path}.{k}', stored[k], replayed[k], rel=rel, abs_=abs_)
+                _diff(f'{path}.{_afc_repr(k)}', stored[k], replayed[k],
+                      rel=rel, abs_=abs_)
             return
         if isinstance(stored, list) and isinstance(replayed, list):
             if len(stored) != len(replayed):
@@ -146,15 +166,18 @@ def audit_family_correction(path=None):
         if isinstance(stored, bool) or isinstance(replayed, bool):
             if stored is not replayed:
                 out['problems'].append(
-                    f'{path}: {stored!r} != replayed {replayed!r}')
+                    f'{path}: {_afc_repr(stored)} != replayed '
+                    f'{_afc_repr(replayed)}')
             return
         if isinstance(stored, (int, float)) and isinstance(replayed, (int, float)):
             if not _close(stored, replayed, rel=rel, abs_=abs_):
                 out['problems'].append(
-                    f'{path}: {stored!r} != replayed {replayed!r}')
+                    f'{path}: {_afc_repr(stored)} != replayed '
+                    f'{_afc_repr(replayed)}')
             return
         if stored != replayed:
-            out['problems'].append(f'{path}: {stored!r} != replayed {replayed!r}')
+            out['problems'].append(
+                f'{path}: {_afc_repr(stored)} != replayed {_afc_repr(replayed)}')
 
     for key in ('status', 'alpha', 'm_declared', 'm_used', 'n_seeds',
                 'n_patterns', 'p_floor', 'holm_threshold',
@@ -230,7 +253,8 @@ def audit_family_correction(path=None):
             a0, b0 = _finite_number(ci[0]), _finite_number(ci[1])
             if a0 is None or b0 is None or a0 > b0:
                 out['problems'].append(
-                    f'{name}: simultaneous interval {ci!r} is not ordered/finite')
+                    f'{name}: simultaneous interval {_afc_repr(ci)} is not '
+                    'ordered/finite')
     ns = block.get('n_seeds')
     if isinstance(ns, int) and not isinstance(ns, bool) and isinstance(
             block.get('seeds'), list):
@@ -251,11 +275,12 @@ def audit_family_correction(path=None):
             want_patterns = 1 << ns
             if ns > 0 and block.get('n_patterns') != want_patterns:
                 out['problems'].append(
-                    'n_patterns=%r != 2**n_seeds=%d'
-                    % (block.get('n_patterns'), want_patterns))
+                    'n_patterns=%s != 2**n_seeds=%d'
+                    % (_afc_repr(block.get('n_patterns')), want_patterns))
     if block.get('m_declared') != len(names):
         out['problems'].append(
-            f'm_declared={block.get("m_declared")!r} != len(family_names)={len(names)}')
+            'm_declared=%s != len(family_names)=%d'
+            % (_afc_repr(block.get('m_declared')), len(names)))
     sets = block.get('sets') or {}
     want_maxt = sorted(n for n in names if (rows.get(n) or {}).get('reject_maxt_score') is True)
     want_holm = sorted(n for n in names if (rows.get(n) or {}).get('reject_holm_score') is True)

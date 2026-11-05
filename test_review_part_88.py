@@ -159,6 +159,45 @@ def test_invalid_designs_fail_closed():
         L.fractional_factorial_design(['A', 'B'], n_seeds=0)
 
 
+def test_not_estimable_design_cannot_license_a_claim():
+    # A 2^(4-2) fraction with four cells cannot fit an intercept plus four
+    # main effects.  The alias algebra alone may look separable, but the
+    # design-level and embedded claim flags must both stay false.
+    design = L.fractional_factorial_design(
+        ['A', 'B', 'C', 'D'],
+        defining_relations=[['A', 'B', 'C', 'D'], ['A', 'B', 'C']],
+        max_order=2)
+    assert design['status'] == 'not_estimable'
+    assert design['main_effects_licensed'] is False
+    assert design['interactions_licensed'] is False
+    assert design['claim']['main_effects_licensed'] is False
+    assert design['claim']['interactions_licensed'] is False
+
+    # The analysis must return the named not_estimable verdict from the same
+    # cells instead of raising on the design's own aliased default terms.
+    cells = {frozenset(row): {0: 30.0, 1: 31.0, 2: 32.0}
+             for row in design['cells']}
+    out = L.ablation_screening_analysis(
+        cells, components=['A', 'B', 'C', 'D'],
+        defining_relations=[['A', 'B', 'C', 'D'], ['A', 'B', 'C']],
+        max_order=2, min_n=2)
+    assert out['status'] == 'not_estimable'
+    assert out['main_effects_licensed'] is False
+    assert out['interactions_licensed'] is False
+    json.dumps(out, allow_nan=False)
+
+
+def test_all_empty_cells_report_zero_seeds_not_a_crash():
+    design = L.fractional_factorial_design(['A', 'B'])
+    cells = {frozenset(row): {} for row in design['cells']}
+    out = L.ablation_screening_analysis(
+        cells, components=['A', 'B'], min_n=2)
+    assert out['status'] == 'not_estimable'
+    assert out['n_seeds'] == 0
+    assert any('n=0' in problem for problem in out['problems'])
+    json.dumps(out, allow_nan=False)
+
+
 def test_seed_level_effects_recover_declared_main_effects():
     design, cells = _make_cells(
         ['A', 'B', 'C', 'D'], [['A', 'B', 'C', 'D']],
