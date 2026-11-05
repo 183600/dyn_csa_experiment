@@ -533,6 +533,22 @@ def _flops_plot(rows, outdir):
     fig.savefig(os.path.join(outdir, 'flops_analytic.png'), dpi=120)
     plt.close(fig)
 
+def contrast_pair_reason(name, ra, rb, declarations=None):
+    """Record-level gate for one declared v7 pair.
+
+    Ordinary arms use ``pair_reason``.  A declared protocol contrast (the
+    dense->sparse switch step) must use ``protocol_contrast_reason``: that
+    gate removes ONLY the declared ``warm_steps`` axis and then applies the
+    full ``pair_reason`` check to everything else.  Dispatching in one place
+    keeps the report from accepting a warmup pair through a weaker path or
+    refusing it because ``pair_reason`` sees two protocol tags.
+    """
+    decls = ROPE_CONTRAST_FACTORS if declarations is None else declarations
+    _decl = (decls or {}).get(name) if isinstance(decls, dict) else None
+    if isinstance(_decl, dict) and _decl.get('protocol_factor') is not None:
+        return L.protocol_contrast_reason(ra, rb, _decl)
+    return L.pair_reason(ra, rb)
+
 def bootstrap_report(outdirs, out='analysis_v7/stats.json'):
     os.makedirs(os.path.dirname(out) or '.', exist_ok=True)
     recs = {}
@@ -572,7 +588,7 @@ def bootstrap_report(outdirs, out='analysis_v7/stats.json'):
                         _slot[r['seed']] = _dup
                     continue
                 _slot[r['seed']] = r
-    pairs = [('warmup w=5000 vs scratch', 'results_lm_v7_warmup::csa_fixed::w5000', 'results_lm_v7_warmup::csa_fixed::w0'), ('warmup w=10000 vs scratch', 'results_lm_v7_warmup::csa_fixed::w10000', 'results_lm_v7_warmup::csa_fixed::w0'), ('CSA+RoPE vs CSA absPE', 'results_lm_v7_rope::csa_fixed_rope', 'results_lm_v7_rope::csa_fixed'), ('CSA+RoPE vs dense+RoPE', 'results_lm_v7_rope::csa_fixed_rope', 'results_lm_v7_rope::full_rope'), ('hybrid+RoPE vs dense+RoPE', 'results_lm_v7_rope::hybrid_fixed_rope', 'results_lm_v7_rope::full_rope')]
+    pairs = list(ROPE_REPORT_PAIRS)
     per_variant = {}
     for k, v in recs.items():
         _m = {s: r for s, r in v.items() if not r.get('_dup')}
@@ -609,7 +625,7 @@ def bootstrap_report(outdirs, out='analysis_v7/stats.json'):
                 unstamped += 1
             if rb.get('run_cfg') is None:
                 unstamped += 1
-            reason = L.pair_reason(ra, rb)
+            reason = contrast_pair_reason(name, ra, rb)
             if reason is not None:
                 if reason.startswith('disagreeing') or reason.startswith('unverifiable'):
                     mismatch_fields.add(reason)

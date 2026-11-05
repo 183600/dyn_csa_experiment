@@ -872,6 +872,35 @@ def _v7_knobs_fp(device=None, batch_size=None):
 
 ROPE_VARIANTS = ['full_rope', 'csa_fixed_rope', 'hybrid_fixed_rope', 'csa_dynamic_rope', 'csa_fixed']
 PARAM_MATCHED_V7 = {'full_rope', 'full_sw128_matched_rope', 'full_rope_sink'}
+
+# The dense->sparse warmup panel is a one-factor PROTOCOL experiment: the only
+# axis that may differ is the switch step (`warm_steps`).  These declarations
+# make that explicit and let `sweep_contrast_factor_audit` verify them, while
+# `protocol_contrast_reason` is the record-level gate that removes exactly
+# that axis before applying the ordinary paired-run checks.  Without this,
+# the v7 report's warmup pairs were refused by `pair_reason` (different
+# protocol tags) and never produced a controlled number.
+WARMUP_CONTRAST_FACTORS = {
+    'warmup w=5000 vs scratch': {
+        'protocol_factor': 'warm_steps',
+        'a_level': 5000, 'b_level': 0,
+        'single_factor': True,
+        'factors': ['warm_steps'],
+        'factors_note': ('the dense->sparse switch step is the only moved '
+                         'axis; arm, data, evaluation rows and training recipe '
+                         'stay fixed'),
+    },
+    'warmup w=10000 vs scratch': {
+        'protocol_factor': 'warm_steps',
+        'a_level': 10000, 'b_level': 0,
+        'single_factor': True,
+        'factors': ['warm_steps'],
+        'factors_note': ('the dense->sparse switch step is the only moved '
+                         'axis; arm, data, evaluation rows and training recipe '
+                         'stay fixed'),
+    },
+}
+
 ROPE_CONTRAST_FACTORS = {
     'CSA+RoPE vs CSA absPE': {
         'a': 'csa_fixed_rope', 'b': 'csa_fixed',
@@ -918,6 +947,29 @@ ROPE_CONTRAST_FACTORS = {
         'factors_note': 'single-factor dense attention-sink ablation',
     },
 }
+ROPE_CONTRAST_FACTORS.update(WARMUP_CONTRAST_FACTORS)
+
+# One declaration table is the source of truth for both the report's pair list
+# and the factor audit.  Protocol pairs carry tag names instead of AttnCfg
+# arms; `contrast_pair_reason` dispatches them through the protocol gate.
+ROPE_REPORT_PAIRS = (
+    ('warmup w=5000 vs scratch',
+     'results_lm_v7_warmup::csa_fixed::w5000',
+     'results_lm_v7_warmup::csa_fixed::w0'),
+    ('warmup w=10000 vs scratch',
+     'results_lm_v7_warmup::csa_fixed::w10000',
+     'results_lm_v7_warmup::csa_fixed::w0'),
+    ('CSA+RoPE vs CSA absPE',
+     'results_lm_v7_rope::csa_fixed_rope',
+     'results_lm_v7_rope::csa_fixed'),
+    ('CSA+RoPE vs dense+RoPE',
+     'results_lm_v7_rope::csa_fixed_rope',
+     'results_lm_v7_rope::full_rope'),
+    ('hybrid+RoPE vs dense+RoPE',
+     'results_lm_v7_rope::hybrid_fixed_rope',
+     'results_lm_v7_rope::full_rope'),
+)
+
 
 def attach_contrast_factor_metadata(comparisons, declarations, factor_report):
     _pairs = factor_report.get('pairs') if isinstance(factor_report, dict) else None

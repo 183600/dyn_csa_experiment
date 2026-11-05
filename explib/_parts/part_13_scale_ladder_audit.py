@@ -1432,6 +1432,51 @@ BASELINE_DESIGN = {
     ],
 }
 
+# Descriptive top-k budget sweep.  This family is not an innovation
+# leave-one-out (the report labels it descriptive), but it IS a one-knob dose
+# response: every pair must differ only in `index_topk` from the fixed-block
+# reference.  It used to be a hard-coded pair list in the report, so an arm
+# drift could silently turn "8 vs 32 vs 64 blocks" into a multi-knob
+# comparison while still being printed under a top-k heading.  The registry is
+# now the single source of truth; `sweep_contrast_factor_audit` verifies the
+# actual arm configs and the report reads the same pairs from here.
+TOPK_BUDGET_CONTRAST_FACTORS = {
+    'topk8 vs fixed32': {
+        'a': 'csa_fix_topk8', 'b': 'csa_fixed',
+        'single_factor': True,
+        'factors': ['index_topk'],
+        'factors_note': ('descriptive top-k budget dose response at fixed '
+                         'blocking; the only moved axis is how many blocks '
+                         'are read'),
+    },
+    'topk64 vs fixed32': {
+        'a': 'csa_fix_topk64', 'b': 'csa_fixed',
+        'single_factor': True,
+        'factors': ['index_topk'],
+        'factors_note': ('descriptive top-k budget dose response at fixed '
+                         'blocking; the only moved axis is how many blocks '
+                         'are read'),
+    },
+}
+
+
+def declared_topk_budget_pairs():
+    """Every descriptive top-k pair, in registry order, without duplicates."""
+    out, seen = [], set()
+    if not isinstance(TOPK_BUDGET_CONTRAST_FACTORS, dict):
+        return out
+    for spec in TOPK_BUDGET_CONTRAST_FACTORS.values():
+        if not isinstance(spec, dict):
+            continue
+        a, b = spec.get('a'), spec.get('b')
+        if not isinstance(a, str) or not isinstance(b, str):
+            continue
+        pair = (a, b)
+        if pair not in seen:
+            seen.add(pair)
+            out.append(pair)
+    return out
+
 # ---- 参数匹配基线的预注册 SESOI -------------------------------------------
 # 方法优于参数匹配稠密基线也需要实际显著性边界。一个在 n 很大时「显著」但
 # 只比稠密基线低 0.1% PPL 的差异，不足以支撑「压缩读取代价换来了实际收益」

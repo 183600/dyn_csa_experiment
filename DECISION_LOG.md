@@ -7149,3 +7149,49 @@ fail/not_estimable 分支；非法 spec/seed/delta/alpha/min_specs/min_seeds/
 primary 的 fail-closed；Markdown、`_PARTS`/Makefile/CLI/report 接线；
 README 与 `.github` 路径仍存在。`python audit_gates.py report` 顶层含
 `analysis_multiverse`；完整 CPU 套件在本轮最终树通过。
+
+## 2026-11-05 — 描述性/协议单因素实验也纳入定义点门：top-k 剂量扫描与 warmup 切换点（本轮单因素实验检查，no new runs）
+
+零 GPU；不新增训练、不读取任何 split、不修改
+`confirmation_frozen*.json` 的字节/臂/种子/端点/α/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未删除、未修改、未移动。
+
+**Problem.** 已有单因素门覆盖了消融、NIAH、probe、冻结/动态清单、开放块、
+2x2 简单效应和 lesion，但还有两类被报告引用的单因素实验没有定义点契约。
+第一类是描述性 fixed-block top-k 预算扫描：`csa_fix_topk8/64` 与
+`csa_fixed` 的配对是报告里硬编码的，臂定义漂移不会被发现。第二类是 v7
+dense→sparse warmup：两条预注册比较只差协议切换步 `warm_steps`，却没有
+声明、没有审计，而且报告用 `pair_reason` 配对；该门按设计拒绝两个不同
+protocol tag，所以这两条即使有数据也只能得到 `n=0` / omitted。仓库里的
+`protocol_contrast_reason` 正是为此写的，但此前没有调用点。
+
+**Fix.** 新增
+`exp_lib.TOPK_BUDGET_CONTRAST_FACTORS` / `declared_topk_budget_pairs()`：
+两条 top-k 对照声明为只差 `index_topk`，报告配对表改从注册表读取，
+`sweep_contrast_factor_audit` 用真实工厂核验实际臂 diff；
+`audit_gates.py single_factor` 新增 `topk_budget_contrasts` 块。新增
+`explib.rope.WARMUP_CONTRAST_FACTORS`（`protocol_factor='warm_steps'`，
+明确 `a_level`/`b_level`）并并入 `ROPE_CONTRAST_FACTORS`；v7 报告的配对表
+改由 `ROPE_REPORT_PAIRS` 提供，新增 `contrast_pair_reason()` 按声明分派：
+普通臂走 `pair_reason`，协议对照走 `protocol_contrast_reason`（只移除声明
+的 `warm_steps`，其余字段仍跑完整配对门）。报告把声明元数据与
+`factor_declaration_verified` 一并落盘，未验证时清零 `single_factor`。
+聚合 `audit_single_factor` 新增 `warmup_contrasts` 块，`v7_contrasts` 也
+包含这两条。顺带修复协议声明错误分支的格式串 bug：
+`'... {{protocol_factor!r}}'.format(protocol_factor)` 会触发 `KeyError`，
+现在非法 factors 声明正常返回 `status='fail'`。
+
+**Boundary.** top-k 扫描仍是 descriptive，不进入创新消融 Holm 族，也不
+被升级成机制证据；warmup 是协议单因素而不是 AttnCfg 旋钮，`warm_steps`
+由协议门而不是 cfg 族判据放行。不重算旧结果、不回填缺失记录、不改变冻结
+计划、种子、端点、α/Holm 或 `CODE_SEMANTICS`。
+
+**Verification.** 新增 `test_single_factor_descriptive_controls.py` 8 项：
+top-k 声明只差 `index_topk`、第二旋钮 refuse、报告配对来自同一声明；
+warmup 声明只差 `warm_steps`、第二协议轴 refuse；`pair_reason` 拒绝两个
+protocol tag 而 `protocol_contrast_reason` 放行、错误 level 与第二差异仍
+refuse；`ROPE_REPORT_PAIRS`/声明表同步；临时 summary 端到端跑
+`bootstrap_report` 得到 `n=2` 且 `single_factor=True` /
+`factor_declaration_verified=True`；聚合门的
+`topk_budget_contrasts` / `warmup_contrasts` / `v7_contrasts` 均为 ok。
+完整 CPU 套件在本轮最终树通过。

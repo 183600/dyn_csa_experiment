@@ -1822,11 +1822,10 @@ def _print_pairs(summary):
     _pair_amb = sorted(_amb)
     _pair_skip = []
     # Read the declared leave-one-out design instead of maintaining a second
-    # hard-coded table that can silently omit a declared contrast.  The top-k
-    # budget sweep is descriptive (not an innovation), so its pairs are added
-    # explicitly after the declared ablations.
-    _declared = declared_ablation_pairs() + [
-        ('csa_fix_topk8', 'csa_fixed'), ('csa_fix_topk64', 'csa_fixed')]
+    # hard-coded table that can silently omit a declared contrast.  The
+    # descriptive top-k budget sweep comes from its own registry, which the
+    # same definition-site factor audit verifies.
+    _declared = declared_ablation_pairs() + declared_topk_budget_pairs()
     PAIRS, _seen_pairs = [], set()
     for _pair in _declared:
         if _pair not in _seen_pairs:

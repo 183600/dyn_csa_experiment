@@ -162,6 +162,12 @@ def audit_single_factor(manifest_path=None):
       * v7 RoPE / 选择器 / sink 对照声明（`v7.ROPE_CONTRAST_FACTORS`）：把
         位置编码、选择器、全块读取与 sink 对照的 factors 与 v7 工厂的真实
         arm diff 对账；
+      * v7 dense→sparse warmup 协议对照（`v7.WARMUP_CONTRAST_FACTORS`）：
+        唯一的协议轴 `warm_steps` 与显式 level 对账；记录级由
+        `protocol_contrast_reason` 移除该轴后再跑完整配对门；
+      * 描述性 top-k 预算扫描（`exp_lib.TOPK_BUDGET_CONTRAST_FACTORS`）：
+        `topk8/64 - fixed32` 必须只差 `index_topk`；报告配对表与声明表
+        同源，杜绝硬编码漂移；
       * v10 NIAH 对照声明（`exp_lib.NIAH_CONTRAST_FACTORS`）：推理期 randidx
         /allblocks override 必须只改 `indexer_mode`/`index_topk`，from-scratch
         对照必须与 v7 工厂的真实 arm diff 一致；dense 对照明确为架构级；
@@ -183,6 +189,7 @@ def audit_single_factor(manifest_path=None):
     L = _import_exp_lib()
     out = {'status': 'ok', 'design': {}, 'initialization': {},
            'open_block_matrix': {}, 'sweep_contrasts': {}, 'v7_contrasts': {},
+           'warmup_contrasts': {}, 'topk_budget_contrasts': {},
            'niah_contrasts': {}, 'probe_contrasts': {}, 'dynamic_study': {},
            'frozen_manifest': {}, 'factorial_design': {},
            'content_controls': {}, 'sink_controls': {},
@@ -194,6 +201,22 @@ def audit_single_factor(manifest_path=None):
     out['initialization'] = init_rep
     manip_rep = L.ablation_manipulation_audit()
     out['manipulation'] = manip_rep
+    # The descriptive top-k budget sweep is a dose-response experiment too:
+    # the report prints `topk8/topk64 - fixed32` under a top-k heading, so the
+    # actual arms must differ only in `index_topk`.  It used to bypass every
+    # definition-site check because its pairs were hard-coded in the report.
+    try:
+        topk_rep = L.sweep_contrast_factor_audit(
+            L.TOPK_BUDGET_CONTRAST_FACTORS, verbose=False)
+    except Exception as _e:
+        topk_rep = {'status': 'not_verifiable_locally',
+                    'note': f'cannot audit the top-k budget declarations '
+                            f'({type(_e).__name__}: {_e})'}
+    out['topk_budget_contrasts'] = topk_rep
+    if topk_rep.get('status') != 'ok':
+        # This is an in-repo declaration, not an external artifact: an
+        # unreadable/malformed registry is a design failure, never a pass.
+        out['status'] = 'fail'
     # Within-checkpoint lesions are single-component interventions too.  The
     # lesion design gate now applies the same cfg-diff family test as the
     # between-arm gates; only its zero-model layer is needed here (the full
@@ -251,6 +274,11 @@ def audit_single_factor(manifest_path=None):
             V7.ROPE_CONTRAST_FACTORS, factory=_factory, verbose=False)
         out['v7_contrasts'] = _v7_rep
         if _v7_rep.get('status') == 'fail':
+            out['status'] = 'fail'
+        _warm_rep = L.sweep_contrast_factor_audit(
+            V7.WARMUP_CONTRAST_FACTORS, verbose=False)
+        out['warmup_contrasts'] = _warm_rep
+        if _warm_rep.get('status') != 'ok':
             out['status'] = 'fail'
         _niah_rep = L.niah_contrast_factor_audit(
             factory=_factory, verbose=False)

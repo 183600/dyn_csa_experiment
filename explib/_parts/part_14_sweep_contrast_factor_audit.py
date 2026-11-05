@@ -85,7 +85,7 @@ def sweep_contrast_factor_audit(declarations, *, factory=None, n_layers=6,
                 ok = False
                 report['violations'].append(
                     f'{label}: protocol factors {sorted(declared_set)} must be '
-                    f'exactly {{protocol_factor!r}}'.format(protocol_factor))
+                    f'exactly {{{protocol_factor!r}}}')
             if declared_sf is not True:
                 ok = False
                 report['violations'].append(
