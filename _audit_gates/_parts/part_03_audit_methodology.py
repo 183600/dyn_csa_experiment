@@ -659,11 +659,17 @@ def audit_lesion(path=None, *, verbose=True):
                     f'{len(family_across_artifacts.get("single_panel_only_panels") or [])} '
                     'single-panel claim(s) do not survive the pooled '
                     f'{family_across_artifacts.get("family", {}).get("m")}-panel correction')
+    statuses = [p.get('status') for p in panels.values()]
     if problems:
         status = 'fail'
     elif not panels:
         status = 'not_verifiable_locally'
-    elif (any(p.get('status') == 'warn' for p in panels.values())
+    elif all(s == 'not_verifiable' for s in statuses):
+        # An artifact that exists but carries no replayable panel is missing
+        # evidence, not a pass.  The endpoint gate already uses this
+        # distinction; keep the lesion gate on the same contract.
+        status = 'not_verifiable_locally'
+    elif (any(s in ('warn', 'not_verifiable') for s in statuses)
           or (family_across_artifacts is not None
               and family_across_artifacts.get('status') == 'warn')):
         status = 'warn'

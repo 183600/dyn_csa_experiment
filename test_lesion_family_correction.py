@@ -189,6 +189,69 @@ def test_family_audit_rejects_non_mapping_and_marks_empty_family():
     assert before == after
 
 
+def test_inert_panel_does_not_consume_an_outcome_family_slot():
+    # `inert` means the lesion did not change the forward, so it has no PPL
+    # outcome claim.  It belongs to the declared ladder but must not inflate
+    # the Holm multiplier of the real panel (n=6 necessary would otherwise be
+    # downgraded to single_panel_only by a no-op panel).
+    inert = _records('content_pooling', 'csa_dynamic', n=6, lesion=11.0)
+    for rec in inert:
+        rec['sensitivity'] = {'changed': False, 'weights_unchanged': True}
+    records = _records('attention_sink', 'csa_fixed', n=6, lesion=11.0) + inert
+    rep = L.lesion_panel_audit({'records': records})
+    fam = rep['family']
+    assert rep['panels']['content_pooling/csa_dynamic']['verdict'] == 'inert'
+    assert fam['family']['declared_m'] == 2
+    assert fam['family']['m'] == 1
+    assert fam['family']['outcome_m'] == 1
+    assert fam['family']['inert_panels'] == ['content_pooling/csa_dynamic']
+    assert fam['family']['min_n_for_alpha'] == 6
+    assert fam['superiority']['reject_panels'] == [
+        'attention_sink/csa_fixed']
+    assert fam['equivalence']['reject_panels'] == []
+    assert fam['superiority']['panels']['content_pooling/csa_dynamic'][
+        'p_holm'] is None
+    assert fam['superiority']['panels']['content_pooling/csa_dynamic'][
+        'resolution_limited'] is None
+    inert_row = fam['panels']['content_pooling/csa_dynamic']
+    assert inert_row['in_family'] is True
+    assert inert_row['in_outcome_family'] is False
+    assert inert_row['family_verdict'] == 'inert'
+    assert inert_row['p_holm_superiority'] is None
+    real = fam['panels']['attention_sink/csa_fixed']
+    assert real['in_outcome_family'] is True
+    assert real['family_verdict'] == 'necessary'
+    assert real['family_claim_allowed'] is True
+    assert rep['family_claim_allowed_panels'] == ['attention_sink/csa_fixed']
+    assert rep['single_panel_only_panels'] == []
+
+
+def test_empty_lesion_artifact_is_missing_evidence_not_a_pass(tmp_path,
+                                                             monkeypatch):
+    import audit_gates as A
+    empty = tmp_path / 'results_empty'
+    empty.mkdir()
+    with open(empty / 'lesion.json', 'w', encoding='utf-8') as f:
+        json.dump({'records': []}, f)
+    monkeypatch.setattr(A, 'REPO', str(tmp_path))
+    with contextlib.redirect_stdout(io.StringIO()):
+        rep = A.audit_lesion()
+    assert rep['panels']['results_empty/lesion.json']['status'] == \
+        'not_verifiable'
+    assert rep['status'] == 'not_verifiable_locally', rep
+
+    # One usable artifact and one empty artifact must not turn the gate green:
+    # the missing panel is a warning, not silently ignored.
+    good = tmp_path / 'results_good'
+    good.mkdir()
+    with open(good / 'lesion.json', 'w', encoding='utf-8') as f:
+        json.dump({'records': _records(
+            'attention_sink', 'csa_dynamic', n=6, lesion=11.0)}, f)
+    with contextlib.redirect_stdout(io.StringIO()):
+        mixed = A.audit_lesion()
+    assert mixed['status'] == 'warn', mixed
+
+
 def test_scan_pools_lesion_panels_across_artifacts(tmp_path, monkeypatch):
     import audit_gates as A
     for name, component in (('results_a', 'attention_sink'),

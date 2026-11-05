@@ -1,3 +1,11 @@
+# The exact max-T block materialises 2**n_seeds sign patterns.  Its producer
+# refuses n above the hard enumeration cap, so a larger declared count can only
+# be a malformed artifact; never compute ``1 << n_seeds`` for it (a 1000-digit
+# JSON integer would raise OverflowError while the gate is reporting the
+# tamper).  This is a reporting guard, not the statistical enumeration cap.
+_AFC_MAX_ENUM_SEEDS = 64
+
+
 def audit_family_correction(path=None):
     """Result-analysis gate: replay the dependence-aware family correction.
 
@@ -224,13 +232,27 @@ def audit_family_correction(path=None):
                 out['problems'].append(
                     f'{name}: simultaneous interval {ci!r} is not ordered/finite')
     ns = block.get('n_seeds')
-    if isinstance(ns, int) and isinstance(block.get('seeds'), list):
-        if ns != len(block['seeds']):
+    if isinstance(ns, int) and not isinstance(ns, bool) and isinstance(
+            block.get('seeds'), list):
+        if ns < 0:
             out['problems'].append(
-                f'n_seeds={ns} != len(seeds)={len(block["seeds"])}')
-        if ns > 0 and block.get('n_patterns') != (1 << ns):
+                f'n_seeds must be non-negative, got bit_length={ns.bit_length()}')
+        elif ns > _AFC_MAX_ENUM_SEEDS:
+            # Do not evaluate 1 << ns here: an untrusted artifact can carry a
+            # finite integer far beyond the exact-enumeration cap.
             out['problems'].append(
-                f'n_patterns={block.get("n_patterns")!r} != 2**n_seeds={1 << ns}')
+                'n_seeds declares an integer with '
+                f'bit_length={ns.bit_length()}, above the supported family '
+                f'enumeration cap {_AFC_MAX_ENUM_SEEDS}')
+        else:
+            if ns != len(block['seeds']):
+                out['problems'].append(
+                    f'n_seeds={ns} != len(seeds)={len(block["seeds"])}')
+            want_patterns = 1 << ns
+            if ns > 0 and block.get('n_patterns') != want_patterns:
+                out['problems'].append(
+                    'n_patterns=%r != 2**n_seeds=%d'
+                    % (block.get('n_patterns'), want_patterns))
     if block.get('m_declared') != len(names):
         out['problems'].append(
             f'm_declared={block.get("m_declared")!r} != len(family_names)={len(names)}')

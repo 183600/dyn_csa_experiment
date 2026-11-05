@@ -370,8 +370,17 @@ def test_audit_detects_tampering_and_legacy_artifacts():
         d = copy.deepcopy(good)
         d['family_correction']['family_names'] = [name]
         cases.append(d)
+        # A finite 1001-digit JSON integer still fits Python's decimal limit,
+        # but 1 << n_seeds would raise OverflowError while the gate reports
+        # the tamper.  The count guard must fail closed instead.
+        d = copy.deepcopy(good)
+        d['family_correction']['n_seeds'] = 10 ** 1000
+        d['family_correction']['seeds'] = []
+        cases.append(d)
         for bad in cases:
-            assert write(bad)['status'] == 'fail', bad
+            out = write(bad)
+            assert out['status'] == 'fail', (bad, out)
+            json.dumps(out, allow_nan=False)
         legacy = copy.deepcopy(good)
         legacy.pop('family_correction')
         assert write(legacy, 'legacy.json')['status'] == 'not_verifiable_locally'

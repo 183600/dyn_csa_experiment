@@ -709,8 +709,12 @@ def lesion_family_audit(panels, *, alpha=LESION_POLICY['alpha'],
 
     The function is descriptive and fail-closed: unknown/duplicate family
     names are a ``fail`` (a typo would otherwise shrink the correction), and
-    a panel with no usable p still occupies a slot via ``holm_adjust``.  It
-    never rewrites the single-panel ``verdict`` or ``claim_allowed``; it adds
+    a panel with no usable p still occupies a slot via ``holm_adjust``.  An
+    ``inert`` panel is a manipulation-channel verdict (the lesion did not
+    change the forward), not a PPL outcome claim, so it is listed in the
+    declared family but does NOT consume a superiority/equivalence slot: a
+    no-op lesion must not make a real panel less resolvable.  It never
+    rewrites the single-panel ``verdict`` or ``claim_allowed``; it adds
     ``family_verdict``/``family_claim_allowed`` beside them.
     """
     alpha = _validated_alpha(alpha, context='lesion_family_audit alpha')
@@ -721,6 +725,7 @@ def lesion_family_audit(panels, *, alpha=LESION_POLICY['alpha'],
         'family': {
             'names': [], 'declared': family is not None,
             'source': family_source, 'm': 0,
+            'declared_m': 0, 'outcome_m': 0, 'inert_panels': [],
             'alpha': float(alpha), 'equivalence_alpha': None,
         },
         'superiority': {'method': 'holm over exact sign-flip p',
@@ -785,14 +790,27 @@ def lesion_family_audit(panels, *, alpha=LESION_POLICY['alpha'],
             out['status'] = 'fail'
             return out
     out['family']['names'] = list(family_names)
-    out['family']['m'] = len(family_names)
+    # `m` is the number of panels that actually enter the outcome p-value
+    # families.  An inert panel belongs to the declared ladder (it is still
+    # named and has an operational claim) but has no PPL outcome claim, so it
+    # must not consume a Holm slot or shrink the resolution of the others.
+    inert_set = {
+        name for name in family_names
+        if isinstance(panels.get(name), dict)
+        and panels[name].get('verdict') == 'inert'}
+    inert_names = sorted(inert_set)
+    outcome_names = [name for name in family_names if name not in inert_set]
+    out['family']['declared_m'] = len(family_names)
+    out['family']['m'] = len(outcome_names)
+    out['family']['outcome_m'] = len(outcome_names)
+    out['family']['inert_panels'] = list(inert_names)
     out['family']['min_n_for_alpha'] = signflip_min_n_for_holm(  # noqa: F821
-        len(family_names), alpha, n_max=10000)
+        len(outcome_names), alpha, n_max=10000)
     # The equivalence family needs one one-sided alpha.  Panels should share
     # a TOST confidence level; if they do not, use the most conservative one
     # and say so instead of silently mixing thresholds.
     eq_alphas = []
-    for name in family_names:
+    for name in outcome_names:
         panel = panels.get(name)
         tost = panel.get('tost') if isinstance(panel, dict) else None
         a_one = _lf_probability(tost.get('alpha_one_sided')
@@ -806,9 +824,10 @@ def lesion_family_audit(panels, *, alpha=LESION_POLICY['alpha'],
             'family panels use different TOST one-sided alphas '
             f'{sorted(set(eq_alphas))}; the most conservative '
             f'{eq_alpha!r} is used for every equivalence decision')
-    # Build the two Holm families.  None/invalid p still occupies a slot.
+    # Build the two Holm families.  None/invalid p still occupies a slot; an
+    # inert panel does not, because it has no outcome claim to correct.
     sup_inputs, eq_inputs = [], []
-    for name in family_names:
+    for name in outcome_names:
         panel = panels.get(name) if isinstance(panels.get(name), dict) else {}
         tost = panel.get('tost') if isinstance(panel.get('tost'), dict) else {}
         sup_inputs.append((name, panel.get('p_exact_signflip')))
@@ -828,41 +847,58 @@ def lesion_family_audit(panels, *, alpha=LESION_POLICY['alpha'],
     for name in family_names:
         panel = panels.get(name) if isinstance(panels.get(name), dict) else {}
         tost = panel.get('tost') if isinstance(panel.get('tost'), dict) else {}
+        is_inert = name in inert_set
         sup_rec = sup.get(name) or {}
         eq_rec = eq.get(name) or {}
         p_sup = _lf_probability(panel.get('p_exact_signflip'))
         p_eq = _lf_probability(tost.get('p_tost'))
         floor = _lf_probability(panel.get('p_floor'))
-        res_limited = bool(
+        # Inert panels are not in the outcome family; do not attach a family
+        # p-value or a resolution verdict to a manipulation-channel reading.
+        res_limited = (None if is_inert else bool(
             floor is not None
-            and (len(family_names) * floor) > alpha + 1e-15)
-        out['superiority']['panels'][name] = {
+            and (len(outcome_names) * floor) > alpha + 1e-15))
+        sup_row = {
             'p_raw': p_sup,
-            'p_holm': _lf_probability(sup_rec.get('p_holm')),
-            'rank': sup_rec.get('rank'),
-            'reject': bool(sup_rec.get('reject')),
+            'p_holm': (None if is_inert
+                       else _lf_probability(sup_rec.get('p_holm'))),
+            'rank': (None if is_inert else sup_rec.get('rank')),
+            'reject': False if is_inert else bool(sup_rec.get('reject')),
             'p_floor': floor,
             'resolution_limited': res_limited,
-            'm_effective': sup_rec.get('m_effective'),
+            'm_effective': (None if is_inert
+                            else sup_rec.get('m_effective')),
+            'in_outcome_family': not is_inert,
         }
-        out['equivalence']['panels'][name] = {
+        eq_row = {
             'p_raw': p_eq,
-            'p_holm': _lf_probability(eq_rec.get('p_holm')),
-            'rank': eq_rec.get('rank'),
-            'reject': bool(eq_rec.get('reject')),
+            'p_holm': (None if is_inert
+                       else _lf_probability(eq_rec.get('p_holm'))),
+            'rank': (None if is_inert else eq_rec.get('rank')),
+            'reject': False if is_inert else bool(eq_rec.get('reject')),
             'alpha_one_sided': eq_alpha,
-            'm_effective': eq_rec.get('m_effective'),
+            'm_effective': (None if is_inert
+                            else eq_rec.get('m_effective')),
+            'in_outcome_family': not is_inert,
         }
-        if out['superiority']['panels'][name]['reject']:
+        if is_inert:
+            sup_row['reason'] = (
+                'inert is a manipulation-channel verdict with no PPL '
+                'outcome claim; it does not occupy an outcome-family slot')
+            eq_row['reason'] = sup_row['reason']
+        out['superiority']['panels'][name] = sup_row
+        out['equivalence']['panels'][name] = eq_row
+        if sup_row['reject']:
             out['superiority']['reject_panels'].append(name)
-        if out['equivalence']['panels'][name]['reject']:
+        if eq_row['reject']:
             out['equivalence']['reject_panels'].append(name)
         verdict = panel.get('verdict')
         single_claim = bool(panel.get('claim_allowed'))
-        if verdict in ('necessary', 'harmful', 'engaged_below_sesoi'):
+        if not is_inert and verdict in ('necessary', 'harmful',
+                                        'engaged_below_sesoi'):
             kind = 'superiority'
             fam_ok = bool(sup_rec.get('reject'))
-        elif verdict == 'redundant':
+        elif not is_inert and verdict == 'redundant':
             kind = 'equivalence'
             fam_ok = bool(eq_rec.get('reject'))
         else:
@@ -875,6 +911,12 @@ def lesion_family_audit(panels, *, alpha=LESION_POLICY['alpha'],
                 panel.get('claim')
                 if single_claim else
                 'no outcome claim to correct at the family level')
+            if is_inert:
+                family_claim = (
+                    (panel.get('claim') or 'no outcome claim to correct')
+                    if single_claim else
+                    'inert has no outcome claim; the operational reading is '
+                    'not corrected as a PPL family')
         elif fam_ok and single_claim:
             family_verdict = verdict
             family_claim_allowed = True
@@ -884,8 +926,9 @@ def lesion_family_audit(panels, *, alpha=LESION_POLICY['alpha'],
             family_claim_allowed = False
             family_claim = (
                 'the unadjusted single-panel verdict does not survive Holm '
-                f'across the {len(family_names)}-panel family; report it as '
-                'single-panel/exploratory, not as a family-level conclusion')
+                f'across the {len(outcome_names)}-panel outcome family; '
+                'report it as single-panel/exploratory, not as a '
+                'family-level conclusion')
         if single_claim and kind is not None:
             if family_claim_allowed:
                 claimed.append(name)
@@ -894,16 +937,15 @@ def lesion_family_audit(panels, *, alpha=LESION_POLICY['alpha'],
         out['panels'][name] = {
             'panel': name,
             'in_family': True,
+            'in_outcome_family': not is_inert,
             'single_panel_verdict': verdict,
             'single_panel_claim_allowed': single_claim,
             'family_verdict': family_verdict,
             'family_claim_allowed': bool(family_claim_allowed),
             'family_claim': family_claim,
             'claim_kind': kind,
-            'p_holm_superiority':
-                out['superiority']['panels'][name]['p_holm'],
-            'p_holm_equivalence':
-                out['equivalence']['panels'][name]['p_holm'],
+            'p_holm_superiority': sup_row['p_holm'],
+            'p_holm_equivalence': eq_row['p_holm'],
         }
     # Panels outside a declared family are named, never silently ignored.
     for name in sorted(set(names) - set(family_names)):
@@ -913,6 +955,7 @@ def lesion_family_audit(panels, *, alpha=LESION_POLICY['alpha'],
         out['panels'][name] = {
             'panel': name,
             'in_family': False,
+            'in_outcome_family': False,
             'single_panel_verdict': panel.get('verdict'),
             'single_panel_claim_allowed': single_claim,
             'family_verdict': 'not_in_declared_family',
