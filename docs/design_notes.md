@@ -14654,3 +14654,215 @@ environment-only/not_comparable/unverified 分支；`created_at` 不影响内容
 missing/ok/drift/坏 JSON/裸 result 分支；CLI 的 write/verify/conflict/
 overwrite；以及 `_PARTS`、report、CLI、Makefile 接线与 README/.github
 未被移动。完整 CPU 套件在本轮最终树通过。
+
+## 149. 显著性的差不是差的显著性：冻结 2x2 的交互、族内 max-T 与尺度敏感性（本轮结果分析硬化，no new runs）
+
+零 GPU；不新增训练、不读取任何 split、不修改
+`confirmation_frozen*.json` 的字节/臂/种子/端点/α/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未删除、未修改、未移动。
+
+### 149.1 问题：两个边际的「显著 / 不显著」不是交互
+
+冻结清单里的两条 sink 对照构成一个 2x2 敏感度设计：
+
+| | sink | no sink |
+|---|---|---|
+| CSA | `csa_fixed_rope` | `csa_fixed_rope_nosink` |
+| dense | `full_rope_sink` | `full_rope` |
+
+- `sink-matched`：`csa_fixed_rope - full_rope_sink`；
+- `no-sink`：`csa_fixed_rope_nosink - full_rope`。
+
+报告想回答的是「主对照的优势是不是 sink 解释的」。这句话的估计量不是
+上面任何一个边际，而是**差中差**：
+
+```
+Δ_sink,s   = log PPL(csa_sink,s)   - log PPL(dense_sink,s)
+Δ_nosink,s = log PPL(csa_nosink,s) - log PPL(dense_nosink,s)
+I_s        = Δ_sink,s - Δ_nosink,s
+```
+
+`I` 才是 sink 对 architecture 效应的修饰（effect modification）。仓库
+此前只有两个边际的逐条 p 和 CI；「sink-matched 显著、no-sink 不显著」
+或反过来会被读者当成交互证据。这是经典的 difference-in-significance
+谬误：两个边际检验的显著性差异本身不是它们之差显著；两个边际共享种子，
+交互又是它们的线性组合，逐条 95% CI 的目测重叠也不是交互的 95% CI。
+
+另外两个未被显式处理的结果分析问题：
+
+1. **尺度选择。** 交互可以在 raw PPL 上定义，也可以在 log PPL 上定义。
+   两者回答的是不同 estimand；当两臂基线 PPL 不同时，raw 交互会被基线
+   放大，log 交互不会。事后挑一个显著尺度报告，是把分析自由度藏进
+   「交互显著」这句话里。
+2. **族。** 如果同时读两个边际和交互，这是三个对照；只对交互报一个
+   名义 p，或把三个逐条 p 并排，都没有控制「至少一个」的族错误率。
+
+### 149.2 方法：声明式 2x2、精确 sign-flip、族内 max-T、双尺度
+
+新增 `explib/_parts/part_83_contrast_interaction.py`。
+
+**(a) 声明式 2x2。** `CONFIRMATION_SINK_2X2` 不是按臂名猜：它显式给出
+`factors=['architecture','sink']`、每个 factor 的两个 level、四个
+`cells={cell:{factor:level}}`、`contrast_factor='architecture'`。归一化
+函数要求：
+
+- 恰好两个不同的 factor；
+- 每个 factor 恰好两个不同的 level；
+- 恰好四个 cell，且四个 level 组合各出现一次（重复组合、缺组合、
+  多 cell 都 fail closed）；
+- 每个 cell 的 assignment 恰好覆盖两个 factor，level 必须在声明表里；
+- `contrast_factor` 必须是两个 factor 之一；另一个自动成为 moderator。
+
+这样 `cell_roles[contrast_level][moderator_level]` 是唯一的，不会出现
+「同一个格子被两个名字引用」的静默错配。
+
+**(b) 只用四格共同种子。** `_ci_normalise_cells` 取四个 cell 的 seed
+交集；某格多出来的 seed 被记入 `missing_seeds` 并从交互中剔除，不插补、
+不换种子。少于 `min_n`（默认 3）个共同种子、缺 cell、多 cell、非正/
+非有限 PPL、重复 seed 都返回具名 `not_estimable`，不是 0 或 NaN。
+
+**(c) 两个尺度的逐种子统计。** 对每个 scale（`log_ppl` 主尺度、`ppl`
+敏感性尺度）：
+
+```
+marginal(ml)_s = value(cell[cl0][ml],s) - value(cell[cl1][ml],s)
+interaction_s  = marginal(ml0)_s - marginal(ml1)_s
+```
+
+逐项调用 `paired_effect_stats`：n、mean、t 区间、exact sign-flip p、
+`p_floor`、`n_nonzero`、`resolution_limited`、`underpowered`，并保留
+逐种子值和 seed 标签。log 尺度另给几何 PPL 比 `exp(mean)` 及其区间。
+
+**(d) 方法名必须诚实。** 两个边际 + 交互送进
+`maxt_joint_correction`（同一 seed 向量、`family_size=3`），得到
+`p_family` 与同时区间。max-T 是**学生化 t** twin；逐项
+`p_exact_signflip` 是均值统计，两者不是同一统计量的单调关系，所以
+family 块另存 `p_raw_studentized` 并在交互条目写
+`p_family_statistic`，不把 `p_family >= p_exact_signflip` 当作定理。
+若 n 超过精确枚举上限、矩阵退化或 family 不完整，则**具名**退到同一族
+三个 p 的 Holm：
+
+```
+family.method = 'holm_fallback'
+family.family_ready = false
+family.ci_simultaneous = {}
+```
+
+并写 warning。绝不把 Holm 结果标成 max-T，也不把没有同时区间的读数
+画成同时区间。
+
+**(e) 交互的 TOST 不是默认的。** 只有调用方声明了交互 SESOI
+（`margin` 或 `margin_relative_pct`，两者同时给出时必须描述同一个
+margin）才跑 `tost_paired`。未声明时 `tost=null`，报告必须说「这是
+差异读数，不是与零等价的读数」；「未拒绝交互」不再被写成「无交互」。
+
+**(f) 双尺度一致性是硬 warning。** 计算 log 与 raw 交互的符号是否
+一致、族级拒绝是否一致；任一不一致即
+`scale_agreement.scale_sensitive=true` 并写 warning。报告不得在看到
+结果后挑一个尺度。
+
+**(g) 差中差解读。** `_ci_interpret` 分开：
+
+- `interaction_detected`（族级）；
+- `interaction_detected_raw`（名义）；
+- 哪些边际在族级被拒绝；
+- `difference_in_significance_fallacy`：恰好一个边际名义显著、而交互
+  名义不显著时为 true；这是「不能这样读」的 warning，不是拒绝；
+- `classification`：`effect_modification` /
+  `difference_in_significance_unresolved` /
+  `difference_in_significance_only` / `parallel_effects` /
+  `no_evidence_of_interaction`；
+- `interaction_claim_allowed` 只在族级交互被拒绝、n≥min_n 且非
+  resolution-limited 时为 true，且 `claim_level='exploratory'`。
+
+状态语义：结构/数据不足 `not_estimable`；可估计但有尺度敏感、差中差
+警告、resolution 下限或 fallback 时 `warnings`；其余 `ok`。`ok` 不是
+「交互显著」，只是「这个读数没有命名的 caveat」。
+
+### 149.3 接线：v12、独立产物与审计门
+
+**(a) v12。** `finaltest_stats` 在 by-length cell 建好后调用
+`confirmation_sink_interaction(stats['by_length'], endpoint=
+'by_len.ppl@4096', alpha=_alpha, min_n=3)`，把结果写进
+`stats['sink_factorial']`。它只重述已经准入的四个冻结臂 cell，不读
+manifest 之外的任何数据；缺臂时是具名 `not_estimable`，不会让整个
+stats 失败。该块不进入 `_fam`、不进入 `_rej`/`_conf`、不改变
+`p_exact_signflip`/`p_holm`/`verified`/`confirmed`。
+
+报告新增「冻结 2x2 的 sink × architecture 交互（探索性）」一节：四个
+cell 的 n / mean PPL / mean log PPL，两个尺度的边际与交互表（mean、CI、
+exact p、family p），交互同时区间、TOST（若有），以及差中差/尺度敏感
+warning。节末明确写 post-hoc、非确认、非机制证明。
+
+**(b) 独立产物。** `build_contrast_interaction` / `validate_...` /
+`write_contrast_interaction`：
+
+- `inputs={design,cells,alpha,min_n,margin,margin_relative_pct}`，
+  `result` 是同一 inputs 的重放；`content_sha256` 排除 `created_at` 与
+  自身，所以同一机器重建同一份读数是同一内容身份；
+- validator 先校验 schema/keys/64-hex/hash，再要求 `result` 能从
+  `inputs` **完整重放**；改 mean/p/CI/classification 后重算 hash 仍会
+  被 replay 抓住；夹带 `confirmed`/`verified`/`p_holm`/`verdict`/
+  `decision` 等冻结字段直接 fail；
+- writer 同内容 no-op、不同内容默认 conflict，显式 `overwrite=True`
+  才替换；拒绝写入 invalid artifact。
+
+**(c) 审计门。** `audit_gates.py contrast_interaction`（别名
+`interaction_2x2` / `two_by_two` / `difference_in_differences` / `did` /
+`sink_interaction`）：
+
+- 优先重放 `analysis_v12/contrast_interaction.json`；
+- 没有独立产物时，读 `analysis_v12/test_stats.json` 的
+  `sink_factorial`，用同一 `by_length` 重算并逐字段对账；裸 result
+  没有 inputs 时也走这条路；
+- `ok` / `warnings` / `not_verifiable_locally` / `fail` 分别对应
+  干净、有命名 caveat、无产物或四格不可估计、结构/重放失败；
+- 进入 `audit_gates.py report` 顶层 `contrast_interaction`，并新增
+  `make sink-interaction`。
+
+### 149.4 边界
+
+- **不是新的确认性检验。** 不进入冻结 Holm 族，不改变
+  `confirmed`/`confirmed_effective`/`verified`/`p_holm`，也不改变任何
+  冻结决策。它只回答「这个 2x2 的交互读数是什么」。
+- **不是机制证明。** `csa_fixed_rope`、`full_rope_sink`、
+  `csa_fixed_rope_nosink`、`full_rope` 之间仍有 kernel、qk/kv-norm、
+  MLP/FLOPs、read fraction 等差异；交互只控制 sink 这一个维度的
+  差中差，不能把 `effect_modification` 写成「sink 是唯一原因」。
+- **不是无假设的因果。** 精确 sign-flip 仍以种子为交换单位；交互的
+  有效性依赖四格在种子内的可交换性。缺 cell/缺种子不插补；共同种子
+  不足就 `not_estimable`。
+- **不是尺度无关的。** log 与 raw 回答不同问题；两者不一致时只报
+  warning，不选一个「更显著」的。交互的 raw PPL 读数还会受基线 PPL
+  影响，不能跨 panel 比较大小。
+- **不是等价性。** 未声明交互 SESOI 时没有 TOST；「未拒绝交互」不等于
+  「无交互」。声明 margin 后 TOST 也只回答该 margin 下的等价性。
+- **不是多重宇宙。** 本块只声明一个 2x2 设计；换 cell 定义、换
+  contrast factor、换 scale 仍是研究者自由度，未声明的规格不会被
+  自动校正。旧产物没有该块时 gate 报 `not_verifiable_locally`，不回填
+  历史交互结论。
+- **不是大样本。** n=12 的精确 p 下限是 `2/2^12`，族级下限约
+  `3*2/2^12`；n 较小或交互 resolution-limited 时报告必须写「分辨率
+  不足」，不能把未拒绝读成零交互。
+
+### 149.5 入口与验证
+
+```bash
+python -m pytest -q test_review_part_89.py
+python -m pytest -q test_review_part_09.py test_review_part_42.py
+python audit_gates.py contrast_interaction
+python audit_gates.py interaction_2x2 PATH
+make sink-interaction
+```
+
+新增 `test_review_part_89.py` 16 项：2x2 声明代数与缺/重/多组合
+fail closed；合成交互的精确恢复、exact p 与 family max-T 的
+`p_family >= p_raw`；零交互不被写成 claim；一个边际显著 + 交互不显著
+的差中差 warning；log/raw 尺度不一致的 `scale_sensitive`；缺 cell/
+多 cell/共同种子不足/额外 seed 的不插补；非正/非有限 PPL 与非法
+alpha/min_n/margin 的 fail closed；TOST 仅在声明 margin 时出现；
+artifact 的 hash/`created_at` 身份/重放篡改/冻结字段拒绝；not_estimable
+产物 round-trip 不成 claim；writer 的 no-op/conflict/overwrite；比较器
+的精确差异路径；审计门的 ok/warnings/fail/missing 与 test_stats 内嵌
+重放；v12/report/CLI/Makefile 接线与 README/.github 仍在。完整 CPU
+套件在本轮最终树通过。

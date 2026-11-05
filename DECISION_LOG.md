@@ -7415,3 +7415,93 @@ match/mismatch/environment-only/not_comparable/unverified 分支；
 overwrite；审计门 missing/ok/drift/坏 JSON/裸 result；CLI write/verify/
 conflict/overwrite；`_PARTS`、report、CLI、Makefile 接线与
 README/.github 仍在。完整 CPU 套件在本轮最终树通过。
+
+## 2026-11-05 — 显著性的差不是差的显著性：冻结 2x2 的交互、族内 max-T 与尺度敏感性（本轮结果分析硬化，no new runs）
+
+零 GPU；不新增训练、不读取任何 split、不修改
+`confirmation_frozen*.json` 的字节/臂/种子/端点/α/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未删除、未修改、未移动。
+
+**Problem.** 冻结清单的 `sink-matched` 与 `no-sink` 两条对照构成一个
+2x2 敏感度设计，报告却只给了两个边际的逐条 p/CI。于是「sink-matched
+显著、no-sink 不显著」很容易被写「sink 解释了主对照的优势」；这是
+difference-in-significance 谬误——两个边际检验的显著性差异本身不是
+它们之差显著，两个共享种子的边际的逐条 CI 目测重叠也不是交互的 CI。
+仓库已有 `factorial_interaction_audit` 处理声明式消融 factorial，但
+冻结 v12 的 sink×architecture 2x2 没有接入；同时，交互在 raw PPL 与
+log PPL 上是不同 estimand，事后挑一个显著尺度报告会把分析自由度藏进
+「交互显著」这句话里。
+
+**Fix.** 新增 `explib/_parts/part_83_contrast_interaction.py`：
+
+- `CONFIRMATION_SINK_2X2` 显式声明 factors/levels/cells/contrast_factor；
+  `_ci_normalise_design` 要求恰好两个 factor、每 factor 两个不同 level、
+  四个 cell 覆盖完整 2x2、每个 cell 的 assignment 恰好覆盖两个 factor；
+  缺/重/多组合与未声明 level 均 fail closed。
+- `difference_in_differences(design, cells, ...)` 只用四个 cell 的共同
+  种子；缺 cell/多 cell/非正非有限 PPL/重复 seed 返回具名
+  `not_estimable`，共同种子少于 `min_n` 也不插补。逐种子构造
+  `Δ_sink - Δ_nosink`，对 log PPL 主尺度与 raw PPL 敏感性尺度分别调用
+  `paired_effect_stats`，保留 mean、t 区间、exact sign-flip p、p_floor、
+  n_nonzero、resolution/underpowered 与逐种子值。
+- 两个边际 + 交互送 `maxt_joint_correction`（同一 seed 向量、
+  `family_size=3`）得族内 p 与同时区间；max-T 是学生化 t twin，逐项
+  `p_exact_signflip` 是均值统计，两者不是同一统计量的单调关系，所以
+  family 块另存 `p_raw_studentized` 并在交互条目写
+  `p_family_statistic`。n 超精确枚举上限/退化/族不完整时**具名**退
+  `holm_fallback`，不把 Holm 写成 max-T，也不伪造同时区间。
+- 只有声明交互 SESOI（`margin` 或 `margin_relative_pct`，两者同时给出
+  必须一致）才跑 `tost_paired`；未声明时 `tost=null`，「未拒绝交互」
+  不等于「无交互」。
+- `_ci_interpret` 把 `interaction_detected`（族级）与
+  `interaction_detected_raw`（名义）分开，并给出
+  `difference_in_significance_fallacy`、`classification`
+  （effect_modification / difference_in_significance_unresolved /
+  difference_in_significance_only / parallel_effects /
+  no_evidence_of_interaction）与 `interaction_claim_allowed`（仅族级
+  拒绝 + n≥min_n + 非 resolution-limited；`claim_level='exploratory'`）。
+- `scale_agreement` 比较 log/raw 交互的符号与族级拒绝；任一不一致即
+  `scale_sensitive=true` 并写 warning，报告不得事后挑尺度。
+- `build_/validate_/write_contrast_interaction`：`inputs={design,cells,
+  alpha,min_n,margin,margin_relative_pct}` + `result`，
+  `content_sha256` 排除 `created_at` 与自身；validator 先从 inputs 完整
+  重放并逐字段对账；缺 hash/改 mean/p/CI/classification/夹带
+  `confirmed`/`verified`/`p_holm`/`verdict`/`decision` 均 fail；writer
+  同内容 no-op、不同内容默认 conflict，显式 `overwrite=True` 才替换。
+- `finaltest_stats` 在 by-length cell 建好后把同一批四格重述为
+  `stats['sink_factorial']`；缺臂是具名 `not_estimable`，不影响其余
+  stats。它不进入冻结 Holm 族、`_rej`/`_conf`、功率门或任何冻结字段。
+  报告新增「冻结 2x2 的 sink × architecture 交互（探索性）」一节：
+  cell 表、两个尺度的边际/交互表、family 方法、同时区间、TOST 与
+  差中差/尺度敏感 warning。
+- 新增 `audit_gates.py contrast_interaction`（别名 `interaction_2x2` /
+  `two_by_two` / `difference_in_differences` / `did` /
+  `sink_interaction`）与单产物重放别名：优先重放
+  `analysis_v12/contrast_interaction.json`；没有独立产物时重放
+  `test_stats.json` 的 `sink_factorial`（同一 by_length 重算并逐字段
+  对账）。缺产物/四格不可估计报 `not_verifiable_locally`，结构/重放
+  失败报 `fail`，结果自带 caveat 报 `warnings`。接入
+  `audit_gates.py report` 顶层与 `make sink-interaction`。
+
+**Boundary.** 这是**探索性** 2x2 差中差读数，不是新的确认性检验：不进入
+冻结 Holm 族，不改变 `p_exact_signflip`/`p_holm`/`verified`/
+`confirmed`/`confirmed_effective`，不重算 PPL、不读 test split。四格之间
+仍有 kernel、qk/kv-norm、MLP/FLOPs、read fraction 等差异；交互只控制
+sink 这一个维度的差中差，不能写成「sink 是唯一原因」，也不是机制证明。
+精确 sign-flip 仍以种子为交换单位；缺 cell/缺种子不插补，共同种子不足
+直接不可估计。log 与 raw 是不同 estimand，不一致时只报 warning，不选
+「更显著」的；未声明 SESOI 时没有等价性读数。旧产物没有该块时 gate 报
+`not_verifiable_locally`，不回填历史交互结论。
+
+**Verification.** 新增 `test_review_part_89.py` 16 项：2x2 声明代数与
+缺/重/多组合 fail closed；合成交互的精确恢复、exact p 与
+`p_family >= p_raw`；零交互不成 claim；一个边际显著 + 交互不显著的
+差中差 warning；log/raw 尺度不一致的 `scale_sensitive`；缺 cell/多
+cell/共同种子不足/额外 seed 的不插补；非正/非有限 PPL 与非法
+alpha/min_n/margin 的 fail closed；TOST 仅在声明 margin 时出现；
+artifact 的 hash/`created_at` 身份/重放篡改/冻结字段拒绝；
+not_estimable 产物 round-trip 不成 claim；writer 的
+no-op/conflict/overwrite；比较器的精确差异路径；审计门的
+ok/warnings/fail/missing 与 test_stats 内嵌重放；v12/report/CLI/
+Makefile 接线与 README/.github 仍在。确认相关既有 225 项与完整 CPU 套件
+在本轮最终树通过。

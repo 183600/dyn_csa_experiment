@@ -1991,6 +1991,7 @@ def run_report(out='audit_report.json'):
     res['ablation_ranking'] = audit_ablation_ranking(verbose=False)
     res['ablation_screening'] = audit_ablation_screening(verbose=False)
     res['analysis_multiverse'] = audit_analysis_multiverse(verbose=False)
+    res['contrast_interaction'] = audit_contrast_interaction(verbose=False)
     res['data_exposure'] = audit_data_exposure()
     if str(os.environ.get('CSA_REPLAY_IN_REPORT', '')).strip().lower() in (
             '1', 'true', 'yes', 'on'):
@@ -2142,6 +2143,15 @@ def _run_cli():
                   'global_fdr_artifact': audit_global_fdr_artifact,
                   'global_fdr_replay': audit_global_fdr_artifact,
                   'global_fdr_validation': audit_global_fdr_artifact})
+    _cmds.update({'contrast_interaction': audit_contrast_interaction,
+                  'interaction_2x2': audit_contrast_interaction,
+                  'two_by_two': audit_contrast_interaction,
+                  'difference_in_differences': audit_contrast_interaction,
+                  'did': audit_contrast_interaction,
+                  'sink_interaction': audit_contrast_interaction,
+                  'contrast_interaction_artifact': audit_contrast_interaction_artifact,
+                  'contrast_interaction_replay': audit_contrast_interaction_artifact,
+                  'contrast_interaction_validation': audit_contrast_interaction_artifact})
     _arg = sys.argv[1] if len(sys.argv) > 1 else 'report'
     if _arg in ('-h', '--help'):
         print(__doc__)

@@ -184,6 +184,29 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
                                                                       'n_tokens_by_seed': {str(s): x for s, x in _ntok_by_seed.items()}}
                                                                      if set(_nll_by_seed) == set(_by_seed) else {}),
                                                                   'params': next((r.get('params') for r in rows if isinstance(r.get('params'), (int, float))), None), 'n_seqs': next((c.get('n_seq') for _r in rows for c in [((_r.get('by_len') or {}).get(Ln) or (_r.get('by_len') or {}).get(str(Ln)) or {})] if isinstance(c, dict) and c.get('n_seq') is not None), None)}
+    # The frozen sink-matched / no-sink pair is not two unrelated tests: it is
+    # a 2x2 sensitivity design (architecture x sink).  The question "does the
+    # sink explain the main contrast?" is a difference-in-differences, and a
+    # significant marginal next to a non-significant one is NOT that test.
+    # This block re-describes the SAME four frozen by-length cells; it never
+    # enters the frozen Holm family, the power gate, or the confirmed set.
+    try:
+        stats['sink_factorial'] = L.confirmation_sink_interaction(
+            stats.get('by_length') or {}, endpoint='by_len.ppl@4096',
+            alpha=_alpha, min_n=3)
+    except Exception as _sie:
+        stats['sink_factorial'] = {
+            'kind': 'contrast_interaction',
+            'status': 'not_estimable',
+            'reason': f'{type(_sie).__name__}: {_sie}',
+            'endpoint': 'by_len.ppl@4096',
+            'alpha': float(_alpha),
+            'min_n': 3,
+            'primary_scale': 'log_ppl',
+            'interaction_claim_allowed': False,
+            'note': ('exploratory 2x2 difference-in-differences; it does not '
+                     'change the frozen p/Holm/confirmed decision'),
+        }
     # Position decomposition of the SAME by-length cells: a causal prefix is
     # identical across lengths, so consecutive length totals differ exactly by
     # the newly covered target positions.  This separates a length effect that
@@ -1825,6 +1848,88 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
     else:
         A(f'**尚未运行 P5T**：`{TEST_OUTDIR}/bylen.json` 不存在（或为空）。前置：`python -m explib.confirmation phase P5C`（现覆盖全部六个冻结臂、种子数取自清单；主臂 0-5 已由 P3MT/P4MT 训练，resume 自动跳过），然后 `python -m explib.confirmation phase P5T`。冻结清单已入库（见上），随时可以执行；执行前请勿据任何 validation 读数调整冻结内容。')
         A('')
+    _sf = ft.get('sink_factorial')
+    if isinstance(_sf, dict):
+        A('### 冻结 2x2 的 sink × architecture 交互（探索性）')
+        A('')
+
+        def _sf_num(x, fmt='{:+.4f}'):
+            return (fmt.format(float(x))
+                    if isinstance(x, (int, float)) and not isinstance(x, bool)
+                    else '—')
+
+        _sf_status = _sf.get('status')
+        if _sf_status == 'not_estimable':
+            A(f'- 不可估计：{_sf.get("reason", "frozen 2x2 cells are incomplete")}')
+            A('')
+        else:
+            _sf_cells = _sf.get('cell_means') or {}
+            _sf_design = _sf.get('design') or {}
+            A('| cell | ' + ' | '.join(_sf_design.get('factors') or []) + ' | n | mean PPL | mean log PPL |')
+            A('|---|' + '---|' * (len(_sf_design.get('factors') or []) + 4))
+            for _cell in sorted(_sf_cells):
+                _row = _sf_cells[_cell] or {}
+                _assign = _row.get('assignment') or {}
+                _levels = [_assign.get(_f, '—') for _f in (_sf_design.get('factors') or [])]
+                A('| `%s` | %s | %s | %s | %s |' % (
+                    _cell, ' | '.join(_levels), _row.get('n', '—'),
+                    _sf_num(_row.get('mean_ppl'), '{:.4f}'),
+                    _sf_num(_row.get('mean_log_ppl'), '{:+.4f}')))
+            A('')
+            for _scale in ('log_ppl', 'ppl'):
+                _block = (_sf.get('scales') or {}).get(_scale)
+                if not isinstance(_block, dict):
+                    continue
+                A(f'**尺度 `{_scale}`**')
+                A('')
+                A('| 对照 | mean | 95% CI | p (exact sign-flip) | p (family) |')
+                A('|---|---|---|---|---|')
+                _rows = list((_block.get('marginals') or {}).values())
+                _inter = _block.get('interaction')
+                if isinstance(_inter, dict):
+                    _rows.append(_inter)
+                for _r in _rows:
+                    if not isinstance(_r, dict):
+                        continue
+                    _ci = _r.get('ci95')
+                    _ci_txt = ('[%+.4f, %+.4f]' % (float(_ci[0]), float(_ci[1]))
+                               if isinstance(_ci, list) and len(_ci) == 2
+                               and all(isinstance(x, (int, float)) for x in _ci)
+                               else '—')
+                    A('| %s | %s | %s | %s | %s |' % (
+                        _r.get('name', '—'), _sf_num(_r.get('mean')), _ci_txt,
+                        _sf_num(_r.get('p_exact_signflip'), '{:.4g}'),
+                        _sf_num(_r.get('p_family'), '{:.4g}')))
+                A('')
+                _fam = _block.get('family') or {}
+                A(f'- family: `{_fam.get("method", "—")}`; ready=`{_fam.get("family_ready")}`.')
+                if isinstance(_inter, dict) and _inter.get('ci95_simultaneous'):
+                    _ci = _inter['ci95_simultaneous']
+                    A(f'- interaction simultaneous 95% CI: [{float(_ci[0]):+.4f}, {float(_ci[1]):+.4f}].')
+                _tost = _block.get('tost')
+                if isinstance(_tost, dict):
+                    A(f'- interaction TOST: margin={_sf_num(_tost.get("margin"), "{:.4f}")}, '
+                      f'equivalent=`{_tost.get("equivalent")}`, p={_sf_num(_tost.get("p_tost"), "{:.4g}")}.')
+                A('')
+            _interp = _sf.get('interpretation') or {}
+            A(f'- 读数：`{_interp.get("classification", "—")}`；'
+              f'交互族级拒绝=`{_interp.get("interaction_detected")}`；'
+              f'claim_allowed=`{_interp.get("interaction_claim_allowed")}`（探索性）。')
+            if _interp.get('difference_in_significance_fallacy'):
+                A('- **差中差警告**：一个边际显著、另一个不显著，但交互本身未被拒绝；'
+                  '不能把这读成「两个边际效应不同」。')
+            _agree = _sf.get('scale_agreement') or {}
+            if _agree.get('scale_sensitive'):
+                A('- **尺度敏感**：log PPL 与 raw PPL 的交互在符号或族级拒绝上不一致；'
+                  '不能事后挑一个尺度报告。')
+            for _w in _sf.get('warnings') or []:
+                A(f'- warning: {_w}')
+            A('')
+            A('> 边界：这是同一批冻结 by-length cell 上的 **post-hoc 2x2 交互读数**，'
+              '不是新的确认性检验；不进入冻结 Holm 族、不改变 `confirmed`/`verified`。'
+              '精确 sign-flip 仍以种子为交换单位；TOST 只在事前声明交互 SESOI 时给出等价读数，'
+              '「未拒绝交互」不等于「无交互」。')
+            A('')
     _lp = ft.get('length_position')
     if isinstance(_lp, dict):
         A('### 长度位置分段：共同前缀 vs 延伸位置（探索性）')

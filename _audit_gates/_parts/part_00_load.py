@@ -370,6 +370,17 @@
                not_verifiable_locally。它证明的是「当前算术是否仍是记录
                的那一套」，不是训练逐位确定，也不产生 p 值或改变冻结判定
                （零 GPU；别名 canary / numeric_canary / arithmetic_canary）
+  contrast_interaction  结果分析：2x2 差中差（difference-in-differences）——
+               由声明的 factors/levels/cells 组成完整 2x2，只用四格共同种子，
+               在 log PPL 主尺度上重放两个边际与交互；交互走 exact sign-flip，
+               三个对照再走 exact max-T（不可用时具名退 Holm）给族内 p 与同时
+               区间；raw PPL 尺度并列作敏感性，两尺度符号/拒绝不一致即 warning。
+               显式区分「一个边际显著、另一个不显著」与「交互显著」，未拒绝交互
+               不写成无交互；重放 analysis_v12/contrast_interaction.json 或
+               test_stats.json 内嵌 sink_factorial，缺产物报
+               not_verifiable_locally、篡改判 fail；不进入冻结 Holm 族、不改
+               confirmed/verified（零 GPU；别名 interaction_2x2 / two_by_two /
+               difference_in_differences / did / sink_interaction）
   data_source  上游语料版本：每个 cache meta 是否记录并匹配固定的 Hub commit
                （WikiText-103 / FineWeb-Edu）；train/validation/test 必须同一
                快照；legacy/local 缓存明确报不可验证而非算作干净
