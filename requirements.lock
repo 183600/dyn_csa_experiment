@@ -1,5 +1,5 @@
 # Fully pinned CPU environment for the test / reproduction path.
-# Python 3.12.15, Linux x86_64.  Generated with `python -m pip freeze`;
+# Python 3.12.16, Linux x86_64.  Generated with `python -m pip freeze`;
 # this is a complete transitive closure, not only the five direct deps.
 # This is NOT the CUDA reference environment used for paper-scale runs:
 # those must regenerate their own lock with `python -m pip freeze` and
@@ -9,7 +9,7 @@
 # exp_lib.dependency_contract(): package pins alone do not identify a
 # numerical stack.  Role: verified CPU test / reproduction environment.
 # Regenerate these three lines with the lock on the experiment machine.
-# python-version: 3.12.15
+# python-version: 3.12.16
 # python-implementation: CPython
 # platform: Linux x86_64
 #
