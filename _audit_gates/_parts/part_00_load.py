@@ -439,6 +439,17 @@
                split、不改冻结 p/Holm/confirmed（零 GPU；别名 multiverse /
                pipeline_multiverse / analytic_multiverse /
                multiverse_artifact）
+  ablation_screening  对比/消融：预算受限的分数因子筛选——由声明的
+               defining relations 生成 2^(k-p) 个 cell，显式报告 resolution
+               与每个目标项的别名类；只拟合「全部主效应 + 每个别名类一个
+               代表」，逐种子 OLS 后走 exact sign-flip 与 max-T（失败具名
+               退 Holm）。resolution III 的主效应与 2FI 混杂，必须写明
+               sparsity-of-effects 假设；resolution IV 的 2FI 彼此混杂，
+               不得分别报告。重放 analysis_v12/ablation_screening.json，
+               缺产物/not_estimable 报 not_verifiable_locally，screening
+               null/分辨率不足报 warnings，篡改/夹带冻结字段判 fail；不读
+               split、不产生确认 p、不改冻结判定（零 GPU；别名 screening /
+               screening_design / fractional_factorial / ablation_screen）
   calibration  统计机器的零假设校准：精确符号翻转 / MITM / n>40 鞍点 /
                max-over-looks 序列 p / 配对 TOST / Holm 的负控制（超发率）
                与正控制（灵敏度），以及 seed-t / paired bootstrap-t /

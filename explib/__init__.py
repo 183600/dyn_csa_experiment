@@ -147,6 +147,7 @@ _PARTS = [
 'part_78_global_fdr.py',
 'part_79_ablation_ranking.py',
 'part_80_analysis_multiverse.py',
+'part_81_ablation_screening.py',
 ]
 
 load_root_package(globals(), __file__, _PARTS,

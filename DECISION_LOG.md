@@ -7282,3 +7282,88 @@ claim 通过；redundant 走 TOST 族；两个族不互相替代；声明族排�
 非 mapping/空族；跨两 artifact 的 m=2 族降级。现有 lesion/单因素/
 alignment 测试 22 项通过，`audit_gates.py lesion` 无产物时仍返回
 `not_verifiable_locally` 且设计门 `status='ok'`。
+
+## 2026-11-05 — 完整晶格买不起时不是只能放弃：预算内分数因子筛选与别名表（本轮对比/消融方法硬化，no new runs）
+
+零 GPU；不新增训练、不读取任何 split、不修改
+`confirmation_frozen*.json` 的字节/臂/种子/端点/α/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未删除、未修改、未移动。
+
+**Problem.** §136 正确拒绝把星形留一设计当作子集晶格，§143 又给了完整
+晶格上的 Shapley 联合排名。但完整 2^k 在 k=5/6 时是 32/64 个臂 × n seeds；
+`ablation_lattice_design` 只会把缺口定价并报 `incomplete`，没有给出
+「预算只够 8/16 个 cell 时测哪些子集、能支持什么主张」的正向方案。
+任意挑子集会让主效应与交互混杂，且混杂结构不可见。
+
+**Fix.** 新增 `explib/_parts/part_81_ablation_screening.py`：
+
+- `fractional_factorial_design(components, defining_relations=,
+  max_order=, n_seeds=)`：由独立 defining relations 生成正则
+  2^(k-p) fraction；在 ±1 编码下要求每个 relation 的符号乘积为 +1。
+  返回 cells、`resolution`、defining span、逐项目 `aliased_with` /
+  `aliased_higher_order`、`alias_classes`、`model_terms`（全部主效应 +
+  每个不含主效应的 coset 一个代表，受行数容量约束）、
+  `saved_cells` / `saved_fraction`；另给规划用的
+  `min_seeds_for_family_significance_holm` / `seed_budget_sufficient_holm`
+  （`2^n >= 2m/α`），低于该 n 时记 warning：纯 Holm 报告无法达到 α，
+  max-T 仍可能更有效。
+- 同一 coset 的列完全相同：默认模型每个 coset 只取一个代表，绝不同时
+  放入两个同 coset 项（否则秩亏），也不把「和」写成两个独立效应。
+  resolution III 的主效应与某个 2FI 同列，必须带
+  `requires_sparsity_assumption=true`；resolution IV 的 2FI 两两成对；
+  只有 resolution V/full 才许可主效应与全部 2FI 分开。
+- `ablation_screening_analysis(cells, ...)`：要求 measured cells 与
+  fraction 逐 cell 完全一致（缺/多 cell 直接 `not_estimable`，不插补）；
+  common seed 交集不足直接不可估计。对每个 common seed 在 log PPL 上
+  OLS，`effect=2^order * coef`（主效应尺度 2、二阶交互尺度 4，与
+  `(11-10)-(01-00)` 定义一致）；逐项走 `paired_effect_stats` 的 exact
+  sign-flip / 点估计 CI / `within_seed_noise`，再把全部模型项送进精确
+  max-T；max-T 的同时区间另存 `ci95_simultaneous`，不覆盖点估计 CI。
+  零方差或 n 超枚举上限时具名退同一族 Holm（`family.method=
+  'holm_fallback'` + `fallback_reason`），不伪装成 max-T。
+- `status` 只回答 screening 是否可用：结构不完整/秩亏/主效应同 coset
+  为 `not_estimable`；resolution III、无主效应通过族校正、或 p 下限
+  > α 为 `warnings`；否则 `ok`。`main_effects_licensed` 只表示主效应
+  彼此可分；`interactions_licensed` 只在 resolution V/full 且交互
+  不同 coset 时为真。`n_significant` 与 `n_significant_main` 分开。
+- `build_/validate_/write_ablation_screening`：`inputs={components,
+  defining_relations,max_order,alpha,min_n,model_terms,cells}` +
+  `result`，`content_sha256` 只排除 `created_at` 与自身；从
+  `inputs.cells` 完整重放并逐字段对账。缺 hash、改 design/alias/effect/
+  p/rank/status、增删 cell、超 schema、夹带 `confirmed`/`verified`/
+  `verdict`/`p_holm`/`decision` 均 fail。writer 同内容 no-op、不同内容
+  默认 conflict，显式 `overwrite=True` 才替换。
+- 新增 `audit_gates.py ablation_screening`（别名 `screening` /
+  `screening_design` / `fractional_factorial` / `ablation_screen`）与
+  `ablation_screening_artifact` 单产物重放：缺
+  `analysis_v12/ablation_screening.json`、结构不完整或 `not_estimable`
+  报 `not_verifiable_locally`；screening null / 分辨率不足报
+  `warnings`；篡改报 `fail`。`audit_gates.py report` 顶层新增
+  `ablation_screening`；新增 `make ablation-screen`；
+  `ablation_screening_markdown(result)` 渲染逐项别名表。
+
+**Boundary.** 这是**探索性 screening 读数**：不产生冻结确认 p 值、不进入
+确认 Holm 族、不改变 `p_exact_signflip`/`p_holm`/`verified`/
+`confirmed`/`confirmed_effective`，不重算 PPL、不读 test split、不改
+`CODE_SEMANTICS`。分数设计不是完整晶格的替代品：它不识别 Shapley、不
+识别全部 pairwise interaction，也不支持组件重要性排名；只支持声明模型
+下的主效应筛选与 resolution V/full 时的 2FI 读数（resolution V 的 2FI 仍与 3FI
+同 coset，`interactions_licensed` 依赖高阶项可忽略假设，逐项
+`aliased_higher_order` 明列）。resolution III 的
+主效应与 2FI 同列是设计事实，不是实现误差；把它写成「纯主效应」需要
+sparsity-of-effects 假设。同一 coset 是一个估计量，`aliased_with` 里的
+项不能分别引用。缺 cell 不插补、不换种子；未声明的分数与未测的 cell
+仍是研究者自由度。旧产物没有该 artifact 时 gate 报
+`not_verifiable_locally`，不回填历史筛选结论。
+
+**Verification.** 新增 `test_review_part_88.py` 15 项：resolution III
+的主效应与 2FI 同 coset、resolution IV 的 2FI 成对同 coset、
+resolution V/full 的 clear 与 capacity；非法 component/relation/
+max_order/n_seeds；逐种子 OLS 恢复声明主效应与 max-T 族校正；
+resolution III 的「主效应 + 半个混杂 2FI」数值；resolution IV 的
+「一对 2FI 之和」数值；缺/多 cell 不插补；common seed 交集与
+`<min_n`；小 n 的分辨率下限；非法 PPL/seed/alpha/min_n/model_terms；
+artifact hash/round-trip/`created_at` 不影响内容身份/多类篡改拒绝；
+writer 的 no-op/conflict/overwrite；gate 的 missing/ok/warnings/
+not_estimable/fail 分支；Markdown、`_PARTS`/Makefile/CLI/report 接线；
+README 与 `.github` 路径仍存在。完整 CPU 套件在本轮最终树通过。

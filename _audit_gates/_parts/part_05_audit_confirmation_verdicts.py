@@ -1989,6 +1989,7 @@ def run_report(out='audit_report.json'):
     res['exact_tost'] = audit_exact_tost(verbose=False)
     res['global_fdr'] = audit_global_fdr(verbose=False)
     res['ablation_ranking'] = audit_ablation_ranking(verbose=False)
+    res['ablation_screening'] = audit_ablation_screening(verbose=False)
     res['analysis_multiverse'] = audit_analysis_multiverse(verbose=False)
     res['data_exposure'] = audit_data_exposure()
     if str(os.environ.get('CSA_REPLAY_IN_REPORT', '')).strip().lower() in (
@@ -2088,6 +2089,14 @@ def _run_cli():
                   'multiverse_artifact': audit_analysis_multiverse_artifact,
                   'multiverse_replay': audit_analysis_multiverse_artifact,
                   'multiverse_validation': audit_analysis_multiverse_artifact})
+    _cmds.update({'ablation_screening': audit_ablation_screening,
+                  'screening': audit_ablation_screening,
+                  'screening_design': audit_ablation_screening,
+                  'fractional_factorial': audit_ablation_screening,
+                  'ablation_screen': audit_ablation_screening,
+                  'ablation_screening_artifact': audit_ablation_screening_artifact,
+                  'ablation_screening_replay': audit_ablation_screening_artifact,
+                  'ablation_screening_validation': audit_ablation_screening_artifact})
     _cmds.update({'design_estimability': audit_design_estimability,
                   'estimability': audit_design_estimability,
                   'design_rank': audit_design_estimability,
@@ -2189,6 +2198,10 @@ def _run_cli():
                 'analysis_multiverse', 'multiverse', 'pipeline_multiverse',
                 'analytic_multiverse', 'multiverse_artifact',
                 'multiverse_replay', 'multiverse_validation',
+                'ablation_screening', 'screening', 'screening_design',
+                'fractional_factorial', 'ablation_screen',
+                'ablation_screening_artifact', 'ablation_screening_replay',
+                'ablation_screening_validation',
                 'design_estimability', 'estimability', 'design_rank',
                 'identifiability', 'contrast_estimability', 'design_matrix',
                 'distribution_free_prediction', 'distribution_free',

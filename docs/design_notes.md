@@ -14376,3 +14376,147 @@ claim 合并后的单一族。因此本块不声称「一轮 lesion 中至少一
 necessary/redundant 主张」的联合 FWER ≤ α；要支持这种更强的联合主张，
 需要在看结果前把 α 拆到两个族（例如各 α/2）或另做联合 max-T。这里只
 把「每个族内部」的多重性说清楚，避免把两个 α 当成一个 α。
+
+## 147. 完整晶格买不起时不是只能放弃：分数因子筛选、别名表与主效应推断（本轮对比/消融方法硬化，no new runs）
+
+零 GPU；不新增训练、不读取任何 split、不修改
+`confirmation_frozen*.json` 的字节/臂/种子/端点/α/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未删除、未修改、未移动。
+
+### 147.1 问题：拒绝星形设计之后，预算受限的消融没有正向方案
+
+§136 正确指出：留一法星形设计不是子集晶格，不能把每个组件在 full
+context 的边际效应相加叫作 Shapley；§143 又给了完整晶格上的联合排名。
+但完整 2^k 晶格在 k=5/6 时是 32/64 个臂 × n seeds。现有
+`ablation_lattice_design` 只会把缺口定价并报 `incomplete`，没有回答
+「如果预算只够 8/16 个 cell，应该测哪些子集，能支持什么主张」。
+
+这不是「少跑几个留一对照」：任意挑子集会让主效应与交互混杂，且混杂
+结构不可见。经典 2^(k-p) 分数因子设计正是为此存在：用 p 个声明式
+defining relations 把 2^k 个 cell 压到 2^(k-p) 个，同时给出 resolution
+与每个目标项的别名类。它可以筛选主效应，但不能识别完整晶格上的
+Shapley；两者必须分开写。
+
+### 147.2 方法：声明式 fraction、coset 别名表与逐种子 OLS
+
+新增 `explib/_parts/part_81_ablation_screening.py`。
+
+**(a) 设计代数。** `fractional_factorial_design(components,
+defining_relations=, max_order=, n_seeds=)` 接收一组独立的 defining
+relations（每个字是 component 集合；例如 `[['A','B','C','D']]` 表示
+2^(4-1) 的 I=ABCD）。在 ±1 编码下，一个 cell 的符号乘积等于
+`(-1)^(relation 中未激活的因子数)`；fraction 就是所有满足每个 relation
+乘积为 +1 的子集。函数显式报告：
+
+- `resolution = min |word|`（非零 defining span 的最短字）；
+- `span`：全部 defining words；
+- `alias_classes`：每个目标项的 coset（同一列的字），含
+  `separated_at_declared_order` / `separated_at_all_orders`；
+- `terms`：逐项目的 `aliased_with` / `aliased_higher_order` / 效应尺度；
+- `model_terms`：全部主效应 + 每个“不含主效应”的 coset 只取一个代表；
+  受行数容量约束，放不下的项记入 `model_omitted_terms`；
+- `saved_cells` / `saved_fraction`：相对完整晶格省下的 cell 与比例；
+- `min_seeds_for_family_significance_holm` / `seed_budget_sufficient_holm`：
+  规划用的 Holm 族下限 `2^n >= 2m/α`（m=模型项数）。低于该 n 时仍可用
+  max-T，但纯 Holm 报告不可能达到 α；设计会记 warning，避免把 5 个种子
+  当成一个能过族校正的 screening 计划。
+
+**(b) 为什么这样选模型。** 正则 fraction 中同一 coset 的列完全相同。
+把两个同 coset 的项同时放进模型会秩亏；把它们分别报告成两个效应则是
+把「和」伪装成两个数。因此默认模型每个 coset 只取一个代表，并在
+`aliased_with` 里点名同类的其他项。resolution III 的主效应与某个 2FI
+同 coset；此时主效应估计是主效应与 2FI 的和（按效应尺度，恰好含一半
+的 2FI 对比），必须写明 `requires_sparsity_assumption`。resolution IV
+的主效应清楚，但 2FI 两两成对；只能报告「这一对的和」，不能分别报告。
+resolution V 及以上才许可主效应与全部 2FI 分开；但 resolution V
+的 2FI 仍会与 3FI 同 coset，`interactions_licensed` 的解释依赖高阶项
+可忽略假设，逐项的 `aliased_higher_order` 会把它点名出来。
+
+**(c) 逐种子推断。** `ablation_screening_analysis(cells, ...)` 要求
+`cells: subset -> {seed: positive PPL}` 与声明的 fraction **逐 cell 完全
+一致**；缺 cell/多 cell 直接 `not_estimable`，不插补。对每个 common seed
+在 log PPL 上做 OLS：
+
+```
+y_s = X beta_s + e_s
+effect_s(term) = 2^order(term) * beta_s(term)
+```
+
+主效应尺度 2（active 减 inactive 的均值差），二阶交互尺度 4（与仓库既有
+`(11-10)-(01-00)` 定义一致）。逐项调用 `paired_effect_stats` 得 n、mean、
+sd、exact sign-flip p、CI、`within_seed_noise` 与 `seed_driven`；再把全部
+模型项送进 `maxt_signflip_adjust` 做精确 max-T。若某行零方差或 n 超过
+精确枚举上限，**具名**退到同一族的 Holm（`family.method='holm_fallback'`
++ `fallback_reason`），不把失败伪装成 max-T。逐项 `ci95` 是点估计区间，
+max-T 的同时区间另存 `ci95_simultaneous`；两者不能混用。
+
+**(d) 状态与主张。** `status` 只回答 screening 读数是否可用：
+
+- `not_estimable`：缺/多 cell、common seed < `min_n`、设计矩阵秩亏、
+  主效应彼此同 coset；
+- `warnings`：resolution III（依赖稀疏效应假设）、没有任何主效应通过
+  族校正、或精确 p 下限 > α（分辨率不足）；
+- `ok`：主效应彼此可分、至少一个主效应通过族校正，且不依赖
+  resolution III 假设。
+
+`main_effects_licensed` 只表示主效应彼此可分（resolution III 下仍需
+`requires_sparsity_assumption=true`）；`interactions_licensed` 只在
+resolution V/full 且所选交互都不与同阶目标项同 coset 时为真。
+`n_significant` 统计全部模型项，`n_significant_main` 单独统计主效应，
+避免一个显著交互把 screening null 写成成功。
+
+**(e) 产物与门。** `build_/validate_/write_ablation_screening`：
+`inputs={components,defining_relations,max_order,alpha,min_n,model_terms,
+cells}` + `result`，`content_sha256` 只排除 `created_at` 与自身；从
+`inputs.cells` 完整重放并逐字段对账。缺 hash、改 design/alias/effect/p/
+rank/status、增删 cell、超 schema、夹带 `confirmed`/`verified`/`verdict`/
+`p_holm`/`decision` 均 fail。writer 同内容 no-op、不同内容默认 conflict，
+显式 `overwrite=True` 才替换。
+
+新增 `audit_gates.py ablation_screening`（别名 `screening` /
+`screening_design` / `fractional_factorial` / `ablation_screen`）与
+`ablation_screening_artifact` 单产物重放：缺
+`analysis_v12/ablation_screening.json`、结构不完整或 `not_estimable` 报
+`not_verifiable_locally`；screening null / 分辨率不足报 `warnings`；
+篡改报 `fail`。`audit_gates.py report` 顶层新增 `ablation_screening`；
+新增 `make ablation-screen`；`ablation_screening_markdown(result)` 渲染
+逐项别名表。
+
+### 147.3 边界
+
+- **不是完整晶格的替代品。** 分数设计不识别 Shapley、不识别全部
+  pairwise interaction，也不支持「组件重要性排名」；它只支持声明
+  模型下的主效应筛选与（resolution V 时的）2FI 读数。
+- **resolution III 依赖假设。** 主效应与 2FI 同列是设计事实，不是实现
+  误差；把主效应写成「纯主效应」需要 sparsity-of-effects 假设，结果
+  永远带 `requires_sparsity_assumption=true`。
+- **同一 coset 是一个估计量。** `aliased_with` 里的项不能分别引用；
+  若两个 2FI 同 coset，报告的是它们的和，不是两个独立效应。
+- **不插补、不换种子。** 缺 cell 或多 cell 直接不可估计；common seed
+  交集不足直接不可估计；不把不同 seed 子集平均成一个更漂亮的设计。
+- **不新增确认 p。** 这是探索性 screening 读数，不进入冻结 Holm 族、
+  不改变 `p_exact_signflip`/`p_holm`/`verified`/`confirmed`，不重算
+  PPL、不读 test split。
+- **设计仍可能不完备。** 本块不证明声明的 relation 集合覆盖了所有
+  合理设计；未声明的分数、未测的 cell 仍是研究者自由度。旧产物没有该
+  artifact 时 gate 报 `not_verifiable_locally`，不回填历史筛选结论。
+
+### 147.4 入口与验证
+
+```bash
+python -m pytest -q test_review_part_88.py
+python audit_gates.py ablation_screening
+make ablation-screen
+```
+
+新增 `test_review_part_88.py` 15 项：resolution III 的主效应与 2FI
+同 coset、resolution IV 的 2FI 成对同 coset、resolution V/full 的
+clear 与 capacity；非法 component/relation/max_order/n_seeds；逐种子
+OLS 恢复声明主效应与 max-T 族校正；resolution III 的
+「主效应 + 半个混杂 2FI」数值；resolution IV 的「一对 2FI 之和」数值；
+缺/多 cell 不插补；common seed 交集与 `<min_n`；小 n 的分辨率下限；
+非法 PPL/seed/alpha/min_n/model_terms；artifact hash/round-trip/
+`created_at` 不影响内容身份/多类篡改拒绝；writer 的 no-op/conflict/
+overwrite；gate 的 missing/ok/warnings/not_estimable/fail 分支；
+Markdown、`_PARTS`/Makefile/CLI/report 接线；README 与 `.github` 路径
+仍存在。完整 CPU 套件在本轮最终树通过。
