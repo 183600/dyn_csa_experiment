@@ -985,8 +985,8 @@ def build_exact_signflip_ci(deltas, *, alpha=0.05, max_n=None, seeds=None,
         'kind': EXACT_SIGNFLIP_CI_KIND,
         'schema': EXACT_SIGNFLIP_CI_SCHEMA,
         'created_at': (_esci_time.strftime('%Y-%m-%dT%H:%M:%S')
-                       if created_at is None else str(created_at)[:80]),
-        'source': (None if source is None else str(source)[:500]),
+                       if created_at is None else _esci_key_text(created_at, limit=80)),
+        'source': (None if source is None else _esci_key_text(source, limit=500)),
         'inputs': block['inputs'],
         'result': block['result'],
     }

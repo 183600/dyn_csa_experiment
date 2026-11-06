@@ -23,15 +23,38 @@ _USR_STATS_DEFAULTS = (
 _USR_BLOCK_FIELD = 'unit_split_replication'
 
 
+def _usr_gate_key_text(value, limit=160):
+    """Bounded key text; huge integer dict keys are diagnostics, not crashes."""
+    if isinstance(value, str):
+        text = value
+    else:
+        try:
+            text = str(value)
+        except Exception:
+            return _usr_gate_repr(value, limit=limit)
+    return text if len(text) <= limit else text[:limit - 3] + '...'
+
+
+def _usr_gate_path_text(value):
+    """Filesystem path as text, or ``None`` when the value is not usable."""
+    try:
+        return os.fsdecode(os.fspath(value))
+    except Exception:
+        return None
+
+
 def _usr_gate_resolve(path, defaults):
     if path is not None:
         if isinstance(path, (str, os.PathLike)):
-            return os.fspath(path)
+            return _usr_gate_path_text(path)
         return None
     for rel in defaults:
-        candidate = os.path.join(REPO, rel)  # noqa: F821
-        if os.path.exists(candidate):
-            return candidate
+        try:
+            candidate = os.path.join(REPO, rel)  # noqa: F821
+            if os.path.exists(candidate):
+                return candidate
+        except (OSError, ValueError, TypeError):
+            continue
     return None
 
 
@@ -39,18 +62,25 @@ def _usr_gate_repr(value, limit=200):
     try:
         text = repr(value)
     except Exception:
-        return f'<{type(value).__name__}>'
+        return f'<unrepresentable {type(value).__name__}>'
     return text if len(text) <= limit else text[:limit] + '...'
 
 
 def _usr_gate_row(result):
     if not isinstance(result, dict):
         return {'status': None}
-    halves = result.get('halves') or []
-    test = [((h or {}).get('test') or {}) for h in halves]
-    stats = [((h or {}).get('stats') or {}) for h in halves]
-    iut = result.get('iut') or {}
-    sens = result.get('split_sensitivity') or {}
+    halves = result.get('halves')
+    halves = halves if isinstance(halves, list) else []
+    test = [((h.get('test') if isinstance(h, dict) else None) or {})
+            for h in halves]
+    stats = [((h.get('stats') if isinstance(h, dict) else None) or {})
+             for h in halves]
+    iut = result.get('iut')
+    iut = iut if isinstance(iut, dict) else {}
+    sens = result.get('split_sensitivity')
+    sens = sens if isinstance(sens, dict) else {}
+    warnings = result.get('warnings')
+    warnings = warnings if isinstance(warnings, list) else []
     return {
         'status': result.get('status'),
         'direction': result.get('direction'),
@@ -65,7 +95,7 @@ def _usr_gate_row(result):
         'sign_agreement': result.get('sign_agreement'),
         'split_sensitivity_pass': sens.get('n_pass'),
         'split_sensitivity_estimable': sens.get('n_estimable'),
-        'warnings': list(result.get('warnings') or []),
+        'warnings': [w for w in warnings if isinstance(w, str)],
     }
 
 
@@ -145,13 +175,13 @@ def _usr_gate_scan_stats(path, out):
         return out
     L = _import_exp_lib()  # noqa: F821
     found = 0
-    for name in sorted(comps):
+    for name in sorted(comps, key=_usr_gate_key_text):
         rec = comps.get(name)
         if not isinstance(rec, dict) or _USR_BLOCK_FIELD not in rec:
             continue
         block = rec.get(_USR_BLOCK_FIELD)
         found += 1
-        label = f'{name}.{_USR_BLOCK_FIELD}'
+        label = f'{_usr_gate_key_text(name)}.{_USR_BLOCK_FIELD}'
         if not isinstance(block, dict):
             out['blocks'].append({
                 'name': label, 'status': 'fail',
@@ -162,11 +192,13 @@ def _usr_gate_scan_stats(path, out):
             continue
         if block.get('kind') == 'unit_split_replication_error':
             status = block.get('status')
+            reason = block.get('reason')
             out['blocks'].append({
                 'name': label,
                 'status': (status if status in ('not_estimable', 'not_applicable')
                            else 'not_estimable'),
-                'reason': block.get('reason'),
+                'reason': (reason if isinstance(reason, str)
+                           else _usr_gate_repr(reason)),
             })
             if block.get('status') == 'not_applicable':
                 out['_not_applicable'] = out.get('_not_applicable', 0) + 1
@@ -224,9 +256,32 @@ def audit_unit_split_replication(path=None, *, verbose=True):
     }
     if path is not None:
         resolved = _usr_gate_resolve(path, ())
-        if resolved is None or not os.path.exists(resolved):
+        if resolved is None:
+            # A caller-supplied path is untrusted too: ``os.path.exists``
+            # raises for a huge integer and an arbitrary object is not
+            # JSON-serialisable in the report.  Fail closed with a bounded
+            # diagnostic before touching the filesystem.
+            out['status'] = 'fail'
+            out['path'] = None
+            out['problems'].append(
+                'path is not a usable filesystem path: '
+                f'{_usr_gate_repr(path)}')
+            if verbose:
+                print(json.dumps(out, ensure_ascii=False, indent=2)[:5000])
+            return out
+        out['path'] = resolved
+        try:
+            exists = os.path.exists(resolved)
+        except (OSError, ValueError, TypeError) as exc:
+            out['status'] = 'fail'
+            out['problems'].append(
+                f'path is not usable for filesystem access: '
+                f'{type(exc).__name__}: {_usr_gate_repr(exc)}')
+            if verbose:
+                print(json.dumps(out, ensure_ascii=False, indent=2)[:5000])
+            return out
+        if not exists:
             out['status'] = 'not_verifiable_locally'
-            out['path'] = resolved
             out['reason'] = 'the explicit split-half path does not exist'
             if verbose:
                 print(json.dumps(out, ensure_ascii=False, indent=2)[:5000])

@@ -70,6 +70,14 @@ UNIT_SPLIT_REPLICATION_ARTIFACT_KEYS = (
     'content_sha256',
 )
 UNIT_SPLIT_REPLICATION_BLOCK_KEYS = ('kind', 'inputs', 'result')
+UNIT_SPLIT_REPLICATION_RESULT_KEYS = (
+    'kind', 'version', 'status', 'reason', 'alpha', 'direction', 'min_n',
+    'max_n', 'min_units', 'min_units_per_half', 'min_token_share', 'method',
+    'role', 'boundary', 'n_units', 'n_seeds_input', 'n_seeds', 'seeds',
+    'dropped_seeds', 'unit_id_source', 'token_total', 'assignment', 'halves',
+    'iut', 'sign_agreement', 'half_difference', 'composition', 'warnings',
+    'split_sensitivity',
+)
 UNIT_SPLIT_REPLICATION_FORBIDDEN_KEYS = (
     'confirmed', 'p_holm', 'verified', 'verdict', 'decision',
 )
@@ -115,8 +123,62 @@ def _usr_repr(value, limit=200):
     try:
         text = repr(value)
     except Exception:
-        return f'<{type(value).__name__}>'
+        return f'<unrepresentable {type(value).__name__}>'
     return text if len(text) <= limit else text[:limit] + '...'
+
+
+def _usr_safe_text(value, limit=240):
+    """Exception-safe bounded ``str`` for provenance labels.
+
+    ``created_at``/``source`` accept caller data (and tampered archived
+    artifacts), so a huge integer or an object whose ``__str__`` raises must
+    not be able to crash artifact construction.  ``repr`` is no safer: CPython
+    also refuses to spell an integer beyond its decimal-conversion limit.
+    """
+    if value is None:
+        return None
+    try:
+        text = str(value)
+    except Exception:
+        try:
+            text = f'<unrepresentable {type(value).__name__}>'
+        except Exception:
+            text = '<unrepresentable>'
+    return text if len(text) <= limit else text[:limit]
+
+
+def _usr_finite_sum(values):
+    """Left-to-right float sum, or ``None`` when it overflows/degrades."""
+    total = 0.0
+    try:
+        for value in values:
+            total += float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return total if _usr_math.isfinite(total) else None
+
+
+def _usr_safe_diff(left, right):
+    """``left - right`` without overflowing for opposite extreme signs."""
+    try:
+        diff = float(left) - float(right)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if _usr_math.isfinite(diff):
+        return diff
+    # The true difference can lie outside float64 (e.g. 1.7e308 - -1.7e308).
+    # Scale first so same-sign / near-equal values still produce a finite
+    # result; return None only when the mathematical difference really is
+    # unrepresentable.
+    scale = max(abs(float(left)), abs(float(right)))
+    if not _usr_math.isfinite(scale) or scale == 0.0:
+        return None
+    try:
+        diff = (float(left) / scale - float(right) / scale) * scale
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return diff if _usr_math.isfinite(diff) else None
+
 
 
 def _usr_number(value, name, *, positive=False):
@@ -150,7 +212,12 @@ def _usr_int(name, value, *, minimum, maximum):
         raise ValueError(f'{name} must be an integer, got {_usr_repr(value)}')
     out = int(value)
     if out < int(minimum) or out > int(maximum):
-        raise ValueError(f'{name} must be in [{minimum}, {maximum}], got {out}')
+        # ``out`` can be an attacker/scale-supplied integer above CPython's
+        # decimal-conversion limit; an f-string would then raise the
+        # interpreter's ValueError instead of this named diagnostic.
+        raise ValueError(
+            f'{name} must be in [{_usr_repr(minimum)}, {_usr_repr(maximum)}], '
+            f'got {_usr_repr(out)}')
     return out
 
 
@@ -225,20 +292,40 @@ def unit_split_assignment(unit_ids, tokens, *, salt=UNIT_SPLIT_REPLICATION_DEFAU
             f'{len(ids)} units cannot give two halves of >= {_min_half} units')
     order = sorted(range(len(ids)),
                    key=lambda i: (_usr_unit_digest(salt, ids[i]), ids[i]))
-    halves = ([], [])
-    totals = [0.0, 0.0]
-    counts = [0, 0]
-    for index in order:
-        # Token balance first; ties fall back to the smaller unit count and
-        # then to half 0, so the assignment is a total order with no
-        # dependence on iteration order.
-        left = (totals[0], counts[0], 0)
-        right = (totals[1], counts[1], 1)
-        target = 0 if left <= right else 1
-        halves[target].append(index)
-        totals[target] += weights[index]
-        counts[target] += 1
-    halves = [sorted(h) for h in halves]
+
+    def _balance(used_weights):
+        halves_out = ([], [])
+        totals_out = [0.0, 0.0]
+        counts_out = [0, 0]
+        for index in order:
+            # Token balance first; ties fall back to the smaller unit count and
+            # then to half 0, so the assignment is a total order with no
+            # dependence on iteration order.
+            left = (totals_out[0], counts_out[0], 0)
+            right = (totals_out[1], counts_out[1], 1)
+            target = 0 if left <= right else 1
+            halves_out[target].append(index)
+            totals_out[target] += used_weights[index]
+            counts_out[target] += 1
+        return ([sorted(h) for h in halves_out], totals_out, counts_out)
+
+    halves, totals, counts = _balance(weights)
+    total_tokens = _usr_finite_sum(weights)
+    scaled_tokens = False
+    if (total_tokens is None
+            or not all(_usr_math.isfinite(float(t)) for t in totals)):
+        # A future panel can declare per-unit token counts whose sum exceeds
+        # float64 even though every individual count is finite.  Balancing on
+        # raw totals would then compare inf == inf (and report nan shares);
+        # normalise by the largest count, which is a monotone rescaling of the
+        # same greedy rule, and keep the unrepresentable absolute totals null.
+        token_scale = max(weights)
+        if (not _usr_math.isfinite(token_scale) or token_scale <= 0.0):
+            raise ValueError('tokens cannot be normalised for token balance')
+        scaled = [float(w) / float(token_scale) for w in weights]
+        halves, totals, counts = _balance(scaled)
+        total_tokens = _usr_finite_sum(scaled)
+        scaled_tokens = True
     body = {
         'salt': salt,
         'halves': [[ids[i] for i in halves[0]], [ids[i] for i in halves[1]]],
@@ -248,9 +335,14 @@ def unit_split_assignment(unit_ids, tokens, *, salt=UNIT_SPLIT_REPLICATION_DEFAU
         _usr_json.dumps(body, sort_keys=True, separators=(',', ':'),
                         ensure_ascii=False, allow_nan=False).encode('utf-8')
     ).hexdigest()
-    total_tokens = float(sum(weights))
-    shares = [(float(sum(weights[i] for i in h)) / total_tokens
-               if total_tokens > 0.0 else None) for h in halves]
+    if scaled_tokens:
+        _share_total = float(sum(totals))
+        shares = [(float(totals[i]) / _share_total
+                   if _share_total > 0.0 else None) for i in (0, 1)]
+    else:
+        shares = [(float(sum(weights[i] for i in h)) / total_tokens
+                   if total_tokens is not None and total_tokens > 0.0 else None)
+                  for h in halves]
     return {
         'salt': salt,
         'algorithm': ('sha256(salt\\0unit_id) order + greedy token balance '
@@ -263,7 +355,7 @@ def unit_split_assignment(unit_ids, tokens, *, salt=UNIT_SPLIT_REPLICATION_DEFAU
                 'indices': [int(i) for i in halves[0]],
                 'unit_ids': [ids[i] for i in halves[0]],
                 'n_units': int(len(halves[0])),
-                'n_tokens': float(totals[0]),
+                'n_tokens': (None if scaled_tokens else float(totals[0])),
                 'token_share': shares[0],
             },
             {
@@ -271,7 +363,7 @@ def unit_split_assignment(unit_ids, tokens, *, salt=UNIT_SPLIT_REPLICATION_DEFAU
                 'indices': [int(i) for i in halves[1]],
                 'unit_ids': [ids[i] for i in halves[1]],
                 'n_units': int(len(halves[1])),
-                'n_tokens': float(totals[1]),
+                'n_tokens': (None if scaled_tokens else float(totals[1])),
                 'token_share': shares[1],
             },
         ],
@@ -289,7 +381,12 @@ def _usr_one_sided(deltas, direction):
     mean > 0.  The one-sided upper-tail primitive is the same one used by the
     exact TOST; passing the negated vector turns it into the lower tail.
     """
-    values = [float(x) for x in deltas]
+    try:
+        values = [float(x) for x in deltas]
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if any(not _usr_math.isfinite(x) for x in values):
+        return None
     probe = values if direction == 'positive' else [-x for x in values]
     tail = _etost_upper_tail(probe)  # noqa: F821 (part 77)
     p = tail.get('p')
@@ -309,13 +406,33 @@ def _usr_stats(values):
     n = len(values)
     if n == 0:
         return None
-    mean = float(np.mean(values))
-    sd = float(np.std(values, ddof=1)) if n > 1 else None
+    # NumPy's mean/std sum and square the raw panel.  Finite per-unit effects
+    # near float64's limit then overflow to inf (or underflow to a fake zero
+    # spread) even though the mean and SD are representable; reuse the
+    # repository's scale-normalised helpers so the ordinary path stays
+    # bit-identical and the extreme path stays finite.
+    try:
+        mean = float(_scaled_mean_or_raw(values))  # noqa: F821 (part 32)
+    except Exception:
+        mean = None
+    if mean is None or not _usr_math.isfinite(mean):
+        mean = None
+    sd = None
+    if n > 1:
+        try:
+            sd = _scaled_std_or_raw(values)  # noqa: F821 (part 32)
+        except Exception:
+            sd = None
+        if sd is not None and not _usr_math.isfinite(float(sd)):
+            sd = None
+    sem = (float(sd) / _usr_math.sqrt(n) if sd is not None else None)
+    if sem is not None and not _usr_math.isfinite(sem):
+        sem = None
     return {
         'n': int(n),
         'mean': mean,
-        'sd': sd,
-        'sem': (float(sd / _usr_math.sqrt(n)) if sd is not None else None),
+        'sd': (None if sd is None else float(sd)),
+        'sem': sem,
         'min': float(min(values)),
         'max': float(max(values)),
         'n_positive': int(sum(1 for x in values if x > 0.0)),
@@ -324,13 +441,68 @@ def _usr_stats(values):
     }
 
 
+def _usr_weighted_mean(values, weights):
+    """Token-weighted mean that survives extreme-but-finite magnitudes.
+
+    The historical expression ``fsum(x*w) / sum(w)`` overflows once either the
+    product or the weight total leaves float64, even though the weighted mean
+    is bounded by the (finite) input values.  Try the exact historical path
+    first so normal panels do not change by a single bit, then fall back to a
+    doubly scaled computation (values by max |value|, weights by max weight).
+    """
+    try:
+        vals = [float(v) for v in values]
+        ws = [float(w) for w in weights]
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not vals or len(vals) != len(ws):
+        return None
+    try:
+        # Keep the historical denominator expression for the ordinary path
+        # (builtin left-to-right sum); the scaled fallback below is what
+        # handles an overflowing total.
+        numer = _usr_math.fsum(v * w for v, w in zip(vals, ws))
+        denom = float(sum(ws))
+    except (TypeError, ValueError, OverflowError):
+        numer = None
+        denom = None
+    if (numer is not None and denom is not None
+            and _usr_math.isfinite(numer) and _usr_math.isfinite(denom)
+            and denom > 0.0):
+        out = numer / denom
+        if _usr_math.isfinite(out):
+            return float(out)
+    if any(not _usr_math.isfinite(v) for v in vals + ws):
+        return None
+    vscale = max((abs(v) for v in vals), default=0.0)
+    wscale = max(ws, default=0.0)
+    if (not _usr_math.isfinite(vscale) or not _usr_math.isfinite(wscale)
+            or wscale <= 0.0):
+        return None
+    if vscale == 0.0:
+        return 0.0
+    try:
+        denom_n = _usr_math.fsum(w / wscale for w in ws)
+        if not (_usr_math.isfinite(denom_n) and denom_n > 0.0):
+            return None
+        numer_n = _usr_math.fsum((v / vscale) * (w / wscale)
+                                 for v, w in zip(vals, ws))
+        if not _usr_math.isfinite(numer_n):
+            return None
+        out = (numer_n / denom_n) * vscale
+    except (TypeError, ValueError, OverflowError, ZeroDivisionError):
+        return None
+    return float(out) if _usr_math.isfinite(out) else None
+
+
 def _usr_half_effects(rows, indices, tokens):
     weights = [float(tokens[i]) for i in indices]
-    denom = float(sum(weights))
     effects = []
     for row in rows:
-        numer = _usr_math.fsum(float(row[i]) * w for i, w in zip(indices, weights))
-        effects.append(numer / denom)
+        effect = _usr_weighted_mean([row[i] for i in indices], weights)
+        if effect is None:
+            return None
+        effects.append(effect)
     return effects
 
 
@@ -347,12 +519,13 @@ def _usr_core(rows, unit_ids, tokens, *, direction, salt, alpha, min_n, max_n,
     effects_by_half = []
     for half in assignment['halves']:
         effects = _usr_half_effects(rows, half['indices'], tokens)
-        stats = _usr_stats(effects)
-        test = _usr_one_sided(effects, direction)
+        stats = _usr_stats(effects) if effects is not None else None
+        test = (_usr_one_sided(effects, direction)
+                if effects is not None else None)
         halves.append({
             'name': half['name'],
             'n_units': half['n_units'],
-            'n_seeds': int(len(effects)),
+            'n_seeds': int(len(effects)) if effects is not None else 0,
             'n_tokens': half['n_tokens'],
             'token_share': half['token_share'],
             'stats': stats,
@@ -366,8 +539,12 @@ def _usr_core(rows, unit_ids, tokens, *, direction, salt, alpha, min_n, max_n,
                 'sign_agreement': 'unavailable', 'half_difference': None,
                 'effects_by_half': effects_by_half}
     iut_p = max(float(p0), float(p1))
-    mean0 = halves[0]['stats']['mean']
-    mean1 = halves[1]['stats']['mean']
+    mean0 = (halves[0]['stats'] or {}).get('mean')
+    mean1 = (halves[1]['stats'] or {}).get('mean')
+    if mean0 is None or mean1 is None:
+        return {'assignment': assignment, 'halves': halves, 'iut': None,
+                'sign_agreement': 'unavailable', 'half_difference': None,
+                'effects_by_half': effects_by_half}
     if mean0 < 0.0 and mean1 < 0.0:
         sign = 'both_negative'
     elif mean0 > 0.0 and mean1 > 0.0:
@@ -389,9 +566,12 @@ def _usr_core(rows, unit_ids, tokens, *, direction, salt, alpha, min_n, max_n,
         claim = 'one_half_significant'
     else:
         claim = 'direction_not_supported'
-    diff = [a - b for a, b in zip(effects_by_half[0], effects_by_half[1])]
-    diff_stats = _usr_stats(diff)
-    t_ci = _esci_t_interval(diff, alpha)  # noqa: F821 (part 87)
+    diff = [_usr_safe_diff(a, b)
+            for a, b in zip(effects_by_half[0], effects_by_half[1])]
+    diff_available = (bool(diff) and all(d is not None for d in diff))
+    diff_stats = _usr_stats(diff) if diff_available else None
+    t_ci = (_esci_t_interval(diff, alpha)  # noqa: F821 (part 87)
+            if diff_available else None)
     return {
         'assignment': assignment,
         'halves': halves,
@@ -408,9 +588,9 @@ def _usr_core(rows, unit_ids, tokens, *, direction, salt, alpha, min_n, max_n,
         },
         'sign_agreement': sign,
         'half_difference': {
-            'mean': diff_stats['mean'],
-            'sd': diff_stats['sd'],
-            'sem': diff_stats['sem'],
+            'mean': (diff_stats['mean'] if diff_stats is not None else None),
+            'sd': (diff_stats['sd'] if diff_stats is not None else None),
+            'sem': (diff_stats['sem'] if diff_stats is not None else None),
             'ci95': (t_ci.get('ci') if isinstance(t_ci, dict) else None),
             'ci_method': ('student-t (df=n-1); descriptive only, no p-value'
                           if isinstance(t_ci, dict) else None),
@@ -446,7 +626,10 @@ def _usr_clean_rows(log_ratios, tokens, unit_ids, seeds):
         for value in unit_ids:
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f'unit_ids must be non-empty strings, got {_usr_repr(value)}')
-            ids.append(value.strip())
+            text = value.strip()
+            if len(text) > 500:
+                raise ValueError('unit_ids must be at most 500 characters')
+            ids.append(text)
         if len(ids) != n_units:
             raise ValueError(
                 f'unit_ids length {len(ids)} does not match tokens length {n_units}')
@@ -460,13 +643,13 @@ def _usr_clean_rows(log_ratios, tokens, unit_ids, seeds):
         if isinstance(seeds, (str, bytes)) or not isinstance(seeds, (list, tuple)):
             raise ValueError('seeds must be a sequence or None')
         seed_out = []
-        for value in seeds:
+        for index, value in enumerate(seeds):
             if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)):
                 raise ValueError(f'seeds must be integers, got {_usr_repr(value)}')
             number = int(value)
             if abs(number) > UNIT_SPLIT_REPLICATION_MAX_REPORTABLE_INT:
                 raise ValueError(
-                    f'seed {_usr_repr(value)} is outside the strict-JSON '
+                    f'seeds[{index}] is outside the strict-JSON '
                     'representable integer range')
             seed_out.append(number)
         if len(seed_out) != len(rows_in):
@@ -508,8 +691,12 @@ def _usr_sensitivity(rows, unit_ids, tokens, *, direction, base_salt, alpha,
                      min_n, max_n, min_units_per_half, n_salts,
                      budget=UNIT_SPLIT_REPLICATION_SENSITIVITY_BUDGET):
     n = len(rows)
-    per_salt_patterns = 2 * (1 << int(n))
-    cap = max(1, int(budget // max(1, per_salt_patterns)))
+    # The exact test costs two 2**n enumerations per salt, and rebuilding the
+    # two half effects costs n*units float operations.  Count both so a future
+    # panel with many evaluation units does not turn the default sensitivity
+    # curve into an accidental O(salts * n * units) job.
+    per_salt_work = 2 * (1 << int(n)) + int(n) * max(1, len(unit_ids))
+    cap = max(1, int(budget // max(1, per_salt_work)))
     requested = int(n_salts)
     used = min(requested, cap)
     ps = []
@@ -517,7 +704,15 @@ def _usr_sensitivity(rows, unit_ids, tokens, *, direction, base_salt, alpha,
     digests = set()
     skipped = 0
     for k in range(used):
-        salt = base_salt if k == 0 else f'{base_salt}#{k}'
+        if k == 0:
+            salt = base_salt
+        else:
+            # ``_usr_salt`` caps a salt at 240 characters; a caller-supplied
+            # base at the cap would otherwise make every derived salt invalid
+            # and silently turn a multi-salt sensitivity curve into one split.
+            suffix = f'#{k}'
+            keep = max(0, 240 - len(suffix))
+            salt = f'{base_salt[:keep]}{suffix}'
         try:
             core = _usr_core(rows, unit_ids, tokens, direction=direction,
                              salt=salt, alpha=alpha, min_n=min_n, max_n=max_n,
@@ -555,8 +750,8 @@ def _usr_sensitivity(rows, unit_ids, tokens, *, direction, base_salt, alpha,
     }
     if used < requested:
         out['reason'] = (
-            f'requested {requested} salts but the deterministic work cap '
-            f'({budget} pattern evaluations) allows {used} at n={n}')
+            f'requested {requested} salts but the deterministic work budget '
+            f'({budget} pattern/unit operations) allows {used} at n={n}')
     return out
 
 
@@ -620,6 +815,7 @@ def unit_split_replication(log_ratios, tokens, *, unit_ids=None, seeds=None,
         return base
     rows, kept_seeds, dropped, weights, ids, id_source = _usr_clean_rows(
         log_ratios, tokens, unit_ids, seeds)
+    token_total = _usr_finite_sum(weights)
     base.update({
         'n_units': int(len(weights)),
         'n_seeds_input': int(len(list(log_ratios))),
@@ -627,7 +823,11 @@ def unit_split_replication(log_ratios, tokens, *, unit_ids=None, seeds=None,
         'seeds': kept_seeds,
         'dropped_seeds': dropped,
         'unit_id_source': id_source,
-        'token_total': float(sum(weights)),
+        # A future panel can declare unit token counts whose total is beyond
+        # float64 even though every count is finite.  Reporting the sum as
+        # ``inf`` would break the strict-JSON artifact contract; report the
+        # unrepresentable aggregate as null instead.
+        'token_total': token_total,
     })
     if len(weights) < min_units:
         base.update({
@@ -654,8 +854,9 @@ def unit_split_replication(log_ratios, tokens, *, unit_ids=None, seeds=None,
         core = _usr_core(rows, ids, weights, direction=direction, salt=salt,
                          alpha=alpha, min_n=min_n, max_n=max_n,
                          min_units_per_half=min_units_per_half)
-    except ValueError as exc:
-        base.update({'status': 'not_estimable', 'reason': str(exc)})
+    except (ValueError, TypeError, OverflowError, ZeroDivisionError) as exc:
+        base.update({'status': 'not_estimable',
+                     'reason': _usr_safe_text(exc, 500) or 'build failed'})
         return base
     if core.get('iut') is None:
         base.update({
@@ -674,13 +875,35 @@ def unit_split_replication(log_ratios, tokens, *, unit_ids=None, seeds=None,
     for half in core['assignment']['halves']:
         idx = half['indices']
         largest = (max(weights[i] for i in idx) if idx else None)
+        half_tokens = half['n_tokens']
+        largest_share = None
+        if idx and largest is not None:
+            if half_tokens is not None and half_tokens > 0.0:
+                largest_share = float(largest) / float(half_tokens)
+            else:
+                # Absolute half totals can be unrepresentable at scale.  The
+                # share is a ratio, so recompute it from max-normalised
+                # weights instead of dividing by inf.
+                local_scale = max(weights[i] for i in idx)
+                try:
+                    denom_n = _usr_math.fsum(
+                        weights[i] / local_scale for i in idx)
+                    if denom_n > 0.0:
+                        largest_share = (largest / local_scale) / denom_n
+                except (TypeError, ValueError, OverflowError, ZeroDivisionError):
+                    largest_share = None
+        if largest_share is not None and not _usr_math.isfinite(largest_share):
+            largest_share = None
         per_half.append({
             'name': half['name'],
-            'largest_unit_token_share': (float(largest) / float(half['n_tokens'])
-                                         if idx and half['n_tokens'] > 0.0 else None),
+            'largest_unit_token_share': largest_share,
         })
     base['composition'] = per_half
     warnings = []
+    if token_total is None:
+        warnings.append(
+            'the total scored-token count is beyond float64; absolute token '
+            'totals are null and the split uses max-normalised weights')
     shares = [h.get('token_share') for h in core['assignment']['halves']]
     if any(s is None for s in shares):
         warnings.append('token balance is undefined')
@@ -768,7 +991,10 @@ def unit_split_replication_block(log_ratios, tokens, *, unit_ids=None,
         for value in unit_ids:
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f'unit_ids must be non-empty strings, got {_usr_repr(value)}')
-            ids.append(value.strip())
+            text = value.strip()
+            if len(text) > 500:
+                raise ValueError('unit_ids must be at most 500 characters')
+            ids.append(text)
         if len(ids) != n_units:
             raise ValueError(
                 f'unit_ids length {len(ids)} does not match tokens length {n_units}')
@@ -780,13 +1006,13 @@ def unit_split_replication_block(log_ratios, tokens, *, unit_ids=None,
         if isinstance(seeds, (str, bytes)) or not isinstance(seeds, (list, tuple)):
             raise ValueError('seeds must be a sequence or None')
         seed_out = []
-        for value in seeds:
+        for index, value in enumerate(seeds):
             if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)):
                 raise ValueError(f'seeds must be integers, got {_usr_repr(value)}')
             number = int(value)
             if abs(number) > UNIT_SPLIT_REPLICATION_MAX_REPORTABLE_INT:
                 raise ValueError(
-                    f'seed {_usr_repr(value)} is outside the strict-JSON '
+                    f'seeds[{index}] is outside the strict-JSON '
                     'representable integer range')
             seed_out.append(number)
         if len(seed_out) != len(raw_rows):
@@ -858,8 +1084,8 @@ def build_unit_split_replication(log_ratios, tokens, *, unit_ids=None,
         'kind': UNIT_SPLIT_REPLICATION_KIND,
         'schema': UNIT_SPLIT_REPLICATION_SCHEMA,
         'created_at': (_usr_time.strftime('%Y-%m-%dT%H:%M:%S')
-                       if created_at is None else str(created_at)[:80]),
-        'source': (None if source is None else str(source)[:500]),
+                       if created_at is None else _usr_safe_text(created_at, 80)),
+        'source': _usr_safe_text(source, 500),
         'inputs': block['inputs'],
         'result': block['result'],
     }
@@ -873,10 +1099,185 @@ def compare_unit_split_replication_results(stored, replay, *, rtol=1e-9,
     return {'match': not diffs, 'differences': diffs}
 
 
-def _usr_result_problems(result):
+def _usr_is_int(value):
+    return (isinstance(value, (int, np.integer))
+            and not isinstance(value, (bool, np.bool_)))
+
+
+def _usr_inputs_problems(inputs):
+    """Validate every field a replay consumes, without replaying.
+
+    ``replay=False`` is used by archive/tamper tooling, so a structurally
+    plausible but edited input object must still fail closed here.  In
+    particular, huge integer labels are rendered with ``_usr_repr`` (CPython
+    refuses to format more than ~4300 decimal digits) and malformed nested
+    values are named rather than raising.
+    """
+    problems = []
+    if not isinstance(inputs, dict):
+        return ['inputs must be an object']
+    extra = sorted(set(inputs) - set(UNIT_SPLIT_REPLICATION_INPUT_KEYS),
+                   key=_esci_key_text)  # noqa: F821 (part 87)
+    missing = [k for k in UNIT_SPLIT_REPLICATION_INPUT_KEYS if k not in inputs]
+    if extra or missing:
+        problems.append(
+            f'inputs keys differ: missing={missing}, '
+            f'extra={[_esci_key_text(k) for k in extra]}')  # noqa: F821
+        return problems
+    try:
+        _usr_alpha(inputs.get('alpha'))
+    except ValueError as exc:
+        problems.append(f'inputs.alpha is malformed: {exc}')
+    try:
+        _usr_int('inputs.max_n', inputs.get('max_n'), minimum=2,
+                 maximum=UNIT_SPLIT_REPLICATION_HARD_MAX_N)
+    except ValueError as exc:
+        problems.append(f'inputs.max_n is malformed: {exc}')
+    try:
+        _usr_int('inputs.min_n', inputs.get('min_n'), minimum=2,
+                 maximum=100000)
+    except ValueError as exc:
+        problems.append(f'inputs.min_n is malformed: {exc}')
+    try:
+        _usr_int('inputs.min_units', inputs.get('min_units'), minimum=4,
+                 maximum=100000)
+    except ValueError as exc:
+        problems.append(f'inputs.min_units is malformed: {exc}')
+    try:
+        _usr_int('inputs.min_units_per_half',
+                 inputs.get('min_units_per_half'), minimum=1,
+                 maximum=100000)
+    except ValueError as exc:
+        problems.append(f'inputs.min_units_per_half is malformed: {exc}')
+    try:
+        _usr_int('inputs.n_salts', inputs.get('n_salts'), minimum=0,
+                 maximum=UNIT_SPLIT_REPLICATION_MAX_SALTS)
+    except ValueError as exc:
+        problems.append(f'inputs.n_salts is malformed: {exc}')
+    try:
+        _usr_salt(inputs.get('salt'))
+    except ValueError as exc:
+        problems.append(f'inputs.salt is malformed: {exc}')
+    try:
+        direction = _usr_direction(inputs.get('direction'))
+        if direction is None:
+            problems.append('inputs.direction must be positive or negative '
+                            'for a replayable block')
+    except ValueError as exc:
+        problems.append(f'inputs.direction is malformed: {exc}')
+    try:
+        share = float(inputs.get('min_token_share'))
+        if not _usr_math.isfinite(share) or not (0.0 < share < 0.5):
+            raise ValueError(f'must be finite and in (0,0.5), got {share!r}')
+    except (TypeError, ValueError, OverflowError) as exc:
+        problems.append(f'inputs.min_token_share is malformed: {exc}')
+
+    tokens = inputs.get('tokens')
+    weights = None
+    if isinstance(tokens, (str, bytes)) or not isinstance(tokens, (list, tuple)):
+        problems.append('inputs.tokens must be a sequence')
+    else:
+        weights = []
+        for index, value in enumerate(tokens):
+            number = _usr_number(value, f'inputs.tokens[{index}]', positive=True)
+            if number is None:
+                problems.append(
+                    f'inputs.tokens[{index}] must be finite and positive, got '
+                    f'{_usr_repr(value)}')
+                break
+            weights.append(number)
+
+    ids = None
+    unit_ids = inputs.get('unit_ids')
+    if isinstance(unit_ids, (str, bytes)) or not isinstance(unit_ids, (list, tuple)):
+        problems.append('inputs.unit_ids must be a sequence')
+    else:
+        ids = []
+        for index, value in enumerate(unit_ids):
+            if not isinstance(value, str) or not value.strip():
+                problems.append(
+                    f'inputs.unit_ids[{index}] must be a non-empty string, got '
+                    f'{_usr_repr(value)}')
+                break
+            text = value.strip()
+            if len(text) > 500:
+                problems.append(
+                    f'inputs.unit_ids[{index}] is longer than 500 characters')
+                break
+            ids.append(text)
+        if ids is not None and len(set(ids)) != len(ids):
+            problems.append('inputs.unit_ids contain duplicates')
+        if (ids is not None and weights is not None
+                and len(ids) != len(weights)):
+            problems.append('inputs.unit_ids and inputs.tokens lengths differ')
+
+    seed_values = inputs.get('seeds')
+    seeds = None
+    if isinstance(seed_values, (str, bytes)) or not isinstance(seed_values, (list, tuple)):
+        problems.append('inputs.seeds must be a sequence')
+    else:
+        seeds = []
+        for index, value in enumerate(seed_values):
+            if not _usr_is_int(value):
+                problems.append(
+                    f'inputs.seeds[{index}] must be an integer, got '
+                    f'{_usr_repr(value)}')
+                break
+            number = int(value)
+            if abs(number) > UNIT_SPLIT_REPLICATION_MAX_REPORTABLE_INT:
+                problems.append(
+                    f'inputs.seeds[{index}] is outside the strict-JSON '
+                    'representable integer range')
+                break
+            seeds.append(number)
+        if seeds is not None and len(set(seeds)) != len(seeds):
+            problems.append('inputs.seeds contain duplicates')
+
+    rows = inputs.get('log_ratios')
+    if isinstance(rows, (str, bytes)) or not isinstance(rows, (list, tuple)):
+        problems.append('inputs.log_ratios must be a sequence')
+    elif not rows:
+        problems.append('inputs.log_ratios must not be empty')
+    elif seeds is not None and len(seeds) != len(rows):
+        problems.append('inputs.log_ratios and inputs.seeds lengths differ')
+    else:
+        n_units = len(weights) if weights is not None else None
+        for rindex, row in enumerate(rows):
+            if isinstance(row, (str, bytes)) or not isinstance(row, (list, tuple)):
+                problems.append(
+                    f'inputs.log_ratios[{rindex}] must be a sequence')
+                break
+            if n_units is not None and len(row) != n_units:
+                problems.append(
+                    f'inputs.log_ratios[{rindex}] has length {len(row)}, '
+                    f'expected {n_units}')
+                break
+            for cindex, value in enumerate(row):
+                if value is None:
+                    continue
+                if _usr_number(
+                        value,
+                        f'inputs.log_ratios[{rindex}][{cindex}]') is None:
+                    problems.append(
+                        f'inputs.log_ratios[{rindex}][{cindex}] is not a '
+                        f'finite number or null, got {_usr_repr(value)}')
+                    break
+    return problems
+
+
+def _usr_result_problems(result, inputs=None):
     problems = []
     if not isinstance(result, dict):
         return ['result must be an object']
+    # An untrusted result may carry an extra (possibly huge-int) key.  The
+    # strict-JSON diagnostic is produced by the caller; this schema check makes
+    # the same tamper fail even after the hash is refreshed.
+    extra = sorted(set(result) - set(UNIT_SPLIT_REPLICATION_RESULT_KEYS),
+                   key=_esci_key_text)  # noqa: F821 (part 87)
+    if extra:
+        problems.append(
+            f'result keys differ from the schema: '
+            f'extra={[_esci_key_text(k) for k in extra]}')  # noqa: F821
     if result.get('kind') != UNIT_SPLIT_REPLICATION_RESULT_KIND:
         problems.append(
             f"result.kind must be {UNIT_SPLIT_REPLICATION_RESULT_KIND!r}, got "
@@ -892,17 +1293,304 @@ def _usr_result_problems(result):
             f'got {_usr_repr(status)}')
         return problems
     if status in ('not_estimable', 'not_applicable'):
-        if not isinstance(result.get('reason'), str) or not result['reason'].strip():
+        reason = result.get('reason')
+        if not isinstance(reason, str) or not reason.strip():
             problems.append(f'a {status} result needs a non-empty reason')
         return problems
+
+    # Knobs copied from the inputs must agree even when replay is skipped.
+    def _same_number(left, right):
+        try:
+            a, b = float(left), float(right)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        return _usr_math.isfinite(a) and _usr_math.isfinite(b) and a == b
+
+    declared = inputs if isinstance(inputs, dict) else {}
+    if result.get('direction') not in UNIT_SPLIT_REPLICATION_DIRECTIONS:
+        problems.append('result.direction must be positive or negative')
+    elif ('direction' in declared
+          and result.get('direction') != declared.get('direction')):
+        problems.append('result.direction does not match inputs.direction')
+    alpha = _usr_number(result.get('alpha'), 'result.alpha')
+    if alpha is None or not (0.0 < alpha < 1.0):
+        problems.append('result.alpha must be a finite probability')
+    elif ('alpha' in declared
+          and not _same_number(alpha, declared.get('alpha'))):
+        problems.append('result.alpha does not match inputs.alpha')
+    for key, decoded_key in (('min_n', 'min_n'), ('max_n', 'max_n'),
+                             ('min_units', 'min_units'),
+                             ('min_units_per_half', 'min_units_per_half')):
+        try:
+            value = _usr_int(f'result.{key}', result.get(key), minimum=0,
+                             maximum=100000)
+        except ValueError as exc:
+            problems.append(f'result.{key} is malformed: {exc}')
+            continue
+        if (decoded_key in declared
+                and _usr_is_int(declared.get(decoded_key))
+                and value != int(declared.get(decoded_key))):
+            problems.append(f'result.{key} does not match inputs.{decoded_key}')
+    share = _usr_number(result.get('min_token_share'),
+                        'result.min_token_share')
+    if share is None or not (0.0 < share < 0.5):
+        problems.append('result.min_token_share must be finite and in (0,0.5)')
+    elif ('min_token_share' in declared
+          and not _same_number(share, declared.get('min_token_share'))):
+        problems.append(
+            'result.min_token_share does not match inputs.min_token_share')
+
+    n_units = None
+    try:
+        n_units = _usr_int('result.n_units', result.get('n_units'), minimum=0,
+                           maximum=1000000)
+    except ValueError as exc:
+        problems.append(f'result.n_units is malformed: {exc}')
+    if (n_units is not None and isinstance(declared.get('tokens'), (list, tuple))
+            and n_units != len(declared['tokens'])):
+        problems.append('result.n_units does not match inputs.tokens length')
+
+    n_input = None
+    try:
+        n_input = _usr_int('result.n_seeds_input',
+                           result.get('n_seeds_input'), minimum=0,
+                           maximum=1000000)
+    except ValueError as exc:
+        problems.append(f'result.n_seeds_input is malformed: {exc}')
+    if (n_input is not None
+            and isinstance(declared.get('log_ratios'), (list, tuple))
+            and n_input != len(declared['log_ratios'])):
+        problems.append(
+            'result.n_seeds_input does not match inputs.log_ratios length')
+
+    n_seeds = None
+    try:
+        n_seeds = _usr_int('result.n_seeds', result.get('n_seeds'), minimum=0,
+                           maximum=1000000)
+    except ValueError as exc:
+        problems.append(f'result.n_seeds is malformed: {exc}')
+    seed_values = result.get('seeds')
+    parsed_seeds = None
+    if not isinstance(seed_values, list):
+        problems.append('result.seeds must be a list')
+    else:
+        parsed_seeds = []
+        for index, value in enumerate(seed_values):
+            if not _usr_is_int(value):
+                problems.append(
+                    f'result.seeds[{index}] must be an integer, got '
+                    f'{_usr_repr(value)}')
+                parsed_seeds = None
+                break
+            number = int(value)
+            if abs(number) > UNIT_SPLIT_REPLICATION_MAX_REPORTABLE_INT:
+                problems.append(
+                    f'result.seeds[{index}] is outside the strict-JSON '
+                    'representable integer range')
+                parsed_seeds = None
+                break
+            parsed_seeds.append(number)
+        if parsed_seeds is not None:
+            if len(set(parsed_seeds)) != len(parsed_seeds):
+                problems.append('result.seeds contains a duplicate seed')
+            if n_seeds is not None and len(parsed_seeds) != n_seeds:
+                problems.append('result.n_seeds does not match result.seeds length')
+            if (isinstance(declared.get('seeds'), (list, tuple))
+                    and not isinstance(declared.get('log_ratios'), (list, tuple))):
+                problems.append('declared seeds require declared log_ratios')
+    dropped = result.get('dropped_seeds')
+    if not isinstance(dropped, list):
+        problems.append('result.dropped_seeds must be a list')
+    else:
+        for index, item in enumerate(dropped):
+            if not isinstance(item, dict):
+                problems.append(f'result.dropped_seeds[{index}] must be an object')
+                break
+            if not _usr_is_int(item.get('seed')):
+                problems.append(
+                    f'result.dropped_seeds[{index}].seed must be an integer')
+                break
+            if not isinstance(item.get('reason'), str) or not item['reason'].strip():
+                problems.append(
+                    f'result.dropped_seeds[{index}].reason must be a non-empty string')
+                break
+        if (isinstance(declared.get('seeds'), (list, tuple))
+                and parsed_seeds is not None):
+            declared_seeds = [int(s) for s in declared['seeds']
+                              if _usr_is_int(s)]
+            dropped_seeds = [int(item.get('seed')) for item in dropped
+                             if isinstance(item, dict)
+                             and _usr_is_int(item.get('seed'))]
+            if (set(parsed_seeds) | set(dropped_seeds)
+                    != set(declared_seeds)):
+                problems.append(
+                    'result.seeds plus dropped_seeds do not cover inputs.seeds')
+            if (isinstance(declared.get('log_ratios'), (list, tuple))
+                    and len(declared['log_ratios']) == len(declared_seeds)):
+                expected_dropped = []
+                for seed, row in zip(declared_seeds, declared['log_ratios']):
+                    if not isinstance(row, (list, tuple)):
+                        continue
+                    if any(value is None for value in row):
+                        expected_dropped.append(seed)
+                if sorted(expected_dropped) != sorted(dropped_seeds):
+                    problems.append(
+                        'result.dropped_seeds does not match the rows with a '
+                        'null cell in inputs.log_ratios')
+                expected_kept = [seed for seed, row in zip(
+                    declared_seeds, declared['log_ratios'])
+                    if isinstance(row, (list, tuple))
+                    and not any(value is None for value in row)]
+                if expected_kept != parsed_seeds:
+                    problems.append(
+                        'result.seeds is not the ordered list of complete rows '
+                        'in inputs.log_ratios')
+
+    if result.get('unit_id_source') not in ('supplied', 'position'):
+        problems.append("result.unit_id_source must be 'supplied' or 'position'")
+    token_total = result.get('token_total')
+    if token_total is not None:
+        total = _usr_number(token_total, 'result.token_total')
+        if total is None or total < 0.0:
+            problems.append('result.token_total must be null or a finite '
+                            'non-negative number')
+
+    assignment = result.get('assignment')
+    assign_halves = None
+    if not isinstance(assignment, dict):
+        problems.append('result.assignment must be an object')
+    else:
+        if assignment.get('salt') != declared.get('salt', assignment.get('salt')):
+            if 'salt' in declared:
+                problems.append('result.assignment.salt does not match inputs.salt')
+        digest = assignment.get('digest')
+        if (not isinstance(digest, str) or len(digest) != 64
+                or any(c not in '0123456789abcdef' for c in digest)):
+            problems.append('result.assignment.digest must be a 64-hex string')
+        try:
+            a_units = _usr_int('result.assignment.n_units',
+                               assignment.get('n_units'), minimum=0,
+                               maximum=1000000)
+        except ValueError as exc:
+            problems.append(f'result.assignment.n_units is malformed: {exc}')
+            a_units = None
+        assign_halves = assignment.get('halves')
+        if not isinstance(assign_halves, list) or len(assign_halves) != 2:
+            problems.append('result.assignment.halves must have exactly two entries')
+            assign_halves = None
+        else:
+            seen = []
+            for i, half in enumerate(assign_halves):
+                if not isinstance(half, dict):
+                    problems.append(f'result.assignment.halves[{i}] must be an object')
+                    assign_halves = None
+                    break
+                if half.get('name') != f'half_{i}':
+                    problems.append(
+                        f"result.assignment.halves[{i}].name must be 'half_{i}'")
+                indices = half.get('indices')
+                unit_ids = half.get('unit_ids')
+                if not isinstance(indices, list) or not all(
+                        _usr_is_int(x) for x in indices):
+                    problems.append(
+                        f'result.assignment.halves[{i}].indices must be integers')
+                    continue
+                if not isinstance(unit_ids, list) or not all(
+                        isinstance(x, str) for x in unit_ids):
+                    problems.append(
+                        f'result.assignment.halves[{i}].unit_ids must be strings')
+                    continue
+                if len(unit_ids) != len(indices):
+                    problems.append(
+                        f'result.assignment.halves[{i}] id/index lengths differ')
+                try:
+                    h_units = _usr_int(
+                        f'result.assignment.halves[{i}].n_units',
+                        half.get('n_units'), minimum=0, maximum=1000000)
+                except ValueError as exc:
+                    problems.append(
+                        f'result.assignment.halves[{i}].n_units is malformed: {exc}')
+                    h_units = None
+                if h_units is not None and h_units != len(indices):
+                    problems.append(
+                        f'result.assignment.halves[{i}].n_units does not match '
+                        'its indices')
+                h_tokens = half.get('n_tokens')
+                if h_tokens is not None:
+                    h_tok = _usr_number(
+                        h_tokens, f'result.assignment.halves[{i}].n_tokens')
+                    if h_tok is None or h_tok < 0.0:
+                        problems.append(
+                            f'result.assignment.halves[{i}].n_tokens must be '
+                            'null or finite non-negative')
+                h_share = half.get('token_share')
+                if h_share is not None:
+                    h_share_n = _usr_number(
+                        h_share, f'result.assignment.halves[{i}].token_share')
+                    if h_share_n is None or not (0.0 <= h_share_n <= 1.0):
+                        problems.append(
+                            f'result.assignment.halves[{i}].token_share must be '
+                            'null or in [0,1]')
+                seen.extend(indices)
+            if (a_units is not None and len(seen) != a_units):
+                problems.append(
+                    'result.assignment.n_units does not match its two halves')
+            if seen and sorted(seen) != list(range(len(seen))):
+                problems.append(
+                    'result.assignment halves are not a partition of the unit '
+                    'indices')
+            if (isinstance(declared.get('unit_ids'), (list, tuple))
+                    and assign_halves is not None):
+                declared_ids = declared['unit_ids']
+                for i, half in enumerate(assign_halves):
+                    if not isinstance(half, dict):
+                        continue
+                    idx = half.get('indices')
+                    ids = half.get('unit_ids')
+                    if not isinstance(idx, list) or not isinstance(ids, list):
+                        continue
+                    if any(not _usr_is_int(j) or j < 0 or j >= len(declared_ids)
+                           for j in idx):
+                        problems.append(
+                            f'result.assignment.halves[{i}].indices are out of '
+                            'range for inputs.unit_ids')
+                        continue
+                    if [declared_ids[j] for j in idx] != ids:
+                        problems.append(
+                            f'result.assignment.halves[{i}].unit_ids do not '
+                            'match inputs.unit_ids at its indices')
+
     halves = result.get('halves')
     if not isinstance(halves, list) or len(halves) != 2:
         problems.append('an estimable result needs exactly two halves')
         return problems
+    component_ps = []
     for i, half in enumerate(halves):
         if not isinstance(half, dict):
             problems.append(f'halves[{i}] must be an object')
             return problems
+        if half.get('name') != f'half_{i}':
+            problems.append(f"halves[{i}].name must be 'half_{i}'")
+        stats_obj = half.get('stats')
+        if not isinstance(stats_obj, dict):
+            problems.append(f'halves[{i}].stats must be an object')
+        else:
+            for key in ('mean', 'sd', 'sem'):
+                value = stats_obj.get(key)
+                if value is None:
+                    if key == 'mean':
+                        problems.append(f'halves[{i}].stats.mean must be finite')
+                    continue
+                parsed = _usr_number(value, f'halves[{i}].stats.{key}')
+                if parsed is None:
+                    problems.append(
+                        f'halves[{i}].stats.{key} must be null or finite')
+            for key in ('n', 'n_positive', 'n_negative', 'n_zero'):
+                try:
+                    _usr_int(f'halves[{i}].stats.{key}', stats_obj.get(key),
+                             minimum=0, maximum=1000000)
+                except ValueError as exc:
+                    problems.append(f'halves[{i}].stats.{key} is malformed: {exc}')
         test = half.get('test')
         if not isinstance(test, dict):
             problems.append(f'halves[{i}].test must be an object')
@@ -911,6 +1599,21 @@ def _usr_result_problems(result):
         if p is None or not (0.0 <= p <= 1.0):
             problems.append(f'halves[{i}].test.p_one_sided must be a probability')
             return problems
+        component_ps.append(float(p))
+        if (n_seeds is not None and stats_obj is not None
+                and _usr_is_int(stats_obj.get('n'))
+                and int(stats_obj.get('n')) != n_seeds):
+            problems.append(f'halves[{i}].stats.n does not match result.n_seeds')
+        if (assign_halves is not None
+                and isinstance(assign_halves[i], dict)
+                and half.get('n_units') != assign_halves[i].get('n_units')):
+            problems.append(
+                f'halves[{i}].n_units does not match result.assignment')
+        if (assign_halves is not None
+                and isinstance(assign_halves[i], dict)
+                and half.get('token_share') != assign_halves[i].get('token_share')):
+            problems.append(
+                f'halves[{i}].token_share does not match result.assignment')
     iut = result.get('iut')
     if not isinstance(iut, dict):
         problems.append('iut must be an object')
@@ -918,14 +1621,133 @@ def _usr_result_problems(result):
     p = _usr_number(iut.get('p_iut'), 'iut.p_iut')
     if p is None or not (0.0 <= p <= 1.0):
         problems.append('iut.p_iut must be a probability')
-    elif p + 1e-12 < max(float(halves[0]['test']['p_one_sided']),
-                         float(halves[1]['test']['p_one_sided'])):
+    elif component_ps and p + 1e-12 < max(component_ps):
         problems.append('iut.p_iut is smaller than a component one-sided p; '
                         'the intersection-union maximum was not applied')
-    assignment = result.get('assignment')
-    if not isinstance(assignment, dict) or assignment.get('n_units') != sum(
-            int(h.get('n_units') or 0) for h in assignment.get('halves') or []):
-        problems.append('assignment.n_units does not match its two halves')
+    elif component_ps and abs(p - max(component_ps)) > 1e-12:
+        problems.append('iut.p_iut is not the maximum of the two component '
+                        'one-sided p-values')
+    for key, component in (('p_half_0', 0), ('p_half_1', 1)):
+        value = _usr_number(iut.get(key), f'iut.{key}')
+        if value is None or not (0.0 <= value <= 1.0):
+            problems.append(f'iut.{key} must be a probability')
+        elif component_ps and abs(value - component_ps[component]) > 1e-12:
+            problems.append(f'iut.{key} does not match the corresponding half')
+    if not isinstance(iut.get('method'), str) or not iut['method'].strip():
+        problems.append('iut.method must be a non-empty string')
+    iut_alpha = _usr_number(iut.get('alpha'), 'iut.alpha')
+    if iut_alpha is None or not (0.0 < iut_alpha < 1.0):
+        problems.append('iut.alpha must be a finite probability')
+    elif alpha is not None and abs(iut_alpha - alpha) > 1e-12:
+        problems.append('iut.alpha does not match result.alpha')
+    iut_direction = iut.get('direction')
+    if iut_direction not in UNIT_SPLIT_REPLICATION_DIRECTIONS:
+        problems.append('iut.direction must be positive or negative')
+    elif iut_direction != result.get('direction'):
+        problems.append('iut.direction does not match result.direction')
+    if iut.get('claim') not in (
+            'both_halves_support_direction',
+            'direction_consistent_but_not_jointly_significant',
+            'one_half_significant', 'halves_discordant',
+            'direction_not_supported'):
+        problems.append(
+            f"iut.claim is not one of the documented claims, got "
+            f'{_usr_repr(iut.get("claim"))}')
+    if not isinstance(iut.get('reject'), (bool, np.bool_)):
+        problems.append('iut.reject must be a boolean')
+    elif (p is not None and alpha is not None
+          and bool(iut.get('reject')) != bool(p <= alpha)):
+        problems.append('iut.reject does not agree with p_iut <= alpha')
+    if (result.get('sign_agreement') not in
+            ('both_negative', 'both_positive', 'discordant',
+             'zero_in_one_half', 'unavailable')):
+        problems.append('result.sign_agreement is not a documented value')
+    diff = result.get('half_difference')
+    if not isinstance(diff, dict):
+        problems.append('result.half_difference must be an object')
+    else:
+        for key in ('mean', 'sd', 'sem'):
+            value = diff.get(key)
+            if value is not None and _usr_number(
+                    value, f'half_difference.{key}') is None:
+                problems.append(f'half_difference.{key} must be null or finite')
+        ci = diff.get('ci95')
+        if ci is not None:
+            if (not isinstance(ci, (list, tuple)) or len(ci) != 2
+                    or any(_usr_number(x, 'half_difference.ci95') is None
+                           for x in ci)):
+                problems.append('half_difference.ci95 must be null or a finite pair')
+            elif float(ci[0]) > float(ci[1]):
+                problems.append('half_difference.ci95 must be ordered')
+    composition = result.get('composition')
+    if not isinstance(composition, list) or len(composition) != 2:
+        problems.append('result.composition must have exactly two entries')
+    else:
+        for i, item in enumerate(composition):
+            if not isinstance(item, dict):
+                problems.append(f'result.composition[{i}] must be an object')
+                continue
+            value = item.get('largest_unit_token_share')
+            if value is not None:
+                parsed = _usr_number(
+                    value, f'composition[{i}].largest_unit_token_share')
+                if parsed is None or not (0.0 <= parsed <= 1.0):
+                    problems.append(
+                        f'composition[{i}].largest_unit_token_share must be '
+                        'null or in [0,1]')
+    warnings = result.get('warnings')
+    if not isinstance(warnings, list) or not all(
+            isinstance(w, str) for w in warnings):
+        problems.append('result.warnings must be a list of strings')
+    sens = result.get('split_sensitivity')
+    declared_n_salts = declared.get('n_salts')
+    if sens is None:
+        if declared_n_salts:
+            problems.append('split_sensitivity is null but inputs.n_salts > 0')
+    elif not isinstance(sens, dict):
+        problems.append('result.split_sensitivity must be an object or null')
+    elif not declared_n_salts:
+        problems.append('split_sensitivity is present but inputs.n_salts is 0')
+    else:
+        parsed_sens = {}
+        for key in ('n_salts_requested', 'n_salts_used', 'n_salts_skipped',
+                    'n_estimable', 'n_pass', 'n_distinct_assignments'):
+            try:
+                parsed_sens[key] = _usr_int(
+                    f'split_sensitivity.{key}', sens.get(key), minimum=0,
+                    maximum=1000000)
+            except ValueError as exc:
+                problems.append(f'split_sensitivity.{key} is malformed: {exc}')
+        for key in ('pass_fraction', 'p_min', 'p_median', 'p_max'):
+            value = sens.get(key)
+            if value is None:
+                continue
+            parsed = _usr_number(value, f'split_sensitivity.{key}')
+            if parsed is None or not (0.0 <= parsed <= 1.0):
+                problems.append(
+                    f'split_sensitivity.{key} must be null or in [0,1]')
+        if not isinstance(sens.get('truncated'), (bool, np.bool_)):
+            problems.append('split_sensitivity.truncated must be a boolean')
+        if ('n_pass' in parsed_sens and 'n_estimable' in parsed_sens
+                and parsed_sens['n_pass'] > parsed_sens['n_estimable']):
+            problems.append(
+                'split_sensitivity.n_pass exceeds n_estimable')
+        if ('n_estimable' in parsed_sens and 'n_salts_used' in parsed_sens
+                and parsed_sens['n_estimable'] > parsed_sens['n_salts_used']):
+            problems.append(
+                'split_sensitivity.n_estimable exceeds n_salts_used')
+        if ('n_salts_used' in parsed_sens
+                and 'n_salts_requested' in parsed_sens
+                and parsed_sens['n_salts_used']
+                > parsed_sens['n_salts_requested']):
+            problems.append(
+                'split_sensitivity.n_salts_used exceeds n_salts_requested')
+        if (_usr_is_int(declared_n_salts)
+                and 'n_salts_requested' in parsed_sens
+                and parsed_sens['n_salts_requested'] != int(declared_n_salts)):
+            problems.append(
+                'split_sensitivity.n_salts_requested does not match '
+                'inputs.n_salts')
     return problems
 
 
@@ -953,11 +1775,12 @@ def _usr_validate_common(artifact, *, block=False):
         strict = None
     if strict:
         out['problems'].append(strict)
-    extra = sorted(set(artifact) - set(expected))
+    extra = sorted(set(artifact) - set(expected), key=_esci_key_text)  # noqa: F821
     missing = [k for k in expected if k not in artifact]
     if extra or missing:
         out['problems'].append(
-            f'artifact keys differ from the schema: missing={missing}, extra={extra}')
+            f'artifact keys differ from the schema: missing={missing}, '
+            f'extra={[_esci_key_text(k) for k in extra]}')  # noqa: F821
     want_kind = (UNIT_SPLIT_REPLICATION_BLOCK_KIND if block
                  else UNIT_SPLIT_REPLICATION_KIND)
     if artifact.get('kind') != want_kind:
@@ -996,31 +1819,12 @@ def _usr_validate_common(artifact, *, block=False):
                 out['problems'].append(
                     'artifact.content_sha256 does not match the recorded body')
     inputs = artifact.get('inputs')
+    input_problems = []
     if not isinstance(inputs, dict):
         out['problems'].append('artifact.inputs must be an object')
     else:
-        extra_in = sorted(set(inputs) - set(UNIT_SPLIT_REPLICATION_INPUT_KEYS))
-        missing_in = [k for k in UNIT_SPLIT_REPLICATION_INPUT_KEYS if k not in inputs]
-        if extra_in or missing_in:
-            out['problems'].append(
-                f'inputs keys differ: missing={missing_in}, extra={extra_in}')
-        else:
-            try:
-                _usr_alpha(inputs.get('alpha'))
-                _usr_int('max_n', inputs.get('max_n'), minimum=2,
-                         maximum=UNIT_SPLIT_REPLICATION_HARD_MAX_N)
-                _usr_int('min_n', inputs.get('min_n'), minimum=2,
-                         maximum=100000)
-                _usr_int('min_units', inputs.get('min_units'), minimum=4,
-                         maximum=100000)
-                _usr_int('min_units_per_half', inputs.get('min_units_per_half'),
-                         minimum=1, maximum=100000)
-                _usr_salt(inputs.get('salt'))
-                _usr_int('n_salts', inputs.get('n_salts'), minimum=0,
-                         maximum=UNIT_SPLIT_REPLICATION_MAX_SALTS)
-                _usr_direction(inputs.get('direction'))
-            except ValueError as exc:
-                out['problems'].append(f'inputs are malformed: {exc}')
+        input_problems = _usr_inputs_problems(inputs)
+        out['problems'].extend(input_problems)
     result = artifact.get('result')
     if not isinstance(result, dict):
         out['problems'].append('artifact.result must be an object')
@@ -1028,7 +1832,34 @@ def _usr_validate_common(artifact, *, block=False):
         out['result_status'] = (result.get('status')
                                 if isinstance(result.get('status'), str)
                                 else _usr_repr(result.get('status')))
-        out['problems'].extend(_usr_result_problems(result))
+        out['problems'].extend(_usr_result_problems(result, inputs))
+        # Re-derive the deterministic assignment from the declared inputs.
+        # This is not a full replay, but it means replay=False (archive/tamper
+        # tooling) still rejects an edited salt, token vector or unit id list;
+        # those fields are supposed to explain the recorded partition.
+        if (not input_problems
+                and result.get('status') in ('ok', 'warnings')):
+            try:
+                expected_assignment = unit_split_assignment(
+                    inputs['unit_ids'], inputs['tokens'],
+                    salt=inputs['salt'],
+                    min_units_per_half=inputs['min_units_per_half'])
+            except (ValueError, TypeError, OverflowError) as exc:
+                out['problems'].append(
+                    'assignment is not re-derivable from inputs: '
+                    f'{_usr_repr(exc)}')
+            else:
+                recorded = result.get('assignment')
+                if (not isinstance(recorded, dict)
+                        or recorded.get('digest')
+                        != expected_assignment.get('digest')):
+                    out['problems'].append(
+                        'result.assignment.digest does not match the partition '
+                        're-derived from inputs.unit_ids/tokens/salt')
+                elif recorded != expected_assignment:
+                    out['problems'].append(
+                        'result.assignment body does not match the partition '
+                        're-derived from inputs.unit_ids/tokens/salt')
     if out['problems']:
         return out
     if not block:
