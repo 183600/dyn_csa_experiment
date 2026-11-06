@@ -1086,7 +1086,12 @@ def _ba_shape_problems(inputs, result):
         return problems
     names = [row.get('name') for row in declared_components
              if isinstance(row, dict)]
-    if set(components) != set(names):
+    if any(not isinstance(name, str) for name in names):
+        # A tampered declaration can put a list/dict where a component name
+        # belongs; hashing it into a set of names would raise TypeError
+        # instead of producing the fail-closed diagnostic.
+        problems.append('inputs.design.components names must be strings')
+    elif set(components) != set(names):
         problems.append('result.components does not match the declared '
                         'component names')
     # Validate the analysis knobs that replay would consume even when the

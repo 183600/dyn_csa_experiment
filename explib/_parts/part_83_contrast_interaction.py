@@ -293,6 +293,120 @@ def _ci_content_sha(artifact):
     return hashlib.sha256(blob.encode('utf-8')).hexdigest()
 
 
+def _ci_strict_json_problem(label, body):
+    """Return a bounded diagnostic when ``body`` is not strict JSON."""
+    try:
+        json.dumps(body, allow_nan=False)
+    except Exception as exc:
+        detail = str(exc)
+        if ('Exceeds the limit' in detail
+                or 'integer string conversion' in detail):
+            return (f'{label} carries an unrepresentable int (beyond '
+                    "CPython's decimal-conversion limit) and cannot be "
+                    'strict-JSON serialised')
+        return (f'{label} is not strict-JSON serialisable: '
+                f'{type(exc).__name__}: {_ci_repr(exc)}')
+    return None
+
+
+def _ci_shape_problems(inputs, result):
+    """Cheap result checks that must hold even when replay is skipped.
+
+    ``replay=False`` is used by archive/tamper tooling, so a hand-edited body
+    whose hash has been refreshed must still be rejected.  Only structural and
+    knob-identity fields are checked here; the full replay remains the
+    authoritative comparison.
+    """
+    problems = []
+    if not isinstance(result, dict):
+        return ['result must be an object']
+    status = result.get('status')
+    if status not in ('ok', 'warnings', 'not_estimable'):
+        problems.append('result.status must be ok/warnings/not_estimable, got '
+                        f'{_ci_repr(status)}')
+        return problems
+    if result.get('kind') != CONTRAST_INTERACTION_ARTIFACT_KIND:
+        problems.append(
+            f'result.kind must be {CONTRAST_INTERACTION_ARTIFACT_KIND!r}, got '
+            f'{_ci_repr(result.get("kind"))}')
+    if result.get('primary_scale') != (
+            CONTRAST_INTERACTION_POLICY['primary_scale']):
+        problems.append('result.primary_scale does not match the declared policy')
+    if status == 'not_estimable':
+        reason = result.get('reason')
+        if not isinstance(reason, str) or not reason.strip():
+            problems.append('a not_estimable result needs a non-empty reason')
+        return problems
+
+    knobs = (
+        ('alpha', _ci_alpha, 'result.alpha'),
+        ('min_n', lambda v: _ci_int(v, 'result.min_n', minimum=2,
+                                    maximum=CONTRAST_INTERACTION_MAX_REPORTABLE_INT),
+         'result.min_n'),
+    )
+    for key, decode, label in knobs:
+        try:
+            value = decode(result.get(key))
+        except (TypeError, ValueError) as exc:
+            problems.append(f'{label} is malformed: {exc}')
+            continue
+        if not isinstance(inputs, dict) or key not in inputs:
+            continue
+        try:
+            declared = decode(inputs.get(key))
+        except (TypeError, ValueError):
+            continue
+        if value != declared:
+            problems.append(f'{label} does not match inputs.{key}')
+
+    if isinstance(inputs, dict) and 'margin' in inputs:
+        try:
+            result_margin = (None if result.get('margin') is None
+                             else _ci_margin(result.get('margin'),
+                                             'result.margin'))
+        except (TypeError, ValueError) as exc:
+            problems.append(f'result.margin is malformed: {exc}')
+        else:
+            declared_margin = inputs.get('margin')
+            if declared_margin is None:
+                if result_margin is not None:
+                    problems.append('result.margin does not match inputs.margin')
+            else:
+                try:
+                    declared_margin = _ci_margin(
+                        declared_margin, 'inputs.margin')
+                except (TypeError, ValueError):
+                    declared_margin = None
+                if (declared_margin is None or result_margin is None
+                        or not math.isclose(result_margin, declared_margin,
+                                            rel_tol=1e-12, abs_tol=1e-12)):
+                    problems.append('result.margin does not match inputs.margin')
+
+    if isinstance(inputs, dict) and isinstance(inputs.get('design'), dict):
+        if result.get('design') != inputs.get('design'):
+            problems.append('result.design does not match inputs.design')
+
+    scales = result.get('scales')
+    if not isinstance(scales, dict):
+        problems.append('result.scales must be an object')
+        return problems
+    for scale in CONTRAST_INTERACTION_POLICY['scales']:
+        block = scales.get(scale)
+        if not isinstance(block, dict):
+            problems.append(f'result.scales[{scale!r}] must be an object')
+            continue
+        if not isinstance(block.get('interaction'), dict):
+            problems.append(
+                f'result.scales[{scale!r}].interaction must be an object')
+        if not isinstance(block.get('family'), dict):
+            problems.append(
+                f'result.scales[{scale!r}].family must be an object')
+        if not isinstance(block.get('marginals'), dict):
+            problems.append(
+                f'result.scales[{scale!r}].marginals must be an object')
+    return problems
+
+
 def _ci_not_estimable(reason, *, extra=None):
     out = {
         'kind': 'contrast_interaction',
@@ -1075,6 +1189,9 @@ def validate_contrast_interaction(artifact, *, replay=True):
     if not isinstance(artifact, dict):
         out['problems'].append('artifact must be a JSON object')
         return out
+    strict = _ci_strict_json_problem('artifact', artifact)
+    if strict:
+        out['problems'].append(strict)
     extra = sorted(set(artifact) - set(CONTRAST_INTERACTION_ARTIFACT_KEYS),
                    key=_ci_key_text)
     missing = [k for k in CONTRAST_INTERACTION_ARTIFACT_KEYS
@@ -1125,13 +1242,16 @@ def validate_contrast_interaction(artifact, *, replay=True):
     if not isinstance(result, dict):
         out['problems'].append('artifact.result must be an object')
     else:
-        out['result_status'] = result.get('status')
+        status = result.get('status')
+        out['result_status'] = (status if isinstance(status, str)
+                                else _ci_repr(status))
+        out['problems'].extend(_ci_shape_problems(inputs, result))
     if out['problems']:
         return out
     if not replay:
         out['status'] = ('warnings' if result.get('status') == 'warnings'
                          else 'ok')
-        out['result'] = result
+        out['result'] = _ci_jsonable(result)
         return out
     try:
         replayed = difference_in_differences(

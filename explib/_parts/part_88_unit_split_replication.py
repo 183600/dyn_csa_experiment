@@ -1666,7 +1666,7 @@ def _usr_result_problems(result, inputs=None):
             problems.append(f'halves[{i}].test.p_one_sided must be a probability')
             return problems
         component_ps.append(float(p))
-        if (n_seeds is not None and stats_obj is not None
+        if (n_seeds is not None and isinstance(stats_obj, dict)
                 and _usr_is_int(stats_obj.get('n'))
                 and int(stats_obj.get('n')) != n_seeds):
             problems.append(f'halves[{i}].stats.n does not match result.n_seeds')

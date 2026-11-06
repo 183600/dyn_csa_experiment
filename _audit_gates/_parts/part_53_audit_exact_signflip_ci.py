@@ -23,15 +23,38 @@ _ESCI_STATS_DEFAULTS = (
 _ESCI_BLOCK_FIELDS = ('exact_signflip_ci', 'exact_signflip_ci_log_ratio')
 
 
+def _esci_gate_key_text(value, limit=160):
+    """Bounded key text; huge integer dict keys are diagnostics, not crashes."""
+    if isinstance(value, str):
+        text = value
+    else:
+        try:
+            text = str(value)
+        except Exception:
+            return _esci_gate_repr(value, limit=limit)
+    return text if len(text) <= limit else text[:limit - 3] + '...'
+
+
+def _esci_gate_path_text(value):
+    """Filesystem path as text, or ``None`` when the value is not usable."""
+    try:
+        return os.fsdecode(os.fspath(value))
+    except Exception:
+        return None
+
+
 def _esci_gate_resolve(path, defaults):
     if path is not None:
         if isinstance(path, (str, os.PathLike)):
-            return os.fspath(path)
+            return _esci_gate_path_text(path)
         return None
     for rel in defaults:
-        candidate = os.path.join(REPO, rel)  # noqa: F821
-        if os.path.exists(candidate):
-            return candidate
+        try:
+            candidate = os.path.join(REPO, rel)  # noqa: F821
+            if os.path.exists(candidate):
+                return candidate
+        except (OSError, ValueError, TypeError):
+            continue
     return None
 
 
@@ -144,7 +167,7 @@ def _esci_gate_scan_stats(path, out):
         return out
     L = _import_exp_lib()  # noqa: F821
     found = 0
-    for name in sorted(comps):
+    for name in sorted(comps, key=_esci_gate_key_text):
         rec = comps.get(name)
         if not isinstance(rec, dict):
             continue
@@ -153,7 +176,7 @@ def _esci_gate_scan_stats(path, out):
                 continue
             block = rec.get(field)
             found += 1
-            label = f'{name}.{field}'
+            label = f'{_esci_gate_key_text(name)}.{field}'
             if not isinstance(block, dict):
                 out['blocks'].append({
                     'name': label,
@@ -222,9 +245,32 @@ def audit_exact_signflip_ci(path=None, *, verbose=True):
     }
     if path is not None:
         resolved = _esci_gate_resolve(path, ())
-        if resolved is None or not os.path.exists(resolved):
+        if resolved is None:
+            # A caller-supplied path is untrusted too: ``os.path.exists``
+            # raises for a huge integer and an arbitrary object is not
+            # JSON-serialisable in the report.  Fail closed with a bounded
+            # diagnostic before touching the filesystem.
+            out['status'] = 'fail'
+            out['path'] = None
+            out['problems'].append(
+                'path is not a usable filesystem path: '
+                f'{_esci_gate_repr(path)}')
+            if verbose:
+                print(json.dumps(out, ensure_ascii=False, indent=2)[:5000])
+            return out
+        out['path'] = resolved
+        try:
+            exists = os.path.exists(resolved)
+        except (OSError, ValueError, TypeError) as exc:
+            out['status'] = 'fail'
+            out['problems'].append(
+                f'path is not usable for filesystem access: '
+                f'{type(exc).__name__}: {_esci_gate_repr(exc)}')
+            if verbose:
+                print(json.dumps(out, ensure_ascii=False, indent=2)[:5000])
+            return out
+        if not exists:
             out['status'] = 'not_verifiable_locally'
-            out['path'] = resolved
             out['reason'] = 'the explicit exact-CI path does not exist'
             if verbose:
                 print(json.dumps(out, ensure_ascii=False, indent=2)[:5000])
