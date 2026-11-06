@@ -1076,6 +1076,34 @@ def _signflip_mitm_count(d):
     return int(lo.sum() + (right.size - hi).sum())
 
 
+def _signflip_dominant_all_qualify(d, obs):
+    """Whether every sign assignment counts as at least as extreme as observed.
+
+    For any sign vector the triangle inequality gives
+    ``|sum(s_i*d_i)| >= |d_k| - sum_{i != k}|d_i|`` for every ``k``.  Taking
+    the best ``k`` therefore gives a lower bound on every attainable absolute
+    sum.  If that bound (converted to a mean) already reaches the observed
+    value within the exact enumeration's tolerance, all ``2**n`` assignments
+    qualify and the two-sided p is exactly 1.
+
+    This is a closed-form exact branch, not an approximation: it matters for
+    large dominant panels (one delta outweighs the rest), where the
+    meet-in-the-middle cut-off is no longer affordable and the saddlepoint
+    tail would otherwise understate p (e.g. a 47-seed panel with one large
+    positive delta and many small negative ones has exact p=1).
+    """
+    absd = np.abs(np.asarray(d, dtype=float))
+    n = int(absd.size)
+    if n == 0:
+        return False
+    total = float(absd.sum())
+    if not math.isfinite(total):
+        return False
+    dmax = float(absd.max())
+    lower_mean = (dmax - (total - dmax)) / float(n)
+    return bool(float(obs) <= lower_mean + 1e-12)
+
+
 def _signflip_saddlepoint_p(values):
     """Deterministic Lugannani-Rice saddlepoint tail for n > 40.
 
@@ -1240,6 +1268,14 @@ def exact_signflip_p(deltas):
             return {'n': n, 'p': float(cnt / float(1 << n)),
                     'n_dropped': n_dropped, 'n_nonzero': n_nonzero,
                     'p_floor': p_floor, 'method': 'exact-mitm-dominant'}
+    if _signflip_dominant_all_qualify(d_work, obs):
+        # Exact closed form for a panel beyond the MITM size cap: every sign
+        # assignment is at least as extreme as the observed one.  The label
+        # stays the exact dominant branch so callers can distinguish this
+        # from the saddlepoint approximation.
+        return {'n': n, 'p': 1.0, 'n_dropped': n_dropped,
+                'n_nonzero': n_nonzero, 'p_floor': p_floor,
+                'method': 'exact-mitm-dominant'}
     p, method = _signflip_saddlepoint_p(d_work.tolist())
     return {'n': n, 'p': float(p), 'n_dropped': n_dropped,
             'n_nonzero': n_nonzero, 'p_floor': p_floor, 'method': method}
