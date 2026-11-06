@@ -166,12 +166,19 @@ def _fc_score_maxt(matrix, alpha):
     """
     A = _fc_np.asarray(matrix, dtype=float)
     m, n = A.shape
-    if n > FAMILY_SIGNFLIP_HARD_MAX_N:
+    # A seed column that is exactly zero in every contrast cannot change the
+    # score statistic; its sign only duplicates patterns.  Branch on the
+    # effective columns so a zero-padded family is not refused at the hard
+    # cap and does not pay 2**n for an n it does not use.
+    active = _fc_np.any(A != 0.0, axis=0)
+    n_effective = int(_fc_np.count_nonzero(active))
+    if n_effective > FAMILY_SIGNFLIP_HARD_MAX_N:
         raise ValueError(
-            f'exact family max-T: n={n} exceeds the absolute hard cap '
+            f'exact family max-T: {n_effective} non-zero seed column(s) '
+            f'(of n={n}) exceed the absolute hard cap '
             f'{FAMILY_SIGNFLIP_HARD_MAX_N}; refusing an unbounded 2**n '
             'allocation')
-    total = 1 << n
+    total = 1 << n_effective
     row_scale = _fc_np.max(_fc_np.abs(A), axis=1)
     nz_row = row_scale > 0.0
     D = _fc_np.zeros_like(A)
@@ -186,13 +193,15 @@ def _fc_score_maxt(matrix, alpha):
     order = _fc_np.asarray(sorted(range(m), key=lambda i: (-float(t[i]), i)),
                            dtype=_fc_np.int64)
     t_sorted = t[order]
-    bitpos = _fc_np.arange(n, dtype=_fc_np.int64)[None, :]
+    D_eff = D[:, active]
+    bitpos = _fc_np.arange(n_effective, dtype=_fc_np.int64)[None, :]
     # Each chunk materialises a (patterns x m) matrix.  Sizing the chunk from
     # n alone is fine for the small frozen family, but a scale-up panel can
     # grow the number of declared contrasts: cap the cell count as well, so
     # memory stays O(target) instead of O(target * m).
     chunk = max(1, min(total,
-                       max(1, FAMILY_SIGNFLIP_CHUNK_TARGET // max(n, 1)),
+                       max(1, FAMILY_SIGNFLIP_CHUNK_TARGET //
+                           max(n_effective, 1)),
                        max(1, FAMILY_SIGNFLIP_CHUNK_TARGET // max(m, 1))))
     raw_counts = _fc_np.zeros(m, dtype=_fc_np.int64)
     single_counts = _fc_np.zeros(m, dtype=_fc_np.int64)
@@ -202,7 +211,7 @@ def _fc_score_maxt(matrix, alpha):
         bs = min(chunk, total - off)
         masks = _fc_np.arange(off, off + bs, dtype=_fc_np.int64)[:, None]
         signs = _fc_np.where((masks & (1 << bitpos)) != 0, 1.0, -1.0)
-        sums = signs @ D.T
+        sums = signs @ D_eff.T
         t_star = _fc_np.zeros_like(sums)
         if _fc_np.any(nz):
             t_star[:, nz] = _fc_np.abs(sums[:, nz]) / scale[None, nz]
@@ -461,17 +470,25 @@ def confirmation_family_correction(comparisons, *, family_names, frozen_holm=Non
         return _fc_not_estimable(
             f'only {n} paired seeds; max-T needs at least '
             f'{FAMILY_CORRECTION_POLICY["min_seeds"]}')
-    if n > cap:
-        return _fc_not_estimable(
-            f'n={n} exceeds the exact-enumeration cap max_n={cap}; the '
-            'block refuses an approximation rather than mislabel it exact')
-    if n > FAMILY_SIGNFLIP_HARD_MAX_N:
-        return _fc_not_estimable(
-            f'n={n} exceeds the absolute exact-enumeration hard cap '
-            f'{FAMILY_SIGNFLIP_HARD_MAX_N}; refusing an unbounded 2**n '
-            'allocation rather than exhausting memory')
     m = len(names)
     D = [rows[name] for name in names]
+    # Exact enumeration cost is set by the seed columns that can change a
+    # score.  A zero column is sign-invariant, so a panel padded with zero
+    # seeds must not be refused at the cap when its effective width is small.
+    _D_eff = _fc_np.asarray(D, dtype=float)
+    n_effective = int(_fc_np.count_nonzero(
+        _fc_np.any(_D_eff != 0.0, axis=0)))
+    if n_effective > cap:
+        return _fc_not_estimable(
+            f'{n_effective} non-zero seed column(s) (of n={n} declared) '
+            f'exceed the exact-enumeration cap max_n={cap}; the block refuses '
+            'an approximation rather than mislabel it exact')
+    if n_effective > FAMILY_SIGNFLIP_HARD_MAX_N:
+        return _fc_not_estimable(
+            f'{n_effective} non-zero seed column(s) (of n={n} declared) '
+            f'exceed the absolute exact-enumeration hard cap '
+            f'{FAMILY_SIGNFLIP_HARD_MAX_N}; refusing an unbounded 2**n '
+            'allocation rather than exhausting memory')
 
     score_mx = _fc_score_maxt(D, a)
     raw_score = {name: float(score_mx['p_raw'][i])
@@ -693,6 +710,7 @@ def confirmation_family_correction(comparisons, *, family_names, frozen_holm=Non
         'm_declared': int(m),
         'm_used': int(m),
         'n_seeds': int(n),
+        'n_seeds_effective': int(n_effective),
         'seeds': [int(s) for s in ref_seeds],
         'n_patterns': int(score_mx['n_patterns']),
         'p_floor': p_floor,

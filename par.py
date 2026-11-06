@@ -189,7 +189,16 @@ def resolve_ctx(par=None, label=""):
     if value == "auto":
         wanted = None
     elif re.fullmatch(r"[0-9]+", value):
-        wanted = int(value)
+        # Do not hand an arbitrarily long digit string to int(): CPython's
+        # decimal-conversion limit turns a 5000-digit CSA_PAR into its own
+        # ValueError instead of a driver diagnostic.  Strip leading zeros and
+        # compare digit lengths first; anything wider than the safety limit is
+        # already oversized for both the CPU and GPU branches.
+        digits = value.lstrip("0") or "0"
+        if len(digits) > len(str(_MAX_CPU_WORKERS)):
+            wanted = _MAX_CPU_WORKERS + 1
+        else:
+            wanted = int(digits)
         if wanted <= 0:
             return None
     else:

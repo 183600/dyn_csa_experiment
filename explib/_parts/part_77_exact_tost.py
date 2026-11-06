@@ -247,7 +247,16 @@ def _etost_upper_tail(values):
     if n_nonzero == 0:
         out.update({'p': 1.0, 'method': 'exact'})
         return out
-    scaled, _maxabs = _etost_scaled(vals)
+    # An exact zero is sign-neutral for this one-sided statistic: flipping its
+    # sign changes nothing, so the zeros multiply every attainable count by
+    # the same power of two and leave p unchanged.  They must therefore not
+    # choose the enumeration branch or enlarge the tie tolerance either.  With
+    # a future panel that pads a few informative seeds with many zero rows,
+    # counting those zeros pushed an exactly enumerable panel past the MITM
+    # cap and changed both the method and (through ``tol``) the p-value.
+    calc = vals[vals != 0.0]
+    n_calc = int(calc.size)
+    scaled, _maxabs = _etost_scaled(calc)
     if scaled is None:
         return out
     try:
@@ -255,19 +264,19 @@ def _etost_upper_tail(values):
         sabs = float(math.fsum(abs(float(x)) for x in scaled))
     except (TypeError, ValueError, OverflowError):
         return out
-    tol = _ETOST_TOL * n
+    tol = _ETOST_TOL * n_calc
     if threshold <= -sabs + tol:
         out.update({'p': 1.0, 'method': 'exact'})
         return out
     if threshold >= sabs - tol:
         out.update({'p': floor, 'method': 'exact'})
         return out
-    if n <= _ETOST_ENUM_MAX_N:
+    if n_calc <= _ETOST_ENUM_MAX_N:
         sums = _etost_signed_sums(scaled)
         count = int(np.count_nonzero(sums >= threshold - tol))
         p = count / float(sums.size)
         method = 'exact'
-    elif n <= _ETOST_MITM_MAX_N:
+    elif n_calc <= _ETOST_MITM_MAX_N:
         p = _etost_mitm_upper(scaled, threshold, tol)
         method = 'exact-mitm'
     else:

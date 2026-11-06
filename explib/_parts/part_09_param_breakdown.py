@@ -1526,9 +1526,16 @@ def sequential_signflip_p(looks, *, alpha=0.05):
             else:
                 seed_delta[s] = d
     union_seeds = sorted(seed_delta)
+    # A union seed whose delta is exactly zero in EVERY look is sign-neutral:
+    # it changes no look's statistic, so it only multiplies the number of sign
+    # patterns.  Branch on the seeds that can actually move the statistic;
+    # otherwise a future panel padded with zero rows is needlessly pushed from
+    # exact enumeration to the Bonferroni bound.
+    enum_seeds = [s for s in union_seeds if seed_delta[s] != 0.0]
     base = {'n_looks': k_looks, 'p_min_look': p_min,
             'p_final_look': p_final, 'looks': look_stats,
             'alpha': float(alpha), 'n_union_seeds': len(union_seeds),
+            'n_effective_seeds': len(enum_seeds),
             'inconsistent_seeds': sorted(inconsistent)}
     _final_sum = float(math.fsum(_work_deltas(series[-1])))
     if abs(_final_sum) <= 1e-300:
@@ -1539,7 +1546,7 @@ def sequential_signflip_p(looks, *, alpha=0.05):
         return base
     direction = 1.0 if _final_sum > 0 else -1.0
     t_obs = abs(_final_sum)
-    if inconsistent or len(union_seeds) > LOOK_SEQUENTIAL_ENUM_MAX_N:
+    if inconsistent or len(enum_seeds) > LOOK_SEQUENTIAL_ENUM_MAX_N:
         p_seq = (min(1.0, float(k_looks) * p_final)
                  if math.isfinite(p_final) else float('nan'))
         base.update({
@@ -1552,16 +1559,17 @@ def sequential_signflip_p(looks, *, alpha=0.05):
         return base
     # Exact joint enumeration of max_k T_k in the final direction.  Only the
     # column projection of each look is needed; the per-look null distribution
-    # is implicit in the union sign enumeration.
+    # is implicit in the union sign enumeration.  Zero-delta columns are
+    # omitted from the sign vector (their signs do not change any look).
     cols = []
-    union_index = {s: i for i, s in enumerate(union_seeds)}
+    enum_index = {s: i for i, s in enumerate(enum_seeds)}
     for lk in series:
-        cols.append(np.asarray([union_index[s] for s in lk['seeds']],
-                               dtype=np.int64))
-    d_union = np.asarray([seed_delta[s] for s in union_seeds], dtype=float)
-    total = 1 << len(union_seeds)
-    bitpos = np.arange(len(union_seeds), dtype=np.int64)[None, :]
-    step = max(1, min(total, (1 << 18) // max(len(union_seeds), 1)))
+        cols.append(np.asarray([enum_index[s] for s in lk['seeds']
+                                if s in enum_index], dtype=np.int64))
+    d_union = np.asarray([seed_delta[s] for s in enum_seeds], dtype=float)
+    total = 1 << len(enum_seeds)
+    bitpos = np.arange(len(enum_seeds), dtype=np.int64)[None, :]
+    step = max(1, min(total, (1 << 18) // max(len(enum_seeds), 1)))
     count = 0
     for off in range(0, total, step):
         bs = min(step, total - off)

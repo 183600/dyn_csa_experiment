@@ -476,7 +476,22 @@ def _cv_exact_enumeration(D, *, alpha, margin, flatness_margin):
     obs_sums_g = Dg.sum(axis=1)
     range_tol = CURVE_INFERENCE_TOL * max(
         1.0, float(np.max(np.abs(obs_sums_g))))
-    total = 1 << n
+    # When neither the location margin nor the flatness margin is declared,
+    # a seed whose effect is exactly zero in EVERY condition is sign-neutral:
+    # its sign changes no signed sum and no condition range.  Enumerating that
+    # column only duplicates every pattern.  Drop such columns from the sign
+    # vector so a zero-padded panel is not pushed past the exact cap.  A
+    # non-zero margin makes even a zero effect informative after shifting, so
+    # the full vector is kept in that case.
+    if margin is None and flatness_margin is None:
+        active = np.any(D != 0.0, axis=0)
+        n_effective = int(np.count_nonzero(active))
+    else:
+        active = None
+        n_effective = n
+    Dn_eff = Dn if active is None else Dn[:, active]
+    Dg_eff = Dg if active is None else Dg[:, active]
+    total = 1 << n_effective
     lower_counts = np.zeros(K, dtype=np.int64)
     upper_counts = np.zeros(K, dtype=np.int64)
     range_values = np.empty(total, dtype=float)
@@ -523,15 +538,15 @@ def _cv_exact_enumeration(D, *, alpha, margin, flatness_margin):
             pairs = []
     cell_count = max(1, K, len(pairs))
     chunk = max(1, min(total, max(1, (1 << 18) // cell_count)))
-    bitpos = np.arange(n, dtype=np.int64)
+    bitpos = np.arange(n_effective, dtype=np.int64)
     for off in range(0, total, chunk):
         size = min(chunk, total - off)
         masks = np.arange(off, off + size, dtype=np.int64)[:, None]
         signs = np.where((masks & (1 << bitpos)) != 0, 1.0, -1.0)
-        sums = signs @ Dn.T
+        sums = signs @ Dn_eff.T
         lower_counts += (sums <= obs_sums + tol).sum(axis=0)
         upper_counts += (sums >= obs_sums - tol).sum(axis=0)
-        range_sums = signs @ Dg.T
+        range_sums = signs @ Dg_eff.T
         range_values[off:off + size] = (
             (range_sums.max(axis=1) - range_sums.min(axis=1)) / float(n))
         if margin is not None:
@@ -842,7 +857,16 @@ def curve_simultaneous_inference(conditions, effects, *, seeds=None,
             'distribution is degenerate and the curve carries no '
             'information', conditions=conds, seeds=complete_seeds,
             dropped=dropped, n_input=n_input)
-    if n > int(inputs['max_n']):
+    # The exact cap applies to sign columns that can move a statistic.  With
+    # no declared margin, a seed that is exactly zero at every condition is
+    # sign-neutral and must not trigger the approximation just because the
+    # panel was padded with zero rows.
+    if inputs['margin'] is None and inputs['flatness_margin'] is None:
+        n_exact = int(np.count_nonzero(np.any(D != 0.0, axis=0)))
+    else:
+        n_exact = n
+    n_exact = max(1, n_exact)
+    if n_exact > int(inputs['max_n']):
         enum = _cv_normal_enumeration(
             D, alpha=float(inputs['alpha']), margin=inputs['margin'],
             flatness_margin=inputs['flatness_margin'])

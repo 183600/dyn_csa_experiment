@@ -348,16 +348,27 @@ def maxt_signflip_adjust(named_deltas, *, alpha=0.05,
     alpha = _joint_alpha(alpha, where=where)
     max_n = _joint_max_n(max_n, where=where)
     names, D, n = _joint_named_matrix(named_deltas, where=where)
-    if n > max_n:
-        raise ValueError(f'{where}: n={n} exceeds the exact-enumeration cap '
-                         f'max_n={max_n}; use Holm rather than an '
-                         'approximation')
-    if n > JOINT_SIGNFLIP_HARD_MAX_N:
+    # A column that is exactly zero for EVERY contrast is sign-invariant: its
+    # sign changes none of the sums or studentised statistics.  Enumerating it
+    # only duplicates every pattern, so branch on the columns that can
+    # actually change the family statistic.  This matters at scale: a panel
+    # carrying a few informative seeds plus many zero-padded rows was refused
+    # (or forced onto an approximation) at 2**n even though only the active
+    # columns were relevant.  Report the declared n separately.
+    active = np.any(D != 0.0, axis=0)
+    n_effective = int(np.count_nonzero(active))
+    if n_effective > max_n:
+        raise ValueError(
+            f'{where}: {n_effective} non-zero seed column(s) (of n={n} '
+            f'declared) exceed the exact-enumeration cap max_n={max_n}; use '
+            'Holm rather than an approximation')
+    if n_effective > JOINT_SIGNFLIP_HARD_MAX_N:
         # A caller-controlled ``max_n`` must not be able to disable the
         # memory guard: 2**n is materialised below, so an unbounded cap is an
         # allocation bug rather than a larger exact computation.
         raise ValueError(
-            f'{where}: n={n} exceeds the absolute exact-enumeration hard cap '
+            f'{where}: {n_effective} non-zero seed column(s) (of n={n} '
+            f'declared) exceed the absolute exact-enumeration hard cap '
             f'{JOINT_SIGNFLIP_HARD_MAX_N}; use Holm (or a smaller panel) '
             'rather than attempting an unbounded 2**n allocation')
     m = len(names)
@@ -397,12 +408,14 @@ def maxt_signflip_adjust(named_deltas, *, alpha=0.05,
                        dtype=np.int64)
     t_sorted = t[order]
     tol = 1e-12 * max(1.0, float(np.max(t)) if m else 1.0)
-    total = 1 << n
-    bitpos = np.arange(n, dtype=np.int64)[None, :]
+    total = 1 << n_effective
+    Dn_eff = Dn[:, active]
+    bitpos = np.arange(n_effective, dtype=np.int64)[None, :]
     # Each chunk materialises a (patterns x m) matrix.  A family grows along
     # m as well as n, so cap the cell count, not only the pattern count.
     chunk = max(1, min(total,
-                       max(1, JOINT_SIGNFLIP_CHUNK_TARGET // max(n, 1)),
+                       max(1, JOINT_SIGNFLIP_CHUNK_TARGET //
+                           max(n_effective, 1)),
                        max(1, JOINT_SIGNFLIP_CHUNK_TARGET // max(m, 1))))
     raw_counts = np.zeros(m, dtype=np.int64)
     single_counts = np.zeros(m, dtype=np.int64)
@@ -412,7 +425,7 @@ def maxt_signflip_adjust(named_deltas, *, alpha=0.05,
         bs = min(chunk, total - off)
         masks = np.arange(off, off + bs, dtype=np.int64)[:, None]
         signs = np.where((masks & (1 << bitpos)) != 0, 1.0, -1.0)
-        sums = signs @ Dn.T
+        sums = signs @ Dn_eff.T
         t_star = np.zeros_like(sums)
         if np.any(nz):
             t_star[:, nz] = np.abs(sums[:, nz]) / scale[None, nz]
@@ -518,6 +531,7 @@ def maxt_signflip_adjust(named_deltas, *, alpha=0.05,
         'method': JOINT_SIGNFLIP_METHOD,
         'alpha': float(alpha),
         'n_seeds': int(n),
+        'n_seeds_effective': int(n_effective),
         'm': int(m),
         'n_patterns': int(total),
         'p_floor_single': _p_floor_single,

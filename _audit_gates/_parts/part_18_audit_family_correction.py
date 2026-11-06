@@ -272,11 +272,28 @@ def audit_family_correction(path=None):
             if ns != len(block['seeds']):
                 out['problems'].append(
                     f'n_seeds={ns} != len(seeds)={len(block["seeds"])}')
-            want_patterns = 1 << ns
-            if ns > 0 and block.get('n_patterns') != want_patterns:
+            # The producer enumerates only seed columns that are non-zero
+            # somewhere in the family; all-zero columns are sign-neutral and
+            # are redundant patterns.  Replayed width is authoritative, and a
+            # legacy block without the field still checks against n_seeds.
+            _rep_n_eff = rep.get('n_seeds_effective')
+            if (isinstance(_rep_n_eff, int)
+                    and not isinstance(_rep_n_eff, bool)
+                    and 0 <= _rep_n_eff <= _AFC_MAX_ENUM_SEEDS):
+                n_patterns_seeds = _rep_n_eff
+            else:
+                n_patterns_seeds = ns
+            want_patterns = 1 << n_patterns_seeds
+            if n_patterns_seeds > 0 and block.get('n_patterns') != want_patterns:
                 out['problems'].append(
-                    'n_patterns=%s != 2**n_seeds=%d'
+                    'n_patterns=%s != 2**effective_n_seeds=%d'
                     % (_afc_repr(block.get('n_patterns')), want_patterns))
+            if ('n_seeds_effective' in block
+                    and block.get('n_seeds_effective') != _rep_n_eff):
+                out['problems'].append(
+                    'n_seeds_effective=%s != replayed %s'
+                    % (_afc_repr(block.get('n_seeds_effective')),
+                       _afc_repr(_rep_n_eff)))
     if block.get('m_declared') != len(names):
         out['problems'].append(
             'm_declared=%s != len(family_names)=%d'
