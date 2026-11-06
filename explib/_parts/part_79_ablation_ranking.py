@@ -116,6 +116,38 @@ def _arb_p_floor(n_seeds):
         return 0.0
 
 
+def _arb_support(values):
+    """Number of seeds that can move this contrast's sign-flip statistic."""
+    return sum(1 for value in values if value != 0.0)
+
+
+def _arb_effective_widths(vectors, comps):
+    """Effective (non-zero) widths of the component and pairwise contrasts.
+
+    A zero Shapley vector entry is sign-neutral for that contrast: flipping
+    it changes no signed sum, so it only duplicates patterns.  A future
+    lattice may carry one row per planned seed, including seeds whose
+    attribution is exactly zero.  The exact family floor and the
+    "no contrast/pair can be separated" resolution warning must use the
+    widest informative support, not the declared seed count: the old
+    ``2/2**n_declared`` floor understated the floor (claimed a resolvable
+    panel that is not) whenever zero padding supplied most of the seeds.
+
+    Pairwise ranking tests use differences, so their support is counted
+    separately; a pair can remain informative when two component vectors
+    cancel on a seed, and vice versa.
+    """
+    component_width = max(
+        (_arb_support(vectors[c]) for c in comps), default=0)
+    pair_width = 0
+    for i, a in enumerate(comps):
+        for b in comps[i + 1:]:
+            pair_width = max(
+                pair_width,
+                sum(1 for x, y in zip(vectors[a], vectors[b]) if x != y))
+    return int(component_width), int(pair_width)
+
+
 def _arb_number(value, *, where, positive=False):
     """Finite JSON number for an analysis input; bool/None/str fail closed."""
     if hasattr(value, 'item') and not isinstance(value, (int, float)):
@@ -636,6 +668,14 @@ def ablation_ranking(cells, *, components=None, alpha=0.05, min_n=3,
         'primary_scale': primary_scale,
         'scales': list(scales),
         'p_floor': _arb_p_floor(len(seeds)),
+        # Filled from the informative contrast supports once the Shapley
+        # vectors exist; declared-only placeholders keep the result schema
+        # stable for an early not_estimable return.
+        'p_floor_components': None,
+        'p_floor_pairs': None,
+        'n_seeds_effective': None,
+        'n_seeds_effective_components': None,
+        'n_seeds_effective_pairs': None,
         'resolution_limited': None,
         'status': 'not_estimable',
         'warnings': list(lat.get('warnings') or []),
@@ -705,14 +745,31 @@ def ablation_ranking(cells, *, components=None, alpha=0.05, min_n=3,
                     f'{c}: log Shapley vector disagrees with the canonical '
                     'lattice replay')
                 return base
-    p_floor = _arb_p_floor(len(seeds))
+    vectors = {'log_ppl': log_vec, 'ppl': raw_vec}
+    component_width, pair_width = _arb_effective_widths(
+        vectors[primary_scale], comps)
+    n_seeds_effective = max(component_width, pair_width)
+    p_floor_components = (1.0 if component_width == 0
+                         else _arb_p_floor(component_width))
+    p_floor_pairs = (1.0 if pair_width == 0
+                     else _arb_p_floor(pair_width))
+    # A declared vector/pair whose support is empty cannot attain any p below
+    # 1.0.  When at least one contrast carries information, the family floor
+    # is the best (smallest) floor any declared test can attain.
+    p_floor = min(p_floor_components, p_floor_pairs)
     base['p_floor'] = p_floor
+    base['p_floor_components'] = p_floor_components
+    base['p_floor_pairs'] = p_floor_pairs
+    base['n_seeds_effective'] = int(n_seeds_effective)
+    base['n_seeds_effective_components'] = int(component_width)
+    base['n_seeds_effective_pairs'] = int(pair_width)
     base['resolution_limited'] = bool(p_floor > alpha)
     if base['resolution_limited']:
         base['warnings'].append(
-            f'exact two-sided sign-flip floor 2/2**{len(seeds)}={p_floor:.6g} '
-            f'exceeds alpha={alpha}; no pair can be separated at this n')
-    vectors = {'log_ppl': log_vec, 'ppl': raw_vec}
+            f'exact two-sided sign-flip floor 2/2**{n_seeds_effective}='
+            f'{p_floor:.6g} exceeds alpha={alpha}; no declared contrast or '
+            f'pair can be separated at this effective width '
+            f'(declared n={len(seeds)})')
     # Joint inference is computed once, on the primary scale.  The second
     # scale is a sensitivity readout of the point attribution, not another
     # family of tests; giving both scales their own max-T family would invite
@@ -756,7 +813,13 @@ def ablation_ranking(cells, *, components=None, alpha=0.05, min_n=3,
             'ci_tail_level': primary_joint.get('ci_tail_level'),
             'ci_note': primary_joint.get('ci_note'),
             'family_size': len(comps),
-            'p_floor_single': p_floor,
+            # Prefer the max-T block's own effective floor (it counts the
+            # same non-zero columns).  When the block fell back to Holm it
+            # has no floor, so report the component-width floor rather than
+            # the global component/pair minimum.
+            'p_floor_single': (primary_joint.get('p_floor_single')
+                               if primary_joint.get('p_floor_single') is not None
+                               else p_floor_components),
         },
         'component_stats': stats,
         'ranking': ranking,
