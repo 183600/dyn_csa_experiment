@@ -948,7 +948,14 @@ def _am_json_equal(a, b):
     if (isinstance(a, (int, float)) and not isinstance(a, bool)
             and isinstance(b, (int, float)) and not isinstance(b, bool)):
         return a == b
-    return a == b
+    # A hostile artifact can carry an ndarray (or another non-JSON object)
+    # where the replay produced a scalar.  ``a == b`` then returns an array
+    # whose truth value is ambiguous; collapse it to a mismatch so the
+    # validator reports a named failure instead of raising ValueError.
+    try:
+        return bool(a == b)
+    except (TypeError, ValueError, OverflowError):
+        return False
 
 
 def _am_diff_paths(stored, replay, path='result', out=None, limit=20):

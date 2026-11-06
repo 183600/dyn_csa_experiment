@@ -1141,7 +1141,8 @@ def validate_type_sm_design(artifact):
     if not isinstance(artifact, dict):
         out['problems'].append('artifact must be a JSON object')
         return out
-    if artifact.get('kind') != 'type_sm_design_artifact':
+    if not _tsm_exact_equal(artifact.get('kind'),
+                            'type_sm_design_artifact'):
         out['problems'].append(
             f'artifact.kind must be "type_sm_design_artifact", got '
             f'{_tsm_repr(artifact.get("kind"))}')

@@ -127,6 +127,48 @@ def _dp_repr(value, limit=120):
     return text if len(text) <= limit else text[:limit - 3] + '...'
 
 
+def _dp_json_equal(a, b):
+    """Total equality for a stored protocol value and its expected value.
+
+    A protocol handed straight to the validator has not necessarily gone
+    through JSON.  An ndarray in a scalar slot makes ``a == b`` return an
+    array whose truth value is ambiguous in an ``if``; report a mismatch
+    instead of aborting the gate with ``ValueError``.
+    """
+    if isinstance(a, bool) or isinstance(b, bool):
+        return isinstance(a, bool) and isinstance(b, bool) and a is b
+    if isinstance(a, dict) or isinstance(b, dict):
+        if not (isinstance(a, dict) and isinstance(b, dict)):
+            return False
+        if set(a) != set(b):
+            return False
+        return all(_dp_json_equal(a[key], b[key]) for key in a)
+    if isinstance(a, (list, tuple)) or isinstance(b, (list, tuple)):
+        if not (isinstance(a, (list, tuple))
+                and isinstance(b, (list, tuple))):
+            return False
+        return (len(a) == len(b)
+                and all(_dp_json_equal(x, y) for x, y in zip(a, b)))
+    if a is None or b is None:
+        return a is None and b is None
+    if isinstance(a, str) and isinstance(b, str):
+        return a == b
+    if (isinstance(a, numbers.Integral)
+            and not isinstance(a, (bool, np.bool_))
+            and isinstance(b, numbers.Integral)
+            and not isinstance(b, (bool, np.bool_))):
+        return int(a) == int(b)
+    if isinstance(a, numbers.Real) and isinstance(b, numbers.Real):
+        try:
+            return bool(a == b)
+        except (TypeError, ValueError, OverflowError):
+            return False
+    try:
+        return bool(a == b)
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
 def _dp_str(value, limit=200):
     """Bounded ``str`` preserving the ordinary text of a value."""
     try:
@@ -1045,10 +1087,10 @@ def validate_design_protocol(protocol, *, require_complete=None):
                 out['missing'].append(missing)
         return False
 
-    if protocol.get('kind') != DESIGN_PROTOCOL_KIND:
+    if not _dp_json_equal(protocol.get('kind'), DESIGN_PROTOCOL_KIND):
         _dp_problem(out, f"protocol.kind must be {DESIGN_PROTOCOL_KIND!r}, "
                         f"got {_dp_repr(protocol.get('kind'))}")
-    if protocol.get('schema') != DESIGN_PROTOCOL_SCHEMA:
+    if not _dp_json_equal(protocol.get('schema'), DESIGN_PROTOCOL_SCHEMA):
         _dp_problem(out, f'protocol.schema must be {DESIGN_PROTOCOL_SCHEMA}, '
                         f'got {_dp_repr(protocol.get("schema"))}')
 
@@ -1468,9 +1510,9 @@ def validate_design_protocol(protocol, *, require_complete=None):
         if dispo.get('invalid'):
             _dp_problem(out, f"operations.disposition is invalid: {dispo.get('error') or dispo.get('raw_type')}")
         if strict:
-            if dispo.get('retention') != 'first_success':
+            if not _dp_json_equal(dispo.get('retention'), 'first_success'):
                 _dp_problem(out, "a confirmatory protocol must set disposition.retention='first_success'")
-            if dispo.get('replacement') != 'same_cell':
+            if not _dp_json_equal(dispo.get('replacement'), 'same_cell'):
                 _dp_problem(out, "a confirmatory protocol must set disposition.replacement='same_cell'")
             if dispo.get('allow_supersede') is not False:
                 _dp_problem(out, 'a confirmatory protocol must set disposition.allow_supersede=false')

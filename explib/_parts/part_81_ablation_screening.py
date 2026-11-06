@@ -1167,7 +1167,14 @@ def _asc_json_equal(a, b):
             return False
         return (len(a) == len(b)
                 and all(_asc_json_equal(x, y) for x, y in zip(a, b)))
-    return a == b
+    # A hostile artifact can put an ndarray (or another non-JSON object)
+    # where the replay produced a scalar.  ``a == b`` then returns an array
+    # whose truth value is ambiguous; collapse it to a mismatch instead of
+    # letting ValueError escape the validator.
+    try:
+        return bool(a == b)
+    except (TypeError, ValueError, OverflowError):
+        return False
 
 
 def _asc_diff_paths(stored, replay, path='result', out=None, limit=20):
@@ -1252,11 +1259,11 @@ def validate_ablation_screening(artifact):
     if not isinstance(artifact, dict):
         out['problems'].append('artifact must be a JSON object')
         return out
-    if artifact.get('kind') != ASC_ARTIFACT_KIND:
+    if not _asc_json_equal(artifact.get('kind'), ASC_ARTIFACT_KIND):
         out['problems'].append(
             f'artifact.kind must be {ASC_ARTIFACT_KIND!r}, got '
             f'{_asc_repr(artifact.get("kind"))}')
-    if artifact.get('schema') != ASC_SCHEMA:
+    if not _asc_json_equal(artifact.get('schema'), ASC_SCHEMA):
         out['problems'].append(
             f'artifact.schema must be {ASC_SCHEMA}, got '
             f'{_asc_repr(artifact.get("schema"))}')

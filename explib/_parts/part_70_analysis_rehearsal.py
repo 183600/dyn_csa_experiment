@@ -99,6 +99,48 @@ def _ar_repr(value, limit=120):
     return text if len(text) <= limit else text[:limit - 3] + '...'
 
 
+def _ar_json_equal(a, b):
+    """Total equality for a rehearsal value and its expected value.
+
+    A rehearsal handed straight to the validator may not have round-tripped
+    through JSON.  An ndarray in a scalar slot makes ``a == b`` return an
+    array whose truth value is ambiguous; report a mismatch instead of
+    aborting the validator with ``ValueError``.
+    """
+    if isinstance(a, bool) or isinstance(b, bool):
+        return isinstance(a, bool) and isinstance(b, bool) and a is b
+    if isinstance(a, dict) or isinstance(b, dict):
+        if not (isinstance(a, dict) and isinstance(b, dict)):
+            return False
+        if set(a) != set(b):
+            return False
+        return all(_ar_json_equal(a[key], b[key]) for key in a)
+    if isinstance(a, (list, tuple)) or isinstance(b, (list, tuple)):
+        if not (isinstance(a, (list, tuple))
+                and isinstance(b, (list, tuple))):
+            return False
+        return (len(a) == len(b)
+                and all(_ar_json_equal(x, y) for x, y in zip(a, b)))
+    if a is None or b is None:
+        return a is None and b is None
+    if isinstance(a, str) and isinstance(b, str):
+        return a == b
+    if (isinstance(a, numbers.Integral)
+            and not isinstance(a, (bool, np.bool_))
+            and isinstance(b, numbers.Integral)
+            and not isinstance(b, (bool, np.bool_))):
+        return int(a) == int(b)
+    if isinstance(a, numbers.Real) and isinstance(b, numbers.Real):
+        try:
+            return bool(a == b)
+        except (TypeError, ValueError, OverflowError):
+            return False
+    try:
+        return bool(a == b)
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
 # Content identities share the one canonicalisation contract in part_00.
 _ar_canonical = _canonical_json
 _ar_sha_obj = _sha256_json
@@ -628,12 +670,13 @@ def validate_analysis_rehearsal(rehearsal, *, manifest=None):
         out['problems'].append(
             f'rehearsal must be an object, got {type(rehearsal).__name__}')
         return out
-    if rehearsal.get('kind') != ANALYSIS_REHEARSAL_KIND:
+    if not _ar_json_equal(rehearsal.get('kind'), ANALYSIS_REHEARSAL_KIND):
         out['status'] = 'fail'
         out['problems'].append(
             f"rehearsal.kind={_ar_repr(rehearsal.get('kind'))} is not "
             f"{ANALYSIS_REHEARSAL_KIND!r}")
-    if rehearsal.get('schema') != ANALYSIS_REHEARSAL_SCHEMA:
+    if not _ar_json_equal(rehearsal.get('schema'),
+                          ANALYSIS_REHEARSAL_SCHEMA):
         out['status'] = 'fail'
         out['problems'].append(
             f"rehearsal.schema={_ar_repr(rehearsal.get('schema'))} != "
@@ -667,7 +710,7 @@ def validate_analysis_rehearsal(rehearsal, *, manifest=None):
         out['status'] = 'fail'
         out['problems'].append(
             'rehearsal.test_split_read must be false; this control is pre-test')
-    if rehearsal.get('status') != 'ok':
+    if not _ar_json_equal(rehearsal.get('status'), 'ok'):
         out['status'] = 'fail'
         out['problems'].append(
             f"rehearsal.status={_ar_repr(rehearsal.get('status'))} is not 'ok'")

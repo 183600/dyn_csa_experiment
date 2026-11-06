@@ -58,6 +58,49 @@ ARTICLE_SIDECAR_POLICY = {
 }
 
 
+def _as_sidecar_json_equal(a, b):
+    """Total equality for a stored scalar/container and its expected value.
+
+    Metadata is untrusted and may not have round-tripped through JSON: an
+    array in a scalar slot makes ``a == b`` return an array whose truth value
+    is ambiguous in an ``if``.  Treat such a value as a mismatch instead of
+    letting ``ValueError`` escape the reader.
+    """
+    if isinstance(a, bool) or isinstance(b, bool):
+        return isinstance(a, bool) and isinstance(b, bool) and a is b
+    if isinstance(a, dict) or isinstance(b, dict):
+        if not (isinstance(a, dict) and isinstance(b, dict)):
+            return False
+        if set(a) != set(b):
+            return False
+        return all(_as_sidecar_json_equal(a[key], b[key]) for key in a)
+    if isinstance(a, (list, tuple)) or isinstance(b, (list, tuple)):
+        if not (isinstance(a, (list, tuple))
+                and isinstance(b, (list, tuple))):
+            return False
+        return (len(a) == len(b)
+                and all(_as_sidecar_json_equal(x, y)
+                        for x, y in zip(a, b)))
+    if a is None or b is None:
+        return a is None and b is None
+    if isinstance(a, str) and isinstance(b, str):
+        return a == b
+    if (isinstance(a, numbers.Integral)
+            and not isinstance(a, (bool, np.bool_))
+            and isinstance(b, numbers.Integral)
+            and not isinstance(b, (bool, np.bool_))):
+        return int(a) == int(b)
+    if isinstance(a, numbers.Real) and isinstance(b, numbers.Real):
+        try:
+            return bool(a == b)
+        except (TypeError, ValueError, OverflowError):
+            return False
+    try:
+        return bool(a == b)
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
 def _as_sidecar_int(value, name, *, minimum=0, allow_none=False):
     """Exact non-negative integer from metadata, else ``None``.
 
@@ -70,10 +113,12 @@ def _as_sidecar_int(value, name, *, minimum=0, allow_none=False):
         raise ValueError(f'{name} is missing; the sidecar length is unknown')
     if isinstance(value, (bool, np.bool_)) or not isinstance(
             value, numbers.Integral):
-        raise ValueError(f'{name}={value!r} is not an exact integer')
+        raise ValueError(
+            f'{name}={_safe_repr(value)} is not an exact integer')  # noqa: F821
     value = int(value)
     if value < int(minimum):
-        raise ValueError(f'{name}={value} is below {int(minimum)}')
+        raise ValueError(
+            f'{name}={_safe_repr(value)} is below {int(minimum)}')
     return value
 
 
@@ -97,7 +142,8 @@ def _as_sidecar_ids(values, name, *, expected=None, allow_empty=False):
         raise ValueError(f'{name} has dtype {flat.dtype}, wider than uint64')
     if expected is not None and int(flat.size) != int(expected):
         raise ValueError(
-            f'{name} has {int(flat.size)} id(s) but {int(expected)} were '
+            f'{name} has {int(flat.size)} id(s) but '
+            f'{_safe_repr(expected)} were '  # noqa: F821
             'expected')
     return flat.astype(np.uint64, copy=False)
 
@@ -238,9 +284,10 @@ def article_sidecar_problems(meta, token_article_ids, token_doc_ids, *,
             problems.append(
                 'cache declares article_sidecars=true but records no '
                 'article_unit block')
-        elif declared not in (None, False):
+        elif declared is not None and declared is not False:
             problems.append(
-                f'article_sidecars={declared!r} is not a boolean')
+                'article_sidecars='
+                f'{_safe_repr(declared)} is not a boolean')  # noqa: F821
         return problems
     if not isinstance(block, dict):
         problems.append('article_unit is not an object')
@@ -249,21 +296,29 @@ def article_sidecar_problems(meta, token_article_ids, token_doc_ids, *,
         problems.append(
             'article_unit block is present but article_sidecars is not true; '
             'the article attestation is ambiguous')
-    if block.get('schema') != ARTICLE_SIDECAR_SCHEMA:
+    if not _as_sidecar_json_equal(block.get('schema'),
+                                  ARTICLE_SIDECAR_SCHEMA):
         problems.append(
-            f"article_unit.schema={block.get('schema')!r} is not "
+            "article_unit.schema="
+            f'{_safe_repr(block.get("schema"))} is not '  # noqa: F821
             f'{ARTICLE_SIDECAR_SCHEMA!r}')
-    if block.get('unit') != 'article':
+    if not _as_sidecar_json_equal(block.get('unit'), 'article'):
         problems.append(
-            f"article_unit.unit={block.get('unit')!r} is not 'article'")
-    if block.get('split') not in (None, str(split)):
+            "article_unit.unit="
+            f'{_safe_repr(block.get("unit"))} is not '  # noqa: F821
+            "'article'")
+    split_value = block.get('split')
+    if not (split_value is None
+            or (isinstance(split_value, str) and split_value == str(split))):
         problems.append(
-            f"article_unit.split={block.get('split')!r} does not match "
+            "article_unit.split="
+            f'{_safe_repr(split_value)} does not match '  # noqa: F821
             f'{split!r}')
     if block.get('valid_for_clustering') is not True:
         # A cache that could not evidence article boundaries records an
         # unavailable block and no sidecar; that is a truthful fallback.
-        if block.get('available') in (None, False):
+        available = block.get('available')
+        if available is None or available is False:
             return problems
         problems.append(
             'article_unit claims an available sidecar but is not '
@@ -282,7 +337,7 @@ def article_sidecar_problems(meta, token_article_ids, token_doc_ids, *,
     if n_tokens is not None and int(arr.size) != int(n_tokens):
         problems.append(
             f'token article vector has {int(arr.size)} id(s) but the served '
-            f'slice has {int(n_tokens)} token(s)')
+            f'slice has {_safe_repr(n_tokens)} token(s)')  # noqa: F821
     for key in ('token_article_count', 'n_articles'):
         try:
             got = _as_sidecar_int(block.get(key), f'article_unit.{key}',
@@ -294,8 +349,8 @@ def article_sidecar_problems(meta, token_article_ids, token_doc_ids, *,
                   else int(np.unique(arr).size))
         if got != actual:
             problems.append(
-                f'article_unit.{key}={got} does not match the vector '
-                f'({actual})')
+                f'article_unit.{key}={_safe_repr(got)} does not match '  # noqa: F821
+                f'the vector ({actual})')
     recorded_fp = block.get('token_article_fp')
     if not isinstance(recorded_fp, str) or not recorded_fp:
         problems.append('article_unit.token_article_fp is missing')
@@ -326,7 +381,8 @@ def article_sidecar_problems(meta, token_article_ids, token_doc_ids, *,
     else:
         if declared_lines != n_docs:
             problems.append(
-                f'article_unit.n_lines={declared_lines} does not match the '
+                'article_unit.n_lines='
+                f'{_safe_repr(declared_lines)} does not match the '  # noqa: F821
                 f'{n_docs} distinct line ids in the served slice')
     try:
         declared_articles = _as_sidecar_int(
@@ -336,7 +392,8 @@ def article_sidecar_problems(meta, token_article_ids, token_doc_ids, *,
     else:
         if declared_articles != n_articles:
             problems.append(
-                f'article_unit.n_articles={declared_articles} does not match '
+                'article_unit.n_articles='
+                f'{_safe_repr(declared_articles)} does not match '  # noqa: F821
                 f'the {n_articles} distinct article ids in the served slice')
     return problems
 

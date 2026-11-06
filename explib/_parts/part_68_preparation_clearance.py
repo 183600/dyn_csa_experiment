@@ -91,6 +91,48 @@ def _prep_repr(value, limit=120):
     return text if len(text) <= limit else text[:limit - 3] + '...'
 
 
+def _prep_json_equal(a, b):
+    """Total equality for a clearance value and its expected value.
+
+    A clearance passed directly to the validator may not have round-tripped
+    through JSON.  An array in a scalar slot makes ``a == b`` return an array,
+    whose truth value is ambiguous in an ``if``; report a mismatch instead of
+    aborting the launch gate with ``ValueError``.
+    """
+    if isinstance(a, bool) or isinstance(b, bool):
+        return isinstance(a, bool) and isinstance(b, bool) and a is b
+    if isinstance(a, dict) or isinstance(b, dict):
+        if not (isinstance(a, dict) and isinstance(b, dict)):
+            return False
+        if set(a) != set(b):
+            return False
+        return all(_prep_json_equal(a[key], b[key]) for key in a)
+    if isinstance(a, (list, tuple)) or isinstance(b, (list, tuple)):
+        if not (isinstance(a, (list, tuple))
+                and isinstance(b, (list, tuple))):
+            return False
+        return (len(a) == len(b)
+                and all(_prep_json_equal(x, y) for x, y in zip(a, b)))
+    if a is None or b is None:
+        return a is None and b is None
+    if isinstance(a, str) and isinstance(b, str):
+        return a == b
+    if (isinstance(a, numbers.Integral)
+            and not isinstance(a, (bool, np.bool_))
+            and isinstance(b, numbers.Integral)
+            and not isinstance(b, (bool, np.bool_))):
+        return int(a) == int(b)
+    if isinstance(a, numbers.Real) and isinstance(b, numbers.Real):
+        try:
+            return bool(a == b)
+        except (TypeError, ValueError, OverflowError):
+            return False
+    try:
+        return bool(a == b)
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
 def _prep_str(value, limit=200):
     """Bounded ``str`` preserving the ordinary text of a value."""
     try:
@@ -1006,10 +1048,12 @@ def validate_preparation_clearance(clearance, *, protocol=None):
             f'clearance must be an object, got {type(clearance).__name__}')
         out['status'] = 'fail'
         return out
-    if clearance.get('kind') != PREPARATION_CLEARANCE_KIND:
+    if not _prep_json_equal(clearance.get('kind'),
+                            PREPARATION_CLEARANCE_KIND):
         out['problems'].append(
             f'clearance.kind must be {PREPARATION_CLEARANCE_KIND!r}')
-    if clearance.get('schema') != PREPARATION_CLEARANCE_SCHEMA:
+    if not _prep_json_equal(clearance.get('schema'),
+                            PREPARATION_CLEARANCE_SCHEMA):
         out['problems'].append(
             f'clearance.schema must be {PREPARATION_CLEARANCE_SCHEMA}')
     study = clearance.get('study') if isinstance(
@@ -1037,7 +1081,8 @@ def validate_preparation_clearance(clearance, *, protocol=None):
             out['problems'].append('protocol argument must be an object')
         else:
             current = _prep_text(protocol.get('content_sha256'))
-            if current != study.get('design_protocol_sha256'):
+            if not _prep_json_equal(current,
+                                    study.get('design_protocol_sha256')):
                 out['problems'].append(
                     'clearance is bound to a different design protocol hash')
             proto_level = _prep_study_level(protocol)
@@ -1117,7 +1162,8 @@ def validate_preparation_clearance(clearance, *, protocol=None):
             PREPARATION_CLEARANCE_POLICY['required_confirmatory'])
         _power_entry = checks.get('power')
         if (isinstance(_power_entry, dict)
-                and _power_entry.get('status') == 'not_applicable'):
+                and _prep_json_equal(_power_entry.get('status'),
+                                     'not_applicable')):
             expected_required.discard('power')
         missing = sorted(expected_required - required, key=_prep_repr)
         if missing:
@@ -1131,19 +1177,21 @@ def validate_preparation_clearance(clearance, *, protocol=None):
         for name in sorted(expected_required, key=_prep_repr):
             _entry = checks.get(name)
             if (not isinstance(_entry, dict)
-                    or _entry.get('status') != 'ok'):
+                    or not _prep_json_equal(_entry.get('status'), 'ok')):
                 out['problems'].append(
                     f'confirmatory check {_prep_repr(name)} is not ok')
     for name in required:
         if name not in checks:
             out['problems'].append(f'required check {_prep_repr(name)} is absent')
-    if clearance.get('launch_allowed') is not (clearance.get('status') == 'ok'):
+    clearance_status = _prep_text(clearance.get('status'))
+    if clearance.get('launch_allowed') is not (clearance_status == 'ok'):
         out['problems'].append(
             'launch_allowed must equal (status == "ok")')
-    if clearance.get('status') not in ('ok', 'warnings', 'fail'):
+    if clearance_status not in ('ok', 'warnings', 'fail'):
         out['problems'].append(
-            f'clearance.status={_prep_repr(clearance.get("status"))} is not recognised')
-    if clearance.get('status') == 'ok' and (out['problems'] or out['warnings']):
+            'clearance.status='
+            f'{_prep_repr(clearance.get("status"))} is not recognised')
+    if clearance_status == 'ok' and (out['problems'] or out['warnings']):
         out['problems'].append(
             'clearance is marked ok but its checks are not all clean')
     recorded = _prep_text(clearance.get('content_sha256'))

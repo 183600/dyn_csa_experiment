@@ -431,24 +431,53 @@ def exact_signflip_tost(deltas, margin, conf=0.90):
 
 
 def _etost_json_equal(a, b):
-    """Structural equality with a 1e-12 float tolerance."""
+    """Structural equality with a 1e-12 float tolerance.
+
+    Every branch must be total: an in-memory artifact can carry a NumPy array
+    where the replay produced a scalar, and ``a == b`` then returns an array
+    whose truth value is ambiguous.  Such a value is a mismatch, not an
+    exception that escapes the validator.
+    """
     if isinstance(a, bool) or isinstance(b, bool):
-        return a is b
+        return isinstance(a, bool) and isinstance(b, bool) and a is b
+    if isinstance(a, dict) or isinstance(b, dict):
+        if not (isinstance(a, dict) and isinstance(b, dict)):
+            return False
+        if set(a) != set(b):
+            return False
+        return all(_etost_json_equal(a[k], b[k]) for k in a)
+    if isinstance(a, (list, tuple)) or isinstance(b, (list, tuple)):
+        if not (isinstance(a, (list, tuple))
+                and isinstance(b, (list, tuple))):
+            return False
+        return (len(a) == len(b)
+                and all(_etost_json_equal(x, y) for x, y in zip(a, b)))
+    if (isinstance(a, numbers.Integral)
+            and not isinstance(a, (bool, np.bool_))
+            and isinstance(b, numbers.Integral)
+            and not isinstance(b, (bool, np.bool_))):
+        # Compare counts exactly.  Routing a huge JSON integer through float
+        # either overflows or rounds two different identities together.
+        return int(a) == int(b)
     if isinstance(a, numbers.Real) and isinstance(b, numbers.Real):
         try:
             x, y = float(a), float(b)
         except (TypeError, ValueError, OverflowError):
-            return False
+            # A huge integer is still comparable with Python's exact mixed
+            # int/float semantics; it is just not representable as a float.
+            try:
+                return bool(a == b)
+            except (TypeError, ValueError, OverflowError):
+                return False
         if not (math.isfinite(x) and math.isfinite(y)):
             return x == y
         return math.isclose(x, y, rel_tol=1e-12, abs_tol=1e-12)
-    if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
-        return (len(a) == len(b)
-                and all(_etost_json_equal(x, y) for x, y in zip(a, b)))
-    if isinstance(a, dict) and isinstance(b, dict):
-        return (set(a) == set(b)
-                and all(_etost_json_equal(a[k], b[k]) for k in a))
-    return a == b
+    # Anything else (an ndarray, a mapping where a scalar belongs, ...) is
+    # not a JSON scalar.  Keep the comparison total and non-raising.
+    try:
+        return bool(a == b)
+    except (TypeError, ValueError, OverflowError):
+        return False
 
 
 def _etost_frozen_fields(obj, *, top=True):
@@ -532,7 +561,7 @@ def validate_exact_tost(artifact):
     if not isinstance(artifact, dict):
         out['problems'].append('artifact must be a JSON object')
         return out
-    if artifact.get('kind') != 'exact_tost_artifact':
+    if not _etost_json_equal(artifact.get('kind'), 'exact_tost_artifact'):
         out['problems'].append(
             f'artifact.kind must be "exact_tost_artifact", got '
             f'{_etost_repr(artifact.get("kind"))}')

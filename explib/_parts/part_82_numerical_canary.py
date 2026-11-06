@@ -70,6 +70,48 @@ def _nc_schema_ok(value):
         value, (bool, np.bool_)) and int(value) == NC_SCHEMA
 
 
+def _nc_json_equal(a, b):
+    """Total structural equality for stored/replayed JSON values.
+
+    An in-memory artifact is untrusted and has not necessarily round-tripped
+    through JSON.  A NumPy array in a scalar slot makes ``a == b`` return an
+    array, whose truth value is ambiguous in the caller's ``if``.  Treat any
+    non-JSON object as different instead of letting ``ValueError`` escape.
+    """
+    if isinstance(a, bool) or isinstance(b, bool):
+        return isinstance(a, bool) and isinstance(b, bool) and a is b
+    if isinstance(a, dict) or isinstance(b, dict):
+        if not (isinstance(a, dict) and isinstance(b, dict)):
+            return False
+        if set(a) != set(b):
+            return False
+        return all(_nc_json_equal(a[key], b[key]) for key in a)
+    if isinstance(a, (list, tuple)) or isinstance(b, (list, tuple)):
+        if not (isinstance(a, (list, tuple))
+                and isinstance(b, (list, tuple))):
+            return False
+        return (len(a) == len(b)
+                and all(_nc_json_equal(x, y) for x, y in zip(a, b)))
+    if (isinstance(a, numbers.Integral)
+            and not isinstance(a, (bool, np.bool_))
+            and isinstance(b, numbers.Integral)
+            and not isinstance(b, (bool, np.bool_))):
+        return int(a) == int(b)
+    if isinstance(a, numbers.Real) and isinstance(b, numbers.Real):
+        try:
+            return bool(a == b)
+        except (TypeError, ValueError, OverflowError):
+            return False
+    if a is None or b is None:
+        return a is None and b is None
+    if isinstance(a, str) and isinstance(b, str):
+        return a == b
+    try:
+        return bool(a == b)
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
 def _nc_device_problem(value):
     """Why a recorded ``params.device`` string is not a cpu/cuda device."""
     if not isinstance(value, str):
@@ -433,7 +475,7 @@ def _nc_validate_result(result):
     problems = []
     if not isinstance(result, dict):
         return ['result must be a JSON object']
-    if result.get('kind') != 'numerical_canary':
+    if not _nc_json_equal(result.get('kind'), 'numerical_canary'):
         problems.append(
             f"result.kind must be 'numerical_canary', got "
             f'{_nc_repr(result.get("kind"))}')
@@ -441,7 +483,7 @@ def _nc_validate_result(result):
         problems.append(
             f'result.schema must be {NC_SCHEMA}, got '
             f'{_nc_repr(result.get("schema"))}')
-    if result.get('status') != 'ok':
+    if not _nc_json_equal(result.get('status'), 'ok'):
         problems.append(
             f'result.status must be "ok", got '
             f'{_nc_repr(result.get("status"))}')
@@ -697,7 +739,7 @@ def validate_numerical_canary_artifact(artifact, *, replay=True):
     if not isinstance(artifact, dict):
         out['problems'].append('artifact must be a JSON object')
         return out
-    if artifact.get('kind') != NC_ARTIFACT_KIND:
+    if not _nc_json_equal(artifact.get('kind'), NC_ARTIFACT_KIND):
         out['problems'].append(
             f'artifact.kind must be {NC_ARTIFACT_KIND!r}, got '
             f'{_nc_repr(artifact.get("kind"))}')
@@ -778,7 +820,8 @@ def validate_numerical_canary_artifact(artifact, *, replay=True):
     params = result.get('params')
     if isinstance(params, dict) and isinstance(inputs, dict) and inputs:
         mismatch = [k for k in NC_PARAM_KEYS
-                    if k in inputs and inputs.get(k) != params.get(k)]
+                    if k in inputs
+                    and not _nc_json_equal(inputs.get(k), params.get(k))]
         if mismatch:
             out['problems'].append(
                 'artifact.inputs disagree with result.params on '
