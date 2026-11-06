@@ -90,6 +90,25 @@ def _tx_repr(value, limit=200):
     return text if len(text) <= limit else text[:limit - 3] + '...'
 
 
+def _tx_json_int(name, value):
+    """Return an exact integer that strict JSON can spell.
+
+    Input caps bound each factor, but a derived count (``steps * batch *
+    world_size * seq_len``) can still exceed CPython's integer-to-decimal
+    limit.  Raise a named error before that product reaches an f-string or a
+    report writer; ``str`` is the exact operation ``json.dumps`` performs.
+    """
+    value = int(value)
+    try:
+        str(value)
+    except (ValueError, OverflowError):
+        raise ValueError(
+            f'{name} is not representable as a strict-JSON integer '
+            f'({value.bit_length()} bits exceeds the decimal-conversion '
+            'limit)') from None
+    return value
+
+
 def _tx_exact_pos_int(name, value, *, minimum=1, maximum=None):
     if isinstance(value, (bool, _tx_np.bool_)):
         raise ValueError(f'{name} must be an integer, not a boolean')
@@ -357,8 +376,10 @@ def training_window_exposure(n_tokens, seq_len, batch_size, steps, seed=0, *,
     n_last_start = n_tokens - seq_len - 1
     window_positions = n_last_start + 1          # starts 0 .. n_last_start
     target_positions = n_tokens - 1              # positions 1 .. n_tokens-1
-    draws = int(steps) * int(batch_size) * int(world_size)
-    processed_tokens = draws * int(seq_len)
+    draws = _tx_json_int(
+        'draws', int(steps) * int(batch_size) * int(world_size))
+    processed_tokens = _tx_json_int(
+        'processed_tokens', draws * int(seq_len))
     idx_dtype = (_tx_np.int32
                  if (n_last_start + seq_len + 1) < 2 ** 31
                  else _tx_np.int64)
@@ -571,6 +592,40 @@ def training_coverage_budget(n_tokens, seq_len, batch_size, *, target_coverage,
     # float, which would overflow for a very large planned panel.
     steps_needed = max(1, (int(draws_needed) + per_step - 1) // per_step)
     expected_processed = int(steps_needed) * per_step * int(seq_len)
+    expected_draws = int(steps_needed) * per_step
+    try:
+        expected_draws = _tx_json_int('expected_draws', expected_draws)
+        expected_processed = _tx_json_int(
+            'expected_processed_tokens', expected_processed)
+    except ValueError as exc:
+        # The plan is arithmetically finite but cannot be written as strict
+        # JSON.  Report that explicitly instead of returning a dict that a
+        # report writer would fail to serialise.
+        return {
+            'kind': 'training_coverage_budget',
+            'schema': TRAINING_EXPOSURE_POLICY['schema'],
+            'status': 'not_estimable',
+            'reason': str(exc),
+            'target_coverage': float(q),
+            'n_tokens': int(n_tokens),
+            'seq_len': int(seq_len),
+            'batch_size': int(batch_size),
+            'world_size': int(world_size),
+            'target_positions': int(target_positions),
+            'expected_draws': None,
+            'expected_steps': None,
+            'expected_processed_tokens': None,
+            'expected_unique_tokens': None,
+            'expected_unique_fraction': None,
+            'achievable': False,
+            'method': 'poisson_independent_windows',
+            'exact': False,
+            'policy': TRAINING_EXPOSURE_POLICY['version'],
+            'boundary': (
+                'design estimate under with-replacement sampling; the draw or '
+                'processed-token count is beyond the strict-JSON range, so no '
+                'plan is claimed'),
+        }
     _frac = _tx_ratio_fraction(
         int(steps_needed) * per_step * int(window), int(target_positions))
     expected_unique = _tx_scaled_int(
@@ -589,9 +644,9 @@ def training_coverage_budget(n_tokens, seq_len, batch_size, *, target_coverage,
         'batch_size': int(batch_size),
         'world_size': int(world_size),
         'target_positions': int(target_positions),
-        'expected_draws': int(steps_needed * batch_size * world_size),
+        'expected_draws': expected_draws,
         'expected_steps': int(steps_needed),
-        'expected_processed_tokens': int(expected_processed),
+        'expected_processed_tokens': expected_processed,
         'expected_unique_tokens': int(expected_unique),
         'expected_unique_fraction': (0.0 if not target_positions
                                      else _tx_ratio(expected_unique,

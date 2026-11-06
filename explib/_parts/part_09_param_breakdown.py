@@ -581,13 +581,15 @@ def _validated_alpha(alpha, *, context='alpha'):
     silently change the wording of a result.
     """
     if isinstance(alpha, (bool, np.bool_)):
-        raise ValueError(f'{context} must be a real number in (0,1), got {alpha!r}')
+        raise ValueError(f'{context} must be a real number in (0,1), got '
+                         f'{_safe_repr(alpha)}')
     try:
         a = float(alpha)
     except (TypeError, ValueError, OverflowError):
-        raise ValueError(f'{context} must be a real number in (0,1), got {alpha!r}') from None
+        raise ValueError(f'{context} must be a real number in (0,1), got '
+                         f'{_safe_repr(alpha)}') from None
     if not (0.0 < a < 1.0):
-        raise ValueError(f'{context} must be in (0,1), got {alpha!r}')
+        raise ValueError(f'{context} must be in (0,1), got {_safe_repr(alpha)}')
     return a
 
 def holm_adjust(named_pvals, alpha=0.05):

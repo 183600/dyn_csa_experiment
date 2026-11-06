@@ -695,8 +695,12 @@ def _cv_normal_enumeration(D, *, alpha, margin, flatness_margin):
                         pl = 1.0 - normal.cdf((md + margin_n) / se)
                         ph = 1.0 - normal.cdf((margin_n - md) / se)
                     else:
-                        pl = 0.0 if md + margin_n > 0.0 else 1.0
-                        ph = 0.0 if margin_n - md > 0.0 else 1.0
+                        # A zero spread in the pairwise difference is the same
+                        # degenerate case as a zero-SEM condition: the normal
+                        # approximation has no measured variance, so withhold
+                        # the equivalence p instead of manufacturing p=0 and
+                        # a false "equivalent" claim.
+                        pl = ph = float('nan')
                     pair_tost.append(max(pl, ph))
             else:
                 # All effects are exactly zero; without a location shift the
@@ -975,8 +979,9 @@ def curve_simultaneous_inference(conditions, effects, *, seeds=None,
                     'margin': float(flatness_margin),
                     'p_tost': None,
                     'supported': False,
-                    'reason': ('the pairwise IUT is not available at this '
-                               'number of conditions'),
+                    'reason': ('the pairwise IUT is not available for this '
+                               'panel (too many pairs or a degenerate '
+                               'zero-spread pairwise difference)'),
                 }
             else:
                 pairs = enum.get('pairs') or []
@@ -1193,7 +1198,11 @@ def _cv_shape_problems(inputs, result):
         problems.append(
             "result.kind must be 'curve_simultaneous_inference', got "
             f'{_cv_repr(result.get("kind"))}')
-    if result.get('schema') != CURVE_INFERENCE_SCHEMA:
+    _schema = result.get('schema')
+    # ``True == 1`` in Python, so a boolean schema must be rejected explicitly.
+    if (isinstance(_schema, (bool, np.bool_))
+            or not isinstance(_schema, (int, np.integer))
+            or int(_schema) != CURVE_INFERENCE_SCHEMA):
         problems.append(
             f'result.schema must be {CURVE_INFERENCE_SCHEMA}, got '
             f'{_cv_repr(result.get("schema"))}')
@@ -1405,7 +1414,10 @@ def validate_curve_inference(artifact, *, replay=True):
         out['problems'].append(
             f'artifact.kind must be {CURVE_INFERENCE_KIND!r}, got '
             f'{_cv_repr(artifact.get("kind"))}')
-    if artifact.get('schema') != CURVE_INFERENCE_SCHEMA:
+    _schema = artifact.get('schema')
+    if (isinstance(_schema, (bool, np.bool_))
+            or not isinstance(_schema, (int, np.integer))
+            or int(_schema) != CURVE_INFERENCE_SCHEMA):
         out['problems'].append(
             f'artifact.schema must be {CURVE_INFERENCE_SCHEMA}, got '
             f'{_cv_repr(artifact.get("schema"))}')

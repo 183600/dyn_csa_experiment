@@ -527,10 +527,15 @@ def _dispo_validate_plan(plan):
     if plan.get('kind') != 'run_disposition':
         raise ValueError(f"disposition plan kind must be 'run_disposition', "
                          f"got {_dispo_repr(plan.get('kind'))}")
-    if plan.get('schema') != RUN_DISPOSITION_SCHEMA:
+    _schema = plan.get('schema')
+    # ``True == 1`` in Python, so a boolean schema would otherwise pass this
+    # version check and be treated as the current plan format.
+    if (isinstance(_schema, (bool, np.bool_))
+            or not isinstance(_schema, numbers.Integral)
+            or int(_schema) != RUN_DISPOSITION_SCHEMA):
         raise ValueError(f"disposition plan schema must be "
                          f"{RUN_DISPOSITION_SCHEMA}, got "
-                         f"{_dispo_repr(plan.get('schema'))}")
+                         f"{_dispo_repr(_schema)}")
     cells = _dispo_cells(plan.get('planned_cells'))
     pol = _dispo_policy(plan.get('policy'))
     want = _dispo_content_sha(cells, pol)

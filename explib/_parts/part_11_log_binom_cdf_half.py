@@ -1294,6 +1294,35 @@ def _binom_edgeworth_sf(k, n, p):
     return float(min(1.0, max(0.0, sf)))
 
 
+def _binom_scaled_normal_z(k, n, p, *, upper):
+    """Continuity-corrected normal z for a huge binomial count.
+
+    ``n*p`` can exceed float64 while ``k - n*p`` divided by ``sqrt(n p (1-p))``
+    is ordinary-sized.  Use exact integer arithmetic for the numerator and
+    denominator, then divide by the square root with the overflow-free helper.
+    ``upper`` selects P(X >= k) (correction -0.5) instead of P(X <= k) (+0.5).
+    """
+    num, den = float(p).as_integer_ratio()
+    correction2 = -1 if upper else 1          # 2 * (+/-0.5)
+    k = int(k)
+    n = int(n)
+    # z = ((k + c)*den - n*num) / sqrt(n*num*(den-num)).  Multiply numerator
+    # and the squared denominator by 2 so the half-integer correction is exact.
+    numerator = 2 * k * den + correction2 * den - 2 * n * num
+    denominator = 4 * n * num * (den - num)
+    return _int_over_sqrt(numerator, denominator)
+
+
+def _binom_scaled_normal_cdf(k, n, p):
+    z = _binom_scaled_normal_z(k, n, p, upper=False)
+    return float(min(1.0, max(0.0, 0.5 * math.erfc(-z / math.sqrt(2.0)))))
+
+
+def _binom_scaled_normal_sf(k, n, p):
+    z = _binom_scaled_normal_z(k, n, p, upper=True)
+    return float(min(1.0, max(0.0, 0.5 * math.erfc(z / math.sqrt(2.0)))))
+
+
 def _binomial_cdf_stable(k, n, p):
     k = int(k)
     n = int(n)
@@ -1309,7 +1338,13 @@ def _binomial_cdf_stable(k, n, p):
         # X ~ Bin(n,p) is n - Y with Y ~ Bin(n,1-p).  Evaluate the smaller-p
         # side so the legacy beta path never has to take x close to 1.
         return _binomial_sf_stable(n - k, n, 1.0 - p)
-    mu = n * p
+    try:
+        mu = n * p
+    except OverflowError:
+        # sqrt(n) is beyond float64; the standardised count and tail are not.
+        # The Edgeworth correction is O(1/n) here, so the normal limit is the
+        # only representable term.
+        return _binom_scaled_normal_cdf(k, n, p)
     if k >= mu:
         return float(1.0 - _binomial_sf_stable(k + 1, n, p))
     # A tiny index is the one case the beta path cannot handle at any n: when
@@ -1358,7 +1393,10 @@ def _binomial_sf_stable(k, n, p):
     if p > 0.5:
         # P_p(X>=k) = P_{1-p}(n-X <= n-k).
         return _binomial_cdf_stable(n - k, n, 1.0 - p)
-    mu = n * p
+    try:
+        mu = n * p
+    except OverflowError:
+        return _binom_scaled_normal_sf(k, n, p)
     if k <= mu:
         return float(1.0 - _binomial_cdf_stable(k - 1, n, p))
     if min(k, n - k) <= _BINOMIAL_TINY_INDEX_MAX:

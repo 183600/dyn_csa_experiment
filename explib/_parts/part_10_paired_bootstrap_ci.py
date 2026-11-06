@@ -2021,34 +2021,52 @@ def _int_times_log2(n):
     return math.fsum((head, float(lo) * math.log(2.0)))
 
 
+def _int_over_sqrt(num, den):
+    """``num / sqrt(den)`` for exact integers without overflow.
+
+    ``sqrt(den)`` (and sometimes ``num``) can exceed float64 even when the
+    ratio is ordinary-sized.  Keep ~53 significant bits of each integer and
+    apply the powers of two with ``ldexp``; the relative error is O(2**-53),
+    and an out-of-range result becomes inf (or underflows to 0) just as the
+    real ratio would at float precision.
+    """
+    num = int(num)
+    den = int(den)
+    if den <= 0:
+        raise ValueError('den must be positive')
+    if num == 0:
+        return 0.0
+    sign = 1.0 if num > 0 else -1.0
+    d = abs(num)
+    shift_den = max(0, (den.bit_length() - 53) // 2)
+    root = math.sqrt(float(den >> (2 * shift_den)))
+    if d.bit_length() <= 53:
+        ratio = float(d) / root
+        shift_num = 0
+    else:
+        shift_num = d.bit_length() - 53
+        ratio = float(d >> shift_num) / root
+    try:
+        return sign * math.ldexp(ratio, shift_num - shift_den)
+    except OverflowError:
+        return sign * float('inf')
+
+
 def _binom_normal_z_half(n, m):
-    diff = 2 * m + 1 - n
+    n = int(n)
+    diff = 2 * int(m) + 1 - n
     if diff == 0:
         return 0.0
     try:
-        sd = math.sqrt(n)
+        return diff / math.sqrt(n)
     except OverflowError:
-        # Beyond float64.  ``math.isqrt`` is exact but its cost grows with the
-        # integer width and this helper is called at every binary-search probe
-        # in signflip_min_consistency.  Keep the exact path for panel-sized
-        # integers (which the tests pin) and use a scaled float sqrt for an
-        # astronomically large count: the relative error is ~2**-500 and the
-        # normal tail is already saturated there.
-        try:
-            if n.bit_length() <= 4096:
-                sd = float(math.isqrt(n))
-            else:
-                shift = max(0, (n.bit_length() - 1000) // 2)
-                reduced = n >> (2 * shift)
-                sd = math.ldexp(math.sqrt(float(reduced)), shift)
-        except (OverflowError, ValueError):
-            return None
-    try:
-        return diff / sd
-    except OverflowError:
-        # A count far beyond the mean maps to a saturated normal tail; the
-        # caller only needs the sign/magnitude, not a finite float.
-        return float('inf') if diff > 0 else float('-inf')
+        # ``sqrt(n)`` exceeds float64, but the standardised value
+        # ``diff / sqrt(n)`` can still be representable (e.g. diff=1 at an
+        # even central count gives z ~ 1/sqrt(n)).  Returning None here made
+        # the normal CDF collapse to 0/1 for n with more than ~2048 bits,
+        # which in turn made _binom_cdf_half report 1.0 instead of ~0.5 and
+        # let signflip_min_consistency accept an infeasible plan.
+        return _int_over_sqrt(diff, n)
 
 
 def _log_binom_normal_cdf_half(n, m):
