@@ -487,3 +487,73 @@ def test_paired_nll_recovers_a_finite_ratio_when_the_row_sum_overflows():
     assert order['point_log_ratio'] is not None, order
     assert 'row NLL sum' in order['upstream'], order
     json.dumps(order, allow_nan=False)
+
+
+def test_paired_readouts_accept_an_exact_token_total_beyond_float64():
+    # A single unit can hold more tokens than float64 can represent, and the
+    # panel total can overflow even when each unit's count is representable
+    # (3 * 10**308).  The token-pooled CE is still a representable ratio, so
+    # every paired readout must take its exact-ratio path instead of raising
+    # from the token conversion or calling a representable point "invalid".
+    from fractions import Fraction
+
+    A = np.array([[1e308, 1.1e308, 1.2e308],
+                  [1.05e308, 1.15e308, 1.25e308]])
+    B = np.array([[0.9e308, 1.0e308, 1.1e308],
+                  [0.95e308, 1.05e308, 1.15e308]])
+    tokens = [10 ** 308, 2 * 10 ** 308, 3 * 10 ** 308]
+    total = sum(tokens)
+
+    def _ce(row):
+        return sum((Fraction(float(v)) for v in row), Fraction(0, 1)) / total
+
+    expected_lr = float(sum((_ce(A[s]) - _ce(B[s]) for s in range(A.shape[0])),
+                            Fraction(0, 1)) / A.shape[0])
+
+    ci = L._paired_nll_doc_ci(A, B, tokens)
+    assert ci is not None and math.isfinite(ci['delta_log_ratio']), ci
+    assert math.isclose(ci['delta_log_ratio'], expected_lr,
+                        rel_tol=1e-12, abs_tol=1e-12), ci
+    json.dumps(ci, allow_nan=False)
+
+    infl = L.paired_nll_unit_influence(A, B, tokens)
+    assert infl['available'] is True, infl
+    assert math.isclose(infl['full_delta_log_ratio'], expected_lr,
+                        rel_tol=1e-12, abs_tol=1e-12), infl
+    assert infl['n_units_loo_available'] == len(tokens), infl
+    json.dumps(infl, allow_nan=False)
+
+    two = L.paired_nll_two_way_bootstrap(A, B, tokens, n_boot=40, seed=11)
+    assert two['status'] == 'ok', two
+    assert math.isclose(two['delta_log_ratio'], expected_lr,
+                        rel_tol=1e-12, abs_tol=1e-12), two
+    assert math.isclose(two['delta_ppl'], ci['delta_ppl'],
+                        rel_tol=1e-12, abs_tol=1e-300), two
+    assert two['n_boot_valid'] >= 20, two
+    json.dumps(two, allow_nan=False)
+
+    # A tiny but nonzero log difference must not become a fake zero PPL
+    # difference (exp(a)-exp(b) rounds both sides to the same float).  The
+    # two-level point and its percentile interval must agree with the document
+    # interval's expm1 path.
+    tiny_a = np.full((2, 3), 100.0)
+    tiny_b = np.full((2, 3), 100.0 + 1e-10)
+    tiny_tokens = [10 ** 6] * 3
+    tiny_doc = L._paired_nll_doc_ci(tiny_a, tiny_b, tiny_tokens)
+    tiny = L.paired_nll_two_way_bootstrap(
+        tiny_a, tiny_b, tiny_tokens, n_boot=40, seed=13)
+    assert tiny['status'] == 'ok' and tiny['delta_ppl'] != 0.0, tiny
+    assert math.isclose(tiny['delta_ppl'], tiny_doc['delta_ppl'],
+                        rel_tol=1e-12, abs_tol=0.0), (tiny, tiny_doc)
+    assert (tiny['delta_ppl_ci95'][0] <= tiny['delta_ppl']
+            <= tiny['delta_ppl_ci95'][1]), tiny
+    json.dumps(tiny, allow_nan=False)
+
+    # The variance decomposition uses the wider machine float for the
+    # per-token cells; on a platform without a wider type this assertion is
+    # intentionally skipped rather than pretending the ratio is unmeasurable.
+    if np.finfo(np.longdouble).max > np.finfo(float).max:
+        vc = L.paired_delta_variance_components(A, B, tokens)
+        assert vc['status'] == 'ok', vc
+        assert math.isfinite(vc['token_pooled_delta_nll_per_token']), vc
+        json.dumps(vc, allow_nan=False)

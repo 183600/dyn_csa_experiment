@@ -442,23 +442,39 @@ def paired_delta_variance_components(nll_a, nll_b, n_tokens, *, conf=0.95):
         raise ValueError(f'n_tokens is not a numeric vector: {exc}') from None
     if tok_raw.dtype.kind not in ('i', 'u', 'f', 'O'):
         raise ValueError('n_tokens contains non-numeric values')
+    if tok_raw.ndim != 1 or tok_raw.shape[0] != A.shape[1]:
+        raise ValueError(f'n_tokens must have length {A.shape[1]}, got {tok_raw.shape}')
+    tok = None
+    _wide_tok = None
     try:
         tok = tok_raw.astype(float)
     except (TypeError, ValueError, OverflowError):
-        raise ValueError('n_tokens is not a numeric vector') from None
-    if tok.ndim != 1 or tok.shape[0] != A.shape[1]:
-        raise ValueError(f'n_tokens must have length {A.shape[1]}, got {tok.shape}')
-    if not np.all(np.isfinite(tok)) or np.any(tok <= 0.0):
-        raise ValueError('n_tokens must be finite and strictly positive')
+        tok = None
+    if tok is not None and (not np.all(np.isfinite(tok)) or np.any(tok <= 0.0)):
+        tok = None
+    if tok is None:
+        # An exact token count beyond float64 is still a valid weight; the
+        # wider machine float (where available) can hold it.  Only a value
+        # outside that range, or non-positive, is an invalid weight.
+        try:
+            _wide_tok = tok_raw.astype(np.longdouble)
+        except (TypeError, ValueError, OverflowError):
+            _wide_tok = None
+        if (_wide_tok is None or not np.all(np.isfinite(_wide_tok))
+                or np.any(_wide_tok <= 0.0)):
+            raise ValueError('n_tokens must be finite and strictly positive')
     # NLL sums are usually O(tokens); a finite panel can still be near the
     # float limit.  Both the per-cell subtraction and the token-pooled row sum
     # can then overflow even though the per-token result is representable.
     # Use the platform's wider machine float (x86 long double) only for that
     # extreme path; ordinary panels stay on the exact historical NumPy path.
     _max_abs = max(float(np.max(np.abs(A))), float(np.max(np.abs(B))))
-    with np.errstate(over='ignore', invalid='ignore'):
-        _tok_total = float(np.sum(tok))
-    _tok_overflow = not math.isfinite(_tok_total)
+    if tok is None:
+        _tok_total = float('inf')
+    else:
+        with np.errstate(over='ignore', invalid='ignore'):
+            _tok_total = float(np.sum(tok))
+    _tok_overflow = (tok is None) or not math.isfinite(_tok_total)
     _extreme = ((math.isfinite(_max_abs) and _max_abs > 1e100)
                 or (0.0 < _max_abs < 1e-100) or _tok_overflow)
     _wide = None
@@ -468,12 +484,18 @@ def paired_delta_variance_components(nll_a, nll_b, n_tokens, *, conf=0.95):
                 _wide = np.longdouble
         except (AttributeError, TypeError, ValueError):
             _wide = None
+    if _tok_overflow and _wide is None:
+        raise ValueError(
+            'n_tokens total exceeds the representable float range on this '
+            'platform; the per-token ratio cannot be formed')
     if _wide is not None:
         _ld = _wide
+        _tok_ld = (_wide_tok if _wide_tok is not None
+                   else tok.astype(_ld))
         _diff = A.astype(_ld) - B.astype(_ld)
-        delta = (_diff / tok.astype(_ld)[None, :]).astype(float)
-        _tok_ld = tok.astype(_ld).sum(dtype=_ld)
-        _row_pooled = _diff.sum(axis=1, dtype=_ld) / _tok_ld
+        delta = (_diff / _tok_ld[None, :]).astype(float)
+        _tok_ld_sum = _tok_ld.sum(dtype=_ld)
+        _row_pooled = _diff.sum(axis=1, dtype=_ld) / _tok_ld_sum
         try:
             token_pooled = float(np.mean(_row_pooled, dtype=_ld))
         except (TypeError, ValueError, OverflowError):

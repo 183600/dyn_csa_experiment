@@ -942,11 +942,23 @@ def paired_nll_two_way_bootstrap(nll_a, nll_b, n_tokens, *, n_boot=2000,
         raise ValueError(
             'paired_nll_two_way_bootstrap: every unit needs a finite positive '
             'integer token count')
-    T = np.asarray(counts, dtype=float)
-    if T.size != A.shape[1]:
+    if len(counts) != A.shape[1]:
         raise ValueError(
-            f'paired_nll_two_way_bootstrap: {T.size} token counts for '
+            f'paired_nll_two_way_bootstrap: {len(counts)} token counts for '
             f'{A.shape[1]} units')
+    try:
+        T = np.asarray(counts, dtype=float)
+        total_tok = float(T.sum())
+        if not math.isfinite(total_tok) or total_tok <= 0.0:
+            raise OverflowError
+        _extreme_total = False
+    except (OverflowError, ValueError):
+        # A token total beyond float64 is not an unmeasurable panel: the
+        # bootstrap can run on token shares (the ratio is invariant to a
+        # common factor) while the point uses the exact integer denominator.
+        T = None
+        total_tok = None
+        _extreme_total = True
     if isinstance(conf, (bool, np.bool_)):
         raise ValueError(
             'paired_nll_two_way_bootstrap: conf must be a probability in (0, 1)')
@@ -989,19 +1001,33 @@ def paired_nll_two_way_bootstrap(nll_a, nll_b, n_tokens, *, n_boot=2000,
         out['warnings'].append(
             f'only {D} evaluation units: the percentile two-level interval may '
             'be coarse')
-    total_tok = float(T.sum())
-    if not math.isfinite(total_tok) or total_tok <= 0.0:
-        out['reason'] = 'the total token count must be positive'
-        return out
-    ce_a = _nll_row_ce(A, total_tok)  # noqa: F821 (part 00)
-    ce_b = _nll_row_ce(B, total_tok)  # noqa: F821 (part 00)
+    if _extreme_total:
+        ce_a = _nll_row_ce_exact(A, counts)  # noqa: F821 (part 00)
+        ce_b = _nll_row_ce_exact(B, counts)  # noqa: F821 (part 00)
+        if ce_a is None or ce_b is None:
+            out['reason'] = ('the token total is beyond float64 and a '
+                             'per-seed pooled CE underflows or is not '
+                             'representable; the two-level interval is withheld')
+            return out
+    else:
+        ce_a = _nll_row_ce(A, total_tok)  # noqa: F821 (part 00)
+        ce_b = _nll_row_ce(B, total_tok)  # noqa: F821 (part 00)
     ea = np.asarray([_safe_exp_ppl(x) for x in ce_a], dtype=float)
     eb = np.asarray([_safe_exp_ppl(x) for x in ce_b], dtype=float)
     if not (np.all(np.isfinite(ea)) and np.all(np.isfinite(eb))):
         out['reason'] = ('the full-panel pooled PPL overflows the representable '
                          'float range; the paired Δ is not a finite measurement')
         return out
-    delta_ppl = _scaled_mean_or_raw(ea - eb)
+    # Use the same expm1 path as the document cluster interval: exp(a)-exp(b)
+    # rounds both exponentials to the same float when the two pooled log rates
+    # are close, reporting a fake zero PPL difference while the log ratio is
+    # representable.
+    _diff_ppl = [_ppl_difference(ce_a[s], ce_b[s]) for s in range(S)]
+    if any(v is None for v in _diff_ppl):
+        out['reason'] = ('a per-seed token-pooled PPL difference is not '
+                         'representable; the two-level interval is withheld')
+        return out
+    delta_ppl = _scaled_mean_or_raw(_diff_ppl)
     delta_lr = float(np.mean(ce_a - ce_b))
     out['delta_ppl'] = delta_ppl
     out['delta_log_ratio'] = delta_lr
@@ -1010,17 +1036,31 @@ def paired_nll_two_way_bootstrap(nll_a, nll_b, n_tokens, *, n_boot=2000,
     # even though every resampled CE (and PPL) is representable.  The ratio is
     # invariant to a common positive factor, so the extreme panel is rescaled
     # for the draws and mapped back through the already finite CE point.
-    _draw_scale = max(float(np.max(np.abs(A))),
-                      float(np.max(np.abs(B))),
-                      float(np.max(T)))
-    _scaled_draws = bool(math.isfinite(_draw_scale) and _draw_scale > 0.0
-                         and (_draw_scale < 1e-100 or _draw_scale > 1e100))
-    if _scaled_draws:
-        _A_work = A / _draw_scale
-        _B_work = B / _draw_scale
-        _T_work = T / _draw_scale
+    if _extreme_total:
+        # Express both numerator and denominator as shares of the exact token
+        # total.  Integer/float division is safe for huge Python integers, and
+        # every per-element NLL/total is formed as a rational before rounding.
+        from fractions import Fraction as _Fraction
+        total_int = int(sum(counts))
+        _T_work = np.asarray([c / total_int for c in counts], dtype=float)
+        _A_work = np.asarray(
+            [[float(_Fraction(float(v)) / total_int) for v in row]
+             for row in A], dtype=float)
+        _B_work = np.asarray(
+            [[float(_Fraction(float(v)) / total_int) for v in row]
+             for row in B], dtype=float)
     else:
-        _A_work, _B_work, _T_work = A, B, T
+        _draw_scale = max(float(np.max(np.abs(A))),
+                          float(np.max(np.abs(B))),
+                          float(np.max(T)))
+        _scaled_draws = bool(math.isfinite(_draw_scale) and _draw_scale > 0.0
+                             and (_draw_scale < 1e-100 or _draw_scale > 1e100))
+        if _scaled_draws:
+            _A_work = A / _draw_scale
+            _B_work = B / _draw_scale
+            _T_work = T / _draw_scale
+        else:
+            _A_work, _B_work, _T_work = A, B, T
     rng = np.random.default_rng(_seed)
     draw_ppl = np.full(int(_nb), np.nan, dtype=float)
     draw_lr = np.full(int(_nb), np.nan, dtype=float)
@@ -1040,10 +1080,21 @@ def paired_nll_two_way_bootstrap(nll_a, nll_b, n_tokens, *, n_boot=2000,
             nll_a_draw = doc_counts @ _A_work.T
             nll_b_draw = doc_counts @ _B_work.T
             denom = tot[:, None]
-            ppl_a = np.exp(nll_a_draw / denom)
-            ppl_b = np.exp(nll_b_draw / denom)
-            per_seed = ppl_a - ppl_b
-            per_seed_lr = (nll_a_draw - nll_b_draw) / denom
+            ce_a_draw = nll_a_draw / denom
+            ce_b_draw = nll_b_draw / denom
+            ppl_a = np.exp(ce_a_draw)
+            ppl_b = np.exp(ce_b_draw)
+            # Form the log difference from the two rounded per-draw CE values,
+            # exactly as the point estimate and _paired_nll_doc_ci do, so the
+            # two expm1 branches agree bit-for-bit on a degenerate panel.
+            per_seed_lr = ce_a_draw - ce_b_draw
+            # Same expm1 branch as the point estimate.  Evaluating both
+            # branches is harmless: the unused one may overflow to inf under
+            # errstate, but the selected branch is the representable one.
+            _small = np.abs(per_seed_lr) < 1e-6
+            per_seed = np.where(_small,
+                                ppl_b * np.expm1(per_seed_lr),
+                                ppl_a - ppl_b)
             weights = seed_counts / float(S)
             ppl_mean = np.sum(per_seed * weights, axis=1)
             lr_mean = np.sum(per_seed_lr * weights, axis=1)

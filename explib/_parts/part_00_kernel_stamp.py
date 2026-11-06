@@ -1714,6 +1714,37 @@ def _nll_row_ce(matrix, total_tokens):
     return np.asarray(out, dtype=float)
 
 
+def _nll_row_ce_exact(matrix, counts):
+    """Per-row ``sum(row) / total`` with an exact integer token total.
+
+    ``counts`` are Python integers; the total may exceed float64 (e.g.
+    ``3 * 10**400``).  Each ratio is formed as a rational and rounded once.
+    Returns ``None`` when a non-zero ratio underflows to zero in float64:
+    reporting a fake zero cross-entropy would silently change every downstream
+    PPL and influence value.
+    """
+    from fractions import Fraction as _Fraction
+    arr = np.asarray(matrix, dtype=float)
+    try:
+        total = int(sum(int(c) for c in counts))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if total <= 0:
+        return None
+    out = []
+    for row in arr:
+        try:
+            q = (sum((_Fraction(float(v)) for v in row), _Fraction(0, 1))
+                 / total)
+            value = float(q)
+        except (OverflowError, ValueError, ZeroDivisionError):
+            return None
+        if value == 0.0 and q != 0:
+            return None
+        out.append(value)
+    return np.asarray(out, dtype=float)
+
+
 def _paired_nll_doc_ci(nll_a, nll_b, n_tokens, *, conf=0.95):
     """Cluster-robust CI for a PAIRED token-pooled PPL difference.
 

@@ -66,10 +66,24 @@ def paired_nll_unit_influence(nll_a, nll_b, n_tokens, *, unit_ids=None,
     _counts = [_exact_count(v, minimum=1) for v in _raw_t.tolist()]
     if any(c is None for c in _counts):
         raise ValueError('paired_nll_unit_influence: every unit needs a finite positive integer token count')
-    T = np.asarray(_counts, dtype=float)
-    if T.size != A.shape[1]:
+    if len(_counts) != A.shape[1]:
         raise ValueError(
-            f'paired_nll_unit_influence: {T.size} token counts for {A.shape[1]} units')
+            f'paired_nll_unit_influence: {len(_counts)} token counts for '
+            f'{A.shape[1]} units')
+    try:
+        T = np.asarray(_counts, dtype=float)
+        total_tok = float(T.sum())
+        if not math.isfinite(total_tok) or total_tok <= 0.0:
+            raise OverflowError
+        _extreme_total = False
+    except (OverflowError, ValueError):
+        # A token total beyond float64 is not an unmeasurable panel: the
+        # exact-rational path recovers any representable pooled CE.  Keep the
+        # integer counts and take that path instead of raising from the
+        # float64 conversion.
+        T = None
+        total_tok = None
+        _extreme_total = True
 
     S, D = A.shape
     if D < 3:
@@ -92,10 +106,8 @@ def paired_nll_unit_influence(nll_a, nll_b, n_tokens, *, unit_ids=None,
         if len(set(labels)) != D:
             raise ValueError('paired_nll_unit_influence: unit ids must be unique')
 
-    total_tok = float(T.sum())
-    if not math.isfinite(total_tok) or total_tok <= 0.0:
-        raise ValueError('paired_nll_unit_influence: the total token count must be positive')
-    full = _paired_nll_doc_ci(A, B, T, conf=conf)
+    full = _paired_nll_doc_ci(
+        A, B, (_counts if _extreme_total else T), conf=conf)
     if full is None:
         return {'kind': 'paired_unit_influence', 'available': False,
                 'n_units': int(D), 'n_seeds': int(S),
@@ -103,20 +115,48 @@ def paired_nll_unit_influence(nll_a, nll_b, n_tokens, *, unit_ids=None,
     full_delta = float(full['delta_ppl'])
     full_lr = float(full['delta_log_ratio'])
 
-    with np.errstate(over='ignore', invalid='ignore'):
-        sum_a = A.sum(axis=1)
-        sum_b = B.sum(axis=1)
-    _extreme_rows = not (np.all(np.isfinite(sum_a))
-                         and np.all(np.isfinite(sum_b)))
-    if _extreme_rows:
+    total_int = int(sum(_counts))
+    ce_a_q = ce_b_q = None
+    if _extreme_total:
         # The full-fold CI already recovered a finite pooled ratio from these
-        # finite NLLs; the same overflow must not make the influence readout
-        # report "the per-seed pooled PPL overflowed".
-        ce_a = _nll_row_ce(A, total_tok)  # noqa: F821 (part 00)
-        ce_b = _nll_row_ce(B, total_tok)  # noqa: F821 (part 00)
+        # finite NLLs; form the same per-seed CE with an exact denominator
+        # instead of converting the unrepresentable token total to float.
+        from fractions import Fraction as _Fraction
+        try:
+            ce_a_q = [sum((_Fraction(float(v)) for v in A[s]),
+                          _Fraction(0, 1)) / total_int for s in range(S)]
+            ce_b_q = [sum((_Fraction(float(v)) for v in B[s]),
+                          _Fraction(0, 1)) / total_int for s in range(S)]
+            ce_a = np.asarray([float(q) for q in ce_a_q], dtype=float)
+            ce_b = np.asarray([float(q) for q in ce_b_q], dtype=float)
+        except (OverflowError, ValueError, ZeroDivisionError):
+            return {'kind': 'paired_unit_influence', 'available': False,
+                    'n_units': int(D), 'n_seeds': int(S),
+                    'reason': ('the per-seed token-pooled CE is not '
+                               'representable; the influence readout is '
+                               'withheld')}
+        if (any(x == 0.0 and q != 0 for x, q in zip(ce_a, ce_a_q))
+                or any(x == 0.0 and q != 0 for x, q in zip(ce_b, ce_b_q))):
+            return {'kind': 'paired_unit_influence', 'available': False,
+                    'n_units': int(D), 'n_seeds': int(S),
+                    'reason': ('a per-seed token-pooled CE underflows to zero; '
+                               'the influence readout is withheld')}
+        _extreme_rows = False
     else:
-        ce_a = sum_a / total_tok
-        ce_b = sum_b / total_tok
+        with np.errstate(over='ignore', invalid='ignore'):
+            sum_a = A.sum(axis=1)
+            sum_b = B.sum(axis=1)
+        _extreme_rows = not (np.all(np.isfinite(sum_a))
+                             and np.all(np.isfinite(sum_b)))
+        if _extreme_rows:
+            # The full-fold CI already recovered a finite pooled ratio from
+            # these finite NLLs; the same overflow must not make the influence
+            # readout report "the per-seed pooled PPL overflowed".
+            ce_a = _nll_row_ce(A, total_tok)  # noqa: F821 (part 00)
+            ce_b = _nll_row_ce(B, total_tok)  # noqa: F821 (part 00)
+        else:
+            ce_a = sum_a / total_tok
+            ce_b = sum_b / total_tok
     ea = np.asarray([_safe_exp_ppl(x) for x in ce_a], dtype=float)
     eb = np.asarray([_safe_exp_ppl(x) for x in ce_b], dtype=float)
     if not (np.all(np.isfinite(ea)) and np.all(np.isfinite(eb))):
@@ -127,34 +167,65 @@ def paired_nll_unit_influence(nll_a, nll_b, n_tokens, *, unit_ids=None,
     # Exact delete-one-unit recomputation.  The full-fold point must be the
     # same estimand as the caller's pooled CI; otherwise the influence belongs
     # to a different comparison and is refused rather than silently reported.
-    denom = total_tok - T
-    usable_denom = denom > 0.0
     ce_a_loo = np.full((S, D), np.nan, dtype=float)
     ce_b_loo = np.full((S, D), np.nan, dtype=float)
-    if _extreme_rows:
-        # Same delete-one-unit estimand, but keep the intermediate as a ratio:
-        # (sum - nll_i) / (total - tokens_i)
-        #   = (ce - nll_i/total) * total/(total - tokens_i).
-        # The row sum itself is not representable here, while this difference
-        # and the final CE can be.
-        with np.errstate(over='ignore', invalid='ignore', divide='ignore'):
-            _loo_scale = np.where(usable_denom, total_tok / denom, 0.0)
-            ce_a_loo = ((ce_a[:, None] - A / total_tok)
-                        * _loo_scale[None, :])
-            ce_b_loo = ((ce_b[:, None] - B / total_tok)
-                        * _loo_scale[None, :])
-        ce_a_loo[:, ~usable_denom] = np.nan
-        ce_b_loo[:, ~usable_denom] = np.nan
+    if _extreme_total:
+        # (sum_i nll_i - nll_j) / (sum_i tokens_i - tokens_j), all exact.
+        from fractions import Fraction as _Fraction
+        for s in range(S):
+            row_a = [_Fraction(float(v)) for v in A[s]]
+            row_b = [_Fraction(float(v)) for v in B[s]]
+            sum_a_q = sum(row_a, _Fraction(0, 1))
+            sum_b_q = sum(row_b, _Fraction(0, 1))
+            for j in range(D):
+                remaining = total_int - _counts[j]
+                if remaining <= 0:
+                    continue
+                try:
+                    qa = (sum_a_q - row_a[j]) / remaining
+                    qb = (sum_b_q - row_b[j]) / remaining
+                    va, vb = float(qa), float(qb)
+                except (OverflowError, ValueError, ZeroDivisionError):
+                    continue
+                if (va == 0.0 and qa != 0) or (vb == 0.0 and qb != 0):
+                    continue
+                ce_a_loo[s, j] = va
+                ce_b_loo[s, j] = vb
     else:
-        np.divide(sum_a[:, None] - A, denom[None, :], out=ce_a_loo,
-                  where=usable_denom[None, :])
-        np.divide(sum_b[:, None] - B, denom[None, :], out=ce_b_loo,
-                  where=usable_denom[None, :])
+        denom = total_tok - T
+        usable_denom = denom > 0.0
+        if _extreme_rows:
+            # Same delete-one-unit estimand, but keep the intermediate as a
+            # ratio:
+            # (sum - nll_i) / (total - tokens_i)
+            #   = (ce - nll_i/total) * total/(total - tokens_i).
+            # The row sum itself is not representable here, while this
+            # difference and the final CE can be.
+            with np.errstate(over='ignore', invalid='ignore', divide='ignore'):
+                _loo_scale = np.where(usable_denom, total_tok / denom, 0.0)
+                ce_a_loo = ((ce_a[:, None] - A / total_tok)
+                            * _loo_scale[None, :])
+                ce_b_loo = ((ce_b[:, None] - B / total_tok)
+                            * _loo_scale[None, :])
+            ce_a_loo[:, ~usable_denom] = np.nan
+            ce_b_loo[:, ~usable_denom] = np.nan
+        else:
+            np.divide(sum_a[:, None] - A, denom[None, :], out=ce_a_loo,
+                      where=usable_denom[None, :])
+            np.divide(sum_b[:, None] - B, denom[None, :], out=ce_b_loo,
+                      where=usable_denom[None, :])
     with np.errstate(over='ignore', invalid='ignore'):
         ea_loo = np.exp(ce_a_loo)
         eb_loo = np.exp(ce_b_loo)
-    loo_delta = np.mean(ea_loo - eb_loo, axis=0)
-    loo_lr = np.mean(ce_a_loo - ce_b_loo, axis=0)
+        loo_lr_seed = ce_a_loo - ce_b_loo
+        # Match the pooled document interval's expm1 branch: a tiny but
+        # nonzero log difference must not become a fake zero LOO ΔPPL.
+        _small = np.abs(loo_lr_seed) < 1e-6
+        _loo_diff = np.where(_small,
+                             eb_loo * np.expm1(loo_lr_seed),
+                             ea_loo - eb_loo)
+        loo_delta = np.mean(_loo_diff, axis=0)
+        loo_lr = np.mean(loo_lr_seed, axis=0)
     finite = np.isfinite(loo_delta) & np.isfinite(loo_lr)
     if not np.any(finite):
         return {'kind': 'paired_unit_influence', 'available': False,
@@ -165,7 +236,25 @@ def paired_nll_unit_influence(nll_a, nll_b, n_tokens, *, unit_ids=None,
     # Delta-method influence, exactly the ``bar`` term that the cluster-robust
     # variance squares.  Kept separate from the exact LOO fold so the report
     # can show local influence even when a fold overflows.
-    if _extreme_rows:
+    if _extreme_total:
+        from fractions import Fraction as _Fraction
+        psi = np.full((S, D), np.nan, dtype=float)
+        psi_lr = np.full((S, D), np.nan, dtype=float)
+        for s in range(S):
+            for j in range(D):
+                try:
+                    ra = ((_Fraction(float(A[s, j]))
+                           - ce_a_q[s] * _counts[j]) / total_int)
+                    rb = ((_Fraction(float(B[s, j]))
+                           - ce_b_q[s] * _counts[j]) / total_int)
+                    psi[s, j] = float(_Fraction(ea[s]) * ra
+                                      - _Fraction(eb[s]) * rb)
+                    psi_lr[s, j] = float(ra - rb)
+                except (OverflowError, ValueError, ZeroDivisionError):
+                    continue
+        psi = psi.mean(axis=0)
+        psi_lr = psi_lr.mean(axis=0)
+    elif _extreme_rows:
         # Algebraically identical to the expression below; dividing the NLL
         # and the token count by the (already float) token total first keeps
         # the (A - ce*T) product representable when either factor is near the
