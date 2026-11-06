@@ -159,7 +159,10 @@ def _gfdr_text(value):
 
 
 def _gfdr_int_or_none(value, *, minimum=0, maximum=None):
-    if value is None or isinstance(value, (bool, bytes, bytearray)):
+    # ``np.bool_`` is not a Python ``bool`` subclass but is still a flag, not
+    # a count: accepting it made ``n_nonzero=True`` look like a one-seed
+    # resolution floor (and silently changed the reported p_floor).
+    if value is None or isinstance(value, (bool, np.bool_, bytes, bytearray)):
         return None
     try:
         number = int(value)
@@ -201,7 +204,11 @@ def _gfdr_floor(value, *, p=None, n_nonzero=None, where='p_floor'):
         if nn is None:
             raise ValueError(f'{where}: n_nonzero must be a non-negative '
                              f'integer no larger than 1000000')
-        return 1.0 if nn == 0 else min(1.0, math.ldexp(2.0, -nn + 1))
+        # Two-sided sign-flip floor: 2 / 2**nn == 2 ** (1 - nn).  The old
+        # ``-nn + 1`` exponent was one power too high (4 / 2**nn), which
+        # doubled the reported floor and could falsely label a family
+        # "resolution limited" at alpha.
+        return 1.0 if nn == 0 else min(1.0, math.ldexp(2.0, -nn))
     if value is None:
         return None
     if isinstance(value, (bool, bytes, bytearray, str)):

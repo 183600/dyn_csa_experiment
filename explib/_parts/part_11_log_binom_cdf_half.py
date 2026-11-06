@@ -1166,6 +1166,23 @@ _BINOMIAL_TINY_INDEX_MAX = 100
 _BINOMIAL_OLD_MAX_N = 100000000.0
 
 
+def _log_int(value):
+    """``log(value)`` for an arbitrary-precision positive integer.
+
+    ``math.log`` first converts its argument to float and raises OverflowError
+    for an integer beyond ~1.8e308, even though the log is an ordinary
+    double.  Keep the top ~53 bits and fold the power of two back with
+    ``math.log(2)``.
+    """
+    value = int(value)
+    try:
+        return math.log(value)
+    except OverflowError:
+        pass
+    shift = max(0, value.bit_length() - 53)
+    return math.log(float(value >> shift)) + shift * math.log(2.0)
+
+
 def _binom_log_comb(n, k):
     """Stable log C(n,k) when min(k,n-k) is small enough to sum directly.
 
@@ -1180,12 +1197,18 @@ def _binom_log_comb(n, k):
     m = min(k, n - k)
     if m == 0:
         return 0.0
-    return math.fsum(math.log(n - i) - math.log(i + 1) for i in range(m))
+    return math.fsum(_log_int(n - i) - math.log(i + 1)
+                     for i in range(m))
 
 
 def _binom_logpmf(k, n, p):
-    return (_binom_log_comb(n, k) + k * math.log(p)
-            + (n - k) * math.log1p(-p))
+    try:
+        q_term = (n - k) * math.log1p(-p)
+    except OverflowError:
+        # n alone is beyond float64, but (n-k)*p and the log are not.  Factor
+        # the tiny probability out once so the product stays representable.
+        q_term = _binom_mean_safe(n - k, p) * (math.log1p(-p) / p)
+    return (_binom_log_comb(n, k) + k * math.log(p) + q_term)
 
 
 def _binom_cdf_exact_lower(k, n, p):
@@ -1271,7 +1294,9 @@ def _binom_edgeworth_cdf(k, n, p):
     skewness/kurtosis corrections are O(1/n) or smaller, while the exact tail
     sum is still used when min(k,n-k) is small.
     """
-    mu = n * p
+    mu = _binom_mean_safe(n, p)
+    if not math.isfinite(mu):
+        return _binom_scaled_normal_cdf(k, n, p)
     var = mu * (1.0 - p)
     sd = math.sqrt(var)
     z = _binom_continuity_numerator(k, n, p, 0.5) / sd
@@ -1283,7 +1308,9 @@ def _binom_edgeworth_cdf(k, n, p):
 
 
 def _binom_edgeworth_sf(k, n, p):
-    mu = n * p
+    mu = _binom_mean_safe(n, p)
+    if not math.isfinite(mu):
+        return _binom_scaled_normal_sf(k, n, p)
     var = mu * (1.0 - p)
     sd = math.sqrt(var)
     z = _binom_continuity_numerator(k, n, p, -0.5) / sd
@@ -1311,6 +1338,25 @@ def _binom_scaled_normal_z(k, n, p, *, upper):
     numerator = 2 * k * den + correction2 * den - 2 * n * num
     denominator = 4 * n * num * (den - num)
     return _int_over_sqrt(numerator, denominator)
+
+
+def _binom_mean_safe(n, p):
+    """``n*p`` without a spurious int-to-float overflow.
+
+    ``n * p`` raises OverflowError when the integer ``n`` alone is beyond
+    float64, even if ``n*p`` is small and exactly representable (e.g.
+    n=2**1024, p=2**-1024 gives 1).  Recover the product through the exact
+    float ratio only on that path; a genuinely huge mean becomes +inf.
+    """
+    try:
+        return n * p
+    except OverflowError:
+        pass
+    try:
+        num, den = float(p).as_integer_ratio()
+        return (int(n) * num) / den
+    except (OverflowError, ValueError):
+        return float('inf')
 
 
 def _binom_scaled_normal_cdf(k, n, p):
@@ -1341,10 +1387,15 @@ def _binomial_cdf_stable(k, n, p):
     try:
         mu = n * p
     except OverflowError:
-        # sqrt(n) is beyond float64; the standardised count and tail are not.
-        # The Edgeworth correction is O(1/n) here, so the normal limit is the
-        # only representable term.
-        return _binom_scaled_normal_cdf(k, n, p)
+        # ``n`` alone is beyond float64, but ``n*p`` need not be.  Only fall
+        # back to the normal limit when the mean really is huge; for a small
+        # mean the Poisson/small-index branches below are the accurate ones.
+        mu = _binom_mean_safe(n, p)
+        if not math.isfinite(mu):
+            # sqrt(n) is beyond float64; the standardised count and tail are
+            # not.  The Edgeworth correction is O(1/n) here, so the normal
+            # limit is the only representable term.
+            return _binom_scaled_normal_cdf(k, n, p)
     if k >= mu:
         return float(1.0 - _binomial_sf_stable(k + 1, n, p))
     # A tiny index is the one case the beta path cannot handle at any n: when
@@ -1396,7 +1447,9 @@ def _binomial_sf_stable(k, n, p):
     try:
         mu = n * p
     except OverflowError:
-        return _binom_scaled_normal_sf(k, n, p)
+        mu = _binom_mean_safe(n, p)
+        if not math.isfinite(mu):
+            return _binom_scaled_normal_sf(k, n, p)
     if k <= mu:
         return float(1.0 - _binomial_cdf_stable(k - 1, n, p))
     if min(k, n - k) <= _BINOMIAL_TINY_INDEX_MAX:

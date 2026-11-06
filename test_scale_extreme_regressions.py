@@ -131,3 +131,150 @@ def test_training_exposure_derived_products_are_named_not_digit_limit():
     assert plan['status'] == 'not_estimable', plan
     assert 'strict-JSON' in (plan.get('reason') or ''), plan
     json.dumps(plan, allow_nan=False)
+
+
+def test_numerical_canary_size_is_validated_before_the_digit_limit():
+    # The out-of-range branch used to format the raw arbitrary-precision
+    # integer, so its own error message raised CPython's decimal-conversion
+    # ValueError.  The named range diagnostic must survive any int size.
+    for size in (10 ** 10000, 10 ** 4000, -10 ** 10000, 65, 0, 1):
+        with pytest.raises(ValueError, match=r'size must be in \[2, 64\]'):
+            L.numerical_canary(size=size)
+    for size in (True, 2.5, '8'):
+        with pytest.raises(ValueError, match='size must be an integer'):
+            L.numerical_canary(size=size)
+
+
+def test_global_fdr_does_not_treat_numpy_flags_as_seed_counts():
+    # ``np.bool_`` is not a Python bool subclass.  Treating it as the integer
+    # 1 used to invent a one-seed resolution floor, turning a malformed claim
+    # into a restriction on the reported p-value.
+    import numpy as np
+
+    plain = L.global_fdr([
+        {'name': 'a', 'p': 0.01, 'n': 3, 'n_nonzero': 3}])['claims']['a']
+    flagged = L.global_fdr([
+        {'name': 'a', 'p': 0.01, 'n': np.bool_(True),
+         'n_nonzero': np.bool_(True)}])['claims']['a']
+    assert flagged['n'] is None and flagged['n_nonzero'] is None
+    assert flagged['p_floor'] is None
+    assert flagged['at_floor'] is None
+    assert plain['p_floor'] == 0.01  # ordinary integer counts still work
+
+
+def test_global_fdr_two_sided_floor_is_not_doubled():
+    # The exact two-sided floor for n non-zero seeds is 2 / 2**n.  An extra
+    # factor of two made a resolvable family look resolution-limited.
+    for n_nonzero in (2, 3, 6, 12):
+        expected = 2.0 ** (1 - n_nonzero)
+        assert L._gfdr_floor(None, n_nonzero=n_nonzero) == expected
+        assert L.signflip_p_floor(n_nonzero) == expected
+    out = L.global_fdr({'a': {'p': 0.5, 'n_nonzero': 6}}, alpha=0.05)
+    assert out['claims']['a']['p_floor'] == 2.0 ** -5
+    assert out['family_resolution_limited'] is False
+
+
+def test_subnormal_weighted_mean_is_not_a_fake_zero():
+    # ldexp() used to underflow to 0 before dividing by the weight mantissa;
+    # an all-positive subnormal panel then looked like an exact zero panel.
+    sub = 5e-324
+    assert L._usr_weighted_mean([sub], [sub]) == sub
+    out = L.unit_split_replication(
+        [[sub] * 4 for _ in range(6)], [sub] * 4,
+        unit_ids=['a', 'b', 'c', 'd'], seeds=list(range(6)),
+        direction='positive', alpha=0.05, min_n=2,
+        min_units=4, min_units_per_half=2, salt='x', n_salts=0)
+    assert out['halves'][0]['stats']['n_positive'] == 6
+    assert out['halves'][0]['test']['p_one_sided'] == 0.015625
+    assert out['sign_agreement'] == 'both_positive'
+    assert out['iut']['claim'] == 'both_halves_support_direction'
+
+
+def test_curve_small_scale_condition_is_not_flattened_by_a_large_one():
+    # The per-condition sign-flip p must not depend on adding an independent
+    # much-larger condition.  A single global scale/tolerance used to count
+    # every pattern for the small row.
+    n = 6
+    huge = list(range(1, n + 1))
+    tiny = [1e-13 * x for x in range(1, n + 1)]
+    together = L.curve_simultaneous_inference(
+        ['huge', 'tiny'], {'huge': huge, 'tiny': tiny},
+        seeds=list(range(n)), alpha=0.05, min_n=3)
+    alone = L.curve_simultaneous_inference(
+        ['tiny'], {'tiny': tiny}, seeds=list(range(n)),
+        alpha=0.05, min_n=3)
+    expected = 0.015625
+    assert together['per_condition']['tiny']['p_pointwise_upper'] == expected
+    assert (alone['per_condition']['tiny']['p_pointwise_upper']
+            == expected)
+    assert together['uniform']['positive']['p_iut'] == expected
+    assert together['uniform']['positive']['supported'] is True
+
+
+def test_sequential_obf_with_unrepresentable_alpha_fails_closed():
+    # 1 - alpha/2 rounds to 1.0 below ~2.2e-16 and NormalDist.inv_cdf rejects
+    # p=1.0.  The plan must return not_estimable, not crash.
+    out = L.build_sequential_design(n_max=20, look_sizes=[10, 20],
+                                    alpha=1e-16)
+    assert out['result']['status'] == 'not_estimable'
+    out = L.build_sequential_design(
+        n_max=20, look_sizes=[10, 20], alpha=1e-11, family_size=100000)
+    assert out['result']['status'] == 'not_estimable'
+
+
+def test_canary_builder_is_strict_json_for_untrusted_provenance():
+    import numpy as np
+
+    result = L.numerical_canary(seed=1, size=4)
+    for provenance in ({'code_semantics': 10 ** 10000, 'source_tree': {}},
+                       {'code_semantics': float('nan'), 'source_tree': {}}):
+        with pytest.raises(ValueError, match='strict-JSON'):
+            L.build_numerical_canary_artifact(
+                result=result, provenance=provenance)
+    art = L.build_numerical_canary_artifact(
+        result=result, created_at=10 ** 10000)
+    json.dumps(art, allow_nan=False)
+    assert isinstance(art['created_at'], str)
+
+
+def test_tiny_alpha_planning_and_bh_use_relative_tolerances():
+    # An absolute +1e-15 slack swamps alpha=1e-20 and both approved an
+    # infeasible panel and called q=1e-19 an FDR rejection.
+    assert L.signflip_min_n_for_holm(1, 1e-20, n_max=64) is None
+    pvals = [('target', 1e-21)] + [(f'n{i}', 0.9) for i in range(99)]
+    row = L.global_multiplicity_audit(pvals, alpha=1e-20)['entries'][0]
+    assert row['bh_rejected'] is False
+    assert row['global_status'] == 'family_only'
+
+
+def test_binomial_huge_n_tiny_p_keeps_the_poisson_limit():
+    # n*p == 1 is representable even though n itself is not a float.  The
+    # int-to-float overflow must not silently select the normal limit.
+    n, p = 1 << 1024, 2.0 ** -1024
+    assert L._binomial_cdf_stable(0, n, p) == pytest.approx(
+        math.exp(-1.0), abs=1e-15)
+    assert L._binomial_sf_stable(1, n, p) == pytest.approx(
+        1.0 - math.exp(-1.0), abs=1e-15)
+    assert L._binomial_cdf(0, n, p) == pytest.approx(
+        math.exp(-1.0), abs=1e-15)
+
+
+def test_dominant_delta_uses_an_exact_mitm_count():
+    # A single dominant delta defeats the saddlepoint approximation: every
+    # sign assignment has |sum| >= the observed sum, so the exact p is 1.
+    deltas = [1.0] + [-0.01] * 40
+    out = L.exact_signflip_p(deltas)
+    assert out['method'] == 'exact-mitm-dominant'
+    assert out['p'] == 1.0
+
+
+def test_exposure_fallback_does_not_underflow_unique_counts_to_zero():
+    # 10**2000 / 10**4000 is far below float64, but the unique-token count is
+    # still representable; it must not become a fake zero/100% collision.
+    out = L.training_window_exposure(
+        10 ** 4000, 10 ** 2000, 1, 1, max_exact_draws=4_000_000)
+    assert out['exact'] is False
+    assert out['unique_starts'] == 1
+    assert out['unique_tokens'] == 10 ** 2000
+    assert out['start_collision_fraction'] == 0.0
+    json.dumps(out, allow_nan=False)

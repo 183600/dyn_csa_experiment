@@ -161,8 +161,12 @@ def _nc_size(value):
             f'got {_nc_repr(value)}')
     size = int(value)
     if size < 2 or size > NC_MAX_SIZE:
+        # ``size`` is an arbitrary-precision int here, so an f-string of the
+        # value can raise CPython's 4,300-digit conversion error instead of
+        # the intended diagnostic.  Report it through the bounded repr.
         raise ValueError(
-            f'numerical_canary: size must be in [2, {NC_MAX_SIZE}], got {size}')
+            f'numerical_canary: size must be in [2, {NC_MAX_SIZE}], got '
+            f'{_nc_repr(size)}')
     return size
 
 
@@ -404,14 +408,23 @@ def build_numerical_canary_artifact(*, seed=0, size=NC_DEFAULT_SIZE,
     artifact = {
         'kind': NC_ARTIFACT_KIND,
         'schema': NC_SCHEMA,
-        'created_at': (created_at if created_at is not None
+        'created_at': (_nc_text(created_at) if created_at is not None
                        else reproducible_timestamp()),  # noqa: F821 (part_46)
         'inputs': inputs,
         'result': result,
         'provenance': (provenance if provenance is not None
                        else numerical_canary_provenance()),
     }
-    artifact['content_sha256'] = _nc_content_sha(artifact)
+    try:
+        artifact['content_sha256'] = _nc_content_sha(artifact)
+    except (TypeError, ValueError, OverflowError, RecursionError) as exc:
+        # ``provenance`` (and a hand-edited ``result``) can still carry a NaN,
+        # a huge integer, or a cycle even though the arithmetic record was
+        # checked above.  Surface that as the named build error instead of
+        # leaking CPython's JSON/digit-limit exception.
+        raise ValueError(
+            'build_numerical_canary_artifact: artifact is not strict-JSON '
+            f'serialisable: {type(exc).__name__}: {_nc_repr(exc)}') from None
     return artifact
 
 

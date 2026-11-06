@@ -1848,12 +1848,16 @@ def signflip_min_n_for_holm(m_comparisons, alpha=0.05, n_max=64):
     a = _validated_alpha(alpha, context='signflip_min_n_for_holm alpha')
     if m is None or n_max is None or m <= 0 or n_max < 1:
         return None
-    if holm_min_attainable_p(n_max, m, a) > a + 1e-15:
+    # An absolute 1e-15 slack swamps every alpha below 1e-15 and approves a
+    # panel whose exact floor can never reach the request.  Keep a tiny
+    # relative tolerance for the ordinary float boundary only.
+    _limit = a + min(1e-15, a * 1e-12)
+    if holm_min_attainable_p(n_max, m, a) > _limit:
         return None
     lo, hi = 1, n_max
     while lo < hi:
         mid = (lo + hi) // 2
-        if holm_min_attainable_p(mid, m, a) <= a + 1e-15:
+        if holm_min_attainable_p(mid, m, a) <= _limit:
             hi = mid
         else:
             lo = mid + 1
@@ -1974,7 +1978,9 @@ def global_multiplicity_audit(named_pvals, *, alpha=0.05,
     # BH rejection set == {i : q_i <= alpha} (the defining property of BH
     # q-values; q_i >= p_i always, so tied p values can never receive
     # different verdicts and a p=1 slot is never rejected).
-    bh_rejected = q <= a + 1e-15
+    # Use a scale-relative boundary, not an absolute +1e-15: the latter
+    # labelled q=1e-19 <= alpha=1e-20 as an FDR rejection.
+    bh_rejected = q <= a * (1.0 + 1e-12)
     bonf = np.minimum(parr * m, 1.0)
     n_raw = n_bh = n_bonf = n_famonly = n_global = 0
     for i, e in enumerate(entries):

@@ -32,11 +32,21 @@ def dependency_contract(lock_path=None):
     """
     try:
         parsed = parse_requirements_lock(lock_path)
-    except OSError as e:
-        # Provenance must never crash a training run because a lock file is
-        # unreadable; report it as an explicit contract failure instead.
+    except (OSError, TypeError, ValueError) as e:
+        # Provenance must never crash a training run because a lock file (or
+        # the declared path itself) is unreadable; report it as an explicit
+        # contract failure instead.
+        raw_path = lock_path if lock_path is not None else 'requirements.lock'
+        try:
+            path_text = os.fsdecode(raw_path)
+        except (TypeError, ValueError, OverflowError):
+            path_text = _uo_str(raw_path, limit=500)
+        try:
+            path_text = os.path.abspath(path_text)
+        except (TypeError, ValueError, OSError):
+            path_text = _uo_str(path_text, limit=500)
         return {'kind': 'dependency_contract',
-                'lock_path': os.path.abspath(str(lock_path or 'requirements.lock')),
+                'lock_path': path_text,
                 'lock_sha256': None, 'n_pinned': 0, 'options': [],
                 'mismatches': [], 'missing': [], 'unpinned_installed': [],
                 'unpinned_versions': {}, 'pinned_installed': {},
@@ -44,6 +54,10 @@ def dependency_contract(lock_path=None):
                 'invalid': [f'could not read the lock: {type(e).__name__}: {e}'],
                 'status': 'invalid',
                 'note': 'the lock file exists but could not be read'}
+    # A bytes path is legal for os.path, but the contract block is serialised
+    # to JSON; keep the echoed path a plain string.
+    if isinstance(parsed.get('path'), bytes):
+        parsed['path'] = os.fsdecode(parsed['path'])
     out = {'kind': 'dependency_contract', 'lock_path': parsed['path'],
            'lock_sha256': parsed['sha256'], 'n_pinned': len(parsed['pins']),
            'options': parsed['options'], 'mismatches': [], 'missing': [],
@@ -329,8 +343,13 @@ def environment_fingerprint_v2(env=None):
         'cpu_threads': env.get('cpu_threads'),
         'cpu_interop_threads': env.get('cpu_interop_threads'),
     }
-    blob = json.dumps(fields, sort_keys=True, separators=(',', ':'),
-                      ensure_ascii=True, default=str)
+    try:
+        blob = json.dumps(fields, sort_keys=True, separators=(',', ':'),
+                          ensure_ascii=True, default=str)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            'environment snapshot is not canonical JSON: '
+            f'{type(exc).__name__}: {exc}') from None
     return hashlib.sha256(blob.encode('utf-8')).hexdigest()[:16]
 
 
@@ -514,8 +533,13 @@ def environment_fingerprint_v3(env=None):
         'n_unpinned': len(unpinned),
         'numerical_backend': backend,
     }
-    blob = json.dumps(fields, sort_keys=True, separators=(',', ':'),
-                      ensure_ascii=True, default=str)
+    try:
+        blob = json.dumps(fields, sort_keys=True, separators=(',', ':'),
+                          ensure_ascii=True, default=str)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            'environment snapshot is not canonical JSON: '
+            f'{type(exc).__name__}: {exc}') from None
     return hashlib.sha256(blob.encode('utf-8')).hexdigest()[:16]
 
 
@@ -639,7 +663,13 @@ def execution_fingerprint(env=None):
         'cpu_interop_threads': env.get('cpu_interop_threads'),
         'packages': deps.get('packages') if isinstance(deps, dict) else None,
     }
-    blob = json.dumps(fields, sort_keys=True, default=str, ensure_ascii=True)
+    try:
+        blob = json.dumps(fields, sort_keys=True, default=str,
+                          ensure_ascii=True)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            'environment snapshot is not canonical JSON: '
+            f'{type(exc).__name__}: {exc}') from None
     return hashlib.sha256(blob.encode('utf-8')).hexdigest()[:16]
 
 def _environment_fp_v2(rec):
@@ -743,6 +773,24 @@ def _corpus_prefix_fp(train_ids, cap=None):
         return None
     return _ids_fp(np.ascontiguousarray(arr[:min(int(arr.size), _cap)]))
 
+def _identity_digest(payload, label):
+    """16-hex digest of a canonical JSON identity, or a named error.
+
+    ``payload`` comes from an untrusted panel/archive.  A huge integer count
+    or a mixed int/str nested mapping makes ``json.dumps`` raise the raw
+    decimal-limit/TypeError; provenance should fail with a named contract
+    error instead.
+    """
+    try:
+        blob = json.dumps(_jsonable(payload), sort_keys=True,
+                          separators=(',', ':'), ensure_ascii=True)
+    except (TypeError, ValueError, OverflowError, RecursionError) as exc:
+        raise ValueError(
+            f'{label} is not canonical JSON: '
+            f'{type(exc).__name__}: {exc}') from None
+    return hashlib.sha256(blob.encode('utf-8')).hexdigest()[:16]
+
+
 def _corpus_fp_from_data(data):
     """Budget-independent corpus/tokenizer identity.
 
@@ -757,8 +805,7 @@ def _corpus_fp_from_data(data):
     payload = {k: data.get(k) for k in keys if data.get(k) is not None}
     if not payload.get('corpus_prefix_fp'):
         return None
-    blob = json.dumps(_jsonable(payload), sort_keys=True, separators=(',', ':'), ensure_ascii=True)
-    return hashlib.sha256(blob.encode('utf-8')).hexdigest()[:16]
+    return _identity_digest(payload, 'corpus_fp')
 
 def _data_version(data):
     """Stable content digest of the corpus identity recorded in a panel.
@@ -772,8 +819,7 @@ def _data_version(data):
     """
     keys = ('dataset', 'source', 'fw_fit_docs', 'requested_train_tokens', 'train_tokens', 'seq_len', 'vocab_size', 'val_sequences', 'train_fp', 'val_fp', 'eval_fp', 'cache_val_fp', 'corpus_fp', 'data_extra')
     payload = {k: data.get(k) for k in keys if data.get(k) is not None}
-    blob = json.dumps(_jsonable(payload), sort_keys=True, separators=(',', ':'), ensure_ascii=True)
-    return hashlib.sha256(blob.encode('utf-8')).hexdigest()[:16]
+    return _identity_digest(payload, 'data_version')
 
 def code_provenance():
     """Code + environment provenance block, without any data section.
@@ -1599,6 +1645,29 @@ def unit_order_sha256(unit_ids):
     return h.hexdigest()
 
 
+def _uo_repr(value, limit=200):
+    """Bounded, exception-safe repr for untrusted unit-order metadata.
+
+    A tampered attestation can carry an integer beyond CPython's 4,300-digit
+    decimal-conversion limit; formatting it while building the problem list
+    would replace the intended diagnostic with that raw ValueError.
+    """
+    try:
+        text = repr(value)
+    except Exception:
+        return f'<unrepresentable {type(value).__name__}>'
+    return text if len(text) <= limit else text[:limit - 3] + '...'
+
+
+def _uo_str(value, limit=200):
+    """Bounded, exception-safe ``str`` for a unit-order field."""
+    try:
+        text = str(value)
+    except Exception:
+        return f'<unrepresentable {type(value).__name__}>'
+    return text if len(text) <= limit else text[:limit - 3] + '...'
+
+
 def unit_order_attestation(unit_ids, *, unit_kind, permutation=None,
                            first_positions=None, n_tokens=None):
     """Attest that ``unit_ids`` is the order an order-dependent readout used.
@@ -1611,10 +1680,11 @@ def unit_order_attestation(unit_ids, *, unit_kind, permutation=None,
     they must be strictly increasing.
     """
     ids = _uo_unit_ids(unit_ids)
-    kind = str(unit_kind)
+    kind = _uo_str(unit_kind)
     if kind not in UNIT_ORDER_POLICY['unit_kinds']:
         raise ValueError(f'unit_kind must be one of '
-                         f'{UNIT_ORDER_POLICY["unit_kinds"]}, got {unit_kind!r}')
+                         f'{UNIT_ORDER_POLICY["unit_kinds"]}, got '
+                         f'{_uo_repr(unit_kind)}')
     n_units = len(ids)
     perm = None
     if permutation is not None:
@@ -1706,23 +1776,24 @@ def unit_order_problems(attestation, unit_ids, *, unit_kind=None,
     if attestation.get('policy_version') != UNIT_ORDER_POLICY['version']:
         problems.append('unit_order.policy_version is not '
                         f'{UNIT_ORDER_POLICY["version"]!r} (got '
-                        f'{attestation.get("policy_version")!r})')
+                        f'{_uo_repr(attestation.get("policy_version"))})')
     if attestation.get('basis') != UNIT_ORDER_POLICY['basis']:
         problems.append('unit_order.basis is not '
                         f'{UNIT_ORDER_POLICY["basis"]!r} (got '
-                        f'{attestation.get("basis")!r}); a sorted id vector is '
-                        'not a corpus-order attestation')
+                        f'{_uo_repr(attestation.get("basis"))}); a sorted id '
+                        'vector is not a corpus-order attestation')
     if attestation.get('algorithm') != UNIT_ORDER_POLICY['algorithm']:
         problems.append('unit_order.algorithm is not the documented '
                         'length-prefixed SHA-256')
-    if unit_kind is not None and attestation.get('unit_kind') != str(unit_kind):
+    if unit_kind is not None and attestation.get('unit_kind') != _uo_str(unit_kind):
         problems.append('unit_order.unit_kind '
-                        f'{attestation.get("unit_kind")!r} != {unit_kind!r}')
+                        f'{_uo_repr(attestation.get("unit_kind"))} != '
+                        f'{_uo_repr(unit_kind)}')
     n_units = attestation.get('n_units')
     if isinstance(n_units, bool) or not isinstance(n_units, (int, np.integer)):
         problems.append('unit_order.n_units is not an integer')
     elif int(n_units) != len(ids):
-        problems.append(f'unit_order.n_units={n_units!r} != {len(ids)} ids')
+        problems.append(f'unit_order.n_units={_uo_repr(n_units)} != {len(ids)} ids')
     stored_sha = attestation.get('sha256')
     if not isinstance(stored_sha, str) or len(stored_sha) != 64:
         problems.append('unit_order.sha256 is not a 64-character digest')
@@ -1736,7 +1807,7 @@ def unit_order_problems(attestation, unit_ids, *, unit_kind=None,
                 problems.append('unit_order.sha256 does not recompute from the '
                                 'analyzed id sequence')
     if expected_sha256 is not None:
-        if not isinstance(stored_sha, str) or stored_sha.lower() != str(
+        if not isinstance(stored_sha, str) or stored_sha.lower() != _uo_str(
                 expected_sha256).lower():
             problems.append('unit_order.sha256 disagrees with the expected '
                             'order fingerprint')

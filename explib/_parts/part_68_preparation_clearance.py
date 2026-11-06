@@ -262,7 +262,9 @@ def _prep_protocol_check(protocol, *, power_supplied=False):
     out['level'] = _prep_text(study.get('level'))
     out['study_name'] = _prep_text(study.get('name'))
     out['manifest_sha256'] = _prep_text(study.get('manifest_sha256'))
-    out['protocol_created_at'] = protocol.get('created_at')
+    # Check echoes enter the clearance content hash, so they must stay
+    # bounded and strict-JSON safe even for a tampered protocol.
+    out['protocol_created_at'] = _prep_str(protocol.get('created_at'))
     if protocol.get('kind') != DESIGN_PROTOCOL_KIND:  # noqa: F821
         _prep_fail(out, f'protocol.kind must be {DESIGN_PROTOCOL_KIND!r}')  # noqa: F821
     if protocol.get('schema') != DESIGN_PROTOCOL_SCHEMA:  # noqa: F821
@@ -541,11 +543,15 @@ def _prep_power_check(protocol, power, *, strict=True):
     if not cells:
         _prep_fail(out, 'power artifact carries no per-comparison cells')
     missing = sorted(names - set(cells))
-    extra = sorted(set(cells) - names)
+    # ``comparisons`` is untrusted artifact data: keys can be huge integers or
+    # a mix of int and str, so neither the default sort nor an f-string of the
+    # raw keys is safe.
+    extra = sorted(set(cells) - names, key=_prep_repr)
     if missing:
         _prep_fail(out, f'power artifact omits registered comparisons: {missing[:6]}')
     if extra:
-        _prep_warn(out, f'power artifact carries unregistered comparisons: {extra[:6]}')
+        _prep_warn(out, 'power artifact carries unregistered comparisons: '
+                        f'{[_prep_repr(item) for item in extra[:6]]}')
     q = out['power_q']
     min_power = out['target_power']
     q_key = f'q={q:.2f}' if q is not None else None
@@ -580,12 +586,14 @@ def _prep_power_check(protocol, power, *, strict=True):
             _prep_fail(out, f'{name}: power calibration does not record the '
                             'number of complete validation pairs')
         elif out['min_n'] is not None and n < out['min_n']:
-            _prep_fail(out, f'{name}: power calibration has n={n} complete '
-                            f'pairs, below the registered min_n={out["min_n"]}')
+            _prep_fail(out, f'{name}: power calibration has n={_prep_repr(n)} '
+                            'complete pairs, below the registered '
+                            f'min_n={_prep_repr(out["min_n"])}')
         elif out['planned_seeds'] is not None \
                 and n != out['planned_seeds']:
-            _prep_warn(out, f'{name}: power calibration uses n={n}, not the '
-                            f'planned {out["planned_seeds"]} seeds')
+            _prep_warn(out, f'{name}: power calibration uses '
+                            f'n={_prep_repr(n)}, not the planned '
+                            f'{_prep_repr(out["planned_seeds"])} seeds')
     declared_manifest = _prep_text(report.get('manifest_sha256'))
     registered_manifest = _prep_text(study.get('manifest_sha256'))
     if declared_manifest and registered_manifest \
@@ -833,7 +841,12 @@ def _prep_environment_check(environment):
                                f'{type(exc).__name__}: {exc}')
     if ident is None:
         return _prep_fail(out, 'environment object carries no identity fields')
-    out['environment_sha256'] = _prep_sha_obj(ident)
+    try:
+        out['environment_sha256'] = _prep_sha_obj(ident)
+    except (TypeError, ValueError, OverflowError, RecursionError) as exc:
+        return _prep_fail(
+            out, 'environment identity is not strict-JSON serialisable: '
+                 f'{type(exc).__name__}: {_prep_repr(exc)}')
     return out
 
 
@@ -843,8 +856,8 @@ def _prep_temporal_check(protocol, created_at):
     out = _prep_check('temporal_order', required=True)
     proto = _prep_timestamp(protocol.get('created_at'))
     clear = _prep_timestamp(created_at)
-    out['protocol_created_at'] = protocol.get('created_at')
-    out['clearance_created_at'] = created_at
+    out['protocol_created_at'] = _prep_str(protocol.get('created_at'))
+    out['clearance_created_at'] = _prep_str(created_at)
     if proto is None or clear is None:
         return _prep_warn(out, 'protocol/clearance timestamps are missing or '
                                'unparseable; their order cannot be checked',
@@ -940,7 +953,8 @@ def build_preparation_clearance(
             'level': level,
             'manifest_sha256': _prep_text(study.get('manifest_sha256')),
             'design_protocol_sha256': _prep_text(protocol.get('content_sha256')),
-            'design_protocol_created_at': protocol.get('created_at'),
+            'design_protocol_created_at':
+                _prep_str(protocol.get('created_at')),
             'code_semantics': _prep_text(study.get('code_semantics')),
         },
         'required_checks': sorted(required),
@@ -950,16 +964,21 @@ def build_preparation_clearance(
         'problems': problems,
         'warnings': warnings,
         'policy': dict(PREPARATION_CLEARANCE_POLICY),
-        'created_at': created_at,
+        'created_at': _prep_str(created_at) if created_at is not None else None,
         'revision': _prep_int(revision, minimum=0) or 0,
         'supersedes': [_prep_str(x) for x in (supersedes or [])],
         'reason': _prep_text(reason),
         'notes': _prep_text(notes),
     }
-    clearance['content_sha256'] = _prep_sha_obj(
-        {k: v for k, v in clearance.items()
-         if k not in ('created_at', 'revision', 'supersedes', 'reason',
-                      'notes', 'content_sha256')})
+    try:
+        clearance['content_sha256'] = _prep_sha_obj(
+            {k: v for k, v in clearance.items()
+             if k not in ('created_at', 'revision', 'supersedes', 'reason',
+                          'notes', 'content_sha256')})
+    except (TypeError, ValueError, OverflowError, RecursionError) as exc:
+        raise ValueError(
+            'preparation clearance is not strict-JSON serialisable: '
+            f'{type(exc).__name__}: {_prep_repr(exc)}') from None
     return clearance
 
 
@@ -1130,6 +1149,13 @@ def validate_preparation_clearance(clearance, *, protocol=None):
                 out['problems'].append(
                     'content_sha256 does not reproduce from the clearance body')
     rev = _prep_int(clearance.get('revision'), minimum=0)
+    if rev is not None:
+        try:
+            str(rev)
+        except (ValueError, MemoryError):
+            out['problems'].append(
+                'revision must be representable as a JSON integer')
+            rev = None
     if rev is None:
         out['problems'].append('revision must be an integer >= 0')
         rev = 0
@@ -1543,9 +1569,19 @@ def write_preparation_clearance(outdir, clearance, *, keep_existing=True):
         if _prep_text(clearance.get('reason')) is None:
             raise ValueError('a replacement clearance must carry a reason')
     tmp = path + '.tmp'
-    with open(tmp, 'w', encoding='utf-8') as fh:
-        json.dump(clearance, fh, ensure_ascii=False, indent=1, allow_nan=False)
-        fh.write('\n')
+    try:
+        with open(tmp, 'w', encoding='utf-8') as fh:
+            json.dump(clearance, fh, ensure_ascii=False, indent=1,
+                      allow_nan=False)
+            fh.write('\n')
+    except (TypeError, ValueError, OverflowError) as exc:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise ValueError(
+            'preparation clearance is not strict-JSON serialisable: '
+            f'{type(exc).__name__}: {_prep_repr(exc)}') from None
     os.replace(tmp, path)
     return {'written': True, 'path': path, 'conflict': False,
             'content_sha256': clearance.get('content_sha256')}

@@ -196,6 +196,22 @@ def _tx_scaled_int(count, fraction, *, rounding):
     yields an integer coverage estimate instead of raising in ``float()``.
     """
     count = int(count)
+    # A tiny Poisson fraction (1 - exp(-x) ~ x) cannot be represented as a
+    # float64, but multiplying it by a huge count can still be representable.
+    # Accept the Decimal directly instead of first flushing it to 0.0.
+    if isinstance(fraction, _tx_decimal.Decimal):
+        if (not fraction.is_finite() or fraction <= 0
+                or count <= 0):
+            return 0
+        if fraction >= 1:
+            return count
+        try:
+            with _tx_decimal.localcontext() as ctx:
+                ctx.prec = 60
+                product = _tx_decimal.Decimal(count) * fraction
+                return int(product.to_integral_value(rounding=rounding))
+        except (_tx_decimal.DecimalException, OverflowError, ValueError):
+            return None
     try:
         fraction = float(fraction)
     except (TypeError, ValueError, OverflowError):
@@ -219,7 +235,12 @@ def _tx_scaled_int(count, fraction, *, rounding):
 
 
 def _tx_ratio_fraction(num, den):
-    """``1 - exp(-num/den)`` for non-negative exact counts."""
+    """``1 - exp(-num/den)`` for non-negative exact counts.
+
+    For a tiny ratio a float64 ratio (and the resulting fraction) underflows
+    to 0.0 even though ``count * fraction`` can be representable.  Keep the
+    tiny fraction in Decimal; the scaled-int helper accepts it directly.
+    """
     try:
         n, d = int(num), int(den)
     except (TypeError, ValueError, OverflowError):
@@ -227,8 +248,21 @@ def _tx_ratio_fraction(num, den):
     if d <= 0 or n < 0:
         return None
     try:
+        with _tx_decimal.localcontext() as ctx:
+            ctx.prec = 60
+            ctx.Emin = -999999999
+            ctx.Emax = 999999999
+            ratio_dec = _tx_decimal.Decimal(n) / _tx_decimal.Decimal(d)
+            if not ratio_dec.is_finite() or ratio_dec <= 0:
+                return 0.0
+            if ratio_dec > 745:
+                return 1.0
+            # 1 - exp(-x) == x * (1 - x/2 + ...); for x below this threshold
+            # the x term is accurate to well beyond the Decimal precision.
+            if ratio_dec < _tx_decimal.Decimal('1e-30'):
+                return ratio_dec
         ratio = n / d
-    except OverflowError:
+    except (OverflowError, _tx_decimal.DecimalException):
         return 1.0
     if ratio <= 0.0:
         return 0.0

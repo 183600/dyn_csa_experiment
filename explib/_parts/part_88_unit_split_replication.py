@@ -550,8 +550,12 @@ def _usr_weighted_mean(values, weights):
             _usr_math.ldexp(mant, exp - max_exp) for mant, exp in parts)
         if not _usr_math.isfinite(numer_n):
             return None
-        out = (_usr_math.ldexp(numer_n / denom_n, max_exp - w_exp)
-               / w_mant)
+        # Fold the mantissa division into the significand *before* applying
+        # the exponent.  Applying ldexp first can underflow a subnormal result
+        # to zero even though dividing by w_mant in (0.5, 1] would restore a
+        # representable value (e.g. 5e-324 weighted by itself).
+        out = _usr_math.ldexp(
+            (numer_n / denom_n) / w_mant, max_exp - w_exp)
     except (TypeError, ValueError, OverflowError, ZeroDivisionError):
         return None
     return float(out) if _usr_math.isfinite(out) else None

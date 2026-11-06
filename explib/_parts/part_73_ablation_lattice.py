@@ -180,11 +180,12 @@ def _al_seed(value, *, where):
 def _al_component(value, *, where):
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f'{where}: component names must be non-empty strings, '
-                         f'got {value!r}')
+                         f'got {_al_repr(value)}')
     name = value.strip()
     if any(ch in name for ch in '+,|,'):
         raise ValueError(
-            f'{where}: component name {name!r} contains a lattice separator')
+            f'{where}: component name {_al_repr(name)} contains a lattice '
+            'separator')
     return name
 
 
@@ -192,7 +193,7 @@ def _al_arm(value, *, where):
     """Arm ids are opaque labels; only non-empty strings are required."""
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f'{where}: arm id must be a non-empty string, '
-                         f'got {value!r}')
+                         f'got {_al_repr(value)}')
     return value.strip()
 
 
@@ -225,7 +226,7 @@ def _al_split_key(key):
                      text.replace('|', '+').replace(',', '+').split('+')
                      if part.strip())
     if isinstance(key, (frozenset, set)):
-        return tuple(sorted(key))
+        return tuple(sorted(key, key=_al_repr))
     if isinstance(key, (tuple, list)):
         return tuple(key)
     raise ValueError(
@@ -239,22 +240,22 @@ def _al_normalise_cells(cells, components, *, scale):
     norm = {}
     for key, per_seed in cells.items():
         raw_parts = _al_split_key(key)
-        parts = tuple(_al_component(p, where=f'cells[{key!r}]')
+        parts = tuple(_al_component(p, where=f'cells[{_al_repr(key)}]')
                       for p in raw_parts)
         subset = frozenset(parts)
         if len(subset) != len(parts):
-            raise ValueError(f'cells[{key!r}]: duplicate component in subset')
+            raise ValueError(f'cells[{_al_repr(key)}]: duplicate component in subset')
         if components is not None:
             unknown = sorted(set(subset) - set(components))
             if unknown:
-                raise ValueError(f'cells[{key!r}]: components not declared: '
+                raise ValueError(f'cells[{_al_repr(key)}]: components not declared: '
                                  + ', '.join(unknown))
         if subset in norm:
             raise ValueError(f'cells: duplicate subset {sorted(subset)!r} after '
                              'normalisation')
         if not isinstance(per_seed, dict):
             raise ValueError(
-                f'cells[{key!r}]: values must map seed -> measurement, got '
+                f'cells[{_al_repr(key)}]: values must map seed -> measurement, got '
                 f'{type(per_seed).__name__}')
         vals = {}
         for seed_key, val in per_seed.items():
@@ -1232,11 +1233,11 @@ def ablation_lattice_design(components=None, *, arms_by_subset=None,
                                for p in parts)
             if subset not in expected:
                 out['problems'].append(
-                    f'arms_by_subset[{key!r}]: not a subset of the declared '
+                    f'arms_by_subset[{_al_repr(key)}]: not a subset of the declared '
                     f'components {comps}')
                 continue
             try:
-                arm = _al_arm(arm, where=f'arms_by_subset[{key!r}]')
+                arm = _al_arm(arm, where=f'arms_by_subset[{_al_repr(key)}]')
             except ValueError as exc:
                 out['problems'].append(str(exc))
                 continue

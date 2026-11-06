@@ -127,7 +127,17 @@ def _de_text(value):
         text = value.strip()
         return text or None
     if isinstance(value, numbers.Integral):
-        return str(int(value))
+        out = int(value)
+        try:
+            return str(out)
+        except (ValueError, MemoryError):
+            # Arm/block/factor ids become JSON strings.  CPython 3.12 refuses
+            # to decimalise an integer beyond ~4,300 digits; report a named
+            # input error instead of leaking that conversion exception.
+            raise ValueError(
+                'integer label is too large to represent as a JSON string; '
+                f'use a string label (got a {out.bit_length()}-bit integer)'
+            ) from None
     return None
 
 
@@ -193,9 +203,15 @@ def _de_manifest_canonical_sha(manifest):
 
 
 def _de_fraction_text(value):
-    if value.denominator == 1:
-        return str(value.numerator)
-    return f'{value.numerator}/{value.denominator}'
+    try:
+        if value.denominator == 1:
+            return str(value.numerator)
+        return f'{value.numerator}/{value.denominator}'
+    except (ValueError, MemoryError):
+        raise ValueError(
+            'exact comparison weight is too large to represent as a JSON '
+            f'string (numerator has {value.numerator.bit_length()} bits)'
+        ) from None
 
 
 def _de_float(value):

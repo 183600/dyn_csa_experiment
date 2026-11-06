@@ -1036,6 +1036,10 @@ def finite_range(named_values):
 
 _SIGNFLIP_ENUM_MAX_N = 20
 _SIGNFLIP_MITM_MAX_N = 40
+# A concentrated panel (one delta at least half the total absolute mass) has a
+# bimodal null; the saddlepoint tail is badly anti-conservative there.  The
+# meet-in-the-middle count is still affordable up to this size.
+_SIGNFLIP_DOMINANT_MITM_MAX_N = 46
 
 
 def _signflip_signed_sums(values):
@@ -1225,6 +1229,17 @@ def exact_signflip_p(deltas):
         cnt = _signflip_mitm_count(d_work)
         return {'n': n, 'p': float(cnt / float(1 << n)), 'n_dropped': n_dropped,
                 'n_nonzero': n_nonzero, 'p_floor': p_floor, 'method': 'exact-mitm'}
+    if n <= _SIGNFLIP_DOMINANT_MITM_MAX_N:
+        _abs = np.abs(d_work)
+        _mass = float(_abs.sum())
+        if _mass > 0.0 and float(_abs.max()) >= 0.5 * _mass:
+            # One term dominates: the null is bimodal, where the Lugannani-
+            # Rice saddlepoint tail can be far too small (e.g. p=.66 instead
+            # of the exact 1.0).  The exact MITM count is still affordable.
+            cnt = _signflip_mitm_count(d_work)
+            return {'n': n, 'p': float(cnt / float(1 << n)),
+                    'n_dropped': n_dropped, 'n_nonzero': n_nonzero,
+                    'p_floor': p_floor, 'method': 'exact-mitm-dominant'}
     p, method = _signflip_saddlepoint_p(d_work.tolist())
     return {'n': n, 'p': float(p), 'n_dropped': n_dropped,
             'n_nonzero': n_nonzero, 'p_floor': p_floor, 'method': method}

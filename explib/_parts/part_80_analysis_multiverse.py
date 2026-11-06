@@ -185,7 +185,17 @@ def _am_feature_value(value, *, where):
     if isinstance(value, bool):
         return bool(value)
     if isinstance(value, int):
-        return int(value)
+        out = int(value)
+        try:
+            # The feature level is echoed in the strict-JSON result and in
+            # the influence table.  Reject an integer that CPython cannot
+            # decimalise here, with a named error, instead of failing inside
+            # json.dumps while the result is being assembled.
+            str(out)
+        except (ValueError, MemoryError):
+            raise ValueError(
+                f'{where}: integer is too large to represent as JSON')
+        return out
     if isinstance(value, float):
         if not _am_math.isfinite(value):
             raise ValueError(f'{where} must be finite, got {_am_repr(value)}')

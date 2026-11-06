@@ -1101,29 +1101,46 @@ def ablation_screening_analysis(cells, *, components=None,
 
 
 def _asc_forbidden_paths(value, path='', out=None, limit=50):
+    """Walk an untrusted artifact iteratively, never recursing on its depth.
+
+    A hand-written/cyclic artifact used to raise ``RecursionError`` before the
+    validator could return a failed verdict.  Keep an explicit stack and skip
+    containers already visited; the output order still matches the historical
+    depth-first walk.
+    """
     if out is None:
         out = []
-    if len(out) >= limit:
-        return out
-    if isinstance(value, dict):
-        for key, item in value.items():
-            # The artifact is untrusted (possibly hand-written) JSON.  A huge
-            # integer key can exceed CPython's integer->decimal limit while
-            # this validator is constructing the diagnostic path, so fall back
-            # to the bounded repr instead of aborting the report.
-            try:
-                name = str(key)
-            except Exception:
-                name = _asc_repr(key)
-            if name in ASC_FORBIDDEN:
-                out.append(f'{path}.{name}' if path else name)
-                if len(out) >= limit:
-                    break
-            _asc_forbidden_paths(item, f'{path}.{name}' if path else name,
-                                 out, limit)
-    elif isinstance(value, (list, tuple)):
-        for index, item in enumerate(value):
-            _asc_forbidden_paths(item, f'{path}[{index}]', out, limit)
+    stack = [(value, path)]
+    seen = set()
+    while stack and len(out) < limit:
+        node, here = stack.pop()
+        if isinstance(node, (dict, list, tuple)):
+            marker = id(node)
+            if marker in seen:
+                continue
+            seen.add(marker)
+        if isinstance(node, dict):
+            children = []
+            for key, item in node.items():
+                # The artifact is untrusted (possibly hand-written) JSON.  A
+                # huge integer key can exceed CPython's integer->decimal limit
+                # while this validator is constructing the diagnostic path,
+                # so fall back to the bounded repr instead of aborting.
+                try:
+                    name = str(key)
+                except Exception:
+                    name = _asc_repr(key)
+                child_path = f'{here}.{name}' if here else name
+                if name in ASC_FORBIDDEN:
+                    out.append(child_path)
+                    if len(out) >= limit:
+                        break
+                children.append((item, child_path))
+            # Reverse for depth-first order with a LIFO stack.
+            stack.extend(reversed(children))
+        elif isinstance(node, (list, tuple)):
+            stack.extend(reversed([(item, f'{here}[{index}]')
+                                   for index, item in enumerate(node)]))
     return out
 
 
@@ -1338,7 +1355,12 @@ def validate_ablation_screening(artifact):
                 + ', '.join(_asc_repr(key) for key in extra))
     elif stored_family is not None and not isinstance(stored_family, dict):
         out['problems'].append('artifact.result.family must be an object')
-    diffs = _asc_diff_paths(stored, replay)
+    try:
+        diffs = _asc_diff_paths(stored, replay)
+    except RecursionError:
+        out['problems'].append(
+            'artifact.result is nested too deeply to compare with a replay')
+        diffs = []
     if diffs:
         out['problems'].append(
             'artifact.result does not replay from its declared inputs: '

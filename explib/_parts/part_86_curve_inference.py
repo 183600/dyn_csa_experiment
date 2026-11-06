@@ -460,36 +460,63 @@ def _cv_exact_enumeration(D, *, alpha, margin, flatness_margin):
     scale = float(np.max(np.abs(D)))
     if not (scale > 0.0):
         raise ValueError('the complete effect matrix is exactly zero')
-    Dn = D / scale
+    # Normalise each condition by its own max-abs, not by one global scale:
+    # with rows that differ by many orders of magnitude, a global tolerance
+    # swallowed every signed sum of the small row, so its one-sided p became
+    # 1.0 and an "all conditions positive" IUT flipped to unsupported.
+    row_scale = np.max(np.abs(D), axis=1)
+    row_div = np.where(row_scale > 0.0, row_scale, 1.0)
+    Dn = D / row_div[:, None]
     obs_sums = Dn.sum(axis=1)
-    tol = CURVE_INFERENCE_TOL * max(1.0, float(np.max(np.abs(obs_sums))))
+    tol = CURVE_INFERENCE_TOL * np.maximum(1.0, np.abs(obs_sums))
+    # The range/flatness test is a location-invariant comparison across
+    # conditions, so it keeps one common scale (otherwise each row's
+    # normalisation would change the range's meaning).
+    Dg = D / scale
+    obs_sums_g = Dg.sum(axis=1)
+    range_tol = CURVE_INFERENCE_TOL * max(
+        1.0, float(np.max(np.abs(obs_sums_g))))
     total = 1 << n
     lower_counts = np.zeros(K, dtype=np.int64)
     upper_counts = np.zeros(K, dtype=np.int64)
     range_values = np.empty(total, dtype=float)
     low_counts = high_counts = None
     obs_low = obs_high = None
-    m_scale = max([scale] + [float(x) for x in (margin, flatness_margin)
-                             if x is not None])
-    Dt = D / m_scale
-    Mt = (float(margin) / m_scale if margin is not None else None)
-    Mf = (float(flatness_margin) / m_scale
-          if flatness_margin is not None else None)
+    tol_low = tol_high = None
+    Dt = Mt = None
     if margin is not None:
-        obs_low = (Dt + Mt).sum(axis=1)
-        obs_high = (Mt - Dt).sum(axis=1)
+        _margin = float(margin)
+        # Scale a condition by max(|effects|, margin) so both the effect and
+        # the equivalence shift stay in an O(1) range for the comparison.
+        m_scale_row = np.maximum(row_div, _margin)
+        Dt = D / m_scale_row[:, None]
+        Mt = _margin / m_scale_row
+        obs_low = (Dt + Mt[:, None]).sum(axis=1)
+        obs_high = (Mt[:, None] - Dt).sum(axis=1)
+        tol_low = CURVE_INFERENCE_TOL * np.maximum(1.0, np.abs(obs_low))
+        tol_high = CURVE_INFERENCE_TOL * np.maximum(1.0, np.abs(obs_high))
         low_counts = np.zeros(K, dtype=np.int64)
         high_counts = np.zeros(K, dtype=np.int64)
     pairs = []
     pair_low_counts = pair_high_counts = None
     pair_obs_low = pair_obs_high = None
-    pair_effects = None
-    if Mf is not None and K >= 2:
+    pair_tol_low = pair_tol_high = None
+    pair_effects = pair_M = None
+    if flatness_margin is not None and K >= 2:
         pairs = [(i, j) for i in range(K) for j in range(i + 1, K)]
         if len(pairs) <= CURVE_INFERENCE_MAX_PAIRS:
-            pair_effects = np.asarray([Dt[i] - Dt[j] for i, j in pairs])
-            pair_obs_low = (pair_effects + Mf).sum(axis=1)
-            pair_obs_high = (Mf - pair_effects).sum(axis=1)
+            _flat = float(flatness_margin)
+            pair_raw = np.asarray([D[i] - D[j] for i, j in pairs])
+            pair_scale = np.maximum(
+                np.max(np.abs(pair_raw), axis=1), _flat)
+            pair_effects = pair_raw / pair_scale[:, None]
+            pair_M = _flat / pair_scale
+            pair_obs_low = (pair_effects + pair_M[:, None]).sum(axis=1)
+            pair_obs_high = (pair_M[:, None] - pair_effects).sum(axis=1)
+            pair_tol_low = CURVE_INFERENCE_TOL * np.maximum(
+                1.0, np.abs(pair_obs_low))
+            pair_tol_high = CURVE_INFERENCE_TOL * np.maximum(
+                1.0, np.abs(pair_obs_high))
             pair_low_counts = np.zeros(len(pairs), dtype=np.int64)
             pair_high_counts = np.zeros(len(pairs), dtype=np.int64)
         else:
@@ -504,23 +531,24 @@ def _cv_exact_enumeration(D, *, alpha, margin, flatness_margin):
         sums = signs @ Dn.T
         lower_counts += (sums <= obs_sums + tol).sum(axis=0)
         upper_counts += (sums >= obs_sums - tol).sum(axis=0)
+        range_sums = signs @ Dg.T
         range_values[off:off + size] = (
-            (sums.max(axis=1) - sums.min(axis=1)) / float(n))
+            (range_sums.max(axis=1) - range_sums.min(axis=1)) / float(n))
         if margin is not None:
-            low = signs @ (Dt + Mt).T
-            high = signs @ (Mt - Dt).T
-            low_counts += (low >= obs_low - tol).sum(axis=0)
-            high_counts += (high >= obs_high - tol).sum(axis=0)
+            low = signs @ (Dt + Mt[:, None]).T
+            high = signs @ (Mt[:, None] - Dt).T
+            low_counts += (low >= obs_low - tol_low).sum(axis=0)
+            high_counts += (high >= obs_high - tol_high).sum(axis=0)
         if pair_effects is not None and len(pairs):
-            plow = signs @ (pair_effects + Mf).T
-            phigh = signs @ (Mf - pair_effects).T
-            pair_low_counts += (plow >= pair_obs_low - tol).sum(axis=0)
-            pair_high_counts += (phigh >= pair_obs_high - tol).sum(axis=0)
+            plow = signs @ (pair_effects + pair_M[:, None]).T
+            phigh = signs @ (pair_M[:, None] - pair_effects).T
+            pair_low_counts += (plow >= pair_obs_low - pair_tol_low).sum(axis=0)
+            pair_high_counts += (phigh >= pair_obs_high - pair_tol_high).sum(axis=0)
     p_lower = lower_counts / float(total)
     p_upper = upper_counts / float(total)
-    obs_range = float((obs_sums.max() - obs_sums.min()) / float(n))
-    p_range = float(np.count_nonzero(range_values >= obs_range - tol)
-                    / float(total))
+    obs_range = float((obs_sums_g.max() - obs_sums_g.min()) / float(n))
+    p_range = float(np.count_nonzero(
+        range_values >= obs_range - range_tol) / float(total))
     idx = min(total - 1,
               max(0, int(math.ceil((1.0 - alpha) * total)) - 1))
     range_critical = float(np.partition(range_values, idx)[idx])
@@ -1134,8 +1162,9 @@ def build_curve_inference(conditions, effects, *, seeds=None, alpha=0.05,
         'kind': CURVE_INFERENCE_KIND,
         'schema': CURVE_INFERENCE_SCHEMA,
         'created_at': (time.strftime('%Y-%m-%dT%H:%M:%S') if not created_at
-                       else str(created_at)[:80]),
-        'source': (None if source is None else str(source)[:500]),
+                       else _cv_key_text(created_at, limit=80)),
+        'source': (None if source is None
+                   else _cv_key_text(source, limit=500)),
         'inputs': inputs,
         'result': result,
     }

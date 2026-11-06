@@ -196,6 +196,12 @@ def _dp_subset_source_sha(files, relpaths):
         size = _dp_int(entry.get('bytes'), minimum=0)
         if digest is None or size is None:
             return None
+        try:
+            str(size)
+        except (ValueError, MemoryError):
+            # The path/size row is hashed as text and also echoed into the
+            # strict-JSON report; an unprintable size is a malformed tree.
+            return None
         rows.append(f'{rel}\0{size}\0{digest}\n')
     return _dp_sha_text(''.join(rows))
 
@@ -276,7 +282,8 @@ def _dp_implementation_audit(protocol, *, source_tree=None):
     out['registered'] = {
         'code_semantics': registered.get('code_semantics'),
         'analysis_source_sha256': registered.get('analysis_source_sha256'),
-        'analysis_n_files': registered.get('analysis_n_files'),
+        'analysis_n_files': _dp_json_int(
+            registered.get('analysis_n_files'), minimum=1),
         'full_source_tree_sha256': registered.get('full_source_tree_sha256'),
         'split_registry_sha256': registered.get('split_registry_sha256'),
     }
@@ -356,7 +363,7 @@ def _dp_implementation_audit(protocol, *, source_tree=None):
     # declared scope are part of the same registration.  A same-digest tree
     # with a different count means the block was edited after registration
     # (or constructed inconsistently); do not let that read as verified.
-    _reg_n = _dp_int(registered.get('analysis_n_files'), minimum=1)
+    _reg_n = _dp_json_int(registered.get('analysis_n_files'), minimum=1)
     if (_reg_n is not None and current_relpaths
             and _reg_n != len(current_relpaths)):
         out['problems'].append(
@@ -449,6 +456,23 @@ def _dp_int(value, *, minimum=None, allow_none=False):
         return None
     out = int(value)
     if minimum is not None and out < minimum:
+        return None
+    return out
+
+
+def _dp_json_int(value, *, minimum=None):
+    """Exact integer that strict JSON can spell, else None.
+
+    Counts echoed into a protocol/verdict must not turn the whole document
+    into an unserialisable object when a tampered artifact carries an integer
+    beyond CPython's decimal-conversion limit.
+    """
+    out = _dp_int(value, minimum=minimum)
+    if out is None:
+        return None
+    try:
+        str(out)
+    except (ValueError, MemoryError):
         return None
     return out
 
@@ -766,11 +790,22 @@ def build_design_protocol(
     implementation = _dp_implementation_binding(source_tree)
     stats = manifest.get('statistics')
     stats = stats if isinstance(stats, dict) else {}
+    raw_comps = manifest.get('primary_comparisons')
+    if raw_comps is None:
+        raw_comps = []
+    elif not isinstance(raw_comps, (list, tuple)):
+        raise TypeError('manifest.primary_comparisons must be a list/tuple')
     comps = []
-    for raw in (manifest.get('primary_comparisons') or []):
+    for raw in raw_comps:
         c = _dp_comparison(raw)
         if c is not None:
             comps.append(c)
+    try:
+        manifest_sha = _dp_manifest_sha(manifest)
+    except (TypeError, ValueError, OverflowError, RecursionError) as exc:
+        raise ValueError(
+            'manifest cannot be canonicalised for the protocol hash: '
+            f'{type(exc).__name__}: {_dp_repr(exc)}') from None
     arms_raw = manifest.get('arms')
     arms = []
     if isinstance(arms_raw, (list, tuple)):
@@ -832,7 +867,7 @@ def build_design_protocol(
             'name': (_dp_text(study_name) or _dp_text(manifest.get('name'))
                      or _purpose_name or 'unnamed-study'),
             'level': level,
-            'manifest_sha256': _dp_manifest_sha(manifest),
+            'manifest_sha256': manifest_sha,
             'manifest_version': manifest.get('manifest_version'),
             'declared_status': manifest.get('status'),
             'frozen_at': manifest.get('frozen_at'),
@@ -929,12 +964,32 @@ def build_design_protocol(
         },
         'extras': copy.deepcopy(extras) if isinstance(extras, dict) else None,
     }
-    protocol['commitments'] = _dp_commitments(protocol)
-    protocol['created_at'] = created_at or time.strftime('%Y-%m-%dT%H:%M:%S')
-    protocol['revision'] = _dp_int(revision, minimum=0) or 0
-    protocol['supersedes'] = list(supersedes or [])
+    try:
+        protocol['commitments'] = _dp_commitments(protocol)
+    except (TypeError, ValueError, OverflowError, RecursionError) as exc:
+        raise ValueError(
+            'protocol body is not strict-JSON serialisable: '
+            f'{type(exc).__name__}: {_dp_repr(exc)}') from None
+    protocol['created_at'] = (_dp_str(created_at) if created_at
+                              else time.strftime('%Y-%m-%dT%H:%M:%S'))
+    _revision = _dp_int(revision, minimum=0) or 0
+    try:
+        str(_revision)
+    except (ValueError, MemoryError):
+        raise ValueError(
+            'protocol.revision is too large to represent as a JSON integer'
+        ) from None
+    protocol['revision'] = _revision
+    # These fields are excluded from the content hash, so they must be made
+    # JSON-safe here (a huge int/NaN would otherwise only fail in the writer).
+    protocol['supersedes'] = [_dp_str(x) for x in (supersedes or [])]
     protocol['reason'] = _dp_text(reason)
-    protocol['content_sha256'] = design_protocol_content_sha(protocol)
+    try:
+        protocol['content_sha256'] = design_protocol_content_sha(protocol)
+    except (TypeError, ValueError, OverflowError, RecursionError) as exc:
+        raise ValueError(
+            'protocol body is not strict-JSON serialisable: '
+            f'{type(exc).__name__}: {_dp_repr(exc)}') from None
     return protocol
 
 
@@ -1128,11 +1183,11 @@ def validate_design_protocol(protocol, *, require_complete=None):
         need(False, 'sample_size.family_size must be an integer >= 1',
              missing='sample_size.family_size')
     elif comp_names and fam_n != len(comp_names):
-        _dp_problem(out, f'sample_size.family_size={fam_n} != {len(comp_names)} declared comparisons')
+        _dp_problem(out, f'sample_size.family_size={_dp_repr(fam_n)} != {len(comp_names)} declared comparisons')
     if planned is not None and min_n is not None and min_n > planned:
-        _dp_problem(out, f'sample_size.min_n={min_n} exceeds planned_seeds={planned}')
+        _dp_problem(out, f'sample_size.min_n={_dp_repr(min_n)} exceeds planned_seeds={_dp_repr(planned)}')
     if family and fam_n is not None and fam_n != len(family):
-        _dp_problem(out, f'sample_size.family_size={fam_n} != primary family size {len(family)}')
+        _dp_problem(out, f'sample_size.family_size={_dp_repr(fam_n)} != primary family size {len(family)}')
     raw_seeds = ss.get('seeds')
     if raw_seeds is not None:
         if not isinstance(raw_seeds, list):
@@ -1149,7 +1204,7 @@ def validate_design_protocol(protocol, *, require_complete=None):
                 _dp_problem(out, 'sample_size.seeds contains duplicate seed identities; '
                                  'the same seed cannot count as two independent units')
             if planned is not None and len(seed_values) != planned:
-                _dp_problem(out, f'sample_size.planned_seeds={planned} != '
+                _dp_problem(out, f'sample_size.planned_seeds={_dp_repr(planned)} != '
                                  f'len(sample_size.seeds)={len(seed_values)}')
     target_power = _dp_number(ss.get('target_power'))
     if target_power is None:
@@ -1168,13 +1223,24 @@ def validate_design_protocol(protocol, *, require_complete=None):
                              f'{_dp_repr(ss.get(_flag))}')
     if min_n is not None and fam_n is not None and alpha is not None:
         floor_at_min = _dp_resolution_floor(fam_n, min_n)
-        out['checks']['resolution_floor_at_min_n'] = floor_at_min
+        # The verdict must remain strict JSON: ``_dp_resolution_floor``
+        # deliberately returns +inf for a family too large for float64, and an
+        # infinite check value would make the whole audit unserialisable.
+        out['checks']['resolution_floor_at_min_n'] = (
+            floor_at_min if math.isfinite(floor_at_min) else None)
+        if not math.isfinite(floor_at_min):
+            _dp_problem(out, 'sample_size.family_size is too large to '
+                             'represent a finite resolution floor')
         if floor_at_min >= alpha:
-            _dp_problem(out, f'the declared min_n={min_n}/family={fam_n} has exact Holm resolution floor {floor_at_min:.6g} >= alpha={alpha:.6g}; no effect size can be significant')
+            _dp_problem(out, f'the declared min_n={_dp_repr(min_n)}/family={_dp_repr(fam_n)} has exact Holm resolution floor {floor_at_min:.6g} >= alpha={alpha:.6g}; no effect size can be significant')
         floor_at_planned = (_dp_resolution_floor(fam_n, planned)
                             if planned is not None else None)
         if floor_at_planned is not None:
-            out['checks']['resolution_floor_at_planned_n'] = floor_at_planned
+            out['checks']['resolution_floor_at_planned_n'] = (
+                floor_at_planned if math.isfinite(floor_at_planned) else None)
+            if not math.isfinite(floor_at_planned):
+                _dp_problem(out, 'planned seed count is too large to '
+                                 'represent a finite resolution floor')
         recorded_floor = _dp_number(ss.get('resolution_floor'))
         if recorded_floor is not None and floor_at_planned is not None:
             if not math.isclose(recorded_floor, floor_at_planned,
@@ -1183,7 +1249,14 @@ def validate_design_protocol(protocol, *, require_complete=None):
                               f'recomputed at planned n {floor_at_planned:.6g}')
     n_units = _dp_int(ss.get('n_eval_units'), minimum=1, allow_none=True)
     if n_units is not None:
-        out['checks']['n_eval_units'] = n_units
+        try:
+            str(n_units)
+        except (ValueError, MemoryError):
+            _dp_problem(out, 'sample_size.n_eval_units is too large to '
+                             'represent as a JSON integer')
+            n_units = None
+        else:
+            out['checks']['n_eval_units'] = n_units
 
     # ---- randomization / allocation --------------------------------------
     rnd = protocol.get('randomization')
@@ -1213,7 +1286,7 @@ def validate_design_protocol(protocol, *, require_complete=None):
         if planned and arms:
             expected = planned * len(arms)
             if len(text_cells) != expected:
-                _dp_warn(out, f'randomization.planned_cells covers {len(text_cells)} cells but planned_seeds*arms={expected}; verify the arm/seed grid')
+                _dp_warn(out, f'randomization.planned_cells covers {len(text_cells)} cells but planned_seeds*arms={_dp_repr(expected)}; verify the arm/seed grid')
         declared_seeds = ss.get('seeds')
         declared_seeds = (set(int(x) for x in declared_seeds
                               if _dp_int(x, allow_none=True) is not None)
@@ -1283,7 +1356,7 @@ def validate_design_protocol(protocol, *, require_complete=None):
         _dp_problem(out, 'analysis.alpha must equal study.alpha')
     a_fam = _dp_int(an.get('family_size'), minimum=1)
     if a_fam is not None and fam_n is not None and a_fam != fam_n:
-        _dp_problem(out, f'analysis.family_size={a_fam} != sample_size.family_size={fam_n}')
+        _dp_problem(out, f'analysis.family_size={_dp_repr(a_fam)} != sample_size.family_size={_dp_repr(fam_n)}')
     need(_dp_text(an.get('code_semantics')) is not None,
          'analysis.code_semantics is missing', missing='analysis.code_semantics')
     need(_dp_text(an.get('missing_data_policy')) is not None,
@@ -1358,7 +1431,7 @@ def validate_design_protocol(protocol, *, require_complete=None):
         need(False, 'data.test_access.max_looks must be an integer >= 1',
              missing='data.test_access.max_looks')
     elif ta_looks > int(TEST_ACCESS_POLICY['max_looks_limit']):  # noqa: F821
-        _dp_problem(out, f'data.test_access.max_looks={ta_looks} exceeds the '
+        _dp_problem(out, f'data.test_access.max_looks={_dp_repr(ta_looks)} exceeds the '
                          f'supported limit {TEST_ACCESS_POLICY["max_looks_limit"]}')  # noqa: F821
     ta_method = _dp_text(ta.get('method'))
     if ta_method is None:
@@ -1378,7 +1451,7 @@ def validate_design_protocol(protocol, *, require_complete=None):
                     'default, not an explicit statistics.test_access_policy '
                     'declaration', missing='data.test_access.declared')
     if ta_looks is not None and tl is not None and ta_looks != tl:
-        _dp_problem(out, f'stopping.test_looks={tl} != data.test_access.max_looks={ta_looks}')
+        _dp_problem(out, f'stopping.test_looks={_dp_repr(tl)} != data.test_access.max_looks={_dp_repr(ta_looks)}')
     if data.get('disjoint_declared') is False:
         _dp_problem(out, 'data.disjoint_declared is false: the test split is not disjoint from selection')
     elif data.get('disjoint_declared') is not True:
@@ -1432,8 +1505,12 @@ def validate_design_protocol(protocol, *, require_complete=None):
                 continue
             if got is None or got != want:
                 _dp_problem(out, f'commitments.{section} does not match the section body')
-    rev = _dp_int(protocol.get('revision'), minimum=0, allow_none=True)
-    if rev is None:
+    rev = _dp_json_int(protocol.get('revision'), minimum=0)
+    if protocol.get('revision') is not None and rev is None:
+        _dp_problem(out, 'revision must be an integer >= 0 representable '
+                         'as a JSON number')
+        rev = 0
+    elif rev is None:
         _dp_problem(out, 'revision must be an integer >= 0')
         rev = 0
     sup = protocol.get('supersedes')
@@ -1478,7 +1555,14 @@ def design_protocol_conformance(protocol, manifest, source_tree=None):
         return out
     study = protocol.get('study') if isinstance(protocol.get('study'), dict) else {}
     want = _dp_text(study.get('manifest_sha256'))
-    got = _dp_manifest_sha(manifest)
+    try:
+        got = _dp_manifest_sha(manifest)
+    except (TypeError, ValueError, OverflowError, RecursionError) as exc:
+        out['status'] = 'fail'
+        out['problems'].append(
+            'manifest cannot be canonicalised for comparison: '
+            f'{type(exc).__name__}: {_dp_repr(exc)}')
+        return out
     if want != got:
         out['problems'].append('study.manifest_sha256 does not match the supplied manifest body')
     stats = manifest.get('statistics') if isinstance(manifest.get('statistics'), dict) else {}
@@ -1487,7 +1571,8 @@ def design_protocol_conformance(protocol, manifest, source_tree=None):
     manifest_names = []
     for c in comps:
         if isinstance(c, dict):
-            n = _dp_text(c.get('name')) or f'{c.get("a")} - {c.get("b")}'
+            n = (_dp_text(c.get('name'))
+                 or f'{_dp_str(c.get("a"))} - {_dp_str(c.get("b"))}')
             if n:
                 manifest_names.append(n)
     proto_comps = protocol.get('comparisons')
@@ -1503,26 +1588,26 @@ def design_protocol_conformance(protocol, manifest, source_tree=None):
               if isinstance(h, dict) and h.get('id') is not None]
     raw_hyps = manifest.get('hypotheses')
     if isinstance(raw_hyps, dict) and raw_hyps:
-        if set(p_hids) != set(map(str, raw_hyps)):
+        if set(p_hids) != {_dp_str(key) for key in raw_hyps}:
             out['problems'].append(
                 'hypothesis ids do not match manifest.hypotheses')
     p_arms = protocol.get('arms') if isinstance(protocol.get('arms'), list) else []
     m_arms = manifest.get('arms') if isinstance(manifest.get('arms'), list) else []
-    if set(map(str, p_arms)) != set(map(str, m_arms)):
+    if {_dp_str(arm) for arm in p_arms} != {_dp_str(arm) for arm in m_arms}:
         out['problems'].append('arms do not match manifest.arms')
     ss = protocol.get('sample_size') if isinstance(protocol.get('sample_size'), dict) else {}
     p_n = _dp_int(ss.get('planned_seeds'), minimum=1)
     m_seeds = manifest.get('seeds')
     m_n = len(m_seeds) if isinstance(m_seeds, (list, tuple)) else None
     if p_n is not None and m_n is not None and p_n != m_n:
-        out['problems'].append(f'sample_size.planned_seeds={p_n} != manifest seed count {m_n}')
+        out['problems'].append(f'sample_size.planned_seeds={_dp_repr(p_n)} != manifest seed count {m_n}')
     p_min = _dp_int(ss.get('min_n'), minimum=1)
     m_min = _dp_int(stats.get('min_seeds_for_confirmation'), minimum=1)
     if p_min is not None and m_min is not None and p_min != m_min:
-        out['problems'].append(f'sample_size.min_n={p_min} != statistics.min_seeds_for_confirmation={m_min}')
+        out['problems'].append(f'sample_size.min_n={_dp_repr(p_min)} != statistics.min_seeds_for_confirmation={_dp_repr(m_min)}')
     p_fam = _dp_int(ss.get('family_size'), minimum=1)
     if p_fam is not None and p_fam != len(manifest_names):
-        out['problems'].append(f'sample_size.family_size={p_fam} != {len(manifest_names)} primary comparisons')
+        out['problems'].append(f'sample_size.family_size={_dp_repr(p_fam)} != {len(manifest_names)} primary comparisons')
     study_alpha = _dp_number(study.get('alpha'))
     m_alpha = _dp_number(stats.get('alpha', manifest.get('alpha')))
     if study_alpha is not None and m_alpha is not None and not math.isclose(
@@ -1550,7 +1635,7 @@ def design_protocol_conformance(protocol, manifest, source_tree=None):
         m_looks = _dp_int(ta_manifest.get('max_looks'), minimum=1)
         p_looks = _dp_int(p_ta.get('max_looks'), minimum=1)
         if m_looks is not None and p_looks is not None and m_looks != p_looks:
-            out['problems'].append(f'data.test_access.max_looks={p_looks} != manifest budget {m_looks}')
+            out['problems'].append(f'data.test_access.max_looks={_dp_repr(p_looks)} != manifest budget {_dp_repr(m_looks)}')
         m_method = _dp_text(ta_manifest.get('method'))
         p_method = _dp_text(p_ta.get('method'))
         if m_method is not None and p_method is not None and m_method != p_method:
@@ -1894,9 +1979,19 @@ def write_design_protocol(outdir, protocol, *, keep_existing=True):
         if _dp_text(protocol.get('reason')) is None:
             raise ValueError('a replacement protocol must carry a reason')
     tmp = path + '.tmp'
-    with open(tmp, 'w', encoding='utf-8') as fh:
-        json.dump(protocol, fh, ensure_ascii=False, indent=1, allow_nan=False)
-        fh.write('\n')
+    try:
+        with open(tmp, 'w', encoding='utf-8') as fh:
+            json.dump(protocol, fh, ensure_ascii=False, indent=1,
+                      allow_nan=False)
+            fh.write('\n')
+    except (TypeError, ValueError, OverflowError) as exc:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise ValueError(
+            'design protocol is not strict-JSON serialisable: '
+            f'{type(exc).__name__}: {_dp_repr(exc)}') from None
     os.replace(tmp, path)
     return {'written': True, 'path': path, 'conflict': False,
             'content_sha256': protocol.get('content_sha256')}
