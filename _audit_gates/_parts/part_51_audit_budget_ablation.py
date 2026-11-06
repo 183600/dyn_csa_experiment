@@ -19,10 +19,30 @@ _BA_GATE_DEFAULTS = (
 _ba_gate_load = _gate_load  # shared loader: unreadable/malformed == no evidence
 
 
+def _ba_gate_repr(value, limit=160):
+    """Bounded, exception-safe repr for an untrusted path/diagnostic value."""
+    try:
+        text = repr(value)
+    except Exception:
+        return f'<unrepresentable {type(value).__name__}>'
+    return text if len(text) <= limit else text[:limit - 3] + '...'
+
+
+def _ba_gate_path_text(value):
+    """Filesystem path as text, or None when the value is not usable."""
+    try:
+        return os.fsdecode(os.fspath(value))
+    except Exception:
+        return None
+
+
 def _ba_gate_resolve(path):
     if path is not None:
         if isinstance(path, (str, os.PathLike)):
-            return os.fspath(path)
+            try:
+                return os.fspath(path)
+            except Exception:
+                return None
         return None
     for candidate in _BA_GATE_DEFAULTS:
         full = os.path.join(REPO, candidate)  # noqa: F821
@@ -66,6 +86,17 @@ def audit_budget_ablation(path=None, *, verbose=True):
                  'change a frozen p/Holm/verified/confirmed verdict.'),
     }
     resolved = _ba_gate_resolve(path)
+    if path is not None and resolved is None:
+        # A caller-supplied path is untrusted too: ``os.path.exists(10**10000)``
+        # raises, and an arbitrary object is not JSON-serialisable in the
+        # report.  Fail closed before touching the filesystem.
+        out['status'] = 'fail'
+        out['problems'].append(
+            'path is not a usable filesystem path: '
+            f'{_ba_gate_repr(path)}')
+        if verbose:
+            print(json.dumps(out, ensure_ascii=False, indent=2)[:6000])
+        return out
     if resolved is None:
         out['problems'].append(
             'no budget_ablation.json artifact was found in the default '
@@ -73,6 +104,16 @@ def audit_budget_ablation(path=None, *, verbose=True):
         if verbose:
             print(json.dumps(out, ensure_ascii=False, indent=2)[:6000])
         return out
+    text = _ba_gate_path_text(resolved)
+    if text is None:
+        out['status'] = 'fail'
+        out['problems'].append(
+            'resolved artifact path is not usable: '
+            f'{_ba_gate_repr(resolved)}')
+        if verbose:
+            print(json.dumps(out, ensure_ascii=False, indent=2)[:6000])
+        return out
+    resolved = text
     out['path'] = resolved
     if not os.path.exists(resolved):
         out['problems'].append(f'{resolved}: artifact does not exist')

@@ -36,6 +36,8 @@
 # training, no split read, no PPL recomputation, no frozen p/Holm/confirmed
 # change, no CODE_SEMANTICS bump.
 
+import json
+
 BUDGET_ABLATION_KIND = 'budget_ablation'
 BUDGET_ABLATION_SCHEMA = 1
 BUDGET_ABLATION_MAX_BUDGETS = 64
@@ -97,6 +99,93 @@ def _ba_repr(value, limit=160):
     return text if len(text) <= limit else text[:limit - 3] + '...'
 
 
+def _ba_key_text(value, limit=120):
+    """Bounded text for an untrusted mapping key/path component."""
+    if isinstance(value, str):
+        return value if len(value) <= limit else value[:limit - 3] + '...'
+    try:
+        text = str(value)
+    except Exception:
+        return _ba_repr(value, limit=limit)
+    return text if len(text) <= limit else text[:limit - 3] + '...'
+
+
+def _ba_key_json(value):
+    """JSON object key without an int-to-decimal conversion limit.
+
+    Ordinary keys keep their historical ``str(key)`` spelling.  A huge integer
+    key falls back to exact hexadecimal (which CPython can always format), so
+    hashing a tampered artifact reports a mismatch instead of raising.
+    """
+    if isinstance(value, str):
+        return value
+    try:
+        return str(value)
+    except Exception:
+        if isinstance(value, int) and not isinstance(value, bool):
+            return hex(value)
+        return _ba_key_text(value)
+
+
+def _ba_text_or_repr(value, *, limit=240):
+    """Display text for untrusted metadata (a huge int must not abort)."""
+    if isinstance(value, str):
+        text = value
+    else:
+        try:
+            text = str(value)
+        except Exception:
+            text = _ba_repr(value, limit=limit)
+    return text if len(text) <= limit else text[:limit - 3] + '...'
+
+
+def _ba_jsonable_safe(value):
+    """Rewrite untrusted keys/int before :func:`_json_clean`.
+
+    An artifact is untrusted input: a hand-edited mapping key or integer can be
+    beyond CPython 3.12's integer-to-decimal conversion limit.  Hashing and
+    reporting such a body must not raise before the validator can name it.
+    Ordinary values keep their historical JSON spelling.
+    """
+    if isinstance(value, dict):
+        return {_ba_key_json(key): _ba_jsonable_safe(item)
+                for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_ba_jsonable_safe(item) for item in value]
+    if isinstance(value, np.ndarray):
+        if value.dtype.kind in 'Mm':
+            return value
+        return _ba_jsonable_safe(value.tolist())
+    if isinstance(value, np.generic):
+        if isinstance(value, (np.datetime64, np.timedelta64)):
+            return value
+        if isinstance(value, np.integer):
+            return _ba_jsonable_safe(int(value))
+        return value
+    if isinstance(value, int) and not isinstance(value, bool):
+        try:
+            str(value)
+        except (ValueError, OverflowError):
+            return {'__unprintable_int_hex__': hex(value)}
+    return value
+
+
+def _ba_strict_json_problem(label, body):
+    """A fail-closed description when ``body`` is not strict JSON, or None."""
+    try:
+        json.dumps(body, allow_nan=False)
+    except Exception as exc:
+        detail = str(exc)
+        if ('Exceeds the limit' in detail
+                or 'integer string conversion' in detail):
+            return (f'{label} carries an unrepresentable int (beyond '
+                    "CPython's decimal-conversion limit) and cannot be "
+                    'strict-JSON serialised')
+        return (f'{label} is not strict-JSON serialisable: '
+                f'{type(exc).__name__}: {_ba_repr(exc)}')
+    return None
+
+
 def _ba_text(value, name):
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f'{name} must be a non-empty string, got '
@@ -156,7 +245,7 @@ def _ba_num(value):
 
 
 def _ba_jsonable(value):
-    return _json_clean(value)  # noqa: F821 (part_08)
+    return _json_clean(_ba_jsonable_safe(value))  # noqa: F821 (part_08)
 
 
 def _ba_content_sha(artifact):
@@ -170,7 +259,7 @@ def _ba_forbidden_paths(obj, path=''):
     found = []
     if isinstance(obj, dict):
         for key, value in obj.items():
-            name = str(key)
+            name = _ba_key_text(key)
             here = f'{path}.{name}' if path else name
             if name in BUDGET_ABLATION_FORBIDDEN_KEYS:
                 found.append(here)
@@ -186,15 +275,22 @@ def _ba_normalise_design(design):
     if not isinstance(design, dict):
         raise ValueError('design must be a JSON object')
     allowed = {'budget_key', 'budgets', 'components', 'seeds', 'label', 'note'}
-    extra = sorted(set(design) - allowed, key=str)
+    extra = sorted(set(design) - allowed, key=_ba_key_text)
     if extra:
         raise ValueError('design has undeclared key(s): '
-                         + ', '.join(str(k) for k in extra))
+                         + ', '.join(_ba_key_text(k) for k in extra))
     budget_key = _ba_text(design.get('budget_key', 'steps'), 'budget_key')
     budgets_raw = design.get('budgets')
     if not isinstance(budgets_raw, (list, tuple)):
         raise ValueError('design.budgets must be a list of at least two '
                          'strictly increasing positive integers')
+    # Check the cheap length cap before validating every element, so a
+    # malformed multi-million-entry ladder fails immediately instead of
+    # consuming time proportional to its size.
+    if len(budgets_raw) > BUDGET_ABLATION_MAX_BUDGETS:
+        raise ValueError(f'design.budgets is capped at '
+                         f'{BUDGET_ABLATION_MAX_BUDGETS} points, got '
+                         f'{len(budgets_raw)}')
     budgets = []
     for index, raw in enumerate(budgets_raw):
         budgets.append(_ba_int(raw, f'design.budgets[{index}]', minimum=1,
@@ -202,9 +298,6 @@ def _ba_normalise_design(design):
     if len(budgets) < 2:
         raise ValueError('design.budgets needs at least two budgets, got '
                          f'{_ba_repr(budgets)}')
-    if len(budgets) > BUDGET_ABLATION_MAX_BUDGETS:
-        raise ValueError(f'design.budgets is capped at '
-                         f'{BUDGET_ABLATION_MAX_BUDGETS} points, got {len(budgets)}')
     if any(b <= a for a, b in zip(budgets, budgets[1:])):
         raise ValueError('design.budgets must be strictly increasing, got '
                          f'{_ba_repr(budgets)}')
@@ -221,11 +314,11 @@ def _ba_normalise_design(design):
         if not isinstance(raw, dict):
             raise ValueError(f'design.components[{index}] must be an object')
         allowed_c = {'name', 'with_arm', 'without_arm', 'note'}
-        extra_c = sorted(set(raw) - allowed_c, key=str)
+        extra_c = sorted(set(raw) - allowed_c, key=_ba_key_text)
         if extra_c:
             raise ValueError(
                 f'design.components[{index}] has undeclared key(s): '
-                + ', '.join(str(k) for k in extra_c))
+                + ', '.join(_ba_key_text(k) for k in extra_c))
         name = _ba_text(raw.get('name'), f'design.components[{index}].name')
         if name in names:
             raise ValueError(f'design.components has duplicate name {name!r}')
@@ -328,11 +421,44 @@ def _ba_cell_table(cells):
     return table, problems
 
 
+def _ba_log_budget_ratio(budget, base):
+    """``log(budget / base)`` without overflowing an intermediate float.
+
+    ``budget`` may be an exact integer far above float64's range (the design
+    caps it at ``10**4000`` for strict-JSON identity).  Dividing two such
+    integers or converting one to float raises ``OverflowError`` even though
+    the log-ratio is small and representable.  Prefer the overflow-free
+    integer quotient, and fall back to the difference of logs.
+    """
+    budget = int(budget)
+    base = int(base)
+    if budget <= 0 or base <= 0:
+        return None
+    try:
+        ratio = budget / base
+    except (OverflowError, ZeroDivisionError):
+        ratio = None
+    if ratio is not None and math.isfinite(ratio) and ratio > 0.0:
+        try:
+            value = math.log(ratio)
+        except (ValueError, OverflowError):
+            value = None
+        if value is not None and math.isfinite(value):
+            return value
+    try:
+        value = math.log(budget) - math.log(base)
+    except (ValueError, OverflowError):
+        return None
+    return value if math.isfinite(value) else None
+
+
 def _ba_slope(values, budgets):
     """OLS slope of values on log(budget / first budget)."""
     if len(values) != len(budgets) or len(values) < 2:
         return None
-    x = [math.log(float(b) / float(budgets[0])) for b in budgets]
+    x = [_ba_log_budget_ratio(b, budgets[0]) for b in budgets]
+    if any(value is None for value in x):
+        return None
     xbar = sum(x) / len(x)
     ybar = sum(values) / len(values)
     denom = sum((xi - xbar) ** 2 for xi in x)
@@ -487,6 +613,11 @@ def budget_ablation_analysis(design, cells, *, alpha=0.05, min_n=3,
         return _ba_not_estimable('; '.join(cell_problems[:4]),
                                  extra={'cell_problems': cell_problems})
     declared_seeds = norm['seeds']
+    # Index once; inferring the common seed set by rescanning the whole table
+    # for every component x budget would be cubic in the declared scale.
+    seeds_by_arm_budget = {}
+    for (arm, seed, budget) in table:
+        seeds_by_arm_budget.setdefault((arm, budget), set()).add(seed)
 
     rows = {}
     component_problems = {}
@@ -499,12 +630,12 @@ def budget_ablation_analysis(design, cells, *, alpha=0.05, min_n=3,
         else:
             per_budget = []
             for budget in budgets:
-                per_budget.append({
-                    seed for seed in
-                    (s for (arm, s, b) in table
-                     if arm == with_arm and b == budget)
-                    if (without_arm, seed, budget) in table
-                })
+                with_seeds = seeds_by_arm_budget.get((with_arm, budget))
+                without_seeds = seeds_by_arm_budget.get((without_arm, budget))
+                if with_seeds is None or without_seeds is None:
+                    per_budget.append(set())
+                else:
+                    per_budget.append(with_seeds & without_seeds)
             if not per_budget:
                 seeds = []
             else:
@@ -828,6 +959,12 @@ def _ba_same(a, b, path='result', *, rtol=1e-9, atol=1e-12, diffs=None):
             diffs.append(f'{path}: {_ba_repr(a)} != {_ba_repr(b)}')
         return diffs
     if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+        if isinstance(a, int) and isinstance(b, int):
+            # Compare exact integers directly: a valid budget above float64's
+            # range must not become "uncomparable" during replay.
+            if int(a) != int(b):
+                diffs.append(f'{path}: {_ba_repr(a)} != {_ba_repr(b)}')
+            return diffs
         try:
             if not math.isclose(float(a), float(b), rel_tol=rtol, abs_tol=atol):
                 diffs.append(f'{path}: {_ba_repr(a)} != {_ba_repr(b)}')
@@ -837,16 +974,19 @@ def _ba_same(a, b, path='result', *, rtol=1e-9, atol=1e-12, diffs=None):
         return diffs
     if isinstance(a, dict) and isinstance(b, dict):
         if set(a) != set(b):
-            missing = sorted(set(b) - set(a), key=str)
-            extra = sorted(set(a) - set(b), key=str)
+            missing = sorted(set(b) - set(a), key=_ba_key_text)
+            extra = sorted(set(a) - set(b), key=_ba_key_text)
             if missing:
                 diffs.append(f'{path}: missing keys '
-                             + ', '.join(str(k) for k in missing[:8]))
+                             + ', '.join(_ba_key_text(k)
+                                         for k in missing[:8]))
             if extra:
                 diffs.append(f'{path}: extra keys '
-                             + ', '.join(str(k) for k in extra[:8]))
-        for key in sorted(set(a) & set(b), key=str):
-            _ba_same(a[key], b[key], f'{path}.{key}', rtol=rtol, atol=atol,
+                             + ', '.join(_ba_key_text(k)
+                                         for k in extra[:8]))
+        for key in sorted(set(a) & set(b), key=_ba_key_text):
+            _ba_same(a[key], b[key],
+                     f'{path}.{_ba_key_text(key)}', rtol=rtol, atol=atol,
                      diffs=diffs)
         return diffs
     if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
@@ -940,18 +1080,97 @@ def _ba_shape_problems(inputs, result):
     if not isinstance(declared, dict):
         problems.append('inputs.design must be an object')
         return problems
-    names = [row.get('name') for row in (declared.get('components') or [])
+    declared_components = declared.get('components')
+    if not isinstance(declared_components, (list, tuple)):
+        problems.append('inputs.design.components must be a list')
+        return problems
+    names = [row.get('name') for row in declared_components
              if isinstance(row, dict)]
     if set(components) != set(names):
         problems.append('result.components does not match the declared '
                         'component names')
+    # Validate the analysis knobs that replay would consume even when the
+    # expensive replay is skipped by archive/tamper tooling.
+    try:
+        alpha = _ba_finite(inputs.get('alpha'), 'inputs.alpha')
+        if not (0.0 < alpha < 1.0):
+            raise ValueError(f'inputs.alpha must be in (0,1), got {alpha!r}')
+        _ba_int(inputs.get('min_n'), 'inputs.min_n', minimum=1)
+        _ba_finite(inputs.get('zero_tol'), 'inputs.zero_tol', nonnegative=True)
+        conf = _ba_finite(inputs.get('conf'), 'inputs.conf')
+        if not (0.0 < conf < 1.0):
+            raise ValueError(f'inputs.conf must be in (0,1), got {conf!r}')
+        margin = inputs.get('margin')
+        if margin is not None:
+            _ba_finite(margin, 'inputs.margin', positive=True)
+    except (TypeError, ValueError) as exc:
+        problems.append(f'inputs analysis parameters are malformed: {exc}')
+        alpha = None
+    # Cheap dimension checks: a hand-edited result must be rejected even when
+    # the expensive replay is skipped.  They also keep ``replay=False`` from
+    # copying an unrepresentable/tampered scalar into the verdict.
+    declared_budgets = declared.get('budgets')
+    result_budgets = result.get('budgets')
+    wanted_budgets = None
+    if isinstance(declared_budgets, (list, tuple)):
+        try:
+            wanted_budgets = [_ba_int(value, 'inputs.design.budgets[]',
+                                      minimum=1) for value in declared_budgets]
+        except (TypeError, ValueError):
+            wanted_budgets = None
+        if wanted_budgets is not None:
+            if not isinstance(result_budgets, (list, tuple)):
+                problems.append('result.budgets must be a list')
+            else:
+                try:
+                    got_budgets = [_ba_int(value, 'result.budgets[]',
+                                           minimum=1)
+                                   for value in result_budgets]
+                except (TypeError, ValueError):
+                    got_budgets = None
+                if got_budgets is not None and got_budgets != wanted_budgets:
+                    problems.append(
+                        'result.budgets does not match the declared ladder')
+    try:
+        n_estimable = _ba_int(result.get('n_estimable'),
+                              'result.n_estimable', minimum=0)
+        n_not_estimable = _ba_int(result.get('n_not_estimable'),
+                                  'result.n_not_estimable', minimum=0)
+    except (TypeError, ValueError) as exc:
+        problems.append(f'result component counts are malformed: {exc}')
+        return problems
+    if n_estimable + n_not_estimable != len(components):
+        problems.append(
+            'result.n_estimable + result.n_not_estimable must equal the '
+            'number of declared components')
+    family = result.get('family')
+    if not isinstance(family, dict):
+        problems.append('result.family must be an object')
+    else:
+        try:
+            family_m = _ba_int(family.get('m'), 'result.family.m', minimum=0)
+        except (TypeError, ValueError) as exc:
+            problems.append(f'result.family.m is malformed: {exc}')
+        else:
+            if family_m != len(declared_components):
+                problems.append(
+                    'result.family.m does not match the declared component '
+                    'count')
+        family_alpha = _ba_num(family.get('alpha'))
+        if alpha is not None:
+            if (family_alpha is None
+                    or not math.isclose(family_alpha, alpha,
+                                        rel_tol=1e-12, abs_tol=1e-15)):
+                problems.append(
+                    'result.family.alpha does not match inputs.alpha')
     for name, row in components.items():
+        label = _ba_key_text(name)
         if not isinstance(row, dict):
-            problems.append(f'result.components[{name!r}] is not an object')
+            problems.append(f'result.components[{label!r}] is not an object')
             continue
         if row.get('status') not in ('ok', 'not_estimable'):
             problems.append(
-                f'result.components[{name!r}].status is invalid')
+                f'result.components[{label!r}].status is invalid')
             continue
         if row.get('status') == 'not_estimable':
             continue
@@ -959,13 +1178,44 @@ def _ba_shape_problems(inputs, result):
                     'classification', 'single_budget_extrapolation_allowed'):
             if key not in row:
                 problems.append(
-                    f'result.components[{name!r}] is missing {key!r}')
+                    f'result.components[{label!r}] is missing {key!r}')
+        try:
+            row_n = _ba_int(row.get('n'), f'component {label} n', minimum=0)
+        except (TypeError, ValueError) as exc:
+            row_n = None
+            problems.append(f'result.components[{label!r}].n is malformed: '
+                            f'{exc}')
+        row_seeds = row.get('seeds')
+        if not isinstance(row_seeds, (list, tuple)):
+            problems.append(
+                f'result.components[{label!r}].seeds must be a list')
+        elif row_n is not None and len(row_seeds) != row_n:
+            problems.append(
+                f'result.components[{label!r}].n does not match its seeds '
+                'list length')
+        row_budgets = row.get('budgets')
+        if not isinstance(row_budgets, (list, tuple)):
+            problems.append(
+                f'result.components[{label!r}].budgets must be a list')
+        elif wanted_budgets is not None:
+            try:
+                got_row_budgets = [_ba_int(value,
+                                           f'component {label} budgets[]',
+                                           minimum=1)
+                                   for value in row_budgets]
+            except (TypeError, ValueError):
+                got_row_budgets = None
+            if (got_row_budgets is not None
+                    and got_row_budgets != wanted_budgets):
+                problems.append(
+                    f'result.components[{label!r}].budgets does not match '
+                    'the declared ladder')
         if not isinstance(row.get('per_budget'), list):
             problems.append(
-                f'result.components[{name!r}].per_budget must be a list')
+                f'result.components[{label!r}].per_budget must be a list')
         if not isinstance(row.get('log_slope'), dict):
             problems.append(
-                f'result.components[{name!r}].log_slope must be an object')
+                f'result.components[{label!r}].log_slope must be an object')
     return problems
 
 
@@ -984,12 +1234,13 @@ def validate_budget_ablation(artifact, *, replay=True):
     if not isinstance(artifact, dict):
         out['problems'].append('artifact must be a JSON object')
         return out
-    extra = sorted(set(artifact) - set(BUDGET_ABLATION_ARTIFACT_KEYS), key=str)
+    extra = sorted(set(artifact) - set(BUDGET_ABLATION_ARTIFACT_KEYS),
+                   key=_ba_key_text)
     missing = [k for k in BUDGET_ABLATION_ARTIFACT_KEYS if k not in artifact]
     if extra or missing:
         out['problems'].append(
             f'artifact keys differ from the schema: missing={missing}, '
-            'extra=[' + ', '.join(str(k) for k in extra) + ']')
+            'extra=[' + ', '.join(_ba_key_text(k) for k in extra) + ']')
     if artifact.get('kind') != BUDGET_ABLATION_KIND:
         out['problems'].append(
             f'artifact.kind must be {BUDGET_ABLATION_KIND!r}, got '
@@ -998,7 +1249,13 @@ def validate_budget_ablation(artifact, *, replay=True):
         out['problems'].append(
             f'artifact.schema must be {BUDGET_ABLATION_SCHEMA}, got '
             f'{_ba_repr(artifact.get("schema"))}')
-    forbidden = _ba_forbidden_paths(artifact)
+    try:
+        forbidden = _ba_forbidden_paths(artifact)
+    except Exception as exc:
+        out['problems'].append(
+            'artifact cannot be inspected for frozen-decision fields: '
+            f'{type(exc).__name__}: {_ba_repr(exc)}')
+        return out
     if forbidden:
         out['problems'].append(
             'artifact carries frozen-decision key(s): '
@@ -1013,7 +1270,8 @@ def validate_budget_ablation(artifact, *, replay=True):
             actual = _ba_content_sha(artifact)
         except Exception as exc:
             out['problems'].append(
-                f'content hash is not computable: {type(exc).__name__}: {exc}')
+                'content hash is not computable: '
+                f'{type(exc).__name__}: {_ba_repr(exc)}')
             actual = None
         if actual is not None and actual != recorded:
             out['problems'].append(
@@ -1022,19 +1280,44 @@ def validate_budget_ablation(artifact, *, replay=True):
     if not isinstance(inputs, dict):
         out['problems'].append('artifact.inputs must be an object')
     else:
-        extra_i = sorted(set(inputs) - set(BUDGET_ABLATION_INPUT_KEYS), key=str)
+        extra_i = sorted(set(inputs) - set(BUDGET_ABLATION_INPUT_KEYS),
+                         key=_ba_key_text)
         missing_i = [k for k in BUDGET_ABLATION_INPUT_KEYS if k not in inputs]
         if extra_i or missing_i:
             out['problems'].append(
                 f'inputs keys differ: missing={missing_i}, extra=['
-                + ', '.join(str(k) for k in extra_i) + ']')
+                + ', '.join(_ba_key_text(k) for k in extra_i) + ']')
     result = artifact.get('result')
     if not isinstance(result, dict):
         out['problems'].append('artifact.result must be an object')
     else:
-        out['result_status'] = result.get('status')
+        result_status = result.get('status')
+        out['result_status'] = (result_status if isinstance(result_status, str)
+                                else (None if result_status is None
+                                      else _ba_repr(result_status)))
     if out['problems']:
         return out
+    # Metadata excluded from the content hash is still untrusted input.  Keep
+    # the diagnostic record strictly JSON-serialisable and fail closed on a
+    # hand-edited unrepresentable/typed field.
+    if not isinstance(artifact.get('created_at'), str):
+        out['problems'].append(
+            'created_at must be a string, got '
+            f'{_ba_repr(artifact.get("created_at"))}')
+        return out
+    source = artifact.get('source')
+    if source is not None and not isinstance(source, str):
+        out['problems'].append(
+            f'source must be a string or null, got {_ba_repr(source)}')
+        return out
+    # Reject values that a strict JSON writer cannot represent (a huge
+    # integer, NaN/Infinity, or an unprintable mapping key) before copying
+    # them into the verdict, even when the expensive replay is skipped.
+    for label, body in (('inputs', inputs), ('result', result)):
+        problem = _ba_strict_json_problem(label, body)
+        if problem is not None:
+            out['problems'].append(problem)
+            return out
     problems = _ba_shape_problems(inputs, result)
     if problems:
         out['problems'].extend(problems)
@@ -1044,7 +1327,7 @@ def validate_budget_ablation(artifact, *, replay=True):
                          else ('not_estimable'
                                if result.get('status') == 'not_estimable'
                                else 'ok'))
-        out['result'] = result
+        out['result'] = _ba_jsonable(result)
         return out
     try:
         replayed = budget_ablation_analysis(
@@ -1054,7 +1337,7 @@ def validate_budget_ablation(artifact, *, replay=True):
             zero_tol=inputs['zero_tol'])
     except Exception as exc:
         out['problems'].append(
-            f'replay failed: {type(exc).__name__}: {exc}')
+            f'replay failed: {type(exc).__name__}: {_ba_repr(exc)}')
         return out
     out['replayed'] = True
     cmp = compare_budget_ablation_results(result, replayed)
@@ -1063,7 +1346,7 @@ def validate_budget_ablation(artifact, *, replay=True):
             'replayed result differs from the stored result')
         out['warnings'].extend(cmp['differences'][:8])
         return out
-    out['result'] = replayed
+    out['result'] = _ba_jsonable(replayed)
     if replayed.get('status') == 'not_estimable':
         out['status'] = 'not_estimable'
     elif replayed.get('status') == 'warnings':
@@ -1107,27 +1390,31 @@ def write_budget_ablation(path_or_dir, artifact, *, overwrite=False,
 
 def budget_ablation_markdown(result, *, title='Budget x ablation interaction'):
     """Render a compact Markdown table for one result body."""
-    title = str(title)[:240]
+    title = _ba_text_or_repr(title, limit=240)
     if not isinstance(result, dict):
         return f'**{title}**: not estimable (not an object).'
     if result.get('status') == 'not_estimable':
-        reason = str(result.get('reason') or 'no reason')[:500]
+        reason = _ba_text_or_repr(result.get('reason') or 'no reason',
+                                  limit=500)
         return f'**{title}**: not estimable — {reason}.'
     components = result.get('components')
     components = components if isinstance(components, dict) else {}
+    family = result.get('family')
+    family = family if isinstance(family, dict) else {}
     lines = [
-        f'**{title}** (`{result.get("budget_key", "budget")}`; '
-        f'n_estimable={result.get("n_estimable")}; '
-        f'family m={((result.get("family") or {}).get("m"))})', '',
+        f'**{title}** (`{_ba_text_or_repr(result.get("budget_key", "budget"))}`; '
+        f'n_estimable={_ba_text_or_repr(result.get("n_estimable"))}; '
+        f'family m={_ba_text_or_repr(family.get("m"))})', '',
         '| component | n | log-PPL slope / e-fold | 95% CI | p | p_family | '
         'classification | extrapolable |',
         '|---|---|---|---|---|---|---|---|',
     ]
     for name, row in components.items():
+        label = _ba_key_text(name)
         if not isinstance(row, dict):
             continue
         if row.get('status') != 'ok':
-            lines.append(f'| `{name}` | — | — | — | — | — | not_estimable | '
+            lines.append(f'| `{label}` | — | — | — | — | — | not_estimable | '
                          'no |')
             continue
         slope = row.get('log_slope') or {}
@@ -1136,15 +1423,22 @@ def budget_ablation_markdown(result, *, title='Budget x ablation interaction'):
         hi = slope.get('ci95_high')
         p = slope.get('p_exact_signflip')
         def _fmt(value, digits=4):
-            return '—' if value is None else f'{float(value):.{digits}g}'
+            if value is None:
+                return '—'
+            try:
+                return f'{float(value):.{digits}g}'
+            except (TypeError, ValueError, OverflowError):
+                return _ba_repr(value)
         lines.append(
-            f'| `{name}` | {row.get("n")} | {_fmt(mean)} | '
+            f'| `{label}` | {_ba_text_or_repr(row.get("n"))} | {_fmt(mean)} | '
             f'[{_fmt(lo)}, {_fmt(hi)}] | {_fmt(p)} | '
-            f'{_fmt(row.get("p_family"))} | {row.get("classification")} | '
+            f'{_fmt(row.get("p_family"))} | '
+            f'{_ba_text_or_repr(row.get("classification"))} | '
             f'{"yes" if row.get("single_budget_extrapolation_allowed") else "no"} |')
     warnings = result.get('warnings') or []
     if warnings:
-        lines.extend(['', '> ' + '; '.join(str(w)[:300] for w in warnings[:6])])
+        lines.extend(['', '> ' + '; '.join(
+            _ba_text_or_repr(w, limit=300) for w in warnings[:6])])
     return '\n'.join(lines)
 
 
@@ -1166,6 +1460,7 @@ def budget_ablation_cells_from_records(records, design):
     budgets = set(norm['budgets'])
     key = norm['budget_key']
     rows = []
+    seen = set()
     for index, raw in enumerate(records or []):
         if not isinstance(raw, dict):
             raise ValueError(f'records[{index}] must be an object')
@@ -1189,6 +1484,13 @@ def budget_ablation_cells_from_records(records, design):
             continue
         if not math.isfinite(ppl):
             continue
-        rows.append({'arm': str(arm), 'seed': int(seed_int),
-                     'budget': int(budget_int), 'ppl': ppl})
+        cell_key = (str(arm), int(seed_int), int(budget_int))
+        if cell_key in seen:
+            raise ValueError(
+                f'records[{index}]: duplicate (arm={cell_key[0]!r}, '
+                f'seed={cell_key[1]}, budget={cell_key[2]}) cell; the two '
+                'PPLs would be ambiguous')
+        seen.add(cell_key)
+        rows.append({'arm': cell_key[0], 'seed': cell_key[1],
+                     'budget': cell_key[2], 'ppl': ppl})
     return _ba_normalise_cells(rows)
