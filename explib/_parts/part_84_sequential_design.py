@@ -51,6 +51,16 @@ SEQUENTIAL_DESIGN_KIND = 'sequential_design'
 SEQUENTIAL_DESIGN_SCHEMA = 1
 SEQUENTIAL_MAX_N = 1024
 SEQUENTIAL_MAX_LOOKS = 32
+# A power curve is a display/planning summary, not a measurement array.  Cap
+# its length so an untrusted declaration cannot force one exact DP replay per
+# supplied point.
+SEQUENTIAL_MAX_POWER_CURVE = 4096
+# CPython 3.12 refuses to decimalise an integer above ~4300 digits.  Design
+# metadata is copied into a strict-JSON artifact, so values that can appear in
+# that body are bounded by the same reportable-range convention used by the
+# scale-ladder and contrast-interaction audits.  Untrusted values are still
+# *reported* (as ``<unrepresentable int>``) rather than aborting the validator.
+SEQUENTIAL_MAX_REPORTABLE_INT = 10 ** 4000
 SEQUENTIAL_SIDES = ('two', 'greater', 'less')
 SEQUENTIAL_SPENDING = ('pocock', 'obrien_fleming', 'obf', 'linear',
                        'custom', 'none')
@@ -102,12 +112,84 @@ SEQUENTIAL_DESIGN_INPUTS = (
 
 
 def _seq_repr(value, limit=160):
-    """Bounded, exception-safe repr for diagnostics."""
+    """Bounded, exception-safe repr for diagnostics.
+
+    A hand-edited artifact can contain a Python integer beyond CPython 3.12's
+    integer-to-decimal limit.  Formatting that value must not replace the
+    validation verdict with a second ``ValueError``; the fallback text keeps
+    the offending type visible.
+    """
     try:
         text = repr(value)
     except Exception:
         return f'<unrepresentable {type(value).__name__}>'
     return text if len(text) <= limit else text[:limit - 3] + '...'
+
+
+def _seq_key_text(value, limit=120):
+    """Bounded text for an untrusted mapping key/path component.
+
+    ``str(10**10000)`` raises in CPython 3.12 and a mixed int/str key set
+    cannot be ``sorted()``.  Ordinary keys keep their historical ``str(key)``
+    spelling, so diagnostics do not change for valid artifacts.
+    """
+    if isinstance(value, str):
+        return value if len(value) <= limit else value[:limit - 3] + '...'
+    try:
+        text = str(value)
+    except Exception:
+        return _seq_repr(value, limit=limit)
+    return text if len(text) <= limit else text[:limit - 3] + '...'
+
+
+def _seq_key_json(value):
+    """JSON object key without an int->decimal conversion limit.
+
+    Ordinary keys keep their historical ``str(key)`` spelling.  A huge integer
+    key falls back to exact hexadecimal (which CPython can always format), so
+    hashing a tampered artifact reports a mismatch instead of raising.
+    """
+    if isinstance(value, str):
+        return value
+    try:
+        return str(value)
+    except Exception:
+        if isinstance(value, int) and not isinstance(value, bool):
+            return hex(value)
+        return _seq_key_text(value)
+
+
+def _seq_text_or_repr(value, *, limit=240):
+    """Display text for untrusted metadata (a huge int must not abort)."""
+    if isinstance(value, str):
+        text = value
+    else:
+        try:
+            text = str(value)
+        except Exception:
+            text = _seq_repr(value, limit=limit)
+    return text if len(text) <= limit else text[:limit - 3] + '...'
+
+
+def _seq_jsonable(value):
+    """Convert a nested mapping/list to strict-JSON safe Python objects."""
+    if isinstance(value, dict):
+        return {_seq_key_json(k): _seq_jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_seq_jsonable(v) for v in value]
+    if isinstance(value, np.ndarray):
+        return _seq_jsonable(value.tolist())
+    if isinstance(value, np.generic):
+        return _seq_jsonable(value.item())
+    if isinstance(value, int) and not isinstance(value, bool):
+        try:
+            str(value)
+        except (ValueError, OverflowError):
+            # A tampered artifact can carry an integer beyond CPython's
+            # decimal-conversion limit.  Encode it exactly in hex so a
+            # validation/hash diagnostic can still be produced and written.
+            return {'__unprintable_int_hex__': hex(value)}
+    return value
 
 
 def _seq_int(value, name, *, minimum=None, maximum=None):
@@ -116,9 +198,11 @@ def _seq_int(value, name, *, minimum=None, maximum=None):
         raise TypeError(f'{name} must be an integer, got {type(value).__name__}')
     out = int(value)
     if minimum is not None and out < int(minimum):
-        raise ValueError(f'{name} must be >= {int(minimum)}, got {out}')
+        raise ValueError(f'{name} must be >= {_seq_repr(int(minimum))}, got '
+                         f'{_seq_repr(out)}')
     if maximum is not None and out > int(maximum):
-        raise ValueError(f'{name} must be <= {int(maximum)}, got {out}')
+        raise ValueError(f'{name} must be <= {_seq_repr(int(maximum))}, got '
+                         f'{_seq_repr(out)}')
     return out
 
 
@@ -174,8 +258,8 @@ def _seq_bool(value, name):
 
 
 def _seq_canonical(obj):
-    return json.dumps(obj, sort_keys=True, separators=(',', ':'),
-                       ensure_ascii=True, default=str)
+    return json.dumps(_seq_jsonable(obj), sort_keys=True,
+                       separators=(',', ':'), ensure_ascii=True, default=str)
 
 
 def _seq_sha(obj):
@@ -186,7 +270,12 @@ def _seq_content_sha(artifact):
     body = {k: v for k, v in artifact.items()
             if k not in ('content_sha256', 'created_at', 'revision',
                          'supersedes', 'reason')}
-    return _seq_sha(body)
+    try:
+        return _seq_sha(body)
+    except Exception as exc:  # a diagnostic must not hide behind a formatter
+        raise ValueError(
+            'artifact body is not JSON-serialisable: '
+            f'{type(exc).__name__}: {_seq_repr(exc)}') from None
 
 
 def _seq_forbidden_paths(obj, path='artifact'):
@@ -194,7 +283,7 @@ def _seq_forbidden_paths(obj, path='artifact'):
     found = []
     if isinstance(obj, dict):
         for key, value in obj.items():
-            key_text = str(key)
+            key_text = _seq_key_text(key)
             child = f'{path}.{key_text}'
             if key_text in SEQUENTIAL_DESIGN_FORBIDDEN_KEYS:
                 found.append(child)
@@ -337,15 +426,37 @@ def _seq_nominal_fractions(spending, look_sizes, alpha, sides,
 
 
 def _seq_tail_prob(n, b, sides):
-    """Exact one/two-sided tail probability of |W|>=b or W>=b at look n."""
+    """Exact one/two-sided tail probability of |W|>=b or W>=b at look n.
+
+    ``b`` is the absolute integer boundary.  ``greater`` rejects W>=b and
+    ``less`` rejects W<=-b; by symmetry both have the same probability.  The
+    support is the attainable lattice W = -n, -n+2, ..., n, so a threshold
+    with the wrong parity must be advanced before summing (e.g. n=4, b=3 is
+    P(|W|>=3) = 2/16, not 8/16).
+    """
     n = int(n)
     b = int(b)
-    if b <= 0:
-        return 1.0
-    if b > n:
-        return 0.0
+    if n < 0:
+        raise ValueError(f'n must be non-negative, got {_seq_repr(n)}')
+    if sides == 'two':
+        if b <= 0:
+            return 1.0
+        if b > n:
+            return 0.0
+        low = b
+    else:
+        # P(W >= b) for both one-sided directions.  A threshold at or below
+        # -n is certain; above n it is impossible.  b=0 (or any negative
+        # threshold) is *not* certain for a one-sided test, so do not reuse
+        # the two-sided trivial branch here.
+        if b <= -n:
+            return 1.0
+        if b > n:
+            return 0.0
+        low = max(b, -n)
+    first = low if (low - n) % 2 == 0 else low + 1
     total = 0
-    for w in range(b, n + 1, 2):
+    for w in range(first, n + 1, 2):
         total += math.comb(n, (n + w) // 2)
     prob = float(Fraction(total, 1 << n))
     return min(1.0, 2.0 * prob) if sides == 'two' else prob
@@ -385,18 +496,22 @@ def sequential_boundaries(look_sizes, *, alpha=0.05, sides='two',
     if isinstance(look_sizes, (str, bytes, bytearray)) or not isinstance(
             look_sizes, (list, tuple)):
         raise TypeError('look_sizes must be a list/tuple of integers')
+    if not look_sizes:
+        raise ValueError('look_sizes must not be empty')
+    # Check the cheap length cap before validating every element, so a
+    # malformed multi-million-entry schedule fails immediately instead of
+    # consuming memory/time proportional to its size.
+    if len(look_sizes) > SEQUENTIAL_MAX_LOOKS:
+        raise ValueError(
+            f'look_sizes has {len(look_sizes)} looks; the supported cap is '
+            f'{SEQUENTIAL_MAX_LOOKS}')
     looks = []
     for index, raw in enumerate(look_sizes):
         looks.append(_seq_int(raw, f'look_sizes[{index}]', minimum=1,
                               maximum=SEQUENTIAL_MAX_N))
-    if not looks:
-        raise ValueError('look_sizes must not be empty')
-    if len(looks) > SEQUENTIAL_MAX_LOOKS:
-        raise ValueError(
-            f'look_sizes has {len(looks)} looks; the supported cap is '
-            f'{SEQUENTIAL_MAX_LOOKS}')
     if any(b <= a for a, b in zip(looks, looks[1:])):
-        raise ValueError(f'look_sizes must be strictly increasing, got {looks!r}')
+        raise ValueError('look_sizes must be strictly increasing, got '
+                         f'{_seq_repr(looks)}')
     alpha = _seq_probability(alpha, 'alpha', lo=0.0, hi=1.0,
                              lo_open=True, hi_open=True)
     sides = _seq_text(sides, 'sides', limit=16)
@@ -589,6 +704,29 @@ def sequential_conditional_power(design, *, look, observed_w, q):
         sides = 'two'
     if not isinstance(rows, (list, tuple)) or not rows:
         raise ValueError('design has no boundary list')
+    if len(rows) > SEQUENTIAL_MAX_LOOKS:
+        raise ValueError(
+            f'design has {len(rows)} looks; the supported cap is '
+            f'{SEQUENTIAL_MAX_LOOKS}')
+    prev_n = 0
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            raise ValueError(f'boundaries[{index}] is not an object')
+        n_row = _seq_int(row.get('n'), f'boundaries[{index}].n',
+                         minimum=1, maximum=SEQUENTIAL_MAX_N)
+        if n_row <= prev_n:
+            raise ValueError(
+                'boundary look sizes must be strictly increasing, got '
+                f'n={_seq_repr(n_row)} after {prev_n}')
+        b_row = row.get('b')
+        if b_row is not None:
+            _seq_int(b_row, f'boundaries[{index}].b', minimum=1,
+                     maximum=n_row)
+        prev_n = n_row
+    sides = _seq_text(sides, 'sides', limit=16)
+    if sides not in SEQUENTIAL_SIDES:
+        raise ValueError(
+            f'sides must be one of {SEQUENTIAL_SIDES}, got {sides!r}')
     look = _seq_int(look, 'look', minimum=1, maximum=len(rows))
     if isinstance(observed_w, (bool, np.bool_)) or not isinstance(observed_w, numbers.Integral):
         raise TypeError('observed_w must be an integer sign sum')
@@ -597,9 +735,13 @@ def sequential_conditional_power(design, *, look, observed_w, q):
     index = int(look) - 1
     row = rows[index]
     n_k = int(row['n'])
+    if abs(observed_w) > n_k:
+        raise ValueError(
+            f'observed_w={_seq_repr(observed_w)} is outside [-{n_k}, {n_k}]')
     if (n_k + observed_w) % 2:
         raise ValueError(
-            f'observed_w={observed_w} has the wrong parity for n={n_k}')
+            f'observed_w={_seq_repr(observed_w)} has the wrong parity for '
+            f'n={n_k}')
     out = {
         'status': 'ok',
         'look': int(look),
@@ -651,6 +793,39 @@ def _seq_min_q_for_power(rows, sides, target_power):
     return float(hi)
 
 
+def _seq_safe_stdev(values):
+    """Sample SD with a guarded fallback for extreme finite values.
+
+    ``statistics.stdev([1.7e308, -1.7e308])`` raises ``OverflowError`` even
+    though both measurements are finite.  A true SD beyond float64 is not a
+    measured spread, so withhold it (``None``) instead of letting the raw
+    exception abort the design artifact.
+    """
+    if len(values) < 2:
+        return None
+    try:
+        out = float(statistics.stdev(values))
+    except (OverflowError, TypeError, ValueError, ZeroDivisionError):
+        out = None
+    if out is not None and math.isfinite(out):
+        return out
+    # Scale first so a representable SD is not lost to an overflowing
+    # intermediate; the product is checked again for the truly unrepresentable
+    # case.
+    try:
+        scale = max(abs(float(value)) for value in values)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(scale) or scale == 0.0:
+        return None
+    try:
+        scaled = [float(value) / scale for value in values]
+        out = float(scale * statistics.stdev(scaled))
+    except (OverflowError, TypeError, ValueError, ZeroDivisionError):
+        return None
+    return out if math.isfinite(out) else None
+
+
 def _seq_pilot_summary(deltas):
     """Sign rate and SD of a validation pilot (no test split, no imputation)."""
     if isinstance(deltas, (str, bytes, bytearray, dict)):
@@ -659,6 +834,10 @@ def _seq_pilot_summary(deltas):
         raw = list(deltas)
     except TypeError:
         raise TypeError('pilot_deltas must be an iterable of numbers') from None
+    if len(raw) > SEQUENTIAL_MAX_N * 1000:
+        raise ValueError(
+            f'pilot_deltas has {len(raw)} entries; the supported cap is '
+            f'{SEQUENTIAL_MAX_N * 1000}')
     values = []
     for index, value in enumerate(raw):
         if isinstance(value, (bool, np.bool_)):
@@ -678,7 +857,11 @@ def _seq_pilot_summary(deltas):
     negatives = int(sum(1 for x in values if x < 0.0))
     zeros = int(n - positives - negatives)
     sign_rate = float((positives + 0.5 * zeros) / n)
-    sd = float(statistics.stdev(values)) if n >= 2 else None
+    sd_raw = _seq_safe_stdev(values)
+    # A zero or unrepresentable pilot spread cannot identify an MDE; withhold
+    # it (the caller records the caveat) rather than rejecting the sign-rate
+    # declaration or emitting Infinity.
+    sd = sd_raw if (sd_raw is not None and sd_raw > 0.0) else None
     return {
         'n_pilot': int(n),
         'n_positive': positives,
@@ -686,6 +869,7 @@ def _seq_pilot_summary(deltas):
         'n_zero': zeros,
         'pilot_sign_rate': sign_rate,
         'pilot_sd': sd,
+        'pilot_sd_withheld': bool(n >= 2 and sd is None),
     }
 
 
@@ -721,14 +905,19 @@ def build_sequential_design(
     if isinstance(look_sizes, (str, bytes, bytearray)) or not isinstance(
             look_sizes, (list, tuple)):
         raise TypeError('look_sizes must be a list/tuple of integers')
+    if not look_sizes:
+        raise ValueError('look_sizes must not be empty')
+    if len(look_sizes) > SEQUENTIAL_MAX_LOOKS:
+        raise ValueError(
+            f'look_sizes has {len(look_sizes)} looks; the supported cap is '
+            f'{SEQUENTIAL_MAX_LOOKS}')
     looks = [_seq_int(v, f'look_sizes[{i}]', minimum=1,
                       maximum=SEQUENTIAL_MAX_N)
              for i, v in enumerate(look_sizes)]
-    if not looks:
-        raise ValueError('look_sizes must not be empty')
     if looks[-1] != n_max:
         raise ValueError(
-            f'the final look must equal n_max ({n_max}), got {looks[-1]}')
+            f'the final look must equal n_max ({_seq_repr(n_max)}), got '
+            f'{_seq_repr(looks[-1])}')
     alpha = _seq_probability(alpha, 'alpha', lo=0.0, hi=1.0,
                              lo_open=True, hi_open=True)
     sides = _seq_text(sides, 'sides', limit=16)
@@ -765,7 +954,8 @@ def build_sequential_design(
                 f'n_pilot={n_pilot} disagrees with pilot_deltas length '
                 f'{summary["n_pilot"]}')
     elif summary is not None:
-        n_pilot = int(summary['n_pilot'])
+        n_pilot = _seq_int(summary['n_pilot'], 'n_pilot', minimum=0,
+                           maximum=SEQUENTIAL_MAX_N * 1000)
     for _name, _value in (('pilot_n_positive', pilot_n_positive),
                           ('pilot_n_negative', pilot_n_negative),
                           ('pilot_n_zero', pilot_n_zero)):
@@ -808,6 +998,10 @@ def build_sequential_design(
     if isinstance(power_curve_q, (str, bytes, bytearray)) or not isinstance(
             power_curve_q, (list, tuple)):
         raise TypeError('power_curve_q must be a list of probabilities')
+    if len(power_curve_q) > SEQUENTIAL_MAX_POWER_CURVE:
+        raise ValueError(
+            f'power_curve_q has {len(power_curve_q)} entries; the supported '
+            f'cap is {SEQUENTIAL_MAX_POWER_CURVE}')
     curve_q = []
     for index, raw in enumerate(power_curve_q):
         value = _seq_probability(raw, f'power_curve_q[{index}]')
@@ -831,6 +1025,11 @@ def build_sequential_design(
                 core['boundaries'], q, sides)['power']) for q in curve_q
         },
     })
+    if (pilot_sd is None and n_pilot is not None
+            and int(n_pilot) >= 2):
+        result['warnings'].append(
+            'no usable pilot SD is recorded (a zero or unrepresentable '
+            'spread); the MDE fields are withheld')
     min_q = _seq_min_q_for_power(core['boundaries'], sides, target_power)
     result['min_q_for_target_power'] = (None if min_q is None else float(min_q))
     result['target_power'] = float(target_power)
@@ -913,16 +1112,25 @@ def build_sequential_design(
         'pilot_n_zero': (None if pilot_n_zero is None
                          else int(pilot_n_zero)),
     }
+    if supersedes is None:
+        supersedes = []
+    if isinstance(supersedes, (str, bytes, bytearray)) or not isinstance(
+            supersedes, (list, tuple)):
+        raise TypeError('supersedes must be a list/tuple of revision labels')
     artifact = {
         'kind': SEQUENTIAL_DESIGN_KIND,
         'schema': SEQUENTIAL_DESIGN_SCHEMA,
-        'created_at': (created_at or time.strftime('%Y-%m-%dT%H:%M:%S')),
-        'source': (None if source is None else str(source)),
+        'created_at': (time.strftime('%Y-%m-%dT%H:%M:%S') if not created_at
+                       else _seq_text_or_repr(created_at, limit=80)),
+        'source': (None if source is None
+                   else _seq_text_or_repr(source)),
         'inputs': inputs,
         'result': result,
-        'revision': _seq_int(revision, 'revision', minimum=0),
-        'supersedes': [str(x) for x in (supersedes or [])],
-        'reason': (None if reason is None else str(reason)),
+        'revision': _seq_int(revision, 'revision', minimum=0,
+                             maximum=SEQUENTIAL_MAX_REPORTABLE_INT),
+        'supersedes': [_seq_text_or_repr(x, limit=80) for x in supersedes],
+        'reason': (None if reason is None
+                   else _seq_text_or_repr(reason)),
     }
     artifact['content_sha256'] = _seq_content_sha(artifact)
     return artifact
@@ -935,31 +1143,39 @@ def _seq_compare(a, b, path='result', *, rtol=1e-9, atol=1e-12,
         differences = []
     if isinstance(a, bool) or isinstance(b, bool):
         if a != b:
-            differences.append(f'{path}: {a!r} != {b!r}')
+            differences.append(f'{path}: {_seq_repr(a)} != {_seq_repr(b)}')
         return differences
     if isinstance(a, (int, float)) and isinstance(b, (int, float)):
         if isinstance(a, int) and isinstance(b, int):
             if int(a) != int(b):
-                differences.append(f'{path}: {a!r} != {b!r}')
+                differences.append(
+                    f'{path}: {_seq_repr(a)} != {_seq_repr(b)}')
             return differences
         try:
             if not math.isclose(float(a), float(b), rel_tol=rtol,
                                 abs_tol=atol):
-                differences.append(f'{path}: {a!r} != {b!r}')
+                differences.append(
+                    f'{path}: {_seq_repr(a)} != {_seq_repr(b)}')
         except (TypeError, ValueError, OverflowError):
             if a != b:
-                differences.append(f'{path}: {a!r} != {b!r}')
+                differences.append(
+                    f'{path}: {_seq_repr(a)} != {_seq_repr(b)}')
         return differences
     if isinstance(a, dict) and isinstance(b, dict):
         if set(a) != set(b):
-            missing = sorted(set(b) - set(a))
-            extra = sorted(set(a) - set(b))
+            missing = sorted(set(b) - set(a), key=_seq_key_text)
+            extra = sorted(set(a) - set(b), key=_seq_key_text)
             if missing:
-                differences.append(f'{path}: missing keys {missing[:8]}')
+                differences.append(
+                    f'{path}: missing keys '
+                    + ', '.join(_seq_key_text(k) for k in missing[:8]))
             if extra:
-                differences.append(f'{path}: extra keys {extra[:8]}')
-        for key in sorted(set(a) & set(b), key=str):
-            _seq_compare(a[key], b[key], f'{path}.{key}', rtol=rtol,
+                differences.append(
+                    f'{path}: extra keys '
+                    + ', '.join(_seq_key_text(k) for k in extra[:8]))
+        for key in sorted(set(a) & set(b), key=_seq_key_text):
+            _seq_compare(a[key], b[key],
+                         f'{path}.{_seq_key_text(key)}', rtol=rtol,
                          atol=atol, differences=differences)
         return differences
     if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
@@ -969,9 +1185,125 @@ def _seq_compare(a, b, path='result', *, rtol=1e-9, atol=1e-12,
             _seq_compare(left, right, f'{path}[{index}]', rtol=rtol,
                          atol=atol, differences=differences)
         return differences
-    if a != b:
-        differences.append(f'{path}: {a!r} != {b!r}')
+    try:
+        same = bool(a == b)
+    except Exception:
+        same = False
+    if not same:
+        differences.append(f'{path}: {_seq_repr(a)} != {_seq_repr(b)}')
     return differences
+
+
+def _seq_shape_problems(inputs, result):
+    """Cheap structural checks shared by replay and no-replay validation.
+
+    Replaying the whole plan is the authoritative check, but ``replay=False``
+    is also used by archive/tamper tooling.  It must still reject a hand-edited
+    result (a huge integer, a wrong boundary count, an inconsistent n) instead
+    of copying it into a verdict that then cannot be serialised.
+    """
+    problems = []
+    status = result.get('status')
+    if status not in ('ok', 'not_estimable'):
+        problems.append(
+            'result.status must be "ok" or "not_estimable", got '
+            f'{_seq_repr(status)}')
+        return problems
+    try:
+        n_max = _seq_int(result.get('n_max'), 'result.n_max', minimum=2,
+                         maximum=SEQUENTIAL_MAX_N)
+        n_looks = _seq_int(result.get('n_looks'), 'result.n_looks',
+                           minimum=1, maximum=SEQUENTIAL_MAX_LOOKS)
+    except (TypeError, ValueError) as exc:
+        problems.append(f'result dimensions are malformed: {exc}')
+        return problems
+    look_sizes = result.get('look_sizes')
+    if (not isinstance(look_sizes, (list, tuple))
+            or len(look_sizes) != n_looks):
+        problems.append(
+            'result.look_sizes must be a list with n_looks entries, got '
+            f'{_seq_repr(look_sizes)}')
+        return problems
+    try:
+        normalised = [_seq_int(value, f'result.look_sizes[{index}]',
+                               minimum=1, maximum=SEQUENTIAL_MAX_N)
+                      for index, value in enumerate(look_sizes)]
+    except (TypeError, ValueError) as exc:
+        problems.append(f'result.look_sizes is malformed: {exc}')
+        return problems
+    if any(b <= a for a, b in zip(normalised, normalised[1:])):
+        problems.append('result.look_sizes must be strictly increasing, got '
+                        f'{_seq_repr(normalised)}')
+        return problems
+    if normalised[-1] != n_max:
+        problems.append(
+            f'result.look_sizes[-1]={_seq_repr(normalised[-1])} must equal '
+            f'result.n_max={_seq_repr(n_max)}')
+        return problems
+    boundaries = result.get('boundaries')
+    if (not isinstance(boundaries, (list, tuple))
+            or len(boundaries) != n_looks):
+        problems.append(
+            'result.boundaries must be a list with n_looks entries, got '
+            f'{_seq_repr(boundaries)}')
+        return problems
+    for index, row in enumerate(boundaries):
+        if not isinstance(row, dict):
+            problems.append(f'result.boundaries[{index}] is not an object')
+            return problems
+        try:
+            row_n = _seq_int(row.get('n'),
+                             f'result.boundaries[{index}].n', minimum=1,
+                             maximum=SEQUENTIAL_MAX_N)
+        except (TypeError, ValueError) as exc:
+            problems.append(f'result.boundaries[{index}].n is malformed: {exc}')
+            return problems
+        if row_n != normalised[index]:
+            problems.append(
+                f'result.boundaries[{index}].n={_seq_repr(row_n)} does not '
+                f'match result.look_sizes[{index}]={normalised[index]}')
+            return problems
+        row_b = row.get('b')
+        if row_b is not None:
+            try:
+                row_b = _seq_int(row_b, f'result.boundaries[{index}].b',
+                                 minimum=1, maximum=row_n)
+            except (TypeError, ValueError) as exc:
+                problems.append(
+                    f'result.boundaries[{index}].b is malformed: {exc}')
+                return problems
+    for field in ('fwer', 'power', 'expected_n'):
+        value = result.get(field)
+        if (isinstance(value, (bool, np.bool_))
+                or not isinstance(value, (int, float))):
+            problems.append(
+                f'result.{field} must be a finite number, got '
+                f'{_seq_repr(value)}')
+            continue
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            problems.append(
+                f'result.{field} must be a finite number, got '
+                f'{_seq_repr(value)}')
+            continue
+        if not math.isfinite(number):
+            problems.append(f'result.{field} must be finite, got '
+                            f'{_seq_repr(value)}')
+    # The cheap structure must agree with the declared inputs as well; this
+    # catches a tampered result or inputs field even when replay is skipped.
+    for input_key, result_key in (('n_max', 'n_max'),
+                                  ('look_sizes', 'look_sizes'),
+                                  ('alpha', 'alpha'),
+                                  ('sides', 'sides'),
+                                  ('spending', 'spending'),
+                                  ('family_size', 'family_size')):
+        if input_key in inputs and inputs.get(input_key) != result.get(result_key):
+            problems.append(
+                f'inputs.{input_key} disagrees with result.{result_key}: '
+                f'{_seq_repr(inputs.get(input_key))} vs '
+                f'{_seq_repr(result.get(result_key))}')
+    return problems
 
 
 def validate_sequential_design(artifact, *, replay=True):
@@ -985,7 +1317,13 @@ def validate_sequential_design(artifact, *, replay=True):
     if not isinstance(artifact, dict):
         out['problems'].append('artifact is not a JSON object')
         return out
-    forbidden = _seq_forbidden_paths(artifact)
+    try:
+        forbidden = _seq_forbidden_paths(artifact)
+    except Exception as exc:
+        out['problems'].append(
+            'artifact cannot be inspected for frozen-decision fields: '
+            f'{type(exc).__name__}: {_seq_repr(exc)}')
+        return out
     if forbidden:
         out['problems'].append(
             'artifact carries frozen-decision field(s): '
@@ -994,23 +1332,36 @@ def validate_sequential_design(artifact, *, replay=True):
     if artifact.get('kind') != SEQUENTIAL_DESIGN_KIND:
         out['problems'].append(
             f'kind must be {SEQUENTIAL_DESIGN_KIND!r}, got '
-            f'{artifact.get("kind")!r}')
+            f'{_seq_repr(artifact.get("kind"))}')
         return out
-    if artifact.get('schema') != SEQUENTIAL_DESIGN_SCHEMA:
+    schema = artifact.get('schema')
+    if isinstance(schema, (bool, np.bool_)) or schema != SEQUENTIAL_DESIGN_SCHEMA:
         out['problems'].append(
             f'schema must be {SEQUENTIAL_DESIGN_SCHEMA}, got '
-            f'{artifact.get("schema")!r}')
+            f'{_seq_repr(schema)}')
         return out
-    extra = sorted(set(artifact) - set(SEQUENTIAL_DESIGN_ARTIFACT_KEYS))
-    if extra:
+    missing = [key for key in SEQUENTIAL_DESIGN_ARTIFACT_KEYS
+               if key not in artifact]
+    extra = sorted(set(artifact) - set(SEQUENTIAL_DESIGN_ARTIFACT_KEYS),
+                   key=_seq_key_text)
+    if missing or extra:
         out['problems'].append(
-            f'artifact carries undeclared top-level key(s): {extra[:8]}')
+            'artifact keys differ from the schema: '
+            f'missing={missing}, extra=['
+            + ', '.join(_seq_key_text(key) for key in extra[:8]) + ']')
         return out
     stored_sha = artifact.get('content_sha256')
     if not isinstance(stored_sha, str) or len(stored_sha) != 64:
         out['problems'].append('content_sha256 is missing or malformed')
         return out
-    if _seq_content_sha(artifact) != stored_sha:
+    try:
+        actual_sha = _seq_content_sha(artifact)
+    except Exception as exc:
+        out['problems'].append(
+            'content_sha256 is not computable from the artifact body: '
+            f'{type(exc).__name__}: {_seq_repr(exc)}')
+        return out
+    if actual_sha != stored_sha:
         out['problems'].append(
             'content_sha256 does not match the artifact body')
         return out
@@ -1026,29 +1377,92 @@ def validate_sequential_design(artifact, *, replay=True):
     if missing:
         out['problems'].append(f'inputs is missing required key(s): {missing}')
         return out
-    extra = [key for key in inputs if key not in SEQUENTIAL_DESIGN_INPUTS]
+    extra = sorted((key for key in inputs
+                    if key not in SEQUENTIAL_DESIGN_INPUTS),
+                   key=_seq_key_text)
     if extra:
-        out['problems'].append(f'inputs carries undeclared key(s): {extra}')
+        out['problems'].append(
+            'inputs carries undeclared key(s): ['
+            + ', '.join(_seq_key_text(key) for key in extra[:8]) + ']')
+        return out
+    # Metadata excluded from the content hash is still untrusted input.  Keep
+    # the diagnostic record strictly JSON-serialisable and fail closed on a
+    # hand-edited unrepresentable/typed field.
+    if not isinstance(artifact.get('created_at'), str):
+        out['problems'].append(
+            'created_at must be a string, got '
+            f'{_seq_repr(artifact.get("created_at"))}')
+        return out
+    for field in ('source', 'reason'):
+        value = artifact.get(field)
+        if value is not None and not isinstance(value, str):
+            out['problems'].append(
+                f'{field} must be a string or null, got {_seq_repr(value)}')
+            return out
+    supersedes = artifact.get('supersedes')
+    if (not isinstance(supersedes, (list, tuple))
+            or any(not isinstance(value, str) for value in supersedes)):
+        out['problems'].append(
+            'supersedes must be a list of strings, got '
+            f'{_seq_repr(supersedes)}')
+        return out
+    try:
+        _seq_int(artifact.get('revision'), 'revision', minimum=0,
+                 maximum=SEQUENTIAL_MAX_REPORTABLE_INT)
+    except (TypeError, ValueError) as exc:
+        out['problems'].append(f'revision is malformed: {exc}')
+        return out
+    # Reject values that a strict JSON writer cannot represent (a huge
+    # integer, NaN/Infinity, or an unprintable mapping key) before copying
+    # them into the verdict, even when the expensive replay is skipped.
+    for label, body in (('inputs', inputs), ('result', result)):
+        try:
+            json.dumps(body, allow_nan=False)
+        except Exception as exc:
+            detail = str(exc)
+            if ('Exceeds the limit' in detail
+                    or 'integer string conversion' in detail):
+                out['problems'].append(
+                    f'{label} carries an unrepresentable int (beyond '
+                    'CPython\'s decimal-conversion limit) and cannot be '
+                    'strict-JSON serialised')
+            else:
+                out['problems'].append(
+                    f'{label} is not strict-JSON serialisable: '
+                    f'{type(exc).__name__}: {_seq_repr(exc)}')
+            return out
+    shape_problems = _seq_shape_problems(inputs, result)
+    if shape_problems:
+        out['problems'].extend(shape_problems)
         return out
     if not replay:
         out['status'] = 'ok'
         out['result_status'] = result.get('status')
-        out['result'] = result
+        out['result'] = _seq_jsonable(result)
         return out
     try:
         replayed = build_sequential_design(**inputs)
     except Exception as exc:
         out['problems'].append(
-            f'replay failed: {type(exc).__name__}: {exc}')
+            f'replay failed: {type(exc).__name__}: {_seq_repr(exc)}')
         return out
-    differences = _seq_compare(result, replayed['result'], 'result')
+    try:
+        differences = _seq_compare(result, replayed['result'], 'result')
+    except Exception as exc:
+        out['problems'].append(
+            'stored result cannot be compared with the replay: '
+            f'{type(exc).__name__}: {_seq_repr(exc)}')
+        return out
     if differences:
         out['problems'].append(
             'stored result differs from a full replay of the declared inputs')
         out['warnings'].extend(differences[:12])
         return out
     out['result_status'] = replayed['result'].get('status')
-    out['result'] = replayed['result']
+    try:
+        out['result'] = _seq_jsonable(replayed['result'])
+    except Exception:
+        out['result'] = replayed['result']
     out['warnings'].extend(list(replayed['result'].get('warnings') or []))
     out['status'] = ('ok' if replayed['result'].get('status') == 'ok'
                      else 'not_estimable')
@@ -1093,9 +1507,19 @@ def sequential_design_from_manifest(manifest, *, created_at=None):
     if n_max is None and isinstance(seeds, list):
         n_max = len(seeds)
     look_sizes = seq.get('look_sizes')
-    if look_sizes is None and isinstance(seeds, list) and isinstance(
-            seq.get('n_looks'), int) and seq['n_looks'] >= 1:
-        n_looks = int(seq['n_looks'])
+    n_looks = seq.get('n_looks')
+    if (look_sizes is None and isinstance(seeds, list)
+            and isinstance(n_looks, int)
+            and not isinstance(n_looks, bool) and n_looks >= 1):
+        # A declaration is untrusted input.  Materialising ``range(n_looks)``
+        # before the schedule cap is checked turns a malformed 10**9-look
+        # declaration into an OOM instead of a fail-closed error.
+        if int(n_looks) > min(len(seeds), SEQUENTIAL_MAX_LOOKS):
+            raise ValueError(
+                f'n_looks={_seq_repr(n_looks)} exceeds the supported '
+                f'look cap {SEQUENTIAL_MAX_LOOKS} or the seed count '
+                f'{len(seeds)}')
+        n_looks = int(n_looks)
         if n_looks == 1:
             look_sizes = [len(seeds)]
         else:
@@ -1159,9 +1583,16 @@ def sequential_design_from_protocol(protocol, *, created_at=None):
     family = question.get('primary_family')
     n_max = seq.get('n_max', sample.get('planned_seeds'))
     look_sizes = seq.get('look_sizes')
-    if look_sizes is None and isinstance(n_max, int) and isinstance(
-            seq.get('n_looks'), int) and seq['n_looks'] >= 1:
-        n_looks = int(seq['n_looks'])
+    n_looks = seq.get('n_looks')
+    if (look_sizes is None and isinstance(n_max, int)
+            and not isinstance(n_max, bool) and isinstance(n_looks, int)
+            and not isinstance(n_looks, bool) and n_looks >= 1):
+        if int(n_looks) > min(int(n_max), SEQUENTIAL_MAX_LOOKS):
+            raise ValueError(
+                f'n_looks={_seq_repr(n_looks)} exceeds the supported '
+                f'look cap {SEQUENTIAL_MAX_LOOKS} or n_max '
+                f'{_seq_repr(n_max)}')
+        n_looks = int(n_looks)
         if n_looks == 1:
             look_sizes = [n_max]
         else:
@@ -1203,6 +1634,14 @@ def _seq_load_json(path):
         return None
 
 
+def _seq_path_text(value):
+    """Filesystem path as a JSON-safe string, or None if unusable."""
+    try:
+        return os.fsdecode(os.fspath(value))
+    except Exception:
+        return None
+
+
 def _seq_timestamp(value):
     if not isinstance(value, str):
         return None
@@ -1232,7 +1671,15 @@ def _seq_is_study_event(event):
     """True only for an execution/look event, not an audit-report event."""
     if not isinstance(event, dict):
         return False
-    kind = str(event.get('kind') or '').strip().lower()
+    kind = event.get('kind')
+    if not isinstance(kind, str):
+        # A malformed (or unprintable-integer) kind is simply not a study
+        # event; classifying a ledger line must not abort the timing gate.
+        try:
+            kind = str(kind or '')
+        except Exception:
+            return False
+    kind = kind.strip().lower()
     return kind in ('panel_look', 'look', 'cell', 'cell_start', 'cell_end',
                     'training', 'training_run', 'run', 'experiment',
                     'phase_start', 'phase_end')
@@ -1341,6 +1788,35 @@ def sequential_design_audit(path=None, *, manifest_path=None,
                  'p/Holm/confirmed verdict'),
     }
     manifest = None
+    # A caller-supplied path is untrusted too: ``os.path.exists(10**10000)``
+    # raises, and an arbitrary object is not JSON-serialisable in the report.
+    # Normalise (or fail closed) before touching the filesystem.
+    for _name, _value in (('path', path),
+                          ('manifest_path', manifest_path),
+                          ('protocol_path', protocol_path),
+                          ('look_history_path', look_history_path),
+                          ('events_path', events_path)):
+        if _value is None:
+            continue
+        _text = _seq_path_text(_value)
+        if _text is None:
+            out['status'] = 'fail'
+            out['problems'].append(
+                f'{_name} is not a usable filesystem path: '
+                f'{_seq_repr(_value)}')
+            if verbose:
+                print(json.dumps(out, ensure_ascii=False, indent=2)[:8000])
+            return out
+        if _name == 'path':
+            path = _text
+        elif _name == 'manifest_path':
+            manifest_path = _text
+        elif _name == 'protocol_path':
+            protocol_path = _text
+        elif _name == 'look_history_path':
+            look_history_path = _text
+        else:
+            events_path = _text
     if manifest_path is None:
         default_manifest = os.path.join(root, 'confirmation_frozen.json')
         if os.path.exists(default_manifest):
@@ -1407,7 +1883,8 @@ def sequential_design_audit(path=None, *, manifest_path=None,
         if verbose:
             print(json.dumps(out, ensure_ascii=False, indent=2)[:8000])
         return out
-    out['path'] = os.fspath(resolved)
+    out['path'] = (_seq_path_text(resolved)
+                   or _seq_text_or_repr(resolved))
     if not os.path.exists(resolved):
         out['status'] = 'not_verifiable_locally'
         out['problems'].append(f'{resolved}: artifact does not exist')
@@ -1441,7 +1918,8 @@ def sequential_design_audit(path=None, *, manifest_path=None,
     if verdict.get('status') == 'not_estimable':
         out['status'] = 'not_verifiable_locally'
         out['problems'].append(
-            str(result.get('reason') or 'the design is not estimable'))
+            _seq_text_or_repr(result.get('reason')
+                              or 'the design is not estimable'))
         if verbose:
             print(json.dumps(out, ensure_ascii=False, indent=2)[:8000])
         return out
@@ -1454,8 +1932,8 @@ def sequential_design_audit(path=None, *, manifest_path=None,
             if out['n_max'] != len(seeds):
                 out['status'] = 'fail'
                 out['problems'].append(
-                    f'design n_max={out["n_max"]} does not match the '
-                    f'manifest seed count {len(seeds)}')
+                    f'design n_max={_seq_repr(out["n_max"])} does not match '
+                    f'the manifest seed count {len(seeds)}')
         else:
             out['warnings'].append(
                 'manifest has no seed list; n_max cannot be cross-checked')
@@ -1467,13 +1945,13 @@ def sequential_design_audit(path=None, *, manifest_path=None,
     if isinstance(protocol, dict):
         stopping = protocol.get('stopping')
         stopping = stopping if isinstance(stopping, dict) else {}
-        rule = str(stopping.get('rule') or '')
+        rule = _seq_text_or_repr(stopping.get('rule') or '')
         if rule == 'fixed_plan_no_optional_stopping' and (
                 out['n_looks'] or 1) > 1:
             out['status'] = 'fail'
             out['problems'].append(
                 'the protocol declares fixed_plan_no_optional_stopping but '
-                f'the plan has {out["n_looks"]} looks')
+                f'the plan has {_seq_repr(out["n_looks"])} looks')
         if isinstance(stopping.get('sequential'), dict):
             declared = True
 
@@ -1514,15 +1992,24 @@ def sequential_design_audit(path=None, *, manifest_path=None,
             if isinstance(raw, (bool, np.bool_)) or not isinstance(
                     raw, numbers.Integral):
                 continue
-            observed.append(int(raw))
+            value = int(raw)
+            if abs(value) > SEQUENTIAL_MAX_REPORTABLE_INT:
+                out['status'] = 'fail'
+                out['problems'].append(
+                    'observed look size '
+                    f'n={_seq_repr(raw)} exceeds the reportable integer '
+                    'bound; it cannot be compared with the registered '
+                    'schedule as exact JSON')
+                continue
+            observed.append(value)
         if observed:
             planned = set(out['look_sizes'] or [])
             off = sorted(set(observed) - planned)
             if off:
                 out['status'] = 'fail'
                 out['problems'].append(
-                    f'observed look size(s) {off} are not in the registered '
-                    f'schedule {sorted(planned)}')
+                    f'observed look size(s) {_seq_repr(off)} are not in the '
+                    f'registered schedule {_seq_repr(sorted(planned))}')
             out['observed_look_sizes'] = observed
     if out['status'] == 'ok' and out['warnings']:
         out['status'] = 'warnings'
