@@ -691,10 +691,15 @@ def _combined_seed_doc_ci(recs, *, n_boot=2000, seed=20261018, conf=0.95):
                 # interval.
                 lp = per_tok
                 seed_logppl = lp
-                _se_seed = lp.std(ddof=1) / math.sqrt(S)
-                _se_seed_f = float(_se_seed)
-                out['se_seed_logppl'] = (_se_seed_f
-                                         if math.isfinite(_se_seed_f) else None)
+                # ``np.std`` squares the deviations, so a finite panel whose
+                # CE is around 1e200 (representable SD, unrepresentable
+                # square) used to look unmeasurable.  Reuse the scaled helper;
+                # ordinary panels keep the historical NumPy value exactly.
+                _se_seed_sd = _scaled_std_or_raw(lp)
+                if _se_seed_sd is not None:
+                    _se_seed_f = float(_se_seed_sd / math.sqrt(S))
+                    out['se_seed_logppl'] = (_se_seed_f
+                                             if math.isfinite(_se_seed_f) else None)
                 out['n_docs'] = int(nll_mat.shape[1])
                 out['n_docs_dropped_zero_token'] = n_dropped
             elif ok.sum() == S:
@@ -737,13 +742,17 @@ def _combined_seed_doc_ci(recs, *, n_boot=2000, seed=20261018, conf=0.95):
             draws = np.empty(0, dtype=float)
         draws = draws[np.isfinite(draws)]
         if draws.size >= max(20, int(0.5 * _nb)):
-            sd = float(draws.std(ddof=1))
-            if sd < 1e-12:
-                # Identical documents: the bootstrap SD is pure float noise.
-                # Report the component as exactly zero so the ratio field is
-                # not a 1e16 number that reads like a measurement.
-                sd = 0.0
-            if math.isfinite(sd):
+            # As for the seed component, compute the SD on a scaled panel so
+            # a finite CE whose square overflows still yields its (possibly
+            # representable) spread instead of an unavailable component.
+            sd = _scaled_std_or_raw(draws)
+            if sd is not None:
+                if sd < 1e-12:
+                    # Identical documents: the bootstrap SD is pure float
+                    # noise.  Report the component as exactly zero so the
+                    # ratio field is not a 1e16 number that reads like a
+                    # measurement.
+                    sd = 0.0
                 out['se_doc_logppl'] = sd
             if out['n_docs'] is None:
                 out['n_docs'] = R
@@ -759,7 +768,10 @@ def _combined_seed_doc_ci(recs, *, n_boot=2000, seed=20261018, conf=0.95):
         return out
     se_s = out['se_seed_logppl']
     se_d = out['se_doc_logppl']
-    _se_comb = math.sqrt(se_s * se_s + se_d * se_d)
+    # ``sqrt(se_s**2 + se_d**2)`` overflows for two finite components near
+    # 1e200 although the combined SE is representable; ``hypot`` is the
+    # scale-free form of the same quantity.
+    _se_comb = math.hypot(se_s, se_d)
     out['se_combined_logppl'] = (_se_comb if math.isfinite(_se_comb) else None)
     if se_d > 0 and math.isfinite(se_s / se_d):
         out['component_ratio_seed_over_doc'] = float(se_s / se_d)
@@ -767,9 +779,10 @@ def _combined_seed_doc_ci(recs, *, n_boot=2000, seed=20261018, conf=0.95):
         tc = _t_critical(float(_conf), S - 1)
     except Exception:
         tc = None
-    _m = None
+    # ``np.mean`` sums the panel first; a finite CE vector whose sum overflows
+    # used to hide a representable center (and therefore the CI decision).
     try:
-        _m = float(seed_logppl.mean())
+        _m = _scaled_mean_or_raw(seed_logppl)
     except (TypeError, ValueError, OverflowError):
         _m = None
     if (tc is not None and math.isfinite(tc)
@@ -1158,7 +1171,16 @@ def paired_nll_two_way_bootstrap(nll_a, nll_b, n_tokens, *, n_boot=2000,
                          'representable; the two-level interval is withheld')
         return out
     delta_ppl = _scaled_mean_or_raw(_diff_ppl)
-    delta_lr = float(np.mean(ce_a - ce_b))
+    _lr_vals = np.asarray(ce_a, dtype=float) - np.asarray(ce_b, dtype=float)
+    if not np.all(np.isfinite(_lr_vals)):
+        out['reason'] = ('a per-seed token-pooled log-ratio difference is not '
+                         'representable; the two-level interval is withheld')
+        return out
+    delta_lr = _scaled_mean_or_raw(_lr_vals)
+    if not math.isfinite(delta_lr):
+        out['reason'] = ('the mean per-seed log-ratio is beyond the '
+                         'representable float range')
+        return out
     out['delta_ppl'] = delta_ppl
     out['delta_log_ratio'] = delta_lr
 

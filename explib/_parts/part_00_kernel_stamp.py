@@ -1615,8 +1615,17 @@ def _paired_nll_doc_ci_extreme(A, B, counts, conf, *,
     _diff_ppl = [_ppl_difference(ce_a[s], ce_b[s]) for s in range(S)]
     if any(v is None for v in _diff_ppl):
         return None
-    delta_ppl = float(np.mean(np.asarray(_diff_ppl, dtype=float)))
-    lr = float(np.mean(np.asarray(ce_a) - np.asarray(ce_b)))
+    _delta_vals = np.asarray(_diff_ppl, dtype=float)
+    _lr_vals = np.asarray(ce_a, dtype=float) - np.asarray(ce_b, dtype=float)
+    if not (np.all(np.isfinite(_delta_vals))
+            and np.all(np.isfinite(_lr_vals))):
+        return None
+    # The per-seed differences are representable, but their sum need not be:
+    # three near-maximum PPL differences overflow ``np.mean`` even though the
+    # mean itself is a finite measurement.  The scaled helper keeps ordinary
+    # panels bit-identical and withholds only an unrepresentable mean.
+    delta_ppl = _scaled_mean_or_raw(_delta_vals)
+    lr = _scaled_mean_or_raw(_lr_vals)
     if not (math.isfinite(delta_ppl) and math.isfinite(lr)):
         return None
     out = {'n_docs': int(D), 'n_seeds': int(S), 'conf': float(conf),
@@ -1842,8 +1851,17 @@ def _paired_nll_doc_ci(nll_a, nll_b, n_tokens, *, conf=0.95):
     _diff_ppl = [_ppl_difference(ce_a[s], ce_b[s]) for s in range(S)]
     if any(v is None for v in _diff_ppl):
         return None
-    delta_ppl = float(np.mean(np.asarray(_diff_ppl, dtype=float)))
-    lr = float(np.mean(ce_a - ce_b))
+    _delta_vals = np.asarray(_diff_ppl, dtype=float)
+    _lr_vals = np.asarray(ce_a, dtype=float) - np.asarray(ce_b, dtype=float)
+    if not (np.all(np.isfinite(_delta_vals))
+            and np.all(np.isfinite(_lr_vals))):
+        return None
+    # Same overflow-safe mean as the exact-ratio fallback: a finite per-seed
+    # difference can have an unrepresentable sum at the float limit.
+    delta_ppl = _scaled_mean_or_raw(_delta_vals)
+    lr = _scaled_mean_or_raw(_lr_vals)
+    if not (math.isfinite(delta_ppl) and math.isfinite(lr)):
+        return None
     out = {'n_docs': int(D), 'n_seeds': int(S), 'conf': float(conf),
            'delta_ppl': delta_ppl, 'delta_log_ratio': lr,
            'delta_ppl_ci95': None, 'delta_log_ratio_ci95': None,

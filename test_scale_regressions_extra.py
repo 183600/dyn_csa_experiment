@@ -609,3 +609,45 @@ def test_row_bootstrap_pools_token_columns_beyond_int64_and_nll_float64():
     assert math.isclose(row['ci95_delta_ppl'][0], expected_delta,
                         rel_tol=1e-12), row
     json.dumps(row, allow_nan=False)
+
+
+def test_combined_seed_doc_ci_scales_components_without_squaring_overflow():
+    # A finite but huge cross-entropy panel has a representable sample SD and
+    # combined SE, yet the ordinary sqrt(s**2 + d**2) and np.std paths square
+    # values around 1e200 and overflow.  The components must stay finite (and
+    # strict-JSON safe); the exponentiated CI itself is correctly unavailable
+    # because no finite PPL endpoint exists for a CE of that size.
+    for scale in (1e200, 1e308):
+        recs = []
+        for s, off in enumerate((0.0, 0.05, 0.1)):
+            nll = [scale * (1.0 + off + 0.01 * j) for j in range(4)]
+            recs.append({'variant': 'a', 'seed': s, 'ppl': 1.0,
+                         'nll_per_row': nll,
+                         'n_tokens_per_row': [1] * 4})
+        r = L._combined_seed_doc_ci(recs, n_boot=60, seed=5)
+        for key in ('se_seed_logppl', 'se_doc_logppl',
+                    'se_combined_logppl'):
+            assert r[key] is not None and math.isfinite(r[key]), (scale, key, r)
+        assert r['se_combined_logppl'] >= max(r['se_seed_logppl'],
+                                              r['se_doc_logppl']), r
+        assert r['status'] == 'ci_unavailable' and r['ci95_ppl'] is None, r
+        json.dumps(r, allow_nan=False)
+
+
+def test_paired_nll_doc_ci_mean_survives_three_maximum_ppl_differences():
+    # exp(709) is the largest finite PPL.  Three seed differences near that
+    # value are each representable, but np.mean sums them to inf.  The point
+    # estimate (and the zero-variance interval) must stay finite and strict-
+    # JSON safe; the same values exercise the exact-ratio fallback.
+    A = np.full((3, 3), 709.0)
+    B = np.zeros((3, 3))
+    tokens = [1, 1, 1]
+    expected = math.exp(709.0) - 1.0
+    assert math.isfinite(expected)
+    for got in (L._paired_nll_doc_ci(A, B, tokens),
+                L._paired_nll_doc_ci_extreme(A, B, tokens, 0.95)):
+        assert got is not None, 'a finite maximum-PPL panel was discarded'
+        assert math.isclose(got['delta_ppl'], expected, rel_tol=1e-15), got
+        assert got['delta_log_ratio'] == 709.0, got
+        assert got['delta_ppl_ci95'] == [expected, expected], got
+        json.dumps(got, allow_nan=False)
