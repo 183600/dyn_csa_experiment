@@ -395,7 +395,13 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
                          if f is not None]
                 if _vals:
                     if _trial_nll is not None and _trial_ntok is not None and _trial_ntok > 0:
-                        _expected = float(_safe_exp_ppl(_trial_nll / _trial_ntok))
+                        # The token count is exact and can exceed float64 even
+                        # when the per-token ratio is representable; a raw
+                        # float/int division raises OverflowError there.
+                        _ratio = _nll_per_token_ratio(  # noqa: F821 (part 32)
+                            _trial_nll, _trial_ntok)
+                        _expected = (float(_safe_exp_ppl(_ratio))
+                                     if _ratio is not None else float('nan'))
                         if not math.isfinite(_expected):
                             # The pooled value itself is beyond float64.  A
                             # finite reported PPL cannot equal it, and the old

@@ -1412,9 +1412,46 @@ def tuning_selection_stability(trials, metric='ppl', direction='lower_is_better'
             if not keep:
                 return {'status': 'unavailable', 'reason': f'trial has no finite values after dropping seed {drop}'}
             if _use_acc:
-                _nll = sum(acc_maps[i][s][0] for s in keep)
-                _tok = sum(acc_maps[i][s][1] for s in keep)
-                value = float(_safe_exp_ppl(_nll / _tok))
+                _pairs = [acc_maps[i][s] for s in keep]
+                _nll = sum(p[0] for p in _pairs)
+                _tok = sum(p[1] for p in _pairs)
+                _ratio = None
+                if math.isfinite(_nll) and math.isfinite(_tok) and _tok > 0.0:
+                    _ratio = _nll / _tok
+                if _ratio is None or not math.isfinite(_ratio):
+                    # A finite panel can overflow either total even though the
+                    # pooled ratio is representable.  Recover it from the
+                    # per-seed exact integer counts; a fractional token count
+                    # has no well-defined pooled denominator and stays
+                    # unavailable.
+                    try:
+                        _nlls = [float(p[0]) for p in _pairs]
+                        _toks = []
+                        for _p in _pairs:
+                            _t = float(_p[1])
+                            _ti = int(_t)
+                            if (not math.isfinite(_t) or _t <= 0.0
+                                    or float(_ti) != _t):
+                                raise ValueError('fractional token count')
+                            _toks.append(_ti)
+                        _exact_tok = True
+                    except (TypeError, ValueError, OverflowError):
+                        _exact_tok = False
+                    if _exact_tok:
+                        _ratio = _pooled_nll_ratio(  # noqa: F821 (part 32)
+                            _nlls, _toks)
+                value = (_safe_exp_ppl(_ratio)
+                         if _ratio is not None else None)
+                if value is not None:
+                    value = float(value)
+                    if not math.isfinite(value):
+                        value = None
+                if value is None:
+                    return {
+                        'status': 'unavailable',
+                        'reason': ('a leave-one-out token-pooled PPL is not '
+                                   'representable, so the selected config '
+                                   'cannot be compared')}
             else:
                 # A finite per-seed PPL panel can overflow a naive sum at the
                 # float limit; the guarded mean is scale invariant and leaves

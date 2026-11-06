@@ -288,6 +288,33 @@ def _scaled_mean_or_raw(values):
     return float(np.mean(arr))
 
 
+def _scaled_mean_axis0(values):
+    """Column-wise mean that survives an overflowing reduction along axis 0.
+
+    ``np.mean(matrix, axis=0)`` sums each column before dividing, so a finite
+    panel with large same-sign entries can report ``inf`` for a representable
+    mean.  Keep the ordinary NumPy reduction bit-for-bit and fall back to the
+    scaled one-dimensional helper only for a column whose naive mean is
+    non-finite while every entry is finite.  A NaN input (an unavailable
+    leave-one-unit-out fold, for example) keeps its existing NaN result.
+    """
+    arr = np.asarray(values, dtype=float)
+    with np.errstate(over='ignore', invalid='ignore'):
+        out = np.asarray(np.mean(arr, axis=0), dtype=float)
+    if arr.ndim != 2 or out.ndim != 1:
+        return out
+    for j in range(int(arr.shape[1])):
+        if np.isfinite(out[j]):
+            continue
+        col = arr[:, j]
+        if not np.all(np.isfinite(col)):
+            continue
+        _m = _scaled_mean_or_raw(col)
+        if _m is not None and math.isfinite(_m):
+            out[j] = _m
+    return out
+
+
 def _scaled_median_or_raw(values):
     """Median that survives extreme-but-finite magnitudes.
 

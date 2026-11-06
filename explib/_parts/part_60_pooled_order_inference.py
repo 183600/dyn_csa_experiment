@@ -785,9 +785,12 @@ def _po_extreme_pooled(A, B, counts):
     diff_ppl = [_ppl_difference(ce_a[s], ce_b[s]) for s in range(S)]
     if any(v is None for v in diff_ppl):
         return None
-    delta_ppl = float(_po_np.mean(_po_np.asarray(diff_ppl, dtype=float)))
-    delta_log = float(_po_np.mean(_po_np.asarray(ce_a)
-                                  - _po_np.asarray(ce_b)))
+    # A finite per-seed difference can have an unrepresentable sum (three
+    # near-maximum PPL differences), so use the repository's scaled mean.
+    delta_ppl = float(_scaled_mean_or_raw(  # noqa: F821 (part 32)
+        _po_np.asarray(diff_ppl, dtype=float)))
+    delta_log = float(_scaled_mean_or_raw(  # noqa: F821 (part 32)
+        _po_np.asarray(ce_a) - _po_np.asarray(ce_b)))
     if not (_po_math.isfinite(delta_ppl) and _po_math.isfinite(delta_log)):
         return None
     psi = _po_np.empty((S, D), dtype=float)
@@ -806,7 +809,9 @@ def _po_extreme_pooled(A, B, counts):
         return None
     if not (_po_np.all(_po_np.isfinite(psi)) and _po_np.all(_po_np.isfinite(q))):
         return None
-    return psi.mean(axis=0), q.mean(axis=0), delta_ppl, delta_log
+    return (_scaled_mean_axis0(psi),  # noqa: F821 (part 32)
+            _scaled_mean_axis0(q),    # noqa: F821 (part 32)
+            delta_ppl, delta_log)
 
 
 def pooled_order_inference(nll_a, nll_b, n_tokens, *, unit_ids=None,
@@ -942,8 +947,11 @@ def pooled_order_inference(nll_a, nll_b, n_tokens, *, unit_ids=None,
                 'n_units': D, 'n_seeds': S,
                 'reason': ('a per-seed token-pooled PPL difference is not '
                            'representable; the confidence readout is withheld')}
-    delta_ppl = float(_po_np.mean(_po_np.asarray(diff_ppl, dtype=float)))
-    delta_log = float(_po_np.mean(ce_a - ce_b))
+    # Same overflow-safe mean as the exact-rational fallback above.
+    delta_ppl = float(_scaled_mean_or_raw(  # noqa: F821 (part 32)
+        _po_np.asarray(diff_ppl, dtype=float)))
+    delta_log = float(_scaled_mean_or_raw(  # noqa: F821 (part 32)
+        ce_a - ce_b))
     if not (_po_math.isfinite(delta_ppl) and _po_math.isfinite(delta_log)):
         return {'kind': 'pooled_order_inference',
                 'policy_version': POOLED_ORDER_POLICY['version'],
@@ -968,7 +976,8 @@ def pooled_order_inference(nll_a, nll_b, n_tokens, *, unit_ids=None,
                 'reason': ('the cluster influence is not representable; the '
                            'design-effect readout is withheld')}
     out = pooled_order_inference_from_influence(
-        psi.mean(axis=0), q.mean(axis=0),
+        _scaled_mean_axis0(psi),  # noqa: F821 (part 32)
+        _scaled_mean_axis0(q),    # noqa: F821 (part 32)
         delta_ppl=delta_ppl, delta_log_ratio=delta_log,
         unit_ids=unit_ids, seeds=seeds, n_seeds=S,
         block_lengths=block_lengths, n_batches=n_batches, n_boot=n_boot,

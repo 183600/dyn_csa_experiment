@@ -224,8 +224,8 @@ def paired_nll_unit_influence(nll_a, nll_b, n_tokens, *, unit_ids=None,
         _loo_diff = np.where(_small,
                              eb_loo * np.expm1(loo_lr_seed),
                              ea_loo - eb_loo)
-        loo_delta = np.mean(_loo_diff, axis=0)
-        loo_lr = np.mean(loo_lr_seed, axis=0)
+        loo_delta = _scaled_mean_axis0(_loo_diff)  # noqa: F821 (part 32)
+        loo_lr = _scaled_mean_axis0(loo_lr_seed)  # noqa: F821 (part 32)
     finite = np.isfinite(loo_delta) & np.isfinite(loo_lr)
     if not np.any(finite):
         return {'kind': 'paired_unit_influence', 'available': False,
@@ -252,25 +252,27 @@ def paired_nll_unit_influence(nll_a, nll_b, n_tokens, *, unit_ids=None,
                     psi_lr[s, j] = float(ra - rb)
                 except (OverflowError, ValueError, ZeroDivisionError):
                     continue
-        psi = psi.mean(axis=0)
-        psi_lr = psi_lr.mean(axis=0)
+        psi = _scaled_mean_axis0(psi)  # noqa: F821 (part 32)
+        psi_lr = _scaled_mean_axis0(psi_lr)  # noqa: F821 (part 32)
     elif _extreme_rows:
         # Algebraically identical to the expression below; dividing the NLL
         # and the token count by the (already float) token total first keeps
         # the (A - ce*T) product representable when either factor is near the
         # float limit.
         _tok_fraction = T / total_tok
-        psi = (ea[:, None] * (A / total_tok - ce_a[:, None] * _tok_fraction[None, :])
-               - eb[:, None] * (B / total_tok - ce_b[:, None] * _tok_fraction[None, :])
-               ).mean(axis=0)
-        psi_lr = ((A / total_tok - ce_a[:, None] * _tok_fraction[None, :])
-                  - (B / total_tok - ce_b[:, None] * _tok_fraction[None, :])
-                  ).mean(axis=0)
+        psi = _scaled_mean_axis0(  # noqa: F821 (part 32)
+            ea[:, None] * (A / total_tok - ce_a[:, None] * _tok_fraction[None, :])
+            - eb[:, None] * (B / total_tok - ce_b[:, None] * _tok_fraction[None, :]))
+        psi_lr = _scaled_mean_axis0(  # noqa: F821 (part 32)
+            (A / total_tok - ce_a[:, None] * _tok_fraction[None, :])
+            - (B / total_tok - ce_b[:, None] * _tok_fraction[None, :]))
     else:
-        psi = (ea[:, None] * (A - ce_a[:, None] * T[None, :]) / total_tok
-               - eb[:, None] * (B - ce_b[:, None] * T[None, :]) / total_tok).mean(axis=0)
-        psi_lr = ((A - ce_a[:, None] * T[None, :])
-                  - (B - ce_b[:, None] * T[None, :])).mean(axis=0) / total_tok
+        psi = _scaled_mean_axis0(  # noqa: F821 (part 32)
+            ea[:, None] * (A - ce_a[:, None] * T[None, :]) / total_tok
+            - eb[:, None] * (B - ce_b[:, None] * T[None, :]) / total_tok)
+        psi_lr = _scaled_mean_axis0(  # noqa: F821 (part 32)
+            (A - ce_a[:, None] * T[None, :])
+            - (B - ce_b[:, None] * T[None, :])) / total_tok
 
     change_ppl = loo_delta - full_delta
     change_lr = loo_lr - full_lr

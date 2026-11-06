@@ -651,3 +651,65 @@ def test_paired_nll_doc_ci_mean_survives_three_maximum_ppl_differences():
         assert got['delta_log_ratio'] == 709.0, got
         assert got['delta_ppl_ci95'] == [expected, expected], got
         json.dumps(got, allow_nan=False)
+
+
+def test_pooled_order_and_unit_influence_mean_survives_maximum_ppl_differences():
+    # Three per-seed PPL differences near exp(709) overflow a plain column
+    # mean although the mean itself is representable.  Both the pooled-order
+    # readout and the leave-one-unit-out influence must keep the finite point
+    # estimate instead of declaring the panel unmeasurable.
+    pattern = np.array([-0.2, -0.1, 0.0, 0.1, 0.2, -0.15, 0.05, 0.1])
+    assert math.isclose(float(pattern.sum()), 0.0, abs_tol=1e-15)
+    A = 709.0 + np.tile(pattern, (3, 1))
+    B = np.zeros((3, 8))
+    tokens = [1] * 8
+    expected = math.exp(709.0) - 1.0
+
+    block = L.pooled_order_inference(A, B, tokens, n_boot=40, n_perm=0)
+    assert block['status'] == 'ok', block
+    assert math.isclose(block['point_ppl'], expected, rel_tol=1e-15), block
+    assert math.isclose(block['point_log_ratio'], 709.0,
+                        rel_tol=0.0, abs_tol=1e-12), block
+    json.dumps(block, allow_nan=False)
+
+    inf = L.paired_nll_unit_influence(A, B, tokens)
+    assert inf['available'] is True, inf
+    assert math.isclose(inf['full_delta_ppl'], expected,
+                        rel_tol=1e-15), inf
+    finite = [v for v in inf['loo_delta_ppl'] if v is not None]
+    assert len(finite) == 8 and all(math.isfinite(v) for v in finite), inf
+    json.dumps(inf, allow_nan=False)
+
+    # The helper preserves the ordinary NumPy column mean bit-for-bit.
+    ordinary = np.array([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
+    assert np.array_equal(L._scaled_mean_axis0(ordinary),
+                          np.mean(ordinary, axis=0))
+
+
+def test_tuning_selection_stability_recovers_overflowing_token_totals():
+    # Each seed's NLL and token count is finite, but three of them overflow a
+    # plain float sum.  The pooled ratio (1.0 here) is still representable, so
+    # the leave-one-seed-out choice must be a finite PPL and strict-JSON safe;
+    # a NaN would also make min()/max() arbitrary.
+    trials = [
+        {'config': {'arm': i},
+         'seed_ppls': {0: math.e, 1: math.e, 2: math.e},
+         'seed_nll_sum': {0: 1e308, 1: 1e308, 2: 1e308},
+         'seed_n_tokens': {0: 1e308, 1: 1e308, 2: 1e308}}
+        for i in range(3)
+    ]
+    rep = L.tuning_selection_stability(trials)
+    assert rep['status'] == 'ok', rep
+    assert all(math.isclose(c['metric'], math.e, rel_tol=1e-15)
+               for c in rep['choices']), rep
+    json.dumps(rep, allow_nan=False)
+
+    # A fractional token count has no exact pooled denominator; the scan must
+    # fail closed instead of truncating it to an integer.
+    bad = [{'config': {'arm': 0},
+            'seed_ppls': {0: 2.0, 1: 2.0, 2: 2.0},
+            'seed_nll_sum': {0: 1e308, 1: 1e308, 2: 1e308},
+            'seed_n_tokens': {0: 1.5, 1: 1.5, 2: 1.5}}]
+    rep_bad = L.tuning_selection_stability(bad)
+    assert rep_bad['status'] == 'unavailable', rep_bad
+    json.dumps(rep_bad, allow_nan=False)
