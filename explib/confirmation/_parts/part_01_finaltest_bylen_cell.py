@@ -789,6 +789,21 @@ def _by_len_shape_reason(rec, n_seq):
             if len(_dlen) != 1:
                 return (f'by_len[{_ln_i}] document vectors disagree in length '
                         f'{sorted(_dlen)}')
+            # ``eval_length_gen``/``aggregate_nll_by_document`` emit one entry
+            # per unique document id.  A duplicated id means the same document
+            # is counted twice: token sums can still partition n_tok, so the
+            # cell would pass admission while inflating the independent-unit
+            # count and understating the document bootstrap's uncertainty.
+            # Use the same fail-closed rule as the article branch below.
+            _dids = _c.get('doc_ids')
+            try:
+                _dset = set(_dids)
+            except TypeError:
+                return (f'by_len[{_ln_i}].doc_ids contains an unhashable '
+                        'entry; the document list is malformed')
+            if len(_dset) != len(_dids):
+                return (f'by_len[{_ln_i}].doc_ids contains duplicate ids; '
+                        'a document cannot be counted twice')
             _dnt = _c.get('n_tokens_per_doc')
             _dsum = 0
             for _x in _dnt:

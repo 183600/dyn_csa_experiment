@@ -1932,3 +1932,41 @@ def test_paired_design_sensitivity_planning():
     assert any('minimum attainable Holm p' in v
                for v in L.paired_design_sensitivity(6, 4)['violations'])
 
+
+def test_look_history_audit_excludes_changed_cell_arms():
+    """A factorial look with different cell arms is a different estimand.
+
+    ``_attach_look_analysis`` excludes that look; the independent audit used
+    to clear the stale-seed list and include it, recomputing a different
+    sequential family and raising a false failure at scale.
+    """
+    import contextlib
+    import io
+    import json
+    import tempfile
+
+    key = 'component::dynamic_blocking::csa_dynamic|csa_fixed||'
+
+    def _look(number, seeds, deltas, cells):
+        return {'look': number, 'contrasts': {key: {
+            'seeds': seeds, 'deltas': deltas,
+            'p_exact_signflip': L.exact_signflip_p(deltas)['p'],
+            'cells': cells}}}
+
+    hist = {'schema': 1, 'looks': [
+        _look(1, list(range(6)), [-1.0] * 6,
+              {'control|control': 'OLD'}),
+        _look(2, list(range(8)), [0.0] * 8,
+              {'control|control': 'NEW'}),
+    ]}
+    with tempfile.TemporaryDirectory() as td:
+        with open(os.path.join(td, 'look_history.json'), 'w',
+                  encoding='utf-8') as fh:
+            json.dump(hist, fh)
+        with contextlib.redirect_stdout(io.StringIO()):
+            aud = A.audit_look_history(paths=[td])
+    assert aud['status'] == 'warnings', aud
+    assert aud['n_contrasts_adjusted'] == 0, aud
+    assert any('cell arms changed across looks' in w
+               for w in aud['warnings']), aud
+

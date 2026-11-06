@@ -83,6 +83,16 @@ def test_headroom_bounded_unbounded_and_best_arm_reference():
     p = L.endpoint_headroom('ppl', 30.0, minimum_meaningful_effect=0.5)
     assert p['status'] == 'ok' and p['headroom'] == 30.0
     assert p['headroom_relative'] is None
+    # The opposite/harmful-bound distance is non-negative for both directions:
+    # lower_is_better has opposite=hi, so a signed ref-hi gap was reversed.
+    hi = L.endpoint_headroom('custom', 0.2, metric='custom',
+                             bounds=[0.0, 1.0],
+                             direction='higher_is_better')
+    lo = L.endpoint_headroom('custom', 0.8, metric='custom',
+                             bounds=[0.0, 1.0],
+                             direction='lower_is_better')
+    assert abs(hi['opposite_headroom'] - 0.2) < 1e-12, hi
+    assert abs(lo['opposite_headroom'] - 0.2) < 1e-12, lo
     # An explicitly unbounded beneficial direction is not bound-limited.
     u = L.endpoint_headroom('custom', 5.0, metric='custom',
                             bounds=[0.0, None],

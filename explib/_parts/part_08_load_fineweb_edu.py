@@ -978,10 +978,10 @@ def _stamped_artifact_path(path_or_dir, name):
 def _read_json_object_or_none(path):
     """Read a JSON object for conflict detection, or return None.
 
-    An absent, unreadable or non-object file is treated as "no comparable
-    artifact"; the writer then decides from ``overwrite``.  This mirrors the
-    historical per-writer try/except blocks and keeps conflict handling from
-    depending on the shape of a corrupt file.
+    ``None`` means "no comparable object" for an absent, unreadable or
+    non-object file; the caller must check ``os.path.exists`` separately.  A
+    present-but-unreadable path is a conflict, never a licence to replace the
+    previous bytes without ``overwrite=True``.
     """
     if not os.path.exists(path):
         return None
@@ -1023,16 +1023,33 @@ def _write_stamped_artifact(path_or_dir, artifact, *, validator, name,
         return {'status': 'invalid', 'path': None, 'problems': problems}
 
     path = _stamped_artifact_path(path_or_dir, name)
+    path_exists = os.path.exists(path)
     existing = _read_json_object_or_none(path)
-    if isinstance(existing, dict):
-        if existing.get('content_sha256') == artifact.get('content_sha256'):
-            return {'status': unchanged_status,
-                    'path': os.path.abspath(path)}
-        if not overwrite:
+    if path_exists:
+        artifact_sha = artifact.get('content_sha256')
+        if isinstance(existing, dict):
+            existing_sha = existing.get('content_sha256')
+            # A missing content digest is not evidence of equality.  The old
+            # ``None == None`` comparison treated two arbitrary digest-less
+            # objects as the same artifact and silently skipped the write.
+            if (isinstance(artifact_sha, str) and artifact_sha
+                    and existing_sha == artifact_sha):
+                return {'status': unchanged_status,
+                        'path': os.path.abspath(path)}
+            if not overwrite:
+                return {'status': 'conflict', 'path': os.path.abspath(path),
+                        'note': conflict_note or (
+                            'an artifact with different content already exists; '
+                            'pass overwrite=True to replace it')}
+        elif not overwrite:
+            # The path exists but is unreadable, deeply nested, or valid JSON
+            # that is not an object.  Treating it as absent would destroy the
+            # previous bytes (possibly a crashed/truncated measurement)
+            # without the caller asking for overwrite.  Fail closed instead.
             return {'status': 'conflict', 'path': os.path.abspath(path),
                     'note': conflict_note or (
-                        'an artifact with different content already exists; '
-                        'pass overwrite=True to replace it')}
+                        'an existing artifact at this path cannot be read as a '
+                        'JSON object; pass overwrite=True to replace it')}
     atomic_write_json(path, artifact, indent=indent)
     return {'status': 'written', 'path': os.path.abspath(path)}
 

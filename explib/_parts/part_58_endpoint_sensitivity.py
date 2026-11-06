@@ -506,7 +506,13 @@ def endpoint_headroom(endpoint=None, control_level=None, *, arm_levels=None,
     opposite = lo if higher else hi
     out['bounded_beneficial'] = beneficial is not None
     if opposite is not None:
-        out['opposite_headroom'] = _es_diff(ref, opposite)
+        # Distance from the reference to the harmful/opposite bound.  For
+        # lower_is_better ``opposite`` is the upper bound, so the signed
+        # ref-hi difference was negative; report the non-negative headroom
+        # symmetrically with the higher_is_better branch.
+        _opposite_gap = _es_diff(ref, opposite)
+        out['opposite_headroom'] = (None if _opposite_gap is None
+                                    else abs(_opposite_gap))
     if beneficial is None:
         out['status'] = 'ok'
         out['structurally_possible'] = True

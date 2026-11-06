@@ -366,3 +366,33 @@ def test_empty_joint_correction_family_is_not_estimable():
                                          'reason': 'arm absent'}})
     assert rep['status'] == 'not_estimable', rep
     assert rep['excluded'] == {'a': 'arm absent'}, rep
+
+
+def test_max_t_floor_uses_nonzero_support_not_total_seeds():
+    """Zero paired deltas are sign-invariant and reduce the exact p floor.
+
+    The max-T statistic is ``|sum(s_i d_i)| / sqrt(sum d_i**2)``.  A contrast
+    with only m non-zero deltas can reach its observed maximum under
+    2*2**(n-m) sign assignments, so its two-sided floor is 2/2**m, not
+    2/2**n.  Using the total seed count claimed resolution the panel did not
+    have.
+    """
+    n = 8
+    rows = {'a': [1.0] + [0.0] * (n - 1),
+            'b': [0.0, 1.0] + [0.0] * (n - 2),
+            'c': [0.0, 0.0, 1.0] + [0.0] * (n - 3)}
+    out = L.maxt_signflip_adjust(rows)
+    assert out['p_floor_single'] == 1.0, out
+    assert all(v['p_maxt'] == 1.0 for v in out['contrasts'].values()), out
+
+    # A one-contrast family must expose the same floor through the family
+    # correction gate, and it must not certify a Holm family as resolvable.
+    d = [1.0, 1.0, 0.0, 0.0, 0.0, 0.0]
+    exact = L.exact_signflip_p(d)
+    assert exact['p_floor'] == 0.5
+    cmp = {'a': {'per_seed': d, 'seeds': list(range(6)),
+                 'p_exact_signflip': exact['p']}}
+    fam = L.confirmation_family_correction(cmp, family_names=['a'])
+    assert fam['p_floor'] == 0.5, fam
+    assert fam['holm_gate_attainable'] is False, fam
+    assert fam['comparisons']['a']['p_maxt_score'] == exact['p'], fam

@@ -183,3 +183,95 @@ def test_empty_unit_panel_builds_a_not_estimable_artifact():
         assert verdict['status'] == 'not_estimable', (replay, verdict)
         assert verdict['problems'] == [], (replay, verdict)
         _strict_json(verdict)
+
+
+def test_skewed_token_weights_cannot_violate_min_units_per_half():
+    """A dominant unit must not collapse one half below the declared floor.
+
+    The old assignment only checked ``len(units) >= 2 * min_units_per_half``
+    before the greedy balance.  With weights ``[1000, 1, 1, 1]`` the other
+    three units all chase the dominant one, leaving a 3/1 split and a
+    half with fewer units than requested.  At scale, one very long document
+    can do the same to a much larger panel.  The repair moves the lightest
+    units, never the dominant one, so the floor is met without rejecting the
+    panel.
+    """
+    units = ['u0', 'u1', 'u2', 'u3']
+    assignment = L.unit_split_assignment(
+        units, [1000.0, 1.0, 1.0, 1.0], salt='x', min_units_per_half=2)
+    counts = [h['n_units'] for h in assignment['halves']]
+    assert min(counts) >= 2, assignment
+    assert sorted(assignment['halves'][0]['indices']
+                  + assignment['halves'][1]['indices']) == list(range(4))
+    _strict_json(assignment)
+
+    result = L.unit_split_replication(
+        [[0.0] * 4 for _ in SEEDS], [1000.0, 1.0, 1.0, 1.0],
+        unit_ids=units, seeds=SEEDS, direction='negative',
+        min_units=4, min_units_per_half=2, salt='x', n_salts=0)
+    assert result['status'] in ('ok', 'warnings'), result
+    assert all(h['n_units'] >= 2 for h in result['assignment']['halves'])
+    _strict_json(result)
+
+
+def test_discordant_halves_survive_subnormal_effect_underflow():
+    """Tiny opposite half effects are discordant, not a zero half.
+
+    ``mean0 * mean1`` underflows to ``-0.0`` when the two means are around
+    +/-1e-200, so the product test called a genuinely opposite pair
+    ``zero_in_one_half``.  Comparing the two signs directly is exact at any
+    representable magnitude.
+    """
+    assignment = L.unit_split_assignment(UNITS, TOKENS)
+    i0 = assignment['halves'][0]['indices']
+    i1 = assignment['halves'][1]['indices']
+    row = [0.0] * len(UNITS)
+    for i in i0:
+        row[i] = -1e-200
+    for i in i1:
+        row[i] = 1e-200
+    result = L.unit_split_replication(
+        [row[:] for _ in SEEDS], TOKENS, unit_ids=UNITS, seeds=SEEDS,
+        direction='negative', n_salts=0)
+    assert result['status'] in ('ok', 'warnings'), result
+    assert result['halves'][0]['stats']['mean'] < 0.0
+    assert result['halves'][1]['stats']['mean'] > 0.0
+    assert result['sign_agreement'] == 'discordant', result
+    assert result['iut']['claim'] == 'halves_discordant', result
+    _strict_json(result)
+
+
+def test_stamped_writer_preserves_unreadable_or_nonobject_artifacts(tmp_path):
+    """A corrupt existing artifact must conflict, not be silently replaced.
+
+    ``json.load`` can fail on a crash-truncated file, very deep JSON, or a
+    multi-GB archive; valid-but-non-object JSON also has no comparable content
+    digest.  Previously all of those looked like an absent path to the writer,
+    so ``overwrite=False`` destroyed the previous bytes.
+    """
+    artifact = L.build_unit_split_replication(
+        _rows(), TOKENS, unit_ids=UNITS, seeds=SEEDS, direction='negative',
+        n_salts=0)
+    path = tmp_path / 'unit_split.json'
+    assert L.write_unit_split_replication(path, artifact)['status'] == 'written'
+
+    for body in ('{truncated', '[1, 2, 3]', 'true'):
+        path.write_text(body, encoding='utf-8')
+        result = L.write_unit_split_replication(
+            path, artifact, overwrite=False)
+        assert result['status'] == 'conflict', (body, result)
+        assert path.read_text(encoding='utf-8') == body, body
+        assert L.write_unit_split_replication(
+            path, artifact, overwrite=True)['status'] == 'written'
+        _strict_json(json.loads(path.read_text(encoding='utf-8')))
+
+    # Two objects with no content digest are not the same artifact.  The old
+    # ``None == None`` shortcut skipped the write and reported a no-op.
+    no_hash = copy.deepcopy(artifact)
+    no_hash.pop('content_sha256', None)
+    path.write_text('{"other": 1}', encoding='utf-8')
+    result = L._write_stamped_artifact(
+        path, no_hash, validator=lambda _a: {'status': 'ok'},
+        name='unit_split.json')
+    assert result['status'] == 'conflict', result
+    assert path.read_text(encoding='utf-8') == '{"other": 1}'

@@ -859,6 +859,7 @@ def audit_look_history(paths=None):
                     list(cur.values())
                     + [d for _lk in looks for d in _lk['deltas']])
                 valid, stale = [], []
+                seen = set()
                 for lk in looks:
                     _bad = [s for s, d in zip(lk['seeds'], lk['deltas'])
                             if s in cur
@@ -869,8 +870,15 @@ def audit_look_history(paths=None):
                     if (_last_cells and _look_cells
                             and {str(k): str(v) for k, v in _look_cells.items()}
                             != _last_cells):
-                        _bad = []
-                        _reason = 'cell arms changed across looks'
+                        # A changed factorial cell mapping is a different
+                        # estimand, not a stale seed.  Mirror
+                        # _attach_look_analysis / step_00: exclude the whole
+                        # look.  Falling through to valid.append() here used to
+                        # recompute a different sequential family than the one
+                        # the artifact recorded, producing a false audit fail.
+                        stale.append({'look': lk['look'],
+                                      'reason': 'cell arms changed across looks'})
+                        continue
                     if not _bad and _last_tags_n and isinstance(lk.get('tags'), dict) and lk.get('tags'):
                         _look_tags = {}
                         for _s, _t in lk['tags'].items():
@@ -890,6 +898,16 @@ def audit_look_history(paths=None):
                         stale.append({'look': lk['look'], 'reason': _reason,
                                       'seeds': sorted(_bad)})
                     else:
+                        # The recorder deduplicates identical looks before
+                        # building the sequential family; do the same so a
+                        # repeated snapshot cannot inflate n_looks or change
+                        # the joint null.
+                        _sig = (tuple(lk['seeds']),
+                                L._look_values_signature(lk['deltas'],
+                                                         _look_scale))
+                        if _sig in seen:
+                            continue
+                        seen.add(_sig)
                         valid.append(lk)
                 if stale:
                     rec['warnings'].append(

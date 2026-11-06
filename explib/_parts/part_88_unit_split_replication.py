@@ -306,7 +306,31 @@ def unit_split_assignment(unit_ids, tokens, *, salt=UNIT_SPLIT_REPLICATION_DEFAU
             halves_out[target].append(index)
             totals_out[target] += used_weights[index]
             counts_out[target] += 1
-        return ([sorted(h) for h in halves_out], totals_out, counts_out)
+        halves_out = [sorted(h) for h in halves_out]
+        # ``min_units_per_half`` is a contract, not a hint.  Greedy token
+        # balance can put one dominant unit alone in a half and every small
+        # unit in the other, even though the pre-check only proved that the
+        # unit COUNT allows two halves of the requested size.  Repair the
+        # partition by moving the lightest units out of the overfull half
+        # (moving the lightest changes the token balance least and never moves
+        # the dominant unit).  With total >= 2*min_half the overfull half
+        # always has enough surplus, so no valid declaration is rejected just
+        # because one document is very long.
+        if min(len(halves_out[0]), len(halves_out[1])) < _min_half:
+            if len(halves_out[0]) < _min_half:
+                dst, src = 0, 1
+            else:
+                dst, src = 1, 0
+            need = int(_min_half - len(halves_out[dst]))
+            movable = sorted(halves_out[src],
+                             key=lambda i: (used_weights[i], i))[:need]
+            for index in movable:
+                halves_out[src].remove(index)
+                halves_out[dst].append(index)
+            halves_out = [sorted(h) for h in halves_out]
+            totals_out = [sum(used_weights[i] for i in h) for h in halves_out]
+            counts_out = [len(h) for h in halves_out]
+        return halves_out, totals_out, counts_out
 
     halves, totals, counts = _balance(weights)
     total_tokens = _usr_finite_sum(weights)
@@ -548,7 +572,11 @@ def _usr_core(rows, unit_ids, tokens, *, direction, salt, alpha, min_n, max_n,
         sign = 'both_negative'
     elif mean0 > 0.0 and mean1 > 0.0:
         sign = 'both_positive'
-    elif mean0 * mean1 < 0.0:
+    elif mean0 != 0.0 and mean1 != 0.0:
+        # The two same-sign branches above already own every non-zero pair
+        # whose signs agree.  Compare the signs directly: ``mean0 * mean1``
+        # underflows to -0.0 for tiny opposite effects (e.g. +/-1e-200), which
+        # would mislabel a genuinely discordant panel as zero_in_one_half.
         sign = 'discordant'
     else:
         sign = 'zero_in_one_half'

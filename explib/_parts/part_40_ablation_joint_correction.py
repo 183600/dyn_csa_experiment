@@ -463,6 +463,17 @@ def maxt_signflip_adjust(named_deltas, *, alpha=0.05,
             'sem_available': sem is not None,
             'ci_simultaneous': ci,
         }
+    # A zero delta is sign-invariant for the studentised score, so a row with
+    # only m non-zero entries multiplies every attainable count by 2**(n-m).
+    # Its exact two-sided floor is therefore 2/2**m, not 2/2**n.  Using n
+    # overstates the family's resolution whenever a contrast has exact zeros
+    # (more likely as the seed panel grows).  A family can attain the floor of
+    # its widest-support row, so the tight lower bound uses max non-zero count.
+    _nz_per_row = (np.count_nonzero(D, axis=1)
+                   if int(D.size) else np.asarray([], dtype=np.int64))
+    _max_nz = int(_nz_per_row.max()) if _nz_per_row.size else 0
+    _p_floor_single = (1.0 if _max_nz <= 0
+                       else min(1.0, 2.0 ** (1 - _max_nz)))
     return {
         'kind': 'maxt_signflip',
         'status': 'ok',
@@ -471,7 +482,7 @@ def maxt_signflip_adjust(named_deltas, *, alpha=0.05,
         'n_seeds': int(n),
         'm': int(m),
         'n_patterns': int(total),
-        'p_floor_single': (2.0 / total if total > 1 else 1.0),
+        'p_floor_single': _p_floor_single,
         'critical_value': critical,
         'ci_level_requested': float(1.0 - alpha),
         'ci_tail_level': float(achieved),

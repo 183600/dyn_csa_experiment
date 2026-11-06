@@ -265,6 +265,22 @@ def _doc_level_analysis(recs_a, recs_b, common, Ln, primary_deltas=None):
     n_docs = min(_lens)
     if n_docs < 2:
         return None
+    # A repeated unit id would be resampled as two independent documents while
+    # the reported n_units/population floor counts it twice.  Admission already
+    # rejects such cells; refuse a direct/legacy call here as well instead of
+    # silently degrading to positional labels.
+    if isinstance(_ref_ids, (list, tuple)) and len(_ref_ids) == n_docs:
+        try:
+            _ids_check = [str(x) for x in _ref_ids]
+        except (TypeError, ValueError):
+            _ids_check = None
+        if _ids_check is None or len(set(_ids_check)) != n_docs:
+            return {'n_docs': int(n_docs), 'n_seeds': len(common),
+                    'comparable': False,
+                    'granularity': _granularity,
+                    'reason': (f'{_granularity} ids contain duplicates or are '
+                               'not hashable; a unit cannot be counted twice'),
+                    'note': 'refused rather than resampling a duplicated unit'}
     # Unit labels for the leave-one-unit-out influence readout.  The order was
     # already checked across arm/seed records above; only a unique, complete id
     # vector may label the folds, otherwise the readout falls back to indices

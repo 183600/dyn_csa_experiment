@@ -246,7 +246,9 @@ def split_registry_manifest(root=None):
     * a listed fragment that does not exist / escapes the repository,
     * a fragment on disk that is not listed (silently dead source),
     * duplicate or path-like entries,
-    * a package with no parseable ``_PARTS`` literal.
+    * a package with no parseable ``_PARTS`` literal,
+    * a root that is not a readable directory (a typo'd checkout path or an
+      incomplete unpack must not attest an empty package set as verified).
 
     The digest deliberately covers order and membership.  Reordering two
     fragments or dropping one from the list changes it even when no fragment
@@ -261,11 +263,17 @@ def split_registry_manifest(root=None):
     problems = []
     packages = {}
     n_parts = 0
+    root_is_dir = os.path.isdir(root)
+    if not root_is_dir:
+        problems.append(
+            f'root is not a readable directory: {root!r}; refusing to attest '
+            'an empty package set')
 
     def _inside(path):
         return path_is_within(root_real, path)
 
-    for pkg_dir, parts_dir in _split_package_dirs(root):
+    for pkg_dir, parts_dir in (
+            _split_package_dirs(root) if root_is_dir else []):
         pkg_rel = _split_rel(pkg_dir, root)
         init_path = os.path.join(pkg_dir, '__init__.py')
         pkg_problems = []

@@ -1062,6 +1062,16 @@ def test_doc_level_analysis_prefers_document_cells():
     assert got['n_docs'] == 4, got
     assert got['doc_delta_negative'] == 1 and got['doc_delta_positive'] == 2, got
     assert got['doc_delta_zero'] == 1, got
+    # A repeated unit id must not be resampled as two independent documents,
+    # even when an older/unadmitted artifact reaches the analysis directly.
+    dup_ids = [docs[0], docs[0], docs[2], docs[3]]
+    dup_a = {s: {'by_len': {512: dict(
+        recs_a[s]['by_len'][512], doc_ids=list(dup_ids))}} for s in (0, 1)}
+    dup_b = {s: {'by_len': {512: dict(
+        recs_b[s]['by_len'][512], doc_ids=list(dup_ids))}} for s in (0, 1)}
+    dup = V12._doc_level_analysis(dup_a, dup_b, [0, 1], 512)
+    assert dup is not None and dup['comparable'] is False, dup
+    assert 'duplicates' in dup['reason'], dup
     # Mixing document-level and row-level cells would silently change the
     # estimand; the analysis must refuse rather than fall back per record.
     mixed = {s: {'by_len': {512: {'ppl_per_seq': list(na)}}} for s in (0,)}
@@ -1084,6 +1094,13 @@ def test_doc_level_analysis_prefers_document_cells():
                  'doc_ids': ['0000000000000001', '0000000000000002'],
                  'n_docs': 2}
     assert V12._by_len_shape_reason({'by_len': {8: dict(good_cell)}}, 4) is None
+    # A document id identifies one independent evaluation unit; duplicates
+    # would still partition n_tok but inflate the population-claim unit count
+    # and let the bootstrap reuse the same document.
+    dup_doc = dict(good_cell, doc_ids=['0000000000000001',
+                                      '0000000000000001'])
+    assert 'doc_ids contains duplicate ids' in str(
+        V12._by_len_shape_reason({'by_len': {8: dup_doc}}, 4))
     broken = dict(good_cell)
     broken['n_tokens_per_doc'] = [20, 7]
     assert 'n_tokens_per_doc sums' in str(

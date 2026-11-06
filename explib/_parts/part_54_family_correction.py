@@ -207,8 +207,15 @@ def _fc_score_maxt(matrix, alpha):
     critical, achieved = _joint_tail_threshold(_fc_np.sort(max_all), alpha)
     rank_by_name = _fc_np.empty(m, dtype=_fc_np.int64)
     rank_by_name[order] = _fc_np.arange(1, m + 1, dtype=_fc_np.int64)
-    p_floor = (1.0 if not _fc_np.any(t > 0.0)
-               else min(1.0, 2.0 / float(total)))
+    # Zero deltas are sign-invariant for the studentised score: a row with m
+    # non-zero entries has floor 2/2**m, not 2/2**n.  The family can attain
+    # the floor of its widest-support row, so use the largest non-zero count;
+    # the old all-seed denominator overstated resolution with tied/zero cells.
+    _nz_per_row = (_fc_np.count_nonzero(A, axis=1)
+                   if int(A.size) else _fc_np.asarray([], dtype=_fc_np.int64))
+    _max_nz = int(_nz_per_row.max()) if _nz_per_row.size else 0
+    p_floor = (1.0 if (not _fc_np.any(t > 0.0) or _max_nz <= 0)
+               else min(1.0, 2.0 ** (1 - _max_nz)))
     return {
         'p_raw': [float(x) for x in raw_p],
         'p_maxt_single': [float(x) for x in single_p],

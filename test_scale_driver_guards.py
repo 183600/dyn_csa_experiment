@@ -141,3 +141,17 @@ def test_scale_ladder_unprintable_identity_counts_stay_json_safe():
         assert any(field in p and 'reportable integer bound' in p
                    for p in out['problems']), (field, out['problems'])
         json.dumps(out, allow_nan=False)
+
+
+def test_split_registry_rejects_a_non_directory_root(tmp_path):
+    """A typo'd checkout must not attest an empty package set as verified."""
+    missing = tmp_path / 'does-not-exist'
+    afile = tmp_path / 'not-a-directory'
+    afile.write_text('x', encoding='utf-8')
+    for root in (str(missing), str(afile)):
+        out = L.split_registry_manifest(root=root)
+        assert out['status'] == 'invalid', (root, out)
+        assert out['n_packages'] == 0 and out['n_parts'] == 0, (root, out)
+        assert any('not a readable directory' in p
+                   for p in out['problems']), (root, out)
+        json.dumps(out, allow_nan=False)
