@@ -89,7 +89,7 @@ def sec_p1l():
         ratio = sum((last_map[sd] / base_map[sd] for sd in _matched)) / len(_matched) if _matched and len(lens) >= 2 else None
         per_v[v] = ratio
         trunc_v[v] = trunc_flags
-        rt_txt = f'×{ratio:.2f}' if _finite_or_none(ratio) is not None else '—'
+        rt_txt = f'×{ratio:.2f}' if _as_finite(ratio) is not None else '—'
         _vmark = '，⚠ 陈旧' if v in _stale_vars else ''
         lines.append(f'| `{v}`（n={len(_seeds_by_v.get(v, []))}{_vmark}） | ' + ' | '.join(cells) + f' | {rt_txt} |')
     if _stale_vars:
@@ -99,11 +99,11 @@ def sec_p1l():
         lines += ['', '**位置受限（截断）臂**：' + '、'.join((f'`{v}`' for v, f in sorted(trunc_v.items()) if any(f))) + ' —— 其 span > max_pos 的格全部只覆盖最后 `max_pos` 个 token，与真正的长上下文分数不可比；比较外推能力时须以 RoPE 臂（无位置上限）为准。', '']
     if per_v:
         lines += ['', '**读法（相对退化，越低越好）**：', '']
-        for v, rt in sorted(per_v.items(), key=lambda kv: kv[1] if _finite_or_none(kv[1]) is not None else 1000000000.0):
-            if _finite_or_none(rt) is None:
+        for v, rt in sorted(per_v.items(), key=lambda kv: kv[1] if _as_finite(kv[1]) is not None else 1000000000.0):
+            if _as_finite(rt) is None:
                 continue
             lines.append(f'- `{v}`：{lens[-1]}/{lens[0]} = ×{rt:.2f}')
-        _rope_ok = 'csa_fixed_rope' in per_v and 'full_rope' in per_v and _finite_or_none(per_v['csa_fixed_rope']) is not None and _finite_or_none(per_v['full_rope']) is not None and (not (trunc_v.get('csa_fixed_rope', [0])[-1] or trunc_v.get('full_rope', [0])[-1]))
+        _rope_ok = 'csa_fixed_rope' in per_v and 'full_rope' in per_v and _as_finite(per_v['csa_fixed_rope']) is not None and _as_finite(per_v['full_rope']) is not None and (not (trunc_v.get('csa_fixed_rope', [0])[-1] or trunc_v.get('full_rope', [0])[-1]))
         if _rope_ok:
             _ra = per_v['csa_fixed_rope']
             _rb = per_v['full_rope']
@@ -127,8 +127,8 @@ def sec_p1l():
                 note = f'`csa_fixed_rope` 的长度外推退化低于 `full_rope` {abs(dv):.2f} 个比值单位——稀疏掩码滤掉了远距噪声，外推更稳。' + _tail
             lines += ['', f'**结论**：{note}', '']
         elif 'csa_fixed_rope' in per_v and 'full_rope' in per_v:
-            _ra_t = f"×{per_v['csa_fixed_rope']:.2f}" if _finite_or_none(per_v.get('csa_fixed_rope')) is not None else '—'
-            _rb_t = f"×{per_v['full_rope']:.2f}" if _finite_or_none(per_v.get('full_rope')) is not None else '—'
+            _ra_t = f"×{per_v['csa_fixed_rope']:.2f}" if _as_finite(per_v.get('csa_fixed_rope')) is not None else '—'
+            _rb_t = f"×{per_v['full_rope']:.2f}" if _as_finite(per_v.get('full_rope')) is not None else '—'
             lines += ['', f'**结论**：外推对比只看两个 RoPE 臂（`csa_fixed_rope` {_ra_t} vs `full_rope` {_rb_t}）——absPE 臂在 `max_pos` 之外没有可比的读数，**不参与**该对比。', '']
         lines.append('')
     lines.append('图：`results_len/length_gen.png`（PPL 与相对比值 vs 评测长度）。')
@@ -1290,20 +1290,7 @@ def main(argv=None):
         return None
     txt = '\n'.join((p for p in parts if p))
     out = os.path.join(REPO, 'REPORT_v7.md')
-    _d = os.path.dirname(os.path.abspath(out))
-    _fd, _tmp = tempfile.mkstemp(dir=_d, prefix=os.path.basename(out) + '.', suffix='.tmp')
-    try:
-        with os.fdopen(_fd, 'w', encoding='utf-8') as f:
-            f.write(txt)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(_tmp, out)
-    except BaseException:
-        try:
-            os.unlink(_tmp)
-        except OSError:
-            pass
-        raise
+    _write_text_atomic(out, txt)
     print(f'[report] wrote {out} ({len(txt)} bytes)')
     return out
 def _run_cli():

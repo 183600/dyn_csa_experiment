@@ -33,7 +33,7 @@
 |---|---|---|
 | 驱动代次 | `v12` | `explib/` 下最新的驱动/研究代次 |
 | 库测量语义 | `CODE_SEMANTICS = v11.128` | 由冻结清单绑定的测量语义戳 |
-| 冻结清单 | `manifest_version: 3`（修订历史 v1–v5） | `confirmation_frozen.json` 的结构版本 |
+| 冻结清单 | `manifest_version: 3`（修订历史 v1–v3） | `confirmation_frozen.json` 的结构版本 |
 | 确认范围 | `confirmation_frozen.json` 中的固定分块 CSA 比较 | 唯一在读取最终 test split 前冻结的比较 |
 | 已发布证据 | 未随仓库提供 | Git 树只存放源码；见 `RELEASES.md` |
 
@@ -59,6 +59,9 @@
 
 | 术语 | 含义 |
 |---|---|
+| 代次（generation） | 一组按版本组织的研究面板及其驱动（`v6`–`v12`、M0、open-block） |
+| 驱动（driver） | 调度某一代次各阶段的入口（`python -m explib.<driver>`） |
+| 阶段（phase） | 驱动内可续跑的命名步骤（例如 `P5C`）；`full` 会把它们串起来 |
 | 面板（panel） | 一起分析的一组已声明训练矩阵（臂 × 种子） |
 | 臂（arm） | 面板中的一个模型/配方变体 |
 | 单元（cell） | 一次 `(臂, 种子)` 训练，是续跑的最小单位 |
@@ -138,25 +141,25 @@
 | `python -m explib.resume` | `smoke`、`analysis`、`report`、`phase P2T` / `P2S3`、`full` |
 | `python -m explib.corruption` | `smoke`、`analysis`、`report`、`phase <name>`、`full` |
 | `python -m explib.length` | `smoke`、`analysis`、`report`、`phase <name>`、`full` |
-| `python -m explib.confirmation` | `smoke`、`plan`、`dynamic-plan`、`power`、`phase <name>`、`analysis`、`report`、`full`、`auto` |
+| `python -m explib.confirmation` | `smoke`、`plan`、`dynamic-plan`、`power`、`phase <name>`、`finaltest`、`analysis`、`report`、`full`、`auto` |
 | `python -m explib.open_block` | `smoke`、`pilot`、`main`、`aux`、`extended`、`report` |
 | `python -m explib.m0` | `params`、`data`、`smoke`、`kernel`、`analysis`、`full`、`auto` |
-| `python -m explib.reproduce` | `compare 原始目录 重跑目录`、`report OLD.json NEW.json` |
+| `python -m explib.reproduce` | `compare 原始目录 重跑目录`、`report OLD.json NEW.json`、`canary [--write]` / `[--verify PATH]` |
 
 ## 从这里开始
 
 所有命令均在仓库根目录执行。`make test` 通过即表示检出可用。
 
-| 目标 | 先运行 | 会启动训练吗？ |
-|---|---|---|
-| 检查代码与环境是否正常 | `python -m pip install -r requirements.lock`，再 `make test` | 不会 |
-| 预检冻结清单，不读 test split | `make plan` | 不会 |
-| 运行未结束块因果性/参考实现门禁 | `python -m pytest -q test_open_block.py` | 不会 |
-| 端到端试跑整条流水线 | `python run_gapfill.py smoke` | 仅 smoke 小跑 |
-| 运行或续跑正式面板 | [研究一览](#研究一览)中的驱动表 | 会 |
-| 从本地产物重建报告 | `python build_report.py`，或该驱动提供 `report` 模式时使用它 | 不会 |
-| 比较两次运行是否一致 | `python -m explib.reproduce compare 原始目录 重跑目录` | 不会 |
-| 理解某个测量为什么这样定义 | [从哪里读起](#从哪里读起) | 不会 |
+| 目标 | 命令 | 会启动训练吗？ | 成功时的表现 |
+|---|---|---|---|
+| 检查代码与环境是否正常 | `python -m pip install -r requirements.lock`，再 `make test` | 不会 | pytest 摘要且退出码为 0 |
+| 预检冻结清单，不读 test split | `make plan` | 不会 | 预检报告且退出码为 0；不读取 test split |
+| 运行未结束块因果性/参考实现门禁 | `python -m pytest -q test_open_block.py` | 不会 | 全部门禁通过 |
+| 端到端试跑整条流水线 | `python run_gapfill.py smoke` | 仅 smoke 小跑 | 打印 `[smoke] PASSED`，smoke 产物已清理 |
+| 运行或续跑正式面板 | [研究一览](#研究一览)中的驱动表 | 会 | `results_*/` 下出现逐单元记录 |
+| 从本地产物重建报告 | `python build_report.py`，或该驱动提供 `report` 模式时使用它 | 不会 | 用本地产物重写 `REPORT*.md` |
+| 比较两次运行是否一致 | `python -m explib.reproduce compare 原始目录 重跑目录` | 不会 | 逐维度判定；仅复现成功时退出码为 0 |
+| 理解某个测量为什么这样定义 | [从哪里读起](#从哪里读起) | 不会 | 定位到相应设计小节或契约 |
 
 ## 快速开始
 
@@ -207,29 +210,46 @@ python run_gapfill.py smoke            # v6 流水线自检，不产生研究测
 python -m explib.confirmation plan     # 冻结清单预检，不读 test
 ```
 
-逐阶段运行冻结确认链（每阶段可续跑；只有 `P5T` 读取 test split）：
+逐阶段运行冻结确认链。下面的训练/评估阶段顺序与驱动的 `full` 链一致；
+每阶段均可续跑，且只有 `P5T` 读取 test split。最后的 `analysis` 与
+`report` 是零 GPU 步骤：
 
 ```bash
-python -m explib.confirmation plan
-python -m explib.confirmation phase P5C
-python -m explib.confirmation phase P5MP
-python -m explib.confirmation phase P5S2
-python -m explib.confirmation phase P5S3
-python -m explib.confirmation phase P5T
-python -m explib.confirmation analysis
-python -m explib.confirmation report
+python -m explib.confirmation plan       # 机器预检；不训练、不读 test
+python -m explib.confirmation phase P5C  # 按清单种子训练冻结臂
+python -m explib.confirmation phase P5H  # 训练曲线健康诊断
+python -m explib.confirmation phase P5PW # 用 P5C validation 差值做条件功效检查
+python -m explib.confirmation phase P5T  # 一次性 test-split 评估
+python -m explib.confirmation phase P5MP # 扩展腐坏/NIAH 探针
+python -m explib.confirmation phase P5S2 # 等 token 规模臂
+python -m explib.confirmation phase P5S3 # 参数量代理规模臂
+python -m explib.confirmation analysis   # 确认性统计
+python -m explib.confirmation report     # 重建 REPORT_v12.md
 ```
+
+`python -m explib.confirmation full` 会在一个进程里跑同一条链；`auto` 额外
+采用无人值守的预检/停止行为。逐阶段运行适合在进入下一步前检查门禁结果。
 
 在相信重跑报告前，先与原始产物比较：
 
 ```bash
 python -m explib.reproduce compare results_lm_v3_1500 results_lm_v3_1500_rerun
+# 追加 --require exact 可要求端点与记录曲线逐位相同
 ```
 
 ## 从哪里读起
 
 先看[从这里开始](#从这里开始)确定当前任务，再用[研究一览](#研究一览)
 查找具体命令。需要更多背景时，按下表定位权威文档。
+
+如果按角色阅读，下面的顺序可以少走弯路：
+
+| 角色 | 建议顺序 |
+|---|---|
+| 运行实验 | [从这里开始](#从这里开始) → [快速开始](#快速开始) → [研究一览](#研究一览) → [复现方法（任意机器）](#复现方法任意机器)中的对应驱动小节 → [常见注意事项](#常见注意事项) |
+| 审计或评审主张 | [范围与状态](#范围与状态) → [测量护栏](#测量护栏) → `docs/design_notes.md` §17/§20 → [`DECISION_LOG.md`](DECISION_LOG.md) → [`RELEASES.md`](RELEASES.md) → [`REVIEW_4_RESPONSE.md`](REVIEW_4_RESPONSE.md) |
+| 修改库或驱动 | [仓库结构](#仓库结构) → [核心代码](#核心代码) → `_split_loader.py` → [测试与冻结输入](#测试与冻结输入) → `docs/design_notes.md` 的对应小节 |
+| 重建报告 | [重新生成实验产物](#重新生成实验产物) → 驱动的 `report` 小节 → [测量护栏](#测量护栏) |
 
 | 问题 | 文档 |
 |---|---|
@@ -260,6 +280,12 @@ explib/<driver>/            v7-v12、M0/S1 与 open-block 研究驱动
 run_gapfill.py              v6 驱动（历史入口）
 audit_gates.py              零实验审计门
 archive_release.py          证据归档构建与校验
+confirmation_frozen.json    冻结的确认清单（P5T 与 plan 门读取）
+confirmation_frozen_dynamic.json  独立的动态/HCA 草案清单
+docs/design_notes.md        固定的设计与测量说明
+DECISION_LOG.md             决策时间线
+RELEASES.md                 证据发布索引
+REVIEW_4_RESPONSE.md        逐条评审处置
 ```
 
 完整清单见下表。
@@ -303,7 +329,7 @@ archive_release.py          证据归档构建与校验
 |---|---|
 | `test_open_block.py` | **未结束块 CPU 门禁**：配置/分段器、优化前缀池化与逐查询参考的前向/梯度一致、前缀不变性、未来扰动/未来梯度、候选掩码、边界情形、closed 回归、单 token 语义与 HCA 预算声明 |
 | `test_review_part_*.py`、`test_review_fixes.py` | **CPU 评审 pytest 套件**：兼容入口与拆分后的测试模块（用 `make test` 或 `pytest` 运行） |
-| `confirmation_frozen.json` | **预注册确认清单**（入库；`manifest_version: 3`，修订历史 v1–v5）：冻结臂与种子 0-11（在任何 test-split 访问**之前**由 6 修订为 12，含功效表）、终点、精确符号翻转 + Holm、决策规则、机器可校验的绑定块与范围声明——见 `docs/design_notes.md` §17 与 `DECISION_LOG.md` |
+| `confirmation_frozen.json` | **预注册确认清单**（入库；`manifest_version: 3`，修订历史 v1–v3）：冻结臂与种子 0-11（在任何 test-split 访问**之前**由 6 修订为 12，含功效表）、终点、精确符号翻转 + Holm、决策规则、机器可校验的绑定块与范围声明——见 `docs/design_notes.md` §17 与 `DECISION_LOG.md` |
 | `confirmation_frozen_dynamic.json` | **动态分块与 HCA 的独立预注册草案**（`manifest_version: 4`；尚未冻结）：H1 分段质量、H2 检索精度、H3 长程覆盖，以及冻结前必须排期的对照——见 `DECISION_LOG.md` |
 
 ### 证据与设计记录
@@ -648,13 +674,18 @@ python -m explib.confirmation auto            # 无人值守：与 full 同链�
                                               #   代码戳/git 树/arms/seeds/主比较/α）自动落盘，
                                               #   人工核对变为事后异步，不再阻塞链的启动
 python -m explib.confirmation phase P5C       # 按清单种子训练全部六个冻结臂（可续跑；主臂 0-5 由 P3MT/P4MT 覆盖）
+python -m explib.confirmation phase P5H       # 诊断：冻结臂训练曲线健康门禁（不参与选择）
+python -m explib.confirmation phase P5PW      # 零 GPU：用 P5C validation 差值做条件功效检查
+python -m explib.confirmation phase P5T       # 冻结后的最终测试（读 wiki.test.raw，需冻结清单）
 python -m explib.confirmation phase P5MP      # 扩展探针（全部模式 + NIAH + 对照），种子取自清单
 python -m explib.confirmation phase P5S2      # 等 token 大规模臂（8000 步）
-python -m explib.confirmation phase P5S3      # 6ND 参数量代理预算大规模臂（参数量比例缩步）
-python -m explib.confirmation phase P5T       # 冻结后的最终测试（读 wiki.test.raw，需冻结清单）
+python -m explib.confirmation phase P5S3      # 参数量代理规模臂（参数量比例缩步）
 python -m explib.confirmation analysis        # 零 GPU：共享 v10 统计 + 冻结确认性统计
 python -m explib.confirmation report          # 从磁盘重建 REPORT_v12.md（零 GPU）
 ```
+
+`python -m explib.confirmation finaltest` 是 `phase P5T` 的快捷方式；两者
+只能选一个，因为 test 读取是一次性的。
 
 P5T 在 `confirmation_frozen.json` 缺失时拒绝运行，代码语义戳与清单不一致
 时同样拒绝（必须显式重冻结），**最小可达 Holm p > α 的清单直接拒绝**
@@ -753,30 +784,20 @@ python build_report.py            # 从产物重建 REPORT_v7.md（零 GPU）
 
 ### 常见注意事项
 
-- **在仓库根目录运行。** 驱动按检出路径解析 `results_*/`、`analysis_*/`
-  与冻结清单。
-- **v6 裸跑会训练。** `python run_gapfill.py` 默认使用 `full` 模式；只想
-  做流水线自检时请显式运行 `smoke`。
-- **先看 `--help` 再选模式。** `python -m explib.<driver> --help` 打印驱动
-  说明，模式列表见[研究一览](#研究一览)。不要在位置式模式后追加 `--help`：
-  `python run_gapfill.py smoke --help` 会直接开始 smoke 运行。
-- **定向 pytest 不等于全量套件。** `make test` 会收集所有 `test_*.py`
-  模块；`pytest path::test` 只检查对应用例。
-- **test split 是一次性的。** 只有 P5T 读 `wiki.test.raw`；不要在其外围
-  再写读 test 的脚本。
-- **陈旧缓存不会静默重建。** 更换 train 语料后先删除 `wt103_cache/` 再
-  重建，然后才比较两次运行。
-- **报告本身不等于证据。** 引用数字前先发布并校验归档
-  （`archive_release.py`）。
-- **新检出不带结果。** `results_*/` 与 `analysis_*/` 已 gitignore；
-  `python -m explib.confirmation report`、`python build_report.py` 及其他
-  `report` 模式只能从本机已有产物重建。
-- **内核模式是可选且依赖硬件的。** `CSA_KERNEL` 未设置时 eager 路径随处
-  可跑；`CSA_KERNEL=1` 需要 CUDA + Triton，`CSA_KERNEL=ref` 选择可在 CPU
-  运行的参考孪生实现用于调试。
-- **缺可选包 / Hub 不可达。** 先安装 `requirements.lock` 再跑套件；数据
-  访问可把 `WT103_RAW_TXT` 指向本地原始文本目录，或仅在官方 Hub 不可达时
-  显式设置 `CSA_HF_MIRROR=1`。
+命令行为与预期不符时，可按这张表逐项排查。
+
+| 现象 | 原因 | 处理 |
+|---|---|---|
+| 找不到产物或清单 | 驱动按检出路径解析 `results_*/`、`analysis_*/` 与冻结输入 | 所有命令都在仓库根目录执行 |
+| 裸跑 v6 命令却开始长时间训练 | `python run_gapfill.py` 默认 `full` | 只做流水线自检时用 `python run_gapfill.py smoke` |
+| `--help` 没有打印说明，反而开始运行 | 位置式模式先于标志被消费（尤其 v6 脚本） | 把 `--help` 放在最前：`python run_gapfill.py --help`，或 `python -m explib.<driver> --help` |
+| 定向测试通过，但没有覆盖改动 | `make test` 收集所有 `test_*.py`；`pytest path::test` 只检查对应用例 | 交付前运行 `make test` |
+| test split 读取后无法回退 | `P5T` 是一次性评估，也只有它读 `wiki.test.raw` | 不要在其外围再写读 test 的脚本；先检查 plan |
+| 修改语料后结果发生变化 | 陈旧的 `wt103_cache/` 不会静默重建 | 删除缓存、重建，再比较两次运行 |
+| 报告里的数字无法复核 | 报告本身不等于证据 | 引用数字前先发布并校验归档（`archive_release.py`） |
+| 重建出的报告为空，或提示没有数据 | `results_*/` 与 `analysis_*/` 已 gitignore，新检出不带这些产物 | 先跑产生产物的阶段，或把 `report` 指向已有产物目录 |
+| 本机内核模式失败 | `CSA_KERNEL=1` 需要 CUDA + Triton | 不设 `CSA_KERNEL` 走 eager，或用 `CSA_KERNEL=ref` 走 CPU 参考孪生 |
+| 离线时导入或 Hub 失败 | 可选包未安装，或官方 Hub 不可达 | 安装 `requirements.lock`；把 `WT103_RAW_TXT` 指向本地原始文本，或仅在必要时用 `CSA_HF_MIRROR=1` 回退 |
 
 ## 测量护栏
 

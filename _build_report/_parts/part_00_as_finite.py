@@ -40,6 +40,30 @@ def _as_finite(v):
         return None
     return f if math.isfinite(f) else None
 
+def _write_text_atomic(path, text):
+    """Write ``text`` via a same-directory temp file and an atomic replace.
+
+    The report is published only after every section computed successfully;
+    this helper keeps that final write from leaving a truncated report if the
+    process is interrupted mid-write.
+    """
+    directory = os.path.dirname(os.path.abspath(path))
+    fd, temporary = tempfile.mkstemp(
+        dir=directory, prefix=os.path.basename(path) + '.', suffix='.tmp')
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+
+
 def load(path, default=None):
     try:
         with open(path, encoding='utf-8') as f:
@@ -505,9 +529,6 @@ def _primary_ppl(rec):
         return None
     v = _as_finite(rec.get('ppl'))
     return v if v is not None and v >= 1.0 else None
-
-def _finite_or_none(v):
-    return _as_finite(v)
 
 def _int_or(v, default):
     if v is None or isinstance(v, (bool, np.bool_)):

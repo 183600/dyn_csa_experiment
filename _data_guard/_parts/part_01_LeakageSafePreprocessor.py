@@ -415,6 +415,36 @@ def _sorted_categories(values):
                   key=lambda v: (type(v).__name__, repr(v)))
 
 
+def _as_category_matrix(X):
+    """Return category input as rows of cells without changing its contents.
+
+    The fingerprints accept a scalar, a row and a table alike; normalising
+    only the 0-D/1-D cases keeps their historical iteration order and leaves
+    validated higher-dimensional input untouched.
+    """
+    arr = np.asarray(X, dtype=object)
+    if arr.ndim == 0:
+        return arr.reshape(1, 1)
+    if arr.ndim == 1:
+        return arr.reshape(-1, 1)
+    return arr
+
+
+def _update_category_identity(h, value):
+    """Feed one category's canonical encoder identity into ``h``.
+
+    ``_target_key`` is the same identity ``transform`` uses.  Keeping the
+    encoding here means the order-sensitive and order-insensitive
+    fingerprints cannot drift apart and disagree about which rows are the
+    training rows.
+    """
+    key = _target_key(value)
+    h.update(str(len(key)).encode('ascii'))
+    h.update(b':')
+    h.update(key.encode('utf-8', errors='replace'))
+    h.update(b'|')
+
+
 def _categorical_fingerprint(X):
     """Content fingerprint of a categorical table under encoder identity.
 
@@ -426,19 +456,11 @@ def _categorical_fingerprint(X):
     identity that ``transform`` uses instead.
     """
     h = hashlib.sha256()
-    arr = np.asarray(X, dtype=object)
-    if arr.ndim == 0:
-        arr = arr.reshape(1, 1)
-    elif arr.ndim == 1:
-        arr = arr.reshape(-1, 1)
+    arr = _as_category_matrix(X)
     h.update(str(arr.shape).encode('ascii'))
     for row in arr.tolist():
         for value in row:
-            key = _target_key(value)
-            h.update(str(len(key)).encode('ascii'))
-            h.update(b':')
-            h.update(key.encode('utf-8', errors='replace'))
-            h.update(b'|')
+            _update_category_identity(h, value)
         h.update(b'\x1f')
     return h.hexdigest()
 
@@ -453,22 +475,14 @@ def _categorical_row_set_fingerprint(X):
     would restore the full-table leak.  Only a commutative 128-bit sum/xor of
     per-row digests is retained, so large tables are not kept in memory.
     """
-    arr = np.asarray(X, dtype=object)
-    if arr.ndim == 0:
-        arr = arr.reshape(1, 1)
-    elif arr.ndim == 1:
-        arr = arr.reshape(-1, 1)
+    arr = _as_category_matrix(X)
     mask = (1 << 128) - 1
     total = 0
     xored = 0
     for row in arr.tolist():
         h = hashlib.blake2b(digest_size=16)
         for value in row:
-            key = _target_key(value)
-            h.update(str(len(key)).encode('ascii'))
-            h.update(b':')
-            h.update(key.encode('utf-8', errors='replace'))
-            h.update(b'|')
+            _update_category_identity(h, value)
         digest = int.from_bytes(h.digest(), 'little')
         total = (total + digest) & mask
         xored ^= digest

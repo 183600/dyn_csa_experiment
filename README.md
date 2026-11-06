@@ -38,7 +38,7 @@ comparisons are confirmatory and what "released" means in this checkout.
 |---|---|---|
 | driver generation | `v12` | the newest driver/study generation under `explib/` |
 | library semantics | `CODE_SEMANTICS = v11.128` | measurement-semantics stamp bound by the frozen plan |
-| frozen manifest | `manifest_version: 3` (revision history v1-v5) | schema revision of `confirmation_frozen.json` |
+| frozen manifest | `manifest_version: 3` (revision history v1-v3) | schema revision of `confirmation_frozen.json` |
 | confirmatory scope | the fixed-chunk CSA comparisons in `confirmation_frozen.json` | the only comparisons frozen before the final test read |
 | released evidence | none bundled | the Git tree stays source-only; see `RELEASES.md` |
 
@@ -67,6 +67,9 @@ The tables and command comments below use a few terms in a specific sense.
 
 | term | meaning here |
 |---|---|
+| generation | one versioned group of panels and its driver (`v6`–`v12`, M0, open-block) |
+| driver | the entry point that schedules a generation's phases (`python -m explib.<driver>`) |
+| phase | a named, resumable stage within a driver (for example `P5C`); `full` chains them |
 | panel | one declared matrix of training runs (arms × seeds) analyzed together |
 | arm | one model/recipe variant in a panel |
 | cell | one `(arm, seed)` training run; the smallest resumable unit |
@@ -149,26 +152,26 @@ subcommands.
 | `python -m explib.resume` | `smoke`, `analysis`, `report`, `phase P2T` / `P2S3`, `full` |
 | `python -m explib.corruption` | `smoke`, `analysis`, `report`, `phase <name>`, `full` |
 | `python -m explib.length` | `smoke`, `analysis`, `report`, `phase <name>`, `full` |
-| `python -m explib.confirmation` | `smoke`, `plan`, `dynamic-plan`, `power`, `phase <name>`, `analysis`, `report`, `full`, `auto` |
+| `python -m explib.confirmation` | `smoke`, `plan`, `dynamic-plan`, `power`, `phase <name>`, `finaltest`, `analysis`, `report`, `full`, `auto` |
 | `python -m explib.open_block` | `smoke`, `pilot`, `main`, `aux`, `extended`, `report` |
 | `python -m explib.m0` | `params`, `data`, `smoke`, `kernel`, `analysis`, `full`, `auto` |
-| `python -m explib.reproduce` | `compare ORIGINAL RERUN`, `report OLD.json NEW.json` |
+| `python -m explib.reproduce` | `compare ORIGINAL RERUN`, `report OLD.json NEW.json`, `canary [--write]` / `[--verify PATH]` |
 
 ## Start here
 
 Run every command from the repository root. A checkout is healthy when
 `make test` passes.
 
-| goal | start with | starts training? |
-|---|---|---|
-| verify that a checkout is healthy | `python -m pip install -r requirements.lock`, then `make test` | no |
-| validate the frozen plan without touching the test split | `make plan` | no |
-| run the open-block causality/reference gates | `python -m pytest -q test_open_block.py` | no |
-| try the pipeline end to end | `python run_gapfill.py smoke` | smoke run only |
-| run or resume a study panel | the [Study at a glance](#study-at-a-glance) table | yes |
-| rebuild a report from local artifacts | `python build_report.py`, or the driver's `report` mode where it has one | no |
-| check whether two runs agree | `python -m explib.reproduce compare ORIGINAL RERUN` | no |
-| understand why a measurement is defined this way | the [Where to look](#where-to-look) table | no |
+| goal | command | starts training? | what success looks like |
+|---|---|---|---|
+| verify that a checkout is healthy | `python -m pip install -r requirements.lock`, then `make test` | no | pytest summary and exit 0 |
+| validate the frozen plan without touching the test split | `make plan` | no | preflight report and exit 0; the test split is not read |
+| run the open-block causality/reference gates | `python -m pytest -q test_open_block.py` | no | all gates pass |
+| try the pipeline end to end | `python run_gapfill.py smoke` | smoke run only | `[smoke] PASSED`; smoke outputs are removed |
+| run or resume a study panel | the [Study at a glance](#study-at-a-glance) table | yes | per-cell records under `results_*/` |
+| rebuild a report from local artifacts | `python build_report.py`, or the driver's `report` mode where it has one | no | `REPORT*.md` rewritten from local artifacts |
+| check whether two runs agree | `python -m explib.reproduce compare ORIGINAL RERUN` | no | per-dimension verdict; exit 0 only when reproduced |
+| understand why a measurement is defined this way | the [Where to look](#where-to-look) table | no | the named design section or contract |
 
 ## Quick start
 
@@ -225,24 +228,33 @@ python run_gapfill.py smoke            # v6 plumbing, no research measurement
 python -m explib.confirmation plan     # frozen-plan preflight, no test read
 ```
 
-Run the frozen confirmation chain phase by phase (each phase is resumable; only
-`P5T` reads the test split):
+Run the frozen confirmation chain phase by phase. The training/evaluation
+phases below follow the driver's `full` order; each phase is resumable, and
+only `P5T` reads the test split. The final `analysis` and `report` steps are
+zero-GPU:
 
 ```bash
-python -m explib.confirmation plan
-python -m explib.confirmation phase P5C
-python -m explib.confirmation phase P5MP
-python -m explib.confirmation phase P5S2
-python -m explib.confirmation phase P5S3
-python -m explib.confirmation phase P5T
-python -m explib.confirmation analysis
-python -m explib.confirmation report
+python -m explib.confirmation plan       # machine preflight; no training, no test read
+python -m explib.confirmation phase P5C  # train the frozen arms at the manifest seeds
+python -m explib.confirmation phase P5H  # training-health diagnostic
+python -m explib.confirmation phase P5PW # conditional power check on P5C validation deltas
+python -m explib.confirmation phase P5T  # the one-shot test-split evaluation
+python -m explib.confirmation phase P5MP # extended corruption/NIAH probe
+python -m explib.confirmation phase P5S2 # token-matched scale arm
+python -m explib.confirmation phase P5S3 # parameter-proxy scale arm
+python -m explib.confirmation analysis   # confirmatory statistics
+python -m explib.confirmation report     # rebuild REPORT_v12.md
 ```
+
+`python -m explib.confirmation full` runs the same chain in one process (and
+`auto` adds the unattended preflight/stop behaviour). Running phases manually
+is useful when you need to inspect a gate before allowing the next step.
 
 Compare a re-run against the original before trusting its report:
 
 ```bash
 python -m explib.reproduce compare results_lm_v3_1500 results_lm_v3_1500_rerun
+# add --require exact to demand a bit-identical endpoint and recorded curve
 ```
 
 ## Where to look
@@ -250,6 +262,15 @@ python -m explib.reproduce compare results_lm_v3_1500 results_lm_v3_1500_rerun
 Start with [Start here](#start-here) for the task you have in mind, then use
 [Study at a glance](#study-at-a-glance) for the exact command. The table below
 maps a question to its authoritative source when you need more detail.
+
+If you are reading for a specific role, this order avoids most dead ends:
+
+| role | read in this order |
+|---|---|
+| run an experiment | [Start here](#start-here) → [Quick start](#quick-start) → [Study at a glance](#study-at-a-glance) → the driver section under [Running the experiments](#running-the-experiments) → [Common pitfalls](#common-pitfalls) |
+| audit or review a claim | [Scope and status](#scope-and-status) → [Measurement guardrails](#measurement-guardrails) → `docs/design_notes.md` §17/§20 → [`DECISION_LOG.md`](DECISION_LOG.md) → [`RELEASES.md`](RELEASES.md) → [`REVIEW_4_RESPONSE.md`](REVIEW_4_RESPONSE.md) |
+| change the library or a driver | [Repository layout](#repository-layout) → [Core code](#core-code) → `_split_loader.py` → [Tests and frozen inputs](#tests-and-frozen-inputs) → the relevant section of `docs/design_notes.md` |
+| rebuild a report | [Regenerating the experiment artifacts](#regenerating-the-experiment-artifacts) → the driver's `report` section → [Measurement guardrails](#measurement-guardrails) |
 
 | question | document |
 |---|---|
@@ -282,6 +303,12 @@ explib/<driver>/            v7-v12, M0/S1 and open-block study drivers
 run_gapfill.py              v6 driver (historical entry point)
 audit_gates.py              zero-experiment audit gates
 archive_release.py          evidence archive builder and verifier
+confirmation_frozen.json    frozen confirmatory plan (read by P5T and the plan gate)
+confirmation_frozen_dynamic.json  separate dynamic/HCA draft plan
+docs/design_notes.md        fixed design and measurement notes
+DECISION_LOG.md             decision chronology
+RELEASES.md                 evidence release index
+REVIEW_4_RESPONSE.md        item-by-item review disposition
 ```
 
 The tables below give the full inventory.
@@ -326,7 +353,7 @@ also needs the small `__main__.py` entry point that calls `_run_cli`.
 |---|---|
 | `test_open_block.py` | **open-block CPU gates**: config/segmenter, optimized-vs-reference prefix pooling (forward + gradients), prefix invariance, future perturbation/gradient, candidate masks, edge cases, closed regression, singleton semantics and HCA budget declaration |
 | `test_review_part_*.py`, `test_review_fixes.py` | **CPU review pytest suite**: compatibility entry point plus the split test modules (run with `make test` or `pytest`) |
-| `confirmation_frozen.json` | **pre-registered confirmation plan** (tracked; `manifest_version: 3`, revision history v1-v5): frozen arms and seeds 0-11 (revised 6->12 BEFORE any test-split access; power table recorded), endpoints, exact sign-flip + Holm, decision rule, machine-checkable binding block and a scope declaration — see `docs/design_notes.md` §17 and `DECISION_LOG.md` |
+| `confirmation_frozen.json` | **pre-registered confirmation plan** (tracked; `manifest_version: 3`, revision history v1-v3): frozen arms and seeds 0-11 (revised 6->12 BEFORE any test-split access; power table recorded), endpoints, exact sign-flip + Holm, decision rule, machine-checkable binding block and a scope declaration — see `docs/design_notes.md` §17 and `DECISION_LOG.md` |
 | `confirmation_frozen_dynamic.json` | **separate draft pre-registration for dynamic chunking and HCA** (`manifest_version: 4`; not frozen): H1 segmentation quality, H2 retrieval precision and H3 long-range coverage, plus the controls that must be scheduled before a disjoint test corpus is reserved — see `DECISION_LOG.md` |
 
 ### Evidence and design records
@@ -713,13 +740,17 @@ python -m explib.confirmation auto            # UNATTENDED: the same chain as `f
                                               #   primary comparisons / alpha) is archived for ASYNCHRONOUS human
                                               #   review instead of blocking the launch
 python -m explib.confirmation phase P5C       # train all six frozen arms at the manifest seed list (resumable; 0-5 main arms covered by P3MT/P4MT)
+python -m explib.confirmation phase P5H       # diagnostic: training-health gate for the frozen arms (not used for selection)
+python -m explib.confirmation phase P5PW      # zero GPU: conditional power check on the P5C validation deltas
+python -m explib.confirmation phase P5T       # FROZEN final test on wiki.test.raw (requires the freeze manifest)
 python -m explib.confirmation phase P5MP      # extended probe (all modes + NIAH + controls) at the manifest seed list
 python -m explib.confirmation phase P5S2      # token-matched large scale arm (8000 steps)
 python -m explib.confirmation phase P5S3      # compute-matched large scale arm (param-ratio steps)
-python -m explib.confirmation phase P5T       # FROZEN final test on wiki.test.raw (requires the freeze manifest)
 python -m explib.confirmation analysis        # zero-GPU: shared v10 stats + frozen final-test stats
 python -m explib.confirmation report          # rebuild REPORT_v12.md from disk (zero GPU)
 ```
+
+`python -m explib.confirmation finaltest` is a shortcut for `phase P5T`; use one or the other, not both, because the test read is one-shot.
 
 P5T refuses to run without `confirmation_frozen.json`, refuses a manifest whose
 smallest attainable Holm p exceeds alpha (a plan that cannot confirm is a design
@@ -827,33 +858,20 @@ above belong to the v6 driver; `explib` drivers leave the instance running.
 
 ### Common pitfalls
 
-- **Run from the repository root.** The drivers resolve `results_*/`,
-  `analysis_*/` and the frozen manifests relative to the checkout.
-- **A bare v6 invocation trains.** `python run_gapfill.py` uses the default
-  `full` mode; use `smoke` when you only want a plumbing check.
-- **Use `--help` before a mode.** `python -m explib.<driver> --help` prints the
-  driver description; the mode list is in [Study at a glance](#study-at-a-glance).
-  Do not append `--help` after a positional mode:
-  `python run_gapfill.py smoke --help` starts a smoke run.
-- **A targeted pytest is not the full suite.** `make test` discovers every
-  `test_*.py` module; `pytest path::test` checks only that case.
-- **The test split is one-shot.** Only P5T reads `wiki.test.raw`; do not add a
-  test-reading script around it.
-- **A stale cache is not rebuilt silently.** Delete `wt103_cache/` after
-  changing the train corpus, then rebuild before comparing runs.
-- **A report is not evidence by itself.** Publish and verify an archive
-  (`archive_release.py`) before quoting a number.
-- **Fresh checkouts have no results.** `results_*/` and `analysis_*/` are
-  gitignored; `python -m explib.confirmation report`,
-  `python build_report.py`, and the other `report` modes rebuild only from
-  artifacts that exist locally.
-- **Kernel mode is opt-in and hardware-dependent.** With `CSA_KERNEL` unset the
-  eager path runs anywhere; `CSA_KERNEL=1` requires CUDA + Triton, while
-  `CSA_KERNEL=ref` selects the CPU-runnable reference twin for debugging.
-- **Missing optional packages / offline Hub.** Install `requirements.lock`
-  before running the suite; for data access, set `WT103_RAW_TXT` to a local
-  raw-text directory or opt into `CSA_HF_MIRROR=1` only when the official Hub
-  is unreachable.
+Treat this as a checklist when a command behaves unexpectedly.
+
+| symptom | why | what to do |
+|---|---|---|
+| artifacts or manifests are "not found" | the drivers resolve `results_*/`, `analysis_*/` and frozen inputs relative to the checkout | run every command from the repository root |
+| a bare v6 command starts a long run | `python run_gapfill.py` defaults to `full` | use `python run_gapfill.py smoke` for a plumbing check |
+| `--help` starts a run instead of printing help | a positional mode is consumed before the flag (notably in the v6 script) | put `--help` first: `python run_gapfill.py --help`, or `python -m explib.<driver> --help` |
+| a passing targeted test did not cover the change | `make test` discovers every `test_*.py` module; `pytest path::test` checks only that case | run `make test` before trusting the change |
+| a test-split read cannot be undone | `P5T` is the one-shot evaluation; only it reads `wiki.test.raw` | do not add a test-reading script around it; inspect the plan first |
+| results changed after editing the corpus | a stale `wt103_cache/` is not rebuilt silently | delete the cache, rebuild it, then compare runs |
+| a report number cannot be audited | a report is not evidence by itself | publish and verify an archive (`archive_release.py`) before quoting a number |
+| a rebuilt report is empty or says there is no data | `results_*/` and `analysis_*/` are gitignored and absent from a fresh checkout | run the producing phase first, or point `report` at an existing artifact directory |
+| kernel mode fails on this machine | `CSA_KERNEL=1` requires CUDA + Triton | unset `CSA_KERNEL` for eager, or use `CSA_KERNEL=ref` for the CPU reference twin |
+| imports or the Hub fail offline | optional packages are not installed, or the official Hub is unreachable | install `requirements.lock`; set `WT103_RAW_TXT` to local raw text, or use `CSA_HF_MIRROR=1` only as an explicit fallback |
 
 ## Measurement guardrails
 
