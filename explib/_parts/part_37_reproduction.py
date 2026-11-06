@@ -153,7 +153,10 @@ def _repro_render(value):
 
 
 def _repro_validate_tolerance(name, value):
-    if isinstance(value, bool):
+    # ``np.bool_`` is not a Python ``bool`` subclass, but it is still a flag,
+    # not a tolerance: ``float(np.bool_(True))`` used to become 1.0 and make a
+    # replay comparison arbitrarily loose.
+    if isinstance(value, (bool, np.bool_)):
         raise ValueError(f'reproduction: {name} must be a finite non-negative number')
     try:
         number = float(value)

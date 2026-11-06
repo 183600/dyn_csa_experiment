@@ -192,16 +192,25 @@ def _bt_declared_list(values, label, problems):
     for index, value in enumerate(values):
         if _bt_is_bool(value):
             problems.append(
-                f'{label}[{index}]={value!r} is not a string/integer '
+                f'{label}[{index}]={_bt_repr(value)} is not a string/integer '
                 'identifier')
             continue
         if isinstance(value, numbers.Integral):
-            token = str(int(value))
+            try:
+                # A hand-edited artifact can carry an integer beyond
+                # CPython's decimal-conversion limit.  Report the malformed
+                # identifier instead of raising while normalising it.
+                token = str(int(value))
+            except (ValueError, MemoryError):
+                problems.append(
+                    f'{label}[{index}] is an integer identifier too large to '
+                    'write as JSON')
+                continue
         elif isinstance(value, (float, np.floating)):
             parsed = _bt_int(value, minimum=0)
             if parsed is None:
                 problems.append(
-                    f'{label}[{index}]={value!r} is not a non-negative '
+                    f'{label}[{index}]={_bt_repr(value)} is not a non-negative '
                     'integer identifier')
                 continue
             token = str(parsed)
@@ -209,7 +218,7 @@ def _bt_declared_list(values, label, problems):
             token = value.strip()
         else:
             problems.append(
-                f'{label}[{index}]={value!r} is not a string/integer '
+                f'{label}[{index}]={_bt_repr(value)} is not a string/integer '
                 'identifier')
             continue
         if not token:
@@ -217,7 +226,7 @@ def _bt_declared_list(values, label, problems):
             continue
         if token in seen:
             problems.append(f'{label} contains duplicate identifier '
-                            f'{token!r}')
+                            f'{_bt_repr(token)}')
             continue
         seen.add(token)
         out.append(token)

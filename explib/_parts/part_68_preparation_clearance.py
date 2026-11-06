@@ -108,22 +108,36 @@ def _prep_study_level(protocol):
 
 def _prep_int(value, *, minimum=None):
     """Exact integer (booleans rejected), or None."""
-    if isinstance(value, bool):
+    # ``np.bool_`` is not a Python bool subclass, but it is still a flag and
+    # must not become a count.  The check is explicit for the same reason as
+    # the number reader below.
+    if isinstance(value, (bool, np.bool_)):
         return None
-    if isinstance(value, int):
+    if isinstance(value, (int, np.integer)):
         out = int(value)
-    elif isinstance(value, float) and value.is_integer():
+    elif isinstance(value, (float, np.floating)) and value.is_integer():
         out = int(value)
     else:
         return None
     if minimum is not None and out < minimum:
+        return None
+    try:
+        # A count that CPython cannot spell as a decimal integer cannot be
+        # written into the clearance's strict-JSON body.  Treat it as an
+        # unusable malformed value rather than failing later while hashing or
+        # writing the artifact.
+        str(out)
+    except (ValueError, MemoryError):
         return None
     return out
 
 
 def _prep_number(value):
     """Finite float, or None; booleans/strings are not measurements."""
-    if value is None or isinstance(value, (bool, str, bytes, bytearray)):
+    # ``np.bool_`` is not a ``bool`` subclass.  Without the explicit check,
+    # ``float(np.bool_(True))`` would be accepted as the measurement 1.0 and
+    # could satisfy a registered power threshold.
+    if value is None or isinstance(value, (bool, np.bool_, str, bytes, bytearray)):
         return None
     try:
         out = float(value)
