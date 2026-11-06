@@ -1,0 +1,100 @@
+"""Scale/tamper regressions for curve-level simultaneous inference.
+
+The exact path normalises each condition by its max-abs scale before the
+max-T/range enumeration.  The normal fallback used by larger panels must do the
+same: squaring an unscaled ``1e300`` effect overflows even though the mean,
+standard error, p-value and interval are representable.  These are CPU-only,
+zero-experiment checks.
+"""
+import copy
+import json
+import math
+import os
+import sys
+
+import pytest
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from test_support import *  # noqa: F401,F403
+
+REPO = os.path.dirname(os.path.abspath(__file__))
+SEEDS = list(range(21))
+
+
+def _scaled_curve(scale):
+    effects = {
+        label: [scale * (-0.20 + 0.01 * math.sin(i + k))
+                for i in range(len(SEEDS))]
+        for k, label in enumerate(('a', 'b', 'c'))
+    }
+    return effects
+
+
+def test_huge_effects_have_finite_fallback_summaries_and_replay():
+    base = _scaled_curve(1.0)
+    baseline = L.curve_simultaneous_inference(
+        list(base), base, seeds=SEEDS, alpha=0.05, min_n=6,
+        margin=0.05, flatness_margin=0.05)
+    for scale in (1e100, 1e200, 1e300, 1.7e308):
+        effects = _scaled_curve(scale)
+        artifact = L.build_curve_inference(
+            list(effects), effects, seeds=SEEDS, alpha=0.05, min_n=6,
+            margin=0.05 * scale, flatness_margin=0.05 * scale)
+        result = artifact['result']
+        assert result['method'] == 'normal_approximation_fallback'
+        row = result['per_condition']['a']
+        for key in ('mean', 'sd', 'sem'):
+            assert row[key] is not None, (scale, key)
+            assert math.isfinite(row[key]), (scale, key, row[key])
+        assert row['ci95_pointwise'] is not None
+        assert all(math.isfinite(x) for x in row['ci95_pointwise'])
+        assert row['p_pointwise_lower'] is not None
+        assert row['p_pointwise_lower'] == pytest.approx(
+            baseline['per_condition']['a']['p_pointwise_lower'])
+        assert result['uniform']['negative']['supported'] is True
+        verdict = L.validate_curve_inference(artifact)
+        assert verdict['status'] in ('ok', 'warnings'), verdict
+        assert verdict['problems'] == [], verdict
+        json.dumps(artifact, allow_nan=False)
+        json.dumps(verdict, allow_nan=False)
+
+
+def test_replay_false_still_rejects_knob_and_shape_tamper():
+    effects = {
+        'a': [-0.20, -0.30, -0.10, -0.25, -0.15, -0.22],
+        'b': [-0.10, -0.20, -0.15, -0.18, -0.12, -0.16],
+    }
+    artifact = L.build_curve_inference(
+        list(effects), effects, seeds=list(range(6)), min_n=3)
+    cases = [
+        (('inputs', 'alpha'), 0.3),
+        (('inputs', 'min_n'), 2),
+        (('result', 'alpha'), 0.3),
+        (('result', 'min_n'), 2),
+        (('result', 'kind'), 'not_curve_inference'),
+        (('result', 'schema'), 2),
+        (('result', 'per_condition', 'a', 'p_adj_single'), 1.5),
+    ]
+    for path, value in cases:
+        bad = copy.deepcopy(artifact)
+        node = bad
+        for key in path[:-1]:
+            node = node[key]
+        node[path[-1]] = value
+        bad['content_sha256'] = L._cv_content_sha(bad)
+        verdict = L.validate_curve_inference(bad, replay=False)
+        assert verdict['status'] == 'fail', (path, verdict)
+        assert verdict['problems'], (path, verdict)
+        json.dumps(verdict, allow_nan=False)
+
+
+def test_seed_cap_and_unrepresentable_seed_label_fail_closed():
+    with pytest.raises(ValueError, match='maximum|4096'):
+        L.curve_simultaneous_inference(
+            ['a'], {'a': [0.1] * 4097})
+    with pytest.raises(ValueError, match='maximum|4096'):
+        L.curve_simultaneous_inference(
+            ['a'], {'a': [0.1] * 4097}, seeds=list(range(4097)))
+    with pytest.raises(ValueError, match='strict-JSON|representable'):
+        L.curve_simultaneous_inference(
+            ['a'], {'a': [0.1, 0.2]}, seeds=[10 ** 10000, 1])

@@ -530,10 +530,12 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
             if key not in _ci_stats:
                 return None
             value = _ci_stats.get(key)
-            if (isinstance(value, (int, float))
-                    and not isinstance(value, bool)
-                    and math.isfinite(float(value)) and float(value) > 0.0):
-                return float(value)
+            # ``float(10**10000)`` raises OverflowError rather than returning
+            # inf; an untrusted manifest margin must become a named warning,
+            # not abort the whole result analysis.
+            number = L._finite_scalar(value)
+            if number is not None and number > 0.0:
+                return float(number)
             res.setdefault('warnings', []).append(
                 f'{key} is declared in the frozen plan but is not a positive '
                 'finite margin; no curve-level equivalence claim is made')

@@ -37,6 +37,17 @@ def _cv_gate_path_text(value):
         return None
 
 
+def _cv_gate_key_text(value, limit=120):
+    """Bounded display text for an untrusted comparison key."""
+    if isinstance(value, str):
+        return value if len(value) <= limit else value[:limit - 3] + '...'
+    try:
+        text = str(value)
+    except Exception:
+        return _cv_gate_repr(value, limit=limit)
+    return text if len(text) <= limit else text[:limit - 3] + '...'
+
+
 def _cv_gate_resolve(path):
     if path is not None:
         if isinstance(path, (str, os.PathLike)):
@@ -111,7 +122,10 @@ def _cv_gate_embedded(test_stats, L, out):
             'cannot be located')
         return 0
     seen = 0
-    for name in sorted(comps):
+    # JSON object keys are strings, but the gate is also callable with an
+    # in-memory report; sorting mixed/huge keys by their raw value raises
+    # TypeError/ValueError before a diagnostic can be produced.
+    for name in sorted(comps, key=_cv_gate_key_text):
         comp = comps.get(name)
         if not isinstance(comp, dict):
             continue
@@ -120,7 +134,7 @@ def _cv_gate_embedded(test_stats, L, out):
             continue
         seen += 1
         verdict = L.validate_curve_inference_block(block)
-        _cv_gate_add_block(out, name, verdict)
+        _cv_gate_add_block(out, _cv_gate_key_text(name), verdict)
     return seen
 
 

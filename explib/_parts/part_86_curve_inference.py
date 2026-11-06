@@ -48,6 +48,10 @@ CURVE_INFERENCE_MAX_N = 20
 CURVE_INFERENCE_HARD_MAX_N = 20
 CURVE_INFERENCE_MAX_CONDITIONS = 64
 CURVE_INFERENCE_MAX_SEEDS = 4096
+# Seeds are labels, not measurements, but an artifact is strict JSON: keep the
+# declared value inside the range CPython can spell (the same bound the other
+# scale-safe artifacts use) so a hash/validation diagnostic is possible.
+CURVE_INFERENCE_MAX_REPORTABLE_INT = 10 ** 4000
 CURVE_INFERENCE_MAX_PAIRS = 200
 CURVE_INFERENCE_TOL = 1e-12
 
@@ -201,6 +205,16 @@ def _cv_normalise_conditions(conditions):
     if isinstance(conditions, (str, bytes, bytearray, dict)):
         raise ValueError('conditions must be an ordered iterable of labels, '
                          f'not a {type(conditions).__name__}')
+    # A sized over-large declaration can be rejected without materialising it
+    # (a future panel may pass a range or a huge list of candidate lengths).
+    try:
+        declared_len = len(conditions)
+    except (TypeError, OverflowError):
+        declared_len = None
+    if (declared_len is not None
+            and declared_len > CURVE_INFERENCE_MAX_CONDITIONS):
+        raise ValueError(f'conditions has {declared_len} labels; the supported '
+                         f'maximum is {CURVE_INFERENCE_MAX_CONDITIONS}')
     try:
         raw = list(conditions)
     except TypeError:
@@ -254,9 +268,24 @@ def _cv_normalise_effects(conditions, effects):
             raise ValueError(f'effects[{label!r}] must be an iterable of '
                              'numbers, not a string/mapping')
         try:
+            row_len = len(row)
+        except (TypeError, OverflowError):
+            row_len = None
+        if row_len is not None and row_len > CURVE_INFERENCE_MAX_SEEDS:
+            raise ValueError(
+                f'effects[{label!r}] has {row_len} values; the supported '
+                f'maximum is {CURVE_INFERENCE_MAX_SEEDS} seeds')
+        try:
             values = list(row)
         except TypeError:
             raise ValueError(f'effects[{label!r}] is not an iterable') from None
+        # Check the cheap length cap before validating every element.  A
+        # malformed multi-million-entry row must fail immediately instead of
+        # consuming memory/time proportional to its size.
+        if len(values) > CURVE_INFERENCE_MAX_SEEDS:
+            raise ValueError(
+                f'effects[{label!r}] has {len(values)} values; the supported '
+                f'maximum is {CURVE_INFERENCE_MAX_SEEDS} seeds')
         clean = []
         for index, value in enumerate(values):
             if isinstance(value, (bool, np.bool_)):
@@ -275,6 +304,10 @@ def _cv_normalise_inputs(conditions, effects, seeds, *, alpha, min_n,
     if not rows:
         raise ValueError('effects is empty')
     width = len(rows[0])
+    if width > CURVE_INFERENCE_MAX_SEEDS:
+        raise ValueError(
+            f'effects rows have {width} values; the supported maximum is '
+            f'{CURVE_INFERENCE_MAX_SEEDS} seeds')
     for label, row in zip(conditions, rows):
         if len(row) != width:
             raise ValueError(f'effects[{label!r}] has {len(row)} values but '
@@ -290,20 +323,45 @@ def _cv_normalise_inputs(conditions, effects, seeds, *, alpha, min_n,
             raise ValueError('seeds must be an iterable of integers, not a '
                              f'{type(seeds).__name__}')
         try:
+            declared_seed_len = len(seeds)
+        except (TypeError, OverflowError):
+            declared_seed_len = None
+        if (declared_seed_len is not None
+                and declared_seed_len > CURVE_INFERENCE_MAX_SEEDS):
+            raise ValueError(
+                f'seeds has {declared_seed_len} entries; the supported '
+                f'maximum is {CURVE_INFERENCE_MAX_SEEDS}')
+        try:
             raw_seeds = list(seeds)
         except TypeError:
             raise ValueError('seeds must be an iterable of integers') from None
+        # Check the declared-set cap before the cheaper alignment message:
+        # an over-large seed vector is a scale error regardless of how many
+        # effect values a malformed caller supplied.
+        if len(raw_seeds) > CURVE_INFERENCE_MAX_SEEDS:
+            raise ValueError(
+                f'seeds has {len(raw_seeds)} entries; the supported maximum '
+                f'is {CURVE_INFERENCE_MAX_SEEDS}')
         if len(raw_seeds) != width:
             raise ValueError(f'seeds has {len(raw_seeds)} entries but the '
                              f'effect rows have {width}')
         seed_labels = []
+        seen_seeds = set()
         for index, value in enumerate(raw_seeds):
             parsed = _as_seed_int(value)  # noqa: F821 (part_13)
             if parsed is None:
                 raise ValueError(f'seeds[{index}] is not an exact integer: '
                                  f'{_cv_repr(value)}')
-            if parsed in seed_labels:
+            if not (-CURVE_INFERENCE_MAX_REPORTABLE_INT <= parsed
+                    <= CURVE_INFERENCE_MAX_REPORTABLE_INT):
+                # Beyond this bound str()/json.dumps of the label itself may
+                # raise, so the artifact could not be hashed or replayed.
+                raise ValueError(
+                    f'seeds[{index}] is outside the strict-JSON representable '
+                    f'integer range +/-{CURVE_INFERENCE_MAX_REPORTABLE_INT}')
+            if parsed in seen_seeds:
                 raise ValueError(f'duplicate seed {parsed!r}')
+            seen_seeds.add(parsed)
             seed_labels.append(parsed)
         declared_seeds = True
     alpha = _validated_alpha(alpha, context='curve inference alpha')  # noqa: F821
@@ -363,6 +421,7 @@ def _cv_not_estimable(reason, *, conditions=None, seeds=None,
                       dropped=None, n_input=None, warnings=None):
     return {
         'kind': 'curve_simultaneous_inference',
+        'schema': CURVE_INFERENCE_SCHEMA,
         'status': 'not_estimable',
         'reason': str(reason),
         'conditions': list(conditions or []),
@@ -501,23 +560,42 @@ def _cv_exact_enumeration(D, *, alpha, margin, flatness_margin):
 
 
 def _cv_normal_enumeration(D, *, alpha, margin, flatness_margin):
-    """Normal-approximation fallback for n > the exact-enumeration cap."""
+    """Normal-approximation fallback for n > the exact-enumeration cap.
+
+    The fallback is used exactly where a future panel can have hundreds of
+    seeds, so it must not square an unscaled effect: ``std(1e200)`` overflows
+    even though the mean, standard error and p-value are representable.  Work
+    on each condition's max-abs scale (the same row-scaling used by the exact
+    max-T path) and restore units only for the reported summaries.
+    """
     K, n = D.shape
     normal = statistics.NormalDist()  # noqa: F821 (stdlib import added below)
-    means = D.mean(axis=1)
-    sds = D.std(axis=1, ddof=1)
-    sems = sds / math.sqrt(n)
-    safe_sem = np.where(sems > 0.0, sems, np.nan)
-    z = np.where(np.isfinite(safe_sem), means / safe_sem, 0.0)
-    # z = mean/se.  The lower-tail p (H1: mean < 0) is Phi(z); the
-    # upper-tail p (H1: mean > 0) is 1-Phi(z).
+    with np.errstate(over='ignore', invalid='ignore', divide='ignore'):
+        row_scale = np.max(np.abs(D), axis=1) if K else np.empty(0)
+        row_div = np.where(row_scale > 0.0, row_scale, 1.0)
+        Dn = D / row_div[:, None]
+        mean_n = Dn.mean(axis=1) if K else np.empty(0)
+        sd_n = (Dn.std(axis=1, ddof=1) if (K and n > 1)
+                else np.zeros(K))
+        sem_n = sd_n / math.sqrt(n) if n > 0 else np.zeros(K)
+        means = mean_n * row_scale
+        sds = sd_n * row_scale
+        sems = sem_n * row_scale
+    # z = mean/se.  The lower-tail p (H1: mean < 0) is Phi(z); the upper-tail
+    # p (H1: mean > 0) is 1-Phi(z).  Taking the ratio in normalised units keeps
+    # it finite when both the mean and the SE are near float64's limit.
+    z = np.zeros(K, dtype=float)
+    pos = sem_n > 0.0
+    with np.errstate(over='ignore', invalid='ignore', divide='ignore'):
+        z[pos] = mean_n[pos] / sem_n[pos]
     p_lower = np.asarray([normal.cdf(float(v)) for v in z])
     p_upper = np.asarray([1.0 - normal.cdf(float(v)) for v in z])
     # A measured zero spread with a non-zero mean is a degenerate but
     # directional panel: the normal limit must not turn it into p=0.5.
-    p_lower = np.where(sems == 0.0,
+    spread_zero = ~pos
+    p_lower = np.where(spread_zero,
                        np.where(means < 0.0, 0.0, 1.0), p_lower)
-    p_upper = np.where(sems == 0.0,
+    p_upper = np.where(spread_zero,
                        np.where(means > 0.0, 0.0, 1.0), p_upper)
     p_two = np.minimum(1.0, 2.0 * np.minimum(p_lower, p_upper))
     _p = 1.0 - alpha / 2.0
@@ -527,14 +605,27 @@ def _cv_normal_enumeration(D, *, alpha, margin, flatness_margin):
         # two-sided level instead of crashing the fallback.
         _p = 1.0 - 1e-15
     zcrit = normal.inv_cdf(_p)
-    ci = np.column_stack([means - zcrit * sems, means + zcrit * sems])
+    with np.errstate(over='ignore', invalid='ignore'):
+        ci_n = np.column_stack([mean_n - zcrit * sem_n,
+                                mean_n + zcrit * sem_n])
+        ci = ci_n * row_scale[:, None]
+    # The range is a location-invariant summary; compute it on the globally
+    # normalised matrix so opposite-signed effects cannot overflow the mean.
+    data_scale = float(np.max(np.abs(D))) if D.size else 0.0
+    if data_scale > 0.0:
+        with np.errstate(over='ignore', invalid='ignore'):
+            mean_g = (D / data_scale).mean(axis=1)
+            range_observed = float((mean_g.max() - mean_g.min())
+                                   * data_scale)
+    else:
+        range_observed = 0.0
     out = {
         'total': None,
         'p_lower': p_lower,
         'p_upper': p_upper,
         'p_floor_one_sided': None,
         'p_floor_two_sided': None,
-        'range_observed': float(means.max() - means.min()),
+        'range_observed': range_observed,
         'range_critical': None,
         'range_upper_bound': None,
         'p_range': None,
@@ -550,12 +641,16 @@ def _cv_normal_enumeration(D, *, alpha, margin, flatness_margin):
         'zcrit': zcrit,
     }
     if margin is not None:
-        p_low = np.asarray([1.0 - normal.cdf(float((m + margin) / s))
-                            if s > 0.0 else (1.0 if m + margin <= 0.0 else 0.0)
-                            for m, s in zip(means, sems)])
-        p_high = np.asarray([1.0 - normal.cdf(float((margin - m) / s))
-                             if s > 0.0 else (1.0 if margin - m <= 0.0 else 0.0)
-                             for m, s in zip(means, sems)])
+        with np.errstate(over='ignore', invalid='ignore', divide='ignore'):
+            margin_n = margin / row_div
+            p_low = np.asarray([
+                1.0 - normal.cdf(float((m + gm) / s)) if s > 0.0
+                else (1.0 if m + gm <= 0.0 else 0.0)
+                for m, s, gm in zip(mean_n, sem_n, margin_n)])
+            p_high = np.asarray([
+                1.0 - normal.cdf(float((gm - m) / s)) if s > 0.0
+                else (1.0 if gm - m <= 0.0 else 0.0)
+                for m, s, gm in zip(mean_n, sem_n, margin_n)])
         p_tost = np.maximum(p_low, p_high)
         out['p_tost'] = p_tost
         out['p_low_margin'] = p_low
@@ -567,18 +662,27 @@ def _cv_normal_enumeration(D, *, alpha, margin, flatness_margin):
         pairs = [(i, j) for i in range(K) for j in range(i + 1, K)]
         if len(pairs) <= CURVE_INFERENCE_MAX_PAIRS:
             pair_tost = []
-            for i, j in pairs:
-                diff = D[i] - D[j]
-                sd = float(np.std(diff, ddof=1))
-                se = sd / math.sqrt(n) if sd > 0.0 else 0.0
-                md = float(np.mean(diff))
-                if se > 0.0:
-                    pl = 1.0 - normal.cdf((md + flatness_margin) / se)
-                    ph = 1.0 - normal.cdf((flatness_margin - md) / se)
-                else:
-                    pl = 0.0 if md + flatness_margin > 0.0 else 1.0
-                    ph = 0.0 if flatness_margin - md > 0.0 else 1.0
-                pair_tost.append(max(pl, ph))
+            if data_scale > 0.0:
+                Dg = D / data_scale
+                with np.errstate(over='ignore', invalid='ignore', divide='ignore'):
+                    margin_n = flatness_margin / data_scale
+                for i, j in pairs:
+                    diff = Dg[i] - Dg[j]
+                    sd = float(np.std(diff, ddof=1)) if n > 1 else 0.0
+                    se = sd / math.sqrt(n) if sd > 0.0 else 0.0
+                    md = float(np.mean(diff))
+                    if se > 0.0:
+                        pl = 1.0 - normal.cdf((md + margin_n) / se)
+                        ph = 1.0 - normal.cdf((margin_n - md) / se)
+                    else:
+                        pl = 0.0 if md + margin_n > 0.0 else 1.0
+                        ph = 0.0 if margin_n - md > 0.0 else 1.0
+                    pair_tost.append(max(pl, ph))
+            else:
+                # All effects are exactly zero; without a location shift the
+                # pairwise difference is degenerate at zero.
+                for _i, _j in pairs:
+                    pair_tost.append(0.0 if flatness_margin > 0.0 else 1.0)
             out['pair_tost'] = np.asarray(pair_tost)
             out['flatness_equivalence_p'] = float(np.max(pair_tost))
             out['pairs'] = pairs
@@ -733,14 +837,16 @@ def curve_simultaneous_inference(conditions, effects, *, seeds=None,
     min_n = int(inputs['min_n'])
     margin = inputs['margin']
     flatness_margin = inputs['flatness_margin']
-    means = (np.asarray([float(np.mean(D[k])) for k in range(len(conds))])
+    # In the fallback branch use the already scale-normalised summaries from
+    # ``_cv_normal_enumeration``.  Recomputing ``np.std(D[k])`` here would
+    # square an unscaled 1e200 effect and turn a representable SE into None.
+    means = (np.asarray(enum['means'], dtype=float)
              if maxt is None else
              np.asarray([maxt['contrasts'][label]['mean'] for label in conds]))
-    sds = (np.asarray([float(np.std(D[k], ddof=1)) for k in range(len(conds))])
+    sds = (np.asarray(enum['sds'], dtype=float)
            if maxt is None else
            np.asarray([maxt['contrasts'][label]['sd'] for label in conds]))
-    sems = (np.asarray([float(np.std(D[k], ddof=1) / math.sqrt(n))
-                        for k in range(len(conds))])
+    sems = (np.asarray(enum['sems'], dtype=float)
             if maxt is None else
             np.asarray([maxt['contrasts'][label]['sem'] for label in conds]))
     per_condition = {}
@@ -752,7 +858,7 @@ def curve_simultaneous_inference(conditions, effects, *, seeds=None,
             p_two = _cv_num(enum['p_two'][k])
             p_lower = _cv_num(enum['p_lower'][k])
             p_upper = _cv_num(enum['p_upper'][k])
-            ci_sim = [float(x) for x in enum['ci'][k]]
+            ci_sim = [_cv_num(x) for x in enum['ci'][k]]
             ci_point = _cv_t_interval(mean, sem, n, alpha)
             # The normal fallback has no exact max-T null; use an explicitly
             # approximate Bonferroni family p so the direction flag is not
@@ -1058,30 +1164,124 @@ def _cv_shape_problems(inputs, result):
     problems = []
     if not isinstance(result, dict):
         return ['result must be an object']
+    if result.get('kind') != 'curve_simultaneous_inference':
+        problems.append(
+            "result.kind must be 'curve_simultaneous_inference', got "
+            f'{_cv_repr(result.get("kind"))}')
+    if result.get('schema') != CURVE_INFERENCE_SCHEMA:
+        problems.append(
+            f'result.schema must be {CURVE_INFERENCE_SCHEMA}, got '
+            f'{_cv_repr(result.get("schema"))}')
     status = result.get('status')
     if status not in ('ok', 'warnings', 'not_estimable'):
         problems.append('result.status must be ok/warnings/not_estimable, '
                         f'got {_cv_repr(status)}')
         return problems
     if status == 'not_estimable':
+        reason = result.get('reason')
+        if not isinstance(reason, str) or not reason.strip():
+            problems.append('result.reason must be a non-empty string for a '
+                            'not_estimable result')
+    if not isinstance(inputs, dict):
+        problems.append('inputs must be an object')
         return problems
+
+    # Validate the knobs replay would consume even when replay is skipped by
+    # tamper/archive tooling.  Without this, rewriting inputs.alpha (or the
+    # result copy) and refreshing the hash would look structurally valid.
+    try:
+        alpha = _cv_number(inputs.get('alpha'), 'inputs.alpha')
+        if not (0.0 < alpha < 1.0):
+            raise ValueError(f'inputs.alpha must be in (0,1), got {alpha!r}')
+    except (TypeError, ValueError) as exc:
+        problems.append(f'inputs.alpha is malformed: {exc}')
+        alpha = None
+    try:
+        min_n = _cv_int(inputs.get('min_n'), 'inputs.min_n', minimum=1,
+                        maximum=CURVE_INFERENCE_MAX_SEEDS)
+    except (TypeError, ValueError) as exc:
+        problems.append(f'inputs.min_n is malformed: {exc}')
+        min_n = None
+    input_margins = {}
+    for key in ('margin', 'flatness_margin'):
+        value = inputs.get(key)
+        if value is None:
+            input_margins[key] = None
+            continue
+        try:
+            input_margins[key] = _cv_number(value, f'inputs.{key}',
+                                            positive=True)
+        except (TypeError, ValueError) as exc:
+            problems.append(f'inputs.{key} is malformed: {exc}')
+            input_margins[key] = None
+
     conditions = inputs.get('conditions')
     got = result.get('conditions')
     if not isinstance(got, list) or got != conditions:
         problems.append('result.conditions does not match the declared order')
+
+    if status != 'not_estimable':
+        try:
+            result_alpha = _cv_number(result.get('alpha'), 'result.alpha')
+        except (TypeError, ValueError) as exc:
+            problems.append(f'result.alpha is malformed: {exc}')
+        else:
+            if (alpha is not None
+                    and not math.isclose(result_alpha, alpha,
+                                         rel_tol=1e-12, abs_tol=1e-15)):
+                problems.append('result.alpha does not match inputs.alpha')
+        try:
+            result_min_n = _cv_int(result.get('min_n'), 'result.min_n',
+                                   minimum=1,
+                                   maximum=CURVE_INFERENCE_MAX_SEEDS)
+        except (TypeError, ValueError) as exc:
+            problems.append(f'result.min_n is malformed: {exc}')
+        else:
+            if min_n is not None and result_min_n != min_n:
+                problems.append('result.min_n does not match inputs.min_n')
+        for key in ('margin', 'flatness_margin'):
+            value = result.get(key)
+            wanted = input_margins.get(key)
+            if value is None:
+                got_margin = None
+            else:
+                try:
+                    got_margin = _cv_number(value, f'result.{key}',
+                                            positive=True)
+                except (TypeError, ValueError) as exc:
+                    problems.append(f'result.{key} is malformed: {exc}')
+                    got_margin = None
+            if wanted is None:
+                if got_margin is not None:
+                    problems.append(
+                        f'result.{key} is present but inputs.{key} is null')
+            elif (got_margin is None
+                  or not math.isclose(got_margin, wanted,
+                                      rel_tol=1e-12, abs_tol=1e-15)):
+                problems.append(
+                    f'result.{key} does not match inputs.{key}')
+
     per = result.get('per_condition')
     if not isinstance(per, dict):
         problems.append('result.per_condition must be an object')
-    elif isinstance(conditions, list) and set(per) != set(conditions):
+    elif (status != 'not_estimable' and isinstance(conditions, list)
+          and set(per) != set(conditions)):
         problems.append('result.per_condition keys do not match conditions')
     family = result.get('family')
-    if not isinstance(family, dict):
+    if status == 'not_estimable':
+        # The not-estimable result intentionally carries no family/interval
+        # object (there is no estimated curve); only its reason and declared
+        # shape are checkable.
+        pass
+    elif not isinstance(family, dict):
         problems.append('result.family must be an object')
     elif isinstance(conditions, list) and family.get('m') != len(conditions):
         problems.append('result.family.m does not match the condition count')
     try:
-        n = _cv_int(result.get('n'), 'result.n', minimum=0)
-        n_input = _cv_int(result.get('n_input'), 'result.n_input', minimum=0)
+        n = _cv_int(result.get('n'), 'result.n', minimum=0,
+                    maximum=CURVE_INFERENCE_MAX_SEEDS)
+        n_input = _cv_int(result.get('n_input'), 'result.n_input', minimum=0,
+                          maximum=CURVE_INFERENCE_MAX_SEEDS)
         if n > n_input:
             problems.append('result.n exceeds result.n_input')
         if isinstance(inputs.get('seeds'), list):
@@ -1089,6 +1289,69 @@ def _cv_shape_problems(inputs, result):
                 problems.append('result.n_input does not match inputs.seeds')
     except (TypeError, ValueError) as exc:
         problems.append(f'result counts are malformed: {exc}')
+        return problems
+    result_seeds = result.get('seeds')
+    if not isinstance(result_seeds, list):
+        problems.append('result.seeds must be a list')
+    else:
+        try:
+            parsed_seeds = [_cv_int(value, 'result.seeds[]', minimum=None)
+                            for value in result_seeds]
+        except (TypeError, ValueError) as exc:
+            problems.append(f'result.seeds is malformed: {exc}')
+        else:
+            if status != 'not_estimable' and len(parsed_seeds) != n:
+                problems.append('result.n does not match result.seeds length')
+            if len(set(parsed_seeds)) != len(parsed_seeds):
+                problems.append('result.seeds contains a duplicate seed')
+    dropped = result.get('dropped_seeds')
+    if not isinstance(dropped, list):
+        problems.append('result.dropped_seeds must be a list')
+    elif status != 'not_estimable':
+        if len(dropped) != n_input - n:
+            problems.append(
+                'result.dropped_seeds length does not match n_input - n')
+    if not isinstance(result.get('warnings'), list):
+        problems.append('result.warnings must be a list')
+    if status != 'not_estimable':
+        if not isinstance(result.get('flatness'), dict):
+            problems.append('result.flatness must be an object')
+        if not isinstance(result.get('uniform'), dict):
+            problems.append('result.uniform must be an object')
+        if not isinstance(result.get('resolved_conditions'), list):
+            problems.append('result.resolved_conditions must be a list')
+    if (status != 'not_estimable' and isinstance(per, dict)
+            and isinstance(conditions, list)):
+        for label in conditions:
+            row = per.get(label)
+            if not isinstance(row, dict):
+                problems.append(f'result.per_condition[{label!r}] must be '
+                                'an object')
+                continue
+            if row.get('condition') != label:
+                problems.append(
+                    f'result.per_condition[{label!r}].condition does not '
+                    'match its key')
+            if row.get('n') != n:
+                problems.append(
+                    f'result.per_condition[{label!r}].n does not match '
+                    'result.n')
+            for key in ('p_pointwise_two_sided', 'p_pointwise_lower',
+                        'p_pointwise_upper', 'p_adj_single',
+                        'p_adj_stepdown'):
+                value = row.get(key)
+                if value is None:
+                    continue
+                try:
+                    parsed_p = _cv_number(
+                        value, f'result.per_condition[{label!r}].{key}')
+                except (TypeError, ValueError) as exc:
+                    problems.append(str(exc))
+                    continue
+                if not (0.0 <= parsed_p <= 1.0):
+                    problems.append(
+                        f'result.per_condition[{label!r}].{key} is not a '
+                        'probability')
     return problems
 
 
