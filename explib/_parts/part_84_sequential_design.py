@@ -551,7 +551,15 @@ def sequential_boundaries(look_sizes, *, alpha=0.05, sides='two',
         for b in range(1, b_max + 1):
             cross = _seq_cross_count(surv, b, sides)
             cum = actual_cum + Fraction(int(cross), 1 << int(n_k))
-            if float(cum) <= target + 1e-12:
+            # Compare against the allocated spend with a *relative* tolerance.
+            # An absolute 1e-12 admitted a ~9e-13 tail at a look whose
+            # nominal spend was exactly zero (or whose alpha was 1e-15),
+            # making the reported FWER orders of magnitude larger than the
+            # declared alpha while fwer_ok still said True.
+            _cum_f = float(cum)
+            _within = (_cum_f <= target if target <= 0.0
+                       else _cum_f <= target * (1.0 + 1e-12))
+            if _within:
                 chosen = (int(b), int(cross), cum)
                 break
         if chosen is None:
@@ -630,7 +638,10 @@ def sequential_boundaries(look_sizes, *, alpha=0.05, sides='two',
         'boundaries': rows,
         'fwer': float(fwer),
         'fwer_nominal': float(comparison_alpha),
-        'fwer_ok': bool(fwer <= float(comparison_alpha) + 1e-12),
+        'fwer_ok': bool(
+            fwer <= float(comparison_alpha)
+            if comparison_alpha <= 0.0
+            else fwer <= float(comparison_alpha) * (1.0 + 1e-12)),
         'familywise_fwer_bound': float(min(1.0, float(fwer) * family_size)),
         'minimum_attainable_p_final': (
             min(1.0, 2.0 * math.ldexp(1.0, -int(looks[-1])))

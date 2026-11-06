@@ -524,12 +524,24 @@ def _cv_exact_enumeration(D, *, alpha, margin, flatness_margin):
     idx = min(total - 1,
               max(0, int(math.ceil((1.0 - alpha) * total)) - 1))
     range_critical = float(np.partition(range_values, idx)[idx])
+    # Exact zero effects are sign-invariant: a condition with m non-zero
+    # entries has a one-sided floor 1/2**m, not 1/2**n.  The family floor is
+    # the smallest attainable p, i.e. the one from the widest-support row
+    # (the same convention ``maxt_signflip_adjust`` reports as
+    # p_floor_single).  Using 2**n overstated resolution when any condition
+    # carried an exact zero.
+    _nz_per_row = np.count_nonzero(D, axis=1) if int(D.size) else np.empty(0)
+    _max_nz = int(_nz_per_row.max()) if _nz_per_row.size else 0
+    _floor_one = (1.0 if _max_nz <= 0
+                  else min(1.0, math.ldexp(1.0, -_max_nz)))
+    _floor_two = (1.0 if _max_nz <= 0
+                  else min(1.0, math.ldexp(2.0, -_max_nz)))
     out = {
         'total': int(total),
         'p_lower': p_lower,
         'p_upper': p_upper,
-        'p_floor_one_sided': 1.0 / float(total),
-        'p_floor_two_sided': 2.0 / float(total),
+        'p_floor_one_sided': _floor_one,
+        'p_floor_two_sided': _floor_two,
         'range_observed': obs_range * scale,
         'range_critical': range_critical * scale,
         'range_upper_bound': (obs_range + range_critical) * scale,
@@ -590,14 +602,19 @@ def _cv_normal_enumeration(D, *, alpha, margin, flatness_margin):
         z[pos] = mean_n[pos] / sem_n[pos]
     p_lower = np.asarray([normal.cdf(float(v)) for v in z])
     p_upper = np.asarray([1.0 - normal.cdf(float(v)) for v in z])
-    # A measured zero spread with a non-zero mean is a degenerate but
-    # directional panel: the normal limit must not turn it into p=0.5.
+    # A measured zero spread with a non-zero mean is degenerate; the exact
+    # branch refuses it.  The old fallback synthesised p_lower=1/p_upper=0
+    # (or the reverse), which then produced p_two=0 and a "reject" at n
+    # above the exact cap — a discrete sign-flip p can never be zero.  Mark
+    # the p-values unavailable instead and let the report call the condition
+    # unresolved.
     spread_zero = ~pos
-    p_lower = np.where(spread_zero,
-                       np.where(means < 0.0, 0.0, 1.0), p_lower)
-    p_upper = np.where(spread_zero,
-                       np.where(means > 0.0, 0.0, 1.0), p_upper)
+    p_lower = np.asarray(p_lower, dtype=float)
+    p_upper = np.asarray(p_upper, dtype=float)
+    p_lower[spread_zero] = np.nan
+    p_upper[spread_zero] = np.nan
     p_two = np.minimum(1.0, 2.0 * np.minimum(p_lower, p_upper))
+    p_two[spread_zero] = np.nan
     _p = 1.0 - alpha / 2.0
     if not (0.0 < _p < 1.0):
         # ``1 - alpha/2`` rounds to exactly 1.0 for alpha below ~1e-16;
@@ -643,13 +660,16 @@ def _cv_normal_enumeration(D, *, alpha, margin, flatness_margin):
     if margin is not None:
         with np.errstate(over='ignore', invalid='ignore', divide='ignore'):
             margin_n = margin / row_div
+            # A zero SEM is the same degenerate case as above: the exact
+            # branch has no TOST here, so do not turn no measured spread into
+            # a zero equivalence p-value.
             p_low = np.asarray([
-                1.0 - normal.cdf(float((m + gm) / s)) if s > 0.0
-                else (1.0 if m + gm <= 0.0 else 0.0)
+                (1.0 - normal.cdf(float((m + gm) / s)) if s > 0.0
+                 else float('nan'))
                 for m, s, gm in zip(mean_n, sem_n, margin_n)])
             p_high = np.asarray([
-                1.0 - normal.cdf(float((gm - m) / s)) if s > 0.0
-                else (1.0 if gm - m <= 0.0 else 0.0)
+                (1.0 - normal.cdf(float((gm - m) / s)) if s > 0.0
+                 else float('nan'))
                 for m, s, gm in zip(mean_n, sem_n, margin_n)])
         p_tost = np.maximum(p_low, p_high)
         out['p_tost'] = p_tost
@@ -1056,6 +1076,11 @@ def curve_simultaneous_inference(conditions, effects, *, seeds=None,
         warnings.append(
             'n exceeds the exact sign-flip enumeration cap; this result uses '
             'a normal-approximation fallback and is not exact')
+        if any(_cv_num(x) == 0.0 for x in sems):
+            warnings.append(
+                'at least one condition has zero seed variance; its normal '
+                'p-values and equivalence readouts are withheld rather than '
+                'reported as a zero-variance rejection')
     if len(conds) < 2:
         warnings.append('a one-condition curve cannot test flatness')
     if all(abs(float(means[k])) <= CURVE_INFERENCE_TOL for k in range(len(conds))):

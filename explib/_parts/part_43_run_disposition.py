@@ -80,34 +80,162 @@ _REPLACEMENT_MODES = ('same_cell',)
 _SUCCESS_STATUSES = ('ok',)
 _FAILURE_STATUSES = ('error', 'failed', 'truncated', 'skipped_cap')
 _KNOWN_STATUSES = _SUCCESS_STATUSES + _FAILURE_STATUSES
+# Every persisted count/label must remain strict-JSON spellable.  10**4000 is
+# below CPython 3.12's default 4300-digit conversion limit while still far
+# beyond any real attempt/seed count.
+_DISPO_MAX_REPORTABLE_INT = 10 ** 4000
+
+
+def _dispo_repr(value, limit=200, _depth=0):
+    """Bounded repr for untrusted values.
+
+    ``repr(10**10000)`` raises CPython's "Exceeds the limit ... for integer
+    string conversion" on Python 3.12+.  Diagnostics must report the bad field,
+    not replace the audit verdict with that second exception.  Ordinary values
+    keep their historical ``repr`` spelling; a container whose child is
+    unprintable is rendered recursively so the offending integer is still
+    named.
+    """
+    try:
+        text = repr(value)
+    except Exception:
+        if isinstance(value, numbers.Integral) and not isinstance(
+                value, (bool, np.bool_)):
+            return f'<unrepresentable int: {int(value).bit_length()} bits>'
+        if _depth >= 4:
+            return '<...>'
+        if isinstance(value, dict):
+            parts = []
+            for key, item in value.items():
+                parts.append(f'{_dispo_repr(key, limit, _depth + 1)}: '
+                             f'{_dispo_repr(item, limit, _depth + 1)}')
+            text = '{' + ', '.join(parts) + '}'
+        elif isinstance(value, (list, tuple)):
+            parts = [_dispo_repr(item, limit, _depth + 1) for item in value]
+            opening, closing = ('[', ']') if isinstance(value, list) else ('(', ')')
+            text = opening + ', '.join(parts) + closing
+        else:
+            return f'<unrepresentable {type(value).__name__}>'
+    return text if len(text) <= limit else text[:limit - 3] + '...'
+
+
+def _dispo_key_text(value, limit=120):
+    """Bounded mapping-key text that never stringifies a huge integer."""
+    if isinstance(value, str):
+        return value if len(value) <= limit else value[:limit - 3] + '...'
+    try:
+        text = str(value)
+    except Exception:
+        return _dispo_repr(value, limit)
+    return text if len(text) <= limit else text[:limit - 3] + '...'
+
+
+def _dispo_json_key(value, limit=500):
+    """Exact JSON object key without a decimal-conversion limit.
+
+    JSON object keys are strings, so ordinary keys keep their historical
+    ``str(key)`` spelling.  A huge integer key is rendered in exact hex; two
+    distinct huge seeds therefore stay distinct instead of collapsing to the
+    same bounded diagnostic text.  A str subclass is copied to a plain str so
+    it cannot be unhashable.
+    """
+    if isinstance(value, str):
+        return str(value)
+    if isinstance(value, numbers.Integral) and not isinstance(value, (bool, np.bool_)):
+        try:
+            return str(int(value))
+        except (ValueError, OverflowError):
+            return hex(int(value))
+    return _dispo_key_text(value, limit)
+
+
+def _dispo_default(value):
+    """Deterministic JSON fallback for an in-memory ``run_cfg`` value.
+
+    ``default=str`` used to spell an arbitrary object with its address, so two
+    processes compared unequal though the config text was the same.  Known
+    scalar wrappers keep their value; anything else is reduced to its type.
+    """
+    if isinstance(value, np.generic):
+        return _dispo_jsonable(value.item())
+    if isinstance(value, str):
+        return str(value)
+    if isinstance(value, os.PathLike):
+        return os.fspath(value)
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value).decode('utf-8', 'replace')
+    return {'__unserialisable_type__': type(value).__name__}
+
+
+def _dispo_jsonable(value, _depth=0):
+    """Strict-JSON-safe copy of an untrusted ``run_cfg`` descriptor.
+
+    Only used on the exceptional path, when the historical ``json.dumps``
+    cannot spell the value (a huge integer, a non-finite float, or an
+    unserialisable object).  The ordinary path below stays byte-identical.
+    """
+    if _depth >= 20:
+        # A constant marker would make two different deep configs compare
+        # equal and could hide a genuine supersede.  Hash the bounded repr so
+        # the fallback stays deterministic and (practically) injective.
+        try:
+            digest = hashlib.sha256(
+                _dispo_repr(value, 4000).encode('utf-8', 'replace')).hexdigest()
+        except Exception:
+            digest = '<unprintable>'
+        return {'__depth_limit_sha256__': digest}
+    if isinstance(value, dict):
+        return {_dispo_json_key(key): _dispo_jsonable(item, _depth + 1)
+                for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_dispo_jsonable(item, _depth + 1) for item in value]
+    if isinstance(value, np.generic):
+        return _dispo_jsonable(value.item(), _depth + 1)
+    if isinstance(value, (bool, str)) or value is None:
+        return value
+    if isinstance(value, numbers.Integral):
+        try:
+            str(value)
+        except (ValueError, OverflowError):
+            return {'__unrepresentable_int_hex__': hex(int(value))}
+        return int(value)
+    if isinstance(value, numbers.Real):
+        number = float(value)
+        return number if math.isfinite(number) else _dispo_repr(value)
+    if isinstance(value, os.PathLike):
+        return os.fspath(value)
+    return {'__unserialisable_type__': type(value).__name__}
 
 
 def _dispo_int(name, value, *, minimum=None, maximum=None):
     if isinstance(value, (bool, np.bool_)) or not isinstance(value, numbers.Integral):
-        raise ValueError(f'{name} must be an integer, got {value!r}')
+        raise ValueError(f'{name} must be an integer, got {_dispo_repr(value)}')
     as_int = int(value)
     if minimum is not None and as_int < minimum:
-        raise ValueError(f'{name} must be >= {minimum}, got {as_int}')
-    if maximum is not None and as_int > maximum:
-        raise ValueError(f'{name} must be <= {maximum}, got {as_int}')
+        raise ValueError(f'{name} must be >= {minimum}, got {_dispo_repr(as_int)}')
+    if maximum is None:
+        maximum = _DISPO_MAX_REPORTABLE_INT
+    if as_int > maximum:
+        raise ValueError(f'{name} must be <= {_dispo_repr(maximum)}, got '
+                         f'{_dispo_repr(as_int)}')
     return as_int
 
 
 def _dispo_bool(name, value):
     if isinstance(value, (bool, np.bool_)):
         return bool(value)
-    raise ValueError(f'{name} must be a boolean, got {value!r}')
+    raise ValueError(f'{name} must be a boolean, got {_dispo_repr(value)}')
 
 
 def _dispo_number(name, value, *, minimum=None, maximum=None):
     if isinstance(value, (bool, np.bool_)) or isinstance(value, str) or value is None:
-        raise ValueError(f'{name} must be a number, got {value!r}')
+        raise ValueError(f'{name} must be a number, got {_dispo_repr(value)}')
     try:
         out = float(value)
     except (TypeError, ValueError, OverflowError):
-        raise ValueError(f'{name} must be a number, got {value!r}')
+        raise ValueError(f'{name} must be a number, got {_dispo_repr(value)}')
     if not math.isfinite(out):
-        raise ValueError(f'{name} must be finite, got {value!r}')
+        raise ValueError(f'{name} must be finite, got {_dispo_repr(value)}')
     if minimum is not None and out < minimum:
         raise ValueError(f'{name} must be >= {minimum}, got {out}')
     if maximum is not None and out > maximum:
@@ -117,12 +245,14 @@ def _dispo_number(name, value, *, minimum=None, maximum=None):
 
 def _dispo_str_tuple(name, value, *, allow_empty=False):
     if isinstance(value, (str, bytes, bytearray)) or not isinstance(value, (list, tuple)):
-        raise ValueError(f'{name} must be a list/tuple of strings, got {value!r}')
+        raise ValueError(f'{name} must be a list/tuple of strings, got '
+                         f'{_dispo_repr(value)}')
     out = []
     seen = set()
     for item in value:
         if not isinstance(item, str) or not item.strip():
-            raise ValueError(f'{name} entries must be non-empty strings, got {item!r}')
+            raise ValueError(f'{name} entries must be non-empty strings, got '
+                             f'{_dispo_repr(item)}')
         text = item.strip()
         if text in seen:
             raise ValueError(f'{name} contains a duplicate entry {text!r}')
@@ -136,12 +266,14 @@ def _dispo_str_tuple(name, value, *, allow_empty=False):
 def _dispo_cells(cells, *, where='planned_cells'):
     """Validate a flat ``arm::seedN`` cell list and preserve its order."""
     if isinstance(cells, (str, bytes, bytearray)) or not isinstance(cells, (list, tuple)):
-        raise ValueError(f'{where} must be a list/tuple of cell labels, got {cells!r}')
+        raise ValueError(f'{where} must be a list/tuple of cell labels, got '
+                         f'{_dispo_repr(cells)}')
     out = []
     seen = set()
     for cell in cells:
         if not isinstance(cell, str) or not cell.strip():
-            raise ValueError(f'{where} entries must be non-empty strings, got {cell!r}')
+            raise ValueError(f'{where} entries must be non-empty strings, got '
+                             f'{_dispo_repr(cell)}')
         text = cell.strip()
         arm, sep, seed_text = text.rpartition('::seed')
         if not sep or not arm:
@@ -150,8 +282,12 @@ def _dispo_cells(cells, *, where='planned_cells'):
             seed = int(seed_text)
         except (TypeError, ValueError, OverflowError):
             raise ValueError(f'{where} entry {text!r} has a non-integer seed')
-        if str(seed) != seed_text or seed < 0:
-            raise ValueError(f'{where} entry {text!r} has an invalid non-negative seed')
+        if seed < 0 or seed > _DISPO_MAX_REPORTABLE_INT:
+            raise ValueError(f'{where} entry {text!r} has an invalid '
+                             'non-negative seed')
+        if str(seed) != seed_text:
+            raise ValueError(f'{where} entry {text!r} has an invalid '
+                             'non-negative seed')
         if text in seen:
             raise ValueError(f'{where} contains a duplicate cell {text!r}')
         seen.add(text)
@@ -175,20 +311,35 @@ def _dispo_policy(policy=None):
         policy = {}
     if not isinstance(policy, dict):
         raise ValueError(f'policy must be an object, got {type(policy).__name__}')
-    unknown = sorted(set(policy) - set(base))
+    # A hand-written policy can mix ordinary string keys with an unprintable
+    # integer key; sort by bounded text so the diagnostic itself cannot raise.
+    unknown = sorted(set(policy) - set(base), key=_dispo_key_text)
     if unknown:
-        raise ValueError(f'unknown disposition policy keys: {unknown}')
+        raise ValueError('unknown disposition policy keys: '
+                         f'{_dispo_repr(unknown)}')
     merged = dict(base)
     merged.update(policy)
+
+    # ``version`` and ``role`` are descriptive strings in the persisted
+    # policy.  A hand-written/third-party declaration could otherwise smuggle
+    # a huge integer or NaN into the plan, where the content hash and the
+    # eventual JSON writer would fail after validation had already passed.
+    for _key in ('version', 'role'):
+        _value = merged.get(_key)
+        if not isinstance(_value, str) or not _value.strip():
+            raise ValueError(f'policy.{_key} must be a non-empty string, got '
+                             f'{_dispo_repr(_value)}')
+        merged[_key] = _value
 
     retention = merged.get('retention')
     if retention not in _RETENTION_MODES:
         raise ValueError(f'policy.retention must be one of {list(_RETENTION_MODES)}, '
-                         f'got {retention!r}')
+                         f'got {_dispo_repr(retention)}')
     replacement = merged.get('replacement')
     if replacement not in _REPLACEMENT_MODES:
         raise ValueError(f'policy.replacement must be one of '
-                         f'{list(_REPLACEMENT_MODES)}, got {replacement!r}')
+                         f'{list(_REPLACEMENT_MODES)}, got '
+                         f'{_dispo_repr(replacement)}')
     max_cell = _dispo_int('policy.max_attempts_per_cell',
                           merged.get('max_attempts_per_cell'), minimum=1)
     max_total = merged.get('max_total_attempts')
@@ -226,16 +377,17 @@ def _dispo_policy(policy=None):
     for cls, pats in patterns.items():
         if cls not in known_classes:
             raise ValueError(f'policy.failure_class_patterns has a class '
-                             f'{cls!r} that is not declared replaceable or '
-                             'non-replaceable')
+                             f'{_dispo_repr(cls)} that is not declared '
+                             'replaceable or non-replaceable')
         clean_patterns[cls] = _dispo_str_tuple(
-            f'policy.failure_class_patterns[{cls!r}]', pats)
+            f'policy.failure_class_patterns[{_dispo_repr(cls, 120)}]', pats)
     # A declared class with no pattern is allowed (events may carry an explicit
     # `failure_class`); a pattern for an undeclared class is not.
     merged['replaceable_failure_classes'] = replaceable
     merged['non_replaceable_failure_classes'] = non_replaceable
-    merged['failure_class_patterns'] = {k: clean_patterns[k]
-                                        for k in sorted(clean_patterns)}
+    merged['failure_class_patterns'] = {
+        k: clean_patterns[k]
+        for k in sorted(clean_patterns, key=_dispo_key_text)}
     return merged
 
 
@@ -335,13 +487,14 @@ def build_run_disposition_plan(planned_cells, *, policy=None, revision=0,
             raise ValueError('a revised plan must carry a non-empty reason')
         reason = reason.strip()
     elif reason is not None:
-        reason = str(reason).strip() or None
+        reason = _dispo_key_text(reason, 500).strip() or None
     if run_cfg is not None and not isinstance(run_cfg, str):
         raise ValueError('run_cfg must be a string or None')
     return {
         'kind': 'run_disposition',
         'schema': RUN_DISPOSITION_SCHEMA,
-        'created_at': created_at or time.strftime('%Y-%m-%dT%H:%M:%S'),
+        'created_at': (_dispo_key_text(created_at, 80) if created_at
+                       else time.strftime('%Y-%m-%dT%H:%M:%S')),
         'revision': rev,
         'supersedes': sup,
         'reason': reason,
@@ -356,12 +509,28 @@ def _dispo_validate_plan(plan):
     if not isinstance(plan, dict):
         raise ValueError(f'disposition plan must be an object, got '
                          f'{type(plan).__name__}')
+    # Validate the whole persisted shape, not only the fields used by the
+    # audit: a metadata typo must fail here rather than after the raw plan has
+    # been written/chained into a downstream JSON artifact.
+    _allowed = {'kind', 'schema', 'created_at', 'revision', 'supersedes',
+                'reason', 'run_cfg', 'planned_cells', 'policy',
+                'content_sha256'}
+    _unknown = sorted(set(plan) - _allowed, key=_dispo_key_text)
+    if _unknown:
+        raise ValueError('disposition plan has unknown keys: '
+                         f'{_dispo_repr(_unknown)}')
+    for _key in ('created_at', 'run_cfg', 'reason'):
+        _value = plan.get(_key)
+        if _value is not None and not isinstance(_value, str):
+            raise ValueError(f'disposition plan {_key} must be a string or '
+                             f'null, got {_dispo_repr(_value)}')
     if plan.get('kind') != 'run_disposition':
         raise ValueError(f"disposition plan kind must be 'run_disposition', "
-                         f"got {plan.get('kind')!r}")
+                         f"got {_dispo_repr(plan.get('kind'))}")
     if plan.get('schema') != RUN_DISPOSITION_SCHEMA:
         raise ValueError(f"disposition plan schema must be "
-                         f"{RUN_DISPOSITION_SCHEMA}, got {plan.get('schema')!r}")
+                         f"{RUN_DISPOSITION_SCHEMA}, got "
+                         f"{_dispo_repr(plan.get('schema'))}")
     cells = _dispo_cells(plan.get('planned_cells'))
     pol = _dispo_policy(plan.get('policy'))
     want = _dispo_content_sha(cells, pol)
@@ -452,9 +621,9 @@ def _dispo_failure_class(event, policy):
     # pattern phrases.
     if event.get('status') in ('truncated', 'skipped_cap'):
         return 'runtime_cap', False, [str(event.get('status'))]
-    haystack = ' '.join(str(event.get(k) or '') for k in ('error', 'reason',
-                                                          'diagnosis',
-                                                          'detail')).lower()
+    haystack = ' '.join(_dispo_key_text(event.get(k) or '', 4000)
+                        for k in ('error', 'reason', 'diagnosis',
+                                  'detail')).lower()
     if not haystack.strip():
         return 'unclassified', False, []
     matches = []
@@ -487,12 +656,38 @@ def _dispo_run_cfg(value):
     if value is None:
         return None
     if isinstance(value, str):
-        return value
+        # Copy a str subclass to a plain str: it must be hashable because the
+        # canonical spelling is used as a dict key.
+        return str(value)
     try:
         return json.dumps(value, sort_keys=True, separators=(',', ':'),
-                          ensure_ascii=True, default=str, allow_nan=False)
-    except (TypeError, ValueError, OverflowError):
-        return repr(value)
+                          ensure_ascii=True, default=_dispo_default,
+                          allow_nan=False)
+    except (TypeError, ValueError, OverflowError, RecursionError):
+        try:
+            # A huge integer or a non-finite float cannot be spelled by the
+            # historical encoder.  Normalise only that malformed value; the
+            # result stays deterministic and hashable so the ledger
+            # comparison can still be reported.
+            return json.dumps(_dispo_jsonable(value), sort_keys=True,
+                              separators=(',', ':'), ensure_ascii=True,
+                              allow_nan=False)
+        except (TypeError, ValueError, OverflowError, RecursionError):
+            return _dispo_repr(value)
+
+
+def _dispo_time_text(value, limit=80):
+    """Persisted timestamp text, or null for a non-string/missing value.
+
+    Event rows are embedded verbatim in the JSON report.  A hand-edited
+    ``started_at: NaN`` or a huge integer would otherwise make the whole
+    report non-strict-JSON after the audit itself had succeeded.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    return _dispo_key_text(value, limit)
 
 
 def _dispo_event_rows(events):
@@ -506,9 +701,17 @@ def _dispo_event_rows(events):
     ``arm::seedN`` event with an inconsistent variant/seed/status still fails
     closed.
     """
+    if isinstance(events, (str, bytes, bytearray, dict)):
+        raise ValueError('events must be an iterable of cell event objects, '
+                         f'not {type(events).__name__}')
+    try:
+        event_iter = iter(events)
+    except TypeError:
+        raise ValueError('events must be an iterable of cell event objects, '
+                         f'not {type(events).__name__}') from None
     rows = []
     ignored = []
-    for i, ev in enumerate(events):
+    for i, ev in enumerate(event_iter):
         if not isinstance(ev, dict):
             raise ValueError(f'event #{i} is a {type(ev).__name__}, not an object')
         if ev.get('kind') != 'cell':
@@ -529,24 +732,27 @@ def _dispo_event_rows(events):
         seed_int = _dispo_int(f'event #{i} seed', ev.get('seed'), minimum=0)
         if seed_int != seed_from_key:
             raise ValueError(f'cell event #{i} key {key!r} disagrees with '
-                             f'seed={seed_int}')
+                             f'seed={_dispo_repr(seed_int)}')
         variant = ev.get('variant')
         if not isinstance(variant, str) or not variant:
             raise ValueError(f'cell event #{i} has no variant')
         if variant != arm:
-            raise ValueError(f'cell event #{i} variant {variant!r} disagrees '
-                             f'with key arm {arm!r}')
+            raise ValueError(f'cell event #{i} variant '
+                             f'{_dispo_repr(variant)} disagrees with key arm '
+                             f'{_dispo_repr(arm)}')
         status = ev.get('status')
         if not isinstance(status, str) or status not in _KNOWN_STATUSES:
-            raise ValueError(f'cell event #{i} has unknown status {status!r}')
+            raise ValueError(f'cell event #{i} has unknown status '
+                             f'{_dispo_repr(status)}')
         run_id = ev.get('run_id')
         if not isinstance(run_id, str) or not run_id.strip():
             run_id = None
         rows.append({'index': i, 'key': key, 'variant': arm, 'seed': seed_int,
                      'status': status, 'run_id': run_id,
                      'run_cfg': _dispo_run_cfg(ev.get('run_cfg')),
-                     'started_at': ev.get('started_at'),
-                     'finished_at': ev.get('finished_at'),
+                     'started_at': _dispo_time_text(ev.get('started_at')),
+                     'finished_at': _dispo_time_text(ev.get('finished_at')),
+                     'event': ev,
                      'failure_class': None, 'ambiguous_class': False,
                      'matched_terms': [], 'success': status in _SUCCESS_STATUSES,
                      'failure': status in _FAILURE_STATUSES})
@@ -625,7 +831,9 @@ def run_disposition_audit(events, *, planned_cells=None, plan=None,
         out['frame'] = 'precommitted'
         out['plan_revision'] = plan_valid['revision']
         out['plan_content_sha256'] = plan_valid['content_sha256']
-        out['plan_created_at'] = plan.get('created_at')
+        _plan_created = plan.get('created_at')
+        out['plan_created_at'] = (None if _plan_created is None
+                                  else _dispo_key_text(_plan_created, 80))
     elif planned_cells is not None:
         planned = _dispo_cells(planned_cells, where='planned_cells')
         pol = _dispo_policy(policy)
@@ -738,7 +946,7 @@ def run_disposition_audit(events, *, planned_cells=None, plan=None,
         if r['failure']:
             out['n_failures'] += 1
             # Rows are built in order, so the source event is the row's index.
-            cls, ambiguous, terms = _dispo_failure_class(events[r['index']], pol)
+            cls, ambiguous, terms = _dispo_failure_class(r['event'], pol)
             r['failure_class'] = cls
             r['ambiguous_class'] = bool(ambiguous)
             r['matched_terms'] = list(terms)
@@ -813,13 +1021,21 @@ def run_disposition_audit(events, *, planned_cells=None, plan=None,
         if not isinstance(retained, dict):
             raise ValueError(f'retained must be an object, got '
                              f'{type(retained).__name__}')
+        _retained_seen = set()
         for key, rec in retained.items():
             if not isinstance(key, str) or not key.strip():
                 raise ValueError(f'retained keys must be non-empty strings, '
-                                 f'got {key!r}')
+                                 f'got {_dispo_key_text(key)}')
             key = key.strip()
+            if key in _retained_seen:
+                raise ValueError(
+                    'retained contains more than one record for cell '
+                    f'{key!r} after trimming; the binding measurement would '
+                    'depend on dict insertion order')
+            _retained_seen.add(key)
             if not isinstance(rec, dict):
-                raise ValueError(f'retained[{key!r}] must be an object')
+                raise ValueError(f'retained[{_dispo_repr(key)}] must be an '
+                                 'object')
             rid = rec.get('run_id')
             retained_valid[key] = {'run_id': (rid if isinstance(rid, str) and
                                               rid.strip() else None),
@@ -875,7 +1091,10 @@ def run_disposition_audit(events, *, planned_cells=None, plan=None,
             })
         # A failure is "retried" when any later attempt exists for the cell.
         for r in fail_rows:
-            if any(x['index'] > r['index'] for x in cell_rows):
+            # Rows are appended in source-index order, so the last attempt is
+            # the only possible later one.  Scanning the whole cell here made
+            # one long-retried cell O(N^2) in its attempt count.
+            if cell_rows and cell_rows[-1]['index'] > r['index']:
                 cell['retried_after_failure'] = True
                 cls = r['failure_class']
                 if cls in out['failure_classes']:

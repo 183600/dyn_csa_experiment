@@ -75,17 +75,24 @@ def signflip_min_consistency(n_seeds, m_comparisons, alpha=0.05):
     m = _as_seed_int(m_comparisons)
     if n is None or m is None or n <= 0 or m <= 0:
         return None
+    # Keep the historical absolute tolerance for ordinary alpha, but never
+    # let it swamp a tiny alpha: the old +1e-15 admitted alpha=1e-15/1e-16
+    # boundaries that fail the gate by hundreds of times, and signflip_power
+    # then reported power for an infeasible plan.
+    _tol = min(1e-15, alpha * 1e-12)
+    _limit = alpha + _tol
+
     def passes(k):
         cdf = _binom_cdf_half(n, n - k)
         if cdf > 0.0:
             try:
-                return m * 2.0 * cdf <= alpha + 1e-15
+                return m * 2.0 * cdf <= _limit
             except OverflowError:
                 log_lhs = math.log(m) + math.log(2.0) + math.log(cdf)
         else:
             log_lhs = (math.log(m) + math.log(2.0)
                        + _log_binom_cdf_half(n, n - k))
-        return log_lhs <= math.log(alpha) + 1e-15
+        return log_lhs <= math.log(_limit)
 
     if not passes(n):
         return None

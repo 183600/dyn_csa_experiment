@@ -68,17 +68,42 @@ TRAINING_EXPOSURE_STATUSES = ('ok', 'not_estimable')
 # draw; the hard cap is therefore also an absolute memory guard for future
 # scale (20M int64 starts is already ~160 MB before ``unique``/``counts``).
 TRAINING_EXPOSURE_HARD_MAX_DRAWS = 20_000_000
+# The replay echoes one data seed per rank, so an unbounded world size is a
+# memory allocation before any draw cap can be checked.  One million ranks is
+# already an ~8 MB index plus the JSON echo; larger declarations are rejected
+# with a named diagnostic rather than attempting that list.
+TRAINING_EXPOSURE_HARD_MAX_WORLD_SIZE = 1_000_000
+# Counts are echoed in a strict-JSON artifact.  Keep them below CPython 3.12's
+# 4300-digit integer-to-decimal limit so a malformed declaration produces a
+# named error instead of a second formatting exception.
+TRAINING_EXPOSURE_MAX_REPORTABLE_INT = 10 ** 4000
 _TX_INT64_MAX = 2 ** 63 - 1
 
 
-def _tx_exact_pos_int(name, value, *, minimum=1):
+def _tx_repr(value, limit=200):
+    try:
+        text = repr(value)
+    except Exception:
+        if isinstance(value, int) and not isinstance(value, bool):
+            return f'<unrepresentable int: {int(value).bit_length()} bits>'
+        return f'<unrepresentable {type(value).__name__}>'
+    return text if len(text) <= limit else text[:limit - 3] + '...'
+
+
+def _tx_exact_pos_int(name, value, *, minimum=1, maximum=None):
     if isinstance(value, (bool, _tx_np.bool_)):
         raise ValueError(f'{name} must be an integer, not a boolean')
     if not isinstance(value, (int, _tx_np.integer)):
         raise ValueError(f'{name} must be an integer, got {type(value).__name__}')
     value = int(value)
     if value < int(minimum):
-        raise ValueError(f'{name} must be >= {int(minimum)}, got {value}')
+        raise ValueError(f'{name} must be >= {int(minimum)}, got '
+                         f'{_tx_repr(value)}')
+    if maximum is None:
+        maximum = TRAINING_EXPOSURE_MAX_REPORTABLE_INT
+    if value > int(maximum):
+        raise ValueError(f'{name} must be <= {_tx_repr(int(maximum))}, got '
+                         f'{_tx_repr(value)}')
     return value
 
 
@@ -89,9 +114,12 @@ def _tx_nonneg_int(name, value, *, maximum=None):
         raise ValueError(f'{name} must be an integer, got {type(value).__name__}')
     value = int(value)
     if value < 0:
-        raise ValueError(f'{name} must be >= 0, got {value}')
-    if maximum is not None and value > int(maximum):
-        raise ValueError(f'{name} must be <= {int(maximum)}, got {value}')
+        raise ValueError(f'{name} must be >= 0, got {_tx_repr(value)}')
+    if maximum is None:
+        maximum = TRAINING_EXPOSURE_MAX_REPORTABLE_INT
+    if value > int(maximum):
+        raise ValueError(f'{name} must be <= {_tx_repr(int(maximum))}, got '
+                         f'{_tx_repr(value)}')
     return value
 
 
@@ -101,9 +129,10 @@ def _tx_finite_fraction(name, value):
     try:
         out = float(value)
     except (TypeError, ValueError, OverflowError):
-        raise ValueError(f'{name} must be a finite number, got {value!r}') from None
+        raise ValueError(f'{name} must be a finite number, got '
+                         f'{_tx_repr(value)}') from None
     if not _tx_math.isfinite(out):
-        raise ValueError(f'{name} must be finite, got {value!r}')
+        raise ValueError(f'{name} must be finite, got {_tx_repr(value)}')
     return out
 
 
@@ -225,6 +254,12 @@ def _tx_rank_seeds(seed, world_size, data_seeds=None):
     except NameError:
         seed = _tx_nonneg_int('seed', seed, maximum=2 ** 63 - 1)
     world_size = _tx_exact_pos_int('world_size', world_size)
+    if world_size > TRAINING_EXPOSURE_HARD_MAX_WORLD_SIZE:
+        raise ValueError(
+            'world_size exceeds the replay/echo cap '
+            f'{TRAINING_EXPOSURE_HARD_MAX_WORLD_SIZE} '
+            f'(got an integer with {int(world_size).bit_length()} bits); '
+            'per-rank data seeds cannot be materialised for this declaration')
     if data_seeds is not None:
         try:
             vals = list(data_seeds)

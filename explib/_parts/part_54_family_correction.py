@@ -79,26 +79,58 @@ FAMILY_CORRECTION_POLICY = {
 }
 FAMILY_CORRECTION_STATUSES = ('ok', 'degenerate', 'not_estimable')
 
+# A family member label / seed is echoed in a strict-JSON block.  Keep it
+# below CPython 3.12's integer-to-decimal limit so a hand-edited artifact
+# produces a named not_estimable verdict rather than a formatting exception.
+FAMILY_CORRECTION_MAX_REPORTABLE_INT = 10 ** 4000
+
+
+def _fc_repr(value, limit=200):
+    try:
+        text = repr(value)
+    except Exception:
+        if isinstance(value, int) and not isinstance(value, bool):
+            return f'<unrepresentable int: {int(value).bit_length()} bits>'
+        return f'<unrepresentable {type(value).__name__}>'
+    return text if len(text) <= limit else text[:limit - 3] + '...'
+
+
+def _fc_key_text(value, limit=500):
+    """Text for an untrusted family name; huge integers stay bounded."""
+    if isinstance(value, str):
+        return value if len(value) <= limit else value[:limit - 3] + '...'
+    try:
+        text = str(value)
+    except Exception:
+        return _fc_repr(value, limit)
+    return text if len(text) <= limit else text[:limit - 3] + '...'
+
 
 def _fc_number(value, name):
     if isinstance(value, (bool, _fc_np.bool_, str, bytes, bytearray)):
-        raise ValueError(f'{name} must be a real number, got {value!r}')
+        raise ValueError(f'{name} must be a real number, got {_fc_repr(value)}')
     try:
         out = float(value)
     except (TypeError, ValueError, OverflowError):
-        raise ValueError(f'{name} must be a real number, got {value!r}') from None
+        raise ValueError(f'{name} must be a real number, got '
+                         f'{_fc_repr(value)}') from None
     if not _fc_math.isfinite(out):
-        raise ValueError(f'{name} must be finite, got {value!r}')
+        raise ValueError(f'{name} must be finite, got {_fc_repr(value)}')
     return out
 
 
-def _fc_int(value, name, *, minimum=None):
+def _fc_int(value, name, *, minimum=None, maximum=None):
     if isinstance(value, (bool, _fc_np.bool_)) or not isinstance(
             value, (int, _fc_np.integer)):
-        raise ValueError(f'{name} must be an integer, got {value!r}')
+        raise ValueError(f'{name} must be an integer, got {_fc_repr(value)}')
     out = int(value)
     if minimum is not None and out < minimum:
-        raise ValueError(f'{name} must be >= {minimum}, got {out}')
+        raise ValueError(f'{name} must be >= {minimum}, got {_fc_repr(out)}')
+    if maximum is None:
+        maximum = FAMILY_CORRECTION_MAX_REPORTABLE_INT
+    if out > maximum:
+        raise ValueError(f'{name} must be <= {_fc_repr(maximum)}, got '
+                         f'{_fc_repr(out)}')
     return out
 
 
@@ -358,7 +390,7 @@ def confirmation_family_correction(comparisons, *, family_names, frozen_holm=Non
     if isinstance(family_names, (str, bytes, bytearray)) or not family_names:
         return _fc_not_estimable('family_names must be a non-empty sequence')
     try:
-        names = [str(x) for x in family_names]
+        names = [_fc_key_text(x) for x in family_names]
     except TypeError:
         return _fc_not_estimable('family_names must be an iterable')
     if any(not n.strip() for n in names):
@@ -378,7 +410,7 @@ def confirmation_family_correction(comparisons, *, family_names, frozen_holm=Non
         if not isinstance(rec, dict):
             return _fc_not_estimable(f'{n}: comparison record is not an object')
         if 'omitted' in rec or rec.get('omitted'):
-            omitted[n] = str(rec.get('omitted'))
+            omitted[n] = _fc_key_text(rec.get('omitted'), 500)
     if omitted:
         return _fc_not_estimable(
             'a declared comparison is omitted; max-T is not computed over a '

@@ -66,6 +66,30 @@ JOINT_SIGNFLIP_MAX_N = 20
 JOINT_SIGNFLIP_HARD_MAX_N = 24
 JOINT_SIGNFLIP_CHUNK_TARGET = 1 << 18
 JOINT_SIGNFLIP_METHOD = 'westfall-young free step-down max-T (exact sign flips)'
+# Seed labels and family sizes are persisted in strict-JSON reports.  Keep
+# them below CPython 3.12's integer-to-decimal limit so a malformed record
+# yields a named ValueError rather than a formatting exception.
+JOINT_SIGNFLIP_MAX_REPORTABLE_INT = 10 ** 4000
+
+
+def _joint_repr(value, limit=200):
+    try:
+        text = repr(value)
+    except Exception:
+        if isinstance(value, int) and not isinstance(value, bool):
+            return f'<unrepresentable int: {int(value).bit_length()} bits>'
+        return f'<unrepresentable {type(value).__name__}>'
+    return text if len(text) <= limit else text[:limit - 3] + '...'
+
+
+def _joint_key_text(value, limit=500):
+    if isinstance(value, str):
+        return value if len(value) <= limit else value[:limit - 3] + '...'
+    try:
+        text = str(value)
+    except Exception:
+        return _joint_repr(value, limit)
+    return text if len(text) <= limit else text[:limit - 3] + '...'
 
 
 def _joint_finite(value, *, where, name):
@@ -74,13 +98,16 @@ def _joint_finite(value, *, where, name):
         raise ValueError(f'{where}: {name} is a boolean, not a measurement')
     if isinstance(value, (str, bytes, bytearray, dict, complex,
                           np.complexfloating)):
-        raise ValueError(f'{where}: {name} is not a real number ({value!r})')
+        raise ValueError(f'{where}: {name} is not a real number '
+                         f'({_joint_repr(value)})')
     try:
         out = float(value)
     except (TypeError, ValueError, OverflowError):
-        raise ValueError(f'{where}: {name} is not a real number ({value!r})') from None
+        raise ValueError(f'{where}: {name} is not a real number '
+                         f'({_joint_repr(value)})') from None
     if not math.isfinite(out):
-        raise ValueError(f'{where}: {name} is not finite ({value!r})')
+        raise ValueError(f'{where}: {name} is not finite '
+                         f'({_joint_repr(value)})')
     return out
 
 
@@ -96,22 +123,23 @@ def _joint_named_matrix(named_deltas, *, where='maxt_signflip_adjust'):
     for raw_name, raw_vals in named_deltas.items():
         if not isinstance(raw_name, str) or not raw_name.strip():
             raise ValueError(f'{where}: contrast names must be non-empty '
-                             f'strings, got {raw_name!r}')
+                             f'strings, got {_joint_repr(raw_name)}')
         if isinstance(raw_vals, (str, bytes, bytearray)):
-            raise ValueError(f'{where}: deltas for {raw_name!r} must be an '
-                             'iterable of numbers, not a string')
+            raise ValueError(f'{where}: deltas for {_joint_repr(raw_name)} '
+                             'must be an iterable of numbers, not a string')
         try:
             vals = list(raw_vals)
         except TypeError:
-            raise ValueError(f'{where}: deltas for {raw_name!r} are not an '
-                             'iterable') from None
+            raise ValueError(f'{where}: deltas for {_joint_repr(raw_name)} '
+                             'are not an iterable') from None
         vals = [_joint_finite(v, where=where, name=f'{raw_name}[{i}]')
                 for i, v in enumerate(vals)]
         if n is None:
             n = len(vals)
         elif len(vals) != n:
-            raise ValueError(f'{where}: contrast {raw_name!r} has {len(vals)} '
-                             f'deltas but {names[0]!r} has {n}; a joint '
+            raise ValueError(f'{where}: contrast {_joint_repr(raw_name)} has '
+                             f'{len(vals)} deltas but '
+                             f'{_joint_repr(names[0])} has {n}; a joint '
                              'correction needs one row per seed')
         names.append(raw_name)
         rows.append(vals)
@@ -124,14 +152,15 @@ def _joint_named_matrix(named_deltas, *, where='maxt_signflip_adjust'):
 def _joint_alpha(alpha, *, where):
     if isinstance(alpha, (bool, np.bool_)):
         raise ValueError(f'{where}: alpha must be a probability in (0,1), '
-                         f'got {alpha!r}')
+                         f'got {_joint_repr(alpha)}')
     try:
         out = float(alpha)
     except (TypeError, ValueError, OverflowError):
         raise ValueError(f'{where}: alpha must be a probability in (0,1), '
-                         f'got {alpha!r}') from None
+                         f'got {_joint_repr(alpha)}') from None
     if not (0.0 < out < 1.0):
-        raise ValueError(f'{where}: alpha must be in (0,1), got {alpha!r}')
+        raise ValueError(f'{where}: alpha must be in (0,1), got '
+                         f'{_joint_repr(alpha)}')
     return out
 
 
@@ -143,7 +172,8 @@ def _joint_exact_int(value, *, where, name, minimum):
     so integral values are taken exactly and non-integral reals are refused.
     """
     if isinstance(value, (bool, np.bool_, str, bytes, bytearray)):
-        raise ValueError(f'{where}: {name} must be an exact integer, got {value!r}')
+        raise ValueError(f'{where}: {name} must be an exact integer, got '
+                         f'{_joint_repr(value)}')
     if isinstance(value, numbers.Integral):
         out = int(value)
     else:
@@ -151,15 +181,22 @@ def _joint_exact_int(value, *, where, name, minimum):
             out = int(value)
         except (TypeError, ValueError, OverflowError):
             raise ValueError(
-                f'{where}: {name} must be an exact integer, got {value!r}') from None
+                f'{where}: {name} must be an exact integer, got '
+                f'{_joint_repr(value)}') from None
         try:
             if value != out:
                 raise ValueError
         except (TypeError, ValueError, OverflowError):
             raise ValueError(
-                f'{where}: {name} must be an exact integer, got {value!r}') from None
+                f'{where}: {name} must be an exact integer, got '
+                f'{_joint_repr(value)}') from None
     if out < minimum:
-        raise ValueError(f'{where}: {name} must be >= {minimum}, got {value!r}')
+        raise ValueError(f'{where}: {name} must be >= {minimum}, got '
+                         f'{_joint_repr(out)}')
+    if out > JOINT_SIGNFLIP_MAX_REPORTABLE_INT:
+        raise ValueError(f'{where}: {name} must be <= '
+                         f'{_joint_repr(JOINT_SIGNFLIP_MAX_REPORTABLE_INT)}, '
+                         f'got {_joint_repr(out)}')
     return out
 
 
@@ -168,7 +205,8 @@ def _joint_max_n(value, *, where):
         return _joint_exact_int(value, where=where, name='max_n', minimum=2)
     except ValueError:
         raise ValueError(
-            f'{where}: max_n must be an exact positive integer, got {value!r}') from None
+            f'{where}: max_n must be an exact positive integer, got '
+            f'{_joint_repr(value)}') from None
 
 
 def _joint_seed(value, *, where):
@@ -185,7 +223,7 @@ def _joint_seed(value, *, where):
     except ValueError:
         raise ValueError(
             f'{where}: seeds must be exact non-negative integers, '
-            f'got {value!r}') from None
+            f'got {_joint_repr(value)}') from None
 
 
 def _joint_deltas_fingerprint(names, matrix, seeds):
@@ -533,16 +571,17 @@ def maxt_joint_correction(records, *, alpha=0.05,
         except ValueError:
             raise ValueError(
                 f'{where}: family_size must be an exact positive integer, '
-                f'got {family_size!r}') from None
+                f'got {_joint_repr(family_size)}') from None
     groups = {}
     excluded = {}
     for key, rec in records.items():
         if not isinstance(key, str) or not key.strip():
-            raise ValueError(f'{where}: record keys must be non-empty strings, '
-                             f'got {key!r}')
+            raise ValueError(f'{where}: record keys must be non-empty '
+                             f'strings, got {_joint_repr(key)}')
         rec = rec if isinstance(rec, dict) else {}
         if not rec.get('eligible', True):
-            excluded[key] = str(rec.get('reason') or 'ineligible')
+            excluded[key] = _joint_key_text(
+                rec.get('reason') or 'ineligible', 500)
             continue
         raw_seeds = rec.get('seeds')
         try:

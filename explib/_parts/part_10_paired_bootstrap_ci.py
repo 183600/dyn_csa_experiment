@@ -1,5 +1,37 @@
 
 
+_PB_MAX_REPORTABLE_INT = 10 ** 4000
+
+
+def _pb_repr(value, limit=200, _depth=0):
+    """Bounded repr for untrusted seed/count diagnostics.
+
+    ``repr(10**10000)`` raises Python 3.12's integer-to-decimal limit; a
+    validation error must name the field rather than raise a formatting error.
+    """
+    try:
+        text = repr(value)
+    except Exception:
+        if isinstance(value, numbers.Integral) and not isinstance(
+                value, (bool, np.bool_)):
+            return f'<unrepresentable int: {int(value).bit_length()} bits>'
+        if _depth >= 4:
+            return '<...>'
+        if isinstance(value, (list, tuple)):
+            parts = [_pb_repr(item, limit, _depth + 1) for item in value]
+            opening, closing = (('[', ']') if isinstance(value, list)
+                                else ('(', ')'))
+            text = opening + ', '.join(parts) + closing
+        elif isinstance(value, dict):
+            parts = [f'{_pb_repr(k, limit, _depth + 1)}: '
+                     f'{_pb_repr(v, limit, _depth + 1)}'
+                     for k, v in value.items()]
+            text = '{' + ', '.join(parts) + '}'
+        else:
+            return f'<unrepresentable {type(value).__name__}>'
+    return text if len(text) <= limit else text[:limit - 3] + '...'
+
+
 def paired_bootstrap_ci(deltas, *, n_boot=4000, seed=20261018):
     """Paired studentized bootstrap CI for the mean paired difference.
 
@@ -632,7 +664,8 @@ def paired_effect_stats(deltas, alpha=0.05, min_n=3, with_values=None, without_v
     # silently change which panels are labelled underpowered.
     _min_n = _as_seed_int(min_n)
     if _min_n is None or _min_n < 0:
-        raise ValueError(f'min_n must be a non-negative integer, got {min_n!r}')
+        raise ValueError('min_n must be a non-negative integer, got '
+                         f'{_pb_repr(min_n)}')
     min_n = _min_n
     if isinstance(deltas, (str, bytes, bytearray, dict)):
         # A string is an iterable of characters and a mapping iterates its
@@ -673,9 +706,14 @@ def paired_effect_stats(deltas, alpha=0.05, min_n=3, with_values=None, without_v
                 % (len(_seed_in), n_input))
         _norm_seeds = [_as_seed_int(s) for s in _seed_in]
         if any(s is None for s in _norm_seeds):
-            raise ValueError(f'paired_effect_stats: seeds are not integers ({_seed_in!r})')
+            raise ValueError('paired_effect_stats: seeds are not integers '
+                             f'({_pb_repr(_seed_in)})')
         if len(set(_norm_seeds)) != len(_norm_seeds):
-            raise ValueError(f'paired_effect_stats: duplicate seeds {_norm_seeds!r}')
+            raise ValueError('paired_effect_stats: duplicate seeds '
+                             f'{_pb_repr(_norm_seeds)}')
+        if any(abs(s) > _PB_MAX_REPORTABLE_INT for s in _norm_seeds):
+            raise ValueError('paired_effect_stats: seed label is outside the '
+                             'strict-JSON representable integer range')
         seed_labels = [_norm_seeds[i] for i in kept_pos]
         dropped_seeds = [_norm_seeds[i] for i in dropped_pos]
     complete_pairs = bool(n_dropped == 0)
@@ -784,7 +822,7 @@ def paired_effect_stats(deltas, alpha=0.05, min_n=3, with_values=None, without_v
                    'the surviving subset is not a confirmatory result'
                    % (n_dropped, n_input))
     elif underpowered:
-        verdict = 'underpowered (n<%d)' % min_n
+        verdict = 'underpowered (n<%s)' % _pb_repr(min_n)
     elif within_seed_noise:
         verdict = 'effect within seed noise (|mean|<=std)'
     elif significant:
@@ -1096,9 +1134,13 @@ def _paired_payload(deltas, seeds=None, *, where='paired analysis'):
             raise ValueError(f'{where}: seeds length {len(sl)} does not match deltas length {len(raw)}')
         norm = [_as_seed_int(s) for s in sl]
         if any(s is None for s in norm):
-            raise ValueError(f'{where}: seeds must be integers ({sl!r})')
+            raise ValueError(f'{where}: seeds must be integers '
+                             f'({_pb_repr(sl)})')
         if len(set(norm)) != len(norm):
-            raise ValueError(f'{where}: duplicate seeds {norm!r}')
+            raise ValueError(f'{where}: duplicate seeds {_pb_repr(norm)}')
+        if any(abs(s) > _PB_MAX_REPORTABLE_INT for s in norm):
+            raise ValueError(f'{where}: seed label is outside the '
+                             'strict-JSON representable integer range')
     else:
         norm = list(range(len(raw)))
     d, labels, keep = [], [], []
@@ -1986,15 +2028,27 @@ def _binom_normal_z_half(n, m):
     try:
         sd = math.sqrt(n)
     except OverflowError:
-        root = math.isqrt(n)
+        # Beyond float64.  ``math.isqrt`` is exact but its cost grows with the
+        # integer width and this helper is called at every binary-search probe
+        # in signflip_min_consistency.  Keep the exact path for panel-sized
+        # integers (which the tests pin) and use a scaled float sqrt for an
+        # astronomically large count: the relative error is ~2**-500 and the
+        # normal tail is already saturated there.
         try:
-            sd = float(root)
-        except OverflowError:
+            if n.bit_length() <= 4096:
+                sd = float(math.isqrt(n))
+            else:
+                shift = max(0, (n.bit_length() - 1000) // 2)
+                reduced = n >> (2 * shift)
+                sd = math.ldexp(math.sqrt(float(reduced)), shift)
+        except (OverflowError, ValueError):
             return None
     try:
         return diff / sd
     except OverflowError:
-        return None
+        # A count far beyond the mean maps to a saturated normal tail; the
+        # caller only needs the sign/magnitude, not a finite float.
+        return float('inf') if diff > 0 else float('-inf')
 
 
 def _log_binom_normal_cdf_half(n, m):
