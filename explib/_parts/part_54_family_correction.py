@@ -255,7 +255,15 @@ def _fc_score_maxt(matrix, alpha):
     _nz_per_row = (_fc_np.count_nonzero(A, axis=1)
                    if int(A.size) else _fc_np.asarray([], dtype=_fc_np.int64))
     _max_nz = int(_nz_per_row.max()) if _nz_per_row.size else 0
-    p_floor = (1.0 if (not _fc_np.any(t > 0.0) or _max_nz <= 0)
+    # The floor is a property of the observed magnitudes, not of the observed
+    # signed sum: a contrast such as [1, -1, 1, -1, ...] has a zero observed
+    # score but still has 2**n attainable sign patterns and a floor of
+    # 2/2**n.  Conditioning on ``any(t > 0)`` reported 1.0 whenever every
+    # observed contrast happened to cancel to zero, claiming the family was
+    # unresolvable even though its non-zero support could reach alpha.  Only
+    # an all-zero matrix has no informative support (and is already reported
+    # as ``degenerate``).
+    p_floor = (1.0 if _max_nz <= 0
                else min(1.0, 2.0 ** (1 - _max_nz)))
     return {
         'p_raw': [float(x) for x in raw_p],

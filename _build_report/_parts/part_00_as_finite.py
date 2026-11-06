@@ -371,7 +371,16 @@ def exact_signflip(deltas, *, n_input=None):
     # non-zero effects among 44 zeros) onto the saddlepoint approximation.
     # An all-zero panel keeps the historical branch label based on n.
     if _n_nonzero:
-        _calc_deltas = [x for x in _p_deltas if x != 0.0]
+        # Mask by the ORIGINAL non-zero entries, not by the scaled values.
+        # Dividing by a large panel maximum can underflow a genuine tiny delta
+        # to +/-0.0; filtering the scaled list then made it shorter than
+        # ``_n_calc``.  For n>20 that silently divided the exact count by
+        # 2**(number of underflowed columns) (a factor-2-too-small p), and the
+        # exact branch indexed a shorter array than its sign mask.  Keeping
+        # the underflowed column as 0.0 is exactly what exp_lib does: it is
+        # sign-neutral, so it doubles both the count and the denominator.
+        _calc_deltas = [x for x, original in zip(_p_deltas, deltas)
+                        if original != 0.0]
         _n_calc = _n_nonzero
     else:
         _calc_deltas = _p_deltas
