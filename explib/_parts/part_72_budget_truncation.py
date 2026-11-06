@@ -158,6 +158,40 @@ def _bt_repr(value, limit=120):
     return text if len(text) <= limit else text[:limit - 3] + '...'
 
 
+def _bt_json_equal(a, b):
+    """Structural equality for a stored and replayed JSON body.
+
+    A hand-edited artifact can carry an array where the replay has a list;
+    plain ``a != b`` then returns an array and its truth value is ambiguous.
+    Only JSON scalar types participate, so a non-JSON object is different.
+    """
+    if isinstance(a, bool) or isinstance(b, bool):
+        return (isinstance(a, bool) and isinstance(b, bool) and a is b)
+    if isinstance(a, dict) or isinstance(b, dict):
+        if not (isinstance(a, dict) and isinstance(b, dict)):
+            return False
+        if set(a) != set(b):
+            return False
+        return all(_bt_json_equal(a[key], b[key]) for key in a)
+    if isinstance(a, (list, tuple)) or isinstance(b, (list, tuple)):
+        if not (isinstance(a, (list, tuple))
+                and isinstance(b, (list, tuple))):
+            return False
+        return (len(a) == len(b)
+                and all(_bt_json_equal(x, y) for x, y in zip(a, b)))
+    if (isinstance(a, (int, float)) and not isinstance(a, bool)
+            and isinstance(b, (int, float)) and not isinstance(b, bool)):
+        try:
+            return bool(a == b)
+        except (TypeError, ValueError, OverflowError):
+            return False
+    if a is None or b is None:
+        return a is None and b is None
+    if isinstance(a, str) and isinstance(b, str):
+        return a == b
+    return False
+
+
 def _bt_message_list(value):
     """A string list for problems/warnings, even if the artifact was edited.
 
@@ -1412,22 +1446,22 @@ def validate_budget_truncation(artifact, *, manifest=None):
         return out
     out['replayed'] = True
     for section in ('design', 'floor', 'cost', 'budget', 'inputs', 'study'):
-        if artifact.get(section) != replayed.get(section):
+        if not _bt_json_equal(artifact.get(section), replayed.get(section)):
             out['problems'].append(
                 f'artifact.{section} does not reproduce from its inputs')
     kept = artifact.get('frontier') if isinstance(
         artifact.get('frontier'), dict) else {}
     fresh = replayed.get('frontier') if isinstance(
         replayed.get('frontier'), dict) else {}
-    if kept.get('points') != fresh.get('points'):
+    if not _bt_json_equal(kept.get('points'), fresh.get('points')):
         out['problems'].append(
             'artifact.frontier.points does not reproduce from the inputs')
     for key in ('n_points', 'sampled', 'first_min_n_cells',
                 'first_complete_cells'):
-        if kept.get(key) != fresh.get(key):
+        if not _bt_json_equal(kept.get(key), fresh.get(key)):
             out['problems'].append(
                 f'artifact.frontier.{key} does not reproduce')
-    if artifact.get('status') != replayed.get('status'):
+    if not _bt_json_equal(artifact.get('status'), replayed.get('status')):
         out['problems'].append(
             'artifact.status does not reproduce from the inputs')
     kept_problems = _bt_message_list(artifact.get('problems'))

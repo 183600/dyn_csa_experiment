@@ -517,7 +517,9 @@ def _esci_compare(a, b, path='result', *, rtol=1e-9, atol=1e-12, diffs=None):
     if diffs is None:
         diffs = []
     if isinstance(a, bool) or isinstance(b, bool):
-        if bool(a) != bool(b):
+        # A boolean is a JSON value of its own; ``bool(np.array([...]))`` is
+        # ambiguous and must not replace the comparison with an exception.
+        if not (isinstance(a, bool) and isinstance(b, bool) and a is b):
             diffs.append(f'{path}: {_esci_repr(a)} != {_esci_repr(b)}')
         return diffs
     if isinstance(a, (int, float)) and isinstance(b, (int, float)):
@@ -546,7 +548,14 @@ def _esci_compare(a, b, path='result', *, rtol=1e-9, atol=1e-12, diffs=None):
             _esci_compare(x, y, f'{path}[{i}]', rtol=rtol, atol=atol,
                           diffs=diffs)
         return diffs
-    if a != b:
+    # A tampered artifact can put an array/object where replay produced a
+    # scalar (or vice versa).  ``a != b`` then yields an array whose truth
+    # value is ambiguous, so collapse any non-scalar comparison to "different".
+    try:
+        same = bool(a == b)
+    except (TypeError, ValueError, OverflowError):
+        same = False
+    if not same:
         diffs.append(f'{path}: {_esci_repr(a)} != {_esci_repr(b)}')
     return diffs
 

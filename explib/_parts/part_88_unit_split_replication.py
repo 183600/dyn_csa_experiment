@@ -1194,6 +1194,40 @@ def _usr_is_int(value):
             and not isinstance(value, (bool, np.bool_)))
 
 
+def _usr_json_equal(a, b):
+    """Exact JSON-value equality for an untrusted stored assignment.
+
+    ``recorded != expected`` is not safe on a hand-edited artifact: if either
+    side holds a NumPy array, the comparison returns an array and the ``if``
+    raises "truth value is ambiguous".  Only JSON scalar types participate;
+    an array/object where JSON produced a scalar is simply different.  Python
+    int/float equality is exact for arbitrarily large integers and never
+    converts through float64.
+    """
+    if isinstance(a, bool) or isinstance(b, bool):
+        return (isinstance(a, bool) and isinstance(b, bool) and a is b)
+    if isinstance(a, dict) or isinstance(b, dict):
+        if not (isinstance(a, dict) and isinstance(b, dict)):
+            return False
+        if set(a) != set(b):
+            return False
+        return all(_usr_json_equal(a[key], b[key]) for key in a)
+    if isinstance(a, (list, tuple)) or isinstance(b, (list, tuple)):
+        if not (isinstance(a, (list, tuple))
+                and isinstance(b, (list, tuple))):
+            return False
+        return (len(a) == len(b)
+                and all(_usr_json_equal(x, y) for x, y in zip(a, b)))
+    if (isinstance(a, (int, float)) and not isinstance(a, bool)
+            and isinstance(b, (int, float)) and not isinstance(b, bool)):
+        return bool(a == b)
+    if a is None or b is None:
+        return a is None and b is None
+    if isinstance(a, str) and isinstance(b, str):
+        return a == b
+    return False
+
+
 def _usr_inputs_problems(inputs):
     """Validate every field a replay consumes, without replaying.
 
@@ -1927,7 +1961,12 @@ def _usr_validate_common(artifact, *, block=False):
         # This is not a full replay, but it means replay=False (archive/tamper
         # tooling) still rejects an edited salt, token vector or unit id list;
         # those fields are supposed to explain the recorded partition.
-        if (not input_problems
+        # ``input_problems`` is empty when ``artifact.inputs`` is not an
+        # object at all: the schema problem is reported separately above, but
+        # indexing a scalar here would replace the structured fail-closed
+        # verdict with an IndexError.  Re-derivation is only possible from a
+        # mapping that passed its own shape checks.
+        if (isinstance(inputs, dict) and not input_problems
                 and result.get('status') in ('ok', 'warnings')):
             try:
                 expected_assignment = unit_split_assignment(
@@ -1941,12 +1980,13 @@ def _usr_validate_common(artifact, *, block=False):
             else:
                 recorded = result.get('assignment')
                 if (not isinstance(recorded, dict)
-                        or recorded.get('digest')
-                        != expected_assignment.get('digest')):
+                        or not _usr_json_equal(
+                            recorded.get('digest'),
+                            expected_assignment.get('digest'))):
                     out['problems'].append(
                         'result.assignment.digest does not match the partition '
                         're-derived from inputs.unit_ids/tokens/salt')
-                elif recorded != expected_assignment:
+                elif not _usr_json_equal(recorded, expected_assignment):
                     out['problems'].append(
                         'result.assignment body does not match the partition '
                         're-derived from inputs.unit_ids/tokens/salt')

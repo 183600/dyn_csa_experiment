@@ -994,7 +994,14 @@ def _al_equiv(a, b, *, tol=1e-9):
     if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
         return len(a) == len(b) and all(
             _al_equiv(x, y, tol=tol) for x, y in zip(a, b))
-    return a == b
+    # An untrusted artifact can place an array where replay produced a scalar
+    # (or a mapping where it produced a list).  ``a == b`` then returns an
+    # array and its truth value is ambiguous; report a mismatch instead of
+    # aborting the validator with ValueError.
+    try:
+        return bool(a == b)
+    except (TypeError, ValueError, OverflowError):
+        return False
 
 
 def validate_ablation_lattice(artifact):

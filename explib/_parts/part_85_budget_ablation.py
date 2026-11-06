@@ -453,19 +453,42 @@ def _ba_log_budget_ratio(budget, base):
 
 
 def _ba_slope(values, budgets):
-    """OLS slope of values on log(budget / first budget)."""
+    """OLS slope of values on log(budget / first budget).
+
+    The raw-PPL sensitivity readout can hold finite effects near float64's
+    limit.  Summing them over the (up to 64-point) ladder then overflows even
+    when the slope itself is representable -- a constant 1e308 effect has a
+    true slope of exactly zero.  Ordinary panels keep the historical
+    expression bit-for-bit; only an extreme magnitude is centred on a common
+    scale, and the result is restored once at the end.
+    """
     if len(values) != len(budgets) or len(values) < 2:
         return None
     x = [_ba_log_budget_ratio(b, budgets[0]) for b in budgets]
     if any(value is None for value in x):
         return None
     xbar = sum(x) / len(x)
-    ybar = sum(values) / len(values)
     denom = sum((xi - xbar) ** 2 for xi in x)
     if not math.isfinite(denom) or denom <= 0.0:
         return None
-    num = sum((xi - xbar) * (yi - ybar) for xi, yi in zip(x, values))
-    out = num / denom
+    try:
+        yscale = max(abs(float(y)) for y in values)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(yscale):
+        return None
+    if yscale <= 1e100:
+        ybar = sum(values) / len(values)
+        num = sum((xi - xbar) * (yi - ybar) for xi, yi in zip(x, values))
+        out = num / denom
+        return out if math.isfinite(out) else None
+    ys = [float(y) / yscale for y in values]
+    ybar = sum(ys) / len(ys)
+    num = sum((xi - xbar) * (yi - ybar) for xi, yi in zip(x, ys))
+    try:
+        out = (num / denom) * yscale
+    except (OverflowError, ValueError):
+        return None
     return out if math.isfinite(out) else None
 
 

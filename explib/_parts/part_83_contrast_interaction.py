@@ -82,6 +82,41 @@ def _ci_repr(value, limit=160):
     return text if len(text) <= limit else text[:limit - 3] + '...'
 
 
+def _ci_json_equal(a, b):
+    """Structural JSON equality that never raises on a tampered value.
+
+    A hand-edited artifact can carry an array where the replay has a list;
+    plain ``a != b`` then returns an array and its truth value is ambiguous.
+    Only JSON scalar types take part in equality, so a non-JSON object is
+    simply different.
+    """
+    if isinstance(a, bool) or isinstance(b, bool):
+        return (isinstance(a, bool) and isinstance(b, bool) and a is b)
+    if isinstance(a, dict) or isinstance(b, dict):
+        if not (isinstance(a, dict) and isinstance(b, dict)):
+            return False
+        if set(a) != set(b):
+            return False
+        return all(_ci_json_equal(a[key], b[key]) for key in a)
+    if isinstance(a, (list, tuple)) or isinstance(b, (list, tuple)):
+        if not (isinstance(a, (list, tuple))
+                and isinstance(b, (list, tuple))):
+            return False
+        return (len(a) == len(b)
+                and all(_ci_json_equal(x, y) for x, y in zip(a, b)))
+    if (isinstance(a, (int, float)) and not isinstance(a, bool)
+            and isinstance(b, (int, float)) and not isinstance(b, bool)):
+        try:
+            return bool(a == b)
+        except (TypeError, ValueError, OverflowError):
+            return False
+    if a is None or b is None:
+        return a is None and b is None
+    if isinstance(a, str) and isinstance(b, str):
+        return a == b
+    return False
+
+
 def _ci_key_text(value, limit=120):
     """Bounded text for an untrusted mapping key/path component.
 
@@ -383,7 +418,7 @@ def _ci_shape_problems(inputs, result):
                     problems.append('result.margin does not match inputs.margin')
 
     if isinstance(inputs, dict) and isinstance(inputs.get('design'), dict):
-        if result.get('design') != inputs.get('design'):
+        if not _ci_json_equal(result.get('design'), inputs.get('design')):
             problems.append('result.design does not match inputs.design')
 
     scales = result.get('scales')
@@ -1159,7 +1194,11 @@ def _ci_same(a, b, path='result', *, rtol=1e-9, atol=1e-12, diffs=None):
             diffs.append(f'{path}: uncomparable numbers '
                          f'{_ci_repr(a)}, {_ci_repr(b)}')
         return diffs
-    if a != b:
+    try:
+        same = bool(a == b)
+    except (TypeError, ValueError, OverflowError):
+        same = False
+    if not same:
         diffs.append(f'{path}: {_ci_repr(a)} != {_ci_repr(b)}')
     return diffs
 

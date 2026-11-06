@@ -935,6 +935,11 @@ def curve_simultaneous_inference(conditions, effects, *, seeds=None,
             p_lower = _cv_num(enum['p_lower'][k])
             p_upper = _cv_num(enum['p_upper'][k])
             ci_sim = [_cv_num(x) for x in enum['ci'][k]]
+            if any(x is None for x in ci_sim):
+                # An endpoint can overflow even when the centre and SEM are
+                # representable; a [null, null] pair reads as a reported
+                # interval.  Withhold the whole simultaneous interval instead.
+                ci_sim = None
             ci_point = _cv_t_interval(mean, sem, n, alpha)
             # The normal fallback has no exact max-T null; use an explicitly
             # approximate Bonferroni family p so the direction flag is not
@@ -955,6 +960,8 @@ def curve_simultaneous_inference(conditions, effects, *, seeds=None,
                 ci_sim = None
             else:
                 ci_sim = [_cv_num(ci_sim[0]), _cv_num(ci_sim[1])]
+                if any(x is None for x in ci_sim):
+                    ci_sim = None
             p_adj_single = _cv_num(row.get('p_maxt_single'))
             p_adj_step = _cv_num(row.get('p_maxt'))
             reject_maxt = bool(row.get('reject_maxt'))

@@ -32,6 +32,7 @@
 
 import json as _am_json
 import math as _am_math
+import numbers as _am_numbers
 import os as _am_os
 import time as _am_time
 
@@ -110,7 +111,11 @@ def _am_repr(value):
 
 def _am_number(value, *, where, positive=False):
     """Finite JSON number; bool/None/str and non-finite values fail closed."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    # NumPy integer/floating scalars are numeric measurements even though
+    # they are not instances of the builtin int/float (``_finite_scalar``
+    # accepts them for the same reason).  ``np.bool_`` is not a Real, so it
+    # stays rejected rather than becoming 0.0/1.0.
+    if isinstance(value, bool) or not isinstance(value, _am_numbers.Real):
         raise ValueError(f'{where} must be a finite number, got '
                          f'{_am_repr(value)}')
     try:
@@ -126,7 +131,7 @@ def _am_number(value, *, where, positive=False):
 
 
 def _am_int(value, *, where, minimum=None, maximum=None):
-    if isinstance(value, bool) or not isinstance(value, int):
+    if isinstance(value, bool) or not isinstance(value, _am_numbers.Integral):
         raise ValueError(f'{where} must be an integer, got '
                          f'{_am_repr(value)}')
     out = int(value)
@@ -160,7 +165,7 @@ def _am_seed(value, *, where):
             raise ValueError(
                 f'{where}: seed is too large to represent as a JSON key'
             ) from None
-    if isinstance(value, bool) or not isinstance(value, int):
+    if isinstance(value, bool) or not isinstance(value, _am_numbers.Integral):
         raise ValueError(f'{where} must be an integer seed label, got '
                          f'{_am_repr(value)}')
     if value < 0:
@@ -184,7 +189,7 @@ def _am_feature_value(value, *, where):
     """Scalar feature level; containers/None are not a declared choice."""
     if isinstance(value, bool):
         return bool(value)
-    if isinstance(value, int):
+    if isinstance(value, _am_numbers.Integral):
         out = int(value)
         try:
             # The feature level is echoed in the strict-JSON result and in
@@ -196,10 +201,11 @@ def _am_feature_value(value, *, where):
             raise ValueError(
                 f'{where}: integer is too large to represent as JSON')
         return out
-    if isinstance(value, float):
-        if not _am_math.isfinite(value):
+    if isinstance(value, _am_numbers.Real):
+        number = float(value)
+        if not _am_math.isfinite(number):
             raise ValueError(f'{where} must be finite, got {_am_repr(value)}')
-        return float(value)
+        return number
     if isinstance(value, str):
         return value
     raise ValueError(f'{where} must be a bool/int/float/string, got '

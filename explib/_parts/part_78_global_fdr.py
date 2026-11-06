@@ -140,7 +140,25 @@ def _gfdr_exact(a, b):
         return a is b
     if isinstance(a, (int, float)) and isinstance(b, (int, float)):
         return _gfdr_close(a, b)
-    return a == b
+    if isinstance(a, dict) or isinstance(b, dict):
+        if not (isinstance(a, dict) and isinstance(b, dict)):
+            return False
+        if set(a) != set(b):
+            return False
+        return all(_gfdr_exact(a[key], b[key]) for key in a)
+    if isinstance(a, (list, tuple)) or isinstance(b, (list, tuple)):
+        if not (isinstance(a, (list, tuple))
+                and isinstance(b, (list, tuple))):
+            return False
+        return (len(a) == len(b)
+                and all(_gfdr_exact(x, y) for x, y in zip(a, b)))
+    # A hostile artifact can carry an array here.  ``a == b`` would return an
+    # array whose truth value is ambiguous, turning a named validation failure
+    # into an uncaught ValueError.
+    try:
+        return bool(a == b)
+    except (TypeError, ValueError, OverflowError):
+        return False
 
 
 def _gfdr_text(value):
@@ -783,11 +801,11 @@ def validate_global_fdr(artifact):
         if key not in stored:
             out['problems'].append(f'result.{key} is missing')
             continue
-        if stored.get(key) != replay.get(key):
+        if not _gfdr_exact(stored.get(key), replay.get(key)):
             out['problems'].append(
                 f'result.{key}: stored={_gfdr_repr(stored.get(key))}, '
                 f'replay={_gfdr_repr(replay.get(key))}')
-    if stored.get('policy') != replay.get('policy'):
+    if not _gfdr_exact(stored.get('policy'), replay.get('policy')):
         out['problems'].append('result.policy differs from the replay')
     stored_claims = stored.get('claims')
     replay_claims = replay.get('claims') or {}

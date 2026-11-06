@@ -151,10 +151,19 @@ def _vt_seed(value):
 def _vt_close(a, b, rel=1e-9, abs_=1e-12):
     if not (isinstance(a, (int, float)) and isinstance(b, (int, float))):
         return False
-    if not (math.isfinite(float(a)) and math.isfinite(float(b))):
-        return False
-    return abs(float(a) - float(b)) <= abs_ + rel * max(
-        1.0, abs(float(a)), abs(float(b)))
+    try:
+        fa, fb = float(a), float(b)
+    except (OverflowError, ValueError):
+        # A hand-edited block can carry an integer beyond float64.  It cannot
+        # equal a finite replay value, but Python's exact mixed comparison is
+        # safe and must not abort the replay verdict.
+        try:
+            return bool(a == b)
+        except (TypeError, ValueError, OverflowError):
+            return False
+    if not (math.isfinite(fa) and math.isfinite(fb)):
+        return bool(a == b)
+    return abs(fa - fb) <= abs_ + rel * max(1.0, abs(fa), abs(fb))
 
 
 def _vt_list(value):
@@ -1147,7 +1156,12 @@ def replay_validation_transfer(block, manifest=None):
     classes = {}
     n_incomplete = 0
     for name in family:
-        rec = comps.get(name) or {}
+        # A tampered block can replace a comparison object with any JSON
+        # scalar; ``comps.get(name) or {}`` would keep a truthy scalar and the
+        # next ``.get`` would abort the structured replay verdict.
+        rec = comps.get(name)
+        if not isinstance(rec, dict):
+            rec = {}
         cls = (rec.get('classification')
                if rec.get('status') == 'ok' else 'not_estimable')
         if not isinstance(cls, str):

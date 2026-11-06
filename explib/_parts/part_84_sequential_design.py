@@ -799,9 +799,30 @@ def sequential_conditional_power(design, *, look, observed_w, q):
 
 
 def _seq_min_q_for_power(rows, sides, target_power):
+    """Sign rate at the target-power boundary (``q = P(delta > 0)``).
+
+    For ``greater``/``two`` power grows with q, so the boundary is the
+    smallest powered q and the search interval is [0.5, 1).  For ``less`` the
+    tested direction is negative: power grows as q falls below 0.5, so the
+    boundary is the **largest** powered q below 0.5.  Searching only [0.5, 1)
+    made a perfectly powered one-sided negative design report ``None`` and
+    withhold its MDE.
+    """
     target_power = float(target_power)
     if _seq_power(rows, 0.5, sides)['power'] >= target_power:
         return 0.5
+    if sides == 'less':
+        # q=0 is the strongest possible negative alternative.
+        if _seq_power(rows, 0.0, sides)['power'] < target_power:
+            return None
+        lo, hi = 0.0, 0.5  # power(lo) >= target > power(hi)
+        for _ in range(100):
+            mid = (lo + hi) / 2.0
+            if _seq_power(rows, mid, sides)['power'] >= target_power:
+                lo = mid
+            else:
+                hi = mid
+        return float(lo)
     lo, hi = 0.5, 1.0 - 1e-12
     if _seq_power(rows, hi, sides)['power'] < target_power:
         return None
