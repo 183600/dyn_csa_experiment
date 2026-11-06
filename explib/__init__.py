@@ -151,6 +151,7 @@ _PARTS = [
 'part_82_numerical_canary.py',
 'part_83_contrast_interaction.py',
 'part_84_sequential_design.py',
+'part_85_budget_ablation.py',
 ]
 
 load_root_package(globals(), __file__, _PARTS,

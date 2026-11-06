@@ -39,6 +39,7 @@ _PARTS = [
 'part_48_audit_numerical_canary.py',
 'part_49_audit_contrast_interaction.py',
 'part_50_audit_sequential_design.py',
+'part_51_audit_budget_ablation.py',
 'part_05_audit_confirmation_verdicts.py',
 'part_08_audit_missingness.py',
 'part_09_audit_trajectory.py',

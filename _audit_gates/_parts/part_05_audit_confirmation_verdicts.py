@@ -1993,6 +1993,7 @@ def run_report(out='audit_report.json'):
     res['analysis_multiverse'] = audit_analysis_multiverse(verbose=False)
     res['contrast_interaction'] = audit_contrast_interaction(verbose=False)
     res['sequential_design'] = audit_sequential_design(verbose=False)
+    res['budget_ablation'] = audit_budget_ablation(verbose=False)
     res['data_exposure'] = audit_data_exposure()
     if str(os.environ.get('CSA_REPLAY_IN_REPORT', '')).strip().lower() in (
             '1', 'true', 'yes', 'on'):
@@ -2161,6 +2162,13 @@ def _run_cli():
                   'sequential_design_artifact': audit_sequential_design_artifact,
                   'sequential_design_replay': audit_sequential_design_artifact,
                   'sequential_design_validation': audit_sequential_design_artifact})
+    _cmds.update({'budget_ablation': audit_budget_ablation,
+                  'budget_ablation_artifact': audit_budget_ablation,
+                  'budget_ablation_replay': audit_budget_ablation,
+                  'budget_ablation_validation': audit_budget_ablation,
+                  'budget_interaction': audit_budget_ablation,
+                  'ablation_budget': audit_budget_ablation,
+                  'budget_ladder': audit_budget_ablation})
     _arg = sys.argv[1] if len(sys.argv) > 1 else 'report'
     if _arg in ('-h', '--help'):
         print(__doc__)
@@ -2251,7 +2259,10 @@ def _run_cli():
                 'sequential_design', 'group_sequential', 'sequential',
                 'alpha_spending', 'look_plan',
                 'sequential_design_artifact', 'sequential_design_replay',
-                'sequential_design_validation'):
+                'sequential_design_validation',
+                'budget_ablation', 'budget_ablation_artifact',
+                'budget_ablation_replay', 'budget_ablation_validation',
+                'budget_interaction', 'ablation_budget', 'budget_ladder'):
         _r = _cmds[_arg](*_pos)
     elif _arg in ('test_access', 'test_access_audit', 'heldout', 'test_looks',
                   'environment_identity', 'environment', 'env_drift',
