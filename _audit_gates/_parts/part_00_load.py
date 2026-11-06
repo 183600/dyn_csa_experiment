@@ -381,6 +381,16 @@
                not_verifiable_locally、篡改判 fail；不进入冻结 Holm 族、不改
                confirmed/verified（零 GPU；别名 interaction_2x2 / two_by_two /
                difference_in_differences / did / sink_interaction）
+  sequential_design  实验设计与准备：前瞻的群序列（group-sequential）符号检验
+               计划——声明 look schedule、alpha 消耗函数与整数边界；用精确
+               路径计数重放 FWER、power、expected_n 与条件 power，检查计划
+               早于第一次 panel_look/cell 事件、n_max 与冻结清单一致、
+               look_history 的 n 都在计划内、且不与协议
+               fixed_plan_no_optional_stopping 冲突；缺产物且清单/协议声明
+               sequential 报 not_verifiable_locally，未声明报 not_applicable，
+               篡改/晚于第一次 look/计划外 look 判 fail；不训练、不读 split、
+               不产生确认 p 或改冻结判定（零 GPU；别名 group_sequential /
+               sequential / alpha_spending / look_plan）
   data_source  上游语料版本：每个 cache meta 是否记录并匹配固定的 Hub commit
                （WikiText-103 / FineWeb-Edu）；train/validation/test 必须同一
                快照；legacy/local 缓存明确报不可验证而非算作干净

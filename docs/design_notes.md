@@ -14866,3 +14866,156 @@ artifact 的 hash/`created_at` 身份/重放篡改/冻结字段拒绝；not_esti
 的精确差异路径；审计门的 ok/warnings/fail/missing 与 test_stats 内嵌
 重放；v12/report/CLI/Makefile 接线与 README/.github 仍在。完整 CPU
 套件在本轮最终树通过。
+
+## 150. 补种子之前就要说好「看几次」：精确符号检验的群序列设计（本轮实验设计与准备硬化，no new runs）
+
+### 150.1 问题：事后 max-over-looks 不是设计
+
+仓库已经能记录并纠正重复查看：`look_history.json` 保存每次补种子后的种子
+集合，`audit_gates.py looks` 用 exact max-over-looks 重算 p。这解决的问题是
+「已经看了 k 次，最终 p 应该乘多少」。它没有解决更早、也更便宜的问题：
+
+> 这个面板**本来允许**看几次？每次在多少种子上看？每次的拒绝边界是多少？
+> 如果第一次看没显著，第二次看需要多强的证据才能拒绝？
+
+没有这份事前计划，补种子就只能靠**事后**纠正。事后纠正当然能控制 FWER，
+但它是保守的、不可逆的，而且无法区分「设计好的期中分析」与「看到不显著
+才加种子」。在实验设计与准备阶段，这应该是一个和 arm/seed/alpha 一样被
+冻结的决策，而不是分析阶段才补的补丁。
+
+### 150.2 方法：符号和随机游走 + 整数精确枚举
+
+设第 i 个种子的配对差为 d_i，定义符号 x_i = sign(d_i) ∈ {+1,-1}，
+W_n = Σ_{i≤n} x_i。原假设下 x_i 是独立 Rademacher 变量，所以
+(W_{n_1},...,W_{n_K}) 的**联合分布**完全由 n_k 决定，不需要正态近似，
+也不需要 Monte Carlo。
+
+声明 look schedule n_1 < ... < n_K = n_max，每个 look 只看前 n_k 个种子
+（嵌套，不换种子、不按结果挑种子）。相邻 look 之间的 m 步用二项系数
+卷积推进**整数路径计数**：
+
+```
+surv_0 = {0: 1}
+surv_k = convolve(surv_{k-1}, steps=n_k-n_{k-1})
+```
+
+对每个 look，候选边界是整数绝对阈值 b_k（two-sided 用 |W|>=b，
+one-sided 用 W>=b 或 W<=-b）。`sequential_boundaries` 从左到右扫描 b，
+取**能放进当前累计 alpha 的最小 b**：
+
+```
+target_k = comparison_alpha * spending_fraction(n_k / n_max)
+actual_k = actual_{k-1} + (# paths crossing at look k) / 2**n_k
+choose smallest b with actual_k <= target_k
+```
+
+所以 `fwer` 是精确的路径计数比，不是把 nominal alpha 当成实际 alpha。
+离散性会导致实际值低于名义值（例如 n=6 时最小可达双边 p 是 2/64=0.03125，
+放不进 OBF 在 t=0.5 的 0.00557），这时报告 `attainable=false` 并写明
+「这个 look 不能拒绝」，而不是伪造一个不存在的连续边界。
+
+支持 `pocock` / `obrien_fleming` / `linear` / `custom` / `none` 五种消耗。
+`custom` 的累计比例必须非降、以 1.0 结束。`family_size>1` 用 Bonferroni
+把 alpha 均分给比较，并明确写成 Bonferroni，不冒充 Holm-sequential。
+
+`monotone_z` 是可选项：打开时强制 `b_k/sqrt(n_k)` 不高于前一个 look，
+避免「后看反而更难拒绝」。但离散 + 前载消耗可能让这个约束不可行（例如
+Pocock 在 n=6 无法拒绝、n=9 用掉大部分 alpha、n=12 又被 z 上限卡住）。
+默认关闭；若 z 上升，结果显式 warning「该计划前载 alpha，后面的 look
+更难拒绝」，不静默当成标准群序列边界。
+
+### 150.3 功效、期望样本量与 MDE
+
+给定 pilot（**只能是 validation**）的符号率 q = P(d_i > 0)，同一个整数
+路径计数可以精确计算符号检验的 power：
+
+```
+P(stop at look k) = Σ_{|W|>=b_k} count_k(W) * q**((n_k+W)/2) * (1-q)**((n_k-W)/2)
+power             = Σ_k P(stop at look k)
+expected_n        = Σ_k n_k * P(stop at look k) + n_max * P(no stop)
+```
+
+零假设 q=0.5 时 power 精确等于 `fwer`（校准测试直接断言这一点）。
+`min_q_for_target_power` 用二分反解；若提供 `pilot_sd`，再用正态位置模型
+把 q 映回 log-PPL 尺度：
+
+```
+mde_log_ppl = pilot_sd * Phi^{-1}(q_min)
+```
+
+这是和 `signflip_power` 同一类**计划投影**：仓库的确认检验是均值型
+exact sign-flip，而这里是符号检验的精确群序列设计。两者不是同一个统计量，
+所以 power 不能写成对最终 p 值的承诺；它回答的是「这个 look schedule 在
+这个符号率下有多大概率走到拒绝」。
+
+`sequential_conditional_power(design, look=k, observed_w=w, q=q)` 是同一
+路径计数的条件版本：固定第 k 个 look 的 W，后续 m 步只用
+`q**s * (1-q)**(m-s)` 加权（s 由 W 的变化量决定），得到「已经观察到 w、
+还没跨过边界，最终跨过的概率」。这是期中分析前的 rehearsal 读数，不是
+确认 p 值，也不是对已观察到 w 的事后 power。
+
+### 150.4 产物、重放与审计门
+
+`build_sequential_design` 写一个 hash-bound 的 `sequential_design.json`：
+
+- `inputs`：n_max、look_sizes、alpha、sides、spending、cumulative_spend、
+  family_size、pilot 摘要（符号率/SD/PPL/计数）、q_for_power、target_power、
+  power_curve_q、monotone_z；
+- `result`：每个 look 的 n/t/b/z、nominal p、累计名义/实际 alpha、是否
+  可达、精确 FWER、power、expected_n、逐 look 停止概率、power curve、
+  min q、MDE、resolution floor 与 warnings；
+- `content_sha256` 排除 `created_at`/`revision`/`supersedes`/`reason`，但
+  包含 `inputs` 与 `result`；validator 从 `inputs` 完整重放并逐字段对账，
+  同时拒绝任何 `confirmed`/`verified`/`p_holm`/`verdict`/`decision` 字段。
+
+`sequential_design_audit` 是设计/准备门，区分五种状态：
+
+| 状态 | 含义 |
+|---|---|
+| `ok` | 产物重放通过、n_max 与冻结清单一致、计划早于第一次 look/study event、观察到的 look 都在计划表内 |
+| `warnings` | 重放通过，但计划本身有离散/前载/未绑定清单或协议等 caveat |
+| `not_verifiable_locally` | 清单/协议声明了 sequential，但本地产物缺失或不可读 |
+| `not_applicable` | 没有声明 sequential（固定单 look 设计） |
+| `fail` | 产物被篡改、n_max 与清单不符、计划晚于第一次 look、观察到计划外的 look，或与协议 `fixed_plan_no_optional_stopping` 冲突 |
+
+时间比较只认 `panel_look`/cell/training 这类**执行事件**，不把
+`analysis_audit` 的报告事件当成一次 look。`look_history.json` 里出现
+计划外的 n（例如计划 [6,9,12] 却看到 n=8）直接 fail：这不是「补种子」，
+是一个没有预注册的新 look。
+
+### 150.5 边界：它修复什么，不修复什么
+
+- **修复的是未来。** 它让下一次面板可以在第一次看之前冻结 look schedule
+  和边界；它不能把已经发生的 optional stopping 变成预先计划。v12 冻结清单
+  明确 `fixed_plan_no_optional_stopping`，所以 v12 本身是
+  `not_applicable`，本块不改变它。
+- **不是新的确认性检验。** 不训练、不读任何 split、不产生确认 p 值、不进
+  入冻结 Holm 族，也不改 `confirmed`/`verified`。
+- **不是均值检验的精确替身。** 符号和只利用方向，忽略幅度；sign-flip 的
+  均值统计量对大幅度种子更敏感。两者回答的问题不同，power 只作为计划读数。
+- **不是 Holm-sequential。** `family_size>1` 只是 Bonferroni 均分；真正的
+  Holm 与 group-sequential 的组合需要另外的联合分布，本块不冒充。
+- **不是无离散的。** 小 n、大 alpha 或早期 look 可能根本没有可达到的整数
+  边界；`attainable=false` 和 `not_estimable` 是设计结论，不是「没有效应」。
+- **不是签名。** hash 只能让计划与重放不一致可见；它挡不住同时改写计划与
+  产物的人，也不替代 result-level 的审计。
+
+### 150.6 入口与验证
+
+```bash
+python -m pytest -q test_review_part_90.py
+python audit_gates.py sequential_design                 # 默认位置
+python audit_gates.py sequential_design PATH            # 指定产物
+python audit_gates.py group_sequential PATH             # 别名
+make sequential-design
+```
+
+新增 `test_review_part_90.py` 22 项：三种 sides 的精确 FWER 与 2^n 暴力枚举
+对拍；power/停止分布/expected_n 与加权暴力枚举对拍；条件 power 与未来
+符号枚举对拍；q=0.5 时 power 精确等于 FWER；五种 spending 的 FWER 上界与 family_size=1/2/4 的 Bonferroni
+上界；整数边界/不可达 look 的具名状态；monotone_z 的可行/不可行与 z 上升
+warning；custom spending 的重放与非法输入；artifact 的 build/validate/
+tamper/forbidden-field；pilot 摘要与 MDE；writer 的 no-op/conflict/
+overwrite；manifest/protocol reader；审计门的 not_applicable/not_verifiable/
+timing fail/manifest mismatch/off-schedule/protocol conflict；CLI/Makefile
+接线与 README/.github 仍在。完整 CPU 套件在本轮最终树通过。

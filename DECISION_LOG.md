@@ -7505,3 +7505,85 @@ no-op/conflict/overwrite；比较器的精确差异路径；审计门的
 ok/warnings/fail/missing 与 test_stats 内嵌重放；v12/report/CLI/
 Makefile 接线与 README/.github 仍在。确认相关既有 225 项与完整 CPU 套件
 在本轮最终树通过。
+
+## 2026-11-06 — 补种子之前先说好「看几次」：精确符号检验的群序列设计与发射前 look 计划（本轮实验设计与准备硬化，no new runs）
+
+**Problem.** 仓库已经能**事后**纠正重复查看：`look_history.json` 记录每次
+补种子后的种子集合，`audit_gates.py looks` 用 exact max-over-looks 重算 p。
+但没有任何对象要求「允许看几次、每次在多少种子上看、每次的拒绝边界是多少」
+在第一次 look 之前被冻结。结果是补种子只能靠事后 max-over-looks 变保守：
+FWER 能控住，但无法区分「设计好的期中分析」与「看到不显著才加种子」，也
+无法在加种子之前回答「这次期中分析值不值得做」。这是实验设计与准备阶段
+缺少的前瞻对象，不是又一个结果分析读数。
+
+**Fix.** 新增 `explib/_parts/part_84_sequential_design.py`：
+
+- 声明 look schedule `n_1 < ... < n_K = n_max`，每个 look 只看前 n_k 个
+  种子的嵌套前缀；不换种子、不按结果挑种子。
+- 统计量取符号和 `W_n = Σ sign(d_i)`。H0 下符号是独立 Rademacher，所以
+  `(W_{n_1},...,W_{n_K})` 的联合分布用**整数动态规划 + 二项系数**精确
+  枚举；不做正态近似、不做 Monte Carlo。相邻 look 的 m 步用
+  `surv ⊛ Binomial(m)` 推进，所有路径计数保持 Python 整数。
+- `sequential_boundaries(look_sizes, alpha, sides, spending, family_size,
+  monotone_z)` 支持 Pocock / O'Brien-Fleming / linear / custom / none；
+  每个 look 取能放进 `comparison_alpha * nominal_cumulative_spend` 的
+  **最小整数绝对阈值**，实际累计 FWER 用精确路径计数重算。离散导致实际
+  值低于名义值时保留差值并 warning；没有任何整数边界可达时写
+  `attainable=false`，`n_max` 的 final look 不可达则 `not_estimable`，
+  不伪造连续边界。
+- `sides ∈ {two, greater, less}`；`family_size>1` 用 Bonferroni 均分
+  `alpha`，报告 `comparison_alpha` 与 `familywise_fwer_bound`，明确不冒充
+  Holm-sequential。`monotone_z` 可选（默认关）：打开时强制
+  `b_k/sqrt(n_k)` 不高于前一个 look；离散/前载消耗使约束不可行时不静默
+  改边界，而是 `not_estimable` 或 warning。
+- `_seq_power` 用同一组整数路径计数精确计算 sign-test power、逐 look
+  停止概率、`expected_n` 与 `prob_no_stop`；q=0.5 时 power 精确等于 FWER。
+  `sequential_conditional_power` 用同一路径计数给条件 power：固定某 look 的
+  W 后，后续 m 步按 `q**s*(1-q)**(m-s)` 精确加权。
+  `min_q_for_target_power` 二分反解；若给 `pilot_sd`，用
+  `pilot_sd * Phi^{-1}(q_min)` 报 log-PPL 尺度 MDE；若给 `pilot_ppl`，
+  再报相对百分比。pilot 只接受 validation 配对差，不读 test split。
+- `build_/validate_/write_sequential_design`：`inputs` 存 n_max/look_sizes/
+  alpha/sides/spending/cumulative_spend/family_size/pilot 摘要/q/target/
+  curve/monotone_z；`result` 存逐 look 边界、nominal p、累计名义/实际
+  alpha、FWER、power、expected_n、停止分布、curve、min q、MDE、resolution
+  与 warnings。`content_sha256` 排除 `created_at`/`revision`/`supersedes`/
+  `reason`，但绑定 `inputs`/`result`；validator 从 `inputs` 完整重放并逐
+  字段对账，缺 hash/改 power/改边界/夹带 `confirmed`/`verified`/`p_holm`/
+  `verdict`/`decision` 均 fail；writer 同内容 no-op、不同内容默认 conflict，
+  显式 `overwrite=True` 才替换。
+- `sequential_design_from_manifest` 读可选的
+  `statistics.sequential` 块，`sequential_design_from_protocol` 读
+  `stopping.sequential`/`extras.sequential`；没有声明返回 `None`，不改变
+  v12 冻结清单。
+- 新增 `audit_gates.py sequential_design`（别名 `group_sequential` /
+  `sequential` / `alpha_spending` / `look_plan`）与单产物重放别名。门检查：
+  产物重放、`n_max` 与冻结清单 seed 数一致、计划早于第一次
+  `panel_look`/cell/training 事件（不把 `analysis_audit` 报告事件当成
+  look）、`look_history.json` 的每个 n 都在注册 schedule 内、协议
+  `fixed_plan_no_optional_stopping` 与多 look 计划不冲突。缺产物且清单/
+  协议声明 sequential 报 `not_verifiable_locally`，未声明报
+  `not_applicable`（v12 就是这一类），篡改/晚于第一次 look/计划外 look/
+  n 不一致/协议冲突报 `fail`。接入 `audit_gates.py report` 顶层与
+  `make sequential-design`。
+
+**Boundary.** 这是**前瞻设计/准备**对象，不是新的确认性检验：不训练、
+不读任何 split、不产生确认 p 值、不进入冻结 Holm 族、不改变
+`p_exact_signflip`/`p_holm`/`verified`/`confirmed`。它修复的是下一次
+面板可以预先冻结 look schedule；不能把已经发生的 optional stopping 变成
+预先计划。v12 明确 `fixed_plan_no_optional_stopping`，所以 v12 本身是
+`not_applicable`，本块不为它补一个事后计划。符号和只利用方向、忽略幅度，
+与均值型 exact sign-flip 不是同一统计量；power 只是计划投影，不是对最终
+p 值的承诺。`family_size>1` 只是 Bonferroni，不是 Holm-sequential。离散
+导致早期 look 不可达时，`attainable=false` 是设计结论，不是「没有效应」。
+
+**Verification.** 新增 `test_review_part_90.py` 22 项：two/greater/less
+三种 sides 的精确 FWER 与 2^n 暴力枚举对拍；power、逐 look 停止概率、
+expected_n 与加权暴力枚举对拍；条件 power 与未来符号枚举对拍；q=0.5 时 power 精确等于 FWER；五种
+spending 的 FWER 上界与 family_size=1/2/4 的 Bonferroni 上界；整数边界/
+不可达 look 的具名状态；`monotone_z` 的可行/不可行与 z 上升 warning；
+custom spending 的重放与非法输入；artifact 的 build/validate/tamper/
+forbidden-field；pilot 摘要与 MDE；writer 的 no-op/conflict/overwrite；
+manifest/protocol reader；审计门的 `not_applicable`/`not_verifiable_locally`/
+timing fail/manifest mismatch/off-schedule/protocol conflict；CLI/Makefile
+接线与 README/.github 仍在。完整 CPU 套件在本轮最终树通过。

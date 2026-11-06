@@ -150,6 +150,7 @@ _PARTS = [
 'part_81_ablation_screening.py',
 'part_82_numerical_canary.py',
 'part_83_contrast_interaction.py',
+'part_84_sequential_design.py',
 ]
 
 load_root_package(globals(), __file__, _PARTS,

@@ -1992,6 +1992,7 @@ def run_report(out='audit_report.json'):
     res['ablation_screening'] = audit_ablation_screening(verbose=False)
     res['analysis_multiverse'] = audit_analysis_multiverse(verbose=False)
     res['contrast_interaction'] = audit_contrast_interaction(verbose=False)
+    res['sequential_design'] = audit_sequential_design(verbose=False)
     res['data_exposure'] = audit_data_exposure()
     if str(os.environ.get('CSA_REPLAY_IN_REPORT', '')).strip().lower() in (
             '1', 'true', 'yes', 'on'):
@@ -2152,6 +2153,14 @@ def _run_cli():
                   'contrast_interaction_artifact': audit_contrast_interaction_artifact,
                   'contrast_interaction_replay': audit_contrast_interaction_artifact,
                   'contrast_interaction_validation': audit_contrast_interaction_artifact})
+    _cmds.update({'sequential_design': audit_sequential_design,
+                  'group_sequential': audit_sequential_design,
+                  'sequential': audit_sequential_design,
+                  'alpha_spending': audit_sequential_design,
+                  'look_plan': audit_sequential_design,
+                  'sequential_design_artifact': audit_sequential_design_artifact,
+                  'sequential_design_replay': audit_sequential_design_artifact,
+                  'sequential_design_validation': audit_sequential_design_artifact})
     _arg = sys.argv[1] if len(sys.argv) > 1 else 'report'
     if _arg in ('-h', '--help'):
         print(__doc__)
@@ -2238,7 +2247,11 @@ def _run_cli():
                 'exact_tost_validation',
                 'global_fdr', 'global_fdr_audit', 'cross_panel_fdr',
                 'exploratory_fdr', 'fdr', 'global_fdr_artifact',
-                'global_fdr_replay', 'global_fdr_validation'):
+                'global_fdr_replay', 'global_fdr_validation',
+                'sequential_design', 'group_sequential', 'sequential',
+                'alpha_spending', 'look_plan',
+                'sequential_design_artifact', 'sequential_design_replay',
+                'sequential_design_validation'):
         _r = _cmds[_arg](*_pos)
     elif _arg in ('test_access', 'test_access_audit', 'heldout', 'test_looks',
                   'environment_identity', 'environment', 'env_drift',
