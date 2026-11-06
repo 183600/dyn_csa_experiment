@@ -560,6 +560,16 @@ def _esci_compare(a, b, path='result', *, rtol=1e-9, atol=1e-12, diffs=None):
     return diffs
 
 
+def _esci_equal(a, b):
+    """True when two JSON values match, without raising on an array scalar.
+
+    The full comparator already collapses an array/scalar mismatch to
+    "different"; reuse it so the schema checks cannot be the one place where
+    ``bool(a == b)`` escapes as an ambiguous-truth ``ValueError``.
+    """
+    return not _esci_compare(a, b, 'value')
+
+
 def _esci_inputs_problems(inputs):
     problems = []
     if not isinstance(inputs, dict):
@@ -594,16 +604,18 @@ def _esci_result_problems(result):
     problems = []
     if not isinstance(result, dict):
         return ['result must be an object']
-    if result.get('kind') != EXACT_SIGNFLIP_CI_RESULT_KIND:
+    if not _esci_equal(result.get('kind'), EXACT_SIGNFLIP_CI_RESULT_KIND):
         problems.append(
             f"result.kind must be {EXACT_SIGNFLIP_CI_RESULT_KIND!r}, got "
             f'{_esci_repr(result.get("kind"))}')
-    if result.get('version') != EXACT_SIGNFLIP_CI_POLICY['version']:
+    if not _esci_equal(result.get('version'),
+                       EXACT_SIGNFLIP_CI_POLICY['version']):
         problems.append(
             f"result.version must be {EXACT_SIGNFLIP_CI_POLICY['version']!r}, "
             f'got {_esci_repr(result.get("version"))}')
     status = result.get('status')
-    if status not in EXACT_SIGNFLIP_CI_STATUSES:
+    if not any(_esci_equal(status, value)
+               for value in EXACT_SIGNFLIP_CI_STATUSES):
         problems.append(
             f'result.status must be one of {EXACT_SIGNFLIP_CI_STATUSES}, '
             f'got {_esci_repr(status)}')
@@ -1069,11 +1081,13 @@ def _esci_validate_common(artifact, *, block=False):
             f'extra={[_esci_key_text(k) for k in extra]}')
     want_kind = (EXACT_SIGNFLIP_CI_BLOCK_KIND if block
                  else EXACT_SIGNFLIP_CI_KIND)
-    if artifact.get('kind') != want_kind:
+    if not _esci_equal(artifact.get('kind'), want_kind):
         out['problems'].append(
             f'artifact.kind must be {want_kind!r}, got '
             f'{_esci_repr(artifact.get("kind"))}')
-    if not block and artifact.get('schema') != EXACT_SIGNFLIP_CI_SCHEMA:
+    if (not block
+            and not _esci_equal(artifact.get('schema'),
+                                EXACT_SIGNFLIP_CI_SCHEMA)):
         out['problems'].append(
             f'artifact.schema must be {EXACT_SIGNFLIP_CI_SCHEMA}, got '
             f'{_esci_repr(artifact.get("schema"))}')

@@ -998,7 +998,8 @@ def validate_analysis_multiverse(artifact):
     if not isinstance(artifact, dict):
         out['problems'].append('artifact must be a JSON object')
         return out
-    if artifact.get('kind') != AM_ARTIFACT_KIND:
+    if (not isinstance(artifact.get('kind'), str)
+            or artifact.get('kind') != AM_ARTIFACT_KIND):
         out['problems'].append(
             f'artifact.kind must be {AM_ARTIFACT_KIND!r}, got '
             f'{_am_repr(artifact.get("kind"))}')

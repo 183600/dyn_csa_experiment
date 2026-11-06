@@ -698,7 +698,8 @@ def validate_global_fdr(artifact):
     if not isinstance(artifact, dict):
         out['problems'].append('artifact must be a JSON object')
         return out
-    if artifact.get('kind') != GLOBAL_FDR_ARTIFACT_KIND:
+    if not _gfdr_exact(artifact.get('kind'),
+                       GLOBAL_FDR_ARTIFACT_KIND):
         out['problems'].append(
             f'artifact.kind must be {GLOBAL_FDR_ARTIFACT_KIND!r}, got '
             f'{_gfdr_repr(artifact.get("kind"))}')

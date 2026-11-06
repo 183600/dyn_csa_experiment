@@ -39,6 +39,7 @@ slot (p=1) rather than silently shrinking the correction family.
 """
 
 import math
+import numbers
 
 VALIDATION_TRANSFER_KIND = 'validation_transfer'
 # CPython refuses decimal conversion of a 4,301+ digit integer by default, so
@@ -164,6 +165,73 @@ def _vt_close(a, b, rel=1e-9, abs_=1e-12):
     if not (math.isfinite(fa) and math.isfinite(fb)):
         return bool(a == b)
     return abs(fa - fb) <= abs_ + rel * max(1.0, abs(fa), abs(fb))
+
+
+def _vt_equal(a, b, _depth=0):
+    """Structural JSON equality that never raises on a malformed value.
+
+    An in-memory artifact has not necessarily round-tripped through JSON: a
+    hand-edited or hostile caller can place a NumPy array where the replay
+    produced a scalar.  ``a != b`` then returns an array whose truth value is
+    ambiguous, which used to escape as ``ValueError`` instead of a named
+    validation failure.  Only JSON scalar/container types take part here; an
+    array where a scalar belongs is simply different.
+    """
+    if _depth > 200:
+        # A hostile body can nest containers far beyond the recursion
+        # limit; a comparison that cannot be completed is a mismatch, not an
+        # exception for the caller.
+        return False
+    if (isinstance(a, (bool, np.bool_))
+            or isinstance(b, (bool, np.bool_))):
+        return (isinstance(a, (bool, np.bool_))
+                and isinstance(b, (bool, np.bool_))
+                and bool(a) == bool(b))
+    if isinstance(a, dict) or isinstance(b, dict):
+        if not (isinstance(a, dict) and isinstance(b, dict)):
+            return False
+        if set(a) != set(b):
+            return False
+        return all(_vt_equal(a[key], b[key], _depth + 1) for key in a)
+    if isinstance(a, (list, tuple)) or isinstance(b, (list, tuple)):
+        if not (isinstance(a, (list, tuple))
+                and isinstance(b, (list, tuple))):
+            return False
+        return (len(a) == len(b)
+                and all(_vt_equal(x, y, _depth + 1)
+                        for x, y in zip(a, b)))
+    if isinstance(a, numbers.Real) and isinstance(b, numbers.Real):
+        try:
+            return bool(a == b)
+        except (TypeError, ValueError, OverflowError):
+            return False
+    if a is None or b is None:
+        return a is None and b is None
+    if isinstance(a, str) and isinstance(b, str):
+        return a == b
+    # Anything else (an ndarray, a mapping where a scalar belongs, ...) is
+    # not a JSON scalar.  Keep the comparison total and non-raising.
+    try:
+        return bool(a == b)
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def _vt_truth(value):
+    """Boolean value for a stored flag, or ``None`` for a non-boolean.
+
+    ``bool(np.array([...]))`` raises; a flag that is not a JSON boolean (or a
+    plain 0/1 number for legacy compatibility) is reported as unreadable so
+    the caller can fail the replay with a named problem.
+    """
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    if isinstance(value, numbers.Real):
+        try:
+            return bool(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+    return None
 
 
 def _vt_list(value):
@@ -806,25 +874,26 @@ def replay_validation_transfer(block, manifest=None):
     if not isinstance(block, dict):
         return {'status': 'fail', 'problems': ['block is not a JSON object'],
                 'warnings': warnings}
-    if block.get('kind') != VALIDATION_TRANSFER_KIND:
+    if not _vt_equal(block.get('kind'), VALIDATION_TRANSFER_KIND):
         problems.append(f"kind is {_vt_repr(block.get('kind'))}, expected "
                         f"{_vt_repr(VALIDATION_TRANSFER_KIND)}")
-    if block.get('schema') != VALIDATION_TRANSFER_SCHEMA:
+    if not _vt_equal(block.get('schema'), VALIDATION_TRANSFER_SCHEMA):
         problems.append(f"schema is {_vt_repr(block.get('schema'))}, expected "
                         f"{VALIDATION_TRANSFER_SCHEMA}")
-    if block.get('frozen_decision_changed') is not False:
+    if _vt_truth(block.get('frozen_decision_changed')) is not False:
         problems.append('frozen_decision_changed must be false')
-    if block.get('evidence_level') != 'descriptive':
+    if not _vt_equal(block.get('evidence_level'), 'descriptive'):
         problems.append('evidence_level must be "descriptive"')
     # The policy/role/boundary strings are the declared interpretation of the
     # block.  A replay that ignores them lets a tampered artifact relabel a
     # transport readout as confirmatory evidence while every number still
     # agrees.
-    if block.get('policy') != VALIDATION_TRANSFER_POLICY:
+    if not _vt_equal(block.get('policy'), VALIDATION_TRANSFER_POLICY):
         problems.append('policy does not match the registered transfer policy')
-    if block.get('role') != VALIDATION_TRANSFER_POLICY['role']:
+    if not _vt_equal(block.get('role'), VALIDATION_TRANSFER_POLICY['role']):
         problems.append('role does not match the declared descriptive role')
-    if block.get('boundary') != VALIDATION_TRANSFER_POLICY['boundary']:
+    if not _vt_equal(block.get('boundary'),
+                     VALIDATION_TRANSFER_POLICY['boundary']):
         problems.append('boundary does not match the declared boundary')
 
     raw_family = block.get('family')
@@ -833,7 +902,7 @@ def replay_validation_transfer(block, manifest=None):
         problems.append('family is missing, empty, non-string or has '
                         'duplicate names')
         family = []
-    if block.get('family_size') != len(family):
+    if not _vt_equal(block.get('family_size'), len(family)):
         problems.append(f'family_size={_vt_repr(block.get("family_size"))}, expected '
                         f'{len(family)}')
     family_set = set(family)
@@ -902,24 +971,25 @@ def replay_validation_transfer(block, manifest=None):
             problems.append(f'{name}: comparison block is missing')
             named_p.append((name, 1.0))
             continue
-        if rec.get('name') != name:
+        if not _vt_equal(rec.get('name'), name):
             problems.append(f'{name}: name={_vt_repr(rec.get("name"))} does not '
                             'match its family slot')
         want_comp = want_by_name.get(name)
         if isinstance(want_comp, dict):
             for key in ('a', 'b', 'endpoint'):
                 if (key in want_comp
-                        and rec.get(key) != want_comp.get(key)):
+                        and not _vt_equal(rec.get(key),
+                                          want_comp.get(key))):
                     problems.append(
                         f'{name}: {key}={_vt_repr(rec.get(key))} does not match the '
                         f'manifest value {_vt_repr(want_comp.get(key))}')
         status = rec.get('status')
-        if status == 'not_estimable':
+        if _vt_equal(status, 'not_estimable'):
             if not rec.get('reason'):
                 problems.append(f'{name}: not_estimable without a reason')
             named_p.append((name, 1.0))
             continue
-        if status != 'ok':
+        if not _vt_equal(status, 'ok'):
             problems.append(f'{name}: unknown status {_vt_repr(status)}')
             named_p.append((name, 1.0))
             continue
@@ -937,7 +1007,7 @@ def replay_validation_transfer(block, manifest=None):
             problems.append(f'{name}: vector lengths differ')
             named_p.append((name, 1.0))
             continue
-        if rec.get('n') != n:
+        if not _vt_equal(rec.get('n'), n):
             problems.append(f'{name}: n={_vt_repr(rec.get("n"))}, expected {n}')
         si = [_vt_seed(s) for s in seeds]
         if any(s is None for s in si):
@@ -1082,7 +1152,7 @@ def replay_validation_transfer(block, manifest=None):
         ci_high = dstats.get('ci95_high')
         want_cls = _vt_classify(vmean, tmean, ci_low, ci_high,
                                 dstats.get('p_exact_signflip'), alpha)
-        if rec.get('classification') != want_cls:
+        if not _vt_equal(rec.get('classification'), want_cls):
             problems.append(f'{name}: classification={_vt_repr(rec.get("classification"))}, '
                             f'recomputed {_vt_repr(want_cls)}')
         want_ratio, want_shrink = _vt_ratio_and_shrinkage(vmean, tmean)
@@ -1099,9 +1169,9 @@ def replay_validation_transfer(block, manifest=None):
             problems.append(f'{name}: direction_agreement='
                             f'{_vt_repr(rec.get("direction_agreement"))}, recomputed '
                             f'{_vt_repr(want_dir)}')
-        if rec.get('frozen_decision_changed') is not False:
+        if _vt_truth(rec.get('frozen_decision_changed')) is not False:
             problems.append(f'{name}: frozen_decision_changed must be false')
-        if rec.get('evidence_level') != 'descriptive':
+        if not _vt_equal(rec.get('evidence_level'), 'descriptive'):
             problems.append(f'{name}: evidence_level must be "descriptive"')
         named_p.append((name, dstats.get('p_exact_signflip')))
 
@@ -1121,7 +1191,8 @@ def replay_validation_transfer(block, manifest=None):
             if not _vt_same_number(got.get('p_holm'), want.get('p_holm')):
                 problems.append(f'{name}: holm p={_vt_repr(got.get("p_holm"))}, '
                                 f'recomputed {_vt_repr(want.get("p_holm"))}')
-            if bool(got.get('reject')) is not bool(want.get('reject')):
+            if (_vt_truth(got.get('reject'))
+                    is not _vt_truth(want.get('reject'))):
                 problems.append(f'{name}: holm reject={_vt_repr(got.get("reject"))}, '
                                 f'recomputed {_vt_repr(want.get("reject"))}')
         for key in stored:
@@ -1131,27 +1202,29 @@ def replay_validation_transfer(block, manifest=None):
     # family block as well, not merely with themselves.
     for name in family:
         rec = comps.get(name)
-        if not isinstance(rec, dict) or rec.get('status') not in (
-                'ok', 'not_estimable'):
+        if (not isinstance(rec, dict)
+                or not isinstance(rec.get('status'), str)
+                or rec.get('status') not in ('ok', 'not_estimable')):
             continue
         want = holm.get(name) or {}
         if not _vt_same_number(rec.get('difference_p_holm'), want.get('p_holm')):
             problems.append(f'{name}: difference_p_holm='
                             f'{_vt_repr(rec.get("difference_p_holm"))}, recomputed '
                             f'{_vt_repr(want.get("p_holm"))}')
-        if bool(rec.get('holm_reject')) is not bool(want.get('reject')):
+        if (_vt_truth(rec.get('holm_reject'))
+                is not _vt_truth(want.get('reject'))):
             problems.append(f'{name}: holm_reject={_vt_repr(rec.get("holm_reject"))}, '
                             f'recomputed {_vt_repr(want.get("reject"))}')
 
-    if block.get('n_ok') != n_ok:
+    if not _vt_equal(block.get('n_ok'), n_ok):
         problems.append(f'n_ok={_vt_repr(block.get("n_ok"))}, recomputed {n_ok}')
-    if block.get('n_not_estimable') != len(family) - n_ok:
+    if not _vt_equal(block.get('n_not_estimable'), len(family) - n_ok):
         problems.append('n_not_estimable='
                         f'{_vt_repr(block.get("n_not_estimable"))}, recomputed '
                         f'{len(family) - n_ok}')
     want_status = ('ok' if n_ok == len(family) and family
                    else 'not_estimable' if n_ok == 0 else 'partial')
-    if family and block.get('status') != want_status:
+    if family and not _vt_equal(block.get('status'), want_status):
         problems.append(f'status={_vt_repr(block.get("status"))}, recomputed {_vt_repr(want_status)}')
     classes = {}
     n_incomplete = 0
@@ -1163,7 +1236,7 @@ def replay_validation_transfer(block, manifest=None):
         if not isinstance(rec, dict):
             rec = {}
         cls = (rec.get('classification')
-               if rec.get('status') == 'ok' else 'not_estimable')
+               if _vt_equal(rec.get('status'), 'ok') else 'not_estimable')
         if not isinstance(cls, str):
             # A malformed label cannot be a dictionary key; it is already a
             # replay failure when compared with the recomputed classification.
@@ -1177,17 +1250,19 @@ def replay_validation_transfer(block, manifest=None):
     if not isinstance(summary, dict):
         problems.append('summary is not an object')
     else:
-        if summary.get('n_ok') != n_ok:
+        if not _vt_equal(summary.get('n_ok'), n_ok):
             problems.append(f'summary.n_ok={_vt_repr(summary.get("n_ok"))}, '
                             f'recomputed {n_ok}')
-        if summary.get('n_comparisons') != len(family):
+        if not _vt_equal(summary.get('n_comparisons'), len(family)):
             problems.append(f'summary.n_comparisons={_vt_repr(summary.get("n_comparisons"))}, '
                             f'expected {len(family)}')
-        if summary.get('n_not_estimable') != len(family) - n_ok:
+        if not _vt_equal(summary.get('n_not_estimable'),
+                         len(family) - n_ok):
             problems.append('summary.n_not_estimable='
                             f'{_vt_repr(summary.get("n_not_estimable"))}, '
                             f'recomputed {len(family) - n_ok}')
-        if summary.get('class_counts') != dict(sorted(classes.items())):
+        if not _vt_equal(summary.get('class_counts'),
+                         dict(sorted(classes.items()))):
             problems.append('summary.class_counts='
                             f'{_vt_repr(summary.get("class_counts"))}, '
                             f'recomputed {_vt_repr(dict(sorted(classes.items())))}')
@@ -1198,13 +1273,13 @@ def replay_validation_transfer(block, manifest=None):
                 ('n_not_distinguishable',
                  classes.get('same_sign_not_distinguishable', 0)),
                 ('n_incomplete_coverage', n_incomplete)):
-            if summary.get(key) != want:
+            if not _vt_equal(summary.get(key), want):
                 problems.append(f'summary.{key}={_vt_repr(summary.get(key))}, '
                                 f'recomputed {want}')
         _stored_rejections = summary.get('family_holm_rejections')
         if not isinstance(_stored_rejections, (list, tuple)):
             problems.append('summary.family_holm_rejections is not an array')
-        elif list(_stored_rejections) != want_reject:
+        elif not _vt_equal(list(_stored_rejections), want_reject):
             problems.append('summary.family_holm_rejections='
                             f'{_vt_repr(_stored_rejections)}, '
                             f'recomputed {_vt_repr(want_reject)}')

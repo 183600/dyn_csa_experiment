@@ -1287,11 +1287,14 @@ def validate_budget_ablation(artifact, *, replay=True):
         out['problems'].append(
             f'artifact keys differ from the schema: missing={missing}, '
             'extra=[' + ', '.join(_ba_key_text(k) for k in extra) + ']')
-    if artifact.get('kind') != BUDGET_ABLATION_KIND:
+    if (not isinstance(artifact.get('kind'), str)
+            or artifact.get('kind') != BUDGET_ABLATION_KIND):
         out['problems'].append(
             f'artifact.kind must be {BUDGET_ABLATION_KIND!r}, got '
             f'{_ba_repr(artifact.get("kind"))}')
-    if artifact.get('schema') != BUDGET_ABLATION_SCHEMA:
+    if (not isinstance(artifact.get('schema'), (int, np.integer))
+            or isinstance(artifact.get('schema'), (bool, np.bool_))
+            or int(artifact.get('schema')) != BUDGET_ABLATION_SCHEMA):
         out['problems'].append(
             f'artifact.schema must be {BUDGET_ABLATION_SCHEMA}, got '
             f'{_ba_repr(artifact.get("schema"))}')

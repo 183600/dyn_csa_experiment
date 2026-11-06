@@ -1371,13 +1371,16 @@ def validate_sequential_design(artifact, *, replay=True):
             'artifact carries frozen-decision field(s): '
             + ', '.join(forbidden[:8]))
         return out
-    if artifact.get('kind') != SEQUENTIAL_DESIGN_KIND:
+    if (not isinstance(artifact.get('kind'), str)
+            or artifact.get('kind') != SEQUENTIAL_DESIGN_KIND):
         out['problems'].append(
             f'kind must be {SEQUENTIAL_DESIGN_KIND!r}, got '
             f'{_seq_repr(artifact.get("kind"))}')
         return out
     schema = artifact.get('schema')
-    if isinstance(schema, (bool, np.bool_)) or schema != SEQUENTIAL_DESIGN_SCHEMA:
+    if (isinstance(schema, (bool, np.bool_))
+            or not isinstance(schema, (int, np.integer))
+            or int(schema) != SEQUENTIAL_DESIGN_SCHEMA):
         out['problems'].append(
             f'schema must be {SEQUENTIAL_DESIGN_SCHEMA}, got '
             f'{_seq_repr(schema)}')

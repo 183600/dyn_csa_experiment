@@ -941,15 +941,16 @@ def validate_ablation_ranking(artifact):
     if not isinstance(artifact, dict):
         out['problems'].append('artifact must be a JSON object')
         return out
-    if artifact.get('kind') != AR_KIND:
+    if not _al_equiv(artifact.get('kind'), AR_KIND, tol=0.0):  # noqa: F821
         out['problems'].append(
             f'artifact.kind must be {AR_KIND!r}, got '
             f'{_arb_repr(artifact.get("kind"))}')
-    if artifact.get('schema') != AR_SCHEMA:
+    if not _al_equiv(artifact.get('schema'), AR_SCHEMA, tol=0.0):  # noqa: F821
         out['problems'].append(
             f'artifact.schema must be {AR_SCHEMA}, got '
             f'{_arb_repr(artifact.get("schema"))}')
-    if artifact.get('policy') != AR_POLICY:
+    if not _al_equiv(artifact.get('policy'), AR_POLICY,
+                     tol=0.0):  # noqa: F821
         out['problems'].append(
             'artifact.policy does not match this implementation')
     stolen = sorted(set(_arb_forbidden_payload(artifact)))

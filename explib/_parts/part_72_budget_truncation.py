@@ -1374,14 +1374,18 @@ def validate_budget_truncation(artifact, *, manifest=None):
             f'artifact must be an object, got {type(artifact).__name__}')
         out['status'] = 'fail'
         return out
-    if artifact.get('kind') != BUDGET_TRUNCATION_KIND:
+    if not _bt_json_equal(artifact.get('kind'),
+                           BUDGET_TRUNCATION_KIND):
         out['problems'].append(
             f'artifact.kind must be {BUDGET_TRUNCATION_KIND!r}')
-    if artifact.get('schema') != BUDGET_TRUNCATION_SCHEMA:
+    if not _bt_json_equal(artifact.get('schema'),
+                           BUDGET_TRUNCATION_SCHEMA):
         out['problems'].append(
             f'artifact.schema must be {BUDGET_TRUNCATION_SCHEMA}')
-    if artifact.get('status') not in ('ok', 'warnings', 'not_verifiable',
-                                      'fail'):
+    _bt_status = artifact.get('status')
+    if (not isinstance(_bt_status, str)
+            or _bt_status not in ('ok', 'warnings', 'not_verifiable',
+                                  'fail')):
         out['problems'].append(
             f'artifact.status={_bt_repr(artifact.get("status"))} is not '
             'recognised')
@@ -1391,7 +1395,8 @@ def validate_budget_truncation(artifact, *, manifest=None):
             out['problems'].append(
                 f'artifact.{field} must be a list, got '
                 f'{type(value).__name__}')
-    if artifact.get('policy') != BUDGET_TRUNCATION_POLICY:
+    if not _bt_json_equal(artifact.get('policy'),
+                           BUDGET_TRUNCATION_POLICY):
         out['problems'].append(
             'artifact.policy does not match this implementation; the '
             'artifact was produced by a different feasibility policy')
@@ -1472,8 +1477,8 @@ def validate_budget_truncation(artifact, *, manifest=None):
     if kept_warnings != _bt_message_list(replayed.get('warnings')):
         out['problems'].append(
             'artifact.warnings does not reproduce from the inputs')
-    if artifact.get('status') == 'ok' and (
-            kept_problems or kept_warnings):
+    if (isinstance(_bt_status, str) and _bt_status == 'ok'
+            and (kept_problems or kept_warnings)):
         out['problems'].append(
             'artifact is marked ok but carries problems/warnings')
     out['warnings'].extend(kept_warnings)
@@ -1536,7 +1541,8 @@ def budget_truncation_summary(artifact):
     return {
         'kind': 'budget_truncation_summary',
         'status': artifact.get('status'),
-        'ok': artifact.get('status') == 'ok',
+        'ok': (isinstance(artifact.get('status'), str)
+               and artifact.get('status') == 'ok'),
         'content_sha256': artifact.get('content_sha256'),
         'manifest_canonical_sha256': study.get(
             'manifest_canonical_sha256'),

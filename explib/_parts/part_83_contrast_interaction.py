@@ -356,15 +356,18 @@ def _ci_shape_problems(inputs, result):
     if not isinstance(result, dict):
         return ['result must be an object']
     status = result.get('status')
-    if status not in ('ok', 'warnings', 'not_estimable'):
+    if (not isinstance(status, str)
+            or status not in ('ok', 'warnings', 'not_estimable')):
         problems.append('result.status must be ok/warnings/not_estimable, got '
                         f'{_ci_repr(status)}')
         return problems
-    if result.get('kind') != CONTRAST_INTERACTION_ARTIFACT_KIND:
+    if not _ci_json_equal(result.get('kind'),
+                          CONTRAST_INTERACTION_ARTIFACT_KIND):
         problems.append(
             f'result.kind must be {CONTRAST_INTERACTION_ARTIFACT_KIND!r}, got '
             f'{_ci_repr(result.get("kind"))}')
-    if result.get('primary_scale') != (
+    if not _ci_json_equal(
+            result.get('primary_scale'),
             CONTRAST_INTERACTION_POLICY['primary_scale']):
         problems.append('result.primary_scale does not match the declared policy')
     if status == 'not_estimable':
@@ -1239,11 +1242,13 @@ def validate_contrast_interaction(artifact, *, replay=True):
         out['problems'].append(
             f'artifact keys differ from the schema: missing={missing}, '
             'extra=[' + ', '.join(_ci_key_text(k) for k in extra) + ']')
-    if artifact.get('kind') != CONTRAST_INTERACTION_ARTIFACT_KIND:
+    if not _ci_json_equal(artifact.get('kind'),
+                          CONTRAST_INTERACTION_ARTIFACT_KIND):
         out['problems'].append(
             f'artifact.kind must be {CONTRAST_INTERACTION_ARTIFACT_KIND!r}, '
             f'got {_ci_repr(artifact.get("kind"))}')
-    if artifact.get('schema') != CONTRAST_INTERACTION_ARTIFACT_SCHEMA:
+    if not _ci_json_equal(artifact.get('schema'),
+                          CONTRAST_INTERACTION_ARTIFACT_SCHEMA):
         out['problems'].append(
             f'artifact.schema must be {CONTRAST_INTERACTION_ARTIFACT_SCHEMA}, '
             f'got {_ci_repr(artifact.get("schema"))}')

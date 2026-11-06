@@ -1254,7 +1254,8 @@ def _cv_shape_problems(inputs, result):
     problems = []
     if not isinstance(result, dict):
         return ['result must be an object']
-    if result.get('kind') != 'curve_simultaneous_inference':
+    if (not isinstance(result.get('kind'), str)
+            or result.get('kind') != 'curve_simultaneous_inference'):
         problems.append(
             "result.kind must be 'curve_simultaneous_inference', got "
             f'{_cv_repr(result.get("kind"))}')
@@ -1267,7 +1268,8 @@ def _cv_shape_problems(inputs, result):
             f'result.schema must be {CURVE_INFERENCE_SCHEMA}, got '
             f'{_cv_repr(result.get("schema"))}')
     status = result.get('status')
-    if status not in ('ok', 'warnings', 'not_estimable'):
+    if (not isinstance(status, str)
+            or status not in ('ok', 'warnings', 'not_estimable')):
         problems.append('result.status must be ok/warnings/not_estimable, '
                         f'got {_cv_repr(status)}')
         return problems
@@ -1470,7 +1472,8 @@ def validate_curve_inference(artifact, *, replay=True):
         out['problems'].append(
             f'artifact keys differ from the schema: missing={missing}, '
             'extra=[' + ', '.join(_cv_key_text(k) for k in extra) + ']')
-    if artifact.get('kind') != CURVE_INFERENCE_KIND:
+    if (not isinstance(artifact.get('kind'), str)
+            or artifact.get('kind') != CURVE_INFERENCE_KIND):
         out['problems'].append(
             f'artifact.kind must be {CURVE_INFERENCE_KIND!r}, got '
             f'{_cv_repr(artifact.get("kind"))}')
@@ -1577,7 +1580,8 @@ def validate_curve_inference_block(block, *, replay=True):
     if not isinstance(block, dict):
         out['problems'].append('block must be a JSON object')
         return out
-    if block.get('kind') != CURVE_INFERENCE_BLOCK_KIND:
+    if (not isinstance(block.get('kind'), str)
+            or block.get('kind') != CURVE_INFERENCE_BLOCK_KIND):
         out['problems'].append(
             f'block.kind must be {CURVE_INFERENCE_BLOCK_KIND!r}, got '
             f'{_cv_repr(block.get("kind"))}')

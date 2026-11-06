@@ -1020,18 +1020,23 @@ def validate_ablation_lattice(artifact):
         out['problems'].append(
             f'artifact must be an object, got {type(artifact).__name__}')
         return out
-    if artifact.get('kind') != AL_LATTICE_KIND:
+    if not _al_equiv(artifact.get('kind'), AL_LATTICE_KIND,
+                     tol=0.0):
         out['problems'].append(
             f"artifact.kind must be {AL_LATTICE_KIND!r}")
-    if artifact.get('schema') != AL_LATTICE_SCHEMA:
+    if not _al_equiv(artifact.get('schema'), AL_LATTICE_SCHEMA,
+                     tol=0.0):
         out['problems'].append(
             f'artifact.schema must be {AL_LATTICE_SCHEMA}')
-    if artifact.get('status') not in ('ok', 'warnings', 'not_estimable',
-                                      'fail'):
+    _al_status = artifact.get('status')
+    if (not isinstance(_al_status, str)
+            or _al_status not in ('ok', 'warnings', 'not_estimable',
+                                  'fail')):
         out['problems'].append(
             'artifact.status='
             f'{_al_repr(artifact.get("status"))} is not recognised')
-    if artifact.get('policy') != AL_LATTICE_POLICY:
+    if not _al_equiv(artifact.get('policy'), AL_LATTICE_POLICY,
+                     tol=0.0):
         out['problems'].append(
             'artifact.policy does not match this implementation')
     for field in ('problems', 'warnings'):
@@ -1066,7 +1071,8 @@ def validate_ablation_lattice(artifact):
         else:
             components = _al_components(raw_components)
         scale = inputs.get('scale')
-        if scale not in ('ppl', 'log_ppl'):
+        if (not isinstance(scale, str)
+                or scale not in ('ppl', 'log_ppl')):
             raise ValueError("inputs.scale must be 'ppl' or 'log_ppl'")
         cells = _al_cells_from_records(inputs.get('cells'), components,
                                        scale=scale)
@@ -1090,7 +1096,8 @@ def validate_ablation_lattice(artifact):
         if not _al_equiv(artifact.get(key), replay.get(key)):
             out['problems'].append(
                 f'artifact.{key} does not replay from its recorded cells')
-    if artifact.get('status') != replay.get('status'):
+    if not _al_equiv(artifact.get('status'), replay.get('status'),
+                     tol=0.0):
         out['problems'].append(
             'artifact.status='
             f'{_al_repr(artifact.get("status"))} does not match '

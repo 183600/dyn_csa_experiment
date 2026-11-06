@@ -1407,14 +1407,19 @@ def validate_design_estimability(artifact):
             f'artifact must be an object, got {type(artifact).__name__}')
         out['status'] = 'fail'
         return out
-    if artifact.get('kind') != DESIGN_ESTIMABILITY_KIND:
+    if (not isinstance(artifact.get('kind'), str)
+            or artifact.get('kind') != DESIGN_ESTIMABILITY_KIND):
         out['problems'].append(
             f'artifact.kind must be {DESIGN_ESTIMABILITY_KIND!r}')
-    if artifact.get('schema') != DESIGN_ESTIMABILITY_SCHEMA:
+    if (not isinstance(artifact.get('schema'), (int, np.integer))
+            or isinstance(artifact.get('schema'), (bool, np.bool_))
+            or int(artifact.get('schema')) != DESIGN_ESTIMABILITY_SCHEMA):
         out['problems'].append(
             f'artifact.schema must be {DESIGN_ESTIMABILITY_SCHEMA}')
-    if artifact.get('status') not in ('ok', 'warnings', 'not_estimable',
-                                      'fail'):
+    _de_artifact_status = artifact.get('status')
+    if (not isinstance(_de_artifact_status, str)
+            or _de_artifact_status not in ('ok', 'warnings',
+                                          'not_estimable', 'fail')):
         out['problems'].append(
             f'artifact.status={_de_repr(artifact.get("status"))} is not '
             'recognised')
@@ -1448,7 +1453,7 @@ def validate_design_estimability(artifact):
             'artifact body is not canonical JSON: '
             f'{type(exc).__name__}: {exc}')
         return out
-    if got != want:
+    if not isinstance(got, str) or got != want:
         out['status'] = 'fail'
         out['problems'].append(
             'artifact.content_sha256 does not match the artifact body')

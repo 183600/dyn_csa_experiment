@@ -1402,16 +1402,19 @@ def _usr_result_problems(result, inputs=None):
         problems.append(
             f'result keys differ from the schema: '
             f'extra={[_esci_key_text(k) for k in extra]}')  # noqa: F821
-    if result.get('kind') != UNIT_SPLIT_REPLICATION_RESULT_KIND:
+    if not _usr_json_equal(result.get('kind'),
+                           UNIT_SPLIT_REPLICATION_RESULT_KIND):
         problems.append(
             f"result.kind must be {UNIT_SPLIT_REPLICATION_RESULT_KIND!r}, got "
             f'{_usr_repr(result.get("kind"))}')
-    if result.get('version') != UNIT_SPLIT_REPLICATION_POLICY['version']:
+    if not _usr_json_equal(result.get('version'),
+                           UNIT_SPLIT_REPLICATION_POLICY['version']):
         problems.append(
             f"result.version must be {UNIT_SPLIT_REPLICATION_POLICY['version']!r}, "
             f'got {_usr_repr(result.get("version"))}')
     status = result.get('status')
-    if status not in UNIT_SPLIT_REPLICATION_STATUSES:
+    if (not isinstance(status, str)
+            or status not in UNIT_SPLIT_REPLICATION_STATUSES):
         problems.append(
             f'result.status must be one of {UNIT_SPLIT_REPLICATION_STATUSES}, '
             f'got {_usr_repr(status)}')
@@ -1431,10 +1434,13 @@ def _usr_result_problems(result, inputs=None):
         return _usr_math.isfinite(a) and _usr_math.isfinite(b) and a == b
 
     declared = inputs if isinstance(inputs, dict) else {}
-    if result.get('direction') not in UNIT_SPLIT_REPLICATION_DIRECTIONS:
+    _usr_direction_value = result.get('direction')
+    if (not isinstance(_usr_direction_value, str)
+            or _usr_direction_value not in UNIT_SPLIT_REPLICATION_DIRECTIONS):
         problems.append('result.direction must be positive or negative')
     elif ('direction' in declared
-          and result.get('direction') != declared.get('direction')):
+          and not _usr_json_equal(_usr_direction_value,
+                                  declared.get('direction'))):
         problems.append('result.direction does not match inputs.direction')
     alpha = _usr_number(result.get('alpha'), 'result.alpha')
     if alpha is None or not (0.0 < alpha < 1.0):
@@ -1570,7 +1576,8 @@ def _usr_result_problems(result, inputs=None):
                         'result.seeds is not the ordered list of complete rows '
                         'in inputs.log_ratios')
 
-    if result.get('unit_id_source') not in ('supplied', 'position'):
+    if (not isinstance(result.get('unit_id_source'), str)
+            or result.get('unit_id_source') not in ('supplied', 'position')):
         problems.append("result.unit_id_source must be 'supplied' or 'position'")
     token_total = result.get('token_total')
     if token_total is not None:
@@ -1584,7 +1591,9 @@ def _usr_result_problems(result, inputs=None):
     if not isinstance(assignment, dict):
         problems.append('result.assignment must be an object')
     else:
-        if assignment.get('salt') != declared.get('salt', assignment.get('salt')):
+        if not _usr_json_equal(assignment.get('salt'),
+                               declared.get('salt',
+                                            assignment.get('salt'))):
             if 'salt' in declared:
                 problems.append('result.assignment.salt does not match inputs.salt')
         digest = assignment.get('digest')
@@ -1609,7 +1618,7 @@ def _usr_result_problems(result, inputs=None):
                     problems.append(f'result.assignment.halves[{i}] must be an object')
                     assign_halves = None
                     break
-                if half.get('name') != f'half_{i}':
+                if not _usr_json_equal(half.get('name'), f'half_{i}'):
                     problems.append(
                         f"result.assignment.halves[{i}].name must be 'half_{i}'")
                 indices = half.get('indices')
@@ -1679,7 +1688,8 @@ def _usr_result_problems(result, inputs=None):
                             f'result.assignment.halves[{i}].indices are out of '
                             'range for inputs.unit_ids')
                         continue
-                    if [declared_ids[j] for j in idx] != ids:
+                    if not _usr_json_equal(
+                            [declared_ids[j] for j in idx], ids):
                         problems.append(
                             f'result.assignment.halves[{i}].unit_ids do not '
                             'match inputs.unit_ids at its indices')
@@ -1693,7 +1703,7 @@ def _usr_result_problems(result, inputs=None):
         if not isinstance(half, dict):
             problems.append(f'halves[{i}] must be an object')
             return problems
-        if half.get('name') != f'half_{i}':
+        if not _usr_json_equal(half.get('name'), f'half_{i}'):
             problems.append(f"halves[{i}].name must be 'half_{i}'")
         stats_obj = half.get('stats')
         if not isinstance(stats_obj, dict):
@@ -1730,12 +1740,16 @@ def _usr_result_problems(result, inputs=None):
             problems.append(f'halves[{i}].stats.n does not match result.n_seeds')
         if (assign_halves is not None
                 and isinstance(assign_halves[i], dict)
-                and half.get('n_units') != assign_halves[i].get('n_units')):
+                and not _usr_json_equal(
+                    half.get('n_units'),
+                    assign_halves[i].get('n_units'))):
             problems.append(
                 f'halves[{i}].n_units does not match result.assignment')
         if (assign_halves is not None
                 and isinstance(assign_halves[i], dict)
-                and half.get('token_share') != assign_halves[i].get('token_share')):
+                and not _usr_json_equal(
+                    half.get('token_share'),
+                    assign_halves[i].get('token_share'))):
             problems.append(
                 f'halves[{i}].token_share does not match result.assignment')
     iut = result.get('iut')
@@ -1765,15 +1779,18 @@ def _usr_result_problems(result, inputs=None):
     elif alpha is not None and abs(iut_alpha - alpha) > 1e-12:
         problems.append('iut.alpha does not match result.alpha')
     iut_direction = iut.get('direction')
-    if iut_direction not in UNIT_SPLIT_REPLICATION_DIRECTIONS:
+    if (not isinstance(iut_direction, str)
+            or iut_direction not in UNIT_SPLIT_REPLICATION_DIRECTIONS):
         problems.append('iut.direction must be positive or negative')
-    elif iut_direction != result.get('direction'):
+    elif not _usr_json_equal(iut_direction, result.get('direction')):
         problems.append('iut.direction does not match result.direction')
-    if iut.get('claim') not in (
+    _usr_claim = iut.get('claim')
+    if (not isinstance(_usr_claim, str)
+            or _usr_claim not in (
             'both_halves_support_direction',
             'direction_consistent_but_not_jointly_significant',
             'one_half_significant', 'halves_discordant',
-            'direction_not_supported'):
+            'direction_not_supported')):
         problems.append(
             f"iut.claim is not one of the documented claims, got "
             f'{_usr_repr(iut.get("claim"))}')
@@ -1782,7 +1799,9 @@ def _usr_result_problems(result, inputs=None):
     elif (p is not None and alpha is not None
           and bool(iut.get('reject')) != bool(p <= alpha)):
         problems.append('iut.reject does not agree with p_iut <= alpha')
-    if (result.get('sign_agreement') not in
+    _usr_sign_agreement = result.get('sign_agreement')
+    if (not isinstance(_usr_sign_agreement, str)
+            or _usr_sign_agreement not in
             ('both_negative', 'both_positive', 'discordant',
              'zero_in_one_half', 'unavailable')):
         problems.append('result.sign_agreement is not a documented value')
@@ -1826,11 +1845,13 @@ def _usr_result_problems(result, inputs=None):
     sens = result.get('split_sensitivity')
     declared_n_salts = declared.get('n_salts')
     if sens is None:
-        if declared_n_salts:
+        if (_usr_is_int(declared_n_salts)
+                and int(declared_n_salts) > 0):
             problems.append('split_sensitivity is null but inputs.n_salts > 0')
     elif not isinstance(sens, dict):
         problems.append('result.split_sensitivity must be an object or null')
-    elif not declared_n_salts:
+    elif not (_usr_is_int(declared_n_salts)
+              and int(declared_n_salts) > 0):
         problems.append('split_sensitivity is present but inputs.n_salts is 0')
     else:
         parsed_sens = {}
@@ -1907,11 +1928,13 @@ def _usr_validate_common(artifact, *, block=False):
             f'extra={[_esci_key_text(k) for k in extra]}')  # noqa: F821
     want_kind = (UNIT_SPLIT_REPLICATION_BLOCK_KIND if block
                  else UNIT_SPLIT_REPLICATION_KIND)
-    if artifact.get('kind') != want_kind:
+    if not _usr_json_equal(artifact.get('kind'), want_kind):
         out['problems'].append(
             f'artifact.kind must be {want_kind!r}, got '
             f'{_usr_repr(artifact.get("kind"))}')
-    if not block and artifact.get('schema') != UNIT_SPLIT_REPLICATION_SCHEMA:
+    if (not block
+            and not _usr_json_equal(artifact.get('schema'),
+                                    UNIT_SPLIT_REPLICATION_SCHEMA)):
         out['problems'].append(
             f'artifact.schema must be {UNIT_SPLIT_REPLICATION_SCHEMA}, got '
             f'{_usr_repr(artifact.get("schema"))}')
@@ -1966,8 +1989,10 @@ def _usr_validate_common(artifact, *, block=False):
         # indexing a scalar here would replace the structured fail-closed
         # verdict with an IndexError.  Re-derivation is only possible from a
         # mapping that passed its own shape checks.
+        _usr_result_status = result.get('status')
         if (isinstance(inputs, dict) and not input_problems
-                and result.get('status') in ('ok', 'warnings')):
+                and isinstance(_usr_result_status, str)
+                and _usr_result_status in ('ok', 'warnings')):
             try:
                 expected_assignment = unit_split_assignment(
                     inputs['unit_ids'], inputs['tokens'],
