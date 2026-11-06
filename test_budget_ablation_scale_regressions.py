@@ -67,6 +67,43 @@ def test_huge_budget_ladder_is_representable_and_replays():
     json.dumps(verdict, allow_nan=False)
 
 
+def test_finite_ppls_near_float_max_keep_a_representable_mean():
+    """The per-budget mean PPL must not be lost to an overflowing sum.
+
+    Four finite PPLs near 1e308 have an ordinary mean near 1e308, but their
+    naive total overflows float64.  The summary used to turn both arms into
+    ``null`` even though the reported geometric mean was present; a scale-up
+    panel must keep the arithmetic readout too.
+    """
+    scale = 1e308 / 30.0
+    budgets = [1500, 3000, 8000]
+    design = _design(budgets=budgets)
+    rows = []
+    expected = {}
+    for index, budget in enumerate(budgets):
+        base = 30.0 * math.exp(-0.1 * index)
+        with_ppl = base * scale * math.exp(0.01)
+        without_ppl = base * scale * math.exp(-0.01)
+        expected[budget] = (with_ppl, without_ppl)
+        for seed in design['seeds']:
+            rows.append({'arm': 'with', 'seed': seed, 'budget': budget,
+                         'ppl': with_ppl})
+            rows.append({'arm': 'without', 'seed': seed, 'budget': budget,
+                         'ppl': without_ppl})
+    assert sum(row['ppl'] for row in rows[:4]) == float('inf')
+    artifact = L.build_budget_ablation(design, rows)
+    component = artifact['result']['components']['component']
+    assert component['status'] == 'ok', component
+    for row in component['per_budget']:
+        with_ppl, without_ppl = expected[row['budget']]
+        assert row['with_mean_ppl'] == pytest.approx(with_ppl)
+        assert row['without_mean_ppl'] == pytest.approx(without_ppl)
+        assert math.isfinite(row['with_mean_ppl'])
+        assert math.isfinite(row['without_mean_ppl'])
+    assert L.validate_budget_ablation(artifact)['status'] in ('ok', 'warnings')
+    json.dumps(artifact, allow_nan=False)
+
+
 def test_tampered_scalars_and_keys_fail_closed_and_stay_strict_json():
     artifact = L.build_budget_ablation(
         _design(), _cells([1500, 3000, 8000], list(range(4)),

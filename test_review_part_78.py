@@ -231,6 +231,33 @@ def test_malformed_lattice_inputs_fail_closed():
     assert any('max_components' in p for p in too_many['problems'])
 
 
+def test_numpy_boolean_scalars_are_flags_not_ppls_or_counts():
+    """``np.bool_`` is not a Python bool subclass but is still a flag.
+
+    Accepting it as a measurement turns a boolean cell into PPL=1.0, and as
+    ``min_n``/``max_components`` into an integer gate of 1.  The scalar
+    boundary must fail closed just like the other numeric readers.
+    """
+    cells = _ppl_cells({
+        frozenset(): 0.0, frozenset({'a'}): -1.0,
+        frozenset({'b'}): -1.0, frozenset({'a', 'b'}): -2.0,
+    })
+    for flag in (np.bool_(True), np.bool_(False)):
+        bad = copy.deepcopy(cells)
+        bad[frozenset({'a'})][0] = flag
+        with _pytest.raises(ValueError):
+            L.shapley_lattice_attribution(
+                bad, components=['a', 'b'], min_n=3)
+        with _pytest.raises(ValueError):
+            L.shapley_lattice_attribution(
+                cells, components=['a', 'b'], min_n=flag)
+        with _pytest.raises(ValueError):
+            L.shapley_lattice_attribution(
+                cells, components=['a', 'b'], max_components=flag)
+    assert L.shapley_lattice_attribution(
+        cells, components=['a', 'b'], min_n=3)['status'] == 'ok'
+
+
 def test_one_component_degenerate_lattice():
     cells = _ppl_cells({frozenset(): 0.0, frozenset({'a'}): -1.0})
     out = L.shapley_lattice_attribution(cells, components=['a'])

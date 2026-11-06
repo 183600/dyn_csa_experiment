@@ -99,9 +99,27 @@ def _al_repr(value, *, limit=120):
     return text if len(text) <= limit else text[:limit - 3] + '...'
 
 
+def _al_bool_scalar(value):
+    """Whether ``value`` is a boolean flag, including a NumPy boolean.
+
+    ``np.bool_`` is not a subclass of Python ``bool`` but is still a flag, not
+    a PPL, seed count or coefficient.  The repository's scalar contract
+    rejects it at every numeric boundary; checking the 0-d ``item()`` keeps
+    that rule without importing NumPy here.
+    """
+    if isinstance(value, bool):
+        return True
+    if not hasattr(value, 'item'):
+        return False
+    try:
+        return isinstance(value.item(), bool)
+    except Exception:
+        return False
+
+
 def _al_finite(value, *, where, positive=False):
     """Finite number for an analysis input; no strings/bools/NaN/Inf."""
-    if isinstance(value, (bool,)):
+    if _al_bool_scalar(value):
         raise ValueError(
             f'{where}: expected a finite number, got {_al_repr(value)}')
     try:
@@ -128,7 +146,7 @@ def _al_finite(value, *, where, positive=False):
 
 
 def _al_int(value, *, where, minimum=None):
-    if isinstance(value, bool):
+    if _al_bool_scalar(value):
         raise ValueError(
             f'{where}: expected an integer, got {_al_repr(value)}')
     try:
@@ -285,7 +303,7 @@ def _al_all_subsets(components):
 
 def _al_num(value):
     """Finite JSON number or None; strict-JSON writers must not see NaN."""
-    if isinstance(value, (bool,)):
+    if _al_bool_scalar(value):
         return None
     try:
         out = float(value)

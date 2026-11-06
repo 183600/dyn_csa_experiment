@@ -469,6 +469,24 @@ def _ba_slope(values, budgets):
     return out if math.isfinite(out) else None
 
 
+def _ba_mean_or_raw(values):
+    """Per-budget mean PPL without an overflowing intermediate sum.
+
+    ``sum(values) / len(values)`` overflows to ``inf`` when a scale-up panel
+    holds several finite PPLs near the float64 limit, even though their mean
+    is representable.  Keep the historical expression for ordinary panels
+    (bit-identical output) and use the repository's scaled mean only on the
+    overflow path; ``_ba_num`` then withholds a genuinely unrepresentable
+    mean instead of leaking a non-strict-JSON ``inf``.
+    """
+    if not values:
+        return None
+    raw = sum(values) / len(values)
+    if math.isfinite(raw):
+        return raw
+    return _scaled_mean_or_raw(values)  # noqa: F821 (part_32)
+
+
 def _ba_stats(values, seeds, *, alpha, min_n):
     """Paired exact-sign-flip summary plus explicit per-seed values."""
     stats = paired_effect_stats(values, alpha=alpha, min_n=min_n, seeds=seeds)
@@ -705,8 +723,8 @@ def budget_ablation_analysis(design, cells, *, alpha=0.05, min_n=3,
                 'budget': int(budget),
                 'log_effect': log_stats,
                 'raw_effect': raw_stats,
-                'with_mean_ppl': float(sum(with_values) / len(with_values)),
-                'without_mean_ppl': float(sum(without_values) / len(without_values)),
+                'with_mean_ppl': _ba_num(_ba_mean_or_raw(with_values)),
+                'without_mean_ppl': _ba_num(_ba_mean_or_raw(without_values)),
                 'with_geometric_mean_ppl': math.exp(
                     sum(math.log(x) for x in with_values) / len(with_values)),
                 'without_geometric_mean_ppl': math.exp(
