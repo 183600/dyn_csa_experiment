@@ -47,6 +47,11 @@ CONTRAST_INTERACTION_POLICY = {
 
 CONTRAST_INTERACTION_ARTIFACT_KIND = 'contrast_interaction'
 CONTRAST_INTERACTION_ARTIFACT_SCHEMA = 1
+# CPython 3.12 refuses to decimalise an integer above ~4300 digits.  Exact seed
+# labels and min_n are copied into the strict-JSON result, so keep them inside
+# a bound that can still be serialised (the same 10**4000 convention used by
+# the scale-ladder audit).
+CONTRAST_INTERACTION_MAX_REPORTABLE_INT = 10 ** 4000
 CONTRAST_INTERACTION_ARTIFACT_KEYS = (
     'kind', 'schema', 'created_at', 'source', 'inputs', 'result',
     'content_sha256',
@@ -77,6 +82,41 @@ def _ci_repr(value, limit=160):
     return text if len(text) <= limit else text[:limit - 3] + '...'
 
 
+def _ci_key_text(value, limit=120):
+    """Bounded text for an untrusted mapping key/path component.
+
+    ``str(10**10000)`` raises in CPython 3.12, and a mixed int/str key set
+    cannot be ``sorted()``; both occur in tamper tests.  Ordinary keys keep
+    their historical ``str(key)`` spelling (including NumPy scalars/Decimal),
+    so diagnostics do not silently change for valid inputs.
+    """
+    if isinstance(value, str):
+        return value if len(value) <= limit else value[:limit - 3] + '...'
+    try:
+        text = str(value)
+    except Exception:
+        return _ci_repr(value, limit=limit)
+    return text if len(text) <= limit else text[:limit - 3] + '...'
+
+
+def _ci_key_json(value):
+    """JSON object key without an int->decimal conversion limit.
+
+    Ordinary keys keep their historical ``str(key)`` spelling.  A huge integer
+    key falls back to exact hexadecimal (which CPython can always format), so
+    hashing a tampered artifact reports a mismatch instead of raising the
+    interpreter's digit-limit error.
+    """
+    if isinstance(value, str):
+        return value
+    try:
+        return str(value)
+    except Exception:
+        if isinstance(value, int) and not isinstance(value, bool):
+            return hex(value)
+        return _ci_key_text(value)
+
+
 def _ci_text(value, name):
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f'{name} must be a non-empty string, got '
@@ -87,18 +127,27 @@ def _ci_text(value, name):
 def _ci_int(value, name, *, minimum=None, maximum=None):
     if isinstance(value, (bool, np.bool_)):
         raise ValueError(f'{name} must be an integer, not a boolean')
-    try:
-        out = int(value)
-    except (TypeError, ValueError, OverflowError):
-        raise ValueError(f'{name} must be an integer, got '
-                         f'{_ci_repr(value)}') from None
-    if isinstance(value, float) and (not math.isfinite(value) or value != out):
-        raise ValueError(f'{name} must be an exact integer, got '
-                         f'{_ci_repr(value)}')
+    # Numeric strings are the legacy spelling used by the endpoint parser
+    # (``by_len.ppl@4096``), so keep accepting an exact integer string.  Every
+    # other value goes through the repository-wide exact-integer reader:
+    # plain ``int()`` silently truncates a fractional Fraction/Decimal or a
+    # NumPy scalar (``min_n=2.5`` became 2), which would accept a malformed
+    # analysis contract instead of failing closed.
+    if isinstance(value, (str, bytes, bytearray)):
+        try:
+            out = int(value)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(f'{name} must be an integer, got '
+                             f'{_ci_repr(value)}') from None
+    else:
+        out = _as_seed_int(value)  # noqa: F821 (part_13)
+        if out is None:
+            raise ValueError(f'{name} must be an exact integer, got '
+                             f'{_ci_repr(value)}')
     if minimum is not None and out < minimum:
-        raise ValueError(f'{name} must be >= {minimum}, got {out}')
+        raise ValueError(f'{name} must be >= {minimum}, got {_ci_repr(out)}')
     if maximum is not None and out > maximum:
-        raise ValueError(f'{name} must be <= {maximum}, got {out}')
+        raise ValueError(f'{name} must be <= {maximum}, got {_ci_repr(out)}')
     return out
 
 
@@ -115,6 +164,54 @@ def _ci_number(value, name):
     return float(number)
 
 
+def _ci_float_or_none(value):
+    """Best-effort finite float for an error/not-estimable record."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _ci_int_or_none(value):
+    """Best-effort integer for an error/not-estimable record."""
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _ci_endpoint_text(value, limit=240):
+    """JSON-safe, bounded endpoint label for a not-estimable diagnostic."""
+    if isinstance(value, str):
+        return value if len(value) <= limit else value[:limit - 3] + '...'
+    try:
+        text = str(value)
+    except Exception:
+        return _ci_key_text(value, limit=limit)
+    return text if len(text) <= limit else text[:limit - 3] + '...'
+
+
+def _ci_md_text(value, limit=500):
+    """Display text for a Markdown field (a huge int must not abort rendering)."""
+    if isinstance(value, str):
+        text = value
+    else:
+        text = _ci_repr(value, limit=limit)
+    return text if len(text) <= limit else text[:limit - 3] + '...'
+
+
+def _ci_md_num(value, fmt):
+    """Format a numeric Markdown field, withholding unrepresentable values."""
+    number = _ci_float_or_none(value)
+    if number is None:
+        return '—'
+    try:
+        return fmt.format(number)
+    except (TypeError, ValueError, OverflowError):
+        return '—'
+
+
 def _ci_ppl(value, name):
     number = _ci_number(value, name)
     if number <= 0.0:
@@ -124,9 +221,10 @@ def _ci_ppl(value, name):
 
 def _ci_seed(value, name):
     seed = _as_seed_int(value)
-    if seed is None or seed < 0:
-        raise ValueError(f'{name} must be an exact non-negative integer seed, '
-                         f'got {_ci_repr(value)}')
+    if (seed is None or seed < 0
+            or seed > CONTRAST_INTERACTION_MAX_REPORTABLE_INT):
+        raise ValueError(f'{name} must be an exact non-negative integer seed '
+                         f'within the reportable range, got {_ci_repr(value)}')
     return seed
 
 
@@ -169,13 +267,21 @@ def _ci_margin_pair(margin, margin_relative_pct):
 def _ci_jsonable(value):
     """Convert a nested mapping/list to strict-JSON safe Python objects."""
     if isinstance(value, dict):
-        return {str(k): _ci_jsonable(v) for k, v in value.items()}
+        return {_ci_key_json(k): _ci_jsonable(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
         return [_ci_jsonable(v) for v in value]
     if isinstance(value, np.ndarray):
         return _ci_jsonable(value.tolist())
     if isinstance(value, np.generic):
         return _ci_jsonable(value.item())
+    if isinstance(value, int) and not isinstance(value, bool):
+        try:
+            str(value)
+        except (ValueError, OverflowError):
+            # A tampered artifact can carry an integer beyond CPython's
+            # decimal-conversion limit.  Encode it exactly in hex so a
+            # validation/hash diagnostic can still be produced and written.
+            return {'__unprintable_int_hex__': hex(value)}
     return value
 
 
@@ -250,7 +356,8 @@ def _ci_normalise_design(design):
         if extra or missing:
             raise ValueError(
                 f'design.cells[{name!r}] must assign exactly {factors}; '
-                f'missing={sorted(missing)}, extra={sorted(extra)}')
+                f'missing={_ci_repr(sorted(missing, key=_ci_repr))}, '
+                f'extra={_ci_repr(sorted(extra, key=_ci_repr))}')
         combo = []
         for factor in factors:
             level = assignment[factor]
@@ -326,12 +433,13 @@ def _ci_normalise_cells(cells, design):
         return out
     expected = list(design['cells'])
     out['missing_cells'] = [name for name in expected if name not in cells]
-    out['extra_cells'] = sorted(set(cells) - set(expected))
+    out['extra_cells'] = sorted(set(cells) - set(expected), key=_ci_repr)
     if out['missing_cells']:
         out['reason'] = f'missing cell(s): {out["missing_cells"]}'
         return out
     if out['extra_cells']:
-        out['reason'] = f'undeclared cell(s): {out["extra_cells"]}'
+        out['reason'] = (f'undeclared cell(s): '
+                         f'{_ci_repr(out["extra_cells"])}')
         return out
     per_cell = {}
     for name in expected:
@@ -540,33 +648,51 @@ def _ci_scale_analysis(per_cell, seeds, design, *, alpha, min_n, scale,
         cell: {seed: transform(per_cell[cell][seed]) for seed in seeds}
         for cell in design['cells']
     }
-    marginals = {}
-    for ml in (ml0, ml1):
+
+    def _contrast(ml):
         left = design['cell_roles'][cl0][ml]
         right = design['cell_roles'][cl1][ml]
-        vals = [values[left][s] - values[right][s] for s in seeds]
+        return {s: values[left][s] - values[right][s] for s in seeds}
+
+    marginal_vals = {ml: _contrast(ml) for ml in (ml0, ml1)}
+    interaction_vals = {
+        s: marginal_vals[ml0][s] - marginal_vals[ml1][s] for s in seeds}
+    # Every input PPL is finite, but a raw-PPL difference of two finite
+    # values near the float limit can still overflow to inf, and the family
+    # is only paired when all three contrasts are defined on the same seed.
+    # Drop such a seed from THIS scale (recorded explicitly) instead of
+    # emitting an inf/NaN into a strict-JSON artifact or a bogus statistic.
+    all_contrasts = (marginal_vals[ml0], marginal_vals[ml1], interaction_vals)
+    kept_seeds, dropped_seeds = [], []
+    for seed in seeds:
+        if all(math.isfinite(float(c[seed])) for c in all_contrasts):
+            kept_seeds.append(seed)
+        else:
+            dropped_seeds.append(seed)
+    marginals = {}
+    for ml in (ml0, ml1):
+        vals = [marginal_vals[ml][s] for s in kept_seeds]
         name = f'{contrast}: {cl0} - {cl1} @ {moderator}={ml}'
         marginals[ml] = _ci_stat_block(
-            vals, seeds, alpha=alpha, min_n=min_n, scale=scale, name=name,
+            vals, kept_seeds, alpha=alpha, min_n=min_n, scale=scale, name=name,
             definition=f'({cl0} - {cl1}) at {moderator}={ml}')
-    inter_vals = [marginals[ml0]['per_seed'][i] - marginals[ml1]['per_seed'][i]
-                  for i in range(len(seeds))]
+    inter_vals = [interaction_vals[s] for s in kept_seeds]
     inter_name = (f'interaction: ({contrast}: {cl0} - {cl1}) @ '
-                  f'{moderator}={ml1} minus @ {moderator}={ml0}')
+                  f'{moderator}={ml0} minus @ {moderator}={ml1}')
     interaction = _ci_stat_block(
-        inter_vals, seeds, alpha=alpha, min_n=min_n, scale=scale,
+        inter_vals, kept_seeds, alpha=alpha, min_n=min_n, scale=scale,
         name=inter_name,
         definition=(f'({marginals[ml0]["name"]}) - '
                     f'({marginals[ml1]["name"]})'))
     records = {
         marginals[ml0]['name']: {
-            'deltas': marginals[ml0]['per_seed'], 'seeds': list(seeds),
+            'deltas': marginals[ml0]['per_seed'], 'seeds': list(kept_seeds),
             'eligible': True},
         marginals[ml1]['name']: {
-            'deltas': marginals[ml1]['per_seed'], 'seeds': list(seeds),
+            'deltas': marginals[ml1]['per_seed'], 'seeds': list(kept_seeds),
             'eligible': True},
         interaction['name']: {
-            'deltas': interaction['per_seed'], 'seeds': list(seeds),
+            'deltas': interaction['per_seed'], 'seeds': list(kept_seeds),
             'eligible': True},
     }
     family = _ci_family(records, alpha=alpha)
@@ -588,6 +714,9 @@ def _ci_scale_analysis(per_cell, seeds, design, *, alpha, min_n, scale,
         'interaction': interaction,
         'family': family,
         'tost': tost,
+        'seeds': list(kept_seeds),
+        'n_input_seeds': len(seeds),
+        'dropped_seeds': list(dropped_seeds),
     }
 
 
@@ -678,7 +807,8 @@ def difference_in_differences(design, cells, *, alpha=0.05, min_n=3,
     raise ``ValueError``.
     """
     a = _ci_alpha(alpha)
-    mn = _ci_int(min_n, 'min_n', minimum=2)
+    mn = _ci_int(min_n, 'min_n', minimum=2,
+                  maximum=CONTRAST_INTERACTION_MAX_REPORTABLE_INT)
     margin, rel = _ci_margin_pair(margin, margin_relative_pct)
     norm_design = _ci_normalise_design(design)
     norm_cells = _ci_normalise_cells(cells, norm_design)
@@ -688,7 +818,7 @@ def difference_in_differences(design, cells, *, alpha=0.05, min_n=3,
             'alpha': a, 'min_n': mn, 'margin': margin,
             'margin_relative_pct': rel,
             'missing_cells': norm_cells['missing_cells'],
-            'extra_cells': norm_cells['extra_cells'],
+            'extra_cells': _ci_jsonable(norm_cells['extra_cells']),
             'n_by_cell': norm_cells['n_by_cell'],
         })
     seeds = list(norm_cells['seeds'])
@@ -707,7 +837,14 @@ def difference_in_differences(design, cells, *, alpha=0.05, min_n=3,
     cell_means = {}
     for cell in norm_design['cells']:
         values = [norm_cells['per_cell'][cell][seed] for seed in seeds]
-        mean_ppl = math.fsum(values) / float(len(values))
+        try:
+            mean_ppl = math.fsum(values) / float(len(values))
+        except OverflowError:
+            # Every PPL is a finite positive float, but their sum can exceed
+            # the float range even when the mean is representable (e.g. three
+            # seeds at 1e308).  Use the guarded scaled mean instead of
+            # aborting the whole readout on a units-only overflow.
+            mean_ppl = _scaled_mean_or_raw(values)  # noqa: F821 (part_32)
         mean_log = math.fsum(math.log(v) for v in values) / float(len(values))
         cell_means[cell] = {
             'n': len(values),
@@ -735,6 +872,16 @@ def difference_in_differences(design, cells, *, alpha=0.05, min_n=3,
     scale_sensitive = bool(sign_agree is False or reject_agree is False)
     interpretation = _ci_interpret(primary, alpha=a, min_n=mn)
     warnings = []
+    _dropped_by_scale = {
+        name: block.get('dropped_seeds')
+        for name, block in analyses.items() if block.get('dropped_seeds')}
+    if _dropped_by_scale:
+        warnings.append(
+            'some paired seeds are not representable on a reported scale '
+            '(e.g. a raw-PPL difference beyond the float range) and were '
+            'dropped only from that scale: '
+            + ', '.join(f'{name}: {len(seeds_)}' for name, seeds_ in
+                        sorted(_dropped_by_scale.items())))
     if scale_sensitive:
         warnings.append('the log-PPL and raw-PPL interactions disagree in '
                         'sign or in the family-level reject decision; do not '
@@ -793,29 +940,50 @@ def build_contrast_interaction(design, cells, *, alpha=0.05, min_n=3,
     not have to trust the stored statistics.
     """
     a = _ci_alpha(alpha)
-    mn = _ci_int(min_n, 'min_n', minimum=2)
+    mn = _ci_int(min_n, 'min_n', minimum=2,
+                  maximum=CONTRAST_INTERACTION_MAX_REPORTABLE_INT)
     margin, rel = _ci_margin_pair(margin, margin_relative_pct)
     norm_design = _ci_normalise_design(design)
     if not isinstance(cells, dict):
         raise ValueError('cells must be a mapping cell -> {seed: PPL}')
     # Serialise the caller's cells verbatim (after JSON normalisation) so the
     # replay is over the same measurements, not over a silently cleaned copy.
+    encoded_cells = _ci_jsonable(cells)
+    result = difference_in_differences(
+        norm_design, cells, alpha=a, min_n=mn, margin=margin,
+        margin_relative_pct=rel)
+    # A JSON object cannot carry an integer key beyond CPython's decimal
+    # limit, and a huge integer value cannot be written at all.  If the
+    # serialised cells no longer replay to the same result, storing this
+    # artifact would create one that its own validator must reject; fail the
+    # builder instead so malformed input cannot masquerade as a valid record.
+    try:
+        encoded_result = difference_in_differences(
+            norm_design, encoded_cells, alpha=a, min_n=mn, margin=margin,
+            margin_relative_pct=rel)
+    except Exception as exc:
+        raise ValueError(
+            'cells cannot be serialised without changing their identity: '
+            f'{type(exc).__name__}: {exc}') from None
+    if not compare_contrast_interaction_results(result, encoded_result).get(
+            'match'):
+        raise ValueError(
+            'cells cannot be serialised without changing their identity '
+            '(unrepresentable seed/PPL value or non-JSON cell key)')
     inputs = {
         'design': norm_design,
-        'cells': _ci_jsonable(cells),
+        'cells': encoded_cells,
         'alpha': a,
         'min_n': mn,
         'margin': margin,
         'margin_relative_pct': rel,
     }
-    result = difference_in_differences(
-        norm_design, cells, alpha=a, min_n=mn, margin=margin,
-        margin_relative_pct=None)
     artifact = {
         'kind': CONTRAST_INTERACTION_ARTIFACT_KIND,
         'schema': CONTRAST_INTERACTION_ARTIFACT_SCHEMA,
         'created_at': reproducible_timestamp(),
-        'source': (None if source is None else str(source)),
+        'source': (None if source is None
+                   else _ci_endpoint_text(source)),
         'inputs': inputs,
         'result': _ci_jsonable(result),
     }
@@ -827,7 +995,7 @@ def _ci_forbidden_paths(obj, path='artifact'):
     found = []
     if isinstance(obj, dict):
         for key, value in obj.items():
-            here = f'{path}.{key}'
+            here = f'{path}.{_ci_key_text(key)}'
             if key in CONTRAST_INTERACTION_FORBIDDEN_KEYS:
                 found.append(here)
             found.extend(_ci_forbidden_paths(value, here))
@@ -843,12 +1011,16 @@ def _ci_same(a, b, path='result', *, rtol=1e-9, atol=1e-12, diffs=None):
         diffs = []
     if isinstance(a, dict) and isinstance(b, dict):
         if set(a) != set(b):
-            diffs.append(f'{path}: keys differ (stored={sorted(set(a) - set(b))}, '
-                         f'replay={sorted(set(b) - set(a))})')
+            only_a = sorted(set(a) - set(b), key=_ci_key_text)
+            only_b = sorted(set(b) - set(a), key=_ci_key_text)
+            diffs.append(
+                f'{path}: keys differ (stored=['
+                + ', '.join(_ci_key_text(k) for k in only_a) + '], replay=['
+                + ', '.join(_ci_key_text(k) for k in only_b) + '])')
             return diffs
-        for key in sorted(a):
-            _ci_same(a[key], b[key], f'{path}.{key}', rtol=rtol, atol=atol,
-                     diffs=diffs)
+        for key in sorted(a, key=_ci_key_text):
+            _ci_same(a[key], b[key], f'{path}.{_ci_key_text(key)}',
+                     rtol=rtol, atol=atol, diffs=diffs)
         return diffs
     if isinstance(a, list) and isinstance(b, list):
         if len(a) != len(b):
@@ -859,21 +1031,22 @@ def _ci_same(a, b, path='result', *, rtol=1e-9, atol=1e-12, diffs=None):
         return diffs
     if isinstance(a, bool) or isinstance(b, bool):
         if a is not b:
-            diffs.append(f'{path}: {a!r} != {b!r}')
+            diffs.append(f'{path}: {_ci_repr(a)} != {_ci_repr(b)}')
         return diffs
     if a is None or b is None:
         if a is not b:
-            diffs.append(f'{path}: {a!r} != {b!r}')
+            diffs.append(f'{path}: {_ci_repr(a)} != {_ci_repr(b)}')
         return diffs
     if isinstance(a, (int, float)) and isinstance(b, (int, float)):
         try:
             if not math.isclose(float(a), float(b), rel_tol=rtol, abs_tol=atol):
-                diffs.append(f'{path}: {a!r} != {b!r}')
+                diffs.append(f'{path}: {_ci_repr(a)} != {_ci_repr(b)}')
         except (TypeError, ValueError, OverflowError):
-            diffs.append(f'{path}: uncomparable numbers {a!r}, {b!r}')
+            diffs.append(f'{path}: uncomparable numbers '
+                         f'{_ci_repr(a)}, {_ci_repr(b)}')
         return diffs
     if a != b:
-        diffs.append(f'{path}: {a!r} != {b!r}')
+        diffs.append(f'{path}: {_ci_repr(a)} != {_ci_repr(b)}')
     return diffs
 
 
@@ -902,13 +1075,14 @@ def validate_contrast_interaction(artifact, *, replay=True):
     if not isinstance(artifact, dict):
         out['problems'].append('artifact must be a JSON object')
         return out
-    extra = sorted(set(artifact) - set(CONTRAST_INTERACTION_ARTIFACT_KEYS))
+    extra = sorted(set(artifact) - set(CONTRAST_INTERACTION_ARTIFACT_KEYS),
+                   key=_ci_key_text)
     missing = [k for k in CONTRAST_INTERACTION_ARTIFACT_KEYS
                if k not in artifact]
     if extra or missing:
         out['problems'].append(
             f'artifact keys differ from the schema: missing={missing}, '
-            f'extra={extra}')
+            'extra=[' + ', '.join(_ci_key_text(k) for k in extra) + ']')
     if artifact.get('kind') != CONTRAST_INTERACTION_ARTIFACT_KIND:
         out['problems'].append(
             f'artifact.kind must be {CONTRAST_INTERACTION_ARTIFACT_KIND!r}, '
@@ -939,12 +1113,14 @@ def validate_contrast_interaction(artifact, *, replay=True):
     if not isinstance(inputs, dict):
         out['problems'].append('artifact.inputs must be an object')
     else:
-        extra_i = sorted(set(inputs) - set(CONTRAST_INTERACTION_INPUT_KEYS))
+        extra_i = sorted(set(inputs) - set(CONTRAST_INTERACTION_INPUT_KEYS),
+                         key=_ci_key_text)
         missing_i = [k for k in CONTRAST_INTERACTION_INPUT_KEYS
                      if k not in inputs]
         if extra_i or missing_i:
             out['problems'].append(
-                f'inputs keys differ: missing={missing_i}, extra={extra_i}')
+                f'inputs keys differ: missing={missing_i}, extra=['
+                + ', '.join(_ci_key_text(k) for k in extra_i) + ']')
     result = artifact.get('result')
     if not isinstance(result, dict):
         out['problems'].append('artifact.result must be an object')
@@ -1016,15 +1192,20 @@ def write_contrast_interaction(outdir, artifact, *, overwrite=False,
 
 def contrast_interaction_markdown(result, *, title='2x2 interaction'):
     """Render a compact Markdown block for a result body."""
+    title = _ci_md_text(title, 240)
     if not isinstance(result, dict):
         return f'**{title}**: not estimable (not an object).'
     if result.get('status') == 'not_estimable':
-        return (f'**{title}**: not estimable — {result.get("reason", "no reason")}.')
-    lines = [f'**{title}** (`{result.get("design", {}).get("label", "2x2")}`; '
-             f'n={result.get("n")})', '']
-    design = result.get('design') or {}
-    scales = result.get('scales') or {}
-    primary = scales.get(result.get('primary_scale', 'log_ppl')) or {}
+        reason = _ci_md_text(result.get('reason', 'no reason'))
+        return f'**{title}**: not estimable — {reason}.'
+    design = result.get('design')
+    design = design if isinstance(design, dict) else {}
+    lines = [f'**{title}** (`{_ci_md_text(design.get("label", "2x2"))}`; '
+             f'n={_ci_md_text(result.get("n"))})', '']
+    scales = result.get('scales')
+    scales = scales if isinstance(scales, dict) else {}
+    primary = scales.get(result.get('primary_scale', 'log_ppl'))
+    primary = primary if isinstance(primary, dict) else {}
     lines.append('| scale | contrast | mean | 95% CI | p (sign-flip) | '
                  'p (family) |')
     lines.append('|---|---|---|---|---|---|')
@@ -1038,39 +1219,44 @@ def contrast_interaction_markdown(result, *, title='2x2 interaction'):
             if not isinstance(row, dict):
                 continue
             ci = row.get('ci95')
-            ci_txt = ('[%+.4f, %+.4f]' % (ci[0], ci[1])
+            ci_txt = ('[%s, %s]' % (_ci_md_num(ci[0], '{:+.4f}'),
+                                    _ci_md_num(ci[1], '{:+.4f}'))
                       if isinstance(ci, list) and len(ci) == 2 else '—')
-            p = row.get('p_exact_signflip')
-            pf = row.get('p_family')
             lines.append('| %s | %s | %s | %s | %s | %s |' % (
-                scale_name, row.get('name', '—'),
-                ('%+.4f' % row['mean']) if isinstance(row.get('mean'), (int, float)) else '—',
-                ci_txt,
-                ('%.4g' % p) if isinstance(p, (int, float)) else '—',
-                ('%.4g' % pf) if isinstance(pf, (int, float)) else '—'))
+                _ci_md_text(scale_name), _ci_md_text(row.get('name', '—')),
+                _ci_md_num(row.get('mean'), '{:+.4f}'), ci_txt,
+                _ci_md_num(row.get('p_exact_signflip'), '{:.4g}'),
+                _ci_md_num(row.get('p_family'), '{:.4g}')))
     lines.append('')
     inter = primary.get('interaction') or {}
     lines.append('- primary interaction: `%s`; direction `%s`.' % (
-        inter.get('definition', '—'), inter.get('direction', '—')))
+        _ci_md_text(inter.get('definition', '—')),
+        _ci_md_text(inter.get('direction', '—'))))
     fam = primary.get('family') or {}
     lines.append('- family: `%s`; simultaneous 95%% CI %s.' % (
-        fam.get('method', '—'),
-        inter.get('ci95_simultaneous') if inter.get('ci95_simultaneous') else '—'))
-    interpretation = result.get('interpretation') or {}
+        _ci_md_text(fam.get('method', '—')),
+        _ci_md_text(inter.get('ci95_simultaneous'))
+        if inter.get('ci95_simultaneous') else '—'))
+    interpretation = result.get('interpretation')
+    interpretation = interpretation if isinstance(interpretation, dict) else {}
     lines.append('- verdict: `%s`; claim allowed: `%s` (exploratory).' % (
-        interpretation.get('classification'), interpretation.get('claim_allowed')))
+        _ci_md_text(interpretation.get('classification')),
+        _ci_md_text(interpretation.get('interaction_claim_allowed'))))
     if interpretation.get('difference_in_significance_fallacy'):
         lines.append('- **difference-in-significance warning**: one marginal is '
                      'significant and the other is not, but the interaction is '
                      'not rejected; do not read this as a significant '
                      'difference between the marginal effects.')
-    agreement = result.get('scale_agreement') or {}
+    agreement = result.get('scale_agreement')
+    agreement = agreement if isinstance(agreement, dict) else {}
     if agreement.get('scale_sensitive'):
         lines.append('- **scale sensitivity**: the log-PPL and raw-PPL '
                      'interactions disagree; the choice of scale changes the '
                      'readout.')
-    for warning in result.get('warnings') or []:
-        lines.append(f'- warning: {warning}')
+    warnings = result.get('warnings')
+    if isinstance(warnings, (list, tuple)):
+        for warning in warnings:
+            lines.append(f'- warning: {_ci_md_text(warning)}')
     lines.append('')
     lines.append('> exploratory only: this block is not in the frozen Holm '
                  'family and does not change any confirmed/verified verdict.')
@@ -1115,7 +1301,8 @@ def confirmation_sink_interaction(by_length, *, endpoint='by_len.ppl@4096',
             raise ValueError('by_length must be a mapping')
         text = str(endpoint)
         if '@' not in text:
-            raise ValueError(f'endpoint {endpoint!r} has no @length suffix')
+            raise ValueError(f'endpoint {_ci_endpoint_text(endpoint)!r} has '
+                             'no @length suffix')
         length = _ci_int(text.rsplit('@', 1)[1], 'endpoint length', minimum=1)
         cells = {}
         reasons = {}
@@ -1137,14 +1324,17 @@ def confirmation_sink_interaction(by_length, *, endpoint='by_len.ppl@4096',
             return _ci_not_estimable(
                 'frozen 2x2 cells are incomplete: '
                 + '; '.join(f'{k}: {v}' for k, v in sorted(reasons.items())),
-                extra={'endpoint': endpoint, 'alpha': float(alpha),
-                       'min_n': int(min_n), 'margin': margin,
-                       'margin_relative_pct': margin_relative_pct,
+                extra={'endpoint': _ci_endpoint_text(endpoint),
+                       'alpha': _ci_float_or_none(alpha),
+                       'min_n': _ci_int_or_none(min_n),
+                       'margin': _ci_float_or_none(margin),
+                       'margin_relative_pct': _ci_float_or_none(
+                           margin_relative_pct),
                        'missing': reasons})
         result = difference_in_differences(
             CONFIRMATION_SINK_2X2, cells, alpha=alpha, min_n=min_n,
             margin=margin, margin_relative_pct=margin_relative_pct)
-        result['endpoint'] = endpoint
+        result['endpoint'] = _ci_endpoint_text(endpoint)
         result['upstream'] = ('finaltest_stats: frozen by-length cells for '
                               'csa_fixed_rope / full_rope_sink / '
                               'csa_fixed_rope_nosink / full_rope')
@@ -1152,6 +1342,9 @@ def confirmation_sink_interaction(by_length, *, endpoint='by_len.ppl@4096',
     except Exception as exc:
         return _ci_not_estimable(
             f'{type(exc).__name__}: {exc}',
-            extra={'endpoint': endpoint, 'alpha': float(alpha),
-                   'min_n': int(min_n), 'margin': margin,
-                   'margin_relative_pct': margin_relative_pct})
+            extra={'endpoint': _ci_endpoint_text(endpoint),
+                   'alpha': _ci_float_or_none(alpha),
+                   'min_n': _ci_int_or_none(min_n),
+                   'margin': _ci_float_or_none(margin),
+                   'margin_relative_pct': _ci_float_or_none(
+                       margin_relative_pct)})
