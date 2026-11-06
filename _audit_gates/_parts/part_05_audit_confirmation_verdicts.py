@@ -1995,6 +1995,7 @@ def run_report(out='audit_report.json'):
     res['sequential_design'] = audit_sequential_design(verbose=False)
     res['budget_ablation'] = audit_budget_ablation(verbose=False)
     res['curve_inference'] = audit_curve_inference(verbose=False)
+    res['exact_signflip_ci'] = audit_exact_signflip_ci(verbose=False)
     res['data_exposure'] = audit_data_exposure()
     if str(os.environ.get('CSA_REPLAY_IN_REPORT', '')).strip().lower() in (
             '1', 'true', 'yes', 'on'):
@@ -2178,6 +2179,14 @@ def _run_cli():
                   'curve_simultaneous': audit_curve_inference,
                   'uniform_curve': audit_curve_inference,
                   'curve_flatness': audit_curve_inference})
+    _cmds.update({'exact_signflip_ci': audit_exact_signflip_ci,
+                  'exact_signflip_ci_artifact': audit_exact_signflip_ci_artifact,
+                  'exact_signflip_ci_replay': audit_exact_signflip_ci_artifact,
+                  'exact_signflip_ci_validation': audit_exact_signflip_ci_artifact,
+                  'exact_ci': audit_exact_signflip_ci,
+                  'signflip_ci': audit_exact_signflip_ci,
+                  'seed_ci': audit_exact_signflip_ci,
+                  'exact_seed_ci': audit_exact_signflip_ci})
     _arg = sys.argv[1] if len(sys.argv) > 1 else 'report'
     if _arg in ('-h', '--help'):
         print(__doc__)
@@ -2275,7 +2284,10 @@ def _run_cli():
                 'curve_inference', 'curve_inference_artifact',
                 'curve_inference_replay', 'curve_inference_validation',
                 'length_curve', 'curve_simultaneous', 'uniform_curve',
-                'curve_flatness'):
+                'curve_flatness',
+                'exact_signflip_ci', 'exact_signflip_ci_artifact',
+                'exact_signflip_ci_replay', 'exact_signflip_ci_validation',
+                'exact_ci', 'signflip_ci', 'seed_ci', 'exact_seed_ci'):
         _r = _cmds[_arg](*_pos)
     elif _arg in ('test_access', 'test_access_audit', 'heldout', 'test_looks',
                   'environment_identity', 'environment', 'env_drift',

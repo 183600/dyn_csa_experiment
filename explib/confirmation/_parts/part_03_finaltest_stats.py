@@ -421,6 +421,38 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
         res['init_core_fp_recorded'] = any(('a' in e) or ('b' in e)
                                           for e in _init_aud['per_seed'])
         res['min_seeds_for_confirmation'] = _n_min
+        # Exact confidence set by inverting the SAME sign-flip test that
+        # produced p_exact_signflip.  The historical seed-level interval is a
+        # Student-t interval (`paired_effect_stats.ci95_*`); it can exclude
+        # zero while the exact test does not reject (and vice versa), because
+        # it assumes normality the exact test does not.  The exact set is
+        # consistent with the exact rational test at zero and is reported
+        # beside the t interval, never as a replacement for the frozen
+        # decision; the float enumeration's tie tolerance is named by
+        # p_consistency rather than hidden.
+        try:
+            res['exact_signflip_ci'] = L.exact_signflip_ci_block(
+                dl, alpha=_alpha, seeds=[int(s) for s in usable])
+        except Exception as _ecie:
+            res['exact_signflip_ci'] = {
+                'kind': 'exact_signflip_ci_error',
+                'status': 'not_estimable',
+                'reason': f'{type(_ecie).__name__}: {_ecie}',
+            }
+        # The practical-significance table uses the per-seed log ratio; give
+        # that estimand the same exact-set companion so the SESOI/TOST
+        # interval is not the only interval on the log scale.
+        try:
+            _log_dl = [math.log(pa) - math.log(pb)
+                       for pa, pb in zip(_pa_used, _pb_used)]
+            res['exact_signflip_ci_log_ratio'] = L.exact_signflip_ci_block(
+                _log_dl, alpha=_alpha, seeds=[int(s) for s in usable])
+        except Exception as _ecie2:
+            res['exact_signflip_ci_log_ratio'] = {
+                'kind': 'exact_signflip_ci_error',
+                'status': 'not_estimable',
+                'reason': f'{type(_ecie2).__name__}: {_ecie2}',
+            }
         # Effect-scale / robust-location sensitivity: the frozen test is on
         # the raw PPL difference.  Report whether the same paired seeds give
         # the same direction and zero-exclusion under the log-PPL scale and
@@ -1789,6 +1821,129 @@ def _practical_significance_markdown(block):
     return out
 
 
+def _exact_signflip_ci_markdown(comps, *, alpha=0.05):
+    """Render the exact seed-level confidence sets beside the t intervals.
+
+    The main comparison table's ``doc_sampling`` CI is a different estimand
+    (token-pooled document cluster); the exact set below is the interval for
+    the same per-seed mean that produced ``p_exact_signflip``.  No frozen
+    verdict is read or written here.
+    """
+    if not isinstance(comps, dict) or not comps:
+        return []
+
+    def _result(block):
+        if not isinstance(block, dict):
+            return None
+        if block.get('kind') == 'exact_signflip_ci_error':
+            return {'status': 'not_estimable',
+                    'reason': block.get('reason') or 'build failed'}
+        result = block.get('result')
+        return result if isinstance(result, dict) else None
+
+    def _num(x, fmt='{:+.4f}'):
+        if isinstance(x, bool) or not isinstance(x, (int, float)):
+            return '—'
+        x = float(x)
+        return fmt.format(x) if math.isfinite(x) else '—'
+
+    def _ci(ci):
+        if not isinstance(ci, (list, tuple)) or len(ci) != 2:
+            return '—'
+        return f'[{_num(ci[0])}, {_num(ci[1])}]'
+
+    try:
+        pct = int(round(100.0 * (1.0 - float(alpha))))
+    except (TypeError, ValueError, OverflowError):
+        pct = 95
+    raw_rows = []
+    log_rows = []
+    for name, v in comps.items():
+        if not isinstance(v, dict) or 'omitted' in v:
+            continue
+        raw = _result(v.get('exact_signflip_ci'))
+        log = _result(v.get('exact_signflip_ci_log_ratio'))
+        if raw is not None:
+            raw_rows.append((name, v, raw))
+        if log is not None:
+            log_rows.append((name, v, log))
+    if not raw_rows and not log_rows:
+        return []
+    out = []
+    A = out.append
+    A('### 种子级均值的精确符号翻转置信集（与精确 p 同源）')
+    A('')
+    A('主比较表里的文档/文章 cluster 区间是 token 池化 ΔPPL 的另一个估计量；'
+      '本节给的是与 `p_exact_signflip` **同一个** per-seed 均值的区间。'
+      '精确集由同一个符号翻转检验反演得到（逐候选 `mu` 计算精确 p，接受 '
+      '`p(mu) >= alpha` 的集合），因此在零点的成员关系与精确有理检验一致；'
+      '浮点枚举的 `1e-12` 并列容差只在精确并列处可能差一个模式（见下）。')
+    A('')
+    if raw_rows:
+        A(f'| 比较（raw ΔPPL） | n | mean | exact {pct}% set | t {pct}% CI | p at 0 (rational) | 含 0 | exact vs t | 状态 |')
+        A('|---|---|---|---|---|---|---|---|---|')
+        for name, v, r in raw_rows:
+            rel = (r.get('zero_relation') or {}).get('relation')
+            status = r.get('status')
+            if status == 'not_estimable':
+                A(f'| {name} | {r.get("n", "—")} | —（{r.get("reason", "not estimable")}） | — | — | — | — | — | not_estimable |')
+                continue
+            if r.get('unbounded'):
+                exact_txt = '整条实轴（分辨率不足）'
+            elif r.get('connected') is False:
+                exact_txt = ' ∪ '.join(_ci(x) for x in (r.get('intervals') or []))
+            else:
+                exact_txt = _ci(r.get('ci'))
+            t_ci = (r.get('t_interval') or {}).get('ci')
+            A(f'| {name} | {r.get("n", "—")} | {_num(r.get("mean"))} | '
+              f'{exact_txt} | {_ci(t_ci)} | {_num(r.get("p_at_zero"), "{:.4g}")} | '
+              f'{r.get("contains_zero")} | `{rel}` | {status} |')
+        A('')
+    if log_rows:
+        A(f'| 比较（log ratio） | n | mean | exact {pct}% set | t {pct}% CI | p at 0 (rational) | 含 0 | exact vs t | 状态 |')
+        A('|---|---|---|---|---|---|---|---|---|')
+        for name, v, r in log_rows:
+            rel = (r.get('zero_relation') or {}).get('relation')
+            status = r.get('status')
+            if status == 'not_estimable':
+                A(f'| {name} | {r.get("n", "—")} | —（{r.get("reason", "not estimable")}） | — | — | — | — | — | not_estimable |')
+                continue
+            if r.get('unbounded'):
+                exact_txt = '整条实轴（分辨率不足）'
+            elif r.get('connected') is False:
+                exact_txt = ' ∪ '.join(_ci(x) for x in (r.get('intervals') or []))
+            else:
+                exact_txt = _ci(r.get('ci'))
+            t_ci = (r.get('t_interval') or {}).get('ci')
+            A(f'| {name} | {r.get("n", "—")} | {_num(r.get("mean"))} | '
+              f'{exact_txt} | {_ci(t_ci)} | {_num(r.get("p_at_zero"), "{:.4g}")} | '
+              f'{r.get("contains_zero")} | `{rel}` | {status} |')
+        A('')
+    disagree = [name for name, _v, r in (raw_rows + log_rows)
+                if (r.get('zero_relation') or {}).get('relation') in
+                ('t_excludes_exact_includes', 't_includes_exact_excludes')]
+    if disagree:
+        A('**区间口径提醒**：' + '；'.join(f'`{k}`' for k in disagree)
+          + ' 的 Student-t 区间与精确符号翻转集在「是否含 0」上不一致。'
+            't 区间假设配对差近似正态；精确集只依赖对称性，并且与报告的精确 p '
+            '同源。引用时必须并列两者，不能把 t 区间的零点排除写成「精确检验显著」。')
+        A('')
+    A('> 边界：精确集是同一个符号翻转检验的反演，因此与 `p_exact_signflip` '
+      '同源；它只要求配对差关于均值对称，比正态假设弱，但**不是无假设**的：'
+      '偏态/重尾下仍可能欠覆盖。离散性使它保守（覆盖率 ≥ 1−α，而不是恰好）。'
+      '`n < 6`（α=0.05，且无零差）或零差使有效非零数不足时，精确 p 下限'
+      '已高于 α，接受集是整条实轴，报告为'
+      '「分辨率不足」而不是一个假的有限区间；常数面板的零宽区间是离散性'
+      '伪影，不是无限精度。`p at 0 (rational)` 是精确有理计数；主表的 '
+      '`p (exact)` 是同一检验的浮点枚举（带 `1e-12` 并列容差），两者只在'
+      '精确并列处可能差一个模式，块内 `p_consistency` 会点名。该块不产生新 p、'
+      '不进入冻结 Holm 族、不改变 '
+      '`p_exact_signflip` / `p_holm` / `verified` / `confirmed`，也不替代'
+      '预注册的 t-TOST；它只把「与精确 p 同源的区间」放在结果旁边。')
+    A('')
+    return out
+
+
 def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
     v12_analysis(out=stats_p)
     st = json.load(open(stats_p, encoding='utf-8'))
@@ -2309,6 +2464,8 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
             _pf_t = _cmp_num(v.get('p_floor'), '.3f')
             A(f'| {k} | {v.get("n", "—")} | {v.get("coverage_ok")} | {v.get("param_matched")} | {_ipa_txt} | {_mean_t} ± {_std_t} | {_dcitxt} | {_dz_t} | {_p_t} | {_pf_t} | {_hp} | {_hr} | {_ds} |')
         A('')
+        for _line in _exact_signflip_ci_markdown(comps, alpha=_report_alpha):
+            A(_line)
         _fc_md = L._family_correction_markdown(ft.get('family_correction'))
         if _fc_md:
             for _line in _fc_md:

@@ -153,6 +153,7 @@ _PARTS = [
 'part_84_sequential_design.py',
 'part_85_budget_ablation.py',
 'part_86_curve_inference.py',
+'part_87_exact_signflip_ci.py',
 ]
 
 load_root_package(globals(), __file__, _PARTS,

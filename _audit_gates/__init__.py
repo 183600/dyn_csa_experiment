@@ -41,6 +41,7 @@ _PARTS = [
 'part_50_audit_sequential_design.py',
 'part_51_audit_budget_ablation.py',
 'part_52_audit_curve_inference.py',
+'part_53_audit_exact_signflip_ci.py',
 'part_05_audit_confirmation_verdicts.py',
 'part_08_audit_missingness.py',
 'part_09_audit_trajectory.py',

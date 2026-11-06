@@ -7,7 +7,7 @@ PYTHON ?= python
 BUILD_DIR := .build
 INSTALL_DIR := $(BUILD_DIR)/install-check
 
-.PHONY: help test plan protocol preparation rehearsal transfer budget attribution ablation-rank ablation-screen sink-interaction sequential-design budget-ablation curve-inference estimability conformal type-sm exact-tost global-fdr multiverse audit manipulation integrity env-check canary canary-check registry data-sensitivity reproduce report-diff install-check build clean
+.PHONY: help test plan protocol preparation rehearsal transfer budget attribution ablation-rank ablation-screen sink-interaction sequential-design budget-ablation curve-inference exact-signflip-ci estimability conformal type-sm exact-tost global-fdr multiverse audit manipulation integrity env-check canary canary-check registry data-sensitivity reproduce report-diff install-check build clean
 
 help:
 	@echo "make test          # CPU unit/reproducibility suite (zero GPU)"
@@ -24,6 +24,7 @@ help:
 	@echo "make sequential-design # prospective group-sequential plan: exact alpha spending (zero GPU)"
 	@echo "make budget-ablation # budget x ablation interaction: paired log-PPL slopes + exact TOST (zero GPU)"
 	@echo "make curve-inference # curve-level simultaneous band, flatness and uniform IUT claims (zero GPU)"
+	@echo "make exact-signflip-ci # exact seed-level confidence set consistent with the sign-flip p (zero GPU)"
 	@echo "make estimability  # design matrix rank / contrast estimability (zero GPU)"
 	@echo "make conformal    # distribution-free prediction interval replay (zero GPU)"
 	@echo "make type-sm       # design-stage Type S / Type M sign & magnitude risk (zero GPU)"
@@ -106,6 +107,9 @@ budget-ablation:
 
 curve-inference:
 	$(PYTHON) audit_gates.py curve_inference
+
+exact-signflip-ci:
+	$(PYTHON) audit_gates.py exact_signflip_ci
 
 audit:
 	$(PYTHON) audit_gates.py report

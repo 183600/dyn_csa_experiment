@@ -7694,3 +7694,56 @@ mismatch；`curve_ref` 逃逸 summary 目录时拒绝读取并报 unverified；C
 默认与 `--require exact` 下都对同终点不同曲线退出 1；审计门
 `curve_changed` 判 fail。相关 `test_review_part_37/51/54/70/24` 与完整
 CPU 套件在本轮最终树通过。
+
+## 2026-11-06 — 精确 p 配 t 区间是两套推断：符号翻转置信集反演（本轮结果分析硬化，no new runs）
+
+**Problem.** 冻结确认检验是逐种子配对差的精确双侧符号翻转检验，但报告
+里与它并排的区间是 Student-t 区间。两者对同一个均值估计量回答「是否含 0」，
+却依赖不同假设，可以不一致：一个 12 种子合成向量的 t 95% CI 为
+`[+0.0022, +0.9256]`（不含 0），而精确 p=0.0518（不拒绝）。`finaltest_stats`
+的主比较表只有文档/文章 cluster 的 token 池化区间（另一个估计量），没有
+与 `p_exact_signflip` 同源的种子级区间；`paired_effect_stats` 的 `ci95_*`
+仍是 t 区间。把 t 区间的零点排除读成「精确检验显著」是结果分析层的
+口径错误。
+
+**Fix.** 新增 `explib/_parts/part_87_exact_signflip_ci.py`：对候选
+`mu` 用 `e_i = d_i - mu` 计算精确符号翻转 p，反演得到
+`A = {mu : p(mu) >= alpha}`。每个符号模式的不等式是开口向下的二次式，
+因此接受一个闭区间；用公共分母整数与 `Fraction` 端点做精确边界扫描，
+不做网格/Monte Carlo/正态近似。`k = ceil(alpha*2**n)`；全同号模式贡献 2，
+`k<=2` 时接受集为整条实轴，报告 `unbounded` 而不是伪造有限区间。结果给出
+`ci`、`intervals`（可能不相交）、`bounding_interval`、`p_at_zero`、
+`contains_zero`、`t_interval`、`zero_relation`、`p_consistency`、
+`resolution` 与 `enumeration`；t 与精确集在零点不一致时写具名 warning。
+新增 `exact_signflip_ci_block`、`build_/validate_/write_exact_signflip_ci`
+（内容摘要、完整重放、冻结字段拒绝、三态写入）与 markdown。
+v12 `finaltest_stats` 在同一批已准入 per-seed 差上追加
+`exact_signflip_ci`（raw ΔPPL）与 `exact_signflip_ci_log_ratio`；报告新增
+种子级精确置信集两表。新增 `_audit_gates/_parts/part_53_audit_exact_signflip_ci.py`
+重放 embedded/standalone 块，接入 `audit_gates.py report`、CLI 别名与
+`make exact-signflip-ci`。
+
+**Boundary.** 这是**描述性结果分析读数**，不是新的确认性检验：不训练、
+不读 split、不向冻结族增加新 p、不进入冻结 Holm 族，不改变
+`p_exact_signflip` / `p_holm` / `verified` / `confirmed`，也不修改
+`confirmation_frozen*.json`。精确集与符号翻转检验依赖同一个对称性假设；
+偏态/重尾下仍可能欠覆盖。精确只在 `n <= max_n`（默认 16、硬上限 18）；
+超过上限返回 `not_estimable`，不退回 t 区间。α=0.05 时 n<6 的接受集是
+整条实轴，报告 `unbounded`；常数面板的零宽集合是离散性伪影，不是无限
+精度。t 区间仍并列显示，不替换预注册 t-TOST；精确集不是新种子预测区间、
+不是后验概率，也不修复选择偏差、缺失种子或非可交换面板。精确有理 p 与
+浮点枚举的 `1e-12` 并列容差只可能在精确并列处差一个模式，
+`p_consistency` 会点名。该片段是分析侧新增，冻结清单字节未改；但首次
+test 读取的冻结锁绑定测量源码树（§51），所以它必须与 P5T 同树或在首次
+读取前进入，读取后加入会按 §51 拒绝未声明漂移。
+
+**Verification.** 新增 `test_review_part_93.py` 16 项：任意 `mu` 的精确 p
+与独立暴力枚举对拍；置信集成员与暴力接受集逐点对拍及端点内外关系；
+12 种子反例的 t/精确零点不一致；缩放/平移等变性与 p 的平移语义；常数/
+全零/n<6 的退化与分辨率；非法输入、seeds、max_n 与超过上限的
+fail-closed；非有限值具名丢弃；artifact 的 hash/重放/冻结字段/输入篡改；
+block 的 round-trip/篡改/缺键/not_estimable；writer 三态；markdown；
+v12 `finaltest_stats` 真的追加 raw 与 log-ratio 块且
+`p_at_zero == p_exact_signflip`；审计门四态；CLI/Makefile/`_PARTS` 接线
+与 `.github`/README 仍在；300 次正态对称模拟覆盖率不低于 0.90。相关
+`test_review_part_43/83/85/92` 与完整 CPU 套件在本轮最终树通过。

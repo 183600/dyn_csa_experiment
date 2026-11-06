@@ -15271,3 +15271,144 @@ make reproduce A=ORIGINAL B=RERUN
 summary 目录时拒绝读取并报 unverified；CLI 对同终点不同曲线在两个
 `--require` 模式下都退出 1；审计门 `curve_changed` 判 fail。完整 CPU
 套件在本轮最终树通过。
+
+## 153. 精确 p 配 t 区间是两套推断：符号翻转置信集的反演（本轮结果分析硬化，no new runs）
+
+零 GPU；不新增训练、不读取 split、不修改
+`confirmation_frozen*.json` 的字节/臂/种子/端点/α/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未删除、未修改、未移动。
+
+### 153.1 问题：p 是精确的，区间却是正态近似的
+
+冻结确认检验是逐种子配对差的**精确双侧符号翻转检验**；它的有效性只要求
+配对差在原假设附近对称（不需要正态）。但报告里与它并排的区间一直是
+Student-t 区间 `mean ± t * sd / sqrt(n)`。两者对同一个均值估计量给出
+「是否含 0」的答案，却依赖不同假设，因此可以不一致。一个具体的 12 种子
+合成向量（不是实验结果）：
+
+```text
+mean = +0.463926, sd = 0.726647, n = 12
+t 95% CI      = [+0.002237, +0.925616]     # 不含 0
+exact sign-flip p = 0.051758 > 0.05        # 不拒绝
+```
+
+t 区间说「零在区间外」，精确 p 说「在 0.05 下不拒绝」。这不是哪个数字
+算错：t 区间是正态近似，精确 p 是符号翻转。但并排展示会让读者把 t 区间
+的零点排除误读成「精确检验显著」。仓库里 `paired_effect_stats` 的
+`ci95_*` 正是 t 区间；`finaltest_stats` 的主比较表只有文档/文章 cluster
+的 token 池化区间（另一个估计量），没有与 `p_exact_signflip` 同源的种子
+级区间。§92/§108 已经注明「同时区间是 t 样式，精确尾水平不等于覆盖」，
+但没有给出一个与精确检验**同源**的区间。
+
+### 153.2 方法：反演同一个精确检验
+
+对候选位置 `mu`，令 `e_i = d_i - mu`。精确双侧符号翻转 p 是
+
+```text
+p(mu) = 2^{-n} * #{ s in {-1,+1}^n :
+                     |sum_i s_i e_i| >= |sum_i e_i| }.
+```
+
+在 `mu=0` 时它就是冻结检验的 p。水平 `1-alpha` 的置信集是
+
+```text
+A = { mu : p(mu) >= alpha }.
+```
+
+对每个符号模式 `s`，不等式 `|S_s - m mu| >= |S - n mu|`（其中
+`S=sum d_i`, `S_s=sum s_i d_i`, `m=sum s_i`）两边平方后是一个**开口向下**
+的二次式：
+
+```text
+(S_s - S + (n-m)mu) * (S_s + S - (n+m)mu) >= 0.
+```
+
+因此每个模式接受一个闭区间（`m=±n` 的两个全同号模式对所有 `mu` 都成立）。
+把所有区间端点排序后做一次扫描，就能得到 `p(mu) >= alpha` 的精确集合；
+不需要网格、Monte Carlo 或正态近似。实现用公共分母的整数
+`xi_i = d_i * D`，端点是精确有理数 `Fraction`，最后才转成 float 输出。
+`k = ceil(alpha * 2**n)` 是最小接受计数；全同号模式贡献 2，所以 `k <= 2`
+时接受集是整条实轴（在当前 n 下精确检验不可能拒绝任何 `mu`），报告为
+`unbounded` 而不是伪造一个有限区间。
+
+集合可能是多个不相交闭区间；实现返回 `intervals` 并另给
+`bounding_interval`，不把凸包冒充集合。由于 `p(mean)=1`，接受集至少含
+样本均值，不会是空集。置信集在对称性下覆盖率至少 `1-alpha`；离散性使它
+保守（实际覆盖可以严格大于名义水平），这一点与精确 p 的离散分辨率一致。
+零宽集合通常来自常数/零方差面板（也可能是离散边界上的单点），是离散性
+伪影，不是无限精度。
+
+### 153.3 接线：与 t 区间并列，不改变冻结判定
+
+- 新增 `explib/_parts/part_87_exact_signflip_ci.py`：
+  `exact_signflip_location_p`（任意 `mu` 的精确 p）、
+  `exact_signflip_ci`（结果块）、`exact_signflip_ci_block`（无时间戳块）、
+  `build_/validate_/write_exact_signflip_ci`（内容摘要 + 重放 + 三态写入）、
+  `exact_signflip_ci_markdown`。
+- 结果同时报告 `p_at_zero`（精确有理计数）、`contains_zero`、
+  `t_interval`、`zero_relation`（`both_include_zero` /
+  `both_exclude_zero` / `t_excludes_exact_includes` /
+  `t_includes_exact_excludes` / `t_unavailable`）、`p_consistency`、
+  `resolution` 与 `enumeration`。t 与精确集在零点不一致时写具名
+  warning，不静默选一个。
+- v12 的 `finaltest_stats` 在**同一批已准入 per-seed 差**上追加
+  `exact_signflip_ci`（raw ΔPPL）与 `exact_signflip_ci_log_ratio`；报告
+  新增「种子级均值的精确符号翻转置信集」两表，主比较表与
+  SESOI/TOST 表都不改，冻结的 `p_exact_signflip` / `p_holm` /
+  `verified` / `confirmed` 不重算、不覆盖。
+- 新增 `_audit_gates/_parts/part_53_audit_exact_signflip_ci.py`：优先重放
+  `analysis_v12/test_stats.json` 的比较块，其次独立
+  `analysis_v12/exact_signflip_ci.json`；缺块是 `not_applicable`（旧产物），
+  缺文件是 `not_verifiable_locally`，篡改/不可重放是 `fail`。接入
+  `audit_gates.py report` 顶层、CLI 别名与 `make exact-signflip-ci`。
+
+### 153.4 边界：它修复什么，不修复什么
+
+- **这不是无假设区间。** 它和精确符号翻转检验一样要求配对差关于均值
+  对称；偏态/重尾下仍可能欠覆盖，此时 t 区间也不自动更好。它不改变
+  「配对是否可交换」这个更根本的假设。
+- **精确只在 n <= max_n。** 默认 16、硬上限 18；超过上限返回
+  `not_estimable`，不偷偷退回 t 区间。n 小于 `ceil(log2(2/alpha))`
+  （α=0.05 时 n<6）时精确 p 下限已高于 α，接受集是整条实轴，报告为
+  `unbounded`；这是分辨率不足，不是「没有效应」。
+- **常数面板的零宽区间不是精度。** 它说明该面板没有可估计的种子间散布；
+  引用时必须同时说明 `n_nonzero`、标准差和退化原因。
+- **t 区间照旧显示。** 精确集不替换预注册的 t-TOST，也不把
+  「区间含 0」变成「等价」；它只是让「与精确 p 同源的区间」可见。要让
+  等价主张成立，仍必须走声明的 SESOI/TOST 门。
+- **精确有理 p 与浮点枚举的容差。** `exact_signflip_p` 在单位化后用
+  `1e-12` 的并列容差；本块用精确有理计数。只有浮点并列时两者才可能
+  差一个模式，`p_consistency` 会点名，不把差异藏起来。
+- **不修复选择偏差、缺失种子、非可交换面板或 winner's curse。** 它也
+  不是新种子的预测区间（§80/§139），不是后验概率，不进入任何 Holm 族。
+- **不向冻结族增加新 p。** 该块不改变 `p_exact_signflip` / `p_holm` /
+  `verified` / `confirmed`，也不改变 `confirmation_frozen*.json` 的字节、
+  臂、种子、α、终点或 `CODE_SEMANTICS`。
+- **源码树绑定。** 这是分析侧新增片段；冻结清单的字节没变，但首次
+  test 读取写下的冻结锁绑定测量源码树（§51）。因此它必须与 P5T 在同一棵
+  树里，或在首次 test 读取**之前**进入；若在读取后加入，锁会按 §51 拒绝
+  未声明漂移，而不是让新代码悄悄改变读数。
+
+### 153.5 入口与验证
+
+```bash
+python audit_gates.py exact_signflip_ci
+python audit_gates.py exact_signflip_ci analysis_v12/test_stats.json
+python audit_gates.py exact_signflip_ci_artifact analysis_v12/exact_signflip_ci.json
+make exact-signflip-ci
+python -m pytest -q test_review_part_93.py
+python -m pytest -q            # 完整 CPU 套件
+```
+
+`test_review_part_93.py` 16 项覆盖：任意 `mu` 的精确 p 与独立暴力枚举
+逐值对拍；置信集成员与暴力接受集逐点对拍、端点内外的 p 关系；12 种子
+反例上 t 区间排除 0 而精确 p=0.0518 时精确集含 0 且 relation 为
+`t_excludes_exact_includes`；正缩放/平移的等变性与 p 的平移语义；
+常数面板零宽退化、全零面板分辨率不足、n<6 无有限区间；非法
+alpha/max_n/输入/seeds 与超过精确上限的 fail-closed；非有限值按位置
+丢弃；artifact 的 hash/重放/冻结字段拒绝与输入篡改；block 的
+round-trip/篡改/缺键/not_estimable；writer 的 no-op/conflict/overwrite；
+markdown 边界；v12 `finaltest_stats` 真的追加 raw 与 log-ratio 块且
+`p_at_zero == p_exact_signflip`；审计门的 embedded/standalone/篡改/
+缺块/缺文件四态；CLI/Makefile/`_PARTS` 接线与 `.github`/README 仍在；
+300 次正态对称模拟的覆盖率不低于 0.90。完整 CPU 套件在本轮最终树通过。
