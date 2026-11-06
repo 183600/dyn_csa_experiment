@@ -7747,3 +7747,62 @@ v12 `finaltest_stats` 真的追加 raw 与 log-ratio 块且
 `p_at_zero == p_exact_signflip`；审计门四态；CLI/Makefile/`_PARTS` 接线
 与 `.github`/README 仍在；300 次正态对称模拟覆盖率不低于 0.90。相关
 `test_review_part_43/83/85/92` 与完整 CPU 套件在本轮最终树通过。
+
+## 2026-11-06 — 显著的平均不是每个评测单位都改善：数据盲 split-half 一致性、IUT 与划分规格曲线（本轮结果分析硬化，no new runs）
+
+**Problem.** 冻结确认检验以种子为单位，回答「平均效应能否与 0 分辨」；
+它不回答效应是否分布在评测单位上。PPL 是 token 池化的，少数长文档可以
+主导权重：一个在 8 篇文档上为负、另外 8 篇上为正的效应，仍可能给出显著
+的种子级均值。已有 `doc_sampling`（逐文档 cluster 区间）、§115（逐单位
+分位/尾部）和 §57（leave-one-unit-out）都是逐单位读数，不是「同一个
+方向在两个不相交半区都成立」的交集主张。把全样本区间和两半区间并排，
+既没有共同水平控制，划分本身也是看结果后可以再挑的分析选择。
+
+**Fix.** 新增 `explib/_parts/part_88_unit_split_replication.py`：
+
+- `unit_split_assignment` 用固定盐 + 单位 id 的 SHA-256 排序，贪心按
+  token 总量把评测单位分进两个不相交半区（并列看单位数，再并列取
+  half 0）。划分不读结果，盐/id/token 被 assignment digest 绑定。
+- 每个半区按 token 权重重算逐种子 `log PPL_a - log PPL_b`，做单侧精确
+  符号翻转检验（复用 `_etost_upper_tail`）；「两半都朝预注册方向」的
+  p 是交集-并集 `max(p_half0, p_half1)`，不需要两半独立，也不需要
+  Bonferroni，但只支持「两半都满足」。
+- 结果报告 assignment、两半 stats/test、IUT、`sign_agreement`、
+  逐种子半区差的 t 样式描述区间、半区组成，以及多个确定性盐下的
+  `split_sensitivity`（通过数/可估数、p 分位、不同划分数）。规格曲线
+  是描述量，`pass_fraction` 不是 p，也不能用来挑盐。
+- `build_/validate_/write_unit_split_replication` 提供内容摘要、完整
+  重放、冻结字段拒绝与三态写入；`unit_split_replication_markdown`
+  渲染边界。v12 `finaltest_stats` 在 `doc_sampling` 之后、实际显著性
+  之前，对有预注册方向的比较追加 `comparisons[*].unit_split_replication`
+  （article 优先，缺失/不足时退回 document 并具名，两种粒度不混池）。
+  新增 `_audit_gates/_parts/part_54_audit_unit_split_replication.py`
+  重放 embedded/standalone 块，接入 `audit_gates.py report`、CLI 别名
+  与 `make unit-split`。
+
+**Boundary.** 这是**内部一致性**，不是独立复现：两个半区是同一个固定
+评测切片的不相交单位，且共享同一批训练种子，不能建立外部效度，也不能
+替代新语料/新种子复现。它不产生确认 p、不进入冻结 Holm 族、不改变
+`p_exact_signflip` / `p_holm` / `verified` / `confirmed`，也不修改
+`confirmation_frozen*.json`。每个半区的精确检验仍依赖配对差关于 0 对称；
+IUT 只免掉两半独立假设，不修复非可交换面板、选择偏差或 optional
+stopping。半区单位 < 2、种子 < 6、种子 > 20 或 token 占比 < 0.25 时
+报 `not_estimable`/`warnings`，不插补、不近似；全零效应 p=1、claim 为
+`direction_not_supported`，不冒充「没有效应」。`half_difference` 是
+描述量，没有 p，不能把「半区差不大」写成「等价」。该片段是分析侧新增，
+冻结清单字节未改；但首次 test 读取的冻结锁绑定测量源码树（§51），所以
+它必须与 P5T 同树或在首次读取前进入，读取后加入会按 §51 拒绝未声明漂移。
+
+**Verification.** 新增 `test_review_part_94.py` 13 项：划分确定性与
+结果盲、互斥且覆盖；token 贪心平衡与重复 id/非正 token/长度不齐/空盐的
+fail-closed；单侧精确 p 与独立暴力枚举逐值对拍、取负/反方向的等价；
+IUT 等于两分量最大值、全同向 claim、反向拒绝；效应集中在一半时
+`halves_discordant`；非有限行整颗丢弃并具名、block 以 `null` 严格 JSON
+存储且重放一致；`min_n`/`max_n`/`min_units`/无方向的
+not_estimable/not_applicable；全零面板 p=1；artifact 的
+hash/重放/篡改/缺键/夹带冻结字段；writer 三态；split 敏感性计数与
+`n_salts=0` 关闭；markdown 边界；审计门 embedded/standalone/error/
+legacy/missing/tamper 六态；v12 `finaltest_stats` 真的追加块且
+`p_iut == max(分量 p)`、article 粒度与冻结字段不受影响；
+CLI/Makefile/`_PARTS` 接线与 `.github`/README 仍在。相关
+`test_review_part_43/83/85/92/93` 与完整 CPU 套件在本轮最终树通过。

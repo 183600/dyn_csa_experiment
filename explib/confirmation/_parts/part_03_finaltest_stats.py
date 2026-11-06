@@ -587,6 +587,24 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
                                    primary_deltas=dl)
         if _doc is not None:
             res['doc_sampling'] = _doc
+        # Internal split-half consistency across evaluation units: a
+        # significant seed-level mean can be carried by one half of the
+        # documents.  The split is data-blind (fixed hash salt) and the
+        # both-halves claim is an intersection-union test on the SAME seeds.
+        # It is descriptive and changes no frozen p/Holm/verdict.
+        try:
+            _usr_block, _usr_unit = _unit_split_replication_for(
+                recs_a, recs_b, usable, Ln, direction=exp_sign,
+                alpha=_alpha, min_n=6, min_units=4, n_salts=32)
+            res['unit_split_replication'] = _usr_block
+            if _usr_unit is not None:
+                res['unit_split_replication_unit'] = _usr_unit
+        except Exception as _usre:
+            res['unit_split_replication'] = {
+                'kind': 'unit_split_replication_error',
+                'status': 'not_estimable',
+                'reason': f'{type(_usre).__name__}: {_usre}',
+            }
         # Practical significance on the SAME paired seeds.  The estimand is
         # the per-seed log ratio (positive = arm a worse), so the margin is a
         # relative PPL effect and does not depend on the observed baseline.
@@ -1946,6 +1964,97 @@ def _exact_signflip_ci_markdown(comps, *, alpha=0.05):
     return out
 
 
+def _unit_split_replication_markdown(comps):
+    """Render the data-blind split-half consistency of the paired effect.
+
+    A significant seed-level mean can be produced by one half of the
+    evaluation units.  This table recomputes the per-seed effect inside two
+    deterministic, disjoint halves and reports the intersection-union p for
+    "the declared direction holds in BOTH halves".  It is internal
+    consistency, not independent replication, and changes no frozen verdict.
+    """
+    if not isinstance(comps, dict) or not comps:
+        return []
+
+    def _result(block):
+        if not isinstance(block, dict):
+            return None
+        if block.get('kind') == 'unit_split_replication_error':
+            return {'status': block.get('status') or 'not_estimable',
+                    'reason': block.get('reason') or 'build failed'}
+        result = block.get('result')
+        return result if isinstance(result, dict) else None
+
+    rows = [(name, _result(v.get('unit_split_replication')))
+            for name, v in comps.items()
+            if isinstance(v, dict) and 'omitted' not in v]
+    rows = [(name, r) for name, r in rows if r is not None]
+    if not rows:
+        return []
+
+    def _num(x, fmt='{:+.4f}'):
+        if isinstance(x, bool) or not isinstance(x, (int, float)):
+            return '—'
+        x = float(x)
+        return fmt.format(x) if math.isfinite(x) else '—'
+
+    def _p(x):
+        if isinstance(x, bool) or not isinstance(x, (int, float)):
+            return '—'
+        x = float(x)
+        return '{:.4g}'.format(x) if math.isfinite(x) else '—'
+
+    out = []
+    A = out.append
+    A('### 评测单位上的 split-half 一致性（数据盲划分；内部一致性，不是独立复现）')
+    A('')
+    A('冻结检验以种子为单位回答「平均效应是否可分辨」，它不回答效应是否'
+      '分布在评测单位上。本节用固定哈希盐把文档（或文章）确定性、'
+      '**与结果无关**地分成两个不相交半区，在每个半区上重算同一批种子的'
+      'token 加权 log-PPL 效应，并对「两个半区都朝预注册方向」做'
+      'intersection-union 检验（`p_IUT = max(p_half0, p_half1)`）。'
+      'IUT 不需要两个半区独立，也不需要 Bonferroni；代价是它只支持'
+      '「两半都满足」这一交集主张。')
+    A('')
+    A('| comparison | 单位 | 半区0 单位/种子 | 半区0 mean / p | 半区1 mean / p | p_IUT | 判定 | split 敏感性（通过/可估） | 状态 |')
+    A('|---|---|---|---|---|---|---|---|---|')
+    for name, r in rows:
+        status = r.get('status')
+        unit_meta = (comps.get(name) or {}).get('unit_split_replication_unit') or {}
+        unit_kind = unit_meta.get('granularity') or '—'
+        if status in ('not_estimable', 'not_applicable'):
+            A(f'| {name} | {unit_kind} | — | — | — | — | — | — | {status}: {str(r.get("reason") or "")[:120]} |')
+            continue
+        halves = r.get('halves') or [{}, {}]
+        h0, h1 = (halves + [{}, {}])[:2]
+        s0, s1 = (h0.get('stats') or {}), (h1.get('stats') or {})
+        t0, t1 = (h0.get('test') or {}), (h1.get('test') or {})
+        iut = r.get('iut') or {}
+        sens = r.get('split_sensitivity') or {}
+        sens_txt = (f'{sens.get("n_pass")}/{sens.get("n_estimable")}'
+                    if sens else '—')
+        A(f'| {name} | {unit_kind} | {h0.get("n_units", "—")} / {r.get("n_seeds", "—")} | '
+          f'{_num(s0.get("mean"))} / {_p(t0.get("p_one_sided"))} | '
+          f'{_num(s1.get("mean"))} / {_p(t1.get("p_one_sided"))} | '
+          f'{_p(iut.get("p_iut"))} | `{iut.get("claim")}` | {sens_txt} | {status} |')
+    A('')
+    warn = [name for name, r in rows if r.get('warnings')]
+    if warn:
+        A('**半区组成提醒**：' + '；'.join(f'`{k}`' for k in warn)
+          + ' 的半区在 token 质量、单单位占比或种子数上不均衡；'
+            '半区结论不能当作「语料级」读数。')
+        A('')
+    A('> 边界：两个半区是**同一个固定评测切片**的不相交单位，且共享同一批'
+      '训练种子，所以这是内部一致性，不是独立复现，也不是外部效度。'
+      '它不修复评测单位不代表语料、种子面板不可交换或 validation 选择偏差。'
+      '划分由固定盐与单位 id 的哈希决定，不看结果；`split 敏感性` 是对多个'
+      '确定性盐的描述性规格曲线，**不是 p 值**，也不能用来挑一个好看的划分。'
+      '该块不产生新的确认 p、不进入冻结 Holm 族，不改变 '
+      '`p_exact_signflip` / `p_holm` / `verified` / `confirmed`。')
+    A('')
+    return out
+
+
 def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
     v12_analysis(out=stats_p)
     st = json.load(open(stats_p, encoding='utf-8'))
@@ -2467,6 +2576,8 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
             A(f'| {k} | {v.get("n", "—")} | {v.get("coverage_ok")} | {v.get("param_matched")} | {_ipa_txt} | {_mean_t} ± {_std_t} | {_dcitxt} | {_dz_t} | {_p_t} | {_pf_t} | {_hp} | {_hr} | {_ds} |')
         A('')
         for _line in _exact_signflip_ci_markdown(comps, alpha=_report_alpha):
+            A(_line)
+        for _line in _unit_split_replication_markdown(comps):
             A(_line)
         _fc_md = L._family_correction_markdown(ft.get('family_correction'))
         if _fc_md:

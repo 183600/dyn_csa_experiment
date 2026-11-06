@@ -15412,3 +15412,148 @@ markdown 边界；v12 `finaltest_stats` 真的追加 raw 与 log-ratio 块且
 `p_at_zero == p_exact_signflip`；审计门的 embedded/standalone/篡改/
 缺块/缺文件四态；CLI/Makefile/`_PARTS` 接线与 `.github`/README 仍在；
 300 次正态对称模拟的覆盖率不低于 0.90。完整 CPU 套件在本轮最终树通过。
+
+## 154. 显著的平均不是每个评测单位都改善：数据盲 split-half 一致性、IUT 与划分规格曲线（本轮结果分析硬化，no new runs）
+
+零 GPU 的结果分析硬化；不新增训练、不读取 test split、不修改
+`confirmation_frozen*.json` 的字节/种子/端点/α/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未删除、未移动、未修改。
+
+### 154.1 问题：种子级均值没有回答「效应是否分布在评测单位上」
+
+冻结确认检验以**种子**为观测单位：12 个逐种子配对差做精确符号翻转，
+回答「平均效应能否与 0 分辨」。它不回答一个对语料级主张同样重要的问题：
+这个平均是否由**一半评测文档/文章**单独扛起。PPL 是 token 池化的，少数
+长文档可以主导 token 权重；一个在 8 篇文档上为负、在另外 8 篇上为正的
+效应，仍可能给出一个显著的种子级均值。已有 `doc_sampling` 给逐文档
+cluster 区间、§115 给逐单位分位与收益/伤害分解、§57 给 leave-one-unit-out
+影响，但这些读数都没有回答「**同一个方向在两个不相交半区都成立**」这个
+交集主张：逐单位区间不是 IUT，逐单位分位也不是「两半都通过」。
+
+把同一个检验换一个单位再算一遍，也不是新方法：在全部 16 篇文档上算一次
+cluster 区间、再在两半上各算一次，然后把「两半都显著」当成结论，既没有
+共同水平控制，也没有预先固定的划分。划分本身是一个分析选择：如果允许
+看完结果再挑一个「两半都显著」的划分，这就是标准的 garden of forking
+paths。
+
+### 154.2 方法：固定盐的确定性划分 + 两个单侧精确检验的 IUT
+
+令 `d[s,u] = log PPL_a[s,u] - log PPL_b[s,u]` 为种子 `s` 在评测单位 `u`
+上的配对 log 比（正 = 臂 a 更差），`t[u]` 为该单位实际计分的 token 数。
+半区效应是 token 加权平均
+
+```text
+e_h[s] = sum_{u in h} t[u] * d[s,u] / sum_{u in h} t[u],   h = 0,1.
+```
+
+**划分（与结果无关）**：对每个单位 id 计算 `sha256(salt + "\0" + id)`，
+按哈希序访问；每个单位贪心地放进当前 token 总量较小的半区（并列时放
+单位数较少的一侧，再并列放 half 0）。划分只依赖 id、token 数与固定盐，
+不依赖 `d`，所以对结果盲。默认盐是代码常量
+`csas-unit-split-v1`；盐和 id 顺序、token 数一起被 assignment digest
+绑定，可逐字节重放。
+
+**检验**：在每个半区内对 `e_h[·]` 做单侧精确符号翻转检验（与主检验
+同一个 `_etost_upper_tail` 原语，`n <= 20` 枚举 `2**n`）。要主张
+「预注册方向在两个半区都成立」，零假设是交集
+`H0 = {mean(e_0) >= 0} ∪ {mean(e_1) >= 0}`（以 negative 方向为例）。
+对每个半区各做水平 α 的单侧检验，取
+
+```text
+p_IUT = max(p_half0, p_half1).
+```
+
+这是交集-并集检验：交集零假设成立时至少有一个分量零假设成立，该分量
+以概率 ≤ α 拒绝，所以 `p_IUT <= α` 的 FWER 不超过 α。**不需要两半独立，
+也不需要 Bonferroni**；代价是它只支持「两半都满足」，不能反读成
+「某一半显著」。这与 §151 的曲线 IUT 是同一逻辑，但单位是评测单位
+而不是长度条件。
+
+**划分规格曲线**：同一批数据在多个确定性盐下会得到不同划分。块内对
+`n_salts` 个盐（默认 64，`salt`、`salt#1`、…）重放同一个 IUT，报告
+`n_pass` / `n_estimable`、`pass_fraction`、`p_min` / `p_median` /
+`p_max`、不同 assignment 数与通过盐的样本。它是**描述性规格曲线**：
+`pass_fraction` 不是 p 值，也不能用来挑一个好看的盐。工作量大时按
+`2*2**n` 的确定性预算截断并显式写 `truncated`。
+
+### 154.3 接线：并列报告，不改变冻结判定
+
+- 新增 `explib/_parts/part_88_unit_split_replication.py`：
+  `unit_split_assignment`（纯划分）、`unit_split_replication`（结果块）、
+  `unit_split_replication_block`（无时间戳输入/结果块）、
+  `build_/validate_/write_unit_split_replication`（内容摘要 + 完整重放 +
+  三态写入）与 `unit_split_replication_markdown`。
+- 结果报告 `assignment`（盐、digest、两半的 id/token/占比）、
+  `halves[*].stats/test`、`iut`（`p_iut`、两个分量 p、claim）、
+  `sign_agreement`、`half_difference`（逐种子半区差，t 样式描述区间，
+  不产生 p）、`composition`、`warnings` 与 `split_sensitivity`。
+  `claim` 只取 `both_halves_support_direction` /
+  `direction_consistent_but_not_jointly_significant` /
+  `one_half_significant` / `halves_discordant` / `direction_not_supported`。
+- v12 `finaltest_stats` 在 `doc_sampling` 之后、实际显著性之前，对每个
+  有预注册方向的比较追加 `comparisons[*].unit_split_replication`；单位优先
+  用 article（独立语料单位），不足或缺失时退回 line-level document 并把
+  `granularity`/回退原因写在旁边的
+  `unit_split_replication_unit` 中。**article 与 document 不混池**；某个
+  单位在任一臂/种子上缺失、id 顺序不同或 token 数不同即拒绝该粒度。
+- 新增 `_audit_gates/_parts/part_54_audit_unit_split_replication.py`：
+  优先重放 `analysis_v12/test_stats.json` 的比较块，其次独立
+  `analysis_v12/unit_split_replication.json`；缺块是 `not_applicable`
+  （旧产物），缺文件是 `not_verifiable_locally`，篡改/不可重放是
+  `fail`。接入 `audit_gates.py report` 顶层、CLI 别名与
+  `make unit-split`。
+
+### 154.4 边界：它修复什么，不修复什么
+
+- **这是内部一致性，不是独立复现。** 两个半区是**同一个固定评测切片**的
+  不相交单位，而且共享同一批训练种子；它们不能建立外部效度，也不能替代
+  新语料/新种子的独立复现。
+- **不是新的确认性检验。** 不产生确认 p、不进入冻结 Holm 族、不改变
+  `p_exact_signflip` / `p_holm` / `verified` / `confirmed`，也不修改
+  `confirmation_frozen*.json`。报告措辞只能是「两半都支持该方向」，
+  不能写成「已确认」或「机制成立」。
+- **对称性假设照旧。** 每个半区的精确单侧检验仍要求该半区的逐种子效应
+  关于 0 对称；偏态/重尾下仍可能欠覆盖。IUT 只免掉两半独立假设，不修复
+  非可交换面板。
+- **选择偏差不会因为 IUT 消失。** 划分是数据盲的，但「决定做这个读数」
+  本身是分析选择；因此 `split_sensitivity` 把「换一个盐会不会翻转」摆出来。
+  仍然不能排除 validation 选择、endpoint 选择或 optional stopping。
+- **小面板是分辨率受限。** 半区单位数 < 2、种子数 < `min_n=6`、种子数
+  超过精确上限 `max_n=20`，或半区 token 占比低于 `min_token_share=0.25`
+  时，块报 `not_estimable` 或 `warnings`，不插补、不近似、不伪造
+  「两半一致」。
+- **常数/零效应。** 全零半区效应给出 p=1，`claim` 为
+  `direction_not_supported`，不冒充「没有效应」；常数非零效应在
+  `n < 6` 时同样受分辨率限制。
+- **不是半区之间的异质性检验。** `half_difference` 是描述量（逐种子
+  半区差 + t 样式区间），没有 p、不进任何族；不能把「半区差不大」写成
+  「两半等价」。
+- **旧产物不回填。** 旧 `test_stats.json` 没有该块时审计报
+  `not_applicable`；不反推、不改写旧结论。
+
+### 154.5 入口与验证
+
+```bash
+python -m pytest -q test_review_part_94.py
+python audit_gates.py unit_split_replication        # 默认 analysis_v12/test_stats.json
+python audit_gates.py unit_split_replication PATH   # 独立 artifact / block
+python audit_gates.py split_half                    # 别名
+make unit-split
+python -m pytest -q                                 # 完整 CPU 套件
+```
+
+`test_review_part_94.py` 13 项覆盖：划分确定性与结果盲（同输入同 digest、
+换盐不同 digest、单位两半互斥且覆盖全部）；token 贪心平衡与重复 id /
+非正 token / 长度不齐 / 空盐的 fail-closed；单侧精确 p 与独立暴力枚举
+逐值对拍、方向相反向量与取负的等价；IUT 等于两分量最大值、全同向时
+`both_halves_support_direction`、反向时拒绝；效应集中在一半时
+`halves_discordant` 且不产生「两半」主张；非有限行整颗丢弃并具名、
+block 内以 `null` 严格 JSON 存储且重放一致；`min_n` / `max_n` /
+`min_units` / 无方向的 not_estimable/not_applicable；全零面板 p=1；
+artifact 的 hash/重放/篡改/缺键/夹带冻结字段；writer 的
+no-op/conflict/overwrite；split 敏感性计数与 `n_salts=0` 关闭；
+markdown 表格与边界；audit gate 的 embedded/standalone/error/legacy/
+missing/tamper 六态；v12 `finaltest_stats` 真的追加块且
+`p_iut == max(分量 p)`、article 粒度与冻结字段不受影响；
+CLI/Makefile/`_PARTS` 接线与 `.github`/README 仍在。完整 CPU 套件在本轮
+最终树通过。

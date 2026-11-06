@@ -154,6 +154,7 @@ _PARTS = [
 'part_85_budget_ablation.py',
 'part_86_curve_inference.py',
 'part_87_exact_signflip_ci.py',
+'part_88_unit_split_replication.py',
 ]
 
 load_root_package(globals(), __file__, _PARTS,

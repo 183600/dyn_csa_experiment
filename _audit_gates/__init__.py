@@ -42,6 +42,7 @@ _PARTS = [
 'part_51_audit_budget_ablation.py',
 'part_52_audit_curve_inference.py',
 'part_53_audit_exact_signflip_ci.py',
+'part_54_audit_unit_split_replication.py',
 'part_05_audit_confirmation_verdicts.py',
 'part_08_audit_missingness.py',
 'part_09_audit_trajectory.py',

@@ -1996,6 +1996,7 @@ def run_report(out='audit_report.json'):
     res['budget_ablation'] = audit_budget_ablation(verbose=False)
     res['curve_inference'] = audit_curve_inference(verbose=False)
     res['exact_signflip_ci'] = audit_exact_signflip_ci(verbose=False)
+    res['unit_split_replication'] = audit_unit_split_replication(verbose=False)
     res['data_exposure'] = audit_data_exposure()
     if str(os.environ.get('CSA_REPLAY_IN_REPORT', '')).strip().lower() in (
             '1', 'true', 'yes', 'on'):
@@ -2187,6 +2188,14 @@ def _run_cli():
                   'signflip_ci': audit_exact_signflip_ci,
                   'seed_ci': audit_exact_signflip_ci,
                   'exact_seed_ci': audit_exact_signflip_ci})
+    _cmds.update({'unit_split_replication': audit_unit_split_replication,
+                  'unit_split_replication_artifact': audit_unit_split_replication_artifact,
+                  'unit_split_replication_replay': audit_unit_split_replication_artifact,
+                  'unit_split_replication_validation': audit_unit_split_replication_artifact,
+                  'split_half': audit_unit_split_replication,
+                  'split_half_replication': audit_unit_split_replication,
+                  'unit_split': audit_unit_split_replication,
+                  'unit_halves': audit_unit_split_replication})
     _arg = sys.argv[1] if len(sys.argv) > 1 else 'report'
     if _arg in ('-h', '--help'):
         print(__doc__)
@@ -2287,7 +2296,11 @@ def _run_cli():
                 'curve_flatness',
                 'exact_signflip_ci', 'exact_signflip_ci_artifact',
                 'exact_signflip_ci_replay', 'exact_signflip_ci_validation',
-                'exact_ci', 'signflip_ci', 'seed_ci', 'exact_seed_ci'):
+                'exact_ci', 'signflip_ci', 'seed_ci', 'exact_seed_ci',
+                'unit_split_replication', 'unit_split_replication_artifact',
+                'unit_split_replication_replay',
+                'unit_split_replication_validation', 'split_half',
+                'split_half_replication', 'unit_split', 'unit_halves'):
         _r = _cmds[_arg](*_pos)
     elif _arg in ('test_access', 'test_access_audit', 'heldout', 'test_looks',
                   'environment_identity', 'environment', 'env_drift',

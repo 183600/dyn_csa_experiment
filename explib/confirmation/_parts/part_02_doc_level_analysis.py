@@ -750,6 +750,124 @@ def _doc_level_analysis(recs_a, recs_b, common, Ln, primary_deltas=None):
     return out
 
 
+def _unit_split_replication_for(recs_a, recs_b, common, Ln, *, direction,
+                                alpha=0.05, min_n=6, min_units=4, n_salts=32):
+    """Paired log-PPL rows for the data-blind split-half consistency readout.
+
+    The unit is the article when every arm/seed cell carries article-level
+    cells (the independent corpus unit) and there are enough of them; it falls
+    back to the line-level document, and refuses rather than mixing the two
+    estimands.  Every seed must carry the same unit vector and the same
+    per-unit token counts across both arms, otherwise the paired rows are
+    refused.  A non-finite per-unit PPL becomes ``null`` and lets the library
+    drop that whole seed by name (never a positional pairing).
+    """
+    if direction not in ('positive', 'negative'):
+        return ({
+            'kind': 'unit_split_replication_error',
+            'status': 'not_applicable',
+            'reason': ('no pre-registered direction; a both-halves directional '
+                       'claim is undefined without one'),
+        }, None)
+    common = list(common or [])
+    if len(common) < 2:
+        return ({
+            'kind': 'unit_split_replication_error',
+            'status': 'not_estimable',
+            'reason': f'fewer than 2 usable seeds ({len(common)})',
+        }, None)
+
+    def _cell(recs, seed):
+        bl = (recs.get(seed) or {}).get('by_len') or {}
+        return bl.get(Ln, bl.get(str(Ln)))
+
+    def _extract(granularity):
+        if granularity == 'article':
+            ppl_key, tok_key, ids_key = ('ppl_per_article',
+                                         'n_tokens_per_article',
+                                         'article_ids')
+        else:
+            ppl_key, tok_key, ids_key = ('ppl_per_doc', 'n_tokens_per_doc',
+                                         'doc_ids')
+        a_rows, b_rows = [], []
+        for seed in common:
+            ca, cb = _cell(recs_a, seed), _cell(recs_b, seed)
+            if not isinstance(ca, dict) or not isinstance(cb, dict):
+                return None, f'missing cell at L{Ln} for seed {seed}'
+            for side, cell in (('a', ca), ('b', cb)):
+                for key in (ppl_key, tok_key, ids_key):
+                    if not isinstance(cell.get(key), list) or not cell.get(key):
+                        return None, f'{side} seed {seed} lacks {key}'
+            a_rows.append(ca)
+            b_rows.append(cb)
+        n_units = len(a_rows[0][ppl_key])
+        if n_units < int(min_units):
+            return None, (f'{n_units} {granularity} units is below the '
+                          f'configured min_units={min_units}')
+        ref_ids = a_rows[0][ids_key]
+        ref_tok = a_rows[0][tok_key]
+        if len(ref_ids) != n_units or len(ref_tok) != n_units:
+            return None, f'{granularity} ids/tokens are not aligned with the PPL vector'
+        if len(set(ref_ids)) != n_units:
+            return None, f'{granularity} ids are not unique'
+        for cell in a_rows + b_rows:
+            if (len(cell[ppl_key]) != n_units or len(cell[tok_key]) != n_units
+                    or len(cell[ids_key]) != n_units):
+                return None, f'{granularity} vector lengths differ across cells'
+            if cell[ids_key] != ref_ids:
+                return None, f'{granularity} id order differs across arm/seed cells'
+            if cell[tok_key] != ref_tok:
+                return None, (f'per-{granularity} token counts differ across '
+                              'arm/seed cells')
+        log_rows = []
+        for ca, cb in zip(a_rows, b_rows):
+            row = []
+            for i in range(n_units):
+                try:
+                    la = math.log(float(ca[ppl_key][i]))
+                    lb = math.log(float(cb[ppl_key][i]))
+                except (TypeError, ValueError, OverflowError):
+                    row.append(None)
+                    continue
+                value = la - lb
+                row.append(float(value) if math.isfinite(value) else None)
+            log_rows.append(row)
+        return {
+            'granularity': granularity,
+            'ids': [str(x) for x in ref_ids],
+            'tokens': [float(x) for x in ref_tok],
+            'log_ratios': log_rows,
+        }, None
+
+    article, article_reason = _extract('article')
+    if article is not None:
+        chosen, gran_note = article, None
+    else:
+        document, document_reason = _extract('document')
+        if document is None:
+            return ({
+                'kind': 'unit_split_replication_error',
+                'status': 'not_estimable',
+                'reason': ('no complete article- or document-level cells: '
+                           f'article: {article_reason}; document: {document_reason}'),
+            }, None)
+        chosen = document
+        gran_note = (f'article-level cells unavailable or too few '
+                     f'({article_reason}); fell back to the document unit')
+    try:
+        block = L.unit_split_replication_block(
+            chosen['log_ratios'], chosen['tokens'], unit_ids=chosen['ids'],
+            seeds=[int(s) for s in common], direction=direction,
+            alpha=alpha, min_n=min_n, min_units=min_units, n_salts=n_salts)
+    except (ValueError, TypeError) as exc:
+        return ({
+            'kind': 'unit_split_replication_error',
+            'status': 'not_estimable',
+            'reason': f'{type(exc).__name__}: {exc}',
+        }, {'granularity': chosen['granularity'], 'note': gran_note})
+    return block, {'granularity': chosen['granularity'], 'note': gran_note}
+
+
 def _length_interaction_analysis(recs_a, recs_b, common, lengths, *, primary_len=None,
                                  alpha=0.05, min_n=6):
     """Paired effect modification of the arm contrast across evaluation lengths.
