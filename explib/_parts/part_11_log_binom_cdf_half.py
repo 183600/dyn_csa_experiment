@@ -1211,6 +1211,45 @@ def _binom_logpmf(k, n, p):
     return (_binom_log_comb(n, k) + k * math.log(p) + q_term)
 
 
+def _binom_lower_step_ratio(i, n, p):
+    """P(X=i-1)/P(X=i) without converting a huge ``n`` to float.
+
+    The direct form is used while it is representable (it preserves the
+    ordinary-case rounding).  When ``n`` is beyond float64, ``n - i + 1.0``
+    raises OverflowError even though the ratio is a small ordinary number;
+    the log form keeps the same ratio without materialising the integer as a
+    float.  ``p`` is in (0, 1] here, so ``log(p)`` is finite.
+    """
+    num = float(i) * (1.0 - p)
+    den = _binom_mean_safe(n - i + 1, p)
+    if math.isfinite(num) and math.isfinite(den) and den > 0.0:
+        ratio = num / den
+        if math.isfinite(ratio):
+            return ratio
+    log_ratio = (math.log(float(i)) + math.log1p(-p)
+                 - _log_int(n - i + 1) - math.log(p))
+    try:
+        return float(math.exp(log_ratio))
+    except OverflowError:
+        return float('inf')
+
+
+def _binom_upper_step_ratio(i, n, p):
+    """P(X=i+1)/P(X=i) for huge ``n`` without an int-to-float overflow."""
+    num = _binom_mean_safe(n - i, p)
+    den = float(i + 1) * (1.0 - p)
+    if math.isfinite(num) and math.isfinite(den) and den > 0.0:
+        ratio = num / den
+        if math.isfinite(ratio):
+            return ratio
+    log_ratio = (_log_int(n - i) - math.log(float(i + 1))
+                 + math.log(p) - math.log1p(-p))
+    try:
+        return float(math.exp(log_ratio))
+    except OverflowError:
+        return float('inf')
+
+
 def _binom_cdf_exact_lower(k, n, p):
     """P(Bin(n,p) <= k) for k below the mean, summed away from the mode.
 
@@ -1221,12 +1260,11 @@ def _binom_cdf_exact_lower(k, n, p):
     lp = _binom_logpmf(k, n, p)
     if lp < -745.0:
         return 0.0
-    q = 1.0 - p
     term = math.exp(lp)
     total = term
     i = int(k)
     while i > 0:
-        ratio = (i / (n - i + 1.0)) * (q / p)
+        ratio = _binom_lower_step_ratio(i, n, p)
         term *= ratio
         i -= 1
         total += term
@@ -1240,12 +1278,11 @@ def _binom_sf_exact_upper(k, n, p):
     lp = _binom_logpmf(k, n, p)
     if lp < -745.0:
         return 0.0
-    q = 1.0 - p
     term = math.exp(lp)
     total = term
     i = int(k)
     while i < n:
-        ratio = ((n - i) / (i + 1.0)) * (p / q)
+        ratio = _binom_upper_step_ratio(i, n, p)
         term *= ratio
         i += 1
         total += term
@@ -1413,6 +1450,11 @@ def _binomial_cdf_stable(k, n, p):
         # derivative is ~n*pmf.  Close to the mean the direct lower beta
         # avoids the fold; further out the exact lower sum avoids the
         # direct path's loss of precision as the lower tail approaches one.
+        if n.bit_length() > 1023:
+            # ``float(n - k)`` is not representable, but the tail sum is
+            # still an ordinary probability.  k < mu is finite on this
+            # branch, so the exact walk has at most k ordinary-sized steps.
+            return _binom_cdf_exact_lower(k, n, p)
         if p <= 1e-5:
             _var = mu * (1.0 - p)
             if _var > 0.0 and k >= mu - 0.55 * math.sqrt(_var):
@@ -1457,21 +1499,57 @@ def _binomial_sf_stable(k, n, p):
     if n <= _BINOMIAL_OLD_MAX_N:
         return float(_betai_nr(float(k), float(n - k + 1), p))
     if min(k, n - k) <= _BINOMIAL_EXACT_INDEX_MAX:
+        if n.bit_length() > 1023:
+            # As in the CDF branch: do not turn an exact tail into a
+            # ``float(n - k)`` OverflowError just because n is large.
+            return _binom_sf_exact_upper(k, n, p)
         return float(_betai_nr(float(k), float(n - k + 1), p))
     return _binom_edgeworth_sf(k, n, p)
 
 
+def _is_integral_value(value):
+    """Whether ``value`` is an exact integer without forcing a float cast.
+
+    ``float(10**4000)`` raises OverflowError, but the value is still an exact
+    integer and the binomial dispatcher below can use it directly.
+    """
+    if isinstance(value, numbers.Integral):
+        return True
+    try:
+        return math.isfinite(value) and float(value).is_integer()
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
 def _betai(a, b, x):
     """正则化不完全贝塔 I_x(a,b)。"""
-    if (not (a > 0.0 and b > 0.0) or not math.isfinite(a)
-            or not math.isfinite(b) or not math.isfinite(x)):
+    # Do the sign and finiteness tests without an unconditional float cast:
+    # an exact Python integer beyond float64 is still a valid (finite) beta
+    # shape parameter, and ``math.isfinite(10**4000)`` raises OverflowError.
+    try:
+        if not (a > 0 and b > 0):
+            return float('nan')
+    except (TypeError, ValueError, OverflowError):
         return float('nan')
-    if x <= 0.0:
-        return 0.0
-    if x >= 1.0:
-        return 1.0
+    for _shape in (a, b):
+        if not _is_integral_value(_shape):
+            try:
+                if not math.isfinite(_shape):
+                    return float('nan')
+            except (TypeError, ValueError, OverflowError):
+                return float('nan')
+    try:
+        if x <= 0:
+            return 0.0
+        if x >= 1:
+            return 1.0
+        x = float(x)
+        if not math.isfinite(x):
+            return float('nan')
+    except (TypeError, ValueError, OverflowError):
+        return float('nan')
     if (a >= 1.0 and b >= 1.0 and a + b >= 1000000.0
-            and float(a).is_integer() and float(b).is_integer()):
+            and _is_integral_value(a) and _is_integral_value(b)):
         n_binom = int(a) + int(b) - 1
         return _binomial_sf_stable(int(a), n_binom, float(x))
     return _betai_nr(a, b, x)
