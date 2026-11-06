@@ -555,14 +555,17 @@ def _repro_curve_payload(rec, base):
         'sha256': _repro_curve_sha(rec.get('curve_sha256')),
         'ppl_sha256': _repro_curve_sha(rec.get('ppl_history_sha256')),
         'stats': _repro_curve_stats(rec), 'problems': [], 'path': None,
+        'digest_invalid': False,
     }
     for kind in ('losses', 'ppl_history'):
         raw = rec.get(kind)
         if isinstance(raw, list) and raw:
             out.update(values=raw, kind=kind, source='inline')
             return out
+    ref_key = 'curve_ref'
     ref = rec.get('curve_ref')
     if not isinstance(ref, str) or not ref.strip():
+        ref_key = 'ppl_history_ref'
         ref = rec.get('ppl_history_ref')
     if isinstance(ref, str) and ref.strip():
         ref = ref.strip()
@@ -594,9 +597,11 @@ def _repro_curve_payload(rec, base):
         out['path'] = path
         if path is not None:
             try:
-                with open(path, encoding='utf-8') as fh:
-                    doc = json.load(fh)
-            except (OSError, ValueError) as exc:
+                with open(path, 'rb') as fh:
+                    raw_bytes = fh.read()
+                file_sha = hashlib.sha256(raw_bytes).hexdigest()
+                doc = json.loads(raw_bytes.decode('utf-8'))
+            except (OSError, ValueError, UnicodeDecodeError) as exc:
                 out['problems'].append(
                     f'curve sidecar {ref!r} is unreadable '
                     f'({type(exc).__name__}: {exc})')
@@ -606,6 +611,32 @@ def _repro_curve_payload(rec, base):
                         f'curve sidecar {ref!r} is a {type(doc).__name__}, '
                         'not a JSON object')
                 else:
+                    # A recorded digest is only identity evidence if it still
+                    # describes the bytes on disk.  A stale/tampered sidecar
+                    # (or a summary copied without its curve file) must not
+                    # let two different arrays claim the same digest.
+                    claimed = []
+                    if ref_key == 'curve_ref':
+                        claimed.append(('sha256', 'curve_sha256'))
+                        ph_ref = rec.get('ppl_history_ref')
+                        if (not isinstance(ph_ref, str) or not ph_ref.strip()
+                                or ph_ref.strip() == ref):
+                            claimed.append(('ppl_sha256',
+                                            'ppl_history_sha256'))
+                    else:
+                        claimed.append(('ppl_sha256', 'ppl_history_sha256'))
+                        c_ref = rec.get('curve_ref')
+                        if (not isinstance(c_ref, str) or not c_ref.strip()
+                                or c_ref.strip() == ref):
+                            claimed.append(('sha256', 'curve_sha256'))
+                    for slot, label in claimed:
+                        recorded = out[slot]
+                        if recorded is not None and recorded != file_sha:
+                            out[slot] = None
+                            out['digest_invalid'] = True
+                            out['problems'].append(
+                                f'{label} does not match the sidecar bytes '
+                                f'for {ref!r}')
                     for kind in ('losses', 'ppl_history'):
                         raw = doc.get(kind)
                         if isinstance(raw, list) and raw:
@@ -637,6 +668,26 @@ def _repro_curve_array(values):
             return None, (f'element {i} is not numeric '
                           f'({type(exc).__name__}: {exc})')
     return out, None
+
+
+def _repro_curve_max_abs_diff(aa, bb):
+    """Largest finite pairwise difference, or None if it is unrepresentable.
+
+    ``aa`` and ``bb`` can each be near float64's limit with opposite signs;
+    ``a - b`` then overflows to inf even though both inputs are finite.  The
+    report is strict JSON, so an unrepresentable magnitude must be withheld
+    (None) rather than serialised as ``Infinity``.  Non-finite entries are
+    missing/diverged markers and are not part of a numeric magnitude.
+    """
+    finite = np.isfinite(aa) & np.isfinite(bb)
+    if not np.any(finite):
+        return None
+    with np.errstate(over='ignore', invalid='ignore'):
+        diffs = np.abs(aa[finite] - bb[finite])
+    if not diffs.size:
+        return None
+    value = float(np.max(diffs))
+    return value if math.isfinite(value) else None
 
 
 def _repro_curve_values_compare(a_values, b_values, *, rtol, atol):
@@ -676,30 +727,38 @@ def _repro_curve_values_compare(a_values, b_values, *, rtol, atol):
                 'first_difference_index': None, 'max_abs_diff': 0.0,
                 'byte_identical': True,
                 'detail': 'every recorded curve value is identical'}
-    with np.errstate(invalid='ignore', over='ignore'):
-        close = np.isclose(aa, bb, rtol=rtol, atol=atol, equal_nan=True)
+    # Tolerance must be symmetric: comparing A->B and B->A cannot disagree
+    # about whether the same two trajectories are close.  ``np.isclose``
+    # scales by |bb| only, while the declared contract (and the scalar-summary
+    # comparator) uses max(|a|,|b|).  Keep non-finite entries as missing
+    # markers instead of letting inf satisfy an inf tolerance.
+    close = np.isnan(aa) & np.isnan(bb)
+    finite = np.isfinite(aa) & np.isfinite(bb)
+    if np.any(finite):
+        with np.errstate(invalid='ignore', over='ignore'):
+            scale = np.maximum(np.abs(aa[finite]), np.abs(bb[finite]))
+            tolerance = atol + rtol * scale
+            difference = np.abs(aa[finite] - bb[finite])
+            close[finite] = difference <= tolerance
     if bool(np.all(close)):
-        finite = np.isfinite(aa) & np.isfinite(bb)
-        diffs = np.abs(aa[finite] - bb[finite]) if np.any(finite) else np.array([])
         return {'status': 'within_tolerance', 'method': 'curve_values',
                 'n_points_original': int(aa.size),
                 'n_points_rerun': int(bb.size),
                 'n_nonfinite_original': n_a, 'n_nonfinite_rerun': n_b,
                 'first_difference_index': None,
-                'max_abs_diff': (float(np.max(diffs)) if diffs.size else None),
+                'max_abs_diff': _repro_curve_max_abs_diff(aa, bb),
                 'byte_identical': False,
-                'detail': ('every curve value is within atol + rtol*|value|; '
-                           'the trajectories are close, not identical')}
+                'detail': ('every curve value is within atol + rtol*'
+                           'max(|original|,|rerun|); the trajectories are '
+                           'close, not identical')}
     bad = np.flatnonzero(~close)
     first = int(bad[0]) if bad.size else None
-    finite = np.isfinite(aa) & np.isfinite(bb)
-    diffs = np.abs(aa[finite] - bb[finite]) if np.any(finite) else np.array([])
     return {'status': 'mismatch', 'method': 'curve_values',
             'n_points_original': int(aa.size),
             'n_points_rerun': int(bb.size),
             'n_nonfinite_original': n_a, 'n_nonfinite_rerun': n_b,
             'first_difference_index': first,
-            'max_abs_diff': (float(np.max(diffs)) if diffs.size else None),
+            'max_abs_diff': _repro_curve_max_abs_diff(aa, bb),
             'byte_identical': False,
             'detail': (f'curve differs at index {first}'
                        if first is not None else 'curve differs')}
@@ -763,6 +822,8 @@ def _repro_curve_dimension(original, rerun, *, rtol, atol,
         'sha256_rerun': b['sha256'] or b['ppl_sha256'],
         'n_nonfinite_original': a['stats'].get('curve_n_nonfinite'),
         'n_nonfinite_rerun': b['stats'].get('curve_n_nonfinite'),
+        'digest_invalid': bool(a.get('digest_invalid')
+                               or b.get('digest_invalid')),
         'first_difference_index': None, 'max_abs_diff': None,
         'detail': None,
     }
@@ -823,6 +884,18 @@ def _repro_curve_dimension(original, rerun, *, rtol, atol,
         cmp = _repro_curve_values_compare(a['values'], b['values'],
                                           rtol=rtol, atol=atol)
         out.update(cmp)
+        # A digest that no longer matches the bytes on disk is not identity
+        # evidence.  Keep the numeric verdict, but never call the run
+        # byte-identical on a stale/tampered sidecar.
+        if out['digest_invalid']:
+            out['byte_identical'] = False
+            if out['status'] == 'exact':
+                out['detail'] = _detail(
+                    'numeric curve values are identical but a recorded '
+                    'curve digest does not match the sidecar bytes')
+            else:
+                out['detail'] = _detail(out.get('detail'))
+            return out
         # The sidecar digest covers more than the loss array (delta_trace /
         # ppl_history / opt_diag).  Equal numbers with unequal bytes are not
         # a bit-identical run, so keep the digest verdict separate.
@@ -850,6 +923,15 @@ def _repro_curve_dimension(original, rerun, *, rtol, atol,
                    detail=_detail(
                        'a recorded curve digest is present but the '
                        'curve payload is unavailable on at least one side'))
+        return out
+
+    if problems:
+        # A reference or sidecar that cannot be read must not be silently
+        # downgraded to a scalar-summary match: the caller asked to compare
+        # the recorded trajectory, and that trajectory is unavailable.
+        out.update(status='unverified', method='none',
+                   detail=_detail('a curve reference or sidecar is unusable; '
+                                  'the scalar summary is not substituted'))
         return out
 
     cmp = _repro_curve_stats_compare(a['stats'], b['stats'],

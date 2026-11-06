@@ -490,3 +490,95 @@ def test_curve_ref_cannot_escape_the_summary_directory():
         assert diag['dimensions']['curve']['status'] == 'unverified', diag
         assert 'resolves outside' in (diag['dimensions']['curve']['detail'] or ''), diag
         assert rep['bit_identical'] is False and rep['n_curve_unverified'] == 1, rep
+
+
+def test_extreme_curve_difference_never_serialises_infinity():
+    # Two finite values near float64's limit have an unrepresentable absolute
+    # difference.  The curve is still a definite mismatch, but the report is
+    # strict JSON, so the magnitude must be withheld instead of becoming inf.
+    a = _record(losses=(1e308, 1.0))
+    b = _record(losses=(-1e308, 1.0))
+    d = L.reproduction_diagnosis(a, b)
+    curve = d['dimensions']['curve']
+    assert d['verdict'] == 'curve_changed' and d['reproduced'] is False, d
+    assert curve['status'] == 'mismatch' and curve['first_difference_index'] == 0, curve
+    assert curve['max_abs_diff'] is None, curve
+    json.dumps(d, sort_keys=True, allow_nan=False)
+    rep = L.compare_reproductions({'csa_dynamic::seed0': a},
+                                  {'csa_dynamic::seed0': b})
+    assert rep['verdict'] == 'not_reproduced' and rep['counts'] == {
+        'curve_changed': 1}, rep
+    json.dumps(rep, sort_keys=True, allow_nan=False)
+
+
+def test_unreadable_curve_sidecar_is_not_downgraded_to_scalar_summary():
+    with tempfile.TemporaryDirectory() as td:
+        dirs = [os.path.join(td, name) for name in ('a', 'b')]
+        for root in dirs:
+            os.makedirs(root)
+            cell = _record()
+            cell.pop('losses', None)
+            cell.update({
+                'curve_ref': 'missing.json',
+                'curve_n_points': 3, 'curve_first': 3.0,
+                'curve_last': 1.0, 'curve_best': 1.0,
+                'curve_n_nonfinite': 0,
+            })
+            with open(os.path.join(root, 'summary.json'), 'w',
+                      encoding='utf-8') as f:
+                json.dump({'csa_dynamic::seed0': cell}, f)
+        rep = L.compare_reproductions(dirs[0], dirs[1])
+        diag = rep['cells']['csa_dynamic::seed0']
+        curve = diag['dimensions']['curve']
+        assert curve['status'] == 'unverified', curve
+        assert curve['coarse'] is False, curve
+        assert 'not substituted' in (curve['detail'] or ''), curve
+        assert diag['curve_compared'] is False, diag
+        assert rep['n_curve_compared'] == 0, rep
+        assert rep['n_curve_unverified'] == 1 and rep['bit_identical'] is False, rep
+
+
+def test_recorded_curve_digest_must_match_the_sidecar_bytes():
+    with tempfile.TemporaryDirectory() as td:
+        a_dir = os.path.join(td, 'a')
+        b_dir = os.path.join(td, 'b')
+        c_dir = os.path.join(td, 'c')
+        os.makedirs(a_dir)
+        os.makedirs(b_dir)
+        os.makedirs(c_dir)
+        base = _record()
+        # The recorded digest is intentionally stale in all three panels: it
+        # cannot make equal bytes out of different sidecars, nor can it turn
+        # an unverified serialization into a bit-identical claim.
+        _write_curve_panel(a_dir, base, (3.0, 2.5, 2.3), sha='0' * 64)
+        _write_curve_panel(b_dir, base, (3.0, 2.5, 2.3), sha='0' * 64)
+        _write_curve_panel(c_dir, base, (9.0, 9.0, 9.0), sha='0' * 64)
+
+        same = L.compare_reproductions(a_dir, b_dir)
+        diag = same['cells']['csa_dynamic::seed0']
+        curve = diag['dimensions']['curve']
+        assert curve['digest_invalid'] is True, curve
+        assert curve['status'] == 'exact' and curve['byte_identical'] is False, curve
+        assert diag['verdict'] == 'within_tolerance' and diag['bit_identical'] is False, diag
+        assert same['bit_identical'] is False, same
+
+        changed = L.compare_reproductions(a_dir, c_dir)
+        diag = changed['cells']['csa_dynamic::seed0']
+        assert diag['dimensions']['curve']['status'] == 'mismatch', diag
+        assert changed['verdict'] == 'not_reproduced', changed
+        assert changed['counts'] == {'curve_changed': 1}, changed['counts']
+
+
+def test_curve_tolerance_is_symmetric_between_original_and_rerun():
+    # np.isclose scales by its second argument, which made the same pair
+    # "close" one way and "different" the other.  The declared tolerance uses
+    # max(|original|,|rerun|), so both directions must agree.
+    a = _record(losses=(1.0 + 1.0000004e-6,))
+    b = _record(losses=(1.0,))
+    forward = L.reproduction_diagnosis(a, b, rtol=1e-6)
+    reverse = L.reproduction_diagnosis(b, a, rtol=1e-6)
+    assert forward['dimensions']['curve']['status'] == 'within_tolerance', forward
+    assert reverse['dimensions']['curve']['status'] == 'within_tolerance', reverse
+    assert forward['verdict'] == reverse['verdict'] == 'within_tolerance', (
+        forward, reverse)
+    assert forward['dimensions']['curve']['max_abs_diff'] is not None, forward
