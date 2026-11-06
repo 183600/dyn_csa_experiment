@@ -422,3 +422,68 @@ def test_meta_analysis_mixed_subfloor_and_ordinary_effects_share_a_scale():
                         rel_tol=1e-12), meta['fixed_effect']
     assert math.isfinite(meta['fixed_effect']['se']), meta['fixed_effect']
     json.dumps(meta, allow_nan=False)
+
+
+def test_paired_nll_recovers_a_finite_ratio_when_the_row_sum_overflows():
+    # Each per-document NLL is finite, but the three-document row sum is
+    # beyond float64.  The token-pooled CE (and therefore the PPL) is still
+    # representable: 1e308 / 1e306 ~ 275.  The cluster interval and the
+    # delete-one-unit influence must not collapse to "unavailable" merely
+    # because NumPy's accumulator overflowed.
+    from fractions import Fraction
+
+    A = np.array([[1e308, 1.1e308, 1.2e308],
+                  [1.05e308, 1.15e308, 1.25e308]])
+    B = np.array([[0.9e308, 1.0e308, 1.1e308],
+                  [0.95e308, 1.05e308, 1.15e308]])
+    tokens = [3 * 10 ** 305, 4 * 10 ** 305, 5 * 10 ** 305]
+    with np.errstate(over='ignore', invalid='ignore'):
+        assert not np.isfinite(A.sum(axis=1)).all()
+
+    def _ce_rows(matrix):
+        total = sum(Fraction(int(t)) for t in tokens)
+        return [sum((Fraction(float(v)) for v in row), Fraction(0, 1)) / total
+                for row in matrix]
+
+    ce_a = _ce_rows(A)
+    ce_b = _ce_rows(B)
+    expected_lr = float(sum((a - b for a, b in zip(ce_a, ce_b)),
+                            Fraction(0, 1)) / len(ce_a))
+    ci = L._paired_nll_doc_ci(A, B, tokens)
+    assert ci is not None, 'a representable pooled ratio was discarded'
+    assert math.isclose(ci['delta_log_ratio'], expected_lr,
+                        rel_tol=1e-12, abs_tol=1e-12), ci
+    assert math.isfinite(ci['delta_ppl']), ci
+    assert 'row NLL sum' in ci['method'], ci
+    json.dumps(ci, allow_nan=False)
+
+    infl = L.paired_nll_unit_influence(A, B, tokens)
+    assert infl['available'] is True, infl
+    assert math.isclose(infl['full_delta_log_ratio'], expected_lr,
+                        rel_tol=1e-12, abs_tol=1e-12), infl
+    assert infl['n_units_loo_available'] == len(tokens), infl
+    json.dumps(infl, allow_nan=False)
+
+    two = L.paired_nll_two_way_bootstrap(
+        A, B, tokens, n_boot=40, seed=7)
+    assert two['status'] == 'ok', two
+    assert math.isclose(two['delta_log_ratio'], expected_lr,
+                        rel_tol=1e-12, abs_tol=1e-12), two
+    assert two['n_boot_valid'] >= 20, two
+    json.dumps(two, allow_nan=False)
+
+    # The order-dependence readout shares the same point estimator and must
+    # use the exact-rational influence path instead of withholding the point.
+    D = 8
+    A8 = np.array([[1e308 * (1.0 + 0.01 * i) for i in range(D)],
+                   [1.05e308 * (1.0 + 0.01 * i) for i in range(D)]])
+    B8 = np.array([[0.9e308 * (1.0 + 0.01 * i) for i in range(D)],
+                   [0.95e308 * (1.0 + 0.01 * i) for i in range(D)]])
+    tokens8 = [10 ** 306 * (i + 1) for i in range(D)]
+    order = L.pooled_order_inference(
+        A8, B8, tokens8, n_boot=40, n_perm=0)
+    assert order['status'] == 'ok', order
+    assert math.isfinite(order['point_ppl']), order
+    assert order['point_log_ratio'] is not None, order
+    assert 'row NLL sum' in order['upstream'], order
+    json.dumps(order, allow_nan=False)

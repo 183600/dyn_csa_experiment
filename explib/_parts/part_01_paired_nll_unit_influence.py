@@ -103,10 +103,20 @@ def paired_nll_unit_influence(nll_a, nll_b, n_tokens, *, unit_ids=None,
     full_delta = float(full['delta_ppl'])
     full_lr = float(full['delta_log_ratio'])
 
-    sum_a = A.sum(axis=1)
-    sum_b = B.sum(axis=1)
-    ce_a = sum_a / total_tok
-    ce_b = sum_b / total_tok
+    with np.errstate(over='ignore', invalid='ignore'):
+        sum_a = A.sum(axis=1)
+        sum_b = B.sum(axis=1)
+    _extreme_rows = not (np.all(np.isfinite(sum_a))
+                         and np.all(np.isfinite(sum_b)))
+    if _extreme_rows:
+        # The full-fold CI already recovered a finite pooled ratio from these
+        # finite NLLs; the same overflow must not make the influence readout
+        # report "the per-seed pooled PPL overflowed".
+        ce_a = _nll_row_ce(A, total_tok)  # noqa: F821 (part 00)
+        ce_b = _nll_row_ce(B, total_tok)  # noqa: F821 (part 00)
+    else:
+        ce_a = sum_a / total_tok
+        ce_b = sum_b / total_tok
     ea = np.asarray([_safe_exp_ppl(x) for x in ce_a], dtype=float)
     eb = np.asarray([_safe_exp_ppl(x) for x in ce_b], dtype=float)
     if not (np.all(np.isfinite(ea)) and np.all(np.isfinite(eb))):
@@ -121,10 +131,25 @@ def paired_nll_unit_influence(nll_a, nll_b, n_tokens, *, unit_ids=None,
     usable_denom = denom > 0.0
     ce_a_loo = np.full((S, D), np.nan, dtype=float)
     ce_b_loo = np.full((S, D), np.nan, dtype=float)
-    np.divide(sum_a[:, None] - A, denom[None, :], out=ce_a_loo,
-              where=usable_denom[None, :])
-    np.divide(sum_b[:, None] - B, denom[None, :], out=ce_b_loo,
-              where=usable_denom[None, :])
+    if _extreme_rows:
+        # Same delete-one-unit estimand, but keep the intermediate as a ratio:
+        # (sum - nll_i) / (total - tokens_i)
+        #   = (ce - nll_i/total) * total/(total - tokens_i).
+        # The row sum itself is not representable here, while this difference
+        # and the final CE can be.
+        with np.errstate(over='ignore', invalid='ignore', divide='ignore'):
+            _loo_scale = np.where(usable_denom, total_tok / denom, 0.0)
+            ce_a_loo = ((ce_a[:, None] - A / total_tok)
+                        * _loo_scale[None, :])
+            ce_b_loo = ((ce_b[:, None] - B / total_tok)
+                        * _loo_scale[None, :])
+        ce_a_loo[:, ~usable_denom] = np.nan
+        ce_b_loo[:, ~usable_denom] = np.nan
+    else:
+        np.divide(sum_a[:, None] - A, denom[None, :], out=ce_a_loo,
+                  where=usable_denom[None, :])
+        np.divide(sum_b[:, None] - B, denom[None, :], out=ce_b_loo,
+                  where=usable_denom[None, :])
     with np.errstate(over='ignore', invalid='ignore'):
         ea_loo = np.exp(ce_a_loo)
         eb_loo = np.exp(ce_b_loo)
@@ -140,10 +165,23 @@ def paired_nll_unit_influence(nll_a, nll_b, n_tokens, *, unit_ids=None,
     # Delta-method influence, exactly the ``bar`` term that the cluster-robust
     # variance squares.  Kept separate from the exact LOO fold so the report
     # can show local influence even when a fold overflows.
-    psi = (ea[:, None] * (A - ce_a[:, None] * T[None, :]) / total_tok
-           - eb[:, None] * (B - ce_b[:, None] * T[None, :]) / total_tok).mean(axis=0)
-    psi_lr = ((A - ce_a[:, None] * T[None, :])
-              - (B - ce_b[:, None] * T[None, :])).mean(axis=0) / total_tok
+    if _extreme_rows:
+        # Algebraically identical to the expression below; dividing the NLL
+        # and the token count by the (already float) token total first keeps
+        # the (A - ce*T) product representable when either factor is near the
+        # float limit.
+        _tok_fraction = T / total_tok
+        psi = (ea[:, None] * (A / total_tok - ce_a[:, None] * _tok_fraction[None, :])
+               - eb[:, None] * (B / total_tok - ce_b[:, None] * _tok_fraction[None, :])
+               ).mean(axis=0)
+        psi_lr = ((A / total_tok - ce_a[:, None] * _tok_fraction[None, :])
+                  - (B / total_tok - ce_b[:, None] * _tok_fraction[None, :])
+                  ).mean(axis=0)
+    else:
+        psi = (ea[:, None] * (A - ce_a[:, None] * T[None, :]) / total_tok
+               - eb[:, None] * (B - ce_b[:, None] * T[None, :]) / total_tok).mean(axis=0)
+        psi_lr = ((A - ce_a[:, None] * T[None, :])
+                  - (B - ce_b[:, None] * T[None, :])).mean(axis=0) / total_tok
 
     change_ppl = loo_delta - full_delta
     change_lr = loo_lr - full_lr

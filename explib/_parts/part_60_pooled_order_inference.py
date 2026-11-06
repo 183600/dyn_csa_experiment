@@ -891,12 +891,35 @@ def pooled_order_inference(nll_a, nll_b, n_tokens, *, unit_ids=None,
         ce_b = B.sum(axis=1) / total_f
     if not (_po_np.all(_po_np.isfinite(ce_a))
             and _po_np.all(_po_np.isfinite(ce_b))):
-        return {'kind': 'pooled_order_inference',
-                'policy_version': POOLED_ORDER_POLICY['version'],
-                'status': 'not_estimable',
-                'n_units': D, 'n_seeds': S,
-                'reason': ('a per-seed token-pooled mean NLL is not '
-                           'representable; the confidence readout is withheld')}
+        # A finite per-unit NLL can overflow its row sum while the pooled CE
+        # is representable.  Reuse the exact-rational influence path (the same
+        # one used for an unrepresentable token total) instead of discarding
+        # the readout.
+        _extreme = _po_extreme_pooled(A, B, counts)
+        if _extreme is None:
+            return {'kind': 'pooled_order_inference',
+                    'policy_version': POOLED_ORDER_POLICY['version'],
+                    'status': 'not_estimable',
+                    'n_units': D, 'n_seeds': S,
+                    'reason': ('a per-seed token-pooled mean NLL is not '
+                               'representable and the exact-ratio influence '
+                               'is not representable; the confidence readout '
+                               'is withheld')}
+        _psi_x, _q_x, _delta_ppl_x, _delta_log_x = _extreme
+        _out = pooled_order_inference_from_influence(
+            _psi_x, _q_x, delta_ppl=_delta_ppl_x,
+            delta_log_ratio=_delta_log_x,
+            unit_ids=unit_ids, seeds=seeds, n_seeds=S,
+            block_lengths=block_lengths, n_batches=n_batches,
+            n_boot=n_boot, n_perm=n_perm, conf=conf, alpha=alpha,
+            seed=seed, design_effect_tolerance=design_effect_tolerance,
+            material_ci_inflation=material_ci_inflation,
+            order_attestation=order_attestation)
+        _out['upstream'] = (
+            'pooled_order_inference: exact-rational per-seed token-pooled '
+            'NLL influence for a row NLL sum beyond float64; same estimand '
+            'as the primary comparison')
+        return _out
     with _po_np.errstate(over='ignore', invalid='ignore'):
         ea = _po_np.asarray([_safe_exp_ppl(x) for x in ce_a], dtype=float)
         eb = _po_np.asarray([_safe_exp_ppl(x) for x in ce_b], dtype=float)

@@ -993,8 +993,8 @@ def paired_nll_two_way_bootstrap(nll_a, nll_b, n_tokens, *, n_boot=2000,
     if not math.isfinite(total_tok) or total_tok <= 0.0:
         out['reason'] = 'the total token count must be positive'
         return out
-    ce_a = A.sum(axis=1) / total_tok
-    ce_b = B.sum(axis=1) / total_tok
+    ce_a = _nll_row_ce(A, total_tok)  # noqa: F821 (part 00)
+    ce_b = _nll_row_ce(B, total_tok)  # noqa: F821 (part 00)
     ea = np.asarray([_safe_exp_ppl(x) for x in ce_a], dtype=float)
     eb = np.asarray([_safe_exp_ppl(x) for x in ce_b], dtype=float)
     if not (np.all(np.isfinite(ea)) and np.all(np.isfinite(eb))):
@@ -1006,6 +1006,21 @@ def paired_nll_two_way_bootstrap(nll_a, nll_b, n_tokens, *, n_boot=2000,
     out['delta_ppl'] = delta_ppl
     out['delta_log_ratio'] = delta_lr
 
+    # A finite NLL/token panel can still exceed float64 in one matrix product
+    # even though every resampled CE (and PPL) is representable.  The ratio is
+    # invariant to a common positive factor, so the extreme panel is rescaled
+    # for the draws and mapped back through the already finite CE point.
+    _draw_scale = max(float(np.max(np.abs(A))),
+                      float(np.max(np.abs(B))),
+                      float(np.max(T)))
+    _scaled_draws = bool(math.isfinite(_draw_scale) and _draw_scale > 0.0
+                         and (_draw_scale < 1e-100 or _draw_scale > 1e100))
+    if _scaled_draws:
+        _A_work = A / _draw_scale
+        _B_work = B / _draw_scale
+        _T_work = T / _draw_scale
+    else:
+        _A_work, _B_work, _T_work = A, B, T
     rng = np.random.default_rng(_seed)
     draw_ppl = np.full(int(_nb), np.nan, dtype=float)
     draw_lr = np.full(int(_nb), np.nan, dtype=float)
@@ -1020,10 +1035,10 @@ def paired_nll_two_way_bootstrap(nll_a, nll_b, n_tokens, *, n_boot=2000,
         # the token-weighted recomputation one matrix product.
         doc_counts = rng.multinomial(D, np.full(D, 1.0 / D), size=m).astype(float)
         seed_counts = rng.multinomial(S, np.full(S, 1.0 / S), size=m).astype(float)
-        tot = doc_counts @ T
+        tot = doc_counts @ _T_work
         with np.errstate(divide='ignore', invalid='ignore', over='ignore'):
-            nll_a_draw = doc_counts @ A.T
-            nll_b_draw = doc_counts @ B.T
+            nll_a_draw = doc_counts @ _A_work.T
+            nll_b_draw = doc_counts @ _B_work.T
             denom = tot[:, None]
             ppl_a = np.exp(nll_a_draw / denom)
             ppl_b = np.exp(nll_b_draw / denom)

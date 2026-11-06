@@ -1575,14 +1575,17 @@ def _nll_doc_ci(nll_per_row, n_tokens_per_row):
             'ppl_ci95_high': _safe_exp_ppl(ce + _tc * _sem_ce),
             'n_docs': n_docs}
 
-def _paired_nll_doc_ci_extreme(A, B, counts, conf):
-    """Exact-ratio fallback for token totals beyond float64.
+def _paired_nll_doc_ci_extreme(A, B, counts, conf, *,
+                               basis='a token total beyond float64'):
+    """Exact-ratio fallback for an unrepresentable float intermediate.
 
     ``A``/``B`` are the validated ``[n_seeds, n_docs]`` matrices and
     ``counts`` are exact positive Python integers.  The pooled CE, the
     cluster influence and the log-ratio influence are formed as exact
     rationals and rounded once per reported value, so a representable result
-    survives a token total such as ``10**400`` that cannot itself be a float.
+    survives a token total such as ``10**400`` that cannot itself be a float --
+    or a finite row NLL whose float sum overflows even though the token-pooled
+    CE (and therefore the PPL) is representable.
     """
     from fractions import Fraction as _Fraction
     S, D = A.shape
@@ -1623,7 +1626,7 @@ def _paired_nll_doc_ci_extreme(A, B, counts, conf):
            'df': (int(D - 1) if D > 1 else None),
            'method': ('cluster-robust documents (delta method, t df=n_docs-1; '
                       'token-pooled per seed then averaged over seeds; '
-                      'exact-ratio fallback for a token total beyond float64)')}
+                      f'exact-ratio fallback for {basis})')}
     if D < 2:
         out['method'] = ('point estimate only: a cluster-robust interval needs '
                          'at least two documents')
@@ -1681,6 +1684,34 @@ def _paired_nll_doc_ci_extreme(A, B, counts, conf):
                        else None),
     })
     return out
+
+
+def _nll_row_ce(matrix, total_tokens):
+    """Per-row ``sum(row) / total_tokens`` without an overflowing intermediate.
+
+    The ordinary NumPy reduction is kept bit-for-bit.  Only a row whose float
+    sum is non-finite -- while every entry is finite -- is re-summed as exact
+    rationals, because the token-pooled cross-entropy (and hence the PPL) may
+    still be representable.  Callers that already hold validated, finite
+    matrices use this to avoid treating an overflowing accumulator as an
+    unrepresentable measurement.
+    """
+    arr = np.asarray(matrix, dtype=float)
+    with np.errstate(over='ignore', invalid='ignore'):
+        sums = arr.sum(axis=1)
+    if np.all(np.isfinite(sums)):
+        return sums / float(total_tokens)
+    from fractions import Fraction as _Fraction
+    denom = _Fraction(float(total_tokens))
+    out = []
+    for row in arr:
+        try:
+            value = (sum((_Fraction(float(v)) for v in row), _Fraction(0, 1))
+                     / denom)
+            out.append(float(value))
+        except (OverflowError, ValueError, ZeroDivisionError):
+            out.append(float('nan'))
+    return np.asarray(out, dtype=float)
 
 
 def _paired_nll_doc_ci(nll_a, nll_b, n_tokens, *, conf=0.95):
@@ -1761,8 +1792,18 @@ def _paired_nll_doc_ci(nll_a, nll_b, n_tokens, *, conf=0.95):
         _extreme_tokens = True
     if _extreme_tokens:
         return _paired_nll_doc_ci_extreme(A, B, _counts, conf)
-    ce_a = A.sum(axis=1) / total_tok
-    ce_b = B.sum(axis=1) / total_tok
+    with np.errstate(over='ignore', invalid='ignore'):
+        _row_a = A.sum(axis=1)
+        _row_b = B.sum(axis=1)
+    if not (np.all(np.isfinite(_row_a)) and np.all(np.isfinite(_row_b))):
+        # A finite per-document NLL can still overflow a row's float sum while
+        # the token-pooled CE (and PPL) is representable.  The exact-rational
+        # fallback keeps the point and the cluster interval instead of
+        # discarding the whole panel as unmeasurable.
+        return _paired_nll_doc_ci_extreme(
+            A, B, _counts, conf, basis='a row NLL sum beyond float64')
+    ce_a = _row_a / total_tok
+    ce_b = _row_b / total_tok
     ea = np.asarray([_safe_exp_ppl(x) for x in ce_a], dtype=float)
     eb = np.asarray([_safe_exp_ppl(x) for x in ce_b], dtype=float)
     if not (np.all(np.isfinite(ea)) and np.all(np.isfinite(eb))):
