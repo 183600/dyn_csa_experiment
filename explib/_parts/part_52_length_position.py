@@ -250,10 +250,6 @@ def _lpd_max_band_signflip(band_rows, *, alpha):
         return {'status': 'not_estimable',
                 'reason': 'fewer than two common seeds across bands',
                 'n_bands': len(band_rows)}
-    if n > 16:
-        return {'status': 'not_estimable',
-                'reason': f'n={n} exceeds the exact fallback enumeration cap 16',
-                'n_bands': len(band_rows)}
     D = np.asarray([[float(next(item['log_ratio'] for item in row['per_seed']
                               if item['seed'] == s)) for s in seeds]
                     for row in band_rows], dtype=float)
@@ -262,6 +258,23 @@ def _lpd_max_band_signflip(band_rows, *, alpha):
                 'reason': ('at least one band log ratio is not finite, so the '
                            'sign-flip score cannot be enumerated'),
                 'n_bands': len(band_rows)}
+    # A seed column that is exactly zero in every band cannot change the score
+    # statistic: flipping its sign leaves every band sum unchanged, so it only
+    # duplicates patterns.  Count the effective width for the enumeration cap
+    # and enumerate only those columns; a panel padded with zero rows must not
+    # be refused (or pay 2**n) for columns that carry no information.
+    active = np.any(D != 0.0, axis=0)
+    n_effective = int(np.count_nonzero(active))
+    if n_effective > 16:
+        reason = (f'n={n} exceeds the exact fallback enumeration cap 16'
+                  if n_effective == n else
+                  f'{n_effective} non-zero seed column(s) (of n={n} declared) '
+                  'exceed the exact fallback enumeration cap 16')
+        return {'status': 'not_estimable',
+                'reason': reason,
+                'n_bands': len(band_rows),
+                'n': int(n),
+                'n_effective': int(n_effective)}
     # Work on each row's max-abs scale.  The score is scale invariant, and
     # squaring a finite log ratio near the float limit would otherwise turn a
     # perfectly valid family into an inf/nan table (same guard as the primary
@@ -274,15 +287,16 @@ def _lpd_max_band_signflip(band_rows, *, alpha):
     scale = np.sqrt((Dn * Dn).sum(axis=1))
     obs = np.zeros(len(labels), dtype=float)
     obs[nz] = np.abs(Dn[nz].sum(axis=1)) / scale[nz]
-    total = 1 << n
-    bitpos = np.arange(n, dtype=np.int64)[None, :]
+    Dn_eff = Dn[:, active]
+    total = 1 << n_effective
+    bitpos = np.arange(n_effective, dtype=np.int64)[None, :]
     step = max(1, min(total, (1 << 20) // max(len(labels), 1)))
     max_null = []
     for off in range(0, total, step):
         bs = min(step, total - off)
         masks = np.arange(off, off + bs, dtype=np.int64)[:, None]
         signs = np.where((masks & (1 << bitpos)) != 0, 1.0, -1.0)
-        T = np.abs(signs @ Dn.T)
+        T = np.abs(signs @ Dn_eff.T)
         if np.any(nz):
             T[:, nz] = T[:, nz] / scale[nz]
         max_null.append(T.max(axis=1))
@@ -295,6 +309,8 @@ def _lpd_max_band_signflip(band_rows, *, alpha):
         'method': ('exact sign-flip score max-T across position bands '
                    '(constant-band fallback)'),
         'n_bands': len(labels),
+        'n': int(n),
+        'n_effective': int(n_effective),
         'p_family': p_family,
         'critical_value': float(np.quantile(max_null, 1.0 - alpha)),
         'ci_tail_level': None,

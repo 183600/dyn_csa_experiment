@@ -757,15 +757,29 @@ def _usr_clean_rows(log_ratios, tokens, unit_ids, seeds):
     return rows, kept_seeds, dropped, weights, ids, id_source
 
 
+def _usr_nonzero_row_count(rows):
+    """Seed rows that can move a sign-flip sum.
+
+    A row that is exactly zero at every evaluation unit has zero half effects:
+    both signs contribute the same statistic, so it only duplicates patterns.
+    Such padded/unused rows must not consume the exact-enumeration cap.  Rows
+    that partially cancel are still counted here (this is a conservative
+    upper bound), so the guard can only be loosened for exact all-zero rows.
+    """
+    return sum(1 for row in rows if any(value != 0.0 for value in row))
+
+
 def _usr_sensitivity(rows, unit_ids, tokens, *, direction, base_salt, alpha,
                      min_n, max_n, min_units_per_half, n_salts,
                      budget=UNIT_SPLIT_REPLICATION_SENSITIVITY_BUDGET):
     n = len(rows)
-    # The exact test costs two 2**n enumerations per salt, and rebuilding the
-    # two half effects costs n*units float operations.  Count both so a future
-    # panel with many evaluation units does not turn the default sensitivity
-    # curve into an accidental O(salts * n * units) job.
-    per_salt_work = 2 * (1 << int(n)) + int(n) * max(1, len(unit_ids))
+    n_nonzero = _usr_nonzero_row_count(rows)
+    # The exact test costs two 2**n_nonzero enumerations per salt (zero rows
+    # are sign-neutral), and rebuilding the two half effects still costs
+    # n*units float operations.  Count both so a future panel with many
+    # evaluation units does not turn the default sensitivity curve into an
+    # accidental O(salts * n * units) job.
+    per_salt_work = 2 * (1 << int(n_nonzero)) + int(n) * max(1, len(unit_ids))
     cap = max(1, int(budget // max(1, per_salt_work)))
     requested = int(n_salts)
     used = min(requested, cap)
@@ -913,12 +927,18 @@ def unit_split_replication(log_ratios, tokens, *, unit_ids=None, seeds=None,
                        f'dropping non-finite entries; min_n={min_n}'),
         })
         return base
-    if len(rows) > max_n:
-        base.update({
-            'status': 'not_estimable',
-            'reason': (f'{len(rows)} seeds exceeds the exact sign-flip cap '
-                       f'max_n={max_n}; no approximate fallback is substituted'),
-        })
+    n_nonzero_rows = _usr_nonzero_row_count(rows)
+    if n_nonzero_rows > max_n:
+        if n_nonzero_rows == len(rows):
+            # Preserve the historical diagnostic for an ordinary panel.
+            reason = (f'{len(rows)} seeds exceeds the exact sign-flip cap '
+                      f'max_n={max_n}; no approximate fallback is substituted')
+        else:
+            reason = (f'{n_nonzero_rows} seed row(s) with a non-zero effect '
+                      f'(of {len(rows)} declared) exceed the exact sign-flip '
+                      f'cap max_n={max_n}; no approximate fallback is '
+                      'substituted')
+        base.update({'status': 'not_estimable', 'reason': reason})
         return base
     try:
         core = _usr_core(rows, ids, weights, direction=direction, salt=salt,

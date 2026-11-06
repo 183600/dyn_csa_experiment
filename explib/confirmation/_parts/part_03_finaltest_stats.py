@@ -1121,27 +1121,43 @@ def _paired_len_deltas(recs_a, recs_b, common, Ln):
 def _signflip_power_table(abs_d, m_family, alpha, qs, expected_sign):
     """Exact conditional power of the sign-flip test for fixed |d_i|.
 
-    Enumerates all 2**n sign patterns of the observed validation deltas.  The
-    two-sided p of a candidate pattern is its rank in that same sign-flip null;
-    Holm is screened conservatively as min(1, m*p).  Power at q is the
+    Enumerates the sign patterns of the observed validation deltas.  A delta
+    that is exactly zero is sign-neutral for the sign-flip statistic: flipping
+    its sign leaves every null sum unchanged, so it only duplicates patterns
+    and does not change the power.  The enumeration and its cap therefore use
+    the non-zero width ``n_nonzero``; ``n`` remains the declared panel size.
+    The two-sided p of a candidate pattern is its rank in that same sign-flip
+    null; Holm is screened conservatively as min(1, m*p).  Power at q is the
     q**k (1-q)**(n-k) mass of patterns that reject *and* point in the
     pre-registered direction.  This is the simulation the manifest asks for
     before the one-shot test.
 
-    The rank of every pattern is obtained by sorting the 2**n null sums once
-    (O(2**n log 2**n)) instead of building the all-pairs comparison matrix
-    (O(4**n) time and memory), so the exact table remains usable for the
-    16-seed dynamic panel and remains bounded at n<=20.  Larger panels refuse
-    explicitly rather than silently exhausting memory; the exact sign-flip
-    analysis itself switches to meet-in-the-middle/saddlepoint above that
-    point, but conditional power still needs every sign pattern.
+    The rank of every pattern is obtained by sorting the null sums once
+    (O(2**m log 2**m), m=n_nonzero) instead of building the all-pairs
+    comparison matrix (O(4**m) time and memory), so the exact table remains
+    usable for the 16-seed dynamic panel and remains bounded at m<=20.  Larger
+    effective widths refuse explicitly rather than silently exhausting memory;
+    the exact sign-flip analysis itself switches to
+    meet-in-the-middle/saddlepoint above that point, but conditional power
+    still needs every sign pattern.
     """
     abs_d = np.asarray([abs(float(x)) for x in abs_d], dtype=float)
     n = int(abs_d.size)
     if n < 2:
         raise ValueError('power needs at least two paired deltas')
-    if n > 20:
-        raise ValueError(f'power enumeration is capped at n<=20 (got {n}); split the panel or add a Monte-Carlo path consciously')
+    # Drop sign-neutral zero deltas before choosing the exact branch.  Keeping
+    # them multiplied both the pattern count and the probability mass by
+    # 2**(#zeros), so the power is unchanged while a future panel padded with
+    # unused seed slots could be refused at the n<=20 cap for no reason.
+    active = abs_d != 0.0
+    n_nonzero = int(np.count_nonzero(active))
+    abs_d = abs_d[active]
+    if n_nonzero > 20:
+        detail = (str(n) if n_nonzero == n else
+                  f'{n_nonzero} non-zero delta(s) of n={n} declared')
+        raise ValueError(
+            f'power enumeration is capped at n<=20 (got {detail}); split the '
+            'panel or add a Monte-Carlo path consciously')
     # The conditional power table is a property of the sign-flip ranks, so a
     # units-only rescaling of the observed |deltas| must not change it.  The
     # null sums below are compared with an absolute 1e-12 tie tolerance; left
@@ -1149,11 +1165,11 @@ def _signflip_power_table(abs_d, m_family, alpha, qs, expected_sign):
     # deltas) makes every pattern look tied while a large one can overflow the
     # sums.  Work on a unit-scaled copy, exactly as `exact_signflip_p` does;
     # the tolerance is then relative to the panel.
-    _scale = float(np.max(abs_d)) if n else 0.0
+    _scale = float(np.max(abs_d)) if n_nonzero else 0.0
     if math.isfinite(_scale) and _scale > 0.0:
         abs_d = abs_d / _scale
-    total = 1 << n
-    bits = (1 << np.arange(n, dtype=np.int64))[None, :]
+    total = 1 << n_nonzero
+    bits = (1 << np.arange(n_nonzero, dtype=np.int64))[None, :]
     _idx = np.arange(total, dtype=np.int64)
     try:
         k_plus = np.bitwise_count(_idx)
@@ -1164,7 +1180,7 @@ def _signflip_power_table(abs_d, m_family, alpha, qs, expected_sign):
     k_power = np.empty(total, dtype=np.int16)
     k_same = np.empty(total, dtype=np.int16)
     sign_ok = np.empty(total, dtype=bool)
-    step = max(1, min(total, (1 << 18) // max(n, 1)))
+    step = max(1, min(total, (1 << 18) // max(n_nonzero, 1)))
     for off in range(0, total, step):
         bs = min(step, total - off)
         masks = np.arange(off, off + bs, dtype=np.int64)[:, None]
@@ -1174,8 +1190,8 @@ def _signflip_power_table(abs_d, m_family, alpha, qs, expected_sign):
         _kp = k_plus[off:off + bs]
         if expected_sign == 'negative':
             sign_ok[off:off + bs] = sums < 0
-            k_power[off:off + bs] = n - _kp
-            k_same[off:off + bs] = n - _kp
+            k_power[off:off + bs] = n_nonzero - _kp
+            k_same[off:off + bs] = n_nonzero - _kp
         elif expected_sign == 'positive':
             sign_ok[off:off + bs] = sums > 0
             k_power[off:off + bs] = _kp
@@ -1183,7 +1199,7 @@ def _signflip_power_table(abs_d, m_family, alpha, qs, expected_sign):
         else:
             sign_ok[off:off + bs] = True
             k_power[off:off + bs] = _kp
-            k_same[off:off + bs] = np.maximum(_kp, n - _kp)
+            k_same[off:off + bs] = np.maximum(_kp, n_nonzero - _kp)
     sorted_abs = np.sort(abs_sums)
     p = (total - np.searchsorted(sorted_abs, abs_sums - 1e-12,
                                  side='left')) / float(total)
@@ -1191,21 +1207,24 @@ def _signflip_power_table(abs_d, m_family, alpha, qs, expected_sign):
     power = {}
     for q in qs:
         q = float(q)
-        prob = (q ** k_power) * ((1.0 - q) ** (n - k_power))
+        prob = (q ** k_power) * ((1.0 - q) ** (n_nonzero - k_power))
         power[f'q={q:.2f}'] = float((prob * ((p_holm < alpha) & sign_ok)).sum())
     min_same = None
-    for s in range(n + 1):
+    for s in range(n_nonzero + 1):
         sel = (k_same == s) & sign_ok
         if sel.any() and float(p_holm[sel].min()) < alpha:
             min_same = int(s)
             break
-    return {'n': n, 'enumerated': total, 'm_family': int(m_family),
+    return {'n': n, 'n_nonzero': n_nonzero,
+            'n_effective': n_nonzero, 'enumerated': total,
+            'm_family': int(m_family),
             'alpha': float(alpha), 'expected_sign': expected_sign,
             'power': power, 'min_same_sign_for_alpha': min_same,
             'min_attainable_p_holm': float(p_holm.min()),
-            'note': ('exact enumeration over the 2**n sign patterns of the observed |d_i|; '
-                     'Holm screened as min(1, m*p); power conditions on these magnitudes, '
-                     'not on an assumed effect size')}
+            'note': ('exact enumeration over the 2**n_nonzero sign patterns of the '
+                     'observed |d_i| (zero deltas are sign-neutral and omitted); '
+                     'Holm screened as min(1, m*p); power conditions on these '
+                     'magnitudes, not on an assumed effect size')}
 
 
 def run_power(manifest_path=FREEZE_MANIFEST, summary='results_v10_mech/summary.json',

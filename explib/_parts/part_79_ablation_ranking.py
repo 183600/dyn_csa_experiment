@@ -29,6 +29,8 @@
 import math as _arb_math
 import time as _arb_time
 
+import numpy as _arb_np
+
 
 AR_KIND = 'ablation_ranking'
 AR_RESULT_KIND = 'ablation_ranking_result'
@@ -140,7 +142,9 @@ def _arb_number(value, *, where, positive=False):
 
 
 def _arb_int(value, *, where, minimum=None, maximum=None):
-    if isinstance(value, bool):
+    # ``np.bool_`` is not a Python bool subclass, but it is a flag rather than
+    # a count: int(np.True_) would otherwise silently become seed/lattice 1.
+    if isinstance(value, (bool, _arb_np.bool_)):
         raise ValueError(
             f'{where}: expected an integer, got {_arb_repr(value)}')
     try:

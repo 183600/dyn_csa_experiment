@@ -656,22 +656,43 @@ def exact_signflip_location_p(deltas, value=0.0):
     if val is None:
         raise ValueError(f'value must be a finite real number, got {_esci_repr(value)}')
     if n == 0:
-        return {'p': None, 'n': 0, 'n_nonzero': 0, 'value': float(val),
+        return {'p': None, 'n': 0, 'n_nonzero': 0, 'n_effective': 0,
+                'value': float(val),
                 'n_input': n_input, 'n_dropped': len(dropped),
                 'dropped_positions': dropped, 'method': 'none'}
     mu = _EsciFraction(val)
-    xi, denom = _esci_scale_to_integers(vals)
+    # At the zero null an exactly-zero delta is sign-neutral: both of its
+    # signs contribute the same shifted sum, so removing those columns leaves
+    # the rational p unchanged.  Use that effective width for the enumeration
+    # cap so a panel padded with unused seed slots is not refused.  For
+    # ``value != 0`` a zero delta is no longer neutral after centring, so the
+    # full declared width is required.
+    n_nonzero = int(sum(1 for x in vals if x != 0.0))
+    if mu == 0:
+        calc_vals = [x for x in vals if x != 0.0]
+        n_effective = n_nonzero
+    else:
+        calc_vals = vals
+        n_effective = n
+    if n_effective > EXACT_SIGNFLIP_CI_HARD_MAX_N:
+        raise ValueError(
+            f'n_effective={n_effective} (of n={n} declared) exceeds the exact '
+            f'location-p inversion hard cap {EXACT_SIGNFLIP_CI_HARD_MAX_N}; '
+            'enumerating 2**n sign patterns would be unbounded')
+    xi, denom = _esci_scale_to_integers(calc_vals)
     p = _esci_p_at(xi, denom, mu)
     return {
         'p': float(p),
         'p_exact': f'{p.numerator}/{p.denominator}',
         'n': int(n),
-        'n_nonzero': int(sum(1 for x in vals if x != 0.0)),
+        'n_nonzero': n_nonzero,
+        'n_effective': int(n_effective),
         'value': float(val),
         'n_input': int(n_input),
         'n_dropped': int(len(dropped)),
         'dropped_positions': list(dropped),
-        'method': 'exact sign-flip test inversion (2**n enumeration)',
+        'method': ('exact sign-flip test inversion '
+                   '(2**n_effective enumeration)'),
     }
 
 

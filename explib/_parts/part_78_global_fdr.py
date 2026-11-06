@@ -179,9 +179,11 @@ def _gfdr_int_or_none(value, *, minimum=0, maximum=None):
 
 def _gfdr_p(value):
     """A valid p is a finite real in [0,1]; bool/NaN/Inf/non-numeric are not."""
-    if isinstance(value, (bool, bytes, bytearray, str)):
+    if isinstance(value, (bool, np.bool_, bytes, bytearray, str)):
         # Numeric strings are serialisations, not measurements: accepting
         # float('0.01') would let a malformed artifact enter the FDR family.
+        # ``np.bool_`` is not a Python bool subclass but is equally a flag, not
+        # a probability.
         return None
     try:
         p = float(value)
@@ -211,8 +213,9 @@ def _gfdr_floor(value, *, p=None, n_nonzero=None, where='p_floor'):
         return 1.0 if nn == 0 else min(1.0, math.ldexp(2.0, -nn))
     if value is None:
         return None
-    if isinstance(value, (bool, bytes, bytearray, str)):
-        # A numeric string is a serialisation artefact, not a measurement.
+    if isinstance(value, (bool, np.bool_, bytes, bytearray, str)):
+        # A numeric string is a serialisation artefact, not a measurement; a
+        # NumPy boolean is still a flag rather than a probability threshold.
         raise ValueError(f'{where}: p_floor must be a finite number in (0,1]')
     try:
         floor = float(value)
