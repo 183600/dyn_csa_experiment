@@ -241,6 +241,110 @@ def test_discordant_halves_survive_subnormal_effect_underflow():
     _strict_json(result)
 
 
+def test_tiny_token_weights_do_not_underflow_a_weighted_effect_to_zero():
+    """``x*w`` can round to zero even when the weighted mean is representable.
+
+    With per-unit effects and token weights around 1e-200, the product leaves
+    float64's subnormal range and the historical ratio returns a fake zero for
+    a non-zero half.  The scaled path must recover the value.
+    """
+    assert L._usr_weighted_mean([-1e-201], [1e-254]) == -1e-201
+    assert L._usr_weighted_mean([1e-289], [1e-197]) == 1e-289
+
+    assignment = L.unit_split_assignment(UNITS, TOKENS)
+    i0 = assignment['halves'][0]['indices']
+    i1 = assignment['halves'][1]['indices']
+    row = [0.0] * len(UNITS)
+    for i in i0:
+        row[i] = -1e-201
+    for i in i1:
+        row[i] = 1e-201
+    tiny_tokens = [1e-254] * len(UNITS)
+    result = L.unit_split_replication(
+        [row[:] for _ in SEEDS], tiny_tokens, unit_ids=UNITS, seeds=SEEDS,
+        direction='negative', n_salts=0)
+    assert result['status'] in ('ok', 'warnings'), result
+    assert result['halves'][0]['stats']['mean'] == pytest.approx(-1e-201)
+    assert result['halves'][1]['stats']['mean'] == pytest.approx(1e-201)
+    _strict_json(result)
+
+
+def test_mixed_extreme_scales_do_not_underflow_the_weighted_mean():
+    """Independently extreme values and weights must not cancel to a fake zero.
+
+    Scaling values and weights by their own maxima turns each product into a
+    ratio that can underflow when the two ranges are reciprocal (values around
+    1e-200 next to 1e200, weights the mirror image), even though every product
+    and the weighted mean are representable.  The exponent-scaled path must
+    keep the products aligned.
+    """
+    assert L._usr_weighted_mean(
+        [1e-200, 1e200], [1e200, 1e-200]) == pytest.approx(2e-200)
+    assert L._usr_weighted_mean(
+        [1e-300, 1e300], [1e300, 1e-300]) == pytest.approx(2e-300)
+    assert L._usr_weighted_mean(
+        [1e-200, 1e200], [1e100, 1e-100]) == pytest.approx(1.0)
+    assert L._usr_weighted_mean(
+        [-2.410128919743533e-94, 1.7361598627325803e-224,
+         2.999731335233904e-281],
+        [5.33017606188e-312, 1.1554912996464657e-202,
+         6.973097902012155e-42]) == pytest.approx(2.999731335233904e-281,
+                                                 rel=1e-9)
+
+    from fractions import Fraction
+    units = [f'u{i}' for i in range(8)]
+    weights = [1e200 if i % 2 == 0 else 1e-200 for i in range(8)]
+    values = [1e-200 if i % 2 == 0 else 1e200 for i in range(8)]
+    result = L.unit_split_replication(
+        [values[:] for _ in range(4)], weights, unit_ids=units,
+        seeds=list(range(4)), direction='positive', min_n=2, min_units=4,
+        min_units_per_half=2, salt='mixed', n_salts=0)
+    assert result['status'] in ('ok', 'warnings'), result
+    for half, assigned in zip(result['halves'],
+                              result['assignment']['halves']):
+        idx = assigned['indices']
+        truth = float(
+            sum(Fraction(values[j]) * Fraction(weights[j]) for j in idx)
+            / sum(Fraction(weights[j]) for j in idx))
+        assert half['stats']['mean'] == pytest.approx(truth, rel=1e-12)
+    _strict_json(result)
+
+
+def test_ci_endpoint_overflow_is_withheld_not_emitted_as_inf():
+    """A finite half-width can still make ``mean + half`` overflow.
+
+    ``_esci_t_interval`` checked ``sd`` and ``half`` for finiteness but not the
+    endpoints.  At scale (effects near 1.7e308) the unit-split artifact then
+    carried ``inf`` in ``half_difference.ci95``, which is not strict JSON and
+    cannot be replayed.  The interval must be withheld as null instead.
+    """
+    assert L._esci_t_interval([1.5e308, 1.7e308], 0.05) is None
+    # n=2 gives tc=6.31; the half-width is finite while the upper endpoint is
+    # not (1.6e308 + 6.31e307 > float64 max).
+
+    units = ['u0', 'u1', 'u2', 'u3']
+    tokens = [1.0, 1.0, 1.0, 1.0]
+    assignment = L.unit_split_assignment(
+        units, tokens, salt='x', min_units_per_half=2)
+    h0 = assignment['halves'][0]['indices']
+    rows = []
+    for value in (1.5e308, 1.7e308):
+        row = [0.0] * len(units)
+        for i in h0:
+            row[i] = value
+        rows.append(row)
+    artifact = L.build_unit_split_replication(
+        rows, tokens, unit_ids=units, seeds=[0, 1], direction='positive',
+        min_n=2, max_n=20, min_units=4, salt='x', n_salts=0)
+    diff = artifact['result']['half_difference']
+    assert diff['mean'] is not None and math.isfinite(diff['mean'])
+    assert diff['ci95'] is None, diff
+    _strict_json(artifact)
+    verdict = L.validate_unit_split_replication(artifact)
+    assert verdict['status'] in ('ok', 'warnings'), verdict
+    assert verdict['problems'] == [], verdict
+
+
 def test_stamped_writer_preserves_unreadable_or_nonobject_artifacts(tmp_path):
     """A corrupt existing artifact must conflict, not be silently replaced.
 

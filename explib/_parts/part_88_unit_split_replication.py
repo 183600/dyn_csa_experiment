@@ -324,9 +324,10 @@ def unit_split_assignment(unit_ids, tokens, *, salt=UNIT_SPLIT_REPLICATION_DEFAU
             need = int(_min_half - len(halves_out[dst]))
             movable = sorted(halves_out[src],
                              key=lambda i: (used_weights[i], i))[:need]
-            for index in movable:
-                halves_out[src].remove(index)
-                halves_out[dst].append(index)
+            moved = set(movable)
+            halves_out[src] = [i for i in halves_out[src]
+                               if i not in moved]
+            halves_out[dst].extend(movable)
             halves_out = [sorted(h) for h in halves_out]
             totals_out = [sum(used_weights[i] for i in h) for h in halves_out]
             counts_out = [len(h) for h in halves_out]
@@ -469,9 +470,11 @@ def _usr_weighted_mean(values, weights):
 
     The historical expression ``fsum(x*w) / sum(w)`` overflows once either the
     product or the weight total leaves float64, even though the weighted mean
-    is bounded by the (finite) input values.  Try the exact historical path
-    first so normal panels do not change by a single bit, then fall back to a
-    doubly scaled computation (values by max |value|, weights by max weight).
+    is bounded by the (finite) input values.  Underflow is the symmetric
+    hazard: a product can round to zero and turn a representable weighted mean
+    into a fake zero.  Try the exact historical path first so normal panels do
+    not change by a single bit; route extreme scales (where a product could
+    leave the float64 range) through an exponent-scaled computation instead.
     """
     try:
         vals = [float(v) for v in values]
@@ -480,39 +483,75 @@ def _usr_weighted_mean(values, weights):
         return None
     if not vals or len(vals) != len(ws):
         return None
-    try:
-        # Keep the historical denominator expression for the ordinary path
-        # (builtin left-to-right sum); the scaled fallback below is what
-        # handles an overflowing total.
-        numer = _usr_math.fsum(v * w for v, w in zip(vals, ws))
-        denom = float(sum(ws))
-    except (TypeError, ValueError, OverflowError):
-        numer = None
-        denom = None
-    if (numer is not None and denom is not None
-            and _usr_math.isfinite(numer) and _usr_math.isfinite(denom)
-            and denom > 0.0):
-        out = numer / denom
-        if _usr_math.isfinite(out):
-            return float(out)
-    if any(not _usr_math.isfinite(v) for v in vals + ws):
-        return None
     vscale = max((abs(v) for v in vals), default=0.0)
     wscale = max(ws, default=0.0)
+    if vscale == 0.0:
+        return (0.0 if (_usr_math.isfinite(wscale) and wscale > 0.0)
+                else None)
+    # Products of two magnitudes inside [1e-100, 1e100] stay finite, normal
+    # and non-zero, so the ordinary path cannot silently under/overflow.
+    # Check every magnitude, not only the maxima: a tiny non-zero value next
+    # to a large weight can still make its product subnormal and lose most of
+    # its precision even when both maxima are comfortably in range.
+    vmin = min((abs(v) for v in vals if v != 0.0), default=None)
+    wmin = min((w for w in ws if w > 0.0), default=None)
+    ordinary_safe = (
+        _usr_math.isfinite(vscale) and _usr_math.isfinite(wscale)
+        and wscale > 0.0
+        and vmin is not None and wmin is not None
+        and 1e-100 <= vmin and vmin <= vscale <= 1e100
+        and 1e-100 <= wmin and wmin <= wscale <= 1e100)
+    if ordinary_safe:
+        try:
+            # Keep the historical denominator expression for the ordinary path
+            # (builtin left-to-right sum).
+            numer = _usr_math.fsum(v * w for v, w in zip(vals, ws))
+            denom = float(sum(ws))
+        except (TypeError, ValueError, OverflowError):
+            numer = None
+            denom = None
+        if (numer is not None and denom is not None
+                and _usr_math.isfinite(numer) and _usr_math.isfinite(denom)
+                and denom > 0.0):
+            out = numer / denom
+            if _usr_math.isfinite(out):
+                # A zero numerator with a non-zero measurement is underflow,
+                # not a measured zero; let the scaled path recover the mean.
+                if numer != 0.0 or not any(v != 0.0 for v in vals):
+                    return float(out)
+    if any(not _usr_math.isfinite(v) for v in vals + ws):
+        return None
     if (not _usr_math.isfinite(vscale) or not _usr_math.isfinite(wscale)
             or wscale <= 0.0):
         return None
-    if vscale == 0.0:
-        return 0.0
     try:
         denom_n = _usr_math.fsum(w / wscale for w in ws)
         if not (_usr_math.isfinite(denom_n) and denom_n > 0.0):
             return None
-        numer_n = _usr_math.fsum((v / vscale) * (w / wscale)
-                                 for v, w in zip(vals, ws))
+        # Scale each product by a common power of two.  A doubly scaled
+        # ``(v/vscale)*(w/wscale)`` underflows when values and weights span
+        # opposite extreme ranges (e.g. 1e-200 paired with 1e200), even though
+        # every ``v*w`` product and the weighted mean are representable.
+        w_mant, w_exp = _usr_math.frexp(wscale)
+        parts = []
+        max_exp = None
+        for v, w in zip(vals, ws):
+            if v == 0.0 or w == 0.0:
+                continue
+            v_mant, v_exp = _usr_math.frexp(v)
+            ww_mant, ww_exp = _usr_math.frexp(w)
+            exp = v_exp + ww_exp
+            if max_exp is None or exp > max_exp:
+                max_exp = exp
+            parts.append((v_mant * ww_mant, exp))
+        if max_exp is None:
+            return 0.0
+        numer_n = _usr_math.fsum(
+            _usr_math.ldexp(mant, exp - max_exp) for mant, exp in parts)
         if not _usr_math.isfinite(numer_n):
             return None
-        out = (numer_n / denom_n) * vscale
+        out = (_usr_math.ldexp(numer_n / denom_n, max_exp - w_exp)
+               / w_mant)
     except (TypeError, ValueError, OverflowError, ZeroDivisionError):
         return None
     return float(out) if _usr_math.isfinite(out) else None

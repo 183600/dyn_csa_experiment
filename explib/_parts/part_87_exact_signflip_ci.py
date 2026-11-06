@@ -386,6 +386,9 @@ def _esci_t_interval(vals, alpha):
         mean = float(_scaled_mean_or_raw(vals))  # noqa: F821 (part 32)
     except Exception:
         return None
+    if not _esci_math.isfinite(mean):
+        # A centre beyond float64 cannot have representable endpoints.
+        return None
     try:
         scaled = _scaled_mean_std_if_extreme(vals, ddof=1)  # noqa: F821 (part 00)
         if scaled is not None:
@@ -406,12 +409,20 @@ def _esci_t_interval(vals, alpha):
     half = float(tc) * sd / _esci_math.sqrt(n)
     if not _esci_math.isfinite(half):
         return None
+    lo, hi = mean - half, mean + half
+    # ``half`` can be finite while ``mean + half`` (or the lower endpoint)
+    # overflows: an extreme mean near float64's limit plus a wide interval.
+    # Returning [..., inf] used to leak a non-strict-JSON value into the
+    # unit-split artifact; withhold the whole interval, exactly as the other
+    # t-interval helpers in this repository do.
+    if not (_esci_math.isfinite(lo) and _esci_math.isfinite(hi)):
+        return None
     return {
         'method': 'student-t (df=n-1); normality approximation',
         'conf': float(1.0 - alpha),
         'df': int(n - 1),
         'sd': float(sd),
-        'ci': [float(mean - half), float(mean + half)],
+        'ci': [float(lo), float(hi)],
     }
 
 
