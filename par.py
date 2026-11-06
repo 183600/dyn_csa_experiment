@@ -17,6 +17,7 @@ lifecycle, logs, and child result files.
 
 import collections
 import importlib
+from contextlib import contextmanager
 import json
 import math
 import os
@@ -251,6 +252,25 @@ def ctx_active(ctx, n_cells=1):
     return workers > 1 and cells > 1
 
 
+@contextmanager
+def _payload_container(seen, obj, kind):
+    """Track ``obj`` on the current payload path, rejecting a cycle.
+
+    ``kind`` is the human-readable container name used in the error.  Yielding
+    the shared set lets recursive calls keep one path stack instead of each
+    branch re-implementing add/check/discard.
+    """
+    if seen is None:
+        seen = set()
+    if id(obj) in seen:
+        raise ValueError(f'job payload contains a cyclic {kind}')
+    seen.add(id(obj))
+    try:
+        yield seen
+    finally:
+        seen.discard(id(obj))
+
+
 def _norm(obj, _seen=None, _depth=0):
     """Convert driver payloads to JSON-compatible values.
 
@@ -261,34 +281,15 @@ def _norm(obj, _seen=None, _depth=0):
     if _depth > 512:
         raise ValueError('job payload nesting exceeds the 512-level limit')
     if isinstance(obj, dict):
-        if _seen is None:
-            _seen = set()
-        if id(obj) in _seen:
-            raise ValueError('job payload contains a cyclic mapping')
-        _seen.add(id(obj))
-        try:
-            return {_safe_text(key): _norm(value, _seen, _depth + 1)
+        with _payload_container(_seen, obj, 'mapping') as seen:
+            return {_safe_text(key): _norm(value, seen, _depth + 1)
                     for key, value in obj.items()}
-        finally:
-            _seen.discard(id(obj))
     if isinstance(obj, (list, tuple)):
-        if _seen is None:
-            _seen = set()
-        if id(obj) in _seen:
-            raise ValueError('job payload contains a cyclic sequence')
-        _seen.add(id(obj))
-        try:
-            return [_norm(value, _seen, _depth + 1) for value in obj]
-        finally:
-            _seen.discard(id(obj))
+        with _payload_container(_seen, obj, 'sequence') as seen:
+            return [_norm(value, seen, _depth + 1) for value in obj]
     if isinstance(obj, (set, frozenset)):
-        if _seen is None:
-            _seen = set()
-        if id(obj) in _seen:
-            raise ValueError('job payload contains a cyclic set')
-        _seen.add(id(obj))
-        try:
-            normalised = [_norm(value, _seen, _depth + 1) for value in obj]
+        with _payload_container(_seen, obj, 'set') as seen:
+            normalised = [_norm(value, seen, _depth + 1) for value in obj]
 
             def _sort_key(value):
                 try:
@@ -297,8 +298,6 @@ def _norm(obj, _seen=None, _depth=0):
                     return _safe_repr(value)
 
             return sorted(normalised, key=_sort_key)
-        finally:
-            _seen.discard(id(obj))
     # NumPy scalars are not instances of the builtin int/float classes, but
     # they are ordinary JSON numbers; converting them to str would silently
     # turn a seed/count into a string in the child job file.  The same applies
@@ -316,26 +315,12 @@ def _denorm(obj, _seen=None, _depth=0):
     if _depth > 512:
         raise ValueError('job payload nesting exceeds the 512-level limit')
     if isinstance(obj, dict):
-        if _seen is None:
-            _seen = set()
-        if id(obj) in _seen:
-            raise ValueError('job payload contains a cyclic mapping')
-        _seen.add(id(obj))
-        try:
-            return {_safe_text(key): _denorm(value, _seen, _depth + 1)
+        with _payload_container(_seen, obj, 'mapping') as seen:
+            return {_safe_text(key): _denorm(value, seen, _depth + 1)
                     for key, value in obj.items()}
-        finally:
-            _seen.discard(id(obj))
     if isinstance(obj, list):
-        if _seen is None:
-            _seen = set()
-        if id(obj) in _seen:
-            raise ValueError('job payload contains a cyclic sequence')
-        _seen.add(id(obj))
-        try:
-            return [_denorm(value, _seen, _depth + 1) for value in obj]
-        finally:
-            _seen.discard(id(obj))
+        with _payload_container(_seen, obj, 'sequence') as seen:
+            return [_denorm(value, seen, _depth + 1) for value in obj]
     return obj
 
 

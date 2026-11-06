@@ -296,6 +296,11 @@ def _asc_span(relations, components):
     return sorted(span)
 
 
+def _asc_coset(mask, span):
+    """Canonical representative of the alias class containing ``mask``."""
+    return min(mask ^ word for word in span)
+
+
 def _asc_popcount(mask):
     return int(mask).bit_count()
 
@@ -362,12 +367,9 @@ def fractional_factorial_design(components, *, defining_relations=None,
     targets = [mask for mask in _asc_all_words(k)
                if _asc_popcount(mask) <= _max_order]
 
-    def _coset(mask):
-        return min(mask ^ word for word in span)
-
     classes = {}
     for mask in targets:
-        classes.setdefault(_coset(mask), []).append(mask)
+        classes.setdefault(_asc_coset(mask, span), []).append(mask)
     for key in list(classes):
         classes[key].sort(key=lambda mask: (_asc_popcount(mask), mask))
     # Every word in the coset, including orders above max_order, is confounded
@@ -395,9 +397,10 @@ def fractional_factorial_design(components, *, defining_relations=None,
         })
 
     mains = [mask for mask in targets if _asc_popcount(mask) == 1]
-    main_classes = {_coset(mask) for mask in mains}
+    main_classes = {_asc_coset(mask, span) for mask in mains}
     main_effects_separable = len(main_classes) == len(mains)
-    main_effects_clear = all(len(classes[_coset(mask)]) == 1 for mask in mains)
+    main_effects_clear = all(
+        len(classes[_asc_coset(mask, span)]) == 1 for mask in mains)
     # Model selection: every main effect, then one representative per alias
     # class whose class contains no main effect.  Two terms from the same
     # coset are the same column and must never be entered together.
@@ -414,7 +417,7 @@ def fractional_factorial_design(components, *, defining_relations=None,
         for mask in targets:
             if _asc_popcount(mask) != order:
                 continue
-            key = _coset(mask)
+            key = _asc_coset(mask, span)
             if key in selected_classes:
                 continue
             if any(_asc_popcount(member) == 1 for member in classes[key]):
@@ -428,7 +431,7 @@ def fractional_factorial_design(components, *, defining_relations=None,
     selected.sort(key=lambda mask: (_asc_popcount(mask), mask))
     terms = {}
     for mask in targets:
-        key = _coset(mask)
+        key = _asc_coset(mask, span)
         others = [m for m in classes[key] if m != mask]
         terms[_asc_term_name(mask, comps)] = {
             'name': _asc_term_name(mask, comps),
@@ -477,7 +480,8 @@ def fractional_factorial_design(components, *, defining_relations=None,
     interaction_targets = [mask for mask in targets
                            if _asc_popcount(mask) >= 2]
     interactions_clear = bool(interaction_targets) and all(
-        len(classes[_coset(mask)]) == 1 for mask in interaction_targets)
+        len(classes[_asc_coset(mask, span)]) == 1
+        for mask in interaction_targets)
     # Planning counterpart: with m model terms, the Holm-corrected exact
     # sign-flip floor needs 2**n >= 2*m/alpha.  This is a conservative floor
     # (max-T can reach alpha with fewer seeds); report it explicitly so a
@@ -909,11 +913,9 @@ def ablation_screening_analysis(cells, *, components=None,
     # matrix singular; detect them before fitting.
     masks = [_asc_term_mask(name, comps) for name in selected_names]
     span = _asc_span(design['defining_relations'], comps)
-    def _coset(mask):
-        return min(mask ^ word for word in span)
     cosets = {}
     for name, mask in zip(selected_names, masks):
-        key = _coset(mask)
+        key = _asc_coset(mask, span)
         if key in cosets:
             raise ValueError(
                 f'model_terms selects aliased terms {cosets[key]!r} and '

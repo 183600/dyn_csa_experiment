@@ -15,37 +15,38 @@ everything else is exploratory.
 
 There are three common ways to use this tree:
 
-- **Check a checkout.** Install the verified CPU environment and run
-  `make test`; no GPU is required.
-- **Run or resume a study panel.** Pick a generation in
-  [Study at a glance](#study-at-a-glance), then follow its section under
-  [Running the experiments](#running-the-experiments).
-- **Rebuild results from artifacts you already have.** Use a driver's zero-GPU
-  `analysis` / `report` mode, or `python build_report.py` for the v7 report.
+1. **Check a checkout.** Install the verified CPU environment and run
+   `make test`; no GPU is required.
+2. **Run or resume a study panel.** Pick a generation in
+   [Study at a glance](#study-at-a-glance), then follow its section under
+   [Running the experiments](#running-the-experiments).
+3. **Rebuild results from artifacts you already have.** Use a driver's zero-GPU
+   `analysis` / `report` mode, or `python build_report.py` for the v7 report.
 
 Whichever path you take, run commands from the repository root: drivers resolve
 artifacts and manifests relative to the checkout. A generated report describes
 *your* run, not released evidence; treat it as independently auditable only
-after its archive is published and `archive_release.py verify` passes.
-
-> **Version naming.** `v12` is the driver/study generation. `CODE_SEMANTICS =
-> v11.128` is the library measurement-semantics stamp bound by the frozen plan.
-> The two numbering schemes are intentionally different. The frozen manifest is
-> at `manifest_version: 3` (see its `revision.history`).
-
-> **Evidence levels.** v6-v11 are exploratory: panels were extended after
-> looking at the same validation split. Only the frozen v12 fixed-chunk
-> comparisons are confirmatory. See `DECISION_LOG.md` and
-> `docs/design_notes.md` §17/§20.
-
-> **Evidence status — read this before quoting a number.** `results_*/`,
-> `analysis_*/` and `REPORT*.md` are intentionally not tracked, and no formal
-> evidence release is bundled (`RELEASES.md` has no row yet). Generated reports
-> are reproducible from artifacts you produce yourself, but a claim becomes
-> auditable only when its `release_<tag>.tar.gz` plus manifest is published and
-> `archive_release.py verify` passes.
+after its archive is published and `archive_release.py verify` passes. Before
+quoting a number, read [Scope and status](#scope-and-status): it states which
+comparisons are confirmatory and what "released" means in this checkout.
 
 ## Scope and status
+
+### Version and evidence at a glance
+
+| dimension | current value | what it means |
+|---|---|---|
+| driver generation | `v12` | the newest driver/study generation under `explib/` |
+| library semantics | `CODE_SEMANTICS = v11.128` | measurement-semantics stamp bound by the frozen plan |
+| frozen manifest | `manifest_version: 3` (revision history v1-v5) | schema revision of `confirmation_frozen.json` |
+| confirmatory scope | the fixed-chunk CSA comparisons in `confirmation_frozen.json` | the only comparisons frozen before the final test read |
+| released evidence | none bundled | the Git tree stays source-only; see `RELEASES.md` |
+
+The three numbering schemes are independent: `v12` is not `v11.128`, and neither
+is a manifest revision. The v6-v11 panels are exploratory because they were
+extended after looking at the same validation split; only the frozen v12
+fixed-chunk comparisons are confirmatory. See `DECISION_LOG.md` and
+`docs/design_notes.md` §17/§20.
 
 The repository distinguishes three levels of evidence. Use the level, not the
 version number alone, to decide what a result may support.
@@ -78,6 +79,7 @@ The tables and command comments below use a few terms in a specific sense.
 ## Contents
 
 - [Scope and status](#scope-and-status)
+  - [Version and evidence at a glance](#version-and-evidence-at-a-glance)
   - [Terminology](#terminology)
 - [Study at a glance](#study-at-a-glance)
 - [Start here](#start-here)
@@ -179,6 +181,7 @@ torch wheel that matches the local driver first, then the ranges in
 python -m pip install -r requirements.lock
 make test                              # complete CPU pytest suite
 make plan                              # frozen-manifest preflight; no test-split read
+make registry                          # split-package _PARTS registration check
 python -m explib.confirmation --help   # driver help; no run starts
 make help                              # available zero-GPU targets
 ```
@@ -186,7 +189,8 @@ make help                              # available zero-GPU targets
 `make test` invokes pytest over the repository, so it is the same whole-suite
 check used by CI; a targeted `pytest path::test` call is only a subset. `make
 plan` exits non-zero when the frozen plan fails its preflight and never reads
-the test split.
+the test split. `make registry` checks that every declared fragment exists and
+that the loader's part list matches the package on disk.
 
 None of these commands starts a training run. Training is explicit except for
 `python run_gapfill.py`, whose default mode is `full`: invoke a driver's
@@ -202,9 +206,9 @@ with that driver's `smoke` mode when validating a change to the pipeline.
 - Angle-bracket text (`<driver>`, `<phase>`, `<name>`) is a placeholder, not
   literal syntax; `--help` or the driver table names the accepted values. A
   trailing `...` marks an abbreviated command.
-- `--help` is the safe way to inspect a driver. `smoke --help` is not a help
-  command on the positional drivers: the second token is ignored and a smoke
-  run starts.
+- `--help` is the safe way to inspect a driver. On a driver that dispatches on
+  a positional mode (notably `python run_gapfill.py`), `smoke --help` is not a
+  help command: the mode token wins and a smoke run starts.
 - Training drivers write into `results_*/` and `analysis_*/` (both are
   gitignored); `plan`, `analysis`, and `report` modes do not add a research
   measurement.
@@ -829,8 +833,8 @@ above belong to the v6 driver; `explib` drivers leave the instance running.
   `full` mode; use `smoke` when you only want a plumbing check.
 - **Use `--help` before a mode.** `python -m explib.<driver> --help` prints the
   driver description; the mode list is in [Study at a glance](#study-at-a-glance).
-  `python -m explib.<driver> smoke --help` is not a help command — the second
-  token is ignored by the positional-mode drivers, so it starts a smoke run.
+  Do not append `--help` after a positional mode:
+  `python run_gapfill.py smoke --help` starts a smoke run.
 - **A targeted pytest is not the full suite.** `make test` discovers every
   `test_*.py` module; `pytest path::test` checks only that case.
 - **The test split is one-shot.** Only P5T reads `wiki.test.raw`; do not add a

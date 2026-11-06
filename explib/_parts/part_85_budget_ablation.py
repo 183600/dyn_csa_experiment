@@ -1360,32 +1360,9 @@ def validate_budget_ablation(artifact, *, replay=True):
 def write_budget_ablation(path_or_dir, artifact, *, overwrite=False,
                           name='budget_ablation.json'):
     """Write a validated artifact; same content is a no-op, different conflicts."""
-    verdict = validate_budget_ablation(artifact)
-    if verdict['status'] == 'fail':
-        raise ValueError('refusing to write an invalid artifact: '
-                         + '; '.join(verdict['problems'][:4]))
-    if (isinstance(path_or_dir, (str, os.PathLike))
-            and str(path_or_dir).endswith('.json')):
-        path = os.fspath(path_or_dir)
-    else:
-        path = os.path.join(os.fspath(path_or_dir), name)
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    existing = None
-    if os.path.exists(path):
-        try:
-            with open(path, encoding='utf-8') as fh:
-                existing = json.load(fh)
-        except Exception:
-            existing = None
-    if isinstance(existing, dict):
-        if existing.get('content_sha256') == artifact.get('content_sha256'):
-            return {'status': 'noop', 'path': os.path.abspath(path)}
-        if not overwrite:
-            return {'status': 'conflict', 'path': os.path.abspath(path),
-                    'note': ('an artifact with different content already '
-                             'exists; pass overwrite=True to replace it')}
-    atomic_write_json(path, artifact)  # noqa: F821 (part_08)
-    return {'status': 'written', 'path': os.path.abspath(path)}
+    return _write_stamped_artifact(
+        path_or_dir, artifact, validator=validate_budget_ablation,
+        name=name, overwrite=overwrite)
 
 
 def budget_ablation_markdown(result, *, title='Budget x ablation interaction'):

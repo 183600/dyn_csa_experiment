@@ -961,6 +961,82 @@ def atomic_write_json(path, obj, indent=2):
 def atomic_write_text(path, text):
     _write_text_atomic(path, text)
 
+
+def _stamped_artifact_path(path_or_dir, name):
+    """Resolve a writer's ``path_or_dir`` argument to one JSON file path.
+
+    Every stamped-artifact writer accepts either a full ``*.json`` path or a
+    directory plus a conventional file name.  Keeping the rule here means a
+    new writer cannot drift from the existing call convention.
+    """
+    if (isinstance(path_or_dir, (str, os.PathLike))
+            and str(path_or_dir).endswith('.json')):
+        return os.fspath(path_or_dir)
+    return os.path.join(os.fspath(path_or_dir), name)
+
+
+def _read_json_object_or_none(path):
+    """Read a JSON object for conflict detection, or return None.
+
+    An absent, unreadable or non-object file is treated as "no comparable
+    artifact"; the writer then decides from ``overwrite``.  This mirrors the
+    historical per-writer try/except blocks and keeps conflict handling from
+    depending on the shape of a corrupt file.
+    """
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding='utf-8') as stream:
+            return json.load(stream)
+    except Exception:
+        return None
+
+
+def _write_stamped_artifact(path_or_dir, artifact, *, validator, name,
+                            overwrite=False, indent=2,
+                            unchanged_status='noop',
+                            invalid_status='raise',
+                            conflict_note=None):
+    """Persist a content-stamped artifact with conflict-safe semantics.
+
+    Stamped analysis artifacts carry ``content_sha256`` so a rerun can be
+    distinguished from a changed result:
+
+    * identical content is a no-op with ``unchanged_status``;
+    * different content refuses to replace an existing artifact unless
+      ``overwrite=True``;
+    * a validation failure either raises (default) or returns an ``invalid``
+      result when ``invalid_status='return'``.
+
+    ``validator`` must return a dict with ``status`` and optional ``problems``.
+    The returned dict's ``path`` is absolute, exactly as the individual
+    writers documented before this helper existed.
+    """
+    verdict = validator(artifact)
+    status = verdict.get('status') if isinstance(verdict, dict) else None
+    problems = (list(verdict.get('problems') or [])
+                if isinstance(verdict, dict) else [])
+    if status == 'fail':
+        if invalid_status == 'raise':
+            raise ValueError('refusing to write an invalid artifact: '
+                             + '; '.join(problems[:4]))
+        return {'status': 'invalid', 'path': None, 'problems': problems}
+
+    path = _stamped_artifact_path(path_or_dir, name)
+    existing = _read_json_object_or_none(path)
+    if isinstance(existing, dict):
+        if existing.get('content_sha256') == artifact.get('content_sha256'):
+            return {'status': unchanged_status,
+                    'path': os.path.abspath(path)}
+        if not overwrite:
+            return {'status': 'conflict', 'path': os.path.abspath(path),
+                    'note': conflict_note or (
+                        'an artifact with different content already exists; '
+                        'pass overwrite=True to replace it')}
+    atomic_write_json(path, artifact, indent=indent)
+    return {'status': 'written', 'path': os.path.abspath(path)}
+
+
 def locked_json_read(path):
     """Consistent read of a shared JSON file under the same flock the writers
     use ({} when absent).  Pure read: never creates or rewrites the file."""

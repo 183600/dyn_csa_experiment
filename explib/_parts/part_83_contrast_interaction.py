@@ -1163,31 +1163,9 @@ def validate_contrast_interaction(artifact, *, replay=True):
 def write_contrast_interaction(outdir, artifact, *, overwrite=False,
                                name='contrast_interaction.json'):
     """Write a validated artifact; same content is a no-op, different conflicts."""
-    verdict = validate_contrast_interaction(artifact)
-    if verdict['status'] == 'fail':
-        raise ValueError('refusing to write an invalid artifact: '
-                         + '; '.join(verdict['problems'][:4]))
-    if isinstance(outdir, (str, os.PathLike)) and str(outdir).endswith('.json'):
-        path = os.fspath(outdir)
-    else:
-        path = os.path.join(os.fspath(outdir), name)
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    existing = None
-    if os.path.exists(path):
-        try:
-            with open(path, encoding='utf-8') as fh:
-                existing = json.load(fh)
-        except Exception:
-            existing = None
-    if isinstance(existing, dict):
-        if (existing.get('content_sha256') == artifact.get('content_sha256')):
-            return {'status': 'noop', 'path': os.path.abspath(path)}
-        if not overwrite:
-            return {'status': 'conflict', 'path': os.path.abspath(path),
-                    'note': ('an artifact with different content already '
-                             'exists; pass overwrite=True to replace it')}
-    atomic_write_json(path, artifact)
-    return {'status': 'written', 'path': os.path.abspath(path)}
+    return _write_stamped_artifact(
+        outdir, artifact, validator=validate_contrast_interaction,
+        name=name, overwrite=overwrite)
 
 
 def contrast_interaction_markdown(result, *, title='2x2 interaction'):

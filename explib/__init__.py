@@ -22,10 +22,12 @@ _PARTS_HASH = None
 _PARTS_VALIDATED = False
 
 
-def _validate_parts_parts():
-    """Validate that every part in _PARTS exists inside the package's _parts/.
+def _validate_parts():
+    """Validate the declared fragment set and return its canonical hash.
 
-    Returns the canonical part-list hash, or raises ImportError on failure.
+    Checks that every name in ``_PARTS`` exists under this package's
+    ``_parts/`` directory.  The hash is memoised, so repeated callers (both
+    provenance writers and tests) do not rescan the directory.
     """
     global _PARTS_HASH, _PARTS_VALIDATED
     if _PARTS_VALIDATED:
@@ -37,12 +39,8 @@ def _validate_parts_parts():
     if not fragment_dir.is_dir():
         raise ImportError(f'_parts/ directory not found at {fragment_dir}')
 
-    missing = []
-    for part in _PARTS:
-        p = fragment_dir / part
-        if not p.is_file():
-            missing.append(part)
-
+    missing = [part for part in _PARTS
+               if not (fragment_dir / part).is_file()]
     if missing:
         raise ImportError(
             f'Missing _parts/ entries: {missing}.  '
@@ -61,7 +59,7 @@ def part_list_hash():
     a different part-list hash have been generated with a different measurement
     library configuration and are not directly comparable.
     """
-    _validate_parts_parts()
+    _validate_parts()
     return _PARTS_HASH
 
 

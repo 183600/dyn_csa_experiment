@@ -13,31 +13,34 @@
 
 常见的使用方式有三种：
 
-- **检查代码检出**：安装已验证的 CPU 环境并运行 `make test`，不需要 GPU。
-- **运行或续跑研究面板**：在[研究一览](#研究一览)中选择代次，再按
-  [复现方法（任意机器）](#复现方法任意机器)中的对应小节执行。
-- **从已有产物重建结果**：使用驱动的零 GPU `analysis` / `report` 模式，
-  或用 `python build_report.py` 重建 v7 报告。
+1. **检查代码检出**：安装已验证的 CPU 环境并运行 `make test`，不需要 GPU。
+2. **运行或续跑研究面板**：在[研究一览](#研究一览)中选择代次，再按
+   [复现方法（任意机器）](#复现方法任意机器)中的对应小节执行。
+3. **从已有产物重建结果**：使用驱动的零 GPU `analysis` / `report` 模式，
+   或用 `python build_report.py` 重建 v7 报告。
 
 无论选择哪种方式，都请在仓库根目录执行命令：驱动按检出路径解析产物与清单。
 生成的报告描述的是**你自己这轮运行**，不是已发布证据；只有归档发布并通过
-`archive_release.py verify` 后，相应结果才可独立复核。
-
-> **版本命名**：`v12` 是驱动/研究代次；`CODE_SEMANTICS = v11.128` 是冻结
-> 清单绑定的库测量语义戳。两套编号故意不同。冻结清单当前为
-> `manifest_version: 3`（见其 `revision.history`）。
-
-> **证据等级**：v6–v11 为探索性（在同一 validation split 上观察后继续
-> 扩展面板）；只有 v12 冻结的固定分块比较是确认性。详见 `DECISION_LOG.md`
-> 与 `docs/design_notes.md` §17/§20。
-
-> **证据状态（引用数字前必读）**：`results_*/`、`analysis_*/` 与
-> `REPORT*.md` 有意不入库，且**没有随仓库发布证据归档**
-> （`RELEASES.md` 尚无记录）。报告可由你自己产生的产物重建，但没有重建过
-> 的报告数值无法独立复核。只有当 `release_<tag>.tar.gz` 与清单发布到只读
-> 位置，并通过 `archive_release.py verify` 时，相应主张才可审计。
+`archive_release.py verify` 后，相应结果才可独立复核。引用数字前请先读
+[范围与状态](#范围与状态)，确认哪些比较属于确认性、本检出中的「已发布」
+指什么。
 
 ## 范围与状态
+
+### 版本与证据一览
+
+| 维度 | 当前值 | 含义 |
+|---|---|---|
+| 驱动代次 | `v12` | `explib/` 下最新的驱动/研究代次 |
+| 库测量语义 | `CODE_SEMANTICS = v11.128` | 由冻结清单绑定的测量语义戳 |
+| 冻结清单 | `manifest_version: 3`（修订历史 v1–v5） | `confirmation_frozen.json` 的结构版本 |
+| 确认范围 | `confirmation_frozen.json` 中的固定分块 CSA 比较 | 唯一在读取最终 test split 前冻结的比较 |
+| 已发布证据 | 未随仓库提供 | Git 树只存放源码；见 `RELEASES.md` |
+
+三种编号互相独立：`v12` 不是 `v11.128`，二者也都不是清单修订号。v6–v11
+面板属于探索性（在同一 validation split 上观察后继续扩展面板）；只有 v12
+冻结的固定分块比较是确认性。详见 `DECISION_LOG.md` 与
+`docs/design_notes.md` §17/§20。
 
 仓库区分三个证据层级。判断结果能支持什么，应看层级而不是只看版本号。
 
@@ -68,6 +71,7 @@
 ## 目录
 
 - [范围与状态](#范围与状态)
+  - [版本与证据一览](#版本与证据一览)
   - [术语](#术语)
 - [研究一览](#研究一览)
 - [从这里开始](#从这里开始)
@@ -164,13 +168,15 @@ CPU 环境；CUDA 机器请先安装与本机驱动匹配的 torch wheel，再�
 python -m pip install -r requirements.lock
 make test                              # 完整 CPU pytest 套件
 make plan                              # 冻结清单预检；不读取 test split
+make registry                          # 拆分包的 _PARTS 注册检查
 python -m explib.confirmation --help   # 查看驱动说明，不启动实验
 make help                              # 可用的零 GPU 目标
 ```
 
 `make test` 会对整个仓库调用 pytest，与 CI 使用同一套全量检查；
 编辑时运行 `pytest path::test` 只覆盖相应子集。`make plan` 在冻结计划
-未通过预检时以非零状态退出，并且不会读取 test split。
+未通过预检时以非零状态退出，并且不会读取 test split。`make registry`
+检查声明的片段是否都存在，以及加载器的片段列表是否与磁盘上的包一致。
 
 以上命令都不会启动训练。训练需要显式选择模式，例外是 `python
 run_gapfill.py`（默认 `full`）：要跑正式面板时调用驱动的 `full`、
@@ -183,8 +189,9 @@ run_gapfill.py`（默认 `full`）：要跑正式面板时调用驱动的 `full`
   脚本，保留位置参数式模式。
 - 尖括号内容（`<driver>`、`<phase>`、`<name>`）是占位符而非字面语法；
   可接受值见 `--help` 或驱动表。结尾的 `...` 表示命令已省略其余部分。
-- 用 `--help` 查看驱动说明最稳妥；对位置式驱动而言 `smoke --help` 不是
-  帮助命令，第二个 token 会被忽略并直接开始 smoke 运行。
+- 用 `--help` 查看驱动说明最稳妥；对按位置参数分派模式的驱动（尤其是
+  `python run_gapfill.py`）而言，`smoke --help` 不是帮助命令，模式 token
+  优先，会直接开始 smoke 运行。
 - 训练驱动写入 `results_*/` 与 `analysis_*/`（两者均已 gitignore）；
   `plan`、`analysis`、`report` 模式不产生新的研究测量。
 - 检查通过时打印自己的摘要并以 0 退出；失败时以非零退出。先看退出状态，
@@ -751,9 +758,8 @@ python build_report.py            # 从产物重建 REPORT_v7.md（零 GPU）
 - **v6 裸跑会训练。** `python run_gapfill.py` 默认使用 `full` 模式；只想
   做流水线自检时请显式运行 `smoke`。
 - **先看 `--help` 再选模式。** `python -m explib.<driver> --help` 打印驱动
-  说明，模式列表见[研究一览](#研究一览)。注意
-  `python -m explib.<driver> smoke --help` 不是帮助命令——位置式驱动会忽略
-  第二个 token，直接开始 smoke 运行。
+  说明，模式列表见[研究一览](#研究一览)。不要在位置式模式后追加 `--help`：
+  `python run_gapfill.py smoke --help` 会直接开始 smoke 运行。
 - **定向 pytest 不等于全量套件。** `make test` 会收集所有 `test_*.py`
   模块；`pytest path::test` 只检查对应用例。
 - **test split 是一次性的。** 只有 P5T 读 `wiki.test.raw`；不要在其外围

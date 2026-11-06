@@ -7,7 +7,7 @@ PYTHON ?= python
 BUILD_DIR := .build
 INSTALL_DIR := $(BUILD_DIR)/install-check
 
-.PHONY: help test plan protocol preparation rehearsal transfer budget attribution ablation-rank ablation-screen sink-interaction sequential-design budget-ablation curve-inference exact-signflip-ci unit-split estimability conformal type-sm exact-tost global-fdr multiverse audit manipulation integrity env-check canary canary-check registry data-sensitivity reproduce report-diff install-check build clean
+.PHONY: help test plan protocol preparation rehearsal transfer budget attribution ablation-rank ablation-screen sink-interaction sequential-design budget-ablation curve-inference exact-signflip-ci unit-split estimability conformal type-sm exact-tost global-fdr multiverse audit manipulation integrity env-check canary canary-check registry data-sensitivity reproduce report-diff install-check build clean part-hash
 
 help:
 	@echo "make test          # CPU unit/reproducibility suite (zero GPU)"

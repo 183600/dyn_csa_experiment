@@ -35,7 +35,6 @@ seeds.  The block changes no frozen p-value, no Holm family and never writes
 import hashlib as _usr_hashlib
 import json as _usr_json
 import math as _usr_math
-import os as _usr_os
 import time as _usr_time
 
 import numpy as np
@@ -1943,34 +1942,10 @@ def validate_unit_split_replication_block(block, *, replay=True):
 
 def write_unit_split_replication(path_or_dir, artifact, *, overwrite=False,
                                  name='unit_split_replication.json'):
-    verdict = validate_unit_split_replication(artifact)
-    if verdict['status'] == 'fail':
-        raise ValueError('refusing to write an invalid artifact: '
-                         + '; '.join(verdict['problems'][:4]))
-    if (isinstance(path_or_dir, (str, _usr_os.PathLike))
-            and str(path_or_dir).endswith('.json')):
-        path = _usr_os.fspath(path_or_dir)
-    else:
-        path = _usr_os.path.join(_usr_os.fspath(path_or_dir), name)
-    _usr_os.makedirs(_usr_os.path.dirname(_usr_os.path.abspath(path)),
-                     exist_ok=True)
-    existing = None
-    if _usr_os.path.exists(path):
-        try:
-            with open(path, encoding='utf-8') as fh:
-                existing = _usr_json.load(fh)
-        except Exception:
-            existing = None
-    if isinstance(existing, dict):
-        if existing.get('content_sha256') == artifact.get('content_sha256'):
-            return {'status': 'noop', 'path': _usr_os.path.abspath(path)}
-        if not overwrite:
-            return {'status': 'conflict',
-                    'path': _usr_os.path.abspath(path),
-                    'note': ('an artifact with different content already '
-                             'exists; pass overwrite=True to replace it')}
-    atomic_write_json(path, artifact)  # noqa: F821 (part 08)
-    return {'status': 'written', 'path': _usr_os.path.abspath(path)}
+    """Write a validated artifact; same content is a no-op, different conflicts."""
+    return _write_stamped_artifact(
+        path_or_dir, artifact, validator=validate_unit_split_replication,
+        name=name, overwrite=overwrite)
 
 
 def unit_split_replication_markdown(result, *, title='Split-half consistency across evaluation units'):
