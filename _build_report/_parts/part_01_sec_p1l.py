@@ -471,7 +471,12 @@ def global_multiplicity_adjust(named_pvals, alpha=0.05):
         rows[row_i]['q_bh'] = q_by_rank[idx_in_sorted]
         rows[row_i]['p_bonferroni'] = min(1.0, rows[row_i]['p_slot'] * m)
         p_slot = rows[row_i]['p_slot']
-        rows[row_i]['bh_rejected'] = bool(rows[row_i]['q_bh'] <= a + 1e-15 and rows[row_i]['p_raw'] is not None)
+        # Mirror exp_lib.global_multiplicity_audit: a scale-relative BH
+        # boundary, not an absolute +1e-15 (which rejected q=1e-19 at
+        # alpha=1e-20 and disagreed with the audit twin).
+        rows[row_i]['bh_rejected'] = bool(
+            rows[row_i]['q_bh'] <= a * (1.0 + 1e-12)
+            and rows[row_i]['p_raw'] is not None)
     n_raw = n_bh = n_bonf = n_untest = 0
     for r in rows:
         if r['p_raw'] is None:

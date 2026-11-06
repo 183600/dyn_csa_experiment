@@ -208,6 +208,29 @@ def _signflip_mitm_count(deltas):
     return int(lo.sum() + (right.size - hi).sum())
 
 
+def _signflip_dominant_all_qualify(deltas, obs_mean):
+    """Mirror of `exp_lib._signflip_dominant_all_qualify`.
+
+    For every sign assignment the triangle inequality gives
+    ``|sum(s_i*d_i)| >= max_k(|d_k| - sum_{i != k}|d_i|)``.  If that lower
+    bound already reaches the observed mean (within the exact branch's
+    ``1e-12`` tolerance), every one of the ``2**n`` assignments is at least
+    as extreme and the two-sided p is exactly 1.  This matters for a
+    concentrated panel above the meet-in-the-middle size cap, where the
+    saddlepoint tail is anti-conservative.
+    """
+    n = len(deltas)
+    if n == 0:
+        return False
+    absd = [abs(float(x)) for x in deltas]
+    total = math.fsum(absd)
+    if not math.isfinite(total):
+        return False
+    dmax = max(absd)
+    lower_mean = (dmax - (total - dmax)) / float(n)
+    return bool(float(obs_mean) <= lower_mean + 1e-12)
+
+
 def _signflip_saddlepoint_p(values):
     """Mirror of `exp_lib._signflip_saddlepoint_p` (no torch import here).
 
@@ -317,7 +340,19 @@ def exact_signflip(deltas, *, n_input=None):
     # collapse to "every sign assignment qualifies".
     _p_deltas = ([x / _amax for x in deltas]
                  if _amax > 0.0 else deltas)
-    _obs_p = abs(sum(_p_deltas))
+    # Zero deltas are sign-neutral: they scale every attainable count by
+    # 2**(#zeros), so p is unchanged while the resolution floor is set by the
+    # non-zero count.  Pick the enumeration branch from the non-zero entries
+    # too, or many exact zeros push an exactly enumerable panel (e.g. three
+    # non-zero effects among 44 zeros) onto the saddlepoint approximation.
+    # An all-zero panel keeps the historical branch label based on n.
+    if _n_nonzero:
+        _calc_deltas = [x for x in _p_deltas if x != 0.0]
+        _n_calc = _n_nonzero
+    else:
+        _calc_deltas = _p_deltas
+        _n_calc = n
+    _obs_p = abs(sum(_calc_deltas))
     # Panel attrition is part of the result: `deltas` may be the complete-case
     # subset after unpaired/non-finite seeds were dropped.  The caller can pass
     # the planned/paired count so the report gate can refuse a
@@ -346,18 +381,39 @@ def exact_signflip(deltas, *, n_input=None):
              'loo_means': _loo, 'seed_driven': _seed_driven,
              'seed_robust': (None if _seed_driven is None else (not _seed_driven)),
              **_attrition}
-    if 20 < n <= 40:
+    if 20 < _n_calc <= 40:
         try:
-            _cnt = _signflip_mitm_count(_p_deltas)
+            _cnt = _signflip_mitm_count(_calc_deltas)
             return {'n': n, 'mean': mu, 'std': std,
-                    'p_exact_signflip': _cnt / (1 << n),
+                    'p_exact_signflip': _cnt / (1 << _n_calc),
                     'method': 'exact-mitm', **_diag}
         except ImportError:
             pass
-    if n > 40:
+    _mass = sum(abs(x) for x in _calc_deltas)
+    if 40 < _n_calc <= 46 and _mass > 0.0:
+        _dmax = max(abs(x) for x in _calc_deltas)
+        if _dmax >= 0.5 * _mass:
+            # Mirror exp_lib: a concentrated panel has a bimodal null, where
+            # the saddlepoint tail can be far too small.  The exact MITM
+            # count is still affordable up to this size.
+            try:
+                _cnt = _signflip_mitm_count(_calc_deltas)
+                return {'n': n, 'mean': mu, 'std': std,
+                        'p_exact_signflip': _cnt / (1 << _n_calc),
+                        'method': 'exact-mitm-dominant', **_diag}
+            except ImportError:
+                pass
+    if (_n_calc > 40
+            and _signflip_dominant_all_qualify(_calc_deltas,
+                                               _obs_p / _n_calc)):
+        # Exact closed form above the MITM cap: every sign assignment is at
+        # least as extreme as the observed one, so the two-sided p is 1.
+        return {'n': n, 'mean': mu, 'std': std, 'p_exact_signflip': 1.0,
+                'method': 'exact-mitm-dominant', **_diag}
+    if _n_calc > 40:
         # Same deterministic tail as exp_lib: no random MC draw, and the
         # variance is the sign-flip null variance sum(d_i**2).
-        _p, _method = _signflip_saddlepoint_p(_p_deltas)
+        _p, _method = _signflip_saddlepoint_p(_calc_deltas)
         return {'n': n, 'mean': mu, 'std': std, 'p_exact_signflip': _p,
                 'method': _method, **_diag}
     try:
@@ -365,12 +421,13 @@ def exact_signflip(deltas, *, n_input=None):
     except ImportError:
         _np = None
     if _np is not None:
-        _total = 1 << n
-        _thr = _obs_p - 1e-12 * n
-        _darr = _np.asarray(_p_deltas, dtype=float)
-        _ebnd = n * 2.220446049250313e-16 * float(_np.abs(_darr).sum())
-        _bitpos = _np.arange(n, dtype=_np.int64)
-        _step = max(1, min(_total, (1 << 24) // max(n, 1)))
+        _total = 1 << _n_calc
+        _thr = _obs_p - 1e-12 * _n_calc
+        _darr = _np.asarray(_calc_deltas, dtype=float)
+        _ebnd = (_n_calc * 2.220446049250313e-16
+                 * float(_np.abs(_darr).sum()))
+        _bitpos = _np.arange(_n_calc, dtype=_np.int64)
+        _step = max(1, min(_total, (1 << 24) // max(_n_calc, 1)))
         cnt = 0
         for _off in range(0, _total, _step):
             _masks = _np.arange(_off, min(_off + _step, _total), dtype=_np.int64)
@@ -379,17 +436,20 @@ def exact_signflip(deltas, *, n_input=None):
             _near = _np.abs(_s - _thr) <= _ebnd
             cnt += int((_s[~_near] >= _thr).sum())
             for _m in _masks[_near].tolist():
-                s = sum((d if _m >> i & 1 else -d for i, d in enumerate(_p_deltas)))
+                s = sum((d if _m >> i & 1 else -d
+                         for i, d in enumerate(_calc_deltas)))
                 if abs(s) >= _thr:
                     cnt += 1
     else:
         cnt = 0
-        for mask in range(1 << n):
-            s = sum((d if mask >> i & 1 else -d for i, d in enumerate(_p_deltas)))
-            if abs(s) >= _obs_p - 1e-12 * n:
+        for mask in range(1 << _n_calc):
+            s = sum((d if mask >> i & 1 else -d
+                     for i, d in enumerate(_calc_deltas)))
+            if abs(s) >= _obs_p - 1e-12 * _n_calc:
                 cnt += 1
     return {'n': n, 'mean': mu, 'std': std,
-            'p_exact_signflip': cnt / (1 << n), 'method': 'exact', **_diag}
+            'p_exact_signflip': cnt / (1 << _n_calc), 'method': 'exact',
+            **_diag}
 
 def _measurable(r):
     if not isinstance(r, dict):

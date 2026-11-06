@@ -11,6 +11,7 @@ import math
 import pytest
 
 import exp_lib as L
+import build_report as BR
 
 
 def test_boolean_schema_is_not_coerced_to_version_one():
@@ -245,6 +246,21 @@ def test_tiny_alpha_planning_and_bh_use_relative_tolerances():
     row = L.global_multiplicity_audit(pvals, alpha=1e-20)['entries'][0]
     assert row['bh_rejected'] is False
     assert row['global_status'] == 'family_only'
+    # The report builder keeps a local twin of this audit; it used the same
+    # absolute slack and called q=1e-19 an FDR rejection at alpha=1e-20.
+    twin = BR.global_multiplicity_adjust(pvals, alpha=1e-20)['rows'][0]
+    assert twin['bh_rejected'] is False, twin
+    assert twin['global_status'] == 'family_only', twin
+    # The design-sensitivity gate had the same absolute slack: at n=60 the
+    # exact Holm floor is 1.73e-18, only ~1.7e-19 above a slightly smaller
+    # alpha, which the old ``> a + 1e-15`` comparison called attainable.
+    floor = L.holm_min_attainable_p(60, 1, 0.05)
+    assert floor > 0.0
+    tiny = floor * 0.9
+    sensitivity = L.paired_design_sensitivity(60, 1, alpha=tiny)
+    assert sensitivity['min_attainable_p_holm'] > tiny
+    assert any('resolution-limited' in v for v in sensitivity['violations']), (
+        sensitivity['violations'])
 
 
 def test_binomial_huge_n_tiny_p_keeps_the_poisson_limit():

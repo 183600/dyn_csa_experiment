@@ -1352,7 +1352,9 @@ def paired_design_sensitivity(n_seeds, m_comparisons, *, alpha=0.05,
     if n is not None and m is not None and a is not None:
         out['p_floor'] = float(signflip_p_floor(n))
         out['min_attainable_p_holm'] = float(holm_min_attainable_p(n, m, a))
-        if out['min_attainable_p_holm'] > a + 1e-15:
+        # Relative, like the other resolution gates: an absolute +1e-15
+        # swamps alpha below 1e-15 and marks an infeasible plan feasible.
+        if out['min_attainable_p_holm'] > a * (1.0 + 1e-12):
             out['violations'].append(
                 f'with n={n} seeds and m={m} comparisons the minimum attainable '
                 f'Holm p is {out["min_attainable_p_holm"]:.6g} > alpha={a}; '

@@ -857,7 +857,9 @@ def lesion_family_audit(panels, *, alpha=LESION_POLICY['alpha'],
         # p-value or a resolution verdict to a manipulation-channel reading.
         res_limited = (None if is_inert else bool(
             floor is not None
-            and (len(outcome_names) * floor) > alpha + 1e-15))
+            # Scale-relative boundary: an absolute +1e-15 made a floor just
+            # above alpha look attainable whenever alpha itself was tiny.
+            and (len(outcome_names) * floor) > alpha * (1.0 + 1e-12)))
         sup_row = {
             'p_raw': p_sup,
             'p_holm': (None if is_inert

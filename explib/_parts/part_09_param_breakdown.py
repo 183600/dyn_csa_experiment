@@ -1195,6 +1195,9 @@ def exact_signflip_p(deltas):
     `method`); it uses the null variance ``sum(d_i**2)`` and is therefore
     neither a Monte-Carlo draw nor the anti-conservative centered-SD normal
     approximation.  Non-finite deltas are dropped (the count is returned).
+    Exact zero deltas are sign-neutral, so the branch threshold and the
+    enumeration size are based on the non-zero count: they leave p unchanged
+    but do lower the resolution floor to ``2 / 2**(#nonzero)``.
     Pure function over its input — used by the aggregate audit so the core
     panel reports the same p the per-phase suites do, rather than a bare
     mean±std that could be mistaken for evidence.
@@ -1239,36 +1242,51 @@ def exact_signflip_p(deltas):
     # Scaling by the largest magnitude turns the tolerance into a relative
     # one without changing the comparison for ordinary O(1) panels.
     d_work = (d / _scale) if _scale > 0.0 else d
-    obs = abs(float(d_work.mean()))
-    if n <= _SIGNFLIP_ENUM_MAX_N:
-        total = 1 << n
+    # Zero deltas are sign-neutral: they multiply every attainable count by
+    # 2**(#zeros), so they leave p unchanged while reducing the resolution
+    # floor.  Choose the enumeration branch from the number of NON-ZERO
+    # deltas; otherwise a scale-up panel with many exact zeros (e.g. 3
+    # non-zero effects among 44 zeros) is pushed onto the saddlepoint
+    # approximation even though 2**3 sign patterns can be counted exactly.
+    # The all-zero panel keeps the historical branch label based on n so an
+    # existing report does not change method for a degenerate input.
+    if n_nonzero:
+        d_calc = d_work[d != 0]
+        n_calc = n_nonzero
+    else:
+        d_calc = d_work
+        n_calc = n
+    obs = abs(float(d_calc.mean())) if n_calc else 0.0
+    if n_calc <= _SIGNFLIP_ENUM_MAX_N:
+        total = 1 << n_calc
         cnt = 0
-        bitpos = np.arange(n, dtype=np.int64)[None, :]
-        step = max(1, min(total, (1 << 22) // max(n, 1)))
+        bitpos = np.arange(n_calc, dtype=np.int64)[None, :]
+        step = max(1, min(total, (1 << 22) // max(n_calc, 1)))
         for off in range(0, total, step):
             bs = min(step, total - off)
             masks = np.arange(off, off + bs, dtype=np.int64)[:, None]
             signs = np.where((masks & (1 << bitpos)) != 0, 1.0, -1.0)
-            cnt += int((np.abs((signs * d_work[None, :]).mean(1))
+            cnt += int((np.abs((signs * d_calc[None, :]).mean(1))
                     >= obs - 1e-12).sum())
         return {'n': n, 'p': float(cnt / total), 'n_dropped': n_dropped,
                 'n_nonzero': n_nonzero, 'p_floor': p_floor, 'method': 'exact'}
-    if n <= _SIGNFLIP_MITM_MAX_N:
-        cnt = _signflip_mitm_count(d_work)
-        return {'n': n, 'p': float(cnt / float(1 << n)), 'n_dropped': n_dropped,
-                'n_nonzero': n_nonzero, 'p_floor': p_floor, 'method': 'exact-mitm'}
-    if n <= _SIGNFLIP_DOMINANT_MITM_MAX_N:
-        _abs = np.abs(d_work)
+    if n_calc <= _SIGNFLIP_MITM_MAX_N:
+        cnt = _signflip_mitm_count(d_calc)
+        return {'n': n, 'p': float(cnt / float(1 << n_calc)),
+                'n_dropped': n_dropped, 'n_nonzero': n_nonzero,
+                'p_floor': p_floor, 'method': 'exact-mitm'}
+    if n_calc <= _SIGNFLIP_DOMINANT_MITM_MAX_N:
+        _abs = np.abs(d_calc)
         _mass = float(_abs.sum())
         if _mass > 0.0 and float(_abs.max()) >= 0.5 * _mass:
             # One term dominates: the null is bimodal, where the Lugannani-
             # Rice saddlepoint tail can be far too small (e.g. p=.66 instead
             # of the exact 1.0).  The exact MITM count is still affordable.
-            cnt = _signflip_mitm_count(d_work)
-            return {'n': n, 'p': float(cnt / float(1 << n)),
+            cnt = _signflip_mitm_count(d_calc)
+            return {'n': n, 'p': float(cnt / float(1 << n_calc)),
                     'n_dropped': n_dropped, 'n_nonzero': n_nonzero,
                     'p_floor': p_floor, 'method': 'exact-mitm-dominant'}
-    if _signflip_dominant_all_qualify(d_work, obs):
+    if _signflip_dominant_all_qualify(d_calc, obs):
         # Exact closed form for a panel beyond the MITM size cap: every sign
         # assignment is at least as extreme as the observed one.  The label
         # stays the exact dominant branch so callers can distinguish this
@@ -1276,7 +1294,7 @@ def exact_signflip_p(deltas):
         return {'n': n, 'p': 1.0, 'n_dropped': n_dropped,
                 'n_nonzero': n_nonzero, 'p_floor': p_floor,
                 'method': 'exact-mitm-dominant'}
-    p, method = _signflip_saddlepoint_p(d_work.tolist())
+    p, method = _signflip_saddlepoint_p(d_calc.tolist())
     return {'n': n, 'p': float(p), 'n_dropped': n_dropped,
             'n_nonzero': n_nonzero, 'p_floor': p_floor, 'method': method}
 
