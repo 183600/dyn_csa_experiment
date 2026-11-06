@@ -38,7 +38,7 @@ help:
 	@echo "make canary-check  # replay analysis_v12/numerical_canary.json (zero GPU)"
 	@echo "make registry      # split-package _PARTS registration integrity (zero GPU)"
 	@echo "make data-sensitivity # cleaning-choice/order sensitivity of the cached corpus (zero GPU)"
-	@echo "make reproduce A=<dir> B=<dir>  # compare two independent runs (zero GPU)"
+	@echo "make reproduce A=<dir> B=<dir>  # compare source/data/init/endpoint/curve (zero GPU)"
 	@echo "make report-diff A=<json> B=<json>  # compare two stamped reports (zero GPU)"
 	@echo "make install-check # verify the project builds/installs as a wheel"
 	@echo "make build         # sdist + wheel via python -m build"

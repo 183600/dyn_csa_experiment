@@ -8,7 +8,10 @@
 # 把「PPL 看起来差不多」当成复现，也不会把「环境不同但数值接近」误报成
 # 代码/数据复现。
 
-REPRODUCTION_SCHEMA = 'reproduction_diagnosis_v1'
+# v2 adds the recorded-curve dimension and makes ``bit_identical`` require an
+# identical trajectory.  A v1 report could call two runs "bit-identical" from
+# the final PPL alone; that verdict is not comparable with v2.
+REPRODUCTION_SCHEMA = 'reproduction_diagnosis_v2'
 
 _REPRODUCTION_REQUIRED_DIMENSIONS = ('code', 'data', 'config', 'environment',
                                      'initialization')
@@ -502,7 +505,362 @@ def _repro_metric(original, rerun, *, rtol, atol):
     return out
 
 
-def reproduction_diagnosis(original, rerun, *, rtol=1e-6, atol=0.0):
+_REPRO_CURVE_STATS = (
+    'curve_n_points', 'curve_first', 'curve_last', 'curve_best',
+    'curve_n_nonfinite', 'curve_first_nonfinite_index',
+)
+
+
+def _repro_curve_sha(value):
+    """A recorded SHA-256 hex digest, or None for a missing/malformed value."""
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, str):
+        return None
+    text = value.strip().lower()
+    if len(text) != 64 or any(c not in '0123456789abcdef' for c in text):
+        return None
+    return text
+
+
+def _repro_curve_stats(rec):
+    """The scalar curve summary a summary.json record may carry."""
+    out = {}
+    for key in _REPRO_CURVE_STATS:
+        raw = rec.get(key)
+        if raw is None or isinstance(raw, (bool, np.bool_, str, bytes, bytearray)):
+            out[key] = None
+            continue
+        try:
+            number = float(raw)
+        except (TypeError, ValueError, OverflowError):
+            out[key] = None
+            continue
+        out[key] = number if math.isfinite(number) else None
+    return out
+
+
+def _repro_curve_payload(rec, base):
+    """Load one cell's recorded trajectory and its identity fields.
+
+    The panel writer moves per-cell arrays to a ``curves/<cell>.json`` sidecar
+    when they are large and keeps only ``curve_ref`` / ``curve_sha256`` in the
+    summary.  Older summaries may still carry ``losses`` / ``ppl_history``
+    inline.  Both shapes, and the scalar summary-only legacy shape, are read
+    here so a comparison is not silently reduced to "final PPL only".
+
+    Nothing here writes or trains; a missing/unreadable sidecar is recorded in
+    ``problems`` and leaves the curve unverified rather than raising.
+    """
+    out = {
+        'values': None, 'kind': None, 'source': None,
+        'sha256': _repro_curve_sha(rec.get('curve_sha256')),
+        'ppl_sha256': _repro_curve_sha(rec.get('ppl_history_sha256')),
+        'stats': _repro_curve_stats(rec), 'problems': [], 'path': None,
+    }
+    for kind in ('losses', 'ppl_history'):
+        raw = rec.get(kind)
+        if isinstance(raw, list) and raw:
+            out.update(values=raw, kind=kind, source='inline')
+            return out
+    ref = rec.get('curve_ref')
+    if not isinstance(ref, str) or not ref.strip():
+        ref = rec.get('ppl_history_ref')
+    if isinstance(ref, str) and ref.strip():
+        ref = ref.strip()
+        # A sidecar reference is an artifact-relative path.  Without the
+        # summary's directory there is no honest way to resolve it, so leave
+        # values absent and let the scalar summary or the digest decide.
+        # Resolve through realpath and refuse a target outside that directory:
+        # a hand-edited summary must not turn a comparison into a read of an
+        # unrelated file elsewhere on the audit machine.
+        path = None
+        if base:
+            base_real = os.path.realpath(base)
+            candidate = os.path.realpath(
+                ref if os.path.isabs(ref) else os.path.join(base, ref))
+            try:
+                inside = os.path.commonpath([base_real, candidate]) == base_real
+            except (OSError, ValueError):
+                inside = False
+            if inside:
+                path = candidate
+            else:
+                out['problems'].append(
+                    f'curve sidecar {ref!r} resolves outside the summary '
+                    'directory; refusing to read it')
+        else:
+            out['problems'].append(
+                'curve_ref is present but there is no summary directory to '
+                'resolve it against')
+        out['path'] = path
+        if path is not None:
+            try:
+                with open(path, encoding='utf-8') as fh:
+                    doc = json.load(fh)
+            except (OSError, ValueError) as exc:
+                out['problems'].append(
+                    f'curve sidecar {ref!r} is unreadable '
+                    f'({type(exc).__name__}: {exc})')
+            else:
+                if not isinstance(doc, dict):
+                    out['problems'].append(
+                        f'curve sidecar {ref!r} is a {type(doc).__name__}, '
+                        'not a JSON object')
+                else:
+                    for kind in ('losses', 'ppl_history'):
+                        raw = doc.get(kind)
+                        if isinstance(raw, list) and raw:
+                            out.update(values=raw, kind=kind,
+                                       source='curve_sidecar')
+                            return out
+    return out
+
+
+def _repro_curve_array(values):
+    """Convert one recorded series to float, refusing type coercion.
+
+    ``np.asarray(['3.0'], dtype=float)`` would turn a malformed string into a
+    measurement and ``bool`` into 0/1.  The writer emits numbers or ``null``;
+    anything else is not a reproducible measurement and must stay unverified
+    instead of being silently converted.  ``None`` becomes NaN (the same
+    missing/non-finite marker used for a diverged step).
+    """
+    out = np.empty(len(values), dtype=float)
+    for i, value in enumerate(values):
+        if value is None:
+            out[i] = np.nan
+            continue
+        if isinstance(value, (bool, np.bool_, str, bytes, bytearray)):
+            return None, f'element {i} is a {type(value).__name__}, not a number'
+        try:
+            out[i] = float(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            return None, (f'element {i} is not numeric '
+                          f'({type(exc).__name__}: {exc})')
+    return out, None
+
+
+def _repro_curve_values_compare(a_values, b_values, *, rtol, atol):
+    """Compare two recorded numeric series with an explicit tolerance.
+
+    ``None`` and non-finite entries are treated as the same missing marker
+    (the writer uses ``null`` for a non-finite loss), so two runs that both
+    diverged at the same step are not falsely reported as a reproduction.
+    """
+    if a_values is None or b_values is None:
+        return {'status': 'unverified', 'method': 'none',
+                'detail': 'one or both records carry no curve values'}
+    if len(a_values) != len(b_values):
+        return {'status': 'mismatch', 'method': 'curve_values',
+                'n_points_original': len(a_values),
+                'n_points_rerun': len(b_values),
+                'detail': (f'different curve lengths ({len(a_values)} vs '
+                           f'{len(b_values)})')}
+    if not a_values:
+        return {'status': 'unverified', 'method': 'none',
+                'detail': 'an empty curve is not a trajectory'}
+    aa, a_problem = _repro_curve_array(a_values)
+    bb, b_problem = _repro_curve_array(b_values)
+    if a_problem or b_problem:
+        return {'status': 'unverified', 'method': 'none',
+                'detail': '; '.join(p for p in (a_problem, b_problem) if p)}
+    if aa.shape != bb.shape:
+        return {'status': 'mismatch', 'method': 'curve_values',
+                'detail': f'curve shapes differ ({aa.shape} vs {bb.shape})'}
+    n_a = int(np.count_nonzero(~np.isfinite(aa)))
+    n_b = int(np.count_nonzero(~np.isfinite(bb)))
+    if np.array_equal(aa, bb, equal_nan=True):
+        return {'status': 'exact', 'method': 'curve_values',
+                'n_points_original': int(aa.size),
+                'n_points_rerun': int(bb.size),
+                'n_nonfinite_original': n_a, 'n_nonfinite_rerun': n_b,
+                'first_difference_index': None, 'max_abs_diff': 0.0,
+                'byte_identical': True,
+                'detail': 'every recorded curve value is identical'}
+    with np.errstate(invalid='ignore', over='ignore'):
+        close = np.isclose(aa, bb, rtol=rtol, atol=atol, equal_nan=True)
+    if bool(np.all(close)):
+        finite = np.isfinite(aa) & np.isfinite(bb)
+        diffs = np.abs(aa[finite] - bb[finite]) if np.any(finite) else np.array([])
+        return {'status': 'within_tolerance', 'method': 'curve_values',
+                'n_points_original': int(aa.size),
+                'n_points_rerun': int(bb.size),
+                'n_nonfinite_original': n_a, 'n_nonfinite_rerun': n_b,
+                'first_difference_index': None,
+                'max_abs_diff': (float(np.max(diffs)) if diffs.size else None),
+                'byte_identical': False,
+                'detail': ('every curve value is within atol + rtol*|value|; '
+                           'the trajectories are close, not identical')}
+    bad = np.flatnonzero(~close)
+    first = int(bad[0]) if bad.size else None
+    finite = np.isfinite(aa) & np.isfinite(bb)
+    diffs = np.abs(aa[finite] - bb[finite]) if np.any(finite) else np.array([])
+    return {'status': 'mismatch', 'method': 'curve_values',
+            'n_points_original': int(aa.size),
+            'n_points_rerun': int(bb.size),
+            'n_nonfinite_original': n_a, 'n_nonfinite_rerun': n_b,
+            'first_difference_index': first,
+            'max_abs_diff': (float(np.max(diffs)) if diffs.size else None),
+            'byte_identical': False,
+            'detail': (f'curve differs at index {first}'
+                       if first is not None else 'curve differs')}
+
+
+def _repro_curve_stats_compare(a_stats, b_stats, *, rtol, atol):
+    """Compare the scalar legacy summary when the arrays are unavailable."""
+    common = [k for k in _REPRO_CURVE_STATS
+              if a_stats.get(k) is not None and b_stats.get(k) is not None]
+    if not common:
+        return {'status': 'unverified', 'method': 'none',
+                'detail': 'no comparable curve values or scalar summary'}
+    problems = []
+    for key in common:
+        a, b = a_stats[key], b_stats[key]
+        if key in ('curve_n_points', 'curve_n_nonfinite',
+                   'curve_first_nonfinite_index'):
+            # Counts and indexes are exact integers.  ``int(1.5)`` would
+            # silently truncate a malformed summary into a match.
+            if not (float(a).is_integer() and float(b).is_integer()):
+                problems.append(f'{key} is not an integer ({a!r} vs {b!r})')
+            elif int(a) != int(b):
+                problems.append(f'{key} {int(a)} != {int(b)}')
+            continue
+        if not math.isclose(a, b, rel_tol=rtol, abs_tol=atol):
+            problems.append(f'{key} {a!r} != {b!r}')
+    if problems:
+        return {'status': 'mismatch', 'method': 'summary_stats',
+                'coarse': True, 'byte_identical': False,
+                'detail': 'scalar curve summary differs: ' + '; '.join(problems)}
+    return {'status': 'exact', 'method': 'summary_stats', 'coarse': True,
+            'byte_identical': False,
+            'detail': ('only the scalar curve summary is available; it '
+                       'matches, but a pointwise trajectory comparison and '
+                       'bit-identical claim require the array/sidecar')}
+
+
+def _repro_curve_dimension(original, rerun, *, rtol, atol,
+                           original_base=None, rerun_base=None):
+    """Compare the recorded loss/eval trajectory, not only the final PPL.
+
+    The final PPL is one scalar; two runs with different data order,
+    nondeterministic kernels or a different resume point can coincidentally
+    end at the same value.  A reproduction claim is therefore checked against
+    the full recorded curve where available.  The dimension is deliberately
+    optional for legacy records: missing curves make ``bit_identical``
+    unverifiable, but they do not turn an otherwise matching endpoint into a
+    failure.
+    """
+    a = _repro_curve_payload(original, original_base)
+    b = _repro_curve_payload(rerun, rerun_base)
+    out = {
+        'name': 'curve', 'status': 'unverified', 'method': 'none',
+        'kind': a['kind'] or b['kind'],
+        'coarse': False, 'byte_identical': False,
+        'n_points_original': (len(a['values']) if a['values'] is not None
+                              else a['stats'].get('curve_n_points')),
+        'n_points_rerun': (len(b['values']) if b['values'] is not None
+                           else b['stats'].get('curve_n_points')),
+        'sha256_original': a['sha256'] or a['ppl_sha256'],
+        'sha256_rerun': b['sha256'] or b['ppl_sha256'],
+        'n_nonfinite_original': a['stats'].get('curve_n_nonfinite'),
+        'n_nonfinite_rerun': b['stats'].get('curve_n_nonfinite'),
+        'first_difference_index': None, 'max_abs_diff': None,
+        'detail': None,
+    }
+    problems = list(a['problems']) + list(b['problems'])
+
+    def _detail(base):
+        parts = [str(p) for p in problems if p]
+        if base:
+            parts.append(str(base))
+        return '; '.join(parts)
+
+    if problems:
+        out['detail'] = _detail(None)
+
+    # The writer records the same sidecar bytes under both digest fields.  A
+    # record claiming one equal and one unequal digest is internally
+    # contradictory; do not let the first field's "equal" hide that.
+    if (a['sha256'] is not None and b['sha256'] is not None
+            and a['ppl_sha256'] is not None and b['ppl_sha256'] is not None):
+        if ((a['sha256'] == b['sha256'])
+                != (a['ppl_sha256'] == b['ppl_sha256'])):
+            out.update(status='mismatch', method='curve_sha256',
+                       byte_identical=False,
+                       detail=_detail(
+                           'curve_sha256 and ppl_history_sha256 disagree '
+                           'about whether the recorded sidecar is equal'))
+            return out
+
+    # A recorded sidecar digest is the strongest identity: equal digests mean
+    # the exact serialized array (and its auxiliary diagnostics) is the same.
+    for label, ha, hb in (
+            ('curve_sha256', a['sha256'], b['sha256']),
+            ('ppl_history_sha256', a['ppl_sha256'], b['ppl_sha256'])):
+        if ha is None or hb is None:
+            continue
+        if ha == hb:
+            out.update(status='exact', method=label, byte_identical=True,
+                       detail=_detail(f'{label} is identical'))
+            return out
+        # Digests differ.  If both arrays are available a value comparison
+        # can distinguish a formatting-only difference from a real drift;
+        # otherwise the recorded bytes are the only evidence and they differ.
+        if a['values'] is None or b['values'] is None:
+            out.update(status='mismatch', method=label, byte_identical=False,
+                       detail=_detail(
+                           f'{label} differs and the curve payload is '
+                           'not available for a numeric comparison'))
+            return out
+        break
+
+    if a['values'] is not None and b['values'] is not None:
+        if a['kind'] != b['kind']:
+            out.update(status='unverified', method='none',
+                       detail=_detail(
+                           f'different trajectory kinds '
+                           f'({a["kind"]!r} vs {b["kind"]!r})'))
+            return out
+        cmp = _repro_curve_values_compare(a['values'], b['values'],
+                                          rtol=rtol, atol=atol)
+        out.update(cmp)
+        # The sidecar digest covers more than the loss array (delta_trace /
+        # ppl_history / opt_diag).  Equal numbers with unequal bytes are not
+        # a bit-identical run, so keep the digest verdict separate.
+        if (a['sha256'] is not None and b['sha256'] is not None
+                and a['sha256'] != b['sha256']):
+            out['byte_identical'] = False
+            if out['status'] == 'exact':
+                out['detail'] = _detail(
+                    'numeric curve values are identical but the '
+                    'serialized sidecar bytes differ')
+        elif (a['ppl_sha256'] is not None and b['ppl_sha256'] is not None
+                and a['ppl_sha256'] != b['ppl_sha256']):
+            out['byte_identical'] = False
+        elif ((a['sha256'] is None) != (b['sha256'] is None)
+              or (a['ppl_sha256'] is None) != (b['ppl_sha256'] is None)):
+            # One side carries a sidecar digest and the other does not (an
+            # inline legacy curve or a summary-only record): numeric values
+            # can still match, but full byte identity is unverified.
+            out['byte_identical'] = False
+        return out
+
+    if (a['sha256'] is not None or b['sha256'] is not None
+            or a['ppl_sha256'] is not None or b['ppl_sha256'] is not None):
+        out.update(status='unverified', method='none',
+                   detail=_detail(
+                       'a recorded curve digest is present but the '
+                       'curve payload is unavailable on at least one side'))
+        return out
+
+    cmp = _repro_curve_stats_compare(a['stats'], b['stats'],
+                                     rtol=rtol, atol=atol)
+    out.update(cmp)
+    out['detail'] = _detail(out.get('detail'))
+    return out
+
+
+def reproduction_diagnosis(original, rerun, *, rtol=1e-6, atol=0.0,
+                           original_base=None, rerun_base=None):
     """Compare one recorded cell against an independent re-execution.
 
     Returns a dimension-by-dimension verdict.  ``reproduced`` is True only
@@ -511,6 +869,13 @@ def reproduction_diagnosis(original, rerun, *, rtol=1e-6, atol=0.0):
     is ``provenance_incomplete`` (never a pass), and a different environment
     or data slice is reported as its own failure mode rather than as generic
     numerical drift.
+
+    The recorded loss/eval curve is compared too when available.  Equal final
+    PPL is not evidence that the same trajectory was executed; a curve
+    mismatch fails the reproduction, and ``bit_identical`` is only claimed
+    when the curve (not just the endpoint) is identical.  Legacy records
+    without curves remain comparable, but their ``bit_identical`` claim stays
+    false because it cannot be verified.
 
     This is a descriptive identity comparison, not a statistical test: it has
     no p-value, no confidence interval and no tolerance for selection.  The
@@ -528,6 +893,7 @@ def reproduction_diagnosis(original, rerun, *, rtol=1e-6, atol=0.0):
             'kind': 'reproduction_diagnosis', 'schema': REPRODUCTION_SCHEMA,
             'verdict': 'not_comparable', 'reproduced': False,
             'bit_identical': False, 'identity_ok': False,
+            'curve_compared': False, 'curve_identical': False,
             'rtol': rtol, 'atol': atol,
             'dimensions': {}, 'metric': None,
             'problems': ['a synthesized record was reconstructed from an '
@@ -547,6 +913,19 @@ def reproduction_diagnosis(original, rerun, *, rtol=1e-6, atol=0.0):
         'name': 'rng_state', 'diagnostic': True,
         'fields': [rng_field], 'status': rng_field['status'],
     }
+    curve = _repro_curve_dimension(
+        original, rerun, rtol=rtol, atol=atol,
+        original_base=original_base, rerun_base=rerun_base)
+    curve['fields'] = [{
+        'field': 'recorded_curve',
+        'original': curve.get('sha256_original'),
+        'rerun': curve.get('sha256_rerun'),
+        'status': ('mismatch' if curve['status'] == 'mismatch'
+                   else 'unverified' if curve['status'] == 'unverified'
+                   else 'match'),
+        'detail': curve.get('detail'),
+    }]
+    dimensions['curve'] = curve
     metric = _repro_metric(original, rerun, rtol=rtol, atol=atol)
 
     mismatch = [d for d in _REPRODUCTION_REQUIRED_DIMENSIONS
@@ -561,11 +940,32 @@ def reproduction_diagnosis(original, rerun, *, rtol=1e-6, atol=0.0):
         warnings.append('rng_state.rng_fp: the initial RNG stream differs; '
                         'a same-seed replay did not start from the recorded '
                         'state (diagnostic only, not an arm-pairing failure)')
+    curve_mismatch = curve['status'] == 'mismatch'
+    curve_unverified = curve['status'] == 'unverified'
+    if curve_mismatch:
+        problems.append(f'curve.recorded_curve: {curve.get("detail")}')
+    elif curve_unverified:
+        warnings.append(
+            'curve.recorded_curve: no comparable loss/eval trajectory is '
+            'recorded on both sides; the endpoint can still match, but '
+            'bit_identical cannot be claimed')
+    elif curve.get('coarse'):
+        warnings.append(
+            'curve.recorded_curve: only the scalar curve summary is available '
+            '(no array/sidecar); it matches, but pointwise reproduction and '
+            'bit_identical remain unverified')
+    elif curve['status'] == 'within_tolerance':
+        warnings.append(
+            'curve.recorded_curve: the trajectories match only within the '
+            'declared tolerance, so the run is not bit-identical')
     if metric and metric['status'] not in ('exact', 'within_tolerance'):
         problems.append(f'metric.ppl: {metric.get("detail")}')
 
     if mismatch:
         verdict = _REPRODUCTION_DIMENSION_VERDICTS[mismatch[0]]
+        reproduced = False
+    elif curve_mismatch:
+        verdict = 'curve_changed'
         reproduced = False
     elif unverified:
         verdict = 'provenance_incomplete'
@@ -577,29 +977,67 @@ def reproduction_diagnosis(original, rerun, *, rtol=1e-6, atol=0.0):
                               'denominator_unverified'):
         verdict = 'metric_mismatch'
         reproduced = False
-    elif metric['status'] == 'exact':
+    elif (metric['status'] == 'exact'
+          and curve['status'] == 'exact' and not curve.get('coarse')
+          and curve.get('byte_identical')):
         verdict = 'identical'
         reproduced = True
-    elif metric['status'] == 'within_tolerance':
+    elif (metric['status'] in ('exact', 'within_tolerance')
+          and curve['status'] in ('exact', 'within_tolerance')
+          and not curve.get('coarse')):
+        # The endpoint and the full trajectory both reproduced, but at least
+        # one needed the declared tolerance.
         verdict = 'within_tolerance'
+        reproduced = True
+    elif metric['status'] in ('exact', 'within_tolerance'):
+        # The endpoint reproduced, but the trajectory is missing or only a
+        # scalar summary is available.  That is a reproduced endpoint, not a
+        # reproduced run.
+        verdict = 'endpoint_only'
         reproduced = True
     else:
         verdict = 'numerical_drift'
         reproduced = False
 
     identity_ok = bool(not mismatch and not unverified)
+    curve_identical = bool(
+        curve['status'] == 'exact' and not curve.get('coarse')
+        and curve.get('byte_identical'))
     return {
         'kind': 'reproduction_diagnosis', 'schema': REPRODUCTION_SCHEMA,
         'verdict': verdict, 'reproduced': bool(reproduced),
-        'bit_identical': bool(identity_ok and metric['status'] == 'exact'),
+        'bit_identical': bool(identity_ok and metric['status'] == 'exact'
+                              and curve_identical),
         'identity_ok': identity_ok,
+        'curve_compared': bool(curve['status'] != 'unverified'),
+        'curve_identical': curve_identical,
         'rtol': rtol, 'atol': atol,
         'dimensions': dimensions, 'metric': metric,
         'problems': problems,
         'warnings': warnings,
-        'note': ('identity comparison of two independent executions; absence '
-                 'of a fingerprint is not evidence of a match'),
+        'note': ('identity and recorded-trajectory comparison of two '
+                 'independent executions; absence of a fingerprint or curve '
+                 'is not evidence of a match'),
     }
+
+
+def _repro_curve_base(label):
+    """Directory a summary's ``curve_ref`` paths are relative to.
+
+    ``_repro_load_summary`` returns the resolved summary path for a directory
+    or file input and the caller's label for an in-memory mapping.  Only the
+    former can locate sidecars; a mapping has no directory and must not borrow
+    the current working directory (that would make the comparison depend on
+    where the auditor happened to run it).
+    """
+    if not isinstance(label, str):
+        return None
+    path = os.path.abspath(label)
+    if os.path.isfile(path):
+        return os.path.dirname(path)
+    if os.path.isdir(path):
+        return path
+    return None
 
 
 def _repro_load_summary(source, label):
@@ -654,11 +1092,20 @@ def compare_reproductions(original, rerun, *, rtol=1e-6, atol=0.0):
     ``variant::seedN`` key; a key present on only one side is not silently
     dropped.  The aggregate verdict is ``reproduced`` only when every matched
     cell reproduces and no planned cell is missing.
+
+    For directory/file inputs the cell's ``curve_ref`` sidecar is resolved
+    against its own summary directory, so a recorded trajectory is compared
+    even though the arrays were moved out of ``summary.json``.  A differing
+    trajectory makes the cell (and therefore the panel) ``curve_changed``;
+    ``bit_identical`` is reserved for panels whose recorded curves are also
+    identical.
     """
     rtol = _repro_validate_tolerance('rtol', rtol)
     atol = _repro_validate_tolerance('atol', atol)
     a_summary, a_label = _repro_load_summary(original, 'original')
     b_summary, b_label = _repro_load_summary(rerun, 'rerun')
+    a_base = _repro_curve_base(a_label)
+    b_base = _repro_curve_base(b_label)
     a_cells, a_malformed = _repro_cells(a_summary)
     b_cells, b_malformed = _repro_cells(b_summary)
     common = sorted(set(a_cells) & set(b_cells))
@@ -668,7 +1115,8 @@ def compare_reproductions(original, rerun, *, rtol=1e-6, atol=0.0):
     cells, counts, problems, warnings = {}, {}, [], []
     for key in common:
         diag = reproduction_diagnosis(a_cells[key], b_cells[key],
-                                      rtol=rtol, atol=atol)
+                                      rtol=rtol, atol=atol,
+                                      original_base=a_base, rerun_base=b_base)
         diag['key'] = key
         cells[key] = diag
         counts[diag['verdict']] = counts.get(diag['verdict'], 0) + 1
@@ -688,7 +1136,8 @@ def compare_reproductions(original, rerun, *, rtol=1e-6, atol=0.0):
     if not common:
         verdict = 'not_comparable'
     elif any(v in ('code_changed', 'data_changed', 'config_changed',
-                   'environment_changed', 'initialization_changed')
+                   'environment_changed', 'initialization_changed',
+                   'curve_changed')
              for v in counts):
         verdict = 'not_reproduced'
     elif only_original or only_rerun or a_malformed or b_malformed:
@@ -702,7 +1151,8 @@ def compare_reproductions(original, rerun, *, rtol=1e-6, atol=0.0):
         verdict = 'reproduced'
     reproduced = verdict == 'reproduced'
     bit_identical = bool(reproduced and all(
-        d['verdict'] == 'identical' for d in cells.values()))
+        d['verdict'] == 'identical' and d.get('curve_identical')
+        for d in cells.values()))
     for dim in ('code', 'data', 'config', 'environment', 'initialization'):
         n_bad = sum(1 for d in cells.values()
                     if (d.get('dimensions') or {}).get(dim, {}).get('status')
@@ -716,6 +1166,20 @@ def compare_reproductions(original, rerun, *, rtol=1e-6, atol=0.0):
     if n_rng:
         warnings.append(f'{n_rng} cells started from a different initial RNG '
                         'stream (diagnostic only; not an arm-pairing failure)')
+    n_curve_compared = sum(1 for d in cells.values() if d.get('curve_compared'))
+    n_curve_identical = sum(1 for d in cells.values() if d.get('curve_identical'))
+    n_curve_unverified = len(cells) - n_curve_compared
+    n_curve_mismatch = sum(
+        1 for d in cells.values()
+        if (d.get('dimensions') or {}).get('curve', {}).get('status')
+        == 'mismatch')
+    if n_curve_mismatch:
+        problems.append(f'{n_curve_mismatch} cells have a recorded curve that '
+                        'differs from the original run')
+    if n_curve_unverified:
+        warnings.append(f'{n_curve_unverified} cells have no comparable '
+                        'recorded curve; their endpoint may match, but the '
+                        'trajectory (and bit_identical) is unverified')
     return {
         'kind': 'reproduction_report', 'schema': REPRODUCTION_SCHEMA,
         'verdict': verdict, 'reproduced': bool(reproduced),
@@ -732,13 +1196,20 @@ def compare_reproductions(original, rerun, *, rtol=1e-6, atol=0.0):
         'malformed_original': a_malformed[:50],
         'malformed_rerun': b_malformed[:50],
         'counts': dict(sorted(counts.items())),
+        'n_curve_compared': n_curve_compared,
+        'n_curve_identical': n_curve_identical,
+        'n_curve_unverified': n_curve_unverified,
+        'n_curve_mismatch': n_curve_mismatch,
         'cells': cells,
         'problems': problems,
         'warnings': warnings,
         'note': ('a reproduced verdict requires matching source bytes, data '
                  'slice, configuration, execution environment, matched '
-                 'initialization and a metric inside the declared tolerance; '
-                 'missing provenance is reported, not assumed equal'),
+                 'initialization, a metric inside the declared tolerance and a '
+                 'recorded trajectory that does not differ; bit_identical '
+                 'additionally requires the recorded curve to be identical. '
+                 'Missing provenance or a missing curve is reported, not '
+                 'assumed equal'),
     }
 
 
@@ -749,7 +1220,10 @@ _REPRODUCTION_USAGE = """usage:
 
 compare: two independent executions of the same cells (result directories or
 summary.json paths).  Exit status: 0 reproduced, 1 not reproduced, 2 usage or
-input error.  --require exact removes the tolerance and demands identical PPL.
+input error.  Each cell compares its recorded loss/eval curve as well as its
+final PPL: an equal endpoint with a different trajectory is not a reproduced
+run.  --require exact removes the tolerance and demands an identical PPL and an
+identical recorded curve (``bit_identical``).
 
 report: two stamped analysis/report JSON files (for example an audit_report.json
 and its rebuild).  Separates a changed result body from changed evidence inputs,

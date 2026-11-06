@@ -1,12 +1,14 @@
 """Cross-run reproduction is a comparison, not a declaration.
 
 These checks cover the dimension-level diagnosis (code / data / config /
-environment / initialization / RNG), the per-cell aggregate report, the
-tri-state handling of missing provenance, and the CLI/audit wiring.  They use
-synthetic summaries only: no training, no GPU and no test-split read.
+environment / initialization / RNG / recorded curve), the per-cell aggregate
+report, the tri-state handling of missing provenance, and the CLI/audit
+wiring.  They use synthetic summaries only: no training, no GPU and no
+test-split read.
 """
 import contextlib
 import copy
+import hashlib
 import inspect
 import io
 import json
@@ -36,7 +38,8 @@ def _objective():
 
 def _record(*, tree='a' * 64, code='CS', data='data', val='val',
             data_version='dv', corpus='corpus', cfg='cfg_csCS', env='env',
-            init='init', rng='rng', ppl=10.0, tokens=1000, synth=False):
+            init='init', rng='rng', ppl=10.0, tokens=1000, synth=False,
+            losses=(3.0, 2.5, 2.3)):
     prov = {
         'code': {
             'code_semantics': 'v11.128',
@@ -58,6 +61,7 @@ def _record(*, tree='a' * 64, code='CS', data='data', val='val',
         'train_knobs': L.training_knobs(amp_dtype='fp32', eager_batch=False),
         'train_objective': _objective(),
         'provenance': prov,
+        'losses': list(losses) if losses is not None else None,
         'synthesized': bool(synth),
     }
 
@@ -84,7 +88,7 @@ def test_identical_runs_are_identical_not_merely_close():
     assert d['metric']['abs_diff'] == 0.0 and d['metric']['status'] == 'exact', d['metric']
     # The report is JSON-safe and stable: no NaN/Inf token leaks into the body.
     blob = json.dumps(d, sort_keys=True, allow_nan=False)
-    assert 'reproduction_diagnosis_v1' in blob and 'NaN' not in blob
+    assert 'reproduction_diagnosis_v2' in blob and 'NaN' not in blob
 
 
 def test_tolerance_is_declared_and_drift_is_not_reproduction():
@@ -314,3 +318,175 @@ def test_cli_and_audit_gate_are_wired():
             sys.argv = old_argv
     src = inspect.getsource(A.run_report)
     assert "'reproduction': audit_reproduction()" in src, src[-2000:]
+
+
+def _write_curve_panel(root, cell, losses, *, sha=None):
+    """Write the summary + curve sidecar shape the real panel writer emits."""
+    os.makedirs(os.path.join(root, 'curves'), exist_ok=True)
+    payload = {'losses': list(losses)}
+    curve_path = os.path.join(root, 'curves', 'cell.json')
+    with open(curve_path, 'w', encoding='utf-8') as f:
+        json.dump(payload, f, separators=(',', ':'))
+    cell = copy.deepcopy(cell)
+    cell.pop('losses', None)
+    cell['curve_ref'] = 'curves/cell.json'
+    if sha is None:
+        with open(curve_path, 'rb') as f:
+            sha = hashlib.sha256(f.read()).hexdigest()
+    cell['curve_sha256'] = sha
+    cell['curve_n_points'] = len(losses)
+    with open(os.path.join(root, 'summary.json'), 'w', encoding='utf-8') as f:
+        json.dump({'csa_dynamic::seed0': cell}, f)
+    return cell
+
+
+def test_equal_endpoint_with_different_curve_is_not_a_reproduction():
+    a = _record()
+    b = _record(losses=(3.0, 2.5, 2.0))
+    d = L.reproduction_diagnosis(a, b)
+    assert d['verdict'] == 'curve_changed' and d['reproduced'] is False, d
+    assert d['bit_identical'] is False and d['curve_identical'] is False, d
+    assert d['dimensions']['curve']['status'] == 'mismatch', d['dimensions']['curve']
+    assert d['dimensions']['curve']['first_difference_index'] == 2, d['dimensions']['curve']
+    assert any('curve' in p for p in d['problems']), d['problems']
+
+    rep = L.compare_reproductions({'csa_dynamic::seed0': a},
+                                  {'csa_dynamic::seed0': b})
+    assert rep['verdict'] == 'not_reproduced' and rep['reproduced'] is False, rep
+    assert rep['counts'] == {'curve_changed': 1}, rep['counts']
+    assert rep['n_curve_mismatch'] == 1 and rep['bit_identical'] is False, rep
+
+
+def test_curve_tolerance_missing_curve_and_coarse_summary_are_distinct():
+    close = _record(losses=(3.0, 2.5, 2.3 + 1e-9))
+    d = L.reproduction_diagnosis(_record(), close)
+    assert d['verdict'] == 'within_tolerance' and d['reproduced'] is True, d
+    assert d['bit_identical'] is False, d
+    assert d['dimensions']['curve']['status'] == 'within_tolerance', d['dimensions']['curve']
+    assert any('tolerance' in w for w in d['warnings']), d['warnings']
+
+    exact = L.reproduction_diagnosis(_record(), close, rtol=0.0, atol=0.0)
+    assert exact['verdict'] == 'curve_changed' and exact['reproduced'] is False, exact
+
+    # A shape change is a definite curve failure, not a tolerance question.
+    shortened = L.reproduction_diagnosis(_record(), _record(losses=(3.0, 2.5)))
+    assert shortened['verdict'] == 'curve_changed', shortened
+    assert shortened['dimensions']['curve']['status'] == 'mismatch', shortened
+
+    # A boolean/string is not a loss value; it is unverified, never coerced
+    # into 1.0 or 3.0 and never silently matched.
+    for bad_value in (True, '3.0'):
+        bad = _record(losses=(3.0, bad_value, 2.3))
+        d = L.reproduction_diagnosis(_record(), bad)
+        assert d['dimensions']['curve']['status'] == 'unverified', (bad_value, d)
+        assert d['verdict'] == 'endpoint_only' and d['bit_identical'] is False, d
+
+    missing = _record()
+    missing.pop('losses')
+    d = L.reproduction_diagnosis(_record(), missing)
+    # The endpoint reproduced, but without a recorded trajectory this is not
+    # a bit-identical run and the report says so explicitly.
+    assert d['verdict'] == 'endpoint_only' and d['reproduced'] is True, d
+    assert d['bit_identical'] is False and d['curve_compared'] is False, d
+    assert any('no comparable' in w for w in d['warnings']), d['warnings']
+
+    coarse_a = _record()
+    coarse_b = _record()
+    for rec, best in ((coarse_a, 2.3), (coarse_b, 2.3)):
+        rec.pop('losses')
+        rec.update({'curve_n_points': 3, 'curve_first': 3.0,
+                    'curve_last': 2.3, 'curve_best': best,
+                    'curve_n_nonfinite': 0})
+    d = L.reproduction_diagnosis(coarse_a, coarse_b)
+    assert d['verdict'] == 'endpoint_only' and d['reproduced'] is True, d
+    assert d['dimensions']['curve']['coarse'] is True, d['dimensions']['curve']
+    assert any('scalar curve summary' in w for w in d['warnings']), d['warnings']
+
+    coarse_b['curve_best'] = 2.1
+    d = L.reproduction_diagnosis(coarse_a, coarse_b)
+    assert d['verdict'] == 'curve_changed' and d['reproduced'] is False, d
+    assert d['dimensions']['curve']['method'] == 'summary_stats', d['dimensions']['curve']
+
+
+def test_curve_sidecar_digest_binds_more_than_the_values():
+    with tempfile.TemporaryDirectory() as td:
+        a_dir = os.path.join(td, 'a')
+        b_dir = os.path.join(td, 'b')
+        c_dir = os.path.join(td, 'c')
+        os.makedirs(a_dir)
+        os.makedirs(b_dir)
+        os.makedirs(c_dir)
+        base = _record()
+        _write_curve_panel(a_dir, base, (3.0, 2.5, 2.3))
+        _write_curve_panel(b_dir, base, (3.0, 2.5, 2.3))
+        rep = L.compare_reproductions(a_dir, b_dir)
+        assert rep['verdict'] == 'reproduced' and rep['bit_identical'] is True, rep
+        assert rep['n_curve_compared'] == 1 and rep['n_curve_identical'] == 1, rep
+
+        # Same numeric values, different sidecar digest: the values reproduce,
+        # but the serialized run artifact (delta/ppl/opt diagnostics) does not.
+        _write_curve_panel(c_dir, base, (3.0, 2.5, 2.3), sha='0' * 64)
+        rep = L.compare_reproductions(a_dir, c_dir)
+        assert rep['verdict'] == 'reproduced' and rep['reproduced'] is True, rep
+        assert rep['counts'] == {'within_tolerance': 1}, rep['counts']
+        assert rep['bit_identical'] is False and rep['n_curve_identical'] == 0, rep
+        assert rep['n_curve_compared'] == 1, rep
+
+        # A differing digest with no loadable payload is a definite mismatch,
+        # not an unverifiable one: the recorded bytes are the evidence.
+        with open(os.path.join(c_dir, 'summary.json'), encoding='utf-8') as f:
+            c_cell = json.load(f)
+        c_cell['csa_dynamic::seed0'].pop('curve_ref')
+        with open(os.path.join(c_dir, 'summary.json'), 'w', encoding='utf-8') as f:
+            json.dump(c_cell, f)
+        rep = L.compare_reproductions(a_dir, c_dir)
+        assert rep['verdict'] == 'not_reproduced', rep
+        assert rep['counts'] == {'curve_changed': 1}, rep['counts']
+
+
+def test_cli_rejects_same_endpoint_different_curve():
+    with tempfile.TemporaryDirectory() as td:
+        a, b = os.path.join(td, 'a'), os.path.join(td, 'b')
+        os.makedirs(a)
+        os.makedirs(b)
+        original = _summary('csa_dynamic::seed0')
+        with open(os.path.join(a, 'summary.json'), 'w', encoding='utf-8') as f:
+            json.dump(original, f)
+        changed = copy.deepcopy(original)
+        changed['csa_dynamic::seed0']['losses'] = [3.0, 2.5, 1.0]
+        with open(os.path.join(b, 'summary.json'), 'w', encoding='utf-8') as f:
+            json.dump(changed, f)
+        for extra in ([], ['--require', 'exact']):
+            proc = subprocess.run(
+                [sys.executable, '-m', 'explib.reproduce', 'compare', a, b,
+                 *extra],
+                cwd=REPO, capture_output=True, text=True)
+            assert proc.returncode == 1, (proc.stdout[-2000:], proc.stderr[-2000:])
+            assert 'curve_changed' in proc.stdout, proc.stdout[-2000:]
+        with contextlib.redirect_stdout(io.StringIO()):
+            audit = A.audit_reproduction(a, b)
+        assert audit['status'] == 'fail' and audit['verdict'] == 'not_reproduced', audit
+        assert audit['counts'] == {'curve_changed': 1}, audit['counts']
+        assert audit['n_curve_mismatch'] == 1, audit
+
+
+def test_curve_ref_cannot_escape_the_summary_directory():
+    with tempfile.TemporaryDirectory() as td:
+        panel = os.path.join(td, 'panel')
+        os.makedirs(panel)
+        with open(os.path.join(td, 'outside.json'), 'w', encoding='utf-8') as f:
+            json.dump({'losses': [3.0, 2.5, 2.3]}, f)
+        cell = _record()
+        for key in ('losses', 'curve_sha256', 'ppl_history_sha256',
+                    'curve_n_points', 'curve_first', 'curve_last',
+                    'curve_best', 'curve_n_nonfinite',
+                    'curve_first_nonfinite_index'):
+            cell.pop(key, None)
+        cell['curve_ref'] = '../outside.json'
+        with open(os.path.join(panel, 'summary.json'), 'w', encoding='utf-8') as f:
+            json.dump({'csa_dynamic::seed0': cell}, f)
+        rep = L.compare_reproductions(panel, panel)
+        diag = rep['cells']['csa_dynamic::seed0']
+        assert diag['dimensions']['curve']['status'] == 'unverified', diag
+        assert 'resolves outside' in (diag['dimensions']['curve']['detail'] or ''), diag
+        assert rep['bit_identical'] is False and rep['n_curve_unverified'] == 1, rep

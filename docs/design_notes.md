@@ -6149,20 +6149,24 @@ atol=0.0)`。它把复现拆成互相独立的维度，每一维只有三种状�
 
 `metric` 单独比较 `ppl` 与 `n_tokens`：token 数不同是
 `metric_mismatch`（不是同一次测量），PPL 在 `atol + rtol*|a|` 内为
-`within_tolerance`，严格相等才是 `identical`。判定优先级：
+`within_tolerance`。PPL 严格相等只是 `identical` 的必要条件之一；曲线还
+必须 exact/非 coarse/`byte_identical`（§152）。判定优先级：
 
 ```
 任一 code/data/config/environment/initialization mismatch -> 对应 *_changed
-否则任一 unverified                    -> provenance_incomplete
+否则 curve mismatch                    -> curve_changed
+否则任一必需指纹 unverified            -> provenance_incomplete
 否则 metric 缺失/分母不同              -> metric_missing / metric_mismatch
-否则 PPL 严格相等                      -> identical
-否则 PPL 在容差内                      -> within_tolerance
+否则 PPL 严格相等且曲线 exact/byte      -> identical
+否则 PPL 与曲线都在容差内              -> within_tolerance
+否则 PPL 可复现但曲线缺失/coarse       -> endpoint_only
 否则                                    -> numerical_drift
 ```
 
-只有 `identical` / `within_tolerance` 的 `reproduced` 为真；
-`bit_identical` 额外要求 PPL 严格相等。**缺任何必需指纹都不是通过**，这和
-仓库其它 tri-state 门一致。
+只有 `identical` / `within_tolerance` / `endpoint_only` 的 `reproduced`
+为真；`bit_identical` 额外要求 PPL 严格相等、曲线 exact、非 coarse 且
+`byte_identical`（见 §152）。**缺任何必需指纹都不是通过**，这和仓库其它
+tri-state 门一致；缺曲线不否定终点，但会把 `bit_identical` 留为 false。
 
 `exp_lib.compare_reproductions(original, rerun, ...)` 接受两份 summary
 mapping、结果目录或 `summary.json` 路径，按 `variant::seedN` 逐格匹配：
@@ -6170,8 +6174,8 @@ mapping、结果目录或 `summary.json` 路径，按 `variant::seedN` 逐格匹
 - 只在一边出现的格子进入 `only_original` / `only_rerun`，汇总判
   `incomplete`，不静默取交集；
 - 没有共同格子 -> `not_comparable`；
-- 任一格 `*_changed` -> `not_reproduced`；只有全部身份维匹配而 PPL 漂移
-  才判 `drift`；全部匹配为 `reproduced`；
+- 任一格 `*_changed`（含 `curve_changed`）-> `not_reproduced`；只有全部
+  身份维匹配而 PPL 漂移才判 `drift`；全部匹配为 `reproduced`；
 - `synthesized`（由旧 aggregate 重建、没有权重/运行的记录）直接
   `not_comparable`。
 
@@ -6185,7 +6189,8 @@ python audit_gates.py reproduction results_A results_B   # 同样的检查，sta
 make reproduce A=results_A B=results_B
 ```
 
-退出码：`0` 复现（`--require exact` 时还要求逐位相同）、`1` 未复现、
+退出码：`0` 复现（`--require exact` 时还要求终点与已落盘曲线逐位相同，
+即 `bit_identical`）、`1` 未复现（含同终点不同曲线的 `curve_changed`）、
 `2` 用法/输入错误。`audit_gates.py report` 的 `reproduction` 块在没有显式
 两份目录时为 `not_verifiable_locally`：审计不会猜哪两个目录是一对重跑。
 
@@ -6194,8 +6199,9 @@ make reproduce A=results_A B=results_B
 - 这是**描述性身份比较**，不是统计检验：没有 p 值、没有置信区间，也不
   修复选择偏差、测量误差或跨硬件数值差异。`rtol`/`atol` 必须由调用方声明
   并原样回显；`reproduced` 只表示「在这些声明下两产物是同一实验」。
-- 它比较的是**记录里的身份字段**，不重新训练、不重算 PPL、不读取 test
-  split，也不改变 `CODE_SEMANTICS`、冻结清单、种子、端点或 Holm 族。
+- 它比较的是**记录里的身份字段与已落盘曲线**，不重新训练、不重算 PPL、
+  不读取 test split，也不改变 `CODE_SEMANTICS`、冻结清单、种子、端点或
+  Holm 族。
 - `exec_fp` 相同不等于逐位可复现；不同也不自动说明代码有错（可能是另一
   台合法机器）。工具把这个区别显式化，而不是替读者裁决。
 - `rng_fp` 只诊断；`init_core_fp`、`data_*`、`source_tree` 等缺失时结果
@@ -15175,3 +15181,93 @@ build/validate/篡改/冻结字段；writer 的 no-op/conflict/overwrite；
 markdown 字段；审计门的 artifact/block/test_stats/缺失/篡改路径；v12
 helper 的完整种子与渲染；n>20 的 normal fallback；report/CLI/Makefile
 接线与 `.github`/README 仍在。完整 CPU 套件在本轮最终树通过。
+
+## 152. 同一个终点不是同一次运行：复现比较必须检查已落盘的 loss/eval 曲线（本轮可复现性/工程规范硬化，no new runs）
+
+### 152.1 问题：最终 PPL 相同不等于逐位复现
+
+`compare_reproductions` 原先只比较最终 PPL（与 token 分母）。于是两次执行
+只要终点落在 `rtol`/`atol` 内，就会被判为 `identical`，并在聚合报告里写成
+`bit_identical=true`——即使两条训练轨迹从头到尾都不同。这个过度声称有两
+个来源：
+
+1. 终点是一个标量。不同的数据顺序、非确定性 kernel、不同的 resume 点或
+   一次数值发散后收敛，都可能碰巧落在同一 PPL 上；
+2. 面板写入器早已把每格曲线移到 `curves/<cell>.json` 侧车，并在 summary
+   里留下 `curve_ref` / `curve_sha256` / `curve_n_points` 等字段。比较器
+   从未读取它们，所以「有曲线可查」和「只查了终点」在报告里长得一样。
+
+结果是：复现门可以说「逐位相同」，但没有检查任何一条曲线。这是可复现性
+声明，不是统计主张；它不需要新的实验，只需要把已有证据读完。
+
+### 152.2 方法：读取、强度、状态与判定四层
+
+新增 `curve` 维（`reproduction_diagnosis_v2`）：
+
+1. **读取层。** 先看 summary 内联的 `losses` / `ppl_history`；否则按
+   `curve_ref`（或 `ppl_history_ref`）相对**该 summary 所在目录**解析侧车。
+   相对路径不以审计者的当前工作目录为基准，因此同一份产物在任意 checkout
+   下比较结果一致。侧车缺失/不可解析/形状错误只写进 `problems`，不抛异常。
+2. **强度层。** 两侧都有同一字段的 SHA-256（`curve_sha256` 或
+   `ppl_history_sha256`）时，摘要相同即 `exact`；摘要不同且两侧数组都可读
+   时再做逐点比较，以区分「只是序列化字节不同」与「数值真的漂移」。没有
+   摘要时逐点比较；没有数组时退到 `curve_n_points` / `curve_first` /
+   `curve_last` / `curve_best` / `curve_n_nonfinite` /
+   `curve_first_nonfinite_index` 的标量摘要，并显式标 `coarse=true`。
+3. **状态层。** `exact`（逐点相同或摘要相同）、`within_tolerance`（逐点
+   都在 `atol + rtol*max(|a|,|b|)` 内）、`mismatch`（有可比较证据且超差）、
+   `unverified`（没有可比较证据）。`None` 与非有限值按同一「缺失/发散」
+   标记处理，只有两侧在同一位置都缺失时才不算差异；布尔与字符串不是损失
+   值，不会被强制转成 0/1 或数值，而是直接 `unverified`。
+4. **判定层。**
+   - 曲线 `mismatch` → 单元 `curve_changed`，整 panel
+     `not_reproduced`；即使终点完全相同也失败。
+   - 终点 exact + 曲线 exact 且 `byte_identical`（非 coarse）→
+     `identical`。
+   - 终点/曲线至少一侧只落在容差内，或曲线摘要字节不同 →
+     `within_tolerance`（可复现的数值，但不是逐位相同）。
+   - 终点可复现但曲线缺失或只有标量摘要 → `endpoint_only`：端点复现，
+     不是整次运行复现；`bit_identical=false`。
+   - `bit_identical` 现在要求身份维全部 match、终点 exact、曲线 exact、
+     非 coarse 且 `byte_identical`。这是对旧 `bit_identical` 的收紧，所以
+     schema 从 `reproduction_diagnosis_v1` 升到 v2；v1 报告不能与新报告
+     混读。
+
+聚合报告新增 `n_curve_compared` / `n_curve_identical` /
+`n_curve_unverified` / `n_curve_mismatch`，并把 `curve_changed` 计入
+`not_reproduced`。`audit_gates.py reproduction` 同步把
+`curve_changed` 判为 `fail`，并回显曲线计数；`--require exact` 现在同时
+要求终点与曲线逐位相同。
+
+### 152.3 边界：它检查的是已记录证据，不是重跑
+
+- 不训练、不重跑、不读 test split；只读 `summary.json` 与其
+  `curve_ref` 侧车。没有曲线时不会凭空生成，也不会把缺曲线当成通过。
+- 曲线比较不能替代独立复现。它只回答「这两份落盘产物记录的是同一条
+  轨迹吗」；两份都缺失、都被截断、或都记录错的曲线，仍然无法由本门
+  证明。
+- `curve_sha256` 覆盖整个侧车负载（losses / delta_trace / ppl_history /
+  opt_diag），所以「数值相同但摘要不同」被判为不是逐位相同，这是有意的：
+  辅助诊断不同也是运行不同。
+- 标量摘要匹配仍不是逐点匹配；`coarse=true` 时不会给出
+  `bit_identical`。
+- 该维不产生 p 值、不进入任何 Holm 族、不改变 `p_exact_signflip` /
+  `p_holm` / `verified` / `confirmed`；它只影响复现门的措辞与退出码。
+
+### 152.4 入口与验证
+
+```bash
+python -m explib.reproduce compare ORIGINAL RERUN
+python -m explib.reproduce compare ORIGINAL RERUN --require exact
+python audit_gates.py reproduction ORIGINAL RERUN
+make reproduce A=ORIGINAL B=RERUN
+```
+
+`test_review_part_23.py` 新增 5 项、共 12 项：同终点不同曲线的
+`curve_changed` 与聚合计数；曲线容差与 `rtol=0` 的区分；缺曲线的
+`endpoint_only`；标量摘要的 `coarse` 匹配与不匹配；`curve_ref` 侧车的
+逐点读取；摘要相同但 `curve_sha256` 不同（数值相同、字节不同）的
+`within_tolerance`；摘要不同且无负载的确定 mismatch；`curve_ref` 逃逸
+summary 目录时拒绝读取并报 unverified；CLI 对同终点不同曲线在两个
+`--require` 模式下都退出 1；审计门 `curve_changed` 判 fail。完整 CPU
+套件在本轮最终树通过。

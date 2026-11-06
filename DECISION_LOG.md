@@ -7639,3 +7639,58 @@ resolution-limited；全零 not_estimable；单条件 not_applicable；声明错
 fail-closed；artifact/block 重放/篡改/冻结字段；writer 三态；markdown；
 审计门四态；v12 helper；n>20 fallback；report/CLI/Makefile 接线与
 `.github`/README 仍在。完整 CPU 套件在本轮最终树通过。
+
+## 2026-11-06 — 同一个终点不是同一次运行：复现比较器必须比较已落盘的 loss/eval 曲线（本轮可复现性/工程规范硬化，no new runs）
+
+**Problem.** `compare_reproductions` / `reproduction_diagnosis` 只比较最终
+PPL 与 token 分母。两次执行只要终点落在 `rtol`/`atol` 内就被判为
+`identical`，聚合报告还会写 `bit_identical=true`，即使训练轨迹从第一步就
+不同。面板写入器实际上已经把每格曲线移到 `curves/<cell>.json` 侧车，并在
+summary 里留下 `curve_ref` / `curve_sha256` / `curve_n_points` 等字段；
+比较器从未读取它们。于是「有曲线可查」和「只查了终点」在复现报告里长得
+一样，`bit_identical` 是一个没有轨迹证据支撑的声明。
+
+**Fix.** 在 `explib/_parts/part_37_reproduction.py` 增加 `curve` 维：
+
+- `_repro_curve_payload` 先读内联 `losses` / `ppl_history`，否则按
+  `curve_ref`（或 `ppl_history_ref`）相对**summary 所在目录**解析侧车；
+  相对路径不依赖审计者的 cwd。侧车缺失/损坏只记 `problems`，不抛异常。
+- `_repro_curve_values_compare` 逐点比较：`None` 与非有限值按同一「缺失/
+  发散」标记；两侧同位置都缺失才算相同。`np.array_equal(equal_nan=True)`
+  给 `exact`，`np.isclose(rtol, atol, equal_nan=True)` 给
+  `within_tolerance`，否则 `mismatch` 并报首个差异下标与最大绝对差。
+- `_repro_curve_dimension` 分层：两侧同字段 SHA-256 相同 → `exact`
+  (`byte_identical=true`)；摘要不同但两侧数组可读 → 逐点比较，数值相同
+  也保留 `byte_identical=false`；无摘要 → 逐点；无数组 → 标量摘要
+  (`coarse=true`)；无任何证据 → `unverified`。
+- `reproduction_diagnosis` 的判定：曲线 `mismatch` 直接
+  `curve_changed`（`reproduced=false`，即使终点 exact）；终点 exact 且
+  曲线 exact、非 coarse、`byte_identical` 才 `identical`；其余可复现情形
+  （容差/字节不同）为 `within_tolerance`；终点可复现但曲线缺失或只有
+  标量摘要为 `endpoint_only`（`reproduced=true`、`bit_identical=false`）。
+  `bit_identical` 现在要求身份维全部 match、终点 exact、曲线 exact 且
+  `byte_identical`。`REPRODUCTION_SCHEMA` 升为
+  `reproduction_diagnosis_v2`，v1 报告不能与新语义混读。
+- 聚合报告新增 `n_curve_compared` / `n_curve_identical` /
+  `n_curve_unverified` / `n_curve_mismatch`，`curve_changed` 计入
+  `not_reproduced`；`audit_gates.py reproduction` 同步判 fail 并回显曲线
+  计数；`--require exact` 同时要求终点与曲线逐位相同。
+
+**Boundary.** 这是**只读的产物比较**，不训练、不重跑、不读 test split。
+它只回答「两份已落盘产物记录的是同一条轨迹吗」，不能替代独立复现：两侧
+都缺曲线、都被截断或都记录错时，本门仍无法给出证明，只会报
+`unverified` / `endpoint_only`。`curve_sha256` 覆盖整个侧车负载
+（losses/delta_trace/ppl_history/opt_diag），所以「数值相同、摘要不同」被
+判为不是逐位相同是有意的。标量摘要匹配只是 coarse，不产生
+`bit_identical`。该维不产生 p 值、不进入 Holm 族、不改变
+`p_exact_signflip` / `p_holm` / `verified` / `confirmed`。
+
+**Verification.** `test_review_part_23.py` 新增 5 项（共 12 项）：同终点
+不同曲线报 `curve_changed` 且聚合计数正确；曲线容差与 `rtol=0` 的区分；
+缺曲线为 `endpoint_only` 且 `bit_identical=false`；标量摘要的 coarse 匹配
+与不匹配；`curve_ref` 侧车逐点读取；数值相同但 `curve_sha256` 不同为
+`within_tolerance` + `bit_identical=false`；摘要不同且无负载为确定
+mismatch；`curve_ref` 逃逸 summary 目录时拒绝读取并报 unverified；CLI 在
+默认与 `--require exact` 下都对同终点不同曲线退出 1；审计门
+`curve_changed` 判 fail。相关 `test_review_part_37/51/54/70/24` 与完整
+CPU 套件在本轮最终树通过。

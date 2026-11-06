@@ -52,6 +52,7 @@ def _record(*, env='env', env_v2='v2', env_v3='v3', ppl=10.0, tokens=1000):
             'loss_terms': ['ce', 'comp_reg'],
         },
         'provenance': prov,
+        'losses': [3.0, 2.5, 2.3],
         'synthesized': False,
     }
     if env_v2 is not None:

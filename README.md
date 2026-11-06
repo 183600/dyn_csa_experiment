@@ -314,7 +314,7 @@ also needs the small `__main__.py` entry point that calls `_run_cli`.
 | `explib/confirmation/` | **the v12 confirmation driver** (`python -m explib.confirmation`; reviewer-response + review-2 hardening): P5C trains all six frozen arms at the manifest seed list, P5MP runs the extended corruption-mode probe (uniform/realistic-token/mask/delete + review-2 span/doc/topical + NIAH-natural), P5S2/P5S3 add the token-matched and 6ND-param-proxy scale arms, P5T performs the frozen final evaluation on the held-out WikiText-103 test split per `confirmation_frozen.json` — with a load-time plan-power gate (a plan that cannot mathematically confirm is refused), strict record admission (seed whitelist / unique records / one frozen test slice / recipe signature / manifest sha), a first-access freeze lock, and per-document PPL records |
 | `explib/open_block/` | **open-block panel driver** (`python -m explib.open_block`): maximum block length (32/64/128/no cap) × current-block reading rule (`closed` / `prefix_summary` / `prefix_singletons`), with a shared top-k budget, causal prefix construction, outside-window auxiliary panel, paired per-seed deltas and interaction statistics — see `docs/design_notes.md` §24 |
 | `explib/m0/` | **the M0/S1 driver (adopted B tier)** (`python -m explib.m0`): entry points for the scale-up roadmap — `params` (zero-GPU S1–S4 parameter audit), `data` (FineWeb-Edu + 32k-BPE corpus cache), `smoke` (end-to-end self-check on the B-tier data path), `kernel` (the G0 validation suite: kernel/eager numerical comparison for the three operators plus the sparse-attention benchmark), `analysis`, `full` (the S1 panel) and `auto`; see [B-tier M0/S1](#b-tier-m0--s1-scale-up-entry-point-adopted-tier-b) |
-| `explib/reproduce/` | **cross-run reproduction comparator** (`python -m explib.reproduce compare ORIGINAL RERUN`): matches two panel summaries cell by cell and reports whether they share source bytes, data slice, configuration, execution environment and matched initialization, plus whether the final PPL is exact/within a declared tolerance. Missing provenance is `provenance_incomplete`, never a pass; the same check is exposed as `audit_gates.py reproduction ORIGINAL RERUN` — see `docs/design_notes.md` §83 |
+| `explib/reproduce/` | **cross-run reproduction comparator** (`python -m explib.reproduce compare ORIGINAL RERUN`): matches two panel summaries cell by cell and reports whether they share source bytes, data slice, configuration, execution environment and matched initialization, whether the recorded loss/eval trajectory differs, and whether the final PPL is exact/within a declared tolerance. An equal endpoint with a different curve is `curve_changed`; `bit_identical` requires an identical curve. Missing provenance is `provenance_incomplete`, never a pass; the same check is exposed as `audit_gates.py reproduction ORIGINAL RERUN` — see `docs/design_notes.md` §83 and §152 |
 
 ### Tests and frozen inputs
 
@@ -391,15 +391,18 @@ report:
 
 ```bash
 python -m explib.reproduce compare results_lm_v3_1500 results_lm_v3_1500_rerun
-# exit 0 only when source bytes, data slice, config, environment, matched
-# initialization and the declared PPL tolerance all line up; use
-# --require exact for a bit-identical demand.
+# exit 0 when source bytes, data slice, config, environment, matched
+# initialization and the declared PPL tolerance line up. A recorded loss/eval
+# curve that differs exits 1 as curve_changed; a missing curve is
+# endpoint_only (exit 0, bit_identical=false). Use --require exact for a
+# bit-identical demand.
 ```
 
 The verifier reports each dimension separately, so `environment_changed`,
-`data_changed`, `code_changed` and `numerical_drift` are not collapsed into one
-"did not reproduce" message. A missing fingerprint is
-`provenance_incomplete` (never a pass).
+`data_changed`, `code_changed`, `curve_changed` and `numerical_drift` are not
+collapsed into one "did not reproduce" message. A missing fingerprint is
+`provenance_incomplete` (never a pass); a missing curve leaves the endpoint
+comparable but `bit_identical` false.
 
 Two already-built report files can be compared without re-running anything:
 

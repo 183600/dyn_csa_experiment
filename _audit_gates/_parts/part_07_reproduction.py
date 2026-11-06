@@ -11,7 +11,9 @@ def audit_reproduction(original=None, rerun=None, *, rtol=1e-6, atol=0.0):
 
     A "reproduced" claim is only quotable when the two runs share source
     bytes, data slice, configuration, execution environment and matched
-    initialization, and the final PPL is inside the declared tolerance.
+    initialization, the final PPL is inside the declared tolerance, and the
+    recorded loss/eval trajectory does not differ.  Equal final PPL with a
+    different curve is a ``curve_changed`` failure, not a reproduction.
     Missing provenance is reported as ``not_verifiable_locally``, never as a
     pass.  This gate is read-only and never touches the test split.
     """
@@ -49,21 +51,40 @@ def audit_reproduction(original=None, rerun=None, *, rtol=1e-6, atol=0.0):
     out['bit_identical'] = bool(report.get('bit_identical'))
     out['n_compared'] = report.get('n_compared')
     out['counts'] = report.get('counts') or {}
+    out['n_curve_compared'] = report.get('n_curve_compared')
+    out['n_curve_identical'] = report.get('n_curve_identical')
+    out['n_curve_unverified'] = report.get('n_curve_unverified')
+    out['n_curve_mismatch'] = report.get('n_curve_mismatch')
     out['problems'] = list(report.get('problems') or [])
     out['warnings'] = list(report.get('warnings') or [])
     if report.get('verdict') == 'reproduced':
         out['status'] = 'ok'
-        out['note'] = ('every matched cell matches on source/data/config/'
-                       'environment/initialization and the final metric is '
-                       'inside the declared tolerance')
-    elif report.get('verdict') in ('not_reproduced', 'drift', 'not_comparable'):
+        _n_cmp = out['n_curve_compared'] or 0
+        _n_ident = out['n_curve_identical'] or 0
+        if out['n_curve_unverified']:
+            out['note'] = ('the endpoint and identity dimensions reproduce, '
+                           f'but {out["n_curve_unverified"]} cell(s) have no '
+                           'comparable recorded curve; bit_identical is not '
+                           'claimed')
+        elif _n_cmp and _n_ident < _n_cmp:
+            out['note'] = ('the endpoint and identity dimensions reproduce, '
+                           'but the recorded curve matches only within '
+                           'tolerance (not bit-identical)')
+        else:
+            out['note'] = ('every matched cell matches on source/data/config/'
+                           'environment/initialization, the recorded trajectory '
+                           'does not differ, and the final metric is inside the '
+                           'declared tolerance')
+    elif report.get('verdict') in ('not_reproduced', 'drift', 'not_comparable',
+                                   'curve_changed'):
         out['status'] = 'fail'
         out['note'] = ('the rerun is not a reproduction under the declared '
-                       'tolerance; see the dimension-level report')
+                       'tolerance; an equal endpoint with a different '
+                       'trajectory fails at the curve dimension')
     else:
         out['status'] = 'not_verifiable_locally'
-        out['note'] = ('the comparison is incomplete: missing cells or '
-                       'provenance mean the runs cannot be called a '
-                       'reproduction either way')
+        out['note'] = ('the comparison is incomplete: missing cells, '
+                       'provenance or curves mean the runs cannot be called '
+                       'a reproduction either way')
     print(json.dumps(out, ensure_ascii=False, indent=2)[:4000])
     return out
