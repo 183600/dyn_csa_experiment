@@ -294,21 +294,14 @@ jobs:
           RUN_HOURS=3
           DEADLINE=$(( $(date +%s) + RUN_HOURS*3600 - 600 ))
 
-          # ================= 五阶段提示词 =================
+          # ================= 各阶段提示词 =================
           PROMPT_PERF='优化代码的性能和显存占用，不要输出或写入"优化了哪些内容"的报告。注意以后可能会scale。另外，.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件；README*.md（含 README_zh.md、README_en.md 等所有语言版本的 README） 是项目说明文档，同样绝对不能删除或移动。DECISION_LOG.md 是入库的决策记录，绝对不能删除或移动。'
           PROMPT_BUG='仔细检查代码中是否存在bug，如果有就修改代码。注意以后可能会scale。另外，.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件；README*.md（含 README_zh.md、README_en.md 等所有语言版本的 README） 是项目说明文档，同样绝对不能删除或移动。'
 
-          # ================= 科研方法改进阶段（sci）：提示词池，每次运行时随机选一个 =================
-          # SCI_1 为通用提示词：只要求改进科研方法，不指定改进哪一方面；
-          # SCI_2~SCI_6 各自只聚焦一个方面：实验设计与准备 / 数据处理 / 可复现性与工程规范 / 对比实验与消融 / 结果分析。
-          PROMPT_SCI_1='改进这个项目的科研方法。另外，.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件；README*.md（含 README_zh.md、README_en.md 等所有语言版本的 README） 是项目说明文档，同样绝对不能删除或移动。'
-          PROMPT_SCI_2='从实验设计与准备的角度改进这个项目的科研方法。另外，.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件；README*.md（含 README_zh.md、README_en.md 等所有语言版本的 README） 是项目说明文档，同样绝对不能删除或移动。'
-          PROMPT_SCI_3='从数据处理的角度改进这个项目的科研方法。另外，.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件；README*.md（含 README_zh.md、README_en.md 等所有语言版本的 README） 是项目说明文档，同样绝对不能删除或移动。'
-          PROMPT_SCI_4='从可复现性与工程规范的角度改进这个项目的科研方法。另外，.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件；README*.md（含 README_zh.md、README_en.md 等所有语言版本的 README） 是项目说明文档，同样绝对不能删除或移动。'
-          PROMPT_SCI_5='从对比实验与消融的角度改进这个项目的科研方法。另外，.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件；README*.md（含 README_zh.md、README_en.md 等所有语言版本的 README） 是项目说明文档，同样绝对不能删除或移动。'
-          PROMPT_SCI_6='从结果分析的角度改进这个项目的科研方法。另外，.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件；README*.md（含 README_zh.md、README_en.md 等所有语言版本的 README） 是项目说明文档，同样绝对不能删除或移动。'
-          # SINGLE 与 SCI_1~6 一起进入随机池：命中时本轮 sci 做单因素实验检查。
-          PROMPT_SINGLE='确保需要是单因素实验的实验都是单因素实验。另外，.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件；README*.md（含 README_zh.md、README_en.md 等所有语言版本的 README） 是项目说明文档，同样绝对不能删除或移动。'
+          # ================= 科研方法改进阶段（sci）已移除 =================
+          # 按需求去除「改进科研方法」的 LLM 调用：原 sci 阶段（随机七选一的科研方法
+          # 提示词）不再进入主循环，也不再发起任何 dsh / opencode 调用。
+          # 其余阶段（bug / apply / docs / testfix）的调用保持不变。
           PROMPT_CLEAN='不要修改 docs/design_notes.md（设计笔记，不属于“多余的内容”）；确保远程仓库里没有实验结果文件、REPORTxx.md、autodl_budgetxx.json 以及算力申请.md（该文件已废弃，若再次出现请删除）；确保 docs 目录只保留 design_notes.md；docs/compute_plan.md 已废弃并从仓库删除，绝对不要重新创建；确保远程仓库中没有任何关于性能、预算、花费、修复了哪些bug和显存占用的记录（包括注释），但 docs/design_notes.md 中的设计记录除外。删除所有多余的内容。注意：.github 目录是 CI 配置，必须原样保留，绝对不能删除、修改或移动其中任何文件，它不属于“多余的内容”；README*.md（含 README_zh.md、README_en.md 等所有语言版本的 README） 是项目说明文档，同样必须原样保留，绝对不能删除或移动，也不属于“多余的内容”；DECISION_LOG.md 与 RELEASES.md 是入库的证据/决策记录，同样必须原样保留，绝对不能删除或移动。'
           PROMPT_APPLY='确保 docs/design_notes.md 存在且没有被误删或清空；若发现算力申请.md 再次出现则删除它（已废弃）。docs/compute_plan.md 已废弃并从仓库删除，绝对不要重新创建。不要修改 docs/design_notes.md 的内容。不要删除或移动 README*.md（含 README_zh.md、README_en.md 等所有语言版本的 README）；.github 目录是 CI 配置，绝对不要删除、修改或移动其中任何文件。'
           # ================= 新增：docs 阶段提示词（每次循环 1/10 概率执行） =================
@@ -320,7 +313,6 @@ jobs:
           # 阶段正常结束会立即返回，上限只在模型卡住时生效。
           PERF_TIMEOUT=$((3*3600))     # 3h（性能与显存优化；当前该阶段已停用）
           BUG_TIMEOUT=$((3*3600))      # 3h
-          SCI_TIMEOUT=$((3*3600))      # 3h
           CLEAN_TIMEOUT=$((3*3600))     # 3h（当前该阶段已从主循环移除）
           APPLY_TIMEOUT=$((3*3600))     # 3h（算力申请.md 检查）
           DOCS_TIMEOUT=$((3*3600))    # 3h（docs 阶段：优化代码与文档，1/10 概率执行）
@@ -1143,27 +1135,14 @@ jobs:
               break
             fi
 
-            # ----- 阶段：perf 与 clean 已停用 → bug -> sci（7 选 1，含单因素）-> apply（clean 的清理工作交给收尾的 shell 步骤）-----
-            # for phase in perf bug sci clean apply; do
-            for phase in bug sci apply; do
+            # ----- 阶段：perf / clean / sci 已停用 → bug -> apply -----
+            # sci（改进科研方法）阶段已移除：该阶段原本会随机挑选一个科研方法提示词
+            # 并发起一次 LLM 调用，现按需求彻底去掉，不再产生任何 dsh / opencode 调用。
+            # clean 的清理工作交给收尾的 shell 步骤。
+            for phase in bug apply; do
               case "$phase" in
                 perf)  P="$PROMPT_PERF";  T="$PERF_TIMEOUT"  ;;
                 bug)   P="$PROMPT_BUG";   T="$BUG_TIMEOUT"   ;;
-                sci)
-                  # 科研方法改进：从 PROMPT_SCI_1~6 + PROMPT_SINGLE 中随机选一个提示词（7 选 1）
-                  SCI_ROLL=$(( (RANDOM % 7) + 1 ))
-                  case "$SCI_ROLL" in
-                    1) P="$PROMPT_SCI_1"; SCI_LABEL='通用（不指定方面）' ;;
-                    2) P="$PROMPT_SCI_2"; SCI_LABEL='实验设计与准备' ;;
-                    3) P="$PROMPT_SCI_3"; SCI_LABEL='数据处理' ;;
-                    4) P="$PROMPT_SCI_4"; SCI_LABEL='可复现性与工程规范' ;;
-                    5) P="$PROMPT_SCI_5"; SCI_LABEL='对比实验与消融' ;;
-                    6) P="$PROMPT_SCI_6"; SCI_LABEL='结果分析' ;;
-                    7) P="$PROMPT_SINGLE"; SCI_LABEL='单因素实验' ;;
-                  esac
-                  T="$SCI_TIMEOUT"
-                  echo "[info] sci 阶段随机选中科研方法提示词 #$SCI_ROLL：$SCI_LABEL"
-                ;;
                 clean) P="$PROMPT_CLEAN"; T="$CLEAN_TIMEOUT" ;;
                 apply) P="$PROMPT_APPLY"; T="$APPLY_TIMEOUT" ;;
               esac
@@ -1181,9 +1160,9 @@ jobs:
               # 无论成功失败，先把已完成的改动提交上去
               commit_and_push "$i-$phase"
 
-              # ⭐ 测试门：bug / sci 阶段提交后都跑一遍全量测试，详见 maybe_run_tests
+              # ⭐ 测试门：bug 阶段提交后跑一遍全量测试，详见 maybe_run_tests
               case "$phase" in
-                bug|sci) maybe_run_tests "$i" ;;
+                bug) maybe_run_tests "$i" ;;
               esac
 
               sleep 5
@@ -1205,7 +1184,7 @@ jobs:
                 echo ">>> iteration #$i | phase=docs | budget=${T}s"
                 run_phase docs "$P" "$T"
                 commit_and_push "$i-docs"
-                # ⭐ 测试门：docs 阶段也可能触碰代码，提交后与 bug / sci 一样跑全量测试
+                # ⭐ 测试门：docs 阶段也可能触碰代码，提交后与 bug 一样跑全量测试
                 maybe_run_tests "$i"
               fi
             else
