@@ -152,6 +152,7 @@ _PARTS = [
 'part_83_contrast_interaction.py',
 'part_84_sequential_design.py',
 'part_85_budget_ablation.py',
+'part_86_curve_inference.py',
 ]
 
 load_root_package(globals(), __file__, _PARTS,

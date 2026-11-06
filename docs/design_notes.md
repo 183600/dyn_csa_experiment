@@ -15019,3 +15019,159 @@ tamper/forbidden-field；pilot 摘要与 MDE；writer 的 no-op/conflict/
 overwrite；manifest/protocol reader；审计门的 not_applicable/not_verifiable/
 timing fail/manifest mismatch/off-schedule/protocol conflict；CLI/Makefile
 接线与 README/.github 仍在。完整 CPU 套件在本轮最终树通过。
+
+## 151. 一行一个 p 值不是一条曲线：有序条件的 max-T 同时带、平坦性 range 检验与 IUT 等价（本轮结果分析硬化，no new runs）
+
+零 GPU 的结果分析硬化；不新增训练、不读取 test split、不修改
+`confirmation_frozen*.json` 的字节/种子/端点/α/Holm 规则，也不改
+`CODE_SEMANTICS`；`.github/` 与所有 README 未删除、未移动、未修改。
+
+### 151.1 问题：逐条件显著不是「整条曲线」的陈述
+
+v12 报告已经给出每个评测长度的逐种子配对效应、逐长度 exact sign-flip
+p、pointwise 95% 区间，以及相对参考长度的交互检验。它们回答的是
+「某个长度上是否有效应」与「某个长度相对参考长度是否不同」，但没有回答
+以下三种**曲线级**主张：
+
+1. **所有条件同向改善**。把 L512、L1024、L2048、L4096 的 p 都算一遍，
+   再要求每个 p<α，不是「整条曲线都改善」的族级陈述：四个逐条件检验
+   没有共同的水平控制；而且「四个都显著」与「四个都同向」是不同事件。
+2. **整条曲线在实践中平坦/等价**。交互 p 不显著只说明「没检出差异」，
+   不是「所有两两差都在 SESOI 内」。§52/§67 已经反复强调这一点，但
+   报告仍缺少一个把**全部条件**（而不是参考对比）放进同一个等价主张的
+   对象。
+3. **曲线是否有一个整体形状**。逐相邻对比或相对参考的 Holm 不是
+   「所有条件均值相等」的单一检验；后者需要以 range 为统计量的一次
+   联合检验。
+
+这不是又一个逐条件 p 值的排列组合，而是把推断单位从「一行」提升到
+「整条曲线」：一个 max-T 同时带、一个 range 检验、两个 intersection-union
+（IUT）主张。
+
+### 151.2 方法：同一批完整种子上的三个精确对象
+
+令第 s 个种子在第 k 个条件上的配对效应为 `d[s,k]`（PPL 曲线取
+`log(PPL_a)-log(PPL_b)`）。所有条件必须使用**同一个完整种子集合**：
+某个种子缺任一条件，就整颗从曲线剔除并具名，绝不按位置配对、绝不插补。
+在这个矩阵上：
+
+#### (a) 条件族的 exact sign-flip max-T
+
+复用 `exp_lib.maxt_signflip_adjust`（§92/§143 的同一台机器）：对
+`2**n` 个符号翻转枚举整个条件向量，用 sign-invariant 的 score 尺度
+`|Σ d| / sqrt(Σ d²)` 做 studentised max-T，得到
+
+- 每个条件的 `p_adj_single`（single-step max-T）与 `p_adj_stepdown`
+  （Westfall–Young free step-down）；
+- 每个条件的 `ci_simultaneous = mean ± c * sd/sqrt(n)`，其中 `c` 是
+  条件族最大统计量的精确分位数；
+- `family.p_floor_single = 2/2**n` 与 `family.ci_tail_level`。
+
+这一步只回答「在这个条件族里，哪个条件在族级水平上可分辨」。它是
+逐条件的族级读数，不是整条曲线的同向/等价陈述。
+
+#### (b) 平坦性：range 的一次 exact sign-flip 检验
+
+令 `R = max_k mean_k - min_k mean_k`。在「所有条件均值相等」的零假设下，
+把同一个种子的所有条件同时乘上 `ε_s ∈ {±1}`，`R` 的分布与
+「所有均值为 0」时相同：因为 `ε_s μ` 是加在所有条件上的同一个常数，
+range 对共同平移不变。于是
+
+```
+p_range = P(R* >= R_obs),  R* = range(Σ_s ε_s d[s,:] / n)
+```
+
+是一次精确的 sign-flip range 检验，不需要逐对做检验再取最小 p。它回答
+「曲线是否整体不平坦」，而不是「哪一对不同」。`range_critical` 与
+`range_upper_bound = R_obs + c_range` 是 t 样式的描述性上界，明确标注
+不是精确置信区间。
+
+#### (c) 同向与等价：IUT 不需要多重校正
+
+- **全部同向改善**：对每个条件做单侧 exact sign-flip 下尾检验
+  `p_lower[k] = P(mean*_k <= mean_k)`。要主张「所有条件都改善」，零假设是
+  交集 `∩_k {μ_k >= 0}`；取
+  `p_IUT = max_k p_lower[k]`。IUT 的交集零假设意味着每个分量零假设都成立，
+  所以不需要再乘 `m`；`p_IUT` 就是整个交集主张的有效 p。全部同向变差
+  同理用 `p_upper`。
+- **全部条件在 margin 内**：对每个条件做 exact sign-flip TOST
+  （§141），取 `p_IUT = max_k p_tost[k]`；`p_IUT <= α` 才能说「整条曲线
+  都在 ±margin 内」。
+- **全部两两差在 flatness margin 内**：对每一对条件做 exact sign-flip
+  TOST，取所有对的 `max p_tost`；这是「整条曲线任意两点之差都在 margin
+  内」的 IUT p。
+
+IUT 的保守性是**方向上的**：它要求每个分量都拒绝；但它不会因为
+「看了很多对」而需要把 α 除以对数。这与「先做交互检验再逐对比较」是
+不同的推断对象，不能互相替代。
+
+### 151.3 产物、重放与审计门
+
+`curve_simultaneous_inference(conditions, effects, seeds=..., alpha=...,
+min_n=..., margin=..., flatness_margin=..., max_n=20)` 返回一个
+strict-JSON 的结果；`curve_inference_block(...)` 返回无时间戳的
+`{kind, inputs, result}`，由 v12 的 `_length_curve_inference` 写入
+`comparisons[*].length_curve_inference`。独立产物用
+`build_curve_inference` / `write_curve_inference` 落成
+`curve_inference.json`：
+
+- `inputs`：conditions、逐条件逐种子 effects（缺测为 null）、seeds、
+  alpha、min_n、margin、flatness_margin、max_n；
+- `result`：完整种子集合、dropped seeds、条件族 max-T（adjusted p、
+  同时区间、critical value、p floor）、逐条件 pointwise/one-sided/TOST、
+  range 检验、uniform IUT、warnings；
+- `content_sha256` 绑定 `inputs`/`result`；validator 从 `inputs` 完整
+  重放并逐字段对账，拒绝 `confirmed`/`p_holm`/`verified`/`verdict`/
+  `decision` 等冻结字段。
+
+`audit_gates.py curve_inference`（别名 `length_curve` /
+`curve_simultaneous` / `uniform_curve` / `curve_flatness`）优先重放
+`analysis_v12/test_stats.json` 中每个 comparison 的
+`length_curve_inference` 块；没有 test_stats 时读独立 artifact。缺块报
+`not_applicable`（可选的曲线分析没跑），缺产物/不可估计报
+`not_verifiable_locally`，重放不一致/篡改/夹带冻结字段报 `fail`。接入
+`audit_gates.py report` 顶层与 `make curve-inference`。
+
+### 151.4 边界：它修复什么，不修复什么
+
+- **不是新的确认性检验。** 不训练、不读 split、不产生确认 p 值、不进入
+  冻结 Holm 族，也不改 `p_exact_signflip`/`p_holm`/`verified`/
+  `confirmed`。v12 的冻结主终点仍由原来的逐种子 exact sign-flip 与
+  Holm 决定。
+- **max-T 区间是 t 样式近似。** 精确对象是 adjusted p、range p 与 IUT p；
+  `ci_simultaneous` 用精确临界值但按 `mean ± c*sem` 构造，`ci_tail_level`
+  是实际尾质量，不是覆盖证明。报告不得把该区间写成「精确 95% CI」。
+- **符号对称假设与主检验相同。** 所有 exact 对象都依赖「同一条件内的
+  配对差关于 0 对称」；种子不是随机样本，跨条件相关由同一个 `ε_s`
+  保留，但这不修复选择偏差、optional stopping 或跨语料外推。
+- **IUT 不是「任一条件」检验。** `p_IUT` 只对「所有条件都满足」的
+  交集主张有效；不能用它反过来说「某一条显著」。反过来，某个条件
+  max-T adjusted p 不显著，也不妨碍全部同向 IUT 成立（两者是不同族）。
+- **n>20 是近似。** exact 枚举上限为 20 个完整种子；超过后退回
+  Bonferroni-normal 近似并显式 warning，不能与 exact 结果混写。
+- **一个条件没有平坦性。** `K<2` 时 range 与两两等价为
+  `not_applicable`，不伪造一个「平坦」结论。
+- **不替代逐条件报告。** 曲线级读数与逐长度表并列；不能只引用更有利的
+  一个，也不能把曲线级「全部改善」写成机制因果。
+
+### 151.5 入口与验证
+
+```bash
+python -m pytest -q test_review_part_92.py
+python audit_gates.py curve_inference          # 默认 analysis_v12/test_stats.json
+python audit_gates.py curve_inference PATH     # 独立 artifact / block
+python audit_gates.py length_curve PATH        # 别名
+make curve-inference
+```
+
+`test_review_part_92.py` 21 项覆盖：单侧/TOST 与 `2**n` 暴力枚举逐值对拍；
+range 检验与暴力枚举对拍、共同平移不变；max-T adjusted p 不低于
+pointwise、同时区间半宽等于 `critical*sem`；全同向 IUT 的「一个反例即
+关闭」；全条件 margin IUT；全两两 flatness IUT；单调曲线被 range 检出、
+常数曲线不检出；缺条件种子整颗剔除并具名、不插补；underpowered/
+resolution-limited 的具名 warning；全零矩阵 not_estimable；单条件
+flatness not_applicable；声明错误 fail-closed；artifact/block 的
+build/validate/篡改/冻结字段；writer 的 no-op/conflict/overwrite；
+markdown 字段；审计门的 artifact/block/test_stats/缺失/篡改路径；v12
+helper 的完整种子与渲染；n>20 的 normal fallback；report/CLI/Makefile
+接线与 `.github`/README 仍在。完整 CPU 套件在本轮最终树通过。

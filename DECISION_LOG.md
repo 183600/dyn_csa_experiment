@@ -7587,3 +7587,55 @@ forbidden-field；pilot 摘要与 MDE；writer 的 no-op/conflict/overwrite；
 manifest/protocol reader；审计门的 `not_applicable`/`not_verifiable_locally`/
 timing fail/manifest mismatch/off-schedule/protocol conflict；CLI/Makefile
 接线与 README/.github 仍在。完整 CPU 套件在本轮最终树通过。
+
+## 2026-11-06 — 一行一个 p 值不是一条曲线：有序条件的 max-T 同时带、平坦性 range 检验与 IUT 等价（结果分析硬化，no new runs）
+
+**Problem.** 报告已经有逐长度的 exact sign-flip p、pointwise 区间和相对
+参考长度的交互检验，但没有曲线级对象。于是「所有长度都改善」被写成多个
+逐条件 p 的合取，「曲线平坦」被写成交互 p 不显著，「全部长度在 margin
+内」没有对象可查。前者没有共同族水平，后两者把「没检出差异」当成
+「等价」。
+
+**Fix.** 新增 `explib/_parts/part_86_curve_inference.py`：
+
+- 同一批完整种子的 `d[s,k]` 矩阵；缺任一条件的种子整颗剔除并具名，不
+  插补。
+- 复用 `maxt_signflip_adjust` 做条件族 exact sign-flip max-T，给出
+  `p_adj_single`/`p_adj_stepdown` 与 studentised 同时区间；区间明确标为
+  t 样式（`ci_tail_level` 是精确尾质量，不是覆盖证明）。
+- 新增一次 exact sign-flip **range** 检验 `H0: 所有条件均值相等`；range
+  对共同平移不变，因此 sign-flip 零分布就是平坦性零分布。
+- 新增三个 IUT：全部同向（`max_k p_lower` / `max_k p_upper`）、全部
+  条件在 margin 内（`max_k p_tost`）、全部两两差在 flatness margin 内
+  （`max_{j<k} p_tost(d_j-d_k)`）。IUT 的交集主张不需要多重校正；这与
+  逐条件 max-T 是不同推断对象。
+- `build_/validate_/write_curve_inference` 与无时间戳
+  `curve_inference_block`：hash 绑定 `inputs`/`result`，重放逐字段对账，
+  拒绝 `confirmed`/`p_holm`/`verified`/`verdict`/`decision` 等冻结字段；
+  缺测/全零/声明错误按 `not_estimable` 或 `ValueError` fail closed；n>20
+  退回 Bonferroni-normal 近似并显式 warning。
+- v12 `_length_curve_inference` 把同一批 by-length cell 写入
+  `comparisons[*].length_curve_inference`；报告新增「全长度曲线的同时
+  推断」表：逐条件 pointwise/族级 p/同时区间、全部同向 IUT、全部 margin
+  IUT、flatness p 与两两 flatness IUT。
+- 新增 `audit_gates.py curve_inference`（别名 `length_curve` /
+  `curve_simultaneous` / `uniform_curve` / `curve_flatness`），优先重放
+  test_stats 内嵌块，其次独立 artifact；缺块 `not_applicable`、缺产物/
+  不可估计 `not_verifiable_locally`、篡改/重放不一致 `fail`。接入
+  `audit_gates.py report` 顶层与 `make curve-inference`。
+
+**Boundary.** 这是**探索性曲线级读数**，不是新的确认性检验：不训练、不读
+split、不产生确认 p 值、不进入冻结 Holm 族、不改变
+`p_exact_signflip`/`p_holm`/`verified`/`confirmed`。exact 对象是 adjusted p、
+range p、IUT p；同时区间是 t 样式近似。IUT 只支持「全部条件」主张，不能
+反读成「某一条显著」；「平坦性不显著」不是「曲线等价」，除非 flatness
+IUT 拒绝。n>20 的 normal fallback 是近似，不能与 exact 结果混写。
+
+**Verification.** 新增 `test_review_part_92.py` 21 项：单侧/TOST/range 与
+`2**n` 暴力枚举逐值对拍；共同平移不变；adjusted p 的族级单调性；同时
+区间半宽公式；全同向 IUT 的一个反例即关闭；全条件 margin IUT；全两两
+flatness IUT；单调/常数曲线；缺种子整颗剔除；underpowered/
+resolution-limited；全零 not_estimable；单条件 not_applicable；声明错误
+fail-closed；artifact/block 重放/篡改/冻结字段；writer 三态；markdown；
+审计门四态；v12 helper；n>20 fallback；report/CLI/Makefile 接线与
+`.github`/README 仍在。完整 CPU 套件在本轮最终树通过。

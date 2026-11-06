@@ -519,6 +519,31 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
             alpha=_alpha, min_n=6)
         if _li is not None and _li.get('n_complete', 0) >= 2:
             res['length_interaction'] = _li
+        # Curve-level simultaneous inference on the SAME by-length cells:
+        # "all lengths improve" and "the curve is flat" are intersection
+        # claims, not the conjunction of row-wise p-values.  Optional margins
+        # come from the frozen plan's statistics block; absent margins mean no
+        # equivalence claim, never a default margin.
+        _ci_stats = (manifest.get('statistics')
+                     if isinstance(manifest.get('statistics'), dict) else {})
+        def _ci_margin(key):
+            if key not in _ci_stats:
+                return None
+            value = _ci_stats.get(key)
+            if (isinstance(value, (int, float))
+                    and not isinstance(value, bool)
+                    and math.isfinite(float(value)) and float(value) > 0.0):
+                return float(value)
+            res.setdefault('warnings', []).append(
+                f'{key} is declared in the frozen plan but is not a positive '
+                'finite margin; no curve-level equivalence claim is made')
+            return None
+        _ci = _length_curve_inference(
+            recs_a, recs_b, usable, _li_lens, alpha=_alpha, min_n=6,
+            margin=_ci_margin('length_curve_margin'),
+            flatness_margin=_ci_margin('length_curve_flatness_margin'))
+        if _ci is not None:
+            res['length_curve_inference'] = _ci
         res['in_distribution_L512'] = res['by_length_curve'].get('512')
         if exp_sign in ('positive', 'negative') and math.isfinite(res.get('mean', float('nan'))):
             res['direction_ok'] = bool((res['mean'] > 0) == (exp_sign == 'positive'))
@@ -2519,6 +2544,14 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
                 A('### 长度效应修饰（post-hoc；不改变冻结判定）')
                 A('')
                 lines.extend(_li_lines)
+            _ci_lines = []
+            for _k, _v in comps.items():
+                _ci_lines.extend(_length_curve_inference_markdown(
+                    _k, _v.get('length_curve_inference')))
+            if _ci_lines:
+                A('### 全长度曲线的同时推断（post-hoc；不改变冻结判定）')
+                A('')
+                lines.extend(_ci_lines)
         _claim_no = [k for k, v in comps.items() if v.get('mechanism_claim_allowed') is False]
         if _claim_no:
             A('**主张边界（v4）**：以下比较不自动构成机制证据（`mechanism_claim_allowed=false`）：')

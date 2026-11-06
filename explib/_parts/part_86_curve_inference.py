@@ -1,0 +1,1388 @@
+# ---- a curve is not a row of pointwise p-values: simultaneous inference and
+#      intersection-union equivalence over ordered conditions ----
+# The panel reports one effect per evaluation length (or per budget / dose).
+# Each row has its own exact sign-flip p and t interval, and the report also
+# tests effect modification against a reference.  That still leaves three
+# claims the row-wise table cannot support:
+#
+#   * "the effect has the same sign at EVERY condition" needs a simultaneous
+#     statement over the whole curve, not the conjunction of individually
+#     significant rows;
+#   * "the effect is practically constant" needs an equivalence statement over
+#     ALL conditions (and all pairwise differences), not a non-significant
+#     interaction;
+#   * "the curve is flat" needs a single family test whose null is equality of
+#     all condition means, not one p-value per adjacent pair.
+#
+# This fragment adds those three readouts on the same per-seed matrix:
+#
+#   * exact sign-flip max-T (Westfall-Young) over the condition family gives
+#     per-condition adjusted p-values and simultaneous intervals, reusing the
+#     repository's `maxt_signflip_adjust` (score-studentised, sign-invariant);
+#   * a single exact sign-flip RANGE test of H0: all condition means equal
+#     (the range is invariant to a common location shift, so the sign-flip
+#     null is the flatness null);
+#   * intersection-union (IUT) one-sided tests for "all conditions improve"
+#     and IUT TOST for "all conditions are within the declared margin" and
+#     "all pairwise differences are within the flatness margin".  An IUT needs
+#     no multiplicity correction: the claim is the intersection, so the
+#     maximum of the component p-values is a valid p-value.
+#
+# Every condition uses the same complete seed set; a seed missing one condition
+# is dropped from the whole curve and named, never paired positionally.  The
+# block is exploratory/descriptive: no frozen p/Holm/confirmed change, no
+# training, no split read, no CODE_SEMANTICS bump.
+
+import json
+import math
+import os
+import statistics
+import time
+
+import numpy as np
+
+CURVE_INFERENCE_KIND = 'curve_inference'
+CURVE_INFERENCE_BLOCK_KIND = 'curve_inference_block'
+CURVE_INFERENCE_SCHEMA = 1
+CURVE_INFERENCE_MAX_N = 20
+CURVE_INFERENCE_HARD_MAX_N = 20
+CURVE_INFERENCE_MAX_CONDITIONS = 64
+CURVE_INFERENCE_MAX_SEEDS = 4096
+CURVE_INFERENCE_MAX_PAIRS = 200
+CURVE_INFERENCE_TOL = 1e-12
+
+CURVE_INFERENCE_POLICY = {
+    'version': 'curve-inference-1',
+    'effect_definition': ('one paired per-seed effect per ordered condition '
+                          '(the caller supplies the scale; for PPL curves the '
+                          'natural choice is log(PPL_a)-log(PPL_b))'),
+    'family': ('exact sign-flip Westfall-Young max-T over all declared '
+               'conditions; per-condition adjusted p-values and studentised '
+               'simultaneous intervals'),
+    'flatness': ('one exact sign-flip test of the range of condition means; '
+                 'the range is invariant to a common location shift, so the '
+                 'sign-flip null is the all-means-equal null'),
+    'uniform_direction': ('intersection-union test: the maximum one-sided '
+                          'exact sign-flip p over conditions is a valid p for '
+                          '"all means improve"; no multiplicity correction is '
+                          'needed for an intersection claim'),
+    'uniform_equivalence': ('intersection-union TOST: the maximum exact '
+                            'sign-flip TOST p over conditions is a valid p for '
+                            '"all means are within the margin"'),
+    'flatness_equivalence': ('intersection-union TOST over all pairwise '
+                             'differences; the maximum pairwise TOST p is a '
+                             'valid p for "the whole curve is within the '
+                             'flatness margin"'),
+    'completeness': ('a condition is estimated only when every declared seed '
+                     'has a finite effect at every condition; incomplete '
+                     'seeds are dropped from the whole curve and named'),
+    'role': ('post-hoc curve-level inference; it creates no confirmatory '
+             'p-value, enters no frozen Holm family and does not change '
+             'p/Holm/verified/confirmed or any PPL'),
+    'boundary': ('seed-level sign symmetry is the same assumption as the '
+                 'repository primary test.  The max-T interval is t-style, '
+                 'not an exact inversion of the multivariate sign-flip test; '
+                 'the exact objects are the adjusted p-values, the range test '
+                 'and the IUT p-values.  A non-significant flatness test is '
+                 'not equivalence unless the flatness IUT rejects.'),
+}
+
+CURVE_INFERENCE_ARTIFACT_KEYS = (
+    'kind', 'schema', 'created_at', 'source', 'inputs', 'result',
+    'content_sha256',
+)
+CURVE_INFERENCE_INPUT_KEYS = (
+    'conditions', 'effects', 'seeds', 'alpha', 'min_n', 'margin',
+    'flatness_margin', 'max_n',
+)
+CURVE_INFERENCE_FORBIDDEN_KEYS = frozenset({
+    'confirmed', 'confirmed_effective', 'p_holm', 'verified', 'verdict',
+    'decision', 'frozen_decision', 'final_decision', 'holm', 'confirmed_effect',
+})
+
+
+def _cv_repr(value, limit=160):
+    try:
+        text = repr(value)
+    except Exception:
+        return f'<unrepresentable {type(value).__name__}>'
+    return text if len(text) <= limit else text[:limit - 3] + '...'
+
+
+def _cv_text(value, name, *, limit=500):
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f'{name} must be a non-empty string, got '
+                         f'{_cv_repr(value)}')
+    text = value.strip()
+    return text if len(text) <= limit else text[:limit - 3] + '...'
+
+
+def _cv_key_text(value, limit=120):
+    if isinstance(value, str):
+        return value if len(value) <= limit else value[:limit - 3] + '...'
+    try:
+        text = str(value)
+    except Exception:
+        return _cv_repr(value, limit=limit)
+    return text if len(text) <= limit else text[:limit - 3] + '...'
+
+
+def _cv_int(value, name, *, minimum=None, maximum=None):
+    out = _as_seed_int(value)  # noqa: F821 (part_13)
+    if out is None:
+        raise ValueError(f'{name} must be an exact integer, got '
+                         f'{_cv_repr(value)}')
+    if minimum is not None and out < minimum:
+        raise ValueError(f'{name} must be >= {minimum}, got {_cv_repr(out)}')
+    if maximum is not None and out > maximum:
+        raise ValueError(f'{name} must be <= {maximum}, got {_cv_repr(out)}')
+    return out
+
+
+def _cv_number(value, name, *, positive=False, nonnegative=False):
+    if isinstance(value, (bool, np.bool_)):
+        raise ValueError(f'{name} must be a finite real number, got '
+                         f'{_cv_repr(value)}')
+    try:
+        out = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f'{name} must be a finite real number, got '
+                         f'{_cv_repr(value)}') from None
+    if not math.isfinite(out):
+        raise ValueError(f'{name} must be finite, got {_cv_repr(value)}')
+    if positive and not (out > 0.0):
+        raise ValueError(f'{name} must be > 0, got {_cv_repr(out)}')
+    if nonnegative and not (out >= 0.0):
+        raise ValueError(f'{name} must be >= 0, got {_cv_repr(out)}')
+    return out
+
+
+def _cv_jsonable(value):
+    return _json_clean(_ba_jsonable_safe(value))  # noqa: F821 (parts 08/85)
+
+
+def _cv_content_sha(artifact):
+    body = {k: v for k, v in artifact.items()
+            if k not in ('created_at', 'content_sha256')}
+    return _sha256_json(_cv_jsonable(body))  # noqa: F821 (part_00)
+
+
+def _cv_forbidden_paths(obj, path=''):
+    found = []
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            name = _cv_key_text(key)
+            here = f'{path}.{name}' if path else name
+            if name in CURVE_INFERENCE_FORBIDDEN_KEYS:
+                found.append(here)
+            found.extend(_cv_forbidden_paths(value, here))
+    elif isinstance(obj, (list, tuple)):
+        for index, value in enumerate(obj):
+            found.extend(_cv_forbidden_paths(value, f'{path}[{index}]'))
+    return found
+
+
+def _cv_strict_json_problem(label, body):
+    try:
+        json.dumps(body, allow_nan=False)
+    except Exception as exc:
+        detail = str(exc)
+        if ('Exceeds the limit' in detail
+                or 'integer string conversion' in detail):
+            return (f'{label} carries an unrepresentable int (beyond '
+                    "CPython's decimal-conversion limit) and cannot be "
+                    'strict-JSON serialised')
+        return (f'{label} is not strict-JSON serialisable: '
+                f'{type(exc).__name__}: {_cv_repr(exc)}')
+    return None
+
+
+def _cv_normalise_conditions(conditions):
+    if isinstance(conditions, (str, bytes, bytearray, dict)):
+        raise ValueError('conditions must be an ordered iterable of labels, '
+                         f'not a {type(conditions).__name__}')
+    try:
+        raw = list(conditions)
+    except TypeError:
+        raise ValueError('conditions must be an ordered iterable of labels') from None
+    if not raw:
+        raise ValueError('conditions must contain at least one label')
+    if len(raw) > CURVE_INFERENCE_MAX_CONDITIONS:
+        raise ValueError(f'conditions has {len(raw)} labels; the supported '
+                         f'maximum is {CURVE_INFERENCE_MAX_CONDITIONS}')
+    out = []
+    for item in raw:
+        if isinstance(item, (bool, np.bool_)):
+            raise ValueError(f'condition labels must be strings, got '
+                             f'{_cv_repr(item)}')
+        label = str(item).strip()
+        if not label:
+            raise ValueError('condition labels must be non-empty')
+        if label in out:
+            raise ValueError(f'duplicate condition label {label!r}')
+        out.append(label)
+    return out
+
+
+def _cv_normalise_effects(conditions, effects):
+    if isinstance(effects, dict):
+        by_label = {}
+        for key, value in effects.items():
+            label = str(key).strip()
+            if not label:
+                raise ValueError('effects keys must be non-empty')
+            if label in by_label:
+                raise ValueError(f'duplicate effects key {label!r}')
+            by_label[label] = value
+        if set(by_label) != set(conditions):
+            missing = sorted(set(conditions) - set(by_label))
+            extra = sorted(set(by_label) - set(conditions))
+            raise ValueError('effects keys must match conditions exactly; '
+                             f'missing={missing}, extra={extra}')
+        rows = [by_label[label] for label in conditions]
+    elif isinstance(effects, (list, tuple)):
+        if len(effects) != len(conditions):
+            raise ValueError(f'effects has {len(effects)} rows but '
+                             f'{len(conditions)} conditions were declared')
+        rows = list(effects)
+    else:
+        raise ValueError('effects must be a mapping condition->values or an '
+                         f'ordered sequence, got {type(effects).__name__}')
+    out = []
+    for label, row in zip(conditions, rows):
+        if isinstance(row, (str, bytes, bytearray, dict)):
+            raise ValueError(f'effects[{label!r}] must be an iterable of '
+                             'numbers, not a string/mapping')
+        try:
+            values = list(row)
+        except TypeError:
+            raise ValueError(f'effects[{label!r}] is not an iterable') from None
+        clean = []
+        for index, value in enumerate(values):
+            if isinstance(value, (bool, np.bool_)):
+                raise ValueError(f'effects[{label!r}][{index}] is a boolean, '
+                                 'not a measurement')
+            number = _finite_scalar(value)  # noqa: F821 (part_00)
+            clean.append(None if number is None else float(number))
+        out.append(clean)
+    return out
+
+
+def _cv_normalise_inputs(conditions, effects, seeds, *, alpha, min_n,
+                         margin, flatness_margin, max_n):
+    conditions = _cv_normalise_conditions(conditions)
+    rows = _cv_normalise_effects(conditions, effects)
+    if not rows:
+        raise ValueError('effects is empty')
+    width = len(rows[0])
+    for label, row in zip(conditions, rows):
+        if len(row) != width:
+            raise ValueError(f'effects[{label!r}] has {len(row)} values but '
+                             f'{conditions[0]!r} has {width}; every condition '
+                             'must be aligned to the same seed list')
+    if seeds is None:
+        if width == 0:
+            raise ValueError('cannot infer seeds from an empty effect row')
+        seed_labels = list(range(width))
+        declared_seeds = False
+    else:
+        if isinstance(seeds, (str, bytes, bytearray, dict)):
+            raise ValueError('seeds must be an iterable of integers, not a '
+                             f'{type(seeds).__name__}')
+        try:
+            raw_seeds = list(seeds)
+        except TypeError:
+            raise ValueError('seeds must be an iterable of integers') from None
+        if len(raw_seeds) != width:
+            raise ValueError(f'seeds has {len(raw_seeds)} entries but the '
+                             f'effect rows have {width}')
+        seed_labels = []
+        for index, value in enumerate(raw_seeds):
+            parsed = _as_seed_int(value)  # noqa: F821 (part_13)
+            if parsed is None:
+                raise ValueError(f'seeds[{index}] is not an exact integer: '
+                                 f'{_cv_repr(value)}')
+            if parsed in seed_labels:
+                raise ValueError(f'duplicate seed {parsed!r}')
+            seed_labels.append(parsed)
+        declared_seeds = True
+    alpha = _validated_alpha(alpha, context='curve inference alpha')  # noqa: F821
+    min_n = _cv_int(min_n, 'min_n', minimum=1,
+                    maximum=CURVE_INFERENCE_MAX_SEEDS)
+    margin = (None if margin is None
+              else _cv_number(margin, 'margin', positive=True))
+    flatness_margin = (None if flatness_margin is None
+                       else _cv_number(flatness_margin, 'flatness_margin',
+                                      positive=True))
+    max_n = _cv_int(max_n, 'max_n', minimum=2,
+                    maximum=CURVE_INFERENCE_HARD_MAX_N)
+    inputs = {
+        'conditions': list(conditions),
+        'effects': {label: list(row) for label, row in zip(conditions, rows)},
+        'seeds': [int(s) for s in seed_labels],
+        'alpha': float(alpha),
+        'min_n': int(min_n),
+        'margin': margin,
+        'flatness_margin': flatness_margin,
+        'max_n': int(max_n),
+    }
+    # Keep the declared-seed distinction out of the artifact schema; an
+    # inferred 0..n-1 list is a valid explicit list for replay.
+    return inputs, declared_seeds
+
+
+def _cv_complete_matrix(inputs):
+    conditions = list(inputs['conditions'])
+    seeds = list(inputs['seeds'])
+    effects = inputs['effects']
+    n_input = len(seeds)
+    complete = []
+    dropped = []
+    for index, seed in enumerate(seeds):
+        values = []
+        missing = []
+        for label in conditions:
+            row = effects[label]
+            value = row[index] if index < len(row) else None
+            if value is None:
+                missing.append(label)
+            values.append(value)
+        if missing:
+            dropped.append({'seed': int(seed),
+                            'missing_conditions': missing})
+            continue
+        complete.append((int(seed), values))
+    n = len(complete)
+    if n == 0:
+        return conditions, [], [], dropped, n_input
+    D = np.asarray([values for _seed, values in complete], dtype=float).T
+    return conditions, [seed for seed, _values in complete], D, dropped, n_input
+
+
+def _cv_not_estimable(reason, *, conditions=None, seeds=None,
+                      dropped=None, n_input=None, warnings=None):
+    return {
+        'kind': 'curve_simultaneous_inference',
+        'status': 'not_estimable',
+        'reason': str(reason),
+        'conditions': list(conditions or []),
+        'n': 0,
+        'n_input': (int(n_input) if n_input is not None else 0),
+        'seeds': [int(s) for s in (seeds or [])],
+        'dropped_seeds': list(dropped or []),
+        'family': None,
+        'per_condition': {},
+        'flatness': None,
+        'uniform': None,
+        'warnings': list(warnings or []),
+        'role': CURVE_INFERENCE_POLICY['role'],
+        'boundary': CURVE_INFERENCE_POLICY['boundary'],
+    }
+
+
+def _cv_maxt(D, conditions, *, alpha, max_n):
+    named = {label: [float(x) for x in D[k]]
+             for k, label in enumerate(conditions)}
+    try:
+        return maxt_signflip_adjust(named, alpha=alpha, max_n=max_n)  # noqa: F821 (part_40)
+    except ValueError as exc:
+        raise ValueError(f'exact sign-flip max-T is not estimable: {exc}') from None
+
+
+def _cv_exact_enumeration(D, *, alpha, margin, flatness_margin):
+    """One exact sign-flip pass for one-sided, range and TOST readouts.
+
+    The max-T p-values/interval come from ``maxt_signflip_adjust``; this pass
+    adds the objects that a family of two-sided p-values cannot express: the
+    lower/upper one-sided p for each condition, the range null, and the TOST
+    p for each condition and each pair.
+    """
+    K, n = D.shape
+    scale = float(np.max(np.abs(D)))
+    if not (scale > 0.0):
+        raise ValueError('the complete effect matrix is exactly zero')
+    Dn = D / scale
+    obs_sums = Dn.sum(axis=1)
+    tol = CURVE_INFERENCE_TOL * max(1.0, float(np.max(np.abs(obs_sums))))
+    total = 1 << n
+    lower_counts = np.zeros(K, dtype=np.int64)
+    upper_counts = np.zeros(K, dtype=np.int64)
+    range_values = np.empty(total, dtype=float)
+    low_counts = high_counts = None
+    obs_low = obs_high = None
+    m_scale = max([scale] + [float(x) for x in (margin, flatness_margin)
+                             if x is not None])
+    Dt = D / m_scale
+    Mt = (float(margin) / m_scale if margin is not None else None)
+    Mf = (float(flatness_margin) / m_scale
+          if flatness_margin is not None else None)
+    if margin is not None:
+        obs_low = (Dt + Mt).sum(axis=1)
+        obs_high = (Mt - Dt).sum(axis=1)
+        low_counts = np.zeros(K, dtype=np.int64)
+        high_counts = np.zeros(K, dtype=np.int64)
+    pairs = []
+    pair_low_counts = pair_high_counts = None
+    pair_obs_low = pair_obs_high = None
+    pair_effects = None
+    if Mf is not None and K >= 2:
+        pairs = [(i, j) for i in range(K) for j in range(i + 1, K)]
+        if len(pairs) <= CURVE_INFERENCE_MAX_PAIRS:
+            pair_effects = np.asarray([Dt[i] - Dt[j] for i, j in pairs])
+            pair_obs_low = (pair_effects + Mf).sum(axis=1)
+            pair_obs_high = (Mf - pair_effects).sum(axis=1)
+            pair_low_counts = np.zeros(len(pairs), dtype=np.int64)
+            pair_high_counts = np.zeros(len(pairs), dtype=np.int64)
+        else:
+            pairs = []
+    cell_count = max(1, K, len(pairs))
+    chunk = max(1, min(total, max(1, (1 << 18) // cell_count)))
+    bitpos = np.arange(n, dtype=np.int64)
+    for off in range(0, total, chunk):
+        size = min(chunk, total - off)
+        masks = np.arange(off, off + size, dtype=np.int64)[:, None]
+        signs = np.where((masks & (1 << bitpos)) != 0, 1.0, -1.0)
+        sums = signs @ Dn.T
+        lower_counts += (sums <= obs_sums + tol).sum(axis=0)
+        upper_counts += (sums >= obs_sums - tol).sum(axis=0)
+        range_values[off:off + size] = (
+            (sums.max(axis=1) - sums.min(axis=1)) / float(n))
+        if margin is not None:
+            low = signs @ (Dt + Mt).T
+            high = signs @ (Mt - Dt).T
+            low_counts += (low >= obs_low - tol).sum(axis=0)
+            high_counts += (high >= obs_high - tol).sum(axis=0)
+        if pair_effects is not None and len(pairs):
+            plow = signs @ (pair_effects + Mf).T
+            phigh = signs @ (Mf - pair_effects).T
+            pair_low_counts += (plow >= pair_obs_low - tol).sum(axis=0)
+            pair_high_counts += (phigh >= pair_obs_high - tol).sum(axis=0)
+    p_lower = lower_counts / float(total)
+    p_upper = upper_counts / float(total)
+    obs_range = float((obs_sums.max() - obs_sums.min()) / float(n))
+    p_range = float(np.count_nonzero(range_values >= obs_range - tol)
+                    / float(total))
+    idx = min(total - 1,
+              max(0, int(math.ceil((1.0 - alpha) * total)) - 1))
+    range_critical = float(np.partition(range_values, idx)[idx])
+    out = {
+        'total': int(total),
+        'p_lower': p_lower,
+        'p_upper': p_upper,
+        'p_floor_one_sided': 1.0 / float(total),
+        'p_floor_two_sided': 2.0 / float(total),
+        'range_observed': obs_range * scale,
+        'range_critical': range_critical * scale,
+        'range_upper_bound': (obs_range + range_critical) * scale,
+        'p_range': p_range,
+        'range_method': 'exact sign-flip range of condition means',
+        'equivalence': None,
+        'flatness_equivalence': None,
+        'n_pairs': len(pairs),
+    }
+    if margin is not None:
+        p_low = low_counts / float(total)
+        p_high = high_counts / float(total)
+        p_tost = np.maximum(p_low, p_high)
+        out['p_tost'] = p_tost
+        out['p_low_margin'] = p_low
+        out['p_high_margin'] = p_high
+        out['uniform_equivalence_p'] = float(np.max(p_tost))
+        out['equivalent_conditions'] = [
+            bool(p_tost[k] <= alpha) for k in range(K)]
+    if pair_effects is not None and len(pairs):
+        pair_low = pair_low_counts / float(total)
+        pair_high = pair_high_counts / float(total)
+        pair_tost = np.maximum(pair_low, pair_high)
+        out['pair_tost'] = pair_tost
+        out['flatness_equivalence_p'] = float(np.max(pair_tost))
+        out['pairs'] = pairs
+    return out
+
+
+def _cv_normal_enumeration(D, *, alpha, margin, flatness_margin):
+    """Normal-approximation fallback for n > the exact-enumeration cap."""
+    K, n = D.shape
+    normal = statistics.NormalDist()  # noqa: F821 (stdlib import added below)
+    means = D.mean(axis=1)
+    sds = D.std(axis=1, ddof=1)
+    sems = sds / math.sqrt(n)
+    safe_sem = np.where(sems > 0.0, sems, np.nan)
+    z = np.where(np.isfinite(safe_sem), means / safe_sem, 0.0)
+    # z = mean/se.  The lower-tail p (H1: mean < 0) is Phi(z); the
+    # upper-tail p (H1: mean > 0) is 1-Phi(z).
+    p_lower = np.asarray([normal.cdf(float(v)) for v in z])
+    p_upper = np.asarray([1.0 - normal.cdf(float(v)) for v in z])
+    # A measured zero spread with a non-zero mean is a degenerate but
+    # directional panel: the normal limit must not turn it into p=0.5.
+    p_lower = np.where(sems == 0.0,
+                       np.where(means < 0.0, 0.0, 1.0), p_lower)
+    p_upper = np.where(sems == 0.0,
+                       np.where(means > 0.0, 0.0, 1.0), p_upper)
+    p_two = np.minimum(1.0, 2.0 * np.minimum(p_lower, p_upper))
+    _p = 1.0 - alpha / 2.0
+    if not (0.0 < _p < 1.0):
+        # ``1 - alpha/2`` rounds to exactly 1.0 for alpha below ~1e-16;
+        # NormalDist refuses p=1.0.  Clamp to the largest representable
+        # two-sided level instead of crashing the fallback.
+        _p = 1.0 - 1e-15
+    zcrit = normal.inv_cdf(_p)
+    ci = np.column_stack([means - zcrit * sems, means + zcrit * sems])
+    out = {
+        'total': None,
+        'p_lower': p_lower,
+        'p_upper': p_upper,
+        'p_floor_one_sided': None,
+        'p_floor_two_sided': None,
+        'range_observed': float(means.max() - means.min()),
+        'range_critical': None,
+        'range_upper_bound': None,
+        'p_range': None,
+        'range_method': 'normal approximation does not provide a range null',
+        'equivalence': None,
+        'flatness_equivalence': None,
+        'n_pairs': 0,
+        'means': means,
+        'sds': sds,
+        'sems': sems,
+        'p_two': p_two,
+        'ci': ci,
+        'zcrit': zcrit,
+    }
+    if margin is not None:
+        p_low = np.asarray([1.0 - normal.cdf(float((m + margin) / s))
+                            if s > 0.0 else (1.0 if m + margin <= 0.0 else 0.0)
+                            for m, s in zip(means, sems)])
+        p_high = np.asarray([1.0 - normal.cdf(float((margin - m) / s))
+                             if s > 0.0 else (1.0 if margin - m <= 0.0 else 0.0)
+                             for m, s in zip(means, sems)])
+        p_tost = np.maximum(p_low, p_high)
+        out['p_tost'] = p_tost
+        out['p_low_margin'] = p_low
+        out['p_high_margin'] = p_high
+        out['uniform_equivalence_p'] = float(np.max(p_tost))
+        out['equivalent_conditions'] = [
+            bool(p_tost[k] <= alpha) for k in range(K)]
+    if flatness_margin is not None and K >= 2:
+        pairs = [(i, j) for i in range(K) for j in range(i + 1, K)]
+        if len(pairs) <= CURVE_INFERENCE_MAX_PAIRS:
+            pair_tost = []
+            for i, j in pairs:
+                diff = D[i] - D[j]
+                sd = float(np.std(diff, ddof=1))
+                se = sd / math.sqrt(n) if sd > 0.0 else 0.0
+                md = float(np.mean(diff))
+                if se > 0.0:
+                    pl = 1.0 - normal.cdf((md + flatness_margin) / se)
+                    ph = 1.0 - normal.cdf((flatness_margin - md) / se)
+                else:
+                    pl = 0.0 if md + flatness_margin > 0.0 else 1.0
+                    ph = 0.0 if flatness_margin - md > 0.0 else 1.0
+                pair_tost.append(max(pl, ph))
+            out['pair_tost'] = np.asarray(pair_tost)
+            out['flatness_equivalence_p'] = float(np.max(pair_tost))
+            out['pairs'] = pairs
+            out['n_pairs'] = len(pairs)
+    return out
+
+
+def _cv_family_summary(maxt, enum, *, alpha):
+    contrasts = maxt.get('contrasts') or {}
+    return {
+        'm': int(maxt.get('m') or 0),
+        'n_patterns': maxt.get('n_patterns'),
+        'p_floor_single': _cv_num(maxt.get('p_floor_single')),
+        'p_floor_one_sided': _cv_num(enum.get('p_floor_one_sided')),
+        'p_floor_two_sided': _cv_num(enum.get('p_floor_two_sided')),
+        'critical_value': _cv_num(maxt.get('critical_value')),
+        'ci_level_requested': _cv_num(maxt.get('ci_level_requested')),
+        'ci_tail_level': _cv_num(maxt.get('ci_tail_level')),
+        'ci_method': maxt.get('ci_method'),
+        'method': maxt.get('method'),
+        'reject': sorted(
+            name for name, row in contrasts.items()
+            if isinstance(row, dict) and row.get('reject_maxt')),
+        'deltas_fp': maxt.get('deltas_fp'),
+        'note': maxt.get('note'),
+    }
+
+
+def _cv_num(value):
+    if value is None or isinstance(value, (bool, np.bool_)):
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return out if math.isfinite(out) else None
+
+
+def _cv_t_interval(mean, sem, n, alpha):
+    if mean is None or sem is None or n < 2:
+        return None
+    if not (math.isfinite(mean) and math.isfinite(sem)):
+        return None
+    if sem == 0.0:
+        return [float(mean), float(mean)]
+    try:
+        crit = _t_critical(1.0 - alpha, n - 1)  # noqa: F821 (part_11)
+    except Exception:
+        return None
+    if crit is None or not math.isfinite(float(crit)):
+        return None
+    lo = float(mean) - float(crit) * float(sem)
+    hi = float(mean) + float(crit) * float(sem)
+    if not (math.isfinite(lo) and math.isfinite(hi)):
+        return None
+    return [lo, hi]
+
+
+def _cv_direction(mean, lower, upper, *, alpha, zero_tol=1e-12):
+    if mean is None:
+        return 'unavailable'
+    if lower is not None and lower > zero_tol:
+        return 'positive'
+    if upper is not None and upper < -zero_tol:
+        return 'negative'
+    if mean > zero_tol:
+        return 'positive_unresolved'
+    if mean < -zero_tol:
+        return 'negative_unresolved'
+    return 'zero_unresolved'
+
+
+def curve_simultaneous_inference(conditions, effects, *, seeds=None,
+                                 alpha=0.05, min_n=3, margin=None,
+                                 flatness_margin=None, max_n=20):
+    """Simultaneous inference for an ordered curve of paired effects.
+
+    ``conditions`` is an ordered list of labels and ``effects`` maps each
+    label to one per-seed paired effect (or is an ordered sequence of rows).
+    The same seed set is required at every condition; a seed missing any
+    condition is dropped from the whole curve and named in ``dropped_seeds``.
+
+    The returned object is strict-JSON safe.  Data-level incompleteness is
+    reported as a ``not_estimable`` result; malformed declarations raise
+    ``ValueError`` so a typo cannot silently change the curve.
+    """
+    inputs, _declared = _cv_normalise_inputs(
+        conditions, effects, seeds, alpha=alpha, min_n=min_n,
+        margin=margin, flatness_margin=flatness_margin, max_n=max_n)
+    conds, complete_seeds, D, dropped, n_input = _cv_complete_matrix(inputs)
+    if n_input < 2:
+        return _cv_not_estimable(
+            'fewer than two declared seeds; a paired curve cannot be '
+            'estimated', conditions=conds, seeds=complete_seeds,
+            dropped=dropped, n_input=n_input)
+    if len(complete_seeds) < 2:
+        return _cv_not_estimable(
+            'fewer than two complete seeds across every condition; the '
+            'curve is not estimable', conditions=conds,
+            seeds=complete_seeds, dropped=dropped, n_input=n_input)
+    n = len(complete_seeds)
+    if float(np.max(np.abs(D))) <= 0.0:
+        return _cv_not_estimable(
+            'every complete paired effect is exactly zero; the sign-flip '
+            'distribution is degenerate and the curve carries no '
+            'information', conditions=conds, seeds=complete_seeds,
+            dropped=dropped, n_input=n_input)
+    if n > int(inputs['max_n']):
+        enum = _cv_normal_enumeration(
+            D, alpha=float(inputs['alpha']), margin=inputs['margin'],
+            flatness_margin=inputs['flatness_margin'])
+        method = 'normal_approximation_fallback'
+        fallback = True
+        maxt = None
+        family = {
+            'm': len(conds),
+            'n_patterns': None,
+            'p_floor_single': None,
+            'p_floor_one_sided': None,
+            'p_floor_two_sided': None,
+            'critical_value': _cv_num(enum.get('zcrit')),
+            'ci_level_requested': 1.0 - float(inputs['alpha']),
+            'ci_tail_level': None,
+            'ci_method': 'normal-approximation interval',
+            'method': 'normal approximation (exact cap exceeded)',
+            'reject': [],
+            'deltas_fp': None,
+            'note': ('n exceeds the exact sign-flip enumeration cap; this '
+                     'is an approximate fallback, not an exact result'),
+        }
+    else:
+        try:
+            maxt = _cv_maxt(D, conds, alpha=float(inputs['alpha']),
+                            max_n=int(inputs['max_n']))
+        except ValueError as exc:
+            return _cv_not_estimable(str(exc), conditions=conds,
+                                     seeds=complete_seeds, dropped=dropped,
+                                     n_input=n_input)
+        try:
+            enum = _cv_exact_enumeration(
+                D, alpha=float(inputs['alpha']), margin=inputs['margin'],
+                flatness_margin=inputs['flatness_margin'])
+        except ValueError as exc:
+            return _cv_not_estimable(str(exc), conditions=conds,
+                                     seeds=complete_seeds, dropped=dropped,
+                                     n_input=n_input)
+        method = 'exact_signflip_maxt_iut'
+        fallback = False
+        family = _cv_family_summary(maxt, enum,
+                                    alpha=float(inputs['alpha']))
+    alpha = float(inputs['alpha'])
+    min_n = int(inputs['min_n'])
+    margin = inputs['margin']
+    flatness_margin = inputs['flatness_margin']
+    means = (np.asarray([float(np.mean(D[k])) for k in range(len(conds))])
+             if maxt is None else
+             np.asarray([maxt['contrasts'][label]['mean'] for label in conds]))
+    sds = (np.asarray([float(np.std(D[k], ddof=1)) for k in range(len(conds))])
+           if maxt is None else
+           np.asarray([maxt['contrasts'][label]['sd'] for label in conds]))
+    sems = (np.asarray([float(np.std(D[k], ddof=1) / math.sqrt(n))
+                        for k in range(len(conds))])
+            if maxt is None else
+            np.asarray([maxt['contrasts'][label]['sem'] for label in conds]))
+    per_condition = {}
+    for k, label in enumerate(conds):
+        mean = _cv_num(means[k])
+        sd = _cv_num(sds[k])
+        sem = _cv_num(sems[k])
+        if maxt is None:
+            p_two = _cv_num(enum['p_two'][k])
+            p_lower = _cv_num(enum['p_lower'][k])
+            p_upper = _cv_num(enum['p_upper'][k])
+            ci_sim = [float(x) for x in enum['ci'][k]]
+            ci_point = _cv_t_interval(mean, sem, n, alpha)
+            # The normal fallback has no exact max-T null; use an explicitly
+            # approximate Bonferroni family p so the direction flag is not
+            # silently based on an unadjusted per-condition p.
+            p_adj_single = (None if p_two is None
+                            else min(1.0, len(conds) * p_two))
+            p_adj_step = p_adj_single
+            reject_maxt = bool(p_adj_single is not None
+                               and p_adj_single <= alpha)
+        else:
+            row = maxt['contrasts'][label]
+            p_two = _cv_num(row.get('p_raw_signflip'))
+            p_lower = _cv_num(enum['p_lower'][k])
+            p_upper = _cv_num(enum['p_upper'][k])
+            ci_point = _cv_t_interval(mean, sem, n, alpha)
+            ci_sim = row.get('ci_simultaneous')
+            if not (isinstance(ci_sim, (list, tuple)) and len(ci_sim) == 2):
+                ci_sim = None
+            else:
+                ci_sim = [_cv_num(ci_sim[0]), _cv_num(ci_sim[1])]
+            p_adj_single = _cv_num(row.get('p_maxt_single'))
+            p_adj_step = _cv_num(row.get('p_maxt'))
+            reject_maxt = bool(row.get('reject_maxt'))
+        tost = None
+        if margin is not None:
+            if maxt is None:
+                p_tost = _cv_num(enum['p_tost'][k])
+            else:
+                p_tost = _cv_num(enum['p_tost'][k])
+            tost = {
+                'margin': float(margin),
+                'p_tost': p_tost,
+                'equivalent': bool(p_tost is not None and p_tost <= alpha),
+            }
+        per_condition[label] = {
+            'condition': label,
+            'n': int(n),
+            'mean': mean,
+            'sd': sd,
+            'sem': sem,
+            'ci95_pointwise': ci_point,
+            'ci95_simultaneous': ci_sim,
+            'p_pointwise_two_sided': p_two,
+            'p_pointwise_lower': p_lower,
+            'p_pointwise_upper': p_upper,
+            'p_adj_single': p_adj_single,
+            'p_adj_stepdown': p_adj_step,
+            'reject_simultaneous': reject_maxt,
+            # The exact family-adjusted p decides "resolved"; the t-style
+            # simultaneous interval is a descriptive companion and must not
+            # promote a condition whose adjusted p did not clear alpha.
+            'direction': (
+                ('positive' if mean > 0.0 else 'negative')
+                if (reject_maxt and mean is not None) else
+                _cv_direction(mean, None, None, alpha=alpha)),
+            'ci_direction': _cv_direction(
+                mean,
+                (ci_sim[0] if ci_sim else None),
+                (ci_sim[1] if ci_sim else None),
+                alpha=alpha),
+            'uniform_lower_supported': bool(
+                p_lower is not None and p_lower <= alpha),
+            'uniform_upper_supported': bool(
+                p_upper is not None and p_upper <= alpha),
+            'equivalence': tost,
+        }
+    if maxt is None:
+        family['reject'] = sorted(
+            label for label in conds
+            if per_condition[label]['reject_simultaneous'])
+    # A single range test of H0: all condition means are equal.  The range of
+    # the summed vector is unchanged by a common location shift, so sign-flip
+    # is the correct null for flatness as well as for the zero-effect null.
+    if len(conds) < 2:
+        flatness = {
+            'status': 'not_applicable',
+            'reason': 'a single condition has no flatness contrast',
+            'n_pairs': 0,
+        }
+    else:
+        flatness = {
+            'status': 'ok',
+            'observed_range': enum.get('range_observed'),
+            'p_range': enum.get('p_range'),
+            'range_critical': enum.get('range_critical'),
+            'range_upper_bound': enum.get('range_upper_bound'),
+            'range_method': enum.get('range_method'),
+            'n_pairs': int(enum.get('n_pairs') or 0),
+        }
+        if flatness_margin is not None:
+            p_eq = _cv_num(enum.get('flatness_equivalence_p'))
+            if p_eq is None:
+                flatness['equivalence'] = {
+                    'margin': float(flatness_margin),
+                    'p_tost': None,
+                    'supported': False,
+                    'reason': ('the pairwise IUT is not available at this '
+                               'number of conditions'),
+                }
+            else:
+                pairs = enum.get('pairs') or []
+                pt = enum.get('pair_tost')
+                worst = None
+                worst_p = None
+                if pairs and pt is not None:
+                    idx = int(np.argmax(pt))
+                    worst = [int(pairs[idx][0]), int(pairs[idx][1])]
+                    worst_p = _cv_num(pt[idx])
+                flatness['equivalence'] = {
+                    'margin': float(flatness_margin),
+                    'p_tost': p_eq,
+                    'supported': bool(p_eq <= alpha),
+                    'n_pairs': len(pairs),
+                    'worst_pair': (None if worst is None else
+                                   [conds[worst[0]], conds[worst[1]]]),
+                    'worst_pair_p': worst_p,
+                    'method': ('IUT over all pairwise exact sign-flip TOST; '
+                               'the maximum pairwise p is the intersection '
+                               'p-value'),
+                }
+        else:
+            flatness['equivalence'] = None
+    # Intersection-union claims.  The maximum component p is the p-value for
+    # the all-components claim; no multiplicity correction is applied because
+    # the claim is the intersection, not the union, of the component nulls.
+    negative_p = _cv_num(np.max(enum['p_lower'])) if len(conds) else None
+    positive_p = _cv_num(np.max(enum['p_upper'])) if len(conds) else None
+    not_negative = [label for k, label in enumerate(conds)
+                    if not (enum['p_lower'][k] <= alpha)]
+    not_positive = [label for k, label in enumerate(conds)
+                    if not (enum['p_upper'][k] <= alpha)]
+    uniform = {
+        'negative': {
+            'p_iut': negative_p,
+            'supported': bool(negative_p is not None and negative_p <= alpha),
+            'conditions_not_supported': not_negative,
+        },
+        'positive': {
+            'p_iut': positive_p,
+            'supported': bool(positive_p is not None and positive_p <= alpha),
+            'conditions_not_supported': not_positive,
+        },
+        'equivalence': None,
+        'all_conditions_reject': bool(
+            all(per_condition[label]['reject_simultaneous'] for label in conds)
+            if maxt is not None else False),
+        'note': ('the IUT p is the maximum one-sided sign-flip p over the '
+                 'conditions; no multiplicity correction is applied because '
+                 'the claim is an intersection ("all"), not a union'),
+    }
+    if margin is not None:
+        p_eq = _cv_num(enum.get('uniform_equivalence_p'))
+        eq_not = [label for k, label in enumerate(conds)
+                  if not (enum['p_tost'][k] <= alpha)]
+        uniform['equivalence'] = {
+            'margin': float(margin),
+            'p_tost': p_eq,
+            'supported': bool(p_eq is not None and p_eq <= alpha),
+            'conditions_not_equivalent': eq_not,
+            'method': ('IUT over the per-condition exact sign-flip TOST; '
+                       'the maximum component TOST p is the intersection '
+                       'p-value'),
+        }
+    resolved = [label for label in conds
+                if per_condition[label]['direction'] in
+                ('positive', 'negative')]
+    mixed = (any(per_condition[label]['direction'] == 'positive'
+                 for label in conds)
+             and any(per_condition[label]['direction'] == 'negative'
+                     for label in conds))
+    warnings = []
+    if n < min_n:
+        warnings.append(
+            f'underpowered: n={n} complete seeds is below min_n={min_n}')
+    floor = _cv_num(family.get('p_floor_two_sided')
+                    if family.get('p_floor_two_sided') is not None
+                    else family.get('p_floor_single'))
+    if floor is not None and floor > alpha:
+        warnings.append(
+            f'resolution-limited: the exact family floor {floor:.6g} is '
+            f'above alpha={alpha:.6g}; no effect, however large, can clear '
+            'the bar at this seed count')
+    if dropped:
+        warnings.append(
+            f'{len(dropped)} declared seed(s) are incomplete across the '
+            'conditions and were dropped from the whole curve: '
+            + ', '.join(str(row.get('seed')) for row in dropped[:8])
+            + ('' if len(dropped) <= 8 else
+               f' (+{len(dropped) - 8} more)'))
+    if family.get('critical_value') is None:
+        warnings.append(
+            'the exact family null cannot reach the requested level at this '
+            'n; no finite simultaneous interval is reported')
+    if fallback:
+        warnings.append(
+            'n exceeds the exact sign-flip enumeration cap; this result uses '
+            'a normal-approximation fallback and is not exact')
+    if len(conds) < 2:
+        warnings.append('a one-condition curve cannot test flatness')
+    if all(abs(float(means[k])) <= CURVE_INFERENCE_TOL for k in range(len(conds))):
+        warnings.append(
+            'all condition means are numerically zero; the IUT/equivalence '
+            'readings are degenerate and are not a scientific conclusion')
+    status = 'warnings' if warnings else 'ok'
+    result = {
+        'kind': 'curve_simultaneous_inference',
+        'schema': CURVE_INFERENCE_SCHEMA,
+        'status': status,
+        'method': method,
+        'exact': not fallback,
+        'alpha': float(alpha),
+        'min_n': int(min_n),
+        'margin': (None if margin is None else float(margin)),
+        'flatness_margin': (None if flatness_margin is None else
+                            float(flatness_margin)),
+        'n': int(n),
+        'n_input': int(n_input),
+        'seeds': [int(s) for s in complete_seeds],
+        'dropped_seeds': dropped,
+        'conditions': list(conds),
+        'family': family,
+        'per_condition': per_condition,
+        'flatness': flatness,
+        'uniform': uniform,
+        'resolved_conditions': resolved,
+        'mixed_direction': bool(mixed),
+        'warnings': warnings,
+        'role': CURVE_INFERENCE_POLICY['role'],
+        'boundary': CURVE_INFERENCE_POLICY['boundary'],
+        'policy': dict(CURVE_INFERENCE_POLICY),
+    }
+    return _cv_jsonable(result)
+
+
+def build_curve_inference(conditions, effects, *, seeds=None, alpha=0.05,
+                          min_n=3, margin=None, flatness_margin=None,
+                          max_n=20, source=None, created_at=None):
+    inputs, _declared = _cv_normalise_inputs(
+        conditions, effects, seeds, alpha=alpha, min_n=min_n,
+        margin=margin, flatness_margin=flatness_margin, max_n=max_n)
+    result = curve_simultaneous_inference(**inputs)
+    artifact = {
+        'kind': CURVE_INFERENCE_KIND,
+        'schema': CURVE_INFERENCE_SCHEMA,
+        'created_at': (time.strftime('%Y-%m-%dT%H:%M:%S') if not created_at
+                       else str(created_at)[:80]),
+        'source': (None if source is None else str(source)[:500]),
+        'inputs': inputs,
+        'result': result,
+    }
+    artifact['content_sha256'] = _cv_content_sha(artifact)
+    return artifact
+
+
+def curve_inference_block(conditions, effects, *, seeds=None, alpha=0.05,
+                          min_n=3, margin=None, flatness_margin=None,
+                          max_n=20):
+    """Return the timestamp-free ``inputs``/``result`` block for a report."""
+    inputs, _declared = _cv_normalise_inputs(
+        conditions, effects, seeds, alpha=alpha, min_n=min_n,
+        margin=margin, flatness_margin=flatness_margin, max_n=max_n)
+    result = curve_simultaneous_inference(**inputs)
+    return {
+        'kind': CURVE_INFERENCE_BLOCK_KIND,
+        'inputs': inputs,
+        'result': result,
+    }
+
+
+def compare_curve_inference_results(stored, replay, *, rtol=1e-9,
+                                    atol=1e-12):
+    diffs = []
+    _ba_same(stored, replay, 'result', rtol=rtol, atol=atol, diffs=diffs)
+    return {'match': not diffs, 'differences': diffs}
+
+
+def _cv_inputs_problems(inputs):
+    problems = []
+    if not isinstance(inputs, dict):
+        return ['inputs must be an object']
+    extra = sorted(set(inputs) - set(CURVE_INFERENCE_INPUT_KEYS),
+                   key=_cv_key_text)
+    missing = [k for k in CURVE_INFERENCE_INPUT_KEYS if k not in inputs]
+    if extra or missing:
+        problems.append(f'inputs keys differ: missing={missing}, extra=['
+                        + ', '.join(_cv_key_text(k) for k in extra) + ']')
+        return problems
+    try:
+        conditions = _cv_normalise_conditions(inputs.get('conditions'))
+        _cv_normalise_effects(conditions, inputs.get('effects'))
+        _cv_normalise_inputs(
+            conditions, inputs.get('effects'), inputs.get('seeds'),
+            alpha=inputs.get('alpha'), min_n=inputs.get('min_n'),
+            margin=inputs.get('margin'),
+            flatness_margin=inputs.get('flatness_margin'),
+            max_n=inputs.get('max_n'))
+    except (TypeError, ValueError) as exc:
+        problems.append(f'inputs are malformed: {exc}')
+    return problems
+
+
+def _cv_shape_problems(inputs, result):
+    problems = []
+    if not isinstance(result, dict):
+        return ['result must be an object']
+    status = result.get('status')
+    if status not in ('ok', 'warnings', 'not_estimable'):
+        problems.append('result.status must be ok/warnings/not_estimable, '
+                        f'got {_cv_repr(status)}')
+        return problems
+    if status == 'not_estimable':
+        return problems
+    conditions = inputs.get('conditions')
+    got = result.get('conditions')
+    if not isinstance(got, list) or got != conditions:
+        problems.append('result.conditions does not match the declared order')
+    per = result.get('per_condition')
+    if not isinstance(per, dict):
+        problems.append('result.per_condition must be an object')
+    elif isinstance(conditions, list) and set(per) != set(conditions):
+        problems.append('result.per_condition keys do not match conditions')
+    family = result.get('family')
+    if not isinstance(family, dict):
+        problems.append('result.family must be an object')
+    elif isinstance(conditions, list) and family.get('m') != len(conditions):
+        problems.append('result.family.m does not match the condition count')
+    try:
+        n = _cv_int(result.get('n'), 'result.n', minimum=0)
+        n_input = _cv_int(result.get('n_input'), 'result.n_input', minimum=0)
+        if n > n_input:
+            problems.append('result.n exceeds result.n_input')
+        if isinstance(inputs.get('seeds'), list):
+            if n_input != len(inputs['seeds']):
+                problems.append('result.n_input does not match inputs.seeds')
+    except (TypeError, ValueError) as exc:
+        problems.append(f'result counts are malformed: {exc}')
+    return problems
+
+
+def validate_curve_inference(artifact, *, replay=True):
+    out = {
+        'kind': 'curve_inference_validation',
+        'status': 'fail',
+        'content_sha256': None,
+        'result_status': None,
+        'replayed': False,
+        'problems': [],
+        'warnings': [],
+        'result': None,
+    }
+    if not isinstance(artifact, dict):
+        out['problems'].append('artifact must be a JSON object')
+        return out
+    extra = sorted(set(artifact) - set(CURVE_INFERENCE_ARTIFACT_KEYS),
+                   key=_cv_key_text)
+    missing = [k for k in CURVE_INFERENCE_ARTIFACT_KEYS if k not in artifact]
+    if extra or missing:
+        out['problems'].append(
+            f'artifact keys differ from the schema: missing={missing}, '
+            'extra=[' + ', '.join(_cv_key_text(k) for k in extra) + ']')
+    if artifact.get('kind') != CURVE_INFERENCE_KIND:
+        out['problems'].append(
+            f'artifact.kind must be {CURVE_INFERENCE_KIND!r}, got '
+            f'{_cv_repr(artifact.get("kind"))}')
+    if artifact.get('schema') != CURVE_INFERENCE_SCHEMA:
+        out['problems'].append(
+            f'artifact.schema must be {CURVE_INFERENCE_SCHEMA}, got '
+            f'{_cv_repr(artifact.get("schema"))}')
+    try:
+        forbidden = _cv_forbidden_paths(artifact)
+    except Exception as exc:
+        out['problems'].append(
+            'artifact cannot be inspected for frozen-decision fields: '
+            f'{type(exc).__name__}: {_cv_repr(exc)}')
+        return out
+    if forbidden:
+        out['problems'].append('artifact carries frozen-decision key(s): '
+                               + ', '.join(forbidden[:8]))
+    recorded = artifact.get('content_sha256')
+    if not isinstance(recorded, str) or len(recorded) != 64:
+        out['problems'].append('artifact.content_sha256 must be a 64-hex string')
+    else:
+        out['content_sha256'] = recorded
+        try:
+            actual = _cv_content_sha(artifact)
+        except Exception as exc:
+            out['problems'].append(
+                'content hash is not computable: '
+                f'{type(exc).__name__}: {_cv_repr(exc)}')
+            actual = None
+        if actual is not None and actual != recorded:
+            out['problems'].append(
+                'artifact.content_sha256 does not match the recorded body')
+    inputs = artifact.get('inputs')
+    out['problems'].extend(_cv_inputs_problems(inputs))
+    result = artifact.get('result')
+    if not isinstance(result, dict):
+        out['problems'].append('artifact.result must be an object')
+    else:
+        out['result_status'] = (result.get('status')
+                                if isinstance(result.get('status'), str)
+                                else _cv_repr(result.get('status')))
+    if out['problems']:
+        return out
+    if not isinstance(artifact.get('created_at'), str):
+        out['problems'].append('created_at must be a string')
+        return out
+    source = artifact.get('source')
+    if source is not None and not isinstance(source, str):
+        out['problems'].append('source must be a string or null')
+        return out
+    for label, body in (('inputs', inputs), ('result', result)):
+        problem = _cv_strict_json_problem(label, body)
+        if problem is not None:
+            out['problems'].append(problem)
+            return out
+    problems = _cv_shape_problems(inputs, result)
+    if problems:
+        out['problems'].extend(problems)
+        return out
+    if not replay:
+        out['status'] = ('warnings' if result.get('status') == 'warnings'
+                         else ('not_estimable'
+                               if result.get('status') == 'not_estimable'
+                               else 'ok'))
+        out['result'] = _cv_jsonable(result)
+        return out
+    try:
+        replayed = curve_simultaneous_inference(**inputs)
+    except Exception as exc:
+        out['problems'].append(
+            f'replay failed: {type(exc).__name__}: {_cv_repr(exc)}')
+        return out
+    out['replayed'] = True
+    cmp = compare_curve_inference_results(result, replayed)
+    if not cmp['match']:
+        out['problems'].append('replayed result differs from the stored result')
+        out['warnings'].extend(cmp['differences'][:8])
+        return out
+    out['result'] = _cv_jsonable(replayed)
+    if replayed.get('status') == 'not_estimable':
+        out['status'] = 'not_estimable'
+    elif replayed.get('status') == 'warnings':
+        out['status'] = 'warnings'
+        out['warnings'].extend(list(replayed.get('warnings') or []))
+    else:
+        out['status'] = 'ok'
+    return out
+
+
+def validate_curve_inference_block(block, *, replay=True):
+    """Validate a timestamp-free ``curve_inference_block``."""
+    out = {
+        'kind': 'curve_inference_block_validation',
+        'status': 'fail',
+        'result_status': None,
+        'replayed': False,
+        'problems': [],
+        'warnings': [],
+        'result': None,
+    }
+    if not isinstance(block, dict):
+        out['problems'].append('block must be a JSON object')
+        return out
+    if block.get('kind') != CURVE_INFERENCE_BLOCK_KIND:
+        out['problems'].append(
+            f'block.kind must be {CURVE_INFERENCE_BLOCK_KIND!r}, got '
+            f'{_cv_repr(block.get("kind"))}')
+    extra = sorted(set(block) - {'kind', 'inputs', 'result'},
+                   key=_cv_key_text)
+    if extra:
+        out['problems'].append('block keys differ from the schema: extra=['
+                               + ', '.join(_cv_key_text(k) for k in extra)
+                               + ']')
+    try:
+        forbidden = _cv_forbidden_paths(block)
+    except Exception as exc:
+        out['problems'].append(
+            'block cannot be inspected for frozen-decision fields: '
+            f'{type(exc).__name__}: {_cv_repr(exc)}')
+        return out
+    if forbidden:
+        out['problems'].append('block carries frozen-decision key(s): '
+                               + ', '.join(forbidden[:8]))
+    inputs = block.get('inputs')
+    out['problems'].extend(_cv_inputs_problems(inputs))
+    result = block.get('result')
+    if not isinstance(result, dict):
+        out['problems'].append('block.result must be an object')
+    else:
+        out['result_status'] = (result.get('status')
+                                if isinstance(result.get('status'), str)
+                                else _cv_repr(result.get('status')))
+    if out['problems']:
+        return out
+    for label, body in (('inputs', inputs), ('result', result)):
+        problem = _cv_strict_json_problem(label, body)
+        if problem is not None:
+            out['problems'].append(problem)
+            return out
+    problems = _cv_shape_problems(inputs, result)
+    if problems:
+        out['problems'].extend(problems)
+        return out
+    if not replay:
+        out['status'] = ('warnings' if result.get('status') == 'warnings'
+                         else ('not_estimable'
+                               if result.get('status') == 'not_estimable'
+                               else 'ok'))
+        out['result'] = _cv_jsonable(result)
+        return out
+    try:
+        replayed = curve_simultaneous_inference(**inputs)
+    except Exception as exc:
+        out['problems'].append(
+            f'replay failed: {type(exc).__name__}: {_cv_repr(exc)}')
+        return out
+    out['replayed'] = True
+    cmp = compare_curve_inference_results(result, replayed)
+    if not cmp['match']:
+        out['problems'].append('replayed result differs from the stored result')
+        out['warnings'].extend(cmp['differences'][:8])
+        return out
+    out['result'] = _cv_jsonable(replayed)
+    if replayed.get('status') == 'not_estimable':
+        out['status'] = 'not_estimable'
+    elif replayed.get('status') == 'warnings':
+        out['status'] = 'warnings'
+        out['warnings'].extend(list(replayed.get('warnings') or []))
+    else:
+        out['status'] = 'ok'
+    return out
+
+
+def write_curve_inference(path_or_dir, artifact, *, overwrite=False,
+                          name='curve_inference.json'):
+    verdict = validate_curve_inference(artifact)
+    if verdict['status'] == 'fail':
+        raise ValueError('refusing to write an invalid artifact: '
+                         + '; '.join(verdict['problems'][:4]))
+    if (isinstance(path_or_dir, (str, os.PathLike))
+            and str(path_or_dir).endswith('.json')):
+        path = os.fspath(path_or_dir)
+    else:
+        path = os.path.join(os.fspath(path_or_dir), name)
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    existing = None
+    if os.path.exists(path):
+        try:
+            with open(path, encoding='utf-8') as fh:
+                existing = json.load(fh)
+        except Exception:
+            existing = None
+    if isinstance(existing, dict):
+        if existing.get('content_sha256') == artifact.get('content_sha256'):
+            return {'status': 'noop', 'path': os.path.abspath(path)}
+        if not overwrite:
+            return {'status': 'conflict', 'path': os.path.abspath(path),
+                    'note': ('an artifact with different content already '
+                             'exists; pass overwrite=True to replace it')}
+    atomic_write_json(path, artifact)  # noqa: F821 (part_08)
+    return {'status': 'written', 'path': os.path.abspath(path)}
+
+
+def curve_inference_markdown(result, *, title='Curve-level simultaneous inference'):
+    title = _cv_text(title, 'title', limit=240)
+    if not isinstance(result, dict):
+        return f'**{title}**: not estimable (not an object).'
+    if result.get('status') == 'not_estimable':
+        return (f'**{title}**: not estimable — '
+                f'{_cv_repr(result.get("reason") or "no reason", limit=500)}.')
+    conditions = result.get('conditions')
+    conditions = conditions if isinstance(conditions, list) else []
+    per = result.get('per_condition')
+    per = per if isinstance(per, dict) else {}
+    lines = [
+        f'**{title}** (n={result.get("n")}; m={len(conditions)}; '
+        f'method=`{result.get("method")}`)', '',
+        '| condition | n | mean | pointwise 95% | adjusted p | simultaneous 95% | direction |',
+        '|---|---|---|---|---|---|---|',
+    ]
+
+    def _fmt(value, digits=4):
+        if value is None:
+            return '—'
+        try:
+            return f'{float(value):.{digits}g}'
+        except (TypeError, ValueError, OverflowError):
+            return _cv_repr(value)
+    for label in conditions:
+        row = per.get(label)
+        if not isinstance(row, dict):
+            continue
+        pt = row.get('ci95_pointwise') or [None, None]
+        sim = row.get('ci95_simultaneous') or [None, None]
+        lines.append(
+            f'| `{_cv_key_text(label)}` | {row.get("n")} | '
+            f'{_fmt(row.get("mean"))} | [{_fmt(pt[0])}, {_fmt(pt[1])}] | '
+            f'{_fmt(row.get("p_adj_single"))} | '
+            f'[{_fmt(sim[0])}, {_fmt(sim[1])}] | '
+            f'{_cv_key_text(row.get("direction") or "—")} |')
+    uniform = result.get('uniform') if isinstance(result.get('uniform'), dict) else {}
+    neg = uniform.get('negative') if isinstance(uniform.get('negative'), dict) else {}
+    pos = uniform.get('positive') if isinstance(uniform.get('positive'), dict) else {}
+    eq = uniform.get('equivalence') if isinstance(uniform.get('equivalence'), dict) else {}
+    lines.extend([
+        '',
+        f'- all conditions improve: p_IUT={_fmt(neg.get("p_iut"))}; '
+        f'supported={neg.get("supported")}',
+        f'- all conditions worsen: p_IUT={_fmt(pos.get("p_iut"))}; '
+        f'supported={pos.get("supported")}',
+    ])
+    if eq:
+        lines.append(
+            f'- all conditions within ±{_fmt(eq.get("margin"))}: '
+            f'p_IUT={_fmt(eq.get("p_tost"))}; supported={eq.get("supported")}')
+    flat = result.get('flatness') if isinstance(result.get('flatness'), dict) else {}
+    if flat.get('status') == 'ok':
+        lines.append(
+            f'- flatness (H0: all condition means equal): '
+            f'range={_fmt(flat.get("observed_range"))}; '
+            f'p={_fmt(flat.get("p_range"))}')
+        feq = flat.get('equivalence')
+        if isinstance(feq, dict):
+            lines.append(
+                f'- flatness equivalence within ±{_fmt(feq.get("margin"))}: '
+                f'p_IUT={_fmt(feq.get("p_tost"))}; '
+                f'supported={feq.get("supported")}')
+    warnings = result.get('warnings') or []
+    if warnings:
+        lines.extend(['', '> ' + '; '.join(_cv_repr(w, limit=300)
+                                           for w in warnings[:6])])
+    return '\n'.join(lines)

@@ -806,6 +806,126 @@ def _length_interaction_analysis(recs_a, recs_b, common, lengths, *, primary_len
     return res
 
 
+def _length_curve_inference(recs_a, recs_b, common, lengths, *,
+                             alpha=0.05, min_n=6, margin=None,
+                             flatness_margin=None):
+    """Curve-level simultaneous inference over the SAME by-length cells.
+
+    The per-length rows are separate exact tests; this block asks the
+    curve-level questions that a row-wise table cannot answer: is the sign
+    uniform over every length, is the whole curve practically constant, and
+    is the curve flat?  It is post-hoc/descriptive and never enters the frozen
+    Holm family.  A seed missing one length is dropped from the whole curve
+    (and named by the inference block), never paired positionally.
+    """
+    lens = sorted({int(x) for x in (lengths or [])})
+    if len(lens) < 2:
+        return None
+    seeds = sorted({int(s) for s in (common or [])})
+    if len(seeds) < 2:
+        return None
+    effects = {str(Ln): [] for Ln in lens}
+    for seed in seeds:
+        values = {}
+        for Ln in lens:
+            pa = _ppl_at_len(recs_a.get(seed), Ln)
+            pb = _ppl_at_len(recs_b.get(seed), Ln)
+            if pa is None or pb is None:
+                # Keep the other lengths' measured values: the block will
+                # drop this seed from the whole curve and can name exactly
+                # which condition was missing, not "all of them".
+                values[str(Ln)] = None
+                continue
+            try:
+                values[str(Ln)] = float(math.log(pa) - math.log(pb))
+            except (TypeError, ValueError, OverflowError):
+                values[str(Ln)] = None
+        for Ln in lens:
+            effects[str(Ln)].append(values.get(str(Ln)))
+    # Pass the declared seed list (with None for an incomplete seed) so the
+    # block can name the dropped seeds instead of silently shrinking n_input.
+    return L.curve_inference_block(
+        [str(Ln) for Ln in lens], effects, seeds=seeds, alpha=alpha,
+        min_n=min_n, margin=margin, flatness_margin=flatness_margin)
+
+
+def _length_curve_inference_markdown(name, block):
+    """Render the curve-level simultaneous block as compact Markdown."""
+    if not isinstance(block, dict):
+        return []
+    result = block.get('result') if isinstance(block.get('result'), dict) else {}
+    if not result:
+        return []
+    if result.get('status') == 'not_estimable':
+        return [f'- `{name}`：全长度同时推断不可估计 — '
+                f'{result.get("reason") or "no reason"}']
+    conditions = result.get('conditions') if isinstance(result.get('conditions'), list) else []
+    per = result.get('per_condition') if isinstance(result.get('per_condition'), dict) else {}
+    if not conditions:
+        return []
+
+    def _f(value, digits=3):
+        if value is None:
+            return '—'
+        try:
+            return f'{float(value):.{digits}g}'
+        except (TypeError, ValueError, OverflowError):
+            return '—'
+    lines = [
+        f'**`{name}` — 全长度曲线的同时推断**（n={result.get("n")}；'
+        f'm={len(conditions)}；method=`{result.get("method")}`）',
+        '',
+        '| 长度 | n | mean Δlog PPL | pointwise 95% | max-T adjusted p | '
+        'simultaneous 95% | 方向 |',
+        '|---|---|---|---|---|---|---|',
+    ]
+    for label in conditions:
+        row = per.get(label) if isinstance(per.get(label), dict) else {}
+        pt = row.get('ci95_pointwise') or [None, None]
+        sim = row.get('ci95_simultaneous') or [None, None]
+        lines.append(
+            f'| L{label} | {row.get("n", "—")} | {_f(row.get("mean"))} | '
+            f'[{_f(pt[0])}, {_f(pt[1])}] | {_f(row.get("p_adj_single"))} | '
+            f'[{_f(sim[0])}, {_f(sim[1])}] | '
+            f'{row.get("direction", "—")} |')
+    uniform = result.get('uniform') if isinstance(result.get('uniform'), dict) else {}
+    neg = uniform.get('negative') if isinstance(uniform.get('negative'), dict) else {}
+    pos = uniform.get('positive') if isinstance(uniform.get('positive'), dict) else {}
+    eq = uniform.get('equivalence') if isinstance(uniform.get('equivalence'), dict) else {}
+    lines.extend([
+        '',
+        f'- 全部长度同向改善（IUT）：p={_f(neg.get("p_iut"))}；'
+        f'supported={neg.get("supported")}',
+        f'- 全部长度同向变差（IUT）：p={_f(pos.get("p_iut"))}；'
+        f'supported={pos.get("supported")}',
+    ])
+    if eq:
+        lines.append(
+            f'- 全部长度落在 ±{_f(eq.get("margin"))} 内（IUT TOST）：'
+            f'p={_f(eq.get("p_tost"))}；supported={eq.get("supported")}')
+    flat = result.get('flatness') if isinstance(result.get('flatness'), dict) else {}
+    if flat.get('status') == 'ok':
+        lines.append(
+            f'- 曲线平坦性（H0：所有长度均值相等）：range={_f(flat.get("observed_range"))}；'
+            f'p={_f(flat.get("p_range"))}')
+        feq = flat.get('equivalence')
+        if isinstance(feq, dict):
+            lines.append(
+                f'- 全部两两差落在 ±{_f(feq.get("margin"))} 内（IUT TOST）：'
+                f'p={_f(feq.get("p_tost"))}；supported={feq.get("supported")}')
+    lines.extend([
+        '',
+        '> 边界：这是**同一批 by-length cell 上的 post-hoc 曲线级读数**，不进入冻结 Holm 族，不改变 `p_exact_signflip`/`p_holm`/`verified`/`confirmed`。'
+        ' max-T 区间是 t 样式近似（`ci_tail_level` 才是精确尾质量）；精确对象是 max-T adjusted p、range 检验与 IUT p。'
+        ' 全同向 IUT 用的是单侧 p，某个条件在双侧族校正下不显著仍可能支持“全部同向”；两者是不同主张。'
+        ' “平坦性不显著”不是“曲线等价”，除非声明的 flatness margin 被 IUT 拒绝。',
+    ])
+    warnings = result.get('warnings') or []
+    if warnings:
+        lines.extend(['', '> ' + '；'.join(str(w) for w in warnings[:6])])
+    return lines
+
+
 def _test_probe_stats(probe_path, manifest, slice_fp):
     """Descriptive summary of the P5T test-split distractor probe.
 
