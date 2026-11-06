@@ -143,6 +143,41 @@ def test_resolution_limited_panel_has_no_finite_ci():
     assert any('resolution limit' in w for w in result['warnings'])
 
 
+def test_zero_deltas_do_not_make_the_acceptance_set_unbounded():
+    # A zero delta is sign-invariant at mu=0, so it lowers the test's
+    # zero-null resolution (p_floor = 2/2**n_nonzero).  It is NOT
+    # sign-invariant after centering at mu != 0: as |mu| grows only the
+    # all-plus/all-minus patterns remain, so the far-tail floor is 2/2**n.
+    # Unboundedness is decided by that tail floor.  Using n_nonzero here used
+    # to report "whole real line" for this six-seed panel even though exact
+    # p(mu) < 0.05 for mu < 0 or mu > 5.
+    d = [5.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    result = L.exact_signflip_ci(d)
+    assert result['status'] == 'ok'
+    assert result['n_nonzero'] == 1
+    assert result['resolution']['p_floor'] == 1.0
+    assert result['resolution']['tail_p_floor'] == pytest.approx(2.0 / 64.0)
+    assert result['resolution']['attainable'] is False
+    assert result['resolution']['tail_attainable'] is True
+    assert result['resolution']['ci_attainable'] is True
+    assert result['unbounded'] is False and result['ci'] == [0.0, 5.0]
+    assert result['contains_zero'] is True
+    assert L.exact_signflip_location_p(d, -0.1)['p'] < 0.05
+    assert L.exact_signflip_location_p(d, 5.1)['p'] < 0.05
+    # The same decision must survive block replay: a block built from the
+    # mixed-zero panel is valid, finite, and reproduces p_at_zero exactly.
+    block = L.exact_signflip_ci_block(d, seeds=[0, 1, 2, 3, 4, 5])
+    assert block['result']['unbounded'] is False
+    verdict = L.validate_exact_signflip_ci_block(block)
+    assert verdict['status'] in ('ok', 'warnings'), verdict
+    assert block['result']['p_at_zero'] == pytest.approx(
+        L.exact_signflip_p(d)['p'], abs=1e-12)
+    # The all-zero panel keeps the documented conservative "no finite
+    # interval" policy; it must not be confused with the mixed-zero case.
+    zero = L.exact_signflip_ci([0.0] * 6)
+    assert zero['unbounded'] is True and zero['ci'] is None
+
+
 def test_invalid_and_large_inputs_fail_closed():
     for alpha in (0.0, 1.0, -0.1, True, 'x', float('nan')):
         with pytest.raises(ValueError):
@@ -170,6 +205,62 @@ def test_invalid_and_large_inputs_fail_closed():
     assert dropped['n_dropped'] == 2
     assert dropped['dropped_positions'] == [1, 3]
     assert dropped['status'] == 'warnings'
+
+
+def test_unrepresentable_integers_fail_closed_without_formatting_crash():
+    # CPython 3.12 refuses str()/repr()/json.dumps() on an integer with more
+    # than 4300 decimal digits.  A future/scale caller can still hand the
+    # public API an exact integer max_n or seed label, and an artifact is
+    # untrusted input: both must produce a bounded diagnostic, not the
+    # interpreter's integer-conversion error from inside an f-string.
+    huge = 10 ** 10000
+    for bad_max_n in (huge, -huge):
+        with pytest.raises(ValueError, match='max_n'):
+            L.exact_signflip_ci([1.0, 2.0, 3.0], max_n=bad_max_n)
+    for seeds in ([huge, 1, 2], [1, 2, -huge]):
+        with pytest.raises(ValueError, match='seeds'):
+            L.exact_signflip_ci([1.0, 2.0, 3.0], seeds=seeds)
+
+    artifact = L.build_exact_signflip_ci(DISAGREE12, seeds=SEEDS12)
+    for path, value in ((('schema',), huge),
+                        (('result', 'n'), huge),
+                        (('inputs', 'max_n'), huge)):
+        bad = copy.deepcopy(artifact)
+        node = bad
+        for key in path[:-1]:
+            node = node[key]
+        node[path[-1]] = value
+        # Hashing must survive the unrepresentable value so the validator can
+        # name it; the strict-JSON and schema checks then fail closed.
+        bad['content_sha256'] = L._esci_content_sha(bad)
+        verdict = L.validate_exact_signflip_ci(bad, replay=False)
+        assert verdict['status'] == 'fail', (path, verdict)
+        json.dumps(verdict, allow_nan=False)
+
+    # A structurally invalid interval must also fail without relying on the
+    # content hash or on replay: an artifact can be re-hashed by an attacker.
+    for bad_ci in ([1.0, 'x'], [2.0, 1.0], ['x', 'y'], [1.0]):
+        bad = copy.deepcopy(artifact)
+        bad['result']['ci'] = bad_ci
+        bad['content_sha256'] = L._esci_content_sha(bad)
+        verdict = L.validate_exact_signflip_ci(bad, replay=False)
+        assert verdict['status'] == 'fail', (bad_ci, verdict)
+        json.dumps(verdict, allow_nan=False)
+
+    for where in ('artifact', 'inputs', 'result'):
+        bad = copy.deepcopy(artifact)
+        if where == 'artifact':
+            bad[huge] = {'x': 1}
+        elif where == 'inputs':
+            bad['inputs'][huge] = 1
+        else:
+            bad['result'][huge] = 1
+        bad['content_sha256'] = L._esci_content_sha(bad)
+        verdict = L.validate_exact_signflip_ci(bad, replay=False)
+        assert verdict['status'] == 'fail', (where, verdict)
+        assert any('unrepresentable int' in problem
+                   for problem in verdict['problems']), (where, verdict)
+        json.dumps(verdict, allow_nan=False)
 
 
 def test_artifact_roundtrip_hash_and_tamper():

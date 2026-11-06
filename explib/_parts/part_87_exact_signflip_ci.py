@@ -55,6 +55,10 @@ EXACT_SIGNFLIP_CI_RESULT_KIND = 'exact_signflip_ci_result'
 EXACT_SIGNFLIP_CI_SCHEMA = 1
 EXACT_SIGNFLIP_CI_MAX_N = 16
 EXACT_SIGNFLIP_CI_HARD_MAX_N = 18
+# Seed labels are identities, not measurements, but the artifact is strict
+# JSON.  Keep them inside the range CPython can spell (the same bound the
+# other scale-safe artifacts use) so a hash/replay diagnostic is possible.
+EXACT_SIGNFLIP_CI_MAX_REPORTABLE_INT = 10 ** 4000
 
 EXACT_SIGNFLIP_CI_INPUT_KEYS = ('deltas', 'seeds', 'alpha', 'max_n')
 EXACT_SIGNFLIP_CI_ARTIFACT_KEYS = (
@@ -113,6 +117,38 @@ def _esci_repr(value, limit=200):
     return text if len(text) <= limit else text[:limit] + '...'
 
 
+def _esci_key_text(value, limit=120):
+    """Bounded text for a dict key without formatting a huge integer."""
+    if isinstance(value, str):
+        return value if len(value) <= limit else value[:limit - 3] + '...'
+    try:
+        text = str(value)
+    except Exception:
+        return _esci_repr(value, limit=limit)
+    return text if len(text) <= limit else text[:limit - 3] + '...'
+
+
+def _esci_json_key(value):
+    """JSON-object key: preserve strings, safely render anything else."""
+    return value if isinstance(value, str) else _esci_key_text(value)
+
+
+def _esci_strict_json_problem(label, body):
+    """Return a bounded diagnostic when ``body`` is not strict JSON."""
+    try:
+        _esci_json.dumps(body, allow_nan=False)
+    except Exception as exc:
+        detail = str(exc)
+        if ('Exceeds the limit' in detail
+                or 'integer string conversion' in detail):
+            return (f'{label} carries an unrepresentable int (beyond '
+                    "CPython's decimal-conversion limit) and cannot be "
+                    'strict-JSON serialised')
+        return (f'{label} is not strict-JSON serialisable: '
+                f'{type(exc).__name__}: {_esci_repr(exc)}')
+    return None
+
+
 def _esci_number(value, name, *, positive=False):
     """Finite float, or ``None`` for bool/str/NaN/inf (and non-positive)."""
     if isinstance(value, (bool, np.bool_)):
@@ -147,11 +183,11 @@ def _esci_max_n(value):
         raise ValueError(f'max_n must be an integer, got {_esci_repr(value)}')
     out = int(value)
     if out < 2:
-        raise ValueError(f'max_n must be >= 2, got {out}')
+        raise ValueError(f'max_n must be >= 2, got {_esci_repr(out)}')
     if out > EXACT_SIGNFLIP_CI_HARD_MAX_N:
         raise ValueError(
             f'max_n must be <= {EXACT_SIGNFLIP_CI_HARD_MAX_N} '
-            f'(the 2**n boundary sweep), got {out}')
+            f'(the 2**n boundary sweep), got {_esci_repr(out)}')
     return out
 
 
@@ -210,6 +246,12 @@ def _esci_inputs(deltas, seeds=None, *, strict=False, where='deltas'):
         norm = [_esci_seed(s) for s in seed_in]
         if any(s is None for s in norm):
             raise ValueError(f'seeds must be integers, got {_esci_repr(seed_in)}')
+        for index, seed_value in enumerate(norm):
+            if abs(seed_value) > EXACT_SIGNFLIP_CI_MAX_REPORTABLE_INT:
+                raise ValueError(
+                    f'seeds[{index}] is outside the strict-JSON representable '
+                    f'integer range +/-{_esci_repr(EXACT_SIGNFLIP_CI_MAX_REPORTABLE_INT)}; '
+                    f'got {_esci_repr(seed_value)}')
         if len(set(norm)) != len(norm):
             raise ValueError(f'seeds contain duplicates: {_esci_repr(norm)}')
         seeds_out = [norm[i] for i in kept]
@@ -415,13 +457,22 @@ def _esci_mean_median(vals):
 
 def _esci_jsonable(value):
     if isinstance(value, dict):
-        return {str(k): _esci_jsonable(v) for k, v in value.items()}
+        return {_esci_json_key(k): _esci_jsonable(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
         return [_esci_jsonable(v) for v in value]
     if isinstance(value, (bool, np.bool_)):
         return bool(value)
     if isinstance(value, (int, np.integer)):
-        return int(value)
+        out = int(value)
+        if not isinstance(value, (bool, np.bool_)):
+            try:
+                str(out)
+            except (ValueError, OverflowError):
+                # Keep a tampered/legacy artifact hashable so the validator
+                # can name the unrepresentable int instead of crashing while
+                # recomputing the content digest.
+                return {'__unprintable_int_hex__': hex(out)}
+        return out
     if isinstance(value, (float, np.floating)):
         out = float(value)
         return out if _esci_math.isfinite(out) else None
@@ -441,7 +492,7 @@ def _esci_forbidden_paths(obj, path=''):
     found = []
     if isinstance(obj, dict):
         for key, value in obj.items():
-            name = str(key)
+            name = _esci_key_text(key)
             here = f'{path}.{name}' if path else name
             if name in EXACT_SIGNFLIP_CI_FORBIDDEN_KEYS:
                 found.append(here)
@@ -469,11 +520,13 @@ def _esci_compare(a, b, path='result', *, rtol=1e-9, atol=1e-12, diffs=None):
         return diffs
     if isinstance(a, dict) and isinstance(b, dict):
         if set(a) != set(b):
-            diffs.append(f'{path}: keys {sorted(map(str, a))} != {sorted(map(str, b))}')
+            diffs.append(
+                f'{path}: keys {sorted(map(_esci_key_text, a))} != '
+                f'{sorted(map(_esci_key_text, b))}')
             return diffs
         for k in a:
-            _esci_compare(a[k], b[k], f'{path}.{k}', rtol=rtol, atol=atol,
-                          diffs=diffs)
+            _esci_compare(a[k], b[k], f'{path}.{_esci_key_text(k)}',
+                          rtol=rtol, atol=atol, diffs=diffs)
         return diffs
     if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
         if len(a) != len(b):
@@ -492,10 +545,13 @@ def _esci_inputs_problems(inputs):
     problems = []
     if not isinstance(inputs, dict):
         return ['inputs must be an object']
-    extra = sorted(set(inputs) - set(EXACT_SIGNFLIP_CI_INPUT_KEYS))
+    extra = sorted(set(inputs) - set(EXACT_SIGNFLIP_CI_INPUT_KEYS),
+                   key=_esci_key_text)
     missing = [k for k in EXACT_SIGNFLIP_CI_INPUT_KEYS if k not in inputs]
     if extra or missing:
-        problems.append(f'inputs keys differ: missing={missing}, extra={extra}')
+        problems.append(
+            f'inputs keys differ: missing={missing}, '
+            f'extra={[_esci_key_text(k) for k in extra]}')
         return problems
     try:
         alpha = _esci_alpha(inputs.get('alpha'))
@@ -554,8 +610,17 @@ def _esci_result_problems(result):
                 or any(_esci_number(x, f'intervals[{i}]') is None for x in item)):
             problems.append(f'intervals[{i}] must be a finite [lo, hi] pair')
             return problems
-    if ci is not None and (not isinstance(ci, (list, tuple)) or len(ci) != 2):
-        problems.append('ci must be null or a [lo, hi] pair')
+        if float(item[0]) > float(item[1]):
+            problems.append(f'intervals[{i}] must be ordered [lo <= hi]')
+            return problems
+    if ci is not None:
+        if (not isinstance(ci, (list, tuple)) or len(ci) != 2
+                or any(_esci_number(x, 'ci') is None for x in ci)):
+            problems.append('ci must be null or a finite [lo, hi] pair')
+            return problems
+        if float(ci[0]) > float(ci[1]):
+            problems.append('ci must be ordered [lo <= hi]')
+            return problems
     p0 = result.get('p_at_zero')
     if _esci_number(p0, 'p_at_zero') is None or not (0.0 <= float(p0) <= 1.0):
         problems.append('p_at_zero must be a finite probability')
@@ -663,7 +728,24 @@ def exact_signflip_ci(deltas, *, alpha=0.05, max_n=None, seeds=None):
         })
         return _esci_jsonable(base)
     n_nonzero = int(sum(1 for x in vals if x != 0.0))
+    # Two different floors matter here and must not be conflated:
+    #   * p_floor is the resolution of the test AT ZERO.  A zero delta is
+    #     sign-invariant there, so it multiplies every attainable count by
+    #     the same 2**(number of zeros) and the relative floor is 2/2**n_nonzero.
+    #   * tail_floor is the value of p(mu) as |mu| -> infinity.  A zero delta
+    #     is *not* sign-invariant after centering at mu != 0, so only the
+    #     all-plus and all-minus patterns remain and the floor is 2/2**n.
+    # The acceptance set {mu: p(mu) >= alpha} is the whole real line exactly
+    # when tail_floor >= alpha.  Deciding unboundedness from p_floor would
+    # wrongly return "unbounded" for a panel with some zero deltas even though
+    # values far from the observed mean are rejected.
     p_floor = _esci_p_floor(n_nonzero)
+    tail_floor = _esci_p_floor(n)
+    # An all-zero panel carries no non-zero paired difference.  Keep the
+    # documented conservative policy (no finite interval) even though the
+    # exact acceptance set degenerates to a single point; a zero-width set
+    # would otherwise be read as infinite precision.
+    unbounded = bool(n_nonzero == 0 or tail_floor >= alpha)
     min_n = _esci_min_n_for_alpha(alpha)
     mean, median = _esci_mean_median(vals)
     sd = None
@@ -687,15 +769,26 @@ def exact_signflip_ci(deltas, *, alpha=0.05, max_n=None, seeds=None):
         'std': sd,
         'resolution': {
             'p_floor': float(p_floor),
+            'tail_p_floor': float(tail_floor),
             'alpha': float(alpha),
+            # ``attainable`` keeps its historical meaning: can the test
+            # reject at its zero null?  ``ci_attainable`` says whether the
+            # inverted acceptance set is finite (equivalently, whether the
+            # far-tail floor is below alpha).  They differ only when some
+            # deltas are exactly zero.
             'attainable': bool(p_floor <= alpha),
+            'tail_attainable': bool(tail_floor < alpha),
+            'ci_attainable': bool(not unbounded),
             'min_n_for_alpha': (int(min_n) if min_n is not None else None),
             'n_nonzero': n_nonzero,
-            'note': ('the all-nonzero exact-test floor is 2/2**n; zero deltas '
-                     'reduce the resolution, so p_floor uses n_nonzero'),
+            'note': ('p_floor is the exact-test resolution at zero and uses '
+                     'n_nonzero because a zero delta is sign-invariant there; '
+                     'unboundedness uses tail_p_floor=2/2**n, the p(mu) limit '
+                     'as |mu| grows, where zero deltas are no longer '
+                     'sign-invariant'),
         },
     })
-    if p_floor > alpha:
+    if unbounded:
         p0 = _esci_p_at_zero_for(vals)
         t_int = _esci_t_interval(vals, alpha)
         base.update({
@@ -724,10 +817,15 @@ def exact_signflip_ci(deltas, *, alpha=0.05, max_n=None, seeds=None):
                             'all_real': True, 'n_intervals': 0,
                             'n_boundaries': 0},
             'warnings': [
-                (f'the exact test cannot reject any value at n={n} '
-                 f'(p floor {p_floor:.4g} > alpha={alpha:.4g}); no finite '
-                 'confidence set exists, which is a resolution limit rather '
-                 'than evidence of no effect')
+                ((f'every paired delta is exactly zero at n={n}; the exact '
+                  'acceptance set collapses to a single point, and a '
+                  'zero-width confidence set is not claimed as infinite '
+                  'precision (resolution limit)')
+                 if n_nonzero == 0 else
+                 (f'the exact test cannot reject any value at n={n} '
+                  f'(far-tail p floor {tail_floor:.4g} >= alpha={alpha:.4g}); '
+                  'no finite confidence set exists, which is a resolution '
+                  'limit rather than evidence of no effect'))
             ],
         })
         return _esci_jsonable(base)
@@ -919,12 +1017,16 @@ def _esci_validate_common(artifact, *, block=False):
         return out
     expected = (EXACT_SIGNFLIP_CI_BLOCK_KEYS if block
                 else EXACT_SIGNFLIP_CI_ARTIFACT_KEYS)
-    extra = sorted(set(artifact) - set(expected))
+    strict = _esci_strict_json_problem(
+        'block' if block else 'artifact', artifact)
+    if strict:
+        out['problems'].append(strict)
+    extra = sorted(set(artifact) - set(expected), key=_esci_key_text)
     missing = [k for k in expected if k not in artifact]
     if extra or missing:
         out['problems'].append(
             f'artifact keys differ from the schema: missing={missing}, '
-            f'extra={extra}')
+            f'extra={[_esci_key_text(k) for k in extra]}')
     want_kind = (EXACT_SIGNFLIP_CI_BLOCK_KIND if block
                  else EXACT_SIGNFLIP_CI_KIND)
     if artifact.get('kind') != want_kind:
@@ -1143,7 +1245,7 @@ def exact_signflip_ci_markdown(result, *, title='Exact sign-flip confidence set'
     lines.append('> Boundary: the exact set is the inversion of the same '
                  'sign-flip test (symmetry assumption), so it cannot disagree '
                  'with the exact p about zero; it is conservative and finite '
-                 'only when the p floor is below alpha. The t interval is '
+                 'only when the far-tail p floor 2/2**n is below alpha. The t interval is '
                  'shown for transparency and is not a replacement for the '
                  'pre-registered test. It is not a prediction interval and '
                  'not a posterior probability.')
