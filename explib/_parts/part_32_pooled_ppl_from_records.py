@@ -420,6 +420,41 @@ def _token_matrix(tok):
     return arr
 
 
+def _sum_axis_wide(matrix, axis):
+    """Sum along ``axis`` without silently overflowing the accumulator.
+
+    Returns ``(sums, used_wide)``.  The ordinary float64 reduction is kept
+    bit-for-bit; only a reduction that leaves float64 is repeated in the
+    platform's wider float (where available).  ``sums`` is ``None`` when the
+    true sum does not fit even that type, so callers can withhold the readout
+    instead of computing an interval from ``inf`` or a wrapped int64 total.
+
+    An integer token matrix is summed directly in float64: counts from
+    ``_token_matrix`` are at most int64 and a panel cannot hold enough rows to
+    overflow float64, while the old int64 reduction could wrap above 2**63.
+    """
+    arr = np.asarray(matrix)
+    try:
+        with np.errstate(over='ignore', invalid='ignore'):
+            if np.issubdtype(arr.dtype, np.integer):
+                direct = arr.sum(axis=axis, dtype=np.float64)
+            else:
+                direct = np.asarray(arr, dtype=float).sum(axis=axis)
+    except (TypeError, ValueError, OverflowError):
+        direct = None
+    if direct is not None and np.all(np.isfinite(direct)):
+        return direct, False
+    try:
+        if not (np.finfo(np.longdouble).max > np.finfo(float).max):
+            return None, False
+        wide = np.asarray(arr, dtype=np.longdouble).sum(axis=axis)
+    except (TypeError, ValueError, OverflowError):
+        return None, False
+    if not np.all(np.isfinite(wide)):
+        return None, False
+    return wide, True
+
+
 def _doc_bootstrap_ppl_ci(recs, *, n_boot=2000, seed=20261018):
     """Row-level bootstrap CI for the pooled PPL (legacy name kept).
 
@@ -475,8 +510,18 @@ def _doc_bootstrap_ppl_ci(recs, *, n_boot=2000, seed=20261018):
     nll_mat = np.stack([a for a, _ in rows], axis=0)          # [S, R]
     ntok_mat = np.stack([b for _, b in rows], axis=0)         # [S, R]
     rng = np.random.default_rng(_seed)
-    nll_col = nll_mat.sum(axis=0)
-    ntok_col = ntok_mat.sum(axis=0)
+    # Column totals are pooled over seeds.  A finite per-seed panel can still
+    # exceed float64 (NLL) or int64 (tokens, e.g. four 3e18-token records)
+    # in the pooled denominator; sum in a wider type rather than let an int
+    # wrap to a negative token total (which silently discarded every draw).
+    nll_col, nll_wide = _sum_axis_wide(nll_mat, 0)
+    ntok_col, tok_wide = _sum_axis_wide(ntok_mat, 0)
+    if nll_col is None or ntok_col is None:
+        return None
+    _wide = bool(nll_wide or tok_wide)
+    if _wide:
+        nll_col = np.asarray(nll_col, dtype=np.longdouble)
+        ntok_col = np.asarray(ntok_col, dtype=np.longdouble)
     vals = np.empty(_n_draws, dtype=float)
     # Multinomial bootstrap counts: a single [chunk, R] count matrix is reused
     # across draws.  Size the chunk so a very large document panel does not
@@ -486,6 +531,9 @@ def _doc_bootstrap_ppl_ci(recs, *, n_boot=2000, seed=20261018):
     while _b < _n_draws:
         _nb = min(_chunk, _n_draws - _b)
         counts = rng.multinomial(R, np.full(R, 1.0 / R, dtype=float), size=_nb)
+        # Float counts avoid an int64 product with a near-int64 token column;
+        # for ordinary panels every count and total is exactly representable.
+        counts = counts.astype(np.longdouble if _wide else float)
         nt = counts @ ntok_col
         nn = counts @ nll_col
         ok = nt > 0
@@ -555,20 +603,33 @@ def _combined_seed_doc_ci(recs, *, n_boot=2000, seed=20261018, conf=0.95):
     if isinstance(rows, list):
         nll_mat = np.stack([a for a, _ in rows], axis=0)          # [S, R]
         ntok_mat = np.stack([b for _, b in rows], axis=0)          # [S, R]
-        keep = ntok_mat.sum(axis=0) > 0
-        n_dropped = int((~keep).sum())
-        nll_mat = nll_mat[:, keep]
-        ntok_mat = ntok_mat[:, keep]
-        if not np.isfinite(nll_mat).all() or not np.isfinite(ntok_mat).all() or (ntok_mat < 0).any():
+        # Pooled token totals can exceed int64 even when each record's own
+        # total fits (e.g. four 3e18-token records): an int64 reduction wraps
+        # negative and the old code then dropped every document as
+        # "zero-token".  Use the wide sum and compare in the wide domain.
+        keep_sums, _keep_wide = _sum_axis_wide(ntok_mat, 0)
+        if keep_sums is None:
             rows = None
-        elif (ntok_mat.sum(axis=1) <= 0).any():
-            # A record with no scored token anywhere is not a PPL measurement
-            # (0 tokens would otherwise divide by 1e-30 and enter the seed
-            # component as a fake CE=0 seed).  Its NLLs also cannot be pooled
-            # into the document component.  Refuse the interval instead of
-            # inventing a zero-variance seed.
-            rows = None
-            _zero_token_seed = True
+        else:
+            keep = np.asarray(keep_sums) > 0
+            n_dropped = int((~keep).sum())
+            nll_mat = nll_mat[:, keep]
+            ntok_mat = ntok_mat[:, keep]
+            if (not np.isfinite(nll_mat).all()
+                    or not np.isfinite(ntok_mat).all()
+                    or (ntok_mat < 0).any()):
+                rows = None
+            else:
+                _tok_row_sums, _ = _sum_axis_wide(ntok_mat, 1)
+                if _tok_row_sums is None or (_tok_row_sums <= 0).any():
+                    # A record with no scored token anywhere is not a PPL
+                    # measurement (0 tokens would otherwise divide by 1e-30
+                    # and enter the seed component as a fake CE=0 seed).  Its
+                    # NLLs also cannot be pooled into the document component.
+                    # Refuse the interval instead of inventing a zero-variance
+                    # seed.
+                    rows = None
+                    _zero_token_seed = True
     out = {'status': 'unverifiable', 'n_seeds': len(recs), 'n_docs': None,
            'n_docs_dropped_zero_token': None,
            'se_seed_logppl': None, 'se_doc_logppl': None,
@@ -613,43 +674,67 @@ def _combined_seed_doc_ci(recs, *, n_boot=2000, seed=20261018, conf=0.95):
     # Seed-level component: per-seed pooled PPL over the SAME doc set.
     seed_logppl = None
     if rows is not None:
-        per_tok = nll_mat.sum(axis=1) / np.maximum(ntok_mat.sum(axis=1), 1e-30)
-        # Cross-entropy is zero for a perfectly predicted token, so a zero
-        # log-PPL is a valid measurement (PPL=1), not a missing component.
-        ok = np.isfinite(per_tok) & (per_tok >= 0)
-        if ok.sum() == S and S >= 2:
-            # nll/tokens is already cross-entropy = log(PPL); do not log it a
-            # second time or the reported interval is not a PPL interval.
-            lp = per_tok
-            seed_logppl = lp
-            out['se_seed_logppl'] = float(lp.std(ddof=1) / math.sqrt(S))
-            out['n_docs'] = int(nll_mat.shape[1])
-            out['n_docs_dropped_zero_token'] = n_dropped
-        elif ok.sum() == S:
-            out['n_docs'] = int(nll_mat.shape[1])
-            out['n_docs_dropped_zero_token'] = n_dropped
+        nll_row, nll_row_wide = _sum_axis_wide(nll_mat, 1)
+        tok_row, tok_row_wide = _sum_axis_wide(ntok_mat, 1)
+        if nll_row is not None and tok_row is not None:
+            if nll_row_wide or tok_row_wide:
+                nll_row = np.asarray(nll_row, dtype=np.longdouble)
+                tok_row = np.asarray(tok_row, dtype=np.longdouble)
+            with np.errstate(over='ignore', invalid='ignore'):
+                per_tok = nll_row / np.maximum(tok_row, 1e-30)
+            # Cross-entropy is zero for a perfectly predicted token, so a zero
+            # log-PPL is a valid measurement (PPL=1), not a missing component.
+            ok = np.isfinite(per_tok) & (per_tok >= 0)
+            if ok.sum() == S and S >= 2:
+                # nll/tokens is already cross-entropy = log(PPL); do not log
+                # it a second time or the reported interval is not a PPL
+                # interval.
+                lp = per_tok
+                seed_logppl = lp
+                _se_seed = lp.std(ddof=1) / math.sqrt(S)
+                _se_seed_f = float(_se_seed)
+                out['se_seed_logppl'] = (_se_seed_f
+                                         if math.isfinite(_se_seed_f) else None)
+                out['n_docs'] = int(nll_mat.shape[1])
+                out['n_docs_dropped_zero_token'] = n_dropped
+            elif ok.sum() == S:
+                out['n_docs'] = int(nll_mat.shape[1])
+                out['n_docs_dropped_zero_token'] = n_dropped
     # Doc-level component: bootstrap SD of log pooled PPL over doc resamples
     # (seed-pooled NLL/ntok columns, the same pooled estimator the doc CI
     # uses, taken on the log scale).
     if rows is not None and nll_mat.shape[1] >= 2:
         rng = np.random.default_rng(_seed)
-        nll_col = nll_mat.sum(axis=0)
-        ntok_col = ntok_mat.sum(axis=0)
+        nll_col, nll_col_wide = _sum_axis_wide(nll_mat, 0)
+        ntok_col, tok_col_wide = _sum_axis_wide(ntok_mat, 0)
         R = int(nll_mat.shape[1])
-        draws = np.empty(int(_nb), dtype=float)
-        _chunk = _bootstrap_draw_chunk(R)
-        _b = 0
-        while _b < int(_nb):
-            _nb_draw = min(_chunk, int(_nb) - _b)
-            counts = rng.multinomial(R, np.full(R, 1.0 / R, dtype=float), size=_nb_draw)
-            nt = counts @ ntok_col
-            nn = counts @ nll_col
-            with np.errstate(divide='ignore', invalid='ignore'):
-                # nn/nt is already the pooled log-PPL (CE) of the resample.
-                lp_draw = np.where((nt > 0) & np.isfinite(nn), nn / np.maximum(nt, 1e-30), np.nan)
-                lp_draw = np.where(np.isfinite(lp_draw) & (lp_draw >= 0), lp_draw, np.nan)
-            draws[_b:_b + _nb_draw] = lp_draw
-            _b += _nb_draw
+        _wide = bool(nll_col is not None and ntok_col is not None
+                     and (nll_col_wide or tok_col_wide))
+        if nll_col is not None and ntok_col is not None:
+            if _wide:
+                nll_col = np.asarray(nll_col, dtype=np.longdouble)
+                ntok_col = np.asarray(ntok_col, dtype=np.longdouble)
+            draws = np.empty(int(_nb), dtype=float)
+            _chunk = _bootstrap_draw_chunk(R)
+            _b = 0
+            while _b < int(_nb):
+                _nb_draw = min(_chunk, int(_nb) - _b)
+                counts = rng.multinomial(
+                    R, np.full(R, 1.0 / R, dtype=float), size=_nb_draw)
+                counts = counts.astype(np.longdouble if _wide else float)
+                nt = counts @ ntok_col
+                nn = counts @ nll_col
+                with np.errstate(divide='ignore', invalid='ignore',
+                                 over='ignore'):
+                    # nn/nt is already the pooled log-PPL (CE) of the resample.
+                    lp_draw = np.where((nt > 0) & np.isfinite(nn),
+                                       nn / np.maximum(nt, 1e-30), np.nan)
+                    lp_draw = np.where(np.isfinite(lp_draw) & (lp_draw >= 0),
+                                       lp_draw, np.nan)
+                draws[_b:_b + _nb_draw] = lp_draw
+                _b += _nb_draw
+        else:
+            draws = np.empty(0, dtype=float)
         draws = draws[np.isfinite(draws)]
         if draws.size >= max(20, int(0.5 * _nb)):
             sd = float(draws.std(ddof=1))
@@ -658,7 +743,8 @@ def _combined_seed_doc_ci(recs, *, n_boot=2000, seed=20261018, conf=0.95):
                 # Report the component as exactly zero so the ratio field is
                 # not a 1e16 number that reads like a measurement.
                 sd = 0.0
-            out['se_doc_logppl'] = sd
+            if math.isfinite(sd):
+                out['se_doc_logppl'] = sd
             if out['n_docs'] is None:
                 out['n_docs'] = R
                 out['n_docs_dropped_zero_token'] = n_dropped
@@ -673,15 +759,23 @@ def _combined_seed_doc_ci(recs, *, n_boot=2000, seed=20261018, conf=0.95):
         return out
     se_s = out['se_seed_logppl']
     se_d = out['se_doc_logppl']
-    out['se_combined_logppl'] = float(math.sqrt(se_s * se_s + se_d * se_d))
-    if se_d > 0:
+    _se_comb = math.sqrt(se_s * se_s + se_d * se_d)
+    out['se_combined_logppl'] = (_se_comb if math.isfinite(_se_comb) else None)
+    if se_d > 0 and math.isfinite(se_s / se_d):
         out['component_ratio_seed_over_doc'] = float(se_s / se_d)
     try:
         tc = _t_critical(float(_conf), S - 1)
     except Exception:
         tc = None
-    if tc is not None and math.isfinite(tc):
-        m = float(seed_logppl.mean())
+    _m = None
+    try:
+        _m = float(seed_logppl.mean())
+    except (TypeError, ValueError, OverflowError):
+        _m = None
+    if (tc is not None and math.isfinite(tc)
+            and out['se_combined_logppl'] is not None
+            and _m is not None and math.isfinite(_m)):
+        m = _m
         _lo = float(_safe_exp_ppl(m - tc * out['se_combined_logppl']))
         _hi = float(_safe_exp_ppl(m + tc * out['se_combined_logppl']))
         if math.isfinite(_lo) and math.isfinite(_hi):
@@ -814,10 +908,18 @@ def paired_row_bootstrap_delta(pairs, *, n_boot=1000, seed=20261018, conf=0.95):
     # Point estimate on the full rows, equal weight per seed (the same
     # estimand the paired contrast uses).
     def _seed_ppls(nll, tok):
-        _den = tok.sum(axis=1).astype(float)
+        _den, _den_wide = _sum_axis_wide(tok, 1)
+        _num, _num_wide = _sum_axis_wide(nll, 1)
+        if _den is None or _num is None:
+            return np.full(nll.shape[0], np.nan, dtype=float)
+        _wide = bool(_den_wide or _num_wide)
+        if _wide:
+            _den = np.asarray(_den, dtype=np.longdouble)
+            _num = np.asarray(_num, dtype=np.longdouble)
         _ok = _den > 0
-        _ppl = np.full(_den.shape, np.nan, dtype=float)
-        _ppl[_ok] = np.exp(nll.sum(axis=1)[_ok] / _den[_ok])
+        _ppl = np.full(nll.shape[0], np.nan, dtype=float)
+        with np.errstate(over='ignore', invalid='ignore'):
+            _ppl[_ok] = np.exp(_num[_ok] / _den[_ok])
         return _ppl
     _pa, _pb = _seed_ppls(nll_a, tok_a), _seed_ppls(nll_b, tok_b)
     _ok = np.isfinite(_pa) & np.isfinite(_pb)
@@ -829,19 +931,47 @@ def paired_row_bootstrap_delta(pairs, *, n_boot=1000, seed=20261018, conf=0.95):
     out['mean_delta'] = _scaled_mean_or_raw(_pa[_ok] - _pb[_ok])
     rng = np.random.default_rng(_seed)
     vals = np.full(int(_nb), np.nan, dtype=float)
+    # A draw can select one row up to R times, so the row-level float64 sums
+    # are not a sufficient guard: the resampled numerator may overflow even
+    # when every full-panel row sum is finite.  Use the wider float only for
+    # such extreme panels (and whenever the full sum already overflowed).
+    _row_a, _ = _sum_axis_wide(nll_a, 1)
+    _row_b, _ = _sum_axis_wide(nll_b, 1)
+    _max_abs = max(float(np.max(np.abs(nll_a))),
+                   float(np.max(np.abs(nll_b))))
+    _wide_draws = bool(_row_a is None or _row_b is None
+                       or not np.all(np.isfinite(_row_a))
+                       or not np.all(np.isfinite(_row_b))
+                       or (_max_abs > 0.0
+                           and _max_abs > np.finfo(float).max / max(1, R)))
+    if _wide_draws:
+        try:
+            _wider = np.finfo(np.longdouble).max > np.finfo(float).max
+        except (AttributeError, TypeError, ValueError):
+            _wider = False
+        if _wider:
+            _nll_a_work = nll_a.astype(np.longdouble)
+            _nll_b_work = nll_b.astype(np.longdouble)
+        else:
+            _wide_draws = False
+            _nll_a_work, _nll_b_work = nll_a, nll_b
+    else:
+        _nll_a_work, _nll_b_work = nll_a, nll_b
     _chunk = _bootstrap_draw_chunk(R)
     _b = 0
     while _b < int(_nb):
         _nb_draw = min(_chunk, int(_nb) - _b)
         counts = rng.multinomial(R, np.full(R, 1.0 / R, dtype=float), size=_nb_draw)
+        counts = counts.astype(np.longdouble if _wide_draws else float)
         def _draw(nll, tok):
             nt = counts @ tok.T.astype(float)          # [nb, S]
             nn = counts @ nll.T                         # [nb, S]
-            with np.errstate(divide='ignore', invalid='ignore'):
+            with np.errstate(divide='ignore', invalid='ignore',
+                             over='ignore'):
                 ppl = np.exp(nn / np.where(nt > 0, nt, np.nan))
             return np.where(np.isfinite(ppl), ppl, np.nan)
-        da = _draw(nll_a, tok_a)
-        db = _draw(nll_b, tok_b)
+        da = _draw(_nll_a_work, tok_a)
+        db = _draw(_nll_b_work, tok_b)
         diff = da - db
         _valid = np.isfinite(diff)
         _cnt = _valid.sum(axis=1)

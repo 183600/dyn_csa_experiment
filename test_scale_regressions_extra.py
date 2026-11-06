@@ -557,3 +557,55 @@ def test_paired_readouts_accept_an_exact_token_total_beyond_float64():
         assert vc['status'] == 'ok', vc
         assert math.isfinite(vc['token_pooled_delta_nll_per_token']), vc
         json.dumps(vc, allow_nan=False)
+
+
+def test_row_bootstrap_pools_token_columns_beyond_int64_and_nll_float64():
+    # Four records of three 3e18-token rows: each record's own total is below
+    # int64, but the pooled column total (1.2e19) wraps negative in an int64
+    # reduction.  The old code then treated every document as zero-token and
+    # withheld both intervals.  Every row has the same CE (1/3), so the
+    # resampling distribution is a point mass at exp(1/3).
+    expected = math.exp(1.0 / 3.0)
+    recs = [{'variant': 'a', 'seed': s, 'ppl': expected,
+             'nll_per_row': [1e18, 1e18, 1e18],
+             'n_tokens_per_row': [3 * 10 ** 18] * 3} for s in range(4)]
+    doc = L._doc_bootstrap_ppl_ci(recs, n_boot=60, seed=5)
+    assert doc is not None, 'a representable pooled CE was discarded'
+    assert math.isclose(doc[0], expected, rel_tol=1e-12), doc
+    assert math.isclose(doc[1], expected, rel_tol=1e-12), doc
+    combined = L._combined_seed_doc_ci(recs, n_boot=60, seed=5)
+    assert combined['status'] == 'ok', combined
+    assert combined['n_docs'] == 3 and combined['n_docs_dropped_zero_token'] == 0, combined
+    assert math.isclose(combined['ci95_ppl'][0], expected, rel_tol=1e-12), combined
+    json.dumps(combined, allow_nan=False)
+
+    # The same records can also have a finite row NLL whose float64 column
+    # sum overflows (3 * 1e308).  The CE is still 100, so the interval must be
+    # reported instead of collapsing to "unrepresentable".
+    big = [{'variant': 'a', 'seed': s, 'ppl': math.exp(100.0),
+            'nll_per_row': [1e308] * 3,
+            'n_tokens_per_row': [10 ** 306] * 3} for s in range(3)]
+    doc_big = L._doc_bootstrap_ppl_ci(big, n_boot=60, seed=5)
+    assert doc_big is not None, 'a finite CE with an overflowing NLL sum was lost'
+    assert math.isclose(doc_big[0], math.exp(100.0), rel_tol=1e-12), doc_big
+    combined_big = L._combined_seed_doc_ci(big, n_boot=60, seed=5)
+    assert combined_big['status'] == 'ok', combined_big
+    assert math.isclose(combined_big['ci95_ppl'][0], math.exp(100.0),
+                        rel_tol=1e-12), combined_big
+    json.dumps(combined_big, allow_nan=False)
+
+    # The paired row bootstrap shares the same denominator/numerator hazards.
+    a = [{'variant': 'a', 'seed': s, 'ppl': math.exp(100.0),
+          'nll_per_row': [1e308] * 3,
+          'n_tokens_per_row': [10 ** 306] * 3} for s in range(3)]
+    b = [{'variant': 'b', 'seed': s, 'ppl': math.exp(150.0),
+          'nll_per_row': [1.5e308] * 3,
+          'n_tokens_per_row': [10 ** 306] * 3} for s in range(3)]
+    row = L.paired_row_bootstrap_delta(list(zip(a, b)), n_boot=60, seed=5)
+    assert row['status'] == 'ok', row
+    expected_delta = math.exp(100.0) - math.exp(150.0)
+    assert math.isclose(row['mean_delta'], expected_delta,
+                        rel_tol=1e-12), row
+    assert math.isclose(row['ci95_delta_ppl'][0], expected_delta,
+                        rel_tol=1e-12), row
+    json.dumps(row, allow_nan=False)
