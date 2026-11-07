@@ -275,6 +275,36 @@ def test_binomial_huge_n_tiny_p_keeps_the_poisson_limit():
         math.exp(-1.0), abs=1e-15)
 
 
+def test_binomial_tail_at_huge_n_does_not_convert_the_count_distance():
+    # ``n`` itself is beyond float64 and ``p`` is tiny, so n*p is an ordinary
+    # large float (1e200..1e300), while the central count k=n//2 minus n*p is
+    # a ~1e300 integer.  Converting that distance to float before dividing by
+    # sd used to raise OverflowError inside the Edgeworth tail even though the
+    # standardised z is finite (or +inf) and the tail is 0/1.  The exact-int
+    # normal-z fallback must return the limiting tail instead.
+    n = 10 ** 400
+    for p in (1e-300, 1e-200, 1e-100, 2.0 ** -1074):
+        # Central count: the integer distance k - n*p is ~n, far beyond
+        # float64, while z is finite-huge or +inf.
+        for k in (n // 2, n - 1):
+            near_max = (k == n - 1)
+            sf = L._binomial_sf_stable(k, n, p)
+            cdf = L._binomial_cdf_stable(k, n, p)
+            assert sf == 0.0, (p, near_max, sf)
+            assert cdf == 1.0, (p, near_max, cdf)
+            assert L._binomial_sf(k, n, p) == 0.0, (p, near_max)
+        # A tiny index is far below the mean: the same log-pmf path must
+        # report probability one instead of converting k to float.
+        sf = L._binomial_sf_stable(2, n, p)
+        cdf = L._binomial_cdf_stable(2, n, p)
+        assert sf == 1.0, (p, sf)
+        assert cdf == 0.0, (p, cdf)
+        # signflip_power builds k_min ~ n/2 and passes the same tail through
+        # the same dispatcher; it must report zero power, not crash.
+        power = L.signflip_power(n, 4, p, 0.05)
+        assert power == 0.0, (p, power)
+
+
 def test_dominant_delta_uses_an_exact_mitm_count():
     # A single dominant delta defeats the saddlepoint approximation: every
     # sign assignment has |sum| >= the observed sum, so the exact p is 1.

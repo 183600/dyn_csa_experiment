@@ -1208,7 +1208,17 @@ def _binom_logpmf(k, n, p):
         # n alone is beyond float64, but (n-k)*p and the log are not.  Factor
         # the tiny probability out once so the product stays representable.
         q_term = _binom_mean_safe(n - k, p) * (math.log1p(-p) / p)
-    return (_binom_log_comb(n, k) + k * math.log(p) + q_term)
+    try:
+        k_log_p = k * math.log(p)
+    except OverflowError:
+        # ``k`` alone can exceed float64 (e.g. k=n-1 for n=2**1024) even
+        # though the count is still an exact integer.  Here p is in (0, 0.5]
+        # (the dispatcher folds p>0.5), so log(p) < 0 and the product is
+        # below -float_max: the pmf is zero at any representable precision.
+        # Returning the log limit keeps the exact-tail walker from raising on
+        # a tail it would immediately report as 0/1.
+        k_log_p = float('-inf')
+    return (_binom_log_comb(n, k) + k_log_p + q_term)
 
 
 def _binom_lower_step_ratio(i, n, p):
@@ -1323,6 +1333,30 @@ def _binom_continuity_numerator(k, n, p, correction):
                       float(correction)))
 
 
+def _binom_edgeworth_z(k, n, p, *, upper):
+    """Continuity-corrected z without overflowing on a huge count.
+
+    ``_binom_continuity_numerator`` is exact until it converts the integer
+    distance ``k - n*p`` to float.  At planning scales that distance can be
+    larger than float64 even when the standardised value
+    ``(k - n*p) / sqrt(n*p*(1-p))`` is ordinary (or infinite).  In that case
+    use the exact-integer normal-z helper, which divides before converting;
+    the caller then returns the corresponding 0/1 tail instead of raising
+    ``OverflowError``.  A zero/underflowed mean has the same failure mode
+    (division by a zero sd), so it routes through the same safe helper.
+    """
+    mu = _binom_mean_safe(n, p)
+    if not math.isfinite(mu):
+        return _binom_scaled_normal_z(k, n, p, upper=upper)
+    var = mu * (1.0 - p)
+    sd = math.sqrt(var)
+    try:
+        return _binom_continuity_numerator(
+            k, n, p, -0.5 if upper else 0.5) / sd
+    except (OverflowError, ZeroDivisionError):
+        return _binom_scaled_normal_z(k, n, p, upper=upper)
+
+
 def _binom_edgeworth_cdf(k, n, p):
     """Edgeworth CDF for a large binomial count (continuity corrected).
 
@@ -1335,11 +1369,10 @@ def _binom_edgeworth_cdf(k, n, p):
     if not math.isfinite(mu):
         return _binom_scaled_normal_cdf(k, n, p)
     var = mu * (1.0 - p)
-    sd = math.sqrt(var)
-    z = _binom_continuity_numerator(k, n, p, 0.5) / sd
+    z = _binom_edgeworth_z(k, n, p, upper=False)
     phi = math.exp(-0.5 * z * z) / math.sqrt(2.0 * math.pi)
     cdf = 0.5 * math.erfc(-z / math.sqrt(2.0))
-    if abs(z) < 1e6:
+    if abs(z) < 1e6 and math.isfinite(var) and var > 0.0:
         cdf += phi * _binom_edgeworth_corr(z, var, p)
     return float(min(1.0, max(0.0, cdf)))
 
@@ -1349,11 +1382,10 @@ def _binom_edgeworth_sf(k, n, p):
     if not math.isfinite(mu):
         return _binom_scaled_normal_sf(k, n, p)
     var = mu * (1.0 - p)
-    sd = math.sqrt(var)
-    z = _binom_continuity_numerator(k, n, p, -0.5) / sd
+    z = _binom_edgeworth_z(k, n, p, upper=True)
     phi = math.exp(-0.5 * z * z) / math.sqrt(2.0 * math.pi)
     sf = 0.5 * math.erfc(z / math.sqrt(2.0))
-    if abs(z) < 1e6:
+    if abs(z) < 1e6 and math.isfinite(var) and var > 0.0:
         sf -= phi * _binom_edgeworth_corr(z, var, p)
     return float(min(1.0, max(0.0, sf)))
 
