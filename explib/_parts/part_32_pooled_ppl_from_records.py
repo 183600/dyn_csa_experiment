@@ -1121,11 +1121,19 @@ def paired_nll_two_way_bootstrap(nll_a, nll_b, n_tokens, *, n_boot=2000,
         total_tok = float(T.sum())
         if not math.isfinite(total_tok) or total_tok <= 0.0:
             raise OverflowError
+        # Counts/totals above 2**53 are not exact floats.  The bootstrap uses
+        # token shares, so a rounded denominator would silently resample a
+        # different panel; route those inputs through the exact-integer path.
+        if (not np.all(np.isfinite(T))
+                or int(total_tok) != int(sum(counts))
+                or any(int(t) != c for t, c in zip(T.tolist(), counts))):
+            raise OverflowError
         _extreme_total = False
     except (OverflowError, ValueError):
-        # A token total beyond float64 is not an unmeasurable panel: the
-        # bootstrap can run on token shares (the ratio is invariant to a
-        # common factor) while the point uses the exact integer denominator.
+        # A token total/count beyond exact float64 representation is not an
+        # unmeasurable panel: the bootstrap can run on token shares (the ratio
+        # is invariant to a common factor) while the point uses the exact
+        # integer denominator.
         T = None
         total_tok = None
         _extreme_total = True

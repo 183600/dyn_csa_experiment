@@ -119,6 +119,32 @@ def test_complete_clearance_binds_every_required_check():
     edited['checks']['power']['status'] = 'fail'
     assert L.validate_preparation_clearance(edited, protocol=p)['status'] == 'fail'
 
+    # A check body's own problems/warnings are evidence.  Rehashing the edited
+    # body made the object internally consistent except for an "ok" status
+    # that contradicted its contents; the validator must not drop them.
+    def _rehash(obj):
+        obj['content_sha256'] = L._prep_sha_obj({
+            k: v for k, v in obj.items()
+            if k not in ('created_at', 'revision', 'supersedes', 'reason',
+                         'notes', 'content_sha256')})
+        return obj
+
+    forged = _rehash(copy.deepcopy(c))
+    forged['checks']['protocol']['status'] = 'ok'
+    forged['checks']['protocol']['problems'] = ['forged problem']
+    _rehash(forged)
+    got = L.validate_preparation_clearance(forged, protocol=p)
+    assert got['status'] == 'fail', got
+    assert any('records problems' in x for x in got['problems']), got
+
+    warned = _rehash(copy.deepcopy(c))
+    warned['checks']['protocol']['status'] = 'ok'
+    warned['checks']['protocol']['warnings'] = ['forged warning']
+    _rehash(warned)
+    got = L.validate_preparation_clearance(warned, protocol=p)
+    assert got['status'] == 'fail', got
+    assert any('records warnings' in x for x in got['warnings']), got
+
     blob = json.dumps(c, sort_keys=True)
     for forbidden in ('p_holm', 'p_exact_signflip', 'p_value', 'confirmed',
                       'verified', 'verdict'):

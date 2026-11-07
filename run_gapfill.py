@@ -188,7 +188,15 @@ def _aggregate_seed_map(entry, tag='', *, log_prefix='[synth]'):
     for _s, _p in zip(entry.get('seeds') or [], entry.get('ppls') or []):
         _si = _num_or_none(_s)
         if _si is not None and L.ppl_is_usable(_p):
-            out[_si] = float(_p)
+            _value = float(_p)
+            if _si in out and out[_si] != _value:
+                # Two different measurements for one seed cannot both be the
+                # seed's PPL.  Last-wins would silently drop one and let the
+                # surviving value replace the pre-retrain snapshot's number;
+                # refuse the whole entry instead of fabricating a series.
+                print(f'{log_prefix} NOTE: aggregate entry{(" for " + tag) if tag else ""} repeats seed {_si} with conflicting PPLs ({out[_si]!r} vs {_value!r}) — skipping the entry instead of silently dropping one measurement')
+                return {}
+            out[_si] = _value
     return out
 
 # Historical private spelling; kept so out-of-tree callers do not break.

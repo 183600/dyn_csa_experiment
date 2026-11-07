@@ -2487,13 +2487,16 @@ def audit_joint_correction(outdirs=None, alpha=0.05):
                 panel['violations'].append(
                     f'{key}: ci_simultaneous presence {si!r} != {ri!r}')
             elif si is not None:
-                if not (isinstance(si, (list, tuple)) and len(si) == 2
+                _si_ok = isinstance(si, (list, tuple)) and len(si) == 2
+                if not (_si_ok
                         and _joint_gate_close(si[0], ri[0], tol=1e-9)
                         and _joint_gate_close(si[1], ri[1], tol=1e-9)):
                     panel['violations'].append(
                         f'{key}: ci_simultaneous {si!r} != recomputed {ri!r}')
                 _mean = e.get('mean')
-                if isinstance(_mean, (int, float)) and not isinstance(_mean, bool):
+                if (_si_ok
+                        and isinstance(_mean, (int, float))
+                        and not isinstance(_mean, bool)):
                     if not (float(si[0]) - 1e-9 <= float(_mean) <= float(si[1]) + 1e-9):
                         panel['violations'].append(
                             f'{key}: the simultaneous interval does not contain '

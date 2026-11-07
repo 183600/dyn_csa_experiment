@@ -313,10 +313,15 @@ def test_joint_correction_gate_replays_and_refuses_tampering():
         gid = next(iter(rep['family']['maxt']['groups']))
         rep['family']['maxt']['groups'][gid]['deltas_fp'] = 'deadbeef'
 
+    def _scalar_ci(rep):
+        # A malformed scalar interval must be a named violation, not an
+        # uncaught TypeError while the mean-containment check indexes it.
+        rep['components']['compA'][0]['ci_simultaneous'] = 5.0
+
     for mut, why in ((_p, 'p_maxt'), (_ci, 'simultaneous interval'),
                      (_rank, 'rank'), (_ready, 'family_ready'),
                      (_only, 'maxt_only'), (_single, 'p_maxt_single'),
-                     (_fp, 'deltas_fp')):
+                     (_fp, 'deltas_fp'), (_scalar_ci, 'scalar interval')):
         bad = _mutate(mut)
         assert bad['status'] == 'fail', (why, bad)
         assert bad['violations'], (why, bad)

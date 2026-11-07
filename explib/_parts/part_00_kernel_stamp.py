@@ -1964,13 +1964,25 @@ def _paired_nll_doc_ci(nll_a, nll_b, n_tokens, *, conf=0.95):
 
     S, D = A.shape
     _extreme_tokens = False
+    _inexact_tokens = False
     try:
         T = np.asarray(_counts, dtype=float)
         total_tok = float(T.sum())
         if not math.isfinite(total_tok) or total_tok <= 0.0:
             raise OverflowError
+        # A token count above 2**53 is not exactly a float: converting it
+        # would silently divide by a different integer.  Likewise, the SUM of
+        # individually exact counts can exceed 2**53 and round.  The ordinary
+        # path is only valid when every count and the total round-trip
+        # exactly; otherwise use the exact-rational path that already takes
+        # Python integers.  Defer the branch until after the row-sum check so
+        # an overflowing row keeps its more specific diagnostic.
+        _inexact_tokens = (
+            (not np.all(np.isfinite(T)))
+            or int(total_tok) != int(sum(_counts))
+            or any(int(t) != c for t, c in zip(T.tolist(), _counts)))
     except (OverflowError, ValueError):
-        # A token total beyond float64 (or a single count beyond it) is not a
+        # A token total/count beyond exact float64 representation is not a
         # reason to lose a representable ratio: run the exact-rational path.
         _extreme_tokens = True
     if _extreme_tokens:
@@ -1985,6 +1997,10 @@ def _paired_nll_doc_ci(nll_a, nll_b, n_tokens, *, conf=0.95):
         # discarding the whole panel as unmeasurable.
         return _paired_nll_doc_ci_extreme(
             A, B, _counts, conf, basis='a row NLL sum beyond float64')
+    if _inexact_tokens:
+        return _paired_nll_doc_ci_extreme(
+            A, B, _counts, conf,
+            basis='a token count/total beyond exact float64 representation')
     ce_a = _row_a / total_tok
     ce_b = _row_b / total_tok
     ea = np.asarray([_safe_exp_ppl(x) for x in ce_a], dtype=float)

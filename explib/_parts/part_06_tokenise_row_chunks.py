@@ -337,7 +337,10 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=None, cache_dir=None,
                                 f'test article-id sidecar hash unreadable '
                                 f'({type(_tae).__name__}: {_tae})')
                         else:
-                            if str(_actual_sha) != str(_rec_sha):
+                            # Accept either hex case; the format check above
+                            # accepts A-F, and writers may have emitted the
+                            # digest through a uppercase-preserving channel.
+                            if str(_actual_sha).lower() != str(_rec_sha).lower():
                                 _problems_tta.append(
                                     'test article-id sidecar sha256 does not '
                                     'match the cache metadata')

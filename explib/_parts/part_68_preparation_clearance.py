@@ -1129,16 +1129,27 @@ def validate_preparation_clearance(clearance, *, protocol=None):
             out['problems'].append(
                 f'checks.{name}.required must be boolean')
         out['checks'][name] = status
+        _check_problems = _prep_detail_head(check.get('problems'), limit=3)
+        _check_warnings = _prep_detail_head(check.get('warnings'), limit=3)
         if status == 'fail':
             # ``checks`` is untrusted JSON: problems may be a mapping, a
             # scalar, or a list of non-strings.  Slicing/joining it directly
             # aborts the validator instead of returning the named failure.
-            _detail = _prep_detail_head(check.get('problems'), limit=3)
             out['problems'].append(
                 f'checks.{name} failed: '
-                + '; '.join(_prep_str(x) for x in _detail))
+                + '; '.join(_prep_str(x) for x in _check_problems))
+        elif _check_problems:
+            # A check body that records explicit problems cannot also be
+            # reported as clean (or merely informational): the validator must
+            # fail closed instead of dropping the body's own evidence.
+            out['problems'].append(
+                f'checks.{name} records problems with status={_prep_repr(status)}: '
+                + '; '.join(_prep_str(x) for x in _check_problems))
         elif status in ('warnings', 'not_verifiable'):
             out['warnings'].append(f'checks.{name} is {status}')
+        elif status == 'ok' and _check_warnings:
+            out['warnings'].append(
+                f'checks.{name} records warnings with status=ok')
     required = set(recorded_required)
     for name in PREPARATION_CLEARANCE_CHECK_ORDER:
         check = checks.get(name)

@@ -337,12 +337,32 @@ def _slug(value):
     return re.sub(r"[^A-Za-z0-9._-]+", "_", _safe_text(value))[:80]
 
 
+def _bounded_hash_seed(seed):
+    """A deterministic PYTHONHASHSEED value for any exact integer seed.
+
+    CPython accepts only ``random`` or an integer in ``[0, 2**32 - 1]``.
+    ``int(seed)`` used to be written through verbatim, so a legitimate
+    large job seed (2**40, 2**53 + 1) made the child interpreter abort in
+    ``config_init_hash_seed`` before the job could start.  The hash seed does
+    not have to equal the job seed; it only has to be deterministic, so fold
+    the identity into the supported range.  Non-integral/malformed values do
+    not pin a hash seed instead of crashing the child.
+    """
+    if seed is None or isinstance(seed, (bool, np.bool_)):
+        return None
+    try:
+        return int(seed) % (1 << 32)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
 def _child_env(slot, seed=None):
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = str(slot)
     env["PYTHONUNBUFFERED"] = "1"
-    if seed is not None:
-        env["PYTHONHASHSEED"] = str(int(seed))
+    _hash_seed = _bounded_hash_seed(seed)
+    if _hash_seed is not None:
+        env["PYTHONHASHSEED"] = str(_hash_seed)
     return env
 
 

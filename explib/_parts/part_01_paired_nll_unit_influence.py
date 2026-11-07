@@ -75,12 +75,19 @@ def paired_nll_unit_influence(nll_a, nll_b, n_tokens, *, unit_ids=None,
         total_tok = float(T.sum())
         if not math.isfinite(total_tok) or total_tok <= 0.0:
             raise OverflowError
+        # Counts/totals above 2**53 cannot be represented exactly as floats.
+        # Using the rounded value would silently divide by a different number
+        # of tokens, so route those panels through the exact-integer path too.
+        if (not np.all(np.isfinite(T))
+                or int(total_tok) != int(sum(_counts))
+                or any(int(t) != c for t, c in zip(T.tolist(), _counts))):
+            raise OverflowError
         _extreme_total = False
     except (OverflowError, ValueError):
-        # A token total beyond float64 is not an unmeasurable panel: the
-        # exact-rational path recovers any representable pooled CE.  Keep the
-        # integer counts and take that path instead of raising from the
-        # float64 conversion.
+        # A token total/count beyond exact float64 representation is not an
+        # unmeasurable panel: the exact-rational path recovers any
+        # representable pooled CE.  Keep the integer counts and take that path
+        # instead of raising from the float64 conversion.
         T = None
         total_tok = None
         _extreme_total = True
@@ -106,8 +113,11 @@ def paired_nll_unit_influence(nll_a, nll_b, n_tokens, *, unit_ids=None,
         if len(set(labels)) != D:
             raise ValueError('paired_nll_unit_influence: unit ids must be unique')
 
-    full = _paired_nll_doc_ci(
-        A, B, (_counts if _extreme_total else T), conf=conf)
+    # Always pass the exact integer counts.  Passing the float copy would
+    # round counts/totals above 2**53 before `_paired_nll_doc_ci` can apply
+    # its own exactness check, so the full-fold point could disagree with the
+    # integer LOO folds computed below.
+    full = _paired_nll_doc_ci(A, B, _counts, conf=conf)
     if full is None:
         return {'kind': 'paired_unit_influence', 'available': False,
                 'n_units': int(D), 'n_seeds': int(S),

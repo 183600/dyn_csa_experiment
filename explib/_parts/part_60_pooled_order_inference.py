@@ -853,21 +853,14 @@ def pooled_order_inference(nll_a, nll_b, n_tokens, *, unit_ids=None,
     total = int(sum(counts))
     if total <= 0:
         raise ValueError('pooled_order_inference: the total token count must be positive')
-    try:
-        T = _po_np.asarray(counts, dtype=float)
-        total_f = float(total)
-        if not _po_math.isfinite(total_f) or total_f <= 0.0:
-            raise OverflowError
-    except (OverflowError, ValueError):
+    def _exact_result(basis, reason):
         _extreme = _po_extreme_pooled(A, B, counts)
         if _extreme is None:
             return {'kind': 'pooled_order_inference',
                     'policy_version': POOLED_ORDER_POLICY['version'],
                     'status': 'not_estimable',
                     'n_units': D, 'n_seeds': S,
-                    'reason': ('the token total exceeds the representable '
-                               'float64 range and the exact-ratio influence '
-                               'is not representable')}
+                    'reason': reason}
         _psi_x, _q_x, _delta_ppl_x, _delta_log_x = _extreme
         _out = pooled_order_inference_from_influence(
             _psi_x, _q_x, delta_ppl=_delta_ppl_x,
@@ -880,9 +873,29 @@ def pooled_order_inference(nll_a, nll_b, n_tokens, *, unit_ids=None,
             order_attestation=order_attestation)
         _out['upstream'] = (
             'pooled_order_inference: exact-rational per-seed token-pooled '
-            'NLL influence for a token total beyond float64; same estimand '
-            'as the primary comparison')
+            f'NLL influence for {basis}; same estimand as the primary '
+            'comparison')
         return _out
+
+    _inexact_total = False
+    try:
+        T = _po_np.asarray(counts, dtype=float)
+        total_f = float(total)
+        if not _po_math.isfinite(total_f) or total_f <= 0.0:
+            raise OverflowError
+        # Counts and their total above 2**53 are not exactly representable as
+        # floats.  Rounding them here would silently change the denominator
+        # of every pooled rate, so defer to the exact-integer path.  The
+        # row-sum check below runs first to keep its more specific reason.
+        _inexact_total = (
+            (not _po_np.all(_po_np.isfinite(T)))
+            or int(total_f) != total
+            or any(int(t) != c for t, c in zip(T.tolist(), counts)))
+    except (OverflowError, ValueError):
+        return _exact_result(
+            'a token total beyond float64',
+            'the token total exceeds the representable float64 range and '
+            'the exact-ratio influence is not representable')
     with _po_np.errstate(over='ignore', invalid='ignore'):
         ce_a = A.sum(axis=1) / total_f
         ce_b = B.sum(axis=1) / total_f
@@ -892,31 +905,17 @@ def pooled_order_inference(nll_a, nll_b, n_tokens, *, unit_ids=None,
         # is representable.  Reuse the exact-rational influence path (the same
         # one used for an unrepresentable token total) instead of discarding
         # the readout.
-        _extreme = _po_extreme_pooled(A, B, counts)
-        if _extreme is None:
-            return {'kind': 'pooled_order_inference',
-                    'policy_version': POOLED_ORDER_POLICY['version'],
-                    'status': 'not_estimable',
-                    'n_units': D, 'n_seeds': S,
-                    'reason': ('a per-seed token-pooled mean NLL is not '
-                               'representable and the exact-ratio influence '
-                               'is not representable; the confidence readout '
-                               'is withheld')}
-        _psi_x, _q_x, _delta_ppl_x, _delta_log_x = _extreme
-        _out = pooled_order_inference_from_influence(
-            _psi_x, _q_x, delta_ppl=_delta_ppl_x,
-            delta_log_ratio=_delta_log_x,
-            unit_ids=unit_ids, seeds=seeds, n_seeds=S,
-            block_lengths=block_lengths, n_batches=n_batches,
-            n_boot=n_boot, n_perm=n_perm, conf=conf, alpha=alpha,
-            seed=seed, design_effect_tolerance=design_effect_tolerance,
-            material_ci_inflation=material_ci_inflation,
-            order_attestation=order_attestation)
-        _out['upstream'] = (
-            'pooled_order_inference: exact-rational per-seed token-pooled '
-            'NLL influence for a row NLL sum beyond float64; same estimand '
-            'as the primary comparison')
-        return _out
+        return _exact_result(
+            'a row NLL sum beyond float64',
+            'a per-seed token-pooled mean NLL is not representable and the '
+            'exact-ratio influence is not representable; the confidence '
+            'readout is withheld')
+    if _inexact_total:
+        return _exact_result(
+            'a token count/total beyond exact float64 representation',
+            'a per-seed token-pooled mean NLL is not representable with the '
+            'exact token counts and the exact-ratio influence is not '
+            'representable; the confidence readout is withheld')
     with _po_np.errstate(over='ignore', invalid='ignore'):
         ea = _po_np.asarray([_safe_exp_ppl(x) for x in ce_a], dtype=float)
         eb = _po_np.asarray([_safe_exp_ppl(x) for x in ce_b], dtype=float)

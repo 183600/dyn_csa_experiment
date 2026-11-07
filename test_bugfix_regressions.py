@@ -595,6 +595,54 @@ def test_paired_doc_ci_supports_token_totals_beyond_float64():
     json.dumps(got, allow_nan=False)
 
 
+def test_paired_doc_ci_keeps_token_counts_above_2_53_exact():
+    # The counts are finite and their float conversion does not overflow, but
+    # they are not exactly representable: 2**53 + 1 collapses to 2**53.  The
+    # ordinary float path then divides by a different token total, shifting a
+    # pooled CE near 600 by ~1e-13.  Every count and the total must round-trip
+    # exactly before the float path is used; otherwise the exact-integer path
+    # keeps the recorded denominator.
+    from fractions import Fraction
+
+    counts = [2 ** 53 + 1, 2 ** 53 + 3, 5]
+    a = np.asarray([[3.7440801623928146e18, 3.460177318818624e18,
+                     3.411705721302951e18],
+                    [3.614657350700201e18, 3.373076456249718e18,
+                     3.5778909711515904e18]])
+    b = np.asarray([[3.882764075539516e18, 3.8099703465620337e18,
+                     3.8954859630907663e18],
+                    [3.6617239548940585e18, 3.3637183619587804e18,
+                     3.600665096136473e18]])
+    total = sum(counts)
+    exact_lr = sum(
+        float(sum(Fraction(float(v)) for v in a[s]) / total
+              - sum(Fraction(float(v)) for v in b[s]) / total)
+        for s in range(2)) / 2.0
+
+    got = L._paired_nll_doc_ci(a, b, counts)
+    assert got is not None, got
+    assert got['delta_log_ratio'] == exact_lr, (got['delta_log_ratio'], exact_lr)
+    json.dumps(got, allow_nan=False)
+
+    influence = L.paired_nll_unit_influence(a, b, counts)
+    assert influence['available'] is True, influence
+    assert influence['full_delta_log_ratio'] == exact_lr, influence
+    json.dumps(influence, allow_nan=False)
+
+    bootstrap = L.paired_nll_two_way_bootstrap(
+        a, b, counts, n_boot=50, seed=1)
+    assert bootstrap['status'] == 'ok', bootstrap
+    assert bootstrap['delta_log_ratio'] == exact_lr, bootstrap
+    json.dumps(bootstrap, allow_nan=False)
+
+    # The order-dependence readout uses the same token denominator.  Its
+    # sufficient statistics must not be computed from rounded counts even
+    # when the panel is too small for a bootstrap/permutation interval.
+    order = L.pooled_order_inference(a, b, counts, seeds=[0, 1])
+    assert order['sufficient_statistics']['delta_log_ratio'] == exact_lr, order
+    json.dumps(order, allow_nan=False)
+
+
 def test_endpoint_sensitivity_withholds_unrepresentable_scale_statistics():
     # A finite repeat panel can have a representable mean/range/SD even when
     # the naive NumPy reductions overflow, and an actually unrepresentable
@@ -1199,3 +1247,39 @@ def test_document_ci_withholds_exponentiated_endpoints_that_overflow():
         assert all(math.isfinite(v) for v in got['delta_log_ratio_ci95']), got
         assert got['ratio_ci95'] is None, got
         json.dumps(got, allow_nan=False)
+
+
+def test_parallel_child_env_bounds_pythonhashseed_for_large_seeds():
+    # CPython accepts PYTHONHASHSEED only as "random" or an integer below
+    # 2**32.  Writing a legitimate large job seed through verbatim made the
+    # child die in config_init_hash_seed before the job started; the hash seed
+    # only needs a deterministic valid value, not the exact seed identity.
+    import subprocess
+    import sys
+
+    import par
+
+    for seed in (0, 17, 2 ** 40, 2 ** 53 + 1, -1, 10 ** 400):
+        env = par._child_env('0', seed)
+        raw = env.get('PYTHONHASHSEED')
+        assert raw is not None, (seed, env.get('PYTHONHASHSEED'))
+        assert 0 <= int(raw) < 2 ** 32, (seed, raw)
+
+    env = par._child_env('0', 2 ** 53 + 1)
+    subprocess.run([sys.executable, '-c', 'import sys; sys.hash_info'],
+                   env=env, check=True, capture_output=True)
+
+
+def test_aggregate_seed_map_refuses_conflicting_duplicate_seeds():
+    # A seed is an identity.  Two different PPLs for the same seed cannot both
+    # be that seed's measurement; last-wins used to drop one and could
+    # overwrite the pre-retrain snapshot value.
+    import run_gapfill as G
+
+    assert G._aggregate_seed_map(
+        {'seeds': [0, 1], 'ppls': [10.0, 20.0]}) == {0: 10.0, 1: 20.0}
+    # An exact duplicate is the same measurement, not a conflict.
+    assert G._aggregate_seed_map(
+        {'seeds': [0, 0], 'ppls': [10.0, 10.0]}) == {0: 10.0}
+    assert G._aggregate_seed_map(
+        {'seeds': [0, 0], 'ppls': [10.0, 20.0]}) == {}
