@@ -1887,7 +1887,21 @@ def _nll_row_ce(matrix, total_tokens):
     route it through the exact-integer companion instead of letting
     ``float(total_tokens)`` escape as ``OverflowError``.
     """
-    arr = np.asarray(matrix, dtype=float)
+    try:
+        arr = np.asarray(matrix, dtype=float)
+    except (TypeError, ValueError, OverflowError):
+        # An exact integer entry beyond float64 cannot enter the float
+        # reduction, but the row ratio is still defined exactly.  Reuse the
+        # exact-integer companion (which also handles a huge token total) and
+        # keep a NaN row when even the exact ratio is unrepresentable.
+        exact = _nll_row_ce_exact(matrix, [total_tokens])
+        if exact is not None:
+            return exact
+        try:
+            n_rows = int(np.asarray(matrix, dtype=object).shape[0])
+        except (TypeError, ValueError, OverflowError, IndexError):
+            return np.asarray(float('nan'))
+        return np.full(n_rows, np.nan)
     with np.errstate(over='ignore', invalid='ignore'):
         sums = arr.sum(axis=1)
     try:
@@ -1928,7 +1942,17 @@ def _nll_row_ce_exact(matrix, counts):
     PPL and influence value.
     """
     from fractions import Fraction as _Fraction
-    arr = np.asarray(matrix, dtype=float)
+    try:
+        arr = np.asarray(matrix, dtype=float)
+        rows = arr.tolist()
+    except (TypeError, ValueError, OverflowError):
+        try:
+            obj = np.asarray(matrix, dtype=object)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if obj.ndim != 2:
+            return None
+        rows = obj.tolist()
     try:
         total = int(sum(int(c) for c in counts))
     except (TypeError, ValueError, OverflowError):
@@ -1936,12 +1960,17 @@ def _nll_row_ce_exact(matrix, counts):
     if total <= 0:
         return None
     out = []
-    for row in arr:
+    for row in rows:
         try:
-            q = (sum((_Fraction(float(v)) for v in row), _Fraction(0, 1))
-                 / total)
+            terms = []
+            for value in row:
+                try:
+                    terms.append(_Fraction(value))
+                except (TypeError, ValueError):
+                    terms.append(_Fraction(float(value)))
+            q = sum(terms, _Fraction(0, 1)) / total
             value = float(q)
-        except (OverflowError, ValueError, ZeroDivisionError):
+        except (OverflowError, ValueError, ZeroDivisionError, TypeError):
             return None
         if value == 0.0 and q != 0:
             return None

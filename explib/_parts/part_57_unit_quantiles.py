@@ -390,7 +390,28 @@ def _uq_pooled_row(row, total_tokens):
     term-by-term sum; only an unrepresentable term falls back to an exact
     rational accumulation, so a representable pooled ratio survives.
     """
-    vals = [float(v) for v in row]
+    try:
+        raw = list(row)
+    except TypeError:
+        raw = [row]
+    try:
+        vals = [float(v) for v in raw]
+    except (TypeError, ValueError, OverflowError):
+        # An exact integer beyond float64 still has an exact per-token ratio
+        # when the token total is exact.  Form the sum as rationals instead of
+        # aborting from the float conversion.
+        from fractions import Fraction as _Fraction
+        try:
+            den = int(total_tokens)
+            if total_tokens != den or den <= 0:
+                return None
+            exact = sum((_Fraction(v) for v in raw), _Fraction(0, 1)) / den
+            out = float(exact)
+        except (OverflowError, ValueError, ZeroDivisionError, TypeError):
+            return None
+        if out == 0.0 and exact != 0:
+            return None
+        return out if _uq_math.isfinite(out) else None
     terms = []
     need_exact = False
     for v in vals:
@@ -413,6 +434,8 @@ def _uq_pooled_row(row, total_tokens):
             exact += _Fraction(v) / den
         out = float(exact)
     except (OverflowError, ValueError, ZeroDivisionError):
+        return None
+    if out == 0.0 and exact != 0:
         return None
     return out if _uq_math.isfinite(out) else None
 

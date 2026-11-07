@@ -372,7 +372,15 @@ def _binary_threshold_metrics(y_bin, score, threshold):
 
 
 def _binary_calibration(y_bin, score, n_bins=10):
-    score = np.asarray(score, dtype=float).ravel()
+    try:
+        score = np.asarray(score, dtype=float).ravel()
+    except OverflowError:
+        # An exact integer beyond float64 cannot be a probability in [0, 1].
+        # This is the same unavailable verdict the finite-range check below
+        # gives every other out-of-range score, not an escaping conversion
+        # error from a readout.
+        return {'status': 'unavailable',
+                'reason': 'scores are not finite probabilities in [0, 1]; Brier/ECE require probabilities'}
     _bins = _as_seed_int(n_bins)
     if _bins is None or _bins < 1:
         raise ValueError(f'n_bins must be a positive integer, got {n_bins!r}')
@@ -411,7 +419,11 @@ def _multiclass_calibration(y_true, y_score, labels, n_bins=10):
     uses the top-1 confidence (the standard top-label reliability diagnostic).
     """
     y_true = _preserve_label_array(y_true)
-    p = np.asarray(y_score, dtype=float)
+    try:
+        p = np.asarray(y_score, dtype=float)
+    except OverflowError:
+        return {'status': 'unavailable',
+                'reason': 'scores are outside [0, 1]; Brier/ECE require probabilities'}
     labels = _preserve_label_array(labels)
     if p.ndim != 2 or p.shape[1] != labels.size or p.shape[0] != y_true.size:
         return {'status': 'unavailable', 'reason': 'expected a rows x classes score matrix'}

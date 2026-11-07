@@ -329,7 +329,14 @@ def _aru_ranks(values, better):
     though the rank readout only needs O(K * B) storage.
     """
     import numpy as np
-    v = np.asarray(values, dtype=float)
+    try:
+        v = np.asarray(values, dtype=float)
+    except (TypeError, ValueError, OverflowError):
+        # An exact integer beyond float64 cannot become a float order
+        # statistic, but competition ranks depend only on the value order and
+        # exact ties.  Rank the raw values column by column instead of
+        # escaping with OverflowError.
+        return _aru_exact_ranks(values, better)
     if v.ndim != 2:
         raise ValueError('rank values must be 2-D')
     k, b = v.shape
@@ -348,6 +355,57 @@ def _aru_ranks(values, better):
     ranks = np.empty((k, b), dtype=np.int64)
     np.put_along_axis(ranks, order, sorted_ranks, axis=0)
     return ranks
+
+
+def _aru_exact_ranks(values, better):
+    """Competition ranks for values with no float64 spelling.
+
+    The ordinary path converts the whole panel to float first.  When one
+    value is an exact integer beyond float64 that conversion raises even
+    though ranking is still exactly defined: Python compares the raw ints (and
+    mixed int/float values) exactly.  Ties are value equality, matching the
+    ordinary ``ordered[1:] != ordered[:-1]`` grouping.
+    """
+    import numpy as np
+    try:
+        raw = list(values)
+    except TypeError:
+        raise ValueError('rank values must be 2-D') from None
+    # Keep a one-shot iterator materialised once; list() above already did.
+    if not raw:
+        empty = np.empty((0, 0), dtype=np.int64)
+        return empty
+    try:
+        obj = np.asarray(raw, dtype=object)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError('rank values must be 2-D') from None
+    if obj.ndim != 2:
+        raise ValueError('rank values must be 2-D')
+    k, b = obj.shape
+    if k == 0 or b == 0:
+        return np.empty((k, b), dtype=np.int64)
+    reverse = better != 'min'
+    out = np.empty((k, b), dtype=np.int64)
+    for j in range(b):
+        column = obj[:, j].tolist()
+        try:
+            order = sorted(range(k), key=lambda i: column[i],
+                           reverse=reverse)
+        except (TypeError, ValueError):
+            raise ValueError('rank values must be mutually comparable') from None
+        ordered = [column[i] for i in order]
+        first = 1
+        pos = 0
+        while pos < k:
+            end = pos + 1
+            while end < k and ordered[end] == ordered[pos]:
+                end += 1
+            # Competition rank of a tie group is its first 1-based position.
+            for index in order[pos:end]:
+                out[index, j] = first
+            pos = end
+            first = pos + 1
+    return out
 
 
 def _aru_sample_sd(values):
