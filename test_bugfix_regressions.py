@@ -643,6 +643,30 @@ def test_paired_doc_ci_keeps_token_counts_above_2_53_exact():
     json.dumps(order, allow_nan=False)
 
 
+def test_unpaired_doc_ci_keeps_token_counts_above_2_53_exact():
+    # The paired readout learned to require an exact float round-trip for
+    # every token count, but the unpaired document CI still divided by
+    # ``float(total_tok)``.  Counts that are finite yet above 2**53 round to a
+    # neighbouring integer, so a pooled CE near 600 moved by ~1e-13 even
+    # though the recorded denominator never changed.
+    from fractions import Fraction
+
+    assert L._safe_float_ratio(1.0, 2 ** 53 + 1) == float(
+        Fraction(1, 2 ** 53 + 1))
+    # A fractional denominator is not a token count; int() truncation would
+    # silently divide by a different number.
+    assert L._safe_float_ratio(1.0, 2.5) is None
+
+    counts = [2 ** 53 + 1, 2 ** 53 + 3, 5]
+    nll = [3.7440801623928146e18, 3.460177318818624e18,
+           3.411705721302951e18]
+    exact_ce = float(sum(Fraction(float(v)) for v in nll) / sum(counts))
+    got = L._nll_doc_ci(nll, counts)
+    assert got is not None, got
+    assert got['ppl'] == L._safe_exp_ppl(exact_ce), (got['ppl'], exact_ce)
+    json.dumps(got, allow_nan=False)
+
+
 def test_endpoint_sensitivity_withholds_unrepresentable_scale_statistics():
     # A finite repeat panel can have a representable mean/range/SD even when
     # the naive NumPy reductions overflow, and an actually unrepresentable

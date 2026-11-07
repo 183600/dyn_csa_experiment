@@ -1258,14 +1258,49 @@ def _safe_float_ratio(num, den):
     ``OverflowError`` even when the quotient is representable.  The fallback
     divides in the exact rational domain and rounds once; an underflowing
     nonzero quotient is reported as unavailable instead of a fake zero.
+
+    An integer denominator above 2**53 is *finite* but not exactly
+    representable as a float.  ``float(num) / int(den)`` would silently
+    convert it to a neighbouring integer -- changing the pooled denominator
+    while every count still looks valid.  The same applies to an integral
+    numerator above 2**53.  Take the exact-rational path in either case; for
+    ordinary binaries the direct division is already correctly rounded and
+    is kept bit-for-bit.
     """
     try:
-        out = float(num) / int(den)
-    except (OverflowError, ValueError, ZeroDivisionError):
+        d = int(den)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if d == 0:
+        return None
+    # The helper is only defined for an exact integer denominator.  A
+    # fractional value used to be truncated by int(), silently dividing by a
+    # different number; refuse it instead.
+    try:
+        if den != d:
+            return None
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+    def _exact():
         from fractions import Fraction as _Fraction
         try:
-            out = float(_Fraction(num) / int(den))
-        except (OverflowError, ValueError, ZeroDivisionError):
+            return float(_Fraction(num) / d)
+        except TypeError:
+            return float(_Fraction(float(num)) / d)
+
+    _num_is_int = isinstance(num, numbers.Integral) and not isinstance(
+        num, (bool, np.bool_))
+    _inexact_num = _num_is_int and abs(int(num)) > (1 << 53)
+    try:
+        if abs(d) <= (1 << 53) and not _inexact_num:
+            out = float(num) / d
+        else:
+            out = _exact()
+    except (OverflowError, ValueError, ZeroDivisionError, TypeError):
+        try:
+            out = _exact()
+        except (OverflowError, ValueError, ZeroDivisionError, TypeError):
             return None
     if not math.isfinite(out):
         return None
