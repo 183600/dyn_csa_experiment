@@ -358,24 +358,99 @@ def _am_sign(value):
     return 0
 
 
+def _am_as_fraction(value):
+    """Exact rational for an arbitrary-precision measurement.
+
+    Python/NumPy integers and ``Decimal`` values convert directly; floats use
+    their exact binary value.  Used only on the extreme-scale fallback paths,
+    so ordinary float panels never pay for the conversion.
+    """
+    from fractions import Fraction as _Fraction
+    try:
+        return _Fraction(value)
+    except (TypeError, ValueError):
+        return _Fraction.from_float(float(value))
+
+
+def _am_exact_mean(vals):
+    try:
+        total = sum((_am_as_fraction(v) for v in vals), _am_as_fraction(0))
+        out = float(total / len(vals))
+    except (TypeError, ValueError, OverflowError, ZeroDivisionError):
+        return None
+    return out if _am_math.isfinite(out) else None
+
+
+def _am_exact_sd(vals):
+    n = len(vals)
+    if n < 2:
+        return 0.0
+    try:
+        exact = [_am_as_fraction(v) for v in vals]
+        mean = sum(exact, _am_as_fraction(0)) / n
+        var = sum(((x - mean) ** 2 for x in exact),
+                  _am_as_fraction(0)) / (n - 1)
+        if var < 0:
+            return None
+        if var == 0:
+            return 0.0
+        try:
+            fvar = float(var)
+        except OverflowError:
+            return float('inf')
+        sd = _am_math.sqrt(fvar)
+    except (TypeError, ValueError, OverflowError, ZeroDivisionError):
+        return None
+    return sd if _am_math.isfinite(sd) else float('inf')
+
+
 def _am_span(values):
     """Representable ``max - min`` span, or ``None`` beyond float64.
 
     A finite panel can still have a span larger than the float range (for
     example ``[+1e308, -1e308]``).  Reports are strict JSON, so an infinite
-    descriptive spread is withheld instead of poisoning the artifact.
+    descriptive spread is withheld instead of poisoning the artifact.  Exact
+    integer endpoints beyond float64 have an exact difference even though the
+    final float conversion is what must be checked.
     """
     lo = min(values)
     hi = max(values)
     try:
         out = hi - lo
-    except OverflowError:
+    except (TypeError, ValueError, OverflowError):
+        return None
+    try:
+        out = float(out)
+    except (TypeError, ValueError, OverflowError):
         return None
     return out if _am_math.isfinite(out) else None
 
 
 def _am_median(values):
-    ordered = sorted(float(x) for x in values)
+    vals = list(values)
+    try:
+        ordered = sorted(float(x) for x in vals)
+    except (TypeError, ValueError, OverflowError):
+        # An exact integer beyond float64 cannot enter the historical float
+        # median, but its median may still be representable (or explicitly
+        # unavailable).  Compute it exactly instead of aborting the readout.
+        if not all(isinstance(x, _am_numbers.Integral)
+                   and not isinstance(x, bool) for x in vals):
+            return None
+        ordered = sorted(int(x) for x in vals)
+        n = len(ordered)
+        if n == 0:
+            return None
+        mid = n // 2
+        try:
+            if n % 2:
+                out = float(_am_as_fraction(ordered[mid]))
+            else:
+                out = float(_am_as_fraction(
+                    ordered[mid - 1] + ordered[mid]) / 2)
+        except (TypeError, ValueError, OverflowError, ZeroDivisionError):
+            return None
+        return out if _am_math.isfinite(out) else None
     n = len(ordered)
     if n == 0:
         return None
@@ -403,7 +478,14 @@ def _am_mean(vals):
     scale = max(abs(x) for x in vals)
     if scale == 0.0:
         return 0.0
-    return (_am_math.fsum(x / scale for x in vals) / n) * scale
+    try:
+        out = (_am_math.fsum(x / scale for x in vals) / n) * scale
+    except (TypeError, ValueError, OverflowError, ZeroDivisionError):
+        # Multiplying the unitless mean back by an exact integer scale beyond
+        # float64 raises even when the true mean (or a zero mean) is
+        # representable; form it exactly in that case.
+        return _am_exact_mean(vals)
+    return out
 
 
 def _am_sd(vals):
@@ -418,7 +500,13 @@ def _am_sd(vals):
     mean = _am_math.fsum(scaled) / n
     var = _am_math.fsum((x - mean) ** 2 for x in scaled) / (n - 1)
     sd_scaled = _am_math.sqrt(max(0.0, var))
-    out = sd_scaled * scale
+    try:
+        out = sd_scaled * scale
+    except (TypeError, ValueError, OverflowError):
+        # Same conversion hazard as the mean: an exact integer scale beyond
+        # float64 (or an all-identical huge-int panel with true SD 0) must be
+        # evaluated exactly, not escape.
+        return _am_exact_sd(vals)
     return out if _am_math.isfinite(out) else float('inf')
 
 

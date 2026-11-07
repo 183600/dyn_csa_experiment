@@ -134,7 +134,13 @@ def _etost_signed_sums(values):
 
 def _etost_scaled(values):
     """Scale by the max absolute value so sums stay representable."""
-    vals = np.asarray(values, dtype=float)
+    try:
+        vals = np.asarray(values, dtype=float)
+    except (TypeError, ValueError, OverflowError):
+        # The callers drop non-finite measurements before this point; a direct
+        # call with an exact integer beyond float64 is likewise unavailable
+        # rather than an escaping conversion error.
+        return None, None
     if vals.size == 0:
         return vals, 0.0
     maxabs = float(np.max(np.abs(vals)))
@@ -212,7 +218,18 @@ def _etost_upper_tail(values):
     the method actually used.  This is the one-sided primitive behind both
     arms of the exact TOST.
     """
-    vals = np.asarray(values, dtype=float)
+    try:
+        vals = np.asarray(values, dtype=float)
+    except (TypeError, ValueError, OverflowError):
+        # Mirror the public `_etost_inputs` contract: an unrepresentable
+        # measurement is dropped, leaving a valid (possibly empty) tail record.
+        try:
+            raw = list(values)
+        except TypeError:
+            raw = []
+        finite = [float(f) for f in (_finite_scalar(x) for x in raw)
+                  if f is not None]
+        vals = np.asarray(finite, dtype=float)
     n = int(vals.size)
     n_nonzero = int(np.count_nonzero(vals))
     floor = _etost_floor(n_nonzero)

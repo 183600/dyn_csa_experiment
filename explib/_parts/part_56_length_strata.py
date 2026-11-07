@@ -152,33 +152,59 @@ def _ls_div(num, den):
     even when the quotient is representable.  The fallback does the division
     in the exact rational domain and rounds once.  Ordinary panels keep the
     historical float division bit-for-bit.
+
+    A zero, negative or fractional denominator is not a token count.  The
+    first used to escape as ``ZeroDivisionError`` and the last was silently
+    truncated by ``int(den)``, dividing by a *different* count; both are
+    unavailable ratios here.  A non-zero quotient that rounds to zero is
+    likewise withheld instead of being reported as a measured zero.
     """
+    if isinstance(den, (bool, _ls_np.bool_)):
+        return None
     try:
         d = int(den)
     except (OverflowError, ValueError, ZeroDivisionError, TypeError):
         return None
-    if abs(d) <= (1 << 53):
-        try:
-            return float(num) / d
-        except OverflowError:
-            pass
     try:
-        from fractions import Fraction as _Fraction
-        try:
-            quotient = _Fraction(num) / d
-        except TypeError:
-            quotient = _Fraction(float(num)) / d
-        return float(quotient)
+        # Reject a fractional denominator: truncating it would silently divide
+        # by a different number than the caller declared.
+        if den != d:
+            return None
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if d <= 0:
+        return None
+    try:
+        if abs(d) <= (1 << 53):
+            out = float(num) / d
+        else:
+            from fractions import Fraction as _Fraction
+            try:
+                quotient = _Fraction(num) / d
+            except TypeError:
+                quotient = _Fraction(float(num)) / d
+            out = float(quotient)
     except (OverflowError, ValueError, ZeroDivisionError, TypeError):
         return None
+    if not _ls_math.isfinite(out):
+        return None
+    if out == 0.0 and num != 0:
+        # The true quotient is below the smallest representable float; a fake
+        # zero would silently drop a stratum/unit from the readout.
+        return None
+    return float(out)
 
 
 def _ls_summary(values, conf):
     """Mean and two-sided t interval for a seed-level vector."""
     finite = [float(v) for v in values if _finite_scalar(v) is not None]
     n = len(finite)
+    try:
+        conf_f = float(conf)
+    except (TypeError, ValueError, OverflowError):
+        conf_f = None
     out = {'n': int(n), 'mean': None, 'std': None, 'sem': None,
-           'ci95': None, 'conf': float(conf)}
+           'ci95': None, 'conf': conf_f}
     if not finite:
         return out
     mean, std = _ls_mean_std(finite)
@@ -186,11 +212,12 @@ def _ls_summary(values, conf):
     out['std'] = std
     if mean is None:
         return out
-    if n > 1 and std is not None:
+    if (n > 1 and std is not None and conf_f is not None
+            and _ls_math.isfinite(conf_f) and 0.0 < conf_f < 1.0):
         sem = std / _ls_math.sqrt(n)
         if _ls_math.isfinite(sem):
             out['sem'] = float(sem)
-            tc = _t_critical(conf, n - 1)
+            tc = _t_critical(conf_f, n - 1)
             if _ls_math.isfinite(tc):
                 lo = mean - tc * sem
                 hi = mean + tc * sem
@@ -221,14 +248,19 @@ def _ls_groups(tokens, n_strata, min_units, *, preserve_order=False):
     # Sort by the exact integer token count (not float64, which would round
     # counts above 2**53 and could merge distinct lengths into a fake tie).
     order = sorted(range(d), key=lambda i: (int(tokens[i]), i))
-    for g in range(int(n_strata), 1, -1):
-        if d < g * int(min_units):
+    # Any g above d // min_units is skipped by the size check below, so start
+    # there.  Iterating down from an arbitrary-precision n_strata (e.g. a
+    # scale fixture declaring 10**400 strata) would otherwise never finish.
+    _min_units = max(1, int(min_units))
+    _start = min(int(n_strata), d // _min_units)
+    for g in range(_start, 1, -1):
+        if d < g * _min_units:
             continue
         cuts = [(i * d) // g for i in range(1, g)]
         if len(set(cuts)) != len(cuts):
             continue
         groups = [order[start:stop] for start, stop in zip([0] + cuts, cuts + [d])]
-        if all(len(part) >= int(min_units) for part in groups):
+        if all(len(part) >= _min_units for part in groups):
             return [[int(i) for i in part] for part in groups]
     return None
 

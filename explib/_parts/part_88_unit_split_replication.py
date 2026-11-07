@@ -413,11 +413,29 @@ def unit_split_assignment(unit_ids, tokens, *, salt=UNIT_SPLIT_REPLICATION_DEFAU
             counts_out = [len(h) for h in halves_out]
         return halves_out, totals_out, counts_out
 
-    halves, totals, counts = _balance(weights)
+    # Decide on the scaled path *before* balancing.  A panel may mix exact
+    # integer counts beyond float64 with a legacy fractional weight (the
+    # reader explicitly accepts both): accumulating a huge int into an
+    # already-float running total (or a float into an exact-int total) raises
+    # ``OverflowError`` inside the greedy loop, even though the normalised
+    # weights and the partition are perfectly representable.
     total_tokens = _usr_finite_sum(weights)
-    scaled_tokens = False
-    if (total_tokens is None
-            or not all(_usr_math.isfinite(float(t)) for t in totals)):
+    scaled_tokens = total_tokens is None
+    halves = totals = counts = None
+    if not scaled_tokens:
+        try:
+            halves, totals, counts = _balance(weights)
+        except OverflowError:
+            scaled_tokens = True
+        else:
+            try:
+                finite_totals = all(
+                    _usr_math.isfinite(float(t)) for t in totals)
+            except (OverflowError, TypeError, ValueError):
+                finite_totals = False
+            if not finite_totals:
+                scaled_tokens = True
+    if scaled_tokens:
         # A future panel can declare per-unit token counts whose sum exceeds
         # float64 even though every individual count is finite.  Balancing on
         # raw totals would then compare inf == inf (and report nan shares);
@@ -540,6 +558,17 @@ def _usr_stats(values):
     n = len(values)
     if n == 0:
         return None
+
+    def _extreme(value):
+        # An exact integer beyond float64 cannot be a JSON min/max; reporting
+        # it as unavailable keeps the statistics block strict-JSON safe
+        # instead of letting the conversion abort the whole readout.
+        try:
+            out = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return out if _usr_math.isfinite(out) else None
+
     # NumPy's mean/std sum and square the raw panel.  Finite per-unit effects
     # near float64's limit then overflow to inf (or underflow to a fake zero
     # spread) even though the mean and SD are representable; reuse the
@@ -567,8 +596,8 @@ def _usr_stats(values):
         'mean': mean,
         'sd': (None if sd is None else float(sd)),
         'sem': sem,
-        'min': float(min(values)),
-        'max': float(max(values)),
+        'min': _extreme(min(values)),
+        'max': _extreme(max(values)),
         'n_positive': int(sum(1 for x in values if x > 0.0)),
         'n_negative': int(sum(1 for x in values if x < 0.0)),
         'n_zero': int(sum(1 for x in values if x == 0.0)),

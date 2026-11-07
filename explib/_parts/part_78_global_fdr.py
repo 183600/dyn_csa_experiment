@@ -107,11 +107,24 @@ def _gfdr_method(value):
 
 
 def _gfdr_harmonic(m):
-    """H_m = sum_{i=1..m} 1/i, the BY arbitrary-dependence factor."""
-    if m in _GLOBAL_FDR_HARMONIC_CACHE:
-        return _GLOBAL_FDR_HARMONIC_CACHE[m]
-    h = math.fsum(1.0 / i for i in range(1, int(m) + 1))
-    _GLOBAL_FDR_HARMONIC_CACHE[int(m)] = h
+    """H_m = sum_{i=1..m} 1/i, the BY arbitrary-dependence factor.
+
+    The exact sum is cheap for a real family.  A scale-up/degenerate input can
+    declare an arbitrarily large count, where iterating to ``int(m)`` never
+    finishes; for those use the Euler-Maclaurin expansion, whose omitted terms
+    are below float64 precision once ``m`` is this large.
+    """
+    mi = int(m)
+    if mi in _GLOBAL_FDR_HARMONIC_CACHE:
+        return _GLOBAL_FDR_HARMONIC_CACHE[mi]
+    if mi > 1_000_000:
+        log_m = math.log(mi)
+        inv_m = math.exp(-log_m)
+        h = (log_m + 0.5772156649015329 + 0.5 * inv_m
+             - inv_m * inv_m / 12.0)
+    else:
+        h = math.fsum(1.0 / i for i in range(1, max(0, mi) + 1))
+    _GLOBAL_FDR_HARMONIC_CACHE[mi] = h
     return h
 
 

@@ -500,7 +500,13 @@ def _ba_mean_or_raw(values):
     """
     if not values:
         return None
-    raw = sum(values) / len(values)
+    try:
+        raw = sum(values) / len(values)
+    except (TypeError, ValueError, OverflowError, ZeroDivisionError):
+        # Exact integers beyond float64 make the quotient itself raise; the
+        # guarded helper can still recover a representable mean (or withhold
+        # an unrepresentable one) without aborting the ladder.
+        return _scaled_mean_or_raw(values)  # noqa: F821 (part_32)
     if math.isfinite(raw):
         return raw
     return _scaled_mean_or_raw(values)  # noqa: F821 (part_32)

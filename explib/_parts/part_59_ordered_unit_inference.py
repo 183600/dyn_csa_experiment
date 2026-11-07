@@ -184,7 +184,13 @@ def _od_mean_sd(values):
     n = len(values)
     if n == 0:
         return None, None
-    arr = _od_np.asarray(values, dtype=float)
+    try:
+        arr = _od_np.asarray(values, dtype=float)
+    except (TypeError, ValueError, OverflowError):
+        # An exact integer beyond float64 has no representable mean/SD; the
+        # documented unavailable value must not be replaced by an escaping
+        # conversion exception.
+        return None, None
     with _od_np.errstate(over='ignore', invalid='ignore'):
         try:
             mean = float(_od_np.mean(arr))
@@ -251,6 +257,12 @@ def _od_percentile_ci(reps, conf):
     """Percentile interval from a finite replicate vector."""
     if not reps:
         return None
+    try:
+        conf = float(conf)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not (_od_math.isfinite(conf) and 0.0 < conf < 1.0):
+        return None
     lo_q = 100.0 * (1.0 - conf) / 2.0
     hi_q = 100.0 * (1.0 + conf) / 2.0
     try:
@@ -283,8 +295,12 @@ def _od_batch_design(values, n_batches):
     """Non-overlapping batch-means SE, design effect and effective n."""
     n = len(values)
     g = int(n_batches)
+    if g < 2:
+        # Check before integer-dividing by g: a zero batch count is "not
+        # estimable", not a ZeroDivisionError escaping the audit.
+        return None
     b = n // g
-    if g < 2 or b < 2:
+    if b < 2:
         return None
     used = g * b
     means = []
@@ -365,8 +381,14 @@ def _od_block_bootstrap(values, block_length, *, n_boot, seed, conf):
 def _od_primary_batches(n):
     if n < 4:
         return None
-    g = int(round(_od_math.sqrt(n)))
-    g = max(4, min(10, g))
+    # The result is capped at 10, so any n >= 100 already maps there.  Avoid
+    # math.sqrt(n) for an enormous exact integer: it would raise OverflowError
+    # even though the capped batch count is just 10.
+    if n >= 100:
+        g = 10
+    else:
+        g = int(round(_od_math.sqrt(n)))
+        g = max(4, min(10, g))
     g = min(g, n // 2)
     return g if g >= 2 else None
 

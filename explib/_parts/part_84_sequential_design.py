@@ -325,6 +325,12 @@ def _seq_step_counts(surv, steps):
         raise ValueError('steps must be non-negative')
     if steps == 0:
         return dict(surv)
+    if steps > 1_000_000:
+        # The convolution is exact and materialises ``steps + 1`` binomial
+        # coefficients; a pathological count (e.g. an exact integer beyond
+        # float64) must fail closed instead of looping effectively forever.
+        raise ValueError(
+            f'steps={steps} exceeds the exact-convolution budget of 1000000')
     binom = [math.comb(steps, s) for s in range(steps + 1)]
     out = {}
     for w, count in surv.items():
@@ -372,8 +378,16 @@ def _seq_norm_sf(x):
     spending at an early look evaluates exactly that tail, and reporting
     ``spend=0`` for a positive (if tiny) allocation would understate the
     declared alpha spend.  ``erfc`` keeps the far tail.
+
+    An exact integer beyond float64 has the same limiting tail as an infinite
+    z: 0 above the origin and 1 below it.  Converting it would raise
+    ``OverflowError`` before the tail could be returned.
     """
-    return 0.5 * math.erfc(float(x) / math.sqrt(2.0))
+    try:
+        xf = float(x)
+    except OverflowError:
+        return 0.0 if x > 0 else 1.0
+    return 0.5 * math.erfc(xf / math.sqrt(2.0))
 
 
 def _seq_spend_fraction(name, t, alpha, sides):

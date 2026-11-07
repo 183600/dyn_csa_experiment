@@ -1048,7 +1048,15 @@ def _normal_cdf(x):
     # erfc is accurate in both tails.  The previous 0.5*(1+erf(x)) form lost
     # every probability below about 1e-19 and could not serve as a bracketing
     # function for the quantile helper.
-    return 0.5 * math.erfc(-float(x) / math.sqrt(2.0))
+    #
+    # An exact integer beyond float64 has the limiting CDF directly: 1 above
+    # the origin, 0 below it.  Converting it first would raise OverflowError
+    # even though the answer is well defined.
+    try:
+        xf = float(x)
+    except OverflowError:
+        return 0.0 if x < 0 else 1.0
+    return 0.5 * math.erfc(-xf / math.sqrt(2.0))
 
 
 def _normal_quantile(p):

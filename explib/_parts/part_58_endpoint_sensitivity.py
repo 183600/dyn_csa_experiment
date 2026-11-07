@@ -223,7 +223,28 @@ def _es_close(a, b):
     tolerance keeps the ordinary accuracy-scale behaviour and degrades to the
     exact comparison at (sub)normal scales.
     """
-    return math.isclose(a, b, rel_tol=1e-12, abs_tol=0.0)
+    try:
+        return math.isclose(a, b, rel_tol=1e-12, abs_tol=0.0)
+    except (TypeError, ValueError, OverflowError):
+        # An exact integer beyond float64 cannot enter math.isclose, but the
+        # relative comparison is still well defined (e.g. two huge counts one
+        # apart are a tie, while a huge count and zero are not).
+        from fractions import Fraction as _Fraction
+
+        def _frac(value):
+            try:
+                return _Fraction(value)
+            except (TypeError, ValueError):
+                return _Fraction.from_float(float(value))
+
+        try:
+            fa, fb = _frac(a), _frac(b)
+            if fa == fb:
+                return True
+            scale = max(abs(fa), abs(fb))
+            return abs(fa - fb) <= _Fraction.from_float(1e-12) * scale
+        except (TypeError, ValueError, OverflowError, ZeroDivisionError):
+            return False
 
 
 def _es_ge(a, b):

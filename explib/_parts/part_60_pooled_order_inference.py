@@ -257,8 +257,14 @@ def _po_policy(block_lengths, n_batches, n_boot, n_perm, conf, alpha, seed,
 def _po_primary_batches(n):
     if n < 4:
         return None
-    g = int(round(_po_math.sqrt(n)))
-    g = max(4, min(10, g))
+    # The result is capped at 10, so any n >= 100 already maps there.  Avoid
+    # math.sqrt(n) for an enormous exact integer: it would raise OverflowError
+    # even though the capped batch count is just 10.
+    if n >= 100:
+        g = 10
+    else:
+        g = int(round(_po_math.sqrt(n)))
+        g = max(4, min(10, g))
     g = min(g, n // 2)
     return g if g >= 2 else None
 

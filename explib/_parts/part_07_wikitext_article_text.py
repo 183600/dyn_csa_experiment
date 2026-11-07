@@ -442,8 +442,29 @@ def _sampling_finite_sum(values):
     ``float.max``; summing those overflows even though every element is finite,
     and a NaN/inf coverage fraction makes the whole plan non-JSON.  Normalise
     by the largest element only on that overflow path.
+
+    Exact integers beyond float64 cannot even enter the float array.  Their
+    sum may still be representable (for example two huge opposite-sign sizes
+    that cancel), so fall back to an exact rational accumulation instead of
+    escaping as ``OverflowError``.
     """
-    arr = np.asarray(values, dtype=np.float64)
+    try:
+        arr = np.asarray(values, dtype=np.float64)
+    except (TypeError, ValueError, OverflowError):
+        from fractions import Fraction as _Fraction
+        try:
+            total = _Fraction(0)
+            for value in values:
+                if isinstance(value, (bool, np.bool_)):
+                    return None
+                try:
+                    total += _Fraction(value)
+                except (TypeError, ValueError):
+                    total += _Fraction.from_float(float(value))
+            out = float(total)
+        except (TypeError, ValueError, OverflowError, ZeroDivisionError):
+            return None
+        return out if math.isfinite(out) else None
     if arr.size == 0:
         return 0.0
     with np.errstate(over='ignore', invalid='ignore'):

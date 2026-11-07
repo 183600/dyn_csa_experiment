@@ -359,7 +359,17 @@ def _aru_sample_sd(values):
     variance, and the reported variance shares depend on that being true.
     """
     import numpy as np
-    a = np.asarray(values, dtype=float).reshape(-1)
+    try:
+        a = np.asarray(values, dtype=float).reshape(-1)
+    except (TypeError, ValueError, OverflowError):
+        # An exact integer beyond float64 cannot enter the float variance
+        # path; form the SD exactly (including the exactly-zero constant
+        # vector) instead of escaping.
+        try:
+            raw = list(values)
+        except TypeError:
+            return None
+        return _am_exact_sd(raw)  # noqa: F821 (part_80)
     if a.size == 0:
         return None
     if a.size == 1:

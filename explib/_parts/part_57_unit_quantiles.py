@@ -183,14 +183,23 @@ def _uq_lerp(lo, hi, frac):
     # not a rounded weighted sum (which can move by one ulp and hide an exact
     # per-token denominator).
     if lo == hi:
-        return float(lo)
+        try:
+            return float(lo)
+        except (TypeError, ValueError, OverflowError):
+            return None
     if frac <= 0.0:
-        return float(lo)
+        try:
+            return float(lo)
+        except (TypeError, ValueError, OverflowError):
+            return None
     if frac >= 1.0:
-        return float(hi)
+        try:
+            return float(hi)
+        except (TypeError, ValueError, OverflowError):
+            return None
     try:
         out = _uq_math.fsum([(1.0 - frac) * lo, frac * hi])
-    except (OverflowError, ValueError):
+    except (OverflowError, ValueError, TypeError):
         return None
     return out if _uq_math.isfinite(out) else None
 
@@ -200,12 +209,24 @@ def _uq_quantile(sorted_values, q):
     n = len(sorted_values)
     if n == 0:
         return None
-    h = (n - 1) * float(q)
+    try:
+        q = float(q)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not (_uq_math.isfinite(q) and 0.0 <= q <= 1.0):
+        # A probability outside [0,1] (or an exact integer beyond float64) is
+        # not a quantile; clamping it to the sample maximum would invent an
+        # order statistic the caller did not request.
+        return None
+    h = (n - 1) * q
     if not _uq_math.isfinite(h) or h < 0.0:
         return None
     i = int(_uq_math.floor(h))
     if i >= n - 1:
-        return float(sorted_values[-1])
+        try:
+            return float(sorted_values[-1])
+        except (TypeError, ValueError, OverflowError):
+            return None
     return _uq_lerp(sorted_values[i], sorted_values[i + 1], h - i)
 
 
@@ -226,7 +247,17 @@ def _uq_sign(value):
 
 
 def _uq_sort_values(values):
-    return sorted(float(v) for v in values)
+    vals = list(values)
+    try:
+        return sorted(float(v) for v in vals)
+    except (TypeError, ValueError, OverflowError):
+        # An exact integer beyond float64 cannot become a float order
+        # statistic, but it can still be sorted exactly.  The interpolation
+        # helpers above withhold an unrepresentable result instead of raising.
+        if all(isinstance(v, (int, _uq_np.integer))
+               and not isinstance(v, (bool, _uq_np.bool_)) for v in vals):
+            return sorted(int(v) for v in vals)
+        raise
 
 
 def _uq_binom_cdf(k, n, p):

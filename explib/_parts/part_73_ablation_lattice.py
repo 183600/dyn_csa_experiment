@@ -313,11 +313,17 @@ def _raw_mean_or_scaled(values):
 
     The bit-for-bit ordinary path matters for stored artifacts; the scaled
     fallback recovers a representable mean from finite effects near the float
-    limit instead of propagating ``inf``.
+    limit instead of propagating ``inf``.  A panel of exact integers beyond
+    float64 makes the raw division itself raise even though the mean may be
+    representable (or explicitly unavailable); route that through the guarded
+    helper rather than aborting the lattice readout.
     """
     if not values:
         return None
-    raw = sum(values) / len(values)
+    try:
+        raw = sum(values) / len(values)
+    except (OverflowError, TypeError, ValueError, ZeroDivisionError):
+        return _scaled_mean_or_raw(values)
     if _al_math.isfinite(raw):
         return raw
     return _scaled_mean_or_raw(values)
@@ -329,13 +335,20 @@ def _al_span(lo, hi):
     Finite effects at opposite ends of the float range can have an
     unrepresentable descriptive range even though each endpoint is a valid
     JSON number; an artifact writer with ``allow_nan=False`` must not see
-    the resulting ``inf``.
+    the resulting ``inf``.  Exact integer endpoints beyond float64 must also
+    not escape as ``OverflowError`` from the final ``isfinite`` check: their
+    difference is still exact, so convert it first and withhold only a span
+    that genuinely does not fit a float.
     """
     if lo is None or hi is None:
         return None
     try:
         out = hi - lo
-    except OverflowError:
+    except (TypeError, ValueError, OverflowError):
+        return None
+    try:
+        out = float(out)
+    except (TypeError, ValueError, OverflowError):
         return None
     return out if _al_math.isfinite(out) else None
 
@@ -383,6 +396,37 @@ def _al_stats(vector, seeds, *, alpha, min_n):
     return out
 
 
+def _al_tie_close(a, b, *, tol=AL_LATTICE_TOL):
+    """Whether two values are a tie under the lattice's relative tolerance.
+
+    The ordinary expression matches the historical ranking bit-for-bit.  An
+    exact integer beyond float64 makes ``tol * max(1.0, |a|, |b|)`` raise
+    ``OverflowError`` even though the comparison itself is well defined;
+    fall back to exact rational arithmetic in that case (one item's difference
+    is still small compared with its magnitude).
+    """
+    try:
+        diff = abs(a - b)
+        limit = tol * max(1.0, abs(a), abs(b))
+        return bool(diff <= limit)
+    except (TypeError, ValueError, OverflowError):
+        pass
+    try:
+        from fractions import Fraction as _Fraction
+
+        def _frac(value):
+            try:
+                return _Fraction(value)
+            except (TypeError, ValueError):
+                return _Fraction.from_float(float(value))
+
+        fa, fb = _frac(a), _frac(b)
+        scale = max(_Fraction(1), abs(fa), abs(fb))
+        return bool(abs(fa - fb) <= _Fraction.from_float(float(tol)) * scale)
+    except (TypeError, ValueError, OverflowError, ZeroDivisionError):
+        return False
+
+
 def _al_rank(values, *, tol=AL_LATTICE_TOL):
     """Average ranks, ascending; ties share the average rank."""
     n = len(values)
@@ -391,8 +435,8 @@ def _al_rank(values, *, tol=AL_LATTICE_TOL):
     i = 0
     while i < n:
         j = i
-        while j + 1 < n and abs(values[order[j + 1]] - values[order[i]]) <= tol * max(
-                1.0, abs(values[order[i]]), abs(values[order[j + 1]])):
+        while j + 1 < n and _al_tie_close(
+                values[order[j + 1]], values[order[i]], tol=tol):
             j += 1
         avg = 0.5 * (i + j) + 1.0
         for pos in range(i, j + 1):
