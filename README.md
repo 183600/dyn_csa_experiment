@@ -13,6 +13,11 @@ own artifacts cannot be independently audited from this Git tree alone. Only
 the comparisons frozen in `confirmation_frozen.json` are confirmatory;
 everything else is exploratory.
 
+> **Quick navigation.** New to the tree? Read [Start here](#start-here), then
+> run [Quick start](#quick-start). Auditing a claim? Begin with
+> [Scope and status](#scope-and-status) and
+> [Measurement guardrails](#measurement-guardrails).
+
 There are three common ways to use this tree:
 
 1. **Verify a checkout.** Install the verified CPU environment and run
@@ -184,9 +189,9 @@ Run every command from the repository root. A checkout is healthy when
 
 ## Quick start
 
-Python ≥3.12 is required. `requirements.lock` is the verified CPU environment
-used by the tests and the zero-GPU analysis path. On a CUDA machine, install the
-torch wheel that matches the local driver first, then the ranges in
+Python 3.12 or newer is required. `requirements.lock` is the verified CPU
+environment used by the tests and the zero-GPU analysis path. On a CUDA machine,
+install the torch wheel that matches the local driver first, then the ranges in
 `requirements.txt` (see [Environment](#environment)).
 
 ```bash
@@ -204,7 +209,14 @@ plan` exits non-zero when the frozen plan fails its preflight and never reads
 the test split. `make registry` checks that every declared fragment exists and
 that the loader's part list matches the package on disk.
 
-None of these commands starts a training run. Mode selection is usually
+To exercise the full v6 pipeline on a tiny synthetic run — including the dense,
+fixed, dynamic and ablation forward paths — use:
+
+```bash
+python run_gapfill.py smoke            # prints [smoke] PASSED on success
+```
+
+None of these checks starts a research panel. Mode selection is usually
 explicit, but the v6 script and the v7–v12 drivers default to `full` when no
 mode is supplied, so a bare invocation starts a panel. When you intend to run
 one, pass `full`, `phase <name>`, or `auto`; start with `smoke` when validating
@@ -279,6 +291,21 @@ python -m explib.reproduce compare results_lm_v3_1500 results_lm_v3_1500_rerun
 # add --require exact to demand a bit-identical endpoint and recorded curve
 ```
 
+A compact path from a fresh checkout to a locally rebuilt v7 report:
+
+```bash
+python -m pip install -r requirements.lock
+make test                          # proves the checkout and environment agree
+python run_gapfill.py smoke        # proves the training pipeline runs
+python -m explib.rope full         # produces the v7 result panels
+python build_report.py             # reads results_*/ and analysis_*/ from disk
+```
+
+The first three steps validate the environment, the test suite and the
+pipeline; only the `full` command starts a research panel. `build_report.py`
+is a zero-GPU reader: it computes every number from the artifacts on disk and
+does not fill in a missing panel.
+
 ## Where to look
 
 Start with [Start here](#start-here) for the task you have in mind, then use
@@ -319,6 +346,8 @@ experiments. `.gitignore` keeps those path families out of the repository;
 At a glance:
 
 ```text
+README.md / README_zh.md    usage guide in English / Chinese
+Makefile                    named zero-GPU checks and workflows
 exp_lib.py                  historical import shim -> explib/
 explib/                     measurement library (model, attention, training, statistics)
 explib/<driver>/            v7-v12, M0/S1 and open-block study drivers
@@ -331,6 +360,7 @@ docs/design_notes.md        fixed design and measurement notes
 DECISION_LOG.md             decision chronology
 RELEASES.md                 evidence release index
 REVIEW_4_RESPONSE.md        item-by-item review disposition
+test_*.py                   CPU regression and contract tests
 ```
 
 ### How the pieces fit

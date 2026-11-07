@@ -11,6 +11,10 @@
 树无法独立复核。只有 `confirmation_frozen.json` 冻结的比较属于确认性证据；
 其余均为探索性。
 
+> **快速导航。** 初次接触本仓库？先读[从这里开始](#从这里开始)，再运行
+> [快速开始](#快速开始)。需要审计某个主张？先看[范围与状态](#范围与状态)与
+> [测量护栏](#测量护栏)。
+
 常见的使用方式有三种：
 
 1. **验证检出**：安装已验证的 CPU 环境并运行 `make test`，不需要 GPU。
@@ -171,8 +175,8 @@
 
 ## 快速开始
 
-需要 Python ≥3.12。`requirements.lock` 是测试与零 GPU 分析路径使用的已验证
-CPU 环境；CUDA 机器请先安装与本机驱动匹配的 torch wheel，再安装
+需要 Python 3.12 或更高版本。`requirements.lock` 是测试与零 GPU 分析路径使用
+的已验证 CPU 环境；CUDA 机器请先安装与本机驱动匹配的 torch wheel，再安装
 `requirements.txt` 中的范围（见[环境](#环境)）。
 
 ```bash
@@ -189,9 +193,17 @@ make help                              # 可用的零 GPU 目标
 未通过预检时以非零状态退出，并且不会读取 test split。`make registry`
 检查声明的片段是否都存在，以及加载器的片段列表是否与磁盘上的包一致。
 
-以上命令都不会启动训练。模式通常需要显式指定；但 v6 脚本与 v7–v12 驱动在
-省略模式时默认 `full`，裸跑会启动面板。要跑正式面板时显式传入 `full`、
-`phase <name>` 或 `auto`；修改流水线后，先用该驱动的 `smoke` 模式验证。
+要在一个极小的合成运行上走通 v6 流水线（覆盖 dense、固定、动态与消融前向
+路径），请使用：
+
+```bash
+python run_gapfill.py smoke            # 成功时打印 [smoke] PASSED
+```
+
+以上检查都不会启动正式研究面板。模式通常需要显式指定；但 v6 脚本与
+v7–v12 驱动在省略模式时默认 `full`，裸跑会启动面板。要跑正式面板时显式传入
+`full`、`phase <name>` 或 `auto`；修改流水线后，先用该驱动的 `smoke` 模式
+验证。
 
 ### 命令约定
 
@@ -255,6 +267,20 @@ python -m explib.reproduce compare results_lm_v3_1500 results_lm_v3_1500_rerun
 # 追加 --require exact 可要求端点与记录曲线逐位相同
 ```
 
+从全新检出到本地重建 v7 报告的一条紧凑路径：
+
+```bash
+python -m pip install -r requirements.lock
+make test                          # 证明检出与环境一致
+python run_gapfill.py smoke        # 证明训练流水线可运行
+python -m explib.rope full         # 产出 v7 研究面板
+python build_report.py             # 从磁盘上的 results_*/ 与 analysis_*/ 读取
+```
+
+前三步分别校验环境、测试套件与流水线；只有 `full` 会启动正式研究面板。
+`build_report.py` 是零 GPU 读取器：它从磁盘产物计算每个数字，不会为缺失的
+面板补值。
+
 ## 从哪里读起
 
 先看[从这里开始](#从这里开始)确定当前任务，再用[研究一览](#研究一览)
@@ -292,6 +318,8 @@ python -m explib.reproduce compare results_lm_v3_1500 results_lm_v3_1500_rerun
 先看一个最小地图：
 
 ```text
+README.md / README_zh.md    英文 / 中文使用说明
+Makefile                    具名的零 GPU 检查与工作流
 exp_lib.py                  历史导入 shim -> explib/
 explib/                     测量库（模型、注意力、训练、统计）
 explib/<driver>/            v7-v12、M0/S1 与 open-block 研究驱动
@@ -304,6 +332,7 @@ docs/design_notes.md        固定的设计与测量说明
 DECISION_LOG.md             决策时间线
 RELEASES.md                 证据发布索引
 REVIEW_4_RESPONSE.md        逐条评审处置
+test_*.py                   CPU 回归与契约测试
 ```
 
 ### 各部分如何衔接

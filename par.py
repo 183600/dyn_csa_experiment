@@ -42,22 +42,28 @@ _OFF = ("", "0", "no", "off", "false", "none", "serial")
 _MAX_CPU_WORKERS = 4096
 
 
-def _safe_text(value, limit=80):
-    """Bounded text for untrusted diagnostics/config values."""
+def _bounded_text(value, *, limit, render):
+    """Render an untrusted value and cap the result at ``limit`` characters.
+
+    ``render`` is ``str`` or ``repr``.  Both conversions can raise on Python
+    3.12's huge-int limit or on a broken ``__str__``/``__repr__``; such a value
+    is named by type instead of aborting a diagnostic path.
+    """
     try:
-        text = str(value)
+        text = render(value)
     except Exception:
         return f'<unrepresentable {type(value).__name__}>'
     return text if len(text) <= limit else text[:limit - 3] + '...'
+
+
+def _safe_text(value, limit=80):
+    """Bounded text for untrusted diagnostics/config values."""
+    return _bounded_text(value, limit=limit, render=str)
 
 
 def _safe_repr(value, limit=120):
     """Bounded repr that also survives Python 3.12's huge-int limit."""
-    try:
-        text = repr(value)
-    except Exception:
-        return f'<unrepresentable {type(value).__name__}>'
-    return text if len(text) <= limit else text[:limit - 3] + '...'
+    return _bounded_text(value, limit=limit, render=repr)
 
 
 def _num_or_none(value):

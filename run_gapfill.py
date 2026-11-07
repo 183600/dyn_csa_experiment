@@ -60,6 +60,28 @@ def _num_or_none(v):
     return int(f) if math.isfinite(f) and f.is_integer() else None
 
 
+def _guarded_stat(values, stat, fallback):
+    """Evaluate ``stat`` with a scale-safe fallback for extreme panels.
+
+    The ordinary path is kept byte-identical: ``stat`` runs first and its
+    finite result is returned unchanged.  Only an arithmetic failure or a
+    non-finite result is routed through ``fallback``; if that also cannot
+    produce a finite value, the statistic is withheld as ``None`` rather than
+    propagating an exception into the aggregation path.
+    """
+    try:
+        out = stat(values)
+    except (OverflowError, TypeError, ValueError, ZeroDivisionError):
+        out = None
+    if out is not None and math.isfinite(out):
+        return out
+    try:
+        out = fallback(values)
+    except (OverflowError, TypeError, ValueError):
+        return None
+    return out if out is not None and math.isfinite(out) else None
+
+
 def _safe_mean(values):
     """Arithmetic mean that survives an unrepresentable finite panel.
 
@@ -72,17 +94,8 @@ def _safe_mean(values):
     """
     if not values:
         return None
-    try:
-        out = sum(values) / len(values)
-    except (OverflowError, TypeError, ValueError, ZeroDivisionError):
-        out = None
-    if out is not None and math.isfinite(out):
-        return out
-    try:
-        out = L._scaled_mean_or_raw(values)
-    except (OverflowError, TypeError, ValueError):
-        return None
-    return out if out is not None and math.isfinite(out) else None
+    return _guarded_stat(
+        values, lambda vals: sum(vals) / len(vals), L._scaled_mean_or_raw)
 
 
 def _safe_stdev(values):
@@ -95,17 +108,8 @@ def _safe_stdev(values):
     """
     if len(values) < 2:
         return 0.0
-    try:
-        out = statistics.stdev(values)
-    except (OverflowError, TypeError, ValueError, ZeroDivisionError):
-        out = None
-    if out is not None and math.isfinite(out):
-        return out
-    try:
-        out = L._scaled_std_or_raw(values)
-    except (OverflowError, TypeError, ValueError):
-        return None
-    return out if out is not None and math.isfinite(out) else None
+    return _guarded_stat(values, statistics.stdev, L._scaled_std_or_raw)
+
 
 def _announce_seed_plan(label, cfg, seeds):
     """Print the prospective family-corrected seed requirement for a phase.
