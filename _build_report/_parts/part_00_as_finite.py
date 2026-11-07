@@ -279,21 +279,25 @@ def _signflip_saddlepoint_p(values):
         return floor, 'saddlepoint'
     inv = 1.0 / max(abs(x) for x in vals)
 
-    def _kp(t):
+    def _cumulant_deriv(t):
+        # K'(t) = sum(d_i * tanh(t*d_i)); the saddlepoint solves K'(t) = |S|.
         return math.fsum(x * math.tanh(t * x) for x in vals)
 
-    def _k(t):
+    def _log_cosh_cumulant(t):
+        # K(t) = sum(log cosh(t*d_i)).
+        # log cosh(z) = |z| + log1p(exp(-2|z|)) - log(2), stable for large |z|.
         return math.fsum(abs(t * x) + math.log1p(math.exp(-2.0 * abs(t * x))) - math.log(2.0)
                          for x in vals)
 
-    def _kpp(t):
+    def _cumulant_curvature(t):
+        # K''(t) = sum(d_i**2 * sech^2(t*d_i)).
         # sech^2(z) = 1 - tanh^2(z) avoids a cosh overflow in the extreme
         # near-maximum-sum tail while staying algebraically identical.
         return math.fsum(x * x * (1.0 - math.tanh(t * x) ** 2) for x in vals)
 
     hi = inv
     for _ in range(60):
-        if _kp(hi) >= T:
+        if _cumulant_deriv(hi) >= T:
             break
         hi *= 2.0
     else:
@@ -303,13 +307,13 @@ def _signflip_saddlepoint_p(values):
     lo = 0.0
     for _ in range(160):
         mid = 0.5 * (lo + hi)
-        if _kp(mid) < T:
+        if _cumulant_deriv(mid) < T:
             lo = mid
         else:
             hi = mid
     t = 0.5 * (lo + hi)
-    Kt = _k(t)
-    K2 = _kpp(t)
+    Kt = _log_cosh_cumulant(t)
+    K2 = _cumulant_curvature(t)
     w = math.sqrt(max(0.0, 2.0 * (t * T - Kt)))
     u = t * math.sqrt(K2) if K2 > 0.0 else 0.0
     if w < 1e-8 or u <= 0.0:

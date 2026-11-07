@@ -185,39 +185,14 @@ def _etost_saddle_upper(values, threshold, floor):
         return 0.5
     if T >= sabs * (1.0 - 1e-13):
         return float(floor)
-    inv = 1.0 / max(abs(x) for x in vals)
-
-    def _kp(t):
-        return math.fsum(x * math.tanh(t * x) for x in vals)
-
-    def _k(t):
-        # log cosh(z) = |z| + log1p(exp(-2|z|)) - log(2), stable for large |z|
-        return math.fsum(
-            abs(t * x) + math.log1p(math.exp(-2.0 * abs(t * x))) - math.log(2.0)
-            for x in vals)
-
-    def _kpp(t):
-        return math.fsum(x * x * (1.0 - math.tanh(t * x) ** 2) for x in vals)
-
-    hi = inv
-    for _ in range(60):
-        if _kp(hi) >= T:
-            break
-        hi *= 2.0
-    else:
+    # Shared with the two-sided sign-flip test: one root solve keeps both
+    # tails arithmetically aligned as panels grow past the exact/MITM caps.
+    solved = _saddlepoint_root(vals, T)
+    if solved is None:
         sd = math.sqrt(math.fsum(x * x for x in vals))
         p = math.erfc(T / (sd * math.sqrt(2.0))) if sd > 0.0 else floor
         return float(min(1.0, max(floor, p)))
-    lo = 0.0
-    for _ in range(160):
-        mid = 0.5 * (lo + hi)
-        if _kp(mid) < T:
-            lo = mid
-        else:
-            hi = mid
-    t = 0.5 * (lo + hi)
-    Kt = _k(t)
-    K2 = _kpp(t)
+    t, Kt, K2 = solved
     w = math.sqrt(max(0.0, 2.0 * (t * T - Kt)))
     u = t * math.sqrt(K2) if K2 > 0.0 else 0.0
     if w < 1e-8 or u <= 0.0:

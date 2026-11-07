@@ -170,12 +170,20 @@ def git_push(msg):
         print('[git] WARNING: the commit is only on this instance — the work is NOT on the remote.  Re-push before shutting down.')
     return ok
 
-def _agg_seed_map(entry, tag=''):
+def _aggregate_seed_map(entry, tag='', *, log_prefix='[synth]'):
+    """Map ``seed -> PPL`` for one aggregate entry.
+
+    An aggregate is usable only when its ``seeds`` and ``ppls`` lists line up
+    one-to-one.  A mismatch is skipped with a note rather than truncated:
+    pairing a seed with the wrong PPL would turn a measurement into a
+    fabricated value.  ``log_prefix`` lets both reconstruction paths share the
+    parser while keeping their own stage label.
+    """
     out = {}
     if not isinstance(entry, dict):
         return out
     if len(entry.get('seeds') or []) != len(entry.get('ppls') or []):
-        print(f'[synth] NOTE: seeds/ppls length mismatch in aggregate entry{(" for " + tag) if tag else ""} — skipping it instead of silently truncating')
+        print(f'{log_prefix} NOTE: seeds/ppls length mismatch in aggregate entry{(" for " + tag) if tag else ""} — skipping it instead of silently truncating')
         return out
     for _s, _p in zip(entry.get('seeds') or [], entry.get('ppls') or []):
         _si = _num_or_none(_s)
@@ -183,13 +191,32 @@ def _agg_seed_map(entry, tag=''):
             out[_si] = float(_p)
     return out
 
+# Historical private spelling; kept so out-of-tree callers do not break.
+_agg_seed_map = _aggregate_seed_map
+
+def _store_seed_series(entry, seed_map):
+    """Write the canonical seed/ppl series and its mean/std onto ``entry``.
+
+    Both the snapshot recovery and the post-run merge enlarge an aggregate the
+    same way; keeping the field order and guarded statistics here prevents the
+    two paths from drifting apart as new aggregate fields are added.
+    """
+    seeds = sorted(seed_map)
+    vals = [seed_map[_s] for _s in seeds]
+    entry['seeds'] = seeds
+    entry['ppls'] = vals
+    entry['n_seeds'] = len(vals)
+    entry['ppl_mean'] = _safe_mean(vals)
+    entry['ppl_std'] = _safe_stdev(vals)
+
 def _fold_backup_into_aggregate(adir):
     agg_path = os.path.join(adir, 'aggregate.json')
     bak_path = agg_path + '.v6bak'
     if not os.path.exists(bak_path):
         return
     try:
-        bak = json.load(open(bak_path, encoding='utf-8'))
+        with open(bak_path, encoding='utf-8') as fh:
+            bak = json.load(fh)
     except Exception as _e:
         print(f'[synth] NOTE: the pre-retrain snapshot {bak_path} cannot be parsed ({type(_e).__name__}: {_e}) — ignoring it')
         return
@@ -200,7 +227,8 @@ def _fold_backup_into_aggregate(adir):
     live = {}
     if os.path.exists(agg_path):
         try:
-            live = json.load(open(agg_path, encoding='utf-8'))
+            with open(agg_path, encoding='utf-8') as fh:
+                live = json.load(fh)
         except Exception:
             live = {}
     if not isinstance(live, dict):
@@ -211,7 +239,8 @@ def _fold_backup_into_aggregate(adir):
         if not isinstance(bentry, dict):
             continue
         lentry = merged.get(key)
-        sm_b, sm_l = (_agg_seed_map(bentry, tag=str(key)), _agg_seed_map(lentry, tag=str(key)))
+        sm_b, sm_l = (_aggregate_seed_map(bentry, tag=str(key)),
+                      _aggregate_seed_map(lentry, tag=str(key)))
         missing = set(sm_b) - set(sm_l)
         if not missing:
             continue
@@ -221,15 +250,7 @@ def _fold_backup_into_aggregate(adir):
             continue
         sm = dict(sm_b)
         sm.update(sm_l)
-        seeds_sorted = sorted(sm)
-        vals = [sm[_s] for _s in seeds_sorted]
-        lentry['seeds'] = seeds_sorted
-        lentry['ppls'] = vals
-        lentry['n_seeds'] = len(vals)
-        _m = _safe_mean(vals)
-        _s = _safe_stdev(vals)
-        lentry['ppl_mean'] = _m
-        lentry['ppl_std'] = _s
+        _store_seed_series(lentry, sm)
         # Every other aggregate was computed over the pre-recovery seed subset.
         # It is not safe to keep those values next to a larger `seeds` list, so
         # invalidate them explicitly instead of mixing a 1-seed mean with a
@@ -262,7 +283,8 @@ def synthesize_long_summary():
         print(f'[synth] SKIP: {agg_path} is absent — the panel is a LOCAL experiment artifact and is not tracked in the repository, so there is nothing to synthesize from.  Run the v3 panel (or restore the artifact) if you need this reconstruction.')
         return ({'skipped_missing_aggregate': agg_path}, None)
     try:
-        agg = json.load(open(agg_path, encoding='utf-8'))
+        with open(agg_path, encoding='utf-8') as fh:
+            agg = json.load(fh)
     except Exception as _e:
         print(f'[synth] SKIP: {agg_path} exists but cannot be parsed ({type(_e).__name__}: {_e}) — refusing to rebuild summary.json from a corrupt aggregate; re-derive the aggregate first.')
         return ({'skipped_unreadable_aggregate': agg_path}, None)
@@ -274,7 +296,8 @@ def synthesize_long_summary():
     summary = {}
     if os.path.exists(spath):
         try:
-            summary = json.load(open(spath, encoding='utf-8'))
+            with open(spath, encoding='utf-8') as fh:
+                summary = json.load(fh)
         except Exception as _e:
             print(f'[synth] FATAL: {spath} exists but cannot be parsed ({type(_e).__name__}: {_e}).  Refusing to overwrite it with an empty summary — move it aside to start fresh.')
             raise
@@ -412,7 +435,8 @@ def merge_long_aggregate(adir, snapshot_agg):
         return
     agg_path = os.path.join(adir, 'aggregate.json')
     try:
-        fresh = json.load(open(agg_path, encoding='utf-8'))
+        with open(agg_path, encoding='utf-8') as fh:
+            fresh = json.load(fh)
     except Exception as _e:
         print(f'[v6-merge] WARNING: cannot read the freshly written {agg_path} ({type(_e).__name__}: {_e}) — the snapshot is left unmerged; re-run `_finish_panel` on the panel to rebuild it')
         return
@@ -430,17 +454,7 @@ def merge_long_aggregate(adir, snapshot_agg):
         merged = copy.deepcopy(snapshot_agg)
 
     def _seed_map(entry, tag=''):
-        out = {}
-        if not isinstance(entry, dict):
-            return out
-        if len(entry.get('seeds') or []) != len(entry.get('ppls') or []):
-            print(f'[v6-merge] NOTE: seeds/ppls length mismatch in aggregate entry{(" for " + tag) if tag else ""} — skipping it instead of silently truncating')
-            return out
-        for _s, _p in zip(entry.get('seeds') or [], entry.get('ppls') or []):
-            _s = _num_or_none(_s)
-            if _s is not None and L.ppl_is_usable(_p):
-                out[_s] = float(_p)
-        return out
+        return _aggregate_seed_map(entry, tag, log_prefix='[v6-merge]')
     n_folded = 0
     _folded_keys = set()
     for key, fentry in fresh.items():
@@ -452,7 +466,6 @@ def merge_long_aggregate(adir, snapshot_agg):
             continue
         sm_old = _seed_map(sentry, tag=str(key))
         fm = _seed_map(fentry, tag=str(key))
-        _overlap = set(sm_old) & set(fm)
         # Fresh values replace the old value for an overlapping seed; old-only
         # seeds keep their snapshot value.  Secondary means must therefore be
         # weighted by old-ONLY vs fresh draws, never by all old draws (which
@@ -463,15 +476,7 @@ def merge_long_aggregate(adir, snapshot_agg):
         sm.update(fm)
         if not sm:
             continue
-        seeds_sorted = sorted(sm)
-        vals = [sm[_s] for _s in seeds_sorted]
-        sentry['seeds'] = seeds_sorted
-        sentry['ppls'] = vals
-        sentry['n_seeds'] = len(vals)
-        _m = _safe_mean(vals)
-        _s = _safe_stdev(vals)
-        sentry['ppl_mean'] = _m
-        sentry['ppl_std'] = _s
+        _store_seed_series(sentry, sm)
         # Every field below was computed over the snapshot's seed subset.
         # Keeping it next to the enlarged seeds/ppls/ppl_mean would mix a
         # 1-seed primary/CI/pooled value with a 3-seed mean.  The curve,
@@ -779,7 +784,8 @@ def run_smoke():
     _got = {}
     if os.path.exists(_sp):
         try:
-            _got = json.load(open(_sp, encoding='utf-8'))
+            with open(_sp, encoding='utf-8') as fh:
+                _got = json.load(fh)
         except Exception:
             _got = {}
     _bad = [f'{v}::seed0' for v in smoke_cfg['variants'] if not L.ppl_is_usable((_got.get(f'{v}::seed0') or {}).get('ppl'))]

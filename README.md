@@ -15,7 +15,7 @@ everything else is exploratory.
 
 There are three common ways to use this tree:
 
-1. **Check a checkout.** Install the verified CPU environment and run
+1. **Verify a checkout.** Install the verified CPU environment and run
    `make test`; no GPU is required.
 2. **Run or resume a study panel.** Pick a generation in
    [Study at a glance](#study-at-a-glance), then follow its section under
@@ -32,6 +32,11 @@ comparisons are confirmatory and what "released" means in this checkout.
 
 ## Scope and status
 
+**Bottom line:** only the fixed-chunk CSA comparisons in
+`confirmation_frozen.json` are confirmatory, and this checkout ships no released
+evidence. Everything else is exploratory unless a published archive says
+otherwise.
+
 ### Version and evidence at a glance
 
 | dimension | current value | what it means |
@@ -43,7 +48,7 @@ comparisons are confirmatory and what "released" means in this checkout.
 | released evidence | none bundled | the Git tree stays source-only; see `RELEASES.md` |
 
 The three numbering schemes are independent: `v12` is not `v11.128`, and neither
-is a manifest revision. The v6-v11 panels are exploratory because they were
+is a manifest revision. The v6–v11 panels are exploratory because they were
 extended after looking at the same validation split; only the frozen v12
 fixed-chunk comparisons are confirmatory. See `DECISION_LOG.md` and
 `docs/design_notes.md` §17/§20.
@@ -63,7 +68,7 @@ read it so the draft stays internally checkable.
 
 ### Terminology
 
-The tables and command comments below use a few terms in a specific sense.
+The tables and command comments below use these terms in a specific sense.
 
 | term | meaning here |
 |---|---|
@@ -74,6 +79,7 @@ The tables and command comments below use a few terms in a specific sense.
 | arm | one model/recipe variant in a panel |
 | cell | one `(arm, seed)` training run; the smallest resumable unit |
 | seed | the training seed that identifies a cell within an arm |
+| open-block | the still-open block that contains the current position; the open-block panel varies its maximum length and how the current prefix is read |
 | confirmatory | a comparison fixed in `confirmation_frozen.json` before the final test split was read |
 | exploratory | a comparison inspected while panels were still being extended; it can guide the next run, but it is not a frozen claim |
 | zero-GPU | the command runs on CPU only: tests, plan/analysis/report builders and audit gates |
@@ -91,6 +97,7 @@ The tables and command comments below use a few terms in a specific sense.
   - [Example workflows](#example-workflows)
 - [Where to look](#where-to-look)
 - [Repository layout](#repository-layout)
+  - [How the pieces fit](#how-the-pieces-fit)
   - [Core code](#core-code)
   - [Driver modules](#driver-modules)
   - [Tests and frozen inputs](#tests-and-frozen-inputs)
@@ -269,7 +276,7 @@ If you are reading for a specific role, this order avoids most dead ends:
 |---|---|
 | run an experiment | [Start here](#start-here) → [Quick start](#quick-start) → [Study at a glance](#study-at-a-glance) → the driver section under [Running the experiments](#running-the-experiments) → [Common pitfalls](#common-pitfalls) |
 | audit or review a claim | [Scope and status](#scope-and-status) → [Measurement guardrails](#measurement-guardrails) → `docs/design_notes.md` §17/§20 → [`DECISION_LOG.md`](DECISION_LOG.md) → [`RELEASES.md`](RELEASES.md) → [`REVIEW_4_RESPONSE.md`](REVIEW_4_RESPONSE.md) |
-| change the library or a driver | [Repository layout](#repository-layout) → [Core code](#core-code) → `_split_loader.py` → [Tests and frozen inputs](#tests-and-frozen-inputs) → the relevant section of `docs/design_notes.md` |
+| change the library or a driver | [Repository layout](#repository-layout) → [How the pieces fit](#how-the-pieces-fit) → [Core code](#core-code) → `_split_loader.py` → [Tests and frozen inputs](#tests-and-frozen-inputs) → the relevant section of `docs/design_notes.md` |
 | rebuild a report | [Regenerating the experiment artifacts](#regenerating-the-experiment-artifacts) → the driver's `report` section → [Measurement guardrails](#measurement-guardrails) |
 
 | question | document |
@@ -311,6 +318,33 @@ RELEASES.md                 evidence release index
 REVIEW_4_RESPONSE.md        item-by-item review disposition
 ```
 
+### How the pieces fit
+
+A driver consumes a configuration (the `RUN_*` presets, a phase table, or the
+frozen manifest), resolves local artifacts relative to the checkout, and
+writes one record per `(arm, seed)` cell. The zero-GPU analysis and report
+modes read those records back; an evidence archive is built from the same
+on-disk artifacts.
+
+```text
+configuration / frozen manifest
+        |
+        v
+python -m explib.<driver>  -- training modes -->  results_*/  (per-cell records)
+        |                  -- plan modes ------>  preflight only
+        v
+analysis / report modes  -->  analysis_*/ (stamped JSON)  -->  REPORT*.md
+        |
+        v
+archive_release.py  -->  release_<tag>.tar.gz + per-file SHA-256 manifest
+```
+
+Arrows show data flow, not a mandatory order: a driver may skip straight to
+`report` when its `results_*/` already exist, and `plan` never starts training.
+A fresh checkout has neither `results_*/` nor `analysis_*/`; a command that
+needs them either names the producing run or reports the missing input instead
+of substituting a number.
+
 The tables below give the full inventory.
 
 ### Core code
@@ -332,6 +366,20 @@ in execution order and call `load_root_package` (top-level package) or
 `_HERE`, `_REPO` and the historical `__file__`, then compiles each fragment
 under its real path. Adding a fragment is one line in `_PARTS`; adding a driver
 also needs the small `__main__.py` entry point that calls `_run_cli`.
+
+For example, to add a new self-contained measurement helper without touching
+the loader:
+
+1. create `explib/_parts/part_89_<name>.py`;
+2. append `'part_89_<name>.py'` to `explib/__init__.py`'s `_PARTS` list at the
+   position where its dependencies are already defined;
+3. run `make registry` (the declaration must match the files on disk) and
+   `make test`.
+
+Keep the fragment name unique and keep the list in execution order: later
+fragments share the module namespace and may use names defined by earlier ones.
+A new driver is the same pattern plus `__main__.py`, which simply calls
+`_run_cli`.
 
 ### Driver modules
 
@@ -607,9 +655,8 @@ modes always run serially regardless of `CSA_PAR`.
 
 ### B-tier M0 / S1 (scale-up entry point, adopted tier B)
 
-The adopted B-tier scale-up plan (entry point `python -m explib.m0`; the former
-compute-plan document is retired) adds a second corpus path and the S1–S4 scale
-ladder on top of the WikiText-103 mechanism layer:
+The adopted B-tier scale-up path (`python -m explib.m0`) adds a second corpus
+path and the S1–S4 scale ladder on top of the WikiText-103 mechanism layer:
 
 ```bash
 python -m explib.m0 params   # zero GPU: S1–S4 parameter audit vs the plan

@@ -6,16 +6,16 @@
 （BPE-8k，WikiText-103）中，对比**压缩块稀疏注意力**（CSA / HCA，固定分块
 与动态分块）与稠密注意力。
 
-这是一个**只存放源码**的仓库：没有随仓库发布数值证据归档（见
+这是一个**仅存放源码**的仓库：未随仓库发布数值证据归档（见
 `RELEASES.md`）。因此，任何没有用自己产物重建过的报告 PPL 数值，仅凭 Git
 树无法独立复核。只有 `confirmation_frozen.json` 冻结的比较属于确认性证据；
 其余均为探索性。
 
 常见的使用方式有三种：
 
-1. **检查代码检出**：安装已验证的 CPU 环境并运行 `make test`，不需要 GPU。
+1. **验证检出**：安装已验证的 CPU 环境并运行 `make test`，不需要 GPU。
 2. **运行或续跑研究面板**：在[研究一览](#研究一览)中选择代次，再按
-   [复现方法（任意机器）](#复现方法任意机器)中的对应小节执行。
+   [运行实验](#运行实验)中的对应小节执行。
 3. **从已有产物重建结果**：使用驱动的零 GPU `analysis` / `report` 模式，
    或用 `python build_report.py` 重建 v7 报告。
 
@@ -26,6 +26,10 @@
 指什么。
 
 ## 范围与状态
+
+**一句话结论：** 只有 `confirmation_frozen.json` 中的固定分块 CSA 比较属于
+确认性；本检出不附带任何已发布证据。除此之外的结果都是探索性的，除非已发布
+的归档另有说明。
 
 ### 版本与证据一览
 
@@ -66,6 +70,7 @@
 | 臂（arm） | 面板中的一个模型/配方变体 |
 | 单元（cell） | 一次 `(臂, 种子)` 训练，是续跑的最小单位 |
 | 种子（seed） | 同一臂内标识一个单元的训练随机种子 |
+| 开放块（open-block） | 包含当前位置、尚未结束的块；开放块面板改变其最大长度与当前前缀的读取规则 |
 | 确认性 | 在读取最终 test split 之前就已固定在 `confirmation_frozen.json` 中的比较 |
 | 探索性 | 在面板仍在扩展时查看过的比较；可指导下一轮运行，但不是冻结主张 |
 | 零 GPU | 命令只使用 CPU：测试、plan/analysis/report 构建器与审计门 |
@@ -83,6 +88,7 @@
   - [示例流程](#示例流程)
 - [从哪里读起](#从哪里读起)
 - [仓库结构](#仓库结构)
+  - [各部分如何衔接](#各部分如何衔接)
   - [核心代码](#核心代码)
   - [驱动模块](#驱动模块)
   - [测试与冻结输入](#测试与冻结输入)
@@ -90,7 +96,7 @@
   - [生成的路径](#生成的路径)
   - [工具](#工具)
   - [重新生成实验产物](#重新生成实验产物)
-- [复现方法（任意机器）](#复现方法任意机器)
+- [运行实验](#运行实验)
   - [环境](#环境)
   - [数据与缓存回退](#数据与缓存回退)
   - [训练前校验流水线](#训练前校验流水线)
@@ -101,7 +107,7 @@
   - [v11 统计收尾套件](#v11-统计收尾套件)
   - [v10 机制 / 扩规模 / 统计套件](#v10-机制--扩规模--统计套件)
   - [v12 确认套件（探索 / 确认分离）](#v12-确认套件探索--确认分离)
-  - [未结束块面板](#未结束块面板)
+  - [开放块面板](#开放块面板)
   - [v8 / v9 收尾套件](#v8--v9-收尾套件)
   - [v7 回应 reviewer 套件](#v7-回应-reviewer-套件)
   - [常见注意事项](#常见注意事项)
@@ -124,7 +130,7 @@
 | v11 | v10/v11 面板的统计收尾 | [`python -m explib.length`](#v11-统计收尾套件) | `analysis_v11/`、`REPORT_v11.md` |
 | v12 | 冻结的固定分块确认 | [`python -m explib.confirmation`](#v12-确认套件探索--确认分离) | `analysis_v12/`、`REPORT_v12.md` |
 | M0 | FineWeb-Edu 数据路径、内核 G0 门、S1/S2 规模面板 | [`python -m explib.m0`](#b-档-m0--s1扩规模入口已选定-b-档) | `results_b_s1/`、`results_b_s2/`、`analysis_m0/` |
-| open-block | 最大块长 × 未结束块读取规则 | [`python -m explib.open_block`](#未结束块面板) | `analysis_open_block/` |
+| open-block | 最大块长 × 当前开放块的读取规则 | [`python -m explib.open_block`](#开放块面板) | `analysis_open_block/` |
 
 训练模式不会隐式启动；唯一的历史例外是 v6 脚本：它默认使用 `full`，因此
 裸跑 `python run_gapfill.py` 会启动主面板。训练模式之外的模式（`smoke`、
@@ -154,7 +160,7 @@
 |---|---|---|---|
 | 检查代码与环境是否正常 | `python -m pip install -r requirements.lock`，再 `make test` | 不会 | pytest 摘要且退出码为 0 |
 | 预检冻结清单，不读 test split | `make plan` | 不会 | 预检报告且退出码为 0；不读取 test split |
-| 运行未结束块因果性/参考实现门禁 | `python -m pytest -q test_open_block.py` | 不会 | 全部门禁通过 |
+| 运行开放块因果性/参考实现门禁 | `python -m pytest -q test_open_block.py` | 不会 | 全部门禁通过 |
 | 端到端试跑整条流水线 | `python run_gapfill.py smoke` | 仅 smoke 小跑 | 打印 `[smoke] PASSED`，smoke 产物已清理 |
 | 运行或续跑正式面板 | [研究一览](#研究一览)中的驱动表 | 会 | `results_*/` 下出现逐单元记录 |
 | 从本地产物重建报告 | `python build_report.py`，或该驱动提供 `report` 模式时使用它 | 不会 | 用本地产物重写 `REPORT*.md` |
@@ -221,8 +227,8 @@ python -m explib.confirmation phase P5H  # 训练曲线健康诊断
 python -m explib.confirmation phase P5PW # 用 P5C validation 差值做条件功效检查
 python -m explib.confirmation phase P5T  # 一次性 test-split 评估
 python -m explib.confirmation phase P5MP # 扩展腐坏/NIAH 探针
-python -m explib.confirmation phase P5S2 # 等 token 规模臂
-python -m explib.confirmation phase P5S3 # 参数量代理规模臂
+python -m explib.confirmation phase P5S2 # token 数匹配的规模臂
+python -m explib.confirmation phase P5S3 # 参数量代理的规模臂
 python -m explib.confirmation analysis   # 确认性统计
 python -m explib.confirmation report     # 重建 REPORT_v12.md
 ```
@@ -246,14 +252,14 @@ python -m explib.reproduce compare results_lm_v3_1500 results_lm_v3_1500_rerun
 
 | 角色 | 建议顺序 |
 |---|---|
-| 运行实验 | [从这里开始](#从这里开始) → [快速开始](#快速开始) → [研究一览](#研究一览) → [复现方法（任意机器）](#复现方法任意机器)中的对应驱动小节 → [常见注意事项](#常见注意事项) |
+| 运行实验 | [从这里开始](#从这里开始) → [快速开始](#快速开始) → [研究一览](#研究一览) → [运行实验](#运行实验)中的对应驱动小节 → [常见注意事项](#常见注意事项) |
 | 审计或评审主张 | [范围与状态](#范围与状态) → [测量护栏](#测量护栏) → `docs/design_notes.md` §17/§20 → [`DECISION_LOG.md`](DECISION_LOG.md) → [`RELEASES.md`](RELEASES.md) → [`REVIEW_4_RESPONSE.md`](REVIEW_4_RESPONSE.md) |
-| 修改库或驱动 | [仓库结构](#仓库结构) → [核心代码](#核心代码) → `_split_loader.py` → [测试与冻结输入](#测试与冻结输入) → `docs/design_notes.md` 的对应小节 |
+| 修改库或驱动 | [仓库结构](#仓库结构) → [各部分如何衔接](#各部分如何衔接) → [核心代码](#核心代码) → `_split_loader.py` → [测试与冻结输入](#测试与冻结输入) → `docs/design_notes.md` 的对应小节 |
 | 重建报告 | [重新生成实验产物](#重新生成实验产物) → 驱动的 `report` 小节 → [测量护栏](#测量护栏) |
 
 | 问题 | 文档 |
 |---|---|
-| 实验如何运行或重跑？ | 本 README，从[复现方法（任意机器）](#复现方法任意机器)开始 |
+| 实验如何运行或重跑？ | 本 README，从[运行实验](#运行实验)开始 |
 | 该用哪个命令和子命令？ | [研究一览](#研究一览)与下文各驱动小节 |
 | 某个测量或比较为什么这样定义？ | [`docs/design_notes.md`](docs/design_notes.md) |
 | 到底冻结了什么、允许主张什么？ | `confirmation_frozen.json` 与 [`docs/design_notes.md`](docs/design_notes.md) §17/§20 |
@@ -288,6 +294,30 @@ RELEASES.md                 证据发布索引
 REVIEW_4_RESPONSE.md        逐条评审处置
 ```
 
+### 各部分如何衔接
+
+驱动读取配置（`RUN_*` 预设、阶段表或冻结清单），按检出路径解析本地产物，
+并为每个 `(臂, 种子)` 单元写入一条记录。零 GPU 的 analysis / report 模式
+再读回这些记录；证据归档也从同一批落盘产物构建。
+
+```text
+配置 / 冻结清单
+        |
+        v
+python -m explib.<driver>  -- 训练模式 -->  results_*/  （逐单元记录）
+        |                  -- plan 模式 -->  仅预检
+        v
+analysis / report 模式  -->  analysis_*/（带戳 JSON）  -->  REPORT*.md
+        |
+        v
+archive_release.py  -->  release_<tag>.tar.gz + 逐文件 SHA-256 清单
+```
+
+箭头表示数据流向，不是强制执行顺序：已有 `results_*/` 时可直接运行
+`report`，而 `plan` 不会启动训练。全新检出既没有 `results_*/` 也没有
+`analysis_*/`；需要这些产物的命令会指出应由哪个阶段生成，或报告输入缺失，
+不会用替代数字补位。
+
 完整清单见下表。
 
 ### 核心代码
@@ -309,6 +339,17 @@ REVIEW_4_RESPONSE.md        逐条评审处置
 再以片段真实路径编译执行。新增片段只需在 `_PARTS` 加一行；新增驱动还需
 一个调用 `_run_cli` 的简短 `__main__.py` 入口。
 
+例如，新增一个自包含的测量辅助函数而不改动加载器：
+
+1. 创建 `explib/_parts/part_89_<name>.py`；
+2. 把 `'part_89_<name>.py'` 追加到 `explib/__init__.py` 的 `_PARTS` 列表
+   中，位置放在其依赖已定义之后；
+3. 运行 `make registry`（声明必须与磁盘文件一致）与 `make test`。
+
+片段名需唯一，列表必须保持执行顺序：后面的片段共享模块命名空间，可以使用
+前面片段定义的名字。新增驱动沿用同一模式，再加一个调用 `_run_cli` 的
+`__main__.py`。
+
 ### 驱动模块
 
 | 路径 | 说明 |
@@ -318,8 +359,8 @@ REVIEW_4_RESPONSE.md        逐条评审处置
 | `explib/resume/` | **v9 驱动**（`python -m explib.resume`）：P2T（seq-2048 的 topk 扫描，`batch_size=1`）与 P2S3（RoPE 20k 长跑的第三个 seed） |
 | `explib/corruption/` | **v10 驱动**（`python -m explib.corruption`）：P3M 长度外推机制 + 干扰项注入探针、P3S 交叉面板扩规模、P3T topk 扫描补至 4 seeds |
 | `explib/length/` | **v11 驱动**（`python -m explib.length`）：统计收尾——干扰探针扩到 n=6（P4MT/P4MP）、交叉面板扩到 n=4（P4S）、d=384 配对臂扩到 n=4（P4F） |
-| `explib/confirmation/` | **v12 确认驱动**（`python -m explib.confirmation`；评审响应 + 评审二轮加固）：P5C 按清单种子列表训练全部六个冻结臂，P5MP 跑扩展腐坏模式探针（uniform/realistic-token/mask/delete + 评审二轮新增 span/doc/topical + NIAH-natural），P5S2/P5S3 补等 token 与 6ND 参数量代理预算的大规模臂，P5T 按 `confirmation_frozen.json` 在 held-out 的 WikiText-103 test split 上做**冻结后一次性确认评估**——含加载期功效硬门槛（数学上不可能确认的清单直接拒绝）、严格记录准入（种子白名单/唯一记录/单一冻结切片/配方签名/manifest 哈希）、首次访问冻结锁与逐文档 PPL 落盘 |
-| `explib/open_block/` | **未结束块读取面板驱动**（`python -m explib.open_block`）：最大块长（32/64/128/无强制上限）× 当前未结束块读取方式（`closed` / `prefix_summary` / `prefix_singletons`）；共享 top-k 预算、因果前缀构造、窗口外辅助面板、逐种子配对差与交互统计——见 `docs/design_notes.md` §24 |
+| `explib/confirmation/` | **v12 确认驱动**（`python -m explib.confirmation`；评审响应 + 评审二轮加固）：P5C 按清单种子列表训练全部六个冻结臂，P5MP 跑扩展腐坏模式探针（uniform/realistic-token/mask/delete + 评审二轮新增 span/doc/topical + NIAH-natural），P5S2/P5S3 补 token 数匹配与 6ND 参数量代理的大规模臂，P5T 按 `confirmation_frozen.json` 在 held-out 的 WikiText-103 test split 上做**冻结后一次性确认评估**——含加载期功效硬门槛（数学上不可能确认的清单直接拒绝）、严格记录准入（种子白名单/唯一记录/单一冻结切片/配方签名/manifest 哈希）、首次访问冻结锁与逐文档 PPL 落盘 |
+| `explib/open_block/` | **开放块读取面板驱动**（`python -m explib.open_block`）：最大块长（32/64/128/无强制上限）× 当前开放块的读取方式（`closed` / `prefix_summary` / `prefix_singletons`）；共享 top-k 预算、因果前缀构造、窗口外辅助面板、逐种子配对差与交互统计——见 `docs/design_notes.md` §24 |
 | `explib/m0/` | **M0/S1 驱动（已选定 B 档）**（`python -m explib.m0`）：扩规模路线图的代码入口——`params`（零 GPU 的 S1–S4 参数量核算）、`data`（FineWeb-Edu + 32k BPE 语料缓存）、`smoke`（B 档数据路径端到端自检）、`kernel`（G0 验证套件：三算子 kernel/eager 数值对照 + 稀疏注意力基准）、`analysis`、`full`（S1 主面板）与 `auto`；见下文 [B 档 M0/S1](#b-档-m0--s1扩规模入口已选定-b-档) |
 | `explib/reproduce/` | **跨运行复现比较器**（`python -m explib.reproduce compare 原始目录 重跑目录`）：按 `variant::seedN` 逐格比较两份 panel，分别报告源码字节、数据切片、配置、执行环境、匹配初始化、已落盘的 loss/eval 曲线与最终 PPL 容差；终点相同但曲线不同报 `curve_changed`，`bit_identical` 要求曲线也相同；缺指纹一律 `provenance_incomplete`，绝不当作通过。同一检查也暴露为 `audit_gates.py reproduction 原始目录 重跑目录`——见 `docs/design_notes.md` §83 与 §152 |
 
@@ -327,7 +368,7 @@ REVIEW_4_RESPONSE.md        逐条评审处置
 
 | 路径 | 说明 |
 |---|---|
-| `test_open_block.py` | **未结束块 CPU 门禁**：配置/分段器、优化前缀池化与逐查询参考的前向/梯度一致、前缀不变性、未来扰动/未来梯度、候选掩码、边界情形、closed 回归、单 token 语义与 HCA 预算声明 |
+| `test_open_block.py` | **开放块 CPU 门禁**：配置/分段器、优化前缀池化与逐查询参考的前向/梯度一致、前缀不变性、未来扰动/未来梯度、候选掩码、边界情形、closed 回归、单 token 语义与 HCA 预算声明 |
 | `test_review_part_*.py`、`test_review_fixes.py` | **CPU 评审 pytest 套件**：兼容入口与拆分后的测试模块（用 `make test` 或 `pytest` 运行） |
 | `confirmation_frozen.json` | **预注册确认清单**（入库；`manifest_version: 3`，修订历史 v1–v3）：冻结臂与种子 0-11（在任何 test-split 访问**之前**由 6 修订为 12，含功效表）、终点、精确符号翻转 + Holm、决策规则、机器可校验的绑定块与范围声明——见 `docs/design_notes.md` §17 与 `DECISION_LOG.md` |
 | `confirmation_frozen_dynamic.json` | **动态分块与 HCA 的独立预注册草案**（`manifest_version: 4`；尚未冻结）：H1 分段质量、H2 检索精度、H3 长程覆盖，以及冻结前必须排期的对照——见 `DECISION_LOG.md` |
@@ -372,7 +413,7 @@ REVIEW_4_RESPONSE.md        逐条评审处置
 > `exp_lib.py`（以及 `csa_kernels.py`、`audit_gates.py`、`build_report.py`、
 > `data_guard.py`）只是重新导出拆分包的兼容 shim。
 >
-> **驱动入口。** 历史顶层的 v7–v12、M0/S1 与未结束块脚本现已迁入 `explib/`
+> **驱动入口。** 历史顶层的 v7–v12、M0/S1 与开放块脚本现已迁入 `explib/`
 > 下的模块：使用 `python -m explib.rope`、`python -m explib.scale`、
 > `python -m explib.resume`、`python -m explib.corruption`、
 > `python -m explib.length`、`python -m explib.confirmation`、
@@ -416,7 +457,7 @@ python -m explib.reproduce report OLD.json NEW.json --ignore-ledger
 这是对带戳报告的结构化 diff，不是新的统计检验；用于确认从同一批产物重建
 报告没有改变其内容。
 
-## 复现方法（任意机器）
+## 运行实验
 
 以下命令按副作用分组：先准备环境，再跑零 GPU 校验，最后才启动训练。
 均在仓库根目录执行。训练面板面向 GPU；测试、分析、报告构建与审计门在
@@ -485,12 +526,12 @@ CPU 上运行。
 ```bash
 python run_gapfill.py smoke
 python -m explib.corruption smoke        # 腐坏模式 + NIAH + 对照
-python -m pytest -q test_open_block.py   # 未结束块因果性/参考实现/掩码门禁（CPU）
-python -m explib.open_block smoke        # 未结束块矩阵的微型合成自检
+python -m pytest -q test_open_block.py   # 开放块因果性/参考实现/掩码门禁（CPU）
+python -m explib.open_block smoke        # 开放块矩阵的微型合成自检
 python -m explib.confirmation smoke      # 冻结最终测试的完整往返
 ```
 
-其余未结束块模式是真实运行：
+其余开放块模式是真实运行：
 
 ```bash
 python -m explib.open_block pilot     # 单格短程运行
@@ -561,7 +602,7 @@ CSA_PAR=2 CSA_PAR_GPUS=0,3 python -m explib.corruption phase P3SL
 
 ### B 档 M0 / S1（扩规模入口，已选定 B 档）
 
-B 档规模计划（入口 `python -m explib.m0`；原算力规划文档已退役）在
+B 档规模路径（入口 `python -m explib.m0`）在
 WikiText-103 机制层之上新增第二条语料路径与 S1–S4 规模阶梯：
 
 ```bash
@@ -585,7 +626,7 @@ python -m explib.m0 auto     # 无人值守：G0 门（fail-closed）→ 证书�
   回退——不同语料内容必然产生不同指纹，不会与真缓存混淆）；
 - `full` 受 `M0_CAP` 上限约束（状态文件 `run_time_state_m0.json`，
   `M0_CAP_HOURS` 可覆盖）：Triton 内核通过 G0 判据之前，eager 路径的预计
-  耗时会被拒绝启动——这是规划文档自身的前提判断，不是缺陷。
+  耗时会被拒绝启动——这是该入口自身的前提判断，不是缺陷。
 
 ### Triton 内核路径（M0/G0）
 
@@ -655,8 +696,8 @@ python -m explib.corruption report         # 从磁盘重建 REPORT_v10.md（零
 random-indexer / see-everything 各臂，**uniform / realistic-token（natural）/
 mask / delete + 评审二轮新增 span / doc / topical 腐坏模式** + NIAH-natural
 远端必要信息任务）、P3T（topk 扫描 seeds 2/3 → n=4）、P3SS/P3SL（
-d=128/4L 8000 步与 d=512/10L 4000 步交叉面板）、P3SL2/P3SL3（**等 token
-与 6ND 参数量代理预算的大模型臂**——规模混杂修复，代理 ≠ 实测等
+d=128/4L 8000 步与 d=512/10L 4000 步交叉面板）、P3SL2/P3SL3（**token
+数匹配与 6ND 参数量代理的大模型臂**——规模混杂修复，代理 ≠ 实测等
 FLOPs，见 `docs/design_notes.md` §16）。成对污染协议、预注册交叉判据、
 腐坏模式/ΔNLL 口径（§15）与「测试时干预 vs 从头训练对照」的区别
 （§18）见 `docs/design_notes.md`。
@@ -678,7 +719,7 @@ python -m explib.confirmation phase P5H       # 诊断：冻结臂训练曲线�
 python -m explib.confirmation phase P5PW      # 零 GPU：用 P5C validation 差值做条件功效检查
 python -m explib.confirmation phase P5T       # 冻结后的最终测试（读 wiki.test.raw，需冻结清单）
 python -m explib.confirmation phase P5MP      # 扩展探针（全部模式 + NIAH + 对照），种子取自清单
-python -m explib.confirmation phase P5S2      # 等 token 大规模臂（8000 步）
+python -m explib.confirmation phase P5S2      # token 数匹配的大规模臂（8000 步）
 python -m explib.confirmation phase P5S3      # 参数量代理规模臂（参数量比例缩步）
 python -m explib.confirmation analysis        # 零 GPU：共享 v10 统计 + 冻结确认性统计
 python -m explib.confirmation report          # 从磁盘重建 REPORT_v12.md（零 GPU）
@@ -719,7 +760,7 @@ python audit_gates.py release     # 证据发布就绪：无完整记录 => sour
 python archive_release.py plan v13 --dirs results_lm_test analysis_v12   # 证据归档 dry-run
 ```
 
-### 未结束块面板
+### 开放块面板
 
 open-block 驱动在相同的 top-k 读取上限下，改变最大块长（32 / 64 / 128 / 不设
 上限）与当前开放块的读取规则（`closed`、`prefix_summary`、

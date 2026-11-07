@@ -5,6 +5,9 @@ the import path works regardless of whether the code is invoked as a package
 or as a script from the repository root.
 """
 
+# Keep this literal aligned with explib.CODE_SEMANTICS.  The zero-GPU report
+# builder reads it from this file directly (it deliberately does not import
+# torch), so the shim is also the stable, import-free location of the stamp.
 CODE_SEMANTICS = 'v11.128'
 
 import sys as _sys

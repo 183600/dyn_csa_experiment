@@ -44,8 +44,12 @@ def _validate_parts():
     if missing:
         raise ImportError(
             f'Missing _parts/ entries: {missing}.  '
-            'Add the new part to _PARTS in the correct order, or create the file.')
+            'Add the missing fragment to _PARTS in execution order, or create the file.')
 
+    # The hash binds membership, not execution order (the registry audit checks
+    # order).  Sorting makes the value independent of declaration order, so a
+    # reordered but otherwise identical part set keeps the same membership
+    # stamp while the registry flags the reordering separately.
     canonical = json.dumps(sorted(_PARTS), sort_keys=True, separators=(',', ':'))
     _PARTS_HASH = hashlib.sha256(canonical.encode('utf-8')).hexdigest()
     _PARTS_VALIDATED = True

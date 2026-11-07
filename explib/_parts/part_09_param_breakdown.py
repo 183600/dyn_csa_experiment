@@ -1104,6 +1104,50 @@ def _signflip_dominant_all_qualify(d, obs):
     return bool(float(obs) <= lower_mean + 1e-12)
 
 
+def _saddlepoint_root(vals, target):
+    """Solve ``K'(t) = target`` for the sign-flip cumulant generating function.
+
+    ``vals`` are the non-zero paired differences.  Returns ``(t, K(t), K''(t))``
+    or ``None`` when the root does not bracket within the expansion budget; the
+    caller then uses the deterministic normal-tail fallback.  Keeping the
+    cumulant derivatives and the bracket search here means the two-sided
+    sign-flip test and the one-sided exact-TOST tail solve the same equation
+    with the same arithmetic.
+    """
+    def _cumulant_deriv(t):
+        # K'(t) = sum(d_i * tanh(t*d_i)); the saddlepoint solves K'(t) = target.
+        return math.fsum(x * math.tanh(t * x) for x in vals)
+
+    def _log_cosh_cumulant(t):
+        # K(t) = sum(log cosh(t*d_i)).
+        # log cosh(z) = |z| + log1p(exp(-2|z|)) - log(2), stable for large |z|.
+        return math.fsum(abs(t * x) + math.log1p(math.exp(-2.0 * abs(t * x))) - math.log(2.0)
+                         for x in vals)
+
+    def _cumulant_curvature(t):
+        # K''(t) = sum(d_i**2 * sech^2(t*d_i)).
+        # sech^2(z) = 1 - tanh^2(z) avoids a cosh overflow in the extreme
+        # near-maximum-sum tail while staying algebraically identical.
+        return math.fsum(x * x * (1.0 - math.tanh(t * x) ** 2) for x in vals)
+
+    hi = 1.0 / max(abs(x) for x in vals)
+    for _ in range(60):
+        if _cumulant_deriv(hi) >= target:
+            break
+        hi *= 2.0
+    else:
+        return None
+    lo = 0.0
+    for _ in range(160):
+        mid = 0.5 * (lo + hi)
+        if _cumulant_deriv(mid) < target:
+            lo = mid
+        else:
+            hi = mid
+    t = 0.5 * (lo + hi)
+    return t, _log_cosh_cumulant(t), _cumulant_curvature(t)
+
+
 def _signflip_saddlepoint_p(values):
     """Deterministic Lugannani-Rice saddlepoint tail for n > 40.
 
@@ -1134,42 +1178,14 @@ def _signflip_saddlepoint_p(values):
     # |S| can only equal the maximum sum when every sign is the same.
     if T >= sabs * (1.0 - 1e-13):
         return floor, 'saddlepoint'
-    inv = 1.0 / max(abs(x) for x in vals)
-
-    def _kp(t):
-        return math.fsum(x * math.tanh(t * x) for x in vals)
-
-    def _k(t):
-        # log cosh(z) = |z| + log1p(exp(-2|z|)) - log(2), stable for large |z|.
-        return math.fsum(abs(t * x) + math.log1p(math.exp(-2.0 * abs(t * x))) - math.log(2.0)
-                         for x in vals)
-
-    def _kpp(t):
-        # sech^2(z) = 1 - tanh^2(z) avoids a cosh overflow in the extreme
-        # near-maximum-sum tail while staying algebraically identical.
-        return math.fsum(x * x * (1.0 - math.tanh(t * x) ** 2) for x in vals)
-
-    hi = inv
-    for _ in range(60):
-        if _kp(hi) >= T:
-            break
-        hi *= 2.0
-    else:
+    solved = _saddlepoint_root(vals, T)
+    if solved is None:
         # Pathological near-maximum sum: the normal tail with the CORRECT
         # uncentered variance is the safe deterministic fallback.
         sd = math.sqrt(math.fsum(x * x for x in vals))
         p = math.erfc(T / (sd * math.sqrt(2.0))) if sd > 0 else floor
         return float(min(1.0, max(floor, p))), 'saddlepoint-normal-fallback'
-    lo = 0.0
-    for _ in range(160):
-        mid = 0.5 * (lo + hi)
-        if _kp(mid) < T:
-            lo = mid
-        else:
-            hi = mid
-    t = 0.5 * (lo + hi)
-    Kt = _k(t)
-    K2 = _kpp(t)
+    t, Kt, K2 = solved
     w = math.sqrt(max(0.0, 2.0 * (t * T - Kt)))
     u = t * math.sqrt(K2) if K2 > 0.0 else 0.0
     if w < 1e-8 or u <= 0.0:

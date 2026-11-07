@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
+"""Zero-GPU fuse-vs-no-fuse analysis for saved v6 panels.
+
+Reads the per-seed records under ``results_*/summary.json``, recomputes
+per-layer boundary alignment, block-length statistics and paired PPL
+trajectories, and writes the tables/plots plus ``stats.json`` under
+``analysis_fuse/``.  It trains nothing and never reads the frozen test split.
+"""
 import json, math, os, sys, functools, tempfile, warnings
+from typing import NamedTuple
 for _stream in (sys.stdout, sys.stderr):
     if hasattr(_stream, 'reconfigure'):
         try:
@@ -15,6 +23,21 @@ OUT = os.path.join(ROOT, 'analysis_fuse')
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 import exp_lib as L
+
+class _Variant(NamedTuple):
+    """Where one fuse/no-fuse arm lives and how the report labels it."""
+    panel: str
+    label: str
+    fused: bool
+
+
+VARIANTS = {
+    'hybrid_csa_dyn': _Variant('results_lm_v4_abl', 'hybrid dyn (no-fuse)', False),
+    'hybrid_csa_dyn_fuse': _Variant('results_lm_v4_abl', 'hybrid dyn + fuse', True),
+    'csa_dyn_fuse': _Variant('results_lm_v4_abl', 'csa dyn + fuse', True),
+    'csa_dynamic': _Variant('results_lm_v3_1500', 'csa dyn (no-fuse)', False),
+}
+
 
 def _save_fig(fig, name, **kw):
     path = os.path.join(OUT, name)
@@ -42,7 +65,6 @@ def load(panel):
         raise FileNotFoundError(f'fuse_analysis: results panel `{panel}` is not present ({path}).\n  The repository tracks SOURCE only — `results_*/` directories, `REPORT*.md` and the run-state files are all build products and are not committed.\n  Regenerate the panel before running this zero-GPU analysis, e.g.:  python run_gapfill.py full   (or the driver that owns `{panel}`), then re-run `python fuse_analysis.py`.')
     with open(path, encoding='utf-8') as f:
         return json.load(f)
-VARIANTS = {'hybrid_csa_dyn': ('results_lm_v4_abl', 'hybrid dyn (no-fuse)', False), 'hybrid_csa_dyn_fuse': ('results_lm_v4_abl', 'hybrid dyn + fuse', True), 'csa_dyn_fuse': ('results_lm_v4_abl', 'csa dyn + fuse', True), 'csa_dynamic': ('results_lm_v3_1500', 'csa dyn (no-fuse)', False)}
 
 _RESOLVED = {}
 _PANEL_CACHE = {}
@@ -55,7 +77,7 @@ def _read_panel(panel_name):
     return hit
 
 def _variant_records(variant):
-    panel_name = VARIANTS[variant][0]
+    panel_name = VARIANTS[variant].panel
     rkey = (panel_name, variant)
     if rkey not in _RESOLVED:
         groups = {}
@@ -82,7 +104,7 @@ def _variant_records(variant):
 
 def _require_panels():
     for _v in VARIANTS:
-        _p = VARIANTS[_v][0]
+        _p = VARIANTS[_v].panel
         if not os.path.exists(os.path.join(ROOT, _p, 'summary.json')):
             load(_p)  # raises FileNotFoundError with the panel-specific message
 
@@ -100,7 +122,7 @@ def layer_idx(layers):
 def rec(variant, seed):
     r = _variant_records(variant).get(seed)
     if not isinstance(r, dict):
-        raise KeyError(f'fuse_analysis: {variant}::seed{seed} is absent from {VARIANTS[variant][0]}/summary.json — the panel is incomplete; run that cell first (or restrict SEEDS to the ones present)')
+        raise KeyError(f'fuse_analysis: {variant}::seed{seed} is absent from {VARIANTS[variant].panel}/summary.json — the panel is incomplete; run that cell first (or restrict SEEDS to the ones present)')
     if r.get('synthesized') or not L.ppl_is_usable(r.get('ppl')):
         raise ValueError(f'fuse_analysis: {variant}::seed{seed} has no usable `ppl` ({r.get('ppl')!r}) — it is not a measurement, so it cannot be paired. Re-run that cell or exclude the variant.')
     return r
@@ -483,7 +505,7 @@ def main(argv=None):
         lines.append(f'> 注：分块偏移量未计算——{_pgate_drop} 全部因两臂配置/训练量不一致被 `pair_reason` 排除，没有可配对的 seed；本节的块长分布表只列各臂自身的描述值。\n')
     elif _pgate_drop:
         lines.append(f'> 注：分块偏移量的配对已按 `pair_reason` 过滤，{_pgate_drop} 因两臂配置/训练量不一致被排除；下方偏移量是在 {_pair_ok_seeds} 上计算的。\n')
-    for v, (panel_name, label, fused) in VARIANTS.items():
+    for v in VARIANTS:
         _v_seeds = _seeds_of(v)
         if not _v_seeds:
             lines.append(f'| `{v}` | — | — | — | — | — | （该变体没有已测种子）|')
@@ -498,22 +520,12 @@ def main(argv=None):
         except (KeyError, ValueError, TypeError) as e:
             lines.append(f'| `{v}` | — | — | — | — | — | （该变体数据缺失：{e}）|')
             continue
-        def _nm(M):
+        def _nanmean_fmt(M, spec):
             with warnings.catch_warnings():
                 warnings.simplefilter('ignore', RuntimeWarning)
-                v = np.nanmean(M)
-            return f'{v:.1f}' if np.isfinite(v) else '—'
-        def _nm3(M):
-            with warnings.catch_warnings():
-                warnings.simplefilter('ignore', RuntimeWarning)
-                v = np.nanmean(M)
-            return f'{v:.3f}' if np.isfinite(v) else '—'
-        def _nmp(M):
-            with warnings.catch_warnings():
-                warnings.simplefilter('ignore', RuntimeWarning)
-                v = np.nanmean(M)
-            return f'{v:+.3f}' if np.isfinite(v) else '—'
-        lines.append(f'| `{v}` | {_nm3(Mm)} | {_nm3(Ms)} | {_nm(Mx)} | {_nm3(Mf)} | {_nm(Mb)} | {_nmp(Md)} |')
+                _v = np.nanmean(M)
+            return spec.format(_v) if np.isfinite(_v) else '—'
+        lines.append(f'| `{v}` | {_nanmean_fmt(Mm, "{:.3f}")} | {_nanmean_fmt(Ms, "{:.3f}")} | {_nanmean_fmt(Mx, "{:.1f}")} | {_nanmean_fmt(Mf, "{:.3f}")} | {_nanmean_fmt(Mb, "{:.1f}")} | {_nanmean_fmt(Md, "{:+.3f}")} |')
     lines.append('')
     _hyb_keep = None
     try:
