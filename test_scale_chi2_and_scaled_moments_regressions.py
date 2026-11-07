@@ -14,6 +14,7 @@ Both failures are CPU-only, finite-input cases:
   space.
 """
 import math
+import sys
 
 import pytest
 
@@ -68,6 +69,45 @@ def test_chi2_tail_accepts_exact_integer_arguments_beyond_float64():
     assert L._gammaincc(huge, huge + 10 ** 300) == 0.0
     assert L._gammaincc(0.5, huge) == 0.0
     assert L._gammaincc(1000.0, huge) == 0.0
+
+
+def test_chi2_tail_keeps_the_standardised_gap_beyond_float64():
+    # Both arguments can be arbitrary-precision integers.  Their difference is
+    # then exact even though it cannot be converted to float; the tail at one
+    # standard deviation from the mode is ~0.159, not the saturated 0/1.
+    huge = 10 ** 400
+    sd = 10 ** 200                      # sqrt(huge)
+    for gap in (10 ** 200, 2 * sd, 10 ** 250):
+        z = gap / sd
+        upper = 0.5 * math.erfc(z / math.sqrt(2.0))
+        assert L._gammaincc(huge, huge + gap) == pytest.approx(
+            upper, rel=1e-12, abs=0.0), gap
+        assert L._gammaincc(huge, huge - gap) == pytest.approx(
+            1.0 - upper, rel=1e-12, abs=0.0), gap
+        assert L._gammaincc(huge + gap, huge) == pytest.approx(
+            1.0 - upper, rel=1e-12, abs=0.0), gap
+    # A float shape at the top of the float range and an integer statistic just
+    # beyond it: the gap is one, ~1e-154 sd, so the tail is still at the mode.
+    top = int(sys.float_info.max)
+    assert L._gammaincc(float(sys.float_info.max), top + 1) == 0.5
+    # The same near-mode precision for a huge int shape with a float statistic.
+    assert L._gammaincc(huge, 1e300) == 1.0
+
+
+def test_chi2_tail_without_the_special_function_does_not_loop_forever(monkeypatch):
+    # The fallback series needs O(sqrt(a)) terms.  If the special function is
+    # unavailable, a=1e15 would need ~1.6e9 iterations; use the normal limit
+    # that is already accurate well below float64 resolution at this shape.
+    def _nan_gammaincc(*_args, **_kwargs):
+        return L.torch.tensor(float('nan'), dtype=L.torch.float64)
+
+    monkeypatch.setattr(L.torch.special, 'gammaincc', _nan_gammaincc)
+    assert L._gammaincc(1e15, 1e15) == pytest.approx(0.5, abs=1e-8)
+    sd = math.sqrt(1e15)
+    assert L._gammaincc(1e15, 1e15 - sd) == pytest.approx(
+        0.8413447460685429, abs=1e-8)
+    assert L._gammaincc(1e15, 1e15 + sd) == pytest.approx(
+        0.15865525393145707, abs=1e-8)
 
 
 def test_scaled_root_recovers_an_overflowing_ss_times_multiplier():

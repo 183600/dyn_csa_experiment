@@ -29,6 +29,38 @@ def test_student_t_far_tail_keeps_a_representable_power_law_tail():
     assert L._student_t_sf(1e200, 2.0) == 0.0
 
 
+def test_student_t_with_both_arguments_beyond_float64_keeps_their_ratio():
+    # Each argument alone is unrepresentable, but the tail depends on
+    # t/sqrt(df): t=10**400 with df=10**800 is one normal standard deviation,
+    # not an infinite-t tail.  The ratio must be formed exactly.
+    huge = 10 ** 400
+    assert L._student_t_sf(huge, huge ** 2) == pytest.approx(
+        0.15865525393145707, abs=1e-15)
+    assert L._student_t_sf(-huge, huge ** 2) == pytest.approx(
+        0.8413447460685429, abs=1e-15)
+    assert L._student_t_sf(huge, 4 * huge ** 2) == pytest.approx(
+        0.3085375387259869, abs=1e-15)
+    # A ratio far above one still saturates to zero.
+    assert L._student_t_sf(huge, huge) == 0.0
+
+
+def test_two_sided_p_and_chi2_keep_exact_int_ratios_beyond_float64():
+    # The public wrappers must not turn both exact integers into +inf before
+    # _student_t_sf/_gammaincc can form their ratio.
+    huge = 10 ** 400
+    assert L.student_t_two_sided_p(huge, huge ** 2) == pytest.approx(
+        2.0 * 0.15865525393145707, abs=1e-15)
+    assert L.chi2_sf(huge, huge) == 0.5
+    gap = 10 ** 200                       # one standard deviation: sqrt(2*huge)
+    z = gap / (10 ** 200 * math.sqrt(2.0))
+    upper = 0.5 * math.erfc(z / math.sqrt(2.0))
+    assert L.chi2_sf(huge + gap, huge) == pytest.approx(upper, abs=1e-15)
+    assert L.chi2_sf(huge - gap, huge) == pytest.approx(1.0 - upper, abs=1e-15)
+    # The ordinary path is unchanged.
+    assert L.chi2_sf(3.841458820694124, 1.0) == pytest.approx(
+        0.05, abs=1e-12)
+
+
 def test_student_t_far_tail_tiny_df_limit_is_symmetric_half_mass():
     # df/2 underflows for the smallest positive df.  The tiny-shape limit puts
     # half the mass on each side at any finite t, so this is 0.5, not 0/1.

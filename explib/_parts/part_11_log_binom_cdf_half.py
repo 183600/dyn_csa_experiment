@@ -1014,6 +1014,48 @@ def interaction_practical_decision(deltas, *, margin=None, sesoi=None,
 # 则不能用 PPL 直接比较（需要 bits-per-byte 之类的归一化，见 design_notes
 # §22）。下列函数只做数学，不替调用方选择族或预注册方向。
 
+def _gamma_tail_saturating(a, x):
+    """Normal-limit ``Q(a,x)`` for shapes beyond the lgamma/torch range.
+
+    Gamma(a, 1) is concentrated at ``a`` with standard deviation
+    ``sqrt(a)``.  For the huge shapes this helper primarily targets the
+    O(1/sqrt(a)) skew correction is far below float64 resolution.  It is also
+    the fallback when the special function is unavailable at ``a >= 1e7``;
+    there the neglected correction is small (and still far preferable to the
+    O(sqrt(a))-term series).  The standardised gap is formed from exact
+    integer ratios rather than ``x - a``: both operands can be
+    arbitrary-precision integers (or a float shape next to an integer
+    statistic beyond float64), and converting either to float can overflow
+    even when the standardised gap is ordinary.
+    """
+    try:
+        if isinstance(a, numbers.Integral) and not isinstance(a, (bool, np.bool_)):
+            a_num, a_den = int(a), 1
+        else:
+            a_num, a_den = float(a).as_integer_ratio()
+        if isinstance(x, numbers.Integral) and not isinstance(x, (bool, np.bool_)):
+            x_num, x_den = int(x), 1
+        else:
+            x_num, x_den = float(x).as_integer_ratio()
+    except (TypeError, ValueError, OverflowError):
+        # No exact ratio: comparison still tells which saturated side we are
+        # on (the normal tail is 0/1/0.5 there).
+        if x == a:
+            return 0.5
+        return 0.0 if x > a else 1.0
+    # z = (x - a) / sqrt(a), with every integer kept exact until the final
+    # scaled division.  ``_int_over_sqrt`` divides before converting, so the
+    # standardised value stays ordinary even when x-a or a does not fit.
+    diff_num = x_num * a_den - a_num * x_den
+    # x - a = diff_num/(x_den*a_den); sqrt(a) = sqrt(a_num/a_den).
+    # z = diff_num / sqrt(a_num * a_den * x_den**2).
+    z = _int_over_sqrt(diff_num, a_num * a_den * x_den * x_den)
+    if math.isnan(z):
+        return float('nan')
+    q = 0.5 * math.erfc(z / math.sqrt(2.0))
+    return float(min(1.0, max(0.0, q)))
+
+
 def _gammaincc(a, x):
     """正则化上不完全伽马 Q(a,x)，用于 Cochran Q 的卡方尾概率。"""
     # ``x != x`` is the NaN test that also works for an arbitrary-precision
@@ -1033,22 +1075,11 @@ def _gammaincc(a, x):
     try:
         x_finite = math.isfinite(x)
     except OverflowError:
-        # An exact integer beyond float64.  For a finite float shape it is
-        # effectively +inf, but when both arguments are arbitrary-precision
-        # integers their difference can be tiny relative to the gamma sd
-        # sqrt(a), so compare the gap in log space before saturating.
-        if x == a:
-            return 0.5
-        near_mode = False
-        try:
-            gap = abs(x - a)
-            near_mode = (gap > 0
-                         and math.log(gap) <= 0.5 * math.log(a))
-        except (OverflowError, TypeError, ValueError):
-            near_mode = False
-        if near_mode:
-            return 0.5
-        return 1.0 if x < a else 0.0
+        # An exact integer beyond float64.  The standardised gap can still be
+        # ordinary (or zero) when the shape is comparably large, so evaluate
+        # the normal limit from exact integer ratios rather than saturating
+        # on the raw comparison.
+        return _gamma_tail_saturating(a, x)
     if not x_finite:
         return float('nan')
     if x == 0.0:
@@ -1068,17 +1099,19 @@ def _gammaincc(a, x):
             _q = float('nan')
         if math.isfinite(_q):
             return float(min(1.0, max(0.0, _q)))
+        # The series below needs O(sqrt(a)) terms.  At planning scales that is
+        # an unbounded loop if the special function is unavailable; the gamma
+        # law is already normal to well below float64 resolution here.
+        if a >= 1e7:
+            return _gamma_tail_saturating(a, x)
     try:
         gln = math.lgamma(a)
     except OverflowError:
         # Beyond a ~4e305 the log-gamma itself is not representable.  The
-        # Gamma(a,1) law is then concentrated at a with sd=sqrt(a); one
-        # float64 ulp in x is already ~2**-52*a / sqrt(a) standard
-        # deviations, which is astronomically large at this scale.  The tail
-        # therefore saturates to 0/1 except exactly at the mode.
-        if x == a:
-            return 0.5
-        return 1.0 if x < a else 0.0
+        # Gamma(a,1) law is then concentrated at a with sd=sqrt(a); keep the
+        # exact standardised gap so a statistic one integer away from the
+        # mode is still 0.5 instead of being saturated by the raw comparison.
+        return _gamma_tail_saturating(a, x)
     if x < a + 1.0:
         ap = float(a)
         s = 1.0 / a
@@ -1766,6 +1799,22 @@ def _student_t_sf_large_df(z, df):
 
 def _student_t_sf(t, df):
     """Student t 的上尾概率 P(T >= t)。"""
+    # When BOTH arguments are exact integers beyond float64, ``_dist_real``
+    # maps each to +inf independently and loses their ratio.  The limit is
+    # then T ~ N(0, 1) evaluated at t/sqrt(df): e.g. t=10**400 with
+    # df=10**800 is one normal standard deviation (~0.159), not an infinite
+    # statistic's zero.  Keep the ratio in the exact integer domain and divide
+    # before converting.
+    if (isinstance(t, numbers.Integral)
+            and not isinstance(t, (bool, np.bool_))
+            and isinstance(df, numbers.Integral)
+            and not isinstance(df, (bool, np.bool_))):
+        t_int, df_int = int(t), int(df)
+        _fmax = sys.float_info.max
+        if df_int > 0 and (abs(t_int) > _fmax and df_int > _fmax):
+            z = _int_over_sqrt(abs(t_int), df_int)
+            tail = 0.5 * math.erfc(z / math.sqrt(2.0))
+            return float(tail if t_int >= 0 else 1.0 - tail)
     t = _dist_real(t)
     df = _dist_real(df)
     if t is None or df is None or not (df > 0.0) or math.isnan(t):
@@ -1824,11 +1873,21 @@ def _student_t_sf(t, df):
 
 def student_t_two_sided_p(t, df):
     """双侧 Student t 检验 p 值（小样本斜率/交互推断用）。"""
-    t = _dist_real(t)
-    df = _dist_real(df)
-    if t is None or df is None:
+    t_real = _dist_real(t)
+    df_real = _dist_real(df)
+    if t_real is None or df_real is None:
         return float('nan')
-    sf = _student_t_sf(abs(t), df)
+    # Do not collapse two exact integers to +inf before forming their ratio;
+    # _student_t_sf has an exact-int branch for that scale (t/sqrt(df)).
+    if (isinstance(t, numbers.Integral)
+            and not isinstance(t, (bool, np.bool_))
+            and isinstance(df, numbers.Integral)
+            and not isinstance(df, (bool, np.bool_))
+            and abs(int(t)) > sys.float_info.max
+            and int(df) > sys.float_info.max):
+        sf = _student_t_sf(abs(int(t)), int(df))
+    else:
+        sf = _student_t_sf(abs(t_real), df_real)
     if not math.isfinite(sf):
         return float('nan')
     return float(min(1.0, 2.0 * sf))
@@ -1918,6 +1977,22 @@ def _t_critical_alpha(alpha, df):
 
 def chi2_sf(x, df):
     """卡方分布上尾概率 P(chi2_df >= x)（Cochran Q 用）。"""
+    # Two exact integers beyond float64 cannot be compared after _dist_real
+    # maps both to +inf: the tail depends on (x-df)/sqrt(2*df).  Keep that
+    # ratio exact so x=df=10**400 is the mode (~0.5), not an "infinite
+    # statistic" with tail zero.
+    if (isinstance(x, numbers.Integral)
+            and not isinstance(x, (bool, np.bool_))
+            and isinstance(df, numbers.Integral)
+            and not isinstance(df, (bool, np.bool_))):
+        x_int, df_int = int(x), int(df)
+        _fmax = sys.float_info.max
+        if df_int > 0 and (abs(x_int) > _fmax or df_int > _fmax):
+            if x_int <= 0:
+                return 1.0
+            z = _int_over_sqrt(x_int - df_int, 2 * df_int)
+            q = 0.5 * math.erfc(z / math.sqrt(2.0))
+            return float(min(1.0, max(0.0, q)))
     x = _dist_real(x)
     df = _dist_real(df)
     if x is None or df is None or not (df > 0.0) or math.isnan(x):
