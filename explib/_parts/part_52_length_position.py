@@ -160,7 +160,16 @@ def _lpd_stats(values, *, alpha, min_seeds, seeds):
         raise ValueError(
             f'paired readout is misaligned: {len(values)} values but '
             f'{len(seeds)} seed labels')
-    d = np.asarray([float(x) for x in values], dtype=float)
+    try:
+        d = np.asarray([float(x) for x in values], dtype=float)
+    except (TypeError, ValueError, OverflowError):
+        # An exact integer beyond float64 has no float spelling.  The readout
+        # already represents an unrepresentable moment as None; keep that
+        # fail-closed contract instead of aborting the whole analysis.
+        return {'n': len(values), 'mean': None, 'std': None, 'ci95': None,
+                'p_exact_signflip': None, 'p_floor': None, 'direction': None,
+                'significant': False, 'status': 'not_estimable',
+                'seeds': [int(s) for s in seeds]}
     n = int(d.size)
     if n == 0:
         return {'n': 0, 'mean': None, 'std': None, 'ci95': None,
@@ -250,9 +259,24 @@ def _lpd_max_band_signflip(band_rows, *, alpha):
         return {'status': 'not_estimable',
                 'reason': 'fewer than two common seeds across bands',
                 'n_bands': len(band_rows)}
-    D = np.asarray([[float(next(item['log_ratio'] for item in row['per_seed']
-                              if item['seed'] == s)) for s in seeds]
-                    for row in band_rows], dtype=float)
+    _raw = [[next(item['log_ratio'] for item in row['per_seed']
+                  if item['seed'] == s) for s in seeds]
+            for row in band_rows]
+    try:
+        D = np.asarray(_raw, dtype=float)
+    except (TypeError, ValueError, OverflowError):
+        # The score statistic is invariant to a positive row rescaling, so an
+        # exact integer log ratio can enter the float arithmetic after its row
+        # is divided by the exact maximum magnitude (the same rule as the
+        # family max-T matrix helper).  A genuinely unrepresentable entry is
+        # reported through this function's existing not_estimable verdict.
+        try:
+            D = _fc_matrix_float(_raw)
+        except (TypeError, ValueError, OverflowError):
+            return {'status': 'not_estimable',
+                    'reason': ('at least one band log ratio cannot be '
+                               'represented as a finite float'),
+                    'n_bands': len(band_rows)}
     if not np.all(np.isfinite(D)):
         return {'status': 'not_estimable',
                 'reason': ('at least one band log ratio is not finite, so the '

@@ -546,7 +546,16 @@ def _production_loop_sanity_check_impl(variant='full', *, seed=0, steps=150, lr=
             losses = []
             opt = {}
         else:
-            losses = [float(v) for v in (rec.get('losses') or [])]
+            losses = []
+            for _v in (rec.get('losses') or []):
+                if isinstance(_v, bool):
+                    continue
+                try:
+                    losses.append(float(_v))
+                except (TypeError, ValueError, OverflowError):
+                    # An exact integer beyond float64 cannot enter the loss
+                    # curve; skip it instead of aborting the replay.
+                    continue
             x = torch.from_numpy(np.tile(window[:-1], (batch_size, 1))).to(device)
             y = torch.from_numpy(np.tile(window[1:], (batch_size, 1))).to(device)
             try:

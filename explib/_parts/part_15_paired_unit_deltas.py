@@ -365,11 +365,23 @@ def unit_precision_design(n_units, *, pilot_unit_deltas=None,
             target_halfwidth_value = None
     out['target_halfwidth'] = target_halfwidth_value
     half = None
+    # A legal exact unit count can exceed float64 even though the precision
+    # readout is still well defined in the normal (df -> infinity) limit.
+    # Convert the degrees of freedom defensively; the count itself stays an
+    # exact integer for the report.
+    try:
+        _n_df = float(n) - 1.0 if n is not None else None
+    except (OverflowError, TypeError, ValueError):
+        _n_df = float('inf')
+    try:
+        _n_sqrt = math.sqrt(n) if n is not None else None
+    except (OverflowError, TypeError, ValueError):
+        _n_sqrt = float('inf')
     if sd is not None and a is not None and n is not None:
-        tc = _t_critical_alpha(a, float(n) - 1.0)
+        tc = _t_critical_alpha(a, _n_df)
         if math.isfinite(tc):
             try:
-                half = float(tc * sd / math.sqrt(n))
+                half = float(tc * sd / _n_sqrt)
             except (OverflowError, ValueError):
                 half = None
             if half is not None and not math.isfinite(half):
@@ -377,7 +389,7 @@ def unit_precision_design(n_units, *, pilot_unit_deltas=None,
                 # half-width is representable for a large n.  Reorder the
                 # division before the multiplication on that extreme path.
                 try:
-                    half = float((sd / math.sqrt(n)) * tc)
+                    half = float((sd / _n_sqrt) * tc)
                 except (OverflowError, ValueError):
                     half = None
                 if half is not None and not math.isfinite(half):
@@ -403,13 +415,19 @@ def unit_precision_design(n_units, *, pilot_unit_deltas=None,
                     f'{target_halfwidth_value!r}')
     if sd is not None and tp is not None and a is not None and n is not None:
         ze = float(_normal_quantile(tp))
-        tc = _t_critical_alpha(a, float(n) - 1.0)
-        mde = ((tc + ze) * sd / math.sqrt(n)) if math.isfinite(tc) else None
+        tc = _t_critical_alpha(a, _n_df)
+        if math.isfinite(tc):
+            try:
+                mde = (tc + ze) * sd / _n_sqrt
+            except (OverflowError, ValueError):
+                mde = None
+        else:
+            mde = None
         if mde is not None and not math.isfinite(mde):
             # Same intermediate-overflow pattern as the CI: at a large n the
             # final MDE can be representable even when (tc+ze)*sd is not.
             try:
-                mde = float((sd / math.sqrt(n)) * (tc + ze))
+                mde = float((sd / _n_sqrt) * (tc + ze))
             except (OverflowError, ValueError):
                 mde = None
             if mde is not None and not math.isfinite(mde):

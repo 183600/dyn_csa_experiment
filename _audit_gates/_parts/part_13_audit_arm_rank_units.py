@@ -17,11 +17,10 @@ def _aru_axis_coherent(axis, *, arms, key):
         return False, f'{key}.p_best does not cover exactly the stored arms'
     vals = []
     for arm in arms:
-        v = pb[arm]
-        if (isinstance(v, bool) or not isinstance(v, (int, float))
-                or not math.isfinite(float(v)) or not 0.0 <= float(v) <= 1.0):
+        v = _finite_number(pb[arm])
+        if v is None or not 0.0 <= v <= 1.0:
             return False, f'{key}.p_best[{arm!r}] is not a probability'
-        vals.append(float(v))
+        vals.append(v)
     # With competition ranks several arms can share rank 1 in one replicate,
     # so the arm-wise probabilities sum to the expected number of (possibly
     # tied) winners: at least 1 and at most K.  Requiring exactly 1 would
@@ -161,13 +160,12 @@ def audit_arm_rank_units(path=None):
         out['problems'].append(f'arm_rank_units.better {better!r} is not min/max')
     levels = {}
     for key in ('unit_level', 'seed_level', 'lead_level'):
-        v = rk.get(key)
-        if (isinstance(v, bool) or not isinstance(v, (int, float))
-                or not math.isfinite(float(v)) or not 0.0 <= float(v) <= 1.0):
+        v = _finite_number(rk.get(key))
+        if v is None or not 0.0 <= v <= 1.0:
             out['status'] = 'fail'
             out['problems'].append(f'arm_rank_units.{key} is not a probability')
         else:
-            levels[key] = float(v)
+            levels[key] = v
 
     # Rebuild the nested input from the block's own raw matrices.
     unit_ids = rk.get('unit_ids')

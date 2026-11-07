@@ -186,13 +186,90 @@ def signflip(deltas):
     # enumeration up to n=20, exact meet-in-the-middle up to n=40, and a
     # deterministic normal approximation beyond that.  This keeps the result
     # poolable with the exact p-values used by the other panels.
-    r = L.exact_signflip_p([float(x) for x in np.asarray(deltas, dtype=float).reshape(-1)])
+    # Flatten without a float pre-cast: the delegate already drops a scalar it
+    # cannot represent and reports ``n_dropped``; converting the whole array
+    # to float here would abort before that documented contract runs.
+    try:
+        values = np.asarray(deltas, dtype=object).reshape(-1).tolist()
+    except (TypeError, ValueError):
+        values = list(deltas)
+    r = L.exact_signflip_p(values)
     if r.get('method') == 'none':
         return None
     return r['p']
 
+
+def _sample_std_exact_integral(values):
+    """Sample SD of exact integers, computed without a float conversion."""
+    ints = []
+    for value in values:
+        if isinstance(value, (bool, np.bool_)) or not isinstance(
+                value, (int, np.integer)):
+            return None
+        ints.append(int(value))
+    n = len(ints)
+    if n < 2:
+        return None
+    total = sum(ints)
+    numerator = n * sum(x * x for x in ints) - total * total
+    if numerator <= 0:
+        return 0.0
+    denominator = n * (n - 1)
+    try:
+        from decimal import Decimal, localcontext
+        with localcontext() as ctx:
+            ctx.prec = 50
+            return float((Decimal(numerator) / Decimal(denominator)).sqrt())
+    except (ArithmeticError, TypeError, ValueError):
+        return float('nan')
+
+
+def _sample_std_1d(values):
+    """Fallback sample SD for a panel the ordinary float path cannot hold."""
+    exact = _sample_std_exact_integral(values)
+    if exact is not None:
+        return exact
+    finite = []
+    for value in values:
+        f = L._finite_scalar(value)
+        if f is not None:
+            finite.append(f)
+    if len(finite) <= 1:
+        return float('nan')
+    arr = np.asarray(finite, dtype=float)
+    _ms = L._scaled_mean_std_if_extreme(arr, ddof=1)
+    return float(_ms[1]) if _ms is not None else float(np.std(arr, ddof=1))
+
+
+def _sample_std_object(deltas, axis):
+    """``sample_std`` path for inputs with an unrepresentable scalar."""
+    obj = np.asarray(deltas, dtype=object)
+    if axis is None:
+        return _sample_std_1d(obj.reshape(-1).tolist())
+    if not isinstance(axis, (int, np.integer)):
+        raise TypeError(f'axis must be an integer, got {axis!r}')
+    axis = int(axis)
+    if axis < 0:
+        axis += obj.ndim
+    if not (0 <= axis < obj.ndim):
+        raise ValueError(
+            f'axis {axis} is out of bounds for an array with '
+            f'{obj.ndim} dimension(s)')
+    out_shape = obj.shape[:axis] + obj.shape[axis + 1:]
+    if obj.shape[axis] < 2:
+        return np.full(out_shape, np.nan)
+    srt = np.moveaxis(obj, axis, 0).reshape(obj.shape[axis], -1)
+    out = np.full(srt.shape[1], np.nan)
+    for j in range(srt.shape[1]):
+        out[j] = _sample_std_1d(srt[:, j].tolist())
+    return out.reshape(out_shape)
+
+
 def sample_std(deltas, axis=None):
-    d = np.asarray(deltas, dtype=float)
+    try:
+        d = np.asarray(deltas, dtype=float)
+    except (TypeError, ValueError, OverflowError):
+        return _sample_std_object(deltas, axis)
     if axis is None:
         # When nothing is non-finite, d[np.isfinite(d)] is a copy of the same
         # values in the same order, so np.std on `d` directly is

@@ -466,7 +466,13 @@ def classify_training_health(history, *, tail_k=4, slope_tol=None, gap_tol=None)
         train_tol = max(1e-5, 2.0 * train_se) if train_se is not None else 1e-5
         val_tol = max(1e-5, 2.0 * val_se) if val_se is not None else 1e-5
     else:
-        train_tol = val_tol = float(slope_tol)
+        try:
+            train_tol = val_tol = float(slope_tol)
+        except (TypeError, ValueError, OverflowError):
+            # A finite numeric tolerance beyond float64 means "never treat a
+            # finite slope as significant", i.e. an infinite threshold.  Do
+            # not abort curve classification on a legal numeric argument.
+            train_tol = val_tol = float('inf')
     # The docstring promises ``val_ce`` OR ``val_ppl``.  Derive a PPL from CE
     # only when the PPL field is absent/None: an explicitly recorded NaN/inf
     # PPL is a measured failure and must not be papered over by the CE twin.
@@ -1571,10 +1577,20 @@ def _nll_doc_ci(nll_per_row, n_tokens_per_row):
     def _parse_pair(nll, ntok):
         if isinstance(nll, (bool, np.bool_)) or isinstance(ntok, (bool, np.bool_)):
             return None
-        try:
-            nll = float(nll)
-        except (TypeError, ValueError, OverflowError):
-            return None
+        # Keep an exact integer NLL exact.  Converting it to float first
+        # silently dropped a finite measurement beyond float64 (and with it
+        # the row's token count) even though the pooled CE can still be
+        # representable after cancellation or against a huge token total.
+        # Non-integral values keep the historical float conversion.
+        if isinstance(nll, numbers.Integral):
+            nll = int(nll)
+        else:
+            try:
+                nll = float(nll)
+            except (TypeError, ValueError, OverflowError):
+                return None
+            if not math.isfinite(nll):
+                return None
         # Token counts are exact integers.  A fractional count would silently
         # change the pooled denominator if int() truncated it.
         try:
@@ -1596,13 +1612,15 @@ def _nll_doc_ci(nll_per_row, n_tokens_per_row):
                 ntok = int(nf)
         except (TypeError, ValueError, OverflowError):
             return None
-        if ntok <= 0 or not math.isfinite(nll):
+        if ntok <= 0:
+            return None
+        if not isinstance(nll, numbers.Integral) and not math.isfinite(nll):
             return None
         return nll, ntok
 
     pairs = []
     doc_ce = []
-    total_nll = 0.0
+    total_nll = 0
     total_tok = 0
     for nll, ntok in zip(_nll, _ntok):
         pair = _parse_pair(nll, ntok)
@@ -1613,7 +1631,12 @@ def _nll_doc_ci(nll_per_row, n_tokens_per_row):
         # historical behaviour) changed the pooled denominator, so one huge
         # low-NLL document could turn a PPL near 1 into a fabricated 0.
         pairs.append(pair)
-        total_nll += pair[0]
+        try:
+            total_nll = total_nll + pair[0]
+        except (OverflowError, TypeError):
+            # A mixed huge-int/float panel has no float accumulator.  The
+            # exact-rational fallback below still sees every pair.
+            total_nll = None
         total_tok += pair[1]
         ratio = _safe_float_ratio(pair[0], pair[1])
         if ratio is not None:
@@ -1626,10 +1649,16 @@ def _nll_doc_ci(nll_per_row, n_tokens_per_row):
                 'doc_ce_mean': None, 'doc_ce_sem': None,
                 'ppl_ci95_low': None, 'ppl_ci95_high': None,
                 'n_docs': len(pairs)}
-    if not math.isfinite(total_nll):
+    try:
+        _total_finite = total_nll is not None and math.isfinite(total_nll)
+    except (TypeError, ValueError, OverflowError):
+        # An exact integer total beyond float64 is finite as an integer but
+        # has no float spelling; the Fraction fallback below handles it.
+        _total_finite = False
+    if not _total_finite:
         try:
             total_nll = math.fsum(p[0] for p in pairs)
-        except (OverflowError, ValueError):
+        except (OverflowError, ValueError, TypeError):
             total_nll = None
     ce = (_safe_float_ratio(total_nll, total_tok)
           if total_nll is not None else None)
@@ -1902,6 +1931,18 @@ def _nll_row_ce(matrix, total_tokens):
         except (TypeError, ValueError, OverflowError, IndexError):
             return np.asarray(float('nan'))
         return np.full(n_rows, np.nan)
+    # An empty sequence is a valid empty row set, not a one-dimensional array
+    # that ``sum(axis=1)`` rejects.  A single row passed without its outer
+    # list is accepted as that one row; a true 3-D input is not a row matrix.
+    if arr.ndim == 0:
+        arr = arr.reshape(1, 1)
+    elif arr.ndim == 1:
+        if arr.size == 0:
+            return np.asarray([], dtype=float)
+        arr = arr.reshape(1, -1)
+    elif arr.ndim > 2:
+        raise ValueError(
+            f'_nll_row_ce: matrix must be at most 2-D, got shape {arr.shape}')
     with np.errstate(over='ignore', invalid='ignore'):
         sums = arr.sum(axis=1)
     try:

@@ -104,6 +104,14 @@ def _es_float(value):
     return out if math.isfinite(out) else None
 
 
+def _es_label(value):
+    """Display key for an arm label, without an unbounded ``str()``."""
+    try:
+        return str(value)
+    except (ValueError, MemoryError):
+        return _safe_repr(value)
+
+
 def _es_diff(a, b):
     """``a - b`` as a finite float, or ``None`` when the result overflows."""
     try:
@@ -449,7 +457,7 @@ def endpoint_headroom(endpoint=None, control_level=None, *, arm_levels=None,
                         f'arm_levels[{name!r}]={value!r} is not a finite '
                         'number and was dropped')
                 else:
-                    levels[str(name)] = f
+                    levels[_es_label(name)] = f
     if control_level is not None:
         f = _es_float(control_level)
         if f is None:

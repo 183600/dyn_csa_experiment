@@ -518,8 +518,11 @@ def merge_long_aggregate(adir, snapshot_agg):
             _partial_overlap = bool(_overlap and not _fresh_covers)
             for _f in ('avg_dyn_block_len', 'avg_block_len', 'boundary_f1_dyn', 'boundary_excess_dyn', 'delta_logit_mean', 'tokens_per_step'):
                 _vo, _vn = (sentry.get(_f), fentry.get(_f))
-                _vn_ok = isinstance(_vn, (int, float)) and (not isinstance(_vn, bool)) and math.isfinite(_vn)
-                _vo_ok = isinstance(_vo, (int, float)) and (not isinstance(_vo, bool)) and math.isfinite(_vo)
+                # A finite exact integer beyond float64 is not a usable
+                # secondary mean (and ``math.isfinite`` raises on it); route
+                # both sides through the library's guarded scalar predicate.
+                _vn_ok = L._finite_scalar(_vn) is not None
+                _vo_ok = L._finite_scalar(_vo) is not None
                 if not _vn_ok:
                     continue
                 if _partial_overlap:

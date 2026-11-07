@@ -280,7 +280,20 @@ def _ar_deltas(specs, pattern, *, n_seeds, omitted=(), strong=None,
 def _ar_direction_ok(deltas, expected_sign):
     if expected_sign is None or not deltas:
         return None
-    mean = float(sum(deltas)) / float(len(deltas))
+    try:
+        mean = float(sum(deltas)) / float(len(deltas))
+    except (OverflowError, TypeError, ValueError, ZeroDivisionError):
+        # A finite exact-integer delta beyond float64 (or a mixed huge-int /
+        # float panel) has no float sum even though the sign of the mean is
+        # exactly defined.  Decide that sign in the rational domain.
+        from fractions import Fraction as _Fraction
+        try:
+            total = sum((_Fraction(x) for x in deltas), _Fraction(0, 1))
+        except (TypeError, ValueError, OverflowError, ZeroDivisionError):
+            return False
+        if total == 0:
+            return False
+        return bool((total > 0) == (expected_sign == 'positive'))
     if mean == 0.0:
         return False
     return bool((mean > 0.0) == (expected_sign == 'positive'))

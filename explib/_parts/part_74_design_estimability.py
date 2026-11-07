@@ -137,6 +137,19 @@ def _de_text(value):
     return None
 
 
+def _de_label(value):
+    """String label for a manifest arm/seed without an unbounded ``str()``."""
+    if isinstance(value, numbers.Integral) and not _de_is_bool(value):
+        text = _de_text(value)
+        if text is None:
+            raise ValueError('integer label is empty')
+        return text
+    try:
+        return str(value)
+    except (ValueError, MemoryError):
+        return _safe_repr(value)
+
+
 def _de_int(value, *, minimum=None):
     if _de_is_bool(value):
         return None
@@ -1490,9 +1503,9 @@ def design_estimability_from_manifest(
         raise TypeError('manifest must be an object')
     raw_arms = manifest.get('arms')
     raw_seeds = manifest.get('seeds')
-    arms = [str(a) for a in raw_arms] if isinstance(
+    arms = [_de_label(a) for a in raw_arms] if isinstance(
         raw_arms, (list, tuple)) else []
-    seeds = [str(s) for s in raw_seeds] if isinstance(
+    seeds = [_de_label(s) for s in raw_seeds] if isinstance(
         raw_seeds, (list, tuple)) else []
     comparisons = []
     raw_comparisons = manifest.get('primary_comparisons')

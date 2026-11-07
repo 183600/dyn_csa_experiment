@@ -58,12 +58,13 @@ CONTRAST_NETWORK_POLICY = {
 
 def _cn_node_id(arm, tag):
     """Stable node id for an (arm, protocol tag) pair."""
-    return str(arm) if not tag else '%s::%s' % (str(arm), str(tag))
+    return (_cn_label(arm) if not tag
+            else '%s::%s' % (_cn_label(arm), _cn_label(tag)))
 
 
 def _cn_tag(entry, side):
     raw = entry.get('tag_%s' % side)
-    return '' if raw is None else str(raw)
+    return '' if raw is None else _cn_label(raw)
 
 
 def _cn_same(a, b, tol):
@@ -93,6 +94,19 @@ def _cn_json_safe(value):
         return str(value)
     except Exception:  # pragma: no cover - __str__ on an exotic object
         return repr(type(value))
+
+
+def _cn_label(value):
+    """A component/arm label that survives an unrepresentable integer.
+
+    Component descriptors are only used as display keys, so an exact integer
+    beyond CPython's decimal-conversion limit must not abort the whole audit.
+    A real string keeps its text; an unprintable value is named by type.
+    """
+    try:
+        return str(value)
+    except (ValueError, MemoryError):
+        return _safe_repr(value)
 
 
 def _cn_entries(entries):
@@ -587,8 +601,9 @@ def contrast_network_audit(entries, *, reference_arm=None, alpha=0.05, min_n=3):
             continue
         if edge.get('kind') not in (None, 'component'):
             continue
-        info = declared.setdefault(str(comp), {'nodes': set(), 'clean_nodes': set(),
-                                               'clean_edges': set()})
+        info = declared.setdefault(_cn_label(comp),
+                                   {'nodes': set(), 'clean_nodes': set(),
+                                    'clean_edges': set()})
         info['nodes'].update((edge['node_with'], edge['node_without']))
         eid = _cn_edge_id(edge)
         if eid in clean:

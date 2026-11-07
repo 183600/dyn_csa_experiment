@@ -385,7 +385,14 @@ def _ls_reference_weights(reference, strata, total_tokens):
         if total is None or not (_ls_math.isfinite(total) and total > 0.0):
             _need_exact = True
         else:
-            return 'custom', [w / total for w in weights]
+            normalised = [w / total for w in weights]
+            # A positive weight whose share underflows to 0.0 would silently
+            # drop that stratum from the reference distribution.  Fall
+            # through to the exact branch, which either recovers a positive
+            # share or refuses the reference explicitly.
+            if all(_ls_math.isfinite(x) and x > 0.0 for x in normalised):
+                return 'custom', normalised
+            _need_exact = True
     # Exact normalisation for huge/tiny rational weights and for a float sum
     # that overflows even though each normalised weight is representable.
     from fractions import Fraction as _Fraction

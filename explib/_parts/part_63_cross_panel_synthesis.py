@@ -75,6 +75,14 @@ def _cps_finite_or_none(value):
     return number if math.isfinite(number) else None
 
 
+def _cps_label(value):
+    """JSON object key for a panel/component label of any declared type."""
+    try:
+        return str(value)
+    except (ValueError, MemoryError):
+        return _safe_repr(value)
+
+
 def _cps_in_names(value, name):
     """Whether ``name`` is listed in a report's component-name sequence."""
     if not isinstance(value, (list, tuple, set, frozenset)):
@@ -412,7 +420,7 @@ def _cps_leave_one_out(points, *, alpha, min_n, full_mean):
     for i, p in enumerate(_work_points):
         rest = _work_points[:i] + _work_points[i + 1:]
         if len(rest) < 2:
-            out[str(p.get('label'))] = {'status': 'insufficient_panels'}
+            out[_cps_label(p.get('label'))] = {'status': 'insufficient_panels'}
             continue
         meta = _cps_pool(rest, alpha=alpha, min_n=min_n,
                          pair_detail_limit=0,
@@ -426,7 +434,7 @@ def _cps_leave_one_out(points, *, alpha, min_n, full_mean):
             if mean is None:
                 mean = fe_block.get('mean')
             mean = _cps_finite_or_none(mean)
-        out[str(p.get('label'))] = {
+        out[_cps_label(p.get('label'))] = {
             'status': meta.get('status'),
             'pooled_mean': mean,
             'same_sign_as_full': (None if mean is None
@@ -556,19 +564,19 @@ def cross_panel_synthesis(reports, design=None, *, alpha=0.05, min_n=3,
     # JSON object keys are strings, and a mixed int/str panel mapping made
     # `sorted(reports)` raise before any analysis.  Normalise the public
     # boundary once so every downstream label/audit lookup uses the same key.
-    design = {str(k): v for k, v in design.items()}
+    design = {_cps_label(k): v for k, v in design.items()}
     if not isinstance(reports, dict):
         reports = {}
     else:
-        reports = {str(k): _normalise_component_report(v)
+        reports = {_cps_label(k): _normalise_component_report(v)
                    for k, v in reports.items()}
     if components is None:
         wanted = set(design)
     elif isinstance(components, (str, bytes, bytearray)):
-        wanted = {str(components)}
+        wanted = {_cps_label(components)}
     else:
         try:
-            wanted = {str(c) for c in components}
+            wanted = {_cps_label(c) for c in components}
         except TypeError:
             raise ValueError(
                 'components must be an iterable of names or a single name, '
@@ -615,7 +623,7 @@ def cross_panel_synthesis(reports, design=None, *, alpha=0.05, min_n=3,
         declared_pairs = []
         for spec in contrasts:
             if isinstance(spec, (list, tuple)) and len(spec) >= 2:
-                declared_pairs.append((str(spec[0]), str(spec[1])))
+                declared_pairs.append((_cps_label(spec[0]), _cps_label(spec[1])))
         # A component not declared with a machine-readable arm pair is still
         # reported from what the panels actually measured, so an older design
         # table cannot hide a contrast.

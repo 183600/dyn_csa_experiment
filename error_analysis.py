@@ -213,20 +213,32 @@ def _print_bad_cases(res, *, n_tokens=10, n_sequences=3):
     print('[errors] Read the context and label before acting: annotation error, genuine ambiguity and a model blind spot need different fixes.\n')
 
 
+def _finite_text_number(value):
+    """Finite float for report formatting, or None for anything else."""
+    if isinstance(value, (bool, np.bool_)) or not isinstance(
+            value, (int, float, np.integer, np.floating)):
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return out if math.isfinite(out) else None
+
+
 def _ci_text(ci, fmt='{:+.3f}'):
-    if (not isinstance(ci, (list, tuple)) or len(ci) != 2
-            or not all(isinstance(x, (int, float)) and not isinstance(x, bool)
-                       and math.isfinite(float(x)) for x in ci)):
+    if not isinstance(ci, (list, tuple)) or len(ci) != 2:
         return 'n/a'
-    return '[' + ', '.join(fmt.format(float(x)) for x in ci) + ']'
+    values = [_finite_text_number(x) for x in ci]
+    if any(value is None for value in values):
+        return 'n/a'
+    return '[' + ', '.join(fmt.format(value) for value in values) + ']'
 
 
 def _num_text(value, fmt='{:+.3f}'):
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    number = _finite_text_number(value)
+    if number is None:
         return 'n/a'
-    if not math.isfinite(float(value)):
-        return 'n/a'
-    return fmt.format(float(value))
+    return fmt.format(number)
 
 
 def _render_paired_bucket_inference(paired):

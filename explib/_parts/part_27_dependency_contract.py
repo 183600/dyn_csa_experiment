@@ -1038,7 +1038,20 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reprodu
                     continue
                 _curves = _cell_curve_data(outdir, rec)
                 _losses = rec.get('losses') if isinstance(rec.get('losses'), list) else (_curves.get('losses') if isinstance(_curves.get('losses'), list) else [])
-                _loss_nums = [float(x) for x in _losses if isinstance(x, (int, float)) and not isinstance(x, bool)]
+                # Keep NaN/inf exactly as recorded (they are explicit
+                # measurement failures), but skip a scalar that has no float
+                # spelling at all -- an exact integer beyond float64 used to
+                # abort the whole manifest write.
+                _loss_nums = []
+                for _x in _losses:
+                    if (isinstance(_x, bool)
+                            or not isinstance(_x, (int, float, np.integer,
+                                                   np.floating))):
+                        continue
+                    try:
+                        _loss_nums.append(float(_x))
+                    except (TypeError, ValueError, OverflowError):
+                        continue
                 _ph = rec.get('ppl_history') if isinstance(rec.get('ppl_history'), list) else (_curves.get('ppl_history') if isinstance(_curves.get('ppl_history'), list) else [])
                 if not _losses and rec.get('curve_n_points') is not None:
                     _loss_nums = []
