@@ -553,6 +553,29 @@ def test_unpaired_doc_ci_supports_token_totals_beyond_float64():
     json.dumps(got, allow_nan=False)
 
 
+def test_unpaired_doc_ci_keeps_underflowing_rows_in_the_token_denominator():
+    # A per-document CE can underflow while the token-pooled CE is
+    # representable.  The row's tokens still belong to that pooled
+    # denominator: dropping them divided the sibling NLL by only 3 tokens
+    # instead of ~1e15 and fabricated a divergent PPL.  The per-document
+    # mean/SEM may omit the underflowing row, but the primary pooled estimate
+    # and n_docs must not.
+    nll = [12000.0, 80000.0, 1e-320]
+    tok = [2, 1, 10 ** 15]
+    got = L._nll_doc_ci(nll, tok)
+    assert got is not None, got
+    assert got['n_docs'] == 3, got
+    expected_ce = 92000.0 / (10 ** 15 + 3)
+    assert got['ppl'] > 0.0, got
+    assert math.isclose(got['ppl'], math.exp(expected_ce),
+                        rel_tol=0.0, abs_tol=1e-15), got
+    # The pooled point estimate is on the same token-pooled estimand as the
+    # cluster interval, which includes every valid document.
+    if got['ppl_ci95_low'] is not None:
+        assert got['ppl_ci95_low'] <= got['ppl'] <= got['ppl_ci95_high'], got
+    json.dumps(got, allow_nan=False)
+
+
 def test_paired_doc_ci_supports_token_totals_beyond_float64():
     # The token total (3e400) is not representable, but the pooled log ratio
     # (1e300 / 1e400 = 1e-100) is.  The exact-rational fallback must keep the

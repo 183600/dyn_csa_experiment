@@ -1573,19 +1573,24 @@ def _nll_doc_ci(nll_per_row, n_tokens_per_row):
         pair = _parse_pair(nll, ntok)
         if pair is None:
             continue
-        ratio = _safe_float_ratio(pair[0], pair[1])
-        if ratio is None:
-            # An exact ratio that underflows float64 is not a measurement of
-            # zero; drop the row rather than manufacture an all-zero CE.
-            continue
+        # Every valid row contributes to the token-pooled totals even when its
+        # own per-document CE underflows.  Dropping the row's token count (the
+        # historical behaviour) changed the pooled denominator, so one huge
+        # low-NLL document could turn a PPL near 1 into a fabricated 0.
         pairs.append(pair)
         total_nll += pair[0]
         total_tok += pair[1]
-        doc_ce.append(ratio)
+        ratio = _safe_float_ratio(pair[0], pair[1])
+        if ratio is not None:
+            # The unweighted per-document mean/SEM cannot represent an
+            # underflowing ratio as a real zero, so it excludes only that
+            # row -- not the row's tokens from the primary pooled estimator.
+            doc_ce.append(ratio)
     if not pairs or total_tok <= 0:
         return {'ppl': None,
                 'doc_ce_mean': None, 'doc_ce_sem': None,
-                'ppl_ci95_low': None, 'ppl_ci95_high': None, 'n_docs': len(doc_ce)}
+                'ppl_ci95_low': None, 'ppl_ci95_high': None,
+                'n_docs': len(pairs)}
     if not math.isfinite(total_nll):
         try:
             total_nll = math.fsum(p[0] for p in pairs)
@@ -1606,7 +1611,8 @@ def _nll_doc_ci(nll_per_row, n_tokens_per_row):
     if len(doc_ce) < 2 or ce is None:
         return {'ppl': (_safe_exp_ppl(ce) if ce is not None else None),
                 'doc_ce_mean': None, 'doc_ce_sem': None,
-                'ppl_ci95_low': None, 'ppl_ci95_high': None, 'n_docs': len(doc_ce)}
+                'ppl_ci95_low': None, 'ppl_ci95_high': None,
+                'n_docs': len(pairs)}
     mean = sum(doc_ce) / len(doc_ce)
     _doc_var = _scaled_sum_of_squares(
         [x - mean for x in doc_ce], 1.0 / (len(doc_ce) - 1))
