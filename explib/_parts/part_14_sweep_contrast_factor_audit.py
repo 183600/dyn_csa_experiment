@@ -4,11 +4,7 @@ _SCF_COUNT_BITS_MAX = 64
 
 def _scf_text(value, limit=120):
     """Bounded text for a declaration name/key."""
-    try:
-        text = str(value)
-    except Exception:
-        return f'<unrepresentable {type(value).__name__}>'
-    return text if len(text) <= limit else text[:limit - 3] + '...'
+    return _bounded_text(value, limit)
 
 
 def _scf_json_safe(value, _depth=0):
@@ -48,11 +44,7 @@ def _scf_repr(value, limit=120):
     exception.  The same bound keeps adversarial strings/lists from turning a
     diagnostic into an unbounded allocation.
     """
-    try:
-        text = repr(value)
-    except Exception:
-        return f'<unrepresentable {type(value).__name__}>'
-    return text if len(text) <= limit else text[:limit - 3] + '...'
+    return _safe_repr(value, limit=limit)
 
 
 def _scf_json_int_ok(value):

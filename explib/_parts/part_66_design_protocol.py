@@ -120,11 +120,7 @@ def _dp_repr(value, limit=120):
     tampered protocol must become a failed validation, not a formatting
     exception that escapes before the gate can report the failure.
     """
-    try:
-        text = repr(value)
-    except Exception:
-        return f'<unrepresentable {type(value).__name__}>'
-    return text if len(text) <= limit else text[:limit - 3] + '...'
+    return _safe_repr(value, limit=limit)
 
 
 def _dp_json_equal(a, b):
@@ -171,17 +167,17 @@ def _dp_json_equal(a, b):
 
 def _dp_str(value, limit=200):
     """Bounded ``str`` preserving the ordinary text of a value."""
-    try:
-        text = str(value)
-    except Exception:
-        return f'<unrepresentable {type(value).__name__}>'
-    return text if len(text) <= limit else text[:limit - 3] + '...'
+    return _bounded_text(value, limit)
 
 
 def _dp_canonical(obj):
-    """Canonical JSON used for every design hash (sorted, compact, strict)."""
-    return json.dumps(obj, sort_keys=True, separators=(',', ':'),
-                      ensure_ascii=True, allow_nan=False)
+    """Canonical JSON used for every design hash (sorted, compact, strict).
+
+    Shares the project-wide canonicalisation contract in part_00, so a
+    design hash and an artifact hash cannot disagree on key order or on
+    non-finite numbers.
+    """
+    return _canonical_json(obj)
 
 
 def _dp_sha_obj(obj):

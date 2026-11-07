@@ -115,12 +115,26 @@ def _safe_text(value):
         return f'<unrepresentable {type(value).__name__}>'
 
 
+def _bounded_text(value, limit=240):
+    """Bounded, exception-safe ``str`` for untrusted diagnostics.
+
+    Like :func:`_safe_text` but truncates to ``limit`` characters.  Diagnostic
+    wrappers keep their historical defaults while sharing this one rule.
+    """
+    text = _safe_text(value)
+    return text if len(text) <= limit else text[:limit - 3] + '...'
+
+
 def _safe_repr(value, limit=240):
     """Bounded, exception-safe ``repr`` for untrusted diagnostics.
 
     CPython 3.12 refuses to decimalise an integer with more than ~4300
     digits, so ``repr(10**10000)`` raises.  A validator must report a
     malformed value as a failure, never abort while formatting it.
+
+    This is the canonical implementation; later fragments keep their own
+    named wrappers (with their historical default limits) so call sites and
+    diagnostics stay stable while the formatting rule lives in one place.
     """
     try:
         text = repr(value)

@@ -113,11 +113,7 @@ def _de_repr(value, limit=120):
     malformed artifact must become a failed validation, not a formatting
     exception.
     """
-    try:
-        text = repr(value)
-    except Exception:
-        return f'<unrepresentable {type(value).__name__}>'
-    return text if len(text) <= limit else text[:limit - 3] + '...'
+    return _safe_repr(value, limit=limit)
 
 
 def _de_text(value):

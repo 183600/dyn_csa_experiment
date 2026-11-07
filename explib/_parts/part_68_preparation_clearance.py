@@ -84,11 +84,7 @@ def _prep_repr(value, limit=120):
     malformed clearance must return a failed validation, not abort the launch
     gate while formatting its own failure message.
     """
-    try:
-        text = repr(value)
-    except Exception:
-        return f'<unrepresentable {type(value).__name__}>'
-    return text if len(text) <= limit else text[:limit - 3] + '...'
+    return _safe_repr(value, limit=limit)
 
 
 def _prep_json_equal(a, b):
@@ -135,11 +131,7 @@ def _prep_json_equal(a, b):
 
 def _prep_str(value, limit=200):
     """Bounded ``str`` preserving the ordinary text of a value."""
-    try:
-        text = str(value)
-    except Exception:
-        return f'<unrepresentable {type(value).__name__}>'
-    return text if len(text) <= limit else text[:limit - 3] + '...'
+    return _bounded_text(value, limit)
 
 
 def _prep_study_level(protocol):
@@ -263,9 +255,8 @@ def _prep_timestamp(value):
 
 
 def _prep_comparable(a, b):
-    if a is None or b is None:
-        return False
-    return (a.tzinfo is None) == (b.tzinfo is None)
+    """True when two parsed timestamps share one clock (run-allocation rule)."""
+    return _comparable_timestamps(a, b)
 
 
 def _prep_check(name, *, required=False):
@@ -1307,8 +1298,8 @@ def preparation_clearance_timing(clearance, events):
 
 
 def _prep_load_json(path):
-    with open(path, encoding='utf-8') as fh:
-        return json.load(fh, parse_constant=_dp_reject_json_constant)  # noqa: F821
+    """Load one strict-JSON artifact (shared with the design protocol)."""
+    return _dp_load_json(path)
 
 
 def _prep_find_named(name, explicit=None):

@@ -100,11 +100,7 @@ ASC_FORBIDDEN = frozenset({
 
 
 def _asc_repr(value, *, limit=160):
-    try:
-        text = repr(value)
-    except Exception:
-        return f'<unrepresentable {type(value).__name__}>'
-    return text if len(text) <= limit else text[:limit - 3] + '...'
+    return _safe_repr(value, limit=limit)
 
 
 def _asc_finite(value, *, where, positive=False):

@@ -57,11 +57,7 @@ def _vt_repr(value, limit=240):
     with that formatting exception.  Ordinary values keep their historical
     ``repr`` spelling, so existing diagnostics do not change.
     """
-    try:
-        text = repr(value)
-    except Exception:
-        return f'<unrepresentable {type(value).__name__}>'
-    return text if len(text) <= limit else text[:limit - 3] + '...'
+    return _safe_repr(value, limit=limit)
 
 
 VALIDATION_TRANSFER_SCHEMA = 1
@@ -102,14 +98,11 @@ def _vt_num(value):
     ``"1.0"``; that is a serialisation artefact, not a measured PPL or log
     ratio.  Accepting it here used to let a hand-edited vector replay as
     data, so strings/bytes and booleans are refused before ``float``.
+
+    Delegates to the endpoint-sensitivity definition (part_58) so all
+    stored-artifact reads share one scalar contract.
     """
-    if isinstance(value, (bool, np.bool_, str, bytes, bytearray)):
-        return None
-    try:
-        out = float(value)
-    except (TypeError, ValueError, OverflowError):
-        return None
-    return out if math.isfinite(out) else None
+    return _es_float(value)
 
 
 def _vt_positive(value):

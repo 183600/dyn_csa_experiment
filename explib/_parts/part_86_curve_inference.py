@@ -106,11 +106,7 @@ CURVE_INFERENCE_FORBIDDEN_KEYS = frozenset({
 
 
 def _cv_repr(value, limit=160):
-    try:
-        text = repr(value)
-    except Exception:
-        return f'<unrepresentable {type(value).__name__}>'
-    return text if len(text) <= limit else text[:limit - 3] + '...'
+    return _safe_repr(value, limit=limit)
 
 
 def _cv_text(value, name, *, limit=500):
@@ -793,8 +789,12 @@ def _cv_num(value):
 
 
 def _cv_norm_cdf(x):
-    """Standard-normal CDF through ``erfc`` (accurate in the lower tail)."""
-    return 0.5 * math.erfc(-float(x) / math.sqrt(2.0))
+    """Standard-normal CDF through ``erfc`` (accurate in the lower tail).
+
+    Shares the definition with the sweep/contrast audit (part_14) so every
+    tail computation in the library uses the same arithmetic.
+    """
+    return _normal_cdf(x)
 
 
 def _cv_norm_sf(x):
@@ -805,8 +805,11 @@ def _cv_norm_sf(x):
     fallback exists for (hundreds of seeds), a standard error well below the
     mean easily produces such a z; ``erfc`` keeps the real tail value and
     prevents ``p=0`` / a certainty-valued TOST decision.
+
+    Delegates to the sequential-design definition (part_84); both paths must
+    agree on the far upper tail as the panel grows.
     """
-    return 0.5 * math.erfc(float(x) / math.sqrt(2.0))
+    return _seq_norm_sf(x)
 
 
 def _cv_t_interval(mean, sem, n, alpha):

@@ -124,11 +124,12 @@ def _etost_floor(n_nonzero):
 
 
 def _etost_signed_sums(values):
-    """All 2**k signed sums of ``values`` (deterministic doubling table)."""
-    out = np.zeros(1, dtype=float)
-    for v in np.asarray(values, dtype=float):
-        out = np.concatenate((out + v, out - v))
-    return out
+    """All 2**k signed sums of ``values`` (deterministic doubling table).
+
+    Reuses the two-sided sign-flip table builder (part_09) so both exact
+    tests enumerate and accumulate in the same order.
+    """
+    return _signflip_signed_sums(values)
 
 
 def _etost_scaled(values):

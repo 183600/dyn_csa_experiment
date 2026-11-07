@@ -151,11 +151,7 @@ def _bt_dict(value):
 
 def _bt_repr(value, limit=120):
     """Bounded, exception-safe text for untrusted diagnostics."""
-    try:
-        text = repr(value)
-    except Exception:
-        return f'<unrepresentable {type(value).__name__}>'
-    return text if len(text) <= limit else text[:limit - 3] + '...'
+    return _safe_repr(value, limit=limit)
 
 
 def _bt_json_equal(a, b):

@@ -377,11 +377,7 @@ def pair_reason(ra, rb):
 
 def _pcr_safe_repr(value, limit=100):
     """Bounded repr for a malformed protocol declaration diagnostic."""
-    try:
-        text = repr(value)
-    except Exception:
-        return f'<unrepresentable {type(value).__name__}>'
-    return text if len(text) <= limit else text[:limit - 3] + '...'
+    return _safe_repr(value, limit=limit)
 
 
 def protocol_contrast_reason(ra, rb, declaration=None, *, factor=None):

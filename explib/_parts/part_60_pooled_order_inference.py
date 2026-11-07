@@ -130,15 +130,7 @@ def _po_int(value, name, *, minimum=None, maximum=None):
 
 def _po_point(value, name):
     """Finite endpoint point estimate, rejecting flags and strings."""
-    if isinstance(value, (bool, _po_np.bool_, str, bytes, bytearray)):
-        raise ValueError(f'{name} must be a finite number, got {value!r}')
-    try:
-        out = float(value)
-    except (TypeError, ValueError, OverflowError):
-        raise ValueError(f'{name} must be a finite number, got {value!r}') from None
-    if not _po_math.isfinite(out):
-        raise ValueError(f'{name} must be a finite number, got {value!r}')
-    return out
+    return _po_number(value, name)
 
 
 def _po_policy(block_lengths, n_batches, n_boot, n_perm, conf, alpha, seed,

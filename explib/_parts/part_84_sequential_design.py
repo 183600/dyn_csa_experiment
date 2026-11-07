@@ -119,11 +119,7 @@ def _seq_repr(value, limit=160):
     validation verdict with a second ``ValueError``; the fallback text keeps
     the offending type visible.
     """
-    try:
-        text = repr(value)
-    except Exception:
-        return f'<unrepresentable {type(value).__name__}>'
-    return text if len(text) <= limit else text[:limit - 3] + '...'
+    return _safe_repr(value, limit=limit)
 
 
 def _seq_key_text(value, limit=120):

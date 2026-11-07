@@ -102,11 +102,7 @@ AM_RESULT_KEYS = (
 
 def _am_repr(value):
     """Short, exception-safe repr for diagnostics on untrusted values."""
-    try:
-        text = repr(value)
-    except Exception:
-        return f'<unrepresentable {type(value).__name__}>'
-    return text if len(text) <= 160 else text[:157] + '...'
+    return _safe_repr(value, limit=160)
 
 
 def _am_number(value, *, where, positive=False):

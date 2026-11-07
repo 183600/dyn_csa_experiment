@@ -128,7 +128,7 @@ The tables and command comments below use these terms in a specific sense.
 The drivers are organized by study generation. Each has a `smoke` mode for
 plumbing checks, a training mode for the real panels, and zero-GPU
 analysis/report subcommands where applicable. v6 keeps its historical script
-entry point; v7 onwards live under `explib/`.
+entry point; v7 and later live under `explib/`.
 
 | generation | scope | entry point | generated artifacts |
 |---|---|---|---|
@@ -224,6 +224,18 @@ with that driver's `smoke` mode when validating a change to the pipeline.
   measurement.
 - A successful check prints its own summary and exits 0; a failed check exits
   non-zero. Read the exit status before reading the prose around a command.
+
+| exit code | usual meaning |
+|---|---|
+| `0` | the command finished and its checks held (or found no difference) |
+| `1` | the command ran, but a check found a difference/violation or a run failed |
+| `2` | usage error: unknown mode, missing required argument, or bad input |
+
+A driver that dispatches on a positional mode rejects an unknown one with code
+`2` and names the accepted modes; it never falls back to a training default.
+`pytest` also uses its own non-zero codes (for example `5` when no tests are
+collected), so treat any non-zero status as a failed check and read the printed
+summary for the cause.
 
 ### Example workflows
 
@@ -492,6 +504,18 @@ python -m explib.reproduce report OLD.json NEW.json --ignore-ledger
 
 This is a structural diff of stamped reports, not a new statistical test; use it
 to confirm that rebuilding a report from the same artifacts did not change it.
+
+The same two comparisons are available as Make targets when you prefer named
+arguments over remembering the flags:
+
+```bash
+make reproduce A=results_lm_v3_1500 B=results_lm_v3_1500_rerun
+make report-diff A=OLD.json B=NEW.json
+```
+
+`A` and `B` are required; `make` stops with a usage message when either is
+missing. The targets call the same comparator, so their exit codes and verdict
+names match the `python -m explib.reproduce` examples above.
 
 ## Running the experiments
 

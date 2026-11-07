@@ -89,11 +89,7 @@ def _gfdr_repr(value):
     calling ``repr`` on such a value inside a validation error would replace
     the intended ``ValueError`` with ``ValueError: Exceeds the limit ...``.
     """
-    try:
-        text = repr(value)
-    except Exception:
-        return f'<unrepresentable {type(value).__name__}>'
-    return text if len(text) <= 120 else text[:117] + '...'
+    return _safe_repr(value, limit=120)
 
 
 def _gfdr_method(value):

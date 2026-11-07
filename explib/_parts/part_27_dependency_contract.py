@@ -1652,20 +1652,12 @@ def _uo_repr(value, limit=200):
     decimal-conversion limit; formatting it while building the problem list
     would replace the intended diagnostic with that raw ValueError.
     """
-    try:
-        text = repr(value)
-    except Exception:
-        return f'<unrepresentable {type(value).__name__}>'
-    return text if len(text) <= limit else text[:limit - 3] + '...'
+    return _safe_repr(value, limit=limit)
 
 
 def _uo_str(value, limit=200):
     """Bounded, exception-safe ``str`` for a unit-order field."""
-    try:
-        text = str(value)
-    except Exception:
-        return f'<unrepresentable {type(value).__name__}>'
-    return text if len(text) <= limit else text[:limit - 3] + '...'
+    return _bounded_text(value, limit)
 
 
 def unit_order_attestation(unit_ids, *, unit_kind, permutation=None,

@@ -51,14 +51,12 @@ _CROSS_PANEL_SCALE_DISAGREEMENTS = ('direction_discordant',
 
 
 def _cpss_finite(value):
-    """Finite float or ``None``; booleans/strings are not measurements."""
-    if isinstance(value, (bool, np.bool_, str, bytes, bytearray)) or value is None:
-        return None
-    try:
-        number = float(value)
-    except (TypeError, ValueError, OverflowError):
-        return None
-    return number if math.isfinite(number) else None
+    """Finite float or ``None``; booleans/strings are not measurements.
+
+    Shares the display/normalisation rule defined with the cross-panel
+    synthesis report (part_63).
+    """
+    return _cps_finite_or_none(value)
 
 
 def _cpss_ci(value):

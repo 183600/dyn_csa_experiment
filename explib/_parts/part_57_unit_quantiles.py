@@ -144,25 +144,11 @@ def _uq_div(num, den):
     division would divide by a different integer.  Use the exact rational only
     for that case; ordinary panels keep the historical float division
     bit-for-bit.
+
+    Delegates to the length-strata definition (part_56); the two panels share
+    one exact-division rule.
     """
-    try:
-        d = int(den)
-    except (OverflowError, ValueError, ZeroDivisionError, TypeError):
-        return None
-    if abs(d) <= (1 << 53):
-        try:
-            return float(num) / d
-        except OverflowError:
-            pass
-    try:
-        from fractions import Fraction as _Fraction
-        try:
-            quotient = _Fraction(num) / d
-        except TypeError:
-            quotient = _Fraction(float(num)) / d
-        return float(quotient)
-    except (OverflowError, ValueError, ZeroDivisionError, TypeError):
-        return None
+    return _ls_div(num, den)
 
 
 def _uq_mean(values):

@@ -92,11 +92,7 @@ def _ar_repr(value, limit=120):
     to stringify.  The validator must report that as a failed check instead
     of raising while formatting the message.
     """
-    try:
-        text = repr(value)
-    except Exception:
-        return f'<unrepresentable {type(value).__name__}>'
-    return text if len(text) <= limit else text[:limit - 3] + '...'
+    return _safe_repr(value, limit=limit)
 
 
 def _ar_json_equal(a, b):

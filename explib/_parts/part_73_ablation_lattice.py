@@ -92,11 +92,7 @@ def _al_repr(value, *, limit=120):
     ``repr(10**10000)`` raises on Python 3.12's integer-digit limit and would
     replace a validation failure with an uncaught exception.
     """
-    try:
-        text = repr(value)
-    except Exception:
-        return f'<unrepresentable {type(value).__name__}>'
-    return text if len(text) <= limit else text[:limit - 3] + '...'
+    return _safe_repr(value, limit=limit)
 
 
 def _al_bool_scalar(value):
