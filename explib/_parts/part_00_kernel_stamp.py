@@ -360,22 +360,46 @@ def _curve_slope_stats(points, key, k=4):
     # legal integer label beyond the float64 exponent range.  Subtracting the
     # first exact integer step keeps the differences exact and finite.
     base = pts[0][0]
-    xs = [float(x - base) for x, _ in pts]
+    # The SPAN between two exact steps can still exceed the float64 exponent
+    # range (e.g. a synthetic look at step 10**400).  Converting such a
+    # difference used to escape as an OverflowError from a health classifier
+    # that is documented to return ``None`` for an undefined slope.  A slope
+    # over an unrepresentable x axis is unavailable, not a crash.
+    try:
+        xs = [float(x - base) for x, _ in pts]
+    except (OverflowError, ValueError):
+        return None, None
+    if not all(math.isfinite(x) for x in xs):
+        return None, None
     ys = [y for _, y in pts]
-    mx = sum(xs) / n
-    my = sum(ys) / n
-    den = sum((x - mx) ** 2 for x in xs)
-    if den <= 0:
+    try:
+        mx = sum(xs) / n
+        my = sum(ys) / n
+        den = sum((x - mx) ** 2 for x in xs)
+    except (OverflowError, ValueError):
+        return None, None
+    # ``den`` can overflow to inf (or a large y mean to inf) even when every
+    # input is finite; both make the least-squares slope meaningless.
+    if not (math.isfinite(mx) and math.isfinite(my)
+            and math.isfinite(den) and den > 0.0):
         return None, None
     slope = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / den
+    if not math.isfinite(slope):
+        return None, None
     # Residual standard error of the slope.  With n=2 the residual dof is 0;
     # the slope is then interpolating the two points, so no noise estimate is
     # possible (None -> the caller falls back to the fixed floor).
     dof = n - 2
     if dof <= 0:
         return slope, None
-    rss = sum((y - (my + slope * (x - mx))) ** 2 for x, y in zip(xs, ys))
-    se = math.sqrt((rss / dof) / den) if den > 0 else None
+    try:
+        rss = sum((y - (my + slope * (x - mx))) ** 2
+                  for x, y in zip(xs, ys))
+        se = math.sqrt((rss / dof) / den) if den > 0 else None
+    except (OverflowError, ValueError):
+        se = None
+    if se is not None and not math.isfinite(se):
+        se = None
     return slope, se
 
 

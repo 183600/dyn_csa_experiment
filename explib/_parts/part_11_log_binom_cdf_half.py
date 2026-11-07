@@ -1156,7 +1156,13 @@ def _betai_log_bt(a, b, x):
 def _betai_nr(a, b, x):
     """正则化不完全贝塔 I_x(a,b) 的 Numerical Recipes 路径。"""
     bt = math.exp(_betai_log_bt(a, b, x))
-    if x < (a + 1.0) / (a + b + 2.0):
+    lower = x < (a + 1.0) / (a + b + 2.0)
+    if bt == 0.0:
+        # The prefactor underflowed on a far tail.  The continued fraction can
+        # still overflow/NaN for extreme shapes (e.g. b=1e200), and
+        # ``0 * nan`` would turn a perfectly ordinary 0/1 tail into NaN.
+        return 0.0 if lower else 1.0
+    if lower:
         return float(bt * _betacf(a, b, x) / a)
     return float(1.0 - bt * _betacf(b, a, 1.0 - x) / b)
 
@@ -1635,11 +1641,21 @@ def _betai(a, b, x):
     if (_a_float is None or _b_float is None) and not (
             _is_integral_value(a) and _is_integral_value(b)):
         return float('nan')
-    if (a >= 1.0 and b >= 1.0 and a + b >= 1000000.0
-            and _is_integral_value(a) and _is_integral_value(b)):
+    # Sum the exact integer shapes, not ``a + b``: a float mixed with an
+    # integer beyond float64 makes Python's float addition raise
+    # OverflowError even though both shapes are valid and the binomial
+    # identity only needs their exact sum.
+    if (a >= 1.0 and b >= 1.0
+            and _is_integral_value(a) and _is_integral_value(b)
+            and int(a) + int(b) >= 1000000):
         n_binom = int(a) + int(b) - 1
         return _binomial_sf_stable(int(a), n_binom, float(x))
-    return _betai_nr(a, b, x)
+    out = _betai_nr(a, b, x)
+    if math.isnan(out):
+        return float('nan')
+    # The continued fraction can overshoot 1 (or undershoot 0) by a few ulps
+    # at extreme shapes; the regularized beta is a probability by definition.
+    return float(min(1.0, max(0.0, out)))
 
 
 def _dist_real(value):
@@ -1724,7 +1740,37 @@ def _student_t_sf(t, df):
         tail = _student_t_sf_large_df(abs(t), df)
     else:
         x = df / (df + t * t)
-        tail = 0.5 * _betai(df / 2.0, 0.5, x)
+        if x > 0.0:
+            tail = 0.5 * _betai(df / 2.0, 0.5, x)
+        else:
+            # ``t*t`` can overflow (or df/(df+t*t) underflow) while the tail
+            # is still representable: for small df the t tail is a power law,
+            # not an underflow to zero.  The incomplete-beta argument is
+            # x = df/(df+t^2); when x rounds to 0, evaluate log(x) directly
+            # and use I_x(a,b) ~ x**a / (a*B(a,b)) as x -> 0.
+            a = df / 2.0
+            if a <= 0.0:
+                # df/2 underflowed for a subnormal df.  The tiny-shape limit
+                # is symmetric with half the mass on each side at any finite t.
+                a = 0.0
+            try:
+                logx = (math.log(df)
+                        - math.log1p(df / (t * t))
+                        - 2.0 * math.log(abs(t)))
+                if a == 0.0:
+                    log_i = 0.0
+                else:
+                    log_beta = (math.lgamma(a) + math.lgamma(0.5)
+                                - math.lgamma(a + 0.5))
+                    log_i = a * logx - math.log(a) - log_beta
+                # The leading term is an upper bound on a probability; a
+                # positive value can only be cancellation at tiny shapes.
+                if math.isnan(log_i):
+                    tail = 0.0
+                else:
+                    tail = 0.5 * math.exp(min(0.0, log_i))
+            except (OverflowError, ValueError):
+                tail = 0.0
     return float(tail if t >= 0 else 1.0 - tail)
 
 
