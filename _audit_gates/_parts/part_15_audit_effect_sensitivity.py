@@ -123,17 +123,24 @@ def audit_effect_sensitivity(path=None):
                     f'per_seed[{i}].seed {s} is not in the frozen manifest seed list')
             av = entry.get('with')
             bv = entry.get('without')
-            if (not isinstance(av, (int, float)) or isinstance(av, bool)
-                    or not isinstance(bv, (int, float)) or isinstance(bv, bool)
-                    or not math.isfinite(float(av)) or not math.isfinite(float(bv))
-                    or float(av) <= 0.0 or float(bv) <= 0.0):
+            # An exact integer beyond float64 is finite but has no float
+            # spelling; float() would raise outside the replay try and abort
+            # the whole audit.  Treat it as an unusable stored measurement.
+            av_f = (_finite_number(av)
+                    if isinstance(av, (int, float)) and not isinstance(av, bool)
+                    else None)
+            bv_f = (_finite_number(bv)
+                    if isinstance(bv, (int, float)) and not isinstance(bv, bool)
+                    else None)
+            if (av_f is None or bv_f is None
+                    or av_f <= 0.0 or bv_f <= 0.0):
                 row['problems'].append(
                     f'per_seed[{i}] with/without are not finite positive PPLs')
                 continue
             _seen.add(s)
             seeds.append(s)
-            a_vals.append(float(av))
-            b_vals.append(float(bv))
+            a_vals.append(av_f)
+            b_vals.append(bv_f)
         if row['problems']:
             out['problems'].extend(f'{name}: {x}' for x in row['problems'])
             continue

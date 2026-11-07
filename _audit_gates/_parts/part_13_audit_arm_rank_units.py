@@ -208,10 +208,15 @@ def audit_arm_rank_units(path=None):
     _cross_check = (rk.get('endpoint_values_match') == 'checked')
     _all_numeric = False
     if isinstance(pav, dict):
+        # A stored JSON integer may be finite but have no float64 spelling
+        # (e.g. 10**400).  ``float`` would raise OverflowError here, outside
+        # the replay ``try``, aborting the audit instead of failing closed.
+        # The shared predicate returns None for such a value.
         _all_numeric = all(
             isinstance(row, dict)
             and all(isinstance(x, (int, float)) and not isinstance(x, bool)
-                    and math.isfinite(float(x)) for x in row.values())
+                    and _finite_number(x) is not None
+                    for x in row.values())
             for row in pav.values())
     try:
         replay = L.arm_rank_unit_sensitivity(

@@ -142,21 +142,28 @@ def audit_selection(path='analysis_mechanism/selection_attribution.json'):
             for _j, _cell in enumerate(out['cells']):
                 _st = _cell.get('seed_test')
                 _p = (_st.get('p_exact_signflip') if isinstance(_st, dict) else None)
-                _pf.append((str(_j), float(_p)
-                            if isinstance(_p, (int, float))
-                            and math.isfinite(float(_p)) else 1.0))
+                _p_f = (_finite_number(_p)
+                        if isinstance(_p, (int, float))
+                        and not isinstance(_p, bool) else None)
+                _pf.append((str(_j), _p_f if _p_f is not None else 1.0))
             _holm = _L.holm_adjust(_pf, alpha=0.05)
             for _j, _cell in enumerate(out['cells']):
                 _h = _holm.get(str(_j)) or {}
                 _cell['p_holm'] = _h.get('p_holm')
                 _st = _cell.get('seed_test')
+                _md = (_st.get('mean_delta') if isinstance(_st, dict) else None)
+                _md_f = (_finite_number(_md)
+                         if isinstance(_md, (int, float))
+                         and not isinstance(_md, bool) else None)
+                _ph_f = (_finite_number(_cell.get('p_holm'))
+                         if isinstance(_cell.get('p_holm'), (int, float))
+                         and not isinstance(_cell.get('p_holm'), bool) else None)
                 _cell['claim_allowed'] = bool(
                     _cell['mass_excess'] > 0.0 and _cell['recall_excess'] > 0.0
                     and _cell['n_queries'] > 0 and isinstance(_st, dict)
-                    and _st.get('mean_delta') is not None
-                    and float(_st['mean_delta']) > 0.0
-                    and _cell.get('p_holm') is not None
-                    and float(_cell['p_holm']) < 0.05
+                    and _md_f is not None and _md_f > 0.0
+                    and _ph_f is not None
+                    and _ph_f < 0.05
                     and int(_st.get('n', 0)) >= 6)
             out['claim_family'] = {
                 'method': 'holm step-down over the displayed selection cells',

@@ -1608,10 +1608,12 @@ def audit_budget(state_files=('run_time_state_v10.json', 'run_time_state_v12.jso
             return None
 
         def _positive_real(value):
-            if value is None or isinstance(value, (bool, np.bool_)) or not isinstance(value, numbers.Real):
+            if value is None or not isinstance(value, numbers.Real):
                 return None
-            f = float(value)
-            return f if math.isfinite(f) and f > 0.0 else None
+            # Exact integers beyond float64 have no float spelling; a
+            # malformed stored scale is withheld instead of aborting.
+            f = _finite_number(value)
+            return f if f is not None and f > 0.0 else None
 
         recs = []
         for r in summ.values():
@@ -1884,35 +1886,36 @@ def audit_training_health(outdirs=None):
                                          f'curve best step {int(_rh["best_step"])}')
                         if _bp is not None:
                             # PPL is a positive real, not an integer count.
-                            _bpv = None
-                            if (not isinstance(_bp, (bool, np.bool_))
-                                    and isinstance(_bp, numbers.Real)):
-                                _f = float(_bp)
-                                _bpv = _f if (math.isfinite(_f) and _f > 0.0) else None
+                            # A finite exact integer beyond float64 has no
+                            # float spelling; float() would abort the audit.
+                            _bpv = _finite_number(_bp)
+                            if _bpv is not None and _bpv <= 0.0:
+                                _bpv = None
                             _rbp = _rh.get('best_val_ppl')
+                            _rbp_f = (_finite_number(_rbp)
+                                      if isinstance(_rbp, (int, float))
+                                      and not isinstance(_rbp, bool) else None)
                             if _bpv is None:
                                 w.append(f'curve_health.best_val_ppl is not a finite '
                                          f'positive number ({_bp!r})')
-                            elif (isinstance(_rbp, (int, float)) and not isinstance(_rbp, bool)
-                                  and math.isfinite(float(_rbp))
-                                  and abs(_bpv - float(_rbp)) > 1e-6 * max(1.0, abs(float(_rbp)))):
+                            elif (_rbp_f is not None
+                                  and abs(_bpv - _rbp_f) > 1e-6 * max(1.0, abs(_rbp_f))):
                                 w.append(f'curve_health.best_val_ppl={_bpv:g} does not match the '
-                                         f'curve best {float(_rbp):g}')
+                                         f'curve best {_rbp_f:g}')
                         _fm = h.get('final_minus_best')
                         if _fm is not None:
-                            _fmv = None
-                            if (not isinstance(_fm, (bool, np.bool_))
-                                    and isinstance(_fm, numbers.Real)):
-                                _f = float(_fm)
-                                _fmv = _f if math.isfinite(_f) else None
+                            # Same no-float-spelling hazard as best_val_ppl.
+                            _fmv = _finite_number(_fm)
                             _rfm = _rh.get('final_minus_best')
+                            _rfm_f = (_finite_number(_rfm)
+                                      if isinstance(_rfm, (int, float))
+                                      and not isinstance(_rfm, bool) else None)
                             if _fmv is None:
                                 w.append(f'curve_health.final_minus_best is not finite ({_fm!r})')
-                            elif (isinstance(_rfm, (int, float)) and not isinstance(_rfm, bool)
-                                  and math.isfinite(float(_rfm))
-                                  and abs(_fmv - float(_rfm)) > 1e-6 * max(1.0, abs(float(_rfm)))):
+                            elif (_rfm_f is not None
+                                  and abs(_fmv - _rfm_f) > 1e-6 * max(1.0, abs(_rfm_f))):
                                 w.append(f'curve_health.final_minus_best={_fmv:g} does not match '
-                                         f'the curve {float(_rfm):g}')
+                                         f'the curve {_rfm_f:g}')
                         _sb = h.get('steps_since_best')
                         if _sb is not None:
                             _sbv = _nonneg(_sb)
@@ -2056,10 +2059,11 @@ def audit_efficiency_pairs(outdirs=None, pairs=None, *, tolerance=0.05):
             def _num(v):
                 # Timing/token fields are measurements: booleans and
                 # non-finite values are not numbers, whatever float() accepts.
+                # A finite exact integer beyond float64 has no float spelling;
+                # the shared predicate withholds it instead of raising.
                 if isinstance(v, (bool, np.bool_)) or not isinstance(v, (int, float, np.integer, np.floating)):
                     return None
-                f = float(v)
-                return f if math.isfinite(f) else None
+                return _finite_number(v)
 
             def _med(rows, key):
                 _v = [f for f in (_num(r.get(key)) for r in rows) if f is not None]
@@ -2497,7 +2501,12 @@ def audit_joint_correction(outdirs=None, alpha=0.05):
                 if (_si_ok
                         and isinstance(_mean, (int, float))
                         and not isinstance(_mean, bool)):
-                    if not (float(si[0]) - 1e-9 <= float(_mean) <= float(si[1]) + 1e-9):
+                    _mean_f = _finite_number(_mean)
+                    _si_lo_f = _finite_number(si[0])
+                    _si_hi_f = _finite_number(si[1])
+                    if (_mean_f is None or _si_lo_f is None or _si_hi_f is None
+                            or not (_si_lo_f - 1e-9 <= _mean_f
+                                    <= _si_hi_f + 1e-9)):
                         panel['violations'].append(
                             f'{key}: the simultaneous interval does not contain '
                             f'the contrast mean {_mean!r}')
@@ -2510,13 +2519,22 @@ def audit_joint_correction(outdirs=None, alpha=0.05):
             p_single = e.get('p_maxt_single')
             if all(isinstance(v, (int, float)) and not isinstance(v, bool)
                    for v in (p_raw, p_maxt, p_single)):
-                if p_maxt + 1e-12 < p_raw:
+                _p_raw_f = _finite_number(p_raw)
+                _p_maxt_f = _finite_number(p_maxt)
+                _p_single_f = _finite_number(p_single)
+                if (_p_raw_f is None or _p_maxt_f is None
+                        or _p_single_f is None):
                     panel['violations'].append(
-                        f'{key}: p_maxt {p_maxt!r} < its own raw p {p_raw!r}')
-                if p_maxt > p_single + 1e-12:
-                    panel['violations'].append(
-                        f'{key}: step-down p_maxt {p_maxt!r} > single-step '
-                        f'{p_single!r}')
+                        f'{key}: p_raw/p_maxt/p_maxt_single is not a finite '
+                        'representable probability')
+                else:
+                    if _p_maxt_f + 1e-12 < _p_raw_f:
+                        panel['violations'].append(
+                            f'{key}: p_maxt {p_maxt!r} < its own raw p {p_raw!r}')
+                    if _p_maxt_f > _p_single_f + 1e-12:
+                        panel['violations'].append(
+                            f'{key}: step-down p_maxt {p_maxt!r} > single-step '
+                            f'{p_single!r}')
         # Monotone adjusted p across ranks.
         ranked = sorted(((e.get('maxt_rank'), e.get('p_maxt'))
                          for e in stored.values()
@@ -2525,11 +2543,17 @@ def audit_joint_correction(outdirs=None, alpha=0.05):
                         key=lambda t: t[0])
         prev = 0.0
         for rank, pv in ranked:
-            if float(pv) + 1e-12 < prev:
+            _pv_f = _finite_number(pv)
+            if _pv_f is None:
+                panel['violations'].append(
+                    f'rank {rank}: p_maxt {pv!r} is not a finite representable '
+                    'probability')
+                continue
+            if _pv_f + 1e-12 < prev:
                 panel['violations'].append(
                     f'rank {rank}: p_maxt {pv!r} is smaller than the previous '
                     f'rank {prev!r}; the step-down vector is not monotone')
-            prev = max(prev, float(pv))
+            prev = max(prev, _pv_f)
         # Holm-only / max-T-only lists must match the stored verdicts.
         holm_sig = {k for k, e in stored.items() if e.get('significant_global')}
         want_maxt_only = sorted(

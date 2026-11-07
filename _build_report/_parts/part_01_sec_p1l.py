@@ -1158,11 +1158,12 @@ def sec_efficiency():
              '> Measured on the actual checkpoint/architecture with warmup + repeated runs. `prefix_prefill` is **not** incremental decode: the model has no KV cache, so each step re-runs the whole prefix. Training throughput is wall-clock tokens/s for the whole cell (it includes evaluation/checkpoint overhead, so it is not a pure kernel measurement).', '',
              '| panel | cell | params (M) | prefill p50/p95 ms | tokens/s | prefix-prefill p50 ms | peak alloc MB | peak reserved MB | train tokens/s | tokens seen |', '|---|---|---|---|---|---|---|---|---|---|']
     for name, key, rec, eff in rows[:200]:
-        p = rec.get('params')
-        pm = (p / 1e6) if isinstance(p, (int, float)) else None
-        _ttps = rec.get('train_tokens_per_s')
-        if not isinstance(_ttps, (int, float)) or isinstance(_ttps, bool) or not math.isfinite(float(_ttps)):
-            _ttps = None
+        # Report fields can be exact integers beyond float64 (e.g. 10**400).
+        # Dividing/float()-ing one would raise and abort the whole report;
+        # the shared reader withholds it as unavailable.
+        p = _as_finite(rec.get('params'))
+        pm = (p / 1e6) if p is not None else None
+        _ttps = _as_finite(rec.get('train_tokens_per_s'))
         lines.append('| %s | `%s` | %s | %s / %s | %s | %s | %s | %s | %s | %s |' % (
             name, key, fm(pm), fm(eff.get('prefill_ms_p50'), 2), fm(eff.get('prefill_ms_p95'), 2),
             fm(eff.get('tokens_per_s_prefill'), 1), fm(eff.get('prefix_prefill_ms_p50'), 2),

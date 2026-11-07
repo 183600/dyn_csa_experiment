@@ -520,8 +520,11 @@ def audit_attribution(outdirs=None):
                 _found = True
                 for _src, _dst in (('blocks', 'blocks_mean'), ('len_mean', 'block_len_mean'), ('len_p95', 'block_len_p95')):
                     _x = _lv.get(_src)
-                    if isinstance(_x, (int, float)) and math.isfinite(float(_x)):
-                        ent[_dst].append(float(_x))
+                    _x_f = (_finite_number(_x)
+                            if isinstance(_x, (int, float))
+                            and not isinstance(_x, bool) else None)
+                    if _x_f is not None:
+                        ent[_dst].append(_x_f)
             if _found or r.get('block_stats') or r.get('by_len_block_stats') or (isinstance(r.get('mech'), dict) and r['mech'].get('cuts')):
                 ent['with_block_stats'] += 1
         if panel:
@@ -578,10 +581,11 @@ def audit_boundary(outdirs=None):
     def _num(value):
         # Alignment readings are measurements: booleans, strings and
         # non-finite values cannot support a "beats the random baseline" claim.
+        # The shared predicate also withholds an exact integer beyond float64
+        # instead of letting float() abort the audit.
         if isinstance(value, (bool, np.bool_)) or not isinstance(value, numbers.Real):
             return None
-        f = float(value)
-        return f if math.isfinite(f) else None
+        return _finite_number(value)
 
     for d in dirs:
         summ = _load(_audit_artifact(os.path.join(d, 'summary.json')))

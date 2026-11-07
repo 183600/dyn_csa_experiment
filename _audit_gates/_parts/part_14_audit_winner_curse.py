@@ -86,8 +86,10 @@ def audit_winner_curse(path=None):
     better = pol.get('better')
     lead_level = pol.get('lead_level')
     tie_tol = pol.get('tie_tol', 0.0)
-    if (not isinstance(tie_tol, (int, float)) or isinstance(tie_tol, bool)
-            or not math.isfinite(float(tie_tol)) or float(tie_tol) < 0.0):
+    _tie_tol_f = (_finite_number(tie_tol)
+                  if isinstance(tie_tol, (int, float))
+                  and not isinstance(tie_tol, bool) else None)
+    if _tie_tol_f is None or _tie_tol_f < 0.0:
         out['status'] = 'fail'
         out['problems'].append(
             'winner_curse policy.tie_tol is not a non-negative finite number')
@@ -165,11 +167,14 @@ def audit_winner_curse(path=None):
                 out['problems'].append(
                     f'winner_curse.{name}[{arm!r}] is not a number')
                 continue
-            value = float(value)
-            if not math.isfinite(value) or value < 0.0 or value > 1.0:
+            # A finite exact integer beyond float64 has no float spelling;
+            # float() would abort the audit instead of failing this field.
+            value = _finite_number(value)
+            if value is None or value < 0.0 or value > 1.0:
                 out['status'] = 'fail'
                 out['problems'].append(
                     f'winner_curse.{name}[{arm!r}] is not a probability')
+                continue
             vals.append(value)
         if vals and abs(sum(vals) - 1.0) > 1e-9:
             out['status'] = 'fail'
@@ -214,25 +219,32 @@ def audit_winner_curse(path=None):
                 out['problems'].append(
                     'winner_curse.split_sample n_partitions exceeds max_partitions')
     gap = wc.get('observed_gap')
-    if gap is not None and (not isinstance(gap, (int, float))
-                            or not math.isfinite(float(gap)) or float(gap) < 0.0):
+    _gap_f = (_finite_number(gap)
+              if isinstance(gap, (int, float)) and not isinstance(gap, bool)
+              else None)
+    if gap is not None and (_gap_f is None or _gap_f < 0.0):
         out['status'] = 'fail'
         out['problems'].append('winner_curse.observed_gap is not a non-negative finite number')
     if isinstance(ss, dict):
         for key in ('selection_regret_mean', 'selection_regret_ci95'):
             val = ss.get(key)
             if key.endswith('_mean'):
-                if val is not None and (not isinstance(val, (int, float))
-                                        or not math.isfinite(float(val))
-                                        or float(val) < 0.0):
+                _val_f = (_finite_number(val)
+                          if isinstance(val, (int, float))
+                          and not isinstance(val, bool) else None)
+                if val is not None and (_val_f is None or _val_f < 0.0):
                     out['status'] = 'fail'
                     out['problems'].append(
                         f'winner_curse.split_sample.{key} is not a non-negative finite number')
             elif isinstance(val, (list, tuple)) and len(val) >= 2:
                 lo, hi = val[0], val[1]
-                if (not isinstance(lo, (int, float)) or not isinstance(hi, (int, float))
-                        or not math.isfinite(float(lo)) or not math.isfinite(float(hi))
-                        or float(lo) > float(hi)):
+                _lo_f = (_finite_number(lo)
+                         if isinstance(lo, (int, float))
+                         and not isinstance(lo, bool) else None)
+                _hi_f = (_finite_number(hi)
+                         if isinstance(hi, (int, float))
+                         and not isinstance(hi, bool) else None)
+                if _lo_f is None or _hi_f is None or _lo_f > _hi_f:
                     out['status'] = 'fail'
                     out['problems'].append(
                         f'winner_curse.split_sample.{key} is not an ordered finite interval')
@@ -246,16 +258,33 @@ def audit_winner_curse(path=None):
                 'winner_curse.bootstrap.n_valid is not an integer in [0, n_boot]')
     if isinstance(bs, dict) and isinstance(bs.get('optimism_ci95'), (list, tuple)):
         pair = bs['optimism_ci95']
-        if (len(pair) >= 2 and all(isinstance(x, (int, float)) for x in pair[:2])
-                and float(pair[0]) > float(pair[1])):
-            out['status'] = 'fail'
-            out['problems'].append(
-                'winner_curse.bootstrap.optimism_ci95 is not ordered')
+        if len(pair) >= 2:
+            _p0 = (_finite_number(pair[0])
+                   if isinstance(pair[0], (int, float))
+                   and not isinstance(pair[0], bool) else None)
+            _p1 = (_finite_number(pair[1])
+                   if isinstance(pair[1], (int, float))
+                   and not isinstance(pair[1], bool) else None)
+            if _p0 is None or _p1 is None or _p0 > _p1:
+                out['status'] = 'fail'
+                out['problems'].append(
+                    'winner_curse.bootstrap.optimism_ci95 is not ordered')
     pbest = wc.get('observed_winner_p_best')
     lead = pol.get('lead_level')
+    _pbest_f = (_finite_number(pbest)
+                if isinstance(pbest, (int, float))
+                and not isinstance(pbest, bool) else None)
+    _lead_f = (_finite_number(lead)
+               if isinstance(lead, (int, float))
+               and not isinstance(lead, bool) else None)
     if status == 'selection_robust':
         if isinstance(pbest, (int, float)) and isinstance(lead, (int, float)):
-            if float(pbest) < float(lead):
+            if _pbest_f is None or _lead_f is None:
+                out['status'] = 'fail'
+                out['problems'].append(
+                    'selection_robust requires finite observed winner P(best) '
+                    'and lead_level')
+            elif _pbest_f < _lead_f:
                 out['status'] = 'fail'
                 out['problems'].append(
                     'selection_robust requires the observed winner P(best) to '
@@ -267,7 +296,12 @@ def audit_winner_curse(path=None):
                 'bootstrap selection regret')
     if status == 'winner_unstable':
         if isinstance(pbest, (int, float)) and isinstance(lead, (int, float)):
-            if float(pbest) >= float(lead):
+            if _pbest_f is None or _lead_f is None:
+                out['status'] = 'fail'
+                out['problems'].append(
+                    'winner_unstable requires finite observed winner P(best) '
+                    'and lead_level')
+            elif _pbest_f >= _lead_f:
                 out['status'] = 'fail'
                 out['problems'].append(
                     'winner_unstable requires P(best) below lead_level')
@@ -279,7 +313,12 @@ def audit_winner_curse(path=None):
                 'tied_best requires at least two arms sharing the best value')
     if status == 'selection_noise_dominated':
         if isinstance(pbest, (int, float)) and isinstance(lead, (int, float)):
-            if float(pbest) < float(lead):
+            if _pbest_f is None or _lead_f is None:
+                out['status'] = 'fail'
+                out['problems'].append(
+                    'selection_noise_dominated requires finite observed winner '
+                    'P(best) and lead_level')
+            elif _pbest_f < _lead_f:
                 out['status'] = 'fail'
                 out['problems'].append(
                     'selection_noise_dominated requires P(best) to reach lead_level')

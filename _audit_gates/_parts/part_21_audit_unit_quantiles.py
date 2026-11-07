@@ -164,7 +164,7 @@ def audit_unit_quantiles(path=None):
                         row['problems'].append(
                             'per_seed_nll_diff contains a non-numeric value')
                         break
-                    if not math.isfinite(float(v)):
+                    if _finite_number(v) is None:
                         row['problems'].append(
                             'per_seed_nll_diff contains a non-finite value')
                         break
@@ -185,12 +185,24 @@ def audit_unit_quantiles(path=None):
             if len(norm) != n_seeds:
                 row['problems'].append('seeds length differs from n_seeds')
         if isinstance(qs, list):
-            if any(isinstance(q, bool) or not isinstance(q, (int, float))
-                   or not math.isfinite(float(q)) or not (0.0 < float(q) < 1.0)
-                   for q in qs):
+            # Quantiles are probabilities.  A huge exact integer has no float
+            # spelling, and float() would raise outside the replay try.
+            _q_vals = []
+            _q_ok = True
+            for q in qs:
+                if isinstance(q, bool) or not isinstance(q, (int, float)):
+                    _q_ok = False
+                    break
+                qv = _finite_number(q)
+                if qv is None or not (0.0 < qv < 1.0):
+                    _q_ok = False
+                    break
+                _q_vals.append(qv)
+            if not _q_ok:
                 row['problems'].append(
                     'quantiles contains a value outside (0, 1)')
-            elif any(float(qs[i]) >= float(qs[i + 1]) for i in range(len(qs) - 1)):
+            elif any(_q_vals[i] >= _q_vals[i + 1]
+                     for i in range(len(_q_vals) - 1)):
                 row['problems'].append('quantiles are not strictly increasing')
         dsm_units = _uqa_int(dsm.get('pooled_ci_n_units')) if isinstance(dsm, dict) else None
         if dsm_units is not None and n_units is not None and dsm_units != n_units:
