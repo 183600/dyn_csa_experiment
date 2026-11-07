@@ -108,6 +108,23 @@ def test_normal_fallback_upper_tail_is_not_a_fake_zero():
     json.dumps(out, allow_nan=False)
 
 
+def test_normal_fallback_critical_value_survives_alpha_below_one_ulp():
+    # A large Bonferroni family can push alpha below the spacing below 1, so
+    # ``1 - alpha/2`` rounds to exactly 1.0.  Clamping to 1-1e-15 silently
+    # narrowed the interval; the lower-tail solve keeps the exact z.
+    from statistics import NormalDist
+    rng = np.random.default_rng(3)
+    D = rng.normal(loc=1.0, scale=0.1, size=(2, 21))
+    alpha = 1e-18
+    out = L._cv_normal_enumeration(
+        D, alpha=alpha, margin=None, flatness_margin=None)
+    expected = -NormalDist().inv_cdf(alpha / 2.0)
+    assert out['zcrit'] == pytest.approx(expected, rel=1e-15)
+    assert out['zcrit'] > 8.3
+    assert out['ci'] is not None
+    assert np.all(np.isfinite(out['ci'])), out['ci']
+
+
 def test_seed_cap_and_unrepresentable_seed_label_fail_closed():
     with pytest.raises(ValueError, match='maximum|4096'):
         L.curve_simultaneous_inference(

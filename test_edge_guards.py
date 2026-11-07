@@ -65,6 +65,18 @@ def test_type_sm_lower_tail_keeps_a_tiny_but_real_power():
     assert out['type_s'] is not None and out['type_m'] is not None, out
 
 
+def test_type_sm_family_adjusted_critical_value_survives_tiny_alpha():
+    # A large family makes alpha/family_size smaller than the spacing below 1.
+    # ``1 - adj/2`` then rounds to exactly 1.0 and the old quantile call
+    # declared the design unrepresentable even though z is finite.
+    out = L.type_sm_design(12, 1.0, 0.5, alpha=1e-12, family_size=10 ** 6)
+    assert out['status'] in ('ok', 'warnings'), out
+    assert out['alpha_adjusted'] == pytest.approx(1e-18, rel=1e-12)
+    assert out['critical_value'] is not None, out
+    assert out['critical_value'] > 8.3, out
+    assert out['power'] is not None and out['power'] > 0.0, out
+
+
 def test_normal_quantile_does_not_clamp_at_the_old_bracket_edge():
     assert L._normal_quantile(0.5) == pytest.approx(0.0, abs=1e-15)
     assert L._normal_quantile(1e-20) < -9.0

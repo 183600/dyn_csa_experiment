@@ -397,22 +397,31 @@ def _seq_spend_fraction(name, t, alpha, sides):
     if name in ('obrien_fleming', 'obf'):
         if _SeqNormalDist is None:  # pragma: no cover
             raise RuntimeError('statistics.NormalDist is unavailable')
-        nd = _SeqNormalDist()
-        if sides == 'two':
-            _p = 1.0 - float(alpha) / 2.0
-            if not (0.0 < _p < 1.0):
-                # ``1 - alpha/2`` rounds to exactly 1.0 once alpha is below
-                # ~2.2e-16 (also reachable through a large Bonferroni family).
-                # NormalDist rejects p=1.0; spend nothing at an interim look
-                # and let the final look (t>=1, handled above) spend all.
-                return 0.0
-            z = nd.inv_cdf(_p)
-            return float(2.0 * _seq_norm_sf(z / math.sqrt(t)) / float(alpha))
-        _p = 1.0 - float(alpha)
-        if not (0.0 < _p < 1.0):
+        alpha_f = float(alpha)
+        if not (alpha_f > 0.0):
+            # The caller validates 0 < alpha < 1; keep the direct-call
+            # contract conservative instead of dividing by zero.
             return 0.0
-        z = nd.inv_cdf(_p)
-        return float(_seq_norm_sf(z / math.sqrt(t)) / float(alpha))
+        nd = _SeqNormalDist()
+        # Solve the critical value in the LOWER tail.  ``1 - alpha`` and
+        # ``1 - alpha/2`` round to exactly 1.0 once alpha is below ~2.2e-16
+        # (also reachable through a large Bonferroni family, which is exactly
+        # the scale this design is meant to support), so the old upper-tail
+        # solve silently returned 0 spend for every interim look.  Quantile
+        # symmetry gives the same z as ``inv_cdf(1 - tail)`` but keeps the
+        # tiny tail representable.
+        if sides == 'two':
+            tail = alpha_f / 2.0
+            if tail <= 0.0:
+                # alpha/2 underflowed to 0 for a subnormal alpha.  Using the
+                # larger one-sided tail spends slightly less than the exact
+                # O'Brien-Fleming fraction (conservative) rather than
+                # pretending the interim looks spend nothing.
+                tail = alpha_f
+            z = -float(nd.inv_cdf(tail))
+            return float(2.0 * _seq_norm_sf(z / math.sqrt(t)) / alpha_f)
+        z = -float(nd.inv_cdf(alpha_f))
+        return float(_seq_norm_sf(z / math.sqrt(t)) / alpha_f)
     if name == 'linear':
         return float(t)
     raise ValueError(f'unknown spending function {name!r}')

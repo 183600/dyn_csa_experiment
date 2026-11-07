@@ -234,6 +234,25 @@ def test_obf_interim_spend_is_not_a_fake_zero_at_small_alpha():
     assert spend < 1.0, spend
 
 
+def test_obf_spend_survives_alpha_below_the_float_one_ulp():
+    # A large Bonferroni family can make the comparison alpha smaller than the
+    # spacing below 1.  Solving ``inv_cdf(1 - alpha)`` then rounds to
+    # ``inv_cdf(1.0)`` and the old code returned a fake zero spend at every
+    # interim look.  The lower-tail solve must keep the representable fraction
+    # and, at a scale where that spend exceeds the look's exact resolution,
+    # actually produce an interim rejection boundary.
+    for sides in ('two', 'greater'):
+        f = L._seq_spend_fraction('obrien_fleming', 0.5, 1e-18, sides)
+        assert 0.0 < f <= 1.0, (sides, f)
+    plan = L.sequential_boundaries([64, 128, 256], alpha=1e-18,
+                                   spending='obrien_fleming')
+    assert plan['status'] == 'ok', plan
+    assert plan['boundaries'][0]['nominal_cumulative_spend'] > 0.0
+    assert isinstance(plan['boundaries'][1]['b'], int), plan['boundaries']
+    assert plan['boundaries'][1]['nominal_cumulative_spend'] > 0.0
+    json.dumps(plan, allow_nan=False)
+
+
 def test_large_but_admissible_plan_remains_exact_and_bounded():
     looks = [32 * i for i in range(1, 33)]
     plan = L.sequential_boundaries(looks, alpha=0.05,

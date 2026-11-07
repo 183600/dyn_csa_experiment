@@ -659,13 +659,16 @@ def _cv_normal_enumeration(D, *, alpha, margin, flatness_margin):
     p_upper[spread_zero] = np.nan
     p_two = np.minimum(1.0, 2.0 * np.minimum(p_lower, p_upper))
     p_two[spread_zero] = np.nan
-    _p = 1.0 - alpha / 2.0
-    if not (0.0 < _p < 1.0):
-        # ``1 - alpha/2`` rounds to exactly 1.0 for alpha below ~1e-16;
-        # NormalDist refuses p=1.0.  Clamp to the largest representable
-        # two-sided level instead of crashing the fallback.
-        _p = 1.0 - 1e-15
-    zcrit = normal.inv_cdf(_p)
+    # Solve the two-sided critical value in the LOWER tail.  ``1 - alpha/2``
+    # rounds to exactly 1.0 for alpha below ~2e-16 (a large Bonferroni family
+    # reaches that scale), and clamping to 1-1e-15 silently understates the
+    # interval.  Quantile symmetry keeps the exact tiny tail representable.
+    _tail = float(alpha) / 2.0
+    if _tail <= 0.0:
+        # alpha/2 underflowed for a subnormal alpha; the one-sided tail is a
+        # conservative (wider) interval rather than a fake fixed level.
+        _tail = float(alpha)
+    zcrit = -float(normal.inv_cdf(_tail))
     with np.errstate(over='ignore', invalid='ignore'):
         ci_n = np.column_stack([mean_n - zcrit * sem_n,
                                 mean_n + zcrit * sem_n])

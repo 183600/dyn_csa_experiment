@@ -164,8 +164,18 @@ def _tsm_z(alpha, family_size, critical_value):
     if not (0.0 < adj < 1.0):
         return None, None, 'bonferroni', (
             f'alpha/family_size={_tsm_repr(adj)} is not a probability in (0,1)')
+    # Solve the two-sided critical value in the LOWER tail.  ``1 - adj/2``
+    # rounds to exactly 1.0 once the Bonferroni-adjusted alpha is below
+    # ~2e-16, which a large family reaches; that used to make the design
+    # "not representable" even though the critical value is finite.  Quantile
+    # symmetry keeps the tiny tail representable.
+    _tail = adj / 2.0
+    if _tail <= 0.0:
+        # adj/2 underflowed for a subnormal adjusted alpha; the one-sided
+        # tail is a conservative (larger) critical value.
+        _tail = adj
     try:
-        z = _tsm_quantile(1.0 - adj / 2.0)
+        z = -float(_tsm_quantile(_tail))
     except (ValueError, OverflowError):
         return None, None, 'bonferroni', (
             'the family-adjusted two-sided critical value is not representable')
