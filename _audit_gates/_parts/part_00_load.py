@@ -637,6 +637,64 @@ def _finite_number(value):
     return number if math.isfinite(number) else None
 
 
+# The audit fragments below are appended into one module namespace, so helpers
+# that would otherwise be repeated with a gate-specific prefix (``_bt_``,
+# ``_de_``, ``_es_``, …) live here once.  Each fragment keeps its historical
+# prefixed name as an alias; call sites and diagnostics stay unchanged.
+def _gate_plain_int(value):
+    """Return ``value`` when it is an exact non-boolean integer, else ``None``.
+
+    Artifact integers (seeds, counts) are identities, not measurements: a
+    ``bool`` is a flag and a float such as ``1.0`` is not an exact integer
+    spelling.  No string or float coercion happens here.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return int(value)
+
+
+def _gate_str_list(value):
+    """Normalise a JSON list/tuple of identifiers to a list of strings.
+
+    Non-string members are formatted with ``str`` so a malformed declaration is
+    reported as text instead of aborting the audit.  Other container types are
+    treated as an empty declaration.
+    """
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [item if isinstance(item, str) else str(item) for item in value]
+
+
+def _gate_path_text(value):
+    """Filesystem path as text, or ``None`` when the value is not usable."""
+    try:
+        return os.fsdecode(os.fspath(value))
+    except Exception:
+        return None
+
+
+def _gate_key_text_80(key):
+    """Bounded, exception-safe key text for untrusted diagnostics."""
+    try:
+        text = str(key)
+    except (ValueError, MemoryError):
+        return f'<unrepresentable {type(key).__name__}>'
+    return text if len(text) <= 80 else text[:77] + '...'
+
+
+def _gate_resolve_first(path, defaults):
+    """Resolve an explicit path, or the first existing default under ``REPO``."""
+    if path is not None:
+        if isinstance(path, (str, os.PathLike)):
+            return os.fspath(path)
+        return None
+    for rel in defaults:
+        candidate = os.path.join(REPO, rel)  # noqa: F821 (defined below)
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
 def _exact_int(value):
     """Exact integer for a JSON value, or ``None``.
 

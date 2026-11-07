@@ -52,7 +52,7 @@ if _NEEDED:
         print(f"[setup] {_msg}")
 import torch
 print('torch', torch.__version__, '| cuda', torch.cuda.is_available())
-import gc, copy, math, os, re, time, json, random, csv, tempfile, itertools, hashlib, collections, threading, numbers
+import gc, copy, math, re, time, json, random, csv, tempfile, itertools, hashlib, collections, threading, numbers
 import array
 from math import comb
 from dataclasses import dataclass
@@ -77,7 +77,6 @@ from data_guard import (
     prepare_categorical_features, fit_categorical_encoder,
     categorical_shift_report, duplicate_mask,
 )
-import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint

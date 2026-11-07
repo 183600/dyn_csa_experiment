@@ -132,24 +132,26 @@
 | M0 | FineWeb-Edu 数据路径、内核 G0 门、S1/S2 规模面板 | [`python -m explib.m0`](#b-档-m0--s1扩规模入口已选定-b-档) | `results_b_s1/`、`results_b_s2/`、`analysis_m0/` |
 | open-block | 最大块长 × 当前开放块的读取规则 | [`python -m explib.open_block`](#开放块面板) | `analysis_open_block/` |
 
-训练模式不会隐式启动；唯一的历史例外是 v6 脚本：它默认使用 `full`，因此
-裸跑 `python run_gapfill.py` 会启动主面板。训练模式之外的模式（`smoke`、
-`plan`、`analysis`、`report`）不启动研究面板；训练模式（`full`、
-`phase <name>`、`main`、`pilot`、`aux`、`extended`、`auto`，以及 v6 的
-`overfit` / `topup` 辅助模式）会启动训练。各驱动的模式见下表；`--help`
-打印驱动说明，argparse 驱动的子命令也会一并列出。
+训练模式通常需要显式指定，但有两组入口在省略模式时默认 `full`：v6 脚本
+（`python run_gapfill.py`）与 `explib/` 下的 v7–v12 驱动。裸跑其中任一入口
+都会启动该代次的主面板；M0、open-block 与 `explib.reproduce` 则必须给出
+模式或子命令。训练模式之外的模式（`smoke`、`plan`、`analysis`、`report`）
+不启动研究面板；训练模式（`full`、`phase <name>`、`main`、`pilot`、`aux`、
+`extended`、`auto`，以及 v6 的 `overfit` / `topup` 辅助模式）会启动训练。
+各驱动的模式见下表；`--help` 打印驱动说明，argparse 驱动的子命令也会一并
+列出。
 
 | 驱动 | 模式 |
 |---|---|
 | `python run_gapfill.py` | `smoke`、`overfit`、`topup`、`full`（默认 `full`） |
-| `python -m explib.rope` | `smoke`、`analysis`、`phase P0R` / `P0W` / `P0E` / `P2S` / `P1L` / `P1T`、`full` |
-| `python -m explib.scale` | `smoke`、`analysis`、`phase P1S` / `P2R`、`full` |
-| `python -m explib.resume` | `smoke`、`analysis`、`report`、`phase P2T` / `P2S3`、`full` |
-| `python -m explib.corruption` | `smoke`、`analysis`、`report`、`phase <name>`、`full` |
-| `python -m explib.length` | `smoke`、`analysis`、`report`、`phase <name>`、`full` |
-| `python -m explib.confirmation` | `smoke`、`plan`、`dynamic-plan`、`power`、`phase <name>`、`finaltest`、`analysis`、`report`、`full`、`auto` |
-| `python -m explib.open_block` | `smoke`、`pilot`、`main`、`aux`、`extended`、`report` |
-| `python -m explib.m0` | `params`、`data`、`smoke`、`kernel`、`analysis`、`full`、`auto` |
+| `python -m explib.rope` | `smoke`、`analysis`、`phase P0R` / `P0W` / `P0E` / `P2S` / `P1L` / `P1T`、`full`（默认 `full`） |
+| `python -m explib.scale` | `smoke`、`analysis`、`phase P1S` / `P2R`、`full`（默认 `full`） |
+| `python -m explib.resume` | `smoke`、`analysis`、`report`、`phase P2T` / `P2S3`、`full`（默认 `full`） |
+| `python -m explib.corruption` | `smoke`、`analysis`、`report`、`phase <name>`、`full`（默认 `full`） |
+| `python -m explib.length` | `smoke`、`analysis`、`report`、`phase <name>`、`full`（默认 `full`） |
+| `python -m explib.confirmation` | `smoke`、`plan`、`dynamic-plan`、`power`、`phase <name>`、`finaltest`、`analysis`、`report`、`full`（默认 `full`）、`auto` |
+| `python -m explib.open_block` | `smoke`、`pilot`、`main`、`aux`、`extended`、`report`（必须给出模式） |
+| `python -m explib.m0` | `params`、`data`、`smoke`、`kernel`、`analysis`、`full`、`auto`（必须给出模式） |
 | `python -m explib.reproduce` | `compare 原始目录 重跑目录`、`report OLD.json NEW.json`、`canary [--write]` / `[--verify PATH]` |
 
 ## 从这里开始
@@ -187,8 +189,8 @@ make help                              # 可用的零 GPU 目标
 未通过预检时以非零状态退出，并且不会读取 test split。`make registry`
 检查声明的片段是否都存在，以及加载器的片段列表是否与磁盘上的包一致。
 
-以上命令都不会启动训练。训练需要显式选择模式，例外是 `python
-run_gapfill.py`（默认 `full`）：要跑正式面板时调用驱动的 `full`、
+以上命令都不会启动训练。模式通常需要显式指定；但 v6 脚本与 v7–v12 驱动在
+省略模式时默认 `full`，裸跑会启动面板。要跑正式面板时显式传入 `full`、
 `phase <name>` 或 `auto`；修改流水线后，先用该驱动的 `smoke` 模式验证。
 
 ### 命令约定
@@ -589,9 +591,10 @@ tail -f run_v6.log
 
 ### 任务级并行（每个实验一张卡）
 
-在多卡机器上，所有驱动都可以并行运行独立单元——每个 `(variant, seed)`
-训练一个进程，**一卡一进程**。严格可选、默认关闭：不设置变量时行为与上面
-的串行描述完全一致。
+v7–v12 与 M0 驱动可以在多卡机器上并行运行独立单元——每个
+`(variant, seed)` 训练一个进程，**一卡一进程**。开放块面板与历史 v6 脚本
+不使用该执行器，仍走各自的串行循环。并行严格可选、默认关闭：不设置变量时
+行为与上面的串行描述完全一致。
 
 ```bash
 # 每张可见 GPU 一个 worker（推荐）：
@@ -834,11 +837,11 @@ python -m explib.rope phase P1T   # seq-2048 topk 扫描
 python build_report.py            # 从产物重建 REPORT_v7.md（零 GPU）
 ```
 
-所有训练驱动都按配置的运行时上限计量自己的加速器时间：超过上限的运行拒绝
-启动，运行中途到达上限则被硬截断。多卡机器上 `CSA_PAR=auto` 以一卡一
-实验并行运行相同阶段（上限此时按 GPU-秒总账计量）——被截断的单元不会留下
-不完整测量，会在下一轮重试。上面描述的 push / 关机钩子属于 v6 驱动；
-`explib` 驱动不会主动关闭实例。
+使用运行时上限的 v6–v12 与 M0 训练驱动按配置的上限计量自己的加速器时间：
+超过上限的运行拒绝启动，运行中途到达上限则被硬截断。其中 v7–v12 与 M0
+驱动在多卡机器上还接受 `CSA_PAR=auto`，以一卡一实验并行运行相同阶段（上限
+此时按 GPU-秒总账计量）——被截断的单元不会留下不完整测量，会在下一轮重试。
+上面描述的 push / 关机钩子属于 v6 驱动；`explib` 驱动不会主动关闭实例。
 
 > 量值一律以 `build_report.py` / `fuse_analysis.py` 与各驱动 `report`
 > 构建器从 `results_*/`、`analysis_*/` 落盘产物现算出的表格为准，仓库正文
@@ -851,8 +854,8 @@ python build_report.py            # 从产物重建 REPORT_v7.md（零 GPU）
 | 现象 | 原因 | 处理 |
 |---|---|---|
 | 找不到产物或清单 | 驱动按检出路径解析 `results_*/`、`analysis_*/` 与冻结输入 | 所有命令都在仓库根目录执行 |
-| 裸跑 v6 命令却开始长时间训练 | `python run_gapfill.py` 默认 `full` | 只做流水线自检时用 `python run_gapfill.py smoke` |
-| `--help` 没有打印说明，反而开始运行 | 位置式模式先于标志被消费（尤其 v6 脚本） | 把 `--help` 放在最前：`python run_gapfill.py --help`，或 `python -m explib.<driver> --help` |
+| 裸跑 v6 或 v7–v12 命令却开始长时间训练 | v6 脚本与 v7–v12 驱动默认 `full` | 只做流水线自检时用 `smoke`，或显式指定 `phase <name>` / `analysis` |
+| `--help` 没有打印说明，反而开始运行 | 位置式模式先于标志被消费（v6 脚本与 v7–v12 驱动均如此） | 把 `--help` 放在最前：`python run_gapfill.py --help`，或 `python -m explib.<driver> --help` |
 | 定向测试通过，但没有覆盖改动 | `make test` 收集所有 `test_*.py`；`pytest path::test` 只检查对应用例 | 交付前运行 `make test` |
 | test split 读取后无法回退 | `P5T` 是一次性评估，也只有它读 `wiki.test.raw` | 不要在其外围再写读 test 的脚本；先检查 plan |
 | 修改语料后结果发生变化 | 陈旧的 `wt103_cache/` 不会静默重建 | 删除缓存、重建，再比较两次运行 |

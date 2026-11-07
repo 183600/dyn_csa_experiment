@@ -36,11 +36,8 @@ def _esci_gate_key_text(value, limit=160):
 
 
 def _esci_gate_path_text(value):
-    """Filesystem path as text, or ``None`` when the value is not usable."""
-    try:
-        return os.fsdecode(os.fspath(value))
-    except Exception:
-        return None
+    """Path text or ``None``; shared rule in :func:`_gate_path_text`."""
+    return _gate_path_text(value)
 
 
 def _esci_gate_resolve(path, defaults):

@@ -10,9 +10,8 @@ def _es_close(a, b, rel=1e-9, abs_=1e-12):
 
 
 def _es_audit_int(value):
-    if isinstance(value, bool) or not isinstance(value, int):
-        return None
-    return int(value)
+    """Exact integer or ``None``; shared rule in :func:`_gate_plain_int`."""
+    return _gate_plain_int(value)
 
 
 def audit_effect_sensitivity(path=None):

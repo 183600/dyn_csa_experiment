@@ -142,26 +142,28 @@ entry point; v7 and later live under `explib/`.
 | M0 | FineWeb-Edu data path, kernel G0 gate, S1/S2 scale panels | [`python -m explib.m0`](#b-tier-m0--s1-scale-up-entry-point-adopted-tier-b) | `results_b_s1/`, `results_b_s2/`, `analysis_m0/` |
 | open-block | maximum block length × open-block reading rule | [`python -m explib.open_block`](#open-block-panel) | `analysis_open_block/` |
 
-Training modes are never implicit, with one historical exception: the v6
-script defaults to `full`, so a bare `python run_gapfill.py` starts the main
-panel. Modes other than the training modes (`smoke`, `plan`, `analysis`,
-`report`) do not start a research panel; the training modes (`full`,
-`phase <name>`, `main`, `pilot`, `aux`, `extended`, `auto`, and the v6
-`overfit` / `topup` helpers) do. The modes are summarized below; `--help`
-prints the driver description, and the argparse-based drivers also list their
-subcommands.
+Training modes usually require an explicit argument, but two sets of entry
+points default to `full` when none is given: the v6 script
+(`python run_gapfill.py`) and the v7–v12 drivers under `explib/`. A bare
+command in either set starts that generation's main panel. M0, open-block and
+`explib.reproduce` require a mode or subcommand. Modes other than the training
+modes (`smoke`, `plan`, `analysis`, `report`) do not start a research panel;
+the training modes (`full`, `phase <name>`, `main`, `pilot`, `aux`, `extended`,
+`auto`, and the v6 `overfit` / `topup` helpers) do. The modes are summarized
+below; `--help` prints the driver description, and the argparse-based drivers
+also list their subcommands.
 
 | driver | modes |
 |---|---|
 | `python run_gapfill.py` | `smoke`, `overfit`, `topup`, `full` (default `full`) |
-| `python -m explib.rope` | `smoke`, `analysis`, `phase P0R` / `P0W` / `P0E` / `P2S` / `P1L` / `P1T`, `full` |
-| `python -m explib.scale` | `smoke`, `analysis`, `phase P1S` / `P2R`, `full` |
-| `python -m explib.resume` | `smoke`, `analysis`, `report`, `phase P2T` / `P2S3`, `full` |
-| `python -m explib.corruption` | `smoke`, `analysis`, `report`, `phase <name>`, `full` |
-| `python -m explib.length` | `smoke`, `analysis`, `report`, `phase <name>`, `full` |
-| `python -m explib.confirmation` | `smoke`, `plan`, `dynamic-plan`, `power`, `phase <name>`, `finaltest`, `analysis`, `report`, `full`, `auto` |
-| `python -m explib.open_block` | `smoke`, `pilot`, `main`, `aux`, `extended`, `report` |
-| `python -m explib.m0` | `params`, `data`, `smoke`, `kernel`, `analysis`, `full`, `auto` |
+| `python -m explib.rope` | `smoke`, `analysis`, `phase P0R` / `P0W` / `P0E` / `P2S` / `P1L` / `P1T`, `full` (default `full`) |
+| `python -m explib.scale` | `smoke`, `analysis`, `phase P1S` / `P2R`, `full` (default `full`) |
+| `python -m explib.resume` | `smoke`, `analysis`, `report`, `phase P2T` / `P2S3`, `full` (default `full`) |
+| `python -m explib.corruption` | `smoke`, `analysis`, `report`, `phase <name>`, `full` (default `full`) |
+| `python -m explib.length` | `smoke`, `analysis`, `report`, `phase <name>`, `full` (default `full`) |
+| `python -m explib.confirmation` | `smoke`, `plan`, `dynamic-plan`, `power`, `phase <name>`, `finaltest`, `analysis`, `report`, `full` (default `full`), `auto` |
+| `python -m explib.open_block` | `smoke`, `pilot`, `main`, `aux`, `extended`, `report` (a mode is required) |
+| `python -m explib.m0` | `params`, `data`, `smoke`, `kernel`, `analysis`, `full`, `auto` (a mode is required) |
 | `python -m explib.reproduce` | `compare ORIGINAL RERUN`, `report OLD.json NEW.json`, `canary [--write]` / `[--verify PATH]` |
 
 ## Start here
@@ -202,10 +204,11 @@ plan` exits non-zero when the frozen plan fails its preflight and never reads
 the test split. `make registry` checks that every declared fragment exists and
 that the loader's part list matches the package on disk.
 
-None of these commands starts a training run. Training is explicit except for
-`python run_gapfill.py`, whose default mode is `full`: invoke a driver's
-`full`, `phase <name>`, or `auto` mode when you intend to run it, and start
-with that driver's `smoke` mode when validating a change to the pipeline.
+None of these commands starts a training run. Mode selection is usually
+explicit, but the v6 script and the v7–v12 drivers default to `full` when no
+mode is supplied, so a bare invocation starts a panel. When you intend to run
+one, pass `full`, `phase <name>`, or `auto`; start with `smoke` when validating
+a change to the pipeline.
 
 ### Command conventions
 
@@ -640,10 +643,12 @@ with `V6_NO_PUSH=1`).
 
 ### Task-level parallelism (one GPU per run)
 
-Every driver can run its independent cells — one `(variant, seed)` training
-run each — in parallel, **one card per run**, on multi-GPU boxes. It is
-strictly opt-in and off by default, so the serial behaviour above is exactly
-what you get when the variable is unset:
+The v7–v12 and M0 drivers can run their independent cells — one
+`(variant, seed)` training run each — in parallel, **one card per run**, on
+multi-GPU boxes. The open-block panel and the historical v6 script do not use
+this executor and keep their serial loops. Parallel execution is strictly
+opt-in and off by default, so the serial behaviour above is exactly what you
+get when the variable is unset:
 
 ```bash
 # one worker per visible GPU (recommended):
@@ -914,13 +919,14 @@ python -m explib.rope phase P1T   # seq-2048 topk sweep
 python build_report.py            # regenerate REPORT_v7.md from artifacts (zero GPU)
 ```
 
-Every training driver meters its own accelerator time against a configured
-run-time cap: it refuses to start a run that would pass the cap, and
-hard-truncates a run that reaches it mid-flight. On a multi-GPU box,
-`CSA_PAR=auto` runs the same phases with one independent run per card (the cap
-then meters aggregate GPU-seconds) — a truncated cell leaves no partial
-measurement and is retried on the next pass. The push/shutdown hooks described
-above belong to the v6 driver; `explib` drivers leave the instance running.
+The v6–v12 and M0 training drivers meter their own accelerator time against a
+configured run-time cap: they refuse to start a run that would pass the cap, and
+hard-truncate a run that reaches it mid-flight. On a multi-GPU box, the v7–v12
+and M0 drivers also accept `CSA_PAR=auto`, which runs the same phases with one
+independent run per card (the cap then meters aggregate GPU-seconds) — a
+truncated cell leaves no partial measurement and is retried on the next pass.
+The push/shutdown hooks described above belong to the v6 driver; `explib`
+drivers leave the instance running.
 
 > All quantities are taken from the tables that `build_report.py` /
 > `fuse_analysis.py` and the per-driver `report` builders compute on the fly
@@ -934,8 +940,8 @@ Treat this as a checklist when a command behaves unexpectedly.
 | symptom | why | what to do |
 |---|---|---|
 | artifacts or manifests are "not found" | the drivers resolve `results_*/`, `analysis_*/` and frozen inputs relative to the checkout | run every command from the repository root |
-| a bare v6 command starts a long run | `python run_gapfill.py` defaults to `full` | use `python run_gapfill.py smoke` for a plumbing check |
-| `--help` starts a run instead of printing help | a positional mode is consumed before the flag (notably in the v6 script) | put `--help` first: `python run_gapfill.py --help`, or `python -m explib.<driver> --help` |
+| a bare v6 or v7–v12 command starts a long run | the v6 script and the v7–v12 drivers default to `full` | use `smoke` for a plumbing check, or name `phase <name>` / `analysis` explicitly |
+| `--help` starts a run instead of printing help | a positional mode is consumed before the flag (in the v6 script and the v7–v12 drivers) | put `--help` first: `python run_gapfill.py --help`, or `python -m explib.<driver> --help` |
 | a passing targeted test did not cover the change | `make test` discovers every `test_*.py` module; `pytest path::test` checks only that case | run `make test` before trusting the change |
 | a test-split read cannot be undone | `P5T` is the one-shot evaluation; only it reads `wiki.test.raw` | do not add a test-reading script around it; inspect the plan first |
 | results changed after editing the corpus | a stale `wt103_cache/` is not rebuilt silently | delete the cache, rebuild it, then compare runs |

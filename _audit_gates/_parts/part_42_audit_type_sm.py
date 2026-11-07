@@ -24,15 +24,8 @@ _TSM_GATE_ARTIFACT_DEFAULTS = (
 
 
 def _tsm_gate_resolve(path, defaults):
-    if path is not None:
-        if isinstance(path, (str, os.PathLike)):
-            return os.fspath(path)
-        return None
-    for rel in defaults:
-        candidate = os.path.join(REPO, rel)  # noqa: F821
-        if os.path.exists(candidate):
-            return candidate
-    return None
+    """Resolve a path; shared rule in :func:`_gate_resolve_first`."""
+    return _gate_resolve_first(path, defaults)
 
 
 def audit_type_sm(manifest_path=None, pilot_path=None, *, verbose=True):

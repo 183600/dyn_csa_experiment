@@ -19,12 +19,8 @@
 
 
 def _pss_key_text(key):
-    """Bounded, exception-safe key text for untrusted diagnostics."""
-    try:
-        text = str(key)
-    except (ValueError, MemoryError):
-        return f'<unrepresentable {type(key).__name__}>'
-    return text if len(text) <= 80 else text[:77] + '...'
+    """Bounded key text; shared rule in :func:`_gate_key_text_80`."""
+    return _gate_key_text_80(key)
 
 
 def _pss_forbidden_keys(value, *, path=''):

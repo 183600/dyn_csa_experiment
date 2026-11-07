@@ -44,9 +44,8 @@ def _bt_gate_dict(value):
 
 
 def _bt_gate_list(value):
-    if not isinstance(value, (list, tuple)):
-        return []
-    return [item if isinstance(item, str) else str(item) for item in value]
+    """String list or ``[]``; shared rule in :func:`_gate_str_list`."""
+    return _gate_str_list(value)
 
 
 def _bt_gate_manifest(manifest_path):

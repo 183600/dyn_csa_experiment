@@ -54,9 +54,8 @@ def _lsa_same(got, want, path, problems):
 
 
 def _lsa_int(value):
-    if isinstance(value, bool) or not isinstance(value, int):
-        return None
-    return int(value)
+    """Exact integer or ``None``; shared rule in :func:`_gate_plain_int`."""
+    return _gate_plain_int(value)
 
 
 def audit_length_strata(path=None):
