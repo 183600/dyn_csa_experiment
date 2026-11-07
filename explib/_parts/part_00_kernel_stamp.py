@@ -1361,9 +1361,9 @@ def _scaled_sum_of_squares(values, multiplier):
     if not (math.isfinite(ss) and ss > 0.0):
         return None
     try:
-        logval = (math.log(float(multiplier)) + 2.0 * math.log(scale)
+        logval = (math.log(multiplier) + 2.0 * math.log(scale)
                   + math.log(ss))
-    except (ValueError, OverflowError):
+    except (ValueError, TypeError, OverflowError):
         return None
     if not math.isfinite(logval) or logval > math.log(sys.float_info.max):
         return None
@@ -1379,11 +1379,25 @@ def _scaled_root_sum_of_squares(values, multiplier):
     deliberately returns a variance (or ``None``), so callers that need a
     standard error should use this helper instead of taking ``sqrt(var)``
     after an underflow.
+
+    The ordinary expression can overflow at the intermediate ``ss*multiplier``
+    (or fail for a multiplier above float64) even when the final scaled SE is
+    representable; those cases are recovered in log space.
     """
     vals = [float(v) for v in values]
     if not vals:
         return 0.0
-    if not (math.isfinite(multiplier) and multiplier >= 0.0):
+    if isinstance(multiplier, (bool, np.bool_)):
+        return None
+    try:
+        # ``math.isfinite`` converts to float and raises for an
+        # arbitrary-precision integer, which is still a finite multiplier.
+        multiplier_finite = math.isfinite(multiplier)
+    except OverflowError:
+        multiplier_finite = True
+    except (TypeError, ValueError):
+        return None
+    if not multiplier_finite or multiplier < 0.0:
         return None
     scale = max((abs(v) for v in vals), default=0.0)
     if not math.isfinite(scale):
@@ -1392,10 +1406,35 @@ def _scaled_root_sum_of_squares(values, multiplier):
         return 0.0
     try:
         ss = math.fsum((v / scale) ** 2 for v in vals)
-        if not (math.isfinite(ss) and ss > 0.0):
-            return None
-        out = scale * math.sqrt(ss * multiplier)
     except (OverflowError, ValueError):
+        return None
+    if not (math.isfinite(ss) and ss > 0.0):
+        return None
+    # Fast path: the ordinary float expression.  ``ss * multiplier`` can
+    # overflow (or underflow) even when the final, scale-normalised result is
+    # representable; the log-space fallback below recovers that case.
+    try:
+        out = scale * math.sqrt(ss * multiplier)
+    except (OverflowError, TypeError, ValueError):
+        out = None
+    if (out is not None and math.isfinite(out)
+            and not (out == 0.0 and any(v != 0.0 for v in vals))):
+        return out
+    if multiplier == 0.0:
+        # All-positive values times a zero multiplier is an exact zero SE, but
+        # the caller asked for a scale factor that makes it zero; keep the
+        # historical "not a measured zero" contract.
+        return None
+    try:
+        log_out = (math.log(scale) + 0.5 * math.log(ss)
+                   + 0.5 * math.log(multiplier))
+    except (OverflowError, TypeError, ValueError):
+        return None
+    if not math.isfinite(log_out) or log_out > math.log(sys.float_info.max):
+        return None
+    try:
+        out = math.exp(log_out)
+    except OverflowError:
         return None
     if not math.isfinite(out):
         return None
@@ -1403,7 +1442,7 @@ def _scaled_root_sum_of_squares(values, multiplier):
         # The standard error is below the smallest representable float; do not
         # report a fake exact-zero uncertainty.
         return None
-    return out
+    return float(out)
 
 
 def _scaled_mean_std_if_extreme(values, ddof=1):

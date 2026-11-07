@@ -1016,13 +1016,40 @@ def interaction_practical_decision(deltas, *, margin=None, sesoi=None,
 
 def _gammaincc(a, x):
     """正则化上不完全伽马 Q(a,x)，用于 Cochran Q 的卡方尾概率。"""
-    if not (a > 0.0) or math.isnan(x) or x < 0.0:
+    # ``x != x`` is the NaN test that also works for an arbitrary-precision
+    # integer (``math.isnan`` converts to float and raises above 1e308).
+    if not (a > 0.0) or x != x or x < 0.0:
         return float('nan')
-    if not math.isfinite(a):
+    try:
+        a_finite = math.isfinite(a)
+    except OverflowError:
+        # An exact positive integer beyond float64 is still a finite shape;
+        # the saturated-tail branch below compares it exactly.
+        a_finite = True
+    if not a_finite:
         return float('nan')
     if x == float('inf'):
         return 0.0
-    if not math.isfinite(x):
+    try:
+        x_finite = math.isfinite(x)
+    except OverflowError:
+        # An exact integer beyond float64.  For a finite float shape it is
+        # effectively +inf, but when both arguments are arbitrary-precision
+        # integers their difference can be tiny relative to the gamma sd
+        # sqrt(a), so compare the gap in log space before saturating.
+        if x == a:
+            return 0.5
+        near_mode = False
+        try:
+            gap = abs(x - a)
+            near_mode = (gap > 0
+                         and math.log(gap) <= 0.5 * math.log(a))
+        except (OverflowError, TypeError, ValueError):
+            near_mode = False
+        if near_mode:
+            return 0.5
+        return 1.0 if x < a else 0.0
+    if not x_finite:
         return float('nan')
     if x == 0.0:
         return 1.0
@@ -1041,7 +1068,17 @@ def _gammaincc(a, x):
             _q = float('nan')
         if math.isfinite(_q):
             return float(min(1.0, max(0.0, _q)))
-    gln = math.lgamma(a)
+    try:
+        gln = math.lgamma(a)
+    except OverflowError:
+        # Beyond a ~4e305 the log-gamma itself is not representable.  The
+        # Gamma(a,1) law is then concentrated at a with sd=sqrt(a); one
+        # float64 ulp in x is already ~2**-52*a / sqrt(a) standard
+        # deviations, which is astronomically large at this scale.  The tail
+        # therefore saturates to 0/1 except exactly at the mode.
+        if x == a:
+            return 0.5
+        return 1.0 if x < a else 0.0
     if x < a + 1.0:
         ap = float(a)
         s = 1.0 / a
@@ -1053,7 +1090,16 @@ def _gammaincc(a, x):
             if abs(d) < abs(s) * 1e-15:
                 break
         if a >= 1000.0:
-            r = (x - a) / a
+            # Compute the ratio before subtracting, so ``r = x/a - 1`` cannot
+            # round to exactly -1 when x is tiny relative to a (e.g. x=1e-300
+            # at a=1e3).  ``math.log1p(-1.0)`` raises ValueError; the true
+            # lower tail is simply zero there (the upper tail is one).
+            ratio = x / a
+            if ratio <= 0.0:
+                # x underflowed relative to a: the lower tail is below the
+                # smallest representable float.
+                return 1.0
+            r = ratio - 1.0
             if abs(r) < 1e-3:
                 log_r = (-(r * r) / 2.0
                          + (r ** 3) / 3.0
@@ -1061,7 +1107,9 @@ def _gammaincc(a, x):
                          + (r ** 5) / 5.0
                          - (r ** 6) / 6.0)
             else:
-                log_r = math.log1p(r) - r
+                # log(x/a) - (x/a - 1), evaluated without the cancellation
+                # that ``log1p(r)`` suffers once 1+r is no longer representable.
+                log_r = math.log(ratio) - r
             inv_a = 1.0 / a
             delta = inv_a * (1.0 / 12.0
                              - inv_a * inv_a * (1.0 / 360.0
