@@ -225,6 +225,15 @@ def test_audit_unusable_path_values_fail_closed_and_stay_strict_json():
                    for problem in report['problems']), (kwargs, report)
 
 
+def test_obf_interim_spend_is_not_a_fake_zero_at_small_alpha():
+    # z/sqrt(t) can exceed 8.3 at an early look, where 1-NormalDist().cdf(z)
+    # is exactly zero.  The O'Brien-Fleming spend is then reported as 0 even
+    # though it is a positive (representable) fraction of alpha.
+    spend = L._seq_spend_fraction('obrien_fleming', 0.25, 3e-16, 'two')
+    assert spend > 0.0, spend
+    assert spend < 1.0, spend
+
+
 def test_large_but_admissible_plan_remains_exact_and_bounded():
     looks = [32 * i for i in range(1, 33)]
     plan = L.sequential_boundaries(looks, alpha=0.05,

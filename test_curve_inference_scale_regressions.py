@@ -88,6 +88,26 @@ def test_replay_false_still_rejects_knob_and_shape_tamper():
         json.dumps(verdict, allow_nan=False)
 
 
+def test_normal_fallback_upper_tail_is_not_a_fake_zero():
+    # As a panel scales past the exact cap, a small SE against the mean gives
+    # z ~ 9.  ``1 - NormalDist().cdf(9)`` rounds to exactly 0.0, so the old
+    # fallback reported p=0 and a TOST p=0 (certainty).  The upper tail must
+    # stay the positive erfc value instead.
+    n = len(SEEDS)
+    sd = math.sqrt(n) / 9.0          # sem = sd/sqrt(n) = 1/9, mean = 1
+    effects = {'a': [1.0 - sd] * 10 + [1.0] + [1.0 + sd] * 10}
+    out = L.curve_simultaneous_inference(
+        ['a'], effects, seeds=SEEDS, alpha=0.05, min_n=6, margin=2.0)
+    assert out['method'] == 'normal_approximation_fallback'
+    row = out['per_condition']['a']
+    assert row['p_pointwise_upper'] > 0.0, row
+    assert row['p_pointwise_upper'] == pytest.approx(
+        0.5 * math.erfc(9.0 / math.sqrt(2.0)), rel=1e-9)
+    assert row['equivalence']['p_tost'] > 0.0, row
+    assert out['uniform']['equivalence']['p_tost'] > 0.0, out['uniform']
+    json.dumps(out, allow_nan=False)
+
+
 def test_seed_cap_and_unrepresentable_seed_label_fail_closed():
     with pytest.raises(ValueError, match='maximum|4096'):
         L.curve_simultaneous_inference(

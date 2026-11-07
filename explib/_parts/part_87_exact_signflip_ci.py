@@ -292,6 +292,58 @@ def _esci_scale_to_integers(vals):
     return xi, denom
 
 
+def _esci_float_ceil(frac):
+    """Smallest float ``>= frac`` (directed rounding of a lower bound).
+
+    ``float(Fraction)`` rounds to nearest, which can land *outside* the exact
+    acceptance set.  A reported confidence set must not advertise a location
+    whose exact sign-flip p is below alpha, so lower endpoints round upward.
+    Every exact endpoint is a subset mean of the input deltas, hence inside
+    ``[min(deltas), max(deltas)]``; the conversion cannot overflow for finite
+    inputs.
+    """
+    out = float(frac)
+    if _EsciFraction(out) < frac:
+        out = _esci_math.nextafter(out, _esci_math.inf)
+    return out
+
+
+def _esci_float_floor(frac):
+    """Largest float ``<= frac`` (directed rounding of an upper bound)."""
+    out = float(frac)
+    if _EsciFraction(out) > frac:
+        out = _esci_math.nextafter(out, -_esci_math.inf)
+    return out
+
+
+def _esci_float_intervals(intervals):
+    """Map exact rational intervals to the float range they may advertise.
+
+    Lower ends are rounded up and upper ends down, so every reported float
+    point still satisfies the exact test at the declared alpha.  In the rare
+    case where an exact interval is narrower than one float spacing and
+    straddles no representable value, there is no float interval that is both
+    non-empty and fully inside the set; report the nearest representable hull
+    and let the caller name that limitation instead of silently over-covering.
+    """
+    out = []
+    collapsed = []
+    for lo, hi in intervals:
+        lo_f = _esci_float_ceil(lo)
+        hi_f = _esci_float_floor(hi)
+        if lo_f <= hi_f:
+            out.append([lo_f, hi_f])
+            continue
+        lo_hull = _esci_float_floor(lo)
+        hi_hull = _esci_float_ceil(hi)
+        if lo_hull <= hi_hull:
+            out.append([lo_hull, hi_hull])
+            collapsed.append([float(lo), float(hi)])
+        else:  # pragma: no cover - ordered rationals always satisfy the hull
+            out.append([float(lo), float(hi)])
+    return out, collapsed
+
+
 def _esci_intervals(xi, denom, alpha):
     """Return (intervals, meta) for A = {mu: p(mu) >= alpha}.
 
@@ -915,7 +967,13 @@ def exact_signflip_ci(deltas, *, alpha=0.05, max_n=None, seeds=None):
                 'confidence set exists at this n and alpha'],
         })
         return _esci_jsonable(base)
-    float_intervals = [[float(lo), float(hi)] for lo, hi in intervals]
+    float_intervals, _collapsed = _esci_float_intervals(intervals)
+    if _collapsed:
+        warnings.append(
+            'the exact acceptance set is narrower than one float spacing and '
+            'contains no representable value; the reported endpoints are the '
+            'nearest representable hull, so boundary membership may disagree '
+            'with the exact rational test by less than one ulp')
     bounding = [min(lo for lo, _ in float_intervals),
                 max(hi for _, hi in float_intervals)]
     exact_contains = _esci_contains_zero(intervals)

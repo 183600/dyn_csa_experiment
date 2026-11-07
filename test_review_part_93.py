@@ -88,6 +88,26 @@ def test_exact_ci_cannot_disagree_with_exact_p_where_t_does():
     assert result['ci'][0] <= 0.0 <= result['ci'][1]
 
 
+def test_reported_float_endpoints_stay_inside_the_exact_acceptance_set():
+    # ``float(Fraction)`` rounds to nearest.  The exact rational endpoint can
+    # sit one ulp inside the interval, so a nearest-rounded lower/upper bound
+    # can advertise a location whose exact sign-flip p is already below alpha.
+    # DISAGREE12 used to report hi=0.891311359143354, where p=0.0498046875.
+    cases = [
+        (DISAGREE12, 0.05),
+        ([-0.58, -1.03, -0.51, -2.4, 2.45], 0.20),
+        ([0.4, -0.25, 1.1, 0.05, -0.6, 0.9, 0.15, -0.35], 0.10),
+    ]
+    for d, alpha in cases:
+        result = L.exact_signflip_ci(d, alpha=alpha)
+        assert result['unbounded'] is False, (d, alpha)
+        for lo, hi in result['intervals']:
+            p_lo = L.exact_signflip_location_p(d, lo)['p']
+            p_hi = L.exact_signflip_location_p(d, hi)['p']
+            assert p_lo is not None and p_lo >= alpha, (d, alpha, lo, p_lo)
+            assert p_hi is not None and p_hi >= alpha, (d, alpha, hi, p_hi)
+
+
 def test_shift_and_scale_equivariance():
     d = [0.4, -0.3, 1.2, 0.05, -0.8, 0.6, 0.2, -0.1, 0.9, -0.5, 0.3, 0.7]
     base = L.exact_signflip_ci(d)

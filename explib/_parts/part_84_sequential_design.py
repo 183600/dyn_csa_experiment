@@ -369,6 +369,17 @@ def _seq_incremental_prob(count, w, w0, n, n0, q):
         return 0.0
 
 
+def _seq_norm_sf(x):
+    """Standard-normal upper tail without ``1 - cdf`` cancellation.
+
+    ``NormalDist.cdf`` rounds to 1.0 above about z=8.3; the O'Brien-Fleming
+    spending at an early look evaluates exactly that tail, and reporting
+    ``spend=0`` for a positive (if tiny) allocation would understate the
+    declared alpha spend.  ``erfc`` keeps the far tail.
+    """
+    return 0.5 * math.erfc(float(x) / math.sqrt(2.0))
+
+
 def _seq_spend_fraction(name, t, alpha, sides):
     """Cumulative alpha spent by fraction ``t`` of the maximum sample size.
 
@@ -396,12 +407,12 @@ def _seq_spend_fraction(name, t, alpha, sides):
                 # and let the final look (t>=1, handled above) spend all.
                 return 0.0
             z = nd.inv_cdf(_p)
-            return float(2.0 * (1.0 - nd.cdf(z / math.sqrt(t))) / float(alpha))
+            return float(2.0 * _seq_norm_sf(z / math.sqrt(t)) / float(alpha))
         _p = 1.0 - float(alpha)
         if not (0.0 < _p < 1.0):
             return 0.0
         z = nd.inv_cdf(_p)
-        return float((1.0 - nd.cdf(z / math.sqrt(t))) / float(alpha))
+        return float(_seq_norm_sf(z / math.sqrt(t)) / float(alpha))
     if name == 'linear':
         return float(t)
     raise ValueError(f'unknown spending function {name!r}')

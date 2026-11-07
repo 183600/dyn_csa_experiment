@@ -637,14 +637,15 @@ def _cv_normal_enumeration(D, *, alpha, margin, flatness_margin):
         sds = sd_n * row_scale
         sems = sem_n * row_scale
     # z = mean/se.  The lower-tail p (H1: mean < 0) is Phi(z); the upper-tail
-    # p (H1: mean > 0) is 1-Phi(z).  Taking the ratio in normalised units keeps
-    # it finite when both the mean and the SE are near float64's limit.
+    # p (H1: mean > 0) is the survival function.  Taking the ratio in
+    # normalised units keeps it finite when both the mean and the SE are near
+    # float64's limit.
     z = np.zeros(K, dtype=float)
     pos = sem_n > 0.0
     with np.errstate(over='ignore', invalid='ignore', divide='ignore'):
         z[pos] = mean_n[pos] / sem_n[pos]
-    p_lower = np.asarray([normal.cdf(float(v)) for v in z])
-    p_upper = np.asarray([1.0 - normal.cdf(float(v)) for v in z])
+    p_lower = np.asarray([_cv_norm_cdf(float(v)) for v in z])
+    p_upper = np.asarray([_cv_norm_sf(float(v)) for v in z])
     # A measured zero spread with a non-zero mean is degenerate; the exact
     # branch refuses it.  The old fallback synthesised p_lower=1/p_upper=0
     # (or the reverse), which then produced p_two=0 and a "reject" at n
@@ -707,11 +708,11 @@ def _cv_normal_enumeration(D, *, alpha, margin, flatness_margin):
             # branch has no TOST here, so do not turn no measured spread into
             # a zero equivalence p-value.
             p_low = np.asarray([
-                (1.0 - normal.cdf(float((m + gm) / s)) if s > 0.0
+                (_cv_norm_sf(float((m + gm) / s)) if s > 0.0
                  else float('nan'))
                 for m, s, gm in zip(mean_n, sem_n, margin_n)])
             p_high = np.asarray([
-                (1.0 - normal.cdf(float((gm - m) / s)) if s > 0.0
+                (_cv_norm_sf(float((gm - m) / s)) if s > 0.0
                  else float('nan'))
                 for m, s, gm in zip(mean_n, sem_n, margin_n)])
         p_tost = np.maximum(p_low, p_high)
@@ -735,8 +736,8 @@ def _cv_normal_enumeration(D, *, alpha, margin, flatness_margin):
                     se = sd / math.sqrt(n) if sd > 0.0 else 0.0
                     md = float(np.mean(diff))
                     if se > 0.0:
-                        pl = 1.0 - normal.cdf((md + margin_n) / se)
-                        ph = 1.0 - normal.cdf((margin_n - md) / se)
+                        pl = _cv_norm_sf((md + margin_n) / se)
+                        ph = _cv_norm_sf((margin_n - md) / se)
                     else:
                         # A zero spread in the pairwise difference is the same
                         # degenerate case as a zero-SEM condition: the normal
@@ -786,6 +787,23 @@ def _cv_num(value):
     except (TypeError, ValueError, OverflowError):
         return None
     return out if math.isfinite(out) else None
+
+
+def _cv_norm_cdf(x):
+    """Standard-normal CDF through ``erfc`` (accurate in the lower tail)."""
+    return 0.5 * math.erfc(-float(x) / math.sqrt(2.0))
+
+
+def _cv_norm_sf(x):
+    """Standard-normal upper tail ``P(Z > x)`` without ``1 - cdf`` cancellation.
+
+    ``statistics.NormalDist().cdf`` rounds to exactly 1.0 for ``z`` above about
+    8.3, so ``1 - cdf(z)`` becomes a fake exact zero.  At the scale this
+    fallback exists for (hundreds of seeds), a standard error well below the
+    mean easily produces such a z; ``erfc`` keeps the real tail value and
+    prevents ``p=0`` / a certainty-valued TOST decision.
+    """
+    return 0.5 * math.erfc(float(x) / math.sqrt(2.0))
 
 
 def _cv_t_interval(mean, sem, n, alpha):
