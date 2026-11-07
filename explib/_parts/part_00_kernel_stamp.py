@@ -1692,11 +1692,22 @@ def _nll_doc_ci(nll_per_row, n_tokens_per_row):
     # high-variance document sample; exponentiating that raw lower endpoint
     # reported an impossible sub-1 perplexity confidence bound.
     _ce_lo = max(0.0, ce - _tc * _sem_ce)
+    _ce_hi = ce + _tc * _sem_ce
+    _ppl_lo = _safe_exp_ppl(_ce_lo)
+    _ppl_hi = _safe_exp_ppl(_ce_hi)
+    # A finite CE interval can still exponentiate past float64 (or, in
+    # principle, to NaN if the upper CE itself overflowed).  An infinite PPL
+    # bound is not a measured endpoint and is not strict-JSON safe, so report
+    # both endpoints as unavailable -- the same fail-closed rule the paired
+    # and bootstrap intervals use.  The log-scale SEM (and therefore a
+    # finite-scale bound) remains available for callers that need one.
+    if not (math.isfinite(_ppl_lo) and math.isfinite(_ppl_hi)):
+        _ppl_lo = _ppl_hi = None
     return {'ppl': _safe_exp_ppl(ce), 'doc_ce_mean': mean, 'doc_ce_sem': sem,
             'ce_sem_cluster_robust': _sem_ce,
             'ci_method': 'cluster-robust documents (t, df=n_docs-1)',
-            'ppl_ci95_low': _safe_exp_ppl(_ce_lo),
-            'ppl_ci95_high': _safe_exp_ppl(ce + _tc * _sem_ce),
+            'ppl_ci95_low': _ppl_lo,
+            'ppl_ci95_high': _ppl_hi,
             'n_docs': n_docs}
 
 def _paired_nll_doc_ci_extreme(A, B, counts, conf, *,
@@ -1803,6 +1814,16 @@ def _paired_nll_doc_ci_extreme(A, B, counts, conf, *,
         return out
     _lo, _hi = delta_ppl - tc * se, delta_ppl + tc * se
     _lrl, _lrh = lr - tc * se_lr, lr + tc * se_lr
+    # Exponentiating the log-ratio endpoints can overflow even when both log
+    # endpoints are finite.  An infinite ratio bound is not a measured
+    # interval (and breaks strict JSON), so withhold the ratio interval while
+    # keeping the finite log-scale one.
+    _rlo = _safe_exp_ppl(_lrl)
+    _rhi = _safe_exp_ppl(_lrh)
+    _ratio_ci = ([_rlo, _rhi]
+                 if (math.isfinite(_lrl) and math.isfinite(_lrh)
+                     and math.isfinite(_rlo) and math.isfinite(_rhi))
+                 else None)
     out.update({
         'se_ppl': float(se),
         'se_log_ratio': float(se_lr),
@@ -1812,9 +1833,7 @@ def _paired_nll_doc_ci_extreme(A, B, counts, conf, *,
         'delta_log_ratio_ci95': ([_lrl, _lrh]
                                  if math.isfinite(_lrl) and math.isfinite(_lrh)
                                  else None),
-        'ratio_ci95': ([_safe_exp_ppl(_lrl), _safe_exp_ppl(_lrh)]
-                       if math.isfinite(_lrl) and math.isfinite(_lrh)
-                       else None),
+        'ratio_ci95': _ratio_ci,
     })
     return out
 
@@ -2025,6 +2044,16 @@ def _paired_nll_doc_ci(nll_a, nll_b, n_tokens, *, conf=0.95):
         return out
     _lo, _hi = delta_ppl - tc * se, delta_ppl + tc * se
     _lrl, _lrh = lr - tc * se_lr, lr + tc * se_lr
+    # Exponentiating the log-ratio endpoints can overflow even when both log
+    # endpoints are finite.  An infinite ratio bound is not a measured
+    # interval (and breaks strict JSON), so withhold the ratio interval while
+    # keeping the finite log-scale one.
+    _rlo = _safe_exp_ppl(_lrl)
+    _rhi = _safe_exp_ppl(_lrh)
+    _ratio_ci = ([_rlo, _rhi]
+                 if (math.isfinite(_lrl) and math.isfinite(_lrh)
+                     and math.isfinite(_rlo) and math.isfinite(_rhi))
+                 else None)
     out.update({
         'se_ppl': float(se),
         'se_log_ratio': float(se_lr),
@@ -2034,8 +2063,6 @@ def _paired_nll_doc_ci(nll_a, nll_b, n_tokens, *, conf=0.95):
         'delta_log_ratio_ci95': ([_lrl, _lrh]
                                  if math.isfinite(_lrl) and math.isfinite(_lrh)
                                  else None),
-        'ratio_ci95': ([_safe_exp_ppl(_lrl), _safe_exp_ppl(_lrh)]
-                       if math.isfinite(_lrl) and math.isfinite(_lrh)
-                       else None),
+        'ratio_ci95': _ratio_ci,
     })
     return out

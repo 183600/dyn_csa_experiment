@@ -1176,3 +1176,26 @@ def test_unpaired_doc_ci_finite_documents_keep_a_finite_descriptive_mean():
     assert got['doc_ce_mean'] < 1.7e308, got
     assert got['doc_ce_sem'] is not None and math.isfinite(got['doc_ce_sem']), got
     json.dumps(got, allow_nan=False)
+
+
+def test_document_ci_withholds_exponentiated_endpoints_that_overflow():
+    # The CE interval can be finite on the log scale while its upper PPL
+    # endpoint exceeds exp(709).  Returning the sentinel inf for a confidence
+    # bound leaks a non-strict-JSON value into the artifact, so both PPL
+    # endpoints are withheld (the log-scale SEM remains available).
+    got = L._nll_doc_ci([1000.0, 0.0], [1, 1])
+    assert math.isfinite(got['ppl']), got
+    assert got['ppl_ci95_low'] is None and got['ppl_ci95_high'] is None, got
+    json.dumps(got, allow_nan=False)
+
+    # Paired variant: the log-ratio interval is finite (about [-1007, 1179])
+    # but the exponentiated ratio upper bound is inf.
+    a = np.array([[0.0, 172.0]])
+    b = np.array([[0.0, 0.0]])
+    tokens = [1, 1]
+    for got in (L._paired_nll_doc_ci(a, b, tokens),
+                L._paired_nll_doc_ci_extreme(a, b, tokens, 0.95)):
+        assert got['delta_log_ratio_ci95'] is not None, got
+        assert all(math.isfinite(v) for v in got['delta_log_ratio_ci95']), got
+        assert got['ratio_ci95'] is None, got
+        json.dumps(got, allow_nan=False)
