@@ -1039,9 +1039,19 @@ _SIGNFLIP_DOMINANT_MITM_MAX_N = 46
 
 
 def _signflip_signed_sums(values):
-    """All 2**k signed sums of `values` (deterministic doubling table)."""
-    out = np.zeros(1, dtype=float)
-    for v in np.asarray(values, dtype=float):
+    """All 2**k signed sums of `values` (deterministic doubling table).
+
+    An exact integer beyond float64 has no float spelling, but signed sums and
+    exact cancellations are still well defined.  Keep the historical float
+    table for ordinary panels and use an object table only when the initial
+    conversion cannot represent an entry.
+    """
+    try:
+        vals = np.asarray(values, dtype=float)
+    except OverflowError:
+        vals = np.asarray(values, dtype=object)
+    out = np.zeros(1, dtype=object if vals.dtype == object else float)
+    for v in vals:
         out = np.concatenate((out + v, out - v))
     return out
 
@@ -1443,10 +1453,33 @@ def _look_values_close(a, b, scale, *, rel_tol=_LOOK_REL_TOL):
 
 
 def _look_values_signature(values, scale):
-    """Hashable identity of a look's deltas at the contrast's common scale."""
-    if scale and math.isfinite(scale):
-        return tuple(round(float(v) / scale, _LOOK_SIG_DECIMALS)
-                     for v in values)
+    """Hashable identity of a look's deltas at the contrast's common scale.
+
+    ``scale`` comes from a max-absolute reduction, so it can be an exact
+    integer beyond float64 even though every ``value / scale`` ratio is in
+    ``[-1, 1]``.  ``math.isfinite`` and the per-value float conversion used to
+    raise before that ratio could be formed; keep the ordinary path bit-for-bit
+    and fall back to an exact rational ratio only when float cannot spell the
+    operand.
+    """
+    try:
+        scale_finite = math.isfinite(scale)
+    except (TypeError, ValueError, OverflowError):
+        # An exact integer beyond float64 is finite by construction.
+        scale_finite = isinstance(scale, int) and not isinstance(scale, bool)
+    if scale and scale_finite:
+        out = []
+        for v in values:
+            try:
+                ratio = float(v) / scale
+            except (TypeError, ValueError, OverflowError):
+                from fractions import Fraction as _Fraction
+                try:
+                    ratio = float(_Fraction(v) / _Fraction(scale))
+                except (TypeError, ValueError, OverflowError, ZeroDivisionError):
+                    ratio = 0.0
+            out.append(round(ratio, _LOOK_SIG_DECIMALS))
+        return tuple(out)
     return tuple(0.0 for _ in values)
 
 

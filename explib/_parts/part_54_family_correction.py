@@ -156,6 +156,59 @@ def _fc_not_estimable(reason, *, extra=None):
     return out
 
 
+def _fc_matrix_float(matrix):
+    """Float matrix for the score statistic, row-scaled when an entry is exact.
+
+    The score ``|sum(d)| / sqrt(sum(d**2))`` is invariant to a positive
+    rescaling of a row, so an exact integer row can be divided by its exact
+    maximum magnitude and enter the float arithmetic with the same statistic.
+    Ordinary matrices keep the historical bit-for-bit conversion.
+    """
+    try:
+        return _fc_np.asarray(matrix, dtype=float)
+    except OverflowError:
+        obj = _fc_np.asarray(matrix, dtype=object)
+        if obj.ndim != 2:
+            raise ValueError('family max-T needs a two-dimensional matrix') from None
+        rows = []
+        for row in obj.tolist():
+            vals = list(row)
+            if not vals:
+                rows.append([])
+                continue
+            for value in vals:
+                if (isinstance(value, (bool, _fc_np.bool_))
+                        or isinstance(value, (complex, _fc_np.complexfloating))
+                        or not isinstance(value, numbers.Number)):
+                    raise ValueError(
+                        'family max-T matrix entries must be finite numbers') from None
+                try:
+                    if not _fc_math.isfinite(float(value)):
+                        raise ValueError(
+                            'family max-T matrix entries must be finite numbers')
+                except OverflowError:
+                    pass  # an exact integer beyond float64 is still finite
+            max_abs = max((abs(value) for value in vals), default=0)
+            if max_abs == 0:
+                rows.append([0.0] * len(vals))
+                continue
+            scaled_row = []
+            for value in vals:
+                try:
+                    ratio = value / max_abs
+                except (TypeError, ValueError, OverflowError):
+                    from fractions import Fraction as _Fraction
+                    try:
+                        ratio = float(_Fraction(value) / _Fraction(max_abs))
+                    except (TypeError, ValueError, OverflowError,
+                            ZeroDivisionError):
+                        raise ValueError(
+                            'family max-T matrix entries are not representable') from None
+                scaled_row.append(float(ratio))
+            rows.append(scaled_row)
+        return _fc_np.asarray(rows, dtype=float)
+
+
 def _fc_score_maxt(matrix, alpha):
     """Exact free step-down max-T on the sign-invariant score statistic.
 
@@ -164,7 +217,7 @@ def _fc_score_maxt(matrix, alpha):
     and it is zero for a constant non-zero effect.  A row with all-zero deltas
     has score 0 and can never be rejected; it still occupies its declared slot.
     """
-    A = _fc_np.asarray(matrix, dtype=float)
+    A = _fc_matrix_float(matrix)
     m, n = A.shape
     # A seed column that is exactly zero in every contrast cannot change the
     # score statistic; its sign only duplicates patterns.  Branch on the

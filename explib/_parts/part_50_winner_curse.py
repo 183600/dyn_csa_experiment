@@ -203,6 +203,30 @@ def _wc_mean(values):
     return total if math.isfinite(total) else None
 
 
+def _wc_ratio(value, scale):
+    """``value / scale`` when representable, else an exact rational ratio."""
+    try:
+        return value / scale
+    except (TypeError, ValueError, OverflowError):
+        from fractions import Fraction as _Fraction
+        try:
+            return float(_Fraction(value) / _Fraction(scale))
+        except (TypeError, ValueError, OverflowError, ZeroDivisionError):
+            return None
+
+
+def _wc_scaled_object(oriented, scale):
+    """Divide an object array by an exact scale, preserving its shape."""
+    arr = np.asarray(oriented, dtype=object)
+    if arr.ndim == 0:
+        return np.asarray(_wc_ratio(arr.item(), scale), dtype=float)
+    if arr.ndim == 1:
+        return np.asarray([_wc_ratio(v, scale) for v in arr.tolist()],
+                          dtype=float)
+    return np.asarray([[_wc_ratio(v, scale) for v in row]
+                       for row in arr.tolist()], dtype=float)
+
+
 def _wc_scale(raw, better):
     """Return ``(work, scale, shift, orientation)`` for stable arithmetic.
 
@@ -210,10 +234,37 @@ def _wc_scale(raw, better):
     shifted into a small range.  ``scale``/``shift`` invert the transform;
     ``orientation`` is ``+1`` for ``better='min'`` and ``-1`` for
     ``better='max'``.
+
+    An exact integer beyond float64 has no float spelling, but its magnitude
+    can still be the common scale: divide it as an exact rational and keep the
+    scaled panel finite instead of aborting the readout.
     """
-    oriented = raw if better == 'min' else -raw
-    max_abs = float(np.max(np.abs(oriented)))
+    if better == 'min':
+        oriented = raw
+    else:
+        try:
+            oriented = -raw
+        except TypeError:
+            # A plain list has no unary minus; the public caller passes an
+            # array, but a direct helper call may pass the panel as a list.
+            oriented = -np.asarray(raw)
     orientation = 1.0 if better == 'min' else -1.0
+    try:
+        max_abs = float(np.max(np.abs(oriented)))
+    except (TypeError, ValueError, OverflowError):
+        # ``np.max`` returns the exact integer; only ``float`` failed.  Use
+        # the exact magnitude as the scale and divide in the rational domain.
+        obj = np.asarray(oriented, dtype=object)
+        if obj.size == 0:
+            return oriented, 1.0, 0.0, orientation
+        max_abs = max((abs(v) for v in obj.ravel().tolist()), default=0)
+        if max_abs == 0:
+            return oriented, 1.0, 0.0, orientation
+        scaled = _wc_scaled_object(oriented, max_abs)
+        if not np.all(np.isfinite(scaled)):
+            return oriented, 1.0, 0.0, orientation
+        shift = float(np.min(scaled))
+        return scaled - shift, max_abs, shift, orientation
     if max_abs == 0.0:
         return oriented, 1.0, 0.0, orientation
     if max_abs > 1e100 or max_abs < 1e-100:

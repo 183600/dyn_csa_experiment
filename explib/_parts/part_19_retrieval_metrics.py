@@ -194,7 +194,18 @@ def _multiclass_ranking_metrics(y_true, y_score, labels, label_names=None):
     being silently assigned 0 or 1.
     """
     y_true = _preserve_label_array(y_true)
-    score = np.asarray(y_score, dtype=float)
+    try:
+        score = np.asarray(y_score, dtype=float)
+    except OverflowError:
+        # Ranking is defined by the score order only; an exact integer beyond
+        # float64 still ranks.  Keep an object matrix so the per-column
+        # AUC/AP helpers can use their exact-integer fallback.  Other
+        # conversion failures (a string, a ragged matrix) keep their
+        # historical hard error.
+        try:
+            score = np.asarray(y_score, dtype=object)
+        except (TypeError, ValueError):
+            raise ValueError('multiclass ranking needs a numeric score matrix') from None
     labels = _preserve_label_array(labels)
     if label_names is None:
         label_names = _display_label_names(labels)
@@ -307,7 +318,7 @@ def _majority_class_floor(labels, supports, label_names=None):
                 'balanced_accuracy': None, 'f1_macro': None, 'f1_micro': None,
                 'f1_weighted': None,
                 'note': 'no observations; the trivial floor is undefined'}
-    best_i = int(np.argmax(np.asarray(supports, dtype=np.int64)))
+    best_i = max(range(len(supports)), key=lambda i: supports[i])
     s = supports[best_i]
     p = s / n
     f1_major = 2.0 * p / (1.0 + p) if p > 0 else 0.0
@@ -348,13 +359,27 @@ def _binary_positive_vector(y_true, positive_label=None):
     return (y == pos).astype(np.int64), pos, uniq
 
 
+def _threshold_scalar(value):
+    """A float threshold when representable, else the exact value.
+
+    A caller may declare a cut as an exact integer beyond float64.  The cut is
+    still an exact ordering boundary, so keep its integer spelling instead of
+    letting ``float(value)`` abort the whole curve.
+    """
+    try:
+        return float(value)
+    except (TypeError, ValueError, OverflowError):
+        return value
+
+
 def _threshold_row_from_counts(tp, fp, fn, tn, threshold):
     tp, fp, fn, tn = int(tp), int(fp), int(fn), int(tn)
     precision = tp / (tp + fp) if tp + fp else 0.0
     recall = tp / (tp + fn) if tp + fn else 0.0
     f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
     specificity = tn / (tn + fp) if tn + fp else 0.0
-    return {'threshold': float(threshold), 'tp': tp, 'fp': fp, 'fn': fn, 'tn': tn,
+    return {'threshold': _threshold_scalar(threshold),
+            'tp': tp, 'fp': fp, 'fn': fn, 'tn': tn,
             'precision': precision, 'recall': recall, 'f1': f1,
             'specificity': specificity,
             'balanced_accuracy': 0.5 * (recall + specificity),
@@ -364,7 +389,7 @@ def _threshold_row_from_counts(tp, fp, fn, tn, threshold):
 
 
 def _binary_threshold_metrics(y_bin, score, threshold):
-    pred = np.asarray(score) >= float(threshold)
+    pred = np.asarray(score) >= _threshold_scalar(threshold)
     return _threshold_row_from_counts(
         np.sum(pred & (y_bin == 1)), np.sum(pred & (y_bin == 0)),
         np.sum((~pred) & (y_bin == 1)), np.sum((~pred) & (y_bin == 0)),
@@ -447,6 +472,110 @@ def _multiclass_calibration(y_true, y_score, labels, n_bins=10):
                      '(top-label calibration) on a row-normalized probability matrix')}
 
 
+def _threshold_score_is_finite(value):
+    """Finite numeric score, including an exact integer beyond float64.
+
+    The ordinary path converts the whole score vector to float.  A valid exact
+    integer may have no float spelling, so the fallback validates each value
+    without that conversion and lets the Python order comparisons below keep
+    the score exact.
+    """
+    if (isinstance(value, (bool, np.bool_))
+            or isinstance(value, (complex, np.complexfloating))
+            or not isinstance(value, numbers.Number)):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except OverflowError:
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+def _binary_threshold_curve_exact(y_bin, y_score, pos, uniq, *,
+                                  thresholds, metric, max_thresholds):
+    """Threshold curve when a score has no float64 spelling.
+
+    Only the score order and the exact tie groups matter for the confusion
+    matrix; the candidate cut itself is kept as the caller's exact scalar.
+    """
+    import bisect
+
+    try:
+        raw = np.asarray(y_score, dtype=object).ravel().tolist()
+    except (TypeError, ValueError):
+        raw = [y_score]
+    if len(raw) != int(y_bin.size):
+        raise ValueError('y_score and y_true differ')
+    if not all(_threshold_score_is_finite(value) for value in raw):
+        raise ValueError('y_score contains NaN/Inf; a threshold cannot be '
+                         'selected from non-finite scores')
+    n = len(raw)
+    n_pos = int(y_bin.sum())
+    n_neg = int(n - n_pos)
+    order = sorted(range(n), key=lambda i: raw[i], reverse=True)
+    tp_cum = [0] * (n + 1)
+    fp_cum = [0] * (n + 1)
+    tp = fp = 0
+    for j, index in enumerate(order, 1):
+        if int(y_bin[index]) == 1:
+            tp += 1
+        else:
+            fp += 1
+        tp_cum[j] = tp
+        fp_cum[j] = fp
+    asc = sorted(raw)
+    if thresholds is None:
+        cand = sorted(set(raw))
+        truncated = False
+        if len(cand) > int(max_thresholds):
+            keep = np.linspace(0, len(cand) - 1,
+                               int(max_thresholds)).astype(np.int64)
+            cand = [cand[int(i)] for i in keep]
+            truncated = True
+    else:
+        try:
+            requested = list(thresholds)
+        except TypeError:
+            raise ValueError('thresholds must be a non-empty finite sequence') from None
+        if not requested or not all(_threshold_score_is_finite(v)
+                                    for v in requested):
+            raise ValueError('thresholds must be a non-empty finite sequence')
+        cand = sorted(set(requested))
+        truncated = False
+    rows = []
+    for t in cand:
+        k = int(n - bisect.bisect_left(asc, t))
+        rows.append(_threshold_row_from_counts(
+            tp_cum[k], fp_cum[k], n_pos - tp_cum[k], n_neg - fp_cum[k], t))
+    rows.sort(key=lambda row: row['threshold'])
+    default = _binary_threshold_metrics(y_bin, raw, 0.5)
+    if not rows:
+        raise ValueError('no candidate threshold could be scored')
+
+    def _key(row):
+        value = row[metric]
+        try:
+            distance = abs(row['threshold'] - 0.5)
+        except OverflowError:
+            # Python cannot subtract a float from an exact integer beyond
+            # float64.  The tie-break is still exact as a rational.
+            from fractions import Fraction as _Fraction
+            distance = abs(_Fraction(row['threshold']) - _Fraction(1, 2))
+        return (-value, distance, row['threshold'])
+
+    best = min(rows, key=_key)
+    return {'positive_label': str(pos), 'labels': [str(x) for x in uniq],
+            'n': int(y_bin.size), 'n_positive': int(y_bin.sum()),
+            'prevalence': float(y_bin.mean()), 'metric': metric,
+            'best_threshold': best['threshold'], 'best_value': best[metric],
+            'best_metrics': best, 'at_default_0.5': default,
+            'threshold_sensitivity': float(best[metric] - default[metric]),
+            'n_candidates': int(len(rows)), 'threshold_grid_truncated': truncated,
+            'thresholds': rows,
+            'note': 'select on validation rows disjoint from evaluation; record the split and metric'}
+
+
 def binary_threshold_curve(y_true, y_score, *, positive_label=None, thresholds=None,
                            metric='f1', max_thresholds=4096):
     """Precision/recall/F1 at every candidate cut for a binary endpoint.
@@ -468,7 +597,16 @@ def binary_threshold_curve(y_true, y_score, *, positive_label=None, thresholds=N
         raise ValueError(f'max_thresholds must be a positive integer, got {max_thresholds!r}')
     max_thresholds = _mt
     y_bin, pos, uniq = _binary_positive_vector(y_true, positive_label)
-    score = np.asarray(y_score, dtype=float).ravel()
+    try:
+        score = np.asarray(y_score, dtype=float).ravel()
+    except (TypeError, ValueError, OverflowError):
+        # An exact integer beyond float64 is still an exact ordering score.
+        # Do not let the failed float conversion abort a threshold readout
+        # that only needs the score order; the fallback keeps the cut and the
+        # tie groups exact and returns the same record shape.
+        return _binary_threshold_curve_exact(
+            y_bin, y_score, pos, uniq, thresholds=thresholds, metric=metric,
+            max_thresholds=max_thresholds)
     if score.size != y_bin.size:
         raise ValueError(f'y_score {score.shape} and y_true {y_bin.shape} differ')
     if not np.all(np.isfinite(score)):
@@ -609,12 +747,29 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None, posit
     if len({_label_identity(v) for v in labels.tolist()}) != int(labels.size):
         raise ValueError(f'labels contains duplicate class identifiers: {labels.tolist()}')
     _label_names = _display_label_names(labels)
+    _score_exact = False
     if y_score is not None:
         try:
             y_score = np.asarray(y_score, dtype=float)
-        except (TypeError, ValueError, OverflowError):
+        except OverflowError:
+            # An exact integer beyond float64 is a valid ordering score even
+            # though it cannot enter the float matrix.  Keep it as an object
+            # array and let the rank/threshold helpers use their exact path;
+            # reject non-numeric or non-finite entries below, so this fallback
+            # cannot smuggle strings into a ranking.
+            try:
+                y_score = np.asarray(y_score, dtype=object)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    'y_score must be numeric (scores/probabilities)') from None
+            if not all(_threshold_score_is_finite(v)
+                       for v in y_score.ravel().tolist()):
+                raise ValueError(
+                    'y_score must be finite numeric scores/probabilities')
+            _score_exact = True
+        except (TypeError, ValueError):
             raise ValueError('y_score must be numeric (scores/probabilities)') from None
-        if not np.all(np.isfinite(y_score)):
+        if not _score_exact and not np.all(np.isfinite(y_score)):
             # Ranking with a NaN/Inf score is not defined; treating it as an
             # ordinary rank silently manufactures an AUC/AP from a failed
             # prediction.  Refuse instead of reporting a corrupted metric.
@@ -808,7 +963,8 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None, posit
         y_bin = (y_true == pos).astype(np.int64)
         # A 2-D score matrix is column-per-label: the binary endpoint uses the
         # named positive-class column, not an assumed last column.
-        _score = np.asarray(y_score, dtype=float)
+        _score = (np.asarray(y_score) if _score_exact
+                  else np.asarray(y_score, dtype=float))
         if _score.ndim == 2:
             _pos_idx = int(np.where(labels == pos)[0][0])
             _bin_score = _score[:, _pos_idx]
@@ -816,8 +972,10 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None, posit
             _bin_score = _score.ravel()
         if _bin_score.size != y_bin.size:
             raise ValueError(f'y_score {_score.shape} does not match y_true {y_true.shape}')
-        out['score_min'] = float(np.min(_bin_score)) if _bin_score.size else None
-        out['score_max'] = float(np.max(_bin_score)) if _bin_score.size else None
+        out['score_min'] = (_finite_scalar(np.min(_bin_score))
+                            if _bin_score.size else None)
+        out['score_max'] = (_finite_scalar(np.max(_bin_score))
+                            if _bin_score.size else None)
         out['roc_auc'] = _binary_roc_auc(y_bin, _bin_score)
         out['pr_auc'] = _binary_average_precision(y_bin, _bin_score)
         # Only advertise the ranking metrics that were actually computed from
@@ -825,9 +983,19 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None, posit
         out['threshold_free_metrics'].extend(['roc_auc', 'pr_auc'])
         if out['decision_threshold'] is not None and _bin_score.size:
             _t = float(out['decision_threshold'])
-            out['threshold_within_score_range'] = bool(
-                out['score_min'] <= _t <= out['score_max'])
-            if not out['threshold_within_score_range'] and _true_pos and _true_pos < y_bin.size:
+            if out['score_min'] is not None and out['score_max'] is not None:
+                out['threshold_within_score_range'] = bool(
+                    out['score_min'] <= _t <= out['score_max'])
+            else:
+                # An exact score beyond float64 has no float endpoint; the
+                # range comparison is still defined, but the JSON readout of
+                # the endpoints is unavailable.
+                out['threshold_within_score_range'] = bool(
+                    np.min(_bin_score) <= _t <= np.max(_bin_score))
+            if (not out['threshold_within_score_range']
+                    and out['score_min'] is not None
+                    and out['score_max'] is not None
+                    and _true_pos and _true_pos < y_bin.size):
                 out['threshold_range_warning'] = (
                     f'decision threshold {_t:g} lies outside the observed score range '
                     f'[{out["score_min"]:.4g}, {out["score_max"]:.4g}]; the thresholded '
@@ -871,7 +1039,8 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None, posit
         if _extreme_imbalance(prev):
             out['imbalance_warning'] = ('positives at or beyond 1:1000 — report PR-AUC with scores; F1 must name its averaging rule and recall should be reported per class')
     if labels.size > 2 and y_score is not None:
-        _score = np.asarray(y_score, dtype=float)
+        _score = (np.asarray(y_score) if _score_exact
+                  else np.asarray(y_score, dtype=float))
         if _score.ndim == 2:
             _rank = _multiclass_ranking_metrics(y_true, _score, labels,
                                                 label_names=_label_names)
