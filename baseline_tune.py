@@ -78,6 +78,32 @@ def _mean_std(values):
     return mean, std
 
 
+def _common_budget(records, key):
+    """One shared exact integer budget, or ``None`` when it is ambiguous.
+
+    The tuning artifact exposes a trial-level ``steps``/``tokens_seen`` next
+    to the per-seed ``budget_by_seed`` map.  A resumed or partially completed
+    search can leave the seeds on different horizons.  Picking an arbitrary
+    member of the distinct values (the old ``next(iter(set))``) would make the
+    trial-level field contradict the per-seed table; a missing value would
+    likewise be hidden by the remaining seeds.  Report the common value only
+    when every record carries the same one, so an audit sees the ambiguity.
+    """
+    values = set()
+    for rec in records.values():
+        if not isinstance(rec, dict) or rec.get(key) is None:
+            return None
+        # Use the shared exact-integer reader: int(3.5) would silently turn a
+        # fractional horizon into 3, and a huge int must stay exact.
+        value = L._as_seed_int(rec[key])
+        if value is None:
+            return None
+        values.add(value)
+        if len(values) > 1:
+            return None
+    return next(iter(values)) if len(values) == 1 else None
+
+
 def _protocol_arm_groups(protocol, base, arms):
     """Resolve the protocol's arm groups, falling back to one legacy group.
 
@@ -442,8 +468,11 @@ def run_tuning(base_cfg=None, outdir='results_baseline_tuning', protocol=None,
                     mean_full = float('nan')
                 else:
                     mean_full = _mean_std(list(full_seed_ppls.values()))[0]
-                _steps = {int(records[s]['steps']) for s in records if records[s].get('steps') is not None}
-                _tokens = {int(records[s]['tokens_seen']) for s in records if records[s].get('tokens_seen') is not None}
+                # Do not let a heterogeneous resumed panel inherit one
+                # arbitrary seed's horizon: a trial-level budget is only
+                # meaningful when every seed in the trial shares it.
+                _steps = _common_budget(records, 'steps')
+                _tokens = _common_budget(records, 'tokens_seen')
                 per_arm[arm].append({
                     'config': dict(knobs), 'ppl': mean, 'ppl_std': std,
                     # Which estimator produced `ppl`: audit reads this field
@@ -465,8 +494,8 @@ def run_tuning(base_cfg=None, outdir='results_baseline_tuning', protocol=None,
                     'evaluation_row_fp': ((_row_state['meta'] or {}).get('evaluation_row_fp')
                                           if selection_ppls is not None else None),
                     'params': records[sorted(records)[0]].get('params'),
-                    'steps': next(iter(_steps), None),
-                    'tokens_seen': next(iter(_tokens), None),
+                    'steps': _steps,
+                    'tokens_seen': _tokens,
                     'budget_by_seed': {str(s): [records[s].get('steps', None),
                                                 records[s].get('tokens_seen', None)]
                                        for s in sorted(records)},

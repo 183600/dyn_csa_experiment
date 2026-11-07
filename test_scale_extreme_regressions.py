@@ -324,3 +324,31 @@ def test_exposure_fallback_does_not_underflow_unique_counts_to_zero():
     assert out['unique_tokens'] == 10 ** 2000
     assert out['start_collision_fraction'] == 0.0
     json.dumps(out, allow_nan=False)
+
+
+def test_beta_huge_shape_with_fractional_partner_fails_closed():
+    # A shape integer beyond float64 is supported only by the exact binomial
+    # identity, which needs both shapes integral.  With a fractional partner
+    # the continued fraction used to convert the huge int to float and raise
+    # OverflowError; the limiting beta is 0 when a dominates and 1 when b
+    # dominates (x is strictly inside (0, 1)).
+    huge = 10 ** 4000
+    for x in (0.5, 1e-10, 1.0 - 2.0 ** -53):
+        assert L._betai(huge, 0.5, x) == 0.0
+        assert L._betai(0.5, huge, x) == 1.0
+    # Finite shapes above the safe Stirling range used to overflow lgamma
+    # (``math range error``) even though the one-shape limit is well defined.
+    for a, b, expected in ((1e308, 0.5, 0.0), (0.5, 1e308, 1.0),
+                           (1e300, 1.5, 0.0), (1.5, 1e300, 1.0)):
+        assert L._betai(a, b, 0.5) == expected, (a, b)
+    # A b just beyond float64 is not enough to make every positive x large:
+    # b*x still matters.  The gamma limit resolves a subnormal x instead of
+    # claiming the whole mass.
+    b = 2 ** 1024
+    y = math.ldexp(5e-324, 1024)
+    assert L._betai(0.5, b, 5e-324) == pytest.approx(
+        math.erf(math.sqrt(y)), rel=1e-8)
+    # Both shapes integral still take the exact identity: I_x(a, 1) = x**a is
+    # far below float64 here, and the central symmetric case is 1/2.
+    assert L._betai(huge, 1, 0.5) == 0.0
+    assert L._betai(huge, huge, 0.5) == pytest.approx(0.5, abs=1e-12)

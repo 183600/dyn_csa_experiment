@@ -1164,6 +1164,14 @@ def _betai_nr(a, b, x):
 _BINOMIAL_EXACT_INDEX_MAX = 2000000
 _BINOMIAL_TINY_INDEX_MAX = 100
 _BINOMIAL_OLD_MAX_N = 100000000.0
+# Above these finite shapes, the incomplete-beta continued fraction and the
+# two-shape Stirling expansion both overflow ``math.lgamma``/float products.
+# The distribution is then a one-shape limit; use it instead of raising.  The
+# two thresholds differ because a huge numerator shape puts all mass at 1
+# (needs to be farther from 1 than any float), while a huge denominator shape
+# already has a negligibly small beta-to-gamma limit at 1e50.
+_BETA_HUGE_A = 1e100
+_BETA_HUGE_B = 1e50
 
 
 def _log_int(value):
@@ -1579,6 +1587,53 @@ def _betai(a, b, x):
         if not math.isfinite(x):
             return float('nan')
     except (TypeError, ValueError, OverflowError):
+        return float('nan')
+    # A shape beyond float64 is only representable through the exact binomial
+    # identity below, which requires BOTH shapes to be exact integers.  If the
+    # other shape is fractional, the continued-fraction path would convert the
+    # huge int to float and raise OverflowError, and a finite shape above
+    # their respective threshold overflows the Stirling/lgamma route in the
+    # same way.  Handle the two one-sided limits without materialising the
+    # huge shape:
+    #   * huge a: the beta mass sits at 1, so any x < 1 has I_x ~ 0 (the
+    #     largest float below 1 is still many standard deviations away once
+    #     a >= 1e100);
+    #   * huge b: with y = b*x finite, I_x(a,b) -> P(Gamma(a,1) <= y).
+    # The second limit matters for a subnormal x: b*x need not be huge merely
+    # because b is beyond float64, so returning a constant 1 would be wrong.
+    _a_float = _b_float = None
+    try:
+        _a_float = float(a)
+    except (TypeError, ValueError, OverflowError):
+        pass
+    try:
+        _b_float = float(b)
+    except (TypeError, ValueError, OverflowError):
+        pass
+    _a_huge = _a_float is None or abs(_a_float) >= _BETA_HUGE_A
+    _b_huge = _b_float is None or abs(_b_float) >= _BETA_HUGE_B
+    if _a_huge and _b_float is not None and not _is_integral_value(b):
+        return 0.0
+    if _b_huge and _a_float is not None and not _is_integral_value(a):
+        y = _binom_mean_safe(b, x)
+        if not math.isfinite(y):
+            return 1.0
+        # torch's lower regularized gamma keeps a tiny P(Gamma(a,1) <= y)
+        # instead of cancelling it out of 1 - Q (which loses every tail below
+        # float epsilon).  Fall back to the dependency-free upper tail only
+        # when the special function is unavailable.
+        try:
+            lower = float(torch.special.gammainc(
+                torch.tensor(_a_float, dtype=torch.float64),
+                torch.tensor(y, dtype=torch.float64)).item())
+        except Exception:
+            try:
+                lower = 1.0 - _gammaincc(_a_float, y)
+            except (TypeError, ValueError, OverflowError):
+                return float('nan')
+        return float(min(1.0, max(0.0, lower)))
+    if (_a_float is None or _b_float is None) and not (
+            _is_integral_value(a) and _is_integral_value(b)):
         return float('nan')
     if (a >= 1.0 and b >= 1.0 and a + b >= 1000000.0
             and _is_integral_value(a) and _is_integral_value(b)):
