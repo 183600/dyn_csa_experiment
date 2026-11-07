@@ -448,13 +448,19 @@ def _sampling_finite_sum(values):
     that cancel), so fall back to an exact rational accumulation instead of
     escaping as ``OverflowError``.
     """
+    # Materialise once: the exact fallback below would otherwise iterate an
+    # already-consumed generator and report a fake sum of zero.
     try:
-        arr = np.asarray(values, dtype=np.float64)
+        raw = list(values)
+    except TypeError:
+        raw = [values]
+    try:
+        arr = np.asarray(raw, dtype=np.float64)
     except (TypeError, ValueError, OverflowError):
         from fractions import Fraction as _Fraction
         try:
             total = _Fraction(0)
-            for value in values:
+            for value in raw:
                 if isinstance(value, (bool, np.bool_)):
                     return None
                 try:

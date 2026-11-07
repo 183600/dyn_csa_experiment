@@ -413,8 +413,13 @@ def _am_span(values):
     integer endpoints beyond float64 have an exact difference even though the
     final float conversion is what must be checked.
     """
-    lo = min(values)
-    hi = max(values)
+    try:
+        lo = min(values)
+        hi = max(values)
+    except (TypeError, ValueError):
+        # An empty panel has no descriptive spread; it is unavailable rather
+        # than a ``min() arg is an empty sequence`` crash in a readout.
+        return None
     try:
         out = hi - lo
     except (TypeError, ValueError, OverflowError):
@@ -493,16 +498,22 @@ def _am_sd(vals):
     n = len(vals)
     if n < 2:
         return 0.0
-    scale = max(abs(x) for x in vals)
-    if scale == 0.0:
-        return 0.0
-    scaled = [x / scale for x in vals]
-    mean = _am_math.fsum(scaled) / n
-    var = _am_math.fsum((x - mean) ** 2 for x in scaled) / (n - 1)
-    sd_scaled = _am_math.sqrt(max(0.0, var))
     try:
+        scale = max(abs(x) for x in vals)
+        if scale == 0.0:
+            return 0.0
+        # A mixed panel can contain one exact huge integer and one ordinary
+        # float.  ``scale`` is then that huge int, and dividing a float by it
+        # overflows the int->float conversion even though the exact SD is
+        # well defined (or explicitly unrepresentable).  Route the whole
+        # scaled computation through the exact fallback, like the final
+        # multiply below already did.
+        scaled = [x / scale for x in vals]
+        mean = _am_math.fsum(scaled) / n
+        var = _am_math.fsum((x - mean) ** 2 for x in scaled) / (n - 1)
+        sd_scaled = _am_math.sqrt(max(0.0, var))
         out = sd_scaled * scale
-    except (TypeError, ValueError, OverflowError):
+    except (TypeError, ValueError, OverflowError, ZeroDivisionError):
         # Same conversion hazard as the mean: an exact integer scale beyond
         # float64 (or an all-identical huge-int panel with true SD 0) must be
         # evaluated exactly, not escape.

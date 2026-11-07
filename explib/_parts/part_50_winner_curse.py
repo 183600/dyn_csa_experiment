@@ -128,8 +128,18 @@ def _wc_percentile(values, q):
 
 def _wc_mean(values):
     """Guarded mean of finite values; ``None`` when nothing is representable."""
-    finite = [float(v) for v in values if isinstance(v, (int, float))
-              and math.isfinite(float(v))]
+    finite = []
+    for value in values:
+        if not isinstance(value, (int, float)):
+            continue
+        # ``float(10**400)`` raises; an exact count beyond float64 has no
+        # representable mean, so skip it instead of aborting the readout.
+        try:
+            out = float(value)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if math.isfinite(out):
+            finite.append(out)
     if not finite:
         return None
     n = float(len(finite))

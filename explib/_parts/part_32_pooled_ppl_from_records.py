@@ -421,8 +421,14 @@ def _seed_t_ci(ppls, alpha=0.05):
     if _ms is not None:
         mu, sd = _ms
     else:
-        mu = float(np.mean(ppls))
-        sd = float(np.std(ppls, ddof=1))
+        try:
+            mu = float(np.mean(ppls))
+            sd = float(np.std(ppls, ddof=1))
+        except (TypeError, ValueError, OverflowError, ZeroDivisionError):
+            # An exact integer PPL beyond float64 has no representable
+            # mean/SD, so the interval is unavailable -- not an escaping
+            # int-to-float conversion error.
+            return None
     try:
         tc = _t_critical_alpha(alpha, n - 1)
     except Exception:

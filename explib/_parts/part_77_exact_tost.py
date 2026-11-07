@@ -218,15 +218,18 @@ def _etost_upper_tail(values):
     the method actually used.  This is the one-sided primitive behind both
     arms of the exact TOST.
     """
+    # Materialise once: an unrepresentable measurement must be dropped from
+    # the same input the ordinary path saw, not from an already-consumed
+    # generator (which used to yield a fake empty tail record).
     try:
-        vals = np.asarray(values, dtype=float)
+        raw = list(values)
+    except TypeError:
+        raw = [values]
+    try:
+        vals = np.asarray(raw, dtype=float)
     except (TypeError, ValueError, OverflowError):
         # Mirror the public `_etost_inputs` contract: an unrepresentable
         # measurement is dropped, leaving a valid (possibly empty) tail record.
-        try:
-            raw = list(values)
-        except TypeError:
-            raw = []
         finite = [float(f) for f in (_finite_scalar(x) for x in raw)
                   if f is not None]
         vals = np.asarray(finite, dtype=float)

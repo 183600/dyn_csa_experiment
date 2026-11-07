@@ -232,3 +232,58 @@ def test_length_strata_grouping_does_not_iterate_from_a_huge_stratum_count():
     # huge declared count must not turn the search into an unbounded loop.
     assert L._ls_groups([1, 2, 3, 4], HUGE, 1) == [[0], [1], [2], [3]]
     assert L._ls_groups([1, 2, 3, 4], 2, 1) == [[0, 1], [2, 3]]
+
+
+def test_exact_division_keeps_a_representable_quotient_with_a_huge_numerator():
+    # A small denominator used to take the direct float path and fail on
+    # float(10**309), even though the quotient (1e308) is representable.
+    # The exact-rational fallback must also cover an overflowing numerator.
+    assert L._ls_div(10 ** 309, 10) == 1e308
+    assert L._uq_div(10 ** 309, 10) == 1e308
+    assert L._ls_div(10 ** 308, 4) == 2.5e307
+    # A quotient that genuinely exceeds float64 is still withheld.
+    assert L._ls_div(10 ** 400, 10) is None
+    # Ordinary panels keep the historical float division bit-for-bit.
+    assert L._ls_div(1.0, 2) == 0.5
+
+
+def test_mixed_extreme_panels_do_not_escape_float_conversion():
+    # One exact huge integer next to an ordinary float: the scaled SD still
+    # has a defined limit (or is explicitly unavailable), never a raw
+    # OverflowError.  The same applies to the quantile sorter.
+    assert L._am_sd([HUGE, 1.0]) == float('inf')
+    assert L._am_span([]) is None
+    assert L._uq_sort_values([HUGE, 1.0]) == [1.0, HUGE]
+    assert L._uq_quantile([1.0, HUGE], 0.5) is None
+    # Ordinary panels keep the historical path.
+    assert L._am_sd([1.0, 2.0, 3.0]) == 1.0
+    assert L._uq_sort_values([3, 1.0, 2]) == [1.0, 2.0, 3.0]
+
+
+def test_panel_means_and_seed_interval_withhold_unrepresentable_huge_ints():
+    assert L._wc_mean([HUGE]) is None
+    assert L._wc_mean([1.0, 2.0]) == 1.5
+    assert L._seed_t_ci([HUGE, HUGE + 1]) is None
+    assert L._tsm_mean_sd([HUGE, 1.0]) == (None, None)
+    # Ordinary values keep their historical results.
+    assert L._tsm_mean_sd([1.0, 2.0, 3.0]) == (2.0, 1.0)
+
+
+def test_exact_fallbacks_materialise_a_one_shot_iterator():
+    # The float conversion fails on the huge element; the exact/rational
+    # fallback must still see the same values instead of an exhausted
+    # generator (which would have reported a fake zero / empty tail).
+    assert L._sampling_finite_sum(iter([HUGE, -HUGE])) == 0.0
+    assert L._sampling_finite_sum(iter([1.0, 2.0])) == 3.0
+    tail = L._etost_upper_tail(iter([HUGE, -HUGE]))
+    assert tail['n'] == 0 and math.isnan(tail['p'])
+    ordinary = L._etost_upper_tail(iter([-0.1, -0.2, -0.3]))
+    assert ordinary['n'] == 3
+    assert 0.0 <= ordinary['p'] <= 1.0
+
+
+def test_harmonic_keeps_the_empty_sum_for_non_positive_counts():
+    assert L._gfdr_harmonic(0) == 0.0
+    assert L._gfdr_harmonic(-5) == 0.0
+    assert L._gfdr_harmonic(4) == pytest.approx(
+        sum(1.0 / i for i in range(1, 5)))

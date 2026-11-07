@@ -115,6 +115,10 @@ def _gfdr_harmonic(m):
     are below float64 precision once ``m`` is this large.
     """
     mi = int(m)
+    if mi <= 0:
+        # H_0 is the empty sum.  Keep that historical value for a degenerate
+        # (including negative) family count instead of taking log(<=0).
+        return 0.0
     if mi in _GLOBAL_FDR_HARMONIC_CACHE:
         return _GLOBAL_FDR_HARMONIC_CACHE[mi]
     if mi > 1_000_000:

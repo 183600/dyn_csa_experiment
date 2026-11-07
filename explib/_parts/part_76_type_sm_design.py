@@ -544,17 +544,26 @@ def type_sm_design_curve(n, sigma, effect, *, factors=(1.0, 0.75, 0.5, 0.25),
 
 def _tsm_mean_sd(values):
     """Stable mean and sample SD (ddof=1), avoiding overflow at extreme scales."""
-    finite = [float(x) for x in values]
+    try:
+        finite = [float(x) for x in values]
+    except (TypeError, ValueError, OverflowError):
+        # An exact integer beyond float64 cannot form a float mean/SD; the
+        # pair is explicitly unavailable instead of an escaping conversion.
+        return None, None
     n = len(finite)
     if n < 2:
         return (finite[0] if finite else None), None
-    scale = max(abs(x) for x in finite)
-    if scale == 0.0:
-        return 0.0, 0.0
-    scaled = [x / scale for x in finite]
-    mean = math.fsum(scaled) / n
-    var = math.fsum((x - mean) ** 2 for x in scaled) / (n - 1)
-    return mean * scale, math.sqrt(var) * scale
+    try:
+        scale = max(abs(x) for x in finite)
+        if scale == 0.0:
+            return 0.0, 0.0
+        scaled = [x / scale for x in finite]
+        mean = math.fsum(scaled) / n
+        var = math.fsum((x - mean) ** 2 for x in scaled) / (n - 1)
+        out = (mean * scale, math.sqrt(var) * scale)
+    except (TypeError, ValueError, OverflowError, ZeroDivisionError):
+        return None, None
+    return out
 
 
 def type_sm_design_from_deltas(n, deltas=None, *, pilot_sd=None, sesoi=None,

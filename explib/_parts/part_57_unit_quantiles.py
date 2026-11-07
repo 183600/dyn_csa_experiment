@@ -250,14 +250,37 @@ def _uq_sort_values(values):
     vals = list(values)
     try:
         return sorted(float(v) for v in vals)
-    except (TypeError, ValueError, OverflowError):
+    except (TypeError, ValueError, OverflowError) as exc:
         # An exact integer beyond float64 cannot become a float order
         # statistic, but it can still be sorted exactly.  The interpolation
         # helpers above withhold an unrepresentable result instead of raising.
         if all(isinstance(v, (int, _uq_np.integer))
                and not isinstance(v, (bool, _uq_np.bool_)) for v in vals):
             return sorted(int(v) for v in vals)
-        raise
+        # A mixed panel (an exact huge integer next to an ordinary float)
+        # is just as sortable; only its float conversion is unavailable.  Use
+        # exact rational keys so equal magnitudes still tie correctly.
+        from fractions import Fraction as _Fraction
+
+        def _fraction(value):
+            try:
+                return _Fraction(value)
+            except (TypeError, ValueError):
+                return _Fraction.from_float(float(value))
+
+        def _normalise(value):
+            if isinstance(value, (bool, _uq_np.bool_)):
+                return float(value)
+            if isinstance(value, (int, _uq_np.integer)):
+                return int(value)
+            if isinstance(value, (float, _uq_np.floating)):
+                return float(value)
+            return value
+
+        try:
+            return sorted((_normalise(v) for v in vals), key=_fraction)
+        except (TypeError, ValueError, OverflowError, ZeroDivisionError):
+            raise exc
 
 
 def _uq_binom_cdf(k, n, p):

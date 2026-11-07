@@ -174,18 +174,31 @@ def _ls_div(num, den):
         return None
     if d <= 0:
         return None
+    from fractions import Fraction as _Fraction
+
+    def _exact_div():
+        try:
+            return float(_Fraction(num) / d)
+        except TypeError:
+            return float(_Fraction(float(num)) / d)
+
     try:
         if abs(d) <= (1 << 53):
-            out = float(num) / d
-        else:
-            from fractions import Fraction as _Fraction
             try:
-                quotient = _Fraction(num) / d
-            except TypeError:
-                quotient = _Fraction(float(num)) / d
-            out = float(quotient)
+                out = float(num) / d
+            except OverflowError:
+                # ``num`` may be an exact integer beyond float64 even though
+                # the quotient itself is representable (e.g. 10**309 / 10).
+                # Dividing by a small integer must not discard that case just
+                # because the numerator conversion overflowed.
+                out = _exact_div()
+        else:
+            out = _exact_div()
     except (OverflowError, ValueError, ZeroDivisionError, TypeError):
-        return None
+        try:
+            out = _exact_div()
+        except (OverflowError, ValueError, ZeroDivisionError, TypeError):
+            return None
     if not _ls_math.isfinite(out):
         return None
     if out == 0.0 and num != 0:
