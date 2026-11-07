@@ -1614,16 +1614,29 @@ def _nll_doc_ci(nll_per_row, n_tokens_per_row):
                 'ppl_ci95_low': None, 'ppl_ci95_high': None,
                 'n_docs': len(pairs)}
     mean = sum(doc_ce) / len(doc_ce)
+    if not math.isfinite(mean):
+        # Every per-document CE is finite, but their unweighted sum can
+        # overflow while the mean itself is representable (e.g. two documents
+        # at 1.7e308 and one at 0).  The descriptive mean must not become inf
+        # -- and an inf mean would turn every deviation below into NaN.
+        _mean_scaled = _scaled_mean_or_raw(doc_ce)
+        if _mean_scaled is not None and math.isfinite(_mean_scaled):
+            mean = float(_mean_scaled)
+    _deviations = [x - mean for x in doc_ce]
     _doc_var = _scaled_sum_of_squares(
-        [x - mean for x in doc_ce], 1.0 / (len(doc_ce) - 1))
+        _deviations, 1.0 / (len(doc_ce) - 1))
     sem = (math.sqrt(max(_doc_var, 0.0) / len(doc_ce))
            if _doc_var is not None else None)
-    if sem == 0.0 and any(x != mean for x in doc_ce):
+    if sem is None and all(math.isfinite(d) for d in _deviations):
+        # The variance can exceed float64 while its standard error is still
+        # representable; scale only the final square root.
+        sem = _scaled_root_sum_of_squares(
+            _deviations, 1.0 / ((len(doc_ce) - 1) * len(doc_ce)))
+    elif sem == 0.0 and any(x != mean for x in doc_ce):
         # The variance underflowed although the standard error is
         # representable; do not report a fake zero-width interval.
         sem = _scaled_root_sum_of_squares(
-            [x - mean for x in doc_ce],
-            1.0 / ((len(doc_ce) - 1) * len(doc_ce)))
+            _deviations, 1.0 / ((len(doc_ce) - 1) * len(doc_ce)))
     # The point estimate is token-pooled, so the interval must be for that
     # same estimand.  Resampling/weighting per-document CEs as if the pooled
     # CE were their unweighted mean mixes two different estimators and is
@@ -1769,14 +1782,14 @@ def _paired_nll_doc_ci_extreme(A, B, counts, conf, *,
         return None
     if not (np.all(np.isfinite(psi)) and np.all(np.isfinite(psi_lr))):
         return None
-    bar = psi.mean(axis=0)
+    bar = _scaled_mean_axis0(psi)
     var = _scaled_sum_of_squares(bar, D / (D - 1.0))
     se = (math.sqrt(max(var, 0.0)) if var is not None else None)
     if se == 0.0 and any(v != 0.0 for v in bar):
         # The variance underflowed although the standard error is
         # representable; do not report a fake zero-width interval.
         se = _scaled_root_sum_of_squares(bar, D / (D - 1.0))
-    bar_lr = psi_lr.mean(axis=0)
+    bar_lr = _scaled_mean_axis0(psi_lr)
     var_lr = _scaled_sum_of_squares(bar_lr, D / (D - 1.0))
     se_lr = (math.sqrt(max(var_lr, 0.0)) if var_lr is not None else None)
     if se_lr == 0.0 and any(v != 0.0 for v in bar_lr):
@@ -1989,7 +2002,7 @@ def _paired_nll_doc_ci(nll_a, nll_b, n_tokens, *, conf=0.95):
     # Per-seed influence on the pooled CE difference, then average over seeds.
     psi = (ea[:, None] * (A - ce_a[:, None] * T[None, :]) / total_tok
            - eb[:, None] * (B - ce_b[:, None] * T[None, :]) / total_tok)
-    bar = psi.mean(axis=0)
+    bar = _scaled_mean_axis0(psi)
     var = _scaled_sum_of_squares(bar, D / (D - 1.0))
     se = (math.sqrt(max(var, 0.0)) if var is not None else None)
     if se == 0.0 and any(v != 0.0 for v in bar):
@@ -1998,7 +2011,7 @@ def _paired_nll_doc_ci(nll_a, nll_b, n_tokens, *, conf=0.95):
         se = _scaled_root_sum_of_squares(bar, D / (D - 1.0))
     psi_lr = ((A - ce_a[:, None] * T[None, :])
               - (B - ce_b[:, None] * T[None, :])) / total_tok
-    bar_lr = psi_lr.mean(axis=0)
+    bar_lr = _scaled_mean_axis0(psi_lr)
     var_lr = _scaled_sum_of_squares(bar_lr, D / (D - 1.0))
     se_lr = (math.sqrt(max(var_lr, 0.0)) if var_lr is not None else None)
     if se_lr == 0.0 and any(v != 0.0 for v in bar_lr):

@@ -1127,3 +1127,52 @@ def test_cleaning_replay_rejects_a_fit_prefix_larger_than_the_raw_source():
         train_rows, val_rows, train_meta=zero,
         train_doc_ids=train_ids, validation_doc_ids=val_ids)
     assert rep2['status'] == 'not_verifiable', rep2
+
+
+def test_block_ranking_with_nan_matches_the_stable_sort_contract():
+    # _rank_blocks uses a rank/scatter construction for k < B.  A NaN compares
+    # false against the k-th value, so the selected rank slots are never
+    # written and the uninitialised sentinel buffer leaks arbitrary column
+    # indices (an out-of-bounds crash in the gather).  The helper documents
+    # the same stable top-k contract as _stable_topk_desc, whose NaN fallback
+    # already delegates to torch.sort; both tie rules must agree with it.
+    import torch
+
+    from _csa_kernels import _stable_topk_desc
+
+    values = [float('-inf'), float('inf'), float('nan'), 1.0, 0.0]
+    for B in (2, 5, 10):
+        x = torch.tensor([[values[(i + j) % len(values)] for j in range(B)]
+                          for i in range(3)])
+        for k in range(0, B + 2):
+            kk = min(max(int(k), 0), B)
+            for ties in ('earliest', 'latest'):
+                got = L._rank_blocks(x, B, ties, k=k)
+                if ties == 'earliest':
+                    expected = torch.argsort(x, dim=1, stable=True,
+                                             descending=True)
+                else:
+                    expected = B - 1 - torch.argsort(
+                        x.flip(1), dim=1, stable=True, descending=True)
+                expected = expected[:, :kk]
+                assert torch.equal(got, expected), (B, k, ties, x, got, expected)
+                # The kernel-side twin must select the same columns.
+                _, top = _stable_topk_desc(x, k)
+                if ties == 'earliest':
+                    assert torch.equal(got, top), (B, k, x, got, top)
+
+
+def test_unpaired_doc_ci_finite_documents_keep_a_finite_descriptive_mean():
+    # Each document CE is finite, but two of them at 1.7e308 overflow their
+    # unweighted sum.  The token-pooled PPL stays finite (~e); the descriptive
+    # per-document mean/SEM must not serialise as inf (or turn every deviation
+    # into NaN), because that is a strict-JSON failure rather than a real
+    # "unrepresentable" measurement.
+    got = L._nll_doc_ci([1.7e308, 1.7e308, 0.0],
+                        [1, 1, 34 * 10 ** 307])
+    assert got is not None, got
+    assert got['ppl'] == 1.0 or math.isclose(got['ppl'], math.e, rel_tol=1e-12), got
+    assert math.isfinite(got['doc_ce_mean']), got
+    assert got['doc_ce_mean'] < 1.7e308, got
+    assert got['doc_ce_sem'] is not None and math.isfinite(got['doc_ce_sem']), got
+    json.dumps(got, allow_nan=False)

@@ -8,6 +8,7 @@ trial.
 """
 
 import json
+import math
 import os
 import shutil
 import tempfile
@@ -70,3 +71,39 @@ def test_mixed_seed_horizons_do_not_claim_a_common_trial_budget(monkeypatch):
     # not silently promote seed 0's shorter horizon to the whole trial.
     assert row['steps'] is None
     assert row['tokens_seen'] is None
+
+
+def test_selection_pooling_survives_unrepresentable_nll_and_token_totals():
+    # record_subset_ppl() reports nll_sum=None when one seed's float NLL sum
+    # overflows, and a token total above 10**308 cannot become a float.  The
+    # tuning driver used to sum those None values (TypeError) or convert the
+    # total with float() (OverflowError) before reaching _safe_exp_ppl.
+    huge = 10 ** 400
+    stats = {
+        0: {'nll': 1.0, 'nll_sum': None, 'n_tokens': huge},
+        1: {'nll': 2.0, 'nll_sum': None, 'n_tokens': 3 * huge},
+    }
+    ppl, total_nll, total_tok, seed_nll = BT._selection_pooled_metrics(stats)
+    assert total_nll is None and total_tok == 4 * huge, (total_nll, total_tok)
+    # Token-weighted exact mean CE = (1*1e400 + 2*3e400) / (4e400) = 7/4.
+    assert math.isclose(math.log(ppl), 1.75, rel_tol=1e-15), ppl
+    assert seed_nll == {'0': None, '1': None}, seed_nll
+
+    # Finite per-seed NLL totals whose cross-seed sum overflows are recovered
+    # from the ratio, not by dividing an infinity.
+    stats = {
+        0: {'nll': 1.0, 'nll_sum': 1e308, 'n_tokens': 10 ** 308},
+        1: {'nll': 1.0, 'nll_sum': 1e308, 'n_tokens': 10 ** 308},
+    }
+    ppl, total_nll, total_tok, seed_nll = BT._selection_pooled_metrics(stats)
+    assert total_nll is None and total_tok == 2 * 10 ** 308, (total_nll, total_tok)
+    assert math.isclose(ppl, math.e, rel_tol=1e-12), ppl
+    assert seed_nll == {'0': 1e308, '1': 1e308}, seed_nll
+
+    # The ordinary finite path keeps the historical total and ratio.
+    stats = {0: {'nll': 1.0, 'nll_sum': 3.0, 'n_tokens': 4},
+             1: {'nll': 2.0, 'nll_sum': 6.0, 'n_tokens': 4}}
+    ppl, total_nll, total_tok, seed_nll = BT._selection_pooled_metrics(stats)
+    assert total_nll == 9.0 and total_tok == 8, (total_nll, total_tok)
+    assert math.isclose(ppl, math.exp(9.0 / 8.0), rel_tol=1e-15), ppl
+    assert seed_nll == {'0': 3.0, '1': 6.0}, seed_nll

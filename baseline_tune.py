@@ -104,6 +104,96 @@ def _common_budget(records, key):
     return next(iter(values)) if len(values) == 1 else None
 
 
+def _selection_pooled_metrics(selection_stats):
+    """Token-pooled PPL over the search seeds, without a float total.
+
+    ``record_subset_ppl`` deliberately reports ``nll_sum=None`` when the
+    per-row float sum overflows even though the token-pooled CE is still
+    representable.  Summing that ``None`` (or converting a huge exact token
+    total to float) used to abort the whole tuning run.  Keep the historical
+    ordinary path bit-for-bit; use the overflow-safe ratio only when a float
+    intermediate is unavailable, and recover the pooled mean from the exact
+    per-seed ``nll``/``n_tokens`` accounting in the remaining case.
+
+    Returns ``(ppl, total_nll_or_None, total_tokens, seed_nll_map)``.
+    """
+    try:
+        keys = sorted(selection_stats)
+        stats = [selection_stats[k] for k in keys]
+    except (TypeError, KeyError):
+        return float('nan'), None, 0, None
+    if not stats:
+        return float('nan'), None, 0, None
+    toks = []
+    for st in stats:
+        if not isinstance(st, dict):
+            return float('nan'), None, 0, None
+        try:
+            tok = int(st['n_tokens'])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return float('nan'), None, 0, None
+        if tok <= 0:
+            return float('nan'), None, 0, None
+        toks.append(tok)
+    total_tok = int(sum(toks))
+    if total_tok <= 0:
+        return float('nan'), None, 0, None
+
+    raw_sums = [st.get('nll_sum') for st in stats]
+    sums = None
+    if all(v is not None and not isinstance(v, (bool, np.bool_))
+           for v in raw_sums):
+        try:
+            candidate = [float(v) for v in raw_sums]
+        except (TypeError, ValueError, OverflowError):
+            candidate = None
+        if candidate is not None and all(math.isfinite(v) for v in candidate):
+            sums = candidate
+
+    if sums is not None:
+        seed_nll = {str(k): float(v) for k, v in zip(keys, sums)}
+        try:
+            total_nll = float(sum(sums))
+            if math.isfinite(total_nll):
+                ce = total_nll / float(total_tok)
+                return (float(L._safe_exp_ppl(ce)), total_nll, total_tok,
+                        seed_nll)
+        except (OverflowError, ValueError, ZeroDivisionError):
+            pass
+        # Either the NLL total or the token total is beyond float64; the
+        # ratio of the two may still be representable.
+        ce = L._pooled_nll_ratio(sums, toks)
+        ppl = float(L._safe_exp_ppl(ce)) if ce is not None else float('nan')
+        return ppl, None, total_tok, seed_nll
+
+    # ``nll_sum`` is unavailable for at least one seed.  Reconstruct each
+    # seed's total NLL from its finite per-token CE and exact token count, then
+    # pool in the exact rational domain.  This keeps the token-pooled estimand
+    # instead of falling back to an equal-weight mean of PPLs.
+    from fractions import Fraction as _Fraction
+    try:
+        seed_q = [_Fraction(float(st['nll'])) * tok
+                  for st, tok in zip(stats, toks)]
+        q = sum(seed_q, _Fraction(0, 1)) / total_tok
+        ce = float(q)
+        if ce == 0.0 and q != 0:
+            ce = None
+    except (KeyError, TypeError, ValueError, OverflowError, ZeroDivisionError):
+        ce = None
+        seed_q = None
+    ppl = float(L._safe_exp_ppl(ce)) if ce is not None else float('nan')
+    seed_nll = None
+    if seed_q is not None:
+        seed_nll = {}
+        for k, qv in zip(keys, seed_q):
+            try:
+                fv = float(qv)
+            except (TypeError, ValueError, OverflowError):
+                fv = None
+            seed_nll[str(k)] = fv if fv is not None and math.isfinite(fv) else None
+    return ppl, None, total_tok, seed_nll
+
+
 def _protocol_arm_groups(protocol, base, arms):
     """Resolve the protocol's arm groups, falling back to one legacy group.
 
@@ -445,20 +535,31 @@ def run_tuning(base_cfg=None, outdir='results_baseline_tuning', protocol=None,
                 if selection_ppls is not None:
                     # Token-pooled within each seed and across search seeds:
                     # the same estimator as the panel's primary PPL.
-                    _nll_tot = float(sum(selection_stats[s]['nll_sum'] for s in selection_stats))
-                    _tok_tot = int(sum(selection_stats[s]['n_tokens'] for s in selection_stats))
-                    if _tok_tot == 0:
-                        mean = float('nan')
-                    else:
-                        mean = float(L._safe_exp_ppl(_nll_tot / _tok_tot))
-                    std = _mean_std(list(selection_ppls.values()))[1]
+                    mean, _nll_tot, _tok_tot, _seed_nll = (
+                        _selection_pooled_metrics(selection_stats))
                     _metric_ppls = selection_ppls
-                    _seed_nll = {str(s): float(selection_stats[s]['nll_sum']) for s in sorted(selection_stats)}
-                    _seed_ntok = {str(s): int(selection_stats[s]['n_tokens']) for s in sorted(selection_stats)}
-                    _agg = 'pooled_token_nll'
+                    std = _mean_std(list(selection_ppls.values()))[1]
+                    if _nll_tot is None:
+                        # The per-seed NLL totals exist but their cross-seed
+                        # sum is beyond float64.  There is no representable
+                        # aggregate nll_sum to back a "pooled" claim, so do not
+                        # make one up: use the already finite per-seed pooled
+                        # PPLs and label the fallback.  (The tuning audit
+                        # rejects a pooled label without a usable nll_sum.)
+                        mean, std = _mean_std(list(selection_ppls.values()))
+                        _tok_tot = None
+                        _seed_nll = None
+                        _seed_ntok = None
+                        _agg = 'arithmetic_seed_mean_fallback'
+                    else:
+                        _seed_ntok = {str(s): int(selection_stats[s]['n_tokens'])
+                                      for s in sorted(selection_stats)}
+                        _agg = 'pooled_token_nll'
                 else:
                     mean, std = _mean_std(list(full_seed_ppls.values()))
                     _metric_ppls = full_seed_ppls
+                    _nll_tot = None
+                    _tok_tot = None
                     _seed_nll = None
                     _seed_ntok = None
                     _agg = 'arithmetic_seed_mean_fallback'
@@ -479,10 +580,8 @@ def run_tuning(base_cfg=None, outdir='results_baseline_tuning', protocol=None,
                     # to check that a pooled claim is backed by nll_sum /
                     # n_tokens instead of having to infer it from nullability.
                     'ppl_aggregation': _agg,
-                    'nll_sum': (float(sum(selection_stats[s]['nll_sum'] for s in selection_stats))
-                                if selection_ppls is not None else None),
-                    'n_tokens': (int(sum(selection_stats[s]['n_tokens'] for s in selection_stats))
-                                 if selection_ppls is not None else None),
+                    'nll_sum': _nll_tot,
+                    'n_tokens': _tok_tot,
                     'seed_nll_sum': _seed_nll, 'seed_n_tokens': _seed_ntok,
                     'n_seeds': len(records), 'seeds': sorted(records),
                     'seed_ppls': {str(s): float(_metric_ppls[s]) for s in sorted(records)},

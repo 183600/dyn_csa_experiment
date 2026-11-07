@@ -898,6 +898,21 @@ def _rank_blocks(masked, B, ties, k=None):
     kk = B if k is None else min(max(int(k), 0), B)
     if kk <= 0:
         return torch.empty((masked.shape[0], 0), dtype=torch.long, device=masked.device)
+    if masked.is_floating_point() and bool(torch.isnan(masked).any()):
+        # The rank/scatter construction below needs a defined k-th value.  A
+        # NaN compares false against every candidate, so the selected rank
+        # slots are never written and `buf` keeps arbitrary uninitialised
+        # column indices -- a crash or a garbage selection depending on the
+        # allocator.  Delegate the whole row to torch.sort, whose stable NaN
+        # ordering is the contract this helper documents.  This mirrors the
+        # NaN fallback in `_stable_topk_desc` (the two implementations must
+        # agree on every input, including a non-finite one).
+        if ties == 'earliest':
+            order = torch.argsort(masked, dim=1, stable=True, descending=True)
+        else:
+            order = torch.argsort(masked.flip(1), dim=1, stable=True, descending=True)
+            order = torch.sub(B - 1, order, out=order)
+        return order[:, :kk]
     if kk >= B:
         # argsort returns exactly the same stable permutation as sort(...).indices.
         if ties == 'earliest':
