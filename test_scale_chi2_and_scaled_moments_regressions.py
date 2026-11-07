@@ -150,3 +150,30 @@ def test_scaled_root_still_withholds_unrepresentable_or_invalid_results():
     assert L._scaled_sum_of_squares([1.0, 2.0], -1.0) is None
     # A constant panel keeps the exact zero, and the all-zero panel is zero.
     assert L._scaled_root_sum_of_squares([0.0, 0.0], 1e308) == 0.0
+
+
+def test_scaled_moments_withhold_exact_values_beyond_float64():
+    # float(10**400) raises OverflowError before the value can be scaled.
+    # The result (variance, SE or mean) is unrepresentable, so the documented
+    # fail-closed contract is None -- never an escaping int-to-float error.
+    huge = 10 ** 400
+    assert L._scaled_sum_of_squares([huge], 1.0) is None
+    assert L._scaled_sum_of_squares([1.0, huge], 1.0) is None
+    assert L._scaled_sum_of_squares([huge], huge) is None
+    assert L._scaled_root_sum_of_squares([huge], 1.0) is None
+    assert L._scaled_root_sum_of_squares([1.0, huge], 1.0) is None
+    assert L._scaled_mean_std_if_extreme([huge, huge]) is None
+    # Ordinary values still take the representable path.
+    assert L._scaled_sum_of_squares([1.0, 2.0], 1.0) == pytest.approx(5.0)
+    assert L._scaled_root_sum_of_squares([3.0, 4.0], 1.0) == pytest.approx(5.0)
+
+
+def test_safe_exp_ppl_keeps_the_limit_of_an_exact_ce_beyond_float64():
+    # A finite but unrepresentably large cross-entropy has exp=+inf (the
+    # divergent-run sentinel), and an unrepresentably negative one underflows
+    # to 0.  Neither is a missing measurement, so None would be wrong.
+    huge = 10 ** 400
+    assert L._safe_exp_ppl(huge) == float('inf')
+    assert L._safe_exp_ppl(-huge) == 0.0
+    assert L._safe_exp_ppl(1000.0) == float('inf')
+    assert L._safe_exp_ppl(-1000.0) == 0.0

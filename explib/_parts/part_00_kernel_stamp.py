@@ -1197,7 +1197,21 @@ def _safe_exp_ppl(x):
     ``eval_ppl`` overflow behaviour while making the CI bounds consistent."""
     try:
         x = float(x)
-    except (TypeError, ValueError, OverflowError):
+    except OverflowError:
+        # An exact integer beyond float64 is still a finite CE.  Its
+        # exponential is the same limit as the corresponding infinity:
+        # a divergent positive CE is inf, and a very negative one underflows
+        # to zero.  Returning None here made a representable limit look like
+        # a missing measurement.
+        try:
+            if x > 0:
+                return float('inf')
+            if x < 0:
+                return 0.0
+        except (TypeError, ValueError):
+            return None
+        return None
+    except (TypeError, ValueError):
         return None
     if math.isnan(x):
         return float('nan')
@@ -1345,7 +1359,12 @@ def _scaled_sum_of_squares(values, multiplier):
     space.  Returns None when the true result does not fit a float, so callers
     can mark the interval unavailable instead of emitting inf.
     """
-    vals = [float(v) for v in values]
+    try:
+        vals = [float(v) for v in values]
+    except (TypeError, ValueError, OverflowError):
+        # An exact integer beyond float64 has an unrepresentable square as
+        # well; the caller must withhold the variance rather than crash.
+        return None
     if not vals:
         return 0.0
     scale = max((abs(v) for v in vals), default=0.0)
@@ -1383,7 +1402,12 @@ def _scaled_root_sum_of_squares(values, multiplier):
     (or fail for a multiplier above float64) even when the final scaled SE is
     representable; those cases are recovered in log space.
     """
-    vals = [float(v) for v in values]
+    try:
+        vals = [float(v) for v in values]
+    except (TypeError, ValueError, OverflowError):
+        # Exact integers beyond float64 cannot contribute a representable
+        # standard error; fail closed instead of escaping as OverflowError.
+        return None
     if not vals:
         return 0.0
     if isinstance(multiplier, (bool, np.bool_)):
@@ -1458,7 +1482,12 @@ def _scaled_mean_std_if_extreme(values, ddof=1):
     cannot be scaled.  The 1e-100/1e100 cutoffs are the same convention used by
     the exact sign-flip helpers.
     """
-    vals = [float(v) for v in values]
+    try:
+        vals = [float(v) for v in values]
+    except (TypeError, ValueError, OverflowError):
+        # The mean/magnitude itself does not fit float64; there is no
+        # representable (mean, std) to return.
+        return None
     n = len(vals)
     if n == 0:
         return None
