@@ -208,10 +208,50 @@ def _ls_div(num, den):
     return float(out)
 
 
+def _ls_is_bool(value):
+    return isinstance(value, (bool, _ls_np.bool_))
+
+
+def _ls_finite_but_unrepresentable(value):
+    """A real, finite measurement whose float64 spelling does not exist.
+
+    NaN/inf are non-measurements and are still dropped; only an overflow from
+    a finite value (for example ``10**400``) is a representable observation
+    with an unavailable float statistic.
+    """
+    if _ls_is_bool(value):
+        return False
+    if isinstance(value, (complex, _ls_np.complexfloating)):
+        return False
+    if not isinstance(value, numbers.Number):
+        return False
+    try:
+        return _ls_math.isfinite(float(value))
+    except OverflowError:
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
 def _ls_summary(values, conf):
-    """Mean and two-sided t interval for a seed-level vector."""
-    finite = [float(v) for v in values if _finite_scalar(v) is not None]
-    n = len(finite)
+    """Mean and two-sided t interval for a seed-level vector.
+
+    A finite measurement that cannot be spelled as a float64 (an exact integer
+    beyond the exponent range) is still an observation: it must count toward
+    ``n`` and make the mean/SD explicitly unavailable.  Filtering it out with
+    ``_finite_scalar`` and then reporting the remaining values as ``n`` would
+    silently describe a smaller panel than the caller supplied.
+    """
+    finite = []
+    n_unrepresentable = 0
+    for value in values:
+        f = _finite_scalar(value)
+        if f is not None:
+            finite.append(float(f))
+            continue
+        if _ls_finite_but_unrepresentable(value):
+            n_unrepresentable += 1
+    n = len(finite) + n_unrepresentable
     try:
         conf_f = float(conf)
     except (TypeError, ValueError, OverflowError):
@@ -219,6 +259,10 @@ def _ls_summary(values, conf):
     out = {'n': int(n), 'mean': None, 'std': None, 'sem': None,
            'ci95': None, 'conf': conf_f}
     if not finite:
+        return out
+    if n_unrepresentable:
+        # The panel mean/SD is not representable.  Do not compute a statistic
+        # for the representable subset under the full panel's label.
         return out
     mean, std = _ls_mean_std(finite)
     out['mean'] = mean

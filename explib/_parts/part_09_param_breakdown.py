@@ -1045,11 +1045,40 @@ def _signflip_signed_sums(values):
     exact cancellations are still well defined.  Keep the historical float
     table for ordinary panels and use an object table only when the initial
     conversion cannot represent an entry.
+
+    The object table must not mix a huge Python integer with a float: Python's
+    ``huge_int + 1.0`` converts the integer to float and raises
+    ``OverflowError`` even though the mathematical sum is exact.  Convert the
+    non-integral entries to ``Fraction`` in that fallback, so a mixed panel is
+    accumulated in the exact rational domain.  An all-integer fallback keeps
+    ints (the historical exact spelling).
     """
     try:
         vals = np.asarray(values, dtype=float)
     except OverflowError:
-        vals = np.asarray(values, dtype=object)
+        try:
+            raw = list(values)
+        except TypeError:
+            raw = [values]
+        obj = np.asarray(raw, dtype=object)
+        if obj.ndim != 1:
+            raise ValueError('signed sums need a one-dimensional sequence')
+        from fractions import Fraction as _Fraction
+        exact_terms = []
+        for value in obj.tolist():
+            if isinstance(value, (int, np.integer)) and not isinstance(
+                    value, (bool, np.bool_)):
+                exact_terms.append(int(value))
+                continue
+            try:
+                exact_terms.append(_Fraction(value))
+            except (TypeError, ValueError, OverflowError):
+                # A float/Decimal spelling that Fraction cannot consume still
+                # has a Python value; use its exact binary/rational form.  A
+                # non-number keeps the historical hard error rather than
+                # being silently treated as zero.
+                exact_terms.append(_Fraction(float(value)))
+        vals = np.asarray(exact_terms, dtype=object)
     out = np.zeros(1, dtype=object if vals.dtype == object else float)
     for v in vals:
         out = np.concatenate((out + v, out - v))

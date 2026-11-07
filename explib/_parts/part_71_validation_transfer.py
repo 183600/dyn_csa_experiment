@@ -288,24 +288,63 @@ def _vt_same_number(a, b):
     return _vt_close(a, b)
 
 
+def _vt_finite_number(value):
+    """A finite float, or an exact rational for an integer beyond float64.
+
+    ``math.isfinite(10**400)`` raises ``OverflowError``; an exact integer
+    beyond float64 is still finite.  Return ``None`` for NaN/inf, booleans and
+    non-numbers.  Converting each operand independently keeps a mixed panel
+    (for example ``np.float32`` next to a huge int) usable.
+    """
+    if value is None or isinstance(value, (bool, np.bool_)):
+        return None
+    try:
+        out = float(value)
+    except OverflowError:
+        from fractions import Fraction
+        try:
+            return Fraction(value)
+        except (TypeError, ValueError, ZeroDivisionError):
+            try:
+                return Fraction(float(value))
+            except (TypeError, ValueError, ZeroDivisionError,
+                    OverflowError):
+                return None
+    except (TypeError, ValueError):
+        return None
+    return out if math.isfinite(out) else None
+
+
+def _vt_finite_pair(validation_mean, test_mean):
+    """Return finite numeric operands, or ``(None, None)``."""
+    v = _vt_finite_number(validation_mean)
+    t = _vt_finite_number(test_mean)
+    if v is None or t is None:
+        return None, None
+    return v, t
+
+
 def _vt_ratio_and_shrinkage(validation_mean, test_mean):
     """Derived ``test/validation`` ratio and percent shrinkage, JSON safe.
 
     Both quantities are only defined for a nonzero validation mean.  A
     representable ratio can still make ``(1 - ratio) * 100`` overflow; an
     infinite percentage is not a measurement and must not enter a strict-JSON
-    report.
+    report.  An exact integer beyond float64 is handled as an exact rational,
+    not as ``math.isfinite`` on the raw object (which raises ``OverflowError``).
     """
-    if (validation_mean is None or test_mean is None
-            or not (math.isfinite(validation_mean)
-                    and math.isfinite(test_mean))
-            or validation_mean == 0.0):
+    v, t = _vt_finite_pair(validation_mean, test_mean)
+    if v is None or v == 0:
         return None, None
     try:
-        ratio = float(test_mean / validation_mean)
+        ratio = float(t / v)
     except (OverflowError, ZeroDivisionError, TypeError, ValueError):
         return None, None
     if not math.isfinite(ratio):
+        return None, None
+    if ratio == 0.0 and t != 0:
+        # A nonzero test/validation ratio below the smallest float is not a
+        # measured zero; the derived readout is unavailable.
         return None, None
     try:
         shrinkage = float((1.0 - ratio) * 100.0)
@@ -317,12 +356,10 @@ def _vt_ratio_and_shrinkage(validation_mean, test_mean):
 
 
 def _vt_direction_agreement(validation_mean, test_mean):
-    if (validation_mean is None or test_mean is None
-            or not (math.isfinite(validation_mean)
-                    and math.isfinite(test_mean))
-            or validation_mean == 0.0):
+    v, t = _vt_finite_pair(validation_mean, test_mean)
+    if v is None or v == 0:
         return None
-    return bool((validation_mean > 0.0) == (test_mean > 0.0))
+    return bool((v > 0.0) == (t > 0.0))
 
 
 def _vt_endpoint_length(comp):

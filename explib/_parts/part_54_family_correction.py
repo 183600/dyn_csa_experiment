@@ -851,7 +851,15 @@ def confirmation_family_correction(comparisons, *, family_names, frozen_holm=Non
 
 def _fc_num(value, fmt='{:.4f}'):
     if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return fmt.format(float(value))
+        try:
+            return fmt.format(float(value))
+        except (TypeError, ValueError, OverflowError):
+            # An exact integer beyond float64 has no float spelling; a
+            # display helper must not abort the surrounding report.
+            try:
+                return f'{int(value):+d}'
+            except (TypeError, ValueError, OverflowError):
+                return '—'
     return '—'
 
 
