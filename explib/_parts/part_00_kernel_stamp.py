@@ -1882,14 +1882,31 @@ def _nll_row_ce(matrix, total_tokens):
     still be representable.  Callers that already hold validated, finite
     matrices use this to avoid treating an overflowing accumulator as an
     unrepresentable measurement.
+
+    An exact token total beyond float64 is not an unmeasurable denominator:
+    route it through the exact-integer companion instead of letting
+    ``float(total_tokens)`` escape as ``OverflowError``.
     """
     arr = np.asarray(matrix, dtype=float)
     with np.errstate(over='ignore', invalid='ignore'):
         sums = arr.sum(axis=1)
+    try:
+        den = float(total_tokens)
+    except OverflowError:
+        exact = _nll_row_ce_exact(matrix, [total_tokens])
+        # The exact companion reports a fully unrepresentable row set as
+        # None; this per-row API keeps a NaN row so callers can withhold the
+        # interval instead of iterating over None.
+        if exact is None:
+            return np.full(int(arr.shape[0]), np.nan)
+        return exact
+    except (TypeError, ValueError):
+        return np.full(int(arr.shape[0]), np.nan)
     if np.all(np.isfinite(sums)):
-        return sums / float(total_tokens)
+        with np.errstate(over='ignore', invalid='ignore'):
+            return np.asarray(sums / den, dtype=float)
     from fractions import Fraction as _Fraction
-    denom = _Fraction(float(total_tokens))
+    denom = _Fraction(den)
     out = []
     for row in arr:
         try:

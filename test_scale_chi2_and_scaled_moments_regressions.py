@@ -168,6 +168,50 @@ def test_scaled_moments_withhold_exact_values_beyond_float64():
     assert L._scaled_root_sum_of_squares([3.0, 4.0], 1.0) == pytest.approx(5.0)
 
 
+def test_scaled_means_withhold_exact_values_beyond_float64():
+    # The single-value scaled-moment helpers shared the same conversion
+    # hazard the variance/SE helpers were already hardened against: the
+    # historical ``np.asarray(values, dtype=float)`` raised OverflowError for
+    # an exact integer beyond float64.  A mean/median/percentile/SD that
+    # cannot be represented is unavailable, not an escaping conversion error.
+    huge = 10 ** 400
+    assert L._scaled_mean_or_raw([huge]) is None
+    assert L._scaled_mean_or_raw([1.0, huge]) is None
+    assert L._scaled_std_or_raw([huge, huge]) is None
+    assert L._scaled_median_or_raw([huge]) is None
+    assert L._scaled_percentile_or_raw([huge], (25, 75)) == (None, None)
+    # A column-wise reduction cannot form any column value, so every column
+    # is unavailable (NaN) instead of crashing in the initial conversion.
+    out = L._scaled_mean_axis0([[huge, 1.0], [huge, 2.0]])
+    assert out.shape == (2,)
+    assert all(math.isnan(x) for x in out)
+    # The panel-specific mean/SD wrappers share the same fail-closed contract.
+    assert L._uq_mean([huge]) is None
+    assert L._ls_mean_std([huge]) == (None, None)
+    assert L._es_mean_sd([huge]) == (None, None)
+    # Ordinary panels keep the historical bit-for-bit values.
+    assert L._scaled_mean_or_raw([1.0, 2.0, 3.0]) == 2.0
+    assert L._scaled_std_or_raw([1.0, 2.0, 3.0]) == 1.0
+    assert L._scaled_median_or_raw([1.0, 2.0, 3.0]) == 2.0
+    assert L._scaled_percentile_or_raw([1.0, 2.0, 3.0], (25, 75)) == (1.5, 2.5)
+
+
+def test_row_ce_accepts_an_exact_token_total_beyond_float64():
+    # float(total_tokens) used to raise before the exact-integer sibling
+    # could be used.  A representable per-row CE is still recovered, while a
+    # quotient that underflows is withheld rather than reported as a fake 0.
+    from fractions import Fraction
+    huge = 10 ** 400
+    got = L._nll_row_ce([[1e308, 1e308]], huge)
+    assert got is not None and got.shape == (1,)
+    exact = float(sum(Fraction(1e308) for _ in range(2)) / huge)
+    assert got[0] == exact
+    # A per-row quotient that underflows to zero is withheld as NaN (the
+    # caller treats NaN rows as an unavailable interval), never a fake 0.
+    under = L._nll_row_ce([[1.0, 2.0]], huge)
+    assert under is not None and math.isnan(under[0])
+
+
 def test_safe_exp_ppl_keeps_the_limit_of_an_exact_ce_beyond_float64():
     # A finite but unrepresentably large cross-entropy has exp=+inf (the
     # divergent-run sentinel), and an unrepresentably negative one underflows

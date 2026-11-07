@@ -255,18 +255,28 @@ def _scaled_std_or_raw(values):
     though each measurement is finite (e.g. ``[1.7e308, -1.7e308]``).  The
     historical return of ``inf`` is not a measured spread and is not strict-
     JSON safe, so callers get the same "unavailable" value they already use
-    for a missing SD.
+    for a missing SD.  An exact integer beyond float64 has no representable
+    sample SD either; return ``None`` instead of letting ``np.asarray``/
+    ``np.std`` escape as ``OverflowError`` (the same fail-closed contract as
+    ``_scaled_sum_of_squares`` and ``_scaled_mean_std_if_extreme``).
     """
     try:
         if len(values) < 2:
             return 0.0
     except TypeError:
         return 0.0
-    _ms = _scaled_mean_std_if_extreme(values, ddof=1)
+    try:
+        arr = np.asarray(values, dtype=float)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    _ms = _scaled_mean_std_if_extreme(arr, ddof=1)
     if _ms is not None:
         sd = float(_ms[1])
     else:
-        sd = float(np.std(values, ddof=1))
+        try:
+            sd = float(np.std(arr, ddof=1))
+        except (TypeError, ValueError, OverflowError):
+            return None
     return sd if math.isfinite(sd) else None
 
 
@@ -278,8 +288,15 @@ def _scaled_mean_or_raw(values):
     seeds at ``1e308``).  Reuse the guarded mean/SD helper, which scales by the
     largest magnitude only for an extreme panel and therefore leaves ordinary
     panels bit-identical to the historical ``np.mean``.
+
+    Returns ``None`` when the panel cannot be represented in float64 at all
+    (an exact integer beyond float64): a mean that cannot be formed is
+    unavailable, not an ``OverflowError`` escaping from ``np.asarray``.
     """
-    arr = np.asarray(values, dtype=float)
+    try:
+        arr = np.asarray(values, dtype=float)
+    except (TypeError, ValueError, OverflowError):
+        return None
     if arr.size == 0:
         return float(np.mean(arr))
     _ms = _scaled_mean_std_if_extreme(arr, ddof=1)
@@ -297,8 +314,20 @@ def _scaled_mean_axis0(values):
     scaled one-dimensional helper only for a column whose naive mean is
     non-finite while every entry is finite.  A NaN input (an unavailable
     leave-one-unit-out fold, for example) keeps its existing NaN result.
+    An exact integer beyond float64 makes the whole reduction unavailable;
+    return an all-NaN result of the same column shape instead of raising from
+    the initial conversion.
     """
-    arr = np.asarray(values, dtype=float)
+    try:
+        arr = np.asarray(values, dtype=float)
+    except (TypeError, ValueError, OverflowError):
+        try:
+            shape = np.asarray(values, dtype=object).shape
+        except (TypeError, ValueError, OverflowError):
+            return np.asarray(float('nan'))
+        if len(shape) >= 2:
+            return np.full(tuple(int(n) for n in shape[1:]), np.nan)
+        return np.asarray(float('nan'))
     with np.errstate(over='ignore', invalid='ignore'):
         out = np.asarray(np.mean(arr, axis=0), dtype=float)
     if arr.ndim != 2 or out.ndim != 1:
@@ -322,9 +351,13 @@ def _scaled_median_or_raw(values):
     finite PPLs near the float limit even though the median is representable.
     The ordinary path keeps ``np.median`` exactly (``np.percentile(..., 50)``
     can differ in the last bit), so persisted non-extreme aggregates do not
-    change.
+    change.  ``None`` is returned when the input cannot be represented in
+    float64 at all, matching the other scaled moment helpers.
     """
-    arr = np.asarray(values, dtype=float)
+    try:
+        arr = np.asarray(values, dtype=float)
+    except (TypeError, ValueError, OverflowError):
+        return None
     if arr.size == 0:
         return float(np.median(arr))
     scale = float(np.max(np.abs(arr)))
@@ -342,9 +375,14 @@ def _scaled_percentile_or_raw(values, qs):
     ``np.percentile`` interpolates as ``a + (b - a) * t``; near the float limit
     that subtraction can overflow although every input and the requested
     quantile are finite.  Returns the requested quantiles in input order.
+    When the input cannot be represented in float64 at all, every requested
+    quantile is unavailable (``None``) rather than an ``OverflowError``.
     """
-    arr = np.asarray(values, dtype=float)
     _qs = tuple(float(q) for q in qs)
+    try:
+        arr = np.asarray(values, dtype=float)
+    except (TypeError, ValueError, OverflowError):
+        return tuple(None for _q in _qs)
     if arr.size == 0:
         return tuple(float('nan') for _q in _qs)
     scale = float(np.max(np.abs(arr)))

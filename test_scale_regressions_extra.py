@@ -286,6 +286,16 @@ def test_trajectory_step_span_beyond_float64_withholds_slope_only():
     json.dumps(rep, allow_nan=False)
 
 
+def test_trajectory_y_beyond_float64_withholds_slope_only():
+    # The x-axis conversion was hardened first; a y measurement that is an
+    # exact integer beyond float64 must likewise make the slope unavailable
+    # instead of escaping from the float conversion.
+    huge = 10 ** 400
+    assert L._traj_slope([(0, 1.0), (1, huge)]) is None
+    # Ordinary panels keep the slope.
+    assert math.isclose(L._traj_slope([(0, 1.0), (1000, 3.0)]), 2.0)
+
+
 def test_dose_response_extreme_adjacent_steps_are_strict_json():
     # Adjacent differences can overflow even though each level mean is finite.
     # Report the unavailable step as None (not inf/NaN) and keep the endpoint

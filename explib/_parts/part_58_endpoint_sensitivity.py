@@ -120,9 +120,14 @@ def _es_mean_sd(values):
     a non-finite statistic does the fallback scale by the largest magnitude
     before summing, which recovers a representable mean/SD from a panel whose
     naive sum or squares overflowed.  A statistic genuinely beyond float64 is
-    returned as ``None``; it is never represented as an infinity.
+    returned as ``None``; it is never represented as an infinity.  The same
+    applies to an exact integer beyond float64, whose conversion would
+    otherwise escape as ``OverflowError``.
     """
-    vals = [float(v) for v in values]
+    try:
+        vals = [float(v) for v in values]
+    except (TypeError, ValueError, OverflowError):
+        return None, None
     n = len(vals)
     if n == 0:
         return None, None

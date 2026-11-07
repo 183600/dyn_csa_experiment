@@ -121,8 +121,16 @@ def _ls_sign(value):
 
 
 def _ls_mean_std(values):
-    """Mean and sample SD, with the repository's overflow-safe path."""
-    vals = [float(v) for v in values]
+    """Mean and sample SD, with the repository's overflow-safe path.
+
+    An exact integer beyond float64 makes both statistics unrepresentable;
+    return the documented ``(None, None)`` rather than raising from the
+    conversion.
+    """
+    try:
+        vals = [float(v) for v in values]
+    except (TypeError, ValueError, OverflowError):
+        return None, None
     if not vals:
         return None, None
     scaled = _scaled_mean_std_if_extreme(vals, ddof=1)

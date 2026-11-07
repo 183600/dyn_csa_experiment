@@ -157,6 +157,53 @@ def _usr_finite_sum(values):
     return total if _usr_math.isfinite(total) else None
 
 
+def _usr_token_total(weights):
+    """Exact total for integral counts, float fallback for legacy weights.
+
+    A total above 2**53 is a representable integer even though it is not an
+    exact float; keep it integral.  The scaled balance path uses
+    ``_usr_finite_sum`` directly and reports the total as null only when the
+    sum itself is not representable.
+    """
+    if weights and all(isinstance(w, (int, np.integer))
+                       and not isinstance(w, (bool, np.bool_))
+                       for w in weights):
+        return int(sum(int(w) for w in weights))
+    return _usr_finite_sum(weights)
+
+
+def _usr_count_out(value):
+    """JSON-safe count that keeps an exact integer count above 2**53.
+
+    Half totals are sums of declared counts.  Reporting them through
+    ``float()`` would silently round a representable integer total; keep the
+    integer when the underlying arithmetic was integral.
+    """
+    if isinstance(value, (int, np.integer)):
+        return int(value)
+    return float(value)
+
+
+def _usr_ratio(num, den):
+    """``num / den`` as a float, falling back to exact rationals.
+
+    Both operands may be exact integers beyond float64 (for example a half
+    total above 2**53 or beyond the float exponent range); the quotient is
+    still representable, so divide in the exact domain before rounding.
+    """
+    try:
+        return float(num) / float(den)
+    except ZeroDivisionError:
+        return None
+    except (OverflowError, ValueError, TypeError):
+        pass
+    from fractions import Fraction as _Fraction
+    try:
+        return float(_Fraction(num) / _Fraction(den))
+    except (OverflowError, ValueError, ZeroDivisionError, TypeError):
+        return None
+
+
 def _usr_safe_diff(left, right):
     """``left - right`` without overflowing for opposite extreme signs."""
     try:
@@ -192,6 +239,34 @@ def _usr_number(value, name, *, positive=False):
     if positive and out <= 0.0:
         return None
     return out
+
+
+def _usr_token_weight(value):
+    """Positive token count, keeping exact integers above 2**53 intact.
+
+    ``_usr_number`` converts every value through float64, which silently
+    rounds an integral count like ``2**53 + 1`` onto a neighbouring integer.
+    The partition, its digest and the reported token totals are all defined
+    on the declared counts, so an integral value must stay in the integer
+    domain.  Non-integral positive weights are still accepted for legacy
+    callers, but the ordinary/scaled balance code treats them as floats.
+    """
+    if value is None or isinstance(value, (bool, np.bool_)):
+        return None
+    # A caller that supplied a float already chose a float weight (and the
+    # historical max-normalised path for counts like 1e308).  Keep its float
+    # semantics bit-for-bit instead of turning it into an exact integer.
+    if isinstance(value, (float, np.floating)):
+        return _usr_number(value, 'tokens', positive=True)
+    # Exact integer *types* (including NumPy integers and arbitrary-precision
+    # Decimal/Fraction/numeric strings) stay in the integer domain above 2**53
+    # and above the float exponent range.  The shared reader rejects
+    # fractional/boolean/NaN inputs.
+    exact = _exact_count(value, minimum=1)  # noqa: F821 (part_13)
+    if exact is not None:
+        return int(exact)
+    # Legacy callers may have passed a non-integral positive weight.
+    return _usr_number(value, 'tokens', positive=True)
 
 
 def _usr_alpha(value):
@@ -276,7 +351,7 @@ def unit_split_assignment(unit_ids, tokens, *, salt=UNIT_SPLIT_REPLICATION_DEFAU
         raise ValueError(f'tokens must be a sequence, got {_usr_repr(tokens)}')
     weights = []
     for value in tokens:
-        number = _usr_number(value, 'tokens', positive=True)
+        number = _usr_token_weight(value)
         if number is None:
             raise ValueError(f'tokens must be finite and positive, got {_usr_repr(value)}')
         weights.append(number)
@@ -294,7 +369,12 @@ def unit_split_assignment(unit_ids, tokens, *, salt=UNIT_SPLIT_REPLICATION_DEFAU
 
     def _balance(used_weights):
         halves_out = ([], [])
-        totals_out = [0.0, 0.0]
+        # Start integral: adding an exact count above 2**53 to the float 0.0
+        # raises OverflowError once the count exceeds float64, and even below
+        # that it rounds the running total.  A Python int accumulates counts
+        # exactly and still produces a float when a legacy fractional weight
+        # is present.
+        totals_out = [0, 0]
         counts_out = [0, 0]
         for index in order:
             # Token balance first; ties fall back to the smaller unit count and
@@ -344,9 +424,33 @@ def unit_split_assignment(unit_ids, tokens, *, salt=UNIT_SPLIT_REPLICATION_DEFAU
         # normalise by the largest count, which is a monotone rescaling of the
         # same greedy rule, and keep the unrepresentable absolute totals null.
         token_scale = max(weights)
-        if (not _usr_math.isfinite(token_scale) or token_scale <= 0.0):
+        try:
+            scale_finite = _usr_math.isfinite(token_scale)
+        except OverflowError:
+            # An arbitrarily large exact int is finite; math.isfinite rejects
+            # it only because it insists on a float conversion.
+            scale_finite = True
+        except (TypeError, ValueError):
+            scale_finite = False
+        if not scale_finite or token_scale <= 0.0:
             raise ValueError('tokens cannot be normalised for token balance')
-        scaled = [float(w) / float(token_scale) for w in weights]
+        scaled = []
+        for w in weights:
+            try:
+                ratio = float(w) / float(token_scale)
+            except (OverflowError, ValueError):
+                ratio = None
+            if ratio is None or (ratio == 0.0 and w != 0):
+                # Keep the exact ratio for counts beyond float64 (or whose
+                # quotient underflows).  Fraction accepts both arbitrary
+                # integers and finite floats.
+                from fractions import Fraction as _Fraction
+                try:
+                    ratio = float(_Fraction(w) / _Fraction(token_scale))
+                except (OverflowError, ValueError, ZeroDivisionError):
+                    raise ValueError(
+                        'tokens cannot be normalised for token balance') from None
+            scaled.append(ratio)
         halves, totals, counts = _balance(scaled)
         total_tokens = _usr_finite_sum(scaled)
         scaled_tokens = True
@@ -364,8 +468,12 @@ def unit_split_assignment(unit_ids, tokens, *, salt=UNIT_SPLIT_REPLICATION_DEFAU
         shares = [(float(totals[i]) / _share_total
                    if _share_total > 0.0 else None) for i in (0, 1)]
     else:
-        shares = [(float(sum(weights[i] for i in h)) / total_tokens
-                   if total_tokens is not None and total_tokens > 0.0 else None)
+        # Use the exact integer total when every weight is integral; a float
+        # denominator above 2**53 rounds and makes the two shares fail to sum
+        # to one even though the declared counts do.
+        exact_total = _usr_token_total(weights)
+        shares = [(_usr_ratio(sum(weights[i] for i in h), exact_total)
+                   if exact_total is not None and exact_total > 0 else None)
                   for h in halves]
     return {
         'salt': salt,
@@ -379,7 +487,8 @@ def unit_split_assignment(unit_ids, tokens, *, salt=UNIT_SPLIT_REPLICATION_DEFAU
                 'indices': [int(i) for i in halves[0]],
                 'unit_ids': [ids[i] for i in halves[0]],
                 'n_units': int(len(halves[0])),
-                'n_tokens': (None if scaled_tokens else float(totals[0])),
+                'n_tokens': (None if scaled_tokens
+                             else _usr_count_out(totals[0])),
                 'token_share': shares[0],
             },
             {
@@ -387,7 +496,8 @@ def unit_split_assignment(unit_ids, tokens, *, salt=UNIT_SPLIT_REPLICATION_DEFAU
                 'indices': [int(i) for i in halves[1]],
                 'unit_ids': [ids[i] for i in halves[1]],
                 'n_units': int(len(halves[1])),
-                'n_tokens': (None if scaled_tokens else float(totals[1])),
+                'n_tokens': (None if scaled_tokens
+                             else _usr_count_out(totals[1])),
                 'token_share': shares[1],
             },
         ],
@@ -562,7 +672,29 @@ def _usr_weighted_mean(values, weights):
 
 
 def _usr_half_effects(rows, indices, tokens):
-    weights = [float(tokens[i]) for i in indices]
+    raw = [tokens[i] for i in indices]
+    weights = None
+    # Keep the historical float weights for ordinary counts.  An integral
+    # count above 2**53 (or one beyond float64) loses low bits -- or fails to
+    # convert -- so form scale-free exact ratios instead; a common positive
+    # factor cancels out of the weighted mean.
+    if not any(isinstance(t, (int, np.integer))
+               and not isinstance(t, (bool, np.bool_)) and abs(int(t)) > (1 << 53)
+               for t in raw):
+        try:
+            weights = [float(t) for t in raw]
+        except (TypeError, ValueError, OverflowError):
+            weights = None
+    if weights is None:
+        from fractions import Fraction as _Fraction
+        scale = max(raw)
+        try:
+            weights = [float(_Fraction(t) / _Fraction(scale)) for t in raw]
+        except (OverflowError, ValueError, ZeroDivisionError, TypeError):
+            return None
+        if any(w == 0.0 and t != 0 for w, t in zip(weights, raw)):
+            # A unit whose share underflows is not a zero-weight unit.
+            return None
     effects = []
     for row in rows:
         effect = _usr_weighted_mean([row[i] for i in indices], weights)
@@ -684,7 +816,7 @@ def _usr_clean_rows(log_ratios, tokens, unit_ids, seeds):
         raise ValueError('tokens must be a sequence')
     weights = []
     for value in tokens:
-        number = _usr_number(value, 'tokens', positive=True)
+        number = _usr_token_weight(value)
         if number is None:
             raise ValueError(f'tokens must be finite and positive, got {_usr_repr(value)}')
         weights.append(number)
@@ -899,7 +1031,7 @@ def unit_split_replication(log_ratios, tokens, *, unit_ids=None, seeds=None,
         return base
     rows, kept_seeds, dropped, weights, ids, id_source = _usr_clean_rows(
         log_ratios, tokens, unit_ids, seeds)
-    token_total = _usr_finite_sum(weights)
+    token_total = _usr_token_total(weights)
     base.update({
         'n_units': int(len(weights)),
         'n_seeds_input': int(len(list(log_ratios))),
@@ -969,7 +1101,7 @@ def unit_split_replication(log_ratios, tokens, *, unit_ids=None, seeds=None,
         largest_share = None
         if idx and largest is not None:
             if half_tokens is not None and half_tokens > 0.0:
-                largest_share = float(largest) / float(half_tokens)
+                largest_share = _usr_ratio(largest, half_tokens)
             else:
                 # Absolute half totals can be unrepresentable at scale.  The
                 # share is a ratio, so recompute it from max-normalised
@@ -977,9 +1109,10 @@ def unit_split_replication(log_ratios, tokens, *, unit_ids=None, seeds=None,
                 local_scale = max(weights[i] for i in idx)
                 try:
                     denom_n = _usr_math.fsum(
-                        weights[i] / local_scale for i in idx)
+                        _usr_ratio(weights[i], local_scale) for i in idx)
                     if denom_n > 0.0:
-                        largest_share = (largest / local_scale) / denom_n
+                        largest_share = (_usr_ratio(largest, local_scale)
+                                         / denom_n)
                 except (TypeError, ValueError, OverflowError, ZeroDivisionError):
                     largest_share = None
         if largest_share is not None and not _usr_math.isfinite(largest_share):
@@ -992,8 +1125,14 @@ def unit_split_replication(log_ratios, tokens, *, unit_ids=None, seeds=None,
     warnings = []
     if token_total is None:
         warnings.append(
-            'the total scored-token count is beyond float64; absolute token '
-            'totals are null and the split uses max-normalised weights')
+            'the total scored-token count is not representable as a float; '
+            'absolute token totals are null and the split uses max-normalised '
+            'weights')
+    elif any(h.get('n_tokens') is None
+             for h in core['assignment']['halves']):
+        warnings.append(
+            'absolute half token totals are beyond float64; shares are '
+            'computed from max-normalised weights')
     shares = [h.get('token_share') for h in core['assignment']['halves']]
     if any(s is None for s in shares):
         warnings.append('token balance is undefined')
@@ -1069,7 +1208,7 @@ def unit_split_replication_block(log_ratios, tokens, *, unit_ids=None,
         raise ValueError('tokens must be a sequence')
     weights = []
     for value in tokens:
-        number = _usr_number(value, 'tokens', positive=True)
+        number = _usr_token_weight(value)
         if number is None:
             raise ValueError(f'tokens must be finite and positive, got {_usr_repr(value)}')
         weights.append(number)
@@ -1132,7 +1271,10 @@ def unit_split_replication_block(log_ratios, tokens, *, unit_ids=None,
         stored_rows.append(stored)
     inputs = {
         'log_ratios': stored_rows,
-        'tokens': [float(x) for x in weights],
+        # Keep exact integral counts (2**53+1 and above) intact; a float
+        # round-trip here would make replay reproduce a different partition
+        # and a different digest than the recorded result.
+        'tokens': list(weights),
         'unit_ids': list(ids),
         'seeds': [int(s) for s in seed_out],
         'direction': direction,
@@ -1303,7 +1445,7 @@ def _usr_inputs_problems(inputs):
     else:
         weights = []
         for index, value in enumerate(tokens):
-            number = _usr_number(value, f'inputs.tokens[{index}]', positive=True)
+            number = _usr_token_weight(value)
             if number is None:
                 problems.append(
                     f'inputs.tokens[{index}] must be finite and positive, got '
@@ -1581,10 +1723,15 @@ def _usr_result_problems(result, inputs=None):
         problems.append("result.unit_id_source must be 'supplied' or 'position'")
     token_total = result.get('token_total')
     if token_total is not None:
-        total = _usr_number(token_total, 'result.token_total')
-        if total is None or total < 0.0:
-            problems.append('result.token_total must be null or a finite '
-                            'non-negative number')
+        # An exact integer count may exceed float64 (and 2**53) while still
+        # being a finite non-negative total; do not reject it via a float
+        # round-trip.
+        exact_total = _exact_count(token_total, minimum=0)  # noqa: F821
+        if exact_total is None:
+            total = _usr_number(token_total, 'result.token_total')
+            if total is None or total < 0.0:
+                problems.append('result.token_total must be null or a finite '
+                                'non-negative number')
 
     assignment = result.get('assignment')
     assign_halves = None

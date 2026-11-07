@@ -152,8 +152,16 @@ def _uq_div(num, den):
 
 
 def _uq_mean(values):
-    """Overflow-safe mean of a finite scalar vector."""
-    vals = [float(v) for v in values]
+    """Overflow-safe mean of a finite scalar vector.
+
+    An exact integer beyond float64 has no representable mean; the helper's
+    ``None`` contract covers it instead of escaping as ``OverflowError`` from
+    the conversion.
+    """
+    try:
+        vals = [float(v) for v in values]
+    except (TypeError, ValueError, OverflowError):
+        return None
     if not vals:
         return None
     scale = max(abs(v) for v in vals)

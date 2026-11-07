@@ -140,7 +140,14 @@ def _traj_slope(points, *, unit=1000.0):
         xs = np.asarray([float(offset) for offset in offsets], dtype=float)
     except (OverflowError, ValueError):
         return None
-    ys = np.asarray([float(p[1]) for p in points], dtype=float)
+    # A y value is normally a validated finite PPL, but this pure helper is
+    # also callable with arbitrary measurements.  An exact integer beyond
+    # float64 cannot define a float slope; the documented contract is
+    # ``None`` for an undefined slope, not an escaping OverflowError.
+    try:
+        ys = np.asarray([float(p[1]) for p in points], dtype=float)
+    except (OverflowError, ValueError):
+        return None
     xm = float(np.mean(xs))
     ym = float(np.mean(ys))
     dx = xs - xm

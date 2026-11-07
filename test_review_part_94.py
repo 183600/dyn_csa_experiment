@@ -85,6 +85,45 @@ def test_assignment_token_balance_and_validations():
                                 salt='   ')
 
 
+def test_assignment_keeps_exact_token_counts_above_2_53():
+    # Token counts are exact integers elsewhere in the repository; routing
+    # them through float() rounded 2**53+1 onto a neighbouring count and made
+    # the partition, digest, reported totals and replay inputs disagree with
+    # the declared panel.
+    units = [f'u{i}' for i in range(8)]
+    tokens = [2 ** 53 + 1, 2 ** 53 + 3, 5, 7, 11, 13, 17, 19]
+    a = L.unit_split_assignment(units, tokens)
+    half_tokens = [h['n_tokens'] for h in a['halves']]
+    assert all(isinstance(value, int) for value in half_tokens)
+    assert sum(half_tokens) == sum(tokens)
+    assert sum(h['token_share'] for h in a['halves']) == pytest.approx(1.0)
+    # The replayable block binds the exact counts and reproduces the digest.
+    rows = _rows_uniform([-0.05] * len(units))
+    block = L.unit_split_replication_block(
+        rows, tokens, unit_ids=units, seeds=SEEDS, direction='negative',
+        n_salts=0)
+    assert block['inputs']['tokens'] == tokens
+    assert block['result']['token_total'] == sum(tokens)
+    verdict = L.validate_unit_split_replication_block(block)
+    assert verdict['status'] in ('ok', 'warnings'), verdict
+    assert verdict['replayed'] is True
+    # Counts beyond float64 are still finite exact totals: the absolute half
+    # totals are withheld (no float representation) but the total and replay
+    # stay exact instead of raising.
+    huge = [10 ** 400 + i for i in range(len(units))]
+    huge_result = L.unit_split_replication(
+        rows, huge, unit_ids=units, seeds=SEEDS, direction='negative',
+        n_salts=0)
+    assert huge_result['token_total'] == sum(huge)
+    assert all(h['n_tokens'] is None for h in huge_result['halves'])
+    huge_block = L.unit_split_replication_block(
+        rows, huge, unit_ids=units, seeds=SEEDS, direction='negative',
+        n_salts=0)
+    huge_verdict = L.validate_unit_split_replication_block(huge_block)
+    assert huge_verdict['status'] in ('ok', 'warnings'), huge_verdict
+    assert huge_verdict['replayed'] is True
+
+
 # ---------------------------------------------------------------------------
 # exact one-sided primitive and IUT
 # ---------------------------------------------------------------------------
