@@ -246,11 +246,29 @@ def _od_centre(values):
     Working on this scale makes the bootstrap/batch arithmetic overflow-safe
     for panels near the float64 limit; every design effect and correlation is
     scale invariant, and the mean/interval is mapped back once.
+
+    A mixed panel may contain an exact integer beyond float64 next to an
+    ordinary float.  Python's true division of a huge integer by a large float
+    raises ``OverflowError`` even though the *ratio* is bounded by one; form
+    the quotient exactly in that case, like the other exact-count helpers.
     """
-    scale = _od_scale(values)
+    vals = list(values)
+    scale = _od_scale(vals)
     if scale == 0.0:
-        return [0.0 for _ in values], 0.0
-    return [v / scale for v in values], scale
+        return [0.0 for _ in vals], 0.0
+    out = []
+    for value in vals:
+        try:
+            ratio = value / scale
+        except (TypeError, ValueError, OverflowError, ZeroDivisionError):
+            from fractions import Fraction as _Fraction
+            try:
+                ratio = float(_Fraction(value) / _Fraction(scale))
+            except (TypeError, ValueError, OverflowError, ZeroDivisionError):
+                raise ValueError(
+                    'values cannot be normalised for order-dependence') from None
+        out.append(float(ratio))
+    return out, scale
 
 
 def _od_percentile_ci(reps, conf):
@@ -281,13 +299,32 @@ def _od_lag1(values):
     n = len(values)
     if n < 3:
         return None
-    mean = _od_math.fsum(values) / n
-    den = _od_math.fsum((v - mean) ** 2 for v in values)
-    if not (_od_math.isfinite(den) and den > 0.0):
-        return None
-    num = _od_math.fsum((values[i] - mean) * (values[i + 1] - mean)
-                        for i in range(n - 1))
-    out = num / den
+    try:
+        mean = _od_math.fsum(values) / n
+        den = _od_math.fsum((v - mean) ** 2 for v in values)
+        if not (_od_math.isfinite(den) and den > 0.0):
+            return None
+        num = _od_math.fsum((values[i] - mean) * (values[i + 1] - mean)
+                            for i in range(n - 1))
+        out = num / den
+    except (TypeError, ValueError, OverflowError):
+        # An exact integer beyond float64 makes the raw sums unrepresentable
+        # even though the correlation is scale invariant and bounded.  The
+        # exact rational fallback also recovers the correlation of a panel
+        # whose adjacent differences are far below the float spacing.
+        from fractions import Fraction as _Fraction
+        try:
+            exact = [_Fraction(v) for v in values]
+            exact_mean = sum(exact, _Fraction(0, 1)) / n
+            exact_den = sum(((v - exact_mean) ** 2 for v in exact),
+                            _Fraction(0, 1))
+            if exact_den <= 0:
+                return None
+            exact_num = sum(((exact[i] - exact_mean) * (exact[i + 1] - exact_mean)
+                             for i in range(n - 1)), _Fraction(0, 1))
+            out = float(exact_num / exact_den)
+        except (TypeError, ValueError, OverflowError, ZeroDivisionError):
+            return None
     return out if _od_math.isfinite(out) else None
 
 

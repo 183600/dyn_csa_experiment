@@ -1224,7 +1224,37 @@ def hypothesis_audit(table=None, kind='component', names=None, policy=None):
 def _binary_roc_auc(y, score):
     """Rank-based ROC-AUC for a binary endpoint (ties get average ranks)."""
     y = np.asarray(y).astype(np.int64)
-    score = np.asarray(score, dtype=float)
+    try:
+        score = np.asarray(score, dtype=float)
+    except (TypeError, ValueError, OverflowError):
+        # ROC-AUC depends only on the score order, so an exact integer beyond
+        # float64 is still rankable even though it has no float spelling.
+        seq = list(score)
+        if len(seq) != int(y.size):
+            raise ValueError('score length does not match labels')
+        if not np.any(y == 1) or not np.any(y != 1):
+            return None
+        order = sorted(range(len(seq)), key=lambda i: seq[i])
+        n = len(seq)
+        ranks = [0.0] * n
+        i = 0
+        while i < n:
+            j = i + 1
+            while j < n and seq[order[j]] == seq[order[i]]:
+                j += 1
+            rank = 0.5 * ((i + 1) + j)
+            for k in range(i, j):
+                ranks[order[k]] = rank
+            i = j
+        pos = y == 1
+        n_pos = int(pos.sum())
+        n_neg = int((~pos).sum())
+        try:
+            return float((sum(rank for rank, is_pos in zip(ranks, pos)
+                              if is_pos)
+                          - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg))
+        except (TypeError, ValueError, ZeroDivisionError, OverflowError):
+            return None
     pos = y == 1
     n_pos, n_neg = int(pos.sum()), int((~pos).sum())
     if n_pos == 0 or n_neg == 0:
@@ -1244,7 +1274,34 @@ def _binary_roc_auc(y, score):
 def _binary_average_precision(y, score):
     """Average precision (the step-wise PR-AUC) for a binary endpoint."""
     y = np.asarray(y).astype(np.int64)
-    score = np.asarray(score, dtype=float)
+    try:
+        score = np.asarray(score, dtype=float)
+    except (TypeError, ValueError, OverflowError):
+        # The step-wise PR curve is defined by the score order only; rank the
+        # exact integers and walk the same thresholds.
+        seq = list(score)
+        if len(seq) != int(y.size):
+            raise ValueError('score length does not match labels')
+        n_pos = int((y == 1).sum())
+        if n_pos == 0:
+            return None
+        n = len(seq)
+        order = sorted(range(n), key=lambda i: seq[i], reverse=True)
+        tp = fp = 0
+        prev_recall = 0.0
+        ap = 0.0
+        for i, index in enumerate(order):
+            if y[index] == 1:
+                tp += 1
+            else:
+                fp += 1
+            if i + 1 < n and seq[order[i + 1]] == seq[index]:
+                continue
+            precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+            recall = tp / n_pos
+            ap += (recall - prev_recall) * precision
+            prev_recall = recall
+        return float(ap)
     n_pos = int((y == 1).sum())
     if n_pos == 0:
         return None

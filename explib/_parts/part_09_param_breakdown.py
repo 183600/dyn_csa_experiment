@@ -1159,7 +1159,18 @@ def _signflip_saddlepoint_p(values):
     number of sign assignments without changing the null distribution; the
     resulting floor ``2 / 2**m`` is the same exact-test floor.
     """
-    vals = [float(x) for x in values if float(x) != 0.0]
+    try:
+        raw = list(values)
+    except TypeError:
+        raw = [values]
+    # An unrepresentable measurement has no float sign assignment; drop it by
+    # the same contract as the public exact test instead of aborting with an
+    # escaping OverflowError from the comprehension.
+    vals = []
+    for value in raw:
+        out = _finite_scalar(value)  # noqa: F821 (part 00)
+        if out is not None and out != 0.0:
+            vals.append(out)
     m = len(vals)
     if m == 0:
         return 1.0, 'saddlepoint'

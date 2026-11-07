@@ -806,7 +806,48 @@ def _error_label_vector(values, n, *, where):
 
 def _error_cluster_stats(values, token_counts=None):
     """Equal-cluster mean with t CI and exact sign-flip p (two-sided)."""
-    vals = np.asarray(values, dtype=np.float64)
+    # Materialise once: a one-shot generator used to be consumed by the
+    # conversion and then appear empty (or raise) in later passes.  A scalar is
+    # one cluster, not an iterable-protocol violation.
+    if isinstance(values, np.ndarray):
+        raw = values
+    else:
+        try:
+            raw = list(values)
+        except TypeError:
+            raw = [values]
+
+    def _token_total(default):
+        if token_counts is None:
+            return default
+        try:
+            items = list(token_counts)
+        except TypeError:
+            items = [token_counts]
+        try:
+            if items and all(isinstance(t, (int, np.integer))
+                             and not isinstance(t, (bool, np.bool_))
+                             for t in items):
+                return int(sum(int(t) for t in items))
+        except (TypeError, ValueError, OverflowError):
+            pass
+        try:
+            return int(np.sum(items))
+        except (TypeError, ValueError, OverflowError):
+            return default
+
+    try:
+        vals = np.asarray(raw, dtype=np.float64)
+    except (TypeError, ValueError, OverflowError):
+        # An exact integer beyond float64 cannot form a representable mean/SD.
+        # The panel still has a declared cluster count and (possibly exact)
+        # token total; report those and withhold the unrepresentable summary
+        # instead of letting the conversion escape from a readout.
+        n = int(len(raw))
+        return {'n_clusters': n, 'n_tokens': _token_total(n), 'mean': None,
+                'sd': None, 'se': None, 'ci95_low': None, 'ci95_high': None,
+                'p_exact_signflip': None, 'p_floor': None,
+                'ci_excludes_zero': False, 'direction': 0}
     n = int(vals.size)
     if n == 0:
         return {'n_clusters': 0, 'n_tokens': 0, 'mean': None, 'sd': None,
@@ -820,6 +861,7 @@ def _error_cluster_stats(values, token_counts=None):
     # interval rather than emitting inf (a strict JSON writer would turn it
     # into null after downstream consumers already accepted it).
     mean = _scaled_mean_or_raw(vals)
+    mean_ok = mean is not None and math.isfinite(mean)
     if n >= 2:
         _ms = _scaled_mean_std_if_extreme(vals, ddof=1)
         sd = float(_ms[1]) if _ms is not None else float(vals.std(ddof=1))
@@ -827,7 +869,7 @@ def _error_cluster_stats(values, token_counts=None):
             # The true SD is beyond float64; `None` is "not representable",
             # not a measured infinite spread.
             sd = None
-        if sd is not None and math.isfinite(mean):
+        if sd is not None and mean_ok:
             se = sd / math.sqrt(n)
             half = float(_t_critical(0.95, n - 1)) * se
             lo, hi = mean - half, mean + half
@@ -842,18 +884,47 @@ def _error_cluster_stats(values, token_counts=None):
         ci_excludes_zero = False
     sf = exact_signflip_p(vals.tolist())
     p = sf.get('p')
-    p = float(p) if isinstance(p, (int, float)) and math.isfinite(float(p)) else None
-    n_tokens = (int(np.sum(token_counts)) if token_counts is not None and len(token_counts) else n)
+    try:
+        p = float(p) if isinstance(p, (int, float)) and math.isfinite(float(p)) else None
+    except (TypeError, ValueError, OverflowError):
+        p = None
+    n_tokens = _token_total(n)
     return {'n_clusters': n, 'n_tokens': n_tokens, 'mean': mean,
             'sd': sd, 'se': se, 'ci95_low': lo, 'ci95_high': hi,
             'p_exact_signflip': p, 'p_floor': sf.get('p_floor'),
             'ci_excludes_zero': ci_excludes_zero,
-            'direction': (1 if mean > 0 else (-1 if mean < 0 else 0))}
+            'direction': (1 if mean is not None and mean > 0
+                          else (-1 if mean is not None and mean < 0 else 0))}
 
 
 def _error_stat_rank(values):
     """Average ranks for a small vector of bucket means (ties share a rank)."""
-    vals = np.asarray(values, dtype=np.float64)
+    try:
+        vals = np.asarray(values, dtype=np.float64)
+    except (TypeError, ValueError, OverflowError):
+        # An exact integer beyond float64 cannot become a float order
+        # statistic, but its rank is still exactly defined.  Rank the raw
+        # values and return the same float rank vector as the ordinary path.
+        try:
+            seq = list(values)
+        except TypeError:
+            seq = [values]
+        n = len(seq)
+        try:
+            order = sorted(range(n), key=lambda i: seq[i])
+        except (TypeError, ValueError):
+            raise ValueError('values cannot be ranked') from None
+        ranks = [0.0] * n
+        pos = 0
+        while pos < n:
+            end = pos + 1
+            while end < n and seq[order[end]] == seq[order[pos]]:
+                end += 1
+            rank = 0.5 * (pos + 1 + end)
+            for k in range(pos, end):
+                ranks[order[k]] = rank
+            pos = end
+        return np.asarray(ranks, dtype=np.float64)
     order = np.argsort(vals, kind='mergesort')
     ranks = np.empty(vals.size, dtype=np.float64)
     ranks[order] = np.arange(1, vals.size + 1, dtype=np.float64)

@@ -114,6 +114,12 @@ def _tsm_int(value, name, *, minimum=0, maximum=None):
 
 
 def _tsm_pdf(x):
+    try:
+        x = float(x)
+    except OverflowError:
+        # A magnitude beyond float64 is in the far tail: the density is
+        # numerically zero, not an unavailable conversion.
+        return 0.0
     return math.exp(-0.5 * x * x) / _SQRT2PI
 
 
@@ -122,14 +128,26 @@ def _tsm_cdf(x):
     # every x below about -8.3 to exactly 0, turning a small but real power
     # into "not computable".  It also cancels for large positive x, which is
     # why the upper tail is evaluated through _tsm_sf below.
-    x = float(x)
+    try:
+        x = float(x)
+    except (TypeError, ValueError):
+        raise
+    except OverflowError:
+        # An exact integer beyond float64 has the same limiting CDF as an
+        # infinite z: 1 above the origin and 0 below it.
+        return 1.0 if x > 0 else 0.0
     return 0.5 * math.erfc(-x / _SQRT2)
 
 
 def _tsm_sf(x):
     # Upper tail P(Z > x); erfc keeps the far upper tail representable and
-    # avoids 1 - cdf cancellation.
-    return 0.5 * math.erfc(float(x) / _SQRT2)
+    # avoids 1 - cdf cancellation.  An exact integer beyond float64 has the
+    # limiting tail: 0 above the origin and 1 below it.
+    try:
+        xf = float(x)
+    except OverflowError:
+        return 0.0 if x > 0 else 1.0
+    return 0.5 * math.erfc(xf / _SQRT2)
 
 
 def _tsm_quantile(p):

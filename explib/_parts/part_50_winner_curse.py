@@ -97,7 +97,51 @@ def _wc_percentile(values, q):
     """Linear-interpolation percentile of a finite list; ``None`` if empty."""
     if not values:
         return None
-    arr = np.sort(np.asarray(values, dtype=float))
+    try:
+        arr = np.sort(np.asarray(values, dtype=float))
+    except (TypeError, ValueError, OverflowError):
+        # An exact integer beyond float64 cannot become a float order
+        # statistic.  Order and interpolate exactly instead; the requested
+        # percentile may still be representable (or explicitly unavailable).
+        try:
+            ordered = sorted(values)
+            q = float(q)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        n = len(ordered)
+        if n == 0:
+            return None
+        if q <= 0.0:
+            ordered = [ordered[0]]
+            q = 0.0
+        elif q >= 1.0:
+            ordered = [ordered[-1]]
+            q = 0.0
+        if len(ordered) == 1:
+            try:
+                out = float(ordered[0])
+            except (TypeError, ValueError, OverflowError):
+                return None
+            return out if math.isfinite(out) else None
+        pos = q * float(n - 1)
+        lo = int(math.floor(pos))
+        hi = int(math.ceil(pos))
+        if lo == hi:
+            try:
+                out = float(ordered[lo])
+            except (TypeError, ValueError, OverflowError):
+                return None
+            return out if math.isfinite(out) else None
+        frac = pos - float(lo)
+        from fractions import Fraction as _Fraction
+        try:
+            value = (_Fraction(ordered[lo])
+                     + (_Fraction(ordered[hi]) - _Fraction(ordered[lo]))
+                     * _Fraction(frac))
+            out = float(value)
+        except (TypeError, ValueError, OverflowError, ZeroDivisionError):
+            return None
+        return out if math.isfinite(out) else None
     n = int(arr.size)
     if n == 0:
         return None

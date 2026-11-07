@@ -280,7 +280,15 @@ def _fc_score_maxt(matrix, alpha):
 
 def _fc_dependence(matrix):
     """Per-seed correlation, eigenvalues and effective number of tests."""
-    A = _fc_np.asarray(matrix, dtype=float)
+    try:
+        A = _fc_np.asarray(matrix, dtype=float)
+    except (TypeError, ValueError, OverflowError):
+        # An exact integer beyond float64 has no representable correlation
+        # matrix.  This descriptive sub-block is optional; fail it closed with
+        # a reason instead of aborting the whole family-correction readout.
+        return {'available': False,
+                'reason': ('matrix entries are not representable as float64; '
+                           'the dependence summary is not computed')}
     m, n = A.shape
     if m < 2 or n < 2:
         return {'available': False,
@@ -795,11 +803,23 @@ def _fc_num(value, fmt='{:.4f}'):
 
 
 def _fc_ci(pair):
-    if (isinstance(pair, (list, tuple)) and len(pair) >= 2
+    if not (isinstance(pair, (list, tuple)) and len(pair) >= 2
             and isinstance(pair[0], (int, float))
             and isinstance(pair[1], (int, float))):
-        return f'[{float(pair[0]):+.4f}, {float(pair[1]):+.4f}]'
-    return '—'
+        return '—'
+
+    def _endpoint(value):
+        try:
+            return f'{float(value):+.4f}'
+        except (TypeError, ValueError, OverflowError):
+            # Exact integer endpoints beyond float64: the integer spelling is
+            # at least exact, and a display helper must not abort the report.
+            try:
+                return f'{int(value):+d}'
+            except (TypeError, ValueError, OverflowError):
+                return '—'
+
+    return f'[{_endpoint(pair[0])}, {_endpoint(pair[1])}]'
 
 
 def _family_correction_markdown(block):

@@ -283,8 +283,18 @@ def _esci_attainable_count(alpha, n):
 
 
 def _esci_scale_to_integers(vals):
-    """Common-denominator integer representation of the float deltas."""
-    fr = [_EsciFraction(float(x)) for x in vals]
+    """Common-denominator integer representation of the float deltas.
+
+    An exact integer beyond float64 has no float spelling but *does* have an
+    exact ratio representation; converting it directly keeps the rational
+    enumeration available instead of raising from ``float(x)``.
+    """
+    fr = []
+    for value in vals:
+        try:
+            fr.append(_EsciFraction(value))
+        except (TypeError, ValueError, OverflowError):
+            fr.append(_EsciFraction(float(value)))
     denom = 1
     for f in fr:
         denom = denom * f.denominator // _esci_math.gcd(denom, f.denominator)
