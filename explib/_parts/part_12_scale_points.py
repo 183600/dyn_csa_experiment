@@ -394,7 +394,7 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3,
                                         if n else 0.0),
                         'underpowered': n < int(min_seeds)})
             if n > 1:
-                tc = _t_critical(1.0 - float(alpha), n - 1)
+                tc = _t_critical_alpha(float(alpha), n - 1)
                 _lo = m - tc * se
                 _hi = m + tc * se
                 row['ci'] = ([_lo, _hi]
@@ -546,7 +546,7 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3,
     sws = float(ws.sum())
     mu_re = float((ws * y).sum() / sws)
     se_re = float(math.sqrt(1.0 / sws))
-    tc = _t_critical(1.0 - float(alpha), max(1, df))
+    tc = _t_critical_alpha(float(alpha), max(1, df))
     if _scale_effects:
         mu_fe_out = float(mu_fe * _effect_scale)
         se_fe_out = float(math.sqrt(1.0 / sw) * _effect_scale)
@@ -563,7 +563,7 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3,
     # three usable scales it is not defined.
     _pi = None
     if len(usable) >= 3:
-        _tc_pi = _t_critical(1.0 - float(alpha), len(usable) - 2)
+        _tc_pi = _t_critical_alpha(float(alpha), len(usable) - 2)
         if math.isfinite(_tc_pi):
             _half = _tc_pi * math.sqrt(tau2_work + se_re ** 2)
             if _scale_effects:
@@ -766,7 +766,7 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3,
         _paired_common['prediction_interval_95'] = _pc_pi
     _paired_common = _finite_tree(_paired_common)
 
-    _tc_fe = _t_critical(1.0 - float(alpha), max(1, df))
+    _tc_fe = _t_critical_alpha(float(alpha), max(1, df))
     _fe_ci = _finite_ci([mu_fe_out - _tc_fe * se_fe_out,
                          mu_fe_out + _tc_fe * se_fe_out])
     _re_ci = _finite_ci([mu_re_out - tc * se_re_out,
@@ -1383,7 +1383,7 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3,
     if k > 2:
         sigma2 = float((n * resid ** 2).sum() / (k - 2))
         se_work = float(math.sqrt(sigma2 / sxx))
-        tc = _t_critical(1.0 - float(alpha), k - 2)
+        tc = _t_critical_alpha(float(alpha), k - 2)
         # A zero-residual fit has no residual variance.  Its t statistic is
         # infinite only when the slope is non-zero; an exactly flat line is a
         # perfect fit with an undefined (not zero) p-value, so report p=1
@@ -1441,7 +1441,7 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3,
         slopes = np.asarray(slopes, dtype=float)
         paired_slope_work = float(slopes.mean())
         st = paired_effect_stats(slopes, alpha=alpha, min_n=min_seeds)
-        tc = _t_critical(1.0 - float(alpha), len(slopes) - 1)
+        tc = _t_critical_alpha(float(alpha), len(slopes) - 1)
         se_s = float(slopes.std(ddof=1) / math.sqrt(len(slopes))) if len(slopes) > 1 else float('nan')
         with np.errstate(over='ignore', invalid='ignore'):
             slopes_out = (slopes * _effect_scale if _scale_effects else slopes)

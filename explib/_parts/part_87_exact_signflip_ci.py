@@ -453,7 +453,7 @@ def _esci_t_interval(vals, alpha):
     if not _esci_math.isfinite(sd):
         return None
     try:
-        tc = _t_critical(1.0 - alpha, n - 1)  # noqa: F821 (part 10)
+        tc = _t_critical_alpha(alpha, n - 1)  # noqa: F821 (part 10)
     except Exception:
         tc = None
     if tc is None or not _esci_math.isfinite(float(tc)):

@@ -570,7 +570,7 @@ def confirmation_family_correction(comparisons, *, family_names, frozen_holm=Non
     critical = (t_block.get('critical_value')
                 if isinstance(t_block, dict) else None)
     try:
-        holm_tc = _t_critical(1.0 - a / float(m), n - 1)
+        holm_tc = _t_critical_alpha(a / float(m), n - 1)
     except Exception:
         holm_tc = None
 

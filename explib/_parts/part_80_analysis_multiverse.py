@@ -437,7 +437,7 @@ def _am_t_interval(mean, sd, n, alpha):
             return [float(mean), float(mean)], 'zero seed variance'
         return None, None
     try:
-        tc = float(_t_critical(1.0 - alpha, float(n - 1)))  # noqa: F821
+        tc = float(_t_critical_alpha(alpha, float(n - 1)))  # noqa: F821
     except Exception:
         return None, None
     if not _am_math.isfinite(tc):

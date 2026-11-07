@@ -125,6 +125,25 @@ def test_normal_fallback_critical_value_survives_alpha_below_one_ulp():
     assert np.all(np.isfinite(out['ci'])), out['ci']
 
 
+def test_exact_path_critical_value_survives_alpha_below_one_ulp():
+    # The exact sign-flip path still builds its pointwise t interval through
+    # ``1 - alpha``; a level below the spacing at 1.0 used to make the
+    # critical value NaN and silently drop the interval.  The alpha-form
+    # helper must keep it finite (and very wide) instead.
+    rng = np.random.default_rng(4)
+    D = rng.normal(loc=1.0, scale=0.1, size=(2, 6))
+    for alpha in (1e-12, 1e-18, 1e-300):
+        out = L.curve_simultaneous_inference(
+            ['a', 'b'], {'a': D[0].tolist(), 'b': D[1].tolist()},
+            alpha=alpha, min_n=3)
+        assert out['method'] == 'exact_signflip_maxt_iut', out['method']
+        ci = out['per_condition']['a']['ci95_pointwise']
+        assert ci is not None, (alpha, out['per_condition']['a'])
+        assert all(math.isfinite(x) for x in ci), (alpha, ci)
+        assert ci[0] < 1.0 < ci[1], (alpha, ci)
+        json.dumps(out, allow_nan=False)
+
+
 def test_seed_cap_and_unrepresentable_seed_label_fail_closed():
     with pytest.raises(ValueError, match='maximum|4096'):
         L.curve_simultaneous_inference(

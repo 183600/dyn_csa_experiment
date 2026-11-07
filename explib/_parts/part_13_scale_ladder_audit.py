@@ -572,7 +572,7 @@ def loglog_regression(points, *, alpha=0.05):
     if k >= 3:
         sigma2 = ss_res / (k - 2)
         se = float(math.sqrt(sigma2 / sxx))
-        tc = _t_critical(1.0 - float(alpha), k - 2)
+        tc = _t_critical_alpha(float(alpha), k - 2)
         # A zero-residual fit has an infinite t statistic, not an undefined
         # p-value: report p=0 for a non-zero slope (p=1 for an exactly flat
         # line).  ``nan`` would hide a perfectly recovered power law.

@@ -1679,7 +1679,18 @@ def _t_critical(conf, df):
 
 @functools.lru_cache(maxsize=8192)
 def _t_critical_cached(conf, df):
-    target = (1.0 - conf) / 2.0
+    return _t_critical_tail_cached((1.0 - conf) / 2.0, df)
+
+
+@functools.lru_cache(maxsize=8192)
+def _t_critical_tail_cached(target, df):
+    """Two-sided critical value from the lower-tail probability ``target``.
+
+    ``target`` is ``alpha/2`` (or ``(1-conf)/2``); solving in the lower tail
+    keeps the requested level representable after the confidence form has
+    rounded to 1.0.  Bracket the upper critical point, then bisect.
+    """
+    target = float(target)
     lo, hi = 0.0, 1.0
     for _ in range(1100):
         if _student_t_sf(hi, df) <= target:
@@ -1698,6 +1709,30 @@ def _t_critical_cached(conf, df):
         else:
             hi = mid
     return float(0.5 * (lo + hi))
+
+
+def _t_critical_alpha(alpha, df):
+    """Two-sided t critical value from ``alpha`` itself.
+
+    Constructing the confidence level first (``conf = 1 - alpha``) loses
+    every alpha below the spacing between 1.0 and its predecessor.  A large
+    Bonferroni family, or a level supplied on that scale, can reach it; the
+    old call then saw ``conf == 1.0``, returned NaN, and the caller silently
+    withheld a valid interval.  For representable confidence levels this
+    delegates to the ordinary cached path so ordinary panels stay
+    bit-for-bit unchanged.
+    """
+    a = _dist_real(alpha)
+    df = _dist_real(df)
+    if a is None or df is None or not (0.0 < a < 1.0) or not (df > 0.0):
+        return float('nan')
+    conf = 1.0 - a
+    if 0.0 < conf < 1.0:
+        return _t_critical_cached(conf, df)
+    # alpha/2 may underflow to zero for a subnormal alpha; the tail helper
+    # then brackets on the smallest representable probability, which still
+    # gives the finite (very large) critical value instead of NaN.
+    return _t_critical_tail_cached(a / 2.0, df)
 
 
 def chi2_sf(x, df):

@@ -783,7 +783,7 @@ def endpoint_sensitivity(endpoint=None, *, control_level=None, arm_levels=None,
                 'n_units exceeds the representable float64 range; the MDE '
                 'cannot be evaluated at this scale')
             nu_f = None
-        tc = (_t_critical(1.0 - a, nu_f - 1.0)
+        tc = (_t_critical_alpha(a, nu_f - 1.0)
               if nu_f is not None else float('nan'))
         z = _normal_quantile(tp)
         if (math.isfinite(tc) and math.isfinite(z) and z > 0.0):

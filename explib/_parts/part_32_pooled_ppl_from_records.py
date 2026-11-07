@@ -386,7 +386,7 @@ def _seed_t_ci(ppls, alpha=0.05):
         mu = float(np.mean(ppls))
         sd = float(np.std(ppls, ddof=1))
     try:
-        tc = _t_critical(1.0 - alpha, n - 1)
+        tc = _t_critical_alpha(alpha, n - 1)
     except Exception:
         return None
     half = tc * sd / math.sqrt(n)

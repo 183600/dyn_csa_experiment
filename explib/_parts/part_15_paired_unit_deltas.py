@@ -131,7 +131,7 @@ def _unit_power_at(n, sd, margin, alpha):
     se = sd / math.sqrt(n)
     if not (math.isfinite(se) and se > 0.0):
         return None
-    tc = _t_critical(1.0 - alpha, n - 1.0)
+    tc = _t_critical_alpha(alpha, n - 1.0)
     if not math.isfinite(tc):
         return None
     z = margin / se
@@ -176,7 +176,7 @@ def _unit_needed_n(n0, *, sd, alpha, target, kind, n_max,
             return power is not None and power + 1e-15 >= tp
     else:
         def _ok(n):
-            tc = _t_critical(1.0 - alpha, float(n) - 1.0)
+            tc = _t_critical_alpha(alpha, float(n) - 1.0)
             return (math.isfinite(tc)
                     and tc * sd / math.sqrt(float(n)) <= target)
     if _ok(2):
@@ -366,7 +366,7 @@ def unit_precision_design(n_units, *, pilot_unit_deltas=None,
     out['target_halfwidth'] = target_halfwidth_value
     half = None
     if sd is not None and a is not None and n is not None:
-        tc = _t_critical(1.0 - a, float(n) - 1.0)
+        tc = _t_critical_alpha(a, float(n) - 1.0)
         if math.isfinite(tc):
             try:
                 half = float(tc * sd / math.sqrt(n))
@@ -403,7 +403,7 @@ def unit_precision_design(n_units, *, pilot_unit_deltas=None,
                     f'{target_halfwidth_value!r}')
     if sd is not None and tp is not None and a is not None and n is not None:
         ze = float(_normal_quantile(tp))
-        tc = _t_critical(1.0 - a, float(n) - 1.0)
+        tc = _t_critical_alpha(a, float(n) - 1.0)
         mde = ((tc + ze) * sd / math.sqrt(n)) if math.isfinite(tc) else None
         if mde is not None and not math.isfinite(mde):
             # Same intermediate-overflow pattern as the CI: at a large n the

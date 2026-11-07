@@ -817,7 +817,7 @@ def _cv_t_interval(mean, sem, n, alpha):
     if sem == 0.0:
         return [float(mean), float(mean)]
     try:
-        crit = _t_critical(1.0 - alpha, n - 1)  # noqa: F821 (part_11)
+        crit = _t_critical_alpha(alpha, n - 1)  # noqa: F821 (part_11)
     except Exception:
         return None
     if crit is None or not math.isfinite(float(crit)):

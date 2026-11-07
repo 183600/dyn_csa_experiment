@@ -77,6 +77,21 @@ def test_type_sm_family_adjusted_critical_value_survives_tiny_alpha():
     assert out['power'] is not None and out['power'] > 0.0, out
 
 
+def test_t_critical_alpha_keeps_tiny_levels_representable():
+    # ``1 - alpha`` rounds to 1.0 below one ulp, which used to make the
+    # two-sided t critical value NaN even though the level is valid.  The
+    # alpha-form helper solves the same lower tail directly.
+    ordinary = L._t_critical_alpha(0.05, 10)
+    assert ordinary == L._t_critical(0.95, 10)
+    prev = ordinary
+    for alpha in (1e-12, 1e-16, 1e-18, 1e-300):
+        crit = L._t_critical_alpha(alpha, 10)
+        assert math.isfinite(crit) and crit > prev, (alpha, crit, prev)
+        prev = crit
+    assert math.isnan(L._t_critical_alpha(0.0, 10))
+    assert math.isnan(L._t_critical_alpha(1.0, 10))
+
+
 def test_normal_quantile_does_not_clamp_at_the_old_bracket_edge():
     assert L._normal_quantile(0.5) == pytest.approx(0.0, abs=1e-15)
     assert L._normal_quantile(1e-20) < -9.0
