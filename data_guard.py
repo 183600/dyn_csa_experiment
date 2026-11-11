@@ -1792,11 +1792,13 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
         split_rows = {name: (_empty_index() if idx[name] is None else idx[name])
                       for name in SPLIT_NAMES}
     ref = split_rows['train']
-    if ref.size == 0 and (split_rows['val'].size or split_rows['test'].size):
+    if ref.size == 0 and n > 0:
+        # An explicit empty train_idx (with or without holdouts) audits
+        # nothing; every vacuous check would otherwise report "ok".  An empty
+        # input table remains a vacuous no-op rather than an error.
         raise ValueError(
-            'data_quality_report: the training reference is empty while '
-            'validation/test rows were supplied; holdout rows must never be '
-            'used as the reference that defines the statistics')
+            'data_quality_report: the training reference is empty; there are '
+            'no training rows whose statistics can be audited')
     warnings = []
     hard_failures = []
     checks = {}

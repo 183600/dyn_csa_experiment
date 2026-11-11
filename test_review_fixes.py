@@ -3020,6 +3020,14 @@ def t_data_quality_report_index_disjointness():
         assert 'training reference is empty' in str(e), e
     else:
         raise AssertionError('an empty training reference must not define holdout statistics')
+    # With no holdout either, an explicit empty training split still audits
+    # nothing and must not be reported as a clean/ok panel.
+    try:
+        L.data_quality_report(X, train_idx=[])
+    except ValueError as e:
+        assert 'training reference is empty' in str(e), e
+    else:
+        raise AssertionError('an explicit empty training split must not report ok')
 
 
 def t_preprocessor_train_only():
