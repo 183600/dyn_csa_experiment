@@ -772,8 +772,11 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                     te = np.load(_tfp, mmap_mode='r')
                     rec['test_file'] = os.path.basename(_tfp)
                     rec['test_tag'] = _ttag
-                except Exception:
+                except Exception as _te:
                     te = None
+                    rec['status'] = 'fail'
+                    _fail(f'{cd}/{tag}: test cache exists but is unreadable '
+                          f'({type(_te).__name__}: {_te})')
             elif len(_cands) > 1:
                 rec['test_pairing'] = 'ambiguous'
                 rec['test_candidates'] = sorted(os.path.basename(p) for p, _, _ in _cands)
