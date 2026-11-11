@@ -1131,6 +1131,11 @@ def sec_p1l():
             # of being quoted with a warning marker.
             print(f'[report] sec_p1l: {_v}: NONE of the {len(_rv)} by-length record(s) carries the current code-semantics stamp {_CUR_CS!r} — EXCLUDED from the table and conclusions; re-run the length panel to refresh')
             _stale_vars.add(_v)
+    # One run_cfg per variant: a length table must not pool @512 from one
+    # configuration with @4096 from another, which would fabricate a
+    # same-weights extrapolation ratio.
+    recs = _prefer_one_cfg(
+        recs, lambda r: (r.get('variant'), r.get('run_cfg')), who='sec_p1l')
     if not recs:
         _msg = '## P1 长上下文长度外推 — （无可验证结果）\n\n'
         if _stale_vars:

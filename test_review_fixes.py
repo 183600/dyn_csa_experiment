@@ -4106,6 +4106,25 @@ def t_sec_p1l_excludes_stale_records():
     assert '陈旧记录已排除' in txt, txt[:400]
     assert '10.0' not in txt and '40.0' not in txt, 'stale PPL must not be quoted in the section'
     assert 'ratio' not in txt or '不计算 ratio' in txt, txt[:400]
+    # Two run_cfg groups of one variant must not be pooled into one length
+    # table (that would pair @512 from cfgA with @4096 from cfgB).
+    cur_cs = f'_cs{BR._CUR_CS}'
+    summ = {
+        'v::s0': {'variant': 'v', 'seed': 0, '_code': BR._CUR_CS,
+                  'run_cfg': 'steps3000' + cur_cs,
+                  'by_len': {'512': {'ppl': 10.0, 'truncated': False},
+                             '4096': {'ppl': 12.0, 'truncated': False}}},
+        'v::s1': {'variant': 'v', 'seed': 1, '_code': BR._CUR_CS,
+                  'run_cfg': 'steps999' + cur_cs,
+                  'by_len': {'512': {'ppl': 99.0, 'truncated': False}}},
+    }
+    BR._LOADED[('summary', 'results_len')] = summ
+    try:
+        txt2 = BR.sec_p1l()
+    finally:
+        BR._LOADED.pop(('summary', 'results_len'), None)
+    assert '99.0' not in txt2, 'a minority run_cfg must not enter the length table'
+    assert '10.0' in txt2 and '12.0' in txt2, txt2[:500]
 
 
 def t_efficiency_pairs_audit_and_sweep():
