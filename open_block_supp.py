@@ -485,12 +485,22 @@ def analyse(outdir, *, seeds=None, analysis_dir='analysis_open_block'):
         if name in results:
             return results[name]
         ds, ppl_ds, used = _paired(cells, va, vb, seeds)
-        # Controlled-comparator check on the first paired seed.
+        # A seed whose two records differ in an undeclared factor is not a
+        # controlled observation.  Report the violation AND exclude that seed
+        # from the test; keeping it would let an uncontrolled run decide the
+        # paired statistic while the table merely records a warning.
         reasons = []
+        controlled = []
         for s in used:
             r = _controlled_reason(cells[(va, s)]['record'], cells[(vb, s)]['record'])
             if r:
                 reasons.append(f'seed{s}: {r}')
+            else:
+                controlled.append(s)
+        if len(controlled) != len(used):
+            ds = [float(cells[(va, s)]['nll'] - cells[(vb, s)]['nll']) for s in controlled]
+            ppl_ds = [float(cells[(va, s)]['ppl'] - cells[(vb, s)]['ppl']) for s in controlled]
+            used = controlled
         st = L.paired_effect_stats(ds, alpha=0.05, min_n=3) if ds else {'n': 0}
         st = dict(st)
         st.update({
@@ -512,30 +522,28 @@ def analyse(outdir, *, seeds=None, analysis_dir='analysis_open_block'):
     # Interaction: (summary - closed at None) - (summary - closed at 128),
     # computed seed-wise as Δ_none - Δ_128.
     d_int, p_int, used_int = [], [], []
+    _int_reasons = []
     for s in seeds:
         a = cells.get((variant(None, 'summary'), s))
         b = cells.get((variant(None, 'closed'), s))
         c = cells.get((variant(128, 'summary'), s))
         d = cells.get((variant(128, 'closed'), s))
-        if None in (a, b, c, d):
-            continue
-        d_int.append(float((a['nll'] - b['nll']) - (c['nll'] - d['nll'])))
-        p_int.append(float((a['ppl'] - b['ppl']) - (c['ppl'] - d['ppl'])))
-        used_int.append(int(s))
-    _int_reasons = []
-    for s in used_int:
-        a = cells.get((variant(None, 'summary'), s))
-        b = cells.get((variant(None, 'closed'), s))
-        c = cells.get((variant(128, 'summary'), s))
-        d = cells.get((variant(128, 'closed'), s))
+        _bad = False
         for _lbl, _x, _y in (('none summary/closed', a, b),
                              ('128 summary/closed', c, d)):
             if _x is None or _y is None:
                 _int_reasons.append(f'seed{s}: {_lbl} record missing')
+                _bad = True
                 continue
             _why = _controlled_reason(_x['record'], _y['record'])
             if _why:
                 _int_reasons.append(f'seed{s}: {_lbl}: {_why}')
+                _bad = True
+        if _bad:
+            continue
+        d_int.append(float((a['nll'] - b['nll']) - (c['nll'] - d['nll'])))
+        p_int.append(float((a['ppl'] - b['ppl']) - (c['ppl'] - d['ppl'])))
+        used_int.append(int(s))
     st = dict(L.paired_effect_stats(d_int, alpha=0.05, min_n=3) if d_int else {'n': 0})
     st.update({'name': 'interaction: summary effect (none - 128)',
                'family': 'primary', 'a': 'summary-none - closed-none',
