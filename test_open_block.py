@@ -505,6 +505,17 @@ def t_open_candidate_edge_cases():
     assert mass.shape == (n,) and torch.isfinite(mass).all(), mass
 
 
+def t_paired_seeds_are_unique():
+    import open_block_supp as OB
+    cells = {(v, s): {'nll': (1.0 if v == 'a' else 2.0),
+                      'ppl': (20.0 if v == 'a' else 21.0)}
+             for v in ('a', 'b') for s in (0, 1, 2)}
+    ds, ppl_ds, used = OB._paired(cells, 'a', 'b', [0, 0, 1, 1, 2, 2])
+    assert used == [0, 1, 2] and len(ds) == len(ppl_ds) == 3, (used, ds, ppl_ds)
+    import exp_lib as L
+    assert L.exact_signflip_p(ds)['n'] == 3, ds
+
+
 CHECKS = [
     ('K1 open-block config/segmenter', t_config_and_segmenter),
     ('K2 prefix pooling reference/grad', t_prefix_pool_reference),
@@ -517,6 +528,7 @@ CHECKS = [
     ('K9 HCA budget declaration', t_hca_budget_declaration),
     ('K10 forced-vs-natural cuts', t_forced_vs_natural_cuts),
     ('K11 open candidate edge cases', t_open_candidate_edge_cases),
+    ('K12 paired seeds are unique', t_paired_seeds_are_unique),
 ]
 
 

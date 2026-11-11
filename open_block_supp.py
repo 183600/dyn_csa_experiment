@@ -297,13 +297,20 @@ def _rec_by_cell(summary, run_fingerprint=None):
 
 def _paired(cells, va, vb, seeds):
     ds, ppl_ds, used = [], [], []
+    seen = set()
     for s in seeds:
+        s = int(s)
+        if s in seen:
+            # One seed is one paired observation.  Repeating a requested seed
+            # must not fabricate extra n and shrink the exact-test p floor.
+            continue
+        seen.add(s)
         a, b = cells.get((va, s)), cells.get((vb, s))
         if a is None or b is None:
             continue
         ds.append(float(a['nll'] - b['nll']))
         ppl_ds.append(float(a['ppl'] - b['ppl']))
-        used.append(int(s))
+        used.append(s)
     return ds, ppl_ds, used
 
 
@@ -446,7 +453,15 @@ def analyse(outdir, *, seeds=None, analysis_dir='analysis_open_block'):
     if not cells:
         raise SystemExit(f'no usable records in {outdir}/summary.json')
     avail_seeds = sorted({s for (_, s) in cells})
-    seeds = [int(s) for s in (seeds or avail_seeds)]
+    # A caller may repeat a seed on the command line; deduplicate while
+    # preserving the requested order so n stays the number of unique seeds.
+    _seen_seeds = set()
+    seeds = []
+    for s in (seeds or avail_seeds):
+        s = int(s)
+        if s not in _seen_seeds:
+            _seen_seeds.add(s)
+            seeds.append(s)
     results = {}
 
     def variant(mb, mode, scope='full_prefix'):
