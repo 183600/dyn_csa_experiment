@@ -902,6 +902,13 @@ def t_pair_reason_fingerprint_gate():
     # The zero-GPU report builder has a local pair gate; it must mirror this.
     assert 'data_fp' in BR._pair_reason(base, dict(b, data_fp='train-b'))
     assert 'unverifiable val_fp' in BR._pair_reason(base, {k: v for k, v in b.items() if k != 'val_fp'})
+    # The report's local gate must also require the matched-initialization
+    # digest, not only the same seed/run_cfg.
+    mi = dict(base, init_core_fp='init-a')
+    mi_b = dict(b, init_core_fp='init-a')
+    assert BR._pair_reason(mi, mi_b) is None
+    assert 'init_core_fp' in BR._pair_reason(mi, dict(mi_b, init_core_fp='init-b'))
+    assert 'unverifiable init_core_fp' in BR._pair_reason(mi, b)
     # One-sided presence is unverifiable, not silently compatible.
     c = dict(b)
     c.pop('val_fp')
