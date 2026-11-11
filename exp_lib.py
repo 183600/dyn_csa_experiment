@@ -8979,13 +8979,38 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
     if isinstance(_seed_driven, (bool, np.bool_)) and bool(_seed_driven):
         out['reasons'].append('leave-one-seed-out stability fails: dropping one seed flips the mean sign')
     if family_size is not None:
+        # A boolean flag or a non-integral number is not a declared family
+        # size.  int() would turn True into m=1 (the smallest possible family)
+        # or 4.9 into m=4, silently relaxing the correction instead of failing
+        # closed on malformed input.
+        _fs = None
+        if isinstance(family_size, (bool, np.bool_)):
+            out['reasons'].append(f'family_size {family_size!r} is a boolean flag, not a comparison count')
+        elif isinstance(family_size, numbers.Integral):
+            _fs = int(family_size)
+        elif isinstance(family_size, numbers.Real):
+            _f = float(family_size)
+            if math.isfinite(_f) and _f == math.floor(_f):
+                _fs = int(_f)
+            else:
+                out['reasons'].append(f'family_size {family_size!r} is not an integer comparison count')
+        else:
+            try:
+                _fs = int(family_size)
+            except (TypeError, ValueError, OverflowError):
+                _fs = None
+            if _fs is None:
+                out['reasons'].append(f'family_size {family_size!r} is not an integer comparison count')
+        if _fs is not None and _fs <= 0:
+            out['reasons'].append(f'family_size {family_size!r} must be positive')
+            _fs = None
         try:
-            _fl = holm_min_attainable_p(n, int(family_size), alpha)
+            _fl = holm_min_attainable_p(n, _fs, alpha) if _fs is not None else None
         except Exception:
             _fl = None
         out['min_attainable_p_holm_family'] = _fl
         if _fl is not None and math.isfinite(_fl) and _fl > alpha:
-            out['reasons'].append(f'family of m={int(family_size)} at n={n} has minimum attainable Holm p {_fl:.4g} > alpha')
+            out['reasons'].append(f'family of m={_fs} at n={n} has minimum attainable Holm p {_fl:.4g} > alpha')
     out['allowed'] = not out['reasons']
     if out['allowed']:
         out['level'] = 'confirmatory' if str(evidence_level).lower() == 'confirmatory' else 'exploratory_significant'

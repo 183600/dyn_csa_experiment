@@ -4088,6 +4088,15 @@ def t_boolean_pvalues_are_not_probabilities():
                               min_n=1)['allowed'] is False
     assert L.reportable_claim({'n': 12, 'mean': True, 'std': 0.1,
                                'p_exact_signflip': 0.01, 'p_holm': 0.02})['allowed'] is False
+    # family_size is a comparison count: a boolean flag / non-integral value
+    # must not be coerced into a smaller family that relaxes Holm.
+    base = {'n': 12, 'mean': -1.0, 'std': 0.1,
+            'p_exact_signflip': 0.01, 'p_holm': 0.02}
+    for bad_family in (True, np.bool_(False), 4.9, 0, -1):
+        r = L.reportable_claim(base, family_size=bad_family)
+        assert r['allowed'] is False, (bad_family, r)
+        assert r['min_attainable_p_holm_family'] is None, (bad_family, r)
+    assert L.reportable_claim(base, family_size=4.0)['allowed'] is True
 
 
 def t_holm_family_resolution_ceiling():
