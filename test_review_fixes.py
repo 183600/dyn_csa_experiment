@@ -3093,6 +3093,16 @@ def t_split_sizes_explicit_never_negative():
         else:
             raise AssertionError(f'n={bad_n!r} must be rejected')
     assert len(L.chronological_split_indices(100.0)['train']) == 80
+    # Fractional splits use largest-remainder apportionment at small n: the
+    # rounding remainder must not all be dumped into test while train is
+    # under-allocated, and a zero-fraction split must stay empty.
+    for n, want in {3: (1, 1, 1), 4: (2, 1, 1), 5: (3, 1, 1),
+                    6: (4, 1, 1), 8: (6, 1, 1), 10: (8, 1, 1)}.items():
+        idx = L.chronological_split_indices(n)
+        got = tuple(len(idx[k]) for k in ('train', 'val', 'test'))
+        assert got == want, (n, got, want)
+    idx = L.chronological_split_indices(7, 0.5, 0.5, 0.0)
+    assert [len(idx[k]) for k in ('train', 'val', 'test')] == [3, 4, 0], idx
 
 
 def t_audit_split_sequence_overlap():

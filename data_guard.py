@@ -157,23 +157,34 @@ def _resolve_sizes(n, train_frac=0.8, val_frac=0.1, test_frac=0.1,
     if abs(frac_sum - 1.0) > 1e-6:
         raise ValueError(
             f'train_frac + val_frac + test_frac must sum to 1, got {frac_sum}')
-    sizes = [int(math.floor(n * f)) for f in (train_frac, val_frac, test_frac)]
-    # Small n: guarantee one row for every requested non-empty split.  Larger
-    # splits are reduced first (from the end) so the chronological order is
-    # never broken.
-    requested = [f > 0 for f in (train_frac, val_frac, test_frac)]
+    fracs = (train_frac, val_frac, test_frac)
+    requested = [f > 0 for f in fracs]
     if n < sum(requested):
         raise ValueError(
             f'n={n} is too small for {sum(requested)} non-empty chronological splits')
+    # Largest-remainder apportionment: floor every target, then give the
+    # leftover rows to the splits with the largest fractional parts.  This
+    # keeps small-n splits close to their requested proportions (a plain
+    # floor+remainder-to-test rule would turn n=8, 80/10/10 into 4/1/3) and
+    # never puts rows into a split whose requested fraction is zero.
+    targets = [n * f for f in fracs]
+    sizes = [int(math.floor(t)) for t in targets]
+    remaining = n - sum(sizes)
+    order = sorted(range(3), key=lambda i: (-(targets[i] - sizes[i]), -i))
+    eligible = [i for i in order if requested[i]]
+    for k in range(remaining):
+        sizes[eligible[k % len(eligible)]] += 1
+    # A requested split that still rounds to zero (very small n) must borrow
+    # one row from the largest split that can spare it.
     for i in range(3):
         if requested[i] and sizes[i] == 0:
+            donors = [j for j in range(3) if j != i and sizes[j] > 1]
+            if not donors:
+                raise ValueError(f'inconsistent split sizes {sizes} for n={n}')
+            j = max(donors, key=lambda k: (sizes[k], -k))
+            sizes[j] -= 1
             sizes[i] = 1
-            for j in (2, 1, 0):
-                if j != i and sizes[j] > 1:
-                    sizes[j] -= 1
-                    break
-    sizes[2] = n - sizes[0] - sizes[1]
-    if sizes[2] < 0 or sizes[0] < 0 or sizes[1] < 0:
+    if sum(sizes) != n or any(v < 0 for v in sizes):
         raise ValueError(f'inconsistent split sizes {sizes} for n={n}')
     return tuple(int(v) for v in sizes)
 
