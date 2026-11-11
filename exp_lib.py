@@ -479,7 +479,7 @@ def _nll_doc_ci(nll_per_row, n_tokens_per_row):
                 ntok = int(ntok)
         except (TypeError, ValueError, OverflowError):
             return None
-        if ntok <= 0 or not math.isfinite(nll):
+        if ntok <= 0 or not math.isfinite(nll) or nll < 0.0:
             return None
         return nll, ntok
 
@@ -18717,7 +18717,7 @@ def _doc_bootstrap_ppl_ci(recs, *, n_boot=2000, seed=20261018):
         _nll, _ntok = [], []
         for _a, _b in zip(nll, ntok):
             _fa, _fb = _finite_scalar(_a), _finite_scalar(_b)
-            if (_fa is None or _fb is None or _fb < 0.0 or _fb != math.floor(_fb)):
+            if (_fa is None or _fb is None or _fa < 0.0 or _fb < 0.0 or _fb != math.floor(_fb)):
                 return None
             _nll.append(_fa)
             _ntok.append(_fb)
@@ -18791,7 +18791,7 @@ def _combined_seed_doc_ci(recs, *, n_boot=2000, seed=20261018, conf=0.95):
         _nll, _ntok = [], []
         for _a, _b in zip(nll, ntok):
             _fa, _fb = _finite_scalar(_a), _finite_scalar(_b)
-            if (_fa is None or _fb is None or _fb < 0.0 or _fb != math.floor(_fb)):
+            if (_fa is None or _fb is None or _fa < 0.0 or _fb < 0.0 or _fb != math.floor(_fb)):
                 rows = None
                 break
             _nll.append(_fa)

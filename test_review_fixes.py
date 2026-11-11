@@ -194,6 +194,17 @@ def t_safe_exp_and_doc_ci():
     assert ci_np['n_docs'] == 3 and abs(ci_np['ppl'] - ci['ppl']) < 1e-12, ci_np
     ci_gen = L._nll_doc_ci(iter(nll), iter(ntok))
     assert ci_gen['n_docs'] == 3 and abs(ci_gen['ppl'] - ci['ppl']) < 1e-12, ci_gen
+    # Negative NLL is not a measured cross-entropy: it would report PPL < 1
+    # with a zero-width interval.  The bootstrap helpers must refuse it too.
+    bad = L._nll_doc_ci([-10.0, -10.0], [100, 100])
+    assert bad['ppl'] is None and bad['n_docs'] == 0, bad
+    assert L._doc_bootstrap_ppl_ci([
+        {'nll_per_row': [-1.0, 2.0], 'n_tokens_per_row': [3, 4]},
+        {'nll_per_row': [-1.0, 2.0], 'n_tokens_per_row': [3, 4]}]) is None
+    comb = L._combined_seed_doc_ci([
+        {'nll_per_row': [-1.0, 2.0], 'n_tokens_per_row': [3, 4]},
+        {'nll_per_row': [-1.0, 2.0], 'n_tokens_per_row': [3, 4]}])
+    assert comb['se_doc_logppl'] is None and comb['n_docs'] is None, comb
     # Misaligned per-document arrays must not be silently truncated by zip().
     try:
         L._nll_doc_ci([1.0, 100.0], [10])
