@@ -3690,6 +3690,17 @@ def t_corpus_audit_memo_keys_validation_shape():
     assert r2['val_shape'] == [2, 3], r2
 
 
+def t_report_aggregate_status_fails_closed():
+    assert A._aggregate_audit_status({'a': {'status': 'ok'}}) == 'ok'
+    assert A._aggregate_audit_status(
+        {'a': {'status': 'ok'}, 'b': {'status': 'warnings'}}) == 'warnings'
+    assert A._aggregate_audit_status(
+        {'a': {'status': 'warnings'}, 'b': {'status': 'fail'}}) == 'fail'
+    assert A._aggregate_audit_status(
+        {'a': {'status': 'ok'}, 'b': {'status': 'not_verifiable_locally'}}) == 'not_verifiable_locally'
+    assert A._aggregate_audit_status({'a': None, 'b': {}}) == 'ok'
+
+
 def t_audit_length_requires_eval_span():
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, 'bylen.json')
@@ -4758,6 +4769,7 @@ def main():
     _check('L10 selection-attribution contract', t_selection_attribution_contract)
     _check('L10b corpus-audit memo cannot bypass the strict gate', t_corpus_audit_memo_does_not_bypass_strict_gate)
     _check('L10c corpus-audit memo keys the validation row shape', t_corpus_audit_memo_keys_validation_shape)
+    _check('L10d report command aggregates sub-audit status', t_report_aggregate_status_fails_closed)
     _check('L10c length audit rejects malformed cell objects', t_audit_length_malformed_cells_do_not_crash)
     _check('L11 length audit fails closed on missing truncation flag', t_audit_length_missing_truncated_flag)
     _check('L12 length audit fails closed on missing n_seq', t_audit_length_missing_n_seq_flag)

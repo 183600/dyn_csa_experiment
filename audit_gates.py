@@ -1941,8 +1941,23 @@ def audit_selection(path='analysis_mechanism/selection_attribution.json'):
     return out
 
 
+def _aggregate_audit_status(results):
+    """Worst status across the sub-audits, so `report` can fail the CLI."""
+    statuses = [r.get('status') for r in results.values() if isinstance(r, dict)]
+    if 'fail' in statuses:
+        return 'fail'
+    if any(s in ('warnings', 'warn') for s in statuses):
+        return 'warnings'
+    if 'not_verifiable_locally' in statuses:
+        return 'not_verifiable_locally'
+    return 'ok'
+
+
 def run_report(out='audit_report.json'):
     res = {'generated_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'leakage': audit_leakage(), 'split_discipline': audit_split_discipline(), 'attribution': audit_attribution(), 'boundary': audit_boundary(), 'length': audit_length(), 'fairness': audit_fairness(), 'metrics': audit_metrics(), 'tuning': audit_tuning(), 'simple_baseline': audit_simple_baseline(), 'hypotheses': audit_hypotheses(), 'methodology': audit_methodology(), 'failures': audit_failures(), 'budget': audit_budget(), 'efficiency_pairs': audit_efficiency_pairs(), 'release': audit_release_readiness(), 'selection': audit_selection()}
+    # The CLI exits non-zero only on a top-level status; without this the
+    # report subcommand always exited 0 even when a sub-audit failed.
+    res['status'] = _aggregate_audit_status(res)
     L_atomic = None
     try:
         L = _import_exp_lib()
