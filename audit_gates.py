@@ -1944,7 +1944,10 @@ def audit_release_readiness(path='RELEASES.md'):
             missing.append('archive SHA-256')
         if not re.fullmatch(r'[0-9a-fA-F]{64}', msha or ''):
             missing.append('manifest SHA-256')
-        if not verifier or verifier in ('—', '-', 'n/a', 'none'):
+        _verifier = (verifier or '').strip().lower()
+        if (not _verifier
+                or _verifier in ('—', '-', 'n/a', 'na', 'none', 'null',
+                                 'unknown', 'tbd', 'todo')):
             missing.append('verifier')
         if missing:
             out['problems'].append(f'{tag}: missing {missing}')
