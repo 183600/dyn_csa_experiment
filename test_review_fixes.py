@@ -4422,6 +4422,15 @@ def t_boolean_pvalues_are_not_probabilities():
     assert L.reportable_claim({'n': True, 'mean': -1.0, 'std': 0.1,
                                'p_exact_signflip': 0.01, 'p_holm': 0.02},
                               min_n=1)['allowed'] is False
+    # A fractional or string seed count must not be truncated into a smaller
+    # n that changes the exact-test p floor.
+    for bad_n in (6.9, '6'):
+        rr = L.reportable_claim({'n': bad_n, 'mean': -1.0, 'std': 0.1,
+                                 'p_exact_signflip': 0.001, 'p_holm': 0.001}, min_n=6)
+        assert rr['allowed'] is False and rr['n'] == 0, (bad_n, rr)
+    assert L.reportable_claim({'n': 6.0, 'mean': -1.0, 'std': 0.1,
+                               'p_exact_signflip': 0.001, 'p_holm': 0.001},
+                              min_n=6)['allowed'] is True
     assert L.reportable_claim({'n': 12, 'mean': True, 'std': 0.1,
                                'p_exact_signflip': 0.01, 'p_holm': 0.02})['allowed'] is False
     # Boolean per-seed deltas are flags, not effects; they must be dropped

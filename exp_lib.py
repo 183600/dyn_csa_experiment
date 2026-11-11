@@ -8942,15 +8942,24 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
     if not isinstance(stats, dict):
         out['reasons'].append('not a statistics dict')
         return out
-    _n_bool = isinstance(stats.get('n'), (bool, np.bool_))
-    if _n_bool:
+    _n_raw = stats.get('n')
+    if isinstance(_n_raw, (bool, np.bool_)):
         n = 0
         out['reasons'].append('n is a boolean flag, not a seed count')
-    else:
-        try:
-            n = int(stats.get('n') or 0)
-        except (TypeError, ValueError, OverflowError):
+    elif isinstance(_n_raw, numbers.Integral):
+        n = int(_n_raw)
+    elif isinstance(_n_raw, numbers.Real):
+        _nf = float(_n_raw)
+        if math.isfinite(_nf) and _nf == math.floor(_nf):
+            n = int(_nf)
+        else:
             n = 0
+            out['reasons'].append(f'n {_n_raw!r} is not an integer seed count')
+    else:
+        # Do not accept a string or other object by truncating/coercing it:
+        # a declared seed count must be an exact integer.
+        n = 0
+        out['reasons'].append(f'n {_n_raw!r} is not an integer seed count')
     p = stats.get('p_exact_signflip')
     if p is None:
         p = stats.get('p')
