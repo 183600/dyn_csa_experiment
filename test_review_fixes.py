@@ -5152,6 +5152,11 @@ def t_stats_accept_numpy_scalars():
         ('int', np.int64(1)), ('f32', np.float32(2.5)),
         ('nan', np.float64('nan')), ('bool', True)])
     assert (lo, hi, dropped) == (1.0, 2.5, ['nan', 'bool']), (lo, hi, dropped)
+    _j = L._jsonable({'a': np.longdouble(1.5), 'b': np.array([np.longdouble(2.5)]),
+                      'c': np.float32(3.5), 'd': np.bool_(True)})
+    assert _j == {'a': 1.5, 'b': [2.5], 'c': 3.5, 'd': True}, _j
+    import json as _json
+    _json.dumps(_j)
     meta = L.meta_analyze_effects([
         {'label': 'A', 'scale': 1, 'effects': np.array([1, 2, 3], dtype=np.int64), 'seeds': [0, 1, 2]},
         {'label': 'B', 'scale': 2, 'effects': np.array([2, 3, 4], dtype=np.int64), 'seeds': [0, 1, 2]},

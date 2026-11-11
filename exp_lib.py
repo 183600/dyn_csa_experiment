@@ -14228,7 +14228,17 @@ def _jsonable(v):
     if isinstance(v, np.ndarray):
         return _jsonable(v.tolist())
     if isinstance(v, np.generic):
-        return v.item()
+        # longdouble.item() returns another NumPy scalar; convert through the
+        # scalar kind so JSON serialisation cannot recurse or leak a
+        # non-serialisable object.
+        if isinstance(v, np.bool_):
+            return bool(v)
+        if isinstance(v, np.integer):
+            return int(v)
+        if isinstance(v, np.floating):
+            return float(v)
+        item = v.item()
+        return _jsonable(item) if not isinstance(item, np.generic) else str(item)
     if isinstance(v, (str, int, float, bool)) or v is None:
         return v
     return str(v)
