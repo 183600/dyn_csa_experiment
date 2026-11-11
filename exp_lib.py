@@ -16660,7 +16660,8 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
                 'val_ppl': val_ppl, 'train_ce': train_ce, 'health': _h,
                 'extra': {'train_fp': _ids_fp(train_ids),
                           'eval_fp': _ids_fp(np.ascontiguousarray(np.asarray(val_batch)).reshape(-1)) if val_batch is not None else None,
-                          'rng_fp': _rng_fp, 'params': int(n_param),
+                          'rng_fp': _rng_fp, 'init_core_fp': _init_core_fp,
+                          'params': int(n_param),
                           'open_block_config': open_block_config(_inner_model)}})
             print(f'  [ckpt] saved {tag} checkpoint {path} (step={step_no}, val_ppl={val_ppl})')
         except Exception as _se:

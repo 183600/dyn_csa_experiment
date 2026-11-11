@@ -890,28 +890,51 @@ def t_finaltest_requires_parameter_matching():
                            'descriptive_only': True},
             'manifest_sha256': 'M', 'code_semantics_expected': L.CODE_SEMANTICS,
         }
-        admitted = {}
-        for s in seeds:
-            for arm, ppl in (('a_arm', 30.0), ('b_arm', 31.0)):
-                admitted[(arm, s)] = {
-                    'variant': arm, 'seed': s, 'train_fp': 't', 'data_fp': 'd',
-                    'by_len': {'4096': {'ppl': ppl, 'n_tok': 16 * 4095,
-                                         'n_seq': 16, 'truncated': False}},
-                }
+        def _records(*, params=None, init=None):
+            out = {}
+            for s in seeds:
+                for arm, ppl in (('a_arm', 30.0), ('b_arm', 31.0)):
+                    r = {'variant': arm, 'seed': s, 'train_fp': 't',
+                         'data_fp': 'd',
+                         'by_len': {'4096': {'ppl': ppl, 'n_tok': 16 * 4095,
+                                              'n_seq': 16, 'truncated': False}}}
+                    if params is not None:
+                        r['params'] = params
+                    if init is not None:
+                        r['init_core_fp'] = init
+                    out[(arm, s)] = r
+            return out
         _old_admit = V12._admit_confirmation_records
         _old_probe = V12._test_probe_stats
         try:
-            V12._admit_confirmation_records = lambda raw, man: (admitted, None)
             V12._test_probe_stats = lambda *a, **k: {}
+            V12._admit_confirmation_records = lambda raw, man: (_records(), None)
             st = V12.finaltest_stats(manifest=manifest,
                                      bylen_path=os.path.join(td, 'bylen.json'),
                                      probe_path=os.path.join(td, 'probe.json'),
                                      out=os.path.join(td, 'stats.json'))
+            assert st['comparisons']['c1']['param_matched'] is None
+            assert st['confirmed'] == [], st['confirmed']
+            # Missing matched-init provenance is also not a confirmation.
+            V12._admit_confirmation_records = lambda raw, man: (_records(params=1000), None)
+            st2 = V12.finaltest_stats(manifest=manifest,
+                                      bylen_path=os.path.join(td, 'bylen.json'),
+                                      probe_path=os.path.join(td, 'probe.json'),
+                                      out=os.path.join(td, 'stats2.json'))
+            assert st2['comparisons']['c1']['param_matched'] is True
+            assert st2['comparisons']['c1']['init_core_fp_recorded'] is False
+            assert st2['confirmed'] == [], st2['confirmed']
+            # With parameter matching AND a shared init digest it confirms.
+            V12._admit_confirmation_records = lambda raw, man: (_records(params=1000, init='INIT'), None)
+            st3 = V12.finaltest_stats(manifest=manifest,
+                                      bylen_path=os.path.join(td, 'bylen.json'),
+                                      probe_path=os.path.join(td, 'probe.json'),
+                                      out=os.path.join(td, 'stats3.json'))
         finally:
             V12._admit_confirmation_records = _old_admit
             V12._test_probe_stats = _old_probe
-        assert st['comparisons']['c1']['param_matched'] is None, st['comparisons']['c1']
-        assert st['confirmed'] == [], st['confirmed']
+        assert st3['comparisons']['c1']['same_init_core_fp'] is True, st3['comparisons']['c1']
+        assert st3['confirmed'] == ['c1'], st3['confirmed']
 
 
 def t_freeze_lock():

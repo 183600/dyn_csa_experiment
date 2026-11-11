@@ -919,10 +919,21 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test', train_
     model = L.SmallGPT(int(d.get('vocab', 8192)), *_arch, d.get('train_len', 512), [copy.deepcopy(c) for c in d['cfg']], mlp_ratio=d['mlp_ratio']).to(DEVICE)
     model.load_state_dict(d.pop('sd'))
     model.eval()
+    # The shared-trunk initialisation digest is part of the matched-arm
+    # contract.  Older checkpoints may not have persisted it; recover it from
+    # the loaded weights rather than silently omitting the field.
+    _ck_init = d.get('init_core_fp')
+    if not _ck_init:
+        try:
+            _ck_init = L.init_core_fingerprint(model)
+        except Exception:
+            _ck_init = None
     # Keep the checkpoint's provenance fields on a separate binding so the
     # record writer never depends on a variable that this function deletes.
     _ck_prov = {k: d.get(k) for k in ('train_knobs', 'params', 'train_objective',
-                                      'param_breakdown', 'rng_fp')}
+                                      'param_breakdown', 'rng_fp', 'init_core_fp')}
+    if _ck_prov.get('init_core_fp') is None:
+        _ck_prov['init_core_fp'] = _ck_init
     # score EVERY loaded row: test_ids is the frozen slice already sliced to
     # the manifest's n_seqs_clean, and data_fp is computed over all of them.
     # eval_length_gen's default (n_seq=8) would measure only the
@@ -947,6 +958,7 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test', train_
                                     'train_objective': _tr.get('train_objective') or _ck_prov.get('train_objective'),
                                     'param_breakdown': _tr.get('param_breakdown') or _ck_prov.get('param_breakdown'),
                                     'rng_fp': _tr.get('rng_fp') or _ck_prov.get('rng_fp'),
+                                    'init_core_fp': _tr.get('init_core_fp') or _ck_prov.get('init_core_fp'),
                                     'amp_dtype': (_tk or {}).get('amp_dtype') if isinstance(_tk, dict) else None,
                                     'amp_grad_scaler': (_tk or {}).get('amp_grad_scaler') if isinstance(_tk, dict) else None,
                                     'eager_batch': (_tk or {}).get('eager_batch') if isinstance(_tk, dict) else None}
@@ -1673,6 +1685,8 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
     # L4096 cell may not annihilate an otherwise complete comparison.
     _conf = [k for k in _rej if stats['comparisons'].get(k, {}).get('direction_ok') is True
              and stats['comparisons'].get(k, {}).get('param_matched') is True
+             and stats['comparisons'].get(k, {}).get('same_init_core_fp') is True
+             and stats['comparisons'].get(k, {}).get('init_core_fp_recorded') is True
              and int(stats['comparisons'].get(k, {}).get('n_effective') or 0) >= int(stats['comparisons'].get(k, {}).get('min_seeds_for_confirmation') or len(manifest['seeds']))]
     stats['confirmed'] = _conf
     stats['significant_nondirectional'] = [k for k in _rej if stats['comparisons'].get(k, {}).get('direction_ok') is None]
@@ -1680,7 +1694,9 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
                                           'coverage_ok': stats['comparisons'].get(k, {}).get('coverage_ok'),
                                           'n_effective': stats['comparisons'].get(k, {}).get('n_effective'),
                                           'min_seeds_for_confirmation': stats['comparisons'].get(k, {}).get('min_seeds_for_confirmation'),
-                                          'direction_ok': stats['comparisons'].get(k, {}).get('direction_ok')}
+                                          'direction_ok': stats['comparisons'].get(k, {}).get('direction_ok'),
+                                          'same_init_core_fp': stats['comparisons'].get(k, {}).get('same_init_core_fp'),
+                                          'init_core_fp_recorded': stats['comparisons'].get(k, {}).get('init_core_fp_recorded')}
                                       for k in _rej if k not in _conf}
     _m = len(manifest['primary_comparisons'])
     _n = len(manifest['seeds'])
@@ -1836,7 +1852,7 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
         A('')
         _conf = ft.get('confirmed')
         if _conf is None:
-            _conf = [k for k, v in holm.items() if v.get('reject') and (comps.get(k, {}).get('direction_ok') is True) and (comps.get(k, {}).get('param_matched') is True) and (comps.get(k, {}).get('coverage_ok') is True)]
+            _conf = [k for k, v in holm.items() if v.get('reject') and (comps.get(k, {}).get('direction_ok') is True) and (comps.get(k, {}).get('param_matched') is True) and (comps.get(k, {}).get('same_init_core_fp') is True) and (comps.get(k, {}).get('init_core_fp_recorded') is True) and (comps.get(k, {}).get('coverage_ok') is True)]
         if _conf:
             A(f'**确认结果**：{len(_conf)}/{len(comps)} 个冻结主比较在 Holm 校正后成立**且方向符合预注册**（{sorted(_conf)}）——这是预注册规则下的确认性证据。')
         else:
