@@ -1449,6 +1449,8 @@ def _test_probe_stats(probe_path, manifest, slice_fp):
                 why = f"rho {r.get('rho')!r} is not a finite numeric measurement"
             elif not (0.0 <= _rho_i <= 1.0):
                 why = f"rho {_rho_i!r} is outside the corruption-fraction range [0,1]"
+            elif not isinstance(r.get('probe_params'), dict) or not r.get('probe_params'):
+                why = 'missing probe_params geometry (a probe measured under unknown parameters cannot be paired)'
         if why:
             excluded.append(f'{key}: {why}')
             continue
@@ -1497,15 +1499,23 @@ def _test_probe_stats(probe_path, manifest, slice_fp):
                              'mean': float(np.mean(list(by_seed.values()))),
                              'ppl_by_seed': {str(sd): p for sd, p in sorted(by_seed.items())}})
     # Descriptive paired contrasts against the learned arm on the same slice.
-    _idx = {}
-    for c in out['cells']:
-        if not c.get('ambiguous_cell'):
-            _idx[(c['variant'], c['arm'], c['eval_len'], c['rho'], c['mode'])] = c['ppl_by_seed']
-    for (v, arm, Ln, rho, mode), learned in sorted(_idx.items()):
-        if arm != 'learned':
+    # The full cell identity (including probe_params, recipe and code stamp)
+    # must match on both sides: same length/rho/mode is not enough when the
+    # two arms were probed under different sequence counts or evaluation
+    # geometries.  A visible cell with several parameterisations is ambiguous
+    # and contributes no contrast.
+    for ident, learned in sorted(groups.items()):
+        v, arm, Ln, rho, mode = ident[:5]
+        if arm != 'learned' or len(by_visible.get((v, arm, Ln, rho, mode), [])) > 1:
             continue
-        for (_v, other_arm, _Ln, _rho, _mode), other in sorted(_idx.items()):
-            if _v != v or _Ln != Ln or _rho != rho or _mode != mode or other_arm == 'learned':
+        for oident, other in sorted(groups.items()):
+            _v, other_arm, _Ln, _rho, _mode = oident[:5]
+            if (_v != v or _Ln != Ln or _rho != rho or _mode != mode
+                    or other_arm == 'learned'
+                    or len(by_visible.get((_v, other_arm, _Ln, _rho, _mode), [])) > 1):
+                continue
+            if oident[5:] != ident[5:]:
+                # Different probe_params / recipe / code stamp.
                 continue
             common = sorted(set(learned) & set(other), key=float)
             if len(common) < 2:

@@ -4704,6 +4704,36 @@ def t_v7_bootstrap_single_config():
         shutil.rmtree(root, ignore_errors=True)
 
 
+def t_v12_probe_contrasts_require_matching_params():
+    root = tempfile.mkdtemp()
+    try:
+        path = os.path.join(root, 'probe.json')
+
+        def _write(learned_pp, drop=False):
+            raw = {}
+            for s in (0, 1):
+                for arm, pp, ppl in (('learned', learned_pp, 10.0),
+                                     ('dense', {'n_seq': 16}, 11.0)):
+                    r = {'variant': 'csa_fixed', 'seed': s, 'arm': arm,
+                         'eval_len': 4096, 'rho': 0.5, 'mode': 'uniform',
+                         'ppl_mean': ppl, 'probe_params': pp, 'val_fp': 'F',
+                         '_code': L.code_stamp()}
+                    if drop and arm == 'learned':
+                        r.pop('probe_params')
+                    raw[f'{arm}{s}'] = r
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(raw, f)
+            return V12._test_probe_stats(path, {'arms': ['csa_fixed'], 'seeds': [0, 1]}, 'F')
+
+        assert _write({'n_seq': 8})['contrasts'] == {}
+        assert _write({'n_seq': 16})['contrasts'], 'same probe_params must pair'
+        miss = _write({'n_seq': 16}, drop=True)
+        assert miss['n_admitted'] == 2 and miss['n_excluded'] == 2, miss
+        assert miss['contrasts'] == {}, miss
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def t_v11_by_length_deduplicates_seeds():
     rows = [{'variant': 'v', 'seed': 0, 'by_len': {512: {'ppl': 10.0}}},
             {'variant': 'v', 'seed': 0, 'by_len': {512: {'ppl': 20.0}}},
@@ -5714,6 +5744,7 @@ def main():
     _check('L3e v8/v9 pairing keeps one run_cfg group', t_driver_pairing_single_config)
     _check('L3f v7 bootstrap pairing keeps one run_cfg group', t_v7_bootstrap_single_config)
     _check('L3g v11 by-length table deduplicates seed records', t_v11_by_length_deduplicates_seeds)
+    _check('L3h v12 probe contrasts require matching probe_params', t_v12_probe_contrasts_require_matching_params)
     _check('L4 matched-init fingerprint + pair gate', t_init_core_fingerprint_and_pair_gate)
     _check('L5 param breakdown + measured compute control', t_param_and_compute_control_detail)
     _check('L6 stale aggregate refused', t_stale_aggregate_refused)
