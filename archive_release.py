@@ -251,7 +251,14 @@ def cmd_verify(tar_path):
         if man_name is None:
             print('[archive] REFUSE: no MANIFEST inside the archive')
             return 1
-        man = json.load(tf.extractfile(man_name))
+        try:
+            man = json.load(tf.extractfile(man_name))
+        except Exception as _e:
+            print(f'[archive] REFUSE: the archive manifest is not valid JSON ({type(_e).__name__}: {_e})')
+            return 1
+        if not isinstance(man, dict) or not isinstance(man.get('files'), dict):
+            print('[archive] REFUSE: the archive manifest is not an object with a `files` mapping')
+            return 1
         bad = []
         for member in tf.getmembers():
             if member.name == man_name or not member.isfile():
