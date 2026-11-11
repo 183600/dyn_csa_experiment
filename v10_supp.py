@@ -1496,7 +1496,9 @@ def v10_analysis(out='analysis_v10/stats.json'):
                             contrasts[f'ΔNLL L{Ln} {mode} r{rho}: {arm} - csa+learned'] = res
         # ---- Holm correction over the whole contrast family ----
         holm = {}
-        _fam = [(k, v.get('p_exact_signflip')) for k, v in contrasts.items() if isinstance(v.get('p_exact_signflip'), (int, float)) and math.isfinite(v.get('p_exact_signflip'))]
+        # Declared-but-unmeasurable contrasts keep a p=1 family slot; filtering
+        # them out shrinks m and makes the surviving p_holm too small.
+        _fam = [(k, v.get('p_exact_signflip')) for k, v in contrasts.items()]
         if _fam:
             holm = L.holm_adjust(_fam)
             for _k, _v in contrasts.items():
@@ -1566,8 +1568,7 @@ def v10_analysis(out='analysis_v10/stats.json'):
             _comb = dict(contrasts)
             _comb.update(niah_contrasts)
             if _comb:
-                _h2 = L.holm_adjust([(k, v.get('p_exact_signflip')) for k, v in _comb.items()
-                                     if isinstance(v.get('p_exact_signflip'), (int, float)) and math.isfinite(v.get('p_exact_signflip'))])
+                _h2 = L.holm_adjust([(k, v.get('p_exact_signflip')) for k, v in _comb.items()])
                 for _k, _v in _comb.items():
                     if isinstance(_v, dict):
                         _e2 = _h2.get(_k)
