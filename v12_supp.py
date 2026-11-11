@@ -1679,10 +1679,20 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
         else:
             res['param_matched'] = None
             res['param_rel_diff'] = None
-        _iv = sorted({str(recs_a[s].get('init_core_fp')) for s in usable if recs_a[s].get('init_core_fp')} |
-                     {str(recs_b[s].get('init_core_fp')) for s in usable if recs_b[s].get('init_core_fp')})
-        res['same_init_core_fp'] = (len(_iv) <= 1)
-        res['init_core_fp_recorded'] = bool(_iv)
+        # Every usable PAIR must carry a digest for both arms.  A union over
+        # the non-null values would let one missing digest disappear while the
+        # remaining 23 records still attest the same init, confirming a
+        # comparison whose initialization was not actually verified per seed.
+        _iv = []
+        _init_complete = bool(usable)
+        for _s in usable:
+            _ia, _ib = recs_a[_s].get('init_core_fp'), recs_b[_s].get('init_core_fp')
+            if not _ia or not _ib:
+                _init_complete = False
+                continue
+            _iv.extend((str(_ia), str(_ib)))
+        res['init_core_fp_recorded'] = _init_complete
+        res['same_init_core_fp'] = bool(_init_complete and len(set(_iv)) <= 1)
         _act = []
         for _recs in (recs_a, recs_b):
             for s in usable:

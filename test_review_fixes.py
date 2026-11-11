@@ -971,11 +971,22 @@ def t_finaltest_requires_parameter_matching():
                                       bylen_path=os.path.join(td, 'bylen.json'),
                                       probe_path=os.path.join(td, 'probe.json'),
                                       out=os.path.join(td, 'stats3.json'))
+            # One missing per-seed digest is unverifiable, not a shared init.
+            _partial = _records(params=1000, init='INIT')
+            _partial[('b_arm', 0)].pop('init_core_fp')
+            V12._admit_confirmation_records = lambda raw, man: (_partial, None)
+            st4 = V12.finaltest_stats(manifest=manifest,
+                                      bylen_path=os.path.join(td, 'bylen.json'),
+                                      probe_path=os.path.join(td, 'probe.json'),
+                                      out=os.path.join(td, 'stats4.json'))
         finally:
             V12._admit_confirmation_records = _old_admit
             V12._test_probe_stats = _old_probe
         assert st3['comparisons']['c1']['same_init_core_fp'] is True, st3['comparisons']['c1']
         assert st3['confirmed'] == ['c1'], st3['confirmed']
+        assert st4['comparisons']['c1']['init_core_fp_recorded'] is False, st4['comparisons']['c1']
+        assert st4['comparisons']['c1']['same_init_core_fp'] is False, st4['comparisons']['c1']
+        assert st4['confirmed'] == [], st4['confirmed']
 
 
 def t_freeze_lock():
