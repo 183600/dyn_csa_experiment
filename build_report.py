@@ -1438,18 +1438,37 @@ def sec_flops():
             lines.append(f'| {r['seq_len']} | {r['sel_ratio']:.2%} | {r['csa_over_dense']:.3f} | {r['hybrid_over_dense']:.3f} | {r['csa_kv_over_dense']:.3f} |')
         except (KeyError, TypeError, ValueError) as _e:
             print(f'[report] sec_flops: a malformed row was skipped ({type(_e).__name__}: {_e})')
-    _clean = sorted((r for r in rows if isinstance(r, dict) and isinstance(r.get('seq_len'), (int, float)) and (not isinstance(r.get('seq_len'), bool)) and math.isfinite(r['seq_len'])), key=lambda r: r['seq_len'])
+    _need = ('seq_len', 'sel_ratio', 'csa_over_dense', 'hybrid_over_dense',
+             'csa_kv_over_dense')
+    _clean = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        try:
+            _sv = float(r.get('seq_len'))
+            if not math.isfinite(_sv):
+                continue
+            if any(not isinstance(r.get(k), (int, float))
+                   or isinstance(r.get(k), bool)
+                   or not math.isfinite(float(r[k])) for k in _need[1:]):
+                continue
+        except (TypeError, ValueError, OverflowError):
+            continue
+        _clean.append(r)
+    _clean.sort(key=lambda r: float(r['seq_len']))
     _rows = {}
     for r in _clean:
         _rows.setdefault(r['seq_len'], r)
     _x = d.get('crossover_seq_len_csa_beats_dense')
     _r512 = _rows.get(512)
     if _r512 is not None and _x is not None:
-        _ratio = _r512['csa_over_dense']
-        _sel = _r512['sel_ratio']
+        _ratio = float(_r512['csa_over_dense'])
+        _sel = float(_r512['sel_ratio'])
         _verdict = '省' if _ratio < 1.0 else '不省'
         _cross = f'交叉点本身就在 seq={_x}' if _x <= 512 else f'交叉点在 seq={_x}，训练序列（512）尚未到达'
-        _ratios = [r['csa_over_dense'] for r in _clean]
+        # Use one row per sequence length so a duplicated malformed/partial
+        # entry cannot distort the monotonicity read.
+        _ratios = [float(r['csa_over_dense']) for _k, r in sorted(_rows.items())]
         _mono = all((_ratios[i] >= _ratios[i + 1] - 1e-12 for i in range(len(_ratios) - 1)))
         _trend = f'比值单调降到 {min(_ratios):.3f}' if _mono else f'比值总体下行到 {min(_ratios):.3f}（非严格单调，逐点见 flops_analytic.csv）'
         lines += ['', f'**要点**：在训练用的短序列（512）下 CSA 相对 dense **{_verdict}**（csa/dense FLOPs 比 = {_ratio:.3f}，选择率 {_sel:.1%}）；{_cross}。**按该解析口径**（仅注意力项，不是实测延迟/吞吐/显存），CSA/dense 比随长度下降（{_trend}）；这不等于真实 GPU 加速，实际收益须由 checkpoint 上的测量确认。', '']
