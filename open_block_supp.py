@@ -401,7 +401,8 @@ def _controlled_reason(a, b):
     la, lb = oa.get('layers') or [], ob.get('layers') or []
     if len(la) != len(lb):
         return 'different layer counts'
-    allowed = {'max_block', 'open_block_mode', 'open_block_scope'}
+    # max_block_tokens is the same factor under its public alias.
+    allowed = {'max_block', 'max_block_tokens', 'open_block_mode', 'open_block_scope'}
     for i, (x, y) in enumerate(zip(la, lb)):
         for k in set(x) | set(y):
             if k in allowed:

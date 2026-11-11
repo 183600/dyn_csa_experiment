@@ -114,6 +114,19 @@ def t_config_and_segmenter():
             pass
         else:
             raise AssertionError(f'AttnCfg accepted invalid settings {kwargs}')
+    # The max-block alias emitted by open_block_config is a declared factor,
+    # not an uncontrolled field when comparing different caps.
+    import open_block_supp as O
+    def _cfg(cap):
+        return {'open_block_config': {'fingerprint': f'fp{cap}', 'layers': [{
+            'max_block': cap, 'max_block_tokens': cap,
+            'open_block_mode': 'summary', 'open_block_scope': 'full_prefix'}]}}
+    assert O._controlled_reason(_cfg(8), _cfg(None)) is None
+    bad = _cfg(8)
+    bad['open_block_config']['fingerprint'] = 'bad'
+    bad['open_block_config']['layers'][0]['extra_factor'] = 1
+    assert 'undeclared field' in O._controlled_reason(
+        dict(_cfg(8), run_fingerprint='x'), dict(bad, run_fingerprint='x'))
 
 
 # ---------------------------------------------------------------------------
