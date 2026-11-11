@@ -465,6 +465,12 @@ def _nll_doc_ci(nll_per_row, n_tokens_per_row):
     # residual pass below (silently reporting n_docs=0).
     _nll = list(nll_per_row) if nll_per_row is not None else []
     _ntok = list(n_tokens_per_row) if n_tokens_per_row is not None else []
+    if len(_nll) != len(_ntok):
+        # zip() would silently drop the extra documents, changing both the
+        # pooled token denominator and the number of independent clusters.
+        raise ValueError(
+            f'_nll_doc_ci: nll_per_row has {len(_nll)} entries but '
+            f'n_tokens_per_row has {len(_ntok)}; the per-document arrays are misaligned')
 
     def _parse_pair(nll, ntok):
         if isinstance(nll, (bool, np.bool_)) or isinstance(ntok, (bool, np.bool_)):
