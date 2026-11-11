@@ -1387,6 +1387,12 @@ def t_segment_uniform_stride_only_when_all_cuts():
     assert counts == [1, 1, 1] and bids.tolist() == [0, 1, 2], (bids, hon, counts)
     bids, _, counts = L._segment(4, [True, True, False, True], 1, 3)
     assert counts == [1, 1, 2] and bids.tolist() == [0, 1, 2, 2], (bids, counts)
+    # The small-n segmentation cache must key on boolean truthiness, not on a
+    # uint8 cast: 0.5 is a wanted cut, not a zero byte.
+    L._SEGMENT_CACHE.clear()
+    assert L._segment(3, [0.0, 0.0], 1, 3)[2] == [3]
+    bids, _, counts = L._segment(3, [0.5, 0.0], 1, 3)
+    assert counts == [1, 2] and bids.tolist() == [0, 1, 1], (bids, counts)
 
 
 def t_shipped_manifest_consistency():

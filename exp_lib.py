@@ -833,10 +833,11 @@ def _segment(n, want_cut_list, min_block, max_block):
     if max_block is None:
         max_block = int(n)
     cacheable = n <= 64
-    # uint8 cast of the booleans is exactly 0/1 per slot — the same byte string
-    # `bytes(bytearray(1 if _c else 0 ...))` built; the cached
-    # bids/honoured/counts the key guards are unchanged.
-    key = (n, min_block, max_block, np.asarray(want_cut_list, dtype=np.uint8).tobytes()) if cacheable else None
+    # The segmentation below uses boolean truthiness, not the raw numeric
+    # value; the cache key must normalise the same way.  Casting to uint8
+    # would turn 0.5 into 0 (and raise for 256/NaN) while the walk still sees
+    # a cut, so the cache could return a segmentation for all-False input.
+    key = (n, min_block, max_block, np.asarray(want_cut_list, dtype=bool).tobytes()) if cacheable else None
     if cacheable:
         hit = _SEGMENT_CACHE.get(key)
         if hit is not None:
