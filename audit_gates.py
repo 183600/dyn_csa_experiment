@@ -759,24 +759,41 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                     _fail(f'{cd}/{tag}: {shared_val_test} test rows exactly duplicate a validation row')
                 _ted_path = os.path.join(cd, f'test_doc_ids_{_ttag}.npy')
                 if os.path.exists(_ted_path):
-                    try:
-                        _ted = np.load(_ted_path)
-                        _trd = np.load(_trd_path) if os.path.exists(_trd_path) else np.empty(0, dtype=np.uint64)
-                        _vad = np.load(_vad_path) if os.path.exists(_vad_path) else np.empty(0, dtype=np.uint64)
-                        _dtrain = int(np.intersect1d(_trd, _ted).size)
-                        _dval = int(np.intersect1d(_vad, _ted).size)
-                        rec['test_documents'] = int(_ted.size)
-                        rec['test_train_document_overlap'] = _dtrain
-                        rec['test_validation_document_overlap'] = _dval
-                        if _dtrain:
+                    # Substituting an empty array for a missing train/val
+                    # sidecar would make the intersection trivially zero and
+                    # report an unverifiable test cache as isolated.  Require
+                    # BOTH paired sidecars before claiming zero overlap.
+                    _have_trd = os.path.exists(_trd_path)
+                    _have_vad = os.path.exists(_vad_path)
+                    if not (_have_trd and _have_vad):
+                        _missing = [n for n, ok in (('train', _have_trd),
+                                                   ('validation', _have_vad)) if not ok]
+                        rec['test_document_isolation'] = (
+                            'not_verified (missing '
+                            + '/'.join(_missing)
+                            + ' document-id sidecar)')
+                        _warn(f'{cd}/{tag}: test document-id sidecar exists but the '
+                              f'{"/".join(_missing)} sidecar is missing; test/train '
+                              'and test/validation group isolation cannot be verified')
+                    else:
+                        try:
+                            _ted = np.load(_ted_path)
+                            _trd = np.load(_trd_path)
+                            _vad = np.load(_vad_path)
+                            _dtrain = int(np.intersect1d(_trd, _ted).size)
+                            _dval = int(np.intersect1d(_vad, _ted).size)
+                            rec['test_documents'] = int(_ted.size)
+                            rec['test_train_document_overlap'] = _dtrain
+                            rec['test_validation_document_overlap'] = _dval
+                            if _dtrain:
+                                rec['status'] = 'fail'
+                                _fail(f'{cd}/{tag}: {_dtrain} test document ids also occur in train (group leakage)')
+                            if _dval:
+                                rec['status'] = 'fail'
+                                _fail(f'{cd}/{tag}: {_dval} test document ids also occur in validation (selection/test group leakage)')
+                        except Exception as _de:
                             rec['status'] = 'fail'
-                            _fail(f'{cd}/{tag}: {_dtrain} test document ids also occur in train (group leakage)')
-                        if _dval:
-                            rec['status'] = 'fail'
-                            _fail(f'{cd}/{tag}: {_dval} test document ids also occur in validation (selection/test group leakage)')
-                    except Exception as _de:
-                        rec['status'] = 'fail'
-                        _fail(f'{cd}/{tag}: test document-id sidecar unreadable ({type(_de).__name__}: {_de})')
+                            _fail(f'{cd}/{tag}: test document-id sidecar unreadable ({type(_de).__name__}: {_de})')
                 else:
                     rec['test_document_isolation'] = 'not_verified (no test_doc_ids sidecar)'
             else:
