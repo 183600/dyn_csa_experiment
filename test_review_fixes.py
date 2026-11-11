@@ -3726,6 +3726,17 @@ def t_audit_length_malformed_cells_do_not_crash():
                 'truncated': False}}}}, f)
         r2 = A.audit_length(p)
         assert r2['status'] == 'fail' and any('n_tok is not a scalar' in x for x in r2['problems']), r2
+        # Malformed keys/cells must fail closed rather than being skipped.
+        with open(p, 'w', encoding='utf-8') as f:
+            json.dump({'a::s0': {'by_len': {'4096.5': {
+                'n_tok': 4095, 'eval_span': 4095, 'n_seq': 1,
+                'truncated': False}}}}, f)
+        r3 = A.audit_length(p)
+        assert r3['status'] == 'fail' and any('not an integer length' in x for x in r3['problems']), r3
+        with open(p, 'w', encoding='utf-8') as f:
+            json.dump({'a::s0': {'by_len': {'4096': 42}}}, f)
+        r4 = A.audit_length(p)
+        assert r4['status'] == 'fail' and any('cell is not an object' in x for x in r4['problems']), r4
     finally:
         shutil.rmtree(td, ignore_errors=True)
 

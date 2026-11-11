@@ -1193,9 +1193,16 @@ def audit_length(bylen_path='results_lm_test/bylen.json'):
                 continue
             try:
                 Ln = int(k)
+                if isinstance(k, float) and (not math.isfinite(k) or k != Ln):
+                    raise ValueError
             except (TypeError, ValueError, OverflowError):
+                # A key that cannot be read as an exact integer length is not
+                # silently skipped: doing so would let an unauditable cell
+                # leave the overall status at "ok".
+                problems.append(f'{key}: by_len key {k!r} is not an integer length')
                 continue
             if not isinstance(c, dict):
+                problems.append(f'{key}: by_len[{k!r}] cell is not an object')
                 continue
             e = by_len.setdefault(Ln, {'n_tok': set(), 'eval_span': set(), 'truncated': set(), 'n_seq': set()})
 
