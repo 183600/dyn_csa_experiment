@@ -982,6 +982,12 @@ def run_finaltest(cfg=None, guard=None):
     `.freeze_lock.json`（manifest sha256 + test 切片指纹）；此后清单或
     test 数据变更都会被拒绝（V12_REFREEZE=1 显式改冻结并降级前轮）。"""
     cfg = dict(FINALTEST_CFG) if cfg is None else dict(cfg)
+    # `phase P5T` performs this zero-GPU preflight, but the direct
+    # `finaltest` CLI mode used to skip it and could burn the one-shot test
+    # access on a plan that plan_check would reject.  Smoke runs use injected
+    # data and are not the frozen confirmation, so they skip it.
+    if not _PLAN_DONE and not bool(cfg.get('smoke')):
+        plan_check(cfg.get('manifest') or FREEZE_MANIFEST)
     manifest = _load_manifest(cfg['manifest'])
     outdir = cfg['outdir']
     os.makedirs(outdir, exist_ok=True)
