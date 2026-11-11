@@ -669,6 +669,19 @@ def sec_p0w():
     s = summary('results_lm_v7_warmup')
     if not s:
         return '## P0-1 dense→sparse warmup — （无结果）\n\n'
+    if _CUR_CS:
+        _meas = [(k, r) for k, r in s.items()
+                 if isinstance(r, dict) and _measurable(r)]
+        _cur = [(k, r) for k, r in _meas if r.get('_code') == _CUR_CS]
+        if _meas and not _cur:
+            print(f'[report] sec_p0w: NONE of the {len(_meas)} measurable record(s) carries the current code-semantics stamp {_CUR_CS!r} — stale panel excluded')
+            return ('## P0-1 dense→sparse warmup — （无可验证结果）\n\n'
+                    f'> **陈旧记录已排除**：全部可测量记录都早于当前代码语义戳 `{_CUR_CS}`。'
+                    '本节不引用这些 PPL、不计算差值，也不给出显著性结论；重跑预热面板后再纳入。\n\n')
+        if len(_cur) < len(_meas):
+            print(f'[report] sec_p0w: {len(_meas) - len(_cur)} measurable record(s) predate the current code semantics — excluded from the table and conclusions')
+            _stale_keys = {k for k, _r in _meas} - {k for k, _r in _cur}
+            s = {k: v for k, v in s.items() if k not in _stale_keys}
     _legacy_ok = _legacy_warm_tags_cached('results_lm_v7_warmup')
     rows = []
     for k, r in s.items():
@@ -832,7 +845,17 @@ def sec_p0e():
         if r is None:
             continue
         lines.append(f'| `{v}` | {fm(_ppl_value(r))} {sp(r.get('ppl_std'))} | {r.get('n_seeds', r.get('n', '?'))} | {_params_m(r)} |')
-    _s_items = _prefer_one_cfg([_kv for _kv in s.items() if isinstance(_kv[1], dict) and 'variant' in _kv[1] and _measurable(_kv[1])], lambda kv: (kv[1].get('variant'), kv[1].get('run_cfg')), who='sec_p0e')
+    _raw_items = [_kv for _kv in s.items() if isinstance(_kv[1], dict) and 'variant' in _kv[1] and _measurable(_kv[1])]
+    if _CUR_CS:
+        _cur_items = [_kv for _kv in _raw_items if _kv[1].get('_code') == _CUR_CS]
+        if _raw_items and not _cur_items:
+            print(f'[report] sec_p0e: NONE of the {len(_raw_items)} measurable trajectory record(s) carries the current code-semantics stamp {_CUR_CS!r} — stale panel excluded')
+            lines += ['', f'> **⚠ 陈旧记录已排除**：全部可测量轨迹记录都早于当前代码语义戳 `{_CUR_CS}`，未进入轨迹表、尾段斜率或任何结论；重跑长跑面板后再纳入。', '']
+            return '\n'.join(lines) + '\n'
+        if len(_cur_items) < len(_raw_items):
+            print(f'[report] sec_p0e: {len(_raw_items) - len(_cur_items)} measurable trajectory record(s) predate the current code semantics — excluded from the trajectory and conclusions')
+        _raw_items = _cur_items
+    _s_items = _prefer_one_cfg(_raw_items, lambda kv: (kv[1].get('variant'), kv[1].get('run_cfg')), who='sec_p0e')
     trajs = collections.defaultdict(lambda: collections.defaultdict(dict))
     _dropped_pts = 0
     for _k, r in _s_items:
@@ -983,6 +1006,10 @@ def sec_p1t():
             if not isinstance(_r, dict) or _r.get('variant') != base_variant:
                 continue
             if not _measurable(_r):
+                continue
+            if _CUR_CS and _r.get('_code') != _CUR_CS:
+                # A stale record's block count must not set the displayed
+                # selection rate for a current aggregate row.
                 continue
             for _e in (_r.get('stats') or {}).values():
                 if isinstance(_e, dict) and isinstance(_e.get('blocks'), (int, float)) and _e['blocks'] > 0:

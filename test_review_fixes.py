@@ -4438,6 +4438,43 @@ def t_report_paired_row_single_config():
     assert pair[0] in ([('', 0)], [('', 1)]), pair
 
 
+def t_report_stale_trajectory_refused():
+    stale = 'old_csOLD'
+    s = {}
+    for i in range(6):
+        s[f'csa_fixed::w0::seed{i}'] = dict(variant='csa_fixed', seed=i,
+            warm_steps=0, ppl=10.0 + i * 0.1, run_cfg=stale, steps=100,
+            tokens_seen=1000, _code='OLD')
+        s[f'csa_fixed::w5000::seed{i}'] = dict(variant='csa_fixed', seed=i,
+            warm_steps=5000, ppl=9.0 + i * 0.1, run_cfg=stale, steps=100,
+            tokens_seen=1000, _code='OLD')
+    BR._LOADED[('summary', 'results_lm_v7_warmup')] = s
+    try:
+        txt = BR.sec_p0w()
+    finally:
+        BR._LOADED.pop(('summary', 'results_lm_v7_warmup'), None)
+    assert '陈旧记录已排除' in txt and '10.25' not in txt and '9.25' not in txt, txt
+
+    long_s = {}
+    for i in range(2):
+        for v in ('csa_fixed', 'full'):
+            long_s[f'{v}::seed{i}'] = dict(variant=v, seed=i, ppl=10.0 + i,
+                run_cfg=stale, steps=100, tokens_seen=1000, _code='OLD',
+                hist={'20000': 10.0, '40000': 9.0})
+    BR._LOADED[('summary', 'results_lm_v7_long40')] = long_s
+    BR._LOADED[('agg', 'results_lm_v7_long40')] = {
+        'csa_fixed': {'variant': 'csa_fixed', 'run_cfg': stale,
+                      'n_seeds': 2, 'ppl_mean': 10.0},
+        'full': {'variant': 'full', 'run_cfg': stale,
+                 'n_seeds': 2, 'ppl_mean': 11.0}}
+    try:
+        txt2 = BR.sec_p0e()
+    finally:
+        BR._LOADED.pop(('summary', 'results_lm_v7_long40'), None)
+        BR._LOADED.pop(('agg', 'results_lm_v7_long40'), None)
+    assert '陈旧记录已排除' in txt2 and '**10.0**' not in txt2, txt2
+
+
 def t_stale_aggregate_refused():
     cur = BR._CUR_CS
     d = {'a@cfg1': {'variant': 'a', 'run_cfg': f'steps1_d8_L1_csOLD1', 'n_seeds': 4, 'ppl_mean': 10.0},
@@ -5341,6 +5378,7 @@ def main():
     _check('L3 crossover fit refusal rules + slope CI', t_crossover_scaling_refusals)
     _check('L3b scale-ladder budget + transfer audit', t_scale_ladder_budget_and_transfer_audit)
     _check('L3c report pairing keeps one run_cfg group', t_report_paired_row_single_config)
+    _check('L3d report refuses stale trajectories', t_report_stale_trajectory_refused)
     _check('L4 matched-init fingerprint + pair gate', t_init_core_fingerprint_and_pair_gate)
     _check('L5 param breakdown + measured compute control', t_param_and_compute_control_detail)
     _check('L6 stale aggregate refused', t_stale_aggregate_refused)
