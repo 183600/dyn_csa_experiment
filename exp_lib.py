@@ -11555,7 +11555,7 @@ def simple_baseline_audit(artifact=None, path=None, protocol=None):
             # collapse to 100 and would hide unequal evaluation sizes.
             _ntv = _as_seed_int(t.get('n_tokens'))
             if _ntv is None or _ntv <= 0:
-                problems.append(f'{arm}: trial n_tokens is not a positive integer ({t.get("n_tokens")!r})')
+                problems.append(f'{arm}: trial n_tokens is not an integer ({t.get("n_tokens")!r}); expected a positive integer')
                 break
             nt.add(_ntv)
         if len(nt) > 1:
