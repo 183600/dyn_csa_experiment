@@ -5086,6 +5086,15 @@ def t_audit_length_missing_n_seq_flag():
                                                     'eval_span': 4095, 'truncated': False}}}}, f)
         r2 = A.audit_length(p)
         assert r2['status'] == 'fail' and r2['by_length']['4096']['same_n_seq_across_records'] is False, r2
+        # Fractional counts must not be truncated into a valid-looking cell.
+        for field, val in (('n_tok', 4.9), ('n_seq', 1.9), ('eval_span', 4.9)):
+            cell = {'ppl': 30.0, 'n_tok': 4, 'eval_span': 5, 'n_seq': 1,
+                    'truncated': False}
+            cell[field] = val
+            with open(p, 'w', encoding='utf-8') as f:
+                json.dump({'a::s0': {'by_len': {'5': cell}}}, f)
+            rf = A.audit_length(p)
+            assert rf['status'] == 'fail' and any('not an integer count' in x for x in rf['problems']), (field, rf)
     finally:
         shutil.rmtree(td, ignore_errors=True)
 
