@@ -373,7 +373,12 @@ def _controlled_reason(a, b):
     """Only the declared experimental factors may differ between two arms."""
     if not isinstance(a, dict) or not isinstance(b, dict):
         return 'missing record'
-    ha, hb = a.get('hyperparams') or {}, b.get('hyperparams') or {}
+    ha, hb = a.get('hyperparams'), b.get('hyperparams')
+    if (ha is None) != (hb is None):
+        return 'unverifiable hyperparams (only one record carries the descriptor)'
+    if ha is not None and (not isinstance(ha, dict) or not isinstance(hb, dict)):
+        return 'unverifiable hyperparams (not an object)'
+    ha, hb = (ha or {}), (hb or {})
     keys = ('steps', 'tokens_seen', 'n_train_tokens', 'seq_len', 'batch_size',
             'lr', 'weight_decay', 'warmup', 'comp_lambda', 'delta_lr_mult',
             'd', 'n_layers', 'n_heads', 'd_head', 'mlp_ratio', 'vocab_size',
@@ -381,20 +386,34 @@ def _controlled_reason(a, b):
             'code', 'amp_dtype', 'eager_batch')
     for k in keys:
         va, vb = ha.get(k), hb.get(k)
-        if va is not None and vb is not None and va != vb:
+        if va is None or vb is None:
+            if va is None and vb is None:
+                continue
+            return f'unverifiable {k} (only one record carries it)'
+        if va != vb:
             return f'{k} differs ({va!r} != {vb!r})'
-    if a.get('code') != b.get('code'):
+    if (a.get('code') is None) != (b.get('code') is None):
+        return 'unverifiable code stamp (only one record carries it)'
+    if a.get('code') is not None and a.get('code') != b.get('code'):
         return f"code stamp differs ({a.get('code')!r} != {b.get('code')!r})"
-    if a.get('params') is not None and b.get('params') is not None and a.get('params') != b.get('params'):
+    if (a.get('params') is None) != (b.get('params') is None):
+        return 'unverifiable parameter count (only one record carries it)'
+    if a.get('params') is not None and a.get('params') != b.get('params'):
         return f"parameter count differs ({a.get('params')!r} != {b.get('params')!r})"
-    if a.get('run_fingerprint') != b.get('run_fingerprint'):
+    if (a.get('run_fingerprint') is None) != (b.get('run_fingerprint') is None):
+        return 'unverifiable run_fingerprint (only one record carries it)'
+    if a.get('run_fingerprint') is not None and a.get('run_fingerprint') != b.get('run_fingerprint'):
         return 'run_fingerprint differs (recipe/backend/matrix changed)'
     for k in ('data_fp', 'val_fp', 'eval_fp', 'eval_subset_fp', 'rng_fp'):
         va, vb = a.get(k), b.get(k)
-        if va is not None and vb is not None and va != vb:
+        if (va is None) != (vb is None):
+            return f'unverifiable {k} (only one record carries it)'
+        if va is not None and va != vb:
             return f'{k} differs ({va!r} != {vb!r})'
-    oa = a.get('open_block_config') or {}
-    ob = b.get('open_block_config') or {}
+    if not isinstance(a.get('open_block_config'), dict) or not isinstance(b.get('open_block_config'), dict):
+        return 'unverifiable open_block_config (at least one record omits it)'
+    oa = a.get('open_block_config')
+    ob = b.get('open_block_config')
     if oa.get('fingerprint') is not None and oa.get('fingerprint') == ob.get('fingerprint'):
         return None
     # The only allowed layer-level differences are max_block/open mode/scope.
@@ -474,13 +493,27 @@ def analyse(outdir, *, seeds=None, analysis_dir='analysis_open_block'):
         d_int.append(float((a['nll'] - b['nll']) - (c['nll'] - d['nll'])))
         p_int.append(float((a['ppl'] - b['ppl']) - (c['ppl'] - d['ppl'])))
         used_int.append(int(s))
+    _int_reasons = []
+    for s in used_int:
+        a = cells.get((variant(None, 'summary'), s))
+        b = cells.get((variant(None, 'closed'), s))
+        c = cells.get((variant(128, 'summary'), s))
+        d = cells.get((variant(128, 'closed'), s))
+        for _lbl, _x, _y in (('none summary/closed', a, b),
+                             ('128 summary/closed', c, d)):
+            if _x is None or _y is None:
+                _int_reasons.append(f'seed{s}: {_lbl} record missing')
+                continue
+            _why = _controlled_reason(_x['record'], _y['record'])
+            if _why:
+                _int_reasons.append(f'seed{s}: {_lbl}: {_why}')
     st = dict(L.paired_effect_stats(d_int, alpha=0.05, min_n=3) if d_int else {'n': 0})
     st.update({'name': 'interaction: summary effect (none - 128)',
                'family': 'primary', 'a': 'summary-none - closed-none',
                'b': 'summary-128 - closed-128', 'seeds': used_int,
                'per_seed_delta_nll': d_int, 'per_seed_delta_ppl': p_int,
                'delta_convention': 'negative = prefix summary gains more when no cap',
-               'controlled_violations': [], 'p_holm': None})
+               'controlled_violations': _int_reasons, 'p_holm': None})
     results[st['name']] = st
 
     # Secondary descriptive cells.
