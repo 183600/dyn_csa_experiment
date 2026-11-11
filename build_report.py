@@ -730,6 +730,7 @@ def sec_p0w():
         _parts = []
         _ds = []
         _ds_sig = []
+        _contrasts = []
         for v, w in sorted(grp):
             if v != 'csa_fixed' or w == 0:
                 continue
@@ -749,6 +750,14 @@ def sec_p0w():
             _st = exact_signflip(_dd) if _dd else None
             if _st is None:
                 continue
+            _contrasts.append((v, w, _dd, _st))
+        # Holm over the warm-up contrasts this section actually displays, then
+        # attach the corrected p before the significance gate runs.
+        _p0w_names = [(f'P0W csa_fixed warm={w} vs warm=0', st.get('p_exact_signflip'))
+                      for _v, w, _dd, st in _contrasts]
+        _p0w_holm = holm_adjust(_p0w_names) if _p0w_names else {}
+        for v, w, _dd, _st in _contrasts:
+            _st['p_holm'] = _p0w_holm.get(f'P0W csa_fixed warm={w} vs warm=0')
             _d = _st['mean']
             _floor = signflip_p_floor(_st['n'])
             _same_dir = all((x != 0 and (x > 0) == (_d > 0) for x in _dd))
