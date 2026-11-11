@@ -3889,6 +3889,39 @@ def t_split_audit_fails_on_unreadable_meta():
         assert out['caches'][os.path.abspath(d)]['status'] == 'fail', out
 
 
+def t_valid_json_non_object_summaries_are_refused():
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, 'summary.json'), 'w', encoding='utf-8') as f:
+            json.dump([], f)
+        for fn in (A.audit_attribution, A.audit_boundary, A.audit_failures,
+                   A.audit_metrics, A.audit_efficiency_pairs):
+            out = fn(outdirs=[d])
+            assert out['status'] == 'fail', (fn.__name__, out)
+        out = A.audit_methodology(outdirs=[d], write=False)
+        assert out['status'] == 'fail', out
+        out = A.audit_fairness(os.path.join(d, 'summary.json'))
+        assert out['status'] == 'fail', out
+        out = A.audit_budget(state_files=(), panels=((d, 'arm', 10),))
+        assert out['status'] == 'fail', out
+        # The report builder must refuse a non-object summary/aggregate too.
+        try:
+            BR.summary(d)
+        except RuntimeError as e:
+            assert 'not an object' in str(e), e
+        else:
+            raise AssertionError('build_report.summary accepted a non-object JSON file')
+        with open(os.path.join(d, 'aggregate.json'), 'w', encoding='utf-8') as f:
+            json.dump({}, f)
+        with open(os.path.join(d, 'summary.json'), 'w', encoding='utf-8') as f:
+            json.dump(123, f)
+        try:
+            BR.summary(d)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError('build_report.summary accepted a numeric JSON file')
+
+
 def t_selection_audit_empty_per_seed_fails():
     with tempfile.TemporaryDirectory() as d:
         p = os.path.join(d, 'sel.json')
@@ -4960,6 +4993,7 @@ def main():
     _check('I15c selection audit rejects empty per_seed evidence', t_selection_audit_empty_per_seed_fails)
     _check('I15c2 selection audit rejects out-of-range claim cells', t_selection_audit_rejects_out_of_range_claims)
     _check('I15d split audit fails closed on unreadable metadata', t_split_audit_fails_on_unreadable_meta)
+    _check('I15e valid-JSON non-object summaries are refused', t_valid_json_non_object_summaries_are_refused)
     _check('I16 fairness audit ignores a NaN seed instead of crashing', t_audit_fairness_nan_seed_does_not_crash)
     _check('I17 an empty split cache is not reported as verified', t_audit_split_empty_cache_is_not_ok)
     _check('I18 tuning audit reports malformed seed keys instead of crashing', t_baseline_audit_malformed_seed_keys)

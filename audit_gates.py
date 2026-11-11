@@ -1097,6 +1097,13 @@ def audit_attribution(outdirs=None):
     dirs = outdirs or list(_iter_result_dirs())
     for d in dirs:
         summ = _load(os.path.join(d, 'summary.json'))
+        if summ is None:
+            continue
+        if not isinstance(summ, dict):
+            out['status'] = 'fail'
+            out.setdefault('problems', []).append(
+                f'{d}: summary.json is {type(summ).__name__}, not an object — the block attribution cannot be audited')
+            continue
         if not summ:
             continue
         panel = {}
@@ -1147,7 +1154,7 @@ def audit_attribution(outdirs=None):
             out['panels'][d] = panel
             if missing:
                 out['panels'][d]['note'] = f'no block-stat fields found for {sorted(missing)} — run evals with exp_lib.enable_block_stats(model, True) (or the kernel twin, same collection) before this audit can compare block counts/compression across arms'
-    if not out['panels']:
+    if not out['panels'] and out['status'] == 'ok':
         out['status'] = 'not_verifiable_locally'
         out['note'] = 'no results_*/summary.json on this machine — the attribution readout needs the experiment artifacts; the collection hooks are already wired (enable_block_stats / attn._stats per design_notes §14)'
     print(json.dumps(out, ensure_ascii=False, indent=2)[:4000])
@@ -1171,6 +1178,13 @@ def audit_boundary(outdirs=None):
     dirs = outdirs or list(_iter_result_dirs())
     for d in dirs:
         summ = _load(os.path.join(d, 'summary.json'))
+        if summ is None:
+            continue
+        if not isinstance(summ, dict):
+            out['status'] = 'fail'
+            out.setdefault('problems', []).append(
+                f'{d}: summary.json is {type(summ).__name__}, not an object — boundary alignment cannot be audited')
+            continue
         if not summ:
             continue
         found = {}
@@ -1234,7 +1248,7 @@ def audit_boundary(outdirs=None):
                 out['status'] = 'fail'
                 out.setdefault('problems', []).append(
                     f'{d}: boundary alignment does not exceed the random baseline')
-    if not out['panels']:
+    if not out['panels'] and out['status'] == 'ok':
         out['status'] = 'not_verifiable_locally'
         out['note'] = 'no boundary-alignment fields in the local results; fuse_analysis.py recomputes per-layer alignment (tol=1) from summary.json and exp_lib._random_cut_precision provides the matched-length random baseline — run them on the experiment machine'
     print(json.dumps(out, ensure_ascii=False, indent=2)[:4000])
@@ -1400,6 +1414,13 @@ def audit_fairness(summary_path='results_v10_mech/summary.json', arms=None):
         out = {'status': 'not_verifiable_locally', 'note': f'{summary_path} absent — needs the training records of the frozen arms'}
         print(json.dumps(out, ensure_ascii=False))
         return out
+    if not isinstance(summ, dict):
+        out = {'status': 'fail', 'arms': {}, 'controlled_variables': None,
+               'seed_coverage': {},
+               'problems': [f'{summary_path} is {type(summ).__name__}, not an object — the frozen-arm records cannot be audited'],
+               'warnings': [], 'tuning': {}}
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return out
     L = _import_exp_lib()
     arms = arms or ['csa_fixed_rope', 'full_rope', 'csa_fixed_rope_randidx', 'csa_fixed_rope_allblocks']
     per_arm = {}
@@ -1513,6 +1534,13 @@ def audit_failures(outdirs=None):
     dirs = outdirs or list(_iter_result_dirs())
     for d in dirs:
         summ = _load(os.path.join(d, 'summary.json'))
+        if summ is None:
+            continue
+        if not isinstance(summ, dict):
+            out['status'] = 'fail'
+            out.setdefault('problems', []).append(
+                f'{d}: summary.json is {type(summ).__name__}, not an object — failures cannot be audited')
+            continue
         if not summ:
             continue
         by_arm = {}
@@ -1527,7 +1555,7 @@ def audit_failures(outdirs=None):
                 n_ok[v] = n_ok.get(v, 0) + 1
         if by_arm:
             out['panels'][d] = {'errors_by_arm': {v: len(e) for v, e in by_arm.items()}, 'ok_by_arm': n_ok, 'error_samples': {v: e[:2] for v, e in by_arm.items()}}
-    if not out['panels']:
+    if not out['panels'] and out['status'] == 'ok':
         out['status'] = 'not_verifiable_locally'
         out['note'] = 'no error records found in local results (or no results) — run after each phase on the experiment machine; failures are already written as error records by the drivers'
     print(json.dumps(out, ensure_ascii=False, indent=2))
@@ -1551,6 +1579,13 @@ def audit_metrics(outdirs=None):
     dirs = outdirs or list(_iter_result_dirs())
     for d in dirs:
         summ = _load(os.path.join(d, 'summary.json'))
+        if summ is None:
+            continue
+        if not isinstance(summ, dict):
+            out['status'] = 'fail'
+            out.setdefault('problems', []).append(
+                f'{d}: summary.json is {type(summ).__name__}, not an object — metric policy cannot be audited')
+            continue
         if not summ:
             continue
         rep = L.metric_policy_audit(summ)
@@ -1637,6 +1672,13 @@ def audit_methodology(outdirs=None, design=None, alpha=0.05, min_n=3, write=True
     for d in dirs:
         _dir = d if os.path.isabs(d) else os.path.join(REPO, d)
         summ = _load(os.path.join(_dir, 'summary.json'))
+        if summ is None:
+            continue
+        if not isinstance(summ, dict):
+            out['status'] = 'fail'
+            out.setdefault('problems', []).append(
+                f'{d}: summary.json is {type(summ).__name__}, not an object — methodology cannot be audited')
+            continue
         if not summ:
             continue
         rep = L.methodology_audit(summ, design=design, alpha=alpha, min_n=min_n,
@@ -1664,7 +1706,7 @@ def audit_methodology(outdirs=None, design=None, alpha=0.05, min_n=3, write=True
         out['panels'][d] = _panel
         if _panel['arms_below_min_seeds'] or _panel['warnings']:
             out['status'] = 'warn'
-    if not out['panels']:
+    if not out['panels'] and out['status'] == 'ok':
         out['status'] = 'not_verifiable_locally'
         out['note'] = 'no results_*/summary.json found — run the experiment phases first; the audit is zero-GPU over saved records'
     print(json.dumps(out, ensure_ascii=False, indent=2))
@@ -1694,6 +1736,12 @@ def audit_budget(state_files=('run_time_state_v10.json', 'run_time_state_v12.jso
         if summ is None:
             out['panels'][d] = 'not present locally'
             continue
+        if not isinstance(summ, dict):
+            out['status'] = 'fail'
+            out.setdefault('problems', []).append(
+                f'{d}: summary.json is {type(summ).__name__}, not an object — the budget cannot be reconciled')
+            out['panels'][d] = 'not an object'
+            continue
         recs = [r for r in summ.values() if isinstance(r, dict) and r.get('variant') == v and isinstance(r.get('params'), (int, float))]
         if not recs:
             out['panels'][d] = 'no param records'
@@ -1706,6 +1754,11 @@ def audit_budget(state_files=('run_time_state_v10.json', 'run_time_state_v12.jso
     for sf in state_files:
         st = _load(sf)
         if st is not None:
+            if not isinstance(st, dict):
+                out['status'] = 'fail'
+                out.setdefault('problems', []).append(
+                    f'{sf}: TimeGuard state is {type(st).__name__}, not an object — the run ledger cannot be reconciled')
+                continue
             # TimeGuard stores `runs` as an integer counter; older/foreign
             # state files may store a list.  len(integer) would crash the whole
             # audit on any machine that has actually run a cell.
@@ -1717,7 +1770,7 @@ def audit_budget(state_files=('run_time_state_v10.json', 'run_time_state_v12.jso
             else:
                 _run_count = st.get('run_count')
             out.setdefault('measured', {})[sf] = {'booked_seconds': st.get('booked_seconds'), 'run_count': _run_count}
-    if all(not isinstance(x, dict) for x in out['panels'].values()):
+    if all(not isinstance(x, dict) for x in out['panels'].values()) and out['status'] == 'ok':
         out['status'] = 'not_verifiable_locally'
         out['note'] = 'scale panels not present locally; estimates + TimeGuard bookkeeping run on the experiment machine'
     print(json.dumps(out, ensure_ascii=False, indent=2))
@@ -1818,6 +1871,13 @@ def audit_efficiency_pairs(outdirs=None, pairs=None, *, tolerance=0.05):
            'note': 'measured prefill only; no KV cache in this model; analytic FLOPs are never substituted for timing'}
     for d in dirs:
         summ = _load(os.path.join(d, 'summary.json'))
+        if summ is None:
+            continue
+        if not isinstance(summ, dict):
+            out['status'] = 'fail'
+            out.setdefault('problems', []).append(
+                f'{d}: summary.json is {type(summ).__name__}, not an object — efficiency pairs cannot be audited')
+            continue
         if not summ:
             continue
         eff = {}
@@ -1914,7 +1974,7 @@ def audit_efficiency_pairs(outdirs=None, pairs=None, *, tolerance=0.05):
             (out['claims_allowed'] if rec['speed_claim_allowed'] else out['refused']).append(f'{d}: {a} vs {b}')
         if panel:
             out['panels'][d] = panel
-    if not out['panels']:
+    if not out['panels'] and out['status'] == 'ok':
         out['status'] = 'not_verifiable_locally'
         out['note'] = ('no records carry a measured `efficiency` block with status ok — the efficiency panel needs '
                        'checkpoints measured with exp_lib.measure_efficiency / measure_efficiency_sweep; analytic FLOPs do not qualify')

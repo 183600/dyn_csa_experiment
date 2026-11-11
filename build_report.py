@@ -49,16 +49,28 @@ def load(path, default=None):
         # 发布（进入 main 的 failed 列表），而不是伪装成「（无结果）」。
         raise RuntimeError(f'{path} exists but cannot be parsed ({type(_e).__name__}: {_e}); refusing to build a report over corrupt data — repair or remove the file') from _e
 
+def _object_or_refuse(value, path, kind):
+    """A valid-JSON non-object is corrupt for this role, not empty data."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise RuntimeError(
+            f'{path} is valid JSON but not an object ({type(value).__name__}); '
+            f'refusing to build a {kind} over it — repair or remove the file')
+    return value
+
 def agg(outdir):
     key = ('agg', outdir)
     if key not in _LOADED:
-        _LOADED[key] = load(os.path.join(REPO, outdir, 'aggregate.json'), {}) or {}
+        _path = os.path.join(REPO, outdir, 'aggregate.json')
+        _LOADED[key] = _object_or_refuse(load(_path, {}), _path, 'report aggregate')
     return _LOADED[key]
 
 def summary(outdir):
     key = ('summary', outdir)
     if key not in _LOADED:
-        _LOADED[key] = load(os.path.join(REPO, outdir, 'summary.json'), {}) or {}
+        _path = os.path.join(REPO, outdir, 'summary.json')
+        _LOADED[key] = _object_or_refuse(load(_path, {}), _path, 'report')
     return _LOADED[key]
 
 def fm(x, nd=2):
