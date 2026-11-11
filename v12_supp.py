@@ -1428,12 +1428,14 @@ def _test_probe_stats(probe_path, manifest, slice_fp):
             why = 'ppl_mean is not a usable measurement'
         elif r.get('arm') is None or r.get('eval_len') is None or r.get('rho') is None:
             why = 'missing arm/eval_len/rho'
-        elif _record_int(r.get('eval_len')) is None:
-            why = f"eval_len {r.get('eval_len')!r} is not an integer"
+        elif _record_int(r.get('eval_len')) is None or _record_int(r.get('eval_len')) <= 0:
+            why = f"eval_len {r.get('eval_len')!r} is not a positive integer"
         else:
             _rho_i = None if isinstance(r.get('rho'), (bool, np.bool_)) else L._finite_scalar(r.get('rho'))
             if _rho_i is None:
                 why = f"rho {r.get('rho')!r} is not a finite numeric measurement"
+            elif not (0.0 <= _rho_i <= 1.0):
+                why = f"rho {_rho_i!r} is outside the corruption-fraction range [0,1]"
         if why:
             excluded.append(f'{key}: {why}')
             continue
