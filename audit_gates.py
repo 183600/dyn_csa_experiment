@@ -980,7 +980,9 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
     # at all" -- the split contract was not verified.  Do not leave the
     # top-level verdict as 'ok' in that case.
     if (not out['caches']
-            or not any(c.get('corpora') for c in out['caches'].values())):
+            or not any(c.get('corpora') for c in out['caches'].values())
+            or any(c.get('status') == 'not_verifiable_locally'
+                   for c in out['caches'].values())):
         if out['status'] == 'ok':
             out['status'] = 'not_verifiable_locally'
     print(json.dumps(out, ensure_ascii=False, indent=2))
