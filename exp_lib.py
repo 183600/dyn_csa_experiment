@@ -7545,10 +7545,16 @@ def _corpus_audit_cache_key(dataset, vocab, train_ids, val_batch, meta,
     share a cache slot.
     """
     _mdoc = (meta or {}).get('doc_ids') or {}
+    _va = np.asarray(val_batch)
     return (str(dataset), int(vocab),
             _ids_fp(np.asarray(train_ids).reshape(-1)),
-            (_ids_fp(np.ascontiguousarray(val_batch).reshape(-1))
-             if np.asarray(val_batch).size else None),
+            # The report is shape-sensitive (row counts, duplicate rows, the
+            # sampled rows): two holdouts with the same flattened tokens but
+            # different row boundaries are different evaluations and must not
+            # share a memo slot.
+            (tuple(int(x) for x in _va.shape),
+             _ids_fp(np.ascontiguousarray(_va).reshape(-1))
+             if _va.size else None),
             int(max_scan_tokens), int(sample_rows),
             float(shift_warn), float(shift_fail),
             str((meta or {}).get('split_strategy')),

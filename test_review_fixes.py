@@ -3658,6 +3658,22 @@ def t_corpus_audit_memo_does_not_bypass_strict_gate():
         raise AssertionError('cached non-strict report bypassed the strict gate')
 
 
+def t_corpus_audit_memo_keys_validation_shape():
+    # The same flattened tokens with different row boundaries are different
+    # holdouts (different per-row overlap/duplicate checks and n_seq), so the
+    # memo must not return the first report for the second shape.
+    tr = np.arange(10, dtype=np.int64)
+    flat = np.arange(40, 46, dtype=np.int64)
+    va_one = flat.reshape(1, 6)
+    va_rows = flat.reshape(2, 3)
+    r1 = L.audit_corpus_split(tr, va_one, 64, dataset='shape-memo-test',
+                              max_scan_tokens=64, sample_rows=1, strict=False)
+    r2 = L.audit_corpus_split(tr, va_rows, 64, dataset='shape-memo-test',
+                              max_scan_tokens=64, sample_rows=1, strict=False)
+    assert r1['val_shape'] == [1, 6], r1
+    assert r2['val_shape'] == [2, 3], r2
+
+
 def t_audit_length_requires_eval_span():
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, 'bylen.json')
@@ -4719,6 +4735,7 @@ def main():
     _check('L9 evidence-release readiness audit', t_release_readiness_audit)
     _check('L10 selection-attribution contract', t_selection_attribution_contract)
     _check('L10b corpus-audit memo cannot bypass the strict gate', t_corpus_audit_memo_does_not_bypass_strict_gate)
+    _check('L10c corpus-audit memo keys the validation row shape', t_corpus_audit_memo_keys_validation_shape)
     _check('L10c length audit rejects malformed cell objects', t_audit_length_malformed_cells_do_not_crash)
     _check('L11 length audit fails closed on missing truncation flag', t_audit_length_missing_truncated_flag)
     _check('L12 length audit fails closed on missing n_seq', t_audit_length_missing_n_seq_flag)
