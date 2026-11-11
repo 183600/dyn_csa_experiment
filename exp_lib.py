@@ -7532,6 +7532,27 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
                 pass
 
 _CORPUS_AUDIT_MEMO = {}
+_CORPUS_AUDIT_MEMO_CAP = 8
+
+
+def _corpus_audit_cache_key(dataset, vocab, train_ids, val_batch, meta,
+                            max_scan_tokens, sample_rows, shift_warn, shift_fail):
+    """Identity of a corpus-audit result, including the scan/dedup options.
+
+    The fingerprints identify the DATA, not the audit policy: two calls with
+    the same rows but a smaller ``max_scan_tokens`` (or a different sample /
+    threshold / document attestation) produce different reports and must not
+    share a cache slot.
+    """
+    _mdoc = (meta or {}).get('doc_ids') or {}
+    return (str(dataset), int(vocab),
+            _ids_fp(np.asarray(train_ids).reshape(-1)),
+            (_ids_fp(np.ascontiguousarray(val_batch).reshape(-1))
+             if np.asarray(val_batch).size else None),
+            int(max_scan_tokens), int(sample_rows),
+            float(shift_warn), float(shift_fail),
+            str((meta or {}).get('split_strategy')),
+            json.dumps(_mdoc, sort_keys=True, default=str))
 
 
 def audit_corpus_split(train_ids, val_batch, vocab, *, dataset='wikitext',
@@ -7558,10 +7579,18 @@ def audit_corpus_split(train_ids, val_batch, vocab, *, dataset='wikitext',
         'warnings': [],
         'meta_split_strategy': (meta or {}).get('split_strategy'),
     }
-    key = (dataset, int(vocab), _ids_fp(tr),
-           _ids_fp(np.ascontiguousarray(va).reshape(-1)) if va.size else None)
+    key = _corpus_audit_cache_key(dataset, vocab, tr, va, meta,
+                                  max_scan_tokens, sample_rows,
+                                  shift_warn, shift_fail)
     _hit = _CORPUS_AUDIT_MEMO.get(key)
     if _hit is not None:
+        # A non-strict exploratory call may have cached a FAILING report.
+        # Returning it to a strict caller would silently bypass the hard gate.
+        if _hit.get('hard_failures') and strict:
+            raise RuntimeError(
+                f'[{dataset}] DATA GATE REFUSED this split: ' +
+                '; '.join(_hit['hard_failures']) +
+                ' — fix the split/cache before training (no model has been fitted).')
         return _hit
     try:
         _validate_token_ids(tr, vocab, f'{dataset} train_ids')
@@ -7677,6 +7706,8 @@ def audit_corpus_split(train_ids, val_batch, vocab, *, dataset='wikitext',
             f'[{dataset}] DATA GATE REFUSED this split: ' +
             '; '.join(report['hard_failures']) +
             ' — fix the split/cache before training (no model has been fitted).')
+    if key not in _CORPUS_AUDIT_MEMO and len(_CORPUS_AUDIT_MEMO) >= _CORPUS_AUDIT_MEMO_CAP:
+        _CORPUS_AUDIT_MEMO.pop(next(iter(_CORPUS_AUDIT_MEMO)))
     _CORPUS_AUDIT_MEMO[key] = report
     return report
 

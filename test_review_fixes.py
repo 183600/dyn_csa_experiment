@@ -3616,6 +3616,24 @@ def t_corpus_audit_overlap_is_unique_across_windows():
     assert rep['sampled_val_rows'] == 1, rep
 
 
+def t_corpus_audit_memo_does_not_bypass_strict_gate():
+    tr = np.arange(40, dtype=np.int64)
+    va = np.array([[5, 6, 7, 8]], dtype=np.int64)
+    # An exploratory (strict=False) call caches the failing report.
+    rep = L.audit_corpus_split(tr, va, 64, dataset='wikitext',
+                               max_scan_tokens=64, sample_rows=1, strict=False)
+    assert rep['status'] == 'fail', rep
+    # A later strict call on the SAME data must still raise instead of
+    # returning the cached non-raising report.
+    try:
+        L.audit_corpus_split(tr, va, 64, dataset='wikitext',
+                             max_scan_tokens=64, sample_rows=1, strict=True)
+    except RuntimeError as e:
+        assert 'DATA GATE REFUSED' in str(e), e
+    else:
+        raise AssertionError('cached non-strict report bypassed the strict gate')
+
+
 def t_audit_length_requires_eval_span():
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, 'bylen.json')
@@ -4648,6 +4666,7 @@ def main():
     _check('L8 efficiency-pair audit + shape sweep', t_efficiency_pairs_audit_and_sweep)
     _check('L9 evidence-release readiness audit', t_release_readiness_audit)
     _check('L10 selection-attribution contract', t_selection_attribution_contract)
+    _check('L10b corpus-audit memo cannot bypass the strict gate', t_corpus_audit_memo_does_not_bypass_strict_gate)
     _check('L11 length audit fails closed on missing truncation flag', t_audit_length_missing_truncated_flag)
     _check('L12 length audit fails closed on missing n_seq', t_audit_length_missing_n_seq_flag)
     _check('L13 global cross-panel multiplicity audit (exp_lib)', t_global_multiplicity_audit_basic)
