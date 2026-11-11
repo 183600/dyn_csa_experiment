@@ -18643,12 +18643,11 @@ def record_tag(rec, key, legacy_ok):
 
 def _group_params(recs):
     for r in recs:
-        v = r.get('params')
-        if v is not None:
-            try:
-                return int(v)
-            except (TypeError, ValueError, OverflowError):
-                continue
+        # Exact positive integer counts only: int(True)=1 and int(1.5)=1 are
+        # not a measured parameter count.
+        v = _as_seed_int(r.get('params'))
+        if v is not None and v > 0:
+            return v
     return None
 
 def _pooled_ppl_from_records(recs):
