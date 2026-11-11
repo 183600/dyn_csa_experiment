@@ -3917,6 +3917,16 @@ def t_efficiency_pairs_audit_and_sweep():
         r2 = A.audit_efficiency_pairs(outdirs=[td])
         rec2 = r2['panels'][td]['a vs b']
         assert rec2['speed_claim_allowed'] is False and 'token counts' in rec2['reason'], rec2
+        # A later seed measured on a different device/torch build must also
+        # refuse the speed claim; checking only the first record would let a
+        # mixed CPU/GPU panel through.
+        with open(os.path.join(td, 'summary.json'), 'w', encoding='utf-8') as f:
+            json.dump({'a::s0': {'variant': 'a', 'efficiency': eff_a},
+                       'a::s1': {'variant': 'a', 'efficiency': dict(eff_a, device='cpu', torch='2.9.0')},
+                       'b::s0': {'variant': 'b', 'efficiency': eff_b}}, f)
+        r3 = A.audit_efficiency_pairs(outdirs=[td])
+        rec3 = r3['panels'][td]['a vs b']
+        assert rec3['speed_claim_allowed'] is False and 'device or torch' in rec3['reason'], rec3
     finally:
         shutil.rmtree(td, ignore_errors=True)
     L.set_seed(0)

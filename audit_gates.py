@@ -1705,8 +1705,26 @@ def audit_efficiency_pairs(outdirs=None, pairs=None, *, tolerance=0.05):
                 _v = [float(r[key]) for r in rows if isinstance(r.get(key), (int, float)) and math.isfinite(float(r[key]))]
                 return (float(np.median(_v)) if _v else None)
             ra, rb = eff[a][0], eff[b][0]
-            same_env = (ra.get('device') == rb.get('device') and ra.get('torch') == rb.get('torch'))
-            same_kv = bool(ra.get('decode_has_kv_cache')) == bool(rb.get('decode_has_kv_cache'))
+
+            def _env_rows(rows):
+                envs = {(r.get('device'), r.get('torch')) for r in rows}
+                return (envs.pop() if len(envs) == 1 else None)
+
+            def _kv_rows(rows):
+                vals = {r.get('decode_has_kv_cache') for r in rows}
+                if len(vals) != 1:
+                    return None
+                v = next(iter(vals))
+                return v if isinstance(v, (bool, np.bool_)) else None
+
+            _ea, _eb = _env_rows(eff[a]), _env_rows(eff[b])
+            _ka, _kb = _kv_rows(eff[a]), _kv_rows(eff[b])
+            # Every record of both arms must share one measured environment.
+            # Comparing only the first seed would let a panel that mixes CPU
+            # and GPU (or torch versions / KV semantics) still claim "faster".
+            same_env = bool(_ea is not None and _ea == _eb
+                            and _ea[0] is not None and _ea[1] is not None)
+            same_kv = bool(_ka is not None and _kb is not None and _ka == _kb)
             # Median over seeds, not the first record: a single slow seed must
             # not decide a "faster" claim.
             _ta, _tb = _med(eff[a], 'prefill_ms_p50'), _med(eff[b], 'prefill_ms_p50')
