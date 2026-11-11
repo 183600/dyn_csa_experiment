@@ -4562,6 +4562,18 @@ def t_selection_attribution_contract():
             json.dump({'cells': [bad3]}, f)
         r5 = A.audit_selection()
         assert r5['cells'][0]['claim_allowed'] is False and r5['cells'][0]['n_seeds_valid'] == 2, r5
+        # Booleans are flags, not measurements: a boolean-only cell must fail
+        # structurally instead of becoming k=1/B=1/nq=1 and a claim.
+        bool_cell = {'arm': 'a', 'eval_len': True, 'k': True, 'n_blocks': True,
+                     'n_queries': True, 'recall_at_k': True,
+                     'mass_covered': True, 'random_baseline': False,
+                     'per_seed': {str(i): {'mass_covered': 0.8,
+                                           'random_baseline': 0.03}
+                                  for i in range(6)}}
+        with open(os.path.join(td, 'analysis_mechanism', 'selection_attribution.json'), 'w', encoding='utf-8') as f:
+            json.dump({'cells': [bool_cell]}, f)
+        r6 = A.audit_selection()
+        assert r6['status'] == 'fail' and any('boolean' in x for x in r6['problems']), r6
     finally:
         A.REPO = old_repo
         shutil.rmtree(td, ignore_errors=True)

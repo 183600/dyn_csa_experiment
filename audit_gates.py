@@ -2100,6 +2100,18 @@ def audit_selection(path='analysis_mechanism/selection_attribution.json'):
         if not isinstance(c.get('per_seed'), dict):
             out['problems'].append(f'cell {i} ({c.get("arm")}): per_seed must be a seed -> measurement object')
             continue
+        # Boolean flags are not measurements: int(True)==1 and
+        # float(False)==0.0 would let a boolean-only cell pass the range and
+        # geometry checks and even set claim_allowed.
+        import numpy as np
+        _bool_fields = [k for k in ('eval_len', 'k', 'n_blocks', 'n_queries',
+                                    'recall_at_k', 'mass_covered',
+                                    'random_baseline')
+                        if isinstance(c.get(k), (bool, np.bool_))]
+        if _bool_fields:
+            out['problems'].append(
+                f'cell {i} ({c.get("arm")}): boolean values in numeric fields {_bool_fields}')
+            continue
         try:
             k, B = int(c['k']), int(c['n_blocks'])
             rec, mass, base = (float(c['recall_at_k']), float(c['mass_covered']), float(c['random_baseline']))
@@ -2132,6 +2144,9 @@ def audit_selection(path='analysis_mechanism/selection_attribution.json'):
         _d, _bad_seed = [], []
         for _sk, v in _seeds.items():
             if not isinstance(v, dict) or v.get('mass_covered') is None or v.get('random_baseline') is None:
+                _bad_seed.append(str(_sk))
+                continue
+            if isinstance(v.get('mass_covered'), (bool, np.bool_)) or isinstance(v.get('random_baseline'), (bool, np.bool_)):
                 _bad_seed.append(str(_sk))
                 continue
             try:
