@@ -4036,6 +4036,23 @@ def t_reportable_claim_gate():
     assert r['allowed'] is False and any('leave-one-seed-out' in x for x in r['reasons']), r
 
 
+def t_record_readers_refuse_non_object_summaries():
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, 'summary.json'), 'w', encoding='utf-8') as f:
+            json.dump([], f)
+        assert L.read_panel(d) == {}
+        assert L.ppl_by_seed(d) == {}
+        assert L.ppl_by_seed_grouped(d) == {}
+        assert L.variant_presence(d) == {}
+        assert L.legacy_warm_tags([]) == {}
+        try:
+            L.aggregate([])
+        except ValueError as e:
+            assert 'summary object' in str(e), e
+        else:
+            raise AssertionError('aggregate accepted a list as a panel summary')
+
+
 def t_boolean_pvalues_are_not_probabilities():
     # A boolean flag must never be coerced to p=0/1 by a correction or claim
     # gate: float(False) == 0.0 would otherwise manufacture a certain result.
@@ -5075,6 +5092,7 @@ def main():
         _check('K0 open-block suite import', lambda _e=_obe: (_ for _ in ()).throw(_e))
     _check('L1 reportable claim gate', t_reportable_claim_gate)
     _check('L1b boolean p-values are not probabilities', t_boolean_pvalues_are_not_probabilities)
+    _check('L1c record readers refuse non-object summaries', t_record_readers_refuse_non_object_summaries)
     _check('L2 Holm family resolution ceiling', t_holm_family_resolution_ceiling)
     _check('L3 crossover fit refusal rules + slope CI', t_crossover_scaling_refusals)
     _check('L3b scale-ladder budget + transfer audit', t_scale_ladder_budget_and_transfer_audit)

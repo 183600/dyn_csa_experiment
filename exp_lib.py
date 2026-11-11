@@ -10827,6 +10827,9 @@ def variant_presence(outdir):
     except Exception as e:
         print(f'[stats] WARNING: cannot read {sp} ({type(e).__name__}: {e}) — variant presence cannot be established')
         return out
+    if not isinstance(raw, dict):
+        print(f'[stats] WARNING: {sp} is valid JSON but not an object ({type(raw).__name__}) — variant presence cannot be established')
+        return out
     kept = {}
     refused = {}
     for _k, r in raw.items():
@@ -10910,6 +10913,9 @@ def read_panel(outdir):
         raw = json.load(open(sp, encoding='utf-8'))
     except Exception as e:
         print(f'[stats] WARNING: cannot read {sp} ({type(e).__name__}: {e}) — this panel is EXCLUDED')
+        return {}
+    if not isinstance(raw, dict):
+        print(f'[stats] WARNING: {sp} is valid JSON but not an object ({type(raw).__name__}) — this panel is EXCLUDED')
         return {}
     _legacy_ok = legacy_warm_tags(raw)
     _by_id = {}
@@ -18440,6 +18446,8 @@ def _tag_of(rec):
     return ''
 
 def legacy_warm_tags(summary):
+    if not isinstance(summary, dict):
+        return {}
     _legacy = {}
     for key, rec in summary.items():
         if not isinstance(rec, dict) or 'seed' not in rec or 'ppl' not in rec:
@@ -18693,6 +18701,10 @@ def _combined_seed_doc_ci(recs, *, n_boot=2000, seed=20261018, conf=0.95):
     return out
 
 def aggregate(summary):
+    if not isinstance(summary, dict):
+        raise ValueError(
+            f'aggregate() needs a summary object (variant/cell -> record), got '
+            f'{type(summary).__name__}; a list/scalar cannot be aggregated as a panel')
 
     def _protocol_tag(rec, key=None):
         if key is None:
