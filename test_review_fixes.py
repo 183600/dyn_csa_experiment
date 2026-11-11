@@ -4668,6 +4668,13 @@ def t_efficiency_pairs_audit_and_sweep():
         r3 = A.audit_efficiency_pairs(outdirs=[td])
         rec3 = r3['panels'][td]['a vs b']
         assert rec3['speed_claim_allowed'] is False and 'device or torch' in rec3['reason'], rec3
+        # Boolean latency/token fields are flags, not measurements.
+        with open(os.path.join(td, 'summary.json'), 'w', encoding='utf-8') as f:
+            json.dump({'a::s0': {'variant': 'a', 'efficiency': dict(eff_a, prefill_ms_p50=True)},
+                       'b::s0': {'variant': 'b', 'efficiency': dict(eff_b, n_tokens=True)}}, f)
+        r4 = A.audit_efficiency_pairs(outdirs=[td])
+        rec4 = r4['panels'][td]['a vs b']
+        assert rec4['speed_claim_allowed'] is False, rec4
     finally:
         shutil.rmtree(td, ignore_errors=True)
     L.set_seed(0)

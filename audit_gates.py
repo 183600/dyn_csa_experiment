@@ -1915,7 +1915,15 @@ def audit_efficiency_pairs(outdirs=None, pairs=None, *, tolerance=0.05):
             if a not in eff or b not in eff:
                 continue
             def _med(rows, key):
-                _v = [float(r[key]) for r in rows if isinstance(r.get(key), (int, float)) and math.isfinite(float(r[key]))]
+                _v = []
+                for r in rows:
+                    x = r.get(key)
+                    # Boolean flags are not measured milliseconds.
+                    if isinstance(x, (bool, np.bool_)) or not isinstance(x, (int, float)):
+                        continue
+                    f = float(x)
+                    if math.isfinite(f):
+                        _v.append(f)
                 return (float(np.median(_v)) if _v else None)
             ra, rb = eff[a][0], eff[b][0]
 
@@ -1963,8 +1971,12 @@ def audit_efficiency_pairs(outdirs=None, pairs=None, *, tolerance=0.05):
             # Median over seeds, not the first record: a single slow seed must
             # not decide a "faster" claim.
             _ta, _tb = _med(eff[a], 'prefill_ms_p50'), _med(eff[b], 'prefill_ms_p50')
-            _na = sorted({int(r['n_tokens']) for r in eff[a] if isinstance(r.get('n_tokens'), int)})
-            _nb = sorted({int(r['n_tokens']) for r in eff[b] if isinstance(r.get('n_tokens'), int)})
+            def _tok_counts(rows):
+                return sorted({int(r['n_tokens']) for r in rows
+                               if isinstance(r.get('n_tokens'), (int, np.integer))
+                               and not isinstance(r.get('n_tokens'), (bool, np.bool_))
+                               and int(r['n_tokens']) > 0})
+            _na, _nb = _tok_counts(eff[a]), _tok_counts(eff[b])
             rec = {'a': a, 'b': b, 'same_device_torch': same_env, 'same_kv_semantics': same_kv,
                    'same_batch': _same_batch,
                    'a_batches': (sorted(_ba) if _ba is not None else None),
