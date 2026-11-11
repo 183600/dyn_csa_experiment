@@ -1780,13 +1780,15 @@ def t_seed_axis_normalization():
     assert L.normalize_seed_list(None) == [0]
     assert L.normalize_seed_list('0, 2 2') == [0, 2]
     assert L.normalize_variant_list(['full', 'csa_fixed', 'full']) == ['full', 'csa_fixed']
-    for bad in (True, 1.5, 'x'):
+    for bad in (True, 1.5, 'x', np.float64(2 ** 53 + 1), 9007199254740993.0):
         try:
             L.normalize_seed_list([bad])
         except ValueError:
             pass
         else:
             raise AssertionError(f'normalize_seed_list must reject {bad!r}')
+    # Exact Python integers above 2**53 are preserved (only lossy floats fail).
+    assert L.normalize_seed_list(['9007199254740993']) == [9007199254740993]
     d = tempfile.mkdtemp()
     _saved_load = L.load_run_corpus
     _old_skip_overfit = os.environ.get('CSA_SKIP_OVERFIT')

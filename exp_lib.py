@@ -13731,8 +13731,14 @@ def normalize_seed_list(seeds, *, default=(0,)):
     for raw in seeds:
         if isinstance(raw, (bool, np.bool_)):
             raise ValueError(f'seed must be an integer, got boolean {raw!r}')
-        if isinstance(raw, (float, np.floating)) and not float(raw).is_integer():
-            raise ValueError(f'seed must be an integer, got non-integral {raw!r}')
+        if isinstance(raw, (float, np.floating)):
+            _rf = float(raw)
+            if not _rf.is_integer():
+                raise ValueError(f'seed must be an integer, got non-integral {raw!r}')
+            if abs(_rf) >= 2 ** 53:
+                # Above 2**53 a float no longer represents every integer; the
+                # requested seed may silently collapse to a different seed.
+                raise ValueError(f'seed {raw!r} exceeds the exact float-integer range (2**53); pass an int')
         try:
             s = int(raw)
         except (TypeError, ValueError, OverflowError):
