@@ -1437,13 +1437,30 @@ def v10_analysis(out='analysis_v10/stats.json'):
         delta_nll = {}
 
         def _nll_tok(rec):
+            # nll_sum and n_tok are PER-ROW arrays: they must align, and token
+            # counts must be exact non-negative integers.  int(1.9) -> 1 and
+            # int(True) -> 1 would silently change the denominator.
+            ns_raw, nt_raw = rec.get('nll_sum'), rec.get('n_tok')
+            if (not isinstance(ns_raw, (list, tuple))
+                    or not isinstance(nt_raw, (list, tuple))
+                    or len(ns_raw) != len(nt_raw) or not ns_raw):
+                return float('nan')
             try:
-                ns = [float(x) for x in (rec.get('nll_sum') or [])]
-                nt = [int(x) for x in (rec.get('n_tok') or [])]
+                ns = []
+                for x in ns_raw:
+                    if isinstance(x, (bool, np.bool_)):
+                        return float('nan')
+                    ns.append(float(x))
+                nt = []
+                for x in nt_raw:
+                    c = L._as_seed_int(x)
+                    if c is None or c < 0:
+                        return float('nan')
+                    nt.append(c)
             except (TypeError, ValueError, OverflowError):
                 return float('nan')
             tot = sum(nt)
-            if not nt or tot <= 0:
+            if tot <= 0:
                 return float('nan')
             v = math.fsum(ns) / tot
             return v if math.isfinite(v) else float('nan')
