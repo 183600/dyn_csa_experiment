@@ -537,6 +537,19 @@ def paired_row(a_records, b_records):
         _keep_tag, _kept_keys = _ranked[0]
         print(f"[report] paired_row: the two arms share {len(_by_tag)} protocol conditions ({sorted(_by_tag)}) — one sign-flip test cannot pool deltas across protocols (that would fake extra seeds), so only the largest shared condition `{_keep_tag or '(untagged)'}` ({len(_kept_keys)} seed(s)) is tested; the rest ({sorted((t for t in _by_tag if t != _keep_tag))}) is left to its own per-condition section")
         common = _kept_keys
+    # Every paired seed must come from ONE run configuration on each side.
+    # _pair_reason checks only the two records inside a seed; without this
+    # grouping seed 0 from cfgA and seed 1 from cfgB would be pooled into one
+    # sign-flip test and fabricate n.
+    _cfg_groups = collections.defaultdict(list)
+    for _tk in common:
+        _cfg_groups[(a_records[_tk].get('run_cfg'), b_records[_tk].get('run_cfg'))].append(_tk)
+    if len(_cfg_groups) > 1:
+        _ranked = sorted(_cfg_groups.items(),
+                         key=lambda kv: (not (isinstance(kv[0][0], str) and _CUR_CS and kv[0][0].endswith(f'_cs{_CUR_CS}')), -len(kv[1]), str(kv[0])))
+        _keep_cfg, _kept_keys = _ranked[0]
+        print(f'[report] paired_row: the paired seeds span {len(_cfg_groups)} run_cfg groups; pooling them would fabricate n, so only the largest/current group ({len(_kept_keys)} seed(s)) is tested and the rest are skipped')
+        common = _kept_keys
     dl, kept, skipped = ([], [], [])
     for s in common:
         reason = _pair_reason(a_records[s], b_records[s])

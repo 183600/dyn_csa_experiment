@@ -4426,6 +4426,18 @@ def t_param_and_compute_control_detail():
     assert r['components']['c'][0]['compute_confound_direction'] == 'favors_claimed_winner', r['components']['c'][0]
 
 
+def t_report_paired_row_single_config():
+    base = dict(train_knobs=None, data_fp='d', val_fp='v', eval_fp='e',
+                init_core_fp='i', steps=10, tokens_seen=100)
+    a = {('', 0): dict(base, variant='a', seed=0, ppl=10.0, run_cfg='cfgA'),
+         ('', 1): dict(base, variant='a', seed=1, ppl=10.0, run_cfg='cfgB')}
+    b = {('', 0): dict(base, variant='b', seed=0, ppl=11.0, run_cfg='cfgA'),
+         ('', 1): dict(base, variant='b', seed=1, ppl=11.0, run_cfg='cfgB')}
+    pair = BR.paired_row(a, b)
+    assert pair is not None and pair[2]['n'] == 1, pair
+    assert pair[0] in ([('', 0)], [('', 1)]), pair
+
+
 def t_stale_aggregate_refused():
     cur = BR._CUR_CS
     d = {'a@cfg1': {'variant': 'a', 'run_cfg': f'steps1_d8_L1_csOLD1', 'n_seeds': 4, 'ppl_mean': 10.0},
@@ -5328,6 +5340,7 @@ def main():
     _check('L2 Holm family resolution ceiling', t_holm_family_resolution_ceiling)
     _check('L3 crossover fit refusal rules + slope CI', t_crossover_scaling_refusals)
     _check('L3b scale-ladder budget + transfer audit', t_scale_ladder_budget_and_transfer_audit)
+    _check('L3c report pairing keeps one run_cfg group', t_report_paired_row_single_config)
     _check('L4 matched-init fingerprint + pair gate', t_init_core_fingerprint_and_pair_gate)
     _check('L5 param breakdown + measured compute control', t_param_and_compute_control_detail)
     _check('L6 stale aggregate refused', t_stale_aggregate_refused)
