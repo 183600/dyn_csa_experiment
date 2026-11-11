@@ -10139,13 +10139,22 @@ def _scale_points(points):
             # must be a hard error, not silently "n looks larger".  Normalise
             # first so 0 and "0" from a JSON round-trip cannot slip through.
             raise ValueError('scale point %r: duplicate seeds %r' % (label, seeds_kept))
+        if isinstance(scale, (bool, np.bool_)):
+            raise ValueError('scale point %r: scale %r is a boolean flag, not a measurement'
+                             % (label, scale))
         try:
             sc = float(scale)
         except (TypeError, ValueError, OverflowError):
             sc = float('nan')
-        try:
-            vb = int(vocab) if vocab is not None else None
-        except (TypeError, ValueError, OverflowError):
+        if vocab is not None:
+            # A tokenizer vocabulary is an exact positive count; int(True)=1
+            # or int(1.9)=1 would masquerade as a real vocabulary and could
+            # falsely satisfy the shared-tokenisation check.
+            vb = _as_seed_int(vocab)
+            if vb is None or vb <= 0:
+                raise ValueError('scale point %r: vocab %r is not a positive integer'
+                                 % (label, vocab))
+        else:
             vb = None
         out.append({'label': str(label), 'scale': sc, 'effects': effects, 'seeds': seeds_kept,
                     'corpus_fp': (str(corpus_fp) if corpus_fp not in (None, '') else None),

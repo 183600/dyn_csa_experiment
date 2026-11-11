@@ -5193,6 +5193,16 @@ def t_scale_point_provenance_roundtrip():
     assert pts[0]['corpus_fp'] == 'fpA' and pts[0]['vocab'] == 8000, pts
     assert pts[1]['corpus_fp'] == 'fpB' and pts[1]['vocab'] is None, pts
     assert pts[2]['corpus_fp'] is None, pts
+    # Booleans and fractional vocabulary sizes are not provenance.
+    for bad in ({'label': 'S1', 'scale': True, 'effects': [0.1]},
+                {'label': 'S1', 'scale': 1, 'effects': [0.1], 'vocab': True},
+                {'label': 'S1', 'scale': 1, 'effects': [0.1], 'vocab': 1.5}):
+        try:
+            L._scale_points([bad])
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'malformed scale provenance accepted: {bad!r}')
 
 
 def t_stats_accept_numpy_scalars():
