@@ -1988,6 +1988,11 @@ def _aggregate_audit_status(results):
         return 'warnings'
     if 'not_verifiable_locally' in statuses:
         return 'not_verifiable_locally'
+    # Fail closed for any other non-ok verdict (no_release, incomplete,
+    # skipped_no_torch, ...).  Treating an unknown status as clean would let a
+    # sub-audit's explicit refusal disappear from the aggregate exit code.
+    if any(s not in (None, 'ok') for s in statuses):
+        return 'not_verifiable_locally'
     return 'ok'
 
 
