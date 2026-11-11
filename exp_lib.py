@@ -18911,6 +18911,13 @@ def aggregate(summary):
             continue
         if not ppl_is_usable(rec.get('ppl')) or rec.get('synthesized'):
             continue
+        # A seed id is the unit of independent replication.  `int()` would
+        # turn True into 1 and 1.5 into 1, fabricating extra or duplicate
+        # seeds in the reported n; use the same exact-integer contract as
+        # read_panel / _variant_seed_map and ignore unverifiable records.
+        if _as_seed_int(rec.get('seed')) is None:
+            print(f'[aggregate] WARNING: ignoring record {key!r}: seed {rec.get("seed")!r} is not an exact integer')
+            continue
         v = rec.get('variant')
         if v is None:
             v = str(key).split('::', 1)[0]

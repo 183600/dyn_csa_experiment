@@ -1023,6 +1023,17 @@ def t_aggregate_seed_normalization():
         pass
 
 
+def t_aggregate_rejects_malformed_seed_ids():
+    fp = 'steps1_sl8_bs1_nt10_lr0.0003_wd0.1_d8_L1_H1_Dh8_v16_wu1_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee1_es1_detcpu-eager_dfabc_csX'
+    base = dict(variant='a', run_cfg=fp, steps=1, tokens_seen=1, params=100, ppl=10.0)
+    raw = {'a::seed0': dict(base, seed=True),
+           'b::seed1': dict(base, seed=1.5),
+           'c::seed2': dict(base, seed=2, ppl=20.0)}
+    agg = L.aggregate(raw)['a']
+    assert agg['n_seeds'] == 1 and agg['seeds'] == [2], agg
+    assert agg['ppl_mean'] == 20.0, agg
+
+
 def t_audit_resolution_classification():
     fp = 'steps1_sl8_bs1_nt10_lr0.0003_wd0.1_d8_L1_H1_Dh8_v16_wu1_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee1_es1_detcpu-eager_dfabc_csX'
 
@@ -5427,6 +5438,7 @@ def main():
     _check('C5 freeze lock', t_freeze_lock)
     _check('C5b final test requires parameter matching', t_finaltest_requires_parameter_matching)
     _check('C9 aggregate seed normalization', t_aggregate_seed_normalization)
+    _check('C9b aggregate rejects malformed seed ids', t_aggregate_rejects_malformed_seed_ids)
     _check('C10 audit resolution classification', t_audit_resolution_classification)
     _check('C11 controlled-variable gate: mixed train_knobs', t_pair_reason_train_knobs_mixed)
     _check('C11b corpus/validation-slice fingerprint gate', t_pair_reason_fingerprint_gate)
