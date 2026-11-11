@@ -18698,7 +18698,14 @@ def _doc_bootstrap_ppl_ci(recs, *, n_boot=2000, seed=20261018):
         ntok = r.get('n_tokens_per_row')
         if not isinstance(nll, list) or not isinstance(ntok, list) or len(nll) != len(ntok) or not nll:
             return None
-        rows.append((np.asarray(nll, dtype=float), np.asarray(ntok, dtype=float)))
+        _nll, _ntok = [], []
+        for _a, _b in zip(nll, ntok):
+            _fa, _fb = _finite_scalar(_a), _finite_scalar(_b)
+            if (_fa is None or _fb is None or _fb < 0.0 or _fb != math.floor(_fb)):
+                return None
+            _nll.append(_fa)
+            _ntok.append(_fb)
+        rows.append((np.asarray(_nll, dtype=float), np.asarray(_ntok, dtype=float)))
     if len({len(a) for a, _ in rows}) != 1:
         return None
     R = len(rows[0][0])
@@ -18766,7 +18773,17 @@ def _combined_seed_doc_ci(recs, *, n_boot=2000, seed=20261018, conf=0.95):
         if not isinstance(nll, list) or not isinstance(ntok, list) or len(nll) != len(ntok) or not nll:
             rows = None
             break
-        rows.append((np.asarray(nll, dtype=float), np.asarray(ntok, dtype=float)))
+        _nll, _ntok = [], []
+        for _a, _b in zip(nll, ntok):
+            _fa, _fb = _finite_scalar(_a), _finite_scalar(_b)
+            if (_fa is None or _fb is None or _fb < 0.0 or _fb != math.floor(_fb)):
+                rows = None
+                break
+            _nll.append(_fa)
+            _ntok.append(_fb)
+        if rows is None:
+            break
+        rows.append((np.asarray(_nll, dtype=float), np.asarray(_ntok, dtype=float)))
     if isinstance(rows, list):
         if len({len(a) for a, _ in rows}) != 1:
             rows = None

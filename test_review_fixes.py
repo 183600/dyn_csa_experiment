@@ -1711,6 +1711,16 @@ def t_combined_seed_doc_uncertainty():
     r = L._combined_seed_doc_ci(recs)
     assert r['status'] == 'ok', r
     assert r['n_seeds'] == 3 and r['n_docs'] == 32 and r['n_docs_dropped_zero_token'] == 0, r
+    # Boolean/fractional per-document NLL or token rows are malformed, not
+    # measurements: no interval may be invented from them.
+    _bad = _recs([0.0, 0.2, 0.4])
+    _bad[0]['nll_per_row'][0] = True
+    assert L._doc_bootstrap_ppl_ci(_bad) is None
+    assert L._combined_seed_doc_ci(_bad)['status'] == 'unverifiable'
+    _bad2 = _recs([0.0, 0.2, 0.4])
+    _bad2[1]['n_tokens_per_row'][0] = 1.5
+    assert L._doc_bootstrap_ppl_ci(_bad2) is None
+    assert L._combined_seed_doc_ci(_bad2)['status'] == 'unverifiable'
     per_seed_lp = []
     for off in (0.0, 0.2, 0.4):
         nll = [1.0 + off + 0.01 * j for j in range(32)]
