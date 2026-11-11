@@ -12656,13 +12656,13 @@ def _compute_control_detail(recs, a, b, *, tolerance=0.25):
         for (v, _t, _s), r in recs.items():
             if v != arm or not isinstance(r, dict):
                 continue
-            tt, tok = r.get('train_time_s'), r.get('tokens_seen')
-            if isinstance(tt, (int, float)) and isinstance(tok, (int, float)) and tt > 0 and tok > 0:
+            tt, tok = _finite_scalar(r.get('train_time_s')), _finite_scalar(r.get('tokens_seen'))
+            if tt is not None and tok is not None and tt > 0 and tok > 0:
                 tpt.append(float(tt) / float(tok))
-            p = r.get('params')
-            if isinstance(p, (int, float)) and p > 0:
+            p = _finite_scalar(r.get('params'))
+            if p is not None and p > 0:
                 par.append(float(p))
-                if isinstance(tok, (int, float)) and tok > 0:
+                if tok is not None and tok > 0:
                     prox.append(float(p) * float(tok))
         med = (lambda xs: float(np.median(xs)) if xs else None)
         return med(tpt), med(par), med(prox)

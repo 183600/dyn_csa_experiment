@@ -231,21 +231,36 @@ def cmd_verify(tar_path):
         print(f'[archive] REFUSE: {tar_path} not found')
         return 1
     side = tar_path + '.sha256'
-    if os.path.exists(side):
-        try:
-            _parts = open(side, encoding='utf-8').read().split()
-        except OSError as _e:
-            print(f'[archive] REFUSE: cannot read {side} ({type(_e).__name__}: {_e})')
-            return 1
-        want = _parts[0] if _parts else ''
-        if not want:
-            print(f'[archive] REFUSE: {side} is empty or malformed — cannot verify the archive hash')
-            return 1
-        got = _sha256(tar_path)
-        print(f'[archive] archive sha256: {got}  {"OK" if got == want else "MISMATCH (expected " + want + ")"}')
-        if got != want:
-            return 1
-    with tarfile.open(tar_path, 'r:gz') as tf:
+    if not os.path.exists(side):
+        # The manifest travels INSIDE the tar, so without the external
+        # checksum sidecar an attacker can rewrite the archive and its
+        # manifest together and still pass this verifier.  A missing sidecar
+        # is therefore a refusal, not an optional extra.
+        print(f'[archive] REFUSE: external checksum sidecar {side} is missing — '
+              'without it the archive and its in-archive manifest are not '
+              'anchored to any independently published digest')
+        return 1
+    try:
+        _parts = open(side, encoding='utf-8').read().split()
+    except OSError as _e:
+        print(f'[archive] REFUSE: cannot read {side} ({type(_e).__name__}: {_e})')
+        return 1
+    want = _parts[0] if _parts else ''
+    if not want:
+        print(f'[archive] REFUSE: {side} is empty or malformed — cannot verify the archive hash')
+        return 1
+    got = _sha256(tar_path)
+    print(f'[archive] archive sha256: {got}  {"OK" if got == want else "MISMATCH (expected " + want + ")"}')
+    if got != want:
+        return 1
+    try:
+        tf = tarfile.open(tar_path, 'r:gz')
+    except (tarfile.TarError, OSError, EOFError) as _e:
+        print(f'[archive] REFUSE: {tar_path} is not a readable tar.gz archive '
+              f'({type(_e).__name__}: {_e}) — the checksum anchor cannot rescue '
+              'a corrupt file; rebuild or re-download the release')
+        return 1
+    with tf:
         names = tf.getnames()
         man_name = next((n for n in names if n.endswith('.MANIFEST.sha256')), None)
         if man_name is None:

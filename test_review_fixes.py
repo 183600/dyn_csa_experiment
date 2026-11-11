@@ -4177,6 +4177,17 @@ def t_param_and_compute_control_detail():
     c = L._compute_control_detail(recs, 'a', 'b')
     assert c['compute_matched'] is False and c['more_compute_arm'] == 'b', c
     assert abs(c['time_ratio_a_over_b'] - 0.5) < 1e-12, c
+    # NumPy measurements are real values; boolean flags are not measurements.
+    np_recs = {('a', 'p', 0): {'params': np.int64(1000), 'train_time_s': np.float32(10.0),
+                               'tokens_seen': np.int64(100)},
+               ('b', 'p', 0): {'params': np.int64(1000), 'train_time_s': np.float32(20.0),
+                               'tokens_seen': np.int64(100)}}
+    np_c = L._compute_control_detail(np_recs, 'a', 'b')
+    assert np_c['time_ratio_a_over_b'] is not None, np_c
+    bool_c = L._compute_control_detail(
+        {('a', 'p', 0): {'params': True, 'train_time_s': True, 'tokens_seen': True},
+         ('b', 'p', 0): {'params': True, 'train_time_s': True, 'tokens_seen': True}}, 'a', 'b')
+    assert bool_c['compute_matched'] is None and bool_c['time_ratio_a_over_b'] is None, bool_c
     # A significant contrast whose extra compute favours the winner is
     # system-level, not a verified mechanism.
     entry = {'controlled': True, 'param_controlled': True, 'n': 6, 'significant_global': True,
@@ -4303,6 +4314,22 @@ def t_release_readiness_audit():
         A.REPO = old_repo
         shutil.rmtree(td, ignore_errors=True)
 
+
+
+def t_archive_verify_requires_external_checksum():
+    import archive_release as AR
+    with tempfile.TemporaryDirectory() as d:
+        tar = os.path.join(d, 'release_x.tar.gz')
+        with open(tar, 'wb') as f:
+            f.write(b'not a real tar')
+        # Without the external sidecar the in-archive manifest can be rewritten
+        # together with the archive, so verify must refuse.
+        assert AR.cmd_verify(tar) == 1
+        with open(tar + '.sha256', 'w', encoding='utf-8') as f:
+            f.write(AR._sha256(tar) + '  release_x.tar.gz\n')
+        # The checksum now anchors the file; the invalid tar itself must not be
+        # accepted as a release either (a clean refusal, not a traceback).
+        assert AR.cmd_verify(tar) == 1
 
 
 def t_selection_attribution_contract():
@@ -5033,6 +5060,7 @@ def main():
     _check('L7 stale length panel excluded from report', t_sec_p1l_excludes_stale_records)
     _check('L8 efficiency-pair audit + shape sweep', t_efficiency_pairs_audit_and_sweep)
     _check('L9 evidence-release readiness audit', t_release_readiness_audit)
+    _check('L9b archive verifier requires the external checksum', t_archive_verify_requires_external_checksum)
     _check('L10 selection-attribution contract', t_selection_attribution_contract)
     _check('L10b corpus-audit memo cannot bypass the strict gate', t_corpus_audit_memo_does_not_bypass_strict_gate)
     _check('L10c corpus-audit memo keys the validation row shape', t_corpus_audit_memo_keys_validation_shape)
