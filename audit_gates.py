@@ -761,6 +761,13 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                     if _tndc.get('policy') != 'test_documents_deduplicated_against_train_and_validation':
                         rec['status'] = 'fail'
                         _fail(f'{cd}/{tag}: test metadata does not attest duplicate cleanup against both train and validation')
+                else:
+                    # Without this attestation near-duplicates between test and
+                    # train/validation cannot be ruled out; exact-row checks
+                    # alone would leave the cache labelled clean.
+                    rec['status'] = 'fail'
+                    _fail(f'{cd}/{tag}: test metadata has no near-duplicate cleanup '
+                          'attestation against train and validation')
                 try:
                     te = np.load(_tfp, mmap_mode='r')
                     rec['test_file'] = os.path.basename(_tfp)
