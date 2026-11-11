@@ -1576,12 +1576,13 @@ def exact_sign_permutation(deltas):
     n = len(d)
     n_dropped = int(len(d_in) - n)
 
-    def _extras(res, d, n):
+    def _extras(res, d, n, floor_n=None):
         """效应量与逐种子差值：报告必须给出逐种子 Δ 与
         d_z（配对差均值/样本标准差），并把该 n 下的 p 值分辨率下限
         一并写出，避免把分辨率上限误读为数据结论。纯增量字段。"""
         res['per_seed'] = [float(x) for x in d.tolist()]
-        res['p_floor'] = math.ldexp(2.0, -int(n)) if n > 0 else float('nan')
+        _fn = int(n if floor_n is None else floor_n)
+        res['p_floor'] = math.ldexp(2.0, -_fn) if _fn > 0 else float('nan')
         _sd = res.get('std', 0.0)
         _mu = res.get('mean', float('nan'))
         if (not isinstance(_sd, (int, float))) or (not math.isfinite(_mu)):
@@ -1610,12 +1611,17 @@ def exact_sign_permutation(deltas):
         # Monte-Carlo draw, beyond that).  Do not label a sampled p-value as
         # an exact sign-flip p.
         _r = L.exact_signflip_p(d)
+        # The saddlepoint branch drops zero deltas (they do not change the
+        # null distribution), so its attainable floor is 2/2**m with m the
+        # number of NONZERO deltas — not 2/2**n.  Report the floor of the
+        # test that actually ran.  MITM/enumeration keep all n slots.
+        _m_nonzero = int(np.count_nonzero(d)) if str(_r.get('method', '')).startswith('saddlepoint') else n
         return _extras({'n': n, 'mean': float(d.mean()),
                         'std': float(d.std(ddof=1)) if n > 1 else 0.0,
                         'p_exact_signflip': float(_r['p']),
                         'n_flips': (int(1 << n) if _r.get('method', '').startswith('exact') else 0),
                         'method': _r.get('method'),
-                        'n_dropped': n_dropped}, d, n)
+                        'n_dropped': n_dropped}, d, n, floor_n=_m_nonzero)
     cnt = 0
     total = 1 << n
     bitpos = np.arange(n, dtype=np.int64)[None, :]

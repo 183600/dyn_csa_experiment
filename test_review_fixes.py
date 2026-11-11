@@ -465,6 +465,12 @@ def t_signflip_saddlepoint_large_n():
     v = V7.exact_sign_permutation(list(rng.normal(0.2, 1.0, size=50)))
     assert v['method'].startswith('saddlepoint'), v
     assert 'saddlepoint' in v['test'], v
+    # Zero deltas do not multiply the saddlepoint null distribution: the
+    # reported floor must be 2/2**(number of NONZERO deltas), not 2/2**n.
+    zv = V7.exact_sign_permutation([0.7] * 40 + [0.0] * 10)
+    assert zv['method'].startswith('saddlepoint'), zv
+    assert abs(zv['p_floor'] - 2.0 / (1 << 40)) < 1e-30, zv['p_floor']
+    assert abs(zv['p_exact_signflip'] - 2.0 / (1 << 40)) < 1e-30, zv['p_exact_signflip']
 
 
 def t_wilcoxon_exact_dp():
