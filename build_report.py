@@ -1333,6 +1333,12 @@ def sec_p2s():
     if rows:
         lines += ['', '**配对检验（同 seed 配对，符号翻转）**：', '', '| 比较 | n (配对 seeds) | Δ (a−b) mean±std | p | params |', '|---|---|---|---|---|']
         for a, b, common, st in rows:
+            # Every p-value printed in this table belongs to the report's
+            # global multiplicity family, not only the one row later used by
+            # the prose gate.
+            _note_comparison(f'P2S {a} - {b}', st.get('p_exact_signflip'),
+                             family='P2S', p_holm=st.get('p_holm'),
+                             n=st.get('n'), mean=st.get('mean'))
             _pl = f'{st["p_exact_signflip"]:.3f}' + (' (saddlepoint)' if str(st.get('method', '')).startswith('saddlepoint') else ' (exact)')
             lines.append(f'| `{a}` − `{b}` | {len(common)} | {st['mean']:+.2f} ± {st['std']:.2f} | {_pl} | {unmatched_tag(_agg_entry(_agg, a), _agg_entry(_agg, b)) or '✓'} |')
         main = next((r for r in rows if r[0] == 'csa_fixed' and r[1] == 'full'), None)
@@ -1343,7 +1349,9 @@ def sec_p2s():
             _which = '`csa_fixed − full_matched`（参数对齐）' if _mt else '`csa_fixed − full`（未做容量匹配）'
             _tag = unmatched_tag(_agg_entry(_agg, _ba), _agg_entry(_agg, _bb)) if _mt else unmatched_tag(_agg_entry(_agg, 'csa_fixed'), _agg_entry(_agg, 'full'))
             if st['mean'] > 0:
-                concl = f'scale 面板上 {_which} 的配对差为 **{st['mean']:+.2f} PPL**（n={len(common)}，p={st['p_exact_signflip']:.3f}）：' + ('该差距通过 n≥6 + Holm + 效应>噪声门槛，方向为 sparse 更差。' if _sig_gate(st, label=f'P2S scale {_which}', family='P2S') else '该差距**未通过** n≥6 + Holm + 效应>噪声门槛，只能作方向性读数，不能写成「已经反转」。') + '该面板同时改变宽度、层数、序列长度与训练量，**不能把差异单独归因于「dense 的容量红利」**；需要参数/计算/训练量匹配的规模臂才能做机制归因。' + (f'{_tag}' if _tag else '✓')
+                _gate_ok = _sig_gate(st, label=f'P2S {_ba} - {_bb}',
+                                     family='P2S', register=False)
+                concl = f'scale 面板上 {_which} 的配对差为 **{st['mean']:+.2f} PPL**（n={len(common)}，p={st['p_exact_signflip']:.3f}）：' + ('该差距通过 n≥6 + Holm + 效应>噪声门槛，方向为 sparse 更差。' if _gate_ok else '该差距**未通过** n≥6 + Holm + 效应>噪声门槛，只能作方向性读数，不能写成「已经反转」。') + '该面板同时改变宽度、层数、序列长度与训练量，**不能把差异单独归因于「dense 的容量红利」**；需要参数/计算/训练量匹配的规模臂才能做机制归因。' + (f'{_tag}' if _tag else '✓')
             else:
                 concl = f'scale 面板上 {_which} 的配对差为 **{st['mean']:+.2f} PPL**（n={len(common)}，p={st['p_exact_signflip']:.3f}）：该规模下 sparse 仍领先，早期优势未随规模消失。{_tag or '✓'}'
             lines += ['', f'**结论**：{concl}', '']
@@ -1383,7 +1391,7 @@ def sec_flops():
         lines += ['', f'**要点**：在训练用的短序列（512）下 CSA 相对 dense **{_verdict}**（csa/dense FLOPs 比 = {_ratio:.3f}，选择率 {_sel:.1%}）；{_cross}。**按该解析口径**（仅注意力项，不是实测延迟/吞吐/显存），CSA/dense 比随长度下降（{_trend}）；这不等于真实 GPU 加速，实际收益须由 checkpoint 上的测量确认。', '']
     return '\n'.join(lines) + '\n'
 
-def _sig_gate(st, alpha=0.05, min_n=6, label=None, family=None):
+def _sig_gate(st, alpha=0.05, min_n=6, label=None, family=None, register=True):
     """Conservative significance gate for report prose.
 
     Requires n>=6 (the exact sign-flip floor at n<6 is >alpha, so no n<6 panel
@@ -1401,11 +1409,12 @@ def _sig_gate(st, alpha=0.05, min_n=6, label=None, family=None):
         return False
     global _GATE_CALLS, _UNREGISTERED_GATES
     _GATE_CALLS += 1
-    if label is None:
-        _UNREGISTERED_GATES += 1
-    else:
-        _note_comparison(label, st.get('p_exact_signflip'), family,
-                         st.get('p_holm'), st.get('n'), st.get('mean'))
+    if register:
+        if label is None:
+            _UNREGISTERED_GATES += 1
+        else:
+            _note_comparison(label, st.get('p_exact_signflip'), family,
+                             st.get('p_holm'), st.get('n'), st.get('mean'))
     n = st.get('n') or 0
     p = st.get('p_exact_signflip')
     ph = st.get('p_holm')
