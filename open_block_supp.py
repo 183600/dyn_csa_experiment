@@ -155,8 +155,14 @@ def _is_current(rec, fp):
         return False
     if rec.get('code') != L.code_stamp():
         return False
+    if rec.get('synthesized'):
+        return False
     ppl = rec.get('ppl')
-    return isinstance(ppl, (int, float)) and not isinstance(ppl, bool) and math.isfinite(float(ppl)) and float(ppl) > 0
+    if not (isinstance(ppl, (int, float)) and not isinstance(ppl, bool) and math.isfinite(float(ppl)) and float(ppl) > 0):
+        return False
+    # Resume must agree with the analysis predicate: a record without usable
+    # per-token NLL is not a completed cell even if it has a positive PPL.
+    return _nll_per_token(rec) is not None
 
 
 def _synthetic_data(cfg, vocab=97, n_train=40000, val_rows=8):
@@ -264,14 +270,13 @@ def run_panel(cfg, matrix, *, device, synthetic=False, max_hours=None, label='ma
 # ---------------------------------------------------------------------------
 
 def _nll_per_token(rec):
-    try:
-        n = float(rec['n_tokens'])
-        v = float(rec['nll_sum'])
-        if n > 0 and math.isfinite(v):
-            return v / n
-    except Exception:
-        pass
-    return None
+    if not isinstance(rec, dict):
+        return None
+    n = L._as_seed_int(rec.get('n_tokens'))
+    v = L._finite_scalar(rec.get('nll_sum'))
+    if n is None or n <= 0 or v is None:
+        return None
+    return v / n
 
 
 def _rec_by_cell(summary, run_fingerprint=None):
@@ -281,12 +286,19 @@ def _rec_by_cell(summary, run_fingerprint=None):
             continue
         if run_fingerprint is not None and rec.get('run_fingerprint') != run_fingerprint:
             continue
-        if not L.ppl_is_usable(rec.get('ppl')):
+        if rec.get('synthesized') or not L.ppl_is_usable(rec.get('ppl')):
             continue
         v, _, s = key.partition('::seed')
-        try:
-            seed = int(s)
-        except Exception:
+        seed = L._as_seed_int(s)
+        if seed is None:
+            continue
+        # The key is not the identity: a record whose own variant/seed fields
+        # disagree with its summary key would otherwise be paired as a
+        # different cell than the one it was actually run for.
+        if rec.get('variant') is not None and str(rec.get('variant')) != str(v):
+            continue
+        _rec_seed = L._as_seed_int(rec.get('seed'))
+        if rec.get('seed') is not None and _rec_seed != seed:
             continue
         nll = _nll_per_token(rec)
         if nll is None:
@@ -458,7 +470,9 @@ def analyse(outdir, *, seeds=None, analysis_dir='analysis_open_block'):
     _seen_seeds = set()
     seeds = []
     for s in (seeds or avail_seeds):
-        s = int(s)
+        s = L._as_seed_int(s)
+        if s is None:
+            raise SystemExit(f'open-block: invalid seed identifier {s!r} — seeds must be integers')
         if s not in _seen_seeds:
             _seen_seeds.add(s)
             seeds.append(s)
@@ -575,9 +589,11 @@ def analyse(outdir, *, seeds=None, analysis_dir='analysis_open_block'):
         if e is not None:
             efficiency[f'{v}::seed{s}'] = e
     _prim_n = [int(results[n].get('n') or 0) for n in prim_names if results[n].get('n')]
-    _prim_n_min = min(_prim_n) if _prim_n else 0
-    _holm_floor = (L.holm_min_attainable_p(_prim_n_min, len(prim_names), 0.05)
-                   if _prim_n_min and prim_names else None)
+    # The family's finest attainable p is set by the best-resolved (largest-n)
+    # comparison, not the smallest one.
+    _prim_n_max = max(_prim_n) if _prim_n else 0
+    _holm_floor = (L.holm_min_attainable_p(_prim_n_max, len(prim_names), 0.05)
+                   if _prim_n_max and prim_names else None)
     _holm_min_n = (L.signflip_min_n_for_holm(len(prim_names), 0.05)
                    if prim_names else None)
     os.makedirs(analysis_dir, exist_ok=True)

@@ -516,6 +516,25 @@ def t_paired_seeds_are_unique():
     assert L.exact_signflip_p(ds)['n'] == 3, ds
 
 
+def t_record_identity_and_completeness():
+    import open_block_supp as OB
+    fp = 'fp'
+    base = {'variant': 'A', 'seed': 0, 'ppl': 10.0, 'nll_sum': 10.0,
+            'n_tokens': 1, 'run_fingerprint': fp}
+    # A positive PPL without usable per-token NLL is not a completed cell.
+    assert OB._is_current({'run_fingerprint': fp, 'code': L.code_stamp(),
+                           'ppl': 2.0}, fp) is False
+    cells = OB._rec_by_cell({'A::seed0': dict(base, variant='B', seed=1)}, fp)
+    assert cells == {}, cells
+    cells = OB._rec_by_cell({'A::seed0': dict(base, nll_sum=True,
+                                             n_tokens=True)}, fp)
+    assert cells == {}, cells
+    cells = OB._rec_by_cell({'A::seed0': dict(base, nll_sum=10.0,
+                                             n_tokens=1.5)}, fp)
+    assert cells == {}, cells
+    assert OB._rec_by_cell({'A::seed0': base}, fp)
+
+
 CHECKS = [
     ('K1 open-block config/segmenter', t_config_and_segmenter),
     ('K2 prefix pooling reference/grad', t_prefix_pool_reference),
@@ -529,6 +548,7 @@ CHECKS = [
     ('K10 forced-vs-natural cuts', t_forced_vs_natural_cuts),
     ('K11 open candidate edge cases', t_open_candidate_edge_cases),
     ('K12 paired seeds are unique', t_paired_seeds_are_unique),
+    ('K13 record identity/completeness', t_record_identity_and_completeness),
 ]
 
 
