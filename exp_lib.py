@@ -5852,8 +5852,17 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
     trd_path = os.path.join(cache_dir, f'train_doc_ids_{tag}.npy')
     vad_path = os.path.join(cache_dir, f'val_doc_ids_{tag}.npy')
     if all((os.path.exists(p) for p in (tr_path, va_path, vp_path, me_path))):
-        _sig = _memo_file_sig({'train': tr_path, 'val': va_path,
-                               'bnd': vp_path, 'meta': me_path})
+        _sig_paths = {'train': tr_path, 'val': va_path,
+                      'bnd': vp_path, 'meta': me_path}
+        # Document-id sidecars are part of the cache identity and are checked
+        # on every cold hit.  Leaving them out of the memo key let a swapped
+        # or removed sidecar be hidden by an in-process hit after the first
+        # verification.
+        if os.path.exists(trd_path):
+            _sig_paths['train_doc_ids'] = trd_path
+        if os.path.exists(vad_path):
+            _sig_paths['val_doc_ids'] = vad_path
+        _sig = _memo_file_sig(_sig_paths)
         _mkey = (os.path.abspath(cache_dir), tag, _sig)
         _hit = _WT103_MEMO.get(_mkey)
         if _hit is not None:
@@ -6284,6 +6293,16 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
         import glob as _glob_memo
         for _tp in sorted(_glob_memo.glob(os.path.join(cache_dir, 'tok_v5_*.json'))):
             _sig_paths[f'train_tok:{os.path.basename(_tp)}'] = _tp
+        # The cached-test verification also intersects the persisted train and
+        # validation document-id sidecars and cross-checks every train meta.
+        # Those files are therefore part of the memo identity too: a swapped
+        # sidecar/meta must force verification, not be masked by a memo hit.
+        for _dp in sorted(_glob_memo.glob(os.path.join(cache_dir, 'train_doc_ids_v5_*.npy'))):
+            _sig_paths[f'train_doc_ids:{os.path.basename(_dp)}'] = _dp
+        for _dp in sorted(_glob_memo.glob(os.path.join(cache_dir, 'val_doc_ids_*.npy'))):
+            _sig_paths[f'val_doc_ids:{os.path.basename(_dp)}'] = _dp
+        for _mp in sorted(_glob_memo.glob(os.path.join(cache_dir, 'meta_v5_*.json'))):
+            _sig_paths[f'train_meta:{os.path.basename(_mp)}'] = _mp
         _sig = _memo_file_sig(_sig_paths)
         _mkey = (os.path.abspath(cache_dir), tag, _sig)
         _hit = _WT103_TEST_MEMO.get(_mkey)
