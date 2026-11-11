@@ -2018,7 +2018,8 @@ def plan_check(manifest_path=FREEZE_MANIFEST):
                                      'n_seq': int(_nseq), 'ppl_per_seq': [100.0] * int(_nseq),
                                      'truncated': False}
                            for Ln in _lens},
-                'data_fp': 'plan-test-slice-fp', 'train_fp': 'plan-train-fp',
+                'data_fp': 'plan-test-slice-fp',
+                'train_fp': (_frozen_train_fp(m) or 'plan-train-fp'),
                 '_code': L.code_stamp(), 'manifest_sha256': m.get('manifest_sha256'),
                 'recipe': _recipe, 'train_knobs': _tk, 'n_seq': int(_nseq),
                 'params': 11089904,
