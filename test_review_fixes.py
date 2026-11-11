@@ -3497,7 +3497,9 @@ def t_audit_split_test_metadata_discipline():
         ttag = 'tiny_test'
         tr = np.arange(40, dtype=np.int64)
         va = (np.arange(16, dtype=np.int64) + 40).reshape(2, 8)
-        te = (np.arange(16, dtype=np.int64) + 56).reshape(2, 8)
+        # The held-out cache may use a different sequence length than the
+        # training cache (e.g. 512 vs 4097); pairing must not require equality.
+        te = (np.arange(32, dtype=np.int64) + 56).reshape(2, 16)
         np.save(os.path.join(d, f'train_ids_{tag}.npy'), tr)
         np.save(os.path.join(d, f'val_batch_{tag}.npy'), va)
         np.save(os.path.join(d, f'test_ids_{ttag}.npy'), te)
@@ -3505,7 +3507,7 @@ def t_audit_split_test_metadata_discipline():
             json.dump({'vocab': 80, 'seq_len': 8, 'split_strategy': 'ordered',
                        'shuffle_at_split': False,
                        'tokenizer_fit_split': 'train'}, f)
-        good_test = {'vocab': 80, 'seq_len': 8, 'split_strategy': 'official_test',
+        good_test = {'vocab': 80, 'seq_len': 16, 'split_strategy': 'official_test',
                      'shuffle_at_split': False,
                      'tokenizer_fit_split': 'train',
                      'near_duplicate_cleanup': {
@@ -3514,6 +3516,7 @@ def t_audit_split_test_metadata_discipline():
             json.dump(good_test, f)
         out = A.audit_split_discipline(cache_dirs=[d], min_shift_tokens=1)
         rec = out['caches'][os.path.abspath(d)]['corpora'][tag]
+        assert rec.get('test_tag') == ttag, rec
         assert rec.get('test_shuffle_at_split') is False, rec
         assert rec['status'] != 'fail', rec
         bad_test = dict(good_test, shuffle_at_split=True,

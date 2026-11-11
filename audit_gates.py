@@ -694,8 +694,13 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                 _tfp = os.path.join(cd, f'test_ids_{_ttag}.npy')
                 if not os.path.exists(_tfp):
                     continue
-                if meta.get('seq_len') is not None and _tm.get('seq_len') is not None and int(_tm['seq_len']) != int(meta['seq_len']):
-                    continue
+                # Do NOT require the train and held-out sequence lengths to
+                # match: the training cache is built at the training seq_len
+                # while the frozen test slice can use a longer evaluation
+                # window (e.g. 512 vs 4097).  Pair on the tokenizer/vocab
+                # provenance instead; the row-overlap checks below accept
+                # different shapes, and >1 matching candidate is reported as
+                # ambiguous rather than guessed.
                 if meta.get('vocab') is not None and _tm.get('vocab') is not None and int(_tm['vocab']) != int(meta['vocab']):
                     continue
                 if meta.get('fit_fp') and _tm.get('fit_fp') and meta['fit_fp'] != _tm['fit_fp']:
