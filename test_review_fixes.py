@@ -1295,6 +1295,11 @@ def t_tuned_pairing_keeps_optimizer_gate():
     b3.pop('train_knobs')
     why2 = BT._relaxed_pair_reason(a, b3, {'a': 3, 'b': 3})
     assert why2 and 'unverifiable train_knobs' in why2, why2
+    # Boolean/fractional parameter "counts" are not verifiable counts.
+    for _bad in (True, 1.5, float(2 ** 53)):
+        _why = BT._relaxed_pair_reason(dict(a, params=_bad), dict(b, params=_bad),
+                                       {'a': 3, 'b': 3})
+        assert _why and 'unverifiable params' in _why, (_bad, _why)
     # A paired seed does not imply a matched shared-trunk initialization.
     a4 = dict(a, init_core_fp='aaaa')
     b4 = dict(b, init_core_fp='bbbb')
