@@ -1094,6 +1094,7 @@ def audit_attribution(outdirs=None):
     out = {'status': 'ok', 'panels': {}}
     L = _import_exp_lib()
     import numpy as np
+    _missing_panels = []
     dirs = outdirs or list(_iter_result_dirs())
     for d in dirs:
         summ = _load(os.path.join(d, 'summary.json'))
@@ -1153,7 +1154,16 @@ def audit_attribution(outdirs=None):
                     out.setdefault('blocking_contrasts', {})[f'{a} vs {b}'] = rec
             out['panels'][d] = panel
             if missing:
+                _missing_panels.append(d)
                 out['panels'][d]['note'] = f'no block-stat fields found for {sorted(missing)} — run evals with exp_lib.enable_block_stats(model, True) (or the kernel twin, same collection) before this audit can compare block counts/compression across arms'
+    if _missing_panels and out['status'] == 'ok':
+        # A panel with records but no block statistics cannot support the
+        # block-attribution readout; calling it "ok" would treat an absent
+        # measurement as a passed audit.
+        if len(_missing_panels) == len(out['panels']):
+            out['status'] = 'not_verifiable_locally'
+        else:
+            out['status'] = 'warn'
     if not out['panels'] and out['status'] == 'ok':
         out['status'] = 'not_verifiable_locally'
         out['note'] = 'no results_*/summary.json on this machine — the attribution readout needs the experiment artifacts; the collection hooks are already wired (enable_block_stats / attn._stats per design_notes §14)'

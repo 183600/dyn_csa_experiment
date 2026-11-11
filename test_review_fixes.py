@@ -4064,6 +4064,14 @@ def t_audit_metrics_missing_or_malformed_summary():
         out = A.audit_metrics(outdirs=[d])
         assert out['status'] == 'fail', out
         assert out['problems'], out
+    with tempfile.TemporaryDirectory() as d:
+        # Records without block statistics cannot support a block-attribution
+        # audit; the panel must not be reported as "ok".
+        with open(os.path.join(d, 'summary.json'), 'w', encoding='utf-8') as f:
+            json.dump({'a::s0': {'variant': 'a', 'ppl': 10.0}}, f)
+        out = A.audit_attribution(outdirs=[d])
+        assert out['status'] == 'not_verifiable_locally', out
+        assert out['panels'][d].get('note'), out
 
 
 def t_selection_audit_empty_per_seed_fails():
