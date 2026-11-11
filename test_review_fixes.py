@@ -144,6 +144,16 @@ def t_tost_student_t_and_boundary():
     for boundary in ([0.1] * 6, [-0.1] * 6):
         b = L.tost_paired(boundary, margin=0.1)
         assert b['equivalent'] is False and abs(b['p_tost'] - 0.5) < 1e-12, b
+    # The equivalence decision must follow the requested CI confidence:
+    # 0.90 corresponds to two one-sided alpha=0.05 tests, 0.95 to alpha=0.025.
+    between = [-0.006126797500916851, 0.014617151619714162,
+               -0.013712951262380337, 0.04085417964408369,
+               -0.01058772677371541, 0.029558696798855623]
+    r90 = L.tost_paired(between, margin=0.03, conf=0.90)
+    r95 = L.tost_paired(between, margin=0.03, conf=0.95)
+    assert 0.025 < r90['p_tost'] < 0.05, r90
+    assert r90['equivalent'] is True and r95['equivalent'] is False, (r90, r95)
+    assert abs(r90['equiv_alpha'] - 0.05) < 1e-12 and abs(r95['equiv_alpha'] - 0.025) < 1e-12, (r90, r95)
 
 
 def t_safe_exp_and_doc_ci():

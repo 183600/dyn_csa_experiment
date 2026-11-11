@@ -9635,7 +9635,14 @@ def tost_paired(deltas, margin, conf=0.90):
     out['p_hi'] = float(p_hi)
     out['p_lo'] = float(p_lo)
     out['p_tost'] = float(max(p_hi, p_lo))
-    out['equivalent'] = bool(p_hi < 0.05 and p_lo < 0.05)
+    # TOST decision level and the reported interval must agree.  A two-sided
+    # ``conf`` CI is the (1-conf)/2 one-sided test in each direction (conf=0.90
+    # -> alpha=0.05, the pre-registered G0 rule).  Hard-coding 0.05 made a
+    # caller requesting conf=0.95 report a 95% interval but decide at the 90%
+    # level (and vice versa).
+    equiv_alpha = (1.0 - float(conf)) / 2.0
+    out['equiv_alpha'] = float(equiv_alpha)
+    out['equivalent'] = bool(p_hi < equiv_alpha and p_lo < equiv_alpha)
     out['ci_within_margin'] = bool(out['ci'][0] > -margin and out['ci'][1] < margin)
     return out
 
