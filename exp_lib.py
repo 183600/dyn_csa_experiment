@@ -11938,6 +11938,11 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
             if isinstance(_ppls, dict) and _trial_ppl is not None:
                 _vals = [f for f in (_finite_scalar(v) for v in _ppls.values())
                          if f is not None]
+                if len(_vals) != len(_ppls):
+                    # Dropping a NaN/Inf draw changes which seeds the trial
+                    # was actually selected on; it is a broken measurement,
+                    # not a valid mean over the surviving subset.
+                    problems.append(f'{arm}: trial seed_ppls contains non-finite values')
                 if _vals:
                     _m = float(np.mean(_vals))
                     if abs(_m - _trial_ppl) > 1e-9 * max(1.0, abs(_m)):
@@ -11948,9 +11953,12 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
                         except (TypeError, ValueError, OverflowError):
                             problems.append(f'{arm}: trial ppl_std is not numeric ({t.get("ppl_std")!r})')
                         else:
-                            _s = float(np.std(_vals, ddof=1))
-                            if abs(_s - _reported_sd) > 1e-9 * max(1.0, abs(_s)):
-                                problems.append(f'{arm}: trial ppl_std is not the sample std of its per-seed values')
+                            if not math.isfinite(_reported_sd):
+                                problems.append(f'{arm}: trial ppl_std is not finite ({t.get("ppl_std")!r})')
+                            else:
+                                _s = float(np.std(_vals, ddof=1))
+                                if abs(_s - _reported_sd) > 1e-9 * max(1.0, abs(_s)):
+                                    problems.append(f'{arm}: trial ppl_std is not the sample std of its per-seed values')
         if len(_set) > 1:
             # Trials inside ONE arm must compare the same seed draws.  Equal
             # arm-level sets cannot fix a within-arm mismatch: its selected
