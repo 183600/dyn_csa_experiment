@@ -1712,6 +1712,10 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
         A('')
     comps = ft.get('comparisons') or {}
     if comps:
+        try:
+            _alpha = float(((ft.get('manifest') or {}).get('statistics') or {}).get('alpha', 0.05))
+        except (TypeError, ValueError, OverflowError):
+            _alpha = 0.05
         A('| 冻结主比较（test split，配对） | n | 覆盖完整 | 参数匹配 | Δ mean±std | 文档 Δ 95% CI | d_z | p (exact) | p 下限 | Holm p | Holm 拒绝 | 方向符合 |')
         A('|---|---|---|---|---|---|---|---|---|---|---|---|')
         holm = ft.get('holm') or {}
@@ -1721,7 +1725,7 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
                 continue
             _h = holm.get(k) or {}
             _hp = f'{_h.get("p_holm", float("nan")):.3f}' if _h.get('p_holm') is not None else '—'
-            _hr = '✔' if (_h.get('p_holm') is not None and float(_h['p_holm']) < 0.05) else '✘'
+            _hr = '✔' if (_h.get('p_holm') is not None and float(_h['p_holm']) < _alpha) else '✘'
             _dir = v.get('direction_ok')
             _ds = '—（非方向性）' if _dir is None else ('✔' if _dir else '✘')
             _dsm = v.get('doc_sampling') or {}
@@ -1735,14 +1739,14 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
         if _conf:
             A(f'**确认结果**：{len(_conf)}/{len(comps)} 个冻结主比较在 Holm 校正后成立**且方向符合预注册**（{sorted(_conf)}）——这是预注册规则下的确认性证据。')
         else:
-            A('**确认结果**：没有冻结主比较同时满足「Holm 校正后 p < 0.05」与「方向符合预注册」。按预注册的决策规则，相应主张**不获确认**；探索性面板的正向读数保持「探索性」标签，不得写成结论。')
+            A(f'**确认结果**：没有冻结主比较同时满足「Holm 校正后 p < {_alpha:g}」与「方向符合预注册」。按预注册的决策规则，相应主张**不获确认**；探索性面板的正向读数保持「探索性」标签，不得写成结论。')
         _nd = ft.get('significant_nondirectional') or []
         if _nd:
             A('')
-            A(f'**非方向性机制读数**：{sorted(_nd)} 在 Holm 校正后达到 p<0.05，但冻结清单未给方向（expected_sign=null），只能作为机制读数，不能计入「方向符合预注册」的确认集合。')
+            A(f'**非方向性机制读数**：{sorted(_nd)} 在 Holm 校正后达到 p<{_alpha:g}，但冻结清单未给方向（expected_sign=null），只能作为机制读数，不能计入「方向符合预注册」的确认集合。')
         if ft.get('min_attainable_p_holm') is not None:
             A('')
-            A(f"（诊断：n 个种子与 m 元 Holm 族下，最小可达 Holm p = {ft['min_attainable_p_holm']:.4f}。加载期功效门槛已拒绝「数学上不可能确认」的清单；若此处仍 > 0.05，说明有绕过门槛的旧状态，需回查清单与记录的来源。）")
+            A(f"（诊断：n 个种子与 m 元 Holm 族下，最小可达 Holm p = {ft['min_attainable_p_holm']:.4f}。加载期功效门槛已拒绝「数学上不可能确认」的清单；若此处仍 > {_alpha:g}，说明有绕过门槛的旧状态，需回查清单与记录的来源。）")
         _dsn = ft.get('doc_sampling_note')
         if _dsn:
             A('')
