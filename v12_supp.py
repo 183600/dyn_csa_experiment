@@ -993,9 +993,9 @@ def run_finaltest(cfg=None, guard=None):
     `.freeze_lock.json`（manifest sha256 + test 切片指纹）；此后清单或
     test 数据变更都会被拒绝（V12_REFREEZE=1 显式改冻结并降级前轮）。"""
     cfg = dict(FINALTEST_CFG) if cfg is None else dict(cfg)
-    # `phase P5T` performs this zero-GPU preflight, but the direct
-    # `finaltest` CLI mode used to skip it and could burn the one-shot test
-    # access on a plan that plan_check would reject.  Smoke runs use injected
+    # `phase P5T` performs this zero-GPU preflight; the direct
+    # `finaltest` CLI mode must run it before any test access so a plan that
+    # plan_check would reject cannot consume the one-shot test.  Smoke runs use injected
     # data and are not the frozen confirmation, so they skip it.
     if not _PLAN_DONE and not bool(cfg.get('smoke')):
         plan_check(cfg.get('manifest') or FREEZE_MANIFEST)
@@ -1698,7 +1698,7 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
     # The pre-registered decision rule (manifest v3) requires p_holm < alpha
     # AND the observed direction AND parameter matching AND at least
     # `min_seeds_for_confirmation` complete pairs.  `coverage_ok` (all 12
-    # seeds) is reported but is no longer an all-or-nothing veto: one failed
+    # seeds) is reported but is not an all-or-nothing veto: one failed
     # L4096 cell may not annihilate an otherwise complete comparison.
     _conf = [k for k in _rej if stats['comparisons'].get(k, {}).get('direction_ok') is True
              and stats['comparisons'].get(k, {}).get('param_matched') is True
@@ -2005,8 +2005,8 @@ def _plan_recipe(manifest, arm, mr):
 def plan_check(manifest_path=FREEZE_MANIFEST):
     """Zero-GPU pre-flight for the frozen confirmation plan.
 
-    A stamp-only fix would turn P5T from "fails fast" into "burns the
-    one-shot test access, then admits 0/48 records".  This check closes that
+    A plan that only updates the stamp would let P5T burn the
+    one-shot test access, then admit 0/48 records.  This check closes that
     hole WITHOUT reading test data: it derives the implementation descriptor
     from the same
     `make_layer_cfgs` + `_uses_batched_eager` code the trainer uses, builds

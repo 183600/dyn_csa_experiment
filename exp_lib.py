@@ -4242,7 +4242,7 @@ class AttnCfg:
     # positions are handled by `pool_position_policy` (currently `truncate`).
     pool_position_capacity: int = 129
     pool_position_policy: str = 'truncate'
-    # Open-block reading rule.  `closed` is the historical behaviour: only
+    # Open-block reading rule.  `closed` is the default: only
     # blocks whose end is strictly before the query are readable.  The two
     # prefix modes add a causal representation of the current (still open)
     # block to the candidate set without changing the dynamic cut table.
@@ -8635,8 +8635,8 @@ def pair_reason(ra, rb):
     # newer records.  Compare them explicitly (the descriptor above already
     # covers records that carry it) so an fp32-vs-bf16 or row-loop-vs-batched
     # pair cannot be treated as controlled even if some future caller omits
-    # the full descriptor.  Legacy records (neither key present) keep the
-    # historical permissive path; a one-sided key is unverifiable.
+    # the full descriptor.  Records with neither key present keep the
+    # permissive path; a one-sided key is unverifiable.
     for _k in ('amp_dtype', 'amp_grad_scaler', 'eager_batch'):
         _pa, _pb = (_k in ra), (_k in rb)
         if _pa != _pb:
@@ -8740,7 +8740,7 @@ def by_len_cells(rows, Ln, variant=None):
     keys = (Ln, int(Ln), str(int(Ln)))
     # Length-panel rows must all come from one validation slice: PPL@L is only
     # comparable when the underlying corpus is the same.  Records without a
-    # fingerprint keep the historical permissive path; a mixed fingerprint set
+    # fingerprint keep the permissive path; a mixed fingerprint set
     # raises instead of silently averaging two slices.
     assert_shared_validation_fp([r for r in rows if isinstance(r, dict)],
                                 context=f'by_len_cells(L={Ln})')

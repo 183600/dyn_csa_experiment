@@ -480,7 +480,7 @@ def t_signflip_saddlepoint_large_n():
     assert nr['method'].startswith('saddlepoint') and 0.0 < nr['p'] < 1.0, nr
     brn = BR.exact_signflip(near)
     assert abs(brn['p_exact_signflip'] - nr['p']) < 1e-12, (brn, nr)
-    # The confirmation driver delegates to exp_lib, so it inherits the fix.
+    # The confirmation driver delegates to exp_lib, so it inherits the same behaviour.
     v = V7.exact_sign_permutation(list(rng.normal(0.2, 1.0, size=50)))
     assert v['method'].startswith('saddlepoint'), v
     assert 'saddlepoint' in v['test'], v
@@ -3197,7 +3197,7 @@ def t_preprocessor_train_only():
 def t_preprocessor_fill_is_consistent():
     # A requested imputation constant outside the training quantiles must be
     # applied identically in fit and transform.  If fit clips it but transform
-    # does not, the fitted scale no longer centres its own training matrix.
+    # does not, the fitted scale does not centre its own training matrix.
     X = np.array([[10.0], [11.0], [12.0], [np.nan]])
     prep = L.LeakageSafePreprocessor(scale='standard', missing=0.0,
                                      clip_quantiles=(0.1, 0.9))
@@ -3255,7 +3255,7 @@ def t_categorical_shift_empty_reference():
     assert r['n_reference'] == 0 and r['n_holdout'] == 3, r
     assert r['unseen_rate'] == 1.0 and r['total_variation'] > 0.0, r
     # Composite (tuple/list) categories are single identities; reshape(-1)
-    # used to split them into scalar categories and corrupt every frequency.
+    # would split them into scalar categories and corrupt every frequency.
     for ref in ([('a', 1), ('b', 2)], [['a', 1], ['b', 2]],
                 np.array([('a', 1), ('b', 2)], dtype=object)):
         r = L.categorical_shift_report(ref, [('a', 1)])

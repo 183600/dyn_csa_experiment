@@ -271,7 +271,7 @@ def t_candidate_masks():
     valid = torch.zeros(T, C, dtype=torch.bool)
     for t in range(T):
         valid[t, :min(C, t + 2)] = True
-    # make every invalid column hugely attractive: a mask bug would select it
+    # make every invalid column hugely attractive: any mask error would select it
     scores = scores.masked_fill(~valid, 1e6)
     idx = L._indexer_selection(scores, valid, k)
     box = []
