@@ -2802,6 +2802,11 @@ def t_audit_leakage_handles_flat_train_cache():
         overlap = out['checks'].get('doc_overlap')
         assert isinstance(overlap, dict), overlap
         assert overlap['shared_shingles'] > 0, overlap
+        # No test doc-id sidecar means document isolation is unverifiable; the
+        # top-level status must not claim a clean "ok" (this cache also fails
+        # on overlap, so accept either non-ok status).
+        assert out['status'] in ('warnings', 'fail'), out
+        assert out['checks']['document_isolation']['status'] == 'not_verified', out
         # A legacy/malformed meta without a numeric vocab must fail closed, not
         # crash with int(None) before the audit can report anything.
         with open(os.path.join(cache, 'meta_v4_x.json'), 'w', encoding='utf-8') as f:

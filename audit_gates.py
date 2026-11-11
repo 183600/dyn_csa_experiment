@@ -296,6 +296,12 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
             'status': 'not_verified',
             'note': 'legacy test cache without test_doc_ids; rebuild it to prove train/val/test document-group isolation',
         }
+        # An unverifiable isolation claim must not be reported as a clean
+        # "ok" audit: a consumer that only reads the top-level status would
+        # otherwise treat it as proof of document isolation.
+        if out['status'] == 'ok':
+            out['status'] = 'warnings'
+        out.setdefault('note', 'document-group isolation is not verified (legacy test cache without test_doc_ids)')
     # d) document overlap via deterministic SLIDING shingles on the cached id
     # matrices.  A fixed polynomial rolling hash over every window, uniform
     # segments across the full train stream, and an explicit scanned fraction
@@ -428,6 +434,8 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
                                'analysis is reported).')
         else:
             out['checks']['doc_overlap'] = 'npy caches absent'
+            if out['status'] == 'ok':
+                out['status'] = 'warnings'
     except Exception as e:
         out['checks']['doc_overlap'] = f'failed ({type(e).__name__}: {e})'
     print(json.dumps(out, ensure_ascii=False, indent=2))
