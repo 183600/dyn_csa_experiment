@@ -708,6 +708,10 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                 rec['status'] = 'fail'
                 _fail(f'{cd}/{tag}: cache metadata records document ids but the '
                       'sidecar files are missing')
+            else:
+                rec['document_isolation'] = 'not_verified (legacy cache has no document-id sidecars)'
+                _warn(f'{cd}/{tag}: cache has no document-id sidecars; '
+                      'whole-document group isolation cannot be verified')
 
             # Exact duplicate rows across train/val/test.  This is row-level
             # leakage regardless of how the split was generated.
