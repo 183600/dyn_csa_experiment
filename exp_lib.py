@@ -10816,6 +10816,11 @@ def crossover_scaling_fit(entries, *, min_points=4, volume_tol=0.25,
         dur = e.get('d')
         tok = e.get('crossover_tokens')
         tr = e.get('train_tokens')
+        # Booleans are flags, not measured widths/token counts.  float(True)
+        # would otherwise become d=1 or a one-token training volume and enter
+        # the fit as a real point.
+        if any(isinstance(_x, (bool, np.bool_)) for _x in (dur, tok, tr) if _x is not None):
+            continue
         try:
             fd = float(dur)
             ftok = float(tok) if tok is not None else None

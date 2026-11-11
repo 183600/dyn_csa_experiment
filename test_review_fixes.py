@@ -4376,6 +4376,13 @@ def t_crossover_scaling_refusals():
     dup = pts(4) + [{'label': 'd512_half', 'd': 512, 'crossover_tokens': 40e6, 'train_tokens': 25e6}]
     f = L.crossover_scaling_fit(dup)
     assert f['status'] == 'ok' and 'd512_half' in (f.get('deduped_by_d') or []), f
+    # Boolean flags are not widths/volumes; they are excluded rather than
+    # becoming d=1 / one-token points.
+    for _field in ('d', 'crossover_tokens', 'train_tokens'):
+        _bad = pts(4)
+        _bad[0] = dict(_bad[0], **{_field: True})
+        f = L.crossover_scaling_fit(_bad)
+        assert f['status'] == 'insufficient_points', (_field, f)
     # A clean 4-point fit carries a slope CI and is labelled descriptive.
     f = L.crossover_scaling_fit(pts(4))
     assert f['status'] == 'ok' and f.get('slope') is not None and f.get('ci') is not None, f
