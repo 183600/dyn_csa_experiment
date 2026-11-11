@@ -2283,6 +2283,8 @@ def t_atomic_torch_save():
         V7._atomic_torch_save({'a': torch.arange(4)}, p)
         got = torch.load(p, weights_only=False)
         assert got['a'].numel() == 4, 'the atomic replace did not publish the new checkpoint'
+        # Distinct cell keys must not share a curve sidecar filename.
+        assert L._curve_sidecar_rel('a#1::seed0') != L._curve_sidecar_rel('a@1::seed0')
     finally:
         shutil.rmtree(d, ignore_errors=True)
 

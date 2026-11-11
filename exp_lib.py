@@ -15984,8 +15984,13 @@ _CURVE_SIDECAR_INLINE_PPL = 4096
 
 
 def _curve_sidecar_rel(key):
+    # The readable prefix is for humans; the digest makes the mapping
+    # injective.  Replacing every unsafe character with '_' alone collided
+    # (a#1 and a@1 both became a_1), letting one cell overwrite another's
+    # curves.
     safe = ''.join(ch if (ch.isalnum() or ch in '._:-') else '_' for ch in str(key))
-    return f'curves/{safe}.json'
+    digest = hashlib.sha1(str(key).encode('utf-8')).hexdigest()[:16]
+    return f'curves/{safe}-{digest}.json'
 
 
 def _write_cell_curve(outdir, key, rec):
