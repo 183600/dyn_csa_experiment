@@ -1521,11 +1521,17 @@ def _sig_gate(st, alpha=0.05, min_n=6, label=None, family=None, register=True):
     try:
         if int(n) < int(min_n):
             return False
-        if p is None or not (float(p) < alpha):
+        pf, phf = (float(p) if p is not None else None), (float(ph) if ph is not None else None)
+        if pf is None or not (math.isfinite(pf) and 0.0 <= pf <= 1.0 and pf < alpha):
             return False
-        if ph is None or not (float(ph) < alpha):
+        if phf is None or not (math.isfinite(phf) and 0.0 <= phf <= 1.0 and phf < alpha):
             return False
-        if mean is None or std is None or abs(float(mean)) <= float(std):
+        if mean is None or std is None:
+            return False
+        mf, sf = float(mean), float(std)
+        if not (math.isfinite(mf) and math.isfinite(sf) and sf >= 0.0):
+            return False
+        if abs(mf) <= sf:
             return False
     except (TypeError, ValueError, OverflowError):
         return False
@@ -1810,10 +1816,15 @@ def sec_stats():
         _pv = None
         if isinstance(v, dict) and 'omitted' not in v:
             _pv = v.get('p_exact_signflip') if v.get('p_exact_signflip') is not None else v.get('p')
-            try:
-                _pv = float(_pv)
-            except (TypeError, ValueError, OverflowError):
+            if isinstance(_pv, (bool, np.bool_)):
+                # Booleans are flags; float(False)==0.0 would enter Holm as
+                # the strongest possible p while the display shows n/a.
                 _pv = None
+            else:
+                try:
+                    _pv = float(_pv)
+                except (TypeError, ValueError, OverflowError):
+                    _pv = None
         # Omitted/invalid comparisons keep a dummy p=1 slot so a report cannot
         # shrink its own correction family by dropping a failed comparison.
         _pairs.append((k, _pv if (_pv is not None and math.isfinite(_pv) and 0.0 <= _pv <= 1.0) else 1.0))

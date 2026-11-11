@@ -1616,6 +1616,20 @@ def t_review3_evidence_metadata():
     assert BR._sig_gate({'n': 6, 'p_exact_signflip': 0.01, 'p_holm': 0.02, 'mean': 1.0, 'std': 0.5}) is True
     assert BR._sig_gate({'n': 3, 'p_exact_signflip': 0.01, 'p_holm': 0.02, 'mean': 1.0, 'std': 0.5}) is False
     assert BR._sig_gate({'n': 6, 'p_exact_signflip': 0.01, 'p_holm': None, 'mean': 1.0, 'std': 0.5}) is False
+    base = {'n': 6, 'p_exact_signflip': 0.01, 'p_holm': 0.02, 'mean': 1.0, 'std': 0.5}
+    assert BR._sig_gate(dict(base, std=float('nan')), register=False) is False
+    assert BR._sig_gate(dict(base, std=-1.0), register=False) is False
+    assert BR._sig_gate(dict(base, mean=float('inf')), register=False) is False
+    assert BR._sig_gate(dict(base, p_exact_signflip=-0.1), register=False) is False
+    # A boolean p must not be converted to 0.0 before the report's correction.
+    old_load = BR.load
+    try:
+        BR.load = lambda *a, **k: {'comparisons': {'flag': {'mean': 1.0,
+                                                           'p_exact_signflip': False}}}
+        txt = BR.sec_stats()
+    finally:
+        BR.load = old_load
+    assert '| flag | 1.00 | n/a | 1.0000 |' in txt, txt
 
 def t_review3_pooled_aggregate():
     summary = {}
