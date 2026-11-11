@@ -1722,6 +1722,15 @@ def t_review3_pooled_aggregate():
     assert e['ppl_primary'] == e['ppl_pooled']
     assert e['ppl_mean_arithmetic'] != e['ppl_pooled'] or True
 
+def t_pooled_ppl_rejects_malformed_counts():
+    assert L._pooled_ppl_from_records([{'nll_sum': 10.0, 'n_tokens': 4.4},
+                                       {'nll_sum': 10.0, 'n_tokens': 4.4}]) == (None, None, None)
+    assert L._pooled_ppl_from_records([{'nll_sum': -4.0, 'n_tokens': 10},
+                                       {'nll_sum': -4.0, 'n_tokens': 10}]) == (None, None, None)
+    ppl, nll, nt = L._pooled_ppl_from_records([{'nll_sum': 4.0, 'n_tokens': 10}])
+    assert abs(ppl - math.exp(0.4)) < 1e-12 and (nll, nt) == (4.0, 10), (ppl, nll, nt)
+
+
 def t_combined_seed_doc_uncertainty():
     # Two-level (seed x document) combined interval: the seed-level t CI and
     # the doc-level bootstrap each see only ONE variance source; the
@@ -5472,6 +5481,7 @@ def main():
     _check('D1 eval per-seq ppl', t_eval_per_seq)
     _check('J1 evidence metadata + significance gate', t_review3_evidence_metadata)
     _check('J2 pooled aggregation', t_review3_pooled_aggregate)
+    _check('J2b pooled PPL rejects malformed counts', t_pooled_ppl_rejects_malformed_counts)
     _check('J3 Holm declared-family slots', t_review3_holm_family_size)
     _check('J4 task-boundary arm + objective descriptor', t_review3_boundary_arm_and_objective)
     _check('J5 span clean-baseline key', t_review3_span_clean_key)

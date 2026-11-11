@@ -18673,8 +18673,11 @@ def _pooled_ppl_from_records(recs):
     `nll_sum`/`n_tokens` cannot be pooled and fall back explicitly."""
     nlls, nts = [], []
     for r in recs:
-        nll, nt = _finite_scalar(r.get('nll_sum')), _finite_scalar(r.get('n_tokens'))
-        if nll is None or nt is None or nt <= 0:
+        nll = _finite_scalar(r.get('nll_sum'))
+        # Token counts are exact positive integers: int(4.9) would change
+        # the pooled denominator without changing the reported n_tokens.
+        nt = _as_seed_int(r.get('n_tokens'))
+        if nll is None or nt is None or nt <= 0 or nll < 0.0:
             return None, None, None
         nlls.append(nll)
         nts.append(nt)
