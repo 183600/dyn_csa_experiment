@@ -8852,21 +8852,31 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
         out['reasons'].append(f'n={n} < min_n={int(min_n)}: the exact-test p floor is {out["p_floor"]:.3g} > alpha' if out['p_floor'] is not None else f'n={n} < min_n={int(min_n)}')
     elif out['p_floor'] is not None and math.isfinite(out['p_floor']) and out['p_floor'] > alpha:
         out['reasons'].append(f'p floor {out["p_floor"]:.3g} > alpha={alpha}: resolution ceiling, not a null result')
-    try:
-        if out['p_raw'] is None or not (out['p_raw'] < alpha):
-            out['reasons'].append(f'raw p {out["p_raw"]!r} is not < alpha={alpha}')
-    except TypeError:
-        out['reasons'].append('raw p is not comparable')
+    _praw = out['p_raw']
+    if _praw is None:
+        out['reasons'].append(f'raw p {_praw!r} is not a probability')
+    elif not (math.isfinite(_praw) and 0.0 <= _praw <= 1.0):
+        out['reasons'].append(f'raw p {_praw!r} is not a probability in [0,1]')
+    elif not (_praw < alpha):
+        out['reasons'].append(f'raw p {_praw:.3g} is not < alpha={alpha}')
     if require_holm:
-        if out['p_holm'] is None:
+        _ph = out['p_holm']
+        if _ph is None:
             out['reasons'].append('no Holm-corrected p (family correction not attached)')
-        elif not (out['p_holm'] < alpha):
-            out['reasons'].append(f'Holm p {out["p_holm"]:.3g} is not < alpha={alpha}')
+        elif not (math.isfinite(_ph) and 0.0 <= _ph <= 1.0):
+            out['reasons'].append(f'Holm p {_ph!r} is not a probability in [0,1]')
+        elif not (_ph < alpha):
+            out['reasons'].append(f'Holm p {_ph:.3g} is not < alpha={alpha}')
     try:
-        if mean is None or std is None or not (abs(float(mean)) > float(std)):
-            out['reasons'].append('|mean| <= std: effect is within seed noise')
+        _mean_f = float(mean)
+        _std_f = float(std)
     except (TypeError, ValueError, OverflowError):
         out['reasons'].append('mean/std are not numeric')
+    else:
+        if not (math.isfinite(_mean_f) and math.isfinite(_std_f) and _std_f >= 0.0):
+            out['reasons'].append('mean/std are not finite non-negative measurements')
+        elif not (abs(_mean_f) > _std_f):
+            out['reasons'].append('|mean| <= std: effect is within seed noise')
     # Leave-one-seed-out instability is a direct contradiction of a stable
     # directional effect: dropping one seed must not flip the sign.  Only
     # enforced when the caller supplied the diagnostic (old stats dicts do not
