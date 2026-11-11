@@ -10576,6 +10576,11 @@ def loglog_regression(points, *, alpha=0.05):
     return out
 
 
+def _mean_not_crossed(v):
+    """True only for a real boolean false (including numpy.bool_)."""
+    return isinstance(v, (bool, np.bool_)) and not bool(v)
+
+
 def crossover_scaling_fit(entries, *, min_points=4, volume_tol=0.25,
                           d_spread_min=1.2):
     """Fit log10(crossover tokens) ~ log10(d_model) only when the points can
@@ -10635,7 +10640,7 @@ def crossover_scaling_fit(entries, *, min_points=4, volume_tol=0.25,
         rows.append({'label': str(label), 'd': fd,
                      'crossover_tokens': (ftok if ftok is not None and math.isfinite(ftok) and ftok > 0.0 else None),
                      'train_tokens': (ftr if ftr is not None and math.isfinite(ftr) and ftr > 0.0 else None),
-                     'censored': bool(e.get('censored') or e.get('mean_crossed') is False)})
+                     'censored': bool(e.get('censored')) or _mean_not_crossed(e.get('mean_crossed'))})
     out = {'status': 'insufficient_points', 'n_input': len(rows),
            'claim_level': 'descriptive', 'min_points': int(min_points),
            'volume_tolerance': float(volume_tol), 'points': [], 'excluded': [],
