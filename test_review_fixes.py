@@ -3569,6 +3569,15 @@ def t_audit_split_test_metadata_discipline():
         assert rec.get('test_tag') == ttag, rec
         assert rec.get('test_shuffle_at_split') is False, rec
         assert rec['status'] != 'fail', rec
+        # Malformed metadata must fail the audit, not crash int().
+        with open(os.path.join(d, f'test_meta_{ttag}.json'), 'w', encoding='utf-8') as f:
+            json.dump(dict(good_test, vocab='abc'), f)
+        out = A.audit_split_discipline(cache_dirs=[d], min_shift_tokens=1)
+        rec = out['caches'][os.path.abspath(d)]['corpora'][tag]
+        assert rec['status'] == 'fail', rec
+        assert any('non-integer vocab' in w for w in out['warnings']), out
+        with open(os.path.join(d, f'test_meta_{ttag}.json'), 'w', encoding='utf-8') as f:
+            json.dump(good_test, f)
         bad_test = dict(good_test, shuffle_at_split=True,
                         tokenizer_fit_split='test',
                         near_duplicate_cleanup={'policy': 'none'})

@@ -778,8 +778,18 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                 # can use a longer evaluation window).  Pair on tokenizer/vocab
                 # provenance; the row-overlap checks accept different shapes,
                 # and >1 matching candidate is reported as ambiguous.
-                if meta.get('vocab') is not None and _tm.get('vocab') is not None and int(_tm['vocab']) != int(meta['vocab']):
-                    continue
+                if meta.get('vocab') is not None and _tm.get('vocab') is not None:
+                    try:
+                        _same_vocab = int(_tm['vocab']) == int(meta['vocab'])
+                    except (TypeError, ValueError, OverflowError):
+                        # A malformed vocab cannot be paired; fail the cache
+                        # instead of letting int() abort the whole report.
+                        rec['status'] = 'fail'
+                        _fail(f'{cd}/{tag}: cache metadata has a non-integer vocab '
+                              f'(train={meta.get("vocab")!r}, test={_tm.get("vocab")!r})')
+                        continue
+                    if not _same_vocab:
+                        continue
                 if meta.get('fit_fp') and _tm.get('fit_fp') and meta['fit_fp'] != _tm['fit_fp']:
                     continue
                 _cands.append((_tfp, _ttag, _tm))
