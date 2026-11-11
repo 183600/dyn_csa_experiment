@@ -107,7 +107,13 @@ def t_config_and_segmenter():
     for kwargs in ({'open_block_mode': 'prefix_summary', 'kind': 'full'},
                    {'open_block_mode': 'nope'},
                    {'pool_position_capacity': 0},
-                   {'max_block': 1, 'min_block': 2}):
+                   {'max_block': 1, 'min_block': 2},
+                   {'min_block': True},
+                   {'block_size': 1.5},
+                   {'sliding_window': True},
+                   {'index_topk': 2.5},
+                   {'pool_position_capacity': True},
+                   {'max_block': True}):
         try:
             L.AttnCfg(**kwargs)
         except ValueError:

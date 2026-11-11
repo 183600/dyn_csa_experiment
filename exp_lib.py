@@ -4263,33 +4263,42 @@ class AttnCfg:
             raise ValueError(f'unknown selection_budget {self.selection_budget!r}; expected one of {SELECTION_BUDGETS}')
         if self.pool_position_policy not in POOL_POSITION_POLICIES:
             raise ValueError(f'unknown pool_position_policy {self.pool_position_policy!r}; expected one of {POOL_POSITION_POLICIES}')
-        if int(self.pool_position_capacity) < 1:
-            raise ValueError(f'pool_position_capacity must be >= 1, got {self.pool_position_capacity!r}')
+
+        def _cfg_int(label, value, minimum):
+            # Structural counts are exact integers: booleans and fractional
+            # values must not be silently truncated into a different config.
+            if isinstance(value, (bool, np.bool_)):
+                raise ValueError(f'{label} must be an integer, got {value!r}')
+            if isinstance(value, numbers.Integral):
+                out = int(value)
+            elif isinstance(value, numbers.Real):
+                f = float(value)
+                if not math.isfinite(f) or f != math.floor(f):
+                    raise ValueError(f'{label} must be an integer, got {value!r}')
+                out = int(f)
+            else:
+                raise ValueError(f'{label} must be an integer, got {value!r}')
+            if out < int(minimum):
+                raise ValueError(f'{label} must be >= {minimum}, got {value!r}')
+            return out
+
+        _cfg_int('pool_position_capacity', self.pool_position_capacity, 1)
         # Non-negative/positive structural bounds.  A negative window or
         # overlap is not a meaningful configuration; reject it here rather
         # than failing later inside torch.arange/index maths.
-        if int(self.min_block) < 1:
-            raise ValueError(f'min_block must be >= 1, got {self.min_block!r}')
-        if int(self.block_size) < 1:
-            raise ValueError(f'block_size must be >= 1, got {self.block_size!r}')
-        if int(self.target_block_tokens) < 1:
-            raise ValueError(f'target_block_tokens must be >= 1, got {self.target_block_tokens!r}')
-        if int(self.overlap) < 0:
-            raise ValueError(f'overlap must be >= 0, got {self.overlap!r}')
-        if int(self.sliding_window) < 0:
-            raise ValueError(f'sliding_window must be >= 0, got {self.sliding_window!r}')
-        if int(self.window) < 0:
-            raise ValueError(f'window must be >= 0, got {self.window!r}')
-        if int(self.index_topk) < 0:
-            raise ValueError(f'index_topk must be >= 0, got {self.index_topk!r}')
-        if int(self.c_kv) < 0 or int(self.c_index) < 0:
-            raise ValueError(f'c_kv/c_index must be >= 0, got {self.c_kv!r}/{self.c_index!r}')
-        if int(self.n_index_heads) < 1:
-            raise ValueError(f'n_index_heads must be >= 1, got {self.n_index_heads!r}')
+        min_block = _cfg_int('min_block', self.min_block, 1)
+        _cfg_int('block_size', self.block_size, 1)
+        _cfg_int('target_block_tokens', self.target_block_tokens, 1)
+        _cfg_int('overlap', self.overlap, 0)
+        _cfg_int('sliding_window', self.sliding_window, 0)
+        _cfg_int('window', self.window, 0)
+        _cfg_int('index_topk', self.index_topk, 0)
+        _cfg_int('c_kv', self.c_kv, 0)
+        _cfg_int('c_index', self.c_index, 0)
+        _cfg_int('n_index_heads', self.n_index_heads, 1)
         if self.max_block is not None:
-            if int(self.max_block) < 1:
-                raise ValueError(f'max_block must be None or >= 1, got {self.max_block!r}')
-            if int(self.max_block) < int(self.min_block):
+            max_block = _cfg_int('max_block', self.max_block, 1)
+            if max_block < min_block:
                 raise ValueError(f'max_block={self.max_block} is smaller than min_block={self.min_block}')
         if self.open_block_mode != 'closed':
             if self.kind not in ('csa', 'hca'):
