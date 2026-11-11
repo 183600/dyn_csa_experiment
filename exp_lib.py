@@ -6408,13 +6408,25 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
             except Exception as _te:
                 _problems.append(f'test tokenizer file unreadable ({type(_te).__name__}: {_te})')
         _tok_sha_meta = meta.get('tokenizer_file_sha256')
+        _train_toks = sorted(_glob2.glob(os.path.join(cache_dir, 'tok_v5_*.json')))
         if _tok_sha_meta:
             if _tok_sha_now is None:
                 _problems.append('test meta binds a tokenizer file that is missing')
             elif _tok_sha_now != _tok_sha_meta:
                 raise RuntimeError(f'load_wikitest: the cached test tokenizer bytes (sha256 {_tok_sha_now[:16]}…) do not match the identity recorded in test meta ({str(_tok_sha_meta)[:16]}…) — the test cache and its tokenizer are not a matched pair; delete the test cache and rebuild it')
+            if _tok_sha_now is not None and _train_toks:
+                # A test tokenizer can match its own metadata and still differ
+                # from the tokenizer that defines the train id space.  Compare
+                # the full id->token maps, not just fit text or file bytes.
+                try:
+                    from tokenizers import Tokenizer as _Tok
+                    _tv = dict(_Tok.from_file(tk_path).get_vocab())
+                    _trv = dict(_Tok.from_file(_train_toks[0]).get_vocab())
+                except Exception as _te:
+                    raise RuntimeError(f'load_wikitest: could not compare the test tokenizer with the train tokenizer ({type(_te).__name__}: {_te}); rebuild the test cache') from _te
+                if _tv != _trv:
+                    raise RuntimeError('load_wikitest: the test tokenizer vocabulary is not identical to the train tokenizer vocabulary — the id spaces cannot be paired; delete the test cache and rebuild it')
         else:
-            _train_toks = sorted(_glob2.glob(os.path.join(cache_dir, 'tok_v5_*.json')))
             if _tok_sha_now is None or not _train_toks:
                 raise RuntimeError('load_wikitest: this is a legacy test cache without a tokenizer identity and without a matched train tokenizer file; refusing to serve an unpaired id space — rebuild the test cache with the current loader')
             try:
