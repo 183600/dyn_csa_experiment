@@ -1183,7 +1183,11 @@ def audit_length(bylen_path='results_lm_test/bylen.json'):
     for key, r in raw.items():
         if not isinstance(r, dict):
             continue
-        for k, c in (r.get('by_len') or {}).items():
+        _cells = r.get('by_len')
+        if _cells is not None and not isinstance(_cells, dict):
+            problems.append(f'{key}: by_len is not an object — the per-length cells cannot be audited')
+            continue
+        for k, c in (_cells or {}).items():
             if isinstance(k, (bool, np.bool_)):
                 problems.append(f'{key}: by_len key {k!r} is not an integer length')
                 continue
@@ -1194,16 +1198,27 @@ def audit_length(bylen_path='results_lm_test/bylen.json'):
             if not isinstance(c, dict):
                 continue
             e = by_len.setdefault(Ln, {'n_tok': set(), 'eval_span': set(), 'truncated': set(), 'n_seq': set()})
-            e['n_tok'].add(c.get('n_tok'))
-            e['eval_span'].add(c.get('eval_span'))
-            e['truncated'].add(c.get('truncated'))
+
+            def _add_cell(field, value):
+                try:
+                    e[field].add(value)
+                except TypeError:
+                    # A list/dict is not a measurement; keep the audit running
+                    # and record the malformed cell instead of aborting with
+                    # an unhashable-type error.
+                    e[field].add(repr(value))
+                    problems.append(f'{key}: L{Ln} {field} is not a scalar value ({type(value).__name__})')
+
+            _add_cell('n_tok', c.get('n_tok'))
+            _add_cell('eval_span', c.get('eval_span'))
+            _add_cell('truncated', c.get('truncated'))
             _nseq_cell = None
             if isinstance(c.get('ppl_per_seq'), list):
                 _nseq_cell = len(c['ppl_per_seq'])
-                e['n_seq'].add(_nseq_cell)
+                _add_cell('n_seq', _nseq_cell)
             elif c.get('n_seq') is not None:
                 _nseq_cell = c.get('n_seq')
-                e['n_seq'].add(_nseq_cell)
+                _add_cell('n_seq', _nseq_cell)
             else:
                 # Keep the absence in the same set as the observed counts so
                 # one record with n_seq cannot mask another record without it.

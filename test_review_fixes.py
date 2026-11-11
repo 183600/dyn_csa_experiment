@@ -3645,6 +3645,24 @@ def t_audit_length_requires_eval_span():
         assert out['by_length']['512']['same_scored_targets_across_records'] is False, out
 
 
+def t_audit_length_malformed_cells_do_not_crash():
+    td = tempfile.mkdtemp(prefix='len_', dir=REPO)
+    try:
+        p = os.path.join(td, 'bylen.json')
+        with open(p, 'w', encoding='utf-8') as f:
+            json.dump({'a::s0': {'by_len': [1, 2, 3]}}, f)
+        r = A.audit_length(p)
+        assert r['status'] == 'fail' and any('by_len is not an object' in x for x in r['problems']), r
+        with open(p, 'w', encoding='utf-8') as f:
+            json.dump({'a::s0': {'by_len': {'4096': {
+                'n_tok': [1, 2], 'eval_span': 4095, 'n_seq': 16,
+                'truncated': False}}}}, f)
+        r2 = A.audit_length(p)
+        assert r2['status'] == 'fail' and any('n_tok is not a scalar' in x for x in r2['problems']), r2
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+
 def t_audit_fairness_nan_seed_does_not_crash():
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, 'summary.json')
@@ -4677,6 +4695,7 @@ def main():
     _check('L9 evidence-release readiness audit', t_release_readiness_audit)
     _check('L10 selection-attribution contract', t_selection_attribution_contract)
     _check('L10b corpus-audit memo cannot bypass the strict gate', t_corpus_audit_memo_does_not_bypass_strict_gate)
+    _check('L10c length audit rejects malformed cell objects', t_audit_length_malformed_cells_do_not_crash)
     _check('L11 length audit fails closed on missing truncation flag', t_audit_length_missing_truncated_flag)
     _check('L12 length audit fails closed on missing n_seq', t_audit_length_missing_n_seq_flag)
     _check('L13 global cross-panel multiplicity audit (exp_lib)', t_global_multiplicity_audit_basic)
