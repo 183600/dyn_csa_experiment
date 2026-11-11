@@ -280,14 +280,45 @@ def _load_manifest(path):
     if not isinstance(_ts, dict):
         raise SystemExit(f'[v12] REFUSE: binding.test_slice must be an object ({_ts!r})')
     _eval = m.get('eval') or {}
-    if _ts and _eval:
-        _ts_n = _ts.get('n_seqs')
+    _ts_n = _ts.get('n_seqs') if isinstance(_ts, dict) else None
+    if _ts_n is not None:
         _ev_n = _eval.get('n_seqs_clean')
-        if (_ts_n is not None and _ev_n is not None
-                and _int_field(_ts_n, 'binding.test_slice.n_seqs') != _int_field(_ev_n, 'eval.n_seqs_clean')):
+        if _ev_n is None:
+            raise SystemExit(f'[v12] REFUSE: binding.test_slice.n_seqs={_ts_n} is declared but eval.n_seqs_clean is missing — the evaluation plan must carry the same frozen row count')
+        if _int_field(_ts_n, 'binding.test_slice.n_seqs') != _int_field(_ev_n, 'eval.n_seqs_clean'):
             raise SystemExit(f'[v12] REFUSE: binding.test_slice.n_seqs={_ts_n} disagrees with eval.n_seqs_clean={_ev_n} — the machine-checkable binding block and the evaluation plan must describe the same slice')
     if _eval and _int_field(_eval.get('n_seqs_clean') or 0, 'eval.n_seqs_clean') <= 0:
         raise SystemExit('[v12] REFUSE: eval.n_seqs_clean is missing/zero — the frozen row count is part of the held-out slice, not a runtime default')
+    _probe = _eval.get('distractor_probe') if isinstance(_eval, dict) else None
+    if _probe is not None:
+        if not isinstance(_probe, dict):
+            raise SystemExit(f'[v12] REFUSE: eval.distractor_probe must be an object ({_probe!r})')
+        if _probe.get('mode') is not None and not isinstance(_probe.get('mode'), str):
+            raise SystemExit(f'[v12] REFUSE: eval.distractor_probe.mode must be a string ({_probe.get("mode")!r})')
+        for _pk in ('rhos', 'eval_lens'):
+            if _pk not in _probe:
+                continue
+            _pv = _probe.get(_pk)
+            if not isinstance(_pv, list) or not _pv:
+                raise SystemExit(f'[v12] REFUSE: eval.distractor_probe.{_pk} must be a non-empty list ({_pv!r})')
+            for _x in _pv:
+                if isinstance(_x, (bool, np.bool_)):
+                    raise SystemExit(f'[v12] REFUSE: eval.distractor_probe.{_pk} contains a boolean ({_x!r})')
+                try:
+                    _xf = float(_x)
+                except (TypeError, ValueError, OverflowError):
+                    raise SystemExit(f'[v12] REFUSE: eval.distractor_probe.{_pk} contains a non-numeric value ({_x!r})')
+                if not math.isfinite(_xf):
+                    raise SystemExit(f'[v12] REFUSE: eval.distractor_probe.{_pk} contains a non-finite value ({_x!r})')
+                if _pk == 'rhos' and not (0.0 <= _xf <= 1.0):
+                    raise SystemExit(f'[v12] REFUSE: eval.distractor_probe.rhos value {_xf!r} is outside [0,1]')
+                if _pk == 'eval_lens' and (_xf <= 0 or _xf != math.floor(_xf)):
+                    raise SystemExit(f'[v12] REFUSE: eval.distractor_probe.eval_lens value {_x!r} is not a positive integer')
+        for _pk in ('target', 'n_seq'):
+            if _pk in _probe:
+                _iv = _int_field(_probe.get(_pk), f'eval.distractor_probe.{_pk}')
+                if _iv <= 0:
+                    raise SystemExit(f'[v12] REFUSE: eval.distractor_probe.{_pk} must be positive ({_iv})')
     _tokb = (_bind.get('tokenizer') or {}) if isinstance(_bind, dict) else {}
     if _tokb and not isinstance(_tokb, dict):
         raise SystemExit(f'[v12] REFUSE: binding.tokenizer must be an object ({_tokb!r})')
@@ -636,12 +667,16 @@ def _check_or_write_freeze_lock(outdir, manifest, test_ids_fp, stage='access',
             lock = json.load(open(lp, encoding='utf-8'))
         except Exception as e:
             raise SystemExit(f'[v12] REFUSE: freeze lock {lp} exists but cannot be parsed ({type(e).__name__}: {e}) — delete it only if you can prove no test-split record was ever written under it')
+        if not isinstance(lock, dict):
+            raise SystemExit(f'[v12] REFUSE: freeze lock {lp} is valid JSON but not an object ({type(lock).__name__}) — refusing to interpret it')
         _manifest_changed = lock.get('manifest_sha256') != _sha
         _test_changed = (test_ids_fp is not None
                          and lock.get('test_ids_fp') not in (None, test_ids_fp))
         _train_changed = (train_fp is not None
                           and lock.get('train_fp') not in (None, train_fp))
         _refreeze = os.environ.get('V12_REFREEZE', '').strip().lower() in ('1', 'true', 'yes', 'on')
+        if train_fp is None and lock.get('train_fp') is not None and not _refreeze:
+            raise SystemExit(f'[v12] REFUSE: the freeze lock pins a training corpus (train_fp={lock.get("train_fp")}) but the current records do not prove one — a confirmation run cannot drop the training-set binding')
         if (_manifest_changed or _test_changed or _train_changed) and not _refreeze:
             if _manifest_changed:
                 raise SystemExit(f'[v12] REFUSE: the test split was already accessed under a DIFFERENT frozen manifest (lock {lp}: {lock.get("manifest_sha256")} != current {_sha}, locked_at={lock.get("locked_at")}). Changing the plan after seeing test data is selection bias by construction. To consciously re-freeze, set V12_REFREEZE=1 — the earlier round must then be reported as exploratory in the plan history.')
@@ -1021,6 +1056,8 @@ def run_finaltest(cfg=None, guard=None):
         if _ov.get('status') == 'fail':
             _doc = (_ov.get('checks') or {}).get('doc_overlap') or {}
             raise SystemExit(f'[v12] REFUSE: the data-leakage audit reports a hard failure (doc_overlap={_doc if isinstance(_doc, dict) else _doc!r}); see audit_gates.py leakage output — confirmation claims are unavailable until the near-duplicate evaluation documents are excluded')
+        if _ov.get('status') not in (None, 'ok'):
+            raise SystemExit(f'[v12] REFUSE: the data-leakage audit returned status {_ov.get("status")!r} ({_ov.get("note") or _ov.get("warnings")}) — a confirmation run unlocks only on a verifiably clean isolation audit, not on warnings')
         _doc = (_ov.get('checks') or {}).get('doc_overlap')
         if not isinstance(_doc, dict):
             raise SystemExit(f'[v12] REFUSE: the leakage audit did not produce a document-overlap result ({_doc!r}) — the npy caches are missing or unreadable, so train/test isolation cannot be verified before the one-shot test access')
@@ -1439,6 +1476,8 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
     raw = {}
     if os.path.exists(bylen_path):
         raw = json.load(open(bylen_path, encoding='utf-8'))
+        if not isinstance(raw, dict):
+            raise SystemExit(f'[v12] REFUSE: {bylen_path} is valid JSON but not an object ({type(raw).__name__}) — the confirmation records cannot be admitted')
     admitted, unified_fp = _admit_confirmation_records(raw, manifest)
     # The analysis entry point is as much part of the frozen round as P5T:
     # reuse the same persistent lock so a manifest or test-slice change after
