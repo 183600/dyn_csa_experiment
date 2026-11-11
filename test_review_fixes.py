@@ -3533,6 +3533,66 @@ def t_audit_split_test_metadata_discipline():
         assert any('duplicate cleanup' in w for w in out['warnings']), out
 
 
+def t_audit_split_test_sidecar_self_consistency():
+    # A test doc-id sidecar must be checked against its OWN metadata even when
+    # the paired train/validation sidecars are missing; otherwise swapping in a
+    # truncated test sidecar would only downgrade to a "not verified" warning.
+    with tempfile.TemporaryDirectory() as d:
+        tag = 'tiny'
+        ttag = 'tiny_test'
+        tr = np.arange(40, dtype=np.int64)
+        va = (np.arange(16, dtype=np.int64) + 40).reshape(2, 8)
+        te = (np.arange(32, dtype=np.int64) + 56).reshape(2, 16)
+        trd = np.array([1, 2, 3], dtype=np.uint64)
+        vad = np.array([4, 5], dtype=np.uint64)
+        ted = np.array([6, 7], dtype=np.uint64)
+        np.save(os.path.join(d, f'train_ids_{tag}.npy'), tr)
+        np.save(os.path.join(d, f'val_batch_{tag}.npy'), va)
+        np.save(os.path.join(d, f'test_ids_{ttag}.npy'), te)
+        np.save(os.path.join(d, f'train_doc_ids_{tag}.npy'), trd)
+        np.save(os.path.join(d, f'val_doc_ids_{tag}.npy'), vad)
+        np.save(os.path.join(d, f'test_doc_ids_{ttag}.npy'), ted)
+        meta = {'vocab': 80, 'seq_len': 8, 'split_strategy': 'ordered',
+                'shuffle_at_split': False, 'tokenizer_fit_split': 'train',
+                'doc_ids': {'train_count': len(trd), 'validation_count': len(vad),
+                            'train_fp': A._sidecar_fp(trd),
+                            'validation_fp': A._sidecar_fp(vad),
+                            'overlap': 0, 'disjoint': True}}
+        tmeta = {'vocab': 80, 'seq_len': 16, 'split_strategy': 'official_test',
+                 'shuffle_at_split': False, 'tokenizer_fit_split': 'train',
+                 'near_duplicate_cleanup': {
+                     'policy': 'test_documents_deduplicated_against_train_and_validation'},
+                 'doc_ids': {'test_count': len(ted),
+                             'test_fp': A._sidecar_fp(ted),
+                             'train_overlap': 0, 'validation_overlap': 0,
+                             'disjoint': True}}
+        def _write_meta():
+            with open(os.path.join(d, f'meta_{tag}.json'), 'w', encoding='utf-8') as f:
+                json.dump(meta, f)
+            with open(os.path.join(d, f'test_meta_{ttag}.json'), 'w', encoding='utf-8') as f:
+                json.dump(tmeta, f)
+        _write_meta()
+        good = A.audit_split_discipline(cache_dirs=[d], min_shift_tokens=1)
+        rec = good['caches'][os.path.abspath(d)]['corpora'][tag]
+        assert rec['status'] != 'fail', rec
+        # Remove the paired train sidecar and corrupt only the test fingerprint.
+        os.unlink(os.path.join(d, f'train_doc_ids_{tag}.npy'))
+        tmeta['doc_ids']['test_fp'] = 'not-the-test-fingerprint'
+        _write_meta()
+        out = A.audit_split_discipline(cache_dirs=[d], min_shift_tokens=1)
+        rec = out['caches'][os.path.abspath(d)]['corpora'][tag]
+        assert rec['status'] == 'fail', rec
+        assert any('test document-id sidecar does not match' in w for w in out['warnings']), out
+        # Metadata records document ids but the sidecar is gone: fail closed.
+        tmeta['doc_ids']['test_fp'] = A._sidecar_fp(ted)
+        _write_meta()
+        os.unlink(os.path.join(d, f'test_doc_ids_{ttag}.npy'))
+        out = A.audit_split_discipline(cache_dirs=[d], min_shift_tokens=1)
+        rec = out['caches'][os.path.abspath(d)]['corpora'][tag]
+        assert rec['status'] == 'fail', rec
+        assert any('test document-id sidecar is missing' in w for w in out['warnings']), out
+
+
 def t_corpus_audit_overlap_is_unique_across_windows():
     # The same validation row repeated in two disjoint training windows is ONE
     # overlapping validation row, not two.
@@ -4531,6 +4591,7 @@ def main():
     _check('I12 object-time NaN + zero-feature data guards', t_object_time_and_zero_feature_guards)
     _check('I13 split audit marks per-cache warnings', t_audit_split_warning_status)
     _check('I13b split audit checks test metadata discipline', t_audit_split_test_metadata_discipline)
+    _check('I13c split audit verifies test doc-id sidecar self-consistency', t_audit_split_test_sidecar_self_consistency)
     _check('I14 corpus audit counts overlapping validation rows once', t_corpus_audit_overlap_is_unique_across_windows)
     _check('I15 length audit refuses a missing eval span', t_audit_length_requires_eval_span)
     _check('I16 fairness audit ignores a NaN seed instead of crashing', t_audit_fairness_nan_seed_does_not_crash)

@@ -231,13 +231,26 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
             _doc_checks = {'test_documents': int(_ted.size)}
             _doc_leak = []
             _tm_doc = (test_meta or {}).get('doc_ids') or {}
+            _train_doc = (train_meta or {}).get('doc_ids') or {}
             if _tm_doc:
                 if int(_tm_doc.get('test_count', -1)) != int(_ted.size):
                     _doc_leak.append('test document-id sidecar count disagrees with the test metadata')
+                if (_tm_doc.get('test_fp')
+                        and _tm_doc['test_fp'] != _sidecar_fp(_ted)):
+                    _doc_leak.append('test document-id sidecar does not match the '
+                                     'fingerprint in the test metadata')
             else:
                 _doc_checks['metadata'] = 'test meta has no doc_ids attestation'
             if os.path.exists(_trd_p):
-                _n = int(np.intersect1d(np.load(_trd_p), _ted).size)
+                _trd = np.load(_trd_p)
+                if (_train_doc.get('train_count') is not None
+                        and int(_train_doc['train_count']) != int(np.asarray(_trd).size)):
+                    _doc_leak.append('train document-id sidecar count disagrees with the cache metadata')
+                if (_train_doc.get('train_fp')
+                        and _train_doc['train_fp'] != _sidecar_fp(_trd)):
+                    _doc_leak.append('train document-id sidecar does not match the '
+                                     'fingerprint in the cache metadata')
+                _n = int(np.intersect1d(_trd, _ted).size)
                 _doc_checks['test_train_overlap'] = _n
                 if _n:
                     _doc_leak.append(f'{_n} test document ids also occur in train')
@@ -245,7 +258,15 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
                 _doc_checks['test_train_overlap'] = 'train sidecar missing'
                 _doc_leak.append('train document-id sidecar is missing; test/train group isolation cannot be verified')
             if os.path.exists(_vad_p):
-                _n = int(np.intersect1d(np.load(_vad_p), _ted).size)
+                _vad = np.load(_vad_p)
+                if (_train_doc.get('validation_count') is not None
+                        and int(_train_doc['validation_count']) != int(np.asarray(_vad).size)):
+                    _doc_leak.append('validation document-id sidecar count disagrees with the cache metadata')
+                if (_train_doc.get('validation_fp')
+                        and _train_doc['validation_fp'] != _sidecar_fp(_vad)):
+                    _doc_leak.append('validation document-id sidecar does not match '
+                                     'the fingerprint in the cache metadata')
+                _n = int(np.intersect1d(_vad, _ted).size)
                 _doc_checks['test_validation_overlap'] = _n
                 if _n:
                     _doc_leak.append(f'{_n} test document ids also occur in validation')
@@ -262,6 +283,14 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
             out['status'] = 'fail'
             out['note'] = (f'held-out document-id sidecar unreadable ({_de}); '
                            'document-group isolation cannot be verified')
+    elif (test_meta or {}).get('doc_ids'):
+        out['checks']['document_isolation'] = {
+            'status': 'fail',
+            'note': 'test metadata records document ids but the test document-id sidecar is missing',
+        }
+        out['status'] = 'fail'
+        out['note'] = ('held-out test document-id sidecar is missing while the test '
+                       'metadata records document ids — rebuild the test cache')
     else:
         out['checks']['document_isolation'] = {
             'status': 'not_verified',
@@ -682,6 +711,17 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                         rec['status'] = 'fail'
                         _fail(f'{cd}/{tag}: validation document-id sidecar does not '
                               'match the fingerprint in the cache metadata')
+                    # A count recorded in the metadata is a second, independent
+                    # binding: a truncated/extra sidecar must fail even when the
+                    # fingerprint field was omitted by a legacy writer.
+                    if _mdoc.get('train_count') is not None and int(_mdoc['train_count']) != int(np.asarray(_trd).size):
+                        rec['status'] = 'fail'
+                        _fail(f'{cd}/{tag}: train document-id sidecar count '
+                              'disagrees with the cache metadata')
+                    if _mdoc.get('validation_count') is not None and int(_mdoc['validation_count']) != int(np.asarray(_vad).size):
+                        rec['status'] = 'fail'
+                        _fail(f'{cd}/{tag}: validation document-id sidecar count '
+                              'disagrees with the cache metadata')
                     _shared_docs = int(np.intersect1d(_trd, _vad).size)
                     rec['documents'] = {
                         'train_count': int(np.asarray(_trd).size),
@@ -811,40 +851,43 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                     _fail(f'{cd}/{tag}: {shared_val_test} test rows exactly duplicate a validation row')
                 _ted_path = os.path.join(cd, f'test_doc_ids_{_ttag}.npy')
                 if os.path.exists(_ted_path):
-                    # Both paired sidecars are required before claiming zero
-                    # overlap; a missing sidecar leaves the isolation
-                    # unverified.
-                    _have_trd = os.path.exists(_trd_path)
-                    _have_vad = os.path.exists(_vad_path)
-                    if not (_have_trd and _have_vad):
-                        _missing = [n for n, ok in (('train', _have_trd),
-                                                   ('validation', _have_vad)) if not ok]
-                        rec['test_document_isolation'] = (
-                            'not_verified (missing '
-                            + '/'.join(_missing)
-                            + ' document-id sidecar)')
-                        _warn(f'{cd}/{tag}: test document-id sidecar exists but the '
-                              f'{"/".join(_missing)} sidecar is missing; test/train '
-                              'and test/validation group isolation cannot be verified')
-                    else:
-                        try:
-                            _ted = np.load(_ted_path)
+                    # The test sidecar can be checked against its own metadata
+                    # even when the paired train/validation sidecars are absent.
+                    # Group isolation needs both pairs, but self-consistency
+                    # does not: a truncated or swapped sidecar must fail here
+                    # rather than downgrade to a warning.
+                    try:
+                        _ted = np.load(_ted_path)
+                        _mtdoc = (_tmeta or {}).get('doc_ids') or {}
+                        if _mtdoc:
+                            if int(_mtdoc.get('test_count', -1)) != int(np.asarray(_ted).size):
+                                rec['status'] = 'fail'
+                                _fail(f'{cd}/{tag}: test document-id sidecar count '
+                                      'disagrees with the test metadata')
+                            if (_mtdoc.get('test_fp')
+                                    and _mtdoc['test_fp'] != _sidecar_fp(_ted)):
+                                rec['status'] = 'fail'
+                                _fail(f'{cd}/{tag}: test document-id sidecar does '
+                                      'not match the fingerprint in the test metadata')
+                        rec['test_documents'] = int(_ted.size)
+                        _have_trd = os.path.exists(_trd_path)
+                        _have_vad = os.path.exists(_vad_path)
+                        if not (_have_trd and _have_vad):
+                            _missing = [n for n, ok in (('train', _have_trd),
+                                                       ('validation', _have_vad)) if not ok]
+                            rec['test_document_isolation'] = (
+                                'not_verified (missing '
+                                + '/'.join(_missing)
+                                + ' document-id sidecar)')
+                            _warn(f'{cd}/{tag}: test document-id sidecar is self-consistent, '
+                                  f'but the {"/".join(_missing)} sidecar is missing; '
+                                  'test/train and test/validation group isolation '
+                                  'cannot be verified')
+                        else:
                             _trd = np.load(_trd_path)
                             _vad = np.load(_vad_path)
-                            _mtdoc = (_tmeta or {}).get('doc_ids') or {}
-                            if _mtdoc:
-                                if int(_mtdoc.get('test_count', -1)) != int(np.asarray(_ted).size):
-                                    rec['status'] = 'fail'
-                                    _fail(f'{cd}/{tag}: test document-id sidecar count '
-                                          'disagrees with the test metadata')
-                                if (_mtdoc.get('test_fp')
-                                        and _mtdoc['test_fp'] != _sidecar_fp(_ted)):
-                                    rec['status'] = 'fail'
-                                    _fail(f'{cd}/{tag}: test document-id sidecar does '
-                                          'not match the fingerprint in the test metadata')
                             _dtrain = int(np.intersect1d(_trd, _ted).size)
                             _dval = int(np.intersect1d(_vad, _ted).size)
-                            rec['test_documents'] = int(_ted.size)
                             rec['test_train_document_overlap'] = _dtrain
                             rec['test_validation_document_overlap'] = _dval
                             if _dtrain:
@@ -853,9 +896,13 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                             if _dval:
                                 rec['status'] = 'fail'
                                 _fail(f'{cd}/{tag}: {_dval} test document ids also occur in validation (selection/test group leakage)')
-                        except Exception as _de:
-                            rec['status'] = 'fail'
-                            _fail(f'{cd}/{tag}: test document-id sidecar unreadable ({type(_de).__name__}: {_de})')
+                    except Exception as _de:
+                        rec['status'] = 'fail'
+                        _fail(f'{cd}/{tag}: test document-id sidecar unreadable ({type(_de).__name__}: {_de})')
+                elif ((_tmeta or {}).get('doc_ids')):
+                    rec['status'] = 'fail'
+                    _fail(f'{cd}/{tag}: test metadata records document ids but the '
+                          'test document-id sidecar is missing')
                 else:
                     rec['test_document_isolation'] = 'not_verified (no test_doc_ids sidecar)'
             else:
