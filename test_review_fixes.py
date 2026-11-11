@@ -4682,6 +4682,27 @@ def t_driver_pairing_single_config():
     assert len(comps['mixed']['seeds']) == 1, comps['mixed']
 
 
+def t_v7_bootstrap_single_config():
+    root = tempfile.mkdtemp()
+    try:
+        od = os.path.join(root, 'results_lm_v7_warmup')
+        os.makedirs(od)
+        raw = {}
+        for seed, cfg in ((0, 'cfgA'), (1, 'cfgB')):
+            for warm, ppl in ((5000, 10.0), (0, 11.0)):
+                raw[f'csa_fixed::w{warm}::seed{seed}'] = {
+                    'variant': 'csa_fixed', 'seed': seed, 'warm_steps': warm,
+                    'run_cfg': cfg, 'steps': 100, 'tokens_seen': 1000,
+                    'ppl': ppl + seed}
+        with open(os.path.join(od, 'summary.json'), 'w', encoding='utf-8') as f:
+            json.dump(raw, f)
+        r = V7.bootstrap_report([od], out=os.path.join(root, 'stats.json'))
+        comp = r['comparisons']['warmup w=5000 vs scratch']
+        assert comp['n'] == 1 and comp['per_seed'] == [-1.0], comp
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def t_report_stale_trajectory_refused():
     stale = 'old_csOLD'
     s = {}
@@ -5681,6 +5702,7 @@ def main():
     _check('L3c report pairing keeps one run_cfg group', t_report_paired_row_single_config)
     _check('L3d report refuses stale trajectories', t_report_stale_trajectory_refused)
     _check('L3e v8/v9 pairing keeps one run_cfg group', t_driver_pairing_single_config)
+    _check('L3f v7 bootstrap pairing keeps one run_cfg group', t_v7_bootstrap_single_config)
     _check('L4 matched-init fingerprint + pair gate', t_init_core_fingerprint_and_pair_gate)
     _check('L5 param breakdown + measured compute control', t_param_and_compute_control_detail)
     _check('L6 stale aggregate refused', t_stale_aggregate_refused)

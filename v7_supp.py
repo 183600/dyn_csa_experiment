@@ -1781,6 +1781,11 @@ def bootstrap_report(outdirs, out='analysis_v7/stats.json'):
             _dropped = [s for _g, _ss in _ranked[1:] for s in _ss]
             print(f'[stats] WARNING: {k}: seed(s) {_dropped} were measured under a DIFFERENT run_cfg group than seed(s) {_keep_seeds} — the per-variant mean pools only one configuration group ({len(_keep_seeds)} seed(s), current code stamp preferred); pooling across configurations is not allowed')
             _m = {s: _m[s] for s in _keep_seeds}
+        # The comparisons below must use the SAME single configuration group
+        # that supplies the per-variant mean.  Keeping the unfiltered records
+        # here would pair seed 0 from cfgA with seed 1 from cfgB even though
+        # the printed mean excludes one of them.
+        recs[k] = _m
         per_variant[k] = {'ppls': {s: r['ppl'] for s, r in _m.items()}, 'mean': float(np.mean([r['ppl'] for r in _m.values()]))}
     out_d = {'per_variant': per_variant, 'comparisons': {}}
     for name, a, b in pairs:
