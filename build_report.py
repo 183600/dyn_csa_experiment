@@ -1095,6 +1095,11 @@ def sec_p1t():
         _pair = paired_row(_recs.get('csa_fixed_topk8', {}), _recs.get('csa_fixed_topk32', {}))
         if _pair is not None:
             _kept, _dl, _st = _pair
+            # This is the single pre-specified contrast in P1T: Holm over a
+            # one-element family is the raw p.  Without this the gate saw
+            # p_holm=None and could never pass, while the prose claimed a
+            # Holm failure that was never computed.
+            _st['p_holm'] = _st.get('p_exact_signflip')
             _sig_txt = '显示该差距**达到 p≤0.05 且通过族校正/噪声门槛**，按显著性读法处理。' if _sig_gate(_st, label='P1T csa_fixed_topk8 vs topk32 (seq2048)', family='P1T') else '显示该差距未通过「n≥6 + 原始 p<0.05 + Holm + 效应大于 seed 噪声」门槛，**不构成显著性主张**，只作方向性参考。'
             lines.append(f'2. 在已完成的两个选择率点上：{_dir}；配对的精确符号翻转检验（n={_st['n']}，p={_st['p_exact_signflip']:.3f}，Δ(topk8−topk32) mean={_st['mean']:+.2f} PPL）{_sig_txt}')
         else:
