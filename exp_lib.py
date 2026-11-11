@@ -840,9 +840,8 @@ def _segment(n, want_cut_list, min_block, max_block):
         max_block = int(n)
     cacheable = n <= 64
     # The segmentation below uses boolean truthiness, not the raw numeric
-    # value; the cache key must normalise the same way.  Casting to uint8
-    # would turn 0.5 into 0 (and raise for 256/NaN) while the walk still sees
-    # a cut, so the cache could return a segmentation for all-False input.
+    # value; the cache key must normalise the same way (any non-zero value is
+    # a cut, not only exactly 1).
     key = (n, min_block, max_block, np.asarray(want_cut_list, dtype=bool).tobytes()) if cacheable else None
     if cacheable:
         hit = _SEGMENT_CACHE.get(key)
@@ -1149,8 +1148,7 @@ def _d2h_stage(shape, dtype, device):
 
 def blocks_from_cuts(n, want_cut_list, min_block, max_block, device, return_count=False, return_honoured=False):
     # _segment() treats any non-positive length as "no tokens, no blocks";
-    # the public wrapper must do the same instead of calling max() on an
-    # empty count table for n < 0.
+    # the public wrapper follows the same rule.
     if n <= 0:
         base, cnt, hon = (torch.empty(0, dtype=torch.long, device=device), 0, {})
     elif n == 1:
@@ -9710,9 +9708,7 @@ def tost_paired(deltas, margin, conf=0.90):
     out['p_tost'] = float(max(p_hi, p_lo))
     # TOST decision level and the reported interval must agree.  A two-sided
     # ``conf`` CI is the (1-conf)/2 one-sided test in each direction (conf=0.90
-    # -> alpha=0.05, the pre-registered G0 rule).  Hard-coding 0.05 made a
-    # caller requesting conf=0.95 report a 95% interval but decide at the 90%
-    # level (and vice versa).
+    # -> alpha=0.05, the pre-registered G0 rule).
     equiv_alpha = (1.0 - float(conf)) / 2.0
     out['equiv_alpha'] = float(equiv_alpha)
     out['equivalent'] = bool(p_hi < equiv_alpha and p_lo < equiv_alpha)

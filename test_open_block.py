@@ -76,7 +76,7 @@ def _tiny(mode='closed', scope='full_prefix', max_block=8, seq=32, window=6,
 def t_config_and_segmenter():
     c = L.AttnCfg()
     assert c.max_block == 128 and c.position_capacity() == 129
-    assert c.open_block_mode == 'closed', 'the default must preserve the historical closed rule'
+    assert c.open_block_mode == 'closed', 'the default must keep the closed rule'
     assert c.position_policy() == 'truncate'
     n = 23
     cuts = np.zeros(n - 1, dtype=bool)

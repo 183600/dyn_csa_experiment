@@ -839,8 +839,7 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test', train_
             return True  # the manifest changed after this record was written
         # by_len_cells() only checks that a usable ppl exists; it does not
         # reject a truncated/partial cell.  Use the same full-shape predicate
-        # as admission, otherwise resume would skip re-evaluation and the
-        # record would then be silently excluded from the one-shot test.
+        # as admission.
         if (not all((L.by_len_cells([rec], Ln) for Ln in eval_lens))
                 or _by_len_shape_reason(rec, test_ids.shape[0]) is not None):
             return True

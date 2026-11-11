@@ -164,9 +164,8 @@ def _resolve_sizes(n, train_frac=0.8, val_frac=0.1, test_frac=0.1,
             f'n={n} is too small for {sum(requested)} non-empty chronological splits')
     # Largest-remainder apportionment: floor every target, then give the
     # leftover rows to the splits with the largest fractional parts.  This
-    # keeps small-n splits close to their requested proportions (a plain
-    # floor+remainder-to-test rule would turn n=8, 80/10/10 into 4/1/3) and
-    # never puts rows into a split whose requested fraction is zero.
+    # keeps small-n splits close to their requested proportions and never
+    # puts rows into a split whose requested fraction is zero.
     targets = [n * f for f in fracs]
     sizes = [int(math.floor(t)) for t in targets]
     remaining = n - sum(sizes)
@@ -671,10 +670,9 @@ def split_indices(n, *, time=None, groups=None, train_frac=0.8, val_frac=0.1,
         _cuts_arr = np.asarray(cuts)
         for _si, size in enumerate(sizes):
             cumulative += int(size)
-            # Reserve one legal cut for every later non-empty split.  Greedily
-            # taking the first cut at/after the cumulative target can consume
-            # the last timestamp block and leave a later split empty even
-            # though an earlier legal boundary would satisfy all three.
+            # Reserve one legal cut for every later non-empty split, so an
+            # earlier legal boundary can satisfy every split instead of
+            # consuming the last timestamp block for the first one.
             _later = sum(1 for _s in sizes[_si + 1:] if int(_s) > 0)
             max_pos = len(cuts) - 1 - _later
             pos = int(np.searchsorted(_cuts_arr, cumulative, side='left'))

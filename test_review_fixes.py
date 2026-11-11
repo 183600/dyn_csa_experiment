@@ -282,8 +282,8 @@ def t_training_health_noise_aware_threshold():
     assert h['slope_tol_mode'] == 'adaptive_2se', h
     assert h['val_ce_slope_se'] is not None and h['val_slope_tol'] > 1e-5, h
     assert h['val_ce_slope_per_step'] > 1e-5, h
-    # The historical fixed threshold is still available explicitly and still
-    # calls the same noise "overfitting" (proving the test is discriminating).
+    # The fixed threshold is still available explicitly and calls the same
+    # noise "overfitting", so the test discriminates between the two rules.
     h_fixed = L.classify_training_health(hist, slope_tol=1e-5)
     assert h_fixed['status'] == 'overfitting', h_fixed
     assert h_fixed['slope_tol_mode'] == 'fixed', h_fixed

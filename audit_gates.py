@@ -791,7 +791,7 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                         _same_vocab = int(_tm['vocab']) == int(meta['vocab'])
                     except (TypeError, ValueError, OverflowError):
                         # A malformed vocab cannot be paired; fail the cache
-                        # instead of letting int() abort the whole report.
+                        # instead of aborting the whole report.
                         rec['status'] = 'fail'
                         _fail(f'{cd}/{tag}: cache metadata has a non-integer vocab '
                               f'(train={meta.get("vocab")!r}, test={_tm.get("vocab")!r})')
@@ -871,9 +871,8 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                 if os.path.exists(_ted_path):
                     # The test sidecar can be checked against its own metadata
                     # even when the paired train/validation sidecars are absent.
-                    # Group isolation needs both pairs, but self-consistency
-                    # does not: a truncated or swapped sidecar must fail here
-                    # rather than downgrade to a warning.
+                    # Group isolation needs both pairs, but self-consistency is
+                    # independent of them.
                     try:
                         _ted = np.load(_ted_path)
                         _mtdoc = (_tmeta or {}).get('doc_ids') or {}
@@ -1994,8 +1993,8 @@ def _aggregate_audit_status(results):
 
 def run_report(out='audit_report.json'):
     res = {'generated_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'leakage': audit_leakage(), 'split_discipline': audit_split_discipline(), 'attribution': audit_attribution(), 'boundary': audit_boundary(), 'length': audit_length(), 'fairness': audit_fairness(), 'metrics': audit_metrics(), 'tuning': audit_tuning(), 'simple_baseline': audit_simple_baseline(), 'hypotheses': audit_hypotheses(), 'methodology': audit_methodology(), 'failures': audit_failures(), 'budget': audit_budget(), 'efficiency_pairs': audit_efficiency_pairs(), 'release': audit_release_readiness(), 'selection': audit_selection()}
-    # The CLI exits non-zero only on a top-level status; without this the
-    # report subcommand always exited 0 even when a sub-audit failed.
+    # The CLI exit code follows the aggregate status, not only the top-level
+    # record's own status.
     res['status'] = _aggregate_audit_status(res)
     L_atomic = None
     try:
