@@ -2174,6 +2174,27 @@ def t_provenance_and_manifest():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def t_manifest_seed_integrity_is_exact():
+    tr = np.arange(512, dtype=np.int64) % 97
+    va = np.arange(64, dtype=np.int64).reshape(2, 32) % 97
+    prov = L.experiment_provenance({'dataset': 'unit', 'n_train_tokens': 512,
+                                    'seq_len': 32}, train_ids=tr, val_batch=va, vocab=97)
+    d = tempfile.mkdtemp()
+    try:
+        cfg = {'seeds': [0], 'variants': ['full'], 'outdir': d,
+               'n_train_tokens': 512, 'seq_len': 32}
+        hp = L.run_hyperparameters(cfg, seed=0, d=64, n_layers=2, n_heads=4,
+                                   d_head=16, vocab=97, mlp_ratio=4.0)
+        rec = {'variant': 'full', 'seed': 0.9, 'ppl': 10.0, 'hyperparams': hp}
+        path = L.write_run_manifest(d, cfg, 'FP', prov, {},
+                                    cell_records={'full::seed0': rec})
+        integ = json.load(open(path, encoding='utf-8'))['panels']['FP']['tracking_integrity']
+        assert integ['with_seed_metadata'] == 0, integ
+        assert integ['seed_metadata_mismatch'] == ['full::seed0'], integ
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 # ---------------------------------------------------------------------------
 # E5-E8. 进一步的可复现性 / 训练追踪检查
 # ---------------------------------------------------------------------------
@@ -5522,6 +5543,7 @@ def main():
     _check('E6 end-to-end training reproducibility', t_train_variant_reproducible)
     _check('E7 overfit check detects broken optimizer', t_overfit_detects_broken_optimizer)
     _check('E8 append-only experiment ledger + manifest', t_experiment_ledger)
+    _check('E4b manifest seed integrity is exact', t_manifest_seed_integrity_is_exact)
     _check('E9 data_version identity', t_data_version_identity)
     _check('E10 crash-safe manifest status/planned cells', t_manifest_running_then_complete)
     _check('E11 failed overfit guard is retried', t_failed_guard_is_retried)

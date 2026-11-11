@@ -14599,22 +14599,29 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reprodu
     _seed_ok = 0
     for _key, _c in cells.items():
         try:
-            _expected = int(str(_key).rsplit('::seed', 1)[1])
-        except (ValueError, IndexError):
+            _expected = _as_seed_int(str(_key).rsplit('::seed', 1)[1])
+        except IndexError:
+            _expected = None
+        if _expected is None:
             _seed_mismatch.append(_key)
             continue
         _hp = _c.get('hyperparams') if isinstance(_c.get('hyperparams'), dict) else {}
         _rng = _hp.get('rng') if isinstance(_hp.get('rng'), dict) else {}
-        try:
-            _vals = [int(_hp.get('seed'))] if _hp.get('seed') is not None else []
-            if _hp.get('data_seed') is not None:
-                _vals.append(int(_hp.get('data_seed')))
-            _vals.extend(int(_rng[k]) for k in ('python', 'numpy', 'torch', 'cuda', 'tensorflow',
-                                                'data', 'dataloader_generator') if _rng.get(k) is not None)
-            _ok = (bool(_c.get('seed') is not None) and int(_c.get('seed')) == _expected
-                   and all(v == _expected for v in _vals))
-        except (TypeError, ValueError, OverflowError):
-            _ok = False
+        _vals = [x for x in (_as_seed_int(_hp.get('seed')),
+                             _as_seed_int(_hp.get('data_seed'))) if x is not None]
+        _rng_keys = ('python', 'numpy', 'torch', 'cuda', 'tensorflow',
+                     'data', 'dataloader_generator')
+        _vals.extend(x for x in (_as_seed_int(_rng.get(k)) for k in _rng_keys
+                                 if _rng.get(k) is not None) if x is not None)
+        # Exact integer identity only: int(0.9) == 0 would make a mis-keyed
+        # fractional seed look like the declared seed 0.
+        _rec_seed = _as_seed_int(_c.get('seed'))
+        _hp_seeds_ok = all(_as_seed_int(_hp.get(k)) is not None
+                           for k in ('seed', 'data_seed') if _hp.get(k) is not None)
+        _rng_seeds_ok = all(_as_seed_int(_rng.get(k)) is not None
+                            for k in _rng_keys if _rng.get(k) is not None)
+        _ok = (_rec_seed == _expected and _hp_seeds_ok and _rng_seeds_ok
+               and all(v == _expected for v in _vals))
         if _ok:
             _seed_ok += 1
         else:
