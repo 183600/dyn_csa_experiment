@@ -388,12 +388,14 @@ def _relaxed_pair_reason(a, b, tuned_arms):
         return 'unverifiable init_core_fp (only one record carries the matched-initialization digest)'
     if ia is not None and ib is not None and ia != ib:
         return f'different init_core_fp ({str(ia)[:12]}… vs {str(ib)[:12]}…)'
+    if a.get('params') is None or b.get('params') is None:
+        return 'unverifiable params (at least one record omits the parameter count)'
     try:
         pa, pb = int(a.get('params')), int(b.get('params'))
         if abs(pa - pb) / float(max(pa, pb, 1)) > 0.01:
             return f'parameter mismatch ({pa} vs {pb})'
     except (TypeError, ValueError, OverflowError):
-        pass
+        return 'unverifiable params (not an integer count)'
     if tuned_arms.get(a.get('variant')) != tuned_arms.get(b.get('variant')):
         return 'arms did not receive the same declared tuning range'
     return None
