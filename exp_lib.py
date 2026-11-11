@@ -699,7 +699,7 @@ SCALE_LADDER = {'S1': dict(d=768, n_layers=12, n_heads=12, d_head=64), 'S2': dic
 # explicit: a scale comparison that changes width/depth also changes the
 # optimal optimizer settings, so a constant LR is a DISCLOSED assumption, not
 # a matched control.  `scale_ladder_audit` checks the token budget and makes
-# the assumption visible before the panel spends GPU time.
+# the assumption visible.
 SCALE_TRANSFER_POLICY = {
     'tokens_per_param_tolerance': 0.25,
     'lr_transfer': 'constant_declared_not_validated',
@@ -1154,7 +1154,7 @@ def blocks_from_cuts(n, want_cut_list, min_block, max_block, device, return_coun
         cnt = len(counts)
         if isinstance(counts, np.ndarray):
             # Large cut tables return their counts as a numpy row; use the
-            # vectorised extrema instead of iterating Python ints over it.
+            # vectorised extrema.
             _mx = int(counts.max()) if counts.size else 0
             _mx_prev = int(counts[:-1].max()) if cnt > 1 else 0
         else:
@@ -1214,9 +1214,8 @@ def _hoist_blocks_from_cuts(T, gate_lists, min_block, max_block, device, want_ho
         # Build the honoured table on the host as float32 and let _h2d_async
         # perform the cast+staging.  A direct H2D-pool borrow cannot expose a
         # NumPy view for dtypes such as bfloat16 (used under AMP), and an
-        # abandoned borrow leaves its pinned slot reserved.  The mask is only
-        # B x (T-1) exact 0.0/1.0 values, so the extra copy is negligible next
-        # to the hidden states.
+        # abandoned borrow leaves its pinned slot reserved.  The mask is
+        # B x (T-1) exact 0.0/1.0 values.
         arr = np.zeros((len(gate_lists), T - 1), dtype=np.float32)
         for _i, _hon in enumerate(hons):
             if _hon:
@@ -3021,7 +3020,7 @@ def _prefix_overlap_values(geo, Xb, Zb, B_pos_b, overlap):
     prev_start_full = torch.cat([starts[:1], prev_start], 0)
     # The overlap-lane width is a pure function of (geo, overlap): cache it on
     # the shared geometry dict so the GPU->CPU maximum is read once per
-    # forward instead of once per layer.
+    # forward.
     _wkey = '_ov_w_' + str(int(overlap))
     Wb = geo.get(_wkey)
     if Wb is None:
@@ -3269,8 +3268,8 @@ def _rank_blocks(masked, B, ties, k=None):
     # Scatter the selected source columns into [n, kk] (column order); the
     # sentinel column kk absorbs the non-selected lanes and is sliced away.
     # The base arange is a read-only constant of (B, device) — the same exact
-    # integers a fresh torch.arange returns every call — so it rides the
-    # shared index-table cache instead of being rebuilt per chunk.
+    # integers a fresh torch.arange returns every call — so it uses the
+    # shared index-table cache.
     cols = _i32_range_cache(B, src.device)[None, :].expand(n, B)
     buf = torch.empty(n, kk + 1, dtype=torch.int32, device=src.device)
     buf.scatter_(1, rank, cols)
@@ -3626,7 +3625,7 @@ def lightning_indexer_open(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, *,
     topk = max(int(topk), 0)
     q_chunk = max(1, min(int(query_chunk), max(n, 1)))
     # The singleton gather is [C, P, nIH, hd]; cap it so long contexts use
-    # smaller query chunks instead of materialising a huge candidate table.
+    # smaller query chunks.
     if P > 0:
         _per = max(1, int(nIH) * int(P) * int(hd))
         q_chunk = max(1, min(q_chunk, (16 << 20) // _per))
@@ -4008,8 +4007,7 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
             del blk_logits, win_logits
         else:
             # Write the two independent logits halves into one preallocated
-            # [q, h, nb + w] table instead of materialising both halves and a
-            # concatenated copy.  The slice assignment feeds the same einsum
+            # [q, h, nb + w] table.  The slice assignment feeds the same einsum
             # values to the same lanes.
             _w0 = int(_win_local.shape[1])
             logits = qseg.new_empty((qseg.shape[0], qseg.shape[1], _nb + _w0))
@@ -5494,8 +5492,7 @@ def boundary_token_ids(tok, eos_id):
     ids = set()
     _n = int(tok.get_vocab_size())
     try:
-        # One batched decode instead of a Python-level call per vocabulary
-        # entry (32k entries on the B-tier tokenizer).
+        # Decode the vocabulary in one batch.
         decoded = tok.decode_batch([[i] for i in range(_n)])
     except (AttributeError, TypeError, ValueError):
         decoded = [tok.decode([i]) for i in range(_n)]
@@ -6848,9 +6845,8 @@ def _npy_serve_int32(path):
         _mn, _mx = int(src.min()), int(src.max())
         if _mn < 0 or _mx > 2 ** 31 - 1:
             raise ValueError(f'_npy_serve_int32: token ids in {path} span [{_mn}, {_mx}], outside the int32 transport range')
-    # Serve an identity-bound int32 sidecar so workers share one mapped copy:
-    # the returned values are the same exact integers and the fingerprint
-    # stays on the int32 canonical form.
+    # Serve an identity-bound int32 sidecar: the returned values are the same
+    # exact integers and the fingerprint stays on the int32 canonical form.
     try:
         _side = _i32_sidecar_path(path)
         if os.path.exists(_side):
@@ -7965,10 +7961,8 @@ def _gpu_corpus_cache_fits(nbytes, device):
         return True
 
 _NARROW_MEMO = {}
-# The memo holds the narrowed corpus (an int32 copy or a mapped sidecar), so
-# it must stay bounded: an unbounded id-keyed cache retains one corpus-sized
-# array per distinct training stream for the whole process.  Keep a small LRU
-# and drop entries whose source array has died.
+# Keep a small LRU of narrowed corpora and drop entries whose source array
+# has died.
 _NARROW_MEMO_CAP = 8
 
 
@@ -8049,8 +8043,7 @@ def _ids_narrow(train_ids):
         try:
             _st = os.stat(_path)
             # Bind the sidecar to the same identity fields the cache loaders
-            # use.  A same-size rewrite can preserve mtime (``cp -p``), so
-            # size+mtime alone could silently serve a stale int32 copy.
+            # use; size+mtime alone does not identify it.
             _side = _i32_sidecar_path(_path)
             if os.path.exists(_side):
                 _n = np.load(_side, mmap_mode='r')
@@ -16806,8 +16799,8 @@ def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
                 n_nonfinite += int((~finite).sum())
             ce_safe = torch.where(finite, ce_f, torch.zeros_like(ce_f))
             row_nll += ce_safe.double().sum(dim=1).cpu().numpy()
-            # Entropy from one log_softmax table (no separate softmax/log
-            # copies); top-k works directly on the fp32 logits.
+            # Entropy from one log_softmax table; top-k works directly on the
+            # fp32 logits.
             lg_work = lg.float()
             logp = torch.log_softmax(lg_work, dim=-1)
             ent = -(logp * logp.exp()).sum(-1)
@@ -18339,10 +18332,8 @@ def _combined_seed_doc_ci(recs, *, n_boot=2000, seed=20261018, conf=0.95):
     if S < 1:
         return out
     # Seed-level component: per-seed pooled PPL over the SAME doc set.
-    # log(PPL) is exactly the pooled cross-entropy (NLL per token), so the
-    # seed-level log-PPL values are ``per_tok`` itself -- not log(per_tok),
-    # which would put the interval on the CE scale and exponentiate it back to
-    # CE instead of PPL.
+    # log(PPL) is the pooled cross-entropy (NLL per token), so the seed-level
+    # values are ``per_tok`` itself.
     seed_logppl = None
     if rows is not None:
         per_tok = nll_mat.sum(axis=1) / np.maximum(ntok_mat.sum(axis=1), 1e-30)
@@ -18373,8 +18364,7 @@ def _combined_seed_doc_ci(recs, *, n_boot=2000, seed=20261018, conf=0.95):
             nt = counts @ ntok_col
             nn = counts @ nll_col
             with np.errstate(divide='ignore', invalid='ignore'):
-                # log(PPL) = pooled CE = NLL/tokens.  Taking log() here would
-                # be a second log and turn the final exp() into CE, not PPL.
+                # log(PPL) = pooled CE = NLL/tokens.
                 lp_draw = np.where(nt > 0, nn / np.maximum(nt, 1e-30), np.nan)
                 lp_draw = np.where(np.isfinite(lp_draw) & (lp_draw > 0), lp_draw, np.nan)
             draws[_b:_b + _nb] = lp_draw
@@ -19431,8 +19421,7 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
     # Explicit seed contract: same seed reproduces every RNG source the
     # pipeline can consume (Python/NumPy/Torch/CUDA/TF/DataLoader generator
     # and worker hook) and a different seed actually changes each one.  This
-    # is cheaper than the 3-step training check and pinpoints WHICH stream is
-    # unseeded when a reproduction fails.
+    # check pinpoints WHICH stream is unseeded when a reproduction fails.
     _seed_contract = seed_contract_check(seed=_first_seed)
     _seed_contract.update({'run_cfg': fp, 'label': label or outdir, 'provenance': prov})
     atomic_write_json(os.path.join(outdir, 'seed_contract.json'), _seed_contract)

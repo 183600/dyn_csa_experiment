@@ -704,9 +704,7 @@ def _group_key(value):
 
 
 def _assert_index_and_group_disjoint(split_idx, groups=None):
-    # Row-index disjointness is a pure set operation; intersecting the int64
-    # arrays avoids materialising every index as a Python int (the set form
-    # costs ~28 bytes/row and dominates memory on a scale-up split).
+    # Row-index disjointness is a pure set operation on the int64 arrays.
     arrays = {name: np.asarray(split_idx[name]).reshape(-1)
               for name in SPLIT_NAMES}
     for i, a in enumerate(SPLIT_NAMES):
@@ -1518,11 +1516,8 @@ def _row_keys(X):
             arr[arr == 0.0] = 0.0
         finite = np.isfinite(arr)
         if finite.all():
-            # Fast path: every row is finite, so the old key is exactly
-            # ``row_bytes + b'|' + packbits(all-False)``.  Hashing the
-            # contiguous row view with the precomputed all-zero mask tail
-            # reproduces the historical key byte-for-byte while avoiding the
-            # per-row boolean-index copy and packbits call.
+            # Fast path: every row is finite, so the key is
+            # ``row_bytes + b'|' + packbits(all-False)``.
             _tail = np.packbits(np.zeros(int(src.shape[1]), dtype=bool)).tobytes()
             for row_view in arr.view(np.uint8):
                 h = hashlib.blake2b(digest_size=8)

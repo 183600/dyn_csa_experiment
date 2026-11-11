@@ -672,9 +672,8 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                 try:
                     _trd = np.load(_trd_path)
                     _vad = np.load(_vad_path)
-                    # The sidecars must be the ones this metadata describes:
-                    # a swapped/truncated sidecar can be disjoint by accident
-                    # while no longer proving this split's group isolation.
+                    # The sidecars must match the fingerprints in the metadata
+                    # before their contents are read.
                     if _mdoc.get('train_fp') and _mdoc['train_fp'] != _sidecar_fp(_trd):
                         rec['status'] = 'fail'
                         _fail(f'{cd}/{tag}: train document-id sidecar does not '
@@ -734,13 +733,11 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                 _tfp = os.path.join(cd, f'test_ids_{_ttag}.npy')
                 if not os.path.exists(_tfp):
                     continue
-                # Do NOT require the train and held-out sequence lengths to
-                # match: the training cache is built at the training seq_len
-                # while the frozen test slice can use a longer evaluation
-                # window (e.g. 512 vs 4097).  Pair on the tokenizer/vocab
-                # provenance instead; the row-overlap checks below accept
-                # different shapes, and >1 matching candidate is reported as
-                # ambiguous rather than guessed.
+                # Train and held-out sequence lengths may differ (the training
+                # cache uses the training seq_len while the frozen test slice
+                # can use a longer evaluation window).  Pair on tokenizer/vocab
+                # provenance; the row-overlap checks accept different shapes,
+                # and >1 matching candidate is reported as ambiguous.
                 if meta.get('vocab') is not None and _tm.get('vocab') is not None and int(_tm['vocab']) != int(meta['vocab']):
                     continue
                 if meta.get('fit_fp') and _tm.get('fit_fp') and meta['fit_fp'] != _tm['fit_fp']:
@@ -766,9 +763,9 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                         rec['status'] = 'fail'
                         _fail(f'{cd}/{tag}: test metadata does not attest duplicate cleanup against both train and validation')
                 else:
-                    # Without this attestation near-duplicates between test and
-                    # train/validation cannot be ruled out; exact-row checks
-                    # alone would leave the cache labelled clean.
+                    # The attestation is required: exact-row checks alone do
+                    # not rule out near-duplicates between test and
+                    # train/validation.
                     rec['status'] = 'fail'
                     _fail(f'{cd}/{tag}: test metadata has no near-duplicate cleanup '
                           'attestation against train and validation')
@@ -814,10 +811,9 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                     _fail(f'{cd}/{tag}: {shared_val_test} test rows exactly duplicate a validation row')
                 _ted_path = os.path.join(cd, f'test_doc_ids_{_ttag}.npy')
                 if os.path.exists(_ted_path):
-                    # Substituting an empty array for a missing train/val
-                    # sidecar would make the intersection trivially zero and
-                    # report an unverifiable test cache as isolated.  Require
-                    # BOTH paired sidecars before claiming zero overlap.
+                    # Both paired sidecars are required before claiming zero
+                    # overlap; a missing sidecar leaves the isolation
+                    # unverified.
                     _have_trd = os.path.exists(_trd_path)
                     _have_vad = os.path.exists(_vad_path)
                     if not (_have_trd and _have_vad):

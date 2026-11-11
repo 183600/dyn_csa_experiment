@@ -1507,7 +1507,7 @@ def t_combined_seed_doc_uncertainty():
     per_seed_lp = []
     for off in (0.0, 0.2, 0.4):
         nll = [1.0 + off + 0.01 * j for j in range(32)]
-        # log(PPL) is the pooled cross-entropy, not log(CE).
+        # log(PPL) is the pooled cross-entropy.
         per_seed_lp.append(sum(nll) / (32 * 50))
     _se_seed = _np.std(per_seed_lp, ddof=1) / math.sqrt(3)
     assert abs(r['se_seed_logppl'] - float(_se_seed)) < 1e-12, (r, _se_seed)
@@ -1516,8 +1516,8 @@ def t_combined_seed_doc_uncertainty():
     assert abs(r['se_combined_logppl'] - _comb) < 1e-12, r
     assert abs(r['component_ratio_seed_over_doc'] - r['se_seed_logppl'] / r['se_doc_logppl']) < 1e-12, r
     lo, hi = r['ci95_ppl']
-    # The combined interval is on the PPL scale, not the CE scale: it must
-    # contain the recs' PPLs (log PPL = pooled CE).
+    # The combined interval is on the PPL scale and must contain the recs'
+    # PPLs.
     assert 0 < lo < hi, r
     assert lo > 1.0 and hi > 1.0, r
     assert all(lo <= rec['ppl'] <= hi for rec in recs), (r, [rec['ppl'] for rec in recs])
@@ -3498,7 +3498,7 @@ def t_audit_split_test_metadata_discipline():
         tr = np.arange(40, dtype=np.int64)
         va = (np.arange(16, dtype=np.int64) + 40).reshape(2, 8)
         # The held-out cache may use a different sequence length than the
-        # training cache (e.g. 512 vs 4097); pairing must not require equality.
+        # training cache (e.g. 512 vs 4097).
         te = (np.arange(32, dtype=np.int64) + 56).reshape(2, 16)
         np.save(os.path.join(d, f'train_ids_{tag}.npy'), tr)
         np.save(os.path.join(d, f'val_batch_{tag}.npy'), va)
