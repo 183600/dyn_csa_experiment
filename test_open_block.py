@@ -541,6 +541,25 @@ def t_record_identity_and_completeness():
     assert OB._rec_by_cell({'A::seed0': base}, fp)
 
 
+def t_summary_refuses_nonobject():
+    import json
+    import tempfile
+    import shutil
+    import open_block_supp as OB
+    d = tempfile.mkdtemp()
+    try:
+        with open(os.path.join(d, 'summary.json'), 'w', encoding='utf-8') as f:
+            json.dump([{'variant': 'A', 'seed': 0, 'ppl': 1.0}], f)
+        try:
+            OB._load_summary(d)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('a valid-JSON non-object summary must be refused, not treated as empty')
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 CHECKS = [
     ('K1 open-block config/segmenter', t_config_and_segmenter),
     ('K2 prefix pooling reference/grad', t_prefix_pool_reference),
@@ -555,6 +574,7 @@ CHECKS = [
     ('K11 open candidate edge cases', t_open_candidate_edge_cases),
     ('K12 paired seeds are unique', t_paired_seeds_are_unique),
     ('K13 record identity/completeness', t_record_identity_and_completeness),
+    ('K14 summary refuses non-object payloads', t_summary_refuses_nonobject),
 ]
 
 

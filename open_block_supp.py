@@ -138,9 +138,16 @@ def _load_summary(outdir):
         try:
             with open(p, encoding='utf-8') as f:
                 d = json.load(f)
-            return d if isinstance(d, dict) else {}
         except Exception as e:
             print(f'[open-block] WARNING: unreadable summary {p} ({type(e).__name__}: {e}); starting a fresh one')
+            return {}
+        if not isinstance(d, dict):
+            # Valid JSON but the wrong shape is corrupt evidence, not an empty
+            # panel: silently returning {} would let the next save overwrite
+            # whatever records the file still holds.
+            raise ValueError(f'open-block summary {p} is valid JSON but not an object '
+                             f'({type(d).__name__}); refusing to overwrite it')
+        return d
     return {}
 
 
