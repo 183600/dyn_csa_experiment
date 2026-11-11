@@ -3549,6 +3549,13 @@ def t_audit_split_sequence_overlap():
                                     np.array([[1, 2, 3]], dtype=dt_b)) == 1, (dt_a, dt_b)
     assert A._row_overlap_count(np.array([[1, 2]], dtype=np.int64),
                                 np.array([[1, 3]], dtype=np.int32)) == 0
+    import data_guard as DG
+    assert DG._matrix_fingerprint(np.array([[2 ** 53]], dtype=np.int64)) != \
+        DG._matrix_fingerprint(np.array([[2 ** 53 + 1]], dtype=np.int64))
+    # In-range integer tables keep their historical float64 fingerprint, which
+    # is exact below 2**53 and therefore stable across integer widths.
+    lo = np.array([[1, 2, 3]], dtype=np.int64)
+    assert DG._matrix_fingerprint(lo) == DG._matrix_fingerprint(lo.astype(np.int32))
 
 
 def t_categorical_and_cache_guards():

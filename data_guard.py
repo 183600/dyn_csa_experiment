@@ -1539,8 +1539,25 @@ def _matrix_fingerprint(X):
     # from the actual width.
     _w = int(arr.shape[1]) if arr.ndim > 1 else 1
     _step = _hash_row_block(_w, 1 << 20)
+    # float64 preserves integers up to 2**53 exactly.  Beyond that two
+    # different token ids can round to the same float and produce a false
+    # corpus fingerprint, so those integral tables are hashed as exact
+    # uint64 instead.  In-range tables keep their historical fingerprint.
+    _integral = (arr.dtype != object
+                 and (np.issubdtype(arr.dtype, np.integer)
+                      or np.issubdtype(arr.dtype, np.bool_)))
+    _wide_int = False
+    if _integral and arr.size:
+        _lim = 2 ** 53
+        if np.issubdtype(arr.dtype, np.unsignedinteger):
+            _wide_int = bool((arr > _lim).any())
+        else:
+            _wide_int = bool(((arr > _lim) | (arr < -_lim)).any())
     for start in range(0, arr.shape[0], _step):
-        block = np.asarray(arr[start:start + _step], dtype=np.float64)
+        if _wide_int:
+            block = np.ascontiguousarray(arr[start:start + _step], dtype=np.uint64)
+        else:
+            block = np.asarray(arr[start:start + _step], dtype=np.float64)
         h.update(np.ascontiguousarray(block).tobytes())
     return h.hexdigest()[:16]
 
