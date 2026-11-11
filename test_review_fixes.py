@@ -1374,6 +1374,9 @@ def t_segment_empty():
     bids, hon, counts = L._segment(0, [], 2, 128)
     assert bids.size == 0 and hon == {} and counts == []
     assert L._segment(1, [], 2, 128)[2] == [1]
+    for n in (0, -1):
+        base = L.blocks_from_cuts(n, [], 2, 8, torch.device('cpu'))
+        assert base.numel() == 0, (n, base)
 
 
 def t_segment_uniform_stride_only_when_all_cuts():

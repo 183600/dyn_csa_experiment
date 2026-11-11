@@ -1148,7 +1148,10 @@ def _d2h_stage(shape, dtype, device):
         return (None, None)
 
 def blocks_from_cuts(n, want_cut_list, min_block, max_block, device, return_count=False, return_honoured=False):
-    if n == 0:
+    # _segment() treats any non-positive length as "no tokens, no blocks";
+    # the public wrapper must do the same instead of calling max() on an
+    # empty count table for n < 0.
+    if n <= 0:
         base, cnt, hon = (torch.empty(0, dtype=torch.long, device=device), 0, {})
     elif n == 1:
         base, cnt, hon = (torch.zeros(1, dtype=torch.long, device=device), 1, {})
