@@ -4334,6 +4334,12 @@ def t_categorical_shift_requires_two_bins():
             raise AssertionError(f'max_categories={bad!r} must be rejected')
     r = L.categorical_shift_report([1, 1, 2], [1, 2], max_categories=2)
     assert r['n_reference'] == 3 and r['n_holdout'] == 2, r
+    # max_categories folds rare REFERENCE categories into the "other" bin.
+    # A holdout value that exists in the reference is therefore not unseen,
+    # even though it does not own a displayed bin.
+    r = L.categorical_shift_report(['a'] * 10 + ['b'] * 9 + ['rare'],
+                                   ['a', 'rare', 'never'], max_categories=2)
+    assert abs(r['unseen_rate'] - 1.0 / 3.0) < 1e-12, r
 
 
 def t_data_quality_unhashable_labels():

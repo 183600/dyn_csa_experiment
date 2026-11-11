@@ -2129,6 +2129,11 @@ def categorical_shift_report(reference, holdout, *, max_categories=None):
     else:
         keep = sorted(counts, key=_sort_key)
     keep_index = {key: i for i, key in enumerate(keep)}
+    # `keep` may be TRUNCATED by max_categories, but a holdout value that was a
+    # genuine reference category (just not frequent enough to get its own bin)
+    # is not "unseen" — it is represented by the reference's other-bin.  Track
+    # the full reference vocabulary separately from the displayed bins.
+    reference_keys = set(counts)
 
     def _hist(keys):
         h = np.zeros(len(keep) + 1, dtype=np.float64)
@@ -2153,8 +2158,8 @@ def categorical_shift_report(reference, holdout, *, max_categories=None):
 
     tv = 0.5 * float(np.sum(np.abs(p - q)))
     js = 0.5 * _kl(p, m) + 0.5 * _kl(q, m)
-    if keep:
-        unseen = float(np.mean([key not in keep_index for key in hold_keys]))
+    if reference_keys:
+        unseen = float(np.mean([key not in reference_keys for key in hold_keys]))
     else:
         # No reference category exists (e.g. an empty training side): every
         # holdout token is unseen, not zero.
