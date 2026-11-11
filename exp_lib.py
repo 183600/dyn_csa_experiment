@@ -5671,6 +5671,8 @@ def _ids_fp(train_ids):
             _tdtype = np.dtype(np.asarray(train_ids).dtype).str
             with open(_side, encoding='utf-8') as _sf:
                 _rec = json.load(_sf)
+            if not isinstance(_rec, dict):
+                raise ValueError('idsfp sidecar is not a JSON object')
             if ((int(_rec.get('size', -1)), int(_rec.get('mtime_ns', -1)),
                  int(_rec.get('ctime_ns', -1)), int(_rec.get('inode', -1))) == _stat
                     and isinstance(_rec.get('fp'), str)
