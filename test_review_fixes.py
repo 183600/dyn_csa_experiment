@@ -5048,6 +5048,13 @@ def t_selection_attribution_contract():
             json.dump({'cells': [bool_cell]}, f)
         r6 = A.audit_selection()
         assert r6['status'] == 'fail' and any('boolean' in x for x in r6['problems']), r6
+        # Fractions must not be truncated into a geometry that satisfies
+        # k <= n_blocks (1.9 -> 1, 1.1 -> 1) and then certify the cell.
+        frac_cell = dict(cell, k=1.9, n_blocks=1.1)
+        with open(os.path.join(td, 'analysis_mechanism', 'selection_attribution.json'), 'w', encoding='utf-8') as f:
+            json.dump({'cells': [frac_cell]}, f)
+        r7 = A.audit_selection()
+        assert r7['status'] == 'fail' and any('non-integral geometry' in x for x in r7['problems']), r7
     finally:
         A.REPO = old_repo
         shutil.rmtree(td, ignore_errors=True)

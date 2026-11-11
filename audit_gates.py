@@ -2140,13 +2140,31 @@ def audit_selection(path='analysis_mechanism/selection_attribution.json'):
             out['problems'].append(
                 f'cell {i} ({c.get("arm")}): boolean values in numeric fields {_bool_fields}')
             continue
+        def _exact_int(v):
+            if isinstance(v, (bool, np.bool_)):
+                return None
+            try:
+                f = float(v)
+            except (TypeError, ValueError, OverflowError):
+                return None
+            if not (math.isfinite(f) and f == math.floor(f)):
+                return None
+            return int(f)
+
+        _ints = {name: _exact_int(c[name]) for name in
+                 ('eval_len', 'k', 'n_blocks', 'n_queries')}
+        _bad_int = [name for name, v in _ints.items() if v is None]
+        if _bad_int:
+            out['problems'].append(
+                f'cell {i} ({c.get("arm")}): non-integral geometry fields {_bad_int}')
+            continue
         try:
-            k, B = int(c['k']), int(c['n_blocks'])
             rec, mass, base = (float(c['recall_at_k']), float(c['mass_covered']), float(c['random_baseline']))
-            nq = int(c['n_queries'])
         except (TypeError, ValueError, OverflowError):
             out['problems'].append(f'cell {i}: non-numeric fields')
             continue
+        k, B = _ints['k'], _ints['n_blocks']
+        nq = _ints['n_queries']
         _range_ok = bool(0.0 <= rec <= 1.0 and 0.0 <= mass <= 1.0 and 0.0 <= base <= 1.0)
         if not _range_ok:
             out['problems'].append(f'cell {i}: recall/mass/baseline outside [0,1]')
