@@ -10017,9 +10017,10 @@ def paired_log_ratio(with_values, without_values, seeds=None):
     ss = list(range(len(wa))) if seeds is None else list(seeds)
     if len(ss) != len(wa):
         raise ValueError('paired_log_ratio seeds length %d does not match vectors length %d' % (len(ss), len(wa)))
-    if len(set(ss)) != len(ss):
+    if len({_seed_identity(x) for x in ss}) != len(ss):
         # Two rows for one seed are not independent observations; downstream
-        # means/SEs would silently double-count that seed.
+        # means/SEs would silently double-count that seed.  Compare the
+        # normalised identity so 0 and "0" (the same JSON seed) collide.
         raise ValueError('paired_log_ratio got duplicate seeds %r' % (ss,))
     effects, kept, dropped = [], [], []
     for s, a, b in zip(ss, wa, wb):
@@ -10084,10 +10085,11 @@ def _scale_points(points):
                     if f is not None]
             seeds_kept = [s for s, _v in keep]
             effects = [f for _s, f in keep]
-        if len(set(seeds_kept)) != len(seeds_kept):
+        if len({_seed_identity(x) for x in seeds_kept}) != len(seeds_kept):
             # A repeated seed would be counted as two independent observations
             # and shrink every within-scale SE in meta_analyze_effects; this
-            # must be a hard error, not silently "n looks larger".
+            # must be a hard error, not silently "n looks larger".  Normalise
+            # first so 0 and "0" from a JSON round-trip cannot slip through.
             raise ValueError('scale point %r: duplicate seeds %r' % (label, seeds_kept))
         try:
             sc = float(scale)
@@ -10238,9 +10240,10 @@ def scale_interaction(low_effects, high_effects, *, low_label='low', high_label=
     ss = list(range(len(a))) if seeds is None else list(seeds)
     if len(ss) != len(a):
         raise ValueError('scale_interaction seeds length does not match effects')
-    if len(set(ss)) != len(ss):
+    if len({_seed_identity(x) for x in ss}) != len(ss):
         # A repeated seed would enter paired_effect_stats as two independent
-        # observations and shrink the interaction SE.
+        # observations and shrink the interaction SE.  Normalise so 0 and
+        # "0" (the same JSON seed) collide.
         raise ValueError('scale_interaction got duplicate seeds %r' % (ss,))
     diff, kept = [], []
     for s, x, y in zip(ss, a, b):
@@ -10942,6 +10945,20 @@ def _as_seed_int(v):
         return int(v)
     except (TypeError, ValueError, OverflowError):
         return None
+
+def _seed_identity(v):
+    """Normalise a seed id for duplicate/pairing checks.
+
+    JSON round-trips can leave the same seed as ``0`` or ``"0"``; raw set
+    membership treats those as distinct and would count one seed twice.  The
+    numeric normal form is used when available; non-numeric ids keep a typed
+    wrapper so ``True``/``1`` and other Python equality collisions stay
+    distinct.
+    """
+    n = _as_seed_int(v)
+    if n is not None:
+        return n
+    return ('__seed_id__', type(v).__name__, repr(v))
 
 def read_panel(outdir):
     sp = os.path.join(outdir, 'summary.json')

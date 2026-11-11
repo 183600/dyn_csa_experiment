@@ -367,15 +367,23 @@ def t_scale_input_guards():
         raise AssertionError('two rows for one scale label must not be pooled as independent studies')
     except ValueError:
         pass
+    # JSON round-trips can leave the same seed as 0 or "0"; all three scale
+    # entry points must normalise before checking for duplicates.
+    try:
+        L.meta_analyze_effects([{'label': 'A', 'scale': 1.0, 'effects': [1.0, 2.0], 'seeds': [0, '0']}])
+        raise AssertionError('meta_analyze_effects must normalise 0 and "0" to the same seed')
+    except ValueError:
+        pass
     for fn, args in (
         (L.paired_log_ratio, ([1.0, 2.0], [1.1, 2.1])),
         (L.scale_interaction, ([1.0, 2.0], [1.1, 2.1])),
     ):
-        try:
-            fn(*args, seeds=[0, 0])
-            raise AssertionError(f'{fn.__name__} must reject duplicate seeds instead of double-counting them')
-        except ValueError:
-            pass
+        for dup in ([0, 0], [0, '0']):
+            try:
+                fn(*args, seeds=dup)
+                raise AssertionError(f'{fn.__name__} must reject duplicate seeds instead of double-counting them')
+            except ValueError:
+                pass
 
 
 def t_exact_signflip_baseline():
