@@ -10970,9 +10970,16 @@ def _as_seed_int(v):
     if isinstance(v, numbers.Real):
         # np.float32/np.float64 are Real but not all are Python ``float``;
         # int() would silently truncate 1.5 to 1, turning an invalid seed
-        # into a different valid one.
+        # into a different valid one.  Above 2**53 a float no longer
+        # represents every integer, so accepting it would let a requested
+        # seed collapse to a different one (the same rule as
+        # normalize_seed_list).
         f = float(v)
-        return int(f) if math.isfinite(f) and f.is_integer() else None
+        if not (math.isfinite(f) and f.is_integer()):
+            return None
+        if abs(f) >= 2 ** 53:
+            return None
+        return int(f)
     try:
         return int(v)
     except (TypeError, ValueError, OverflowError):
@@ -16288,8 +16295,14 @@ def ckpt_file_name(variant, seed, tag):
 
     The variant comes from user config; without sanitisation a value like
     ``../escape`` or ``/tmp/escape`` escapes ``ckpt_dir``.  Keep the normal
-    names unchanged while making the component a single safe path element."""
-    return (f'{_safe_path_component(variant)}_seed{int(seed)}_'
+    names unchanged while making the component a single safe path element.
+    The seed uses the same exact-integer contract as the panel plan: a
+    boolean, a fractional float, or a float above 2**53 is refused rather
+    than silently truncated to a different checkpoint identity."""
+    seed_i = _as_seed_int(seed)
+    if seed_i is None:
+        raise ValueError(f'ckpt_file_name: seed must be an exact integer, got {seed!r}')
+    return (f'{_safe_path_component(variant)}_seed{seed_i}_'
             f'{_safe_path_component(tag)}.pt')
 
 

@@ -1812,6 +1812,11 @@ def t_seed_axis_normalization():
             raise AssertionError(f'normalize_seed_list must reject {bad!r}')
     # Exact Python integers above 2**53 are preserved (only lossy floats fail).
     assert L.normalize_seed_list(['9007199254740993']) == [9007199254740993]
+    # The same exact-integer contract applies wherever a recorded/checkpoint
+    # seed is normalised, not only to the panel planner.
+    assert L._as_seed_int(float(2 ** 53)) is None
+    assert L._as_seed_int(float(2 ** 53 - 1)) == 2 ** 53 - 1
+    assert L._as_seed_int(1.5) is None and L._as_seed_int(True) is None
     d = tempfile.mkdtemp()
     _saved_load = L.load_run_corpus
     _old_skip_overfit = os.environ.get('CSA_SKIP_OVERFIT')
@@ -2315,6 +2320,15 @@ def t_atomic_torch_save():
         assert '/' not in L.ckpt_file_name('../escape', 0, 'final')
         assert os.path.basename(L.ckpt_file_name('/tmp/escape', 1, 'final')) == '_tmp_escape_seed1_final.pt'
         assert os.path.basename(L.ckpt_file_name('csa_dynamic', 2, 'final')) == 'csa_dynamic_seed2_final.pt'
+        # A boolean/fractional/lossy seed is not silently truncated into a
+        # different checkpoint identity.
+        for _bad_seed in (True, 1.5, float(2 ** 53)):
+            try:
+                L.ckpt_file_name('csa_dynamic', _bad_seed, 'final')
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f'ckpt_file_name accepted invalid seed {_bad_seed!r}')
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
