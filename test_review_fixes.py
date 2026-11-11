@@ -3128,6 +3128,13 @@ def t_categorical_shift_empty_reference():
     r = L.categorical_shift_report([], [1, 2, 3])
     assert r['n_reference'] == 0 and r['n_holdout'] == 3, r
     assert r['unseen_rate'] == 1.0 and r['total_variation'] > 0.0, r
+    # Composite (tuple/list) categories are single identities; reshape(-1)
+    # used to split them into scalar categories and corrupt every frequency.
+    for ref in ([('a', 1), ('b', 2)], [['a', 1], ['b', 2]],
+                np.array([('a', 1), ('b', 2)], dtype=object)):
+        r = L.categorical_shift_report(ref, [('a', 1)])
+        assert r['n_reference'] == 2 and r['n_holdout'] == 1, (ref, r)
+        assert r['unseen_rate'] == 0.0, (ref, r)
     try:
         L.categorical_shift_report([1, 2], [1, 2], max_categories=0)
     except ValueError:

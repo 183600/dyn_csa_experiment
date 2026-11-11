@@ -2219,8 +2219,32 @@ def categorical_shift_report(reference, holdout, *, max_categories=None):
     category frequencies; sorting the identity keys on ``(type, repr)`` keeps
     the report computable and deterministic without conflating distinct values.
     """
-    ref = np.asarray(reference, dtype=object).reshape(-1)
-    hold = np.asarray(holdout, dtype=object).reshape(-1)
+    def _categories(values):
+        # Categories are hashable identities, not a flat scalar column: a
+        # list of tuple labels must stay two categories, not be expanded into
+        # four scalars by reshape(-1).  Rows of a genuine 2-D array are one
+        # composite category each.
+        def _item(v):
+            # A list is the unhashable spelling of the same composite
+            # category; normalise it so a row from a 2-D array and a tuple
+            # supplied by the caller compare equal.
+            return tuple(v) if isinstance(v, list) else v
+
+        if isinstance(values, np.ndarray):
+            if values.ndim == 0:
+                return [values.item()]
+            if values.ndim == 1:
+                return values.tolist()
+            return [_item(v) for v in values.tolist()]
+        if isinstance(values, (str, bytes)):
+            return [values]
+        try:
+            return [_item(v) for v in values]
+        except TypeError:
+            return [values]
+
+    ref = _categories(reference)
+    hold = _categories(holdout)
     if max_categories is not None:
         max_categories = _check_count('max_categories', max_categories, positive=True)
         if max_categories < 2:
@@ -2228,9 +2252,9 @@ def categorical_shift_report(reference, holdout, *, max_categories=None):
                 'max_categories must be at least 2: a single bin would collapse '
                 'the reference distribution and report zero divergence while '
                 'every holdout category is unseen')
-    if hold.size == 0:
+    if not hold:
         return {'js_divergence': 0.0, 'total_variation': 0.0,
-                'n_reference': int(ref.size), 'n_holdout': 0,
+                'n_reference': len(ref), 'n_holdout': 0,
                 'unseen_rate': 0.0}
 
     def _key(value):
@@ -2239,8 +2263,8 @@ def categorical_shift_report(reference, holdout, *, max_categories=None):
     def _sort_key(value):
         return (type(value).__name__, repr(value))
 
-    ref_keys = [_key(v) for v in ref.tolist()]
-    hold_keys = [_key(v) for v in hold.tolist()]
+    ref_keys = [_key(v) for v in ref]
+    hold_keys = [_key(v) for v in hold]
     counts = {}
     for key in ref_keys:
         counts[key] = counts.get(key, 0) + 1
@@ -2294,7 +2318,7 @@ def categorical_shift_report(reference, holdout, *, max_categories=None):
     return {
         'js_divergence': js,
         'total_variation': tv,
-        'n_reference': int(ref.size),
-        'n_holdout': int(hold.size),
+        'n_reference': int(len(ref)),
+        'n_holdout': int(len(hold)),
         'unseen_rate': unseen,
     }
