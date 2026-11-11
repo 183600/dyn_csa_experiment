@@ -384,6 +384,12 @@ def t_scale_input_guards():
                 raise AssertionError(f'{fn.__name__} must reject duplicate seeds instead of double-counting them')
             except ValueError:
                 pass
+    # Boolean flags are not measurements: they must be dropped BEFORE float()
+    # turns them into PPL/effect values.
+    r = L.paired_log_ratio([True, 1.0, 2.0], [1.0, 1.0, 1.0])
+    assert r['n'] == 2 and r['dropped_seeds'] == [0], r
+    assert L.scale_interaction([True, 0.1], [1.0, 0.2])['n'] == 1
+    assert L.loglog_regression([(True, 1.0), (2, 4), (4, 16)])['n_points'] == 2
 
 
 def t_exact_signflip_baseline():

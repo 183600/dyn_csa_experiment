@@ -10069,6 +10069,11 @@ def paired_log_ratio(with_values, without_values, seeds=None):
         raise ValueError('paired_log_ratio got duplicate seeds %r' % (ss,))
     effects, kept, dropped = [], [], []
     for s, a, b in zip(ss, wa, wb):
+        # Boolean flags are not PPL measurements.  float(True) would become
+        # PPL 1.0 and enter the log-ratio as a real observation.
+        if isinstance(a, (bool, np.bool_)) or isinstance(b, (bool, np.bool_)):
+            dropped.append(s)
+            continue
         try:
             fa, fb = float(a), float(b)
         except (TypeError, ValueError, OverflowError):
@@ -10292,6 +10297,10 @@ def scale_interaction(low_effects, high_effects, *, low_label='low', high_label=
         raise ValueError('scale_interaction got duplicate seeds %r' % (ss,))
     diff, kept = [], []
     for s, x, y in zip(ss, a, b):
+        # Boolean flags are not scale effects; reject them before float()
+        # turns them into 0/1 observations.
+        if isinstance(x, (bool, np.bool_)) or isinstance(y, (bool, np.bool_)):
+            continue
         try:
             fx, fy = float(x), float(y)
         except (TypeError, ValueError, OverflowError):
@@ -10693,6 +10702,8 @@ def loglog_regression(points, *, alpha=0.05):
         elif isinstance(p, (tuple, list)) and len(p) >= 2:
             x, y, label = p[0], p[1], i
         else:
+            continue
+        if isinstance(x, (bool, np.bool_)) or isinstance(y, (bool, np.bool_)):
             continue
         try:
             fx, fy = float(x), float(y)
