@@ -401,6 +401,10 @@ def t_exact_signflip_at_scale():
         assert r['method'] == 'exact-mitm', f'n={n} must stay exact via meet-in-the-middle, got {r}'
         assert abs(r['p'] - 2.0 / (1 << n)) < 1e-18, f'all-equal d n={n}: only +/- assignments reach the observed mean, p={r["p"]}'
     assert BR.exact_signflip([0.7] * 22)['method'] == 'exact-mitm', 'the zero-GPU report builder must use the same exact path'
+    # The report's displayed test floor must be the exact 2/2^n for every n,
+    # not a fixed 1/200001 surrogate above the n<=20 enumeration path.
+    for n in (6, 12, 22, 40, 60):
+        assert abs(BR.signflip_p_floor(n) - L.signflip_p_floor(n)) < 1e-18, n
     assert abs(BR.exact_signflip([0.7] * 22)['p_exact_signflip'] - 2.0 / (1 << 22)) < 1e-15
     z = L.exact_signflip_p([0.0] * 24)
     assert z['p'] == 1.0 and z['method'] == 'exact-mitm', 'every sign assignment matches a zero observed mean'

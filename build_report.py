@@ -199,6 +199,12 @@ def _signflip_saddlepoint_p(values):
     return float(min(1.0, max(floor, p))), 'saddlepoint'
 
 
+def signflip_p_floor(n):
+    """Smallest achievable two-sided exact sign-flip p for n nonzero deltas."""
+    n = int(n)
+    return min(1.0, math.ldexp(2.0, -n)) if n > 0 else 1.0
+
+
 def exact_signflip(deltas):
     # Same scalar contract as exp_lib.exact_signflip_p: NumPy integers and
     # floats are measurements too, non-finite/boolean values are not.
@@ -744,7 +750,7 @@ def sec_p0w():
             if _st is None:
                 continue
             _d = _st['mean']
-            _floor = 2.0 / (1 << _st['n']) if _st['n'] and _st['n'] <= 20 else 1.0 / 200001.0
+            _floor = signflip_p_floor(_st['n'])
             _same_dir = all((x != 0 and (x > 0) == (_d > 0) for x in _dd))
             _gate_ok = _sig_gate(_st, label=f'P0W csa_fixed warm={w} vs warm=0', family='P0W')
             if not _gate_ok:
