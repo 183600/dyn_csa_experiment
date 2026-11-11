@@ -382,8 +382,7 @@ def _geom_nbytes(geom):
     # Charge the real (physical) storage of every integer table a geometry
     # entry holds, including its lazily-built gather constants.  The eight
     # scalar tables are slices of ONE packed `_buf`, and the int64 views can
-    # share storage too, so charge each underlying storage exactly once
-    # rather than once per view.
+    # share storage too, so charge each underlying storage exactly once.
     seen = {}
     def _charge(t):
         if t is None:
@@ -2289,7 +2288,7 @@ def _indexer_topk_chunked(scores, last_tok, t0, T, Bm, k_out, need_soft, out_dty
     R, tc = int(scores.shape[0]), int(scores.shape[1])
     dev = scores.device
     k_out = max(0, min(int(k_out), int(Bm)))
-    # Chunk width: keep one candidate tile around a few megabytes.
+    # Chunk width for the candidate tile.
     bc = max(64, min(int(Bm), (4 << 20) // max(1, R * tc * 4)))
     b = torch.arange(int(Bm), device=dev, dtype=torch.long)
     lt = last_tok[:, :Bm].to(torch.int64)

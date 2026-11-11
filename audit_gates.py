@@ -453,10 +453,7 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
 # 1b) split discipline：划分顺序 / 群组完整性 / 重复行 / 分布偏移
 # ---------------------------------------------------------------------------
 
-# Above this many elements the length-n permutation behind
-# rng.choice(..., replace=False) is not worth its memory in an audit
-# box (>= 2**28 * 8 B); _sample_tokens then draws the same uniform
-# without-replacement sample by rejection in O(cap) memory instead.
+# Threshold for switching to the rejection sampler below.
 _CHOICE_PERM_MAX_ELEMS = 1 << 28
 
 
@@ -468,13 +465,9 @@ def _sample_tokens(arr, cap=1000000, seed=0):
         return a
     n = int(a.size)
     rng = np.random.default_rng(seed)
-    # rng.choice(..., replace=False) materialises a length-n permutation
-    # (O(n) work and memory).  That is fine for today's corpus sizes, but a
-    # scale-up corpus makes it an allocation hazard, so above the threshold
-    # where the permutation does not fit a sane audit box the same kind of
-    # uniform without-replacement sample is drawn by rejection instead:
-    # every K-subset remains equally likely and the draw stays
-    # seed-deterministic, with O(cap) memory.
+    # Above the threshold the same uniform without-replacement sample is
+    # drawn by rejection: every K-subset remains equally likely and the draw
+    # stays seed-deterministic.
     if n <= _CHOICE_PERM_MAX_ELEMS:
         idx = rng.choice(n, size=int(cap), replace=False)
     else:

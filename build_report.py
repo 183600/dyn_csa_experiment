@@ -83,7 +83,7 @@ def sp(x, nd=2):
 
 def _ppl_value(entry):
     """Primary PPL aggregate: pooled token-level NLL when the records carry it,
-    otherwise the historical arithmetic seed mean (explicitly labelled)."""
+    otherwise the arithmetic seed mean (explicitly labelled)."""
     if not isinstance(entry, dict):
         return None
     for k in ('ppl_primary', 'ppl_pooled', 'ppl_mean'):

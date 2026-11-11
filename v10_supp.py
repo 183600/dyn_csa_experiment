@@ -902,8 +902,7 @@ def _hist_by_seed(outdir, variant, raw=None):
         if not (isinstance(r, dict) and r.get('variant') == variant and r.get('ppl_history')):
             continue
         # Use the shared exact-integer contract: this also rejects np.float32
-        # fractions (int() would truncate 1.5 -> 1) and lossy floats >= 2**53,
-        # which the local float-only branch used to accept.
+        # fractions (int() would truncate 1.5 -> 1) and lossy floats >= 2**53.
         _s_raw = r.get('seed')
         s = L._as_seed_int(_s_raw)
         if s is None:

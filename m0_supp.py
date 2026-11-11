@@ -466,14 +466,13 @@ def _calibrate_panel(run_cfg, guard, panel):
     """Measure the per-step rate at the panel geometry before planning.
 
     TimeGuard's uncalibrated default is a base-geometry rate extrapolated with
-    an analytic factor; on the S1/S2 ladder that extrapolation is many orders
-    of magnitude too pessimistic (seq 512 -> 8192 and d 256 -> 768/1024 are far
-    outside the fitted range), so a fresh state file would mark every cell
-    `skipped_cap` without ever training.  A short real run at the EXACT panel
-    geometry gives the guard an exact `sps_by_class` entry per variant, and the
-    per-variant key keeps a dense arm from being priced as a sparse one.
+    an analytic factor; on the S1/S2 ladder that extrapolation is not reliable,
+    so a fresh state file could mark every cell `skipped_cap` without ever
+    training.  A short real run at the EXACT panel geometry gives the guard an
+    exact `sps_by_class` entry per variant, and the per-variant key keeps a
+    dense arm from being priced as a sparse one.
 
-    Calibration seconds are booked to the same cap (they are real GPU time).
+    Calibration time is booked to the same cap.
     `M0_CALIB_STEPS` (default 20) controls the probe length; set it to 0 to
     skip when a prior state file already holds every variant's calibration.
     """

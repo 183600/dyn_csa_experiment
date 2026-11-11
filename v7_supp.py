@@ -759,7 +759,7 @@ def install_patches():
     # Fall back to SmallGPTRoPE's actual base (the class it was defined
     # against at import time) rather than the current L.SmallGPT: if another
     # patcher replaced L.SmallGPT before this install, capturing it here while
-    # SmallGPTRoPE keeps the older base would make the two factory branches
+    # SmallGPTRoPE uses its own base would make the two factory branches
     # inherit from different class chains.
     _orig_smallgpt = L.__dict__.get('_v7_orig_smallgpt', SmallGPTRoPE.__mro__[1])
     L.__dict__['_v7_orig_smallgpt'] = _orig_smallgpt
@@ -2430,8 +2430,7 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
          'batch_size': batch_size}, device=L.DEVICE)
     # The ACTUAL per-arm dispatch, not the backend capability: every frozen
     # rope arm takes the per-row `_single_rope` loop even when the CUDA batched
-    # twin exists.  Using the backend default here wrote eager_batch=True into
-    # the recipe while train_variant recorded False (and vice versa).
+    # twin exists.  The recipe and train_variant must record the same value.
     _plan_cfgs = L.make_layer_cfgs(6, v)
     _eager_mode = L._uses_batched_eager(_plan_cfgs, L.DEVICE, batch_size)
     _tk_fp = L.training_knobs_fingerprint(amp_dtype=_amp_mode, eager_batch=_eager_mode)

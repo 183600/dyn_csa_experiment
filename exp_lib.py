@@ -405,8 +405,8 @@ def _safe_exp_ppl(x):
 
     ``math.exp`` raises once the exponent exceeds ~709.  A training run that
     has diverged but still produced finite CE must be recorded as ``inf`` and
-    diagnosed, not crash the eval callback.  The clamp mirrors the historical
-    ``eval_ppl`` overflow behaviour while making the CI bounds consistent."""
+    diagnosed, not crash the eval callback.  The clamp keeps the CI bounds
+    consistent."""
     if isinstance(x, (bool, np.bool_)):
         return None
     try:
@@ -1207,9 +1207,8 @@ def _hoist_blocks_from_cuts(T, gate_lists, min_block, max_block, device, want_ho
     if want_honoured and T > 1:
         # Build the honoured table on the host as float32 and let _h2d_async
         # perform the cast+staging.  A direct H2D-pool borrow cannot expose a
-        # NumPy view for dtypes such as bfloat16 (used under AMP), and an
-        # abandoned borrow leaves its pinned slot reserved.  The mask is
-        # B x (T-1) exact 0.0/1.0 values.
+        # NumPy view for dtypes such as bfloat16 (used under AMP).  The mask
+        # is B x (T-1) exact 0.0/1.0 values.
         arr = np.zeros((len(gate_lists), T - 1), dtype=np.float32)
         for _i, _hon in enumerate(hons):
             if _hon:
@@ -2948,18 +2947,15 @@ def _open_prefix_geometry(bid, n_blocks=None, scope='full_prefix', window=128,
     else:
         raise ValueError(f'unknown open_block_scope {scope!r}')
     # `prefix_summary` needs only ONE candidate per query; only the singleton
-    # table is [T, P].  Never materialise an O(T^2) table for a summary just
-    # because a no-cap block is long.  The maximum prefix length is read from
-    # the device only when the singleton table actually needs its width, so
-    # the summary path performs no GPU->CPU synchronisation.
+    # table is [T, P].  The maximum prefix length is read from the device only
+    # when the singleton table actually needs its width.
     if not candidate_table:
         P = 1
     else:
         P = int(plen.max().item()) if n else 0
-        # A full-prefix singleton table is [T, P]; for a pathological no-cap
-        # block this can be O(T^2).  Fail explicitly instead of silently
-        # exhausting GPU memory; the panel reports candidate growth and can
-        # cap/evaluate in shorter slices.
+        # A full-prefix singleton table is [T, P]; a pathological no-cap block
+        # can make this very large.  Fail explicitly; the panel reports
+        # candidate growth and can cap/evaluate in shorter slices.
         if n * max(P, 1) > (16 << 20):
             raise RuntimeError(
                 f'open-block prefix candidate table would be {n}x{P} '
@@ -3013,8 +3009,7 @@ def _prefix_overlap_values(geo, Xb, Zb, B_pos_b, overlap):
     ov_len = torch.cat([torch.zeros_like(ov_len_prev[:1]), ov_len_prev], 0)
     prev_start_full = torch.cat([starts[:1], prev_start], 0)
     # The overlap-lane width is a pure function of (geo, overlap): cache it on
-    # the shared geometry dict so the GPU->CPU maximum is read once per
-    # forward.
+    # the shared geometry dict.
     _wkey = '_ov_w_' + str(int(overlap))
     Wb = geo.get(_wkey)
     if Wb is None:
@@ -5113,10 +5108,9 @@ class HybridAttention(nn.Module):
         if pre_blocks is not None:
             _prefetch_pool_geometry(self, pre_blocks, T, x.device)
         # Write each row's attention output into the batch output: the stacked
-        # buffer holds exactly the tensor torch.stack would have built (a
-        # per-row copy into the same layout), and the CopySlices backward hands
-        # each row the identical grad slice — value-identical to the stack form
-        # (transport only, design notes §6.1).
+        # buffer holds exactly the tensor torch.stack would have built, and the
+        # CopySlices backward hands each row the identical grad slice —
+        # value-identical to the stack form (transport only, design notes §6.1).
         outs = torch.empty(B, T, d, device=x.device, dtype=x.dtype)
         gates = []
         _prev_batch = _CPU_ACTIVE_BATCH[0]
@@ -8116,7 +8110,7 @@ def _narrow_memo_put(key, train_ids, value):
 
 def _cache_id_upper_bound(path):
     """Recorded token-id upper bound for a cache file, when the sibling meta
-    file provides one.  Avoids a full-corpus max() scan on legacy int64 caches."""
+    file provides one."""
     if not path:
         return None
     base = os.path.basename(str(path))
@@ -10510,7 +10504,7 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
     A width/depth comparison is not controlled if the larger model also saw a
     different tokens-per-parameter budget or silently inherited an untested
     learning-rate transfer.  This audit does not choose those values; it makes
-    them machine-checkable and persistent before a panel consumes GPU time.
+    them machine-checkable and persistent.
 
     `tiers` is a list of {name, cfg, params}: `cfg` carries steps / batch_size
     / seq_len / n_train_tokens / lr / warmup / seeds, `params` is the measured
@@ -15064,9 +15058,9 @@ class _PrefixStats:
             self.n_seq += 1
             self.age_sum += float(age.sum().item())
             self.age_max = max(self.age_max, int(age.max().item()))
-            # Ages are exact integers; int32 halves the retained diagnostic
-            # memory versus the int64 device dtype (the summary casts to
-            # float32 only when computing the quantiles).
+            # Ages are exact integers; int32 is sufficient for the retained
+            # diagnostic values (the summary casts to float32 only when
+            # computing the quantiles).
             self.age_p95.append(age.detach().to(torch.int32).cpu())
             self.outside_len_sum += float(outside_len.sum().item())
             self.outside_nonzero += int((outside_len > 0).sum().item())
@@ -16131,7 +16125,7 @@ def distributed_info():
 
     Initialises the default process group on first use when ``WORLD_SIZE > 1``
     and no group exists yet.  Single-process runs return ``(0, 1, False)`` and
-    never touch torch.distributed, so the historical path is unchanged."""
+    never touch torch.distributed."""
     if not torch.distributed.is_available():
         return (0, 1, False)
     if torch.distributed.is_initialized():
@@ -16172,10 +16166,10 @@ def _amp_requested():
 def _active_amp(device=None):
     """The autocast dtype the training path uses on ``device``.
 
-    The fp32 path is the historical, bitwise-stable one; AMP only applies on
-    CUDA.  Keeping this helper separate lets `training_knobs()` record the
-    concrete choice on a CPU analysis box (None) without pretending that a
-    GPU job ran in fp32."""
+    The fp32 path is the bitwise-stable one; AMP only applies on CUDA.
+    Keeping this helper separate lets `training_knobs()` record the concrete
+    choice on a CPU analysis box (None) without pretending that a GPU job ran
+    in fp32."""
     if device is None:
         device = DEVICE
     if getattr(device, 'type', str(device)) != 'cuda':
@@ -16349,7 +16343,6 @@ def ckpt_file_name(variant, seed, tag):
 def direct_ckpt_name(variant, seed):
     """Tagless per-cell checkpoint name used by the length/probe drivers.
 
-    These drivers historically built ``f'{variant}_seed{seed}.pt'`` directly.
     Sanitise the variant and require an exact seed so a user-supplied arm name
     cannot escape ``ckpt_dir`` or truncate a fractional seed into another
     cell's checkpoint.  Normal names are unchanged."""
@@ -16612,7 +16605,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
     # the same per-element IEEE op chain as the single-tensor form (lerp /
     # addcmul / sqrt are elementwise, so every element sees the identical
     # rounding sequence), so the update is bit-identical to the single-tensor
-    # form, and on CUDA it pins the already-default foreach path.
+    # form.
     opt = torch.optim.AdamW([{'params': decay_params, 'weight_decay': weight_decay, 'lr_scale': 1.0}, {'params': ndecay_params, 'weight_decay': 0.0, 'lr_scale': 1.0}, {'params': delta_params, 'weight_decay': 0.0, 'lr_scale': delta_lr_mult}], lr=lr, betas=OPT_ADAMW_BETAS, eps=OPT_ADAMW_EPS, foreach=True)
     if delta_params:
         print(f'    delta_logit params: {len(delta_params)} (lr x{delta_lr_mult:g})')
@@ -16641,8 +16634,8 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
             _fixed_eval = None
     _diag_stride = max(1, int(diag_every) if diag_every else max(1, int(steps) // 1000))
     # Lightweight token-range/shape checks stay at roughly every 1% of the run
-    # (plus step 0 and any post-anomaly window), not once per 1024 steps: a
-    # single corrupted window can poison all later checkpoints.
+    # (plus step 0 and any post-anomaly window): a single corrupted window can
+    # poison all later checkpoints.
     _token_check_every = max(1, int(steps) // 100)
     _diag = {'step': [], 'ce': [], 'total_loss': [], 'comp_reg': [], 'boundary_pg': [],
              'grad_norm_pre_clip': [], 'update_norm': [], 'lr': [], 'clipped': [],
@@ -17145,7 +17138,7 @@ def _lm_batch_metrics(model, x, y, vocab, chunk=64, ignore_index=None):
 
     With ``ignore_index`` set, both the loss and the accuracy are reduced over
     the valid targets only (the same denominator the caller's training loss
-    uses).  The historical non-masked path keeps its exact reduction order.
+    uses).  The non-masked path keeps its exact reduction order.
     """
     was_training = model.training
     model.eval()
@@ -17239,7 +17232,7 @@ def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
             b = 'position:last10%'
         return b
 
-    # Vectorised bucket accumulation: one bincount per chunk.
+    # Vectorised bucket accumulation.
     _bucket_names = ['position:first10%', 'position:10-50%', 'position:50-90%',
                      'position:last10%', 'target:rare(<=5 train occurrences)',
                      'target:common', 'target:boundary-token']
@@ -18315,8 +18308,8 @@ class TimeGuard:
         Geometry alone is too coarse on the B-tier ladder: a dense full-attention
         arm and a sparse CSA arm with the same shapes can differ by a large
         factor, so one shared rate would systematically under- or over-book
-        cells.  `variant=None` keeps the historical geometry-only key used by
-        the v7-v12 drivers, so existing state files stay valid."""
+        cells.  `variant=None` keeps the geometry-only key used by the v7-v12
+        drivers, so existing state files stay valid."""
         base = str((int(d), int(n_layers), int(seq_len), int(batch_size)))
         return base if variant is None else f'{base}|{variant}'
 
@@ -18742,8 +18735,7 @@ def _doc_bootstrap_ppl_ci(recs, *, n_boot=2000, seed=20261018):
     nll_col = nll_mat.sum(axis=0)
     ntok_col = ntok_mat.sum(axis=0)
     vals = np.empty(int(n_boot), dtype=float)
-    # Multinomial bootstrap counts: a single [chunk, R] count matrix is reused
-    # across draws.
+    # Multinomial bootstrap counts drawn in [chunk, R] blocks.
     _chunk = 256
     _b = 0
     while _b < int(n_boot):

@@ -1535,10 +1535,8 @@ def _matrix_fingerprint(X):
     arr = np.asarray(X)
     h = hashlib.sha256()
     h.update(str(arr.shape).encode('ascii'))
-    # Convert and hash in bounded row blocks: the whole matrix is never
-    # duplicated as float64 just to be hashed, and the block row count is
-    # sized from the actual width so a wide matrix cannot allocate a
-    # gigabyte-sized block from a fixed row count.
+    # Convert and hash in bounded row blocks; the block row count is sized
+    # from the actual width.
     _w = int(arr.shape[1]) if arr.ndim > 1 else 1
     _step = _hash_row_block(_w, 1 << 20)
     for start in range(0, arr.shape[0], _step):

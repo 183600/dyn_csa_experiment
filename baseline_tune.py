@@ -168,8 +168,8 @@ def _contrast_plan(protocol, groups, selected):
 
     The v6 and frozen-v12 arms are matched against different references, so a
     cross-group contrast would change the parameter-matching reference as well
-    as the mechanism.  Legacy protocols without `arm_groups` keep the old
-    single-method rule.
+    as the mechanism.  Protocols without `arm_groups` use the single-method
+    rule.
     """
     selected = set(selected)
     plan = []
