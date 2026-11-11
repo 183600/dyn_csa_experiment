@@ -401,6 +401,11 @@ def _assert_order_finite(order, *, name='order'):
                             f'{name} contains NaT; a temporal split needs a '
                             'well-defined order')
                     continue
+                # Only real numeric scalars can be missing.  Calling float()
+                # on every object turned the legitimate string key "nan" (or
+                # "inf") into a spurious NaN timestamp.
+                if not isinstance(value, numbers.Real) or isinstance(value, (bool, np.bool_)):
+                    continue
                 try:
                     f = float(value)
                 except (TypeError, ValueError, OverflowError):
@@ -1527,6 +1532,33 @@ def _row_keys(X):
             f'duplicate detection needs a 1-D or 2-D table, got shape {src.shape}')
     if src.ndim == 1:
         src = src.reshape(-1, 1)
+    if src.dtype == object:
+        # Object tables are often mixed/non-contiguous; converting them to
+        # float64 both crashes on string columns and loses integer precision
+        # above 2**53.  Build an exact canonical key per cell instead.
+        def _cell_key(v):
+            if isinstance(v, (bool, np.bool_)):
+                return ('bool', bool(v))
+            if isinstance(v, (int, np.integer)):
+                return ('num', int(v))
+            if isinstance(v, (float, np.floating)):
+                f = float(v)
+                if math.isnan(f):
+                    return ('nan',)
+                if math.isinf(f):
+                    return ('inf', 1 if f > 0 else -1)
+                return ('num', 0.0 if f == 0.0 else f)
+            if isinstance(v, (np.datetime64, np.timedelta64)):
+                if np.isnat(v):
+                    return ('nat', type(v).__name__)
+                return ('dt', type(v).__name__, str(v))
+            try:
+                hash(v)
+            except TypeError:
+                return ('unhashable', type(v).__name__, repr(v))
+            return ('obj', type(v).__name__, v)
+
+        return [tuple(_cell_key(v) for v in row) for row in src]
     keys = []
     # Integer/bool/datetime/string columns have an exact fixed-width byte
     # representation.  Converting them through float64 loses integers above
@@ -1622,6 +1654,10 @@ def _hashable_label(value):
 
 def _label_key(v):
     if v is None:
+        return None
+    if isinstance(v, (np.datetime64, np.timedelta64)) and np.isnat(v):
+        # NaT is a missing target, just like NaN (object-dtype labels are not
+        # normalised by ndarray.tolist() the way native datetime arrays are).
         return None
     # Only actual numeric scalars are checked for NaN/Inf.  Coercing every
     # value through float() turned legitimate categorical labels spelled
@@ -1901,13 +1937,22 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
             raw_labels = [tuple(r) for r in _rows_y]
             labels = [tuple(_label_key(v) for v in r) for r in _rows_y]
 
+        def _raw_missing_atom(v):
+            if v is None:
+                return True
+            return (isinstance(v, (np.datetime64, np.timedelta64))
+                    and np.isnat(v))
+
         def _raw_missing(v):
-            return v is None or (isinstance(v, tuple)
-                                 and all(x is None for x in v))
+            # For a multi-output target, any missing output makes the row
+            # unusable; requiring ALL outputs to be missing hid a partially
+            # corrupted row from both the missing and non-finite counters.
+            return _raw_missing_atom(v) or (isinstance(v, tuple)
+                                            and any(_raw_missing_atom(x) for x in v))
 
         def _label_missing(v):
             return v is None or (isinstance(v, tuple)
-                                 and all(x is None for x in v))
+                                 and any(x is None for x in v))
 
         missing_labels = int(sum(_label_missing(v) for v in labels))
         absent_labels = int(sum(_raw_missing(v) for v in raw_labels))
