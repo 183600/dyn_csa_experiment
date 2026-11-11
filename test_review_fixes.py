@@ -268,6 +268,12 @@ def t_training_health_classifier():
              'val_ce': 4.0 - 0.02 * i, 'val_ppl': 55.0 - 0.5 * i} for i in range(6)]
     h = L.classify_training_health(hist)
     assert h['status'] == 'nonfinite' and h['n_nonfinite'] == 1, h
+    # Boolean/string curve entries are flags/metadata, not measurements.
+    hist = [{'step': i * 100, 'train_ce': 6.0 - 0.30 * i, 'val_ce': 4.0 - 0.02 * i,
+             'val_ppl': 55.0 - 0.5 * i} for i in range(6)]
+    hist[2]['val_ce'] = True
+    h = L.classify_training_health(hist)
+    assert h['status'] == 'nonfinite' and h['n_nonfinite'] == 1, h
     # Too few points stays insufficient regardless of which side is missing.
     h = L.classify_training_health([{'step': 100, 'train_ce': 5.0, 'val_ce': 4.0, 'val_ppl': 55.0}])
     assert h['status'] == 'insufficient_data', h

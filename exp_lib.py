@@ -216,15 +216,14 @@ def _finite_curve(values):
     first_bad = None
     last_bad = None
     for i, v in enumerate(vals):
-        try:
-            fv = float(v)
-        except (TypeError, ValueError, OverflowError):
-            fv = None
-        if fv is not None and math.isfinite(fv):
+        # Booleans/strings are flags/metadata, not curve measurements (and
+        # float(True) would become a genuine loss point of 1.0).
+        fv = _finite_scalar(v)
+        if fv is not None:
             finite.append(fv)
         elif first_bad is None:
             first_bad = i
-        if fv is None or not math.isfinite(fv):
+        if fv is None:
             last_bad = i
     return {'n_points': len(vals), 'n_finite': len(finite),
             'n_nonfinite': len(vals) - len(finite),
@@ -249,12 +248,9 @@ def _curve_slope_stats(points, key, k=4):
     for p in (points if points is not None else []):
         if not isinstance(p, dict):
             continue
-        try:
-            x = float(p.get('step'))
-            y = float(p.get(key))
-        except (TypeError, ValueError, OverflowError):
-            continue
-        if math.isfinite(x) and math.isfinite(y):
+        x = _finite_scalar(p.get('step'))
+        y = _finite_scalar(p.get(key))
+        if x is not None and y is not None:
             pts.append((x, y))
     pts = pts[-max(2, int(k)):]
     if len(pts) < 2:
@@ -310,13 +306,10 @@ def classify_training_health(history, *, tail_k=4, slope_tol=None, gap_tol=None)
                 # healthy validation curve `nonfinite` and block or excuse a
                 # run for the wrong reason.
                 continue
-            try:
-                v = float(v)
-            except (TypeError, ValueError, OverflowError):
+            fv = _finite_scalar(v)
+            if fv is None:
                 n_bad += 1
                 continue
-            if not math.isfinite(v):
-                n_bad += 1
             if key == 'train_ce':
                 n_train_measured += 1
     train_s, train_se = _curve_slope_stats(entries, 'train_ce', k=tail_k)
@@ -324,12 +317,9 @@ def classify_training_health(history, *, tail_k=4, slope_tol=None, gap_tol=None)
     if val_s is None:
         _val_from_ppl = []
         for _p in entries:
-            try:
-                _st = float(_p.get('step'))
-                _vp = float(_p.get('val_ppl'))
-            except (TypeError, ValueError, OverflowError):
-                continue
-            if math.isfinite(_st) and math.isfinite(_vp) and _vp > 0.0:
+            _st = _finite_scalar(_p.get('step'))
+            _vp = _finite_scalar(_p.get('val_ppl'))
+            if _st is not None and _vp is not None and _vp > 0.0:
                 _val_from_ppl.append({'step': _st, 'val_ce': math.log(_vp)})
         val_s, val_se = _curve_slope_stats(_val_from_ppl, 'val_ce', k=tail_k)
     if slope_tol is None:
@@ -341,22 +331,16 @@ def classify_training_health(history, *, tail_k=4, slope_tol=None, gap_tol=None)
         train_tol = val_tol = float(slope_tol)
     val_ppl_points = []
     for h in entries:
-        try:
-            st = int(h.get('step'))
-            vp = float(h.get('val_ppl'))
-        except (TypeError, ValueError, OverflowError):
-            continue
-        if math.isfinite(vp) and vp > 0:
+        st = _as_seed_int(h.get('step'))
+        vp = _finite_scalar(h.get('val_ppl'))
+        if st is not None and vp is not None and vp > 0:
             val_ppl_points.append((st, vp, h))
     best = min(val_ppl_points, key=lambda t: t[1]) if val_ppl_points else None
     last = val_ppl_points[-1] if val_ppl_points else None
     last_gap = None
     for h in reversed(entries):
-        try:
-            g = float(h.get('gap'))
-        except (TypeError, ValueError, OverflowError):
-            continue
-        if math.isfinite(g):
+        g = _finite_scalar(h.get('gap'))
+        if g is not None:
             last_gap = g
             break
     if n_bad:
