@@ -576,7 +576,7 @@ def run_probe_cell(cfg, v, seed, guard=None, val_ids=None, mech_summ=None):
             except Exception as _e:
                 print(f'[p3mp] FATAL: {_msp} exists but cannot be parsed ({type(_e).__name__}: {_e}) — without it no checkpoint can be attributed to a training recipe, so the probe would score unknown weights.  Move it aside to re-train.')
                 raise
-    ck = os.path.join(cfg['ckpt_dir'], f'{v}_seed{seed}.pt')
+    ck = os.path.join(cfg['ckpt_dir'], L.direct_ckpt_name(v, seed))
     if not os.path.exists(ck):
         print(f'[p3mp] SKIP {v} s{seed}: no checkpoint {ck} (run phase P3MT first)')
         out['status'] = 'skipped_no_ckpt'

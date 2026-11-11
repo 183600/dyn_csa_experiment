@@ -1985,7 +1985,7 @@ def run_niah_phase(payload, guard=None, label=''):
             }, vocab=int(vocab))
             _niah_knobs = _v7_knobs(L.DEVICE, 12)
             _prov_by_seed[int(seed)] = _niah_prov
-            ck = os.path.join(ckpt_dir, f'{v}_seed{seed}.pt')
+            ck = os.path.join(ckpt_dir, L.direct_ckpt_name(v, seed))
             stale = False
             _ckp_pre = None
             if os.path.exists(ck):
@@ -2456,7 +2456,7 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
                           'amp_dtype': _amp_mode, 'eager_batch': _eager_mode,
                           'mlp_match_ref': 'csa_fixed_rope'},
                          256, 6, 8, 32, vocab, train_ids, val_ids, device=L.DEVICE)
-    ck = os.path.join(ckpt_dir, f'{v}_seed{seed}.pt')
+    ck = os.path.join(ckpt_dir, L.direct_ckpt_name(v, seed))
     stale = False
     _ckp_pre = None
     if os.path.exists(ck):

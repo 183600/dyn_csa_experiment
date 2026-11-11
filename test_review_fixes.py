@@ -2335,6 +2335,17 @@ def t_atomic_torch_save():
                 pass
             else:
                 raise AssertionError(f'ckpt_file_name accepted invalid seed {_bad_seed!r}')
+        # The tagless length/probe checkpoint name must have the same path
+        # and seed-safety contract.
+        assert L.direct_ckpt_name('csa_dynamic', 2) == 'csa_dynamic_seed2.pt'
+        assert '/' not in L.direct_ckpt_name('../escape', 0)
+        for _bad_seed in (True, 1.5, float(2 ** 53)):
+            try:
+                L.direct_ckpt_name('csa_dynamic', _bad_seed)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f'direct_ckpt_name accepted invalid seed {_bad_seed!r}')
     finally:
         shutil.rmtree(d, ignore_errors=True)
 

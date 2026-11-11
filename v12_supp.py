@@ -133,7 +133,7 @@ def run_training_health(cfg=None):
     for v in manifest['arms']:
         for seed in manifest['seeds']:
             key = f'{v}::s{seed}'
-            ck = os.path.join(ckpt_dir, f'{v}_seed{seed}.pt')
+            ck = os.path.join(ckpt_dir, L.direct_ckpt_name(v, seed))
             if not os.path.exists(ck):
                 rows[key] = {'status': 'missing_checkpoint', 'path': ck}
                 missing.append(key)
@@ -790,7 +790,7 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test', train_
     _ft_run_id = L.new_experiment_id('p5t')
     _ft_started = time.strftime('%Y-%m-%dT%H:%M:%S')
     _ft_t0 = time.time()
-    ck = os.path.join(cfg['ckpt_dir'], f'{v}_seed{seed}.pt')
+    ck = os.path.join(cfg['ckpt_dir'], L.direct_ckpt_name(v, seed))
     if not os.path.exists(ck):
         print(f'[p5t] SKIP {v} s{seed}: no checkpoint {ck} (run P3MT/P4MT/P5C first)')
         out['status'] = 'skipped_no_ckpt'

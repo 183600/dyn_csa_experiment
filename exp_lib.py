@@ -16341,6 +16341,19 @@ def ckpt_file_name(variant, seed, tag):
             f'{_safe_path_component(tag)}.pt')
 
 
+def direct_ckpt_name(variant, seed):
+    """Tagless per-cell checkpoint name used by the length/probe drivers.
+
+    These drivers historically built ``f'{variant}_seed{seed}.pt'`` directly.
+    Sanitise the variant and require an exact seed so a user-supplied arm name
+    cannot escape ``ckpt_dir`` or truncate a fractional seed into another
+    cell's checkpoint.  Normal names are unchanged."""
+    seed_i = _as_seed_int(seed)
+    if seed_i is None:
+        raise ValueError(f'direct_ckpt_name: seed must be an exact integer, got {seed!r}')
+    return f'{_safe_path_component(variant)}_seed{seed_i}.pt'
+
+
 def _atomic_torch_save(obj, path, hash_out=None):
     d = os.path.dirname(os.path.abspath(path))
     os.makedirs(d, exist_ok=True)
