@@ -8386,15 +8386,18 @@ def batch_contract_check(train_ids, seq_len, batch_size, device, seed=0, vocab=N
                     _row = _xn[_bi]
                     _last = int(_yn[_bi, -1])
                     _starts = np.flatnonzero(_src[:max(0, _src.size - seq_len)] == _row[0])
-                    _ok_row = False
+                    _nexts = set()
                     for _p in _starts:
                         _p = int(_p)
                         if _p + seq_len < _src.size and np.array_equal(
                                 _src[_p:_p + seq_len], _row):
-                            if int(_src[_p + seq_len]) == _last:
-                                _ok_row = True
-                                break
-                    if not _ok_row:
+                            _nexts.add(int(_src[_p + seq_len]))
+                    # A repeated input window with different continuations
+                    # makes the final target unverifiable from x/y alone:
+                    # accepting ANY occurrence lets a corrupted iterator pass
+                    # by borrowing another occurrence's target.  Pass only when
+                    # every matching occurrence agrees on the continuation.
+                    if len(_nexts) != 1 or _last not in _nexts:
                         checks['final_target_matches_source'] = False
                         break
             checks['same_seed_repeats_stream'] = bool(

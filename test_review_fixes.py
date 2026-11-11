@@ -1866,6 +1866,25 @@ def t_batch_contract_check():
         L.batch_iter = _orig
     assert bad['passed'] is False, 'a loader that does not shift labels must FAIL the contract check'
     assert bad['checks']['labels_are_next_token_shift'] is False, bad
+    # A repeated input window with two different continuations cannot prove
+    # which occurrence was sampled; a target borrowed from another occurrence
+    # must fail rather than pass.
+    src = np.array([0, 0, 1, 0, 0, 2], dtype=np.int64)
+    class _WrongRepeat:
+        def __init__(self): self.n = 0
+        def __iter__(self): return self
+        def __next__(self):
+            self.n += 1
+            if self.n > 2: raise StopIteration
+            return (torch.tensor([[0, 0], [0, 0]]),
+                    torch.tensor([[0, 1], [0, 1]]))
+    L.batch_iter = lambda *a, **k: _WrongRepeat()
+    try:
+        amb = L.batch_contract_check(src, 2, 2, torch.device('cpu'))
+    finally:
+        L.batch_iter = _orig
+    assert amb['checks']['final_target_matches_source'] is False, amb
+    assert amb['passed'] is False, amb
 
 
 
