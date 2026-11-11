@@ -3499,6 +3499,12 @@ def t_data_guard_index_label_and_shift_edges():
     assert clean_i['train_idx'].tolist() == [0, 1], clean_i
     rep_i = L.data_quality_report(Xi, train_idx=[0], val_idx=[1])
     assert rep_i['checks']['duplicate_rows_across_splits']['train__val'] == 0, rep_i
+    # Multi-output labels are audited per row, not flattened to n*k.
+    ym = np.array([[0, 1], [0, 0], [1, 1], [2, 2]])
+    Xm = np.array([[0.0], [0.0], [1.0], [2.0]])
+    rep_m = L.data_quality_report(Xm, y=ym, train_idx=[0, 1, 3],
+                                  val_idx=[2], test_idx=[])
+    assert rep_m['checks']['label_conflicts_on_duplicate_rows'] == 1, rep_m
     repnf = L.data_quality_report(Xnf, train_idx=[0], val_idx=[1], test_idx=[2, 3])
     assert repnf['checks']['duplicate_rows_across_splits']['train__val'] == 0, repnf
 

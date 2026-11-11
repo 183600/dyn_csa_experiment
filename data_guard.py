@@ -1871,13 +1871,32 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
     # and the counts are broken down by split so a corrupted holdout cannot
     # hide behind a clean overall total.
     if y is not None:
-        y = np.asarray(y).reshape(-1)
-        if y.shape[0] != n:
-            raise ValueError(f'y has length {y.shape[0]}, expected {n}')
-        raw_labels = y.tolist()
-        labels = [_label_key(v) for v in raw_labels]
-        missing_labels = int(sum(v is None for v in labels))
-        absent_labels = int(sum(v is None for v in raw_labels))
+        yarr = np.asarray(y)
+        if yarr.ndim == 0 or yarr.shape[0] != n:
+            raise ValueError(
+                f'y has {yarr.shape[0] if yarr.ndim else 1} rows, expected {n}')
+        if yarr.ndim == 1:
+            raw_labels = yarr.tolist()
+            labels = [_label_key(v) for v in raw_labels]
+        else:
+            # Multi-output targets: flatten only along the output axis, not
+            # across rows.  reshape(-1) would make the flattened length n*k
+            # and reject every valid multi-output target with a misleading
+            # length error (clean_training_rows already supports this shape).
+            _rows_y = yarr.reshape(n, -1).tolist()
+            raw_labels = [tuple(r) for r in _rows_y]
+            labels = [tuple(_label_key(v) for v in r) for r in _rows_y]
+
+        def _raw_missing(v):
+            return v is None or (isinstance(v, tuple)
+                                 and all(x is None for x in v))
+
+        def _label_missing(v):
+            return v is None or (isinstance(v, tuple)
+                                 and all(x is None for x in v))
+
+        missing_labels = int(sum(_label_missing(v) for v in labels))
+        absent_labels = int(sum(_raw_missing(v) for v in raw_labels))
         nonfinite_labels = missing_labels - absent_labels
         checks['missing_labels'] = absent_labels
         checks['nonfinite_labels'] = nonfinite_labels
@@ -1886,9 +1905,11 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
         for name, rows in split_rows.items():
             _rows = np.asarray(rows, dtype=np.int64).reshape(-1).tolist()
             checks['missing_labels_by_split'][name] = int(
-                sum(labels[i] is None and raw_labels[i] is None for i in _rows))
+                sum(_label_missing(labels[i]) and _raw_missing(raw_labels[i])
+                    for i in _rows))
             checks['nonfinite_labels_by_split'][name] = int(
-                sum(labels[i] is None and raw_labels[i] is not None for i in _rows))
+                sum(_label_missing(labels[i]) and not _raw_missing(raw_labels[i])
+                    for i in _rows))
         if absent_labels:
             warnings.append(f'{absent_labels} missing labels')
         if nonfinite_labels:
