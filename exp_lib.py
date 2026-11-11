@@ -44,7 +44,7 @@ if _NEEDED:
         print(f"[setup] {_msg}")
 import torch
 print('torch', torch.__version__, '| cuda', torch.cuda.is_available())
-import gc, copy, math, os, re, time, json, random, csv, tempfile, itertools, hashlib, collections, threading, numbers
+import gc, copy, math, os, re, time, json, random, csv, tempfile, itertools, hashlib, collections, threading, numbers, weakref
 import array
 from math import comb
 from dataclasses import dataclass
@@ -7965,6 +7965,22 @@ def _gpu_corpus_cache_fits(nbytes, device):
         return True
 
 _NARROW_MEMO = {}
+# The memo holds the narrowed corpus (an int32 copy or a mapped sidecar), so
+# it must stay bounded: an unbounded id-keyed cache retains one corpus-sized
+# array per distinct training stream for the whole process.  Keep a small LRU
+# and drop entries whose source array has died.
+_NARROW_MEMO_CAP = 8
+
+
+def _narrow_memo_put(key, train_ids, value):
+    memo = _NARROW_MEMO
+    for _k in [k for k, v in memo.items()
+               if v[0] is not None and v[0]() is None]:
+        memo.pop(_k, None)
+    if key not in memo:
+        while len(memo) >= _NARROW_MEMO_CAP:
+            memo.pop(next(iter(memo)))
+    memo[key] = (weakref.ref(train_ids), value)
 
 
 def _cache_id_upper_bound(path):
@@ -8041,7 +8057,7 @@ def _ids_narrow(train_ids):
                 if (int(_n.size) == int(train_ids.size)
                         and tuple(_n.shape) == tuple(train_ids.shape)
                         and np.dtype(_n.dtype) == np.dtype(np.int32)):
-                    _NARROW_MEMO[_key] = (_weakref.ref(train_ids), _n)
+                    _narrow_memo_put(_key, train_ids, _n)
                     return _n
             _mx = _cache_id_upper_bound(_path)
             if _mx is None:
@@ -8068,7 +8084,7 @@ def _ids_narrow(train_ids):
                         pass
                     raise
                 _n = np.load(_side, mmap_mode='r')
-                _NARROW_MEMO[_key] = (_weakref.ref(train_ids), _n)
+                _narrow_memo_put(_key, train_ids, _n)
                 return _n
         except (OSError, ValueError, TypeError):
             pass
@@ -8077,7 +8093,7 @@ def _ids_narrow(train_ids):
         _mx = int(train_ids.max()) if train_ids.size else -1
     if train_ids.size and _mx < 2 ** 31:
         _n = train_ids.astype(np.int32)
-        _NARROW_MEMO[_key] = (_weakref.ref(train_ids), _n)
+        _narrow_memo_put(_key, train_ids, _n)
         return _n
     return train_ids
 
