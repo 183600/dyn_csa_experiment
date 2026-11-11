@@ -4083,6 +4083,9 @@ def t_boolean_pvalues_are_not_probabilities():
     # Boolean measurements are not seed counts/effects either.
     assert L.reportable_claim({'n': True, 'mean': -1.0, 'std': 0.1,
                                'p_exact_signflip': 0.01, 'p_holm': 0.02})['allowed'] is False
+    assert L.reportable_claim({'n': True, 'mean': -1.0, 'std': 0.1,
+                               'p_exact_signflip': 0.01, 'p_holm': 0.02},
+                              min_n=1)['allowed'] is False
     assert L.reportable_claim({'n': 12, 'mean': True, 'std': 0.1,
                                'p_exact_signflip': 0.01, 'p_holm': 0.02})['allowed'] is False
 

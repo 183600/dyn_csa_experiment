@@ -8904,10 +8904,15 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
     if not isinstance(stats, dict):
         out['reasons'].append('not a statistics dict')
         return out
-    try:
-        n = int(stats.get('n') or 0)
-    except (TypeError, ValueError, OverflowError):
+    _n_bool = isinstance(stats.get('n'), (bool, np.bool_))
+    if _n_bool:
         n = 0
+        out['reasons'].append('n is a boolean flag, not a seed count')
+    else:
+        try:
+            n = int(stats.get('n') or 0)
+        except (TypeError, ValueError, OverflowError):
+            n = 0
     p = stats.get('p_exact_signflip')
     if p is None:
         p = stats.get('p')
