@@ -483,6 +483,31 @@ def _window_hashes(values, width):
     return out
 
 
+def _sidecar_fp(arr):
+    """Content fingerprint for a document-id sidecar.
+
+    Mirrors ``exp_lib._ids_fp`` for the integer arrays the loaders persist as
+    sidecars (uint8/uint16 are widened to int32; wider dtypes are hashed as
+    stored).  Keeping the same digest here lets the zero-GPU audit compare a
+    sidecar against the fingerprint recorded at build time without importing
+    the torch-backed experiment library.
+    """
+    import hashlib
+    import numpy as np
+    h = hashlib.sha256()
+    a = np.asarray(arr)
+    _widen = a.dtype in (np.dtype(np.uint8), np.dtype(np.uint16))
+    step = 1 << 24
+    for off in range(0, len(a), step):
+        part = a[off:off + step]
+        if _widen:
+            part = part.astype(np.int32, copy=False)
+        elif not part.flags.c_contiguous:
+            part = np.ascontiguousarray(part)
+        h.update(memoryview(part).cast('B'))
+    return h.hexdigest()[:16]
+
+
 def _row_overlap_count(train, rows, chunk_tokens=1 << 20):
     """Count unique ``rows`` that occur verbatim in ``train``.
 
@@ -647,6 +672,17 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                 try:
                     _trd = np.load(_trd_path)
                     _vad = np.load(_vad_path)
+                    # The sidecars must be the ones this metadata describes:
+                    # a swapped/truncated sidecar can be disjoint by accident
+                    # while no longer proving this split's group isolation.
+                    if _mdoc.get('train_fp') and _mdoc['train_fp'] != _sidecar_fp(_trd):
+                        rec['status'] = 'fail'
+                        _fail(f'{cd}/{tag}: train document-id sidecar does not '
+                              'match the fingerprint in the cache metadata')
+                    if _mdoc.get('validation_fp') and _mdoc['validation_fp'] != _sidecar_fp(_vad):
+                        rec['status'] = 'fail'
+                        _fail(f'{cd}/{tag}: validation document-id sidecar does not '
+                              'match the fingerprint in the cache metadata')
                     _shared_docs = int(np.intersect1d(_trd, _vad).size)
                     rec['documents'] = {
                         'train_count': int(np.asarray(_trd).size),
@@ -785,6 +821,17 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                             _ted = np.load(_ted_path)
                             _trd = np.load(_trd_path)
                             _vad = np.load(_vad_path)
+                            _mtdoc = (_tmeta or {}).get('doc_ids') or {}
+                            if _mtdoc:
+                                if int(_mtdoc.get('test_count', -1)) != int(np.asarray(_ted).size):
+                                    rec['status'] = 'fail'
+                                    _fail(f'{cd}/{tag}: test document-id sidecar count '
+                                          'disagrees with the test metadata')
+                                if (_mtdoc.get('test_fp')
+                                        and _mtdoc['test_fp'] != _sidecar_fp(_ted)):
+                                    rec['status'] = 'fail'
+                                    _fail(f'{cd}/{tag}: test document-id sidecar does '
+                                          'not match the fingerprint in the test metadata')
                             _dtrain = int(np.intersect1d(_trd, _ted).size)
                             _dval = int(np.intersect1d(_vad, _ted).size)
                             rec['test_documents'] = int(_ted.size)
