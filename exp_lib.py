@@ -5928,12 +5928,18 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
                 # Fingerprints make the sidecars part of the cache identity:
                 # a sidecar swapped in from another build can be disjoint by
                 # accident without describing these token arrays.
-                if _mdoc.get('train_fp') and _mdoc['train_fp'] != _ids_fp(_trd):
+                if not _mdoc.get('train_fp') or not _mdoc.get('validation_fp'):
+                    # Without both fingerprints a sidecar swapped in from
+                    # another build can look disjoint by accident.
                     _problems.append(
-                        'train document-id sidecar does not match the fingerprint in the cache metadata')
-                if _mdoc.get('validation_fp') and _mdoc['validation_fp'] != _ids_fp(_vad):
-                    _problems.append(
-                        'validation document-id sidecar does not match the fingerprint in the cache metadata')
+                        'cache metadata omits the train/validation document-id fingerprints')
+                else:
+                    if _mdoc['train_fp'] != _ids_fp(_trd):
+                        _problems.append(
+                            'train document-id sidecar does not match the fingerprint in the cache metadata')
+                    if _mdoc['validation_fp'] != _ids_fp(_vad):
+                        _problems.append(
+                            'validation document-id sidecar does not match the fingerprint in the cache metadata')
             except Exception as _de:
                 _problems.append(f'document-id sidecars unreadable ({type(_de).__name__}: {_de})')
         elif _has_doc_meta:
@@ -6331,7 +6337,10 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
                 if int(np.asarray(test_doc_ids).size) != int(_mdoc.get('test_count', -1)):
                     _problems.append(
                         'test document-id sidecar count does not match the cache metadata')
-                if _mdoc.get('test_fp') and _mdoc['test_fp'] != _ids_fp(test_doc_ids):
+                if not _mdoc.get('test_fp'):
+                    _problems.append(
+                        'test cache metadata omits the document-id fingerprint')
+                elif _mdoc['test_fp'] != _ids_fp(test_doc_ids):
                     _problems.append(
                         'test document-id sidecar does not match the fingerprint in the cache metadata')
                 if (_mdoc.get('disjoint') is not True
@@ -6359,6 +6368,13 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
                     _problems.append(
                         f'{_shared["train"]} train / {_shared["validation"]} validation '
                         'document ids also occur in the test split (group leakage)')
+        else:
+            # No sidecars/attestation: the test split cannot be shown to be
+            # group-disjoint from train/validation, so rebuild instead of
+            # silently serving it.
+            _problems.append(
+                'test cache has no document-id attestation; whole-document '
+                'group isolation cannot be verified — rebuild the test cache')
         # A cached test set is only pairable if its tokenizer was fitted on the
         # SAME train prefix as the train/validation cache.  Verifying this on
         # the cold path is not enough: a swapped test cache could otherwise
