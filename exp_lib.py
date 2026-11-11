@@ -7769,7 +7769,18 @@ def _json_clean(obj):
     if isinstance(obj, np.ndarray):
         return _json_clean(obj.tolist())
     if isinstance(obj, np.generic):
-        return _json_clean(obj.item())
+        # ``longdouble.item()`` returns another NumPy scalar, so recursing on
+        # item() alone loops forever.  Convert through the scalar kind first.
+        if isinstance(obj, np.bool_):
+            return bool(obj)
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return _json_clean(float(obj))
+        _item = obj.item()
+        return _json_clean(_item) if not isinstance(_item, np.generic) else str(_item)
+    if isinstance(obj, (set, frozenset)):
+        return sorted((_json_clean(v) for v in obj), key=str)
     if isinstance(obj, float):
         return obj if math.isfinite(obj) else None
     return obj
