@@ -1180,6 +1180,31 @@ def _admit_confirmation_records(raw, manifest):
         raise SystemExit(f'[p5t stats] REFUSE: admissible records span {len(fps)} different test-slice fingerprints ({sorted(fps)}) — the whole panel must be measured on ONE frozen test slice, not merely pairwise-equal fingerprints')
     if len(train_fps) > 1:
         raise SystemExit(f'[p5t stats] REFUSE: admissible records were trained on {len(train_fps)} different corpora ({sorted(train_fps)}) — all frozen arms must share the canonical training split')
+    if not _want_nseq and admitted:
+        # A legacy/descriptive manifest may omit the eval block, but if the
+        # records DO carry a row count it is still part of the estimand.  Do
+        # not let a missing manifest field disable the check and pair two
+        # different n_seq panels.
+        _nseq_by = {k: _record_int(r.get('n_seq')) for k, r in admitted.items()}
+        _present = {v for v in _nseq_by.values() if v is not None}
+        if len(_present) > 1:
+            raise SystemExit(
+                f'[p5t stats] REFUSE: admissible records disagree on n_seq '
+                f'({sorted(_present)}) and the manifest has no frozen eval.n_seqs_clean '
+                '— different row counts are different estimands')
+        if _present:
+            _missing = [k for k, v in _nseq_by.items() if v is None]
+            if _missing:
+                raise SystemExit(
+                    '[p5t stats] REFUSE: some admissible records carry n_seq and '
+                    f'others do not ({_missing[:5]}) — the row count cannot be verified')
+            _nseq = next(iter(_present))
+            for _k, _r in admitted.items():
+                _why = _by_len_shape_reason(_r, _nseq)
+                if _why is not None:
+                    raise SystemExit(
+                        f'[p5t stats] REFUSE: {_k}: {_why} (no frozen row count '
+                        'to fall back on)')
     return admitted, (sorted(fps)[0] if fps else None)
 
 

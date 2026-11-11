@@ -800,6 +800,26 @@ def t_admission_refuses():
         raise AssertionError('records spanning two test slices must be refused (pairwise-equal fps are not enough)')
     except SystemExit as e:
         assert 'slice' in str(e).lower()
+    # A manifest without eval.n_seqs_clean must not disable the row-count
+    # consistency check when the records themselves carry n_seq.
+    raw = {'a::s0': dict(_rec('a_arm', 0, 'FP'), n_seq=16),
+           'b::s0': dict(_rec('b_arm', 0, 'FP'), n_seq=8)}
+    try:
+        V12._admit_confirmation_records(raw, m)
+        raise AssertionError('records with different n_seq must not be paired')
+    except SystemExit as e:
+        assert 'n_seq' in str(e), e
+    # Same n_seq, but a truncated cell is not a complete measurement.
+    raw = {
+        'a::s0': dict(_rec('a_arm', 0, 'FP'), n_seq=16),
+        'b::s0': dict(_rec('b_arm', 0, 'FP', by_len={'4096': {
+            'ppl': 30.0, 'n_tok': 16 * 4095, 'n_seq': 16, 'truncated': True}}), n_seq=16),
+    }
+    try:
+        V12._admit_confirmation_records(raw, m)
+        raise AssertionError('a truncated by_len cell must not be admitted')
+    except SystemExit as e:
+        assert 'truncated' in str(e), e
 
 
 def t_recipe_signature():
