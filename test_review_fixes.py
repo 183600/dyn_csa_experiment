@@ -4915,6 +4915,31 @@ def t_release_readiness_audit():
 
 
 
+def t_archive_verify_uses_own_manifest():
+    import archive_release as AR
+    root = tempfile.mkdtemp()
+    old_repo = AR.REPO
+    try:
+        repo = os.path.join(root, 'repo')
+        os.makedirs(repo)
+        for n in ('DECISION_LOG.md', 'RELEASES.md', 'confirmation_frozen.json'):
+            with open(os.path.join(repo, n), 'w', encoding='utf-8') as f:
+                f.write('x')
+        d = os.path.join(repo, 'results_x')
+        os.makedirs(d)
+        with open(os.path.join(d, 'payload.txt'), 'w', encoding='utf-8') as f:
+            f.write('hello')
+        with open(os.path.join(d, 'aaa.MANIFEST.sha256'), 'w', encoding='utf-8') as f:
+            json.dump({'files': {'payload.txt': {'sha256': 'deadbeef'}}}, f)
+        AR.REPO = repo
+        assert AR.cmd_make('v1', ['results_x'], outdir='arch') == 0
+        tar = os.path.join(repo, 'arch', 'release_v1.tar.gz')
+        assert AR.cmd_verify(tar) == 0, 'a stray collected manifest must not hijack verification'
+    finally:
+        AR.REPO = old_repo
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def t_archive_hashes_all_checkpoint_extensions():
     import archive_release as AR
     root = tempfile.mkdtemp()
@@ -5838,6 +5863,7 @@ def main():
     _check('L9b archive verifier requires the external checksum', t_archive_verify_requires_external_checksum)
     _check('L9b2 archive refuses result dirs outside the repo', t_archive_refuses_dirs_outside_repo)
     _check('L9b3 archive hashes every checkpoint extension', t_archive_hashes_all_checkpoint_extensions)
+    _check('L9b4 archive verify selects its own manifest', t_archive_verify_uses_own_manifest)
     _check('L10 selection-attribution contract', t_selection_attribution_contract)
     _check('L10b corpus-audit memo cannot bypass the strict gate', t_corpus_audit_memo_does_not_bypass_strict_gate)
     _check('L10c corpus-audit memo keys the validation row shape', t_corpus_audit_memo_keys_validation_shape)

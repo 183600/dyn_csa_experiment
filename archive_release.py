@@ -329,9 +329,21 @@ def cmd_verify(tar_path):
         return 1
     with tf:
         names = tf.getnames()
-        man_name = next((n for n in names if n.endswith('.MANIFEST.sha256')), None)
-        if man_name is None:
-            print('[archive] REFUSE: no MANIFEST inside the archive')
+        # The manifest written by `make` is named after the archive itself.
+        # Picking the first `*.MANIFEST.sha256` member would let an ordinary
+        # collected file (e.g. a stray results_*/aaa.MANIFEST.sha256) hijack
+        # verification and make a valid release fail its own check.
+        _base = os.path.basename(tar_path)
+        for _suf in ('.tar.gz', '.tgz'):
+            if _base.endswith(_suf):
+                _base = _base[:-len(_suf)]
+                break
+        else:
+            _base = os.path.splitext(_base)[0]
+        man_name = f'{_base}.MANIFEST.sha256'
+        _hits = [n for n in names if n == man_name]
+        if len(_hits) != 1:
+            print(f'[archive] REFUSE: expected exactly one {man_name!r} inside the archive, found {len(_hits)}')
             return 1
         try:
             man = json.load(tf.extractfile(man_name))
