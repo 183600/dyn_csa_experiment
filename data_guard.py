@@ -157,7 +157,12 @@ def _resolve_sizes(n, train_frac=0.8, val_frac=0.1, test_frac=0.1,
     if abs(frac_sum - 1.0) > 1e-6:
         raise ValueError(
             f'train_frac + val_frac + test_frac must sum to 1, got {frac_sum}')
-    fracs = (train_frac, val_frac, test_frac)
+    # The tolerance accepts sums within 1e-6 of 1.  At scale, n*frac can then
+    # overshoot n by thousands of rows and the floor sum could exceed n
+    # (negative remainder).  Renormalising the accepted fractions keeps the
+    # targets summing to n exactly for every n; the deviation is already
+    # inside the declared tolerance.
+    fracs = tuple(f / frac_sum for f in (train_frac, val_frac, test_frac))
     requested = [f > 0 for f in fracs]
     if n < sum(requested):
         raise ValueError(

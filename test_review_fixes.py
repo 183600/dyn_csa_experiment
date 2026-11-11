@@ -3212,6 +3212,13 @@ def t_split_sizes_explicit_never_negative():
             pass
         else:
             raise AssertionError(f'train_size={bad!r} must be rejected')
+    # Fractions within the 1e-6 tolerance must still reconcile at scale: a
+    # large n times a slightly-over-1 sum must not produce a negative
+    # remainder / inconsistent-size error.
+    for fr in ((0.5, 0.5000005, 0.0), (0.5, 0.499999, 0.0)):
+        idx = L.chronological_split_indices(10_000_000, *fr)
+        sizes = [len(idx[k]) for k in ('train', 'val', 'test')]
+        assert sum(sizes) == 10_000_000 and all(s >= 0 for s in sizes), (fr, sizes)
     for bad_n in (10.5, '10', True):
         try:
             L.chronological_split_indices(bad_n)
