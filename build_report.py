@@ -1341,8 +1341,9 @@ def sec_p2s():
                       for a, b, _c, st in rows]
         _p2s_holm = holm_adjust(_p2s_pairs)
         for a, b, _c, st in rows:
-            _h = _p2s_holm.get(f'P2S {a} - {b}') or {}
-            st['p_holm'] = _h.get('p_holm')
+            # The local holm_adjust returns {name: adjusted_float}; this is
+            # deliberately not exp_lib's {name: {'p_holm': ...}} shape.
+            st['p_holm'] = _p2s_holm.get(f'P2S {a} - {b}')
         lines += ['', '**配对检验（同 seed 配对，符号翻转）**：', '', '| 比较 | n (配对 seeds) | Δ (a−b) mean±std | p | params |', '|---|---|---|---|---|']
         for a, b, common, st in rows:
             # Every p-value printed in this table belongs to the report's
