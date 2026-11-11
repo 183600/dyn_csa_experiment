@@ -147,10 +147,21 @@ def run_training_health(cfg=None):
             d = d if isinstance(d, dict) else {}
             h = d.get('curve_health') if isinstance(d.get('curve_health'), dict) else None
             status = (h or {}).get('status', 'unmonitored')
+            # The pre-test gate must reject a stale checkpoint BEFORE the
+            # held-out split is read and locked.  A healthy curve alone proves
+            # nothing about the code/recipe that produced these weights.
+            _code_ok = d.get('code') == V.CKPT_CODE
+            _want_tfp = _frozen_train_fp(manifest)
+            _tfp_ok = (_want_tfp is None or d.get('train_fp') == _want_tfp)
+            if not _code_ok:
+                status = 'stale_code'
+            elif not _tfp_ok:
+                status = 'stale_train_fp'
             rows[key] = {'status': status, 'health': h,
                          'best_step': d.get('best_step'),
                          'best_val_ppl': d.get('best_val_ppl'),
                          'final_ppl': d.get('final_ppl'),
+                         'code': d.get('code'), 'train_fp': d.get('train_fp'),
                          'path': ck}
             if status != 'healthy':
                 unhealthy.append(key)
