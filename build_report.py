@@ -815,7 +815,10 @@ def sec_p0e():
             continue
         if not _measurable(r):
             continue
-        _sdv = str(r.get('seed'))
+        _sdv = _int_or(r.get('seed'), None)
+        if _sdv is None:
+            print(f"[report] sec_p0e: record {_k!r} carries a non-integer seed ({r.get('seed')!r}) — it is skipped, not counted")
+            continue
         for step, pv in _hist_points(r):
             if not _ppl_ok(pv):
                 _dropped_pts += 1
@@ -847,7 +850,9 @@ def sec_p0e():
             _rec_of = {}
             for _k, r in _s_items:
                 if isinstance(r, dict):
-                    _rec_of.setdefault((r.get('variant'), str(r.get('seed'))), r)
+                    _sd_rec = _int_or(r.get('seed'), None)
+                    if _sd_rec is not None:
+                        _rec_of.setdefault((r.get('variant'), _sd_rec), r)
             _paired = []
             _pair_gated = []
             for _sd in _paired_raw:
