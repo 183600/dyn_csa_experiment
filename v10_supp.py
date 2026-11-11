@@ -901,18 +901,13 @@ def _hist_by_seed(outdir, variant, raw=None):
     for _k, r in raw.items():
         if not (isinstance(r, dict) and r.get('variant') == variant and r.get('ppl_history')):
             continue
+        # Use the shared exact-integer contract: this also rejects np.float32
+        # fractions (int() would truncate 1.5 -> 1) and lossy floats >= 2**53,
+        # which the local float-only branch used to accept.
         _s_raw = r.get('seed')
-        if isinstance(_s_raw, bool):
-            _s_raw = None
-        if isinstance(_s_raw, float):
-            s = int(_s_raw) if math.isfinite(_s_raw) and _s_raw.is_integer() else None
-        else:
-            try:
-                s = int(_s_raw)
-            except (TypeError, ValueError, OverflowError):
-                s = None
+        s = L._as_seed_int(_s_raw)
         if s is None:
-            print(f'[v10 stats] {_k} has no usable `seed`; its curve cannot be attributed and is skipped')
+            print(f'[v10 stats] {_k} has no usable `seed` ({_s_raw!r}); its curve cannot be attributed and is skipped')
             continue
         try:
             fp = tuple(((int(t), type(v).__name__, round(float(v), 9)) for t, v in r['ppl_history'] if isinstance(v, (int, float)) and (not isinstance(v, bool)) and (v == v)))
