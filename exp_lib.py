@@ -10412,7 +10412,13 @@ def scaling_trend(points, *, alpha=0.05, min_seeds=3, min_points=3, log_scale=Tr
     # is 2/2**n), and a two-point "trend" is a line even when the per-seed
     # exact test rejects.  Gate the README-level claim on the same thresholds
     # the rest of this function reports.
-    underpowered = bool(paired.get('underpowered')) if paired_primary else False
+    # The unpaired WLS fallback has no paired sign-flip test, but the
+    # pre-registered seed floor still applies: a ladder whose scale points each
+    # carry fewer than min_seeds observations is descriptive, however small the
+    # t-test p happens to be.
+    _unpaired_underpowered = any(len(p['effects']) < int(min_seeds) for p in pts)
+    underpowered = (bool(paired.get('underpowered')) if paired_primary
+                    else _unpaired_underpowered)
     too_few_scales = k < int(min_points)
     sig = bool(p_primary is not None and math.isfinite(float(p_primary)) and float(p_primary) < alpha
                and not resolution_limited and not underpowered and not too_few_scales)

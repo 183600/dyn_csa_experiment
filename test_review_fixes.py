@@ -636,6 +636,16 @@ def t_scaling_trend_primary_direction_and_floor():
     assert r4['p_primary'] < 0.05 and r4['significant'] is False, r4
     assert r4['verdict'] == 'insufficient_points', r4['verdict']
 
+    # The unpaired WLS fallback must still honour min_seeds: one observation
+    # per scale is not a confirmatory trend even when the t-test p is tiny.
+    y = [0.2, 1.15, 1.95, 2.85]
+    one_each = [{'label': f'S{i}', 'scale': 10.0 ** i, 'effects': [y[i]],
+                 'seeds': [i], 'corpus_fp': 'x'} for i in range(4)]
+    r6 = L.scaling_trend(one_each, min_seeds=6, min_points=3)
+    assert r6['paired']['n_complete_seeds'] == 0, r6
+    assert r6['p_primary'] < 0.05 and r6['underpowered'] is True, r6
+    assert r6['significant'] is False and r6['verdict'] == 'underpowered', r6
+
 
 # ---------------------------------------------------------------------------
 # B. v10 corruption modes
