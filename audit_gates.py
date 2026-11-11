@@ -1200,6 +1200,10 @@ def audit_length(bylen_path='results_lm_test/bylen.json'):
         out = {'status': 'not_verifiable_locally', 'note': f'{bylen_path} absent — P5T has not run; the same checks apply to results_v10_mech/summary.json by_len panels'}
         print(json.dumps(out, ensure_ascii=False))
         return out
+    if not isinstance(raw, dict):
+        out = {'status': 'fail', 'problems': [f'{bylen_path}: top-level JSON is {type(raw).__name__}, not an object — the length cells cannot be audited']}
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return out
     L = _import_exp_lib()
     import numpy as np
     by_len = {}
@@ -1254,6 +1258,26 @@ def audit_length(bylen_path='results_lm_test/bylen.json'):
                 # Keep the absence in the same set as the observed counts so
                 # one record with n_seq cannot mask another record without it.
                 e['n_seq'].add(None)
+            # Finite, positive measurements only.  NaN/Inf would otherwise
+            # form a one-element set and pass the cross-arm agreement check;
+            # an all-zero (n_tok, n_seq) pair would satisfy the identity
+            # below without scoring a single target token.
+            for _field, _val in (('n_tok', c.get('n_tok')),
+                                 ('eval_span', c.get('eval_span')),
+                                 ('n_seq', _nseq_cell)):
+                if _val is None:
+                    continue
+                if isinstance(_val, (bool, np.bool_)):
+                    problems.append(f'{key}: L{Ln} {_field} is a boolean, not a measurement')
+                    continue
+                try:
+                    _fval = float(_val)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if not math.isfinite(_fval):
+                    problems.append(f'{key}: L{Ln} {_field} is not finite ({_val!r}) — unverifiable')
+                elif _field in ('n_tok', 'n_seq') and _fval <= 0:
+                    problems.append(f'{key}: L{Ln} {_field} must be positive, got {_val!r}')
             # The complete-cell identity is n_tok == n_seq * (Ln - 1).  Equal
             # (but equally wrong) counts across arms are not a valid target
             # set, so verify the formula whenever the cell claims to be a
@@ -1291,7 +1315,15 @@ def audit_length(bylen_path='results_lm_test/bylen.json'):
         if not nseq_ok:
             problems.append(f'L{Ln}: records disagree on the per-document row count n_seq — the arms did not score the same documents')
     out['problems'] = problems
-    out['status'] = 'fail' if problems else 'ok'
+    if problems:
+        out['status'] = 'fail'
+    elif not by_len:
+        # An empty file (or records with no by_len cells) proves nothing; it
+        # must not be reported as a clean length audit.
+        out['status'] = 'not_verifiable_locally'
+        out['note'] = f'{bylen_path} contains no auditable by_len cells'
+    else:
+        out['status'] = 'ok'
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return out
 
