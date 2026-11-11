@@ -238,6 +238,32 @@ def _fmt_pm(cell, std=None):
         mean = cell
     return f'{mean:.2f} ±{std or 0.0:.2f}'
 
+def _one_record_per_seed(rows, label=''):
+    """Drop invalid seeds and exclude every ambiguous duplicate seed.
+
+    The by-length table means each seed once; averaging two records for one
+    seed would bias the column while the reported n (a set) still counts one.
+    """
+    by_seed = {}
+    dup = set()
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        s = L._as_seed_int(r.get('seed'))
+        if s is None:
+            continue
+        if s in by_seed:
+            dup.add(s)
+        else:
+            by_seed[s] = r
+    if dup:
+        print(f'[v11 report] {label}: seed(s) {sorted(dup)} hold more than one by-length record — '
+              'the duplicate seed(s) are EXCLUDED rather than averaged into the column')
+        for s in dup:
+            by_seed.pop(s, None)
+    return list(by_seed.values())
+
+
 def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
     v11_analysis(out=stats_p)
     st = json.load(open(stats_p, encoding='utf-8'))
@@ -364,7 +390,7 @@ def build_report(out='REPORT_v11.md', stats_p='analysis_v11/stats.json'):
                 _rv = _cur
             elif _rv:
                 print(f'[v11 report] {v}: no by-length record carries the current code semantics ({L.code_stamp()}) — quoting all {len(_rv)} (they predate it; re-run P4MT to refresh)')
-            _rows_by_v[v] = _rv
+            _rows_by_v[v] = _one_record_per_seed(_rv, label=v)
         n_by_v = {v: {r['seed'] for r in _rv} for v, _rv in _rows_by_v.items() if _rv}
         if len(n_by_v) > 1:
             _common_seeds = set.intersection(*n_by_v.values())

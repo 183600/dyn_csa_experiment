@@ -41,6 +41,7 @@ try:
     import torch  # noqa: F401
     import exp_lib as L
     import v10_supp as V10
+    import v11_supp as V11
     import v12_supp as V12
     import v7_supp as V7
     import audit_gates as A
@@ -4703,6 +4704,15 @@ def t_v7_bootstrap_single_config():
         shutil.rmtree(root, ignore_errors=True)
 
 
+def t_v11_by_length_deduplicates_seeds():
+    rows = [{'variant': 'v', 'seed': 0, 'by_len': {512: {'ppl': 10.0}}},
+            {'variant': 'v', 'seed': 0, 'by_len': {512: {'ppl': 20.0}}},
+            {'variant': 'v', 'seed': 1, 'by_len': {512: {'ppl': 30.0}}},
+            {'variant': 'v', 'seed': True, 'by_len': {512: {'ppl': 40.0}}}]
+    kept = V11._one_record_per_seed(rows, label='test')
+    assert [r['seed'] for r in kept] == [1], kept
+
+
 def t_report_stale_trajectory_refused():
     stale = 'old_csOLD'
     s = {}
@@ -5703,6 +5713,7 @@ def main():
     _check('L3d report refuses stale trajectories', t_report_stale_trajectory_refused)
     _check('L3e v8/v9 pairing keeps one run_cfg group', t_driver_pairing_single_config)
     _check('L3f v7 bootstrap pairing keeps one run_cfg group', t_v7_bootstrap_single_config)
+    _check('L3g v11 by-length table deduplicates seed records', t_v11_by_length_deduplicates_seeds)
     _check('L4 matched-init fingerprint + pair gate', t_init_core_fingerprint_and_pair_gate)
     _check('L5 param breakdown + measured compute control', t_param_and_compute_control_detail)
     _check('L6 stale aggregate refused', t_stale_aggregate_refused)
