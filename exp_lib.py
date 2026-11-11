@@ -407,6 +407,8 @@ def _safe_exp_ppl(x):
     has diverged but still produced finite CE must be recorded as ``inf`` and
     diagnosed, not crash the eval callback.  The clamp mirrors the historical
     ``eval_ppl`` overflow behaviour while making the CI bounds consistent."""
+    if isinstance(x, (bool, np.bool_)):
+        return None
     try:
         x = float(x)
     except (TypeError, ValueError, OverflowError):

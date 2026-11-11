@@ -176,6 +176,7 @@ def t_safe_exp_and_doc_ci():
     assert math.isfinite(L._safe_exp_ppl(705.0))
     assert L._safe_exp_ppl(1000.0) == float('inf')
     assert L._safe_exp_ppl(float('nan')) != L._safe_exp_ppl(float('nan'))  # NaN stays NaN
+    assert L._safe_exp_ppl(True) is None and L._safe_exp_ppl(np.bool_(False)) is None
     # Token-pooled CE and its interval must target the same estimand even when
     # document lengths differ.
     nll = [10.0, 1.0, 4.0]
