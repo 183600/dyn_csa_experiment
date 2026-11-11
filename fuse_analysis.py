@@ -612,7 +612,7 @@ def main(argv=None):
     elif _ppl_sig:
         _c3 = f'3. **PPL 存在可分辨的差异**：同面板配对的终点差为 **{_pv('d_ppl', '{:+.2f}')} PPL**（±{_psd('sd_ppl')}，p={_pv('p_ppl', '{:.3f}')} < 0.05），「PPL 不变」的读法在本轮产物上不成立。\n'
     else:
-        _ppl_floor = (2.0 / (1 << _n_pp) if _n_pp <= 20 else 1.0 / 200001.0) if isinstance(_n_pp, int) and _n_pp > 0 else float('nan')
+        _ppl_floor = L.signflip_p_floor(_n_pp) if isinstance(_n_pp, int) and _n_pp > 0 else float('nan')
         _ppl_floor_txt = f'配对符号翻转 p 值打在 n={_n_pp} 的分辨率下限上，任何差异不能排除是种子噪声' if _ppl_p is not None and math.isfinite(_ppl_floor) and (abs(_ppl_p - _ppl_floor) < 1e-12) else f'配对符号翻转 p={_pv('p_ppl', '{:.3f}')}，高于 n={_n_pp or '?'} 的分辨率下限 {_ppl_floor:.3f}，任何差异不能排除是种子噪声'
         _x_ppl = probe.get('x_d_ppl_csa')
         _x_ppl_txt = f'，跨面板纯 CSA 对比为 {_pv('x_d_ppl_csa', '{:+.2f}')} PPL' if _x_ppl is not None and np.isfinite(_x_ppl) else '，跨面板纯 CSA 对比未测量'
