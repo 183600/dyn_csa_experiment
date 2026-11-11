@@ -1502,6 +1502,10 @@ def _sig_gate(st, alpha=0.05, min_n=6, label=None, family=None, register=True):
     p = st.get('p_exact_signflip')
     ph = st.get('p_holm')
     mean, std = st.get('mean'), st.get('std')
+    if any(isinstance(v, (bool, np.bool_)) for v in (n, p, ph, mean, std)):
+        # float(False) == 0.0 would otherwise turn a boolean flag into a
+        # significant p-value (or a zero seed count into a real measurement).
+        return False
     try:
         if int(n) < int(min_n):
             return False
@@ -1565,7 +1569,7 @@ def global_multiplicity_adjust(named_pvals, alpha=0.05):
         seen.add(name)
         p = item[1]
         valid = False
-        if p is not None and not isinstance(p, bool):
+        if p is not None and not isinstance(p, (bool, np.bool_)):
             try:
                 pf = float(p)
                 valid = math.isfinite(pf) and 0.0 <= pf <= 1.0
@@ -1670,10 +1674,15 @@ def holm_adjust(named_pvals, alpha=0.05):
         if name in _seen:
             raise ValueError(f'holm_adjust: duplicate comparison name {name!r}')
         _seen.add(name)
-        try:
-            pv = float(v)
-        except (TypeError, ValueError, OverflowError):
+        if isinstance(v, (bool, np.bool_)):
+            # A flag is not a probability: float(False) == 0.0 would make it
+            # the strongest possible p-value and shrink the family.
             pv = float('nan')
+        else:
+            try:
+                pv = float(v)
+            except (TypeError, ValueError, OverflowError):
+                pv = float('nan')
         if (not math.isfinite(pv)) or pv < 0.0 or pv > 1.0:
             pv = 1.0
         items.append((name, pv))

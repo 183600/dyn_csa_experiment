@@ -8762,10 +8762,16 @@ def holm_adjust(named_pvals, alpha=0.05):
             # corrupt the correction family.
             raise ValueError(f'holm_adjust: duplicate comparison name {sname!r}')
         _seen_names.add(sname)
-        try:
-            pv = float(p)
-        except (TypeError, ValueError, OverflowError):
+        if isinstance(p, (bool, np.bool_)):
+            # A boolean is a flag, not a probability.  float(False) == 0.0
+            # would otherwise become the strongest possible p-value and
+            # shrink the correction family to a bogus "certain" result.
             pv = float('nan')
+        else:
+            try:
+                pv = float(p)
+            except (TypeError, ValueError, OverflowError):
+                pv = float('nan')
         if (not math.isfinite(pv)) or pv < 0.0 or pv > 1.0:
             invalid[sname] = {'p_raw': p, 'p_holm': None, 'rank': None, 'reject': False, 'reason': 'p not in [0,1] or not finite'}
             continue
@@ -8809,10 +8815,15 @@ def attach_holm(comparisons, *, alpha=0.05, family='reported comparisons', explo
         p = v.get('p_exact_signflip')
         if p is None:
             p = v.get('p')
-        try:
-            p = float(p)
-        except (TypeError, ValueError, OverflowError):
+        if isinstance(p, (bool, np.bool_)):
+            # Boolean flags are not p-values; treat them as invalid so the
+            # declared family keeps a p=1 slot instead of a fake p=0.
             p = float('nan')
+        else:
+            try:
+                p = float(p)
+            except (TypeError, ValueError, OverflowError):
+                p = float('nan')
         if math.isfinite(p) and 0.0 <= p <= 1.0:
             pairs.append((str(k), p))
             tested += 1
@@ -8903,14 +8914,21 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
     ph = stats.get('p_holm')
     mean, std = stats.get('mean'), stats.get('std')
     out['n'] = n
-    try:
-        out['p_raw'] = float(p) if p is not None else None
-    except (TypeError, ValueError, OverflowError):
+    if isinstance(p, (bool, np.bool_)):
+        # float(False) == 0.0 must never be read as a significant p-value.
         out['p_raw'] = None
-    try:
-        out['p_holm'] = float(ph) if ph is not None else None
-    except (TypeError, ValueError, OverflowError):
+    else:
+        try:
+            out['p_raw'] = float(p) if p is not None else None
+        except (TypeError, ValueError, OverflowError):
+            out['p_raw'] = None
+    if isinstance(ph, (bool, np.bool_)):
         out['p_holm'] = None
+    else:
+        try:
+            out['p_holm'] = float(ph) if ph is not None else None
+        except (TypeError, ValueError, OverflowError):
+            out['p_holm'] = None
     out['p_floor'] = signflip_p_floor(n) if n > 0 else None
     if n < int(min_n):
         out['reasons'].append(f'n={n} < min_n={int(min_n)}: the exact-test p floor is {out["p_floor"]:.3g} > alpha' if out['p_floor'] is not None else f'n={n} < min_n={int(min_n)}')
@@ -8931,16 +8949,19 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
             out['reasons'].append(f'Holm p {_ph!r} is not a probability in [0,1]')
         elif not (_ph < alpha):
             out['reasons'].append(f'Holm p {_ph:.3g} is not < alpha={alpha}')
-    try:
-        _mean_f = float(mean)
-        _std_f = float(std)
-    except (TypeError, ValueError, OverflowError):
-        out['reasons'].append('mean/std are not numeric')
+    if isinstance(mean, (bool, np.bool_)) or isinstance(std, (bool, np.bool_)):
+        out['reasons'].append('mean/std are boolean flags, not measurements')
     else:
-        if not (math.isfinite(_mean_f) and math.isfinite(_std_f) and _std_f >= 0.0):
-            out['reasons'].append('mean/std are not finite non-negative measurements')
-        elif not (abs(_mean_f) > _std_f):
-            out['reasons'].append('|mean| <= std: effect is within seed noise')
+        try:
+            _mean_f = float(mean)
+            _std_f = float(std)
+        except (TypeError, ValueError, OverflowError):
+            out['reasons'].append('mean/std are not numeric')
+        else:
+            if not (math.isfinite(_mean_f) and math.isfinite(_std_f) and _std_f >= 0.0):
+                out['reasons'].append('mean/std are not finite non-negative measurements')
+            elif not (abs(_mean_f) > _std_f):
+                out['reasons'].append('|mean| <= std: effect is within seed noise')
     # Leave-one-seed-out instability is a direct contradiction of a stable
     # directional effect: dropping one seed must not flip the sign.  Only
     # enforced when the caller supplied the diagnostic (old stats dicts do not
@@ -12683,8 +12704,11 @@ def _holm_assign(entries, m_family, alpha, out_key):
     named = []
     for i, e in enumerate(entries):
         p = e.get('p_exact_signflip')
-        if isinstance(p, (int, float)) and math.isfinite(float(p)):
-            named.append((str(i), float(p)))
+        if (isinstance(p, (bool, np.bool_))
+                or not isinstance(p, (int, float))
+                or not math.isfinite(float(p))):
+            continue
+        named.append((str(i), float(p)))
     m_eff = max(int(m_family), len(entries), len(named))
     for j in range(m_eff - len(named)):
         named.append((f'__missing_{j}', 1.0))

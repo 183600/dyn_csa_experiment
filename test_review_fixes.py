@@ -3951,6 +3951,40 @@ def t_reportable_claim_gate():
     assert r['allowed'] is False and any('leave-one-seed-out' in x for x in r['reasons']), r
 
 
+def t_boolean_pvalues_are_not_probabilities():
+    # A boolean flag must never be coerced to p=0/1 by a correction or claim
+    # gate: float(False) == 0.0 would otherwise manufacture a certain result.
+    for bad in (False, True, np.bool_(False), np.bool_(True)):
+        h = L.holm_adjust([('flag', bad), ('real', 0.03)])
+        assert h['flag']['p_holm'] is None and h['flag']['p_raw'] is bad, (bad, h)
+        assert h['real']['m_effective'] == 2, (bad, h)
+        comps = {'flag': {'n': 12, 'mean': -1.0, 'std': 0.1,
+                          'p_exact_signflip': bad},
+                 'real': {'n': 12, 'mean': -1.0, 'std': 0.1,
+                          'p_exact_signflip': 0.03}}
+        fam = L.attach_holm(dict(comps), family='bool p')
+        assert comps['flag']['p_holm'] == 1.0, (bad, comps)
+        assert comps['real']['p_holm'] is not None, (bad, comps)
+        claim = L.reportable_claim({'n': 12, 'mean': -1.0, 'std': 0.1,
+                                    'p_exact_signflip': bad, 'p_holm': 0.02})
+        assert claim['allowed'] is False and claim['p_raw'] is None, (bad, claim)
+        # The report builder's local twins must reject the same values.
+        bh = BR.holm_adjust([('flag', bad), ('real', 0.03)])
+        assert bh['flag'] == 1.0 and abs(bh['real'] - 0.06) < 1e-12, (bad, bh)
+        ga = BR.global_multiplicity_adjust([('flag', bad), ('real', 0.03)])
+        r = {x['name']: x for x in ga['rows']}
+        assert r['flag']['p_raw'] is None and r['flag']['global_status'] == 'untestable', (bad, ga)
+        assert r['real']['p_raw'] == 0.03, (bad, ga)
+        assert BR._sig_gate({'n': 12, 'mean': -1.0, 'std': 0.1,
+                             'p_exact_signflip': bad, 'p_holm': 0.02},
+                            register=False) is False
+    # Boolean measurements are not seed counts/effects either.
+    assert L.reportable_claim({'n': True, 'mean': -1.0, 'std': 0.1,
+                               'p_exact_signflip': 0.01, 'p_holm': 0.02})['allowed'] is False
+    assert L.reportable_claim({'n': 12, 'mean': True, 'std': 0.1,
+                               'p_exact_signflip': 0.01, 'p_holm': 0.02})['allowed'] is False
+
+
 def t_holm_family_resolution_ceiling():
     comps = {f'c{i}': {'n': 3, 'mean': -1.0, 'std': 0.2, 'p_exact_signflip': 0.25} for i in range(100)}
     fam = L.attach_holm(comps, family='100 exploratory contrasts')
@@ -4906,6 +4940,7 @@ def main():
     except Exception as _obe:
         _check('K0 open-block suite import', lambda _e=_obe: (_ for _ in ()).throw(_e))
     _check('L1 reportable claim gate', t_reportable_claim_gate)
+    _check('L1b boolean p-values are not probabilities', t_boolean_pvalues_are_not_probabilities)
     _check('L2 Holm family resolution ceiling', t_holm_family_resolution_ceiling)
     _check('L3 crossover fit refusal rules + slope CI', t_crossover_scaling_refusals)
     _check('L3b scale-ladder budget + transfer audit', t_scale_ladder_budget_and_transfer_audit)
