@@ -1507,7 +1507,8 @@ def t_combined_seed_doc_uncertainty():
     per_seed_lp = []
     for off in (0.0, 0.2, 0.4):
         nll = [1.0 + off + 0.01 * j for j in range(32)]
-        per_seed_lp.append(math.log(sum(nll) / (32 * 50)))
+        # log(PPL) is the pooled cross-entropy, not log(CE).
+        per_seed_lp.append(sum(nll) / (32 * 50))
     _se_seed = _np.std(per_seed_lp, ddof=1) / math.sqrt(3)
     assert abs(r['se_seed_logppl'] - float(_se_seed)) < 1e-12, (r, _se_seed)
     assert r['se_doc_logppl'] is not None and r['se_doc_logppl'] > 0, r
@@ -1515,7 +1516,11 @@ def t_combined_seed_doc_uncertainty():
     assert abs(r['se_combined_logppl'] - _comb) < 1e-12, r
     assert abs(r['component_ratio_seed_over_doc'] - r['se_seed_logppl'] / r['se_doc_logppl']) < 1e-12, r
     lo, hi = r['ci95_ppl']
+    # The combined interval is on the PPL scale, not the CE scale: it must
+    # contain the recs' PPLs (log PPL = pooled CE).
     assert 0 < lo < hi, r
+    assert lo > 1.0 and hi > 1.0, r
+    assert all(lo <= rec['ppl'] <= hi for rec in recs), (r, [rec['ppl'] for rec in recs])
     # The combined interval is never NARROWER than the seed-only t interval.
     tc = L._t_critical(0.95, 2)
     seed_only = (math.exp(_np.mean(per_seed_lp) - tc * _se_seed),

@@ -18323,12 +18323,16 @@ def _combined_seed_doc_ci(recs, *, n_boot=2000, seed=20261018, conf=0.95):
     if S < 1:
         return out
     # Seed-level component: per-seed pooled PPL over the SAME doc set.
+    # log(PPL) is exactly the pooled cross-entropy (NLL per token), so the
+    # seed-level log-PPL values are ``per_tok`` itself -- not log(per_tok),
+    # which would put the interval on the CE scale and exponentiate it back to
+    # CE instead of PPL.
     seed_logppl = None
     if rows is not None:
         per_tok = nll_mat.sum(axis=1) / np.maximum(ntok_mat.sum(axis=1), 1e-30)
         ok = np.isfinite(per_tok) & (per_tok > 0)
         if ok.sum() == S and S >= 2:
-            lp = np.log(per_tok)
+            lp = per_tok
             seed_logppl = lp
             out['se_seed_logppl'] = float(lp.std(ddof=1) / math.sqrt(S))
             out['n_docs'] = int(nll_mat.shape[1])
@@ -18353,8 +18357,10 @@ def _combined_seed_doc_ci(recs, *, n_boot=2000, seed=20261018, conf=0.95):
             nt = counts @ ntok_col
             nn = counts @ nll_col
             with np.errstate(divide='ignore', invalid='ignore'):
+                # log(PPL) = pooled CE = NLL/tokens.  Taking log() here would
+                # be a second log and turn the final exp() into CE, not PPL.
                 lp_draw = np.where(nt > 0, nn / np.maximum(nt, 1e-30), np.nan)
-                lp_draw = np.where(np.isfinite(lp_draw) & (lp_draw > 0), np.log(np.where(np.isfinite(lp_draw) & (lp_draw > 0), lp_draw, 1.0)), np.nan)
+                lp_draw = np.where(np.isfinite(lp_draw) & (lp_draw > 0), lp_draw, np.nan)
             draws[_b:_b + _nb] = lp_draw
             _b += _nb
         draws = draws[np.isfinite(draws)]
