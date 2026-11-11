@@ -4355,6 +4355,14 @@ def t_simple_baseline_audit_malformed_records():
     out = L.simple_baseline_audit(art)
     assert out['status'] == 'fail', out
     assert any('n_tokens is not an integer' in p for p in out['problems']), out
+    # Fractional token counts must not be truncated into equal sizes.
+    art2 = json.loads(json.dumps(art))
+    art2['baselines']['a']['trials'] = [
+        {'config': {'alpha': 0.1}, 'ppl': 1.0, 'n_tokens': 100.4},
+        {'config': {'alpha': 0.2}, 'ppl': 2.0, 'n_tokens': 100.9}]
+    out2 = L.simple_baseline_audit(art2)
+    assert out2['status'] == 'fail', out2
+    assert any('positive integer' in p for p in out2['problems']), out2
 
 
 

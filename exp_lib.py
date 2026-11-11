@@ -11551,13 +11551,13 @@ def simple_baseline_audit(artifact=None, path=None, protocol=None):
         for t in trials:
             if not isinstance(t, dict) or t.get('n_tokens') is None:
                 continue
-            try:
-                if isinstance(t.get('n_tokens'), (bool, np.bool_)):
-                    raise ValueError
-                nt.add(int(t.get('n_tokens')))
-            except (TypeError, ValueError, OverflowError):
-                problems.append(f'{arm}: trial n_tokens is not an integer ({t.get("n_tokens")!r})')
+            # Exact positive integer only: int(100.4) and int(100.9) both
+            # collapse to 100 and would hide unequal evaluation sizes.
+            _ntv = _as_seed_int(t.get('n_tokens'))
+            if _ntv is None or _ntv <= 0:
+                problems.append(f'{arm}: trial n_tokens is not a positive integer ({t.get("n_tokens")!r})')
                 break
+            nt.add(_ntv)
         if len(nt) > 1:
             problems.append(f'{arm}: trials evaluated different token counts {sorted(nt)} — PPLs are not comparable')
         n_tokens_by_arm[arm] = sorted(nt)
