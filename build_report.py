@@ -1419,7 +1419,17 @@ def sec_p2s():
         if r is None:
             continue
         _dci = r.get('ppl_ci95_doc_bootstrap')
-        _dcitxt = f'[{_dci[0]:.2f}, {_dci[1]:.2f}]' if isinstance(_dci, (list, tuple)) and len(_dci) == 2 else '—（缺逐文档 NLL）'
+        _dci_ok = False
+        if isinstance(_dci, (list, tuple)) and len(_dci) == 2:
+            try:
+                _dlo, _dhi = float(_dci[0]), float(_dci[1])
+                _dci_ok = (not isinstance(_dci[0], (bool, np.bool_))
+                           and not isinstance(_dci[1], (bool, np.bool_))
+                           and math.isfinite(_dlo) and math.isfinite(_dhi)
+                           and _dlo <= _dhi)
+            except (TypeError, ValueError, OverflowError):
+                _dci_ok = False
+        _dcitxt = f'[{_dlo:.2f}, {_dhi:.2f}]' if _dci_ok else '—（缺失/无效的逐文档 NLL CI）'
         lines.append(f'| `{v}` | {fm(_ppl_value(r))} {sp(r.get('ppl_std'))} | {_dcitxt} | {r.get('n_seeds', r.get('n', '?'))} | {_params_m(r)} |')
     lines += ['', '> 注：`±seed sd` 是**种子层**训练随机性；`文档 bootstrap 95% CI` 重采样固定的评测文档，只量化**文档抽样**不确定性，二者不是同一个估计量。评测文档少于 64 条时该 CI 不覆盖语言数据总体（design_notes §20）。', '']
     ps = per_seed_records('results_lm_v5_scale')
@@ -1462,7 +1472,17 @@ def sec_p2s():
         _base = _mt if _mt else main
         if _base:
             _ba, _bb, common, st = _base
-            _which = '`csa_fixed − full_matched`（参数对齐）' if _mt else '`csa_fixed − full`（未做容量匹配）'
+            if _mt:
+                _pm_ok = is_param_matched(_agg_entry(_agg, 'csa_fixed'),
+                                          _agg_entry(_agg, 'full_matched'))
+                if _pm_ok is True:
+                    _which = '`csa_fixed − full_matched`（参数对齐）'
+                elif _pm_ok is False:
+                    _which = '`csa_fixed − full_matched`（参数不匹配，见下表）'
+                else:
+                    _which = '`csa_fixed − full_matched`（参数未验证，见下表）'
+            else:
+                _which = '`csa_fixed − full`（未做容量匹配）'
             _tag = unmatched_tag(_agg_entry(_agg, _ba), _agg_entry(_agg, _bb)) if _mt else unmatched_tag(_agg_entry(_agg, 'csa_fixed'), _agg_entry(_agg, 'full'))
             if st['mean'] > 0:
                 _gate_ok = _sig_gate(st, label=f'P2S {_ba} - {_bb}',
