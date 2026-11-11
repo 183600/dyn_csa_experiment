@@ -666,11 +666,26 @@ def split_indices(n, *, time=None, groups=None, train_frac=0.8, val_frac=0.1,
             ))
         blocks = []
         start = 0
+        start_pos = 0
         cumulative = 0
-        for size in sizes:
+        _cuts_arr = np.asarray(cuts)
+        for _si, size in enumerate(sizes):
             cumulative += int(size)
-            pos = int(np.searchsorted(np.asarray(cuts), cumulative, side='left'))
-            pos = min(max(pos, 0), len(cuts) - 1)
+            # Reserve one legal cut for every later non-empty split.  Greedily
+            # taking the first cut at/after the cumulative target can consume
+            # the last timestamp block and leave a later split empty even
+            # though an earlier legal boundary would satisfy all three.
+            _later = sum(1 for _s in sizes[_si + 1:] if int(_s) > 0)
+            max_pos = len(cuts) - 1 - _later
+            pos = int(np.searchsorted(_cuts_arr, cumulative, side='left'))
+            # Never move backwards, and force progress for a non-empty split.
+            pos = max(pos, start_pos + (1 if int(size) > 0 else 0))
+            pos = min(max(pos, 0), max_pos)
+            if pos <= start_pos and int(size) > 0:
+                raise ValueError(
+                    'cannot form the requested non-empty chronological split '
+                    'without cutting an equal-timestamp block; supply groups '
+                    '(grouped_chronological_split_indices) or fewer split rows')
             end = int(cuts[pos])
             end = max(end, start)
             if int(size) > 0 and end <= start:
@@ -684,6 +699,7 @@ def split_indices(n, *, time=None, groups=None, train_frac=0.8, val_frac=0.1,
             # [7, 6]) instead of time order.
             blocks.append(order[start:end].copy())
             start = end
+            start_pos = pos
         return _purge_tail(dict(zip(SPLIT_NAMES, blocks)), purge)
     return chronological_split_indices(
         n, train_frac, val_frac, test_frac,

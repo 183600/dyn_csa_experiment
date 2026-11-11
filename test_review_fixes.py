@@ -3217,6 +3217,18 @@ def t_split_and_prepare_fits_train_only():
                                      time=np.array([5, 4, 3, 2, 1, 0])) is True
 
 
+def t_time_split_backtracks_for_repeated_timestamps():
+    # A greedy forward snap takes the last timestamp block for train and then
+    # cannot give val/test any rows, even though 6/2/2 is a legal split.
+    time = np.array([0, 0, 1, 1, 2, 2, 3, 3, 4, 4])
+    idx = L.split_indices(10, time=time)
+    sizes = [len(idx[k]) for k in ('train', 'val', 'test')]
+    assert sizes == [6, 2, 2], sizes
+    L.assert_no_split_leakage(idx['train'], idx['val'], idx['test'], time=time)
+    assert time[idx['train']].max() < time[idx['val']].min()
+    assert time[idx['val']].max() < time[idx['test']].min()
+
+
 def t_data_quality_temporal_audit():
     # Indices built outside the split helpers must still be audited for time
     # leakage: row/group disjointness alone cannot catch a shuffled series.
@@ -4784,6 +4796,7 @@ def main():
     _check('I20 index aliasing, non-finite labels, signed-zero duplicates, undefined SMD, NaT groups', t_data_guard_index_label_and_shift_edges)
     _check('I21 split-and-prepare fits preprocessing on train only', t_split_and_prepare_fits_train_only)
     _check('I21a data-quality temporal split audit', t_data_quality_temporal_audit)
+    _check('I21a2 time split backtracks for repeated timestamps', t_time_split_backtracks_for_repeated_timestamps)
     _check('I21b capped test document-id sidecar', t_capped_document_id_sidecar)
     _check('I22 purge/embargo keeps window boundaries sealed', t_split_purge_embargo)
     _check('I23 grouped split refuses an empty requested side', t_group_split_refuses_empty_requested_side)
