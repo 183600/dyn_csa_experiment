@@ -3151,6 +3151,35 @@ def t_data_quality_report():
     assert rep4['status'] == 'fail'
 
 
+def t_multi_output_missing_labels():
+    # A fully missing multi-output label is not a real category: it must not
+    # create a duplicate-label conflict, an unknown-label hit, or a histogram
+    # bin.  A row that is partly missing and partly non-finite must still count
+    # its non-finite output instead of hiding it behind the missing one.
+    X = np.array([[0.0], [0.0], [1.0]])
+    y = np.array([[None, None], [0, 1], [2, 2]], dtype=object)
+    rep = L.data_quality_report(X, y=y, train_idx=[0, 1, 2],
+                                known_labels=[(0, 1), (2, 2)], shift_threshold=10)
+    assert rep['checks']['label_conflicts_on_duplicate_rows'] == 0, rep
+    assert not any(rep['checks']['unknown_labels_by_split'].values()), rep
+    assert '(None, None)' not in rep['checks']['label_distribution'], rep
+    Xn = np.array([[0.0, 0.0], [2.0, 2.0], [1.0, 1.0]])
+    yn = np.array([[None, np.inf], [0, 1], [0, 1]], dtype=object)
+    repn = L.data_quality_report(Xn, y=yn, train_idx=[0, 1], val_idx=[2],
+                                 fail_on_nonfinite_labels=True,
+                                 shift_threshold=10)
+    assert repn['checks']['missing_labels'] == 1, repn
+    assert repn['checks']['nonfinite_labels'] == 1, repn
+    assert repn['status'] == 'fail' and repn['hard_failures'], repn
+    # clean_training_rows uses the same 'any output missing' rule, so a
+    # partially missing label cannot trigger a false duplicate conflict.
+    Xc = np.array([[0.0], [0.0]])
+    yc = np.array([[None, 0], [1, 0]], dtype=object)
+    clean = L.clean_training_rows(Xc, y=yc, train_idx=[0, 1])
+    assert clean['n_train_rows_out'] == 1, clean
+    assert clean['n_label_conflict_clusters'] == 0, clean
+
+
 def t_split_sizes_explicit_never_negative():
     # Explicit sizes and fractional targets can overdraw the remaining rows; the
     # filler must clamp rather than emit a negative split.
@@ -5084,6 +5113,7 @@ def main():
     _check('I3b imputation fill is identical in fit and transform', t_preprocessor_fill_is_consistent)
     _check('I3c leakage checks validate time/group inputs', t_leakage_checks_validate_inputs)
     _check('I4 data-quality/leakage report', t_data_quality_report)
+    _check('I4a data-quality multi-output missing labels', t_multi_output_missing_labels)
     _check('I4b data-quality report checks split index disjointness', t_data_quality_report_index_disjointness)
     _check('I5a categorical shift handles an empty reference', t_categorical_shift_empty_reference)
     _check('I5 categorical shift + cache guards', t_categorical_and_cache_guards)

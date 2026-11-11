@@ -1355,8 +1355,12 @@ def clean_training_rows(X, y=None, *, train_idx, drop_duplicates=True,
                       for i in train_rows_needed}
 
     def _missing(lab):
+        # Any missing output makes the multi-output label unusable, matching
+        # data_quality_report / _label_key.  Requiring every output to be
+        # missing let a partially missing label masquerade as a real label and
+        # trigger a false duplicate-label conflict.
         return lab is None or (isinstance(lab, tuple)
-                               and all(v is None for v in lab))
+                               and any(v is None for v in lab))
 
     keys = _row_keys(Xraw)
     clusters = {}
@@ -1954,23 +1958,31 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
             return v is None or (isinstance(v, tuple)
                                  and any(x is None for x in v))
 
-        missing_labels = int(sum(_label_missing(v) for v in labels))
-        absent_labels = int(sum(_raw_missing(v) for v in raw_labels))
-        nonfinite_labels = missing_labels - absent_labels
-        checks['missing_labels'] = absent_labels
+        def _row_nonfinite(label, raw):
+            # A row can be BOTH partly missing and partly non-finite
+            # (e.g. (None, inf)).  Subtracting the missing count from the
+            # missing-label count hid the Inf entirely, so count the two
+            # conditions independently at the output level.
+            pairs = (zip(label, raw) if isinstance(label, tuple)
+                     else ((label, raw),))
+            return any(key is None and not _raw_missing_atom(atom)
+                       for key, atom in pairs)
+
+        missing_labels = int(sum(_raw_missing(v) for v in raw_labels))
+        nonfinite_labels = int(sum(_row_nonfinite(lab, raw)
+                                   for lab, raw in zip(labels, raw_labels)))
+        checks['missing_labels'] = missing_labels
         checks['nonfinite_labels'] = nonfinite_labels
         checks['missing_labels_by_split'] = {}
         checks['nonfinite_labels_by_split'] = {}
         for name, rows in split_rows.items():
             _rows = np.asarray(rows, dtype=np.int64).reshape(-1).tolist()
             checks['missing_labels_by_split'][name] = int(
-                sum(_label_missing(labels[i]) and _raw_missing(raw_labels[i])
-                    for i in _rows))
+                sum(_raw_missing(raw_labels[i]) for i in _rows))
             checks['nonfinite_labels_by_split'][name] = int(
-                sum(_label_missing(labels[i]) and not _raw_missing(raw_labels[i])
-                    for i in _rows))
-        if absent_labels:
-            warnings.append(f'{absent_labels} missing labels')
+                sum(_row_nonfinite(labels[i], raw_labels[i]) for i in _rows))
+        if missing_labels:
+            warnings.append(f'{missing_labels} missing labels')
         if nonfinite_labels:
             _msg = (f'{nonfinite_labels} non-finite labels (NaN/Inf); impute '
                     'or remove them before fitting')
@@ -1980,7 +1992,7 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
                 warnings.append(_msg)
         by_row = {}
         for i, (k, lab) in enumerate(zip(keys, labels)):
-            if lab is not None:
+            if not _label_missing(lab):
                 by_row.setdefault(k, set()).add(_hashable_label(lab))
         conflicts = [k for k, labs in by_row.items() if len(labs) > 1]
         checks['label_conflicts_on_duplicate_rows'] = len(conflicts)
@@ -1997,7 +2009,7 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
                 counts = {}
                 for i in np.asarray(rows, dtype=np.int64).reshape(-1).tolist():
                     lab = labels[i]
-                    if lab is None:
+                    if _label_missing(lab):
                         continue
                     key = _hashable_label(lab)
                     if key not in known:
@@ -2019,7 +2031,7 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
         def _label_hist(values):
             hist = {}
             for v in values:
-                if v is not None:
+                if not _label_missing(v):
                     hist[str(v)] = hist.get(str(v), 0) + 1
             return {k: hist[k] for k in sorted(hist)}
         checks['label_distribution'] = _label_hist(labels)
@@ -2035,12 +2047,13 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
         label_shift = {}
         _train_lab = [str(labels[i]) for i in
                       np.asarray(ref, dtype=np.int64).reshape(-1).tolist()
-                      if labels[i] is not None]
+                      if not _label_missing(labels[i])]
         for name in ('val', 'test'):
             _rows = np.asarray(split_rows[name], dtype=np.int64).reshape(-1).tolist()
             if not _rows:
                 continue
-            _hold_lab = [str(labels[i]) for i in _rows if labels[i] is not None]
+            _hold_lab = [str(labels[i]) for i in _rows
+                         if not _label_missing(labels[i])]
             if not _train_lab or not _hold_lab:
                 continue
             _sh = categorical_shift_report(_train_lab, _hold_lab)
