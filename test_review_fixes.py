@@ -2980,6 +2980,15 @@ def t_group_split_contract():
     idx2 = L.split_indices(60, groups=shuffled, train_frac=0.6, val_frac=0.2, test_frac=0.2)
     g2 = {k: {shuffled[i] for i in idx2[k]} for k in ('train', 'val', 'test')}
     assert not (g2['train'] & g2['val']) and not (g2['train'] & g2['test']) and not (g2['val'] & g2['test'])
+    # With an ordering key, each split's returned row indices must stay in
+    # chronological order, not sorted by original row position.
+    g = np.arange(6)
+    t = np.array([5, 4, 3, 2, 1, 0])
+    ordered = L.grouped_chronological_split_indices(6, g, 0.5, 0.25, 0.25,
+                                                    order=t)
+    for name in ('train', 'val', 'test'):
+        vals = t[ordered[name]].tolist()
+        assert vals == sorted(vals), (name, ordered[name], vals)
 
 
 def t_group_split_respects_time_windows():

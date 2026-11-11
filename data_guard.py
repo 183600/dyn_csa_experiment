@@ -573,7 +573,23 @@ def grouped_chronological_split_indices(n, groups, train_frac=0.8, val_frac=0.1,
                len(out[SPLIT_NAMES[current]]) >= targets[current]):
             current += 1
         out[SPLIT_NAMES[current]].extend(int(i) for i in members[g])
-    res = {name: np.asarray(sorted(v), dtype=np.int64) for name, v in out.items()}
+    # Preserve chronological order within each split when an ordering key is
+    # supplied: sorting only by row index would hand back a shuffled
+    # time-series split (the non-grouped path explicitly preserves time
+    # order).  Without an order key, ascending row index is the deterministic
+    # first-appearance order.
+    res = {}
+    for name, v in out.items():
+        arr = np.asarray(v, dtype=np.int64)
+        if arr.size and order is not None:
+            _ord = np.asarray(order)
+            try:
+                arr = arr[np.argsort(_ord[arr], kind='stable')]
+            except (TypeError, ValueError, OverflowError):
+                arr = np.sort(arr)
+        else:
+            arr = np.sort(arr)
+        res[name] = arr
     # A requested non-empty split must not silently be empty.  An empty
     # validation set is not a harmless corner case: selection/early stopping
     # then has no legal data and callers are tempted to fall back to test.
