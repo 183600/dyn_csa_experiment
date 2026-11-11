@@ -8683,7 +8683,12 @@ def holm_adjust(named_pvals, alpha=0.05):
     输出 {name: {'p_raw', 'p_holm', 'rank', 'reject', 'm_effective'}}。
     family 的定义必须由调用方预先声明（预注册的族用冻结清单，探索性的族
     明示「未预注册」），本函数只做数学，不做族的选择——族的选择正是
-    多重比较问题的来源（design_notes §4/§17）。"""
+    多重比较问题的来源（design_notes §4/§17）。
+
+    An invalid/missing p-value still occupies its declared family slot: it is
+    counted in ``m`` as ``p=1`` (its own ``p_holm`` stays None).  Dropping it
+    from ``m`` would shrink the correction family and make the remaining
+    comparisons look more significant than the caller's stated family allows."""
     fam = []
     invalid = {}
     _seen_names = set()
@@ -8704,7 +8709,9 @@ def holm_adjust(named_pvals, alpha=0.05):
             continue
         fam.append((sname, pv))
     out = dict(invalid)
-    m = len(fam)
+    # Invalid slots sort after every valid p as p=1, so they increase m
+    # without changing the ranks of the valid comparisons.
+    m = len(fam) + len(invalid)
     order = sorted(fam, key=lambda kv: kv[1])
     prev = 0.0
     for i, (name, p) in enumerate(order):

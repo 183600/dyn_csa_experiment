@@ -96,6 +96,13 @@ def t_holm_min_attainable():
         raise AssertionError('duplicate comparison names must be rejected')
 
 
+def t_holm_invalid_slots_stay_in_family():
+    r = L.holm_adjust([(str(i), 0.012) for i in range(4)] + [('bad', None)])
+    assert r['bad']['p_holm'] is None and r['bad']['reject'] is False, r
+    assert r['0']['m_effective'] == 5, r
+    assert abs(r['0']['p_holm'] - 0.06) < 1e-12, r
+    assert r['0']['reject'] is False, r
+
 def t_min_consistency():
     assert L.signflip_min_consistency(12, 4, 0.05) == 11, 'n=12, m=4: 11/12 same-sign clears the first Holm gate (raw p = 2*(1+12)/4096 = 0.00635 < 0.0125)'
     assert L.signflip_min_consistency(6, 4, 0.05) is None, 'n=6, m=4: even 6/6 cannot clear the gate'
@@ -4672,6 +4679,7 @@ def main():
         print('[test] SKIPPED (no torch in this environment)')
         return 0
     _check('A1 holm_min_attainable_p', t_holm_min_attainable)
+    _check('A1a invalid Holm slots stay in the declared family', t_holm_invalid_slots_stay_in_family)
     _check('A2 signflip_min_consistency', t_min_consistency)
     _check('A3 signflip_power', t_power)
     _check('A4 tost_paired directions', t_tost)
