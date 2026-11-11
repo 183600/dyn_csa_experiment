@@ -975,7 +975,10 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
                 _nan_events.append({'step': step + 1, 'kind': 'param', 'loss': _loss_item,
                                     'grad_norm': _gn_pre, 'lr': base})
                 raise FloatingPointError(f'non-finite parameter values after step {step + 1}; aborting instead of training on corrupted weights')
-            if _ce_d is not None:
+            if _ce_d is not None and bool(torch.isfinite(_ce_d)):
+                # Never write a non-finite CE into the REINFORCE baseline:
+                # the next step's PG term would then be non-finite for every
+                # sample and poison all subsequent updates.
                 _ce_baseline.mul_(0.99).add_(_ce_d, alpha=0.01)
             _lbuf.append(ce.detach())
             _tail.append(ce.detach())
