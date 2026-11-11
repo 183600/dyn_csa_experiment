@@ -1549,7 +1549,15 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
         _adm_train_fps = {r.get('train_fp') for r in admitted.values() if isinstance(r.get('train_fp'), str) and r.get('train_fp')}
         _check_or_write_freeze_lock(_lock_dir, manifest, unified_fp, stage='accessed',
                                     train_fp=(next(iter(_adm_train_fps)) if len(_adm_train_fps) == 1 else None))
-    _alpha = float((manifest.get('statistics') or {}).get('alpha', 0.05))
+    _alpha_raw = (manifest.get('statistics') or {}).get('alpha', 0.05)
+    if isinstance(_alpha_raw, (bool, np.bool_)):
+        raise SystemExit(f'[p5t stats] REFUSE: statistics.alpha={_alpha_raw!r} is a boolean, not a significance level')
+    try:
+        _alpha = float(_alpha_raw)
+    except (TypeError, ValueError, OverflowError):
+        raise SystemExit(f'[p5t stats] REFUSE: statistics.alpha={_alpha_raw!r} is not numeric') from None
+    if not (math.isfinite(_alpha) and 0.0 < _alpha < 1.0):
+        raise SystemExit(f'[p5t stats] REFUSE: statistics.alpha={_alpha!r} must be in (0,1)')
     stats = {'manifest': {'frozen_at': manifest.get('frozen_at'), 'manifest_sha256': manifest.get('manifest_sha256'), 'arms': manifest['arms'], 'seeds': manifest['seeds'], 'code_semantics_expected': manifest.get('code_semantics_expected'), 'statistics': manifest.get('statistics'), 'scope': manifest.get('scope'), 'revision': manifest.get('revision')}, 'admission': {'n_admitted': len(admitted), 'test_slice_fp': unified_fp, 'n_effective_seeds': len({int(s) for (_v, s) in admitted}), 'n_declared_seeds': len(manifest['seeds'])}, 'comparisons': {}, 'holm': {}, 'by_length': {}, 'probe': _test_probe_stats(probe_path, manifest, unified_fp)}
     # The exact sign-flip p is valid only under within-seed exchangeability.
     # admission binds the corpus/slice/row count/recipe/code, but the RNG stream
