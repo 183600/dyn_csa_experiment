@@ -4915,6 +4915,27 @@ def t_release_readiness_audit():
 
 
 
+def t_archive_hashes_all_checkpoint_extensions():
+    import archive_release as AR
+    root = tempfile.mkdtemp()
+    old_repo = AR.REPO
+    try:
+        os.makedirs(os.path.join(root, 'results_x'))
+        for n in ('a.pt', 'b.ckpt', 'c.pth', 'd.safetensors'):
+            with open(os.path.join(root, 'results_x', n), 'wb') as f:
+                f.write(n.encode())
+        AR.REPO = root
+        hashed = AR._ckpt_hash_table(['results_x'])
+        assert sorted(hashed) == ['results_x/a.pt', 'results_x/b.ckpt',
+                                  'results_x/c.pth', 'results_x/d.safetensors'], hashed
+        packed = AR._collect(['results_x'])
+        assert not any(p.endswith(('.pt', '.ckpt', '.pth', '.safetensors'))
+                       for p in packed), packed
+    finally:
+        AR.REPO = old_repo
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def t_archive_refuses_dirs_outside_repo():
     import archive_release as AR
     root = tempfile.mkdtemp()
@@ -5816,6 +5837,7 @@ def main():
     _check('L9 evidence-release readiness audit', t_release_readiness_audit)
     _check('L9b archive verifier requires the external checksum', t_archive_verify_requires_external_checksum)
     _check('L9b2 archive refuses result dirs outside the repo', t_archive_refuses_dirs_outside_repo)
+    _check('L9b3 archive hashes every checkpoint extension', t_archive_hashes_all_checkpoint_extensions)
     _check('L10 selection-attribution contract', t_selection_attribution_contract)
     _check('L10b corpus-audit memo cannot bypass the strict gate', t_corpus_audit_memo_does_not_bypass_strict_gate)
     _check('L10c corpus-audit memo keys the validation row shape', t_corpus_audit_memo_keys_validation_shape)
