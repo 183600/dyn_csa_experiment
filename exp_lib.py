@@ -18580,7 +18580,12 @@ def _doc_bootstrap_ppl_ci(recs, *, n_boot=2000, seed=20261018):
     if len({len(a) for a, _ in rows}) != 1:
         return None
     R = len(rows[0][0])
-    if R == 0:
+    if R < 2:
+        # Resampling ONE document always reproduces the same pooled PPL, so a
+        # percentile interval would be [ppl, ppl] — false certainty rather
+        # than a document-sampling uncertainty estimate.  The combined
+        # seed x document helper already reports R<2 as unverifiable; keep the
+        # standalone helper consistent instead of inventing a zero-width CI.
         return None
     nll_mat = np.stack([a for a, _ in rows], axis=0)          # [S, R]
     ntok_mat = np.stack([b for _, b in rows], axis=0)         # [S, R]

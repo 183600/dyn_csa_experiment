@@ -1636,6 +1636,9 @@ def t_combined_seed_doc_uncertainty():
     # A single scored document cannot carry a doc-resampling component.
     r3 = L._combined_seed_doc_ci(_recs([0.0, 0.2], n_docs=1, ntok=50))
     assert r3['status'] == 'doc_component_unverifiable' and r3['se_doc_logppl'] is None and r3['se_seed_logppl'] is not None, r3
+    # The standalone document bootstrap must not report a one-document
+    # zero-width interval as if it had measured document uncertainty.
+    assert L._doc_bootstrap_ppl_ci(_recs([0.0], n_docs=1, ntok=50)) is None
     # Zero-token (never scored) rows are dropped, not pooled as free mass.
     r4 = L._combined_seed_doc_ci(_recs([0.0, 0.2], n_docs=8, ntok=50, zero_docs=2))
     assert r4['status'] == 'ok' and r4['n_docs'] == 6 and r4['n_docs_dropped_zero_token'] == 2, r4
