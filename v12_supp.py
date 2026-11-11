@@ -1326,11 +1326,10 @@ def _doc_level_analysis(recs_a, recs_b, common, Ln):
         logs = []
         for k in range(len(common)):
             a, b = per_seq_a[k][i], per_seq_b[k][i]
-            try:
-                fa, fb = float(a), float(b)
-            except (TypeError, ValueError, OverflowError):
-                fa = fb = float('nan')
-            if (not math.isfinite(fa)) or (not math.isfinite(fb)) or fa <= 0.0 or fb <= 0.0:
+            # Booleans/strings are flags/metadata, not per-document PPL
+            # measurements; float(True) would silently become PPL 1.0.
+            fa, fb = L._finite_scalar(a), L._finite_scalar(b)
+            if fa is None or fb is None or fa <= 0.0 or fb <= 0.0:
                 incomplete += 1
                 continue
             cell.append(fa - fb)
@@ -1428,12 +1427,9 @@ def _test_probe_stats(probe_path, manifest, slice_fp):
         elif _record_int(r.get('eval_len')) is None:
             why = f"eval_len {r.get('eval_len')!r} is not an integer"
         else:
-            try:
-                _rho_i = float(r.get('rho'))
-            except (TypeError, ValueError, OverflowError):
-                _rho_i = float('nan')
-            if not math.isfinite(_rho_i):
-                why = f"rho {r.get('rho')!r} is not numeric"
+            _rho_i = None if isinstance(r.get('rho'), (bool, np.bool_)) else L._finite_scalar(r.get('rho'))
+            if _rho_i is None:
+                why = f"rho {r.get('rho')!r} is not a finite numeric measurement"
         if why:
             excluded.append(f'{key}: {why}')
             continue

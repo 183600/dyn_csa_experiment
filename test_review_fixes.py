@@ -1603,6 +1603,15 @@ def t_doc_level_analysis():
     assert d is not None and d['n_docs'] == n_doc
     assert abs(d['per_doc_delta_mean'] - (-1.0)) < 1e-9, 'per-doc delta must be a - b = -1.0'
     assert abs(d['between_doc_sd']) < 1e-9, 'constant -1.0 shift across docs -> zero between-doc spread'
+    # A boolean/string is not a per-document PPL measurement; it is counted as
+    # an incomplete cell, not coerced to 1.0 (or a numeric string).
+    bad_a = {k: dict(v, by_len={'4096': dict(v['by_len']['4096'],
+                                            ppl_per_seq=list(v['by_len']['4096']['ppl_per_seq']))})
+             for k, v in recs_a.items()}
+    bad_a[0]['by_len']['4096']['ppl_per_seq'][0] = True
+    bad_a[1]['by_len']['4096']['ppl_per_seq'][0] = '30.0'
+    d2 = V12._doc_level_analysis(bad_a, recs_b, list(range(n_seed)), 4096)
+    assert d2 is not None and d2['incomplete_doc_seed_cells'] == 2, d2
 
 
 # ---------------------------------------------------------------------------
