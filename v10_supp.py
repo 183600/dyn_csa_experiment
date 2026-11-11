@@ -1549,11 +1549,23 @@ def v10_analysis(out='analysis_v10/stats.json'):
                     continue
                 if r.get('variant') is None or r.get('seed') is None or r.get('arm') is None or r.get('condition') is None:
                     continue
-                nkey = (r['variant'], r['arm'], r['eval_len'], r['condition'], json.dumps(_fp_norm(r.get('probe_params')), sort_keys=True), str(r.get('_code')), str(r.get('recipe')))
-                grp = ncells.setdefault(nkey, {})
-                if r['seed'] in grp:
+                _seed = L._as_seed_int(r.get('seed'))
+                if _seed is None:
                     continue
-                grp[r['seed']] = r
+                # acc/nll are measurements: a bool/string/NaN is not a result.
+                # Preserve the declared cell with a NaN value so the Holm
+                # family keeps its slot, but never let np.mean crash or read a
+                # boolean as an accuracy.
+                _acc = L._finite_scalar(r.get('acc'))
+                _nll = L._finite_scalar(r.get('nll'))
+                _r = dict(r, seed=_seed,
+                          acc=(_acc if _acc is not None else float('nan')),
+                          nll=(_nll if _nll is not None else float('nan')))
+                nkey = (_r['variant'], _r['arm'], _r['eval_len'], _r['condition'], json.dumps(_fp_norm(_r.get('probe_params')), sort_keys=True), str(_r.get('_code')), str(_r.get('recipe')))
+                grp = ncells.setdefault(nkey, {})
+                if _seed in grp:
+                    continue
+                grp[_seed] = _r
             niah_cells = []
             for (v, arm, Ln, cond, _pp, _cd, _recipe), by_seed in sorted(ncells.items(), key=lambda kv: kv[0]):
                 accs = {s: r['acc'] for s, r in by_seed.items()}
