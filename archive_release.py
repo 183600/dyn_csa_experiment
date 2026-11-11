@@ -123,6 +123,17 @@ def _collect(dirs, include_ckpt=False):
         p = os.path.join(REPO, f)
         if os.path.exists(p) and not os.path.islink(p) and os.path.isfile(p):
             files.append(p)
+    # The loaders write tag-suffixed metadata/tokenizer files (e.g.
+    # meta_v5_sl512_....json), not the legacy fixed names above.  Pack those
+    # small provenance files too; otherwise a release silently omits the cache
+    # and tokenizer identity its own documentation promises.
+    import glob as _glob
+    for _pat in ('wt103_cache/meta_v5_*.json', 'wt103_cache/test_meta_v2_*.json',
+                 'wt103_cache/tok_v5_*.json', 'wt103_cache/test_tok_v2_*.json',
+                 'fineweb_cache/meta_v2_*.json'):
+        for _p in sorted(_glob.glob(os.path.join(REPO, _pat))):
+            if os.path.isfile(_p) and not os.path.islink(_p):
+                files.append(_p)
     for f in ('results_lm_test/.freeze_lock.json',):
         p = os.path.join(REPO, f)
         if os.path.exists(p) and not os.path.islink(p) and os.path.isfile(p):

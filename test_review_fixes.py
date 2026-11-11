@@ -4782,10 +4782,18 @@ def t_archive_verify_requires_external_checksum():
             with open(os.path.join(_td, 'results_x', 'payload.txt'), 'w') as f:
                 f.write('hello')
             os.symlink('/etc/passwd', os.path.join(_td, 'results_x', 'link'))
+            os.makedirs(os.path.join(_td, 'wt103_cache'))
+            for _n in ('meta_v5_sl512.json', 'tok_v5_sl512.json',
+                       'test_meta_v2_sl512.json', 'test_tok_v2_sl512.json'):
+                with open(os.path.join(_td, 'wt103_cache', _n), 'w') as f:
+                    f.write('{}')
             _files = AR._collect(['results_x'])
             _rels = {os.path.relpath(f, _td) for f in _files}
             assert 'results_x/payload.txt' in _rels, _rels
             assert 'results_x/link' not in _rels, _rels
+            for _n in ('meta_v5_sl512.json', 'tok_v5_sl512.json',
+                       'test_meta_v2_sl512.json', 'test_tok_v2_sl512.json'):
+                assert os.path.join('wt103_cache', _n) in _rels, (_n, _rels)
         finally:
             AR.REPO = _old_repo
             shutil.rmtree(_td, ignore_errors=True)
