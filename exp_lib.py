@@ -11231,6 +11231,50 @@ def simple_baseline_audit(artifact=None, path=None, protocol=None):
             problems.append(f'{arm}: no trial records')
             continue
         cfgs = [json.dumps(t.get('config') or {}, sort_keys=True, default=str) for t in trials if isinstance(t, dict)]
+        # The declared search range is part of the evidence: a "selected"
+        # smoothing value outside the protocol grid was never part of the
+        # equal-search comparison.
+        _arm_decl = (_declared.get(arm) if isinstance(_declared, dict) else None)
+        _arm_order = None
+        if isinstance(_arm_decl, dict) and _arm_decl.get('order') is not None:
+            try:
+                _arm_order = int(_arm_decl['order'])
+            except (TypeError, ValueError, OverflowError):
+                problems.append(f'{arm}: declared order is not an integer ({_arm_decl.get("order")!r})')
+        _grids = protocol.get('grids')
+        _grid = _grids.get(arm) if isinstance(_grids, dict) else None
+        if isinstance(_grid, dict):
+            for _ti, _t in enumerate(trials):
+                if not isinstance(_t, dict):
+                    continue
+                _cfg = _t.get('config')
+                if not isinstance(_cfg, dict):
+                    problems.append(f'{arm}: trial {_ti} has no config mapping')
+                    continue
+                if _arm_order is not None:
+                    try:
+                        _co = int(_cfg.get('order'))
+                    except (TypeError, ValueError, OverflowError):
+                        _co = None
+                    if _co is None:
+                        problems.append(f'{arm}: trial {_ti} has no integer order')
+                    elif _co != _arm_order:
+                        problems.append(f'{arm}: trial {_ti} order={_co} differs from the declared order={_arm_order}')
+                for _gk, _gvals in _grid.items():
+                    if not isinstance(_gvals, (list, tuple)) or not _gvals:
+                        continue
+                    if _gk not in _cfg:
+                        if _gk == 'interpolation' and _arm_order == 1:
+                            continue
+                        problems.append(f'{arm}: trial {_ti} is missing declared {_gk}')
+                        continue
+                    _gv = _finite_scalar(_cfg.get(_gk))
+                    _allowed = [_finite_scalar(x) for x in _gvals]
+                    if _gv is None or not any(_a is not None and abs(_gv - _a) <= 1e-12
+                                              for _a in _allowed):
+                        problems.append(
+                            f'{arm}: trial {_ti} {_gk}={_cfg.get(_gk)!r} is outside '
+                            f'the declared search grid {list(_gvals)!r}')
         chosen = entry.get('selected') or entry.get('selected_config')
         if not isinstance(chosen, dict):
             problems.append(f'{arm}: no selected config')
