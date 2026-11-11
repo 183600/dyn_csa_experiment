@@ -4438,6 +4438,18 @@ def t_report_paired_row_single_config():
     assert pair[0] in ([('', 0)], [('', 1)]), pair
 
 
+def t_driver_pairing_single_config():
+    import v9_supp as V9
+    def rec(cfg, ppl):
+        return {'run_cfg': cfg, 'steps': 100, 'tokens_seen': 1000, 'ppl': ppl}
+    panel = {'a': {0: rec('cfgA', 10.0), 1: rec('cfgB', 10.0)},
+             'b': {0: rec('cfgA', 12.0), 1: rec('cfgB', 12.0)}}
+    comps = {}
+    V9.add_paired(comps, 'mixed', panel, 'a', 'b')
+    assert comps['mixed']['n'] == 1, comps['mixed']
+    assert len(comps['mixed']['seeds']) == 1, comps['mixed']
+
+
 def t_report_stale_trajectory_refused():
     stale = 'old_csOLD'
     s = {}
@@ -5379,6 +5391,7 @@ def main():
     _check('L3b scale-ladder budget + transfer audit', t_scale_ladder_budget_and_transfer_audit)
     _check('L3c report pairing keeps one run_cfg group', t_report_paired_row_single_config)
     _check('L3d report refuses stale trajectories', t_report_stale_trajectory_refused)
+    _check('L3e v8/v9 pairing keeps one run_cfg group', t_driver_pairing_single_config)
     _check('L4 matched-init fingerprint + pair gate', t_init_core_fingerprint_and_pair_gate)
     _check('L5 param breakdown + measured compute control', t_param_and_compute_control_detail)
     _check('L6 stale aggregate refused', t_stale_aggregate_refused)
