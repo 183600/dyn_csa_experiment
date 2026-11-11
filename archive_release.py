@@ -187,6 +187,16 @@ def cmd_make(tag, dirs, include_ckpt=False, outdir='archive'):
     stamp = time.strftime('%Y%m%dT%H%M%S')
     base_name = f'release_{tag}'
     tar_path = os.path.join(REPO, outdir, f'{base_name}.tar.gz')
+    _existing = [p for p in (tar_path, tar_path + '.sha256',
+                             os.path.join(REPO, outdir, f'{base_name}.MANIFEST.sha256'),
+                             os.path.join(REPO, outdir, f'{base_name}.release_record.json'))
+                 if os.path.exists(p)]
+    if _existing:
+        print('[archive] REFUSE: release artifacts already exist for tag '
+              f'{tag!r} ({[os.path.basename(p) for p in _existing]}) — an '
+              'evidence archive is immutable; choose a new tag or move the old '
+              'release aside explicitly')
+        return 1
     man = {'release': base_name, 'tag': tag, 'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'created_by': 'archive_release.py', 'git': _git_state(), 'environment': _env_snapshot(), 'dirs': list(dirs), 'include_ckpt_bodies': bool(include_ckpt), 'files': {}, 'checkpoint_hashes': _ckpt_hash_table(dirs)}
     with tarfile.open(tar_path, 'w:gz') as tf:
         for p in files:
