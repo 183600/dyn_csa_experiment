@@ -1149,6 +1149,7 @@ def audit_boundary(outdirs=None):
     「对齐精度 − 随机基线」的差值与比值汇总成显式判读。"""
     out = {'status': 'ok', 'panels': {}}
     L = _import_exp_lib()
+    import numpy as np
     dirs = outdirs or list(_iter_result_dirs())
     for d in dirs:
         summ = _load(os.path.join(d, 'summary.json'))
@@ -1165,12 +1166,38 @@ def audit_boundary(outdirs=None):
                     break
         if found:
             agg = []
+            bad = []
             for key, b in list(found.items())[:200]:
                 p = b.get('precision')
                 rp = b.get('random_precision')
-                if p is not None and rp is not None:
-                    agg.append({'key': key, 'precision': p, 'random_baseline': rp, 'excess': p - rp, 'ratio': (p / rp) if rp else None, 'verdict': 'exceeds random baseline' if p > rp else ('at baseline (block-length artifact)' if abs(p - rp) < 1e-9 else 'below baseline')})
+                if p is None or rp is None:
+                    # A cell that only carries `excess` cannot be audited: both
+                    # the precision and the matched-length random baseline are
+                    # required to test the claim.
+                    bad.append(f'{key}: missing precision/random_precision')
+                    continue
+                if (isinstance(p, (bool, np.bool_))
+                        or isinstance(rp, (bool, np.bool_))):
+                    bad.append(f'{key}: precision/random_precision is boolean')
+                    continue
+                try:
+                    p = float(p)
+                    rp = float(rp)
+                except (TypeError, ValueError, OverflowError):
+                    bad.append(f'{key}: precision/random_precision is not numeric')
+                    continue
+                if not (math.isfinite(p) and math.isfinite(rp)):
+                    bad.append(f'{key}: precision/random_precision is not finite')
+                    continue
+                agg.append({'key': key, 'precision': p, 'random_baseline': rp, 'excess': p - rp, 'ratio': (p / rp) if rp else None, 'verdict': 'exceeds random baseline' if p > rp else ('at baseline (block-length artifact)' if abs(p - rp) < 1e-9 else 'below baseline')})
             out['panels'][d] = agg
+            if bad:
+                out['status'] = 'fail'
+                out.setdefault('problems', []).extend(f'{d}: {msg}' for msg in bad)
+            if not agg:
+                out['status'] = 'fail'
+                out.setdefault('problems', []).append(
+                    f'{d}: boundary cells exist but none has a usable precision/random_precision pair')
             # The audit's claim is that alignment EXCEEDS the matched-length
             # random baseline; a cell at/below it is a failed claim, not a
             # silent diagnostic.
