@@ -752,6 +752,13 @@ def t_admission_gate():
     good = {'a::s0': _rec('a_arm', 0, 'FP'), 'b::s0': _rec('b_arm', 0, 'FP'), 'a::s1': _rec('a_arm', 1, 'FP'), 'b::s1': _rec('b_arm', 1, 'FP')}
     adm, fp = V12._admit_confirmation_records(good, m)
     assert len(adm) == 4 and fp == 'FP'
+    # A usable ppl alone does not make a truncated cell complete: resume must
+    # use the same full-shape predicate as admission or it will skip a record
+    # that admission later rejects.
+    trunc = _rec('a_arm', 0, 'FP', by_len={'4096': {
+        'ppl': 30.0, 'n_tok': 16 * 4095, 'n_seq': 16, 'truncated': True}})
+    assert L.by_len_cells([trunc], 4096), 'the truncated cell has a usable ppl'
+    assert V12._by_len_shape_reason(trunc, 16) is not None
     # off-whitelist seed: excluded, named, never counted
     raw = dict(good, **{'a::s9': _rec('a_arm', 9, 'FP')})
     adm2, _ = V12._admit_confirmation_records(raw, m)

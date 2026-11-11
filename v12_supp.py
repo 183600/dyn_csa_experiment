@@ -833,12 +833,16 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test', train_
             return True
         # A record measured on a different row count is a different estimand.
         # n_seq is stored explicitly and a mismatch is treated as stale.
-        if int(rec.get('n_seq') or -1) != int(test_ids.shape[0]):
+        if _record_int(rec.get('n_seq')) != int(test_ids.shape[0]):
             return True
         if _msha is not None and rec.get('manifest_sha256') != _msha:
             return True  # the manifest changed after this record was written
-        bl = rec.get('by_len') or {}
-        if not all((L.by_len_cells([rec], Ln) for Ln in eval_lens)):
+        # by_len_cells() only checks that a usable ppl exists; it does not
+        # reject a truncated/partial cell.  Use the same full-shape predicate
+        # as admission, otherwise resume would skip re-evaluation and the
+        # record would then be silently excluded from the one-shot test.
+        if (not all((L.by_len_cells([rec], Ln) for Ln in eval_lens))
+                or _by_len_shape_reason(rec, test_ids.shape[0]) is not None):
             return True
         # The record must belong to the SAME weights now on disk.  A metadata
         # (size, mtime_ns, ctime_ns, inode) signature recorded at write time
