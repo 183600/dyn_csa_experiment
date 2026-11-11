@@ -437,7 +437,14 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
             if out['status'] == 'ok':
                 out['status'] = 'warnings'
     except Exception as e:
+        # A failed overlap computation leaves the train/test document
+        # separation unverified.  Reporting the top-level audit as "ok" would
+        # let a malformed cache/meta silently clear the leakage gate.
         out['checks']['doc_overlap'] = f'failed ({type(e).__name__}: {e})'
+        out['status'] = 'fail'
+        out['note'] = (f'train/test document-overlap computation failed ({type(e).__name__}: {e}); '
+                       'document separation cannot be verified — rebuild the caches '
+                       'or fix the malformed inputs before quoting a clean leakage audit')
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return out
 
@@ -645,10 +652,17 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
             if os.path.basename(mp).startswith('test_meta_'):
                 continue
             _nwarn_before = len(out['warnings'])
+            tag = os.path.basename(mp)[len('meta_'):-len('.json')]
             meta = _load(mp)
             if not isinstance(meta, dict):
+                # An existing but unreadable/non-object meta is a corrupt
+                # cache, not "no cache": skipping it silently would leave the
+                # split contract unverified while the audit reports ok.
+                cache['corpora'][tag] = {'status': 'fail', 'meta': os.path.basename(mp),
+                                         'error': 'metadata exists but is not a JSON object'}
+                cache['status'] = 'fail'
+                _fail(f'{cd}/{tag}: cache metadata is unreadable or not a JSON object — split contract cannot be verified')
                 continue
-            tag = os.path.basename(mp)[len('meta_'):-len('.json')]
             trp = os.path.join(cd, f'train_ids_{tag}.npy')
             vap = os.path.join(cd, f'val_batch_{tag}.npy')
             if not (os.path.exists(trp) and os.path.exists(vap)):
@@ -774,10 +788,12 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
             # negatives in the overlap audit.
             _cands = []
             for _tmp in sorted(glob.glob(os.path.join(cd, 'test_meta_*.json'))):
+                _ttag = os.path.basename(_tmp)[len('test_meta_'):-len('.json')]
                 _tm = _load(_tmp)
                 if not isinstance(_tm, dict):
+                    rec['status'] = 'fail'
+                    _fail(f'{cd}/{_ttag}: test cache metadata is unreadable or not a JSON object — test split contract cannot be verified')
                     continue
-                _ttag = os.path.basename(_tmp)[len('test_meta_'):-len('.json')]
                 _tfp = os.path.join(cd, f'test_ids_{_ttag}.npy')
                 if not os.path.exists(_tfp):
                     continue
@@ -1169,7 +1185,10 @@ def audit_boundary(outdirs=None):
         if found:
             agg = []
             bad = []
-            for key, b in list(found.items())[:200]:
+            # Audit EVERY cell, not only the first 200: truncating the loop
+            # would let a failing cell beyond the cap disappear from the
+            # verdict while the audit still reports "ok".
+            for key, b in found.items():
                 p = b.get('precision')
                 rp = b.get('random_precision')
                 if p is None or rp is None:
@@ -1191,8 +1210,16 @@ def audit_boundary(outdirs=None):
                 if not (math.isfinite(p) and math.isfinite(rp)):
                     bad.append(f'{key}: precision/random_precision is not finite')
                     continue
+                # Precision and a probability baseline are fractions in [0,1].
+                # An out-of-range value (e.g. -0.5 or 1.7) cannot support the
+                # "exceeds the random baseline" reading and must not be
+                # summarised as if it did.
+                if not (0.0 <= p <= 1.0 and 0.0 <= rp <= 1.0):
+                    bad.append(f'{key}: precision/random_precision outside [0,1] ({p!r}, {rp!r})')
+                    continue
                 agg.append({'key': key, 'precision': p, 'random_baseline': rp, 'excess': p - rp, 'ratio': (p / rp) if rp else None, 'verdict': 'exceeds random baseline' if p > rp else ('at baseline (block-length artifact)' if abs(p - rp) < 1e-9 else 'below baseline')})
             out['panels'][d] = agg
+            out.setdefault('cells_audited', {})[d] = len(agg)
             if bad:
                 out['status'] = 'fail'
                 out.setdefault('problems', []).extend(f'{d}: {msg}' for msg in bad)
@@ -2020,11 +2047,14 @@ def audit_selection(path='analysis_mechanism/selection_attribution.json'):
         except (TypeError, ValueError, OverflowError):
             out['problems'].append(f'cell {i}: non-numeric fields')
             continue
-        if not (0.0 <= rec <= 1.0 and 0.0 <= mass <= 1.0 and 0.0 <= base <= 1.0):
+        _range_ok = bool(0.0 <= rec <= 1.0 and 0.0 <= mass <= 1.0 and 0.0 <= base <= 1.0)
+        if not _range_ok:
             out['problems'].append(f'cell {i}: recall/mass/baseline outside [0,1]')
-        if k <= 0 or B <= 0 or k > B:
+        _geom_ok = bool(k > 0 and B > 0 and k <= B)
+        if not _geom_ok:
             out['problems'].append(f'cell {i}: require 0 < k <= n_blocks (got k={k}, B={B})')
-        if nq <= 0:
+        _nq_ok = bool(nq > 0)
+        if not _nq_ok:
             out['problems'].append(f'cell {i}: n_queries must be positive')
         _seeds = c.get('per_seed')
         if not _seeds:
@@ -2063,7 +2093,11 @@ def audit_selection(path='analysis_mechanism/selection_attribution.json'):
                              'mass_excess': mass - base, 'recall_excess': rec - base,
                              'n_queries': nq, 'n_seeds': _n_seeds, 'n_seeds_valid': _n_valid,
                              'seed_test': _st,
-                             'claim_allowed': bool(mass > base and rec > base and nq > 0 and _st is not None and _st.get('p_exact_signflip', 1.0) < 0.05 and int(_st.get('n', 0)) >= 6)})
+                             'claim_allowed': bool(_range_ok and _geom_ok and _nq_ok
+                                                   and mass > base and rec > base
+                                                   and _st is not None
+                                                   and _st.get('p_exact_signflip', 1.0) < 0.05
+                                                   and int(_st.get('n', 0)) >= 6)})
     out['status'] = 'fail' if out['problems'] else 'ok'
     out['note'] = ('cells pass the structural contract; `claim_allowed` additionally requires mass/recall above the '
                    'random baseline and a seed-level exact sign-flip p<0.05 with n>=6')

@@ -3843,6 +3843,52 @@ def t_audit_boundary_below_baseline_fails():
         assert out['status'] == 'ok', out
 
 
+def t_audit_boundary_audits_every_cell_and_range():
+    # A failing cell beyond any display cap must still fail the audit, and a
+    # precision/baseline outside [0,1] is unverifiable, not an "excess".
+    with tempfile.TemporaryDirectory() as d:
+        recs = {f'a::s{i}': {'variant': 'a', 'mech': {
+            'precision': 0.30, 'random_precision': 0.20}} for i in range(200)}
+        recs['z::s_bad'] = {'variant': 'z', 'mech': {
+            'precision': 0.10, 'random_precision': 0.20}}
+        with open(os.path.join(d, 'summary.json'), 'w', encoding='utf-8') as f:
+            json.dump(recs, f)
+        out = A.audit_boundary(outdirs=[d])
+        assert out['status'] == 'fail', out['status']
+        assert out.get('cells_audited', {}).get(d) == 201, out.get('cells_audited')
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, 'summary.json'), 'w', encoding='utf-8') as f:
+            json.dump({'a::s0': {'variant': 'a', 'mech': {
+                'precision': 1.5, 'random_precision': 0.2}}}, f)
+        out = A.audit_boundary(outdirs=[d])
+        assert out['status'] == 'fail', out
+        assert any('outside [0,1]' in x for x in out.get('problems', [])), out
+
+
+def t_selection_audit_rejects_out_of_range_claims():
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, 'sel.json')
+        per_seed = {str(i): {'mass_covered': 0.8, 'random_baseline': 0.03}
+                    for i in range(6)}
+        with open(p, 'w', encoding='utf-8') as f:
+            json.dump({'cells': [{
+                'arm': 'a', 'eval_len': 4096, 'k': 32, 'n_blocks': 1024,
+                'n_queries': 10, 'recall_at_k': 0.5, 'mass_covered': 1.5,
+                'random_baseline': 0.03, 'per_seed': per_seed}]}, f)
+        out = A.audit_selection(p)
+        assert out['status'] == 'fail', out
+        assert out['cells'][0]['claim_allowed'] is False, out['cells'][0]
+
+
+def t_split_audit_fails_on_unreadable_meta():
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, 'meta_bad.json'), 'w', encoding='utf-8') as f:
+            f.write('{not valid json')
+        out = A.audit_split_discipline(cache_dirs=[d])
+        assert out['status'] == 'fail', out
+        assert out['caches'][os.path.abspath(d)]['status'] == 'fail', out
+
+
 def t_selection_audit_empty_per_seed_fails():
     with tempfile.TemporaryDirectory() as d:
         p = os.path.join(d, 'sel.json')
@@ -4910,7 +4956,10 @@ def main():
     _check('I14 corpus audit counts overlapping validation rows once', t_corpus_audit_overlap_is_unique_across_windows)
     _check('I15 length audit refuses a missing eval span', t_audit_length_requires_eval_span)
     _check('I15b boundary audit fails below the random baseline', t_audit_boundary_below_baseline_fails)
+    _check('I15b2 boundary audit covers every cell and validates ranges', t_audit_boundary_audits_every_cell_and_range)
     _check('I15c selection audit rejects empty per_seed evidence', t_selection_audit_empty_per_seed_fails)
+    _check('I15c2 selection audit rejects out-of-range claim cells', t_selection_audit_rejects_out_of_range_claims)
+    _check('I15d split audit fails closed on unreadable metadata', t_split_audit_fails_on_unreadable_meta)
     _check('I16 fairness audit ignores a NaN seed instead of crashing', t_audit_fairness_nan_seed_does_not_crash)
     _check('I17 an empty split cache is not reported as verified', t_audit_split_empty_cache_is_not_ok)
     _check('I18 tuning audit reports malformed seed keys instead of crashing', t_baseline_audit_malformed_seed_keys)
