@@ -16267,6 +16267,22 @@ class _HashingWriter:
         return getattr(self._f, name)
 
 
+def _safe_path_component(value):
+    """A single safe filename component (no separators / traversal)."""
+    s = ''.join(ch if (ch.isalnum() or ch in '._-') else '_' for ch in str(value))
+    return s or '_'
+
+
+def ckpt_file_name(variant, seed, tag):
+    """Checkpoint filename built from a variant/seed/tag.
+
+    The variant comes from user config; without sanitisation a value like
+    ``../escape`` or ``/tmp/escape`` escapes ``ckpt_dir``.  Keep the normal
+    names unchanged while making the component a single safe path element."""
+    return (f'{_safe_path_component(variant)}_seed{int(seed)}_'
+            f'{_safe_path_component(tag)}.pt')
+
+
 def _atomic_torch_save(obj, path, hash_out=None):
     d = os.path.dirname(os.path.abspath(path))
     os.makedirs(d, exist_ok=True)
@@ -16627,7 +16643,7 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
         if tag == 'final' and _save_mode not in ('final', 'both'):
             return
         try:
-            path = os.path.join(ckpt_dir, f'{variant}_seed{seed}_{tag}.pt')
+            path = os.path.join(ckpt_dir, ckpt_file_name(variant, seed, tag))
             _h = classify_training_health(_health_history)
             _checkpoints[tag] = _save_analysis_checkpoint(path, _inner_model, {
                 'variant': variant, 'seed': seed, 'step': step_no,

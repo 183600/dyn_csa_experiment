@@ -2287,6 +2287,11 @@ def t_atomic_torch_save():
         assert got['a'].numel() == 4, 'the atomic replace did not publish the new checkpoint'
         # Distinct cell keys must not share a curve sidecar filename.
         assert L._curve_sidecar_rel('a#1::seed0') != L._curve_sidecar_rel('a@1::seed0')
+        # A configured variant name cannot escape ckpt_dir through the
+        # checkpoint filename.
+        assert '/' not in L.ckpt_file_name('../escape', 0, 'final')
+        assert os.path.basename(L.ckpt_file_name('/tmp/escape', 1, 'final')) == '_tmp_escape_seed1_final.pt'
+        assert os.path.basename(L.ckpt_file_name('csa_dynamic', 2, 'final')) == 'csa_dynamic_seed2_final.pt'
     finally:
         shutil.rmtree(d, ignore_errors=True)
 

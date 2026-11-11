@@ -1068,7 +1068,7 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
     if _save_mode and ckpt_dir:
         try:
             os.makedirs(ckpt_dir, exist_ok=True)
-            _ck = os.path.join(ckpt_dir, f'{variant}_seed{seed}_final.pt')
+            _ck = os.path.join(ckpt_dir, L.ckpt_file_name(variant, seed, 'final'))
             _atomic_torch_save({'cfg': cfgs, 'mlp_ratio': mlp_ratio, 'vocab': vocab, 'd': d,
                                 'n_layers': n_layers, 'n_heads': n_heads, 'd_head': d_head,
                                 'train_len': seq_len, 'max_seq': seq_len, 'code': CKPT_CODE,
