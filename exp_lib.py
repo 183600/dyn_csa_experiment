@@ -6276,6 +6276,14 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
         _sig_paths = {'test': te_path, 'bnd': tb_path, 'meta': me_path}
         if os.path.exists(td_path):
             _sig_paths['test_doc_ids'] = td_path
+        # The tokenizer bytes are part of the verified identity on every hit.
+        # Leaving them out of the memo key served a stale pair after the test
+        # or train tokenizer was replaced, bypassing the checks below.
+        if os.path.exists(tk_path):
+            _sig_paths['test_tok'] = tk_path
+        import glob as _glob_memo
+        for _tp in sorted(_glob_memo.glob(os.path.join(cache_dir, 'tok_v5_*.json'))):
+            _sig_paths[f'train_tok:{os.path.basename(_tp)}'] = _tp
         _sig = _memo_file_sig(_sig_paths)
         _mkey = (os.path.abspath(cache_dir), tag, _sig)
         _hit = _WT103_TEST_MEMO.get(_mkey)
