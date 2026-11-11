@@ -4101,6 +4101,15 @@ def t_holm_family_resolution_ceiling():
     fam2 = L.attach_holm(comps2, family='4 confirmatory contrasts', exploratory=False)
     assert fam2['family_resolution_limited'] is False, fam2
     assert fam2['evidence_level'] == 'confirmatory', fam2
+    # A panel with mixed seed counts is bounded by its BEST-resolved member,
+    # not its least-resolved one: m=2, n_max=12 gives 2*2/2**12, so the large-n
+    # comparison can reject even though the n=3 row cannot.
+    mixed = {'short': {'n': 3, 'mean': -1.0, 'std': 0.2, 'p_exact_signflip': 0.25},
+             'long': {'n': 12, 'mean': -1.0, 'std': 0.2, 'p_exact_signflip': 0.001}}
+    fam3 = L.attach_holm(mixed, family='mixed n')
+    assert abs(fam3['family_min_attainable_p_holm'] - 0.0009765625) < 1e-12, fam3
+    assert fam3['family_resolution_limited'] is False, fam3
+    assert mixed['long']['p_holm'] is not None and mixed['long']['p_holm'] < 0.05, mixed
 
 
 def t_crossover_scaling_refusals():

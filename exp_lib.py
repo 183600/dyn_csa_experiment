@@ -8849,10 +8849,14 @@ def attach_holm(comparisons, *, alpha=0.05, family='reported comparisons', explo
         if _n > 0:
             _ns.append(_n)
     _m = int(len(comparisons or {}))
-    _fam_floor = holm_min_attainable_p(min(_ns), _m, alpha) if _ns else None
+    # The family's smallest attainable raw p is min_i 2/2**n_i, which is set
+    # by the LARGEST seed count in the family (more seeds -> finer p grid).
+    # Using the smallest n here overstated the floor and could call a family
+    # resolution-limited even when its best-resolved comparison can reject.
+    _fam_floor = holm_min_attainable_p(max(_ns), _m, alpha) if _ns else None
     _fam_limited = bool(_fam_floor is not None and math.isfinite(_fam_floor) and _fam_floor > alpha)
     if _fam_limited:
-        print(f'[stats] WARNING: family {family!r} has m={_m} declared comparisons and n_min={min(_ns)} seeds — '
+        print(f'[stats] WARNING: family {family!r} has m={_m} declared comparisons and n_max={max(_ns)} seeds — '
               f'the smallest attainable Holm p is {_fam_floor:.4g} > alpha={alpha}; NO comparison in this family can be significant. '
               'That is a resolution ceiling, not a null result; report it as such and add seeds before interpreting p_holm=1.0')
     return {
