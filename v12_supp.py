@@ -1178,6 +1178,10 @@ def _record_int(value):
         return None
     if not math.isfinite(f) or f != math.floor(f):
         return None
+    if abs(f) >= 2 ** 53:
+        # Above 2**53 a float no longer represents every integer; the recorded
+        # seed/count may silently denote a different value.
+        return None
     return int(f)
 
 

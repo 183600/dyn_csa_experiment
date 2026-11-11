@@ -289,7 +289,9 @@ def _int_or(v, default):
         return int(v)
     if isinstance(v, numbers.Real):
         f = float(v)
-        return int(f) if math.isfinite(f) and f.is_integer() else default
+        if not (math.isfinite(f) and f.is_integer()) or abs(f) >= 2 ** 53:
+            return default
+        return int(f)
     try:
         return int(v)
     except (TypeError, ValueError, OverflowError):
@@ -451,7 +453,8 @@ def per_seed_records(outdir):
                 continue
             if isinstance(_sv, numbers.Real):
                 _sf = float(_sv)
-                _sd = int(_sf) if math.isfinite(_sf) and _sf.is_integer() else None
+                _sd = (int(_sf) if math.isfinite(_sf) and _sf.is_integer()
+                       and abs(_sf) < 2 ** 53 else None)
             else:
                 try:
                     _sd = int(_sv)
@@ -1240,7 +1243,9 @@ def sec_p1l():
             return None
         if isinstance(x, numbers.Real):
             f = float(x)
-            return int(f) if math.isfinite(f) and f.is_integer() else None
+            if not (math.isfinite(f) and f.is_integer()) or abs(f) >= 2 ** 53:
+                return None
+            return int(f)
         try:
             return int(x)
         except (TypeError, ValueError, OverflowError):

@@ -16,14 +16,9 @@ LONG_GAP_VARIANTS = ['hybrid_fixed', 'hybrid_dynamic', 'hybrid_csa_dyn']
 _LONG_STEPS = L.RUN_LONG['steps']
 
 def _num_or_none(v):
-    if v is None or isinstance(v, bool):
-        return None
-    if isinstance(v, float):
-        return int(v) if math.isfinite(v) and v.is_integer() else None
-    try:
-        return int(v)
-    except (TypeError, ValueError, OverflowError):
-        return None
+    # One exact-integer contract for seeds/counts: reject booleans, fractional
+    # NumPy floats, and lossy floats at/above 2**53 instead of truncating them.
+    return L._as_seed_int(v)
 
 def git_push(msg):
     if os.environ.get('V6_NO_PUSH'):
