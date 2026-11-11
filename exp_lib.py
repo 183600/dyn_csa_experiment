@@ -9189,10 +9189,11 @@ def exact_signflip_p(deltas):
     与残余风险（训练随机性进入种间方差、文档抽样进入 doc 层方差）。"""
     d_in = []
     for _x in (deltas if deltas is not None else []):
-        try:
-            d_in.append(float(_x))
-        except (TypeError, ValueError, OverflowError):
-            d_in.append(float('nan'))
+        # Use the shared scalar contract: booleans are flags, not paired
+        # effects.  float(True) == 1.0 would otherwise turn six flags into six
+        # identical "significant" deltas.
+        _f = _finite_scalar(_x)
+        d_in.append(_f if _f is not None else float('nan'))
     d = np.asarray([x for x in d_in if math.isfinite(x)], dtype=float)
     n = int(d.size)
     n_dropped = len(d_in) - n

@@ -4088,6 +4088,10 @@ def t_boolean_pvalues_are_not_probabilities():
                               min_n=1)['allowed'] is False
     assert L.reportable_claim({'n': 12, 'mean': True, 'std': 0.1,
                                'p_exact_signflip': 0.01, 'p_holm': 0.02})['allowed'] is False
+    # Boolean per-seed deltas are flags, not effects; they must be dropped
+    # rather than coerced to six identical 1.0 deltas.
+    es = L.exact_signflip_p([True] * 6)
+    assert es['n'] == 0 and es['n_dropped'] == 6 and math.isnan(es['p']), es
     # family_size is a comparison count: a boolean flag / non-integral value
     # must not be coerced into a smaller family that relaxes Holm.
     base = {'n': 12, 'mean': -1.0, 'std': 0.1,
