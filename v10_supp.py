@@ -1231,6 +1231,26 @@ def _equal_token_slices():
         for _h in (ha, hb):
             for s in _stale:
                 _h.pop(s, None)
+        _synth = sorted(s for s in (set(ha) | set(hb))
+                        if getattr(ha, 'per_seed_synth', {}).get(s)
+                        or getattr(hb, 'per_seed_synth', {}).get(s))
+        if _synth:
+            # Reconstructed curves are copies of an old aggregate, not
+            # independent runs; they may not enter an endpoint, convergence
+            # read or matched-token slice.
+            print(f'[stats] {name}: seed(s) {_synth} carry a SYNTHESIZED reconstruction — excluded from the matched-token analysis')
+            for _h in (ha, hb):
+                for s in _synth:
+                    _h.pop(s, None)
+        _cfg_a = getattr(ha, 'per_seed_cfg', {})
+        _cfg_b = getattr(hb, 'per_seed_cfg', {})
+        _cfg_bad = sorted(s for s in (set(ha) & set(hb))
+                          if _cfg_a.get(s) != _cfg_b.get(s))
+        if _cfg_bad:
+            print(f'[stats] {name}: seed(s) {_cfg_bad} pair a `csa_fixed` curve against a `full` curve measured under a DIFFERENT run_cfg — excluded from the matched-token analysis')
+            for _h in (ha, hb):
+                for s in _cfg_bad:
+                    _h.pop(s, None)
         _panel_hists[name] = {'csa_fixed': ha, 'full': hb}
         hists = _panel_hists[name]
         tps = _tokens_per_step(spec['outdir'], fallback=spec['batch'] * spec['seq'], raw=_raw)
@@ -1294,8 +1314,9 @@ def v10_analysis(out='analysis_v10/stats.json'):
             if not isinstance(r, dict):
                 _bad_cells.append((_k, 'not a dict'))
                 continue
-            if r.get('variant') is None or r.get('seed') is None:
-                _bad_cells.append((_k, 'no variant/seed'))
+            _seed = L._as_seed_int(r.get('seed'))
+            if r.get('variant') is None or _seed is None:
+                _bad_cells.append((_k, 'no variant/integer seed'))
                 continue
             if not L.ppl_is_usable(r.get('ppl_mean')):
                 _bad_cells.append((_k, 'ppl_mean is not a usable measurement'))
@@ -1303,7 +1324,7 @@ def v10_analysis(out='analysis_v10/stats.json'):
             if r.get('arm') is None or r.get('eval_len') is None or r.get('rho') is None:
                 _bad_cells.append((_k, 'no arm/eval_len/rho'))
                 continue
-            _usable[_k] = r
+            _usable[_k] = dict(r, seed=_seed)
         if _bad_cells:
             print(f'[v10 stats] {len(_bad_cells)} record(s) in {sp} carry no variant/seed/ppl_mean and are skipped (they are error or truncation stubs, not measurements): ' + ', '.join((f'{k}({why})' for k, why in _bad_cells[:4])))
         _n_bad_pre = len(_bad_cells)

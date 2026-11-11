@@ -97,8 +97,9 @@ def v11_analysis(out='analysis_v11/stats.json'):
             if not isinstance(r, dict):
                 _bad_cells.append((_k, 'not a dict'))
                 continue
-            if r.get('variant') is None or r.get('seed') is None:
-                _bad_cells.append((_k, 'no variant/seed'))
+            _seed = L._as_seed_int(r.get('seed'))
+            if r.get('variant') is None or _seed is None:
+                _bad_cells.append((_k, 'no variant/integer seed'))
                 continue
             if not L.ppl_is_usable(r.get('ppl_mean')):
                 _bad_cells.append((_k, 'ppl_mean is not a usable measurement'))
@@ -111,10 +112,10 @@ def v11_analysis(out='analysis_v11/stats.json'):
                 continue
             pk = (r['variant'], r.get('arm'), r.get('eval_len'), r.get('rho'), str(r.get('mode', 'uniform')), json.dumps(V10._fp_norm(r.get('probe_params')), sort_keys=True), str(r.get('_code')), str(r.get('recipe')))
             grp = cells.setdefault(pk, {})
-            if r['seed'] in grp:
-                _dup_cells.append((_k, pk[:4], r['seed']))
+            if _seed in grp:
+                _dup_cells.append((_k, pk[:4], _seed))
                 continue
-            grp[r['seed']] = r
+            grp[_seed] = dict(r, seed=_seed)
         if _bad_cells:
             print(f'[v11 stats] {len(_bad_cells)} record(s) in {sp} carry no variant/seed/ppl_mean and are skipped (they are error or truncation stubs, not measurements): ' + ', '.join((f'{k}({why})' for k, why in _bad_cells[:4])))
         if _dup_cells:
