@@ -401,6 +401,12 @@ def _relaxed_pair_reason(a, b, tuned_arms):
 
 def _run_final(base, outdir, protocol, selected):
     final_seeds = [int(s) for s in protocol.get('final_seeds', [])]
+    if not final_seeds:
+        # An empty partition would be silently normalised to seed 0 by the
+        # runner, reusing a search draw as an "independent" final evaluation.
+        raise ValueError(
+            'protocol declares no final_seeds — refusing to fall back to seed 0; '
+            'declare a disjoint final seed partition before running final records')
     search_seeds, _, overlap = _search_final_seeds(protocol)
     if final_seeds and overlap:
         raise ValueError(
