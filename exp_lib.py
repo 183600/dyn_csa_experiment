@@ -12330,6 +12330,31 @@ def _setting_control(vals_by_arm, *, check_within_arm=True):
     return {'equal': equal, 'within_arm_mixed': mixed, 'missing_arms': missing,
             'values': {a: sorted(v) for a, v in nonempty.items()}}
 
+def _setting_missing_records(recs, arms, getter):
+    """Per-arm count of records whose descriptor is absent/unreadable."""
+    out = {a: 0 for a in arms}
+    for (v, _t, _s), r in recs.items():
+        if v in out and getter(r) is None:
+            out[v] += 1
+    return out
+
+
+def _apply_within_arm_missing(ctl, missing, totals):
+    """A partially recorded descriptor is unverifiable, not controlled.
+
+    Dropping a record with no `run_cfg` from the value set would let the
+    remaining (identical) records call the arm controlled even though one
+    seed's protocol cannot be checked at all.
+    """
+    bad = sorted(a for a in totals
+                 if 0 < missing.get(a, 0) < totals.get(a, 0))
+    if bad:
+        ctl['within_arm_missing'] = bad
+        if ctl['equal'] is True:
+            ctl['equal'] = None
+    return ctl
+
+
 def controlled_variables_report(recs, arms):
     """Per-component controlled-variable audit across ALL seed records.
 
@@ -12341,14 +12366,30 @@ def controlled_variables_report(recs, arms):
     `run_cfg_equal` / `train_knobs_equal` keys and adds the detail.
     """
     arms = sorted(set(arms))
-    run_cfg = _setting_control(_setting_values(
-        recs, arms, lambda r: _canon_setting(r.get('run_cfg'))))
-    train_knobs = _setting_control(_setting_values(
-        recs, arms, lambda r: _canon_setting(r.get('train_knobs'))))
+    _totals = {a: sum(1 for (v, _t, _s) in recs if v == a) for a in arms}
+
+    def _cfg_get(r):
+        return _canon_setting(r.get('run_cfg'))
+
+    def _knobs_get(r):
+        return _canon_setting(r.get('train_knobs'))
+
+    def _hp_get(r, k):
+        hp = r.get('hyperparams')
+        return _canon_setting(hp.get(k)) if isinstance(hp, dict) else None
+
+    run_cfg = _apply_within_arm_missing(
+        _setting_control(_setting_values(recs, arms, _cfg_get)),
+        _setting_missing_records(recs, arms, _cfg_get), _totals)
+    train_knobs = _apply_within_arm_missing(
+        _setting_control(_setting_values(recs, arms, _knobs_get)),
+        _setting_missing_records(recs, arms, _knobs_get), _totals)
     hyper = {}
     for key in _CONTROL_HYPER_KEYS:
-        hyper[key] = _setting_control(_setting_values(
-            recs, arms, lambda r, k=key: _canon_setting((r.get('hyperparams') or {}).get(k))))
+        _get = lambda r, k=key: _hp_get(r, k)
+        hyper[key] = _apply_within_arm_missing(
+            _setting_control(_setting_values(recs, arms, _get)),
+            _setting_missing_records(recs, arms, _get), _totals)
     hp_checked = [k for k, v in hyper.items()
                   if any(v['values'].get(a) for a in arms)]
     hp_diffs = [k for k in hp_checked if hyper[k]['equal'] is False]
@@ -12363,6 +12404,10 @@ def controlled_variables_report(recs, arms):
         hp_equal = True
     mixed = sorted(set(run_cfg['within_arm_mixed']) | set(train_knobs['within_arm_mixed'])
                    | {a for k in hp_checked for a in hyper[k]['within_arm_mixed']})
+    missing_records = sorted(
+        set(run_cfg.get('within_arm_missing', []))
+        | set(train_knobs.get('within_arm_missing', []))
+        | {a for k in hp_checked for a in hyper[k].get('within_arm_missing', [])})
     diff_values = {}
     for key, ctl in (('run_cfg', run_cfg), ('train_knobs', train_knobs)):
         if ctl['equal'] is False:
@@ -12404,6 +12449,7 @@ def controlled_variables_report(recs, arms):
         'hyperparams_equal': hp_equal,
         'controlled': controlled,
         'within_arm_mixed': mixed,
+        'within_arm_missing': missing_records,
         'differences': diff_values,
         'checked_hyperparam_keys': sorted(hp_checked),
         'hyperparam_differences': hp_diffs,
