@@ -1336,6 +1336,15 @@ def sec_p2s():
                 common, dl, st = pr
                 rows.append((a, b, common, st))
     if rows:
+        # Holm-correct the P2S family that is actually displayed, then attach
+        # the adjusted p to each row so both the prose gate and the global
+        # multiplicity registry see a corrected value.
+        _p2s_pairs = [(f'P2S {a} - {b}', st.get('p_exact_signflip'))
+                      for a, b, _c, st in rows]
+        _p2s_holm = holm_adjust(_p2s_pairs)
+        for a, b, _c, st in rows:
+            _h = _p2s_holm.get(f'P2S {a} - {b}') or {}
+            st['p_holm'] = _h.get('p_holm')
         lines += ['', '**配对检验（同 seed 配对，符号翻转）**：', '', '| 比较 | n (配对 seeds) | Δ (a−b) mean±std | p | params |', '|---|---|---|---|---|']
         for a, b, common, st in rows:
             # Every p-value printed in this table belongs to the report's
