@@ -7812,6 +7812,7 @@ def atomic_write_text(path, text):
 def locked_json_read(path):
     """Consistent read of a shared JSON file under the same flock the writers
     use ({} when absent).  Pure read: never creates or rewrites the file."""
+    path = os.fspath(path)
     try:
         import fcntl
     except ImportError:
@@ -7823,7 +7824,14 @@ def locked_json_read(path):
             fcntl.flock(lock_f, fcntl.LOCK_SH)
         except OSError:
             # A missing/unwritable parent directory means the file is absent
-            # (or unreadable); a read must return {} rather than crash.
+            # (or unreadable); a read must return {} rather than crash.  If
+            # open() succeeded but flock() failed, close the descriptor here:
+            # the cleanup below only runs for a successfully held lock.
+            if lock_f is not None:
+                try:
+                    lock_f.close()
+                except OSError:
+                    pass
             lock_f = None
     try:
         if not os.path.exists(path):
@@ -7852,6 +7860,7 @@ def locked_json_update(path, mutfn, indent=2):
     write itself stays atomic (atomic_write_json), so a crash mid-update
     leaves the previous content intact.
     """
+    path = os.fspath(path)
     try:
         import fcntl
     except ImportError:
@@ -7861,8 +7870,18 @@ def locked_json_update(path, mutfn, indent=2):
     # that does not exist yet.
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     if fcntl is not None:
-        lock_f = open(path + '.lock', 'a')
-        fcntl.flock(lock_f, fcntl.LOCK_EX)
+        try:
+            lock_f = open(path + '.lock', 'a')
+            fcntl.flock(lock_f, fcntl.LOCK_EX)
+        except BaseException:
+            # Do not leak the descriptor when open() succeeds but the lock
+            # cannot be acquired; the finally below is not reached yet.
+            if lock_f is not None:
+                try:
+                    lock_f.close()
+                except OSError:
+                    pass
+            raise
     try:
         obj = {}
         if os.path.exists(path):

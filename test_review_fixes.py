@@ -4394,6 +4394,12 @@ def t_locked_json_and_csv_generator():
         assert L.locked_json_read(p) == {}
         got = L.locked_json_update(p, lambda obj: (obj.update(k=1) or obj))
         assert got == {'k': 1} and L.locked_json_read(p) == {'k': 1}, got
+        # Both helpers accept path-like objects, not only str.
+        import pathlib
+        pp = pathlib.Path(p)
+        assert L.locked_json_read(pp) == {'k': 1}
+        got2 = L.locked_json_update(pp, lambda obj: (obj.update(k=2) or obj))
+        assert got2 == {'k': 2} and L.locked_json_read(pp) == {'k': 2}
         c = os.path.join(root, 'rows.csv')
         L.atomic_write_csv(c, None, ({'a': i, 'b': i * 2} for i in range(3)))
         with open(c, encoding='utf-8') as f:
