@@ -408,6 +408,12 @@ def _load_manifest(path):
         _sig = _recipe_signature({'binding': _bind})
         if (_bind.get('training_recipe_signature') is not None or _bind.get('training_recipe') is not None) and _sig is None:
             raise SystemExit(f'[v12] REFUSE: binding.training_recipe_signature must be an object of machine-checkable fields ({_bind.get("training_recipe_signature")!r})')
+        if _sig is not None:
+            for _sk, _sv in _sig.items():
+                if isinstance(_sv, (bool, np.bool_)):
+                    raise SystemExit(f'[v12] REFUSE: training_recipe_signature.{_sk}={_sv!r} is a boolean, not a numeric recipe knob')
+                if isinstance(_sv, numbers.Real) and not math.isfinite(float(_sv)):
+                    raise SystemExit(f'[v12] REFUSE: training_recipe_signature.{_sk}={_sv!r} is not finite')
         _per = _bind.get('per_arm_recipe_signature')
         if _per is not None:
             if not isinstance(_per, dict) or set(_per) != set(m['arms']):
@@ -415,6 +421,11 @@ def _load_manifest(path):
             for _arm, _asig in _per.items():
                 if not isinstance(_asig, dict) or not _asig:
                     raise SystemExit(f'[v12] REFUSE: binding.per_arm_recipe_signature[{_arm!r}] must be a non-empty object')
+                for _sk, _sv in _asig.items():
+                    if isinstance(_sv, (bool, np.bool_)):
+                        raise SystemExit(f'[v12] REFUSE: per-arm signature {_arm!r}.{_sk}={_sv!r} is a boolean, not a numeric recipe knob')
+                    if isinstance(_sv, numbers.Real) and not math.isfinite(float(_sv)):
+                        raise SystemExit(f'[v12] REFUSE: per-arm signature {_arm!r}.{_sk}={_sv!r} is not finite')
                 if 'mr' in _asig:
                     try:
                         _mr = float(_asig['mr'])
@@ -625,6 +636,8 @@ def _recipe_matches_signature(recipe, sig):
         if got is None:
             if _is_p1l and k in ('ee', 'es'):
                 continue
+            return False
+        if isinstance(got, (bool, np.bool_)) or isinstance(want, (bool, np.bool_)):
             return False
         try:
             # Recipes format floats with limited precision (e.g. mr{:.8g});

@@ -887,6 +887,23 @@ def t_recipe_signature():
         v2 = json.load(f)
     shipped = v2['binding']['training_recipe_signature']
     assert V12._recipe_matches_signature(recipe, shipped) is True, 'the shipped v2 signature must accept the canonical P3MT recipe string'
+    # A boolean/non-finite signature value must be refused at load time: the
+    # synthetic plan recipe could otherwise "match" by string equality while
+    # every real checkpoint (numeric steps) is rejected after test access.
+    with tempfile.NamedTemporaryFile('w', suffix='.json', delete=False) as f:
+        _bad = json.loads(json.dumps(v2))
+        _bad['binding']['training_recipe_signature']['steps'] = True
+        json.dump(_bad, f)
+        _bad_path = f.name
+    try:
+        try:
+            V12._load_manifest(_bad_path)
+        except SystemExit as e:
+            assert 'boolean' in str(e), e
+        else:
+            raise AssertionError('a boolean recipe-signature value must be refused')
+    finally:
+        os.unlink(_bad_path)
 
 
 def t_finaltest_requires_parameter_matching():
