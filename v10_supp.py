@@ -1309,10 +1309,16 @@ def v10_analysis(out='analysis_v10/stats.json'):
         except Exception as _e:
             print(f'[stats] FATAL: {sp} exists but cannot be parsed ({type(_e).__name__}: {_e}) — refusing to compute probe statistics from a truncated file; move it aside to re-probe.')
             raise
+        if not isinstance(raw, dict):
+            print(f'[v10 stats] WARNING: {sp} is valid JSON but not an object ({type(raw).__name__}) — the probe panel is EXCLUDED')
+            raw = {}
         _usable, _bad_cells = ({}, [])
         for _k, r in raw.items():
             if not isinstance(r, dict):
                 _bad_cells.append((_k, 'not a dict'))
+                continue
+            if r.get('synthesized'):
+                _bad_cells.append((_k, 'synthesized reconstruction'))
                 continue
             _seed = L._as_seed_int(r.get('seed'))
             if r.get('variant') is None or _seed is None:
@@ -1515,9 +1521,14 @@ def v10_analysis(out='analysis_v10/stats.json'):
             except Exception as _e:
                 print(f'[stats] WARNING: {_nsp} exists but cannot be parsed ({type(_e).__name__}: {_e}) — the NIAH-natural panel is skipped')
                 nraw = {}
+            if not isinstance(nraw, dict):
+                print(f'[v10 stats] WARNING: {_nsp} is valid JSON but not an object ({type(nraw).__name__}) — the NIAH-natural panel is EXCLUDED')
+                nraw = {}
             ncells = {}
             for _k, r in nraw.items():
                 if not isinstance(r, dict) or r.get('task') != 'niah_natural':
+                    continue
+                if r.get('synthesized'):
                     continue
                 if r.get('variant') is None or r.get('seed') is None or r.get('arm') is None or r.get('condition') is None:
                     continue

@@ -92,10 +92,16 @@ def v11_analysis(out='analysis_v11/stats.json'):
         except Exception as _e:
             print(f'[stats] FATAL: {sp} exists but cannot be parsed ({type(_e).__name__}: {_e}) — refusing to compute probe statistics from a truncated file; move it aside to re-probe.')
             raise
+        if not isinstance(raw, dict):
+            print(f'[v11 stats] WARNING: {sp} is valid JSON but not an object ({type(raw).__name__}) — the probe panel is EXCLUDED')
+            raw = {}
         cells, _dup_cells, _bad_cells = ({}, [], [])
         for _k, r in raw.items():
             if not isinstance(r, dict):
                 _bad_cells.append((_k, 'not a dict'))
+                continue
+            if r.get('synthesized'):
+                _bad_cells.append((_k, 'synthesized reconstruction'))
                 continue
             _seed = L._as_seed_int(r.get('seed'))
             if r.get('variant') is None or _seed is None:
