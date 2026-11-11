@@ -108,16 +108,24 @@ def _collect(dirs, include_ckpt=False):
         for root, _dirs, names in os.walk(base):
             for n in names:
                 p = os.path.join(root, n)
+                if os.path.islink(p) or not os.path.isfile(p):
+                    # tarfile would store a symlink/device member, but the
+                    # verifier only attests regular-file content.  Packing it
+                    # would make `make` produce an archive its own `verify`
+                    # rejects.  Leave it out instead of following it outside
+                    # the repository.
+                    print(f'[archive] WARNING: skipping non-regular file {os.path.relpath(p, REPO)} — only regular files are content-attested')
+                    continue
                 if not include_ckpt and (n.endswith('.pt') or n.endswith('.ckpt') or n.endswith('.pth') or n.endswith('.safetensors')):
                     continue
                 files.append(p)
     for f in ENV_FILES:
         p = os.path.join(REPO, f)
-        if os.path.exists(p):
+        if os.path.exists(p) and not os.path.islink(p) and os.path.isfile(p):
             files.append(p)
     for f in ('results_lm_test/.freeze_lock.json',):
         p = os.path.join(REPO, f)
-        if os.path.exists(p):
+        if os.path.exists(p) and not os.path.islink(p) and os.path.isfile(p):
             files.append(p)
     # Training logs (gitignored, so they only exist on the experiment machine).
     # Pack every per-seed log in the evidence release; pack every
@@ -154,6 +162,8 @@ def _ckpt_hash_table(dirs):
             for n in names:
                 if n.endswith('.pt'):
                     p = os.path.join(root, n)
+                    if os.path.islink(p) or not os.path.isfile(p):
+                        continue
                     rows[os.path.relpath(p, REPO)] = _sha256(p)
     return rows
 
@@ -192,7 +202,8 @@ def cmd_make(tag, dirs, include_ckpt=False, outdir='archive'):
             for n in names:
                 if not include_ckpt and (n.endswith('.pt') or n.endswith('.ckpt') or n.endswith('.pth') or n.endswith('.safetensors')):
                     continue
-                if os.path.isfile(os.path.join(root, n)):
+                _p = os.path.join(root, n)
+                if os.path.isfile(_p) and not os.path.islink(_p):
                     _n_artifacts += 1
     if not _n_artifacts:
         print('[archive] REFUSE: nothing to archive — the named result dirs do not exist here (or contain no files); run this on the machine holding the artifacts')

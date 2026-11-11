@@ -4714,6 +4714,25 @@ def t_archive_verify_requires_external_checksum():
                            outdir=d) == 1
         assert not any(n.startswith('release_probe_no_artifacts')
                        for n in os.listdir(d))
+        # A symlink inside a result directory must not be packed: tar stores
+        # it as a symlink member, while the verifier only attests regular-file
+        # content, so packing it would make `make` produce an archive its own
+        # `verify` rejects.
+        _td = tempfile.mkdtemp()
+        _old_repo = AR.REPO
+        try:
+            AR.REPO = _td
+            os.makedirs(os.path.join(_td, 'results_x'))
+            with open(os.path.join(_td, 'results_x', 'payload.txt'), 'w') as f:
+                f.write('hello')
+            os.symlink('/etc/passwd', os.path.join(_td, 'results_x', 'link'))
+            _files = AR._collect(['results_x'])
+            _rels = {os.path.relpath(f, _td) for f in _files}
+            assert 'results_x/payload.txt' in _rels, _rels
+            assert 'results_x/link' not in _rels, _rels
+        finally:
+            AR.REPO = _old_repo
+            shutil.rmtree(_td, ignore_errors=True)
 
 
 def t_selection_attribution_contract():
