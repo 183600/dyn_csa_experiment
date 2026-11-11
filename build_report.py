@@ -102,10 +102,14 @@ def _hist_points(r):
     for _pt in (r.get('ppl_history') or []) if isinstance(r, dict) else []:
         try:
             _st, _pv = _pt
-            _st = int(_st)
         except (TypeError, ValueError, OverflowError):
             continue
-        yield (_st, _pv)
+        # int(1.5) == int(True) == 1 would merge distinct/failed evaluation
+        # points into step 1 and distort the warmup/long-run curve.
+        _step = _int_or(_st, None)
+        if _step is None or _step < 0:
+            continue
+        yield (_step, _pv)
 
 def sample_std(vals):
     n = len(vals)

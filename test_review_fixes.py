@@ -4749,6 +4749,12 @@ def t_v12_probe_contrasts_require_matching_params():
         shutil.rmtree(root, ignore_errors=True)
 
 
+def t_report_history_steps_are_exact():
+    rec = {'ppl_history': [[1.5, 10.0], [1.0, 20.0], [True, 30.0],
+                           ['2', 40.0], [-1, 50.0]]}
+    assert list(BR._hist_points(rec)) == [(1, 20.0), (2, 40.0)], list(BR._hist_points(rec))
+
+
 def t_v11_by_length_deduplicates_seeds():
     rows = [{'variant': 'v', 'seed': 0, 'by_len': {512: {'ppl': 10.0}}},
             {'variant': 'v', 'seed': 0, 'by_len': {512: {'ppl': 20.0}}},
@@ -5775,6 +5781,7 @@ def main():
     _check('L3e v8/v9 pairing keeps one run_cfg group', t_driver_pairing_single_config)
     _check('L3f v7 bootstrap pairing keeps one run_cfg group', t_v7_bootstrap_single_config)
     _check('L3g v11 by-length table deduplicates seed records', t_v11_by_length_deduplicates_seeds)
+    _check('L3i report history steps are exact integers', t_report_history_steps_are_exact)
     _check('L3h v12 probe contrasts require matching probe_params', t_v12_probe_contrasts_require_matching_params)
     _check('L4 matched-init fingerprint + pair gate', t_init_core_fingerprint_and_pair_gate)
     _check('L5 param breakdown + measured compute control', t_param_and_compute_control_detail)
