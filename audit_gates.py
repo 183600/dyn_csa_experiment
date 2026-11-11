@@ -1936,6 +1936,13 @@ def audit_selection(path='analysis_mechanism/selection_attribution.json'):
         if nq <= 0:
             out['problems'].append(f'cell {i}: n_queries must be positive')
         _seeds = c.get('per_seed')
+        if not _seeds:
+            # An empty per_seed is not evidence: requiring the key but
+            # accepting {} would mark a cell with no seed-level measurements
+            # as structurally valid ("ok").
+            out['problems'].append(
+                f'cell {i} ({c.get("arm")}): per_seed is empty — no seed-level evidence')
+            continue
         _n_seeds = len(_seeds)
         _st = None
         # Only complete seed rows enter the paired test.  A malformed row must
