@@ -4727,6 +4727,11 @@ def t_archive_verify_requires_external_checksum():
                            outdir=d) == 1
         assert not any(n.startswith('release_probe_no_artifacts')
                        for n in os.listdir(d))
+        # A release tag is a filename component, not a path: separators or
+        # dot segments must be refused before any output path is built.
+        for _bad_tag in ('../escape', 'a/b', 'a\\b', '..', ''):
+            assert AR._safe_tag(_bad_tag) is None, _bad_tag
+        assert AR._safe_tag('v13') == 'v13'
         # A symlink inside a result directory must not be packed: tar stores
         # it as a symlink member, while the verifier only attests regular-file
         # content, so packing it would make `make` produce an archive its own

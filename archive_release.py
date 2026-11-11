@@ -183,7 +183,19 @@ def cmd_plan(tag, dirs, include_ckpt=False):
     return files
 
 
+def _safe_tag(tag):
+    """A release tag used in filenames must be a single path component."""
+    if not isinstance(tag, str) or not tag or tag in ('.', '..'):
+        return None
+    if any(_c in tag for _c in ('/', '\\', '\x00', os.sep, os.altsep or os.sep)):
+        return None
+    return tag
+
+
 def cmd_make(tag, dirs, include_ckpt=False, outdir='archive'):
+    if _safe_tag(tag) is None:
+        print(f'[archive] REFUSE: release tag {tag!r} is not a single safe filename component (path separators / empty / dot segments are not allowed)')
+        return 1
     _required = ['DECISION_LOG.md', 'RELEASES.md', 'confirmation_frozen.json']
     _missing = [f for f in _required if not os.path.exists(os.path.join(REPO, f))]
     if _missing:
