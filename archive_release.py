@@ -179,6 +179,24 @@ def cmd_make(tag, dirs, include_ckpt=False, outdir='archive'):
     if _missing:
         print(f'[archive] REFUSE: formal release is missing required provenance file(s): {_missing}')
         return 1
+    # Provenance files alone are not an evidence release.  _collect always
+    # adds them, so the later `not files` guard could never fire when every
+    # requested result directory is missing.  Require at least one actual
+    # artifact under the requested dirs.
+    _n_artifacts = 0
+    for d in dirs:
+        base = os.path.join(REPO, d)
+        if not os.path.isdir(base):
+            continue
+        for root, _walk_dirs, names in os.walk(base):
+            for n in names:
+                if not include_ckpt and (n.endswith('.pt') or n.endswith('.ckpt') or n.endswith('.pth') or n.endswith('.safetensors')):
+                    continue
+                if os.path.isfile(os.path.join(root, n)):
+                    _n_artifacts += 1
+    if not _n_artifacts:
+        print('[archive] REFUSE: nothing to archive — the named result dirs do not exist here (or contain no files); run this on the machine holding the artifacts')
+        return 1
     files = _collect(dirs, include_ckpt)
     if not files:
         print('[archive] REFUSE: nothing to archive — the named result dirs do not exist here; run this on the machine holding the artifacts')
@@ -276,7 +294,14 @@ def cmd_verify(tar_path):
             return 1
         bad = []
         for member in tf.getmembers():
-            if member.name == man_name or not member.isfile():
+            if member.name == man_name:
+                continue
+            if not member.isfile():
+                # A symlink/hardlink/device is not a content member.  The
+                # manifest cannot attest its target, so silently skipping it
+                # would let the member's name satisfy the presence check while
+                # its bytes are never hashed.
+                bad.append(f'{member.name}: non-regular tar member ({member.type!r}) is not allowed')
                 continue
             f = tf.extractfile(member)
             if f is None:

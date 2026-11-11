@@ -4542,6 +4542,29 @@ def t_archive_verify_requires_external_checksum():
         with open(tar2 + '.sha256', 'w', encoding='utf-8') as f:
             f.write(AR._sha256(tar2) + '  release_y.tar.gz\n')
         assert AR.cmd_verify(tar2) == 1
+        # A symlink/hardlink member is not attested by the manifest and must
+        # not be silently skipped while its name satisfies the presence check.
+        tar3 = os.path.join(d, 'release_z.tar.gz')
+        link_man = {'files': {'payload.txt': {'sha256': '0' * 64, 'bytes': 1}}}
+        with tarfile.open(tar3, 'w:gz') as tf:
+            ti = tarfile.TarInfo('payload.txt')
+            ti.type = tarfile.SYMTYPE
+            ti.linkname = '/etc/passwd'
+            tf.addfile(ti)
+            mb = json.dumps(link_man).encode('utf-8')
+            mti = tarfile.TarInfo('release_z.MANIFEST.sha256')
+            mti.size = len(mb)
+            tf.addfile(mti, io.BytesIO(mb))
+        with open(tar3 + '.sha256', 'w', encoding='utf-8') as f:
+            f.write(AR._sha256(tar3) + '  release_z.tar.gz\n')
+        assert AR.cmd_verify(tar3) == 1
+        # Provenance files alone do not make a release: with no requested
+        # result directory present, make must refuse instead of archiving
+        # only the environment/provenance snapshot.
+        assert AR.cmd_make('probe_no_artifacts', ['definitely_not_a_dir'],
+                           outdir=d) == 1
+        assert not any(n.startswith('release_probe_no_artifacts')
+                       for n in os.listdir(d))
 
 
 def t_selection_attribution_contract():
