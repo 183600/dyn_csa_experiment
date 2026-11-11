@@ -8323,8 +8323,10 @@ def batch_contract_check(train_ids, seq_len, batch_size, device, seed=0, vocab=N
         'labels_are_next_token_shift': True,
         'ids_within_vocab': True,
         'same_seed_repeats_stream': True,
+        'final_target_matches_source': True,
         'nonempty': True,
     }
+    _src = np.asarray(train_ids).reshape(-1)
     try:
         it_a = batch_iter(train_ids, seq_len, batch_size, device, seed=int(seed))
         it_b = batch_iter(train_ids, seq_len, batch_size, device, seed=int(seed))
@@ -8346,6 +8348,27 @@ def batch_contract_check(train_ids, seq_len, batch_size, device, seed=0, vocab=N
                 checks['labels_are_next_token_shift']
                 and ya.shape[1] == xa.shape[1]
                 and torch.equal(ya[:, :-1], xa[:, 1:]))
+            # The shift identity only covers ya[:, :-1]; it says nothing about
+            # the final target.  Verify that every last target is the token
+            # following the matching input window in the source stream.
+            if _src.size > seq_len and xa.numel() and ya.numel():
+                _xn = xa.detach().cpu().numpy()
+                _yn = ya.detach().cpu().numpy()
+                for _bi in range(_xn.shape[0]):
+                    _row = _xn[_bi]
+                    _last = int(_yn[_bi, -1])
+                    _starts = np.flatnonzero(_src[:max(0, _src.size - seq_len)] == _row[0])
+                    _ok_row = False
+                    for _p in _starts:
+                        _p = int(_p)
+                        if _p + seq_len < _src.size and np.array_equal(
+                                _src[_p:_p + seq_len], _row):
+                            if int(_src[_p + seq_len]) == _last:
+                                _ok_row = True
+                                break
+                    if not _ok_row:
+                        checks['final_target_matches_source'] = False
+                        break
             checks['same_seed_repeats_stream'] = bool(
                 checks['same_seed_repeats_stream']
                 and torch.equal(xa, xb) and torch.equal(ya, yb))
