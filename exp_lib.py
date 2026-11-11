@@ -11892,6 +11892,13 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
                             _s = float(np.std(_vals, ddof=1))
                             if abs(_s - _reported_sd) > 1e-9 * max(1.0, abs(_s)):
                                 problems.append(f'{arm}: trial ppl_std is not the sample std of its per-seed values')
+        if len(_set) > 1:
+            # Trials inside ONE arm must compare the same seed draws.  Equal
+            # arm-level sets cannot fix a within-arm mismatch: its selected
+            # config was still chosen on a different noise realisation.
+            problems.append(
+                f'{arm}: its trials used different search-seed sets '
+                f'{sorted(_set)} — the trial comparison is not equal-search')
         if _set:
             search_seed_sets[arm] = _set
         if declared and any(c not in declared for c in cfgs):
