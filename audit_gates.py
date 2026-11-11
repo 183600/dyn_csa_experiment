@@ -1822,8 +1822,30 @@ def audit_efficiency_pairs(outdirs=None, pairs=None, *, tolerance=0.05):
                 v = next(iter(vals))
                 return v if isinstance(v, (bool, np.bool_)) else None
 
+            def _batch_rows(rows):
+                vals = set()
+                for r in rows:
+                    b = r.get('batch')
+                    if b is None or isinstance(b, (bool, np.bool_)):
+                        return None
+                    try:
+                        f = float(b)
+                        if not math.isfinite(f) or f != math.floor(f):
+                            return None
+                        vals.add(int(f))
+                    except (TypeError, ValueError, OverflowError):
+                        return None
+                return frozenset(vals) if vals else None
+
             _ea, _eb = _env_rows(eff[a]), _env_rows(eff[b])
             _ka, _kb = _kv_rows(eff[a]), _kv_rows(eff[b])
+            _ba, _bb = _batch_rows(eff[a]), _batch_rows(eff[b])
+            # Latency depends on the batch shape as well as the token count.
+            # Legacy records without `batch` stay unverifiable (None) rather
+            # than being rejected as a mismatch; when both sides record it,
+            # every seed must agree and the two arms must use the same batch.
+            _same_batch = (None if (_ba is None or _bb is None)
+                           else bool(_ba == _bb and len(_ba) == 1))
             # Every record of both arms must share one measured environment.
             # Comparing only the first seed would let a panel that mixes CPU
             # and GPU (or torch versions / KV semantics) still claim "faster".
@@ -1836,12 +1858,18 @@ def audit_efficiency_pairs(outdirs=None, pairs=None, *, tolerance=0.05):
             _na = sorted({int(r['n_tokens']) for r in eff[a] if isinstance(r.get('n_tokens'), int)})
             _nb = sorted({int(r['n_tokens']) for r in eff[b] if isinstance(r.get('n_tokens'), int)})
             rec = {'a': a, 'b': b, 'same_device_torch': same_env, 'same_kv_semantics': same_kv,
+                   'same_batch': _same_batch,
+                   'a_batches': (sorted(_ba) if _ba is not None else None),
+                   'b_batches': (sorted(_bb) if _bb is not None else None),
                    'a_ms_p50': _ta, 'b_ms_p50': _tb, 'a_tokens': _na, 'b_tokens': _nb,
                    'ratio_b_over_a': None, 'speed_claim_allowed': False, 'faster_arm': None, 'reason': None}
             if not (isinstance(_ta, (int, float)) and isinstance(_tb, (int, float)) and _ta > 0 and _tb > 0):
                 rec['reason'] = 'missing or non-positive measured prefill time'
             elif _na != _nb or len(_na) != 1 or len(_nb) != 1:
                 rec['reason'] = f'different or ambiguous measured token counts ({_na} vs {_nb}); a latency ratio across shapes is not a speed comparison'
+            elif _same_batch is False:
+                rec['reason'] = (f'different or ambiguous batch sizes ({sorted(_ba) if _ba is not None else None} '
+                                 f'vs {sorted(_bb) if _bb is not None else None}); latency depends on the batch shape')
             elif not same_env:
                 rec['reason'] = 'different device or torch version recorded'
             elif not same_kv:
