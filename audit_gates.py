@@ -1164,6 +1164,13 @@ def audit_boundary(outdirs=None):
                 if p is not None and rp is not None:
                     agg.append({'key': key, 'precision': p, 'random_baseline': rp, 'excess': p - rp, 'ratio': (p / rp) if rp else None, 'verdict': 'exceeds random baseline' if p > rp else ('at baseline (block-length artifact)' if abs(p - rp) < 1e-9 else 'below baseline')})
             out['panels'][d] = agg
+            # The audit's claim is that alignment EXCEEDS the matched-length
+            # random baseline; a cell at/below it is a failed claim, not a
+            # silent diagnostic.
+            if any(v['verdict'] != 'exceeds random baseline' for v in agg):
+                out['status'] = 'fail'
+                out.setdefault('problems', []).append(
+                    f'{d}: boundary alignment does not exceed the random baseline')
     if not out['panels']:
         out['status'] = 'not_verifiable_locally'
         out['note'] = 'no boundary-alignment fields in the local results; fuse_analysis.py recomputes per-layer alignment (tol=1) from summary.json and exp_lib._random_cut_precision provides the matched-length random baseline — run them on the experiment machine'

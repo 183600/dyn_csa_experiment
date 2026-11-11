@@ -3790,6 +3790,23 @@ def t_audit_length_malformed_cells_do_not_crash():
         shutil.rmtree(td, ignore_errors=True)
 
 
+def t_audit_boundary_below_baseline_fails():
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, 'summary.json'), 'w', encoding='utf-8') as f:
+            json.dump({'a::s0': {'variant': 'a', 'mech': {
+                'precision': 0.10, 'random_precision': 0.20}}}, f)
+        out = A.audit_boundary(outdirs=[d])
+        assert out['status'] == 'fail', out
+        assert out['panels'][d][0]['verdict'] == 'below baseline', out
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, 'summary.json'), 'w', encoding='utf-8') as f:
+            json.dump({'a::s0': {'variant': 'a', 'mech': {
+                'precision': 0.30, 'random_precision': 0.20}}}, f)
+        out = A.audit_boundary(outdirs=[d])
+        assert out['status'] == 'ok', out
+
+
 def t_audit_fairness_nan_seed_does_not_crash():
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, 'summary.json')
@@ -4789,6 +4806,7 @@ def main():
     _check('I13c split audit verifies test doc-id sidecar self-consistency', t_audit_split_test_sidecar_self_consistency)
     _check('I14 corpus audit counts overlapping validation rows once', t_corpus_audit_overlap_is_unique_across_windows)
     _check('I15 length audit refuses a missing eval span', t_audit_length_requires_eval_span)
+    _check('I15b boundary audit fails below the random baseline', t_audit_boundary_below_baseline_fails)
     _check('I16 fairness audit ignores a NaN seed instead of crashing', t_audit_fairness_nan_seed_does_not_crash)
     _check('I17 an empty split cache is not reported as verified', t_audit_split_empty_cache_is_not_ok)
     _check('I18 tuning audit reports malformed seed keys instead of crashing', t_baseline_audit_malformed_seed_keys)
