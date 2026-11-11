@@ -3541,6 +3541,14 @@ def t_audit_split_sequence_overlap():
     # 2-D tables keep the exact aligned-row contract.
     table = np.array([[1, 2], [3, 4], [5, 6]])
     assert A._row_overlap_count(table, np.array([[3, 4], [9, 9]])) == 1
+    # The same logical row must match across integer storage widths; raw
+    # width-dependent bytes would let cross-dtype leakage pass the audit.
+    for dt_a, dt_b in ((np.int64, np.int32), (np.uint16, np.int32),
+                       (np.int64, np.uint16), (np.int8, np.uint64)):
+        assert A._row_overlap_count(np.array([[1, 2, 3]], dtype=dt_a),
+                                    np.array([[1, 2, 3]], dtype=dt_b)) == 1, (dt_a, dt_b)
+    assert A._row_overlap_count(np.array([[1, 2]], dtype=np.int64),
+                                np.array([[1, 3]], dtype=np.int32)) == 0
 
 
 def t_categorical_and_cache_guards():

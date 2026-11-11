@@ -1587,10 +1587,21 @@ def _row_keys(X):
     # representation.  Converting them through float64 loses integers above
     # 2**53 (2**53 and 2**53+1 would hash as the same row and one would be
     # dropped as a false duplicate), so hash the raw row bytes instead.
-    if src.dtype != object and not np.issubdtype(src.dtype, np.floating):
+    # Integral tables are first canonicalised to uint64: the same logical
+    # integer then hashes identically whether a cache stored it as int32 or
+    # int64 (raw bytes are width-dependent and would miss cross-dtype
+    # leakage).  uint64 keeps every integer value exact, including negatives
+    # via two's complement.
+    _integral = (src.dtype != object
+                 and (np.issubdtype(src.dtype, np.integer)
+                      or np.issubdtype(src.dtype, np.bool_)))
+    if _integral or (src.dtype != object and not np.issubdtype(src.dtype, np.floating)):
         _step = _hash_row_block(int(src.shape[1]), 1 << 16)
         for start in range(0, src.shape[0], _step):
-            arr = np.ascontiguousarray(src[start:start + _step])
+            if _integral:
+                arr = np.ascontiguousarray(src[start:start + _step], dtype=np.uint64)
+            else:
+                arr = np.ascontiguousarray(src[start:start + _step])
             for row_view in arr.view(np.uint8).reshape(arr.shape[0], -1):
                 h = hashlib.blake2b(digest_size=8)
                 h.update(memoryview(row_view))
