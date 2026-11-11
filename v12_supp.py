@@ -1687,7 +1687,16 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
     _fam = []
     for k, v in stats['comparisons'].items():
         p = v.get('p_exact_signflip')
-        _fam.append((k, float(p) if isinstance(p, (int, float)) and math.isfinite(p) else 1.0))
+        # Booleans are flags, not probabilities.  float(False) == 0.0 would
+        # become the strongest possible p and let a malformed comparison
+        # shrink the family while appearing significant.
+        if isinstance(p, (bool, np.bool_)):
+            p = float('nan')
+        try:
+            p = float(p)
+        except (TypeError, ValueError, OverflowError):
+            p = float('nan')
+        _fam.append((k, p if math.isfinite(p) and 0.0 <= p <= 1.0 else 1.0))
     if _fam:
         stats['holm'] = L.holm_adjust(_fam, alpha=_alpha)
     _rej = [k for k, v in stats['holm'].items() if v.get('p_holm') is not None and float(v['p_holm']) < _alpha]
