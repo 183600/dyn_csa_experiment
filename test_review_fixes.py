@@ -3484,6 +3484,20 @@ def t_data_guard_index_label_and_shift_edges():
     else:
         raise AssertionError('NaT group ids must not be split across sides')
 
+    # timedelta NaT is the same missing-value contract as datetime NaT: it
+    # must not become a unique group/category.
+    gt = np.array([np.timedelta64('NaT'), np.timedelta64('NaT'),
+                   np.timedelta64(1, 'D')], dtype=object)
+    try:
+        L.assert_no_split_leakage([0], [1], [2], groups=gt)
+    except ValueError as e:
+        assert 'share group ids' in str(e), e
+    else:
+        raise AssertionError('timedelta NaT group ids must not be split across sides')
+    enc_td = L.LeakageSafeCategoricalEncoder().fit(
+        np.array([[np.timedelta64('NaT')], [np.timedelta64('NaT')]], dtype=object))
+    assert enc_td.get_stats()['features'][0]['n_categories'] == 0, enc_td.get_stats()
+
 
 def t_audit_split_warning_status():
     with tempfile.TemporaryDirectory() as d:

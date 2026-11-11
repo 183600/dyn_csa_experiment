@@ -385,7 +385,7 @@ def _assert_order_finite(order, *, name='order'):
             # cannot sort to an arbitrary position and silently define the
             # split.  Non-numeric/string keys are left to the caller's order.
             for value in arr.tolist():
-                if isinstance(value, np.datetime64):
+                if isinstance(value, (np.datetime64, np.timedelta64)):
                     if np.isnat(value):
                         raise ValueError(
                             f'{name} contains NaT; a temporal split needs a '
@@ -691,7 +691,7 @@ def _group_key(value):
         f = float(value)
         if math.isnan(f):
             return ('__nan__',)
-    if isinstance(value, np.datetime64) and np.isnat(value):
+    if isinstance(value, (np.datetime64, np.timedelta64)) and np.isnat(value):
         return ('__nat__',)
     try:
         hash(value)
@@ -1074,7 +1074,7 @@ def _category_is_missing(value):
         return True
     if isinstance(value, (float, np.floating)):
         return bool(math.isnan(float(value)))
-    if isinstance(value, np.datetime64):
+    if isinstance(value, (np.datetime64, np.timedelta64)):
         return bool(np.isnat(value))
     return False
 
