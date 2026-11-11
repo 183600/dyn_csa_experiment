@@ -111,6 +111,13 @@ def t_min_consistency():
     # Scale-up: the planning math must not overflow int->float at large n.
     big = L.signflip_min_consistency(2000, 10, 0.05)
     assert big is not None and 0 < big < 2000, big
+    # The planning boundary matches Holm's inclusive rejection rule: at
+    # n=3, m=1, alpha=0.25 the minimum raw p is exactly 0.25, which
+    # holm_adjust rejects, so the plan is feasible (k_min=3), not impossible.
+    assert L.holm_adjust([('x', 0.25)], alpha=0.25)['x']['reject'] is True
+    assert L.signflip_min_n_for_holm(1, alpha=0.25) == 3
+    assert L.signflip_min_consistency(3, 1, alpha=0.25) == 3
+    assert abs(L.signflip_power(3, 1, 0.9, alpha=0.25) - 0.729) < 1e-12
 
 
 def t_power():

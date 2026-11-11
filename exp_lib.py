@@ -9727,7 +9727,10 @@ def signflip_min_consistency(n_seeds, m_comparisons, alpha=0.05):
     best = None
     for k in range(n, -1, -1):
         p = 2.0 * _binom_cdf_half(n, n - k)
-        if m * p < alpha:
+        # Holm rejects at p_holm <= alpha, so the planning helper must use the
+        # same inclusive boundary.  A strict '<' would report a plan as
+        # impossible at the exact boundary that holm_adjust accepts.
+        if m * p <= alpha + 1e-15:
             best = k  # keep descending: p(k) grows monotonically as k shrinks,
             # so the last k that still clears the gate is the MINIMUM k
         else:
