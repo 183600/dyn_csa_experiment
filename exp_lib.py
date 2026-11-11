@@ -13840,9 +13840,17 @@ def set_seed(seed):
     seed = int(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
     random.seed(seed)
-    np.random.seed(seed)
+    # NumPy's legacy global RNG only accepts [0, 2**32-1], while the panel
+    # planner deliberately preserves exact Python integers beyond that (and
+    # negative ids).  Fold only out-of-range ids into the RNG's domain so a
+    # planned panel can actually start; in-range seeds keep their exact
+    # historical stream.
+    np_seed = seed if 0 <= seed < 2 ** 32 else seed % (2 ** 32)
+    np.random.seed(np_seed)
     _attb_bump_epoch()
-    torch.manual_seed(seed)
+    # torch accepts the signed/unsigned 64-bit range; fold anything larger.
+    torch_seed = seed if -(2 ** 63) <= seed < 2 ** 64 else seed % (2 ** 64)
+    torch.manual_seed(torch_seed)
     _pin_cpu_threads()
     # Pin the backend determinism switches on CPU too: the cuDNN flags are
     # inert without CUDA, while CSA_DETERMINISTIC must still enable torch's
@@ -13852,8 +13860,8 @@ def set_seed(seed):
     if torch.cuda.is_available():
         # manual_seed already covers all devices; the explicit current-device
         # call documents the contract and is harmless.
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
+        torch.cuda.manual_seed(torch_seed)
+        torch.cuda.manual_seed_all(torch_seed)
     # TensorFlow is not a dependency of this repo, but a future/embedded
     # TensorFlow path must not become an unseeded RNG source.  Only touch it
     # when the user has already imported it (never import TensorFlow here:

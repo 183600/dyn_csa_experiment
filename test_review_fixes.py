@@ -1897,6 +1897,15 @@ def t_seed_axis_normalization():
             raise AssertionError(f'normalize_seed_list must reject {bad!r}')
     # Exact Python integers above 2**53 are preserved (only lossy floats fail).
     assert L.normalize_seed_list(['9007199254740993']) == [9007199254740993]
+    # ...and every preserved id must be usable by set_seed: NumPy's legacy
+    # RNG otherwise rejects negative or >=2**32 seeds and aborts the panel.
+    for huge in (-1, 2 ** 32, 9007199254740993, 10 ** 30):
+        _before = (random.random(), float(np.random.random()), float(torch.rand(1).item()))
+        L.set_seed(huge)
+        _a = (random.random(), float(np.random.random()), float(torch.rand(1).item()))
+        L.set_seed(huge)
+        _b = (random.random(), float(np.random.random()), float(torch.rand(1).item()))
+        assert _a == _b, (huge, _a, _b)
     # The same exact-integer contract applies wherever a recorded/checkpoint
     # seed is normalised, not only to the panel planner.
     assert L._as_seed_int(float(2 ** 53)) is None
