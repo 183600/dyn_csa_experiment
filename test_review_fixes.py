@@ -4054,6 +4054,18 @@ def t_valid_json_non_object_summaries_are_refused():
             raise AssertionError('build_report.summary accepted a numeric JSON file')
 
 
+def t_audit_metrics_missing_or_malformed_summary():
+    with tempfile.TemporaryDirectory() as d:
+        # No local panel: the policy was checked, but the record-level audit
+        # did not run, so the status must not be a fabricated "ok".
+        assert A.audit_metrics(outdirs=[d])['status'] == 'not_verifiable_locally'
+        with open(os.path.join(d, 'summary.json'), 'w', encoding='utf-8') as f:
+            f.write('{bad json')
+        out = A.audit_metrics(outdirs=[d])
+        assert out['status'] == 'fail', out
+        assert out['problems'], out
+
+
 def t_selection_audit_empty_per_seed_fails():
     with tempfile.TemporaryDirectory() as d:
         p = os.path.join(d, 'sel.json')
@@ -5227,6 +5239,7 @@ def main():
     _check('I15c2 selection audit rejects out-of-range claim cells', t_selection_audit_rejects_out_of_range_claims)
     _check('I15d split audit fails closed on unreadable metadata', t_split_audit_fails_on_unreadable_meta)
     _check('I15e valid-JSON non-object summaries are refused', t_valid_json_non_object_summaries_are_refused)
+    _check('I15f metrics audit distinguishes absent from malformed summaries', t_audit_metrics_missing_or_malformed_summary)
     _check('I16 fairness audit ignores a NaN seed instead of crashing', t_audit_fairness_nan_seed_does_not_crash)
     _check('I17 an empty split cache is not reported as verified', t_audit_split_empty_cache_is_not_ok)
     _check('I18 tuning audit reports malformed seed keys instead of crashing', t_baseline_audit_malformed_seed_keys)

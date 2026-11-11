@@ -1578,8 +1578,16 @@ def audit_metrics(outdirs=None):
     out = {'status': 'ok', 'policy': L.metric_policy_audit(), 'panels': {}}
     dirs = outdirs or list(_iter_result_dirs())
     for d in dirs:
-        summ = _load(os.path.join(d, 'summary.json'))
+        sp = os.path.join(d, 'summary.json')
+        summ = _load(sp)
         if summ is None:
+            if os.path.exists(sp):
+                # Exists but is unreadable: this is a failed panel, not an
+                # absent one.  Silently skipping it would leave status "ok"
+                # with the record-level checks never run.
+                out['status'] = 'fail'
+                out.setdefault('problems', []).append(
+                    f'{d}: summary.json exists but cannot be parsed — metric policy cannot be audited')
             continue
         if not isinstance(summ, dict):
             out['status'] = 'fail'
@@ -1594,7 +1602,8 @@ def audit_metrics(outdirs=None):
             out['status'] = 'warn'
     if out['policy']['warnings']:
         out['status'] = 'warn'
-    if not out['panels']:
+    if not out['panels'] and out['status'] == 'ok':
+        out['status'] = 'not_verifiable_locally'
         out['note'] = 'no local summaries — policy declarations were checked; record-level checks run on the experiment machine'
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return out
