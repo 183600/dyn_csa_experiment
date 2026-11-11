@@ -1975,6 +1975,12 @@ def t_batch_contract_check():
 
 def t_parallel_child_env_seed():
     import par
+    # Job payload normalisation must terminate for NumPy scalar subtypes
+    # (longdouble.item() returns another NumPy scalar) and preserve numbers.
+    normed = par._norm({'x': np.longdouble(1.5),
+                        'y': np.array([np.longdouble(2.5)]),
+                        'z': np.float32(3.5), 'b': np.bool_(True)})
+    assert normed == {'x': 1.5, 'y': [2.5], 'z': 3.5, 'b': True}, normed
     env = par._child_env('0', 17)
     assert env['PYTHONHASHSEED'] == '17' and env['CUDA_VISIBLE_DEVICES'] == '0', {k: env.get(k) for k in ('PYTHONHASHSEED', 'CUDA_VISIBLE_DEVICES')}
     env2 = par._child_env('0')

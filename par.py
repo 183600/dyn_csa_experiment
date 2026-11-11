@@ -200,7 +200,17 @@ def _norm(obj):
     # turn a seed/count into a string in the child job file.  The same applies
     # to a 0-d array (and to small arrays used as job payloads).
     if isinstance(obj, np.generic):
-        return _norm(obj.item())
+        # ``longdouble.item()`` returns another NumPy scalar, so recursing on
+        # item() alone can loop forever.  Convert through the scalar kind and
+        # use a final str fallback for anything still generic.
+        if isinstance(obj, np.bool_):
+            return bool(obj)
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        item = obj.item()
+        return _norm(item) if not isinstance(item, np.generic) else str(item)
     if isinstance(obj, np.ndarray):
         return _norm(obj.tolist())
     if isinstance(obj, (str, int, float, bool)) or obj is None:
