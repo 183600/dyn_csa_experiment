@@ -180,9 +180,11 @@ def run_training_health(cfg=None):
 
 def run_phase(name, guard, par=None):
     global _PLAN_DONE
-    if name in ('P5C', 'P5MP') and not _PLAN_DONE:
-        # A direct `phase P5C` must not start training under a plan that the
-        # P5T admission gate would reject.  `run_full` runs this once at
+    if name in ('P5C', 'P5MP', 'P5T') and not _PLAN_DONE:
+        # A direct phase must not start under a plan that the P5T admission
+        # gate would reject.  In particular `phase P5T` reads the held-out
+        # split, so the zero-GPU plan preflight has to run before that access,
+        # not only for the training phases.  `run_full` runs this once at
         # startup; the cache avoids repeating it for each phase.
         plan_check()
     import par as _par
@@ -239,6 +241,8 @@ def _load_manifest(path):
     if not isinstance(m['statistics'], dict):
         raise SystemExit(f'[v12] REFUSE: statistics must be an object ({m.get("statistics")!r})')
     for _fld, _val in (('binding', m.get('binding')), ('eval', m.get('eval'))):
+        if _fld in m and _val is None:
+            raise SystemExit(f'[v12] REFUSE: {_fld} is explicitly null; omit it or provide an object')
         if _val is not None and not isinstance(_val, dict):
             raise SystemExit(f'[v12] REFUSE: {_fld} must be an object ({_val!r})')
 
@@ -285,6 +289,8 @@ def _load_manifest(path):
     if _eval and _int_field(_eval.get('n_seqs_clean') or 0, 'eval.n_seqs_clean') <= 0:
         raise SystemExit('[v12] REFUSE: eval.n_seqs_clean is missing/zero — the frozen row count is part of the held-out slice, not a runtime default')
     _tokb = (_bind.get('tokenizer') or {}) if isinstance(_bind, dict) else {}
+    if _tokb and not isinstance(_tokb, dict):
+        raise SystemExit(f'[v12] REFUSE: binding.tokenizer must be an object ({_tokb!r})')
     if _tokb and str(_tokb.get('fit', '')).lower() and 'train' not in str(_tokb.get('fit', '')).lower():
         raise SystemExit(f'[v12] REFUSE: binding.tokenizer.fit={_tokb.get("fit")!r} is not the train-only fit required by the freeze')
     _test = str(_stat.get('test', 'exact two-sided sign-flip over paired per-seed deltas')).lower()
@@ -294,9 +300,23 @@ def _load_manifest(path):
     if 'holm' not in _corr:
         raise SystemExit(f'[v12] REFUSE: freeze manifest pre-registers correction {_stat.get("correction")!r}, but this analyzer only implements Holm step-down — update the code or re-freeze')
     for comp in m['primary_comparisons']:
+        if not isinstance(comp, dict):
+            raise SystemExit(f'[v12] REFUSE: every frozen primary comparison must be an object ({comp!r})')
         for _k in ('name', 'a', 'b'):
             if not comp.get(_k):
                 raise SystemExit(f'[v12] REFUSE: a frozen primary comparison lacks {_k!r} ({comp!r})')
+        if not isinstance(comp.get('name'), str):
+            # Numeric/boolean names (1 vs 1.0 vs True) can be distinct after
+            # str() but collapse as dict keys in the statistics family, which
+            # would silently shrink the Holm correction.
+            raise SystemExit(f'[v12] REFUSE: comparison name must be a string ({comp.get("name")!r})')
+        _ep = comp.get('endpoint')
+        if _ep is not None:
+            if not isinstance(_ep, str) or '@' not in _ep:
+                raise SystemExit(f'[v12] REFUSE: comparison {comp.get("name")!r} endpoint {_ep!r} is not a by-length endpoint (e.g. by_len.ppl@4096)')
+            _tail = _ep.rsplit('@', 1)[-1].strip()
+            if not _tail.isdigit() or int(_tail) <= 0:
+                raise SystemExit(f'[v12] REFUSE: comparison {comp.get("name")!r} endpoint {_ep!r} does not end in a positive integer length')
         _es = comp.get('expected_sign')
         if _es is not None and str(_es).lower() not in ('positive', 'negative'):
             raise SystemExit(f'[v12] REFUSE: comparison {comp.get("name")!r} has expected_sign={_es!r} (expected "positive", "negative", or null)')
@@ -2040,7 +2060,9 @@ def plan_check(manifest_path=FREEZE_MANIFEST):
         _missing = [x for x in (_a, _b) if x not in arms]
         if _missing:
             errs.append(f'comparison {comp.get("name")!r} names arms outside the frozen list: {_missing}')
-        if _Ln is not None and _lens and _Ln not in _lens:
+        if _Ln is None:
+            errs.append(f'comparison {comp.get("name")!r} has a malformed endpoint {comp.get("endpoint")!r} — the analysis cannot resolve a length')
+        elif _lens and _Ln not in _lens:
             errs.append(f'comparison {comp.get("name")!r} endpoint L{_Ln} is not in eval.by_length_ppl {_lens}')
         _low = [s for s in seeds if (_a, s) not in admitted or (_b, s) not in admitted]
         if _low:
