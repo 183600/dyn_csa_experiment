@@ -427,6 +427,10 @@ def t_exact_signflip_at_scale():
     # a random Monte-Carlo p-value for the pre-registered exact test at n>20.
     v = V7.exact_sign_permutation([0.7] * 21)
     assert abs(v['p_exact_signflip'] - 2.0 / (1 << 21)) < 1e-18 and v.get('method') == 'exact-mitm', v
+    # The v7-v12 driver wrapper must reject boolean deltas too, not coerce
+    # them through np.asarray(dtype=float).
+    vb = V7.exact_sign_permutation([True] * 6)
+    assert vb['n'] == 0 and vb['n_dropped'] == 6 and math.isnan(vb['p_exact_signflip']), vb
     rng = np.random.default_rng(11)
     d = rng.normal(size=21)
     got = L.exact_signflip_p(d)['p']

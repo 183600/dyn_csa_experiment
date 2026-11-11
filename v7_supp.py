@@ -1570,7 +1570,19 @@ def eval_niah(model, seq_len, device=DEVICE, n_seq=64, n_pairs=4, vocab=8192, se
         model.train(was)
 
 def exact_sign_permutation(deltas):
-    d = np.asarray(deltas, dtype=float)
+    # Boolean flags are not paired effects: float(True)==1.0 would turn six
+    # flags into six identical 'significant' deltas.  Keep the same scalar
+    # contract as exp_lib.exact_signflip_p.
+    _vals = []
+    for _x in (deltas if deltas is not None else []):
+        if isinstance(_x, (bool, np.bool_)):
+            _vals.append(float('nan'))
+            continue
+        try:
+            _vals.append(float(_x))
+        except (TypeError, ValueError, OverflowError):
+            _vals.append(float('nan'))
+    d = np.asarray(_vals, dtype=float)
     d_in = d
     d = d[np.isfinite(d)]
     n = len(d)
