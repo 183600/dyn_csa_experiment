@@ -45,6 +45,7 @@ for _stream in (sys.stdout, sys.stderr):
 
 REPO = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_DIRS = ['results_lm_test', 'analysis_v12']
+_CKPT_EXTS = ('.pt', '.ckpt', '.pth', '.safetensors')
 ENV_FILES = ['confirmation_frozen.json', 'DECISION_LOG.md', 'RELEASES.md', 'requirements.txt',
             'requirements.lock', 'pyproject.toml',
             # data/cache provenance: a tokenizer or cache that changes the ids
@@ -97,14 +98,24 @@ def _env_snapshot():
     return env
 
 
+def _dir_inside_repo(d):
+    """True only when `d` resolves to a directory inside REPO."""
+    try:
+        root = os.path.realpath(REPO)
+        base = os.path.realpath(os.path.join(REPO, d))
+        return os.path.isdir(base) and os.path.commonpath([root, base]) == root
+    except (OSError, ValueError):
+        return False
+
+
 def _collect(dirs, include_ckpt=False):
     """Files that would enter the archive, with sizes and hashes (lazily)."""
     files = []
     for d in dirs:
-        base = os.path.join(REPO, d)
-        if not os.path.isdir(base):
-            print(f'[archive] WARNING: {d} does not exist locally — skipped (run on the experiment machine)')
+        if not _dir_inside_repo(d):
+            print(f'[archive] WARNING: {d} does not resolve to a directory inside the repository — skipped (archive members must stay repo-relative)')
             continue
+        base = os.path.join(REPO, d)
         for root, _dirs, names in os.walk(base):
             for n in names:
                 p = os.path.join(root, n)
@@ -116,7 +127,7 @@ def _collect(dirs, include_ckpt=False):
                     # the repository.
                     print(f'[archive] WARNING: skipping non-regular file {os.path.relpath(p, REPO)} — only regular files are content-attested')
                     continue
-                if not include_ckpt and (n.endswith('.pt') or n.endswith('.ckpt') or n.endswith('.pth') or n.endswith('.safetensors')):
+                if not include_ckpt and n.endswith(_CKPT_EXTS):
                     continue
                 files.append(p)
     for f in ENV_FILES:
@@ -166,12 +177,12 @@ def _ckpt_hash_table(dirs):
     .pt bodies are not packed) — the weights stay auditable by hash."""
     rows = {}
     for d in dirs:
-        base = os.path.join(REPO, d)
-        if not os.path.isdir(base):
+        if not _dir_inside_repo(d):
             continue
+        base = os.path.join(REPO, d)
         for root, _dirs, names in os.walk(base):
             for n in names:
-                if n.endswith('.pt'):
+                if n.endswith(_CKPT_EXTS):
                     p = os.path.join(root, n)
                     if os.path.islink(p) or not os.path.isfile(p):
                         continue
@@ -189,7 +200,7 @@ def cmd_plan(tag, dirs, include_ckpt=False):
         print(f'  {sz:>12,d} B  {os.path.relpath(p, REPO)}')
     ck = _ckpt_hash_table(dirs)
     if ck:
-        print(f'[archive] checkpoints found: {len(ck)} (.pt) — hashed into the manifest' + (' and packed' if include_ckpt else ' (bodies NOT packed; use --include-ckpt to embed them)'))
+        print(f'[archive] checkpoints found: {len(ck)} — hashed into the manifest' + (' and packed' if include_ckpt else ' (bodies NOT packed; use --include-ckpt to embed them)'))
     print(f'[archive] total: {total:,d} B (~{total / (1 << 20):.1f} MiB)')
     return files
 
@@ -207,6 +218,10 @@ def cmd_make(tag, dirs, include_ckpt=False, outdir='archive'):
     if _safe_tag(tag) is None:
         print(f'[archive] REFUSE: release tag {tag!r} is not a single safe filename component (path separators / empty / dot segments are not allowed)')
         return 1
+    _unsafe = [d for d in dirs if not _dir_inside_repo(d) and os.path.isdir(os.path.join(REPO, d))]
+    if _unsafe:
+        print(f'[archive] REFUSE: result dir(s) {_unsafe} resolve outside the repository — archive members must stay repo-relative')
+        return 1
     _required = ['DECISION_LOG.md', 'RELEASES.md', 'confirmation_frozen.json']
     _missing = [f for f in _required if not os.path.exists(os.path.join(REPO, f))]
     if _missing:
@@ -218,12 +233,12 @@ def cmd_make(tag, dirs, include_ckpt=False, outdir='archive'):
     # artifact under the requested dirs.
     _n_artifacts = 0
     for d in dirs:
-        base = os.path.join(REPO, d)
-        if not os.path.isdir(base):
+        if not _dir_inside_repo(d):
             continue
+        base = os.path.join(REPO, d)
         for root, _walk_dirs, names in os.walk(base):
             for n in names:
-                if not include_ckpt and (n.endswith('.pt') or n.endswith('.ckpt') or n.endswith('.pth') or n.endswith('.safetensors')):
+                if not include_ckpt and n.endswith(_CKPT_EXTS):
                     continue
                 _p = os.path.join(root, n)
                 if os.path.isfile(_p) and not os.path.islink(_p):

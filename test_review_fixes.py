@@ -4915,6 +4915,31 @@ def t_release_readiness_audit():
 
 
 
+def t_archive_refuses_dirs_outside_repo():
+    import archive_release as AR
+    root = tempfile.mkdtemp()
+    old_repo = AR.REPO
+    try:
+        repo = os.path.join(root, 'repo')
+        os.makedirs(repo)
+        for n in ('DECISION_LOG.md', 'RELEASES.md', 'confirmation_frozen.json'):
+            with open(os.path.join(repo, n), 'w', encoding='utf-8') as f:
+                f.write('x')
+        outside = os.path.join(root, 'outside')
+        os.makedirs(outside)
+        with open(os.path.join(outside, 'secret.txt'), 'w', encoding='utf-8') as f:
+            f.write('payload')
+        AR.REPO = repo
+        assert AR.cmd_make('v1', ['../outside'], outdir='arch') == 1
+        assert not os.path.exists(os.path.join(repo, 'arch', 'release_v1.tar.gz'))
+        files = AR._collect(['../outside'])
+        assert all(os.path.realpath(p).startswith(os.path.realpath(repo) + os.sep)
+                   for p in files), files
+    finally:
+        AR.REPO = old_repo
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def t_archive_verify_requires_external_checksum():
     import archive_release as AR
     with tempfile.TemporaryDirectory() as d:
@@ -5790,6 +5815,7 @@ def main():
     _check('L8 efficiency-pair audit + shape sweep', t_efficiency_pairs_audit_and_sweep)
     _check('L9 evidence-release readiness audit', t_release_readiness_audit)
     _check('L9b archive verifier requires the external checksum', t_archive_verify_requires_external_checksum)
+    _check('L9b2 archive refuses result dirs outside the repo', t_archive_refuses_dirs_outside_repo)
     _check('L10 selection-attribution contract', t_selection_attribution_contract)
     _check('L10b corpus-audit memo cannot bypass the strict gate', t_corpus_audit_memo_does_not_bypass_strict_gate)
     _check('L10c corpus-audit memo keys the validation row shape', t_corpus_audit_memo_keys_validation_shape)
