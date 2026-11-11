@@ -976,7 +976,9 @@ def sec_p1t():
         if v in seen or v not in d:
             continue
         seen.add(v)
-        r = d[v]
+        r = _agg_entry(d, v)
+        if r is None:
+            continue
         ppls = _finite_ppls(r)
         if ppls:
             mean = sum(ppls) / len(ppls)
