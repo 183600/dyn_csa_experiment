@@ -279,6 +279,9 @@ def cmd_verify(tar_path):
             if member.name == man_name or not member.isfile():
                 continue
             f = tf.extractfile(member)
+            if f is None:
+                bad.append(f'{member.name}: in tar but its content cannot be read')
+                continue
             h = hashlib.sha256()
             while True:
                 b = f.read(1 << 20)
@@ -286,9 +289,16 @@ def cmd_verify(tar_path):
                     break
                 h.update(b)
             got = h.hexdigest()
-            want = (man['files'].get(member.name) or {}).get('sha256')
-            if want is None:
+            _entry = man['files'].get(member.name)
+            if _entry is None:
                 bad.append(f'{member.name}: in tar but NOT in manifest')
+                continue
+            if not isinstance(_entry, dict):
+                bad.append(f'{member.name}: manifest entry is {type(_entry).__name__}, not an object')
+                continue
+            want = _entry.get('sha256')
+            if not isinstance(want, str) or not want:
+                bad.append(f'{member.name}: manifest entry has no usable sha256')
             elif got != want:
                 bad.append(f'{member.name}: hash mismatch (manifest {want[:12]}…, actual {got[:12]}…)')
         missing = [n for n in man['files'] if n not in names]

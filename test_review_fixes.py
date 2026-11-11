@@ -4330,6 +4330,24 @@ def t_archive_verify_requires_external_checksum():
         # The checksum now anchors the file; the invalid tar itself must not be
         # accepted as a release either (a clean refusal, not a traceback).
         assert AR.cmd_verify(tar) == 1
+        # A valid tar with a malformed per-file manifest entry is also refused
+        # instead of crashing the verifier.
+        import io
+        import tarfile
+        tar2 = os.path.join(d, 'release_y.tar.gz')
+        man = {'files': {'payload.txt': 'not-an-object'}}
+        with tarfile.open(tar2, 'w:gz') as tf:
+            payload = b'hello'
+            ti = tarfile.TarInfo('payload.txt')
+            ti.size = len(payload)
+            tf.addfile(ti, io.BytesIO(payload))
+            mb = json.dumps(man).encode('utf-8')
+            mti = tarfile.TarInfo('release_y.MANIFEST.sha256')
+            mti.size = len(mb)
+            tf.addfile(mti, io.BytesIO(mb))
+        with open(tar2 + '.sha256', 'w', encoding='utf-8') as f:
+            f.write(AR._sha256(tar2) + '  release_y.tar.gz\n')
+        assert AR.cmd_verify(tar2) == 1
 
 
 def t_selection_attribution_contract():
