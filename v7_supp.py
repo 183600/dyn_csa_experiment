@@ -1734,9 +1734,13 @@ def bootstrap_report(outdirs, out='analysis_v7/stats.json'):
         except Exception as e:
             print(f'[stats] WARNING: cannot read {sp} ({type(e).__name__}: {e}) — its panel is EXCLUDED from these statistics')
             continue
+        if not isinstance(s, dict):
+            print(f'[stats] WARNING: {sp} is valid JSON but not an object ({type(s).__name__}) — its panel is EXCLUDED from these statistics')
+            continue
         _legacy_ok = L.legacy_warm_tags(s)
         for k, r in s.items():
-            if isinstance(r, dict) and 'seed' in r and (not r.get('synthesized')) and L.ppl_is_usable(r.get('ppl')):
+            _seed = L._as_seed_int(r.get('seed')) if isinstance(r, dict) else None
+            if isinstance(r, dict) and _seed is not None and (not r.get('synthesized')) and L.ppl_is_usable(r.get('ppl')):
                 tag = f'{od.split('/')[-1]}::{r.get('variant')}'
                 if r.get('warm_steps') is not None:
                     tag += f'::w{r['warm_steps']}'
@@ -1745,22 +1749,22 @@ def bootstrap_report(outdirs, out='analysis_v7/stats.json'):
                     if _wt:
                         tag += f'::{_wt}'
                 _slot = recs.setdefault(tag, {})
-                _old = _slot.get(r['seed'])
+                _old = _slot.get(_seed)
                 if _old is not None:
                     if _old.get('_dup'):
                         continue
                     _new_cur = r.get('_code') == CKPT_CODE
                     _old_cur = _old.get('_code') == CKPT_CODE
                     if _new_cur and not _old_cur:
-                        print(f'[stats] WARNING: {tag} seed {r['seed']} holds TWO measurable records — the PPL is ambiguous; the one stamped with the current code semantics is kept and the duplicate is dropped')
-                        _slot[r['seed']] = r
+                        print(f'[stats] WARNING: {tag} seed {_seed} holds TWO measurable records — the PPL is ambiguous; the one stamped with the current code semantics is kept and the duplicate is dropped')
+                        _slot[_seed] = r
                     elif _new_cur == _old_cur:
-                        print(f'[stats] WARNING: {tag} seed {r['seed']} holds TWO measurable records with identical stamp status — the seed is EXCLUDED from every comparison rather than quoting an arbitrarily picked PPL')
+                        print(f'[stats] WARNING: {tag} seed {_seed} holds TWO measurable records with identical stamp status — the seed is EXCLUDED from every comparison rather than quoting an arbitrarily picked PPL')
                         _dup = dict(_old)
                         _dup['_dup'] = True
-                        _slot[r['seed']] = _dup
+                        _slot[_seed] = _dup
                     continue
-                _slot[r['seed']] = r
+                _slot[_seed] = r
     pairs = [('warmup w=5000 vs scratch', 'results_lm_v7_warmup::csa_fixed::w5000', 'results_lm_v7_warmup::csa_fixed::w0'), ('warmup w=10000 vs scratch', 'results_lm_v7_warmup::csa_fixed::w10000', 'results_lm_v7_warmup::csa_fixed::w0'), ('CSA+RoPE vs CSA absPE', 'results_lm_v7_rope::csa_fixed_rope', 'results_lm_v7_rope::csa_fixed'), ('CSA+RoPE vs dense+RoPE', 'results_lm_v7_rope::csa_fixed_rope', 'results_lm_v7_rope::full_rope'), ('hybrid+RoPE vs dense+RoPE', 'results_lm_v7_rope::hybrid_fixed_rope', 'results_lm_v7_rope::full_rope')]
     per_variant = {}
     for k, v in recs.items():
