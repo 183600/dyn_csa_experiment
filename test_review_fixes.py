@@ -872,6 +872,44 @@ def t_recipe_signature():
     assert V12._recipe_matches_signature(recipe, shipped) is True, 'the shipped v2 signature must accept the canonical P3MT recipe string'
 
 
+def t_finaltest_requires_parameter_matching():
+    # A confirmation must be parameter-matched.  Missing params is
+    # unverifiable, not a pass: the decision rule may not treat None like True.
+    with tempfile.TemporaryDirectory() as td:
+        seeds = list(range(12))
+        manifest = {
+            'arms': ['a_arm', 'b_arm'], 'seeds': seeds,
+            'primary_comparisons': [{'name': 'c1', 'a': 'a_arm', 'b': 'b_arm',
+                                     'endpoint': 'by_len.ppl@4096',
+                                     'expected_sign': 'negative'}],
+            'statistics': {'alpha': 0.05, 'min_seeds_for_confirmation': 8,
+                           'descriptive_only': True},
+            'manifest_sha256': 'M', 'code_semantics_expected': L.CODE_SEMANTICS,
+        }
+        admitted = {}
+        for s in seeds:
+            for arm, ppl in (('a_arm', 30.0), ('b_arm', 31.0)):
+                admitted[(arm, s)] = {
+                    'variant': arm, 'seed': s, 'train_fp': 't', 'data_fp': 'd',
+                    'by_len': {'4096': {'ppl': ppl, 'n_tok': 16 * 4095,
+                                         'n_seq': 16, 'truncated': False}},
+                }
+        _old_admit = V12._admit_confirmation_records
+        _old_probe = V12._test_probe_stats
+        try:
+            V12._admit_confirmation_records = lambda raw, man: (admitted, None)
+            V12._test_probe_stats = lambda *a, **k: {}
+            st = V12.finaltest_stats(manifest=manifest,
+                                     bylen_path=os.path.join(td, 'bylen.json'),
+                                     probe_path=os.path.join(td, 'probe.json'),
+                                     out=os.path.join(td, 'stats.json'))
+        finally:
+            V12._admit_confirmation_records = _old_admit
+            V12._test_probe_stats = _old_probe
+        assert st['comparisons']['c1']['param_matched'] is None, st['comparisons']['c1']
+        assert st['confirmed'] == [], st['confirmed']
+
+
 def t_freeze_lock():
     with tempfile.TemporaryDirectory() as td:
         man = {'manifest_sha256': 'AAA', 'frozen_at': '2026-10-17'}
@@ -5061,6 +5099,7 @@ def main():
     _check('C4 recipe signature', t_recipe_signature)
     _check('C4b P1L checkpoint recipe signature', t_p1l_recipe_signature)
     _check('C5 freeze lock', t_freeze_lock)
+    _check('C5b final test requires parameter matching', t_finaltest_requires_parameter_matching)
     _check('C9 aggregate seed normalization', t_aggregate_seed_normalization)
     _check('C10 audit resolution classification', t_audit_resolution_classification)
     _check('C11 controlled-variable gate: mixed train_knobs', t_pair_reason_train_knobs_mixed)

@@ -1672,7 +1672,7 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
     # seeds) is reported but is no longer an all-or-nothing veto: one failed
     # L4096 cell may not annihilate an otherwise complete comparison.
     _conf = [k for k in _rej if stats['comparisons'].get(k, {}).get('direction_ok') is True
-             and stats['comparisons'].get(k, {}).get('param_matched') is not False
+             and stats['comparisons'].get(k, {}).get('param_matched') is True
              and int(stats['comparisons'].get(k, {}).get('n_effective') or 0) >= int(stats['comparisons'].get(k, {}).get('min_seeds_for_confirmation') or len(manifest['seeds']))]
     stats['confirmed'] = _conf
     stats['significant_nondirectional'] = [k for k in _rej if stats['comparisons'].get(k, {}).get('direction_ok') is None]
@@ -1836,7 +1836,7 @@ def build_report(out='REPORT_v12.md', stats_p='analysis_v12/stats.json'):
         A('')
         _conf = ft.get('confirmed')
         if _conf is None:
-            _conf = [k for k, v in holm.items() if v.get('reject') and (comps.get(k, {}).get('direction_ok') is True) and (comps.get(k, {}).get('param_matched') is not False) and (comps.get(k, {}).get('coverage_ok') is True)]
+            _conf = [k for k, v in holm.items() if v.get('reject') and (comps.get(k, {}).get('direction_ok') is True) and (comps.get(k, {}).get('param_matched') is True) and (comps.get(k, {}).get('coverage_ok') is True)]
         if _conf:
             A(f'**确认结果**：{len(_conf)}/{len(comps)} 个冻结主比较在 Holm 校正后成立**且方向符合预注册**（{sorted(_conf)}）——这是预注册规则下的确认性证据。')
         else:
