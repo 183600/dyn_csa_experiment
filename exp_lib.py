@@ -7274,10 +7274,20 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
                 if meta.get('doc_ids', {}).get('disjoint') is not True:
                     _problems.append('cache metadata does not attest document-level disjointness')
                 _mdoc = meta.get('doc_ids') or {}
-                if _mdoc.get('train_fp') and _mdoc['train_fp'] != _ids_fp(_trd):
+                # A missing fingerprint is not a pass: it cannot bind the
+                # sidecar to this cache.  WikiText already fails closed here;
+                # FineWeb must too, or swapped sidecars can be served as long
+                # as the pair happens to be disjoint.
+                if not _mdoc.get('train_fp'):
+                    _problems.append(
+                        'cache metadata does not record a train document-id fingerprint')
+                elif _mdoc['train_fp'] != _ids_fp(_trd):
                     _problems.append(
                         'train document-id sidecar does not match the fingerprint in the cache metadata')
-                if _mdoc.get('validation_fp') and _mdoc['validation_fp'] != _ids_fp(_vad):
+                if not _mdoc.get('validation_fp'):
+                    _problems.append(
+                        'cache metadata does not record a validation document-id fingerprint')
+                elif _mdoc['validation_fp'] != _ids_fp(_vad):
                     _problems.append(
                         'validation document-id sidecar does not match the fingerprint in the cache metadata')
             except Exception as _de:
