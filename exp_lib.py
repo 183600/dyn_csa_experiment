@@ -8580,6 +8580,11 @@ def result_is_current(rec, code, *required_keys):
         return False
     if 'ppl' in required_keys and (not ppl_is_usable(rec.get('ppl'))):
         return False
+    if 'acc' in required_keys and _finite_scalar(rec.get('acc')) is None:
+        # NIAH cells are skipped on resume through this predicate; a bool,
+        # string or NaN 'acc' is not a completed measurement and must be
+        # re-evaluated rather than frozen as done.
+        return False
     return rec.get('_code') == code
 PAIR_STEP_KEYS = ('steps', 'tokens_seen')
 

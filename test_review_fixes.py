@@ -4201,6 +4201,11 @@ def t_record_readers_refuse_non_object_summaries():
             assert 'summary object' in str(e), e
         else:
             raise AssertionError('aggregate accepted a list as a panel summary')
+    # Resume completeness for a NIAH cell needs a real finite accuracy, not
+    # a boolean/string/NaN placeholder.
+    for bad in (True, '0.9', float('nan'), float('inf')):
+        assert L.result_is_current({'acc': bad, '_code': 'X'}, 'X', 'acc') is False, bad
+    assert L.result_is_current({'acc': 0.0, '_code': 'X'}, 'X', 'acc') is True
 
 
 def t_boolean_pvalues_are_not_probabilities():
