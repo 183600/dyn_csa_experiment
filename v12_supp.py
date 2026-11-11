@@ -1369,6 +1369,7 @@ def _test_probe_stats(probe_path, manifest, slice_fp):
         isinstance(_r, dict) and bool(_r.get('train_fp')) for _r in raw.values())
     groups = {}
     excluded = []
+    _probe_train_fps = set()
     for key, r in raw.items():
         if not isinstance(r, dict):
             excluded.append(f'{key}: not a dict')
@@ -1416,8 +1417,21 @@ def _test_probe_stats(probe_path, manifest, slice_fp):
             excluded.append(f'{key}: duplicate (cell, seed) identity — the pooled mean would be ambiguous')
             continue
         grp[_seed_i] = float(r['ppl_mean'])
+        if r.get('train_fp'):
+            _probe_train_fps.add(str(r['train_fp']))
+    if len(_probe_train_fps) > 1:
+        # The probe is descriptive, but pooling/contrasting records trained on
+        # different corpora would still misattribute the effect to this slice.
+        out['error'] = (f'probe records span {len(_probe_train_fps)} different training corpora '
+                        f'({sorted(_probe_train_fps)}) — refusing to pool or contrast them')
+        out['n_excluded'] = len(excluded)
+        out['n_admitted'] = 0
+        out['train_fps'] = sorted(_probe_train_fps)
+        return out
     out['n_excluded'] = len(excluded)
     out['n_admitted'] = sum(len(g) for g in groups.values())
+    if _probe_train_fps:
+        out['train_fps'] = sorted(_probe_train_fps)
     by_visible = {}
     for ident, by_seed in groups.items():
         v, arm, Ln, rho, mode = ident[:5]
