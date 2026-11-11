@@ -1305,7 +1305,8 @@ def clean_training_rows(X, y=None, *, train_idx, drop_duplicates=True,
     Returns ``train_idx`` (the cleaned index array), the dropped rows and
     counts suitable for a run manifest.
     """
-    Xarr = _as_float_2d(X)
+    Xraw = _as_numeric_2d(X)
+    Xarr = _as_float_2d(Xraw)
     n = int(Xarr.shape[0])
     train_rows = _validated_index(train_idx, name='train_idx')
     if train_rows.size == 0:
@@ -1338,7 +1339,7 @@ def clean_training_rows(X, y=None, *, train_idx, drop_duplicates=True,
         return lab is None or (isinstance(lab, tuple)
                                and all(v is None for v in lab))
 
-    keys = _row_keys(Xarr)
+    keys = _row_keys(Xraw)
     clusters = {}
     for pos, row in enumerate(train_rows.tolist()):
         clusters.setdefault(keys[row], []).append(pos)
@@ -1513,7 +1514,21 @@ def _row_keys(X):
     if src.ndim == 1:
         src = src.reshape(-1, 1)
     keys = []
-    # Hash row blocks; each block is converted to float64 before hashing.
+    # Integer/bool/datetime/string columns have an exact fixed-width byte
+    # representation.  Converting them through float64 loses integers above
+    # 2**53 (2**53 and 2**53+1 would hash as the same row and one would be
+    # dropped as a false duplicate), so hash the raw row bytes instead.
+    if src.dtype != object and not np.issubdtype(src.dtype, np.floating):
+        _step = _hash_row_block(int(src.shape[1]), 1 << 16)
+        for start in range(0, src.shape[0], _step):
+            arr = np.ascontiguousarray(src[start:start + _step])
+            for row_view in arr.view(np.uint8).reshape(arr.shape[0], -1):
+                h = hashlib.blake2b(digest_size=8)
+                h.update(memoryview(row_view))
+                keys.append(h.digest())
+        return keys
+    # Hash row blocks; each floating block is converted to float64 before
+    # hashing (values are preserved exactly for float16/32/64).
     _step = _hash_row_block(int(src.shape[1]), 1 << 16)
     for start in range(0, src.shape[0], _step):
         arr = np.ascontiguousarray(np.asarray(src[start:start + _step], dtype=np.float64))
@@ -1681,7 +1696,8 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
         raise ValueError(
             f'shift_threshold must be a finite non-negative number, got '
             f'{shift_threshold!r}')
-    X = _as_float_2d(X)
+    Xraw = _as_numeric_2d(X)
+    X = _as_float_2d(Xraw)
     n = X.shape[0]
     known = None
     if known_labels is not None:
@@ -1768,7 +1784,7 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
 
     # Exact duplicates within each split.
     dup = {}
-    keys = _row_keys(X)
+    keys = _row_keys(Xraw)
     for name, rows in split_rows.items():
         sub = [keys[i] for i in rows]
         dup[name] = int(len(sub) - len(set(sub)))

@@ -3491,6 +3491,14 @@ def t_data_guard_index_label_and_shift_edges():
     Xnf = np.array([[np.nan, 1.0], [np.inf, 1.0], [-np.inf, 1.0], [np.nan, 1.0]])
     mask = L.duplicate_mask(Xnf)
     assert mask.tolist() == [False, False, False, True], mask
+    # Integers above 2**53 are exact.  Coercing them to float64 would make
+    # 2**53 and 2**53+1 look like the same row and drop a real observation.
+    Xi = np.array([[2 ** 53], [2 ** 53 + 1]], dtype=np.int64)
+    assert L.duplicate_mask(Xi).tolist() == [False, False]
+    clean_i = L.clean_training_rows(Xi, y=[0, 0], train_idx=[0, 1])
+    assert clean_i['train_idx'].tolist() == [0, 1], clean_i
+    rep_i = L.data_quality_report(Xi, train_idx=[0], val_idx=[1])
+    assert rep_i['checks']['duplicate_rows_across_splits']['train__val'] == 0, rep_i
     repnf = L.data_quality_report(Xnf, train_idx=[0], val_idx=[1], test_idx=[2, 3])
     assert repnf['checks']['duplicate_rows_across_splits']['train__val'] == 0, repnf
 
