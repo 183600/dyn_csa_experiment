@@ -222,7 +222,15 @@ def cmd_verify(tar_path):
         return 1
     side = tar_path + '.sha256'
     if os.path.exists(side):
-        want = open(side, encoding='utf-8').read().split()[0]
+        try:
+            _parts = open(side, encoding='utf-8').read().split()
+        except OSError as _e:
+            print(f'[archive] REFUSE: cannot read {side} ({type(_e).__name__}: {_e})')
+            return 1
+        want = _parts[0] if _parts else ''
+        if not want:
+            print(f'[archive] REFUSE: {side} is empty or malformed — cannot verify the archive hash')
+            return 1
         got = _sha256(tar_path)
         print(f'[archive] archive sha256: {got}  {"OK" if got == want else "MISMATCH (expected " + want + ")"}')
         if got != want:
