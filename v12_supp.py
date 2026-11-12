@@ -1300,8 +1300,17 @@ def _record_int(value):
 
 def _manifest_seed_ids(manifest):
     """Exact, unique frozen seed ids (also for an in-memory manifest)."""
+    if not isinstance(manifest, dict):
+        raise SystemExit(f'[p5t stats] REFUSE: frozen manifest is {type(manifest).__name__}, not an object')
+    _seeds_raw = manifest.get('seeds')
+    if not isinstance(_seeds_raw, (list, tuple)) or not _seeds_raw:
+        # A string/bytes container would iterate characters or byte values and
+        # silently build a whitelist of different seed identities.
+        raise SystemExit(
+            f'[p5t stats] REFUSE: frozen seeds must be a non-empty list '
+            f'({manifest.get("seeds")!r})')
     _ids = []
-    for _s in manifest.get('seeds') or []:
+    for _s in _seeds_raw:
         _si = L._as_seed_int(_s)
         if _si is None:
             raise SystemExit(f'[p5t stats] REFUSE: frozen seed {_s!r} is not an exact integer')
@@ -1322,7 +1331,13 @@ def _admit_confirmation_records(raw, manifest):
     出现两条可采纳记录 = 歧义，**拒绝运行**（而不是后者覆盖前者）；
     可采纳记录的 data_fp 必须全局唯一（同一冻结 test 切片），否则拒绝。
     返回 (admitted[(variant, seed)] -> record, unified data_fp)。"""
-    arms = list(manifest['arms'])
+    _arms_raw = manifest.get('arms')
+    if (not isinstance(_arms_raw, (list, tuple)) or not _arms_raw
+            or not all(isinstance(a, str) and a for a in _arms_raw)):
+        raise SystemExit(
+            f'[p5t stats] REFUSE: frozen arms must be a non-empty list of '
+            f'arm names ({manifest.get("arms")!r})')
+    arms = list(_arms_raw)
     # This gate is also callable with an in-memory manifest (finaltest_stats /
     # tests).  Apply the loader's exact seed identity here too: int(True)==1
     # or int(4.9)==4 would admit a record under a different planned seed.

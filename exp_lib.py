@@ -4339,24 +4339,39 @@ class AttnCfg:
                 raise ValueError(f'{label} must be >= {minimum}, got {value!r}')
             return out
 
-        _cfg_int('pool_position_capacity', self.pool_position_capacity, 1)
+        # Store the normalised integers, not only validate them: an integral
+        # float (e.g. c_index=8.0) would otherwise survive into torch.empty /
+        # nn.Linear, and a float sliding_window would build a float index
+        # table instead of an integer one.
+        self.pool_position_capacity = _cfg_int(
+            'pool_position_capacity', self.pool_position_capacity, 1)
         # Non-negative/positive structural bounds.  A negative window or
         # overlap is not a meaningful configuration; reject it here rather
         # than failing later inside torch.arange/index maths.
         min_block = _cfg_int('min_block', self.min_block, 1)
-        _cfg_int('block_size', self.block_size, 1)
-        _cfg_int('target_block_tokens', self.target_block_tokens, 1)
-        _cfg_int('overlap', self.overlap, 0)
-        _cfg_int('sliding_window', self.sliding_window, 0)
-        _cfg_int('window', self.window, 0)
-        _cfg_int('index_topk', self.index_topk, 0)
-        _cfg_int('c_kv', self.c_kv, 0)
-        _cfg_int('c_index', self.c_index, 0)
-        _cfg_int('n_index_heads', self.n_index_heads, 1)
+        self.min_block = min_block
+        self.block_size = _cfg_int('block_size', self.block_size, 1)
+        self.target_block_tokens = _cfg_int(
+            'target_block_tokens', self.target_block_tokens, 1)
+        self.overlap = _cfg_int('overlap', self.overlap, 0)
+        self.sliding_window = _cfg_int('sliding_window', self.sliding_window, 0)
+        self.window = _cfg_int('window', self.window, 0)
+        self.index_topk = _cfg_int('index_topk', self.index_topk, 0)
+        self.c_kv = _cfg_int('c_kv', self.c_kv, 0)
+        self.c_index = _cfg_int('c_index', self.c_index, 0)
+        self.n_index_heads = _cfg_int('n_index_heads', self.n_index_heads, 1)
+        if self.c_index % self.n_index_heads != 0:
+            # The indexer splits c_index evenly across its heads; a truncated
+            # quotient would pass construction and only crash on the first
+            # lightning_indexer call.
+            raise ValueError(
+                f'c_index={self.c_index} must be divisible by '
+                f'n_index_heads={self.n_index_heads}')
         if self.max_block is not None:
             max_block = _cfg_int('max_block', self.max_block, 1)
             if max_block < min_block:
                 raise ValueError(f'max_block={self.max_block} is smaller than min_block={self.min_block}')
+            self.max_block = max_block
         if self.open_block_mode != 'closed':
             if self.kind not in ('csa', 'hca'):
                 raise ValueError(f'open_block_mode={self.open_block_mode!r} is only defined for csa/hca layers, not {self.kind!r}')
@@ -7205,6 +7220,15 @@ class _DocDeduplicator:
         return [(b, (int(h) >> (b * self.bits)) & self.mask)
                 for b in range(self.bands)]
 
+    def _index(self, h, fp_key):
+        # Index every document the filter has SEEN, including a near duplicate
+        # that was rejected.  Otherwise a later document near the rejected one
+        # (but not near the retained original) would slip through even though
+        # its near copy was already observed.
+        self.exact.add(fp_key)
+        for key in self._bucket_keys(h):
+            self.buckets.setdefault(key, []).append(h)
+
     def is_duplicate(self, text, fp=None):
         if fp is None:
             fp = _doc_exact_fp(text)
@@ -7220,11 +7244,10 @@ class _DocDeduplicator:
             for other in self.buckets.get(key, ()):
                 if _hamming64(h, other) <= self.near_threshold:
                     self.n_near_skipped += 1
+                    self._index(h, fp_key)
                     return True, 'near'
-        self.exact.add(fp_key)
+        self._index(h, fp_key)
         self.n_seen += 1
-        for key in self._bucket_keys(h):
-            self.buckets.setdefault(key, []).append(h)
         return False, None
 
     def stats(self):
@@ -9024,6 +9047,7 @@ def attach_holm(comparisons, *, alpha=0.05, family='reported comparisons', explo
             f'attach_holm needs a comparisons object (name -> record), got '
             f'{type(comparisons).__name__}')
     pairs, omitted, tested = [], [], 0
+    _tested_vals = []
     for k, v in comparisons.items():
         if not isinstance(v, dict):
             pairs.append((str(k), 1.0))
@@ -9051,6 +9075,7 @@ def attach_holm(comparisons, *, alpha=0.05, family='reported comparisons', explo
         if math.isfinite(p) and 0.0 <= p <= 1.0:
             pairs.append((str(k), p))
             tested += 1
+            _tested_vals.append(v)
         else:
             pairs.append((str(k), 1.0))
     h = holm_adjust(pairs, alpha=alpha) if pairs else {}
@@ -9064,7 +9089,11 @@ def attach_holm(comparisons, *, alpha=0.05, family='reported comparisons', explo
     # instead of leaving the reader to infer that the effect is null.
     _ns = []
     _ns_floor = []
-    for v in comparisons.values():
+    # Only comparisons that actually carry a testable p can reject.  An
+    # omitted/invalid row keeps its p=1 family slot (m) but must not lend the
+    # family a large-n floor it can never use; doing so would hide a real
+    # resolution ceiling on the tested rows.
+    for v in _tested_vals:
         if not isinstance(v, dict):
             continue
         # A boolean/fractional n is not a seed count; int(True)=1 or
@@ -10778,11 +10807,22 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
     mu_re = float((ws * y).sum() / sws)
     se_re = float(math.sqrt(1.0 / sws))
     tc = _t_critical(1.0 - float(alpha), max(1, df))
+    # A random-effects prediction interval for k studies is a t interval with
+    # k-2 degrees of freedom (the residual df after estimating the mean and
+    # tau^2), not the k-1 used for the pooled-mean CI.  With k=2 there is no
+    # residual df, so the interval is withheld rather than reported too
+    # narrowly.
+    _pi_df = len(usable) - 2
+    _tc_pi = _t_critical(1.0 - float(alpha), _pi_df) if _pi_df >= 1 else float('nan')
+    _pi = ([mu_re - _tc_pi * math.sqrt(tau2 + se_re ** 2),
+            mu_re + _tc_pi * math.sqrt(tau2 + se_re ** 2)]
+           if math.isfinite(_tc_pi) else None)
     out.update({'fixed_effect': {'mean': mu_fe, 'se': float(math.sqrt(1.0 / sw)), 'ci': [mu_fe - _t_critical(1.0 - float(alpha), max(1, df)) * math.sqrt(1.0 / sw), mu_fe + _t_critical(1.0 - float(alpha), max(1, df)) * math.sqrt(1.0 / sw)]},
                 'random_effects': {'mean': mu_re, 'se': se_re, 'ci': [mu_re - tc * se_re, mu_re + tc * se_re]},
                 'heterogeneity': {'Q': q, 'df': int(df), 'p': p_q, 'I2_percent': i2, 'tau2': tau2,
                                   'method': 'Cochran Q + DerSimonian-Laird tau^2'},
-                'prediction_interval': [mu_re - tc * math.sqrt(tau2 + se_re ** 2), mu_re + tc * math.sqrt(tau2 + se_re ** 2)],
+                'prediction_interval': _pi,
+                'prediction_interval_df': (int(_pi_df) if math.isfinite(_tc_pi) else None),
                 'poolable': bool(len(usable) >= 3 and df > 0 and i2 <= 50.0 and (not math.isfinite(p_q) or p_q >= alpha)),
                 'note': 'poolable requires >=3 scales, I2<=50% and a non-significant Q; otherwise report per-scale effects only'})
     out['status'] = 'ok'
@@ -13705,7 +13745,14 @@ def _classify_group_status(entries, *, min_n, alpha, m_family, require_param_mat
     if not noise_free:
         return 'noise_level'
     for e in noise_free:
-        fl = holm_min_attainable_p(e.get('n') or 0, m_family, alpha)
+        # The exact sign-flip test drops zero deltas, so its attainable floor is
+        # set by the nonzero pair count.  Using the declared n here would claim
+        # a finer p grid than the test actually has and hide a resolution
+        # ceiling behind 'noise_level'.
+        _n_eff = e.get('n_nonzero')
+        if _n_eff is None:
+            _n_eff = e.get('n')
+        fl = holm_min_attainable_p(_n_eff or 0, m_family, alpha)
         if math.isfinite(fl) and fl > alpha:
             return 'resolution_limited'
     return 'noise_level'
@@ -14798,7 +14845,13 @@ def dataloader_generator(seed):
     ``worker_init_fn=L.seed_worker`` so worker RNGs are derived from the same
     seed instead of the OS entropy pool."""
     g = torch.Generator()
-    g.manual_seed(int(seed))
+    # Match set_seed's torch-domain folding: a planned exact integer seed can
+    # exceed the signed/unsigned 64-bit range, and manual_seed would raise
+    # instead of deriving the same in-range stream.
+    _s = int(seed)
+    if not (-(2 ** 63) <= _s < 2 ** 64):
+        _s %= 2 ** 64
+    g.manual_seed(_s)
     return g
 
 def seed_worker(worker_id):
@@ -17778,7 +17831,9 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
                     ppl_hist.append([step + 1, sub_ppl])
                     _ci = _nll_doc_ci(_sub_stats.get('nll_per_row'), _sub_stats.get('n_tokens_per_row'))
                 else:
-                    sub_ppl = float('nan')
+                    # No validation batch was supplied: the point is
+                    # UNMEASURED (None), not a measured non-finite value.
+                    sub_ppl = None
                     _ci = {'ppl': None, 'doc_ce_sem': None, 'ppl_ci95_low': None,
                            'ppl_ci95_high': None, 'n_docs': 0}
                 _train_ce = None
@@ -17793,10 +17848,13 @@ def train_variant(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_laye
                 # latter as a non-finite curve point.
                 if _is_finite_number(_train_ce):
                     _last_train_ce = _train_ce
-                _val_ce = math.log(sub_ppl) if (_is_finite_number(sub_ppl) and sub_ppl > 0) else float('nan')
+                _val_ce = (math.log(sub_ppl) if (_is_finite_number(sub_ppl) and sub_ppl > 0)
+                           else (None if sub_ppl is None else float('nan')))
                 _entry = {'step': step + 1, 'val_ppl': sub_ppl, 'val_ce': _val_ce,
                           'train_ce': _train_ce,
-                          'gap': (_val_ce - _train_ce) if (math.isfinite(_val_ce) and _is_finite_number(_train_ce)) else None,
+                          'gap': ((_val_ce - _train_ce)
+                                  if (_val_ce is not None and math.isfinite(_val_ce)
+                                      and _is_finite_number(_train_ce)) else None),
                           'val_ci95_low': _ci.get('ppl_ci95_low'),
                           'val_ci95_high': _ci.get('ppl_ci95_high'),
                           'val_doc_ce_sem': _ci.get('doc_ce_sem'),
@@ -19814,7 +19872,7 @@ def _combined_seed_doc_ci(recs, *, n_boot=2000, seed=20261018, conf=0.95):
         out['status'] = 'ci_unavailable'
     return out
 
-def aggregate(summary):
+def aggregate(summary, *, outdir=None):
     if not isinstance(summary, dict):
         raise ValueError(
             f'aggregate() needs a summary object (variant/cell -> record), got '
@@ -20039,7 +20097,26 @@ def aggregate(summary):
             entry['boundary_f1_dyn_std'] = float(np.std(bf1, ddof=1)) if len(bf1) > 1 else 0.0
         if bex:
             entry['boundary_excess_dyn'] = float(np.mean(bex))
-        hists = [r['ppl_history'] for r in recs if r.get('ppl_history')]
+        def _ppl_hist_of(_r):
+            _ph = _r.get('ppl_history')
+            if isinstance(_ph, list):
+                return _ph
+            # Long curves are moved to a per-cell sidecar.  When the caller
+            # supplies the panel directory, hydrate them back so a seed that
+            # crossed the inline threshold does not silently drop out of the
+            # seed-averaged curve.
+            _ref = _r.get('ppl_history_ref')
+            if outdir and isinstance(_ref, str) and _ref:
+                _data = _cell_curve_data(outdir, {'curve_ref': _ref})
+                _ph = _data.get('ppl_history')
+                if isinstance(_ph, list):
+                    return _ph
+            return None
+        hists = []
+        for _r in recs:
+            _h = _ppl_hist_of(_r)
+            if _h:
+                hists.append(_h)
         if hists:
             def _point(_pt):
                 try:
@@ -20513,6 +20590,20 @@ def _plan_run(cfg, summary_path, fp):
                 if _drop_is_stale:
                     stale_dropped.append(key)
             cells.append((v, seed))
+    planned = {f'{v}::seed{seed}' for v, seed in cells}
+    unplanned = sorted(k for k in summary if k not in planned)
+    if unplanned:
+        # A smaller/renamed plan must not keep aggregating records that are not
+        # in this panel's manifest (a shrunk seed list previously left the
+        # removed seed in the aggregate table).
+        print(f'[resume] dropping {len(unplanned)} record(s) outside the current plan: '
+              + ', '.join(unplanned[:8]) + (' …' if len(unplanned) > 8 else ''))
+
+        def _drop_unplanned(s):
+            for _k in unplanned:
+                s.pop(_k, None)
+            return s
+        locked_json_update(summary_path, _drop_unplanned)
     return cells, stale_dropped
 
 
@@ -21090,7 +21181,7 @@ def run(cfg=None, seeds=None, guard=None, label='', par=None):
 def _dump_aggregate(outdir, summary):
     agg = {}
     try:
-        agg = aggregate(summary)
+        agg = aggregate(summary, outdir=outdir)
     except Exception as e:
         print(f'[aggregate] aggregate({outdir}) failed: {type(e).__name__}: {e}')
         print('[aggregate] retrying with the unusable records (no measured `ppl`, `synthesized`, or an ambiguous same-seed duplicate) removed — the untouched records keep their exact values')
@@ -21111,7 +21202,7 @@ def _dump_aggregate(outdir, summary):
         if _dups:
             print(f'[aggregate] {len(_dups)} ambiguous record(s) dropped (first key wins): ' + ', '.join((f'kept {keep!r}, dropped {k!r}' for k, keep in _dups)))
         print(f'[aggregate] {len(summary) - len(clean)} record(s) dropped in total: ' + (', '.join(sorted(set(summary) - set(clean))) or '(none)'))
-        agg = aggregate(clean)
+        agg = aggregate(clean, outdir=outdir)
         atomic_write_json(os.path.join(outdir, 'summary.aggregatable.json'), clean)
         records_for_readers = clean
     else:

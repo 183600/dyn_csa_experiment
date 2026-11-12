@@ -6924,6 +6924,154 @@ def t_targeted_contract_edges():
         BR._LOADED.pop(_k2, None)
 
 
+def t_statistical_and_config_regressions():
+    # Config structural counts must be STORED as integers after validation;
+    # an integral float otherwise survives into torch.empty/nn.Linear and a
+    # float sliding_window builds a float index table.
+    _c = L.AttnCfg(kind='csa', c_index=8.0, sliding_window=4.0,
+                   c_kv=32.0, n_index_heads=2.0, block_size=4.0,
+                   target_block_tokens=16.0, overlap=8.0, index_topk=2.0)
+    for _name in ('c_index', 'sliding_window', 'c_kv', 'n_index_heads',
+                  'block_size', 'target_block_tokens', 'overlap', 'index_topk'):
+        assert isinstance(getattr(_c, _name), int), (_name, getattr(_c, _name))
+    _idx, _ = L._window_geometry(6, _c.sliding_window, torch.device('cpu'))
+    assert _idx.dtype in (torch.int32, torch.int64), _idx.dtype
+    try:
+        L.AttnCfg(kind='csa', c_index=6, n_index_heads=4)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('c_index not divisible by n_index_heads was accepted')
+
+    # An omitted/invalid comparison occupies a p=1 family slot but cannot set
+    # the family's attainable-p floor; only tested rows can reject.
+    _comps = {'tested': {'p': 0.2, 'n': 3, 'n_nonzero': 3},
+              'omitted': {'omitted': 'not run', 'n': 20, 'n_nonzero': 20}}
+    _fam = L.attach_holm(_comps)
+    assert abs(_fam['family_min_attainable_p_holm'] - 0.5) < 1e-12, _fam
+    assert _fam['family_resolution_limited'] is True, _fam
+
+    # The resolution classifier must use the exact test's effective count.
+    _e = {'controlled': True, 'n': 7, 'n_nonzero': 3,
+          'significant_global': False, 'within_seed_noise': False,
+          'param_controlled': True}
+    assert L._classify_group_status([_e], min_n=3, alpha=0.05,
+                                    m_family=1) == 'resolution_limited'
+
+    # Random-effects prediction interval uses k-2 residual df, not k-1.
+    _pts = [{'label': 'a', 'scale': 1, 'effects': [0.0, 0.1, 0.2, 0.3, 0.4]},
+            {'label': 'b', 'scale': 2, 'effects': [-0.5, -0.4, -0.3, -0.2, -0.1]},
+            {'label': 'c', 'scale': 4, 'effects': [0.8, 0.9, 1.0, 1.1, 1.2]}]
+    _m = L.meta_analyze_effects(_pts)
+    assert _m['prediction_interval_df'] == 1, _m
+    _sd = math.sqrt(_m['heterogeneity']['tau2'] + _m['random_effects']['se'] ** 2)
+    _mu = _m['random_effects']['mean']
+    _lo, _hi = _m['prediction_interval']
+    assert abs(_hi - _lo - 2 * L._t_critical(0.95, 1) * _sd) < 1e-12, _m
+
+    # A planned seed beyond torch's 64-bit domain must fold exactly like
+    # set_seed instead of raising in the DataLoader generator.
+    _s = 2 ** 64 + 7
+    L.set_seed(_s)
+    assert L.dataloader_generator(_s).initial_seed() == _s % (2 ** 64)
+
+    # A rejected near-duplicate is still "seen": a later document near the
+    # rejected copy (but not near the retained original) must be skipped.
+    _hashes = {'K': 0b000000, 'A': 0b000111, 'B': 0b111111}
+    _old_hash = L._doc_simhash
+    try:
+        L._doc_simhash = lambda text: _hashes[text]
+        _d = L._DocDeduplicator(near_threshold=3, bands=4)
+        assert _d.is_duplicate('K') == (False, None)
+        assert _d.is_duplicate('A') == (True, 'near')
+        assert _d.is_duplicate('B') == (True, 'near')
+    finally:
+        L._doc_simhash = _old_hash
+
+    # In-memory confirmation manifests must not iterate a string/bytes seed
+    # container into a different seed whitelist.
+    for _bad_seeds in ('01', b'12', 12, None):
+        try:
+            V12._manifest_seed_ids({'seeds': _bad_seeds})
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError(f'non-list frozen seeds accepted: {_bad_seeds!r}')
+    _m2 = {'arms': 'ab', 'seeds': [0], 'manifest_sha256': 'x',
+           'code_semantics_expected': L.CODE_SEMANTICS}
+    try:
+        V12._admit_confirmation_records({}, _m2)
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError('a string frozen-arm container was accepted')
+
+
+def t_audit_resume_and_curve_regressions():
+    # A hard audit failure is sticky even if a later panel only warns.
+    with tempfile.TemporaryDirectory() as bad, tempfile.TemporaryDirectory() as good:
+        with open(os.path.join(bad, 'summary.json'), 'w', encoding='utf-8') as f:
+            f.write('{bad json')
+        with open(os.path.join(good, 'summary.json'), 'w', encoding='utf-8') as f:
+            json.dump({'r': {'variant': 'a', 'seed': 0, 'ppl': 10.0,
+                             'task': 'classification', 'accuracy': 0.9}}, f)
+        out = A.audit_metrics(outdirs=[bad, good])
+        assert out['status'] == 'fail', out
+        assert out['problems'], out
+        out = A.audit_methodology(outdirs=[bad, good], write=False)
+        assert out['status'] == 'fail', out
+        assert out['problems'], out
+    with tempfile.TemporaryDirectory() as d:
+        # Non-numeric length cells are not measurements; they must fail closed.
+        p = os.path.join(d, 'bylen.json')
+        with open(p, 'w', encoding='utf-8') as f:
+            json.dump({'a::s0': {'by_len': {'4096': {
+                'n_tok': 'not-a-number', 'eval_span': 'garbage',
+                'n_seq': 1, 'truncated': False}}}}, f)
+        out = A.audit_length(p)
+        assert out['status'] == 'fail', out
+        assert any('not a numeric measurement' in x for x in out['problems']), out
+
+    # A planned panel shrinking its seed list drops records outside the plan
+    # instead of silently aggregating the removed seed.
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, 'summary.json')
+        with open(p, 'w', encoding='utf-8') as f:
+            json.dump({'a::seed0': {'variant': 'a', 'seed': 0, 'ppl': 10.0,
+                                    'run_cfg': 'OLD'},
+                       'a::seed1': {'variant': 'a', 'seed': 1, 'ppl': 11.0,
+                                    'run_cfg': 'OLD'}}, f)
+        cells, _ = L._plan_run({'seeds': [0], 'variants': ['a']}, p, 'NEW')
+        assert cells == [('a', 0)], cells
+        with open(p, encoding='utf-8') as f:
+            remaining = json.load(f)
+        assert 'a::seed1' not in remaining, remaining
+
+    # Long PPL histories moved to a sidecar still feed the seed-averaged curve.
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, 'curves'))
+        ref = 'curves/a-seed0.json'
+        with open(os.path.join(d, ref), 'w', encoding='utf-8') as f:
+            json.dump({'ppl_history': [[10, 12.0], [20, 11.0]]}, f)
+        rec = {'variant': 'a', 'seed': 0, 'ppl': 11.0, 'nll_sum': 11.0,
+               'n_tokens': 10, 'steps': 20, 'tokens_seen': 200,
+               'params': 10, 'ppl_history_ref': ref,
+               'ppl_history_n_points': 2}
+        agg = L.aggregate({'a::seed0': rec}, outdir=d)['a']
+        assert agg.get('ppl_curve') == [[10, 12.0], [20, 11.0]], agg
+
+    # An unavailable validation batch is an UNMEASURED point (None), not a
+    # measured non-finite one; the health classifier must not say 'nonfinite'.
+    _ids = np.random.default_rng(0).integers(0, 64, size=500).astype(np.int64)
+    _r = L.train_variant('full', _ids, None, 64, seed=0, d=32, n_layers=1,
+                         n_heads=4, d_head=8, seq_len=16, batch_size=2, steps=2,
+                         lr=1e-3, weight_decay=0.0, warmup=1, comp_lambda=0.0,
+                         eval_every=1, eval_subset=2, log_every=0, mlp_ratio=2,
+                         measure_eff=False, device=torch.device('cpu'))
+    assert _r['curve_health']['status'] != 'nonfinite', _r['curve_health']
+    assert _r['health_history'][0]['val_ppl'] is None, _r['health_history'][0]
+
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -6943,6 +7091,8 @@ def main():
     _check('A6b scaling_trend ragged seed panels', t_scaling_trend_ragged_pairs)
     _check('A6b2 scaling_trend primary direction + floors', t_scaling_trend_primary_direction_and_floor)
     _check('A6c meta-analysis input guards', t_scale_input_guards)
+    _check('A6d statistical/config/container regressions', t_statistical_and_config_regressions)
+    _check('A6e audit/resume/curve/training regressions', t_audit_resume_and_curve_regressions)
     _check('A5b exact sign-flip at scale (MITM)', t_exact_signflip_at_scale)
     _check('A5c deterministic saddlepoint sign-flip for n>40', t_signflip_saddlepoint_large_n)
     _check('A5d exact Wilcoxon DP beyond n=16', t_wilcoxon_exact_dp)

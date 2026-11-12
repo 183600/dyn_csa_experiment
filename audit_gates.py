@@ -1018,6 +1018,9 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                           'test document-id sidecar is missing')
                 else:
                     rec['test_document_isolation'] = 'not_verified (no test_doc_ids sidecar)'
+                    _warn(f'{cd}/{tag}: test cache has no test_doc_ids sidecar; '
+                          'test/train and test/validation group isolation '
+                          'cannot be verified')
             else:
                 rec['test_file'] = None
 
@@ -1200,7 +1203,6 @@ def audit_attribution(outdirs=None):
             for _lk, _lv in _layers.items():
                 if not isinstance(_lv, dict) or 'blocks' not in _lv:
                     continue
-                _found = True
                 for _src, _dst in (('blocks', 'blocks_mean'), ('len_mean', 'block_len_mean'), ('len_p95', 'block_len_p95')):
                     _x = _lv.get(_src)
                     if (isinstance(_x, (int, float))
@@ -1210,6 +1212,10 @@ def audit_attribution(outdirs=None):
                         except (TypeError, ValueError, OverflowError):
                             continue
                         if math.isfinite(_xf):
+                            # Numeric evidence only: merely containing a
+                            # `blocks` key (e.g. "junk") must not make an
+                            # absent block-stat measurement look collected.
+                            _found = True
                             ent[_dst].append(_xf)
             if _found or r.get('block_stats') or r.get('by_len_block_stats') or (isinstance(r.get('mech'), dict) and r['mech'].get('cuts')):
                 ent['with_block_stats'] += 1
@@ -1449,6 +1455,9 @@ def audit_length(bylen_path='results_lm_test/bylen.json'):
                 try:
                     _fval = float(_val)
                 except (TypeError, ValueError, OverflowError):
+                    problems.append(
+                        f'{key}: L{Ln} {_field} is not a numeric measurement '
+                        f'({_val!r}) — unverifiable')
                     continue
                 if not math.isfinite(_fval):
                     problems.append(f'{key}: L{Ln} {_field} is not finite ({_val!r}) — unverifiable')
@@ -1732,9 +1741,11 @@ def audit_metrics(outdirs=None):
             continue
         rep = L.metric_policy_audit(summ)
         out['panels'][d] = {'status': rep['status'], 'checks': rep['checks'], 'warnings': rep['warnings']}
-        if rep['warnings']:
+        if rep['warnings'] and out['status'] == 'ok':
+            # Severity is sticky: a hard failure from another panel must not
+            # be downgraded to warn just because this panel has warnings.
             out['status'] = 'warn'
-    if out['policy']['warnings']:
+    if out['policy']['warnings'] and out['status'] == 'ok':
         out['status'] = 'warn'
     if not out['panels'] and out['status'] == 'ok':
         out['status'] = 'not_verifiable_locally'
@@ -1824,8 +1835,13 @@ def audit_methodology(outdirs=None, design=None, alpha=0.05, min_n=3, write=True
     out = {'status': 'ok', 'alpha': alpha, 'min_n': min_n, 'panels': {}}
     for d in dirs:
         _dir = d if os.path.isabs(d) else os.path.join(REPO, d)
-        summ = _load(os.path.join(_dir, 'summary.json'))
+        _sp = os.path.join(_dir, 'summary.json')
+        summ = _load(_sp)
         if summ is None:
+            if os.path.exists(_sp):
+                out['status'] = 'fail'
+                out.setdefault('problems', []).append(
+                    f'{d}: summary.json exists but cannot be parsed — methodology cannot be audited')
             continue
         if not isinstance(summ, dict):
             out['status'] = 'fail'
@@ -1857,7 +1873,7 @@ def audit_methodology(outdirs=None, design=None, alpha=0.05, min_n=3, write=True
             'warnings': rep.get('warnings'),
         }
         out['panels'][d] = _panel
-        if _panel['arms_below_min_seeds'] or _panel['warnings']:
+        if (_panel['arms_below_min_seeds'] or _panel['warnings']) and out['status'] == 'ok':
             out['status'] = 'warn'
     if not out['panels'] and out['status'] == 'ok':
         out['status'] = 'not_verifiable_locally'

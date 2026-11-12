@@ -2405,8 +2405,13 @@ def _indexer_fwd_triton(qI, kI, w_idx, last_tok, topk, need_soft=True):
                                   K=k_out, BB=BB2, HAS_SOFT=bool(need_soft),
                                   num_warps=8 if BB2 >= 1024 else 4)
         else:
+            # idx_score writes its [R, tc, Bm] tile packed with row stride tc,
+            # not the full buffer stride T_c.  `scores[:, :tc]` would keep the
+            # T_c stride and read the wrong rows on a partial final chunk
+            # (R > 1); pass the same packed view the kernel wrote.
+            _scores_chunk = scores.reshape(-1)[:R * tc * Bm].view(R, tc, Bm)
             _i, _v, _s = _indexer_topk_chunked(
-                scores[:, :tc], last_tok, t0, T, Bm, k_out, bool(need_soft), qI.dtype)
+                _scores_chunk, last_tok, t0, T, Bm, k_out, bool(need_soft), qI.dtype)
             idx[:, t0:t0 + tc] = _i
             valid_i8[:, t0:t0 + tc] = _v.to(torch.int8)
             if soft is not None:

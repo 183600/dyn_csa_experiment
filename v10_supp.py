@@ -1402,7 +1402,7 @@ def v10_analysis(out='analysis_v10/stats.json'):
             # the grouping key carries the mode EXPLICITLY (probe_params' mode
             # field is normalised out by _fp_norm): uniform and natural cells
             # at the same rho must never merge into one pooled cell.
-            key = (r['variant'], r['arm'], r['eval_len'], r['rho'], _mode, json.dumps(_fp_norm(r.get('probe_params')), sort_keys=True), str(r.get('_code')), str(r.get('recipe')))
+            key = (r['variant'], r['arm'], r['eval_len'], r['rho'], _mode, json.dumps(_fp_norm(r.get('probe_params')), sort_keys=True), str(r.get('_code')), str(r.get('recipe')), str(r.get('val_fp')))
             grp = cells.setdefault(key, {})
             if r['seed'] in grp:
                 _dup_cells.append((k, key[:5], r['seed']))
@@ -1414,10 +1414,10 @@ def v10_analysis(out='analysis_v10/stats.json'):
         if _new_bad:
             print(f'[v10 stats] {len(_new_bad)} record(s) in {sp} lack `probe_params` and are dropped from every mean/paired statistic: ' + ', '.join((f'{k}({why})' for k, why in _new_bad[:4])))
         probe_cells = []
-        for (v, arm, Ln, rho, mode, _pp, _cd, _recipe), by_seed in sorted(cells.items(), key=lambda kv: kv[0]):
+        for (v, arm, Ln, rho, mode, _pp, _cd, _recipe, _vfp), by_seed in sorted(cells.items(), key=lambda kv: kv[0]):
             means = {s: r['ppl_mean'] for s, r in by_seed.items()}
             assert means, (v, arm, Ln, rho, mode)
-            probe_cells.append({'variant': v, 'arm': arm, 'eval_len': Ln, 'rho': rho, 'mode': mode, 'seeds': sorted(means), 'ppl_by_seed': means, 'probe_params': next(iter(by_seed.values())).get('probe_params'), '_code': _cd, 'recipe': _recipe, 'mean': float(np.mean(list(means.values()))), 'n': len(means)})
+            probe_cells.append({'variant': v, 'arm': arm, 'eval_len': Ln, 'rho': rho, 'mode': mode, 'seeds': sorted(means), 'ppl_by_seed': means, 'probe_params': next(iter(by_seed.values())).get('probe_params'), '_code': _cd, 'recipe': _recipe, 'val_fp': _vfp, 'mean': float(np.mean(list(means.values()))), 'n': len(means)})
         contrasts = {}
 
         # The grouped lists are exactly what a scan of probe_cells would have
@@ -1435,6 +1435,9 @@ def v10_analysis(out='analysis_v10/stats.json'):
             return hits[0] if hits else {}
 
         def _pairable(a, b, Ln, rho, tag, mode='uniform'):
+            if str(a.get('val_fp')) != str(b.get('val_fp')):
+                print(f'[v10 stats] L{Ln} r{rho} {mode} {tag}: the two arms were scored on DIFFERENT validation slices (val_fp {str(a.get("val_fp"))[:12]}… vs {str(b.get("val_fp"))[:12]}…) — pairing them would difference two different measurements, so the contrast is omitted')
+                return False
             if _fp_norm(a.get('probe_params')) != _fp_norm(b.get('probe_params')):
                 print(f'[v10 stats] L{Ln} r{rho} {mode} {tag}: the two arms were probed under DIFFERENT probe_params — pairing them would difference two different measurements, so the contrast is omitted')
                 return False
@@ -1454,27 +1457,30 @@ def v10_analysis(out='analysis_v10/stats.json'):
                 contrasts[name] = V.exact_sign_permutation(dl)
                 contrasts[name]['seeds'] = common
         # ---- uniform-mode contrasts (names unchanged for report compat) ----
+        _declared_contrasts = []
         for Ln in PROBE['eval_lens']:
             for rho in PROBE['rhos']:
                 learned = cell_mean('csa_fixed_rope', 'learned', Ln, rho, 'uniform')
                 for arm, tag in (('dense', 'full_rope(dense)'), ('randidx', 'csa+randidx'), ('allblocks', 'csa+allblocks')):
+                    _cname = f'L{Ln} r{rho}: {tag} - csa+learned'
+                    _declared_contrasts.append(_cname)
                     other = cell_mean('full_rope', 'dense', Ln, rho, 'uniform') if arm == 'dense' else cell_mean('csa_fixed_rope', arm, Ln, rho, 'uniform')
                     if not learned or not other:
                         continue
                     if not _pairable(learned, other, Ln, rho, tag):
                         continue
-                    _add_contrast(f'L{Ln} r{rho}: {tag} - csa+learned', learned, other)
+                    _add_contrast(_cname, learned, other)
         # ---- from-scratch selector controls ----
         for Ln in PROBE['eval_lens']:
             for rho in PROBE['rhos']:
                 learned = cell_mean('csa_fixed_rope', 'learned', Ln, rho, 'uniform')
-                if not learned:
-                    continue
                 for tag, ov, oarm in (('csa_randtrain', 'csa_fixed_rope_randidx', 'learned'), ('csa_alltrain', 'csa_fixed_rope_allblocks', 'learned')):
+                    _cname = f'L{Ln} r{rho}: {tag} - csa+learned'
+                    _declared_contrasts.append(_cname)
                     other = cell_mean(ov, oarm, Ln, rho, 'uniform')
-                    if not other or not _pairable(learned, other, Ln, rho, tag):
+                    if not learned or not other or not _pairable(learned, other, Ln, rho, tag):
                         continue
-                    _add_contrast(f'L{Ln} r{rho}: {tag} - csa+learned', learned, other)
+                    _add_contrast(_cname, learned, other)
                 # intervention-vs-retrain gap (NOT a causal
                 # mismatch decomposition): test-time intervention minus the
                 # trained-with-that-selection control at the same (L, rho).
@@ -1485,17 +1491,21 @@ def v10_analysis(out='analysis_v10/stats.json'):
                 # a raw difference, never as 'the part that cannot be
                 # attributed to mismatch'.
                 for tag, tt_arm, sv in (('retrain-gap(random): csa+randidx - csa_randtrain', 'randidx', 'csa_fixed_rope_randidx'), ('retrain-gap(allblocks): csa+allblocks - csa_alltrain', 'allblocks', 'csa_fixed_rope_allblocks')):
+                    _cname = f'L{Ln} r{rho}: {tag}'
+                    _declared_contrasts.append(_cname)
                     tt = cell_mean('csa_fixed_rope', tt_arm, Ln, rho, 'uniform')
                     sc = cell_mean(sv, 'learned', Ln, rho, 'uniform')
                     if not tt or not sc or not _pairable(tt, sc, Ln, rho, tag):
                         continue
-                    _add_contrast(f'L{Ln} r{rho}: {tag}', sc, tt)
+                    _add_contrast(_cname, sc, tt)
                 # architecture-aligned dense: full_rope minus
                 # the all-blocks CSA twin (same projections/norm/RoPE/sink)
                 dense = cell_mean('full_rope', 'dense', Ln, rho, 'uniform')
                 allt = cell_mean('csa_fixed_rope_allblocks', 'learned', Ln, rho, 'uniform')
+                _cname = f'L{Ln} r{rho}: arch-aligned: full_rope - csa_alltrain'
+                _declared_contrasts.append(_cname)
                 if dense and allt and _pairable(dense, allt, Ln, rho, 'arch-aligned'):
-                    _add_contrast(f'L{Ln} r{rho}: arch-aligned: full_rope - csa_alltrain', allt, dense)
+                    _add_contrast(_cname, allt, dense)
         # ---- delta-NLL on the corruption modes ----
         delta_nll = {}
         _dn_id = {}
@@ -1530,7 +1540,7 @@ def v10_analysis(out='analysis_v10/stats.json'):
             v = math.fsum(ns) / tot
             return v if math.isfinite(v) else float('nan')
 
-        for (v, arm, Ln, rho, mode, _pp, _cd, _recipe), by_seed in sorted(cells.items()):
+        for (v, arm, Ln, rho, mode, _pp, _cd, _recipe, _vfp), by_seed in sorted(cells.items()):
             if _cd != L.code_stamp():
                 # Stale probe semantics cannot enter the delta-NLL family either
                 # (the uniform contrasts already enforce this in _pairable).
@@ -1552,7 +1562,7 @@ def v10_analysis(out='analysis_v10/stats.json'):
                     _pp_obj = None
                 if isinstance(_pp_obj, dict):
                     _pp_clean = json.dumps(_clean_probe_params(_pp_obj), sort_keys=True)
-            clean_key = (v, arm, Ln, 0.0, 'uniform', _pp_clean, _cd, _recipe)
+            clean_key = (v, arm, Ln, 0.0, 'uniform', _pp_clean, _cd, _recipe, _vfp)
             clean_grp = cells.get(clean_key) or {}
             if not clean_grp:
                 continue
@@ -1569,7 +1579,7 @@ def v10_analysis(out='analysis_v10/stats.json'):
                 _dl = list(means.values())
                 entry = {'variant': v, 'arm': arm, 'eval_len': Ln, 'rho': rho, 'mode': mode, 'n': len(_dl), 'mean': float(np.mean(_dl)), 'std': float(np.std(_dl, ddof=1)) if len(_dl) > 1 else 0.0, 'per_seed': means, 'clean_nll_by_seed': {s: _nll_tok(r) for s, r in clean_grp.items() if math.isfinite(_nll_tok(r))}, 'note': 'delta = NLL_corrupted - NLL_clean, nats per target token'}
                 _dnk = f'{v}::{arm}::L{Ln}::{mode}::r{rho}'
-                _dnident = (v, arm, Ln, rho, mode, _pp, _cd, _recipe)
+                _dnident = (v, arm, Ln, rho, mode, _pp, _cd, _recipe, _vfp)
                 if _dnk in _dn_ambiguous:
                     continue
                 if _dnk in delta_nll:
@@ -1592,6 +1602,8 @@ def v10_analysis(out='analysis_v10/stats.json'):
                     _lk = f'csa_fixed_rope::learned::L{Ln}::{mode}::r{rho}'
                     learned = delta_nll.get(_lk)
                     for arm, tag in (('dense', 'full_rope::dense'), ('randidx', 'csa_fixed_rope::randidx'), ('allblocks', 'csa_fixed_rope::allblocks')):
+                        _cname = f'ΔNLL L{Ln} {mode} r{rho}: {arm} - csa+learned'
+                        _declared_contrasts.append(_cname)
                         _ok = f'{tag}::L{Ln}::{mode}::r{rho}'
                         other = delta_nll.get(_ok)
                         if not learned or not other:
@@ -1599,7 +1611,7 @@ def v10_analysis(out='analysis_v10/stats.json'):
                         # Both sides must describe the SAME measurement
                         # geometry/recipe/code; the display key alone omits
                         # those identities.
-                        if _dn_id.get(_lk, (None,) * 8)[2:] != _dn_id.get(_ok, (None,) * 8)[2:]:
+                        if _dn_id.get(_lk, (None,) * 9)[2:] != _dn_id.get(_ok, (None,) * 9)[2:]:
                             print(f'[v10 stats] ΔNLL L{Ln} {mode} r{rho}: {arm} and learned were measured under different probe_params/code/recipe — contrast omitted')
                             continue
                         common = sorted(set(learned['per_seed']) & set(other['per_seed']))
@@ -1607,12 +1619,14 @@ def v10_analysis(out='analysis_v10/stats.json'):
                             dl = [other['per_seed'][s] - learned['per_seed'][s] for s in common]
                             res = V.exact_sign_permutation(dl)
                             res['seeds'] = common
-                            contrasts[f'ΔNLL L{Ln} {mode} r{rho}: {arm} - csa+learned'] = res
+                            contrasts[_cname] = res
         # ---- Holm correction over the whole contrast family ----
         holm = {}
         # Declared-but-unmeasurable contrasts keep a p=1 family slot; filtering
         # them out shrinks m and makes the surviving p_holm too small.
-        _fam = [(k, v.get('p_exact_signflip')) for k, v in contrasts.items()]
+        _fam_names = list(dict.fromkeys(_declared_contrasts + list(contrasts)))
+        _fam = [(k, (contrasts.get(k) or {}).get('p_exact_signflip') if k in contrasts else None)
+                for k in _fam_names]
         if _fam:
             holm = L.holm_adjust(_fam)
             for _k, _v in contrasts.items():
@@ -1655,16 +1669,16 @@ def v10_analysis(out='analysis_v10/stats.json'):
                 _r = dict(r, seed=_seed,
                           acc=(_acc if _acc is not None else float('nan')),
                           nll=(_nll if _nll is not None else float('nan')))
-                nkey = (_r['variant'], _r['arm'], _r['eval_len'], _r['condition'], json.dumps(_fp_norm(_r.get('probe_params')), sort_keys=True), str(_r.get('_code')), str(_r.get('recipe')))
+                nkey = (_r['variant'], _r['arm'], _r['eval_len'], _r['condition'], json.dumps(_fp_norm(_r.get('probe_params')), sort_keys=True), str(_r.get('_code')), str(_r.get('recipe')), str(_r.get('val_fp')))
                 grp = ncells.setdefault(nkey, {})
                 if _seed in grp:
                     continue
                 grp[_seed] = _r
             niah_cells = []
-            for (v, arm, Ln, cond, _pp, _cd, _recipe), by_seed in sorted(ncells.items(), key=lambda kv: kv[0]):
+            for (v, arm, Ln, cond, _pp, _cd, _recipe, _vfp), by_seed in sorted(ncells.items(), key=lambda kv: kv[0]):
                 accs = {s: r['acc'] for s, r in by_seed.items()}
                 nlls = {s: r['nll'] for s, r in by_seed.items()}
-                niah_cells.append({'variant': v, 'arm': arm, 'eval_len': Ln, 'condition': cond, 'seeds': sorted(accs), 'acc_by_seed': accs, 'nll_by_seed': nlls, 'acc_mean': float(np.mean(list(accs.values()))), 'nll_mean': float(np.mean(list(nlls.values()))), 'n': len(accs), 'n_pairs': next(iter(by_seed.values())).get('n_pairs'), 'dist_mean': next(iter(by_seed.values())).get('dist_mean'), '_pp': _pp, '_code': _cd, '_recipe': _recipe})
+                niah_cells.append({'variant': v, 'arm': arm, 'eval_len': Ln, 'condition': cond, 'seeds': sorted(accs), 'acc_by_seed': accs, 'nll_by_seed': nlls, 'acc_mean': float(np.mean(list(accs.values()))), 'nll_mean': float(np.mean(list(nlls.values()))), 'n': len(accs), 'n_pairs': next(iter(by_seed.values())).get('n_pairs'), 'dist_mean': next(iter(by_seed.values())).get('dist_mean'), '_pp': _pp, '_code': _cd, '_recipe': _recipe, 'val_fp': _vfp})
             niah_contrasts = {}
             _nidx = {}
             for c in niah_cells:
@@ -1673,12 +1687,18 @@ def v10_analysis(out='analysis_v10/stats.json'):
             def _ncell(v, arm, Ln, cond):
                 hits = _nidx.get((v, arm, Ln, cond), [])
                 return hits[0] if len(hits) == 1 else {}
+            _niah_declared = []
             for Ln in PROBE['eval_lens']:
                 for cond in (PROBE.get('niah') or {}).get('conditions', ['clean', 'distract']):
                     learned = _ncell('csa_fixed_rope', 'learned', Ln, cond)
                     for arm, tag in (('dense', 'full_rope'), ('randidx', 'csa_fixed_rope'), ('allblocks', 'csa_fixed_rope')):
+                        _cname = f'NIAH-nat L{Ln} {cond}: {arm} - learned (answer NLL)'
+                        _niah_declared.append(_cname)
                         other = _ncell('full_rope', 'dense', Ln, cond) if arm == 'dense' else _ncell(tag, arm, Ln, cond)
                         if not learned or not other:
+                            continue
+                        if str(learned.get('val_fp')) != str(other.get('val_fp')):
+                            print(f'[v10 stats] NIAH-nat L{Ln} {cond}: {arm} and learned were scored on DIFFERENT validation slices — contrast omitted')
                             continue
                         if (learned.get('_pp'), learned.get('_code'), learned.get('_recipe')) != (other.get('_pp'), other.get('_code'), other.get('_recipe')):
                             print(f'[v10 stats] NIAH-nat L{Ln} {cond}: {arm} and learned were measured under different probe_params/code/recipe — contrast omitted')
@@ -1687,10 +1707,15 @@ def v10_analysis(out='analysis_v10/stats.json'):
                         if len(common) >= 2:
                             res = V.exact_sign_permutation([other['nll_by_seed'][s] - learned['nll_by_seed'][s] for s in common])
                             res['seeds'] = common
-                            niah_contrasts[f'NIAH-nat L{Ln} {cond}: {arm} - learned (answer NLL)'] = res
+                            niah_contrasts[_cname] = res
                     for tag, ov in (('csa_randtrain', 'csa_fixed_rope_randidx'), ('csa_alltrain', 'csa_fixed_rope_allblocks')):
+                        _cname = f'NIAH-nat L{Ln} {cond}: {tag} - learned (answer NLL)'
+                        _niah_declared.append(_cname)
                         other = _ncell(ov, 'learned', Ln, cond)
                         if not learned or not other:
+                            continue
+                        if str(learned.get('val_fp')) != str(other.get('val_fp')):
+                            print(f'[v10 stats] NIAH-nat L{Ln} {cond}: {tag} and learned were scored on DIFFERENT validation slices — contrast omitted')
                             continue
                         if (learned.get('_pp'), learned.get('_code'), learned.get('_recipe')) != (other.get('_pp'), other.get('_code'), other.get('_recipe')):
                             print(f'[v10 stats] NIAH-nat L{Ln} {cond}: {tag} and learned were measured under different probe_params/code/recipe — contrast omitted')
@@ -1699,7 +1724,7 @@ def v10_analysis(out='analysis_v10/stats.json'):
                         if len(common) >= 2:
                             res = V.exact_sign_permutation([other['nll_by_seed'][s] - learned['nll_by_seed'][s] for s in common])
                             res['seeds'] = common
-                            niah_contrasts[f'NIAH-nat L{Ln} {cond}: {tag} - learned (answer NLL)'] = res
+                            niah_contrasts[_cname] = res
             probe['niah_natural'] = {'cells': niah_cells, 'contrasts': niah_contrasts}
             # NIAH contrasts are built AFTER the corruption family was
             # corrected.  Leaving them out of the Holm family would report
@@ -1707,8 +1732,11 @@ def v10_analysis(out='analysis_v10/stats.json'):
             # correction over the union and overwrite both.
             _comb = dict(contrasts)
             _comb.update(niah_contrasts)
-            if _comb:
-                _h2 = L.holm_adjust([(k, v.get('p_exact_signflip')) for k, v in _comb.items()])
+            _comb_names = list(dict.fromkeys(_fam_names + _niah_declared + list(_comb)))
+            if _comb_names:
+                _h2 = L.holm_adjust([
+                    (k, (_comb.get(k) or {}).get('p_exact_signflip') if k in _comb else None)
+                    for k in _comb_names])
                 for _k, _v in _comb.items():
                     if isinstance(_v, dict):
                         _e2 = _h2.get(_k)
@@ -2074,7 +2102,7 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
     A('')
     A('| 规模 | 面板 | seeds | 交叉步（seed 均值轨迹） | 交叉 token | 状态 |')
     A('|---|---|---|---|---|---|')
-    _recon = {k for k, v in xo.items() if v.get('status') == 'ok' and any((v.get('per_seed_synth', {}).get(str(s)) for s in v.get('seeds', [])))}
+    _recon = {k for k, v in xo.items() if v.get('status') == 'ok' and (v.get('excluded_reconstructed') or any((v.get('per_seed_synth', {}).get(str(s)) for s in v.get('seeds', []))))}
     for label, v in xo.items():
         if v.get('status') != 'ok':
             A(f'| {label} | `{v['outdir']}` | — | — | — | 数据缺失 |')
@@ -2108,7 +2136,7 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
     _xo256 = xo.get('d256_L6') or next((v for v in xo.values() if v.get('d') == 256), {})
     _xo256_step = _xo256.get('mean_crossover_step')
     _xo256_txt = f'~{_xo256_step:g} 步' if isinstance(_xo256_step, (int, float)) and math.isfinite(_xo256_step) else '步数未知（该规模无有效交叉读数）'
-    _xo256_recon = any(((_xo256.get('per_seed_synth') or {}).get(str(s)) for s in _xo256.get('seeds', [])))
+    _xo256_recon = bool(_xo256.get('excluded_reconstructed')) or any(((_xo256.get('per_seed_synth') or {}).get(str(s)) for s in _xo256.get('seeds', [])))
     if _xo256_recon:
         A(f'**注意**：d=256 的轨迹取自 `results_lm_v3_long/summary.json`，其中部分记录是从旧聚合表重构的副本（`synthesized`），逐种子轨迹不可独立恢复——该规模的逐种子交叉步互为副本，只有 seed 均值轨迹的交叉步（{_xo256_txt}，eval 网格 1000 步）是有效读数。')
     elif _xo256.get('status') == 'ok':

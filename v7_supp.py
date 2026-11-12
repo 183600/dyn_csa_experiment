@@ -2680,8 +2680,30 @@ def run_lenphase_cell(payload, v, seed, guard=None, prebook=False, val_ids=None)
     key = f'{v}::seed{seed}'
     _cur = L.locked_json_read(spath).get(key)
     _need_lens = list(eval_lens)
+
+    def _len_cell_complete(_rec, _ln):
+        # A usable PPL alone is not a complete length measurement: the report
+        # also needs the truncation flag and, for a full-length cell, the exact
+        # requested span.  Re-evaluate a cell that lacks that metadata instead
+        # of leaving a permanently unverifiable column.
+        _cells = L.by_len_cells([_rec], _ln)
+        if not _cells:
+            return False
+        _c = _cells[0]
+        _tr = _c.get('truncated')
+        if not isinstance(_tr, (bool, np.bool_)):
+            return False
+        _es = L._as_seed_int(_c.get('eval_span'))
+        if _es is None:
+            return False
+        if not _tr and _es != int(_ln):
+            return False
+        if _tr and _es < 2:
+            return False
+        return True
+
     if L.result_is_current(_cur, CKPT_CODE, 'by_len') and _cur.get('recipe') == _recipe:
-        _need_lens = [Ln for Ln in eval_lens if not L.by_len_cells([_cur], Ln)]
+        _need_lens = [Ln for Ln in eval_lens if not _len_cell_complete(_cur, Ln)]
         if not _need_lens:
             return out
         print(f'[resume] {key}: by_len record is stamped current but at least one eval length holds no usable measurement (error cell) — re-evaluating the missing lengths')

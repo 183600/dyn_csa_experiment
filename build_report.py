@@ -66,11 +66,31 @@ def agg(outdir):
         _LOADED[key] = _object_or_refuse(load(_path, {}), _path, 'report aggregate')
     return _LOADED[key]
 
+def _hydrate_curve_sidecars(outdir, obj):
+    # Long per-cell curves live in a sidecar referenced by `ppl_history_ref`;
+    # hydrate them so report sections that read `ppl_history` do not silently
+    # lose the cells that crossed the inline threshold.
+    for _r in obj.values():
+        if not isinstance(_r, dict) or isinstance(_r.get('ppl_history'), list):
+            continue
+        _ref = _r.get('ppl_history_ref')
+        if not isinstance(_ref, str) or not _ref or '#' in _ref:
+            continue
+        try:
+            with open(os.path.join(REPO, outdir, _ref), encoding='utf-8') as _f:
+                _data = json.load(_f)
+        except Exception:
+            continue
+        if isinstance(_data, dict) and isinstance(_data.get('ppl_history'), list):
+            _r['ppl_history'] = _data['ppl_history']
+    return obj
+
 def summary(outdir):
     key = ('summary', outdir)
     if key not in _LOADED:
         _path = os.path.join(REPO, outdir, 'summary.json')
-        _LOADED[key] = _object_or_refuse(load(_path, {}), _path, 'report')
+        _LOADED[key] = _hydrate_curve_sidecars(
+            outdir, _object_or_refuse(load(_path, {}), _path, 'report'))
     return _LOADED[key]
 
 def fm(x, nd=2):
@@ -666,7 +686,13 @@ def sec_p0r():
         if rope_unmatched and rope_is_defect and _has_mt:
             lines += [f'> **本表的限制（务必先读）**：RoPE 面板里**没有**参数对齐的 dense 基线——落盘记录显示 `full_rope` 的 MLP 停在标准宽度（{_params_m(_fu_r)}），而 `csa_fixed_rope` 保持全宽（{_params_m(_cf_r)}），{f'相差 {100 * _pgap_r:.1f}%' if _pgap_r is not None else '参数差未知'}。对照 absPE 面板，同样的容量差异会贡献约 {g_abs - g_abs_m:.1f} PPL。因此**上面 RoPE 的组间差距不能与 absPE 的组间差距直接相减**，「差距几乎不变」的读法在当前产物上不成立。需**重跑 P0R 面板**（得到参数对齐的 dense 臂）才能给出该结论；在那之前，**P0-3 的证伪只由 absPE 面板的参数对齐数字支持**。', '']
         _arms_gain = d_abs > 0 and d_sp > 0
-        _gain_txt = 'RoPE+QK-norm 对两臂都有真实增益，值得保留为新默认' if _arms_gain else f'RoPE+QK-norm 并未对两臂都带来增益（dense {_d_abs_t}、sparse {_d_sp_t}）'
+        # These are cross-panel seed means, not paired contrasts.  A positive
+        # mean difference is a directional readout only; calling it a "real
+        # gain" (or a new default) needs a paired gate, which this block
+        # cannot compute across the two panels.
+        _gain_txt = ('RoPE+QK-norm 在两臂的跨面板均值上均更低（方向性读数：两面板未按 seed 配对，不能据此称为「真实增益」或新默认）'
+                     if _arms_gain else
+                     f'RoPE+QK-norm 并未对两臂都带来均值下降（dense {_d_abs_t}、sparse {_d_sp_t}）')
         _pair_mt = None
         if _has_mt:
             _ps_ab = per_seed_records('results_lm_v3_1500')
@@ -1555,7 +1581,14 @@ def sec_p2s():
                                      family='P2S', register=False)
                 concl = f'scale 面板上 {_which} 的配对差为 **{st['mean']:+.2f} PPL**（n={len(common)}，p={st['p_exact_signflip']:.3f}）：' + ('该差距通过 n≥6 + Holm + 效应>噪声门槛，方向为 sparse 更差。' if _gate_ok else '该差距**未通过** n≥6 + Holm + 效应>噪声门槛，只能作方向性读数，不能写成「已经反转」。') + '该面板同时改变宽度、层数、序列长度与训练量，**不能把差异单独归因于「dense 的容量红利」**；需要参数/计算/训练量匹配的规模臂才能做机制归因。' + (f'{_tag}' if _tag else '✓')
             else:
-                concl = f'scale 面板上 {_which} 的配对差为 **{st['mean']:+.2f} PPL**（n={len(common)}，p={st['p_exact_signflip']:.3f}）：该规模下 sparse 仍领先，早期优势未随规模消失。{_tag or '✓'}'
+                _gate_ok = _sig_gate(st, label=f'P2S {_ba} - {_bb}',
+                                     family='P2S', register=False)
+                _lead = ('该规模下 sparse 仍领先，早期优势未随规模消失。' if _gate_ok
+                         else '该差距**未通过** n≥6 + Holm + 效应>噪声门槛，只能作方向性读数，不能写成「优势仍在」。')
+                concl = (f'scale 面板上 {_which} 的配对差为 **{st['mean']:+.2f} PPL**'
+                         f'（n={len(common)}，p={st['p_exact_signflip']:.3f}）：' + _lead
+                         + '该面板同时改变宽度、层数、序列长度与训练量，**不能把差异单独归因于「dense 的容量红利」**；需要参数/计算/训练量匹配的规模臂才能做机制归因。'
+                         + (f'{_tag}' if _tag else '✓'))
             lines += ['', f'**结论**：{concl}', '']
     return '\n'.join(lines) + '\n'
 

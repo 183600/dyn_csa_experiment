@@ -613,8 +613,21 @@ def main(argv=None):
     _n_pp = probe.get('n_ppl')
     _f1_d, _f1_p = (probe.get('d_f1'), probe.get('p_f1'))
     _ppl_d, _ppl_p = (probe.get('d_ppl'), probe.get('p_ppl'))
-    _f1_sig = _f1_p is not None and _f1_p <= 0.05
-    _ppl_sig = _ppl_p is not None and _ppl_p <= 0.05
+    # F1 and PPL are two displayed tests in one family.  Use the repo's
+    # reportable gate (exact-test resolution, Holm over the displayed family,
+    # and effect-vs-seed-noise) instead of calling any raw p<=0.05 result
+    # "significant".
+    _fuse_holm = L.holm_adjust([('f1', _f1_p), ('ppl', _ppl_p)])
+
+    def _fuse_gate(_key, _n, _mean, _std, _p):
+        _ph = (_fuse_holm.get(_key) or {}).get('p_holm')
+        return bool(L.reportable_claim(
+            {'n': _n, 'mean': _mean, 'std': _std,
+             'p_exact_signflip': _p, 'p_holm': _ph},
+            family_size=2, min_n=6, require_holm=True)['allowed'])
+
+    _f1_sig = _fuse_gate('f1', _n_p, _f1_d, probe.get('sd_f1'), _f1_p)
+    _ppl_sig = _fuse_gate('ppl', _n_pp, _ppl_d, probe.get('sd_ppl'), _ppl_p)
     _blk_stable = bool(_blk) and _blk_max <= 0.01
     if _f1_d is None:
         _c1 = f'1. **边界 F1 的同面板配对差未测量**（n={_n_p or 0} 的可用配对不足），本节不对 F1 方向作断言。\n'
