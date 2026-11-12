@@ -370,11 +370,11 @@ def _relaxed_pair_reason(a, b, tuned_arms):
         if _va is None or _vb is None:
             return f'unverifiable {k} (at least one record omits it)'
         if k in ('steps', 'tokens_seen'):
-            # Budgets are exact integer counts; raw equality would accept
-            # 1 vs True (and compare "1" against 1 as different).
+            # Step/token counts are exact integers; equality must compare
+            # exact integer values rather than raw representations.
             _ia, _ib = L._as_seed_int(_va), L._as_seed_int(_vb)
             if _ia is None or _ib is None:
-                return f'unverifiable {k} (not an exact integer training budget)'
+                return f'unverifiable {k} (not an exact integer training count)'
             if _ia != _ib:
                 return f'{k} differs ({_va!r} vs {_vb!r})'
         elif _va != _vb:

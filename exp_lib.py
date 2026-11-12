@@ -8723,15 +8723,14 @@ def pair_reason(ra, rb):
             return f'unverifiable {sorted(unknown)}'
         if absent:
             return f'unverifiable {sorted(absent)}'
-    # A training budget is an exact integer count.  Raw equality would accept
-    # steps=1 vs steps=True (1 == True) and fractional/fractional pairs as a
-    # controlled comparison, and would reject the same integer spelled "1".
+    # Step/token counts are exact integers, so equality compares exact integer
+    # values rather than raw representations.
     _disagree = []
     for k in PAIR_STEP_KEYS:
         _va = _as_seed_int(ra.get(k))
         _vb = _as_seed_int(rb.get(k))
         if _va is None or _vb is None:
-            return (f'unverifiable {k} (not an exact integer training budget: '
+            return (f'unverifiable {k} (not an exact integer training count: '
                     f'{ra.get(k)!r} vs {rb.get(k)!r})')
         if _va != _vb:
             _disagree.append(k)
@@ -19094,16 +19093,16 @@ def aggregate(summary):
     if _multi:
         print('[aggregate] WARNING: these variants hold MULTIPLE protocol groups and are reported per-group, NOT pooled across groups (pooling would fake extra seeds): ' + ', '.join((f'{v}->{t}' for v, t in sorted(_multi.items()))))
 
-    def _budget_id(rec, key):
+    def _count_id(rec, key):
         _v = _as_seed_int(rec.get(key))
         return _v if _v is not None else ('__invalid__', type(rec.get(key)).__name__, repr(rec.get(key)))
 
     def _cfg_fp(rec):
-        # int(1.9)==1 and int(True)==1 would merge two different parameter
-        # counts into one configuration group; use the exact-integer contract.
+        # The exact-integer contract keeps different parameter counts from
+        # being merged into one configuration group.
         _p = _as_seed_int(rec.get('params'))
         return json.dumps([rec.get('run_cfg'), _p,
-                           [_budget_id(rec, k) for k in PAIR_STEP_KEYS]],
+                           [_count_id(rec, k) for k in PAIR_STEP_KEYS]],
                           sort_keys=True, default=str)
 
     def _steps_ok(recs):
@@ -19329,8 +19328,8 @@ def aggregate(summary):
         # legitimately differs from the sparse arm in parameter count, so a
         # params-including fingerprint could never match it (dead branch).
         # run_cfg + steps/tokens is exactly the gate `pair_reason` applies,
-        # and the budget fields use the same exact-integer normalisation.
-        return json.dumps([rec.get('run_cfg'), [_budget_id(rec, k) for k in PAIR_STEP_KEYS]], sort_keys=True, default=str)
+        # and those counts use the same exact-integer normalisation.
+        return json.dumps([rec.get('run_cfg'), [_count_id(rec, k) for k in PAIR_STEP_KEYS]], sort_keys=True, default=str)
 
     def _baseline_for(tag, fp_idx, base_groups, recs):
         _want = _cfg_fp_noparam(recs[0]) if recs else None

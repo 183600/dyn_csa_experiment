@@ -538,7 +538,7 @@ def _pair_reason(ra, rb):
     for k in PAIR_STEP_KEYS:
         _va, _vb = _int_or(ra.get(k), None), _int_or(rb.get(k), None)
         if _va is None or _vb is None:
-            return (f'unverifiable {k} (not an exact integer training budget: '
+            return (f'unverifiable {k} (not an exact integer training count: '
                     f'{ra.get(k)!r} vs {rb.get(k)!r})')
         if _va != _vb:
             _disagree.append(k)
