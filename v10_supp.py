@@ -406,7 +406,7 @@ def _probe_params_current(rec, fp, mode='uniform'):
 
 def _probe_defs(cfg):
     """The (eval_len, rho, mode) grid of a probe config.  Absent 'modes' means
-    the legacy uniform-only protocol (cfg['rhos'])."""
+    the uniform-only protocol (cfg['rhos'])."""
     _modes = cfg.get('modes') or {'uniform': list(cfg['rhos'])}
     out = []
     for _mode, _rhos in _modes.items():
@@ -563,7 +563,7 @@ def run_probe_cell(cfg, v, seed, guard=None, val_ids=None, mech_summ=None):
     # only the shape/config: n_seq, target, vocab, val_seq_len).  Stored on the
     # record and checked forward-compatibly below: a stored record that carries
     # a val_fp differing from the current slice is stale and re-measured, while
-    # legacy records without the field keep their existing resume behaviour.
+    # records without the field keep their existing resume behaviour.
     # v12 reuses this cell with val_ids=test_ids, so the frozen test slice gets
     # the same per-record fingerprint.
     _val_fp = L._ids_fp(np.ascontiguousarray(val_ids).reshape(-1))
@@ -1220,7 +1220,7 @@ def _equal_token_slices():
     """The scale panels' endpoints confound model size with
     cumulative training tokens.  This analysis re-reads the SAME curves at
     matched token counts (and, when the matched arms exist, at matched total
-    compute), so a cross-scale endpoint difference can no longer be silently
+    compute), so a cross-scale endpoint difference cannot be silently
     attributed to scale alone."""
     conf = {}
     _panel_hists = {}
@@ -1398,7 +1398,7 @@ def v10_analysis(out='analysis_v10/stats.json'):
                 dl = [b['ppl_by_seed'][s] - a['ppl_by_seed'][s] for s in common]
                 contrasts[name] = V.exact_sign_permutation(dl)
                 contrasts[name]['seeds'] = common
-        # ---- legacy uniform-mode contrasts (names unchanged for report compat) ----
+        # ---- uniform-mode contrasts (names unchanged for report compat) ----
         for Ln in PROBE['eval_lens']:
             for rho in PROBE['rhos']:
                 learned = cell_mean('csa_fixed_rope', 'learned', Ln, rho, 'uniform')

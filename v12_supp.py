@@ -865,7 +865,7 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test', train_
     _want_train_fp = train_fp if train_fp is not None else _frozen_train_fp(manifest)
     # Manifests that DECLARE binding.training_data_fingerprint require the
     # binding unconditionally, even while canonical_train_fp is still null.
-    # Legacy manifests/records without either field stay admissible.
+    # Manifests/records without either field stay admissible.
     _require_train_fp = _train_fp_required(manifest) or bool(_want_train_fp) or bool(_ck_train_fp) or bool(_tr_train_fp)
     if _require_train_fp and (not isinstance(_tr_train_fp, str) or not _tr_train_fp):
         print(f'[p5t] REFUSE {v} s{seed}: training record has no train_fp — the weights cannot be attributed to a specific training corpus')
@@ -1200,7 +1200,7 @@ def _record_int(value):
     if not math.isfinite(f) or f != math.floor(f):
         return None
     if abs(f) >= 2 ** 53:
-        # Above 2**53 a float no longer represents every integer; the recorded
+        # Above 2**53 a float cannot represent every integer; the recorded
         # seed/count may silently denote a different value.
         return None
     return int(f)
@@ -1310,7 +1310,7 @@ def _admit_confirmation_records(raw, manifest):
     if len(train_fps) > 1:
         raise SystemExit(f'[p5t stats] REFUSE: admissible records were trained on {len(train_fps)} different corpora ({sorted(train_fps)}) — all frozen arms must share the canonical training split')
     if not _want_nseq and admitted:
-        # A legacy/descriptive manifest may omit the eval block, but if the
+        # A descriptive manifest may omit the eval block, but if the
         # records DO carry a row count it is still part of the estimand.  Do
         # not let a missing manifest field disable the check and pair two
         # different n_seq panels.

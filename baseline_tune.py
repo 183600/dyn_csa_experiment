@@ -68,7 +68,7 @@ def _mean_std(values):
 
 
 def _protocol_arm_groups(protocol, base, arms):
-    """Resolve the protocol's arm groups, falling back to one legacy group.
+    """Resolve the protocol's arm groups, falling back to one group.
 
     Groups exist because the v6 arms and the frozen v12 rope arms parameter-
     match against DIFFERENT reference arms (csa_dynamic vs csa_fixed_rope),
@@ -218,7 +218,7 @@ def run_tuning(base_cfg=None, outdir='results_baseline_tuning', protocol=None,
     # Tuning selection must not be decided by a single seed's validation
     # noise.  The same declared search-seed set is used for every arm and
     # every trial, and selection uses the mean validation PPL (with the
-    # across-seed std recorded).  Legacy protocols that only declare
+    # across-seed std recorded).  Protocols that only declare
     # `search_seed` keep the single-seed path.
     search_seeds, final_seeds_declared, overlap = _search_final_seeds(protocol)
     if final and final_seeds_declared and overlap:

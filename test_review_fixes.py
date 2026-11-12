@@ -1158,7 +1158,7 @@ def t_pair_reason_fingerprint_gate():
     c = dict(b)
     c.pop('val_fp')
     assert 'unverifiable val_fp' in L.pair_reason(base, c)
-    # Legacy records (both without fingerprints) keep the compatibility path.
+    # Records without fingerprints keep the compatibility path.
     leg = {k: v for k, v in base.items() if k not in ('data_fp', 'val_fp', 'eval_fp')}
     assert L.pair_reason(leg, dict(leg, variant='b')) is None
     # aggregate must refuse to pool one group across two evaluation slices.
@@ -1956,8 +1956,8 @@ def t_seed_axis_normalization():
             raise AssertionError(f'normalize_seed_list must reject {bad!r}')
     # Exact Python integers above 2**53 are preserved (only lossy floats fail).
     assert L.normalize_seed_list(['9007199254740993']) == [9007199254740993]
-    # ...and every preserved id must be usable by set_seed: NumPy's legacy
-    # RNG otherwise rejects negative or >=2**32 seeds and aborts the panel.
+    # ...and every preserved id must be usable by set_seed: NumPy's RNG
+    # otherwise rejects negative or >=2**32 seeds and aborts the panel.
     for huge in (-1, 2 ** 32, 9007199254740993, 10 ** 30):
         _before = (random.random(), float(np.random.random()), float(torch.rand(1).item()))
         L.set_seed(huge)
@@ -2395,8 +2395,8 @@ def t_experiment_ledger():
 
 def t_npy_serve_int32_rejects_invalid_and_out_of_range():
     # The int32 narrowing helper must never turn a corrupt cache into plausible
-    # token ids.  Its range/dtype guards used to be swallowed by the sidecar
-    # fallback, which silently truncated floats and wrapped out-of-int32 ids.
+    # token ids.  Its range/dtype guards stay ahead of the sidecar fallback,
+    # which must not truncate floats or wrap out-of-int32 ids.
     with tempfile.TemporaryDirectory() as d:
         ok = np.array([0, 1, 65535], dtype=np.int64)
         p_ok = os.path.join(d, 'ok.npy')
@@ -3088,7 +3088,7 @@ def t_tuning_selection_stability_audit():
     assert out2['tuning_verified'] is True, out2
     assert out2['selection_stable_all'] is False, out2
     assert any('not leave-one-search-seed-out stable' in w for w in out2['warnings']), out2
-    # Legacy rows without per-seed values can never report stability as a pass.
+    # Rows without per-seed values can never report stability as a pass.
     no_seed = L.tuning_selection_stability([{'config': {'lr': 1e-4}, 'ppl': 1.0}])
     assert no_seed['status'] == 'unavailable', no_seed
 
@@ -3315,7 +3315,7 @@ def t_audit_leakage_handles_flat_train_cache():
         # on overlap, so accept either non-ok status).
         assert out['status'] in ('warnings', 'fail'), out
         assert out['checks']['document_isolation']['status'] == 'not_verified', out
-        # A legacy/malformed meta without a numeric vocab must fail closed, not
+        # A malformed meta without a numeric vocab must fail closed, not
         # crash with int(None) before the audit can report anything.
         with open(os.path.join(cache, 'meta_v4_x.json'), 'w', encoding='utf-8') as f:
             json.dump({'src_fp': 'train'}, f)
@@ -3742,8 +3742,8 @@ def t_audit_split_sequence_overlap():
     import data_guard as DG
     assert DG._matrix_fingerprint(np.array([[2 ** 53]], dtype=np.int64)) != \
         DG._matrix_fingerprint(np.array([[2 ** 53 + 1]], dtype=np.int64))
-    # In-range integer tables keep their historical float64 fingerprint, which
-    # is exact below 2**53 and therefore stable across integer widths.
+    # In-range integer tables keep their float64 fingerprint, which is exact
+    # below 2**53 and therefore stable across integer widths.
     lo = np.array([[1, 2, 3]], dtype=np.int64)
     assert DG._matrix_fingerprint(lo) == DG._matrix_fingerprint(lo.astype(np.int32))
 
@@ -3989,7 +3989,7 @@ def t_group_split_refuses_empty_requested_side():
 def t_label_shift_and_split_counts():
     X = np.arange(12, dtype=float).reshape(6, 2)
     # Non-finite labels are counted per split; fail_on_nonfinite_labels turns
-    # a corrupted target into a hard failure (off by default for legacy use).
+    # a corrupted target into a hard failure (off by default for compatibility).
     y = [0, 0, 1, 1, np.inf, 2]
     rep = L.data_quality_report(X, y=y, train_idx=[0, 1], val_idx=[2, 3],
                                 test_idx=[4, 5])
@@ -4194,7 +4194,7 @@ def t_audit_split_warning_status():
         va = np.arange(100, 108, dtype=np.int64).reshape(2, 4)
         np.save(os.path.join(d, f'train_ids_{tag}.npy'), tr)
         np.save(os.path.join(d, f'val_batch_{tag}.npy'), va)
-        # Missing split_strategy is an explicit legacy-cache warning.
+        # Missing split_strategy is an explicit cache warning.
         with open(os.path.join(d, f'meta_{tag}.json'), 'w', encoding='utf-8') as f:
             json.dump({'vocab': 40, 'seq_len': 4}, f)
         out = A.audit_split_discipline(cache_dirs=[d], min_shift_tokens=1)
@@ -4527,7 +4527,7 @@ def t_selection_audit_rejects_out_of_range_claims():
         out = A.audit_selection(p)
         assert out['status'] == 'fail', out
         assert out['cells'][0]['claim_allowed'] is False, out['cells'][0]
-        # A huge integral float is no longer an exact geometry count.
+        # A huge integral float is not an exact geometry count.
         with open(p, 'w', encoding='utf-8') as f:
             json.dump({'cells': [{
                 'arm': 'a', 'eval_len': 4096, 'k': 2 ** 60, 'n_blocks': 2 ** 61,
@@ -4687,7 +4687,7 @@ def t_simple_baseline_audit_malformed_records():
 
 
 # ---------------------------------------------------------------------------
-# L. Additional hardening: claim gate, Holm family floor, crossover fit,
+# L. Additional checks: claim gate, Holm family floor, crossover fit,
 #    matched init, compute control, stale refusal, efficiency pairs.
 # ---------------------------------------------------------------------------
 
@@ -6177,7 +6177,7 @@ def main():
     _check('I30 train-only cleaning before preprocessing', t_clean_training_rows_and_split)
     _check('I31 declared label set catches unseen/holdout labels', t_known_labels_audit)
     # Open-block reading rule: the substantive gates (causality, reference
-    # pooling, masks, edge cases, closed regression) live in test_open_block.py
+    # pooling, masks, edge cases, closed behaviour) live in test_open_block.py
     # so they can also be run on their own.
     try:
         import test_open_block as _OB

@@ -1758,7 +1758,7 @@ def _range_cache(lo, hi, device):
 def _i32_range_cache(n, device):
     # int32 [n] arange (index transport, §6.1: the same exact integers as the
     # int64 form, narrowed).  Read-only constant of (n, device); shared by the
-    # hot selection paths so no per-chunk arange kernel/alloc is issued.
+    # hot selection paths.
     key = (_dev_str(device), 'arange_i32', int(n))
     a = _cache_get(_IDX_CACHE, key)
     if a is None:
@@ -4514,7 +4514,7 @@ class HybridAttention(nn.Module):
             # 张量上的 exp_ 原地——exp 反向保存的输出此后再无人改写）；原地
             # sub_ 会使 logsumexp 保存的张量版本失效，反向直接报错。
             # 推理（无梯度）时没有保存值，logits 也不再被读取，因此可以直接
-            # 原地归一化，省掉一张与 logits 同尺寸的临时表。
+            # 原地归一化。
             if torch.is_grad_enabled():
                 attn = logits.sub(lse).exp_()
             else:
@@ -5756,7 +5756,7 @@ def _cached_split_problems(meta, train_ids, val_batch, val_bnd, vocab, seq_len=N
     the train fingerprint lets a stale/mixed validation file be served under a
     valid train cache — exactly the situation in which validation (or test)
     rows leak into the tuning split.  New caches always record ``val_fp``;
-    legacy caches without it are accepted with an explicit warning so existing
+    caches without it are accepted with an explicit warning so existing
     results remain reproducible, but their validation bytes are not silently
     blessed as verified.
     """
@@ -6439,7 +6439,7 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
         # Bind the actual test tokenizer bytes on EVERY cache hit.
         # `fit_fp` hashes the fit TEXT, which two different BPE merge sets can
         # share; it is not a tokenizer identity.  A missing identity in a
-        # legacy cache is a hard refusal for the frozen confirmation (delete
+        # cache is a hard refusal for the frozen confirmation (delete
         # the test cache and rebuild it from the same train tokenizer).
         _tok_sha_now = None
         if os.path.exists(tk_path):
@@ -6577,8 +6577,8 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
     # the two corpora builds cannot be paired — refuse rather than serve it.
     # A persisted train tokenizer is compared by FULL vocab identity (id->token
     # mapping), not merely by size: two BPE fits can share a vocab size with
-    # different merges, in which case the id spaces are un-pairable.  Legacy
-    # caches without a persisted tokenizer fall back to the size check.
+    # different merges, in which case the id spaces are un-pairable.  Caches
+    # without a persisted tokenizer fall back to the size check.
     import glob as _glob
     _test_vocab = dict(tok.get_vocab())
     _train_tok_paths = _glob.glob(os.path.join(cache_dir, 'tok_v5_*.json'))
@@ -6887,10 +6887,9 @@ def _disk_ids_chunk(buf, disk_dt, vocab):
     # numpy builds that silently overflow).  `_fineweb_disk_dtype` returns
     # uint16 only for vocab <= 65536, so this is a defensive guard.
     if buf:
-        # Convert once to int64 and take the extrema with NumPy's C loops:
-        # scanning a multi-million-element Python list twice is the slow part
-        # of the staging write at scale.  The range check still runs on the
-        # pre-cast values, so a uint16 wrap can never hide a bad id.
+        # Convert once to int64 and take the extrema with NumPy's C loops.
+        # The range check runs on the pre-cast values, so a uint16 wrap can
+        # never hide a bad id.
         _a = np.asarray(buf, dtype=np.int64)
         _mn, _mx = int(_a.min()), int(_a.max())
         if _mn < 0 or _mx >= int(vocab):
@@ -8223,7 +8222,7 @@ def _ids_narrow(train_ids):
             # hand-edited value below 2**31 would make the int32 cast wrap an
             # out-of-range token into a negative id (which PyTorch then indexes
             # from the end of the embedding table).  The sidecar + binding mean
-            # this full scan happens once per cache build, not per run.
+            # this full scan happens at cache build time.
             _mn = int(train_ids.min()) if train_ids.size else 0
             _mx = int(train_ids.max()) if train_ids.size else -1
             if -2 ** 31 <= _mn and _mx < 2 ** 31:
@@ -8666,14 +8665,14 @@ def pair_reason(ra, rb):
     # Controlled-variable gate for the settings the run fingerprint does not
     # carry (optimizer identity / betas / eps, LR-schedule shape, grad-clip,
     # augmentation).  BOTH records must carry the descriptor or BOTH must omit
-    # it (legacy-vs-legacy); a one-sided descriptor is unverifiable and is
+    # it (absent-vs-absent); a one-sided descriptor is unverifiable and is
     # refused.
     _ka, _kb = (ra.get('train_knobs'), rb.get('train_knobs'))
     # Mixed presence is itself unverifiable: a record that carries the
     # descriptor and one that does not cannot be shown to share the optimizer /
     # schedule / clipping / augmentation settings, and pairing them is exactly
     # the uncontrolled comparison this gate exists to prevent.  Only
-    # legacy-vs-legacy (both absent) keeps the permissive path.
+    # both-absent keeps the permissive path.
     if (_ka is None) != (_kb is None):
         return 'unverifiable train_knobs (only one record carries the optimizer / lr-schedule / augmentation descriptor)'
     if _ka is not None and _ka != _kb:
@@ -8706,9 +8705,9 @@ def pair_reason(ra, rb):
             return f'different {_k} ({str(_pa)[:12]}… vs {str(_pb)[:12]}…)'
     # Matched initialization: same seed is not enough (architectures consume
     # different amounts of RNG), so compare the shared-trunk init digest.
-    # Both-present equality is required; one-sided is unverifiable (legacy
-    # records predate the field).  RNG-state equality is deliberately NOT
-    # required: architecture-induced RNG consumption is part of the arm.
+    # Both-present equality is required; one-sided is unverifiable.  RNG-state
+    # equality is deliberately NOT required: architecture-induced RNG
+    # consumption is part of the arm.
     _ia, _ib = ra.get('init_core_fp'), rb.get('init_core_fp')
     _ha = _ia is not None and str(_ia) != ''
     _hb = _ib is not None and str(_ib) != ''
@@ -8734,7 +8733,7 @@ def _hyperparam_reason(ra, rb):
     `hyperparams` copy additionally carries `mlp_ratio` (and any future key
     that never made it into the string).  Two records with equal run_cfg can
     still differ in MLP width, which is a capacity change rather than the
-    module under test.  Both records must carry the descriptor (legacy/legacy
+    module under test.  Both records must carry the descriptor (both absent
     is the only permissive path) and every checked key must agree.
 
     Baseline-vs-method contrasts do NOT use this gate: their MLP width is
@@ -11048,8 +11047,8 @@ def _as_seed_int(v):
     if isinstance(v, numbers.Real):
         # np.float32/np.float64 are Real but not all are Python ``float``;
         # int() would silently truncate 1.5 to 1, turning an invalid seed
-        # into a different valid one.  Above 2**53 a float no longer
-        # represents every integer, so accepting it would let a requested
+        # into a different valid one.  Above 2**53 a float cannot
+        # represent every integer, so accepting it would let a requested
         # seed collapse to a different one (the same rule as
         # normalize_seed_list).
         f = float(v)
@@ -12305,7 +12304,7 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
     # Equal tuning includes equal SEARCH SEEDS.  If one arm selected on seeds
     # {0} and another on {0,1,2}, their selection noise differs even though the
     # lr grid is identical.  Only trials that expose their seed set are
-    # checkable; legacy artifacts without it stay on the untested path.
+    #     checkable; artifacts without it stay on the untested path.
     search_seed_balanced = None
     search_seeds_seen = None
     _declared_ss = protocol.get('search_seeds')
@@ -12575,7 +12574,7 @@ def _knobs_equal_across_arms(recs, arms, key):
             if key in r and r.get(key) is not None:
                 vals.append(json.dumps(r.get(key), sort_keys=True, default=str))
                 break
-            # keep scanning this arm: a legacy/first record without the key
+            # keep scanning this arm: an early record without the key
             # must not mask a later record that does record it.
     if len(vals) < 2:
         return None
@@ -12802,7 +12801,7 @@ def _param_breakdown_of_arm(recs, arm):
 def _param_control_detail(recs, a, b):
     """Capacity breakdown for a pair: total as well as non-embedding and
     active parameters.  Returns `{}` when neither record exposes the detail,
-    so legacy records are not silently labelled controlled."""
+    so records without it are not silently labelled controlled."""
     out = {'total_rel_diff': None, 'total_controlled': None,
            'non_embedding_rel_diff': None, 'non_embedding_controlled': None,
            'active_rel_diff': None, 'active_controlled': None,
@@ -13847,7 +13846,7 @@ def normalize_seed_list(seeds, *, default=(0,)):
             if not _rf.is_integer():
                 raise ValueError(f'seed must be an integer, got non-integral {raw!r}')
             if abs(_rf) >= 2 ** 53:
-                # Above 2**53 a float no longer represents every integer; the
+                # Above 2**53 a float cannot represent every integer; the
                 # requested seed may silently collapse to a different seed.
                 raise ValueError(f'seed {raw!r} exceeds the exact float-integer range (2**53); pass an int')
         try:
@@ -13884,7 +13883,7 @@ def normalize_variant_list(variants):
 
 def set_seed(seed):
     """Seed every RNG that can affect a run: Python ``random``, NumPy's
-    legacy global RNG, PyTorch's CPU RNG and every CUDA device, plus the
+    global RNG, PyTorch's CPU RNG and every CUDA device, plus the
     Python hash seed (best effort for child processes).  Returns the integer
     seed so callers can record exactly what was used.  torch's deterministic
     algorithm / cuDNN switches are pinned at the same time, so two runs with
@@ -13892,11 +13891,10 @@ def set_seed(seed):
     seed = int(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
     random.seed(seed)
-    # NumPy's legacy global RNG only accepts [0, 2**32-1], while the panel
-    # planner deliberately preserves exact Python integers beyond that (and
-    # negative ids).  Fold only out-of-range ids into the RNG's domain so a
-    # planned panel can actually start; in-range seeds keep their exact
-    # historical stream.
+    # NumPy's global RNG only accepts [0, 2**32-1], while the panel planner
+    # deliberately preserves exact Python integers beyond that (and negative
+    # ids).  Fold only out-of-range ids into the RNG's domain so a planned
+    # panel can actually start; in-range seeds keep their exact stream.
     np_seed = seed if 0 <= seed < 2 ** 32 else seed % (2 ** 32)
     np.random.seed(np_seed)
     _attb_bump_epoch()
@@ -16053,7 +16051,7 @@ def training_knobs_fingerprint(*, amp_dtype='auto', eager_batch='auto'):
     per-record `train_knobs` copy, which `pair_reason` checks at analysis
     time.  Putting this digest in the resume fingerprint makes a changed
     descriptor invalidate earlier cells just like a changed lr.
-    Unset/legacy fingerprints simply decode without a `tk` field.
+    Unset fingerprints simply decode without a `tk` field.
     """
     if amp_dtype == 'auto' and eager_batch == 'auto':
         _knobs = training_knobs()
@@ -18464,10 +18462,10 @@ class TimeGuard:
             return True  # 无法判定（非 posix 等）时按存活处理，绝不误退
 
     def reconcile(self):
-        """Refund per-token bookings whose recording process is no longer
-        alive (crash/kill recovery).  Old state files without a `bookings`
-        map are untouched: their `booked_seconds` is preserved as
-        `booked_untracked` once any tokenised booking coexists."""
+        """Refund per-token bookings whose recording process is not alive
+        (crash/kill recovery).  State files without a `bookings` map are
+        untouched: their `booked_seconds` is preserved as `booked_untracked`
+        once any tokenised booking coexists."""
         try:
             import fcntl
         except ImportError:

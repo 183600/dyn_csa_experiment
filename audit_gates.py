@@ -250,7 +250,7 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
     # now persist test_doc_ids; when the sidecar is present, recompute the
     # train/test and val/test document intersections instead of trusting the
     # metadata flags.  A missing sidecar is reported as not independently
-    # verified (legacy cache), not silently treated as clean.
+    # verified (unverified cache), not silently treated as clean.
     _trd_p = os.path.join(cache_dir, f'train_doc_ids_{train_tag}.npy')
     _vad_p = os.path.join(cache_dir, f'val_doc_ids_{train_tag}.npy')
     _ted_p = os.path.join(cache_dir, f'test_doc_ids_{test_tag}.npy')
@@ -345,7 +345,7 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
             if os.path.exists(expected):
                 return [expected]
             _c = sorted(glob.glob(os.path.join(cache_dir, pattern)))
-            # Legacy caches may use a different tag spelling.  A single
+            # Caches may use a different tag spelling.  A single
             # remaining candidate is unambiguous; more than one is refused
             # instead of silently pairing the wrong configuration.
             return _c if len(_c) == 1 else []
@@ -766,7 +766,7 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                               'match the fingerprint in the cache metadata')
                     # A count recorded in the metadata is a second, independent
                     # binding: a truncated/extra sidecar must fail even when the
-                    # fingerprint field was omitted by a legacy writer.
+                    # fingerprint field was omitted by the writer.
                     if _mdoc.get('train_count') is not None and _exact_int_scalar(_mdoc['train_count']) != int(np.asarray(_trd).size):
                         rec['status'] = 'fail'
                         _fail(f'{cd}/{tag}: train document-id sidecar count '
@@ -1832,7 +1832,7 @@ def audit_budget(state_files=('run_time_state_v10.json', 'run_time_state_v12.jso
             elif isinstance(_runs, (int, float)) and not isinstance(_runs, bool):
                 # A run counter is an exact integer; int(3.9) would silently
                 # report a different number of completed runs.  A malformed
-                # counter falls back to the legacy field instead.
+                # counter falls back to an alternative field instead.
                 _run_count = _exact_int_scalar(_runs)
                 if _run_count is None:
                     _run_count = st.get('run_count')
@@ -2006,8 +2006,8 @@ def audit_efficiency_pairs(outdirs=None, pairs=None, *, tolerance=0.05):
             _ea, _eb = _env_rows(eff[a]), _env_rows(eff[b])
             _ka, _kb = _kv_rows(eff[a]), _kv_rows(eff[b])
             _ba, _bb = _batch_rows(eff[a]), _batch_rows(eff[b])
-            # Latency depends on the batch shape as well as the token count.
-            # Legacy records without `batch` stay unverifiable (None) rather
+            # The batch shape is part of the measured environment.
+            # Records without `batch` stay unverifiable (None) rather
             # than being rejected as a mismatch; when both sides record it,
             # every seed must agree and the two arms must use the same batch.
             _same_batch = (None if (_ba is None or _bb is None)
@@ -2202,7 +2202,7 @@ def audit_selection(path='analysis_mechanism/selection_attribution.json'):
                 return None
             if (not (math.isfinite(f) and f == math.floor(f))
                     or abs(f) >= 2 ** 53):
-                # Beyond 2**53 a float no longer represents every integer, so
+                # Beyond 2**53 a float cannot represent every integer, so
                 # the recorded geometry count may denote a different value.
                 return None
             return int(f)

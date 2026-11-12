@@ -135,7 +135,7 @@ def _collect(dirs, include_ckpt=False):
         if os.path.exists(p) and not os.path.islink(p) and os.path.isfile(p):
             files.append(p)
     # The loaders write tag-suffixed metadata/tokenizer files (e.g.
-    # meta_v5_sl512_....json), not the legacy fixed names above.  Pack those
+    # meta_v5_sl512_....json), not the fixed names above.  Pack those
     # small provenance files too; otherwise a release silently omits the cache
     # and tokenizer identity its own documentation promises.
     import glob as _glob

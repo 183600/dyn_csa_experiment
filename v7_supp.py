@@ -147,7 +147,7 @@ class HybridAttentionRoPE(L.HybridAttention):
         cfg = self.cfg
         # Eval-only fused q/k/v projection (same cache contract as
         # exp_lib.HybridAttention._full_batched).  Training uses the three
-        # separate projections so no concatenated weight is rebuilt per step.
+        # separate projections.
         _nhq = self.nh * self.hd
         if x.device.type == 'cuda' and not torch.is_grad_enabled():
             # eval-only weight-concat cache, keyed on the source weights'

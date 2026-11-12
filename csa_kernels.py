@@ -275,7 +275,7 @@ class PoolGeometry:
             starts_prev_np = np.zeros((R, Bm), dtype=np.int64)
             max_ov = 0
         W_b = max_ov if overlap is not None else 0
-        # 8 张 int32 几何表打包进一条宿主缓冲、一次 H2D（同样的 int32 值、
+        # 8 张 int32 几何表打包进一条宿主缓冲（同样的 int32 值、
         # 同样的 int64→int32 窄化，transport only），设备侧按只读视图切分。
         flat = np.empty(7 * R * Bm + R, dtype=np.int32)
         for _i, _a in enumerate((counts_np, ends_np, starts_np, last_np,

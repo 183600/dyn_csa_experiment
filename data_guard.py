@@ -1542,7 +1542,7 @@ def _matrix_fingerprint(X):
     # float64 preserves integers up to 2**53 exactly.  Beyond that two
     # different token ids can round to the same float and produce a false
     # corpus fingerprint, so those integral tables are hashed as exact
-    # uint64 instead.  In-range tables keep their historical fingerprint.
+    # uint64 instead.  In-range tables keep the same fingerprint.
     _integral = (arr.dtype != object
                  and (np.issubdtype(arr.dtype, np.integer)
                       or np.issubdtype(arr.dtype, np.bool_)))

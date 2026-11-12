@@ -54,7 +54,7 @@ def _load_model(path):
     try:
         d = torch.load(path, map_location='cpu', weights_only=False, mmap=True)
     except (TypeError, RuntimeError, ValueError):
-        # mmap=True cannot read legacy non-zip serialisation (RuntimeError), a
+        # mmap=True cannot read non-zip serialisation (RuntimeError), a
         # non-mmap-able file (TypeError), or a corrupt archive (ValueError).
         d = torch.load(path, map_location='cpu', weights_only=False)
     if not isinstance(d, dict) or 'sd' not in d:

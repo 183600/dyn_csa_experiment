@@ -354,7 +354,7 @@ def t_edge_cases():
 
 
 # ---------------------------------------------------------------------------
-# K7 closed regression / untouched cut table
+# K7 closed behaviour / untouched cut table
 # ---------------------------------------------------------------------------
 
 def t_closed_regression():
@@ -456,7 +456,7 @@ def t_singleton_is_length_one_pooled():
 
 
 # ---------------------------------------------------------------------------
-# K9 HCA budget declaration
+# K9 HCA declaration
 # ---------------------------------------------------------------------------
 
 def t_hca_budget_declaration():

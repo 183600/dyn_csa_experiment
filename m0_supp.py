@@ -555,8 +555,8 @@ def _calibrate_panel(run_cfg, guard, panel):
           f'(booked so far {state.get("booked_seconds", 0.0) / 3600:.2f} h)')
     if total + state.get('booked_seconds', 0.0) / 3600.0 > cap_h:
         print('[m0-calib] WARNING: the measured projection exceeds the usable cap. The TimeGuard will skip or hard-truncate '
-              'cells that no longer fit (a truncated cell leaves no partial measurement). Raise the cap, reduce the seed/arm '
-              'list, or use a faster kernel — do not read the resulting incomplete panel as a full-panel result.')
+              'cells that do not fit (a truncated cell leaves no partial measurement). Raise the cap or reduce the seed/arm '
+              'list — do not read the resulting incomplete panel as a full-panel result.')
 
 
 B_SCALE_DESIGN = {
