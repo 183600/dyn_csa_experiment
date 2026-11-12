@@ -60,7 +60,11 @@ def _exact_int_scalar(value):
     provenance (vocab sizes, sequence lengths) into a different valid cache
     identity, which would let the leakage/split audits pair the wrong files.
     """
-    if value is None or isinstance(value, bool):
+    # np.bool_ is neither numbers.Integral nor numbers.Real on NumPy 2, so it
+    # would otherwise fall through float(np.True_) == 1.0 and be accepted.
+    # Its dtype kind is the stable spelling across NumPy versions.
+    if (value is None or isinstance(value, bool)
+            or getattr(getattr(value, 'dtype', None), 'kind', None) == 'b'):
         return None
     if isinstance(value, numbers.Integral):
         return int(value)
@@ -259,7 +263,7 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
             _tm_doc = (test_meta or {}).get('doc_ids') or {}
             _train_doc = (train_meta or {}).get('doc_ids') or {}
             if _tm_doc:
-                if int(_tm_doc.get('test_count', -1)) != int(_ted.size):
+                if _exact_int_scalar(_tm_doc.get('test_count')) != int(_ted.size):
                     _doc_leak.append('test document-id sidecar count disagrees with the test metadata')
                 if (_tm_doc.get('test_fp')
                         and _tm_doc['test_fp'] != _sidecar_fp(_ted)):
@@ -270,7 +274,7 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
             if os.path.exists(_trd_p):
                 _trd = np.load(_trd_p)
                 if (_train_doc.get('train_count') is not None
-                        and int(_train_doc['train_count']) != int(np.asarray(_trd).size)):
+                        and _exact_int_scalar(_train_doc['train_count']) != int(np.asarray(_trd).size)):
                     _doc_leak.append('train document-id sidecar count disagrees with the cache metadata')
                 if (_train_doc.get('train_fp')
                         and _train_doc['train_fp'] != _sidecar_fp(_trd)):
@@ -286,7 +290,7 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
             if os.path.exists(_vad_p):
                 _vad = np.load(_vad_p)
                 if (_train_doc.get('validation_count') is not None
-                        and int(_train_doc['validation_count']) != int(np.asarray(_vad).size)):
+                        and _exact_int_scalar(_train_doc['validation_count']) != int(np.asarray(_vad).size)):
                     _doc_leak.append('validation document-id sidecar count disagrees with the cache metadata')
                 if (_train_doc.get('validation_fp')
                         and _train_doc['validation_fp'] != _sidecar_fp(_vad)):
@@ -763,11 +767,11 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                     # A count recorded in the metadata is a second, independent
                     # binding: a truncated/extra sidecar must fail even when the
                     # fingerprint field was omitted by a legacy writer.
-                    if _mdoc.get('train_count') is not None and int(_mdoc['train_count']) != int(np.asarray(_trd).size):
+                    if _mdoc.get('train_count') is not None and _exact_int_scalar(_mdoc['train_count']) != int(np.asarray(_trd).size):
                         rec['status'] = 'fail'
                         _fail(f'{cd}/{tag}: train document-id sidecar count '
                               'disagrees with the cache metadata')
-                    if _mdoc.get('validation_count') is not None and int(_mdoc['validation_count']) != int(np.asarray(_vad).size):
+                    if _mdoc.get('validation_count') is not None and _exact_int_scalar(_mdoc['validation_count']) != int(np.asarray(_vad).size):
                         rec['status'] = 'fail'
                         _fail(f'{cd}/{tag}: validation document-id sidecar count '
                               'disagrees with the cache metadata')
@@ -785,7 +789,7 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                         rec['status'] = 'fail'
                         _fail(f'{cd}/{tag}: cache metadata does not attest '
                               'document-disjoint splits')
-                    if _mdoc and int(_mdoc.get('overlap', 0) or 0) != 0:
+                    if _mdoc and _exact_int_scalar(_mdoc.get('overlap', 0)) != 0:
                         rec['status'] = 'fail'
                         _fail(f'{cd}/{tag}: cache metadata records a nonzero '
                               'train/validation document overlap')
@@ -921,7 +925,7 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                         _ted = np.load(_ted_path)
                         _mtdoc = (_tmeta or {}).get('doc_ids') or {}
                         if _mtdoc:
-                            if int(_mtdoc.get('test_count', -1)) != int(np.asarray(_ted).size):
+                            if _exact_int_scalar(_mtdoc.get('test_count')) != int(np.asarray(_ted).size):
                                 rec['status'] = 'fail'
                                 _fail(f'{cd}/{tag}: test document-id sidecar count '
                                       'disagrees with the test metadata')

@@ -4240,6 +4240,31 @@ def t_audit_split_test_sidecar_self_consistency():
         good = A.audit_split_discipline(cache_dirs=[d], min_shift_tokens=1)
         rec = good['caches'][os.path.abspath(d)]['corpora'][tag]
         assert rec['status'] != 'fail', rec
+        # Counts are exact integers: int(3.9)==3 and int(True)==1 must not
+        # masquerade as a matching sidecar size.
+        assert A._exact_int_scalar(3.9) is None
+        assert A._exact_int_scalar(True) is None
+        assert A._exact_int_scalar(np.bool_(True)) is None
+        assert A._exact_int_scalar(3.0) == 3
+        for _field, _bad in (('train_count', 3.9),
+                             ('validation_count', 2.9)):
+            _old = meta['doc_ids'][_field]
+            meta['doc_ids'][_field] = _bad
+            _write_meta()
+            out = A.audit_split_discipline(cache_dirs=[d], min_shift_tokens=1)
+            rec = out['caches'][os.path.abspath(d)]['corpora'][tag]
+            assert rec['status'] == 'fail', (_field, _bad, rec)
+            assert any('count disagrees' in w for w in out['warnings']), (_field, out)
+            meta['doc_ids'][_field] = _old
+        _old = tmeta['doc_ids']['test_count']
+        tmeta['doc_ids']['test_count'] = 2.9
+        _write_meta()
+        out = A.audit_split_discipline(cache_dirs=[d], min_shift_tokens=1)
+        rec = out['caches'][os.path.abspath(d)]['corpora'][tag]
+        assert rec['status'] == 'fail', rec
+        assert any('count disagrees' in w for w in out['warnings']), out
+        tmeta['doc_ids']['test_count'] = _old
+        _write_meta()
         # Remove the paired train sidecar and corrupt only the test fingerprint.
         os.unlink(os.path.join(d, f'train_doc_ids_{tag}.npy'))
         tmeta['doc_ids']['test_fp'] = 'not-the-test-fingerprint'
