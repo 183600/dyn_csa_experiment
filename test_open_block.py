@@ -472,8 +472,8 @@ def t_hca_budget_declaration():
 
 
 def t_open_candidate_edge_cases():
-    # Empty query sets and zero available candidates must return the same
-    # shapes the non-empty path promises, not crash inside a gather.
+    # Empty query sets and zero available candidates return the same shapes
+    # as the non-empty path.
     d, nIH = 8, 2
     W_DQ, W_DK, W_w = torch.randn(d, d), torch.randn(d, d), torch.randn(nIH, d)
     empty_bid = torch.empty(0, dtype=torch.long)
@@ -539,7 +539,7 @@ def t_record_identity_and_completeness():
                                              n_tokens=1.5)}, fp)
     assert cells == {}, cells
     assert OB._rec_by_cell({'A::seed0': base}, fp)
-    # A malformed summary/descriptor is refused, not crashed through.
+    # A malformed summary/descriptor is refused.
     assert OB._rec_by_cell([base], fp) == {}
     _rec_a = dict(base, open_block_config={'fingerprint': None,
                                            'layers': [1]})

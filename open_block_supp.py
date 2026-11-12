@@ -301,7 +301,7 @@ def _nll_per_token(rec):
         return v / n
     except OverflowError:
         # An exact token total beyond the binary64 range underflows the
-        # per-token NLL to zero rather than crashing the panel reader.
+        # per-token NLL to zero.
         return 0.0
 
 

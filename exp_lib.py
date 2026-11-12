@@ -537,7 +537,7 @@ def _nll_doc_ci(nll_per_row, n_tokens_per_row):
                 _early_ce = total_nll / total_tok
             except OverflowError:
                 # An exact token total beyond the binary64 range underflows
-                # the pooled cross-entropy to zero rather than crashing.
+                # the pooled cross-entropy to zero.
                 _early_ce = 0.0
         return {'ppl': (_safe_exp_ppl(_early_ce) if _early_ce is not None else None),
                 'doc_ce_mean': None, 'doc_ce_sem': None,
@@ -8030,9 +8030,9 @@ def locked_json_read(path):
             fcntl.flock(lock_f, fcntl.LOCK_SH)
         except OSError:
             # A missing/unwritable parent directory means the file is absent
-            # (or unreadable); a read must return {} rather than crash.  If
-            # open() succeeded but flock() failed, close the descriptor here:
-            # the cleanup below only runs for a successfully held lock.
+            # (or unreadable); a read returns {} for it.  If open() succeeded
+            # but flock() failed, close the descriptor here: the cleanup below
+            # only runs for a successfully held lock.
             if lock_f is not None:
                 try:
                     lock_f.close()
@@ -19626,7 +19626,7 @@ def _combined_seed_doc_ci(recs, *, n_boot=2000, seed=20261018, conf=0.95):
         m = float(seed_logppl.mean())
         # Use the same overflow-safe exponential as the rest of the PPL
         # paths: a finite pooled CE near log(float max) can push the upper
-        # bound past math.exp's range, and a report builder must not crash.
+        # bound past math.exp's range.
         out['ci95_ppl'] = [_safe_exp_ppl(m - tc * out['se_combined_logppl']),
                            _safe_exp_ppl(m + tc * out['se_combined_logppl'])]
         out['status'] = 'ok'

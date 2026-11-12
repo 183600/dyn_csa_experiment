@@ -2279,7 +2279,7 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=16, max_pos=
     # silently score a DIFFERENT span under the caller's label, and a length
     # below 2 has no next-token target at all (it would either index an empty
     # cumulative column or report a vacuous PPL of 1).  Record those as named
-    # error cells instead of truncating/crashing.
+    # error cells.
     _norm_lens = []
     for _ln in (eval_lens if eval_lens is not None else []):
         _li = L._as_seed_int(_ln)

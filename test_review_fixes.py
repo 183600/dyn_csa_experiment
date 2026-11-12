@@ -203,27 +203,27 @@ def t_scale_robustness_edges():
                                     'lr': 1e-3, 'warmup': 0, 'seeds': [0]},
                'params': _big ** 3}]
     assert L.scale_ladder_audit(_tiers)['budget_matched'] is True
-    # Exact token counts beyond binary64 must not crash the pooled/per-document
-    # PPL reductions.
+    # Pooled/per-document PPL reductions handle exact token counts beyond
+    # binary64.
     _huge_tok = 10 ** 400
     assert L._nll_doc_ci([100.0, 100.0], [_huge_tok, _huge_tok])['n_docs'] == 2
     _ppl, _nll, _ntok = L._pooled_ppl_from_records(
         [{'nll_sum': 100.0, 'n_tokens': _huge_tok},
          {'nll_sum': 100.0, 'n_tokens': _huge_tok}])
     assert _ppl == 1.0 and _ntok == 2 * _huge_tok, (_ppl, _nll, _ntok)
-    # The short-panel branch of the per-document CI must also survive a token
-    # total beyond binary64 (it used to divide a huge int and raise).
+    # The short-panel branch of the per-document CI also handles a token
+    # total beyond binary64.
     _early = L._nll_doc_ci([100.0], [_huge_tok])
     assert _early['n_docs'] == 1 and _early['ppl'] == 1.0, _early
     # Per-row token counts are exact: a value that rounds through float64
-    # (2**53+1) must not silently become a different denominator.
+    # (2**53+1) is not a valid denominator.
     _row = [{'variant': 'csa', 'seed': s, 'ppl': 10.0,
              'nll_per_row': [1.0, 1.0],
              'n_tokens_per_row': [2 ** 53 + 1, 2 ** 53 + 1]} for s in range(3)]
     assert L._doc_bootstrap_ppl_ci(_row, n_boot=20) is None
     assert L._combined_seed_doc_ci(_row, n_boot=20)['status'] == 'unverifiable'
     # A missing/non-object record cannot certify either uncertainty
-    # component; the helpers must report unverifiable rather than crash.
+    # component; the helpers report unverifiable.
     for _bad_recs in (None, [None], [1], ['x']):
         assert L._doc_bootstrap_ppl_ci(_bad_recs, n_boot=20) is None
         assert L._combined_seed_doc_ci(_bad_recs, n_boot=20)['status'] == 'unverifiable'
@@ -232,12 +232,11 @@ def t_scale_robustness_edges():
     for _bad_conf in (True, np.bool_(False), 0, 1, 1.5, float('nan'), 'x'):
         _r = L._combined_seed_doc_ci(_ok_recs, n_boot=20, conf=_bad_conf)
         assert _r['status'] == 'invalid_options' and _r['ci95_ppl'] is None, _r
-    # Panel readers must not crash on a malformed per-layer stats payload.
+    # Panel readers ignore a malformed per-layer stats payload.
     _agg_bad = L.aggregate({'x': {'variant': 'csa', 'seed': 0, 'ppl': 10.0,
                                   'nll_sum': 10.0, 'n_tokens': 1, 'stats': [1]}})
     assert 'avg_dyn_block_len' not in _agg_bad['csa'], _agg_bad
-    # Panel readers refuse a non-object summary instead of raising a raw
-    # AttributeError halfway through.
+    # Panel readers refuse a non-object summary.
     for _bad_summary in (None, [], 123, 'x'):
         try:
             L.methodology_audit(_bad_summary, design={}, baselines={}, verbose=False)
@@ -1609,7 +1608,7 @@ def t_eval_length_invalid_lengths():
     # Truncating to fewer than two tokens has no next-token target.
     out_trunc = V7.eval_length_gen(model, ids, [20], dev, max_pos=1)
     assert 'error' in out_trunc[20] and 'ppl' not in out_trunc[20], out_trunc
-    # Malformed (unhashable) length identities must not crash the whole eval.
+    # Malformed (unhashable) length identities become named error cells.
     out_bad = V7.eval_length_gen(model, ids, [[8]], dev, max_pos=None)
     assert len(out_bad) == 1 and 'error' in next(iter(out_bad.values())), out_bad
     # Row count and truncation span are exact integers too: fractional,
@@ -3763,8 +3762,8 @@ def t_audit_leakage_handles_flat_train_cache():
         # on overlap, so accept either non-ok status).
         assert out['status'] in ('warnings', 'fail'), out
         assert out['checks']['document_isolation']['status'] == 'not_verified', out
-        # A malformed meta without a numeric vocab must fail closed, not
-        # crash with int(None) before the audit can report anything.
+        # A malformed meta without a numeric vocab fails closed before the
+        # audit can report anything.
         with open(os.path.join(cache, 'meta_v4_x.json'), 'w', encoding='utf-8') as f:
             json.dump({'src_fp': 'train'}, f)
         with open(os.path.join(cache, 'test_meta_x.json'), 'w', encoding='utf-8') as f:
@@ -4576,7 +4575,7 @@ def t_object_time_and_zero_feature_guards():
             assert 'NaN/Inf' in str(e), e
         else:
             raise AssertionError('an object-dtype NaN timestamp must be rejected')
-    # A zero-feature table is uninformative but must not crash the report.
+    # A zero-feature table is uninformative but is still reported.
     rep = L.data_quality_report(np.empty((4, 0)), train_idx=[0, 1],
                                 val_idx=[2], test_idx=[3])
     assert rep['n_features'] == 0, rep
@@ -4728,7 +4727,7 @@ def t_audit_split_test_metadata_discipline():
         assert rec.get('test_tag') == ttag, rec
         assert rec.get('test_shuffle_at_split') is False, rec
         assert rec['status'] != 'fail', rec
-        # Malformed metadata must fail the audit, not crash int().
+        # Malformed metadata fails the audit.
         with open(os.path.join(d, f'test_meta_{ttag}.json'), 'w', encoding='utf-8') as f:
             json.dump(dict(good_test, vocab='abc'), f)
         out = A.audit_split_discipline(cache_dirs=[d], min_shift_tokens=1)
@@ -5747,8 +5746,8 @@ def t_sec_p1l_rejects_malformed_length_keys():
         str(2 ** 53 + 1): {'ppl': 55.0, 'truncated': False},
         float(2 ** 60): {'ppl': 77.0, 'truncated': False},
     }}}
-    # A malformed by_len payload (valid JSON but not an object) must be
-    # skipped, not crash the whole length section while a valid record exists.
+    # A malformed by_len payload (valid JSON but not an object) is skipped
+    # while a valid record exists.
     rec['bad::s0'] = {'variant': 'bad', 'seed': 0, '_code': BR._CUR_CS,
                       'by_len': [{'ppl': 99.0, 'truncated': False}]}
     BR._LOADED[('summary', 'results_len')] = rec
@@ -5849,7 +5848,7 @@ def t_efficiency_pairs_audit_and_sweep():
         r4 = A.audit_efficiency_pairs(outdirs=[td])
         rec4 = r4['panels'][td]['a vs b']
         assert rec4['speed_claim_allowed'] is False, rec4
-        # An out-of-float-range timing is not a measurement, not a crash.
+        # An out-of-float-range timing is not a measurement.
         with open(os.path.join(td, 'summary.json'), 'w', encoding='utf-8') as f:
             json.dump({'a::s0': {'variant': 'a', 'efficiency': dict(eff_a, prefill_ms_p50=10 ** 400)},
                        'b::s0': {'variant': 'b', 'efficiency': eff_b}}, f)
@@ -5976,8 +5975,7 @@ def t_archive_verify_requires_external_checksum():
         # The checksum anchors the file; the invalid tar itself must not be
         # accepted as a release either (a clean refusal, not a traceback).
         assert AR.cmd_verify(tar) == 1
-        # A valid tar with a malformed per-file manifest entry is also refused
-        # instead of crashing the verifier.
+        # A valid tar with a malformed per-file manifest entry is also refused.
         import io
         import tarfile
         tar2 = os.path.join(d, 'release_y.tar.gz')
@@ -6778,8 +6776,7 @@ def t_targeted_contract_edges():
         _out = A.audit_split_discipline(cache_dirs=[td])
         _rec = _out['caches'][os.path.abspath(td)]['corpora']['x']
         assert _rec['status'] == 'fail', _rec
-    # A malformed per-layer stats payload must be ignored by the top-k table,
-    # not crash the report builder.
+    # A malformed per-layer stats payload is ignored by the top-k table.
     _cur = f'_cs{BR._CUR_CS}'
     _k1 = ('agg', 'results_lm_v7_seq2k')
     _k2 = ('summary', 'results_lm_v7_seq2k')

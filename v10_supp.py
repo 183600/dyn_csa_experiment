@@ -371,7 +371,7 @@ def _cell_ppl(nll_sum, n_tok):
         ce = total / nt
     except OverflowError:
         # An exact token total beyond the binary64 range underflows the
-        # per-token NLL to zero (PPL 1.0) rather than crashing the panel.
+        # per-token NLL to zero (PPL 1.0).
         return 1.0
     if ce > 709.0:
         return float('inf')
