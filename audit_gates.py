@@ -1518,9 +1518,8 @@ def audit_fairness(summary_path='results_v10_mech/summary.json', arms=None):
         warnings.append('declared arm(s) absent from the summary: ' + ', '.join(_missing_arms) + ' — the frozen-arm comparison is only partially audited')
 
     def _meta_key(value):
-        # A malformed metadata field may be a list/dict.  Putting it directly
-        # into a set raises TypeError and aborts the audit; canonicalise it so
-        # the malformed record is still counted/reported instead.
+        # Metadata may be any JSON value; canonicalise unhashable values so
+        # every record is still counted and reported.
         try:
             hash(value)
             return value
@@ -1532,13 +1531,11 @@ def audit_fairness(summary_path='results_v10_mech/summary.json', arms=None):
         knob_vals = {json.dumps(r.get('train_knobs'), sort_keys=True)
                      for r in recs if r.get('train_knobs') is not None}
         n_missing_knobs = sum(1 for r in recs if r.get('train_knobs') is None)
-        # NaN / non-integral floats have no seed identity; int(nan) would
-        # abort the whole audit instead of excluding the malformed record.
+        # Only exact integer seeds carry a seed identity.
         seeds = sorted({_s for r in recs
                         if (_s := L._as_seed_int(r.get('seed'))) is not None})
-        # Parameter counts normally share one numeric type, but a malformed
-        # record may carry a string/object/list.  Distinctness and sorting
-        # must therefore use a total, hashable key.
+        # Parameter counts may be any JSON value; distinctness and sorting use
+        # a total, hashable key.
         _param_by_key = {_meta_key(r.get('params')): r.get('params') for r in recs}
         out['arms'][a] = {
             'n_records': len(recs), 'seeds': seeds, 'n_seeds': len(seeds),

@@ -880,8 +880,7 @@ def t_power_gate():
                 assert 'integer' in str(e), str(e)[:200]
             else:
                 raise AssertionError(f'eval.n_seqs_clean={_bad_nseq!r} must be refused')
-        # A non-object eval block must be refused explicitly, not crash the
-        # loader with AttributeError.
+        # A non-object eval block must be refused explicitly.
         for _bad_eval in ([], [4096], 'x'):
             pbad = os.path.join(td, 'bad_eval.json')
             mb = _write_manifest(pbad, list(range(12)))
@@ -4900,8 +4899,7 @@ def t_audit_fairness_nan_seed_does_not_crash():
                                     'ppl': 10.0, 'run_cfg': 'x'}}, f)
         out = A.audit_fairness(path, arms=['a'])
         assert out['arms']['a']['seeds'] == [], out
-        # Mixed parameter-count spellings are malformed but must not abort the
-        # whole fairness audit with a TypeError.
+        # Mixed parameter-count spellings must still be counted and reported.
         with open(path, 'w', encoding='utf-8') as f:
             json.dump({'a::seed0': {'variant': 'a', 'seed': 0, 'params': 10,
                                     'ppl': 10.0, 'run_cfg': 'x'},
@@ -4909,7 +4907,7 @@ def t_audit_fairness_nan_seed_does_not_crash():
                                     'ppl': 10.0, 'run_cfg': 'x'}}, f)
         out = A.audit_fairness(path, arms=['a'])
         assert out['arms']['a']['n_records'] == 2, out
-        # Unhashable (list/dict) metadata must not crash the audit either.
+        # Unhashable (list/dict) metadata must still be counted and reported.
         with open(path, 'w', encoding='utf-8') as f:
             json.dump({'a::seed0': {'variant': 'a', 'seed': 0, 'params': [10],
                                     'ppl': 10.0, 'run_cfg': ['x']}}, f)

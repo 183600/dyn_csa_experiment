@@ -826,9 +826,8 @@ def sec_p0w():
         for v, w, _dd, _st in _contrasts:
             _st['p_holm'] = _p0w_holm.get(f'P0W csa_fixed warm={w} vs warm=0')
             _d = _st['mean']
-            # The exact test drops zero deltas, so the resolution floor is set
-            # by the NONZERO pair count; quoting the pair count can overstate
-            # the resolution when identical arms produce zero deltas.
+            # The exact test drops zero deltas, so the resolution floor follows
+            # the NONZERO pair count.
             _floor = signflip_p_floor(sum(1 for x in _dd if x != 0))
             _same_dir = all((x != 0 and (x > 0) == (_d > 0) for x in _dd))
             _gate_ok = _sig_gate(_st, label=f'P0W csa_fixed warm={w} vs warm=0', family='P0W')

@@ -465,10 +465,8 @@ def _nll_doc_ci(nll_per_row, n_tokens_per_row):
             nll = float(nll)
         except (TypeError, ValueError, OverflowError):
             return None
-        # Token counts are exact integers.  A fractional count would silently
-        # change the pooled denominator if int() truncated it; use the shared
-        # contract so Decimal('4.9'), booleans and lossy large floats are all
-        # rejected instead of truncated.
+        # Token counts are exact integers under the shared contract;
+        # Decimal('4.9'), booleans and lossy large floats are rejected.
         ntok = _as_seed_int(ntok)
         if ntok is None:
             return None

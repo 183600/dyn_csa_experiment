@@ -1210,9 +1210,8 @@ def _by_len_shape_reason(rec, n_seq):
         if not math.isfinite(_ntok_f) or _ntok_f != math.floor(_ntok_f) or int(_ntok_f) != _want:
             return f'by_len[{_ln_i}].n_tok={_ntok!r} != the frozen {_want} (= {n_seq} rows x {_ln_i - 1} predictions) — truncated/empty cells are not admissible'
         # The cell's own row count is part of the estimand: the by-length
-        # summary quotes the first cell's n_seq, so a cell that claims a
-        # different row count than the frozen slice would silently relabel
-        # the pooled PPL's document sample.
+        # summary quotes the first cell's n_seq, so each cell must state the
+        # frozen row count.
         _cnseq_raw = _c.get('n_seq')
         if _cnseq_raw is not None:
             _cnseq = _record_int(_cnseq_raw)
