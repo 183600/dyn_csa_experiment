@@ -1810,8 +1810,18 @@ def audit_methodology(outdirs=None, design=None, alpha=0.05, min_n=3, write=True
     没有 `results_*/summary.json` 时返回 not_verifiable_locally，而不是
     伪造一个通过。"""
     L = _import_exp_lib()
+    _alpha = L._valid_alpha01(alpha)
+    _min_n = L._valid_min_n(min_n)
+    if _alpha is None or _min_n is None:
+        out = {'status': 'fail', 'alpha': None, 'min_n': None, 'panels': {},
+               'problems': [f'alpha={alpha!r} must be a finite number in (0,1) '
+                            f'and min_n={min_n!r} a positive exact integer; no '
+                            'methodology claim is audited']}
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return out
+    alpha, min_n = _alpha, _min_n
     dirs = list(outdirs) if outdirs is not None else list(_iter_result_dirs())
-    out = {'status': 'ok', 'alpha': float(alpha), 'min_n': int(min_n), 'panels': {}}
+    out = {'status': 'ok', 'alpha': alpha, 'min_n': min_n, 'panels': {}}
     for d in dirs:
         _dir = d if os.path.isabs(d) else os.path.join(REPO, d)
         summ = _load(os.path.join(_dir, 'summary.json'))

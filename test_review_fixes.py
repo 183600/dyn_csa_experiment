@@ -1601,6 +1601,54 @@ def t_seed_plan_exact_counts():
         assert p['sufficient_for_family_rejection'] is False, (bad, p)
     assert L.methodology_seed_plan('3')['n_seeds'] == 3
     assert L.methodology_seed_plan(3.0)['n_seeds'] == 3
+    # The planning significance level is part of the claim contract too: a
+    # boolean/out-of-range/non-numeric alpha must not crash or be echoed as a
+    # usable level.
+    for _bad_alpha in (True, np.bool_(False), 0, 1, 1.5, float('nan'),
+                       float('inf'), 'x', 10 ** 400):
+        _p = L.methodology_seed_plan(12, alpha=_bad_alpha)
+        assert _p['status'] == 'invalid_options', (_bad_alpha, _p)
+        assert _p['sufficient_for_family_rejection'] is False, (_bad_alpha, _p)
+        assert _p['min_seeds_for_family_significance'] is None, (_bad_alpha, _p)
+        assert not math.isfinite(_p['alpha']), (_bad_alpha, _p)
+
+
+def t_analysis_option_gates():
+    # A boolean/fractional seed floor must not weaken the underpowered gate.
+    for _bad_min_n in (True, np.bool_(False), 0, -1, 1.5, float('nan'), 'x'):
+        try:
+            L.methodology_audit({}, design={}, baselines={},
+                                min_n=_bad_min_n, verbose=False)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'methodology_audit accepted min_n={_bad_min_n!r}')
+    for _bad_alpha in (True, np.bool_(False), 0, 1, 1.5, float('nan'), 'x'):
+        try:
+            L.methodology_audit({}, design={}, baselines={},
+                                alpha=_bad_alpha, verbose=False)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'methodology_audit accepted alpha={_bad_alpha!r}')
+    # The family descriptor must not silently echo an invalid level even when
+    # there is no comparison to correct.
+    for _bad_alpha in (True, np.bool_(False), 0, 1, 1.5, float('nan'), 'x', 10 ** 400):
+        try:
+            L.attach_holm({}, alpha=_bad_alpha)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'attach_holm accepted alpha={_bad_alpha!r}')
+    # An unknown selection direction must fail closed, not select the maximum.
+    _trials = [{'config': {'lr': 1}, 'seed_ppls': {0: 1.0, 1: 2.0, 2: 3.0}},
+               {'config': {'lr': 2}, 'seed_ppls': {0: 2.0, 1: 3.0, 2: 4.0}}]
+    for _bad_dir in ('bogus', '', None, True, np.bool_(False), 0):
+        _r = L.tuning_selection_stability(_trials, direction=_bad_dir)
+        assert _r['status'] == 'invalid_options', (_bad_dir, _r)
+        assert _r['stable'] is None and _r['choices'] == [], (_bad_dir, _r)
+    assert L.tuning_selection_stability(_trials, direction='lower_is_better')['choices'][0]['config'] == {'lr': 1}
+    assert L.tuning_selection_stability(_trials, direction='higher_is_better')['choices'][0]['config'] == {'lr': 2}
 
 
 def t_t_critical_high_confidence():
@@ -5467,6 +5515,18 @@ def t_crossover_scaling_refusals():
         _bad[0] = dict(_bad[0], **{_field: True})
         f = L.crossover_scaling_fit(_bad)
         assert f['status'] == 'insufficient_points', (_field, f)
+    # Malformed fitting options are refused before any gate can be disabled:
+    # a NaN volume tolerance or a <1 width-span factor would otherwise let a
+    # confounded/degenerate fit through.
+    for _bad in (True, np.bool_(False), 0, -1, 1.5, float('nan'), float('inf'), 'x'):
+        f = L.crossover_scaling_fit(pts(4), min_points=_bad)
+        assert f['status'] == 'invalid_options' and f['reasons'], (_bad, f)
+    for _bad in (True, np.bool_(False), -0.1, float('nan'), float('inf'), 'x'):
+        f = L.crossover_scaling_fit(pts(4), volume_tol=_bad)
+        assert f['status'] == 'invalid_options' and f['reasons'], (_bad, f)
+    for _bad in (True, np.bool_(False), 0, 0.5, -1, float('nan'), float('inf'), 'x'):
+        f = L.crossover_scaling_fit(pts(4), d_spread_min=_bad)
+        assert f['status'] == 'invalid_options' and f['reasons'], (_bad, f)
     # A clean 4-point fit carries a slope CI and is labelled descriptive.
     f = L.crossover_scaling_fit(pts(4))
     assert f['status'] == 'ok' and f.get('slope') is not None and f.get('ci') is not None, f
@@ -6914,6 +6974,7 @@ def main():
     _check('C11b corpus/validation-slice fingerprint gate', t_pair_reason_fingerprint_gate)
     _check('C21 M0 scale analysis stays descriptive at n=4', t_m0_scale_analysis_descriptive)
     _check('C12 seed plan', t_seed_plan)
+    _check('C12b analysis options fail closed', t_analysis_option_gates)
     _check('C12a seed plan requires exact integer counts', t_seed_plan_exact_counts)
     _check('C12b t critical covers high-confidence intervals', t_t_critical_high_confidence)
     _check('C12c recorded counts use the exact integer contract', t_record_int_exact_spelling)

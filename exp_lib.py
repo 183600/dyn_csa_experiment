@@ -9012,6 +9012,11 @@ def attach_holm(comparisons, *, alpha=0.05, family='reported comparisons', explo
     over-claiming but cannot turn validation-selected v7-v11 panels into
     pre-registered confirmation (design_notes §17).
     """
+    _alpha = _valid_alpha01(alpha)
+    if _alpha is None:
+        raise ValueError(
+            f'attach_holm: alpha must be a real number in (0,1), got {alpha!r}')
+    alpha = _alpha
     if comparisons is None:
         comparisons = {}
     if not isinstance(comparisons, dict):
@@ -11421,11 +11426,53 @@ def crossover_scaling_fit(entries, *, min_points=4, volume_tol=0.25,
     `loglog_regression`; the claim level is fixed to `descriptive` because the
     scale panels are observational, not randomized.
     """
+    _min_points = _valid_min_n(min_points)
+    if isinstance(volume_tol, (bool, np.bool_)):
+        _volume_tol = None
+    else:
+        try:
+            _volume_tol = float(volume_tol)
+        except (TypeError, ValueError, OverflowError):
+            _volume_tol = None
+        else:
+            if not math.isfinite(_volume_tol) or _volume_tol < 0.0:
+                _volume_tol = None
+    if isinstance(d_spread_min, (bool, np.bool_)):
+        _d_spread_min = None
+    else:
+        try:
+            _d_spread_min = float(d_spread_min)
+        except (TypeError, ValueError, OverflowError):
+            _d_spread_min = None
+        else:
+            if not math.isfinite(_d_spread_min) or _d_spread_min < 1.0:
+                _d_spread_min = None
+    if _min_points is None or _volume_tol is None or _d_spread_min is None:
+        _bad = []
+        if _min_points is None:
+            _bad.append(f'min_points={min_points!r} is not a positive exact integer')
+        if _volume_tol is None:
+            _bad.append(f'volume_tol={volume_tol!r} is not a finite non-negative fraction')
+        if _d_spread_min is None:
+            _bad.append(f'd_spread_min={d_spread_min!r} is not a finite factor >= 1')
+        return {'status': 'invalid_options', 'n_input': 0,
+                'claim_level': 'descriptive',
+                'min_points': (_min_points if _min_points is not None else 0),
+                'volume_tolerance': _volume_tol,
+                'd_spread_min': _d_spread_min,
+                'points': [], 'excluded': [], 'reasons': _bad,
+                'note': 'invalid fitting options; no crossover slope is reported'}
+    min_points, volume_tol, d_spread_min = _min_points, _volume_tol, _d_spread_min
     rows = []
     if isinstance(entries, dict):
         entries = [(k, v) for k, v in entries.items()]
+    elif entries is None:
+        entries = []
     else:
-        entries = list(entries) if entries is not None else []
+        try:
+            entries = list(entries)
+        except TypeError:
+            entries = []
     for i, item in enumerate(entries):
         if isinstance(item, dict):
             label, e = item.get('label', str(i)), item
@@ -11459,7 +11506,8 @@ def crossover_scaling_fit(entries, *, min_points=4, volume_tol=0.25,
                      'censored': bool(e.get('censored')) or _mean_not_crossed(e.get('mean_crossed'))})
     out = {'status': 'insufficient_points', 'n_input': len(rows),
            'claim_level': 'descriptive', 'min_points': int(min_points),
-           'volume_tolerance': float(volume_tol), 'points': [], 'excluded': [],
+           'volume_tolerance': float(volume_tol),
+           'd_spread_min': float(d_spread_min), 'points': [], 'excluded': [],
            'note': 'observational scale fit; the panels are not randomized, so a slope is a descriptive trend, not a scaling law'}
     if not rows:
         out['reasons'] = ['no usable crossover panels']
@@ -12682,7 +12730,21 @@ def tuning_selection_stability(trials, metric='ppl', direction='lower_is_better'
     noise draw, not a stable choice.  Requires trial rows that expose their
     per-seed values; returns status `unavailable` otherwise (never a pass).
     """
-    rows = [t for t in (trials or []) if isinstance(t, dict)]
+    if direction not in ('lower_is_better', 'higher_is_better'):
+        # An unknown/absent direction must not silently fall through to the
+        # max: a typo in the objective would report the opposite config as
+        # "selected" and its leave-one-out stability would look valid.
+        return {'status': 'invalid_options',
+                'reason': (f'direction={direction!r} is not one of '
+                           'lower_is_better / higher_is_better; no selection is reported'),
+                'stable': None, 'n_distinct_configs': None,
+                'n_common_seeds': None, 'common_seeds': [], 'choices': [],
+                'metric': metric, 'direction': direction,
+                'note': 'invalid selection direction'}
+    try:
+        rows = [t for t in (trials or []) if isinstance(t, dict)]
+    except TypeError:
+        rows = []
     if not rows:
         return {'status': 'unavailable', 'reason': 'no trial records'}
     seed_maps = []
@@ -13790,6 +13852,18 @@ def methodology_seed_plan(n_seeds, design=None, baselines=None, alpha=0.05, vari
     moved in the predicted direction.  Drivers call this BEFORE training so a
     3-seed panel is labelled descriptive up front instead of being read after
     the fact as a failed confirmation.  Pure function; never blocks a run."""
+    _alpha = _valid_alpha01(alpha)
+    n = _as_seed_int(n_seeds)
+    if n is None or n < 0:
+        n = 0
+    if _alpha is None:
+        return {'n_seeds': n, 'declared_contrasts': 0, 'alpha': float('nan'),
+                'min_seeds_for_family_significance': None,
+                'sufficient_for_family_rejection': False,
+                'ablation_completeness': {}, 'ablation_complete': None,
+                'status': 'invalid_options',
+                'note': ('alpha must be a finite number in (0,1); no seed plan is reported')}
+    alpha = _alpha
     if design is None:
         design = ABLATION_DESIGN
         if baselines is None:
@@ -13809,9 +13883,6 @@ def methodology_seed_plan(n_seeds, design=None, baselines=None, alpha=0.05, vari
     # A seed count is an exact integer.  int(4.9)=4 or int(True)=1 would
     # report a DIFFERENT plan as sufficient (a fractional/boolean count is not
     # a panel size).  Share the exact contract used by the confirmation gates.
-    n = _as_seed_int(n_seeds)
-    if n is None or n < 0:
-        n = 0
     return {'n_seeds': n, 'declared_contrasts': int(m), 'alpha': float(alpha),
             'min_seeds_for_family_significance': req,
             'sufficient_for_family_rejection': bool(req is not None and n >= req),
@@ -13846,6 +13917,13 @@ def methodology_audit(summary, design=None, *, baselines=None, alpha=0.05, min_n
         raise ValueError(
             f'methodology_audit needs a summary object (variant/cell -> record), '
             f'got {type(summary).__name__}; a list/scalar cannot be audited as a panel')
+    _alpha = _valid_alpha01(alpha)
+    _min_n = _valid_min_n(min_n)
+    if _alpha is None or _min_n is None:
+        raise ValueError(
+            'methodology_audit: alpha must be a finite number in (0,1) and '
+            f'min_n a positive exact integer; got alpha={alpha!r}, min_n={min_n!r}')
+    alpha, min_n = _alpha, _min_n
     default_design = design is None
     design = ABLATION_DESIGN if design is None else design
     recs, amb = _variant_seed_map(summary)
