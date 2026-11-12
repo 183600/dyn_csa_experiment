@@ -4800,7 +4800,7 @@ def t_boolean_pvalues_are_not_probabilities():
     # must not be coerced into a smaller family that relaxes Holm.
     base = {'n': 12, 'mean': -1.0, 'std': 0.1,
             'p_exact_signflip': 0.01, 'p_holm': 0.02}
-    for bad_family in (True, np.bool_(False), 4.9, 0, -1):
+    for bad_family in (True, np.bool_(False), 4.9, 0, -1, '4'):
         r = L.reportable_claim(base, family_size=bad_family)
         assert r['allowed'] is False, (bad_family, r)
         assert r['min_attainable_p_holm_family'] is None, (bad_family, r)

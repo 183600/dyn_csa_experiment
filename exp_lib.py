@@ -9077,12 +9077,9 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
             else:
                 out['reasons'].append(f'family_size {family_size!r} is not an integer comparison count')
         else:
-            try:
-                _fs = int(family_size)
-            except (TypeError, ValueError, OverflowError):
-                _fs = None
-            if _fs is None:
-                out['reasons'].append(f'family_size {family_size!r} is not an integer comparison count')
+            # Strings/other objects are not exact declared family sizes; do not
+            # coerce int('4') into a smaller family than the caller stated.
+            out['reasons'].append(f'family_size {family_size!r} is not an integer comparison count')
         if _fs is not None and _fs <= 0:
             out['reasons'].append(f'family_size {family_size!r} must be positive')
             _fs = None
