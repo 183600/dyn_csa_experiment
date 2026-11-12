@@ -9688,12 +9688,19 @@ def signflip_min_n_for_holm(m_comparisons, alpha=0.05, n_max=64):
         return None
     if not (math.isfinite(a) and 0.0 < a < 1.0):
         return None
-    if m <= 0 or not (0.0 < a < 1.0):
+    # The attainable floor decreases monotonically with n, so the smallest
+    # feasible n is the left edge of a suffix.  Binary search keeps this
+    # planning helper O(log n_max) when a scale-up asks for a huge n_max.
+    if holm_min_attainable_p(n_max, m, a) > a + 1e-15:
         return None
-    for n in range(1, n_max + 1):
-        if holm_min_attainable_p(n, m, a) <= a + 1e-15:
-            return n
-    return None
+    lo, hi = 1, n_max
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if holm_min_attainable_p(mid, m, a) <= a + 1e-15:
+            hi = mid
+        else:
+            lo = mid + 1
+    return lo
 
 
 def global_multiplicity_audit(named_pvals, *, alpha=0.05,
@@ -9845,14 +9852,49 @@ def global_multiplicity_audit(named_pvals, *, alpha=0.05,
     return out
 
 
+# Above this n the continued-fraction incomplete beta stops converging in a
+# bounded number of steps, while the Edgeworth expansion below is accurate to
+# O(1/n^2).  The cutoff keeps every small/medium panel on the exact branch.
+_BINOM_EXACT_MAX_N = 1 << 20
+
+
+def _binom_cdf_half_asymptotic(n, m):
+    """P(Bin(n,1/2) <= m) via a continuity-corrected Edgeworth CDF.
+
+    The Bernoulli(1/2) skewness is zero, so only the kurtosis term survives:
+    F(z) ~= Phi(z) + phi(z) * (gamma2/24) * (3z - z^3), gamma2 = -2/n.
+    This is used for very large n where the O(1)-ish incomplete beta becomes
+    numerically unreliable; its error is O(1/n^2), far below any planning
+    threshold."""
+    sd = math.sqrt(n) * 0.5
+    z = (m + 0.5 - 0.5 * n) / sd
+    cdf = 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
+    phi = math.exp(-0.5 * z * z) / math.sqrt(2.0 * math.pi)
+    correction = phi * ((-2.0 / n) / 24.0) * (3.0 * z - z ** 3)
+    return float(min(1.0, max(0.0, cdf + correction)))
+
+
+def _binom_sf_normal(n, k, q):
+    """P(Bin(n,q) >= k) via a continuity-corrected normal tail.
+
+    Used only for very large n; `q` can differ from 1/2 (power planning)."""
+    sd = math.sqrt(n * q * (1.0 - q))
+    if sd <= 0.0:
+        return 1.0 if k <= n * q else 0.0
+    z = (k - 0.5 - n * q) / sd
+    return float(min(1.0, max(0.0, 0.5 * math.erfc(z / math.sqrt(2.0)))))
+
+
 def _binom_cdf_half(n, m):
-    """P(Bin(n, 1/2) <= m), evaluated in log space.
+    """P(Bin(n, 1/2) <= m), evaluated stably at any n.
 
     The planning tools are called with growing seed counts at scale.  The
     direct form `2.0 * sum(comb(n, i)) / 2**n` overflows `float` once n is
     large (int-to-float conversion), even though the probability is perfectly
     representable.  This implementation uses lgamma log-sum-exp for the small
-    tail and symmetry for the upper half, so it stays finite for any n."""
+    tail, symmetry for the upper half, and an asymptotic Edgeworth form for
+    very large n (where the incomplete-beta continued fraction no longer
+    converges in its bounded iteration budget)."""
     n = int(n)
     m = int(m)
     if n <= 0:
@@ -9861,6 +9903,8 @@ def _binom_cdf_half(n, m):
         return 0.0
     if m >= n:
         return 1.0
+    if n > _BINOM_EXACT_MAX_N:
+        return _binom_cdf_half_asymptotic(n, m)
     if m * 2 >= n:
         # P(X <= m) = 1 - P(X <= n-m-1) with n-m-1 < n/2.
         return float(1.0 - _binom_cdf_half(n, n - m - 1))
@@ -9891,18 +9935,26 @@ def signflip_min_consistency(n_seeds, m_comparisons, alpha=0.05):
     m = _as_seed_int(m_comparisons)
     if n is None or m is None or n <= 0 or m <= 0:
         return None
-    best = None
-    for k in range(n, -1, -1):
+    def _clears(k):
         p = 2.0 * _binom_cdf_half(n, n - k)
         # Holm rejects at p_holm <= alpha, so the planning helper must use the
         # same inclusive boundary.  A strict '<' would report a plan as
         # impossible at the exact boundary that holm_adjust accepts.
-        if m * p <= alpha + 1e-15:
-            best = k  # keep descending: p(k) grows monotonically as k shrinks,
-            # so the last k that still clears the gate is the MINIMUM k
+        return m * p <= alpha + 1e-15
+
+    # p(k) decreases monotonically as k grows, so "clears the gate" is a
+    # suffix of [0, n].  Binary search finds its left edge in O(log n) calls
+    # instead of the former O(n) scan (which hung for large seed counts).
+    if not _clears(n):
+        return None
+    lo, hi = 0, n
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if _clears(mid):
+            hi = mid
         else:
-            break
-    return best
+            lo = mid + 1
+    return lo
 
 
 def signflip_power(n_seeds, m_comparisons, q, alpha=0.05):
@@ -9931,6 +9983,11 @@ def signflip_power(n_seeds, m_comparisons, q, alpha=0.05):
         return 1.0
     if q <= 0.0:
         return 0.0
+    # The incomplete beta loses accuracy (and the log-space fallback becomes
+    # O(n)) once n is very large; a normal tail is stable and more accurate
+    # there.  Small panels keep the exact incomplete-beta path.
+    if n > _BINOM_EXACT_MAX_N:
+        return _binom_sf_normal(n, kmin, q)
     cdf = _betai(n - kmin + 1, kmin, 1.0 - q)
     if not math.isfinite(cdf):
         # Fallback: log-space binomial tail (overflow-free).
