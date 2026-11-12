@@ -398,6 +398,23 @@ def _fp_norm(p):
         return p
     return {k: v for k, v in p.items() if k not in ('chunk', 'mode')}
 
+def _val_fp_key(value):
+    """Hashable grouping key that preserves an invalid val_fp as invalid.
+
+    Probe records are grouped before the pairing gate runs.  Stringifying the
+    value here made a boolean flag indistinguishable from the literal string
+    'True', so a malformed record could enter the same group as a verifiably
+    fingerprinted one and bypass the content-identity check.
+    """
+    text = L._content_fp_text(value)
+    if text is not None:
+        return text
+    return ('__invalid_val_fp__', type(value).__name__, repr(value))
+
+def _val_fp_value(key):
+    """The fingerprint to publish on a grouped cell (None if invalid)."""
+    return key if isinstance(key, str) else None
+
 def _recipe_norm(recipe):
     if not isinstance(recipe, str):
         return recipe
@@ -1402,7 +1419,7 @@ def v10_analysis(out='analysis_v10/stats.json'):
             # the grouping key carries the mode EXPLICITLY (probe_params' mode
             # field is normalised out by _fp_norm): uniform and natural cells
             # at the same rho must never merge into one pooled cell.
-            key = (r['variant'], r['arm'], r['eval_len'], r['rho'], _mode, json.dumps(_fp_norm(r.get('probe_params')), sort_keys=True), str(r.get('_code')), str(r.get('recipe')), str(r.get('val_fp')))
+            key = (r['variant'], r['arm'], r['eval_len'], r['rho'], _mode, json.dumps(_fp_norm(r.get('probe_params')), sort_keys=True), str(r.get('_code')), str(r.get('recipe')), _val_fp_key(r.get('val_fp')))
             grp = cells.setdefault(key, {})
             if r['seed'] in grp:
                 _dup_cells.append((k, key[:5], r['seed']))
@@ -1417,7 +1434,7 @@ def v10_analysis(out='analysis_v10/stats.json'):
         for (v, arm, Ln, rho, mode, _pp, _cd, _recipe, _vfp), by_seed in sorted(cells.items(), key=lambda kv: kv[0]):
             means = {s: r['ppl_mean'] for s, r in by_seed.items()}
             assert means, (v, arm, Ln, rho, mode)
-            probe_cells.append({'variant': v, 'arm': arm, 'eval_len': Ln, 'rho': rho, 'mode': mode, 'seeds': sorted(means), 'ppl_by_seed': means, 'probe_params': next(iter(by_seed.values())).get('probe_params'), '_code': _cd, 'recipe': _recipe, 'val_fp': _vfp, 'mean': float(np.mean(list(means.values()))), 'n': len(means)})
+            probe_cells.append({'variant': v, 'arm': arm, 'eval_len': Ln, 'rho': rho, 'mode': mode, 'seeds': sorted(means), 'ppl_by_seed': means, 'probe_params': next(iter(by_seed.values())).get('probe_params'), '_code': _cd, 'recipe': _recipe, 'val_fp': _val_fp_value(_vfp), 'mean': float(np.mean(list(means.values()))), 'n': len(means)})
         contrasts = {}
 
         # The grouped lists are exactly what a scan of probe_cells would have
@@ -1674,7 +1691,7 @@ def v10_analysis(out='analysis_v10/stats.json'):
                 _r = dict(r, seed=_seed,
                           acc=(_acc if _acc is not None else float('nan')),
                           nll=(_nll if _nll is not None else float('nan')))
-                nkey = (_r['variant'], _r['arm'], _r['eval_len'], _r['condition'], json.dumps(_fp_norm(_r.get('probe_params')), sort_keys=True), str(_r.get('_code')), str(_r.get('recipe')), str(_r.get('val_fp')))
+                nkey = (_r['variant'], _r['arm'], _r['eval_len'], _r['condition'], json.dumps(_fp_norm(_r.get('probe_params')), sort_keys=True), str(_r.get('_code')), str(_r.get('recipe')), _val_fp_key(_r.get('val_fp')))
                 grp = ncells.setdefault(nkey, {})
                 if _seed in grp:
                     continue
@@ -1683,7 +1700,7 @@ def v10_analysis(out='analysis_v10/stats.json'):
             for (v, arm, Ln, cond, _pp, _cd, _recipe, _vfp), by_seed in sorted(ncells.items(), key=lambda kv: kv[0]):
                 accs = {s: r['acc'] for s, r in by_seed.items()}
                 nlls = {s: r['nll'] for s, r in by_seed.items()}
-                niah_cells.append({'variant': v, 'arm': arm, 'eval_len': Ln, 'condition': cond, 'seeds': sorted(accs), 'acc_by_seed': accs, 'nll_by_seed': nlls, 'acc_mean': float(np.mean(list(accs.values()))), 'nll_mean': float(np.mean(list(nlls.values()))), 'n': len(accs), 'n_pairs': next(iter(by_seed.values())).get('n_pairs'), 'dist_mean': next(iter(by_seed.values())).get('dist_mean'), '_pp': _pp, '_code': _cd, '_recipe': _recipe, 'val_fp': _vfp})
+                niah_cells.append({'variant': v, 'arm': arm, 'eval_len': Ln, 'condition': cond, 'seeds': sorted(accs), 'acc_by_seed': accs, 'nll_by_seed': nlls, 'acc_mean': float(np.mean(list(accs.values()))), 'nll_mean': float(np.mean(list(nlls.values()))), 'n': len(accs), 'n_pairs': next(iter(by_seed.values())).get('n_pairs'), 'dist_mean': next(iter(by_seed.values())).get('dist_mean'), '_pp': _pp, '_code': _cd, '_recipe': _recipe, 'val_fp': _val_fp_value(_vfp)})
             niah_contrasts = {}
             _nidx = {}
             for c in niah_cells:

@@ -379,8 +379,12 @@ def _relaxed_pair_reason(a, b, tuned_arms):
                 return f'unverifiable {k} (not an exact integer training count)'
             if _ia != _ib:
                 return f'{k} differs ({_va!r} vs {_vb!r})'
-        elif _va != _vb:
-            return f'{k} differs ({_va!r} vs {_vb!r})'
+        else:
+            _ta, _tb = L._content_fp_text(_va), L._content_fp_text(_vb)
+            if _ta is None or _tb is None:
+                return f'{k} is not a text fingerprint ({_va!r} vs {_vb!r})'
+            if _ta != _tb:
+                return f'{k} differs ({_ta[:12]!r} vs {_tb[:12]!r})'
     # Tuning may change lr/wd/warmup, but it must never silently change the
     # optimizer, betas/eps, LR-schedule shape, grad-clip or augmentation.  The
     # strict `pair_reason` already enforces this for architecture contrasts;
@@ -396,8 +400,12 @@ def _relaxed_pair_reason(a, b, tuned_arms):
     ia, ib = a.get('init_core_fp'), b.get('init_core_fp')
     if (ia is None) != (ib is None):
         return 'unverifiable init_core_fp (only one record carries the matched-initialization digest)'
-    if ia is not None and ib is not None and ia != ib:
-        return f'different init_core_fp ({str(ia)[:12]}… vs {str(ib)[:12]}…)'
+    if ia is not None:
+        _ta, _tb = L._content_fp_text(ia), L._content_fp_text(ib)
+        if _ta is None or _tb is None:
+            return f'init_core_fp is not a text fingerprint ({ia!r} vs {ib!r})'
+        if _ta != _tb:
+            return f'different init_core_fp ({_ta[:12]}… vs {_tb[:12]}…)'
     pa, pb = L._as_seed_int(a.get('params')), L._as_seed_int(b.get('params'))
     if pa is None or pb is None or pa <= 0 or pb <= 0:
         return 'unverifiable params (missing, boolean, fractional or non-positive count)'

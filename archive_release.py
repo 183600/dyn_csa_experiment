@@ -27,6 +27,7 @@ SHA-256 清单的固定归档**，可发布到任何只读位置（release 附�
 verify 独立于 make：任何拿到归档的人都能校验完整性。
 """
 import argparse
+from collections import Counter
 import hashlib
 import json
 import os
@@ -354,6 +355,30 @@ def cmd_verify(tar_path):
         return 1
     with tf:
         names = tf.getnames()
+        # A verified archive must be unambiguously extractable.  `make` refuses
+        # to create duplicate members, and it only stores repo-relative regular
+        # files; verify applies the same contract to archives produced by other
+        # tools so a pass cannot bless an archive that extraction would resolve
+        # differently (duplicate names) or write outside the destination
+        # (absolute / `..` member names).
+        _dup_members = sorted(n for n, c in Counter(names).items() if c > 1)
+        if _dup_members:
+            print(f'[archive] REFUSE: archive contains duplicate member names '
+                  f'{_dup_members[:5]} — extraction would be ambiguous, so the '
+                  'content hashes cannot identify one unique release tree')
+            return 1
+        _unsafe_members = []
+        for _name in names:
+            _parts = _name.replace('\\', '/').split('/')
+            if (not _name or _name.startswith('/') or
+                    any(_p in ('', '..') for _p in _parts) or
+                    (len(_parts[0]) == 2 and _parts[0][1] == ':')):
+                _unsafe_members.append(_name)
+        if _unsafe_members:
+            print(f'[archive] REFUSE: archive contains unsafe member path(s) '
+                  f'{_unsafe_members[:5]} — absolute or parent-traversing '
+                  'members cannot be extracted safely')
+            return 1
         # The manifest written by `make` is named after the archive itself.
         # Picking the first `*.MANIFEST.sha256` member would let an ordinary
         # collected file (e.g. a stray results_*/aaa.MANIFEST.sha256) hijack

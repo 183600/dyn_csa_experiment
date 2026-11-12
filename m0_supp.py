@@ -605,8 +605,15 @@ def _panel_corpus_fp(summary, variant=None):
         fp = rec.get('data_version')
         if fp is None and isinstance(rec.get('provenance'), dict):
             fp = ((rec['provenance'].get('data') or {}).get('data_version'))
-        if fp not in (None, ''):
-            fps.add(str(fp))
+        if fp is None:
+            continue
+        # A boolean flag (or an empty/non-UTF-8 bytes value) is not a corpus
+        # identity.  Stringifying it here would turn True into the literal
+        # fingerprint "True" and let unrelated panels look tokenizer-identical.
+        text = L._content_fp_text(fp)
+        if text is None:
+            raise ValueError(f'{variant or "panel"}: records carry a malformed data_version fingerprint {fp!r} (boolean/empty/non-text)')
+        fps.add(text)
     if len(fps) > 1:
         raise ValueError(f'{variant or "panel"}: records carry {len(fps)} different data_version fingerprints {sorted(fps)}')
     return (sorted(fps)[0] if fps else None)

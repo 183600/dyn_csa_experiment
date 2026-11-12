@@ -1413,6 +1413,13 @@ def t_finaltest_requires_parameter_matching():
                                       bylen_path=os.path.join(td, 'bylen.json'),
                                       probe_path=os.path.join(td, 'probe.json'),
                                       out=os.path.join(td, 'stats5.json'))
+            # A boolean is a flag, not a shared-init digest: str(True) must not
+            # make two malformed arms look like the same initialization.
+            V12._admit_confirmation_records = lambda raw, man: (_records(params=1000, init=True), None)
+            st6 = V12.finaltest_stats(manifest=manifest,
+                                      bylen_path=os.path.join(td, 'bylen.json'),
+                                      probe_path=os.path.join(td, 'probe.json'),
+                                      out=os.path.join(td, 'stats6.json'))
         finally:
             V12._admit_confirmation_records = _old_admit
             V12._test_probe_stats = _old_probe
@@ -1422,6 +1429,9 @@ def t_finaltest_requires_parameter_matching():
         assert st4['comparisons']['c1']['same_init_core_fp'] is False, st4['comparisons']['c1']
         assert st4['confirmed'] == [], st4['confirmed']
         assert st5['by_length']['a_arm']['4096']['n_seqs'] is None, st5['by_length']['a_arm']['4096']
+        assert st6['comparisons']['c1']['init_core_fp_recorded'] is False, st6['comparisons']['c1']
+        assert st6['comparisons']['c1']['same_init_core_fp'] is False, st6['comparisons']['c1']
+        assert st6['confirmed'] == [], st6['confirmed']
 
 
 def t_freeze_lock():
@@ -1927,6 +1937,15 @@ def t_tuned_pairing_keeps_optimizer_gate():
     b5 = dict(b)
     why4 = BT._relaxed_pair_reason(a4, b5, {'a': 3, 'b': 3})
     assert why4 and 'unverifiable init_core_fp' in why4, why4
+    # A boolean flag (even the same one on both arms) is not a corpus or
+    # matched-init identity.
+    for _k in ('data_fp', 'val_fp'):
+        _why = BT._relaxed_pair_reason(dict(a, **{_k: True}),
+                                       dict(b, **{_k: True}), {'a': 3, 'b': 3})
+        assert _why and 'text fingerprint' in _why, (_k, _why)
+    _why = BT._relaxed_pair_reason(dict(a, init_core_fp=True),
+                                   dict(b, init_core_fp=True), {'a': 3, 'b': 3})
+    assert _why and 'text fingerprint' in _why, _why
 
 
 def t_arm_mean_std_and_relative_effect():
@@ -7128,6 +7147,90 @@ def t_audit_resume_and_curve_regressions():
     assert _r['health_history'][0]['val_ppl'] is None, _r['health_history'][0]
 
 
+def t_content_fingerprint_bytes_and_probe_grouping():
+    # A bytes fingerprint is its text twin, while empty/non-UTF-8 bytes are
+    # absent.  str(b'') is "b''" (truthy), which previously masqueraded as a
+    # real corpus identity.
+    assert L._content_fp_text(b'') is None
+    assert BR._content_fp_text(b'') is None
+    assert L._content_fp_text(b'abc') == 'abc' == BR._content_fp_text(b'abc')
+    assert L._content_fp_text(b'\xff') is None
+
+    # Probe grouping must preserve an invalid val_fp as invalid: stringifying
+    # a boolean made it identical to the literal fingerprint "True", letting
+    # it bypass the later content-fingerprint pairing gate.
+    _bad = V10._val_fp_key(True)
+    assert _bad != V10._val_fp_key('True'), (_bad, V10._val_fp_key('True'))
+    assert V10._val_fp_value(_bad) is None
+    assert V10._val_fp_value(V10._val_fp_key('True')) == 'True'
+    assert V11.V10._val_fp_key(False) != V11.V10._val_fp_key('False')
+
+    # The same identity rule applies to scale-panel corpus provenance and to
+    # the descriptive test-probe admission: a boolean is not a fingerprint.
+    try:
+        M0._panel_corpus_fp({'a::seed0': {'variant': 'a', 'data_version': True}})
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('a boolean data_version must not become the corpus fingerprint "True"')
+    _pts = L._scale_points([{'label': 'p', 'scale': 1.0, 'effects': [0.1],
+                             'seeds': [0], 'corpus_fp': b'abc'}])
+    assert _pts[0]['corpus_fp'] == 'abc', _pts
+    for _bad_fp in (True, b'', b'\xff'):
+        try:
+            L._scale_points([{'label': 'p', 'scale': 1.0, 'effects': [0.1],
+                              'seeds': [0], 'corpus_fp': _bad_fp}])
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'a malformed corpus_fp {_bad_fp!r} must be refused')
+
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, 'probe.json')
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump({'learned0': {'variant': 'csa_fixed', 'seed': 0,
+                                    'arm': 'learned', 'eval_len': 4096,
+                                    'rho': 0.5, 'ppl_mean': 10.0,
+                                    'probe_params': {'n_seq': 16},
+                                    'val_fp': 'F', 'train_fp': True,
+                                    '_code': L.code_stamp()}}, f)
+        st = V12._test_probe_stats(path, {'arms': ['csa_fixed'], 'seeds': [0]}, 'F')
+        assert st['n_admitted'] == 0 and st['n_excluded'] == 1, st
+
+
+def t_archive_verify_rejects_ambiguous_member_paths():
+    import archive_release as AR
+    import io
+    import tarfile
+
+    def _release(path, members):
+        base = os.path.basename(path)
+        assert base.endswith('.tar.gz')
+        man_name = base[:-len('.tar.gz')] + '.MANIFEST.sha256'
+        man = {'files': {}}
+        with tarfile.open(path, 'w:gz') as tf:
+            for name, payload in members:
+                ti = tarfile.TarInfo(name)
+                ti.size = len(payload)
+                tf.addfile(ti, io.BytesIO(payload))
+                import hashlib
+                man['files'][name] = {'sha256': hashlib.sha256(payload).hexdigest(),
+                                      'bytes': len(payload)}
+            mb = json.dumps(man).encode('utf-8')
+            mti = tarfile.TarInfo(man_name)
+            mti.size = len(mb)
+            tf.addfile(mti, io.BytesIO(mb))
+        with open(path + '.sha256', 'w', encoding='utf-8') as f:
+            f.write(AR._sha256(path) + '  ' + base + '\n')
+
+    with tempfile.TemporaryDirectory() as d:
+        _release(os.path.join(d, 'release_dup.tar.gz'),
+                 [('payload.txt', b'hello'), ('payload.txt', b'hello')])
+        assert AR.cmd_verify(os.path.join(d, 'release_dup.tar.gz')) == 1
+        _release(os.path.join(d, 'release_escape.tar.gz'),
+                 [('../escape.txt', b'hello')])
+        assert AR.cmd_verify(os.path.join(d, 'release_escape.tar.gz')) == 1
+
 def main():
     if not _HAVE_TORCH:
         print('[test] SKIPPED: the CPU test suite could not import its dependencies; this is NOT a pass (exit 3)')
@@ -7374,6 +7477,8 @@ def main():
     _check('L15b scale-point corpus provenance roundtrip', t_scale_point_provenance_roundtrip)
     _check('L15c scale-edge regressions (tiny effects, zero deltas, tiny corpora)', t_scale_edge_case_regressions)
     _check('L16 targeted contract edges', t_targeted_contract_edges)
+    _check('L17 content fingerprints canonicalise bytes; probe grouping preserves invalid val_fp', t_content_fingerprint_bytes_and_probe_grouping)
+    _check('L18 archive verify rejects duplicate/traversing member paths', t_archive_verify_rejects_ambiguous_member_paths)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')

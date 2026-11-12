@@ -536,10 +536,19 @@ def _content_fp_text(value):
     flags, not fingerprints).  Mirrors exp_lib._content_fp_text."""
     if value is None or isinstance(value, (bool, np.bool_)):
         return None
-    try:
-        text = str(value)
-    except Exception:
-        return None
+    if isinstance(value, (bytes, bytearray)):
+        # Same identity contract as exp_lib._content_fp_text: decode a bytes
+        # fingerprint, and treat empty/non-UTF-8 bytes as absent rather than
+        # accepting the truthy repr "b''" as a corpus identity.
+        try:
+            text = bytes(value).decode('utf-8')
+        except UnicodeDecodeError:
+            return None
+    else:
+        try:
+            text = str(value)
+        except Exception:
+            return None
     return text if text else None
 
 

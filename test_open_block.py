@@ -133,6 +133,14 @@ def t_config_and_segmenter():
     bad['open_block_config']['layers'][0]['extra_factor'] = 1
     assert 'undeclared field' in O._controlled_reason(
         dict(_cfg(8), run_fingerprint='x'), dict(bad, run_fingerprint='x'))
+    # A boolean is a flag, not a corpus fingerprint, even when both arms carry
+    # the same malformed value; empty strings are the 'both omitted' state.
+    _bfp_a = dict(_cfg(8), run_fingerprint='x', data_fp=True)
+    _bfp_b = dict(_cfg(None), run_fingerprint='x', data_fp=True)
+    assert 'text fingerprint' in O._controlled_reason(_bfp_a, _bfp_b)
+    _efp_a = dict(_cfg(8), run_fingerprint='x', data_fp='')
+    _efp_b = dict(_cfg(None), run_fingerprint='x', data_fp='')
+    assert O._controlled_reason(_efp_a, _efp_b) is None
 
 
 # ---------------------------------------------------------------------------

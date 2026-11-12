@@ -7988,10 +7988,20 @@ def _content_fp_text(value):
     booleans (and empty values) as absent so pairing fails closed."""
     if value is None or isinstance(value, (bool, np.bool_)):
         return None
-    try:
-        text = str(value)
-    except Exception:
-        return None
+    if isinstance(value, (bytes, bytearray)):
+        # A bytes fingerprint is the same identity as its text twin.  str(b'')
+        # is the truthy 3-character string "b''", which would let an empty
+        # fingerprint masquerade as a real one; decode first and fail closed
+        # on non-UTF-8 bytes rather than inventing a representation.
+        try:
+            text = bytes(value).decode('utf-8')
+        except UnicodeDecodeError:
+            return None
+    else:
+        try:
+            text = str(value)
+        except Exception:
+            return None
     return text if text else None
 
 
@@ -10725,6 +10735,10 @@ def _scale_points(points):
             # would compare equal across unrelated panels.
             raise ValueError('scale point %r: corpus_fp=%r is a boolean flag, not a fingerprint'
                              % (label, corpus_fp))
+        _corpus_fp_text = _content_fp_text(corpus_fp)
+        if corpus_fp not in (None, '') and _corpus_fp_text is None:
+            raise ValueError('scale point %r: corpus_fp=%r is not a text fingerprint'
+                             % (label, corpus_fp))
         if vocab is not None:
             # A tokenizer vocabulary is an exact positive count; int(True)=1
             # or int(1.9)=1 would masquerade as a real vocabulary and could
@@ -10736,7 +10750,7 @@ def _scale_points(points):
         else:
             vb = None
         out.append({'label': str(label), 'scale': sc, 'effects': effects, 'seeds': seeds_kept,
-                    'corpus_fp': (str(corpus_fp) if corpus_fp not in (None, '') else None),
+                    'corpus_fp': _corpus_fp_text,
                     'vocab': vb})
     return out
 

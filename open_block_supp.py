@@ -463,8 +463,21 @@ def _controlled_reason(a, b):
         va, vb = a.get(k), b.get(k)
         if (va is None) != (vb is None):
             return f'unverifiable {k} (only one record carries it)'
-        if va is not None and va != vb:
-            return f'{k} differs ({va!r} != {vb!r})'
+        if va is None:
+            continue
+        # A fingerprint is a text identity: str(True) == "True" would let a
+        # malformed boolean pass as a shared corpus/validation slice.
+        ta, tb = L._content_fp_text(va), L._content_fp_text(vb)
+        if ta is None or tb is None:
+            # Two explicit absent spellings are the same "both omitted"
+            # state as None; a boolean/empty-marker mismatch is not.
+            def _absent_fp(x):
+                return x is None or (isinstance(x, (str, bytes, bytearray)) and not x)
+            if _absent_fp(va) and _absent_fp(vb):
+                continue
+            return f'{k} is not a text fingerprint ({va!r} vs {vb!r})'
+        if ta != tb:
+            return f'{k} differs ({ta[:12]!r} != {tb[:12]!r})'
     if not isinstance(a.get('open_block_config'), dict) or not isinstance(b.get('open_block_config'), dict):
         return 'unverifiable open_block_config (at least one record omits it)'
     oa = a.get('open_block_config')

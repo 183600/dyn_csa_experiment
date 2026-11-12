@@ -1568,7 +1568,11 @@ def _test_probe_stats(probe_path, manifest, slice_fp):
     impl = _frozen_implementation(manifest)
     want_train_fp = _frozen_train_fp(manifest)
     _require_train_fp = _train_fp_required(manifest) or any(
-        isinstance(_r, dict) and bool(_r.get('train_fp')) for _r in raw.values())
+        # A malformed truthy/falsey value still declares an intended binding;
+        # use presence, not truthiness, so a boolean cannot be treated as
+        # "no descriptor" and silently admitted.
+        isinstance(_r, dict) and _r.get('train_fp') is not None
+        for _r in raw.values())
     groups = {}
     excluded = []
     _probe_train_fps = set()
@@ -1579,6 +1583,7 @@ def _test_probe_stats(probe_path, manifest, slice_fp):
             continue
         why = None
         _seed_i = _record_int(r.get('seed'))
+        _tfp_text = L._content_fp_text(r.get('train_fp'))
         if r.get('synthesized'):
             why = 'synthesized reconstruction — not an independent probe measurement'
         elif r.get('variant') not in arms:
@@ -1589,10 +1594,14 @@ def _test_probe_stats(probe_path, manifest, slice_fp):
             why = f"val_fp {str(r.get('val_fp'))[:12]}… does not match the frozen test slice {str(slice_fp)[:12]}…"
         elif exp_code is not None and r.get('_code') != exp_code:
             why = f"_code {r.get('_code')!r} does not match the frozen code semantics {exp_code!r}"
-        elif _require_train_fp and not r.get('train_fp'):
-            why = 'missing training-corpus fingerprint (train_fp) for the probe record'
-        elif want_train_fp is not None and r.get('train_fp') != want_train_fp:
-            why = f"train_fp {r.get('train_fp')} does not match the frozen canonical training fingerprint {want_train_fp}"
+        elif _require_train_fp and _tfp_text is None:
+            why = (f'missing/invalid training-corpus fingerprint (train_fp={r.get("train_fp")!r}) '
+                   'for the probe record')
+        elif r.get('train_fp') is not None and _tfp_text is None:
+            why = (f'train_fp {r.get("train_fp")!r} is not a text fingerprint — '
+                   'a boolean/empty/non-text value is not a corpus identity')
+        elif want_train_fp is not None and _tfp_text != want_train_fp:
+            why = f"train_fp {_tfp_text} does not match the frozen canonical training fingerprint {want_train_fp}"
         elif _recipe_signature(manifest, r.get('variant')) is not None and not _recipe_matches_signature(r.get('recipe'), _recipe_signature(manifest, r.get('variant'))):
             why = 'recipe does not match the frozen training_recipe signature (including the per-arm mr)'
         elif _implementation_reason(r, impl) is not None:
@@ -1626,8 +1635,8 @@ def _test_probe_stats(probe_path, manifest, slice_fp):
             _ambiguous_idents.add(ident)
             continue
         grp[_seed_i] = float(r['ppl_mean'])
-        if r.get('train_fp'):
-            _probe_train_fps.add(str(r['train_fp']))
+        if _tfp_text is not None:
+            _probe_train_fps.add(_tfp_text)
     for _ident in _ambiguous_idents:
         groups.pop(_ident, None)
     if len(_probe_train_fps) > 1:
@@ -1738,8 +1747,10 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
     # admission binds the corpus/slice/row count/recipe/code, but the RNG stream
     # and batch order are not independently re-derivable from a record; report
     # them instead of silently assuming them.
-    _rngs = sorted({str(r.get('rng_fp')) for r in admitted.values() if r.get('rng_fp')})
-    _inits = sorted({str(r.get('init_core_fp')) for r in admitted.values() if r.get('init_core_fp')})
+    _rngs = sorted({_t for _t in (L._content_fp_text(r.get('rng_fp'))
+                                  for r in admitted.values()) if _t is not None})
+    _inits = sorted({_t for _t in (L._content_fp_text(r.get('init_core_fp'))
+                                  for r in admitted.values()) if _t is not None})
     stats['validity'] = {
         'rng_fp_values': _rngs,
         'same_rng_fp': len(_rngs) <= 1,
@@ -1893,11 +1904,15 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
         _iv = []
         _init_complete = bool(usable)
         for _s in usable:
-            _ia, _ib = recs_a[_s].get('init_core_fp'), recs_b[_s].get('init_core_fp')
-            if not _ia or not _ib:
+            _ia = L._content_fp_text(recs_a[_s].get('init_core_fp'))
+            _ib = L._content_fp_text(recs_b[_s].get('init_core_fp'))
+            if _ia is None or _ib is None:
+                # A boolean/empty/non-text digest is not a shared-trunk
+                # initialization identity; accepting str(True) would let two
+                # malformed records "confirm" a matched init.
                 _init_complete = False
                 continue
-            _iv.extend((str(_ia), str(_ib)))
+            _iv.extend((_ia, _ib))
         res['init_core_fp_recorded'] = _init_complete
         res['same_init_core_fp'] = bool(_init_complete and len(set(_iv)) <= 1)
         _act = []
