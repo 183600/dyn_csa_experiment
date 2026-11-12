@@ -20700,9 +20700,9 @@ def _plan_run(cfg, summary_path, fp):
                 if _drop_is_stale:
                     stale_dropped.append(key)
             cells.append((v, seed))
-    # The declared plan is every cfg cell, not only the cells that still need
-    # to run.  Building this set from `cells` classified every already-complete
-    # cell as unplanned and deleted it from summary.json on a normal resume.
+    # The declared plan is every cfg cell, including cells that are already
+    # complete; only cells outside this manifest are unplanned and removed
+    # from summary.json.
     planned = {f'{v}::seed{seed}'
                for seed in cfg['seeds'] for v in cfg['variants']}
     unplanned = sorted(k for k in summary if k not in planned)

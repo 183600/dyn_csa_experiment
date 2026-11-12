@@ -60,10 +60,9 @@ if _HAVE_TORCH:
     class _WorkerDrawDataset(torch.utils.data.Dataset):
         """Module-level dataset so DataLoader workers can pickle it.
 
-        Python 3.14 changed the default non-Mac start method to forkserver,
-        which requires the dataset object (including its class) to be
-        picklable.  A function-local class cannot be pickled, so the worker
-        reproducibility test would error before exercising the seed contract.
+        Python 3.14's default non-Mac start method is forkserver, which
+        requires the dataset object (including its class) to be picklable;
+        a function-local class cannot be pickled.
         """
 
         def __len__(self):

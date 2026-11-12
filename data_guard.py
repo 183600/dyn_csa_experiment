@@ -1600,10 +1600,9 @@ def _matrix_fingerprint(X):
         # the float64 fallback collapses 2**53 and 2**53+1.
         _vals = arr.reshape(-1).tolist()
         # Booleans are integral in the row-key contract (0/1), so include them
-        # here too.  Excluding them sent an object table such as
-        # [[True, 2**53]] through the float64 fallback, where 2**53 and
-        # 2**53+1 collide even though the duplicate detector keeps them
-        # distinct.
+        # here too: an object table such as [[True, 2**53]] stays on the exact
+        # integer path, where 2**53 and 2**53+1 remain distinct as the
+        # duplicate detector requires.
         _obj_int = all(isinstance(v, numbers.Integral)
                        or isinstance(v, (bool, np.bool_))
                        for v in _vals)

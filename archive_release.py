@@ -265,10 +265,10 @@ def cmd_make(tag, dirs, include_ckpt=False, outdir='archive'):
         return 1
     base_name = f'release_{tag}'
     man_path_rel = f'{base_name}.MANIFEST.sha256'
-    # The in-archive manifest has a reserved member name.  A collected file
-    # with the same repo-relative path (e.g. `--dirs .` plus a stray root
-    # manifest) would create two members with that name; `make` would succeed
-    # but its own verifier would refuse the archive.  Exclude it up front.
+    # The in-archive manifest has a reserved member name.  Exclude any
+    # collected file with the same repo-relative path (e.g. `--dirs .` plus a
+    # stray root manifest) so the archive never contains two members with that
+    # name and still passes its own verifier.
     _collisions = [p for p in files
                    if os.path.relpath(p, REPO) == man_path_rel]
     if _collisions:

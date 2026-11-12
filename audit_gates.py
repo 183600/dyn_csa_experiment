@@ -94,9 +94,9 @@ def _exact_int_scalar(value):
         return int(f)
     if isinstance(value, (str, bytes)):
         # A JSON spelling is either a canonical decimal integer ("3"/"-3") or
-        # not.  int() would also accept whitespace, a leading '+', leading
-        # zeros or underscores ("1_0"), silently mapping malformed provenance
-        # to a different canonical identity than the strict record contract.
+        # not.  Whitespace, a leading '+', leading zeros and underscores
+        # ("1_0") are not accepted, so malformed provenance cannot map to a
+        # different canonical identity than the strict record contract.
         try:
             _s = value.decode('ascii') if isinstance(value, bytes) else value
         except (UnicodeDecodeError, AttributeError):

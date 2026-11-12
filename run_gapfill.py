@@ -297,10 +297,9 @@ def merge_long_aggregate(adir, snapshot_agg):
         fm = _seed_map(fentry, tag=str(key))
         _overlap = set(sm) & set(fm)
         n_old_all = len(sm)
-        # A partially overlapping fresh run must contribute only its NEW seeds
-        # to a union mean; the old snapshot contributes only the seeds the
-        # fresh run did not re-measure.  Weighting the old mean by all old
-        # seeds (including the overlap) double-counted those seeds.
+        # A partially overlapping fresh run contributes only its NEW seeds to
+        # a union mean; the old snapshot contributes only the seeds the fresh
+        # run did not re-measure.
         n_old_only, n_new_only = (n_old_all - len(_overlap),
                                   len(fm) - len(_overlap))
         sm.update(fm)
