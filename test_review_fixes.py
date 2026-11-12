@@ -4942,6 +4942,29 @@ def t_scale_ladder_budget_and_transfer_audit():
     out4 = L.scale_ladder_audit([tier('S1', 1000, None), b])
     assert out4['budget_matched'] is None, out4
     assert any('params missing' in w for w in out4['warnings']), out4
+    # Vocabulary provenance is an exact positive count, not a boolean or a
+    # fractional value.  int(True)=1 / int(2.9)=2 would otherwise let two
+    # different tokenisations look "shared".
+    for _bad_vocab in (True, np.bool_(False), 1.5, '1000', 0, -1):
+        _a = tier('S1', 1000, 1000)
+        _b = tier('S2', 2000, 2000)
+        _a['cfg']['vocab'] = _bad_vocab
+        _b['cfg']['vocab'] = _bad_vocab
+        _out = L.scale_ladder_audit([_a, _b])
+        assert _out['status'] == 'fail', (_bad_vocab, _out)
+        assert any('vocab' in p for p in _out['problems']), (_bad_vocab, _out)
+    _a = tier('S1', 1000, 1000)
+    _b = tier('S2', 2000, 2000)
+    _a['cfg']['vocab'] = _b['cfg']['vocab'] = 8000
+    assert L.scale_ladder_audit([_a, _b])['status'] != 'fail'
+    # A boolean learning rate is a flag, not float(True)=1.0.
+    for _bad_lr in (True, np.bool_(False)):
+        _a = tier('S1', 1000, 1000)
+        _b = tier('S2', 2000, 2000)
+        _a['cfg']['lr'] = _b['cfg']['lr'] = _bad_lr
+        _out = L.scale_ladder_audit([_a, _b])
+        assert _out['status'] == 'fail', (_bad_lr, _out)
+        assert any('lr' in p for p in _out['problems']), (_bad_lr, _out)
     # The deployed plan must carry an explicit transfer policy and expose the
     # S1/S2 allocation ratio rather than silently calling it matched.
     pol = L.SCALE_TRANSFER_POLICY

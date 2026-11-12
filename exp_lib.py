@@ -10610,10 +10610,18 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
             if _v is None:
                 continue
             if _fpk == 'vocab':
+                # A tokenizer vocabulary is an exact positive count, not a
+                # boolean flag or a fractional value: int(True)=1 and
+                # int(2.9)=2 would masquerade as a real (and "shared")
+                # tokenisation.  Strings are refused too; a declared count
+                # must be a number, not a coercion target.
                 try:
-                    _v = int(_v)
+                    _v = _as_int(_v, 'vocab')
                 except (TypeError, ValueError, OverflowError):
                     problems.append(f'{name}: vocab={_v!r} is not an integer')
+                    continue
+                if _v <= 0:
+                    problems.append(f'{name}: vocab={_v!r} must be positive')
                     continue
             row[_fpk] = _v
         try:
@@ -10621,7 +10629,12 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
             batch = _as_int(cfg['batch_size'], 'batch_size')
             seq = _as_int(cfg['seq_len'], 'seq_len')
             declared_tokens = _as_int(cfg.get('n_train_tokens') or 0, 'n_train_tokens')
-            lr = float(cfg.get('lr'))
+            _lr_raw = cfg.get('lr')
+            if isinstance(_lr_raw, (bool, np.bool_)):
+                # A boolean is a flag, not a learning rate: float(True)=1.0
+                # would silently become a plausible (and finite) LR.
+                raise ValueError(f'lr={_lr_raw!r} is a boolean, not a number')
+            lr = float(_lr_raw)
             warmup = _as_int(cfg.get('warmup') or 0, 'warmup')
             seeds = [_as_int(s, 'seed') for s in (cfg.get('seeds') or [])]
         except (KeyError, TypeError, ValueError, OverflowError) as e:
