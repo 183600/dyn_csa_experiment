@@ -5741,9 +5741,8 @@ def _validate_token_ids(ids, vocab, label='token ids'):
 def _meta_declares_shuffle(value):
     """True when split metadata declares (or cannot deny) a shuffled split.
 
-    Only a real boolean ``False``/``None`` is a clean declaration.  A JSON
-    ``1``/``"yes"`` is malformed provenance and must fail closed instead of
-    silently passing an ``is True`` check, exactly like the audit gate.
+    Only a real boolean ``False``/``None`` is a clean declaration; any other
+    value is malformed provenance and fails closed.
     """
     if value is None:
         return False
@@ -9090,9 +9089,8 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
         _n_eff = n
     else:
         # The nonzero-pair count is an exact integer, like every other seed
-        # count: int(4.9)=4 would silently claim a finer resolution floor
-        # than the panel actually has.  Malformed values fail closed (their
-        # reason blocks the claim) while the floor still uses the declared n.
+        # count; malformed values fail closed (their reason blocks the claim)
+        # while the floor still uses the declared n.
         _n_eff = _as_seed_int(_n_eff_raw)
         if _n_eff is None or _n_eff < 0 or _n_eff > n:
             out['reasons'].append(

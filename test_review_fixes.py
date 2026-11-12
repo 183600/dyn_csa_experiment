@@ -1374,14 +1374,12 @@ def t_eval_length_invalid_lengths():
         assert 'error' in out[bad] and 'ppl' not in out[bad], (bad, out[bad])
     for good in (8, 16):
         assert 'ppl' in out[good] and out[good]['eval_span'] == good, (good, out[good])
-    # A requested length beyond the supplied slice cannot be scored in full:
-    # it must be a named error cell, not an index crash or a silent short span.
+    # A requested length beyond the supplied slice is a named error cell.
     short = np.asarray(np.random.default_rng(12).integers(0, 64, size=(2, 12)), dtype=np.int64)
     out_short = V7.eval_length_gen(model, short, [8, 20], dev, max_pos=None)
     assert 'ppl' in out_short[8] and 'error' in out_short[20], out_short
     assert out_short[20].get('eval_span') is None, out_short
-    # Truncating to fewer than two tokens has no next-token target; exp(0)=1
-    # would masquerade as a perfect measurement.
+    # Truncating to fewer than two tokens has no next-token target.
     out_trunc = V7.eval_length_gen(model, ids, [20], dev, max_pos=1)
     assert 'error' in out_trunc[20] and 'ppl' not in out_trunc[20], out_trunc
     # Malformed (unhashable) length identities must not crash the whole eval.
@@ -3970,8 +3968,8 @@ def t_categorical_and_cache_guards():
     bad2 = dict(meta, shuffle_at_split=True)
     assert any('shuffled split' in p for p in
                L._cached_split_problems(bad2, tr, va, np.zeros_like(va, dtype=bool), 11, seq_len=8))
-    # A malformed non-boolean spelling cannot deny a shuffled split and must
-    # fail closed instead of passing an `is True` check.
+    # A malformed non-boolean spelling cannot deny a shuffled split; it
+    # fails closed.
     bad2b = dict(meta, shuffle_at_split=1)
     assert any('shuffled split' in p for p in
                L._cached_split_problems(bad2b, tr, va, np.zeros_like(va, dtype=bool), 11, seq_len=8))
@@ -5028,8 +5026,8 @@ def t_reportable_claim_gate():
     # directional claim, even if the aggregate p happens to clear Holm.
     r = L.reportable_claim(dict(base, seed_driven=True))
     assert r['allowed'] is False and any('leave-one-seed-out' in x for x in r['reasons']), r
-    # n_nonzero is an exact nonzero-pair count; a fractional spelling must not
-    # be truncated into a different (finer) resolution floor.
+    # n_nonzero is an exact nonzero-pair count; a fractional spelling is
+    # rejected.
     r = L.reportable_claim(dict(base, n_nonzero=4.9))
     assert r['allowed'] is False and any('n_nonzero' in x for x in r['reasons']), r
 

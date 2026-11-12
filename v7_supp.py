@@ -2287,9 +2287,8 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=16, max_pos=
     for _ln in (eval_lens if eval_lens is not None else []):
         _li = L._as_seed_int(_ln)
         if _li is None:
-            # Malformed length keys must not crash the whole evaluation: an
-            # unhashable value (list/dict) cannot be a dict key, so use a
-            # stable repr fallback while keeping exact-integer keys unchanged.
+            # Unhashable length identities use a stable repr fallback;
+            # exact-integer keys are unchanged.
             try:
                 _bad_key = _ln
                 hash(_bad_key)
@@ -2325,11 +2324,10 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=16, max_pos=
                              f'cannot evaluate L={Ln} with max_pos=None — use a RoPE arm '
                              'or pass max_pos to request the explicit truncated span'),
                    'truncated': False, 'eval_span': None}
-    # A non-truncated request consumes Ln contiguous tokens from val_ids.  If
-    # the supplied slice is shorter, the full-prefix branch would index past
-    # its end (and report a token count it never scored), so fail closed with
-    # a named error cell.  Truncated requests only need the (possibly shorter)
-    # tail window and are handled by the _trunc_lens branch below.
+    # A non-truncated request consumes Ln contiguous tokens from val_ids, so
+    # a shorter supplied slice is a named error cell.  Truncated requests only
+    # need the (possibly shorter) tail window and are handled by the
+    # _trunc_lens branch below.
     _too_long = [int(Ln) for Ln in eval_lens
                  if int(Ln) not in _over
                  and (_eff_max is None or int(Ln) <= _eff_max)
@@ -2419,8 +2417,7 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=16, max_pos=
             _key = (_start, _end)
             if _end - _start < 2:
                 # A truncated span shorter than 2 tokens has no next-token
-                # target at all; reporting exp(0) = 1.0 would look like a
-                # perfect measurement.  Fail closed with a named error cell.
+                # target, so it is a named error cell.
                 _err = (f'evaluation length {Ln} truncates to a {_end - _start}-token '
                         'span, which has no next-token prediction (needs >= 2 tokens; '
                         'increase max_pos or supply a longer val_ids slice)')
