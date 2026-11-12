@@ -1192,7 +1192,7 @@ def sec_p1l():
     s = summary('results_len')
     if not s:
         return '## P1 长上下文长度外推（train@512 → eval 512..4096）— （无结果）\n\n> 注：合成 NIAH 检索探针已实现并调试（碰撞无关布局、可达标签）；本报告以 wikitext 长度外推覆盖长上下文评测（见报告头部说明）。\n\n'
-    recs = [r for r in s.values() if isinstance(r, dict) and 'by_len' in r and (not r.get('synthesized')) and any((isinstance(c, dict) and _ppl_ok(c.get('ppl')) for c in r['by_len'].values()))]
+    recs = [r for r in s.values() if isinstance(r, dict) and isinstance(r.get('by_len'), dict) and (not r.get('synthesized')) and any((isinstance(c, dict) and _ppl_ok(c.get('ppl')) for c in r['by_len'].values()))]
     _by_var = {}
     for r in recs:
         _by_var.setdefault(r.get('variant'), []).append(r)

@@ -5032,12 +5032,17 @@ def t_sec_p1l_rejects_malformed_length_keys():
         '512': {'ppl': 10.0, 'truncated': False},
         '4096': {'ppl': 20.0, 'truncated': False},
     }}}
+    # A malformed by_len payload (valid JSON but not an object) must be
+    # skipped, not crash the whole length section while a valid record exists.
+    rec['bad::s0'] = {'variant': 'bad', 'seed': 0, '_code': BR._CUR_CS,
+                      'by_len': [{'ppl': 99.0, 'truncated': False}]}
     BR._LOADED[('summary', 'results_len')] = rec
     try:
         txt = BR.sec_p1l()
     finally:
         BR._LOADED.pop(('summary', 'results_len'), None)
     assert 'PPL@512' in txt and 'PPL@4096' in txt, txt[:600]
+    assert '99.0' not in txt, txt[:600]
     for _bad in ('PPL@0', 'PPL@1 ', 'PPL@4 ', 'PPL@-512'):
         assert _bad not in txt, (_bad, txt[:600])
     for _bad_val in ('11.0', '22.0', '33.0', '44.0'):
