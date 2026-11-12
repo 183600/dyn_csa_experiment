@@ -178,18 +178,16 @@ def _resolve_sizes(n, train_frac=0.8, val_frac=0.1, test_frac=0.1,
     order = sorted(range(3), key=lambda i: (-(targets[i] - sizes[i]), -i))
     eligible = [i for i in order if requested[i]]
     if remaining > 0:
-        # Flooring the rounded float targets can leave a handful of rows (or,
-        # at very large n, several) unassigned.  Distribute them in one step
-        # instead of looping `remaining` times, which would be unbounded for a
-        # scale-up row count.
+        # Flooring the rounded float targets can leave rows unassigned;
+        # distribute them across the requested splits in one step.
         _base, _extra = divmod(remaining, len(eligible))
         for _pos, _i in enumerate(eligible):
             sizes[_i] += _base + (1 if _pos < _extra else 0)
     elif remaining < 0:
-        # At very large n the float targets can also round UP enough that the
-        # floors sum to more than n.  Remove the overshoot from the splits
-        # with the smallest fractional parts first (largest split breaks ties)
-        # so every size stays non-negative.
+        # The float targets can also round UP enough that the floors sum to
+        # more than n.  Remove the overshoot from the splits with the smallest
+        # fractional parts first (largest split breaks ties) so every size
+        # stays non-negative.
         _need = -remaining
         _drop_order = sorted(range(3), key=lambda i: (targets[i] - sizes[i],
                                                       -sizes[i], i))
@@ -1592,8 +1590,8 @@ def _matrix_fingerprint(X):
             if not _obj_fits:
                 # No fixed-width dtype can hold these values exactly, so no
                 # cross-width twin exists.  Hash their canonical decimal
-                # spelling (length-prefixed) rather than rounding through
-                # float64, which collides for distinct huge integers.
+                # spelling (length-prefixed) to keep distinct integers
+                # distinct.
                 _obj_int = False
                 _obj_big = True
     _integral = _integral or _obj_int

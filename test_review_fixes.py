@@ -133,19 +133,18 @@ def t_min_consistency():
 
 
 def t_scale_robustness_edges():
-    # A planning family count can be a huge integer; it must saturate, not
-    # raise OverflowError while converting the count to float.
+    # A planning family count can be a huge integer; it must saturate.
     assert L.holm_min_attainable_p(6, 10 ** 400) == 1.0
     assert 0.0 < L.holm_min_attainable_p(2000, 10 ** 400) < 1.0
     assert L.signflip_min_n_for_holm(10 ** 400, 0.05) is None
     # Above the exact cutoff, the asymptotic branch must still evaluate the
-    # lower tail (the old 0.5*(1+erf(z)) form cancelled to exactly 0 for z<-8).
+    # lower tail.
     _n = (1 << 20) + 1
     _m = _n // 2 - 4 * math.isqrt(_n)
     _p = L._binom_cdf_half(_n, _m)
     assert 0.0 < _p < 1e-10, _p
     assert L._binom_cdf_half(_n, _m - 1) <= _p <= L._binom_cdf_half(_n, _m + 1)
-    # A malformed significance level fails closed instead of crashing midway.
+    # A malformed significance level fails closed.
     for _bad_alpha in (True, np.bool_(False), 'bad', 0, 1, float('nan')):
         assert L.signflip_min_consistency(12, 4, _bad_alpha) is None, _bad_alpha
         assert L.signflip_power(12, 4, 0.9, _bad_alpha) == 0.0, _bad_alpha
@@ -155,28 +154,27 @@ def t_scale_robustness_edges():
             pass
         else:
             raise AssertionError(f'holm_adjust accepted alpha={_bad_alpha!r}')
-    # Split sizing must still sum to n when n is large enough that the
-    # floating-point targets can overshoot/undershoot by a row.
+    # Split sizing must still sum to n when the floating-point targets
+    # overshoot or undershoot by a row.
     import data_guard as _DG
     _n = 2 ** 53
     for _fs in ((0.5, 0.3, 0.2), (0.5123048843996699, 0.3125296923390423,
                                   0.17516542326128773)):
         _sizes = _DG._resolve_sizes(_n, *_fs)
         assert sum(_sizes) == _n and all(v >= 0 for v in _sizes), (_fs, _sizes)
-    # Frozen by-length row/token counts are exact integers even above 2**53;
-    # the float path used to round a valid count and reject it.
+    # Frozen by-length row/token counts are exact integers even above 2**53.
     _nseq = 2 ** 53 + 1
     _cell = {'n_tok': _nseq * 7, 'n_seq': _nseq, 'truncated': False, 'eval_span': 8}
     assert V12._by_len_shape_reason({'by_len': {'8': dict(_cell)}}, _nseq) is None
     _bad = dict(_cell, n_tok=_nseq * 7 + 1)
     assert V12._by_len_shape_reason({'by_len': {'8': _bad}}, _nseq) is not None
     # Object integer tables outside int64/uint64 have no fixed-width twin;
-    # they must still fingerprint exactly (the float64 fallback collided).
+    # they must still fingerprint exactly.
     import data_guard as DG
     assert DG._matrix_fingerprint(np.array([[10 ** 30]], dtype=object)) != \
         DG._matrix_fingerprint(np.array([[10 ** 30 + 1]], dtype=object))
-    # Object booleans must key like their typed bool/int twin, otherwise a
-    # cache serialised as object can hide a cross-split duplicate.
+    # Object booleans must key like their typed bool/int twin so that
+    # cross-split duplicates remain visible.
     for _v in (True, False):
         _obj = np.array([[_v]], dtype=object)
         for _dt in (np.bool_, np.int8, np.int64, np.uint64):

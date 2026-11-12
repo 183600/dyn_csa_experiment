@@ -1241,10 +1241,8 @@ def _by_len_shape_reason(rec, n_seq):
         if (isinstance(_ntok, (bool, np.bool_))
                 or not isinstance(_ntok, (int, float, np.integer, np.floating))):
             return f'by_len[{_ln_i}].n_tok={_ntok!r} != the frozen {_want} (= {_nseq_i} rows x {_ln_i - 1} predictions) — truncated/empty cells are not admissible'
-        # Exact integer contract: a float conversion rounds integers above
-        # 2**53, which at scale can reject a correct cell or admit a rounded
-        # neighbouring count.  _record_int keeps integral floats but rejects
-        # lossy/fractional values.
+        # Exact integer contract: _record_int keeps integral floats but
+        # rejects lossy/fractional values.
         _ntok_i = _record_int(_ntok)
         if _ntok_i is None or _ntok_i != _want:
             return f'by_len[{_ln_i}].n_tok={_ntok!r} != the frozen {_want} (= {_nseq_i} rows x {_ln_i - 1} predictions) — truncated/empty cells are not admissible'
@@ -1753,8 +1751,7 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
         a, b = (comp['a'], comp['b'])
         ep = comp.get('endpoint', 'by_len.ppl@4096')
         # An in-memory manifest (the tests and some callers bypass
-        # _load_manifest) must fail closed here too instead of raising a raw
-        # ValueError after a possible test access.
+        # _load_manifest) must also fail closed here.
         _ep_tail = str(ep).rsplit('@', 1)[-1].strip() if '@' in str(ep) else ''
         Ln = _record_int(_ep_tail)
         if Ln is None or Ln < 2:

@@ -9214,9 +9214,8 @@ def finite_range(named_values):
 
 _SIGNFLIP_ENUM_MAX_N = 20
 _SIGNFLIP_MITM_MAX_N = 40
-# Largest 2**e denominator the Holm planning helper materialises exactly.
-# 2**1048576 is a 128 KiB integer; above it the exponent/mantissa projection
-# is used so a huge seed count cannot allocate an unbounded integer.
+# Largest exact 2**e denominator used by the Holm planning helper; above it
+# an exponent/mantissa projection is used.
 _HOLM_EXACT_SHIFT_MAX = 1 << 20
 
 
@@ -9673,12 +9672,9 @@ def holm_min_attainable_p(n_seeds, m_comparisons, alpha=0.05):
     m = _as_seed_int(m_comparisons)
     if n is None or m is None or n <= 0 or m <= 0:
         return float('nan')
-    # floor = 2 / 2**n = 1 / 2**(n-1).  Evaluating `m * floor` converts the
-    # integer family size to float first, which raises OverflowError for a
-    # planning input with an enormous m (a scale-up family count).  Compare
-    # the exact integer against the denominator where that is cheap, and use
-    # a mantissa/exponent projection only when the denominator itself would
-    # be too large to materialise.
+    # floor = 2 / 2**n = 1 / 2**(n-1).  Compare the exact integer against
+    # the denominator when it is representable, otherwise use a
+    # mantissa/exponent projection.
     e = n - 1
     if e <= _HOLM_EXACT_SHIFT_MAX:
         denom = 1 << e
@@ -9898,9 +9894,8 @@ def _binom_cdf_half_asymptotic(n, m):
     threshold."""
     sd = math.sqrt(n) * 0.5
     z = (m + 0.5 - 0.5 * n) / sd
-    # 0.5*(1+erf(z)) cancels to exactly 0 once z < -8, even though the true
-    # lower tail is still representable; erfc of the negated argument computes
-    # the same probability without that cancellation.
+    # erfc of the negated argument evaluates the lower tail accurately far
+    # from the bulk.
     cdf = 0.5 * math.erfc(-z / math.sqrt(2.0))
     # The Edgeworth correction is only meaningful near the bulk.  Far in the
     # tail its truncated polynomial can exceed (and turn negative) the leading
@@ -9975,8 +9970,8 @@ def signflip_min_consistency(n_seeds, m_comparisons, alpha=0.05):
     m = _as_seed_int(m_comparisons)
     if n is None or m is None or n <= 0 or m <= 0:
         return None
-    # Planning must fail closed on a malformed significance level instead of
-    # raising a TypeError midway (e.g. alpha='0.05' from a JSON field).
+    # Planning fails closed on a malformed significance level (e.g. a JSON
+    # string).
     if isinstance(alpha, (bool, np.bool_)):
         return None
     try:
