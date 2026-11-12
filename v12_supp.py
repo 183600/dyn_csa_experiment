@@ -1154,12 +1154,11 @@ def _by_len_shape_reason(rec, n_seq):
             return f'by_len[{_ln!r}] is not a cell object'
         if isinstance(_ln, (bool, np.bool_)):
             return f'by_len key {_ln!r} is not an integer length'
-        try:
-            _ln_f = float(_ln)
-            if not math.isfinite(_ln_f) or _ln_f != math.floor(_ln_f):
-                raise ValueError
-            _ln_i = int(_ln_f)
-        except (TypeError, ValueError, OverflowError):
+        # Exact integer length only: a fractional key would denote a different
+        # length, and a float above 2**53 cannot represent every integer, so
+        # it could alias a neighbouring frozen endpoint.
+        _ln_i = _record_int(_ln)
+        if _ln_i is None:
             return f'by_len key {_ln!r} is not an integer length'
         if _ln_i < 2:
             return f'by_len length {_ln_i} has no next-token prediction (needs Ln>=2); an empty cell is not admissible'

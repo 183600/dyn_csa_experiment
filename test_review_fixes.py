@@ -851,6 +851,15 @@ def t_admission_gate():
         'ppl': 30.0, 'n_tok': 16 * 4095, 'n_seq': 16, 'truncated': True}})
     assert L.by_len_cells([trunc], 4096), 'the truncated cell has a usable ppl'
     assert V12._by_len_shape_reason(trunc, 16) is not None
+    # The frozen by-length grid accepts only exact integer length keys.  A
+    # boolean, fractional or lossy large float must not alias a real endpoint.
+    for _bad_ln in (True, np.bool_(False), '4.9', 4.9, float(2 ** 60)):
+        _bad = _rec('a_arm', 0, 'FP', by_len={_bad_ln: {
+            'ppl': 30.0, 'n_tok': 16 * 4095, 'n_seq': 16, 'truncated': False}})
+        assert V12._by_len_shape_reason(_bad, 16) is not None, _bad_ln
+    _ok = _rec('a_arm', 0, 'FP', by_len={4096.0: {
+        'ppl': 30.0, 'n_tok': 16 * 4095, 'n_seq': 16, 'truncated': False}})
+    assert V12._by_len_shape_reason(_ok, 16) is None
     # off-whitelist seed: excluded, named, never counted
     raw = dict(good, **{'a::s9': _rec('a_arm', 9, 'FP')})
     adm2, _ = V12._admit_confirmation_records(raw, m)
