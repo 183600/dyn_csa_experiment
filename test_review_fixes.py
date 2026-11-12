@@ -5391,7 +5391,7 @@ def t_efficiency_pairs_audit_and_sweep():
         rec = r['panels'][td]['a vs b']
         assert rec['speed_claim_allowed'] is True and rec['faster_arm'] == 'a', rec
         assert abs(rec['ratio_b_over_a'] - 2.0) < 1e-12, rec
-        # A different token count is not a speed comparison.
+        # A different token count is not a paired comparison.
         with open(os.path.join(td, 'summary.json'), 'w', encoding='utf-8') as f:
             json.dump({'a::s0': {'variant': 'a', 'efficiency': eff_a},
                        'b::s0': {'variant': 'b', 'efficiency': dict(eff_b, n_tokens=4096)}}, f)
@@ -5399,7 +5399,7 @@ def t_efficiency_pairs_audit_and_sweep():
         rec2 = r2['panels'][td]['a vs b']
         assert rec2['speed_claim_allowed'] is False and 'token counts' in rec2['reason'], rec2
         # A later seed measured on a different device/torch build must also
-        # refuse the speed claim; checking only the first record would let a
+        # refuse the directional claim; checking only the first record would let a
         # mixed CPU/GPU panel through.
         with open(os.path.join(td, 'summary.json'), 'w', encoding='utf-8') as f:
             json.dump({'a::s0': {'variant': 'a', 'efficiency': eff_a},

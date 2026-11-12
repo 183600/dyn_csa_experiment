@@ -1620,7 +1620,7 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
         _missing = [k for k in ('parameter_matching', 'flops', 'read_fraction')
                     if not (isinstance(_cbd, dict) and _cbd.get(k))]
         if _missing:
-            raise SystemExit(f'[p5t stats] REFUSE: the frozen plan lacks compute-budget disclosure {_missing}. Parameter matching is not compute matching; the report must state the FLOPs/read-budget mismatch next to every primary comparison .')
+            raise SystemExit(f'[p5t stats] REFUSE: the frozen plan lacks compute-allocation disclosure {_missing}. Parameter matching is not compute matching; the report must state the FLOPs/read-allocation mismatch next to every primary comparison .')
     stats['compute_budget_disclosure'] = _cbd
     for v in manifest['arms']:
         rows = [r for (rv, s), r in admitted.items() if rv == v]

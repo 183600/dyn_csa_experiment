@@ -1668,7 +1668,7 @@ def flops_analysis(outdir='analysis_v7', seq_lens=None):
         rows.append({'seq_len': n, 'sel_ratio': min(k, B) / B if B else 1.0, 'dense_flops': dense, 'csa_flops': csa, 'hca_flops': hca, 'hybrid_flops': hybrid, 'csa_over_dense': csa / dense, 'hybrid_over_dense': hybrid / dense, 'kv_dense': kv_dense, 'kv_csa': kv_csa, 'kv_hca': kv_hca, 'kv_hybrid': kv_hybrid, 'csa_kv_over_dense': kv_csa / kv_dense, 'hybrid_kv_over_dense': kv_hybrid / kv_dense})
     cross = next((r['seq_len'] for r in rows if r['csa_over_dense'] < 1.0), None)
     if cross is None:
-        print('[flops] NOTE: under this accounting CSA is NOT cheaper than dense at any tested length — no crossover exists in this config; reporting None.')
+        print('[flops] NOTE: under this accounting CSA does not fall below dense in analytic FLOPs at any tested length — no crossover exists in this config; reporting None.')
     # The analytic crossover is a quotable claim (it reaches REPORT_v7.md and
     # the README table), so the artifact carries the code/git provenance and a
     # ledger entry like every measured panel — an unstamped json could not be
@@ -1676,7 +1676,7 @@ def flops_analysis(outdir='analysis_v7', seq_lens=None):
     L.stamped_analysis('flops_analytic', {'config': {'d': d, 'heads': H, 'd_head': Dh, 'layers': L_layers, 'm': m, 'topk': k, 'window': w, 'm_hca': mph}, 'crossover_seq_len_csa_beats_dense': cross, 'rows': rows}, outdir=outdir, name='flops_analytic.json')
     L.atomic_write_csv(os.path.join(outdir, 'flops_analytic.csv'), None, rows)
     _flops_plot(rows, outdir)
-    print(f'[flops] crossover (CSA cheaper than dense) at seq = {cross}')
+    print(f'[flops] crossover (CSA below dense analytic FLOPs) at seq = {cross}')
     print(f'[flops] wrote {outdir}/flops_analytic.json|.csv|.png')
     return rows
 

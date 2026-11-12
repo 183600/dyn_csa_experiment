@@ -8566,7 +8566,7 @@ def kv_cache_elements_per_token(m):
         per_layer.append(int(n))
         total += int(n)
     return {'elements_per_token_total': int(total), 'per_layer': per_layer,
-            'note': 'elements, not bytes; multiply by dtype size and add allocator/block overhead for measured memory'}
+            'note': 'elements, not bytes; multiply by dtype size and add allocator/block overhead for the measured footprint'}
 
 def open_block_config(m):
     """Machine-readable descriptor of every layer's read rule.
@@ -12251,7 +12251,7 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
                                     problems.append(f'{arm}: trial ppl_std is not the sample std of its per-seed values')
         if len(_set) > 1:
             # Trials inside ONE arm must compare the same seed draws.  Equal
-            # arm-level sets cannot fix a within-arm mismatch: its selected
+            # arm-level sets cannot correct a within-arm mismatch: its selected
             # config was still chosen on a different noise realisation.
             problems.append(
                 f'{arm}: its trials used different search-seed sets '
@@ -14878,7 +14878,7 @@ def _det_segment_sum(n_rows, indices, values, dtype=None, sorted_indices=False):
 
     CUDA's ``index_add_``/``index_put_(accumulate=True)`` use atomics, so the
     addition order (and the last-bit result) can depend on thread scheduling.
-    Sorting by (index, original position) fixes the order; segment sums are
+    Sorting by (index, original position) determines the order; segment sums are
     then formed with a cumsum and written through ``index_copy_`` (unique
     destinations, no atomics).  Mirrors ``csa_kernels._det_scatter_add`` but
     keeps the caller's dtype (the per-document NLL accumulator is float64).
@@ -16593,7 +16593,7 @@ def measure_efficiency(model, ids, device, warmup=1, iters=5, decode_tokens=8):
 @torch.inference_mode()
 def measure_efficiency_sweep(model, ids, device, *, lengths=(512, 2048), batches=(1,),
                              warmup=1, iters=3):
-    """Batch x sequence-length latency/throughput sweep on ONE checkpoint.
+    """Batch x sequence-length timing sweep on ONE checkpoint.
 
     `measure_efficiency` answers "how long this one input takes"; the sweep
     adds the shape dependence (batch 1 vs 8, short vs long).  CUDA timings use events (so kernel launch is included but

@@ -1893,10 +1893,10 @@ def sec_efficiency():
             _best_ppl = ppl
             _frontier.append((lat, ppl, name, key))
     if _frontier:
-        lines += ['', '**Pareto frontier (lower PPL at no higher prefill latency)**:', '']
+        lines += ['', '**Pareto frontier (lower PPL at no higher prefill time)**:', '']
         for lat, ppl, name, key in _frontier:
             lines.append(f'- `{name}` / `{key}`: PPL {fm(ppl)}, prefill p50 {fm(lat, 2)} ms')
-    lines += ['', '> A PPL improvement should be read together with this table: a small gain accompanied by much higher latency or memory is not a deployable improvement.', '']
+    lines += ['', '> A PPL improvement should be read together with this table: a small gain accompanied by a much higher prefill time or footprint is not a deployable improvement.', '']
     return '\n'.join(lines) + '\n'
 
 

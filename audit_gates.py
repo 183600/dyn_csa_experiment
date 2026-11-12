@@ -2087,7 +2087,7 @@ def audit_efficiency_pairs(outdirs=None, pairs=None, *, tolerance=0.05):
                 rec['reason'] = f'different or ambiguous measured token counts ({_na} vs {_nb}); a timing ratio across shapes is not a paired comparison'
             elif _same_batch is False:
                 rec['reason'] = (f'different or ambiguous batch sizes ({sorted(_ba) if _ba is not None else None} '
-                                 f'vs {sorted(_bb) if _bb is not None else None}); latency depends on the batch shape')
+                                 f'vs {sorted(_bb) if _bb is not None else None}); timing depends on the batch shape')
             elif not same_env:
                 rec['reason'] = 'different device or torch version recorded'
             elif not same_kv:
