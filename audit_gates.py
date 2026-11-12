@@ -1131,7 +1131,7 @@ def audit_causality():
             for cut in (32, 64, 96):
                 part = model(ids[:, :cut])
                 if not torch.allclose(part, full[:, :cut], atol=1e-4, rtol=1e-4):
-                    fails.append(f'{v}: prefix invariance broken at T\'={cut} (future leakage or T-dependent tail-block read)')
+                    fails.append(f'{v}: prefix invariance violated at T\'={cut} (future leakage or T-dependent tail-block read)')
                     break
             # d) incremental decode vs full forward (logits tail column)
             inc = []
@@ -1669,7 +1669,7 @@ def audit_fairness(summary_path='results_v10_mech/summary.json', arms=None):
 def audit_failures(outdirs=None):
     """失败集中度（零 GPU）：error/NaN/截断记录按臂分布的读数。
 
-    审计口径：崩溃/NaN/超时是否集中在某些臂；仅保留成功运行是否构成
+    审计口径：失败/NaN/超时是否集中在某些臂；仅保留成功运行是否构成
     选择偏差。本审计把 error 记录按 (臂, 错误类型) 计数，并给出描述性
     集中度（不主张显著性——小样本下显著性检验本身功效不足）。"""
     L = _import_exp_lib()

@@ -99,8 +99,8 @@ def make_guard():
 # ---- 阶段配置 -------------------------------------------------------------
 # 冻结清单把种子数从 6 修订为 12（修订发生在任何
 # test-split 评估之前，见清单 revision 块）。P5C/P5MP 的
-# 种子列表**不再是这里的硬编码**，运行期由 `_frozen_seeds()` 从冻结清单
-# 读取（单一事实来源）；P5C 同时覆盖全部四个冻结臂（主臂 0-5 已由
+# 种子列表在运行期由 `_frozen_seeds()` 从冻结清单读取（单一事实来源）；
+# P5C 同时覆盖全部四个冻结臂（主臂 0-5 已由
 # P3MT/P4MT 训练，resume 自动跳过；主臂 6-11 与对照臂统一在此补齐），
 # 否则清单扩种子后没有任何驱动会训练主臂新种子。
 P5C_CFG = dict(V10.P3MT_PAYLOAD, seeds=[0, 1, 2, 3, 4, 5], variants=['csa_fixed_rope', 'full_rope'] + list(V10.SCRATCH_CONTROLS),
@@ -873,7 +873,7 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test', train_
 
     记录现在额外携带 manifest_sha256 与
     ckpt_sha256（绑定「哪份冻结计划、哪份权重」）；recipe 必须通过冻结
-    清单的结构化配方签名（不再是自然语言说明）；resume 的 stale 判定
+    清单的结构化配方签名；resume 的 stale 判定
     把 manifest 哈希纳入——清单修订后，同一 outdir 的旧结果自动作废，
     不会被静默复用。"""
     outdir = cfg['outdir']

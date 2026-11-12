@@ -1857,7 +1857,7 @@ def sec_global_multiplicity():
     if aud['n_bh_rejected'] < aud['n_raw_significant']:
         lines.append('> **读法限制**：存在原始 p<0.05 但全局 BH 不拒绝的比较——跨面板引用它们时必须写成「族内显著、未通过全局校正」，不得写成多个独立发现。')
     if _UNREGISTERED_GATES:
-        lines.append(f'> ⚠ 有 {_UNREGISTERED_GATES} 个 `_sig_gate` 判定未带 label 注册（本节族大小可能偏小）——这是报告构建的缺陷，应校正，而不是忽略。')
+        lines.append(f'> ⚠ 有 {_UNREGISTERED_GATES} 个 `_sig_gate` 判定未带 label 注册（本节族大小可能偏小）——这是报告构建的问题，应校正，而不是忽略。')
     lines.append('> 本节是**探索性展示的纪律层**，不是确认性证据：全局校正不把任何探索面板变成预注册结果（见 docs/design_notes.md §17/§20）。')
     lines.append('')
     return '\n'.join(lines) + '\n'

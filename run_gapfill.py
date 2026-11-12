@@ -472,7 +472,7 @@ def run_overfit(cfg=None, variants=None, steps=None):
     L.log_experiment_event(cfg['outdir'], {'kind': 'preflight', 'tracking_schema': 2, 'status': ('ok' if ok and all(bool(r.get('passed')) for r in _repro) else 'failed'), 'created_at': time.strftime('%Y-%m-%dT%H:%M:%S'), 'code': L.code_stamp(), 'provenance': _prov, 'variants': variants, 'run_cfg': _pfp, 'sanity': {'passed': ok, 'n_reports': len(reports)}, 'reproducibility': {'passed': all(bool(r.get('passed')) for r in _repro), 'n_reports': len(_repro)}})
     if not ok:
         _bad = [r['variant'] for r in reports if not r['passed']]
-        raise RuntimeError(f'small-batch overfit sanity check FAILED for {_bad} — do NOT start the full run; this points at a gradient/loss/label plumbing fault (see {cfg["outdir"]}/overfit_sanity.json)')
+        raise RuntimeError(f'small-batch overfit sanity check FAILED for {_bad} — do NOT start the full run; this points at a gradient/loss/label plumbing problem (see {cfg["outdir"]}/overfit_sanity.json)')
     print('[overfit] PASSED (necessary, not sufficient — keep the intermediate-result checks)')
     return reports
 

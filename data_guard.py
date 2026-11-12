@@ -2109,7 +2109,7 @@ def data_quality_report(X, y=None, *, train_idx=None, val_idx=None, test_idx=Non
 
     # Label noise / corruption.  A target is only valid if it is finite; a
     # missing (None/NaN) target is reported separately from an Inf target,
-    # and the counts are broken down by split so a corrupted holdout cannot
+    # and the counts are reported per split so a corrupted holdout cannot
     # hide behind a clean overall total.
     if y is not None:
         yarr = np.asarray(y)
@@ -2451,7 +2451,7 @@ def categorical_shift_report(reference, holdout, *, max_categories=None):
     if max_categories is not None:
         if len(counts) > max_categories:
             # Keep the most frequent reference categories plus an "other" bin.
-            # Count ties are broken by the stable identity key, not by NumPy's
+            # Count ties are resolved by the stable identity key, not by NumPy's
             # unstable argsort of object values.
             ranked = sorted(counts, key=lambda k: (-counts[k], _sort_key(k)))
             keep = sorted(ranked[:max_categories - 1], key=_sort_key)

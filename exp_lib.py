@@ -286,7 +286,7 @@ def classify_training_health(history, *, tail_k=4, slope_tol=None, gap_tol=None)
 
     ``history`` is a list of dicts with ``step``, ``train_ce`` and either
     ``val_ce`` or ``val_ppl``.  This is a diagnostic, not a model-selection
-    rule: it says whether the run looks overfit / underfit / stalled / broken
+    rule: it says whether the run looks overfit / underfit / stalled / invalid
     on the fixed evaluation grid.
 
     ``slope_tol=None`` (the default) makes the threshold
@@ -3237,7 +3237,7 @@ def causal_prefix_pool_reference(Xa, Xb, Za, Zb, bid, B_pos_a, B_pos_b, overlap,
                                  window_start=None):
     """Per-query, numerically stable reference for `causal_prefix_pool`.
 
-    This is deliberately slow and loops over queries; it is the oracle the
+    This is deliberately simple and loops over queries; it is the oracle the
     cumulative-sum form is tested against (forward and gradients).
     """
     geo = _open_block_geometry(bid, n_blocks=n_blocks)
@@ -11441,8 +11441,7 @@ def _mean_not_crossed(v):
 def crossover_scaling_fit(entries, *, min_points=4, volume_tol=0.25,
                           d_spread_min=1.2):
     """Fit log10(crossover tokens) ~ log10(d_model) only when the points can
-    support it.  This replaces fitting a line
-    through whatever panels happen to exist.
+    support it.  The fit uses only the points that can support it.
 
     `entries` is an iterable of dicts (or a dict label -> dict) with keys:
       d                 model width (required)
@@ -18467,7 +18466,7 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
     disable every regulariser (weight decay = 0, the compression penalty = 0;
     the model has no dropout), and optimise only that batch.  A correct
     training path drives the LM loss towards 0 and the next-token accuracy
-    towards 100%.  Failure means a serious plumbing fault (loss not connected
+    towards 100%.  Failure means a serious plumbing problem (loss not connected
     to the graph, gradients not applied, wrong labels, etc.) — do NOT launch a
     full run until it passes.
 
@@ -18711,9 +18710,9 @@ def _overfit_sanity_check_impl(variant='full', *, seed=0, steps=300, lr=3e-3, d=
     elif not loss_decreased:
         report['diagnosis'] = 'loss did not decrease on the fixed batch (optimizer/step or graph is not wired through)'
     elif _label_shift_required and not _label_shift_ok:
-        report['diagnosis'] = 'labels are not the next-token shift of the inputs (label construction/order fault)'
+        report['diagnosis'] = 'labels are not the next-token shift of the inputs (label construction/order error)'
     elif _initial_chance_required and not _initial_near_chance:
-        report['diagnosis'] = 'initial loss is far from log(vocab) (wrong label map, vocabulary mismatch or broken initialisation)'
+        report['diagnosis'] = 'initial loss is far from log(vocab) (wrong label map, vocabulary mismatch or invalid initialisation)'
     elif _batch_contract is False:
         report['diagnosis'] = 'the explicit batch violates the shape/label contract'
     elif not (_finite_curve and _nonfinite_step is None):
@@ -18957,7 +18956,7 @@ def overfit_guard(variants, *, seed=0, steps=200, seq_len=64, batch_size=2, voca
         reports.append(r)
         print(f"[overfit] {v:<24} loss {r['initial_loss']:.3f} -> {r['final_loss']:.4f}  acc {r['final_accuracy'] * 100:.1f}%  grad_finite={r['grad_all_finite']}  params_changed={r['params_changed']}  {'PASS' if r['passed'] else 'FAIL'}")
         if not r['passed']:
-            raise RuntimeError(f'small-batch overfit sanity check FAILED for `{v}` ({r["diagnosis"]}) — do NOT start or continue this run; this points at a gradient/loss/label plumbing fault.  Inspect the returned report and set CSA_SKIP_OVERFIT=1 only if you deliberately accept the risk.')
+            raise RuntimeError(f'small-batch overfit sanity check FAILED for `{v}` ({r["diagnosis"]}) — do NOT start or continue this run; this points at a gradient/loss/label plumbing problem.  Inspect the returned report and set CSA_SKIP_OVERFIT=1 only if you deliberately accept the risk.')
     return reports
 
 _REPRO_GUARD = {}

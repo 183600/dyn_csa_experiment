@@ -721,8 +721,8 @@ def make_layer_cfgs_v7(n_layers, variant):
         # 从头训练的全块读取对照：与 csa_fixed_rope 同一
         # c_kv 压缩 / qk_norm / RoPE / sink / 窗口投影，仅 index_topk 覆盖
         # 全部块（lightning_indexer 内部 k=min(topk, B)）。它同时是
-        # 「逐项对齐的 dense」——与 full_rope 的差别只剩 KV 压缩投影与
-        # 分块读取方式，不再是投影/归一化/编码的混合差异。
+        # 「逐项对齐的 dense」——与 full_rope 的差别只有 KV 压缩投影与
+        # 分块读取方式；投影/归一化/编码保持一致。
         return [AttnCfgRope(kind='csa', dynamic=False, block_size=4, overlap=OVERLAP, index_topk=1000000, rope=True, rope_dim=16, qk_norm=True) for _ in range(n_layers)]
     if variant == 'csa_dynamic_rope':
         return [AttnCfgRope(kind='csa', dynamic=True, chunking='cosine_learnable', target_block_tokens=4, overlap=OVERLAP, index_topk=32, temperature=0.1, rope=True, rope_dim=16, qk_norm=True) for _ in range(n_layers)]
