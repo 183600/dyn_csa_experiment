@@ -364,7 +364,7 @@ def t_closed_regression():
                            L.make_layer_cfgs(2, 'csa_dynamic'), mlp_ratio=2)
     cfg_closed = L.make_layer_cfgs(2, 'csa_dynamic_mb128_closed')
     m_closed = L.SmallGPT(97, 32, 2, 2, 16, 40, cfg_closed, mlp_ratio=2)
-    # identical initialisation: the new fields consume no RNG
+    # identical initialisation: these fields consume no RNG
     sd0, sd1 = m_default.state_dict(), m_closed.state_dict()
     assert set(sd0) == set(sd1)
     for k in sd0:

@@ -782,11 +782,11 @@ def _check_or_write_freeze_lock(outdir, manifest, test_ids_fp, stage='access',
         _dirty = False
         if _manifest_changed or _test_changed or _train_changed:
             print(f'[v12] WARNING: V12_REFREEZE=1 — the locked plan/test/train identity changed (manifest {lock.get("manifest_sha256")} -> {_sha}, test_ids_fp {lock.get("test_ids_fp")} -> {test_ids_fp}, train_fp {lock.get("train_fp")} -> {train_fp}); the earlier round is DOWNGRADED to exploratory and this must be recorded in the plan history')
-            # Persist the conscious re-freeze: under the new plan the lock must
-            # carry the new identity so later runs do not refuse, and the
-            # superseded plan is retained for the exploratory record.  The lock
-            # is written ONCE below, after every check has passed, so a failure
-            # can never leave a half-updated (new plan + stale fingerprints) file.
+            # Persist the conscious re-freeze: the lock carries the current
+            # identity so later runs do not refuse, and the superseded plan is
+            # retained for the exploratory record.  The lock is written ONCE
+            # below, after every check has passed, so a failure can never leave
+            # a half-updated (changed plan + stale fingerprints) file.
             prev = {_k: lock.get(_k) for _k in ('manifest_sha256', 'test_ids_fp', 'train_fp', 'locked_at', 'frozen_at')}
             lock['superseded'] = list(lock.get('superseded') or []) + [prev]
             lock.update({'manifest_sha256': _sha,
@@ -1043,10 +1043,9 @@ def _finaltest_bylen_cell(cfg, manifest, v, seed, test_ids, split='test', train_
         # straight from eval_length_gen; pooled ppl is unchanged.
         # The P5T record carries the SAME provenance descriptor as its
         # training record (`train_knobs` / `train_objective` /
-        # `param_breakdown` / `rng_fp`) plus the evaluated row count.  Without
-        # `train_knobs` the frozen implementation binding excluded ALL 48
-        # records (admitted=0) after the one-shot test access had already been
-        # burned.
+        # `param_breakdown` / `rng_fp`) plus the evaluated row count.  The
+        # frozen implementation binding requires `train_knobs` on every
+        # record.
         _tk = _tr.get('train_knobs') or _ck_prov.get('train_knobs')
         summary[f'{v}::s{seed}'] = {'variant': v, 'seed': seed, 'params': _tr.get('params') or _ck_prov.get('params'), 'by_len': r, 'split': split, 'data_fp': _dfp, 'train_fp': _tr_train_fp, '_code': V.CKPT_CODE, 'recipe': _ck_recipe, 'manifest_sha256': _msha, 'ckpt_sha256': _ensure_ck_sha(), 'ckpt_sig': (list(_ck_sig) if _ck_sig is not None else None),
                                     'n_seq': int(test_ids.shape[0]),

@@ -1472,7 +1472,7 @@ def t_audit_family_holm_and_verified():
     r6 = L.methodology_audit(_summary(6), verbose=False)
     assert r6['family']['effective_m'] == 2
     assert 'compression_vs_matched_dense' not in r6['verified_baselines'], 'm=2 needs n>=7 for a Holm-corrected rejection'
-    # n=7: all seeds same sign now clears the family-corrected gate.
+    # n=7: all seeds same sign clears the family-corrected gate.
     r7 = L.methodology_audit(_summary(7), verbose=False)
     assert 'compression_vs_matched_dense' in r7['verified_baselines'], r7['verified_baselines']
     e = r7['baselines']['compression_vs_matched_dense'][0]
@@ -5792,7 +5792,7 @@ def t_archive_verify_requires_external_checksum():
         assert AR.cmd_verify(tar) == 1
         with open(tar + '.sha256', 'w', encoding='utf-8') as f:
             f.write(AR._sha256(tar) + '  release_x.tar.gz\n')
-        # The checksum now anchors the file; the invalid tar itself must not be
+        # The checksum anchors the file; the invalid tar itself must not be
         # accepted as a release either (a clean refusal, not a traceback).
         assert AR.cmd_verify(tar) == 1
         # A valid tar with a malformed per-file manifest entry is also refused

@@ -267,11 +267,11 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
                        ' — the train/test id spaces cannot be shown to be paired; '
                        'rebuild both caches with the current loaders before using '
                        'the held-out split')
-    # c2) whole-document group isolation for the held-out split.  The loaders
-    # now persist test_doc_ids; when the sidecar is present, recompute the
-    # train/test and val/test document intersections instead of trusting the
-    # metadata flags.  A missing sidecar is reported as not independently
-    # verified (unverified cache), not silently treated as clean.
+    # c2) whole-document group isolation for the held-out split.  When the
+    # persisted test_doc_ids sidecar is present, recompute the train/test and
+    # val/test document intersections instead of trusting the metadata flags.
+    # A missing sidecar is reported as not independently verified (unverified
+    # cache), not silently treated as clean.
     _trd_p = os.path.join(cache_dir, f'train_doc_ids_{train_tag}.npy')
     _vad_p = os.path.join(cache_dir, f'val_doc_ids_{train_tag}.npy')
     _ted_p = os.path.join(cache_dir, f'test_doc_ids_{test_tag}.npy')

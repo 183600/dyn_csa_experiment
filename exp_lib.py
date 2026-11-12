@@ -31,8 +31,8 @@ for _pkg in ('datasets', 'tokenizers', 'matplotlib'):
         _NEEDED.append(_pkg)
 if _NEEDED:
     # Import-time pip install is a reproducibility hazard: it silently changes
-    # the environment and can fetch a different version on every run.  It is
-    # now opt-in; the normal path tells the user what to install.
+    # the environment and can fetch a different version on every run.  Keep it
+    # opt-in; the normal path tells the user what to install.
     _msg = f"missing optional package(s): {', '.join(_NEEDED)}; install the pinned requirements (requirements.txt / requirements.lock) before running"
     if os.environ.get('CSA_AUTO_INSTALL', '').strip().lower() in ('1', 'true', 'yes'):
         print(f"[setup] CSA_AUTO_INSTALL=1 — installing {', '.join(_NEEDED)} (not pinned; archive the resulting pip freeze)")
@@ -2718,8 +2718,7 @@ def _pool_ordered(Xas, Xbs, Zas, Zbs, block_ids, B_pos_a, B_pos_b, overlap, n, F
         sc_a = sc[:, :max_len]
         sc_b = sc[:, max_len:]
         part = (sc_a * Xam).sum(1)
-        # Release the A-lane gather before the B-lane product; the two partial
-        # sums are added in the original order.
+        # The two partial sums are combined in the original order.
         del Xam
         part = part + (sc_b * Xbm).sum(1)
         comp[_b0:_b1] = part
@@ -3931,8 +3930,8 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         # == k_blk rows) and the window half gathers k_sw at win_idx (rows
         # n_blk+j of the stacked tensor == row j of k_sw).  index_select
         # returns exactly the same source rows, so the gathered values — and
-        # hence every downstream value — are bit-identical to the
-        # cat-then-gather form (index re-plumbing only, design notes §6.1).
+        # hence every downstream value — are bit-identical to gathering the
+        # concatenated table.
         _sel_rows = topk_l[s:e]
         _win_local = win_idx[s:e]
         _win_rows = _win_off_tab[s:e] if _win_off_tab is not None else _win_local
@@ -3962,8 +3961,7 @@ def gathered_attention(q, k_blk, v_blk, topk_idx, last_tok, k_sw, v_sw, w, scale
         # The soft branch reads its K halves as two contiguous gathers: the
         # concatenated V gather below holds exactly the same rows as two
         # separate gathers + cat, while the per-half K gathers feed the two
-        # logits einsums with the same operands (index re-plumbing only,
-        # design notes §6.1).
+        # logits einsums with the same operands.
         if k_all is not None:
             # The combined table holds the same rows as the two halves:
             # block rows at the front and window row j at n_blk + j.
@@ -4342,8 +4340,8 @@ class HybridAttention(nn.Module):
         self._cuts = None
         self.fuse_conv = None
         # Fused-weight cache (eval-only): the gateway is `not
-        # torch.is_grad_enabled()`, so training forward passes always rebuild
-        # the cat inside the autograd graph exactly as before.  Under eval the
+        # torch.is_grad_enabled()`, so training forward passes rebuild the cat
+        # inside the autograd graph.  Under eval the
         # concat values are pure functions of the source weights, so keying on
         # their autograd `_version` counters (bumped by every in-place
         # optimizer update) makes a stale hit impossible.
@@ -4741,8 +4739,8 @@ class HybridAttention(nn.Module):
                     else:
                         gate_bool = gate.detach() > _HALF
                     # On the device path the soft-honoured mask is already
-                    # attached to pre_blocks, so the boolean cut row can stay
-                    # on the GPU (it is not consumed by the host segmenter).
+                    # attached to pre_blocks, so use the boolean cut row
+                    # directly; otherwise convert it for the host segmenter.
                     gate_list = gate_bool if _device_segment_enabled(x.device) else gate_bool.cpu().numpy()
             if pre_blocks is not None:
                 bid, nblk, _hon_dev = pre_blocks
@@ -5063,8 +5061,7 @@ class HybridAttention(nn.Module):
             _raw, _gbool = _gs[0], _gs[1]
             if all((_r is not None for _r in _raw)):
                 if _gbool is not None and _device_segment_enabled(x.device):
-                    # Device-side segmentation: the gate decisions and the
-                    # resulting block ids stay on the GPU.
+                    # Device-side segmentation uses the gate booleans directly.
                     gate_sigs = [(tuple(_r) if len(_r) == 3 else (_r[0], _g))
                                  for _r, _g in zip(_raw, _gbool.unbind(0))]
                     pre_blocks = _device_blocks_from_gate_bool(
@@ -5080,9 +5077,9 @@ class HybridAttention(nn.Module):
                     # identical to the per-row form (see _hoist_blocks_from_cuts).
                     pre_blocks = _hoist_blocks_from_cuts(T, _gl, self.cfg.min_block, self.cfg.max_block, x.device, want_honoured=self.need_reg, hon_dtype=_raw[0][0].dtype)
         elif self.cfg.chunking in ('cosine_abs', 'cosine_adaptive') or (self.cfg.dynamic and self.cfg.kind != 'hca'):
-            # same batch-level geometry hoist for the fixed/adaptive cosine
-            # paths (the cut booleans and the resulting block ids are identical
-            # to the per-row form).
+            # Batched block geometry for the fixed/adaptive cosine paths (the
+            # cut booleans and the resulting block ids are identical to the
+            # per-row form).
             pre_blocks = self._cut_blocks_batched(x)
         if _eager_batch:
             return _CK.sparse_layer_forward(self, x, pre_all, gate_sigs, pre_blocks, impl='ref')
@@ -5868,9 +5865,7 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
         _sig_paths = {'train': tr_path, 'val': va_path,
                       'bnd': vp_path, 'meta': me_path}
         # Document-id sidecars are part of the cache identity and are checked
-        # on every cold hit.  Leaving them out of the memo key let a swapped
-        # or removed sidecar be hidden by an in-process hit after the first
-        # verification.
+        # on every cold hit; include every present sidecar in the memo key.
         if os.path.exists(trd_path):
             _sig_paths['train_doc_ids'] = trd_path
         if os.path.exists(vad_path):
@@ -6297,9 +6292,8 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
         _sig_paths = {'test': te_path, 'bnd': tb_path, 'meta': me_path}
         if os.path.exists(td_path):
             _sig_paths['test_doc_ids'] = td_path
-        # The tokenizer bytes are part of the verified identity on every hit.
-        # Leaving them out of the memo key served a stale pair after the test
-        # or train tokenizer was replaced, bypassing the checks below.
+        # The tokenizer bytes are part of the verified identity on every hit;
+        # include every present tokenizer file in the memo key.
         if os.path.exists(tk_path):
             _sig_paths['test_tok'] = tk_path
         import glob as _glob_memo
@@ -6686,7 +6680,7 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
                 'would be built from a different selection split; point '
                 'WT103_RAW_TXT / the HF source at the split used to build the '
                 'train cache, or delete/rebuild both caches from one source')
-    # Tokenizer and fit-cap are now validated.  ONLY NOW read the held-out rows.
+    # With the tokenizer and fit-cap validated, read the held-out rows.
     for cand in _cands:
         _f = os.path.join(cand, 'wiki.test.raw')
         if os.path.exists(_f):
@@ -8331,8 +8325,8 @@ def batch_iter(train_ids, seq_len, batch_size, device, seed=0):
     # Transport-only narrowing (design notes §6.1): every gather index is an
     # exact integer bounded by n + seq_len, so when that bound fits in int32
     # the index tensor is uploaded / consumed as int32 and the gathered ids
-    # are widened back to int64 right after the gather exactly as before —
-    # bit-identical batches.  The broadcast addition itself is then also done
+    # are widened back to int64 right after the gather, giving bit-identical
+    # batches.  The broadcast addition itself is then also done
     # in int32: every operand and the sum are < 2**31, so the int32 result
     # holds exactly the same integers as the int64 form.
     _idx_i32 = n + seq_len + 1 < 2 ** 31
@@ -15201,10 +15195,9 @@ def eval_ppl(model, val_batch, device, chunk=8, eval_rows=None, eval_seed=0, ret
             if _k < _flat:
                 _g = torch.Generator().manual_seed(int(eval_seed))
                 _sel = torch.randperm(_flat, generator=_g)[:_k]
-                # keep the sorted host copy: per-chunk membership bounds are
-                # integer range queries on a sorted table — searchsorted on the
-                # host gives the same slice the boolean-mask form selected
-                # (host-side integer equivalence, design notes §6.2).
+                # Sort the selected rows for integer range queries; this selects
+                # the same slice as the boolean-mask form (host-side integer
+                # equivalence, design notes §6.2).
                 _sel_host = torch.sort(_sel).values
                 _sel_sorted = _sel_host.to(device)
                 print(f'[eval_ppl] scoring a uniform sample of {_k}/{_flat} target rows (eval_rows={int(eval_rows)}, eval_seed={int(eval_seed)}) — this is a SAMPLED estimate, not the full-set PPL')
@@ -15512,7 +15505,7 @@ class _BlockStats:
         self.hi = None
         self.at_min = 0
         self.at_max = 0
-        # GPU counts are queued until a snapshot is requested.
+        # Counts are queued until a snapshot is requested.
         self._pending = []
 
     def snapshot(self):
@@ -18857,10 +18850,9 @@ class TimeGuard:
             if 'bookings' in self.state:
                 # Keep the invariant booked_seconds == booked_untracked + Σ
                 # bookings: recorded actual seconds have no per-token
-                # representation, so they accrue to the untracked remainder.
-                # Without this the next token refund's recompute silently
-                # drops every recorded second from the booked total (the run
-                # -time cap then meters nothing in parallel mode).
+                # representation, so they accrue to the untracked remainder and
+                # the token refund's recompute keeps the booked total
+                # consistent.
                 self.state['booked_untracked'] = float(self.state.get('booked_untracked', 0.0)) + float(seconds)
             if steps_done and steps_done > 0:
                 self.state['runs'] += 1

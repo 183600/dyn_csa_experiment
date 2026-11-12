@@ -2718,8 +2718,7 @@ def selfcheck_operators(device=None, dtype=torch.float32, impl='ref', seed=0, ve
     if verbose:
         print(f'[selfcheck:{impl}:{str(dtype)}] pool  ' + '  '.join(f'{k.split(".")[-1]}={v:.2e}' for k, v in results.items() if k.startswith('pool.')))
     # Multi-chunk check: shrinking _POOL_CHUNK_BYTES exercises the b0>0
-    # rebasing in the chunked backward (the default chunk size would keep this
-    # tiny case single-chunk).
+    # rebasing in the chunked backward.
     _saved_chunk = _POOL_CHUNK_BYTES
     try:
         # two blocks per chunk: lane indices must be rebased into chunk

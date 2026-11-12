@@ -427,9 +427,8 @@ class HybridAttentionRoPE(L.HybridAttention):
                 _nvalid = ~valid[:, None, :]
                 _anyrow = valid.any(-1) if sink is None else None
             # ib selects rows of k_blk_r / v_blk and _wi_all selects rows of
-            # k_sw_r / v_sw — exactly the rows the cat-then-gather form
-            # addressed through the +n_blk offsets, so every gathered value is
-            # bit-identical (index re-plumbing only, §6.1).
+            # k_sw_r / v_sw — exactly the rows addressed through the +n_blk
+            # offsets, so every gathered value is identical.
             _iw = _wi_all[s:e]
             _Kb = L._take_2d(k_blk_r, ib)
             if _has_sw:
@@ -924,9 +923,8 @@ def train_warmup(variant, train_ids, val_batch, vocab, *, seed=0, d=256, n_layer
             _blp = getattr(model, 'boundary_logp', None)
             _ce_d = None
             if _blp is not None:
-                # REINFORCE baseline kept on the device: no .item() before
-                # backward.  The baseline is updated after the optimizer step,
-                # matching exp_lib's post-backward policy.
+                # REINFORCE baseline remains a tensor; update it after the
+                # optimizer step, matching exp_lib's post-backward policy.
                 _ce_d = ce.detach()
                 if _ce_baseline is None:
                     _ce_baseline = _ce_d.new_zeros(())

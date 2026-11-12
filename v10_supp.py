@@ -349,7 +349,7 @@ def _distractor_ppls(model, val_ids, eval_len, rho, n_seq, cfg, row_cache=None, 
             raise
         tgt = ids[:, 1:]
         _ce = F.cross_entropy(logits.reshape(-1, vocab), tgt[:, -target:].reshape(-1), reduction='none').view(len(rows), target)
-        # keep each chunk's fp64 row-sums on device (fp64 values unchanged).
+        # fp64 row sums preserve the values exactly.
         _sum_parts.append(_ce.sum(dim=1, dtype=torch.float64))
         n_tok.extend([target] * len(rows))
         del ids, logits, tgt, _ce
