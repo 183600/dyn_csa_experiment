@@ -2517,6 +2517,22 @@ def t_data_version_identity():
     d = L.experiment_provenance(cfg, train_ids=tr, val_batch=va, vocab=98)['data']
     assert d['data_version'] != a['data_version'], 'changing the vocabulary must change data_version'
     assert a['dataset'] == 'unit' and a['cache_dir'] == './unit_cache'
+    # A boolean/fractional/zero vocabulary is not a token-space identity.
+    for _bad_vocab in (True, np.bool_(False), 97.5, 0, -1):
+        try:
+            L.experiment_provenance(cfg, train_ids=tr, val_batch=va, vocab=_bad_vocab)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'experiment_provenance accepted vocab={_bad_vocab!r}')
+        try:
+            L.preflight_fingerprint(cfg, stage='unit', vocab=_bad_vocab)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'preflight_fingerprint accepted vocab={_bad_vocab!r}')
+    fp = L.preflight_fingerprint(cfg, stage='unit', vocab=97.0)
+    assert fp == L.preflight_fingerprint(cfg, stage='unit', vocab=97)
 
 
 def t_manifest_running_then_complete():

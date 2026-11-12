@@ -14499,7 +14499,13 @@ def experiment_provenance(cfg, *, train_ids=None, val_batch=None, vocab=None):
         data['val_sequences'] = int(np.asarray(val_batch).shape[0])
         data['val_fp'] = _ids_fp(_vb)
     if vocab is not None:
-        data['vocab_size'] = int(vocab)
+        # The vocabulary is part of the data identity: int(True)=1 and
+        # int(8192.9)=8192 would label a different token space under a valid
+        # looking data_version.
+        _vb = _as_seed_int(vocab)
+        if _vb is None or _vb <= 0:
+            raise ValueError(f'experiment_provenance: vocab must be a positive integer, got {vocab!r}')
+        data['vocab_size'] = _vb
     _extra = cfg.get('data_extra')
     if isinstance(_extra, dict):
         # Synthetic/task-specific generators (NIAH recipe, corruption modes)
@@ -19869,10 +19875,15 @@ def preflight_fingerprint(cfg, *, stage, vocab=None, data_fp=None, probe_cfg=Non
     fails before the corpus is loaded).  It is deliberately not a resume key:
     it exists so the evidence can state which config/code/data/probe produced
     it."""
+    _vb = None
+    if vocab is not None:
+        _vb = _as_seed_int(vocab)
+        if _vb is None or _vb <= 0:
+            raise ValueError(f'preflight_fingerprint: vocab must be a positive integer, got {vocab!r}')
     blob = json.dumps({
         'config': _jsonable(cfg),
         'stage': str(stage),
-        'vocab': None if vocab is None else int(vocab),
+        'vocab': _vb,
         'data_fp': data_fp,
         'probe_cfg': _jsonable(probe_cfg) if probe_cfg is not None else None,
         'train_knobs': training_knobs_fingerprint(),
