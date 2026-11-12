@@ -7089,7 +7089,7 @@ class _DocDeduplicator:
             raise ValueError(f'near_threshold must be non-negative, got {near_threshold!r}')
         # The pigeonhole guarantee needs more bands than bits that may differ:
         # if bands <= near_threshold, two near-duplicate hashes can differ in
-        # every band and the LSH index silently misses them.
+        # every band and the LSH index can miss them.
         if bands <= near_threshold:
             raise ValueError(
                 f'bands={bands} must exceed near_threshold={near_threshold}: '
@@ -7783,8 +7783,8 @@ def audit_corpus_split(train_ids, val_batch, vocab, *, dataset='wikitext',
         _scan_frac = (float(_scanned) / float(tr.size)) if tr.size else 1.0
         report['train_tokens_scanned_fraction'] = round(_scan_frac, 6)
         if _scan_frac < 1.0:
-            # A sampled scan can miss a duplicate outside its windows; an
-            # unqualified "ok" would read as proof of the whole corpus.
+            # A sampled scan can miss a duplicate outside its windows, so a
+            # clean result is not a full-corpus proof.
             report['warnings'].append(
                 f'train/validation exact-row scan covered only {_scan_frac:.1%} '
                 'of the training stream; a clean result is not a full-corpus proof')
@@ -8959,9 +8959,8 @@ def attach_holm(comparisons, *, alpha=0.05, family='reported comparisons', explo
         if _n is not None and _n > 0:
             _ns.append(_n)
         # The exact test drops zero deltas, so the attainable p floor is set
-        # by the NONZERO pair count (n_nonzero), not the declared seed count.
-        # Using n here would claim a finer resolution than a family with
-        # identical arms actually has.
+        # by the NONZERO pair count (n_nonzero), not the declared seed count:
+        # the floor must not claim finer resolution than the family has.
         _nn = _as_seed_int(v.get('n_nonzero')) if v.get('n_nonzero') is not None else _n
         if _nn is not None and 0 <= _nn <= (_n if _n is not None else _nn):
             _ns_floor.append(_nn)
@@ -12475,8 +12474,7 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
 
     def _as_seed_values(_raw, _label):
         # A scalar seed (including 0) is a one-element list; only an absent
-        # value means "not declared".  ``or`` would turn 0 into the protocol
-        # fallback and audit the wrong partition.
+        # value means "not declared", so a scalar final seed is retained.
         if _raw is None:
             return []
         if isinstance(_raw, (bool, np.bool_)):
@@ -16455,8 +16453,8 @@ def _normalise_eager_batch(v):
             return True
         if s in ('0', 'false', 'no', 'off'):
             return False
-        # A typo like 'flase' must not be silently read as True (which would
-        # switch the numerical implementation on a CUDA box).
+        # Only the explicit true/false/auto spellings are accepted; any other
+        # value raises rather than selecting an implementation.
         raise ValueError(f'unknown eager_batch {v!r} (use true/false/auto)')
     return bool(v)
 
@@ -16574,7 +16572,7 @@ def _safe_path_component(value):
 
     When sanitisation actually changes the value, append a short digest of the
     original: plain replacement is not injective (``a/b`` and ``a_b`` would
-    otherwise name the same checkpoint and silently overwrite each other).
+    otherwise name the same checkpoint).
     Ordinary safe names are unchanged, so existing panels/resume logic keep
     the same paths.
     """
@@ -17415,9 +17413,8 @@ def _lm_batch_metrics(model, x, y, vocab, chunk=64, ignore_index=None):
         correct = torch.zeros((), dtype=torch.long, device=dev)
         n = 0
         # None still means cross_entropy's own -100 ignore sentinel, so a
-        # target table that happens to contain -100 must not be counted as a
-        # valid prediction.  The common no-sentinel path keeps the original
-        # unmasked reduction order.
+        # target table that happens to contain -100 is not counted as a valid
+        # prediction.  The no-sentinel path uses the unmasked reduction order.
         _ign = -100 if ignore_index is None else int(ignore_index)
         n_cols = min(int(x.shape[1]), int(y.shape[1]))
         for s in range(0, n_cols, chunk):
@@ -17567,8 +17564,7 @@ def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
             _flat_finite = finite.reshape(-1)
             _flat_bnd = _bnd.reshape(-1)
             # Non-finite CE is counted in n_nonfinite and excluded from BOTH
-            # numerator and denominator: folding it to 0 but still counting
-            # the target would report a broken token as a perfect prediction.
+            # numerator and denominator, so only finite targets contribute.
             _bsum[:4] += torch.bincount(_flat_b[_flat_finite],
                                         weights=_flat_ce[_flat_finite], minlength=4)
             _bcnt[:4] += torch.bincount(_flat_b[_flat_finite], minlength=4)
@@ -18202,8 +18198,8 @@ def overfit_reports_for(variants, *, source=None, probe_semantics=None, probe_ke
         if probe_key is not None and _r.get('guard_probe_key') != probe_key:
             continue
         # Match the report's own fingerprint, not the cache-key shape: a
-        # synthetic key has only three elements, so the old ``rest[1]`` test
-        # silently admitted it for a caller requesting a real-data fingerprint.
+        # synthetic key has only three elements and must not be admitted for a
+        # caller requesting a real-data fingerprint.
         if data_fp is not None and _r.get('data_fp') != data_fp:
             continue
         out.append(dict(_r))

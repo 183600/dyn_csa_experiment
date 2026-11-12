@@ -64,9 +64,9 @@ def _variant_records(variant):
             else:
                 _keep = next(iter(groups.values()))
             # A protocol tag can still contain several run_cfg groups (e.g.
-            # seeds run under different recipes).  Pairing seeds from different
-            # configurations would fabricate n, so keep one group: current
-            # code stamp first, then the largest group.
+            # seeds run under different recipes).  Seeds from different
+            # configurations are not pooled: keep one group, current code stamp
+            # first, then the largest group.
             _cfg_groups = {}
             for _s, _r in _keep.items():
                 _cfg_groups.setdefault(_r.get('run_cfg') if isinstance(_r, dict) else None, []).append(_s)

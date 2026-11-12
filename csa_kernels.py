@@ -207,9 +207,7 @@ def _seg_apply(seg, values, out_flat):
     未被任何键覆盖的行保持零，与「零初始化全头缓冲后按 seg_id·nh+h
     写入、末尾一次 cast」逐头 cast 的参考形式逐位一致）。"""
     order, seg_end, seg_id_k, keep = seg
-    # Accumulate in the caller's output precision (fp32 for the fp32/bf16
-    # paths, fp64 when a fp64 pool calls here) so index_copy_ dtypes match and
-    # an fp64 gradient is not silently rounded through fp32.
+    # Accumulate in the caller's output precision so index_copy_ dtypes match.
     val_s = values.index_select(0, order).to(out_flat.dtype)
     csum = val_s.cumsum_(dim=0)
     hi = csum.index_select(0, seg_end)
@@ -570,8 +568,7 @@ def _pool_bwd_ref(Xa, Xb, Za, Zb, geom, B_pos_a, B_pos_b, bid, dcomp,
     dev = Xa.device
     dtype = Xa.dtype
     # Work in max(dtype, fp32), the same contract as the indexer reference:
-    # fp32/bf16/fp16 accumulate in fp32, while fp64 inputs keep fp64.  A
-    # hard-coded fp32 here silently rounded fp64 gradients.
+    # fp32/bf16/fp16 accumulate in fp32, while fp64 inputs keep fp64.
     acc = torch.promote_types(dtype, torch.float32)
     L, W = geom.max_len, geom.W_b
     has_b = Xb is not None and W > 0
@@ -1019,9 +1016,8 @@ def _triton_dtype_ok(dtype):
 
 def _indexer_impl_for_shape(impl, kI):
     # The scoring kernel and the runner-up path both handle long-context
-    # shapes (Bm can be tens of thousands) on the Triton scorer.  A dtype the
-    # kernels do not implement (fp64) must fall back instead of being silently
-    # downcast to fp32, which would disagree with the reference contract.
+    # shapes (Bm can be tens of thousands) on the Triton scorer.  Dtypes the
+    # kernels do not implement (fp64) use the reference backend.
     if impl == 'triton' and not _triton_dtype_ok(kI.dtype):
         _warn_shape_fallback('indexer', f'dtype={kI.dtype} is not supported by the Triton scorer')
         return 'ref'
@@ -1063,9 +1059,8 @@ class FusedIndexer(torch.autograd.Function):
             except (TypeError, ValueError, OverflowError):
                 _tchunk = None
             if _tchunk is not None and _tchunk <= 0:
-                # A negative/zero chunk makes range(0, T, t_chunk) empty (or
-                # raises), silently returning all-zero gradients; fall back to
-                # the default chunking instead.
+                # A chunk size must be positive; non-positive values use the
+                # default chunking instead.
                 print(f'[kernel] indexer: ignoring non-positive CSA_KERNEL_IDX_CHUNK={_ic!r}; using the default chunk size')
                 _tchunk = None
         dqI, dkI, dw = _indexer_bwd_ref(
@@ -2596,9 +2591,8 @@ def kernel_env(mode):
     """临时设置 CSA_KERNEL（exp_lib 的分发按每次 forward 读取环境变量）。
 
     Per-operator overrides (CSA_KERNEL_POOL/_IDX/_ATTN) take precedence over
-    the global mode, so they are cleared for the duration as well: otherwise a
-    stray ``CSA_KERNEL_POOL=ref`` makes a nominally "triton" validation run
-    silently execute the reference pool and still certify the kernel path.
+    the global mode, so they are cleared for the duration as well: a
+    "triton" validation run then executes and certifies the kernel path.
     """
     _names = ('CSA_KERNEL', 'CSA_KERNEL_POOL', 'CSA_KERNEL_IDX', 'CSA_KERNEL_ATTN')
     old = {name: os.environ.get(name) for name in _names}

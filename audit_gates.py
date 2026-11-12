@@ -57,8 +57,7 @@ def _declares_shuffle(value):
     """True when split metadata declares (or cannot deny) a shuffled split.
 
     Only a real boolean ``False``/``None`` is a clean declaration.  A JSON
-    ``1``/``"yes"`` is malformed provenance and must fail closed rather than
-    silently pass an ``is True`` check.
+    ``1``/``"yes"`` is malformed provenance and must fail closed.
     """
     if value is None:
         return False
@@ -722,9 +721,8 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
             trp = os.path.join(cd, f'train_ids_{tag}.npy')
             vap = os.path.join(cd, f'val_batch_{tag}.npy')
             if not (os.path.exists(trp) and os.path.exists(vap)):
-                # Metadata without its arrays is an incomplete/corrupt cache.
-                # Skipping it silently lets a clean sibling make the whole
-                # audit report ``ok`` while this corpus was never verified.
+                # Metadata without its arrays is an incomplete cache and
+                # fails the split contract for this corpus.
                 rec = {'status': 'fail', 'meta': os.path.basename(mp),
                        'error': 'cache metadata exists but its train/val arrays are missing'}
                 cache['corpora'][tag] = rec

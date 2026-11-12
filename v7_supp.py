@@ -1457,9 +1457,8 @@ def run_warmup(cfg, seeds, guard=None, label='', warm_grid=(0, 5000, 10000), var
             _cell_recs[_k]['warm_steps'] = int(_w.replace('w', ''))
         except Exception:
             continue
-    # Count only the PLANNED cells that produced a usable record; scanning all
-    # of summary.values() let stale/extra cells inflate completeness and hide
-    # a missing planned cell.
+    # Count only the PLANNED cells that produced a usable record; stale or
+    # extra summary cells do not affect completeness.
     _measured = len(_cell_recs)
     _write_phase_manifest(outdir, cfg, _fp, _panel_prov, phase='warmup', planned_cells=_planned, cell_records=_cell_recs, status='complete', started_at=_panel_started, data_contract=_data_contract)
     L.log_experiment_event(outdir, {
@@ -1797,7 +1796,7 @@ def bootstrap_report(outdirs, out='analysis_v7/stats.json'):
         # Records that carry an explicit but outdated code stamp are stale
         # measurements of another semantics.  Exclude them (and the whole tag
         # when none is current) instead of emitting p-values from them.  Rows
-        # without a stamp keep the legacy permissive path.
+        # without a stamp remain admissible.
         _codes = {r.get('_code') for r in _m.values() if r.get('_code') is not None}
         if _codes:
             if L.code_stamp() not in _codes:

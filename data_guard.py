@@ -1595,9 +1595,8 @@ def _matrix_fingerprint(X):
             else:
                 block = np.ascontiguousarray(_blk, dtype=np.uint64)
                 if _wide_neg:
-                    # The uint64 bit pattern of -1 equals 2**64-1; without the
-                    # sign lane those logically different values would share a
-                    # fingerprint.
+                    # Encode the sign so -1 and 2**64-1 have distinct
+                    # fingerprints.
                     h.update(np.ascontiguousarray(_blk < 0, dtype=np.uint8).tobytes())
         else:
             block = np.asarray(_blk, dtype=np.float64)

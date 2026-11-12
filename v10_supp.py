@@ -814,8 +814,8 @@ def run_probe(cfg=PROBE, guard=None, label='v10 P3MP', par=None):
                        if isinstance(_r, dict) and not _r.get('synthesized')
                        and _r.get('_code') == V.CKPT_CODE
                        and (L.ppl_is_usable(_r.get('ppl_mean')) or _r.get('task') == 'niah_natural')}
-    # Only planned cells count: an extra/stale summary record must not hide a
-    # missing planned seed by inflating the measured total.
+    # Only planned cells count: stale or extra summary records do not
+    # contribute to the measured total.
     _measured = sum(1 for _v, _sd in cells if (_v, L._as_seed_int(_sd)) in _measured_pairs)
     L.log_experiment_event(outdir, {
         'kind': 'panel_finish', 'tracking_schema': 2, 'label': label or outdir,
@@ -2010,10 +2010,9 @@ def build_report(out='REPORT_v10.md', stats_p='analysis_v10/stats.json'):
             e = dnll[k]
             _ck = f"{e['variant']}::{e['arm']}::L{e['eval_len']}"
             if _ck not in _clean_nll_cache:
-                # The clean rho=0 cells are omitted from delta_nll by design,
-                # so scanning delta_nll for a clean entry always came back
-                # empty and this column was always nan.  Recover the per-seed
-                # clean values that every corrupted entry already carries.
+                # The clean rho=0 cells are omitted from delta_nll by design;
+                # recover the per-seed clean values that every corrupted entry
+                # already carries.
                 _cl = {}
                 for x in dnll.values():
                     if (x['variant'] == e['variant'] and x['arm'] == e['arm']

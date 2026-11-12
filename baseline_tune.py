@@ -156,7 +156,7 @@ def _search_final_seeds(protocol):
     if raw_search is None:
         raw_search = [protocol.get('search_seed', 0)]
     search = _seeds(raw_search)
-    # 0 is a valid seed; ``or []`` would silently discard a scalar final_seeds=0.
+    # An absent final_seeds means no final seed; 0 is a valid seed.
     _final_raw = protocol.get('final_seeds')
     final = _seeds([] if _final_raw is None else _final_raw)
     if not search:

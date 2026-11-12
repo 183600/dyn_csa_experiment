@@ -373,7 +373,7 @@ def t_manifest_v3_admission_can_succeed():
 
 
 def t_v7_rope_gather_rotation_order():
-    # The per-chunk RoPE refactor rotates the gathered window rows.  The
+    # The per-chunk RoPE path rotates the gathered window rows.  The
     # gathered tensor is [queries, lanes, heads, head_dim], so the position
     # table needs a singleton HEAD axis; inserting a singleton LANE axis only
     # broadcasts when lanes == heads.
@@ -6404,7 +6404,7 @@ def t_known_labels_audit():
 
 
 
-def t_bug_hunt_regressions():
+def t_targeted_contract_edges():
     # ce_loss: the default None still means cross_entropy's -100 sentinel, so
     # ignored targets must not inflate the denominator.
     torch.manual_seed(0)
@@ -6715,7 +6715,7 @@ def main():
     _check('L15 cross-scale pooling refuses mixed corpus/tokenizer bindings', t_scale_corpus_binding_refuses_mixed_tokenizers)
     _check('L15b scale-point corpus provenance roundtrip', t_scale_point_provenance_roundtrip)
     _check('L15c scale-edge regressions (tiny effects, zero deltas, tiny corpora)', t_scale_edge_case_regressions)
-    _check('L16 targeted bug-hunt regressions', t_bug_hunt_regressions)
+    _check('L16 targeted contract edges', t_targeted_contract_edges)
     fails = [r for r in _results if r[1] not in ('PASS', 'SKIP')]
     skips = [r for r in _results if r[1] == 'SKIP']
     print(f'\n[test] {len(_results) - len(fails) - len(skips)}/{len(_results)} passed, {len(skips)} skipped, {len(fails)} failed')
