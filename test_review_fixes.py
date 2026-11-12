@@ -3223,6 +3223,18 @@ def t_audit_leakage_handles_flat_train_cache():
             json.dump({'src_fp': 'test'}, f)
         bad = A.audit_leakage(cache_dir=cache, shingle=4, max_rows_shingled=10)
         assert bad['status'] == 'fail' and bad['checks'].get('vocab_agree') is False, bad
+        # Fractional/boolean/NaN metadata is not an integer cache identity;
+        # int() truncation would pair two different vocabularies as equal.
+        assert A._exact_int_scalar(3.5) is None
+        assert A._exact_int_scalar(True) is None
+        assert A._exact_int_scalar(float('nan')) is None
+        assert A._exact_int_scalar('3') == 3
+        with open(os.path.join(cache, 'meta_v4_x.json'), 'w', encoding='utf-8') as f:
+            json.dump({'vocab': 1000.5, 'src_fp': 'train'}, f)
+        with open(os.path.join(cache, 'test_meta_x.json'), 'w', encoding='utf-8') as f:
+            json.dump({'vocab': 1000.5, 'src_fp': 'test'}, f)
+        frac = A.audit_leakage(cache_dir=cache, shingle=4, max_rows_shingled=10)
+        assert frac['status'] != 'ok' and frac['checks'].get('vocab_agree') is False, frac
     finally:
         shutil.rmtree(cache, ignore_errors=True)
 

@@ -38,6 +38,7 @@
 """
 import json
 import math
+import numbers
 import os
 import sys
 import time
@@ -50,6 +51,31 @@ for _stream in (sys.stdout, sys.stderr):
             pass
 
 REPO = os.path.dirname(os.path.abspath(__file__))
+
+
+def _exact_int_scalar(value):
+    """Exact non-lossy integer view of a metadata scalar, or None.
+
+    ``int(1.9) == 1`` and ``int(True) == 1`` silently turn malformed
+    provenance (vocab sizes, sequence lengths) into a different valid cache
+    identity, which would let the leakage/split audits pair the wrong files.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, numbers.Integral):
+        return int(value)
+    if isinstance(value, numbers.Real):
+        f = float(value)
+        if not math.isfinite(f) or f != math.floor(f) or abs(f) >= 2 ** 53:
+            return None
+        return int(f)
+    try:
+        f = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(f) or f != math.floor(f) or abs(f) >= 2 ** 53:
+        return None
+    return int(f)
 
 
 def _load(path):
@@ -119,10 +145,7 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
     # required to match: the training cache is 512-token and the held-out cache
     # is 4097-token by construction.
     def _as_int(value):
-        try:
-            return int(value)
-        except (TypeError, ValueError, OverflowError):
-            return None
+        return _exact_int_scalar(value)
     _pairs = []
     for _tp in _tm:
         _tmeta = _load(_tp)
@@ -141,9 +164,12 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
                 continue
             _pairs.append((_mp, _mmeta, _tp, _tmeta))
     if preferred_train_seq_len is not None:
-        _pref = [p for p in _pairs
-                 if p[1].get('seq_len') is not None
-                 and int(p[1]['seq_len']) == int(preferred_train_seq_len)]
+        _want_sl = _exact_int_scalar(preferred_train_seq_len)
+        _pref = []
+        for p in _pairs:
+            _got_sl = _exact_int_scalar(p[1].get('seq_len'))
+            if _want_sl is not None and _got_sl is not None and _got_sl == _want_sl:
+                _pref.append(p)
         if _pref:
             _pairs = _pref
     if not _pairs:
@@ -796,16 +822,17 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                 # provenance; the row-overlap checks accept different shapes,
                 # and >1 matching candidate is reported as ambiguous.
                 if meta.get('vocab') is not None and _tm.get('vocab') is not None:
-                    try:
-                        _same_vocab = int(_tm['vocab']) == int(meta['vocab'])
-                    except (TypeError, ValueError, OverflowError):
+                    _tv = _exact_int_scalar(_tm['vocab'])
+                    _mv = _exact_int_scalar(meta['vocab'])
+                    if _tv is None or _mv is None:
                         # A malformed vocab cannot be paired; fail the cache
-                        # instead of aborting the whole report.
+                        # instead of truncating it to a different identity or
+                        # aborting the whole report.
                         rec['status'] = 'fail'
                         _fail(f'{cd}/{tag}: cache metadata has a non-integer vocab '
                               f'(train={meta.get("vocab")!r}, test={_tm.get("vocab")!r})')
                         continue
-                    if not _same_vocab:
+                    if _tv != _mv:
                         continue
                 if meta.get('fit_fp') and _tm.get('fit_fp') and meta['fit_fp'] != _tm['fit_fp']:
                     continue
