@@ -8783,7 +8783,15 @@ def ppl_is_usable(v):
     return f is not None and f > 0.0
 
 def by_len_cells(rows, Ln, variant=None):
-    keys = (Ln, int(Ln), str(int(Ln)))
+    # A requested length must be an exact integer >= 2.  int(True)==1 and
+    # int(4.9)==4 would otherwise select cells for a different sequence length;
+    # a length-1 row predicts no next token, so it has no usable cell.
+    Ln_i = _as_seed_int(Ln)
+    if Ln_i is None:
+        raise ValueError(f'by_len_cells: length {Ln!r} is not an exact integer')
+    if Ln_i < 2:
+        return []
+    keys = (Ln_i, str(Ln_i))
     # Length-panel rows must all come from one validation slice: PPL@L is only
     # comparable when the underlying corpus is the same.  Records without a
     # fingerprint keep the permissive path; a mixed fingerprint set

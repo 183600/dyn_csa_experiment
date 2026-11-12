@@ -4475,6 +4475,54 @@ def t_audit_length_malformed_cells_do_not_crash():
         shutil.rmtree(td, ignore_errors=True)
 
 
+def t_by_len_cells_requires_exact_length():
+    base = {'variant': 'a', 'val_fp': 'v', 'by_len': {
+        '1': {'ppl': 5.0}, '4': {'ppl': 10.0}, '4.9': {'ppl': 11.0},
+        '512': {'ppl': 20.0}}}
+    assert [c['ppl'] for c in L.by_len_cells([base], 4)] == [10.0]
+    assert [c['ppl'] for c in L.by_len_cells([base], 512)] == [20.0]
+    assert [c['ppl'] for c in L.by_len_cells([base], '512')] == [20.0]
+    for bad in (True, np.bool_(False), 4.9, float('nan')):
+        try:
+            L.by_len_cells([base], bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'by_len_cells must refuse the length {bad!r}')
+    # A genuine length-one panel has no next-token target and yields no cells.
+    assert L.by_len_cells([base], 1) == []
+
+
+def t_audit_length_exact_integer_fields():
+    td = tempfile.mkdtemp(prefix='len_exact_', dir=REPO)
+    try:
+        p = os.path.join(td, 'bylen.json')
+        huge = 2 ** 60
+        with open(p, 'w', encoding='utf-8') as f:
+            json.dump({'a::s0': {'by_len': {str(huge): {
+                'n_tok': huge, 'eval_span': huge, 'n_seq': 1,
+                'truncated': False}}}}, f)
+        r = A.audit_length(p)
+        assert r['status'] == 'fail', r
+        assert any('not an integer length' in x for x in r['problems']), r
+        with open(p, 'w', encoding='utf-8') as f:
+            json.dump({'a::s0': {'by_len': {'4096': {
+                'n_tok': float(huge), 'eval_span': 4095, 'n_seq': 1,
+                'truncated': False}}}}, f)
+        r2 = A.audit_length(p)
+        assert r2['status'] == 'fail', r2
+        assert any('not an integer count' in x for x in r2['problems']), r2
+        with open(p, 'w', encoding='utf-8') as f:
+            json.dump({'a::s0': {'by_len': {'4096': {
+                'n_tok': '4095.5', 'eval_span': 4095, 'n_seq': 1,
+                'truncated': False}}}}, f)
+        r3 = A.audit_length(p)
+        assert r3['status'] == 'fail', r3
+        assert any('not an integer count' in x for x in r3['problems']), r3
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+
 def t_audit_boundary_below_baseline_fails():
     import tempfile
     with tempfile.TemporaryDirectory() as d:
@@ -6216,6 +6264,8 @@ def main():
     _check('L10c2 corpus-audit document-overlap count is exact', t_corpus_audit_overlap_metadata_exact)
     _check('L10d report command aggregates sub-audit status', t_report_aggregate_status_fails_closed)
     _check('L10c length audit rejects malformed cell objects', t_audit_length_malformed_cells_do_not_crash)
+    _check('L10c2 by-length reader requires an exact integer length', t_by_len_cells_requires_exact_length)
+    _check('L10c3 length audit parses keys and counts exactly', t_audit_length_exact_integer_fields)
     _check('L11 length audit fails closed on missing truncation flag', t_audit_length_missing_truncated_flag)
     _check('L12 length audit fails closed on missing n_seq', t_audit_length_missing_n_seq_flag)
     _check('L13 global cross-panel multiplicity audit (exp_lib)', t_global_multiplicity_audit_basic)

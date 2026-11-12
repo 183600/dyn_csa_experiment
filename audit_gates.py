@@ -1328,14 +1328,10 @@ def audit_length(bylen_path='results_lm_test/bylen.json'):
             problems.append(f'{key}: by_len is not an object — the per-length cells cannot be audited')
             continue
         for k, c in (_cells or {}).items():
-            if isinstance(k, (bool, np.bool_)):
-                problems.append(f'{key}: by_len key {k!r} is not an integer length')
-                continue
-            try:
-                Ln = int(k)
-                if isinstance(k, float) and (not math.isfinite(k) or k != Ln):
-                    raise ValueError
-            except (TypeError, ValueError, OverflowError):
+            # Exact integers only: int(True)==1, int(4.9)==4 and a float above
+            # 2**53 can all denote a length different from the one recorded.
+            Ln = _exact_int_scalar(k)
+            if Ln is None or abs(Ln) >= 2 ** 53:
                 # A key that cannot be read as an exact integer length is not
                 # silently skipped: doing so would let an unauditable cell
                 # leave the overall status at "ok".
@@ -1397,9 +1393,11 @@ def audit_length(bylen_path='results_lm_test/bylen.json'):
                     continue
                 if not math.isfinite(_fval):
                     problems.append(f'{key}: L{Ln} {_field} is not finite ({_val!r}) — unverifiable')
-                elif not _fval.is_integer():
-                    # int(4.9) would truncate the count and could satisfy the
-                    # n_tok == n_seq*(L-1) identity with corrupted evidence.
+                elif not _fval.is_integer() or abs(_fval) >= 2 ** 53:
+                    # int(4.9) would truncate the count, and a float above
+                    # 2**53 cannot represent every integer; either could
+                    # satisfy the n_tok == n_seq*(L-1) identity with corrupted
+                    # evidence.
                     problems.append(f'{key}: L{Ln} {_field} is not an integer count ({_val!r})')
                 elif _field in ('n_tok', 'n_seq', 'eval_span') and _fval <= 0:
                     problems.append(f'{key}: L{Ln} {_field} must be positive, got {_val!r}')
@@ -1408,16 +1406,13 @@ def audit_length(bylen_path='results_lm_test/bylen.json'):
             # set, so verify the formula whenever the cell claims to be a
             # full-length measurement.
             if c.get('truncated') is False and _nseq_cell is not None:
-                try:
-                    _nt = int(c.get('n_tok'))
-                    _ns = int(_nseq_cell)
-                except (TypeError, ValueError, OverflowError):
-                    # The set-based agreement check below already fails on a
-                    # missing/non-numeric value.
-                    pass
-                else:
+                _nt = _exact_int_scalar(c.get('n_tok'))
+                _ns = _exact_int_scalar(_nseq_cell)
+                if _nt is not None and _ns is not None:
                     if Ln >= 2 and _nt != _ns * (Ln - 1):
                         problems.append(f'{key}: L{Ln} n_tok={_nt} != n_seq*(L-1)={_ns * (Ln - 1)} — the cell did not score one next-token target per row')
+                # A missing/non-numeric value is already reported by the
+                # per-field check above (or by the cross-record sets below).
             if 'truncated' not in c:
                 problems.append(f'{key}: L{Ln} cell has NO `truncated` flag — a missing truncation marker is treated as unverifiable, not as a full-length measurement')
             elif not isinstance(c.get('truncated'), (bool, np.bool_)):
