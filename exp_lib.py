@@ -6373,7 +6373,8 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
             if test_doc_ids is None:
                 _problems.append('test cache metadata records document ids but the sidecar is missing')
             else:
-                if int(np.asarray(test_doc_ids).size) != int(_mdoc.get('test_count', -1)):
+                if (int(np.asarray(test_doc_ids).size)
+                        != _as_seed_int(_mdoc.get('test_count', -1))):
                     _problems.append(
                         'test document-id sidecar count does not match the cache metadata')
                 if not _mdoc.get('test_fp'):
@@ -6383,8 +6384,8 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
                     _problems.append(
                         'test document-id sidecar does not match the fingerprint in the cache metadata')
                 if (_mdoc.get('disjoint') is not True
-                        or int(_mdoc.get('train_overlap', 0) or 0) != 0
-                        or int(_mdoc.get('validation_overlap', 0) or 0) != 0):
+                        or _as_seed_int(_mdoc.get('train_overlap', 0)) != 0
+                        or _as_seed_int(_mdoc.get('validation_overlap', 0)) != 0):
                     _problems.append(
                         'test cache metadata does not attest document-disjoint '
                         'train/validation/test groups')
