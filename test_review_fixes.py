@@ -119,6 +119,17 @@ def t_min_consistency():
     assert L.signflip_min_n_for_holm(1, alpha=0.25) == 3
     assert L.signflip_min_consistency(3, 1, alpha=0.25) == 3
     assert abs(L.signflip_power(3, 1, 0.9, alpha=0.25) - 0.729) < 1e-12
+    # Planning counts are exact integers; bool/fractional values must not be
+    # truncated into a feasible-looking plan.
+    for _bad_n in (True, np.bool_(False), 12.9, float('nan'), 0, -1):
+        assert L.signflip_min_consistency(_bad_n, 4) is None, _bad_n
+        assert not math.isfinite(L.holm_min_attainable_p(_bad_n, 4)), _bad_n
+    for _bad_m in (True, np.bool_(False), 4.9, 0, -1):
+        assert L.signflip_min_consistency(12, _bad_m) is None, _bad_m
+        assert not math.isfinite(L.holm_min_attainable_p(12, _bad_m)), _bad_m
+    for _bad in (True, 4.9, 0, -1):
+        assert L.signflip_min_n_for_holm(_bad) is None, _bad
+        assert L.signflip_min_n_for_holm(1, alpha=_bad) is None, _bad
 
 
 def t_power():

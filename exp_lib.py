@@ -9570,15 +9570,12 @@ def holm_min_attainable_p(n_seeds, m_comparisons, alpha=0.05):
     最小可达 p_holm = min(1, m * 2/2^n)。若该值 > alpha，则该方案在构造上
     无法确认任何比较——这是分辨率上限，不是「保守的选择」，应当在读到
     任何测试数据之前修订（加种子 / 缩族 / 改检验），而不是事后再解释。"""
-    if (isinstance(n_seeds, (bool, np.bool_))
-            or isinstance(m_comparisons, (bool, np.bool_))):
-        return float('nan')
-    try:
-        n = int(n_seeds)
-        m = int(m_comparisons)
-    except (TypeError, ValueError, OverflowError):
-        return float('nan')
-    if n <= 0 or m <= 0:
+    # A seed/comparison count is an exact integer: int(12.9)=12 would make a
+    # plan look one seed larger than it is and could wrongly clear the
+    # resolution gate.  _as_seed_int also rejects booleans and lossy floats.
+    n = _as_seed_int(n_seeds)
+    m = _as_seed_int(m_comparisons)
+    if n is None or m is None or n <= 0 or m <= 0:
         return float('nan')
     return min(1.0, m * signflip_p_floor(n))
 
@@ -9595,13 +9592,17 @@ def signflip_min_n_for_holm(m_comparisons, alpha=0.05, n_max=64):
     returned n is descriptive only (the exact-test floor, not the data, bounds
     the p value), so the audit labels it resolution-limited instead of reading
     it as a null result."""
-    if isinstance(m_comparisons, (bool, np.bool_)) or isinstance(n_max, (bool, np.bool_)):
+    m = _as_seed_int(m_comparisons)
+    n_max = _as_seed_int(n_max)
+    if isinstance(alpha, (bool, np.bool_)):
         return None
     try:
-        m = int(m_comparisons)
         a = float(alpha)
-        n_max = int(n_max)
     except (TypeError, ValueError, OverflowError):
+        return None
+    if m is None or n_max is None or m <= 0 or n_max <= 0:
+        return None
+    if not (math.isfinite(a) and 0.0 < a < 1.0):
         return None
     if m <= 0 or not (0.0 < a < 1.0):
         return None
@@ -9800,15 +9801,11 @@ def signflip_min_consistency(n_seeds, m_comparisons, alpha=0.05):
     下界，真实数据可能仍需更多同向种子。返回使 m·p(k) < alpha 的最小
     k；若全部 n 个同向仍不够，返回 None（方案不可能确认）。二项尾概率
     在 log 空间计算，因此大 n（规模扩展后的补种子计划）也不会整数溢出。"""
-    if (isinstance(n_seeds, (bool, np.bool_))
-            or isinstance(m_comparisons, (bool, np.bool_))):
-        return None
-    try:
-        n = int(n_seeds)
-        m = int(m_comparisons)
-    except (TypeError, ValueError, OverflowError):
-        return None
-    if n <= 0 or m <= 0:
+    # Exact integer counts only: truncating 12.9 to 12 would report a plan as
+    # feasible one seed before it actually is.
+    n = _as_seed_int(n_seeds)
+    m = _as_seed_int(m_comparisons)
+    if n is None or m is None or n <= 0 or m <= 0:
         return None
     best = None
     for k in range(n, -1, -1):
