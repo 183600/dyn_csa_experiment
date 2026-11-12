@@ -2319,6 +2319,33 @@ def t_experiment_ledger():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def t_npy_serve_int32_rejects_invalid_and_out_of_range():
+    # The int32 narrowing helper must never turn a corrupt cache into plausible
+    # token ids.  Its range/dtype guards used to be swallowed by the sidecar
+    # fallback, which silently truncated floats and wrapped out-of-int32 ids.
+    with tempfile.TemporaryDirectory() as d:
+        ok = np.array([0, 1, 65535], dtype=np.int64)
+        p_ok = os.path.join(d, 'ok.npy')
+        np.save(p_ok, ok)
+        got = L._npy_serve_int32(p_ok)
+        assert np.array_equal(np.asarray(got, dtype=np.int64), ok), got
+        assert np.asarray(got).dtype == np.int32, got.dtype
+        cases = (
+            ('float', np.array([1.5, 2.0], dtype=np.float64), TypeError),
+            ('negative', np.array([-1, 2], dtype=np.int64), ValueError),
+            ('wide', np.array([2 ** 31, 2], dtype=np.int64), ValueError),
+        )
+        for name, bad, exc in cases:
+            p = os.path.join(d, f'{name}.npy')
+            np.save(p, bad)
+            try:
+                L._npy_serve_int32(p)
+            except exc:
+                pass
+            else:
+                raise AssertionError(f'{name}: invalid token cache was silently accepted')
+
+
 def t_data_version_identity():
     cfg = {'dataset': 'unit', 'n_train_tokens': 512, 'seq_len': 32, 'cache_dir': './unit_cache'}
     tr = np.arange(512, dtype=np.int64) % 97
@@ -5751,6 +5778,7 @@ def main():
     _check('E7 overfit check detects broken optimizer', t_overfit_detects_broken_optimizer)
     _check('E8 append-only experiment ledger + manifest', t_experiment_ledger)
     _check('E4b manifest seed integrity is exact', t_manifest_seed_integrity_is_exact)
+    _check('E9a int32 cache narrowing rejects corrupt ids', t_npy_serve_int32_rejects_invalid_and_out_of_range)
     _check('E9 data_version identity', t_data_version_identity)
     _check('E10 crash-safe manifest status/planned cells', t_manifest_running_then_complete)
     _check('E11 failed overfit guard is retried', t_failed_guard_is_retried)

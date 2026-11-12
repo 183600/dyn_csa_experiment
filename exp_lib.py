@@ -6895,6 +6895,11 @@ def _npy_serve_int32(path):
     # Wider integer cache: narrow to int32 only after proving every id fits.
     # A silent wrap (e.g. 2**32 + 5 -> 5) would pass the downstream
     # vocab-range check for small vocabularies and corrupt the corpus.
+    # Validate BEFORE the sidecar/fallback block: a validation ValueError
+    # (non-integer values, negative ids, out-of-int32 ids) must propagate.
+    # Catching it there and falling through to an int32 cast would truncate a
+    # float cache or wrap a large id, exactly the corruption this guard exists
+    # to prevent.
     if src.size:
         _mn, _mx = int(src.min()), int(src.max())
         if _mn < 0 or _mx > 2 ** 31 - 1:
@@ -6934,6 +6939,8 @@ def _npy_serve_int32(path):
             raise
         return np.load(_side, mmap_mode='r')
     except (OSError, ValueError, TypeError):
+        # The source range was already validated above, so this fallback can
+        # only fail to write/serve the sidecar cache; narrowing is exact.
         out = np.empty(src.shape, dtype=np.int32)
         for s in range(0, src.size, 1 << 24):
             e = min(s + (1 << 24), src.size)
