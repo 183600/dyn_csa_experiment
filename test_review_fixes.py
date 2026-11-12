@@ -234,6 +234,56 @@ def t_scale_robustness_edges():
     assert '/' not in L.ckpt_file_name('..', 0, '.')
 
 
+def t_scale_aggregate_and_claim_edges():
+    # Seed ordering must stay exact above the binary64 range; converting the
+    # id through float() would abort the whole aggregate.
+    _huge_seed = 10 ** 400
+    _summ = {'x': {'variant': 'csa', 'seed': _huge_seed, 'ppl': 10.0,
+                   'nll_sum': 10.0, 'n_tokens': 1}}
+    _agg = L.aggregate(_summ)
+    assert _agg['csa']['seeds'] == [_huge_seed], _agg
+    # A malformed integral p-value is an invalid family slot, not a crash.
+    _entries = [{'p_exact_signflip': _huge_seed}]
+    L._holm_assign(_entries, 1, 0.05, 'p_holm')
+    assert _entries[0]['p_holm'] is None, _entries
+    # The claim gate rejects malformed alpha/min_n instead of coercing a
+    # boolean to a permissive level or overflowing on a huge value.
+    _base = {'n': 10, 'mean': -1.0, 'std': 0.1,
+             'p_exact_signflip': 0.01, 'p_holm': 0.02}
+    assert L.reportable_claim(_base)['allowed'] is True
+    for _bad_alpha in (True, np.bool_(False), _huge_seed, 0, 1.5, 'x'):
+        _r = L.reportable_claim(_base, alpha=_bad_alpha)
+        assert _r['allowed'] is False and _r['reasons'], (_bad_alpha, _r)
+    for _bad_min_n in (True, np.bool_(False), 1.5, '6', None, 0, -1):
+        _r = L.reportable_claim(_base, min_n=_bad_min_n)
+        assert _r['allowed'] is False and _r['reasons'], (_bad_min_n, _r)
+    # A huge but internally consistent ladder must report a finite ratio even
+    # when each per-tier tokens/params ratio overflows binary64.
+    def _tier(name, params):
+        return {'name': name,
+                'cfg': {'steps': 10 ** 200, 'batch_size': 2, 'seq_len': 8,
+                        'n_train_tokens': 10 ** 200 * 16, 'lr': 1e-3,
+                        'warmup': 1, 'seeds': [0, 1]},
+                'params': params}
+    _same = L.scale_ladder_audit([_tier('a', _huge_seed),
+                                  _tier('b', _huge_seed)])
+    assert _same['budget_matched'] is True, _same
+    assert _same['tokens_per_param_ratio'] == 1.0, _same
+    _diff = L.scale_ladder_audit([_tier('a', _huge_seed),
+                                  _tier('b', _huge_seed * 2)])
+    assert _diff['budget_matched'] is False, _diff
+    assert _diff['tokens_per_param_ratio'] == 2.0, _diff
+    # Cache signatures carry nanosecond/inode integers above 2**53; a lossy
+    # float or boolean spelling must not certify the same file identity.
+    _sigs = {'a': [1, 2 ** 60, 3, 4]}
+    assert L._cache_file_sigs_match({'file_sigs': {'a': [1, 2 ** 60, 3, 4]}},
+                                    _sigs) is True
+    for _bad in ([1, float(2 ** 60), 3, 4], [True, 2 ** 60, 3, 4],
+                 [1, 2 ** 60, 3], [1, 2 ** 60, 3, 4.5]):
+        assert L._cache_file_sigs_match({'file_sigs': {'a': _bad}},
+                                        _sigs) is False, _bad
+
+
 def t_power():
     assert L.signflip_power(6, 4, 0.99) == 0.0, 'an impossible plan has zero power at any q'
     pw = L.signflip_power(12, 4, 0.9, 0.05)
@@ -6643,6 +6693,7 @@ def main():
     _check('A1a invalid Holm slots stay in the declared family', t_holm_invalid_slots_stay_in_family)
     _check('A2 signflip_min_consistency', t_min_consistency)
     _check('A2b scale robustness edges', t_scale_robustness_edges)
+    _check('A2c aggregate/claim/ladder large-int edges', t_scale_aggregate_and_claim_edges)
     _check('A3 signflip_power', t_power)
     _check('A4 tost_paired directions', t_tost)
     _check('A5 exact_signflip baseline', t_exact_signflip_baseline)

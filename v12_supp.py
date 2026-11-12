@@ -478,8 +478,13 @@ def _load_manifest(path):
             for _sk, _sv in _sig.items():
                 if isinstance(_sv, (bool, np.bool_)):
                     raise SystemExit(f'[v12] REFUSE: training_recipe_signature.{_sk}={_sv!r} is a boolean, not a numeric recipe knob')
-                if isinstance(_sv, numbers.Real) and not math.isfinite(float(_sv)):
-                    raise SystemExit(f'[v12] REFUSE: training_recipe_signature.{_sk}={_sv!r} is not finite')
+                if isinstance(_sv, numbers.Real):
+                    try:
+                        _svf = float(_sv)
+                    except (TypeError, ValueError, OverflowError):
+                        _svf = float('nan')
+                    if not math.isfinite(_svf):
+                        raise SystemExit(f'[v12] REFUSE: training_recipe_signature.{_sk}={_sv!r} is not finite')
         _per = _bind.get('per_arm_recipe_signature')
         if _per is not None:
             if not isinstance(_per, dict) or set(_per) != set(m['arms']):
@@ -490,8 +495,13 @@ def _load_manifest(path):
                 for _sk, _sv in _asig.items():
                     if isinstance(_sv, (bool, np.bool_)):
                         raise SystemExit(f'[v12] REFUSE: per-arm signature {_arm!r}.{_sk}={_sv!r} is a boolean, not a numeric recipe knob')
-                    if isinstance(_sv, numbers.Real) and not math.isfinite(float(_sv)):
-                        raise SystemExit(f'[v12] REFUSE: per-arm signature {_arm!r}.{_sk}={_sv!r} is not finite')
+                    if isinstance(_sv, numbers.Real):
+                        try:
+                            _svf = float(_sv)
+                        except (TypeError, ValueError, OverflowError):
+                            _svf = float('nan')
+                        if not math.isfinite(_svf):
+                            raise SystemExit(f'[v12] REFUSE: per-arm signature {_arm!r}.{_sk}={_sv!r} is not finite')
                 if 'mr' in _asig:
                     try:
                         _mr = float(_asig['mr'])
@@ -1639,7 +1649,7 @@ def _test_probe_stats(probe_path, manifest, slice_fp):
             if oident[5:] != ident[5:]:
                 # Different probe_params / recipe / code stamp.
                 continue
-            common = sorted(set(learned) & set(other), key=float)
+            common = sorted(set(learned) & set(other))
             if len(common) < 2:
                 continue
             dl = [other[s] - learned[s] for s in common]

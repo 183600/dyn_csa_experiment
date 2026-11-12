@@ -155,6 +155,21 @@ def _save_summary(outdir, summary):
     _atomic_json(os.path.join(outdir, 'summary.json'), summary)
 
 
+def _finite_float(value):
+    """Finite float for a real numeric measurement (None otherwise).
+
+    Exact integers can exceed the binary64 range; float() then raises instead
+    of producing infinity.  Measurements must be representable, so such a
+    value is treated as unusable rather than crashing the panel reader."""
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, float)):
+        return None
+    try:
+        f = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return f if math.isfinite(f) else None
+
+
 def _is_current(rec, fp):
     if not isinstance(rec, dict):
         return False
@@ -164,8 +179,8 @@ def _is_current(rec, fp):
         return False
     if rec.get('synthesized'):
         return False
-    ppl = rec.get('ppl')
-    if not (isinstance(ppl, (int, float)) and not isinstance(ppl, bool) and math.isfinite(float(ppl)) and float(ppl) > 0):
+    ppl = _finite_float(rec.get('ppl'))
+    if ppl is None or ppl <= 0.0:
         return False
     # Resume must agree with the analysis predicate: a record without usable
     # per-token NLL is not a completed cell even if it has a positive PPL.
@@ -355,17 +370,17 @@ def _cell_diagnostics(rec):
         if not isinstance(d, dict):
             continue
         for k in keys_mean:
-            v = d.get(k)
-            if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(float(v)):
-                out[k].append(float(v))
+            v = _finite_float(d.get(k))
+            if v is not None:
+                out[k].append(v)
             ob = d.get('open_block')
             if isinstance(ob, dict):
-                v2 = ob.get(k)
-                if isinstance(v2, (int, float)) and not isinstance(v2, bool) and math.isfinite(float(v2)):
-                    out[k].append(float(v2))
-        lm = d.get('len_max')
-        if isinstance(lm, (int, float)) and math.isfinite(float(lm)):
-            out['len_max'].append(float(lm))
+                v2 = _finite_float(ob.get(k))
+                if v2 is not None:
+                    out[k].append(v2)
+        lm = _finite_float(d.get('len_max'))
+        if lm is not None:
+            out['len_max'].append(lm)
     agg = {}
     for k, vals in out.items():
         if not vals:
@@ -652,9 +667,8 @@ def analyse(outdir, *, seeds=None, analysis_dir='analysis_open_block'):
 
 
 def _fmt(x, nd=4):
-    if isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(float(x)):
-        return f'{float(x):.{nd}f}'
-    return '—'
+    f = _finite_float(x)
+    return '—' if f is None else f'{f:.{nd}f}'
 
 
 def _render_markdown(stats):

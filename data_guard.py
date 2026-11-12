@@ -89,7 +89,10 @@ def _check_count(name, value, *, positive=False):
     if isinstance(value, numbers.Integral):
         value = int(value)
     elif isinstance(value, numbers.Real):
-        f = float(value)
+        try:
+            f = float(value)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(f'{name} must be an integer, got {value!r}') from None
         if (not math.isfinite(f) or f != math.floor(f)
                 or abs(f) >= 2 ** 53):
             raise ValueError(f'{name} must be an integer, got {value!r}')
@@ -276,7 +279,12 @@ def _validated_index(values, *, name='index'):
             if isinstance(v, numbers.Integral):
                 v = int(v)
             elif isinstance(v, numbers.Real):
-                f = float(v)
+                try:
+                    f = float(v)
+                except (TypeError, ValueError, OverflowError):
+                    raise ValueError(
+                        f'{name} must contain exact finite integer row indices, '
+                        f'got {v!r}') from None
                 if (not math.isfinite(f) or f != math.floor(f)
                         or abs(f) >= 2 ** 53):
                     raise ValueError(
@@ -331,7 +339,10 @@ def _check_purge(purge):
     if isinstance(purge, numbers.Integral):
         purge = int(purge)
     elif isinstance(purge, numbers.Real):
-        f = float(purge)
+        try:
+            f = float(purge)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(f'purge must be a non-negative integer, got {purge!r}') from None
         if (not math.isfinite(f) or f != math.floor(f)
                 or abs(f) >= 2 ** 53):
             raise ValueError(f'purge must be a non-negative integer, got {purge!r}')

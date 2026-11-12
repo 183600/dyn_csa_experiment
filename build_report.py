@@ -298,7 +298,10 @@ def _int_or(v, default):
     if isinstance(v, numbers.Integral):
         return int(v)
     if isinstance(v, numbers.Real):
-        f = float(v)
+        try:
+            f = float(v)
+        except (TypeError, ValueError, OverflowError):
+            return default
         if not (math.isfinite(f) and f.is_integer()) or abs(f) >= 2 ** 53:
             return default
         return int(f)
@@ -967,8 +970,8 @@ def sec_p0e():
             r_csa, r_full = (rate('csa_fixed'), rate('full'))
 
             def _gap_at(step):
-                v = gaps.get(step)
-                return f'**{v:+.1f}**' if isinstance(v, (int, float)) and math.isfinite(v) else '**未测量**（该面板无此步）'
+                v = _as_finite(gaps.get(step))
+                return f'**{v:+.1f}**' if v is not None else '**未测量**（该面板无此步）'
             _g20 = _gap_at(20000)
             def _dir_word(r):
                 return '下降' if r < 0 else ('上升' if r > 0 else '持平')
@@ -1000,8 +1003,8 @@ def sec_p0e():
             elif slope < -1e-06:
                 x0 = steps[-1] - g_last * 1000.0 / slope
                 if steps[-1] < x0 <= steps[-1] * 10:
-                    _g20v = gaps.get(20000)
-                    _g20c = f'由 20k 的 **{_g20v:+.1f}** ' if isinstance(_g20v, (int, float)) and math.isfinite(_g20v) else ''
+                    _g20v = _as_finite(gaps.get(20000))
+                    _g20c = f'由 20k 的 **{_g20v:+.1f}** ' if _g20v is not None else ''
                     verdict = f'- 按尾段斜率线性外推，差距将在 ~{x0 / 1000:.0f}k 步附近归零（外推仅供参考：学习率已 cosine 衰减到底，后期斜率通常进一步放缓）。\n\n**结论**：{_lastk:g}k 步内未发生反演，但差距仍在缓慢收窄。**保守表述**：「等 token 量下 CSA 收敛更慢，终点差距 {_g20c}收窄到 {_lastk:g}k 的 {g_last:+.1f}，未见交叉」。是否最终追平属外推，不属证据。'
                 else:
                     verdict = f'- 线性外推的交叉点在 ~{x0 / 1000:.0f}k 步，超出可信外推范围。\n\n**结论**：{_lastk:g}k 步（~{_tok_m} tokens）仍未追平——终点差距 **{g_last:+.1f} PPL**。差距收窄速度在尾段为 {abs(slope):.2f} PPL/1k，即每多训 10k 步约收窄 {abs(slope) * 10:.0f} PPL。**在本轮 {_lastk:g}k 步窗口内差距没有消失**；这支持「等训练量下收敛更慢」，不足以判定收敛后的渐近线（缺学习率续训与独立复现）。'
@@ -1043,8 +1046,17 @@ def sec_p1t():
                 # selection rate for a current aggregate row.
                 continue
             for _e in (_r.get('stats') or {}).values():
-                if isinstance(_e, dict) and isinstance(_e.get('blocks'), (int, float)) and _e['blocks'] > 0:
-                    _vals.append(float(_e['blocks']))
+                if not isinstance(_e, dict):
+                    continue
+                _b = _e.get('blocks')
+                if (isinstance(_b, (int, float))
+                        and not isinstance(_b, (bool, np.bool_)) and _b > 0):
+                    try:
+                        _bf = float(_b)
+                    except (TypeError, ValueError, OverflowError):
+                        continue
+                    if math.isfinite(_bf):
+                        _vals.append(_bf)
         _out = (sum(_vals) / len(_vals)) if _vals else None
         _nblocks_cache[base_variant] = _out
         return _out
@@ -1619,6 +1631,14 @@ def _sig_gate(st, alpha=0.05, min_n=6, label=None, family=None, register=True):
         else:
             _note_comparison(label, st.get('p_exact_signflip'), family,
                              st.get('p_holm'), st.get('n'), st.get('mean'))
+    if isinstance(alpha, (bool, np.bool_)):
+        return False
+    try:
+        alpha = float(alpha)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if not (math.isfinite(alpha) and 0.0 < alpha < 1.0):
+        return False
     # A seed count is an exact integer; `_int_or` rejects booleans and lossy floats.
     n = _int_or(st.get('n'), None)
     p = st.get('p_exact_signflip')
@@ -1897,10 +1917,10 @@ def sec_efficiency():
     # dominated by another measured arm.
     _pts = []
     for name, key, rec, eff in rows:
-        ppl = rec.get('ppl')
-        lat = eff.get('prefill_ms_p50')
-        if isinstance(ppl, (int, float)) and math.isfinite(ppl) and isinstance(lat, (int, float)) and math.isfinite(lat):
-            _pts.append((float(lat), float(ppl), name, key))
+        ppl = _as_finite(rec.get('ppl'))
+        lat = _as_finite(eff.get('prefill_ms_p50'))
+        if ppl is not None and lat is not None:
+            _pts.append((lat, ppl, name, key))
     _pts.sort()
     _frontier = []
     _best_ppl = float('inf')

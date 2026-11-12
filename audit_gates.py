@@ -82,7 +82,10 @@ def _exact_int_scalar(value):
     if isinstance(value, numbers.Integral):
         return int(value)
     if isinstance(value, numbers.Real):
-        f = float(value)
+        try:
+            f = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
         if not math.isfinite(f) or f != math.floor(f) or abs(f) >= 2 ** 53:
             return None
         return int(f)
@@ -1198,8 +1201,14 @@ def audit_attribution(outdirs=None):
                 _found = True
                 for _src, _dst in (('blocks', 'blocks_mean'), ('len_mean', 'block_len_mean'), ('len_p95', 'block_len_p95')):
                     _x = _lv.get(_src)
-                    if isinstance(_x, (int, float)) and math.isfinite(float(_x)):
-                        ent[_dst].append(float(_x))
+                    if (isinstance(_x, (int, float))
+                            and not isinstance(_x, (bool, np.bool_))):
+                        try:
+                            _xf = float(_x)
+                        except (TypeError, ValueError, OverflowError):
+                            continue
+                        if math.isfinite(_xf):
+                            ent[_dst].append(_xf)
             if _found or r.get('block_stats') or r.get('by_len_block_stats') or (isinstance(r.get('mech'), dict) and r['mech'].get('cuts')):
                 ent['with_block_stats'] += 1
         if panel:

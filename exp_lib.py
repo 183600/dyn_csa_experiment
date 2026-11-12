@@ -5610,7 +5610,18 @@ def _cache_file_sigs(paths):
 
 def _cache_file_sigs_match(meta, sigs):
     rec = meta.get('file_sigs') if isinstance(meta, dict) else None
-    return bool(sigs) and isinstance(rec, dict) and all(rec.get(_k) == _v for _k, _v in sigs.items())
+    if not sigs or not isinstance(rec, dict):
+        return False
+    for _k, _v in sigs.items():
+        _got = rec.get(_k)
+        if not isinstance(_got, (list, tuple)) or len(_got) != len(_v):
+            return False
+        # Exact integer fields only: a lossy float spelling of a nanosecond
+        # timestamp (above 2**53) or a boolean must not certify a different
+        # file as the recorded one.
+        if any(_as_seed_int(a) != int(b) for a, b in zip(_got, _v)):
+            return False
+    return True
 
 
 def _memo_file_sig(paths):
@@ -5668,12 +5679,16 @@ def _ids_fp(train_ids):
                 _rec = json.load(_sf)
             if not isinstance(_rec, dict):
                 raise ValueError('idsfp sidecar is not a JSON object')
-            if ((int(_rec.get('size', -1)), int(_rec.get('mtime_ns', -1)),
-                 int(_rec.get('ctime_ns', -1)), int(_rec.get('inode', -1))) == _stat
+            _rec_sig = tuple(_as_seed_int(_rec.get(_k, -1))
+                             for _k in ('size', 'mtime_ns', 'ctime_ns', 'inode'))
+            if (_rec_sig == _stat
                     and isinstance(_rec.get('fp'), str)
                     and _rec.get('algo') == _IDS_FP_ALGO
                     and _rec.get('dtype') == _tdtype
-                    and tuple(_rec.get('shape') or ()) == _tshape):
+                    and isinstance(_rec.get('shape'), (list, tuple))
+                    and len(_rec['shape']) == len(_tshape)
+                    and all(_as_seed_int(a) == b
+                            for a, b in zip(_rec['shape'], _tshape))):
                 _fp = _rec['fp']
                 if _key is not None:
                     try:
@@ -9048,10 +9063,42 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
     into a prohibition on *reporting* the number -- it only forbids the words
     "significant"/"confirmed" and records exactly why.
     """
+    if isinstance(alpha, (bool, np.bool_)):
+        _alpha = float('nan')
+        _alpha_bad = f'alpha {alpha!r} is a boolean flag, not a significance level'
+    else:
+        try:
+            _alpha = float(alpha)
+        except (TypeError, ValueError, OverflowError):
+            _alpha = float('nan')
+        _alpha_bad = (None if (math.isfinite(_alpha) and 0.0 < _alpha < 1.0)
+                      else f'alpha {alpha!r} is not in (0,1)')
+    _min_n = None
+    if isinstance(min_n, (bool, np.bool_)):
+        pass
+    elif isinstance(min_n, numbers.Integral):
+        _min_n = int(min_n)
+    elif isinstance(min_n, numbers.Real):
+        try:
+            _mf = float(min_n)
+        except (TypeError, ValueError, OverflowError):
+            _mf = float('nan')
+        if (math.isfinite(_mf) and _mf == math.floor(_mf)
+                and abs(_mf) < 2 ** 53):
+            _min_n = int(_mf)
+    if _min_n is None or _min_n <= 0:
+        _min_n_bad = f'min_n {min_n!r} is not a positive exact integer seed count'
+        _min_n = 0
+    else:
+        _min_n_bad = None
     out = {'allowed': False, 'level': 'unverifiable', 'reasons': [],
            'n': None, 'p_raw': None, 'p_holm': None, 'p_floor': None,
-           'min_attainable_p_holm_family': None, 'min_n': int(min_n),
-           'alpha': float(alpha)}
+           'min_attainable_p_holm_family': None, 'min_n': _min_n,
+           'alpha': _alpha}
+    if _alpha_bad is not None:
+        out['reasons'].append(_alpha_bad)
+    if _min_n_bad is not None:
+        out['reasons'].append(_min_n_bad)
     if not isinstance(stats, dict):
         out['reasons'].append('not a statistics dict')
         return out
@@ -9113,25 +9160,25 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
                 f'n_nonzero {_n_eff_raw!r} is not an exact integer in [0, n={n}]')
             _n_eff = n
     out['p_floor'] = signflip_p_floor(_n_eff) if _n_eff > 0 else None
-    if n < int(min_n):
-        out['reasons'].append(f'n={n} < min_n={int(min_n)}: the exact-test p floor is {out["p_floor"]:.3g} > alpha' if out['p_floor'] is not None else f'n={n} < min_n={int(min_n)}')
-    elif out['p_floor'] is not None and math.isfinite(out['p_floor']) and out['p_floor'] > alpha:
-        out['reasons'].append(f'p floor {out["p_floor"]:.3g} > alpha={alpha}: resolution ceiling, not a null result')
+    if n < _min_n:
+        out['reasons'].append(f'n={n} < min_n={_min_n}: the exact-test p floor is {out["p_floor"]:.3g} > alpha' if out['p_floor'] is not None else f'n={n} < min_n={_min_n}')
+    elif out['p_floor'] is not None and math.isfinite(out['p_floor']) and out['p_floor'] > _alpha:
+        out['reasons'].append(f'p floor {out["p_floor"]:.3g} > alpha={_alpha}: resolution ceiling, not a null result')
     _praw = out['p_raw']
     if _praw is None:
         out['reasons'].append(f'raw p {_praw!r} is not a probability')
     elif not (math.isfinite(_praw) and 0.0 <= _praw <= 1.0):
         out['reasons'].append(f'raw p {_praw!r} is not a probability in [0,1]')
-    elif not (_praw < alpha):
-        out['reasons'].append(f'raw p {_praw:.3g} is not < alpha={alpha}')
+    elif not (_praw < _alpha):
+        out['reasons'].append(f'raw p {_praw:.3g} is not < alpha={_alpha}')
     if require_holm:
         _ph = out['p_holm']
         if _ph is None:
             out['reasons'].append('no Holm-corrected p (family correction not attached)')
         elif not (math.isfinite(_ph) and 0.0 <= _ph <= 1.0):
             out['reasons'].append(f'Holm p {_ph!r} is not a probability in [0,1]')
-        elif not (_ph < alpha):
-            out['reasons'].append(f'Holm p {_ph:.3g} is not < alpha={alpha}')
+        elif not (_ph < _alpha):
+            out['reasons'].append(f'Holm p {_ph:.3g} is not < alpha={_alpha}')
     if isinstance(mean, (bool, np.bool_)) or isinstance(std, (bool, np.bool_)):
         out['reasons'].append('mean/std are boolean flags, not measurements')
     else:
@@ -9177,21 +9224,21 @@ def reportable_claim(stats, *, family_size=None, alpha=0.05, min_n=6,
             out['reasons'].append(f'family_size {family_size!r} must be positive')
             _fs = None
         try:
-            _fl = (holm_min_attainable_p(_n_eff, _fs, alpha)
+            _fl = (holm_min_attainable_p(_n_eff, _fs, _alpha)
                    if _fs is not None and _n_eff > 0 else None)
         except Exception:
             _fl = None
         out['min_attainable_p_holm_family'] = _fl
-        if _fl is not None and math.isfinite(_fl) and _fl > alpha:
-            out['reasons'].append(f'family of m={_fs} at n_nonzero={_n_eff} has minimum attainable Holm p {_fl:.4g} > alpha')
+        if _fl is not None and math.isfinite(_fl) and _fl > _alpha:
+            out['reasons'].append(f'family of m={_fs} at n_nonzero={_n_eff} has minimum attainable Holm p {_fl:.4g} > alpha={_alpha}')
     out['allowed'] = not out['reasons']
     if out['allowed']:
         out['level'] = 'confirmatory' if str(evidence_level).lower() == 'confirmatory' else 'exploratory_significant'
-    elif n < int(min_n):
+    elif n < _min_n:
         # Underpowered is the actionable label; the resolution ceiling is the
         # reason (both are recorded in `reasons`).
         out['level'] = 'underpowered'
-    elif out['p_floor'] is not None and math.isfinite(out['p_floor']) and out['p_floor'] > alpha:
+    elif out['p_floor'] is not None and math.isfinite(out['p_floor']) and out['p_floor'] > _alpha:
         out['level'] = 'resolution_limited'
     else:
         out['level'] = 'not_significant'
@@ -11010,13 +11057,34 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
         budget_matched = None
         tpp_ratio = None
         if len(tpp) == len(rows):
-            tpp_ratio = max(tpp) / min(tpp) if min(tpp) > 0 else float('inf')
-            budget_matched = bool(tpp_ratio <= 1.0 + tol)
-            if not budget_matched:
+            if all(math.isfinite(x) and x > 0 for x in tpp):
+                tpp_ratio = max(tpp) / min(tpp)
+            else:
+                # The per-tier ratio can overflow binary64 while the ladder is
+                # internally consistent.  Compare on the log scale using the
+                # exact integer counts so equal huge ratios still read as 1.
+                try:
+                    _logs = [math.log(r['effective_tokens']) - math.log(r['params'])
+                             for r in rows]
+                    _span = max(_logs) - min(_logs)
+                    try:
+                        tpp_ratio = math.exp(_span)
+                    except OverflowError:
+                        tpp_ratio = float('inf')
+                except (TypeError, ValueError, OverflowError, ZeroDivisionError):
+                    tpp_ratio = None
+            budget_matched = (bool(tpp_ratio <= 1.0 + tol)
+                              if tpp_ratio is not None else None)
+            if budget_matched is False:
                 warnings.append(
                     'tokens-per-parameter is not matched across the ladder '
                     f'(max/min={tpp_ratio:.2f} > {1.0 + tol:.2f}); a cross-scale '
                     'effect is confounded with a different exposure allocation')
+            elif budget_matched is None:
+                warnings.append(
+                    'tokens-per-parameter matching is unverifiable '
+                    '(the per-tier ratios cannot be represented as finite '
+                    'numbers); the cross-scale exposure allocation is not attested')
         lrs = {r['lr'] for r in rows if r.get('lr') is not None}
         lr_constant = (len(lrs) == 1) if lrs else None
         _transfer = str(policy.get('lr_transfer') or '')
@@ -11400,7 +11468,10 @@ def _as_seed_int(v):
         # represent every integer, so accepting it would let a requested
         # seed collapse to a different one (the same rule as
         # normalize_seed_list).
-        f = float(v)
+        try:
+            f = float(v)
+        except (TypeError, ValueError, OverflowError):
+            return None
         if not (math.isfinite(f) and f.is_integer()):
             return None
         if abs(f) >= 2 ** 53:
@@ -13293,12 +13364,10 @@ def _holm_assign(entries, m_family, alpha, out_key):
     entries fill the difference."""
     named = []
     for i, e in enumerate(entries):
-        p = e.get('p_exact_signflip')
-        if (isinstance(p, (bool, np.bool_))
-                or not isinstance(p, (int, float))
-                or not math.isfinite(float(p))):
+        p = _finite_scalar(e.get('p_exact_signflip'))
+        if p is None:
             continue
-        named.append((str(i), float(p)))
+        named.append((str(i), p))
     m_eff = max(int(m_family), len(entries), len(named))
     for j in range(m_eff - len(named)):
         named.append((f'__missing_{j}', 1.0))
@@ -19565,10 +19634,10 @@ def aggregate(summary):
         v, tag = (_v, _tag)
         key = _agg_key(v, tag, _fp_idx)
         def _seed_sort_key(r):
-            s = r.get('seed')
-            if isinstance(s, (int, float)) and (not isinstance(s, bool)) and math.isfinite(float(s)):
-                return (0, float(s), '')
-            return (1, 0.0, str(s))
+            s = _as_seed_int(r.get('seed'))
+            if s is not None:
+                return (0, s, '')
+            return (1, 0, str(r.get('seed')))
         _recs_sorted = sorted(recs, key=_seed_sort_key)
         recs = _recs_sorted
         ppls = np.array([r['ppl'] for r in recs], dtype=float)
@@ -19945,8 +20014,9 @@ def _plot(summary, agg, outdir):
             if not isinstance(_r, dict) or _r.get('synthesized'):
                 continue
             _loss = _r.get('losses') if isinstance(_r.get('losses'), list) else _cell_curve_data(outdir, _r).get('losses')
-            if isinstance(_loss, list) and _loss and all((isinstance(x, (int, float)) and math.isfinite(x) for x in _loss)):
-                _curves.append(_loss)
+            _loss_f = [_finite_scalar(x) for x in _loss] if isinstance(_loss, list) else []
+            if _loss_f and all(x is not None for x in _loss_f):
+                _curves.append(_loss_f)
         if not _curves:
             continue
         _lens = sorted({len(_c) for _c in _curves})
