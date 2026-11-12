@@ -233,7 +233,7 @@ def t_scale_robustness_edges():
         _r = L._combined_seed_doc_ci(_ok_recs, n_boot=20, conf=_bad_conf)
         assert _r['status'] == 'invalid_options' and _r['ci95_ppl'] is None, _r
     # Bootstrap controls are exact counts too: a boolean/fractional draw count
-    # or a lossy seed must not crash or silently become a different bootstrap.
+    # or a lossy seed selects no bootstrap.
     for _bad_boot in (True, np.bool_(False), 0, 1, 1.5, 2 ** 53 + 1, 10 ** 7 + 1, 'x'):
         assert L._doc_bootstrap_ppl_ci(_ok_recs, n_boot=_bad_boot) is None, _bad_boot
         _r = L._combined_seed_doc_ci(_ok_recs, n_boot=_bad_boot)
@@ -482,14 +482,14 @@ def t_bootstrap_mean_ci():
     u1 = L.unpaired_bootstrap_ci(d + 1.0, d, n_boot=600, seed=11)
     u2 = L.unpaired_bootstrap_ci(d + 1.0, d, n_boot=600, seed=11)
     assert u1 == u2 and u1[0] < 1.0 < u1[1], u1
-    # Draw counts are materialised as arrays: a huge exact count must fail
-    # closed instead of raising MemoryError, and booleans are not counts.
+    # Draw counts are materialised as arrays: a huge exact count selects no
+    # bootstrap, and booleans are not counts.
     for _bad_nb in (True, np.bool_(False), 1.5, 10 ** 7 + 1, 2 ** 60):
         assert L.bootstrap_mean_ci(vals, n_boot=_bad_nb) is None, _bad_nb
         assert L.paired_bootstrap_ci(vals, n_boot=_bad_nb) is None, _bad_nb
         assert L.unpaired_bootstrap_ci(vals, vals, n_boot=_bad_nb) is None, _bad_nb
     # Seed-level t intervals reject a malformed confidence level / boolean
-    # measurements instead of returning a NaN-width interval.
+    # measurement.
     assert L._seed_t_ci(vals) is not None
     for _bad_alpha in (True, np.bool_(False), 0, 1, 1.5, float('nan'), 'x'):
         assert L._seed_t_ci(vals, alpha=_bad_alpha) is None, _bad_alpha
@@ -684,8 +684,8 @@ def t_scale_input_guards():
     assert L.scale_interaction([True, 0.1], [1.0, 0.2])['n'] == 1
     assert L.loglog_regression([(True, 1.0), (2, 4), (4, 16)])['n_points'] == 2
     # Test options on the scale-analysis entry points are part of the claim
-    # contract: a boolean/fractional alpha or seed floor must not be coerced
-    # (float(True)=1.0, int(4.9)=4) into a permissive test.
+    # contract: a boolean/fractional alpha or seed floor is refused
+    # (float(True)=1.0, int(4.9)=4).
     _pts = [{'label': 'A', 'scale': 1.0, 'effects': [1.0, 2.0, 3.0], 'seeds': [0, 1, 2]},
             {'label': 'B', 'scale': 2.0, 'effects': [1.1, 2.1, 3.1], 'seeds': [0, 1, 2]}]
     for _bad_alpha in (True, np.bool_(False), 0.0, 1.0, 1.5, float('nan'), 'x'):
@@ -1387,7 +1387,7 @@ def t_finaltest_requires_parameter_matching():
                                       probe_path=os.path.join(td, 'probe.json'),
                                       out=os.path.join(td, 'stats4.json'))
             # A by-length n_seq is an exact positive count, not a boolean or a
-            # fractional value that int() would silently coerce.
+            # fractional value.
             _bad_ns = _records(params=1000, init='INIT')
             for _r in _bad_ns.values():
                 _r['by_len']['4096']['n_seq'] = True
@@ -5543,8 +5543,8 @@ def t_scale_ladder_budget_and_transfer_audit():
     # S1/S2 allocation ratio rather than silently calling it matched.
     pol = L.SCALE_TRANSFER_POLICY
     assert pol.get('lr_transfer') and pol.get('tokens_per_param_tolerance') is not None, pol
-    # A malformed tolerance/family size would otherwise relax the budget gate
-    # (float(True)=1.0) or shrink the Holm family (int(True)=1).
+    # A malformed tolerance/family size is refused (float(True)=1.0,
+    # int(True)=1).
     for _bad_tol in (True, np.bool_(False), -0.1, float('nan')):
         _out = L.scale_ladder_audit([a, b], tolerance=_bad_tol)
         assert _out['status'] == 'fail', (_bad_tol, _out)
@@ -5921,8 +5921,8 @@ def t_efficiency_pairs_audit_and_sweep():
         r5 = A.audit_efficiency_pairs(outdirs=[td])
         rec5 = r5['panels'][td]['a vs b']
         assert rec5['speed_claim_allowed'] is False, rec5
-        # A boolean/NaN/negative tolerance would relax or destroy the timing
-        # claim gate; fail the audit instead of coercing it.
+        # A boolean/NaN/negative tolerance is not a valid fraction for the
+        # timing claim gate.
         for _bad_tol in (True, np.bool_(False), -0.1, float('nan')):
             _r = A.audit_efficiency_pairs(outdirs=[td], tolerance=_bad_tol)
             assert _r['status'] == 'fail' and _r.get('problems'), (_bad_tol, _r)

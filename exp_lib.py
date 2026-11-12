@@ -408,8 +408,7 @@ def _safe_exp_ppl(x):
 
     ``math.exp`` raises once the exponent exceeds ~709.  A training run that
     has diverged but still produced finite CE must be recorded as ``inf`` and
-    diagnosed, not crash the eval callback.  The clamp keeps the CI bounds
-    consistent."""
+    diagnosed.  The clamp keeps the CI bounds consistent."""
     if isinstance(x, (bool, np.bool_)):
         return None
     try:
@@ -482,9 +481,8 @@ def _valid_min_n(min_n):
     return n if n is not None and n > 0 else None
 
 
-# Bootstrap draws are materialised as float arrays, so an exact-but-enormous
-# count (e.g. a JSON integer above 2**53) must fail closed instead of raising
-# MemoryError halfway through a report build.
+# Bootstrap draws are materialised as float arrays, so exact counts above the
+# supported draw limit (e.g. a JSON integer above 2**53) are refused.
 _BOOTSTRAP_MAX_DRAWS = 10_000_000
 
 
@@ -10705,8 +10703,7 @@ def meta_analyze_effects(points, *, alpha=0.05, min_seeds=3):
     if _alpha is None or _min_seeds is None:
         # The significance level and the per-scale seed floor decide whether a
         # pooled estimate may be treated as an effect.  A boolean/fractional
-        # value must not be coerced into a permissive test (float(True)=1.0,
-        # int(4.9)=4); fail closed instead of producing a claim.
+        # value is not a valid level or floor (float(True)=1.0, int(4.9)=4).
         _alpha_display = _finite_scalar(alpha)
         return {'alpha': (_alpha_display if _alpha_display is not None else float('nan')),
                 'min_seeds': (_min_seeds if _min_seeds is not None else 0),

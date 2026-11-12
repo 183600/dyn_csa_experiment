@@ -1649,8 +1649,7 @@ def v10_analysis(out='analysis_v10/stats.json'):
                     continue
                 # acc/nll are measurements: a bool/string/NaN is not a result.
                 # Preserve the declared cell with a NaN value so the Holm
-                # family keeps its slot, but never let np.mean crash or read a
-                # boolean as an accuracy.
+                # family keeps its slot; a boolean is not an accuracy.
                 _acc = L._finite_scalar(r.get('acc'))
                 _nll = L._finite_scalar(r.get('nll'))
                 _r = dict(r, seed=_seed,

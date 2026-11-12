@@ -286,8 +286,8 @@ def _load_manifest(path):
         if isinstance(value, (str, bytes)):
             # A manifest integer spelling must be an actual integer.  The
             # float path below would accept "512.0"/"1e3" and hand the raw
-            # string to downstream int() calls, which then crash AFTER a test
-            # access.  Reject non-canonical spellings at load time.
+            # string to downstream int() calls after a test access.  Reject
+            # non-canonical spellings at load time.
             try:
                 _iv = int(value)
             except (TypeError, ValueError, OverflowError):
@@ -2181,7 +2181,7 @@ def run_full():
         try:
             run_phase(pname, guard, par=_ctx)
         except SystemExit as _se:
-            # a REFUSE (e.g. freeze-manifest gate) is a controlled stop, not a crash
+            # a REFUSE (e.g. freeze-manifest gate) is a controlled stop
             print(f'[v12] phase {pname} refused: {_se}')
             all_ok = False
             break

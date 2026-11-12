@@ -796,8 +796,7 @@ def _group_key(value):
         hash(value)
     except TypeError:
         # Group ids are normally hashable scalars, but an object column of
-        # lists/arrays should still be groupable by a stable identity rather
-        # than crashing inside a set/dict downstream.
+        # lists/arrays is grouped by a stable identity.
         return ('__unhashable__', type(value).__name__, repr(value))
     return value
 
@@ -1684,9 +1683,9 @@ def _row_keys(X):
                 return _row_keys(np.asarray(_ivs, dtype=np.int64).reshape(src.shape))
             if all(0 <= v <= 2 ** 64 - 1 for v in _ivs):
                 return _row_keys(np.asarray(_ivs, dtype=np.uint64).reshape(src.shape))
-        # Object tables are often mixed/non-contiguous; converting them to
-        # float64 both crashes on string columns and loses integer precision
-        # above 2**53.  Build an exact canonical key per cell instead.
+        # Object tables are often mixed/non-contiguous; float64 does not apply
+        # to string columns and loses integer precision above 2**53.  Build an
+        # exact canonical key per cell instead.
         def _cell_key(v):
             if isinstance(v, (bool, np.bool_)):
                 # Match the typed integral path, which hashes bool as 0/1.
