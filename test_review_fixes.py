@@ -805,6 +805,27 @@ def t_power_gate():
         psm = os.path.join(td, 'smoke.json')
         _write_manifest(psm, [0], extra_stat={'descriptive_only': True})
         V12._load_manifest(psm)  # descriptive smoke manifests opt out
+        # The by-length endpoint grid is part of the frozen plan: bool,
+        # fractional, length-1 and empty grids must be refused at load time,
+        # not silently truncated later.
+        for _bad_lens in (4096, [], [4096, 4.9], [True], [0], [1]):
+            pbad = os.path.join(td, 'bad_lens.json')
+            mb = _write_manifest(pbad, list(range(12)))
+            mb['eval'] = {'n_seqs_clean': 16, 'by_length_ppl': _bad_lens}
+            with open(pbad, 'w', encoding='utf-8') as f:
+                json.dump(mb, f)
+            try:
+                V12._load_manifest(pbad)
+            except SystemExit as e:
+                assert 'by_length_ppl' in str(e), str(e)[:200]
+            else:
+                raise AssertionError(f'by_length_ppl={_bad_lens!r} must be refused')
+        pok = os.path.join(td, 'ok_lens.json')
+        mo = _write_manifest(pok, list(range(12)))
+        mo['eval'] = {'n_seqs_clean': 16, 'by_length_ppl': [512, '1024', 2048.0]}
+        with open(pok, 'w', encoding='utf-8') as f:
+            json.dump(mo, f)
+        V12._load_manifest(pok)
 
 
 def _rec(variant, seed, fp, by_len=None, code=None, recipe='steps3000_sl512_bs12_nt8000000_lr0.0003_wd0.1_d256_L6_H8_Dh32_v8192_wu50_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee250_es128_detcpu-eager_dfdeadbeef_cscURRENT', msha='CURRENT'):

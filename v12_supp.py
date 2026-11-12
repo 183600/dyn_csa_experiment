@@ -291,6 +291,14 @@ def _load_manifest(path):
     if not isinstance(_ts, dict):
         raise SystemExit(f'[v12] REFUSE: binding.test_slice must be an object ({_ts!r})')
     _eval = m.get('eval') or {}
+    _bl = _eval.get('by_length_ppl') if isinstance(_eval, dict) else None
+    if _bl is not None:
+        if not isinstance(_bl, list) or not _bl:
+            raise SystemExit(f'[v12] REFUSE: eval.by_length_ppl must be a non-empty list of positive integer lengths ({_bl!r})')
+        for _x in _bl:
+            _iv = _int_field(_x, 'eval.by_length_ppl entry')
+            if _iv < 2:
+                raise SystemExit(f'[v12] REFUSE: eval.by_length_ppl value {_x!r} has no next-token prediction (needs an integer length >= 2)')
     _ts_n = _ts.get('n_seqs') if isinstance(_ts, dict) else None
     if _ts_n is not None:
         _ev_n = _eval.get('n_seqs_clean')
