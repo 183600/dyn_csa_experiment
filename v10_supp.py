@@ -909,7 +909,18 @@ def _hist_by_seed(outdir, variant, raw=None):
             print(f'[v10 stats] {_k} has no usable `seed` ({_s_raw!r}); its curve cannot be attributed and is skipped')
             continue
         try:
-            fp = tuple(((int(t), type(v).__name__, round(float(v), 9)) for t, v in r['ppl_history'] if isinstance(v, (int, float)) and (not isinstance(v, bool)) and (v == v)))
+            _fp_parts = []
+            for _t_raw, _v_raw in r['ppl_history']:
+                _vf = L._finite_scalar(_v_raw)
+                if _vf is None:
+                    # A boolean/NaN point is not a measurement and is dropped
+                    # by the clean-history pass below; keep the exact step in
+                    # the identity so a fractional step cannot alias an int.
+                    continue
+                _ti = L._as_seed_int(_t_raw)
+                _fp_parts.append((_ti if _ti is not None else ('bad-step', repr(_t_raw)),
+                                  type(_v_raw).__name__, round(_vf, 9)))
+            fp = tuple(_fp_parts)
         except (TypeError, ValueError, OverflowError):
             fp = None
         if fp is None:
@@ -966,12 +977,15 @@ def _hist_by_seed(outdir, variant, raw=None):
         _n_badpt = 0
         for _pt in r['ppl_history']:
             try:
-                _t = int(_pt[0])
-                _v2 = float(_pt[1])
+                _t = L._as_seed_int(_pt[0])
+                _v2 = L._finite_scalar(_pt[1])
             except (TypeError, ValueError, IndexError):
                 _n_badpt += 1
                 continue
-            if not (math.isfinite(_v2) and _v2 > 0):
+            # Exact integer steps only: int(1.5)==1 would merge two distinct
+            # evaluation points, and float(True)==1.0 would turn a flag into a
+            # PPL measurement.
+            if _t is None or _v2 is None or _t < 0 or not (_v2 > 0):
                 _n_badpt += 1
                 continue
             _clean_hist.append([_t, _v2])
