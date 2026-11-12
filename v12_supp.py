@@ -1241,11 +1241,12 @@ def _by_len_shape_reason(rec, n_seq):
         if (isinstance(_ntok, (bool, np.bool_))
                 or not isinstance(_ntok, (int, float, np.integer, np.floating))):
             return f'by_len[{_ln_i}].n_tok={_ntok!r} != the frozen {_want} (= {_nseq_i} rows x {_ln_i - 1} predictions) — truncated/empty cells are not admissible'
-        try:
-            _ntok_f = float(_ntok)
-        except (TypeError, ValueError, OverflowError):
-            _ntok_f = float('nan')
-        if not math.isfinite(_ntok_f) or _ntok_f != math.floor(_ntok_f) or int(_ntok_f) != _want:
+        # Exact integer contract: a float conversion rounds integers above
+        # 2**53, which at scale can reject a correct cell or admit a rounded
+        # neighbouring count.  _record_int keeps integral floats but rejects
+        # lossy/fractional values.
+        _ntok_i = _record_int(_ntok)
+        if _ntok_i is None or _ntok_i != _want:
             return f'by_len[{_ln_i}].n_tok={_ntok!r} != the frozen {_want} (= {_nseq_i} rows x {_ln_i - 1} predictions) — truncated/empty cells are not admissible'
         # The cell's own row count is part of the estimand: the by-length
         # summary quotes the first cell's n_seq, so each cell must state the
@@ -1751,7 +1752,15 @@ def finaltest_stats(manifest=None, bylen_path=None, probe_path=None, out='analys
         name = comp['name']
         a, b = (comp['a'], comp['b'])
         ep = comp.get('endpoint', 'by_len.ppl@4096')
-        Ln = int(str(ep).rsplit('@', 1)[-1])
+        # An in-memory manifest (the tests and some callers bypass
+        # _load_manifest) must fail closed here too instead of raising a raw
+        # ValueError after a possible test access.
+        _ep_tail = str(ep).rsplit('@', 1)[-1].strip() if '@' in str(ep) else ''
+        Ln = _record_int(_ep_tail)
+        if Ln is None or Ln < 2:
+            raise SystemExit(
+                f'[p5t stats] REFUSE: comparison {name!r} endpoint={ep!r} '
+                'does not end in an exact by-length integer >= 2')
         exp_sign = comp.get('expected_sign')
         if exp_sign is not None:
             exp_sign = str(exp_sign).lower()

@@ -8873,6 +8873,14 @@ def holm_adjust(named_pvals, alpha=0.05):
     counted in ``m`` as ``p=1`` (its own ``p_holm`` stays None).  Dropping it
     from ``m`` would shrink the correction family and make the remaining
     comparisons look more significant than the caller's stated family allows."""
+    if isinstance(alpha, (bool, np.bool_)):
+        raise ValueError(f'alpha must be a real number in (0,1), got {alpha!r}')
+    try:
+        a = float(alpha)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f'alpha must be a real number in (0,1), got {alpha!r}')
+    if not (math.isfinite(a) and 0.0 < a < 1.0):
+        raise ValueError(f'alpha must be in (0,1), got {alpha!r}')
     fam = []
     invalid = {}
     _seen_names = set()
@@ -8907,7 +8915,7 @@ def holm_adjust(named_pvals, alpha=0.05):
     for i, (name, p) in enumerate(order):
         adj = min(1.0, (m - i) * p)
         prev = max(prev, adj)
-        out[name] = {'p_raw': p, 'p_holm': float(prev), 'rank': i + 1, 'reject': bool(prev <= alpha), 'm_effective': m}
+        out[name] = {'p_raw': p, 'p_holm': float(prev), 'rank': i + 1, 'reject': bool(prev <= a), 'm_effective': m}
     return out
 
 def attach_holm(comparisons, *, alpha=0.05, family='reported comparisons', exploratory=True):
@@ -9206,6 +9214,10 @@ def finite_range(named_values):
 
 _SIGNFLIP_ENUM_MAX_N = 20
 _SIGNFLIP_MITM_MAX_N = 40
+# Largest 2**e denominator the Holm planning helper materialises exactly.
+# 2**1048576 is a 128 KiB integer; above it the exponent/mantissa projection
+# is used so a huge seed count cannot allocate an unbounded integer.
+_HOLM_EXACT_SHIFT_MAX = 1 << 20
 
 
 def _signflip_signed_sums(values):
@@ -9661,7 +9673,26 @@ def holm_min_attainable_p(n_seeds, m_comparisons, alpha=0.05):
     m = _as_seed_int(m_comparisons)
     if n is None or m is None or n <= 0 or m <= 0:
         return float('nan')
-    return min(1.0, m * signflip_p_floor(n))
+    # floor = 2 / 2**n = 1 / 2**(n-1).  Evaluating `m * floor` converts the
+    # integer family size to float first, which raises OverflowError for a
+    # planning input with an enormous m (a scale-up family count).  Compare
+    # the exact integer against the denominator where that is cheap, and use
+    # a mantissa/exponent projection only when the denominator itself would
+    # be too large to materialise.
+    e = n - 1
+    if e <= _HOLM_EXACT_SHIFT_MAX:
+        denom = 1 << e
+        if m >= denom:
+            return 1.0
+        return float(m / denom)
+    if m.bit_length() <= e:
+        return 0.0
+    shift = max(0, m.bit_length() - 53)
+    mant = m >> shift
+    exp = shift - e
+    if exp > 1023:
+        return 1.0
+    return float(min(1.0, math.ldexp(float(mant), exp)))
 
 
 def signflip_min_n_for_holm(m_comparisons, alpha=0.05, n_max=64):
@@ -9867,10 +9898,20 @@ def _binom_cdf_half_asymptotic(n, m):
     threshold."""
     sd = math.sqrt(n) * 0.5
     z = (m + 0.5 - 0.5 * n) / sd
-    cdf = 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
-    phi = math.exp(-0.5 * z * z) / math.sqrt(2.0 * math.pi)
-    correction = phi * ((-2.0 / n) / 24.0) * (3.0 * z - z ** 3)
-    return float(min(1.0, max(0.0, cdf + correction)))
+    # 0.5*(1+erf(z)) cancels to exactly 0 once z < -8, even though the true
+    # lower tail is still representable; erfc of the negated argument computes
+    # the same probability without that cancellation.
+    cdf = 0.5 * math.erfc(-z / math.sqrt(2.0))
+    # The Edgeworth correction is only meaningful near the bulk.  Far in the
+    # tail its truncated polynomial can exceed (and turn negative) the leading
+    # normal term, so it is applied only where the expansion is accurate.
+    if abs(z) <= 8.0:
+        phi = math.exp(-0.5 * z * z) / math.sqrt(2.0 * math.pi)
+        correction = phi * ((-2.0 / n) / 24.0) * (3.0 * z - z ** 3)
+        corrected = cdf + correction
+        if 0.0 <= corrected <= 1.0:
+            cdf = corrected
+    return float(min(1.0, max(0.0, cdf)))
 
 
 def _binom_sf_normal(n, k, q):
@@ -9934,12 +9975,23 @@ def signflip_min_consistency(n_seeds, m_comparisons, alpha=0.05):
     m = _as_seed_int(m_comparisons)
     if n is None or m is None or n <= 0 or m <= 0:
         return None
+    # Planning must fail closed on a malformed significance level instead of
+    # raising a TypeError midway (e.g. alpha='0.05' from a JSON field).
+    if isinstance(alpha, (bool, np.bool_)):
+        return None
+    try:
+        a = float(alpha)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not (math.isfinite(a) and 0.0 < a < 1.0):
+        return None
+
     def _clears(k):
         p = 2.0 * _binom_cdf_half(n, n - k)
         # Holm rejects at p_holm <= alpha, so the planning helper must use the
         # same inclusive boundary.  A strict '<' would report a plan as
         # impossible at the exact boundary that holm_adjust accepts.
-        return m * p <= alpha + 1e-15
+        return m * p <= a + 1e-15
 
     # p(k) decreases monotonically as k grows, so "clears the gate" is a
     # suffix of [0, n].  Binary search finds its left edge.
@@ -16650,7 +16702,10 @@ def _safe_path_component(value):
     """
     raw = str(value)
     s = ''.join(ch if (ch.isalnum() or ch in '._-') else '_' for ch in raw)
-    if s != raw:
+    # Dot segments are path syntax even though every character is allowed;
+    # treat them like any other sanitised value so the component can never be
+    # '.', '..' or an empty segment on its own.
+    if s != raw or s in ('.', '..'):
         s = f'{s}-{hashlib.sha1(raw.encode("utf-8", "replace")).hexdigest()[:12]}'
     return s or '_'
 

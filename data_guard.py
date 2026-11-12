@@ -177,8 +177,30 @@ def _resolve_sizes(n, train_frac=0.8, val_frac=0.1, test_frac=0.1,
     remaining = n - sum(sizes)
     order = sorted(range(3), key=lambda i: (-(targets[i] - sizes[i]), -i))
     eligible = [i for i in order if requested[i]]
-    for k in range(remaining):
-        sizes[eligible[k % len(eligible)]] += 1
+    if remaining > 0:
+        # Flooring the rounded float targets can leave a handful of rows (or,
+        # at very large n, several) unassigned.  Distribute them in one step
+        # instead of looping `remaining` times, which would be unbounded for a
+        # scale-up row count.
+        _base, _extra = divmod(remaining, len(eligible))
+        for _pos, _i in enumerate(eligible):
+            sizes[_i] += _base + (1 if _pos < _extra else 0)
+    elif remaining < 0:
+        # At very large n the float targets can also round UP enough that the
+        # floors sum to more than n.  Remove the overshoot from the splits
+        # with the smallest fractional parts first (largest split breaks ties)
+        # so every size stays non-negative.
+        _need = -remaining
+        _drop_order = sorted(range(3), key=lambda i: (targets[i] - sizes[i],
+                                                      -sizes[i], i))
+        for _i in _drop_order:
+            if _need <= 0:
+                break
+            _take = min(_need, sizes[_i])
+            sizes[_i] -= _take
+            _need -= _take
+        if _need:
+            raise ValueError(f'inconsistent split sizes {sizes} for n={n}')
     # A requested split that still rounds to zero (very small n) must borrow
     # one row from the largest split that can spare it.
     for i in range(3):
@@ -1557,6 +1579,7 @@ def _matrix_fingerprint(X):
                       or np.issubdtype(arr.dtype, np.bool_)))
     _obj_int = False
     _obj_fits = True
+    _obj_big = False
     if arr.dtype == object and arr.size:
         # Object-dtype integer tables must keep the same exactness contract:
         # the float64 fallback collapses 2**53 and 2**53+1.
@@ -1567,7 +1590,12 @@ def _matrix_fingerprint(X):
         if _obj_int:
             _obj_fits = all(-(2 ** 63) <= int(v) <= 2 ** 64 - 1 for v in _vals)
             if not _obj_fits:
+                # No fixed-width dtype can hold these values exactly, so no
+                # cross-width twin exists.  Hash their canonical decimal
+                # spelling (length-prefixed) rather than rounding through
+                # float64, which collides for distinct huge integers.
                 _obj_int = False
+                _obj_big = True
     _integral = _integral or _obj_int
     _wide_int = False
     _wide_neg = False
@@ -1587,6 +1615,13 @@ def _matrix_fingerprint(X):
             _wide_neg = bool((arr < 0).any())
     for start in range(0, arr.shape[0], _step):
         _blk = arr[start:start + _step]
+        if _obj_big:
+            h.update(b'OBJ_BIG')
+            for v in _blk.reshape(-1).tolist():
+                _s = str(int(v)).encode('ascii')
+                h.update(len(_s).to_bytes(8, 'little'))
+                h.update(_s)
+            continue
         if _wide_int:
             if _blk.dtype == object:
                 _flat_vals = [int(v) for v in _blk.reshape(-1).tolist()]
@@ -1624,9 +1659,10 @@ def _row_keys(X):
         # as object, int64 or uint64, keeping cross-dtype duplicates visible
         # to the duplicate audit.
         _flat_obj = src.reshape(-1).tolist()
-        if _flat_obj and all(isinstance(v, numbers.Integral)
-                             and not isinstance(v, (bool, np.bool_))
-                             for v in _flat_obj):
+        # Booleans are integral in Python/NumPy's canonical integer path, so
+        # include them here as 0/1: an object-dtype bool table must produce the
+        # same row keys as its typed bool/int twin.
+        if _flat_obj and all(isinstance(v, numbers.Integral) for v in _flat_obj):
             _ivs = [int(v) for v in _flat_obj]
             if all(-(2 ** 63) <= v <= 2 ** 63 - 1 for v in _ivs):
                 return _row_keys(np.asarray(_ivs, dtype=np.int64).reshape(src.shape))
@@ -1637,7 +1673,8 @@ def _row_keys(X):
         # above 2**53.  Build an exact canonical key per cell instead.
         def _cell_key(v):
             if isinstance(v, (bool, np.bool_)):
-                return ('bool', bool(v))
+                # Match the typed integral path, which hashes bool as 0/1.
+                return ('num', int(v))
             if isinstance(v, (int, np.integer)):
                 return ('num', int(v))
             if isinstance(v, (float, np.floating)):

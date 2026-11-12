@@ -132,6 +132,61 @@ def t_min_consistency():
         assert L.signflip_min_n_for_holm(1, alpha=_bad) is None, _bad
 
 
+def t_scale_robustness_edges():
+    # A planning family count can be a huge integer; it must saturate, not
+    # raise OverflowError while converting the count to float.
+    assert L.holm_min_attainable_p(6, 10 ** 400) == 1.0
+    assert 0.0 < L.holm_min_attainable_p(2000, 10 ** 400) < 1.0
+    assert L.signflip_min_n_for_holm(10 ** 400, 0.05) is None
+    # Above the exact cutoff, the asymptotic branch must still evaluate the
+    # lower tail (the old 0.5*(1+erf(z)) form cancelled to exactly 0 for z<-8).
+    _n = (1 << 20) + 1
+    _m = _n // 2 - 4 * math.isqrt(_n)
+    _p = L._binom_cdf_half(_n, _m)
+    assert 0.0 < _p < 1e-10, _p
+    assert L._binom_cdf_half(_n, _m - 1) <= _p <= L._binom_cdf_half(_n, _m + 1)
+    # A malformed significance level fails closed instead of crashing midway.
+    for _bad_alpha in (True, np.bool_(False), 'bad', 0, 1, float('nan')):
+        assert L.signflip_min_consistency(12, 4, _bad_alpha) is None, _bad_alpha
+        assert L.signflip_power(12, 4, 0.9, _bad_alpha) == 0.0, _bad_alpha
+        try:
+            L.holm_adjust([('x', 0.01)], alpha=_bad_alpha)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'holm_adjust accepted alpha={_bad_alpha!r}')
+    # Split sizing must still sum to n when n is large enough that the
+    # floating-point targets can overshoot/undershoot by a row.
+    import data_guard as _DG
+    _n = 2 ** 53
+    for _fs in ((0.5, 0.3, 0.2), (0.5123048843996699, 0.3125296923390423,
+                                  0.17516542326128773)):
+        _sizes = _DG._resolve_sizes(_n, *_fs)
+        assert sum(_sizes) == _n and all(v >= 0 for v in _sizes), (_fs, _sizes)
+    # Frozen by-length row/token counts are exact integers even above 2**53;
+    # the float path used to round a valid count and reject it.
+    _nseq = 2 ** 53 + 1
+    _cell = {'n_tok': _nseq * 7, 'n_seq': _nseq, 'truncated': False, 'eval_span': 8}
+    assert V12._by_len_shape_reason({'by_len': {'8': dict(_cell)}}, _nseq) is None
+    _bad = dict(_cell, n_tok=_nseq * 7 + 1)
+    assert V12._by_len_shape_reason({'by_len': {'8': _bad}}, _nseq) is not None
+    # Object integer tables outside int64/uint64 have no fixed-width twin;
+    # they must still fingerprint exactly (the float64 fallback collided).
+    import data_guard as DG
+    assert DG._matrix_fingerprint(np.array([[10 ** 30]], dtype=object)) != \
+        DG._matrix_fingerprint(np.array([[10 ** 30 + 1]], dtype=object))
+    # Object booleans must key like their typed bool/int twin, otherwise a
+    # cache serialised as object can hide a cross-split duplicate.
+    for _v in (True, False):
+        _obj = np.array([[_v]], dtype=object)
+        for _dt in (np.bool_, np.int8, np.int64, np.uint64):
+            assert DG._row_keys(_obj) == DG._row_keys(np.array([[_v]], dtype=_dt)), _dt
+    # Dot segments are path syntax, not ordinary filename components.
+    assert L._safe_path_component('..') not in ('.', '..')
+    assert L._safe_path_component('.') not in ('.', '..')
+    assert '/' not in L.ckpt_file_name('..', 0, '.')
+
+
 def t_power():
     assert L.signflip_power(6, 4, 0.99) == 0.0, 'an impossible plan has zero power at any q'
     pw = L.signflip_power(12, 4, 0.9, 0.05)
@@ -6540,6 +6595,7 @@ def main():
     _check('A1 holm_min_attainable_p', t_holm_min_attainable)
     _check('A1a invalid Holm slots stay in the declared family', t_holm_invalid_slots_stay_in_family)
     _check('A2 signflip_min_consistency', t_min_consistency)
+    _check('A2b scale robustness edges', t_scale_robustness_edges)
     _check('A3 signflip_power', t_power)
     _check('A4 tost_paired directions', t_tost)
     _check('A5 exact_signflip baseline', t_exact_signflip_baseline)
