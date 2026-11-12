@@ -2917,6 +2917,20 @@ def t_baseline_seed_partition_and_coverage_audit():
     assert good['search_final_seed_disjoint'] is True, good
     assert good['search_final_seed_overlap'] == [], good
 
+    # A stale extra final record outside the declared final partition must not
+    # inflate n silently: the coverage sets can otherwise agree on the extra
+    # seed and the audit reports tuning_verified=True.
+    stale = json.loads(json.dumps(art))
+    for _a in chosen:
+        stale['final_records'][f'{_a}::seed9'] = {
+            'seed': 9, 'variant': _a, 'ppl': 9.9, 'params': 100,
+            'train_knobs': L.training_knobs(), 'hyperparams': dict(chosen[_a])}
+    st = L.baseline_tuning_audit(dict(stale, protocol=good_protocol,
+                                      search_seeds=[100, 101, 102]),
+                                 protocol=good_protocol)
+    assert st['tuning_verified'] is False, st
+    assert any('undeclared seed' in p for p in st['problems']), st
+
     # Intervention controls inherit their parent's equal-search evidence, but
     # an unknown parent is reported instead of silently covering the arm.
     cov_protocol = dict(protocol, arms=['csa_fixed_rope'],

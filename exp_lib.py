@@ -12361,6 +12361,11 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
     # checked; this makes the overlap visible either way).
     final_seed_coverage = {}
     if final_records:
+        _bad_final_seeds = [s for s in (final_seeds or [])
+                            if _as_seed_int(s) is None]
+        if _bad_final_seeds:
+            problems.append(
+                f'declared final_seeds contain non-integer values {_bad_final_seeds!r}')
         for arm, entry in arms.items():
             chosen = entry.get('selected') or entry.get('selected_config') or {}
             hits = [(k, r) for k, r in final_records.items()
@@ -12381,6 +12386,17 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
                 _miss = sorted(_need - set(_seeds))
                 if _miss:
                     problems.append(f'{arm}: final records miss declared seeds {_miss}')
+                # Extra records are just as damaging as missing ones: a
+                # resumed/merged panel could carry an older seed that is not
+                # in the declared final partition, inflating n while the
+                # artifact still claims the pre-registered seed set.  Without
+                # this check the coverage sets can agree on the extra seed and
+                # the audit reports tuning_verified=True.
+                _extra = sorted(set(_seeds) - _need)
+                if _extra:
+                    problems.append(
+                        f'{arm}: final records include undeclared seed(s) '
+                        f'{_extra} outside final_seeds {sorted(_need)}')
             for _k, r in hits:
                 hp = r.get('hyperparams') or {}
                 for _kn in ('lr', 'weight_decay', 'warmup'):
