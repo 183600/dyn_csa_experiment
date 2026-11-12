@@ -12596,9 +12596,8 @@ def classification_metrics(y_true, y_score=None, y_pred=None, labels=None, posit
         all_f1s.append(f1)
         # Balanced accuracy / macro recall are also averages over the full
         # REQUESTED label set.  A label absent from y_true (but requested, or
-        # present only in y_pred) has recall 0, not "not applicable": dropping
-        # it made a constant predictor on a two-label endpoint score balanced
-        # accuracy 1.0 instead of 0.5.
+        # present only in y_pred) has recall 0, not "not applicable"; averaging
+        # over the requested set keeps a constant predictor at 0.5.
         rs.append(recall)
         total_tp += tp
         total_fp += fp
