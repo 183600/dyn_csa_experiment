@@ -819,7 +819,8 @@ def t_power_gate():
         # The by-length endpoint grid is part of the frozen plan: bool,
         # fractional, length-1 and empty grids must be refused at load time,
         # not silently truncated later.
-        for _bad_lens in (4096, [], [4096, 4.9], [True], [0], [1]):
+        for _bad_lens in (4096, [], [4096, 4.9], [True], [0], [1],
+                          [float(2 ** 60)], [2 ** 60]):
             pbad = os.path.join(td, 'bad_lens.json')
             mb = _write_manifest(pbad, list(range(12)))
             mb['eval'] = {'n_seqs_clean': 16, 'by_length_ppl': _bad_lens}
@@ -837,6 +838,18 @@ def t_power_gate():
         with open(pok, 'w', encoding='utf-8') as f:
             json.dump(mo, f)
         V12._load_manifest(pok)
+        for _bad_nseq in (float(2 ** 60), 2 ** 60):
+            pbad = os.path.join(td, 'bad_nseq.json')
+            mb = _write_manifest(pbad, list(range(12)))
+            mb['eval'] = {'n_seqs_clean': _bad_nseq, 'by_length_ppl': [4096]}
+            with open(pbad, 'w', encoding='utf-8') as f:
+                json.dump(mb, f)
+            try:
+                V12._load_manifest(pbad)
+            except SystemExit as e:
+                assert 'integer' in str(e), str(e)[:200]
+            else:
+                raise AssertionError(f'eval.n_seqs_clean={_bad_nseq!r} must be refused')
 
 
 def _rec(variant, seed, fp, by_len=None, code=None, recipe='steps3000_sl512_bs12_nt8000000_lr0.0003_wd0.1_d256_L6_H8_Dh32_v8192_wu50_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee250_es128_detcpu-eager_dfdeadbeef_cscURRENT', msha='CURRENT'):

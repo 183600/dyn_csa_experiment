@@ -260,13 +260,18 @@ def _load_manifest(path):
         if isinstance(value, (bool, np.bool_)):
             raise SystemExit(f'[v12] REFUSE: {label}={value!r} is not an integer')
         if isinstance(value, numbers.Integral):
-            return int(value)
+            _iv = int(value)
+            if abs(_iv) >= 2 ** 53:
+                raise SystemExit(f'[v12] REFUSE: {label}={value!r} is outside the exact integer range (< 2**53)')
+            return _iv
         try:
             f = float(value)
         except (TypeError, ValueError, OverflowError):
             raise SystemExit(f'[v12] REFUSE: {label}={value!r} is not an integer')
-        if not math.isfinite(f) or f != math.floor(f):
-            raise SystemExit(f'[v12] REFUSE: {label}={value!r} is not an integer')
+        # Above 2**53 a float cannot represent every integer, so a seeded
+        # length/count could silently denote a neighbouring value.
+        if not math.isfinite(f) or f != math.floor(f) or abs(f) >= 2 ** 53:
+            raise SystemExit(f'[v12] REFUSE: {label}={value!r} is not an exact integer')
         return int(f)
 
     _exp = m.get('code_semantics_expected')
