@@ -289,8 +289,8 @@ def t_bootstrap_mean_ci():
     assert a == b and a['n'] == 5 and a['ci_low'] <= a['mean'] <= a['ci_high'], a
     assert L.bootstrap_mean_ci([1.0]) is None
     assert L.bootstrap_mean_ci([1.0, float('nan'), float('inf')]) is None
-    # Paired/unpaired helpers are chunked for seed panels that can reach
-    # hundreds of seeds; the result stays deterministic and well-formed.
+    # Paired/unpaired helpers stay deterministic and well-formed on large
+    # seed panels.
     rng = np.random.default_rng(3)
     d = rng.normal(0.5, 1.0, size=400)
     p1 = L.paired_bootstrap_ci(d, n_boot=600, seed=11)
@@ -764,10 +764,10 @@ if _HAVE_TORCH:
     _VOCAB = 8192
 
 
-def _legacy_corrupt_row(val_ids, eval_len, rho, mode, jj, vocab, target):
-    """The PRE-refactor inline algorithm, replayed bit-for-bit (uniform /
-    natural / mask / delete). Any divergence means the extraction changed a
-    measured value — the strongest invariant this suite checks."""
+def _reference_corrupt_row(val_ids, eval_len, rho, mode, jj, vocab, target):
+    """Reference inline algorithm for the uniform / natural / mask / delete
+    modes. Any divergence means a measured value changed — the strongest
+    invariant this suite checks."""
     n_far = eval_len - target
     if mode == 'delete':
         return np.asarray(val_ids[jj, eval_len - target:eval_len + 1], dtype=np.int64).copy()
@@ -794,12 +794,12 @@ def _legacy_corrupt_row(val_ids, eval_len, rho, mode, jj, vocab, target):
     return ids
 
 
-def t_legacy_modes_bitexact():
+def t_reference_modes_bitexact():
     for mode, rhos in (('uniform', (0.0, 0.125, 0.5)), ('natural', (0.125, 0.5)), ('mask', (1.0,)), ('delete', (1.0,))):
         for rho in rhos:
             for jj in range(0, 9, 3):
                 a = V10._corrupt_row(_PANEL, 128, rho, mode, jj, _VOCAB, 32)
-                b = _legacy_corrupt_row(_PANEL, 128, rho, mode, jj, _VOCAB, 32)
+                b = _reference_corrupt_row(_PANEL, 128, rho, mode, jj, _VOCAB, 32)
                 assert np.array_equal(a, b), f'compatibility mode {mode} rho={rho} jj={jj} diverged from the reference algorithm'
 
 
@@ -6614,7 +6614,7 @@ def main():
     _check('A4g2 apply_rope preserves width (over-long/odd rope_dim)', t_apply_rope_preserves_width)
     _check('A4g3 numeric helpers accept NumPy scalars', t_stats_accept_numpy_scalars)
     _check('A4h shipped manifest v3 admits 48/48 synthetic records end-to-end', t_manifest_v3_admission_can_succeed)
-    _check('B1 legacy modes bit-exact', t_legacy_modes_bitexact)
+    _check('B1 reference modes bit-exact', t_reference_modes_bitexact)
     _check('B2 determinism + target-zone safety', t_corruption_deterministic_and_paired)
     _check('B3 new modes span/doc/topical', t_new_modes_do_something)
     _check('B4 mode validation', t_mode_validation)

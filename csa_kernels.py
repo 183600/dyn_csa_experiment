@@ -1015,9 +1015,8 @@ def _triton_dtype_ok(dtype):
 
 
 def _indexer_impl_for_shape(impl, kI):
-    # The scoring kernel and the runner-up path both handle long-context
-    # shapes (Bm can be tens of thousands) on the Triton scorer.  Dtypes the
-    # kernels do not implement (fp64) use the reference backend.
+    # The scoring kernel and the runner-up path both run on the Triton scorer.
+    # Dtypes the kernels do not implement (fp64) use the reference backend.
     if impl == 'triton' and not _triton_dtype_ok(kI.dtype):
         _warn_shape_fallback('indexer', f'dtype={kI.dtype} is not supported by the Triton scorer')
         return 'ref'
@@ -2454,8 +2453,7 @@ def sparse_layer_forward(attn, x, pre_all, gate_sigs, pre_blocks, impl=None):
         bids = [pb[0] for pb in pre_blocks]
         nblks = [pb[1] for pb in pre_blocks]
         hons = [pb[2] for pb in pre_blocks]
-        # Write the rows directly into the int32 device table: the exact same
-        # block ids the int64 stack-then-cast produced.
+        # Write the rows directly into the int32 device table.
         bid_full = torch.empty((B, T), dtype=torch.int32, device=dev)
         for _b, _bd in enumerate(bids):
             bid_full[_b].copy_(_bd)

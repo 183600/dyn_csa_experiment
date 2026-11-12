@@ -3604,8 +3604,7 @@ def lightning_indexer_open(H, comp_kv, last_tok, W_DQ, W_DK, W_w, nIH, topk, *,
         kIt = (prefix_token_kv @ W_DK).view(n, nIH, hd)
     topk = max(int(topk), 0)
     q_chunk = max(1, min(int(query_chunk), max(n, 1)))
-    # The singleton gather is [C, P, nIH, hd]; cap it so long contexts use
-    # smaller query chunks.
+    # The singleton gather is [C, P, nIH, hd]; cap it for long contexts.
     if P > 0:
         _per = max(1, int(nIH) * int(P) * int(hd))
         q_chunk = max(1, min(q_chunk, (16 << 20) // _per))
@@ -5305,18 +5304,17 @@ class SmallGPT(nn.Module):
         # 求和链的拓扑结构决定，两种形式相同，因此梯度逐位一致。
         h = self.trunk(ids)
         # When targets contain ignored positions, the mean must be taken over
-        # the valid targets only (F.cross_entropy's own reduction), exactly as
-        # the unchunked form did.  The default None still uses
-        # cross_entropy's own -100 sentinel, so the denominator must exclude
-        # those positions too (a valid token id can never be negative).
+        # the valid targets only (F.cross_entropy's own reduction).  The
+        # default None still uses cross_entropy's own -100 sentinel, so the
+        # denominator must exclude those positions too (a valid token id can
+        # never be negative).
         _ign = -100 if ignore_index is None else int(ignore_index)
         n_tok = int((targets != _ign).sum().item())
         n_tok = max(n_tok, 1)
         ce = None
         _ck = torch.is_grad_enabled() and h.requires_grad
         if _ck and h.device.type != 'cuda':
-            # Every chunk's logits stay alive in the graph until backward, so
-            # the limit covers the whole sequence, not just one chunk.
+            # Estimate the saved logits over the whole sequence.
             _saved = 3 * int(ids.shape[0]) * int(ids.shape[1]) * int(vocab) * 4
             _ck = not _cpu_saved_ok(_saved, _CPU_CE_CKPT_BYTES)
         # The trunk must see the full input (block geometry depends on T), but
@@ -6890,7 +6888,7 @@ def _disk_ids_chunk(buf, disk_dt, vocab):
     # numpy builds that silently overflow).  `_fineweb_disk_dtype` returns
     # uint16 only for vocab <= 65536, so this is a defensive guard.
     if buf:
-        # Convert once to int64 and take the extrema with NumPy's C loops.
+        # Convert to int64 and take the extrema.
         # The range check runs on the pre-cast values, so a uint16 wrap can
         # never hide a bad id.
         _a = np.asarray(buf, dtype=np.int64)
@@ -9407,9 +9405,8 @@ def bootstrap_mean_ci(values, *, n_boot=4000, seed=20261018, conf=0.95):
     Units must be the independent sampling unit.  For LM evaluation a document
     row is the unit (tokens within a document are correlated), and this helper
     is used to report **document-sampling** uncertainty, not seed-level
-    training uncertainty.  Resampling is chunked, so the working set does not
-    grow with n_boot.  The RNG is seeded, so repeated report builds return the
-    same interval.
+    training uncertainty.  The RNG is seeded, so repeated report builds return
+    the same interval.
     """
     v = np.asarray([f for f in (_finite_scalar(x) for x in (values if values is not None else []))
                     if f is not None], dtype=float)
@@ -9446,8 +9443,7 @@ def paired_bootstrap_ci(deltas, *, n_boot=4000, seed=20261018):
                     if f is not None], dtype=float)
     if d.size < 2:
         return None
-    # Draws are generated in chunks, so the panel size does not require a
-    # correspondingly large index table.
+    # Draws are generated in chunks.
     nb = _as_seed_int(n_boot)
     sd = _as_seed_int(seed)
     if nb is None or sd is None or nb < 2:
@@ -16353,10 +16349,10 @@ def _ckpt_geom_key(n_param, n_layers, d, mlp_ratio, batch_size, seq_len, cfgs, n
 
 
 def _auto_ckpt_mode(device, n_param, n_layers, d, mlp_ratio, batch_size, seq_len, cfgs, n_heads=8, d_head=32):
-    # Explicit CSA_CKPT always wins.  Otherwise, on a CUDA box, fall back to
-    # activation recomputation when the estimated working set is large.  The
-    # recomputed forward is the same pure function, so values and gradients
-    # are unchanged (the contract documented at the top).
+    # Explicit CSA_CKPT always wins.  Otherwise, on a CUDA box, activation
+    # recomputation is selected automatically.  The recomputed forward is the
+    # same pure function, so values and gradients are unchanged (the contract
+    # documented at the top).
     if os.environ.get('CSA_CKPT', '').strip():
         return None, None
     if device.type != 'cuda' or not torch.cuda.is_available():
@@ -17700,7 +17696,7 @@ def analyze_errors(model, val_batch, vocab, device, *, tokenizer=None, top_n=50,
             _bsum[6] += _flat_ce[_sel_bnd].sum()
             _bcnt[6] += int(_sel_bnd.sum())
             n_targets += int(_flat_finite.sum())
-            # The per-token loop is bounded by top_tokens, not by B*T.
+            # Select at most top_tokens candidates.
             _sel_n = min(int(top_tokens), _b * _s)
             _pick_val, _pick_idx = torch.topk(torch.where(finite.reshape(-1), ce_f.reshape(-1),
                                                           torch.full_like(ce_f.reshape(-1), float('inf'))),
