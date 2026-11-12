@@ -4052,6 +4052,51 @@ def t_audit_budget_integer_runs():
             json.dump({'booked_seconds': 1.0, 'runs': 3.9, 'run_count': 7}, f)
         out = A.audit_budget(state_files=(state,), panels=())
         assert out['measured'][state]['run_count'] == 7, out
+    # Panel bookkeeping must use exact positive counts: a boolean/fractional
+    # parameter or token count would otherwise produce a plausible FLOP number.
+    td = tempfile.mkdtemp(prefix='budget_', dir=REPO)
+    try:
+        sp = os.path.join(td, 'summary.json')
+        for bad in ({'params': True, 'steps': 3, 'batch_size': 2, 'seq_len': 8},
+                    {'params': 1000.5, 'steps': 3, 'batch_size': 2, 'seq_len': 8},
+                    {'params': 1000, 'steps': 3, 'batch_size': 2, 'seq_len': 8,
+                     'tokens_seen': 48.5},
+                    {'params': 1000, 'steps': 3, 'batch_size': 2.5, 'seq_len': 8}):
+            with open(sp, 'w', encoding='utf-8') as f:
+                json.dump({'v::s0': dict(bad, variant='v')}, f)
+            r = A.audit_budget(state_files=(), panels=((td, 'v', None),))
+            assert r['status'] == 'fail' and r.get('problems'), (bad, r)
+            _panel = r['panels'][td]
+            assert not isinstance(_panel, dict) or _panel.get('estimate') is None, (bad, r)
+        with open(sp, 'w', encoding='utf-8') as f:
+            json.dump({'v::s0': {'variant': 'v', 'params': 1000, 'steps': 3,
+                                 'batch_size': 2, 'seq_len': 8}}, f)
+        r = A.audit_budget(state_files=(), panels=((td, 'v', None),))
+        assert r['status'] == 'ok', r
+        assert r['panels'][td]['tokens'] == 48, r
+        assert r['panels'][td]['estimate']['flops_6nd'] == 6.0 * 1000 * 48, r
+        for _bad in (True, 1.5, -1, None):
+            try:
+                A.train_flops_estimate(_bad, 48)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f'train_flops_estimate accepted params={_bad!r}')
+        for _bad in (True, 1.5, -1, None):
+            try:
+                A.train_flops_estimate(1000, _bad)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f'train_flops_estimate accepted tokens={_bad!r}')
+        try:
+            A.train_flops_estimate(1000, 48, attn_overhead=True)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('train_flops_estimate accepted a boolean overhead')
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
 
 
 def t_audit_failures_ignores_unmeasured_ppl():

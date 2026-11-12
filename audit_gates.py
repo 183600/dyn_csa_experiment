@@ -1781,10 +1781,24 @@ def train_flops_estimate(params, tokens, attn_overhead=0.35):
 
     6·N·D 是前向+反向的常用近似；稀疏选择/池化/激活重算与长序列注意力
     不与参数量成比例，因此用一个**显式声明的**注意力项系数。"""
-    n = float(params)
-    d_tok = float(tokens)
+    # Parameters and tokens are exact positive counts: int(True)=1,
+    # int(1.5)=1 and a negative count would all turn malformed bookkeeping
+    # into a plausible-looking FLOP estimate.
+    n = _exact_int_scalar(params)
+    d_tok = _exact_int_scalar(tokens)
+    if n is None or n <= 0 or d_tok is None or d_tok <= 0:
+        raise ValueError(f'train_flops_estimate: params/tokens must be positive integers (got {params!r}, {tokens!r})')
+    if (isinstance(attn_overhead, bool)
+            or getattr(getattr(attn_overhead, 'dtype', None), 'kind', None) == 'b'):
+        raise ValueError(f'train_flops_estimate: attn_overhead={attn_overhead!r} is a boolean, not a coefficient')
+    try:
+        overhead = float(attn_overhead)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f'train_flops_estimate: attn_overhead={attn_overhead!r} is not numeric') from None
+    if not math.isfinite(overhead) or overhead < 0.0:
+        raise ValueError(f'train_flops_estimate: attn_overhead={attn_overhead!r} must be finite and non-negative')
     base = 6.0 * n * d_tok
-    return {'flops_6nd': base, 'flops_with_attn_proxy': base * (1.0 + attn_overhead), 'attn_overhead_assumed': attn_overhead, 'note': 'analytic PROXY, not a measurement; report alongside TimeGuard seconds'}
+    return {'flops_6nd': base, 'flops_with_attn_proxy': base * (1.0 + overhead), 'attn_overhead_assumed': overhead, 'note': 'analytic PROXY, not a measurement; report alongside TimeGuard seconds'}
 
 
 def audit_budget(state_files=('run_time_state_v10.json', 'run_time_state_v12.json'), panels=(('results_lm_v10_scale_s', 'csa_fixed', 8000), ('results_lm_v10_scale_l8k', 'csa_fixed', 8000), ('results_lm_v10_scale_lflop', 'csa_fixed', None))):
@@ -1801,15 +1815,56 @@ def audit_budget(state_files=('run_time_state_v10.json', 'run_time_state_v12.jso
                 f'{d}: summary.json is {type(summ).__name__}, not an object — the budget cannot be reconciled')
             out['panels'][d] = 'not an object'
             continue
-        recs = [r for r in summ.values() if isinstance(r, dict) and r.get('variant') == v and isinstance(r.get('params'), (int, float))]
+        recs = [r for r in summ.values()
+                if isinstance(r, dict) and r.get('variant') == v
+                and r.get('params') is not None]
         if not recs:
             out['panels'][d] = 'no param records'
             continue
-        r0 = recs[0]
-        _steps = steps or r0.get('steps')
-        tok = r0.get('tokens_seen') or (_steps * r0.get('batch_size', 12) * r0.get('seq_len', 512) if _steps else None)
-        est = train_flops_estimate(r0['params'], tok) if tok else None
-        out['panels'][d] = {'params': r0.get('params'), 'steps': _steps, 'tokens': tok, 'estimate': est}
+        _valid = []
+        for r in recs:
+            p_i = _exact_int_scalar(r.get('params'))
+            if p_i is None or p_i <= 0:
+                out['status'] = 'fail'
+                out.setdefault('problems', []).append(
+                    f'{d}: param count {r.get("params")!r} is not a positive integer — the FLOP estimate would use corrupted bookkeeping')
+                continue
+            _valid.append((r, p_i))
+        if not _valid:
+            out['panels'][d] = 'no usable param records'
+            continue
+        r0, p0 = _valid[0]
+        _steps = steps if steps is not None else r0.get('steps')
+        _steps_i = _exact_int_scalar(_steps)
+        if _steps is not None and (_steps_i is None or _steps_i <= 0):
+            out['status'] = 'fail'
+            out.setdefault('problems', []).append(
+                f'{d}: step count {_steps!r} is not a positive integer — the token count cannot be derived')
+            out['panels'][d] = {'params': p0, 'steps': _steps, 'tokens': None, 'estimate': None}
+            continue
+        _tok_raw = r0.get('tokens_seen')
+        if _tok_raw is not None:
+            tok = _exact_int_scalar(_tok_raw)
+            if tok is None or tok <= 0:
+                out['status'] = 'fail'
+                out.setdefault('problems', []).append(
+                    f'{d}: tokens_seen={_tok_raw!r} is not a positive integer — the FLOP estimate would truncate it')
+                out['panels'][d] = {'params': p0, 'steps': _steps, 'tokens': None, 'estimate': None}
+                continue
+        elif _steps_i is not None:
+            _batch = _exact_int_scalar(r0.get('batch_size', 12))
+            _seq = _exact_int_scalar(r0.get('seq_len', 512))
+            if _batch is None or _batch <= 0 or _seq is None or _seq <= 0:
+                out['status'] = 'fail'
+                out.setdefault('problems', []).append(
+                    f'{d}: batch_size/seq_len {r0.get("batch_size", 12)!r}/{r0.get("seq_len", 512)!r} are not positive integers — the token count cannot be derived')
+                out['panels'][d] = {'params': p0, 'steps': _steps, 'tokens': None, 'estimate': None}
+                continue
+            tok = _steps_i * _batch * _seq
+        else:
+            tok = None
+        est = train_flops_estimate(p0, tok) if tok else None
+        out['panels'][d] = {'params': p0, 'steps': _steps, 'tokens': tok, 'estimate': est}
     for sf in state_files:
         st = _load(sf)
         if st is not None:
