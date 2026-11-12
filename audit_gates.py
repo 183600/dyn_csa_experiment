@@ -1871,9 +1871,8 @@ def train_flops_estimate(params, tokens, attn_overhead=0.35):
     try:
         base = 6.0 * n * d_tok
     except OverflowError:
-        # The counts are exact integers with no declared upper bound; a
-        # scale-up request can leave the binary64 range.  Saturating the
-        # analytic proxy is explicit, unlike crashing the budget audit.
+        # The counts are exact integers with no declared upper bound and can
+        # leave the binary64 range; saturate the analytic proxy.
         base = float('inf')
     try:
         with_attn = base * (1.0 + overhead)

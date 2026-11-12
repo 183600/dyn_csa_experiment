@@ -184,17 +184,15 @@ def t_scale_robustness_edges():
         assert isinstance(_k, int) and 0 < _k <= _n, (_n, _k)
         assert 0.0 <= L.signflip_power(_n, 4, 0.9) <= 1.0, _n
     assert math.isinf(A.train_flops_estimate(10 ** 400, 10 ** 400)['flops_6nd'])
-    # Large-degree t/chi-square tails must stay accurate, not merely finite:
-    # the incomplete-beta/gamma branches lose all precision around df=1e12
-    # (t critical ~90 and chi2 p~0.999 at x=df).  The asymptotic branches
-    # must converge to the normal limit / median.
+    # Large-degree t/chi-square tails must converge to the normal limit /
+    # median.
     assert abs(L._t_critical(0.95, 10 ** 20) - 1.959963984540054) < 1e-6
     assert abs(L.student_t_two_sided_p(2.0, 10 ** 400)
                - 0.04550026389635842) < 1e-9
     assert abs(L.chi2_sf(10 ** 12, 10 ** 12) - 0.5) < 0.01
     assert L.chi2_sf(10 ** 400, 10) == 0.0
-    # The scale-ladder audit performs its 1% budget check with exact integer
-    # arithmetic; a huge (but internally consistent) panel must not overflow.
+    # The scale-ladder audit performs its 1% token-count check with exact
+    # integer arithmetic; a huge internally consistent panel must not overflow.
     _big = 10 ** 200
     _tiers = [{'name': 'a', 'cfg': {'steps': _big, 'batch_size': _big,
                                     'seq_len': _big, 'n_train_tokens': _big ** 3,
@@ -206,7 +204,7 @@ def t_scale_robustness_edges():
                'params': _big ** 3}]
     assert L.scale_ladder_audit(_tiers)['budget_matched'] is True
     # Exact token counts beyond binary64 must not crash the pooled/per-document
-    # PPL reductions (the ratio underflows to a finite value).
+    # PPL reductions.
     _huge_tok = 10 ** 400
     assert L._nll_doc_ci([100.0, 100.0], [_huge_tok, _huge_tok])['n_docs'] == 2
     _ppl, _nll, _ntok = L._pooled_ppl_from_records(

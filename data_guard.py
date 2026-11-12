@@ -136,9 +136,8 @@ def _resolve_sizes(n, train_frac=0.8, val_frac=0.1, test_frac=0.1,
         # rows remain; clamping to the remaining count keeps every size
         # non-negative even when an explicit size or a large fraction would
         # otherwise overdraw it (the last split then takes whatever is left).
-        # Evaluate n*frac exactly: at a scale-up n can exceed the float range,
-        # where n * frac would raise OverflowError (or lose the low bits of a
-        # count that is an exact integer).
+        # Evaluate n*frac exactly: a float product can overflow or lose the
+        # low bits of an exact integer count.
         fracs = (Fraction(train_frac), Fraction(val_frac), Fraction(test_frac))
         unspecified = [i for i in range(3) if sizes[i] is None]
         remaining = n - sum(v for v in sizes if v is not None)
@@ -179,8 +178,7 @@ def _resolve_sizes(n, train_frac=0.8, val_frac=0.1, test_frac=0.1,
     # leftover rows to the splits with the largest fractional parts.  This
     # keeps small-n splits close to their requested proportions and never
     # puts rows into a split whose requested fraction is zero.  Exact
-    # rational arithmetic keeps the targets usable at any integer scale
-    # (n*frac as a float overflows once n leaves the binary64 range).
+    # rational arithmetic keeps the targets usable for any integer n.
     targets = [Fraction(n) * f for f in fracs]
     sizes = [int(t) for t in targets]
     remaining = n - sum(sizes)

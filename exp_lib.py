@@ -501,8 +501,8 @@ def _nll_doc_ci(nll_per_row, n_tokens_per_row):
     try:
         ce = total_nll / total_tok
     except OverflowError:
-        # An exact token count beyond the float range: the pooled CE
-        # underflows to zero rather than crashing the whole report.
+        # An exact token count beyond the float range underflows the pooled
+        # CE to zero.
         ce = 0.0
     # The point estimate is token-pooled, so the interval must be for that
     # same estimand.  Resampling/weighting per-document CEs as if the pooled
@@ -9893,11 +9893,9 @@ _BINOM_EXACT_MAX_N = 1 << 20
 def _sqrt_int_ratio(num, den):
     """sqrt(num/den) for non-negative integers, without int->float overflow.
 
-    Scale-up planning can pass seed/family counts far above the binary64
-    range.  Converting either operand to float first raises OverflowError even
-    when the ratio itself is small (e.g. n/sqrt(n)); shifting each operand by
-    its own scale keeps the quotient representable and the result exact to
-    float precision."""
+    Shifting each operand by its own scale keeps the quotient representable
+    even when the counts themselves are far above the binary64 range, and the
+    result is exact to float precision."""
     if num <= 0:
         return 0.0
     if den <= 0:
@@ -9929,7 +9927,7 @@ def _binom_cdf_half_asymptotic(n, m):
     This is used for very large n where the O(1)-ish incomplete beta becomes
     numerically unreliable; its error is O(1/n^2), far below any planning
     threshold.  The z computation avoids materialising sqrt(n) as a float, so
-    a planning count above the binary64 range still returns a probability."""
+    counts above the binary64 range still return a probability."""
     _num = 2 * int(m) + 1 - int(n)
     _zabs = _sqrt_int_ratio(_num * _num, n)
     z = (_zabs if _num > 0 else -_zabs) if _num else 0.0
@@ -10039,9 +10037,8 @@ def signflip_min_consistency(n_seeds, m_comparisons, alpha=0.05):
         # Holm rejects at p_holm <= alpha, so the planning helper must use the
         # same inclusive boundary.  A strict '<' would report a plan as
         # impossible at the exact boundary that holm_adjust accepts.
-        # Compare via alpha/p instead of m*p: a family size above the float
-        # range would make int->float conversion overflow even though the
-        # comparison is trivially false for any p>0.
+        # Compare via alpha/p: a family size above the float range would make
+        # an int->float conversion overflow.
         if p <= 0.0:
             return True
         return m <= (a + 1e-15) / p
@@ -10293,10 +10290,8 @@ def _student_t_sf(t, df):
         return 1.0
     if isinstance(t, float) and not math.isfinite(t):
         return float('nan')
-    # The incomplete-beta branch is O(1) but loses all significant digits
-    # once df is very large (the continued fraction/ lgamma cancellation
-    # returns a far too small tail: t critical ~90 at df=1e20).  Above this
-    # cutoff the t/normal Edgeworth expansion is both accurate and stable.
+    # Above this cutoff the t/normal Edgeworth expansion is accurate and
+    # stable for very large df.
     if df == float('inf') or df > 1e6:
         sf = 0.5 * math.erfc(t / math.sqrt(2.0))
         try:
@@ -10320,8 +10315,8 @@ def student_t_two_sided_p(t, df):
         _t = abs(float(t))
     except (TypeError, ValueError, OverflowError):
         _t = float('inf')
-    # Keep df as an exact integer: converting a scale-up degree count to
-    # float overflows even though _student_t_sf can handle it exactly.
+    # Keep df as an exact integer; converting it to float can overflow even
+    # though _student_t_sf can handle it exactly.
     sf = _student_t_sf(_t, df)
     if not math.isfinite(sf):
         return float('nan')
@@ -10367,9 +10362,8 @@ def chi2_sf(x, df):
         return float('nan')
     if x <= 0.0:
         return 1.0
-    # `_gammaincc` loses precision for very large df (at df=1e12, x=df it
-    # reported 0.999 instead of ~0.5).  The Wilson-Hilferty transformation is
-    # accurate to O(1/df) and never materialises df as a float.
+    # The Wilson-Hilferty transformation is accurate to O(1/df) for very
+    # large df and never materialises df as a float.
     if df == float('inf') or df > 1e5:
         try:
             _ratio = x / df
@@ -10982,8 +10976,8 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
         if not (math.isfinite(lr) and lr > 0):
             problems.append(f'{name}: lr={lr!r} is not a positive finite number')
         effective_tokens = steps * batch * seq
-        # Exact integer 1% comparison: `0.01 * declared_tokens` raises
-        # OverflowError once a scale-up token count leaves the float range.
+        # Exact integer 1% comparison: a float product can overflow once the
+        # token count leaves the binary64 range.
         if declared_tokens > 0 and abs(effective_tokens - declared_tokens) * 100 > declared_tokens:
             problems.append(
                 f'{name}: declared n_train_tokens={declared_tokens:,} differs from '
