@@ -1604,7 +1604,9 @@ def _sig_gate(st, alpha=0.05, min_n=6, label=None, family=None, register=True):
         else:
             _note_comparison(label, st.get('p_exact_signflip'), family,
                              st.get('p_holm'), st.get('n'), st.get('mean'))
-    n = st.get('n') or 0
+    # A seed count is an exact integer: int(6.9)=6 would let a malformed
+    # count pass the n>=6 gate.  `_int_or` rejects booleans and lossy floats.
+    n = _int_or(st.get('n'), None)
     p = st.get('p_exact_signflip')
     ph = st.get('p_holm')
     mean, std = st.get('mean'), st.get('std')
@@ -1612,8 +1614,11 @@ def _sig_gate(st, alpha=0.05, min_n=6, label=None, family=None, register=True):
         # float(False) == 0.0 would otherwise turn a boolean flag into a
         # significant p-value (or a zero seed count into a real measurement).
         return False
+    _min_n = _int_or(min_n, None)
+    if n is None or _min_n is None:
+        return False
     try:
-        if int(n) < int(min_n):
+        if n < _min_n:
             return False
         pf, phf = (float(p) if p is not None else None), (float(ph) if ph is not None else None)
         if pf is None or not (math.isfinite(pf) and 0.0 <= pf <= 1.0 and pf < alpha):

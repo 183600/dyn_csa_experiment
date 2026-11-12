@@ -1789,6 +1789,11 @@ def t_review3_evidence_metadata():
     assert BR._sig_gate(dict(base, std=-1.0), register=False) is False
     assert BR._sig_gate(dict(base, mean=float('inf')), register=False) is False
     assert BR._sig_gate(dict(base, p_exact_signflip=-0.1), register=False) is False
+    # Fractional/boolean seed counts are not seed counts; int(6.9)=6 and
+    # int(True)=1 must not pass or fail the n>=6 gate as if they were real.
+    for _bad_n in (6.9, True, np.bool_(False), float('nan'), 'not-a-count', None):
+        assert BR._sig_gate(dict(base, n=_bad_n), register=False) is False, _bad_n
+    assert BR._sig_gate(dict(base, n=6.0), register=False) is True
     # A boolean p must not be converted to 0.0 before the report's correction.
     old_load = BR.load
     try:
