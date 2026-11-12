@@ -4387,6 +4387,15 @@ def t_audit_length_malformed_cells_do_not_crash():
             bad = A.audit_length(p)
             assert bad['status'] == 'fail', bad
             assert any('positive' in x for x in bad['problems']), bad
+        # A length-1 cell scores no next-token target, so a self-consistent
+        # n_tok/eval_span pair must not enter the table as a clean measurement.
+        with open(p, 'w', encoding='utf-8') as f:
+            json.dump({'a::s0': {'by_len': {'1': {
+                'n_tok': 1, 'eval_span': 1, 'n_seq': 1,
+                'truncated': False}}}}, f)
+        one = A.audit_length(p)
+        assert one['status'] == 'fail', one
+        assert any('next-token prediction' in x for x in one['problems']), one
     finally:
         shutil.rmtree(td, ignore_errors=True)
 

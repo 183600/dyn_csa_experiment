@@ -1344,6 +1344,12 @@ def audit_length(bylen_path='results_lm_test/bylen.json'):
             if Ln <= 0:
                 problems.append(f'{key}: by_len key {k!r} is not a positive sequence length')
                 continue
+            if Ln < 2:
+                # A length-1 row predicts no next token; its n_tok/eval_span
+                # equality would be a vacuous "measurement" rather than a
+                # scored target set (same rule as v12 admission).
+                problems.append(f'{key}: by_len key {k!r} has no next-token prediction (needs length >= 2)')
+                continue
             if not isinstance(c, dict):
                 problems.append(f'{key}: by_len[{k!r}] cell is not an object')
                 continue
