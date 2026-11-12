@@ -2305,7 +2305,35 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=16, max_pos=
             continue
         _norm_lens.append(_li)
     eval_lens = _norm_lens
-    _val_width = int(np.asarray(val_ids).shape[1])
+    # Row count and truncation span are also exact integers: a fractional /
+    # boolean n_seq would crash or silently score a different number of rows
+    # (n_seq=0 would report exp(0)=1), and int(4.9) on max_pos would score a
+    # different span than the caller named.  Fail closed for every requested
+    # length instead of returning such a measurement.
+    _nseq = L._as_seed_int(n_seq)
+    _max_norm = max_pos if max_pos is None else L._as_seed_int(max_pos)
+    _arg_err = None
+    if _nseq is None or _nseq < 1:
+        _arg_err = (f'n_seq={n_seq!r} must be a positive integer row count; '
+                    'a fractional/boolean value would score a different sample')
+    elif max_pos is not None and _max_norm is None:
+        _arg_err = (f'max_pos={max_pos!r} must be an exact integer token span '
+                    'or None; a fractional/boolean value would score a different span')
+    if _arg_err is not None:
+        for Ln in eval_lens:
+            out[Ln] = {'error': _arg_err, 'truncated': False, 'eval_span': None}
+        model.train(was)
+        return out
+    n_seq, max_pos = _nseq, _max_norm
+    _val_arr = np.asarray(val_ids)
+    if _val_arr.ndim != 2 or _val_arr.shape[0] < 1 or _val_arr.shape[1] < 2:
+        _shape_err = (f'val_ids must be a non-empty 2-D [rows, tokens] slice with '
+                      f'at least 2 tokens, got shape {_val_arr.shape}')
+        for Ln in eval_lens:
+            out[Ln] = {'error': _shape_err, 'truncated': False, 'eval_span': None}
+        model.train(was)
+        return out
+    _val_width = int(_val_arr.shape[1])
     # An absolute-position model cannot score beyond its learned table.  When
     # the caller passes max_pos=None (the "full context" request) a longer
     # length must be an explicit error, never a silent last-max_pos slice.

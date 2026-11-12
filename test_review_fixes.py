@@ -1385,6 +1385,19 @@ def t_eval_length_invalid_lengths():
     # Malformed (unhashable) length identities must not crash the whole eval.
     out_bad = V7.eval_length_gen(model, ids, [[8]], dev, max_pos=None)
     assert len(out_bad) == 1 and 'error' in next(iter(out_bad.values())), out_bad
+    # Row count and truncation span are exact integers too: a fractional
+    # n_seq used to crash, and n_seq=0 used to report exp(0)=1 as a
+    # measurement.  Both must be named error cells, not silent samples.
+    for bad_nseq in (0, -1, 4.9, True, False):
+        out_ns = V7.eval_length_gen(model, ids, [8], dev, max_pos=None, n_seq=bad_nseq)
+        assert 'error' in out_ns[8] and 'ppl' not in out_ns[8], (bad_nseq, out_ns)
+    out_mp = V7.eval_length_gen(model, ids, [8, 16], dev, max_pos=4.9)
+    assert all('error' in out_mp[Ln] and 'ppl' not in out_mp[Ln] for Ln in (8, 16)), out_mp
+    out_mpb = V7.eval_length_gen(model, ids, [8], dev, max_pos=True)
+    assert 'error' in out_mpb[8] and 'ppl' not in out_mpb[8], out_mpb
+    for bad_ids in (np.empty((0, 17), dtype=np.int64), ids[0], np.empty((2, 0), dtype=np.int64)):
+        out_shape = V7.eval_length_gen(model, bad_ids, [8], dev, max_pos=None)
+        assert 'error' in out_shape[8] and 'ppl' not in out_shape[8], (bad_ids.shape, out_shape)
 
 
 def t_audit_family_holm_and_verified():
@@ -1877,6 +1890,14 @@ def t_doc_level_analysis():
     assert d is not None and d['n_docs'] == n_doc
     assert abs(d['per_doc_delta_mean'] - (-1.0)) < 1e-9, 'per-doc delta must be a - b = -1.0'
     assert abs(d['between_doc_sd']) < 1e-9, 'constant -1.0 shift across docs -> zero between-doc spread'
+    _shape_rec = {'by_len': {'8': {'n_tok': 16 * 7, 'n_seq': 16, 'truncated': False}}}
+    assert V12._by_len_shape_reason(_shape_rec, 16) is None
+    _span_rec = {'by_len': {'8': {'n_tok': 16 * 7, 'n_seq': 16, 'truncated': False,
+                                  'eval_span': 7}}}
+    assert V12._by_len_shape_reason(_span_rec, 16) is not None
+    for _bad_nseq in (4.9, True, 0, -1):
+        _why = V12._by_len_shape_reason(_shape_rec, _bad_nseq)
+        assert _why is not None and 'n_seq' in _why, (_bad_nseq, _why)
     # A boolean/string is not a per-document PPL measurement; it is counted as
     # an incomplete cell, not coerced to 1.0 (or a numeric string).
     bad_a = {k: dict(v, by_len={'4096': dict(v['by_len']['4096'],
@@ -5940,6 +5961,21 @@ def t_scale_edge_case_regressions():
     import data_guard as DG
     assert DG._matrix_fingerprint(np.array([[2 ** 53]], dtype=object)) != \
         DG._matrix_fingerprint(np.array([[2 ** 53 + 1]], dtype=object))
+    # The exact float64 boundary must fingerprint identically whether the
+    # table is stored as int64 or as an object integer column.
+    for _val in (2 ** 53, -(2 ** 53)):
+        _obj = np.array([[_val]], dtype=object)
+        _typed = np.array([[_val]], dtype=np.int64)
+        assert DG._matrix_fingerprint(_obj) == DG._matrix_fingerprint(_typed), _val
+        assert DG._row_keys(_obj) == DG._row_keys(_typed), _val
+    # A row must also match across object/int64/uint64 storage so a cache
+    # serialised with object dtype cannot hide cross-split duplicates.
+    for _vals, _dt in (([[1, 2], [3, 4]], np.int64),
+                       ([[0, 2 ** 64 - 1]], np.uint64),
+                       ([[-1, 2 ** 53]], np.int64)):
+        _obj = np.array(_vals, dtype=object)
+        _typed = np.array(_vals, dtype=_dt)
+        assert DG._row_keys(_obj) == DG._row_keys(_typed), (_vals, _dt)
     # A non-truncated length cell must declare the requested span, not L-1.
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, 'bylen.json')

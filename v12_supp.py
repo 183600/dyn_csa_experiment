@@ -1220,6 +1220,11 @@ def _by_len_shape_reason(rec, n_seq):
     bl = rec.get('by_len') or {}
     if not isinstance(bl, dict) or not bl:
         return 'no by_len measurement'
+    # The frozen row count is an exact positive integer; int(4.9)=4 would
+    # validate a cell against a different estimand than the plan declares.
+    _nseq_i = _record_int(n_seq)
+    if _nseq_i is None or _nseq_i <= 0:
+        return f'n_seq={n_seq!r} is not a positive exact integer row count'
     for _ln, _c in bl.items():
         if not isinstance(_c, dict):
             return f'by_len[{_ln!r}] is not a cell object'
@@ -1232,25 +1237,25 @@ def _by_len_shape_reason(rec, n_seq):
         if _ln_i < 2:
             return f'by_len length {_ln_i} has no next-token prediction (needs Ln>=2); an empty cell is not admissible'
         _ntok = _c.get('n_tok')
-        _want = int(n_seq) * (_ln_i - 1)
+        _want = _nseq_i * (_ln_i - 1)
         if (isinstance(_ntok, (bool, np.bool_))
                 or not isinstance(_ntok, (int, float, np.integer, np.floating))):
-            return f'by_len[{_ln_i}].n_tok={_ntok!r} != the frozen {_want} (= {n_seq} rows x {_ln_i - 1} predictions) — truncated/empty cells are not admissible'
+            return f'by_len[{_ln_i}].n_tok={_ntok!r} != the frozen {_want} (= {_nseq_i} rows x {_ln_i - 1} predictions) — truncated/empty cells are not admissible'
         try:
             _ntok_f = float(_ntok)
         except (TypeError, ValueError, OverflowError):
             _ntok_f = float('nan')
         if not math.isfinite(_ntok_f) or _ntok_f != math.floor(_ntok_f) or int(_ntok_f) != _want:
-            return f'by_len[{_ln_i}].n_tok={_ntok!r} != the frozen {_want} (= {n_seq} rows x {_ln_i - 1} predictions) — truncated/empty cells are not admissible'
+            return f'by_len[{_ln_i}].n_tok={_ntok!r} != the frozen {_want} (= {_nseq_i} rows x {_ln_i - 1} predictions) — truncated/empty cells are not admissible'
         # The cell's own row count is part of the estimand: the by-length
         # summary quotes the first cell's n_seq, so each cell must state the
         # frozen row count.
         _cnseq_raw = _c.get('n_seq')
         if _cnseq_raw is not None:
             _cnseq = _record_int(_cnseq_raw)
-            if _cnseq is None or _cnseq != int(n_seq):
+            if _cnseq is None or _cnseq != _nseq_i:
                 return (f'by_len[{_ln_i}].n_seq={_cnseq_raw!r} != the frozen '
-                        f'{int(n_seq)} — a different row count is a different estimand')
+                        f'{_nseq_i} — a different row count is a different estimand')
         # A cell that does not explicitly certify full length is unverifiable.
         # Matching n_tok alone cannot distinguish a full cell from a record
         # whose truncation marker was lost when it was serialised.
@@ -1260,6 +1265,17 @@ def _by_len_shape_reason(rec, n_seq):
             return f'by_len[{_ln_i}].truncated={_c.get("truncated")!r} is not a boolean — an unverifiable cell is not admissible'
         if bool(_c.get('truncated')):
             return f'by_len[{_ln_i}] is marked truncated — a partial cell is not admissible'
+        # A non-truncated cell must cover exactly the requested span.  n_tok
+        # alone cannot catch a cell that scored L-1 tokens under an L label
+        # (the same rule as audit_length): eval_span is the cell's own record
+        # of how many positions it actually ran.
+        _es = _c.get('eval_span')
+        if _es is not None:
+            _es_i = _record_int(_es)
+            if _es_i is None or _es_i != _ln_i:
+                return (f'by_len[{_ln_i}].eval_span={_es!r} != the requested '
+                        f'length — a shorter span under a full-length label is '
+                        'not admissible')
     return None
 
 
