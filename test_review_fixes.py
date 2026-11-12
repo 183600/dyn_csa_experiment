@@ -3996,6 +3996,15 @@ def t_audit_budget_integer_runs():
             json.dump({'booked_seconds': 1.0, 'runs': [1, 2]}, f)
         out = A.audit_budget(state_files=(state,), panels=())
         assert out['measured'][state]['run_count'] == 2, out
+        # A fractional run counter is not a count; never truncate it to one.
+        with open(state, 'w', encoding='utf-8') as f:
+            json.dump({'booked_seconds': 1.0, 'runs': 3.9}, f)
+        out = A.audit_budget(state_files=(state,), panels=())
+        assert out['measured'][state]['run_count'] is None, out
+        with open(state, 'w', encoding='utf-8') as f:
+            json.dump({'booked_seconds': 1.0, 'runs': 3.9, 'run_count': 7}, f)
+        out = A.audit_budget(state_files=(state,), panels=())
+        assert out['measured'][state]['run_count'] == 7, out
 
 
 def t_audit_failures_ignores_unmeasured_ppl():

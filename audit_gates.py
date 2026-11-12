@@ -1830,7 +1830,12 @@ def audit_budget(state_files=('run_time_state_v10.json', 'run_time_state_v12.jso
             if isinstance(_runs, (list, tuple, dict, set)):
                 _run_count = len(_runs)
             elif isinstance(_runs, (int, float)) and not isinstance(_runs, bool):
-                _run_count = int(_runs)
+                # A run counter is an exact integer; int(3.9) would silently
+                # report a different number of completed runs.  A malformed
+                # counter falls back to the legacy field instead.
+                _run_count = _exact_int_scalar(_runs)
+                if _run_count is None:
+                    _run_count = st.get('run_count')
             else:
                 _run_count = st.get('run_count')
             out.setdefault('measured', {})[sf] = {'booked_seconds': st.get('booked_seconds'), 'run_count': _run_count}
