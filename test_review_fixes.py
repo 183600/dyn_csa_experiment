@@ -5595,6 +5595,20 @@ def t_selection_attribution_contract():
             json.dump({'cells': [bad3]}, f)
         r5 = A.audit_selection()
         assert r5['cells'][0]['claim_allowed'] is False and r5['cells'][0]['n_seeds_valid'] == 2, r5
+        # A per-seed fraction outside [0,1] or non-finite cannot support a
+        # claim; it must not inflate n_seeds_valid or produce a p-value.
+        for _bad_pair in (({'mass_covered': 1.5, 'random_baseline': 0.0}),
+                          ({'mass_covered': 0.8, 'random_baseline': -0.1}),
+                          ({'mass_covered': float('nan'), 'random_baseline': 0.03}),
+                          ({'mass_covered': float('inf'), 'random_baseline': 0.03})):
+            _bc = dict(cell, per_seed={str(i): dict(_bad_pair) for i in range(6)})
+            with open(os.path.join(td, 'analysis_mechanism', 'selection_attribution.json'), 'w', encoding='utf-8') as f:
+                json.dump({'cells': [_bc]}, f)
+            _rb = A.audit_selection()
+            assert _rb['cells'][0]['n_seeds_valid'] == 0, (_bad_pair, _rb)
+            assert _rb['cells'][0]['seed_test'] is None, (_bad_pair, _rb)
+            assert _rb['cells'][0]['claim_allowed'] is False, (_bad_pair, _rb)
+            assert _rb['status'] == 'fail', (_bad_pair, _rb)
         # Booleans are flags, not measurements: a boolean-only cell must fail
         # structurally instead of becoming k=1/B=1/nq=1 and a claim.
         bool_cell = {'arm': 'a', 'eval_len': True, 'k': True, 'n_blocks': True,

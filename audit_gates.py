@@ -2302,11 +2302,21 @@ def audit_selection(path='analysis_mechanism/selection_attribution.json'):
                 _bad_seed.append(str(_sk))
                 continue
             try:
-                _d.append(float(v.get('mass_covered')) - float(v.get('random_baseline')))
+                _mv = float(v.get('mass_covered'))
+                _bv = float(v.get('random_baseline'))
             except (TypeError, ValueError, OverflowError):
                 _bad_seed.append(str(_sk))
+                continue
+            # Per-seed fractions must be finite probabilities in [0,1].  A
+            # NaN/Inf or an out-of-range row cannot attest that the selector
+            # covered more attention mass than its random baseline.
+            if (not (math.isfinite(_mv) and math.isfinite(_bv))
+                    or not (0.0 <= _mv <= 1.0 and 0.0 <= _bv <= 1.0)):
+                _bad_seed.append(str(_sk))
+                continue
+            _d.append(_mv - _bv)
         if _bad_seed:
-            out['problems'].append(f'cell {i} ({c.get("arm")}): per_seed rows lack mass_covered/random_baseline: {_bad_seed[:5]}')
+            out['problems'].append(f'cell {i} ({c.get("arm")}): per_seed rows lack usable mass_covered/random_baseline: {_bad_seed[:5]}')
         _n_valid = len(_d)
         if _n_valid >= 2:
             try:
