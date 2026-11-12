@@ -5626,13 +5626,18 @@ def _array_id_range(arr):
     return [int(a.min()), int(a.max())]
 
 
+_IDS_FP_ALGO = 2
+
+
 def _ids_fp(train_ids):
     # Pure function of the token values, memoised on (data pointer, layout)
     # with a weak reference to the array: a dead entry can never alias a
     # recycled pointer, and large corpora are not retained by the cache.
-    # Same tokens in -> same digest out, always.  Sub-int32 storage (the
-    # uint16 FineWeb cache) is hashed through its canonical int32 form, so a
-    # corpus keeps the same fingerprint regardless of storage width.
+    # Same tokens in -> same digest out, always.  Every integer storage width
+    # is hashed through one canonical int64 form (uint64 only when a value
+    # exceeds int64), so a corpus keeps the same fingerprint whether the cache
+    # stored it as int8/int16/int32/uint16 or int64.  Raw width-dependent bytes
+    # would make the same corpus look different across loaders/cache versions.
     import weakref as _weakref
     try:
         _key = (train_ids.__array_interface__['data'][0], train_ids.shape, train_ids.strides, train_ids.dtype.str)
@@ -5665,6 +5670,7 @@ def _ids_fp(train_ids):
             if ((int(_rec.get('size', -1)), int(_rec.get('mtime_ns', -1)),
                  int(_rec.get('ctime_ns', -1)), int(_rec.get('inode', -1))) == _stat
                     and isinstance(_rec.get('fp'), str)
+                    and _rec.get('algo') == _IDS_FP_ALGO
                     and _rec.get('dtype') == _tdtype
                     and tuple(_rec.get('shape') or ()) == _tshape):
                 _fp = _rec['fp']
@@ -5681,12 +5687,19 @@ def _ids_fp(train_ids):
             pass
     _h = hashlib.sha256()
     _arr = np.asarray(train_ids)
-    _widen = _arr.dtype in (np.dtype(np.uint8), np.dtype(np.uint16))
+    _canon = None
+    if np.issubdtype(_arr.dtype, np.integer):
+        _canon = np.dtype(np.int64)
+        # uint64 is the only integer width that cannot be represented exactly
+        # in int64.  Keep it as uint64 only when a value actually needs that
+        # range; all ordinary token/doc ids stay on the signed canonical form.
+        if _arr.dtype == np.dtype(np.uint64) and _arr.size                 and int(_arr.max()) > np.iinfo(np.int64).max:
+            _canon = np.dtype(np.uint64)
     _cs = 1 << 24
     for _off in range(0, len(_arr), _cs):
         _part = _arr[_off:_off + _cs]
-        if _widen:
-            _part = _part.astype(np.int32, copy=False)
+        if _canon is not None and _part.dtype != _canon:
+            _part = _part.astype(_canon, copy=False)
         elif not _part.flags.c_contiguous:
             _part = np.ascontiguousarray(_part)
         _h.update(memoryview(_part).cast('B'))
@@ -5703,6 +5716,7 @@ def _ids_fp(train_ids):
         try:
             _rec_out = {'size': _stat[0], 'mtime_ns': _stat[1],
                         'ctime_ns': _stat[2], 'inode': _stat[3], 'fp': _fp,
+                        'algo': _IDS_FP_ALGO,
                         'dtype': np.dtype(np.asarray(train_ids).dtype).str,
                         'shape': [int(_x) for _x in np.shape(train_ids)]}
             atomic_write_json(_side, _rec_out)

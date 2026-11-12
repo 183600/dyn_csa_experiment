@@ -2346,6 +2346,43 @@ def t_npy_serve_int32_rejects_invalid_and_out_of_range():
                 raise AssertionError(f'{name}: invalid token cache was silently accepted')
 
 
+def t_ids_fp_is_storage_width_invariant():
+    # The same corpus must keep one fingerprint across every integer cache
+    # dtype; otherwise a data_version/resume gate sees a different corpus just
+    # because a loader stored ids as int32 instead of int64.
+    for value in (0, 1, 255, 70000):
+        fps = set()
+        for dt in (np.int8, np.uint8, np.int16, np.uint16,
+                   np.int32, np.uint32, np.int64):
+            try:
+                arr = np.array([value], dtype=dt)
+            except (OverflowError, ValueError):
+                continue
+            fps.add(L._ids_fp(arr))
+        assert len(fps) == 1, (value, fps)
+    # uint64 ids above int64's range must stay exact (no wrap-alias).
+    hi = np.array([2 ** 63 + 1], dtype=np.uint64)
+    hi2 = np.array([2 ** 63 + 2], dtype=np.uint64)
+    assert L._ids_fp(hi) != L._ids_fp(hi2), 'uint64 ids must not wrap into one fingerprint'
+    # A sidecar written by an older fingerprint algorithm must not be served.
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, 'train_ids_x.npy')
+        np.save(path, np.arange(8, dtype=np.int32))
+        st = os.stat(path)
+        with open(path + '.idsfp.json', 'w', encoding='utf-8') as f:
+            json.dump({'size': int(st.st_size),
+                       'mtime_ns': int(getattr(st, 'st_mtime_ns', int(st.st_mtime * 1e9))),
+                       'ctime_ns': int(getattr(st, 'st_ctime_ns', int(st.st_ctime * 1e9))),
+                       'inode': int(getattr(st, 'st_ino', 0)),
+                       'fp': 'stale-old-algorithm',
+                       'dtype': np.dtype(np.int32).str, 'shape': [8]}, f)
+        mm = np.load(path, mmap_mode='r')
+        try:
+            assert L._ids_fp(mm) != 'stale-old-algorithm', 'old sidecar was served after the algorithm changed'
+        finally:
+            del mm
+
+
 def t_data_version_identity():
     cfg = {'dataset': 'unit', 'n_train_tokens': 512, 'seq_len': 32, 'cache_dir': './unit_cache'}
     tr = np.arange(512, dtype=np.int64) % 97
@@ -5779,6 +5816,7 @@ def main():
     _check('E8 append-only experiment ledger + manifest', t_experiment_ledger)
     _check('E4b manifest seed integrity is exact', t_manifest_seed_integrity_is_exact)
     _check('E9a int32 cache narrowing rejects corrupt ids', t_npy_serve_int32_rejects_invalid_and_out_of_range)
+    _check('E9b id fingerprint is storage-width invariant', t_ids_fp_is_storage_width_invariant)
     _check('E9 data_version identity', t_data_version_identity)
     _check('E10 crash-safe manifest status/planned cells', t_manifest_running_then_complete)
     _check('E11 failed overfit guard is retried', t_failed_guard_is_retried)
