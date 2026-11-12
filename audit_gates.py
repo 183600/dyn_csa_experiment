@@ -1516,8 +1516,19 @@ def audit_fairness(summary_path='results_v10_mech/summary.json', arms=None):
     _missing_arms = [a for a in arms if a not in per_arm]
     if _missing_arms:
         warnings.append('declared arm(s) absent from the summary: ' + ', '.join(_missing_arms) + ' — the frozen-arm comparison is only partially audited')
+
+    def _meta_key(value):
+        # A malformed metadata field may be a list/dict.  Putting it directly
+        # into a set raises TypeError and aborts the audit; canonicalise it so
+        # the malformed record is still counted/reported instead.
+        try:
+            hash(value)
+            return value
+        except TypeError:
+            return ('__unhashable__', type(value).__name__, repr(value))
+
     for a, recs in per_arm.items():
-        cfgs = {r.get('run_cfg') for r in recs}
+        cfgs = {_meta_key(r.get('run_cfg')) for r in recs}
         knob_vals = {json.dumps(r.get('train_knobs'), sort_keys=True)
                      for r in recs if r.get('train_knobs') is not None}
         n_missing_knobs = sum(1 for r in recs if r.get('train_knobs') is None)
@@ -1525,13 +1536,18 @@ def audit_fairness(summary_path='results_v10_mech/summary.json', arms=None):
         # abort the whole audit instead of excluding the malformed record.
         seeds = sorted({_s for r in recs
                         if (_s := L._as_seed_int(r.get('seed'))) is not None})
+        # Parameter counts normally share one numeric type, but a malformed
+        # record may carry a string/object/list.  Distinctness and sorting
+        # must therefore use a total, hashable key.
+        _param_by_key = {_meta_key(r.get('params')): r.get('params') for r in recs}
         out['arms'][a] = {
             'n_records': len(recs), 'seeds': seeds, 'n_seeds': len(seeds),
             'n_distinct_run_cfg': len(cfgs),
             'n_distinct_train_knobs': len(knob_vals),
             'n_missing_train_knobs': n_missing_knobs,
-            'params': sorted({r.get('params') for r in recs},
-                             key=lambda x: (x is None, x)),
+            'params': [_param_by_key[_k] for _k in sorted(
+                _param_by_key,
+                key=lambda x: (x is None, type(x).__name__, repr(x)))],
         }
         if len(cfgs) > 1:
             problems.append(f'{a}: {len(cfgs)} distinct run_cfg values within one arm — mixed protocols inside an arm')
@@ -1560,7 +1576,7 @@ def audit_fairness(summary_path='results_v10_mech/summary.json', arms=None):
                 if _eq is None:
                     warnings.append(f'{_key} equality across arms is UNVERIFIABLE (some records omit it / differ in coverage) — do not read the arm means as a controlled contrast')
         ref_arm = arms[0] if arms[0] in per_arm else next(iter(per_arm))
-        ref_cfg = {r.get('run_cfg') for r in per_arm[ref_arm]}
+        ref_cfg = {_meta_key(r.get('run_cfg')) for r in per_arm[ref_arm]}
         if not ref_cfg or None in ref_cfg:
             # Length-phase / checkpoint-backed records carry `by_len` and a
             # code stamp but no run_cfg fingerprint, so cross-arm recipe
@@ -1572,7 +1588,7 @@ def audit_fairness(summary_path='results_v10_mech/summary.json', arms=None):
                 if a == ref_arm:
                     continue
                 for r in recs:
-                    if r.get('run_cfg') is None or r.get('run_cfg') not in ref_cfg:
+                    if r.get('run_cfg') is None or _meta_key(r.get('run_cfg')) not in ref_cfg:
                         problems.append(f'{a}: a record whose run_cfg does not equal the {ref_arm} reference (pair_reason would refuse this pairing)')
                         break
         # Seed coverage: arm means are only comparable if they average the

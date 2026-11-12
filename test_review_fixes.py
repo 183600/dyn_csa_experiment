@@ -880,6 +880,20 @@ def t_power_gate():
                 assert 'integer' in str(e), str(e)[:200]
             else:
                 raise AssertionError(f'eval.n_seqs_clean={_bad_nseq!r} must be refused')
+        # A non-object eval block must be refused explicitly, not crash the
+        # loader with AttributeError.
+        for _bad_eval in ([], [4096], 'x'):
+            pbad = os.path.join(td, 'bad_eval.json')
+            mb = _write_manifest(pbad, list(range(12)))
+            mb['eval'] = _bad_eval
+            with open(pbad, 'w', encoding='utf-8') as f:
+                json.dump(mb, f)
+            try:
+                V12._load_manifest(pbad)
+            except SystemExit as e:
+                assert 'eval' in str(e), str(e)[:200]
+            else:
+                raise AssertionError(f'eval={_bad_eval!r} must be refused')
 
 
 def _rec(variant, seed, fp, by_len=None, code=None, recipe='steps3000_sl512_bs12_nt8000000_lr0.0003_wd0.1_d256_L6_H8_Dh32_v8192_wu50_cl0.05_dlm10.0_mtdefault_mrcsa_dynamic_ee250_es128_detcpu-eager_dfdeadbeef_cscURRENT', msha='CURRENT'):
@@ -914,6 +928,22 @@ def t_admission_gate():
     _ok = _rec('a_arm', 0, 'FP', by_len={4096.0: {
         'ppl': 30.0, 'n_tok': 16 * 4095, 'n_seq': 16, 'truncated': False}})
     assert V12._by_len_shape_reason(_ok, 16) is None
+    # The cell's own n_seq is part of the frozen estimand; a shape-consistent
+    # n_tok with a different row count must not be admitted.
+    _nseq_bad = _rec('a_arm', 0, 'FP', by_len={4096: {
+        'ppl': 30.0, 'n_tok': 16 * 4095, 'n_seq': 8, 'truncated': False}})
+    assert V12._by_len_shape_reason(_nseq_bad, 16) is not None
+    # A synthesized reconstruction has no weights and is not an independent
+    # final-test measurement; it must never enter the confirmation.
+    raw = dict(good, **{'a::s2': dict(_rec('a_arm', 2, 'FP'), synthesized=True)})
+    adm_s, _ = V12._admit_confirmation_records(raw, m)
+    assert (u'a_arm', 2) not in adm_s and len(adm_s) == 4
+    # A shape-complete cell without a usable PPL is not a measurement.
+    _unmeasured = _rec('a_arm', 2, 'FP', by_len={4096: {
+        'ppl': None, 'n_tok': 16 * 4095, 'n_seq': 16, 'truncated': False}})
+    raw = dict(good, **{'a::s2': _unmeasured})
+    adm_u, _ = V12._admit_confirmation_records(raw, m)
+    assert (u'a_arm', 2) not in adm_u and len(adm_u) == 4
     # off-whitelist seed: excluded, named, never counted
     raw = dict(good, **{'a::s9': _rec('a_arm', 9, 'FP')})
     adm2, _ = V12._admit_confirmation_records(raw, m)
@@ -1929,6 +1959,17 @@ def t_pooled_ppl_rejects_malformed_counts():
                                        {'nll_sum': -4.0, 'n_tokens': 10}]) == (None, None, None)
     ppl, nll, nt = L._pooled_ppl_from_records([{'nll_sum': 4.0, 'n_tokens': 10}])
     assert abs(ppl - math.exp(0.4)) < 1e-12 and (nll, nt) == (4.0, 10), (ppl, nll, nt)
+
+
+def t_nll_doc_ci_exact_token_counts():
+    # Per-document token counts are exact integers under the shared contract:
+    # Decimal('4.9') must not be truncated to 4 into the pooled denominator.
+    from decimal import Decimal
+    good = L._nll_doc_ci([2.0, 2.0], [Decimal('4.0'), 4])
+    assert good['n_docs'] == 2 and abs(good['ppl'] - math.exp(0.5)) < 1e-12, good
+    bad = L._nll_doc_ci([2.0, 2.0], [Decimal('4.9'), 4])
+    assert bad['n_docs'] == 1, bad
+    assert L._nll_doc_ci([2.0, 2.0], [True, 4])['n_docs'] == 1
 
 
 def t_combined_seed_doc_uncertainty():
@@ -4859,6 +4900,21 @@ def t_audit_fairness_nan_seed_does_not_crash():
                                     'ppl': 10.0, 'run_cfg': 'x'}}, f)
         out = A.audit_fairness(path, arms=['a'])
         assert out['arms']['a']['seeds'] == [], out
+        # Mixed parameter-count spellings are malformed but must not abort the
+        # whole fairness audit with a TypeError.
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump({'a::seed0': {'variant': 'a', 'seed': 0, 'params': 10,
+                                    'ppl': 10.0, 'run_cfg': 'x'},
+                       'a::seed1': {'variant': 'a', 'seed': 1, 'params': '12',
+                                    'ppl': 10.0, 'run_cfg': 'x'}}, f)
+        out = A.audit_fairness(path, arms=['a'])
+        assert out['arms']['a']['n_records'] == 2, out
+        # Unhashable (list/dict) metadata must not crash the audit either.
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump({'a::seed0': {'variant': 'a', 'seed': 0, 'params': [10],
+                                    'ppl': 10.0, 'run_cfg': ['x']}}, f)
+        out = A.audit_fairness(path, arms=['a'])
+        assert out['arms']['a']['n_records'] == 1, out
 
 
 def t_audit_split_empty_cache_is_not_ok():
@@ -5321,6 +5377,21 @@ def t_v12_probe_contrasts_require_matching_params():
         miss = _write({'n_seq': 16}, drop=True)
         assert miss['n_admitted'] == 2 and miss['n_excluded'] == 2, miss
         assert miss['contrasts'] == {}, miss
+        # A synthesized probe record is a reconstruction, not a measurement;
+        # it must be named and excluded rather than pooled.
+        raw = {}
+        for s in (0, 1):
+            for arm, ppl in (('learned', 10.0), ('dense', 11.0)):
+                raw[f'{arm}{s}'] = {'variant': 'csa_fixed', 'seed': s, 'arm': arm,
+                                    'eval_len': 4096, 'rho': 0.5, 'mode': 'uniform',
+                                    'ppl_mean': ppl, 'probe_params': {'n_seq': 16},
+                                    'val_fp': 'F', '_code': L.code_stamp(),
+                                    'synthesized': True}
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(raw, f)
+        synth = V12._test_probe_stats(path, {'arms': ['csa_fixed'], 'seeds': [0, 1]}, 'F')
+        assert synth['n_admitted'] == 0 and synth['n_excluded'] == 4, synth
+        assert synth['contrasts'] == {}, synth
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
@@ -6411,6 +6482,7 @@ def main():
     _check('J1 evidence metadata + significance gate', t_review3_evidence_metadata)
     _check('J2 pooled aggregation', t_review3_pooled_aggregate)
     _check('J2b pooled PPL rejects malformed counts', t_pooled_ppl_rejects_malformed_counts)
+    _check('J2c document CI token counts are exact integers', t_nll_doc_ci_exact_token_counts)
     _check('J3 Holm declared-family slots', t_review3_holm_family_size)
     _check('J4 task-boundary arm + objective descriptor', t_review3_boundary_arm_and_objective)
     _check('J5 span clean-baseline key', t_review3_span_clean_key)

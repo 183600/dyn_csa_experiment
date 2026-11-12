@@ -466,18 +466,11 @@ def _nll_doc_ci(nll_per_row, n_tokens_per_row):
         except (TypeError, ValueError, OverflowError):
             return None
         # Token counts are exact integers.  A fractional count would silently
-        # change the pooled denominator if int() truncated it.
-        try:
-            if isinstance(ntok, numbers.Integral):
-                ntok = int(ntok)
-            elif isinstance(ntok, numbers.Real):
-                nf = float(ntok)
-                if not math.isfinite(nf) or nf != math.floor(nf):
-                    return None
-                ntok = int(nf)
-            else:
-                ntok = int(ntok)
-        except (TypeError, ValueError, OverflowError):
+        # change the pooled denominator if int() truncated it; use the shared
+        # contract so Decimal('4.9'), booleans and lossy large floats are all
+        # rejected instead of truncated.
+        ntok = _as_seed_int(ntok)
+        if ntok is None:
             return None
         if ntok <= 0 or not math.isfinite(nll) or nll < 0.0:
             return None

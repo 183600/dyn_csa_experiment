@@ -1209,6 +1209,16 @@ def _by_len_shape_reason(rec, n_seq):
             _ntok_f = float('nan')
         if not math.isfinite(_ntok_f) or _ntok_f != math.floor(_ntok_f) or int(_ntok_f) != _want:
             return f'by_len[{_ln_i}].n_tok={_ntok!r} != the frozen {_want} (= {n_seq} rows x {_ln_i - 1} predictions) — truncated/empty cells are not admissible'
+        # The cell's own row count is part of the estimand: the by-length
+        # summary quotes the first cell's n_seq, so a cell that claims a
+        # different row count than the frozen slice would silently relabel
+        # the pooled PPL's document sample.
+        _cnseq_raw = _c.get('n_seq')
+        if _cnseq_raw is not None:
+            _cnseq = _record_int(_cnseq_raw)
+            if _cnseq is None or _cnseq != int(n_seq):
+                return (f'by_len[{_ln_i}].n_seq={_cnseq_raw!r} != the frozen '
+                        f'{int(n_seq)} — a different row count is a different estimand')
         # A cell that does not explicitly certify full length is unverifiable.
         # Matching n_tok alone cannot distinguish a full cell from a record
         # whose truncation marker was lost when it was serialised.
@@ -1283,7 +1293,11 @@ def _admit_confirmation_records(raw, manifest):
             continue
         why = None
         s_i = None
-        if r.get('split') != 'test':
+        if r.get('synthesized'):
+            # A reconstructed record has no weights and is not an independent
+            # measurement; it must never enter the one-shot confirmation.
+            why = 'synthesized reconstruction — not an independent measured record'
+        elif r.get('split') != 'test':
             # Named exclusion, not a silent `continue`.  The
             # docstring promises "named, never silent"; a smoke/validation
             # record sitting in bylen.json must be visible in the audit trail.
@@ -1314,6 +1328,13 @@ def _admit_confirmation_records(raw, manifest):
                 why = _implementation_reason(r, impl)
             elif not isinstance(r.get('by_len'), dict) or not r.get('by_len'):
                 why = 'no by_len measurement'
+            elif not any(isinstance(_c, dict) and L.ppl_is_usable(_c.get('ppl'))
+                         for _c in r['by_len'].values()):
+                # A record whose cells are all shape-complete but carry no
+                # usable PPL is not a measurement at all.  (A single failed
+                # endpoint is handled per pair later; this guard only refuses
+                # a record that cannot contribute ANY endpoint.)
+                why = 'by_len contains no usable PPL measurement'
             else:
                 v = r['variant']
                 if (v, s_i) in admitted:
@@ -1475,7 +1496,9 @@ def _test_probe_stats(probe_path, manifest, slice_fp):
             continue
         why = None
         _seed_i = _record_int(r.get('seed'))
-        if r.get('variant') not in arms:
+        if r.get('synthesized'):
+            why = 'synthesized reconstruction — not an independent probe measurement'
+        elif r.get('variant') not in arms:
             why = f"variant {r.get('variant')!r} is not one of the frozen arms"
         elif _seed_i is None or _seed_i not in seeds:
             why = f"seed {r.get('seed')!r} is outside the frozen whitelist"
