@@ -780,6 +780,21 @@ def t_mode_validation():
             raise AssertionError(f'{mode} must only admit rho=1.0')
         except ValueError:
             pass
+    # rho is a fraction, not a flag/out-of-range request: a boolean or an
+    # out-of-range value must be refused before rng.choice sees a bad size.
+    for bad_rho in (True, False, -0.1, 1.0001, float('nan'), float('inf')):
+        try:
+            V10._corrupt_row(_PANEL, 128, bad_rho, 'uniform', 0, _VOCAB, 32)
+            raise AssertionError(f'rho={bad_rho!r} must be rejected')
+        except ValueError:
+            pass
+    # vocab=1 has no alternative token: the rejection-sampling loop would
+    # never terminate, so the construction must refuse it.
+    try:
+        V10._corrupt_row(_PANEL, 128, 0.5, 'uniform', 0, 1, 32)
+        raise AssertionError('uniform corruption with vocab=1 must be rejected (no alternative token)')
+    except ValueError:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -1253,6 +1268,68 @@ def t_seed_plan():
     assert L.holm_min_attainable_p(req, p['declared_contrasts'], 0.05) <= 0.05
     assert L.holm_min_attainable_p(req - 1, p['declared_contrasts'], 0.05) > 0.05
     assert L.methodology_seed_plan(req)['sufficient_for_family_rejection'] is True
+
+
+def t_seed_plan_exact_counts():
+    # A plan's seed count is an exact integer.  Truncating 4.9/True to 4/1
+    # would report a DIFFERENT (smaller) panel as family-sufficient.
+    for bad in (4.9, True, False, -3, '4.9', 'not-a-count', float('nan'), None):
+        p = L.methodology_seed_plan(bad)
+        assert p['n_seeds'] == 0, (bad, p)
+        assert p['sufficient_for_family_rejection'] is False, (bad, p)
+    assert L.methodology_seed_plan('3')['n_seeds'] == 3
+    assert L.methodology_seed_plan(3.0)['n_seeds'] == 3
+
+
+def t_t_critical_high_confidence():
+    # The old fixed upper bound (1000) made high-confidence intervals too
+    # narrow; df=1 has the analytic t = 1/tan(pi*alpha).
+    for conf in (0.9999, 0.999999):
+        got = L._t_critical(conf, 1)
+        want = 1.0 / math.tan(math.pi * (1.0 - conf) / 2.0)
+        assert abs(got - want) / want < 1e-8, (conf, got, want)
+    assert abs(L._t_critical(0.95, 10) - 2.2281388519862826) < 1e-9
+
+
+def t_record_int_exact_spelling():
+    # v12 admission must use the same exact integer contract as the plan:
+    # a decimal/exponent string denotes a different value, while a genuine
+    # integer spelling stays accepted.
+    assert V12._record_int('4') == 4
+    assert V12._record_int(4.0) == 4
+    for bad in ('4.0', '1e3', ' 4.0 ', 4.9, True, None):
+        assert V12._record_int(bad) is None, bad
+    # The shared seed contract must also reject lossy int() coercion of
+    # number-like objects that are not numbers.Real (e.g. Decimal('4.9')).
+    from decimal import Decimal
+    assert L._as_seed_int(Decimal('4.9')) is None
+    assert L._as_seed_int(Decimal('4.0')) == 4
+    assert L._as_seed_int(Decimal('1e3')) == 1000
+
+    class Truncates:
+        def __int__(self):
+            return 7
+    assert L._as_seed_int(Truncates()) is None
+    # The report twin must obey the same contract (no lossy int() coercion).
+    assert BR._int_or(Decimal('4.9'), None) is None
+    assert BR._int_or(Decimal('4.0'), None) == 4
+    assert BR._int_or('4', None) == 4 and BR._int_or('4.0', None) is None
+    assert BR._int_or(Truncates(), None) is None
+
+
+def t_eval_length_invalid_lengths():
+    import copy as _copy
+    torch.manual_seed(0)
+    dev = torch.device('cpu')
+    cfgs = L.make_layer_cfgs(1, 'full_rope')
+    model = L.SmallGPT(64, 32, 1, 2, 16, 16, _copy.deepcopy(cfgs)).to(dev)
+    model.eval()
+    ids = np.asarray(np.random.default_rng(11).integers(0, 64, size=(2, 17)), dtype=np.int64)
+    out = V7.eval_length_gen(model, ids, [1, 0, -3, 4.9, 8, 16], dev, max_pos=None)
+    for bad in (1, 0, -3, 4.9):
+        assert 'error' in out[bad] and 'ppl' not in out[bad], (bad, out[bad])
+    for good in (8, 16):
+        assert 'ppl' in out[good] and out[good]['eval_span'] == good, (good, out[good])
 
 
 def t_audit_family_holm_and_verified():
@@ -6251,6 +6328,9 @@ def main():
     _check('C11b corpus/validation-slice fingerprint gate', t_pair_reason_fingerprint_gate)
     _check('C21 M0 scale analysis stays descriptive at n=4', t_m0_scale_analysis_descriptive)
     _check('C12 seed plan', t_seed_plan)
+    _check('C12a seed plan requires exact integer counts', t_seed_plan_exact_counts)
+    _check('C12b t critical covers high-confidence intervals', t_t_critical_high_confidence)
+    _check('C12c recorded counts use the exact integer contract', t_record_int_exact_spelling)
     _check('C13 family Holm + verified baseline + param control', t_audit_family_holm_and_verified)
     _check('C14 compression-regularizer loss ablation', t_ablation_design_loss_term)
     _check('C15 optimizer knobs enter the resume fingerprint', t_training_knobs_in_resume_fingerprint)
@@ -6277,6 +6357,7 @@ def main():
     _check('C7 frozen seeds single source', t_frozen_seeds)
     _check('C8 doc-level analysis', t_doc_level_analysis)
     _check('D1 eval per-seq ppl', t_eval_per_seq)
+    _check('D1a eval length rejects invalid/non-integer lengths', t_eval_length_invalid_lengths)
     _check('J1 evidence metadata + significance gate', t_review3_evidence_metadata)
     _check('J2 pooled aggregation', t_review3_pooled_aggregate)
     _check('J2b pooled PPL rejects malformed counts', t_pooled_ppl_rejects_malformed_counts)

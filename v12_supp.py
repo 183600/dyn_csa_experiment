@@ -1192,22 +1192,15 @@ def _by_len_shape_reason(rec, n_seq):
 
 
 def _record_int(value):
-    """Exact integer view of a recorded count, or None for anything else."""
-    if value is None or isinstance(value, (bool, np.bool_)):
-        return None
-    if isinstance(value, numbers.Integral):
-        return int(value)
-    try:
-        f = float(value)
-    except (TypeError, ValueError, OverflowError):
-        return None
-    if not math.isfinite(f) or f != math.floor(f):
-        return None
-    if abs(f) >= 2 ** 53:
-        # Above 2**53 a float cannot represent every integer; the recorded
-        # seed/count may silently denote a different value.
-        return None
-    return int(f)
+    """Exact integer view of a recorded count, or None for anything else.
+
+    Use the shared seed/count contract so a value admitted here is exactly the
+    value the plan/pairing gates admit.  In particular a decimal string such
+    as ``"4.0"`` or ``"1e3"`` is not an exact integer spelling: accepting it
+    would map a recorded seed/count to a different integer than the frozen
+    whitelist, while a genuine integer string ``"4"`` stays accepted.
+    """
+    return L._as_seed_int(value)
 
 
 def _manifest_seed_ids(manifest):

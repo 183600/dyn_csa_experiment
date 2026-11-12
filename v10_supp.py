@@ -204,7 +204,19 @@ def _corrupt_row(val_ids, eval_len, rho, mode, jj, vocab, target, span_len=PROBE
     n_far = eval_len - target
     if mode not in _CORRUPT_MODES:
         raise ValueError(f'_corrupt_row: unknown corruption mode {mode!r} (expected one of {_CORRUPT_MODES})')
-    if mode in ('mask', 'delete', 'doc') and abs(float(rho) - 1.0) > 1e-9:
+    # rho is a corruption FRACTION.  A boolean is a flag, not a fraction, and
+    # a value outside [0,1] would either silently corrupt nothing (negative)
+    # or ask rng.choice for more positions than the far context holds (>1),
+    # so validate before any mode-specific branch.
+    if isinstance(rho, (bool, np.bool_)):
+        raise ValueError(f'_corrupt_row: rho={rho!r} is a boolean flag, not a corruption fraction')
+    try:
+        _rho = float(rho)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f'_corrupt_row: rho={rho!r} is not a number') from None
+    if not math.isfinite(_rho) or not (0.0 <= _rho <= 1.0):
+        raise ValueError(f'_corrupt_row: rho={rho!r} must be a finite fraction in [0,1]')
+    if mode in ('mask', 'delete', 'doc') and abs(_rho - 1.0) > 1e-9:
         raise ValueError(f"mode {mode!r} is an all-or-nothing condition and only admits rho=1.0 (got {rho!r}); partial masking is a different question and is not this probe")
     if mode == 'delete':
         # the far context is REMOVED, not filled: the model sees only
@@ -212,14 +224,14 @@ def _corrupt_row(val_ids, eval_len, rho, mode, jj, vocab, target, span_len=PROBE
         # tokens' pairwise structure is unchanged)
         return np.asarray(val_ids[jj, eval_len - target:eval_len + 1], dtype=np.int64).copy()
     ids = np.asarray(val_ids[jj, :eval_len + 1], dtype=np.int64).copy()
-    k = int(round(rho * n_far))
+    k = int(round(_rho * n_far))
     if mode == 'mask':
         ids[:n_far] = MASK_TOKEN_ID
         return ids
     if mode == 'doc':
         # whole far context replaced by ONE contiguous slice of another row
         # (length- and position-controlled "unrelated document" context)
-        rng = np.random.default_rng((eval_len * 1000003 + jj * 10007) * 1048576 + int(round(rho * 1048576)))
+        rng = np.random.default_rng((eval_len * 1000003 + jj * 10007) * 1048576 + int(round(_rho * 1048576)))
         _src = (jj + max(1, val_ids.shape[0] // 2)) % val_ids.shape[0]
         _row_len = min(val_ids.shape[1], eval_len + 1)
         _max_off = _row_len - n_far
@@ -229,12 +241,18 @@ def _corrupt_row(val_ids, eval_len, rho, mode, jj, vocab, target, span_len=PROBE
     if k <= 0:
         return ids
     if mode == 'uniform':
-        rng = np.random.default_rng((eval_len * 1000003 + jj * 10007) * 1048576 + int(round(rho * 1048576)))
+        # With vocab < 2 there is no alternative token, so the resample loop
+        # below could never make progress (an infinite loop rather than a
+        # measurement).  Refuse the meaningless condition explicitly.
+        _vb = L._as_seed_int(vocab)
+        if _vb is None or _vb < 2:
+            raise ValueError(f'uniform corruption needs an integer vocab >= 2 (got {vocab!r}); no alternative token exists')
+        rng = np.random.default_rng((eval_len * 1000003 + jj * 10007) * 1048576 + int(round(_rho * 1048576)))
         pos = rng.choice(n_far, size=k, replace=False)
-        _draw = rng.integers(0, vocab, size=k)
+        _draw = rng.integers(0, _vb, size=k)
         _same = _draw == ids[pos]
         while _same.any():
-            _draw[_same] = rng.integers(0, vocab, size=int(_same.sum()))
+            _draw[_same] = rng.integers(0, _vb, size=int(_same.sum()))
             _same = _draw == ids[pos]
         ids[pos] = _draw
         return ids
@@ -244,7 +262,7 @@ def _corrupt_row(val_ids, eval_len, rho, mode, jj, vocab, target, span_len=PROBE
         # are part of the realistic-token statistics).
         # topical: same protocol, but the donor row is the most unigram-similar
         # row (topic proxy) instead of the fixed-offset row.
-        rng = np.random.default_rng((eval_len * 1000003 + jj * 10007) * 1048576 + int(round(rho * 1048576)))
+        rng = np.random.default_rng((eval_len * 1000003 + jj * 10007) * 1048576 + int(round(_rho * 1048576)))
         pos = rng.choice(n_far, size=k, replace=False)
         if mode == 'topical':
             _nat = (jj + max(1, val_ids.shape[0] // 2)) % val_ids.shape[0]
@@ -260,7 +278,7 @@ def _corrupt_row(val_ids, eval_len, rho, mode, jj, vocab, target, span_len=PROBE
         # inside each span survives, cross-span coherence is destroyed.
         # actual coverage = len(starts) * seg (recomputable from the same
         # deterministic formula — rho is nominal for this mode).
-        rng = np.random.default_rng((eval_len * 1000003 + jj * 10007) * 1048576 + int(round(rho * 1048576)))
+        rng = np.random.default_rng((eval_len * 1000003 + jj * 10007) * 1048576 + int(round(_rho * 1048576)))
         seg = max(1, int(span_len))
         n_seg = max(1, int(math.ceil(k / seg)))
         seg = min(seg, n_far)

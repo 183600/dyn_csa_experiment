@@ -357,7 +357,11 @@ def build_report(out='REPORT_v9.md', stats_p='analysis_v9/stats.json'):
         _sd = {}
         for _r in _s.values():
             if isinstance(_r, dict) and 'seed' in _r and L.ppl_is_usable(_r.get('ppl')) and (not _r.get('synthesized')):
-                _sd.setdefault(_r.get('variant'), set()).add(_r['seed'])
+                # Normalise the seed identity so 0 and "0" do not count as two
+                # independent seeds in the displayed n.
+                _si = L._as_seed_int(_r['seed'])
+                if _si is not None:
+                    _sd.setdefault(_r.get('variant'), set()).add(_si)
         _ns = [len(x) for x in _sd.values()]
         return (min(_ns), max(_ns)) if _ns else None
 

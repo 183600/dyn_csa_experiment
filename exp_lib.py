@@ -10074,9 +10074,18 @@ def _t_critical(conf, df):
     if not (0.0 < conf < 1.0) or not (df > 0.0):
         return float('nan')
     target = (1.0 - conf) / 2.0
-    lo, hi = 0.0, 1000.0
+    # Expand the bracket instead of hard-coding t<=1000: a very high
+    # confidence level (or df=1) needs a critical value far above 1000
+    # (conf=0.9999, df=1 -> t~6366), and a fixed cap silently returned a
+    # too-small interval.  Stop if the bracket reaches the float range cap.
+    lo, hi = 0.0, 1.0
+    while hi < 1e18 and _student_t_sf(hi, df) > target:
+        lo = hi
+        hi *= 2.0
     for _ in range(200):
         mid = 0.5 * (lo + hi)
+        if mid == lo or mid == hi:
+            break
         if _student_t_sf(mid, df) > target:
             lo = mid
         else:
@@ -11097,10 +11106,26 @@ def _as_seed_int(v):
         if abs(f) >= 2 ** 53:
             return None
         return int(f)
+    # Strings are a deliberate JSON/normalisation spelling: int('4') and
+    # int(' 4 ') are exact, while int('4.9') already raises.
+    if isinstance(v, (str, bytes)):
+        try:
+            return int(v)
+        except (TypeError, ValueError, OverflowError):
+            return None
+    # Other number-like objects (e.g. Decimal) are not numbers.Real.  int()
+    # would silently truncate Decimal('4.9') to 4 -- a different valid seed.
+    # Accept only when the conversion is exact (Decimal('4.0') == 4).
     try:
-        return int(v)
+        iv = int(v)
     except (TypeError, ValueError, OverflowError):
         return None
+    try:
+        if iv != v:
+            return None
+    except Exception:
+        return None
+    return iv
 
 def _seed_identity(v):
     """Normalise a seed id for duplicate/pairing checks.
@@ -13184,9 +13209,11 @@ def methodology_seed_plan(n_seeds, design=None, baselines=None, alpha=0.05, vari
                   'missing_arms': {}})
     m = sum(len(v) for v in design.values()) + sum(len(v) for v in baselines.values())
     req = signflip_min_n_for_holm(m, alpha)
-    try:
-        n = int(n_seeds)
-    except (TypeError, ValueError, OverflowError):
+    # A seed count is an exact integer.  int(4.9)=4 or int(True)=1 would
+    # report a DIFFERENT plan as sufficient (a fractional/boolean count is not
+    # a panel size).  Share the exact contract used by the confirmation gates.
+    n = _as_seed_int(n_seeds)
+    if n is None or n < 0:
         n = 0
     return {'n_seeds': n, 'declared_contrasts': int(m), 'alpha': float(alpha),
             'min_seeds_for_family_significance': req,

@@ -301,10 +301,23 @@ def _int_or(v, default):
         if not (math.isfinite(f) and f.is_integer()) or abs(f) >= 2 ** 53:
             return default
         return int(f)
+    if isinstance(v, (str, bytes)):
+        try:
+            return int(v)
+        except (TypeError, ValueError, OverflowError):
+            return default
+    # Non-Real number-like objects (e.g. Decimal): int() truncates
+    # Decimal('4.9') to 4, so accept only an exact conversion.
     try:
-        return int(v)
+        iv = int(v)
     except (TypeError, ValueError, OverflowError):
         return default
+    try:
+        if iv != v:
+            return default
+    except Exception:
+        return default
+    return iv
 
 def _code_semantics():
     try:
@@ -460,15 +473,9 @@ def per_seed_records(outdir):
             if isinstance(_sv, (bool, np.bool_)):
                 print(f"[report] record {_k!r} in {outdir} carries a boolean seed — skipped for pairing")
                 continue
-            if isinstance(_sv, numbers.Real):
-                _sf = float(_sv)
-                _sd = (int(_sf) if math.isfinite(_sf) and _sf.is_integer()
-                       and abs(_sf) < 2 ** 53 else None)
-            else:
-                try:
-                    _sd = int(_sv)
-                except (TypeError, ValueError, OverflowError):
-                    _sd = None
+            # Use the shared exact-integer contract: int(Decimal('4.9'))=4
+            # would pair a record under a different seed than it declares.
+            _sd = _int_or(_sv, None)
             if _sd is None:
                 print(f"[report] record {_k!r} in {outdir} carries a non-integer seed ({r.get('seed')!r}) — skipped for pairing")
                 continue
@@ -1256,9 +1263,8 @@ def sec_p1l():
                 return None
             v = int(f)
         else:
-            try:
-                v = int(Ln)
-            except (TypeError, ValueError, OverflowError):
+            v = _int_or(Ln, None)
+            if v is None:
                 return None
         return v if v >= 2 else None
 
@@ -1281,17 +1287,7 @@ def sec_p1l():
         return None
 
     def _norm_seed(x):
-        if isinstance(x, (bool, np.bool_)):
-            return None
-        if isinstance(x, numbers.Real):
-            f = float(x)
-            if not (math.isfinite(f) and f.is_integer()) or abs(f) >= 2 ** 53:
-                return None
-            return int(f)
-        try:
-            return int(x)
-        except (TypeError, ValueError, OverflowError):
-            return None
+        return _int_or(x, None)
 
     lens = sorted({_k for _k in (_len_key(Ln) for r in recs for Ln in r['by_len']) if _k is not None})
     if not lens:

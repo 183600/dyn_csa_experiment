@@ -2249,6 +2249,26 @@ def eval_length_gen(model, val_ids, eval_lens, device=DEVICE, n_seq=16, max_pos=
     was = model.training
     model.eval()
     out = {}
+    # A requested evaluation length is an exact integer.  int(4.9)=4 would
+    # silently score a DIFFERENT span under the caller's label, and a length
+    # below 2 has no next-token target at all (it would either index an empty
+    # cumulative column or report a vacuous PPL of 1).  Record those as named
+    # error cells instead of truncating/crashing.
+    _norm_lens = []
+    for _ln in (eval_lens if eval_lens is not None else []):
+        _li = L._as_seed_int(_ln)
+        if _li is None:
+            out[_ln] = {'error': (f'evaluation length {_ln!r} is not an exact integer; a '
+                                  'fractional/boolean length would score a different span'),
+                        'truncated': False, 'eval_span': None}
+            continue
+        if _li < 2:
+            out[_li] = {'error': (f'evaluation length {_li} has no next-token prediction '
+                                  '(needs length >= 2)'),
+                        'truncated': False, 'eval_span': None}
+            continue
+        _norm_lens.append(_li)
+    eval_lens = _norm_lens
     # An absolute-position model cannot score beyond its learned table.  When
     # the caller passes max_pos=None (the "full context" request) a longer
     # length must be an explicit error, never a silent last-max_pos slice.
