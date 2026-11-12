@@ -4330,6 +4330,25 @@ def t_corpus_audit_memo_keys_validation_shape():
     assert r2['val_shape'] == [2, 3], r2
 
 
+def t_corpus_audit_overlap_metadata_exact():
+    # The document-overlap flag is a count: a fractional/boolean value must not
+    # be truncated to zero by int(0.9)==0 and attest a clean split.
+    tr = np.arange(40, dtype=np.int64)
+    va = np.array([[100, 101, 102, 103]], dtype=np.int64)
+    for bad in (0.9, True, -0.5):
+        rep = L.audit_corpus_split(
+            tr, va, 200, dataset='overlap-meta-test',
+            meta={'doc_ids': {'disjoint': True, 'overlap': bad}},
+            max_scan_tokens=64, sample_rows=1, strict=False)
+        assert rep['status'] == 'fail', (bad, rep)
+        assert any('document-disjoint' in x for x in rep['hard_failures']), (bad, rep)
+    ok = L.audit_corpus_split(
+        tr, va, 200, dataset='overlap-meta-test',
+        meta={'doc_ids': {'disjoint': True, 'overlap': 0}},
+        max_scan_tokens=64, sample_rows=1, strict=False)
+    assert ok['status'] != 'fail', ok
+
+
 def t_report_aggregate_status_fails_closed():
     assert A._aggregate_audit_status({'a': {'status': 'ok'}}) == 'ok'
     assert A._aggregate_audit_status(
@@ -6095,6 +6114,7 @@ def main():
     _check('L10 selection-attribution contract', t_selection_attribution_contract)
     _check('L10b corpus-audit memo cannot bypass the strict gate', t_corpus_audit_memo_does_not_bypass_strict_gate)
     _check('L10c corpus-audit memo keys the validation row shape', t_corpus_audit_memo_keys_validation_shape)
+    _check('L10c2 corpus-audit document-overlap count is exact', t_corpus_audit_overlap_metadata_exact)
     _check('L10d report command aggregates sub-audit status', t_report_aggregate_status_fails_closed)
     _check('L10c length audit rejects malformed cell objects', t_audit_length_malformed_cells_do_not_crash)
     _check('L11 length audit fails closed on missing truncation flag', t_audit_length_missing_truncated_flag)

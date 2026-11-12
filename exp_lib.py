@@ -5943,7 +5943,7 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
                         'cache has document-id sidecars but no document-disjointness '
                         'attestation in its metadata')
                 if _mdoc and (_mdoc.get('disjoint') is not True
-                              or int(_mdoc.get('overlap', 0) or 0) != 0):
+                              or _as_seed_int(_mdoc.get('overlap', 0)) != 0):
                     _problems.append(
                         'cache metadata does not attest document-disjoint train/validation splits')
                 # Fingerprints make the sidecars part of the cache identity:
@@ -7780,7 +7780,8 @@ def audit_corpus_split(train_ids, val_batch, vocab, *, dataset='wikitext',
         report['documents'] = {k: _docs.get(k) for k in
                                ('train_count', 'validation_count', 'overlap',
                                 'disjoint', 'policy')}
-        if _docs.get('disjoint') is not True or int(_docs.get('overlap', 0) or 0) != 0:
+        if (_docs.get('disjoint') is not True
+                or _as_seed_int(_docs.get('overlap', 0)) != 0):
             report['hard_failures'].append('cache does not attest document-disjoint train/validation splits')
     elif dataset == 'fineweb':
         report['warnings'].append('legacy FineWeb cache has no document-id disjointness proof')
