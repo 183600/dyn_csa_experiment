@@ -5,7 +5,7 @@ These are the substantive gates the panel must pass before any GPU run:
 
   K1  config / segmenter: `max_block=None` is an explicit no-cap bound,
       the position capacity is independent of it, and the default is closed.
-  K2  optimized causal prefix pooling == per-query reference (forward and
+  K2  causal prefix pooling == per-query reference (forward and
       gradients), for full-prefix and outside-window scopes.  At a block end
       the full-prefix summary equals the closed block pooling exactly.
   K3  prefix invariance: a truncated input gives the same outputs on the
@@ -19,7 +19,7 @@ These are the substantive gates the panel must pass before any GPU run:
   K7  closed regression: the default closed path is unchanged (and the
       open modes leave the dynamic cut table untouched).
   K8  singleton semantics: a length-1 pooled block, not a raw-token K/V.
-  K9  HCA budget declaration: open HCA must declare the extra-read budget.
+  K9  HCA read declaration: open HCA must declare the extra-read allowance.
 
 Run directly (`python test_open_block.py`) or through
 `python test_review_fixes.py` (the CI entry point imports CHECKS).
@@ -465,7 +465,7 @@ def t_hca_budget_declaration():
     except ValueError:
         pass
     else:
-        raise AssertionError('open HCA accepted the shared_topk budget label')
+        raise AssertionError('open HCA accepted the shared_topk quota label')
     c = L.AttnCfg(kind='hca', open_block_mode='prefix_summary',
                   selection_budget='all_closed_plus_prefix')
     assert c.selection_budget == 'all_closed_plus_prefix'
@@ -569,7 +569,7 @@ CHECKS = [
     ('K6 edge cases', t_edge_cases),
     ('K7 closed regression/cut table', t_closed_regression),
     ('K8 singleton semantics', t_singleton_is_length_one_pooled),
-    ('K9 HCA budget declaration', t_hca_budget_declaration),
+    ('K9 HCA read declaration', t_hca_budget_declaration),
     ('K10 forced-vs-natural cuts', t_forced_vs_natural_cuts),
     ('K11 open candidate edge cases', t_open_candidate_edge_cases),
     ('K12 paired seeds are unique', t_paired_seeds_are_unique),

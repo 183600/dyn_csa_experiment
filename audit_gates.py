@@ -324,14 +324,14 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
     else:
         out['checks']['document_isolation'] = {
             'status': 'not_verified',
-            'note': 'legacy test cache without test_doc_ids; rebuild it to prove train/val/test document-group isolation',
+            'note': 'test cache without test_doc_ids; rebuild it to prove train/val/test document-group isolation',
         }
         # An unverifiable isolation claim must not be reported as a clean
         # "ok" audit: a consumer that only reads the top-level status would
         # otherwise treat it as proof of document isolation.
         if out['status'] == 'ok':
             out['status'] = 'warnings'
-        out.setdefault('note', 'document-group isolation is not verified (legacy test cache without test_doc_ids)')
+        out.setdefault('note', 'document-group isolation is not verified (test cache without test_doc_ids)')
     # d) document overlap via deterministic SLIDING shingles on the cached id
     # matrices.  A fixed polynomial rolling hash over every window, uniform
     # segments across the full train stream, and an explicit scanned fraction
@@ -451,7 +451,7 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
                          'evaluation subset or report an overlap-excluded sensitivity '
                          'analysis. Sampling fractions are reported above; '
                          'uniformly-spaced sliding windows over the requested '
-                         'scan budget are deterministic across processes.'),
+                         'scan limit are deterministic across processes.'),
             }
             if _viol:
                 out['status'] = 'fail'
@@ -474,7 +474,7 @@ def audit_leakage(cache_dir=None, shingle=13, max_rows_shingled=400,
         out['status'] = 'fail'
         out['note'] = (f'train/test document-overlap computation failed ({type(e).__name__}: {e}); '
                        'document separation cannot be verified — rebuild the caches '
-                       'or fix the malformed inputs before quoting a clean leakage audit')
+                       'or correct the malformed inputs before quoting a clean leakage audit')
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return out
 
@@ -652,7 +652,7 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
         assumed away).
 
     Exact duplicate rows across splits are a hard failure.  Distribution or
-    legacy-metadata issues are warnings because they need a scientific
+    metadata issues are warnings because they need a scientific
     judgement, not an automatic rebuild.
     """
     import glob
@@ -710,7 +710,7 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                 continue
             rec['train_shape'] = list(tr.shape)
             rec['val_shape'] = list(va.shape)
-            rec['declared_split_strategy'] = meta.get('split_strategy') or 'legacy_unrecorded'
+            rec['declared_split_strategy'] = meta.get('split_strategy') or 'unrecorded'
             rec['shuffle_at_split'] = meta.get('shuffle_at_split')
             rec['tokenizer_fit_split'] = meta.get('tokenizer_fit_split')
             rec['val_fingerprint_recorded'] = bool(meta.get('val_fp'))
@@ -721,7 +721,7 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                 rec['status'] = 'fail'
                 _fail(f'{cd}/{tag}: tokenizer fit split is {meta.get("tokenizer_fit_split")!r}, not train')
             if meta.get('split_strategy') is None:
-                _warn(f'{cd}/{tag}: legacy cache has no split_strategy/tokenizer provenance metadata; rebuild it to make the split auditable')
+                _warn(f'{cd}/{tag}: cache has no split_strategy/tokenizer provenance metadata; rebuild it to make the split auditable')
 
             # Data-cleaning coverage: non-finite values are a hard failure (an
             # embedding index or loss built from them is undefined), and exact
@@ -801,7 +801,7 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                 _fail(f'{cd}/{tag}: cache metadata records document ids but the '
                       'sidecar files are missing')
             else:
-                rec['document_isolation'] = 'not_verified (legacy cache has no document-id sidecars)'
+                rec['document_isolation'] = 'not_verified (cache has no document-id sidecars)'
                 _warn(f'{cd}/{tag}: cache has no document-id sidecars; '
                       'whole-document group isolation cannot be verified')
 
@@ -852,7 +852,7 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
             te = None
             if len(_cands) == 1:
                 _tfp, _ttag, _tmeta = _cands[0]
-                rec['test_split_strategy'] = _tmeta.get('split_strategy') or 'legacy_unrecorded'
+                rec['test_split_strategy'] = _tmeta.get('split_strategy') or 'unrecorded'
                 rec['test_shuffle_at_split'] = _tmeta.get('shuffle_at_split')
                 rec['test_tokenizer_fit_split'] = _tmeta.get('tokenizer_fit_split')
                 if _tmeta.get('shuffle_at_split') is True:
@@ -862,7 +862,7 @@ def audit_split_discipline(cache_dirs=None, max_rows=50000, js_warn=0.05,
                     rec['status'] = 'fail'
                     _fail(f'{cd}/{tag}: test tokenizer was fitted on {_tmeta.get("tokenizer_fit_split")!r}, not train')
                 if _tmeta.get('split_strategy') is None:
-                    _warn(f'{cd}/{tag}: legacy test cache has no split_strategy/tokenizer provenance metadata')
+                    _warn(f'{cd}/{tag}: test cache has no split_strategy/tokenizer provenance metadata')
                 _tndc = _tmeta.get('near_duplicate_cleanup')
                 if isinstance(_tndc, dict):
                     if _tndc.get('policy') != 'test_documents_deduplicated_against_train_and_validation':
@@ -1781,9 +1781,7 @@ def train_flops_estimate(params, tokens, attn_overhead=0.35):
 
     6·N·D 是前向+反向的常用近似；稀疏选择/池化/激活重算与长序列注意力
     不与参数量成比例，因此用一个**显式声明的**注意力项系数。"""
-    # Parameters and tokens are exact positive counts: int(True)=1,
-    # int(1.5)=1 and a negative count would all turn malformed bookkeeping
-    # into a plausible-looking FLOP estimate.
+    # Parameters and tokens are exact positive counts.
     n = _exact_int_scalar(params)
     d_tok = _exact_int_scalar(tokens)
     if n is None or n <= 0 or d_tok is None or d_tok <= 0:
@@ -1812,7 +1810,7 @@ def audit_budget(state_files=('run_time_state_v10.json', 'run_time_state_v12.jso
         if not isinstance(summ, dict):
             out['status'] = 'fail'
             out.setdefault('problems', []).append(
-                f'{d}: summary.json is {type(summ).__name__}, not an object — the budget cannot be reconciled')
+                f'{d}: summary.json is {type(summ).__name__}, not an object — the allocation cannot be reconciled')
             out['panels'][d] = 'not an object'
             continue
         recs = [r for r in summ.values()
@@ -1974,12 +1972,12 @@ def audit_efficiency_pairs(outdirs=None, pairs=None, *, tolerance=0.05):
     """Zero-GPU audit of MEASURED prefill time between arms.
 
     The efficiency question is not "is there a timing field" but "is a
-    speed/cheapness claim supported".  This audit pairs records only when both
+    directional time claim supported".  This audit pairs records only when both
     arms have `efficiency.status == 'ok'` at the SAME token count, on the same
     device and torch version, with the same KV-cache semantics; it reports the
-    p50 ratio and refuses the words "faster/cheaper" unless the ratio is
+    p50 ratio and refuses a directional claim unless the ratio is
     outside `tolerance` in the claimed direction.  It never converts analytic
-    FLOPs into a latency claim.
+    FLOPs into a timing claim.
 
     `pairs` may be a list of (arm_a, arm_b); by default every arm pair sharing
     a panel is reported (descriptive)."""
@@ -2086,7 +2084,7 @@ def audit_efficiency_pairs(outdirs=None, pairs=None, *, tolerance=0.05):
             if not (isinstance(_ta, (int, float)) and isinstance(_tb, (int, float)) and _ta > 0 and _tb > 0):
                 rec['reason'] = 'missing or non-positive measured prefill time'
             elif _na != _nb or len(_na) != 1 or len(_nb) != 1:
-                rec['reason'] = f'different or ambiguous measured token counts ({_na} vs {_nb}); a latency ratio across shapes is not a speed comparison'
+                rec['reason'] = f'different or ambiguous measured token counts ({_na} vs {_nb}); a timing ratio across shapes is not a paired comparison'
             elif _same_batch is False:
                 rec['reason'] = (f'different or ambiguous batch sizes ({sorted(_ba) if _ba is not None else None} '
                                  f'vs {sorted(_bb) if _bb is not None else None}); latency depends on the batch shape')
@@ -2100,7 +2098,7 @@ def audit_efficiency_pairs(outdirs=None, pairs=None, *, tolerance=0.05):
                 rec['faster_arm'] = (b if ratio < 1.0 - tolerance else (a if ratio > 1.0 + tolerance else None))
                 rec['speed_claim_allowed'] = rec['faster_arm'] is not None
                 if not rec['speed_claim_allowed']:
-                    rec['reason'] = f'ratio {ratio:.3f} is within +/-{tolerance:.0%} of 1: no measured speed difference'
+                    rec['reason'] = f'ratio {ratio:.3f} is within +/-{tolerance:.0%} of 1: no measured timing difference'
             panel[f'{a} vs {b}'] = rec
             (out['claims_allowed'] if rec['speed_claim_allowed'] else out['refused']).append(f'{d}: {a} vs {b}')
         if panel:
@@ -2307,9 +2305,7 @@ def audit_selection(path='analysis_mechanism/selection_attribution.json'):
             except (TypeError, ValueError, OverflowError):
                 _bad_seed.append(str(_sk))
                 continue
-            # Per-seed fractions must be finite probabilities in [0,1].  A
-            # NaN/Inf or an out-of-range row cannot attest that the selector
-            # covered more attention mass than its random baseline.
+            # Per-seed fractions must be finite probabilities in [0,1].
             if (not (math.isfinite(_mv) and math.isfinite(_bv))
                     or not (0.0 <= _mv <= 1.0 and 0.0 <= _bv <= 1.0)):
                 _bad_seed.append(str(_sk))

@@ -268,8 +268,7 @@ def _load_manifest(path):
             f = float(value)
         except (TypeError, ValueError, OverflowError):
             raise SystemExit(f'[v12] REFUSE: {label}={value!r} is not an integer')
-        # Above 2**53 a float cannot represent every integer, so a seeded
-        # length/count could silently denote a neighbouring value.
+        # Exact integers only.
         if not math.isfinite(f) or f != math.floor(f) or abs(f) >= 2 ** 53:
             raise SystemExit(f'[v12] REFUSE: {label}={value!r} is not an exact integer')
         return int(f)
@@ -1159,9 +1158,7 @@ def _by_len_shape_reason(rec, n_seq):
             return f'by_len[{_ln!r}] is not a cell object'
         if isinstance(_ln, (bool, np.bool_)):
             return f'by_len key {_ln!r} is not an integer length'
-        # Exact integer length only: a fractional key would denote a different
-        # length, and a float above 2**53 cannot represent every integer, so
-        # it could alias a neighbouring frozen endpoint.
+        # Exact integer length only.
         _ln_i = _record_int(_ln)
         if _ln_i is None:
             return f'by_len key {_ln!r} is not an integer length'
@@ -2260,7 +2257,7 @@ def plan_check(manifest_path=FREEZE_MANIFEST):
         print('[v12 plan] REFUSED — the frozen plan is not runnable end-to-end:')
         for _e in errs:
             print(f'  - {_e}')
-        raise SystemExit('[v12 plan] FAILED: fix the plan/records BEFORE any P5C training or P5T test access')
+        raise SystemExit('[v12 plan] FAILED: correct the plan/records BEFORE any P5C training or P5T test access')
     print(f'[v12 plan] OK: {len(admitted)}/{len(arms) * len(seeds)} synthetic records admitted; {len(_comp_report)} comparisons form all pairs; min n={_n_min} (min Holm p={_min_holm:.4g} <= alpha={_alpha})')
     for _a, _p in _pred.items():
         print(f'  [plan] {_a:32s} eager_batch={_p["eager_batch"]} amp={_p["amp_dtype"]} mr={(_per_arm.get(_a) or {}).get("mr", 4.0)} params={_p.get("params")}')

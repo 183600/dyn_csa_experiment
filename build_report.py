@@ -1236,8 +1236,7 @@ def sec_p1l():
             v = int(Ln)
         elif isinstance(Ln, numbers.Real):
             f = float(Ln)
-            # Above 2**53 a float cannot represent every integer, so accepting
-            # one would risk quoting a cell under a neighbouring length.
+            # Exact integer lengths only.
             if (not math.isfinite(f) or f != math.floor(f)
                     or abs(f) >= 2 ** 53):
                 return None
@@ -1604,8 +1603,7 @@ def _sig_gate(st, alpha=0.05, min_n=6, label=None, family=None, register=True):
         else:
             _note_comparison(label, st.get('p_exact_signflip'), family,
                              st.get('p_holm'), st.get('n'), st.get('mean'))
-    # A seed count is an exact integer: int(6.9)=6 would let a malformed
-    # count pass the n>=6 gate.  `_int_or` rejects booleans and lossy floats.
+    # A seed count is an exact integer; `_int_or` rejects booleans and lossy floats.
     n = _int_or(st.get('n'), None)
     p = st.get('p_exact_signflip')
     ph = st.get('p_holm')
@@ -1745,7 +1743,7 @@ def sec_global_multiplicity():
     Within-family Holm (sec_stats) corrects inside one panel.  A report that
     displays contrasts from several panels and then quotes the significant ones
     has selected over the union, so the union is what a cross-panel quote must
-    survive.  This section does not delete any number; it fixes the allowed
+    survive.  This section does not delete any number; it sets the allowed
     wording for each one."""
     if not _REPORTED_COMPARISONS and _GATE_CALLS == 0:
         return '## 跨面板多重性（全局 FDR / Bonferroni）\n\n> 本报告没有显示任何带 p 值的比较或做任何显著性判定，本节为空。\n\n'

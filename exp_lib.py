@@ -696,7 +696,7 @@ SCALE_TRANSFER_POLICY = {
     'tokens_per_param_tolerance': 0.25,
     'lr_transfer': 'constant_declared_not_validated',
     'family_m': 4,
-    'note': 'S1-S4 hold lr/wd/warmup fraction fixed across widths. No muP or LR-transfer calibration has been run; scale contrasts therefore carry an optimisation-transfer confound and the ladder is descriptive until a transfer check exists.',
+    'note': 'S1-S4 hold lr/wd/warmup fraction fixed across widths. No muP or LR-transfer calibration has been run; scale contrasts therefore carry a training-transfer confound and the ladder is descriptive until a transfer check exists.',
 }
 B_ARMS = ['full_matched', 'full_sw128_matched', 'csa_fixed', 'csa_dynamic', 'hybrid_dynamic']
 RUN_S1 = dict(RUN, dataset='fineweb', vocab_size=B_VOCAB, d=768, n_layers=12, n_heads=12, d_head=64, seq_len=8192, batch_size=8, n_train_tokens=5000000000, steps=76294, warmup=2000, eval_every=4000, eval_subset=32, val_seqs=512, seeds=[0, 1, 2, 3], outdir='results_b_s1', variants=B_ARMS)
@@ -3066,7 +3066,7 @@ def _prefix_overlap_terms(geo, Xb, Zb, B_pos_b, overlap, shift, use_overlap,
 def causal_prefix_pool(Xa, Xb, Za, Zb, bid, B_pos_a, B_pos_b, overlap,
                        *, n_blocks=None, scope='full_prefix', window=128,
                        window_start=None, use_overlap=True):
-    """Optimized all-query causal prefix pooling (see block comment above).
+    """All-query causal prefix pooling (see block comment above).
 
     Xa/Za are the A-lane content/position projections; Xb/Zb are the
     previous-block overlap content/position projections (None for HCA).
@@ -3174,7 +3174,7 @@ def causal_prefix_pool_reference(Xa, Xb, Za, Zb, bid, B_pos_a, B_pos_b, overlap,
     """Per-query, numerically stable reference for `causal_prefix_pool`.
 
     This is deliberately slow and loops over queries; it is the oracle the
-    optimized cumulative-sum form is tested against (forward and gradients).
+    cumulative-sum form is tested against (forward and gradients).
     """
     geo = _open_block_geometry(bid, n_blocks=n_blocks)
     T = int(geo['n'])
@@ -4303,7 +4303,7 @@ class AttnCfg:
                 # quota is not the rule it implements.  Make the extra-read
                 # allowance explicit rather than silently pretending the two
                 # arms have the same number of slots.
-                raise ValueError('open_block_mode on an hca layer requires selection_budget="all_closed_plus_prefix": HCA reads every closed block and has no top-k budget to share; an extra prefix candidate is an ADDITIONAL read slot')
+                raise ValueError('open_block_mode on an hca layer requires selection_budget="all_closed_plus_prefix": HCA reads every closed block and has no top-k quota to share; an extra prefix candidate is an ADDITIONAL read slot')
             if self.kind == 'csa' and self.selection_budget != 'shared_topk':
                 raise ValueError(f'csa open-block layers implement selection_budget="shared_topk"; got {self.selection_budget!r}')
 
@@ -5976,7 +5976,7 @@ def load_wikitext(seq_len, n_train_tokens, vocab_size=8192, val_seqs=512, cache_
             _cache_warning('WikiText train/validation split', _problems)
         else:
             if 'val_fp' not in meta:
-                print('[data] NOTE: this is a legacy cache without a validation fingerprint; its file bytes are range/shape-checked but its split membership cannot be independently re-derived. New caches record val_fp.')
+                print('[data] NOTE: this cache has no validation fingerprint; its file bytes are range/shape-checked but its split membership cannot be independently re-derived.')
             audit_corpus_split(train_ids, val_batch, int(meta['vocab']),
                                dataset='wikitext', meta=meta)
             _out = (train_ids, val_batch, int(meta['vocab']), None, val_bnd)
@@ -6468,15 +6468,15 @@ def load_wikitest(seq_len, n_seqs=256, vocab_size=8192, cache_dir=None):
                     raise RuntimeError('load_wikitest: the test tokenizer vocabulary is not identical to the train tokenizer vocabulary — the id spaces cannot be paired; delete the test cache and rebuild it')
         else:
             if _tok_sha_now is None or not _train_toks:
-                raise RuntimeError('load_wikitest: this is a legacy test cache without a tokenizer identity and without a matched train tokenizer file; refusing to serve an unpaired id space — rebuild the test cache with the current loader')
+                raise RuntimeError('load_wikitest: this test cache has no tokenizer identity and no matched train tokenizer file; refusing to serve an unpaired id space — rebuild the test cache with the current loader')
             try:
                 from tokenizers import Tokenizer as _Tok
                 _tv = dict(_Tok.from_file(tk_path).get_vocab())
                 _trv = dict(_Tok.from_file(_train_toks[0]).get_vocab())
             except Exception as _te:
-                raise RuntimeError(f'load_wikitest: could not compare the legacy test tokenizer with the train tokenizer ({type(_te).__name__}: {_te}); rebuild the test cache') from _te
+                raise RuntimeError(f'load_wikitest: could not compare the test tokenizer with the train tokenizer ({type(_te).__name__}: {_te}); rebuild the test cache') from _te
             if _tv != _trv:
-                raise RuntimeError('load_wikitest: the legacy test tokenizer vocabulary is not identical to the train tokenizer vocabulary — the id spaces cannot be paired; delete the test cache and rebuild it')
+                raise RuntimeError('load_wikitest: the test tokenizer vocabulary is not identical to the train tokenizer vocabulary — the id spaces cannot be paired; delete the test cache and rebuild it')
         if np.asarray(test_ids).shape != (int(n_seqs), int(seq_len)):
             raise RuntimeError(f'load_wikitest: cached test slice shape {np.asarray(test_ids).shape} != the frozen ({int(n_seqs)}, {int(seq_len)}); the frozen slice is part of the pre-registration, so a different row count must be re-frozen explicitly')
         if _problems:
@@ -7354,7 +7354,7 @@ def load_fineweb_edu(seq_len, n_train_tokens, vocab_size=32768, val_seqs=512, ca
                 _cache_warning('FineWeb train/validation split', _problems)
             else:
                 if 'val_fp' not in meta:
-                    print('[data] NOTE: this is a legacy FineWeb cache without a validation fingerprint; shape/range checks passed but split membership cannot be independently re-derived. New caches record val_fp.')
+                    print('[data] NOTE: this FineWeb cache has no validation fingerprint; shape/range checks passed but split membership cannot be independently re-derived.')
                 audit_corpus_split(train_ids, val_batch, int(meta['vocab']),
                                    dataset='fineweb', meta=meta)
                 _out = (train_ids, val_batch, int(meta['vocab']), None, val_bnd)
@@ -7694,7 +7694,7 @@ def audit_corpus_split(train_ids, val_batch, vocab, *, dataset='wikitext',
             raise RuntimeError(
                 f'[{dataset}] DATA GATE REFUSED this split: ' +
                 '; '.join(_hit['hard_failures']) +
-                ' — fix the split/cache before training (no model has been fitted).')
+                ' — correct the split/cache before training (no model has been fitted).')
         return _hit
     try:
         _validate_token_ids(tr, vocab, f'{dataset} train_ids')
@@ -7784,7 +7784,7 @@ def audit_corpus_split(train_ids, val_batch, vocab, *, dataset='wikitext',
                 or _as_seed_int(_docs.get('overlap', 0)) != 0):
             report['hard_failures'].append('cache does not attest document-disjoint train/validation splits')
     elif dataset == 'fineweb':
-        report['warnings'].append('legacy FineWeb cache has no document-id disjointness proof')
+        report['warnings'].append('FineWeb cache has no document-id disjointness proof')
 
     # Training-only reference distribution; the holdout never defines it.
     if tr.size and va.size:
@@ -7810,7 +7810,7 @@ def audit_corpus_split(train_ids, val_batch, vocab, *, dataset='wikitext',
         raise RuntimeError(
             f'[{dataset}] DATA GATE REFUSED this split: ' +
             '; '.join(report['hard_failures']) +
-            ' — fix the split/cache before training (no model has been fitted).')
+            ' — correct the split/cache before training (no model has been fitted).')
     if key not in _CORPUS_AUDIT_MEMO and len(_CORPUS_AUDIT_MEMO) >= _CORPUS_AUDIT_MEMO_CAP:
         _CORPUS_AUDIT_MEMO.pop(next(iter(_CORPUS_AUDIT_MEMO)))
     _CORPUS_AUDIT_MEMO[key] = report
@@ -8763,11 +8763,11 @@ def objective_reason(ra, rb):
     this helper makes the difference explicit instead of silently pairing
     `ce` with `ce + comp_lambda*comp_reg`.  It returns None when the records
     carry matching objective descriptors, a reason string otherwise, and
-    'unverifiable ...' when the descriptors are absent/one-sided (legacy
-    records keep the permissive path, but the state is reported)."""
+    'unverifiable ...' when the descriptors are absent/one-sided (records
+    without a descriptor keep the permissive path, but the state is reported)."""
     oa, ob = ra.get('train_objective'), rb.get('train_objective')
     if oa is None and ob is None:
-        return 'unverifiable train_objective (legacy records carry no objective descriptor)'
+        return 'unverifiable train_objective (records carry no objective descriptor)'
     if (oa is None) != (ob is None):
         return 'unverifiable train_objective (only one record carries the objective descriptor)'
     if not isinstance(oa, dict) or not isinstance(ob, dict):
@@ -9551,7 +9551,7 @@ def paired_effect_stats(deltas, alpha=0.05, min_n=3, with_values=None, without_v
     if with_values is not None and without_values is not None:
         _unpaired_ci = unpaired_bootstrap_ci(with_values, without_values)
     _assumption = ('exact sign-flip is valid as a sign test under symmetric paired differences; '
-                   'same seed does NOT randomise the arm, and architecture-induced RNG/optimisation '
+                   'same seed does NOT randomise the arm, and architecture-induced RNG/training '
                    'differences are part of the arm. p is SEED-level, never token-level.')
     return {'n': n, 'mean': mean, 'std': std, 'sem': sem, 'cohens_dz': dz, 'ci95_low': ci_lo, 'ci95_high': ci_hi, 'loo_means': loo_means, 'seed_driven': seed_driven, 'seed_robust': seed_robust, 'p_exact_signflip': float(p), 'p_floor': p_floor, 'min_reachable_p': p_floor, 'underpowered': underpowered, 'resolution_limited': resolution_limited, 'within_seed_noise': within_seed_noise, 'significant': significant, 'effect_vs_noise': verdict,
             'unit': 'seed', 'assumption': _assumption, 'sign_counts': _sign,
@@ -10682,7 +10682,7 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
             'min_seeds_for_family_significance': signflip_min_n_for_holm(int(policy.get('family_m', 4)), 0.05),
         })
         if params is None:
-            warnings.append(f'{name}: params missing — tokens-per-parameter and budget matching are unverifiable')
+            warnings.append(f'{name}: params missing — tokens-per-parameter and allocation matching are unverifiable')
         rows.append(row)
     if len(rows) >= 2:
         tpp = [r['tokens_per_param'] for r in rows if r.get('tokens_per_param')]
@@ -10702,7 +10702,7 @@ def scale_ladder_audit(tiers, *, policy=None, tolerance=None):
         if lr_constant and _transfer in ('', 'constant_declared_not_validated', 'constant_lr_not_validated'):
             warnings.append(
                 'learning rate is held constant across widths without a validated '
-                'transfer rule (policy=%r); scale contrasts carry an optimisation-'
+                'transfer rule (policy=%r); scale contrasts carry a training-'
                 'transfer confound, not a matched optimizer control' % _transfer)
         warm = [r['warmup_fraction'] for r in rows if r.get('warmup_fraction') is not None]
         warm_ratio = (max(warm) / min(warm)) if len(warm) == len(rows) and min(warm) > 0 else None
@@ -10866,7 +10866,7 @@ def crossover_scaling_fit(entries, *, min_points=4, volume_tol=0.25,
     Refusal rules (each returns `status` + `reasons`, never a slope):
       * reconstructed trajectories are excluded outright;
       * any censored point refuses the fit (dropping it estimates the slope on
-        a selected, faster-crossing subset -- informative censoring);
+        a selected crossing subset -- informative censoring);
       * fewer than `min_points` distinct widths after de-duplication;
       * widths span less than `d_spread_min` (a degenerate x axis);
       * training volume is not comparable: max/min > 1 + volume_tol.  Scale
@@ -10928,7 +10928,7 @@ def crossover_scaling_fit(entries, *, min_points=4, volume_tol=0.25,
     out['incomplete_panels'] = missing
     if censored:
         out.update({'status': 'censored',
-                    'reasons': [f'{len(censored)} panel(s) never crossed inside their training window ({censored}); dropping them would fit the slope on the faster-crossing subset only. Report the censored positions as lower bounds or run longer, then refit.']})
+                    'reasons': [f'{len(censored)} panel(s) never crossed inside their training window ({censored}); dropping them would fit the slope on the crossing subset only. Report the censored positions as lower bounds or run longer, then refit.']})
         return out
     if missing:
         out.update({'status': 'incomplete',
@@ -12275,7 +12275,7 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
         _steps = {v[0] for v in by_cfg.values() if v[0] is not None}
         _toks = {v[1] for v in by_cfg.values() if v[1] is not None}
         if len(_steps) > 1:
-            problems.append(f'{arm}: trials used different step budgets {sorted(_steps)}')
+            problems.append(f'{arm}: trials used different step allocations {sorted(_steps)}')
         if len(_toks) > 1:
             problems.append(f'{arm}: trials saw different token counts {sorted(_toks)}')
         chosen = entry.get('selected') or entry.get('selected_config')
@@ -12326,9 +12326,9 @@ def baseline_tuning_audit(selected=None, path=None, protocol=None):
                     problems.append(f'{arm}: selected trial is not the maximum-{metric} trial')
     if signatures:
         if len(set(signatures.values())) != 1:
-            problems.append('arms did not search the same trial grid — tuning budgets are unequal')
+            problems.append('arms did not search the same trial grid — tuning allocations are unequal')
         if len(set(n_trials.values())) != 1:
-            problems.append('arms did not receive the same number of tuning trials — tuning budgets are unequal')
+            problems.append('arms did not receive the same number of tuning trials — tuning allocations are unequal')
     # Equal tuning includes equal SEARCH SEEDS.  If one arm selected on seeds
     # {0} and another on {0,1,2}, their selection noise differs even though the
     # lr grid is identical.  Only trials that expose their seed set are
@@ -12641,7 +12641,7 @@ def _setting_control(vals_by_arm, *, check_within_arm=True):
 
     Returns `equal` (True/False/None), every arm's distinct values, the arms
     whose own seeds disagree (mixed protocol inside one arm), and arms with
-    no value.  `equal=None` means unverifiable (legacy record), never a pass.
+    no value.  `equal=None` means unverifiable (record without the key), never a pass.
     """
     arms = list(vals_by_arm)
     nonempty = {a: v for a, v in vals_by_arm.items() if v}
@@ -13755,7 +13755,7 @@ def _print_methodology_audit(report):
             continue
         _cv = report.get('controlled_variables', {}).get(comp, {})
         _kn = _cv.get('train_knobs_equal')
-        _kn_s = {True: 'optimizer/schedule knobs shared', False: 'OPTIMIZER/SCHEDULE KNOBS DIFFER', None: 'optimizer/schedule knobs not recorded (legacy or absent)'}[_kn]
+        _kn_s = {True: 'optimizer/schedule knobs shared', False: 'OPTIMIZER/SCHEDULE KNOBS DIFFER', None: 'optimizer/schedule knobs not recorded (absent)'}[_kn]
         print('  [%s]  %s; arms=%s' % (comp, _kn_s, ','.join(_cv.get('arms_present') or []) or 'none'))
         for e in live:
             _c = 'controlled (same run_cfg)' if e['controlled'] else ('UNCONTROLLED: ' + '; '.join(e['skipped_reasons']))
@@ -13791,7 +13791,7 @@ def _print_methodology_audit(report):
     if report.get('resolution_limited_components'):
         print('  resolution-limited (non-noise effect, but the family-corrected p floor > alpha at this n; need n>=%s — add seeds, do NOT read as a null): ' % str((_fam.get('min_seeds_for_family_significance') or '?')) + ', '.join(report['resolution_limited_components']))
     if report.get('system_level_only_components'):
-        print('  SYSTEM-LEVEL ONLY (significant but the objective/compute budget favours the claimed winner): ' + ', '.join(report['system_level_only_components']))
+        print('  SYSTEM-LEVEL ONLY (significant but the objective/compute allocation favours the claimed winner): ' + ', '.join(report['system_level_only_components']))
     if report.get('noise_level_components'):
         print('  noise-level (effect within seed noise across all contrasts): ' + ', '.join(report['noise_level_components']))
     if report.get('underpowered_components'):
@@ -14121,7 +14121,7 @@ def seed_contract_check(seed=0, *, device=None, check_subprocess=False):
     """Explicit audit of every RNG source a reproducible run depends on.
 
     `reproducibility_check` proves that a short TRAINING stream repeats; this
-    check is cheaper and more direct: it enumerates the seed contract itself
+    check is direct: it enumerates the seed contract itself
     (Python, NumPy, PyTorch CPU, every CUDA device, an already-imported
     TensorFlow, the DataLoader generator and the DataLoader worker hook), runs
     it twice with the same seed and once with a different seed, and verifies
@@ -14587,7 +14587,7 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reprodu
 
     def _evidence_for_this_panel(doc, path, what):
         """Only evidence stamped with THIS panel's run_cfg may enter the
-        manifest.  A run_cfg-less (legacy/hand-written) doc must say
+        manifest.  A run_cfg-less (hand-written) doc must say
         ``legacy: true`` explicitly; otherwise a stale pre-flight from a reused
         outdir could silently certify a new configuration."""
         if doc is None:
@@ -14598,9 +14598,9 @@ def write_run_manifest(outdir, cfg, run_cfg, prov, summary, sanity=None, reprodu
         _rc = doc.get('run_cfg')
         if _rc is None:
             if doc.get('legacy') is True:
-                print(f'[track] WARNING: {what} evidence ({path}) has no run_cfg and is explicitly marked legacy — embedding it as unverified legacy evidence')
+                print(f'[track] WARNING: {what} evidence ({path}) has no run_cfg and is explicitly marked as imported — embedding it as unverified evidence')
                 return doc
-            print(f'[track] WARNING: {what} evidence ({path}) has NO run_cfg — refusing to embed it (it cannot be tied to this panel; mark legacy=True only for a deliberately imported old record)')
+            print(f'[track] WARNING: {what} evidence ({path}) has NO run_cfg — refusing to embed it (it cannot be tied to this panel; mark legacy=True only for a deliberately imported record)')
             return None
         if _rc != run_cfg:
             print(f'[track] WARNING: {what} evidence ({path}) belongs to a DIFFERENT run_cfg ({_rc!r} != {run_cfg!r}) — not embedding it in this panel (a stale pre-flight must not certify a new config)')
@@ -15122,8 +15122,7 @@ class _PrefixStats:
     """Diagnostics for the open-block (current-prefix) reading path.
 
     Accumulates per-query quantities only when the caller enables block stats
-    (the validation/eval report), so training keeps its fast path.  Nothing
-    here is a loss term or a model input.
+    (the validation/eval report).  Nothing here is a loss term or a model input.
     """
 
     def __init__(self):
@@ -16361,7 +16360,7 @@ def _resolve_impl_modes(cfg=None, *, device=None):
     else:
         eb = bool(_normalise_eager_batch(eb_raw))
         if eb and device is not None and not _eager_batch_active(device, cfg.get('batch_size')):
-            raise RuntimeError(f'run config requires eager_batch={eb!r} but device={device}/backend cannot provide the batched CUDA twin; pass eager_batch=false or fix the runtime instead of silently changing the implementation')
+            raise RuntimeError(f'run config requires eager_batch={eb!r} but device={device}/backend cannot provide the batched CUDA twin; pass eager_batch=false or correct the runtime instead of silently changing the implementation')
     return amp, bool(eb)
 
 
@@ -16596,9 +16595,8 @@ def measure_efficiency_sweep(model, ids, device, *, lengths=(512, 2048), batches
                              warmup=1, iters=3):
     """Batch x sequence-length latency/throughput sweep on ONE checkpoint.
 
-    `measure_efficiency` answers "how fast is this one input"; a claim that an
-    architecture is cheaper needs the shape dependence too (batch 1 vs 8,
-    short vs long).  CUDA timings use events (so kernel launch is included but
+    `measure_efficiency` answers "how long this one input takes"; the sweep
+    adds the shape dependence (batch 1 vs 8, short vs long).  CUDA timings use events (so kernel launch is included but
     host-side jitter is not); CPU timings use perf_counter.  The output records
     the device, torch/triton versions and TF32 state so two rows are only
     compared when they were measured under the same conditions.
